@@ -77,6 +77,7 @@ public class AgentLlmProperties {
     public static class Endpoint {
         private String baseUrl;
         private String apiKey;
+        private String region;
         /**
          * 新配置支持在 endpoint 下声明模型元信息：
          * endpoint -> models -> modelId -> metadata。
@@ -97,6 +98,14 @@ public class AgentLlmProperties {
 
         public void setApiKey(String apiKey) {
             this.apiKey = apiKey;
+        }
+
+        public String getRegion() {
+            return region;
+        }
+
+        public void setRegion(String region) {
+            this.region = region;
         }
 
         public Map<String, ModelMetadata> getModels() {

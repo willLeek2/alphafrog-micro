@@ -54,6 +54,16 @@ public class AgentAiServiceFactory {
             throw new IllegalArgumentException("LLM api key 未配置: endpoint=" + resolved.endpointName());
         }
         double finalTemperature = temperatureOverride == null ? (temperature == null ? 0.7D : temperature) : temperatureOverride;
+        if (isDashScopeEndpoint(resolved)) {
+            return new DashScopeChatModel(
+                    objectMapper,
+                    resolveDashScopeBaseUrl(resolved.baseUrl(), resolved.region()),
+                    apiKey,
+                    resolved.modelName(),
+                    finalTemperature,
+                    maxTokens
+            );
+        }
         OpenAiChatModel.OpenAiChatModelBuilder builder = OpenAiChatModel.builder()
                 .apiKey(apiKey)
                 .baseUrl(resolved.baseUrl())
@@ -74,6 +84,21 @@ public class AgentAiServiceFactory {
                                                                            List<String> providerOrder,
                                                                            Double temperatureOverride) {
         List<String> normalizedProviderOrder = sanitizeProviderOrder(providerOrder);
+        if (isDashScopeEndpoint(resolved)) {
+            String apiKey = isBlank(resolved.apiKey()) ? openAiApiKey : resolved.apiKey();
+            if (isBlank(apiKey)) {
+                throw new IllegalArgumentException("LLM api key 未配置: endpoint=" + resolved.endpointName());
+            }
+            double finalTemperature = temperatureOverride == null ? (temperature == null ? 0.7D : temperature) : temperatureOverride;
+            return new DashScopeChatModel(
+                    objectMapper,
+                    resolveDashScopeBaseUrl(resolved.baseUrl(), resolved.region()),
+                    apiKey,
+                    resolved.modelName(),
+                    finalTemperature,
+                    maxTokens
+            );
+        }
         if (isOpenRouterEndpoint(resolved) && !normalizedProviderOrder.isEmpty()) {
             String apiKey = isBlank(resolved.apiKey()) ? openAiApiKey : resolved.apiKey();
             if (isBlank(apiKey)) {
@@ -102,6 +127,16 @@ public class AgentAiServiceFactory {
             throw new IllegalArgumentException("LLM api key 未配置: endpoint=" + resolved.endpointName());
         }
         List<String> normalizedProviderOrder = sanitizeProviderOrder(providerOrder);
+        if (isDashScopeEndpoint(resolved)) {
+            return new DashScopeChatModel(
+                    objectMapper,
+                    resolveDashScopeBaseUrl(resolved.baseUrl(), resolved.region()),
+                    apiKey,
+                    resolved.modelName(),
+                    temperature,
+                    maxTokens
+            );
+        }
         if (isOpenRouterEndpoint(resolved) && !normalizedProviderOrder.isEmpty()) {
             Map<String, String> headers = buildCustomHeaders(resolved.baseUrl());
             return new OpenRouterProviderRoutedChatModel(
@@ -148,6 +183,30 @@ public class AgentAiServiceFactory {
 
     private boolean isBlank(String value) {
         return value == null || value.trim().isEmpty();
+    }
+
+
+    private boolean isDashScopeEndpoint(AgentLlmResolver.ResolvedLlm resolved) {
+        if (resolved == null) {
+            return false;
+        }
+        if (!isBlank(resolved.endpointName()) && "dashscope".equalsIgnoreCase(resolved.endpointName().trim())) {
+            return true;
+        }
+        return resolved.baseUrl() != null && resolved.baseUrl().contains("dashscope");
+    }
+
+    private String resolveDashScopeBaseUrl(String configuredBaseUrl, String region) {
+        if (!isBlank(configuredBaseUrl)) {
+            return configuredBaseUrl;
+        }
+        String normalizedRegion = isBlank(region) ? "singapore" : region.trim().toLowerCase();
+        return switch (normalizedRegion) {
+            case "us" -> "https://dashscope-us.aliyuncs.com/compatible-mode/v1";
+            case "cn" -> "https://dashscope.aliyuncs.com/compatible-mode/v1";
+            case "singapore" -> "https://dashscope-intl.aliyuncs.com/compatible-mode/v1";
+            default -> "https://dashscope-intl.aliyuncs.com/compatible-mode/v1";
+        };
     }
 
     private boolean isOpenRouterEndpoint(AgentLlmResolver.ResolvedLlm resolved) {
