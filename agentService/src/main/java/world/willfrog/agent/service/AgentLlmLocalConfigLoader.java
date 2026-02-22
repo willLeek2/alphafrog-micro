@@ -157,6 +157,7 @@ public class AgentLlmLocalConfigLoader {
         prompts.setParallelFinalSystemPrompt(resolvePromptText(prompts.getParallelFinalSystemPrompt(), baseDir, fileTimes));
         prompts.setParallelPatchPlannerSystemPromptTemplate(resolvePromptText(prompts.getParallelPatchPlannerSystemPromptTemplate(), baseDir, fileTimes));
         prompts.setPlanJudgeSystemPromptTemplate(resolvePromptText(prompts.getPlanJudgeSystemPromptTemplate(), baseDir, fileTimes));
+        prompts.setSemanticJudgeSystemPromptTemplate(resolvePromptText(prompts.getSemanticJudgeSystemPromptTemplate(), baseDir, fileTimes));
         prompts.setSubAgentPlannerSystemPromptTemplate(resolvePromptText(prompts.getSubAgentPlannerSystemPromptTemplate(), baseDir, fileTimes));
         prompts.setSubAgentSummarySystemPrompt(resolvePromptText(prompts.getSubAgentSummarySystemPrompt(), baseDir, fileTimes));
         prompts.setPythonRefineSystemPrompt(resolvePromptText(prompts.getPythonRefineSystemPrompt(), baseDir, fileTimes));

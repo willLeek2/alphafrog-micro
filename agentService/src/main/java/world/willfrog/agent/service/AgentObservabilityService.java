@@ -475,6 +475,28 @@ public class AgentObservabilityService {
         });
     }
 
+    public void incrementRecoveryAttempt(String runId, String failureCategory) {
+        mutate(runId, state -> {
+            Summary summary = state.getSummary();
+            String category = nvl(failureCategory).trim().toUpperCase();
+            switch (category) {
+                case "STATIC" -> summary.setStaticRecoveryAttempts(summary.getStaticRecoveryAttempts() + 1);
+                case "SEMANTIC" -> summary.setSemanticRecoveryAttempts(summary.getSemanticRecoveryAttempts() + 1);
+                default -> summary.setRuntimeRecoveryAttempts(summary.getRuntimeRecoveryAttempts() + 1);
+            }
+        });
+    }
+
+    public void recordSemanticJudgeCall(String runId, boolean rejected) {
+        mutate(runId, state -> {
+            Summary summary = state.getSummary();
+            summary.setSemanticJudgeCalls(summary.getSemanticJudgeCalls() + 1);
+            if (rejected) {
+                summary.setSemanticJudgeRejects(summary.getSemanticJudgeRejects() + 1);
+            }
+        });
+    }
+
     public void markPlanningStructured(String runId, boolean enabled) {
         mutate(runId, state -> state.getDiagnostics().setPlanningStructured(enabled));
     }
@@ -1192,6 +1214,11 @@ public class AgentObservabilityService {
         private long startedAtMillis;
         private long completedAtMillis;
         private String status;
+        private long staticRecoveryAttempts;
+        private long runtimeRecoveryAttempts;
+        private long semanticRecoveryAttempts;
+        private long semanticJudgeCalls;
+        private long semanticJudgeRejects;
     }
 
     @Data

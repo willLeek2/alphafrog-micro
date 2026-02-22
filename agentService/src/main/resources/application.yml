@@ -113,6 +113,9 @@ agent:
         某 Todo 工具调用失败，请根据错误信息与已成功完成的 Todo 上下文，修正参数后重试。
         只输出 JSON，格式为 {"params":{...}} 表示用新参数重试，或 {"abandon":true,"reason":"..."} 表示放弃。
         参数引用格式：使用 ${todo_id.output} 或 ${todo_id.output.data.items.0.ts_code} 引用已完成 Todo 的输出；或直接从上下文中提取具体值（如 ts_code: "000300.SH"）。
+      semantic-judge-system-prompt-template: |
+        你是金融分析任务中的语义校验器。必须只输出 JSON：{"pass":true|false,"category":"OK|NUMERIC_ANOMALY|TIME_RANGE_MISMATCH|DOMAIN_INVARIANT_VIOLATION|INSUFFICIENT_EVIDENCE","severity":"LOW|MEDIUM|HIGH","reason_cn":"...","fix_hint":"..."}。
+        若证据不足请返回 pass=false 且 category=INSUFFICIENT_EVIDENCE，并在 fix_hint 说明缺失信息。
       parallel-planner-system-prompt-template: >
         你是并行任务规划器。只输出 JSON。必须输出格式：{"strategy":"parallel","tasks":[...],"finalHint":"..."}。
         任务字段：id,type( tool | sub_agent ),tool,args,dependsOn,goal,maxSteps,description。
@@ -210,6 +213,21 @@ agent:
       orchestrator-summary-system-prompt: |
         你是专业金融分析助手。请基于执行日志输出简洁、清晰、可直接给用户的总结结论。
         优先突出结果与关键数据点，不要仅复述过程。
+    runtime:
+      execution:
+        static-precheck-enabled: ${AF_AGENT_RUNTIME_EXECUTION_STATIC_PRECHECK_ENABLED:true}
+        max-static-recovery-retries: ${AF_AGENT_RUNTIME_EXECUTION_MAX_STATIC_RECOVERY_RETRIES:2}
+        max-runtime-recovery-retries: ${AF_AGENT_RUNTIME_EXECUTION_MAX_RUNTIME_RECOVERY_RETRIES:2}
+        max-semantic-recovery-retries: ${AF_AGENT_RUNTIME_EXECUTION_MAX_SEMANTIC_RECOVERY_RETRIES:1}
+        max-total-recovery-retries: ${AF_AGENT_RUNTIME_EXECUTION_MAX_TOTAL_RECOVERY_RETRIES:2}
+        static-fix-endpoint: ${AF_AGENT_RUNTIME_EXECUTION_STATIC_FIX_ENDPOINT:}
+        static-fix-model: ${AF_AGENT_RUNTIME_EXECUTION_STATIC_FIX_MODEL:}
+        static-fix-temperature: ${AF_AGENT_RUNTIME_EXECUTION_STATIC_FIX_TEMPERATURE:0.0}
+      judge:
+        semantic-enabled: ${AF_AGENT_RUNTIME_JUDGE_SEMANTIC_ENABLED:false}
+        max-attempts: ${AF_AGENT_RUNTIME_JUDGE_MAX_ATTEMPTS:2}
+        fail-open: ${AF_AGENT_RUNTIME_JUDGE_FAIL_OPEN:true}
+        block-on-insufficient-evidence: ${AF_AGENT_RUNTIME_JUDGE_BLOCK_ON_INSUFFICIENT_EVIDENCE:false}
   tools:
     market-data:
       dataset:

@@ -95,6 +95,14 @@
       "maxToolCalls": 20,
       "maxToolCallsPerSubAgent": 10,
       "maxRetriesPerTodo": 3,
+      "staticPrecheckEnabled": true,
+      "maxStaticRecoveryRetries": 2,
+      "maxRuntimeRecoveryRetries": 2,
+      "maxSemanticRecoveryRetries": 1,
+      "maxTotalRecoveryRetries": 2,
+      "staticFixEndpoint": "openrouter",
+      "staticFixModel": "openai/gpt-5.2",
+      "staticFixTemperature": 0.0,
       "failFast": false,
       "defaultExecutionMode": "AUTO"
     },
@@ -120,7 +128,11 @@
     },
     "judge": {
       "enabled": false,
+      "semanticEnabled": false,
       "temperature": 0.0,
+      "maxAttempts": 2,
+      "failOpen": true,
+      "blockOnInsufficientEvidence": false,
       "routes": [
         {
           "endpointName": "openrouter",
@@ -163,6 +175,7 @@
     "parallelFinalSystemPrompt": "file:prompts/parallel/parallel_final_system.txt",
     "parallelPatchPlannerSystemPromptTemplate": "file:prompts/parallel/parallel_patch_planner_system.txt",
     "planJudgeSystemPromptTemplate": "file:prompts/plan/plan_judge_system.txt",
+    "semanticJudgeSystemPromptTemplate": "file:prompts/judge/semantic_judge_system.txt",
     "subAgentPlannerSystemPromptTemplate": "file:prompts/sub_agent/sub_agent_planner_system.txt",
     "subAgentSummarySystemPrompt": "file:prompts/sub_agent/sub_agent_summary_system.txt",
     "pythonRefineSystemPrompt": "file:prompts/python/python_refine_system.txt",

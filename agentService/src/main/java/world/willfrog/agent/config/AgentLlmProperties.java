@@ -335,6 +335,14 @@ public class AgentLlmProperties {
         private Integer maxToolCalls;
         private Integer maxToolCallsPerSubAgent;
         private Integer maxRetriesPerTodo;
+        private Boolean staticPrecheckEnabled;
+        private Integer maxStaticRecoveryRetries;
+        private Integer maxRuntimeRecoveryRetries;
+        private Integer maxSemanticRecoveryRetries;
+        private Integer maxTotalRecoveryRetries;
+        private String staticFixEndpoint;
+        private String staticFixModel;
+        private Double staticFixTemperature;
         private Boolean failFast;
         private String defaultExecutionMode;
 
@@ -368,6 +376,70 @@ public class AgentLlmProperties {
 
         public void setMaxRetriesPerTodo(Integer maxRetriesPerTodo) {
             this.maxRetriesPerTodo = maxRetriesPerTodo;
+        }
+
+        public Boolean getStaticPrecheckEnabled() {
+            return staticPrecheckEnabled;
+        }
+
+        public void setStaticPrecheckEnabled(Boolean staticPrecheckEnabled) {
+            this.staticPrecheckEnabled = staticPrecheckEnabled;
+        }
+
+        public Integer getMaxStaticRecoveryRetries() {
+            return maxStaticRecoveryRetries;
+        }
+
+        public void setMaxStaticRecoveryRetries(Integer maxStaticRecoveryRetries) {
+            this.maxStaticRecoveryRetries = maxStaticRecoveryRetries;
+        }
+
+        public Integer getMaxRuntimeRecoveryRetries() {
+            return maxRuntimeRecoveryRetries;
+        }
+
+        public void setMaxRuntimeRecoveryRetries(Integer maxRuntimeRecoveryRetries) {
+            this.maxRuntimeRecoveryRetries = maxRuntimeRecoveryRetries;
+        }
+
+        public Integer getMaxSemanticRecoveryRetries() {
+            return maxSemanticRecoveryRetries;
+        }
+
+        public void setMaxSemanticRecoveryRetries(Integer maxSemanticRecoveryRetries) {
+            this.maxSemanticRecoveryRetries = maxSemanticRecoveryRetries;
+        }
+
+        public Integer getMaxTotalRecoveryRetries() {
+            return maxTotalRecoveryRetries;
+        }
+
+        public void setMaxTotalRecoveryRetries(Integer maxTotalRecoveryRetries) {
+            this.maxTotalRecoveryRetries = maxTotalRecoveryRetries;
+        }
+
+        public String getStaticFixEndpoint() {
+            return staticFixEndpoint;
+        }
+
+        public void setStaticFixEndpoint(String staticFixEndpoint) {
+            this.staticFixEndpoint = staticFixEndpoint;
+        }
+
+        public String getStaticFixModel() {
+            return staticFixModel;
+        }
+
+        public void setStaticFixModel(String staticFixModel) {
+            this.staticFixModel = staticFixModel;
+        }
+
+        public Double getStaticFixTemperature() {
+            return staticFixTemperature;
+        }
+
+        public void setStaticFixTemperature(Double staticFixTemperature) {
+            this.staticFixTemperature = staticFixTemperature;
         }
 
         public Boolean getFailFast() {
@@ -536,7 +608,11 @@ public class AgentLlmProperties {
 
     public static class Judge {
         private Boolean enabled;
+        private Boolean semanticEnabled;
         private Double temperature;
+        private Integer maxAttempts;
+        private Boolean failOpen;
+        private Boolean blockOnInsufficientEvidence;
         /**
          * 新配置：有序路由列表，每个 endpoint 可配置一组候选 model。
          */
@@ -550,12 +626,44 @@ public class AgentLlmProperties {
             this.enabled = enabled;
         }
 
+        public Boolean getSemanticEnabled() {
+            return semanticEnabled;
+        }
+
+        public void setSemanticEnabled(Boolean semanticEnabled) {
+            this.semanticEnabled = semanticEnabled;
+        }
+
         public Double getTemperature() {
             return temperature;
         }
 
         public void setTemperature(Double temperature) {
             this.temperature = temperature;
+        }
+
+        public Integer getMaxAttempts() {
+            return maxAttempts;
+        }
+
+        public void setMaxAttempts(Integer maxAttempts) {
+            this.maxAttempts = maxAttempts;
+        }
+
+        public Boolean getFailOpen() {
+            return failOpen;
+        }
+
+        public void setFailOpen(Boolean failOpen) {
+            this.failOpen = failOpen;
+        }
+
+        public Boolean getBlockOnInsufficientEvidence() {
+            return blockOnInsufficientEvidence;
+        }
+
+        public void setBlockOnInsufficientEvidence(Boolean blockOnInsufficientEvidence) {
+            this.blockOnInsufficientEvidence = blockOnInsufficientEvidence;
         }
 
         public List<JudgeRoute> getRoutes() {
@@ -693,6 +801,7 @@ public class AgentLlmProperties {
         private String parallelFinalSystemPrompt;
         private String parallelPatchPlannerSystemPromptTemplate;
         private String planJudgeSystemPromptTemplate;
+        private String semanticJudgeSystemPromptTemplate;
         private String subAgentPlannerSystemPromptTemplate;
         private String subAgentSummarySystemPrompt;
         private String pythonRefineSystemPrompt;
@@ -766,6 +875,14 @@ public class AgentLlmProperties {
 
         public void setPlanJudgeSystemPromptTemplate(String planJudgeSystemPromptTemplate) {
             this.planJudgeSystemPromptTemplate = planJudgeSystemPromptTemplate;
+        }
+
+        public String getSemanticJudgeSystemPromptTemplate() {
+            return semanticJudgeSystemPromptTemplate;
+        }
+
+        public void setSemanticJudgeSystemPromptTemplate(String semanticJudgeSystemPromptTemplate) {
+            this.semanticJudgeSystemPromptTemplate = semanticJudgeSystemPromptTemplate;
         }
 
         public String getSubAgentPlannerSystemPromptTemplate() {
