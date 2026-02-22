@@ -1,0 +1,5 @@
+请你检索{{market}}在{{startPublishedAt}}到{{endPublishedAt}}之间发布的最新市场新闻，返回{{limit}}条结果。
+要求：
+1. 检索时优先使用{{language}}相关来源；
+2. 每条结果应包含发布时间、标题、来源和URL；
+3. 仅返回真实可追溯来源，不要编造链接。

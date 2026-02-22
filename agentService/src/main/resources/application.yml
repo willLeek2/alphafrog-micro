@@ -29,6 +29,10 @@ dubbo:
     check: false
 
 agent:
+  search:
+    # 本地搜索配置（可选），支持热加载
+    config-file: ${AF_AGENT_SEARCH_CONFIG_FILE:}
+    config-refresh-interval-ms: ${AF_AGENT_SEARCH_CONFIG_REFRESH_INTERVAL_MS:10000}
   run:
     interrupted-ttl-days: ${AF_AGENT_RUN_INTERRUPTED_TTL_DAYS:7}
     checkpoint-version: ${AF_AGENT_RUN_CHECKPOINT_VERSION:v2}

@@ -57,6 +57,9 @@ import world.willfrog.alphafrogmicro.agent.idl.ListAgentMessagesResponse;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunMessageItem;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRetentionConfigMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentFeatureConfigMessage;
+import world.willfrog.alphafrogmicro.agent.idl.GetTodayMarketNewsRequest;
+import world.willfrog.alphafrogmicro.agent.idl.GetTodayMarketNewsResponse;
+import world.willfrog.alphafrogmicro.agent.idl.MarketNewsItemMessage;
 import world.willfrog.alphafrogmicro.common.dao.user.UserDao;
 import world.willfrog.alphafrogmicro.common.pojo.user.User;
 
@@ -86,6 +89,7 @@ public class AgentDubboServiceImpl extends DubboAgentDubboServiceTriple.AgentDub
     private final UserDao userDao;
     private final ObjectMapper objectMapper;
     private final AgentMessageService messageService;
+    private final MarketNewsService marketNewsService;
 
     @Value("${agent.run.list.default-days:30}")
     private int listDefaultDays;
@@ -919,6 +923,38 @@ public class AgentDubboServiceImpl extends DubboAgentDubboServiceTriple.AgentDub
         } catch (Exception e) {
             throw new IllegalArgumentException("invalid status filter: " + status);
         }
+    }
+
+    @Override
+    public GetTodayMarketNewsResponse getTodayMarketNews(GetTodayMarketNewsRequest request) {
+        String userId = request.getUserId();
+        if (userId == null || userId.isBlank()) {
+            throw new IllegalArgumentException("user_id is required");
+        }
+        var result = marketNewsService.getTodayNews(
+                request.getProvider(),
+                request.getMarket(),
+                request.getLanguage(),
+                request.getLimit(),
+                request.getStartPublishedAt(),
+                request.getEndPublishedAt()
+        );
+        GetTodayMarketNewsResponse.Builder builder = GetTodayMarketNewsResponse.newBuilder()
+                .setUpdatedAt(nvl(result.updatedAt()))
+                .setProvider(nvl(result.provider()));
+        for (var item : result.items()) {
+            builder.addData(MarketNewsItemMessage.newBuilder()
+                    .setId(nvl(item.id()))
+                    .setTimestamp(nvl(item.timestamp()))
+                    .setTitle(nvl(item.title()))
+                    .setSource(nvl(item.source()))
+                    .setCategory(nvl(item.category()))
+                    .setUrl(nvl(item.url()))
+                    .setSummary(nvl(item.summary()))
+                    .setProvider(nvl(item.provider()))
+                    .build());
+        }
+        return builder.build();
     }
 
     private world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage toRunMessage(AgentRun run) {

@@ -1,0 +1,38 @@
+{
+  "enabled": true,
+  "defaultProvider": "exa",
+  "defaultLimit": 10,
+  "defaultLanguage": "zh",
+  "connectTimeoutMillis": 10000,
+  "requestTimeoutMillis": 30000,
+  "prompts": {
+    "marketNewsUserTemplate": "file:prompts/search/market_news_user_template.txt"
+  },
+  "providers": {
+    "exa": {
+      "type": "exa-search",
+      "endpoint": "https://api.exa.ai/search",
+      "apiKey": "${EXA_API_KEY}",
+      "searchMode": "auto",
+      "category": "news",
+      "maxResults": 10
+    },
+    "perplexity": {
+      "type": "perplexity-search",
+      "endpoint": "https://api.perplexity.ai/search",
+      "apiKey": "${PERPLEXITY_API_KEY}",
+      "searchRecencyFilter": "day",
+      "country": "CN",
+      "maxResults": 10
+    },
+    "perplexity_sonar": {
+      "type": "perplexity-sonar",
+      "endpoint": "https://api.perplexity.ai/chat/completions",
+      "apiKey": "${PERPLEXITY_API_KEY}",
+      "model": "sonar-pro",
+      "searchMode": "web",
+      "searchRecencyFilter": "day",
+      "maxResults": 10
+    }
+  }
+}
