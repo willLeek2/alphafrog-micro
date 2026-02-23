@@ -104,7 +104,7 @@ public class MarketNewsController {
         String[] parts = language.split(",");
         List<String> languages = new ArrayList<>();
         for (String part : parts) {
-            if (part != null && !part.isBlank()) {
+            if (!part.isBlank()) {
                 languages.add(part.trim());
             }
         }

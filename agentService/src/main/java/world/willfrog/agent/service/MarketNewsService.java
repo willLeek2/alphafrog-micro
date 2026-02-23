@@ -46,7 +46,7 @@ public class MarketNewsService {
         String providerName = resolveProviderName(query.provider(), local);
         SearchLlmProperties.Provider provider = resolveProvider(providerName, local);
         if (provider == null || isBlank(provider.getBaseUrl())) {
-            throw new IllegalArgumentException("search provider 未配置: " + providerName);
+            throw new IllegalArgumentException("search provider not configured: " + providerName);
         }
 
         int limit = query.limit() > 0 ? query.limit() : defaultLimit(marketNews);
@@ -352,7 +352,7 @@ public class MarketNewsService {
             }
         }
         if (unique.isEmpty()) {
-            throw new IllegalStateException("market news query is empty");
+            throw new IllegalStateException("market news query configuration is empty");
         }
         return String.join(" OR ", unique);
     }
