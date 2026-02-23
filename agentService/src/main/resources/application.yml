@@ -264,7 +264,7 @@ agent:
         sector: ${AF_AGENT_SEARCH_MARKET_NEWS_KEYWORDS_SECTOR:行业,板块,龙头}
         market: ${AF_AGENT_SEARCH_MARKET_NEWS_KEYWORDS_MARKET:A股,沪深,指数,开盘}
     prompts:
-      market-news-query-template: ${AF_AGENT_SEARCH_MARKET_NEWS_PROMPT:}
+      market-news-query-template: ${AF_AGENT_SEARCH_PROMPTS_MARKET_NEWS_QUERY_TEMPLATE:}
   tools:
     market-data:
       dataset:

@@ -441,6 +441,7 @@ public class MarketNewsService {
         if (title == null || title.isBlank()) {
             return false;
         }
+        // 覆盖 CJK Unified Ideographs Extension A (0x3400-0x4DBF) 与基础区 (0x4E00-0x9FFF)。
         boolean hasChinese = title.codePoints().anyMatch(ch ->
                 (ch >= 0x3400 && ch <= 0x4dbf) || (ch >= 0x4e00 && ch <= 0x9fff)
         );
@@ -486,18 +487,19 @@ public class MarketNewsService {
         try {
             return OffsetDateTime.parse(raw);
         } catch (Exception ignore) {
-            // ignore
+            log.debug("Failed to parse as OffsetDateTime: {}", raw, ignore);
         }
         try {
             LocalDateTime local = LocalDateTime.parse(raw, DateTimeFormatter.ISO_LOCAL_DATE_TIME);
             return local.atOffset(ZoneOffset.UTC);
         } catch (Exception ignore) {
-            // ignore
+            log.debug("Failed to parse as LocalDateTime: {}", raw, ignore);
         }
         try {
             LocalDate date = LocalDate.parse(raw, DateTimeFormatter.ISO_LOCAL_DATE);
             return date.atStartOfDay().atOffset(ZoneOffset.UTC);
         } catch (Exception ignore) {
+            log.debug("Failed to parse as LocalDate: {}", raw, ignore);
             return null;
         }
     }
