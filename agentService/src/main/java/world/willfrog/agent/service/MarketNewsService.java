@@ -338,7 +338,7 @@ public class MarketNewsService {
     }
 
     private String resolveQueryText(SearchLlmProperties.MarketNews marketNews, SearchLlmProperties.Prompts prompts) {
-        if (prompts != null && hasText(prompts.getMarketNewsQueryTemplate()) && isEmpty(marketNews.getQueries())) {
+        if (prompts != null && hasText(prompts.getMarketNewsQueryTemplate())) {
             return prompts.getMarketNewsQueryTemplate().trim();
         }
         List<String> queries = marketNews.getQueries();
@@ -416,7 +416,12 @@ public class MarketNewsService {
         OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
         OffsetDateTime start = startTime == null ? now.minusDays(1) : startTime;
         OffsetDateTime end = endTime == null ? now : endTime;
-        long days = Math.abs(Duration.between(start, end).toDays());
+        if (start.isAfter(end)) {
+            OffsetDateTime tmp = start;
+            start = end;
+            end = tmp;
+        }
+        long days = Math.max(1, Duration.between(start, end).toDays());
         if (days <= 1) {
             return "day";
         }
@@ -450,7 +455,7 @@ public class MarketNewsService {
                     return true;
                 }
             } else if (normalized.startsWith("en")) {
-                if (hasLatin && !hasChinese) {
+                if (hasLatin) {
                     return true;
                 }
             } else {

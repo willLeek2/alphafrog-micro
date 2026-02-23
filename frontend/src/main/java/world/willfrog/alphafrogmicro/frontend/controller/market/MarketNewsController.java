@@ -77,7 +77,7 @@ public class MarketNewsController {
             );
             return ResponseWrapper.success(body);
         } catch (RpcException e) {
-            log.error("查询市场新闻失败: {}", e.getMessage());
+            log.error("查询市场新闻失败: {}", e.getMessage(), e);
             return ResponseWrapper.error(ResponseCode.EXTERNAL_SERVICE_ERROR, "查询市场新闻失败");
         } catch (Exception e) {
             log.error("查询市场新闻失败", e);
