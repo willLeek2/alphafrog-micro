@@ -1,0 +1,24 @@
+{
+  "defaultProvider": "exa",
+  "maxDefaultResults": 10,
+  "providers": {
+    "exa": {
+      "baseUrl": "https://api.exa.ai",
+      "apiKey": "replace-with-your-exa-api-key",
+      "type": "auto",
+      "category": "news",
+      "country": "CN",
+      "includeDomains": ["sina.com.cn", "eastmoney.com", "cls.cn", "wallstreetcn.com"]
+    },
+    "perplexity": {
+      "baseUrl": "https://api.perplexity.ai",
+      "apiKey": "replace-with-your-perplexity-api-key",
+      "country": "CN",
+      "recencyFilter": "day",
+      "includeDomains": ["sina.com.cn", "eastmoney.com", "cls.cn", "yicai.com"]
+    }
+  },
+  "prompts": {
+    "marketNewsQueryTemplate": "file:prompts/search/market_news_query.txt"
+  }
+}

@@ -212,9 +212,11 @@ psql -h your_host -U your_user -d alphafrog -f alphafrog_schema_full.sql
 ```bash
 # 复制示例配置
 cp agentService/config/agent-llm.local.example.json agentService/config/agent-llm.local.json
+cp agentService/config/search-llm.local.example.json agentService/config/search-llm.local.json
 
 # 编辑配置，填入您的 API Keys
 vim agentService/config/agent-llm.local.json
+vim agentService/config/search-llm.local.json
 ```
 
 #### 4. 构建并启动

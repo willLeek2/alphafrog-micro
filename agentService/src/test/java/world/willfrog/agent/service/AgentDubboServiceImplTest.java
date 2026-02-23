@@ -16,6 +16,7 @@ import world.willfrog.alphafrogmicro.agent.idl.GetAgentConfigRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentConfigResponse;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentCreditsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunStatusRequest;
+import world.willfrog.alphafrogmicro.agent.idl.GetTodayMarketNewsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentRunsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentModelsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ResumeAgentRunRequest;
@@ -62,6 +63,8 @@ class AgentDubboServiceImplTest {
     private UserDao userDao;
     @Mock
     private AgentMessageService messageService;
+    @Mock
+    private MarketNewsService marketNewsService;
 
     private AgentDubboServiceImpl service;
 
@@ -80,7 +83,8 @@ class AgentDubboServiceImplTest {
                 creditService,
                 userDao,
                 new ObjectMapper(),
-                messageService
+                messageService,
+                marketNewsService
         );
         ReflectionTestUtils.setField(service, "checkpointVersion", "v2");
         ReflectionTestUtils.setField(service, "artifactRetentionNormalDays", 7);
@@ -255,5 +259,35 @@ class AgentDubboServiceImplTest {
         assertEquals("app-1", resp.getApplicationId());
         assertEquals(5000, resp.getTotalCredits());
         assertEquals("PENDING", resp.getStatus());
+    }
+
+    @Test
+    void getTodayMarketNews_shouldMapResult() {
+        when(marketNewsService.getTodayMarketNews("exa", "zh", 5, "", "")).thenReturn(
+                new MarketNewsService.TodayMarketNewsResult(
+                        List.of(new MarketNewsService.MarketNewsItem(
+                                "news_001",
+                                "2026-02-13T09:30:00+08:00",
+                                "沪深300指数开盘上涨 0.5%",
+                                "新浪财经",
+                                "market",
+                                "https://example.com/news_001"
+                        )),
+                        "2026-02-13T09:30:00+08:00",
+                        "exa"
+                )
+        );
+
+        var resp = service.getTodayMarketNews(GetTodayMarketNewsRequest.newBuilder()
+                .setUserId("u1")
+                .setProvider("exa")
+                .setLanguage("zh")
+                .setLimit(5)
+                .build());
+
+        assertEquals(1, resp.getDataCount());
+        assertEquals("news_001", resp.getData(0).getId());
+        assertEquals("exa", resp.getProvider());
+        assertEquals("2026-02-13T09:30:00+08:00", resp.getUpdatedAt());
     }
 }

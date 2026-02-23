@@ -32,6 +32,8 @@ import world.willfrog.alphafrogmicro.agent.idl.ExportAgentRunResponse;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentConfigRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentCreditsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentCreditsResponse;
+import world.willfrog.alphafrogmicro.agent.idl.GetTodayMarketNewsRequest;
+import world.willfrog.alphafrogmicro.agent.idl.GetTodayMarketNewsResponse;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunResultRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunStatusRequest;
@@ -46,6 +48,7 @@ import world.willfrog.alphafrogmicro.agent.idl.ListAgentRunsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentRunsResponse;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentToolsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentToolsResponse;
+import world.willfrog.alphafrogmicro.agent.idl.MarketNewsItemMessage;
 import world.willfrog.alphafrogmicro.agent.idl.PauseAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ResumeAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.SubmitAgentFeedbackRequest;
@@ -86,6 +89,7 @@ public class AgentDubboServiceImpl extends DubboAgentDubboServiceTriple.AgentDub
     private final UserDao userDao;
     private final ObjectMapper objectMapper;
     private final AgentMessageService messageService;
+    private final MarketNewsService marketNewsService;
 
     @Value("${agent.run.list.default-days:30}")
     private int listDefaultDays;
@@ -592,6 +596,34 @@ public class AgentDubboServiceImpl extends DubboAgentDubboServiceTriple.AgentDub
                 .setStatus(nvl(summary.status()))
                 .setAppliedAt(nvl(summary.appliedAt()))
                 .build();
+    }
+
+    @Override
+    public GetTodayMarketNewsResponse getTodayMarketNews(GetTodayMarketNewsRequest request) {
+        if (request.getUserId() == null || request.getUserId().isBlank()) {
+            throw new IllegalArgumentException("user_id is required");
+        }
+        MarketNewsService.TodayMarketNewsResult result = marketNewsService.getTodayMarketNews(
+                request.getProvider(),
+                request.getLanguage(),
+                request.getLimit(),
+                request.getStartPublishedDate(),
+                request.getEndPublishedDate()
+        );
+        GetTodayMarketNewsResponse.Builder response = GetTodayMarketNewsResponse.newBuilder()
+                .setUpdatedAt(nvl(result.updatedAt()))
+                .setProvider(nvl(result.provider()));
+        for (MarketNewsService.MarketNewsItem item : result.data()) {
+            response.addData(MarketNewsItemMessage.newBuilder()
+                    .setId(nvl(item.id()))
+                    .setTimestamp(nvl(item.timestamp()))
+                    .setTitle(nvl(item.title()))
+                    .setSource(nvl(item.source()))
+                    .setCategory(nvl(item.category()))
+                    .setUrl(nvl(item.url()))
+                    .build());
+        }
+        return response.build();
     }
 
     /**

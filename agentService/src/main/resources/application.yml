@@ -228,6 +228,25 @@ agent:
         max-attempts: ${AF_AGENT_RUNTIME_JUDGE_MAX_ATTEMPTS:2}
         fail-open: ${AF_AGENT_RUNTIME_JUDGE_FAIL_OPEN:true}
         block-on-insufficient-evidence: ${AF_AGENT_RUNTIME_JUDGE_BLOCK_ON_INSUFFICIENT_EVIDENCE:false}
+  search-llm:
+    config-file: ${AF_AGENT_SEARCH_LLM_CONFIG_FILE:}
+    config-refresh-interval-ms: ${AF_AGENT_SEARCH_LLM_CONFIG_REFRESH_INTERVAL_MS:10000}
+    default-provider: ${AF_AGENT_SEARCH_DEFAULT_PROVIDER:exa}
+    max-default-results: ${AF_AGENT_SEARCH_MAX_DEFAULT_RESULTS:10}
+    providers:
+      exa:
+        base-url: ${AF_AGENT_SEARCH_EXA_BASE_URL:https://api.exa.ai}
+        api-key: ${AF_AGENT_SEARCH_EXA_API_KEY:}
+        type: ${AF_AGENT_SEARCH_EXA_TYPE:auto}
+        category: ${AF_AGENT_SEARCH_EXA_CATEGORY:news}
+        country: ${AF_AGENT_SEARCH_COUNTRY:CN}
+      perplexity:
+        base-url: ${AF_AGENT_SEARCH_PERPLEXITY_BASE_URL:https://api.perplexity.ai}
+        api-key: ${AF_AGENT_SEARCH_PERPLEXITY_API_KEY:}
+        recency-filter: ${AF_AGENT_SEARCH_PERPLEXITY_RECENCY_FILTER:day}
+        country: ${AF_AGENT_SEARCH_COUNTRY:CN}
+    prompts:
+      market-news-query-template: ${AF_AGENT_SEARCH_MARKET_NEWS_QUERY:今日A股市场实时动态、政策/央行公告、美股/全球市场要闻、行业板块热点}
   tools:
     market-data:
       dataset:
