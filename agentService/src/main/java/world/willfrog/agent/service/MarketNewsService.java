@@ -32,6 +32,12 @@ import java.util.UUID;
 @Slf4j
 public class MarketNewsService {
 
+    private static final int LANGUAGE_DETECTION_SAMPLE_LENGTH = 120;
+    private static final int CJK_EXT_A_START = 0x3400;
+    private static final int CJK_EXT_A_END = 0x4DBF;
+    private static final int CJK_UNIFIED_START = 0x4E00;
+    private static final int CJK_UNIFIED_END = 0x9FFF;
+
     private final ObjectMapper objectMapper;
     private final SearchLlmProperties properties;
     private final SearchLlmLocalConfigLoader localConfigLoader;
@@ -422,7 +428,7 @@ public class MarketNewsService {
             end = tmp;
         }
         // Perplexity recency filter only supports day/week/month/year granularity, so sub-day ranges are rounded up.
-        long days = Math.max(1, Duration.between(start, end).toDays());
+        long days = Duration.between(start, end).toDays();
         if (days <= 1) {
             return "day";
         }
@@ -443,9 +449,12 @@ public class MarketNewsService {
             return false;
         }
         // 覆盖 CJK Unified Ideographs Extension A (0x3400-0x4DBF) 与基础区 (0x4E00-0x9FFF)。
-        String sample = title.length() > 120 ? title.substring(0, 120) : title;
+        String sample = title.length() > LANGUAGE_DETECTION_SAMPLE_LENGTH
+                ? title.substring(0, LANGUAGE_DETECTION_SAMPLE_LENGTH)
+                : title;
         boolean hasChinese = sample.codePoints().anyMatch(ch ->
-                (ch >= 0x3400 && ch <= 0x4dbf) || (ch >= 0x4e00 && ch <= 0x9fff)
+                (ch >= CJK_EXT_A_START && ch <= CJK_EXT_A_END)
+                        || (ch >= CJK_UNIFIED_START && ch <= CJK_UNIFIED_END)
         );
         boolean hasLatin = sample.codePoints().anyMatch(ch -> (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z'));
         for (String lang : languages) {
