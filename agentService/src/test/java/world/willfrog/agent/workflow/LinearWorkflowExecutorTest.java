@@ -260,7 +260,7 @@ class LinearWorkflowExecutorTest {
 
         ChatLanguageModel staticFixModel = mock(ChatLanguageModel.class);
         when(aiServiceFactory.resolveLlm("openrouter", "openai/gpt-5.2")).thenReturn(
-                new AgentLlmResolver.ResolvedLlm("openrouter", "https://openrouter.ai/api/v1", "openai/gpt-5.2", "k")
+                new AgentLlmResolver.ResolvedLlm("openrouter", "https://openrouter.ai/api/v1", "openai/gpt-5.2", "k", null)
         );
         when(aiServiceFactory.buildChatModelWithProviderOrderAndTemperature(any(), any(), any())).thenReturn(staticFixModel);
         Response<AiMessage> staticFixRecoveryResponse = mockResponse("{\"params\":{\"dataset_id\":\"d1\",\"code\":\"print(1)\"}}");
