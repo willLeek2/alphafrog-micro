@@ -228,6 +228,37 @@ agent:
         max-attempts: ${AF_AGENT_RUNTIME_JUDGE_MAX_ATTEMPTS:2}
         fail-open: ${AF_AGENT_RUNTIME_JUDGE_FAIL_OPEN:true}
         block-on-insufficient-evidence: ${AF_AGENT_RUNTIME_JUDGE_BLOCK_ON_INSUFFICIENT_EVIDENCE:false}
+  search-llm:
+    config-file: ${AF_AGENT_SEARCH_LLM_CONFIG_FILE:}
+    config-refresh-interval-ms: ${AF_AGENT_SEARCH_LLM_CONFIG_REFRESH_INTERVAL_MS:10000}
+    default-provider: ${AF_AGENT_SEARCH_LLM_DEFAULT_PROVIDER:perplexity}
+    default-limit: ${AF_AGENT_SEARCH_LLM_DEFAULT_LIMIT:8}
+    default-language: ${AF_AGENT_SEARCH_LLM_DEFAULT_LANGUAGE:zh}
+    providers:
+      perplexity:
+        type: perplexity_search
+        base-url: ${AF_AGENT_SEARCH_LLM_PPLX_BASE_URL:https://api.perplexity.ai}
+        api-key: ${AF_AGENT_SEARCH_LLM_PPLX_API_KEY:}
+        search-path: ${AF_AGENT_SEARCH_LLM_PPLX_SEARCH_PATH:/search}
+        default-recency: ${AF_AGENT_SEARCH_LLM_PPLX_RECENCY:day}
+        default-languages: ${AF_AGENT_SEARCH_LLM_PPLX_LANGUAGES:zh}
+        default-domains: ${AF_AGENT_SEARCH_LLM_PPLX_DOMAINS:}
+        country: ${AF_AGENT_SEARCH_LLM_PPLX_COUNTRY:CN}
+        max-results: ${AF_AGENT_SEARCH_LLM_PPLX_MAX_RESULTS:10}
+      exa:
+        type: exa_search
+        base-url: ${AF_AGENT_SEARCH_LLM_EXA_BASE_URL:https://api.exa.ai}
+        api-key: ${AF_AGENT_SEARCH_LLM_EXA_API_KEY:}
+        search-path: ${AF_AGENT_SEARCH_LLM_EXA_SEARCH_PATH:/search}
+        default-category: ${AF_AGENT_SEARCH_LLM_EXA_CATEGORY:news}
+        default-type: ${AF_AGENT_SEARCH_LLM_EXA_TYPE:auto}
+        default-languages: ${AF_AGENT_SEARCH_LLM_EXA_LANGUAGES:zh}
+        default-domains: ${AF_AGENT_SEARCH_LLM_EXA_DOMAINS:}
+        user-location: ${AF_AGENT_SEARCH_LLM_EXA_USER_LOCATION:CN}
+        max-results: ${AF_AGENT_SEARCH_LLM_EXA_MAX_RESULTS:10}
+    prompts:
+      market-news-query: ${AF_AGENT_SEARCH_LLM_PROMPT_MARKET_NEWS_QUERY:}
+      market-news-fallback: ${AF_AGENT_SEARCH_LLM_PROMPT_MARKET_NEWS_FALLBACK:}
   tools:
     market-data:
       dataset:

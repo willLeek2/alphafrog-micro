@@ -11,6 +11,9 @@ import world.willfrog.agent.entity.AgentRunMessage;
 import world.willfrog.agent.mapper.AgentRunEventMapper;
 import world.willfrog.agent.mapper.AgentRunMapper;
 import world.willfrog.agent.model.AgentRunStatus;
+import world.willfrog.agent.model.MarketNewsModels.MarketNewsItem;
+import world.willfrog.agent.model.MarketNewsModels.MarketNewsQuery;
+import world.willfrog.agent.model.MarketNewsModels.MarketNewsResult;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunListItemMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunEventMessage;
 
@@ -30,6 +33,8 @@ import world.willfrog.alphafrogmicro.agent.idl.DubboAgentDubboServiceTriple;
 import world.willfrog.alphafrogmicro.agent.idl.ExportAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ExportAgentRunResponse;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentConfigRequest;
+import world.willfrog.alphafrogmicro.agent.idl.GetTodayMarketNewsRequest;
+import world.willfrog.alphafrogmicro.agent.idl.GetTodayMarketNewsResponse;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentCreditsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentCreditsResponse;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunRequest;
@@ -57,6 +62,7 @@ import world.willfrog.alphafrogmicro.agent.idl.ListAgentMessagesResponse;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunMessageItem;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRetentionConfigMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentFeatureConfigMessage;
+import world.willfrog.alphafrogmicro.agent.idl.MarketNewsItemMessage;
 import world.willfrog.alphafrogmicro.common.dao.user.UserDao;
 import world.willfrog.alphafrogmicro.common.pojo.user.User;
 
@@ -86,6 +92,7 @@ public class AgentDubboServiceImpl extends DubboAgentDubboServiceTriple.AgentDub
     private final UserDao userDao;
     private final ObjectMapper objectMapper;
     private final AgentMessageService messageService;
+    private final MarketNewsService marketNewsService;
 
     @Value("${agent.run.list.default-days:30}")
     private int listDefaultDays;
@@ -786,6 +793,37 @@ public class AgentDubboServiceImpl extends DubboAgentDubboServiceTriple.AgentDub
         return builder.build();
     }
 
+    @Override
+    public GetTodayMarketNewsResponse getTodayMarketNews(GetTodayMarketNewsRequest request) {
+        String userId = request.getUserId();
+        if (userId == null || userId.isBlank()) {
+            throw new IllegalArgumentException("user_id is required");
+        }
+        ensureUserActive(userId);
+        MarketNewsQuery query = new MarketNewsQuery(
+                request.getLimit() > 0 ? request.getLimit() : null,
+                blankToNull(request.getProvider()),
+                blankToNull(request.getLanguage()),
+                blankToNull(request.getStartPublishedDate()),
+                blankToNull(request.getEndPublishedDate())
+        );
+        MarketNewsResult result = marketNewsService.getTodayMarketNews(query);
+        GetTodayMarketNewsResponse.Builder builder = GetTodayMarketNewsResponse.newBuilder()
+                .setProvider(nvl(result.provider()))
+                .setUpdatedAt(nvl(result.updatedAt()));
+        for (MarketNewsItem item : result.items()) {
+            builder.addData(MarketNewsItemMessage.newBuilder()
+                    .setId(nvl(item.id()))
+                    .setTimestamp(nvl(item.timestamp()))
+                    .setTitle(nvl(item.title()))
+                    .setSource(nvl(item.source()))
+                    .setCategory(nvl(item.category()))
+                    .setUrl(nvl(item.url()))
+                    .build());
+        }
+        return builder.build();
+    }
+
     private AgentRun requireRun(String id, String userId) {
         if (id == null || id.isBlank()) {
             throw new IllegalArgumentException("id is required");
@@ -851,6 +889,14 @@ public class AgentDubboServiceImpl extends DubboAgentDubboServiceTriple.AgentDub
         } catch (Exception e) {
             return "{}";
         }
+    }
+
+    private String blankToNull(String value) {
+        if (value == null) {
+            return null;
+        }
+        String normalized = value.trim();
+        return normalized.isEmpty() ? null : normalized;
     }
 
     private String normalizeTitle(String title) {

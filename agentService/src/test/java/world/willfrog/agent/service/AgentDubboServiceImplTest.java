@@ -12,10 +12,12 @@ import world.willfrog.agent.entity.AgentRunEvent;
 import world.willfrog.agent.mapper.AgentRunEventMapper;
 import world.willfrog.agent.mapper.AgentRunMapper;
 import world.willfrog.agent.model.AgentRunStatus;
+import world.willfrog.agent.model.MarketNewsModels;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentConfigRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentConfigResponse;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentCreditsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunStatusRequest;
+import world.willfrog.alphafrogmicro.agent.idl.GetTodayMarketNewsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentRunsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentModelsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ResumeAgentRunRequest;
@@ -27,6 +29,7 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
@@ -62,6 +65,8 @@ class AgentDubboServiceImplTest {
     private UserDao userDao;
     @Mock
     private AgentMessageService messageService;
+    @Mock
+    private MarketNewsService marketNewsService;
 
     private AgentDubboServiceImpl service;
 
@@ -80,7 +85,8 @@ class AgentDubboServiceImplTest {
                 creditService,
                 userDao,
                 new ObjectMapper(),
-                messageService
+                messageService,
+                marketNewsService
         );
         ReflectionTestUtils.setField(service, "checkpointVersion", "v2");
         ReflectionTestUtils.setField(service, "artifactRetentionNormalDays", 7);
@@ -96,6 +102,10 @@ class AgentDubboServiceImplTest {
                 org.mockito.ArgumentMatchers.anyList(),
                 org.mockito.ArgumentMatchers.anyString()
         )).thenReturn(0);
+        world.willfrog.alphafrogmicro.common.pojo.user.User active = new world.willfrog.alphafrogmicro.common.pojo.user.User();
+        active.setUserId(1L);
+        active.setStatus("ACTIVE");
+        lenient().when(userDao.getUserById(org.mockito.ArgumentMatchers.anyLong())).thenReturn(active);
     }
 
     @Test
@@ -255,5 +265,32 @@ class AgentDubboServiceImplTest {
         assertEquals("app-1", resp.getApplicationId());
         assertEquals(5000, resp.getTotalCredits());
         assertEquals("PENDING", resp.getStatus());
+    }
+
+    @Test
+    void getTodayMarketNews_shouldMapResponse() {
+        MarketNewsModels.MarketNewsItem item = new MarketNewsModels.MarketNewsItem(
+                "news_001",
+                "2026-02-13T09:30:00+08:00",
+                "test title",
+                "sina.com.cn",
+                "market",
+                "https://example.com/news"
+        );
+        when(marketNewsService.getTodayMarketNews(any()))
+                .thenReturn(new MarketNewsModels.MarketNewsResult(List.of(item), "perplexity", "2026-02-13T09:35:00+08:00"));
+
+        var resp = service.getTodayMarketNews(GetTodayMarketNewsRequest.newBuilder()
+                .setUserId("1")
+                .setLimit(5)
+                .setProvider("perplexity")
+                .setLanguage("zh")
+                .build());
+
+        assertEquals("perplexity", resp.getProvider());
+        assertEquals("2026-02-13T09:35:00+08:00", resp.getUpdatedAt());
+        assertEquals(1, resp.getDataCount());
+        assertEquals("test title", resp.getData(0).getTitle());
+        assertEquals("https://example.com/news", resp.getData(0).getUrl());
     }
 }

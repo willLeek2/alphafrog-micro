@@ -1,0 +1,47 @@
+{
+  "defaultProvider": "perplexity",
+  "defaultLimit": 8,
+  "defaultLanguage": "zh",
+  "providers": {
+    "perplexity": {
+      "type": "perplexity_search",
+      "baseUrl": "https://api.perplexity.ai",
+      "apiKey": "replace-with-perplexity-api-key",
+      "searchPath": "/search",
+      "defaultRecency": "day",
+      "defaultLanguages": [
+        "zh"
+      ],
+      "defaultDomains": [
+        "sina.com.cn",
+        "cls.cn",
+        "yicai.com"
+      ],
+      "country": "CN",
+      "maxResults": 10,
+      "maxTokensPerPage": 1024
+    },
+    "exa": {
+      "type": "exa_search",
+      "baseUrl": "https://api.exa.ai",
+      "apiKey": "replace-with-exa-api-key",
+      "searchPath": "/search",
+      "defaultCategory": "news",
+      "defaultType": "auto",
+      "defaultLanguages": [
+        "zh"
+      ],
+      "defaultDomains": [
+        "sina.com.cn",
+        "eastmoney.com",
+        "cls.cn"
+      ],
+      "userLocation": "CN",
+      "maxResults": 12
+    }
+  },
+  "prompts": {
+    "marketNewsQuery": "file:prompts/search/market_news_query.txt",
+    "marketNewsFallback": "今日市场新闻 宏观政策 央行公告 全球市场"
+  }
+}

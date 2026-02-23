@@ -331,6 +331,30 @@ message ListAgentMessagesResponse {
   bool has_more = 3;
 }
 
+message MarketNewsItemMessage {
+  string id = 1;
+  string timestamp = 2;
+  string title = 3;
+  string source = 4;
+  string category = 5;
+  string url = 6;
+}
+
+message GetTodayMarketNewsRequest {
+  string user_id = 1;
+  int32 limit = 2;
+  string provider = 3;
+  string language = 4;
+  string start_published_date = 5;
+  string end_published_date = 6;
+}
+
+message GetTodayMarketNewsResponse {
+  repeated MarketNewsItemMessage data = 1;
+  string updated_at = 2;
+  string provider = 3;
+}
+
 service AgentDubboService {
   rpc CreateRun(CreateAgentRunRequest) returns (AgentRunMessage);
   rpc GetRun(GetAgentRunRequest) returns (AgentRunMessage);
@@ -354,4 +378,5 @@ service AgentDubboService {
   rpc ExportRun(ExportAgentRunRequest) returns (ExportAgentRunResponse);
   rpc SendMessage(SendAgentMessageRequest) returns (SendAgentMessageResponse);
   rpc ListMessages(ListAgentMessagesRequest) returns (ListAgentMessagesResponse);
+  rpc GetTodayMarketNews(GetTodayMarketNewsRequest) returns (GetTodayMarketNewsResponse);
 }
