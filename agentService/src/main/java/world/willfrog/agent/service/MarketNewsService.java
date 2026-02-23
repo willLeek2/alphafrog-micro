@@ -34,6 +34,8 @@ public class MarketNewsService {
     private static final int MAX_LIMIT = 20;
     private static final int MIN_LIMIT = 1;
 
+    private final HttpClient httpClient = HttpClient.newHttpClient();
+
     private final SearchLlmProperties properties;
     private final SearchLlmLocalConfigLoader localConfigLoader;
     private final ObjectMapper objectMapper;
@@ -183,13 +185,12 @@ public class MarketNewsService {
     }
 
     private String postJson(URI uri, String authHeader, String authValue, String payload) throws Exception {
-        HttpClient client = HttpClient.newHttpClient();
         HttpRequest request = HttpRequest.newBuilder(uri)
                 .header("Content-Type", "application/json")
                 .header(authHeader, authValue)
                 .POST(HttpRequest.BodyPublishers.ofString(payload, StandardCharsets.UTF_8))
                 .build();
-        HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
         if (response.statusCode() >= 400) {
             throw new IllegalStateException("market news provider request failed, status=" + response.statusCode());
         }
@@ -276,11 +277,11 @@ public class MarketNewsService {
 
     private String buildQuery(SearchLlmProperties cfg, String language) {
         String template = cfg == null || cfg.getPrompts() == null ? null : cfg.getPrompts().getMarketNewsQueryTemplate();
-        String query = fallback(template, "今日A股市场实时动态、政策、全球市场与行业热点");
+        String query = fallback(template, "今日A股市场实时动态、政策/央行公告、美股/全球市场要闻、行业板块热点");
         if (isBlank(language)) {
             return query;
         }
-        return query + "，请优先返回" + language + "内容";
+        return query + ". Preferred output language: " + language;
     }
 
     private String sourceFromUrl(String url) {

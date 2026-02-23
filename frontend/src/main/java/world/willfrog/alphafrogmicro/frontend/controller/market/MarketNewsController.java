@@ -47,10 +47,10 @@ public class MarketNewsController {
             var response = agentDubboService.getTodayMarketNews(GetTodayMarketNewsRequest.newBuilder()
                     .setUserId(userId)
                     .setLimit(limit)
-                    .setProvider(provider == null ? "" : provider)
-                    .setLanguage(language == null ? "" : language)
-                    .setStartPublishedDate(startPublishedDate == null ? "" : startPublishedDate)
-                    .setEndPublishedDate(endPublishedDate == null ? "" : endPublishedDate)
+                    .setProvider(provider)
+                    .setLanguage(language)
+                    .setStartPublishedDate(startPublishedDate)
+                    .setEndPublishedDate(endPublishedDate)
                     .build());
             List<MarketNewsItemResponse> items = new ArrayList<>();
             for (var item : response.getDataList()) {
