@@ -21,6 +21,7 @@ import world.willfrog.alphafrogmicro.frontend.model.market.MarketNewsResponse;
 import world.willfrog.alphafrogmicro.frontend.service.AuthService;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 @RestController
@@ -101,14 +102,10 @@ public class MarketNewsController {
         if (language == null || language.isBlank()) {
             return List.of();
         }
-        String[] parts = language.split(",");
-        List<String> languages = new ArrayList<>();
-        for (String part : parts) {
-            if (!part.isBlank()) {
-                languages.add(part.trim());
-            }
-        }
-        return languages;
+        return Arrays.stream(language.split(","))
+                .map(String::trim)
+                .filter(part -> !part.isBlank())
+                .toList();
     }
 
     private int resolveLimit(Integer limit) {

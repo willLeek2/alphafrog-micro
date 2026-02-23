@@ -421,6 +421,7 @@ public class MarketNewsService {
             start = end;
             end = tmp;
         }
+        // Perplexity recency filter only supports day/week/month/year granularity, so sub-day ranges are rounded up.
         long days = Math.max(1, Duration.between(start, end).toDays());
         if (days <= 1) {
             return "day";
@@ -442,10 +443,11 @@ public class MarketNewsService {
             return false;
         }
         // 覆盖 CJK Unified Ideographs Extension A (0x3400-0x4DBF) 与基础区 (0x4E00-0x9FFF)。
-        boolean hasChinese = title.codePoints().anyMatch(ch ->
+        String sample = title.length() > 120 ? title.substring(0, 120) : title;
+        boolean hasChinese = sample.codePoints().anyMatch(ch ->
                 (ch >= 0x3400 && ch <= 0x4dbf) || (ch >= 0x4e00 && ch <= 0x9fff)
         );
-        boolean hasLatin = title.codePoints().anyMatch(ch -> (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z'));
+        boolean hasLatin = sample.codePoints().anyMatch(ch -> (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z'));
         for (String lang : languages) {
             if (!hasText(lang)) {
                 continue;

@@ -89,14 +89,16 @@ public class SearchLlmLocalConfigLoader {
                     SearchLlmProperties parsed = objectMapper.readValue(in, SearchLlmProperties.class);
                     SearchLlmProperties sanitized = sanitize(parsed);
                     Map<String, Long> promptFileTimes = resolvePromptFiles(sanitized, path.getParent());
+                    int providerCount = sanitized.getProviders().size();
+                    int queryCount = sanitized.getMarketNews().getQueries().size();
                     this.localConfig = sanitized;
                     this.loadedConfigPath = normalizedPath;
                     this.loadedConfigLastModified = currentModified;
                     this.loadedPromptFileModifiedTimes = promptFileTimes;
                     log.info("Loaded local search config from {} (providers={}, queries={})",
                             path,
-                            sanitized.getProviders().size(),
-                            sanitized.getMarketNews().getQueries().size());
+                            providerCount,
+                            queryCount);
                 }
             } catch (Exception e) {
                 log.error("Failed to load local search config from {}", path, e);
