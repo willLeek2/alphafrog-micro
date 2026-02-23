@@ -228,6 +228,43 @@ agent:
         max-attempts: ${AF_AGENT_RUNTIME_JUDGE_MAX_ATTEMPTS:2}
         fail-open: ${AF_AGENT_RUNTIME_JUDGE_FAIL_OPEN:true}
         block-on-insufficient-evidence: ${AF_AGENT_RUNTIME_JUDGE_BLOCK_ON_INSUFFICIENT_EVIDENCE:false}
+  search-llm:
+    # 本地 JSON 配置文件（可选，不存在则回退到当前 yml/env 配置）
+    config-file: ${AF_AGENT_SEARCH_LLM_CONFIG_FILE:}
+    # 本地 JSON 热更新轮询间隔（毫秒）
+    config-refresh-interval-ms: ${AF_AGENT_SEARCH_LLM_CONFIG_REFRESH_INTERVAL_MS:10000}
+    default-provider: ${AF_AGENT_SEARCH_LLM_DEFAULT_PROVIDER:exa}
+    providers:
+      perplexity:
+        base-url: ${AF_AGENT_SEARCH_PPLX_BASE_URL:https://api.perplexity.ai}
+        api-key: ${AF_AGENT_SEARCH_PPLX_API_KEY:}
+        search-path: ${AF_AGENT_SEARCH_PPLX_SEARCH_PATH:/search}
+        auth-header: ${AF_AGENT_SEARCH_PPLX_AUTH_HEADER:Authorization}
+        auth-prefix: ${AF_AGENT_SEARCH_PPLX_AUTH_PREFIX:Bearer }
+      exa:
+        base-url: ${AF_AGENT_SEARCH_EXA_BASE_URL:https://api.exa.ai}
+        api-key: ${AF_AGENT_SEARCH_EXA_API_KEY:}
+        search-path: ${AF_AGENT_SEARCH_EXA_SEARCH_PATH:/search}
+        auth-header: ${AF_AGENT_SEARCH_EXA_AUTH_HEADER:x-api-key}
+        auth-prefix: ${AF_AGENT_SEARCH_EXA_AUTH_PREFIX:}
+    market-news:
+      default-limit: ${AF_AGENT_SEARCH_MARKET_NEWS_DEFAULT_LIMIT:8}
+      max-results: ${AF_AGENT_SEARCH_MARKET_NEWS_MAX_RESULTS:20}
+      max-tokens-per-page: ${AF_AGENT_SEARCH_MARKET_NEWS_MAX_TOKENS_PER_PAGE:1024}
+      country: ${AF_AGENT_SEARCH_MARKET_NEWS_COUNTRY:CN}
+      user-location: ${AF_AGENT_SEARCH_MARKET_NEWS_USER_LOCATION:CN}
+      exa-search-type: ${AF_AGENT_SEARCH_MARKET_NEWS_EXA_TYPE:auto}
+      exa-category: ${AF_AGENT_SEARCH_MARKET_NEWS_EXA_CATEGORY:news}
+      include-domains: ${AF_AGENT_SEARCH_MARKET_NEWS_INCLUDE_DOMAINS:sina.com.cn,eastmoney.com,cls.cn,yicai.com,wallstreetcn.com}
+      languages: ${AF_AGENT_SEARCH_MARKET_NEWS_LANGUAGES:zh,en}
+      queries: ${AF_AGENT_SEARCH_MARKET_NEWS_QUERIES:今日A股市场行情,央行政策公告,美股市场要闻,全球市场动态,行业板块热点}
+      category-keywords:
+        policy: ${AF_AGENT_SEARCH_MARKET_NEWS_KEYWORDS_POLICY:央行,政策,逆回购}
+        global: ${AF_AGENT_SEARCH_MARKET_NEWS_KEYWORDS_GLOBAL:美股,美联储,纳指,道指}
+        sector: ${AF_AGENT_SEARCH_MARKET_NEWS_KEYWORDS_SECTOR:行业,板块,龙头}
+        market: ${AF_AGENT_SEARCH_MARKET_NEWS_KEYWORDS_MARKET:A股,沪深,指数,开盘}
+    prompts:
+      market-news-query-template: ${AF_AGENT_SEARCH_MARKET_NEWS_PROMPT:}
   tools:
     market-data:
       dataset:

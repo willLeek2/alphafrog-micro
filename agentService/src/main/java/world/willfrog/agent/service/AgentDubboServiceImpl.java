@@ -36,6 +36,8 @@ import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunResultRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunStatusRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentConfigResponse;
+import world.willfrog.alphafrogmicro.agent.idl.GetTodayMarketNewsRequest;
+import world.willfrog.alphafrogmicro.agent.idl.GetTodayMarketNewsResponse;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentArtifactsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentArtifactsResponse;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentModelsRequest;
@@ -57,6 +59,7 @@ import world.willfrog.alphafrogmicro.agent.idl.ListAgentMessagesResponse;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunMessageItem;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRetentionConfigMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentFeatureConfigMessage;
+import world.willfrog.alphafrogmicro.agent.idl.MarketNewsItemMessage;
 import world.willfrog.alphafrogmicro.common.dao.user.UserDao;
 import world.willfrog.alphafrogmicro.common.pojo.user.User;
 
@@ -86,6 +89,7 @@ public class AgentDubboServiceImpl extends DubboAgentDubboServiceTriple.AgentDub
     private final UserDao userDao;
     private final ObjectMapper objectMapper;
     private final AgentMessageService messageService;
+    private final MarketNewsService marketNewsService;
 
     @Value("${agent.run.list.default-days:30}")
     private int listDefaultDays;
@@ -592,6 +596,41 @@ public class AgentDubboServiceImpl extends DubboAgentDubboServiceTriple.AgentDub
                 .setStatus(nvl(summary.status()))
                 .setAppliedAt(nvl(summary.appliedAt()))
                 .build();
+    }
+
+    @Override
+    public GetTodayMarketNewsResponse getTodayMarketNews(GetTodayMarketNewsRequest request) {
+        String userId = request.getUserId();
+        if (userId == null || userId.isBlank()) {
+            throw new IllegalArgumentException("user_id is required");
+        }
+        MarketNewsService.MarketNewsQuery query = new MarketNewsService.MarketNewsQuery(
+                nvl(request.getProvider()),
+                request.getLanguagesList(),
+                request.getLimit(),
+                nvl(request.getStartPublishedDate()),
+                nvl(request.getEndPublishedDate())
+        );
+        MarketNewsService.MarketNewsResult result = marketNewsService.getTodayMarketNews(query);
+        GetTodayMarketNewsResponse.Builder builder = GetTodayMarketNewsResponse.newBuilder()
+                .setUpdatedAt(nvl(result.updatedAt()))
+                .setProvider(nvl(result.provider()));
+        if (result.items() != null) {
+            for (MarketNewsService.MarketNewsItem item : result.items()) {
+                if (item == null) {
+                    continue;
+                }
+                builder.addData(MarketNewsItemMessage.newBuilder()
+                        .setId(nvl(item.id()))
+                        .setTimestamp(nvl(item.timestamp()))
+                        .setTitle(nvl(item.title()))
+                        .setSource(nvl(item.source()))
+                        .setCategory(nvl(item.category()))
+                        .setUrl(nvl(item.url()))
+                        .build());
+            }
+        }
+        return builder.build();
     }
 
     /**

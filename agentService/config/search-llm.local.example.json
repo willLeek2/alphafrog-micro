@@ -1,0 +1,52 @@
+{
+  "defaultProvider": "exa",
+  "providers": {
+    "perplexity": {
+      "baseUrl": "https://api.perplexity.ai",
+      "apiKey": "replace-with-your-perplexity-api-key",
+      "searchPath": "/search",
+      "authHeader": "Authorization",
+      "authPrefix": "Bearer "
+    },
+    "exa": {
+      "baseUrl": "https://api.exa.ai",
+      "apiKey": "replace-with-your-exa-api-key",
+      "searchPath": "/search",
+      "authHeader": "x-api-key",
+      "authPrefix": ""
+    }
+  },
+  "marketNews": {
+    "defaultLimit": 8,
+    "maxResults": 20,
+    "maxTokensPerPage": 1024,
+    "country": "CN",
+    "userLocation": "CN",
+    "exaSearchType": "auto",
+    "exaCategory": "news",
+    "includeDomains": [
+      "sina.com.cn",
+      "eastmoney.com",
+      "cls.cn",
+      "yicai.com",
+      "wallstreetcn.com"
+    ],
+    "languages": ["zh", "en"],
+    "queries": [
+      "今日A股市场行情",
+      "央行政策公告",
+      "美股市场要闻",
+      "全球市场动态",
+      "行业板块热点"
+    ],
+    "categoryKeywords": {
+      "policy": ["央行", "政策", "逆回购"],
+      "global": ["美股", "美联储", "纳指", "道指"],
+      "sector": ["行业", "板块", "龙头"],
+      "market": ["A股", "沪深", "指数", "开盘"]
+    }
+  },
+  "prompts": {
+    "marketNewsQueryTemplate": "file:prompts/search/market_news_query.txt"
+  }
+}
