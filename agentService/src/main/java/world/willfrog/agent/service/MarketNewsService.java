@@ -436,7 +436,9 @@ public class MarketNewsService {
         if (title == null || title.isBlank()) {
             return false;
         }
-        boolean hasChinese = title.codePoints().anyMatch(ch -> ch >= 0x4e00 && ch <= 0x9fff);
+        boolean hasChinese = title.codePoints().anyMatch(ch ->
+                (ch >= 0x3400 && ch <= 0x4dbf) || (ch >= 0x4e00 && ch <= 0x9fff)
+        );
         boolean hasLatin = title.codePoints().anyMatch(ch -> (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z'));
         for (String lang : languages) {
             if (!hasText(lang)) {
@@ -570,7 +572,7 @@ public class MarketNewsService {
             }
             HttpResponse<String> response = httpClient.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString());
             if (response.statusCode() >= 300) {
-                log.error("Search provider {} returned status {}", url, response.statusCode());
+                log.error("Search provider {} returned status {} body {}", url, response.statusCode(), response.body());
                 throw new IllegalStateException("search provider error: " + response.statusCode());
             }
             return response.body();

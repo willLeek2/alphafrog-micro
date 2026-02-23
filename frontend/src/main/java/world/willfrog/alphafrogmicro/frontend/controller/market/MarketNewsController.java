@@ -29,6 +29,8 @@ import java.util.List;
 @Slf4j
 public class MarketNewsController {
 
+    private static final int MAX_LIMIT = 50;
+
     @DubboReference
     private AgentDubboService agentDubboService;
 
@@ -113,7 +115,7 @@ public class MarketNewsController {
         if (limit == null || limit <= 0) {
             return 0;
         }
-        return Math.min(limit, 50);
+        return Math.min(limit, MAX_LIMIT);
     }
 
     private String nvl(String value) {

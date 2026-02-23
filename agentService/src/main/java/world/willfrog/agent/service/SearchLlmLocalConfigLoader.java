@@ -71,7 +71,13 @@ public class SearchLlmLocalConfigLoader {
                 return;
             }
             try {
-                long currentModified = Files.getLastModifiedTime(path).toMillis();
+                long currentModified;
+                try {
+                    currentModified = Files.getLastModifiedTime(path).toMillis();
+                } catch (Exception e) {
+                    log.warn("Failed to read local search config metadata, will reload: {}", path, e);
+                    currentModified = System.currentTimeMillis();
+                }
                 String normalizedPath = path.toString();
                 boolean unchanged = normalizedPath.equals(loadedConfigPath) && currentModified == loadedConfigLastModified;
                 if (!force && unchanged && !promptFilesChanged()) {
