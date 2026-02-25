@@ -7,6 +7,7 @@ import dev.ai4j.openai4j.chat.ChatCompletionResponse;
 import dev.langchain4j.agent.tool.ToolSpecification;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
+import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.model.chat.ChatLanguageModel;
 import dev.langchain4j.model.openai.InternalOpenAiHelper;
 import dev.langchain4j.model.output.FinishReason;
@@ -35,6 +36,11 @@ import java.util.Map;
 @Slf4j
 public class DashScopeChatModel implements ChatLanguageModel {
 
+    private static final HttpClient HTTP_CLIENT = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(30))
+            .build();
+    private static final int DEFAULT_THINKING_BUDGET = 38912;
+
     private final ObjectMapper objectMapper;
     private final String baseUrl;
     private final String apiKey;
@@ -44,10 +50,6 @@ public class DashScopeChatModel implements ChatLanguageModel {
     private final RawHttpLogger httpLogger;
     private final AgentObservabilityService observabilityService;
     private final String endpointName;
-
-    private final HttpClient httpClient = HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(30))
-            .build();
 
     @Override
     public Response<AiMessage> generate(List<ChatMessage> messages) {
@@ -66,12 +68,10 @@ public class DashScopeChatModel implements ChatLanguageModel {
         RawHttpLogger.HttpRequestRecord requestRecord = null;
         RawHttpLogger.HttpResponseRecord responseRecord = null;
         String curlCommand = null;
-        int statusCode = -1;
-        String responseJson = null;
 
         try {
             ChatCompletionRequest.Builder builder = ChatCompletionRequest.builder()
-                    .model(nvl(modelName))
+                    .model(OpenAiCompatibleChatModelSupport.nvl(modelName))
                     .messages(InternalOpenAiHelper.toOpenAiMessages(messages == null ? List.of() : messages))
                     .temperature(temperature)
                     .maxCompletionTokens(maxTokens);
@@ -96,28 +96,28 @@ public class DashScopeChatModel implements ChatLanguageModel {
             applyThinkingConfig(requestJsonMap, messages);
 
             requestJson = objectMapper.writeValueAsString(requestJsonMap);
-            String requestUrl = buildChatCompletionsUrl();
-            Map<String, String> requestHeaders = buildRequestHeaders();
+            String requestUrl = OpenAiCompatibleChatModelSupport.buildChatCompletionsUrl(baseUrl);
+            Map<String, String> requestHeaders = OpenAiCompatibleChatModelSupport.buildRequestHeaders(apiKey);
 
             HttpRequest.Builder httpRequestBuilder = HttpRequest.newBuilder()
                     .uri(URI.create(requestUrl))
                     .timeout(Duration.ofSeconds(180))
                     .header("Content-Type", "application/json")
                     .header("Accept", "application/json")
-                    .header("Authorization", "Bearer " + nvl(apiKey))
+                    .header("Authorization", "Bearer " + OpenAiCompatibleChatModelSupport.nvl(apiKey))
                     .POST(HttpRequest.BodyPublishers.ofString(requestJson, StandardCharsets.UTF_8));
 
             if (shouldCapture) {
                 requestRecord = httpLogger.recordRequest(requestUrl, "POST", requestHeaders, requestJson);
             }
 
-            HttpResponse<String> httpResponse = httpClient.send(
+            HttpResponse<String> httpResponse = HTTP_CLIENT.send(
                     httpRequestBuilder.build(),
                     HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8)
             );
 
-            statusCode = httpResponse.statusCode();
-            responseJson = httpResponse.body();
+            int statusCode = httpResponse.statusCode();
+            String responseJson = httpResponse.body();
             long durationMs = System.currentTimeMillis() - requestStartedAt;
 
             if (shouldCapture) {
@@ -133,9 +133,9 @@ public class DashScopeChatModel implements ChatLanguageModel {
                 }
                 String detail = "DashScope chat completion failed"
                         + " (http=" + statusCode
-                        + ", model=" + nvl(modelName)
-                        + ", error=" + shorten(responseJson)
-                        + ", request=" + shorten(requestJson) + ")";
+                        + ", model=" + OpenAiCompatibleChatModelSupport.nvl(modelName)
+                        + ", error=" + OpenAiCompatibleChatModelSupport.shorten(responseJson)
+                        + ", request=" + OpenAiCompatibleChatModelSupport.shorten(requestJson) + ")";
                 log.warn(detail);
                 throw new IllegalStateException(detail);
             }
@@ -148,7 +148,7 @@ public class DashScopeChatModel implements ChatLanguageModel {
                 aiMessage = new AiMessage(thinking.content(), tools == null ? List.of() : tools);
             }
             TokenUsage tokenUsage = InternalOpenAiHelper.tokenUsageFrom(completion.usage());
-            FinishReason finishReason = extractFinishReason(completion);
+            FinishReason finishReason = OpenAiCompatibleChatModelSupport.extractFinishReason(completion);
 
             Map<String, Object> metadata = new LinkedHashMap<>();
             if (completion.id() != null) {
@@ -176,7 +176,7 @@ public class DashScopeChatModel implements ChatLanguageModel {
             }
 
             String detail = "DashScope chat completion interrupted"
-                    + " (model=" + nvl(modelName) + ")";
+                    + " (model=" + OpenAiCompatibleChatModelSupport.nvl(modelName) + ")";
             throw new IllegalStateException(detail, e);
 
         } catch (Exception e) {
@@ -188,9 +188,9 @@ public class DashScopeChatModel implements ChatLanguageModel {
             }
 
             String detail = "DashScope chat completion failed"
-                    + " (model=" + nvl(modelName)
-                    + ", error=" + shorten(e.getMessage())
-                    + ", request=" + shorten(requestJson) + ")";
+                    + " (model=" + OpenAiCompatibleChatModelSupport.nvl(modelName)
+                    + ", error=" + OpenAiCompatibleChatModelSupport.shorten(e.getMessage())
+                    + ", request=" + OpenAiCompatibleChatModelSupport.shorten(requestJson) + ")";
             log.warn(detail, e);
             throw new IllegalStateException(detail, e);
         }
@@ -215,7 +215,7 @@ public class DashScopeChatModel implements ChatLanguageModel {
             return;
         }
 
-        TokenUsage tokenUsage = extractTokenUsageFromResponse(response);
+        TokenUsage tokenUsage = OpenAiCompatibleChatModelSupport.extractTokenUsageFromResponse(objectMapper, response, log);
         long completedAtMillis = startedAtMillis + durationMs;
 
         observabilityService.recordLlmCallWithRawHttp(
@@ -234,91 +234,51 @@ public class DashScopeChatModel implements ChatLanguageModel {
         );
     }
 
-    private TokenUsage extractTokenUsageFromResponse(RawHttpLogger.HttpResponseRecord response) {
-        if (response == null || response.getBody() == null || response.getBody().isBlank()) {
-            return null;
-        }
-
-        try {
-            Map<String, Object> json = objectMapper.readValue(response.getBody(), new TypeReference<>() {
-            });
-            Object usage = json.get("usage");
-            if (usage instanceof Map<?, ?> usageMap) {
-                Integer promptTokens = toInt(usageMap.get("prompt_tokens"));
-                Integer completionTokens = toInt(usageMap.get("completion_tokens"));
-                Integer totalTokens = toInt(usageMap.get("total_tokens"));
-                int total = totalTokens != null ? totalTokens :
-                        ((promptTokens != null ? promptTokens : 0) + (completionTokens != null ? completionTokens : 0));
-
-                return new TokenUsage(
-                        promptTokens != null ? promptTokens : 0,
-                        completionTokens != null ? completionTokens : 0,
-                        total
-                );
-            }
-        } catch (Exception e) {
-            log.debug("Failed to extract token usage from response: {}", e.getMessage());
-        }
-
-        return null;
-    }
-
-    private Integer toInt(Object value) {
-        if (value == null) {
-            return null;
-        }
-        if (value instanceof Number) {
-            return ((Number) value).intValue();
-        }
-        try {
-            return Integer.parseInt(String.valueOf(value));
-        } catch (Exception e) {
-            return null;
-        }
-    }
-
-    private Map<String, String> buildRequestHeaders() {
-        Map<String, String> headers = new LinkedHashMap<>();
-        headers.put("Content-Type", "application/json");
-        headers.put("Accept", "application/json");
-        headers.put("Authorization", "Bearer " + nvl(apiKey));
-        return headers;
-    }
-
-    private FinishReason extractFinishReason(ChatCompletionResponse completion) {
-        if (completion == null || completion.choices() == null || completion.choices().isEmpty()) {
-            return null;
-        }
-        String raw = completion.choices().get(0).finishReason();
-        if (raw == null || raw.isBlank()) {
-            return null;
-        }
-        try {
-            return InternalOpenAiHelper.finishReasonFrom(raw);
-        } catch (Exception e) {
-            return null;
-        }
-    }
-
     private void applyThinkingConfig(Map<String, Object> requestJsonMap, List<ChatMessage> messages) {
         if (!supportsThinking(modelName)) {
             return;
         }
-        boolean enableThinking = true;
-        if (messages != null) {
-            for (ChatMessage message : messages) {
-                if (message == null || message.text() == null) {
-                    continue;
-                }
-                String text = message.text();
-                if (text.contains("/no_think")) {
-                    enableThinking = false;
-                } else if (text.contains("/think")) {
-                    enableThinking = true;
-                }
+        boolean enableThinking = resolveThinkingFromLatestUserMessage(messages);
+        requestJsonMap.put("enable_thinking", enableThinking);
+        if (enableThinking) {
+            requestJsonMap.put("thinking_budget", DEFAULT_THINKING_BUDGET);
+        }
+    }
+
+    private boolean resolveThinkingFromLatestUserMessage(List<ChatMessage> messages) {
+        UserMessage latestUserMessage = findLatestUserMessage(messages);
+        if (latestUserMessage == null || latestUserMessage.singleText() == null) {
+            return true;
+        }
+        String text = latestUserMessage.singleText();
+        int noThinkIndex = text.lastIndexOf("/no_think");
+        int thinkIndex = text.lastIndexOf("/think");
+        if (noThinkIndex < 0 && thinkIndex < 0) {
+            return true;
+        }
+        if (noThinkIndex < 0) {
+            return true;
+        }
+        if (thinkIndex < 0) {
+            return false;
+        }
+        return thinkIndex > noThinkIndex;
+    }
+
+    private UserMessage findLatestUserMessage(List<ChatMessage> messages) {
+        if (messages == null || messages.isEmpty()) {
+            return null;
+        }
+        for (int i = messages.size() - 1; i >= 0; i--) {
+            ChatMessage message = messages.get(i);
+            if (message == null) {
+                continue;
+            }
+            if (message instanceof UserMessage userMessage) {
+                return userMessage;
             }
         }
-        requestJsonMap.put("enable_thinking", enableThinking);
+        return null;
     }
 
     private boolean supportsThinking(String modelName) {
@@ -333,21 +293,20 @@ public class DashScopeChatModel implements ChatLanguageModel {
         if (content == null || content.isBlank()) {
             return new ThinkingContent(content, "");
         }
-        String text = content;
         StringBuilder cleaned = new StringBuilder();
         StringBuilder thinking = new StringBuilder();
         int index = 0;
         while (true) {
-            int start = text.indexOf("<think>", index);
+            int start = content.indexOf("<think>", index);
             if (start < 0) {
                 break;
             }
-            int end = text.indexOf("</think>", start);
+            int end = content.indexOf("</think>", start);
             if (end < 0) {
                 break;
             }
-            cleaned.append(text, index, start);
-            String chunk = text.substring(start + "<think>".length(), end).trim();
+            cleaned.append(content, index, start);
+            String chunk = content.substring(start + "<think>".length(), end).trim();
             if (!chunk.isEmpty()) {
                 if (thinking.length() > 0) {
                     thinking.append("\n");
@@ -356,38 +315,9 @@ public class DashScopeChatModel implements ChatLanguageModel {
             }
             index = end + "</think>".length();
         }
-        cleaned.append(text.substring(index));
+        cleaned.append(content.substring(index));
         String cleanedText = cleaned.toString().trim();
         return new ThinkingContent(cleanedText, thinking.toString().trim());
-    }
-
-    private String nvl(String value) {
-        return value == null ? "" : value;
-    }
-
-    private String buildChatCompletionsUrl() {
-        String normalized = nvl(baseUrl).trim();
-        if (normalized.endsWith("/")) {
-            normalized = normalized.substring(0, normalized.length() - 1);
-        }
-        if (normalized.endsWith("/chat/completions")) {
-            return normalized;
-        }
-        if (normalized.endsWith("/v1")) {
-            return normalized + "/chat/completions";
-        }
-        return normalized + "/v1/chat/completions";
-    }
-
-    private String shorten(String text) {
-        if (text == null) {
-            return "";
-        }
-        String normalized = text.replace('\n', ' ').replace('\r', ' ');
-        if (normalized.length() <= 600) {
-            return normalized;
-        }
-        return normalized.substring(0, 600) + "...";
     }
 
     private record ThinkingContent(String content, String thinking) {

@@ -69,6 +69,10 @@ import java.util.Map;
 @Slf4j
 public class OpenRouterProviderRoutedChatModel implements ChatLanguageModel {
 
+    private static final HttpClient HTTP_CLIENT = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(30))
+            .build();
+
     // ========== 核心依赖 ==========
     
     private final ObjectMapper objectMapper;
@@ -84,10 +88,6 @@ public class OpenRouterProviderRoutedChatModel implements ChatLanguageModel {
     private final RawHttpLogger httpLogger;
     private final AgentObservabilityService observabilityService;
     private final String endpointName;
-    
-    private final HttpClient httpClient = HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(30))
-            .build();
 
     /**
      * 生成 AI 回复（不带工具）。
@@ -143,7 +143,7 @@ public class OpenRouterProviderRoutedChatModel implements ChatLanguageModel {
         try {
             // ========== 1. 构建请求 ==========
             ChatCompletionRequest.Builder builder = ChatCompletionRequest.builder()
-                    .model(nvl(modelName))
+                    .model(OpenAiCompatibleChatModelSupport.nvl(modelName))
                     .messages(InternalOpenAiHelper.toOpenAiMessages(messages == null ? List.of() : messages))
                     .temperature(temperature)
                     .maxCompletionTokens(maxTokens);
@@ -176,15 +176,15 @@ public class OpenRouterProviderRoutedChatModel implements ChatLanguageModel {
             }
             
             // 构建 HTTP 请求信息
-            String requestUrl = buildChatCompletionsUrl();
-            Map<String, String> requestHeaders = buildRequestHeaders();
+            String requestUrl = OpenAiCompatibleChatModelSupport.buildChatCompletionsUrl(baseUrl);
+            Map<String, String> requestHeaders = OpenAiCompatibleChatModelSupport.buildRequestHeaders(apiKey);
             
             HttpRequest.Builder httpRequestBuilder = HttpRequest.newBuilder()
                     .uri(URI.create(requestUrl))
                     .timeout(Duration.ofSeconds(180))
                     .header("Content-Type", "application/json")
                     .header("Accept", "application/json")
-                    .header("Authorization", "Bearer " + nvl(apiKey))
+                    .header("Authorization", "Bearer " + OpenAiCompatibleChatModelSupport.nvl(apiKey))
                     .POST(HttpRequest.BodyPublishers.ofString(requestJson, StandardCharsets.UTF_8));
             
             // 添加自定义 headers（如 OpenRouter 的 HTTP-Referer、X-Title）
@@ -203,7 +203,7 @@ public class OpenRouterProviderRoutedChatModel implements ChatLanguageModel {
             }
             
             // ========== 2. 发送 HTTP 请求 ==========
-            HttpResponse<String> httpResponse = httpClient.send(
+            HttpResponse<String> httpResponse = HTTP_CLIENT.send(
                     httpRequestBuilder.build(),
                     HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8)
             );
@@ -231,9 +231,9 @@ public class OpenRouterProviderRoutedChatModel implements ChatLanguageModel {
                 String detail = "OpenRouter provider routed chat completion failed"
                         + " (http=" + statusCode
                         + ", providers=" + providerOrder
-                        + ", model=" + nvl(modelName)
-                        + ", error=" + shorten(responseJson)
-                        + ", request=" + shorten(requestJson) + ")";
+                        + ", model=" + OpenAiCompatibleChatModelSupport.nvl(modelName)
+                        + ", error=" + OpenAiCompatibleChatModelSupport.shorten(responseJson)
+                        + ", request=" + OpenAiCompatibleChatModelSupport.shorten(requestJson) + ")";
                 log.warn(detail);
                 throw new IllegalStateException(detail);
             }
@@ -243,7 +243,7 @@ public class OpenRouterProviderRoutedChatModel implements ChatLanguageModel {
 
             AiMessage aiMessage = InternalOpenAiHelper.aiMessageFrom(completion);
             TokenUsage tokenUsage = InternalOpenAiHelper.tokenUsageFrom(completion.usage());
-            FinishReason finishReason = extractFinishReason(completion);
+            FinishReason finishReason = OpenAiCompatibleChatModelSupport.extractFinishReason(completion);
             
             // 构建 metadata
             Map<String, Object> metadata = new LinkedHashMap<>();
@@ -272,7 +272,7 @@ public class OpenRouterProviderRoutedChatModel implements ChatLanguageModel {
             
             String detail = "OpenRouter provider routed chat completion interrupted"
                     + " (providers=" + providerOrder
-                    + ", model=" + nvl(modelName) + ")";
+                    + ", model=" + OpenAiCompatibleChatModelSupport.nvl(modelName) + ")";
             throw new IllegalStateException(detail, e);
             
         } catch (Exception e) {
@@ -286,9 +286,9 @@ public class OpenRouterProviderRoutedChatModel implements ChatLanguageModel {
             
             String detail = "OpenRouter provider routed chat completion failed"
                     + " (providers=" + providerOrder
-                    + ", model=" + nvl(modelName)
-                    + ", error=" + shorten(e.getMessage())
-                    + ", request=" + shorten(requestJson) + ")";
+                    + ", model=" + OpenAiCompatibleChatModelSupport.nvl(modelName)
+                    + ", error=" + OpenAiCompatibleChatModelSupport.shorten(e.getMessage())
+                    + ", request=" + OpenAiCompatibleChatModelSupport.shorten(requestJson) + ")";
             log.warn(detail, e);
             throw new IllegalStateException(detail, e);
         }
@@ -334,7 +334,7 @@ public class OpenRouterProviderRoutedChatModel implements ChatLanguageModel {
         }
         
         // 从响应中提取 token usage
-        TokenUsage tokenUsage = extractTokenUsageFromResponse(response);
+        TokenUsage tokenUsage = OpenAiCompatibleChatModelSupport.extractTokenUsageFromResponse(objectMapper, response, log);
         long completedAtMillis = startedAtMillis + durationMs;
         
         observabilityService.recordLlmCallWithRawHttp(
@@ -353,155 +353,4 @@ public class OpenRouterProviderRoutedChatModel implements ChatLanguageModel {
         );
     }
     
-    /**
-     * 从响应记录中提取 TokenUsage。
-     * 
-     * <p>解析响应 JSON 中的 usage 字段，提取 prompt_tokens、completion_tokens、total_tokens。</p>
-     * <p>如解析失败，返回 null（观测数据中会显示为 null，不影响功能）。</p>
-     * 
-     * @param response HTTP 响应记录
-     * @return TokenUsage 对象，或 null（解析失败时）
-     */
-    private TokenUsage extractTokenUsageFromResponse(RawHttpLogger.HttpResponseRecord response) {
-        if (response == null || response.getBody() == null || response.getBody().isBlank()) {
-            return null;
-        }
-        
-        try {
-            Map<String, Object> json = objectMapper.readValue(response.getBody(), new TypeReference<>() {});
-            Object usage = json.get("usage");
-            if (usage instanceof Map<?, ?> usageMap) {
-                Integer promptTokens = toInt(usageMap.get("prompt_tokens"));
-                Integer completionTokens = toInt(usageMap.get("completion_tokens"));
-                Integer totalTokens = toInt(usageMap.get("total_tokens"));
-                
-                // 如果 totalTokens 为空，自动计算
-                int total = totalTokens != null ? totalTokens : 
-                    ((promptTokens != null ? promptTokens : 0) + (completionTokens != null ? completionTokens : 0));
-                
-                return new TokenUsage(
-                        promptTokens != null ? promptTokens : 0,
-                        completionTokens != null ? completionTokens : 0,
-                        total
-                );
-            }
-        } catch (Exception e) {
-            log.debug("Failed to extract token usage from response: {}", e.getMessage());
-        }
-        
-        return null;
-    }
-    
-    /**
-     * 安全转换为 Integer。
-     * 
-     * @param value 任意类型的值
-     * @return Integer，或 null（转换失败时）
-     */
-    private Integer toInt(Object value) {
-        if (value == null) {
-            return null;
-        }
-        if (value instanceof Number) {
-            return ((Number) value).intValue();
-        }
-        try {
-            return Integer.parseInt(String.valueOf(value));
-        } catch (Exception e) {
-            return null;
-        }
-    }
-    
-    /**
-     * 构建请求 headers Map。
-     * 
-     * <p>用于 HTTP 请求记录。</p>
-     * 
-     * @return headers 的 Map 表示
-     */
-    private Map<String, String> buildRequestHeaders() {
-        Map<String, String> headers = new LinkedHashMap<>();
-        headers.put("Content-Type", "application/json");
-        headers.put("Accept", "application/json");
-        headers.put("Authorization", "Bearer " + nvl(apiKey));
-        return headers;
-    }
-
-    /**
-     * 提取 finish_reason。
-     * 
-     * <p>从 ChatCompletionResponse 中提取 finish_reason 并转换为 LangChain4j 的 FinishReason。</p>
-     * 
-     * @param completion ChatCompletionResponse
-     * @return FinishReason，或 null（无 finish_reason 时）
-     */
-    private FinishReason extractFinishReason(ChatCompletionResponse completion) {
-        if (completion == null || completion.choices() == null || completion.choices().isEmpty()) {
-            return null;
-        }
-        String raw = completion.choices().get(0).finishReason();
-        if (raw == null || raw.isBlank()) {
-            return null;
-        }
-        try {
-            return InternalOpenAiHelper.finishReasonFrom(raw);
-        } catch (Exception e) {
-            return null;
-        }
-    }
-
-    /**
-     * null 值处理。
-     * 
-     * @param value 原始值
-     * @return 非 null 值（null 时返回空字符串）
-     */
-    private String nvl(String value) {
-        return value == null ? "" : value;
-    }
-
-    /**
-     * 构建完整的 chat completions URL。
-     * 
-     * <p>处理 baseUrl 的各种情况：</p>
-     * <ul>
-     *   <li>https://api.openrouter.ai/api/v1 → https://api.openrouter.ai/api/v1/chat/completions</li>
-     *   <li>https://api.openrouter.ai/api/v1/ → https://api.openrouter.ai/api/v1/chat/completions</li>
-     *   <li>https://api.openrouter.ai/ → https://api.openrouter.ai/v1/chat/completions</li>
-     * </ul>
-     * 
-     * @return 完整的 chat completions URL
-     */
-    private String buildChatCompletionsUrl() {
-        String normalized = nvl(baseUrl).trim();
-        if (normalized.endsWith("/")) {
-            normalized = normalized.substring(0, normalized.length() - 1);
-        }
-        if (normalized.endsWith("/chat/completions")) {
-            return normalized;
-        }
-        if (normalized.endsWith("/v1")) {
-            return normalized + "/chat/completions";
-        }
-        return normalized + "/v1/chat/completions";
-    }
-
-    /**
-     * 缩短字符串（用于日志）。
-     * 
-     * <p>将换行符替换为空格，截断到 600 字符。</p>
-     * 
-     * @param text 原始字符串
-     * @return 缩短后的字符串
-     */
-    private String shorten(String text) {
-        if (text == null) {
-            return "";
-        }
-        String normalized = text.replace('\n', ' ').replace('\r', ' ');
-        if (normalized.length() <= 600) {
-            return normalized;
-        }
-        return normalized.substring(0, 600) + "...";
-    }
 }
