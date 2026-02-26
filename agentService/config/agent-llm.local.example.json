@@ -5,7 +5,10 @@
     "moonshotai/kimi-k2.5",
     "openai/gpt-5.2",
     "qwen/qwen3-max-thinking",
-    "accounts/fireworks/models/kimi-k2p5"
+    "accounts/fireworks/models/kimi-k2p5",
+    "qwen-plus",
+    "qwen-max",
+    "qwen-turbo"
   ],
   "modelMetadata": {
     "moonshotai/kimi-k2.5": {
@@ -28,6 +31,18 @@
       "displayName": "Kimi K2.5 (Fireworks)",
       "baseRate": 0.1,
       "features": ["reasoning", "code"]
+    },
+    "qwen-plus": {
+      "displayName": "Qwen Plus",
+      "baseRate": 0.2
+    },
+    "qwen-max": {
+      "displayName": "Qwen Max",
+      "baseRate": 0.5
+    },
+    "qwen-turbo": {
+      "displayName": "Qwen Turbo",
+      "baseRate": 0.1
     }
   },
   "endpoints": {
@@ -63,6 +78,25 @@
     "openai": {
       "baseUrl": "https://api.openai.com/v1",
       "apiKey": "replace-with-your-openai-api-key"
+    },
+    "dashscope": {
+      "baseUrl": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+      "apiKey": "replace-with-your-dashscope-api-key",
+      "region": "singapore",
+      "models": {
+        "qwen-plus": {
+          "displayName": "Qwen Plus",
+          "baseRate": 0.2
+        },
+        "qwen-max": {
+          "displayName": "Qwen Max",
+          "baseRate": 0.5
+        },
+        "qwen-turbo": {
+          "displayName": "Qwen Turbo",
+          "baseRate": 0.1
+        }
+      }
     }
   },
   "runtime": {
