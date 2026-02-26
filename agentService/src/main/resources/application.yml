@@ -233,7 +233,6 @@ agent:
     config-file: ${AF_AGENT_SEARCH_LLM_CONFIG_FILE:}
     # 本地 JSON 热更新轮询间隔（毫秒）
     config-refresh-interval-ms: ${AF_AGENT_SEARCH_LLM_CONFIG_REFRESH_INTERVAL_MS:10000}
-    default-provider: ${AF_AGENT_SEARCH_LLM_DEFAULT_PROVIDER:exa}
     providers:
       perplexity:
         base-url: ${AF_AGENT_SEARCH_PPLX_BASE_URL:https://api.perplexity.ai}
@@ -251,34 +250,35 @@ agent:
         auth-prefix: ${AF_AGENT_SEARCH_EXA_AUTH_PREFIX:}
         connect-timeout-seconds: ${AF_AGENT_SEARCH_EXA_CONNECT_TIMEOUT_SECONDS:20}
         request-timeout-seconds: ${AF_AGENT_SEARCH_EXA_REQUEST_TIMEOUT_SECONDS:45}
-    market-news:
-      default-limit: ${AF_AGENT_SEARCH_MARKET_NEWS_DEFAULT_LIMIT:8}
-      max-results: ${AF_AGENT_SEARCH_MARKET_NEWS_MAX_RESULTS:20}
-      max-tokens-per-page: ${AF_AGENT_SEARCH_MARKET_NEWS_MAX_TOKENS_PER_PAGE:1024}
-      country: ${AF_AGENT_SEARCH_MARKET_NEWS_COUNTRY:CN}
-      user-location: ${AF_AGENT_SEARCH_MARKET_NEWS_USER_LOCATION:CN}
-      exa-search-type: ${AF_AGENT_SEARCH_MARKET_NEWS_EXA_TYPE:auto}
-      exa-category: ${AF_AGENT_SEARCH_MARKET_NEWS_EXA_CATEGORY:news}
-      include-domains:
-        - sina.com.cn
-        - eastmoney.com
-        - cls.cn
-        - yicai.com
-        - wallstreetcn.com
-      languages:
-        - zh
-        - en
-      queries:
-        - 今日A股市场行情
-        - 央行政策公告
-        - 美股市场要闻
-        - 全球市场动态
-        - 行业板块热点
-      category-keywords:
-        policy: ${AF_AGENT_SEARCH_MARKET_NEWS_KEYWORDS_POLICY:央行,政策,逆回购}
-        global: ${AF_AGENT_SEARCH_MARKET_NEWS_KEYWORDS_GLOBAL:美股,美联储,纳指,道指}
-        sector: ${AF_AGENT_SEARCH_MARKET_NEWS_KEYWORDS_SECTOR:行业,板块,龙头}
-        market: ${AF_AGENT_SEARCH_MARKET_NEWS_KEYWORDS_MARKET:A股,沪深,指数,开盘}
+    features:
+      market-news:
+        default-provider: ${AF_AGENT_SEARCH_MARKET_NEWS_DEFAULT_PROVIDER:exa}
+        default-limit: ${AF_AGENT_SEARCH_MARKET_NEWS_DEFAULT_LIMIT:8}
+        max-results: ${AF_AGENT_SEARCH_MARKET_NEWS_MAX_RESULTS:20}
+        exa-search-type: ${AF_AGENT_SEARCH_MARKET_NEWS_EXA_TYPE:auto}
+        exa-category: ${AF_AGENT_SEARCH_MARKET_NEWS_EXA_CATEGORY:news}
+        profiles:
+          - name: cn
+            provider: ${AF_AGENT_SEARCH_MARKET_NEWS_CN_PROVIDER:exa}
+            query: ${AF_AGENT_SEARCH_MARKET_NEWS_CN_QUERY:今日A股市场行情 行业板块热点}
+            include-domains: [sina.com.cn, eastmoney.com, cls.cn, yicai.com]
+            languages: [zh]
+            country: ${AF_AGENT_SEARCH_MARKET_NEWS_CN_COUNTRY:CN}
+            category-hint: market
+          - name: policy
+            provider: ${AF_AGENT_SEARCH_MARKET_NEWS_POLICY_PROVIDER:perplexity}
+            query: ${AF_AGENT_SEARCH_MARKET_NEWS_POLICY_QUERY:央行政策公告 金融监管动态}
+            include-domains: [pbc.gov.cn, gov.cn]
+            languages: [zh]
+            country: ${AF_AGENT_SEARCH_MARKET_NEWS_POLICY_COUNTRY:CN}
+            category-hint: policy
+          - name: us
+            provider: ${AF_AGENT_SEARCH_MARKET_NEWS_US_PROVIDER:exa}
+            query: ${AF_AGENT_SEARCH_MARKET_NEWS_US_QUERY:US stocks market news}
+            include-domains: [wsj.com, bloomberg.com, reuters.com]
+            languages: [en]
+            country: ${AF_AGENT_SEARCH_MARKET_NEWS_US_COUNTRY:US}
+            category-hint: global
     prompts:
       market-news-query-template: ${AF_AGENT_SEARCH_PROMPTS_MARKET_NEWS_QUERY_TEMPLATE:}
   tools:

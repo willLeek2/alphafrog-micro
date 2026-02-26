@@ -1,5 +1,4 @@
 {
-  "defaultProvider": "exa",
   "providers": {
     "perplexity": {
       "baseUrl": "https://api.perplexity.ai",
@@ -20,34 +19,46 @@
       "requestTimeoutSeconds": 45
     }
   },
-  "marketNews": {
-    "defaultLimit": 8,
-    "maxResults": 20,
-    "maxTokensPerPage": 1024,
-    "country": "CN",
-    "userLocation": "CN",
-    "exaSearchType": "auto",
-    "exaCategory": "news",
-    "includeDomains": [
-      "sina.com.cn",
-      "eastmoney.com",
-      "cls.cn",
-      "yicai.com",
-      "wallstreetcn.com"
-    ],
-    "languages": ["zh", "en"],
-    "queries": [
-      "今日A股市场行情",
-      "央行政策公告",
-      "美股市场要闻",
-      "全球市场动态",
-      "行业板块热点"
-    ],
-    "categoryKeywords": {
-      "policy": ["央行", "政策", "逆回购"],
-      "global": ["美股", "美联储", "纳指", "道指"],
-      "sector": ["行业", "板块", "龙头"],
-      "market": ["A股", "沪深", "指数", "开盘"]
+  "features": {
+    "marketNews": {
+      "defaultProvider": "exa",
+      "defaultLimit": 8,
+      "maxResults": 20,
+      "exaSearchType": "auto",
+      "exaCategory": "news",
+      "profiles": [
+        {
+          "name": "cn",
+          "provider": "exa",
+          "query": "今日A股市场行情 行业板块热点",
+          "includeDomains": ["sina.com.cn", "eastmoney.com", "cls.cn", "yicai.com"],
+          "excludeDomains": [],
+          "languages": ["zh"],
+          "country": "CN",
+          "limit": 10,
+          "categoryHint": "market"
+        },
+        {
+          "name": "policy",
+          "provider": "perplexity",
+          "queries": ["央行政策公告", "金融监管动态"],
+          "includeDomains": ["pbc.gov.cn", "gov.cn"],
+          "excludeDomains": [],
+          "languages": ["zh"],
+          "country": "CN",
+          "categoryHint": "policy"
+        },
+        {
+          "name": "us",
+          "provider": "exa",
+          "query": "US stocks market news",
+          "includeDomains": ["wsj.com", "bloomberg.com", "reuters.com"],
+          "excludeDomains": [],
+          "languages": ["en"],
+          "country": "US",
+          "categoryHint": "global"
+        }
+      ]
     }
   },
   "prompts": {

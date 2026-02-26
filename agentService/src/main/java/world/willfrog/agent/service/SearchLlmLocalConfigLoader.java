@@ -1,5 +1,6 @@
 package world.willfrog.agent.service;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
@@ -86,23 +87,35 @@ public class SearchLlmLocalConfigLoader {
                     return;
                 }
                 try (InputStream in = Files.newInputStream(path)) {
-                    SearchLlmProperties parsed = objectMapper.readValue(in, SearchLlmProperties.class);
+                    JsonNode root = objectMapper.readTree(in);
+                    failIfLegacyConfig(root, normalizedPath);
+                    SearchLlmProperties parsed = objectMapper.treeToValue(root, SearchLlmProperties.class);
                     SearchLlmProperties sanitized = sanitize(parsed);
                     Map<String, Long> promptFileTimes = resolvePromptFiles(sanitized, path.getParent());
+
                     int providerCount = sanitized.getProviders().size();
-                    int queryCount = sanitized.getMarketNews().getQueries().size();
+                    int profileCount = sanitized.getFeatures().getMarketNews().getProfiles().size();
                     this.localConfig = sanitized;
                     this.loadedConfigPath = normalizedPath;
                     this.loadedConfigLastModified = currentModified;
                     this.loadedPromptFileModifiedTimes = promptFileTimes;
-                    log.info("Loaded local search config from {} (providers={}, queries={})",
+                    log.info("Loaded local search config from {} (providers={}, marketNewsProfiles={})",
                             path,
                             providerCount,
-                            queryCount);
+                            profileCount);
                 }
             } catch (Exception e) {
                 log.error("Failed to load local search config from {}", path, e);
             }
+        }
+    }
+
+    private void failIfLegacyConfig(JsonNode root, String path) {
+        if (root == null || !root.isObject()) {
+            throw new IllegalStateException("search-llm config must be a JSON object: " + path);
+        }
+        if (root.has("defaultProvider") || root.has("marketNews")) {
+            throw new IllegalStateException("Legacy search-llm config detected. Use features.marketNews.profiles schema only: " + path);
         }
     }
 
@@ -144,11 +157,32 @@ public class SearchLlmLocalConfigLoader {
         if (cfg.getProviders() == null) {
             cfg.setProviders(new LinkedHashMap<>());
         }
-        if (cfg.getMarketNews() == null) {
-            cfg.setMarketNews(new SearchLlmProperties.MarketNews());
+        if (cfg.getFeatures() == null) {
+            cfg.setFeatures(new SearchLlmProperties.Features());
+        }
+        if (cfg.getFeatures().getMarketNews() == null) {
+            cfg.getFeatures().setMarketNews(new SearchLlmProperties.MarketNewsFeature());
         }
         if (cfg.getPrompts() == null) {
             cfg.setPrompts(new SearchLlmProperties.Prompts());
+        }
+
+        SearchLlmProperties.MarketNewsFeature marketNews = cfg.getFeatures().getMarketNews();
+        if (marketNews.getProfiles() == null || marketNews.getProfiles().isEmpty()) {
+            throw new IllegalStateException("features.marketNews.profiles is required and must not be empty");
+        }
+        for (SearchLlmProperties.MarketNewsProfile profile : marketNews.getProfiles()) {
+            if (profile == null) {
+                throw new IllegalStateException("features.marketNews.profiles contains null profile");
+            }
+            if (!hasText(profile.getName())) {
+                throw new IllegalStateException("features.marketNews.profiles[].name is required");
+            }
+            boolean hasQuery = hasText(profile.getQuery());
+            boolean hasQueries = profile.getQueries() != null && !profile.getQueries().isEmpty();
+            if (!hasQuery && !hasQueries) {
+                throw new IllegalStateException("features.marketNews.profiles[" + profile.getName() + "] must set query or queries");
+            }
         }
         return cfg;
     }

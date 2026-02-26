@@ -217,6 +217,56 @@ cp agentService/config/agent-llm.local.example.json agentService/config/agent-ll
 vim agentService/config/agent-llm.local.json
 ```
 
+#### 3.1 配置 Search LLM（market news 非兼容重构）
+
+> 自 `copilot/add-today-market-news-api` 起，`search-llm.local.json` 已切换为 **feature + profiles** 结构。  
+> 旧结构（如 `defaultProvider`、`marketNews.*` 顶层字段）已废弃，加载时会显式报错，不再 fallback。
+
+```bash
+# 复制示例配置
+cp agentService/config/search-llm.local.example.json agentService/config/search-llm.local.json
+
+# 编辑配置，填入您的 API Keys
+vim agentService/config/search-llm.local.json
+```
+
+最小可运行示例（仅展示关键字段）：
+
+```json
+{
+  "providers": {
+    "exa": {
+      "baseUrl": "https://api.exa.ai",
+      "apiKey": "your-key",
+      "searchPath": "/search",
+      "authHeader": "x-api-key"
+    }
+  },
+  "features": {
+    "marketNews": {
+      "defaultProvider": "exa",
+      "defaultLimit": 8,
+      "profiles": [
+        {
+          "name": "cn",
+          "query": "今日A股市场行情",
+          "includeDomains": ["sina.com.cn"],
+          "languages": ["zh"]
+        }
+      ]
+    }
+  }
+}
+```
+
+必填项：
+- `features.marketNews.profiles[].name`
+- `features.marketNews.profiles[].query` 或 `features.marketNews.profiles[].queries`
+
+默认行为：
+- profile 未指定 `provider` 时使用 `features.marketNews.defaultProvider`
+- API 入参未指定 `limit` 时使用 `features.marketNews.defaultLimit`
+
 #### 4. 构建并启动
 ```bash
 # 一键构建所有镜像

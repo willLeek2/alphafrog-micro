@@ -10,18 +10,9 @@ import java.util.Map;
 @ConfigurationProperties(prefix = "agent.search-llm")
 public class SearchLlmProperties {
 
-    private String defaultProvider;
     private Map<String, Provider> providers = new HashMap<>();
-    private MarketNews marketNews = new MarketNews();
+    private Features features = new Features();
     private Prompts prompts = new Prompts();
-
-    public String getDefaultProvider() {
-        return defaultProvider;
-    }
-
-    public void setDefaultProvider(String defaultProvider) {
-        this.defaultProvider = defaultProvider;
-    }
 
     public Map<String, Provider> getProviders() {
         return providers;
@@ -31,12 +22,12 @@ public class SearchLlmProperties {
         this.providers = providers == null ? new HashMap<>() : providers;
     }
 
-    public MarketNews getMarketNews() {
-        return marketNews;
+    public Features getFeatures() {
+        return features;
     }
 
-    public void setMarketNews(MarketNews marketNews) {
-        this.marketNews = marketNews == null ? new MarketNews() : marketNews;
+    public void setFeatures(Features features) {
+        this.features = features == null ? new Features() : features;
     }
 
     public Prompts getPrompts() {
@@ -122,19 +113,34 @@ public class SearchLlmProperties {
         }
     }
 
-    public static class MarketNews {
+    public static class Features {
+        private MarketNewsFeature marketNews = new MarketNewsFeature();
+
+        public MarketNewsFeature getMarketNews() {
+            return marketNews;
+        }
+
+        public void setMarketNews(MarketNewsFeature marketNews) {
+            this.marketNews = marketNews == null ? new MarketNewsFeature() : marketNews;
+        }
+    }
+
+    public static class MarketNewsFeature {
+        private String defaultProvider;
         private Integer defaultLimit;
         private Integer maxResults;
         private Integer maxTokensPerPage;
-        private String country;
-        private String userLocation;
         private String exaSearchType;
         private String exaCategory;
-        private List<String> languages = new ArrayList<>();
-        private List<String> queries = new ArrayList<>();
-        private List<String> includeDomains = new ArrayList<>();
-        private List<String> excludeDomains = new ArrayList<>();
-        private Map<String, List<String>> categoryKeywords = new HashMap<>();
+        private List<MarketNewsProfile> profiles = new ArrayList<>();
+
+        public String getDefaultProvider() {
+            return defaultProvider;
+        }
+
+        public void setDefaultProvider(String defaultProvider) {
+            this.defaultProvider = defaultProvider;
+        }
 
         public Integer getDefaultLimit() {
             return defaultLimit;
@@ -160,22 +166,6 @@ public class SearchLlmProperties {
             this.maxTokensPerPage = maxTokensPerPage;
         }
 
-        public String getCountry() {
-            return country;
-        }
-
-        public void setCountry(String country) {
-            this.country = country;
-        }
-
-        public String getUserLocation() {
-            return userLocation;
-        }
-
-        public void setUserLocation(String userLocation) {
-            this.userLocation = userLocation;
-        }
-
         public String getExaSearchType() {
             return exaSearchType;
         }
@@ -192,12 +182,51 @@ public class SearchLlmProperties {
             this.exaCategory = exaCategory;
         }
 
-        public List<String> getLanguages() {
-            return languages;
+        public List<MarketNewsProfile> getProfiles() {
+            return profiles;
         }
 
-        public void setLanguages(List<String> languages) {
-            this.languages = languages == null ? new ArrayList<>() : languages;
+        public void setProfiles(List<MarketNewsProfile> profiles) {
+            this.profiles = profiles == null ? new ArrayList<>() : profiles;
+        }
+    }
+
+    public static class MarketNewsProfile {
+        private String name;
+        private String provider;
+        private String query;
+        private List<String> queries = new ArrayList<>();
+        private List<String> includeDomains = new ArrayList<>();
+        private List<String> excludeDomains = new ArrayList<>();
+        private List<String> languages = new ArrayList<>();
+        private String country;
+        private String startPublishedDate;
+        private String endPublishedDate;
+        private Integer limit;
+        private String categoryHint;
+
+        public String getName() {
+            return name;
+        }
+
+        public void setName(String name) {
+            this.name = name;
+        }
+
+        public String getProvider() {
+            return provider;
+        }
+
+        public void setProvider(String provider) {
+            this.provider = provider;
+        }
+
+        public String getQuery() {
+            return query;
+        }
+
+        public void setQuery(String query) {
+            this.query = query;
         }
 
         public List<String> getQueries() {
@@ -224,12 +253,52 @@ public class SearchLlmProperties {
             this.excludeDomains = excludeDomains == null ? new ArrayList<>() : excludeDomains;
         }
 
-        public Map<String, List<String>> getCategoryKeywords() {
-            return categoryKeywords;
+        public List<String> getLanguages() {
+            return languages;
         }
 
-        public void setCategoryKeywords(Map<String, List<String>> categoryKeywords) {
-            this.categoryKeywords = categoryKeywords == null ? new HashMap<>() : categoryKeywords;
+        public void setLanguages(List<String> languages) {
+            this.languages = languages == null ? new ArrayList<>() : languages;
+        }
+
+        public String getCountry() {
+            return country;
+        }
+
+        public void setCountry(String country) {
+            this.country = country;
+        }
+
+        public String getStartPublishedDate() {
+            return startPublishedDate;
+        }
+
+        public void setStartPublishedDate(String startPublishedDate) {
+            this.startPublishedDate = startPublishedDate;
+        }
+
+        public String getEndPublishedDate() {
+            return endPublishedDate;
+        }
+
+        public void setEndPublishedDate(String endPublishedDate) {
+            this.endPublishedDate = endPublishedDate;
+        }
+
+        public Integer getLimit() {
+            return limit;
+        }
+
+        public void setLimit(Integer limit) {
+            this.limit = limit;
+        }
+
+        public String getCategoryHint() {
+            return categoryHint;
+        }
+
+        public void setCategoryHint(String categoryHint) {
+            this.categoryHint = categoryHint;
         }
     }
 

@@ -20,6 +20,7 @@ import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -37,86 +38,66 @@ public class MarketNewsService {
     private static final int CJK_EXT_A_END = 0x4DBF;
     private static final int CJK_UNIFIED_START = 0x4E00;
     private static final int CJK_UNIFIED_END = 0x9FFF;
-    private static final int DEFAULT_CONNECT_TIMEOUT_SECONDS = 20;
-    private static final int DEFAULT_REQUEST_TIMEOUT_SECONDS = 45;
 
     private final ObjectMapper objectMapper;
     private final SearchLlmProperties properties;
     private final SearchLlmLocalConfigLoader localConfigLoader;
+    private final HttpClient httpClient = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(20))
+            .build();
 
     public MarketNewsResult getTodayMarketNews(MarketNewsQuery query) {
-        SearchLlmProperties local = localConfigLoader.current().orElse(null);
-        SearchLlmProperties.MarketNews marketNews = resolveMarketNews(local);
-        SearchLlmProperties.Prompts prompts = resolvePrompts(local);
-        String providerName = resolveProviderName(query.provider(), local);
-        SearchLlmProperties.Provider provider = resolveProvider(providerName, local);
-        if (provider == null || isBlank(provider.getBaseUrl())) {
-            throw new IllegalArgumentException("search provider not configured: " + providerName);
+        SearchLlmProperties cfg = localConfigLoader.current().orElse(properties);
+        SearchLlmProperties.MarketNewsFeature feature = requireMarketNewsFeature(cfg);
+
+        int finalLimit = resolveFinalLimit(query.limit(), feature);
+        List<MarketNewsItem> allItems = new ArrayList<>();
+
+        for (SearchLlmProperties.MarketNewsProfile profile : feature.getProfiles()) {
+            ProfileSearchOptions options = resolveProfileOptions(query, feature, profile, cfg.getProviders());
+            MarketNewsResponse response = executeProfileSearch(feature, profile, options);
+            List<MarketNewsItem> profileItems = filterItems(
+                    response.items(),
+                    options.profileLanguages(),
+                    options.startTime(),
+                    options.endTime(),
+                    options.fetchLimit()
+            );
+            allItems.addAll(profileItems);
         }
 
-        int limit = query.limit() > 0 ? query.limit() : defaultLimit(marketNews);
-        int maxResults = marketNews.getMaxResults() == null || marketNews.getMaxResults() <= 0
-                ? Math.max(limit, 10)
-                : marketNews.getMaxResults();
-        int fetchSize = Math.min(limit, maxResults);
-        List<String> languages = resolveLanguages(query.languages(), marketNews);
-        OffsetDateTime startTime = parseOffsetDateTime(query.startPublishedDate());
-        OffsetDateTime endTime = parseOffsetDateTime(query.endPublishedDate());
-        String queryText = resolveQueryText(marketNews, prompts);
-
-        MarketNewsResponse response;
-        if ("exa".equalsIgnoreCase(providerName)) {
-            response = fetchFromExa(provider, marketNews, queryText, fetchSize, startTime, endTime);
-        } else if ("perplexity".equalsIgnoreCase(providerName)) {
-            response = fetchFromPerplexity(provider, marketNews, queryText, fetchSize, languages, startTime, endTime);
-        } else {
-            throw new IllegalArgumentException("unsupported provider: " + providerName);
-        }
-
-        List<MarketNewsItem> filtered = filterItems(
-                response.items(),
-                languages,
-                startTime,
-                endTime,
-                limit
+        List<MarketNewsItem> merged = dedupeAndSort(allItems);
+        List<MarketNewsItem> filteredByRequest = filterItems(
+                merged,
+                query.languages(),
+                parseOffsetDateTime(query.startPublishedDate()),
+                parseOffsetDateTime(query.endPublishedDate()),
+                finalLimit
         );
-        String updatedAt = resolveUpdatedAt(response.updatedAt(), filtered);
-        return new MarketNewsResult(filtered, updatedAt, providerName);
+        String updatedAt = resolveUpdatedAt("", filteredByRequest);
+        return new MarketNewsResult(filteredByRequest, updatedAt, resolveProviderLabel(feature));
     }
 
-    MarketNewsResponse fetchFromPerplexity(SearchLlmProperties.Provider provider,
-                                           SearchLlmProperties.MarketNews marketNews,
-                                           String queryText,
-                                           int limit,
-                                           List<String> languages,
-                                           OffsetDateTime startTime,
-                                           OffsetDateTime endTime) {
-        Map<String, Object> body = new LinkedHashMap<>();
-        body.put("query", queryText);
-        body.put("max_results", Math.min(limit, 20));
-        String recency = resolveRecencyFilter(startTime, endTime);
-        if (hasText(recency)) {
-            body.put("search_recency_filter", recency);
+    MarketNewsResponse executeProfileSearch(SearchLlmProperties.MarketNewsFeature feature,
+                                            SearchLlmProperties.MarketNewsProfile profile,
+                                            ProfileSearchOptions options) {
+        if ("exa".equalsIgnoreCase(options.providerName())) {
+            return fetchFromExa(feature, profile, options);
         }
-        if (marketNews.getMaxTokensPerPage() != null && marketNews.getMaxTokensPerPage() > 0) {
-            body.put("max_tokens_per_page", marketNews.getMaxTokensPerPage());
+        if ("perplexity".equalsIgnoreCase(options.providerName())) {
+            return fetchFromPerplexity(profile, options);
         }
-        List<String> domainFilter = resolveDomainFilter(marketNews);
-        if (!domainFilter.isEmpty()) {
-            body.put("search_domain_filter", domainFilter);
-        }
-        if (!languages.isEmpty()) {
-            body.put("search_language_filter", languages);
-        }
-        if (hasText(marketNews.getCountry())) {
-            body.put("country", marketNews.getCountry());
-        }
-        String responseBody = postJson(provider, body);
+        throw new IllegalArgumentException("unsupported provider: " + options.providerName());
+    }
+
+    MarketNewsResponse fetchFromPerplexity(SearchLlmProperties.MarketNewsProfile profile,
+                                           ProfileSearchOptions options) {
+        String responseBody = postJson(options.provider(), buildPerplexityRequestBody(profile, options));
         try {
             PerplexitySearchResponse response = objectMapper.readValue(responseBody, PerplexitySearchResponse.class);
             List<MarketNewsItem> items = mapPerplexityResults(
                     response == null ? List.of() : response.results(),
-                    marketNews
+                    profile.getCategoryHint()
             );
             return new MarketNewsResponse(items, response == null ? null : response.serverTime());
         } catch (Exception e) {
@@ -124,44 +105,37 @@ public class MarketNewsService {
         }
     }
 
-    MarketNewsResponse fetchFromExa(SearchLlmProperties.Provider provider,
-                                    SearchLlmProperties.MarketNews marketNews,
-                                    String queryText,
-                                    int limit,
-                                    OffsetDateTime startTime,
-                                    OffsetDateTime endTime) {
+    Map<String, Object> buildPerplexityRequestBody(SearchLlmProperties.MarketNewsProfile profile,
+                                                   ProfileSearchOptions options) {
         Map<String, Object> body = new LinkedHashMap<>();
-        body.put("query", queryText);
-        body.put("type", hasText(marketNews.getExaSearchType()) ? marketNews.getExaSearchType() : "auto");
-        if (hasText(marketNews.getExaCategory())) {
-            body.put("category", marketNews.getExaCategory());
-        }
-        body.put("numResults", Math.min(limit, 100));
-        if (startTime != null) {
-            body.put("startPublishedDate", startTime.toInstant().toString());
-        }
-        if (endTime != null) {
-            body.put("endPublishedDate", endTime.toInstant().toString());
-        }
-        if (!marketNews.getIncludeDomains().isEmpty()) {
-            body.put("includeDomains", marketNews.getIncludeDomains());
-        }
-        if (!marketNews.getExcludeDomains().isEmpty()) {
-            body.put("excludeDomains", marketNews.getExcludeDomains());
-        }
-        if (hasText(marketNews.getUserLocation())) {
-            body.put("userLocation", marketNews.getUserLocation());
-        }
-        Map<String, Object> contents = new LinkedHashMap<>();
-        contents.put("text", false);
-        body.put("contents", contents);
+        body.put("query", options.queryText());
+        body.put("max_results", Math.min(options.fetchLimit(), 20));
 
-        String responseBody = postJson(provider, body);
+        String recency = resolveRecencyFilter(options.startTime(), options.endTime());
+        if (hasText(recency)) {
+            body.put("search_recency_filter", recency);
+        }
+        if (!options.domainFilter().isEmpty()) {
+            body.put("search_domain_filter", options.domainFilter());
+        }
+        if (!options.profileLanguages().isEmpty()) {
+            body.put("search_language_filter", options.profileLanguages());
+        }
+        if (hasText(profile.getCountry())) {
+            body.put("country", profile.getCountry());
+        }
+        return body;
+    }
+
+    MarketNewsResponse fetchFromExa(SearchLlmProperties.MarketNewsFeature feature,
+                                    SearchLlmProperties.MarketNewsProfile profile,
+                                    ProfileSearchOptions options) {
+        String responseBody = postJson(options.provider(), buildExaRequestBody(feature, profile, options));
         try {
             ExaSearchResponse response = objectMapper.readValue(responseBody, ExaSearchResponse.class);
             List<MarketNewsItem> items = mapExaResults(
                     response == null ? List.of() : response.results(),
-                    marketNews
+                    profile.getCategoryHint()
             );
             return new MarketNewsResponse(items, null);
         } catch (Exception e) {
@@ -169,8 +143,40 @@ public class MarketNewsService {
         }
     }
 
+    Map<String, Object> buildExaRequestBody(SearchLlmProperties.MarketNewsFeature feature,
+                                            SearchLlmProperties.MarketNewsProfile profile,
+                                            ProfileSearchOptions options) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("query", options.queryText());
+        body.put("type", hasText(feature.getExaSearchType()) ? feature.getExaSearchType() : "auto");
+        if (hasText(feature.getExaCategory())) {
+            body.put("category", feature.getExaCategory());
+        }
+        body.put("numResults", Math.min(options.fetchLimit(), 100));
+        if (options.startTime() != null) {
+            body.put("startPublishedDate", options.startTime().toInstant().toString());
+        }
+        if (options.endTime() != null) {
+            body.put("endPublishedDate", options.endTime().toInstant().toString());
+        }
+        if (!profile.getIncludeDomains().isEmpty()) {
+            body.put("includeDomains", profile.getIncludeDomains());
+        }
+        if (!profile.getExcludeDomains().isEmpty()) {
+            body.put("excludeDomains", profile.getExcludeDomains());
+        }
+        if (hasText(profile.getCountry())) {
+            body.put("userLocation", profile.getCountry());
+        }
+        Map<String, Object> contents = new LinkedHashMap<>();
+        contents.put("summary", true);
+        contents.put("text", false);
+        body.put("contents", contents);
+        return body;
+    }
+
     List<MarketNewsItem> mapPerplexityResults(List<PerplexitySearchResult> results,
-                                              SearchLlmProperties.MarketNews marketNews) {
+                                              String categoryHint) {
         List<MarketNewsItem> items = new ArrayList<>();
         if (results == null) {
             return items;
@@ -184,7 +190,7 @@ public class MarketNewsService {
             String url = nvl(result.url());
             String timestamp = firstNonBlank(result.lastUpdated(), result.date());
             String source = deriveSource(url, null);
-            String category = resolveCategory(title, marketNews);
+            String category = hasText(categoryHint) ? categoryHint.trim() : resolveCategory(title);
             String id = generateId(url, title, index++);
             items.add(new MarketNewsItem(id, timestamp, title, source, category, url));
         }
@@ -192,7 +198,7 @@ public class MarketNewsService {
     }
 
     List<MarketNewsItem> mapExaResults(List<ExaSearchResult> results,
-                                       SearchLlmProperties.MarketNews marketNews) {
+                                       String categoryHint) {
         List<MarketNewsItem> items = new ArrayList<>();
         if (results == null) {
             return items;
@@ -206,7 +212,7 @@ public class MarketNewsService {
             String url = nvl(result.url());
             String timestamp = nvl(result.publishedDate());
             String source = deriveSource(url, result.author());
-            String category = resolveCategory(title, marketNews);
+            String category = hasText(categoryHint) ? categoryHint.trim() : resolveCategory(title);
             String id = firstNonBlank(result.id(), generateId(url, title, index++));
             items.add(new MarketNewsItem(id, timestamp, title, source, category, url));
         }
@@ -242,143 +248,145 @@ public class MarketNewsService {
         return filtered;
     }
 
-    private SearchLlmProperties.MarketNews resolveMarketNews(SearchLlmProperties local) {
-        SearchLlmProperties.MarketNews base = properties.getMarketNews();
-        SearchLlmProperties.MarketNews override = local == null ? null : local.getMarketNews();
-        SearchLlmProperties.MarketNews merged = new SearchLlmProperties.MarketNews();
-        merged.setDefaultLimit(firstNonNull(override == null ? null : override.getDefaultLimit(), base.getDefaultLimit()));
-        merged.setMaxResults(firstNonNull(override == null ? null : override.getMaxResults(), base.getMaxResults()));
-        merged.setMaxTokensPerPage(firstNonNull(override == null ? null : override.getMaxTokensPerPage(), base.getMaxTokensPerPage()));
-        merged.setCountry(firstNonBlank(override == null ? null : override.getCountry(), base.getCountry()));
-        merged.setUserLocation(firstNonBlank(override == null ? null : override.getUserLocation(), base.getUserLocation()));
-        merged.setExaSearchType(firstNonBlank(override == null ? null : override.getExaSearchType(), base.getExaSearchType()));
-        merged.setExaCategory(firstNonBlank(override == null ? null : override.getExaCategory(), base.getExaCategory()));
-        merged.setLanguages(copyList(isEmpty(override == null ? null : override.getLanguages())
-                ? base.getLanguages()
-                : override.getLanguages()));
-        merged.setQueries(copyList(isEmpty(override == null ? null : override.getQueries())
-                ? base.getQueries()
-                : override.getQueries()));
-        merged.setIncludeDomains(copyList(isEmpty(override == null ? null : override.getIncludeDomains())
-                ? base.getIncludeDomains()
-                : override.getIncludeDomains()));
-        merged.setExcludeDomains(copyList(isEmpty(override == null ? null : override.getExcludeDomains())
-                ? base.getExcludeDomains()
-                : override.getExcludeDomains()));
-        merged.setCategoryKeywords(copyMap(isEmpty(override == null ? null : override.getCategoryKeywords())
-                ? base.getCategoryKeywords()
-                : override.getCategoryKeywords()));
+    List<MarketNewsItem> dedupeAndSort(List<MarketNewsItem> items) {
+        if (items == null || items.isEmpty()) {
+            return List.of();
+        }
+        Map<String, MarketNewsItem> urlMap = new LinkedHashMap<>();
+        List<MarketNewsItem> noUrl = new ArrayList<>();
+        for (MarketNewsItem item : items) {
+            if (item == null) {
+                continue;
+            }
+            String key = normalizeKey(item.url());
+            if (!hasText(key)) {
+                noUrl.add(item);
+                continue;
+            }
+            upsertByFreshness(urlMap, key, item);
+        }
+
+        Map<String, MarketNewsItem> titleMap = new LinkedHashMap<>();
+        for (MarketNewsItem item : urlMap.values()) {
+            upsertByFreshness(titleMap, normalizeKey(item.title()), item);
+        }
+        for (MarketNewsItem item : noUrl) {
+            upsertByFreshness(titleMap, normalizeKey(item.title()), item);
+        }
+
+        List<MarketNewsItem> merged = new ArrayList<>(titleMap.values());
+        merged.sort(Comparator.comparing(this::timestampOrMin).reversed());
         return merged;
     }
 
-    private SearchLlmProperties.Prompts resolvePrompts(SearchLlmProperties local) {
-        SearchLlmProperties.Prompts base = properties.getPrompts();
-        SearchLlmProperties.Prompts override = local == null ? null : local.getPrompts();
-        SearchLlmProperties.Prompts merged = new SearchLlmProperties.Prompts();
-        merged.setMarketNewsQueryTemplate(firstNonBlank(
-                override == null ? null : override.getMarketNewsQueryTemplate(),
-                base == null ? null : base.getMarketNewsQueryTemplate()
-        ));
-        return merged;
+    private void upsertByFreshness(Map<String, MarketNewsItem> map, String key, MarketNewsItem candidate) {
+        if (!hasText(key) || candidate == null) {
+            return;
+        }
+        MarketNewsItem existing = map.get(key);
+        if (existing == null || timestampOrMin(candidate).isAfter(timestampOrMin(existing))) {
+            map.put(key, candidate);
+        }
     }
 
-    private SearchLlmProperties.Provider resolveProvider(String providerName, SearchLlmProperties local) {
-        Map<String, SearchLlmProperties.Provider> baseProviders = properties.getProviders();
-        Map<String, SearchLlmProperties.Provider> overrideProviders = local == null ? Map.of() : local.getProviders();
-        SearchLlmProperties.Provider base = baseProviders == null ? null : baseProviders.get(providerName);
-        SearchLlmProperties.Provider override = overrideProviders == null ? null : overrideProviders.get(providerName);
-        if (base == null && override == null) {
-            return null;
-        }
-        SearchLlmProperties.Provider merged = new SearchLlmProperties.Provider();
-        if (base != null) {
-            merged.setBaseUrl(base.getBaseUrl());
-            merged.setApiKey(base.getApiKey());
-            merged.setSearchPath(base.getSearchPath());
-            merged.setAuthHeader(base.getAuthHeader());
-            merged.setAuthPrefix(base.getAuthPrefix());
-            merged.setConnectTimeoutSeconds(base.getConnectTimeoutSeconds());
-            merged.setRequestTimeoutSeconds(base.getRequestTimeoutSeconds());
-            merged.setHeaders(copyMap(base.getHeaders()));
-        }
-        if (override != null) {
-            if (hasText(override.getBaseUrl())) {
-                merged.setBaseUrl(override.getBaseUrl());
-            }
-            if (hasText(override.getApiKey())) {
-                merged.setApiKey(override.getApiKey());
-            }
-            if (hasText(override.getSearchPath())) {
-                merged.setSearchPath(override.getSearchPath());
-            }
-            if (hasText(override.getAuthHeader())) {
-                merged.setAuthHeader(override.getAuthHeader());
-            }
-            if (override.getAuthPrefix() != null) {
-                merged.setAuthPrefix(override.getAuthPrefix());
-            }
-            if (override.getConnectTimeoutSeconds() != null) {
-                merged.setConnectTimeoutSeconds(override.getConnectTimeoutSeconds());
-            }
-            if (override.getRequestTimeoutSeconds() != null) {
-                merged.setRequestTimeoutSeconds(override.getRequestTimeoutSeconds());
-            }
-            if (override.getHeaders() != null && !override.getHeaders().isEmpty()) {
-                Map<String, String> headers = merged.getHeaders();
-                headers.putAll(override.getHeaders());
-                merged.setHeaders(headers);
-            }
-        }
-        return merged;
+    private OffsetDateTime timestampOrMin(MarketNewsItem item) {
+        OffsetDateTime ts = item == null ? null : parseOffsetDateTime(item.timestamp());
+        return ts == null ? OffsetDateTime.MIN : ts;
     }
 
-    private String resolveProviderName(String provider, SearchLlmProperties local) {
-        String resolved = firstNonBlank(
+    private ProfileSearchOptions resolveProfileOptions(MarketNewsQuery query,
+                                                       SearchLlmProperties.MarketNewsFeature feature,
+                                                       SearchLlmProperties.MarketNewsProfile profile,
+                                                       Map<String, SearchLlmProperties.Provider> providers) {
+        String providerName = firstNonBlank(profile.getProvider(), feature.getDefaultProvider());
+        if (!hasText(providerName)) {
+            throw new IllegalStateException("marketNews profile " + profile.getName() + " missing provider and feature defaultProvider");
+        }
+        SearchLlmProperties.Provider provider = providers.get(providerName);
+        if (provider == null || !hasText(provider.getBaseUrl())) {
+            throw new IllegalArgumentException("search provider not configured: " + providerName);
+        }
+
+        String queryText = resolveProfileQuery(profile);
+        int requestedFinalLimit = resolveFinalLimit(query.limit(), feature);
+        int profileLimit = profile.getLimit() != null && profile.getLimit() > 0 ? profile.getLimit() : requestedFinalLimit;
+        int maxResults = feature.getMaxResults() != null && feature.getMaxResults() > 0 ? feature.getMaxResults() : profileLimit;
+        int fetchLimit = Math.min(profileLimit, maxResults);
+
+        OffsetDateTime startTime = parseOffsetDateTime(firstNonBlank(profile.getStartPublishedDate(), query.startPublishedDate()));
+        OffsetDateTime endTime = parseOffsetDateTime(firstNonBlank(profile.getEndPublishedDate(), query.endPublishedDate()));
+
+        List<String> profileLanguages = trimList(profile.getLanguages());
+        List<String> domainFilter = resolveProfileDomainFilter(profile);
+        return new ProfileSearchOptions(
+                providerName,
                 provider,
-                local == null ? null : local.getDefaultProvider(),
-                properties.getDefaultProvider()
+                queryText,
+                fetchLimit,
+                startTime,
+                endTime,
+                profileLanguages,
+                domainFilter
         );
-        if (hasText(resolved)) {
-            return resolved;
-        }
-        Map<String, SearchLlmProperties.Provider> providers = properties.getProviders();
-        if (providers != null && !providers.isEmpty()) {
-            return providers.keySet().iterator().next();
-        }
-        return "";
     }
 
-    private String resolveQueryText(SearchLlmProperties.MarketNews marketNews, SearchLlmProperties.Prompts prompts) {
-        if (prompts != null && hasText(prompts.getMarketNewsQueryTemplate())) {
-            return prompts.getMarketNewsQueryTemplate().trim();
+    private SearchLlmProperties.MarketNewsFeature requireMarketNewsFeature(SearchLlmProperties cfg) {
+        if (cfg == null || cfg.getFeatures() == null || cfg.getFeatures().getMarketNews() == null) {
+            throw new IllegalStateException("search-llm features.marketNews config is required");
         }
-        List<String> queries = marketNews.getQueries();
+        SearchLlmProperties.MarketNewsFeature feature = cfg.getFeatures().getMarketNews();
+        if (feature.getProfiles() == null || feature.getProfiles().isEmpty()) {
+            throw new IllegalStateException("search-llm features.marketNews.profiles must not be empty");
+        }
+        return feature;
+    }
+
+    private int resolveFinalLimit(int requestLimit, SearchLlmProperties.MarketNewsFeature feature) {
+        if (requestLimit > 0) {
+            return requestLimit;
+        }
+        if (feature.getDefaultLimit() != null && feature.getDefaultLimit() > 0) {
+            return feature.getDefaultLimit();
+        }
+        return 8;
+    }
+
+    private String resolveProviderLabel(SearchLlmProperties.MarketNewsFeature feature) {
+        if (feature == null) {
+            return "";
+        }
+        return nvl(feature.getDefaultProvider());
+    }
+
+    private String resolveProfileQuery(SearchLlmProperties.MarketNewsProfile profile) {
         LinkedHashSet<String> unique = new LinkedHashSet<>();
-        for (String q : queries) {
-            if (hasText(q)) {
-                unique.add(q.trim());
+        if (hasText(profile.getQuery())) {
+            unique.add(profile.getQuery().trim());
+        }
+        if (profile.getQueries() != null) {
+            for (String q : profile.getQueries()) {
+                if (hasText(q)) {
+                    unique.add(q.trim());
+                }
             }
         }
         if (unique.isEmpty()) {
-            throw new IllegalStateException("market news query configuration is empty");
+            throw new IllegalStateException("marketNews profile " + profile.getName() + " query is empty");
         }
         return String.join(" OR ", unique);
     }
 
-    private List<String> resolveDomainFilter(SearchLlmProperties.MarketNews marketNews) {
+    private List<String> resolveProfileDomainFilter(SearchLlmProperties.MarketNewsProfile profile) {
         List<String> domains = new ArrayList<>();
-        if (marketNews == null) {
-            return domains;
-        }
-        if (marketNews.getIncludeDomains() != null) {
-            for (String domain : marketNews.getIncludeDomains()) {
+        if (profile.getIncludeDomains() != null) {
+            for (String domain : profile.getIncludeDomains()) {
                 if (hasText(domain)) {
                     domains.add(domain.trim());
                 }
             }
         }
-        if (marketNews.getExcludeDomains() != null) {
-            for (String domain : marketNews.getExcludeDomains()) {
+        if (profile.getExcludeDomains() != null) {
+            for (String domain : profile.getExcludeDomains()) {
                 if (hasText(domain)) {
                     domains.add("-" + domain.trim());
                 }
@@ -387,17 +395,17 @@ public class MarketNewsService {
         return domains;
     }
 
-    private List<String> resolveLanguages(List<String> override, SearchLlmProperties.MarketNews marketNews) {
-        List<String> resolved = new ArrayList<>();
-        List<String> source = isEmpty(override) ? marketNews.getLanguages() : override;
-        if (source != null) {
-            for (String lang : source) {
-                if (hasText(lang)) {
-                    resolved.add(lang.trim());
-                }
+    private List<String> trimList(List<String> raw) {
+        if (raw == null || raw.isEmpty()) {
+            return List.of();
+        }
+        List<String> out = new ArrayList<>();
+        for (String value : raw) {
+            if (hasText(value)) {
+                out.add(value.trim());
             }
         }
-        return resolved;
+        return out;
     }
 
     private String resolveUpdatedAt(String serverTime, List<MarketNewsItem> items) {
@@ -429,7 +437,6 @@ public class MarketNewsService {
             start = end;
             end = tmp;
         }
-        // Perplexity recency filter only supports day/week/month/year granularity, so sub-day ranges are rounded up.
         long days = Duration.between(start, end).toDays();
         if (days <= 1) {
             return "day";
@@ -444,13 +451,12 @@ public class MarketNewsService {
     }
 
     private boolean matchesLanguage(String title, List<String> languages) {
-        if (isEmpty(languages)) {
+        if (languages == null || languages.isEmpty()) {
             return true;
         }
         if (title == null || title.isBlank()) {
             return false;
         }
-        // 覆盖 CJK Unified Ideographs Extension A (0x3400-0x4DBF) 与基础区 (0x4E00-0x9FFF)。
         String sample = title.length() > LANGUAGE_DETECTION_SAMPLE_LENGTH
                 ? title.substring(0, LANGUAGE_DETECTION_SAMPLE_LENGTH)
                 : title;
@@ -517,28 +523,19 @@ public class MarketNewsService {
         }
     }
 
-    private String resolveCategory(String title, SearchLlmProperties.MarketNews marketNews) {
-        if (marketNews != null && marketNews.getCategoryKeywords() != null && !marketNews.getCategoryKeywords().isEmpty()) {
-            String lowered = title == null ? "" : title.toLowerCase(Locale.ROOT);
-            for (Map.Entry<String, List<String>> entry : marketNews.getCategoryKeywords().entrySet()) {
-                String category = entry.getKey();
-                if (!hasText(category)) {
-                    continue;
-                }
-                List<String> keywords = entry.getValue();
-                if (keywords == null || keywords.isEmpty()) {
-                    continue;
-                }
-                for (String keyword : keywords) {
-                    if (keyword == null || keyword.isBlank()) {
-                        continue;
-                    }
-                    String needle = keyword.toLowerCase(Locale.ROOT);
-                    if (lowered.contains(needle)) {
-                        return category;
-                    }
-                }
-            }
+    private String resolveCategory(String title) {
+        if (title == null || title.isBlank()) {
+            return "market";
+        }
+        String lowered = title.toLowerCase(Locale.ROOT);
+        if (lowered.contains("央行") || lowered.contains("政策")) {
+            return "policy";
+        }
+        if (lowered.contains("美股") || lowered.contains("纳指") || lowered.contains("道指")) {
+            return "global";
+        }
+        if (lowered.contains("行业") || lowered.contains("板块")) {
+            return "sector";
         }
         return "market";
     }
@@ -567,6 +564,13 @@ public class MarketNewsService {
         return UUID.nameUUIDFromBytes(seed.getBytes(StandardCharsets.UTF_8)).toString();
     }
 
+    private String normalizeKey(String value) {
+        if (!hasText(value)) {
+            return "";
+        }
+        return value.trim().toLowerCase(Locale.ROOT);
+    }
+
     private String postJson(SearchLlmProperties.Provider provider, Map<String, Object> body) {
         String baseUrl = provider.getBaseUrl();
         String path = provider.getSearchPath();
@@ -576,10 +580,9 @@ public class MarketNewsService {
         }
         try {
             String requestBody = objectMapper.writeValueAsString(body);
-            int requestTimeoutSeconds = resolveRequestTimeoutSeconds(provider);
             HttpRequest.Builder requestBuilder = HttpRequest.newBuilder()
                     .uri(URI.create(url))
-                    .timeout(Duration.ofSeconds(requestTimeoutSeconds))
+                    .timeout(Duration.ofSeconds(requestTimeout(provider)))
                     .header("Content-Type", "application/json")
                     .header("Accept", "application/json")
                     .POST(HttpRequest.BodyPublishers.ofString(requestBody, StandardCharsets.UTF_8));
@@ -591,8 +594,7 @@ public class MarketNewsService {
                     }
                 }
             }
-            HttpClient client = buildHttpClient(provider);
-            HttpResponse<String> response = client.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString());
+            HttpResponse<String> response = httpClient.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString());
             if (response.statusCode() >= 300) {
                 log.error("Search provider {} returned status {} body {}", url, response.statusCode(), response.body());
                 throw new IllegalStateException("search provider error: " + response.statusCode());
@@ -601,6 +603,13 @@ public class MarketNewsService {
         } catch (Exception e) {
             throw new IllegalStateException("search provider request failed", e);
         }
+    }
+
+    private int requestTimeout(SearchLlmProperties.Provider provider) {
+        if (provider == null || provider.getRequestTimeoutSeconds() == null || provider.getRequestTimeoutSeconds() <= 0) {
+            return 45;
+        }
+        return provider.getRequestTimeoutSeconds();
     }
 
     private void applyAuthHeader(SearchLlmProperties.Provider provider, HttpRequest.Builder builder) {
@@ -631,33 +640,6 @@ public class MarketNewsService {
         return normalizedBase + normalizedPath;
     }
 
-    int resolveConnectTimeoutSeconds(SearchLlmProperties.Provider provider) {
-        return firstPositive(
-                provider == null ? null : provider.getConnectTimeoutSeconds(),
-                DEFAULT_CONNECT_TIMEOUT_SECONDS
-        );
-    }
-
-    int resolveRequestTimeoutSeconds(SearchLlmProperties.Provider provider) {
-        return firstPositive(
-                provider == null ? null : provider.getRequestTimeoutSeconds(),
-                DEFAULT_REQUEST_TIMEOUT_SECONDS
-        );
-    }
-
-    private HttpClient buildHttpClient(SearchLlmProperties.Provider provider) {
-        return HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(resolveConnectTimeoutSeconds(provider)))
-                .build();
-    }
-
-    private int defaultLimit(SearchLlmProperties.MarketNews marketNews) {
-        if (marketNews == null || marketNews.getDefaultLimit() == null || marketNews.getDefaultLimit() <= 0) {
-            return 8;
-        }
-        return marketNews.getDefaultLimit();
-    }
-
     private String firstNonBlank(String... values) {
         if (values == null) {
             return "";
@@ -670,42 +652,8 @@ public class MarketNewsService {
         return "";
     }
 
-    private <T> T firstNonNull(T first, T second) {
-        return first != null ? first : second;
-    }
-
-    private int firstPositive(Integer first, int fallback) {
-        if (first != null && first > 0) {
-            return first;
-        }
-        return fallback;
-    }
-
     private boolean hasText(String value) {
         return value != null && !value.trim().isEmpty();
-    }
-
-    private boolean isBlank(String value) {
-        return !hasText(value);
-    }
-
-    private boolean isEmpty(List<?> list) {
-        return list == null || list.isEmpty();
-    }
-
-    private boolean isEmpty(Map<?, ?> map) {
-        return map == null || map.isEmpty();
-    }
-
-    private List<String> copyList(List<String> values) {
-        return values == null ? List.of() : new ArrayList<>(values);
-    }
-
-    private <T> Map<String, T> copyMap(Map<String, T> values) {
-        if (values == null) {
-            return new LinkedHashMap<>();
-        }
-        return new LinkedHashMap<>(values);
     }
 
     private String nvl(String value) {
@@ -733,6 +681,16 @@ public class MarketNewsService {
     public record MarketNewsResponse(List<MarketNewsItem> items, String updatedAt) {
     }
 
+    record ProfileSearchOptions(String providerName,
+                                SearchLlmProperties.Provider provider,
+                                String queryText,
+                                int fetchLimit,
+                                OffsetDateTime startTime,
+                                OffsetDateTime endTime,
+                                List<String> profileLanguages,
+                                List<String> domainFilter) {
+    }
+
     @JsonIgnoreProperties(ignoreUnknown = true)
     public record PerplexitySearchResponse(@JsonProperty("results") List<PerplexitySearchResult> results,
                                            @JsonProperty("server_time") String serverTime) {
@@ -753,6 +711,7 @@ public class MarketNewsService {
     @JsonIgnoreProperties(ignoreUnknown = true)
     public record ExaSearchResult(String title,
                                   String url,
+                                  String summary,
                                   String author,
                                   String id,
                                   @JsonProperty("publishedDate") String publishedDate) {
