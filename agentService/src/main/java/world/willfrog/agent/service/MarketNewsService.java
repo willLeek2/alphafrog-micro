@@ -189,7 +189,7 @@ public class MarketNewsService {
             String url = nvl(result.url());
             String timestamp = firstNonBlank(result.lastUpdated(), result.date());
             String source = deriveSource(url, null);
-            String category = hasText(categoryHint) ? categoryHint.trim() : resolveCategory(title);
+            String category = hasText(categoryHint) ? categoryHint.trim() : "market";
             String id = generateId(url, title, index++);
             items.add(new MarketNewsItem(id, timestamp, title, source, category, url));
         }
@@ -211,7 +211,7 @@ public class MarketNewsService {
             String url = nvl(result.url());
             String timestamp = nvl(result.publishedDate());
             String source = deriveSource(url, result.author());
-            String category = hasText(categoryHint) ? categoryHint.trim() : resolveCategory(title);
+            String category = hasText(categoryHint) ? categoryHint.trim() : "market";
             String id = firstNonBlank(result.id(), generateId(url, title, index++));
             items.add(new MarketNewsItem(id, timestamp, title, source, category, url));
         }
@@ -524,23 +524,6 @@ public class MarketNewsService {
         }
     }
 
-    private String resolveCategory(String title) {
-        if (title == null || title.isBlank()) {
-            return "market";
-        }
-        String lowered = title.toLowerCase(Locale.ROOT);
-        if (lowered.contains("央行") || lowered.contains("政策")) {
-            return "policy";
-        }
-        if (lowered.contains("美股") || lowered.contains("纳指") || lowered.contains("道指")) {
-            return "global";
-        }
-        if (lowered.contains("行业") || lowered.contains("板块")) {
-            return "sector";
-        }
-        return "market";
-    }
-
     private String deriveSource(String url, String author) {
         if (hasText(author)) {
             return author.trim();
@@ -712,7 +695,6 @@ public class MarketNewsService {
     @JsonIgnoreProperties(ignoreUnknown = true)
     public record ExaSearchResult(String title,
                                   String url,
-                                  String summary,
                                   String author,
                                   String id,
                                   @JsonProperty("publishedDate") String publishedDate) {
