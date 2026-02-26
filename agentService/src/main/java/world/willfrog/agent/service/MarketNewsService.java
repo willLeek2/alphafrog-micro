@@ -302,7 +302,7 @@ public class MarketNewsService {
                                                        Map<String, SearchLlmProperties.Provider> providers) {
         String providerName = firstNonBlank(profile.getProvider(), feature.getDefaultProvider());
         if (!hasText(providerName)) {
-            throw new IllegalStateException("marketNews profile " + profile.getName() + " does not specify provider and feature.defaultProvider is not configured");
+            throw new IllegalStateException("marketNews profile '" + profile.getName() + "' does not specify provider and feature.defaultProvider is not configured");
         }
         SearchLlmProperties.Provider provider = providers.get(providerName);
         if (provider == null || !hasText(provider.getBaseUrl())) {

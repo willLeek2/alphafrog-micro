@@ -115,7 +115,7 @@ public class SearchLlmLocalConfigLoader {
             throw new IllegalStateException("search-llm config must be a JSON object: " + path);
         }
         if (root.has("defaultProvider") || root.has("marketNews")) {
-            throw new IllegalStateException("Legacy fields detected (defaultProvider, marketNews). Migrate to features.marketNews.profiles schema. See README section '配置 Search LLM（Market News 非兼容重构）': " + path);
+            throw new IllegalStateException("Legacy fields detected (defaultProvider, marketNews). Migrate to features.marketNews.profiles schema. See README section 'Configure Search LLM (Market News 非兼容重构)': " + path);
         }
     }
 
