@@ -1,4 +1,4 @@
-package world.willfrog.agent.service;
+package world.willfrog.externalinfo.service;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -8,7 +8,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
-import world.willfrog.agent.config.SearchLlmProperties;
+import world.willfrog.externalinfo.config.SearchLlmProperties;
 
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
@@ -26,7 +26,7 @@ public class SearchLlmLocalConfigLoader {
 
     private final ObjectMapper objectMapper;
 
-    @Value("${agent.search-llm.config-file:}")
+    @Value("${external-info.search-llm.config-file:}")
     private String configFile;
 
     private volatile SearchLlmProperties localConfig;
@@ -44,7 +44,7 @@ public class SearchLlmLocalConfigLoader {
         reloadIfNeeded(true);
     }
 
-    @Scheduled(fixedDelayString = "${agent.search-llm.config-refresh-interval-ms:10000}")
+    @Scheduled(fixedDelayString = "${external-info.search-llm.config-refresh-interval-ms:10000}")
     public void refresh() {
         reloadIfNeeded(false);
     }
@@ -57,9 +57,9 @@ public class SearchLlmLocalConfigLoader {
         String file = configFile == null ? "" : configFile.trim();
         if (file.isEmpty()) {
             if (force) {
-                log.info("agent.search-llm.config-file is empty, skip local search config loading");
+                log.info("external-info.search-llm.config-file is empty, skip local search config loading");
             }
-            clearLocalConfigIfPresent("agent.search-llm.config-file is empty");
+            clearLocalConfigIfPresent("external-info.search-llm.config-file is empty");
             return;
         }
         Path path = Paths.get(file).toAbsolutePath().normalize();
@@ -179,7 +179,15 @@ public class SearchLlmLocalConfigLoader {
                 throw new IllegalStateException("features.marketNews.profiles[].name is required");
             }
             boolean hasQuery = hasText(profile.getQuery());
-            boolean hasQueries = profile.getQueries() != null && !profile.getQueries().isEmpty();
+            boolean hasQueries = false;
+            if (profile.getQueries() != null) {
+                for (String q : profile.getQueries()) {
+                    if (hasText(q)) {
+                        hasQueries = true;
+                        break;
+                    }
+                }
+            }
             if (!hasQuery && !hasQueries) {
                 throw new IllegalStateException("features.marketNews.profiles[" + profile.getName() + "] must set query or queries");
             }

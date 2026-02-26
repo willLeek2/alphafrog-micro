@@ -10,8 +10,7 @@ import org.springframework.context.annotation.Configuration;
 @EnableConfigurationProperties({
     AgentLlmProperties.class, 
     CodeRefineProperties.class,
-    AgentObservabilityProperties.class,
-    SearchLlmProperties.class
+    AgentObservabilityProperties.class
 })
 public class AiConfig {
 

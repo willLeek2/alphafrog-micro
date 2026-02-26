@@ -9,13 +9,13 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
-import world.willfrog.alphafrogmicro.agent.idl.AgentDubboService;
-import world.willfrog.alphafrogmicro.agent.idl.GetTodayMarketNewsRequest;
-import world.willfrog.alphafrogmicro.agent.idl.GetTodayMarketNewsResponse;
-import world.willfrog.alphafrogmicro.agent.idl.MarketNewsItemMessage;
 import world.willfrog.alphafrogmicro.common.dto.ResponseCode;
 import world.willfrog.alphafrogmicro.common.dto.ResponseWrapper;
 import world.willfrog.alphafrogmicro.common.pojo.user.User;
+import world.willfrog.alphafrogmicro.externalinfo.idl.ExternalInfoDubboService;
+import world.willfrog.alphafrogmicro.externalinfo.idl.GetTodayMarketNewsRequest;
+import world.willfrog.alphafrogmicro.externalinfo.idl.GetTodayMarketNewsResponse;
+import world.willfrog.alphafrogmicro.externalinfo.idl.MarketNewsItemMessage;
 import world.willfrog.alphafrogmicro.frontend.model.market.MarketNewsItemResponse;
 import world.willfrog.alphafrogmicro.frontend.model.market.MarketNewsResponse;
 import world.willfrog.alphafrogmicro.frontend.service.AuthService;
@@ -25,7 +25,7 @@ import java.util.Arrays;
 import java.util.List;
 
 @RestController
-@RequestMapping("/api/v1/market/news")
+@RequestMapping("/api/market/news")
 @RequiredArgsConstructor
 @Slf4j
 public class MarketNewsController {
@@ -33,7 +33,7 @@ public class MarketNewsController {
     private static final int MAX_LIMIT = 50;
 
     @DubboReference
-    private AgentDubboService agentDubboService;
+    private ExternalInfoDubboService externalInfoDubboService;
 
     private final AuthService authService;
 
@@ -50,8 +50,8 @@ public class MarketNewsController {
         }
         try {
             List<String> languages = parseLanguages(language);
+            // 仅用于保持登录与用户有效性校验逻辑一致，不向外部信息服务透传 userId。
             GetTodayMarketNewsRequest.Builder builder = GetTodayMarketNewsRequest.newBuilder()
-                    .setUserId(userId)
                     .setLimit(resolveLimit(limit))
                     .setProvider(nvl(provider))
                     .setStartPublishedDate(nvl(startPublishedDate))
@@ -59,7 +59,7 @@ public class MarketNewsController {
             if (!languages.isEmpty()) {
                 builder.addAllLanguages(languages);
             }
-            GetTodayMarketNewsResponse resp = agentDubboService.getTodayMarketNews(builder.build());
+            GetTodayMarketNewsResponse resp = externalInfoDubboService.getTodayMarketNews(builder.build());
             List<MarketNewsItemResponse> items = new ArrayList<>();
             for (MarketNewsItemMessage item : resp.getDataList()) {
                 items.add(new MarketNewsItemResponse(

@@ -1,4 +1,4 @@
-package world.willfrog.agent.service;
+package world.willfrog.externalinfo.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
@@ -76,5 +76,40 @@ class SearchLlmLocalConfigLoaderTest {
 
         assertTrue(loader.current().isPresent());
         assertEquals(1, loader.current().orElseThrow().getFeatures().getMarketNews().getProfiles().size());
+    }
+
+    @Test
+    void load_shouldRejectProfileWithOnlyBlankQueries() throws Exception {
+        Path configFile = tempDir.resolve("search-llm.local.json");
+        Files.writeString(configFile, """
+                {
+                  "providers": {
+                    "exa": {
+                      "baseUrl": "https://api.exa.ai",
+                      "apiKey": "k",
+                      "searchPath": "/search",
+                      "authHeader": "x-api-key"
+                    }
+                  },
+                  "features": {
+                    "marketNews": {
+                      "defaultProvider": "exa",
+                      "profiles": [
+                        {
+                          "name": "cn",
+                          "queries": [" ", ""]
+                        }
+                      ]
+                    }
+                  }
+                }
+                """, StandardCharsets.UTF_8);
+
+        SearchLlmLocalConfigLoader loader = new SearchLlmLocalConfigLoader(new ObjectMapper());
+        ReflectionTestUtils.setField(loader, "configFile", configFile.toString());
+
+        loader.load();
+
+        assertFalse(loader.current().isPresent());
     }
 }

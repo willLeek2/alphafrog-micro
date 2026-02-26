@@ -80,8 +80,6 @@ AGENTS.md
 /test_scripts
 /test_guide
 /docs
-!/test_scripts/
-!/test_scripts/market_news_profiles_acceptance.sh
 
 
 .env

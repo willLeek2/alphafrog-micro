@@ -1,4 +1,4 @@
-package world.willfrog.agent.service;
+package world.willfrog.externalinfo.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
@@ -6,9 +6,10 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
-import world.willfrog.agent.config.SearchLlmProperties;
+import world.willfrog.externalinfo.config.SearchLlmProperties;
 
 import java.time.OffsetDateTime;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -107,6 +108,48 @@ class MarketNewsServiceTest {
         assertEquals(2, result.items().size());
         assertEquals("us-1", result.items().get(0).id());
         assertEquals("dup-2", result.items().get(1).id());
+        assertEquals("mixed", result.provider());
+    }
+
+    @Test
+    void getTodayMarketNews_shouldHonorRequestProviderOverride() {
+        SearchLlmProperties cfg = buildMultiProfileConfig();
+        lenient().when(localConfigLoader.current()).thenReturn(Optional.of(cfg));
+        List<String> providersUsed = new ArrayList<>();
+
+        MarketNewsService testService = new MarketNewsService(new ObjectMapper(), properties, localConfigLoader) {
+            @Override
+            MarketNewsResponse executeProfileSearch(SearchLlmProperties.MarketNewsFeature feature,
+                                                    SearchLlmProperties.MarketNewsProfile profile,
+                                                    ProfileSearchOptions options) {
+                providersUsed.add(options.providerName());
+                return new MarketNewsResponse(List.of(), "");
+            }
+        };
+
+        MarketNewsService.MarketNewsResult result = testService.getTodayMarketNews(
+                new MarketNewsService.MarketNewsQuery("perplexity", List.of(), 2, "", "")
+        );
+
+        assertEquals(List.of("perplexity", "perplexity"), providersUsed);
+        assertEquals("perplexity", result.provider());
+    }
+
+    @Test
+    void timeoutResolution_shouldRespectProviderOverrideAndFallback() {
+        SearchLlmProperties.Provider provider = new SearchLlmProperties.Provider();
+        provider.setConnectTimeoutSeconds(6);
+        provider.setRequestTimeoutSeconds(12);
+
+        assertEquals(6, service.connectTimeout(provider));
+        assertEquals(12, service.requestTimeout(provider));
+
+        provider.setConnectTimeoutSeconds(0);
+        provider.setRequestTimeoutSeconds(-1);
+        assertEquals(20, service.connectTimeout(provider));
+        assertEquals(45, service.requestTimeout(provider));
+        assertEquals(20, service.connectTimeout(null));
+        assertEquals(45, service.requestTimeout(null));
     }
 
     private SearchLlmProperties buildMultiProfileConfig() {

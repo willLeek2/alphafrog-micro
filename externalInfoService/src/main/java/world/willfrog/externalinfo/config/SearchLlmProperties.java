@@ -1,4 +1,4 @@
-package world.willfrog.agent.config;
+package world.willfrog.externalinfo.config;
 
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
@@ -7,7 +7,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
-@ConfigurationProperties(prefix = "agent.search-llm")
+@ConfigurationProperties(prefix = "external-info.search-llm")
 public class SearchLlmProperties {
 
     private Map<String, Provider> providers = new HashMap<>();

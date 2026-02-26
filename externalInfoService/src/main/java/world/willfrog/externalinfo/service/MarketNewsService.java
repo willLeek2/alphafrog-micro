@@ -1,4 +1,4 @@
-package world.willfrog.agent.service;
+package world.willfrog.externalinfo.service;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonProperty;
@@ -6,7 +6,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
-import world.willfrog.agent.config.SearchLlmProperties;
+import world.willfrog.externalinfo.config.SearchLlmProperties;
 
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -26,6 +26,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 @Component
@@ -34,6 +35,7 @@ import java.util.UUID;
 public class MarketNewsService {
 
     private static final int DEFAULT_CONNECT_TIMEOUT_SECONDS = 20;
+    private static final int DEFAULT_REQUEST_TIMEOUT_SECONDS = 45;
     private static final int LANGUAGE_DETECTION_SAMPLE_LENGTH = 120;
     private static final int CJK_EXT_A_START = 0x3400;
     private static final int CJK_EXT_A_END = 0x4DBF;
@@ -43,9 +45,6 @@ public class MarketNewsService {
     private final ObjectMapper objectMapper;
     private final SearchLlmProperties properties;
     private final SearchLlmLocalConfigLoader localConfigLoader;
-    private final HttpClient httpClient = HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(DEFAULT_CONNECT_TIMEOUT_SECONDS))
-            .build();
 
     public MarketNewsResult getTodayMarketNews(MarketNewsQuery query) {
         SearchLlmProperties cfg = localConfigLoader.current().orElse(properties);
@@ -53,9 +52,11 @@ public class MarketNewsService {
 
         int finalLimit = resolveFinalLimit(query.limit(), feature);
         List<MarketNewsItem> allItems = new ArrayList<>();
+        Set<String> usedProviders = new LinkedHashSet<>();
 
         for (SearchLlmProperties.MarketNewsProfile profile : feature.getProfiles()) {
             ProfileSearchOptions options = resolveProfileOptions(query, feature, profile, cfg.getProviders());
+            usedProviders.add(options.providerName());
             MarketNewsResponse response = executeProfileSearch(feature, profile, options);
             List<MarketNewsItem> profileItems = filterItems(
                     response.items(),
@@ -76,7 +77,7 @@ public class MarketNewsService {
                 finalLimit
         );
         String updatedAt = resolveUpdatedAt("", filteredByRequest);
-        return new MarketNewsResult(filteredByRequest, updatedAt, resolveProviderLabel(feature));
+        return new MarketNewsResult(filteredByRequest, updatedAt, resolveProviderLabel(query.provider(), usedProviders));
     }
 
     MarketNewsResponse executeProfileSearch(SearchLlmProperties.MarketNewsFeature feature,
@@ -300,7 +301,7 @@ public class MarketNewsService {
                                                        SearchLlmProperties.MarketNewsFeature feature,
                                                        SearchLlmProperties.MarketNewsProfile profile,
                                                        Map<String, SearchLlmProperties.Provider> providers) {
-        String providerName = firstNonBlank(profile.getProvider(), feature.getDefaultProvider());
+        String providerName = firstNonBlank(query.provider(), profile.getProvider(), feature.getDefaultProvider());
         if (!hasText(providerName)) {
             throw new IllegalStateException("marketNews profile '" + profile.getName() + "' does not specify provider and feature.defaultProvider is not configured");
         }
@@ -315,8 +316,8 @@ public class MarketNewsService {
         int maxResults = feature.getMaxResults() != null && feature.getMaxResults() > 0 ? feature.getMaxResults() : profileLimit;
         int fetchLimit = Math.min(profileLimit, maxResults);
 
-        OffsetDateTime startTime = parseOffsetDateTime(firstNonBlank(profile.getStartPublishedDate(), query.startPublishedDate()));
-        OffsetDateTime endTime = parseOffsetDateTime(firstNonBlank(profile.getEndPublishedDate(), query.endPublishedDate()));
+        OffsetDateTime startTime = parseOffsetDateTime(firstNonBlank(query.startPublishedDate(), profile.getStartPublishedDate()));
+        OffsetDateTime endTime = parseOffsetDateTime(firstNonBlank(query.endPublishedDate(), profile.getEndPublishedDate()));
 
         List<String> profileLanguages = trimList(profile.getLanguages());
         List<String> domainFilter = resolveProfileDomainFilter(profile);
@@ -353,11 +354,17 @@ public class MarketNewsService {
         return 8;
     }
 
-    private String resolveProviderLabel(SearchLlmProperties.MarketNewsFeature feature) {
-        if (feature == null) {
+    private String resolveProviderLabel(String requestProvider, Set<String> usedProviders) {
+        if (hasText(requestProvider)) {
+            return requestProvider.trim();
+        }
+        if (usedProviders == null || usedProviders.isEmpty()) {
             return "";
         }
-        return nvl(feature.getDefaultProvider());
+        if (usedProviders.size() == 1) {
+            return usedProviders.iterator().next();
+        }
+        return "mixed";
     }
 
     private String resolveProfileQuery(SearchLlmProperties.MarketNewsProfile profile) {
@@ -579,7 +586,10 @@ public class MarketNewsService {
                     }
                 }
             }
-            HttpResponse<String> response = httpClient.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString());
+            HttpClient client = HttpClient.newBuilder()
+                    .connectTimeout(Duration.ofSeconds(connectTimeout(provider)))
+                    .build();
+            HttpResponse<String> response = client.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString());
             if (response.statusCode() >= 300) {
                 log.error("Search provider {} returned status {} body {}", url, response.statusCode(), response.body());
                 throw new IllegalStateException("search provider error: " + response.statusCode());
@@ -590,9 +600,16 @@ public class MarketNewsService {
         }
     }
 
-    private int requestTimeout(SearchLlmProperties.Provider provider) {
+    int connectTimeout(SearchLlmProperties.Provider provider) {
+        if (provider == null || provider.getConnectTimeoutSeconds() == null || provider.getConnectTimeoutSeconds() <= 0) {
+            return DEFAULT_CONNECT_TIMEOUT_SECONDS;
+        }
+        return provider.getConnectTimeoutSeconds();
+    }
+
+    int requestTimeout(SearchLlmProperties.Provider provider) {
         if (provider == null || provider.getRequestTimeoutSeconds() == null || provider.getRequestTimeoutSeconds() <= 0) {
-            return 45;
+            return DEFAULT_REQUEST_TIMEOUT_SECONDS;
         }
         return provider.getRequestTimeoutSeconds();
     }
