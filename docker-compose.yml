@@ -381,7 +381,7 @@ services:
       LOGGING_LEVEL_EXTERNAL_INFO: ${LOGGING_LEVEL_EXTERNAL_INFO:-INFO}
       JAVA_TOOL_OPTIONS: "-Xms256m -Xmx512m"
     volumes:
-      - ./agentService/config:/app/config:ro
+      - ./externalInfoService/config:/app/config:ro
     ports:
       - "50061:50061"
     deploy:
