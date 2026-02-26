@@ -365,6 +365,32 @@ services:
     networks:
       - alphafrog-network
 
+  external-info-service:
+    image: alphafrog-micro-external-info-service:latest
+    build: ./externalInfoService
+    container_name: alphafrog-external-info-service
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      nacos:
+        condition: service_healthy
+    environment:
+      TZ: Asia/Shanghai
+      NACOS_ADDRESS: nacos
+      AF_EXTERNAL_INFO_SEARCH_LLM_CONFIG_FILE: ${AF_EXTERNAL_INFO_SEARCH_LLM_CONFIG_FILE:-/app/config/search-llm.local.json}
+      LOGGING_LEVEL_EXTERNAL_INFO: ${LOGGING_LEVEL_EXTERNAL_INFO:-INFO}
+      JAVA_TOOL_OPTIONS: "-Xms256m -Xmx512m"
+    volumes:
+      - ./externalInfoService/config:/app/config:ro
+    ports:
+      - "50061:50061"
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+    networks:
+      - alphafrog-network
+
   python-sandbox-service:
     image: alphafrog-python-sandbox:latest
     build: ./pythonSandboxService
@@ -436,6 +462,8 @@ services:
       portfolio-service:
         condition: service_started
       agent-service:
+        condition: service_started
+      external-info-service:
         condition: service_started
     environment:
       TZ: Asia/Shanghai

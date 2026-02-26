@@ -83,6 +83,7 @@
     <modules>
         <module>common</module>
         <module>agentApi</module>
+        <module>externalInfoApi</module>
         <module>domesticStockApi</module>
         <module>domesticFundApi</module>
         <module>domesticIndexApi</module>
@@ -97,6 +98,7 @@
         <module>portfolioService</module>
         <module>frontend</module>
         <module>agentService</module>
+        <module>externalInfoService</module>
         <module>pythonSandboxApi</module>
         <module>pythonSandboxGatewayService</module>
     </modules>
