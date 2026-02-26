@@ -604,6 +604,7 @@ public class AgentDubboServiceImpl extends DubboAgentDubboServiceTriple.AgentDub
         if (userId == null || userId.isBlank()) {
             throw new IllegalArgumentException("user_id is required");
         }
+        ensureUserActive(userId);
         MarketNewsService.MarketNewsQuery query = new MarketNewsService.MarketNewsQuery(
                 nvl(request.getProvider()),
                 request.getLanguagesList(),

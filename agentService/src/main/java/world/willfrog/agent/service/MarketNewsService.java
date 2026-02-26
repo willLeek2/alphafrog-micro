@@ -156,7 +156,6 @@ public class MarketNewsService {
         Map<String, Object> contents = new LinkedHashMap<>();
         contents.put("summary", true);
         contents.put("text", false);
-        contents.put("highlights", true);
         body.put("contents", contents);
 
         String responseBody = postJson(provider, body);
