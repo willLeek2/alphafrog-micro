@@ -4,6 +4,7 @@ import lombok.extern.slf4j.Slf4j;
 import com.meilisearch.sdk.Client;
 import com.meilisearch.sdk.Config;
 import com.meilisearch.sdk.Index;
+import com.meilisearch.sdk.SearchRequest;
 import com.meilisearch.sdk.model.SearchResult;
 import org.apache.dubbo.config.annotation.DubboService;
 import org.springframework.beans.factory.annotation.Value;
@@ -123,11 +124,32 @@ public class DomesticStockServiceImpl extends DomesticStockServiceImplBase {
     @Override
     public DomesticStockSearchResponse searchStock(DomesticStockSearchRequest request) {
         String query = request.getQuery();
-
-        List<StockInfo> stockInfoList = stockInfoDao.getStockInfoByName(query, 10, 0);
-
         DomesticStockSearchResponse.Builder responseBuilder = DomesticStockSearchResponse.newBuilder();
-
+        if (meiliEnabled) {
+            try {
+                Index index = getMeiliClient().index("stocks");
+                SearchResult searchResult = (SearchResult) index.search(
+                        SearchRequest.builder().q(query).limit(20).build());
+                for (Object hitObj : searchResult.getHits()) {
+                    if (!(hitObj instanceof Map<?, ?> hit)) {
+                        continue;
+                    }
+                    DomesticStockInfoSimpleItem.Builder itemBuilder = DomesticStockInfoSimpleItem.newBuilder()
+                            .setTsCode(stringValue(hit.get("ts_code")))
+                            .setSymbol(stringValue(hit.get("symbol")))
+                            .setName(stringValue(hit.get("name")))
+                            .setArea(stringValue(hit.get("area")))
+                            .setIndustry(stringValue(hit.get("industry")));
+                    responseBuilder.addItems(itemBuilder.build());
+                }
+                if (responseBuilder.getItemsCount() > 0) {
+                    return responseBuilder.build();
+                }
+            } catch (Exception e) {
+                log.warn("MeiliSearch query failed for stock search query={}", query, e);
+            }
+        }
+        List<StockInfo> stockInfoList = stockInfoDao.getStockInfoByName(query, 10, 0);
         for (StockInfo stockInfo : stockInfoList) {
             DomesticStockInfoSimpleItem.Builder itemBuilder = DomesticStockInfoSimpleItem.newBuilder();
             itemBuilder.setTsCode(stockInfo.getTsCode())
@@ -135,10 +157,8 @@ public class DomesticStockServiceImpl extends DomesticStockServiceImplBase {
                     .setName(stockInfo.getName())
                     .setArea(stockInfo.getArea() != null ? stockInfo.getArea() : "")
                     .setIndustry(stockInfo.getIndustry() != null ? stockInfo.getIndustry() : "");
-
             responseBuilder.addItems(itemBuilder.build());
         }
-
         return responseBuilder.build();
     }
 
@@ -153,7 +173,8 @@ public class DomesticStockServiceImpl extends DomesticStockServiceImplBase {
         DomesticStockSearchESResponse.Builder responseBuilder = DomesticStockSearchESResponse.newBuilder();
         try {
             Index index = getMeiliClient().index("stocks");
-            SearchResult searchResult = index.search(query);
+            SearchResult searchResult = (SearchResult) index.search(
+                    SearchRequest.builder().q(query).limit(20).build());
             for (Object hitObj : searchResult.getHits()) {
                 if (!(hitObj instanceof Map<?, ?> hit)) {
                     continue;

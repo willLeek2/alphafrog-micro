@@ -4,6 +4,7 @@ import lombok.extern.slf4j.Slf4j;
 import com.meilisearch.sdk.Client;
 import com.meilisearch.sdk.Config;
 import com.meilisearch.sdk.Index;
+import com.meilisearch.sdk.SearchRequest;
 import com.meilisearch.sdk.model.SearchResult;
 import org.springframework.stereotype.Service;
 import org.apache.dubbo.config.annotation.DubboService;
@@ -212,7 +213,8 @@ public class DomesticFundServiceImpl extends DomesticFundServiceImplBase {
         if (meiliEnabled) {
             try {
                 Index index = getMeiliClient().index("funds");
-                SearchResult searchResult = index.search(query);
+                SearchResult searchResult = (SearchResult) index.search(
+                        SearchRequest.builder().q(query).limit(100).build());
                 for (Object hitObj : searchResult.getHits()) {
                     if (!(hitObj instanceof Map<?, ?> hit)) {
                         continue;
