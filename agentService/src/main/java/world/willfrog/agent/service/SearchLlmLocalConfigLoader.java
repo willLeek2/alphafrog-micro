@@ -90,7 +90,7 @@ public class SearchLlmLocalConfigLoader {
                     JsonNode root = objectMapper.readTree(in);
                     failIfLegacyConfig(root, normalizedPath);
                     SearchLlmProperties parsed = objectMapper.treeToValue(root, SearchLlmProperties.class);
-                    SearchLlmProperties sanitized = sanitize(parsed);
+                    SearchLlmProperties sanitized = sanitize(parsed, normalizedPath);
                     Map<String, Long> promptFileTimes = resolvePromptFiles(sanitized, path.getParent());
 
                     int providerCount = sanitized.getProviders().size();
@@ -115,7 +115,7 @@ public class SearchLlmLocalConfigLoader {
             throw new IllegalStateException("search-llm config must be a JSON object: " + path);
         }
         if (root.has("defaultProvider") || root.has("marketNews")) {
-            throw new IllegalStateException("Legacy fields detected (defaultProvider, marketNews). Migrate to features.marketNews.profiles schema. See README section 3.1: Configure Search LLM: " + path);
+            throw new IllegalStateException("Legacy fields detected (defaultProvider, marketNews). Migrate to features.marketNews.profiles schema. See README section '配置 Search LLM（Market News 非兼容重构）': " + path);
         }
     }
 
@@ -152,7 +152,7 @@ public class SearchLlmLocalConfigLoader {
         }
     }
 
-    private SearchLlmProperties sanitize(SearchLlmProperties input) {
+    private SearchLlmProperties sanitize(SearchLlmProperties input, String configPath) {
         SearchLlmProperties cfg = input == null ? new SearchLlmProperties() : input;
         if (cfg.getProviders() == null) {
             cfg.setProviders(new LinkedHashMap<>());
@@ -169,7 +169,7 @@ public class SearchLlmLocalConfigLoader {
 
         SearchLlmProperties.MarketNewsFeature marketNews = cfg.getFeatures().getMarketNews();
         if (marketNews.getProfiles() == null || marketNews.getProfiles().isEmpty()) {
-            throw new IllegalStateException("features.marketNews.profiles is required and must not be empty");
+            throw new IllegalStateException("features.marketNews.profiles is required and must not be empty: " + configPath);
         }
         for (SearchLlmProperties.MarketNewsProfile profile : marketNews.getProfiles()) {
             if (profile == null) {

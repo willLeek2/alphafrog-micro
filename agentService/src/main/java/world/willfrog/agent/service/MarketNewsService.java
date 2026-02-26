@@ -33,6 +33,7 @@ import java.util.UUID;
 @Slf4j
 public class MarketNewsService {
 
+    private static final int DEFAULT_CONNECT_TIMEOUT_SECONDS = 20;
     private static final int LANGUAGE_DETECTION_SAMPLE_LENGTH = 120;
     private static final int CJK_EXT_A_START = 0x3400;
     private static final int CJK_EXT_A_END = 0x4DBF;
@@ -43,7 +44,7 @@ public class MarketNewsService {
     private final SearchLlmProperties properties;
     private final SearchLlmLocalConfigLoader localConfigLoader;
     private final HttpClient httpClient = HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(20))
+            .connectTimeout(Duration.ofSeconds(DEFAULT_CONNECT_TIMEOUT_SECONDS))
             .build();
 
     public MarketNewsResult getTodayMarketNews(MarketNewsQuery query) {

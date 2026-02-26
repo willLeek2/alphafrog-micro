@@ -66,8 +66,8 @@ class MarketNewsServiceTest {
     @Test
     void dedupeAndSort_shouldDedupeByUrlThenTitleAndSortByTimestampDesc() {
         List<MarketNewsService.MarketNewsItem> deduped = service.deduplicateAndSort(List.of(
-                new MarketNewsService.MarketNewsItem("id-1", "2026-02-22T10:00:00+08:00", "同标题", "s1", "market", "https://a.com/n1"),
-                new MarketNewsService.MarketNewsItem("id-2", "2026-02-22T11:00:00+08:00", "同标题更新", "s1", "market", "https://a.com/n1"),
+                new MarketNewsService.MarketNewsItem("id-1", "2026-02-22T10:00:00+08:00", "同URL", "s1", "market", "https://a.com/n1"),
+                new MarketNewsService.MarketNewsItem("id-2", "2026-02-22T11:00:00+08:00", "同URL", "s1", "market", "https://a.com/n1"),
                 new MarketNewsService.MarketNewsItem("id-3", "2026-02-22T09:00:00+08:00", "重复标题", "s2", "market", "https://b.com/n2"),
                 new MarketNewsService.MarketNewsItem("id-4", "2026-02-22T12:00:00+08:00", "重复标题", "s3", "market", "https://c.com/n3")
         ));

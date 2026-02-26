@@ -217,7 +217,7 @@ cp agentService/config/agent-llm.local.example.json agentService/config/agent-ll
 vim agentService/config/agent-llm.local.json
 ```
 
-#### 3.1 配置 Search LLM（market news 非兼容重构）
+#### 3.1 配置 Search LLM（Market News 非兼容重构）
 
 > 自 2026-02 版本起，`search-llm.local.json` 已切换为 **feature + profiles** 结构。  
 > 旧结构（如 `defaultProvider`、`marketNews.*` 顶层字段）已废弃，加载时会显式报错，不再 fallback。
