@@ -1,7 +1,13 @@
 package world.willfrog.alphafrogmicro.domestic.index;
 
 import lombok.extern.slf4j.Slf4j;
+import com.meilisearch.sdk.Client;
+import com.meilisearch.sdk.Config;
+import com.meilisearch.sdk.Index;
+import com.meilisearch.sdk.SearchRequest;
+import com.meilisearch.sdk.model.SearchResult;
 import org.apache.dubbo.config.annotation.DubboService;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import world.willfrog.alphafrogmicro.common.dao.domestic.calendar.TradeCalendarDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.index.IndexInfoDao;
@@ -15,6 +21,7 @@ import world.willfrog.alphafrogmicro.domestic.idl.DubboDomesticIndexServiceTripl
 import world.willfrog.alphafrogmicro.domestic.index.service.IndexDataCompletenessService;
 
 import java.util.List;
+import java.util.Map;
 
 @DubboService
 @Service
@@ -26,6 +33,12 @@ public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
     private final IndexWeightDao indexWeightDao;
     private final IndexDataCompletenessService indexDataCompletenessService;
     private final TradeCalendarDao tradeCalendarDao;
+    @Value("${meilisearch.host:http://localhost:7700}")
+    private String meiliHost;
+    @Value("${meilisearch.api-key:alphafrog_search_key}")
+    private String meiliApiKey;
+    @Value("${advanced.meili-enabled:true}")
+    private boolean meiliEnabled;
 
 
     public DomesticIndexServiceImpl(IndexInfoDao indexInfoDao,
@@ -106,8 +119,33 @@ public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
             return DomesticIndexSearchResponse.newBuilder().build();
         }
         String normalizedQuery = query.trim();
+        DomesticIndexSearchResponse.Builder responseBuilder = DomesticIndexSearchResponse.newBuilder();
+        if (meiliEnabled) {
+            try {
+                Client client = new Client(new Config(meiliHost, meiliApiKey));
+                Index index = client.index("indices");
+                SearchResult searchResult = (SearchResult) index.search(
+                        SearchRequest.builder().q(normalizedQuery).limit(200).build()
+                );
+                for (Object hitObj : searchResult.getHits()) {
+                    if (!(hitObj instanceof Map<?, ?> hit)) {
+                        continue;
+                    }
+                    DomesticIndexInfoSimpleItem.Builder itemBuilder = DomesticIndexInfoSimpleItem.newBuilder()
+                            .setTsCode(stringValue(hit.get("ts_code")))
+                            .setName(stringValue(hit.get("name")))
+                            .setFullname(stringValue(hit.get("full_name")))
+                            .setMarket(stringValue(hit.get("market")));
+                    responseBuilder.addItems(itemBuilder.build());
+                }
+                if (responseBuilder.getItemsCount() > 0) {
+                    return responseBuilder.build();
+                }
+            } catch (Exception e) {
+                log.warn("MeiliSearch query failed for index search query={}", normalizedQuery, e);
+            }
+        }
         List<IndexInfo> indexInfoList;
-
         try {
             // 单条 SQL + 相关性排序，避免高热度关键词下“随机截断”导致基础指数缺失
             indexInfoList = indexInfoDao.searchIndexInfo(normalizedQuery, 200, 0);
@@ -116,18 +154,18 @@ public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
             // 搜索异常时返回空响应
             return DomesticIndexSearchResponse.newBuilder().build();
         }
-
-        DomesticIndexSearchResponse.Builder responseBuilder = DomesticIndexSearchResponse.newBuilder();
-
-        for(IndexInfo indexInfo : indexInfoList) {
+        for (IndexInfo indexInfo : indexInfoList) {
             DomesticIndexInfoSimpleItem.Builder itemBuilder = DomesticIndexInfoSimpleItem.newBuilder()
                     .setTsCode(indexInfo.getTsCode()).setName(indexInfo.getName())
                     .setFullname(indexInfo.getFullName()).setMarket(indexInfo.getMarket());
-
             responseBuilder.addItems(itemBuilder.build());
         }
 
         return responseBuilder.build();
+    }
+
+    private String stringValue(Object value) {
+        return value == null ? "" : String.valueOf(value);
     }
 
     @Override

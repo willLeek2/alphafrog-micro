@@ -1,12 +1,13 @@
 package world.willfrog.alphafrogmicro.domestic.stock;
 
 import lombok.extern.slf4j.Slf4j;
+import com.meilisearch.sdk.Client;
+import com.meilisearch.sdk.Config;
+import com.meilisearch.sdk.Index;
+import com.meilisearch.sdk.SearchRequest;
+import com.meilisearch.sdk.model.SearchResult;
 import org.apache.dubbo.config.annotation.DubboService;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.data.elasticsearch.core.ElasticsearchOperations;
-import org.springframework.data.elasticsearch.core.SearchHits;
-import org.springframework.data.elasticsearch.core.query.StringQuery;
 import org.springframework.stereotype.Service;
 import world.willfrog.alphafrogmicro.common.dao.domestic.stock.StockInfoDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.stock.StockQuoteDao;
@@ -14,9 +15,9 @@ import world.willfrog.alphafrogmicro.common.pojo.domestic.stock.StockDaily;
 import world.willfrog.alphafrogmicro.common.pojo.domestic.stock.StockInfo;
 import world.willfrog.alphafrogmicro.domestic.idl.*;
 import world.willfrog.alphafrogmicro.domestic.idl.DubboDomesticStockServiceTriple.*;
-import world.willfrog.alphafrogmicro.domestic.stock.doc.StockInfoES;
 
 import java.util.List;
+import java.util.Map;
 
 @Service
 @DubboService
@@ -26,19 +27,19 @@ public class DomesticStockServiceImpl extends DomesticStockServiceImplBase {
     private final StockInfoDao stockInfoDao;
     private final StockQuoteDao stockQuoteDao;
 
-    @Autowired(required = false)
-    private final ElasticsearchOperations elasticsearchOperations;
+    @Value("${meilisearch.host:http://localhost:7700}")
+    private String meiliHost;
 
-    @Value("${advanced.es-enabled}")
-    private boolean elasticsearchEnabled;
+    @Value("${meilisearch.api-key:alphafrog_search_key}")
+    private String meiliApiKey;
+
+    @Value("${advanced.meili-enabled:true}")
+    private boolean meiliEnabled;
 
     public DomesticStockServiceImpl(StockInfoDao stockInfoDao,
-                                    StockQuoteDao stockQuoteDao,
-                                    ElasticsearchOperations elasticsearchOperations) {
+                                    StockQuoteDao stockQuoteDao) {
         this.stockInfoDao = stockInfoDao;
         this.stockQuoteDao = stockQuoteDao;
-
-        this.elasticsearchOperations = elasticsearchOperations;
     }
 
     @Override
@@ -144,35 +145,49 @@ public class DomesticStockServiceImpl extends DomesticStockServiceImplBase {
 
     @Override
     public DomesticStockSearchESResponse searchStockES(DomesticStockSearchESRequest request) {
-
-        if (elasticsearchOperations == null || !elasticsearchEnabled) {
+        if (!meiliEnabled) {
             return DomesticStockSearchESResponse.newBuilder().build();
         }
 
         String query = request.getQuery();
-
-        String queryString = String.format("{\"bool\": {\"should\": [{\"match\": {\"ts_code\": \"%s\"}}, {\"match\": {\"name\": \"%s\"}}, {\"match\": {\"fullname\": \"%s\"}}]}}", query, query, query);
-
-        StringQuery stringQuery = new StringQuery(queryString);
-
-        SearchHits<StockInfoES> searchHits = elasticsearchOperations.search(stringQuery, StockInfoES.class);
-
         DomesticStockSearchESResponse.Builder responseBuilder = DomesticStockSearchESResponse.newBuilder();
-
-        searchHits.forEach(searchHit -> {
-            StockInfoES stockInfoES = searchHit.getContent();
-
-            DomesticStockInfoESItem.Builder itemBuilder = DomesticStockInfoESItem.newBuilder();
-            itemBuilder.setTsCode(stockInfoES.getTsCode())
-                    .setSymbol(stockInfoES.getSymbol())
-                    .setName(stockInfoES.getName())
-                    .setArea(stockInfoES.getArea() != null ? stockInfoES.getArea() : "")
-                    .setIndustry(stockInfoES.getIndustry() != null ? stockInfoES.getIndustry() : "");
-
-            responseBuilder.addItems(itemBuilder.build());
-        });
-
+        try {
+            Client client = new Client(new Config(meiliHost, meiliApiKey));
+            Index index = client.index("stocks");
+            SearchResult searchResult = (SearchResult) index.search(
+                    SearchRequest.builder().q(query).limit(20).build()
+            );
+            for (Object hitObj : searchResult.getHits()) {
+                if (!(hitObj instanceof Map<?, ?> hit)) {
+                    continue;
+                }
+                DomesticStockInfoESItem.Builder itemBuilder = DomesticStockInfoESItem.newBuilder();
+                itemBuilder.setTsCode(stringValue(hit.get("ts_code")))
+                        .setSymbol(stringValue(hit.get("symbol")))
+                        .setName(stringValue(hit.get("name")))
+                        .setArea(stringValue(hit.get("area")))
+                        .setIndustry(stringValue(hit.get("industry")));
+                String enName = stringValue(hit.get("en_name"));
+                if (!enName.isEmpty()) {
+                    itemBuilder.setEnName(enName);
+                }
+                String fullName = stringValue(hit.get("full_name"));
+                if (fullName.isEmpty()) {
+                    fullName = stringValue(hit.get("fullname"));
+                }
+                if (!fullName.isEmpty()) {
+                    itemBuilder.setFullName(fullName);
+                }
+                responseBuilder.addItems(itemBuilder.build());
+            }
+        } catch (Exception e) {
+            log.warn("MeiliSearch query failed for stock search query={}", query, e);
+        }
         return responseBuilder.build();
+    }
+
+    private String stringValue(Object value) {
+        return value == null ? "" : String.valueOf(value);
     }
 
 

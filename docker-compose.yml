@@ -100,6 +100,32 @@ services:
     networks:
       - alphafrog-network
 
+  meilisearch:
+    image: getmeili/meilisearch:v1.12
+    container_name: alphafrog-meilisearch
+    environment:
+      MEILI_MASTER_KEY: ${AF_MEILI_API_KEY:-alphafrog_search_key}
+      MEILI_HTTP_ADDR: 0.0.0.0:7700
+      MEILI_MAX_INDEXING_MEMORY: 600Mb
+      MEILI_MAX_INDEXING_THREADS: 1
+      MEILI_EXPERIMENTAL_REDUCE_INDEXING_MEMORY_USAGE: "true"
+      MEILI_EXPERIMENTAL_SEARCH_QUEUE_SIZE: 100
+    ports:
+      - "7700:7700"
+    volumes:
+      - ./data/meilisearch:/meili_data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7700/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    networks:
+      - alphafrog-network
+
   domestic-stock-service:
     image: alphafrog-micro-domestic-stock-service:latest
     build: ./domesticStockService
@@ -111,6 +137,8 @@ services:
         condition: service_healthy
       nacos:
         condition: service_healthy
+      meilisearch:
+        condition: service_healthy
     environment:
       TZ: Asia/Shanghai
       AF_DB_MAIN_HOST: ${AF_DB_MAIN_HOST:-host.docker.internal}
@@ -120,6 +148,8 @@ services:
       AF_DB_MAIN_PASSWORD: ${AF_DB_MAIN_PASSWORD:-alphafrog_pass}
       AF_REDIS_HOST: redis
       AF_REDIS_PASSWORD: ${AF_REDIS_PASSWORD:-Excited1s}
+      AF_MEILI_HOST: http://meilisearch:7700
+      AF_MEILI_API_KEY: ${AF_MEILI_API_KEY:-alphafrog_search_key}
       NACOS_ADDRESS: nacos
       TUSHARE_TOKEN: ${TUSHARE_TOKEN}
       # Memory Optimization (Medium)
@@ -144,6 +174,8 @@ services:
         condition: service_healthy
       nacos:
         condition: service_healthy
+      meilisearch:
+        condition: service_healthy
     environment:
       TZ: Asia/Shanghai
       AF_DB_MAIN_HOST: ${AF_DB_MAIN_HOST:-host.docker.internal}
@@ -153,6 +185,8 @@ services:
       AF_DB_MAIN_PASSWORD: ${AF_DB_MAIN_PASSWORD:-alphafrog_pass}
       AF_REDIS_HOST: redis
       AF_REDIS_PASSWORD: ${AF_REDIS_PASSWORD:-Excited1s}
+      AF_MEILI_HOST: http://meilisearch:7700
+      AF_MEILI_API_KEY: ${AF_MEILI_API_KEY:-alphafrog_search_key}
       NACOS_ADDRESS: nacos
       TUSHARE_TOKEN: ${TUSHARE_TOKEN}
       # Memory Optimization (Medium)
@@ -179,6 +213,8 @@ services:
         condition: service_started
       nacos:
         condition: service_healthy
+      meilisearch:
+        condition: service_healthy
     environment:
       TZ: Asia/Shanghai
       AF_DB_MAIN_HOST: ${AF_DB_MAIN_HOST:-host.docker.internal}
@@ -189,6 +225,8 @@ services:
       AF_KAFKA_BOOTSTRAP_SERVERS: broker:9092
       AF_REDIS_HOST: redis
       AF_REDIS_PASSWORD: ${AF_REDIS_PASSWORD:-Excited1s}
+      AF_MEILI_HOST: http://meilisearch:7700
+      AF_MEILI_API_KEY: ${AF_MEILI_API_KEY:-alphafrog_search_key}
       NACOS_ADDRESS: nacos
       TUSHARE_TOKEN: ${TUSHARE_TOKEN}
       # Memory Optimization (Medium)

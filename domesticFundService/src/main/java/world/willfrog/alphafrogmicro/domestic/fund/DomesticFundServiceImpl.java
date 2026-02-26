@@ -1,8 +1,14 @@
 package world.willfrog.alphafrogmicro.domestic.fund;
 
 import lombok.extern.slf4j.Slf4j;
+import com.meilisearch.sdk.Client;
+import com.meilisearch.sdk.Config;
+import com.meilisearch.sdk.Index;
+import com.meilisearch.sdk.SearchRequest;
+import com.meilisearch.sdk.model.SearchResult;
 import org.springframework.stereotype.Service;
 import org.apache.dubbo.config.annotation.DubboService;
+import org.springframework.beans.factory.annotation.Value;
 import world.willfrog.alphafrogmicro.common.dao.domestic.fund.FundInfoDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.fund.FundNavDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.fund.FundPortfolioDao;
@@ -14,6 +20,7 @@ import world.willfrog.alphafrogmicro.domestic.idl.DubboDomesticFundServiceTriple
 
 import java.util.List;
 import java.util.ArrayList;
+import java.util.Map;
 
 @DubboService
 @Service
@@ -23,6 +30,12 @@ public class DomesticFundServiceImpl extends DomesticFundServiceImplBase {
     private final FundNavDao fundNavDao;
     private final FundInfoDao fundInfoDao;
     private final FundPortfolioDao fundPortfolioDao;
+    @Value("${meilisearch.host:http://localhost:7700}")
+    private String meiliHost;
+    @Value("${meilisearch.api-key:alphafrog_search_key}")
+    private String meiliApiKey;
+    @Value("${advanced.meili-enabled:true}")
+    private boolean meiliEnabled;
 
     public DomesticFundServiceImpl(FundNavDao fundNavDao, FundInfoDao fundInfoDao, FundPortfolioDao fundPortfolioDao) {
         this.fundNavDao = fundNavDao;
@@ -195,9 +208,41 @@ public class DomesticFundServiceImpl extends DomesticFundServiceImplBase {
     public DomesticFundSearchResponse searchDomesticFundInfo(DomesticFundSearchRequest request) {
         
         String query = request.getQuery();
-
-        List<FundInfo> fundInfoList = new ArrayList<>();
         List<DomesticFundInfoSimpleItem> items = new ArrayList<>();
+        if (meiliEnabled) {
+            try {
+                Client client = new Client(new Config(meiliHost, meiliApiKey));
+                Index index = client.index("funds");
+                SearchResult searchResult = (SearchResult) index.search(
+                        SearchRequest.builder().q(query).limit(100).build()
+                );
+                for (Object hitObj : searchResult.getHits()) {
+                    if (!(hitObj instanceof Map<?, ?> hit)) {
+                        continue;
+                    }
+                    DomesticFundInfoSimpleItem.Builder itemBuilder = DomesticFundInfoSimpleItem.newBuilder()
+                            .setTsCode(stringValue(hit.get("ts_code")))
+                            .setName(stringValue(hit.get("name")));
+                    String management = stringValue(hit.get("management"));
+                    if (!management.isEmpty()) {
+                        itemBuilder.setManagement(management);
+                    }
+                    String fundType = stringValue(hit.get("fund_type"));
+                    if (!fundType.isEmpty()) {
+                        itemBuilder.setFundType(fundType);
+                    }
+                    items.add(itemBuilder.build());
+                }
+                if (!items.isEmpty()) {
+                    return DomesticFundSearchResponse.newBuilder()
+                            .addAllItems(items)
+                            .build();
+                }
+            } catch (Exception e) {
+                log.warn("MeiliSearch query failed for fund search query={}", query, e);
+            }
+        }
+        List<FundInfo> fundInfoList = new ArrayList<>();
 
         try{
             // 使用合理的分页参数，避免返回过多数据
@@ -247,6 +292,10 @@ public class DomesticFundServiceImpl extends DomesticFundServiceImplBase {
             // 转换错误时返回空响应
             return DomesticFundSearchResponse.newBuilder().build();
         }
+    }
+
+    private String stringValue(Object value) {
+        return value == null ? "" : String.valueOf(value);
     }
 
     public DomesticFundPortfolioByTsCodeAndDateRangeResponse getDomesticFundPortfolioByTsCodeAndDateRange(
