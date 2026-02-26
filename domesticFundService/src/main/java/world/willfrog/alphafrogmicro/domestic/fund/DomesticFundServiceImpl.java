@@ -4,7 +4,6 @@ import lombok.extern.slf4j.Slf4j;
 import com.meilisearch.sdk.Client;
 import com.meilisearch.sdk.Config;
 import com.meilisearch.sdk.Index;
-import com.meilisearch.sdk.SearchRequest;
 import com.meilisearch.sdk.model.SearchResult;
 import org.springframework.stereotype.Service;
 import org.apache.dubbo.config.annotation.DubboService;
@@ -36,6 +35,7 @@ public class DomesticFundServiceImpl extends DomesticFundServiceImplBase {
     private String meiliApiKey;
     @Value("${advanced.meili-enabled:true}")
     private boolean meiliEnabled;
+    private volatile Client meiliClient;
 
     public DomesticFundServiceImpl(FundNavDao fundNavDao, FundInfoDao fundInfoDao, FundPortfolioDao fundPortfolioDao) {
         this.fundNavDao = fundNavDao;
@@ -211,11 +211,8 @@ public class DomesticFundServiceImpl extends DomesticFundServiceImplBase {
         List<DomesticFundInfoSimpleItem> items = new ArrayList<>();
         if (meiliEnabled) {
             try {
-                Client client = new Client(new Config(meiliHost, meiliApiKey));
-                Index index = client.index("funds");
-                SearchResult searchResult = (SearchResult) index.search(
-                        SearchRequest.builder().q(query).limit(100).build()
-                );
+                Index index = getMeiliClient().index("funds");
+                SearchResult searchResult = index.search(query);
                 for (Object hitObj : searchResult.getHits()) {
                     if (!(hitObj instanceof Map<?, ?> hit)) {
                         continue;
@@ -296,6 +293,17 @@ public class DomesticFundServiceImpl extends DomesticFundServiceImplBase {
 
     private String stringValue(Object value) {
         return value == null ? "" : String.valueOf(value);
+    }
+
+    private Client getMeiliClient() {
+        if (meiliClient == null) {
+            synchronized (this) {
+                if (meiliClient == null) {
+                    meiliClient = new Client(new Config(meiliHost, meiliApiKey));
+                }
+            }
+        }
+        return meiliClient;
     }
 
     public DomesticFundPortfolioByTsCodeAndDateRangeResponse getDomesticFundPortfolioByTsCodeAndDateRange(

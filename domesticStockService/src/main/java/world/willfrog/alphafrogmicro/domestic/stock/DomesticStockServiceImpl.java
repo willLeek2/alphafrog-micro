@@ -4,7 +4,6 @@ import lombok.extern.slf4j.Slf4j;
 import com.meilisearch.sdk.Client;
 import com.meilisearch.sdk.Config;
 import com.meilisearch.sdk.Index;
-import com.meilisearch.sdk.SearchRequest;
 import com.meilisearch.sdk.model.SearchResult;
 import org.apache.dubbo.config.annotation.DubboService;
 import org.springframework.beans.factory.annotation.Value;
@@ -35,6 +34,7 @@ public class DomesticStockServiceImpl extends DomesticStockServiceImplBase {
 
     @Value("${advanced.meili-enabled:true}")
     private boolean meiliEnabled;
+    private volatile Client meiliClient;
 
     public DomesticStockServiceImpl(StockInfoDao stockInfoDao,
                                     StockQuoteDao stockQuoteDao) {
@@ -152,11 +152,8 @@ public class DomesticStockServiceImpl extends DomesticStockServiceImplBase {
         String query = request.getQuery();
         DomesticStockSearchESResponse.Builder responseBuilder = DomesticStockSearchESResponse.newBuilder();
         try {
-            Client client = new Client(new Config(meiliHost, meiliApiKey));
-            Index index = client.index("stocks");
-            SearchResult searchResult = (SearchResult) index.search(
-                    SearchRequest.builder().q(query).limit(20).build()
-            );
+            Index index = getMeiliClient().index("stocks");
+            SearchResult searchResult = index.search(query);
             for (Object hitObj : searchResult.getHits()) {
                 if (!(hitObj instanceof Map<?, ?> hit)) {
                     continue;
@@ -188,6 +185,17 @@ public class DomesticStockServiceImpl extends DomesticStockServiceImplBase {
 
     private String stringValue(Object value) {
         return value == null ? "" : String.valueOf(value);
+    }
+
+    private Client getMeiliClient() {
+        if (meiliClient == null) {
+            synchronized (this) {
+                if (meiliClient == null) {
+                    meiliClient = new Client(new Config(meiliHost, meiliApiKey));
+                }
+            }
+        }
+        return meiliClient;
     }
 
 

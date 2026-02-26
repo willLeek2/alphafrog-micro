@@ -4,7 +4,6 @@ import lombok.extern.slf4j.Slf4j;
 import com.meilisearch.sdk.Client;
 import com.meilisearch.sdk.Config;
 import com.meilisearch.sdk.Index;
-import com.meilisearch.sdk.SearchRequest;
 import com.meilisearch.sdk.model.SearchResult;
 import org.apache.dubbo.config.annotation.DubboService;
 import org.springframework.beans.factory.annotation.Value;
@@ -39,6 +38,7 @@ public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
     private String meiliApiKey;
     @Value("${advanced.meili-enabled:true}")
     private boolean meiliEnabled;
+    private volatile Client meiliClient;
 
 
     public DomesticIndexServiceImpl(IndexInfoDao indexInfoDao,
@@ -122,11 +122,8 @@ public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
         DomesticIndexSearchResponse.Builder responseBuilder = DomesticIndexSearchResponse.newBuilder();
         if (meiliEnabled) {
             try {
-                Client client = new Client(new Config(meiliHost, meiliApiKey));
-                Index index = client.index("indices");
-                SearchResult searchResult = (SearchResult) index.search(
-                        SearchRequest.builder().q(normalizedQuery).limit(200).build()
-                );
+                Index index = getMeiliClient().index("indices");
+                SearchResult searchResult = index.search(normalizedQuery);
                 for (Object hitObj : searchResult.getHits()) {
                     if (!(hitObj instanceof Map<?, ?> hit)) {
                         continue;
@@ -166,6 +163,17 @@ public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
 
     private String stringValue(Object value) {
         return value == null ? "" : String.valueOf(value);
+    }
+
+    private Client getMeiliClient() {
+        if (meiliClient == null) {
+            synchronized (this) {
+                if (meiliClient == null) {
+                    meiliClient = new Client(new Config(meiliHost, meiliApiKey));
+                }
+            }
+        }
+        return meiliClient;
     }
 
     @Override
