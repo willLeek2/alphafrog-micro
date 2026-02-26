@@ -77,7 +77,7 @@ class MarketNewsServiceTest {
     }
 
     @Test
-    void getTodayMarketNews_shouldAggregateProfilesAndApplyLimitTruncation() {
+    void getTodayMarketNews_shouldAggregateMultipleProfilesAndApplyFinalLimit() {
         SearchLlmProperties cfg = buildMultiProfileConfig();
         lenient().when(localConfigLoader.current()).thenReturn(Optional.of(cfg));
 

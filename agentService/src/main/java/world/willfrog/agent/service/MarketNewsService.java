@@ -301,7 +301,7 @@ public class MarketNewsService {
                                                        Map<String, SearchLlmProperties.Provider> providers) {
         String providerName = firstNonBlank(profile.getProvider(), feature.getDefaultProvider());
         if (!hasText(providerName)) {
-            throw new IllegalStateException("marketNews profile " + profile.getName() + " missing provider and feature defaultProvider");
+            throw new IllegalStateException("marketNews profile " + profile.getName() + " does not specify provider and feature.defaultProvider is not configured");
         }
         SearchLlmProperties.Provider provider = providers.get(providerName);
         if (provider == null || !hasText(provider.getBaseUrl())) {
@@ -372,7 +372,7 @@ public class MarketNewsService {
             }
         }
         if (unique.isEmpty()) {
-            throw new IllegalStateException("marketNews profile " + profile.getName() + " query is empty");
+            throw new IllegalStateException("marketNews profile " + profile.getName() + " must specify either query or queries with non-empty value");
         }
         return String.join(" OR ", unique);
     }
