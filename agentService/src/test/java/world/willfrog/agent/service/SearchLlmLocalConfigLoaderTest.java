@@ -9,6 +9,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -74,6 +75,6 @@ class SearchLlmLocalConfigLoaderTest {
         loader.load();
 
         assertTrue(loader.current().isPresent());
-        assertTrue(loader.current().orElseThrow().getFeatures().getMarketNews().getProfiles().size() == 1);
+        assertEquals(1, loader.current().orElseThrow().getFeatures().getMarketNews().getProfiles().size());
     }
 }

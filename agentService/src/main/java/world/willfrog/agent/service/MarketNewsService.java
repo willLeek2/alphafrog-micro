@@ -169,7 +169,6 @@ public class MarketNewsService {
             body.put("userLocation", profile.getCountry());
         }
         Map<String, Object> contents = new LinkedHashMap<>();
-        contents.put("summary", true);
         contents.put("text", false);
         body.put("contents", contents);
         return body;
@@ -284,7 +283,9 @@ public class MarketNewsService {
             return;
         }
         MarketNewsItem existing = map.get(key);
-        if (existing == null || timestampOrMin(candidate).isAfter(timestampOrMin(existing))) {
+        OffsetDateTime candidateTs = timestampOrMin(candidate);
+        OffsetDateTime existingTs = existing == null ? OffsetDateTime.MIN : timestampOrMin(existing);
+        if (existing == null || candidateTs.isAfter(existingTs)) {
             map.put(key, candidate);
         }
     }

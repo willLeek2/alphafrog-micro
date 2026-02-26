@@ -115,7 +115,7 @@ public class SearchLlmLocalConfigLoader {
             throw new IllegalStateException("search-llm config must be a JSON object: " + path);
         }
         if (root.has("defaultProvider") || root.has("marketNews")) {
-            throw new IllegalStateException("Legacy search-llm config detected. Use features.marketNews.profiles schema only: " + path);
+            throw new IllegalStateException("Legacy fields detected (defaultProvider, marketNews). Migrate to features.marketNews.profiles schema. See README migration guide: " + path);
         }
     }
 
