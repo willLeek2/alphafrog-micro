@@ -53,6 +53,8 @@ public class SearchLlmProperties {
         private String searchPath;
         private String authHeader;
         private String authPrefix;
+        private Integer connectTimeoutSeconds;
+        private Integer requestTimeoutSeconds;
         private Map<String, String> headers = new HashMap<>();
 
         public String getBaseUrl() {
@@ -93,6 +95,22 @@ public class SearchLlmProperties {
 
         public void setAuthPrefix(String authPrefix) {
             this.authPrefix = authPrefix;
+        }
+
+        public Integer getConnectTimeoutSeconds() {
+            return connectTimeoutSeconds;
+        }
+
+        public void setConnectTimeoutSeconds(Integer connectTimeoutSeconds) {
+            this.connectTimeoutSeconds = connectTimeoutSeconds;
+        }
+
+        public Integer getRequestTimeoutSeconds() {
+            return requestTimeoutSeconds;
+        }
+
+        public void setRequestTimeoutSeconds(Integer requestTimeoutSeconds) {
+            this.requestTimeoutSeconds = requestTimeoutSeconds;
         }
 
         public Map<String, String> getHeaders() {

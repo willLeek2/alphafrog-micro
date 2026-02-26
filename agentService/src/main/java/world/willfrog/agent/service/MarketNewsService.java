@@ -37,13 +37,12 @@ public class MarketNewsService {
     private static final int CJK_EXT_A_END = 0x4DBF;
     private static final int CJK_UNIFIED_START = 0x4E00;
     private static final int CJK_UNIFIED_END = 0x9FFF;
+    private static final int DEFAULT_CONNECT_TIMEOUT_SECONDS = 20;
+    private static final int DEFAULT_REQUEST_TIMEOUT_SECONDS = 45;
 
     private final ObjectMapper objectMapper;
     private final SearchLlmProperties properties;
     private final SearchLlmLocalConfigLoader localConfigLoader;
-    private final HttpClient httpClient = HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(20))
-            .build();
 
     public MarketNewsResult getTodayMarketNews(MarketNewsQuery query) {
         SearchLlmProperties local = localConfigLoader.current().orElse(null);
@@ -154,7 +153,6 @@ public class MarketNewsService {
             body.put("userLocation", marketNews.getUserLocation());
         }
         Map<String, Object> contents = new LinkedHashMap<>();
-        contents.put("summary", true);
         contents.put("text", false);
         body.put("contents", contents);
 
@@ -299,6 +297,8 @@ public class MarketNewsService {
             merged.setSearchPath(base.getSearchPath());
             merged.setAuthHeader(base.getAuthHeader());
             merged.setAuthPrefix(base.getAuthPrefix());
+            merged.setConnectTimeoutSeconds(base.getConnectTimeoutSeconds());
+            merged.setRequestTimeoutSeconds(base.getRequestTimeoutSeconds());
             merged.setHeaders(copyMap(base.getHeaders()));
         }
         if (override != null) {
@@ -316,6 +316,12 @@ public class MarketNewsService {
             }
             if (override.getAuthPrefix() != null) {
                 merged.setAuthPrefix(override.getAuthPrefix());
+            }
+            if (override.getConnectTimeoutSeconds() != null) {
+                merged.setConnectTimeoutSeconds(override.getConnectTimeoutSeconds());
+            }
+            if (override.getRequestTimeoutSeconds() != null) {
+                merged.setRequestTimeoutSeconds(override.getRequestTimeoutSeconds());
             }
             if (override.getHeaders() != null && !override.getHeaders().isEmpty()) {
                 Map<String, String> headers = merged.getHeaders();
@@ -347,9 +353,6 @@ public class MarketNewsService {
             return prompts.getMarketNewsQueryTemplate().trim();
         }
         List<String> queries = marketNews.getQueries();
-        if (queries == null || queries.isEmpty()) {
-            throw new IllegalStateException("market news query is empty");
-        }
         LinkedHashSet<String> unique = new LinkedHashSet<>();
         for (String q : queries) {
             if (hasText(q)) {
@@ -573,9 +576,10 @@ public class MarketNewsService {
         }
         try {
             String requestBody = objectMapper.writeValueAsString(body);
+            int requestTimeoutSeconds = resolveRequestTimeoutSeconds(provider);
             HttpRequest.Builder requestBuilder = HttpRequest.newBuilder()
                     .uri(URI.create(url))
-                    .timeout(Duration.ofSeconds(45))
+                    .timeout(Duration.ofSeconds(requestTimeoutSeconds))
                     .header("Content-Type", "application/json")
                     .header("Accept", "application/json")
                     .POST(HttpRequest.BodyPublishers.ofString(requestBody, StandardCharsets.UTF_8));
@@ -587,7 +591,8 @@ public class MarketNewsService {
                     }
                 }
             }
-            HttpResponse<String> response = httpClient.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString());
+            HttpClient client = buildHttpClient(provider);
+            HttpResponse<String> response = client.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString());
             if (response.statusCode() >= 300) {
                 log.error("Search provider {} returned status {} body {}", url, response.statusCode(), response.body());
                 throw new IllegalStateException("search provider error: " + response.statusCode());
@@ -626,6 +631,26 @@ public class MarketNewsService {
         return normalizedBase + normalizedPath;
     }
 
+    int resolveConnectTimeoutSeconds(SearchLlmProperties.Provider provider) {
+        return firstPositive(
+                provider == null ? null : provider.getConnectTimeoutSeconds(),
+                DEFAULT_CONNECT_TIMEOUT_SECONDS
+        );
+    }
+
+    int resolveRequestTimeoutSeconds(SearchLlmProperties.Provider provider) {
+        return firstPositive(
+                provider == null ? null : provider.getRequestTimeoutSeconds(),
+                DEFAULT_REQUEST_TIMEOUT_SECONDS
+        );
+    }
+
+    private HttpClient buildHttpClient(SearchLlmProperties.Provider provider) {
+        return HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(resolveConnectTimeoutSeconds(provider)))
+                .build();
+    }
+
     private int defaultLimit(SearchLlmProperties.MarketNews marketNews) {
         if (marketNews == null || marketNews.getDefaultLimit() == null || marketNews.getDefaultLimit() <= 0) {
             return 8;
@@ -647,6 +672,13 @@ public class MarketNewsService {
 
     private <T> T firstNonNull(T first, T second) {
         return first != null ? first : second;
+    }
+
+    private int firstPositive(Integer first, int fallback) {
+        if (first != null && first > 0) {
+            return first;
+        }
+        return fallback;
     }
 
     private boolean hasText(String value) {
@@ -721,7 +753,6 @@ public class MarketNewsService {
     @JsonIgnoreProperties(ignoreUnknown = true)
     public record ExaSearchResult(String title,
                                   String url,
-                                  String summary,
                                   String author,
                                   String id,
                                   @JsonProperty("publishedDate") String publishedDate) {

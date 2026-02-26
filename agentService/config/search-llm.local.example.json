@@ -6,14 +6,18 @@
       "apiKey": "replace-with-your-perplexity-api-key",
       "searchPath": "/search",
       "authHeader": "Authorization",
-      "authPrefix": "Bearer "
+      "authPrefix": "Bearer ",
+      "connectTimeoutSeconds": 20,
+      "requestTimeoutSeconds": 45
     },
     "exa": {
       "baseUrl": "https://api.exa.ai",
       "apiKey": "replace-with-your-exa-api-key",
       "searchPath": "/search",
       "authHeader": "x-api-key",
-      "authPrefix": ""
+      "authPrefix": "",
+      "connectTimeoutSeconds": 20,
+      "requestTimeoutSeconds": 45
     }
   },
   "marketNews": {

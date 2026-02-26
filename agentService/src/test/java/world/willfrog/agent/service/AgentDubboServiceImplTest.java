@@ -15,12 +15,14 @@ import world.willfrog.agent.model.AgentRunStatus;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentConfigRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentConfigResponse;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentCreditsRequest;
+import world.willfrog.alphafrogmicro.agent.idl.GetTodayMarketNewsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunStatusRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentRunsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentModelsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ResumeAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.UpdateAgentRunRequest;
 import world.willfrog.alphafrogmicro.common.dao.user.UserDao;
+import world.willfrog.alphafrogmicro.common.pojo.user.User;
 
 import java.time.OffsetDateTime;
 import java.util.List;
@@ -30,6 +32,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -258,5 +261,67 @@ class AgentDubboServiceImplTest {
         assertEquals("app-1", resp.getApplicationId());
         assertEquals(5000, resp.getTotalCredits());
         assertEquals("PENDING", resp.getStatus());
+    }
+
+    @Test
+    void getTodayMarketNews_shouldRejectDisabledUser() {
+        User user = new User();
+        user.setUserId(1L);
+        user.setStatus("DISABLED");
+        when(userDao.getUserById(1L)).thenReturn(user);
+
+        IllegalStateException ex = assertThrows(IllegalStateException.class, () ->
+                service.getTodayMarketNews(GetTodayMarketNewsRequest.newBuilder()
+                        .setUserId("1")
+                        .setLimit(5)
+                        .build())
+        );
+        assertEquals("user disabled", ex.getMessage());
+        verifyNoInteractions(marketNewsService);
+    }
+
+    @Test
+    void getTodayMarketNews_shouldDelegateToMarketNewsServiceWhenUserActive() {
+        User user = new User();
+        user.setUserId(7L);
+        user.setStatus("ACTIVE");
+        when(userDao.getUserById(7L)).thenReturn(user);
+
+        when(marketNewsService.getTodayMarketNews(any())).thenReturn(
+                new MarketNewsService.MarketNewsResult(
+                        List.of(new MarketNewsService.MarketNewsItem(
+                                "news-1",
+                                "2026-02-26T09:00:00+08:00",
+                                "沪深300高开",
+                                "sina.com.cn",
+                                "market",
+                                "https://finance.sina.com.cn/example"
+                        )),
+                        "2026-02-26T09:01:00+08:00",
+                        "exa"
+                )
+        );
+
+        var response = service.getTodayMarketNews(GetTodayMarketNewsRequest.newBuilder()
+                .setUserId("7")
+                .setLimit(8)
+                .setProvider("exa")
+                .addLanguages("zh")
+                .setStartPublishedDate("2026-02-26T00:00:00+08:00")
+                .setEndPublishedDate("2026-02-26T23:59:59+08:00")
+                .build());
+
+        assertEquals("exa", response.getProvider());
+        assertEquals("2026-02-26T09:01:00+08:00", response.getUpdatedAt());
+        assertEquals(1, response.getDataCount());
+        assertEquals("news-1", response.getData(0).getId());
+        assertEquals("沪深300高开", response.getData(0).getTitle());
+        verify(marketNewsService).getTodayMarketNews(argThat(query ->
+                "exa".equals(query.provider())
+                        && query.limit() == 8
+                        && List.of("zh").equals(query.languages())
+                        && "2026-02-26T00:00:00+08:00".equals(query.startPublishedDate())
+                        && "2026-02-26T23:59:59+08:00".equals(query.endPublishedDate())
+        ));
     }
 }

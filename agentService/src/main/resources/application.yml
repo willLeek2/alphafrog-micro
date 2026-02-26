@@ -241,12 +241,16 @@ agent:
         search-path: ${AF_AGENT_SEARCH_PPLX_SEARCH_PATH:/search}
         auth-header: ${AF_AGENT_SEARCH_PPLX_AUTH_HEADER:Authorization}
         auth-prefix: ${AF_AGENT_SEARCH_PPLX_AUTH_PREFIX:Bearer }
+        connect-timeout-seconds: ${AF_AGENT_SEARCH_PPLX_CONNECT_TIMEOUT_SECONDS:20}
+        request-timeout-seconds: ${AF_AGENT_SEARCH_PPLX_REQUEST_TIMEOUT_SECONDS:45}
       exa:
         base-url: ${AF_AGENT_SEARCH_EXA_BASE_URL:https://api.exa.ai}
         api-key: ${AF_AGENT_SEARCH_EXA_API_KEY:}
         search-path: ${AF_AGENT_SEARCH_EXA_SEARCH_PATH:/search}
         auth-header: ${AF_AGENT_SEARCH_EXA_AUTH_HEADER:x-api-key}
         auth-prefix: ${AF_AGENT_SEARCH_EXA_AUTH_PREFIX:}
+        connect-timeout-seconds: ${AF_AGENT_SEARCH_EXA_CONNECT_TIMEOUT_SECONDS:20}
+        request-timeout-seconds: ${AF_AGENT_SEARCH_EXA_REQUEST_TIMEOUT_SECONDS:45}
     market-news:
       default-limit: ${AF_AGENT_SEARCH_MARKET_NEWS_DEFAULT_LIMIT:8}
       max-results: ${AF_AGENT_SEARCH_MARKET_NEWS_MAX_RESULTS:20}
@@ -255,9 +259,21 @@ agent:
       user-location: ${AF_AGENT_SEARCH_MARKET_NEWS_USER_LOCATION:CN}
       exa-search-type: ${AF_AGENT_SEARCH_MARKET_NEWS_EXA_TYPE:auto}
       exa-category: ${AF_AGENT_SEARCH_MARKET_NEWS_EXA_CATEGORY:news}
-      include-domains: ${AF_AGENT_SEARCH_MARKET_NEWS_INCLUDE_DOMAINS:sina.com.cn,eastmoney.com,cls.cn,yicai.com,wallstreetcn.com}
-      languages: ${AF_AGENT_SEARCH_MARKET_NEWS_LANGUAGES:zh,en}
-      queries: ${AF_AGENT_SEARCH_MARKET_NEWS_QUERIES:今日A股市场行情,央行政策公告,美股市场要闻,全球市场动态,行业板块热点}
+      include-domains:
+        - sina.com.cn
+        - eastmoney.com
+        - cls.cn
+        - yicai.com
+        - wallstreetcn.com
+      languages:
+        - zh
+        - en
+      queries:
+        - 今日A股市场行情
+        - 央行政策公告
+        - 美股市场要闻
+        - 全球市场动态
+        - 行业板块热点
       category-keywords:
         policy: ${AF_AGENT_SEARCH_MARKET_NEWS_KEYWORDS_POLICY:央行,政策,逆回购}
         global: ${AF_AGENT_SEARCH_MARKET_NEWS_KEYWORDS_GLOBAL:美股,美联储,纳指,道指}
