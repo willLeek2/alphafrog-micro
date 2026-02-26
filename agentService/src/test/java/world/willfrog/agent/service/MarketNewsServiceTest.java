@@ -37,6 +37,7 @@ class MarketNewsServiceTest {
     void buildPerplexityRequestBody_shouldIsolateProfileDomainsAndLanguages() {
         SearchLlmProperties.MarketNewsProfile cnProfile = new SearchLlmProperties.MarketNewsProfile();
         cnProfile.setName("cn");
+        cnProfile.setQuery("今日A股");
         cnProfile.setIncludeDomains(List.of("sina.com.cn"));
         cnProfile.setExcludeDomains(List.of("example.com"));
         cnProfile.setLanguages(List.of("zh"));
@@ -64,7 +65,7 @@ class MarketNewsServiceTest {
 
     @Test
     void dedupeAndSort_shouldDedupeByUrlThenTitleAndSortByTimestampDesc() {
-        List<MarketNewsService.MarketNewsItem> deduped = service.dedupeAndSort(List.of(
+        List<MarketNewsService.MarketNewsItem> deduped = service.deduplicateAndSort(List.of(
                 new MarketNewsService.MarketNewsItem("id-1", "2026-02-22T10:00:00+08:00", "同标题", "s1", "market", "https://a.com/n1"),
                 new MarketNewsService.MarketNewsItem("id-2", "2026-02-22T11:00:00+08:00", "同标题更新", "s1", "market", "https://a.com/n1"),
                 new MarketNewsService.MarketNewsItem("id-3", "2026-02-22T09:00:00+08:00", "重复标题", "s2", "market", "https://b.com/n2"),

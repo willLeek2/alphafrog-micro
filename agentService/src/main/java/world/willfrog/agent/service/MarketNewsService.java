@@ -66,7 +66,7 @@ public class MarketNewsService {
             allItems.addAll(profileItems);
         }
 
-        List<MarketNewsItem> merged = dedupeAndSort(allItems);
+        List<MarketNewsItem> merged = deduplicateAndSort(allItems);
         List<MarketNewsItem> filteredByRequest = filterItems(
                 merged,
                 query.languages(),
@@ -247,7 +247,7 @@ public class MarketNewsService {
         return filtered;
     }
 
-    List<MarketNewsItem> dedupeAndSort(List<MarketNewsItem> items) {
+    List<MarketNewsItem> deduplicateAndSort(List<MarketNewsItem> items) {
         if (items == null || items.isEmpty()) {
             return List.of();
         }
