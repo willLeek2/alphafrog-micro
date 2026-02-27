@@ -147,10 +147,12 @@ public class DomesticStockServiceImpl extends DomesticStockServiceImplBase {
 
     /**
      * 将 StockInfo 转换为 MeiliSearch 文档
+     * 注意：ts_code 需要转换为 MeiliSearch 合法的文档 ID（将 . 替换为 _）
      */
     private Map<String, Object> convertToMeiliDocument(StockInfo stock) {
         Map<String, Object> doc = new HashMap<>();
-        doc.put("ts_code", stock.getTsCode());
+        // MeiliSearch 文档 ID 不能包含 '.'，需要转换
+        doc.put("ts_code", MeiliSearchDataSyncService.toMeiliId(stock.getTsCode()));
         doc.put("symbol", stock.getSymbol());
         doc.put("name", stock.getName());
         doc.put("full_name", stock.getFullName());
@@ -258,8 +260,11 @@ public class DomesticStockServiceImpl extends DomesticStockServiceImplBase {
                     if (!(hitObj instanceof Map<?, ?> hit)) {
                         continue;
                     }
+                    // 将 MeiliSearch 的 ts_code 转换回原始格式（将 _ 替换为 .）
+                    String meiliTsCode = stringValue(hit.get("ts_code"));
+                    String originalTsCode = MeiliSearchDataSyncService.fromMeiliId(meiliTsCode);
                     DomesticStockInfoSimpleItem.Builder itemBuilder = DomesticStockInfoSimpleItem.newBuilder()
-                            .setTsCode(stringValue(hit.get("ts_code")))
+                            .setTsCode(originalTsCode)
                             .setSymbol(stringValue(hit.get("symbol")))
                             .setName(stringValue(hit.get("name")))
                             .setArea(stringValue(hit.get("area")))
@@ -309,7 +314,10 @@ public class DomesticStockServiceImpl extends DomesticStockServiceImplBase {
                         continue;
                     }
                     DomesticStockInfoESItem.Builder itemBuilder = DomesticStockInfoESItem.newBuilder();
-                    itemBuilder.setTsCode(stringValue(hit.get("ts_code")))
+                    // 将 MeiliSearch 的 ts_code 转换回原始格式（将 _ 替换为 .）
+                    String meiliTsCode = stringValue(hit.get("ts_code"));
+                    String originalTsCode = MeiliSearchDataSyncService.fromMeiliId(meiliTsCode);
+                    itemBuilder.setTsCode(originalTsCode)
                             .setSymbol(stringValue(hit.get("symbol")))
                             .setName(stringValue(hit.get("name")))
                             .setArea(stringValue(hit.get("area")))

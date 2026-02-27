@@ -25,9 +25,30 @@ import java.util.function.Function;
  * 1. 异步全量同步（服务启动时触发）
  * 2. 定时增量/全量同步
  * 3. 同步状态监控
+ * 
+ * 注意：MeiliSearch 的文档 ID 不能包含 '.'，需要将 ts_code 中的 '.' 替换为 '_'
  */
 @Slf4j
 public class MeiliSearchDataSyncService {
+
+    /**
+     * 转换 ts_code 为 MeiliSearch 合法的文档 ID
+     * MeiliSearch 文档 ID 只能包含：字母、数字、连字符(-)、下划线(_)
+     * 例如：000001.SZ -> 000001_SZ
+     */
+    public static String toMeiliId(String tsCode) {
+        if (tsCode == null) return "";
+        return tsCode.replace('.', '_');
+    }
+
+    /**
+     * 将 MeiliSearch 文档 ID 转换回原始 ts_code
+     * 例如：000001_SZ -> 000001.SZ
+     */
+    public static String fromMeiliId(String meiliId) {
+        if (meiliId == null) return "";
+        return meiliId.replace('_', '.');
+    }
 
     private static final int DEFAULT_BATCH_SIZE = 500;
     private static final int DEFAULT_THREAD_POOL_SIZE = 2;

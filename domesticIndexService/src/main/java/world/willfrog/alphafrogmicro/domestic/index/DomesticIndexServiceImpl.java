@@ -161,10 +161,12 @@ public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
 
     /**
      * 将 IndexInfo 转换为 MeiliSearch 文档
+     * 注意：ts_code 需要转换为 MeiliSearch 合法的文档 ID（将 . 替换为 _）
      */
     private Map<String, Object> convertToMeiliDocument(IndexInfo index) {
         Map<String, Object> doc = new HashMap<>();
-        doc.put("ts_code", index.getTsCode());
+        // MeiliSearch 文档 ID 不能包含 '.'，需要转换
+        doc.put("ts_code", MeiliSearchDataSyncService.toMeiliId(index.getTsCode()));
         doc.put("name", index.getName());
         doc.put("full_name", index.getFullName());
         doc.put("market", index.getMarket());
@@ -250,8 +252,11 @@ public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
                     if (!(hitObj instanceof Map<?, ?> hit)) {
                         continue;
                     }
+                    // 将 MeiliSearch 的 ts_code 转换回原始格式（将 _ 替换为 .）
+                    String meiliTsCode = stringValue(hit.get("ts_code"));
+                    String originalTsCode = MeiliSearchDataSyncService.fromMeiliId(meiliTsCode);
                     DomesticIndexInfoSimpleItem.Builder itemBuilder = DomesticIndexInfoSimpleItem.newBuilder()
-                            .setTsCode(stringValue(hit.get("ts_code")))
+                            .setTsCode(originalTsCode)
                             .setName(stringValue(hit.get("name")))
                             .setFullname(stringValue(hit.get("full_name")))
                             .setMarket(stringValue(hit.get("market")));

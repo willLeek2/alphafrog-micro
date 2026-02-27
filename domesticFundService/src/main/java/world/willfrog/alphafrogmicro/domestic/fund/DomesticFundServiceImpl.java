@@ -151,10 +151,12 @@ public class DomesticFundServiceImpl extends DomesticFundServiceImplBase {
 
     /**
      * 将 FundInfo 转换为 MeiliSearch 文档
+     * 注意：ts_code 需要转换为 MeiliSearch 合法的文档 ID（将 . 替换为 _）
      */
     private Map<String, Object> convertToMeiliDocument(FundInfo fund) {
         Map<String, Object> doc = new HashMap<>();
-        doc.put("ts_code", fund.getTsCode());
+        // MeiliSearch 文档 ID 不能包含 '.'，需要转换
+        doc.put("ts_code", MeiliSearchDataSyncService.toMeiliId(fund.getTsCode()));
         doc.put("name", fund.getName());
         doc.put("management", fund.getManagement());
         doc.put("fund_type", fund.getFundType());
@@ -341,8 +343,11 @@ public class DomesticFundServiceImpl extends DomesticFundServiceImplBase {
                     if (!(hitObj instanceof Map<?, ?> hit)) {
                         continue;
                     }
+                    // 将 MeiliSearch 的 ts_code 转换回原始格式（将 _ 替换为 .）
+                    String meiliTsCode = stringValue(hit.get("ts_code"));
+                    String originalTsCode = MeiliSearchDataSyncService.fromMeiliId(meiliTsCode);
                     DomesticFundInfoSimpleItem.Builder itemBuilder = DomesticFundInfoSimpleItem.newBuilder()
-                            .setTsCode(stringValue(hit.get("ts_code")))
+                            .setTsCode(originalTsCode)
                             .setName(stringValue(hit.get("name")));
                     String management = stringValue(hit.get("management"));
                     if (!management.isEmpty()) {
