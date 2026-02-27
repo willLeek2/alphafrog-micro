@@ -39,3 +39,4 @@ tushare:
 
 advanced:
   meili-enabled: true
+  meili-auto-sync: true
