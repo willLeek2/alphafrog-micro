@@ -7,7 +7,7 @@ import com.meilisearch.sdk.Index;
 import com.meilisearch.sdk.SearchRequest;
 import com.meilisearch.sdk.model.SearchResult;
 import org.apache.dubbo.config.annotation.DubboService;
-import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.env.Environment;
 import org.springframework.stereotype.Service;
 import world.willfrog.alphafrogmicro.common.dao.domestic.calendar.TradeCalendarDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.index.IndexInfoDao;
@@ -22,36 +22,42 @@ import world.willfrog.alphafrogmicro.domestic.index.service.IndexDataCompletenes
 
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 
 @DubboService
 @Service
 @Slf4j
 public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
 
+    private static final String MEILI_HOST_PROP = "meilisearch.host";
+    private static final String MEILI_API_KEY_PROP = "meilisearch.api-key";
+    private static final String MEILI_ENABLED_PROP = "advanced.meili-enabled";
+    private static final String DEFAULT_MEILI_HOST = "http://localhost:7700";
+    private static final String DEFAULT_MEILI_API_KEY = "alphafrog_search_key";
+
     private final IndexInfoDao indexInfoDao;
     private final IndexQuoteDao indexQuoteDao;
     private final IndexWeightDao indexWeightDao;
     private final IndexDataCompletenessService indexDataCompletenessService;
     private final TradeCalendarDao tradeCalendarDao;
-    @Value("${meilisearch.host:http://localhost:7700}")
-    private String meiliHost;
-    @Value("${meilisearch.api-key:alphafrog_search_key}")
-    private String meiliApiKey;
-    @Value("${advanced.meili-enabled:true}")
-    private boolean meiliEnabled;
+    private final Environment environment;
     private volatile Client meiliClient;
+    private volatile String meiliClientHost;
+    private volatile String meiliClientApiKey;
 
 
     public DomesticIndexServiceImpl(IndexInfoDao indexInfoDao,
                                     IndexQuoteDao indexQuoteDao,
                                     IndexWeightDao indexWeightDao,
                                     IndexDataCompletenessService indexDataCompletenessService,
-                                    TradeCalendarDao tradeCalendarDao) {
+                                    TradeCalendarDao tradeCalendarDao,
+                                    Environment environment) {
         this.indexInfoDao = indexInfoDao;
         this.indexQuoteDao = indexQuoteDao;
         this.indexWeightDao = indexWeightDao;
         this.indexDataCompletenessService = indexDataCompletenessService;
         this.tradeCalendarDao = tradeCalendarDao;
+        this.environment = environment;
     }
 
 
@@ -121,7 +127,7 @@ public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
         }
         String normalizedQuery = query.trim();
         DomesticIndexSearchResponse.Builder responseBuilder = DomesticIndexSearchResponse.newBuilder();
-        if (meiliEnabled) {
+        if (isMeiliEnabled()) {
             try {
                 Index index = getMeiliClient().index("indices");
                 SearchResult searchResult = (SearchResult) index.search(
@@ -167,15 +173,32 @@ public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
         return value == null ? "" : String.valueOf(value);
     }
 
+    private boolean isMeiliEnabled() {
+        return Boolean.parseBoolean(environment.getProperty(MEILI_ENABLED_PROP, "true"));
+    }
+
     private Client getMeiliClient() {
-        if (meiliClient == null) {
+        String host = environment.getProperty(MEILI_HOST_PROP, DEFAULT_MEILI_HOST);
+        String apiKey = environment.getProperty(MEILI_API_KEY_PROP, DEFAULT_MEILI_API_KEY);
+
+        Client localClient = meiliClient;
+        if (localClient == null
+                || !Objects.equals(meiliClientHost, host)
+                || !Objects.equals(meiliClientApiKey, apiKey)) {
             synchronized (this) {
-                if (meiliClient == null) {
-                    meiliClient = new Client(new Config(meiliHost, meiliApiKey));
+                localClient = meiliClient;
+                if (localClient == null
+                        || !Objects.equals(meiliClientHost, host)
+                        || !Objects.equals(meiliClientApiKey, apiKey)) {
+                    meiliClient = new Client(new Config(host, apiKey));
+                    meiliClientHost = host;
+                    meiliClientApiKey = apiKey;
+                    localClient = meiliClient;
+                    log.info("MeiliSearch client refreshed for index service, host={}", host);
                 }
             }
         }
-        return meiliClient;
+        return localClient;
     }
 
     @Override

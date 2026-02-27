@@ -7,7 +7,7 @@ import com.meilisearch.sdk.Index;
 import com.meilisearch.sdk.SearchRequest;
 import com.meilisearch.sdk.model.SearchResult;
 import org.apache.dubbo.config.annotation.DubboService;
-import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.env.Environment;
 import org.springframework.stereotype.Service;
 import world.willfrog.alphafrogmicro.common.dao.domestic.stock.StockInfoDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.stock.StockQuoteDao;
@@ -18,29 +18,32 @@ import world.willfrog.alphafrogmicro.domestic.idl.DubboDomesticStockServiceTripl
 
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 
 @Service
 @DubboService
 @Slf4j
 public class DomesticStockServiceImpl extends DomesticStockServiceImplBase {
 
+    private static final String MEILI_HOST_PROP = "meilisearch.host";
+    private static final String MEILI_API_KEY_PROP = "meilisearch.api-key";
+    private static final String MEILI_ENABLED_PROP = "advanced.meili-enabled";
+    private static final String DEFAULT_MEILI_HOST = "http://localhost:7700";
+    private static final String DEFAULT_MEILI_API_KEY = "alphafrog_search_key";
+
     private final StockInfoDao stockInfoDao;
     private final StockQuoteDao stockQuoteDao;
-
-    @Value("${meilisearch.host:http://localhost:7700}")
-    private String meiliHost;
-
-    @Value("${meilisearch.api-key:alphafrog_search_key}")
-    private String meiliApiKey;
-
-    @Value("${advanced.meili-enabled:true}")
-    private boolean meiliEnabled;
+    private final Environment environment;
     private volatile Client meiliClient;
+    private volatile String meiliClientHost;
+    private volatile String meiliClientApiKey;
 
     public DomesticStockServiceImpl(StockInfoDao stockInfoDao,
-                                    StockQuoteDao stockQuoteDao) {
+                                    StockQuoteDao stockQuoteDao,
+                                    Environment environment) {
         this.stockInfoDao = stockInfoDao;
         this.stockQuoteDao = stockQuoteDao;
+        this.environment = environment;
     }
 
     @Override
@@ -129,7 +132,7 @@ public class DomesticStockServiceImpl extends DomesticStockServiceImplBase {
         }
         String normalizedQuery = query.trim();
         DomesticStockSearchResponse.Builder responseBuilder = DomesticStockSearchResponse.newBuilder();
-        if (meiliEnabled) {
+        if (isMeiliEnabled()) {
             try {
                 Index index = getMeiliClient().index("stocks");
                 SearchResult searchResult = (SearchResult) index.search(
@@ -179,7 +182,7 @@ public class DomesticStockServiceImpl extends DomesticStockServiceImplBase {
         }
         String normalizedQuery = query.trim();
         DomesticStockSearchESResponse.Builder responseBuilder = DomesticStockSearchESResponse.newBuilder();
-        if (meiliEnabled) {
+        if (isMeiliEnabled()) {
             try {
                 Index index = getMeiliClient().index("stocks");
                 SearchResult searchResult = (SearchResult) index.search(
@@ -246,15 +249,32 @@ public class DomesticStockServiceImpl extends DomesticStockServiceImplBase {
         return value == null ? "" : String.valueOf(value);
     }
 
+    private boolean isMeiliEnabled() {
+        return Boolean.parseBoolean(environment.getProperty(MEILI_ENABLED_PROP, "true"));
+    }
+
     private Client getMeiliClient() {
-        if (meiliClient == null) {
+        String host = environment.getProperty(MEILI_HOST_PROP, DEFAULT_MEILI_HOST);
+        String apiKey = environment.getProperty(MEILI_API_KEY_PROP, DEFAULT_MEILI_API_KEY);
+
+        Client localClient = meiliClient;
+        if (localClient == null
+                || !Objects.equals(meiliClientHost, host)
+                || !Objects.equals(meiliClientApiKey, apiKey)) {
             synchronized (this) {
-                if (meiliClient == null) {
-                    meiliClient = new Client(new Config(meiliHost, meiliApiKey));
+                localClient = meiliClient;
+                if (localClient == null
+                        || !Objects.equals(meiliClientHost, host)
+                        || !Objects.equals(meiliClientApiKey, apiKey)) {
+                    meiliClient = new Client(new Config(host, apiKey));
+                    meiliClientHost = host;
+                    meiliClientApiKey = apiKey;
+                    localClient = meiliClient;
+                    log.info("MeiliSearch client refreshed for stock service, host={}", host);
                 }
             }
         }
-        return meiliClient;
+        return localClient;
     }
 
 

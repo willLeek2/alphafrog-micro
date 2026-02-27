@@ -8,7 +8,7 @@ import com.meilisearch.sdk.SearchRequest;
 import com.meilisearch.sdk.model.SearchResult;
 import org.springframework.stereotype.Service;
 import org.apache.dubbo.config.annotation.DubboService;
-import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.env.Environment;
 import world.willfrog.alphafrogmicro.common.dao.domestic.fund.FundInfoDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.fund.FundNavDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.fund.FundPortfolioDao;
@@ -21,27 +21,33 @@ import world.willfrog.alphafrogmicro.domestic.idl.DubboDomesticFundServiceTriple
 import java.util.List;
 import java.util.ArrayList;
 import java.util.Map;
+import java.util.Objects;
 
 @DubboService
 @Service
 @Slf4j
 public class DomesticFundServiceImpl extends DomesticFundServiceImplBase {
 
+    private static final String MEILI_HOST_PROP = "meilisearch.host";
+    private static final String MEILI_API_KEY_PROP = "meilisearch.api-key";
+    private static final String MEILI_ENABLED_PROP = "advanced.meili-enabled";
+    private static final String DEFAULT_MEILI_HOST = "http://localhost:7700";
+    private static final String DEFAULT_MEILI_API_KEY = "alphafrog_search_key";
+
     private final FundNavDao fundNavDao;
     private final FundInfoDao fundInfoDao;
     private final FundPortfolioDao fundPortfolioDao;
-    @Value("${meilisearch.host:http://localhost:7700}")
-    private String meiliHost;
-    @Value("${meilisearch.api-key:alphafrog_search_key}")
-    private String meiliApiKey;
-    @Value("${advanced.meili-enabled:true}")
-    private boolean meiliEnabled;
+    private final Environment environment;
     private volatile Client meiliClient;
+    private volatile String meiliClientHost;
+    private volatile String meiliClientApiKey;
 
-    public DomesticFundServiceImpl(FundNavDao fundNavDao, FundInfoDao fundInfoDao, FundPortfolioDao fundPortfolioDao) {
+    public DomesticFundServiceImpl(FundNavDao fundNavDao, FundInfoDao fundInfoDao,
+                                   FundPortfolioDao fundPortfolioDao, Environment environment) {
         this.fundNavDao = fundNavDao;
         this.fundInfoDao = fundInfoDao;
         this.fundPortfolioDao = fundPortfolioDao;
+        this.environment = environment;
     }
 
 
@@ -214,7 +220,7 @@ public class DomesticFundServiceImpl extends DomesticFundServiceImplBase {
         }
         String normalizedQuery = query.trim();
         List<DomesticFundInfoSimpleItem> items = new ArrayList<>();
-        if (meiliEnabled) {
+        if (isMeiliEnabled()) {
             try {
                 Index index = getMeiliClient().index("funds");
                 SearchResult searchResult = (SearchResult) index.search(
@@ -301,15 +307,32 @@ public class DomesticFundServiceImpl extends DomesticFundServiceImplBase {
         return value == null ? "" : String.valueOf(value);
     }
 
+    private boolean isMeiliEnabled() {
+        return Boolean.parseBoolean(environment.getProperty(MEILI_ENABLED_PROP, "true"));
+    }
+
     private Client getMeiliClient() {
-        if (meiliClient == null) {
+        String host = environment.getProperty(MEILI_HOST_PROP, DEFAULT_MEILI_HOST);
+        String apiKey = environment.getProperty(MEILI_API_KEY_PROP, DEFAULT_MEILI_API_KEY);
+
+        Client localClient = meiliClient;
+        if (localClient == null
+                || !Objects.equals(meiliClientHost, host)
+                || !Objects.equals(meiliClientApiKey, apiKey)) {
             synchronized (this) {
-                if (meiliClient == null) {
-                    meiliClient = new Client(new Config(meiliHost, meiliApiKey));
+                localClient = meiliClient;
+                if (localClient == null
+                        || !Objects.equals(meiliClientHost, host)
+                        || !Objects.equals(meiliClientApiKey, apiKey)) {
+                    meiliClient = new Client(new Config(host, apiKey));
+                    meiliClientHost = host;
+                    meiliClientApiKey = apiKey;
+                    localClient = meiliClient;
+                    log.info("MeiliSearch client refreshed for fund service, host={}", host);
                 }
             }
         }
-        return meiliClient;
+        return localClient;
     }
 
     public DomesticFundPortfolioByTsCodeAndDateRangeResponse getDomesticFundPortfolioByTsCodeAndDateRange(
