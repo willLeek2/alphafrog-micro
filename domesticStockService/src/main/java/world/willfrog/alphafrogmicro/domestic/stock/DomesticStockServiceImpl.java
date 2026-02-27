@@ -124,12 +124,16 @@ public class DomesticStockServiceImpl extends DomesticStockServiceImplBase {
     @Override
     public DomesticStockSearchResponse searchStock(DomesticStockSearchRequest request) {
         String query = request.getQuery();
+        if (query == null || query.trim().isEmpty()) {
+            return DomesticStockSearchResponse.newBuilder().build();
+        }
+        String normalizedQuery = query.trim();
         DomesticStockSearchResponse.Builder responseBuilder = DomesticStockSearchResponse.newBuilder();
         if (meiliEnabled) {
             try {
                 Index index = getMeiliClient().index("stocks");
                 SearchResult searchResult = (SearchResult) index.search(
-                        SearchRequest.builder().q(query).limit(20).build());
+                        SearchRequest.builder().q(normalizedQuery).limit(20).build());
                 for (Object hitObj : searchResult.getHits()) {
                     if (!(hitObj instanceof Map<?, ?> hit)) {
                         continue;
@@ -146,18 +150,22 @@ public class DomesticStockServiceImpl extends DomesticStockServiceImplBase {
                     return responseBuilder.build();
                 }
             } catch (Exception e) {
-                log.warn("MeiliSearch query failed for stock search query={}", query, e);
+                log.warn("MeiliSearch query failed for stock search query={}", normalizedQuery, e);
             }
         }
-        List<StockInfo> stockInfoList = stockInfoDao.getStockInfoByName(query, 10, 0);
-        for (StockInfo stockInfo : stockInfoList) {
-            DomesticStockInfoSimpleItem.Builder itemBuilder = DomesticStockInfoSimpleItem.newBuilder();
-            itemBuilder.setTsCode(stockInfo.getTsCode())
-                    .setSymbol(stockInfo.getSymbol())
-                    .setName(stockInfo.getName())
-                    .setArea(stockInfo.getArea() != null ? stockInfo.getArea() : "")
-                    .setIndustry(stockInfo.getIndustry() != null ? stockInfo.getIndustry() : "");
-            responseBuilder.addItems(itemBuilder.build());
+        try {
+            List<StockInfo> stockInfoList = stockInfoDao.getStockInfoByName(normalizedQuery, 10, 0);
+            for (StockInfo stockInfo : stockInfoList) {
+                DomesticStockInfoSimpleItem.Builder itemBuilder = DomesticStockInfoSimpleItem.newBuilder();
+                itemBuilder.setTsCode(stockInfo.getTsCode())
+                        .setSymbol(stockInfo.getSymbol())
+                        .setName(stockInfo.getName())
+                        .setArea(stockInfo.getArea() != null ? stockInfo.getArea() : "")
+                        .setIndustry(stockInfo.getIndustry() != null ? stockInfo.getIndustry() : "");
+                responseBuilder.addItems(itemBuilder.build());
+            }
+        } catch (Exception e) {
+            log.error("DB fallback failed for stock search query={}", normalizedQuery, e);
         }
         return responseBuilder.build();
     }
@@ -165,41 +173,71 @@ public class DomesticStockServiceImpl extends DomesticStockServiceImplBase {
 
     @Override
     public DomesticStockSearchESResponse searchStockES(DomesticStockSearchESRequest request) {
-        if (!meiliEnabled) {
+        String query = request.getQuery();
+        if (query == null || query.trim().isEmpty()) {
             return DomesticStockSearchESResponse.newBuilder().build();
         }
+        String normalizedQuery = query.trim();
+        DomesticStockSearchESResponse.Builder responseBuilder = DomesticStockSearchESResponse.newBuilder();
+        if (meiliEnabled) {
+            try {
+                Index index = getMeiliClient().index("stocks");
+                SearchResult searchResult = (SearchResult) index.search(
+                        SearchRequest.builder().q(normalizedQuery).limit(20).build());
+                for (Object hitObj : searchResult.getHits()) {
+                    if (!(hitObj instanceof Map<?, ?> hit)) {
+                        continue;
+                    }
+                    DomesticStockInfoESItem.Builder itemBuilder = DomesticStockInfoESItem.newBuilder();
+                    itemBuilder.setTsCode(stringValue(hit.get("ts_code")))
+                            .setSymbol(stringValue(hit.get("symbol")))
+                            .setName(stringValue(hit.get("name")))
+                            .setArea(stringValue(hit.get("area")))
+                            .setIndustry(stringValue(hit.get("industry")));
+                    String enName = stringValue(hit.get("en_name"));
+                    if (!enName.isEmpty()) {
+                        itemBuilder.setEnName(enName);
+                    }
+                    String fullName = stringValue(hit.get("full_name"));
+                    if (fullName.isEmpty()) {
+                        fullName = stringValue(hit.get("fullname"));
+                    }
+                    if (!fullName.isEmpty()) {
+                        itemBuilder.setFullName(fullName);
+                    }
+                    responseBuilder.addItems(itemBuilder.build());
+                }
+                if (responseBuilder.getItemsCount() > 0) {
+                    return responseBuilder.build();
+                }
+            } catch (Exception e) {
+                log.warn("MeiliSearch query failed for stock advanced search query={}", normalizedQuery, e);
+            }
+        }
+        return searchStockESFromDb(normalizedQuery);
+    }
 
-        String query = request.getQuery();
+    private DomesticStockSearchESResponse searchStockESFromDb(String query) {
         DomesticStockSearchESResponse.Builder responseBuilder = DomesticStockSearchESResponse.newBuilder();
         try {
-            Index index = getMeiliClient().index("stocks");
-            SearchResult searchResult = (SearchResult) index.search(
-                    SearchRequest.builder().q(query).limit(20).build());
-            for (Object hitObj : searchResult.getHits()) {
-                if (!(hitObj instanceof Map<?, ?> hit)) {
-                    continue;
+            List<StockInfo> stockInfoList = stockInfoDao.getStockInfoByName(query, 20, 0);
+            for (StockInfo stockInfo : stockInfoList) {
+                DomesticStockInfoESItem.Builder itemBuilder = DomesticStockInfoESItem.newBuilder()
+                        .setTsCode(stockInfo.getTsCode() != null ? stockInfo.getTsCode() : "")
+                        .setSymbol(stockInfo.getSymbol() != null ? stockInfo.getSymbol() : "")
+                        .setName(stockInfo.getName() != null ? stockInfo.getName() : "")
+                        .setArea(stockInfo.getArea() != null ? stockInfo.getArea() : "")
+                        .setIndustry(stockInfo.getIndustry() != null ? stockInfo.getIndustry() : "");
+                if (stockInfo.getEnName() != null) {
+                    itemBuilder.setEnName(stockInfo.getEnName());
                 }
-                DomesticStockInfoESItem.Builder itemBuilder = DomesticStockInfoESItem.newBuilder();
-                itemBuilder.setTsCode(stringValue(hit.get("ts_code")))
-                        .setSymbol(stringValue(hit.get("symbol")))
-                        .setName(stringValue(hit.get("name")))
-                        .setArea(stringValue(hit.get("area")))
-                        .setIndustry(stringValue(hit.get("industry")));
-                String enName = stringValue(hit.get("en_name"));
-                if (!enName.isEmpty()) {
-                    itemBuilder.setEnName(enName);
-                }
-                String fullName = stringValue(hit.get("full_name"));
-                if (fullName.isEmpty()) {
-                    fullName = stringValue(hit.get("fullname"));
-                }
-                if (!fullName.isEmpty()) {
-                    itemBuilder.setFullName(fullName);
+                if (stockInfo.getFullName() != null) {
+                    itemBuilder.setFullName(stockInfo.getFullName());
                 }
                 responseBuilder.addItems(itemBuilder.build());
             }
         } catch (Exception e) {
-            log.warn("MeiliSearch query failed for stock search query={}", query, e);
+            log.error("DB fallback failed for stock advanced search query={}", query, e);
         }
         return responseBuilder.build();
     }

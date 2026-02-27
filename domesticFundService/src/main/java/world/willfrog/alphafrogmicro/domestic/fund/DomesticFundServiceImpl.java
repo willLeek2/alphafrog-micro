@@ -209,12 +209,16 @@ public class DomesticFundServiceImpl extends DomesticFundServiceImplBase {
     public DomesticFundSearchResponse searchDomesticFundInfo(DomesticFundSearchRequest request) {
         
         String query = request.getQuery();
+        if (query == null || query.trim().isEmpty()) {
+            return DomesticFundSearchResponse.newBuilder().build();
+        }
+        String normalizedQuery = query.trim();
         List<DomesticFundInfoSimpleItem> items = new ArrayList<>();
         if (meiliEnabled) {
             try {
                 Index index = getMeiliClient().index("funds");
                 SearchResult searchResult = (SearchResult) index.search(
-                        SearchRequest.builder().q(query).limit(100).build());
+                        SearchRequest.builder().q(normalizedQuery).limit(100).build());
                 for (Object hitObj : searchResult.getHits()) {
                     if (!(hitObj instanceof Map<?, ?> hit)) {
                         continue;
@@ -238,21 +242,21 @@ public class DomesticFundServiceImpl extends DomesticFundServiceImplBase {
                             .build();
                 }
             } catch (Exception e) {
-                log.warn("MeiliSearch query failed for fund search query={}", query, e);
+                log.warn("MeiliSearch query failed for fund search query={}", normalizedQuery, e);
             }
         }
         List<FundInfo> fundInfoList = new ArrayList<>();
 
         try{
             // 使用合理的分页参数，避免返回过多数据
-            fundInfoList = fundInfoDao.getFundInfoByTsCode(query, 50, 0);
-            fundInfoList.addAll(fundInfoDao.getFundInfoByName(query, 50, 0));
+            fundInfoList = fundInfoDao.getFundInfoByTsCode(normalizedQuery, 50, 0);
+            fundInfoList.addAll(fundInfoDao.getFundInfoByName(normalizedQuery, 50, 0));
             // 去重
             fundInfoList = fundInfoList.stream()
                     .distinct()
                     .toList();
         } catch (Exception e) {
-            log.error("Error occurred while searching fund info with query: {}", query, e);
+            log.error("Error occurred while searching fund info with query: {}", normalizedQuery, e);
             // 搜索异常时返回空响应而不是null
             return DomesticFundSearchResponse.newBuilder().build();
         }
@@ -287,7 +291,7 @@ public class DomesticFundServiceImpl extends DomesticFundServiceImplBase {
                     .addAllItems(items)
                     .build();
         } catch (Exception e) {
-            log.error("Error occurred while converting fund search data to protobuf for query: {}", query, e);
+            log.error("Error occurred while converting fund search data to protobuf for query: {}", normalizedQuery, e);
             // 转换错误时返回空响应
             return DomesticFundSearchResponse.newBuilder().build();
         }
