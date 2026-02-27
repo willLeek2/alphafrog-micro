@@ -5,6 +5,7 @@ import com.meilisearch.sdk.Index;
 import com.meilisearch.sdk.model.IndexesQuery;
 import com.meilisearch.sdk.model.Results;
 import com.meilisearch.sdk.model.Settings;
+import com.meilisearch.sdk.model.TaskInfo;
 import lombok.extern.slf4j.Slf4j;
 
 import java.util.Arrays;
@@ -50,9 +51,9 @@ public class MeiliSearchIndexManager {
     public boolean indexExists() {
         try {
             IndexesQuery query = new IndexesQuery();
-            Results<com.meilisearch.sdk.model.Index> indexes = meiliClient.getIndexes(query);
+            Results<Index> indexes = meiliClient.getIndexes(query);
             if (indexes != null && indexes.getResults() != null) {
-                for (com.meilisearch.sdk.model.Index idx : indexes.getResults()) {
+                for (Index idx : indexes.getResults()) {
                     if (indexName.equals(idx.getUid())) {
                         return true;
                     }
@@ -125,14 +126,14 @@ public class MeiliSearchIndexManager {
             }
             
             // 设置排名规则（默认 + 相关性优化）
-            settings.setRankingRules(Arrays.asList(
+            settings.setRankingRules(new String[]{
                 "words",
                 "typo",
                 "proximity",
                 "attribute",
                 "sort",
                 "exactness"
-            ));
+            });
             
             index.updateSettings(settings);
             log.info("MeiliSearch 索引 {} 配置更新成功", indexName);

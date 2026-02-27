@@ -50,9 +50,6 @@ public interface IndexInfoDao {
     @Select("SELECT (ts_code) from alphafrog_index_info limit #{limit} offset #{offset}")
     List<String> getAllIndexInfoTsCodes(@Param("offset") int offset,@Param("limit") int limit);
 
-    @Select("SELECT COUNT(*) FROM alphafrog_index_info")
-    int getIndexInfoCount();
-
     @Select("SELECT * FROM alphafrog_index_info ORDER BY ts_code LIMIT #{limit} OFFSET #{offset}")
     List<IndexInfo> getAllIndexInfo(@Param("offset") int offset, @Param("limit") int limit);
 

@@ -154,17 +154,22 @@ public class MeiliSearchDataSyncService {
                 }
                 
                 if (!documents.isEmpty()) {
-                    // 批量导入
-                    TaskInfo task = index.addDocuments(documents);
-                    syncedCount += documents.size();
-                    batchNum++;
-                    
-                    if (batchNum % 5 == 0) {
-                        log.info("[{}] 已同步 {} 批，共 {} 条文档", indexName, batchNum, syncedCount);
+                    // 批量导入 - 使用 JSON 字符串方式
+                    try {
+                        String documentsJson = convertToJson(documents);
+                        TaskInfo task = index.addDocuments(documentsJson);
+                        syncedCount += documents.size();
+                        batchNum++;
+                        
+                        if (batchNum % 5 == 0) {
+                            log.info("[{}] 已同步 {} 批，共 {} 条文档", indexName, batchNum, syncedCount);
+                        }
+                        
+                        // 控制提交速度
+                        Thread.sleep(BATCH_SUBMIT_INTERVAL_MS);
+                    } catch (Exception e) {
+                        log.error("[{}] 批量导入失败: {}", indexName, e.getMessage(), e);
                     }
-                    
-                    // 控制提交速度
-                    Thread.sleep(BATCH_SUBMIT_INTERVAL_MS);
                 }
                 
                 if (batch.size() < batchSize) {
@@ -179,6 +184,61 @@ public class MeiliSearchDataSyncService {
             log.error("[{}] 同步过程异常: {}", indexName, e.getMessage(), e);
             return SyncResult.failed(e.getMessage());
         }
+    }
+    
+    /**
+     * 将文档列表转换为 JSON 字符串
+     */
+    private String convertToJson(List<Map<String, Object>> documents) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("[");
+        for (int i = 0; i < documents.size(); i++) {
+            Map<String, Object> doc = documents.get(i);
+            if (i > 0) sb.append(",");
+            sb.append(convertMapToJson(doc));
+        }
+        sb.append("]");
+        return sb.toString();
+    }
+    
+    /**
+     * 将 Map 转换为 JSON 字符串（简化版）
+     */
+    private String convertMapToJson(Map<String, Object> map) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("{");
+        boolean first = true;
+        for (Map.Entry<String, Object> entry : map.entrySet()) {
+            if (!first) sb.append(",");
+            first = false;
+            sb.append("\"").append(escapeJson(entry.getKey())).append("\":");
+            Object value = entry.getValue();
+            if (value == null) {
+                sb.append("null");
+            } else if (value instanceof Number) {
+                sb.append(value);
+            } else if (value instanceof Boolean) {
+                sb.append(value);
+            } else {
+                sb.append("\"").append(escapeJson(value.toString())).append("\"");
+            }
+        }
+        sb.append("}");
+        return sb.toString();
+    }
+    
+    /**
+     * 转义 JSON 字符串中的特殊字符
+     */
+    private String escapeJson(String str) {
+        if (str == null) return "";
+        return str.replace("\\", "\\\\")
+                  .replace("\"", "\\\"")
+                  .replace("\b", "\\b")
+                  .replace("\f", "\\f")
+                  .replace("\n", "\\n")
+                  .replace("\r", "\\r")
+                  .replace("\t", "\\t");
     }
 
     /**
