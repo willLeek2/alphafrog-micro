@@ -3,9 +3,9 @@ package world.willfrog.alphafrogmicro.frontend.kafka;
 import com.alibaba.fastjson2.JSONObject;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.kafka.annotation.KafkaListener;
-import org.springframework.kafka.support.Acknowledgment;
+import org.springframework.amqp.rabbit.annotation.RabbitListener;
 import org.springframework.stereotype.Service;
+import world.willfrog.alphafrogmicro.frontend.config.TaskProducerRabbitConfig;
 import world.willfrog.alphafrogmicro.frontend.service.FetchTaskStatusService;
 
 @Service
@@ -13,13 +13,12 @@ import world.willfrog.alphafrogmicro.frontend.service.FetchTaskStatusService;
 @Slf4j
 public class FetchTaskStatusListener {
 
-    private static final String FETCH_TASK_RESULT_TOPIC = "fetch_task_result";
     private static final int MAX_MESSAGE_LOG_LENGTH = 2000;
 
     private final FetchTaskStatusService fetchTaskStatusService;
 
-    @KafkaListener(topics = FETCH_TASK_RESULT_TOPIC, groupId = "alphafrog-micro-frontend")
-    public void listenFetchTaskStatus(String message, Acknowledgment acknowledgment) {
+    @RabbitListener(queues = TaskProducerRabbitConfig.FETCH_RESULT_QUEUE)
+    public void listenFetchTaskStatus(String message) {
         try {
             if (log.isDebugEnabled()) {
                 log.debug("Received fetch task status raw message len={} payload={}",
@@ -50,13 +49,6 @@ public class FetchTaskStatusListener {
             }
         } catch (Exception e) {
             log.error("Failed to handle fetch task status: {}", message, e);
-        } finally {
-            if (acknowledgment != null) {
-                acknowledgment.acknowledge();
-                if (log.isDebugEnabled()) {
-                    log.debug("Fetch task status message acknowledged");
-                }
-            }
         }
     }
 

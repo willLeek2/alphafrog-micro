@@ -2,8 +2,8 @@ package world.willfrog.alphafrogmicro.portfolioservice.backtest;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.amqp.rabbit.annotation.RabbitListener;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
-import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Component;
 
 @Slf4j
@@ -19,10 +19,7 @@ public class StrategyBacktestConsumer {
         this.executor = executor;
     }
 
-    @KafkaListener(
-            topics = "${portfolio.backtest.topic}",
-            groupId = "${portfolio.backtest.consumer-group}"
-    )
+    @RabbitListener(queues = "${portfolio.backtest.queue}")
     public void onMessage(String message) {
         try {
             // 消费到回测事件后交给执行器完成具体计算
