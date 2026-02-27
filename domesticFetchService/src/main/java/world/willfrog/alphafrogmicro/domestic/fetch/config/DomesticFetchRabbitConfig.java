@@ -51,7 +51,6 @@ public class DomesticFetchRabbitConfig {
         SimpleRabbitListenerContainerFactory factory = new SimpleRabbitListenerContainerFactory();
         factory.setConnectionFactory(connectionFactory);
         factory.setConcurrentConsumers(3);
-        factory.setPrefetchCount(2);
         return factory;
     }
 }
