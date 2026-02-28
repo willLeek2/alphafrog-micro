@@ -335,12 +335,14 @@ public class OpenRouterProviderRoutedChatModel implements ChatLanguageModel {
         
         // 从响应中提取 token usage
         TokenUsage tokenUsage = OpenAiCompatibleChatModelSupport.extractTokenUsageFromResponse(objectMapper, response, log);
+        Integer cachedTokens = OpenAiCompatibleChatModelSupport.extractCachedTokensFromResponse(objectMapper, response, log);
         long completedAtMillis = startedAtMillis + durationMs;
         
         observabilityService.recordLlmCallWithRawHttp(
                 runId,
                 phase != null ? phase : "unknown",
                 tokenUsage,
+                cachedTokens,
                 durationMs,
                 startedAtMillis,
                 completedAtMillis,
