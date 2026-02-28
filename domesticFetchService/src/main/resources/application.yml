@@ -13,12 +13,17 @@ spring:
     password: ${AF_RABBITMQ_PASS:guest}
     listener:
       simple:
+        acknowledge-mode: manual
         prefetch: 2
   data:
     redis:
       host: ${AF_REDIS_HOST:127.0.0.1}
       port: 6379
       password: ${AF_REDIS_PASSWORD:default}
+
+af:
+  fetch:
+    concurrency: ${AF_FETCH_CONCURRENCY:3}
 
 logging:
   level:

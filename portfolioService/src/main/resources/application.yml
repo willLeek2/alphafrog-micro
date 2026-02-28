@@ -14,6 +14,9 @@ spring:
     port: ${AF_RABBITMQ_PORT:5672}
     username: ${AF_RABBITMQ_USER:guest}
     password: ${AF_RABBITMQ_PASS:guest}
+    listener:
+      simple:
+        acknowledge-mode: manual
 
 server:
   port: 8084

@@ -1,9 +1,12 @@
 package world.willfrog.alphafrogmicro.domestic.fetch;
 
 import com.alibaba.fastjson.JSONObject;
+import com.rabbitmq.client.Channel;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.amqp.support.AmqpHeaders;
+import org.springframework.messaging.handler.annotation.Header;
 import org.springframework.stereotype.Service;
 import world.willfrog.alphafrogmicro.domestic.fetch.config.DomesticFetchRabbitConfig;
 import world.willfrog.alphafrogmicro.domestic.idl.*;
@@ -32,21 +35,24 @@ public class FetchTopicConsumer {
 
 
     @RabbitListener(queues = DomesticFetchRabbitConfig.FETCH_TASK_QUEUE)
-    public void listenFetchTask(String message){
+    public void listenFetchTask(String message,
+                                Channel channel,
+                                @Header(AmqpHeaders.DELIVERY_TAG) long tag){
+        boolean success = false;
         log.info("Received fetch task [V2-DEBUG]: {}", message);
-        JSONObject rawMessageJSON;
-        try{
-            rawMessageJSON = JSONObject.parseObject(message);
-        } catch (Exception e) {
-            log.error("Failed to parse message: {}", message);
-            return;
-        }
 
-        String taskUuid = rawMessageJSON.getString("task_uuid");
-        String taskName = rawMessageJSON.getString("task_name");
-        Integer taskSubTypeValue = rawMessageJSON.getInteger("task_sub_type");
+        String taskUuid = null;
+        String taskName = null;
+        Integer taskSubTypeValue = null;
 
         try{
+            JSONObject rawMessageJSON = JSONObject.parseObject(message);
+            if (rawMessageJSON == null) {
+                throw new IllegalArgumentException("Invalid message JSON payload");
+            }
+            taskUuid = rawMessageJSON.getString("task_uuid");
+            taskName = rawMessageJSON.getString("task_name");
+            taskSubTypeValue = rawMessageJSON.getInteger("task_sub_type");
             int taskSubType = rawMessageJSON.getIntValue("task_sub_type");
             JSONObject taskParams = rawMessageJSON.getJSONObject("task_params");
             if (taskParams == null) {
@@ -246,10 +252,23 @@ public class FetchTopicConsumer {
             }
             log.info("Task result : {}", result);
             sendTaskResult(taskUuid, taskName, taskSubTypeValue, result, null);
+            success = true;
         } catch (Exception e){
             log.error("Failed to start task: {}", message);
             log.error("Stack trace", e);
-            sendTaskResult(taskUuid, taskName, taskSubTypeValue, -1, e.getMessage());
+            if (taskUuid != null && !taskUuid.isBlank()) {
+                sendTaskResult(taskUuid, taskName, taskSubTypeValue, -1, e.getMessage());
+            }
+        } finally {
+            try {
+                if (success) {
+                    channel.basicAck(tag, false);
+                } else {
+                    channel.basicNack(tag, false, false);
+                }
+            } catch (Exception ackException) {
+                log.error("Failed to ack/nack fetch task message", ackException);
+            }
         }
     }
 

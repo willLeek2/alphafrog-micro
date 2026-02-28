@@ -16,6 +16,7 @@ spring:
     password: ${AF_RABBITMQ_PASS:guest}
     listener:
       simple:
+        acknowledge-mode: manual
         prefetch: 20
 
   data:

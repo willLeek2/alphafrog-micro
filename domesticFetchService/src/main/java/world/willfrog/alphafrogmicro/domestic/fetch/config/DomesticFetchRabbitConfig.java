@@ -8,11 +8,15 @@ import org.springframework.amqp.core.QueueBuilder;
 import org.springframework.amqp.rabbit.connection.ConnectionFactory;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.amqp.rabbit.config.SimpleRabbitListenerContainerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
 @Configuration
 public class DomesticFetchRabbitConfig {
+
+    @Value("${af.fetch.concurrency:3}")
+    private int fetchConcurrency;
 
     public static final String FETCH_EXCHANGE = "fetch.exchange";
     public static final String FETCH_TASK_QUEUE = "fetch.task.queue.domesticFetchService";
@@ -50,7 +54,7 @@ public class DomesticFetchRabbitConfig {
     public SimpleRabbitListenerContainerFactory rabbitListenerContainerFactory(ConnectionFactory connectionFactory) {
         SimpleRabbitListenerContainerFactory factory = new SimpleRabbitListenerContainerFactory();
         factory.setConnectionFactory(connectionFactory);
-        factory.setConcurrentConsumers(3);
+        factory.setConcurrentConsumers(fetchConcurrency);
         return factory;
     }
 }

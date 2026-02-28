@@ -23,6 +23,8 @@ import java.util.UUID;
 @RequiredArgsConstructor
 public class TaskController {
 
+    private static final String DEFAULT_DIRECT_EXCHANGE = "";
+
     private final RabbitTemplate rabbitTemplate;
     private final RateLimitingService rateLimitingService;
     private final FetchTaskStatusService fetchTaskStatusService;
@@ -101,9 +103,9 @@ public class TaskController {
             case "fetch":
                 return TaskProducerRabbitConfig.FETCH_EXCHANGE;
             case "analyze":
-                return "analyze.exchange";
+                return DEFAULT_DIRECT_EXCHANGE;
             default:
-                return "default.exchange";
+                return DEFAULT_DIRECT_EXCHANGE;
         }
     }
 
@@ -112,9 +114,9 @@ public class TaskController {
             case "fetch":
                 return TaskProducerRabbitConfig.FETCH_TASK_ROUTING_KEY;
             case "analyze":
-                return "analyze.task";
+                return "analyze_topic";
             default:
-                return "default.task";
+                return "default_topic";
         }
     }
 
