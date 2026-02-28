@@ -75,9 +75,12 @@ public class OpenRouterCostService {
             if (normalizedBase.endsWith("/")) {
                 normalizedBase = normalizedBase.substring(0, normalizedBase.length() - 1);
             }
-            // Ensure we use the base API URL, not the chat completions sub-path
-            if (normalizedBase.endsWith("/v1")) {
-                normalizedBase = normalizedBase.substring(0, normalizedBase.length() - 3);
+            // Strip known sub-paths to get the base domain for the Generation API
+            // e.g. "https://openrouter.ai/api/v1" -> "https://openrouter.ai"
+            if (normalizedBase.endsWith("/api/v1")) {
+                normalizedBase = normalizedBase.substring(0, normalizedBase.length() - "/api/v1".length());
+            } else if (normalizedBase.endsWith("/v1")) {
+                normalizedBase = normalizedBase.substring(0, normalizedBase.length() - "/v1".length());
             }
             String url = normalizedBase + "/api/v1/generation?id=" + generationId;
 
