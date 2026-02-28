@@ -19,8 +19,10 @@ cache_miss_count = 0
 @events.request.add_listener
 def on_request(request_type, name, response_time, response_length,
                response, context, exception, **kwargs):
-    """每个请求结束时触发 - 可在此发送metrics到外部系统"""
-    pass
+    """每个请求结束时触发 - 可在此发送metrics到外部系统（如VictoriaMetrics）"""
+    # 示例: 将数据推送到VictoriaMetrics
+    # requests.post("http://localhost:8428/api/v1/import/prometheus",
+    #     data=f'locust_response_time{{name="{name}"}} {response_time}')
 
 
 @events.test_start.add_listener
