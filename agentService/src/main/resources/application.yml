@@ -282,6 +282,14 @@ langchain4j:
       # enabled: 显式启用 reasoning (用于 DeepSeek)
       enabled: ${AF_AGENT_REASONING_ENABLED:#{null}}
 
+# 压测与性能监控配置
+stress:
+  test:
+    enabled: ${STRESS_TEST_ENABLED:false}
+    tool-latency-enabled: ${STRESS_TEST_TOOL_LATENCY_ENABLED:false}
+    tool-latency-ms: ${STRESS_TEST_TOOL_LATENCY_MS:100}
+    tool-failure-rate: ${STRESS_TEST_TOOL_FAILURE_RATE:0.0}
+
 logging:
   level:
     world.willfrog.agent: ${LOGGING_LEVEL_AGENT:INFO}
