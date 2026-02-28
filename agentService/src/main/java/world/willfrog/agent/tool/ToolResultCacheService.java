@@ -122,6 +122,7 @@ public class ToolResultCacheService {
         // 未命中缓存时才执行真实工具调用（loader）。
         cacheMissCounter.increment();
         ToolExecutionOutcome loaded = loader.get();
+        cacheLookupTimer.record(System.currentTimeMillis() - lookupStartedAt, TimeUnit.MILLISECONDS);
         if (loaded == null) {
             loaded = ToolExecutionOutcome.builder()
                     .result(fallbackToolErrorJson(toolName, "EMPTY_LOADER_RESULT", "Tool invocation error: empty loader result"))

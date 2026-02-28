@@ -16,6 +16,8 @@ import world.willfrog.agent.service.AgentObservabilityService;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 
 @Component
 @RequiredArgsConstructor
@@ -29,6 +31,7 @@ public class ToolRouter {
     private final ObjectMapper objectMapper;
     private final MeterRegistry meterRegistry;
     private final StressTestProperties stressTestProperties;
+    private final ConcurrentHashMap<String, Timer> toolCallTimers = new ConcurrentHashMap<>();
 
     public String invoke(String toolName, Map<String, Object> params) {
         return invokeWithMeta(toolName, params).getOutput();
@@ -51,10 +54,7 @@ public class ToolRouter {
         if (stressTestProperties.getToolFailureRate() > 0 && Math.random() < stressTestProperties.getToolFailureRate()) {
             String errorResult = invocationError(toolName, "Simulated failure for stress test");
             recordObservability(toolName, params, errorResult, 0, false, null);
-            Timer.builder("tool.call")
-                    .tag("toolName", nvl(toolName))
-                    .register(meterRegistry)
-                    .record(0, java.util.concurrent.TimeUnit.MILLISECONDS);
+            getOrCreateToolCallTimer(nvl(toolName)).record(0, TimeUnit.MILLISECONDS);
             return ToolInvocationResult.builder()
                     .output(errorResult)
                     .success(false)
@@ -75,10 +75,7 @@ public class ToolRouter {
         ToolResultCacheService.CacheMeta cacheMeta = cached.getCacheMeta();
         recordObservability(toolName, params, result, durationMs, success, cacheMeta);
 
-        Timer.builder("tool.call")
-                .tag("toolName", nvl(toolName))
-                .register(meterRegistry)
-                .record(durationMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+        getOrCreateToolCallTimer(nvl(toolName)).record(durationMs, TimeUnit.MILLISECONDS);
 
         debugLog("tool invoke response: runId={}, tool={}, success={}, durationMs={}, cache={}, resultPreview={}",
                 AgentContext.getRunId(),
@@ -110,6 +107,13 @@ public class ToolRouter {
                 "searchIndex",
                 "executePython"
         );
+    }
+
+    private Timer getOrCreateToolCallTimer(String toolName) {
+        return toolCallTimers.computeIfAbsent(toolName, name ->
+                Timer.builder("tool.call")
+                        .tag("toolName", name)
+                        .register(meterRegistry));
     }
 
     private ToolResultCacheService.ToolExecutionOutcome executeDirect(String toolName, Map<String, Object> params) {
