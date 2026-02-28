@@ -1,3 +1,12 @@
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics,stress-metrics,info
+  endpoint:
+    metrics:
+      enabled: true
+
 spring:
   application:
     name: agent-service

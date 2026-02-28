@@ -2,11 +2,14 @@ package world.willfrog.agent.tool;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import lombok.Builder;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
+import world.willfrog.agent.config.StressTestProperties;
 import world.willfrog.agent.context.AgentContext;
 import world.willfrog.agent.service.AgentObservabilityService;
 
@@ -24,6 +27,8 @@ public class ToolRouter {
     private final ToolResultCacheService toolResultCacheService;
     private final AgentObservabilityService observabilityService;
     private final ObjectMapper objectMapper;
+    private final MeterRegistry meterRegistry;
+    private final StressTestProperties stressTestProperties;
 
     public String invoke(String toolName, Map<String, Object> params) {
         return invokeWithMeta(toolName, params).getOutput();
@@ -32,6 +37,32 @@ public class ToolRouter {
     public ToolInvocationResult invokeWithMeta(String toolName, Map<String, Object> params) {
         debugLog("tool invoke request: runId={}, tool={}, params={}",
                 AgentContext.getRunId(), nvl(toolName), safeJson(params));
+
+        // Fault injection: simulated latency
+        if (stressTestProperties.isToolLatencyEnabled() && stressTestProperties.getToolLatencyMs() > 0) {
+            try {
+                Thread.sleep(stressTestProperties.getToolLatencyMs());
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+
+        // Fault injection: simulated failure
+        if (stressTestProperties.getToolFailureRate() > 0 && Math.random() < stressTestProperties.getToolFailureRate()) {
+            String errorResult = invocationError(toolName, "Simulated failure for stress test");
+            recordObservability(toolName, params, errorResult, 0, false, null);
+            Timer.builder("tool.call")
+                    .tag("toolName", nvl(toolName))
+                    .register(meterRegistry)
+                    .record(0, java.util.concurrent.TimeUnit.MILLISECONDS);
+            return ToolInvocationResult.builder()
+                    .output(errorResult)
+                    .success(false)
+                    .durationMs(0)
+                    .cacheMeta(null)
+                    .build();
+        }
+
         ToolResultCacheService.CachedToolCallResult cached = toolResultCacheService.executeWithCache(
                 toolName,
                 params,
@@ -43,6 +74,12 @@ public class ToolRouter {
         long durationMs = Math.max(0L, cached.getDurationMs());
         ToolResultCacheService.CacheMeta cacheMeta = cached.getCacheMeta();
         recordObservability(toolName, params, result, durationMs, success, cacheMeta);
+
+        Timer.builder("tool.call")
+                .tag("toolName", nvl(toolName))
+                .register(meterRegistry)
+                .record(durationMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+
         debugLog("tool invoke response: runId={}, tool={}, success={}, durationMs={}, cache={}, resultPreview={}",
                 AgentContext.getRunId(),
                 nvl(toolName),
