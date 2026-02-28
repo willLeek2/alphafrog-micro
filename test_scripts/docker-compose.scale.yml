@@ -1,0 +1,26 @@
+# docker-compose.scale.yml
+# 多实例部署配置 - 用于演示水平扩展和负载均衡
+#
+# 用法:
+#   docker-compose -f docker-compose.yml -f docker-compose.scale.yml up -d
+
+services:
+  nginx-lb:
+    image: nginx:alpine
+    container_name: alphafrog-nginx-lb
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx-lb.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - domestic-index-service
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+    networks:
+      - alphafrog-network
+
+networks:
+  alphafrog-network:
+    external: true
