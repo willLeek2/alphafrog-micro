@@ -49,6 +49,9 @@ public class AgentObservabilityService {
     @Value("${agent.observability.llm-trace.max-text-chars:20000}")
     private int llmTraceMaxTextChars;
 
+    @Value("${agent.observability.llm-trace.capture-cached-tokens:true}")
+    private boolean captureCachedTokens;
+
     @Value("${agent.observability.llm-trace.reasoning-max-chars:20000}")
     private int llmTraceReasoningMaxChars;
 
@@ -706,7 +709,7 @@ public class AgentObservabilityService {
         phaseMetrics.setInputTokens(phaseMetrics.getInputTokens() + Math.max(0L, input));
         phaseMetrics.setOutputTokens(phaseMetrics.getOutputTokens() + Math.max(0L, output));
         phaseMetrics.setTotalTokens(phaseMetrics.getTotalTokens() + Math.max(0L, total));
-        if (cachedTokens != null && cachedTokens > 0) {
+        if (captureCachedTokens && cachedTokens != null && cachedTokens > 0) {
             summary.setCachedTokens(summary.getCachedTokens() + cachedTokens);
             phaseMetrics.setCachedTokens(phaseMetrics.getCachedTokens() + cachedTokens);
         }
@@ -967,7 +970,7 @@ public class AgentObservabilityService {
         trace.setReasoningText(reasoning == null ? "" : reasoning.text());
         trace.setReasoningDetails(reasoning == null ? null : reasoning.details());
         trace.setReasoningTruncated(reasoning != null && reasoning.truncated());
-        trace.setCachedTokens(cachedTokens);
+        trace.setCachedTokens(captureCachedTokens ? cachedTokens : null);
         
         // 设置原始 HTTP 请求信息
         if (httpRequest != null) {

@@ -37,6 +37,7 @@ class AgentObservabilityServiceCacheTest {
         ReflectionTestUtils.setField(service, "llmTraceEnabled", true);
         ReflectionTestUtils.setField(service, "llmTraceMaxCalls", 100);
         ReflectionTestUtils.setField(service, "llmTraceMaxTextChars", 20000);
+        ReflectionTestUtils.setField(service, "captureCachedTokens", true);
         ReflectionTestUtils.setField(service, "llmTraceReasoningMaxChars", 20000);
     }
 
