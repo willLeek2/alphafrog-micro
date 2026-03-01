@@ -53,6 +53,7 @@ final class OpenAiCompatibleChatModelSupport {
      * <p>支持以下格式：</p>
      * <ul>
      *   <li>OpenRouter / Dashscope: {@code usage.prompt_tokens_details.cached_tokens}</li>
+     *   <li>Fireworks: {@code perf_metrics.cached_prompt_tokens}</li>
      * </ul>
      *
      * @param objectMapper Jackson ObjectMapper
@@ -79,6 +80,15 @@ final class OpenAiCompatibleChatModelSupport {
                     if (cached != null) {
                         return cached;
                     }
+                }
+            }
+            
+            // Fireworks: perf_metrics.cached_prompt_tokens
+            Object perfMetrics = json.get("perf_metrics");
+            if (perfMetrics instanceof Map<?, ?> perfMap) {
+                Integer cached = toInt(perfMap.get("cached_prompt_tokens"));
+                if (cached != null) {
+                    return cached;
                 }
             }
         } catch (Exception e) {

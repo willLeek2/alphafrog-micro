@@ -119,4 +119,68 @@ class OpenAiCompatibleChatModelSupportCacheTest {
         assertNotNull(cached);
         assertEquals(0, cached);
     }
+
+    @Test
+    void extractCachedTokens_fireworksFormat() {
+        // Fireworks: perf_metrics.cached_prompt_tokens
+        String body = """
+                {
+                  "usage": {
+                    "prompt_tokens": 1000,
+                    "completion_tokens": 200,
+                    "total_tokens": 1200
+                  },
+                  "perf_metrics": {
+                    "cached_prompt_tokens": 800,
+                    "tokens_per_second": 123.45
+                  }
+                }
+                """;
+        RawHttpLogger.HttpResponseRecord response = RawHttpLogger.HttpResponseRecord.builder()
+                .body(body).statusCode(200).build();
+
+        Integer cached = OpenAiCompatibleChatModelSupport.extractCachedTokensFromResponse(objectMapper, response, log);
+        assertNotNull(cached);
+        assertEquals(800, cached);
+    }
+
+    @Test
+    void extractCachedTokens_fireworksZeroCached() {
+        String body = """
+                {
+                  "usage": {
+                    "prompt_tokens": 1000,
+                    "completion_tokens": 200,
+                    "total_tokens": 1200
+                  },
+                  "perf_metrics": {
+                    "cached_prompt_tokens": 0
+                  }
+                }
+                """;
+        RawHttpLogger.HttpResponseRecord response = RawHttpLogger.HttpResponseRecord.builder()
+                .body(body).statusCode(200).build();
+
+        Integer cached = OpenAiCompatibleChatModelSupport.extractCachedTokensFromResponse(objectMapper, response, log);
+        assertNotNull(cached);
+        assertEquals(0, cached);
+    }
+
+    @Test
+    void extractCachedTokens_fireworksNoPerfMetrics() {
+        String body = """
+                {
+                  "usage": {
+                    "prompt_tokens": 1000,
+                    "completion_tokens": 200,
+                    "total_tokens": 1200
+                  }
+                }
+                """;
+        RawHttpLogger.HttpResponseRecord response = RawHttpLogger.HttpResponseRecord.builder()
+                .body(body).statusCode(200).build();
+
+        Integer cached = OpenAiCompatibleChatModelSupport.extractCachedTokensFromResponse(objectMapper, response, log);
+        assertNull(cached);
+    }
 }
