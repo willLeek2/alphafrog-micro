@@ -5,6 +5,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
+import world.willfrog.agent.config.AgentLlmProperties;
 import world.willfrog.agent.model.openrouter.GenerationResponse;
 
 import java.net.URI;
@@ -39,16 +40,47 @@ public class OpenRouterCostService {
 
     private final AgentObservabilityService observabilityService;
     private final ObjectMapper objectMapper;
+    private final AgentLlmLocalConfigLoader localConfigLoader;
 
+    // 默认配置（从环境变量或 application.yml 读取）
     @Value("${agent.observability.openrouter.cost-enrichment.enabled:false}")
-    private boolean costEnrichmentEnabled;
+    private boolean defaultCostEnrichmentEnabled;
 
     @Value("${agent.observability.openrouter.cost-enrichment.timeout-ms:5000}")
-    private int timeoutMs;
+    private int defaultTimeoutMs;
 
-    public OpenRouterCostService(AgentObservabilityService observabilityService, ObjectMapper objectMapper) {
+    public OpenRouterCostService(AgentObservabilityService observabilityService, 
+                                  ObjectMapper objectMapper,
+                                  AgentLlmLocalConfigLoader localConfigLoader) {
         this.observabilityService = observabilityService;
         this.objectMapper = objectMapper;
+        this.localConfigLoader = localConfigLoader;
+    }
+
+    /**
+     * 获取当前启用的 spending 记录开关。
+     * 优先从 agent-llm.local.json 读取，如果没有配置则使用默认值（环境变量/application.yml）。
+     */
+    private boolean isCostEnrichmentEnabled() {
+        return localConfigLoader.current()
+                .map(cfg -> cfg.getObservability())
+                .map(obs -> obs.getOpenrouter())
+                .map(router -> router.getCostEnrichment())
+                .map(ce -> ce.getEnabled())
+                .orElse(defaultCostEnrichmentEnabled);
+    }
+
+    /**
+     * 获取当前超时时间（毫秒）。
+     * 优先从 agent-llm.local.json 读取，如果没有配置则使用默认值。
+     */
+    private int getTimeoutMs() {
+        return localConfigLoader.current()
+                .map(cfg -> cfg.getObservability())
+                .map(obs -> obs.getOpenrouter())
+                .map(router -> router.getCostEnrichment())
+                .map(ce -> ce.getTimeoutMs())
+                .orElse(defaultTimeoutMs);
     }
 
     /**
@@ -63,7 +95,7 @@ public class OpenRouterCostService {
     @Async
     public void enrichCostInfoAsync(String runId, String traceId, String generationId,
                                     String apiKey, String baseUrl) {
-        if (!costEnrichmentEnabled) {
+        if (!isCostEnrichmentEnabled()) {
             return;
         }
         if (generationId == null || generationId.isBlank()) {
@@ -84,6 +116,7 @@ public class OpenRouterCostService {
             }
             String url = normalizedBase + "/api/v1/generation?id=" + generationId;
 
+            int timeoutMs = getTimeoutMs();
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create(url))
                     .timeout(Duration.ofMillis(timeoutMs > 0 ? timeoutMs : 5000))
