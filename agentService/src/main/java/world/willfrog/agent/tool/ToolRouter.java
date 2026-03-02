@@ -149,13 +149,15 @@ public class ToolRouter {
                 );
                 case "executePython" -> pythonSandboxTools.executePython(
                         str(params.get("code"), params.get("arg0")),
-                        str(params.get("dataset_id"), params.get("datasetId"), params.get("arg1")),
                         str(
                                 params.get("dataset_ids"),
                                 params.get("datasetIds"),
                                 params.get("datasets"),
+                                params.get("dataset_id"),
+                                params.get("datasetId"),
                                 params.get("dataset_refs"),
                                 params.get("datasetRefs"),
+                                params.get("arg1"),
                                 params.get("arg2")
                         ),
                         str(params.get("libraries"), params.get("arg3")),
