@@ -308,7 +308,7 @@ public class SubAgentRunner {
                                     .codingContext(buildCodingContext(args, executedSteps, request.getContext()))
                                     .initialCode(firstNonBlank(args.get("code"), args.get("arg0")))
                                     .initialRunArgs(extractInitialPythonRunArgs(args))
-                                    .datasetId("") // 统一使用 datasetIds 字段
+                                    .datasetId(firstNonBlank(args.get("dataset_id"), args.get("datasetId"), args.get("arg1")))
                                     .datasetIds(firstNonBlank(args.get("dataset_ids"), args.get("datasetIds"), args.get("arg2"), args.get("dataset_id"), args.get("datasetId"), args.get("arg1")))
                                     .libraries(firstNonBlank(args.get("libraries"), args.get("arg3")))
                                     .timeoutSeconds(toNullableInt(args.get("timeout_seconds"), args.get("timeoutSeconds"), args.get("arg4")))
@@ -627,9 +627,11 @@ public class SubAgentRunner {
             }
 
             LinkedHashSet<String> mergedDatasetIds = new LinkedHashSet<>();
+            if (!datasetId.isBlank()) {
+                mergedDatasetIds.add(datasetId);
+            }
             mergedDatasetIds.addAll(parseDatasetIds(firstNonBlank(args.get("dataset_ids"), args.get("datasetIds"), args.get("arg2"))));
             mergedDatasetIds.addAll(availableDatasetIds);
-            mergedDatasetIds.remove(datasetId);
             if (!mergedDatasetIds.isEmpty()) {
                 args.put("dataset_ids", String.join(",", mergedDatasetIds));
             }
