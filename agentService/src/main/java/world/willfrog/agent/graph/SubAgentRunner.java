@@ -308,8 +308,8 @@ public class SubAgentRunner {
                                     .codingContext(buildCodingContext(args, executedSteps, request.getContext()))
                                     .initialCode(firstNonBlank(args.get("code"), args.get("arg0")))
                                     .initialRunArgs(extractInitialPythonRunArgs(args))
-                                    .datasetId(firstNonBlank(args.get("dataset_id"), args.get("datasetId"), args.get("arg1")))
-                                    .datasetIds(firstNonBlank(args.get("dataset_ids"), args.get("datasetIds"), args.get("arg2")))
+                                    .datasetId("") // 统一使用 datasetIds 字段
+                                    .datasetIds(firstNonBlank(args.get("dataset_ids"), args.get("datasetIds"), args.get("arg2"), args.get("dataset_id"), args.get("datasetId"), args.get("arg1")))
                                     .libraries(firstNonBlank(args.get("libraries"), args.get("arg3")))
                                     .timeoutSeconds(toNullableInt(args.get("timeout_seconds"), args.get("timeoutSeconds"), args.get("arg4")))
                                     .endpointName(request.getEndpointName())
@@ -737,11 +737,8 @@ public class SubAgentRunner {
             runArgs.putAll(rawRunArgs);
         }
 
-        String datasetId = firstNonBlank(args.get("dataset_id"), args.get("datasetId"), args.get("arg1"));
-        if (!datasetId.isBlank()) {
-            runArgs.put("dataset_id", datasetId);
-        }
-        String datasetIds = firstNonBlank(args.get("dataset_ids"), args.get("datasetIds"), args.get("arg2"));
+        // 优先使用 dataset_ids（复数），兼容 dataset_id（单数）
+        String datasetIds = firstNonBlank(args.get("dataset_ids"), args.get("datasetIds"), args.get("arg2"), args.get("dataset_id"), args.get("datasetId"), args.get("arg1"));
         if (!datasetIds.isBlank()) {
             runArgs.put("dataset_ids", datasetIds);
         }
