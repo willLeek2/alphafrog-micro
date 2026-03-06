@@ -138,6 +138,7 @@ public class DagWorkflowExecutor implements WorkflowExecutor {
         if (state.getCompletedNodeIds() != null) {
             completed.addAll(state.getCompletedNodeIds());
         }
+        Set<String> failedNodeIds = ConcurrentHashMap.newKeySet();
         Map<String, TodoExecutionRecord> context = new ConcurrentHashMap<>(
                 state.getContext() == null ? Map.of() : state.getContext());
         List<TodoItem> allProcessedItems = java.util.Collections.synchronizedList(new ArrayList<>(
@@ -166,7 +167,7 @@ public class DagWorkflowExecutor implements WorkflowExecutor {
         // 提交所有入度为 0 的就绪节点
         for (String nodeId : graph.getNodesWithZeroIndegree()) {
             if (!completed.contains(nodeId)) {
-                submitNode(nodeId, graph, request, completed, context, allProcessedItems,
+                submitNode(nodeId, graph, request, completed, failedNodeIds, context, allProcessedItems,
                         hasFailure, latch);
             }
         }
@@ -236,11 +237,13 @@ public class DagWorkflowExecutor implements WorkflowExecutor {
 
     /**
      * 将节点提交到线程池异步执行。完成后自动调度后继节点。
+     * 如果某个依赖节点已失败，后继节点将被跳过（SKIPPED）。
      */
     private void submitNode(String todoId,
                             ExecutionGraph graph,
                             LinearWorkflowExecutor.WorkflowRequest request,
                             Set<String> completed,
+                            Set<String> failedNodeIds,
                             Map<String, TodoExecutionRecord> context,
                             List<TodoItem> allProcessedItems,
                             boolean[] hasFailure,
@@ -253,6 +256,31 @@ public class DagWorkflowExecutor implements WorkflowExecutor {
                 TodoItem item = graph.getNode(todoId);
                 if (item == null || completed.contains(todoId)) {
                     return;
+                }
+
+                // 检查是否有依赖节点已失败，如果有则跳过本节点
+                List<String> deps = item.getDependsOn();
+                if (deps != null && !deps.isEmpty()) {
+                    for (String dep : deps) {
+                        if (failedNodeIds.contains(dep)) {
+                            item.setStatus(TodoStatus.SKIPPED);
+                            item.setResultSummary("skipped: dependency " + dep + " failed");
+                            item.setCompletedAt(Instant.now());
+                            allProcessedItems.add(item);
+                            completed.add(todoId);
+                            failedNodeIds.add(todoId);
+                            hasFailure[0] = true;
+                            eventService.append(currentRunId, currentUserId, "TODO_SKIPPED", Map.of(
+                                    "todo_id", nvl(item.getId()),
+                                    "reason", "dependency_failed",
+                                    "failed_dependency", dep
+                            ));
+                            // 递归释放后继节点
+                            releaseSuccessors(todoId, graph, request, completed, failedNodeIds,
+                                    context, allProcessedItems, hasFailure, latch);
+                            return;
+                        }
+                    }
                 }
 
                 item.setStatus(TodoStatus.RUNNING);
@@ -282,6 +310,7 @@ public class DagWorkflowExecutor implements WorkflowExecutor {
                     ));
                 } else {
                     item.setStatus(TodoStatus.FAILED);
+                    failedNodeIds.add(todoId);
                     hasFailure[0] = true;
                     eventService.append(currentRunId, currentUserId, "TODO_FAILED", Map.of(
                             "todo_id", nvl(item.getId()),
@@ -298,28 +327,44 @@ public class DagWorkflowExecutor implements WorkflowExecutor {
                 for (String successor : graph.getSuccessors(todoId)) {
                     int newDegree = graph.decrementIndegree(successor);
                     if (newDegree == 0 && !completed.contains(successor)) {
-                        submitNode(successor, graph, request, completed, context,
+                        submitNode(successor, graph, request, completed, failedNodeIds, context,
                                 allProcessedItems, hasFailure, latch);
                     }
                 }
             } catch (Exception e) {
                 log.error("DAG node execution failed for todoId={}, runId={}", todoId, currentRunId, e);
                 completed.add(todoId);
+                failedNodeIds.add(todoId);
+                hasFailure[0] = true;
 
-                // 如果该节点失败，也需要释放后继节点的 latch（否则会永远等待）
-                // 通过 countDown 来释放后继节点
-                for (String successor : graph.getSuccessors(todoId)) {
-                    int newDegree = graph.decrementIndegree(successor);
-                    if (newDegree == 0 && !completed.contains(successor)) {
-                        submitNode(successor, graph, request, completed, context,
-                                allProcessedItems, hasFailure, latch);
-                    }
-                }
+                releaseSuccessors(todoId, graph, request, completed, failedNodeIds,
+                        context, allProcessedItems, hasFailure, latch);
             } finally {
                 AgentContext.clear();
                 latch.countDown();
             }
         });
+    }
+
+    /**
+     * 释放后继节点（递归调度以确保 latch 正确 countDown）。
+     */
+    private void releaseSuccessors(String todoId,
+                                   ExecutionGraph graph,
+                                   LinearWorkflowExecutor.WorkflowRequest request,
+                                   Set<String> completed,
+                                   Set<String> failedNodeIds,
+                                   Map<String, TodoExecutionRecord> context,
+                                   List<TodoItem> allProcessedItems,
+                                   boolean[] hasFailure,
+                                   CountDownLatch latch) {
+        for (String successor : graph.getSuccessors(todoId)) {
+            int newDegree = graph.decrementIndegree(successor);
+            if (newDegree == 0 && !completed.contains(successor)) {
+                submitNode(successor, graph, request, completed, failedNodeIds, context,
+                        allProcessedItems, hasFailure, latch);
+            }
+        }
     }
 
     private TodoExecutionRecord executeTodo(LinearWorkflowExecutor.WorkflowRequest request,

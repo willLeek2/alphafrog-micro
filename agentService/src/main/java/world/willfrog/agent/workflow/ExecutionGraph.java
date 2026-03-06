@@ -55,7 +55,7 @@ public class ExecutionGraph {
             String current = queue.poll();
             visited++;
             for (String successor : getSuccessors(current)) {
-                int newDegree = tempDegree.get(successor) - 1;
+                int newDegree = tempDegree.getOrDefault(successor, 0) - 1;
                 tempDegree.put(successor, newDegree);
                 if (newDegree == 0) {
                     queue.add(successor);
