@@ -19,7 +19,7 @@ public final class StructuredPlanningSupport {
     public static final String CATEGORY_SCHEMA_VALIDATION_ERROR = "SCHEMA_VALIDATION_ERROR";
 
     private static final Set<String> TODO_TYPES = Set.of("TOOL_CALL", "SUB_AGENT", "THOUGHT");
-    private static final Set<String> EXECUTION_MODES = Set.of("AUTO", "FORCE_SIMPLE", "FORCE_SUB_AGENT");
+    private static final Set<String> EXECUTION_MODES = Set.of("AUTO", "FORCE_SIMPLE", "FORCE_SUB_AGENT", "DAG");
     private static final Pattern PLACEHOLDER = Pattern.compile("\\$\\{([A-Za-z0-9_-]+)\\.output(?:\\.([A-Za-z0-9_.-]+))?}");
 
     private StructuredPlanningSupport() {
@@ -201,19 +201,27 @@ public final class StructuredPlanningSupport {
                                         "type", "object",
                                         "additionalProperties", false,
                                         "required", List.of("id", "sequence", "type", "toolName", "params", "reasoning", "executionMode"),
-                                        "properties", Map.of(
-                                                "id", Map.of("type", "string"),
-                                                "sequence", Map.of("type", "integer"),
-                                                "type", Map.of("type", "string", "enum", List.of("TOOL_CALL", "SUB_AGENT", "THOUGHT")),
-                                                "toolName", Map.of("type", "string"),
-                                                "params", Map.of("type", "object"),
-                                                "reasoning", Map.of("type", "string"),
-                                                "executionMode", Map.of("type", "string", "enum", List.of("AUTO", "FORCE_SIMPLE", "FORCE_SUB_AGENT"))
-                                        )
+                                        "properties", todoItemProperties()
                                 )
                         )
                 )
         );
+    }
+
+    private static Map<String, Object> todoItemProperties() {
+        Map<String, Object> props = new java.util.LinkedHashMap<>();
+        props.put("id", Map.of("type", "string"));
+        props.put("sequence", Map.of("type", "integer"));
+        props.put("type", Map.of("type", "string", "enum", List.of("TOOL_CALL", "SUB_AGENT", "THOUGHT")));
+        props.put("toolName", Map.of("type", "string"));
+        props.put("params", Map.of("type", "object"));
+        props.put("reasoning", Map.of("type", "string"));
+        props.put("executionMode", Map.of("type", "string", "enum", List.of("AUTO", "FORCE_SIMPLE", "FORCE_SUB_AGENT", "DAG")));
+        props.put("dependsOn", Map.of("type", "array", "items", Map.of("type", "string")));
+        props.put("groupKey", Map.of("type", "string"));
+        props.put("parallelizable", Map.of("type", "boolean"));
+        props.put("estimatedDuration", Map.of("type", "integer"));
+        return props;
     }
 
     public static Map<String, Object> subAgentPlanningJsonSchema() {

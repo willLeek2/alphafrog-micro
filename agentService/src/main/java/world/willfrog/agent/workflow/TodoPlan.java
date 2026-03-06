@@ -16,4 +16,7 @@ public class TodoPlan {
     private String analysis;
     @Builder.Default
     private List<TodoItem> items = new ArrayList<>();
+
+    /** DAG 元数据（可选，用于优化） */
+    private DagMetadata dagMetadata;
 }

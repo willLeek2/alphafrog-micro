@@ -170,8 +170,17 @@ public class AgentRunStateStore {
             return Optional.empty();
         }
         try {
-            return Optional.of(objectMapper.readValue(json, WorkflowState.class));
+            WorkflowState state = objectMapper.readValue(json, WorkflowState.class);
+            // 处理从旧版本迁移的情况：确保 DAG 字段有默认值
+            if (state.getCompletedNodeIds() == null) {
+                state.setCompletedNodeIds(new java.util.HashSet<>());
+            }
+            if (state.getRunningNodeIds() == null) {
+                state.setRunningNodeIds(new java.util.HashSet<>());
+            }
+            return Optional.of(state);
         } catch (Exception e) {
+            log.error("Failed to load workflow state for runId={}", runId, e);
             return Optional.empty();
         }
     }
@@ -270,6 +279,7 @@ public class AgentRunStateStore {
     private String buildTodoProgressJson(String runId, JsonNode itemsNode) {
         Optional<WorkflowState> workflowState = loadWorkflowState(runId);
         Map<String, String> completedStatusById = new HashMap<>();
+        Set<String> runningNodeIds = Set.of();
         int currentIndex = -1;
         if (workflowState.isPresent()) {
             currentIndex = workflowState.get().getCurrentIndex();
@@ -280,6 +290,9 @@ public class AgentRunStateStore {
                 }
                 TodoStatus status = item.getStatus() == null ? TodoStatus.COMPLETED : item.getStatus();
                 completedStatusById.put(key, status.name());
+            }
+            if (workflowState.get().getRunningNodeIds() != null) {
+                runningNodeIds = workflowState.get().getRunningNodeIds();
             }
         }
 
@@ -295,7 +308,11 @@ public class AgentRunStateStore {
             String id = nvl(node.path("id").asText("todo_" + (idx + 1)));
             String status = completedStatusById.get(id);
             if (status == null || status.isBlank()) {
-                status = idx == currentIndex ? "RUNNING" : "PENDING";
+                if (runningNodeIds.contains(id) || idx == currentIndex) {
+                    status = "RUNNING";
+                } else {
+                    status = "PENDING";
+                }
             }
 
             if ("COMPLETED".equals(status)) {
