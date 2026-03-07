@@ -21,6 +21,8 @@ import world.willfrog.agent.tool.MarketDataTools;
 import world.willfrog.agent.tool.PythonSandboxTools;
 import world.willfrog.agent.workflow.LinearWorkflowExecutor;
 import world.willfrog.agent.workflow.TodoPlanner;
+import world.willfrog.agent.workflow.WorkflowExecutor;
+import world.willfrog.agent.workflow.WorkflowExecutorFactory;
 import world.willfrog.agent.workflow.WorkflowExecutionResult;
 
 import java.util.ArrayList;
@@ -44,7 +46,7 @@ public class AgentRunExecutor {
     private final AgentObservabilityService observabilityService;
     private final AgentCreditService creditService;
     private final TodoPlanner todoPlanner;
-    private final LinearWorkflowExecutor workflowExecutor;
+    private final WorkflowExecutorFactory workflowExecutorFactory;
     private final AgentMessageService messageService;
     private final ObjectMapper objectMapper;
     private final MeterRegistry meterRegistry;
@@ -163,6 +165,7 @@ public class AgentRunExecutor {
                     .modelName(modelName)
                     .build());
 
+            WorkflowExecutor workflowExecutor = workflowExecutorFactory.getExecutor(todoPlan);
             WorkflowExecutionResult result = workflowExecutor.execute(LinearWorkflowExecutor.WorkflowRequest.builder()
                     .run(run)
                     .userId(userId)

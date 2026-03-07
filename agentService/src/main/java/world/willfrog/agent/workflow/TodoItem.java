@@ -45,5 +45,6 @@ public class TodoItem {
     private boolean parallelizable = false;
 
     /** 预估执行时间（秒），用于调度优化 */
-    private int estimatedDuration;
+    @Builder.Default
+    private int estimatedDuration = 5;
 }

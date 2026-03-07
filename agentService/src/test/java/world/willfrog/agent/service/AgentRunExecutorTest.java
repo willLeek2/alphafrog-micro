@@ -20,6 +20,8 @@ import world.willfrog.agent.workflow.LinearWorkflowExecutor;
 import world.willfrog.agent.workflow.TodoItem;
 import world.willfrog.agent.workflow.TodoPlan;
 import world.willfrog.agent.workflow.TodoPlanner;
+import world.willfrog.agent.workflow.WorkflowExecutor;
+import world.willfrog.agent.workflow.WorkflowExecutorFactory;
 import world.willfrog.agent.workflow.WorkflowExecutionResult;
 
 import java.util.List;
@@ -57,7 +59,9 @@ class AgentRunExecutorTest {
     @Mock
     private TodoPlanner todoPlanner;
     @Mock
-    private LinearWorkflowExecutor workflowExecutor;
+    private WorkflowExecutorFactory workflowExecutorFactory;
+    @Mock
+    private WorkflowExecutor workflowExecutor;
     @Mock
     private ChatModel chatLanguageModel;
     @Mock
@@ -77,7 +81,7 @@ class AgentRunExecutorTest {
                 observabilityService,
                 creditService,
                 todoPlanner,
-                workflowExecutor,
+                workflowExecutorFactory,
                 messageService,
                 new ObjectMapper(),
                 new SimpleMeterRegistry()
@@ -95,6 +99,7 @@ class AgentRunExecutorTest {
         when(aiServiceFactory.resolveLlm(anyString(), anyString()))
                 .thenReturn(new AgentLlmResolver.ResolvedLlm("ep", "base", "model", "", null));
         when(aiServiceFactory.buildChatModelWithProviderOrder(any(), any())).thenReturn(chatLanguageModel);
+        when(workflowExecutorFactory.getExecutor(any())).thenReturn(workflowExecutor);
         lenient().when(creditService.calculateRunTotalCredits(anyString(), anyString(), any())).thenReturn(0);
     }
 

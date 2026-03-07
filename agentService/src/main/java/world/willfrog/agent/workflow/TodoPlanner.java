@@ -44,6 +44,7 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 @Slf4j
 public class TodoPlanner {
+    private static final int DEFAULT_ESTIMATED_DURATION_SECONDS = 5;
 
     private final AgentPromptService promptService;
     private final AgentEventService eventService;
@@ -274,6 +275,10 @@ public class TodoPlanner {
                     .params(raw.getParams() == null ? Map.of() : raw.getParams())
                     .reasoning(nvl(raw.getReasoning()))
                     .executionMode(raw.getExecutionMode() == null ? ExecutionMode.AUTO : raw.getExecutionMode())
+                    .dependsOn(normalizeDependsOn(raw.getDependsOn()))
+                    .groupKey(nvl(raw.getGroupKey()))
+                    .parallelizable(raw.isParallelizable())
+                    .estimatedDuration(raw.getEstimatedDuration() > 0 ? raw.getEstimatedDuration() : DEFAULT_ESTIMATED_DURATION_SECONDS)
                     .status(TodoStatus.PENDING)
                     .decisionLlmTraceId(nvl(raw.getDecisionLlmTraceId()))
                     .decisionStage(nvl(raw.getDecisionStage()))
@@ -321,6 +326,10 @@ public class TodoPlanner {
                         .params(toMap(node.path("params")))
                         .reasoning(nvl(node.path("reasoning").asText("")))
                         .executionMode(parseExecutionMode(node.path("executionMode").asText("AUTO")))
+                        .dependsOn(toStringList(node.path("dependsOn")))
+                        .groupKey(nvl(node.path("groupKey").asText("")))
+                        .parallelizable(node.path("parallelizable").asBoolean(false))
+                        .estimatedDuration(node.path("estimatedDuration").asInt(DEFAULT_ESTIMATED_DURATION_SECONDS))
                         .decisionLlmTraceId(nvl(node.path("decisionLlmTraceId").asText("")))
                         .decisionStage(nvl(node.path("decisionStage").asText("")))
                         .decisionExcerpt(nvl(node.path("decisionExcerpt").asText("")))
@@ -342,6 +351,35 @@ public class TodoPlanner {
             return Map.of();
         }
         return objectMapper.convertValue(node, new TypeReference<Map<String, Object>>() {});
+    }
+
+    private List<String> toStringList(JsonNode node) {
+        if (!node.isArray()) {
+            return List.of();
+        }
+        List<String> out = new ArrayList<>();
+        for (JsonNode child : node) {
+            out.add(child.asText(""));
+        }
+        return filterNonBlank(out);
+    }
+
+    private List<String> normalizeDependsOn(List<String> dependsOn) {
+        return filterNonBlank(dependsOn);
+    }
+
+    private List<String> filterNonBlank(List<String> values) {
+        if (values == null || values.isEmpty()) {
+            return List.of();
+        }
+        List<String> out = new ArrayList<>();
+        for (String value0 : values) {
+            String value = nvl(value0);
+            if (!value.isBlank()) {
+                out.add(value);
+            }
+        }
+        return out;
     }
 
     private TodoType parseType(String text) {

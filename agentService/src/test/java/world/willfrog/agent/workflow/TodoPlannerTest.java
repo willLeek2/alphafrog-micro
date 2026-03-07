@@ -31,6 +31,7 @@ import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -98,7 +99,7 @@ class TodoPlannerTest {
         AiMessage aiMessage = mock(AiMessage.class);
         when(aiMessage.text()).thenReturn(
             "{\"analysis\":\"分析用户查询需求\",\"items\":[" +
-            "{\"id\":\"todo_1\",\"sequence\":1,\"type\":\"TOOL_CALL\",\"toolName\":\"searchStock\",\"params\":{\"keyword\":\"平安\"},\"reasoning\":\"需要搜索股票信息\",\"executionMode\":\"AUTO\"}" +
+            "{\"id\":\"todo_1\",\"sequence\":1,\"type\":\"TOOL_CALL\",\"toolName\":\"searchStock\",\"params\":{\"keyword\":\"平安\"},\"reasoning\":\"需要搜索股票信息\",\"executionMode\":\"DAG\",\"dependsOn\":[],\"groupKey\":\"batch_stock\",\"parallelizable\":true,\"estimatedDuration\":7}" +
             "]}"
         );
         ChatResponse response = ChatResponse.builder()
@@ -120,6 +121,10 @@ class TodoPlannerTest {
 
         assertEquals(1, plan.getItems().size());
         assertEquals("searchStock", plan.getItems().get(0).getToolName());
+        assertEquals(ExecutionMode.DAG, plan.getItems().get(0).getExecutionMode());
+        assertEquals("batch_stock", plan.getItems().get(0).getGroupKey());
+        assertEquals(7, plan.getItems().get(0).getEstimatedDuration());
+        assertTrue(plan.getItems().get(0).isParallelizable());
         verify(runMapper).updatePlan(eq("run-1"), eq("u1"), eq(AgentRunStatus.EXECUTING), anyString());
         verify(eventService).append(eq("run-1"), eq("u1"), eq("TODO_LIST_CREATED"), anyMap());
     }

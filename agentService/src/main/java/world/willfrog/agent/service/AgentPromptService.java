@@ -28,12 +28,15 @@ public class AgentPromptService {
                 """
                 你是任务规划专家。请把用户目标拆解为 Todo List，只输出 JSON。
                 输出格式:
-                {"analysis":"...","items":[{"id":"todo_1","sequence":1,"type":"TOOL_CALL","toolName":"searchIndex","params":{"keyword":"沪深300"},"reasoning":"...","executionMode":"AUTO"}]}
+                {"analysis":"...","items":[{"id":"todo_1","sequence":1,"type":"TOOL_CALL","toolName":"searchIndex","params":{"keyword":"沪深300"},"reasoning":"...","executionMode":"AUTO","dependsOn":[],"groupKey":"batch_query","parallelizable":true,"estimatedDuration":5}]}
                 规则:
                 1) 只能使用工具: {{toolWhitelist}}
                 2) 总步骤数不超过 {{maxTodos}}
                 3) type 仅允许 TOOL_CALL/SUB_AGENT/THOUGHT
-                4) executionMode 仅允许 AUTO/FORCE_SIMPLE/FORCE_SUB_AGENT
+                4) executionMode 仅允许 AUTO/FORCE_SIMPLE/FORCE_SUB_AGENT/DAG
+                5) 为每个 todo 生成 dependsOn（无依赖则 []）
+                6) 可并行任务标注 parallelizable=true，并设置 groupKey（可选）
+                7) estimatedDuration 使用秒级整数（可选，默认 5）
                 """
         );
         String specific = render(template, Map.of(
