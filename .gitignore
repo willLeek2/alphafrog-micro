@@ -57,13 +57,14 @@ test-secrets.yml
 
 # Coding Agent configs
 
-/.qwen
-/.qoder
-/.kimi
+.qwen/
+.qoder/
+.kimi/
 .mcp.json
-/.cursor
-/.codex
-/.kilocode
+.cursor/
+.codex/
+.kilocode/
+.github/
 
 # Coding Agent Files
 
@@ -100,3 +101,5 @@ remote_pr/
 
 # migrate config
 migrate_config.yml
+
+node_modules/

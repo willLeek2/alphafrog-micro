@@ -5,7 +5,6 @@ import com.alibaba.fastjson.JSONObject;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.dubbo.config.annotation.DubboService;
 import org.springframework.stereotype.Service;
-import world.willfrog.alphafrogmicro.common.dao.domestic.fund.FundInfoDao;
 import world.willfrog.alphafrogmicro.common.utils.DateConvertUtils;
 import world.willfrog.alphafrogmicro.domestic.fetch.utils.DomesticFundStoreUtils;
 import world.willfrog.alphafrogmicro.domestic.fetch.utils.TuShareRequestUtils;
@@ -13,7 +12,6 @@ import world.willfrog.alphafrogmicro.domestic.idl.*;
 import world.willfrog.alphafrogmicro.domestic.idl.DubboDomesticFundFetchServiceTriple.DomesticFundFetchServiceImplBase;
 
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 
 @DubboService
@@ -24,14 +22,10 @@ public class DomesticFundFetchServiceImpl extends DomesticFundFetchServiceImplBa
     private final TuShareRequestUtils tuShareRequestUtils;
     private final DomesticFundStoreUtils domesticFundStoreUtils;
 
-    private final FundInfoDao fundInfoDao;
-
     public DomesticFundFetchServiceImpl(TuShareRequestUtils tuShareRequestUtils,
-                                        DomesticFundStoreUtils domesticFundStoreUtils,
-                                        FundInfoDao fundInfoDao) {
+                                        DomesticFundStoreUtils domesticFundStoreUtils) {
         this.tuShareRequestUtils = tuShareRequestUtils;
         this.domesticFundStoreUtils = domesticFundStoreUtils;
-        this.fundInfoDao = fundInfoDao;
     }
 
 
@@ -142,6 +136,52 @@ public class DomesticFundFetchServiceImpl extends DomesticFundFetchServiceImplBa
     }
 
     @Override
+    public DomesticFundNavFetchByDateRangeResponse fetchDomesticFundNavByDateRange(DomesticFundNavFetchByDateRangeRequest request) {
+        long startTs = request.getStartDateTimestamp();
+        long endTs = request.getEndDateTimestamp();
+        String startDate = DateConvertUtils.convertTimestampToString(startTs, "yyyyMMdd");
+        String endDate = DateConvertUtils.convertTimestampToString(endTs, "yyyyMMdd");
+        int offset = request.getOffset();
+        int limit = request.getLimit();
+
+        Map<String, Object> params = new HashMap<>();
+        Map<String, Object> queryParams = new HashMap<>();
+
+        params.put("api_name", "fund_nav");
+        queryParams.put("start_date", startDate);
+        queryParams.put("end_date", endDate);
+        queryParams.put("offset", offset);
+        queryParams.put("limit", limit);
+
+        params.put("params", queryParams);
+        params.put("fields", "ts_code,ann_date,nav_date,unit_nav,accum_nav,accum_div,net_asset,total_netasset,adj_nav");
+
+        JSONObject response = tuShareRequestUtils.createTusharePostRequest(params);
+
+        if (response == null) {
+            return DomesticFundNavFetchByDateRangeResponse.newBuilder()
+                    .setStatus("failure")
+                    .setFetchedItemsCount(0)
+                    .build();
+        }
+
+        JSONArray data = response.getJSONObject("data").getJSONArray("items");
+
+        int affectedRows = domesticFundStoreUtils.storeFundNavsByRawFullTuShareOutput(data);
+
+        if (affectedRows < 0) {
+            return DomesticFundNavFetchByDateRangeResponse.newBuilder()
+                    .setStatus("failure")
+                    .setFetchedItemsCount(affectedRows)
+                    .build();
+        }
+        return DomesticFundNavFetchByDateRangeResponse.newBuilder()
+                .setStatus("success")
+                .setFetchedItemsCount(affectedRows)
+                .build();
+    }
+
+    @Override
     public DomesticFundPortfolioFetchByDateRangeResponse fetchDomesticFundPortfolioByDateRange(DomesticFundPortfolioFetchByDateRangeRequest request) {
 
         long startDateTimestamp = request.getStartDateTimestamp();
@@ -152,57 +192,72 @@ public class DomesticFundFetchServiceImpl extends DomesticFundFetchServiceImplBa
         int offset = request.getOffset();
         int limit = request.getLimit();
 
-        List<String> fundTsCodeList = fundInfoDao.getFundTsCode(offset, limit);
+        // TuShare fund_portfolio：全市场时需与 pro_api 一致，显式传 ts_code/ann_date/period 空串（见错误码 50101）
+        Map<String, Object> params = new HashMap<>();
+        Map<String, Object> queryParams = new HashMap<>();
 
-        int totalFetchedItems = 0;
+        params.put("api_name", "fund_portfolio");
+        String filterTs = request.getTsCode();
+        if (filterTs != null && !filterTs.isBlank()) {
+            queryParams.put("ts_code", filterTs);
+        } else {
+            queryParams.put("ts_code", "");
+            queryParams.put("ann_date", "");
+            queryParams.put("period", "");
+        }
+        queryParams.put("start_date", startDate);
+        queryParams.put("end_date", endDate);
+        queryParams.put("offset", offset);
+        queryParams.put("limit", limit);
+        params.put("params", queryParams);
+        params.put("fields", "ts_code,ann_date,end_date,symbol,mkv,amount,stk_mkv_ratio,stk_float_ratio");
 
-        for (String fundTsCode : fundTsCodeList) {
-            try {
-                Map<String, Object> params = new HashMap<>();
-                Map<String, Object> queryParams = new HashMap<>();
+        JSONObject response = tuShareRequestUtils.createTusharePostRequest(params);
 
-                params.put("api_name", "fund_portfolio");
-                queryParams.put("ts_code", fundTsCode);
-                queryParams.put("start_date", startDate);
-                queryParams.put("end_date", endDate);
-                params.put("params", queryParams);
-                params.put("fields", "ts_code,ann_date,end_date,symbol,mkv,amount,stk_mkv_ratio,stk_float_ratio");
-
-                JSONObject response = tuShareRequestUtils.createTusharePostRequest(params);
-
-                if(response == null) {
-                    return DomesticFundPortfolioFetchByDateRangeResponse.newBuilder()
-                            .setStatus("failure")
-                            .setFetchedItemsCount(totalFetchedItems)
-                            .build();
-                }
-
-                JSONArray data = response.getJSONObject("data").getJSONArray("items");
-
-                int affectedRows = domesticFundStoreUtils.storeFundPortfoliosByRawTuShareOutput(data);
-
-                if(affectedRows < 0) {
-                    return DomesticFundPortfolioFetchByDateRangeResponse.newBuilder()
-                            .setStatus("failure")
-                            .setFetchedItemsCount(totalFetchedItems)
-                            .build();
-                } else {
-                    totalFetchedItems += affectedRows;
-                }
-            } catch (Exception e) {
-                log.error("Error fetching portfolio for fund: " + fundTsCode, e);
-            }
-
-            try {
-                Thread.sleep(200);
-            } catch (InterruptedException e) {
-                log.error("Thread sleep interrupted");
-            }
+        if (response == null) {
+            return DomesticFundPortfolioFetchByDateRangeResponse.newBuilder()
+                    .setStatus("failure")
+                    .setFetchedItemsCount(-1)
+                    .build();
         }
 
+        Integer tushareCode = response.getInteger("code");
+        if (tushareCode != null && tushareCode != 0) {
+            String msg = response.getString("msg");
+            log.error("TuShare fund_portfolio 返回错误: code={} msg={} start={} end={} offset={} limit={}",
+                    tushareCode, msg, startDate, endDate, offset, limit);
+            return DomesticFundPortfolioFetchByDateRangeResponse.newBuilder()
+                    .setStatus("failure")
+                    .setFetchedItemsCount(-4)
+                    .build();
+        }
+
+        JSONObject dataObj = response.getJSONObject("data");
+        if (dataObj == null) {
+            log.warn("TuShare fund_portfolio 响应 data 为空: start={} end={} offset={} limit={}",
+                    startDate, endDate, offset, limit);
+            return DomesticFundPortfolioFetchByDateRangeResponse.newBuilder()
+                    .setStatus("failure")
+                    .setFetchedItemsCount(-2)
+                    .build();
+        }
+
+        JSONArray data = dataObj.getJSONArray("items");
+        if (data == null) {
+            data = new JSONArray();
+        }
+
+        int affectedRows = domesticFundStoreUtils.storeFundPortfoliosByRawTuShareOutput(data);
+
+        if (affectedRows < 0) {
+            return DomesticFundPortfolioFetchByDateRangeResponse.newBuilder()
+                    .setStatus("failure")
+                    .setFetchedItemsCount(affectedRows)
+                    .build();
+        }
         return DomesticFundPortfolioFetchByDateRangeResponse.newBuilder()
                 .setStatus("success")
-                .setFetchedItemsCount(totalFetchedItems)
+                .setFetchedItemsCount(affectedRows)
                 .build();
 
     }
