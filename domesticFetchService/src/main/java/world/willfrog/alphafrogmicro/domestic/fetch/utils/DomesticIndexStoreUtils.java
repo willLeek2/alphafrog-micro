@@ -150,51 +150,31 @@ public class DomesticIndexStoreUtils {
                             indexDaily.setTradeDate(tradeDate);
                             break;
                         case "close":
-                            indexDaily.setClose(item.getBigDecimal(j).doubleValue());
+                            indexDaily.setClose(toNullableDouble(item, j));
                             break;
                         case "open":
-                            if (item.getBigDecimal(j) == null) {
-                                indexDaily.setOpen(null);
-                            } else {
-                                indexDaily.setOpen(item.getBigDecimal(j).doubleValue());
-                            }
+                            indexDaily.setOpen(toNullableDouble(item, j));
                             break;
                         case "high":
-                            if (item.getBigDecimal(j) == null) {
-                                indexDaily.setHigh(null);
-                            } else {
-                                indexDaily.setHigh(item.getBigDecimal(j).doubleValue());
-                            }
+                            indexDaily.setHigh(toNullableDouble(item, j));
                             break;
                         case "low":
-                            if (item.getBigDecimal(j) == null) {
-                                indexDaily.setLow(null);
-                            } else {
-                                indexDaily.setLow(item.getBigDecimal(j).doubleValue());
-                            }
+                            indexDaily.setLow(toNullableDouble(item, j));
                             break;
                         case "pre_close":
-                            indexDaily.setPreClose(item.getBigDecimal(j).doubleValue());
+                            indexDaily.setPreClose(toNullableDouble(item, j));
                             break;
                         case "change":
-                            indexDaily.setChange(item.getBigDecimal(j).doubleValue());
+                            indexDaily.setChange(toNullableDouble(item, j));
                             break;
                         case "pct_chg":
-                            indexDaily.setPctChg(item.getBigDecimal(j).doubleValue());
+                            indexDaily.setPctChg(toNullableDouble(item, j));
                             break;
                         case "vol":
-                            if (item.getBigDecimal(j) == null) {
-                                indexDaily.setVol(null);
-                            } else {
-                                indexDaily.setVol(item.getBigDecimal(j).doubleValue());
-                            }
+                            indexDaily.setVol(toNullableDouble(item, j));
                             break;
                         case "amount":
-                            if (item.getBigDecimal(j) == null) {
-                                indexDaily.setAmount(null);
-                            } else {
-                                indexDaily.setAmount(item.getBigDecimal(j).doubleValue());
-                            }
+                            indexDaily.setAmount(toNullableDouble(item, j));
                             break;
                         default:
                             break;
@@ -254,7 +234,7 @@ public class DomesticIndexStoreUtils {
                             indexWeight.setTradeDate(tradeDate);
                             break;
                         case "weight":
-                            indexWeight.setWeight(item.getBigDecimal(j).doubleValue());
+                            indexWeight.setWeight(toNullableDouble(item, j));
                             break;
                         default:
                             break;
@@ -791,6 +771,11 @@ public class DomesticIndexStoreUtils {
         }
 
         return totalAffected;
+    }
+
+    private Double toNullableDouble(JSONArray item, int index) {
+        BigDecimal value = item.getBigDecimal(index);
+        return value == null ? null : value.doubleValue();
     }
 
 }

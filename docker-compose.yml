@@ -793,6 +793,11 @@ volumes:
 networks:
   alphafrog-network:
     driver: bridge
+    driver_opts:
+      # 生产机如果 Docker daemon 默认关闭 bridge inter-container communication，
+      # 容器内 DNS 仍能解析 rabbitmq/nacos，但 TCP 连接会超时。
+      # 这里显式打开同一 bridge 网络内的容器互通。
+      com.docker.network.bridge.enable_icc: "true"
     ipam:
       config:
         - subnet: 172.18.0.0/16
