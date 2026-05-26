@@ -27,15 +27,15 @@ BUSINESS_SERVICES=(
   admin-service
   portfolio-service
   agent-service
+  agent-langchain-service
   external-info-service
   python-sandbox-gateway-service
   frontend
 )
 
-# 所有服务（含 opt-in；默认全量 deploy 仍只用 BUSINESS_SERVICES）
+# 所有 Java 业务服务
 ALL_SERVICES=(
   "${BUSINESS_SERVICES[@]}"
-  agent-langchain-service
 )
 
 usage() {
@@ -59,7 +59,7 @@ Services:
   admin-service
   portfolio-service
   agent-service
-  agent-langchain-service   # opt-in only (in ALL_SERVICES, not BUSINESS_SERVICES)
+  agent-langchain-service
   external-info-service
   python-sandbox-gateway-service
   frontend
@@ -195,7 +195,7 @@ SELECTED=()
 if [[ ${#SERVICES[@]} -eq 0 ]]; then
   # 未指定服务，使用默认列表
   if [[ "$WITH_ALL" == true ]]; then
-    SELECTED=("${PYTHON_SERVICES[@]}" "${BUSINESS_SERVICES[@]}")
+    SELECTED=("${PYTHON_SERVICES[@]}" "${ALL_SERVICES[@]}")
   else
     SELECTED=("${BUSINESS_SERVICES[@]}")
   fi

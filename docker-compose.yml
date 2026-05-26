@@ -47,6 +47,12 @@ services:
     environment:
       RABBITMQ_DEFAULT_USER: ${AF_RABBITMQ_USER:-alphafrog}
       RABBITMQ_DEFAULT_PASS: ${AF_RABBITMQ_PASS:-Excited1s}
+      RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: >-
+        +P 1048576
+        +sbwt none
+        +sbwtdcpu none
+        +sbwtdio none
+        -rabbit vm_memory_high_watermark 0.70
     ports:
       - "5672:5672"
       - "15672:15672"
@@ -55,7 +61,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 300M
+          memory: 512M
     healthcheck:
       test: rabbitmq-diagnostics -q ping
       interval: 10s
