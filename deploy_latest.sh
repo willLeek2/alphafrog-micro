@@ -280,6 +280,30 @@ else
   exit 1
 fi
 
+wait_for_compose_service() {
+  local svc="$1"
+  local timeout_seconds="${2:-180}"
+  local deadline=$((SECONDS + timeout_seconds))
+  local cid status running
+
+  while (( SECONDS < deadline )); do
+    cid="$($DOCKER_COMPOSE ps -q "$svc" 2>/dev/null || true)"
+    if [[ -n "$cid" ]]; then
+      status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$cid" 2>/dev/null || true)"
+      running="$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null || true)"
+      if [[ "$status" == "healthy" ]] || [[ "$status" == "running" && "$running" == "true" ]]; then
+        echo "Service $svc is ready ($status)"
+        return 0
+      fi
+    fi
+    sleep 2
+  done
+
+  echo "Service $svc did not become ready within ${timeout_seconds}s" >&2
+  $DOCKER_COMPOSE ps "$svc" >&2 || true
+  return 1
+}
+
 # 步骤1: 启动基础设施服务
 # 如果使用了 --with-infra 或指定了基础设施服务，则重建它们
 if [[ "$WITH_INFRA" == true ]] || [[ "$WITH_ALL" == true ]]; then
@@ -289,6 +313,10 @@ else
   echo "=== Ensuring infrastructure services are running ==="
   $DOCKER_COMPOSE up -d --no-recreate "${INFRA_SERVICES[@]}" 2>/dev/null || true
 fi
+echo "=== Waiting for infrastructure services to become healthy ==="
+for svc in "${INFRA_SERVICES[@]}"; do
+  wait_for_compose_service "$svc"
+done
 
 # 步骤2: 启动选定的业务服务（重建）
 # 先过滤出需要重建的业务服务（排除基础设施）
