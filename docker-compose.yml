@@ -1,3 +1,10 @@
+# Agent LLM（OpenRouter 等）经宿主机 HTTP 代理出网。在 .env 中显式设置 HTTP_PROXY= 与 AF_JAVA_PROXY_OPTIONS= 可关闭。
+x-agent-llm-proxy-env: &agent-llm-proxy-env
+  HTTP_PROXY: ${HTTP_PROXY-http://host.docker.internal:7890}
+  HTTPS_PROXY: ${HTTPS_PROXY-http://host.docker.internal:7890}
+  http_proxy: ${HTTP_PROXY-http://host.docker.internal:7890}
+  https_proxy: ${HTTPS_PROXY-http://host.docker.internal:7890}
+
 services:
   # postgres:  <-- 用户使用的是宿主机 PG
   #   image: postgres:16-alpine
@@ -501,15 +508,11 @@ services:
       AF_CONFIG_NACOS_GROUP: "alphafrog-config"
       # code-refine 配置文件路径（动态配置目录，Nacos 推送后可写）
       AF_AGENT_FLOW_CODE_REFINE_CONFIG_FILE: "/app/config-dynamic/code-refine.local.json"
-      # Memory Optimization (Heavy)
-      JAVA_TOOL_OPTIONS: "-Xms512m -Xmx1g"
-      # HTTP/HTTPS 代理（访问 OpenRouter 等境外服务时使用）
-      HTTP_PROXY: ${HTTP_PROXY:-}
-      HTTPS_PROXY: ${HTTPS_PROXY:-}
-      http_proxy: ${HTTP_PROXY:-}
-      https_proxy: ${HTTPS_PROXY:-}
-      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1,nacos,redis,rabbitmq,meilisearch}
-      no_proxy: ${NO_PROXY:-localhost,127.0.0.1,nacos,redis,rabbitmq,meilisearch}
+      # Memory Optimization (Heavy)；JDK HttpClient 读 -Dhttp(s).proxy*，见 AF_JAVA_PROXY_OPTIONS
+      JAVA_TOOL_OPTIONS: "-Xms512m -Xmx1g ${AF_JAVA_PROXY_OPTIONS--Dhttp.proxyHost=host.docker.internal -Dhttp.proxyPort=7890 -Dhttps.proxyHost=host.docker.internal -Dhttps.proxyPort=7890 -Dhttp.nonProxyHosts=localhost|127.0.0.1|nacos|redis|rabbitmq|meilisearch|host.docker.internal}"
+      <<: *agent-llm-proxy-env
+      NO_PROXY: ${NO_PROXY-localhost,127.0.0.1,nacos,redis,rabbitmq,meilisearch,host.docker.internal}
+      no_proxy: ${NO_PROXY-localhost,127.0.0.1,nacos,redis,rabbitmq,meilisearch,host.docker.internal}
     volumes:
       - ./data/agent_datasets:/data/agent_datasets
       - ./agentService/config:/app/config:ro
@@ -582,13 +585,10 @@ services:
       AF_CONFIG_NACOS_DATA_ID: "code-refine.json"
       AF_CONFIG_NACOS_GROUP: "alphafrog-config"
       AF_AGENT_FLOW_CODE_REFINE_CONFIG_FILE: "/app/config-dynamic/code-refine.local.json"
-      JAVA_TOOL_OPTIONS: "-Xms512m -Xmx1g"
-      HTTP_PROXY: ${HTTP_PROXY:-}
-      HTTPS_PROXY: ${HTTPS_PROXY:-}
-      http_proxy: ${HTTP_PROXY:-}
-      https_proxy: ${HTTPS_PROXY:-}
-      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1,nacos,redis,rabbitmq,meilisearch,agent-service}
-      no_proxy: ${NO_PROXY:-localhost,127.0.0.1,nacos,redis,rabbitmq,meilisearch,agent-service}
+      JAVA_TOOL_OPTIONS: "-Xms512m -Xmx1g ${AF_JAVA_PROXY_OPTIONS--Dhttp.proxyHost=host.docker.internal -Dhttp.proxyPort=7890 -Dhttps.proxyHost=host.docker.internal -Dhttps.proxyPort=7890 -Dhttp.nonProxyHosts=localhost|127.0.0.1|nacos|redis|rabbitmq|meilisearch|agent-service|host.docker.internal}"
+      <<: *agent-llm-proxy-env
+      NO_PROXY: ${NO_PROXY-localhost,127.0.0.1,nacos,redis,rabbitmq,meilisearch,agent-service,host.docker.internal}
+      no_proxy: ${NO_PROXY-localhost,127.0.0.1,nacos,redis,rabbitmq,meilisearch,agent-service,host.docker.internal}
     volumes:
       - ./data/agent_datasets:/data/agent_datasets
       - ./agentService/config:/app/config:ro
