@@ -9,6 +9,7 @@ import dev.langchain4j.service.tool.ToolProviderRequest;
 import dev.langchain4j.service.tool.ToolProviderResult;
 import lombok.RequiredArgsConstructor;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
 import world.willfrog.agent.tools.rag.RagTools;
@@ -69,6 +70,7 @@ public class ToolRouterToolProvider implements ToolProvider {
     private final SearchTools searchTools;
     private final PythonSandboxTools pythonSandboxTools;
     private final ObjectMapper objectMapper;
+    private final AgentEventService eventService;
 
     /**
      * 为当前 LC4j 调用构建「工具名 → ToolExecutor」映射。
@@ -103,7 +105,7 @@ public class ToolRouterToolProvider implements ToolProvider {
                 codeInterpreterEnabled
         );
 
-        ToolExecutor executor = new ToolRouterToolExecutor(toolRouter, objectMapper);
+        ToolExecutor executor = new ToolRouterToolExecutor(toolRouter, objectMapper, eventService);
         Map<ToolSpecification, ToolExecutor> tools = new LinkedHashMap<>();
         for (ToolSpecification specification : specifications) {
             tools.put(specification, executor);

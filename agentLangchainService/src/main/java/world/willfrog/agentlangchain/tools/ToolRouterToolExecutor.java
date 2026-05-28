@@ -7,9 +7,15 @@ import dev.langchain4j.invocation.InvocationContext;
 import dev.langchain4j.service.tool.ToolExecutionResult;
 import dev.langchain4j.service.tool.ToolExecutor;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agent.workflow.DatasetRefRegistry;
 import world.willfrog.agent.tools.router.ToolRouter;
 
+import java.time.Duration;
+import java.time.Instant;
+import java.util.HashMap;
 import java.util.Map;
 
 /**
@@ -48,13 +54,18 @@ import java.util.Map;
  * @see world.willfrog.agentlangchain.orchestration.LangchainTodoNodeExecutor tool loop 宿主
  */
 @RequiredArgsConstructor
+@Slf4j
 final class ToolRouterToolExecutor implements ToolExecutor {
+
+    /** 事件 payload 中 output 预览的最大字符数，避免超大结果打爆事件体 */
+    private static final int OUTPUT_PREVIEW_MAX_CHARS = 500;
 
     private static final TypeReference<Map<String, Object>> MAP_TYPE = new TypeReference<>() {
     };
 
     private final ToolRouter toolRouter;
     private final ObjectMapper objectMapper;
+    private final AgentEventService eventService;
 
     /**
      * LC4j 旧版回调：返回工具输出纯文本。{@link #executeWithContext} 是推荐路径，会先同步
@@ -66,9 +77,30 @@ final class ToolRouterToolExecutor implements ToolExecutor {
         LangchainRepeatedToolCallGuard.Decision repeatDecision =
                 LangchainRepeatedToolCallGuard.beforeInvoke(request.name(), params, objectMapper);
         if (repeatDecision.blocked()) {
+            // 重复调用被 block 时也 emit finish，避免 UI card 一直转圈
+            emitToolCallFinished(request.name(), params, false, repeatDecision.outputOrHint(), 0L);
             return repeatDecision.outputOrHint();
         }
-        String output = toolRouter.invokeWithMeta(request.name(), params).getOutput();
+
+        // emit STARTED
+        emitToolCallStarted(request.name(), params);
+
+        Instant start = Instant.now();
+        String output = null;
+        boolean success = true;
+        try {
+            ToolRouter.ToolInvocationResult result = toolRouter.invokeWithMeta(request.name(), params);
+            output = result.getOutput();
+            success = result.isSuccess();
+        } catch (Exception e) {
+            output = e.getMessage();
+            success = false;
+            log.warn("Tool invocation failed: tool={}, runId={}", request.name(), AgentContext.getRunId(), e);
+        } finally {
+            long durationMs = Duration.between(start, Instant.now()).toMillis();
+            emitToolCallFinished(request.name(), params, success, output, durationMs);
+        }
+
         Map<String, String> datasetRefs = LangchainDatasetRefContext.snapshot();
         DatasetRefRegistry.registerFromJson(output, datasetRefs);
         LangchainDatasetRefContext.set(datasetRefs);
@@ -149,5 +181,47 @@ final class ToolRouterToolExecutor implements ToolExecutor {
         }
         String base = output == null ? "" : output;
         return base + "\n\n_retry_hint_: " + repeatDecision.outputOrHint();
+    }
+
+    // ── Tool call event emission helpers ──
+
+    private void emitToolCallStarted(String toolName, Map<String, Object> arguments) {
+        String runId = AgentContext.getRunId();
+        String userId = AgentContext.getUserId();
+        if (runId == null || userId == null) {
+            log.warn("Skip TOOL_CALL_STARTED: missing runId or userId in AgentContext. tool={}", toolName);
+            return;
+        }
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("tool_name", toolName);
+        payload.put("arguments", arguments);
+        eventService.append(runId, userId, "TOOL_CALL_STARTED", payload);
+    }
+
+    private void emitToolCallFinished(String toolName, Map<String, Object> arguments,
+                                      boolean success, String output, long durationMs) {
+        String runId = AgentContext.getRunId();
+        String userId = AgentContext.getUserId();
+        if (runId == null || userId == null) {
+            log.warn("Skip TOOL_CALL_FINISHED: missing runId or userId in AgentContext. tool={}", toolName);
+            return;
+        }
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("tool_name", toolName);
+        payload.put("arguments", arguments);
+        payload.put("success", success);
+        payload.put("result_preview", preview(output));
+        payload.put("duration_ms", durationMs);
+        eventService.append(runId, userId, "TOOL_CALL_FINISHED", payload);
+    }
+
+    private String preview(String text) {
+        if (text == null) {
+            return "";
+        }
+        if (text.length() <= OUTPUT_PREVIEW_MAX_CHARS) {
+            return text;
+        }
+        return text.substring(0, OUTPUT_PREVIEW_MAX_CHARS) + "... (truncated, length=" + text.length() + ")";
     }
 }

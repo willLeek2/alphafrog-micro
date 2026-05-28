@@ -12,6 +12,7 @@ import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.entity.AgentRunEvent;
 import world.willfrog.agent.platform.mapper.AgentRunEventMapper;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
+import world.willfrog.agent.platform.model.AgentRunEventEnvelope;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 
 import java.time.OffsetDateTime;
@@ -60,6 +61,9 @@ public class AgentEventService {
 
     /** Redis 事件序号 key 前缀,完整 key 为 {@code agent:run:event_seq:<runId>} */
     private static final String EVENT_SEQ_KEY_PREFIX = "agent:run:event_seq:";
+
+    /** Redis live 事件频道前缀,完整 channel 为 {@code agent:events:<runId>} */
+    public static final String EVENT_CHANNEL_PREFIX = "agent:events:";
 
     /** run 主表读写。 */
     private final AgentRunMapper runMapper;
@@ -251,7 +255,9 @@ public class AgentEventService {
         event.setEventType(eventType);
         // payload 已经是字符串则直接使用,否则序列化为 JSON
         String payloadJson = payload instanceof String ? (String) payload : writeJson(payload);
-        event.setPayloadJson(normalizePayloadJson(eventType, payloadJson));
+        String normalizedPayloadJson = normalizePayloadJson(eventType, payloadJson);
+        event.setPayloadJson(normalizedPayloadJson);
+        OffsetDateTime publishedAt = OffsetDateTime.now();
         try {
             eventMapper.insert(event);
         } catch (Exception e) {
@@ -261,6 +267,37 @@ public class AgentEventService {
             );
             log.error(msg, e);
             throw new IllegalStateException(msg, e);
+        }
+        publishLiveEvent(runId, nextSeq, eventType, normalizedPayloadJson, publishedAt);
+    }
+
+    /**
+     * 组装 run 级 Redis live 事件频道。
+     *
+     * @param runId 任务 ID
+     * @return Redis channel，例如 {@code agent:events:<runId>}
+     */
+    public static String eventChannel(String runId) {
+        return EVENT_CHANNEL_PREFIX + (runId == null ? "" : runId);
+    }
+
+    private void publishLiveEvent(String runId,
+                                  int seq,
+                                  String eventType,
+                                  String payloadJson,
+                                  OffsetDateTime createdAt) {
+        try {
+            AgentRunEventEnvelope envelope = new AgentRunEventEnvelope(
+                    runId,
+                    seq,
+                    eventType,
+                    payloadJson == null || payloadJson.isBlank() ? "{}" : payloadJson,
+                    createdAt == null ? OffsetDateTime.now().toString() : createdAt.toString()
+            );
+            redisTemplate.convertAndSend(eventChannel(runId), writeJson(envelope));
+        } catch (Exception e) {
+            log.warn("[AgentEventService] live event publish failed: runId={}, eventType={}, seq={}, error={}",
+                    runId, eventType, seq, e.getMessage());
         }
     }
 

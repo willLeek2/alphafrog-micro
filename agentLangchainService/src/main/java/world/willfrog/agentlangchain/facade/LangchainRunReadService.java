@@ -188,10 +188,16 @@ public class LangchainRunReadService {
         requireReadableRun(request.getId(), request.getUserId());
         int afterSeq = Math.max(0, request.getAfterSeq());
         int limit = request.getLimit() <= 0 ? 200 : Math.min(request.getLimit(), 500);
-        List<AgentRunEvent> events = eventMapper.listByRunIdAfterSeq(request.getId(), afterSeq, limit + 1);
-        boolean hasMore = events.size() > limit;
-        if (hasMore) {
-            events = events.subList(0, limit);
+        List<AgentRunEvent> events;
+        boolean hasMore = false;
+        if (request.getLatest()) {
+            events = eventMapper.listLatestByRunId(request.getId(), limit);
+        } else {
+            events = eventMapper.listByRunIdAfterSeq(request.getId(), afterSeq, limit + 1);
+            hasMore = events.size() > limit;
+            if (hasMore) {
+                events = events.subList(0, limit);
+            }
         }
         int nextAfterSeq = afterSeq;
         ListAgentRunEventsResponse.Builder builder = ListAgentRunEventsResponse.newBuilder();

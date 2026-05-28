@@ -110,6 +110,7 @@ message ListAgentRunEventsRequest {
   string id = 2;
   int32 after_seq = 3;
   int32 limit = 4;
+  bool latest = 5; // true 时忽略 after_seq，返回最近 limit 条事件（按 seq 升序输出）
 }
 
 message ListAgentRunEventsResponse {

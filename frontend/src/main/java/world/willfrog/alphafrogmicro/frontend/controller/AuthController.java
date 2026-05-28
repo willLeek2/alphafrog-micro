@@ -1,5 +1,6 @@
 package world.willfrog.alphafrogmicro.frontend.controller;
 
+import jakarta.servlet.http.HttpServletResponse;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
@@ -15,6 +16,7 @@ import world.willfrog.alphafrogmicro.frontend.service.AuthService;
 import world.willfrog.alphafrogmicro.frontend.service.RateLimitingService;
 import world.willfrog.alphafrogmicro.frontend.service.LoginAttemptService;
 import world.willfrog.alphafrogmicro.frontend.model.AuthProfileResponse;
+import world.willfrog.alphafrogmicro.frontend.util.AuthCookieHelper;
 
 import java.util.Map;
 
@@ -27,10 +29,12 @@ public class AuthController {
     private final AuthService authService;
     private final RateLimitingService rateLimitingService;
     private final LoginAttemptService loginAttemptService;
+    private final AuthCookieHelper authCookieHelper;
 
 
     @PostMapping("/login")
-    public ResponseEntity<String> login(@RequestBody Map<String, Object> loginRequest) {
+    public ResponseEntity<String> login(@RequestBody Map<String, Object> loginRequest,
+                                        HttpServletResponse response) {
         // 速率限制检查
         if (!rateLimitingService.tryAcquire("auth")) {
             return ResponseEntity.status(429).body("Too many login attempts, please try again later");
@@ -71,6 +75,8 @@ public class AuthController {
             loginAttemptService.loginSucceeded(username);
             authService.markAsLoggedIn(username);
             String authToken = authService.generateToken(username);
+            // 双轨鉴权：body 返回 raw token（兼容旧前端），同时 Set-Cookie（支持 SSE 等场景）
+            authCookieHelper.setCookie(response, authToken);
             log.info("User {} logged in successfully", username);
             return ResponseEntity.ok(authToken);
         } else {
@@ -84,8 +90,6 @@ public class AuthController {
             }
             return ResponseEntity.badRequest().body(message);
         }
-
-
     }
 
     @PostMapping("/register")
@@ -144,7 +148,8 @@ public class AuthController {
     }
 
     @PostMapping("/logout")
-    public ResponseEntity<String> logout(@RequestBody Map<String, Object> logoutRequest) {
+    public ResponseEntity<String> logout(@RequestBody Map<String, Object> logoutRequest,
+                                         HttpServletResponse response) {
         String username;
 
         try {
@@ -155,6 +160,8 @@ public class AuthController {
 
         if (authService.checkIfLoggedIn(username)) {
             authService.markAsLoggedOut(username);
+            // 清除 Cookie（双轨鉴权：同时清除 body token 状态和 cookie）
+            authCookieHelper.clearCookie(response);
             return ResponseEntity.ok("User logged out successfully");
         } else {
             return ResponseEntity.badRequest().body("User not logged in");

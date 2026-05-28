@@ -17,6 +17,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agent.platform.service.SearchEvidenceJudgeService;
 import world.willfrog.agent.tools.dataset.DatasetRegistry;
 import world.willfrog.agent.tools.dataset.DatasetWriter;
@@ -44,6 +45,9 @@ class ToolRouterToolProviderTest {
     @Mock
     private ToolRouter toolRouter;
 
+    @Mock
+    private AgentEventService eventService;
+
     private ToolRouterToolProvider provider;
 
     @BeforeEach
@@ -66,7 +70,8 @@ class ToolRouterToolProviderTest {
                 ragTools,
                 searchTools,
                 pythonSandboxTools,
-                objectMapper
+                objectMapper,
+                eventService
         );
     }
 

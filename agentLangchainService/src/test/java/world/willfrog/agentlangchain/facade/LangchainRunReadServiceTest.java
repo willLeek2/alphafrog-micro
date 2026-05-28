@@ -93,6 +93,27 @@ class LangchainRunReadServiceTest {
     }
 
     @Test
+    void listEventsLatestReturnsRecentEventsWithoutHasMore() {
+        AgentRun run = run("{\"run_provider\":\"langchain\"}");
+        when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(run);
+        AgentRunEvent event9 = event(9, "TOOL_CALL_STARTED");
+        AgentRunEvent event10 = event(10, "TOOL_CALL_FINISHED");
+        when(eventMapper.listLatestByRunId("r1", 10)).thenReturn(List.of(event9, event10));
+
+        var response = service.listEvents(ListAgentRunEventsRequest.newBuilder()
+                .setUserId("u1")
+                .setId("r1")
+                .setLimit(10)
+                .setLatest(true)
+                .build());
+
+        assertEquals(2, response.getItemsCount());
+        assertEquals(9, response.getItems(0).getSeq());
+        assertEquals(10, response.getNextAfterSeq());
+        assertFalse(response.getHasMore());
+    }
+
+    @Test
     void getResultExtractsAnswerAndCredits() {
         AgentRun run = run("{\"run_provider\":\"langchain\"}");
         run.setSnapshotJson("{\"answer_markdown\":\"done\"}");

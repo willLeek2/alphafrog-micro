@@ -19,6 +19,9 @@ public interface AgentRunEventMapper {
 
     AgentRunEvent findLatestByRunId(@Param("runId") String runId);
 
+    List<AgentRunEvent> listLatestByRunId(@Param("runId") String runId,
+                                          @Param("limit") int limit);
+
     List<AgentRunEvent> listByRunId(@Param("runId") String runId);
 
     List<String> listRunIdsWithExecutePythonArtifacts(@Param("runIds") List<String> runIds);
