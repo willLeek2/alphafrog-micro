@@ -2,15 +2,20 @@ FROM python:3.13-slim
 
 ARG PIP_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL
+ARG http_proxy
+ARG https_proxy
 
+# 使用国内 PyPI 镜像时不必走 HTTP 代理，避免镜像站被错误代理导致失败
 RUN set -eux; \
     PKGS="numpy==2.4.1 pandas==2.3.3 matplotlib==3.10.8 scipy==1.17.0"; \
     if [ -n "${PIP_INDEX_URL:-}" ]; then \
+      unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY; \
       if [ -n "${PIP_EXTRA_INDEX_URL:-}" ]; then \
         pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" --extra-index-url "${PIP_EXTRA_INDEX_URL}" ${PKGS}; \
       else \
         pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" ${PKGS}; \
       fi; \
     else \
+      export http_proxy="${http_proxy:-}" https_proxy="${https_proxy:-}"; \
       pip install --no-cache-dir ${PKGS}; \
     fi
