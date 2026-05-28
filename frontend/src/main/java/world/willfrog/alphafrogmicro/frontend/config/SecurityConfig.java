@@ -41,7 +41,8 @@ public class SecurityConfig{
                                 "/api/auth/logout",
                                 "/api/auth/forgot-password",
                                 "/api/auth/reset-password",
-                                "/api/auth/verify-reset-token"
+                                "/api/auth/verify-reset-token",
+                                "/api/agent/runs/*/stream"
                         ).permitAll()
                         .requestMatchers("/admin/login", "/admin/create").permitAll()
                         .requestMatchers("/rag/ingest", "/rag/fetch/trigger", "/rag/upload-doc").permitAll()
