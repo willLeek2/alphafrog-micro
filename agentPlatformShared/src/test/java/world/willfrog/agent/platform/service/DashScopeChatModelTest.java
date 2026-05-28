@@ -196,6 +196,62 @@ class DashScopeChatModelTest {
         verify(budgetService, never()).checkHttpAttempt(anyInt());
     }
 
+    // ==================== structured output 禁 thinking 回归测试 ====================
+
+    @Test
+    void applyRequestFormatting_shouldSetJsonObjectAndDisableThinking_whenStructuredOutputEnabled() {
+        AgentContext.clear();
+        AgentContext.setStructuredOutputSpec(
+                new AgentContext.StructuredOutputSpec("test_schema", false, Map.of("type", "object"), false, true)
+        );
+        DashScopeChatModel model = newModel("qwen3.6-max-preview", true);
+        Map<String, Object> request = new LinkedHashMap<>();
+        request.put("stream", true);
+
+        model.applyRequestFormatting(request, List.of(), true);
+
+        assertTrue(request.containsKey("response_format"));
+        assertEquals("json_object", ((Map<?, ?>) request.get("response_format")).get("type"));
+        assertFalse(request.containsKey("enable_thinking"), "structured output 时不应开启 enable_thinking");
+        assertFalse(request.containsKey("thinking_budget"), "structured output 时不应设置 thinking_budget");
+
+        AgentContext.clear();
+    }
+
+    @Test
+    void applyRequestFormatting_shouldEnableThinking_whenStructuredOutputDisabled() {
+        AgentContext.clear();
+        // 不设置 StructuredOutputSpec，模拟普通（非结构化）请求
+        DashScopeChatModel model = newModel("qwen3.6-max-preview", true);
+        Map<String, Object> request = new LinkedHashMap<>();
+        request.put("stream", true);
+
+        model.applyRequestFormatting(request, List.of(), true);
+
+        assertEquals(Boolean.TRUE, request.get("enable_thinking"), "普通请求应开启 thinking");
+        assertEquals(38912, request.get("thinking_budget"), "普通请求应设置默认 thinking_budget");
+        assertFalse(request.containsKey("response_format"), "普通请求不应设置 response_format");
+
+        AgentContext.clear();
+    }
+
+    @Test
+    void applyRequestFormatting_shouldDisableThinking_whenStreamIsFalseEvenWithoutStructuredOutput() {
+        AgentContext.clear();
+        // stream=false 时，即使 structured output 未启用，也不应开启 thinking
+        DashScopeChatModel model = newModel("qwen3.6-max-preview", true);
+        Map<String, Object> request = new LinkedHashMap<>();
+        request.put("stream", false);
+
+        model.applyRequestFormatting(request, List.of(), false);
+
+        assertFalse(request.containsKey("enable_thinking"), "stream=false 时不应开启 thinking");
+        assertFalse(request.containsKey("thinking_budget"), "stream=false 时不应设置 thinking_budget");
+        assertFalse(request.containsKey("response_format"));
+
+        AgentContext.clear();
+    }
+
     private static boolean invokeSupportsThinking(DashScopeChatModel model, String name) {
         Boolean result = ReflectionTestUtils.invokeMethod(model, "supportsThinking", name);
         return Boolean.TRUE.equals(result);

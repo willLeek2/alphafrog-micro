@@ -112,15 +112,7 @@ public class DashScopeChatModel implements ChatModel {
                 requestJsonMap.put("stream_options", Map.of("include_usage", true));
             }
 
-            AgentContext.StructuredOutputSpec structuredOutputSpec = AgentContext.getStructuredOutputSpec();
-            if (structuredOutputSpec != null) {
-                requestJsonMap.put("response_format", structuredOutputSpec.asResponseFormat());
-            }
-
-            // DashScope 深度思考模型多数仅支持流式输出，stream=false 时不应开启 thinking
-            if (useStream) {
-                applyThinkingConfig(requestJsonMap, messages);
-            }
+            applyRequestFormatting(requestJsonMap, messages, useStream);
 
             requestJson = objectMapper.writeValueAsString(requestJsonMap);
             String requestUrl = OpenAiCompatibleChatModelSupport.buildChatCompletionsUrl(baseUrl);
@@ -348,6 +340,24 @@ public class DashScopeChatModel implements ChatModel {
         );
         AgentContext.setProviderLlmTraceId(traceId);
         return traceId;
+    }
+
+    /**
+     * 应用请求格式化：structured output 时设置 response_format，同时禁用 thinking。
+     * package-private，供回归测试直接访问。
+     */
+    void applyRequestFormatting(Map<String, Object> requestJsonMap, List<ChatMessage> messages, boolean useStream) {
+        AgentContext.StructuredOutputSpec structuredOutputSpec = AgentContext.getStructuredOutputSpec();
+        if (structuredOutputSpec != null) {
+            // DashScope 使用 json_object，不支持 OpenRouter 的 json_schema 格式
+            requestJsonMap.put("response_format", Map.of("type", "json_object"));
+        }
+        // DashScope 深度思考模型多数仅支持流式输出，stream=false 时不应开启 thinking
+        // 结构化输出与 thinking 模式冲突（Json mode 不支持 enable_thinking=true）
+        boolean needsStructuredOutput = structuredOutputSpec != null;
+        if (useStream && !needsStructuredOutput) {
+            applyThinkingConfig(requestJsonMap, messages);
+        }
     }
 
     private void applyThinkingConfig(Map<String, Object> requestJsonMap, List<ChatMessage> messages) {
