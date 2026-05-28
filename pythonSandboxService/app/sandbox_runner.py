@@ -10,6 +10,10 @@ from .config import SandboxConfig
 DATASET_ID_PATTERN = re.compile(r"^[a-zA-Z0-9._-]+$")
 
 
+def _normalize_library_name(library: str) -> str:
+    return re.split(r"[<>=!~\\[]", library.strip(), maxsplit=1)[0].strip().lower()
+
+
 def _resolve_dataset_dir(config: SandboxConfig, dataset_id: str) -> Path:
     if not DATASET_ID_PATTERN.match(dataset_id):
         raise ValueError("dataset_id contains illegal characters")
@@ -85,7 +89,17 @@ def run_in_sandbox(
     }
 
     timeout = timeout_seconds or config.execution_timeout_seconds
-    libraries = libraries or ["numpy"]
+    requested_libraries = [lib.strip() for lib in (libraries or []) if lib and lib.strip()]
+    install_libraries = [
+        lib for lib in requested_libraries
+        if _normalize_library_name(lib) not in config.preinstalled_libraries
+    ]
+
+    if config.skip_environment_setup:
+        # The runtime image is expected to contain numpy/pandas/matplotlib/scipy.
+        # Passing libraries to llm-sandbox forces pip install on every run and
+        # dominates short pandas jobs, so skip dynamic installation by default.
+        install_libraries = []
 
     primary_mount = f"{config.workdir}/input/{dataset_id}"
 
@@ -96,6 +110,7 @@ def run_in_sandbox(
         runtime_configs=runtime_configs,
         workdir=config.workdir,
         execution_timeout=timeout,
+        skip_environment_setup=config.skip_environment_setup,
     ) as session:
         for ds_id in dataset_id_list:
             dataset_dir = _resolve_dataset_dir(config, ds_id)
@@ -105,7 +120,7 @@ def run_in_sandbox(
             for file_path in files_to_copy:
                 _copy_dataset_file(session, file_path, dataset_mount, ds_id, config.workdir)
 
-        result = session.run(code, libraries=libraries, timeout=timeout)
+        result = session.run(code, libraries=install_libraries, timeout=timeout)
 
     return {
         "exit_code": result.exit_code,

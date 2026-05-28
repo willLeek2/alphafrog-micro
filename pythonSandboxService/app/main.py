@@ -24,26 +24,27 @@ tasks: Dict[str, Task] = {}
 task_queue: asyncio.Queue = asyncio.Queue()
 
 
-async def worker():
-    logger.info("Worker started")
+async def worker(worker_id: int):
+    logger.info("Worker %s started", worker_id)
     while True:
         try:
             task_id = await task_queue.get()
             task = tasks.get(task_id)
             if task and task.status == TaskStatus.QUEUED:
-                await process_task(task)
+                await process_task(task, worker_id)
             task_queue.task_done()
         except asyncio.CancelledError:
-            logger.info("Worker cancelled")
+            logger.info("Worker %s cancelled", worker_id)
             break
         except Exception as e:
-            logger.error(f"Worker error: {e}")
+            logger.error("Worker %s error: %s", worker_id, e)
 
 
-async def process_task(task: Task):
+async def process_task(task: Task, worker_id: int):
     task.status = TaskStatus.RUNNING
     task.started_at = datetime.utcnow()
-    logger.info(f"Processing task {task.task_id}")
+    queued_ms = int((task.started_at - task.created_at).total_seconds() * 1000)
+    logger.info("Processing task %s worker=%s queued_ms=%s", task.task_id, worker_id, queued_ms)
 
     try:
         # Run synchronous sandbox runner in thread pool
@@ -70,19 +71,24 @@ async def process_task(task: Task):
         task.status = TaskStatus.FAILED
     finally:
         task.finished_at = datetime.utcnow()
+        duration_ms = int((task.finished_at - task.started_at).total_seconds() * 1000)
+        logger.info(
+            "Finished task %s worker=%s status=%s duration_ms=%s",
+            task.task_id,
+            worker_id,
+            task.status,
+            duration_ms,
+        )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Start worker
-    worker_task = asyncio.create_task(worker())
+    worker_count = max(1, config.max_concurrency)
+    worker_tasks = [asyncio.create_task(worker(i + 1)) for i in range(worker_count)]
     yield
-    # Cleanup
-    worker_task.cancel()
-    try:
-        await worker_task
-    except asyncio.CancelledError:
-        pass
+    for worker_task in worker_tasks:
+        worker_task.cancel()
+    await asyncio.gather(*worker_tasks, return_exceptions=True)
 
 
 app = FastAPI(title="alphafrog-python-sandbox", version="0.2.0", lifespan=lifespan)

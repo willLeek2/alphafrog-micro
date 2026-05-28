@@ -16,6 +16,8 @@ class SandboxConfig:
     workdir: str
     log_level: str
     sandbox_image: str
+    skip_environment_setup: bool
+    preinstalled_libraries: frozenset[str]
 
 
 def load_config() -> SandboxConfig:
@@ -28,6 +30,15 @@ def load_config() -> SandboxConfig:
     workdir = os.getenv("AF_SANDBOX_WORKDIR", "/sandbox")
     log_level = os.getenv("AF_SANDBOX_LOG_LEVEL", "INFO")
     sandbox_image = os.getenv("AF_SANDBOX_IMAGE", "alphafrog-sandbox-runtime:latest")
+    skip_environment_setup = _parse_bool(os.getenv("AF_SANDBOX_SKIP_ENVIRONMENT_SETUP"), default=True)
+    preinstalled_libraries = frozenset(
+        item.strip().lower()
+        for item in os.getenv(
+            "AF_SANDBOX_PREINSTALLED_LIBRARIES",
+            "numpy,pandas,matplotlib,scipy",
+        ).split(",")
+        if item.strip()
+    )
     return SandboxConfig(
         data_dir=data_dir,
         max_concurrency=max_concurrency,
@@ -38,4 +49,12 @@ def load_config() -> SandboxConfig:
         workdir=workdir,
         log_level=log_level,
         sandbox_image=sandbox_image,
+        skip_environment_setup=skip_environment_setup,
+        preinstalled_libraries=preinstalled_libraries,
     )
+
+
+def _parse_bool(value: str | None, default: bool) -> bool:
+    if value is None or value == "":
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
