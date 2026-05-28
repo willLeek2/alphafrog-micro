@@ -25,6 +25,7 @@ public class AgentAiServiceFactory {
     private final RawHttpLogger httpLogger;
     private final AgentObservabilityService observabilityService;
     private final OpenRouterCostService openRouterCostService;
+    private final AgentEventService eventService;
     private final AgentLlmLocalConfigLoader localConfigLoader;
 
     @Autowired(required = false)
@@ -134,6 +135,7 @@ public class AgentAiServiceFactory {
                     httpLogger,
                     observabilityService,
                     openRouterCostService,
+                    eventService,
                     resolved.endpointName(),
                     localConfigLoader
             );
@@ -175,6 +177,7 @@ public class AgentAiServiceFactory {
                     httpLogger,
                     observabilityService,
                     openRouterCostService,
+                    eventService,
                     resolved.endpointName(),
                     localConfigLoader
             );

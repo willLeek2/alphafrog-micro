@@ -30,7 +30,9 @@ public final class OpenAiCompatibleChatModelSupport {
             String content,
             String reasoningContent,
             ChatCompletionResponse completionResponse,
-            StreamingProgressTracker.StreamingProgressSnapshot progressSnapshot
+            StreamingProgressTracker.StreamingProgressSnapshot progressSnapshot,
+            String lastId,
+            Map<String, Object> lastUsage
     ) {
     }
 
@@ -238,7 +240,9 @@ public final class OpenAiCompatibleChatModelSupport {
                 contentBuilder.toString(),
                 reasoningBuilder.toString(),
                 completion,
-                snapshot
+                snapshot,
+                lastId,
+                lastUsage
         );
     }
 

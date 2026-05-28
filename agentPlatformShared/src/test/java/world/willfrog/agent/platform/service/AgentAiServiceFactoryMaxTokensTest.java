@@ -59,6 +59,7 @@ class AgentAiServiceFactoryMaxTokensTest {
                 mock(RawHttpLogger.class),
                 mock(AgentObservabilityService.class),
                 mock(OpenRouterCostService.class),
+                mock(AgentEventService.class),
                 mock(AgentLlmLocalConfigLoader.class)
         );
         ReflectionTestUtils.setField(factory, "openAiApiKey", "test-key");

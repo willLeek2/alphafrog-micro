@@ -31,6 +31,7 @@ class AgentAiServiceFactoryDashScopeTest {
                 mock(RawHttpLogger.class),
                 mock(AgentObservabilityService.class),
                 mock(OpenRouterCostService.class),
+                mock(AgentEventService.class),
                 mock(AgentLlmLocalConfigLoader.class)
         );
         ReflectionTestUtils.setField(factory, "openAiApiKey", "fallback-key");
@@ -62,6 +63,7 @@ class AgentAiServiceFactoryDashScopeTest {
                 mock(RawHttpLogger.class),
                 mock(AgentObservabilityService.class),
                 mock(OpenRouterCostService.class),
+                mock(AgentEventService.class),
                 mock(AgentLlmLocalConfigLoader.class)
         );
         ReflectionTestUtils.setField(factory, "openAiApiKey", "fallback-key");
@@ -93,6 +95,7 @@ class AgentAiServiceFactoryDashScopeTest {
                 mock(RawHttpLogger.class),
                 mock(AgentObservabilityService.class),
                 mock(OpenRouterCostService.class),
+                mock(AgentEventService.class),
                 mock(AgentLlmLocalConfigLoader.class)
         );
         AgentRunBudgetService budgetService = mock(AgentRunBudgetService.class);

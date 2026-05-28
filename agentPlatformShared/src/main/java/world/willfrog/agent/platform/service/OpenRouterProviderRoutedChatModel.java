@@ -90,8 +90,9 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
     private final RawHttpLogger httpLogger;
     private final AgentObservabilityService observabilityService;
     private final OpenRouterCostService openRouterCostService;
+    private final AgentEventService eventService;
     private final String endpointName;
-    
+
     // Debug 配置加载器（热加载）
     private final AgentLlmLocalConfigLoader localConfigLoader;
 
@@ -132,10 +133,12 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
         String responseJson = null;
         List<Map<String, Object>> attempts = List.of();
         
+        String llmTraceId = java.util.UUID.randomUUID().toString().replace("-", "");
         try {
             if (budgetService != null) {
                 budgetService.checkBeforeLlmCall();
             }
+            emitLlmCallStarted(llmTraceId, true);
             // ========== 1. 构建请求 ==========
             ChatCompletionRequest.Builder builder = ChatCompletionRequest.builder()
                     .model(OpenAiCompatibleChatModelSupport.nvl(modelName))
@@ -257,6 +260,7 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
             ChatCompletionResponse completion;
             String reasoningContent = null;
             StreamingProgressTracker.StreamingProgressSnapshot progressSnapshot = null;
+            OpenAiCompatibleChatModelSupport.SseAggregateResult aggregateResult = null;
 
             if (statusCode >= 200 && statusCode < 300) {
                 // 流式响应：解析 SSE。
@@ -265,8 +269,8 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
                 // usage 等信息拆在多个 chunk 中返回。这里用聚合器还原成一个
                 // ChatCompletionResponse，后续 LangChain4j 才能像非流式响应一样读取
                 // AiMessage 和 TokenUsage。
-                StreamingProgressTracker tracker = createStreamingProgressTracker();
-                OpenAiCompatibleChatModelSupport.SseAggregateResult aggregateResult =
+                StreamingProgressTracker tracker = createStreamingProgressTracker(llmTraceId);
+                aggregateResult =
                         OpenAiCompatibleChatModelSupport.aggregateSseStream(
                                 httpResponse.body(), objectMapper, log, tracker
                         );
@@ -335,11 +339,17 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
             }
 
             // ALP-25：上报成功观测（含 raw HTTP）
+            String observabilityTraceId = null;
             if (shouldCapture && observabilityService != null) {
-                reportLlmCall(requestRecord, responseRecord, curlCommand, requestStartedAt, durationMs, null,
+                observabilityTraceId = reportLlmCall(requestRecord, responseRecord, curlCommand, requestStartedAt, durationMs, null,
                         reasoningContent, progressSnapshot, attemptResult.attempts());
             }
-            
+
+            // SSE live event: LLM call finished (success)
+            Double actualCost = extractActualCostFromUsage(aggregateResult.lastUsage());
+            String generationId = aggregateResult.lastId();
+            emitLlmCallFinished(llmTraceId, tokenUsage, durationMs, actualCost, generationId, null, observabilityTraceId);
+
             return ChatResponse.builder()
                     .aiMessage(aiMessage)
                     .metadata(ChatResponseMetadata.builder()
@@ -350,28 +360,34 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
             
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            
+
+            // SSE live event: LLM call finished (interrupted)
+            long durationMs = System.currentTimeMillis() - requestStartedAt;
+            emitLlmCallFinished(llmTraceId, null, durationMs, null, null, "INTERRUPTED", null);
+
             // ALP-25：上报中断错误
             if (shouldCapture && observabilityService != null) {
-                long durationMs = System.currentTimeMillis() - requestStartedAt;
                 reportLlmCall(requestRecord, responseRecord, curlCommand, requestStartedAt, durationMs, "INTERRUPTED",
                         null, null, List.of());
             }
-            
+
             String detail = "OpenRouter provider routed chat completion interrupted"
                     + " (providers=" + providerOrder
                     + ", model=" + OpenAiCompatibleChatModelSupport.nvl(modelName) + ")";
             throw new IllegalStateException(detail, e);
             
         } catch (Exception e) {
+            // SSE live event: LLM call finished (error)
+            long durationMs = System.currentTimeMillis() - requestStartedAt;
+            String errorType = e.getClass().getSimpleName();
+            emitLlmCallFinished(llmTraceId, null, durationMs, null, null, errorType + ": " + e.getMessage(), null);
+
             // ALP-25：上报异常
             if (shouldCapture && observabilityService != null) {
-                long durationMs = System.currentTimeMillis() - requestStartedAt;
-                String errorType = e.getClass().getSimpleName();
                 reportLlmCall(requestRecord, responseRecord, curlCommand, requestStartedAt, durationMs,
                             errorType + ": " + e.getMessage(), null, null, attempts);
             }
-            
+
             String detail = "OpenRouter provider routed chat completion failed"
                     + " (providers=" + providerOrder
                     + ", model=" + OpenAiCompatibleChatModelSupport.nvl(modelName)
@@ -455,18 +471,25 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
         return traceId;
     }
 
-    private StreamingProgressTracker createStreamingProgressTracker() {
+    private StreamingProgressTracker createStreamingProgressTracker(String llmTraceId) {
         /*
          * StreamingProgressTracker 解决的是长输出阶段「服务端还在流式返回，但前端看起来没动」
          * 的问题。它会按配置间隔写入 chunk 数、字符数、phase 等轻量进度，使 matrix poll
          * 能区分卡死、慢 summarizing、正常 tool execution 三种状态。
+         *
+         * 进度上报拆分为 observability（可选）和 live event（可选）两条独立链路：
+         * 任一链路开启时都会创建 tracker 并触发 ProgressReporter 回调，回调内部再各自判断。
          */
         String runId = AgentContext.getRunId();
         String phase = AgentContext.getPhase();
-        boolean reportEnabled = isStreamingProgressReportEnabled()
+        boolean observabilityEnabled = isStreamingProgressReportEnabled()
                 && observabilityService != null
                 && runId != null
                 && !runId.isBlank();
+        boolean liveEventEnabled = eventService != null
+                && runId != null
+                && !runId.isBlank();
+        boolean reportEnabled = observabilityEnabled || liveEventEnabled;
         return new StreamingProgressTracker(
                 log,
                 modelName,
@@ -474,14 +497,21 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
                 isSseProgressLogEnabled(),
                 reportEnabled,
                 streamingProgressUpdateIntervalMs(),
-                (snapshot, completed) -> observabilityService.recordStreamingProgress(
-                        runId,
-                        phase != null ? phase : "unknown",
-                        endpointName,
-                        modelName,
-                        snapshot,
-                        completed
-                )
+                (snapshot, completed) -> {
+                    // 写 observability（原有行为，条件已在前方判断）
+                    if (observabilityEnabled) {
+                        observabilityService.recordStreamingProgress(
+                                runId,
+                                phase != null ? phase : "unknown",
+                                endpointName,
+                                modelName,
+                                snapshot,
+                                completed
+                        );
+                    }
+                    // emit SSE live event（独立于 observability 开关）
+                    emitLlmCallDelta(llmTraceId, snapshot);
+                }
         );
     }
 
@@ -788,5 +818,123 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
         
         return curl.toString();
     }
-    
+
+    // ── SSE live event helpers ──
+
+    private void emitLlmCallStarted(String llmTraceId, boolean stream) {
+        if (eventService == null) {
+            return;
+        }
+        String runId = AgentContext.getRunId();
+        String userId = AgentContext.getUserId();
+        if (runId == null || userId == null) {
+            log.debug("Skip LLM_CALL_STARTED: missing runId or userId in AgentContext");
+            return;
+        }
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("trace_id", llmTraceId);
+        payload.put("model", nvl(modelName));
+        payload.put("endpoint", nvl(endpointName));
+        payload.put("phase", nvl(AgentContext.getPhase()));
+        payload.put("stream", stream);
+        payload.put("started_at_ms", System.currentTimeMillis());
+        try {
+            eventService.append(runId, userId, "LLM_CALL_STARTED", payload);
+        } catch (Exception e) {
+            log.warn("LLM_CALL_STARTED event emit failed (ignored): {}", e.getMessage());
+        }
+    }
+
+    private void emitLlmCallDelta(String llmTraceId, StreamingProgressTracker.StreamingProgressSnapshot snapshot) {
+        if (eventService == null || snapshot == null) {
+            return;
+        }
+        String runId = AgentContext.getRunId();
+        String userId = AgentContext.getUserId();
+        if (runId == null || userId == null) {
+            return;
+        }
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("trace_id", llmTraceId);
+        payload.put("content_chars", snapshot.contentCharCount());
+        payload.put("reasoning_chars", snapshot.reasoningCharCount());
+        payload.put("tool_call_chars", snapshot.toolCallCharCount());
+        payload.put("chunk_count", snapshot.chunkCount());
+        payload.put("chars_per_second", Math.round(snapshot.charsPerSecond() * 10.0) / 10.0);
+        // 保守估算：按 1 token ≈ 4 chars（英文字符）做上限估算
+        payload.put("estimated_output_tokens", snapshot.totalCharCount() / 4);
+        try {
+            eventService.append(runId, userId, "LLM_CALL_DELTA", payload);
+        } catch (Exception e) {
+            log.warn("LLM_CALL_DELTA event emit failed (ignored): {}", e.getMessage());
+        }
+    }
+
+    private void emitLlmCallFinished(String llmTraceId,
+                                      TokenUsage tokenUsage,
+                                      long durationMs,
+                                      Double actualCost,
+                                      String generationId,
+                                      String errorPreview,
+                                      String observabilityTraceId) {
+        if (eventService == null) {
+            return;
+        }
+        String runId = AgentContext.getRunId();
+        String userId = AgentContext.getUserId();
+        if (runId == null || userId == null) {
+            log.debug("Skip LLM_CALL_FINISHED: missing runId or userId in AgentContext");
+            return;
+        }
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("trace_id", llmTraceId);
+        payload.put("model", nvl(modelName));
+        payload.put("endpoint", nvl(endpointName));
+        payload.put("phase", nvl(AgentContext.getPhase()));
+        payload.put("duration_ms", Math.max(0L, durationMs));
+        payload.put("success", errorPreview == null);
+        if (errorPreview != null) {
+            payload.put("error_preview", errorPreview.length() > 500 ? errorPreview.substring(0, 500) : errorPreview);
+        }
+        if (tokenUsage != null) {
+            payload.put("input_tokens", tokenUsage.inputTokenCount());
+            payload.put("output_tokens", tokenUsage.outputTokenCount());
+            payload.put("total_tokens", tokenUsage.totalTokenCount());
+        }
+        if (actualCost != null) {
+            payload.put("actual_cost", actualCost);
+        }
+        if (generationId != null && !generationId.isBlank()) {
+            payload.put("generation_id", generationId);
+        }
+        if (observabilityTraceId != null && !observabilityTraceId.isBlank()) {
+            payload.put("observability_trace_id", observabilityTraceId);
+        }
+        try {
+            eventService.append(runId, userId, "LLM_CALL_FINISHED", payload);
+        } catch (Exception e) {
+            log.warn("LLM_CALL_FINISHED event emit failed (ignored): {}", e.getMessage());
+        }
+    }
+
+    /**
+     * 从 SSE 聚合结果中的 usage Map 提取 actual cost。
+     * 不依赖 raw HTTP capture，确保正常 run 也能拿到 cost。
+     */
+    @SuppressWarnings("unchecked")
+    private Double extractActualCostFromUsage(Map<String, Object> usage) {
+        if (usage == null) {
+            return null;
+        }
+        Object cost = usage.get("cost");
+        if (cost instanceof Number n) {
+            return n.doubleValue();
+        }
+        return null;
+    }
+
+    private String nvl(String value) {
+        return value == null ? "" : value;
+    }
+
 }
