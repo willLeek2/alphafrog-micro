@@ -18,9 +18,10 @@ else
   DOCKER_PROXY_HOST=${DOCKER_PROXY_HOST:-host.docker.internal}
 fi
 
-PROXY_ARGS=""
-HOST_ARGS=""
-NETWORK_ARGS=""
+# 必须初始化为数组；用空字符串会导致 docker buildx 参数错位、丢失构建上下文 PATH
+NETWORK_ARGS=()
+HOST_ARGS=()
+PROXY_ARGS=()
 
 if [ "$USE_PROXY" = "1" ] || [ "$USE_PROXY" = "true" ]; then
   if [ "$USE_PROXY_HOST_NETWORK" = "1" ] || [ "$USE_PROXY_HOST_NETWORK" = "true" ]; then
@@ -33,9 +34,11 @@ if [ "$USE_PROXY" = "1" ] || [ "$USE_PROXY" = "true" ]; then
     echo "[pythonSandbox] USE_PROXY=1, proxy=${PROXY_URL} (host-gateway)"
   fi
   export https_proxy="$PROXY_URL" http_proxy="$PROXY_URL"
-  PROXY_ARGS=(--build-arg "http_proxy=${PROXY_URL}" --build-arg "https_proxy=${PROXY_URL}")
+  PROXY_ARGS=(
+    --build-arg "http_proxy=${PROXY_URL}"
+    --build-arg "https_proxy=${PROXY_URL}"
+  )
 
-  # 构建前检查宿主机代理端口，避免 pip 重试半天才失败
   if ! (echo >/dev/tcp/127.0.0.1/"${DOCKER_PROXY_PORT}") 2>/dev/null; then
     echo "[pythonSandbox] ERROR: 宿主机 127.0.0.1:${DOCKER_PROXY_PORT} 无进程监听，请先启动 Clash 等代理。" >&2
     echo "  无代理时可: USE_PROXY=0 PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ bash $0" >&2
@@ -50,18 +53,24 @@ PIP_ARGS=()
 if [ -n "${PIP_INDEX_URL:-}" ]; then
   PIP_ARGS+=(--build-arg "PIP_INDEX_URL=${PIP_INDEX_URL}")
 fi
-
 if [ -n "${PIP_EXTRA_INDEX_URL:-}" ]; then
   PIP_ARGS+=(--build-arg "PIP_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL}")
 fi
 
-BUILD_COMMON=("${NETWORK_ARGS[@]}" "${HOST_ARGS[@]}" "${PROXY_ARGS[@]}")
-
 # Build the runtime image for the sandbox (contains numpy, pandas, etc.)
-docker build "${BUILD_COMMON[@]}" "${PIP_ARGS[@]}" \
+docker build \
+  "${NETWORK_ARGS[@]}" \
+  "${HOST_ARGS[@]}" \
+  "${PROXY_ARGS[@]}" \
+  "${PIP_ARGS[@]}" \
   -t alphafrog-sandbox-runtime:latest \
-  -f "$SCRIPT_DIR/Dockerfile.runtime" "$SCRIPT_DIR"
+  -f "$SCRIPT_DIR/Dockerfile.runtime" \
+  "$SCRIPT_DIR"
 
 # Build the service image
-docker build "${BUILD_COMMON[@]}" \
-  -t alphafrog-python-sandbox:latest "$SCRIPT_DIR"
+docker build \
+  "${NETWORK_ARGS[@]}" \
+  "${HOST_ARGS[@]}" \
+  "${PROXY_ARGS[@]}" \
+  -t alphafrog-python-sandbox:latest \
+  "$SCRIPT_DIR"
