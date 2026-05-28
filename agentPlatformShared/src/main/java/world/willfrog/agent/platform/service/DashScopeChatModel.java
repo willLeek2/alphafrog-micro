@@ -33,6 +33,7 @@ import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 
 /**
@@ -378,10 +379,27 @@ public class DashScopeChatModel implements ChatModel {
         }
         // DashScope 深度思考模型多数仅支持流式输出，stream=false 时不应开启 thinking
         // 结构化输出与 thinking 模式冲突（Json mode 不支持 enable_thinking=true）
-        boolean needsStructuredOutput = structuredOutputSpec != null;
-        if (useStream && !needsStructuredOutput) {
+        boolean structuredOutputEnabled = structuredOutputSpec != null || isStructuredOutputEnabledInConfig();
+        if (useStream && !structuredOutputEnabled) {
             applyThinkingConfig(requestJsonMap, messages);
         }
+    }
+
+    private boolean isStructuredOutputEnabledInConfig() {
+        if (localConfigLoader == null) {
+            return false;
+        }
+        Optional<AgentLlmProperties> current = localConfigLoader.current();
+        if (current == null || current.isEmpty()) {
+            return false;
+        }
+        Boolean enabled = current
+                .map(AgentLlmProperties::getRuntime)
+                .map(AgentLlmProperties.Runtime::getPlanning)
+                .map(AgentLlmProperties.Planning::getStructuredOutput)
+                .map(AgentLlmProperties.StructuredOutput::getEnabled)
+                .orElse(null);
+        return enabled == null || enabled;
     }
 
     private void applyThinkingConfig(Map<String, Object> requestJsonMap, List<ChatMessage> messages) {

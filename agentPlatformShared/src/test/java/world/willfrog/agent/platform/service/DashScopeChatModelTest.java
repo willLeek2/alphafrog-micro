@@ -7,11 +7,13 @@ import dev.langchain4j.model.chat.request.ChatRequest;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.springframework.test.util.ReflectionTestUtils;
+import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
 
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -240,6 +242,40 @@ class DashScopeChatModelTest {
     }
 
     @Test
+    void applyRequestFormatting_shouldDisableThinking_whenStructuredOutputEnabledInConfig() {
+        AgentContext.clear();
+        AgentLlmLocalConfigLoader loader = mockStructuredOutputLoader(null);
+        DashScopeChatModel model = newModel("qwen3.6-max-preview", true, mock(AgentEventService.class), loader);
+        Map<String, Object> request = new LinkedHashMap<>();
+        request.put("stream", true);
+
+        model.applyRequestFormatting(request, List.of(), true);
+
+        assertFalse(request.containsKey("response_format"), "没有当前 StructuredOutputSpec 时不应强行进入 JSON Mode");
+        assertFalse(request.containsKey("enable_thinking"), "配置启用 structuredOutput 后，DashScope 请求统一禁用 thinking");
+        assertFalse(request.containsKey("thinking_budget"), "配置启用 structuredOutput 后，DashScope 请求统一禁用 thinking_budget");
+
+        AgentContext.clear();
+    }
+
+    @Test
+    void applyRequestFormatting_shouldEnableThinking_whenStructuredOutputDisabledInConfig() {
+        AgentContext.clear();
+        AgentLlmLocalConfigLoader loader = mockStructuredOutputLoader(false);
+        DashScopeChatModel model = newModel("qwen3.6-max-preview", true, mock(AgentEventService.class), loader);
+        Map<String, Object> request = new LinkedHashMap<>();
+        request.put("stream", true);
+
+        model.applyRequestFormatting(request, List.of(), true);
+
+        assertEquals(Boolean.TRUE, request.get("enable_thinking"));
+        assertEquals(38912, request.get("thinking_budget"));
+        assertFalse(request.containsKey("response_format"));
+
+        AgentContext.clear();
+    }
+
+    @Test
     void applyRequestFormatting_shouldDisableThinking_whenStreamIsFalseEvenWithoutStructuredOutput() {
         AgentContext.clear();
         // stream=false 时，即使 structured output 未启用，也不应开启 thinking
@@ -318,6 +354,13 @@ class DashScopeChatModelTest {
     }
 
     private DashScopeChatModel newModel(String modelName, boolean enableThinking, AgentEventService eventService) {
+        return newModel(modelName, enableThinking, eventService, mock(AgentLlmLocalConfigLoader.class));
+    }
+
+    private DashScopeChatModel newModel(String modelName,
+                                        boolean enableThinking,
+                                        AgentEventService eventService,
+                                        AgentLlmLocalConfigLoader localConfigLoader) {
         return new DashScopeChatModel(
                 new ObjectMapper(),
                 "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
@@ -329,8 +372,22 @@ class DashScopeChatModelTest {
                 mock(AgentObservabilityService.class),
                 "dashscope",
                 enableThinking,
-                mock(AgentLlmLocalConfigLoader.class),
+                localConfigLoader,
                 eventService
         );
+    }
+
+    private AgentLlmLocalConfigLoader mockStructuredOutputLoader(Boolean enabled) {
+        AgentLlmProperties properties = new AgentLlmProperties();
+        AgentLlmProperties.Runtime runtime = new AgentLlmProperties.Runtime();
+        AgentLlmProperties.Planning planning = new AgentLlmProperties.Planning();
+        AgentLlmProperties.StructuredOutput structuredOutput = new AgentLlmProperties.StructuredOutput();
+        structuredOutput.setEnabled(enabled);
+        planning.setStructuredOutput(structuredOutput);
+        runtime.setPlanning(planning);
+        properties.setRuntime(runtime);
+        AgentLlmLocalConfigLoader loader = mock(AgentLlmLocalConfigLoader.class);
+        when(loader.current()).thenReturn(Optional.of(properties));
+        return loader;
     }
 }
