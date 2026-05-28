@@ -23,6 +23,7 @@ import world.willfrog.agent.platform.context.AgentContext;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
+import java.net.ProxySelector;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -44,6 +45,7 @@ import java.util.Map;
 public class DashScopeChatModel implements ChatModel {
 
     private static final HttpClient HTTP_CLIENT = HttpClient.newBuilder()
+            .proxy(ProxySelector.getDefault())
             .connectTimeout(Duration.ofSeconds(30))
             .build();
     private static final int DEFAULT_THINKING_BUDGET = 38912;
