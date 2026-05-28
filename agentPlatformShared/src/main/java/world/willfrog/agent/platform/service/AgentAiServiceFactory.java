@@ -300,7 +300,8 @@ public class AgentAiServiceFactory {
                 observabilityService,
                 resolved.endpointName(),
                 enableThinking,
-                localConfigLoader
+                localConfigLoader,
+                eventService
         );
         model.setBudgetService(budgetService);
         return model;

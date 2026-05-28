@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.model.chat.request.ChatRequest;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.context.AgentContext;
 
@@ -22,8 +23,10 @@ import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -158,7 +161,8 @@ class DashScopeChatModelTest {
                 observabilityService,
                 "dashscope",
                 true,
-                mock(AgentLlmLocalConfigLoader.class)
+                mock(AgentLlmLocalConfigLoader.class),
+                mock(AgentEventService.class)
         );
 
         String traceId = ReflectionTestUtils.invokeMethod(
@@ -252,12 +256,68 @@ class DashScopeChatModelTest {
         AgentContext.clear();
     }
 
+    @Test
+    @SuppressWarnings("unchecked")
+    void emitLlmEvents_shouldAppendDashScopeLiveEvents() {
+        AgentContext.clear();
+        AgentContext.setRunId("run-dashscope-live");
+        AgentContext.setUserId("user-1");
+        AgentContext.setPhase("planning");
+        AgentEventService eventService = mock(AgentEventService.class);
+        DashScopeChatModel model = newModel("qwen3.6-flash", true, eventService);
+
+        ReflectionTestUtils.invokeMethod(model, "emitLlmCallStarted", "trace-live-1", true);
+        ReflectionTestUtils.invokeMethod(
+                model,
+                "emitLlmCallDelta",
+                "trace-live-1",
+                new StreamingProgressTracker.StreamingProgressSnapshot(12, 8, 0, 20, 3, 2000L, 10.0)
+        );
+        ReflectionTestUtils.invokeMethod(
+                model,
+                "emitLlmCallFinished",
+                "trace-live-1",
+                null,
+                2500L,
+                null,
+                "dashscope-generation-1",
+                null,
+                "obs-trace-1"
+        );
+
+        ArgumentCaptor<String> eventTypeCaptor = ArgumentCaptor.forClass(String.class);
+        ArgumentCaptor<Object> payloadCaptor = ArgumentCaptor.forClass(Object.class);
+        verify(eventService, times(3)).append(
+                eq("run-dashscope-live"),
+                eq("user-1"),
+                eventTypeCaptor.capture(),
+                payloadCaptor.capture()
+        );
+
+        assertEquals(List.of("LLM_CALL_STARTED", "LLM_CALL_DELTA", "LLM_CALL_FINISHED"),
+                eventTypeCaptor.getAllValues());
+        Map<String, Object> deltaPayload = (Map<String, Object>) payloadCaptor.getAllValues().get(1);
+        assertEquals("trace-live-1", deltaPayload.get("trace_id"));
+        assertEquals(12, deltaPayload.get("content_chars"));
+        assertEquals(8, deltaPayload.get("reasoning_chars"));
+        assertEquals(5, deltaPayload.get("estimated_output_tokens"));
+        Map<String, Object> finishedPayload = (Map<String, Object>) payloadCaptor.getAllValues().get(2);
+        assertEquals("dashscope-generation-1", finishedPayload.get("generation_id"));
+        assertEquals("obs-trace-1", finishedPayload.get("observability_trace_id"));
+
+        AgentContext.clear();
+    }
+
     private static boolean invokeSupportsThinking(DashScopeChatModel model, String name) {
         Boolean result = ReflectionTestUtils.invokeMethod(model, "supportsThinking", name);
         return Boolean.TRUE.equals(result);
     }
 
     private DashScopeChatModel newModel(String modelName, boolean enableThinking) {
+        return newModel(modelName, enableThinking, mock(AgentEventService.class));
+    }
+
+    private DashScopeChatModel newModel(String modelName, boolean enableThinking, AgentEventService eventService) {
         return new DashScopeChatModel(
                 new ObjectMapper(),
                 "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
@@ -269,7 +329,8 @@ class DashScopeChatModelTest {
                 mock(AgentObservabilityService.class),
                 "dashscope",
                 enableThinking,
-                mock(AgentLlmLocalConfigLoader.class)
+                mock(AgentLlmLocalConfigLoader.class),
+                eventService
         );
     }
 }
