@@ -1,6 +1,7 @@
 package world.willfrog.alphafrogmicro.frontend.controller.agent;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.servlet.http.HttpServletRequest;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -8,6 +9,7 @@ import org.springframework.security.core.Authentication;
 import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.alphafrogmicro.agent.idl.AgentDubboService;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunEventMessage;
+import world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunResultMessage;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunResultRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentRunEventsRequest;
@@ -17,6 +19,7 @@ import world.willfrog.alphafrogmicro.agent.idl.SendAgentMessageResponse;
 import world.willfrog.alphafrogmicro.common.dto.ResponseCode;
 import world.willfrog.alphafrogmicro.common.pojo.user.User;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentMessageSendRequest;
+import world.willfrog.alphafrogmicro.frontend.model.agent.AgentRunCreateRequest;
 import world.willfrog.alphafrogmicro.frontend.model.agent.TimelineResponse;
 import world.willfrog.alphafrogmicro.frontend.service.AuthService;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentRunResultCacheService;
@@ -44,7 +47,11 @@ class AgentControllerTest {
         ReflectionTestUtils.setField(runResultCacheService, "agentDubboService", agentDubboService);
         ReflectionTestUtils.setField(runResultCacheService, "cacheTtlSeconds", 30L);
         controller = new AgentController(authService, new ObjectMapper(), runResultCacheService);
-        ReflectionTestUtils.setField(controller, "agentDubboService", agentDubboService);
+        ReflectionTestUtils.setField(controller, "agentDubboServiceLangchain", agentDubboService);
+        ReflectionTestUtils.setField(controller, "agentDubboServiceLegacy", agentDubboService);
+        HttpServletRequest request = mock(HttpServletRequest.class);
+        when(request.getRequestURI()).thenReturn("/api/agent/runs/run-1");
+        ReflectionTestUtils.setField(controller, "request", request);
 
         authentication = mock(Authentication.class);
         when(authentication.isAuthenticated()).thenReturn(true);
@@ -62,6 +69,24 @@ class AgentControllerTest {
                         .setRunStatus("RECEIVED")
                         .build()
         );
+    }
+
+    @Test
+    void create_shouldReturnStreamUrl() {
+        when(authService.isUserActive(any(User.class))).thenReturn(true);
+        when(agentDubboService.createRun(any())).thenReturn(
+                AgentRunMessage.newBuilder()
+                        .setId("run-new")
+                        .setStatus("RUN_RECEIVED")
+                        .build()
+        );
+
+        var response = controller.create(authentication,
+                new AgentRunCreateRequest("hello", null, null, null,
+                        null, null, null, null, null, null, null));
+
+        assertEquals(ResponseCode.SUCCESS.getCode(), response.getCode());
+        assertEquals("/api/agent/runs/run-new/stream", response.getData().streamUrl());
     }
 
     @Test

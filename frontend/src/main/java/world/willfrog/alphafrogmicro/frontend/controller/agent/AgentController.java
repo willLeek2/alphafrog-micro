@@ -1183,8 +1183,16 @@ public class AgentController {
                 emptyToNull(run.getStartedAt()),
                 emptyToNull(run.getUpdatedAt()),
                 emptyToNull(run.getCompletedAt()),
-                emptyToNull(run.getExt())
+                emptyToNull(run.getExt()),
+                streamUrl(run.getId())
         );
+    }
+
+    private String streamUrl(String runId) {
+        if (runId == null || runId.isBlank()) {
+            return null;
+        }
+        return AGENT_RUNS + "/" + runId + "/stream";
     }
 
     private AgentSnapshotPartsMetaResponse toSnapshotPartsMetaResponse(AgentSnapshotPartsMetaMessage meta) {

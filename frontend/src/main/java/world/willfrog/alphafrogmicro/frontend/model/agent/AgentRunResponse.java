@@ -12,7 +12,7 @@ public record AgentRunResponse(
         String startedAt,
         String updatedAt,
         String completedAt,
-        String ext
+        String ext,
+        String streamUrl
 ) {
 }
-

@@ -52,6 +52,7 @@ class ToolRouterToolExecutorTest {
     void execute_successfulToolCall_emitsStartedAndFinished() {
         // Given
         ToolExecutionRequest request = ToolExecutionRequest.builder()
+                .id("tool-call-1")
                 .name("getStockInfo")
                 .arguments("{\"symbol\":\"000001.SZ\"}")
                 .build();
@@ -75,6 +76,7 @@ class ToolRouterToolExecutorTest {
         ArgumentCaptor<Map<String, Object>> startedPayloadCaptor = ArgumentCaptor.forClass(Map.class);
         verify(eventService).append(eq("run-123"), eq("user-456"), eq("TOOL_CALL_STARTED"), startedPayloadCaptor.capture());
         Map<String, Object> startedPayload = startedPayloadCaptor.getValue();
+        assertEquals("tool-call-1", startedPayload.get("tool_call_id"));
         assertEquals("getStockInfo", startedPayload.get("tool_name"));
         assertEquals(Map.of("symbol", "000001.SZ"), startedPayload.get("arguments"));
 
@@ -82,12 +84,42 @@ class ToolRouterToolExecutorTest {
         ArgumentCaptor<Map<String, Object>> finishedPayloadCaptor = ArgumentCaptor.forClass(Map.class);
         verify(eventService).append(eq("run-123"), eq("user-456"), eq("TOOL_CALL_FINISHED"), finishedPayloadCaptor.capture());
         Map<String, Object> finishedPayload = finishedPayloadCaptor.getValue();
+        assertEquals("tool-call-1", finishedPayload.get("tool_call_id"));
+        assertEquals(startedPayload.get("tool_call_id"), finishedPayload.get("tool_call_id"));
         assertEquals("getStockInfo", finishedPayload.get("tool_name"));
         assertEquals(Map.of("symbol", "000001.SZ"), finishedPayload.get("arguments"));
         assertEquals(true, finishedPayload.get("success"));
         assertEquals("{\"price\":10.5}", finishedPayload.get("result_preview"));
         assertNotNull(finishedPayload.get("duration_ms"));
         assertTrue((Long) finishedPayload.get("duration_ms") >= 0);
+    }
+
+    @Test
+    void execute_missingRequestId_generatesSameToolCallIdForStartAndFinish() {
+        ToolExecutionRequest request = ToolExecutionRequest.builder()
+                .name("getStockInfo")
+                .arguments("{\"symbol\":\"000001.SZ\"}")
+                .build();
+
+        ToolRouter.ToolInvocationResult result = ToolRouter.ToolInvocationResult.builder()
+                .output("{\"price\":10.5}")
+                .success(true)
+                .durationMs(100L)
+                .build();
+
+        when(toolRouter.invokeWithMeta("getStockInfo", Map.of("symbol", "000001.SZ")))
+                .thenReturn(result);
+
+        executor.execute(request, null);
+
+        ArgumentCaptor<Map<String, Object>> startedPayloadCaptor = ArgumentCaptor.forClass(Map.class);
+        ArgumentCaptor<Map<String, Object>> finishedPayloadCaptor = ArgumentCaptor.forClass(Map.class);
+        verify(eventService).append(eq("run-123"), eq("user-456"), eq("TOOL_CALL_STARTED"), startedPayloadCaptor.capture());
+        verify(eventService).append(eq("run-123"), eq("user-456"), eq("TOOL_CALL_FINISHED"), finishedPayloadCaptor.capture());
+        Object startedId = startedPayloadCaptor.getValue().get("tool_call_id");
+        Object finishedId = finishedPayloadCaptor.getValue().get("tool_call_id");
+        assertNotNull(startedId);
+        assertEquals(startedId, finishedId);
     }
 
     @Test

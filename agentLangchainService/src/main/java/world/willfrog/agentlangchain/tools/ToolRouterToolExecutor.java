@@ -17,6 +17,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.UUID;
 
 /**
  * LC4j {@link ToolExecutor}：模型在 tool loop 里发起一次 tool call 后，由此类把请求转给
@@ -73,17 +74,18 @@ final class ToolRouterToolExecutor implements ToolExecutor {
      */
     @Override
     public String execute(ToolExecutionRequest request, Object memoryId) {
+        String toolCallId = resolveToolCallId(request);
         Map<String, Object> params = parseArguments(request.arguments());
         LangchainRepeatedToolCallGuard.Decision repeatDecision =
                 LangchainRepeatedToolCallGuard.beforeInvoke(request.name(), params, objectMapper);
         if (repeatDecision.blocked()) {
             // 重复调用被 block 时也 emit finish，避免 UI card 一直转圈
-            emitToolCallFinished(request.name(), params, false, repeatDecision.outputOrHint(), 0L);
+            emitToolCallFinished(toolCallId, request.name(), params, false, repeatDecision.outputOrHint(), 0L);
             return repeatDecision.outputOrHint();
         }
 
         // emit STARTED
-        emitToolCallStarted(request.name(), params);
+        emitToolCallStarted(toolCallId, request.name(), params);
 
         Instant start = Instant.now();
         String output = null;
@@ -98,7 +100,7 @@ final class ToolRouterToolExecutor implements ToolExecutor {
             log.warn("Tool invocation failed: tool={}, runId={}", request.name(), AgentContext.getRunId(), e);
         } finally {
             long durationMs = Duration.between(start, Instant.now()).toMillis();
-            emitToolCallFinished(request.name(), params, success, output, durationMs);
+            emitToolCallFinished(toolCallId, request.name(), params, success, output, durationMs);
         }
 
         Map<String, String> datasetRefs = LangchainDatasetRefContext.snapshot();
@@ -133,6 +135,14 @@ final class ToolRouterToolExecutor implements ToolExecutor {
         } catch (Exception ignored) {
             return Map.of("raw", arguments);
         }
+    }
+
+    private String resolveToolCallId(ToolExecutionRequest request) {
+        String id = request == null ? null : request.id();
+        if (id != null && !id.isBlank()) {
+            return id;
+        }
+        return UUID.randomUUID().toString();
     }
 
     /**
@@ -185,7 +195,7 @@ final class ToolRouterToolExecutor implements ToolExecutor {
 
     // ── Tool call event emission helpers ──
 
-    private void emitToolCallStarted(String toolName, Map<String, Object> arguments) {
+    private void emitToolCallStarted(String toolCallId, String toolName, Map<String, Object> arguments) {
         String runId = AgentContext.getRunId();
         String userId = AgentContext.getUserId();
         if (runId == null || userId == null) {
@@ -193,12 +203,13 @@ final class ToolRouterToolExecutor implements ToolExecutor {
             return;
         }
         Map<String, Object> payload = new HashMap<>();
+        payload.put("tool_call_id", toolCallId);
         payload.put("tool_name", toolName);
         payload.put("arguments", arguments);
         eventService.append(runId, userId, "TOOL_CALL_STARTED", payload);
     }
 
-    private void emitToolCallFinished(String toolName, Map<String, Object> arguments,
+    private void emitToolCallFinished(String toolCallId, String toolName, Map<String, Object> arguments,
                                       boolean success, String output, long durationMs) {
         String runId = AgentContext.getRunId();
         String userId = AgentContext.getUserId();
@@ -207,6 +218,7 @@ final class ToolRouterToolExecutor implements ToolExecutor {
             return;
         }
         Map<String, Object> payload = new HashMap<>();
+        payload.put("tool_call_id", toolCallId);
         payload.put("tool_name", toolName);
         payload.put("arguments", arguments);
         payload.put("success", success);
