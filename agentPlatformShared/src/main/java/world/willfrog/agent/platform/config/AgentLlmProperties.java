@@ -140,6 +140,8 @@ public class AgentLlmProperties {
         private Double baseRate;
         private List<String> features = new ArrayList<>();
         private List<String> validProviders = new ArrayList<>();
+        /** 模型级 max_completion_tokens 覆盖；null 则使用 endpoint / 全局默认值 */
+        private Integer maxTokens;
 
         public String getDisplayName() {
             return displayName;
@@ -171,6 +173,14 @@ public class AgentLlmProperties {
 
         public void setValidProviders(List<String> validProviders) {
             this.validProviders = validProviders == null ? new ArrayList<>() : validProviders;
+        }
+
+        public Integer getMaxTokens() {
+            return maxTokens;
+        }
+
+        public void setMaxTokens(Integer maxTokens) {
+            this.maxTokens = maxTokens;
         }
     }
 

@@ -80,6 +80,30 @@ class DashScopeChatModelTest {
     }
 
     @Test
+    void applyThinkingConfig_shouldCapThinkingBudgetWhenMaxCompletionTokensTooSmall() {
+        DashScopeChatModel model = newModel("qwen3.6-flash", true);
+        Map<String, Object> request = new LinkedHashMap<>();
+        request.put("max_completion_tokens", 8192);
+
+        ReflectionTestUtils.invokeMethod(model, "applyThinkingConfig", request, java.util.List.of());
+
+        assertEquals(Boolean.TRUE, request.get("enable_thinking"));
+        assertEquals(8191, request.get("thinking_budget"));
+    }
+
+    @Test
+    void applyThinkingConfig_shouldKeepDefaultThinkingBudgetWhenMaxCompletionTokensLargeEnough() {
+        DashScopeChatModel model = newModel("qwen3.6-flash", true);
+        Map<String, Object> request = new LinkedHashMap<>();
+        request.put("max_completion_tokens", 40000);
+
+        ReflectionTestUtils.invokeMethod(model, "applyThinkingConfig", request, java.util.List.of());
+
+        assertEquals(Boolean.TRUE, request.get("enable_thinking"));
+        assertEquals(38912, request.get("thinking_budget"));
+    }
+
+    @Test
     void extractThinkingContent_shouldSplitThinkTags() {
         DashScopeChatModel model = newModel("qwen3.6-max-preview", true);
 

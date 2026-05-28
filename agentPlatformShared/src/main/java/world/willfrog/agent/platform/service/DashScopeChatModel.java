@@ -358,7 +358,15 @@ public class DashScopeChatModel implements ChatModel {
             return;
         }
         requestJsonMap.put("enable_thinking", true);
-        requestJsonMap.put("thinking_budget", DEFAULT_THINKING_BUDGET);
+        int thinkingBudget = DEFAULT_THINKING_BUDGET;
+        Object mct = requestJsonMap.get("max_completion_tokens");
+        if (mct instanceof Number n) {
+            int maxCompletionTokens = n.intValue();
+            if (maxCompletionTokens > 0 && maxCompletionTokens <= thinkingBudget) {
+                thinkingBudget = Math.max(1, maxCompletionTokens - 1);
+            }
+        }
+        requestJsonMap.put("thinking_budget", thinkingBudget);
     }
 
     private boolean supportsThinking(String modelName) {

@@ -45,7 +45,7 @@ class SearchEvidenceJudgeServiceTest {
                 .modelName("small-model")
                 .build();
         var resolved = new AgentLlmResolver.ResolvedLlm(
-                "cheap-judge", "https://example.com/v1", "small-model", "key", "", List.of());
+                "cheap-judge", "https://example.com/v1", "small-model", "key", "", List.of(), null);
         when(selectorService.selectCandidates()).thenReturn(List.of(selection));
         when(aiServiceFactory.resolveLlm("cheap-judge", "small-model")).thenReturn(resolved);
         when(aiServiceFactory.buildChatModelWithProviderOrderAndTemperature(resolved, List.of(), 0.0D))
@@ -182,7 +182,7 @@ class SearchEvidenceJudgeServiceTest {
                 .modelName("small-model")
                 .build();
         var resolved = new AgentLlmResolver.ResolvedLlm(
-                "cheap-judge", "https://example.com/v1", "small-model", "key", "", List.of());
+                "cheap-judge", "https://example.com/v1", "small-model", "key", "", List.of(), null);
         when(selectorService.selectCandidates()).thenReturn(List.of(selection));
         when(aiServiceFactory.resolveLlm("cheap-judge", "small-model")).thenReturn(resolved);
         when(aiServiceFactory.buildChatModelWithProviderOrderAndTemperature(resolved, List.of(), 0.0D))

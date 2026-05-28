@@ -75,7 +75,7 @@ public class AgentAiServiceFactory {
             throw new IllegalArgumentException("LLM api key 未配置: endpoint=" + resolved.endpointName());
         }
         double finalTemperature = temperatureOverride == null ? (temperature == null ? 0.7D : temperature) : temperatureOverride;
-        int effectiveMaxTokens = resolveMaxTokens(maxTokensOverride);
+        int effectiveMaxTokens = resolveMaxTokens(resolved, maxTokensOverride);
         if (isDashScopeEndpoint(resolved)) {
             return buildDashScopeChatModel(resolved, apiKey, finalTemperature, effectiveMaxTokens);
         }
@@ -106,7 +106,7 @@ public class AgentAiServiceFactory {
                                                                            Double temperatureOverride,
                                                                            Integer maxTokensOverride) {
         List<String> normalizedProviderOrder = sanitizeProviderOrder(providerOrder);
-        int effectiveMaxTokens = resolveMaxTokens(maxTokensOverride);
+        int effectiveMaxTokens = resolveMaxTokens(resolved, maxTokensOverride);
         // ALP-25: 对所有端点使用 OpenRouterProviderRoutedChatModel 以支持 HTTP 捕获
         if (isDashScopeEndpoint(resolved)) {
             String apiKey = isBlank(resolved.apiKey()) ? openAiApiKey : resolved.apiKey();
@@ -158,7 +158,7 @@ public class AgentAiServiceFactory {
             throw new IllegalArgumentException("LLM api key 未配置: endpoint=" + resolved.endpointName());
         }
         List<String> normalizedProviderOrder = sanitizeProviderOrder(providerOrder);
-        int effectiveMaxTokens = resolveMaxTokens(maxTokensOverride);
+        int effectiveMaxTokens = resolveMaxTokens(resolved, maxTokensOverride);
         // ALP-25: 对所有端点使用 OpenRouterProviderRoutedChatModel 以支持 HTTP 捕获
         if (isDashScopeEndpoint(resolved)) {
             return buildDashScopeChatModel(resolved, apiKey, temperature, effectiveMaxTokens);
@@ -306,9 +306,12 @@ public class AgentAiServiceFactory {
         return model;
     }
 
-    private int resolveMaxTokens(Integer maxTokensOverride) {
+    private int resolveMaxTokens(AgentLlmResolver.ResolvedLlm resolved, Integer maxTokensOverride) {
         if (maxTokensOverride != null && maxTokensOverride > 0) {
             return maxTokensOverride;
+        }
+        if (resolved != null && resolved.maxTokens() != null && resolved.maxTokens() > 0) {
+            return resolved.maxTokens();
         }
         return maxTokens != null && maxTokens > 0 ? maxTokens : 4096;
     }
