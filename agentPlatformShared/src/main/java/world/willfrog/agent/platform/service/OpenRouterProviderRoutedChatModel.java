@@ -343,7 +343,7 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
             // ALP-25：上报成功观测（含 raw HTTP）
             String observabilityTraceId = null;
             if (shouldCapture && observabilityService != null) {
-                observabilityTraceId = reportLlmCall(requestRecord, responseRecord, curlCommand, requestStartedAt, durationMs, null,
+                observabilityTraceId = reportLlmCall(llmTraceId, requestRecord, responseRecord, curlCommand, requestStartedAt, durationMs, null,
                         reasoningContent, progressSnapshot, attemptResult.attempts());
             }
 
@@ -369,7 +369,7 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
 
             // ALP-25：上报中断错误
             if (shouldCapture && observabilityService != null) {
-                reportLlmCall(requestRecord, responseRecord, curlCommand, requestStartedAt, durationMs, "INTERRUPTED",
+                reportLlmCall(llmTraceId, requestRecord, responseRecord, curlCommand, requestStartedAt, durationMs, "INTERRUPTED",
                         null, null, List.of());
             }
 
@@ -386,7 +386,7 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
 
             // ALP-25：上报异常
             if (shouldCapture && observabilityService != null) {
-                reportLlmCall(requestRecord, responseRecord, curlCommand, requestStartedAt, durationMs,
+                reportLlmCall(llmTraceId, requestRecord, responseRecord, curlCommand, requestStartedAt, durationMs,
                             errorType + ": " + e.getMessage(), null, null, attempts);
             }
 
@@ -407,6 +407,7 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
      * attempts 参数的版本，把每次 HTTP attempt 的状态码、耗时、错误摘要一起写入 trace。</p>
      */
     private String reportLlmCall(
+            String llmCallId,
             RawHttpLogger.HttpRequestRecord request,
             RawHttpLogger.HttpResponseRecord response,
             String curlCommand,
@@ -415,11 +416,12 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
             String errorMessage,
             String thinkingContent,
             StreamingProgressTracker.StreamingProgressSnapshot streamingProgress) {
-        return reportLlmCall(request, response, curlCommand, startedAtMillis, durationMs, errorMessage,
+        return reportLlmCall(llmCallId, request, response, curlCommand, startedAtMillis, durationMs, errorMessage,
                 thinkingContent, streamingProgress, List.of());
     }
 
     private String reportLlmCall(
+            String llmCallId,
             RawHttpLogger.HttpRequestRecord request,
             RawHttpLogger.HttpResponseRecord response,
             String curlCommand,
@@ -451,7 +453,7 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
         Integer cachedTokens = OpenAiCompatibleChatModelSupport.extractCachedTokensFromResponse(objectMapper, response, log);
         long completedAtMillis = startedAtMillis + durationMs;
         
-        String traceId = observabilityService.recordLlmCallWithRawHttp(
+        return observabilityService.recordLlmCallWithRawHttp(
                 runId,
                 phase != null ? phase : "unknown",
                 tokenUsage,
@@ -467,10 +469,9 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
                 request,
                 response,
                 curlCommand,
-                attempts
+                attempts,
+                llmCallId
         );
-        AgentContext.setProviderLlmTraceId(traceId);
-        return traceId;
     }
 
     private StreamingProgressTracker createStreamingProgressTracker(String llmTraceId) {
@@ -834,10 +835,11 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
             return;
         }
         Map<String, Object> payload = new LinkedHashMap<>();
-        payload.put("trace_id", llmTraceId);
+        AgentSsePayloadSupport.putLlmCallIds(payload, llmTraceId);
         payload.put("model", nvl(modelName));
         payload.put("endpoint", nvl(endpointName));
         payload.put("phase", nvl(AgentContext.getPhase()));
+        AgentSsePayloadSupport.putExecutionAttribution(payload);
         payload.put("stream", stream);
         payload.put("started_at_ms", System.currentTimeMillis());
         try {
@@ -857,7 +859,8 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
             return;
         }
         Map<String, Object> payload = new LinkedHashMap<>();
-        payload.put("trace_id", llmTraceId);
+        AgentSsePayloadSupport.putLlmCallIds(payload, llmTraceId);
+        AgentSsePayloadSupport.putExecutionAttribution(payload);
         payload.put("content_chars", snapshot.contentCharCount());
         payload.put("reasoning_chars", snapshot.reasoningCharCount());
         payload.put("tool_call_chars", snapshot.toolCallCharCount());
@@ -889,10 +892,11 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
             return;
         }
         Map<String, Object> payload = new LinkedHashMap<>();
-        payload.put("trace_id", llmTraceId);
+        AgentSsePayloadSupport.putLlmCallIds(payload, llmTraceId);
         payload.put("model", nvl(modelName));
         payload.put("endpoint", nvl(endpointName));
         payload.put("phase", nvl(AgentContext.getPhase()));
+        AgentSsePayloadSupport.putExecutionAttribution(payload);
         payload.put("duration_ms", Math.max(0L, durationMs));
         payload.put("success", errorPreview == null);
         if (errorPreview != null) {

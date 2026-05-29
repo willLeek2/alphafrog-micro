@@ -546,7 +546,29 @@ public class AgentObservabilityService {
             RawHttpLogger.HttpResponseRecord httpResponse,
             String curlCommand) {
         return recordLlmCallWithRawHttp(runId, phase, tokenUsage, cachedTokens, durationMs, startedAtMillis, completedAtMillis,
-                endpointName, modelName, errorMessage, thinkingContent, streamingProgress, httpRequest, httpResponse, curlCommand, List.of());
+                endpointName, modelName, errorMessage, thinkingContent, streamingProgress, httpRequest, httpResponse, curlCommand, List.of(), null);
+    }
+
+    /** 同上，且显式指定 traceId（与 SSE {@code llm_call_id} 对齐）。 */
+    public String recordLlmCallWithRawHttp(
+            String runId,
+            String phase,
+            TokenUsage tokenUsage,
+            Integer cachedTokens,
+            long durationMs,
+            long startedAtMillis,
+            long completedAtMillis,
+            String endpointName,
+            String modelName,
+            String errorMessage,
+            String thinkingContent,
+            StreamingProgressTracker.StreamingProgressSnapshot streamingProgress,
+            RawHttpLogger.HttpRequestRecord httpRequest,
+            RawHttpLogger.HttpResponseRecord httpResponse,
+            String curlCommand,
+            String traceIdOverride) {
+        return recordLlmCallWithRawHttp(runId, phase, tokenUsage, cachedTokens, durationMs, startedAtMillis, completedAtMillis,
+                endpointName, modelName, errorMessage, thinkingContent, streamingProgress, httpRequest, httpResponse, curlCommand, List.of(), traceIdOverride);
     }
 
     /**
@@ -578,12 +600,39 @@ public class AgentObservabilityService {
             RawHttpLogger.HttpResponseRecord httpResponse,
             String curlCommand,
             List<Map<String, Object>> attempts) {
-        // 与 recordLlmCall 一致：若 provider 层已上报 trace，直接复用 traceId 避免重复
-        String providerTraceId = AgentContext.consumeProviderLlmTraceId();
-        if (providerTraceId != null && !providerTraceId.isBlank()) {
-            return providerTraceId;
+        return recordLlmCallWithRawHttp(runId, phase, tokenUsage, cachedTokens, durationMs, startedAtMillis, completedAtMillis,
+                endpointName, modelName, errorMessage, thinkingContent, streamingProgress, httpRequest, httpResponse, curlCommand, attempts, null);
+    }
+
+    public String recordLlmCallWithRawHttp(
+            String runId,
+            String phase,
+            TokenUsage tokenUsage,
+            Integer cachedTokens,
+            long durationMs,
+            long startedAtMillis,
+            long completedAtMillis,
+            String endpointName,
+            String modelName,
+            String errorMessage,
+            String thinkingContent,
+            StreamingProgressTracker.StreamingProgressSnapshot streamingProgress,
+            RawHttpLogger.HttpRequestRecord httpRequest,
+            RawHttpLogger.HttpResponseRecord httpResponse,
+            String curlCommand,
+            List<Map<String, Object>> attempts,
+            String traceIdOverride) {
+        final String traceId;
+        if (traceIdOverride != null && !traceIdOverride.isBlank()) {
+            traceId = traceIdOverride;
+        } else {
+            // 与 recordLlmCall 一致：若 provider 层已上报 trace，直接复用 traceId 避免重复
+            String providerTraceId = AgentContext.consumeProviderLlmTraceId();
+            if (providerTraceId != null && !providerTraceId.isBlank()) {
+                return providerTraceId;
+            }
+            traceId = newTraceId();
         }
-        String traceId = newTraceId();
         String stage = resolveStage(null);
         String rawResponseBody = httpResponse == null ? null : httpResponse.getBody();
         ReasoningExtraction reasoning = extractReasoning(rawResponseBody);

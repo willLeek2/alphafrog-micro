@@ -49,7 +49,11 @@ class ToolRouterToolExecutorTest {
     }
 
     @Test
-    void execute_successfulToolCall_emitsStartedAndFinished() {
+    void execute_successfulToolCall_emitsStartedAndFinishedWithAttribution() {
+        AgentContext.setPhase("linear_execution");
+        AgentContext.setStage("todo_execution");
+        AgentContext.setTodoContext("todo-1", 1);
+        AgentContext.setWorkflow("linear");
         // Given
         ToolExecutionRequest request = ToolExecutionRequest.builder()
                 .id("tool-call-1")
@@ -79,6 +83,10 @@ class ToolRouterToolExecutorTest {
         assertEquals("tool-call-1", startedPayload.get("tool_call_id"));
         assertEquals("getStockInfo", startedPayload.get("tool_name"));
         assertEquals(Map.of("symbol", "000001.SZ"), startedPayload.get("arguments"));
+        assertEquals("linear_execution", startedPayload.get("phase"));
+        assertEquals("todo-1", startedPayload.get("todo_id"));
+        assertEquals(1, startedPayload.get("todo_sequence"));
+        assertEquals("linear", startedPayload.get("workflow"));
 
         // Verify TOOL_CALL_FINISHED
         ArgumentCaptor<Map<String, Object>> finishedPayloadCaptor = ArgumentCaptor.forClass(Map.class);
@@ -92,6 +100,8 @@ class ToolRouterToolExecutorTest {
         assertEquals("{\"price\":10.5}", finishedPayload.get("result_preview"));
         assertNotNull(finishedPayload.get("duration_ms"));
         assertTrue((Long) finishedPayload.get("duration_ms") >= 0);
+        assertEquals("todo-1", finishedPayload.get("todo_id"));
+        assertEquals("linear", finishedPayload.get("workflow"));
     }
 
     @Test

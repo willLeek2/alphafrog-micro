@@ -10,6 +10,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentSsePayloadSupport;
 import world.willfrog.agent.workflow.DatasetRefRegistry;
 import world.willfrog.agent.tools.router.ToolRouter;
 
@@ -206,6 +207,11 @@ final class ToolRouterToolExecutor implements ToolExecutor {
         payload.put("tool_call_id", toolCallId);
         payload.put("tool_name", toolName);
         payload.put("arguments", arguments);
+        String phase = AgentContext.getPhase();
+        if (phase != null && !phase.isBlank()) {
+            payload.put("phase", phase);
+        }
+        AgentSsePayloadSupport.putExecutionAttribution(payload);
         eventService.append(runId, userId, "TOOL_CALL_STARTED", payload);
     }
 
@@ -224,6 +230,11 @@ final class ToolRouterToolExecutor implements ToolExecutor {
         payload.put("success", success);
         payload.put("result_preview", preview(output));
         payload.put("duration_ms", durationMs);
+        String phase = AgentContext.getPhase();
+        if (phase != null && !phase.isBlank()) {
+            payload.put("phase", phase);
+        }
+        AgentSsePayloadSupport.putExecutionAttribution(payload);
         eventService.append(runId, userId, "TOOL_CALL_FINISHED", payload);
     }
 

@@ -245,7 +245,7 @@ public class DashScopeChatModel implements ChatModel {
 
             String observabilityTraceId = null;
             if (shouldCapture && observabilityService != null) {
-                observabilityTraceId = reportLlmCall(requestRecord, responseRecord, curlCommand, requestStartedAt, durationMs, null,
+                observabilityTraceId = reportLlmCall(llmTraceId, requestRecord, responseRecord, curlCommand, requestStartedAt, durationMs, null,
                         finalThinking, progressSnapshot);
             }
             emitLlmCallFinished(llmTraceId, tokenUsage, durationMs, actualCost, generationId, null, observabilityTraceId);
@@ -263,7 +263,7 @@ public class DashScopeChatModel implements ChatModel {
             long durationMs = System.currentTimeMillis() - requestStartedAt;
             String observabilityTraceId = null;
             if (shouldCapture && observabilityService != null) {
-                observabilityTraceId = reportLlmCall(requestRecord, responseRecord, curlCommand, requestStartedAt, durationMs, "INTERRUPTED",
+                observabilityTraceId = reportLlmCall(llmTraceId, requestRecord, responseRecord, curlCommand, requestStartedAt, durationMs, "INTERRUPTED",
                         null, null);
             }
             if (liveEventStarted) {
@@ -278,7 +278,7 @@ public class DashScopeChatModel implements ChatModel {
             String observabilityTraceId = null;
             if (shouldCapture && observabilityService != null) {
                 String errorType = e.getClass().getSimpleName();
-                observabilityTraceId = reportLlmCall(requestRecord, responseRecord, curlCommand, requestStartedAt, durationMs,
+                observabilityTraceId = reportLlmCall(llmTraceId, requestRecord, responseRecord, curlCommand, requestStartedAt, durationMs,
                         errorType + ": " + e.getMessage(), null, null);
             }
             if (liveEventStarted) {
@@ -322,6 +322,7 @@ public class DashScopeChatModel implements ChatModel {
     }
 
     private String reportLlmCall(
+            String llmCallId,
             RawHttpLogger.HttpRequestRecord request,
             RawHttpLogger.HttpResponseRecord response,
             String curlCommand,
@@ -346,7 +347,7 @@ public class DashScopeChatModel implements ChatModel {
         Integer cachedTokens = OpenAiCompatibleChatModelSupport.extractCachedTokensFromResponse(objectMapper, response, log);
         long completedAtMillis = startedAtMillis + durationMs;
 
-        String traceId = observabilityService.recordLlmCallWithRawHttp(
+        return observabilityService.recordLlmCallWithRawHttp(
                 runId,
                 phase != null ? phase : "unknown",
                 tokenUsage,
@@ -361,10 +362,9 @@ public class DashScopeChatModel implements ChatModel {
                 streamingProgress,
                 request,
                 response,
-                curlCommand
+                curlCommand,
+                llmCallId
         );
-        AgentContext.setProviderLlmTraceId(traceId);
-        return traceId;
     }
 
     /**
@@ -581,10 +581,11 @@ public class DashScopeChatModel implements ChatModel {
             return;
         }
         Map<String, Object> payload = new LinkedHashMap<>();
-        payload.put("trace_id", llmTraceId);
+        AgentSsePayloadSupport.putLlmCallIds(payload, llmTraceId);
         payload.put("model", OpenAiCompatibleChatModelSupport.nvl(modelName));
         payload.put("endpoint", OpenAiCompatibleChatModelSupport.nvl(endpointName));
         payload.put("phase", OpenAiCompatibleChatModelSupport.nvl(AgentContext.getPhase()));
+        AgentSsePayloadSupport.putExecutionAttribution(payload);
         payload.put("stream", stream);
         payload.put("started_at_ms", System.currentTimeMillis());
         try {
@@ -604,7 +605,8 @@ public class DashScopeChatModel implements ChatModel {
             return;
         }
         Map<String, Object> payload = new LinkedHashMap<>();
-        payload.put("trace_id", llmTraceId);
+        AgentSsePayloadSupport.putLlmCallIds(payload, llmTraceId);
+        AgentSsePayloadSupport.putExecutionAttribution(payload);
         payload.put("content_chars", snapshot.contentCharCount());
         payload.put("reasoning_chars", snapshot.reasoningCharCount());
         payload.put("tool_call_chars", snapshot.toolCallCharCount());
@@ -635,10 +637,11 @@ public class DashScopeChatModel implements ChatModel {
             return;
         }
         Map<String, Object> payload = new LinkedHashMap<>();
-        payload.put("trace_id", llmTraceId);
+        AgentSsePayloadSupport.putLlmCallIds(payload, llmTraceId);
         payload.put("model", OpenAiCompatibleChatModelSupport.nvl(modelName));
         payload.put("endpoint", OpenAiCompatibleChatModelSupport.nvl(endpointName));
         payload.put("phase", OpenAiCompatibleChatModelSupport.nvl(AgentContext.getPhase()));
+        AgentSsePayloadSupport.putExecutionAttribution(payload);
         payload.put("duration_ms", Math.max(0L, durationMs));
         payload.put("success", errorPreview == null);
         if (errorPreview != null) {

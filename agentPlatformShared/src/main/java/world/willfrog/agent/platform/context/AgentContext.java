@@ -44,6 +44,10 @@ public class AgentContext {
     private static final ThreadLocal<String> TODO_ID_HOLDER = new ThreadLocal<>();
     /** 当前 Todo 在 Plan 中的 sequence(顺序号) */
     private static final ThreadLocal<Integer> TODO_SEQUENCE_HOLDER = new ThreadLocal<>();
+    /**
+     * 当前 run 的工作流形态（{@code linear} / {@code dag}），由 executor 在进入执行期时设置。
+     */
+    private static final ThreadLocal<String> WORKFLOW_HOLDER = new ThreadLocal<>();
     /** Sub-Agent 内的步骤索引,用于观测 sub-agent 多步执行的归类 */
     private static final ThreadLocal<Integer> SUB_AGENT_STEP_INDEX_HOLDER = new ThreadLocal<>();
     /** Python 沙箱代码二次重写(refine)的尝试次数,用于观测和限流 */
@@ -165,6 +169,25 @@ public class AgentContext {
     /** 获取当前 Todo 的 sequence。 */
     public static Integer getTodoSequence() {
         return TODO_SEQUENCE_HOLDER.get();
+    }
+
+    /** 设置当前 run 的工作流形态（{@code linear} / {@code dag}）。 */
+    public static void setWorkflow(String workflow) {
+        if (workflow == null || workflow.isBlank()) {
+            WORKFLOW_HOLDER.remove();
+            return;
+        }
+        WORKFLOW_HOLDER.set(workflow);
+    }
+
+    /** 获取当前工作流形态。 */
+    public static String getWorkflow() {
+        return WORKFLOW_HOLDER.get();
+    }
+
+    /** 清理工作流形态。 */
+    public static void clearWorkflow() {
+        WORKFLOW_HOLDER.remove();
     }
 
     /** 设置 Sub-Agent 的步骤索引。 */
@@ -474,7 +497,8 @@ public class AgentContext {
                 WEB_SEARCH_CONFIG_HOLDER.get(),
                 EXTRACTED_ENTITIES_HOLDER.get(),
                 getReasoningEffort(),
-                getStageConfig()
+                getStageConfig(),
+                getWorkflow()
         );
     }
 
@@ -537,6 +561,11 @@ public class AgentContext {
         } else {
             setStageConfig(snapshot.stageConfig());
         }
+        if (snapshot.workflow() == null) {
+            clearWorkflow();
+        } else {
+            setWorkflow(snapshot.workflow());
+        }
     }
 
     /**
@@ -552,6 +581,7 @@ public class AgentContext {
         clearPhase();
         clearStage();
         clearTodoContext();
+        clearWorkflow();
         clearSubAgentStepIndex();
         clearPythonRefineAttempt();
         clearDecisionContext();
@@ -603,6 +633,7 @@ public class AgentContext {
      * @param extractedEntities   Planner 提取的实体列表
      * @param reasoningEffort     OpenRouter reasoning 强度
      * @param stageConfig         阶段级 LLM 配置
+     * @param workflow            工作流形态（linear / dag）
      */
     public record ContextSnapshot(
             String runId,
@@ -612,7 +643,8 @@ public class AgentContext {
             WebSearchConfig webSearchConfig,
             List<String> extractedEntities,
             String reasoningEffort,
-            RunStageConfig stageConfig
+            RunStageConfig stageConfig,
+            String workflow
     ) {
     }
 

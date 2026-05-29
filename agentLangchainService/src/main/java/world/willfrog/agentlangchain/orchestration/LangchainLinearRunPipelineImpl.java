@@ -193,10 +193,12 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                     .build());
 
             boolean useDag = LangchainWorkflowRouting.shouldUseDag(plan);
+            persistPlan(runId, userId, plan);
             eventService.append(runId, userId, "PLAN_READY", Map.of(
                     "execution_mode", plan.getExecutionMode() == null ? "AUTO" : plan.getExecutionMode().name(),
                     "workflow", useDag ? "dag" : "linear",
-                    "todo_count", plan.getItems() == null ? 0 : plan.getItems().size()
+                    "todo_count", plan.getItems() == null ? 0 : plan.getItems().size(),
+                    "plan", plan
             ));
 
             if (abortIfStopped(runId, userId, "before_execution")) {
@@ -248,6 +250,15 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         } finally {
             // 异步线程会被线程池复用，必须清理 ThreadLocal（线程本地变量），避免下一个 run 继承上一个 run 的 phase/todo/provider 信息。
             AgentContext.clear();
+        }
+    }
+
+    private void persistPlan(String runId, String userId, LangchainTodoPlan plan) {
+        String planJson = writeJson(plan);
+        runMapper.updatePlanJson(runId, userId, planJson);
+        AgentRunStateStore stateStore = stateStoreProvider.getIfAvailable();
+        if (stateStore != null) {
+            stateStore.recordPlan(runId, planJson, true);
         }
     }
 

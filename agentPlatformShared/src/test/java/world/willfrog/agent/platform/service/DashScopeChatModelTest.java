@@ -17,6 +17,7 @@ import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -131,12 +132,12 @@ class DashScopeChatModelTest {
     }
 
     @Test
-    void reportLlmCall_shouldExposeProviderTraceIdForOuterDedup() {
+    void reportLlmCall_shouldPassLlmCallIdAsTraceIdOverride() {
         AgentContext.clear();
         AgentContext.setRunId("run-dashscope-trace");
         AgentObservabilityService observabilityService = mock(AgentObservabilityService.class);
         when(observabilityService.recordLlmCallWithRawHttp(
-                anyString(),
+                eq("run-dashscope-trace"),
                 anyString(),
                 any(),
                 any(),
@@ -150,8 +151,9 @@ class DashScopeChatModelTest {
                 isNull(),
                 isNull(),
                 isNull(),
-                isNull()
-        )).thenReturn("trace-dashscope-1");
+                isNull(),
+                eq("llm-call-1")
+        )).thenReturn("llm-call-1");
         DashScopeChatModel model = new DashScopeChatModel(
                 new ObjectMapper(),
                 "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
@@ -170,6 +172,7 @@ class DashScopeChatModelTest {
         String traceId = ReflectionTestUtils.invokeMethod(
                 model,
                 "reportLlmCall",
+                "llm-call-1",
                 null,
                 null,
                 null,
@@ -180,8 +183,8 @@ class DashScopeChatModelTest {
                 null
         );
 
-        assertEquals("trace-dashscope-1", traceId);
-        assertEquals("trace-dashscope-1", AgentContext.consumeProviderLlmTraceId());
+        assertEquals("llm-call-1", traceId);
+        assertTrue(AgentContext.consumeProviderLlmTraceId() == null);
         AgentContext.clear();
     }
 
@@ -332,7 +335,11 @@ class DashScopeChatModelTest {
 
         assertEquals(List.of("LLM_CALL_STARTED", "LLM_CALL_DELTA", "LLM_CALL_FINISHED"),
                 eventTypeCaptor.getAllValues());
+        Map<String, Object> startedPayload = (Map<String, Object>) payloadCaptor.getAllValues().get(0);
+        assertEquals("trace-live-1", startedPayload.get("llm_call_id"));
+        assertEquals("trace-live-1", startedPayload.get("trace_id"));
         Map<String, Object> deltaPayload = (Map<String, Object>) payloadCaptor.getAllValues().get(1);
+        assertEquals("trace-live-1", deltaPayload.get("llm_call_id"));
         assertEquals("trace-live-1", deltaPayload.get("trace_id"));
         assertEquals(12, deltaPayload.get("content_chars"));
         assertEquals(8, deltaPayload.get("reasoning_chars"));

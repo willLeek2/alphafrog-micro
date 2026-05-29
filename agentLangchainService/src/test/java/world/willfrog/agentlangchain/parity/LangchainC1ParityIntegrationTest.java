@@ -7,6 +7,7 @@ import dev.langchain4j.model.chat.response.ChatResponse;
 import org.junit.jupiter.api.Test;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agentlangchain.orchestration.LangchainLinearRunPipelineImpl;
 import world.willfrog.agentlangchain.orchestration.LangchainLinearWorkflowExecutor;
 import world.willfrog.agentlangchain.orchestration.LangchainRunExecutionGuard;
@@ -33,7 +34,8 @@ class LangchainC1ParityIntegrationTest {
     private final LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
             LangchainTestFixtures.planner(),
             LangchainTestFixtures.todoNodeExecutor(),
-            noopExecutionGuard()
+            noopExecutionGuard(),
+            mock(AgentEventService.class)
     );
 
     @Test

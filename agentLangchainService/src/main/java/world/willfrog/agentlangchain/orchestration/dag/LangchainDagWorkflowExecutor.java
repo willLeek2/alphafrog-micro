@@ -107,6 +107,7 @@ public class LangchainDagWorkflowExecutor {
         AtomicInteger toolCalls = new AtomicInteger();
         try {
             applyRunContext(request);
+            AgentContext.setWorkflow("dag");
             List<TodoItem> items = plan.getItems() == null ? List.of() : plan.getItems();
             // 从 todo items 构建 DAG 图：解析每个 item 的 dependsOn（依赖列表）
             LangchainDagExecutionGraph graph = LangchainDagExecutionGraph.from(items);
@@ -333,6 +334,7 @@ public class LangchainDagWorkflowExecutor {
                              AtomicInteger completedCount) {
         String runId = request.getRunId();
         String userId = request.getUserId();
+        long nodeStartMs = 0;
         try {
             // 1. 检查是否被用户取消（cancel/pause）
             Optional<String> stop = executionGuard.stopReason(runId, userId);
@@ -343,6 +345,10 @@ public class LangchainDagWorkflowExecutor {
                         .build();
                 results.put(item.getId(), interrupted);
                 nodeSuccess.put(item.getId(), false);
+                stateRecorder.persistNodeState(runId, items, workflowStateLock, nodeStates,
+                        item, TodoStatus.FAILED, interrupted, toolCalls.get());
+                emitEventBestEffort(runId, userId, "TODO_NODE_FAILED", todoNodeResultPayload(
+                        item, false, interrupted.getSummary(), 0, 0, "RUN_CANCELED"));
                 return;
             }
             // 2. 恢复父线程的 AgentContext，确保 observability trace 关联正确
@@ -355,23 +361,31 @@ public class LangchainDagWorkflowExecutor {
                 nodeSuccess.put(item.getId(), false);
                 stateRecorder.persistNodeState(runId, items, workflowStateLock, nodeStates,
                         item, TodoStatus.SKIPPED, skipped, toolCalls.get());
-                if (!isBlank(runId) && !isBlank(userId)) {
-                    eventService.append(runId, userId, "DAG_NODE_SKIPPED", Map.of(
-                            "todo_id", item.getId(),
-                            "failed_dependency", failedDependency
-                    ));
-                }
+                emitEventBestEffort(runId, userId, "DAG_NODE_SKIPPED", Map.of(
+                        "todo_id", item.getId(),
+                        "failed_dependency", failedDependency
+                ));
+                Map<String, Object> skippedPayload = new LinkedHashMap<>();
+                skippedPayload.put("todo_id", item.getId());
+                skippedPayload.put("todo_sequence", item.getSequence());
+                skippedPayload.put("workflow", nvl(AgentContext.getWorkflow(), "dag"));
+                skippedPayload.put("phase", "execution");
+                skippedPayload.put("reason", "dependency_failed");
+                skippedPayload.put("failed_dependency", failedDependency);
+                emitEventBestEffort(runId, userId, "TODO_NODE_SKIPPED", skippedPayload);
                 return;
             }
 
             // 4. 设置当前节点的上下文和 phase
             AgentContext.setTodoContext(item.getId(), item.getSequence());
             AgentContext.setPhase(PHASE_DAG_EXECUTION + "_" + item.getId());
-            // 5. 持久化 RUNNING 状态到 Redis
+            // 5. 持久化 RUNNING 状态到 Redis，并发射统一 TODO_NODE_STARTED
             stateRecorder.persistNodeState(runId, items, workflowStateLock, nodeStates,
                     item, TodoStatus.RUNNING, null, toolCalls.get());
+            emitEventBestEffort(runId, userId, "TODO_NODE_STARTED", todoNodeStartedPayload(item));
             // 6. 复制当前共享的 dataset refs 快照，节点执行过程中产生的新的 refs 会 merge 回去
             Map<String, String> localRefs = new ConcurrentHashMap<>(sharedContext.datasetRefsSnapshot());
+            nodeStartMs = System.currentTimeMillis();
             LangchainTodoNodeResult record = todoNodeExecutor.execute(
                     request,
                     item,
@@ -390,35 +404,40 @@ public class LangchainDagWorkflowExecutor {
                         .output(record.getOutput())
                         .summary(record.getSummary())
                         .build());
+                long durationMs = System.currentTimeMillis() - nodeStartMs;
                 stateRecorder.persistNodeState(runId, items, workflowStateLock, nodeStates,
                         item, TodoStatus.COMPLETED, record, toolCalls.get());
-                if (!isBlank(runId) && !isBlank(userId)) {
-                    eventService.append(runId, userId, "DAG_NODE_COMPLETED", Map.of(
-                            "todo_id", item.getId(),
-                            "tool_calls_used", record.getToolCallsUsed()
-                    ));
-                }
+                emitEventBestEffort(runId, userId, "DAG_NODE_COMPLETED", Map.of(
+                        "todo_id", item.getId(),
+                        "tool_calls_used", record.getToolCallsUsed()
+                ));
+                emitEventBestEffort(runId, userId, "TODO_NODE_COMPLETED", todoNodeResultPayload(
+                        item, true, record.getSummary(), durationMs, record.getToolCallsUsed()));
             } else {
+                long durationMs = System.currentTimeMillis() - nodeStartMs;
                 // 失败：状态记录和事件通知，下游节点会因 nodeSuccess=false 而被跳过
                 stateRecorder.persistNodeState(runId, items, workflowStateLock, nodeStates,
                         item, TodoStatus.FAILED, record, toolCalls.get());
-                if (!isBlank(runId) && !isBlank(userId)) {
-                    eventService.append(runId, userId, "DAG_NODE_FAILED", Map.of(
-                            "todo_id", item.getId(),
-                            "summary", nvl(record.getSummary())
-                    ));
-                }
+                emitEventBestEffort(runId, userId, "DAG_NODE_FAILED", Map.of(
+                        "todo_id", item.getId(),
+                        "summary", nvl(record.getSummary())
+                ));
+                emitEventBestEffort(runId, userId, "TODO_NODE_FAILED", todoNodeResultPayload(
+                        item, false, record.getSummary(), durationMs, 0));
             }
         } catch (Throwable t) {
             // 捕获所有未处理异常和错误（Throwable 比 Exception 更宽，能捕获 Error 如 OOM），
             // 防止单个节点崩溃导致工作线程异常退出但 CompletableFuture 永不完成，进而使整个 DAG 挂死
             log.error("Failed to execute DAG node {}", item.getId(), t);
+            long catchDurationMs = nodeStartMs > 0 ? System.currentTimeMillis() - nodeStartMs : 0;
             LangchainTodoNodeResult failed = LangchainTodoNodeResult.failure(
                     "DAG execution failed: " + nvl(t.getMessage()));
             results.put(item.getId(), failed);
             nodeSuccess.put(item.getId(), false);
             stateRecorder.persistNodeState(runId, items, workflowStateLock, nodeStates,
                     item, TodoStatus.FAILED, failed, toolCalls.get());
+            emitEventBestEffort(runId, userId, "TODO_NODE_FAILED", todoNodeResultPayload(
+                    item, false, failed.getSummary(), catchDurationMs, 0));
         } finally {
             // 增加完成计数（用于监控和调试），并清理 ThreadLocal
             completedCount.incrementAndGet();
@@ -535,8 +554,72 @@ public class LangchainDagWorkflowExecutor {
         return value == null || value.trim().isEmpty();
     }
 
+    private static boolean isInterruptedCancel(String reason) {
+        return reason != null && reason.startsWith("RUN_INTERRUPTED:CANCEL");
+    }
+
     private String nvl(String value) {
         return value == null ? "" : value;
+    }
+
+    private String nvl(String primary, String fallback) {
+        if (!isBlank(primary)) {
+            return primary;
+        }
+        return fallback == null ? "" : fallback;
+    }
+
+    private Map<String, Object> todoNodeStartedPayload(TodoItem item) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("todo_id", item.getId());
+        payload.put("todo_sequence", item.getSequence());
+        payload.put("workflow", nvl(AgentContext.getWorkflow(), "dag"));
+        payload.put("phase", "execution");
+        payload.put("started_at", System.currentTimeMillis());
+        return payload;
+    }
+
+    private Map<String, Object> todoNodeResultPayload(TodoItem item, boolean success,
+                                                       String summary, long durationMs, int toolCalls) {
+        return todoNodeResultPayload(item, success, summary, durationMs, toolCalls, null);
+    }
+
+    private Map<String, Object> todoNodeResultPayload(TodoItem item, boolean success,
+                                                       String summary, long durationMs, int toolCalls,
+                                                       String errorCode) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("todo_id", item.getId());
+        payload.put("todo_sequence", item.getSequence());
+        payload.put("workflow", nvl(AgentContext.getWorkflow(), "dag"));
+        payload.put("phase", "execution");
+        payload.put("success", success);
+        payload.put("duration_ms", durationMs);
+        if (toolCalls > 0) {
+            payload.put("tool_calls_used", toolCalls);
+        }
+        String resolvedErrorCode = errorCode;
+        if (!success && isBlank(resolvedErrorCode) && isInterruptedCancel(summary)) {
+            resolvedErrorCode = "RUN_CANCELED";
+        }
+        if (!success && !isBlank(resolvedErrorCode)) {
+            payload.put("error_code", resolvedErrorCode);
+        }
+        if (!success && !isBlank(summary)) {
+            payload.put("failure_reason", summary);
+        }
+        return payload;
+    }
+
+    private void emitEventBestEffort(String runId, String userId, String eventType,
+                                     Map<String, Object> payload) {
+        if (isBlank(runId) || isBlank(userId)) {
+            return;
+        }
+        try {
+            eventService.append(runId, userId, eventType, payload);
+        } catch (Exception e) {
+            // 事件失败不影响节点执行
+        }
     }
 
     /**

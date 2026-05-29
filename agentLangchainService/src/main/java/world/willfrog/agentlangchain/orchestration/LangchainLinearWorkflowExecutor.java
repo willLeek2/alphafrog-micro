@@ -3,6 +3,7 @@ package world.willfrog.agentlangchain.orchestration;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agent.workflow.DatasetRefRegistry;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 import world.willfrog.agent.workflow.TodoItem;
@@ -10,7 +11,9 @@ import world.willfrog.agentlangchain.planning.LangchainAiPlanner;
 import world.willfrog.agentlangchain.planning.LangchainPlanningRequest;
 import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
 
+
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -47,6 +50,7 @@ public class LangchainLinearWorkflowExecutor {
     private final LangchainAiPlanner planner;
     private final LangchainTodoNodeExecutor todoNodeExecutor;
     private final LangchainRunExecutionGuard executionGuard;
+    private final AgentEventService eventService;
 
     public LangchainLinearWorkflowResult execute(LangchainLinearWorkflowRequest request) {
         validate(request);
@@ -101,22 +105,39 @@ public class LangchainLinearWorkflowExecutor {
     private LangchainLinearWorkflowResult executePlanned(LangchainLinearWorkflowRequest request,
                                                          LangchainTodoPlan plan,
                                                          AtomicInteger toolCalls) {
+        AgentContext.setWorkflow("linear");
         AgentContext.setExtractedEntities(plan.getExtractedEntities());
         List<LangchainCompletedTodo> completedTodos = new ArrayList<>();
         Map<String, String> datasetRefs = LangchainTodoUserMessageBuilder.newDatasetRefMap();
         for (TodoItem item : plan.getItems()) {
             Optional<String> stop = executionGuard.stopReason(request.getRunId(), request.getUserId());
             if (stop.isPresent()) {
+                // Cancel/pause：当前剩余节点全部标记为 SKIPPED
+                for (TodoItem remaining : plan.getItems()) {
+                    if (remaining.getSequence() >= item.getSequence()) {
+                        emitTodoNodeEvent(request.getRunId(), request.getUserId(),
+                                "TODO_NODE_SKIPPED", remaining, "run_canceled", 0);
+                    }
+                }
                 return interrupted(plan, completedTodos, stop.get(), toolCalls.get());
             }
             AgentContext.setPhase("linear_execution");
             AgentContext.setStage("todo_execution");
+            emitTodoNodeEvent(request.getRunId(), request.getUserId(),
+                    "TODO_NODE_STARTED", item, null, 0);
+            long nodeStartMs = System.currentTimeMillis();
             LangchainTodoNodeResult nodeResult = todoNodeExecutor.execute(
                     request, item, completedTodos, datasetRefs, toolCalls);
+            long nodeDurationMs = System.currentTimeMillis() - nodeStartMs;
             if (!nodeResult.isSuccess()) {
+                emitTodoNodeEvent(request.getRunId(), request.getUserId(),
+                        "TODO_NODE_FAILED", item,
+                        nvl(nodeResult.getFailureReason(), nodeResult.getSummary()), nodeDurationMs);
                 return failure(plan, completedTodos,
                         nvl(nodeResult.getFailureReason(), nodeResult.getSummary()), toolCalls.get());
             }
+            emitTodoNodeEvent(request.getRunId(), request.getUserId(),
+                    "TODO_NODE_COMPLETED", item, null, nodeDurationMs);
             String trimmed = nodeResult.getOutput();
             DatasetRefRegistry.registerFromJson(trimmed, datasetRefs);
             completedTodos.add(LangchainCompletedTodo.builder()
@@ -206,5 +227,38 @@ public class LangchainLinearWorkflowExecutor {
             return primary;
         }
         return fallback == null ? "" : fallback;
+    }
+
+    private void emitTodoNodeEvent(String runId, String userId, String eventType,
+                                    TodoItem item, String reason, long durationMs) {
+        if (isBlank(runId) || isBlank(userId)) {
+            return;
+        }
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("todo_id", item.getId());
+        payload.put("todo_sequence", item.getSequence());
+        payload.put("workflow", nvl(AgentContext.getWorkflow(), "linear"));
+        payload.put("phase", "execution");
+        boolean isStarted = "TODO_NODE_STARTED".equals(eventType);
+        if (isStarted) {
+            payload.put("started_at", System.currentTimeMillis());
+        } else {
+            payload.put("duration_ms", durationMs);
+        }
+        if (!isBlank(reason)) {
+            if ("TODO_NODE_FAILED".equals(eventType)) {
+                payload.put("failure_reason", reason);
+                if (reason.startsWith("RUN_INTERRUPTED:CANCEL")) {
+                    payload.put("error_code", "RUN_CANCELED");
+                }
+            } else {
+                payload.put("reason", reason);
+            }
+        }
+        try {
+            eventService.append(runId, userId, eventType, payload);
+        } catch (Exception e) {
+            // 事件失败不影响节点执行
+        }
     }
 }
