@@ -29,6 +29,8 @@ public class AgentRunStateStore {
     private static final String PLAN_OVERRIDE_KEY = ":plan_override";
     private static final String STATUS_KEY = ":status";
     private static final String OBSERVABILITY_KEY = ":observability";
+    private static final String DETAIL_LLM_KEY = ":detail:llm:";
+    private static final String DETAIL_TOOL_KEY = ":detail:tool:";
 
     private static final String WORKFLOW_STATE_KEY = ":workflow_state";
     private static final String TOOL_CALL_COUNT_KEY = ":tool_call_count";
@@ -43,6 +45,10 @@ public class AgentRunStateStore {
 
     @Value("${agent.flow.hitl.state-ttl-seconds:3600}")
     private long ttlSeconds;
+
+    /** TTL for per-call detail blobs (independent from run state / observability TTL). */
+    @Value("${agent.call-detail.ttl-seconds:86400}")
+    private long callDetailTtlSeconds;
 
     public void recordPlan(String runId, String planJson, boolean valid) {
         if (blank(runId)) {
@@ -148,6 +154,53 @@ public class AgentRunStateStore {
             return Optional.empty();
         }
         String json = redisTemplate.opsForValue().get(observabilityKey(runId));
+        if (json == null || json.isBlank()) {
+            return Optional.empty();
+        }
+        return Optional.of(json);
+    }
+
+    public void saveLlmCallDetail(String runId, String llmCallId, String detailJson) {
+        saveCallDetail(runId, llmCallId, detailJson, true);
+    }
+
+    public void saveToolCallDetail(String runId, String toolCallId, String detailJson) {
+        saveCallDetail(runId, toolCallId, detailJson, false);
+    }
+
+    public Optional<String> loadLlmCallDetail(String runId, String llmCallId) {
+        return loadCallDetail(runId, llmCallId, true);
+    }
+
+    public Optional<String> loadToolCallDetail(String runId, String toolCallId) {
+        return loadCallDetail(runId, toolCallId, false);
+    }
+
+    /** Public for frontend Redis reader — keep in sync with detail key layout. */
+    public String llmCallDetailKey(String runId, String llmCallId) {
+        return PREFIX + runId + DETAIL_LLM_KEY + nvl(llmCallId);
+    }
+
+    /** Public for frontend Redis reader — keep in sync with detail key layout. */
+    public String toolCallDetailKey(String runId, String toolCallId) {
+        return PREFIX + runId + DETAIL_TOOL_KEY + nvl(toolCallId);
+    }
+
+    private void saveCallDetail(String runId, String callId, String detailJson, boolean llm) {
+        if (blank(runId) || blank(callId)) {
+            return;
+        }
+        String key = llm ? llmCallDetailKey(runId, callId) : toolCallDetailKey(runId, callId);
+        redisTemplate.opsForValue().set(key, nvl(detailJson));
+        touchCallDetail(key);
+    }
+
+    private Optional<String> loadCallDetail(String runId, String callId, boolean llm) {
+        if (blank(runId) || blank(callId)) {
+            return Optional.empty();
+        }
+        String key = llm ? llmCallDetailKey(runId, callId) : toolCallDetailKey(runId, callId);
+        String json = redisTemplate.opsForValue().get(key);
         if (json == null || json.isBlank()) {
             return Optional.empty();
         }
@@ -422,11 +475,19 @@ public class AgentRunStateStore {
     }
 
     private void touch(String key) {
-        if (ttlSeconds <= 0 || key == null || key.isBlank()) {
+        touchWithTtl(key, ttlSeconds);
+    }
+
+    private void touchCallDetail(String key) {
+        touchWithTtl(key, callDetailTtlSeconds);
+    }
+
+    private void touchWithTtl(String key, long ttl) {
+        if (ttl <= 0 || key == null || key.isBlank()) {
             return;
         }
         try {
-            redisTemplate.expire(key, Duration.ofSeconds(ttlSeconds));
+            redisTemplate.expire(key, Duration.ofSeconds(ttl));
         } catch (Exception e) {
             log.debug("touch redis key failed: {}", key, e);
         }

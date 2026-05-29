@@ -6,6 +6,7 @@ import world.willfrog.alphafrogmicro.frontend.model.agent.AgentCallDetailRespons
 
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -122,6 +123,33 @@ class AgentCallDetailMapperTest {
     assertTrue(summary.contains("backend=tavily"));
     assertFalse(summary.contains("internalToken"));
     assertFalse(summary.contains("must-not-show"));
+  }
+
+  @Test
+  void resolveLlmDetail_shouldReturnAvailableWhenNoBlobAndFlagFalse() {
+    Map<String, Object> trace = new LinkedHashMap<>();
+    trace.put("traceId", "llm-ok");
+    trace.put("model", "qwen");
+    trace.put("hasError", false);
+    trace.put("detailBlobStored", false);
+
+    AgentCallDetailResponse detail = AgentCallDetailMapper.resolveLlmDetail(
+            trace, "llm-ok", "run-1", Optional.empty());
+
+    assertEquals(AgentCallDetailResponse.KIND_AVAILABLE, detail.getDetailKind());
+  }
+
+  @Test
+  void resolveLlmDetail_shouldReturnExpiredWhenBlobStoredButMissing() {
+    Map<String, Object> trace = new LinkedHashMap<>();
+    trace.put("traceId", "llm-expired");
+    trace.put("detailBlobStored", true);
+    trace.put("phase", "execution");
+
+    AgentCallDetailResponse detail = AgentCallDetailMapper.resolveLlmDetail(
+            trace, "llm-expired", "run-1", Optional.empty());
+
+    assertEquals(AgentCallDetailResponse.KIND_EXPIRED, detail.getDetailKind());
   }
 
   @Test

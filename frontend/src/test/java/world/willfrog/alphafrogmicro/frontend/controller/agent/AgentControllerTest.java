@@ -23,7 +23,10 @@ import world.willfrog.alphafrogmicro.frontend.model.agent.AgentMessageSendReques
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentRunCreateRequest;
 import world.willfrog.alphafrogmicro.frontend.model.agent.TimelineResponse;
 import world.willfrog.alphafrogmicro.frontend.service.AuthService;
+import world.willfrog.alphafrogmicro.frontend.service.agent.AgentCallDetailBlobReader;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentRunResultCacheService;
+
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -39,6 +42,7 @@ class AgentControllerTest {
     private AgentDubboService agentDubboService;
     private AuthService authService;
     private AgentRunResultCacheService runResultCacheService;
+    private AgentCallDetailBlobReader callDetailBlobReader;
     private AgentController controller;
     private Authentication authentication;
 
@@ -49,7 +53,10 @@ class AgentControllerTest {
         runResultCacheService = new AgentRunResultCacheService();
         ReflectionTestUtils.setField(runResultCacheService, "agentDubboService", agentDubboService);
         ReflectionTestUtils.setField(runResultCacheService, "cacheTtlSeconds", 30L);
-        controller = new AgentController(authService, new ObjectMapper(), runResultCacheService);
+        callDetailBlobReader = mock(AgentCallDetailBlobReader.class);
+        when(callDetailBlobReader.loadLlmCallDetail(any(), any())).thenReturn(Optional.empty());
+        when(callDetailBlobReader.loadToolCallDetail(any(), any())).thenReturn(Optional.empty());
+        controller = new AgentController(authService, new ObjectMapper(), runResultCacheService, callDetailBlobReader);
         ReflectionTestUtils.setField(controller, "agentDubboServiceLangchain", agentDubboService);
         ReflectionTestUtils.setField(controller, "agentDubboServiceLegacy", agentDubboService);
         HttpServletRequest request = mock(HttpServletRequest.class);

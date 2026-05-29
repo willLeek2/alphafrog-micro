@@ -72,8 +72,11 @@ import world.willfrog.alphafrogmicro.frontend.model.agent.TraceDetailResponse;
 import world.willfrog.alphafrogmicro.frontend.model.agent.TraceSpanItem;
 import world.willfrog.alphafrogmicro.frontend.model.agent.TimelineResponse;
 import world.willfrog.alphafrogmicro.frontend.service.AuthService;
+import world.willfrog.alphafrogmicro.frontend.service.agent.AgentCallDetailBlobReader;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentCallDetailMapper;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentRunResultCacheService;
+
+import java.util.Optional;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -112,6 +115,7 @@ public class AgentController {
     private final AuthService authService;
     private final ObjectMapper objectMapper;
     private final AgentRunResultCacheService runResultCacheService;
+    private final AgentCallDetailBlobReader callDetailBlobReader;
 
     /**
      * 根据当前 HTTP 请求路径选择对应的 Dubbo provider。
@@ -890,13 +894,21 @@ public class AgentController {
             if ("llm".equals(type)) {
                 return AgentCallDetailMapper.findLlmTrace(diagnostics, callId)
                         .map(trace -> ResponseWrapper.success(
-                                AgentCallDetailMapper.fromLlmTrace(trace, callId, runId)))
+                                AgentCallDetailMapper.resolveLlmDetail(
+                                        trace,
+                                        callId,
+                                        runId,
+                                        callDetailBlobReader.loadLlmCallDetail(runId, callId))))
                         .orElseGet(() -> ResponseWrapper.success(
                                 AgentCallDetailMapper.unavailable("llm", callId, runId)));
             }
             return AgentCallDetailMapper.findToolTrace(diagnostics, callId)
                     .map(trace -> ResponseWrapper.success(
-                            AgentCallDetailMapper.fromToolTrace(trace, callId, runId)))
+                            AgentCallDetailMapper.resolveToolDetail(
+                                    trace,
+                                    callId,
+                                    runId,
+                                    callDetailBlobReader.loadToolCallDetail(runId, callId))))
                     .orElseGet(() -> ResponseWrapper.success(
                             AgentCallDetailMapper.unavailable("tool", callId, runId)));
         } catch (RpcException e) {

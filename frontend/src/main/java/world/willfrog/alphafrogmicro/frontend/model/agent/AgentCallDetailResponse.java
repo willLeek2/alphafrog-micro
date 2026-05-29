@@ -18,6 +18,7 @@ public class AgentCallDetailResponse {
     public static final String KIND_EXPIRED = "expired";
 
     public static final String SOURCE_OBSERVABILITY = "observability_snapshot";
+    public static final String SOURCE_CALL_DETAIL_REDIS = "call_detail_redis";
 
     private String type;
     private String detailKind;

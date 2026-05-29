@@ -64,7 +64,60 @@ public final class AgentCallDetailMapper {
                 .build();
     }
 
+    public static AgentCallDetailResponse expired(String type, String id, String runId, Map<String, Object> trace) {
+        return AgentCallDetailResponse.builder()
+                .type(type)
+                .detailKind(AgentCallDetailResponse.KIND_EXPIRED)
+                .source(AgentCallDetailResponse.SOURCE_OBSERVABILITY)
+                .id(id)
+                .runId(runId)
+                .todoId(emptyToNull(str(trace.get("todoId"))))
+                .todoSequence(intOrNull(trace.get("todoSequence")))
+                .phase(emptyToNull(str(trace.get("phase"))))
+                .stage(emptyToNull(str(trace.get("stage"))))
+                .time(emptyToNull(str(trace.get("time"))))
+                .durationMs(longOrNull(trace.get("durationMs")))
+                .status("unknown")
+                .summary("Detail expired or no longer available")
+                .limits(limits(false))
+                .build();
+    }
+
+    public static AgentCallDetailResponse resolveLlmDetail(
+            Map<String, Object> trace,
+            String llmCallId,
+            String runId,
+            Optional<String> detailBlobJson) {
+        if (detailBlobJson.isPresent()) {
+            return fromLlmTrace(trace, llmCallId, runId, AgentCallDetailResponse.SOURCE_CALL_DETAIL_REDIS);
+        }
+        if (isDetailBlobStored(trace)) {
+            return expired("llm", llmCallId, runId, trace);
+        }
+        return fromLlmTrace(trace, llmCallId, runId, AgentCallDetailResponse.SOURCE_OBSERVABILITY);
+    }
+
+    public static AgentCallDetailResponse resolveToolDetail(
+            Map<String, Object> trace,
+            String toolCallId,
+            String runId,
+            Optional<String> detailBlobJson) {
+        if (detailBlobJson.isPresent()) {
+            Map<String, Object> blob = parseDetailBlob(detailBlobJson.get());
+            return fromToolTraceWithBlob(trace, blob, toolCallId, runId);
+        }
+        if (isDetailBlobStored(trace)) {
+            return expired("tool", toolCallId, runId, trace);
+        }
+        return fromToolTrace(trace, toolCallId, runId);
+    }
+
     public static AgentCallDetailResponse fromLlmTrace(Map<String, Object> trace, String llmCallId, String runId) {
+        return fromLlmTrace(trace, llmCallId, runId, AgentCallDetailResponse.SOURCE_OBSERVABILITY);
+    }
+
+    public static AgentCallDetailResponse fromLlmTrace(
+            Map<String, Object> trace, String llmCallId, String runId, String source) {
         String model = str(trace.get("model"));
         boolean hasError = bool(trace.get("hasError"));
         String error = emptyToNull(str(trace.get("error")));
@@ -77,7 +130,7 @@ public final class AgentCallDetailMapper {
         return AgentCallDetailResponse.builder()
                 .type("llm")
                 .detailKind(summaryPreview.detailKind())
-                .source(AgentCallDetailResponse.SOURCE_OBSERVABILITY)
+                .source(source)
                 .id(llmCallId)
                 .runId(runId)
                 .todoId(emptyToNull(str(trace.get("todoId"))))
@@ -95,14 +148,34 @@ public final class AgentCallDetailMapper {
     }
 
     public static AgentCallDetailResponse fromToolTrace(Map<String, Object> trace, String toolCallId, String runId) {
+        return fromToolTraceWithBlob(trace, Map.of(), toolCallId, runId, AgentCallDetailResponse.SOURCE_OBSERVABILITY);
+    }
+
+    public static AgentCallDetailResponse fromToolTraceWithBlob(
+            Map<String, Object> trace,
+            Map<String, Object> blob,
+            String toolCallId,
+            String runId) {
+        return fromToolTraceWithBlob(trace, blob, toolCallId, runId, AgentCallDetailResponse.SOURCE_CALL_DETAIL_REDIS);
+    }
+
+    private static AgentCallDetailResponse fromToolTraceWithBlob(
+            Map<String, Object> trace,
+            Map<String, Object> blob,
+            String toolCallId,
+            String runId,
+            String source) {
         String toolName = str(trace.get("toolName"));
         boolean success = bool(trace.get("success"));
         String error = emptyToNull(str(trace.get("error")));
 
-        String paramsSummary = summarizeParams(toolName, trace.get("params"));
+        Object paramsSource = blob.containsKey("params") ? blob.get("params") : trace.get("params");
+        String paramsSummary = summarizeParams(toolName, paramsSource);
         PreviewResult paramsPreview = limitText(paramsSummary, PREVIEW_MAX_CHARS);
 
-        String outputRaw = str(trace.get("output"));
+        String outputRaw = blob.containsKey("output")
+                ? str(blob.get("output"))
+                : firstNonEmpty(str(trace.get("output")), str(trace.get("outputPreview")));
         String outputPreview = summarizeToolOutput(toolName, outputRaw);
         PreviewResult outputResult = limitText(outputPreview, PREVIEW_MAX_CHARS);
 
@@ -117,7 +190,7 @@ public final class AgentCallDetailMapper {
         return AgentCallDetailResponse.builder()
                 .type("tool")
                 .detailKind(detailKind)
-                .source(AgentCallDetailResponse.SOURCE_OBSERVABILITY)
+                .source(source)
                 .id(toolCallId)
                 .runId(runId)
                 .todoId(emptyToNull(str(trace.get("todoId"))))
@@ -135,6 +208,29 @@ public final class AgentCallDetailMapper {
                         .build())
                 .limits(mergeLimits(truncated))
                 .build();
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> parseDetailBlob(String json) {
+        try {
+            return MAPPER.readValue(json, new TypeReference<>() {});
+        } catch (Exception e) {
+            return Map.of();
+        }
+    }
+
+    private static boolean isDetailBlobStored(Map<String, Object> trace) {
+        Object flag = trace.get("detailBlobStored");
+        return flag instanceof Boolean b && b;
+    }
+
+    private static String firstNonEmpty(String... values) {
+        for (String value : values) {
+            if (value != null && !value.isBlank()) {
+                return value;
+            }
+        }
+        return "";
     }
 
     private static Optional<Map<String, Object>> findTraceById(

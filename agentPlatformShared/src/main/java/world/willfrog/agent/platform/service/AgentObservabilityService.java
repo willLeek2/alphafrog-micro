@@ -1141,6 +1141,7 @@ public class AgentObservabilityService {
         Map<String, Object> snapshot = parseJsonObject(snapshotJson);
         Map<String, Object> observabilityMap = objectMapper.convertValue(state, new TypeReference<Map<String, Object>>() {
         });
+        AgentCallDetailPersistence.scrubObservabilityMap(observabilityMap);
         snapshot.put("observability", observabilityMap);
         String output = safeWrite(snapshot);
 
@@ -1654,6 +1655,7 @@ public class AgentObservabilityService {
             trace.setOutputTokens(tokenUsage.outputTokenCount() != null ? tokenUsage.outputTokenCount().longValue() : null);
             trace.setTotalTokens(tokenUsage.totalTokenCount() != null ? tokenUsage.totalTokenCount().longValue() : null);
         }
+        finalizeLlmTraceForPersistence(runId, trace);
         traces.add(trace);
         int limit = llmTraceCallLimit();
         while (traces.size() > limit) {
@@ -1812,12 +1814,49 @@ public class AgentObservabilityService {
         trace.setTodoId(nvl(AgentContext.getTodoId()));
         trace.setTodoSequence(AgentContext.getTodoSequence());
 
+        finalizeLlmTraceForPersistence(runId, trace);
         traces.add(trace);
 
         int limit = llmTraceCallLimit();
         while (traces.size() > limit) {
             traces.remove(0);
         }
+    }
+
+    private void finalizeLlmTraceForPersistence(String runId, LlmTrace trace) {
+        if (trace == null || runId == null || runId.isBlank()) {
+            return;
+        }
+        boolean detailBlobStored = false;
+        Map<String, Object> blob = AgentCallDetailPersistence.toLlmDetailBlob(trace);
+        if (AgentCallDetailPersistence.hasPersistableDetailBlob(blob)) {
+            try {
+                stateStore.saveLlmCallDetail(runId, trace.getTraceId(), safeWrite(blob));
+                detailBlobStored = true;
+            } catch (Exception e) {
+                log.debug("Failed to persist LLM call detail blob: runId={}, traceId={}, error={}",
+                        runId, trace.getTraceId(), e.getMessage());
+            }
+        }
+        AgentCallDetailPersistence.scrubLlmTrace(trace, detailBlobStored);
+    }
+
+    private void finalizeToolTraceForPersistence(String runId, ToolTrace trace) {
+        if (trace == null || runId == null || runId.isBlank()) {
+            return;
+        }
+        boolean detailBlobStored = false;
+        Map<String, Object> blob = AgentCallDetailPersistence.toToolDetailBlob(trace);
+        if (AgentCallDetailPersistence.hasPersistableDetailBlob(blob)) {
+            try {
+                stateStore.saveToolCallDetail(runId, trace.getTraceId(), safeWrite(blob));
+                detailBlobStored = true;
+            } catch (Exception e) {
+                log.debug("Failed to persist tool call detail blob: runId={}, traceId={}, error={}",
+                        runId, trace.getTraceId(), e.getMessage());
+            }
+        }
+        AgentCallDetailPersistence.scrubToolTrace(trace, detailBlobStored);
     }
 
     private String extractOpenRouterGenerationId(String rawResponseBody) {
@@ -1886,6 +1925,7 @@ public class AgentObservabilityService {
         trace.setDecisionLlmTraceId(nvl(AgentContext.getDecisionTraceId()));
         trace.setDecisionStage(nvl(AgentContext.getDecisionStage()));
         trace.setDecisionExcerpt(trim(AgentContext.getDecisionExcerpt(), 1000));
+        finalizeToolTraceForPersistence(runId, trace);
         diagnostics.getToolTraces().add(trace);
     }
     
@@ -2417,6 +2457,9 @@ public class AgentObservabilityService {
         @Deprecated
         private String responsePreview;
 
+        /** Step 2: large fields moved to Redis detail blob; missing blob => expired for detail API. */
+        private boolean detailBlobStored;
+
         /**
          * 流式生成进度快照（写入 trace 用），与 Diagnostics.StreamingProgressStatus
          * 字段大体一致，区别是这里没有 phase/endpoint/model/completed/updatedAt。
@@ -2481,6 +2524,10 @@ public class AgentObservabilityService {
         private long estimatedSavedDurationMs;
         /** 工具输出（长度受配置 agent.observability.tool-trace.max-output-chars 控制） */
         private String output;
+        /** 截断后的输出预览（observability index；完整 output 在 detail blob） */
+        private String outputPreview;
+        /** Step 2: detail blob written to Redis for this trace. */
+        private boolean detailBlobStored;
         /** 错误信息（失败时） */
         private String error;
         /** 触发本次工具调用的 LLM 决策 traceId（便于追溯） */
