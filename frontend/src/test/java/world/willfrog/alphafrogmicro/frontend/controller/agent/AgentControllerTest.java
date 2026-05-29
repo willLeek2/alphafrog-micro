@@ -18,6 +18,7 @@ import world.willfrog.alphafrogmicro.agent.idl.SendAgentMessageRequest;
 import world.willfrog.alphafrogmicro.agent.idl.SendAgentMessageResponse;
 import world.willfrog.alphafrogmicro.common.dto.ResponseCode;
 import world.willfrog.alphafrogmicro.common.pojo.user.User;
+import world.willfrog.alphafrogmicro.frontend.model.agent.AgentCallDetailResponse;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentMessageSendRequest;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentRunCreateRequest;
 import world.willfrog.alphafrogmicro.frontend.model.agent.TimelineResponse;
@@ -25,6 +26,8 @@ import world.willfrog.alphafrogmicro.frontend.service.AuthService;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentRunResultCacheService;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
@@ -192,5 +195,60 @@ class AgentControllerTest {
         TimelineResponse timeline = response.getData();
         assertEquals(2, timeline.items().size());
         assertEquals(1, timeline.items().stream().filter(item -> "trace".equals(item.source())).count());
+    }
+
+    @Test
+    void llmCallDetail_shouldReturnSafeDetail() {
+        String observability = """
+                {"summary":{},"diagnostics":{"llmTraces":[
+                  {"traceId":"llm-1","time":"2026-05-07T10:00:00Z","phase":"execution","stage":"execute",
+                   "durationMs":42,"model":"qwen-plus","hasError":false,"inputTokens":10,"outputTokens":5,
+                   "outputText":"full-secret","reasoningText":"reason-secret","httpRequest":{"x":1}}
+                ],"toolTraces":[]}}
+                """;
+        when(agentDubboService.getResult(any(GetAgentRunResultRequest.class))).thenReturn(
+                AgentRunResultMessage.newBuilder().setObservabilityJson(observability).build()
+        );
+
+        var response = controller.llmCallDetail(authentication, "run-1", "llm-1");
+
+        assertEquals(ResponseCode.SUCCESS.getCode(), response.getCode());
+        AgentCallDetailResponse detail = response.getData();
+        assertEquals("llm", detail.getType());
+        assertEquals(AgentCallDetailResponse.KIND_AVAILABLE, detail.getDetailKind());
+        assertEquals("llm-1", detail.getId());
+        assertNotNull(detail.getLlm());
+        assertFalse(detail.getSummary().contains("full-secret"));
+    }
+
+    @Test
+    void llmCallDetail_shouldReturnUnavailableWhenMissing() {
+        when(agentDubboService.getResult(any(GetAgentRunResultRequest.class))).thenReturn(
+                AgentRunResultMessage.newBuilder()
+                        .setObservabilityJson("{\"summary\":{},\"diagnostics\":{\"llmTraces\":[],\"toolTraces\":[]}}")
+                        .build()
+        );
+
+        var response = controller.llmCallDetail(authentication, "run-1", "missing");
+
+        assertEquals(ResponseCode.SUCCESS.getCode(), response.getCode());
+        assertEquals(AgentCallDetailResponse.KIND_UNAVAILABLE, response.getData().getDetailKind());
+    }
+
+    @Test
+    void toolCallDetail_shouldReturnUnavailableWhenTraceIdMismatch() {
+        String observability = """
+                {"summary":{},"diagnostics":{"llmTraces":[],"toolTraces":[
+                  {"traceId":"internal-trace-only","toolName":"searchAssetInfo","success":true,"output":"{}"}
+                ]}}
+                """;
+        when(agentDubboService.getResult(any(GetAgentRunResultRequest.class))).thenReturn(
+                AgentRunResultMessage.newBuilder().setObservabilityJson(observability).build()
+        );
+
+        var response = controller.toolCallDetail(authentication, "run-1", "sse-tool-call-id");
+
+        assertEquals(ResponseCode.SUCCESS.getCode(), response.getCode());
+        assertEquals(AgentCallDetailResponse.KIND_UNAVAILABLE, response.getData().getDetailKind());
     }
 }

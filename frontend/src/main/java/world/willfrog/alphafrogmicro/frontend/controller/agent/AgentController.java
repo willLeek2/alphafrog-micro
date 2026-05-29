@@ -67,10 +67,12 @@ import world.willfrog.alphafrogmicro.frontend.model.agent.AgentMessageSendRespon
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentMessageItemResponse;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentMessageListResponse;
 import world.willfrog.alphafrogmicro.frontend.model.agent.TraceListResponse;
+import world.willfrog.alphafrogmicro.frontend.model.agent.AgentCallDetailResponse;
 import world.willfrog.alphafrogmicro.frontend.model.agent.TraceDetailResponse;
 import world.willfrog.alphafrogmicro.frontend.model.agent.TraceSpanItem;
 import world.willfrog.alphafrogmicro.frontend.model.agent.TimelineResponse;
 import world.willfrog.alphafrogmicro.frontend.service.AuthService;
+import world.willfrog.alphafrogmicro.frontend.service.agent.AgentCallDetailMapper;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentRunResultCacheService;
 
 import java.nio.charset.StandardCharsets;
@@ -856,6 +858,51 @@ public class AgentController {
             return handleRpcError(e, "查询 trace 详情");
         } catch (Exception e) {
             return handleError(e, "查询 trace 详情");
+        }
+    }
+
+    @GetMapping(AGENT_RUNS + "/{runId}/llm-calls/{llmCallId}/detail")
+    public ResponseWrapper<AgentCallDetailResponse> llmCallDetail(Authentication authentication,
+                                                                @PathVariable("runId") String runId,
+                                                                @PathVariable("llmCallId") String llmCallId) {
+        return safeCallDetail(authentication, runId, "llm", llmCallId);
+    }
+
+    @GetMapping(AGENT_RUNS + "/{runId}/tool-calls/{toolCallId}/detail")
+    public ResponseWrapper<AgentCallDetailResponse> toolCallDetail(Authentication authentication,
+                                                                   @PathVariable("runId") String runId,
+                                                                   @PathVariable("toolCallId") String toolCallId) {
+        return safeCallDetail(authentication, runId, "tool", toolCallId);
+    }
+
+    private ResponseWrapper<AgentCallDetailResponse> safeCallDetail(Authentication authentication,
+                                                                  String runId,
+                                                                  String type,
+                                                                  String callId) {
+        String userId = resolveUserId(authentication);
+        if (userId == null) {
+            return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
+        }
+        try {
+            AgentRunResultMessage result = loadRunResult(userId, runId);
+            String obsJson = result.getObservabilityJson();
+            Map<String, Object> diagnostics = AgentCallDetailMapper.parseDiagnostics(obsJson);
+            if ("llm".equals(type)) {
+                return AgentCallDetailMapper.findLlmTrace(diagnostics, callId)
+                        .map(trace -> ResponseWrapper.success(
+                                AgentCallDetailMapper.fromLlmTrace(trace, callId, runId)))
+                        .orElseGet(() -> ResponseWrapper.success(
+                                AgentCallDetailMapper.unavailable("llm", callId, runId)));
+            }
+            return AgentCallDetailMapper.findToolTrace(diagnostics, callId)
+                    .map(trace -> ResponseWrapper.success(
+                            AgentCallDetailMapper.fromToolTrace(trace, callId, runId)))
+                    .orElseGet(() -> ResponseWrapper.success(
+                            AgentCallDetailMapper.unavailable("tool", callId, runId)));
+        } catch (RpcException e) {
+            return handleRpcError(e, "查询 call 详情");
+        } catch (Exception e) {
+            return handleError(e, "查询 call 详情");
         }
     }
 

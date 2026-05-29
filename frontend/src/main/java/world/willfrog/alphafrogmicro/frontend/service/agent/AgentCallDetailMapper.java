@@ -1,0 +1,373 @@
+package world.willfrog.alphafrogmicro.frontend.service.agent;
+
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import world.willfrog.alphafrogmicro.frontend.model.agent.AgentCallDetailResponse;
+import world.willfrog.alphafrogmicro.frontend.model.agent.AgentCallDetailResponse.DetailLimits;
+import world.willfrog.alphafrogmicro.frontend.model.agent.AgentCallDetailResponse.DetailLlm;
+import world.willfrog.alphafrogmicro.frontend.model.agent.AgentCallDetailResponse.DetailMetrics;
+import world.willfrog.alphafrogmicro.frontend.model.agent.AgentCallDetailResponse.DetailTool;
+
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
+/**
+ * Maps observability diagnostics traces to user-safe call detail (Step 1).
+ */
+public final class AgentCallDetailMapper {
+
+    public static final int PREVIEW_MAX_CHARS = 2000;
+
+    /** Safe param keys per tool for user-facing detail (unknown tools expose count only). */
+    private static final Map<String, List<String>> PARAM_FIELD_WHITELIST = Map.of(
+            "searchAssetInfo", List.of("query"),
+            "searchWeb", List.of("query", "backend", "maxResults", "limit")
+    );
+
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+
+    private AgentCallDetailMapper() {
+    }
+
+    public static Optional<Map<String, Object>> findLlmTrace(Map<String, Object> diagnostics, String llmCallId) {
+        return findTraceById(diagnostics, "llmTraces", llmCallId);
+    }
+
+    public static Optional<Map<String, Object>> findToolTrace(Map<String, Object> diagnostics, String toolCallId) {
+        return findTraceById(diagnostics, "toolTraces", toolCallId);
+    }
+
+    @SuppressWarnings("unchecked")
+    public static Map<String, Object> parseDiagnostics(String observabilityJson) throws Exception {
+        if (observabilityJson == null || observabilityJson.isBlank()) {
+            return Map.of();
+        }
+        Map<String, Object> obs = MAPPER.readValue(observabilityJson, new TypeReference<>() {});
+        Object diagnostics = obs.get("diagnostics");
+        if (diagnostics instanceof Map<?, ?> diag) {
+            return (Map<String, Object>) diag;
+        }
+        return Map.of();
+    }
+
+    public static AgentCallDetailResponse unavailable(String type, String id, String runId) {
+        return AgentCallDetailResponse.builder()
+                .type(type)
+                .detailKind(AgentCallDetailResponse.KIND_UNAVAILABLE)
+                .source(AgentCallDetailResponse.SOURCE_OBSERVABILITY)
+                .id(id)
+                .runId(runId)
+                .limits(limits(false))
+                .build();
+    }
+
+    public static AgentCallDetailResponse fromLlmTrace(Map<String, Object> trace, String llmCallId, String runId) {
+        String model = str(trace.get("model"));
+        boolean hasError = bool(trace.get("hasError"));
+        String error = emptyToNull(str(trace.get("error")));
+        Long inputTokens = nullableLong(trace.get("inputTokens"));
+        Long outputTokens = nullableLong(trace.get("outputTokens"));
+        String summary = buildLlmSummary(model, hasError, error);
+
+        PreviewResult summaryPreview = limitText(summary, PREVIEW_MAX_CHARS);
+
+        return AgentCallDetailResponse.builder()
+                .type("llm")
+                .detailKind(summaryPreview.detailKind())
+                .source(AgentCallDetailResponse.SOURCE_OBSERVABILITY)
+                .id(llmCallId)
+                .runId(runId)
+                .todoId(emptyToNull(str(trace.get("todoId"))))
+                .todoSequence(intOrNull(trace.get("todoSequence")))
+                .phase(emptyToNull(str(trace.get("phase"))))
+                .stage(emptyToNull(str(trace.get("stage"))))
+                .time(emptyToNull(str(trace.get("time"))))
+                .durationMs(longOrNull(trace.get("durationMs")))
+                .status(hasError ? "failed" : "success")
+                .summary(summaryPreview.text())
+                .metrics(buildMetrics(inputTokens, outputTokens, trace.get("actualCost")))
+                .llm(DetailLlm.builder().model(emptyToNull(model)).build())
+                .limits(mergeLimits(summaryPreview.truncated()))
+                .build();
+    }
+
+    public static AgentCallDetailResponse fromToolTrace(Map<String, Object> trace, String toolCallId, String runId) {
+        String toolName = str(trace.get("toolName"));
+        boolean success = bool(trace.get("success"));
+        String error = emptyToNull(str(trace.get("error")));
+
+        String paramsSummary = summarizeParams(toolName, trace.get("params"));
+        PreviewResult paramsPreview = limitText(paramsSummary, PREVIEW_MAX_CHARS);
+
+        String outputRaw = str(trace.get("output"));
+        String outputPreview = summarizeToolOutput(toolName, outputRaw);
+        PreviewResult outputResult = limitText(outputPreview, PREVIEW_MAX_CHARS);
+
+        String summary = buildToolSummary(toolName, success, error);
+        PreviewResult summaryPreview = limitText(summary, PREVIEW_MAX_CHARS);
+
+        boolean truncated = paramsPreview.truncated() || outputResult.truncated() || summaryPreview.truncated();
+        String detailKind = truncated
+                ? AgentCallDetailResponse.KIND_TRUNCATED
+                : AgentCallDetailResponse.KIND_AVAILABLE;
+
+        return AgentCallDetailResponse.builder()
+                .type("tool")
+                .detailKind(detailKind)
+                .source(AgentCallDetailResponse.SOURCE_OBSERVABILITY)
+                .id(toolCallId)
+                .runId(runId)
+                .todoId(emptyToNull(str(trace.get("todoId"))))
+                .todoSequence(intOrNull(trace.get("todoSequence")))
+                .phase(emptyToNull(str(trace.get("phase"))))
+                .stage(emptyToNull(str(trace.get("stage"))))
+                .time(emptyToNull(str(trace.get("time"))))
+                .durationMs(longOrNull(trace.get("durationMs")))
+                .status(success ? "success" : "failed")
+                .summary(summaryPreview.text())
+                .tool(DetailTool.builder()
+                        .name(emptyToNull(toolName))
+                        .paramsSummary(paramsPreview.text())
+                        .outputPreview(outputResult.text())
+                        .build())
+                .limits(mergeLimits(truncated))
+                .build();
+    }
+
+    private static Optional<Map<String, Object>> findTraceById(
+            Map<String, Object> diagnostics, String listKey, String callId) {
+        if (callId == null || callId.isBlank() || diagnostics == null) {
+            return Optional.empty();
+        }
+        Object tracesObj = diagnostics.get(listKey);
+        if (!(tracesObj instanceof List<?> traces)) {
+            return Optional.empty();
+        }
+        for (Object item : traces) {
+            if (item instanceof Map<?, ?> raw) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> trace = (Map<String, Object>) raw;
+                if (callId.equals(str(trace.get("traceId")))) {
+                    return Optional.of(trace);
+                }
+            }
+        }
+        return Optional.empty();
+    }
+
+    private static String buildLlmSummary(String model, boolean hasError, String error) {
+        if (hasError && error != null && !error.isBlank()) {
+            return "LLM " + (model.isBlank() ? "call" : model) + " failed: " + error;
+        }
+        if (!model.isBlank()) {
+            return "LLM call " + model + " completed";
+        }
+        return "LLM call completed";
+    }
+
+    private static String buildToolSummary(String toolName, boolean success, String error) {
+        String label = toolName.isBlank() ? "Tool" : "Tool " + toolName;
+        if (!success && error != null && !error.isBlank()) {
+            return label + " failed: " + error;
+        }
+        return label + (success ? " completed" : " failed");
+    }
+
+    @SuppressWarnings("unchecked")
+    static String summarizeParams(String toolName, Object paramsObj) {
+        if (!(paramsObj instanceof Map<?, ?> raw) || raw.isEmpty()) {
+            return "";
+        }
+        Map<String, Object> params = (Map<String, Object>) raw;
+        List<String> allowedKeys = PARAM_FIELD_WHITELIST.get(toolName);
+        if (allowedKeys == null) {
+            return "parameterCount=" + params.size();
+        }
+        List<String> parts = new ArrayList<>();
+        for (String key : allowedKeys) {
+            Object value = params.get(key);
+            if (value == null) {
+                continue;
+            }
+            String rendered = String.valueOf(value).trim();
+            if (rendered.isBlank()) {
+                continue;
+            }
+            if (rendered.length() > 120) {
+                rendered = rendered.substring(0, 120) + "...";
+            }
+            parts.add(key + "=" + rendered);
+        }
+        return String.join(", ", parts);
+    }
+
+    static String summarizeToolOutput(String toolName, String output) {
+        if (output == null || output.isBlank()) {
+            return "";
+        }
+        String trimmed = output.trim();
+        if ("searchAssetInfo".equals(toolName)) {
+            String structured = trySearchAssetInfoSummary(trimmed);
+            if (structured != null) {
+                return structured;
+            }
+        }
+        return prettyOrRawPreview(trimmed);
+    }
+
+    private static String trySearchAssetInfoSummary(String jsonText) {
+        try {
+            Map<String, Object> root = MAPPER.readValue(jsonText, new TypeReference<>() {});
+            List<String> hits = new ArrayList<>();
+            collectAssetHits(root, hits, 5);
+            if (!hits.isEmpty()) {
+                return "hits: " + String.join("; ", hits);
+            }
+            Object total = root.get("total");
+            if (total != null) {
+                return "total=" + total;
+            }
+        } catch (Exception ignored) {
+            // fall through
+        }
+        return null;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void collectAssetHits(Object node, List<String> hits, int max) {
+        if (hits.size() >= max || node == null) {
+            return;
+        }
+        if (node instanceof List<?> list) {
+            for (Object item : list) {
+                collectAssetHits(item, hits, max);
+                if (hits.size() >= max) {
+                    return;
+                }
+            }
+            return;
+        }
+        if (node instanceof Map<?, ?> map) {
+            Map<String, Object> m = (Map<String, Object>) map;
+            String code = firstNonBlank(m, "code", "symbol", "tsCode", "stockCode");
+            String name = firstNonBlank(m, "name", "assetName", "title");
+            if (!code.isBlank() || !name.isBlank()) {
+                hits.add((code.isBlank() ? "" : code) + (name.isBlank() ? "" : " " + name).trim());
+            }
+            for (Object value : m.values()) {
+                collectAssetHits(value, hits, max);
+                if (hits.size() >= max) {
+                    return;
+                }
+            }
+        }
+    }
+
+    private static String firstNonBlank(Map<String, Object> map, String... keys) {
+        for (String key : keys) {
+            Object value = map.get(key);
+            if (value != null) {
+                String text = String.valueOf(value).trim();
+                if (!text.isBlank()) {
+                    return text;
+                }
+            }
+        }
+        return "";
+    }
+
+    private static String prettyOrRawPreview(String text) {
+        if (text.startsWith("{") || text.startsWith("[")) {
+            try {
+                Object parsed = MAPPER.readValue(text, Object.class);
+                return MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(parsed);
+            } catch (Exception ignored) {
+                return text;
+            }
+        }
+        return text;
+    }
+
+    private static DetailMetrics buildMetrics(Long inputTokens, Long outputTokens, Object actualCost) {
+        Long total = null;
+        if (inputTokens != null || outputTokens != null) {
+            total = (inputTokens == null ? 0L : inputTokens) + (outputTokens == null ? 0L : outputTokens);
+        }
+        Double cost = null;
+        if (actualCost instanceof Number n) {
+            cost = n.doubleValue();
+        }
+        if (inputTokens == null && outputTokens == null && cost == null) {
+            return null;
+        }
+        return DetailMetrics.builder()
+                .inputTokens(inputTokens)
+                .outputTokens(outputTokens)
+                .totalTokens(total)
+                .actualCost(cost)
+                .build();
+    }
+
+    private static PreviewResult limitText(String text, int maxChars) {
+        if (text == null) {
+            return new PreviewResult("", false, AgentCallDetailResponse.KIND_AVAILABLE);
+        }
+        if (text.length() <= maxChars) {
+            return new PreviewResult(text, false, AgentCallDetailResponse.KIND_AVAILABLE);
+        }
+        return new PreviewResult(
+                text.substring(0, maxChars) + "...",
+                true,
+                AgentCallDetailResponse.KIND_TRUNCATED);
+    }
+
+    private static DetailLimits limits(boolean truncated) {
+        return DetailLimits.builder()
+                .previewMaxChars(PREVIEW_MAX_CHARS)
+                .truncated(truncated)
+                .build();
+    }
+
+    private static DetailLimits mergeLimits(boolean truncated) {
+        return limits(truncated);
+    }
+
+    private static String str(Object value) {
+        return value == null ? "" : String.valueOf(value);
+    }
+
+    private static String emptyToNull(String value) {
+        return value == null || value.isBlank() ? null : value;
+    }
+
+    private static boolean bool(Object value) {
+        return value instanceof Boolean b && b;
+    }
+
+    private static Long nullableLong(Object value) {
+        if (value instanceof Number n) {
+            return n.longValue();
+        }
+        return null;
+    }
+
+    private static Long longOrNull(Object value) {
+        if (value instanceof Number n) {
+            return n.longValue();
+        }
+        return null;
+    }
+
+    private static Integer intOrNull(Object value) {
+        if (value instanceof Number n) {
+            return n.intValue();
+        }
+        return null;
+    }
+
+    record PreviewResult(String text, boolean truncated, String detailKind) {
+    }
+}
