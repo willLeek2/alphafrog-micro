@@ -643,13 +643,15 @@ services:
       AF_QDRANT_HTTP_PORT: 6333
       AF_RAG_EMBEDDING_CONFIG_FILE: ${AF_RAG_EMBEDDING_CONFIG_FILE:-/app/config-dynamic/rag-embedding.local.json}
       AF_EMBEDDING_API_KEY: ${AF_EMBEDDING_API_KEY:-}
-      # HTTP/HTTPS 代理（访问 Perplexity/Exa/Tavily 等境外服务时使用）
-      HTTP_PROXY: ${HTTP_PROXY-http://host.docker.internal:7890}
-      HTTPS_PROXY: ${HTTPS_PROXY-http://host.docker.internal:7890}
-      http_proxy: ${HTTP_PROXY-http://host.docker.internal:7890}
-      https_proxy: ${HTTPS_PROXY-http://host.docker.internal:7890}
-      NO_PROXY: ${NO_PROXY-localhost,127.0.0.1,nacos,redis,rabbitmq,meilisearch,shared-qdrant,host.docker.internal}
-      no_proxy: ${NO_PROXY-localhost,127.0.0.1,nacos,redis,rabbitmq,meilisearch,shared-qdrant,host.docker.internal}
+      # HTTP/HTTPS 代理（访问 Perplexity/Exa/Tavily 等境外服务时使用）。
+      # 使用 service-specific 变量，避免部署机 shell 的 HTTP_PROXY=http://127.0.0.1:7890
+      # 被直接带入容器；容器内 127.0.0.1 指向容器自身，不是宿主机代理。
+      HTTP_PROXY: ${AF_EXTERNAL_INFO_HTTP_PROXY-http://host.docker.internal:7890}
+      HTTPS_PROXY: ${AF_EXTERNAL_INFO_HTTPS_PROXY-http://host.docker.internal:7890}
+      http_proxy: ${AF_EXTERNAL_INFO_HTTP_PROXY-http://host.docker.internal:7890}
+      https_proxy: ${AF_EXTERNAL_INFO_HTTPS_PROXY-http://host.docker.internal:7890}
+      NO_PROXY: ${AF_EXTERNAL_INFO_NO_PROXY-localhost,127.0.0.1,::1,nacos,redis,rabbitmq,meilisearch,shared-qdrant,host.docker.internal}
+      no_proxy: ${AF_EXTERNAL_INFO_NO_PROXY-localhost,127.0.0.1,::1,nacos,redis,rabbitmq,meilisearch,shared-qdrant,host.docker.internal}
       AF_RAG_INGEST_TOKEN: ${AF_RAG_INGEST_TOKEN:-}
       AF_OSS_ENDPOINT: ${AF_OSS_ENDPOINT:-oss-ap-southeast-1-internal.aliyuncs.com}
       AF_OSS_BUCKET: ${AF_OSS_BUCKET}
