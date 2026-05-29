@@ -76,39 +76,44 @@ final class ToolRouterToolExecutor implements ToolExecutor {
     @Override
     public String execute(ToolExecutionRequest request, Object memoryId) {
         String toolCallId = resolveToolCallId(request);
-        Map<String, Object> params = parseArguments(request.arguments());
-        LangchainRepeatedToolCallGuard.Decision repeatDecision =
-                LangchainRepeatedToolCallGuard.beforeInvoke(request.name(), params, objectMapper);
-        if (repeatDecision.blocked()) {
-            // 重复调用被 block 时也 emit finish，避免 UI card 一直转圈
-            emitToolCallFinished(toolCallId, request.name(), params, false, repeatDecision.outputOrHint(), 0L);
-            return repeatDecision.outputOrHint();
-        }
-
-        // emit STARTED
-        emitToolCallStarted(toolCallId, request.name(), params);
-
-        Instant start = Instant.now();
-        String output = null;
-        boolean success = true;
+        AgentContext.setToolCallId(toolCallId);
         try {
-            ToolRouter.ToolInvocationResult result = toolRouter.invokeWithMeta(request.name(), params);
-            output = result.getOutput();
-            success = result.isSuccess();
-        } catch (Exception e) {
-            output = e.getMessage();
-            success = false;
-            log.warn("Tool invocation failed: tool={}, runId={}", request.name(), AgentContext.getRunId(), e);
-        } finally {
-            long durationMs = Duration.between(start, Instant.now()).toMillis();
-            emitToolCallFinished(toolCallId, request.name(), params, success, output, durationMs);
-        }
+            Map<String, Object> params = parseArguments(request.arguments());
+            LangchainRepeatedToolCallGuard.Decision repeatDecision =
+                    LangchainRepeatedToolCallGuard.beforeInvoke(request.name(), params, objectMapper);
+            if (repeatDecision.blocked()) {
+                // 重复调用被 block 时也 emit finish，避免 UI card 一直转圈
+                emitToolCallFinished(toolCallId, request.name(), params, false, repeatDecision.outputOrHint(), 0L);
+                return repeatDecision.outputOrHint();
+            }
 
-        Map<String, String> datasetRefs = LangchainDatasetRefContext.snapshot();
-        DatasetRefRegistry.registerFromJson(output, datasetRefs);
-        LangchainDatasetRefContext.set(datasetRefs);
-        output = appendDatasetRetryHintIfNeeded(output, datasetRefs);
-        return appendRepeatedToolCallHintIfNeeded(output, repeatDecision);
+            // emit STARTED
+            emitToolCallStarted(toolCallId, request.name(), params);
+
+            Instant start = Instant.now();
+            String output = null;
+            boolean success = true;
+            try {
+                ToolRouter.ToolInvocationResult result = toolRouter.invokeWithMeta(request.name(), params);
+                output = result.getOutput();
+                success = result.isSuccess();
+            } catch (Exception e) {
+                output = e.getMessage();
+                success = false;
+                log.warn("Tool invocation failed: tool={}, runId={}", request.name(), AgentContext.getRunId(), e);
+            } finally {
+                long durationMs = Duration.between(start, Instant.now()).toMillis();
+                emitToolCallFinished(toolCallId, request.name(), params, success, output, durationMs);
+            }
+
+            Map<String, String> datasetRefs = LangchainDatasetRefContext.snapshot();
+            DatasetRefRegistry.registerFromJson(output, datasetRefs);
+            LangchainDatasetRefContext.set(datasetRefs);
+            output = appendDatasetRetryHintIfNeeded(output, datasetRefs);
+            return appendRepeatedToolCallHintIfNeeded(output, repeatDecision);
+        } finally {
+            AgentContext.clearToolCallId();
+        }
     }
 
     /**

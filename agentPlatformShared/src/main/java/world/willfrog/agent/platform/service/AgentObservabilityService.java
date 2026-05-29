@@ -1599,6 +1599,15 @@ public class AgentObservabilityService {
         return UUID.randomUUID().toString().replace("-", "");
     }
 
+    /** Tool trace id 优先与 SSE / safe detail API 的 {@code tool_call_id} 对齐。 */
+    private String resolveToolTraceId() {
+        String toolCallId = nvl(AgentContext.getToolCallId()).trim();
+        if (!toolCallId.isBlank()) {
+            return toolCallId;
+        }
+        return newTraceId();
+    }
+
     /**
      * 向 diagnostics.llmTraces 追加一条不含原始 HTTP 的 LlmTrace。
      *
@@ -1901,7 +1910,7 @@ public class AgentObservabilityService {
             diagnostics.setToolTraces(new ArrayList<>());
         }
         ToolTrace trace = new ToolTrace();
-        trace.setTraceId(newTraceId());
+        trace.setTraceId(resolveToolTraceId());
         trace.setTime(OffsetDateTime.now().toString());
         trace.setRunId(nvl(runId));
         trace.setPhase(normalizePhase(phase));
@@ -2538,19 +2547,21 @@ public class AgentObservabilityService {
         private String decisionExcerpt;
 
         /**
-         * @deprecated 使用 {@link #output} 替代
-         * 保留用于向后兼容（JSON 反序列化）
+         * @deprecated 使用 {@link #outputPreview} 字段；保留用于旧 JSON 与 scrub 写入路径。
          */
         @Deprecated
         public void setOutputPreview(String value) {
-            this.output = value;
+            this.outputPreview = value;
         }
 
         /**
-         * @deprecated 使用 {@link #getOutput()} 替代
+         * @deprecated 优先返回 {@link #outputPreview}；无预览时回退 {@link #output}（旧 trace）。
          */
         @Deprecated
         public String getOutputPreview() {
+            if (outputPreview != null && !outputPreview.isBlank()) {
+                return outputPreview;
+            }
             return this.output;
         }
     }

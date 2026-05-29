@@ -52,6 +52,8 @@ public class AgentContext {
     private static final ThreadLocal<Integer> SUB_AGENT_STEP_INDEX_HOLDER = new ThreadLocal<>();
     /** Python 沙箱代码二次重写(refine)的尝试次数,用于观测和限流 */
     private static final ThreadLocal<Integer> PYTHON_REFINE_ATTEMPT_HOLDER = new ThreadLocal<>();
+    /** 当前 LangChain tool call id（与 SSE {@code tool_call_id} 对齐，供 observability tool trace）。 */
+    private static final ThreadLocal<String> TOOL_CALL_ID_HOLDER = new ThreadLocal<>();
     /** 决策 trace ID,关联到 PlanJudge 等组件产生的决策链 */
     private static final ThreadLocal<String> DECISION_TRACE_ID_HOLDER = new ThreadLocal<>();
     /** 决策所处阶段(配合 traceId 用) */
@@ -218,6 +220,24 @@ public class AgentContext {
      * @param stage   决策所处阶段
      * @param excerpt 决策摘要片段
      */
+    /** 设置当前 tool call id（LangChain {@code ToolExecutionRequest#id()}，与 SSE 对齐）。 */
+    public static void setToolCallId(String toolCallId) {
+        if (toolCallId == null || toolCallId.isBlank()) {
+            TOOL_CALL_ID_HOLDER.remove();
+        } else {
+            TOOL_CALL_ID_HOLDER.set(toolCallId);
+        }
+    }
+
+    /** 获取当前 tool call id，可能为 null。 */
+    public static String getToolCallId() {
+        return TOOL_CALL_ID_HOLDER.get();
+    }
+
+    public static void clearToolCallId() {
+        TOOL_CALL_ID_HOLDER.remove();
+    }
+
     public static void setDecisionContext(String traceId, String stage, String excerpt) {
         DECISION_TRACE_ID_HOLDER.set(traceId);
         DECISION_STAGE_HOLDER.set(stage);
@@ -584,6 +604,7 @@ public class AgentContext {
         clearWorkflow();
         clearSubAgentStepIndex();
         clearPythonRefineAttempt();
+        clearToolCallId();
         clearDecisionContext();
         PROVIDER_LLM_TRACE_ID_HOLDER.remove();
         clearStructuredOutputSpec();
