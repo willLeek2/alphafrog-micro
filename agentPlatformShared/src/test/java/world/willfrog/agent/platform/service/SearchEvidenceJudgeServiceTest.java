@@ -48,7 +48,7 @@ class SearchEvidenceJudgeServiceTest {
                 "cheap-judge", "https://example.com/v1", "small-model", "key", "", List.of(), null);
         when(selectorService.selectCandidates()).thenReturn(List.of(selection));
         when(aiServiceFactory.resolveLlm("cheap-judge", "small-model")).thenReturn(resolved);
-        when(aiServiceFactory.buildChatModelWithProviderOrderAndTemperature(resolved, List.of(), 0.0D))
+        when(aiServiceFactory.buildChatModelWithProviderOrderAndTemperature(resolved, List.of(), 0.0D, SearchEvidenceJudgeService.JUDGE_MAX_TOKENS))
                 .thenReturn(model);
         when(model.chat(any(List.class))).thenReturn(ChatResponse.builder()
                 .aiMessage(new AiMessage("""
@@ -68,7 +68,7 @@ class SearchEvidenceJudgeServiceTest {
         assertFalse(result.hits().get(0).entityMatch());
         assertEquals("实体C", result.hits().get(0).outOfScopeEntities().get(0));
         assertTrue(result.citations().get(0).entityMatch());
-        verify(aiServiceFactory).buildChatModelWithProviderOrderAndTemperature(resolved, List.of(), 0.0D);
+        verify(aiServiceFactory).buildChatModelWithProviderOrderAndTemperature(resolved, List.of(), 0.0D, SearchEvidenceJudgeService.JUDGE_MAX_TOKENS);
 
         ArgumentCaptor<List<ChatMessage>> captor = ArgumentCaptor.forClass(List.class);
         verify(model).chat(captor.capture());
@@ -90,7 +90,7 @@ class SearchEvidenceJudgeServiceTest {
         assertTrue(result.hits().get(0).entityMatch());
         assertFalse(result.hits().get(0).relevanceJudged());
         assertTrue(result.hits().get(0).relevanceWarning().contains("judge 未完成"));
-        verify(aiServiceFactory, never()).buildChatModelWithProviderOrderAndTemperature(any(), any(), any());
+        verify(aiServiceFactory, never()).buildChatModelWithProviderOrderAndTemperature(any(), any(), any(), any());
     }
 
     @Test
@@ -185,7 +185,7 @@ class SearchEvidenceJudgeServiceTest {
                 "cheap-judge", "https://example.com/v1", "small-model", "key", "", List.of(), null);
         when(selectorService.selectCandidates()).thenReturn(List.of(selection));
         when(aiServiceFactory.resolveLlm("cheap-judge", "small-model")).thenReturn(resolved);
-        when(aiServiceFactory.buildChatModelWithProviderOrderAndTemperature(resolved, List.of(), 0.0D))
+        when(aiServiceFactory.buildChatModelWithProviderOrderAndTemperature(resolved, List.of(), 0.0D, SearchEvidenceJudgeService.JUDGE_MAX_TOKENS))
                 .thenReturn(model);
         return service;
     }

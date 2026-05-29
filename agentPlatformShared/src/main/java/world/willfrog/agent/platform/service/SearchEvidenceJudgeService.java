@@ -23,6 +23,7 @@ import java.util.Map;
 public class SearchEvidenceJudgeService {
 
     public static final String STAGE = "search_evidence_judge";
+    static final int JUDGE_MAX_TOKENS = 2048;
     private static final int MAX_TITLE_CHARS = 200;
     private static final int MAX_SNIPPET_CHARS = 600;
     private static final int MAX_URL_CHARS = 400;
@@ -78,7 +79,7 @@ public class SearchEvidenceJudgeService {
                 AgentLlmResolver.ResolvedLlm resolved = aiServiceFactory.resolveLlm(
                         candidate.getEndpointName(), candidate.getModelName());
                 ChatModel model = aiServiceFactory.buildChatModelWithProviderOrderAndTemperature(
-                        resolved, List.of(), 0.0D);
+                        resolved, List.of(), 0.0D, JUDGE_MAX_TOKENS);
                 return new SelectionAndModel(candidate, model);
             } catch (Exception e) {
                 log.warn("Init search evidence judge model failed: endpoint={}, model={}, err={}",
