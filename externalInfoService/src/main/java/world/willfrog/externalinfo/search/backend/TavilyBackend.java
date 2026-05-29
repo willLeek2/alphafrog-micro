@@ -10,6 +10,7 @@ import world.willfrog.externalinfo.search.profile.GlobalUserProfileInjector;
 import world.willfrog.externalinfo.search.profile.ProfileContext;
 
 import java.net.URI;
+import java.net.ProxySelector;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
@@ -98,6 +99,7 @@ public class TavilyBackend implements SearchBackend {
             applyExtraHeaders(config, requestBuilder);
 
             HttpClient client = HttpClient.newBuilder()
+                    .proxy(ProxySelector.getDefault())
                     .connectTimeout(Duration.ofSeconds(resolveConnectTimeout(config)))
                     .build();
             HttpResponse<String> response = client.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString());

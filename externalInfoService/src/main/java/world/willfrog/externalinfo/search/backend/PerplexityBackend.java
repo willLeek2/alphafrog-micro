@@ -11,6 +11,7 @@ import world.willfrog.externalinfo.search.SearchLlmConfigResolver;
 import world.willfrog.externalinfo.search.WebSearchExecutionContext;
 
 import java.net.URI;
+import java.net.ProxySelector;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
@@ -99,6 +100,7 @@ public class PerplexityBackend implements SearchBackend {
             applyExtraHeaders(config, requestBuilder);
 
             HttpClient client = HttpClient.newBuilder()
+                    .proxy(ProxySelector.getDefault())
                     .connectTimeout(Duration.ofSeconds(resolveConnectTimeout(config)))
                     .build();
             HttpResponse<String> response = client.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString());

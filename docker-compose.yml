@@ -643,20 +643,20 @@ services:
       AF_QDRANT_HTTP_PORT: 6333
       AF_RAG_EMBEDDING_CONFIG_FILE: ${AF_RAG_EMBEDDING_CONFIG_FILE:-/app/config-dynamic/rag-embedding.local.json}
       AF_EMBEDDING_API_KEY: ${AF_EMBEDDING_API_KEY:-}
-      # HTTP/HTTPS 代理（访问 Perplexity/Exa 等境外服务时使用）
-      HTTP_PROXY: ${HTTP_PROXY:-}
-      HTTPS_PROXY: ${HTTPS_PROXY:-}
-      http_proxy: ${HTTP_PROXY:-}
-      https_proxy: ${HTTPS_PROXY:-}
-      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1,nacos,redis,rabbitmq,meilisearch,shared-qdrant}
-      no_proxy: ${NO_PROXY:-localhost,127.0.0.1,nacos,redis,rabbitmq,meilisearch,shared-qdrant}
+      # HTTP/HTTPS 代理（访问 Perplexity/Exa/Tavily 等境外服务时使用）
+      HTTP_PROXY: ${HTTP_PROXY-http://host.docker.internal:7890}
+      HTTPS_PROXY: ${HTTPS_PROXY-http://host.docker.internal:7890}
+      http_proxy: ${HTTP_PROXY-http://host.docker.internal:7890}
+      https_proxy: ${HTTPS_PROXY-http://host.docker.internal:7890}
+      NO_PROXY: ${NO_PROXY-localhost,127.0.0.1,nacos,redis,rabbitmq,meilisearch,shared-qdrant,host.docker.internal}
+      no_proxy: ${NO_PROXY-localhost,127.0.0.1,nacos,redis,rabbitmq,meilisearch,shared-qdrant,host.docker.internal}
       AF_RAG_INGEST_TOKEN: ${AF_RAG_INGEST_TOKEN:-}
       AF_OSS_ENDPOINT: ${AF_OSS_ENDPOINT:-oss-ap-southeast-1-internal.aliyuncs.com}
       AF_OSS_BUCKET: ${AF_OSS_BUCKET}
       AF_OSS_ACCESS_KEY_ID: ${AF_OSS_ACCESS_KEY_ID}
       AF_OSS_ACCESS_KEY_SECRET: ${AF_OSS_ACCESS_KEY_SECRET}
       AF_OSS_PATH_PREFIX: ${AF_OSS_PATH_PREFIX:-alphafrog-rag}
-      JAVA_TOOL_OPTIONS: "-Xms256m -Xmx512m"
+      JAVA_TOOL_OPTIONS: "-Xms256m -Xmx512m ${AF_EXTERNAL_INFO_JAVA_PROXY_OPTIONS--Dhttp.proxyHost=host.docker.internal -Dhttp.proxyPort=7890 -Dhttps.proxyHost=host.docker.internal -Dhttps.proxyPort=7890 -Dhttp.nonProxyHosts=localhost|127.0.0.1|nacos|redis|rabbitmq|meilisearch|shared-qdrant|host.docker.internal}"
       DUBBO_PROTOCOL_HOST: ${DUBBO_PROTOCOL_HOST:-}
     volumes:
       - ./externalInfoService/config:/app/config:ro
