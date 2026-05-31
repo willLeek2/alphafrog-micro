@@ -53,11 +53,11 @@ class AgentEventServiceTest {
         service = new AgentEventService(
                 runMapper,
                 eventMapper,
+                eventRedisStore,
                 objectMapper,
                 redisTemplate,
                 llmLocalConfigLoader,
-                messageService,
-                eventRedisStore
+                messageService
         );
     }
 
