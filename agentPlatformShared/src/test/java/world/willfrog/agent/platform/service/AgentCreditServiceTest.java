@@ -11,7 +11,6 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.entity.AgentRunEvent;
-import world.willfrog.agent.platform.mapper.AgentRunEventMapper;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.alphafrogmicro.common.dao.agent.AgentCreditApplicationDao;
 import world.willfrog.alphafrogmicro.common.dao.agent.AgentCreditLedgerDao;
@@ -38,7 +37,7 @@ class AgentCreditServiceTest {
     @Mock
     private AgentRunMapper runMapper;
     @Mock
-    private AgentRunEventMapper eventMapper;
+    private AgentEventService eventService;
     @Mock
     private AgentModelCatalogService modelCatalogService;
 
@@ -51,7 +50,7 @@ class AgentCreditServiceTest {
                 creditApplicationDao,
                 creditLedgerDao,
                 runMapper,
-                eventMapper,
+                eventService,
                 modelCatalogService,
                 new ObjectMapper()
         );

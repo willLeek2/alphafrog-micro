@@ -4,7 +4,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.entity.AgentRunEvent;
-import world.willfrog.agent.platform.mapper.AgentRunEventMapper;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentArtifactService;
@@ -31,7 +30,6 @@ import static org.mockito.Mockito.*;
 class LangchainRunReadServiceTest {
 
     private final AgentRunMapper runMapper = mock(AgentRunMapper.class);
-    private final AgentRunEventMapper eventMapper = mock(AgentRunEventMapper.class);
     private final AgentEventService eventService = mock(AgentEventService.class);
     private final AgentRunStateStore stateStore = mock(AgentRunStateStore.class);
     private final AgentObservabilityService observabilityService = mock(AgentObservabilityService.class);
@@ -45,7 +43,6 @@ class LangchainRunReadServiceTest {
 
     private final LangchainRunReadService service = new LangchainRunReadService(
             runMapper,
-            eventMapper,
             eventService,
             stateStore,
             observabilityService,
@@ -77,7 +74,7 @@ class LangchainRunReadServiceTest {
         when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(run);
         AgentRunEvent event1 = event(3, "PLAN_READY");
         AgentRunEvent event2 = event(4, "TODO_STARTED");
-        when(eventMapper.listByRunIdAfterSeq("r1", 2, 2)).thenReturn(List.of(event1, event2));
+        when(eventService.listByRunIdAfterSeq("r1", 2, 2)).thenReturn(List.of(event1, event2));
 
         var response = service.listEvents(ListAgentRunEventsRequest.newBuilder()
                 .setUserId("u1")
@@ -98,7 +95,7 @@ class LangchainRunReadServiceTest {
         when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(run);
         AgentRunEvent event9 = event(9, "TOOL_CALL_STARTED");
         AgentRunEvent event10 = event(10, "TOOL_CALL_FINISHED");
-        when(eventMapper.listLatestByRunId("r1", 10)).thenReturn(List.of(event9, event10));
+        when(eventService.listLatestByRunId("r1", 10)).thenReturn(List.of(event9, event10));
 
         var response = service.listEvents(ListAgentRunEventsRequest.newBuilder()
                 .setUserId("u1")
@@ -119,7 +116,7 @@ class LangchainRunReadServiceTest {
         run.setSnapshotJson("{\"answer_markdown\":\"done\"}");
         when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(run);
         when(observabilityService.loadObservabilityJson("r1", run.getSnapshotJson())).thenReturn("{\"summary\":{}}");
-        when(eventMapper.listByRunId("r1")).thenReturn(List.of());
+        when(eventService.listByRunId("r1")).thenReturn(List.of());
         when(creditService.calculateRunTotalCredits(eq(run), anyList(), eq("{\"summary\":{}}"))).thenReturn(7);
 
         var result = service.getResult(GetAgentRunResultRequest.newBuilder()
@@ -140,8 +137,8 @@ class LangchainRunReadServiceTest {
         when(stateStore.buildProgressJson("r1", run.getPlanJson())).thenReturn("{\"progress\":true}");
         when(observabilityService.loadObservabilitySummaryJson("r1", run.getSnapshotJson())).thenReturn("{\"summary\":true}");
         when(observabilityService.isFullObservabilityAvailable("r1", run.getSnapshotJson())).thenReturn(true);
-        when(eventMapper.listByRunId("r1")).thenReturn(List.of());
-        when(eventMapper.findMaxSeq("r1")).thenReturn(4);
+        when(eventService.listByRunId("r1")).thenReturn(List.of());
+        when(eventService.findMaxSeq("r1")).thenReturn(4);
 
         var status = service.getStatus(GetAgentRunStatusRequest.newBuilder()
                 .setUserId("u1")

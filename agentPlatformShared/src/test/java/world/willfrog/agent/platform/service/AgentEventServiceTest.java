@@ -41,6 +41,8 @@ class AgentEventServiceTest {
     private AgentLlmLocalConfigLoader llmLocalConfigLoader;
     @Mock
     private AgentMessageService messageService;
+    @Mock
+    private AgentRunEventRedisStore eventRedisStore;
 
     private AgentEventService service;
     private ObjectMapper objectMapper;
@@ -54,7 +56,8 @@ class AgentEventServiceTest {
                 objectMapper,
                 redisTemplate,
                 llmLocalConfigLoader,
-                messageService
+                messageService,
+                eventRedisStore
         );
     }
 
@@ -68,6 +71,7 @@ class AgentEventServiceTest {
 
         service.append("r1", "u1", "PLAN_READY", Map.of("ok", true));
 
+        verify(eventRedisStore).append(any());
         ArgumentCaptor<String> payloadCaptor = ArgumentCaptor.forClass(String.class);
         verify(redisTemplate).convertAndSend(eq("agent:events:r1"), payloadCaptor.capture());
         Map<?, ?> envelope = objectMapper.readValue(payloadCaptor.getValue(), Map.class);

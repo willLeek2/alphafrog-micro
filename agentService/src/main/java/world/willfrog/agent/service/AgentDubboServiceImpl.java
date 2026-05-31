@@ -265,9 +265,9 @@ public class AgentDubboServiceImpl extends DubboAgentDubboServiceTriple.AgentDub
         List<AgentRunEvent> events;
         boolean hasMore = false;
         if (request.getLatest()) {
-            events = eventMapper.listLatestByRunId(request.getId(), limit);
+            events = eventService.listLatestByRunId(request.getId(), limit);
         } else {
-            events = eventMapper.listByRunIdAfterSeq(request.getId(), afterSeq, limit + 1);
+            events = eventService.listByRunIdAfterSeq(request.getId(), afterSeq, limit + 1);
             hasMore = events.size() > limit;
             if (hasMore) {
                 events = events.subList(0, limit);
@@ -474,7 +474,7 @@ public class AgentDubboServiceImpl extends DubboAgentDubboServiceTriple.AgentDub
         }
         int totalCreditsConsumed = creditService.calculateRunTotalCredits(
                 run,
-                eventMapper.listByRunId(run.getId()),
+                eventService.listByRunId(run.getId()),
                 observabilityJson
         );
         return AgentRunResultMessage.newBuilder()
@@ -498,7 +498,7 @@ public class AgentDubboServiceImpl extends DubboAgentDubboServiceTriple.AgentDub
     @Override
     public AgentRunStatusMessage getStatus(GetAgentRunStatusRequest request) {
         AgentRun run = requireRun(request.getId(), request.getUserId());
-        AgentRunEvent latestEvent = eventMapper.findLatestByRunId(run.getId());
+        AgentRunEvent latestEvent = eventService.findLatestByRunId(run.getId());
         String planJson = run.getPlanJson() == null ? "" : run.getPlanJson();
         var cachedPlan = stateStore.loadPlan(run.getId());
         if (cachedPlan.isPresent()) {
@@ -513,12 +513,12 @@ public class AgentDubboServiceImpl extends DubboAgentDubboServiceTriple.AgentDub
         boolean observabilityFullAvailable = observabilityService.isFullObservabilityAvailable(run.getId(), run.getSnapshotJson());
         int totalCreditsConsumed = creditService.calculateRunTotalCredits(
                 run,
-                eventMapper.listByRunId(run.getId()),
+                eventService.listByRunId(run.getId()),
                 observabilitySummaryJson
         );
 
         // 事件总数
-        Integer maxSeq = eventMapper.findMaxSeq(run.getId());
+        Integer maxSeq = eventService.findMaxSeq(run.getId());
         int eventCount = maxSeq != null ? maxSeq : 0;
 
         // 时间戳（epoch millis）

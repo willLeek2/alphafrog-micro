@@ -457,6 +457,9 @@ public class AgentLlmLocalConfigLoader {
         if (cfg.getExecutor() == null) {
             cfg.setExecutor(null);
         }
+        if (cfg.getEventStore() == null) {
+            cfg.setEventStore(null);
+        }
         return cfg;
     }
 

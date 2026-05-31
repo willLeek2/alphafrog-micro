@@ -302,6 +302,10 @@
     "queueCapacity": 50,
     "threadNamePrefix": "agent-langchain-run-"
   },
+  "eventStore": {
+    "redisFlushBatchSize": 20,
+    "redisFlushStaleMs": 3000
+  },
   "prompts": {
     "agentRunSystemPrompt": "file:prompts/agent/agent_run_system.txt",
     "todoPlannerSystemPromptTemplate": "file:prompts/todo/todo_planner_system.txt",

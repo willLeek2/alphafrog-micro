@@ -20,6 +20,7 @@ public class AgentLlmProperties {
     private Debug debug = new Debug();
     private OpenRouterConfig openrouter = new OpenRouterConfig();
     private ExecutorConfig executor = new ExecutorConfig();
+    private EventStoreConfig eventStore = new EventStoreConfig();
 
     public String getDefaultEndpoint() {
         return defaultEndpoint;
@@ -99,6 +100,14 @@ public class AgentLlmProperties {
 
     public void setExecutor(ExecutorConfig executor) {
         this.executor = executor == null ? new ExecutorConfig() : executor;
+    }
+
+    public EventStoreConfig getEventStore() {
+        return eventStore;
+    }
+
+    public void setEventStore(EventStoreConfig eventStore) {
+        this.eventStore = eventStore == null ? new EventStoreConfig() : eventStore;
     }
 
     public static class Endpoint {
@@ -1743,6 +1752,35 @@ public class AgentLlmProperties {
 
         public void setDataFormat(String dataFormat) {
             this.dataFormat = dataFormat;
+        }
+    }
+
+    /**
+     * Agent run event 持久化相关配置（Nacos → agent-llm.local.json 热更新）。
+     */
+    public static class EventStoreConfig {
+        /**
+         * Redis ZSET 批量刷写条数 K：每累积 K 条 event 才 pipeline 写一次 Redis。
+         * 设为 1 则与逐条写等价。读路径会先 flush 该 run 的 pending，避免漏读。
+         */
+        private Integer redisFlushBatchSize;
+        /** Pending buffer 超过该毫秒数未刷写时，由定时任务兜底 flush（默认 3s）。 */
+        private Integer redisFlushStaleMs;
+
+        public Integer getRedisFlushBatchSize() {
+            return redisFlushBatchSize;
+        }
+
+        public void setRedisFlushBatchSize(Integer redisFlushBatchSize) {
+            this.redisFlushBatchSize = redisFlushBatchSize;
+        }
+
+        public Integer getRedisFlushStaleMs() {
+            return redisFlushStaleMs;
+        }
+
+        public void setRedisFlushStaleMs(Integer redisFlushStaleMs) {
+            this.redisFlushStaleMs = redisFlushStaleMs;
         }
     }
 

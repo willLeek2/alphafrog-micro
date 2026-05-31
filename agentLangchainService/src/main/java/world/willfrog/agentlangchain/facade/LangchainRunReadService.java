@@ -7,7 +7,6 @@ import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.entity.AgentRunEvent;
 import world.willfrog.agent.platform.entity.AgentRunMessage;
-import world.willfrog.agent.platform.mapper.AgentRunEventMapper;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentArtifactService;
@@ -109,7 +108,6 @@ import java.util.Map;
 public class LangchainRunReadService {
 
     private final AgentRunMapper runMapper;
-    private final AgentRunEventMapper eventMapper;
     private final AgentEventService eventService;
     private final AgentRunStateStore stateStore;
     private final AgentObservabilityService observabilityService;
@@ -191,9 +189,9 @@ public class LangchainRunReadService {
         List<AgentRunEvent> events;
         boolean hasMore = false;
         if (request.getLatest()) {
-            events = eventMapper.listLatestByRunId(request.getId(), limit);
+            events = eventService.listLatestByRunId(request.getId(), limit);
         } else {
-            events = eventMapper.listByRunIdAfterSeq(request.getId(), afterSeq, limit + 1);
+            events = eventService.listByRunIdAfterSeq(request.getId(), afterSeq, limit + 1);
             hasMore = events.size() > limit;
             if (hasMore) {
                 events = events.subList(0, limit);
@@ -220,7 +218,7 @@ public class LangchainRunReadService {
         if (snapshot.get("structured_answer") != null) {
             structuredAnswerJson = writeJson(snapshot.get("structured_answer"));
         }
-        int totalCredits = creditService.calculateRunTotalCredits(run, eventMapper.listByRunId(run.getId()), observabilityJson);
+        int totalCredits = creditService.calculateRunTotalCredits(run, eventService.listByRunId(run.getId()), observabilityJson);
         return AgentRunResultMessage.newBuilder()
                 .setId(nvl(run.getId()))
                 .setStatus(run.getStatus() == null ? "" : run.getStatus().name())
@@ -251,7 +249,7 @@ public class LangchainRunReadService {
      */
     public AgentRunStatusMessage getStatus(GetAgentRunStatusRequest request) {
         AgentRun run = requireReadableRun(request.getId(), request.getUserId());
-        AgentRunEvent latestEvent = eventMapper.findLatestByRunId(run.getId());
+        AgentRunEvent latestEvent = eventService.findLatestByRunId(run.getId());
         String planJson = nvl(run.getPlanJson());
         var cachedPlan = stateStore.loadPlan(run.getId());
         if (cachedPlan.isPresent()) {
@@ -260,8 +258,8 @@ public class LangchainRunReadService {
         String progressJson = planJson.isBlank() ? "" : stateStore.buildProgressJson(run.getId(), planJson);
         String observabilitySummaryJson = observabilityService.loadObservabilitySummaryJson(run.getId(), run.getSnapshotJson());
         boolean observabilityFullAvailable = observabilityService.isFullObservabilityAvailable(run.getId(), run.getSnapshotJson());
-        int totalCredits = creditService.calculateRunTotalCredits(run, eventMapper.listByRunId(run.getId()), observabilitySummaryJson);
-        Integer maxSeq = eventMapper.findMaxSeq(run.getId());
+        int totalCredits = creditService.calculateRunTotalCredits(run, eventService.listByRunId(run.getId()), observabilitySummaryJson);
+        Integer maxSeq = eventService.findMaxSeq(run.getId());
         return toStatusMessage(
                 run,
                 latestEvent,
