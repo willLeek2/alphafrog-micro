@@ -454,6 +454,9 @@ public class AgentLlmLocalConfigLoader {
         if (cfg.getOpenrouter() == null) {
             cfg.setOpenrouter(null);
         }
+        if (cfg.getExecutor() == null) {
+            cfg.setExecutor(null);
+        }
         return cfg;
     }
 

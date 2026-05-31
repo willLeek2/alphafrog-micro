@@ -19,6 +19,7 @@ public class AgentLlmProperties {
     private Prompts prompts = new Prompts();
     private Debug debug = new Debug();
     private OpenRouterConfig openrouter = new OpenRouterConfig();
+    private ExecutorConfig executor = new ExecutorConfig();
 
     public String getDefaultEndpoint() {
         return defaultEndpoint;
@@ -90,6 +91,14 @@ public class AgentLlmProperties {
 
     public void setOpenrouter(OpenRouterConfig openrouter) {
         this.openrouter = openrouter == null ? new OpenRouterConfig() : openrouter;
+    }
+
+    public ExecutorConfig getExecutor() {
+        return executor;
+    }
+
+    public void setExecutor(ExecutorConfig executor) {
+        this.executor = executor == null ? new ExecutorConfig() : executor;
     }
 
     public static class Endpoint {
@@ -1734,6 +1743,45 @@ public class AgentLlmProperties {
 
         public void setDataFormat(String dataFormat) {
             this.dataFormat = dataFormat;
+        }
+    }
+
+    public static class ExecutorConfig {
+        private Integer corePoolSize;
+        private Integer maxPoolSize;
+        private Integer queueCapacity;
+        private String threadNamePrefix;
+
+        public Integer getCorePoolSize() {
+            return corePoolSize;
+        }
+
+        public void setCorePoolSize(Integer corePoolSize) {
+            this.corePoolSize = corePoolSize;
+        }
+
+        public Integer getMaxPoolSize() {
+            return maxPoolSize;
+        }
+
+        public void setMaxPoolSize(Integer maxPoolSize) {
+            this.maxPoolSize = maxPoolSize;
+        }
+
+        public Integer getQueueCapacity() {
+            return queueCapacity;
+        }
+
+        public void setQueueCapacity(Integer queueCapacity) {
+            this.queueCapacity = queueCapacity;
+        }
+
+        public String getThreadNamePrefix() {
+            return threadNamePrefix;
+        }
+
+        public void setThreadNamePrefix(String threadNamePrefix) {
+            this.threadNamePrefix = threadNamePrefix;
         }
     }
 }
