@@ -2,6 +2,7 @@ package world.willfrog.agentlangchain.orchestration.dag;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.context.AgentContext;
@@ -86,6 +87,7 @@ public class LangchainDagWorkflowExecutor {
     private final LangchainRunExecutionGuard executionGuard;
     private final AgentPromptService promptService;
     private final ObjectMapper objectMapper;
+    private final ObjectProvider<world.willfrog.agent.platform.service.AgentRunStateStore> stateStoreProvider;
 
     /**
      * DAG 执行线程池大小，默认 4。线程数受限于两个因素：
@@ -590,36 +592,52 @@ public class LangchainDagWorkflowExecutor {
                     eventService.append(runId, userId, "DAG_RECOVERY_JUDGE_FINISHED", Map.of(
                             "decision", "NO",
                             "rationale", truncatedRationale,
-                            "recoveryJudgeDecisionId", recoveryJudgeDecisionId
+                            "recovery_judge_decision_id", recoveryJudgeDecisionId
                     ));
                 }
                 return null;
             }
 
-            // YES 判定 → 发射事件 + 重调度未被阻塞的剩余节点
+            // YES 判定 → 过滤出 plan 中实际存在的 skipId
+            List<String> validSkipIds = skipTodoIds.stream()
+                    .filter(id -> graph.getItemMap().containsKey(id))
+                    .toList();
+            List<String> invalidSkipIds = skipTodoIds.stream()
+                    .filter(id -> !graph.getItemMap().containsKey(id))
+                    .toList();
+
+            // 发射事件 + 重调度未被阻塞的剩余节点
             if (!isBlank(runId) && !isBlank(userId)) {
-                eventService.append(runId, userId, "DAG_RECOVERY_JUDGE_FINISHED", Map.of(
-                        "decision", "YES",
-                        "skipTodoIds", skipTodoIds,
-                        "rationale", truncatedRationale,
-                        "recoveryJudgeDecisionId", recoveryJudgeDecisionId
-                ));
-                for (String skipId : skipTodoIds) {
+                Map<String, Object> judgeFinishedPayload = new LinkedHashMap<>();
+                judgeFinishedPayload.put("decision", "YES");
+                judgeFinishedPayload.put("skipTodoIds", validSkipIds);
+                judgeFinishedPayload.put("rationale", truncatedRationale);
+                judgeFinishedPayload.put("recovery_judge_decision_id", recoveryJudgeDecisionId);
+                if (!invalidSkipIds.isEmpty()) {
+                    judgeFinishedPayload.put("invalid_skip_todo_ids", invalidSkipIds);
+                }
+                eventService.append(runId, userId, "DAG_RECOVERY_JUDGE_FINISHED", judgeFinishedPayload);
+
+                for (String skipId : validSkipIds) {
+                    TodoItem skipItem = graph.getItemMap().get(skipId);
                     Map<String, Object> skippedPayload = new LinkedHashMap<>();
                     skippedPayload.put("todo_id", skipId);
+                    skippedPayload.put("todo_sequence", skipItem.getSequence());
                     skippedPayload.put("reason", "judge_recovery");
                     skippedPayload.put("recovery_judge_decision_id", recoveryJudgeDecisionId);
                     skippedPayload.put("workflow", "dag");
                     skippedPayload.put("phase", "dag_recovery_judge");
                     eventService.append(runId, userId, "TODO_NODE_SKIPPED", skippedPayload);
                 }
+                // 将 judge recovery 跳过的有效节点写入 WorkflowState
+                patchWorkflowStateForRecovery(runId, validSkipIds);
             }
 
             // 准备第二遍 DAG 执行：将 judge 决定跳过的失败节点标记为 "recovered"，
             // 清除因依赖这些节点而被 SKIPPED 的下游节点结果，使它们能重新调度
             Map<String, LangchainTodoNodeResult> preResults = new LinkedHashMap<>();
             Map<String, Boolean> preNodeSuccess = new ConcurrentHashMap<>();
-            Set<String> skipSet = Set.copyOf(skipTodoIds);
+            Set<String> skipSet = Set.copyOf(validSkipIds);
             for (TodoItem item : items) {
                 LangchainTodoNodeResult r = results.get(item.getId());
                 if (r == null) continue;
@@ -680,7 +698,7 @@ public class LangchainDagWorkflowExecutor {
                     .plan(plan)
                     .completedTodos(allCompleted)
                     .toolCallsUsed(toolCalls.get())
-                    .skippedTodoIds(skipTodoIds)
+                    .skippedTodoIds(validSkipIds)
                     .recoveryJudgeDecisionId(recoveryJudgeDecisionId)
                     .recoveryRationale(truncatedRationale)
                     .build();
@@ -690,7 +708,8 @@ public class LangchainDagWorkflowExecutor {
             if (!isBlank(runId) && !isBlank(userId)) {
                 eventService.append(runId, userId, "DAG_RECOVERY_JUDGE_FINISHED", Map.of(
                         "decision", "ERROR",
-                        "error", nvl(e.getMessage())
+                        "error", nvl(e.getMessage()),
+                        "error_type", e.getClass().getSimpleName()
                 ));
             }
             return null;
@@ -740,6 +759,28 @@ public class LangchainDagWorkflowExecutor {
             sb.append("（无）\n");
         }
         return sb.toString();
+    }
+
+    private void patchWorkflowStateForRecovery(String runId, List<String> skipTodoIds) {
+        if (isBlank(runId) || skipTodoIds.isEmpty()) return;
+        try {
+            world.willfrog.agent.platform.service.AgentRunStateStore stateStore = stateStoreProvider.getIfAvailable();
+            if (stateStore == null) return;
+            var existing = stateStore.loadWorkflowState(runId);
+            if (existing.isEmpty()) return;
+            var ws = existing.get();
+            if (ws.getCompletedItems() != null) {
+                for (var item : ws.getCompletedItems()) {
+                    if (skipTodoIds.contains(item.getId())) {
+                        item.setStatus(TodoStatus.SKIPPED);
+                        item.setResultSummary("[recovered by judge]");
+                    }
+                }
+            }
+            stateStore.saveWorkflowState(runId, ws);
+        } catch (Exception e) {
+            log.warn("Failed to patch WorkflowState for recovery judge: {}", e.getMessage());
+        }
     }
 
     // ========== 原有方法 ==========

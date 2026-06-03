@@ -38,7 +38,10 @@ class LangchainDagWorkflowExecutorTest {
                 nodeExecutor,
                 stateRecorder,
                 eventService,
-                executionGuard);
+                executionGuard,
+                mock(world.willfrog.agent.platform.service.AgentPromptService.class),
+                new com.fasterxml.jackson.databind.ObjectMapper(),
+                mock(org.springframework.beans.factory.ObjectProvider.class));
         ReflectionTestUtils.setField(executor, "dagThreadPoolSize", 1);
         when(nodeExecutor.execute(any(), any(), any(), any(), any(AtomicInteger.class)))
                 .thenAnswer(invocation -> {
