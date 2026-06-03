@@ -575,6 +575,8 @@ public class FetchTopicConsumer {
                                         .setEndDate(str(p, "end_date"))
                                         .setOffset(num(p, "offset"))
                                         .setLimit(num(p, "limit"))
+                                        .setEtfOffset(num(p, "etf_offset"))
+                                        .setEtfBatchLimit(num(p, "etf_batch_limit"))
                                         .build();
                         result = domesticFundFetchService.fetchEtfAdjFactor(request).getFetchedItemsCount();
                     } else {

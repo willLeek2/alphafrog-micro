@@ -340,6 +340,9 @@ message DomesticEtfAdjFactorFetchRequest {
   string endDate = 4;
   int32 offset = 5;
   int32 limit = 6;
+  // 本地 ETF ts_code 批次参数；不复用 offset/limit，后者仍表示 TuShare API 分页。
+  int32 etfOffset = 7;
+  int32 etfBatchLimit = 8;
 }
 
 message DomesticEtfAdjFactorFetchResponse {

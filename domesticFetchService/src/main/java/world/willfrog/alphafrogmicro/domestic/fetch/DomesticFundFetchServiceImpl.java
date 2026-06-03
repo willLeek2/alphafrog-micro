@@ -5,6 +5,7 @@ import com.alibaba.fastjson.JSONObject;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.dubbo.config.annotation.DubboService;
 import org.springframework.stereotype.Service;
+import world.willfrog.alphafrogmicro.common.dao.domestic.etf.EtfInfoDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.fund.FundInfoDao;
 import world.willfrog.alphafrogmicro.common.utils.DateConvertUtils;
 import world.willfrog.alphafrogmicro.domestic.fetch.utils.DomesticFundStoreUtils;
@@ -25,13 +26,16 @@ public class DomesticFundFetchServiceImpl extends DomesticFundFetchServiceImplBa
     private final TuShareRequestUtils tuShareRequestUtils;
     private final DomesticFundStoreUtils domesticFundStoreUtils;
     private final FundInfoDao fundInfoDao;
+    private final EtfInfoDao etfInfoDao;
 
     public DomesticFundFetchServiceImpl(TuShareRequestUtils tuShareRequestUtils,
                                         DomesticFundStoreUtils domesticFundStoreUtils,
-                                        FundInfoDao fundInfoDao) {
+                                        FundInfoDao fundInfoDao,
+                                        EtfInfoDao etfInfoDao) {
         this.tuShareRequestUtils = tuShareRequestUtils;
         this.domesticFundStoreUtils = domesticFundStoreUtils;
         this.fundInfoDao = fundInfoDao;
+        this.etfInfoDao = etfInfoDao;
     }
 
 
@@ -356,6 +360,63 @@ public class DomesticFundFetchServiceImpl extends DomesticFundFetchServiceImplBa
         }
     }
 
+
+    // ==================== ETF 复权因子：本地 ETF 批次模式 ====================
+
+    private int fetchEtfAdjFactorForLocalEtfBatch(DomesticEtfAdjFactorFetchRequest request) {
+        int etfOffset = Math.max(0, request.getEtfOffset());
+        int etfBatchLimit = request.getEtfBatchLimit();
+        String startDate = request.getStartDate();
+        String endDate = request.getEndDate();
+
+        List<String> etfTsCodes = etfInfoDao.getEtfTsCodes(etfOffset, etfBatchLimit);
+        if (etfTsCodes == null || etfTsCodes.isEmpty()) {
+            log.info("本地 ETF 批次为空: etfOffset={} etfBatchLimit={}", etfOffset, etfBatchLimit);
+            return 0;
+        }
+
+        int totalRows = 0;
+        for (String tsCode : etfTsCodes) {
+            int affectedRows = fetchEtfAdjFactorForOneEtf(tsCode, startDate, endDate);
+            if (affectedRows < 0) {
+                return affectedRows;
+            }
+            totalRows += affectedRows;
+            sleepQuietly(200);
+        }
+        return totalRows;
+    }
+
+    private int fetchEtfAdjFactorForOneEtf(String tsCode,
+                                            String startDate,
+                                            String endDate) {
+        Map<String, Object> params = new HashMap<>();
+        Map<String, Object> queryParams = new HashMap<>();
+
+        params.put("api_name", "fund_adj");
+        queryParams.put("ts_code", tsCode);
+        queryParams.put("trade_date", "");
+        queryParams.put("start_date", startDate);
+        queryParams.put("end_date", endDate);
+        queryParams.put("offset", "");
+        queryParams.put("limit", "");
+        params.put("params", queryParams);
+        params.put("fields", "ts_code,trade_date,adj_factor");
+
+        JSONObject response = tuShareRequestUtils.createTusharePostRequest(params);
+        if (response == null) {
+            log.warn("TuShare fund_adj ETF 请求无响应: tsCode={} start={} end={}", tsCode, startDate, endDate);
+            return -1;
+        }
+
+        TuShareResponseUtils.DataWrapper wrapper = TuShareResponseUtils.extractData(response, "fund_adj");
+        if (wrapper == null) {
+            log.warn("TuShare fund_adj ETF 响应 data 为空: tsCode={} start={} end={}", tsCode, startDate, endDate);
+            return -2;
+        }
+
+        return domesticFundStoreUtils.storeEtfAdjFactorByRawTuShareOutput(wrapper.getItems(), wrapper.getFields());
+    }
 
     // ==================== 新增：基金管理人 ====================
 
@@ -694,6 +755,16 @@ public class DomesticFundFetchServiceImpl extends DomesticFundFetchServiceImplBa
 
     @Override
     public DomesticEtfAdjFactorFetchResponse fetchEtfAdjFactor(DomesticEtfAdjFactorFetchRequest request) {
+        int etfBatchLimit = request.getEtfBatchLimit();
+
+        if (etfBatchLimit > 0) {
+            int totalRows = fetchEtfAdjFactorForLocalEtfBatch(request);
+            return DomesticEtfAdjFactorFetchResponse.newBuilder()
+                    .setStatus(totalRows < 0 ? "failure" : "success")
+                    .setFetchedItemsCount(totalRows)
+                    .build();
+        }
+
         String tsCode = request.getTsCode();
         String tradeDate = request.getTradeDate();
         String startDate = request.getStartDate();

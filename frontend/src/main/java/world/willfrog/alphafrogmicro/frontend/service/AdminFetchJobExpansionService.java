@@ -356,6 +356,46 @@ public class AdminFetchJobExpansionService {
                     expandedParamsList.add(p);
                 }
             }
+            case "etf_batches" -> {
+                // etf_batches: 按本地 ETF 分批展开，使用 etf_offset/etf_batch_limit 区分于 TuShare 分页 offset/limit。
+                int baseOffset = getIntValue(baseParams.get("etf_offset"), 0);
+                int batchSize = readEtfBatchSize(baseParams);
+                int etfCountLimit = getIntValue(baseParams.get("etf_count_limit"), batchSize);
+                if (etfCountLimit <= 0) etfCountLimit = batchSize;
+                int batchCount = (etfCountLimit + batchSize - 1) / batchSize;
+                for (int b = 0; b < batchCount; b++) {
+                    Map<String, Object> p = new LinkedHashMap<>(baseParams);
+                    p.put("etf_offset", baseOffset + b * batchSize);
+                    p.put("etf_batch_limit", batchSize);
+                    expandedParamsList.add(p);
+                }
+            }
+            case "date_range_with_etf_batches" -> {
+                // date_range_with_etf_batches: 固定日期范围 x 本地 ETF 批次笛卡尔积展开
+                @SuppressWarnings("unchecked")
+                Map<String, Object> dateRange = (Map<String, Object>) rawTask.get("date_range");
+                if (dateRange == null) {
+                    throw new IllegalArgumentException("task_sets[" + index + "] date_range_with_etf_batches 模式需要 date_range 配置");
+                }
+                Object startDateRaw = dateRange.get("start_date");
+                Object endDateRaw = dateRange.get("end_date");
+                if (startDateRaw == null || endDateRaw == null) {
+                    throw new IllegalArgumentException("task_sets[" + index + "] date_range_with_etf_batches 模式需要 start_date 和 end_date");
+                }
+                int baseOffset = getIntValue(baseParams.get("etf_offset"), 0);
+                int batchSize = readEtfBatchSize(baseParams);
+                int etfCountLimit = getIntValue(baseParams.get("etf_count_limit"), batchSize);
+                if (etfCountLimit <= 0) etfCountLimit = batchSize;
+                int batchCount = (etfCountLimit + batchSize - 1) / batchSize;
+                for (int b = 0; b < batchCount; b++) {
+                    Map<String, Object> p = new LinkedHashMap<>(baseParams);
+                    p.put("start_date", String.valueOf(startDateRaw));
+                    p.put("end_date", String.valueOf(endDateRaw));
+                    p.put("etf_offset", baseOffset + b * batchSize);
+                    p.put("etf_batch_limit", batchSize);
+                    expandedParamsList.add(p);
+                }
+            }
             case "date_range_with_api_offsets" -> {
                 // date_range_with_api_offsets: 固定日期范围 + 按 TuShare offset/limit 直接分页展开
                 @SuppressWarnings("unchecked")
@@ -682,6 +722,19 @@ public class AdminFetchJobExpansionService {
                 getIntValue(baseParams.get("fund_limit"), 100));
         if (batchSize <= 0) {
             throw new IllegalArgumentException("fund_batch_limit 必须大于 0");
+        }
+        return batchSize;
+    }
+
+    /**
+     * task_sets 中与「本地 ETF 每批条数」对应的参数：{@code etf_batch_limit}；
+     * 不兼容 {@code limit}，因为 {@code limit} 在 etf_adj 中表示每个 TuShare 请求的返回上限。
+     */
+    private int readEtfBatchSize(Map<String, Object> baseParams) {
+        int batchSize = getIntValue(baseParams.get("etf_batch_limit"),
+                getIntValue(baseParams.get("etf_limit"), 100));
+        if (batchSize <= 0) {
+            throw new IllegalArgumentException("etf_batch_limit 必须大于 0");
         }
         return batchSize;
     }
