@@ -88,13 +88,71 @@ public final class AgentCallDetailMapper {
             String llmCallId,
             String runId,
             Optional<String> detailBlobJson) {
+        return resolveLlmDetail(trace, llmCallId, runId, detailBlobJson, false);
+    }
+
+    /**
+     * Step 1 safe detail with optional thinking/reasoning opt-in.
+     *
+     * @param includeThinking 调用方显式请求 thinking 内容时传 true；为 false 时 thinking 字段一律不出，
+     *                        与 Step 1 普通用户契约一致。
+     */
+    public static AgentCallDetailResponse resolveLlmDetail(
+            Map<String, Object> trace,
+            String llmCallId,
+            String runId,
+            Optional<String> detailBlobJson,
+            boolean includeThinking) {
         if (detailBlobJson.isPresent()) {
-            return fromLlmTrace(trace, llmCallId, runId, AgentCallDetailResponse.SOURCE_CALL_DETAIL_REDIS);
+            String reasoningContent = null;
+            Boolean reasoningUnavailable = null;
+            if (includeThinking) {
+                Map<String, Object> blob = parseDetailBlob(detailBlobJson.get());
+                reasoningContent = extractReasoningContent(blob);
+                if (reasoningContent == null) {
+                    // blob 存在但没有 reasoningText（典型场景：非 thinking 模型没存该字段）
+                    reasoningUnavailable = Boolean.TRUE;
+                }
+            }
+            return fromLlmTrace(
+                    trace, llmCallId, runId,
+                    AgentCallDetailResponse.SOURCE_CALL_DETAIL_REDIS,
+                    reasoningContent, reasoningUnavailable);
         }
         if (isDetailBlobStored(trace)) {
+            // 整份 blob 过期：thinking 不可用，但 detailKind 不应被标 EXPIRED（thinking 是可选增强）。
+            if (includeThinking) {
+                return fromLlmTrace(
+                        trace, llmCallId, runId,
+                        AgentCallDetailResponse.SOURCE_OBSERVABILITY,
+                        null, Boolean.TRUE);
+            }
             return expired("llm", llmCallId, runId, trace);
         }
+        if (includeThinking) {
+            return fromLlmTrace(
+                    trace, llmCallId, runId,
+                    AgentCallDetailResponse.SOURCE_OBSERVABILITY,
+                    null, Boolean.TRUE);
+        }
         return fromLlmTrace(trace, llmCallId, runId, AgentCallDetailResponse.SOURCE_OBSERVABILITY);
+    }
+
+    /**
+     * 从 detail blob 中提取 thinking/reasoning 文本。
+     * 优先取 {@code reasoningText}（与 {@code AgentCallDetailPersistence.toLlmDetailBlob} 一致）；
+     * 空字符串视为缺。
+     */
+    static String extractReasoningContent(Map<String, Object> blob) {
+        if (blob == null || blob.isEmpty()) {
+            return null;
+        }
+        Object value = blob.get("reasoningText");
+        if (value == null) {
+            return null;
+        }
+        String text = String.valueOf(value);
+        return text.isBlank() ? null : text;
     }
 
     public static AgentCallDetailResponse resolveToolDetail(
@@ -113,11 +171,25 @@ public final class AgentCallDetailMapper {
     }
 
     public static AgentCallDetailResponse fromLlmTrace(Map<String, Object> trace, String llmCallId, String runId) {
-        return fromLlmTrace(trace, llmCallId, runId, AgentCallDetailResponse.SOURCE_OBSERVABILITY);
+        return fromLlmTrace(trace, llmCallId, runId, AgentCallDetailResponse.SOURCE_OBSERVABILITY, null, null);
     }
 
     public static AgentCallDetailResponse fromLlmTrace(
             Map<String, Object> trace, String llmCallId, String runId, String source) {
+        return fromLlmTrace(trace, llmCallId, runId, source, null, null);
+    }
+
+    /**
+     * Overload with optional thinking/reasoning opt-in fields.
+     *
+     * @param reasoningContent   仅在 {@code includeThinking=true} 且 blob 含 {@code reasoningText} 时回传；
+     *                           null 时不出 {@code reasoningContent} 字段（保持 Step 1 普通用户契约）。
+     * @param reasoningUnavailable 仅在 {@code includeThinking=true} 但 blob 缺/无 {@code reasoningText} 时为 true；
+     *                           null 时不出 {@code reasoningUnavailable} 字段。
+     */
+    public static AgentCallDetailResponse fromLlmTrace(
+            Map<String, Object> trace, String llmCallId, String runId, String source,
+            String reasoningContent, Boolean reasoningUnavailable) {
         String model = str(trace.get("model"));
         boolean hasError = bool(trace.get("hasError"));
         String error = emptyToNull(str(trace.get("error")));
@@ -126,6 +198,11 @@ public final class AgentCallDetailMapper {
         String summary = buildLlmSummary(model, hasError, error);
 
         PreviewResult summaryPreview = limitText(summary, PREVIEW_MAX_CHARS);
+
+        DetailLlm.DetailLlmBuilder llmBuilder = DetailLlm.builder().model(emptyToNull(model));
+        if (reasoningContent != null) {
+            llmBuilder.reasoningContent(reasoningContent);
+        }
 
         return AgentCallDetailResponse.builder()
                 .type("llm")
@@ -142,8 +219,9 @@ public final class AgentCallDetailMapper {
                 .status(hasError ? "failed" : "success")
                 .summary(summaryPreview.text())
                 .metrics(buildMetrics(inputTokens, outputTokens, trace.get("actualCost")))
-                .llm(DetailLlm.builder().model(emptyToNull(model)).build())
+                .llm(llmBuilder.build())
                 .limits(mergeLimits(summaryPreview.truncated()))
+                .reasoningUnavailable(reasoningUnavailable)
                 .build();
     }
 

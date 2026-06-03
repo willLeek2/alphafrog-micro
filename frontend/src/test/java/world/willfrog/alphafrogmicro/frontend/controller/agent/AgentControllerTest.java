@@ -217,7 +217,7 @@ class AgentControllerTest {
                 AgentRunResultMessage.newBuilder().setObservabilityJson(observability).build()
         );
 
-        var response = controller.llmCallDetail(authentication, "run-1", "llm-1");
+        var response = controller.llmCallDetail(authentication, "run-1", "llm-1", false);
 
         assertEquals(ResponseCode.SUCCESS.getCode(), response.getCode());
         AgentCallDetailResponse detail = response.getData();
@@ -236,7 +236,7 @@ class AgentControllerTest {
                         .build()
         );
 
-        var response = controller.llmCallDetail(authentication, "run-1", "missing");
+        var response = controller.llmCallDetail(authentication, "run-1", "missing", false);
 
         assertEquals(ResponseCode.SUCCESS.getCode(), response.getCode());
         assertEquals(AgentCallDetailResponse.KIND_UNAVAILABLE, response.getData().getDetailKind());
@@ -257,5 +257,89 @@ class AgentControllerTest {
 
         assertEquals(ResponseCode.SUCCESS.getCode(), response.getCode());
         assertEquals(AgentCallDetailResponse.KIND_UNAVAILABLE, response.getData().getDetailKind());
+    }
+
+    @Test
+    void llmCallDetail_adminWithThinking_returnsReasoningContent() {
+        // admin user, blob has reasoningText → includeThinking=true 应映射到 reasoningContent
+        String observability = """
+                {"summary":{},"diagnostics":{"llmTraces":[
+                  {"traceId":"llm-1","time":"2026-05-07T10:00:00Z","phase":"execution","stage":"execute",
+                   "durationMs":42,"model":"qwen-plus","hasError":false,"inputTokens":10,"outputTokens":5,
+                   "detailBlobStored":true}
+                ],"toolTraces":[]}}
+                """;
+        when(agentDubboService.getResult(any(GetAgentRunResultRequest.class))).thenReturn(
+                AgentRunResultMessage.newBuilder().setObservabilityJson(observability).build()
+        );
+        when(callDetailBlobReader.loadLlmCallDetail("run-1", "llm-1"))
+                .thenReturn(Optional.of("{\"type\":\"llm\",\"traceId\":\"llm-1\",\"reasoningText\":\"admin-reasoning-text\"}"));
+
+        var response = controller.llmCallDetail(authentication, "run-1", "llm-1", true);
+
+        assertEquals(ResponseCode.SUCCESS.getCode(), response.getCode());
+        AgentCallDetailResponse detail = response.getData();
+        assertEquals(AgentCallDetailResponse.KIND_AVAILABLE, detail.getDetailKind());
+        assertNotNull(detail.getLlm());
+        assertEquals("admin-reasoning-text", detail.getLlm().getReasoningContent());
+        assertEquals(null, detail.getReasoningUnavailable());
+    }
+
+    @Test
+    void llmCallDetail_nonAdminWithThinking_doesNotReturnReasoningContent() {
+        // 非 admin 用户即使传 includeThinking=true 也应被服务端降级为 false（不抛错）
+        User nonAdmin = new User();
+        nonAdmin.setUserId(99L);
+        nonAdmin.setUserType(1); // 1 = 普通用户
+        when(authService.getUserByUsername("admin")).thenReturn(nonAdmin);
+
+        String observability = """
+                {"summary":{},"diagnostics":{"llmTraces":[
+                  {"traceId":"llm-1","time":"2026-05-07T10:00:00Z","phase":"execution","stage":"execute",
+                   "durationMs":42,"model":"qwen-plus","hasError":false,"inputTokens":10,"outputTokens":5,
+                   "detailBlobStored":true}
+                ],"toolTraces":[]}}
+                """;
+        when(agentDubboService.getResult(any(GetAgentRunResultRequest.class))).thenReturn(
+                AgentRunResultMessage.newBuilder().setObservabilityJson(observability).build()
+        );
+        when(callDetailBlobReader.loadLlmCallDetail("run-1", "llm-1"))
+                .thenReturn(Optional.of("{\"type\":\"llm\",\"traceId\":\"llm-1\",\"reasoningText\":\"leak-should-not-appear\"}"));
+
+        var response = controller.llmCallDetail(authentication, "run-1", "llm-1", true);
+
+        assertEquals(ResponseCode.SUCCESS.getCode(), response.getCode());
+        AgentCallDetailResponse detail = response.getData();
+        // 非 admin 强制走 includeThinking=false 分支：blob 仍存在所以 source 是 redis，但 thinking 字段一律不出
+        assertEquals(AgentCallDetailResponse.SOURCE_CALL_DETAIL_REDIS, detail.getSource());
+        assertNotNull(detail.getLlm());
+        assertEquals(null, detail.getLlm().getReasoningContent());
+        assertEquals(null, detail.getReasoningUnavailable());
+    }
+
+    @Test
+    void llmCallDetail_adminWithThinkingButBlobMissing_returnsAvailableWithHint() {
+        // admin + includeThinking=true + blob 缺：detailKind 仍为 AVAILABLE，reasoningContent=null，reasoningUnavailable=true
+        String observability = """
+                {"summary":{},"diagnostics":{"llmTraces":[
+                  {"traceId":"llm-1","time":"2026-05-07T10:00:00Z","phase":"execution","stage":"execute",
+                   "durationMs":42,"model":"qwen-plus","hasError":false,"inputTokens":10,"outputTokens":5,
+                   "detailBlobStored":true}
+                ],"toolTraces":[]}}
+                """;
+        when(agentDubboService.getResult(any(GetAgentRunResultRequest.class))).thenReturn(
+                AgentRunResultMessage.newBuilder().setObservabilityJson(observability).build()
+        );
+        when(callDetailBlobReader.loadLlmCallDetail("run-1", "llm-1")).thenReturn(Optional.empty());
+
+        var response = controller.llmCallDetail(authentication, "run-1", "llm-1", true);
+
+        assertEquals(ResponseCode.SUCCESS.getCode(), response.getCode());
+        AgentCallDetailResponse detail = response.getData();
+        assertEquals(AgentCallDetailResponse.KIND_AVAILABLE, detail.getDetailKind());
+        assertEquals(Boolean.TRUE, detail.getReasoningUnavailable());
+        if (detail.getLlm() != null) {
+            assertEquals(null, detail.getLlm().getReasoningContent());
+        }
     }
 }

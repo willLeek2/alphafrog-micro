@@ -868,21 +868,25 @@ public class AgentController {
     @GetMapping(AGENT_RUNS + "/{runId}/llm-calls/{llmCallId}/detail")
     public ResponseWrapper<AgentCallDetailResponse> llmCallDetail(Authentication authentication,
                                                                 @PathVariable("runId") String runId,
-                                                                @PathVariable("llmCallId") String llmCallId) {
-        return safeCallDetail(authentication, runId, "llm", llmCallId);
+                                                                @PathVariable("llmCallId") String llmCallId,
+                                                                @RequestParam(value = "includeThinking", defaultValue = "false") boolean includeThinking) {
+        // 强校验：thinking 字段只对 admin 开放；非 admin 即使传 true 也按 false 处理（不抛错，避免破坏普通用户调用）
+        boolean effectiveIncludeThinking = includeThinking && isAdmin(authentication);
+        return safeCallDetail(authentication, runId, "llm", llmCallId, effectiveIncludeThinking);
     }
 
     @GetMapping(AGENT_RUNS + "/{runId}/tool-calls/{toolCallId}/detail")
     public ResponseWrapper<AgentCallDetailResponse> toolCallDetail(Authentication authentication,
                                                                    @PathVariable("runId") String runId,
                                                                    @PathVariable("toolCallId") String toolCallId) {
-        return safeCallDetail(authentication, runId, "tool", toolCallId);
+        return safeCallDetail(authentication, runId, "tool", toolCallId, false);
     }
 
     private ResponseWrapper<AgentCallDetailResponse> safeCallDetail(Authentication authentication,
                                                                   String runId,
                                                                   String type,
-                                                                  String callId) {
+                                                                  String callId,
+                                                                  boolean includeThinking) {
         String userId = resolveUserId(authentication);
         if (userId == null) {
             return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
@@ -898,7 +902,8 @@ public class AgentController {
                                         trace,
                                         callId,
                                         runId,
-                                        callDetailBlobReader.loadLlmCallDetail(runId, callId))))
+                                        callDetailBlobReader.loadLlmCallDetail(runId, callId),
+                                        includeThinking)))
                         .orElseGet(() -> ResponseWrapper.success(
                                 AgentCallDetailMapper.unavailable("llm", callId, runId)));
             }

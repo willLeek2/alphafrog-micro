@@ -164,4 +164,98 @@ class AgentCallDetailMapperTest {
     assertEquals(AgentCallDetailResponse.KIND_TRUNCATED, detail.getDetailKind());
     assertTrue(detail.getLimits().getTruncated());
   }
+
+  @Test
+  void resolveLlmDetail_includeThinkingWithReasoningBlob_mapsReasoningContent() throws Exception {
+    Map<String, Object> trace = new LinkedHashMap<>();
+    trace.put("traceId", "llm-think");
+    trace.put("model", "kimi-k2.6");
+    trace.put("hasError", false);
+    trace.put("detailBlobStored", true);
+
+    String blobJson = objectMapper.writeValueAsString(Map.of(
+        "type", "llm",
+        "traceId", "llm-think",
+        "reasoningText", "I should first search for the asset"
+    ));
+
+    AgentCallDetailResponse detail = AgentCallDetailMapper.resolveLlmDetail(
+            trace, "llm-think", "run-1", Optional.of(blobJson), true);
+
+    assertEquals(AgentCallDetailResponse.KIND_AVAILABLE, detail.getDetailKind());
+    assertEquals(AgentCallDetailResponse.SOURCE_CALL_DETAIL_REDIS, detail.getSource());
+    assertNotNull(detail.getLlm());
+    assertEquals("I should first search for the asset", detail.getLlm().getReasoningContent());
+    assertNull(detail.getReasoningUnavailable());
+  }
+
+  @Test
+  void resolveLlmDetail_includeThinkingButBlobMissing_returnsAvailableWithHint() {
+    // blob 缺：detailKind 保持 AVAILABLE（不标 EXPIRED），仅 reasoningUnavailable=true
+    Map<String, Object> trace = new LinkedHashMap<>();
+    trace.put("traceId", "llm-expired");
+    trace.put("model", "kimi-k2.6");
+    trace.put("hasError", false);
+    trace.put("detailBlobStored", true);
+
+    AgentCallDetailResponse detail = AgentCallDetailMapper.resolveLlmDetail(
+            trace, "llm-expired", "run-1", Optional.empty(), true);
+
+    assertEquals(AgentCallDetailResponse.KIND_AVAILABLE, detail.getDetailKind());
+    assertEquals(AgentCallDetailResponse.SOURCE_OBSERVABILITY, detail.getSource());
+    assertEquals(Boolean.TRUE, detail.getReasoningUnavailable());
+    if (detail.getLlm() != null) {
+      assertNull(detail.getLlm().getReasoningContent());
+    }
+  }
+
+  @Test
+  void resolveLlmDetail_includeThinkingButBlobHasNoReasoningText_returnsAvailableWithHint() throws Exception {
+    // blob 存在但不含 reasoningText（个别场景：非 thinking 模型没存该字段）
+    Map<String, Object> trace = new LinkedHashMap<>();
+    trace.put("traceId", "llm-noreason");
+    trace.put("model", "qwen-plus");
+    trace.put("hasError", false);
+    trace.put("detailBlobStored", true);
+
+    String blobJson = objectMapper.writeValueAsString(Map.of(
+        "type", "llm",
+        "traceId", "llm-noreason",
+        "outputText", "normal answer, no thinking"
+    ));
+
+    AgentCallDetailResponse detail = AgentCallDetailMapper.resolveLlmDetail(
+            trace, "llm-noreason", "run-1", Optional.of(blobJson), true);
+
+    assertEquals(AgentCallDetailResponse.KIND_AVAILABLE, detail.getDetailKind());
+    assertEquals(AgentCallDetailResponse.SOURCE_CALL_DETAIL_REDIS, detail.getSource());
+    assertEquals(Boolean.TRUE, detail.getReasoningUnavailable());
+    if (detail.getLlm() != null) {
+      assertNull(detail.getLlm().getReasoningContent());
+    }
+  }
+
+  @Test
+  void resolveLlmDetail_includeThinkingFalse_doesNotExposeReasoning() throws Exception {
+    // 默认/显式 false：reasoningContent / reasoningUnavailable 都不出（Step 1 契约）
+    Map<String, Object> trace = new LinkedHashMap<>();
+    trace.put("traceId", "llm-default");
+    trace.put("model", "kimi-k2.6");
+    trace.put("hasError", false);
+    trace.put("detailBlobStored", true);
+
+    String blobJson = objectMapper.writeValueAsString(Map.of(
+        "type", "llm",
+        "traceId", "llm-default",
+        "reasoningText", "this should not appear in default response"
+    ));
+
+    AgentCallDetailResponse detail = AgentCallDetailMapper.resolveLlmDetail(
+            trace, "llm-default", "run-1", Optional.of(blobJson), false);
+
+    String json = objectMapper.writeValueAsString(detail);
+    assertFalse(json.contains("reasoningContent"));
+    assertFalse(json.contains("reasoningUnavailable"));
+    assertFalse(json.contains("this should not appear"));
+  }
 }

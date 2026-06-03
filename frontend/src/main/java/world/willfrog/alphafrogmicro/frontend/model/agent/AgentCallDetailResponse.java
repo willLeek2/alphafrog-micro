@@ -37,6 +37,12 @@ public class AgentCallDetailResponse {
     private DetailLlm llm;
     private DetailTool tool;
     private DetailLimits limits;
+    /**
+     * 仅当调用方传了 {@code includeThinking=true}（且调用者为 admin）时才可能为 true：
+     * 表示本次 detail blob 缺失/不含 {@code reasoningText} 字段（6h TTL 过期或根本没存）。
+     * 不影响 detailKind —— 整体仍为 {@code available}，仅 thinking 不可用。
+     */
+    private Boolean reasoningUnavailable;
 
     @Data
     @Builder
@@ -53,6 +59,12 @@ public class AgentCallDetailResponse {
     @JsonInclude(JsonInclude.Include.NON_NULL)
     public static class DetailLlm {
         private String model;
+        /**
+         * 可选：thinking/reasoning 内容。仅在调用方传 {@code includeThinking=true}（且为 admin）
+         * 且 Redis detail blob 包含 {@code reasoningText} 时回传；默认 null（不出 JSON）。
+         * 来源：blob 的 {@code reasoningText} 字段。
+         */
+        private String reasoningContent;
     }
 
     @Data
