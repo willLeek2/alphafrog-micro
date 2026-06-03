@@ -2,13 +2,14 @@ package world.willfrog.alphafrogmicro.frontend.service;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.dubbo.config.annotation.DubboReference;
 import org.springframework.data.redis.connection.Message;
 import org.springframework.data.redis.connection.MessageListener;
 import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.data.redis.listener.ChannelTopic;
+import org.springframework.data.redis.listener.PatternTopic;
 import org.springframework.data.redis.listener.RedisMessageListenerContainer;
 import org.springframework.stereotype.Service;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
@@ -30,6 +31,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -39,6 +41,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /**
  * SSE 实时事件流服务 —— 管理 SSE 连接、snapshot/replay、Redis pub/sub、status watcher 和 heartbeat。
  *
+ * <p>Redis 侧在应用启动时通过 {@link PatternTopic} 订阅一次 {@code agent:events:*}，
+ * 连接建立/断开仅维护内存 session 注册表，避免并发 SUB/UNSUB 损坏共享 {@link RedisMessageListenerContainer}。</p>
+ *
  * <p>外部 SSE 契约在本服务边界完成规范化：DB/Redis 内部仍传 {@code payloadJson}，
  * 但对前端输出的 {@code agent.event.data.payload} 始终是 JSON object。</p>
  */
@@ -46,21 +51,19 @@ import java.util.concurrent.atomic.AtomicBoolean;
 @Slf4j
 public class AgentSseService {
 
+    static final String REDIS_CHANNEL_PREFIX = "agent:events:";
+    private static final String REDIS_PATTERN_TOPIC = REDIS_CHANNEL_PREFIX + "*";
+
     private static final int SNAPSHOT_EVENT_COUNT = 10;
     private static final int REPLAY_PAGE_SIZE = 200;
     private static final int LIVE_REPLAY_BUFFER_LIMIT = 500;
     private static final long HEARTBEAT_INTERVAL_MS = 30_000L;
     private static final long STATUS_WATCH_INTERVAL_MS = 5_000L;
-    private static final String REDIS_CHANNEL_PREFIX = "agent:events:";
     private static final TypeReference<Map<String, Object>> MAP_TYPE = new TypeReference<>() {};
     private static final Set<String> TERMINAL_STATUSES = Set.of(
             "COMPLETED", "PARTIAL", "FAILED", "CANCELED", "CANCELLED", "EXPIRED", "TIMEOUT", "TIMED_OUT"
     );
 
-    /**
-     * Dubbo 代理（langchain provider），通过字段注入，
-     * 与 AgentController 中 agentDubboServiceLangchain 的注入方式一致。
-     */
     @DubboReference(group = "langchain", check = false)
     private AgentDubboService agentDubboService;
 
@@ -77,12 +80,10 @@ public class AgentSseService {
         this.objectMapper = objectMapper;
     }
 
-    /** 保存每个 emitter 关联的 heartbeat 定时任务，清理时 cancel。 */
+    private final ConcurrentHashMap<String, Set<SseSession>> sessionsByRunId = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<SseEmitter, SseSession> emitterSessions = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<SseEmitter, ScheduledFuture<?>> heartbeatTasks = new ConcurrentHashMap<>();
-    /** 保存每个 emitter 关联的 status watcher 定时任务，清理时 cancel。 */
     private final ConcurrentHashMap<SseEmitter, ScheduledFuture<?>> statusTasks = new ConcurrentHashMap<>();
-    /** 保存每个 emitter 关联的 Redis listener，清理时 unsubscribe。 */
-    private final ConcurrentHashMap<SseEmitter, MessageListener> listeners = new ConcurrentHashMap<>();
 
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(4, r -> {
         Thread t = new Thread(r, "agent-sse");
@@ -90,53 +91,46 @@ public class AgentSseService {
         return t;
     });
 
+    private final MessageListener globalRedisListener = this::onRedisMessage;
+    private final AtomicBoolean redisFanoutRegistered = new AtomicBoolean(false);
+
+    @PostConstruct
+    void initRedisFanoutSubscription() {
+        if (!redisFanoutRegistered.compareAndSet(false, true)) {
+            return;
+        }
+        redisListenerContainer.addMessageListener(globalRedisListener, new PatternTopic(REDIS_PATTERN_TOPIC));
+        log.info("Agent SSE Redis fan-out subscribed: pattern={}", REDIS_PATTERN_TOPIC);
+    }
+
     /**
      * 建立 SSE 连接。
      *
      * <p>无恢复 cursor 时发送 snapshot；有 cursor 时先 replay {@code seq > resumeAfterSeq}
-     * 的 durable DB event，再进入 live 模式。Redis listener 会先订阅并在 replay 期间缓冲 live
+     * 的 durable DB event，再进入 live 模式。session 会先注册并在 replay 期间缓冲 live
      * event，减少补发窗口里的丢失风险。</p>
      */
     public void connect(String runId, String userId, Integer resumeAfterSeq, SseEmitter emitter) {
         int safeResumeAfterSeq = resumeAfterSeq == null ? 0 : Math.max(0, resumeAfterSeq);
-        String channelName = REDIS_CHANNEL_PREFIX + runId;
         AtomicBoolean replaying = new AtomicBoolean(safeResumeAfterSeq > 0);
         List<Map<String, Object>> liveBuffer = new ArrayList<>();
         AtomicBoolean overflow = new AtomicBoolean(false);
         AtomicBoolean doneSent = new AtomicBoolean(false);
         StatusState statusState = new StatusState();
 
-        try {
-            MessageListener listener = (Message message, byte[] pattern) -> {
-                try {
-                    Map<String, Object> normalized = normalizeEnvelopeJson(
-                            new String(message.getBody(), StandardCharsets.UTF_8));
-                    synchronized (liveBuffer) {
-                        if (replaying.get()) {
-                            if (liveBuffer.size() >= LIVE_REPLAY_BUFFER_LIMIT) {
-                                overflow.set(true);
-                            } else {
-                                liveBuffer.add(normalized);
-                            }
-                            return;
-                        }
-                    }
-                    sendAgentEvent(emitter, normalized);
-                } catch (Exception e) {
-                    log.debug("SSE live event send failed for runId={}, likely client disconnected: {}",
-                            runId, e.getMessage());
-                }
-            };
-            redisListenerContainer.addMessageListener(listener, new ChannelTopic(channelName));
-            listeners.put(emitter, listener);
+        SseSession session = new SseSession(
+                runId, userId, emitter, replaying, liveBuffer, overflow, doneSent, statusState);
+        registerSession(session);
 
+        try {
             if (safeResumeAfterSeq > 0) {
                 int replayMaxSeq = replayEvents(runId, userId, safeResumeAfterSeq, emitter);
                 replaying.set(false);
                 flushLiveBuffer(emitter, liveBuffer, replayMaxSeq);
                 if (overflow.get()) {
-                    sendErrorAndClose(emitter, "LIVE_REPLAY_BUFFER_OVERFLOW", "SSE live buffer overflow; please repair via REST events");
-                    cleanup(emitter, channelName);
+                    sendErrorAndClose(emitter, "LIVE_REPLAY_BUFFER_OVERFLOW",
+                            "SSE live buffer overflow; please repair via REST events");
+                    cleanup(emitter);
                     return;
                 }
             } else {
@@ -148,7 +142,7 @@ public class AgentSseService {
         } catch (Exception e) {
             log.warn("SSE initialization failed for runId={}, sending error and closing", runId, e);
             sendErrorAndClose(emitter, "STREAM_INIT_FAILED", "无法初始化 run stream");
-            cleanup(emitter, channelName);
+            cleanup(emitter);
             return;
         }
 
@@ -178,18 +172,117 @@ public class AgentSseService {
 
         emitter.onCompletion(() -> {
             log.debug("SSE completed for runId={}", runId);
-            cleanup(emitter, channelName);
+            cleanup(emitter);
         });
         emitter.onError(ex -> {
             log.debug("SSE error for runId={}: {}", runId, ex.getMessage());
-            cleanup(emitter, channelName);
+            cleanup(emitter);
         });
         emitter.onTimeout(() -> {
             log.debug("SSE timeout for runId={}", runId);
-            cleanup(emitter, channelName);
+            cleanup(emitter);
         });
 
         log.info("SSE connected for runId={}, resumeAfterSeq={}", runId, safeResumeAfterSeq);
+    }
+
+    void onRedisMessage(Message message, byte[] pattern) {
+        String runId = parseRunIdFromChannel(message.getChannel());
+        if (runId == null || runId.isBlank()) {
+            return;
+        }
+        Set<SseSession> sessions = sessionsByRunId.get(runId);
+        if (sessions == null || sessions.isEmpty()) {
+            return;
+        }
+        Map<String, Object> normalized;
+        try {
+            normalized = normalizeEnvelopeJson(new String(message.getBody(), StandardCharsets.UTF_8));
+        } catch (Exception e) {
+            log.debug("Ignore invalid Redis envelope for runId={}: {}", runId, e.getMessage());
+            return;
+        }
+        for (SseSession session : sessions) {
+            session.dispatchRedisMessage(normalized);
+        }
+    }
+
+    static String parseRunIdFromChannel(byte[] channelBytes) {
+        if (channelBytes == null || channelBytes.length == 0) {
+            return null;
+        }
+        String channel = new String(channelBytes, StandardCharsets.UTF_8);
+        if (!channel.startsWith(REDIS_CHANNEL_PREFIX)) {
+            return null;
+        }
+        return channel.substring(REDIS_CHANNEL_PREFIX.length());
+    }
+
+    private void registerSession(SseSession session) {
+        emitterSessions.put(session.emitter, session);
+        sessionsByRunId.computeIfAbsent(session.runId, ignored -> new CopyOnWriteArraySet<>()).add(session);
+    }
+
+    private void unregisterSession(SseSession session) {
+        if (session == null) {
+            return;
+        }
+        emitterSessions.remove(session.emitter, session);
+        Set<SseSession> runSessions = sessionsByRunId.get(session.runId);
+        if (runSessions != null) {
+            runSessions.remove(session);
+            if (runSessions.isEmpty()) {
+                sessionsByRunId.remove(session.runId, runSessions);
+            }
+        }
+    }
+
+    private final class SseSession {
+        private final String runId;
+        private final String userId;
+        private final SseEmitter emitter;
+        private final AtomicBoolean replaying;
+        private final List<Map<String, Object>> liveBuffer;
+        private final AtomicBoolean overflow;
+        private final AtomicBoolean doneSent;
+        private final StatusState statusState;
+
+        private SseSession(String runId,
+                           String userId,
+                           SseEmitter emitter,
+                           AtomicBoolean replaying,
+                           List<Map<String, Object>> liveBuffer,
+                           AtomicBoolean overflow,
+                           AtomicBoolean doneSent,
+                           StatusState statusState) {
+            this.runId = runId;
+            this.userId = userId;
+            this.emitter = emitter;
+            this.replaying = replaying;
+            this.liveBuffer = liveBuffer;
+            this.overflow = overflow;
+            this.doneSent = doneSent;
+            this.statusState = statusState;
+        }
+
+        void dispatchRedisMessage(Map<String, Object> normalized) {
+            try {
+                synchronized (liveBuffer) {
+                    if (replaying.get()) {
+                        if (liveBuffer.size() >= LIVE_REPLAY_BUFFER_LIMIT) {
+                            overflow.set(true);
+                        } else {
+                            liveBuffer.add(normalized);
+                        }
+                        return;
+                    }
+                }
+                sendAgentEvent(emitter, normalized);
+            } catch (Exception e) {
+                log.debug("SSE live event send failed for runId={}, likely client disconnected: {}",
+                        runId, e.getMessage());
+            }
+        }
     }
 
     private int replayEvents(String runId, String userId, int afterSeq, SseEmitter emitter) {
@@ -224,7 +317,7 @@ public class AgentSseService {
             buffered = new ArrayList<>(liveBuffer);
             liveBuffer.clear();
         }
-        buffered.sort(Comparator.comparingInt(this::seqOf));
+        buffered.sort(Comparator.comparingInt(AgentSseService.this::seqOf));
         int lastSentSeq = replayAfterSeq;
         for (Map<String, Object> event : buffered) {
             int seq = seqOf(event);
@@ -269,7 +362,6 @@ public class AgentSseService {
         snapshot.put("events", recentEvents);
         snapshot.put("eventCount", recentEvents.size());
 
-        // Proto field eventCount is currently backed by findMaxSeq(); use a local maxSeq name to avoid semantic drift.
         int maxSeq = Math.max(0, statusMsg.getEventCount());
         for (AgentRunEventResponse event : recentEvents) {
             maxSeq = Math.max(maxSeq, event.seq());
@@ -395,7 +487,7 @@ public class AgentSseService {
         scheduler.shutdownNow();
     }
 
-    private void cleanup(SseEmitter emitter, String channelName) {
+    private void cleanup(SseEmitter emitter) {
         ScheduledFuture<?> heartbeat = heartbeatTasks.remove(emitter);
         if (heartbeat != null) {
             heartbeat.cancel(false);
@@ -404,14 +496,8 @@ public class AgentSseService {
         if (statusWatcher != null) {
             statusWatcher.cancel(false);
         }
-        MessageListener listener = listeners.remove(emitter);
-        if (listener != null) {
-            try {
-                redisListenerContainer.removeMessageListener(listener, new ChannelTopic(channelName));
-            } catch (Exception e) {
-                log.debug("Error removing Redis listener for channel {}: {}", channelName, e.getMessage());
-            }
-        }
+        SseSession session = emitterSessions.remove(emitter);
+        unregisterSession(session);
     }
 
     private Object parseJsonOrNull(String json) {
