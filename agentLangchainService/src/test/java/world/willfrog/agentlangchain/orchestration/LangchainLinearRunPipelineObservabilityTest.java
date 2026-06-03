@@ -3,7 +3,6 @@ package world.willfrog.agentlangchain.orchestration;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.ObjectProvider;
-import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.service.AgentEventService;
@@ -18,6 +17,7 @@ import world.willfrog.agentlangchain.orchestration.dag.LangchainDagWorkflowExecu
 import java.util.List;
 
 import static org.mockito.ArgumentMatchers.any;
+import static world.willfrog.agentlangchain.orchestration.LangchainRunSchedulerTestSupport.immediateScheduler;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
@@ -50,11 +50,6 @@ class LangchainLinearRunPipelineObservabilityTest {
         ObjectProvider<AgentObservabilityService> observabilityProvider = mock(ObjectProvider.class);
         when(observabilityProvider.getIfAvailable()).thenReturn(observabilityService);
 
-        ThreadPoolTaskExecutor taskExecutor = new ThreadPoolTaskExecutor();
-        taskExecutor.setCorePoolSize(1);
-        taskExecutor.setMaxPoolSize(1);
-        taskExecutor.initialize();
-
         LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
         when(planner.plan(any())).thenReturn(LangchainTodoPlan.builder()
                 .executionMode(PlanExecutionMode.LINEAR)
@@ -83,7 +78,7 @@ class LangchainLinearRunPipelineObservabilityTest {
                 followUpContextSupport,
                 mock(world.willfrog.agent.platform.service.AgentMessageService.class),
                 mock(LangchainRunExecutionGuard.class),
-                taskExecutor
+                immediateScheduler()
         );
 
         pipeline.executeRun(run);
@@ -92,7 +87,5 @@ class LangchainLinearRunPipelineObservabilityTest {
                 eq("run-obs-1"),
                 eq("openrouter-plan"),
                 eq("kimi-k2.5"),
-                eq(true));
-        taskExecutor.shutdown();
-    }
+                eq(true));    }
 }

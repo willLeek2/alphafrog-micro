@@ -3,7 +3,6 @@ package world.willfrog.agentlangchain.orchestration;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.ObjectProvider;
-import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
@@ -20,6 +19,7 @@ import java.util.Map;
 import java.util.Optional;
 
 import static org.mockito.ArgumentMatchers.any;
+import static world.willfrog.agentlangchain.orchestration.LangchainRunSchedulerTestSupport.immediateScheduler;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.*;
 
@@ -60,11 +60,6 @@ class LangchainLinearRunPipelineInterruptTest {
         when(followUpContextSupport.resolve(run)).thenReturn(
                 new LangchainFollowUpContextSupport.ExecutionContext("goal", ""));
 
-        ThreadPoolTaskExecutor taskExecutor = new ThreadPoolTaskExecutor();
-        taskExecutor.setCorePoolSize(1);
-        taskExecutor.setMaxPoolSize(1);
-        taskExecutor.initialize();
-
         LangchainLinearRunPipelineImpl pipeline = new LangchainLinearRunPipelineImpl(
                 planner,
                 linear,
@@ -80,12 +75,10 @@ class LangchainLinearRunPipelineInterruptTest {
                 followUpContextSupport,
                 mock(world.willfrog.agent.platform.service.AgentMessageService.class),
                 executionGuard,
-                taskExecutor
+                immediateScheduler()
         );
 
         pipeline.executeRun(run);
 
-        verify(runMapper, never()).updateSnapshot(eq("r1"), eq("u1"), eq(AgentRunStatus.COMPLETED), any(), anyBoolean(), any());
-        taskExecutor.shutdown();
-    }
+        verify(runMapper, never()).updateSnapshot(eq("r1"), eq("u1"), eq(AgentRunStatus.COMPLETED), any(), anyBoolean(), any());    }
 }

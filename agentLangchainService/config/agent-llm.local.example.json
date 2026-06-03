@@ -323,7 +323,21 @@
     "corePoolSize": 4,
     "maxPoolSize": 8,
     "queueCapacity": 50,
-    "threadNamePrefix": "agent-langchain-run-"
+    "threadNamePrefix": "agent-langchain-run-",
+    "parallel": {
+      "hard": {
+        "corePoolSize": 100,
+        "maxPoolSize": 100,
+        "queueCapacity": 1000,
+        "threadNamePrefix": "agent-langchain-run-"
+      },
+      "current": {
+        "corePoolSize": 10,
+        "maxPoolSize": 10,
+        "queueCapacity": 100,
+        "threadNamePrefix": "agent-langchain-run-"
+      }
+    }
   },
   "eventStore": {
     "redisFlushBatchSize": 20,

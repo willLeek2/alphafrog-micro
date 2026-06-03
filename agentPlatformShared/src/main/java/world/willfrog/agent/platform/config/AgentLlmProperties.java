@@ -1809,6 +1809,7 @@ public class AgentLlmProperties {
         private Integer maxPoolSize;
         private Integer queueCapacity;
         private String threadNamePrefix;
+        private ExecutorParallelConfig parallel;
 
         public Integer getCorePoolSize() {
             return corePoolSize;
@@ -1840,6 +1841,35 @@ public class AgentLlmProperties {
 
         public void setThreadNamePrefix(String threadNamePrefix) {
             this.threadNamePrefix = threadNamePrefix;
+        }
+
+        public ExecutorParallelConfig getParallel() {
+            return parallel;
+        }
+
+        public void setParallel(ExecutorParallelConfig parallel) {
+            this.parallel = parallel;
+        }
+    }
+
+    public static class ExecutorParallelConfig {
+        private ExecutorConfig hard;
+        private ExecutorConfig current;
+
+        public ExecutorConfig getHard() {
+            return hard;
+        }
+
+        public void setHard(ExecutorConfig hard) {
+            this.hard = hard;
+        }
+
+        public ExecutorConfig getCurrent() {
+            return current;
+        }
+
+        public void setCurrent(ExecutorConfig current) {
+            this.current = current;
         }
     }
 }

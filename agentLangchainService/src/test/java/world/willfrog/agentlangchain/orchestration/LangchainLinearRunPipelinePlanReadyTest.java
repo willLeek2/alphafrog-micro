@@ -5,7 +5,6 @@ import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 import org.springframework.beans.factory.ObjectProvider;
-import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.service.AgentEventService;
@@ -22,6 +21,7 @@ import java.util.Map;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static world.willfrog.agentlangchain.orchestration.LangchainRunSchedulerTestSupport.immediateScheduler;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.eq;
@@ -82,11 +82,6 @@ class LangchainLinearRunPipelinePlanReadyTest {
         when(followUpContextSupport.resolve(run)).thenReturn(
                 new LangchainFollowUpContextSupport.ExecutionContext("goal", ""));
 
-        ThreadPoolTaskExecutor taskExecutor = new ThreadPoolTaskExecutor();
-        taskExecutor.setCorePoolSize(1);
-        taskExecutor.setMaxPoolSize(1);
-        taskExecutor.initialize();
-
         LangchainLinearRunPipelineImpl pipeline = new LangchainLinearRunPipelineImpl(
                 planner,
                 linear,
@@ -102,7 +97,7 @@ class LangchainLinearRunPipelinePlanReadyTest {
                 followUpContextSupport,
                 mock(world.willfrog.agent.platform.service.AgentMessageService.class),
                 executionGuard,
-                taskExecutor
+                immediateScheduler()
         );
 
         pipeline.executeRun(run);
@@ -119,7 +114,5 @@ class LangchainLinearRunPipelinePlanReadyTest {
         inOrder.verify(runMapper).updatePlanJson("run-plan-1", "user-1", expectedPlanJson);
         inOrder.verify(stateStore).recordPlan("run-plan-1", expectedPlanJson, true);
         inOrder.verify(eventService).append(eq("run-plan-1"), eq("user-1"), eq("PLAN_READY"), any());
-        verify(runMapper).updateSnapshot(eq("run-plan-1"), eq("user-1"), any(), any(), anyBoolean(), any());
-        taskExecutor.shutdown();
-    }
+        verify(runMapper).updateSnapshot(eq("run-plan-1"), eq("user-1"), any(), any(), anyBoolean(), any());    }
 }

@@ -5,52 +5,24 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 
-import java.util.concurrent.Executor;
 import java.util.concurrent.ThreadPoolExecutor;
-
-import world.willfrog.agent.platform.config.AgentLlmProperties;
-import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 
 @Configuration
 public class LangchainRunAsyncConfig {
 
     @Bean(name = "agentLangchainRunTaskExecutor")
-    public Executor agentLangchainRunTaskExecutor(
-            @Value("${agent.langchain.run.executor.core-pool-size:4}") int defaultCorePoolSize,
-            @Value("${agent.langchain.run.executor.max-pool-size:8}") int defaultMaxPoolSize,
-            @Value("${agent.langchain.run.executor.queue-capacity:50}") int defaultQueueCapacity,
-            @Value("${agent.langchain.run.executor.thread-name-prefix:agent-langchain-run-}") String defaultThreadNamePrefix,
-            AgentLlmLocalConfigLoader configLoader) {
-
-        int corePoolSize = defaultCorePoolSize;
-        int maxPoolSize = defaultMaxPoolSize;
-        int queueCapacity = defaultQueueCapacity;
-        String threadNamePrefix = defaultThreadNamePrefix;
-
-        AgentLlmProperties.ExecutorConfig executorConfig = configLoader.current()
-                .map(AgentLlmProperties::getExecutor)
-                .orElse(null);
-
-        if (executorConfig != null) {
-            if (executorConfig.getCorePoolSize() != null) {
-                corePoolSize = executorConfig.getCorePoolSize();
-            }
-            if (executorConfig.getMaxPoolSize() != null) {
-                maxPoolSize = executorConfig.getMaxPoolSize();
-            }
-            if (executorConfig.getQueueCapacity() != null) {
-                queueCapacity = executorConfig.getQueueCapacity();
-            }
-            if (executorConfig.getThreadNamePrefix() != null && !executorConfig.getThreadNamePrefix().isEmpty()) {
-                threadNamePrefix = executorConfig.getThreadNamePrefix();
-            }
-        }
-
+    public ThreadPoolTaskExecutor agentLangchainRunTaskExecutor(
+            @Value("${agent.langchain.run.executor.keep-alive-seconds:60}") int keepAliveSeconds,
+            LangchainRunExecutorLimitsResolver limitsResolver) {
+        LangchainRunExecutorLimits hard = limitsResolver.hardLimits();
         ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
-        executor.setCorePoolSize(corePoolSize);
-        executor.setMaxPoolSize(maxPoolSize);
-        executor.setQueueCapacity(queueCapacity);
-        executor.setThreadNamePrefix(threadNamePrefix);
+        executor.setCorePoolSize(hard.getCorePoolSize());
+        executor.setMaxPoolSize(hard.getMaxPoolSize());
+        // Queueing semantics live in LangchainRunConcurrencyScheduler so current.queueCapacity
+        // can shrink/grow at runtime. Keep the physical executor queue at 0 to avoid hidden backlog.
+        executor.setQueueCapacity(0);
+        executor.setKeepAliveSeconds(keepAliveSeconds);
+        executor.setThreadNamePrefix(hard.getThreadNamePrefix());
         executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
         executor.setWaitForTasksToCompleteOnShutdown(true);
         executor.setAwaitTerminationSeconds(30);

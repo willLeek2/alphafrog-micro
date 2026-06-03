@@ -458,6 +458,8 @@ public class AgentLlmLocalConfigLoader {
         }
         if (cfg.getExecutor() == null) {
             cfg.setExecutor(null);
+        } else if (cfg.getExecutor().getParallel() == null) {
+            cfg.getExecutor().setParallel(null);
         }
         if (cfg.getEventStore() == null) {
             cfg.setEventStore(null);

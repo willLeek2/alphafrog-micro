@@ -9,7 +9,6 @@ import dev.langchain4j.service.tool.ToolProvider;
 import dev.langchain4j.service.tool.ToolProviderRequest;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
-import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.entity.AgentRun;
@@ -31,7 +30,6 @@ import world.willfrog.agentlangchain.tools.LangchainToolInvocationKeys;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.Executor;
 
 /**
  * agentLangchainService 的 run 级总控流水线。
@@ -71,7 +69,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
     private final LangchainFollowUpContextSupport followUpContextSupport;
     private final AgentMessageService messageService;
     private final LangchainRunExecutionGuard executionGuard;
-    private final Executor langchainRunTaskExecutor;
+    private final LangchainRunConcurrencyScheduler runConcurrencyScheduler;
 
     public LangchainLinearRunPipelineImpl(LangchainAiPlanner planner,
                                           LangchainLinearWorkflowExecutor linearWorkflowExecutor,
@@ -87,7 +85,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                                           LangchainFollowUpContextSupport followUpContextSupport,
                                           AgentMessageService messageService,
                                           LangchainRunExecutionGuard executionGuard,
-                                          @Qualifier("agentLangchainRunTaskExecutor") Executor langchainRunTaskExecutor) {
+                                          LangchainRunConcurrencyScheduler runConcurrencyScheduler) {
         this.planner = planner;
         this.linearWorkflowExecutor = linearWorkflowExecutor;
         this.dagWorkflowExecutor = dagWorkflowExecutor;
@@ -102,12 +100,17 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         this.followUpContextSupport = followUpContextSupport;
         this.messageService = messageService;
         this.executionGuard = executionGuard;
-        this.langchainRunTaskExecutor = langchainRunTaskExecutor;
+        this.runConcurrencyScheduler = runConcurrencyScheduler;
     }
 
     @Override
     public void launchAsync(AgentRun run) {
-        langchainRunTaskExecutor.execute(() -> executeRun(run));
+        launchAsync(run, null);
+    }
+
+    @Override
+    public void launchAsync(AgentRun run, LangchainRunConcurrencyScheduler.Reservation reservation) {
+        runConcurrencyScheduler.submit(reservation, run, () -> executeRun(run));
     }
 
     void executeRun(AgentRun initialRun) {
