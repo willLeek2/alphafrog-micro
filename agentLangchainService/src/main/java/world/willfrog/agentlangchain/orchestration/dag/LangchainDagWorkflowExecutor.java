@@ -590,7 +590,7 @@ public class LangchainDagWorkflowExecutor {
                     eventService.append(runId, userId, "DAG_RECOVERY_JUDGE_FINISHED", Map.of(
                             "decision", "NO",
                             "rationale", truncatedRationale,
-                            "judgeCallTraceId", recoveryJudgeDecisionId
+                            "recoveryJudgeDecisionId", recoveryJudgeDecisionId
                     ));
                 }
                 return null;
@@ -602,13 +602,13 @@ public class LangchainDagWorkflowExecutor {
                         "decision", "YES",
                         "skipTodoIds", skipTodoIds,
                         "rationale", truncatedRationale,
-                        "judgeCallTraceId", recoveryJudgeDecisionId
+                        "recoveryJudgeDecisionId", recoveryJudgeDecisionId
                 ));
                 for (String skipId : skipTodoIds) {
                     Map<String, Object> skippedPayload = new LinkedHashMap<>();
                     skippedPayload.put("todo_id", skipId);
                     skippedPayload.put("reason", "judge_recovery");
-                    skippedPayload.put("judge_call_trace_id", recoveryJudgeDecisionId);
+                    skippedPayload.put("recovery_judge_decision_id", recoveryJudgeDecisionId);
                     skippedPayload.put("workflow", "dag");
                     skippedPayload.put("phase", "dag_recovery_judge");
                     eventService.append(runId, userId, "TODO_NODE_SKIPPED", skippedPayload);
@@ -665,22 +665,13 @@ public class LangchainDagWorkflowExecutor {
                 }
             }
 
-            // 将 judge recovery 跳过的节点落 WorkflowState
-            if (!isBlank(runId)) {
-                for (String skipId : skipTodoIds) {
-                    stateRecorder.persistNodeState(runId, items, new Object(), new LinkedHashMap<>(),
-                            graph.getItemMap().get(skipId), TodoStatus.SKIPPED,
-                            LangchainTodoNodeResult.skipped("judge_recovery"), toolCalls.get());
-                }
-            }
-
             // 重置 phase 为 summarizing，生成部分可交付答案
             AgentContext.setPhase("summarizing");
             AgentContext.setStage("final_answer");
             List<LangchainCompletedTodo> allCompleted = new ArrayList<>(sharedContext.completedTodosSnapshot());
             String finalAnswer = todoNodeExecutor.writeFinalAnswer(request, allCompleted);
 
-            appendDagCompleted(runId, userId, false, "PARTIAL by recovery judge", toolCalls.get());
+            appendDagCompletedPartial(runId, userId, "PARTIAL by recovery judge", toolCalls.get());
             return LangchainLinearWorkflowResult.builder()
                     .success(false)
                     .partial(true)
@@ -760,6 +751,15 @@ public class LangchainDagWorkflowExecutor {
      * @param failureReason 失败原因（成功时为 null）
      * @param toolCalls    总 tool call 次数
      */
+    private void appendDagCompletedPartial(String runId, String userId, String failureReason, int toolCalls) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("success", false);
+        payload.put("partial", true);
+        payload.put("failure_reason", nvl(failureReason));
+        payload.put("total_tool_calls_used", toolCalls);
+        eventService.append(runId, userId, "DAG_EXECUTION_COMPLETED", payload);
+    }
+
     private void appendDagCompleted(String runId, String userId, boolean success, String failureReason, int toolCalls) {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("success", success);

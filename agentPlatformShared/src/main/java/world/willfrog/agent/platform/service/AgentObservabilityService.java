@@ -1161,7 +1161,7 @@ public class AgentObservabilityService {
                 output.length(), observabilityJson.length());
 
         // 终态后清理 per-runId 锁，避免长期占用内存
-        if (status == AgentRunStatus.COMPLETED || status == AgentRunStatus.FAILED || status == AgentRunStatus.CANCELED) {
+        if (status == AgentRunStatus.COMPLETED || status == AgentRunStatus.PARTIAL || status == AgentRunStatus.FAILED || status == AgentRunStatus.CANCELED) {
             locks.remove(runId);
         }
         return output;
