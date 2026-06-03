@@ -1,5 +1,6 @@
 package world.willfrog.alphafrogmicro.frontend.config;
 
+import jakarta.servlet.DispatcherType;
 import jakarta.servlet.http.HttpServletResponse;
 import lombok.RequiredArgsConstructor;
 import org.springframework.context.annotation.Bean;
@@ -28,7 +29,10 @@ public class SecurityConfig{
                 .cors(Customizer.withDefaults())
                 .csrf(AbstractHttpConfigurer::disable) // JWT认证不需要CSRF保护
                 .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+                // SSE（SseEmitter）会触发 ASYNC 二次派发；需在 ASYNC/ERROR 上放行并传播 SecurityContext
+                .securityContext(sc -> sc.requireExplicitSave(false))
                 .authorizeHttpRequests(auth -> auth
+                        .dispatcherTypeMatchers(DispatcherType.ASYNC, DispatcherType.ERROR).permitAll()
                         .requestMatchers(
                                 "/auth/login",
                                 "/auth/register",

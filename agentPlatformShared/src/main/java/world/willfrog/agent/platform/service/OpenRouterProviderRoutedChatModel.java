@@ -240,12 +240,12 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
                 requestRecord = httpLogger.recordRequest(requestUrl, "POST", requestHeaders, requestJson);
             }
             
-            // Debug curl 日志（热加载配置）
-            if (isDebugCurlEnabled()) {
-                curlCommand = buildCurlCommand(requestUrl, requestHeaders, requestJson);
-                log.info("[LLM Debug CURL] endpoint={} model={} providerOrder={}\n{}", 
-                        endpointName, modelName, providerOrder, curlCommand);
-            }
+            // Debug curl 日志（热加载 debug.logLlmCurl）— 临时关闭：整包 request body 打 INFO 会撑爆远程 tmux 日志
+            // if (isDebugCurlEnabled()) {
+            //     curlCommand = buildCurlCommand(requestUrl, requestHeaders, requestJson);
+            //     log.info("[LLM Debug CURL] endpoint={} model={} providerOrder={}\n{}",
+            //             endpointName, modelName, providerOrder, curlCommand);
+            // }
             
             // ========== 2. 发送 HTTP 请求（流式，按 logical call 聚合重试） ==========
             //
@@ -802,13 +802,15 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
      * 检查是否开启 curl debug 日志（热加载）。
      */
     private boolean isDebugCurlEnabled() {
-        if (localConfigLoader == null) {
-            return false;
-        }
-        return localConfigLoader.current()
-                .map(cfg -> cfg.getDebug())
-                .map(debug -> debug.getLogLlmCurl())
-                .orElse(false);
+        // 与上方 [LLM Debug CURL] 一并临时关闭，避免 Nacos debug.logLlmCurl=true 时仍打全量请求
+        return false;
+        // if (localConfigLoader == null) {
+        //     return false;
+        // }
+        // return localConfigLoader.current()
+        //         .map(cfg -> cfg.getDebug())
+        //         .map(debug -> debug.getLogLlmCurl())
+        //         .orElse(false);
     }
     
     /**

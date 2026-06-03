@@ -69,7 +69,6 @@ public class AgentAiServiceFactory {
     public ChatModel buildChatModelWithTemperature(AgentLlmResolver.ResolvedLlm resolved,
                                                  Double temperatureOverride,
                                                  Integer maxTokensOverride) {
-        boolean debugEnabled = log.isDebugEnabled();
         String apiKey = isBlank(resolved.apiKey()) ? openAiApiKey : resolved.apiKey();
         if (isBlank(apiKey)) {
             throw new IllegalArgumentException("LLM api key 未配置: endpoint=" + resolved.endpointName());
@@ -85,8 +84,9 @@ public class AgentAiServiceFactory {
                 .modelName(resolved.modelName())
                 .maxTokens(effectiveMaxTokens)
                 .temperature(finalTemperature)
-                .logRequests(debugEnabled)
-                .logResponses(debugEnabled);
+                // LC4j 内置 logRequests/logResponses 会打全量 HTTP body；langchain 压测时保持关闭
+                .logRequests(false)
+                .logResponses(false);
 
         Map<String, String> headers = buildCustomHeaders(resolved.baseUrl());
         if (!headers.isEmpty()) {
@@ -152,7 +152,6 @@ public class AgentAiServiceFactory {
     public ChatModel buildChatModelWithProviderOrder(AgentLlmResolver.ResolvedLlm resolved,
                                                      List<String> providerOrder,
                                                      Integer maxTokensOverride) {
-        boolean debugEnabled = log.isDebugEnabled();
         String apiKey = isBlank(resolved.apiKey()) ? openAiApiKey : resolved.apiKey();
         if (isBlank(apiKey)) {
             throw new IllegalArgumentException("LLM api key 未配置: endpoint=" + resolved.endpointName());
@@ -191,8 +190,8 @@ public class AgentAiServiceFactory {
                 .modelName(resolved.modelName())
                 .maxTokens(effectiveMaxTokens)
                 .temperature(temperature)
-                .logRequests(debugEnabled)
-                .logResponses(debugEnabled);
+                .logRequests(false)
+                .logResponses(false);
 
         Map<String, String> headers = buildCustomHeaders(resolved.baseUrl());
         if (!headers.isEmpty()) {

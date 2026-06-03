@@ -138,11 +138,11 @@ public class DashScopeChatModel implements ChatModel {
                 requestRecord = httpLogger.recordRequest(requestUrl, "POST", requestHeaders, requestJson);
             }
 
-            // Debug curl 日志（热加载配置）
-            if (isDebugCurlEnabled()) {
-                curlCommand = buildCurlCommand(requestUrl, requestHeaders, requestJson);
-                log.info("[LLM Debug CURL] endpoint={} model={}\n{}", endpointName, modelName, curlCommand);
-            }
+            // Debug curl 日志（热加载 debug.logLlmCurl）— 临时关闭：整包 request body 打 INFO 会撑爆远程 tmux 日志
+            // if (isDebugCurlEnabled()) {
+            //     curlCommand = buildCurlCommand(requestUrl, requestHeaders, requestJson);
+            //     log.info("[LLM Debug CURL] endpoint={} model={}\n{}", endpointName, modelName, curlCommand);
+            // }
 
             if (budgetService != null) {
                 budgetService.checkHttpAttempt(1);
@@ -473,13 +473,15 @@ public class DashScopeChatModel implements ChatModel {
      * 检查是否开启 curl debug 日志（热加载）。
      */
     private boolean isDebugCurlEnabled() {
-        if (localConfigLoader == null) {
-            return false;
-        }
-        return localConfigLoader.current()
-                .map(cfg -> cfg.getDebug())
-                .map(debug -> debug.getLogLlmCurl())
-                .orElse(false);
+        // 与上方 [LLM Debug CURL] 一并临时关闭，避免 Nacos debug.logLlmCurl=true 时仍打全量请求
+        return false;
+        // if (localConfigLoader == null) {
+        //     return false;
+        // }
+        // return localConfigLoader.current()
+        //         .map(cfg -> cfg.getDebug())
+        //         .map(debug -> debug.getLogLlmCurl())
+        //         .orElse(false);
     }
 
     private StreamingProgressTracker createStreamingProgressTracker(String llmTraceId) {
