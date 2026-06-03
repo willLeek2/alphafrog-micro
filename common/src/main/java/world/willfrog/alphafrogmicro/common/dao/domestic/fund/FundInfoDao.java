@@ -45,6 +45,9 @@ public interface FundInfoDao {
     @Select("SELECT ts_code FROM alphafrog_fund_info LIMIT #{limit} OFFSET #{offset}")
     List<String> getFundTsCode(@Param("offset") int offset, @Param("limit") int limit);
 
+    @Select("SELECT ts_code FROM alphafrog_fund_info WHERE ts_code LIKE '%.OF' ORDER BY ts_code LIMIT #{limit} OFFSET #{offset}")
+    List<String> getOffMarketFundTsCode(@Param("offset") int offset, @Param("limit") int limit);
+
     @Select("SELECT COUNT(*) FROM alphafrog_fund_info")
     int getFundInfoCount();
 

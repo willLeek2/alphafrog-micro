@@ -7,9 +7,9 @@
     {
       "subType": 1,
       "label": "按日期范围抓取",
-      "description": "按指定日期范围，使用 TuShare fund_portfolio 全市场分页（start/end + offset + limit）",
+      "description": "按指定日期范围，使用 TuShare fund_portfolio 全市场分页（start/end + offset + limit），或使用 fund_offset/fund_batch_limit 从本地场外基金列表分批逐基金抓取",
       "requiredParams": ["start_date", "end_date"],
-      "optionalParams": ["ts_code", "offset", "limit"],
+      "optionalParams": ["ts_code", "offset", "limit", "fund_offset", "fund_batch_limit"],
       "paramDefs": {
         "start_date": {
           "label": "开始日期",
@@ -42,6 +42,18 @@
           "description": "TuShare 分页每页条数",
           "type": "number",
           "default": 5000
+        },
+        "fund_offset": {
+          "label": "本地场外基金起始偏移",
+          "description": "从本地 alphafrog_fund_info 中按 ts_code 排序选取 .OF 场外基金代码的起始偏移量；配置后不再使用 TuShare 全市场 offset 分页",
+          "type": "number",
+          "default": 0
+        },
+        "fund_batch_limit": {
+          "label": "本地场外基金批次大小",
+          "description": "每个叶子任务从本地基金库选取的 .OF 场外基金代码数量",
+          "type": "number",
+          "default": null
         }
       },
       "specialFlags": []
@@ -173,6 +185,58 @@
         "offset_range.step": {
           "label": "Offset 步长",
           "description": "每次步进的偏移量",
+          "type": "number",
+          "default": 5000
+        }
+      },
+      "specialFlags": [],
+      "outputTaskVariantSubType": 1
+    },
+    {
+      "subType": 4,
+      "label": "固定日期范围与本地场外基金批次展开",
+      "description": "使用 date_range 与 fund_offset/fund_batch_limit，每个叶子任务从本地场外基金库取一批 ts_code，并逐个调用 TuShare fund_portfolio",
+      "expandParam": "date_range",
+      "expandDescription": "使用 date_range 与本地场外基金批次参数，每个叶子任务携带 start_date、end_date、fund_offset、fund_batch_limit、limit",
+      "expandStrategy": "date_range_with_fund_batches",
+      "requiredParams": ["date_range"],
+      "optionalParams": ["fund_offset", "fund_batch_limit", "fund_count_limit", "limit"],
+      "paramDefs": {
+        "date_range.start_date": {
+          "label": "开始日期",
+          "description": "固定的开始日期，格式 yyyyMMdd",
+          "type": "string",
+          "format": "yyyyMMdd",
+          "default": null
+        },
+        "date_range.end_date": {
+          "label": "结束日期",
+          "description": "固定的结束日期，格式 yyyyMMdd",
+          "type": "string",
+          "format": "yyyyMMdd",
+          "default": null
+        },
+        "fund_offset": {
+          "label": "本地场外基金起始偏移",
+          "description": "从本地 alphafrog_fund_info 中按 ts_code 排序选取 .OF 场外基金代码的起始偏移量",
+          "type": "number",
+          "default": 0
+        },
+        "fund_batch_limit": {
+          "label": "本地场外基金批次大小",
+          "description": "每批从本地基金库选取的 .OF 场外基金代码数量上限",
+          "type": "number",
+          "default": 100
+        },
+        "fund_count_limit": {
+          "label": "本地场外基金总数上限",
+          "description": "本次 task_set 最多覆盖多少只 .OF 场外基金；按 fund_batch_limit 展开为多个叶子任务",
+          "type": "number",
+          "default": 100
+        },
+        "limit": {
+          "label": "TuShare 每基金返回上限",
+          "description": "对每个 ts_code 调用 TuShare fund_portfolio 时的 limit，默认 5000",
           "type": "number",
           "default": 5000
         }

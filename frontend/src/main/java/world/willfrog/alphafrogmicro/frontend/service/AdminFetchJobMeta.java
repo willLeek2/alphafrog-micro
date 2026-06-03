@@ -206,9 +206,9 @@ public final class AdminFetchJobMeta {
         if (paramName.startsWith("trade_dates.")) {
             return List.of("trade_dates", "trade_dates_with_offsets", "trade_dates_with_index_batches");
         }
-        // date_range 相关参数：在 date_range_with_offsets、date_range_with_index_batches、date_range_with_api_offsets 下生效
+        // date_range 相关参数：在 date_range_with_offsets、date_range_with_index_batches、date_range_with_fund_batches、date_range_with_api_offsets 下生效
         if (paramName.startsWith("date_range.")) {
-            return List.of("date_range_with_offsets", "date_range_with_index_batches", "date_range_with_api_offsets");
+            return List.of("date_range_with_offsets", "date_range_with_index_batches", "date_range_with_fund_batches", "date_range_with_api_offsets");
         }
         // offset_range 相关参数：在 offsets、trade_dates_with_offsets、date_range_with_offsets 下生效
         if (paramName.startsWith("offset_range.")) {
@@ -217,6 +217,10 @@ public final class AdminFetchJobMeta {
         // index_batches 相关参数：在 index_batches、trade_dates_with_index_batches、date_range_with_index_batches 下生效
         if (paramName.equals("index_count_limit") || paramName.equals("index_batch_limit")) {
             return List.of("index_batches", "trade_dates_with_index_batches", "date_range_with_index_batches");
+        }
+        // fund_batches 相关参数：在 fund_batches、date_range_with_fund_batches 下生效
+        if (paramName.equals("fund_count_limit") || paramName.equals("fund_batch_limit") || paramName.equals("fund_offset")) {
+            return List.of("fund_batches", "date_range_with_fund_batches");
         }
         // 通用参数（offset, limit, api_offset_* 等）：在当前模式下总是生效
         return List.of(currentExpandStrategy);

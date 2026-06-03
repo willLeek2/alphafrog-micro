@@ -204,6 +204,9 @@ message DomesticFundPortfolioFetchByDateRangeRequest {
   optional string tsCode = 3;
   int32 offset = 4;
   int32 limit = 5;
+  // 本地场外基金 ts_code 批次参数；不复用 offset/limit，后者仍表示 TuShare API 分页。
+  int32 fundOffset = 6;
+  int32 fundBatchLimit = 7;
 }
 
 message DomesticFundPortfolioFetchByDateRangeResponse {

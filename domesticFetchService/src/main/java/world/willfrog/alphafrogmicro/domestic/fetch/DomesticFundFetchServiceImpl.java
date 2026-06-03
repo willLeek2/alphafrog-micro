@@ -5,6 +5,7 @@ import com.alibaba.fastjson.JSONObject;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.dubbo.config.annotation.DubboService;
 import org.springframework.stereotype.Service;
+import world.willfrog.alphafrogmicro.common.dao.domestic.fund.FundInfoDao;
 import world.willfrog.alphafrogmicro.common.utils.DateConvertUtils;
 import world.willfrog.alphafrogmicro.domestic.fetch.utils.DomesticFundStoreUtils;
 import world.willfrog.alphafrogmicro.domestic.fetch.utils.TuShareRequestUtils;
@@ -13,6 +14,7 @@ import world.willfrog.alphafrogmicro.domestic.idl.*;
 import world.willfrog.alphafrogmicro.domestic.idl.DubboDomesticFundFetchServiceTriple.DomesticFundFetchServiceImplBase;
 
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 @DubboService
@@ -22,11 +24,14 @@ public class DomesticFundFetchServiceImpl extends DomesticFundFetchServiceImplBa
 
     private final TuShareRequestUtils tuShareRequestUtils;
     private final DomesticFundStoreUtils domesticFundStoreUtils;
+    private final FundInfoDao fundInfoDao;
 
     public DomesticFundFetchServiceImpl(TuShareRequestUtils tuShareRequestUtils,
-                                        DomesticFundStoreUtils domesticFundStoreUtils) {
+                                        DomesticFundStoreUtils domesticFundStoreUtils,
+                                        FundInfoDao fundInfoDao) {
         this.tuShareRequestUtils = tuShareRequestUtils;
         this.domesticFundStoreUtils = domesticFundStoreUtils;
+        this.fundInfoDao = fundInfoDao;
     }
 
 
@@ -192,6 +197,15 @@ public class DomesticFundFetchServiceImpl extends DomesticFundFetchServiceImplBa
 
         int offset = request.getOffset();
         int limit = request.getLimit();
+        int fundBatchLimit = request.getFundBatchLimit();
+
+        if (fundBatchLimit > 0) {
+            int totalRows = fetchFundPortfolioForLocalFundBatch(request, startDate, endDate, fundBatchLimit);
+            return DomesticFundPortfolioFetchByDateRangeResponse.newBuilder()
+                    .setStatus(totalRows < 0 ? "failure" : "success")
+                    .setFetchedItemsCount(totalRows)
+                    .build();
+        }
 
         // TuShare fund_portfolio：全市场时需与 pro_api 一致，显式传 ts_code/ann_date/period 空串（见错误码 50101）
         Map<String, Object> params = new HashMap<>();
@@ -261,6 +275,85 @@ public class DomesticFundFetchServiceImpl extends DomesticFundFetchServiceImplBa
                 .setFetchedItemsCount(affectedRows)
                 .build();
 
+    }
+
+    private int fetchFundPortfolioForLocalFundBatch(DomesticFundPortfolioFetchByDateRangeRequest request,
+                                                    String startDate,
+                                                    String endDate,
+                                                    int fundBatchLimit) {
+        int fundOffset = Math.max(0, request.getFundOffset());
+        int pageLimit = request.getLimit() > 0 ? request.getLimit() : 5000;
+        List<String> fundTsCodes = fundInfoDao.getOffMarketFundTsCode(fundOffset, fundBatchLimit);
+        if (fundTsCodes == null || fundTsCodes.isEmpty()) {
+            log.info("本地场外基金批次为空: fundOffset={} fundBatchLimit={}", fundOffset, fundBatchLimit);
+            return 0;
+        }
+
+        int totalRows = 0;
+        for (String tsCode : fundTsCodes) {
+            int affectedRows = fetchFundPortfolioForOneFund(tsCode, startDate, endDate, pageLimit);
+            if (affectedRows < 0) {
+                return affectedRows;
+            }
+            totalRows += affectedRows;
+            sleepQuietly(200);
+        }
+        return totalRows;
+    }
+
+    private int fetchFundPortfolioForOneFund(String tsCode,
+                                             String startDate,
+                                             String endDate,
+                                             int limit) {
+        Map<String, Object> params = new HashMap<>();
+        Map<String, Object> queryParams = new HashMap<>();
+
+        params.put("api_name", "fund_portfolio");
+        queryParams.put("ts_code", tsCode);
+        queryParams.put("ann_date", "");
+        queryParams.put("start_date", startDate);
+        queryParams.put("end_date", endDate);
+        queryParams.put("period", "");
+        queryParams.put("symbol", "");
+        queryParams.put("offset", "");
+        queryParams.put("limit", limit);
+        params.put("params", queryParams);
+        params.put("fields", "ts_code,ann_date,end_date,symbol,mkv,amount,stk_mkv_ratio,stk_float_ratio");
+
+        JSONObject response = tuShareRequestUtils.createTusharePostRequest(params);
+        if (response == null) {
+            log.warn("TuShare fund_portfolio 场外基金请求无响应: tsCode={} start={} end={}", tsCode, startDate, endDate);
+            return -1;
+        }
+
+        Integer tushareCode = response.getInteger("code");
+        if (tushareCode != null && tushareCode != 0) {
+            String msg = response.getString("msg");
+            log.error("TuShare fund_portfolio 场外基金返回错误: code={} msg={} tsCode={} start={} end={}",
+                    tushareCode, msg, tsCode, startDate, endDate);
+            return -4;
+        }
+
+        JSONObject dataObj = response.getJSONObject("data");
+        if (dataObj == null) {
+            log.warn("TuShare fund_portfolio 场外基金响应 data 为空: tsCode={} start={} end={}",
+                    tsCode, startDate, endDate);
+            return -2;
+        }
+
+        JSONArray data = dataObj.getJSONArray("items");
+        if (data == null) {
+            data = new JSONArray();
+        }
+        return domesticFundStoreUtils.storeFundPortfoliosByRawTuShareOutput(data);
+    }
+
+    private void sleepQuietly(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
 
