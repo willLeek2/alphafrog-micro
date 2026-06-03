@@ -107,6 +107,7 @@ public class LangchainDagWorkflowExecutor {
         AtomicInteger toolCalls = new AtomicInteger();
         try {
             applyRunContext(request);
+            // 设置工作流形态为 DAG，供下游组件（ToolRouter / EventService / Observability）区分 linear vs dag
             AgentContext.setWorkflow("dag");
             List<TodoItem> items = plan.getItems() == null ? List.of() : plan.getItems();
             // 从 todo items 构建 DAG 图：解析每个 item 的 dependsOn（依赖列表）
@@ -385,6 +386,7 @@ public class LangchainDagWorkflowExecutor {
             emitEventBestEffort(runId, userId, "TODO_NODE_STARTED", todoNodeStartedPayload(item));
             // 6. 复制当前共享的 dataset refs 快照，节点执行过程中产生的新的 refs 会 merge 回去
             Map<String, String> localRefs = new ConcurrentHashMap<>(sharedContext.datasetRefsSnapshot());
+            // 记录节点开始时间，用于计算执行耗时（duration_ms），写入统一的 TODO_NODE_COMPLETED/FAILED 事件
             nodeStartMs = System.currentTimeMillis();
             LangchainTodoNodeResult record = todoNodeExecutor.execute(
                     request,
@@ -554,6 +556,7 @@ public class LangchainDagWorkflowExecutor {
         return value == null || value.trim().isEmpty();
     }
 
+    /** 判断中断原因是否为用户主动取消（cancel），用于区分 cancel 和 budget 等其他中断类型。 */
     private static boolean isInterruptedCancel(String reason) {
         return reason != null && reason.startsWith("RUN_INTERRUPTED:CANCEL");
     }
@@ -562,6 +565,7 @@ public class LangchainDagWorkflowExecutor {
         return value == null ? "" : value;
     }
 
+    /** null/空安全的回退取值：主值非空返回主值，否则返回 fallback（空则返 ""）。 */
     private String nvl(String primary, String fallback) {
         if (!isBlank(primary)) {
             return primary;
@@ -569,6 +573,10 @@ public class LangchainDagWorkflowExecutor {
         return fallback == null ? "" : fallback;
     }
 
+    /**
+     * 构造统一的 TODO_NODE_STARTED 事件 payload —— 包含 todo_id、sequence、workflow 形态、
+     * phase 和启动时间戳。前端可通过 SSE 订阅此事件来渲染 DAG 节点的"开始执行"状态。
+     */
     private Map<String, Object> todoNodeStartedPayload(TodoItem item) {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("todo_id", item.getId());
@@ -579,11 +587,23 @@ public class LangchainDagWorkflowExecutor {
         return payload;
     }
 
+    /**
+     * 构造统一的 TODO_NODE_COMPLETED / TODO_NODE_FAILED 事件 payload。
+     * @param success   节点是否成功完成
+     * @param summary   节点的输出摘要或失败原因文本
+     * @param durationMs 节点执行耗时（毫秒），用于前端展示和各节点耗时对比
+     * @param toolCalls 该节点工具调用次数（完成时传入，失败时传 0）
+     */
     private Map<String, Object> todoNodeResultPayload(TodoItem item, boolean success,
                                                        String summary, long durationMs, int toolCalls) {
         return todoNodeResultPayload(item, success, summary, durationMs, toolCalls, null);
     }
 
+    /**
+     * 带显式 errorCode 的重载版本。
+     * 如果不传 errorCode 且 success=false，会自动根据 summary 判断是否为 cancel 导致的失败
+     * 并填入 {@code RUN_CANCELED} 错误码。
+     */
     private Map<String, Object> todoNodeResultPayload(TodoItem item, boolean success,
                                                        String summary, long durationMs, int toolCalls,
                                                        String errorCode) {
@@ -610,6 +630,11 @@ public class LangchainDagWorkflowExecutor {
         return payload;
     }
 
+    /**
+     * 尽力写入事件（不抛异常）—— 事件系统不可用时不会中断 DAG 节点执行。
+     * <p>用于统一的 TODO_NODE_* 生命周期事件和 DAG_NODE_* 状态事件。
+     * runId 或 userId 为空时直接跳过（例如测试环境或未初始化上下文时）。</p>
+     */
     private void emitEventBestEffort(String runId, String userId, String eventType,
                                      Map<String, Object> payload) {
         if (isBlank(runId) || isBlank(userId)) {
@@ -618,7 +643,7 @@ public class LangchainDagWorkflowExecutor {
         try {
             eventService.append(runId, userId, eventType, payload);
         } catch (Exception e) {
-            // 事件失败不影响节点执行
+            // 事件系统不可用（例如 Redis 宕机）不应阻塞 DAG 执行
         }
     }
 

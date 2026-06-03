@@ -70,6 +70,10 @@ public class ToolRouterToolProvider implements ToolProvider {
     private final SearchTools searchTools;
     private final PythonSandboxTools pythonSandboxTools;
     private final ObjectMapper objectMapper;
+    /**
+     * 事件服务，传递给 {@link ToolRouterToolExecutor} 用于发射 TOOL_CALL_STARTED / TOOL_CALL_FINISHED
+     * SSE 事件（经 Redis pub-sub 推送）。
+     */
     private final AgentEventService eventService;
 
     /**

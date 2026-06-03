@@ -56,6 +56,8 @@ import java.util.Map;
  *   <li><b>原始 HTTP 捕获</b>：完整记录请求/响应信息</li>
  *   <li><b>可观测性上报</b>：将 HTTP 观测数据上报到 AgentObservabilityService</li>
  *   <li><b>默认流式输出</b>：对 LLM Provider 使用 stream=true，内部聚合 SSE 流</li>
+ *   <li><b>实时事件契约</b>：为每次逻辑调用生成 {@code llm_call_id}，并在
+ *       {@code LLM_CALL_STARTED/DELTA/FINISHED} 中带上 todo/workflow/stage 归属</li>
  * </ol>
  *
  * <p>需要特别注意 OpenRouter 的 fallback 语义：只要请求体没有显式写
@@ -135,6 +137,8 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
         String responseJson = null;
         List<Map<String, Object>> attempts = List.of();
         
+        // 这个 id 是前端看到的 llm_call_id，同时也是 observability traceId override。
+        // 保持二者一致后，UI 可以从 SSE 卡片懒加载 safe detail，而不需要再猜 provider generation_id。
         String llmTraceId = java.util.UUID.randomUUID().toString().replace("-", "");
         try {
             if (budgetService != null) {
@@ -437,6 +441,9 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
          * 这里会再次从 response 中提取 tokenUsage/cachedTokens，而不是复用 doChat
          * 中的 TokenUsage，原因是异常路径可能没有成功构造 ChatCompletionResponse，
          * 但 responseRecord 中仍然可能包含 provider 返回的 usage 或错误体。
+         *
+         * llmCallId 由 SSE live event 和 observability 共用。Step 2 存储治理后，
+         * raw 请求/响应会被拆到 Redis detail blob，snapshot 中只保留安全摘要索引。
          */
         if (observabilityService == null) {
             return null;
@@ -823,6 +830,10 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
     }
 
     // ── SSE live event helpers ──
+    //
+    // 这些事件是 Agent V2 前端主链路的数据源。STARTED/DELTA/FINISHED 都要带同一个
+    // llm_call_id / trace_id，以及 AgentContext 中的 phase、stage、todo_id、workflow。
+    // planning/summarizing 阶段可能没有 todo 归属；execution 阶段必须能挂到具体节点。
 
     private void emitLlmCallStarted(String llmTraceId, boolean stream) {
         if (eventService == null) {

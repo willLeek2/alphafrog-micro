@@ -31,10 +31,14 @@ import java.util.UUID;
  *
  * <p>单次调用的处理顺序（{@link #execute}）：</p>
  * <ol>
+ *   <li>解析或生成 {@code tool_call_id}：优先复用 LC4j 请求中的 ID，若无则 fallback 到 UUID，
+ *       确保 SSE 事件和 observability trace 的 tool call 归属一致；</li>
  *   <li>把 LC4j 传来的 arguments JSON 解析为 {@code Map<String, Object>}；</li>
- *   <li>{@link LangchainRepeatedToolCallGuard}：同一 run 内相同工具+相同参数重复超过阈值则直接返回错误文本，
- *       避免模型死循环刷工具；</li>
+ *   <li>{@link LangchainRepeatedToolCallGuard}：同一 run 内相同工具+相同参数重复超过阈值则直接返回错误文本
+ *       （此路径跳过 STARTED 直接 emit FINISHED，避免前端 UI card 永远转圈）；</li>
+ *   <li>emit <b>TOOL_CALL_STARTED</b> 事件（经 SSE + Redis），携带 tool_call_id、tool_name、arguments、phase；</li>
  *   <li>{@link ToolRouter#invokeWithMeta} 执行并取 output 字符串；</li>
+ *   <li>emit <b>TOOL_CALL_FINISHED</b> 事件（经 SSE + Redis），携带结果、duration_ms、success；</li>
  *   <li>从 output 解析 {@code dataset_id}，写入 {@link DatasetRefRegistry} 与
  *       {@link LangchainDatasetRefContext}，供 DAG 下游 todo 或 executePython 引用；</li>
  *   <li>若 output 暗示 dataset 缺失/无效，或发生重复调用，在结果末尾追加 {@code _retry_hint_}
@@ -143,6 +147,17 @@ final class ToolRouterToolExecutor implements ToolExecutor {
         }
     }
 
+    /**
+     * 解析或生成 tool_call_id，确保 SSE 事件与 observability trace 的归属一致。
+     *
+     * <p>优先级：LC4j 请求自带的 ID > 随机 UUID。
+     * LC4j 在每次 tool loop 中会为 ToolExecutionRequest 分配稳定 ID（通常来自模型输出），
+     * 复用该 ID 可保证前端 SSE 流中的 TOOL_CALL_STARTED/TOOL_CALL_FINISHED 与
+     * observability timeline 里的 tool trace 一一对应。</p>
+     *
+     * @param request LC4j 的 tool 执行请求
+     * @return 稳定的 tool_call_id 字符串
+     */
     private String resolveToolCallId(ToolExecutionRequest request) {
         String id = request == null ? null : request.id();
         if (id != null && !id.isBlank()) {
@@ -201,6 +216,18 @@ final class ToolRouterToolExecutor implements ToolExecutor {
 
     // ── Tool call event emission helpers ──
 
+    /**
+     * 发射 TOOL_CALL_STARTED 事件，经 SSE 推送 + Redis 持久化。
+     *
+     * <p>payload 包含 tool_call_id（与 observability traceId 对齐）、tool_name、arguments、
+     * 以及 {@link AgentSsePayloadSupport} 注入的 workflow/phase/stage/todo_id 归属信息。
+     * 若 AgentContext 中缺失 runId 或 userId（如单元测试场景），则跳过发射并打 warn 日志，
+     * 避免 NPE 中断 tool loop。</p>
+     *
+     * @param toolCallId 本次 tool call 的稳定 ID
+     * @param toolName   工具名
+     * @param arguments  解析后的参数映射
+     */
     private void emitToolCallStarted(String toolCallId, String toolName, Map<String, Object> arguments) {
         String runId = AgentContext.getRunId();
         String userId = AgentContext.getUserId();
@@ -220,6 +247,21 @@ final class ToolRouterToolExecutor implements ToolExecutor {
         eventService.append(runId, userId, "TOOL_CALL_STARTED", payload);
     }
 
+    /**
+     * 发射 TOOL_CALL_FINISHED 事件，经 SSE 推送 + Redis 持久化。
+     *
+     * <p>payload 包含 tool_call_id、执行结果（success/duration_ms）、result_preview（截断预览，
+     * 避免超大结果打爆事件体），以及 {@link AgentSsePayloadSupport} 注入的归属信息。
+     * 重复调用被 block 时也会 emit，使前端 UI card 能从「loading」状态恢复为错误展示，
+     * 而不是永远转圈。</p>
+     *
+     * @param toolCallId  本次 tool call 的稳定 ID
+     * @param toolName    工具名
+     * @param arguments   解析后的参数映射
+     * @param success     工具执行是否成功（ToolRouter 返回 isSuccess）
+     * @param output      工具输出文本（可能为异常消息）
+     * @param durationMs  工具执行耗时（毫秒）
+     */
     private void emitToolCallFinished(String toolCallId, String toolName, Map<String, Object> arguments,
                                       boolean success, String output, long durationMs) {
         String runId = AgentContext.getRunId();
@@ -243,6 +285,17 @@ final class ToolRouterToolExecutor implements ToolExecutor {
         eventService.append(runId, userId, "TOOL_CALL_FINISHED", payload);
     }
 
+    /**
+     * 截断工具输出文本，用于事件 payload 的 result_preview 字段。
+     *
+     * <p>防止超大结果（如包含数千行的日线数据）直接塞进 SSE 事件体导致 payload 过大。
+     * 完整输出会先由 {@code AgentObservabilityService} 写入 Redis detail blob；
+     * 持久化后的 observability trace 只保留 outputPreview / detailBlobStored 等索引字段，
+     * 前端通过 safe detail API 按需读取，过期则返回 expired/unavailable。</p>
+     *
+     * @param text 原始工具输出
+     * @return 截断后的预览文本，若未超限则原样返回
+     */
     private String preview(String text) {
         if (text == null) {
             return "";

@@ -46,6 +46,12 @@ import java.util.concurrent.Executor;
  * <p>这个类本身不直接和大模型对话，也不直接执行工具；它负责把“模型、prompt、工具目录、
  * 状态机、可观测性、取消/暂停控制”串成一个完整业务流程。具体规划逻辑在
  * {@link LangchainAiPlanner}，单个 todo 的工具循环在 {@link LangchainTodoNodeExecutor}。</p>
+ *
+ * <p>Agent V2 前端接入后，这个类还承担一个很关键的契约边界：plan 必须在
+ * {@code PLAN_READY} 事件前后可恢复，事件 payload 中要带完整 plan，执行阶段的
+ * {@code TODO_NODE_*}、{@code LLM_CALL_*}、{@code TOOL_CALL_*} 再用同一批 todo id
+ * 做归属。也就是说，前端的 stepper / DAG 图并不是事后解析答案得到的，而是从这里发出的
+ * plan 和后续节点事件逐步拼出来的。</p>
  */
 @Service
 @Slf4j
@@ -193,6 +199,9 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                     .build());
 
             boolean useDag = LangchainWorkflowRouting.shouldUseDag(plan);
+            // PLAN_READY 既是实时 UI 的启动信号，也是断线重连后的恢复锚点。
+            // 因此先把 plan 写入 DB/Redis，再发带完整 plan payload 的事件；这样前端收到事件后，
+            // 即使立刻调用 snapshot/status，也能读到同一份计划。
             persistPlan(runId, userId, plan);
             eventService.append(runId, userId, "PLAN_READY", Map.of(
                     "execution_mode", plan.getExecutionMode() == null ? "AUTO" : plan.getExecutionMode().name(),
@@ -258,6 +267,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         runMapper.updatePlanJson(runId, userId, planJson);
         AgentRunStateStore stateStore = stateStoreProvider.getIfAvailable();
         if (stateStore != null) {
+            // Redis 中的 plan 是前端 snapshot/status 的快速恢复来源；DB 中的 plan 是终态和历史兜底。
             stateStore.recordPlan(runId, planJson, true);
         }
     }
@@ -291,7 +301,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                                  LangchainLinearWorkflowResult result,
                                  AgentRunStatus status) {
         // snapshot 是给前端、调试脚本和恢复流程看的业务快照；它不是完整观测明细。
-        // 大体积 LLM trace 仍由 AgentObservabilityService 管理，必要时通过 observability/full 单独拉取。
+        // 大体积 LLM/tool 明细由 AgentObservabilityService 拆成摘要索引 + Redis detail blob，
+        // 普通用户展开调用详情时走 safe detail API，不再从 snapshot 直接读取 raw HTTP / raw reasoning。
         Map<String, Object> snapshot = new LinkedHashMap<>();
         snapshot.put("user_goal", userGoal);
         snapshot.put("plan", result.getPlan());

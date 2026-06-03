@@ -38,9 +38,11 @@ import java.util.function.Consumer;
  * <ol>
  *   <li><b>LLM 调用 trace</b>：{@link #recordLlmCall} 系列方法记录每次 LLM 调用的 id、phase、
  *       token 用量、耗时、错误。{@link #recordLlmCallWithRawHttp} 支持记录完整原始 HTTP
- *       请求/响应（ALP-25），调试复杂问题时至关重要。</li>
+ *       请求/响应（ALP-25），调试复杂问题时至关重要。完成持久化前会把大字段拆到
+ *       Redis detail blob，trace 列表只保留可索引的安全摘要。</li>
  *   <li><b>工具调用 trace</b>：{@link #recordToolCall} 记录工具名、参数、输出、缓存命中/未命中、
- *       耗时，由 {@code ToolRouter} 调用。</li>
+ *       耗时，由 {@code ToolRouter} 调用；traceId 优先与 SSE 的 {@code tool_call_id} 对齐，
+ *       这样前端展开工具卡片时可以按同一个 id 懒加载详情。</li>
  *   <li><b>Run 初始化与失败</b>：{@link #initializeRun} 在 Pipeline 入口调用，设置启动时间、
  *       endpoint/model、captureLlmRequests 开关。{@link #recordFailure} 在 run 失败时写入
  *       diagnostics.lastErrorType / lastErrorMessage。</li>
@@ -58,17 +60,20 @@ import java.util.function.Consumer;
  * <pre>
  * LLM 调用 → recordLlmCall() → mutate() → Redis（JSON）→ 定期 flush
  * 工具调用  → recordToolCall() → mutate() → Redis
- * Run 结束  → attachObservabilityToSnapshot() → snapshot JSON → DB
+ * Run 结束  → attachObservabilityToSnapshot() → scrub 后的 snapshot JSON → DB
+ * 详情展开  → safe detail API → Redis detail blob（过期则返回 expired/unavailable）
  * Matrix    → loadObservabilityJson() → Redis 优先，snapshot 兜底
  * </pre>
  *
  * <h2>容量保护（面试要点）</h2>
  * <p>生产环境长时间运行的 agent 可能产生数百次 LLM 调用，不加限制会撑爆 Redis 和 DB。
- * 因此设计了三层容量保护：</p>
+ * 因此设计了"摘要索引 + 短期 detail blob + 截断预览"三层容量保护：</p>
  * <ul>
  *   <li>{@code llmTraceMaxCalls}：LlmTrace 列表最大长度（默认 100，超出移除最旧）</li>
  *   <li>{@code llmTraceMaxTextChars}：单条请求/响应文本最大字符数（默认 20K，超出截断）</li>
  *   <li>{@code toolTraceMaxOutputChars}：单条工具输出最大字符数（默认 100K，超出截断）</li>
+ *   <li>raw HTTP、inputMessages、reasoning、完整工具输出等大字段不进入普通 snapshot；
+ *       可懒加载的详情短期存在 Redis，过期后 safe detail API 返回 expired。</li>
  * </ul>
  *
  * <h2>并发安全</h2>
@@ -1108,7 +1113,7 @@ public class AgentObservabilityService {
      * <p>这是 run 终态（COMPLETED/FAILED/CANCELED）写回 DB 前的最后一步：</p>
      * <ol>
      *   <li>mutate：更新 summary.status 和 completedAtMillis（终态时）。</li>
-     *   <li>把 observability 序列化后塞入 snapshot Map 的 {@code observability} 字段。</li>
+     *   <li>把 observability 转成 Map 后先 scrub，移除 raw 大字段，只留下 summary / trace index。</li>
      *   <li>同步保存观测 JSON 到 Redis，避免后续查询从 snapshot 字段慢解析。</li>
      *   <li>若 run 已进入终态，移除 per-runId 锁以释放内存。</li>
      * </ol>
@@ -1836,6 +1841,9 @@ public class AgentObservabilityService {
         if (trace == null || runId == null || runId.isBlank()) {
             return;
         }
+        // Step 2 存储治理：先尝试把可懒加载的大字段写入 Redis detail blob；
+        // 只有写入成功才在 trace index 上标 detailBlobStored=true。否则保留 available summary，
+        // 避免 Redis 写失败被前端误判为 expired。
         boolean detailBlobStored = false;
         Map<String, Object> blob = AgentCallDetailPersistence.toLlmDetailBlob(trace);
         if (AgentCallDetailPersistence.hasPersistableDetailBlob(blob)) {
@@ -1854,6 +1862,8 @@ public class AgentObservabilityService {
         if (trace == null || runId == null || runId.isBlank()) {
             return;
         }
+        // 工具输出可能远大于 SSE preview。这里同样先写 Redis detail blob，再 scrub trace；
+        // 普通用户 safe detail API 只会返回白名单摘要，不会把 raw params/output 直接吐给前端。
         boolean detailBlobStored = false;
         Map<String, Object> blob = AgentCallDetailPersistence.toToolDetailBlob(trace);
         if (AgentCallDetailPersistence.hasPersistableDetailBlob(blob)) {

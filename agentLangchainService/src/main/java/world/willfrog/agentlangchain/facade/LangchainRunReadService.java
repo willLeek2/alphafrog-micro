@@ -77,14 +77,16 @@ import java.util.Map;
  *   <li>run 查询（单个 run 详情、列表分页）</li>
  *   <li>status 轮询（前端 matrix 最频繁调用的接口，含 phase 推断、计划进度、
  *       observability 摘要）</li>
- *   <li>events 增量拉取（通过 afterSeq 游标实现断点续传）</li>
+ *   <li>events 增量拉取（通过 afterSeq 游标实现断点续传；当前 Redis 为主、DB 为过渡期兜底）</li>
  *   <li>result 结果查询（含结构化答案、credits 消耗计算）</li>
  *   <li>配置类查询（可用模型列表、工具列表、credits 余额）</li>
  *   <li>快照分段下载（大 run 的 snapshot 拆成多 part，分段拉取避免 OOM）</li>
  * </ul>
  *
  * <h2>读写一致性</h2>
- * langchain 服务和 legacy agentService 共享同一套 PG/Redis 存储。
+ * langchain 服务和 legacy agentService 共享同一套 PG/Redis 存储。事件流目前由
+ * {@link AgentEventService} 优先从 Redis ZSET 读取，只有 Redis 没有该 run 的事件时才回退 DB；
+ * 这是压测后为了避免大量 event 长期堆在数据库中的过渡设计。
  * 本类的读操作依赖 {@link LangchainSingleWriterGuard} 保证：
  * 当前 langchain 实例有写入权时才允许直接读 PG，避免读到过期的本地缓存。
  *
@@ -189,6 +191,8 @@ public class LangchainRunReadService {
         List<AgentRunEvent> events;
         boolean hasMore = false;
         if (request.getLatest()) {
+            // snapshot 阶段只需要最近 N 条事件，前端用它补足首屏上下文；
+            // 常规补洞仍走 afterSeq，避免每次都传完整事件流。
             events = eventService.listLatestByRunId(request.getId(), limit);
         } else {
             events = eventService.listByRunIdAfterSeq(request.getId(), afterSeq, limit + 1);
@@ -234,18 +238,20 @@ public class LangchainRunReadService {
     /**
      * agent 状态轮询 —— 前端/matrix 最高频的读接口。
      *
-     * <p>返回当前 run 的完整状态快照，包含：
+     * <p>返回当前 run 的轻量状态快照，包含：
      * <ul>
      *   <li>基础状态（COMPLETED/FAILED/EXECUTING 等）</li>
      *   <li>阶段推断（PLANNING/EXECUTING/SUMMARIZING，由 {@link #resolvePhase} 推断）</li>
      *   <li>当前正在执行的 tool 名称（从 TOOL_CALL_STARTED 事件 payload 中提取）</li>
      *   <li>计划进度（planJson + progressJson）</li>
-     *   <li>observability 数据可用性标记（observabilityFullAvailable）</li>
+     *   <li>observability 摘要和完整数据可用性标记（不直接返回完整 traces）</li>
      *   <li>credits 消耗</li>
      *   <li>已用时长（elapsedMs）</li>
      * </ul>
      *
      * <p>这是 agent 前端展示的核心数据源。matrix 脚本在 poll 循环中每 3 秒调一次。
+     * 这里刻意不返回 full observability，避免 status poll 因大 trace 变成 MB 级响应；
+     * 需要完整观测或安全调用详情时，由结果/详情接口按需加载。
      */
     public AgentRunStatusMessage getStatus(GetAgentRunStatusRequest request) {
         AgentRun run = requireReadableRun(request.getId(), request.getUserId());
