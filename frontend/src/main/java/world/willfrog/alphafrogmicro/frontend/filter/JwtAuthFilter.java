@@ -11,7 +11,10 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.context.SecurityContext;
 import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.security.web.context.RequestAttributeSecurityContextRepository;
+import org.springframework.security.web.context.SecurityContextRepository;
 import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
 import org.springframework.web.filter.OncePerRequestFilter;
@@ -28,6 +31,9 @@ import java.util.List;
 @RequiredArgsConstructor
 @Slf4j
 public class JwtAuthFilter extends OncePerRequestFilter {
+
+    private final SecurityContextRepository securityContextRepository =
+            new RequestAttributeSecurityContextRepository();
 
     private final JwtConfig jwtConfig;
     private final SecretKey secretKey;
@@ -70,7 +76,11 @@ public class JwtAuthFilter extends OncePerRequestFilter {
                 chain.doFilter(request, response);
                 return;
             }
-            SecurityContextHolder.getContext().setAuthentication(authentication);
+            // ASYNC 派发（SseEmitter 等）需将 SecurityContext 写入 request attribute，否则二次鉴权丢失登录态
+            SecurityContext context = SecurityContextHolder.createEmptyContext();
+            context.setAuthentication(authentication);
+            SecurityContextHolder.setContext(context);
+            securityContextRepository.saveContext(context, request, response);
             log.info("JWT authentication successful for {}: principal={}, authenticated={}, source={}",
                     requestUri, authentication.getName(), authentication.isAuthenticated(), sourceHolder[0]);
         } else if (token != null) {

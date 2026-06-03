@@ -106,30 +106,30 @@ public class AgentSseService {
         AtomicBoolean doneSent = new AtomicBoolean(false);
         StatusState statusState = new StatusState();
 
-        MessageListener listener = (Message message, byte[] pattern) -> {
-            try {
-                Map<String, Object> normalized = normalizeEnvelopeJson(
-                        new String(message.getBody(), StandardCharsets.UTF_8));
-                synchronized (liveBuffer) {
-                    if (replaying.get()) {
-                        if (liveBuffer.size() >= LIVE_REPLAY_BUFFER_LIMIT) {
-                            overflow.set(true);
-                        } else {
-                            liveBuffer.add(normalized);
-                        }
-                        return;
-                    }
-                }
-                sendAgentEvent(emitter, normalized);
-            } catch (Exception e) {
-                log.debug("SSE live event send failed for runId={}, likely client disconnected: {}",
-                        runId, e.getMessage());
-            }
-        };
-        redisListenerContainer.addMessageListener(listener, new ChannelTopic(channelName));
-        listeners.put(emitter, listener);
-
         try {
+            MessageListener listener = (Message message, byte[] pattern) -> {
+                try {
+                    Map<String, Object> normalized = normalizeEnvelopeJson(
+                            new String(message.getBody(), StandardCharsets.UTF_8));
+                    synchronized (liveBuffer) {
+                        if (replaying.get()) {
+                            if (liveBuffer.size() >= LIVE_REPLAY_BUFFER_LIMIT) {
+                                overflow.set(true);
+                            } else {
+                                liveBuffer.add(normalized);
+                            }
+                            return;
+                        }
+                    }
+                    sendAgentEvent(emitter, normalized);
+                } catch (Exception e) {
+                    log.debug("SSE live event send failed for runId={}, likely client disconnected: {}",
+                            runId, e.getMessage());
+                }
+            };
+            redisListenerContainer.addMessageListener(listener, new ChannelTopic(channelName));
+            listeners.put(emitter, listener);
+
             if (safeResumeAfterSeq > 0) {
                 int replayMaxSeq = replayEvents(runId, userId, safeResumeAfterSeq, emitter);
                 replaying.set(false);
