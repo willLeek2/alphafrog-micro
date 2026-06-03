@@ -54,7 +54,7 @@ public class AgentSseService {
     private static final String REDIS_CHANNEL_PREFIX = "agent:events:";
     private static final TypeReference<Map<String, Object>> MAP_TYPE = new TypeReference<>() {};
     private static final Set<String> TERMINAL_STATUSES = Set.of(
-            "COMPLETED", "FAILED", "CANCELED", "CANCELLED", "EXPIRED", "TIMEOUT", "TIMED_OUT"
+            "COMPLETED", "PARTIAL", "FAILED", "CANCELED", "CANCELLED", "EXPIRED", "TIMEOUT", "TIMED_OUT"
     );
 
     /**

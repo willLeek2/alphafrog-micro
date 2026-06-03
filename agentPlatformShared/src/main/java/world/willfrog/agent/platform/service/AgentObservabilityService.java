@@ -1139,7 +1139,7 @@ public class AgentObservabilityService {
                 current.getSummary().setStatus(status.name());
             }
             // 终态时锁定 completedAtMillis，后续 touch 不会再覆盖 totalDurationMs
-            if (status == AgentRunStatus.COMPLETED || status == AgentRunStatus.FAILED || status == AgentRunStatus.CANCELED) {
+            if (status == AgentRunStatus.COMPLETED || status == AgentRunStatus.PARTIAL || status == AgentRunStatus.FAILED || status == AgentRunStatus.CANCELED) {
                 current.getSummary().setCompletedAtMillis(System.currentTimeMillis());
             }
         });

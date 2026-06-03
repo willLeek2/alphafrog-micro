@@ -376,10 +376,10 @@ public class LangchainDagWorkflowExecutor {
         String userId = request.getUserId();
         long nodeStartMs = 0;
         try {
-            // 0. recovery judge 重调度：已完成节点跳过，避免重复执行
+            // 0. recovery judge 重调度：已有结果的节点跳过，避免重复执行
             LangchainTodoNodeResult existing = results.get(item.getId());
-            if (existing != null && existing.isSuccess()) {
-                nodeSuccess.putIfAbsent(item.getId(), true);
+            if (existing != null) {
+                nodeSuccess.putIfAbsent(item.getId(), existing.isSuccess());
                 return;
             }
             // 1. 检查是否被用户取消（cancel/pause）
@@ -581,16 +581,16 @@ public class LangchainDagWorkflowExecutor {
                     : List.of();
             String rationale = String.valueOf(judgeResult.getOrDefault("rationale", ""));
             String truncatedRationale = rationale.length() > 500 ? rationale.substring(0, 500) : rationale;
-            // judgeTraceId 标识本次 recovery 决策；实际的 LLM trace 在 observability
-            // 中可通过 phase=dag_recovery_judge 过滤定位。
-            String judgeTraceId = java.util.UUID.randomUUID().toString().replace("-", "");
+            // recoveryJudgeDecisionId 标识本次 recovery 决策（非真实 LLM traceId，实际 trace
+            // 在 observability 中通过 phase=dag_recovery_judge 过滤定位）。
+            String recoveryJudgeDecisionId = java.util.UUID.randomUUID().toString().replace("-", "");
 
             if (!"YES".equalsIgnoreCase(decision)) {
                 if (!isBlank(runId) && !isBlank(userId)) {
                     eventService.append(runId, userId, "DAG_RECOVERY_JUDGE_FINISHED", Map.of(
                             "decision", "NO",
                             "rationale", truncatedRationale,
-                            "judgeCallTraceId", judgeTraceId
+                            "judgeCallTraceId", recoveryJudgeDecisionId
                     ));
                 }
                 return null;
@@ -602,13 +602,13 @@ public class LangchainDagWorkflowExecutor {
                         "decision", "YES",
                         "skipTodoIds", skipTodoIds,
                         "rationale", truncatedRationale,
-                        "judgeCallTraceId", judgeTraceId
+                        "judgeCallTraceId", recoveryJudgeDecisionId
                 ));
                 for (String skipId : skipTodoIds) {
                     Map<String, Object> skippedPayload = new LinkedHashMap<>();
                     skippedPayload.put("todo_id", skipId);
                     skippedPayload.put("reason", "judge_recovery");
-                    skippedPayload.put("judge_call_trace_id", judgeTraceId);
+                    skippedPayload.put("judge_call_trace_id", recoveryJudgeDecisionId);
                     skippedPayload.put("workflow", "dag");
                     skippedPayload.put("phase", "dag_recovery_judge");
                     eventService.append(runId, userId, "TODO_NODE_SKIPPED", skippedPayload);
@@ -624,15 +624,17 @@ public class LangchainDagWorkflowExecutor {
                 LangchainTodoNodeResult r = results.get(item.getId());
                 if (r == null) continue;
                 if (skipSet.contains(item.getId())) {
-                    // judge 决定跳过 → 标记为 recovered success
+                    // judge 决定跳过 → 放入 recovered 占位结果，标记 success 释放依赖链
+                    preResults.put(item.getId(), LangchainTodoNodeResult.success(
+                            "[recovered by judge] " + truncatedRationale, 0));
                     preNodeSuccess.put(item.getId(), true);
-                    // 不保留结果，让该节点在第二遍中充当透明依赖
                 } else if (r.isSuccess()) {
                     preResults.put(item.getId(), r);
                     preNodeSuccess.put(item.getId(), true);
                 } else {
                     // 失败或 SKIPPED 节点，不在 skipSet 中 → 保留失败状态
                     preNodeSuccess.put(item.getId(), false);
+                    // FAILED 节点：保留结果，executeNode 的 guard 会跳过
                     // SKIPPED（dependency）节点：清除结果，使其在第二遍中重调度
                     if (!r.isSuccess() && r.getSummary() != null
                             && r.getSummary().startsWith("Skipped:")) {
@@ -648,11 +650,11 @@ public class LangchainDagWorkflowExecutor {
             DagParallelRun secondRun = executeDagParallel(graph, items, request, sharedContext,
                     toolCalls, preResults, preNodeSuccess);
 
-            // 合并第二遍结果
+            // 合并结果：第二遍覆盖第一遍（重新执行的节点用新结果）
             Map<String, LangchainTodoNodeResult> mergedResults = new LinkedHashMap<>(results);
-            secondRun.results().forEach(mergedResults::putIfAbsent);
+            secondRun.results().forEach((k, v) -> mergedResults.put(k, v));
 
-            // 检查第二遍后是否有新失败
+            // 检查第二遍后是否有新失败（skipSet 节点除外）
             for (TodoItem item : items) {
                 if (skipSet.contains(item.getId())) continue;
                 LangchainTodoNodeResult nodeResult = mergedResults.get(item.getId());
@@ -660,6 +662,15 @@ public class LangchainDagWorkflowExecutor {
                     String reason = nodeResult == null ? "No result after recovery" : nvl(nodeResult.getSummary());
                     appendDagCompleted(runId, userId, false, reason, toolCalls.get());
                     return failure(plan, completedTodos, reason, toolCalls.get());
+                }
+            }
+
+            // 将 judge recovery 跳过的节点落 WorkflowState
+            if (!isBlank(runId)) {
+                for (String skipId : skipTodoIds) {
+                    stateRecorder.persistNodeState(runId, items, new Object(), new LinkedHashMap<>(),
+                            graph.getItemMap().get(skipId), TodoStatus.SKIPPED,
+                            LangchainTodoNodeResult.skipped("judge_recovery"), toolCalls.get());
                 }
             }
 
@@ -679,7 +690,7 @@ public class LangchainDagWorkflowExecutor {
                     .completedTodos(allCompleted)
                     .toolCallsUsed(toolCalls.get())
                     .skippedTodoIds(skipTodoIds)
-                    .recoveryJudgeTraceId(judgeTraceId)
+                    .recoveryJudgeDecisionId(recoveryJudgeDecisionId)
                     .recoveryRationale(truncatedRationale)
                     .build();
 

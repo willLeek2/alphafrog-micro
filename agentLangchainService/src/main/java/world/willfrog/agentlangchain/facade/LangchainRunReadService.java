@@ -549,7 +549,8 @@ public class LangchainRunReadService {
         if (status == null) {
             return "";
         }
-        if (status == AgentRunStatus.COMPLETED || status == AgentRunStatus.FAILED
+        if (status == AgentRunStatus.COMPLETED || status == AgentRunStatus.PARTIAL
+                || status == AgentRunStatus.FAILED
                 || status == AgentRunStatus.CANCELED || status == AgentRunStatus.EXPIRED) {
             return status.name();
         }

@@ -23,8 +23,9 @@ public class LangchainLinearWorkflowResult {
     private int toolCallsUsed;
     /** DAG recovery judge 返回的跳过节点 ID 列表（仅 PARTIAL 时有值）。 */
     private List<String> skippedTodoIds;
-    /** DAG recovery judge 的 LLM 调用 traceId（仅 PARTIAL 时有值）。 */
-    private String recoveryJudgeTraceId;
+    /** DAG recovery judge 的决策 ID（非真实 LLM trace；用于关联 SKIPPED 事件）。
+     *  实际 LLM trace 在 observability 中通过 phase=dag_recovery_judge 过滤定位。 */
+    private String recoveryJudgeDecisionId;
     /** DAG recovery judge 的判定理由，截断到 500 字符（仅 PARTIAL 时有值）。 */
     private String recoveryRationale;
 }

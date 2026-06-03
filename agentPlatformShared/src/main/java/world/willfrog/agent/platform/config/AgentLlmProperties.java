@@ -1490,9 +1490,9 @@ public class AgentLlmProperties {
         private String planningTodosStageFile = "prompts/todo/planning_todos_stage.txt";
         /** 第二阶段任务拆解 prompt 内容（由 loader 从文件读取） */
         private String planningTodosStage;
-        /** DAG recovery judge prompt 文件路径（相对于 config 目录） */
-        private String dagRecoveryJudgeSystemPromptFile = "prompts/judge/dag_recovery_judge_system.txt";
-        /** DAG recovery judge prompt 内容（由 loader 从文件读取） */
+        /** DAG recovery judge prompt 文件路径（Nacos file: 前缀时由 loader 解析为内容）。默认 null，走 classpath 兜底。 */
+        private String dagRecoveryJudgeSystemPromptFile;
+        /** DAG recovery judge prompt 内容（由 loader 从 file: 解析或 Nacos 直接注入）。 */
         private String dagRecoveryJudgeSystemPromptTemplate;
 
         public String getAgentRunSystemPrompt() {

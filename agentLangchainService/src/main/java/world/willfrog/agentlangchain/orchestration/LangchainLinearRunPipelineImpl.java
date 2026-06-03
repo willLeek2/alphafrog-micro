@@ -358,8 +358,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         if (result.getRecoveryRationale() != null) {
             snapshot.put("recovery_rationale", result.getRecoveryRationale());
         }
-        if (result.getRecoveryJudgeTraceId() != null) {
-            snapshot.put("recovery_judge_trace_id", result.getRecoveryJudgeTraceId());
+        if (result.getRecoveryJudgeDecisionId() != null) {
+            snapshot.put("recovery_judge_decision_id", result.getRecoveryJudgeDecisionId());
         }
         return writeJson(snapshot);
     }
