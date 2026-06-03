@@ -241,37 +241,49 @@ public class LangchainDagWorkflowExecutor {
                                               LangchainLinearWorkflowRequest request,
                                               LangchainDagSharedContext sharedContext,
                                               AtomicInteger toolCalls) throws Exception {
+        return executeDagParallel(graph, items, request, sharedContext, toolCalls,
+                new ConcurrentHashMap<>(), new ConcurrentHashMap<>());
+    }
+
+    /**
+     * 带预填充结果的 DAG 并行执行（用于 recovery judge YES 后的重调度）。
+     *
+     * <p>当 recovery judge 判定某些失败节点可以跳过时，调用方在 {@code nodeSuccess} 中
+     * 将这些节点标记为 true，使得被它们阻塞的下游节点在新一轮调度中被释放。</p>
+     *
+     * @param preResults    已有的节点执行结果（已完成的节点不会被重新调度）
+     * @param preNodeSuccess 已有的节点成功状态（recovered 节点标为 true 以释放依赖）
+     */
+    private DagParallelRun executeDagParallel(LangchainDagExecutionGraph graph,
+                                              List<TodoItem> items,
+                                              LangchainLinearWorkflowRequest request,
+                                              LangchainDagSharedContext sharedContext,
+                                              AtomicInteger toolCalls,
+                                              Map<String, LangchainTodoNodeResult> preResults,
+                                              Map<String, Boolean> preNodeSuccess) throws Exception {
         String runId = request.getRunId();
         String userId = request.getUserId();
-        // 节点执行结果，ConcurrentHashMap 保证多线程安全
-        Map<String, LangchainTodoNodeResult> results = new ConcurrentHashMap<>();
-        // 节点成功状态，用于失败传播判断
-        Map<String, Boolean> nodeSuccess = new ConcurrentHashMap<>();
-        // 状态锁，保护 nodeStates（节点状态映射）在持久化时的线程安全
+        Map<String, LangchainTodoNodeResult> results = new ConcurrentHashMap<>(preResults);
+        Map<String, Boolean> nodeSuccess = new ConcurrentHashMap<>(preNodeSuccess);
         Object workflowStateLock = new Object();
         Map<String, TodoItem> nodeStates = new LinkedHashMap<>();
-        // 捕获父线程的 AgentContext 快照，后续子线程恢复
         AgentContext.ContextSnapshot parentContext = AgentContext.captureRunContext();
 
-        // 线程池大小取配置值和 todo 数量的较小值，避免资源浪费
         int poolSize = Math.max(1, Math.min(dagThreadPoolSize, items.size()));
         ExecutorService executor = Executors.newFixedThreadPool(poolSize);
         AtomicInteger completedCount = new AtomicInteger();
         try {
-            // 为每个 item 调度一个 CompletableFuture，内部递归处理依赖
             Map<String, CompletableFuture<Void>> futures = new ConcurrentHashMap<>();
             for (TodoItem item : items) {
                 scheduleNode(graph, items, item, request, sharedContext, toolCalls, results, nodeSuccess,
                         workflowStateLock, nodeStates, parentContext, executor, completedCount, futures);
             }
-            // 等待所有节点完成，30 分钟总超时
             CompletableFuture.allOf(futures.values().toArray(new CompletableFuture[0]))
                     .get(30, TimeUnit.MINUTES);
             return new DagParallelRun(results);
         } catch (TimeoutException e) {
             throw new RuntimeException("DAG execution failed: timeout", e);
         } finally {
-            // 强制关闭线程池，中断正在执行的任务
             executor.shutdownNow();
         }
     }
@@ -364,6 +376,12 @@ public class LangchainDagWorkflowExecutor {
         String userId = request.getUserId();
         long nodeStartMs = 0;
         try {
+            // 0. recovery judge 重调度：已完成节点跳过，避免重复执行
+            LangchainTodoNodeResult existing = results.get(item.getId());
+            if (existing != null && existing.isSuccess()) {
+                nodeSuccess.putIfAbsent(item.getId(), true);
+                return;
+            }
             // 1. 检查是否被用户取消（cancel/pause）
             Optional<String> stop = executionGuard.stopReason(runId, userId);
             if (stop.isPresent()) {
@@ -578,7 +596,7 @@ public class LangchainDagWorkflowExecutor {
                 return null;
             }
 
-            // YES 判定 → 发射事件 + 生成部分最终答案 + 返回 PARTIAL
+            // YES 判定 → 发射事件 + 重调度未被阻塞的剩余节点
             if (!isBlank(runId) && !isBlank(userId)) {
                 eventService.append(runId, userId, "DAG_RECOVERY_JUDGE_FINISHED", Map.of(
                         "decision", "YES",
@@ -597,10 +615,59 @@ public class LangchainDagWorkflowExecutor {
                 }
             }
 
+            // 准备第二遍 DAG 执行：将 judge 决定跳过的失败节点标记为 "recovered"，
+            // 清除因依赖这些节点而被 SKIPPED 的下游节点结果，使它们能重新调度
+            Map<String, LangchainTodoNodeResult> preResults = new LinkedHashMap<>();
+            Map<String, Boolean> preNodeSuccess = new ConcurrentHashMap<>();
+            Set<String> skipSet = Set.copyOf(skipTodoIds);
+            for (TodoItem item : items) {
+                LangchainTodoNodeResult r = results.get(item.getId());
+                if (r == null) continue;
+                if (skipSet.contains(item.getId())) {
+                    // judge 决定跳过 → 标记为 recovered success
+                    preNodeSuccess.put(item.getId(), true);
+                    // 不保留结果，让该节点在第二遍中充当透明依赖
+                } else if (r.isSuccess()) {
+                    preResults.put(item.getId(), r);
+                    preNodeSuccess.put(item.getId(), true);
+                } else {
+                    // 失败或 SKIPPED 节点，不在 skipSet 中 → 保留失败状态
+                    preNodeSuccess.put(item.getId(), false);
+                    // SKIPPED（dependency）节点：清除结果，使其在第二遍中重调度
+                    if (!r.isSuccess() && r.getSummary() != null
+                            && r.getSummary().startsWith("Skipped:")) {
+                        // 不放入 preResults，让第二遍重新调度
+                    } else {
+                        preResults.put(item.getId(), r);
+                    }
+                }
+            }
+
+            // 第二遍 DAG 执行：仅调度尚未有结果的节点
+            AgentContext.setPhase(PHASE_DAG_EXECUTION);
+            DagParallelRun secondRun = executeDagParallel(graph, items, request, sharedContext,
+                    toolCalls, preResults, preNodeSuccess);
+
+            // 合并第二遍结果
+            Map<String, LangchainTodoNodeResult> mergedResults = new LinkedHashMap<>(results);
+            secondRun.results().forEach(mergedResults::putIfAbsent);
+
+            // 检查第二遍后是否有新失败
+            for (TodoItem item : items) {
+                if (skipSet.contains(item.getId())) continue;
+                LangchainTodoNodeResult nodeResult = mergedResults.get(item.getId());
+                if (nodeResult == null || !nodeResult.isSuccess()) {
+                    String reason = nodeResult == null ? "No result after recovery" : nvl(nodeResult.getSummary());
+                    appendDagCompleted(runId, userId, false, reason, toolCalls.get());
+                    return failure(plan, completedTodos, reason, toolCalls.get());
+                }
+            }
+
             // 重置 phase 为 summarizing，生成部分可交付答案
             AgentContext.setPhase("summarizing");
             AgentContext.setStage("final_answer");
-            String finalAnswer = todoNodeExecutor.writeFinalAnswer(request, completedTodos);
+            List<LangchainCompletedTodo> allCompleted = new ArrayList<>(sharedContext.completedTodosSnapshot());
+            String finalAnswer = todoNodeExecutor.writeFinalAnswer(request, allCompleted);
 
             appendDagCompleted(runId, userId, false, "PARTIAL by recovery judge", toolCalls.get());
             return LangchainLinearWorkflowResult.builder()
@@ -609,7 +676,7 @@ public class LangchainDagWorkflowExecutor {
                     .failureReason("PARTIAL by recovery judge: " + truncatedRationale)
                     .finalAnswer(isBlank(finalAnswer) ? null : finalAnswer.trim())
                     .plan(plan)
-                    .completedTodos(completedTodos)
+                    .completedTodos(allCompleted)
                     .toolCallsUsed(toolCalls.get())
                     .skippedTodoIds(skipTodoIds)
                     .recoveryJudgeTraceId(judgeTraceId)
