@@ -312,9 +312,18 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
             TokenUsage tokenUsage = OpenAiUtils.tokenUsageFrom(completion.usage());
             FinishReason finishReason = OpenAiCompatibleChatModelSupport.extractFinishReason(completion);
 
-            // 保存 thinking 内容和进度
+            // 保存 thinking 内容和进度。
+            // reasoningContent 来自 SSE 聚合，同时回写 AiMessage.thinking()
+            // 以防合成的 completion 未带 reasoning_content 时 toOpenAiMessages 丢字段。
             if (reasoningContent != null && !reasoningContent.isBlank()) {
                 AgentContext.setThinkingContent(reasoningContent);
+                if (aiMessage.thinking() == null || aiMessage.thinking().isBlank()) {
+                    aiMessage = AiMessage.builder()
+                            .text(aiMessage.text())
+                            .thinking(reasoningContent)
+                            .toolExecutionRequests(aiMessage.toolExecutionRequests())
+                            .build();
+                }
             }
             if (progressSnapshot != null) {
                 AgentContext.setStreamingProgress(progressSnapshot);

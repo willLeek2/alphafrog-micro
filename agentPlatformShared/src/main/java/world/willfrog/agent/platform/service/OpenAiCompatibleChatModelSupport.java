@@ -210,6 +210,10 @@ public final class OpenAiCompatibleChatModelSupport {
         if (!toolCalls.isEmpty()) {
             messageMap.put("tool_calls", toolCalls);
         }
+        String reasoning = reasoningBuilder.toString();
+        if (!reasoning.isEmpty()) {
+            messageMap.put("reasoning_content", reasoning);
+        }
 
         Map<String, Object> choiceMap = new LinkedHashMap<>();
         choiceMap.put("index", 0);
