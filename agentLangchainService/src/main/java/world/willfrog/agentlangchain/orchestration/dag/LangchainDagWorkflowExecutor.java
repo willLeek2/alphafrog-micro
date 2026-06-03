@@ -529,12 +529,18 @@ public class LangchainDagWorkflowExecutor {
             ));
         }
 
+        String previousPhase = AgentContext.getPhase();
+        String previousStage = AgentContext.getStage();
         try {
             // 1. 构建 user message：todo 列表 + 依赖 + 成功/失败摘要
             String systemPrompt = promptService.dagRecoveryJudgeSystemPrompt();
             String userMessage = buildRecoveryJudgeUserMessage(items, graph, results, sharedContext, request);
 
-            // 2. 调用 execution 阶段模型做判定（复用请求中的 execution model）
+            // 2. 设置 judge 上下文，让 ChatModel 生成的 traceId 归属到 dag_recovery_judge
+            AgentContext.setPhase("dag_recovery_judge");
+            AgentContext.setStage("judge");
+
+            // 3. 调用 execution 阶段模型做判定（复用请求中的 execution model）
             ChatModel judgeModel = request.executionModelOrDefault();
             ChatRequest chatRequest = ChatRequest.builder()
                     .messages(List.of(
@@ -547,7 +553,7 @@ public class LangchainDagWorkflowExecutor {
             AiMessage aiMessage = response.aiMessage();
             String responseText = aiMessage.text();
 
-            // 3. 解析结构化 JSON
+            // 4. 解析结构化 JSON
             Map<String, Object> judgeResult = objectMapper.readValue(
                     responseText, new TypeReference<Map<String, Object>>() {});
             String decision = String.valueOf(judgeResult.getOrDefault("decision", "NO"));
@@ -557,10 +563,11 @@ public class LangchainDagWorkflowExecutor {
                     : List.of();
             String rationale = String.valueOf(judgeResult.getOrDefault("rationale", ""));
             String truncatedRationale = rationale.length() > 500 ? rationale.substring(0, 500) : rationale;
+            // judgeTraceId 标识本次 recovery 决策；实际的 LLM trace 在 observability
+            // 中可通过 phase=dag_recovery_judge 过滤定位。
             String judgeTraceId = java.util.UUID.randomUUID().toString().replace("-", "");
 
             if (!"YES".equalsIgnoreCase(decision)) {
-                // NO 判定 → 返回 null 让调用方走原有失败路径
                 if (!isBlank(runId) && !isBlank(userId)) {
                     eventService.append(runId, userId, "DAG_RECOVERY_JUDGE_FINISHED", Map.of(
                             "decision", "NO",
@@ -571,7 +578,7 @@ public class LangchainDagWorkflowExecutor {
                 return null;
             }
 
-            // YES 判定 → 发射 SKIPPED 事件 + 返回 PARTIAL 结果
+            // YES 判定 → 发射事件 + 生成部分最终答案 + 返回 PARTIAL
             if (!isBlank(runId) && !isBlank(userId)) {
                 eventService.append(runId, userId, "DAG_RECOVERY_JUDGE_FINISHED", Map.of(
                         "decision", "YES",
@@ -580,19 +587,27 @@ public class LangchainDagWorkflowExecutor {
                         "judgeCallTraceId", judgeTraceId
                 ));
                 for (String skipId : skipTodoIds) {
-                    eventService.append(runId, userId, "TODO_NODE_SKIPPED", Map.of(
-                            "todo_id", skipId,
-                            "reason", "judge_recovery",
-                            "judge_call_trace_id", judgeTraceId
-                    ));
+                    Map<String, Object> skippedPayload = new LinkedHashMap<>();
+                    skippedPayload.put("todo_id", skipId);
+                    skippedPayload.put("reason", "judge_recovery");
+                    skippedPayload.put("judge_call_trace_id", judgeTraceId);
+                    skippedPayload.put("workflow", "dag");
+                    skippedPayload.put("phase", "dag_recovery_judge");
+                    eventService.append(runId, userId, "TODO_NODE_SKIPPED", skippedPayload);
                 }
             }
+
+            // 重置 phase 为 summarizing，生成部分可交付答案
+            AgentContext.setPhase("summarizing");
+            AgentContext.setStage("final_answer");
+            String finalAnswer = todoNodeExecutor.writeFinalAnswer(request, completedTodos);
 
             appendDagCompleted(runId, userId, false, "PARTIAL by recovery judge", toolCalls.get());
             return LangchainLinearWorkflowResult.builder()
                     .success(false)
                     .partial(true)
                     .failureReason("PARTIAL by recovery judge: " + truncatedRationale)
+                    .finalAnswer(isBlank(finalAnswer) ? null : finalAnswer.trim())
                     .plan(plan)
                     .completedTodos(completedTodos)
                     .toolCallsUsed(toolCalls.get())
@@ -606,10 +621,13 @@ public class LangchainDagWorkflowExecutor {
             if (!isBlank(runId) && !isBlank(userId)) {
                 eventService.append(runId, userId, "DAG_RECOVERY_JUDGE_FINISHED", Map.of(
                         "decision", "ERROR",
-                        "error", e.getMessage()
+                        "error", nvl(e.getMessage())
                 ));
             }
-            return null; // judge 自身异常 → 走原有失败路径
+            return null;
+        } finally {
+            AgentContext.setPhase(previousPhase != null ? previousPhase : "");
+            AgentContext.setStage(previousStage != null ? previousStage : "");
         }
     }
 

@@ -438,9 +438,10 @@ public class AgentPromptService {
      * <p>通过 {@link #composeSystemPrompt(String)} 注入时间基准前缀与全局 agent_run 指令。</p>
      */
     public String dagRecoveryJudgeSystemPrompt() {
+        // 优先取 Nacos/loader 已解析的 Template 内容；File 字段仅作为 loader 输入，
+        // 不参与运行时 firstNonBlank（否则没有 file: 前缀的默认路径会被当作 prompt 正文）。
         String specific = firstNonBlank(
                 currentPrompts().getDagRecoveryJudgeSystemPromptTemplate(),
-                currentPrompts().getDagRecoveryJudgeSystemPromptFile(),
                 defaultDagRecoveryJudgeSystemPrompt()
         );
         return composeSystemPrompt(specific);
@@ -975,6 +976,8 @@ public class AgentPromptService {
         merged.setPlanningStrategyStage(firstNonBlank(local.getPlanningStrategyStage(), base.getPlanningStrategyStage()));
         merged.setPlanningTodosStageFile(firstNonBlank(local.getPlanningTodosStageFile(), base.getPlanningTodosStageFile()));
         merged.setPlanningTodosStage(firstNonBlank(local.getPlanningTodosStage(), base.getPlanningTodosStage()));
+        merged.setDagRecoveryJudgeSystemPromptTemplate(firstNonBlank(local.getDagRecoveryJudgeSystemPromptTemplate(), base.getDagRecoveryJudgeSystemPromptTemplate()));
+        merged.setDagRecoveryJudgeSystemPromptFile(firstNonBlank(local.getDagRecoveryJudgeSystemPromptFile(), base.getDagRecoveryJudgeSystemPromptFile()));
         return merged;
     }
 

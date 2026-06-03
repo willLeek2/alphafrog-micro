@@ -242,6 +242,29 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                         "engine", "agentLangchainService"
                 ));
                 persistAssistantMessage(runId, userId, stageModels, result.getFinalAnswer());
+            } else if (result.isPartial()) {
+                // DAG recovery judge 判定部分完成：写入 PARTIAL 状态 + 部分答案
+                String snapshot = attachObservability(
+                        runId, buildPartialSnapshot(userGoal, result), AgentRunStatus.PARTIAL, null,
+                        result.getFailureReason());
+                runMapper.updateSnapshot(runId, userId, AgentRunStatus.PARTIAL, snapshot, true,
+                        result.getFailureReason());
+                markRunStatus(runId, AgentRunStatus.PARTIAL);
+                Map<String, Object> payload = new LinkedHashMap<>();
+                payload.put("answer", nvl(result.getFinalAnswer()));
+                payload.put("toolCallsUsed", result.getToolCallsUsed());
+                payload.put("engine", "agentLangchainService");
+                payload.put("partial", true);
+                if (result.getSkippedTodoIds() != null) {
+                    payload.put("skippedTodoIds", result.getSkippedTodoIds());
+                }
+                if (result.getRecoveryRationale() != null) {
+                    payload.put("recoveryRationale", result.getRecoveryRationale());
+                }
+                eventService.append(runId, userId, "WORKFLOW_PARTIAL_COMPLETED", payload);
+                if (!isBlank(result.getFinalAnswer())) {
+                    persistAssistantMessage(runId, userId, stageModels, result.getFinalAnswer());
+                }
             } else {
                 publishFailure(runId, userId, userGoal, result, null);
             }
@@ -313,6 +336,31 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         snapshot.put("failure_reason", nvl(result.getFailureReason()));
         snapshot.put("tool_calls_used", result.getToolCallsUsed());
         snapshot.put("engine", "agentLangchainService");
+        return writeJson(snapshot);
+    }
+
+    private String buildPartialSnapshot(String userGoal,
+                                        LangchainLinearWorkflowResult result) {
+        Map<String, Object> snapshot = new LinkedHashMap<>();
+        snapshot.put("user_goal", userGoal);
+        snapshot.put("plan", result.getPlan());
+        snapshot.put("completed_items", result.getCompletedTodos());
+        snapshot.put("answer", nvl(result.getFinalAnswer()));
+        snapshot.put("answer_markdown", nvl(result.getFinalAnswer()));
+        snapshot.put("status", AgentRunStatus.PARTIAL.name());
+        snapshot.put("failure_reason", nvl(result.getFailureReason()));
+        snapshot.put("tool_calls_used", result.getToolCallsUsed());
+        snapshot.put("engine", "agentLangchainService");
+        snapshot.put("partial", true);
+        if (result.getSkippedTodoIds() != null) {
+            snapshot.put("skipped_todo_ids", result.getSkippedTodoIds());
+        }
+        if (result.getRecoveryRationale() != null) {
+            snapshot.put("recovery_rationale", result.getRecoveryRationale());
+        }
+        if (result.getRecoveryJudgeTraceId() != null) {
+            snapshot.put("recovery_judge_trace_id", result.getRecoveryJudgeTraceId());
+        }
         return writeJson(snapshot);
     }
 
