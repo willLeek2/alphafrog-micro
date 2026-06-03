@@ -92,7 +92,7 @@ public class DashScopeChatModel implements ChatModel {
             }
             ChatCompletionRequest.Builder builder = ChatCompletionRequest.builder()
                     .model(OpenAiCompatibleChatModelSupport.nvl(modelName))
-                    .messages(OpenAiUtils.toOpenAiMessages(messages == null ? List.of() : messages))
+                    .messages(OpenAiUtils.toOpenAiMessages(messages == null ? List.of() : messages, true, "reasoning_content"))
                     .temperature(temperature)
                     .maxCompletionTokens(maxTokens);
 
@@ -217,7 +217,7 @@ public class DashScopeChatModel implements ChatModel {
                 reasoningContent = extractReasoningContentFromResponse(responseJson);
             }
 
-            AiMessage aiMessage = OpenAiUtils.aiMessageFrom(completion);
+            AiMessage aiMessage = OpenAiUtils.aiMessageFrom(completion, true);
 
             // 从 reasoningContent 或 <think> 标签提取 thinking
             String finalThinking = reasoningContent;
@@ -225,9 +225,12 @@ public class DashScopeChatModel implements ChatModel {
                 ThinkingContent thinking = extractThinkingContent(aiMessage == null ? null : aiMessage.text());
                 if (thinking.hasThinking()) {
                     finalThinking = thinking.thinking();
-                    if (aiMessage != null && thinking.hasThinking()) {
-                        List<dev.langchain4j.agent.tool.ToolExecutionRequest> tools = aiMessage.toolExecutionRequests();
-                        aiMessage = new AiMessage(thinking.content(), tools == null ? List.of() : tools);
+                    if (aiMessage != null) {
+                        aiMessage = AiMessage.builder()
+                                .text(thinking.content())
+                                .thinking(finalThinking)
+                                .toolExecutionRequests(aiMessage.toolExecutionRequests())
+                                .build();
                     }
                 }
             }

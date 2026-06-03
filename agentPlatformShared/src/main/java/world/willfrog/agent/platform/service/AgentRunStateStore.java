@@ -46,8 +46,9 @@ public class AgentRunStateStore {
     @Value("${agent.flow.hitl.state-ttl-seconds:3600}")
     private long ttlSeconds;
 
-    /** TTL for per-call detail blobs (independent from run state / observability TTL). */
-    @Value("${agent.call-detail.ttl-seconds:86400}")
+    /** TTL for per-call detail blobs (independent from run state / observability TTL).
+     *  Default 6h to keep thinking/reasoning content short-lived while still useful for debugging. */
+    @Value("${agent.call-detail.ttl-seconds:21600}")
     private long callDetailTtlSeconds;
 
     public void recordPlan(String runId, String planJson, boolean valid) {

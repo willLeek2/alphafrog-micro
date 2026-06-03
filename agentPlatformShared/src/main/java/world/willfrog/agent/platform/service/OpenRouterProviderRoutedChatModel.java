@@ -148,7 +148,7 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
             // ========== 1. 构建请求 ==========
             ChatCompletionRequest.Builder builder = ChatCompletionRequest.builder()
                     .model(OpenAiCompatibleChatModelSupport.nvl(modelName))
-                    .messages(OpenAiUtils.toOpenAiMessages(messages == null ? List.of() : messages))
+                    .messages(OpenAiUtils.toOpenAiMessages(messages == null ? List.of() : messages, true, "reasoning_content"))
                     .temperature(temperature)
                     .maxCompletionTokens(maxTokens);
             
@@ -308,7 +308,7 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
             }
             
             // 解析响应体
-            AiMessage aiMessage = OpenAiUtils.aiMessageFrom(completion);
+            AiMessage aiMessage = OpenAiUtils.aiMessageFrom(completion, true);
             TokenUsage tokenUsage = OpenAiUtils.tokenUsageFrom(completion.usage());
             FinishReason finishReason = OpenAiCompatibleChatModelSupport.extractFinishReason(completion);
 
