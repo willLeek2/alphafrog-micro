@@ -6,6 +6,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentPromptService;
 import world.willfrog.agent.workflow.TodoItem;
 import world.willfrog.agent.workflow.TodoStatus;
 import world.willfrog.agentlangchain.orchestration.LangchainCompletedTodo;
@@ -13,6 +14,16 @@ import world.willfrog.agentlangchain.orchestration.LangchainLinearWorkflowReques
 import world.willfrog.agentlangchain.orchestration.LangchainLinearWorkflowResult;
 import world.willfrog.agentlangchain.orchestration.LangchainRunExecutionGuard;
 import world.willfrog.agentlangchain.orchestration.LangchainTodoNodeExecutor;
+import world.willfrog.agentlangchain.orchestration.LangchainTodoNodeResult;
+
+import dev.langchain4j.data.message.AiMessage;
+import dev.langchain4j.data.message.SystemMessage;
+import dev.langchain4j.data.message.UserMessage;
+import dev.langchain4j.model.chat.ChatModel;
+import dev.langchain4j.model.chat.request.ChatRequest;
+import dev.langchain4j.model.chat.response.ChatResponse;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import world.willfrog.agentlangchain.orchestration.LangchainTodoNodeResult;
 import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
 
@@ -73,6 +84,8 @@ public class LangchainDagWorkflowExecutor {
     private final LangchainDagStateRecorder stateRecorder;
     private final AgentEventService eventService;
     private final LangchainRunExecutionGuard executionGuard;
+    private final AgentPromptService promptService;
+    private final ObjectMapper objectMapper;
 
     /**
      * DAG 执行线程池大小，默认 4。线程数受限于两个因素：
@@ -81,6 +94,9 @@ public class LangchainDagWorkflowExecutor {
      */
     @Value("${agent.langchain.dag.thread-pool-size:4}")
     private int dagThreadPoolSize;
+
+    @Value("${agent.dag.recovery-judge.enabled:false}")
+    private boolean recoveryJudgeEnabled;
 
     /**
      * DAG 工作流的主入口。由 {@link world.willfrog.agentlangchain.orchestration.LangchainLinearRunPipelineImpl}
@@ -134,6 +150,17 @@ public class LangchainDagWorkflowExecutor {
             Optional<String> stopBeforeAnswer = executionGuard.stopReason(runId, userId);
             if (stopBeforeAnswer.isPresent()) {
                 return interrupted(plan, completedTodos, stopBeforeAnswer.get(), toolCalls.get());
+            }
+
+            // DAG recovery judge: 若开启且存在失败节点，尝试 LLM 温和降级判定
+            if (recoveryJudgeEnabled && hasFailedNode(parallelRun.results(), items)) {
+                LangchainLinearWorkflowResult judgeResult = tryRecoveryJudge(
+                        request, plan, graph, items, parallelRun.results(), sharedContext,
+                        completedTodos, toolCalls, runId, userId);
+                if (judgeResult != null) {
+                    return judgeResult;
+                }
+                // judge 返回 null（NO 判定）→ 继续走下方失败路径
             }
 
             // 遍历所有节点结果，检查是否有失败或中断
@@ -466,6 +493,170 @@ public class LangchainDagWorkflowExecutor {
         return null;
     }
 
+    // ========== DAG recovery judge ==========
+
+    private boolean hasFailedNode(Map<String, LangchainTodoNodeResult> results, List<TodoItem> items) {
+        for (TodoItem item : items) {
+            LangchainTodoNodeResult nodeResult = results.get(item.getId());
+            if (nodeResult == null || !nodeResult.isSuccess()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 尝试 DAG recovery judge 温和降级。
+     *
+     * @return PARTIAL 结果（YES 判定）、null（NO 判定，走原有失败路径）、
+     *         或原始 failure 结果（judge 调用本身失败）
+     */
+    private LangchainLinearWorkflowResult tryRecoveryJudge(
+            LangchainLinearWorkflowRequest request,
+            LangchainTodoPlan plan,
+            LangchainDagExecutionGraph graph,
+            List<TodoItem> items,
+            Map<String, LangchainTodoNodeResult> results,
+            LangchainDagSharedContext sharedContext,
+            List<LangchainCompletedTodo> completedTodos,
+            AtomicInteger toolCalls,
+            String runId,
+            String userId) {
+
+        if (!isBlank(runId) && !isBlank(userId)) {
+            eventService.append(runId, userId, "DAG_RECOVERY_JUDGE_STARTED", Map.of(
+                    "run_id", runId
+            ));
+        }
+
+        try {
+            // 1. 构建 user message：todo 列表 + 依赖 + 成功/失败摘要
+            String systemPrompt = promptService.dagRecoveryJudgeSystemPrompt();
+            String userMessage = buildRecoveryJudgeUserMessage(items, graph, results, sharedContext, request);
+
+            // 2. 调用 execution 阶段模型做判定（复用请求中的 execution model）
+            ChatModel judgeModel = request.executionModelOrDefault();
+            ChatRequest chatRequest = ChatRequest.builder()
+                    .messages(List.of(
+                            SystemMessage.from(systemPrompt),
+                            UserMessage.from(userMessage)
+                    ))
+                    .build();
+
+            ChatResponse response = judgeModel.doChat(chatRequest);
+            AiMessage aiMessage = response.aiMessage();
+            String responseText = aiMessage.text();
+
+            // 3. 解析结构化 JSON
+            Map<String, Object> judgeResult = objectMapper.readValue(
+                    responseText, new TypeReference<Map<String, Object>>() {});
+            String decision = String.valueOf(judgeResult.getOrDefault("decision", "NO"));
+            @SuppressWarnings("unchecked")
+            List<String> skipTodoIds = judgeResult.get("skipTodoIds") instanceof List<?> list
+                    ? list.stream().map(String::valueOf).toList()
+                    : List.of();
+            String rationale = String.valueOf(judgeResult.getOrDefault("rationale", ""));
+            String truncatedRationale = rationale.length() > 500 ? rationale.substring(0, 500) : rationale;
+            String judgeTraceId = java.util.UUID.randomUUID().toString().replace("-", "");
+
+            if (!"YES".equalsIgnoreCase(decision)) {
+                // NO 判定 → 返回 null 让调用方走原有失败路径
+                if (!isBlank(runId) && !isBlank(userId)) {
+                    eventService.append(runId, userId, "DAG_RECOVERY_JUDGE_FINISHED", Map.of(
+                            "decision", "NO",
+                            "rationale", truncatedRationale,
+                            "judgeCallTraceId", judgeTraceId
+                    ));
+                }
+                return null;
+            }
+
+            // YES 判定 → 发射 SKIPPED 事件 + 返回 PARTIAL 结果
+            if (!isBlank(runId) && !isBlank(userId)) {
+                eventService.append(runId, userId, "DAG_RECOVERY_JUDGE_FINISHED", Map.of(
+                        "decision", "YES",
+                        "skipTodoIds", skipTodoIds,
+                        "rationale", truncatedRationale,
+                        "judgeCallTraceId", judgeTraceId
+                ));
+                for (String skipId : skipTodoIds) {
+                    eventService.append(runId, userId, "TODO_NODE_SKIPPED", Map.of(
+                            "todo_id", skipId,
+                            "reason", "judge_recovery",
+                            "judge_call_trace_id", judgeTraceId
+                    ));
+                }
+            }
+
+            appendDagCompleted(runId, userId, false, "PARTIAL by recovery judge", toolCalls.get());
+            return LangchainLinearWorkflowResult.builder()
+                    .success(false)
+                    .partial(true)
+                    .failureReason("PARTIAL by recovery judge: " + truncatedRationale)
+                    .plan(plan)
+                    .completedTodos(completedTodos)
+                    .toolCallsUsed(toolCalls.get())
+                    .skippedTodoIds(skipTodoIds)
+                    .recoveryJudgeTraceId(judgeTraceId)
+                    .recoveryRationale(truncatedRationale)
+                    .build();
+
+        } catch (Exception e) {
+            log.warn("DAG recovery judge failed, falling back to normal failure path: {}", e.getMessage());
+            if (!isBlank(runId) && !isBlank(userId)) {
+                eventService.append(runId, userId, "DAG_RECOVERY_JUDGE_FINISHED", Map.of(
+                        "decision", "ERROR",
+                        "error", e.getMessage()
+                ));
+            }
+            return null; // judge 自身异常 → 走原有失败路径
+        }
+    }
+
+    private String buildRecoveryJudgeUserMessage(
+            List<TodoItem> items,
+            LangchainDagExecutionGraph graph,
+            Map<String, LangchainTodoNodeResult> results,
+            LangchainDagSharedContext sharedContext,
+            LangchainLinearWorkflowRequest request) {
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("【用户目标】\n").append(request.getUserGoal()).append("\n\n");
+        sb.append("【Todo 列表及依赖关系】\n");
+        for (TodoItem item : items) {
+            LangchainTodoNodeResult result = results.get(item.getId());
+            String status;
+            String detail = "";
+            if (result == null) {
+                status = "UNKNOWN";
+                detail = "（未执行）";
+            } else if (result.isSuccess()) {
+                status = "COMPLETED";
+            } else {
+                status = "FAILED";
+                detail = result.getSummary() != null ? "，错误: " + truncate(result.getSummary(), 200) : "";
+            }
+            Set<String> deps = graph.getDependencies(item.getId());
+            String depStr = deps.isEmpty() ? "无" : String.join(", ", deps);
+            sb.append("- ").append(item.getId()).append(": \"").append(truncate(item.getDescription(), 150))
+                    .append("\" (依赖: ").append(depStr)
+                    .append(") → 状态: ").append(status).append(detail).append("\n");
+        }
+        sb.append("\n【已完成节点的产出摘要】\n");
+        boolean hasCompleted = false;
+        for (LangchainCompletedTodo ct : sharedContext.completedTodosSnapshot()) {
+            hasCompleted = true;
+            String summary = ct.getSummary() != null ? truncate(ct.getSummary(), 200) : "（无摘要）";
+            sb.append(ct.getTodoId()).append(": ").append(summary).append("\n");
+        }
+        if (!hasCompleted) {
+            sb.append("（无）\n");
+        }
+        return sb.toString();
+    }
+
+    // ========== 原有方法 ==========
+
     /**
      * 发送 DAG 执行完成事件，无论成功或失败都会调用。
      *
@@ -563,6 +754,11 @@ public class LangchainDagWorkflowExecutor {
 
     private String nvl(String value) {
         return value == null ? "" : value;
+    }
+
+    private String truncate(String text, int maxLen) {
+        if (text == null || text.isBlank()) return "";
+        return text.length() <= maxLen ? text : text.substring(0, maxLen);
     }
 
     /** null/空安全的回退取值：主值非空返回主值，否则返回 fallback（空则返 ""）。 */

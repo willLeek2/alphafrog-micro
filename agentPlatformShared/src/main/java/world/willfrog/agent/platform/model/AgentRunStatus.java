@@ -7,6 +7,7 @@ public enum AgentRunStatus {
     WAITING,
     SUMMARIZING,
     COMPLETED,
+    PARTIAL, // 部分完成：DAG recovery judge 判定缺节点仍可交付
     FAILED,
     CANCELING,  // 正在取消中，用于通知执行线程停止
     CANCELED,

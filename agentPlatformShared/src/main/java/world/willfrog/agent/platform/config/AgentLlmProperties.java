@@ -1490,6 +1490,10 @@ public class AgentLlmProperties {
         private String planningTodosStageFile = "prompts/todo/planning_todos_stage.txt";
         /** 第二阶段任务拆解 prompt 内容（由 loader 从文件读取） */
         private String planningTodosStage;
+        /** DAG recovery judge prompt 文件路径（相对于 config 目录） */
+        private String dagRecoveryJudgeSystemPromptFile = "prompts/judge/dag_recovery_judge_system.txt";
+        /** DAG recovery judge prompt 内容（由 loader 从文件读取） */
+        private String dagRecoveryJudgeSystemPromptTemplate;
 
         public String getAgentRunSystemPrompt() {
             return agentRunSystemPrompt;
@@ -1713,6 +1717,22 @@ public class AgentLlmProperties {
 
         public void setPlanningTodosStage(String planningTodosStage) {
             this.planningTodosStage = planningTodosStage;
+        }
+
+        public String getDagRecoveryJudgeSystemPromptFile() {
+            return dagRecoveryJudgeSystemPromptFile;
+        }
+
+        public void setDagRecoveryJudgeSystemPromptFile(String dagRecoveryJudgeSystemPromptFile) {
+            this.dagRecoveryJudgeSystemPromptFile = dagRecoveryJudgeSystemPromptFile;
+        }
+
+        public String getDagRecoveryJudgeSystemPromptTemplate() {
+            return dagRecoveryJudgeSystemPromptTemplate;
+        }
+
+        public void setDagRecoveryJudgeSystemPromptTemplate(String dagRecoveryJudgeSystemPromptTemplate) {
+            this.dagRecoveryJudgeSystemPromptTemplate = dagRecoveryJudgeSystemPromptTemplate;
         }
     }
 
