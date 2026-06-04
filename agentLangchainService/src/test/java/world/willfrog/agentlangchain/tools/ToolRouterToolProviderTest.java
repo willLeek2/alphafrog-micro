@@ -26,6 +26,7 @@ import world.willfrog.agent.tools.python.PythonSandboxTools;
 import world.willfrog.agent.tools.rag.RagTools;
 import world.willfrog.agent.tools.router.ToolRouter;
 import world.willfrog.agent.tools.search.SearchTools;
+import world.willfrog.agentlangchain.config.LangchainToolConcurrencyThrottle;
 
 import java.util.Map;
 import java.util.Set;
@@ -71,7 +72,8 @@ class ToolRouterToolProviderTest {
                 searchTools,
                 pythonSandboxTools,
                 objectMapper,
-                eventService
+                eventService,
+                new LangchainToolConcurrencyThrottle(false, 20, 60)
         );
     }
 

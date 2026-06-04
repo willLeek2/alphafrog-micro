@@ -15,6 +15,7 @@ import world.willfrog.agent.tools.python.PythonSandboxTools;
 import world.willfrog.agent.tools.rag.RagTools;
 import world.willfrog.agent.tools.router.ToolRouter;
 import world.willfrog.agent.tools.search.SearchTools;
+import world.willfrog.agentlangchain.config.LangchainToolConcurrencyThrottle;
 
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -75,6 +76,7 @@ public class ToolRouterToolProvider implements ToolProvider {
      * SSE 事件（经 Redis pub-sub 推送）。
      */
     private final AgentEventService eventService;
+    private final LangchainToolConcurrencyThrottle toolThrottle;
 
     /**
      * 为当前 LC4j 调用构建「工具名 → ToolExecutor」映射。
@@ -109,7 +111,7 @@ public class ToolRouterToolProvider implements ToolProvider {
                 codeInterpreterEnabled
         );
 
-        ToolExecutor executor = new ToolRouterToolExecutor(toolRouter, objectMapper, eventService);
+        ToolExecutor executor = new ToolRouterToolExecutor(toolRouter, objectMapper, eventService, toolThrottle);
         Map<ToolSpecification, ToolExecutor> tools = new LinkedHashMap<>();
         for (ToolSpecification specification : specifications) {
             tools.put(specification, executor);

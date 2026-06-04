@@ -5,6 +5,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.test.web.servlet.MockMvc;
+import world.willfrog.agentlangchain.config.LangchainServiceProperties;
 import world.willfrog.agentlangchain.config.LangchainToolConcurrencyThrottle;
 import world.willfrog.agentlangchain.orchestration.AgentLangchainOrchestrator;
 import world.willfrog.agentlangchain.orchestration.LangchainRunConcurrencyScheduler;
@@ -31,10 +32,16 @@ class AgentLangchainHealthControllerTest {
     private LangchainToolConcurrencyThrottle toolThrottle;
 
     @MockBean
+    private LangchainServiceProperties properties;
+
+    @MockBean
     private AgentLangchainOrchestrator orchestrator;
 
     @Test
     void healthReportsOk() throws Exception {
+        LangchainServiceProperties.Provider provider = new LangchainServiceProperties.Provider();
+        when(properties.getProvider()).thenReturn(provider);
+
         mockMvc.perform(get("/agent-langchain/health"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.status", is("UP")));

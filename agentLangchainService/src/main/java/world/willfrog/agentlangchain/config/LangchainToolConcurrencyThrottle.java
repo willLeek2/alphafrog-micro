@@ -94,7 +94,9 @@ public class LangchainToolConcurrencyThrottle {
      */
     public void release(ToolThrottleResult result) {
         if (result == null || !result.acquired()) return;
-        semaphore.release();
+        if (result.markReleased()) {
+            semaphore.release();
+        }
     }
 
     /**
@@ -118,12 +120,18 @@ public class LangchainToolConcurrencyThrottle {
                 "availablePermits", semaphore.availablePermits(),
                 "queueLength", semaphore.getQueueLength(),
                 "timeoutSeconds", timeoutSeconds,
-                "timeoutCounts", Map.copyOf(timeoutCounts),
-                "waitMsTotal", Map.copyOf(waitMsTotal),
-                "waitCount", Map.copyOf(waitCount),
-                "execMsTotal", Map.copyOf(execMsTotal),
-                "execCount", Map.copyOf(execCount)
+                "timeoutCounts", toLongMap(timeoutCounts),
+                "waitMsTotal", toLongMap(waitMsTotal),
+                "waitCount", toLongMap(waitCount),
+                "execMsTotal", toLongMap(execMsTotal),
+                "execCount", toLongMap(execCount)
         );
+    }
+
+    private static Map<String, Long> toLongMap(Map<String, AtomicLong> source) {
+        Map<String, Long> result = new ConcurrentHashMap<>();
+        source.forEach((k, v) -> result.put(k, v.get()));
+        return result;
     }
 
 }

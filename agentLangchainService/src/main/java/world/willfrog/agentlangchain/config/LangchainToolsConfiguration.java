@@ -27,7 +27,8 @@ public class LangchainToolsConfiguration {
                                        SearchTools searchTools,
                                        PythonSandboxTools pythonSandboxTools,
                                        ObjectMapper objectMapper,
-                                       AgentEventService eventService) {
+                                       AgentEventService eventService,
+                                       LangchainToolConcurrencyThrottle toolThrottle) {
         return new ToolRouterToolProvider(
                 toolRouter,
                 marketDataTools,
@@ -35,7 +36,8 @@ public class LangchainToolsConfiguration {
                 searchTools,
                 pythonSandboxTools,
                 objectMapper,
-                eventService
+                eventService,
+                toolThrottle
         );
     }
 }

@@ -12,6 +12,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agent.tools.router.ToolRouter;
+import world.willfrog.agentlangchain.config.LangchainToolConcurrencyThrottle;
 
 import java.util.Map;
 
@@ -37,7 +38,8 @@ class ToolRouterToolExecutorTest {
     @BeforeEach
     void setUp() {
         objectMapper = new ObjectMapper();
-        executor = new ToolRouterToolExecutor(toolRouter, objectMapper, eventService);
+        executor = new ToolRouterToolExecutor(toolRouter, objectMapper, eventService,
+                new LangchainToolConcurrencyThrottle(false, 20, 60));
         // 设置 AgentContext
         AgentContext.setRunId("run-123");
         AgentContext.setUserId("user-456");
