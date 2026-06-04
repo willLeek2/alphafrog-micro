@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException
 
 from .config import load_config
 from .models import CreateTaskResponse, ExecuteRequest, ExecuteResult, Task, TaskStatus
-from .sandbox_runner import run_in_sandbox
+from .sandbox_runner import create_pool, run_in_sandbox
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -22,6 +22,9 @@ config = load_config()
 # In-memory storage
 tasks: Dict[str, Task] = {}
 task_queue: asyncio.Queue = asyncio.Queue()
+
+# Container pool (created in lifespan)
+pool = None
 
 
 async def worker(worker_id: int):
@@ -51,12 +54,14 @@ async def process_task(task: Task, worker_id: int):
         result_dict = await asyncio.to_thread(
             run_in_sandbox,
             config,
+            task.task_id,
             task.request.dataset_id,
             task.request.dataset_ids,
             task.request.code,
             task.request.files,
             task.request.libraries,
             task.request.timeout_seconds,
+            pool,
         )
         task.result = ExecuteResult(
             exit_code=result_dict["exit_code"],
@@ -83,12 +88,29 @@ async def process_task(task: Task, worker_id: int):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global pool
     worker_count = max(1, config.max_concurrency)
+
+    # Create container pool if enabled
+    if config.pool_enabled:
+        pool = create_pool(config)
+        logger.info("Container pool initialized for sandbox runner")
+    else:
+        logger.info("Container pool disabled, using fresh containers per task")
+
     worker_tasks = [asyncio.create_task(worker(i + 1)) for i in range(worker_count)]
     yield
+
+    # Shutdown workers
     for worker_task in worker_tasks:
         worker_task.cancel()
     await asyncio.gather(*worker_tasks, return_exceptions=True)
+
+    # Close pool
+    if pool is not None:
+        logger.info("Closing container pool...")
+        pool.close()
+        pool = None
 
 
 app = FastAPI(title="alphafrog-python-sandbox", version="0.2.0", lifespan=lifespan)
@@ -96,7 +118,7 @@ app = FastAPI(title="alphafrog-python-sandbox", version="0.2.0", lifespan=lifesp
 
 @app.get("/health")
 async def health() -> dict:
-    return {"status": "ok"}
+    return {"status": "ok", "pool_enabled": config.pool_enabled}
 
 
 @app.post("/tasks", response_model=CreateTaskResponse)
