@@ -98,8 +98,8 @@ public class AgentRunBudgetService {
     @Value("${agent.run.budget.max-tokens:300000}")
     private long defaultMaxTokens;
 
-    /** 单次逻辑 LLM 调用的最大 HTTP 重试次数，默认 2 */
-    @Value("${agent.run.budget.max-http-attempts-per-logical-call:2}")
+    /** 单次逻辑 LLM 调用的最大 HTTP attempt 总数，默认 3（首次 + 最多 2 次重试） */
+    @Value("${agent.run.budget.max-http-attempts-per-logical-call:3}")
     private int defaultMaxHttpAttemptsPerLogicalCall;
 
     /**

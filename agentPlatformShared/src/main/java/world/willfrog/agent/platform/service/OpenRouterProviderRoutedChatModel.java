@@ -76,8 +76,9 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
 
     private static final HttpClient HTTP_CLIENT = HttpClient.newBuilder()
             .proxy(ProxySelector.getDefault())
-            .connectTimeout(Duration.ofSeconds(30))
+            .connectTimeout(Duration.ofSeconds(45))
             .build();
+    private static final Duration STREAM_IDLE_TIMEOUT = Duration.ofSeconds(25);
 
     // ========== 核心依赖 ==========
 
@@ -256,7 +257,7 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
             // agent 语义重试会重新让模型思考，而 HTTP retry 只是同一份请求体重发。
             // 因此 retry 次数由 run budget 单独限制，避免一个 LLM step 因 provider 抖动
             // 消耗过多 wall-clock。
-            int maxAttempts = budgetService == null ? 2 : budgetService.maxHttpAttemptsPerLogicalCall();
+            int maxAttempts = budgetService == null ? 3 : budgetService.maxHttpAttemptsPerLogicalCall();
             AttemptResult attemptResult = sendWithRetry(httpRequestBuilder, shouldCapture, requestRecord, requestStartedAt,
                     maxAttempts, requestTimeout);
             attempts = attemptResult.attempts();
@@ -281,7 +282,7 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
                 StreamingProgressTracker tracker = createStreamingProgressTracker(llmTraceId);
                 aggregateResult =
                         OpenAiCompatibleChatModelSupport.aggregateSseStream(
-                                httpResponse.body(), objectMapper, log, tracker
+                                httpResponse.body(), objectMapper, log, tracker, STREAM_IDLE_TIMEOUT
                         );
                 durationMs = System.currentTimeMillis() - requestStartedAt;
                 latencyWindow.record(durationMs);
@@ -367,7 +368,8 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
             // SSE live event: LLM call finished (success)
             Double actualCost = extractActualCostFromUsage(aggregateResult.lastUsage());
             String generationId = aggregateResult.lastId();
-            emitLlmCallFinished(llmTraceId, tokenUsage, durationMs, actualCost, generationId, null, observabilityTraceId);
+            emitLlmCallFinished(llmTraceId, tokenUsage, durationMs, actualCost, generationId, null,
+                    observabilityTraceId, attemptResult.attempts());
 
             return ChatResponse.builder()
                     .aiMessage(aiMessage)
@@ -382,7 +384,7 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
 
             // SSE live event: LLM call finished (interrupted)
             long durationMs = System.currentTimeMillis() - requestStartedAt;
-            emitLlmCallFinished(llmTraceId, null, durationMs, null, null, "INTERRUPTED", null);
+            emitLlmCallFinished(llmTraceId, null, durationMs, null, null, "INTERRUPTED", null, attempts);
 
             // ALP-25：上报中断错误
             if (shouldCapture && observabilityService != null) {
@@ -399,7 +401,7 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
             // SSE live event: LLM call finished (error)
             long durationMs = System.currentTimeMillis() - requestStartedAt;
             String errorType = e.getClass().getSimpleName();
-            emitLlmCallFinished(llmTraceId, null, durationMs, null, null, errorType + ": " + e.getMessage(), null);
+            emitLlmCallFinished(llmTraceId, null, durationMs, null, null, errorType + ": " + e.getMessage(), null, attempts);
 
             // ALP-25：上报异常
             if (shouldCapture && observabilityService != null) {
@@ -606,7 +608,8 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
                 attemptMeta.put("error", e.getClass().getSimpleName() + ": " + e.getMessage());
                 attempts.add(attemptMeta);
                 if (attempt >= cappedAttempts) {
-                    throw e;
+                    return new AttemptResult(null, lastResponseRecord, -1,
+                            e.getClass().getSimpleName() + ": " + e.getMessage(), attempts);
                 }
             }
             sleepBeforeRetry();
@@ -907,7 +910,8 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
                                       Double actualCost,
                                       String generationId,
                                       String errorPreview,
-                                      String observabilityTraceId) {
+                                      String observabilityTraceId,
+                                      List<Map<String, Object>> attempts) {
         if (eventService == null) {
             return;
         }
@@ -925,6 +929,7 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
         AgentSsePayloadSupport.putExecutionAttribution(payload);
         payload.put("duration_ms", Math.max(0L, durationMs));
         payload.put("success", errorPreview == null);
+        putAttemptPayload(payload, attempts);
         if (errorPreview != null) {
             payload.put("error_preview", errorPreview.length() > 500 ? errorPreview.substring(0, 500) : errorPreview);
         }
@@ -947,6 +952,15 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
         } catch (Exception e) {
             log.warn("LLM_CALL_FINISHED event emit failed (ignored): {}", e.getMessage());
         }
+    }
+
+    private void putAttemptPayload(Map<String, Object> payload, List<Map<String, Object>> attempts) {
+        if (attempts == null || attempts.isEmpty()) {
+            payload.put("attempt_count", 0);
+            return;
+        }
+        payload.put("attempt_count", attempts.size());
+        payload.put("attempts", attempts);
     }
 
     /**

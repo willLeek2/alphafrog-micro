@@ -22,6 +22,7 @@ import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
 
 import java.io.BufferedReader;
+import java.io.IOException;
 import java.io.InputStreamReader;
 import java.net.ProxySelector;
 import java.net.URI;
@@ -30,6 +31,7 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -49,9 +51,11 @@ public class DashScopeChatModel implements ChatModel {
 
     private static final HttpClient HTTP_CLIENT = HttpClient.newBuilder()
             .proxy(ProxySelector.getDefault())
-            .connectTimeout(Duration.ofSeconds(30))
+            .connectTimeout(Duration.ofSeconds(45))
             .build();
     private static final int DEFAULT_THINKING_BUDGET = 38912;
+    private static final int DEFAULT_HTTP_ATTEMPTS_PER_LOGICAL_CALL = 3;
+    private static final Duration STREAM_IDLE_TIMEOUT = Duration.ofSeconds(25);
 
     private final ObjectMapper objectMapper;
     private final String baseUrl;
@@ -86,6 +90,7 @@ public class DashScopeChatModel implements ChatModel {
         RawHttpLogger.HttpRequestRecord requestRecord = null;
         RawHttpLogger.HttpResponseRecord responseRecord = null;
         String curlCommand = null;
+        List<Map<String, Object>> attempts = List.of();
 
         try {
             if (budgetService != null) {
@@ -145,17 +150,17 @@ public class DashScopeChatModel implements ChatModel {
             //     log.info("[LLM Debug CURL] endpoint={} model={}\n{}", endpointName, modelName, curlCommand);
             // }
 
-            if (budgetService != null) {
-                budgetService.checkHttpAttempt(1);
-            }
             emitLlmCallStarted(llmTraceId, useStream);
             liveEventStarted = true;
-            HttpResponse<java.io.InputStream> httpResponse = HTTP_CLIENT.send(
-                    httpRequestBuilder.build(),
-                    HttpResponse.BodyHandlers.ofInputStream()
-            );
+            int maxAttempts = budgetService == null
+                    ? DEFAULT_HTTP_ATTEMPTS_PER_LOGICAL_CALL
+                    : budgetService.maxHttpAttemptsPerLogicalCall();
+            AttemptResult attemptResult = sendWithRetry(httpRequestBuilder, shouldCapture, requestRecord, requestStartedAt,
+                    maxAttempts, requestTimeout);
+            attempts = attemptResult.attempts();
+            HttpResponse<java.io.InputStream> httpResponse = attemptResult.response();
 
-            int statusCode = httpResponse.statusCode();
+            int statusCode = attemptResult.statusCode();
             long durationMs = System.currentTimeMillis() - requestStartedAt;
 
             ChatCompletionResponse completion;
@@ -169,7 +174,7 @@ public class DashScopeChatModel implements ChatModel {
                 StreamingProgressTracker tracker = createStreamingProgressTracker(llmTraceId);
                 OpenAiCompatibleChatModelSupport.SseAggregateResult aggregateResult =
                         OpenAiCompatibleChatModelSupport.aggregateSseStream(
-                                httpResponse.body(), objectMapper, log, tracker
+                                httpResponse.body(), objectMapper, log, tracker, STREAM_IDLE_TIMEOUT
                         );
                 durationMs = System.currentTimeMillis() - requestStartedAt;
                 latencyWindow.record(durationMs);
@@ -192,16 +197,22 @@ public class DashScopeChatModel implements ChatModel {
                 }
             } else {
                 // 非流式响应或错误：读取完整 body
-                String responseJson;
-                try (BufferedReader reader = new BufferedReader(
-                        new InputStreamReader(httpResponse.body(), StandardCharsets.UTF_8))) {
-                    responseJson = reader.lines().collect(java.util.stream.Collectors.joining("\n"));
+                String responseJson = attemptResult.errorBody();
+                if (httpResponse != null) {
+                    try (BufferedReader reader = new BufferedReader(
+                            new InputStreamReader(httpResponse.body(), StandardCharsets.UTF_8))) {
+                        responseJson = reader.lines().collect(java.util.stream.Collectors.joining("\n"));
+                    }
                 }
 
                 if (shouldCapture) {
-                    Map<String, String> responseHeaders = httpLogger.extractHeaders(httpResponse);
-                    responseRecord = httpLogger.recordResponse(statusCode, responseHeaders, responseJson, durationMs);
-                    curlCommand = httpLogger.toCurlCommand(requestRecord);
+                    if (httpResponse != null) {
+                        Map<String, String> responseHeaders = httpLogger.extractHeaders(httpResponse);
+                        responseRecord = httpLogger.recordResponse(statusCode, responseHeaders, responseJson, durationMs);
+                        curlCommand = httpLogger.toCurlCommand(requestRecord);
+                    } else {
+                        responseRecord = attemptResult.responseRecord();
+                    }
                 }
 
                 if (statusCode < 200 || statusCode >= 300) {
@@ -251,9 +262,9 @@ public class DashScopeChatModel implements ChatModel {
             String observabilityTraceId = null;
             if (shouldCapture && observabilityService != null) {
                 observabilityTraceId = reportLlmCall(llmTraceId, requestRecord, responseRecord, curlCommand, requestStartedAt, durationMs, null,
-                        finalThinking, progressSnapshot);
+                        finalThinking, progressSnapshot, attempts);
             }
-            emitLlmCallFinished(llmTraceId, tokenUsage, durationMs, actualCost, generationId, null, observabilityTraceId);
+            emitLlmCallFinished(llmTraceId, tokenUsage, durationMs, actualCost, generationId, null, observabilityTraceId, attempts);
 
             return ChatResponse.builder()
                     .aiMessage(aiMessage)
@@ -269,10 +280,10 @@ public class DashScopeChatModel implements ChatModel {
             String observabilityTraceId = null;
             if (shouldCapture && observabilityService != null) {
                 observabilityTraceId = reportLlmCall(llmTraceId, requestRecord, responseRecord, curlCommand, requestStartedAt, durationMs, "INTERRUPTED",
-                        null, null);
+                        null, null, attempts);
             }
             if (liveEventStarted) {
-                emitLlmCallFinished(llmTraceId, null, durationMs, null, null, "INTERRUPTED", observabilityTraceId);
+                emitLlmCallFinished(llmTraceId, null, durationMs, null, null, "INTERRUPTED", observabilityTraceId, attempts);
             }
             String detail = "DashScope chat completion interrupted"
                     + " (model=" + OpenAiCompatibleChatModelSupport.nvl(modelName) + ")";
@@ -284,12 +295,12 @@ public class DashScopeChatModel implements ChatModel {
             if (shouldCapture && observabilityService != null) {
                 String errorType = e.getClass().getSimpleName();
                 observabilityTraceId = reportLlmCall(llmTraceId, requestRecord, responseRecord, curlCommand, requestStartedAt, durationMs,
-                        errorType + ": " + e.getMessage(), null, null);
+                        errorType + ": " + e.getMessage(), null, null, attempts);
             }
             if (liveEventStarted) {
                 String errorType = e.getClass().getSimpleName();
                 emitLlmCallFinished(llmTraceId, null, durationMs, null, null,
-                        errorType + ": " + e.getMessage(), observabilityTraceId);
+                        errorType + ": " + e.getMessage(), observabilityTraceId, attempts);
             }
             String detail = "DashScope chat completion failed"
                     + " (model=" + OpenAiCompatibleChatModelSupport.nvl(modelName)
@@ -326,6 +337,93 @@ public class DashScopeChatModel implements ChatModel {
         return null;
     }
 
+    private AttemptResult sendWithRetry(HttpRequest.Builder httpRequestBuilder,
+                                        boolean shouldCapture,
+                                        RawHttpLogger.HttpRequestRecord requestRecord,
+                                        long logicalStartedAt,
+                                        int maxAttempts,
+                                        Duration requestTimeout) throws IOException, InterruptedException {
+        List<Map<String, Object>> attempts = new ArrayList<>();
+        RawHttpLogger.HttpResponseRecord lastResponseRecord = null;
+        String lastErrorBody = null;
+        int lastStatusCode = -1;
+        int cappedAttempts = Math.max(1, maxAttempts);
+        for (int attempt = 1; attempt <= cappedAttempts; attempt++) {
+            if (budgetService != null) {
+                budgetService.checkHttpAttempt(attempt);
+            }
+            long attemptStarted = System.currentTimeMillis();
+            try {
+                HttpResponse<java.io.InputStream> httpResponse = HTTP_CLIENT.send(
+                        httpRequestBuilder.build(),
+                        HttpResponse.BodyHandlers.ofInputStream()
+                );
+                int status = httpResponse.statusCode();
+                long attemptDuration = System.currentTimeMillis() - attemptStarted;
+                Map<String, Object> attemptMeta = new LinkedHashMap<>();
+                attemptMeta.put("attempt", attempt);
+                attemptMeta.put("httpStatus", status);
+                attemptMeta.put("durationMs", attemptDuration);
+                attemptMeta.put("timeoutSeconds", requestTimeout.toSeconds());
+                attempts.add(attemptMeta);
+
+                if (status >= 200 && status < 300) {
+                    return new AttemptResult(httpResponse, null, status, null, attempts);
+                }
+
+                String body;
+                try (BufferedReader reader = new BufferedReader(
+                        new InputStreamReader(httpResponse.body(), StandardCharsets.UTF_8))) {
+                    body = reader.lines().collect(java.util.stream.Collectors.joining("\n"));
+                }
+                lastErrorBody = body;
+                lastStatusCode = status;
+                if (shouldCapture && httpLogger != null) {
+                    Map<String, String> responseHeaders = httpLogger.extractHeaders(httpResponse);
+                    lastResponseRecord = httpLogger.recordResponse(
+                            status, responseHeaders, body, System.currentTimeMillis() - logicalStartedAt);
+                }
+                attemptMeta.put("retryable", isRetryableStatus(status));
+                attemptMeta.put("error", OpenAiCompatibleChatModelSupport.shorten(body));
+                if (!isRetryableStatus(status) || attempt >= cappedAttempts) {
+                    return new AttemptResult(httpResponse, lastResponseRecord, status, body, attempts);
+                }
+            } catch (IOException e) {
+                long attemptDuration = System.currentTimeMillis() - attemptStarted;
+                Map<String, Object> attemptMeta = new LinkedHashMap<>();
+                attemptMeta.put("attempt", attempt);
+                attemptMeta.put("durationMs", attemptDuration);
+                attemptMeta.put("timeoutSeconds", requestTimeout.toSeconds());
+                attemptMeta.put("retryable", true);
+                attemptMeta.put("error", e.getClass().getSimpleName() + ": " + e.getMessage());
+                attempts.add(attemptMeta);
+                if (attempt >= cappedAttempts) {
+                    return new AttemptResult(null, lastResponseRecord, -1,
+                            e.getClass().getSimpleName() + ": " + e.getMessage(), attempts);
+                }
+            }
+            sleepBeforeRetry();
+        }
+        return new AttemptResult(null, lastResponseRecord, lastStatusCode, lastErrorBody, attempts);
+    }
+
+    private boolean isRetryableStatus(int status) {
+        return status == 408 || status == 429 || (status >= 500 && status <= 599);
+    }
+
+    private void sleepBeforeRetry() throws InterruptedException {
+        Thread.sleep(2000L);
+    }
+
+    private record AttemptResult(
+            HttpResponse<java.io.InputStream> response,
+            RawHttpLogger.HttpResponseRecord responseRecord,
+            int statusCode,
+            String errorBody,
+            List<Map<String, Object>> attempts
+    ) {
+    }
+
     private String reportLlmCall(
             String llmCallId,
             RawHttpLogger.HttpRequestRecord request,
@@ -335,7 +433,8 @@ public class DashScopeChatModel implements ChatModel {
             long durationMs,
             String errorMessage,
             String thinkingContent,
-            StreamingProgressTracker.StreamingProgressSnapshot streamingProgress) {
+            StreamingProgressTracker.StreamingProgressSnapshot streamingProgress,
+            List<Map<String, Object>> attempts) {
 
         if (observabilityService == null) {
             return null;
@@ -352,6 +451,48 @@ public class DashScopeChatModel implements ChatModel {
         Integer cachedTokens = OpenAiCompatibleChatModelSupport.extractCachedTokensFromResponse(objectMapper, response, log);
         long completedAtMillis = startedAtMillis + durationMs;
 
+        return observabilityService.recordLlmCallWithRawHttp(
+                runId,
+                phase != null ? phase : "unknown",
+                tokenUsage,
+                cachedTokens,
+                durationMs,
+                startedAtMillis,
+                completedAtMillis,
+                endpointName,
+                modelName,
+                errorMessage,
+                thinkingContent,
+                streamingProgress,
+                request,
+                response,
+                curlCommand,
+                attempts,
+                llmCallId
+        );
+    }
+
+    private String reportLlmCall(
+            String llmCallId,
+            RawHttpLogger.HttpRequestRecord request,
+            RawHttpLogger.HttpResponseRecord response,
+            String curlCommand,
+            long startedAtMillis,
+            long durationMs,
+            String errorMessage,
+            String thinkingContent,
+            StreamingProgressTracker.StreamingProgressSnapshot streamingProgress) {
+        if (observabilityService == null) {
+            return null;
+        }
+        String runId = AgentContext.getRunId();
+        String phase = AgentContext.getPhase();
+        if (runId == null || runId.isBlank()) {
+            return null;
+        }
+        TokenUsage tokenUsage = OpenAiCompatibleChatModelSupport.extractTokenUsageFromResponse(objectMapper, response, log);
+        Integer cachedTokens = OpenAiCompatibleChatModelSupport.extractCachedTokensFromResponse(objectMapper, response, log);
+        long completedAtMillis = startedAtMillis + durationMs;
         return observabilityService.recordLlmCallWithRawHttp(
                 runId,
                 phase != null ? phase : "unknown",
@@ -633,7 +774,8 @@ public class DashScopeChatModel implements ChatModel {
                                      Double actualCost,
                                      String generationId,
                                      String errorPreview,
-                                     String observabilityTraceId) {
+                                     String observabilityTraceId,
+                                     List<Map<String, Object>> attempts) {
         if (eventService == null) {
             return;
         }
@@ -651,6 +793,7 @@ public class DashScopeChatModel implements ChatModel {
         AgentSsePayloadSupport.putExecutionAttribution(payload);
         payload.put("duration_ms", Math.max(0L, durationMs));
         payload.put("success", errorPreview == null);
+        putAttemptPayload(payload, attempts);
         if (errorPreview != null) {
             payload.put("error_preview", errorPreview.length() > 500 ? errorPreview.substring(0, 500) : errorPreview);
         }
@@ -673,6 +816,26 @@ public class DashScopeChatModel implements ChatModel {
         } catch (Exception e) {
             log.warn("DashScope LLM_CALL_FINISHED event emit failed (ignored): {}", e.getMessage());
         }
+    }
+
+    private void emitLlmCallFinished(String llmTraceId,
+                                     TokenUsage tokenUsage,
+                                     long durationMs,
+                                     Double actualCost,
+                                     String generationId,
+                                     String errorPreview,
+                                     String observabilityTraceId) {
+        emitLlmCallFinished(llmTraceId, tokenUsage, durationMs, actualCost, generationId,
+                errorPreview, observabilityTraceId, List.of());
+    }
+
+    private void putAttemptPayload(Map<String, Object> payload, List<Map<String, Object>> attempts) {
+        if (attempts == null || attempts.isEmpty()) {
+            payload.put("attempt_count", 0);
+            return;
+        }
+        payload.put("attempt_count", attempts.size());
+        payload.put("attempts", attempts);
     }
 
     private Double extractActualCostFromUsage(Map<String, Object> usage) {

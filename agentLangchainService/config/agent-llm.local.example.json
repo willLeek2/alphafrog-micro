@@ -203,7 +203,7 @@
       "maxLlmCalls": 80,
       "maxToolCalls": 120,
       "maxTokens": 600000,
-      "maxHttpAttemptsPerLogicalCall": 2
+      "maxHttpAttemptsPerLogicalCall": 3
     },
     "parallel": {
       "maxParallelSearchQueries": 3,

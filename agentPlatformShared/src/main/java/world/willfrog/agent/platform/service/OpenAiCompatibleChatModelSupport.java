@@ -13,10 +13,18 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 public final class OpenAiCompatibleChatModelSupport {
 
@@ -50,6 +58,15 @@ public final class OpenAiCompatibleChatModelSupport {
             ObjectMapper objectMapper,
             Logger log,
             StreamingProgressTracker progressTracker) {
+        return aggregateSseStream(inputStream, objectMapper, log, progressTracker, null);
+    }
+
+    static SseAggregateResult aggregateSseStream(
+            InputStream inputStream,
+            ObjectMapper objectMapper,
+            Logger log,
+            StreamingProgressTracker progressTracker,
+            Duration idleTimeout) {
 
         StringBuilder contentBuilder = new StringBuilder();
         StringBuilder reasoningBuilder = new StringBuilder();
@@ -61,9 +78,12 @@ public final class OpenAiCompatibleChatModelSupport {
         String lastModel = null;
         long lastCreated = 0;
 
+        ExecutorService readExecutor = idleTimeout == null || idleTimeout.isZero() || idleTimeout.isNegative()
+                ? null
+                : Executors.newSingleThreadExecutor(new DaemonThreadFactory("sse-read-timeout-"));
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream, StandardCharsets.UTF_8))) {
             String line;
-            while ((line = reader.readLine()) != null) {
+            while ((line = readLine(reader, inputStream, idleTimeout, readExecutor)) != null) {
                 if (line.isBlank()) {
                     continue;
                 }
@@ -192,6 +212,10 @@ public final class OpenAiCompatibleChatModelSupport {
             }
         } catch (IOException e) {
             throw new IllegalStateException("SSE 流读取失败", e);
+        } finally {
+            if (readExecutor != null) {
+                readExecutor.shutdownNow();
+            }
         }
 
         // 构造合成的 ChatCompletionResponse
@@ -248,6 +272,51 @@ public final class OpenAiCompatibleChatModelSupport {
                 lastId,
                 lastUsage
         );
+    }
+
+    private static String readLine(BufferedReader reader,
+                                   InputStream inputStream,
+                                   Duration idleTimeout,
+                                   ExecutorService executor) throws IOException {
+        if (idleTimeout == null || idleTimeout.isZero() || idleTimeout.isNegative()) {
+            return reader.readLine();
+        }
+        Future<String> future = executor.submit(reader::readLine);
+        try {
+            return future.get(idleTimeout.toMillis(), TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            future.cancel(true);
+            try {
+                inputStream.close();
+            } catch (IOException closeError) {
+                e.addSuppressed(closeError);
+            }
+            throw new IOException("SSE stream idle timeout after " + idleTimeout.toSeconds() + "s", e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted while reading SSE stream", e);
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof IOException ioException) {
+                throw ioException;
+            }
+            throw new IOException("SSE stream read failed", cause);
+        }
+    }
+
+    private static final class DaemonThreadFactory implements ThreadFactory {
+        private final String prefix;
+
+        private DaemonThreadFactory(String prefix) {
+            this.prefix = prefix;
+        }
+
+        @Override
+        public Thread newThread(Runnable runnable) {
+            Thread thread = new Thread(runnable, prefix + System.nanoTime());
+            thread.setDaemon(true);
+            return thread;
+        }
     }
 
     @SuppressWarnings("unchecked")
