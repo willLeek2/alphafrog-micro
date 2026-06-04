@@ -58,7 +58,8 @@ class OpenRouterProviderRoutedChatModelTest {
                 mock(OpenRouterCostService.class),
                 eventService,
                 "openrouter",
-                mock(AgentLlmLocalConfigLoader.class)
+                mock(AgentLlmLocalConfigLoader.class),
+                mock(LangchainLlmLatencyWindow.class)
         );
 
         ReflectionTestUtils.invokeMethod(model, "emitLlmCallStarted", "or-call-1", true);

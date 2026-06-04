@@ -100,6 +100,9 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
     // Debug 配置加载器（热加载）
     private final AgentLlmLocalConfigLoader localConfigLoader;
 
+    // LLM latency window for adaptive concurrency (shared across all calls)
+    private final LangchainLlmLatencyWindow latencyWindow;
+
     @Setter
     private AgentRunBudgetService budgetService;
 
@@ -281,6 +284,7 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
                                 httpResponse.body(), objectMapper, log, tracker
                         );
                 durationMs = System.currentTimeMillis() - requestStartedAt;
+                latencyWindow.record(durationMs);
                 progressSnapshot = tracker.onStreamComplete(durationMs);
                 completion = aggregateResult.completionResponse();
                 reasoningContent = aggregateResult.reasoningContent();

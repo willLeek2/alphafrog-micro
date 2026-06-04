@@ -65,6 +65,7 @@ public class DashScopeChatModel implements ChatModel {
     private final boolean enableThinking;
     private final AgentLlmLocalConfigLoader localConfigLoader;
     private final AgentEventService eventService;
+    private final LangchainLlmLatencyWindow latencyWindow;
 
     @Setter
     private AgentRunBudgetService budgetService;
@@ -171,6 +172,7 @@ public class DashScopeChatModel implements ChatModel {
                                 httpResponse.body(), objectMapper, log, tracker
                         );
                 durationMs = System.currentTimeMillis() - requestStartedAt;
+                latencyWindow.record(durationMs);
                 progressSnapshot = tracker.onStreamComplete(durationMs);
                 completion = aggregateResult.completionResponse();
                 reasoningContent = aggregateResult.reasoningContent();

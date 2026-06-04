@@ -13,6 +13,8 @@ import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agent.platform.service.AgentSsePayloadSupport;
 import world.willfrog.agent.workflow.DatasetRefRegistry;
 import world.willfrog.agent.tools.router.ToolRouter;
+import world.willfrog.agentlangchain.config.LangchainToolConcurrencyThrottle;
+import world.willfrog.agentlangchain.orchestration.ToolThrottleResult;
 
 import java.time.Duration;
 import java.time.Instant;
@@ -72,6 +74,7 @@ final class ToolRouterToolExecutor implements ToolExecutor {
     private final ToolRouter toolRouter;
     private final ObjectMapper objectMapper;
     private final AgentEventService eventService;
+    private final LangchainToolConcurrencyThrottle toolThrottle;
 
     /**
      * LC4j 旧版回调：返回工具输出纯文本。{@link #executeWithContext} 是推荐路径，会先同步
@@ -97,18 +100,34 @@ final class ToolRouterToolExecutor implements ToolExecutor {
             Instant start = Instant.now();
             String output = null;
             boolean success = true;
-            try {
-                ToolRouter.ToolInvocationResult result = toolRouter.invokeWithMeta(request.name(), params);
-                output = result.getOutput();
-                success = result.isSuccess();
-            } catch (Exception e) {
-                output = e.getMessage();
+
+            // sandbox tool throttle: acquire permit before invoking
+            ToolThrottleResult throttleResult = toolThrottle.tryAcquire(request.name());
+            if (!throttleResult.acquired() && throttleResult.failureReason() != null) {
+                // throttle timeout / interrupted — return error to model, don't fail the run
+                String reason = throttleResult.failureReason();
+                log.warn("Tool throttled: tool={} reason={}", request.name(), reason);
+                output = reason;
                 success = false;
-                log.warn("Tool invocation failed: tool={}, runId={}", request.name(), AgentContext.getRunId(), e);
-            } finally {
-                long durationMs = Duration.between(start, Instant.now()).toMillis();
-                emitToolCallFinished(toolCallId, request.name(), params, success, output, durationMs);
+            } else {
+                try {
+                    ToolRouter.ToolInvocationResult result = toolRouter.invokeWithMeta(request.name(), params);
+                    output = result.getOutput();
+                    success = result.isSuccess();
+                } catch (Exception e) {
+                    output = e.getMessage();
+                    success = false;
+                    log.warn("Tool invocation failed: tool={}, runId={}", request.name(), AgentContext.getRunId(), e);
+                } finally {
+                    if (throttleResult.acquired()) {
+                        toolThrottle.release(throttleResult);
+                    }
+                }
             }
+
+            long durationMs = Duration.between(start, Instant.now()).toMillis();
+            toolThrottle.recordExecution(request.name(), durationMs);
+            emitToolCallFinished(toolCallId, request.name(), params, success, output, durationMs);
 
             Map<String, String> datasetRefs = LangchainDatasetRefContext.snapshot();
             DatasetRefRegistry.registerFromJson(output, datasetRefs);

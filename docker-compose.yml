@@ -686,6 +686,7 @@ services:
     environment:
       AF_SANDBOX_DATA_DIR: /data/agent_datasets
       AF_SANDBOX_DEBUG: ${AF_SANDBOX_DEBUG:-false}
+      AF_SANDBOX_MAX_CONCURRENCY: ${AF_SANDBOX_MAX_CONCURRENCY:-4}
     volumes:
       - ./data/agent_datasets:/data/agent_datasets
       - /var/run/docker.sock:/var/run/docker.sock
@@ -694,7 +695,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 768M
+          memory: 1G
     networks:
       - alphafrog-network
 

@@ -166,7 +166,8 @@ class DashScopeChatModelTest {
                 "dashscope",
                 true,
                 mock(AgentLlmLocalConfigLoader.class),
-                mock(AgentEventService.class)
+                mock(AgentEventService.class),
+                mock(LangchainLlmLatencyWindow.class)
         );
 
         String traceId = ReflectionTestUtils.invokeMethod(
@@ -380,7 +381,8 @@ class DashScopeChatModelTest {
                 "dashscope",
                 enableThinking,
                 localConfigLoader,
-                eventService
+                eventService,
+                mock(LangchainLlmLatencyWindow.class)
         );
     }
 

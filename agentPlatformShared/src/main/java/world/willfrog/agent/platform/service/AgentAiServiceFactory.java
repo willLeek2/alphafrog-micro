@@ -27,6 +27,7 @@ public class AgentAiServiceFactory {
     private final OpenRouterCostService openRouterCostService;
     private final AgentEventService eventService;
     private final AgentLlmLocalConfigLoader localConfigLoader;
+    private final LangchainLlmLatencyWindow latencyWindow;
 
     @Autowired(required = false)
     private AgentRunBudgetService budgetService;
@@ -137,7 +138,8 @@ public class AgentAiServiceFactory {
                     openRouterCostService,
                     eventService,
                     resolved.endpointName(),
-                    localConfigLoader
+                    localConfigLoader,
+                    latencyWindow
             );
             model.setBudgetService(budgetService);
             return model;
@@ -178,7 +180,8 @@ public class AgentAiServiceFactory {
                     openRouterCostService,
                     eventService,
                     resolved.endpointName(),
-                    localConfigLoader
+                    localConfigLoader,
+                    latencyWindow
             );
             model.setBudgetService(budgetService);
             return model;
@@ -300,7 +303,8 @@ public class AgentAiServiceFactory {
                 resolved.endpointName(),
                 enableThinking,
                 localConfigLoader,
-                eventService
+                eventService,
+                latencyWindow
         );
         model.setBudgetService(budgetService);
         return model;

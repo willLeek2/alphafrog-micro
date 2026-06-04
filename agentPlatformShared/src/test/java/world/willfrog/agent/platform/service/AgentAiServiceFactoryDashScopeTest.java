@@ -32,7 +32,8 @@ class AgentAiServiceFactoryDashScopeTest {
                 mock(AgentObservabilityService.class),
                 mock(OpenRouterCostService.class),
                 mock(AgentEventService.class),
-                mock(AgentLlmLocalConfigLoader.class)
+                mock(AgentLlmLocalConfigLoader.class),
+                mock(LangchainLlmLatencyWindow.class)
         );
         ReflectionTestUtils.setField(factory, "openAiApiKey", "fallback-key");
         ReflectionTestUtils.setField(factory, "maxTokens", 1024);
@@ -65,7 +66,8 @@ class AgentAiServiceFactoryDashScopeTest {
                 mock(AgentObservabilityService.class),
                 mock(OpenRouterCostService.class),
                 mock(AgentEventService.class),
-                mock(AgentLlmLocalConfigLoader.class)
+                mock(AgentLlmLocalConfigLoader.class),
+                mock(LangchainLlmLatencyWindow.class)
         );
         ReflectionTestUtils.setField(factory, "openAiApiKey", "fallback-key");
         ReflectionTestUtils.setField(factory, "maxTokens", 1024);
@@ -98,7 +100,8 @@ class AgentAiServiceFactoryDashScopeTest {
                 mock(AgentObservabilityService.class),
                 mock(OpenRouterCostService.class),
                 mock(AgentEventService.class),
-                mock(AgentLlmLocalConfigLoader.class)
+                mock(AgentLlmLocalConfigLoader.class),
+                mock(LangchainLlmLatencyWindow.class)
         );
         AgentRunBudgetService budgetService = mock(AgentRunBudgetService.class);
         ReflectionTestUtils.setField(factory, "budgetService", budgetService);

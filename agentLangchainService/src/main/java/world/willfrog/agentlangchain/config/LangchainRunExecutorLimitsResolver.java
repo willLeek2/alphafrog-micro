@@ -12,6 +12,7 @@ public class LangchainRunExecutorLimitsResolver {
 
     private final AgentLlmLocalConfigLoader configLoader;
     private final LangchainRunExecutorLimits hardLimits;
+    private volatile Integer adaptiveCoreOverride; // null → no override
 
     public LangchainRunExecutorLimitsResolver(
             @Value("${agent.langchain.run.executor.core-pool-size:4}") int defaultCorePoolSize,
@@ -44,13 +45,29 @@ public class LangchainRunExecutorLimitsResolver {
         if (executorConfig != null && executorConfig.getParallel() != null) {
             currentConfig = executorConfig.getParallel().getCurrent();
             if (currentConfig == null) {
-                return hardLimits;
+                return applyOverrideIfSet(hardLimits);
             }
         }
         if (currentConfig == null) {
             currentConfig = executorConfig;
         }
-        return clampCurrent(currentConfig);
+        return applyOverrideIfSet(clampCurrent(currentConfig));
+    }
+
+    private LangchainRunExecutorLimits applyOverrideIfSet(LangchainRunExecutorLimits base) {
+        Integer override = adaptiveCoreOverride;
+        if (override == null) return base;
+        int core = Math.max(1, Math.min(override, Math.min(hardLimits.getCorePoolSize(), base.getMaxPoolSize())));
+        return new LangchainRunExecutorLimits(core, base.getMaxPoolSize(), base.getQueueCapacity(), base.getThreadNamePrefix());
+    }
+
+    /** Set a runtime adaptive core override. Pass null to clear. */
+    public void setAdaptiveCoreOverride(Integer core) {
+        this.adaptiveCoreOverride = core;
+    }
+
+    public Integer getAdaptiveCoreOverride() {
+        return adaptiveCoreOverride;
     }
 
     private LangchainRunExecutorLimits resolveHardLimits(AgentLlmProperties.ExecutorConfig executorConfig,

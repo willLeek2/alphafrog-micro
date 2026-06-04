@@ -9,6 +9,7 @@ import world.willfrog.agentlangchain.config.LangchainRunExecutorLimits;
 import world.willfrog.agentlangchain.config.LangchainRunExecutorLimitsResolver;
 
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -132,5 +133,88 @@ class LangchainRunConcurrencySchedulerTest {
                 Thread.currentThread().interrupt();
             }
         });
+    }
+
+    @Test
+    void schedulerSnapshot_shouldContainCoreMetrics() {
+        Map<String, Object> snap = scheduler.schedulerSnapshot();
+        assertThat(snap).containsKeys(
+                "running", "queued", "rejectedTotal",
+                "corePoolSize", "maxPoolSize", "queueCapacity",
+                "hardCorePoolSize", "hardMaxPoolSize", "hardQueueCapacity",
+                "oldestQueuedAgeMs");
+        assertThat(((Number) snap.get("running")).intValue()).isZero();
+        assertThat(((Number) snap.get("queued")).intValue()).isZero();
+        assertThat(((Number) snap.get("rejectedTotal")).longValue()).isZero();
+        assertThat(((Number) snap.get("corePoolSize")).intValue()).isEqualTo(2);
+        assertThat(((Number) snap.get("maxPoolSize")).intValue()).isEqualTo(3);
+        assertThat(((Number) snap.get("queueCapacity")).intValue()).isEqualTo(2);
+    }
+
+    @Test
+    void schedulerSnapshot_shouldReflectQueuedRun() throws Exception {
+        CountDownLatch started = new CountDownLatch(2);
+        CountDownLatch release1 = new CountDownLatch(1);
+        CountDownLatch release2 = new CountDownLatch(1);
+
+        submitBlocking("run-a", started, release1);
+        submitBlocking("run-b", started, release2);
+        assertThat(started.await(1, TimeUnit.SECONDS)).isTrue();
+
+        CountDownLatch queuedStarted = new CountDownLatch(1);
+        CountDownLatch queuedRelease = new CountDownLatch(1);
+        releases.add(queuedRelease);
+        submitBlocking("run-c", queuedStarted, queuedRelease);
+
+        Map<String, Object> snap = scheduler.schedulerSnapshot();
+        assertThat(snap.get("running")).isEqualTo(2);
+        assertThat(snap.get("queued")).isEqualTo(1);
+        assertThat(((Number) snap.get("oldestQueuedAgeMs")).longValue()).isGreaterThanOrEqualTo(0);
+
+        release1.countDown();
+        release2.countDown();
+        queuedRelease.countDown();
+    }
+
+    @Test
+    void schedulerSnapshot_oldestQueuedAgeMsShouldResetWhenQueueDrains() throws Exception {
+        CountDownLatch started = new CountDownLatch(2);
+        CountDownLatch release1 = new CountDownLatch(1);
+        CountDownLatch release2 = new CountDownLatch(1);
+
+        submitBlocking("run-a", started, release1);
+        submitBlocking("run-b", started, release2);
+        assertThat(started.await(1, TimeUnit.SECONDS)).isTrue();
+
+        CountDownLatch queuedStarted = new CountDownLatch(1);
+        CountDownLatch queuedRelease = new CountDownLatch(1);
+        releases.add(queuedRelease);
+        submitBlocking("run-c", queuedStarted, queuedRelease);
+
+        // Release all: queued run should be drained and oldestQueuedAgeMs reset
+        release1.countDown();
+        release2.countDown();
+        queuedRelease.countDown();
+
+        // Wait for drain
+        Thread.sleep(100);
+        Map<String, Object> snap = scheduler.schedulerSnapshot();
+        assertThat(((Number) snap.get("queued")).intValue()).isZero();
+        assertThat(((Number) snap.get("oldestQueuedAgeMs")).longValue()).isZero();
+    }
+
+    @Test
+    void latestSnapshot_shouldBeUpdatedByDiagLog() {
+        // Initially empty map
+        Map<String, Object> initial = scheduler.latestSnapshot();
+        assertThat(initial).isNotNull();
+
+        // Trigger diagLog which updates latestSnapshot
+        scheduler.diagLog();
+
+        Map<String, Object> updated = scheduler.latestSnapshot();
+        assertThat(updated).containsKeys("running", "queued", "rejectedTotal");
+        // Should now have real values from the current state
+        assertThat(((Number) updated.get("running")).intValue()).isZero();
     }
 }

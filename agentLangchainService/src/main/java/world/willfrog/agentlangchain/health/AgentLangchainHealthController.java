@@ -8,7 +8,9 @@ import org.springframework.web.bind.annotation.RestController;
 import world.willfrog.agent.platform.PlatformModuleMarker;
 import world.willfrog.agent.tools.router.ToolRouter;
 import world.willfrog.agentlangchain.config.LangchainServiceProperties;
+import world.willfrog.agentlangchain.config.LangchainToolConcurrencyThrottle;
 import world.willfrog.agentlangchain.orchestration.AgentLangchainOrchestrator;
+import world.willfrog.agentlangchain.orchestration.LangchainRunConcurrencyScheduler;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -20,6 +22,8 @@ public class AgentLangchainHealthController {
 
     private final LangchainServiceProperties properties;
     private final AgentLangchainOrchestrator orchestrator;
+    private final LangchainRunConcurrencyScheduler concurrencyScheduler;
+    private final LangchainToolConcurrencyThrottle toolThrottle;
 
     @Value("${agent.langchain.service.version:P0-skeleton}")
     private String serviceVersion;
@@ -35,6 +39,16 @@ public class AgentLangchainHealthController {
         body.put("toolsSharedLoaded", isClassLoaded(ToolRouter.class));
         body.put("status", "UP");
         return body;
+    }
+
+    @GetMapping("/scheduler")
+    public Map<String, Object> scheduler() {
+        return concurrencyScheduler.schedulerSnapshot();
+    }
+
+    @GetMapping("/tool-throttle")
+    public Map<String, Object> toolThrottle() {
+        return toolThrottle.throttleMetrics();
     }
 
     private static boolean isClassLoaded(Class<?> type) {
