@@ -17,6 +17,8 @@
 | getOffExchangeAssetDaily | `{"tsCode": "<基金代码>", "startDate": "YYYYMMDD", "endDate": "YYYYMMDD"}` |
 | getListedAssetShareSize | `{"tsCode": "<ETF代码>", "startDate": "YYYYMMDD", "endDate": "YYYYMMDD", "exchange": "SSE|SZSE|BSE"}` |
 | getEtfAdj | `{"tsCode": "<ETF代码>", "startDate": "YYYYMMDD", "endDate": "YYYYMMDD"}` |
+| getTradingDaysSummary | `{"startDate": "YYYYMMDD", "endDate": "YYYYMMDD", "exchange": "SSE|SZSE|BSE"}` |
+| isTradingDay | `{"date": "YYYYMMDD", "exchange": "SSE|SZSE|BSE"}` |
 | getIndexInfo | `{"ts_code": "<指数代码>"}` |
 | getStockInfo | `{"ts_code": "<股票代码>"}` |
 | checkParallelLimits | `{}` |
@@ -62,7 +64,15 @@
 - 若 `adj_factor` 列不存在，说明该 ETF 暂无复权因子数据，继续使用原始价格即可
 - `getEtfAdj` 工具仍可用，但仅在需要单独获取复权因子序列时使用；常规回测直接通过 `getExchangeAssetDaily` 获取即可
 
-### 2.1 联网搜索工具（searchWeb）
+### 2.1 交易日工具（getTradingDaysSummary/isTradingDay）
+- 涉及“某日是否交易日”、“区间交易日数量”、“区间首个交易日”、“区间最后交易日”时，**必须调用交易日工具，不要猜测、不要按周末/节假日经验推断**
+- `getTradingDaysSummary` 使用闭区间 `[startDate, endDate]`，日期必须为 `YYYYMMDD`；返回 `trading_days_count`、`first_trading_date`、`last_trading_date`
+- 区间内无交易日时，`first_trading_date` 和 `last_trading_date` 为 `NONE`
+- `isTradingDay` 用于判断单日是否交易日；返回 `is_trading_day` 和 `calendar_record_found`
+- `calendar_record_found=false` 表示日历表缺少该日期记录，不能把 `is_trading_day=false` 当作非交易日结论；必须在回答中说明日历数据缺口
+- `exchange` 默认使用 `SSE`，除非用户明确要求其它交易所
+
+### 2.2 联网搜索工具（searchWeb）
 - 用于查询互联网实时信息、新闻、政策变化、公司或行业最新公开信息。
 - 必须包含 `query` 参数。
 - `scene` 只能使用 `general`、`finance`、`news` 之一；财经和市场新闻优先使用 `finance`。

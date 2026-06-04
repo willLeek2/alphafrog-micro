@@ -108,6 +108,10 @@ class ToolRouterToolProviderTest {
 
         assertTrue(specsByName.containsKey("checkParallelLimits"));
         assertTrue(specsByName.get("checkParallelLimits").description().contains("maxItems"));
+        assertTrue(specsByName.containsKey("getTradingDaysSummary"));
+        assertTrue(specsByName.containsKey("isTradingDay"));
+        assertTrue(specsByName.get("getTradingDaysSummary").description().contains("YYYYMMDD"));
+        assertTrue(specsByName.get("isTradingDay").description().contains("calendar_record_found"));
 
         String dailyDescription = specsByName.get("getExchangeAssetDaily").description();
         assertTrue(dailyDescription.contains("checkParallelLimits"));

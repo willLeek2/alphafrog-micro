@@ -122,6 +122,21 @@ message DomesticTradingDaysCountResponse {
   int64 startDate = 2;
   int64 endDate = 3;
   int32 tradingDaysCount = 4;
+  int64 firstTradingDate = 5;
+  int64 lastTradingDate = 6;
+}
+
+// 单日是否交易日查询
+message DomesticTradingDayStatusRequest {
+  string exchange = 1;
+  int64 date = 2;
+}
+
+message DomesticTradingDayStatusResponse {
+  string exchange = 1;
+  int64 date = 2;
+  bool tradingDay = 3;
+  bool calendarRecordFound = 4;
 }
 
 /**
@@ -278,6 +293,8 @@ service DomesticIndexService{
   rpc getDomesticIndexDailyByTradeDate(DomesticIndexDailyByTsCodeAndDateRangeRequest) returns (DomesticIndexDailyByTsCodeAndDateRangeResponse);
   // 根据日期范围查询交易日数量
   rpc getTradingDaysCountByDateRange(DomesticTradingDaysCountRequest) returns (DomesticTradingDaysCountResponse);
+  // 查询指定日期是否为交易日
+  rpc isTradingDay(DomesticTradingDayStatusRequest) returns (DomesticTradingDayStatusResponse);
   // 根据代码和时间范围查询指数成分股
   rpc getDomesticIndexWeightByTsCodeAndDateRange(DomesticIndexWeightByTsCodeAndDateRangeRequest) returns (DomesticIndexWeightByTsCodeAndDateRangeResponse);
   // 根据指定股票代码查询所有含有此股票的指数

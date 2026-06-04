@@ -392,14 +392,23 @@ public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
         long startDate = request.getStartDate();
         long endDate = request.getEndDate();
         if (startDate > endDate) {
-            long tmp = startDate;
-            startDate = endDate;
-            endDate = tmp;
+            log.warn("Invalid trading days date range: exchange={}, startDate={}, endDate={}",
+                    exchange, startDate, endDate);
+            return DomesticTradingDaysCountResponse.newBuilder()
+                    .setExchange(exchange)
+                    .setStartDate(startDate)
+                    .setEndDate(endDate)
+                    .setTradingDaysCount(0)
+                    .setFirstTradingDate(0L)
+                    .setLastTradingDate(0L)
+                    .build();
         }
 
         int count;
+        List<Long> tradingDates;
         try {
             count = tradeCalendarDao.countTradingDaysByRange(exchange, startDate, endDate);
+            tradingDates = tradeCalendarDao.getTradingDatesByRange(exchange, startDate, endDate);
         } catch (Exception e) {
             log.error("Error occurred while counting trading days: exchange={}, dateRange={}-{}",
                     exchange, startDate, endDate, e);
@@ -411,12 +420,44 @@ public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
                     .build();
         }
 
+        long firstTradingDate = tradingDates == null || tradingDates.isEmpty() ? 0L : tradingDates.get(0);
+        long lastTradingDate = tradingDates == null || tradingDates.isEmpty() ? 0L : tradingDates.get(tradingDates.size() - 1);
         return DomesticTradingDaysCountResponse.newBuilder()
                 .setExchange(exchange)
                 .setStartDate(startDate)
                 .setEndDate(endDate)
                 .setTradingDaysCount(count)
+                .setFirstTradingDate(firstTradingDate)
+                .setLastTradingDate(lastTradingDate)
                 .build();
+    }
+
+    @Override
+    public DomesticTradingDayStatusResponse isTradingDay(DomesticTradingDayStatusRequest request) {
+        String exchange = request.getExchange();
+        if (exchange == null || exchange.trim().isEmpty()) {
+            exchange = "SSE";
+        }
+
+        long date = request.getDate();
+        try {
+            int records = tradeCalendarDao.countCalendarRecordsByDate(exchange, date);
+            int openDays = tradeCalendarDao.countTradingDaysByDate(exchange, date);
+            return DomesticTradingDayStatusResponse.newBuilder()
+                    .setExchange(exchange)
+                    .setDate(date)
+                    .setCalendarRecordFound(records > 0)
+                    .setTradingDay(openDays > 0)
+                    .build();
+        } catch (Exception e) {
+            log.error("Error occurred while checking trading day: exchange={}, date={}", exchange, date, e);
+            return DomesticTradingDayStatusResponse.newBuilder()
+                    .setExchange(exchange)
+                    .setDate(date)
+                    .setCalendarRecordFound(false)
+                    .setTradingDay(false)
+                    .build();
+        }
     }
 
 

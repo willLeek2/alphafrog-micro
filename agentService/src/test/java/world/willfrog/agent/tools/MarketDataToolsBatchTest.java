@@ -12,11 +12,15 @@ import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 import world.willfrog.agent.tools.dataset.DatasetRegistry;
 import world.willfrog.agent.tools.dataset.DatasetWriter;
 import world.willfrog.agent.tools.market.MarketDataTools;
+import world.willfrog.alphafrogmicro.common.utils.DateConvertUtils;
+import world.willfrog.alphafrogmicro.domestic.idl.DomesticIndexService;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticStockDailyItem;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticStockDailyByTsCodeAndDateRangeResponse;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticStockInfoSimpleItem;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticStockSearchResponse;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticStockService;
+import world.willfrog.alphafrogmicro.domestic.idl.DomesticTradingDayStatusResponse;
+import world.willfrog.alphafrogmicro.domestic.idl.DomesticTradingDaysCountResponse;
 
 import java.util.List;
 import java.util.Map;
@@ -42,6 +46,7 @@ class MarketDataToolsBatchTest {
 
     private MarketDataTools tools;
     private ObjectMapper objectMapper;
+    private DomesticIndexService indexService;
 
     @BeforeEach
     void setUp() {
@@ -62,6 +67,8 @@ class MarketDataToolsBatchTest {
 
         DomesticStockService stockService = mock(DomesticStockService.class);
         ReflectionTestUtils.setField(tools, "domesticStockService", stockService);
+        indexService = mock(DomesticIndexService.class);
+        ReflectionTestUtils.setField(tools, "domesticIndexService", indexService);
 
         DomesticStockInfoSimpleItem searchItem = DomesticStockInfoSimpleItem.newBuilder()
                 .setTsCode("000001.SZ")
@@ -91,6 +98,20 @@ class MarketDataToolsBatchTest {
 
         lenient().when(stockService.searchStock(any())).thenReturn(searchResponse);
         lenient().when(stockService.getStockDailyByTsCodeAndDateRange(any())).thenReturn(dailyResponse);
+        lenient().when(indexService.getTradingDaysCountByDateRange(any())).thenReturn(DomesticTradingDaysCountResponse.newBuilder()
+                .setExchange("SSE")
+                .setStartDate(toTimestamp("20240101"))
+                .setEndDate(toTimestamp("20240105"))
+                .setTradingDaysCount(3)
+                .setFirstTradingDate(toTimestamp("20240102"))
+                .setLastTradingDate(toTimestamp("20240104"))
+                .build());
+        lenient().when(indexService.isTradingDay(any())).thenReturn(DomesticTradingDayStatusResponse.newBuilder()
+                .setExchange("SSE")
+                .setDate(toTimestamp("20240102"))
+                .setCalendarRecordFound(true)
+                .setTradingDay(true)
+                .build());
     }
 
     @Test
@@ -129,6 +150,62 @@ class MarketDataToolsBatchTest {
     }
 
     @Test
+    void getTradingDaysSummary_shouldReturnCountAndBoundaryDates() throws Exception {
+        String response = tools.getTradingDaysSummary("20240101", "20240105", "");
+        Map<?, ?> root = objectMapper.readValue(response, Map.class);
+        Map<?, ?> data = (Map<?, ?>) root.get("data");
+
+        assertEquals(true, root.get("ok"));
+        assertEquals("SSE", data.get("exchange"));
+        assertEquals("20240101", data.get("start_date"));
+        assertEquals("20240105", data.get("end_date"));
+        assertEquals(3, data.get("trading_days_count"));
+        assertEquals("20240102", data.get("first_trading_date"));
+        assertEquals("20240104", data.get("last_trading_date"));
+    }
+
+    @Test
+    void getTradingDaysSummary_shouldRejectInvalidDateRange() throws Exception {
+        String response = tools.getTradingDaysSummary("20240105", "20240101", "SSE");
+        Map<?, ?> root = objectMapper.readValue(response, Map.class);
+        Map<?, ?> error = (Map<?, ?>) root.get("error");
+
+        assertEquals(false, root.get("ok"));
+        assertEquals("INVALID_ARGUMENT", error.get("code"));
+    }
+
+    @Test
+    void isTradingDay_shouldReturnStatusAndCalendarRecordFlag() throws Exception {
+        String response = tools.isTradingDay("20240102", null);
+        Map<?, ?> root = objectMapper.readValue(response, Map.class);
+        Map<?, ?> data = (Map<?, ?>) root.get("data");
+
+        assertEquals(true, root.get("ok"));
+        assertEquals("SSE", data.get("exchange"));
+        assertEquals("20240102", data.get("date"));
+        assertEquals(true, data.get("is_trading_day"));
+        assertEquals(true, data.get("calendar_record_found"));
+    }
+
+    @Test
+    void isTradingDay_shouldExposeCalendarDataGap() throws Exception {
+        when(indexService.isTradingDay(any())).thenReturn(DomesticTradingDayStatusResponse.newBuilder()
+                .setExchange("SSE")
+                .setDate(toTimestamp("20260102"))
+                .setCalendarRecordFound(false)
+                .setTradingDay(false)
+                .build());
+
+        String response = tools.isTradingDay("20260102", "SSE");
+        Map<?, ?> root = objectMapper.readValue(response, Map.class);
+        Map<?, ?> data = (Map<?, ?>) root.get("data");
+
+        assertEquals(true, root.get("ok"));
+        assertEquals(false, data.get("is_trading_day"));
+        assertEquals(false, data.get("calendar_record_found"));
+    }
+
+    @Test
     void searchStock_shouldRejectBatchAboveHotLoadedLimit() throws Exception {
         AgentLlmProperties limited = new AgentLlmProperties();
         AgentLlmProperties.Runtime runtime = new AgentLlmProperties.Runtime();
@@ -144,5 +221,9 @@ class MarketDataToolsBatchTest {
 
         assertEquals(false, root.get("ok"));
         assertEquals("BATCH_LIMIT_EXCEEDED", error.get("code"));
+    }
+
+    private long toTimestamp(String date) {
+        return DateConvertUtils.convertDateStrToLong(date, "yyyyMMdd");
     }
 }

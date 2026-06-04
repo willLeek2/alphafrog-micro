@@ -14,11 +14,17 @@ import world.willfrog.agent.tools.dataset.DatasetWriter;
 import world.willfrog.alphafrogmicro.common.utils.DateConvertUtils;
 import world.willfrog.alphafrogmicro.domestic.idl.*;
 
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -51,6 +57,9 @@ import java.util.function.Function;
 @Slf4j
 @Component
 public class MarketDataTools {
+
+    private static final DateTimeFormatter BASIC_DATE_FORMATTER = DateTimeFormatter.BASIC_ISO_DATE;
+    private static final ZoneId CHINA_ZONE = ZoneId.of("Asia/Shanghai");
 
     /**
      * Dubbo 引用的股票服务，提供股票基础信息、日线、财务数据查询。
@@ -714,6 +723,74 @@ public class MarketDataTools {
         return ok("checkParallelLimits", data);
     }
 
+    @Tool("查询A股交易日区间概览。参数要求：startDate/endDate 必须严格使用 YYYYMMDD；exchange 支持 SSE/SZSE/BSE，可选，默认 SSE。返回 trading_days_count、first_trading_date、last_trading_date；区间无交易日时 first_trading_date/last_trading_date 为 NONE。涉及交易日数量、首个交易日、最后交易日时禁止猜测，必须调用本工具。")
+    public String getTradingDaysSummary(String startDate, String endDate, String exchange) {
+        String normalizedStart = normalizeStrictDate(startDate);
+        String normalizedEnd = normalizeStrictDate(endDate);
+        long startMs = convertStrictDateToMsTimestamp(normalizedStart);
+        long endMs = convertStrictDateToMsTimestamp(normalizedEnd);
+        String normalizedExchange = normalizeExchange(exchange);
+        if (startMs <= 0 || endMs <= 0 || startMs > endMs) {
+            return fail("getTradingDaysSummary", "INVALID_ARGUMENT", "Invalid date range, please use YYYYMMDD and ensure startDate <= endDate.", Map.of(
+                    "exchange", normalizedExchange,
+                    "start_date", nvl(startDate),
+                    "end_date", nvl(endDate)
+            ));
+        }
+
+        try {
+            DomesticTradingDaysCountResponse response = domesticIndexService.getTradingDaysCountByDateRange(
+                    DomesticTradingDaysCountRequest.newBuilder()
+                            .setExchange(normalizedExchange)
+                            .setStartDate(startMs)
+                            .setEndDate(endMs)
+                            .build()
+            );
+            Map<String, Object> data = new LinkedHashMap<>();
+            data.put("exchange", normalizedExchange);
+            data.put("start_date", normalizedStart);
+            data.put("end_date", normalizedEnd);
+            data.put("trading_days_count", response.getTradingDaysCount());
+            data.put("first_trading_date", msTimestampToCompactDate(response.getFirstTradingDate()));
+            data.put("last_trading_date", msTimestampToCompactDate(response.getLastTradingDate()));
+            data.put("calendar_source", "alphafrog_trade_calendar");
+            return ok("getTradingDaysSummary", data);
+        } catch (Exception e) {
+            return fail("getTradingDaysSummary", "TOOL_ERROR", "Error fetching trading day summary", Map.of("message", nvl(e.getMessage())));
+        }
+    }
+
+    @Tool("查询某个日期是否为A股交易日。参数要求：date 必须严格使用 YYYYMMDD；exchange 支持 SSE/SZSE/BSE，可选，默认 SSE。返回 is_trading_day 和 calendar_record_found。涉及某日是否交易日时禁止猜测，必须调用本工具。")
+    public String isTradingDay(String date, String exchange) {
+        String normalizedDate = normalizeStrictDate(date);
+        long dateMs = convertStrictDateToMsTimestamp(normalizedDate);
+        String normalizedExchange = normalizeExchange(exchange);
+        if (dateMs <= 0) {
+            return fail("isTradingDay", "INVALID_ARGUMENT", "Invalid date, please use YYYYMMDD.", Map.of(
+                    "exchange", normalizedExchange,
+                    "date", nvl(date)
+            ));
+        }
+
+        try {
+            DomesticTradingDayStatusResponse response = domesticIndexService.isTradingDay(
+                    DomesticTradingDayStatusRequest.newBuilder()
+                            .setExchange(normalizedExchange)
+                            .setDate(dateMs)
+                            .build()
+            );
+            Map<String, Object> data = new LinkedHashMap<>();
+            data.put("exchange", normalizedExchange);
+            data.put("date", normalizedDate);
+            data.put("is_trading_day", response.getTradingDay());
+            data.put("calendar_record_found", response.getCalendarRecordFound());
+            data.put("calendar_source", "alphafrog_trade_calendar");
+            return ok("isTradingDay", data);
+        } catch (Exception e) {
+            return fail("isTradingDay", "TOOL_ERROR", "Error checking trading day", Map.of("message", nvl(e.getMessage())));
+        }
+    }
+
     private String searchListedAssetEtfSingle(String query) {
         try {
             ListedAssetSearchRequest request = ListedAssetSearchRequest.newBuilder()
@@ -1375,6 +1452,48 @@ public class MarketDataTools {
             return -1;
         }
         return converted;
+    }
+
+    private long convertStrictDateToMsTimestamp(String dateStr) {
+        if (dateStr == null || dateStr.isBlank()) {
+            return -1;
+        }
+        Long converted = DateConvertUtils.convertDateStrToLong(dateStr, "yyyyMMdd");
+        if (converted == null || converted <= 0) {
+            return -1;
+        }
+        return converted;
+    }
+
+    private String normalizeStrictDate(String raw) {
+        if (raw == null) {
+            return "";
+        }
+        String date = raw.trim();
+        if (!date.matches("\\d{8}")) {
+            return "";
+        }
+        try {
+            LocalDate.parse(date, BASIC_DATE_FORMATTER);
+            return date;
+        } catch (DateTimeParseException e) {
+            return "";
+        }
+    }
+
+    private String normalizeExchange(String exchange) {
+        String normalized = nvl(exchange).trim();
+        if (normalized.isEmpty()) {
+            return "SSE";
+        }
+        return normalized.toUpperCase(Locale.ROOT);
+    }
+
+    private String msTimestampToCompactDate(long timestampMs) {
+        if (timestampMs <= 0) {
+            return "NONE";
+        }
+        return Instant.ofEpochMilli(timestampMs).atZone(CHINA_ZONE).toLocalDate().format(BASIC_DATE_FORMATTER);
     }
 
     private String compactDate(String raw) {

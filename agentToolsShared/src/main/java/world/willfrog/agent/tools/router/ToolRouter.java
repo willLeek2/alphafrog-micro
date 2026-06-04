@@ -314,6 +314,8 @@ public class ToolRouter {
                 "searchIndex",
                 "searchAssetInfo",
                 "checkParallelLimits",
+                "getTradingDaysSummary",
+                "isTradingDay",
                 "getExchangeAssetDaily",
                 "getOffExchangeAssetDaily",
                 "getEtfAdj",
@@ -502,6 +504,15 @@ public class ToolRouter {
                         str(params.get("query"), params.get("keyword"), params.get("arg0")),
                         str(params.get("assetTypes"), params.get("asset_types"), params.get("arg1")),
                         str(params.get("marketScope"), params.get("market_scope"), params.get("arg2"), "domestic")
+                );
+                case "getTradingDaysSummary" -> marketDataTools.getTradingDaysSummary(
+                        dateStr(params.get("startDate"), params.get("start_date"), params.get("startDateStr"), params.get("arg0")),
+                        dateStr(params.get("endDate"), params.get("end_date"), params.get("endDateStr"), params.get("arg1")),
+                        str(params.get("exchange"), params.get("arg2"), "SSE")
+                );
+                case "isTradingDay" -> marketDataTools.isTradingDay(
+                        dateStr(params.get("date"), params.get("tradeDate"), params.get("trade_date"), params.get("arg0")),
+                        str(params.get("exchange"), params.get("arg1"), "SSE")
                 );
                 case "getExchangeAssetDaily" -> marketDataTools.getExchangeAssetDaily(
                         str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("arg0")),
