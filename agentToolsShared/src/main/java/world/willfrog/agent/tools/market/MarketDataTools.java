@@ -687,7 +687,8 @@ public class MarketDataTools {
      * <p>返回两类限制：</p>
      * <ul>
      *   <li><b>search 组</b>：搜索类工具（searchStock / searchFund / getStockInfo 等）的 maxItems，默认 3；</li>
-     *   <li><b>daily 组</b>：日线类工具（getStockDaily / getExchangeAssetDaily 等）的 maxItems，默认 2。</li>
+     *   <li><b>daily 组</b>：日线类工具（getStockDaily / getExchangeAssetDaily 等）的 maxItems，默认 2；</li>
+     *   <li><b>calendar 组</b>：交易日批量判断工具（isTradingDay）的 maxItems，默认 50。</li>
      * </ul>
      *
      * <p>配置来源：Nacos 热加载配置优先，fallback 到 classpath 默认配置。
@@ -715,9 +716,17 @@ public class MarketDataTools {
         ));
         daily.put("argumentFormat", "Use | separated tsCode values or JSON arrays. Do not use comma-separated values.");
 
+        Map<String, Object> calendar = new LinkedHashMap<>();
+        calendar.put("maxItems", resolveMaxParallelCalendarQueries());
+        calendar.put("tools", List.of(
+                "isTradingDay"
+        ));
+        calendar.put("argumentFormat", "Use | separated YYYYMMDD values or JSON arrays. Do not use comma-separated values.");
+
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("search", search);
         data.put("daily", daily);
+        data.put("calendar", calendar);
         data.put("fallbackRule", "If checkParallelLimits is unavailable, assume batch/parallel querying is disabled and call tools with one item at a time.");
         data.put("source", "agent.llm.runtime.parallel from hot-loaded local config first, then application properties");
         return ok("checkParallelLimits", data);
@@ -760,8 +769,22 @@ public class MarketDataTools {
         }
     }
 
-    @Tool("查询某个日期是否为A股交易日。参数要求：date 必须严格使用 YYYYMMDD；exchange 支持 SSE/SZSE/BSE，可选，默认 SSE。返回 is_trading_day 和 calendar_record_found。涉及某日是否交易日时禁止猜测，必须调用本工具。")
+    @Tool("查询单个或多个日期是否为A股交易日。参数要求：date 支持单个 YYYYMMDD、| 分隔的多个 YYYYMMDD 或 JSON 数组；批量前必须先调用 checkParallelLimits 查询 calendar.maxItems 并按上限拆批；exchange 支持 SSE/SZSE/BSE，可选，默认 SSE。单日返回 is_trading_day 和 calendar_record_found；批量返回 data.mode=batch、data.results、success_count、failure_count。涉及某日是否交易日时禁止猜测，必须调用本工具。")
     public String isTradingDay(String date, String exchange) {
+        int maxItems = resolveMaxParallelCalendarQueries();
+        List<String> dates = parseBatchValues(date);
+        String limitError = batchLimitFailureIfExceeded("isTradingDay", "date", dates, maxItems);
+        if (limitError != null) {
+            return limitError;
+        }
+        if (dates.size() > 1) {
+            return batchIsTradingDay(dates, exchange);
+        }
+        String singleDate = dates.isEmpty() ? date : dates.get(0);
+        return isTradingDaySingle(singleDate, exchange);
+    }
+
+    private String isTradingDaySingle(String date, String exchange) {
         String normalizedDate = normalizeStrictDate(date);
         long dateMs = convertStrictDateToMsTimestamp(normalizedDate);
         String normalizedExchange = normalizeExchange(exchange);
@@ -789,6 +812,34 @@ public class MarketDataTools {
         } catch (Exception e) {
             return fail("isTradingDay", "TOOL_ERROR", "Error checking trading day", Map.of("message", nvl(e.getMessage())));
         }
+    }
+
+    private String batchIsTradingDay(List<String> dates, String exchange) {
+        String normalizedExchange = normalizeExchange(exchange);
+        List<CompletableFuture<Map<String, Object>>> futures = dates.stream()
+                .map(date -> CompletableFuture.supplyAsync(() -> {
+                    String response = isTradingDaySingle(date, normalizedExchange);
+                    Map<String, Object> payload = readJsonMap(response);
+                    Map<String, Object> row = new LinkedHashMap<>();
+                    row.put("date", date);
+                    row.put("ok", Boolean.TRUE.equals(payload.get("ok")));
+                    row.put("data", readNestedMap(payload.get("data")));
+                    row.put("error", readNestedMap(payload.get("error")));
+                    return row;
+                }))
+                .toList();
+
+        List<Map<String, Object>> results = futures.stream().map(CompletableFuture::join).toList();
+        long successCount = results.stream().filter(it -> Boolean.TRUE.equals(it.get("ok"))).count();
+
+        return ok("isTradingDay", Map.of(
+                "mode", "batch",
+                "dates", dates,
+                "exchange", normalizedExchange,
+                "results", results,
+                "success_count", successCount,
+                "failure_count", Math.max(0, results.size() - successCount)
+        ));
     }
 
     private String searchListedAssetEtfSingle(String query) {
@@ -1237,6 +1288,25 @@ public class MarketDataTools {
             return clamp(base, 1, 20);
         }
         return 2;
+    }
+
+    private int resolveMaxParallelCalendarQueries() {
+        int local = localConfigLoader == null ? 0 : localConfigLoader.current()
+                .map(AgentLlmProperties::getRuntime)
+                .map(AgentLlmProperties.Runtime::getParallel)
+                .map(AgentLlmProperties.Parallel::getMaxParallelCalendarQueries)
+                .orElse(0);
+        if (local > 0) {
+            return clamp(local, 1, 100);
+        }
+        int base = Optional.ofNullable(llmProperties.getRuntime())
+                .map(AgentLlmProperties.Runtime::getParallel)
+                .map(AgentLlmProperties.Parallel::getMaxParallelCalendarQueries)
+                .orElse(0);
+        if (base > 0) {
+            return clamp(base, 1, 100);
+        }
+        return 50;
     }
 
     private int clamp(int value, int min, int max) {

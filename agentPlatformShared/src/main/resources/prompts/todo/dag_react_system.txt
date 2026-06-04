@@ -18,7 +18,7 @@
 | getListedAssetShareSize | `{"tsCode": "<ETF代码>", "startDate": "YYYYMMDD", "endDate": "YYYYMMDD", "exchange": "SSE|SZSE|BSE"}` |
 | getEtfAdj | `{"tsCode": "<ETF代码>", "startDate": "YYYYMMDD", "endDate": "YYYYMMDD"}` |
 | getTradingDaysSummary | `{"startDate": "YYYYMMDD", "endDate": "YYYYMMDD", "exchange": "SSE|SZSE|BSE"}` |
-| isTradingDay | `{"date": "YYYYMMDD", "exchange": "SSE|SZSE|BSE"}` |
+| isTradingDay | `{"date": "YYYYMMDD 或多个YYYYMMDD（用竖线分隔/JSON数组字符串）", "exchange": "SSE|SZSE|BSE"}` |
 | getIndexInfo | `{"ts_code": "<指数代码>"}` |
 | getStockInfo | `{"ts_code": "<股票代码>"}` |
 | checkParallelLimits | `{}` |
@@ -28,19 +28,21 @@
 ## 工具使用详细规则
 
 ### 0. 批量/并行查询限制（必须先查询）
-工作时，并行查询工具的并行限制请调用 `checkParallelLimits` 查询。`checkParallelLimits` 会返回 search、daily 等工具组当前可用的 `maxItems`，这些限制可能由配置热加载改变。
+工作时，并行查询工具的并行限制请调用 `checkParallelLimits` 查询。`checkParallelLimits` 会返回 search、daily、calendar 等工具组当前可用的 `maxItems`，这些限制可能由配置热加载改变。
 
 以下工具支持 `|` 分隔或 JSON 数组批量传参，但每次批量前必须按 `checkParallelLimits` 的返回值拆批：
 - searchAssetInfo、searchStock、searchIndex、searchFund、getStockInfo、getIndexInfo：使用 `data.search.maxItems`
 - getExchangeAssetDaily、getStockDaily、getIndexDaily：使用 `data.daily.maxItems`
+- isTradingDay：使用 `data.calendar.maxItems`
 
 如果当前工具列表中没有 `checkParallelLimits`，或调用失败/返回不可解析，默认并行查询关闭：每次只查 1 个标的或关键词。不要根据旧经验猜测上限，不要使用逗号分隔批量参数。发现式查询仍允许逐步搜索，不必在目标尚未明确时强行批量。
 
 示例：
-（假定 `checkParallelLimits` 返回 daily.maxItems=M、search.maxItems=K）
+（假定 `checkParallelLimits` 返回 daily.maxItems=M、search.maxItems=K、calendar.maxItems=C）
 
 - 已确定要查 `3*M` 只 ETF 的日线，应分 3 次调用 getExchangeAssetDaily（每次 M 个代码），而不是 `3*M` 次单代码调用。
 - 已确定要使用 `K+1` 个不同的关键词查询**中国大陆境内场内资产**信息，并还需要使用 `K-1` 个不同的关键词查询**中国大陆境内场外基金**信息，那么调用两次 searchAssetInfo 即可完成查询 `K+1` 个场内资产，再调用一次 searchFund 即可完成查询 **中国大陆境内场外基金**信息。
+- 已确定要判断 `3*C` 个日期是否交易日，应分 3 次调用 isTradingDay（每次 C 个日期），而不是 `3*C` 次单日调用。
 
 ### 1. 搜索类工具（searchIndex/searchStock/searchFund/searchAssetInfo）
 - **searchFund 仅用于场外基金（公募基金）基本信息检索**，不用于 ETF、场内上市 ETF、行业主题 ETF 筛选
@@ -65,15 +67,16 @@
 - `getEtfAdj` 工具仍可用，但仅在需要单独获取复权因子序列时使用；常规回测直接通过 `getExchangeAssetDaily` 获取即可
 
 ### 2.1 交易日工具（getTradingDaysSummary/isTradingDay）
-- 涉及“某日是否交易日”、“区间交易日数量”、“区间首个交易日”、“区间最后交易日”时，**必须调用交易日工具，不要猜测、不要按周末/节假日经验推断**
+- 涉及“某日是否交易日”、“区间交易日数量”、“区间首个交易日”、“区间最后交易日”时，**必须调用交易日工具，不要猜测、不要按周末/节假日经验推断**。此外，如果你认为你的执行结果中有一些日期对最终回答质量有较明显影响（比如声称某日是交易日、某日不是交易日等等，肯定还有这里没提到的其他情况），也请调用交易日查询工具进行查询。
 - `getTradingDaysSummary` 使用闭区间 `[startDate, endDate]`，日期必须为 `YYYYMMDD`；返回 `trading_days_count`、`first_trading_date`、`last_trading_date`
 - 区间内无交易日时，`first_trading_date` 和 `last_trading_date` 为 `NONE`
-- `isTradingDay` 用于判断单日是否交易日；返回 `is_trading_day` 和 `calendar_record_found`
+- `isTradingDay` 用于判断单日或多个日期是否交易日；多个日期用竖线分隔或 JSON 数组字符串传给 `date`，批量前按 `data.calendar.maxItems` 拆批
+- `isTradingDay` 单日返回 `is_trading_day` 和 `calendar_record_found`；批量返回 `data.mode=batch`、`data.results`、`success_count`、`failure_count`
 - `calendar_record_found=false` 表示日历表缺少该日期记录，不能把 `is_trading_day=false` 当作非交易日结论；必须在回答中说明日历数据缺口
 - `exchange` 默认使用 `SSE`，除非用户明确要求其它交易所
 
 ### 2.2 联网搜索工具（searchWeb）
-- 用于查询互联网实时信息、新闻、政策变化、公司或行业最新公开信息。
+- 用于查询互联网实时信息、新闻、政策变化、公司或行业最新公开信息。这是一个有发起请求的用户指定是否打开的工具，如果你没有看到这个工具，则说明本次run你无法使用它。
 - 必须包含 `query` 参数。
 - `scene` 只能使用 `general`、`finance`、`news` 之一；财经和市场新闻优先使用 `finance`。
 - `backend` 可指定 `perplexity`、`tavily`、`exa`，也可以留空让系统自动选择。

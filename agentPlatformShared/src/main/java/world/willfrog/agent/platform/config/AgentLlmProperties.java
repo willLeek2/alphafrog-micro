@@ -651,6 +651,7 @@ public class AgentLlmProperties {
     public static class Parallel {
         private Integer maxParallelSearchQueries;
         private Integer maxParallelDailyQueries;
+        private Integer maxParallelCalendarQueries;
         private Integer dagThreadPoolSize;
         private ExternalSearch externalSearch = new ExternalSearch();
         private ToolWeightedLimit toolWeightedLimit = new ToolWeightedLimit();
@@ -669,6 +670,14 @@ public class AgentLlmProperties {
 
         public void setMaxParallelDailyQueries(Integer maxParallelDailyQueries) {
             this.maxParallelDailyQueries = maxParallelDailyQueries;
+        }
+
+        public Integer getMaxParallelCalendarQueries() {
+            return maxParallelCalendarQueries;
+        }
+
+        public void setMaxParallelCalendarQueries(Integer maxParallelCalendarQueries) {
+            this.maxParallelCalendarQueries = maxParallelCalendarQueries;
         }
 
         public Integer getDagThreadPoolSize() {

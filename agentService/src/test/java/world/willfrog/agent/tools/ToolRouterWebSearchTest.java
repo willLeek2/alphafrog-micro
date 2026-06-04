@@ -192,12 +192,12 @@ class ToolRouterWebSearchTest {
                 "end_date", "20240105"
         ));
         ToolRouter.ToolInvocationResult status = router.invokeWithMeta("isTradingDay", Map.of(
-                "trade_date", "20240102"
+                "dates", "20240102|20240103"
         ));
 
         assertTrue(summary.isSuccess());
         assertTrue(status.isSuccess());
         verify(marketDataTools).getTradingDaysSummary(eq("20240101"), eq("20240105"), eq("SSE"));
-        verify(marketDataTools).isTradingDay(eq("20240102"), eq("SSE"));
+        verify(marketDataTools).isTradingDay(eq("20240102|20240103"), eq("SSE"));
     }
 }

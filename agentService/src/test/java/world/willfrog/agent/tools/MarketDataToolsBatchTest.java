@@ -142,11 +142,14 @@ class MarketDataToolsBatchTest {
         Map<?, ?> data = (Map<?, ?>) root.get("data");
         Map<?, ?> search = (Map<?, ?>) data.get("search");
         Map<?, ?> daily = (Map<?, ?>) data.get("daily");
+        Map<?, ?> calendar = (Map<?, ?>) data.get("calendar");
 
         assertEquals(5, search.get("maxItems"));
         assertEquals(5, daily.get("maxItems"));
+        assertEquals(50, calendar.get("maxItems"));
         assertTrue(((List<?>) search.get("tools")).contains("searchAssetInfo"));
         assertTrue(((List<?>) daily.get("tools")).contains("getExchangeAssetDaily"));
+        assertTrue(((List<?>) calendar.get("tools")).contains("isTradingDay"));
     }
 
     @Test
@@ -203,6 +206,38 @@ class MarketDataToolsBatchTest {
         assertEquals(true, root.get("ok"));
         assertEquals(false, data.get("is_trading_day"));
         assertEquals(false, data.get("calendar_record_found"));
+    }
+
+    @Test
+    void isTradingDay_shouldSupportBatchDates() throws Exception {
+        String response = tools.isTradingDay("20240102|20240103", "SSE");
+        Map<?, ?> root = objectMapper.readValue(response, Map.class);
+        Map<?, ?> data = (Map<?, ?>) root.get("data");
+
+        assertEquals(true, root.get("ok"));
+        assertEquals("batch", data.get("mode"));
+        assertEquals(List.of("20240102", "20240103"), data.get("dates"));
+        assertEquals(2, ((List<?>) data.get("results")).size());
+        assertEquals(2, data.get("success_count"));
+        assertEquals(0, data.get("failure_count"));
+    }
+
+    @Test
+    void isTradingDay_shouldRejectBatchAboveHotLoadedLimit() throws Exception {
+        AgentLlmProperties limited = new AgentLlmProperties();
+        AgentLlmProperties.Runtime runtime = new AgentLlmProperties.Runtime();
+        AgentLlmProperties.Parallel parallel = new AgentLlmProperties.Parallel();
+        parallel.setMaxParallelCalendarQueries(1);
+        runtime.setParallel(parallel);
+        limited.setRuntime(runtime);
+        when(localConfigLoader.current()).thenReturn(Optional.of(limited));
+
+        String response = tools.isTradingDay("20240102|20240103", "SSE");
+        Map<?, ?> root = objectMapper.readValue(response, Map.class);
+        Map<?, ?> error = (Map<?, ?>) root.get("error");
+
+        assertEquals(false, root.get("ok"));
+        assertEquals("BATCH_LIMIT_EXCEEDED", error.get("code"));
     }
 
     @Test

@@ -185,6 +185,7 @@
     "parallel": {
       "maxParallelSearchQueries": 3,
       "maxParallelDailyQueries": 2,
+      "maxParallelCalendarQueries": 50,
       "dagThreadPoolSize": 4,
       "externalSearch": {
         "maxConcurrent": 2,

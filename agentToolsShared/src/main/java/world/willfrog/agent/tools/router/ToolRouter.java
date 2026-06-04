@@ -511,7 +511,8 @@ public class ToolRouter {
                         str(params.get("exchange"), params.get("arg2"), "SSE")
                 );
                 case "isTradingDay" -> marketDataTools.isTradingDay(
-                        dateStr(params.get("date"), params.get("tradeDate"), params.get("trade_date"), params.get("arg0")),
+                        dateStr(params.get("date"), params.get("dates"), params.get("tradeDate"), params.get("tradeDates"),
+                                params.get("trade_date"), params.get("trade_dates"), params.get("arg0")),
                         str(params.get("exchange"), params.get("arg1"), "SSE")
                 );
                 case "getExchangeAssetDaily" -> marketDataTools.getExchangeAssetDaily(
