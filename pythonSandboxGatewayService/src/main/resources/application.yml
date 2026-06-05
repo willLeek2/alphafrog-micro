@@ -22,4 +22,11 @@ dubbo:
 
 sandbox:
   service:
-    url: ${AF_SANDBOX_SERVICE_URL:http://localhost:8095} 
+    url: ${AF_SANDBOX_SERVICE_URL:http://localhost:8095}
+
+# 260605-2 §3: gateway-side observability.
+# Default to INFO so that sandbox.createTask / sandbox.getTaskStatus / sandbox.getTaskResult
+# entry + RestTemplate duration lines surface in normal operation.
+logging:
+  level:
+    world.willfrog.sandbox: ${LOGGING_LEVEL_PYTHON_SANDBOX_GATEWAY:INFO}

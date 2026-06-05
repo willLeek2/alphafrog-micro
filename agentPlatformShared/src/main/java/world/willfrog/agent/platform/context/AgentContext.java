@@ -66,6 +66,16 @@ public class AgentContext {
      */
     private static final ThreadLocal<String> PROVIDER_LLM_TRACE_ID_HOLDER = new ThreadLocal<>();
     /**
+     * 下一次 LLM 调用写入 observability 时附带的 request meta（一次性消费）。
+     * 供 search judge 等调用方在 provider 自记录 trace 前注入业务字段。
+     */
+    private static final ThreadLocal<Map<String, Object>> LLM_CALL_REQUEST_META_HOLDER = new ThreadLocal<>();
+    /**
+     * 当前线程最近一次 {@code recordLlmCall} 写入的 traceId（一次性读取）。
+     * 用于调用方判断 provider 是否已记录，避免重复累加 llmCalls。
+     */
+    private static final ThreadLocal<String> LAST_RECORDED_LLM_TRACE_ID_HOLDER = new ThreadLocal<>();
+    /**
      * 结构化输出(JSON Schema)规范,LLM 包装器在请求时若发现此项非空,
      * 会自动注入 response_format 以强制模型输出符合 schema 的 JSON。
      */
@@ -487,6 +497,41 @@ public class AgentContext {
         return traceId;
     }
 
+    /** 为下一次 LLM observability 记录附带 request meta。 */
+    public static void setLlmCallRequestMeta(Map<String, Object> requestMeta) {
+        if (requestMeta == null || requestMeta.isEmpty()) {
+            LLM_CALL_REQUEST_META_HOLDER.remove();
+            return;
+        }
+        LLM_CALL_REQUEST_META_HOLDER.set(new LinkedHashMap<>(requestMeta));
+    }
+
+    /** 一次性消费 LLM request meta。 */
+    public static Map<String, Object> consumeLlmCallRequestMeta() {
+        Map<String, Object> meta = LLM_CALL_REQUEST_META_HOLDER.get();
+        LLM_CALL_REQUEST_META_HOLDER.remove();
+        return meta;
+    }
+
+    public static void clearLastRecordedLlmTraceId() {
+        LAST_RECORDED_LLM_TRACE_ID_HOLDER.remove();
+    }
+
+    public static void setLastRecordedLlmTraceId(String traceId) {
+        if (traceId == null || traceId.isBlank()) {
+            LAST_RECORDED_LLM_TRACE_ID_HOLDER.remove();
+            return;
+        }
+        LAST_RECORDED_LLM_TRACE_ID_HOLDER.set(traceId);
+    }
+
+    /** 一次性读取并清理最近一次 observability 记录的 traceId。 */
+    public static String getAndClearLastRecordedLlmTraceId() {
+        String traceId = LAST_RECORDED_LLM_TRACE_ID_HOLDER.get();
+        LAST_RECORDED_LLM_TRACE_ID_HOLDER.remove();
+        return traceId;
+    }
+
     /** 清理结构化输出规范。 */
     public static void clearStructuredOutputSpec() {
         STRUCTURED_OUTPUT_SPEC_HOLDER.remove();
@@ -607,6 +652,8 @@ public class AgentContext {
         clearToolCallId();
         clearDecisionContext();
         PROVIDER_LLM_TRACE_ID_HOLDER.remove();
+        LLM_CALL_REQUEST_META_HOLDER.remove();
+        LAST_RECORDED_LLM_TRACE_ID_HOLDER.remove();
         clearStructuredOutputSpec();
         clearDebugMode();
         clearWebSearchEnabled();

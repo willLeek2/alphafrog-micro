@@ -94,6 +94,16 @@ external-info:
             country: ${AF_EXTERNAL_INFO_SEARCH_MARKET_NEWS_US_COUNTRY:US}
             category-hint: global
       web-search:
+        proxy:
+          enabled: ${AF_EXTERNAL_INFO_WEB_SEARCH_PROXY_ENABLED:true}
+          host: ${AF_EXTERNAL_INFO_WEB_SEARCH_PROXY_HOST:}
+          port: ${AF_EXTERNAL_INFO_WEB_SEARCH_PROXY_PORT:}
+        # Per-backend HTTP retry policy (260605-2 §1.3).
+        # Cross-backend fallback is a separate concern handled in WebSearchOrchestrator (Phase 2).
+        retry:
+          max-attempts: ${AF_EXTERNAL_INFO_WEB_SEARCH_RETRY_MAX_ATTEMPTS:2}
+          delay-ms: ${AF_EXTERNAL_INFO_WEB_SEARCH_RETRY_DELAY_MS:1000}
+          retryable-status-codes: ${AF_EXTERNAL_INFO_WEB_SEARCH_RETRY_STATUS_CODES:408,425,429,500,502,503,504}
         default-preset: ${AF_EXTERNAL_INFO_WEB_SEARCH_DEFAULT_PRESET:finance_default}
         presets:
           finance_default:

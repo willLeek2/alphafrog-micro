@@ -329,6 +329,14 @@ public class SearchLlmProperties {
         private String defaultPreset;
         private Map<String, WebSearchPreset> presets = new HashMap<>();
         private Map<String, BackendConfig> backends = new HashMap<>();
+        /**
+         * Outbound HTTP proxy for search backends. Enabled by default (aligns with agent LLM proxy).
+         */
+        private WebSearchProxy proxy = new WebSearchProxy();
+        /**
+         * Per-backend retry policy for transient upstream failures (260605-2 §1.3).
+         */
+        private WebSearchRetry retry = new WebSearchRetry();
 
         public String getDefaultPreset() {
             return defaultPreset;
@@ -352,6 +360,86 @@ public class SearchLlmProperties {
 
         public void setBackends(Map<String, BackendConfig> backends) {
             this.backends = backends == null ? new HashMap<>() : backends;
+        }
+
+        public WebSearchProxy getProxy() {
+            return proxy;
+        }
+
+        public void setProxy(WebSearchProxy proxy) {
+            this.proxy = proxy == null ? new WebSearchProxy() : proxy;
+        }
+
+        public WebSearchRetry getRetry() {
+            return retry;
+        }
+
+        public void setRetry(WebSearchRetry retry) {
+            this.retry = retry == null ? new WebSearchRetry() : retry;
+        }
+    }
+
+    public static class WebSearchProxy {
+        private boolean enabled = true;
+        private String host;
+        private Integer port;
+
+        public boolean isEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(boolean enabled) {
+            this.enabled = enabled;
+        }
+
+        public String getHost() {
+            return host;
+        }
+
+        public void setHost(String host) {
+            this.host = host;
+        }
+
+        public Integer getPort() {
+            return port;
+        }
+
+        public void setPort(Integer port) {
+            this.port = port;
+        }
+    }
+
+    /**
+     * Per-backend HTTP retry policy (260605-2 §1.3). Cross-backend fallback is
+     * a separate concern handled in {@code WebSearchOrchestrator}.
+     */
+    public static class WebSearchRetry {
+        private Integer maxAttempts;
+        private Long delayMs;
+        private List<Integer> retryableStatusCodes = new ArrayList<>();
+
+        public Integer getMaxAttempts() {
+            return maxAttempts;
+        }
+
+        public void setMaxAttempts(Integer maxAttempts) {
+            this.maxAttempts = maxAttempts;
+        }
+
+        public Long getDelayMs() {
+            return delayMs;
+        }
+
+        public void setDelayMs(Long delayMs) {
+            this.delayMs = delayMs;
+        }
+
+        public List<Integer> getRetryableStatusCodes() {
+            return retryableStatusCodes;
+        }
+
+        public void setRetryableStatusCodes(List<Integer> retryableStatusCodes) {
+            this.retryableStatusCodes = retryableStatusCodes == null ? new ArrayList<>() : retryableStatusCodes;
         }
     }
 

@@ -2,8 +2,11 @@ package world.willfrog.agent.platform.service;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
@@ -17,6 +20,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 @Service
 @RequiredArgsConstructor
@@ -43,7 +47,14 @@ public class AgentRunStateStore {
     private final StringRedisTemplate redisTemplate;
     private final ObjectMapper objectMapper;
 
-    @Value("${agent.flow.hitl.state-ttl-seconds:3600}")
+    /** Micrometer 指标注册中心（可选，若服务未引入 actuator 则为 null） */
+    @Autowired(required = false)
+    private MeterRegistry meterRegistry;
+
+    /** Counter 缓存，避免每次操作都重建 Counter */
+    private final Map<String, Counter> counterCache = new ConcurrentHashMap<>();
+
+    @Value("${agent.flow.hitl.state-ttl-seconds:7200}")
     private long ttlSeconds;
 
     /** TTL for per-call detail blobs (independent from run state / observability TTL).
@@ -146,19 +157,35 @@ public class AgentRunStateStore {
         if (blank(runId)) {
             return;
         }
-        redisTemplate.opsForValue().set(observabilityKey(runId), nvl(observabilityJson));
-        touch(observabilityKey(runId));
+        String key = observabilityKey(runId);
+        try {
+            redisTemplate.opsForValue().set(key, nvl(observabilityJson));
+            recordRedisMetric("set", true);
+            touch(key);
+        } catch (Exception e) {
+            recordRedisMetric("set", false);
+            log.warn("saveObservability redis set failed: runId={}, key={}, error={}", runId, key, e.getMessage());
+            throw e;
+        }
     }
 
     public Optional<String> loadObservability(String runId) {
         if (blank(runId)) {
             return Optional.empty();
         }
-        String json = redisTemplate.opsForValue().get(observabilityKey(runId));
-        if (json == null || json.isBlank()) {
+        String key = observabilityKey(runId);
+        try {
+            String json = redisTemplate.opsForValue().get(key);
+            recordRedisMetric("get", true);
+            if (json == null || json.isBlank()) {
+                return Optional.empty();
+            }
+            return Optional.of(json);
+        } catch (Exception e) {
+            recordRedisMetric("get", false);
+            log.warn("loadObservability redis get failed: runId={}, key={}, error={}", runId, key, e.getMessage());
             return Optional.empty();
         }
-        return Optional.of(json);
     }
 
     public void saveLlmCallDetail(String runId, String llmCallId, String detailJson) {
@@ -489,9 +516,30 @@ public class AgentRunStateStore {
         }
         try {
             redisTemplate.expire(key, Duration.ofSeconds(ttl));
+            recordRedisMetric("expire", true);
         } catch (Exception e) {
-            log.debug("touch redis key failed: {}", key, e);
+            log.warn("touch redis key failed: key={}, ttl={}s, error={}", key, ttl, e.getMessage());
+            recordRedisMetric("expire", false);
         }
+    }
+
+    /**
+     * 记录 Redis 操作指标（Micrometer Counter）。
+     * 当 meterRegistry 不可用时静默跳过，不影响业务逻辑。
+     */
+    private void recordRedisMetric(String operation, boolean success) {
+        if (meterRegistry == null) {
+            return;
+        }
+        String cacheKey = operation + "_" + success;
+        Counter counter = counterCache.computeIfAbsent(cacheKey, k ->
+                Counter.builder("redis.operation")
+                        .description("Redis operation count")
+                        .tag("operation", operation)
+                        .tag("result", success ? "success" : "failure")
+                        .register(meterRegistry)
+        );
+        counter.increment();
     }
 
     private String safeWrite(Object obj) {

@@ -258,8 +258,8 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
             // 因此 retry 次数由 run budget 单独限制，避免一个 LLM step 因 provider 抖动
             // 消耗过多 wall-clock。
             int maxAttempts = budgetService == null ? 3 : budgetService.maxHttpAttemptsPerLogicalCall();
-            AttemptResult attemptResult = sendWithRetry(httpRequestBuilder, shouldCapture, requestRecord, requestStartedAt,
-                    maxAttempts, requestTimeout);
+            AttemptResult attemptResult = sendWithRetry(requestJson, requestUrl, apiKey, customHeaders,
+                    shouldCapture, requestStartedAt, maxAttempts, requestTimeout);
             attempts = attemptResult.attempts();
             HttpResponse<java.io.InputStream> httpResponse = attemptResult.response();
             responseRecord = attemptResult.responseRecord();
@@ -540,9 +540,11 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
         );
     }
 
-    private AttemptResult sendWithRetry(HttpRequest.Builder httpRequestBuilder,
+    private AttemptResult sendWithRetry(String requestJson,
+                                        String requestUrl,
+                                        String apiKey,
+                                        Map<String, String> customHeaders,
                                         boolean shouldCapture,
-                                        RawHttpLogger.HttpRequestRecord requestRecord,
                                         long logicalStartedAt,
                                         int maxAttempts,
                                         Duration requestTimeout) throws IOException, InterruptedException {
@@ -550,6 +552,12 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
          * 这里把多个 HTTP attempt 包装成一个 AttemptResult 返回给 doChat。
          * 调用方只看到一次 ChatResponse；observability 才会看到每次 attempt 的细节。
          * 这样可以避免 provider 轻微抖动直接暴露给 agent loop，同时保留排障证据。
+         *
+         * 业务层 provider 顺序重排（ALP-25 增强）：
+         * - 当 OpenRouter endpoint 且 providerOrder.size() > 1 时，
+         *   每次重试前将上次首选的 provider 移到 order 末尾，尝试下一个 provider。
+         * - 始终保持 allow_fallbacks=false，不把 provider 选择权交给 OpenRouter。
+         * - 单 provider 时跳过重排，避免无意义循环。
          */
         List<Map<String, Object>> attempts = new ArrayList<>();
         Exception lastException = null;
@@ -557,12 +565,38 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
         String lastErrorBody = null;
         int lastStatusCode = -1;
         int cappedAttempts = Math.max(1, maxAttempts);
+
+        // 当前请求体（可能在重试时被修改）和 provider 顺序
+        String currentRequestJson = requestJson;
+        List<String> currentProviderOrder = (providerOrder == null || providerOrder.isEmpty())
+                ? null : new ArrayList<>(providerOrder);
+        boolean isOpenRouter = isOpenRouterEndpoint(baseUrl);
+
         for (int attempt = 1; attempt <= cappedAttempts; attempt++) {
             if (budgetService != null) {
                 budgetService.checkHttpAttempt(attempt);
             }
+
+            // 重试前重排 provider order（业务层，非 OpenRouter fallback）
+            if (attempt > 1 && isOpenRouter && currentProviderOrder != null && currentProviderOrder.size() > 1) {
+                List<String> reordered = rotateProviderOrder(currentProviderOrder);
+                if (!reordered.equals(currentProviderOrder)) {
+                    currentProviderOrder = reordered;
+                    String rebuilt = rebuildRequestWithProviderOrder(currentRequestJson, currentProviderOrder);
+                    if (rebuilt != null) {
+                        currentRequestJson = rebuilt;
+                        if (log.isDebugEnabled()) {
+                            log.debug("Provider order rotated for retry: attempt={}, newOrder={}",
+                                    attempt, currentProviderOrder);
+                        }
+                    }
+                }
+            }
+
             long attemptStarted = System.currentTimeMillis();
             try {
+                HttpRequest.Builder httpRequestBuilder = buildHttpRequest(
+                        requestUrl, apiKey, customHeaders, currentRequestJson, requestTimeout);
                 HttpResponse<java.io.InputStream> httpResponse = HTTP_CLIENT.send(
                         httpRequestBuilder.build(),
                         HttpResponse.BodyHandlers.ofInputStream()
@@ -574,6 +608,9 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
                 attemptMeta.put("httpStatus", status);
                 attemptMeta.put("durationMs", attemptDuration);
                 attemptMeta.put("timeoutSeconds", requestTimeout.toSeconds());
+                if (currentProviderOrder != null) {
+                    attemptMeta.put("providerOrder", currentProviderOrder);
+                }
                 attempts.add(attemptMeta);
 
                 if (status >= 200 && status < 300) {
@@ -606,6 +643,9 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
                 attemptMeta.put("timeoutSeconds", requestTimeout.toSeconds());
                 attemptMeta.put("retryable", true);
                 attemptMeta.put("error", e.getClass().getSimpleName() + ": " + e.getMessage());
+                if (currentProviderOrder != null) {
+                    attemptMeta.put("providerOrder", currentProviderOrder);
+                }
                 attempts.add(attemptMeta);
                 if (attempt >= cappedAttempts) {
                     return new AttemptResult(null, lastResponseRecord, -1,
@@ -618,6 +658,66 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
             throw ioException;
         }
         return new AttemptResult(null, lastResponseRecord, lastStatusCode, lastErrorBody, attempts);
+    }
+
+    /**
+     * 构建 HTTP 请求 Builder。每次重试时独立构建，以便 request body 可能被修改。
+     */
+    private HttpRequest.Builder buildHttpRequest(String requestUrl, String apiKey,
+                                                  Map<String, String> customHeaders,
+                                                  String requestJson, Duration requestTimeout) {
+        HttpRequest.Builder builder = HttpRequest.newBuilder()
+                .uri(URI.create(requestUrl))
+                .timeout(requestTimeout)
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json")
+                .header("Authorization", "Bearer " + OpenAiCompatibleChatModelSupport.nvl(apiKey))
+                .POST(HttpRequest.BodyPublishers.ofString(requestJson, StandardCharsets.UTF_8));
+
+        if (customHeaders != null && !customHeaders.isEmpty()) {
+            for (Map.Entry<String, String> entry : customHeaders.entrySet()) {
+                if (entry.getKey() != null && entry.getValue() != null) {
+                    builder.header(entry.getKey(), entry.getValue());
+                }
+            }
+        }
+        return builder;
+    }
+
+    /**
+     * 将 provider order 列表左旋一位：第一个 provider 移到末尾。
+     * 这样下次重试会优先尝试列表中的下一个 provider。
+     */
+    private List<String> rotateProviderOrder(List<String> currentOrder) {
+        if (currentOrder == null || currentOrder.size() <= 1) {
+            return currentOrder;
+        }
+        List<String> result = new ArrayList<>(currentOrder);
+        String first = result.remove(0);
+        result.add(first);
+        return result;
+    }
+
+    /**
+     * 修改请求 JSON 中的 provider.order 字段。
+     * 保持 allow_fallbacks=false 不变。
+     */
+    @SuppressWarnings("unchecked")
+    private String rebuildRequestWithProviderOrder(String requestJson, List<String> newProviderOrder) {
+        try {
+            Map<String, Object> requestMap = objectMapper.readValue(requestJson, new TypeReference<Map<String, Object>>() {});
+            Object providerObj = requestMap.get("provider");
+            if (providerObj instanceof Map) {
+                Map<String, Object> provider = (Map<String, Object>) providerObj;
+                provider.put("order", newProviderOrder);
+                // 确保 allow_fallbacks 始终为 false
+                provider.put("allow_fallbacks", false);
+            }
+            return objectMapper.writeValueAsString(requestMap);
+        } catch (Exception e) {
+            log.warn("Failed to rebuild request with reordered provider order, using original: {}", e.getMessage());
+            return null;
+        }
     }
 
     private boolean isRetryableStatus(int status) {

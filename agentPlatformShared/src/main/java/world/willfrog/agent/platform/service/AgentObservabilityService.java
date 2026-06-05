@@ -383,9 +383,11 @@ public class AgentObservabilityService {
         // 这里直接复用 traceId 跳过重复记录，避免一次 LLM 调用被算两次
         String providerTraceId = AgentContext.consumeProviderLlmTraceId();
         if (providerTraceId != null && !providerTraceId.isBlank()) {
+            AgentContext.setLastRecordedLlmTraceId(providerTraceId);
             return providerTraceId;
         }
-        Map<String, Object> sanitizedRequestSnapshot = sanitizeRequestSnapshot(requestSnapshot);
+        Map<String, Object> sanitizedRequestSnapshot = sanitizeRequestSnapshot(
+                mergeLlmCallRequestMeta(requestSnapshot));
         String responsePreview = trim(responseText, llmTraceTextLimit());
         String traceId = newTraceId();
         String stage = resolveStage(sanitizedRequestSnapshot);
@@ -443,6 +445,7 @@ public class AgentObservabilityService {
             appendLlmTrace(state.getDiagnostics(), traceId, runId, phase, stage, tokenUsage, durationMs, startedAtMillis, completedAtMillis,
                     endpointName, modelName, errorMessage, sanitizedRequestSnapshot, responsePreview, reasoning);
         });
+        AgentContext.setLastRecordedLlmTraceId(traceId);
         return traceId;
     }
 
@@ -634,6 +637,7 @@ public class AgentObservabilityService {
             // 与 recordLlmCall 一致：若 provider 层已上报 trace，直接复用 traceId 避免重复
             String providerTraceId = AgentContext.consumeProviderLlmTraceId();
             if (providerTraceId != null && !providerTraceId.isBlank()) {
+                AgentContext.setLastRecordedLlmTraceId(providerTraceId);
                 return providerTraceId;
             }
             traceId = newTraceId();
@@ -736,6 +740,7 @@ public class AgentObservabilityService {
                     attempts == null ? List.of() : attempts
             );
         });
+        AgentContext.setLastRecordedLlmTraceId(traceId);
         return traceId;
     }
 
@@ -749,6 +754,53 @@ public class AgentObservabilityService {
      * @param cacheDiscount OpenRouter 缓存折扣
      * @param isByok        OpenRouter 是否 BYOK
      */
+    /**
+     * 向已有 LLM trace 补充 judge 等业务元数据，不增加 llmCalls 计数。
+     */
+    public void enrichLlmTrace(String runId,
+                               String traceId,
+                               String errorMessage,
+                               String responseText,
+                               Map<String, Object> requestFields) {
+        if (runId == null || runId.isBlank() || traceId == null || traceId.isBlank()) {
+            return;
+        }
+        mutate(runId, state -> {
+            if (state.getDiagnostics() == null || state.getDiagnostics().getLlmTraces() == null) {
+                return;
+            }
+            for (LlmTrace trace : state.getDiagnostics().getLlmTraces()) {
+                if (!traceId.equals(trace.getTraceId())) {
+                    continue;
+                }
+                if (errorMessage != null && !errorMessage.isBlank()) {
+                    trace.setHasError(true);
+                    trace.setError(trim(errorMessage, 1000));
+                }
+                if (responseText != null && !responseText.isBlank()) {
+                    String preview = trim(responseText, llmTraceTextLimit());
+                    trace.setOutputText(preview);
+                    trace.setResponsePreview(preview);
+                }
+                if (requestFields != null && !requestFields.isEmpty()) {
+                    Map<String, Object> request = trace.getInputMessages();
+                    if (request == null) {
+                        request = trace.getRequest();
+                    }
+                    if (request == null) {
+                        request = new LinkedHashMap<>();
+                    } else {
+                        request = new LinkedHashMap<>(request);
+                    }
+                    request.putAll(requestFields);
+                    trace.setInputMessages(request);
+                    trace.setRequest(request);
+                }
+                break;
+            }
+        });
+    }
+
     public void enrichLlmCallSpending(String runId,
                                       String traceId,
                                       Double actualCost,
@@ -1967,6 +2019,18 @@ public class AgentObservabilityService {
      * <p>优先级：AgentContext.stage &gt; requestSnapshot.meta.stage &gt; requestSnapshot.stage &gt; ""。
      * stage 通常表示 planning / execution / final_answer 等大阶段。</p>
      */
+    private Map<String, Object> mergeLlmCallRequestMeta(Map<String, Object> requestSnapshot) {
+        Map<String, Object> pendingMeta = AgentContext.consumeLlmCallRequestMeta();
+        if (pendingMeta == null || pendingMeta.isEmpty()) {
+            return requestSnapshot;
+        }
+        Map<String, Object> merged = requestSnapshot == null || requestSnapshot.isEmpty()
+                ? new LinkedHashMap<>()
+                : new LinkedHashMap<>(requestSnapshot);
+        merged.putAll(pendingMeta);
+        return merged;
+    }
+
     private String resolveStage(Map<String, Object> requestSnapshot) {
         String current = nvl(AgentContext.getStage()).trim();
         if (!current.isBlank()) {

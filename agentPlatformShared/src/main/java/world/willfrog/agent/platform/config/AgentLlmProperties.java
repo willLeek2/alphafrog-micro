@@ -1105,8 +1105,10 @@ public class AgentLlmProperties {
         private Boolean failOpen;
         private Boolean blockOnInsufficientEvidence;
         /**
-         * 新配置：有序路由列表，每个 endpoint 可配置一组候选 model。
+         * @deprecated Prefer run {@code stage_config.search_judge} or inherit current phase model.
+         * Ordered route list kept for backward compatibility only.
          */
+        @Deprecated
         private List<JudgeRoute> routes = new ArrayList<>();
 
         public Boolean getEnabled() {
