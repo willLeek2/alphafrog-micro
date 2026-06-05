@@ -15,6 +15,10 @@ from .config import SandboxConfig
 logger = logging.getLogger(__name__)
 
 DATASET_ID_PATTERN = re.compile(r"^[a-zA-Z0-9._-]+$")
+SANDBOX_WORKER_LABELS = {
+    "com.alphafrog.role": "python-sandbox-worker",
+    "com.alphafrog.owner": "python-sandbox-service",
+}
 
 
 def _normalize_library_name(library: str) -> str:
@@ -186,6 +190,7 @@ def create_sandbox_session(config: SandboxConfig, *, execution_timeout: float | 
     runtime_configs = {
         "mem_limit": config.memory_limit,
         "memswap_limit": config.memswap_limit,
+        "labels": SANDBOX_WORKER_LABELS,
     }
     session = SandboxSession(
         lang="python",

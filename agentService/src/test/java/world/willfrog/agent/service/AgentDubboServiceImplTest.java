@@ -72,6 +72,8 @@ class AgentDubboServiceImplTest {
     @Mock
     private AgentCreditService creditService;
     @Mock
+    private AgentRunCostService runCostService;
+    @Mock
     private UserDao userDao;
     @Mock
     private AgentMessageService messageService;
@@ -111,6 +113,7 @@ class AgentDubboServiceImplTest {
                 artifactService,
                 modelCatalogService,
                 creditService,
+                runCostService,
                 userDao,
                 new ObjectMapper(),
                 messageService,
@@ -250,7 +253,7 @@ class AgentDubboServiceImplTest {
         AgentRunEvent event = new AgentRunEvent();
         event.setEventType("TODO_STARTED");
         event.setPayloadJson("{\"todo_id\":\"todo_1\"}");
-        when(eventMapper.findLatestByRunId("run-2")).thenReturn(event);
+        when(eventService.findLatestByRunId("run-2")).thenReturn(event);
         when(stateStore.buildProgressJson("run-2", run.getPlanJson())).thenReturn("{}");
 
         var status = service.getStatus(GetAgentRunStatusRequest.newBuilder().setUserId("u1").setId("run-2").build());

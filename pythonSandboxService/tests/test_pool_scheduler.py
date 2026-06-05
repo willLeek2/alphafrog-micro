@@ -33,6 +33,15 @@ class FakeStateWorker:
         return self.state
 
 
+class FakeDockerContainer:
+    def __init__(self, container_id: str) -> None:
+        self.short_id = container_id
+        self.removed = False
+
+    def remove(self, *, force: bool) -> None:
+        self.removed = force
+
+
 def make_config(*, min_size: int = 1, max_size: int = 2) -> SandboxConfig:
     return SandboxConfig(
         data_dir=Path("/tmp"),
@@ -176,6 +185,38 @@ class ContainerPoolSchedulerTest(unittest.TestCase):
             self.assertTrue(job.future.cancelled())
         finally:
             scheduler._jobs.task_done()
+
+    def test_startup_removes_stale_labeled_worker_containers(self) -> None:
+        stale = FakeDockerContainer("old-worker")
+        filters_seen = {}
+
+        class FakeContainers:
+            def list(self, *, all, filters):
+                filters_seen.update(filters)
+                return [stale]
+
+        class FakeDockerClient:
+            containers = FakeContainers()
+
+            def close(self):
+                pass
+
+        fake_docker = types.ModuleType("docker")
+        fake_docker.from_env = lambda: FakeDockerClient()
+
+        old_docker = sys.modules.get("docker")
+        sys.modules["docker"] = fake_docker
+        try:
+            scheduler = ContainerPoolScheduler(make_config(min_size=0, max_size=0))
+            scheduler.start()
+            self.assertTrue(stale.removed)
+            self.assertIn("label", filters_seen)
+            self.assertIn("com.alphafrog.role=python-sandbox-worker", filters_seen["label"])
+        finally:
+            if old_docker is None:
+                sys.modules.pop("docker", None)
+            else:
+                sys.modules["docker"] = old_docker
 
 
 if __name__ == "__main__":

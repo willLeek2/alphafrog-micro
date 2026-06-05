@@ -12,6 +12,7 @@ import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agent.platform.service.AgentMessageService;
 import world.willfrog.agent.platform.service.AgentModelCatalogService;
 import world.willfrog.agent.platform.service.AgentObservabilityService;
+import world.willfrog.agent.platform.service.AgentRunCostService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agent.platform.service.SnapshotPartService;
 import world.willfrog.agentlangchain.routing.LangchainSingleWriterGuard;
@@ -34,6 +35,7 @@ class LangchainRunReadServiceTest {
     private final AgentRunStateStore stateStore = mock(AgentRunStateStore.class);
     private final AgentObservabilityService observabilityService = mock(AgentObservabilityService.class);
     private final AgentCreditService creditService = mock(AgentCreditService.class);
+    private final AgentRunCostService runCostService = mock(AgentRunCostService.class);
     private final AgentModelCatalogService modelCatalogService = mock(AgentModelCatalogService.class);
     private final AgentMessageService messageService = mock(AgentMessageService.class);
     private final SnapshotPartService snapshotPartService = mock(SnapshotPartService.class);
@@ -47,6 +49,7 @@ class LangchainRunReadServiceTest {
             stateStore,
             observabilityService,
             creditService,
+            runCostService,
             modelCatalogService,
             messageService,
             snapshotPartService,
@@ -149,6 +152,29 @@ class LangchainRunReadServiceTest {
         assertEquals("{\"summary\":true}", status.getObservabilitySummaryJson());
         assertTrue(status.getObservabilityFullAvailable());
         verify(observabilityService, never()).loadObservabilityJson(anyString(), any());
+    }
+
+    @Test
+    void getRunCostProjectsAndPersistsFromFullObservability() {
+        AgentRun run = run("{\"run_provider\":\"langchain\"}");
+        when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(run);
+        when(observabilityService.loadObservabilityJson("r1", run.getSnapshotJson())).thenReturn("{\"diagnostics\":{}}");
+        var cost = world.willfrog.alphafrogmicro.agent.idl.AgentRunCostMessage.newBuilder()
+                .setId("r1")
+                .setTotalCost(0.012)
+                .setHasTotalCost(true)
+                .setPersisted(true)
+                .build();
+        when(runCostService.buildAndPersist(run, "{\"diagnostics\":{}}")).thenReturn(cost);
+
+        var response = service.getRunCost(world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCostRequest.newBuilder()
+                .setUserId("u1")
+                .setId("r1")
+                .build());
+
+        assertEquals(0.012, response.getTotalCost());
+        assertTrue(response.getPersisted());
+        verify(runCostService).buildAndPersist(run, "{\"diagnostics\":{}}");
     }
 
     private AgentRun run(String ext) {

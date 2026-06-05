@@ -15,6 +15,7 @@ import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agent.platform.service.AgentMessageService;
 import world.willfrog.agent.platform.service.AgentModelCatalogService;
 import world.willfrog.agent.platform.service.AgentObservabilityService;
+import world.willfrog.agent.platform.service.AgentRunCostService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agent.platform.service.SnapshotPartService;
 import world.willfrog.agent.platform.service.SnapshotPartsMeta;
@@ -40,6 +41,7 @@ import world.willfrog.alphafrogmicro.agent.idl.GetAgentConfigResponse;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentCreditsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentCreditsResponse;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunRequest;
+import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCostRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunResultRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunStatusRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentSnapshotPartRequest;
@@ -114,6 +116,7 @@ public class LangchainRunReadService {
     private final AgentRunStateStore stateStore;
     private final AgentObservabilityService observabilityService;
     private final AgentCreditService creditService;
+    private final AgentRunCostService runCostService;
     private final AgentModelCatalogService modelCatalogService;
     private final AgentMessageService messageService;
     private final SnapshotPartService snapshotPartService;
@@ -233,6 +236,12 @@ public class LangchainRunReadService {
                 .setAnswerMarkdown(nvl(answerMarkdown))
                 .setStructuredAnswerJson(nvl(structuredAnswerJson))
                 .build();
+    }
+
+    public world.willfrog.alphafrogmicro.agent.idl.AgentRunCostMessage getRunCost(GetAgentRunCostRequest request) {
+        AgentRun run = requireReadableRun(request.getId(), request.getUserId());
+        String observabilityJson = nvl(observabilityService.loadObservabilityJson(run.getId(), run.getSnapshotJson()));
+        return runCostService.buildAndPersist(run, observabilityJson);
     }
 
     /**

@@ -11,6 +11,7 @@ from typing import List
 
 from .config import SandboxConfig
 from .sandbox_runner import (
+    SANDBOX_WORKER_LABELS,
     create_sandbox_session,
     get_session_container_id,
     run_in_open_session,
@@ -199,6 +200,7 @@ class ContainerPoolScheduler:
         self._starting_count = 0
 
     def start(self) -> None:
+        self._cleanup_stale_worker_containers()
         logger.info(
             "POOL_WARMING min=%s max=%s max_concurrency=%s image=%s",
             self.config.pool_min_size,
@@ -359,6 +361,42 @@ class ContainerPoolScheduler:
             if not need_min and not need_queue_capacity:
                 return
         self._start_worker(block_until_ready=False)
+
+    def _cleanup_stale_worker_containers(self) -> None:
+        """Remove labeled worker containers left behind by a previous service process."""
+        if self.config.docker_backend != "docker":
+            return
+        try:
+            import docker
+        except Exception as exc:
+            logger.warning("POOL_STALE_CLEANUP_SKIPPED reason=docker_import_failed error=%s", exc)
+            return
+
+        client = None
+        try:
+            client = docker.from_env()
+            filters = {
+                "label": [f"{key}={value}" for key, value in SANDBOX_WORKER_LABELS.items()],
+            }
+            containers = client.containers.list(all=True, filters=filters)
+            if not containers:
+                return
+            logger.warning("POOL_STALE_CLEANUP_START count=%s", len(containers))
+            for container in containers:
+                container_id = getattr(container, "short_id", None) or getattr(container, "id", "unknown")
+                try:
+                    container.remove(force=True)
+                    logger.warning("POOL_STALE_CLEANUP_REMOVED container=%s", container_id)
+                except Exception as exc:
+                    logger.warning("POOL_STALE_CLEANUP_REMOVE_FAILED container=%s error=%s", container_id, exc)
+        except Exception as exc:
+            logger.warning("POOL_STALE_CLEANUP_FAILED error=%s", exc)
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
 
     def _task_wait_timeout(self, timeout_seconds: float | None) -> float:
         return max((timeout_seconds or self.config.execution_timeout_seconds) * 2, 30)
