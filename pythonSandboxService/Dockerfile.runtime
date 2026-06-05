@@ -5,17 +5,49 @@ ARG PIP_EXTRA_INDEX_URL
 ARG http_proxy
 ARG https_proxy
 
-# 使用国内 PyPI 镜像时不必走 HTTP 代理，避免镜像站被错误代理导致失败
+# Create sandbox working directory
+RUN mkdir -p /sandbox && chmod 777 /sandbox
+
+# Pre-create venv and pip cache directories that llm-sandbox expects.
+# By baking the venv into the image, environment_setup() becomes a no-op
+# (venv already exists, pip already up-to-date, packages already installed).
+RUN python -m venv --system-site-packages /sandbox/.sandbox-venv
+RUN mkdir -p /sandbox/.sandbox-pip-cache
+
+# Install packages into the venv (not system Python) so that llm-sandbox's
+# python_executable_path (/sandbox/.sandbox-venv/bin/python) works out of box.
 RUN set -eux; \
+    VENV_PIP="/sandbox/.sandbox-venv/bin/pip"; \
     PKGS="numpy==2.4.1 pandas==2.3.3 matplotlib==3.10.8 scipy==1.17.0"; \
     if [ -n "${PIP_INDEX_URL:-}" ]; then \
       unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY; \
       if [ -n "${PIP_EXTRA_INDEX_URL:-}" ]; then \
-        pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" --extra-index-url "${PIP_EXTRA_INDEX_URL}" ${PKGS}; \
+        "${VENV_PIP}" install --no-cache-dir --index-url "${PIP_INDEX_URL}" --extra-index-url "${PIP_EXTRA_INDEX_URL}" ${PKGS}; \
       else \
-        pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" ${PKGS}; \
+        "${VENV_PIP}" install --no-cache-dir --index-url "${PIP_INDEX_URL}" ${PKGS}; \
       fi; \
     else \
       export http_proxy="${http_proxy:-}" https_proxy="${https_proxy:-}"; \
-      pip install --no-cache-dir ${PKGS}; \
+      "${VENV_PIP}" install --no-cache-dir ${PKGS}; \
     fi
+
+# Build-time smoke: verify venv Python works and all pre-installed packages import
+RUN /sandbox/.sandbox-venv/bin/python - <<'PY'
+import sys, os
+print("sandbox-smoke: python", sys.version)
+import numpy as np
+print("sandbox-smoke: numpy", np.__version__)
+import pandas as pd
+print("sandbox-smoke: pandas", pd.__version__)
+import matplotlib
+print("sandbox-smoke: matplotlib", matplotlib.__version__)
+import scipy
+print("sandbox-smoke: scipy", scipy.__version__)
+# Verify /sandbox is writable
+test_path = "/sandbox/.write_test"
+with open(test_path, "w") as f:
+    f.write("ok")
+os.remove(test_path)
+print("sandbox-smoke: /sandbox writable")
+print("sandbox-smoke: all checks passed")
+PY

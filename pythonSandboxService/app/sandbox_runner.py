@@ -8,9 +8,6 @@ from typing import Any, Dict, List
 
 from llm_sandbox import SandboxSession
 from llm_sandbox.exceptions import SandboxTimeoutError
-from llm_sandbox.pool import create_pool_manager, PoolConfig
-from llm_sandbox.pool.base import ContainerPoolManager
-from llm_sandbox.pool.session import PooledSandboxSession
 
 from .config import SandboxConfig
 
@@ -62,15 +59,51 @@ def _normalize_dataset_ids(primary: str, extra: List[str] | None) -> List[str]:
 
 
 def _copy_dataset_file(
-    session: SandboxSession | PooledSandboxSession,
+    session: SandboxSession,
     source: Path,
     dest_path: str,
 ) -> None:
     session.copy_to_runtime(str(source), dest_path)
 
 
+def _log_in_container(
+    session: SandboxSession,
+    task_id: str,
+    config: SandboxConfig,
+    message: str,
+) -> None:
+    """Write a timestamped log line inside the container for debugging."""
+    log_path = f"{config.workspace_root}/{task_id}/task.log"
+    cmd = f"echo '[$(date -Iseconds)] {message}' >> {log_path}"
+    try:
+        session.execute_command(cmd)
+    except Exception:
+        # Best-effort: container logging should not break the task
+        pass
+
+
+def _flush_container_log(
+    session: SandboxSession,
+    task_id: str,
+    config: SandboxConfig,
+) -> None:
+    """Read the container-internal task log and emit it to the service logger.
+
+    This preserves the log in service stdout even when the workspace is deleted
+    during cleanup.
+    """
+    log_path = f"{config.workspace_root}/{task_id}/task.log"
+    try:
+        output = session.execute_command(f"cat {log_path} 2>/dev/null || true")
+        if output.stdout:
+            for line in output.stdout.strip().splitlines():
+                logger.info("[container-log] task=%s %s", task_id, line)
+    except Exception:
+        pass
+
+
 def _exec_checked(
-    session: SandboxSession | PooledSandboxSession,
+    session: SandboxSession,
     command: str,
     context: str = "",
 ) -> None:
@@ -84,27 +117,8 @@ def _exec_checked(
         )
 
 
-def _recycle_container(session: PooledSandboxSession, reason: str) -> None:
-    """Destroy container and detach from session so close() doesn't release it back to pool.
-
-    NOTE: Uses ContainerPoolManager._destroy_container (private API) because
-    llm-sandbox 0.3.33 does not expose a public discard/recycle method.
-    We acquire the pool's internal lock to avoid racing with acquire/release/health_check.
-    """
-    if session._pooled_container and session._pool_manager:
-        logger.warning("Recycling container %s: %s", session._pooled_container.container_id, reason)
-        try:
-            manager = session._pool_manager
-            container = session._pooled_container
-            with manager._condition:
-                manager._destroy_container(container)
-        except Exception:
-            logger.exception("Failed to destroy container during recycle")
-        session._pooled_container = None
-
-
 def _prepare_task_workspace(
-    session: SandboxSession | PooledSandboxSession,
+    session: SandboxSession,
     task_id: str,
     config: SandboxConfig,
     dataset_id_list: List[str],
@@ -116,6 +130,7 @@ def _prepare_task_workspace(
 
     # Create workspace
     _exec_checked(session, f"mkdir -p {task_input}", "create_task_workspace")
+    _log_in_container(session, task_id, config, f"task_start workspace={task_workspace}")
 
     # Set up /sandbox/input compatibility symlink if enabled
     if config.compat_input_path_enabled:
@@ -134,21 +149,22 @@ def _prepare_task_workspace(
             # Compatibility copies for common read patterns
             if file_path.name == f"{ds_id}.csv":
                 _copy_dataset_file(session, file_path, f"{dataset_mount}/data.csv")
-                _copy_dataset_file(session, file_path, f"{task_workspace}/{ds_id}")
                 _copy_dataset_file(session, file_path, f"{task_workspace}/{ds_id}.csv")
             elif file_path.name == f"{ds_id}.meta.json":
                 _copy_dataset_file(session, file_path, f"{dataset_mount}/data.meta.json")
+        _log_in_container(session, task_id, config, f"dataset_ready dataset={ds_id} files={len(files_to_copy)}")
 
     return task_workspace
 
 
 def _cleanup_task_workspace(
-    session: PooledSandboxSession,
+    session: SandboxSession,
     task_id: str,
     config: SandboxConfig,
 ) -> bool:
     """Clean up task workspace. Returns True on success, False on failure (container should be recycled)."""
     task_workspace = f"{config.workspace_root}/{task_id}"
+    _log_in_container(session, task_id, config, "cleanup_start")
     try:
         # Remove task workspace
         _exec_checked(session, f"rm -rf {task_workspace}", "cleanup_task_workspace")
@@ -161,45 +177,62 @@ def _cleanup_task_workspace(
         return False
 
 
-def create_pool(config: SandboxConfig) -> ContainerPoolManager | None:
-    """Create and return a ContainerPoolManager if pooling is enabled."""
-    if not config.pool_enabled:
-        return None
+def create_sandbox_session(config: SandboxConfig, *, execution_timeout: float | None = None) -> SandboxSession:
+    """Create and open one llm-sandbox session.
 
-    pool_config = PoolConfig(
-        max_pool_size=config.pool_max_size,
-        min_pool_size=config.pool_min_size,
-        acquisition_timeout=config.pool_acquire_timeout_seconds,
-        idle_timeout=config.pool_idle_timeout_seconds,
-        max_container_uses=config.pool_max_container_uses,
-    )
-
+    The caller owns the returned session and must close it.
+    """
     runtime_configs = {
         "mem_limit": config.memory_limit,
         "memswap_limit": config.memswap_limit,
     }
-
-    pool = create_pool_manager(
-        backend=config.docker_backend,
-        config=pool_config,
+    session = SandboxSession(
         lang="python",
         image=config.sandbox_image,
+        backend=config.docker_backend,
         runtime_configs=runtime_configs,
         workdir=config.workdir,
+        execution_timeout=execution_timeout or config.execution_timeout_seconds,
+        skip_environment_setup=config.skip_environment_setup,
     )
-    logger.info(
-        "Pool created: max_size=%d min_size=%d acquire_timeout=%s idle_timeout=%s max_uses=%s",
-        config.pool_max_size,
-        config.pool_min_size,
-        config.pool_acquire_timeout_seconds,
-        config.pool_idle_timeout_seconds,
-        config.pool_max_container_uses,
-    )
-    return pool
+    session.open()
+    return session
 
 
-def run_in_sandbox(
+def get_session_container_id(session: SandboxSession) -> str:
+    """Best-effort container id extraction across llm-sandbox versions."""
+    for attr in ("container_id", "_container_id"):
+        value = getattr(session, attr, None)
+        if value:
+            return str(value)
+    container = getattr(session, "container", None) or getattr(session, "_container", None)
+    if container is not None:
+        value = getattr(container, "id", None) or getattr(container, "short_id", None)
+        if value:
+            return str(value)
+    return "unknown"
+
+
+def smoke_check_session(config: SandboxConfig, session: SandboxSession, container_id: str) -> None:
+    """Verify the warm container has a usable baked runtime."""
+    smoke_cmd = f"""
+set -e
+test -x {config.workdir}/.sandbox-venv/bin/python
+{config.workdir}/.sandbox-venv/bin/python - <<'PY'
+import numpy
+import pandas
+import matplotlib
+import scipy
+print("sandbox runtime ready")
+PY
+test -w {config.workdir}
+"""
+    _exec_checked(session, smoke_cmd, f"ready_check container={container_id}")
+
+
+def run_in_open_session(
     config: SandboxConfig,
+    session: SandboxSession,
     task_id: str,
     dataset_id: str,
     dataset_ids: List[str] | None,
@@ -207,107 +240,82 @@ def run_in_sandbox(
     files: List[str] | None,
     libraries: List[str] | None,
     timeout_seconds: float | None,
-    pool: ContainerPoolManager | None = None,
+    *,
+    queue_wait_ms: int | None = None,
+    container_id: str | None = None,
+    pool_enabled: bool = True,
 ) -> dict:
-    dataset_id_list = _normalize_dataset_ids(dataset_id, dataset_ids)
+    """Run one task inside an already-open session.
 
+    The caller owns the container lifecycle. This function returns
+    container_recycled=True when the caller should destroy and replace it.
+    """
+    dataset_id_list = _normalize_dataset_ids(dataset_id, dataset_ids)
     timeout = timeout_seconds or config.execution_timeout_seconds
     requested_libraries = [lib.strip() for lib in (libraries or []) if lib and lib.strip()]
     install_libraries = [
         lib for lib in requested_libraries
         if _normalize_library_name(lib) not in config.preinstalled_libraries
     ]
-
     if config.skip_environment_setup:
         install_libraries = []
 
-    # Timing
     t0 = time.monotonic()
     timings: Dict[str, float] = {}
+    if queue_wait_ms is not None:
+        timings["queue_wait_ms"] = queue_wait_ms
+    result = None
     container_recycled = False
     recycle_reason: str | None = None
 
-    if pool is not None and config.pool_enabled:
-        # Pooled execution
-        session = PooledSandboxSession(
-            pool_manager=pool,
-            workdir=config.workdir,
-            execution_timeout=timeout,
-        )
-        t_acquire_start = time.monotonic()
-        try:
-            session.open()
-        except Exception as e:
-            logger.error("Failed to acquire pooled container for task %s: %s", task_id, e)
-            raise
-        timings["pool_acquire_ms"] = int((time.monotonic() - t_acquire_start) * 1000)
-    else:
-        # Non-pooled execution (fallback / original behavior)
-        runtime_configs = {
-            "mem_limit": config.memory_limit,
-            "memswap_limit": config.memswap_limit,
-        }
-        session = SandboxSession(
-            lang="python",
-            image=config.sandbox_image,
-            backend=config.docker_backend,
-            runtime_configs=runtime_configs,
-            workdir=config.workdir,
-            execution_timeout=timeout,
-            skip_environment_setup=config.skip_environment_setup,
-        )
-        t_create_start = time.monotonic()
-        session.open()
-        timings["container_create_ms"] = int((time.monotonic() - t_create_start) * 1000)
-
     try:
-        # Prepare workspace
         t_workspace_start = time.monotonic()
-        task_workspace = _prepare_task_workspace(
-            session, task_id, config, dataset_id_list, files
-        )
+        _prepare_task_workspace(session, task_id, config, dataset_id_list, files)
         timings["workspace_prepare_ms"] = int((time.monotonic() - t_workspace_start) * 1000)
 
-        # Run code
+        _log_in_container(session, task_id, config, "script_start")
         t_run_start = time.monotonic()
         result = session.run(code, libraries=install_libraries, timeout=timeout)
         timings["script_run_ms"] = int((time.monotonic() - t_run_start) * 1000)
+        _log_in_container(
+            session,
+            task_id,
+            config,
+            f"script_end exit_code={result.exit_code} stdout_len={len(result.stdout or '')} stderr_len={len(result.stderr or '')}",
+        )
 
-        # Cleanup workspace
-        if isinstance(session, PooledSandboxSession):
-            t_cleanup_start = time.monotonic()
-            cleanup_ok = _cleanup_task_workspace(session, task_id, config)
-            timings["workspace_cleanup_ms"] = int((time.monotonic() - t_cleanup_start) * 1000)
-            if not cleanup_ok:
-                container_recycled = True
-                recycle_reason = "cleanup_failed"
-                _recycle_container(session, recycle_reason)
+        _flush_container_log(session, task_id, config)
+
+        t_cleanup_start = time.monotonic()
+        cleanup_ok = _cleanup_task_workspace(session, task_id, config)
+        timings["workspace_cleanup_ms"] = int((time.monotonic() - t_cleanup_start) * 1000)
+        if cleanup_ok:
+            _log_in_container(session, task_id, config, "cleanup_end ok")
+        else:
+            container_recycled = True
+            recycle_reason = "cleanup_failed"
+            _log_in_container(session, task_id, config, f"cleanup_failed recycle={recycle_reason}")
 
     except SandboxTimeoutError as e:
         logger.error("Task %s timed out: %s", task_id, e)
-        if isinstance(session, PooledSandboxSession):
-            container_recycled = True
-            recycle_reason = "timeout"
-            _recycle_container(session, recycle_reason)
+        _flush_container_log(session, task_id, config)
+        _log_in_container(session, task_id, config, "script_timeout recycle=timeout")
         raise
     except Exception as e:
         logger.error("Task %s execution error: %s", task_id, e)
-        # On any error during pooled execution, recycle container to be safe
-        if isinstance(session, PooledSandboxSession):
-            container_recycled = True
-            recycle_reason = f"execution_error: {type(e).__name__}"
-            _recycle_container(session, recycle_reason)
+        _flush_container_log(session, task_id, config)
+        _log_in_container(session, task_id, config, f"script_error error={type(e).__name__}")
         raise
     finally:
-        session.close()
-        timings["total_duration_ms"] = int((time.monotonic() - t0) * 1000)
+        timings["total_runner_ms"] = int((time.monotonic() - t0) * 1000)
 
     primary_mount = f"{config.workdir}/input/{dataset_id}"
-
+    actual_container_id = container_id or get_session_container_id(session)
     logger.info(
-        "Sandbox task=%s pool_enabled=%s %s recycled=%s recycle_reason=%s",
+        "Sandbox task=%s container=%s pool_enabled=%s %s recycled=%s recycle_reason=%s",
         task_id,
-        pool is not None and config.pool_enabled,
+        actual_container_id,
+        pool_enabled,
         " ".join(f"{k}={v}" for k, v in timings.items()),
         container_recycled,
         recycle_reason or "none",
@@ -321,4 +329,51 @@ def run_in_sandbox(
         "timings": timings,
         "container_recycled": container_recycled,
         "recycle_reason": recycle_reason,
+        "container_id": actual_container_id,
     }
+
+
+def run_in_sandbox(
+    config: SandboxConfig,
+    task_id: str,
+    dataset_id: str,
+    dataset_ids: List[str] | None,
+    code: str,
+    files: List[str] | None,
+    libraries: List[str] | None,
+    timeout_seconds: float | None,
+) -> dict:
+    timeout = timeout_seconds or config.execution_timeout_seconds
+    t0 = time.monotonic()
+    t_create_start = time.monotonic()
+    session = create_sandbox_session(config, execution_timeout=timeout)
+    container_create_ms = int((time.monotonic() - t_create_start) * 1000)
+    container_id = get_session_container_id(session)
+    try:
+        result = run_in_open_session(
+            config,
+            session,
+            task_id,
+            dataset_id,
+            dataset_ids,
+            code,
+            files,
+            libraries,
+            timeout_seconds,
+            queue_wait_ms=0,
+            container_id=container_id,
+            pool_enabled=False,
+        )
+        timings = result.setdefault("timings", {})
+        timings["container_create_ms"] = container_create_ms
+        timings["total_duration_ms"] = int((time.monotonic() - t0) * 1000)
+        logger.info(
+            "Sandbox task=%s container=%s pool_enabled=False container_create_ms=%s total_duration_ms=%s",
+            task_id,
+            container_id,
+            container_create_ms,
+            timings["total_duration_ms"],
+        )
+        return result
+    finally:
+        session.close()
