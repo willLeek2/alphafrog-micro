@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+import shlex
 import time
 from pathlib import Path
 from typing import Any, Dict, List
@@ -214,19 +215,22 @@ def get_session_container_id(session: SandboxSession) -> str:
 
 
 def smoke_check_session(config: SandboxConfig, session: SandboxSession, container_id: str) -> None:
-    """Verify the warm container has a usable baked runtime."""
-    smoke_cmd = f"""
+    """Verify the warm container has a usable baked runtime.
+
+    With skip_environment_setup=True on a fresh SandboxSession, llm-sandbox
+    executes code with system `python`, not the venv path. Check that actual
+    runner path first, then verify the baked venv compatibility path if present.
+    """
+    import_check = "import numpy, pandas, matplotlib, scipy; print('sandbox runtime ready')"
+    script = f"""
 set -e
-test -x {config.workdir}/.sandbox-venv/bin/python
-{config.workdir}/.sandbox-venv/bin/python - <<'PY'
-import numpy
-import pandas
-import matplotlib
-import scipy
-print("sandbox runtime ready")
-PY
-test -w {config.workdir}
+python -c {shlex.quote(import_check)}
+if [ -x {shlex.quote(config.workdir)}/.sandbox-venv/bin/python ]; then
+  {shlex.quote(config.workdir)}/.sandbox-venv/bin/python -c {shlex.quote(import_check)}
+fi
+test -w {shlex.quote(config.workdir)}
 """
+    smoke_cmd = f"sh -lc {shlex.quote(script)}"
     _exec_checked(session, smoke_cmd, f"ready_check container={container_id}")
 
 
