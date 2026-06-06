@@ -17,6 +17,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agent.platform.service.SearchEvidenceJudgeService;
 import world.willfrog.agent.tools.dataset.DatasetRegistry;
 import world.willfrog.agent.tools.dataset.DatasetWriter;
@@ -25,6 +26,7 @@ import world.willfrog.agent.tools.python.PythonSandboxTools;
 import world.willfrog.agent.tools.rag.RagTools;
 import world.willfrog.agent.tools.router.ToolRouter;
 import world.willfrog.agent.tools.search.SearchTools;
+import world.willfrog.agentlangchain.config.LangchainToolConcurrencyThrottle;
 
 import java.util.Map;
 import java.util.Set;
@@ -43,6 +45,9 @@ class ToolRouterToolProviderTest {
 
     @Mock
     private ToolRouter toolRouter;
+
+    @Mock
+    private AgentEventService eventService;
 
     private ToolRouterToolProvider provider;
 
@@ -66,7 +71,9 @@ class ToolRouterToolProviderTest {
                 ragTools,
                 searchTools,
                 pythonSandboxTools,
-                objectMapper
+                objectMapper,
+                eventService,
+                new LangchainToolConcurrencyThrottle(false, 20, 60)
         );
     }
 
@@ -103,6 +110,12 @@ class ToolRouterToolProviderTest {
 
         assertTrue(specsByName.containsKey("checkParallelLimits"));
         assertTrue(specsByName.get("checkParallelLimits").description().contains("maxItems"));
+        assertTrue(specsByName.containsKey("getTradingDaysSummary"));
+        assertTrue(specsByName.containsKey("isTradingDay"));
+        assertTrue(specsByName.get("getTradingDaysSummary").description().contains("YYYYMMDD"));
+        assertTrue(specsByName.get("isTradingDay").description().contains("calendar_record_found"));
+        assertTrue(specsByName.get("isTradingDay").description().contains("calendar.maxItems"));
+        assertTrue(specsByName.get("isTradingDay").description().contains("data.mode=batch"));
 
         String dailyDescription = specsByName.get("getExchangeAssetDaily").description();
         assertTrue(dailyDescription.contains("checkParallelLimits"));

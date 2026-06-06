@@ -36,6 +36,16 @@ public interface TradeCalendarDao {
                                 @Param("startDateTimestamp") long startDateTimestamp,
                                 @Param("endDateTimestamp") long endDateTimestamp);
 
+    @Select("SELECT COUNT(1) FROM alphafrog_trade_calendar " +
+            "WHERE exchange = #{exchange} AND cal_date_timestamp = #{calDateTimestamp}")
+    int countCalendarRecordsByDate(@Param("exchange") String exchange,
+                                   @Param("calDateTimestamp") long calDateTimestamp);
+
+    @Select("SELECT COUNT(1) FROM alphafrog_trade_calendar " +
+            "WHERE exchange = #{exchange} AND cal_date_timestamp = #{calDateTimestamp} AND is_open = 1")
+    int countTradingDaysByDate(@Param("exchange") String exchange,
+                               @Param("calDateTimestamp") long calDateTimestamp);
+
     /**
      * Finds the latest actual trading day timestamp (YYYYMMDD long format)
      * that is strictly before the given currentCalDateLongYYYYMMDD.

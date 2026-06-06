@@ -8,17 +8,83 @@
     {
       "subType": 2,
       "label": "按日期范围抓取",
-      "description": "按 ts_code 与日期范围抓取复权因子",
+      "description": "按 ts_code 与日期范围抓取复权因子，或使用 etf_offset/etf_batch_limit 从本地 ETF 列表分批逐基金抓取",
       "requiredParams": ["ts_code", "start_date", "end_date"],
-      "optionalParams": ["offset", "limit"],
+      "optionalParams": ["offset", "limit", "etf_offset", "etf_batch_limit"],
       "paramDefs": {
         "ts_code": { "label": "基金代码", "type": "string", "default": null },
         "start_date": { "label": "开始日期", "type": "string", "format": "yyyyMMdd", "default": null },
         "end_date": { "label": "结束日期", "type": "string", "format": "yyyyMMdd", "default": null },
         "offset": { "label": "偏移量", "type": "number", "default": 0 },
-        "limit": { "label": "每页条数", "type": "number", "default": 2000 }
+        "limit": { "label": "每页条数", "type": "number", "default": 2000 },
+        "etf_offset": {
+          "label": "本地 ETF 起始偏移",
+          "description": "从本地 alphafrog_domestic_etf 中按 ts_code 排序选取 ETF 代码的起始偏移量；配置后不再使用 TuShare 全市场 offset 分页",
+          "type": "number",
+          "default": 0
+        },
+        "etf_batch_limit": {
+          "label": "本地 ETF 批次大小",
+          "description": "每个叶子任务从本地 alphafrog_domestic_etf 选取的 ETF 代码数量",
+          "type": "number",
+          "default": null
+        }
       },
       "specialFlags": ["string_date"]
+    }
+  ],
+  "taskSetVariants": [
+    {
+      "subType": 3,
+      "label": "固定日期范围与本地 ETF 批次展开",
+      "description": "使用 date_range 与 etf_offset/etf_batch_limit，每个叶子任务从本地 ETF 库取一批 ts_code，并逐个调用 TuShare fund_adj",
+      "expandParam": "date_range",
+      "expandDescription": "使用 date_range 与本地 ETF 批次参数，每个叶子任务携带 start_date、end_date、etf_offset、etf_batch_limit",
+      "expandStrategy": "date_range_with_etf_batches",
+      "requiredParams": ["date_range"],
+      "optionalParams": ["etf_offset", "etf_batch_limit", "etf_count_limit", "limit"],
+      "paramDefs": {
+        "date_range.start_date": {
+          "label": "开始日期",
+          "description": "固定的开始日期，格式 yyyyMMdd",
+          "type": "string",
+          "format": "yyyyMMdd",
+          "default": null
+        },
+        "date_range.end_date": {
+          "label": "结束日期",
+          "description": "固定的结束日期，格式 yyyyMMdd",
+          "type": "string",
+          "format": "yyyyMMdd",
+          "default": null
+        },
+        "etf_offset": {
+          "label": "本地 ETF 起始偏移",
+          "description": "从本地 alphafrog_domestic_etf 中按 ts_code 排序选取 ETF 代码的起始偏移量",
+          "type": "number",
+          "default": 0
+        },
+        "etf_batch_limit": {
+          "label": "本地 ETF 批次大小",
+          "description": "每批从本地 alphafrog_domestic_etf 选取的 ETF 代码数量上限",
+          "type": "number",
+          "default": 100
+        },
+        "etf_count_limit": {
+          "label": "本地 ETF 总数上限",
+          "description": "本次 task_set 最多覆盖多少只 ETF；按 etf_batch_limit 展开为多个叶子任务",
+          "type": "number",
+          "default": 100
+        },
+        "limit": {
+          "label": "TuShare 每 ETF 返回上限（batch 模式忽略）",
+          "description": "batch 模式下服务端固定传 limit=\"\" 不做分页；此参数仅供旧全市场 offset 模式使用",
+          "type": "number",
+          "default": 2000
+        }
+      },
+      "specialFlags": [],
+      "outputTaskVariantSubType": 2
     }
   ]
 }

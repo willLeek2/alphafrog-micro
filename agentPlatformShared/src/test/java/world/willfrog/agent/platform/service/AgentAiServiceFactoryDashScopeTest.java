@@ -31,7 +31,9 @@ class AgentAiServiceFactoryDashScopeTest {
                 mock(RawHttpLogger.class),
                 mock(AgentObservabilityService.class),
                 mock(OpenRouterCostService.class),
-                mock(AgentLlmLocalConfigLoader.class)
+                mock(AgentEventService.class),
+                mock(AgentLlmLocalConfigLoader.class),
+                mock(LangchainLlmLatencyWindow.class)
         );
         ReflectionTestUtils.setField(factory, "openAiApiKey", "fallback-key");
         ReflectionTestUtils.setField(factory, "maxTokens", 1024);
@@ -43,7 +45,8 @@ class AgentAiServiceFactoryDashScopeTest {
                 "qwen-plus",
                 "dashscope-key",
                 region,
-                java.util.List.of()
+                java.util.List.of(),
+                null
         );
 
         ChatModel model = factory.buildChatModelWithProviderOrder(resolved, java.util.List.of("fireworks"));
@@ -62,7 +65,9 @@ class AgentAiServiceFactoryDashScopeTest {
                 mock(RawHttpLogger.class),
                 mock(AgentObservabilityService.class),
                 mock(OpenRouterCostService.class),
-                mock(AgentLlmLocalConfigLoader.class)
+                mock(AgentEventService.class),
+                mock(AgentLlmLocalConfigLoader.class),
+                mock(LangchainLlmLatencyWindow.class)
         );
         ReflectionTestUtils.setField(factory, "openAiApiKey", "fallback-key");
         ReflectionTestUtils.setField(factory, "maxTokens", 1024);
@@ -74,7 +79,8 @@ class AgentAiServiceFactoryDashScopeTest {
                 "qwen-plus",
                 "dashscope-key",
                 "us",
-                java.util.List.of()
+                java.util.List.of(),
+                null
         );
 
         ChatModel model = factory.buildChatModelWithProviderOrder(resolved, java.util.List.of());
@@ -93,7 +99,9 @@ class AgentAiServiceFactoryDashScopeTest {
                 mock(RawHttpLogger.class),
                 mock(AgentObservabilityService.class),
                 mock(OpenRouterCostService.class),
-                mock(AgentLlmLocalConfigLoader.class)
+                mock(AgentEventService.class),
+                mock(AgentLlmLocalConfigLoader.class),
+                mock(LangchainLlmLatencyWindow.class)
         );
         AgentRunBudgetService budgetService = mock(AgentRunBudgetService.class);
         ReflectionTestUtils.setField(factory, "budgetService", budgetService);
@@ -107,7 +115,8 @@ class AgentAiServiceFactoryDashScopeTest {
                 "qwen-plus",
                 "dashscope-key",
                 "us",
-                java.util.List.of()
+                java.util.List.of(),
+                null
         );
 
         ChatModel model = factory.buildChatModelWithProviderOrder(resolved, java.util.List.of());

@@ -17,6 +17,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8095
 - `AF_SANDBOX_MEMSWAP`：内存+swap 限制（默认 `512m`）
 - `AF_SANDBOX_BACKEND`：容器后端（默认 `docker`）
 - `AF_SANDBOX_WORKDIR`：容器工作目录（默认 `/sandbox`）
+- `AF_SANDBOX_SKIP_ENVIRONMENT_SETUP`：是否跳过 llm-sandbox 每次创建 venv/升级 pip 的环境初始化（默认 `true`，依赖运行时镜像预装库）
+- `AF_SANDBOX_PREINSTALLED_LIBRARIES`：运行时镜像已预装、无需每次 pip install 的库（默认 `numpy,pandas,matplotlib,scipy`）
 
 ## 数据约定
 Java 侧建议将数据落盘：

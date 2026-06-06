@@ -10,7 +10,6 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.entity.AgentRunEvent;
-import world.willfrog.agent.platform.mapper.AgentRunEventMapper;
 import world.willfrog.alphafrogmicro.agent.idl.AgentArtifactMessage;
 
 import java.nio.charset.StandardCharsets;
@@ -39,7 +38,7 @@ public class AgentArtifactService {
     private static final Pattern DATASET_ID_PATTERN = Pattern.compile("^[A-Za-z0-9._-]+$");
     private static final DateTimeFormatter TIME_FORMATTER = DateTimeFormatter.ISO_OFFSET_DATE_TIME;
 
-    private final AgentRunEventMapper eventMapper;
+    private final AgentEventService eventService;
     private final ObjectMapper objectMapper;
 
     @Value("${agent.tools.market-data.dataset.path:/data/agent_datasets}")
@@ -107,7 +106,7 @@ public class AgentArtifactService {
     }
 
     private List<ResolvedArtifact> resolveArtifacts(AgentRun run, boolean isAdmin) {
-        List<AgentRunEvent> events = eventMapper.listByRunId(run.getId());
+        List<AgentRunEvent> events = eventService.listByRunId(run.getId());
         ParsedEvents parsed = parseEvents(events);
 
         List<PythonInvocation> selectedInvocations = selectInvocations(parsed.invocations(), isAdmin);

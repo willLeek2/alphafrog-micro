@@ -15,6 +15,7 @@ import org.springframework.web.bind.annotation.*;
 import jakarta.servlet.http.HttpServletRequest;
 import world.willfrog.alphafrogmicro.agent.idl.AgentDubboService;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage;
+import world.willfrog.alphafrogmicro.agent.idl.AgentRunCostMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunResultMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunStatusMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentSnapshotPartMessage;
@@ -24,6 +25,7 @@ import world.willfrog.alphafrogmicro.agent.idl.DeleteAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.DownloadAgentArtifactRequest;
 import world.willfrog.alphafrogmicro.agent.idl.DownloadAgentArtifactResponse;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunRequest;
+import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCostRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunStatusRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentSnapshotPartRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentSnapshotPartsRequest;
@@ -56,6 +58,7 @@ import world.willfrog.alphafrogmicro.frontend.model.agent.AgentRunEventResponse;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentRunEventsPageResponse;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentRunResumeRequest;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentRunResponse;
+import world.willfrog.alphafrogmicro.frontend.model.agent.AgentRunCostResponse;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentRunResultResponse;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentRunListItemResponse;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentRunListResponse;
@@ -67,11 +70,16 @@ import world.willfrog.alphafrogmicro.frontend.model.agent.AgentMessageSendRespon
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentMessageItemResponse;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentMessageListResponse;
 import world.willfrog.alphafrogmicro.frontend.model.agent.TraceListResponse;
+import world.willfrog.alphafrogmicro.frontend.model.agent.AgentCallDetailResponse;
 import world.willfrog.alphafrogmicro.frontend.model.agent.TraceDetailResponse;
 import world.willfrog.alphafrogmicro.frontend.model.agent.TraceSpanItem;
 import world.willfrog.alphafrogmicro.frontend.model.agent.TimelineResponse;
 import world.willfrog.alphafrogmicro.frontend.service.AuthService;
+import world.willfrog.alphafrogmicro.frontend.service.agent.AgentCallDetailBlobReader;
+import world.willfrog.alphafrogmicro.frontend.service.agent.AgentCallDetailMapper;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentRunResultCacheService;
+
+import java.util.Optional;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -110,6 +118,7 @@ public class AgentController {
     private final AuthService authService;
     private final ObjectMapper objectMapper;
     private final AgentRunResultCacheService runResultCacheService;
+    private final AgentCallDetailBlobReader callDetailBlobReader;
 
     /**
      * 根据当前 HTTP 请求路径选择对应的 Dubbo provider。
@@ -594,6 +603,28 @@ public class AgentController {
         }
     }
 
+    @GetMapping({AGENT_RUNS + "/{runId}/cost", AGENT_LEGACY_RUNS + "/{runId}/cost"})
+    public ResponseWrapper<AgentRunCostResponse> cost(Authentication authentication,
+                                                      @PathVariable("runId") String runId) {
+        String userId = resolveUserId(authentication);
+        if (userId == null) {
+            return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
+        }
+        try {
+            AgentRunCostMessage cost = resolveService().getRunCost(
+                    GetAgentRunCostRequest.newBuilder()
+                            .setUserId(userId)
+                            .setId(runId)
+                            .build()
+            );
+            return ResponseWrapper.success(toCostResponse(cost));
+        } catch (RpcException e) {
+            return handleRpcError(e, "查询 agent run cost");
+        } catch (Exception e) {
+            return handleError(e, "查询 agent run cost");
+        }
+    }
+
     @GetMapping({AGENT_RUNS + "/{runId}/status", AGENT_LEGACY_RUNS + "/{runId}/status"})
     public ResponseWrapper<AgentRunStatusResponse> status(Authentication authentication,
                                                           @PathVariable("runId") String runId) {
@@ -856,6 +887,64 @@ public class AgentController {
             return handleRpcError(e, "查询 trace 详情");
         } catch (Exception e) {
             return handleError(e, "查询 trace 详情");
+        }
+    }
+
+    @GetMapping(AGENT_RUNS + "/{runId}/llm-calls/{llmCallId}/detail")
+    public ResponseWrapper<AgentCallDetailResponse> llmCallDetail(Authentication authentication,
+                                                                @PathVariable("runId") String runId,
+                                                                @PathVariable("llmCallId") String llmCallId,
+                                                                @RequestParam(value = "includeThinking", defaultValue = "false") boolean includeThinking) {
+        // 强校验：thinking 字段只对 admin 开放；非 admin 即使传 true 也按 false 处理（不抛错，避免破坏普通用户调用）
+        boolean effectiveIncludeThinking = includeThinking && isAdmin(authentication);
+        return safeCallDetail(authentication, runId, "llm", llmCallId, effectiveIncludeThinking);
+    }
+
+    @GetMapping(AGENT_RUNS + "/{runId}/tool-calls/{toolCallId}/detail")
+    public ResponseWrapper<AgentCallDetailResponse> toolCallDetail(Authentication authentication,
+                                                                   @PathVariable("runId") String runId,
+                                                                   @PathVariable("toolCallId") String toolCallId) {
+        return safeCallDetail(authentication, runId, "tool", toolCallId, false);
+    }
+
+    private ResponseWrapper<AgentCallDetailResponse> safeCallDetail(Authentication authentication,
+                                                                  String runId,
+                                                                  String type,
+                                                                  String callId,
+                                                                  boolean includeThinking) {
+        String userId = resolveUserId(authentication);
+        if (userId == null) {
+            return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
+        }
+        try {
+            AgentRunResultMessage result = loadRunResult(userId, runId);
+            String obsJson = result.getObservabilityJson();
+            Map<String, Object> diagnostics = AgentCallDetailMapper.parseDiagnostics(obsJson);
+            if ("llm".equals(type)) {
+                return AgentCallDetailMapper.findLlmTrace(diagnostics, callId)
+                        .map(trace -> ResponseWrapper.success(
+                                AgentCallDetailMapper.resolveLlmDetail(
+                                        trace,
+                                        callId,
+                                        runId,
+                                        callDetailBlobReader.loadLlmCallDetail(runId, callId),
+                                        includeThinking)))
+                        .orElseGet(() -> ResponseWrapper.success(
+                                AgentCallDetailMapper.unavailable("llm", callId, runId)));
+            }
+            return AgentCallDetailMapper.findToolTrace(diagnostics, callId)
+                    .map(trace -> ResponseWrapper.success(
+                            AgentCallDetailMapper.resolveToolDetail(
+                                    trace,
+                                    callId,
+                                    runId,
+                                    callDetailBlobReader.loadToolCallDetail(runId, callId))))
+                    .orElseGet(() -> ResponseWrapper.success(
+                            AgentCallDetailMapper.unavailable("tool", callId, runId)));
+        } catch (RpcException e) {
+            return handleRpcError(e, "查询 call 详情");
+        } catch (Exception e) {
+            return handleError(e, "查询 call 详情");
         }
     }
 
@@ -1183,8 +1272,16 @@ public class AgentController {
                 emptyToNull(run.getStartedAt()),
                 emptyToNull(run.getUpdatedAt()),
                 emptyToNull(run.getCompletedAt()),
-                emptyToNull(run.getExt())
+                emptyToNull(run.getExt()),
+                streamUrl(run.getId())
         );
+    }
+
+    private String streamUrl(String runId) {
+        if (runId == null || runId.isBlank()) {
+            return null;
+        }
+        return AGENT_RUNS + "/" + runId + "/stream";
     }
 
     private AgentSnapshotPartsMetaResponse toSnapshotPartsMetaResponse(AgentSnapshotPartsMetaMessage meta) {
@@ -1267,6 +1364,38 @@ public class AgentController {
 
     private AgentRunResultMessage loadRunResult(String userId, String runId) {
         return runResultCacheService.getRunResult(userId, runId);
+    }
+
+    private AgentRunCostResponse toCostResponse(AgentRunCostMessage cost) {
+        return new AgentRunCostResponse(
+                cost.getId(),
+                cost.getHasTotalCost() ? cost.getTotalCost() : null,
+                cost.getHasUpstreamInferenceCost() ? cost.getUpstreamInferenceCost() : null,
+                cost.getHasCacheDiscount() ? cost.getCacheDiscount() : null,
+                cost.getCostedCallCount(),
+                cost.getTotalCallCount(),
+                cost.getComplete(),
+                emptyToNull(cost.getCurrency()),
+                emptyToNull(cost.getSource()),
+                emptyToNull(cost.getUpdatedAt()),
+                cost.getPersisted(),
+                cost.getCallsList().stream()
+                        .map(call -> new AgentRunCostResponse.CallCost(
+                                emptyToNull(call.getTraceId()),
+                                emptyToNull(call.getGenerationId()),
+                                emptyToNull(call.getPhase()),
+                                emptyToNull(call.getTodoId()),
+                                emptyToNull(call.getEndpoint()),
+                                emptyToNull(call.getModel()),
+                                call.getHasActualCost() ? call.getActualCost() : null,
+                                call.getHasUpstreamInferenceCost() ? call.getUpstreamInferenceCost() : null,
+                                call.getHasCacheDiscount() ? call.getCacheDiscount() : null,
+                                call.getHasIsByok() ? call.getIsByok() : null,
+                                call.getStartedAtMs() > 0 ? call.getStartedAtMs() : null,
+                                call.getCompletedAtMs() > 0 ? call.getCompletedAtMs() : null,
+                                emptyToNull(call.getSource())))
+                        .toList()
+        );
     }
 
     private String nvl(String value) {

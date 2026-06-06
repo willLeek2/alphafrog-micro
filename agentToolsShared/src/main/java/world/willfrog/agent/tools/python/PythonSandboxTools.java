@@ -14,7 +14,6 @@ import java.util.concurrent.TimeUnit;
 @Component
 @Slf4j
 public class PythonSandboxTools {
-    private static final int PENDING_EXTRA_WAIT_SECONDS = 90;
     private static final int POLL_INTERVAL_MS = 1000;
 
     @DubboReference
@@ -84,23 +83,7 @@ public class PythonSandboxTools {
                 }
             }
 
-            long extraWaitMs = PENDING_EXTRA_WAIT_SECONDS * 1000L;
-            long extraStart = System.currentTimeMillis();
-            while (System.currentTimeMillis() - extraStart < extraWaitMs) {
-                TaskStatusResponse statusResp = getTaskStatus(taskId);
-                String terminal = terminalOutput(taskId, statusResp);
-                if (terminal != null) {
-                    return terminal;
-                }
-                try {
-                    TimeUnit.MILLISECONDS.sleep(POLL_INTERVAL_MS);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return fail("executePython", "INTERRUPTED", "Task polling interrupted", Map.of("task_id", taskId));
-                }
-            }
-
-            return fail("executePython", "TIMEOUT", "Task pending after timeout window", Map.of("task_id", taskId));
+            return fail("executePython", "TIMEOUT", "Sandbox task timed out after " + timeout + "s", Map.of("task_id", taskId));
         } catch (Exception e) {
             log.error("Execute python tool error", e);
             return fail("executePython", "TOOL_ERROR", "Python sandbox invocation error", Map.of("message", nvl(e.getMessage())));

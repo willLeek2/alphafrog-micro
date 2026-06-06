@@ -137,7 +137,7 @@ class AgentRunExecutorTest {
         lenient().when(simpleToolFastPathService.decide(anyString(), any())).thenReturn(Optional.empty());
 
         when(aiServiceFactory.resolveLlm(anyString(), anyString()))
-                .thenReturn(new AgentLlmResolver.ResolvedLlm("ep", "base", "model", "", null, List.of()));
+                .thenReturn(new AgentLlmResolver.ResolvedLlm("ep", "base", "model", "", null, List.of(), null));
         lenient().when(aiServiceFactory.buildChatModelWithProviderOrder(any(), any())).thenReturn(chatLanguageModel);
         when(aiServiceFactory.buildChatModelWithProviderOrder(any(), any(), any())).thenReturn(chatLanguageModel);
         lenient().when(creditService.calculateRunTotalCredits(anyString(), anyString(), any())).thenReturn(0);
@@ -182,8 +182,9 @@ class AgentRunExecutorTest {
                         "moonshotai/kimi-k2.6",
                         "sk-test",
                         null,
-                        List.of()
-                ));
+                List.of(),
+                null
+        ));
 
         TodoPlan plan = new TodoPlan();
         plan.setItems(List.of(TodoItem.builder().id("todo_1").sequence(1).build()));
@@ -388,7 +389,8 @@ class AgentRunExecutorTest {
                 inv.getArgument(1),
                 "",
                 null,
-                List.of()
+                List.of(),
+                null
         ));
 
         TodoPlan plan = new TodoPlan();
@@ -440,7 +442,8 @@ class AgentRunExecutorTest {
                 inv.getArgument(1),
                 "",
                 null,
-                List.of()
+                List.of(),
+                null
         ));
         stubSuccessfulWorkflow();
 
@@ -478,7 +481,8 @@ class AgentRunExecutorTest {
                 inv.getArgument(1),
                 "",
                 null,
-                List.of()
+                List.of(),
+                null
         ));
         stubSuccessfulWorkflow();
 
@@ -522,7 +526,8 @@ class AgentRunExecutorTest {
                 inv.getArgument(1),
                 "",
                 null,
-                List.of("valid-provider")
+                List.of("valid-provider"),
+                null
         ));
         stubSuccessfulWorkflow();
 
@@ -577,7 +582,8 @@ class AgentRunExecutorTest {
                 inv.getArgument(1),
                 "",
                 null,
-                List.of("valid-provider")
+                List.of("valid-provider"),
+                null
         ));
         stubSuccessfulWorkflow();
 
@@ -602,7 +608,8 @@ class AgentRunExecutorTest {
                 inv.getArgument(1),
                 "",
                 null,
-                List.of()
+                List.of(),
+                null
         ));
         stubSuccessfulWorkflow();
 

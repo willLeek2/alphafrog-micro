@@ -25,7 +25,9 @@ public class AgentAiServiceFactory {
     private final RawHttpLogger httpLogger;
     private final AgentObservabilityService observabilityService;
     private final OpenRouterCostService openRouterCostService;
+    private final AgentEventService eventService;
     private final AgentLlmLocalConfigLoader localConfigLoader;
+    private final LangchainLlmLatencyWindow latencyWindow;
 
     @Autowired(required = false)
     private AgentRunBudgetService budgetService;
@@ -68,13 +70,12 @@ public class AgentAiServiceFactory {
     public ChatModel buildChatModelWithTemperature(AgentLlmResolver.ResolvedLlm resolved,
                                                  Double temperatureOverride,
                                                  Integer maxTokensOverride) {
-        boolean debugEnabled = log.isDebugEnabled();
         String apiKey = isBlank(resolved.apiKey()) ? openAiApiKey : resolved.apiKey();
         if (isBlank(apiKey)) {
             throw new IllegalArgumentException("LLM api key 未配置: endpoint=" + resolved.endpointName());
         }
         double finalTemperature = temperatureOverride == null ? (temperature == null ? 0.7D : temperature) : temperatureOverride;
-        int effectiveMaxTokens = resolveMaxTokens(maxTokensOverride);
+        int effectiveMaxTokens = resolveMaxTokens(resolved, maxTokensOverride);
         if (isDashScopeEndpoint(resolved)) {
             return buildDashScopeChatModel(resolved, apiKey, finalTemperature, effectiveMaxTokens);
         }
@@ -84,8 +85,9 @@ public class AgentAiServiceFactory {
                 .modelName(resolved.modelName())
                 .maxTokens(effectiveMaxTokens)
                 .temperature(finalTemperature)
-                .logRequests(debugEnabled)
-                .logResponses(debugEnabled);
+                // LC4j 内置 logRequests/logResponses 会打全量 HTTP body；langchain 压测时保持关闭
+                .logRequests(false)
+                .logResponses(false);
 
         Map<String, String> headers = buildCustomHeaders(resolved.baseUrl());
         if (!headers.isEmpty()) {
@@ -105,7 +107,7 @@ public class AgentAiServiceFactory {
                                                                            Double temperatureOverride,
                                                                            Integer maxTokensOverride) {
         List<String> normalizedProviderOrder = sanitizeProviderOrder(providerOrder);
-        int effectiveMaxTokens = resolveMaxTokens(maxTokensOverride);
+        int effectiveMaxTokens = resolveMaxTokens(resolved, maxTokensOverride);
         // ALP-25: 对所有端点使用 OpenRouterProviderRoutedChatModel 以支持 HTTP 捕获
         if (isDashScopeEndpoint(resolved)) {
             String apiKey = isBlank(resolved.apiKey()) ? openAiApiKey : resolved.apiKey();
@@ -134,8 +136,10 @@ public class AgentAiServiceFactory {
                     httpLogger,
                     observabilityService,
                     openRouterCostService,
+                    eventService,
                     resolved.endpointName(),
-                    localConfigLoader
+                    localConfigLoader,
+                    latencyWindow
             );
             model.setBudgetService(budgetService);
             return model;
@@ -150,13 +154,12 @@ public class AgentAiServiceFactory {
     public ChatModel buildChatModelWithProviderOrder(AgentLlmResolver.ResolvedLlm resolved,
                                                      List<String> providerOrder,
                                                      Integer maxTokensOverride) {
-        boolean debugEnabled = log.isDebugEnabled();
         String apiKey = isBlank(resolved.apiKey()) ? openAiApiKey : resolved.apiKey();
         if (isBlank(apiKey)) {
             throw new IllegalArgumentException("LLM api key 未配置: endpoint=" + resolved.endpointName());
         }
         List<String> normalizedProviderOrder = sanitizeProviderOrder(providerOrder);
-        int effectiveMaxTokens = resolveMaxTokens(maxTokensOverride);
+        int effectiveMaxTokens = resolveMaxTokens(resolved, maxTokensOverride);
         // ALP-25: 对所有端点使用 OpenRouterProviderRoutedChatModel 以支持 HTTP 捕获
         if (isDashScopeEndpoint(resolved)) {
             return buildDashScopeChatModel(resolved, apiKey, temperature, effectiveMaxTokens);
@@ -175,8 +178,10 @@ public class AgentAiServiceFactory {
                     httpLogger,
                     observabilityService,
                     openRouterCostService,
+                    eventService,
                     resolved.endpointName(),
-                    localConfigLoader
+                    localConfigLoader,
+                    latencyWindow
             );
             model.setBudgetService(budgetService);
             return model;
@@ -188,8 +193,8 @@ public class AgentAiServiceFactory {
                 .modelName(resolved.modelName())
                 .maxTokens(effectiveMaxTokens)
                 .temperature(temperature)
-                .logRequests(debugEnabled)
-                .logResponses(debugEnabled);
+                .logRequests(false)
+                .logResponses(false);
 
         Map<String, String> headers = buildCustomHeaders(resolved.baseUrl());
         if (!headers.isEmpty()) {
@@ -297,15 +302,20 @@ public class AgentAiServiceFactory {
                 observabilityService,
                 resolved.endpointName(),
                 enableThinking,
-                localConfigLoader
+                localConfigLoader,
+                eventService,
+                latencyWindow
         );
         model.setBudgetService(budgetService);
         return model;
     }
 
-    private int resolveMaxTokens(Integer maxTokensOverride) {
+    private int resolveMaxTokens(AgentLlmResolver.ResolvedLlm resolved, Integer maxTokensOverride) {
         if (maxTokensOverride != null && maxTokensOverride > 0) {
             return maxTokensOverride;
+        }
+        if (resolved != null && resolved.maxTokens() != null && resolved.maxTokens() > 0) {
+            return resolved.maxTokens();
         }
         return maxTokens != null && maxTokens > 0 ? maxTokens : 4096;
     }

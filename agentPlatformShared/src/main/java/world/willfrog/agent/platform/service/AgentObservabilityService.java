@@ -38,9 +38,11 @@ import java.util.function.Consumer;
  * <ol>
  *   <li><b>LLM 调用 trace</b>：{@link #recordLlmCall} 系列方法记录每次 LLM 调用的 id、phase、
  *       token 用量、耗时、错误。{@link #recordLlmCallWithRawHttp} 支持记录完整原始 HTTP
- *       请求/响应（ALP-25），调试复杂问题时至关重要。</li>
+ *       请求/响应（ALP-25），调试复杂问题时至关重要。完成持久化前会把大字段拆到
+ *       Redis detail blob，trace 列表只保留可索引的安全摘要。</li>
  *   <li><b>工具调用 trace</b>：{@link #recordToolCall} 记录工具名、参数、输出、缓存命中/未命中、
- *       耗时，由 {@code ToolRouter} 调用。</li>
+ *       耗时，由 {@code ToolRouter} 调用；traceId 优先与 SSE 的 {@code tool_call_id} 对齐，
+ *       这样前端展开工具卡片时可以按同一个 id 懒加载详情。</li>
  *   <li><b>Run 初始化与失败</b>：{@link #initializeRun} 在 Pipeline 入口调用，设置启动时间、
  *       endpoint/model、captureLlmRequests 开关。{@link #recordFailure} 在 run 失败时写入
  *       diagnostics.lastErrorType / lastErrorMessage。</li>
@@ -58,17 +60,20 @@ import java.util.function.Consumer;
  * <pre>
  * LLM 调用 → recordLlmCall() → mutate() → Redis（JSON）→ 定期 flush
  * 工具调用  → recordToolCall() → mutate() → Redis
- * Run 结束  → attachObservabilityToSnapshot() → snapshot JSON → DB
+ * Run 结束  → attachObservabilityToSnapshot() → scrub 后的 snapshot JSON → DB
+ * 详情展开  → safe detail API → Redis detail blob（过期则返回 expired/unavailable）
  * Matrix    → loadObservabilityJson() → Redis 优先，snapshot 兜底
  * </pre>
  *
  * <h2>容量保护（面试要点）</h2>
  * <p>生产环境长时间运行的 agent 可能产生数百次 LLM 调用，不加限制会撑爆 Redis 和 DB。
- * 因此设计了三层容量保护：</p>
+ * 因此设计了"摘要索引 + 短期 detail blob + 截断预览"三层容量保护：</p>
  * <ul>
  *   <li>{@code llmTraceMaxCalls}：LlmTrace 列表最大长度（默认 100，超出移除最旧）</li>
  *   <li>{@code llmTraceMaxTextChars}：单条请求/响应文本最大字符数（默认 20K，超出截断）</li>
  *   <li>{@code toolTraceMaxOutputChars}：单条工具输出最大字符数（默认 100K，超出截断）</li>
+ *   <li>raw HTTP、inputMessages、reasoning、完整工具输出等大字段不进入普通 snapshot；
+ *       可懒加载的详情短期存在 Redis，过期后 safe detail API 返回 expired。</li>
  * </ul>
  *
  * <h2>并发安全</h2>
@@ -378,9 +383,11 @@ public class AgentObservabilityService {
         // 这里直接复用 traceId 跳过重复记录，避免一次 LLM 调用被算两次
         String providerTraceId = AgentContext.consumeProviderLlmTraceId();
         if (providerTraceId != null && !providerTraceId.isBlank()) {
+            AgentContext.setLastRecordedLlmTraceId(providerTraceId);
             return providerTraceId;
         }
-        Map<String, Object> sanitizedRequestSnapshot = sanitizeRequestSnapshot(requestSnapshot);
+        Map<String, Object> sanitizedRequestSnapshot = sanitizeRequestSnapshot(
+                mergeLlmCallRequestMeta(requestSnapshot));
         String responsePreview = trim(responseText, llmTraceTextLimit());
         String traceId = newTraceId();
         String stage = resolveStage(sanitizedRequestSnapshot);
@@ -438,6 +445,7 @@ public class AgentObservabilityService {
             appendLlmTrace(state.getDiagnostics(), traceId, runId, phase, stage, tokenUsage, durationMs, startedAtMillis, completedAtMillis,
                     endpointName, modelName, errorMessage, sanitizedRequestSnapshot, responsePreview, reasoning);
         });
+        AgentContext.setLastRecordedLlmTraceId(traceId);
         return traceId;
     }
 
@@ -546,7 +554,29 @@ public class AgentObservabilityService {
             RawHttpLogger.HttpResponseRecord httpResponse,
             String curlCommand) {
         return recordLlmCallWithRawHttp(runId, phase, tokenUsage, cachedTokens, durationMs, startedAtMillis, completedAtMillis,
-                endpointName, modelName, errorMessage, thinkingContent, streamingProgress, httpRequest, httpResponse, curlCommand, List.of());
+                endpointName, modelName, errorMessage, thinkingContent, streamingProgress, httpRequest, httpResponse, curlCommand, List.of(), null);
+    }
+
+    /** 同上，且显式指定 traceId（与 SSE {@code llm_call_id} 对齐）。 */
+    public String recordLlmCallWithRawHttp(
+            String runId,
+            String phase,
+            TokenUsage tokenUsage,
+            Integer cachedTokens,
+            long durationMs,
+            long startedAtMillis,
+            long completedAtMillis,
+            String endpointName,
+            String modelName,
+            String errorMessage,
+            String thinkingContent,
+            StreamingProgressTracker.StreamingProgressSnapshot streamingProgress,
+            RawHttpLogger.HttpRequestRecord httpRequest,
+            RawHttpLogger.HttpResponseRecord httpResponse,
+            String curlCommand,
+            String traceIdOverride) {
+        return recordLlmCallWithRawHttp(runId, phase, tokenUsage, cachedTokens, durationMs, startedAtMillis, completedAtMillis,
+                endpointName, modelName, errorMessage, thinkingContent, streamingProgress, httpRequest, httpResponse, curlCommand, List.of(), traceIdOverride);
     }
 
     /**
@@ -578,12 +608,40 @@ public class AgentObservabilityService {
             RawHttpLogger.HttpResponseRecord httpResponse,
             String curlCommand,
             List<Map<String, Object>> attempts) {
-        // 与 recordLlmCall 一致：若 provider 层已上报 trace，直接复用 traceId 避免重复
-        String providerTraceId = AgentContext.consumeProviderLlmTraceId();
-        if (providerTraceId != null && !providerTraceId.isBlank()) {
-            return providerTraceId;
+        return recordLlmCallWithRawHttp(runId, phase, tokenUsage, cachedTokens, durationMs, startedAtMillis, completedAtMillis,
+                endpointName, modelName, errorMessage, thinkingContent, streamingProgress, httpRequest, httpResponse, curlCommand, attempts, null);
+    }
+
+    public String recordLlmCallWithRawHttp(
+            String runId,
+            String phase,
+            TokenUsage tokenUsage,
+            Integer cachedTokens,
+            long durationMs,
+            long startedAtMillis,
+            long completedAtMillis,
+            String endpointName,
+            String modelName,
+            String errorMessage,
+            String thinkingContent,
+            StreamingProgressTracker.StreamingProgressSnapshot streamingProgress,
+            RawHttpLogger.HttpRequestRecord httpRequest,
+            RawHttpLogger.HttpResponseRecord httpResponse,
+            String curlCommand,
+            List<Map<String, Object>> attempts,
+            String traceIdOverride) {
+        final String traceId;
+        if (traceIdOverride != null && !traceIdOverride.isBlank()) {
+            traceId = traceIdOverride;
+        } else {
+            // 与 recordLlmCall 一致：若 provider 层已上报 trace，直接复用 traceId 避免重复
+            String providerTraceId = AgentContext.consumeProviderLlmTraceId();
+            if (providerTraceId != null && !providerTraceId.isBlank()) {
+                AgentContext.setLastRecordedLlmTraceId(providerTraceId);
+                return providerTraceId;
+            }
+            traceId = newTraceId();
         }
-        String traceId = newTraceId();
         String stage = resolveStage(null);
         String rawResponseBody = httpResponse == null ? null : httpResponse.getBody();
         ReasoningExtraction reasoning = extractReasoning(rawResponseBody);
@@ -682,6 +740,7 @@ public class AgentObservabilityService {
                     attempts == null ? List.of() : attempts
             );
         });
+        AgentContext.setLastRecordedLlmTraceId(traceId);
         return traceId;
     }
 
@@ -695,6 +754,53 @@ public class AgentObservabilityService {
      * @param cacheDiscount OpenRouter 缓存折扣
      * @param isByok        OpenRouter 是否 BYOK
      */
+    /**
+     * 向已有 LLM trace 补充 judge 等业务元数据，不增加 llmCalls 计数。
+     */
+    public void enrichLlmTrace(String runId,
+                               String traceId,
+                               String errorMessage,
+                               String responseText,
+                               Map<String, Object> requestFields) {
+        if (runId == null || runId.isBlank() || traceId == null || traceId.isBlank()) {
+            return;
+        }
+        mutate(runId, state -> {
+            if (state.getDiagnostics() == null || state.getDiagnostics().getLlmTraces() == null) {
+                return;
+            }
+            for (LlmTrace trace : state.getDiagnostics().getLlmTraces()) {
+                if (!traceId.equals(trace.getTraceId())) {
+                    continue;
+                }
+                if (errorMessage != null && !errorMessage.isBlank()) {
+                    trace.setHasError(true);
+                    trace.setError(trim(errorMessage, 1000));
+                }
+                if (responseText != null && !responseText.isBlank()) {
+                    String preview = trim(responseText, llmTraceTextLimit());
+                    trace.setOutputText(preview);
+                    trace.setResponsePreview(preview);
+                }
+                if (requestFields != null && !requestFields.isEmpty()) {
+                    Map<String, Object> request = trace.getInputMessages();
+                    if (request == null) {
+                        request = trace.getRequest();
+                    }
+                    if (request == null) {
+                        request = new LinkedHashMap<>();
+                    } else {
+                        request = new LinkedHashMap<>(request);
+                    }
+                    request.putAll(requestFields);
+                    trace.setInputMessages(request);
+                    trace.setRequest(request);
+                }
+                break;
+            }
+        });
+    }
+
     public void enrichLlmCallSpending(String runId,
                                       String traceId,
                                       Double actualCost,
@@ -1059,7 +1165,7 @@ public class AgentObservabilityService {
      * <p>这是 run 终态（COMPLETED/FAILED/CANCELED）写回 DB 前的最后一步：</p>
      * <ol>
      *   <li>mutate：更新 summary.status 和 completedAtMillis（终态时）。</li>
-     *   <li>把 observability 序列化后塞入 snapshot Map 的 {@code observability} 字段。</li>
+     *   <li>把 observability 转成 Map 后先 scrub，移除 raw 大字段，只留下 summary / trace index。</li>
      *   <li>同步保存观测 JSON 到 Redis，避免后续查询从 snapshot 字段慢解析。</li>
      *   <li>若 run 已进入终态，移除 per-runId 锁以释放内存。</li>
      * </ol>
@@ -1085,13 +1191,14 @@ public class AgentObservabilityService {
                 current.getSummary().setStatus(status.name());
             }
             // 终态时锁定 completedAtMillis，后续 touch 不会再覆盖 totalDurationMs
-            if (status == AgentRunStatus.COMPLETED || status == AgentRunStatus.FAILED || status == AgentRunStatus.CANCELED) {
+            if (status == AgentRunStatus.COMPLETED || status == AgentRunStatus.PARTIAL || status == AgentRunStatus.FAILED || status == AgentRunStatus.CANCELED) {
                 current.getSummary().setCompletedAtMillis(System.currentTimeMillis());
             }
         });
         Map<String, Object> snapshot = parseJsonObject(snapshotJson);
         Map<String, Object> observabilityMap = objectMapper.convertValue(state, new TypeReference<Map<String, Object>>() {
         });
+        AgentCallDetailPersistence.scrubObservabilityMap(observabilityMap);
         snapshot.put("observability", observabilityMap);
         String output = safeWrite(snapshot);
 
@@ -1106,7 +1213,7 @@ public class AgentObservabilityService {
                 output.length(), observabilityJson.length());
 
         // 终态后清理 per-runId 锁，避免长期占用内存
-        if (status == AgentRunStatus.COMPLETED || status == AgentRunStatus.FAILED || status == AgentRunStatus.CANCELED) {
+        if (status == AgentRunStatus.COMPLETED || status == AgentRunStatus.PARTIAL || status == AgentRunStatus.FAILED || status == AgentRunStatus.CANCELED) {
             locks.remove(runId);
         }
         return output;
@@ -1549,6 +1656,15 @@ public class AgentObservabilityService {
         return UUID.randomUUID().toString().replace("-", "");
     }
 
+    /** Tool trace id 优先与 SSE / safe detail API 的 {@code tool_call_id} 对齐。 */
+    private String resolveToolTraceId() {
+        String toolCallId = nvl(AgentContext.getToolCallId()).trim();
+        if (!toolCallId.isBlank()) {
+            return toolCallId;
+        }
+        return newTraceId();
+    }
+
     /**
      * 向 diagnostics.llmTraces 追加一条不含原始 HTTP 的 LlmTrace。
      *
@@ -1605,6 +1721,7 @@ public class AgentObservabilityService {
             trace.setOutputTokens(tokenUsage.outputTokenCount() != null ? tokenUsage.outputTokenCount().longValue() : null);
             trace.setTotalTokens(tokenUsage.totalTokenCount() != null ? tokenUsage.totalTokenCount().longValue() : null);
         }
+        finalizeLlmTraceForPersistence(runId, trace);
         traces.add(trace);
         int limit = llmTraceCallLimit();
         while (traces.size() > limit) {
@@ -1763,12 +1880,54 @@ public class AgentObservabilityService {
         trace.setTodoId(nvl(AgentContext.getTodoId()));
         trace.setTodoSequence(AgentContext.getTodoSequence());
 
+        finalizeLlmTraceForPersistence(runId, trace);
         traces.add(trace);
 
         int limit = llmTraceCallLimit();
         while (traces.size() > limit) {
             traces.remove(0);
         }
+    }
+
+    private void finalizeLlmTraceForPersistence(String runId, LlmTrace trace) {
+        if (trace == null || runId == null || runId.isBlank()) {
+            return;
+        }
+        // Step 2 存储治理：先尝试把可懒加载的大字段写入 Redis detail blob；
+        // 只有写入成功才在 trace index 上标 detailBlobStored=true。否则保留 available summary，
+        // 避免 Redis 写失败被前端误判为 expired。
+        boolean detailBlobStored = false;
+        Map<String, Object> blob = AgentCallDetailPersistence.toLlmDetailBlob(trace);
+        if (AgentCallDetailPersistence.hasPersistableDetailBlob(blob)) {
+            try {
+                stateStore.saveLlmCallDetail(runId, trace.getTraceId(), safeWrite(blob));
+                detailBlobStored = true;
+            } catch (Exception e) {
+                log.debug("Failed to persist LLM call detail blob: runId={}, traceId={}, error={}",
+                        runId, trace.getTraceId(), e.getMessage());
+            }
+        }
+        AgentCallDetailPersistence.scrubLlmTrace(trace, detailBlobStored);
+    }
+
+    private void finalizeToolTraceForPersistence(String runId, ToolTrace trace) {
+        if (trace == null || runId == null || runId.isBlank()) {
+            return;
+        }
+        // 工具输出可能远大于 SSE preview。这里同样先写 Redis detail blob，再 scrub trace；
+        // 普通用户 safe detail API 只会返回白名单摘要，不会把 raw params/output 直接吐给前端。
+        boolean detailBlobStored = false;
+        Map<String, Object> blob = AgentCallDetailPersistence.toToolDetailBlob(trace);
+        if (AgentCallDetailPersistence.hasPersistableDetailBlob(blob)) {
+            try {
+                stateStore.saveToolCallDetail(runId, trace.getTraceId(), safeWrite(blob));
+                detailBlobStored = true;
+            } catch (Exception e) {
+                log.debug("Failed to persist tool call detail blob: runId={}, traceId={}, error={}",
+                        runId, trace.getTraceId(), e.getMessage());
+            }
+        }
+        AgentCallDetailPersistence.scrubToolTrace(trace, detailBlobStored);
     }
 
     private String extractOpenRouterGenerationId(String rawResponseBody) {
@@ -1813,7 +1972,7 @@ public class AgentObservabilityService {
             diagnostics.setToolTraces(new ArrayList<>());
         }
         ToolTrace trace = new ToolTrace();
-        trace.setTraceId(newTraceId());
+        trace.setTraceId(resolveToolTraceId());
         trace.setTime(OffsetDateTime.now().toString());
         trace.setRunId(nvl(runId));
         trace.setPhase(normalizePhase(phase));
@@ -1837,6 +1996,7 @@ public class AgentObservabilityService {
         trace.setDecisionLlmTraceId(nvl(AgentContext.getDecisionTraceId()));
         trace.setDecisionStage(nvl(AgentContext.getDecisionStage()));
         trace.setDecisionExcerpt(trim(AgentContext.getDecisionExcerpt(), 1000));
+        finalizeToolTraceForPersistence(runId, trace);
         diagnostics.getToolTraces().add(trace);
     }
     
@@ -1859,6 +2019,18 @@ public class AgentObservabilityService {
      * <p>优先级：AgentContext.stage &gt; requestSnapshot.meta.stage &gt; requestSnapshot.stage &gt; ""。
      * stage 通常表示 planning / execution / final_answer 等大阶段。</p>
      */
+    private Map<String, Object> mergeLlmCallRequestMeta(Map<String, Object> requestSnapshot) {
+        Map<String, Object> pendingMeta = AgentContext.consumeLlmCallRequestMeta();
+        if (pendingMeta == null || pendingMeta.isEmpty()) {
+            return requestSnapshot;
+        }
+        Map<String, Object> merged = requestSnapshot == null || requestSnapshot.isEmpty()
+                ? new LinkedHashMap<>()
+                : new LinkedHashMap<>(requestSnapshot);
+        merged.putAll(pendingMeta);
+        return merged;
+    }
+
     private String resolveStage(Map<String, Object> requestSnapshot) {
         String current = nvl(AgentContext.getStage()).trim();
         if (!current.isBlank()) {
@@ -2368,6 +2540,9 @@ public class AgentObservabilityService {
         @Deprecated
         private String responsePreview;
 
+        /** Step 2: large fields moved to Redis detail blob; missing blob => expired for detail API. */
+        private boolean detailBlobStored;
+
         /**
          * 流式生成进度快照（写入 trace 用），与 Diagnostics.StreamingProgressStatus
          * 字段大体一致，区别是这里没有 phase/endpoint/model/completed/updatedAt。
@@ -2432,6 +2607,10 @@ public class AgentObservabilityService {
         private long estimatedSavedDurationMs;
         /** 工具输出（长度受配置 agent.observability.tool-trace.max-output-chars 控制） */
         private String output;
+        /** 截断后的输出预览（observability index；完整 output 在 detail blob） */
+        private String outputPreview;
+        /** Step 2: detail blob written to Redis for this trace. */
+        private boolean detailBlobStored;
         /** 错误信息（失败时） */
         private String error;
         /** 触发本次工具调用的 LLM 决策 traceId（便于追溯） */
@@ -2442,19 +2621,21 @@ public class AgentObservabilityService {
         private String decisionExcerpt;
 
         /**
-         * @deprecated 使用 {@link #output} 替代
-         * 保留用于向后兼容（JSON 反序列化）
+         * @deprecated 使用 {@link #outputPreview} 字段；保留用于旧 JSON 与 scrub 写入路径。
          */
         @Deprecated
         public void setOutputPreview(String value) {
-            this.output = value;
+            this.outputPreview = value;
         }
 
         /**
-         * @deprecated 使用 {@link #getOutput()} 替代
+         * @deprecated 优先返回 {@link #outputPreview}；无预览时回退 {@link #output}（旧 trace）。
          */
         @Deprecated
         public String getOutputPreview() {
+            if (outputPreview != null && !outputPreview.isBlank()) {
+                return outputPreview;
+            }
             return this.output;
         }
     }

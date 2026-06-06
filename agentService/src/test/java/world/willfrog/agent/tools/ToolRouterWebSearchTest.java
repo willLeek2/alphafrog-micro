@@ -153,4 +153,51 @@ class ToolRouterWebSearchTest {
                 anyBoolean(), anyBoolean(), anyBoolean(), anyString(), anyString(), anyLong(), anyLong(), anyString()
         );
     }
+
+    @SuppressWarnings("unchecked")
+    @Test
+    void invoke_shouldRouteTradingCalendarToolsWithAliasesAndDefaultExchange() {
+        MarketDataTools marketDataTools = mock(MarketDataTools.class);
+        when(marketDataTools.getTradingDaysSummary(anyString(), anyString(), anyString()))
+                .thenReturn("{\"ok\":true,\"tool\":\"getTradingDaysSummary\",\"data\":{\"trading_days_count\":3},\"error\":null}");
+        when(marketDataTools.isTradingDay(anyString(), anyString()))
+                .thenReturn("{\"ok\":true,\"tool\":\"isTradingDay\",\"data\":{\"is_trading_day\":true},\"error\":null}");
+        ToolResultCacheService cacheService = mock(ToolResultCacheService.class);
+        when(cacheService.executeWithCache(anyString(), any(), anyString(), any())).thenAnswer(inv -> {
+            Supplier<ToolResultCacheService.ToolExecutionOutcome> supplier = inv.getArgument(3);
+            ToolResultCacheService.ToolExecutionOutcome outcome = supplier.get();
+            return ToolResultCacheService.CachedToolCallResult.builder()
+                    .result(outcome.getResult())
+                    .durationMs(outcome.getDurationMs())
+                    .success(outcome.isSuccess())
+                    .build();
+        });
+
+        ToolRouter router = new ToolRouter(
+                marketDataTools,
+                mock(RagTools.class),
+                mock(SearchTools.class),
+                mock(PythonSandboxTools.class),
+                new PythonStaticPrecheckService(),
+                new AgentLlmProperties(),
+                cacheService,
+                mock(AgentObservabilityService.class),
+                new ObjectMapper(),
+                new SimpleMeterRegistry(),
+                new StressTestProperties()
+        );
+
+        ToolRouter.ToolInvocationResult summary = router.invokeWithMeta("getTradingDaysSummary", Map.of(
+                "start_date", "20240101",
+                "end_date", "20240105"
+        ));
+        ToolRouter.ToolInvocationResult status = router.invokeWithMeta("isTradingDay", Map.of(
+                "dates", "20240102|20240103"
+        ));
+
+        assertTrue(summary.isSuccess());
+        assertTrue(status.isSuccess());
+        verify(marketDataTools).getTradingDaysSummary(eq("20240101"), eq("20240105"), eq("SSE"));
+        verify(marketDataTools).isTradingDay(eq("20240102|20240103"), eq("SSE"));
+    }
 }

@@ -7,6 +7,7 @@ import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.model.openrouter.GenerationResponse;
 
+import java.net.ProxySelector;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -36,6 +37,7 @@ import java.util.Set;
 public class OpenRouterCostService {
 
     private static final HttpClient HTTP_CLIENT = HttpClient.newBuilder()
+            .proxy(ProxySelector.getDefault())
             .connectTimeout(Duration.ofSeconds(10))
             .build();
 

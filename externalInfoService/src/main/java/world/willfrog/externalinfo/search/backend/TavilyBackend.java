@@ -4,6 +4,9 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
+import world.willfrog.externalinfo.search.http.SearchBackendRetry;
+import world.willfrog.externalinfo.search.http.SearchBackendRetry.RetryResult;
+import world.willfrog.externalinfo.search.http.SearchHttpClientFactory;
 import world.willfrog.externalinfo.search.SearchLlmConfigResolver;
 import world.willfrog.externalinfo.search.WebSearchExecutionContext;
 import world.willfrog.externalinfo.search.profile.GlobalUserProfileInjector;
@@ -44,13 +47,19 @@ public class TavilyBackend implements SearchBackend {
     private final ObjectMapper objectMapper;
     private final GlobalUserProfileInjector globalUserProfileInjector;
     private final ProfileContext profileContext;
+    private final SearchHttpClientFactory httpClientFactory;
+    private final SearchBackendRetry retry;
 
     public TavilyBackend(ObjectMapper objectMapper,
                           GlobalUserProfileInjector globalUserProfileInjector,
-                          ProfileContext profileContext) {
+                          ProfileContext profileContext,
+                          SearchHttpClientFactory httpClientFactory,
+                          SearchBackendRetry retry) {
         this.objectMapper = objectMapper;
         this.globalUserProfileInjector = globalUserProfileInjector;
         this.profileContext = profileContext;
+        this.httpClientFactory = httpClientFactory;
+        this.retry = retry;
     }
 
     @Override
@@ -97,18 +106,27 @@ public class TavilyBackend implements SearchBackend {
             applyAuthHeader(config, requestBuilder);
             applyExtraHeaders(config, requestBuilder);
 
-            HttpClient client = HttpClient.newBuilder()
-                    .connectTimeout(Duration.ofSeconds(resolveConnectTimeout(config)))
-                    .build();
-            HttpResponse<String> response = client.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString());
+            HttpClient client = httpClientFactory.newClient(
+                    Duration.ofSeconds(resolveConnectTimeout(config)));
+            RetryResult result = retry.sendWithRetry(client, requestBuilder.build(), name());
 
-            if (response.statusCode() >= 300) {
-                log.error("Tavily 返回状态码 {}，响应体: {}", response.statusCode(), response.body());
-                return BackendSearchResult.error(name(), "HTTP_" + response.statusCode(),
-                        "Tavily 请求失败，状态码: " + response.statusCode());
+            if (!result.ok()) {
+                if (result.isHttpFailure()) {
+                    log.error("Tavily 返回状态码 {}，响应体: {}",
+                            result.response().statusCode(), result.response().body());
+                    return BackendSearchResult.error(name(), "HTTP_" + result.response().statusCode(),
+                            "Tavily 请求失败，状态码: " + result.response().statusCode(),
+                            result.attempts());
+                }
+                log.error("Tavily 搜索请求异常 (attempts={})", result.attempts(), result.error());
+                return BackendSearchResult.error(name(), "REQUEST_EXCEPTION",
+                        result.error() == null ? "未知异常" : result.error().getMessage(),
+                        result.attempts());
             }
 
-            return parseResponse(response.body(), strength, rawQuery, System.currentTimeMillis() - startMs);
+            HttpResponse<String> response = result.response();
+            return parseResponse(response.body(), strength, rawQuery,
+                    System.currentTimeMillis() - startMs, result.attempts());
         } catch (Exception e) {
             log.error("Tavily 搜索请求异常", e);
             return BackendSearchResult.error(name(), "REQUEST_EXCEPTION", e.getMessage());
@@ -246,7 +264,7 @@ public class TavilyBackend implements SearchBackend {
     }
 
     private BackendSearchResult parseResponse(String responseBody, String strength,
-                                               String rawQuery, long costMs) {
+                                               String rawQuery, long costMs, int retryCount) {
         try {
             JsonNode root = objectMapper.readTree(responseBody);
             String answer = root.path("answer").asText("");
@@ -274,10 +292,10 @@ public class TavilyBackend implements SearchBackend {
             }
 
             BackendMeta meta = new BackendMeta(name(), resolveSearchDepth(strength), (int) costMs, rawQuery);
-            return new BackendSearchResult(hits, answer, citations, meta, true, null, null);
+            return new BackendSearchResult(hits, answer, citations, meta, true, null, null, retryCount);
         } catch (Exception e) {
             log.error("Tavily 响应解析失败", e);
-            return BackendSearchResult.error(name(), "PARSE_ERROR", "响应解析失败: " + e.getMessage());
+            return BackendSearchResult.error(name(), "PARSE_ERROR", "响应解析失败: " + e.getMessage(), retryCount);
         }
     }
 

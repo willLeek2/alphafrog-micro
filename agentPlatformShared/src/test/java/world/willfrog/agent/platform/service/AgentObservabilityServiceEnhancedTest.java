@@ -20,7 +20,11 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import static world.willfrog.agent.platform.service.AgentCallDetailPersistence.OBSERVABILITY_PREVIEW_MAX_CHARS;
+
+import org.mockito.ArgumentCaptor;
 
 /**
  * 可观测性增强测试：验证 5.2~5.5 的核心改动。
@@ -68,7 +72,7 @@ class AgentObservabilityServiceEnhancedTest {
     // ==================== 5.2 LLM inputMessages / outputText ====================
 
     @Test
-    void recordLlmCall_shouldPopulateInputMessagesAndOutputText() throws Exception {
+    void recordLlmCall_shouldScrubRawFieldsAndPersistDetailBlob() throws Exception {
         String runId = "test-input-msg-1";
         setupStateStore(runId);
 
@@ -88,11 +92,18 @@ class AgentObservabilityServiceEnhancedTest {
                 objectMapper.readValue(savedJson.get(), AgentObservabilityService.ObservabilityState.class);
         AgentObservabilityService.LlmTrace trace = state.getDiagnostics().getLlmTraces().get(0);
 
-        assertNotNull(trace.getInputMessages(), "inputMessages should be populated");
-        assertEquals(responseText, trace.getOutputText(), "outputText should match response text");
-        // backward compat
-        assertNotNull(trace.getRequest(), "deprecated request field should still be set");
-        assertEquals(responseText, trace.getResponsePreview(), "deprecated responsePreview should still be set");
+        assertNull(trace.getInputMessages(), "raw inputMessages must not remain in observability trace");
+        assertNull(trace.getOutputText(), "raw outputText must not remain in observability trace");
+        assertNull(trace.getRequest(), "deprecated request field is scrubbed from snapshot");
+        assertEquals(responseText, trace.getResponsePreview(), "safe preview kept on trace index");
+        assertTrue(trace.isDetailBlobStored(), "detail blob should be stored when persist succeeds");
+
+        ArgumentCaptor<String> blobCaptor = ArgumentCaptor.forClass(String.class);
+        verify(stateStore).saveLlmCallDetail(eq(runId), eq(trace.getTraceId()), blobCaptor.capture());
+        @SuppressWarnings("unchecked")
+        Map<String, Object> blob = objectMapper.readValue(blobCaptor.getValue(), Map.class);
+        assertNotNull(blob.get("inputMessages"), "full input belongs in Redis detail blob");
+        assertEquals(responseText, blob.get("outputText"));
     }
 
     @Test
@@ -154,7 +165,7 @@ class AgentObservabilityServiceEnhancedTest {
     }
 
     @Test
-    void recordLlmCallWithRawHttp_shouldParseInputMessagesFromHttpBody() throws Exception {
+    void recordLlmCallWithRawHttp_shouldParseInputMessagesIntoDetailBlobNotTrace() throws Exception {
         String runId = "test-raw-http-input";
         setupStateStore(runId);
 
@@ -183,9 +194,21 @@ class AgentObservabilityServiceEnhancedTest {
                 objectMapper.readValue(savedJson.get(), AgentObservabilityService.ObservabilityState.class);
         AgentObservabilityService.LlmTrace trace = state.getDiagnostics().getLlmTraces().get(0);
 
-        assertNotNull(trace.getInputMessages(), "inputMessages should be parsed from HTTP body");
-        assertTrue(trace.getInputMessages().containsKey("messages"), "inputMessages should contain messages key");
-        assertNotNull(trace.getOutputText(), "outputText should be set from HTTP response");
+        assertNull(trace.getInputMessages(), "parsed inputMessages must not remain on trace");
+        assertNull(trace.getOutputText(), "parsed outputText must not remain on trace");
+        assertNull(trace.getHttpRequest(), "raw httpRequest must not remain on trace");
+        assertTrue(trace.isDetailBlobStored());
+
+        ArgumentCaptor<String> blobCaptor = ArgumentCaptor.forClass(String.class);
+        verify(stateStore).saveLlmCallDetail(eq(runId), eq(trace.getTraceId()), blobCaptor.capture());
+        @SuppressWarnings("unchecked")
+        Map<String, Object> blob = objectMapper.readValue(blobCaptor.getValue(), Map.class);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> inputMessages = (Map<String, Object>) blob.get("inputMessages");
+        assertNotNull(inputMessages, "HTTP body should be parsed into detail blob");
+        assertTrue(inputMessages.containsKey("messages"));
+        assertNotNull(blob.get("outputText"));
+        assertNotNull(blob.get("httpRequest"));
     }
 
     // ==================== 5.3 DAG 节点 ID 写入 LlmTrace ====================
@@ -237,6 +260,22 @@ class AgentObservabilityServiceEnhancedTest {
     // ==================== 5.4 工具输出使用独立配置限制 ====================
 
     @Test
+    void recordToolCall_shouldUseAgentContextToolCallIdAsTraceId() throws Exception {
+        String runId = "test-tool-call-id-1";
+        setupStateStore(runId);
+        AgentContext.setToolCallId("functions.searchWeb:0");
+
+        service.recordToolCall(runId, "tool_execution", "searchWeb",
+                Map.of("query", "512800"), "{\"ok\":true}",
+                50L, true, false, false, null, null, 0, 0, null);
+
+        AgentObservabilityService.ObservabilityState state =
+                objectMapper.readValue(savedJson.get(), AgentObservabilityService.ObservabilityState.class);
+        assertEquals("functions.searchWeb:0", state.getDiagnostics().getToolTraces().get(0).getTraceId());
+        AgentContext.clearToolCallId();
+    }
+
+    @Test
     void recordToolCall_shouldUseToolTraceOutputLimit() throws Exception {
         String runId = "test-tool-output-1";
         setupStateStore(runId);
@@ -254,15 +293,25 @@ class AgentObservabilityServiceEnhancedTest {
                 objectMapper.readValue(savedJson.get(), AgentObservabilityService.ObservabilityState.class);
         AgentObservabilityService.ToolTrace trace = state.getDiagnostics().getToolTraces().get(0);
 
-        // Should be truncated at 50 chars + "[truncated]" suffix
-        assertNotNull(trace.getOutput(), "output field should be set");
-        assertTrue(trace.getOutput().length() < longOutput.length(),
-                "output should be truncated by tool-trace-specific limit");
-        assertTrue(trace.getOutput().contains("[truncated]"), "should contain truncation marker");
+        assertNull(trace.getOutput(), "full output must not remain on observability trace");
+        assertNotNull(trace.getOutputPreview(), "safe preview kept on trace index");
+        assertTrue(trace.getOutputPreview().length() < longOutput.length(),
+                "preview should be truncated by tool-trace-specific limit");
+        assertTrue(trace.getOutputPreview().contains("[truncated]"), "preview should contain truncation marker");
+        assertTrue(trace.getOutputPreview().length() <= OBSERVABILITY_PREVIEW_MAX_CHARS + 20);
+        assertTrue(trace.isDetailBlobStored());
+
+        ArgumentCaptor<String> blobCaptor = ArgumentCaptor.forClass(String.class);
+        verify(stateStore).saveToolCallDetail(eq(runId), eq(trace.getTraceId()), blobCaptor.capture());
+        @SuppressWarnings("unchecked")
+        Map<String, Object> blob = objectMapper.readValue(blobCaptor.getValue(), Map.class);
+        String blobOutput = String.valueOf(blob.get("output"));
+        assertTrue(blobOutput.length() < longOutput.length());
+        assertTrue(blobOutput.contains("[truncated]"));
     }
 
     @Test
-    void recordToolCall_shouldNotTruncateShortOutput() throws Exception {
+    void recordToolCall_shouldKeepShortOutputInDetailBlobNotTrace() throws Exception {
         String runId = "test-tool-output-2";
         setupStateStore(runId);
 
@@ -276,17 +325,25 @@ class AgentObservabilityServiceEnhancedTest {
                 objectMapper.readValue(savedJson.get(), AgentObservabilityService.ObservabilityState.class);
         AgentObservabilityService.ToolTrace trace = state.getDiagnostics().getToolTraces().get(0);
 
-        assertEquals(shortOutput, trace.getOutput(), "short output should not be truncated");
+        assertNull(trace.getOutput(), "full output must not remain on observability trace");
+        assertEquals(shortOutput, trace.getOutputPreview(), "short output preview kept on trace index");
+        assertTrue(trace.isDetailBlobStored());
+
+        ArgumentCaptor<String> blobCaptor = ArgumentCaptor.forClass(String.class);
+        verify(stateStore).saveToolCallDetail(eq(runId), eq(trace.getTraceId()), blobCaptor.capture());
+        @SuppressWarnings("unchecked")
+        Map<String, Object> blob = objectMapper.readValue(blobCaptor.getValue(), Map.class);
+        assertEquals(shortOutput, blob.get("output"));
     }
 
     // ==================== ToolTrace backward compat ====================
 
     @Test
-    void toolTrace_setOutputPreview_shouldSetOutput() {
+    void toolTrace_setOutputPreview_shouldSetPreviewFieldNotOutput() {
         AgentObservabilityService.ToolTrace trace = new AgentObservabilityService.ToolTrace();
         trace.setOutputPreview("test value");
-        assertEquals("test value", trace.getOutput());
         assertEquals("test value", trace.getOutputPreview());
+        assertNull(trace.getOutput());
     }
 
     // ==================== LlmTrace without TodoContext ====================

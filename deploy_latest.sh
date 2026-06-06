@@ -17,6 +17,11 @@ PYTHON_SERVICES=(
   python-sandbox-service
 )
 
+# Python沙箱运行时镜像（build-only，不是 compose service）
+PYTHON_RUNTIME_IMAGES=(
+  python-sandbox-runtime
+)
+
 # 业务服务（经常重建）
 BUSINESS_SERVICES=(
   domestic-stock-service
@@ -27,15 +32,15 @@ BUSINESS_SERVICES=(
   admin-service
   portfolio-service
   agent-service
+  agent-langchain-service
   external-info-service
   python-sandbox-gateway-service
   frontend
 )
 
-# 所有服务（含 opt-in；默认全量 deploy 仍只用 BUSINESS_SERVICES）
+# 所有 Java 业务服务
 ALL_SERVICES=(
   "${BUSINESS_SERVICES[@]}"
-  agent-langchain-service
 )
 
 usage() {
@@ -45,7 +50,8 @@ Usage:
   ./deploy_latest.sh serviceA serviceB
   ./deploy_latest.sh --services serviceA,serviceB
   ./deploy_latest.sh --with-infra     # rebuild with infrastructure services
-  ./deploy_latest.sh --all            # rebuild all including python services
+  ./deploy_latest.sh --all            # rebuild all including python runtime/services
+  ./deploy_latest.sh python-sandbox-runtime python-sandbox-service
   ./deploy_latest.sh --skip-maven     # skip Maven, still run docker_build.sh, then recreate containers
   ./deploy_latest.sh --deploy-only    # skip Maven and docker_build.sh, only recreate containers
 
@@ -59,13 +65,16 @@ Services:
   admin-service
   portfolio-service
   agent-service
-  agent-langchain-service   # opt-in only (in ALL_SERVICES, not BUSINESS_SERVICES)
+  agent-langchain-service
   external-info-service
   python-sandbox-gateway-service
   frontend
 
   # Infrastructure (use --with-infra to include)
   redis, rabbitmq, nacos, meilisearch
+
+  # Python Runtime Images (build-only)
+  python-sandbox-runtime
 
   # Python Services (use --all to include)
   python-sandbox-service
@@ -85,6 +94,7 @@ service_build_script() {
     agent-langchain-service) echo "agentLangchainService/docker_build.sh" ;;
     external-info-service) echo "externalInfoService/docker_build.sh" ;;
     python-sandbox-service) echo "pythonSandboxService/docker_build.sh" ;;
+    python-sandbox-runtime) echo "pythonSandboxService/docker_build.sh" ;;
     python-sandbox-gateway-service) echo "pythonSandboxGatewayService/docker_build.sh" ;;
     frontend) echo "frontend/docker_build.sh" ;;
     *) return 1 ;;
@@ -119,6 +129,24 @@ is_in_list() {
     fi
   done
   return 1
+}
+
+service_build_args() {
+  case "$1" in
+    python-sandbox-runtime) echo "runtime" ;;
+    python-sandbox-service)
+      if is_in_list "python-sandbox-runtime" "${SELECTED[@]}"; then
+        echo "service"
+      else
+        echo "all"
+      fi
+      ;;
+    *) echo "" ;;
+  esac
+}
+
+service_has_compose_container() {
+  [[ "$1" != "python-sandbox-runtime" ]] && service_build_script "$1" >/dev/null 2>&1
 }
 
 service_known() {
@@ -195,31 +223,33 @@ SELECTED=()
 if [[ ${#SERVICES[@]} -eq 0 ]]; then
   # 未指定服务，使用默认列表
   if [[ "$WITH_ALL" == true ]]; then
-    SELECTED=("${PYTHON_SERVICES[@]}" "${BUSINESS_SERVICES[@]}")
+    SELECTED=("${PYTHON_RUNTIME_IMAGES[@]}" "${PYTHON_SERVICES[@]}" "${ALL_SERVICES[@]}")
   else
     SELECTED=("${BUSINESS_SERVICES[@]}")
   fi
 else
   # 指定了具体服务
-  declare -A seen=()
+  SEEN_SERVICES=()
   for svc in "${SERVICES[@]}"; do
     if ! service_known "$svc"; then
       echo "Unknown service: $svc" >&2
       usage
       exit 1
     fi
-    seen["$svc"]=1
+    if [[ ${#SEEN_SERVICES[@]} -eq 0 ]] || ! is_in_list "$svc" "${SEEN_SERVICES[@]}"; then
+      SEEN_SERVICES+=("$svc")
+    fi
   done
   
   # 按 ALL_SERVICES 顺序输出
   for svc in "${ALL_SERVICES[@]}"; do
-    if [[ -n "${seen[$svc]:-}" ]]; then
+    if [[ ${#SEEN_SERVICES[@]} -gt 0 ]] && is_in_list "$svc" "${SEEN_SERVICES[@]}"; then
       SELECTED+=("$svc")
     fi
   done
-  # 检查是否包含基础设施服务
-  for svc in "${INFRA_SERVICES[@]}" "${PYTHON_SERVICES[@]}"; do
-    if [[ -n "${seen[$svc]:-}" ]]; then
+  # 检查是否包含基础设施服务、Python runtime 镜像、Python 服务
+  for svc in "${INFRA_SERVICES[@]}" "${PYTHON_RUNTIME_IMAGES[@]}" "${PYTHON_SERVICES[@]}"; do
+    if [[ ${#SEEN_SERVICES[@]} -gt 0 ]] && is_in_list "$svc" "${SEEN_SERVICES[@]}"; then
       SELECTED+=("$svc")
     fi
   done
@@ -261,7 +291,12 @@ if [[ "$DEPLOY_ONLY" != true ]]; then
     build_script="$(service_build_script "$svc" 2>/dev/null || true)"
     if [[ -n "$build_script" ]]; then
       echo "Building: $svc"
-      bash "$build_script"
+      build_args="$(service_build_args "$svc")"
+      if [[ -n "$build_args" ]]; then
+        bash "$build_script" "$build_args"
+      else
+        bash "$build_script"
+      fi
     fi
   done
 else
@@ -280,6 +315,30 @@ else
   exit 1
 fi
 
+wait_for_compose_service() {
+  local svc="$1"
+  local timeout_seconds="${2:-180}"
+  local deadline=$((SECONDS + timeout_seconds))
+  local cid status running
+
+  while (( SECONDS < deadline )); do
+    cid="$($DOCKER_COMPOSE ps -q "$svc" 2>/dev/null || true)"
+    if [[ -n "$cid" ]]; then
+      status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$cid" 2>/dev/null || true)"
+      running="$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null || true)"
+      if [[ "$status" == "healthy" ]] || [[ "$status" == "running" && "$running" == "true" ]]; then
+        echo "Service $svc is ready ($status)"
+        return 0
+      fi
+    fi
+    sleep 2
+  done
+
+  echo "Service $svc did not become ready within ${timeout_seconds}s" >&2
+  $DOCKER_COMPOSE ps "$svc" >&2 || true
+  return 1
+}
+
 # 步骤1: 启动基础设施服务
 # 如果使用了 --with-infra 或指定了基础设施服务，则重建它们
 if [[ "$WITH_INFRA" == true ]] || [[ "$WITH_ALL" == true ]]; then
@@ -289,13 +348,17 @@ else
   echo "=== Ensuring infrastructure services are running ==="
   $DOCKER_COMPOSE up -d --no-recreate "${INFRA_SERVICES[@]}" 2>/dev/null || true
 fi
+echo "=== Waiting for infrastructure services to become healthy ==="
+for svc in "${INFRA_SERVICES[@]}"; do
+  wait_for_compose_service "$svc"
+done
 
 # 步骤2: 启动选定的业务服务（重建）
 # 先过滤出需要重建的业务服务（排除基础设施）
 BUSINESS_TO_RECREATE=()
 for svc in "${SELECTED[@]}"; do
-  # 检查是否是业务服务（有build脚本且在BUSINESS_SERVICES或PYTHON_SERVICES中）
-  if service_build_script "$svc" >/dev/null 2>&1; then
+  # 检查是否是 compose 服务；python-sandbox-runtime 只是 build-only 镜像
+  if service_has_compose_container "$svc"; then
     BUSINESS_TO_RECREATE+=("$svc")
   fi
 done

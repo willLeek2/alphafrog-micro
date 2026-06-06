@@ -8,8 +8,11 @@ import org.springframework.data.redis.connection.RedisStandaloneConfiguration;
 import org.springframework.data.redis.connection.lettuce.LettuceConnectionFactory;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.listener.RedisMessageListenerContainer;
 import org.springframework.data.redis.serializer.GenericJackson2JsonRedisSerializer;
 import org.springframework.data.redis.serializer.StringRedisSerializer;
+
+import java.util.concurrent.Executors;
 
 @Configuration
 public class RedisConfig {
@@ -51,5 +54,18 @@ public class RedisConfig {
         StringRedisTemplate template = new StringRedisTemplate();
         template.setConnectionFactory(factory);
         return template;
+    }
+
+    @Bean
+    public RedisMessageListenerContainer redisMessageListenerContainer(RedisConnectionFactory factory) {
+        RedisMessageListenerContainer container = new RedisMessageListenerContainer();
+        container.setConnectionFactory(factory);
+        // 单线程处理 SUBSCRIBE/UNSUBSCRIBE，降低并发 SSE 重连时对订阅连接的竞态
+        container.setSubscriptionExecutor(Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "redis-subscription");
+            t.setDaemon(true);
+            return t;
+        }));
+        return container;
     }
 }

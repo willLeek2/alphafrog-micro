@@ -24,7 +24,8 @@ class AgentAiServiceFactoryMaxTokensTest {
                 "moonshotai/kimi-k2.6",
                 "",
                 null,
-                List.of()
+                List.of(),
+                null
         );
 
         ChatModel model = factory.buildChatModelWithProviderOrder(resolved, List.of(), 20000);
@@ -34,7 +35,26 @@ class AgentAiServiceFactoryMaxTokensTest {
     }
 
     @Test
-    void buildChatModelWithProviderOrder_shouldFallbackToGlobalDefaultWhenOverrideMissing() {
+    void buildChatModelWithProviderOrder_shouldUseModelMaxTokensWhenNoOverride() {
+        AgentAiServiceFactory factory = newFactory();
+        AgentLlmResolver.ResolvedLlm resolved = new AgentLlmResolver.ResolvedLlm(
+                "dashscope-cn",
+                "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                "qwen3.6-flash",
+                "",
+                null,
+                List.of(),
+                40000
+        );
+
+        ChatModel model = factory.buildChatModelWithProviderOrder(resolved, List.of());
+
+        assertInstanceOf(DashScopeChatModel.class, model);
+        assertEquals(40000, ReflectionTestUtils.getField(model, "maxTokens"));
+    }
+
+    @Test
+    void buildChatModelWithProviderOrder_shouldFallbackToGlobalDefaultWhenModelMaxTokensMissing() {
         AgentAiServiceFactory factory = newFactory();
         AgentLlmResolver.ResolvedLlm resolved = new AgentLlmResolver.ResolvedLlm(
                 "openrouter",
@@ -42,7 +62,8 @@ class AgentAiServiceFactoryMaxTokensTest {
                 "moonshotai/kimi-k2.6",
                 "",
                 null,
-                List.of()
+                List.of(),
+                null
         );
 
         ChatModel model = factory.buildChatModelWithProviderOrder(resolved, List.of());
@@ -59,7 +80,9 @@ class AgentAiServiceFactoryMaxTokensTest {
                 mock(RawHttpLogger.class),
                 mock(AgentObservabilityService.class),
                 mock(OpenRouterCostService.class),
-                mock(AgentLlmLocalConfigLoader.class)
+                mock(AgentEventService.class),
+                mock(AgentLlmLocalConfigLoader.class),
+                mock(LangchainLlmLatencyWindow.class)
         );
         ReflectionTestUtils.setField(factory, "openAiApiKey", "test-key");
         ReflectionTestUtils.setField(factory, "maxTokens", 4096);

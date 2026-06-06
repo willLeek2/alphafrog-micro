@@ -166,9 +166,10 @@ public class LangchainRunControlService {
         return AgentLangchainRunMessageMapper.toRunMessage(refreshed);
     }
 
-    /** COMPLETED / FAILED / CANCELED / EXPIRED 均为不可逆终态 */
+    /** COMPLETED / PARTIAL / FAILED / CANCELED / EXPIRED 均为不可逆终态 */
     private boolean isTerminal(AgentRunStatus status) {
         return status == AgentRunStatus.COMPLETED
+                || status == AgentRunStatus.PARTIAL
                 || status == AgentRunStatus.FAILED
                 || status == AgentRunStatus.CANCELED
                 || status == AgentRunStatus.EXPIRED;

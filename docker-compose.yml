@@ -1,3 +1,10 @@
+# Agent LLM（OpenRouter 等）经宿主机 HTTP 代理出网。在 .env 中显式设置 HTTP_PROXY= 与 AF_JAVA_PROXY_OPTIONS= 可关闭。
+x-agent-llm-proxy-env: &agent-llm-proxy-env
+  HTTP_PROXY: ${HTTP_PROXY-http://host.docker.internal:7890}
+  HTTPS_PROXY: ${HTTPS_PROXY-http://host.docker.internal:7890}
+  http_proxy: ${HTTP_PROXY-http://host.docker.internal:7890}
+  https_proxy: ${HTTPS_PROXY-http://host.docker.internal:7890}
+
 services:
   # postgres:  <-- 用户使用的是宿主机 PG
   #   image: postgres:16-alpine
@@ -22,7 +29,7 @@ services:
   redis:
     image: redis:7-alpine
     container_name: alphafrog-redis
-    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${AF_REDIS_PASSWORD:-Excited1s}"]
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${AF_REDIS_PASSWORD:-Excited1s}", "--maxmemory", "200mb", "--maxmemory-policy", "allkeys-lru"]
     ports:
       - "6379:6379"
     volumes:
@@ -47,6 +54,12 @@ services:
     environment:
       RABBITMQ_DEFAULT_USER: ${AF_RABBITMQ_USER:-alphafrog}
       RABBITMQ_DEFAULT_PASS: ${AF_RABBITMQ_PASS:-Excited1s}
+      RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: >-
+        +P 1048576
+        +sbwt none
+        +sbwtdcpu none
+        +sbwtdio none
+        -rabbit vm_memory_high_watermark 0.70
     ports:
       - "5672:5672"
       - "15672:15672"
@@ -55,7 +68,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 300M
+          memory: 512M
     healthcheck:
       test: rabbitmq-diagnostics -q ping
       interval: 10s
@@ -495,15 +508,11 @@ services:
       AF_CONFIG_NACOS_GROUP: "alphafrog-config"
       # code-refine 配置文件路径（动态配置目录，Nacos 推送后可写）
       AF_AGENT_FLOW_CODE_REFINE_CONFIG_FILE: "/app/config-dynamic/code-refine.local.json"
-      # Memory Optimization (Heavy)
-      JAVA_TOOL_OPTIONS: "-Xms512m -Xmx1g"
-      # HTTP/HTTPS 代理（访问 OpenRouter 等境外服务时使用）
-      HTTP_PROXY: ${HTTP_PROXY:-}
-      HTTPS_PROXY: ${HTTPS_PROXY:-}
-      http_proxy: ${HTTP_PROXY:-}
-      https_proxy: ${HTTPS_PROXY:-}
-      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1,nacos,redis,rabbitmq,meilisearch}
-      no_proxy: ${NO_PROXY:-localhost,127.0.0.1,nacos,redis,rabbitmq,meilisearch}
+      # Memory Optimization (Heavy)；JDK HttpClient 读 -Dhttp(s).proxy*，见 AF_JAVA_PROXY_OPTIONS
+      JAVA_TOOL_OPTIONS: "-Xms512m -Xmx1g ${AF_JAVA_PROXY_OPTIONS--Dhttp.proxyHost=host.docker.internal -Dhttp.proxyPort=7890 -Dhttps.proxyHost=host.docker.internal -Dhttps.proxyPort=7890 -Dhttp.nonProxyHosts=localhost|127.0.0.1|nacos|redis|rabbitmq|meilisearch|host.docker.internal}"
+      <<: *agent-llm-proxy-env
+      NO_PROXY: ${NO_PROXY-localhost,127.0.0.1,nacos,redis,rabbitmq,meilisearch,host.docker.internal}
+      no_proxy: ${NO_PROXY-localhost,127.0.0.1,nacos,redis,rabbitmq,meilisearch,host.docker.internal}
     volumes:
       - ./data/agent_datasets:/data/agent_datasets
       - ./agentService/config:/app/config:ro
@@ -576,13 +585,10 @@ services:
       AF_CONFIG_NACOS_DATA_ID: "code-refine.json"
       AF_CONFIG_NACOS_GROUP: "alphafrog-config"
       AF_AGENT_FLOW_CODE_REFINE_CONFIG_FILE: "/app/config-dynamic/code-refine.local.json"
-      JAVA_TOOL_OPTIONS: "-Xms512m -Xmx1g"
-      HTTP_PROXY: ${HTTP_PROXY:-}
-      HTTPS_PROXY: ${HTTPS_PROXY:-}
-      http_proxy: ${HTTP_PROXY:-}
-      https_proxy: ${HTTPS_PROXY:-}
-      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1,nacos,redis,rabbitmq,meilisearch,agent-service}
-      no_proxy: ${NO_PROXY:-localhost,127.0.0.1,nacos,redis,rabbitmq,meilisearch,agent-service}
+      JAVA_TOOL_OPTIONS: "-Xms512m -Xmx1g ${AF_JAVA_PROXY_OPTIONS--Dhttp.proxyHost=host.docker.internal -Dhttp.proxyPort=7890 -Dhttps.proxyHost=host.docker.internal -Dhttps.proxyPort=7890 -Dhttp.nonProxyHosts=localhost|127.0.0.1|nacos|redis|rabbitmq|meilisearch|agent-service|host.docker.internal}"
+      <<: *agent-llm-proxy-env
+      NO_PROXY: ${NO_PROXY-localhost,127.0.0.1,nacos,redis,rabbitmq,meilisearch,agent-service,host.docker.internal}
+      no_proxy: ${NO_PROXY-localhost,127.0.0.1,nacos,redis,rabbitmq,meilisearch,agent-service,host.docker.internal}
     volumes:
       - ./data/agent_datasets:/data/agent_datasets
       - ./agentService/config:/app/config:ro
@@ -637,20 +643,22 @@ services:
       AF_QDRANT_HTTP_PORT: 6333
       AF_RAG_EMBEDDING_CONFIG_FILE: ${AF_RAG_EMBEDDING_CONFIG_FILE:-/app/config-dynamic/rag-embedding.local.json}
       AF_EMBEDDING_API_KEY: ${AF_EMBEDDING_API_KEY:-}
-      # HTTP/HTTPS 代理（访问 Perplexity/Exa 等境外服务时使用）
-      HTTP_PROXY: ${HTTP_PROXY:-}
-      HTTPS_PROXY: ${HTTPS_PROXY:-}
-      http_proxy: ${HTTP_PROXY:-}
-      https_proxy: ${HTTPS_PROXY:-}
-      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1,nacos,redis,rabbitmq,meilisearch,shared-qdrant}
-      no_proxy: ${NO_PROXY:-localhost,127.0.0.1,nacos,redis,rabbitmq,meilisearch,shared-qdrant}
+      # HTTP/HTTPS 代理（访问 Perplexity/Exa/Tavily 等境外服务时使用）。
+      # 使用 service-specific 变量，避免部署机 shell 的 HTTP_PROXY=http://127.0.0.1:7890
+      # 被直接带入容器；容器内 127.0.0.1 指向容器自身，不是宿主机代理。
+      HTTP_PROXY: ${AF_EXTERNAL_INFO_HTTP_PROXY-http://host.docker.internal:7890}
+      HTTPS_PROXY: ${AF_EXTERNAL_INFO_HTTPS_PROXY-http://host.docker.internal:7890}
+      http_proxy: ${AF_EXTERNAL_INFO_HTTP_PROXY-http://host.docker.internal:7890}
+      https_proxy: ${AF_EXTERNAL_INFO_HTTPS_PROXY-http://host.docker.internal:7890}
+      NO_PROXY: ${AF_EXTERNAL_INFO_NO_PROXY-localhost,127.0.0.1,::1,nacos,redis,rabbitmq,meilisearch,shared-qdrant,host.docker.internal}
+      no_proxy: ${AF_EXTERNAL_INFO_NO_PROXY-localhost,127.0.0.1,::1,nacos,redis,rabbitmq,meilisearch,shared-qdrant,host.docker.internal}
       AF_RAG_INGEST_TOKEN: ${AF_RAG_INGEST_TOKEN:-}
       AF_OSS_ENDPOINT: ${AF_OSS_ENDPOINT:-oss-ap-southeast-1-internal.aliyuncs.com}
       AF_OSS_BUCKET: ${AF_OSS_BUCKET}
       AF_OSS_ACCESS_KEY_ID: ${AF_OSS_ACCESS_KEY_ID}
       AF_OSS_ACCESS_KEY_SECRET: ${AF_OSS_ACCESS_KEY_SECRET}
       AF_OSS_PATH_PREFIX: ${AF_OSS_PATH_PREFIX:-alphafrog-rag}
-      JAVA_TOOL_OPTIONS: "-Xms256m -Xmx512m"
+      JAVA_TOOL_OPTIONS: "-Xms256m -Xmx512m ${AF_EXTERNAL_INFO_JAVA_PROXY_OPTIONS--Dhttp.proxyHost=host.docker.internal -Dhttp.proxyPort=7890 -Dhttps.proxyHost=host.docker.internal -Dhttps.proxyPort=7890 -Dhttp.nonProxyHosts=localhost|127.0.0.1|nacos|redis|rabbitmq|meilisearch|shared-qdrant|host.docker.internal}"
       DUBBO_PROTOCOL_HOST: ${DUBBO_PROTOCOL_HOST:-}
     volumes:
       - ./externalInfoService/config:/app/config:ro
@@ -678,6 +686,26 @@ services:
     environment:
       AF_SANDBOX_DATA_DIR: /data/agent_datasets
       AF_SANDBOX_DEBUG: ${AF_SANDBOX_DEBUG:-false}
+      AF_SANDBOX_MAX_CONCURRENCY: ${AF_SANDBOX_MAX_CONCURRENCY:-20}
+      AF_SANDBOX_EXECUTION_TIMEOUT: ${AF_SANDBOX_EXECUTION_TIMEOUT:-5}
+      AF_SANDBOX_MEMORY: ${AF_SANDBOX_MEMORY:-512m}
+      AF_SANDBOX_MEMSWAP: ${AF_SANDBOX_MEMSWAP:-512m}
+      AF_SANDBOX_BACKEND: ${AF_SANDBOX_BACKEND:-docker}
+      AF_SANDBOX_WORKDIR: /sandbox
+      AF_SANDBOX_LOG_LEVEL: ${AF_SANDBOX_LOG_LEVEL:-INFO}
+      AF_SANDBOX_IMAGE: ${AF_SANDBOX_IMAGE:-alphafrog-sandbox-runtime:latest}
+      AF_SANDBOX_SKIP_ENVIRONMENT_SETUP: ${AF_SANDBOX_SKIP_ENVIRONMENT_SETUP:-true}
+      AF_SANDBOX_PREINSTALLED_LIBRARIES: ${AF_SANDBOX_PREINSTALLED_LIBRARIES:-numpy,pandas,matplotlib,scipy}
+      # Compose/default deployment exercises the pooled runner. Set
+      # AF_SANDBOX_POOL_ENABLED=false in the host env/.env to force the legacy per-task SandboxSession path.
+      AF_SANDBOX_POOL_ENABLED: ${AF_SANDBOX_POOL_ENABLED:-true}
+      AF_SANDBOX_POOL_MIN_SIZE: ${AF_SANDBOX_POOL_MIN_SIZE:-3}
+      AF_SANDBOX_POOL_MAX_SIZE: ${AF_SANDBOX_POOL_MAX_SIZE:-8}
+      AF_SANDBOX_POOL_ACQUIRE_TIMEOUT: ${AF_SANDBOX_POOL_ACQUIRE_TIMEOUT:-30}
+      AF_SANDBOX_POOL_IDLE_TIMEOUT: ${AF_SANDBOX_POOL_IDLE_TIMEOUT:-300}
+      AF_SANDBOX_POOL_MAX_CONTAINER_USES: ${AF_SANDBOX_POOL_MAX_CONTAINER_USES:-}
+      AF_SANDBOX_WORKSPACE_ROOT: /sandbox/runs
+      AF_SANDBOX_COMPAT_INPUT_PATH: "true"
     volumes:
       - ./data/agent_datasets:/data/agent_datasets
       - /var/run/docker.sock:/var/run/docker.sock
@@ -686,7 +714,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 768M
+          memory: 1G
     networks:
       - alphafrog-network
 
@@ -787,6 +815,8 @@ volumes:
 networks:
   alphafrog-network:
     driver: bridge
+    # 勿在已运行的 stack 上改 driver_opts：compose 会尝试删网重建，其它容器仍挂网时会失败。
+    # 若需 enable_icc，须 docker compose down 后全栈 up（见 deploy 文档 / thread e13717e0）。
     ipam:
       config:
         - subnet: 172.18.0.0/16

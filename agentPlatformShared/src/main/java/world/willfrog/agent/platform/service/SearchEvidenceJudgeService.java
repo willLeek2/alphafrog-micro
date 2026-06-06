@@ -7,15 +7,18 @@ import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.chat.response.ChatResponse;
+import dev.langchain4j.model.output.TokenUsage;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import world.willfrog.agent.platform.config.StageLlmConfig;
 import world.willfrog.agent.platform.context.AgentContext;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 @Service
 @RequiredArgsConstructor
@@ -23,13 +26,16 @@ import java.util.Map;
 public class SearchEvidenceJudgeService {
 
     public static final String STAGE = "search_evidence_judge";
+    static final int JUDGE_MAX_TOKENS = 2048;
     private static final int MAX_TITLE_CHARS = 200;
     private static final int MAX_SNIPPET_CHARS = 600;
     private static final int MAX_URL_CHARS = 400;
 
     private final ObjectMapper objectMapper;
     private final AgentAiServiceFactory aiServiceFactory;
+    private final SearchEvidenceJudgeModelResolver judgeModelResolver;
     private final JudgeModelSelectorService judgeModelSelectorService;
+    private final AgentObservabilityService observabilityService;
 
     public JudgeResult judge(String query,
                              List<String> requestedEntities,
@@ -48,16 +54,26 @@ public class SearchEvidenceJudgeService {
 
         String previousPhase = AgentContext.getPhase();
         String previousStage = AgentContext.getStage();
+        long startedAtMillis = System.currentTimeMillis();
         try {
+            AgentContext.clearLastRecordedLlmTraceId();
+            AgentContext.setLlmCallRequestMeta(buildJudgeRequestMeta(
+                    selected, safeHits.size(), safeCitations.size()));
             AgentContext.setPhase(AgentObservabilityService.PHASE_SUMMARIZING);
             AgentContext.setStage(STAGE);
             ChatResponse response = selected.model().chat(buildMessages(query, requestedEntities, safeHits, safeCitations));
+            long durationMs = System.currentTimeMillis() - startedAtMillis;
             String text = response.aiMessage() == null ? "" : nvl(response.aiMessage().text());
             JsonNode root = parseJson(text);
             Validation validation = validate(root, safeHits.size(), safeCitations.size());
             if (!validation.valid()) {
+                recordJudgeObservability(selected, durationMs, startedAtMillis, safeHits.size(), safeCitations.size(),
+                        validation.error(), null, null);
                 return failOpen(validation.error(), safeHits.size(), safeCitations.size());
             }
+            TokenUsage tokenUsage = response.tokenUsage();
+            recordJudgeObservability(selected, durationMs, startedAtMillis, safeHits.size(), safeCitations.size(),
+                    null, tokenUsage, text);
             return new JudgeResult(
                     true,
                     "",
@@ -65,7 +81,10 @@ public class SearchEvidenceJudgeService {
                     parseItems(root.path("citations"), safeCitations.size(), "")
             );
         } catch (Exception e) {
+            long durationMs = System.currentTimeMillis() - startedAtMillis;
             log.warn("Search evidence judge failed: {}", e.getMessage());
+            recordJudgeObservability(selected, durationMs, startedAtMillis, safeHits.size(), safeCitations.size(),
+                    nvl(e.getMessage()), null, null);
             return failOpen("JUDGE_CALL_FAILED: " + nvl(e.getMessage()), safeHits.size(), safeCitations.size());
         } finally {
             restorePhaseAndStage(previousPhase, previousStage);
@@ -73,19 +92,100 @@ public class SearchEvidenceJudgeService {
     }
 
     private SelectionAndModel selectModel() {
-        for (JudgeModelSelectorService.Selection candidate : judgeModelSelectorService.selectCandidates()) {
+        Optional<SearchEvidenceJudgeModelResolver.ResolvedStageModel> resolvedStage = judgeModelResolver.resolve();
+        if (resolvedStage.isPresent()) {
+            StageLlmConfig cfg = resolvedStage.get().config();
+            try {
+                AgentLlmResolver.ResolvedLlm resolved = aiServiceFactory.resolveLlm(
+                        cfg.getEndpointName(), cfg.getModelName());
+                List<String> providerOrder = cfg.getProviderOrder() == null ? List.of() : cfg.getProviderOrder();
+                ChatModel model = aiServiceFactory.buildChatModelWithProviderOrderAndTemperature(
+                        resolved, providerOrder, 0.0D, JUDGE_MAX_TOKENS);
+                return new SelectionAndModel(
+                        cfg.getEndpointName(),
+                        cfg.getModelName(),
+                        resolvedStage.get().source(),
+                        model);
+            } catch (Exception e) {
+                log.warn("Init search evidence judge from stage config failed: endpoint={}, model={}, err={}",
+                        cfg.getEndpointName(), cfg.getModelName(), e.getMessage());
+            }
+        }
+        List<JudgeModelSelectorService.Selection> deprecatedRoutes = judgeModelSelectorService.selectCandidates();
+        if (!deprecatedRoutes.isEmpty()) {
+            log.warn("Search evidence judge falling back to deprecated runtime.judge.routes; "
+                    + "prefer stage_config.search_judge or inherit current phase model");
+        }
+        for (JudgeModelSelectorService.Selection candidate : deprecatedRoutes) {
             try {
                 AgentLlmResolver.ResolvedLlm resolved = aiServiceFactory.resolveLlm(
                         candidate.getEndpointName(), candidate.getModelName());
                 ChatModel model = aiServiceFactory.buildChatModelWithProviderOrderAndTemperature(
-                        resolved, List.of(), 0.0D);
-                return new SelectionAndModel(candidate, model);
+                        resolved, List.of(), 0.0D, JUDGE_MAX_TOKENS);
+                return new SelectionAndModel(
+                        candidate.getEndpointName(),
+                        candidate.getModelName(),
+                        SearchEvidenceJudgeModelResolver.ModelSource.ROUTE_FALLBACK,
+                        model);
             } catch (Exception e) {
                 log.warn("Init search evidence judge model failed: endpoint={}, model={}, err={}",
                         candidate.getEndpointName(), candidate.getModelName(), e.getMessage());
             }
         }
         return null;
+    }
+
+    private void recordJudgeObservability(SelectionAndModel selected,
+                                          long durationMs,
+                                          long startedAtMillis,
+                                          int hitCount,
+                                          int citationCount,
+                                          String errorMessage,
+                                          TokenUsage tokenUsage,
+                                          String responseText) {
+        try {
+            String runId = AgentContext.getRunId();
+            if (runId == null || runId.isBlank()) {
+                return;
+            }
+            Map<String, Object> judgeMeta = buildJudgeRequestMeta(selected, hitCount, citationCount);
+            judgeMeta.put("judge_duration_ms", durationMs);
+            String providerTraceId = AgentContext.getAndClearLastRecordedLlmTraceId();
+            if (providerTraceId != null) {
+                observabilityService.enrichLlmTrace(
+                        runId, providerTraceId, errorMessage, responseText, judgeMeta);
+                return;
+            }
+            Map<String, Object> requestSnapshot = new LinkedHashMap<>(judgeMeta);
+            requestSnapshot.put("stage", STAGE);
+            observabilityService.recordLlmCall(
+                    runId,
+                    AgentObservabilityService.PHASE_SUMMARIZING,
+                    tokenUsage,
+                    durationMs,
+                    startedAtMillis,
+                    startedAtMillis + durationMs,
+                    selected.endpointName(),
+                    selected.modelName(),
+                    errorMessage,
+                    requestSnapshot,
+                    responseText);
+        } catch (Exception e) {
+            log.warn("Search evidence judge observability failed: {}", e.getMessage());
+        }
+    }
+
+    private Map<String, Object> buildJudgeRequestMeta(SelectionAndModel selected,
+                                                      int hitCount,
+                                                      int citationCount) {
+        Map<String, Object> meta = new LinkedHashMap<>();
+        meta.put("stage", STAGE);
+        meta.put("judge_model_source", selected.source().name().toLowerCase());
+        meta.put("hit_count", hitCount);
+        meta.put("citation_count", citationCount);
+        meta.put("judge_model", selected.modelName());
+        meta.put("judge_endpoint", selected.endpointName());
+        return meta;
     }
 
     private List<ChatMessage> buildMessages(String query,
@@ -286,7 +386,11 @@ public class SearchEvidenceJudgeService {
     ) {
     }
 
-    private record SelectionAndModel(JudgeModelSelectorService.Selection selection, ChatModel model) {
+    private record SelectionAndModel(
+            String endpointName,
+            String modelName,
+            SearchEvidenceJudgeModelResolver.ModelSource source,
+            ChatModel model) {
     }
 
     private record Validation(boolean valid, String error) {

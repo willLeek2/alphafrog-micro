@@ -47,7 +47,7 @@ public class AgentLlmRequestSnapshotBuilder {
         try {
             ChatCompletionRequest.Builder builder = ChatCompletionRequest.builder()
                     .model(nvl(modelName))
-                    .messages(OpenAiUtils.toOpenAiMessages(messages == null ? List.of() : messages))
+                    .messages(OpenAiUtils.toOpenAiMessages(messages == null ? List.of() : messages, true, "reasoning_content"))
                     .temperature(temperature)
                     .maxTokens(maxTokens);
 

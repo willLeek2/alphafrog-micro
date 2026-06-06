@@ -3,7 +3,6 @@ package world.willfrog.agentlangchain.orchestration;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.ObjectProvider;
-import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.service.AgentEventService;
 
@@ -13,6 +12,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
+import static world.willfrog.agentlangchain.orchestration.LangchainRunSchedulerTestSupport.immediateScheduler;
 
 class LangchainLinearRunPipelineAsyncTest {
 
@@ -21,13 +21,6 @@ class LangchainLinearRunPipelineAsyncTest {
         CountDownLatch workflowEntered = new CountDownLatch(1);
         CountDownLatch releaseWorkflow = new CountDownLatch(1);
         AtomicBoolean callerReturned = new AtomicBoolean(false);
-
-        ThreadPoolTaskExecutor taskExecutor = new ThreadPoolTaskExecutor();
-        taskExecutor.setCorePoolSize(1);
-        taskExecutor.setMaxPoolSize(1);
-        taskExecutor.setQueueCapacity(1);
-        taskExecutor.setThreadNamePrefix("test-langchain-run-");
-        taskExecutor.initialize();
 
         LangchainLinearRunPipelineImpl pipeline = new LangchainLinearRunPipelineImpl(
                 mock(world.willfrog.agentlangchain.planning.LangchainAiPlanner.class),
@@ -44,7 +37,7 @@ class LangchainLinearRunPipelineAsyncTest {
                 mock(LangchainFollowUpContextSupport.class),
                 mock(world.willfrog.agent.platform.service.AgentMessageService.class),
                 mock(LangchainRunExecutionGuard.class),
-                taskExecutor
+                immediateScheduler()
         ) {
             @Override
             void executeRun(AgentRun initialRun) {
@@ -67,6 +60,5 @@ class LangchainLinearRunPipelineAsyncTest {
         assertThat(callerReturned).isTrue();
         assertThat(workflowEntered.await(2, TimeUnit.SECONDS)).isTrue();
         releaseWorkflow.countDown();
-        taskExecutor.shutdown();
     }
 }

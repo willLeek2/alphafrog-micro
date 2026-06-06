@@ -5,6 +5,7 @@ import org.apache.dubbo.config.annotation.DubboService;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import world.willfrog.agentlangchain.orchestration.AgentLangchainOrchestrator;
 import world.willfrog.alphafrogmicro.agent.idl.AgentEmpty;
+import world.willfrog.alphafrogmicro.agent.idl.AgentRunCostMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunResultMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunStatusMessage;
@@ -25,6 +26,7 @@ import world.willfrog.alphafrogmicro.agent.idl.GetAgentConfigResponse;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentCreditsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentCreditsResponse;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunRequest;
+import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCostRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunResultRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunStatusRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentSnapshotPartRequest;
@@ -135,6 +137,11 @@ public class AgentLangchainDubboServiceImpl extends DubboAgentDubboServiceTriple
     @Override
     public AgentRunResultMessage getResult(GetAgentRunResultRequest request) {
         return readService.getResult(request);
+    }
+
+    @Override
+    public AgentRunCostMessage getRunCost(GetAgentRunCostRequest request) {
+        return readService.getRunCost(request);
     }
 
     @Override

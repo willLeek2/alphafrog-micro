@@ -40,6 +40,12 @@ import java.util.concurrent.TimeUnit;
  * 是否超预算、是否命中缓存、结果如何写 observability、异常如何包装成统一 JSON。
  * 因此本类是「模型工具调用」和「平台业务工具」之间的运行时边界。</p>
  *
+ * <p>Agent V2 前端接入后，工具调用还多了一层实时事件契约：
+ * {@code ToolRouterToolExecutor} 负责发 {@code TOOL_CALL_STARTED/FINISHED}，
+ * 本类负责把同一次调用写入 observability。两边必须共享同一个 {@code tool_call_id}
+ * （通过 {@link AgentContext} 传递），这样前端点击工具卡片时才能用
+ * {@code runId + tool_call_id} 懒加载 safe detail，而不是扫描整份 trace。</p>
+ *
  * <h3>位置与角色</h3>
  * 本路由器是 {@link world.willfrog.agent.workflow.ReactTodoExecutor} 在 ReAct 循环中
  * 处理 LLM 返回的 {@code tool_calls} 时的核心依赖：当 LLM 返回某个 tool_call 后，
@@ -58,7 +64,8 @@ import java.util.concurrent.TimeUnit;
  *   <li><b>结果缓存</b>：通过 {@link ToolResultCacheService} 对工具结果按用户或全局 scope
  *       做缓存复用，节省重复调用成本。</li>
  *   <li><b>观测记录</b>：通过 {@link AgentObservabilityService#recordToolCall} 记录每一次
- *       工具调用 trace（参数、结果、耗时、是否命中缓存等），供 run 观测视图展示。</li>
+ *       工具调用 trace（参数、结果摘要、耗时、是否命中缓存等），供 run 观测视图和
+ *       safe detail 懒加载使用。</li>
  *   <li><b>并发权重限制</b>：通过 {@link ToolWeightedLimitService} 对批量工具调用按有效权重限流，
  *       避免一次批量日线查询占满下游资源。</li>
  *   <li><b>故障注入</b>：根据 {@link StressTestProperties} 注入模拟延迟/失败，用于压测。</li>
@@ -238,8 +245,9 @@ public class ToolRouter {
         boolean success = cached.isSuccess();
         long durationMs = Math.max(0L, cached.getDurationMs());
         ToolResultCacheService.CacheMeta cacheMeta = cached.getCacheMeta();
-        // 记录观测 trace（参数、结果、耗时、缓存命中信息），供 run 详情页展示。
-        // checkParallelLimits 是工具目录自检，不计入 run 级 tool_calls 预算/统计。
+        // 记录观测 trace（参数、结果摘要、耗时、缓存命中信息）。
+        // AgentObservabilityService 会把大输出拆到 Redis detail blob，snapshot 中只保留安全索引。
+        // checkParallelLimits 是工具目录自检，不计入 run 级 tool_calls 预算/统计，也不提供展开详情。
         if (!"checkParallelLimits".equals(toolName)) {
             recordObservability(toolName, params, result, durationMs, success, cacheMeta);
         }
@@ -306,6 +314,8 @@ public class ToolRouter {
                 "searchIndex",
                 "searchAssetInfo",
                 "checkParallelLimits",
+                "getTradingDaysSummary",
+                "isTradingDay",
                 "getExchangeAssetDaily",
                 "getOffExchangeAssetDaily",
                 "getEtfAdj",
@@ -494,6 +504,16 @@ public class ToolRouter {
                         str(params.get("query"), params.get("keyword"), params.get("arg0")),
                         str(params.get("assetTypes"), params.get("asset_types"), params.get("arg1")),
                         str(params.get("marketScope"), params.get("market_scope"), params.get("arg2"), "domestic")
+                );
+                case "getTradingDaysSummary" -> marketDataTools.getTradingDaysSummary(
+                        dateStr(params.get("startDate"), params.get("start_date"), params.get("startDateStr"), params.get("arg0")),
+                        dateStr(params.get("endDate"), params.get("end_date"), params.get("endDateStr"), params.get("arg1")),
+                        str(params.get("exchange"), params.get("arg2"), "SSE")
+                );
+                case "isTradingDay" -> marketDataTools.isTradingDay(
+                        dateStr(params.get("date"), params.get("dates"), params.get("tradeDate"), params.get("tradeDates"),
+                                params.get("trade_date"), params.get("trade_dates"), params.get("arg0")),
+                        str(params.get("exchange"), params.get("arg1"), "SSE")
                 );
                 case "getExchangeAssetDaily" -> marketDataTools.getExchangeAssetDaily(
                         str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("arg0")),
@@ -731,6 +751,10 @@ public class ToolRouter {
      *
      * <p>调用条件：必须存在有效的 runId。脱离 run 上下文（如冒烟测试）的调用不记录。
      * 字段映射：成功时不上报 errorMessage；缓存元数据若为 null 使用安全的占位值。</p>
+     *
+     * <p>{@code tool_call_id} 不在参数列表里出现，而是由上游 executor 写入
+     * {@link AgentContext}。这样同一次工具调用的 SSE event 与 observability trace 可以对齐；
+     * 后续前端调用 {@code /tool-calls/{toolCallId}/detail} 时才能命中同一条安全详情。</p>
      */
     private void recordObservability(String toolName,
                                      Map<String, Object> params,

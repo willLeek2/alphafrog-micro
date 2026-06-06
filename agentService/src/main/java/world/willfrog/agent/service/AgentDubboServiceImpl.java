@@ -17,6 +17,7 @@ import world.willfrog.alphafrogmicro.agent.idl.AgentRunListItemMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunEventMessage;
 
 import world.willfrog.alphafrogmicro.agent.idl.AgentModelMessage;
+import world.willfrog.alphafrogmicro.agent.idl.AgentRunCostMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunResultMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunStatusMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentToolMessage;
@@ -35,6 +36,7 @@ import world.willfrog.alphafrogmicro.agent.idl.GetAgentConfigRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentCreditsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentCreditsResponse;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunRequest;
+import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCostRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunResultRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunStatusRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentConfigResponse;
@@ -89,6 +91,7 @@ public class AgentDubboServiceImpl extends DubboAgentDubboServiceTriple.AgentDub
     private final AgentArtifactService artifactService;
     private final AgentModelCatalogService modelCatalogService;
     private final AgentCreditService creditService;
+    private final AgentRunCostService runCostService;
     private final UserDao userDao;
     private final ObjectMapper objectMapper;
     private final AgentMessageService messageService;
@@ -262,10 +265,16 @@ public class AgentDubboServiceImpl extends DubboAgentDubboServiceTriple.AgentDub
         requireRun(request.getId(), request.getUserId());
         int afterSeq = Math.max(0, request.getAfterSeq());
         int limit = request.getLimit() <= 0 ? 200 : Math.min(request.getLimit(), 500);
-        List<AgentRunEvent> events = eventMapper.listByRunIdAfterSeq(request.getId(), afterSeq, limit + 1);
-        boolean hasMore = events.size() > limit;
-        if (hasMore) {
-            events = events.subList(0, limit);
+        List<AgentRunEvent> events;
+        boolean hasMore = false;
+        if (request.getLatest()) {
+            events = eventService.listLatestByRunId(request.getId(), limit);
+        } else {
+            events = eventService.listByRunIdAfterSeq(request.getId(), afterSeq, limit + 1);
+            hasMore = events.size() > limit;
+            if (hasMore) {
+                events = events.subList(0, limit);
+            }
         }
         int nextAfterSeq = afterSeq;
         ListAgentRunEventsResponse.Builder builder = ListAgentRunEventsResponse.newBuilder();
@@ -468,7 +477,7 @@ public class AgentDubboServiceImpl extends DubboAgentDubboServiceTriple.AgentDub
         }
         int totalCreditsConsumed = creditService.calculateRunTotalCredits(
                 run,
-                eventMapper.listByRunId(run.getId()),
+                eventService.listByRunId(run.getId()),
                 observabilityJson
         );
         return AgentRunResultMessage.newBuilder()
@@ -483,6 +492,13 @@ public class AgentDubboServiceImpl extends DubboAgentDubboServiceTriple.AgentDub
                 .build();
     }
 
+    @Override
+    public AgentRunCostMessage getRunCost(GetAgentRunCostRequest request) {
+        AgentRun run = requireRun(request.getId(), request.getUserId());
+        String observabilityJson = nvl(observabilityService.loadObservabilityJson(run.getId(), run.getSnapshotJson()));
+        return runCostService.buildAndPersist(run, observabilityJson);
+    }
+
     /**
      * 获取 run 当前执行状态（基于最新事件）。
      *
@@ -492,7 +508,7 @@ public class AgentDubboServiceImpl extends DubboAgentDubboServiceTriple.AgentDub
     @Override
     public AgentRunStatusMessage getStatus(GetAgentRunStatusRequest request) {
         AgentRun run = requireRun(request.getId(), request.getUserId());
-        AgentRunEvent latestEvent = eventMapper.findLatestByRunId(run.getId());
+        AgentRunEvent latestEvent = eventService.findLatestByRunId(run.getId());
         String planJson = run.getPlanJson() == null ? "" : run.getPlanJson();
         var cachedPlan = stateStore.loadPlan(run.getId());
         if (cachedPlan.isPresent()) {
@@ -507,12 +523,12 @@ public class AgentDubboServiceImpl extends DubboAgentDubboServiceTriple.AgentDub
         boolean observabilityFullAvailable = observabilityService.isFullObservabilityAvailable(run.getId(), run.getSnapshotJson());
         int totalCreditsConsumed = creditService.calculateRunTotalCredits(
                 run,
-                eventMapper.listByRunId(run.getId()),
+                eventService.listByRunId(run.getId()),
                 observabilitySummaryJson
         );
 
         // 事件总数
-        Integer maxSeq = eventMapper.findMaxSeq(run.getId());
+        Integer maxSeq = eventService.findMaxSeq(run.getId());
         int eventCount = maxSeq != null ? maxSeq : 0;
 
         // 时间戳（epoch millis）

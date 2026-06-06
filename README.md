@@ -1,196 +1,55 @@
-# AlphaFrog-Micro
+# AlphaFrog
 
-> 一站式 A 股数据微服务平台 —— 股票、基金、指数数据的采集、存储与分析
+> AlphaFrog 是 2026 年 1 月开始持续迭代的金融 Agent 个人项目。支持传统金融数据抓取查询，同时重点开发金融 Agent 功能。
 
-## 项目简介
+## 技术栈选择
 
-AlphaFrog-Micro 是一个基于 **Java Spring Boot + Apache Dubbo + RabbitMQ** 的微服务架构项目，旨在提供国内 A 股市场的股票、基金、指数等金融数据的采集、存储、查询与分析能力。
+- **传统后端**：主要使用 Spring Boot、Nacos、Dubbo、Redis、RabbitMQ、PostgreSQL 等常见后端技术，服务之间通过 Dubbo/gRPC 协作，数据抓取任务通过队列调度。
+- **Agent 框架**：使用 LangChain4j 接入模型调用和工具调用；使用 MeiliSearch / Qdrant 支撑资产搜索与年报 RAG 查询；使用 llm-sandbox 支持轻量的、有基本伸缩能力的 Python 沙箱。
+- **部署方式**：当前主要通过 Docker Compose 管理本地和测试环境部署。
 
-**技术栈**：
-- Java 微服务：Spring Boot 3.x + Apache Dubbo 3.x + gRPC/Proto
-- 消息队列：RabbitMQ
-- 数据存储：PostgreSQL + Redis
-- 搜索引擎：MeiliSearch
-- 服务注册：Nacos
+## 已实现的 Agent 功能
 
----
+- 抓取和查询较大量 A 股市场多类资产数据，包括行情、交易日历、财务指标等基础信息。
+- 根据请求难度，可决策 linear 和 DAG 两种执行模式；复杂任务可以拆成多个可观测节点执行，降低单次上下文压力，也便于定位局部失败。
+- 支持自然语言触发资产搜索、批量查询、网页搜索、Python sandbox 计算，以及对已抓取公司年报的基础 RAG 查询。
 
-## 功能概览
+## Agent 可观测性与鲁棒性
 
-### 基础数据服务（传统 CRUD）
+- 初步构建了 Agent 执行的可观测链路，包括 SSE 事件流、LLM 调用 / 工具调用轨迹、LLM 成本分析、基本的合成数据流水线与压测脚本等；不同类型的运行数据按使用场景设置不同 TTL，兼顾调试追踪、成本分析和 Redis 存储压力。
+- 做了一些基本的鲁棒性优化：批量查询、查询结果复用、LLM 与外部搜索调用的可控重试、DAG 节点级重试等。
 
-- **股票服务**：股票信息查询、关键词搜索、日线行情
-- **基金服务**：基金信息查询、净值查询、持仓查询、关键词搜索
-- **指数服务**：指数信息查询、日线行情、成分股权重查询
-- **数据爬取**：同步/异步爬取股票、基金、指数数据，基于 RabbitMQ 的任务调度
-- **投资组合**：组合管理、持仓管理、交易记录、策略投资、估值与业绩指标计算
+## 下一步计划
 
-### Agent 智能服务（核心功能）
+- 收敛/删除部分已经不再使用的微服务，让项目结构更清楚。
+- 继续优化 RAG，尤其是检索质量和评测闭环。
 
-- **自然语言任务执行**：通过自然语言描述目标，Agent 自动规划并执行数据查询、分析、Python 计算等任务
-- **多轮对话与上下文管理**：支持基于消息历史的追问、上下文压缩（滑动窗口策略，默认保留最近 5 轮）
-- **工具调用能力**：
-  - 数据查询：股票/基金/指数实时数据
-  - 搜索能力：MeiliSearch 本地搜索 + Perplexity/Exa 外部市场新闻搜索
-  - Python 沙箱：安全执行 Python 计算任务，支持代码自修复与静态预检
-- **可观测性体系**：
-  - LLM 调用全链路追踪，原始请求/响应捕获
-  - 跨工作流/子 Agent 上下文传播，traceId 支持
-  - 性能指标采集（各环节耗时、LLM 调用时间戳）
-  - 费用追踪（OpenRouter Spending、缓存命中监控）
-- **任务执行可靠性**：
-  - JSON Schema 结构化规划输出，支持步骤间数据传递
-  - 四级重试预算（static/runtime/semantic/total）+ 失败分类感知恢复
-  - Python 静态代码预检 + LLM 语义判断验证
-- **会话管理**：会话重命名、运行监控、强制停止
+## 实际部署
 
-### 基础设施
+- 基本测试文档 coming soon，可查看 <https://alpha.frogwch.com/v1p0> 获取最新使用指引。
+- 可访问 <https://alpha.frogwch.com/invitations> 获取新的试用用户。
 
-- **API 网关**：统一 RESTful API，路由请求至各微服务
-- **管理后台**：Agent 运行监控、系统配置管理、用户额度调整（带审计日志）
-- **额度与审批系统**：申请 → 审批 → 消耗 → 台账完整链路，支持乐观锁与幂等
-
----
-
-## 本地协作提示
-
-- 如果使用 `slock` 启动本项目相关 agent，且本机访问外网需要走代理，请显式开启 Node 环境代理：`NODE_USE_ENV_PROXY=1 npx @slock-ai/daemon --server-url https://api.slock.ai --api-key <your-key>`。
-
----
-
-## 快速部署
-
-### 全新部署（最简单方式）
-
-#### 1. 克隆代码并配置环境变量
+## 快速开始
 
 ```bash
-git clone <repository-url>
-cd alphafrog-micro
+# 1. 克隆并配置环境
 cp .env.example .env
-# 编辑 .env，填写数据库、Redis、API Keys 等必要配置
-```
+# 编辑 .env 填写数据库、Redis、API Keys
 
-#### 2. 初始化数据库
-
-```bash
-# 创建数据库
-createdb -h your_host -U your_user alphafrog
-
-# 导入完整 Schema
+# 2. 初始化数据库
 psql -h your_host -U your_user -d alphafrog -f alphafrog_schema_full.sql
-```
 
-#### 3. 配置 LLM
-
-```bash
-# 复制并编辑 Agent LLM 配置
-cp agentService/config/agent-llm.local.example.json agentService/config/agent-llm.local.json
-vim agentService/config/agent-llm.local.json
-
-# 复制并编辑 Search LLM 配置（市场新闻功能需要）
-cp agentService/config/search-llm.local.example.json agentService/config/search-llm.local.json
-vim agentService/config/search-llm.local.json
-```
-
-#### 4. 构建并启动
-
-```bash
-# 一键构建所有镜像
+# 3. 构建并启动
 bash build_all_images.sh
-
-# 启动全部服务
 docker-compose up -d
-
-# 查看服务状态
-docker-compose ps
 ```
 
-#### 5. 验证部署
+更详细的部署说明见 [deploy_guide.md](./deploy_guide.md)。
 
-```bash
-# 检查健康状态
-curl http://localhost:8090/actuator/health
-```
+## 参与构建本项目的 Slock agents
 
-### 版本迁移
-
-AlphaFrog 提供自动化的版本迁移工具，支持从任意旧版本迁移到最新版本。
-
-#### 迁移前准备
-
-```bash
-# 备份数据库
-pg_dump -h your_host -U your_user -d alphafrog > alphafrog_backup_$(date +%Y%m%d).sql
-
-# 备份配置文件
-cp .env .env.backup
-cp agentService/config/agent-llm.local.json agentService/config/agent-llm.local.json.backup
-```
-
-#### 使用迁移工具
-
-```bash
-# 安装依赖
-pip install psycopg2-binary pyyaml
-
-# 配置迁移（二选一）
-# 方式1：如果已有 .env 文件，直接使用（自动检测 AF_DB_MAIN_* 变量）
-# 方式2：创建 YAML 配置文件
-cp migrate/migrate_config.example.yml migrate/migrate_config.yml
-vim migrate/migrate_config.yml
-
-# 查看当前版本和待执行迁移
-python migrate/migrate.py status
-
-# 自动检测当前版本并迁移到最新发布版本
-python migrate/migrate.py migrate --auto
-
-# 指定版本范围迁移
-python migrate/migrate.py migrate --from v0.2 --to v0.5
-
-# 强制执行，跳过确认
-python migrate/migrate.py migrate --auto --force
-```
-
-迁移工具会执行 SQL 脚本（数据库 DDL/DML 变更）和 Python 脚本（配置检查），每个版本的迁移脚本位于 `db/migrations/upgrades/<版本号>/` 目录下。
+slock-codex-coder-mbp、slock-cckimi-Zhiyuan-mbp、slock-ccmax-Jiancheng-mbp、slock-dpsk-alen-mcp、slock-cursor-bob-mbp、slock-Cindy、slock-cursor-tracy-mbp、slock-grace-teacher-mbp、slock-wang-teacher-mbp
 
 ---
 
-## 文档导航
-
-| 文档 | 说明 |
-|------|------|
-| [deploy_guide.md](./deploy_guide.md) | 完整部署指南（构建、Docker 打包、服务上线） |
-| [migrate/MIGRATION_DESIGN.md](./migrate/MIGRATION_DESIGN.md) | 迁移工具设计与使用说明 |
-| [alphafrog-wiki/agent-api-guide.md](./alphafrog-wiki/agent-api-guide.md) | Agent 对外 API 文档 |
-
----
-
-## 项目结构
-
-```
-alphafrog-micro/
-├── common/                    # 公共模块 (DAO, DTO, Utils)
-├── interface/                 # Dubbo 接口定义 (Proto)
-├── domesticStockService/      # 股票服务
-├── domesticFundService/       # 基金服务
-├── domesticIndexService/      # 指数服务
-├── domesticFetchService/      # 数据爬取服务
-├── portfolioService/          # 投资组合服务
-├── agentService/              # Agent 服务（核心）
-├── externalInfoService/         # 外部信息服务
-├── pythonSandboxService/      # Python 沙箱服务
-├── frontend/                  # API 网关
-└── docker-compose.yml         # Docker Compose 配置
-```
-
----
-
-## License
-
-本项目仅供学习交流使用。
-
----
-
-一切从相信开始。2019.11.27
+一切从相信开始 2019/11/27

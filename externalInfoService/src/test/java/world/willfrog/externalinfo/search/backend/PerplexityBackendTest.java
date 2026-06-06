@@ -5,8 +5,11 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sun.net.httpserver.HttpServer;
 import org.junit.jupiter.api.Test;
 import world.willfrog.alphafrogmicro.externalinfo.idl.WebSearchRequest;
+import world.willfrog.externalinfo.config.SearchLlmProperties;
 import world.willfrog.externalinfo.search.SearchLlmConfigResolver;
 import world.willfrog.externalinfo.search.WebSearchExecutionContext;
+import world.willfrog.externalinfo.search.http.SearchBackendRetry;
+import world.willfrog.externalinfo.search.http.SearchHttpClientFactory;
 import world.willfrog.externalinfo.search.profile.GlobalUserProfileInjector;
 import world.willfrog.externalinfo.search.profile.ProfileContext;
 
@@ -42,7 +45,14 @@ class PerplexityBackendTest {
         });
         server.start();
         try {
-            PerplexityBackend backend = new PerplexityBackend(mapper, new GlobalUserProfileInjector(), new ProfileContext());
+            SearchLlmProperties properties = new SearchLlmProperties();
+            SearchLlmProperties.WebSearchProxy proxy = new SearchLlmProperties.WebSearchProxy();
+            proxy.setEnabled(false);
+            properties.getFeatures().getWebSearch().setProxy(proxy);
+            SearchHttpClientFactory httpClientFactory = new SearchHttpClientFactory(properties);
+            SearchBackendRetry retry = new SearchBackendRetry(properties);
+            PerplexityBackend backend = new PerplexityBackend(
+                    mapper, new GlobalUserProfileInjector(), new ProfileContext(), httpClientFactory, retry);
             BackendSearchResult result = backend.search(new WebSearchExecutionContext(
                     WebSearchRequest.newBuilder()
                             .setQuery("q")
@@ -74,6 +84,7 @@ class PerplexityBackendTest {
             assertEquals("4/1/2026", sent.path("search_after_date_filter").asText());
             assertEquals("example.com", sent.path("search_domain_filter").get(0).asText());
             assertTrue(result.ok());
+            assertEquals(1, result.retryCount());
             assertEquals("Title", result.hits().get(0).title());
             assertEquals("Snippet", result.hits().get(0).snippet());
             assertEquals("answer", result.answer());

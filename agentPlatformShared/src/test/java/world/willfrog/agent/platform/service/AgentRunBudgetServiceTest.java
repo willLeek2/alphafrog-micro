@@ -41,7 +41,7 @@ class AgentRunBudgetServiceTest {
         ReflectionTestUtils.setField(service, "defaultMaxLlmCalls", 50L);
         ReflectionTestUtils.setField(service, "defaultMaxToolCalls", 30L);
         ReflectionTestUtils.setField(service, "defaultMaxTokens", 300000L);
-        ReflectionTestUtils.setField(service, "defaultMaxHttpAttemptsPerLogicalCall", 2);
+        ReflectionTestUtils.setField(service, "defaultMaxHttpAttemptsPerLogicalCall", 3);
         AgentContext.setRunId("run-1");
         AgentContext.setUserId("user-1");
     }
@@ -61,7 +61,7 @@ class AgentRunBudgetServiceTest {
         assertEquals(50L, budget.maxLlmCalls());
         assertEquals(30L, budget.maxToolCalls());
         assertEquals(300000L, budget.maxTokens());
-        assertEquals(2, budget.maxHttpAttemptsPerLogicalCall());
+        assertEquals(3, budget.maxHttpAttemptsPerLogicalCall());
     }
 
     @Test

@@ -298,6 +298,11 @@ public class StageConfigResolver {
                 client == null ? null : client.getSubAgent(),
                 local == null ? null : local.getSubAgent()));
 
+        // search_judge: client-only optional override (no Nacos default; inherits execution when absent)
+        merged.setSearchJudge(mergeStageLlmConfig(
+                client == null ? null : client.getSearchJudge(),
+                null));
+
         return merged;
     }
 

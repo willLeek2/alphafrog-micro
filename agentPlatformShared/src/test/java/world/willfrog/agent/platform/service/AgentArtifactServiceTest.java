@@ -10,7 +10,6 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.entity.AgentRunEvent;
-import world.willfrog.agent.platform.mapper.AgentRunEventMapper;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -24,7 +23,7 @@ import static org.mockito.Mockito.when;
 class AgentArtifactServiceTest {
 
     @Mock
-    private AgentRunEventMapper eventMapper;
+    private AgentEventService eventService;
 
     private AgentArtifactService service;
 
@@ -33,7 +32,7 @@ class AgentArtifactServiceTest {
 
     @BeforeEach
     void setUp() {
-        service = new AgentArtifactService(eventMapper, new ObjectMapper());
+        service = new AgentArtifactService(eventService, new ObjectMapper());
         ReflectionTestUtils.setField(service, "artifactStoragePath", tempDir.resolve("artifacts").toString());
         ReflectionTestUtils.setField(service, "datasetPath", tempDir.resolve("datasets").toString());
         ReflectionTestUtils.setField(service, "normalRetentionDays", 7);
@@ -74,7 +73,7 @@ class AgentArtifactServiceTest {
         e3.setPayloadJson("{\"todo_id\":\"todo_1\",\"success\":true,\"output_preview\":\"{\\\"ok\\\":true,\\\"data\\\":{\\\"dataset_id\\\":\\\"ds1\\\"}}\"}");
         e3.setCreatedAt(OffsetDateTime.now());
 
-        when(eventMapper.listByRunId("run-1")).thenReturn(List.of(e1, e2, e3));
+        when(eventService.listByRunId("run-1")).thenReturn(List.of(e1, e2, e3));
 
         var artifacts = service.listArtifacts(run, false);
 

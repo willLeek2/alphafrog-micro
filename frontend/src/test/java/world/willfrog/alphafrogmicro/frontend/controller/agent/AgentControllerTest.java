@@ -1,6 +1,7 @@
 package world.willfrog.alphafrogmicro.frontend.controller.agent;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.servlet.http.HttpServletRequest;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -8,6 +9,7 @@ import org.springframework.security.core.Authentication;
 import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.alphafrogmicro.agent.idl.AgentDubboService;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunEventMessage;
+import world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunResultMessage;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunResultRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentRunEventsRequest;
@@ -16,12 +18,19 @@ import world.willfrog.alphafrogmicro.agent.idl.SendAgentMessageRequest;
 import world.willfrog.alphafrogmicro.agent.idl.SendAgentMessageResponse;
 import world.willfrog.alphafrogmicro.common.dto.ResponseCode;
 import world.willfrog.alphafrogmicro.common.pojo.user.User;
+import world.willfrog.alphafrogmicro.frontend.model.agent.AgentCallDetailResponse;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentMessageSendRequest;
+import world.willfrog.alphafrogmicro.frontend.model.agent.AgentRunCreateRequest;
 import world.willfrog.alphafrogmicro.frontend.model.agent.TimelineResponse;
 import world.willfrog.alphafrogmicro.frontend.service.AuthService;
+import world.willfrog.alphafrogmicro.frontend.service.agent.AgentCallDetailBlobReader;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentRunResultCacheService;
 
+import java.util.Optional;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
@@ -33,6 +42,7 @@ class AgentControllerTest {
     private AgentDubboService agentDubboService;
     private AuthService authService;
     private AgentRunResultCacheService runResultCacheService;
+    private AgentCallDetailBlobReader callDetailBlobReader;
     private AgentController controller;
     private Authentication authentication;
 
@@ -43,8 +53,15 @@ class AgentControllerTest {
         runResultCacheService = new AgentRunResultCacheService();
         ReflectionTestUtils.setField(runResultCacheService, "agentDubboService", agentDubboService);
         ReflectionTestUtils.setField(runResultCacheService, "cacheTtlSeconds", 30L);
-        controller = new AgentController(authService, new ObjectMapper(), runResultCacheService);
-        ReflectionTestUtils.setField(controller, "agentDubboService", agentDubboService);
+        callDetailBlobReader = mock(AgentCallDetailBlobReader.class);
+        when(callDetailBlobReader.loadLlmCallDetail(any(), any())).thenReturn(Optional.empty());
+        when(callDetailBlobReader.loadToolCallDetail(any(), any())).thenReturn(Optional.empty());
+        controller = new AgentController(authService, new ObjectMapper(), runResultCacheService, callDetailBlobReader);
+        ReflectionTestUtils.setField(controller, "agentDubboServiceLangchain", agentDubboService);
+        ReflectionTestUtils.setField(controller, "agentDubboServiceLegacy", agentDubboService);
+        HttpServletRequest request = mock(HttpServletRequest.class);
+        when(request.getRequestURI()).thenReturn("/api/agent/runs/run-1");
+        ReflectionTestUtils.setField(controller, "request", request);
 
         authentication = mock(Authentication.class);
         when(authentication.isAuthenticated()).thenReturn(true);
@@ -62,6 +79,24 @@ class AgentControllerTest {
                         .setRunStatus("RECEIVED")
                         .build()
         );
+    }
+
+    @Test
+    void create_shouldReturnStreamUrl() {
+        when(authService.isUserActive(any(User.class))).thenReturn(true);
+        when(agentDubboService.createRun(any())).thenReturn(
+                AgentRunMessage.newBuilder()
+                        .setId("run-new")
+                        .setStatus("RUN_RECEIVED")
+                        .build()
+        );
+
+        var response = controller.create(authentication,
+                new AgentRunCreateRequest("hello", null, null, null,
+                        null, null, null, null, null, null, null));
+
+        assertEquals(ResponseCode.SUCCESS.getCode(), response.getCode());
+        assertEquals("/api/agent/runs/run-new/stream", response.getData().streamUrl());
     }
 
     @Test
@@ -167,5 +202,144 @@ class AgentControllerTest {
         TimelineResponse timeline = response.getData();
         assertEquals(2, timeline.items().size());
         assertEquals(1, timeline.items().stream().filter(item -> "trace".equals(item.source())).count());
+    }
+
+    @Test
+    void llmCallDetail_shouldReturnSafeDetail() {
+        String observability = """
+                {"summary":{},"diagnostics":{"llmTraces":[
+                  {"traceId":"llm-1","time":"2026-05-07T10:00:00Z","phase":"execution","stage":"execute",
+                   "durationMs":42,"model":"qwen-plus","hasError":false,"inputTokens":10,"outputTokens":5,
+                   "outputText":"full-secret","reasoningText":"reason-secret","httpRequest":{"x":1}}
+                ],"toolTraces":[]}}
+                """;
+        when(agentDubboService.getResult(any(GetAgentRunResultRequest.class))).thenReturn(
+                AgentRunResultMessage.newBuilder().setObservabilityJson(observability).build()
+        );
+
+        var response = controller.llmCallDetail(authentication, "run-1", "llm-1", false);
+
+        assertEquals(ResponseCode.SUCCESS.getCode(), response.getCode());
+        AgentCallDetailResponse detail = response.getData();
+        assertEquals("llm", detail.getType());
+        assertEquals(AgentCallDetailResponse.KIND_AVAILABLE, detail.getDetailKind());
+        assertEquals("llm-1", detail.getId());
+        assertNotNull(detail.getLlm());
+        assertFalse(detail.getSummary().contains("full-secret"));
+    }
+
+    @Test
+    void llmCallDetail_shouldReturnUnavailableWhenMissing() {
+        when(agentDubboService.getResult(any(GetAgentRunResultRequest.class))).thenReturn(
+                AgentRunResultMessage.newBuilder()
+                        .setObservabilityJson("{\"summary\":{},\"diagnostics\":{\"llmTraces\":[],\"toolTraces\":[]}}")
+                        .build()
+        );
+
+        var response = controller.llmCallDetail(authentication, "run-1", "missing", false);
+
+        assertEquals(ResponseCode.SUCCESS.getCode(), response.getCode());
+        assertEquals(AgentCallDetailResponse.KIND_UNAVAILABLE, response.getData().getDetailKind());
+    }
+
+    @Test
+    void toolCallDetail_shouldReturnUnavailableWhenTraceIdMismatch() {
+        String observability = """
+                {"summary":{},"diagnostics":{"llmTraces":[],"toolTraces":[
+                  {"traceId":"internal-trace-only","toolName":"searchAssetInfo","success":true,"output":"{}"}
+                ]}}
+                """;
+        when(agentDubboService.getResult(any(GetAgentRunResultRequest.class))).thenReturn(
+                AgentRunResultMessage.newBuilder().setObservabilityJson(observability).build()
+        );
+
+        var response = controller.toolCallDetail(authentication, "run-1", "sse-tool-call-id");
+
+        assertEquals(ResponseCode.SUCCESS.getCode(), response.getCode());
+        assertEquals(AgentCallDetailResponse.KIND_UNAVAILABLE, response.getData().getDetailKind());
+    }
+
+    @Test
+    void llmCallDetail_adminWithThinking_returnsReasoningContent() {
+        // admin user, blob has reasoningText → includeThinking=true 应映射到 reasoningContent
+        String observability = """
+                {"summary":{},"diagnostics":{"llmTraces":[
+                  {"traceId":"llm-1","time":"2026-05-07T10:00:00Z","phase":"execution","stage":"execute",
+                   "durationMs":42,"model":"qwen-plus","hasError":false,"inputTokens":10,"outputTokens":5,
+                   "detailBlobStored":true}
+                ],"toolTraces":[]}}
+                """;
+        when(agentDubboService.getResult(any(GetAgentRunResultRequest.class))).thenReturn(
+                AgentRunResultMessage.newBuilder().setObservabilityJson(observability).build()
+        );
+        when(callDetailBlobReader.loadLlmCallDetail("run-1", "llm-1"))
+                .thenReturn(Optional.of("{\"type\":\"llm\",\"traceId\":\"llm-1\",\"reasoningText\":\"admin-reasoning-text\"}"));
+
+        var response = controller.llmCallDetail(authentication, "run-1", "llm-1", true);
+
+        assertEquals(ResponseCode.SUCCESS.getCode(), response.getCode());
+        AgentCallDetailResponse detail = response.getData();
+        assertEquals(AgentCallDetailResponse.KIND_AVAILABLE, detail.getDetailKind());
+        assertNotNull(detail.getLlm());
+        assertEquals("admin-reasoning-text", detail.getLlm().getReasoningContent());
+        assertEquals(null, detail.getReasoningUnavailable());
+    }
+
+    @Test
+    void llmCallDetail_nonAdminWithThinking_doesNotReturnReasoningContent() {
+        // 非 admin 用户即使传 includeThinking=true 也应被服务端降级为 false（不抛错）
+        User nonAdmin = new User();
+        nonAdmin.setUserId(99L);
+        nonAdmin.setUserType(1); // 1 = 普通用户
+        when(authService.getUserByUsername("admin")).thenReturn(nonAdmin);
+
+        String observability = """
+                {"summary":{},"diagnostics":{"llmTraces":[
+                  {"traceId":"llm-1","time":"2026-05-07T10:00:00Z","phase":"execution","stage":"execute",
+                   "durationMs":42,"model":"qwen-plus","hasError":false,"inputTokens":10,"outputTokens":5,
+                   "detailBlobStored":true}
+                ],"toolTraces":[]}}
+                """;
+        when(agentDubboService.getResult(any(GetAgentRunResultRequest.class))).thenReturn(
+                AgentRunResultMessage.newBuilder().setObservabilityJson(observability).build()
+        );
+        when(callDetailBlobReader.loadLlmCallDetail("run-1", "llm-1"))
+                .thenReturn(Optional.of("{\"type\":\"llm\",\"traceId\":\"llm-1\",\"reasoningText\":\"leak-should-not-appear\"}"));
+
+        var response = controller.llmCallDetail(authentication, "run-1", "llm-1", true);
+
+        assertEquals(ResponseCode.SUCCESS.getCode(), response.getCode());
+        AgentCallDetailResponse detail = response.getData();
+        // 非 admin 强制走 includeThinking=false 分支：blob 仍存在所以 source 是 redis，但 thinking 字段一律不出
+        assertEquals(AgentCallDetailResponse.SOURCE_CALL_DETAIL_REDIS, detail.getSource());
+        assertNotNull(detail.getLlm());
+        assertEquals(null, detail.getLlm().getReasoningContent());
+        assertEquals(null, detail.getReasoningUnavailable());
+    }
+
+    @Test
+    void llmCallDetail_adminWithThinkingButBlobMissing_returnsAvailableWithHint() {
+        // admin + includeThinking=true + blob 缺：detailKind 仍为 AVAILABLE，reasoningContent=null，reasoningUnavailable=true
+        String observability = """
+                {"summary":{},"diagnostics":{"llmTraces":[
+                  {"traceId":"llm-1","time":"2026-05-07T10:00:00Z","phase":"execution","stage":"execute",
+                   "durationMs":42,"model":"qwen-plus","hasError":false,"inputTokens":10,"outputTokens":5,
+                   "detailBlobStored":true}
+                ],"toolTraces":[]}}
+                """;
+        when(agentDubboService.getResult(any(GetAgentRunResultRequest.class))).thenReturn(
+                AgentRunResultMessage.newBuilder().setObservabilityJson(observability).build()
+        );
+        when(callDetailBlobReader.loadLlmCallDetail("run-1", "llm-1")).thenReturn(Optional.empty());
+
+        var response = controller.llmCallDetail(authentication, "run-1", "llm-1", true);
+
+        assertEquals(ResponseCode.SUCCESS.getCode(), response.getCode());
+        AgentCallDetailResponse detail = response.getData();
+        assertEquals(AgentCallDetailResponse.KIND_AVAILABLE, detail.getDetailKind());
+        assertEquals(Boolean.TRUE, detail.getReasoningUnavailable());
+        if (detail.getLlm() != null) {
+            assertEquals(null, detail.getLlm().getReasoningContent());
+        }
     }
 }

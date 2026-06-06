@@ -4,7 +4,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.entity.AgentRunEvent;
-import world.willfrog.agent.platform.mapper.AgentRunEventMapper;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentArtifactService;
@@ -13,6 +12,7 @@ import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agent.platform.service.AgentMessageService;
 import world.willfrog.agent.platform.service.AgentModelCatalogService;
 import world.willfrog.agent.platform.service.AgentObservabilityService;
+import world.willfrog.agent.platform.service.AgentRunCostService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agent.platform.service.SnapshotPartService;
 import world.willfrog.agentlangchain.routing.LangchainSingleWriterGuard;
@@ -31,11 +31,11 @@ import static org.mockito.Mockito.*;
 class LangchainRunReadServiceTest {
 
     private final AgentRunMapper runMapper = mock(AgentRunMapper.class);
-    private final AgentRunEventMapper eventMapper = mock(AgentRunEventMapper.class);
     private final AgentEventService eventService = mock(AgentEventService.class);
     private final AgentRunStateStore stateStore = mock(AgentRunStateStore.class);
     private final AgentObservabilityService observabilityService = mock(AgentObservabilityService.class);
     private final AgentCreditService creditService = mock(AgentCreditService.class);
+    private final AgentRunCostService runCostService = mock(AgentRunCostService.class);
     private final AgentModelCatalogService modelCatalogService = mock(AgentModelCatalogService.class);
     private final AgentMessageService messageService = mock(AgentMessageService.class);
     private final SnapshotPartService snapshotPartService = mock(SnapshotPartService.class);
@@ -45,11 +45,11 @@ class LangchainRunReadServiceTest {
 
     private final LangchainRunReadService service = new LangchainRunReadService(
             runMapper,
-            eventMapper,
             eventService,
             stateStore,
             observabilityService,
             creditService,
+            runCostService,
             modelCatalogService,
             messageService,
             snapshotPartService,
@@ -77,7 +77,7 @@ class LangchainRunReadServiceTest {
         when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(run);
         AgentRunEvent event1 = event(3, "PLAN_READY");
         AgentRunEvent event2 = event(4, "TODO_STARTED");
-        when(eventMapper.listByRunIdAfterSeq("r1", 2, 2)).thenReturn(List.of(event1, event2));
+        when(eventService.listByRunIdAfterSeq("r1", 2, 2)).thenReturn(List.of(event1, event2));
 
         var response = service.listEvents(ListAgentRunEventsRequest.newBuilder()
                 .setUserId("u1")
@@ -93,12 +93,33 @@ class LangchainRunReadServiceTest {
     }
 
     @Test
+    void listEventsLatestReturnsRecentEventsWithoutHasMore() {
+        AgentRun run = run("{\"run_provider\":\"langchain\"}");
+        when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(run);
+        AgentRunEvent event9 = event(9, "TOOL_CALL_STARTED");
+        AgentRunEvent event10 = event(10, "TOOL_CALL_FINISHED");
+        when(eventService.listLatestByRunId("r1", 10)).thenReturn(List.of(event9, event10));
+
+        var response = service.listEvents(ListAgentRunEventsRequest.newBuilder()
+                .setUserId("u1")
+                .setId("r1")
+                .setLimit(10)
+                .setLatest(true)
+                .build());
+
+        assertEquals(2, response.getItemsCount());
+        assertEquals(9, response.getItems(0).getSeq());
+        assertEquals(10, response.getNextAfterSeq());
+        assertFalse(response.getHasMore());
+    }
+
+    @Test
     void getResultExtractsAnswerAndCredits() {
         AgentRun run = run("{\"run_provider\":\"langchain\"}");
         run.setSnapshotJson("{\"answer_markdown\":\"done\"}");
         when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(run);
         when(observabilityService.loadObservabilityJson("r1", run.getSnapshotJson())).thenReturn("{\"summary\":{}}");
-        when(eventMapper.listByRunId("r1")).thenReturn(List.of());
+        when(eventService.listByRunId("r1")).thenReturn(List.of());
         when(creditService.calculateRunTotalCredits(eq(run), anyList(), eq("{\"summary\":{}}"))).thenReturn(7);
 
         var result = service.getResult(GetAgentRunResultRequest.newBuilder()
@@ -119,8 +140,8 @@ class LangchainRunReadServiceTest {
         when(stateStore.buildProgressJson("r1", run.getPlanJson())).thenReturn("{\"progress\":true}");
         when(observabilityService.loadObservabilitySummaryJson("r1", run.getSnapshotJson())).thenReturn("{\"summary\":true}");
         when(observabilityService.isFullObservabilityAvailable("r1", run.getSnapshotJson())).thenReturn(true);
-        when(eventMapper.listByRunId("r1")).thenReturn(List.of());
-        when(eventMapper.findMaxSeq("r1")).thenReturn(4);
+        when(eventService.listByRunId("r1")).thenReturn(List.of());
+        when(eventService.findMaxSeq("r1")).thenReturn(4);
 
         var status = service.getStatus(GetAgentRunStatusRequest.newBuilder()
                 .setUserId("u1")
@@ -131,6 +152,29 @@ class LangchainRunReadServiceTest {
         assertEquals("{\"summary\":true}", status.getObservabilitySummaryJson());
         assertTrue(status.getObservabilityFullAvailable());
         verify(observabilityService, never()).loadObservabilityJson(anyString(), any());
+    }
+
+    @Test
+    void getRunCostProjectsAndPersistsFromFullObservability() {
+        AgentRun run = run("{\"run_provider\":\"langchain\"}");
+        when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(run);
+        when(observabilityService.loadObservabilityJson("r1", run.getSnapshotJson())).thenReturn("{\"diagnostics\":{}}");
+        var cost = world.willfrog.alphafrogmicro.agent.idl.AgentRunCostMessage.newBuilder()
+                .setId("r1")
+                .setTotalCost(0.012)
+                .setHasTotalCost(true)
+                .setPersisted(true)
+                .build();
+        when(runCostService.buildAndPersist(run, "{\"diagnostics\":{}}")).thenReturn(cost);
+
+        var response = service.getRunCost(world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCostRequest.newBuilder()
+                .setUserId("u1")
+                .setId("r1")
+                .build());
+
+        assertEquals(0.012, response.getTotalCost());
+        assertTrue(response.getPersisted());
+        verify(runCostService).buildAndPersist(run, "{\"diagnostics\":{}}");
     }
 
     private AgentRun run(String ext) {

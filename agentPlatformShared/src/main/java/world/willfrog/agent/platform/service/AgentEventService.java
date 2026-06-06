@@ -12,6 +12,7 @@ import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.entity.AgentRunEvent;
 import world.willfrog.agent.platform.mapper.AgentRunEventMapper;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
+import world.willfrog.agent.platform.model.AgentRunEventEnvelope;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 
 import java.time.OffsetDateTime;
@@ -38,9 +39,9 @@ import java.util.Map;
  * <ul>
  *   <li>主表 {@code ext} 字段存 run 级 JSON 配置(model_name / endpoint_name / debug_mode /
  *       stage_config_json / context_json 等),供后续执行环节读取。</li>
- *   <li>事件表按 (runId, seq) 顺序追加每一步关键事件(RUN_RECEIVED / EXECUTION_STARTED /
- *       TODO_STARTED / WORKFLOW_COMPLETED 等),seq 通过 Redis INCR 原子生成,
- *       保证同一 run 内并发追加时事件不会乱序。</li>
+ *   <li>事件流默认写入 Redis ZSET（{@code agent:run:events:<runId>}，TTL 7 天）；
+ *       seq 通过 Redis INCR 原子生成。过渡期仍双写 {@code agent_run_event} 表，
+ *       读路径 Redis 无数据时回退 DB；DB 落库将在不久后删除。</li>
  * </ul>
  *
  * <h3>ext 字段提取方法集</h3>
@@ -61,10 +62,15 @@ public class AgentEventService {
     /** Redis 事件序号 key 前缀,完整 key 为 {@code agent:run:event_seq:<runId>} */
     private static final String EVENT_SEQ_KEY_PREFIX = "agent:run:event_seq:";
 
+    /** Redis live 事件频道前缀,完整 channel 为 {@code agent:events:<runId>} */
+    public static final String EVENT_CHANNEL_PREFIX = "agent:events:";
+
     /** run 主表读写。 */
     private final AgentRunMapper runMapper;
-    /** run 事件表读写。 */
+    /** run 事件表读写（过渡期双写，将删除）。 */
     private final AgentRunEventMapper eventMapper;
+    /** run 事件 Redis 持久化（默认读写路径）。 */
+    private final AgentRunEventRedisStore eventRedisStore;
     /** JSON 序列化/反序列化工具。 */
     private final ObjectMapper objectMapper;
     /** Redis 客户端：用于事件序号原子递增。 */
@@ -251,7 +257,17 @@ public class AgentEventService {
         event.setEventType(eventType);
         // payload 已经是字符串则直接使用,否则序列化为 JSON
         String payloadJson = payload instanceof String ? (String) payload : writeJson(payload);
-        event.setPayloadJson(normalizePayloadJson(eventType, payloadJson));
+        String normalizedPayloadJson = normalizePayloadJson(eventType, payloadJson);
+        event.setPayloadJson(normalizedPayloadJson);
+        OffsetDateTime publishedAt = OffsetDateTime.now();
+        event.setCreatedAt(publishedAt);
+        eventRedisStore.append(event);
+        // Terminal events flush the pending buffer immediately so no events are lost.
+        if (isTerminalEventType(eventType)) {
+            eventRedisStore.flush(runId);
+        }
+        // TRANSITIONAL: dual-write to PostgreSQL until all readers are Redis-only.
+        // This database insert will be removed in a near-term release.
         try {
             eventMapper.insert(event);
         } catch (Exception e) {
@@ -261,6 +277,106 @@ public class AgentEventService {
             );
             log.error(msg, e);
             throw new IllegalStateException(msg, e);
+        }
+        publishLiveEvent(runId, nextSeq, eventType, normalizedPayloadJson, publishedAt);
+    }
+
+    /**
+     * 按 seq 游标增量读取事件（默认 Redis；Redis 无该 run 数据时回退 DB）。
+     */
+    public List<AgentRunEvent> listByRunIdAfterSeq(String runId, int afterSeq, int limit) {
+        if (eventRedisStore.hasEvents(runId)) {
+            return eventRedisStore.listByRunIdAfterSeq(runId, afterSeq, limit);
+        }
+        // TRANSITIONAL: remove this database fallback once historical runs age out.
+        return eventMapper.listByRunIdAfterSeq(runId, afterSeq, limit);
+    }
+
+    /**
+     * 读取 run 最近 N 条事件（默认 Redis；Redis 无该 run 数据时回退 DB）。
+     */
+    public List<AgentRunEvent> listLatestByRunId(String runId, int limit) {
+        if (eventRedisStore.hasEvents(runId)) {
+            return eventRedisStore.listLatestByRunId(runId, limit);
+        }
+        // TRANSITIONAL: remove this database fallback once historical runs age out.
+        return eventMapper.listLatestByRunId(runId, limit);
+    }
+
+    /**
+     * 读取 run 全部事件（默认 Redis；Redis 无该 run 数据时回退 DB）。
+     */
+    public List<AgentRunEvent> listByRunId(String runId) {
+        if (eventRedisStore.hasEvents(runId)) {
+            return eventRedisStore.listByRunId(runId);
+        }
+        // TRANSITIONAL: remove this database fallback once historical runs age out.
+        return eventMapper.listByRunId(runId);
+    }
+
+    public AgentRunEvent findLatestByRunId(String runId) {
+        if (eventRedisStore.hasEvents(runId)) {
+            return eventRedisStore.findLatestByRunId(runId);
+        }
+        // TRANSITIONAL: remove this database fallback once historical runs age out.
+        return eventMapper.findLatestByRunId(runId);
+    }
+
+    public Integer findMaxSeq(String runId) {
+        if (eventRedisStore.hasEvents(runId)) {
+            return eventRedisStore.findMaxSeq(runId);
+        }
+        // TRANSITIONAL: remove this database fallback once historical runs age out.
+        return eventMapper.findMaxSeq(runId);
+    }
+
+    /**
+     * 组装 run 级 Redis live 事件频道。
+     *
+     * @param runId 任务 ID
+     * @return Redis channel，例如 {@code agent:events:<runId>}
+     */
+    public static String eventChannel(String runId) {
+        return EVENT_CHANNEL_PREFIX + (runId == null ? "" : runId);
+    }
+
+    /**
+     * Terminal event types that trigger immediate buffer flush.
+     * These indicate the run has reached a final state and no more
+     * events are expected; flushing ensures nothing is left buffered.
+     */
+    private static boolean isTerminalEventType(String eventType) {
+        if (eventType == null) {
+            return false;
+        }
+        return switch (eventType) {
+            case "WORKFLOW_COMPLETED",
+                 "MESSAGE_COMPLETED",
+                 "WORKFLOW_FAILED",
+                 "CANCELED",
+                 "RUN_EXPIRED",
+                 "DAG_EXECUTION_COMPLETED" -> true;
+            default -> false;
+        };
+    }
+
+    private void publishLiveEvent(String runId,
+                                  int seq,
+                                  String eventType,
+                                  String payloadJson,
+                                  OffsetDateTime createdAt) {
+        try {
+            AgentRunEventEnvelope envelope = new AgentRunEventEnvelope(
+                    runId,
+                    seq,
+                    eventType,
+                    payloadJson == null || payloadJson.isBlank() ? "{}" : payloadJson,
+                    createdAt == null ? OffsetDateTime.now().toString() : createdAt.toString()
+            );
+            redisTemplate.convertAndSend(eventChannel(runId), writeJson(envelope));
+        } catch (Exception e) {
+            log.warn("[AgentEventService] live event publish failed: runId={}, eventType={}, seq={}, error={}",
+                    runId, eventType, seq, e.getMessage());
         }
     }
 

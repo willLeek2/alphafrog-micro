@@ -6,7 +6,6 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.entity.AgentRunEvent;
-import world.willfrog.agent.platform.mapper.AgentRunEventMapper;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.alphafrogmicro.common.dao.agent.AgentCreditApplicationDao;
 import world.willfrog.alphafrogmicro.common.dao.agent.AgentCreditLedgerDao;
@@ -32,7 +31,7 @@ public class AgentCreditService {
     private final AgentCreditApplicationDao creditApplicationDao;
     private final AgentCreditLedgerDao creditLedgerDao;
     private final AgentRunMapper runMapper;
-    private final AgentRunEventMapper eventMapper;
+    private final AgentEventService eventService;
     private final AgentModelCatalogService modelCatalogService;
     private final ObjectMapper objectMapper;
 
@@ -128,7 +127,7 @@ public class AgentCreditService {
         if (run == null) {
             return 0;
         }
-        List<AgentRunEvent> events = eventMapper.listByRunId(runId);
+        List<AgentRunEvent> events = eventService.listByRunId(runId);
         return calculateRunTotalCredits(run, events, observabilityJson);
     }
 

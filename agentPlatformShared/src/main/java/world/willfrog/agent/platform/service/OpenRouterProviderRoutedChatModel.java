@@ -23,6 +23,7 @@ import world.willfrog.agent.platform.context.AgentContext;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.net.ProxySelector;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.http.HttpClient;
@@ -55,6 +56,8 @@ import java.util.Map;
  *   <li><b>原始 HTTP 捕获</b>：完整记录请求/响应信息</li>
  *   <li><b>可观测性上报</b>：将 HTTP 观测数据上报到 AgentObservabilityService</li>
  *   <li><b>默认流式输出</b>：对 LLM Provider 使用 stream=true，内部聚合 SSE 流</li>
+ *   <li><b>实时事件契约</b>：为每次逻辑调用生成 {@code llm_call_id}，并在
+ *       {@code LLM_CALL_STARTED/DELTA/FINISHED} 中带上 todo/workflow/stage 归属</li>
  * </ol>
  *
  * <p>需要特别注意 OpenRouter 的 fallback 语义：只要请求体没有显式写
@@ -72,8 +75,10 @@ import java.util.Map;
 public class OpenRouterProviderRoutedChatModel implements ChatModel {
 
     private static final HttpClient HTTP_CLIENT = HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(30))
+            .proxy(ProxySelector.getDefault())
+            .connectTimeout(Duration.ofSeconds(45))
             .build();
+    private static final Duration STREAM_IDLE_TIMEOUT = Duration.ofSeconds(25);
 
     // ========== 核心依赖 ==========
 
@@ -90,10 +95,14 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
     private final RawHttpLogger httpLogger;
     private final AgentObservabilityService observabilityService;
     private final OpenRouterCostService openRouterCostService;
+    private final AgentEventService eventService;
     private final String endpointName;
-    
+
     // Debug 配置加载器（热加载）
     private final AgentLlmLocalConfigLoader localConfigLoader;
+
+    // LLM latency window for adaptive concurrency (shared across all calls)
+    private final LangchainLlmLatencyWindow latencyWindow;
 
     @Setter
     private AgentRunBudgetService budgetService;
@@ -132,14 +141,18 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
         String responseJson = null;
         List<Map<String, Object>> attempts = List.of();
         
+        // 这个 id 是前端看到的 llm_call_id，同时也是 observability traceId override。
+        // 保持二者一致后，UI 可以从 SSE 卡片懒加载 safe detail，而不需要再猜 provider generation_id。
+        String llmTraceId = java.util.UUID.randomUUID().toString().replace("-", "");
         try {
             if (budgetService != null) {
                 budgetService.checkBeforeLlmCall();
             }
+            emitLlmCallStarted(llmTraceId, true);
             // ========== 1. 构建请求 ==========
             ChatCompletionRequest.Builder builder = ChatCompletionRequest.builder()
                     .model(OpenAiCompatibleChatModelSupport.nvl(modelName))
-                    .messages(OpenAiUtils.toOpenAiMessages(messages == null ? List.of() : messages))
+                    .messages(OpenAiUtils.toOpenAiMessages(messages == null ? List.of() : messages, true, "reasoning_content"))
                     .temperature(temperature)
                     .maxCompletionTokens(maxTokens);
             
@@ -231,12 +244,12 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
                 requestRecord = httpLogger.recordRequest(requestUrl, "POST", requestHeaders, requestJson);
             }
             
-            // Debug curl 日志（热加载配置）
-            if (isDebugCurlEnabled()) {
-                curlCommand = buildCurlCommand(requestUrl, requestHeaders, requestJson);
-                log.info("[LLM Debug CURL] endpoint={} model={} providerOrder={}\n{}", 
-                        endpointName, modelName, providerOrder, curlCommand);
-            }
+            // Debug curl 日志（热加载 debug.logLlmCurl）— 临时关闭：整包 request body 打 INFO 会撑爆远程 tmux 日志
+            // if (isDebugCurlEnabled()) {
+            //     curlCommand = buildCurlCommand(requestUrl, requestHeaders, requestJson);
+            //     log.info("[LLM Debug CURL] endpoint={} model={} providerOrder={}\n{}",
+            //             endpointName, modelName, providerOrder, curlCommand);
+            // }
             
             // ========== 2. 发送 HTTP 请求（流式，按 logical call 聚合重试） ==========
             //
@@ -244,9 +257,9 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
             // agent 语义重试会重新让模型思考，而 HTTP retry 只是同一份请求体重发。
             // 因此 retry 次数由 run budget 单独限制，避免一个 LLM step 因 provider 抖动
             // 消耗过多 wall-clock。
-            int maxAttempts = budgetService == null ? 2 : budgetService.maxHttpAttemptsPerLogicalCall();
-            AttemptResult attemptResult = sendWithRetry(httpRequestBuilder, shouldCapture, requestRecord, requestStartedAt,
-                    maxAttempts, requestTimeout);
+            int maxAttempts = budgetService == null ? 3 : budgetService.maxHttpAttemptsPerLogicalCall();
+            AttemptResult attemptResult = sendWithRetry(requestJson, requestUrl, apiKey, customHeaders,
+                    shouldCapture, requestStartedAt, maxAttempts, requestTimeout);
             attempts = attemptResult.attempts();
             HttpResponse<java.io.InputStream> httpResponse = attemptResult.response();
             responseRecord = attemptResult.responseRecord();
@@ -257,6 +270,7 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
             ChatCompletionResponse completion;
             String reasoningContent = null;
             StreamingProgressTracker.StreamingProgressSnapshot progressSnapshot = null;
+            OpenAiCompatibleChatModelSupport.SseAggregateResult aggregateResult = null;
 
             if (statusCode >= 200 && statusCode < 300) {
                 // 流式响应：解析 SSE。
@@ -265,12 +279,13 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
                 // usage 等信息拆在多个 chunk 中返回。这里用聚合器还原成一个
                 // ChatCompletionResponse，后续 LangChain4j 才能像非流式响应一样读取
                 // AiMessage 和 TokenUsage。
-                StreamingProgressTracker tracker = createStreamingProgressTracker();
-                OpenAiCompatibleChatModelSupport.SseAggregateResult aggregateResult =
+                StreamingProgressTracker tracker = createStreamingProgressTracker(llmTraceId);
+                aggregateResult =
                         OpenAiCompatibleChatModelSupport.aggregateSseStream(
-                                httpResponse.body(), objectMapper, log, tracker
+                                httpResponse.body(), objectMapper, log, tracker, STREAM_IDLE_TIMEOUT
                         );
                 durationMs = System.currentTimeMillis() - requestStartedAt;
+                latencyWindow.record(durationMs);
                 progressSnapshot = tracker.onStreamComplete(durationMs);
                 completion = aggregateResult.completionResponse();
                 reasoningContent = aggregateResult.reasoningContent();
@@ -298,13 +313,22 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
             }
             
             // 解析响应体
-            AiMessage aiMessage = OpenAiUtils.aiMessageFrom(completion);
+            AiMessage aiMessage = OpenAiUtils.aiMessageFrom(completion, true);
             TokenUsage tokenUsage = OpenAiUtils.tokenUsageFrom(completion.usage());
             FinishReason finishReason = OpenAiCompatibleChatModelSupport.extractFinishReason(completion);
 
-            // 保存 thinking 内容和进度
+            // 保存 thinking 内容和进度。
+            // reasoningContent 来自 SSE 聚合，同时回写 AiMessage.thinking()
+            // 以防合成的 completion 未带 reasoning_content 时 toOpenAiMessages 丢字段。
             if (reasoningContent != null && !reasoningContent.isBlank()) {
                 AgentContext.setThinkingContent(reasoningContent);
+                if (aiMessage.thinking() == null || aiMessage.thinking().isBlank()) {
+                    aiMessage = AiMessage.builder()
+                            .text(aiMessage.text())
+                            .thinking(reasoningContent)
+                            .toolExecutionRequests(aiMessage.toolExecutionRequests())
+                            .build();
+                }
             }
             if (progressSnapshot != null) {
                 AgentContext.setStreamingProgress(progressSnapshot);
@@ -335,11 +359,18 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
             }
 
             // ALP-25：上报成功观测（含 raw HTTP）
+            String observabilityTraceId = null;
             if (shouldCapture && observabilityService != null) {
-                reportLlmCall(requestRecord, responseRecord, curlCommand, requestStartedAt, durationMs, null,
+                observabilityTraceId = reportLlmCall(llmTraceId, requestRecord, responseRecord, curlCommand, requestStartedAt, durationMs, null,
                         reasoningContent, progressSnapshot, attemptResult.attempts());
             }
-            
+
+            // SSE live event: LLM call finished (success)
+            Double actualCost = extractActualCostFromUsage(aggregateResult.lastUsage());
+            String generationId = aggregateResult.lastId();
+            emitLlmCallFinished(llmTraceId, tokenUsage, durationMs, actualCost, generationId, null,
+                    observabilityTraceId, attemptResult.attempts());
+
             return ChatResponse.builder()
                     .aiMessage(aiMessage)
                     .metadata(ChatResponseMetadata.builder()
@@ -350,28 +381,34 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
             
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            
+
+            // SSE live event: LLM call finished (interrupted)
+            long durationMs = System.currentTimeMillis() - requestStartedAt;
+            emitLlmCallFinished(llmTraceId, null, durationMs, null, null, "INTERRUPTED", null, attempts);
+
             // ALP-25：上报中断错误
             if (shouldCapture && observabilityService != null) {
-                long durationMs = System.currentTimeMillis() - requestStartedAt;
-                reportLlmCall(requestRecord, responseRecord, curlCommand, requestStartedAt, durationMs, "INTERRUPTED",
+                reportLlmCall(llmTraceId, requestRecord, responseRecord, curlCommand, requestStartedAt, durationMs, "INTERRUPTED",
                         null, null, List.of());
             }
-            
+
             String detail = "OpenRouter provider routed chat completion interrupted"
                     + " (providers=" + providerOrder
                     + ", model=" + OpenAiCompatibleChatModelSupport.nvl(modelName) + ")";
             throw new IllegalStateException(detail, e);
             
         } catch (Exception e) {
+            // SSE live event: LLM call finished (error)
+            long durationMs = System.currentTimeMillis() - requestStartedAt;
+            String errorType = e.getClass().getSimpleName();
+            emitLlmCallFinished(llmTraceId, null, durationMs, null, null, errorType + ": " + e.getMessage(), null, attempts);
+
             // ALP-25：上报异常
             if (shouldCapture && observabilityService != null) {
-                long durationMs = System.currentTimeMillis() - requestStartedAt;
-                String errorType = e.getClass().getSimpleName();
-                reportLlmCall(requestRecord, responseRecord, curlCommand, requestStartedAt, durationMs,
+                reportLlmCall(llmTraceId, requestRecord, responseRecord, curlCommand, requestStartedAt, durationMs,
                             errorType + ": " + e.getMessage(), null, null, attempts);
             }
-            
+
             String detail = "OpenRouter provider routed chat completion failed"
                     + " (providers=" + providerOrder
                     + ", model=" + OpenAiCompatibleChatModelSupport.nvl(modelName)
@@ -389,6 +426,7 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
      * attempts 参数的版本，把每次 HTTP attempt 的状态码、耗时、错误摘要一起写入 trace。</p>
      */
     private String reportLlmCall(
+            String llmCallId,
             RawHttpLogger.HttpRequestRecord request,
             RawHttpLogger.HttpResponseRecord response,
             String curlCommand,
@@ -397,11 +435,12 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
             String errorMessage,
             String thinkingContent,
             StreamingProgressTracker.StreamingProgressSnapshot streamingProgress) {
-        return reportLlmCall(request, response, curlCommand, startedAtMillis, durationMs, errorMessage,
+        return reportLlmCall(llmCallId, request, response, curlCommand, startedAtMillis, durationMs, errorMessage,
                 thinkingContent, streamingProgress, List.of());
     }
 
     private String reportLlmCall(
+            String llmCallId,
             RawHttpLogger.HttpRequestRecord request,
             RawHttpLogger.HttpResponseRecord response,
             String curlCommand,
@@ -417,6 +456,9 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
          * 这里会再次从 response 中提取 tokenUsage/cachedTokens，而不是复用 doChat
          * 中的 TokenUsage，原因是异常路径可能没有成功构造 ChatCompletionResponse，
          * 但 responseRecord 中仍然可能包含 provider 返回的 usage 或错误体。
+         *
+         * llmCallId 由 SSE live event 和 observability 共用。Step 2 存储治理后，
+         * raw 请求/响应会被拆到 Redis detail blob，snapshot 中只保留安全摘要索引。
          */
         if (observabilityService == null) {
             return null;
@@ -433,7 +475,7 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
         Integer cachedTokens = OpenAiCompatibleChatModelSupport.extractCachedTokensFromResponse(objectMapper, response, log);
         long completedAtMillis = startedAtMillis + durationMs;
         
-        String traceId = observabilityService.recordLlmCallWithRawHttp(
+        return observabilityService.recordLlmCallWithRawHttp(
                 runId,
                 phase != null ? phase : "unknown",
                 tokenUsage,
@@ -449,24 +491,30 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
                 request,
                 response,
                 curlCommand,
-                attempts
+                attempts,
+                llmCallId
         );
-        AgentContext.setProviderLlmTraceId(traceId);
-        return traceId;
     }
 
-    private StreamingProgressTracker createStreamingProgressTracker() {
+    private StreamingProgressTracker createStreamingProgressTracker(String llmTraceId) {
         /*
          * StreamingProgressTracker 解决的是长输出阶段「服务端还在流式返回，但前端看起来没动」
          * 的问题。它会按配置间隔写入 chunk 数、字符数、phase 等轻量进度，使 matrix poll
          * 能区分卡死、慢 summarizing、正常 tool execution 三种状态。
+         *
+         * 进度上报拆分为 observability（可选）和 live event（可选）两条独立链路：
+         * 任一链路开启时都会创建 tracker 并触发 ProgressReporter 回调，回调内部再各自判断。
          */
         String runId = AgentContext.getRunId();
         String phase = AgentContext.getPhase();
-        boolean reportEnabled = isStreamingProgressReportEnabled()
+        boolean observabilityEnabled = isStreamingProgressReportEnabled()
                 && observabilityService != null
                 && runId != null
                 && !runId.isBlank();
+        boolean liveEventEnabled = eventService != null
+                && runId != null
+                && !runId.isBlank();
+        boolean reportEnabled = observabilityEnabled || liveEventEnabled;
         return new StreamingProgressTracker(
                 log,
                 modelName,
@@ -474,20 +522,29 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
                 isSseProgressLogEnabled(),
                 reportEnabled,
                 streamingProgressUpdateIntervalMs(),
-                (snapshot, completed) -> observabilityService.recordStreamingProgress(
-                        runId,
-                        phase != null ? phase : "unknown",
-                        endpointName,
-                        modelName,
-                        snapshot,
-                        completed
-                )
+                (snapshot, completed) -> {
+                    // 写 observability（原有行为，条件已在前方判断）
+                    if (observabilityEnabled) {
+                        observabilityService.recordStreamingProgress(
+                                runId,
+                                phase != null ? phase : "unknown",
+                                endpointName,
+                                modelName,
+                                snapshot,
+                                completed
+                        );
+                    }
+                    // emit SSE live event（独立于 observability 开关）
+                    emitLlmCallDelta(llmTraceId, snapshot);
+                }
         );
     }
 
-    private AttemptResult sendWithRetry(HttpRequest.Builder httpRequestBuilder,
+    private AttemptResult sendWithRetry(String requestJson,
+                                        String requestUrl,
+                                        String apiKey,
+                                        Map<String, String> customHeaders,
                                         boolean shouldCapture,
-                                        RawHttpLogger.HttpRequestRecord requestRecord,
                                         long logicalStartedAt,
                                         int maxAttempts,
                                         Duration requestTimeout) throws IOException, InterruptedException {
@@ -495,6 +552,12 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
          * 这里把多个 HTTP attempt 包装成一个 AttemptResult 返回给 doChat。
          * 调用方只看到一次 ChatResponse；observability 才会看到每次 attempt 的细节。
          * 这样可以避免 provider 轻微抖动直接暴露给 agent loop，同时保留排障证据。
+         *
+         * 业务层 provider 顺序重排（ALP-25 增强）：
+         * - 当 OpenRouter endpoint 且 providerOrder.size() > 1 时，
+         *   每次重试前将上次首选的 provider 移到 order 末尾，尝试下一个 provider。
+         * - 始终保持 allow_fallbacks=false，不把 provider 选择权交给 OpenRouter。
+         * - 单 provider 时跳过重排，避免无意义循环。
          */
         List<Map<String, Object>> attempts = new ArrayList<>();
         Exception lastException = null;
@@ -502,12 +565,38 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
         String lastErrorBody = null;
         int lastStatusCode = -1;
         int cappedAttempts = Math.max(1, maxAttempts);
+
+        // 当前请求体（可能在重试时被修改）和 provider 顺序
+        String currentRequestJson = requestJson;
+        List<String> currentProviderOrder = (providerOrder == null || providerOrder.isEmpty())
+                ? null : new ArrayList<>(providerOrder);
+        boolean isOpenRouter = isOpenRouterEndpoint(baseUrl);
+
         for (int attempt = 1; attempt <= cappedAttempts; attempt++) {
             if (budgetService != null) {
                 budgetService.checkHttpAttempt(attempt);
             }
+
+            // 重试前重排 provider order（业务层，非 OpenRouter fallback）
+            if (attempt > 1 && isOpenRouter && currentProviderOrder != null && currentProviderOrder.size() > 1) {
+                List<String> reordered = rotateProviderOrder(currentProviderOrder);
+                if (!reordered.equals(currentProviderOrder)) {
+                    currentProviderOrder = reordered;
+                    String rebuilt = rebuildRequestWithProviderOrder(currentRequestJson, currentProviderOrder);
+                    if (rebuilt != null) {
+                        currentRequestJson = rebuilt;
+                        if (log.isDebugEnabled()) {
+                            log.debug("Provider order rotated for retry: attempt={}, newOrder={}",
+                                    attempt, currentProviderOrder);
+                        }
+                    }
+                }
+            }
+
             long attemptStarted = System.currentTimeMillis();
             try {
+                HttpRequest.Builder httpRequestBuilder = buildHttpRequest(
+                        requestUrl, apiKey, customHeaders, currentRequestJson, requestTimeout);
                 HttpResponse<java.io.InputStream> httpResponse = HTTP_CLIENT.send(
                         httpRequestBuilder.build(),
                         HttpResponse.BodyHandlers.ofInputStream()
@@ -519,6 +608,9 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
                 attemptMeta.put("httpStatus", status);
                 attemptMeta.put("durationMs", attemptDuration);
                 attemptMeta.put("timeoutSeconds", requestTimeout.toSeconds());
+                if (currentProviderOrder != null) {
+                    attemptMeta.put("providerOrder", currentProviderOrder);
+                }
                 attempts.add(attemptMeta);
 
                 if (status >= 200 && status < 300) {
@@ -551,9 +643,13 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
                 attemptMeta.put("timeoutSeconds", requestTimeout.toSeconds());
                 attemptMeta.put("retryable", true);
                 attemptMeta.put("error", e.getClass().getSimpleName() + ": " + e.getMessage());
+                if (currentProviderOrder != null) {
+                    attemptMeta.put("providerOrder", currentProviderOrder);
+                }
                 attempts.add(attemptMeta);
                 if (attempt >= cappedAttempts) {
-                    throw e;
+                    return new AttemptResult(null, lastResponseRecord, -1,
+                            e.getClass().getSimpleName() + ": " + e.getMessage(), attempts);
                 }
             }
             sleepBeforeRetry();
@@ -562,6 +658,66 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
             throw ioException;
         }
         return new AttemptResult(null, lastResponseRecord, lastStatusCode, lastErrorBody, attempts);
+    }
+
+    /**
+     * 构建 HTTP 请求 Builder。每次重试时独立构建，以便 request body 可能被修改。
+     */
+    private HttpRequest.Builder buildHttpRequest(String requestUrl, String apiKey,
+                                                  Map<String, String> customHeaders,
+                                                  String requestJson, Duration requestTimeout) {
+        HttpRequest.Builder builder = HttpRequest.newBuilder()
+                .uri(URI.create(requestUrl))
+                .timeout(requestTimeout)
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json")
+                .header("Authorization", "Bearer " + OpenAiCompatibleChatModelSupport.nvl(apiKey))
+                .POST(HttpRequest.BodyPublishers.ofString(requestJson, StandardCharsets.UTF_8));
+
+        if (customHeaders != null && !customHeaders.isEmpty()) {
+            for (Map.Entry<String, String> entry : customHeaders.entrySet()) {
+                if (entry.getKey() != null && entry.getValue() != null) {
+                    builder.header(entry.getKey(), entry.getValue());
+                }
+            }
+        }
+        return builder;
+    }
+
+    /**
+     * 将 provider order 列表左旋一位：第一个 provider 移到末尾。
+     * 这样下次重试会优先尝试列表中的下一个 provider。
+     */
+    private List<String> rotateProviderOrder(List<String> currentOrder) {
+        if (currentOrder == null || currentOrder.size() <= 1) {
+            return currentOrder;
+        }
+        List<String> result = new ArrayList<>(currentOrder);
+        String first = result.remove(0);
+        result.add(first);
+        return result;
+    }
+
+    /**
+     * 修改请求 JSON 中的 provider.order 字段。
+     * 保持 allow_fallbacks=false 不变。
+     */
+    @SuppressWarnings("unchecked")
+    private String rebuildRequestWithProviderOrder(String requestJson, List<String> newProviderOrder) {
+        try {
+            Map<String, Object> requestMap = objectMapper.readValue(requestJson, new TypeReference<Map<String, Object>>() {});
+            Object providerObj = requestMap.get("provider");
+            if (providerObj instanceof Map) {
+                Map<String, Object> provider = (Map<String, Object>) providerObj;
+                provider.put("order", newProviderOrder);
+                // 确保 allow_fallbacks 始终为 false
+                provider.put("allow_fallbacks", false);
+            }
+            return objectMapper.writeValueAsString(requestMap);
+        } catch (Exception e) {
+            log.warn("Failed to rebuild request with reordered provider order, using original: {}", e.getMessage());
+            return null;
+        }
     }
 
     private boolean isRetryableStatus(int status) {
@@ -753,13 +909,15 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
      * 检查是否开启 curl debug 日志（热加载）。
      */
     private boolean isDebugCurlEnabled() {
-        if (localConfigLoader == null) {
-            return false;
-        }
-        return localConfigLoader.current()
-                .map(cfg -> cfg.getDebug())
-                .map(debug -> debug.getLogLlmCurl())
-                .orElse(false);
+        // 与上方 [LLM Debug CURL] 一并临时关闭，避免 Nacos debug.logLlmCurl=true 时仍打全量请求
+        return false;
+        // if (localConfigLoader == null) {
+        //     return false;
+        // }
+        // return localConfigLoader.current()
+        //         .map(cfg -> cfg.getDebug())
+        //         .map(debug -> debug.getLogLlmCurl())
+        //         .orElse(false);
     }
     
     /**
@@ -788,5 +946,141 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
         
         return curl.toString();
     }
-    
+
+    // ── SSE live event helpers ──
+    //
+    // 这些事件是 Agent V2 前端主链路的数据源。STARTED/DELTA/FINISHED 都要带同一个
+    // llm_call_id / trace_id，以及 AgentContext 中的 phase、stage、todo_id、workflow。
+    // planning/summarizing 阶段可能没有 todo 归属；execution 阶段必须能挂到具体节点。
+
+    private void emitLlmCallStarted(String llmTraceId, boolean stream) {
+        if (eventService == null) {
+            return;
+        }
+        String runId = AgentContext.getRunId();
+        String userId = AgentContext.getUserId();
+        if (runId == null || userId == null) {
+            log.debug("Skip LLM_CALL_STARTED: missing runId or userId in AgentContext");
+            return;
+        }
+        Map<String, Object> payload = new LinkedHashMap<>();
+        AgentSsePayloadSupport.putLlmCallIds(payload, llmTraceId);
+        payload.put("model", nvl(modelName));
+        payload.put("endpoint", nvl(endpointName));
+        payload.put("phase", nvl(AgentContext.getPhase()));
+        AgentSsePayloadSupport.putExecutionAttribution(payload);
+        payload.put("stream", stream);
+        payload.put("started_at_ms", System.currentTimeMillis());
+        try {
+            eventService.append(runId, userId, "LLM_CALL_STARTED", payload);
+        } catch (Exception e) {
+            log.warn("LLM_CALL_STARTED event emit failed (ignored): {}", e.getMessage());
+        }
+    }
+
+    private void emitLlmCallDelta(String llmTraceId, StreamingProgressTracker.StreamingProgressSnapshot snapshot) {
+        if (eventService == null || snapshot == null) {
+            return;
+        }
+        String runId = AgentContext.getRunId();
+        String userId = AgentContext.getUserId();
+        if (runId == null || userId == null) {
+            return;
+        }
+        Map<String, Object> payload = new LinkedHashMap<>();
+        AgentSsePayloadSupport.putLlmCallIds(payload, llmTraceId);
+        AgentSsePayloadSupport.putExecutionAttribution(payload);
+        payload.put("content_chars", snapshot.contentCharCount());
+        payload.put("reasoning_chars", snapshot.reasoningCharCount());
+        payload.put("tool_call_chars", snapshot.toolCallCharCount());
+        payload.put("chunk_count", snapshot.chunkCount());
+        payload.put("chars_per_second", Math.round(snapshot.charsPerSecond() * 10.0) / 10.0);
+        // 保守估算：按 1 token ≈ 4 chars（英文字符）做上限估算
+        payload.put("estimated_output_tokens", snapshot.totalCharCount() / 4);
+        try {
+            eventService.append(runId, userId, "LLM_CALL_DELTA", payload);
+        } catch (Exception e) {
+            log.warn("LLM_CALL_DELTA event emit failed (ignored): {}", e.getMessage());
+        }
+    }
+
+    private void emitLlmCallFinished(String llmTraceId,
+                                      TokenUsage tokenUsage,
+                                      long durationMs,
+                                      Double actualCost,
+                                      String generationId,
+                                      String errorPreview,
+                                      String observabilityTraceId,
+                                      List<Map<String, Object>> attempts) {
+        if (eventService == null) {
+            return;
+        }
+        String runId = AgentContext.getRunId();
+        String userId = AgentContext.getUserId();
+        if (runId == null || userId == null) {
+            log.debug("Skip LLM_CALL_FINISHED: missing runId or userId in AgentContext");
+            return;
+        }
+        Map<String, Object> payload = new LinkedHashMap<>();
+        AgentSsePayloadSupport.putLlmCallIds(payload, llmTraceId);
+        payload.put("model", nvl(modelName));
+        payload.put("endpoint", nvl(endpointName));
+        payload.put("phase", nvl(AgentContext.getPhase()));
+        AgentSsePayloadSupport.putExecutionAttribution(payload);
+        payload.put("duration_ms", Math.max(0L, durationMs));
+        payload.put("success", errorPreview == null);
+        putAttemptPayload(payload, attempts);
+        if (errorPreview != null) {
+            payload.put("error_preview", errorPreview.length() > 500 ? errorPreview.substring(0, 500) : errorPreview);
+        }
+        if (tokenUsage != null) {
+            payload.put("input_tokens", tokenUsage.inputTokenCount());
+            payload.put("output_tokens", tokenUsage.outputTokenCount());
+            payload.put("total_tokens", tokenUsage.totalTokenCount());
+        }
+        if (actualCost != null) {
+            payload.put("actual_cost", actualCost);
+        }
+        if (generationId != null && !generationId.isBlank()) {
+            payload.put("generation_id", generationId);
+        }
+        if (observabilityTraceId != null && !observabilityTraceId.isBlank()) {
+            payload.put("observability_trace_id", observabilityTraceId);
+        }
+        try {
+            eventService.append(runId, userId, "LLM_CALL_FINISHED", payload);
+        } catch (Exception e) {
+            log.warn("LLM_CALL_FINISHED event emit failed (ignored): {}", e.getMessage());
+        }
+    }
+
+    private void putAttemptPayload(Map<String, Object> payload, List<Map<String, Object>> attempts) {
+        if (attempts == null || attempts.isEmpty()) {
+            payload.put("attempt_count", 0);
+            return;
+        }
+        payload.put("attempt_count", attempts.size());
+        payload.put("attempts", attempts);
+    }
+
+    /**
+     * 从 SSE 聚合结果中的 usage Map 提取 actual cost。
+     * 不依赖 raw HTTP capture，确保正常 run 也能拿到 cost。
+     */
+    @SuppressWarnings("unchecked")
+    private Double extractActualCostFromUsage(Map<String, Object> usage) {
+        if (usage == null) {
+            return null;
+        }
+        Object cost = usage.get("cost");
+        if (cost instanceof Number n) {
+            return n.doubleValue();
+        }
+        return null;
+    }
+
+    private String nvl(String value) {
+        return value == null ? "" : value;
+    }
+
 }

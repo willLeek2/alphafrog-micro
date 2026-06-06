@@ -430,6 +430,38 @@ public class AgentPromptService {
     }
 
     /**
+     * DAG recovery judge System Prompt。
+     *
+     * <p>加载优先级：Nacos 直接配置 ＞ Nacos 文件引用 ＞ classpath 内置文件
+     * ({@code prompts/judge/dag_recovery_judge_system.txt})。</p>
+     *
+     * <p>通过 {@link #composeSystemPrompt(String)} 注入时间基准前缀与全局 agent_run 指令。</p>
+     */
+    public String dagRecoveryJudgeSystemPrompt() {
+        // Template: Nacos 直接注入的 prompt 正文（优先级最高）
+        // File: loader 解析 file: 引用后的内容（Nacos file: 路径输入，默认为 null）
+        String specific = firstNonBlank(
+                currentPrompts().getDagRecoveryJudgeSystemPromptTemplate(),
+                currentPrompts().getDagRecoveryJudgeSystemPromptFile(),
+                defaultDagRecoveryJudgeSystemPrompt()
+        );
+        return composeSystemPrompt(specific);
+    }
+
+    private String defaultDagRecoveryJudgeSystemPrompt() {
+        try (java.io.InputStream is = getClass().getResourceAsStream(
+                "/prompts/judge/dag_recovery_judge_system.txt")) {
+            if (is != null) {
+                return new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+            }
+        } catch (Exception e) {
+            log.warn("Failed to load default dag recovery judge system prompt from classpath", e);
+        }
+        log.error("dag_recovery_judge_system.txt not found in classpath; returning empty prompt");
+        return "";
+    }
+
+    /**
      * 返回配置的最大并行 Sub-Agent 数量。
      *
      * <p>从 {@code agent.llm.runtime.subAgent.maxCount} 读取，支持热加载。
@@ -945,6 +977,8 @@ public class AgentPromptService {
         merged.setPlanningStrategyStage(firstNonBlank(local.getPlanningStrategyStage(), base.getPlanningStrategyStage()));
         merged.setPlanningTodosStageFile(firstNonBlank(local.getPlanningTodosStageFile(), base.getPlanningTodosStageFile()));
         merged.setPlanningTodosStage(firstNonBlank(local.getPlanningTodosStage(), base.getPlanningTodosStage()));
+        merged.setDagRecoveryJudgeSystemPromptTemplate(firstNonBlank(local.getDagRecoveryJudgeSystemPromptTemplate(), base.getDagRecoveryJudgeSystemPromptTemplate()));
+        merged.setDagRecoveryJudgeSystemPromptFile(firstNonBlank(local.getDagRecoveryJudgeSystemPromptFile(), base.getDagRecoveryJudgeSystemPromptFile()));
         return merged;
     }
 

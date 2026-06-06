@@ -8,4 +8,8 @@ import world.willfrog.agent.platform.entity.AgentRun;
 public interface LangchainLinearRunPipeline {
 
     void launchAsync(AgentRun run);
+
+    default void launchAsync(AgentRun run, LangchainRunConcurrencyScheduler.Reservation reservation) {
+        launchAsync(run);
+    }
 }

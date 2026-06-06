@@ -19,6 +19,8 @@ public class AgentLlmProperties {
     private Prompts prompts = new Prompts();
     private Debug debug = new Debug();
     private OpenRouterConfig openrouter = new OpenRouterConfig();
+    private ExecutorConfig executor = new ExecutorConfig();
+    private EventStoreConfig eventStore = new EventStoreConfig();
 
     public String getDefaultEndpoint() {
         return defaultEndpoint;
@@ -92,6 +94,22 @@ public class AgentLlmProperties {
         this.openrouter = openrouter == null ? new OpenRouterConfig() : openrouter;
     }
 
+    public ExecutorConfig getExecutor() {
+        return executor;
+    }
+
+    public void setExecutor(ExecutorConfig executor) {
+        this.executor = executor == null ? new ExecutorConfig() : executor;
+    }
+
+    public EventStoreConfig getEventStore() {
+        return eventStore;
+    }
+
+    public void setEventStore(EventStoreConfig eventStore) {
+        this.eventStore = eventStore == null ? new EventStoreConfig() : eventStore;
+    }
+
     public static class Endpoint {
         private String baseUrl;
         private String apiKey;
@@ -140,6 +158,8 @@ public class AgentLlmProperties {
         private Double baseRate;
         private List<String> features = new ArrayList<>();
         private List<String> validProviders = new ArrayList<>();
+        /** 模型级 max_completion_tokens 覆盖；null 则使用 endpoint / 全局默认值 */
+        private Integer maxTokens;
 
         public String getDisplayName() {
             return displayName;
@@ -171,6 +191,14 @@ public class AgentLlmProperties {
 
         public void setValidProviders(List<String> validProviders) {
             this.validProviders = validProviders == null ? new ArrayList<>() : validProviders;
+        }
+
+        public Integer getMaxTokens() {
+            return maxTokens;
+        }
+
+        public void setMaxTokens(Integer maxTokens) {
+            this.maxTokens = maxTokens;
         }
     }
 
@@ -623,6 +651,7 @@ public class AgentLlmProperties {
     public static class Parallel {
         private Integer maxParallelSearchQueries;
         private Integer maxParallelDailyQueries;
+        private Integer maxParallelCalendarQueries;
         private Integer dagThreadPoolSize;
         private ExternalSearch externalSearch = new ExternalSearch();
         private ToolWeightedLimit toolWeightedLimit = new ToolWeightedLimit();
@@ -641,6 +670,14 @@ public class AgentLlmProperties {
 
         public void setMaxParallelDailyQueries(Integer maxParallelDailyQueries) {
             this.maxParallelDailyQueries = maxParallelDailyQueries;
+        }
+
+        public Integer getMaxParallelCalendarQueries() {
+            return maxParallelCalendarQueries;
+        }
+
+        public void setMaxParallelCalendarQueries(Integer maxParallelCalendarQueries) {
+            this.maxParallelCalendarQueries = maxParallelCalendarQueries;
         }
 
         public Integer getDagThreadPoolSize() {
@@ -1068,8 +1105,10 @@ public class AgentLlmProperties {
         private Boolean failOpen;
         private Boolean blockOnInsufficientEvidence;
         /**
-         * 新配置：有序路由列表，每个 endpoint 可配置一组候选 model。
+         * @deprecated Prefer run {@code stage_config.search_judge} or inherit current phase model.
+         * Ordered route list kept for backward compatibility only.
          */
+        @Deprecated
         private List<JudgeRoute> routes = new ArrayList<>();
 
         public Boolean getEnabled() {
@@ -1462,6 +1501,10 @@ public class AgentLlmProperties {
         private String planningTodosStageFile = "prompts/todo/planning_todos_stage.txt";
         /** 第二阶段任务拆解 prompt 内容（由 loader 从文件读取） */
         private String planningTodosStage;
+        /** DAG recovery judge prompt 文件路径（Nacos file: 前缀时由 loader 解析为内容）。默认 null，走 classpath 兜底。 */
+        private String dagRecoveryJudgeSystemPromptFile;
+        /** DAG recovery judge prompt 内容（由 loader 从 file: 解析或 Nacos 直接注入）。 */
+        private String dagRecoveryJudgeSystemPromptTemplate;
 
         public String getAgentRunSystemPrompt() {
             return agentRunSystemPrompt;
@@ -1686,6 +1729,22 @@ public class AgentLlmProperties {
         public void setPlanningTodosStage(String planningTodosStage) {
             this.planningTodosStage = planningTodosStage;
         }
+
+        public String getDagRecoveryJudgeSystemPromptFile() {
+            return dagRecoveryJudgeSystemPromptFile;
+        }
+
+        public void setDagRecoveryJudgeSystemPromptFile(String dagRecoveryJudgeSystemPromptFile) {
+            this.dagRecoveryJudgeSystemPromptFile = dagRecoveryJudgeSystemPromptFile;
+        }
+
+        public String getDagRecoveryJudgeSystemPromptTemplate() {
+            return dagRecoveryJudgeSystemPromptTemplate;
+        }
+
+        public void setDagRecoveryJudgeSystemPromptTemplate(String dagRecoveryJudgeSystemPromptTemplate) {
+            this.dagRecoveryJudgeSystemPromptTemplate = dagRecoveryJudgeSystemPromptTemplate;
+        }
     }
 
     public static class DatasetFieldSpec {
@@ -1724,6 +1783,104 @@ public class AgentLlmProperties {
 
         public void setDataFormat(String dataFormat) {
             this.dataFormat = dataFormat;
+        }
+    }
+
+    /**
+     * Agent run event 持久化相关配置（Nacos → agent-llm.local.json 热更新）。
+     */
+    public static class EventStoreConfig {
+        /**
+         * Redis ZSET 批量刷写条数 K：每累积 K 条 event 才 pipeline 写一次 Redis。
+         * 设为 1 则与逐条写等价。读路径会先 flush 该 run 的 pending，避免漏读。
+         */
+        private Integer redisFlushBatchSize;
+        /** Pending buffer 超过该毫秒数未刷写时，由定时任务兜底 flush（默认 3s）。 */
+        private Integer redisFlushStaleMs;
+
+        public Integer getRedisFlushBatchSize() {
+            return redisFlushBatchSize;
+        }
+
+        public void setRedisFlushBatchSize(Integer redisFlushBatchSize) {
+            this.redisFlushBatchSize = redisFlushBatchSize;
+        }
+
+        public Integer getRedisFlushStaleMs() {
+            return redisFlushStaleMs;
+        }
+
+        public void setRedisFlushStaleMs(Integer redisFlushStaleMs) {
+            this.redisFlushStaleMs = redisFlushStaleMs;
+        }
+    }
+
+    public static class ExecutorConfig {
+        private Integer corePoolSize;
+        private Integer maxPoolSize;
+        private Integer queueCapacity;
+        private String threadNamePrefix;
+        private ExecutorParallelConfig parallel;
+
+        public Integer getCorePoolSize() {
+            return corePoolSize;
+        }
+
+        public void setCorePoolSize(Integer corePoolSize) {
+            this.corePoolSize = corePoolSize;
+        }
+
+        public Integer getMaxPoolSize() {
+            return maxPoolSize;
+        }
+
+        public void setMaxPoolSize(Integer maxPoolSize) {
+            this.maxPoolSize = maxPoolSize;
+        }
+
+        public Integer getQueueCapacity() {
+            return queueCapacity;
+        }
+
+        public void setQueueCapacity(Integer queueCapacity) {
+            this.queueCapacity = queueCapacity;
+        }
+
+        public String getThreadNamePrefix() {
+            return threadNamePrefix;
+        }
+
+        public void setThreadNamePrefix(String threadNamePrefix) {
+            this.threadNamePrefix = threadNamePrefix;
+        }
+
+        public ExecutorParallelConfig getParallel() {
+            return parallel;
+        }
+
+        public void setParallel(ExecutorParallelConfig parallel) {
+            this.parallel = parallel;
+        }
+    }
+
+    public static class ExecutorParallelConfig {
+        private ExecutorConfig hard;
+        private ExecutorConfig current;
+
+        public ExecutorConfig getHard() {
+            return hard;
+        }
+
+        public void setHard(ExecutorConfig hard) {
+            this.hard = hard;
+        }
+
+        public ExecutorConfig getCurrent() {
+            return current;
+        }
+
+        public void setCurrent(ExecutorConfig current) {
+            this.current = current;
         }
     }
 }

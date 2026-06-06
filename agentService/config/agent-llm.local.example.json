@@ -185,6 +185,7 @@
     "parallel": {
       "maxParallelSearchQueries": 3,
       "maxParallelDailyQueries": 2,
+      "maxParallelCalendarQueries": 50,
       "dagThreadPoolSize": 4,
       "externalSearch": {
         "maxConcurrent": 2,
@@ -295,6 +296,16 @@
     "logLlmCurl": false,
     "logStageConfig": false,
     "logSseProgress": false
+  },
+  "executor": {
+    "corePoolSize": 4,
+    "maxPoolSize": 8,
+    "queueCapacity": 50,
+    "threadNamePrefix": "agent-langchain-run-"
+  },
+  "eventStore": {
+    "redisFlushBatchSize": 20,
+    "redisFlushStaleMs": 3000
   },
   "prompts": {
     "agentRunSystemPrompt": "file:prompts/agent/agent_run_system.txt",

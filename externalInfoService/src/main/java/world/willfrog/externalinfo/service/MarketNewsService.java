@@ -9,6 +9,7 @@ import org.springframework.stereotype.Component;
 import world.willfrog.externalinfo.config.SearchLlmProperties;
 
 import java.net.URI;
+import java.net.ProxySelector;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
@@ -587,6 +588,7 @@ public class MarketNewsService {
                 }
             }
             HttpClient client = HttpClient.newBuilder()
+                    .proxy(ProxySelector.getDefault())
                     .connectTimeout(Duration.ofSeconds(connectTimeout(provider)))
                     .build();
             HttpResponse<String> response = client.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString());

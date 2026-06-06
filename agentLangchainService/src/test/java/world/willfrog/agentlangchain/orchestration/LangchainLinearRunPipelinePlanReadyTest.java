@@ -1,0 +1,118 @@
+package world.willfrog.agentlangchain.orchestration;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
+import org.springframework.beans.factory.ObjectProvider;
+import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.mapper.AgentRunMapper;
+import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunStateStore;
+import world.willfrog.agent.workflow.PlanExecutionMode;
+import world.willfrog.agent.workflow.TodoItem;
+import world.willfrog.agentlangchain.failure.LangchainFailureMapper;
+import world.willfrog.agentlangchain.orchestration.dag.LangchainDagWorkflowExecutor;
+import world.willfrog.agentlangchain.planning.LangchainAiPlanner;
+import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
+
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static world.willfrog.agentlangchain.orchestration.LangchainRunSchedulerTestSupport.immediateScheduler;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.inOrder;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+class LangchainLinearRunPipelinePlanReadyTest {
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void executeRun_shouldPersistPlanBeforeEmittingPlanReadyWithPlanPayload() throws Exception {
+        AgentRunMapper runMapper = mock(AgentRunMapper.class);
+        AgentEventService eventService = mock(AgentEventService.class);
+        AgentRunStateStore stateStore = mock(AgentRunStateStore.class);
+        LangchainRunStageModelResolver stageModelResolver = mock(LangchainRunStageModelResolver.class);
+        LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
+        LangchainLinearWorkflowExecutor linear = mock(LangchainLinearWorkflowExecutor.class);
+        LangchainRunExecutionGuard executionGuard = mock(LangchainRunExecutionGuard.class);
+        ObjectMapper objectMapper = new ObjectMapper();
+
+        AgentRun run = new AgentRun();
+        run.setId("run-plan-1");
+        run.setUserId("user-1");
+        run.setExt("{}");
+        when(runMapper.findById("run-plan-1")).thenReturn(run);
+        when(eventService.isRunnable("run-plan-1", "user-1")).thenReturn(true);
+        when(eventService.extractCaptureLlmRequests(run.getExt())).thenReturn(false);
+        when(eventService.extractEndpointName(run.getExt())).thenReturn("openrouter");
+        when(eventService.extractModelName(run.getExt())).thenReturn("kimi");
+        when(eventService.extractUserGoal(run.getExt())).thenReturn("goal");
+        when(eventService.extractRunConfig(run.getExt())).thenReturn(AgentEventService.RunConfig.defaults());
+        when(stageModelResolver.resolve(run)).thenReturn(new LangchainRunStageModelResolver.StageModels(
+                null, null, null, "openrouter", "kimi", List.of()));
+        when(executionGuard.stopReason(eq("run-plan-1"), eq("user-1"))).thenReturn(Optional.empty());
+
+        LangchainTodoPlan plan = LangchainTodoPlan.builder()
+                .executionMode(PlanExecutionMode.LINEAR)
+                .items(List.of(TodoItem.builder()
+                        .id("todo-1")
+                        .sequence(1)
+                        .description("查询指数行情")
+                        .dependsOn(List.of())
+                        .build()))
+                .build();
+        when(planner.plan(any())).thenReturn(plan);
+        when(linear.executePlanned(any(), eq(plan))).thenReturn(LangchainLinearWorkflowResult.builder()
+                .success(true)
+                .finalAnswer("ok")
+                .plan(plan)
+                .completedTodos(List.of())
+                .build());
+
+        ObjectProvider<AgentRunStateStore> stateStoreProvider = mock(ObjectProvider.class);
+        when(stateStoreProvider.getIfAvailable()).thenReturn(stateStore);
+        LangchainFollowUpContextSupport followUpContextSupport = mock(LangchainFollowUpContextSupport.class);
+        when(followUpContextSupport.resolve(run)).thenReturn(
+                new LangchainFollowUpContextSupport.ExecutionContext("goal", ""));
+
+        LangchainLinearRunPipelineImpl pipeline = new LangchainLinearRunPipelineImpl(
+                planner,
+                linear,
+                mock(LangchainDagWorkflowExecutor.class),
+                stageModelResolver,
+                runMapper,
+                eventService,
+                objectMapper,
+                mock(ObjectProvider.class),
+                stateStoreProvider,
+                mock(ObjectProvider.class),
+                new LangchainFailureMapper(),
+                followUpContextSupport,
+                mock(world.willfrog.agent.platform.service.AgentMessageService.class),
+                executionGuard,
+                immediateScheduler()
+        );
+
+        pipeline.executeRun(run);
+
+        ArgumentCaptor<Object> payloadCaptor = ArgumentCaptor.forClass(Object.class);
+        verify(eventService).append(eq("run-plan-1"), eq("user-1"), eq("PLAN_READY"), payloadCaptor.capture());
+        Map<String, Object> payload = (Map<String, Object>) payloadCaptor.getValue();
+        assertThat(payload.get("workflow")).isEqualTo("linear");
+        assertThat(payload.get("todo_count")).isEqualTo(1);
+        assertThat(payload.get("plan")).isSameAs(plan);
+
+        String expectedPlanJson = objectMapper.writeValueAsString(plan);
+        InOrder inOrder = inOrder(runMapper, stateStore, eventService);
+        inOrder.verify(runMapper).updatePlanJson("run-plan-1", "user-1", expectedPlanJson);
+        inOrder.verify(stateStore).recordPlan("run-plan-1", expectedPlanJson, true);
+        inOrder.verify(eventService).append(eq("run-plan-1"), eq("user-1"), eq("PLAN_READY"), any());
+        verify(runMapper).updateSnapshot(eq("run-plan-1"), eq("user-1"), any(), any(), anyBoolean(), any());    }
+}

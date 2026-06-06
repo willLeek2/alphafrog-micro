@@ -48,4 +48,7 @@ public interface EtfInfoDao {
     @Select("SELECT * FROM alphafrog_domestic_etf ORDER BY ts_code LIMIT #{limit} OFFSET #{offset}")
     @ResultMap("etfInfoMap")
     List<EtfInfo> getAllEtfInfo(@Param("offset") int offset, @Param("limit") int limit);
+
+    @Select("SELECT ts_code FROM alphafrog_domestic_etf ORDER BY ts_code LIMIT #{limit} OFFSET #{offset}")
+    List<String> getEtfTsCodes(@Param("offset") int offset, @Param("limit") int limit);
 }

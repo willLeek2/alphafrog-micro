@@ -7,10 +7,20 @@ import dev.langchain4j.invocation.InvocationContext;
 import dev.langchain4j.service.tool.ToolExecutionResult;
 import dev.langchain4j.service.tool.ToolExecutor;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentSsePayloadSupport;
 import world.willfrog.agent.workflow.DatasetRefRegistry;
 import world.willfrog.agent.tools.router.ToolRouter;
+import world.willfrog.agentlangchain.config.LangchainToolConcurrencyThrottle;
+import world.willfrog.agentlangchain.orchestration.ToolThrottleResult;
 
+import java.time.Duration;
+import java.time.Instant;
+import java.util.HashMap;
 import java.util.Map;
+import java.util.UUID;
 
 /**
  * LC4j {@link ToolExecutor}：模型在 tool loop 里发起一次 tool call 后，由此类把请求转给
@@ -23,10 +33,14 @@ import java.util.Map;
  *
  * <p>单次调用的处理顺序（{@link #execute}）：</p>
  * <ol>
+ *   <li>解析或生成 {@code tool_call_id}：优先复用 LC4j 请求中的 ID，若无则 fallback 到 UUID，
+ *       确保 SSE 事件和 observability trace 的 tool call 归属一致；</li>
  *   <li>把 LC4j 传来的 arguments JSON 解析为 {@code Map<String, Object>}；</li>
- *   <li>{@link LangchainRepeatedToolCallGuard}：同一 run 内相同工具+相同参数重复超过阈值则直接返回错误文本，
- *       避免模型死循环刷工具；</li>
+ *   <li>{@link LangchainRepeatedToolCallGuard}：同一 run 内相同工具+相同参数重复超过阈值则直接返回错误文本
+ *       （此路径跳过 STARTED 直接 emit FINISHED，避免前端 UI card 永远转圈）；</li>
+ *   <li>emit <b>TOOL_CALL_STARTED</b> 事件（经 SSE + Redis），携带 tool_call_id、tool_name、arguments、phase；</li>
  *   <li>{@link ToolRouter#invokeWithMeta} 执行并取 output 字符串；</li>
+ *   <li>emit <b>TOOL_CALL_FINISHED</b> 事件（经 SSE + Redis），携带结果、duration_ms、success；</li>
  *   <li>从 output 解析 {@code dataset_id}，写入 {@link DatasetRefRegistry} 与
  *       {@link LangchainDatasetRefContext}，供 DAG 下游 todo 或 executePython 引用；</li>
  *   <li>若 output 暗示 dataset 缺失/无效，或发生重复调用，在结果末尾追加 {@code _retry_hint_}
@@ -48,13 +62,19 @@ import java.util.Map;
  * @see world.willfrog.agentlangchain.orchestration.LangchainTodoNodeExecutor tool loop 宿主
  */
 @RequiredArgsConstructor
+@Slf4j
 final class ToolRouterToolExecutor implements ToolExecutor {
+
+    /** 事件 payload 中 output 预览的最大字符数，避免超大结果打爆事件体 */
+    private static final int OUTPUT_PREVIEW_MAX_CHARS = 500;
 
     private static final TypeReference<Map<String, Object>> MAP_TYPE = new TypeReference<>() {
     };
 
     private final ToolRouter toolRouter;
     private final ObjectMapper objectMapper;
+    private final AgentEventService eventService;
+    private final LangchainToolConcurrencyThrottle toolThrottle;
 
     /**
      * LC4j 旧版回调：返回工具输出纯文本。{@link #executeWithContext} 是推荐路径，会先同步
@@ -62,18 +82,61 @@ final class ToolRouterToolExecutor implements ToolExecutor {
      */
     @Override
     public String execute(ToolExecutionRequest request, Object memoryId) {
-        Map<String, Object> params = parseArguments(request.arguments());
-        LangchainRepeatedToolCallGuard.Decision repeatDecision =
-                LangchainRepeatedToolCallGuard.beforeInvoke(request.name(), params, objectMapper);
-        if (repeatDecision.blocked()) {
-            return repeatDecision.outputOrHint();
+        String toolCallId = resolveToolCallId(request);
+        AgentContext.setToolCallId(toolCallId);
+        try {
+            Map<String, Object> params = parseArguments(request.arguments());
+            LangchainRepeatedToolCallGuard.Decision repeatDecision =
+                    LangchainRepeatedToolCallGuard.beforeInvoke(request.name(), params, objectMapper);
+            if (repeatDecision.blocked()) {
+                // 重复调用被 block 时也 emit finish，避免 UI card 一直转圈
+                emitToolCallFinished(toolCallId, request.name(), params, false, repeatDecision.outputOrHint(), 0L);
+                return repeatDecision.outputOrHint();
+            }
+
+            // emit STARTED
+            emitToolCallStarted(toolCallId, request.name(), params);
+
+            Instant start = Instant.now();
+            String output = null;
+            boolean success = true;
+
+            // sandbox tool throttle: acquire permit before invoking
+            ToolThrottleResult throttleResult = toolThrottle.tryAcquire(request.name());
+            if (!throttleResult.acquired() && throttleResult.failureReason() != null) {
+                // throttle timeout / interrupted — return error to model, don't fail the run
+                String reason = throttleResult.failureReason();
+                log.warn("Tool throttled: tool={} reason={}", request.name(), reason);
+                output = reason;
+                success = false;
+            } else {
+                try {
+                    ToolRouter.ToolInvocationResult result = toolRouter.invokeWithMeta(request.name(), params);
+                    output = result.getOutput();
+                    success = result.isSuccess();
+                } catch (Exception e) {
+                    output = e.getMessage();
+                    success = false;
+                    log.warn("Tool invocation failed: tool={}, runId={}", request.name(), AgentContext.getRunId(), e);
+                } finally {
+                    if (throttleResult.acquired()) {
+                        toolThrottle.release(throttleResult);
+                    }
+                }
+            }
+
+            long durationMs = Duration.between(start, Instant.now()).toMillis();
+            toolThrottle.recordExecution(request.name(), durationMs);
+            emitToolCallFinished(toolCallId, request.name(), params, success, output, durationMs);
+
+            Map<String, String> datasetRefs = LangchainDatasetRefContext.snapshot();
+            DatasetRefRegistry.registerFromJson(output, datasetRefs);
+            LangchainDatasetRefContext.set(datasetRefs);
+            output = appendDatasetRetryHintIfNeeded(output, datasetRefs);
+            return appendRepeatedToolCallHintIfNeeded(output, repeatDecision);
+        } finally {
+            AgentContext.clearToolCallId();
         }
-        String output = toolRouter.invokeWithMeta(request.name(), params).getOutput();
-        Map<String, String> datasetRefs = LangchainDatasetRefContext.snapshot();
-        DatasetRefRegistry.registerFromJson(output, datasetRefs);
-        LangchainDatasetRefContext.set(datasetRefs);
-        output = appendDatasetRetryHintIfNeeded(output, datasetRefs);
-        return appendRepeatedToolCallHintIfNeeded(output, repeatDecision);
     }
 
     /**
@@ -101,6 +164,25 @@ final class ToolRouterToolExecutor implements ToolExecutor {
         } catch (Exception ignored) {
             return Map.of("raw", arguments);
         }
+    }
+
+    /**
+     * 解析或生成 tool_call_id，确保 SSE 事件与 observability trace 的归属一致。
+     *
+     * <p>优先级：LC4j 请求自带的 ID > 随机 UUID。
+     * LC4j 在每次 tool loop 中会为 ToolExecutionRequest 分配稳定 ID（通常来自模型输出），
+     * 复用该 ID 可保证前端 SSE 流中的 TOOL_CALL_STARTED/TOOL_CALL_FINISHED 与
+     * observability timeline 里的 tool trace 一一对应。</p>
+     *
+     * @param request LC4j 的 tool 执行请求
+     * @return 稳定的 tool_call_id 字符串
+     */
+    private String resolveToolCallId(ToolExecutionRequest request) {
+        String id = request == null ? null : request.id();
+        if (id != null && !id.isBlank()) {
+            return id;
+        }
+        return UUID.randomUUID().toString();
     }
 
     /**
@@ -149,5 +231,97 @@ final class ToolRouterToolExecutor implements ToolExecutor {
         }
         String base = output == null ? "" : output;
         return base + "\n\n_retry_hint_: " + repeatDecision.outputOrHint();
+    }
+
+    // ── Tool call event emission helpers ──
+
+    /**
+     * 发射 TOOL_CALL_STARTED 事件，经 SSE 推送 + Redis 持久化。
+     *
+     * <p>payload 包含 tool_call_id（与 observability traceId 对齐）、tool_name、arguments、
+     * 以及 {@link AgentSsePayloadSupport} 注入的 workflow/phase/stage/todo_id 归属信息。
+     * 若 AgentContext 中缺失 runId 或 userId（如单元测试场景），则跳过发射并打 warn 日志，
+     * 避免 NPE 中断 tool loop。</p>
+     *
+     * @param toolCallId 本次 tool call 的稳定 ID
+     * @param toolName   工具名
+     * @param arguments  解析后的参数映射
+     */
+    private void emitToolCallStarted(String toolCallId, String toolName, Map<String, Object> arguments) {
+        String runId = AgentContext.getRunId();
+        String userId = AgentContext.getUserId();
+        if (runId == null || userId == null) {
+            log.warn("Skip TOOL_CALL_STARTED: missing runId or userId in AgentContext. tool={}", toolName);
+            return;
+        }
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("tool_call_id", toolCallId);
+        payload.put("tool_name", toolName);
+        payload.put("arguments", arguments);
+        String phase = AgentContext.getPhase();
+        if (phase != null && !phase.isBlank()) {
+            payload.put("phase", phase);
+        }
+        AgentSsePayloadSupport.putExecutionAttribution(payload);
+        eventService.append(runId, userId, "TOOL_CALL_STARTED", payload);
+    }
+
+    /**
+     * 发射 TOOL_CALL_FINISHED 事件，经 SSE 推送 + Redis 持久化。
+     *
+     * <p>payload 包含 tool_call_id、执行结果（success/duration_ms）、result_preview（截断预览，
+     * 避免超大结果打爆事件体），以及 {@link AgentSsePayloadSupport} 注入的归属信息。
+     * 重复调用被 block 时也会 emit，使前端 UI card 能从「loading」状态恢复为错误展示，
+     * 而不是永远转圈。</p>
+     *
+     * @param toolCallId  本次 tool call 的稳定 ID
+     * @param toolName    工具名
+     * @param arguments   解析后的参数映射
+     * @param success     工具执行是否成功（ToolRouter 返回 isSuccess）
+     * @param output      工具输出文本（可能为异常消息）
+     * @param durationMs  工具执行耗时（毫秒）
+     */
+    private void emitToolCallFinished(String toolCallId, String toolName, Map<String, Object> arguments,
+                                      boolean success, String output, long durationMs) {
+        String runId = AgentContext.getRunId();
+        String userId = AgentContext.getUserId();
+        if (runId == null || userId == null) {
+            log.warn("Skip TOOL_CALL_FINISHED: missing runId or userId in AgentContext. tool={}", toolName);
+            return;
+        }
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("tool_call_id", toolCallId);
+        payload.put("tool_name", toolName);
+        payload.put("arguments", arguments);
+        payload.put("success", success);
+        payload.put("result_preview", preview(output));
+        payload.put("duration_ms", durationMs);
+        String phase = AgentContext.getPhase();
+        if (phase != null && !phase.isBlank()) {
+            payload.put("phase", phase);
+        }
+        AgentSsePayloadSupport.putExecutionAttribution(payload);
+        eventService.append(runId, userId, "TOOL_CALL_FINISHED", payload);
+    }
+
+    /**
+     * 截断工具输出文本，用于事件 payload 的 result_preview 字段。
+     *
+     * <p>防止超大结果（如包含数千行的日线数据）直接塞进 SSE 事件体导致 payload 过大。
+     * 完整输出会先由 {@code AgentObservabilityService} 写入 Redis detail blob；
+     * 持久化后的 observability trace 只保留 outputPreview / detailBlobStored 等索引字段，
+     * 前端通过 safe detail API 按需读取，过期则返回 expired/unavailable。</p>
+     *
+     * @param text 原始工具输出
+     * @return 截断后的预览文本，若未超限则原样返回
+     */
+    private String preview(String text) {
+        if (text == null) {
+            return "";
+        }
+        if (text.length() <= OUTPUT_PREVIEW_MAX_CHARS) {
+            return text;
+        }
+        return text.substring(0, OUTPUT_PREVIEW_MAX_CHARS) + "... (truncated, length=" + text.length() + ")";
     }
 }

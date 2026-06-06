@@ -9,7 +9,6 @@ import dev.langchain4j.service.tool.ToolProvider;
 import dev.langchain4j.service.tool.ToolProviderRequest;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
-import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.entity.AgentRun;
@@ -31,7 +30,6 @@ import world.willfrog.agentlangchain.tools.LangchainToolInvocationKeys;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.Executor;
 
 /**
  * agentLangchainService 的 run 级总控流水线。
@@ -46,6 +44,12 @@ import java.util.concurrent.Executor;
  * <p>这个类本身不直接和大模型对话，也不直接执行工具；它负责把“模型、prompt、工具目录、
  * 状态机、可观测性、取消/暂停控制”串成一个完整业务流程。具体规划逻辑在
  * {@link LangchainAiPlanner}，单个 todo 的工具循环在 {@link LangchainTodoNodeExecutor}。</p>
+ *
+ * <p>Agent V2 前端接入后，这个类还承担一个很关键的契约边界：plan 必须在
+ * {@code PLAN_READY} 事件前后可恢复，事件 payload 中要带完整 plan，执行阶段的
+ * {@code TODO_NODE_*}、{@code LLM_CALL_*}、{@code TOOL_CALL_*} 再用同一批 todo id
+ * 做归属。也就是说，前端的 stepper / DAG 图并不是事后解析答案得到的，而是从这里发出的
+ * plan 和后续节点事件逐步拼出来的。</p>
  */
 @Service
 @Slf4j
@@ -65,7 +69,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
     private final LangchainFollowUpContextSupport followUpContextSupport;
     private final AgentMessageService messageService;
     private final LangchainRunExecutionGuard executionGuard;
-    private final Executor langchainRunTaskExecutor;
+    private final LangchainRunConcurrencyScheduler runConcurrencyScheduler;
 
     public LangchainLinearRunPipelineImpl(LangchainAiPlanner planner,
                                           LangchainLinearWorkflowExecutor linearWorkflowExecutor,
@@ -81,7 +85,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                                           LangchainFollowUpContextSupport followUpContextSupport,
                                           AgentMessageService messageService,
                                           LangchainRunExecutionGuard executionGuard,
-                                          @Qualifier("agentLangchainRunTaskExecutor") Executor langchainRunTaskExecutor) {
+                                          LangchainRunConcurrencyScheduler runConcurrencyScheduler) {
         this.planner = planner;
         this.linearWorkflowExecutor = linearWorkflowExecutor;
         this.dagWorkflowExecutor = dagWorkflowExecutor;
@@ -96,12 +100,17 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         this.followUpContextSupport = followUpContextSupport;
         this.messageService = messageService;
         this.executionGuard = executionGuard;
-        this.langchainRunTaskExecutor = langchainRunTaskExecutor;
+        this.runConcurrencyScheduler = runConcurrencyScheduler;
     }
 
     @Override
     public void launchAsync(AgentRun run) {
-        langchainRunTaskExecutor.execute(() -> executeRun(run));
+        launchAsync(run, null);
+    }
+
+    @Override
+    public void launchAsync(AgentRun run, LangchainRunConcurrencyScheduler.Reservation reservation) {
+        runConcurrencyScheduler.submit(reservation, run, () -> executeRun(run));
     }
 
     void executeRun(AgentRun initialRun) {
@@ -193,10 +202,15 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                     .build());
 
             boolean useDag = LangchainWorkflowRouting.shouldUseDag(plan);
+            // PLAN_READY 既是实时 UI 的启动信号，也是断线重连后的恢复锚点。
+            // 因此先把 plan 写入 DB/Redis，再发带完整 plan payload 的事件；这样前端收到事件后，
+            // 即使立刻调用 snapshot/status，也能读到同一份计划。
+            persistPlan(runId, userId, plan);
             eventService.append(runId, userId, "PLAN_READY", Map.of(
                     "execution_mode", plan.getExecutionMode() == null ? "AUTO" : plan.getExecutionMode().name(),
                     "workflow", useDag ? "dag" : "linear",
-                    "todo_count", plan.getItems() == null ? 0 : plan.getItems().size()
+                    "todo_count", plan.getItems() == null ? 0 : plan.getItems().size(),
+                    "plan", plan
             ));
 
             if (abortIfStopped(runId, userId, "before_execution")) {
@@ -231,6 +245,29 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                         "engine", "agentLangchainService"
                 ));
                 persistAssistantMessage(runId, userId, stageModels, result.getFinalAnswer());
+            } else if (result.isPartial()) {
+                // DAG recovery judge 判定部分完成：写入 PARTIAL 状态 + 部分答案
+                String snapshot = attachObservability(
+                        runId, buildPartialSnapshot(userGoal, result), AgentRunStatus.PARTIAL, null,
+                        result.getFailureReason());
+                runMapper.updateSnapshot(runId, userId, AgentRunStatus.PARTIAL, snapshot, true,
+                        result.getFailureReason());
+                markRunStatus(runId, AgentRunStatus.PARTIAL);
+                Map<String, Object> payload = new LinkedHashMap<>();
+                payload.put("answer", nvl(result.getFinalAnswer()));
+                payload.put("toolCallsUsed", result.getToolCallsUsed());
+                payload.put("engine", "agentLangchainService");
+                payload.put("partial", true);
+                if (result.getSkippedTodoIds() != null) {
+                    payload.put("skippedTodoIds", result.getSkippedTodoIds());
+                }
+                if (result.getRecoveryRationale() != null) {
+                    payload.put("recoveryRationale", result.getRecoveryRationale());
+                }
+                eventService.append(runId, userId, "WORKFLOW_PARTIAL_COMPLETED", payload);
+                if (!isBlank(result.getFinalAnswer())) {
+                    persistAssistantMessage(runId, userId, stageModels, result.getFinalAnswer());
+                }
             } else {
                 publishFailure(runId, userId, userGoal, result, null);
             }
@@ -248,6 +285,16 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         } finally {
             // 异步线程会被线程池复用，必须清理 ThreadLocal（线程本地变量），避免下一个 run 继承上一个 run 的 phase/todo/provider 信息。
             AgentContext.clear();
+        }
+    }
+
+    private void persistPlan(String runId, String userId, LangchainTodoPlan plan) {
+        String planJson = writeJson(plan);
+        runMapper.updatePlanJson(runId, userId, planJson);
+        AgentRunStateStore stateStore = stateStoreProvider.getIfAvailable();
+        if (stateStore != null) {
+            // Redis 中的 plan 是前端 snapshot/status 的快速恢复来源；DB 中的 plan 是终态和历史兜底。
+            stateStore.recordPlan(runId, planJson, true);
         }
     }
 
@@ -280,7 +327,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                                  LangchainLinearWorkflowResult result,
                                  AgentRunStatus status) {
         // snapshot 是给前端、调试脚本和恢复流程看的业务快照；它不是完整观测明细。
-        // 大体积 LLM trace 仍由 AgentObservabilityService 管理，必要时通过 observability/full 单独拉取。
+        // 大体积 LLM/tool 明细由 AgentObservabilityService 拆成摘要索引 + Redis detail blob，
+        // 普通用户展开调用详情时走 safe detail API，不再从 snapshot 直接读取 raw HTTP / raw reasoning。
         Map<String, Object> snapshot = new LinkedHashMap<>();
         snapshot.put("user_goal", userGoal);
         snapshot.put("plan", result.getPlan());
@@ -291,6 +339,31 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         snapshot.put("failure_reason", nvl(result.getFailureReason()));
         snapshot.put("tool_calls_used", result.getToolCallsUsed());
         snapshot.put("engine", "agentLangchainService");
+        return writeJson(snapshot);
+    }
+
+    private String buildPartialSnapshot(String userGoal,
+                                        LangchainLinearWorkflowResult result) {
+        Map<String, Object> snapshot = new LinkedHashMap<>();
+        snapshot.put("user_goal", userGoal);
+        snapshot.put("plan", result.getPlan());
+        snapshot.put("completed_items", result.getCompletedTodos());
+        snapshot.put("answer", nvl(result.getFinalAnswer()));
+        snapshot.put("answer_markdown", nvl(result.getFinalAnswer()));
+        snapshot.put("status", AgentRunStatus.PARTIAL.name());
+        snapshot.put("failure_reason", nvl(result.getFailureReason()));
+        snapshot.put("tool_calls_used", result.getToolCallsUsed());
+        snapshot.put("engine", "agentLangchainService");
+        snapshot.put("partial", true);
+        if (result.getSkippedTodoIds() != null) {
+            snapshot.put("skipped_todo_ids", result.getSkippedTodoIds());
+        }
+        if (result.getRecoveryRationale() != null) {
+            snapshot.put("recovery_rationale", result.getRecoveryRationale());
+        }
+        if (result.getRecoveryJudgeDecisionId() != null) {
+            snapshot.put("recovery_judge_decision_id", result.getRecoveryJudgeDecisionId());
+        }
         return writeJson(snapshot);
     }
 

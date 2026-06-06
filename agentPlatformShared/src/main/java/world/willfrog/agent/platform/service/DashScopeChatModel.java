@@ -22,15 +22,21 @@ import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
 
 import java.io.BufferedReader;
+import java.io.IOException;
 import java.io.InputStreamReader;
+import java.net.ProxySelector;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
 
 /**
  * DashScope OpenAI 兼容 ChatModel 实现 (ALP-28)
@@ -44,9 +50,12 @@ import java.util.Map;
 public class DashScopeChatModel implements ChatModel {
 
     private static final HttpClient HTTP_CLIENT = HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(30))
+            .proxy(ProxySelector.getDefault())
+            .connectTimeout(Duration.ofSeconds(45))
             .build();
     private static final int DEFAULT_THINKING_BUDGET = 38912;
+    private static final int DEFAULT_HTTP_ATTEMPTS_PER_LOGICAL_CALL = 3;
+    private static final Duration STREAM_IDLE_TIMEOUT = Duration.ofSeconds(25);
 
     private final ObjectMapper objectMapper;
     private final String baseUrl;
@@ -59,6 +68,8 @@ public class DashScopeChatModel implements ChatModel {
     private final String endpointName;
     private final boolean enableThinking;
     private final AgentLlmLocalConfigLoader localConfigLoader;
+    private final AgentEventService eventService;
+    private final LangchainLlmLatencyWindow latencyWindow;
 
     @Setter
     private AgentRunBudgetService budgetService;
@@ -69,6 +80,8 @@ public class DashScopeChatModel implements ChatModel {
         List<ToolSpecification> toolSpecifications = chatRequest.toolSpecifications();
         String requestJson = null;
         long requestStartedAt = System.currentTimeMillis();
+        String llmTraceId = UUID.randomUUID().toString().replace("-", "");
+        boolean liveEventStarted = false;
 
         boolean clientWantsCapture = observabilityService != null
                 && observabilityService.isCaptureLlmRequestsEnabled(AgentContext.getRunId());
@@ -77,6 +90,7 @@ public class DashScopeChatModel implements ChatModel {
         RawHttpLogger.HttpRequestRecord requestRecord = null;
         RawHttpLogger.HttpResponseRecord responseRecord = null;
         String curlCommand = null;
+        List<Map<String, Object>> attempts = List.of();
 
         try {
             if (budgetService != null) {
@@ -84,7 +98,7 @@ public class DashScopeChatModel implements ChatModel {
             }
             ChatCompletionRequest.Builder builder = ChatCompletionRequest.builder()
                     .model(OpenAiCompatibleChatModelSupport.nvl(modelName))
-                    .messages(OpenAiUtils.toOpenAiMessages(messages == null ? List.of() : messages))
+                    .messages(OpenAiUtils.toOpenAiMessages(messages == null ? List.of() : messages, true, "reasoning_content"))
                     .temperature(temperature)
                     .maxCompletionTokens(maxTokens);
 
@@ -110,15 +124,7 @@ public class DashScopeChatModel implements ChatModel {
                 requestJsonMap.put("stream_options", Map.of("include_usage", true));
             }
 
-            AgentContext.StructuredOutputSpec structuredOutputSpec = AgentContext.getStructuredOutputSpec();
-            if (structuredOutputSpec != null) {
-                requestJsonMap.put("response_format", structuredOutputSpec.asResponseFormat());
-            }
-
-            // DashScope 深度思考模型多数仅支持流式输出，stream=false 时不应开启 thinking
-            if (useStream) {
-                applyThinkingConfig(requestJsonMap, messages);
-            }
+            applyRequestFormatting(requestJsonMap, messages, useStream);
 
             requestJson = objectMapper.writeValueAsString(requestJsonMap);
             String requestUrl = OpenAiCompatibleChatModelSupport.buildChatCompletionsUrl(baseUrl);
@@ -138,38 +144,45 @@ public class DashScopeChatModel implements ChatModel {
                 requestRecord = httpLogger.recordRequest(requestUrl, "POST", requestHeaders, requestJson);
             }
 
-            // Debug curl 日志（热加载配置）
-            if (isDebugCurlEnabled()) {
-                curlCommand = buildCurlCommand(requestUrl, requestHeaders, requestJson);
-                log.info("[LLM Debug CURL] endpoint={} model={}\n{}", endpointName, modelName, curlCommand);
-            }
+            // Debug curl 日志（热加载 debug.logLlmCurl）— 临时关闭：整包 request body 打 INFO 会撑爆远程 tmux 日志
+            // if (isDebugCurlEnabled()) {
+            //     curlCommand = buildCurlCommand(requestUrl, requestHeaders, requestJson);
+            //     log.info("[LLM Debug CURL] endpoint={} model={}\n{}", endpointName, modelName, curlCommand);
+            // }
 
-            if (budgetService != null) {
-                budgetService.checkHttpAttempt(1);
-            }
-            HttpResponse<java.io.InputStream> httpResponse = HTTP_CLIENT.send(
-                    httpRequestBuilder.build(),
-                    HttpResponse.BodyHandlers.ofInputStream()
-            );
+            emitLlmCallStarted(llmTraceId, useStream);
+            liveEventStarted = true;
+            int maxAttempts = budgetService == null
+                    ? DEFAULT_HTTP_ATTEMPTS_PER_LOGICAL_CALL
+                    : budgetService.maxHttpAttemptsPerLogicalCall();
+            AttemptResult attemptResult = sendWithRetry(httpRequestBuilder, shouldCapture, requestRecord, requestStartedAt,
+                    maxAttempts, requestTimeout);
+            attempts = attemptResult.attempts();
+            HttpResponse<java.io.InputStream> httpResponse = attemptResult.response();
 
-            int statusCode = httpResponse.statusCode();
+            int statusCode = attemptResult.statusCode();
             long durationMs = System.currentTimeMillis() - requestStartedAt;
 
             ChatCompletionResponse completion;
             String reasoningContent = null;
             StreamingProgressTracker.StreamingProgressSnapshot progressSnapshot = null;
+            String generationId = null;
+            Map<String, Object> usageMap = null;
 
             if (useStream && statusCode >= 200 && statusCode < 300) {
                 // 流式响应：解析 SSE
-                StreamingProgressTracker tracker = createStreamingProgressTracker();
+                StreamingProgressTracker tracker = createStreamingProgressTracker(llmTraceId);
                 OpenAiCompatibleChatModelSupport.SseAggregateResult aggregateResult =
                         OpenAiCompatibleChatModelSupport.aggregateSseStream(
-                                httpResponse.body(), objectMapper, log, tracker
+                                httpResponse.body(), objectMapper, log, tracker, STREAM_IDLE_TIMEOUT
                         );
                 durationMs = System.currentTimeMillis() - requestStartedAt;
+                latencyWindow.record(durationMs);
                 progressSnapshot = tracker.onStreamComplete(durationMs);
                 completion = aggregateResult.completionResponse();
                 reasoningContent = aggregateResult.reasoningContent();
+                generationId = aggregateResult.lastId();
+                usageMap = aggregateResult.lastUsage();
 
                 // 为了 HTTP 捕获，将聚合后的响应体序列化
                 String aggregatedBody = objectMapper.writeValueAsString(
@@ -184,16 +197,22 @@ public class DashScopeChatModel implements ChatModel {
                 }
             } else {
                 // 非流式响应或错误：读取完整 body
-                String responseJson;
-                try (BufferedReader reader = new BufferedReader(
-                        new InputStreamReader(httpResponse.body(), StandardCharsets.UTF_8))) {
-                    responseJson = reader.lines().collect(java.util.stream.Collectors.joining("\n"));
+                String responseJson = attemptResult.errorBody();
+                if (httpResponse != null) {
+                    try (BufferedReader reader = new BufferedReader(
+                            new InputStreamReader(httpResponse.body(), StandardCharsets.UTF_8))) {
+                        responseJson = reader.lines().collect(java.util.stream.Collectors.joining("\n"));
+                    }
                 }
 
                 if (shouldCapture) {
-                    Map<String, String> responseHeaders = httpLogger.extractHeaders(httpResponse);
-                    responseRecord = httpLogger.recordResponse(statusCode, responseHeaders, responseJson, durationMs);
-                    curlCommand = httpLogger.toCurlCommand(requestRecord);
+                    if (httpResponse != null) {
+                        Map<String, String> responseHeaders = httpLogger.extractHeaders(httpResponse);
+                        responseRecord = httpLogger.recordResponse(statusCode, responseHeaders, responseJson, durationMs);
+                        curlCommand = httpLogger.toCurlCommand(requestRecord);
+                    } else {
+                        responseRecord = attemptResult.responseRecord();
+                    }
                 }
 
                 if (statusCode < 200 || statusCode >= 300) {
@@ -211,7 +230,7 @@ public class DashScopeChatModel implements ChatModel {
                 reasoningContent = extractReasoningContentFromResponse(responseJson);
             }
 
-            AiMessage aiMessage = OpenAiUtils.aiMessageFrom(completion);
+            AiMessage aiMessage = OpenAiUtils.aiMessageFrom(completion, true);
 
             // 从 reasoningContent 或 <think> 标签提取 thinking
             String finalThinking = reasoningContent;
@@ -219,9 +238,12 @@ public class DashScopeChatModel implements ChatModel {
                 ThinkingContent thinking = extractThinkingContent(aiMessage == null ? null : aiMessage.text());
                 if (thinking.hasThinking()) {
                     finalThinking = thinking.thinking();
-                    if (aiMessage != null && thinking.hasThinking()) {
-                        List<dev.langchain4j.agent.tool.ToolExecutionRequest> tools = aiMessage.toolExecutionRequests();
-                        aiMessage = new AiMessage(thinking.content(), tools == null ? List.of() : tools);
+                    if (aiMessage != null) {
+                        aiMessage = AiMessage.builder()
+                                .text(thinking.content())
+                                .thinking(finalThinking)
+                                .toolExecutionRequests(aiMessage.toolExecutionRequests())
+                                .build();
                     }
                 }
             }
@@ -235,11 +257,14 @@ public class DashScopeChatModel implements ChatModel {
 
             TokenUsage tokenUsage = OpenAiUtils.tokenUsageFrom(completion.usage());
             FinishReason finishReason = OpenAiCompatibleChatModelSupport.extractFinishReason(completion);
+            Double actualCost = extractActualCostFromUsage(usageMap);
 
+            String observabilityTraceId = null;
             if (shouldCapture && observabilityService != null) {
-                reportLlmCall(requestRecord, responseRecord, curlCommand, requestStartedAt, durationMs, null,
-                        finalThinking, progressSnapshot);
+                observabilityTraceId = reportLlmCall(llmTraceId, requestRecord, responseRecord, curlCommand, requestStartedAt, durationMs, null,
+                        finalThinking, progressSnapshot, attempts);
             }
+            emitLlmCallFinished(llmTraceId, tokenUsage, durationMs, actualCost, generationId, null, observabilityTraceId, attempts);
 
             return ChatResponse.builder()
                     .aiMessage(aiMessage)
@@ -251,21 +276,31 @@ public class DashScopeChatModel implements ChatModel {
 
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+            long durationMs = System.currentTimeMillis() - requestStartedAt;
+            String observabilityTraceId = null;
             if (shouldCapture && observabilityService != null) {
-                long durationMs = System.currentTimeMillis() - requestStartedAt;
-                reportLlmCall(requestRecord, responseRecord, curlCommand, requestStartedAt, durationMs, "INTERRUPTED",
-                        null, null);
+                observabilityTraceId = reportLlmCall(llmTraceId, requestRecord, responseRecord, curlCommand, requestStartedAt, durationMs, "INTERRUPTED",
+                        null, null, attempts);
+            }
+            if (liveEventStarted) {
+                emitLlmCallFinished(llmTraceId, null, durationMs, null, null, "INTERRUPTED", observabilityTraceId, attempts);
             }
             String detail = "DashScope chat completion interrupted"
                     + " (model=" + OpenAiCompatibleChatModelSupport.nvl(modelName) + ")";
             throw new IllegalStateException(detail, e);
 
         } catch (Exception e) {
+            long durationMs = System.currentTimeMillis() - requestStartedAt;
+            String observabilityTraceId = null;
             if (shouldCapture && observabilityService != null) {
-                long durationMs = System.currentTimeMillis() - requestStartedAt;
                 String errorType = e.getClass().getSimpleName();
-                reportLlmCall(requestRecord, responseRecord, curlCommand, requestStartedAt, durationMs,
-                        errorType + ": " + e.getMessage(), null, null);
+                observabilityTraceId = reportLlmCall(llmTraceId, requestRecord, responseRecord, curlCommand, requestStartedAt, durationMs,
+                        errorType + ": " + e.getMessage(), null, null, attempts);
+            }
+            if (liveEventStarted) {
+                String errorType = e.getClass().getSimpleName();
+                emitLlmCallFinished(llmTraceId, null, durationMs, null, null,
+                        errorType + ": " + e.getMessage(), observabilityTraceId, attempts);
             }
             String detail = "DashScope chat completion failed"
                     + " (model=" + OpenAiCompatibleChatModelSupport.nvl(modelName)
@@ -302,7 +337,95 @@ public class DashScopeChatModel implements ChatModel {
         return null;
     }
 
+    private AttemptResult sendWithRetry(HttpRequest.Builder httpRequestBuilder,
+                                        boolean shouldCapture,
+                                        RawHttpLogger.HttpRequestRecord requestRecord,
+                                        long logicalStartedAt,
+                                        int maxAttempts,
+                                        Duration requestTimeout) throws IOException, InterruptedException {
+        List<Map<String, Object>> attempts = new ArrayList<>();
+        RawHttpLogger.HttpResponseRecord lastResponseRecord = null;
+        String lastErrorBody = null;
+        int lastStatusCode = -1;
+        int cappedAttempts = Math.max(1, maxAttempts);
+        for (int attempt = 1; attempt <= cappedAttempts; attempt++) {
+            if (budgetService != null) {
+                budgetService.checkHttpAttempt(attempt);
+            }
+            long attemptStarted = System.currentTimeMillis();
+            try {
+                HttpResponse<java.io.InputStream> httpResponse = HTTP_CLIENT.send(
+                        httpRequestBuilder.build(),
+                        HttpResponse.BodyHandlers.ofInputStream()
+                );
+                int status = httpResponse.statusCode();
+                long attemptDuration = System.currentTimeMillis() - attemptStarted;
+                Map<String, Object> attemptMeta = new LinkedHashMap<>();
+                attemptMeta.put("attempt", attempt);
+                attemptMeta.put("httpStatus", status);
+                attemptMeta.put("durationMs", attemptDuration);
+                attemptMeta.put("timeoutSeconds", requestTimeout.toSeconds());
+                attempts.add(attemptMeta);
+
+                if (status >= 200 && status < 300) {
+                    return new AttemptResult(httpResponse, null, status, null, attempts);
+                }
+
+                String body;
+                try (BufferedReader reader = new BufferedReader(
+                        new InputStreamReader(httpResponse.body(), StandardCharsets.UTF_8))) {
+                    body = reader.lines().collect(java.util.stream.Collectors.joining("\n"));
+                }
+                lastErrorBody = body;
+                lastStatusCode = status;
+                if (shouldCapture && httpLogger != null) {
+                    Map<String, String> responseHeaders = httpLogger.extractHeaders(httpResponse);
+                    lastResponseRecord = httpLogger.recordResponse(
+                            status, responseHeaders, body, System.currentTimeMillis() - logicalStartedAt);
+                }
+                attemptMeta.put("retryable", isRetryableStatus(status));
+                attemptMeta.put("error", OpenAiCompatibleChatModelSupport.shorten(body));
+                if (!isRetryableStatus(status) || attempt >= cappedAttempts) {
+                    return new AttemptResult(httpResponse, lastResponseRecord, status, body, attempts);
+                }
+            } catch (IOException e) {
+                long attemptDuration = System.currentTimeMillis() - attemptStarted;
+                Map<String, Object> attemptMeta = new LinkedHashMap<>();
+                attemptMeta.put("attempt", attempt);
+                attemptMeta.put("durationMs", attemptDuration);
+                attemptMeta.put("timeoutSeconds", requestTimeout.toSeconds());
+                attemptMeta.put("retryable", true);
+                attemptMeta.put("error", e.getClass().getSimpleName() + ": " + e.getMessage());
+                attempts.add(attemptMeta);
+                if (attempt >= cappedAttempts) {
+                    return new AttemptResult(null, lastResponseRecord, -1,
+                            e.getClass().getSimpleName() + ": " + e.getMessage(), attempts);
+                }
+            }
+            sleepBeforeRetry();
+        }
+        return new AttemptResult(null, lastResponseRecord, lastStatusCode, lastErrorBody, attempts);
+    }
+
+    private boolean isRetryableStatus(int status) {
+        return status == 408 || status == 429 || (status >= 500 && status <= 599);
+    }
+
+    private void sleepBeforeRetry() throws InterruptedException {
+        Thread.sleep(2000L);
+    }
+
+    private record AttemptResult(
+            HttpResponse<java.io.InputStream> response,
+            RawHttpLogger.HttpResponseRecord responseRecord,
+            int statusCode,
+            String errorBody,
+            List<Map<String, Object>> attempts
+    ) {
+    }
+
     private String reportLlmCall(
+            String llmCallId,
             RawHttpLogger.HttpRequestRecord request,
             RawHttpLogger.HttpResponseRecord response,
             String curlCommand,
@@ -310,7 +433,8 @@ public class DashScopeChatModel implements ChatModel {
             long durationMs,
             String errorMessage,
             String thinkingContent,
-            StreamingProgressTracker.StreamingProgressSnapshot streamingProgress) {
+            StreamingProgressTracker.StreamingProgressSnapshot streamingProgress,
+            List<Map<String, Object>> attempts) {
 
         if (observabilityService == null) {
             return null;
@@ -327,7 +451,7 @@ public class DashScopeChatModel implements ChatModel {
         Integer cachedTokens = OpenAiCompatibleChatModelSupport.extractCachedTokensFromResponse(objectMapper, response, log);
         long completedAtMillis = startedAtMillis + durationMs;
 
-        String traceId = observabilityService.recordLlmCallWithRawHttp(
+        return observabilityService.recordLlmCallWithRawHttp(
                 runId,
                 phase != null ? phase : "unknown",
                 tokenUsage,
@@ -342,10 +466,86 @@ public class DashScopeChatModel implements ChatModel {
                 streamingProgress,
                 request,
                 response,
-                curlCommand
+                curlCommand,
+                attempts,
+                llmCallId
         );
-        AgentContext.setProviderLlmTraceId(traceId);
-        return traceId;
+    }
+
+    private String reportLlmCall(
+            String llmCallId,
+            RawHttpLogger.HttpRequestRecord request,
+            RawHttpLogger.HttpResponseRecord response,
+            String curlCommand,
+            long startedAtMillis,
+            long durationMs,
+            String errorMessage,
+            String thinkingContent,
+            StreamingProgressTracker.StreamingProgressSnapshot streamingProgress) {
+        if (observabilityService == null) {
+            return null;
+        }
+        String runId = AgentContext.getRunId();
+        String phase = AgentContext.getPhase();
+        if (runId == null || runId.isBlank()) {
+            return null;
+        }
+        TokenUsage tokenUsage = OpenAiCompatibleChatModelSupport.extractTokenUsageFromResponse(objectMapper, response, log);
+        Integer cachedTokens = OpenAiCompatibleChatModelSupport.extractCachedTokensFromResponse(objectMapper, response, log);
+        long completedAtMillis = startedAtMillis + durationMs;
+        return observabilityService.recordLlmCallWithRawHttp(
+                runId,
+                phase != null ? phase : "unknown",
+                tokenUsage,
+                cachedTokens,
+                durationMs,
+                startedAtMillis,
+                completedAtMillis,
+                endpointName,
+                modelName,
+                errorMessage,
+                thinkingContent,
+                streamingProgress,
+                request,
+                response,
+                curlCommand,
+                llmCallId
+        );
+    }
+
+    /**
+     * 应用请求格式化：structured output 时设置 response_format，同时禁用 thinking。
+     * package-private，供回归测试直接访问。
+     */
+    void applyRequestFormatting(Map<String, Object> requestJsonMap, List<ChatMessage> messages, boolean useStream) {
+        AgentContext.StructuredOutputSpec structuredOutputSpec = AgentContext.getStructuredOutputSpec();
+        if (structuredOutputSpec != null) {
+            // DashScope 使用 json_object，不支持 OpenRouter 的 json_schema 格式
+            requestJsonMap.put("response_format", Map.of("type", "json_object"));
+        }
+        // DashScope 深度思考模型多数仅支持流式输出，stream=false 时不应开启 thinking
+        // 结构化输出与 thinking 模式冲突（Json mode 不支持 enable_thinking=true）
+        boolean structuredOutputEnabled = structuredOutputSpec != null || isStructuredOutputEnabledInConfig();
+        if (useStream && !structuredOutputEnabled) {
+            applyThinkingConfig(requestJsonMap, messages);
+        }
+    }
+
+    private boolean isStructuredOutputEnabledInConfig() {
+        if (localConfigLoader == null) {
+            return false;
+        }
+        Optional<AgentLlmProperties> current = localConfigLoader.current();
+        if (current == null || current.isEmpty()) {
+            return false;
+        }
+        Boolean enabled = current
+                .map(AgentLlmProperties::getRuntime)
+                .map(AgentLlmProperties.Runtime::getPlanning)
+                .map(AgentLlmProperties.Planning::getStructuredOutput)
+                .map(AgentLlmProperties.StructuredOutput::getEnabled)
+                .orElse(null);
+        return enabled == null || enabled;
     }
 
     private void applyThinkingConfig(Map<String, Object> requestJsonMap, List<ChatMessage> messages) {
@@ -356,7 +556,15 @@ public class DashScopeChatModel implements ChatModel {
             return;
         }
         requestJsonMap.put("enable_thinking", true);
-        requestJsonMap.put("thinking_budget", DEFAULT_THINKING_BUDGET);
+        int thinkingBudget = DEFAULT_THINKING_BUDGET;
+        Object mct = requestJsonMap.get("max_completion_tokens");
+        if (mct instanceof Number n) {
+            int maxCompletionTokens = n.intValue();
+            if (maxCompletionTokens > 0 && maxCompletionTokens <= thinkingBudget) {
+                thinkingBudget = Math.max(1, maxCompletionTokens - 1);
+            }
+        }
+        requestJsonMap.put("thinking_budget", thinkingBudget);
     }
 
     private boolean supportsThinking(String modelName) {
@@ -408,22 +616,31 @@ public class DashScopeChatModel implements ChatModel {
      * 检查是否开启 curl debug 日志（热加载）。
      */
     private boolean isDebugCurlEnabled() {
-        if (localConfigLoader == null) {
-            return false;
-        }
-        return localConfigLoader.current()
-                .map(cfg -> cfg.getDebug())
-                .map(debug -> debug.getLogLlmCurl())
-                .orElse(false);
+        // 与上方 [LLM Debug CURL] 一并临时关闭，避免 Nacos debug.logLlmCurl=true 时仍打全量请求
+        return false;
+        // if (localConfigLoader == null) {
+        //     return false;
+        // }
+        // return localConfigLoader.current()
+        //         .map(cfg -> cfg.getDebug())
+        //         .map(debug -> debug.getLogLlmCurl())
+        //         .orElse(false);
     }
 
-    private StreamingProgressTracker createStreamingProgressTracker() {
+    private StreamingProgressTracker createStreamingProgressTracker(String llmTraceId) {
         String runId = AgentContext.getRunId();
+        String userId = AgentContext.getUserId();
         String phase = AgentContext.getPhase();
-        boolean reportEnabled = isStreamingProgressReportEnabled()
+        boolean observabilityEnabled = isStreamingProgressReportEnabled()
                 && observabilityService != null
                 && runId != null
                 && !runId.isBlank();
+        boolean liveEventEnabled = eventService != null
+                && runId != null
+                && !runId.isBlank()
+                && userId != null
+                && !userId.isBlank();
+        boolean reportEnabled = observabilityEnabled || liveEventEnabled;
         return new StreamingProgressTracker(
                 log,
                 modelName,
@@ -431,14 +648,19 @@ public class DashScopeChatModel implements ChatModel {
                 isSseProgressLogEnabled(),
                 reportEnabled,
                 streamingProgressUpdateIntervalMs(),
-                (snapshot, completed) -> observabilityService.recordStreamingProgress(
-                        runId,
-                        phase != null ? phase : "unknown",
-                        endpointName,
-                        modelName,
-                        snapshot,
-                        completed
-                )
+                (snapshot, completed) -> {
+                    if (observabilityEnabled) {
+                        observabilityService.recordStreamingProgress(
+                                runId,
+                                phase != null ? phase : "unknown",
+                                endpointName,
+                                modelName,
+                                snapshot,
+                                completed
+                        );
+                    }
+                    emitLlmCallDelta(llmTraceId, snapshot);
+                }
         );
     }
 
@@ -494,5 +716,136 @@ public class DashScopeChatModel implements ChatModel {
             curl.append("  -d '").append(escapedBody).append("'");
         }
         return curl.toString();
+    }
+
+    private void emitLlmCallStarted(String llmTraceId, boolean stream) {
+        if (eventService == null) {
+            return;
+        }
+        String runId = AgentContext.getRunId();
+        String userId = AgentContext.getUserId();
+        if (runId == null || userId == null) {
+            log.debug("Skip DashScope LLM_CALL_STARTED: missing runId or userId in AgentContext");
+            return;
+        }
+        Map<String, Object> payload = new LinkedHashMap<>();
+        AgentSsePayloadSupport.putLlmCallIds(payload, llmTraceId);
+        payload.put("model", OpenAiCompatibleChatModelSupport.nvl(modelName));
+        payload.put("endpoint", OpenAiCompatibleChatModelSupport.nvl(endpointName));
+        payload.put("phase", OpenAiCompatibleChatModelSupport.nvl(AgentContext.getPhase()));
+        AgentSsePayloadSupport.putExecutionAttribution(payload);
+        payload.put("stream", stream);
+        payload.put("started_at_ms", System.currentTimeMillis());
+        try {
+            eventService.append(runId, userId, "LLM_CALL_STARTED", payload);
+        } catch (Exception e) {
+            log.warn("DashScope LLM_CALL_STARTED event emit failed (ignored): {}", e.getMessage());
+        }
+    }
+
+    private void emitLlmCallDelta(String llmTraceId, StreamingProgressTracker.StreamingProgressSnapshot snapshot) {
+        if (eventService == null || snapshot == null) {
+            return;
+        }
+        String runId = AgentContext.getRunId();
+        String userId = AgentContext.getUserId();
+        if (runId == null || userId == null) {
+            return;
+        }
+        Map<String, Object> payload = new LinkedHashMap<>();
+        AgentSsePayloadSupport.putLlmCallIds(payload, llmTraceId);
+        AgentSsePayloadSupport.putExecutionAttribution(payload);
+        payload.put("content_chars", snapshot.contentCharCount());
+        payload.put("reasoning_chars", snapshot.reasoningCharCount());
+        payload.put("tool_call_chars", snapshot.toolCallCharCount());
+        payload.put("chunk_count", snapshot.chunkCount());
+        payload.put("chars_per_second", Math.round(snapshot.charsPerSecond() * 10.0) / 10.0);
+        payload.put("estimated_output_tokens", snapshot.totalCharCount() / 4);
+        try {
+            eventService.append(runId, userId, "LLM_CALL_DELTA", payload);
+        } catch (Exception e) {
+            log.warn("DashScope LLM_CALL_DELTA event emit failed (ignored): {}", e.getMessage());
+        }
+    }
+
+    private void emitLlmCallFinished(String llmTraceId,
+                                     TokenUsage tokenUsage,
+                                     long durationMs,
+                                     Double actualCost,
+                                     String generationId,
+                                     String errorPreview,
+                                     String observabilityTraceId,
+                                     List<Map<String, Object>> attempts) {
+        if (eventService == null) {
+            return;
+        }
+        String runId = AgentContext.getRunId();
+        String userId = AgentContext.getUserId();
+        if (runId == null || userId == null) {
+            log.debug("Skip DashScope LLM_CALL_FINISHED: missing runId or userId in AgentContext");
+            return;
+        }
+        Map<String, Object> payload = new LinkedHashMap<>();
+        AgentSsePayloadSupport.putLlmCallIds(payload, llmTraceId);
+        payload.put("model", OpenAiCompatibleChatModelSupport.nvl(modelName));
+        payload.put("endpoint", OpenAiCompatibleChatModelSupport.nvl(endpointName));
+        payload.put("phase", OpenAiCompatibleChatModelSupport.nvl(AgentContext.getPhase()));
+        AgentSsePayloadSupport.putExecutionAttribution(payload);
+        payload.put("duration_ms", Math.max(0L, durationMs));
+        payload.put("success", errorPreview == null);
+        putAttemptPayload(payload, attempts);
+        if (errorPreview != null) {
+            payload.put("error_preview", errorPreview.length() > 500 ? errorPreview.substring(0, 500) : errorPreview);
+        }
+        if (tokenUsage != null) {
+            payload.put("input_tokens", tokenUsage.inputTokenCount());
+            payload.put("output_tokens", tokenUsage.outputTokenCount());
+            payload.put("total_tokens", tokenUsage.totalTokenCount());
+        }
+        if (actualCost != null) {
+            payload.put("actual_cost", actualCost);
+        }
+        if (generationId != null && !generationId.isBlank()) {
+            payload.put("generation_id", generationId);
+        }
+        if (observabilityTraceId != null && !observabilityTraceId.isBlank()) {
+            payload.put("observability_trace_id", observabilityTraceId);
+        }
+        try {
+            eventService.append(runId, userId, "LLM_CALL_FINISHED", payload);
+        } catch (Exception e) {
+            log.warn("DashScope LLM_CALL_FINISHED event emit failed (ignored): {}", e.getMessage());
+        }
+    }
+
+    private void emitLlmCallFinished(String llmTraceId,
+                                     TokenUsage tokenUsage,
+                                     long durationMs,
+                                     Double actualCost,
+                                     String generationId,
+                                     String errorPreview,
+                                     String observabilityTraceId) {
+        emitLlmCallFinished(llmTraceId, tokenUsage, durationMs, actualCost, generationId,
+                errorPreview, observabilityTraceId, List.of());
+    }
+
+    private void putAttemptPayload(Map<String, Object> payload, List<Map<String, Object>> attempts) {
+        if (attempts == null || attempts.isEmpty()) {
+            payload.put("attempt_count", 0);
+            return;
+        }
+        payload.put("attempt_count", attempts.size());
+        payload.put("attempts", attempts);
+    }
+
+    private Double extractActualCostFromUsage(Map<String, Object> usage) {
+        if (usage == null) {
+            return null;
+        }
+        Object cost = usage.get("cost");
+        if (cost instanceof Number n) {
+            return n.doubleValue();
+        }
+        return null;
     }
 }

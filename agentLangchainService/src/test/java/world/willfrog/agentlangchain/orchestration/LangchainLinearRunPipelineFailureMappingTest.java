@@ -3,7 +3,6 @@ package world.willfrog.agentlangchain.orchestration;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.ObjectProvider;
-import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.service.AgentEventService;
@@ -18,6 +17,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.mockito.ArgumentMatchers.any;
+import static world.willfrog.agentlangchain.orchestration.LangchainRunSchedulerTestSupport.immediateScheduler;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
@@ -62,11 +62,6 @@ class LangchainLinearRunPipelineFailureMappingTest {
         when(followUpContextSupport.resolve(run)).thenReturn(
                 new LangchainFollowUpContextSupport.ExecutionContext("goal", ""));
 
-        ThreadPoolTaskExecutor taskExecutor = new ThreadPoolTaskExecutor();
-        taskExecutor.setCorePoolSize(1);
-        taskExecutor.setMaxPoolSize(1);
-        taskExecutor.initialize();
-
         LangchainLinearRunPipelineImpl pipeline = new LangchainLinearRunPipelineImpl(
                 planner,
                 linear,
@@ -82,12 +77,10 @@ class LangchainLinearRunPipelineFailureMappingTest {
                 followUpContextSupport,
                 mock(world.willfrog.agent.platform.service.AgentMessageService.class),
                 mock(LangchainRunExecutionGuard.class),
-                taskExecutor
+                immediateScheduler()
         );
 
         pipeline.executeRun(run);
 
-        verify(eventService).append(eq("run-budget-1"), eq("user-1"), eq("RUN_BUDGET_EXCEEDED"), any(Map.class));
-        taskExecutor.shutdown();
-    }
+        verify(eventService).append(eq("run-budget-1"), eq("user-1"), eq("RUN_BUDGET_EXCEEDED"), any(Map.class));    }
 }

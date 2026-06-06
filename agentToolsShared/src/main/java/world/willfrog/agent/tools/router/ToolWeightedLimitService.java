@@ -136,6 +136,8 @@ public class ToolWeightedLimitService {
                     countBatchValues(firstNonBlank(source, "query", "keyword", "arg0"));
             case "getExchangeAssetDaily", "getStockDaily", "getIndexDaily" ->
                     countBatchValues(firstNonBlank(source, "tsCode", "ts_code", "code", "stock_code", "index_code", "arg0"));
+            case "isTradingDay" ->
+                    countBatchValues(firstNonBlank(source, "date", "dates", "tradeDate", "tradeDates", "trade_date", "trade_dates", "arg0"));
             default -> 1;
         };
     }

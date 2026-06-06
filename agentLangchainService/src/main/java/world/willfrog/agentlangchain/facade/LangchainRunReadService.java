@@ -7,7 +7,6 @@ import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.entity.AgentRunEvent;
 import world.willfrog.agent.platform.entity.AgentRunMessage;
-import world.willfrog.agent.platform.mapper.AgentRunEventMapper;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentArtifactService;
@@ -16,6 +15,7 @@ import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agent.platform.service.AgentMessageService;
 import world.willfrog.agent.platform.service.AgentModelCatalogService;
 import world.willfrog.agent.platform.service.AgentObservabilityService;
+import world.willfrog.agent.platform.service.AgentRunCostService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agent.platform.service.SnapshotPartService;
 import world.willfrog.agent.platform.service.SnapshotPartsMeta;
@@ -41,6 +41,7 @@ import world.willfrog.alphafrogmicro.agent.idl.GetAgentConfigResponse;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentCreditsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentCreditsResponse;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunRequest;
+import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCostRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunResultRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunStatusRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentSnapshotPartRequest;
@@ -78,14 +79,16 @@ import java.util.Map;
  *   <li>run 查询（单个 run 详情、列表分页）</li>
  *   <li>status 轮询（前端 matrix 最频繁调用的接口，含 phase 推断、计划进度、
  *       observability 摘要）</li>
- *   <li>events 增量拉取（通过 afterSeq 游标实现断点续传）</li>
+ *   <li>events 增量拉取（通过 afterSeq 游标实现断点续传；当前 Redis 为主、DB 为过渡期兜底）</li>
  *   <li>result 结果查询（含结构化答案、credits 消耗计算）</li>
  *   <li>配置类查询（可用模型列表、工具列表、credits 余额）</li>
  *   <li>快照分段下载（大 run 的 snapshot 拆成多 part，分段拉取避免 OOM）</li>
  * </ul>
  *
  * <h2>读写一致性</h2>
- * langchain 服务和 legacy agentService 共享同一套 PG/Redis 存储。
+ * langchain 服务和 legacy agentService 共享同一套 PG/Redis 存储。事件流目前由
+ * {@link AgentEventService} 优先从 Redis ZSET 读取，只有 Redis 没有该 run 的事件时才回退 DB；
+ * 这是压测后为了避免大量 event 长期堆在数据库中的过渡设计。
  * 本类的读操作依赖 {@link LangchainSingleWriterGuard} 保证：
  * 当前 langchain 实例有写入权时才允许直接读 PG，避免读到过期的本地缓存。
  *
@@ -109,11 +112,11 @@ import java.util.Map;
 public class LangchainRunReadService {
 
     private final AgentRunMapper runMapper;
-    private final AgentRunEventMapper eventMapper;
     private final AgentEventService eventService;
     private final AgentRunStateStore stateStore;
     private final AgentObservabilityService observabilityService;
     private final AgentCreditService creditService;
+    private final AgentRunCostService runCostService;
     private final AgentModelCatalogService modelCatalogService;
     private final AgentMessageService messageService;
     private final SnapshotPartService snapshotPartService;
@@ -188,10 +191,18 @@ public class LangchainRunReadService {
         requireReadableRun(request.getId(), request.getUserId());
         int afterSeq = Math.max(0, request.getAfterSeq());
         int limit = request.getLimit() <= 0 ? 200 : Math.min(request.getLimit(), 500);
-        List<AgentRunEvent> events = eventMapper.listByRunIdAfterSeq(request.getId(), afterSeq, limit + 1);
-        boolean hasMore = events.size() > limit;
-        if (hasMore) {
-            events = events.subList(0, limit);
+        List<AgentRunEvent> events;
+        boolean hasMore = false;
+        if (request.getLatest()) {
+            // snapshot 阶段只需要最近 N 条事件，前端用它补足首屏上下文；
+            // 常规补洞仍走 afterSeq，避免每次都传完整事件流。
+            events = eventService.listLatestByRunId(request.getId(), limit);
+        } else {
+            events = eventService.listByRunIdAfterSeq(request.getId(), afterSeq, limit + 1);
+            hasMore = events.size() > limit;
+            if (hasMore) {
+                events = events.subList(0, limit);
+            }
         }
         int nextAfterSeq = afterSeq;
         ListAgentRunEventsResponse.Builder builder = ListAgentRunEventsResponse.newBuilder();
@@ -214,7 +225,7 @@ public class LangchainRunReadService {
         if (snapshot.get("structured_answer") != null) {
             structuredAnswerJson = writeJson(snapshot.get("structured_answer"));
         }
-        int totalCredits = creditService.calculateRunTotalCredits(run, eventMapper.listByRunId(run.getId()), observabilityJson);
+        int totalCredits = creditService.calculateRunTotalCredits(run, eventService.listByRunId(run.getId()), observabilityJson);
         return AgentRunResultMessage.newBuilder()
                 .setId(nvl(run.getId()))
                 .setStatus(run.getStatus() == null ? "" : run.getStatus().name())
@@ -227,25 +238,33 @@ public class LangchainRunReadService {
                 .build();
     }
 
+    public world.willfrog.alphafrogmicro.agent.idl.AgentRunCostMessage getRunCost(GetAgentRunCostRequest request) {
+        AgentRun run = requireReadableRun(request.getId(), request.getUserId());
+        String observabilityJson = nvl(observabilityService.loadObservabilityJson(run.getId(), run.getSnapshotJson()));
+        return runCostService.buildAndPersist(run, observabilityJson);
+    }
+
     /**
      * agent 状态轮询 —— 前端/matrix 最高频的读接口。
      *
-     * <p>返回当前 run 的完整状态快照，包含：
+     * <p>返回当前 run 的轻量状态快照，包含：
      * <ul>
      *   <li>基础状态（COMPLETED/FAILED/EXECUTING 等）</li>
      *   <li>阶段推断（PLANNING/EXECUTING/SUMMARIZING，由 {@link #resolvePhase} 推断）</li>
      *   <li>当前正在执行的 tool 名称（从 TOOL_CALL_STARTED 事件 payload 中提取）</li>
      *   <li>计划进度（planJson + progressJson）</li>
-     *   <li>observability 数据可用性标记（observabilityFullAvailable）</li>
+     *   <li>observability 摘要和完整数据可用性标记（不直接返回完整 traces）</li>
      *   <li>credits 消耗</li>
      *   <li>已用时长（elapsedMs）</li>
      * </ul>
      *
      * <p>这是 agent 前端展示的核心数据源。matrix 脚本在 poll 循环中每 3 秒调一次。
+     * 这里刻意不返回 full observability，避免 status poll 因大 trace 变成 MB 级响应；
+     * 需要完整观测或安全调用详情时，由结果/详情接口按需加载。
      */
     public AgentRunStatusMessage getStatus(GetAgentRunStatusRequest request) {
         AgentRun run = requireReadableRun(request.getId(), request.getUserId());
-        AgentRunEvent latestEvent = eventMapper.findLatestByRunId(run.getId());
+        AgentRunEvent latestEvent = eventService.findLatestByRunId(run.getId());
         String planJson = nvl(run.getPlanJson());
         var cachedPlan = stateStore.loadPlan(run.getId());
         if (cachedPlan.isPresent()) {
@@ -254,8 +273,8 @@ public class LangchainRunReadService {
         String progressJson = planJson.isBlank() ? "" : stateStore.buildProgressJson(run.getId(), planJson);
         String observabilitySummaryJson = observabilityService.loadObservabilitySummaryJson(run.getId(), run.getSnapshotJson());
         boolean observabilityFullAvailable = observabilityService.isFullObservabilityAvailable(run.getId(), run.getSnapshotJson());
-        int totalCredits = creditService.calculateRunTotalCredits(run, eventMapper.listByRunId(run.getId()), observabilitySummaryJson);
-        Integer maxSeq = eventMapper.findMaxSeq(run.getId());
+        int totalCredits = creditService.calculateRunTotalCredits(run, eventService.listByRunId(run.getId()), observabilitySummaryJson);
+        Integer maxSeq = eventService.findMaxSeq(run.getId());
         return toStatusMessage(
                 run,
                 latestEvent,
@@ -539,7 +558,8 @@ public class LangchainRunReadService {
         if (status == null) {
             return "";
         }
-        if (status == AgentRunStatus.COMPLETED || status == AgentRunStatus.FAILED
+        if (status == AgentRunStatus.COMPLETED || status == AgentRunStatus.PARTIAL
+                || status == AgentRunStatus.FAILED
                 || status == AgentRunStatus.CANCELED || status == AgentRunStatus.EXPIRED) {
             return status.name();
         }

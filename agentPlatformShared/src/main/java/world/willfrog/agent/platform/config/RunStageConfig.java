@@ -12,5 +12,7 @@ public class RunStageConfig {
     private StageLlmConfig execution;
     @JsonAlias({"final_answer", "finalAnswer"})
     private StageLlmConfig finalAnswer;
+    @JsonAlias({"search_judge", "searchJudge"})
+    private StageLlmConfig searchJudge;
     private SubAgentStageConfig subAgent;
 }

@@ -44,10 +44,16 @@ public class AgentContext {
     private static final ThreadLocal<String> TODO_ID_HOLDER = new ThreadLocal<>();
     /** 当前 Todo 在 Plan 中的 sequence(顺序号) */
     private static final ThreadLocal<Integer> TODO_SEQUENCE_HOLDER = new ThreadLocal<>();
+    /**
+     * 当前 run 的工作流形态（{@code linear} / {@code dag}），由 executor 在进入执行期时设置。
+     */
+    private static final ThreadLocal<String> WORKFLOW_HOLDER = new ThreadLocal<>();
     /** Sub-Agent 内的步骤索引,用于观测 sub-agent 多步执行的归类 */
     private static final ThreadLocal<Integer> SUB_AGENT_STEP_INDEX_HOLDER = new ThreadLocal<>();
     /** Python 沙箱代码二次重写(refine)的尝试次数,用于观测和限流 */
     private static final ThreadLocal<Integer> PYTHON_REFINE_ATTEMPT_HOLDER = new ThreadLocal<>();
+    /** 当前 LangChain tool call id（与 SSE {@code tool_call_id} 对齐，供 observability tool trace）。 */
+    private static final ThreadLocal<String> TOOL_CALL_ID_HOLDER = new ThreadLocal<>();
     /** 决策 trace ID,关联到 PlanJudge 等组件产生的决策链 */
     private static final ThreadLocal<String> DECISION_TRACE_ID_HOLDER = new ThreadLocal<>();
     /** 决策所处阶段(配合 traceId 用) */
@@ -59,6 +65,16 @@ public class AgentContext {
      * 通过 {@link #consumeProviderLlmTraceId()} 一次性消费,避免被多次记录。
      */
     private static final ThreadLocal<String> PROVIDER_LLM_TRACE_ID_HOLDER = new ThreadLocal<>();
+    /**
+     * 下一次 LLM 调用写入 observability 时附带的 request meta（一次性消费）。
+     * 供 search judge 等调用方在 provider 自记录 trace 前注入业务字段。
+     */
+    private static final ThreadLocal<Map<String, Object>> LLM_CALL_REQUEST_META_HOLDER = new ThreadLocal<>();
+    /**
+     * 当前线程最近一次 {@code recordLlmCall} 写入的 traceId（一次性读取）。
+     * 用于调用方判断 provider 是否已记录，避免重复累加 llmCalls。
+     */
+    private static final ThreadLocal<String> LAST_RECORDED_LLM_TRACE_ID_HOLDER = new ThreadLocal<>();
     /**
      * 结构化输出(JSON Schema)规范,LLM 包装器在请求时若发现此项非空,
      * 会自动注入 response_format 以强制模型输出符合 schema 的 JSON。
@@ -167,6 +183,25 @@ public class AgentContext {
         return TODO_SEQUENCE_HOLDER.get();
     }
 
+    /** 设置当前 run 的工作流形态（{@code linear} / {@code dag}）。 */
+    public static void setWorkflow(String workflow) {
+        if (workflow == null || workflow.isBlank()) {
+            WORKFLOW_HOLDER.remove();
+            return;
+        }
+        WORKFLOW_HOLDER.set(workflow);
+    }
+
+    /** 获取当前工作流形态。 */
+    public static String getWorkflow() {
+        return WORKFLOW_HOLDER.get();
+    }
+
+    /** 清理工作流形态。 */
+    public static void clearWorkflow() {
+        WORKFLOW_HOLDER.remove();
+    }
+
     /** 设置 Sub-Agent 的步骤索引。 */
     public static void setSubAgentStepIndex(Integer stepIndex) {
         SUB_AGENT_STEP_INDEX_HOLDER.set(stepIndex);
@@ -195,6 +230,24 @@ public class AgentContext {
      * @param stage   决策所处阶段
      * @param excerpt 决策摘要片段
      */
+    /** 设置当前 tool call id（LangChain {@code ToolExecutionRequest#id()}，与 SSE 对齐）。 */
+    public static void setToolCallId(String toolCallId) {
+        if (toolCallId == null || toolCallId.isBlank()) {
+            TOOL_CALL_ID_HOLDER.remove();
+        } else {
+            TOOL_CALL_ID_HOLDER.set(toolCallId);
+        }
+    }
+
+    /** 获取当前 tool call id，可能为 null。 */
+    public static String getToolCallId() {
+        return TOOL_CALL_ID_HOLDER.get();
+    }
+
+    public static void clearToolCallId() {
+        TOOL_CALL_ID_HOLDER.remove();
+    }
+
     public static void setDecisionContext(String traceId, String stage, String excerpt) {
         DECISION_TRACE_ID_HOLDER.set(traceId);
         DECISION_STAGE_HOLDER.set(stage);
@@ -444,6 +497,41 @@ public class AgentContext {
         return traceId;
     }
 
+    /** 为下一次 LLM observability 记录附带 request meta。 */
+    public static void setLlmCallRequestMeta(Map<String, Object> requestMeta) {
+        if (requestMeta == null || requestMeta.isEmpty()) {
+            LLM_CALL_REQUEST_META_HOLDER.remove();
+            return;
+        }
+        LLM_CALL_REQUEST_META_HOLDER.set(new LinkedHashMap<>(requestMeta));
+    }
+
+    /** 一次性消费 LLM request meta。 */
+    public static Map<String, Object> consumeLlmCallRequestMeta() {
+        Map<String, Object> meta = LLM_CALL_REQUEST_META_HOLDER.get();
+        LLM_CALL_REQUEST_META_HOLDER.remove();
+        return meta;
+    }
+
+    public static void clearLastRecordedLlmTraceId() {
+        LAST_RECORDED_LLM_TRACE_ID_HOLDER.remove();
+    }
+
+    public static void setLastRecordedLlmTraceId(String traceId) {
+        if (traceId == null || traceId.isBlank()) {
+            LAST_RECORDED_LLM_TRACE_ID_HOLDER.remove();
+            return;
+        }
+        LAST_RECORDED_LLM_TRACE_ID_HOLDER.set(traceId);
+    }
+
+    /** 一次性读取并清理最近一次 observability 记录的 traceId。 */
+    public static String getAndClearLastRecordedLlmTraceId() {
+        String traceId = LAST_RECORDED_LLM_TRACE_ID_HOLDER.get();
+        LAST_RECORDED_LLM_TRACE_ID_HOLDER.remove();
+        return traceId;
+    }
+
     /** 清理结构化输出规范。 */
     public static void clearStructuredOutputSpec() {
         STRUCTURED_OUTPUT_SPEC_HOLDER.remove();
@@ -474,7 +562,8 @@ public class AgentContext {
                 WEB_SEARCH_CONFIG_HOLDER.get(),
                 EXTRACTED_ENTITIES_HOLDER.get(),
                 getReasoningEffort(),
-                getStageConfig()
+                getStageConfig(),
+                getWorkflow()
         );
     }
 
@@ -537,6 +626,11 @@ public class AgentContext {
         } else {
             setStageConfig(snapshot.stageConfig());
         }
+        if (snapshot.workflow() == null) {
+            clearWorkflow();
+        } else {
+            setWorkflow(snapshot.workflow());
+        }
     }
 
     /**
@@ -552,10 +646,14 @@ public class AgentContext {
         clearPhase();
         clearStage();
         clearTodoContext();
+        clearWorkflow();
         clearSubAgentStepIndex();
         clearPythonRefineAttempt();
+        clearToolCallId();
         clearDecisionContext();
         PROVIDER_LLM_TRACE_ID_HOLDER.remove();
+        LLM_CALL_REQUEST_META_HOLDER.remove();
+        LAST_RECORDED_LLM_TRACE_ID_HOLDER.remove();
         clearStructuredOutputSpec();
         clearDebugMode();
         clearWebSearchEnabled();
@@ -603,6 +701,7 @@ public class AgentContext {
      * @param extractedEntities   Planner 提取的实体列表
      * @param reasoningEffort     OpenRouter reasoning 强度
      * @param stageConfig         阶段级 LLM 配置
+     * @param workflow            工作流形态（linear / dag）
      */
     public record ContextSnapshot(
             String runId,
@@ -612,7 +711,8 @@ public class AgentContext {
             WebSearchConfig webSearchConfig,
             List<String> extractedEntities,
             String reasoningEffort,
-            RunStageConfig stageConfig
+            RunStageConfig stageConfig,
+            String workflow
     ) {
     }
 

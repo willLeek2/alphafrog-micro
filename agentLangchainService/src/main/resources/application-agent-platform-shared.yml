@@ -1,5 +1,7 @@
 # Shared agent platform config — aligned with legacy agentService (excluding legacy-only llm.prompts).
 agent:
+  call-detail:
+    ttl-seconds: ${AF_AGENT_CALL_DETAIL_TTL_SECONDS:86400}
   run:
     interrupted-ttl-days: ${AF_AGENT_RUN_INTERRUPTED_TTL_DAYS:7}
     checkpoint-version: ${AF_AGENT_RUN_CHECKPOINT_VERSION:v2}
@@ -13,7 +15,7 @@ agent:
       max-llm-calls: ${AF_AGENT_RUN_BUDGET_MAX_LLM_CALLS:50}
       max-tool-calls: ${AF_AGENT_RUN_BUDGET_MAX_TOOL_CALLS:30}
       max-tokens: ${AF_AGENT_RUN_BUDGET_MAX_TOKENS:300000}
-      max-http-attempts-per-logical-call: ${AF_AGENT_RUN_BUDGET_MAX_HTTP_ATTEMPTS_PER_LOGICAL_CALL:2}
+      max-http-attempts-per-logical-call: ${AF_AGENT_RUN_BUDGET_MAX_HTTP_ATTEMPTS_PER_LOGICAL_CALL:3}
   tool-cache:
     version: ${AF_AGENT_TOOL_CACHE_VERSION:v1}
     search-ttl-seconds: ${AF_AGENT_TOOL_CACHE_SEARCH_TTL_SECONDS:3600}
@@ -72,7 +74,7 @@ agent:
         max-llm-calls: ${AF_AGENT_RUN_BUDGET_MAX_LLM_CALLS:50}
         max-tool-calls: ${AF_AGENT_RUN_BUDGET_MAX_TOOL_CALLS:30}
         max-tokens: ${AF_AGENT_RUN_BUDGET_MAX_TOKENS:300000}
-        max-http-attempts-per-logical-call: ${AF_AGENT_RUN_BUDGET_MAX_HTTP_ATTEMPTS_PER_LOGICAL_CALL:2}
+        max-http-attempts-per-logical-call: ${AF_AGENT_RUN_BUDGET_MAX_HTTP_ATTEMPTS_PER_LOGICAL_CALL:3}
       judge:
         semantic-enabled: ${AF_AGENT_RUNTIME_JUDGE_SEMANTIC_ENABLED:false}
         max-attempts: ${AF_AGENT_RUNTIME_JUDGE_MAX_ATTEMPTS:2}

@@ -5,11 +5,16 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.mapper.AgentRunMapper;
+import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agentlangchain.orchestration.LangchainLinearRunPipeline;
+import world.willfrog.agentlangchain.orchestration.LangchainRunConcurrencyScheduler;
 import world.willfrog.agentlangchain.routing.LangchainSingleWriterGuard;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage;
 import world.willfrog.alphafrogmicro.agent.idl.CreateAgentRunRequest;
+
+import java.util.Map;
 
 @Service
 @RequiredArgsConstructor
@@ -18,6 +23,8 @@ public class AgentLangchainRunService {
 
     private final ObjectProvider<AgentEventService> eventServiceProvider;
     private final ObjectProvider<LangchainLinearRunPipeline> linearRunPipelineProvider;
+    private final LangchainRunConcurrencyScheduler runConcurrencyScheduler;
+    private final AgentRunMapper runMapper;
     private final LangchainSingleWriterGuard singleWriterGuard;
 
     public AgentRunMessage createRun(CreateAgentRunRequest request) {
@@ -35,30 +42,58 @@ public class AgentLangchainRunService {
             throw new IllegalStateException("agent_event_service_unavailable");
         }
 
-        AgentRun run = eventService.createRun(
-                userId,
-                message,
-                request.getContextJson(),
-                request.getIdempotencyKey(),
-                request.getModelName(),
-                request.getEndpointName(),
-                request.getCaptureLlmRequests(),
-                request.getProvider(),
-                request.getPlannerCandidateCount(),
-                request.getDebugMode(),
-                request.getStageConfigJson()
-        );
-
-        run = singleWriterGuard.markLangchainOwner(run);
-
         LangchainLinearRunPipeline pipeline = linearRunPipelineProvider.getIfAvailable();
+        LangchainRunConcurrencyScheduler.Reservation reservation = null;
+        AgentRun run = null;
         if (pipeline != null) {
-            log.info("Launching langchain linear pipeline for run {}", run.getId());
-            pipeline.launchAsync(run);
-        } else {
-            log.warn("LangchainLinearRunPipeline not registered; run {} created but not executed", run.getId());
+            reservation = runConcurrencyScheduler.reserve();
         }
+        try {
+            run = eventService.createRun(
+                    userId,
+                    message,
+                    request.getContextJson(),
+                    request.getIdempotencyKey(),
+                    request.getModelName(),
+                    request.getEndpointName(),
+                    request.getCaptureLlmRequests(),
+                    request.getProvider(),
+                    request.getPlannerCandidateCount(),
+                    request.getDebugMode(),
+                    request.getStageConfigJson()
+            );
 
-        return AgentLangchainRunMessageMapper.toRunMessage(run);
+            run = singleWriterGuard.markLangchainOwner(run);
+
+            if (pipeline != null) {
+                log.info("Launching langchain linear pipeline for run {}", run.getId());
+                pipeline.launchAsync(run, reservation);
+                reservation = null;
+            } else {
+                log.warn("LangchainLinearRunPipeline not registered; run {} created but not executed", run.getId());
+            }
+            return AgentLangchainRunMessageMapper.toRunMessage(run);
+        } catch (RuntimeException e) {
+            if (reservation != null) {
+                runConcurrencyScheduler.release(reservation);
+            }
+            if (run != null) {
+                markEnqueueFailed(eventService, run, e);
+            }
+            throw e;
+        }
+    }
+
+    private void markEnqueueFailed(AgentEventService eventService, AgentRun run, RuntimeException error) {
+        try {
+            eventService.append(run.getId(), run.getUserId(), "RUN_ENQUEUE_FAILED", Map.of(
+                    "engine", "agentLangchainService",
+                    "reason", error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage()
+            ));
+            runMapper.updateStatus(run.getId(), run.getUserId(), AgentRunStatus.FAILED);
+        } catch (Exception markError) {
+            log.warn("Failed to mark langchain run enqueue failure: runId={}, error={}",
+                    run.getId(), markError.getMessage());
+        }
     }
 }

@@ -8,9 +8,12 @@
 5) 参数引用必须使用 ${todo_id.output...}；索引用 items.0，不要 items[0]；禁止 {todo_1...} 或 task.output。
 6) executePython 的 dataset_ids 必须引用已完成日线工具输出的 data.dataset_id；单数据集或多数据集对比分析均使用 dataset_ids，多数据集用逗号分隔。
 7) 若在 executePython 里处理 trade_date，必须先判断 8 位/13 位并做毫秒单位转换；13 位必须 unit="ms"，否则视为错误。
+8) 涉及“某日是否交易日”、“区间交易日数量”、“区间首个交易日”、“区间最后交易日”时，必须规划 `getTradingDaysSummary` 或 `isTradingDay`，不要猜测，也不要交给 executePython 按周末/节假日经验推断；多个日期是否交易日必须合并为批量 `isTradingDay`，按 `checkParallelLimits` 的 `calendar.maxItems` 拆批。
 
 示例（严格按当前实现字段）：
 - getIndexDaily: {"ts_code":"${todo_1.output.data.items.0.ts_code}","start_date":"20250101","end_date":"20251231"}
 - getStockDaily: {"ts_code":"${todo_1.output.data.items.0.ts_code}","start_date":"20240101","end_date":"20241231"}
+- getTradingDaysSummary: {"startDate":"20240101","endDate":"20241231","exchange":"SSE"}
+- isTradingDay: {"date":"20240102|20240103","exchange":"SSE"}
 - executePython（单数据集分析）: {"dataset_ids":"${todo_2.output.data.dataset_id}","code":"import pandas as pd\nimport glob\nimport os\nfor dataset_path in glob.glob('/sandbox/input/*'):\n    dataset_id = os.path.basename(dataset_path)\n    df = pd.read_csv(f'{dataset_path}/{dataset_id}.csv')\n    ..."}
 - executePython（多数据集对比分析）: {"dataset_ids":"${todo_2.output.data.dataset_id},${todo_3.output.data.dataset_id}","code":"import pandas as pd\nimport glob\nimport os\ndatasets = {}\nfor dataset_path in glob.glob('/sandbox/input/*'):\n    dataset_id = os.path.basename(dataset_path)\n    datasets[dataset_id] = pd.read_csv(f'{dataset_path}/{dataset_id}.csv')\n# 对比分析 datasets 中的多个数据集..."}

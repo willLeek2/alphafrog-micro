@@ -110,6 +110,7 @@ message ListAgentRunEventsRequest {
   string id = 2;
   int32 after_seq = 3;
   int32 limit = 4;
+  bool latest = 5; // true 时忽略 after_seq，返回最近 limit 条事件（按 seq 升序输出）
 }
 
 message ListAgentRunEventsResponse {
@@ -121,6 +122,49 @@ message ListAgentRunEventsResponse {
 message GetAgentRunResultRequest {
   string user_id = 1;
   string id = 2;
+}
+
+message GetAgentRunCostRequest {
+  string user_id = 1;
+  string id = 2;
+}
+
+message AgentLlmCallCostMessage {
+  string trace_id = 1;
+  string generation_id = 2;
+  string phase = 3;
+  string todo_id = 4;
+  string endpoint = 5;
+  string model = 6;
+  double actual_cost = 7;
+  bool has_actual_cost = 8;
+  double upstream_inference_cost = 9;
+  bool has_upstream_inference_cost = 10;
+  double cache_discount = 11;
+  bool has_cache_discount = 12;
+  bool is_byok = 13;
+  bool has_is_byok = 14;
+  int64 started_at_ms = 15;
+  int64 completed_at_ms = 16;
+  string source = 17;
+}
+
+message AgentRunCostMessage {
+  string id = 1;
+  double total_cost = 2;
+  bool has_total_cost = 3;
+  double upstream_inference_cost = 4;
+  bool has_upstream_inference_cost = 5;
+  double cache_discount = 6;
+  bool has_cache_discount = 7;
+  int32 costed_call_count = 8;
+  int32 total_call_count = 9;
+  bool complete = 10;
+  string currency = 11;
+  string source = 12;
+  string updated_at = 13;
+  bool persisted = 14;
+  repeated AgentLlmCallCostMessage calls = 15;
 }
 
 message GetAgentRunStatusRequest {
@@ -383,6 +427,7 @@ service AgentDubboService {
   rpc PauseRun(PauseAgentRunRequest) returns (AgentRunMessage);
   rpc ResumeRun(ResumeAgentRunRequest) returns (AgentRunMessage);
   rpc GetResult(GetAgentRunResultRequest) returns (AgentRunResultMessage);
+  rpc GetRunCost(GetAgentRunCostRequest) returns (AgentRunCostMessage);
   rpc GetStatus(GetAgentRunStatusRequest) returns (AgentRunStatusMessage);
   rpc ListTools(ListAgentToolsRequest) returns (ListAgentToolsResponse);
   rpc ListArtifacts(ListAgentArtifactsRequest) returns (ListAgentArtifactsResponse);

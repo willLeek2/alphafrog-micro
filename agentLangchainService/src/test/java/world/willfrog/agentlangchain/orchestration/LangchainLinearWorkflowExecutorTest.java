@@ -6,6 +6,7 @@ import dev.langchain4j.model.chat.request.ChatRequest;
 import dev.langchain4j.model.chat.response.ChatResponse;
 import org.junit.jupiter.api.Test;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agentlangchain.support.LangchainTestFixtures;
 
 import java.util.ArrayList;
@@ -39,7 +40,8 @@ class LangchainLinearWorkflowExecutorTest {
         LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
                 LangchainTestFixtures.planner(),
                 LangchainTestFixtures.todoNodeExecutor(),
-                noopExecutionGuard()
+                noopExecutionGuard(),
+                mock(AgentEventService.class)
         );
 
         LangchainLinearWorkflowResult result = executor.execute(LangchainLinearWorkflowRequest.builder()
@@ -73,7 +75,8 @@ class LangchainLinearWorkflowExecutorTest {
         LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
                 LangchainTestFixtures.planner(),
                 LangchainTestFixtures.todoNodeExecutor(),
-                noopExecutionGuard()
+                noopExecutionGuard(),
+                mock(AgentEventService.class)
         );
 
         LangchainLinearWorkflowResult result = executor.execute(LangchainLinearWorkflowRequest.builder()
@@ -106,7 +109,8 @@ class LangchainLinearWorkflowExecutorTest {
         LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
                 LangchainTestFixtures.planner(),
                 LangchainTestFixtures.todoNodeExecutor(),
-                noopExecutionGuard()
+                noopExecutionGuard(),
+                mock(AgentEventService.class)
         );
 
         LangchainLinearWorkflowResult result = executor.execute(LangchainLinearWorkflowRequest.builder()

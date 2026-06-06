@@ -65,7 +65,8 @@ public class AgentLlmResolver {
         }
 
         List<String> validProviders = resolveValidProviders(endpoint, model, properties, local);
-        return new ResolvedLlm(endpointKey, baseUrl, model, normalize(endpoint.getApiKey()), region, validProviders);
+        Integer modelMaxTokens = resolveModelMaxTokens(endpoint, model);
+        return new ResolvedLlm(endpointKey, baseUrl, model, normalize(endpoint.getApiKey()), region, validProviders, modelMaxTokens);
     }
 
     /**
@@ -124,6 +125,21 @@ public class AgentLlmResolver {
             }
         }
         return List.of();
+    }
+
+    /**
+     * 从 endpoint 级模型元数据中查找模型的 maxTokens。
+     */
+    private Integer resolveModelMaxTokens(AgentLlmProperties.Endpoint endpoint, String modelName) {
+        if (endpoint == null || endpoint.getModels() == null) {
+            return null;
+        }
+        AgentLlmProperties.ModelMetadata meta = endpoint.getModels().get(modelName);
+        if (meta == null) {
+            return null;
+        }
+        Integer mt = meta.getMaxTokens();
+        return mt != null && mt > 0 ? mt : null;
     }
 
     private Map<String, AgentLlmProperties.Endpoint> mergeEndpoints(AgentLlmProperties base, AgentLlmProperties local) {
@@ -243,11 +259,12 @@ public class AgentLlmResolver {
             target.setBaseRate(source.getBaseRate());
             target.setFeatures(source.getFeatures());
             target.setValidProviders(source.getValidProviders());
+            target.setMaxTokens(source.getMaxTokens());
         }
         return target;
     }
 
     public record ResolvedLlm(String endpointName, String baseUrl, String modelName, String apiKey, String region,
-                               List<String> validProviders) {
+                               List<String> validProviders, Integer maxTokens) {
     }
 }

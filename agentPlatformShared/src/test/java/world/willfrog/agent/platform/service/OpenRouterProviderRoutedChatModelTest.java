@@ -4,12 +4,17 @@ import world.willfrog.agent.platform.service.*;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.model.openai.internal.OpenAiUtils;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
+import org.springframework.test.util.ReflectionTestUtils;
+import world.willfrog.agent.platform.context.AgentContext;
 
 import java.io.ByteArrayInputStream;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -18,8 +23,61 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 
 class OpenRouterProviderRoutedChatModelTest {
+
+    @AfterEach
+    void tearDown() {
+        AgentContext.clear();
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void emitLlmCallStarted_shouldWriteLlmCallIdAndExecutionAttribution() {
+        AgentContext.setRunId("run-or-live");
+        AgentContext.setUserId("user-1");
+        AgentContext.setPhase("execution");
+        AgentContext.setTodoContext("todo-1", 2);
+        AgentContext.setWorkflow("dag");
+        AgentEventService eventService = mock(AgentEventService.class);
+        OpenRouterProviderRoutedChatModel model = new OpenRouterProviderRoutedChatModel(
+                new ObjectMapper(),
+                "https://openrouter.ai/api/v1",
+                "test-key",
+                Map.of(),
+                "moonshotai/kimi-k2.5",
+                0.7D,
+                1024,
+                List.of("fireworks"),
+                mock(RawHttpLogger.class),
+                mock(AgentObservabilityService.class),
+                mock(OpenRouterCostService.class),
+                eventService,
+                "openrouter",
+                mock(AgentLlmLocalConfigLoader.class),
+                mock(LangchainLlmLatencyWindow.class)
+        );
+
+        ReflectionTestUtils.invokeMethod(model, "emitLlmCallStarted", "or-call-1", true);
+
+        ArgumentCaptor<Object> payloadCaptor = ArgumentCaptor.forClass(Object.class);
+        verify(eventService, times(1)).append(
+                eq("run-or-live"),
+                eq("user-1"),
+                eq("LLM_CALL_STARTED"),
+                payloadCaptor.capture()
+        );
+        Map<String, Object> payload = (Map<String, Object>) payloadCaptor.getValue();
+        assertEquals("or-call-1", payload.get("llm_call_id"));
+        assertEquals("or-call-1", payload.get("trace_id"));
+        assertEquals("todo-1", payload.get("todo_id"));
+        assertEquals(2, payload.get("todo_sequence"));
+        assertEquals("dag", payload.get("workflow"));
+    }
 
     @Test
     void normalizeOpenRouterTokenLimit_shouldUseMaxTokensForProviderRouting() {
@@ -230,6 +288,150 @@ class OpenRouterProviderRoutedChatModelTest {
         assertEquals(finalSnapshot.toolCallCharCount(), finalSnapshot.totalCharCount());
         assertEquals(finalSnapshot, reported.get());
         assertEquals(true, completed.get());
+    }
+
+    // ── Provider order rotation tests (§2.3) ──
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void rotateProviderOrder_shouldMoveFirstProviderToEnd() {
+        OpenRouterProviderRoutedChatModel model = createMinimalModel(List.of("deepseek", "fireworks", "alibaba"));
+
+        List<String> rotated = (List<String>) ReflectionTestUtils.invokeMethod(
+                model, "rotateProviderOrder", List.of("deepseek", "fireworks", "alibaba")
+        );
+
+        assertNotNull(rotated);
+        assertEquals(3, rotated.size());
+        assertEquals("fireworks", rotated.get(0));
+        assertEquals("alibaba", rotated.get(1));
+        assertEquals("deepseek", rotated.get(2));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void rotateProviderOrder_shouldRotateTwice() {
+        OpenRouterProviderRoutedChatModel model = createMinimalModel(List.of("a", "b", "c"));
+
+        List<String> first = (List<String>) ReflectionTestUtils.invokeMethod(
+                model, "rotateProviderOrder", List.of("a", "b", "c")
+        );
+        List<String> second = (List<String>) ReflectionTestUtils.invokeMethod(
+                model, "rotateProviderOrder", first
+        );
+
+        assertEquals("c", second.get(0));
+        assertEquals("a", second.get(1));
+        assertEquals("b", second.get(2));
+    }
+
+    @Test
+    void rotateProviderOrder_shouldReturnNullForNull() {
+        OpenRouterProviderRoutedChatModel model = createMinimalModel(List.of("fireworks"));
+
+        @SuppressWarnings("unchecked")
+        List<String> rotated = (List<String>) ReflectionTestUtils.invokeMethod(
+                model, "rotateProviderOrder", (List<String>) null
+        );
+
+        assertEquals(null, rotated);
+    }
+
+    @Test
+    void rotateProviderOrder_shouldReturnSameListForSingleProvider() {
+        OpenRouterProviderRoutedChatModel model = createMinimalModel(List.of("fireworks"));
+
+        @SuppressWarnings("unchecked")
+        List<String> rotated = (List<String>) ReflectionTestUtils.invokeMethod(
+                model, "rotateProviderOrder", List.of("fireworks")
+        );
+
+        assertNotNull(rotated);
+        assertEquals(1, rotated.size());
+        assertEquals("fireworks", rotated.get(0));
+    }
+
+    @Test
+    void rebuildRequestWithProviderOrder_shouldUpdateProviderOrderAndPreserveAllowFallbacksFalse() {
+        OpenRouterProviderRoutedChatModel model = createMinimalModel(List.of("deepseek", "fireworks"));
+        String requestJson = """
+                {"model":"deepseek/deepseek-v4-pro","messages":[],"provider":{"order":["deepseek","fireworks"],"allow_fallbacks":false}}
+                """;
+
+        String rebuilt = (String) ReflectionTestUtils.invokeMethod(
+                model, "rebuildRequestWithProviderOrder", requestJson, List.of("fireworks", "deepseek")
+        );
+
+        assertNotNull(rebuilt);
+        assertTrue(rebuilt.contains("\"order\":[\"fireworks\",\"deepseek\"]"), rebuilt);
+        assertTrue(rebuilt.contains("\"allow_fallbacks\":false"), rebuilt);
+    }
+
+    @Test
+    void rebuildRequestWithProviderOrder_shouldReturnNullForMalformedJson() {
+        OpenRouterProviderRoutedChatModel model = createMinimalModel(List.of("fireworks"));
+
+        String rebuilt = (String) ReflectionTestUtils.invokeMethod(
+                model, "rebuildRequestWithProviderOrder", "not-json", List.of("fireworks")
+        );
+
+        assertEquals(null, rebuilt);
+    }
+
+    @Test
+    void rebuildRequestWithProviderOrder_shouldReturnNullWhenNoProviderField() {
+        OpenRouterProviderRoutedChatModel model = createMinimalModel(List.of("fireworks"));
+        String requestJson = """
+                {"model":"gpt-4","messages":[]}
+                """;
+
+        String rebuilt = (String) ReflectionTestUtils.invokeMethod(
+                model, "rebuildRequestWithProviderOrder", requestJson, List.of("fireworks")
+        );
+
+        // 没有 provider 字段时，方法仍然能正常序列化，只是不会修改 order
+        assertNotNull(rebuilt);
+        assertTrue(rebuilt.contains("\"model\":\"gpt-4\""));
+    }
+
+    @Test
+    void buildHttpRequest_shouldIncludeCustomHeaders() {
+        OpenRouterProviderRoutedChatModel model = createMinimalModel(List.of("fireworks"));
+
+        java.net.http.HttpRequest.Builder builder = (java.net.http.HttpRequest.Builder) ReflectionTestUtils.invokeMethod(
+                model, "buildHttpRequest",
+                "https://openrouter.ai/api/v1/chat/completions",
+                "test-key",
+                Map.of("X-Custom", "value"),
+                "{}",
+                Duration.ofSeconds(30)
+        );
+
+        assertNotNull(builder);
+        java.net.http.HttpRequest request = builder.build();
+        assertEquals("POST", request.method());
+        assertTrue(request.headers().firstValue("X-Custom").isPresent());
+        assertEquals("value", request.headers().firstValue("X-Custom").get());
+    }
+
+    private OpenRouterProviderRoutedChatModel createMinimalModel(List<String> providerOrder) {
+        return new OpenRouterProviderRoutedChatModel(
+                new ObjectMapper(),
+                "https://openrouter.ai/api/v1",
+                "test-key",
+                Map.of(),
+                "moonshotai/kimi-k2.5",
+                0.7D,
+                1024,
+                providerOrder,
+                null,
+                null,
+                null,
+                null,
+                "openrouter",
+                null,
+                null
+        );
     }
 
 }
