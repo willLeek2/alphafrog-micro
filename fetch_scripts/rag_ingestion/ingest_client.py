@@ -1,5 +1,5 @@
 """
-调 externalInfoService HTTP ingestion 端点，写入 Qdrant。
+调 alphafrog frontend 的 /rag/ingest 端点，由 frontend 转发到 externalInfoService 写入 Qdrant。
 """
 from typing import List
 
@@ -17,10 +17,10 @@ def ingest_vectors(
     metadata: dict,
 ) -> bool:
     """
-    将 chunk + embedding 发送到 externalInfoService ingestion 端点。
+    将 chunk + embedding 通过 frontend 转发到 Qdrant ingestion 端点。
     返回是否成功。
     """
-    url = cfg.ingest_endpoint.rstrip("/")
+    url = cfg.service_base_url.rstrip("/") + "/rag/ingest"
     headers = {
         "Authorization": f"Bearer {cfg.ingest_admin_token}",
         "Content-Type": "application/json",

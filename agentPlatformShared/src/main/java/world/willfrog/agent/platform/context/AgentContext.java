@@ -222,14 +222,6 @@ public class AgentContext {
         return PYTHON_REFINE_ATTEMPT_HOLDER.get();
     }
 
-    /**
-     * 一次性写入决策上下文三元组(traceId / stage / excerpt),
-     * 通常由 PlanJudge 在做出决策后调用。
-     *
-     * @param traceId 决策链 trace ID
-     * @param stage   决策所处阶段
-     * @param excerpt 决策摘要片段
-     */
     /** 设置当前 tool call id（LangChain {@code ToolExecutionRequest#id()}，与 SSE 对齐）。 */
     public static void setToolCallId(String toolCallId) {
         if (toolCallId == null || toolCallId.isBlank()) {
@@ -248,6 +240,14 @@ public class AgentContext {
         TOOL_CALL_ID_HOLDER.remove();
     }
 
+    /**
+     * 一次性写入决策上下文三元组（traceId / stage / excerpt），
+     * 通常由 PlanJudge 在做出决策后调用。
+     *
+     * @param traceId 决策链 trace ID
+     * @param stage   决策所处阶段
+     * @param excerpt 决策摘要片段
+     */
     public static void setDecisionContext(String traceId, String stage, String excerpt) {
         DECISION_TRACE_ID_HOLDER.set(traceId);
         DECISION_STAGE_HOLDER.set(stage);

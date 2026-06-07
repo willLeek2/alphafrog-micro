@@ -425,10 +425,23 @@ public class LangchainAiPlanner {
         return Math.max(1, Math.min(requested, configured));
     }
 
+    /**
+     * 返回规划阶段的最大重试次数。
+     *
+     * <p>当前为硬编码的 {@value #DEFAULT_MAX_ATTEMPTS}，未来可扩展为 Nacos 配置。
+     * 两阶段规划的 JSON schema 校验失败时会重试，直到次数耗尽后抛出
+     * {@code IllegalStateException("planning_retry_exhausted")}。</p>
+     */
     private int resolvePlanningMaxAttempts() {
         return DEFAULT_MAX_ATTEMPTS;
     }
 
+    /**
+     * 校验规划请求的必要字段。
+     *
+     * <p>缺少 ChatModel 或用户目标时直接抛 {@link IllegalArgumentException}，
+     * 避免在后续 LLM 调用中出现难以定位的 NPE 或空输出。</p>
+     */
     private void validate(LangchainPlanningRequest request) {
         if (request == null) {
             throw new IllegalArgumentException("planning_request_required");
@@ -473,6 +486,12 @@ public class LangchainAiPlanner {
                 .collect(Collectors.toCollection(LinkedHashSet::new));
     }
 
+    /**
+     * 清理字符串列表：去重、去空、保留原始顺序。
+     *
+     * <p>用于规范化 LLM 输出的 dependsOn / extractedEntities 等列表字段，
+     * 防止空字符串或重复值进入后续的 Todo 执行流程。</p>
+     */
     private java.util.List<String> sanitizeList(java.util.List<String> values) {
         if (values == null || values.isEmpty()) {
             return java.util.List.of();
@@ -487,15 +506,23 @@ public class LangchainAiPlanner {
         return java.util.List.copyOf(unique);
     }
 
+    /**
+     * 将空白字符串转为 null，保留非空值。
+     *
+     * <p>用于处理 LLM 可能输出的空 groupKey / id 等字段，
+     * 避免空字符串污染 DAG 依赖解析。</p>
+     */
     private String blankToNull(String value) {
         String normalized = nvl(value).trim();
         return normalized.isBlank() ? null : normalized;
     }
 
+    /** 判断字符串是否为 null 或仅含空白字符。 */
     private boolean isBlank(String value) {
         return value == null || value.trim().isEmpty();
     }
 
+    /** null 转为空串，避免下游出现 NullPointerException。 */
     private String nvl(String value) {
         return value == null ? "" : value;
     }

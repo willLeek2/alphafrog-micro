@@ -77,8 +77,21 @@ final class ToolRouterToolExecutor implements ToolExecutor {
     private final LangchainToolConcurrencyThrottle toolThrottle;
 
     /**
-     * LC4j 旧版回调：返回工具输出纯文本。{@link #executeWithContext} 是推荐路径，会先同步
-     * {@link InvocationContext} 里的 run 上下文。
+     * 执行一次 LC4j tool call 并把结果返回给模型。
+     *
+     * <p>处理顺序：</p>
+     * <ol>
+     *   <li>解析/生成 tool_call_id 并写入 {@link AgentContext}；</li>
+     *   <li>解析 arguments JSON；</li>
+     *   <li>{@link LangchainRepeatedToolCallGuard} 拦截重复调用；</li>
+     *   <li>发射 <b>TOOL_CALL_STARTED</b> SSE 事件；</li>
+     *   <li>经 {@link LangchainToolConcurrencyThrottle} 获取 permit 后调用 {@link ToolRouter}；</li>
+     *   <li>发射 <b>TOOL_CALL_FINISHED</b> SSE 事件；</li>
+     *   <li>注册 dataset ref 并追加 retry hint。</li>
+     * </ol>
+     *
+     * <p>{@link #executeWithContext} 是推荐入口，会先同步 {@link InvocationContext}
+     * 中的 run 上下文到 {@link AgentContext}。</p>
      */
     @Override
     public String execute(ToolExecutionRequest request, Object memoryId) {

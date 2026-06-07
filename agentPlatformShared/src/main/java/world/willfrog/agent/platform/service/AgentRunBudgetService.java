@@ -104,8 +104,7 @@ public class AgentRunBudgetService {
 
     /**
      * 在每次 LLM 调用前检查预算（由 {@code OpenRouterProviderRoutedChatModel} 调用）。
-     * <p>注意：此入口不检查 llm_calls 维度（llm_calls 的检查在消费方通过 observability 计数后进行），
-     * 这里主要检查 wallClock 和 tokens。</p>
+     * 此入口会检查 wallClock、llm_calls 和 tokens 三个维度；tool_calls 维度不会在这里触发。
      */
     public void checkBeforeLlmCall() {
         check("llm_call");
@@ -113,6 +112,7 @@ public class AgentRunBudgetService {
 
     /**
      * 在每次工具调用前检查预算（由 {@code ToolRouter#invoke} 调用）。
+     * 此入口会检查 wallClock、tool_calls 和 tokens 三个维度；llm_calls 维度不会在这里触发。
      */
     public void checkBeforeToolCall() {
         check("tool_call");
@@ -156,31 +156,38 @@ public class AgentRunBudgetService {
     }
 
     /**
-     * 四维预算检查的核心方法。
-     * <p>注意 tokens 维度无论 operation 类型都检查，因为 token 增长可以发生在任何阶段。</p>
+     * 四维预算检查的核心方法。每次 LLM 调用或工具调用前都会触发。
+     * 按 wall_clock → llm_calls / tool_calls → tokens 的顺序逐维度检查，任一超限即抛异常。
+     * 检查顺序有意把 wall_clock 放第一位——如果挂钟时间已超，后续维度检查无意义。
      *
      * @param operation "llm_call" 或 "tool_call"，决定是否检查 llm_calls / tool_calls 维度
      */
     private void check(String operation) {
         String runId = AgentContext.getRunId();
+        // runId 为空时直接跳过（例如非 run 上下文或测试环境），不抛异常
         if (runId == null || runId.isBlank()) {
             return;
         }
         EffectiveRunBudget budget = effectiveConfig();
         Map<String, Object> summary = loadSummary(runId);
+        // startedAtMillis 由 Pipeline 在 run 开始时写入 observability，用于计算挂钟时间
         long startedAt = toLong(summary.get("startedAtMillis"));
         long elapsed = startedAt <= 0 ? 0 : Math.max(0, System.currentTimeMillis() - startedAt);
+        // 1. 挂钟时间检查：从 run 启动到当前的毫秒数
         if (budget.maxWallClockMs() > 0 && elapsed > budget.maxWallClockMs()) {
             throw exceeded("wall_clock_ms", elapsed, budget.maxWallClockMs());
         }
+        // 2. LLM 调用次数检查：仅 llm_call 入口触发，tool_call 入口跳过
         long llmCalls = toLong(summary.get("llmCalls"));
         if ("llm_call".equals(operation) && budget.maxLlmCalls() > 0 && llmCalls >= budget.maxLlmCalls()) {
             throw exceeded("llm_calls", llmCalls, budget.maxLlmCalls());
         }
+        // 3. 工具调用次数检查：仅 tool_call 入口触发，llm_call 入口跳过
         long toolCalls = toLong(summary.get("toolCalls"));
         if ("tool_call".equals(operation) && budget.maxToolCalls() > 0 && toolCalls >= budget.maxToolCalls()) {
             throw exceeded("tool_calls", toolCalls, budget.maxToolCalls());
         }
+        // 4. Token 检查：无论什么入口都检查，因为 token 消耗可能在 LLM 调用后上报、也可能在工具调用中被附带
         long tokens = toLong(summary.get("totalTokens"));
         if (budget.maxTokens() > 0 && tokens >= budget.maxTokens()) {
             throw exceeded("tokens", tokens, budget.maxTokens());

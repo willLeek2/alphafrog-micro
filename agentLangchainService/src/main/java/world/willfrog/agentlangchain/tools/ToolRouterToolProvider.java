@@ -122,8 +122,11 @@ public class ToolRouterToolProvider implements ToolProvider {
     }
 
     /**
-     * 动态工具目录：每次 AiService 调用都会重新 {@link #provideTools}，
-     * 以便按 run 能力开关（webSearch 等）调整可见工具，而不是进程启动时固定一份列表。
+     * 声明为动态工具目录。
+     *
+     * <p>每次 AiService 调用前都会重新进入 {@link #provideTools}，
+     * 这样 run 级开关（webSearch/codeInterpreter）和当前 AgentContext（runId/userId）
+     * 才能实时生效，而不是进程启动时固定一份工具列表。</p>
      */
     @Override
     public boolean isDynamic() {
@@ -131,7 +134,10 @@ public class ToolRouterToolProvider implements ToolProvider {
     }
 
     /**
-     * 解析布尔开关：优先 InvocationParameters，其次 AgentContext（仅当 runId 已设置），最后默认值。
+     * 解析布尔开关，三层优先级：InvocationParameters > AgentContext > 默认值。
+     *
+     * <p>设计意图：单元测试或无上下文调用时直接使用 invocation parameters；
+     * 生产环境有 runId 时 fallback 到 AgentContext，保证不因为参数未透传就使用硬编码默认值。</p>
      */
     private static boolean resolveBoolean(InvocationParameters parameters,
                                             String key,

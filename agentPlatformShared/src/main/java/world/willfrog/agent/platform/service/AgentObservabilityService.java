@@ -1092,6 +1092,8 @@ public class AgentObservabilityService {
     public String loadObservabilityJson(String runId, String snapshotJson) {
         Optional<String> cached = stateStore.loadObservability(runId);
         if (cached.isPresent()) {
+            // 执行中优先读 Redis，因为这里保存的是最新 trace 列表和 streaming progress。
+            // snapshot 只在终态写回，不能代表当前执行中的实时状态。
             int llmTraces = 0;
             int toolTraces = 0;
             try {
@@ -1112,6 +1114,8 @@ public class AgentObservabilityService {
         Map<String, Object> snapshot = parseJsonObject(snapshotJson);
         Object observability = snapshot.get("observability");
         if (observability != null) {
+            // 这里读到的通常是 scrub 后的终态摘要和 trace index，不一定包含可展开的大字段。
+            // 但它足以支撑历史详情页展示基本耗时、token、错误和工具调用列表。
             String json = safeWrite(observability);
             log.warn("Observability fallback to snapshot: runId={}, size={} bytes", runId, json.length());
             return json;
@@ -1137,6 +1141,8 @@ public class AgentObservabilityService {
         }
         try {
             ObservabilityState state = objectMapper.readValue(full, ObservabilityState.class);
+            // summary 视图会保留 trace 数量和最新诊断状态，但移除完整 traces 列表。
+            // 这是 status/list 高频接口能承受的体积边界。
             return safeWrite(buildSummaryMap(state));
         } catch (Exception e) {
             // 反序列化失败时（可能是历史 schema 字段不匹配），按通用 Map 解析做兜底裁剪
@@ -1198,6 +1204,8 @@ public class AgentObservabilityService {
         Map<String, Object> snapshot = parseJsonObject(snapshotJson);
         Map<String, Object> observabilityMap = objectMapper.convertValue(state, new TypeReference<Map<String, Object>>() {
         });
+        // DB snapshot 只保存可长期查看的安全索引。
+        // raw HTTP、reasoning、完整工具输出等大字段已在 finalize*TraceForPersistence 中拆到 Redis detail blob。
         AgentCallDetailPersistence.scrubObservabilityMap(observabilityMap);
         snapshot.put("observability", observabilityMap);
         String output = safeWrite(snapshot);
@@ -1289,6 +1297,7 @@ public class AgentObservabilityService {
 
             updater.accept(state);
             // touch：更新 startedAt（首次）、totalDurationMs、cacheHitRate、updatedAt
+            // 所有 record* 方法都走 mutate，因此 run 级 duration/cache 统计会随每次写入刷新。
             touch(state);
 
             String json = safeWrite(state);
@@ -1896,6 +1905,8 @@ public class AgentObservabilityService {
         // Step 2 存储治理：先尝试把可懒加载的大字段写入 Redis detail blob；
         // 只有写入成功才在 trace index 上标 detailBlobStored=true。否则保留 available summary，
         // 避免 Redis 写失败被前端误判为 expired。
+        // trace index 留在 observability 列表中，detail blob 用 traceId 单独读取；
+        // 这就是“列表可扫、详情按需展开”的容量保护边界。
         boolean detailBlobStored = false;
         Map<String, Object> blob = AgentCallDetailPersistence.toLlmDetailBlob(trace);
         if (AgentCallDetailPersistence.hasPersistableDetailBlob(blob)) {
@@ -1916,6 +1927,7 @@ public class AgentObservabilityService {
         }
         // 工具输出可能远大于 SSE preview。这里同样先写 Redis detail blob，再 scrub trace；
         // 普通用户 safe detail API 只会返回白名单摘要，不会把 raw params/output 直接吐给前端。
+        // 写失败时 detailBlobStored=false，前端应展示“详情不可用”，而不是把 Redis miss 误判为过期。
         boolean detailBlobStored = false;
         Map<String, Object> blob = AgentCallDetailPersistence.toToolDetailBlob(trace);
         if (AgentCallDetailPersistence.hasPersistableDetailBlob(blob)) {

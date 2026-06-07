@@ -110,6 +110,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
 
     @Override
     public void launchAsync(AgentRun run, LangchainRunConcurrencyScheduler.Reservation reservation) {
+        // 入口层只把 run 交给并发调度器，不直接开线程。
+        // hard/current 并发闸门、排队顺序和队列容量都集中在 scheduler，pipeline 只负责拿到执行权后的业务流程。
         runConcurrencyScheduler.submit(reservation, run, () -> executeRun(run));
     }
 
@@ -137,6 +139,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             }
             runMapper.updateStatus(runId, userId, AgentRunStatus.EXECUTING);
             markRunStatus(runId, AgentRunStatus.EXECUTING);
+            // 先写 EXECUTION_STARTED，让前端和压测脚本知道 run 已经从队列进入执行线程。
+            // 此时还没完成 planning，所以 workflow 先标 pending_plan，后续 PLAN_READY 再给出 linear/dag。
             eventService.append(runId, userId, "EXECUTION_STARTED", Map.of(
                     "run_id", runId,
                     "engine", "agentLangchainService",
@@ -167,6 +171,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
 
             // 这里先解析“当前 run 允许暴露给模型的工具列表”，planning（规划）阶段会把这些工具能力写进 prompt，
             // execution（执行）阶段也会用同一套 ToolSpecification 注册到 LC4j（LangChain4j）AiServices。
+            // 如果两处工具目录不一致，planner 可能安排一个执行阶段拿不到的工具，这是最难排查的类型之一。
             List<ToolSpecification> toolSpecifications = resolveToolSpecifications(runConfig, userGoal);
             LangchainLinearWorkflowRequest workflowRequest = LangchainLinearWorkflowRequest.builder()
                     .runId(runId)
@@ -205,6 +210,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             // PLAN_READY 既是实时 UI 的启动信号，也是断线重连后的恢复锚点。
             // 因此先把 plan 写入 DB/Redis，再发带完整 plan payload 的事件；这样前端收到事件后，
             // 即使立刻调用 snapshot/status，也能读到同一份计划。
+            // Redis 里的 plan 服务于执行中轮询，DB 里的 plan 服务于历史查询和 Redis 过期后的恢复。
             persistPlan(runId, userId, plan);
             eventService.append(runId, userId, "PLAN_READY", Map.of(
                     "execution_mode", plan.getExecutionMode() == null ? "AUTO" : plan.getExecutionMode().name(),
@@ -235,6 +241,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             if (result.isSuccess()) {
                 // 成功路径的状态写入顺序：运行快照带可观测摘要 → 数据库状态 COMPLETED → Redis 控制状态 → 事件 → assistant 消息。
                 // 这样前端先看到终态时，通常也能拿到完整答案和可观测摘要。
+                // assistant message 最后写，是因为 follow-up 只应该引用已经确定落库的最终答案。
                 String snapshot = attachObservability(
                         runId, buildSnapshot(userGoal, result, AgentRunStatus.COMPLETED), AgentRunStatus.COMPLETED, null, null);
                 runMapper.updateSnapshot(runId, userId, AgentRunStatus.COMPLETED, snapshot, true, null);
@@ -246,7 +253,9 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 ));
                 persistAssistantMessage(runId, userId, stageModels, result.getFinalAnswer());
             } else if (result.isPartial()) {
-                // DAG recovery judge 判定部分完成：写入 PARTIAL 状态 + 部分答案
+                // DAG recovery judge 判定部分完成：写入 PARTIAL 状态 + 部分答案。
+                // PARTIAL 不是普通失败：它表示部分 todo 被明确跳过，最终答案可供用户参考，
+                // 所以要记录 skippedTodoIds / recoveryRationale，方便前端解释为什么不是完整完成。
                 String snapshot = attachObservability(
                         runId, buildPartialSnapshot(userGoal, result), AgentRunStatus.PARTIAL, null,
                         result.getFailureReason());
@@ -294,6 +303,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         AgentRunStateStore stateStore = stateStoreProvider.getIfAvailable();
         if (stateStore != null) {
             // Redis 中的 plan 是前端 snapshot/status 的快速恢复来源；DB 中的 plan 是终态和历史兜底。
+            // valid=true 说明这是 planner 生成并被 pipeline 接受的计划，不是 HITL 修改中的临时草稿。
             stateStore.recordPlan(runId, planJson, true);
         }
     }
@@ -329,6 +339,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         // snapshot 是给前端、调试脚本和恢复流程看的业务快照；它不是完整观测明细。
         // 大体积 LLM/tool 明细由 AgentObservabilityService 拆成摘要索引 + Redis detail blob，
         // 普通用户展开调用详情时走 safe detail API，不再从 snapshot 直接读取 raw HTTP / raw reasoning。
+        // 因此这里保留的是“能解释最终答案从哪些 todo 来”的结构，而不是每次模型调用的全部证据。
         Map<String, Object> snapshot = new LinkedHashMap<>();
         snapshot.put("user_goal", userGoal);
         snapshot.put("plan", result.getPlan());
@@ -433,6 +444,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
     private boolean abortIfStopped(String runId, String userId, String phase) {
         return executionGuard.stopReason(runId, userId)
                 .map(reason -> {
+                    // 这里不把状态改回失败，也不追加终态事件。
+                    // cancel/pause 的状态机由控制接口负责，pipeline 只要在关键写点前停止继续覆盖即可。
                     log.info("LangChain run {} aborted at {} (control status={})", runId, phase, reason);
                     return true;
                 })

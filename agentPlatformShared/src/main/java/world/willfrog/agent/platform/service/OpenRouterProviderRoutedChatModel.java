@@ -574,6 +574,8 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
 
         for (int attempt = 1; attempt <= cappedAttempts; attempt++) {
             if (budgetService != null) {
+                // HTTP attempt 预算和 LLM call 预算分开：一次逻辑 LLM 调用可能因为网络/供应商抖动重发。
+                // 如果不单独计数，单个 LLM step 可能在 provider 层消耗过多时间而业务层看不出来。
                 budgetService.checkHttpAttempt(attempt);
             }
 
@@ -582,6 +584,8 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
                 List<String> reordered = rotateProviderOrder(currentProviderOrder);
                 if (!reordered.equals(currentProviderOrder)) {
                     currentProviderOrder = reordered;
+                    // request body 里 provider.order 是 OpenRouter 选择供应商的唯一输入。
+                    // 只改本次重试的 body，不修改 endpoint 配置对象，避免影响后续 run。
                     String rebuilt = rebuildRequestWithProviderOrder(currentRequestJson, currentProviderOrder);
                     if (rebuilt != null) {
                         currentRequestJson = rebuilt;
@@ -614,9 +618,13 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
                 attempts.add(attemptMeta);
 
                 if (status >= 200 && status < 300) {
+                    // 成功时直接把流式 InputStream 交回 doChat，由上层 SSE 聚合器读取。
+                    // 这里不能提前读 body，否则会破坏 streaming 解析。
                     return new AttemptResult(httpResponse, null, status, null, attempts);
                 }
 
+                // 非 2xx 响应通常不是 SSE 流，而是一次性错误 JSON。必须先读出 body，
+                // 否则 raw HTTP capture 和失败 payload 都拿不到 provider 返回的真实原因。
                 String body;
                 try (BufferedReader reader = new BufferedReader(
                         new InputStreamReader(httpResponse.body(), StandardCharsets.UTF_8))) {
@@ -632,6 +640,8 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
                 attemptMeta.put("retryable", isRetryableStatus(status));
                 attemptMeta.put("error", OpenAiCompatibleChatModelSupport.shorten(body));
                 if (!isRetryableStatus(status) || attempt >= cappedAttempts) {
+                    // 不可重试状态或次数耗尽时，把最后一次 HTTP response 连同 attempts 返回，
+                    // doChat 统一转换成异常观测和 LLM_CALL_FINISHED(error) 事件。
                     return new AttemptResult(httpResponse, lastResponseRecord, status, body, attempts);
                 }
             } catch (IOException e) {
@@ -648,10 +658,14 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
                 }
                 attempts.add(attemptMeta);
                 if (attempt >= cappedAttempts) {
+                    // IOException 没有 HTTP status，也可能没有 response record。
+                    // 仍然返回 AttemptResult，是为了让 observability 展示完整 attempts，而不是只看到最后异常。
                     return new AttemptResult(null, lastResponseRecord, -1,
                             e.getClass().getSimpleName() + ": " + e.getMessage(), attempts);
                 }
             }
+            // 固定短等待，避免 provider 瞬时抖动时立即打满同一个后端。
+            // 这里不做指数退避，是因为 agent run 本身有 wall-clock 预算，重试窗口必须可预期。
             sleepBeforeRetry();
         }
         if (lastException instanceof IOException ioException) {
@@ -690,6 +704,7 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
      */
     private List<String> rotateProviderOrder(List<String> currentOrder) {
         if (currentOrder == null || currentOrder.size() <= 1) {
+            // 单 provider 时不能“切换”，保持原顺序可让失败原因更直接。
             return currentOrder;
         }
         List<String> result = new ArrayList<>(currentOrder);
@@ -711,6 +726,8 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
                 Map<String, Object> provider = (Map<String, Object>) providerObj;
                 provider.put("order", newProviderOrder);
                 // 确保 allow_fallbacks 始终为 false
+                // provider 顺序由业务层显式控制，不交给 OpenRouter 自动 fallback，
+                // 这样压测和排障时能解释每次请求到底打到了哪个候选列表。
                 provider.put("allow_fallbacks", false);
             }
             return objectMapper.writeValueAsString(requestMap);

@@ -145,6 +145,13 @@ public class MarketDataTools {
         }
     }
 
+    /**
+     * 查询股票区间日线数据。
+     *
+     * <p>支持单代码或多代码批量查询（{@code |} 分隔 / JSON 数组）。
+     * 大结果会写入 dataset 并返回 {@code dataset_id}，供后续 executePython 等 todo 复用，
+     * 避免重复拉取相同数据。</p>
+     */
     @Tool("查询股票区间日线数据。参数要求：1) tsCode 必须为“6位数字.交易所后缀”，也支持 | 分隔的多个代码或 JSON 数组，如 \"000001.SZ|600519.SH\"，具体批量上限必须先调用 checkParallelLimits 查询；如果没有 checkParallelLimits 工具，默认不要批量；2) startDateStr/endDateStr 必须严格使用 YYYYMMDD（如 20240101），禁止传毫秒时间戳或其他日期格式；3) startDateStr 必须早于或等于 endDateStr。批量返回 data.mode=batch、data.results、success_count、failure_count。")
     public String getStockDaily(String tsCode, String startDateStr, String endDateStr) {
         int maxItems = resolveMaxParallelDailyQueries();
@@ -313,6 +320,12 @@ public class MarketDataTools {
         }
     }
 
+    /**
+     * 查询指数区间日线数据。
+     *
+     * <p>支持单代码或多代码批量查询（{@code |} 分隔 / JSON 数组）。
+     * 与 {@link #getStockDaily} 类似，大结果写入 dataset 并返回 {@code dataset_id}。</p>
+     */
     @Tool("查询指数区间日线数据。参数要求：1) tsCode 必须为“6位数字.交易所后缀”，也支持 | 分隔的多个代码或 JSON 数组，如 \"000300.SH|000905.SH\"，具体批量上限必须先调用 checkParallelLimits 查询；如果没有 checkParallelLimits 工具，默认不要批量；2) startDateStr/endDateStr 必须严格使用 YYYYMMDD（如 20240101），禁止传毫秒时间戳或其他日期格式；3) startDateStr 必须早于或等于 endDateStr。批量返回 data.mode=batch、data.results、success_count、failure_count。")
     public String getIndexDaily(String tsCode, String startDateStr, String endDateStr) {
         int maxItems = resolveMaxParallelDailyQueries();
@@ -409,6 +422,12 @@ public class MarketDataTools {
         }
     }
 
+    /**
+     * 统一搜索股票/ETF/指数/场外基金基本信息。
+     *
+     * <p>通过 assetTypes 参数控制搜索范围，未指定时默认覆盖全部四类资产。
+     * 不同资产类型会并发查询对应 Dubbo 服务，最后合并为统一结果列表。</p>
+     */
     @Tool("统一搜索股票/ETF/指数/场外基金基本信息。参数要求：query 支持 | 分隔或 JSON 数组，具体批量上限必须先调用 checkParallelLimits 查询；如果没有 checkParallelLimits 工具，默认不要批量；assetTypes 可选 stock,etf,index,off_exchange_fund（逗号分隔，默认全部）；marketScope 目前仅支持 domestic。")
     public String searchAssetInfo(String query, String assetTypes, String marketScope) {
         String scope = nvl(marketScope).trim();
@@ -732,6 +751,13 @@ public class MarketDataTools {
         return ok("checkParallelLimits", data);
     }
 
+    /**
+     * 查询A股指定区间内的交易日概览。
+     *
+     * <p>返回交易日总数、首个/最后交易日，所有日期均来自 alphafrog_trade_calendar。
+     * 当区间无交易日时，first_trading_date/last_trading_date 返回 NONE 而非空串，
+     * 便于调用方明确区分「无交易日」和「异常未返回」。</p>
+     */
     @Tool("查询A股交易日区间概览。参数要求：startDate/endDate 必须严格使用 YYYYMMDD；exchange 支持 SSE/SZSE/BSE，可选，默认 SSE。返回 trading_days_count、first_trading_date、last_trading_date；区间无交易日时 first_trading_date/last_trading_date 为 NONE。涉及交易日数量、首个交易日、最后交易日时禁止猜测，必须调用本工具。")
     public String getTradingDaysSummary(String startDate, String endDate, String exchange) {
         String normalizedStart = normalizeStrictDate(startDate);
@@ -769,6 +795,13 @@ public class MarketDataTools {
         }
     }
 
+    /**
+     * 判断单个或多个日期是否为A股交易日。
+     *
+     * <p>支持单日期、{@code |} 分隔或 JSON 数组批量查询；批量时按 calendar.maxItems 拆批并发执行。
+     * 返回字段 {@code calendar_record_found} 用于区分「该日期在日历表中无记录」和「有记录但休市」，
+     * 防止 LLM 把数据缺口误判为节假日。</p>
+     */
     @Tool("查询单个或多个日期是否为A股交易日。参数要求：date 支持单个 YYYYMMDD、| 分隔的多个 YYYYMMDD 或 JSON 数组；批量前必须先调用 checkParallelLimits 查询 calendar.maxItems 并按上限拆批；exchange 支持 SSE/SZSE/BSE，可选，默认 SSE。单日返回 is_trading_day 和 calendar_record_found；批量返回 data.mode=batch、data.results、success_count、failure_count。涉及某日是否交易日时禁止猜测，必须调用本工具。")
     public String isTradingDay(String date, String exchange) {
         int maxItems = resolveMaxParallelCalendarQueries();
@@ -814,6 +847,12 @@ public class MarketDataTools {
         }
     }
 
+    /**
+     * 批量交易日判断：为每个日期并发执行单条查询并聚合结果。
+     *
+     * <p>返回 {@code {mode:"batch", dates, results, success_count, failure_count}}，
+     * 与搜索/日线的批量聚合格式保持一致，便于 LLM 统一解析。</p>
+     */
     private String batchIsTradingDay(List<String> dates, String exchange) {
         String normalizedExchange = normalizeExchange(exchange);
         List<CompletableFuture<Map<String, Object>>> futures = dates.stream()
@@ -842,6 +881,12 @@ public class MarketDataTools {
         ));
     }
 
+    /**
+     * 通过 domesticListedAssetService 搜索 ETF。
+     *
+     * <p>被 {@link #searchAssetInfoSingle} 在 assetTypes 包含 etf 时调用，
+     * 与 searchStock / searchIndex 等单条搜索方法保持相同返回结构。</p>
+     */
     private String searchListedAssetEtfSingle(String query) {
         try {
             ListedAssetSearchRequest request = ListedAssetSearchRequest.newBuilder()
@@ -1290,6 +1335,11 @@ public class MarketDataTools {
         return 2;
     }
 
+    /**
+     * 解析交易日批量判断的当前最大并行查询数。
+     *
+     * <p>配置优先级与搜索/日线相同，硬编码默认值为 50（调用次数杠杆：250 个交易日 → 5 次 tool call）。</p>
+     */
     private int resolveMaxParallelCalendarQueries() {
         int local = localConfigLoader == null ? 0 : localConfigLoader.current()
                 .map(AgentLlmProperties::getRuntime)
@@ -1309,10 +1359,16 @@ public class MarketDataTools {
         return 50;
     }
 
+    /** 将数值限制在 [min, max] 区间，防止配置错误导致过大或过小的并行限制。 */
     private int clamp(int value, int min, int max) {
         return Math.max(min, Math.min(max, value));
     }
 
+    /**
+     * 安全读取嵌套 Map：将 {@code Map<?, ?>} 转为 {@code Map<String, Object>}。
+     *
+     * <p>用于批量聚合时统一 data/error 字段类型，非 Map 输入返回空 Map 避免 NPE。</p>
+     */
     private Map<String, Object> readNestedMap(Object value) {
         if (value instanceof Map<?, ?> raw) {
             Map<String, Object> out = new LinkedHashMap<>();
@@ -1324,6 +1380,12 @@ public class MarketDataTools {
         return Map.of();
     }
 
+    /**
+     * 安全解析 JSON 字符串为 Map。
+     *
+     * <p>批量聚合时各单条查询返回的是 JSON 文本，需要先反序列化为 Map 再统一组装。
+     * 解析失败返回空 Map，避免单条坏数据导致整个批量结果不可用。</p>
+     */
     private Map<String, Object> readJsonMap(String json) {
         if (json == null || json.isBlank()) {
             return Map.of();
@@ -1335,6 +1397,12 @@ public class MarketDataTools {
         }
     }
 
+    /**
+     * 实际拉取股票日线并写入 dataset（若启用）。
+     *
+     * <p>先尝试 {@link DatasetRegistry} 复用已写入的 dataset，未命中再调用
+     * domesticStockService。返回统一 {@code {ok,tool,data,error}} 结构。</p>
+     */
     private String fetchStockDaily(String tsCode, String startDateStr, String endDateStr, List<String> headers) {
         try {
             long startDate = convertToMsTimestamp(startDateStr);
@@ -1399,6 +1467,12 @@ public class MarketDataTools {
         }
     }
 
+    /**
+     * 实际拉取指数日线并写入 dataset（若启用）。
+     *
+     * <p>逻辑与 {@link #fetchStockDaily} 对称，只是底层 Dubbo 服务换为
+     * domesticIndexService，dataset kind 为 {@code "index_daily"}。</p>
+     */
     private String fetchIndexDaily(String tsCode, String startDateStr, String endDateStr, List<String> headers) {
         try {
             long startDate = convertToMsTimestamp(startDateStr);
@@ -1638,6 +1712,12 @@ public class MarketDataTools {
                 .replace("\r", "\\r");
     }
 
+    /**
+     * 解析 assetTypes 参数为规范化集合。
+     *
+     * <p>支持逗号或 {@code |} 分隔；未指定时默认覆盖全部四类资产（stock/etf/index/off_exchange_fund）。
+     * 使用 {@link LinkedHashSet} 保留顺序并去重，使查询顺序与传入顺序一致。</p>
+     */
     private LinkedHashSet<String> parseAssetTypes(String assetTypes) {
         LinkedHashSet<String> types = new LinkedHashSet<>();
         String raw = nvl(assetTypes).trim();
@@ -1663,6 +1743,12 @@ public class MarketDataTools {
         return types;
     }
 
+    /**
+     * 将常见别名归一化为标准资产类型。
+     *
+     * <p>例如 fund / off_exchange / offexchangefund 统一映射为
+     * {@code off_exchange_fund}，提高 LLM 输出稍不标准时的容错性。</p>
+     */
     private String normalizeAssetType(String assetType) {
         String type = nvl(assetType).trim().toLowerCase();
         return switch (type) {
@@ -1672,6 +1758,13 @@ public class MarketDataTools {
         };
     }
 
+    /**
+     * 合并单资产类型的搜索结果到统一列表，并记录局部错误。
+     *
+     * <p>searchAssetInfo 需要在股票/ETF/指数/场外基金之间聚合结果，
+     * 本方法把每次子搜索的 items 打上 {@code asset_type} 标签后合并，
+     * 失败的子搜索记入 {@code partial_errors} 而不是直接让整个查询失败。</p>
+     */
     private void mergeSearchItems(List<Map<String, Object>> items,
                                   List<Map<String, Object>> partialErrors,
                                   String query,
@@ -1704,13 +1797,17 @@ public class MarketDataTools {
         ));
     }
 
-    /**
-     * 构造服务不可用错误响应，当底层 Dubbo 服务不可用时使用（如 DomesticListedAssetService 尚未部署）。
-     */
+    /** 构造服务不可用错误响应，当底层 Dubbo 服务未部署或不可用时使用。 */
     private String serviceUnavailable(String tool, String message) {
         return fail(tool, "SERVICE_UNAVAILABLE", message, Map.of());
     }
 
+    /**
+     * 判断 ETF 复权因子查询是否启用。
+     *
+     * <p>配置来源：Nacos 热加载 {@code agent.llm.runtime.execution.adjFactorEnabled}
+     * 优先，fallback 到 application.yml，默认 false。</p>
+     */
     private boolean isAdjFactorEnabled() {
         Boolean local = localConfigLoader.current()
                 .map(AgentLlmProperties::getRuntime)
@@ -1729,26 +1826,33 @@ public class MarketDataTools {
         return false;
     }
 
+    /**
+     * 查询上市公司财务报表数据（利润表/资产负债表/现金流量表/业绩快报）。
+     *
+     * <p><b>参数约束</b>：必须使用 startPeriod / endPeriod（YYYYMMDD），
+     * 禁止使用 period / year / quarter 等替代参数，否则会被显式拒绝。
+     * 查询结果写入 dataset 并返回 {@code dataset_id}，便于后续 executePython 做财务分析。</p>
+     */
     @Tool("""
         查询上市公司财务报表数据（利润表/资产负债表/现金流量表/业绩快报）。
-        
+
         【参数规范 - 必须严格遵循】
           tsCode      - 股票代码（TuShare 格式，如 600519.SH）
           reportType  - 报告类型：income（利润表）| balancesheet（资产负债表）| cashflow（现金流量表）| express（业绩快报）
           startPeriod - 报告期开始，YYYYMMDD，如 20240101
           endPeriod   - 报告期结束，YYYYMMDD，如 20241231
-        
+
         【⚠️ 严禁使用以下参数，会导致调用失败】
           period, date, year, month, quarter 等替代参数
-        
+
         【正确调用示例】
         ✅ 查茅台2024年年报利润表：{"tool":"getFinancialReport","params":{"tsCode":"600519.SH","reportType":"income","startPeriod":"20240101","endPeriod":"20241231"}}
         ✅ 查茅台2024年Q1-Q3利润表：{"tool":"getFinancialReport","params":{"tsCode":"600519.SH","reportType":"income","startPeriod":"20240331","endPeriod":"20240930"}}
-        
+
         【错误调用示例 - 会导致失败】
         ❌ {"tsCode":"600519.SH","period":"20241231","reportType":"income"}  // 用了period而不是startPeriod/endPeriod
         ❌ {"tsCode":"600519.SH","year":"2024","reportType":"income"}  // 发明year参数
-        
+
         【报告期速查】
         - 2024年报：startPeriod=20240101, endPeriod=20241231
         - 2024半年报：startPeriod=20240101, endPeriod=20240630

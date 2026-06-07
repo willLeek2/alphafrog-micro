@@ -268,9 +268,13 @@ public class LangchainRunReadService {
         String planJson = nvl(run.getPlanJson());
         var cachedPlan = stateStore.loadPlan(run.getId());
         if (cachedPlan.isPresent()) {
+            // 执行中 run 的 Redis plan 更新更及时；DB plan 用于历史和 Redis 过期后的读取。
+            // status 接口优先 Redis，是为了前端轮询时看到最新 HITL/plan override 状态。
             planJson = cachedPlan.get();
         }
         String progressJson = planJson.isBlank() ? "" : stateStore.buildProgressJson(run.getId(), planJson);
+        // status 是高频轮询接口，只返回 summary，不拉完整 observability。
+        // 完整 trace 可能很大，应该由详情页或 matrix 按需读取。
         String observabilitySummaryJson = observabilityService.loadObservabilitySummaryJson(run.getId(), run.getSnapshotJson());
         boolean observabilityFullAvailable = observabilityService.isFullObservabilityAvailable(run.getId(), run.getSnapshotJson());
         int totalCredits = creditService.calculateRunTotalCredits(run, eventService.listByRunId(run.getId()), observabilitySummaryJson);
@@ -411,6 +415,7 @@ public class LangchainRunReadService {
 
     public AgentSnapshotPartsMetaMessage getSnapshotPartsMeta(GetAgentSnapshotPartsRequest request) {
         AgentRun run = requireReadableRun(request.getId(), request.getUserId());
+        // 大 snapshot 不直接塞进单个响应。先生成 meta，让前端知道分片数量、压缩方式和校验信息。
         SnapshotPartsMeta meta = snapshotPartService.getOrBuildMeta(
                 run.getId(),
                 run.getSnapshotJson(),
@@ -428,6 +433,8 @@ public class LangchainRunReadService {
 
     public AgentSnapshotPartMessage getSnapshotPart(GetAgentSnapshotPartRequest request) {
         AgentRun run = requireReadableRun(request.getId(), request.getUserId());
+        // part 内容按 index 拉取，避免超大 run 详情超过网关/浏览器单次响应上限。
+        // meta 和 part 都通过同一个 SnapshotPartService 生成，保证分片参数一致。
         SnapshotPartsMeta meta = snapshotPartService.getOrBuildMeta(
                 run.getId(),
                 run.getSnapshotJson(),
@@ -469,6 +476,8 @@ public class LangchainRunReadService {
         if (run == null || !eventService.shouldMarkExpired(run)) {
             return run;
         }
+        // 过期是读时发现并补写的状态：旧 run 没有后台定时器一直扫描。
+        // 一旦某次读取发现超出保留窗口，就补 RUN_EXPIRED 事件并刷新 Redis 状态。
         runMapper.updateStatus(run.getId(), run.getUserId(), AgentRunStatus.EXPIRED);
         eventService.append(run.getId(), run.getUserId(), "RUN_EXPIRED", Map.of(
                 "run_id", run.getId(),
@@ -569,12 +578,15 @@ public class LangchainRunReadService {
         if ("PLAN_READY".equals(lastEventType)
                 || "PLANNING_STARTED".equals(lastEventType)
                 || "TODO_LIST_CREATED".equals(lastEventType)) {
+            // PLAN_READY 已经有计划，但还没有 TODO_NODE_STARTED/TOOL_CALL_STARTED，
+            // 对前端来说仍应展示为规划阶段结束、执行尚未正式展开。
             return "PLANNING";
         }
         if ("FINAL_ANSWER_GENERATING".equals(lastEventType) || "SUMMARIZING_STARTED".equals(lastEventType)) {
             return "SUMMARIZING";
         }
         if ("TOOL_CALL_STARTED".equals(lastEventType)) {
+            // 当前工具名从 payload 中解析，phase 只负责告诉前端这是工具执行中。
             return "EXECUTING_TOOL";
         }
         if ("EXECUTION_STARTED".equals(lastEventType) || "TODO_STARTED".equals(lastEventType)

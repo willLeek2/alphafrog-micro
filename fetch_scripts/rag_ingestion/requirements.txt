@@ -1,9 +1,6 @@
-# HTTP 请求（Jina Reader API + OSS upload-doc 端点 + embedding API）
+# HTTP 请求（Jina Reader API + OSS upload-doc 端点 + embedding API + alphafrog frontend）
 httpx>=0.28.0,<1.0.0
 requests>=2.32.0
-
-# 数据库
-psycopg2-binary>=2.9.9
 
 # 工具
 python-dotenv>=1.0.0

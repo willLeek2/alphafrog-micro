@@ -114,6 +114,13 @@ public class LangchainFailureMapper {
         return map(null, null, null, failureReason, null, null, null);
     }
 
+    /**
+     * 构造结构化的失败决策对象。
+     *
+     * <p>除了返回给调用方的 {@link LangchainFailureDecision} 外，同时组装一份
+     * {@code eventPayload} 用于 observability timeline，保证分类、可重试性、
+     * 错误码等关键字段在 trace 中可查。</p>
+     */
     private LangchainFailureDecision decision(String eventType,
                                               LangchainFailureCategory category,
                                               boolean retryable,
@@ -146,6 +153,12 @@ public class LangchainFailureMapper {
                 .build();
     }
 
+    /**
+     * 收集所有可能包含失败信息的文本片段。
+     *
+     * <p>合并 failureReason、toolOutput 和 throwable 的类名/消息，
+     * 让关键词匹配能同时覆盖业务错误、工具输出和 JVM 异常，提高分类准确率。</p>
+     */
     private String collect(String failureReason, String toolOutput, Throwable throwable) {
         StringBuilder text = new StringBuilder();
         append(text, failureReason);
@@ -157,6 +170,7 @@ public class LangchainFailureMapper {
         return text.toString().trim();
     }
 
+    /** 将非空值追加到文本收集器，各片段之间用换行分隔。 */
     private void append(StringBuilder text, String value) {
         if (value == null || value.isBlank()) {
             return;
@@ -167,6 +181,7 @@ public class LangchainFailureMapper {
         text.append(value);
     }
 
+    /** 从错误文本中提取第一个 {@code "code":"..."} 形式的错误码，供 failure decision 使用。 */
     private String extractErrorCode(String text) {
         if (text == null || text.isBlank()) {
             return "";
@@ -175,6 +190,7 @@ public class LangchainFailureMapper {
         return matcher.find() ? matcher.group(1) : "";
     }
 
+    /** 判断文本中是否包含任一关键词（大小写不敏感）。 */
     private boolean containsAny(String text, String... needles) {
         if (text == null || text.isBlank()) {
             return false;
@@ -187,12 +203,14 @@ public class LangchainFailureMapper {
         return false;
     }
 
+    /** 仅当 value 非空且非空白时才写入 payload，避免 timeline 里出现大量空字段。 */
     private void putIfNotBlank(Map<String, Object> payload, String key, String value) {
         if (value != null && !value.isBlank()) {
             payload.put(key, value);
         }
     }
 
+    /** null 转为空串，防止 JSON 序列化时出现 null 值。 */
     private String nvl(String value) {
         return value == null ? "" : value;
     }

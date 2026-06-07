@@ -96,23 +96,29 @@ public class LangchainRunControlService {
         }
         String runId = run.getId();
         String userId = run.getUserId();
+        // 1. 先写 Redis 状态为 CANCELING —— todo loop 中的 ExecutionGuard 通过轮询 Redis 检测到这个状态后自行停止
         stateStore.markRunStatus(runId, AgentRunStatus.CANCELING.name());
-        // 给执行器 200ms 窗口去感知 CANCELING 状态（ExecutionGuard 轮询 Redis），
-        // 让正在执行的 todo loop 有机会自然收尾而非被暴力中断
+        // 2. sleep 200ms 给正在执行的 todo loop 一个窗口去感知并响应 CANCELING 状态。
+        //    这比硬 kill 线程更安全——正在执行的工具调用可以自然完成当前轮，避免留下半成品状态
         try {
             Thread.sleep(200);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             log.warn("Cancel langchain run {} interrupted during observability flush wait", runId);
         }
+        // 3. 把当前 Redis 中的 observability 数据强制刷新（运行中的累积数据可能在内存缓冲区）
         observabilityService.forceFlush(runId);
+        // 4. 从 Redis 读取最新 observability → scrub 敏感信息 → 写回 DB snapshot 字段作为终态存档
         String snapshot = observabilityService.attachObservabilityToSnapshot(
                 runId, run.getSnapshotJson(), AgentRunStatus.CANCELED);
+        // 5. 更新 DB：snapshot、status、TTL（中断的 run 过期时间比正常完成的短）
         runMapper.updateSnapshot(runId, userId, AgentRunStatus.CANCELED, snapshot, false, null);
         runMapper.updateStatusWithTtl(runId, userId, AgentRunStatus.CANCELED, eventService.nextInterruptedExpiresAt());
+        // 6. 发 CANCELED 事件 → 前端 SSE 收到后更新 UI 为已取消
         eventService.append(runId, userId, "CANCELED", Map.of(
                 "run_id", runId,
                 "engine", "agentLangchainService"));
+        // 7. 最后再把 Redis 状态从 CANCELING 改成 CANCELED（终态）
         stateStore.markRunStatus(runId, AgentRunStatus.CANCELED.name());
         return AgentLangchainRunMessageMapper.toRunMessage(readService.requireReadableRun(runId, userId));
     }

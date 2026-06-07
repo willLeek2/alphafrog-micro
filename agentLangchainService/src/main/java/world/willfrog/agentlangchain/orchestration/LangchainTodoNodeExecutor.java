@@ -120,7 +120,9 @@ public class LangchainTodoNodeExecutor {
         if (item == null) {
             return LangchainTodoNodeResult.failure("todo_item_required");
         }
+        // 设置当前 todo 的上下文，供下游 observability / ToolRouter / event 服务在 trace 中标记当前 todo
         AgentContext.setTodoContext(item.getId(), item.getSequence());
+        // 拼装 user message：包含用户目标、已完成 todo、dataset refs（数据引用）、当前 todo 描述和工具规格
         String userMessage = LangchainTodoUserMessageBuilder.buildTodoUserMessage(
                 promptService,
                 request.getUserGoal(),
@@ -128,21 +130,30 @@ public class LangchainTodoNodeExecutor {
                 datasetRefs,
                 item.getDescription(),
                 request.getToolSpecifications());
+        // 记录 tool loop 开始前的计数，执行后用差值算出当前 todo 实际消耗的 tool call 次数
         int callsBefore = toolCalls.get();
+        // 把 datasetRefs 注入到 ThreadLocal 上下文中，让工具执行时能读取上游节点产生的数据引用
         LangchainDatasetRefContext.set(datasetRefs);
+        // 清除上一节点残留的重复调用标记，防止历史状态干扰当前 todo 的执行逻辑
         LangchainRepeatedToolCallContext.clear();
         try {
+            // 发 LLM 请求前先检查 run 是否已被取消
             ensureRunnable(request);
             String output = buildTodoAiService(request, toolCalls, datasetRefs).execute(userMessage);
+            // 极端情况：LLM 返回了空字符串（例如被安全过滤或模型异常），视为失败
             if (isBlank(output)) {
                 return LangchainTodoNodeResult.failure("empty_todo_output:" + item.getId());
             }
             String trimmed = output.trim();
+            // 把 LLM 返回结果中的 dataset ref（JSON 片段）注册到引用表，后续节点可通过 datasetRefs 读取复用
             DatasetRefRegistry.registerFromJson(trimmed, datasetRefs);
             return LangchainTodoNodeResult.success(trimmed, Math.max(0, toolCalls.get() - callsBefore));
         } catch (Exception e) {
+            // ensureRunnable 抛出的 RUN_INTERRUPTED 异常、tool loop 内的工具异常、LLM 超时等都会在这里捕获，
+            // 统一转为失败结果；上层 DagWorkflowExecutor 根据 isSuccess() 决定是否 skip 下游节点
             return LangchainTodoNodeResult.failure(e.getMessage());
         } finally {
+            // 清理 ThreadLocal，防止线程池复用时上下文串扰到下一个 run
             LangchainRepeatedToolCallContext.clear();
             LangchainDatasetRefContext.clear();
             AgentContext.clearTodoContext();
@@ -168,7 +179,9 @@ public class LangchainTodoNodeExecutor {
      */
     public String writeFinalAnswer(LangchainLinearWorkflowRequest request,
                                    List<LangchainCompletedTodo> completedTodos) {
+        // 生成最终答案前也要检查 run 是否已被取消——避免用户在最后一步点了 cancel 但请求仍发出
         ensureRunnable(request);
+        // buildFinalAnswerAiService 不注入 toolProvider → 纯文本生成，不会触发工具调用
         return buildFinalAnswerAiService(request)
                 .answer(LangchainTodoUserMessageBuilder.buildFinalUserMessage(
                         promptService,

@@ -217,6 +217,9 @@ public class ToolRouter {
          */
         Optional<ToolWeightedLimitService.WeightLease> weightLease = Optional.empty();
         if (toolWeightedLimitService != null) {
+            // toolCalls 预算按“模型发起了一次工具调用”计数，但真实资源占用可能远大于 1：
+            // 例如批量行情查询一次请求里带多个资产，executePython 会占用沙箱工作线程。
+            // WeightLease 让这些工具按有效权重参与限流，同时保持对模型暴露的工具调用次数语义不变。
             Optional<ToolWeightedLimitService.WeightLease> acquired = toolWeightedLimitService.tryAcquire(toolName, params);
             if (acquired.isEmpty()) {
                 int effectiveWeight = toolWeightedLimitService.previewEffectiveWeight(toolName, params);
@@ -456,6 +459,8 @@ public class ToolRouter {
         try {
             // 能力校验：searchWeb 必须显式开启 webSearch 能力，否则返回不可用响应
             if ("searchWeb".equals(toolName) && !AgentContext.isWebSearchEnabled()) {
+                // webSearch 是按 run 配置开放的能力，不是全局默认工具。
+                // 这里返回结构化不可用结果，让模型知道不能继续依赖搜索，而不是抛异常中断整个 run。
                 result = writeJson(Map.of(
                         "ok", false,
                         "tool", "searchWeb",
@@ -474,6 +479,8 @@ public class ToolRouter {
             }
             // 统一入口负责兼容参数别名（ts_code/code 等），工具实现层只接收标准参数。
             result = switch (toolName) {
+                // checkParallelLimits 是“给模型看的工具目录说明”，只读配置，不访问业务数据。
+                // 它必须和其它工具走同一个路由入口，模型才能通过 tool-calling 正常调用。
                 case "checkParallelLimits" -> marketDataTools.checkParallelLimits();
                 case "getStockInfo" -> marketDataTools.getStockInfo(
                         str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("stock_code"), params.get("arg0"))
@@ -529,6 +536,8 @@ public class ToolRouter {
                 );
                 case "getEtfAdj" -> {
                     if (!isAdjFactorEnabled()) {
+                        // ETF 复权因子是可灰度关闭的功能。禁用时返回标准 JSON，
+                        // 保证前端和 LLM 都能读到明确的 CAPABILITY_DISABLED，而不是把它当作服务异常。
                         yield writeJson(Map.of(
                                 "ok", false,
                                 "tool", "getEtfAdj",
@@ -584,6 +593,7 @@ public class ToolRouter {
             };
         } catch (Exception e) {
             // 任意工具实现抛出的异常都收敛为标准失败 JSON，避免对 LLM 暴露 Java 异常信息
+            // 具体堆栈仍在服务日志中，模型只拿到可解释的 error.message。
             debugLog("tool invoke exception: runId={}, tool={}, error={}",
                     AgentContext.getRunId(), nvl(toolName), nvl(e.getMessage()));
             result = invocationError(toolName, e.getMessage());

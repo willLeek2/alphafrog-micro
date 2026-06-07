@@ -20,6 +20,21 @@ RAG Ingestion 主入口脚本。
 用法（YAML 任务配置模式）：
   python run.py --task-config rag-ingestion-tasks.yml
   # 每个 task 可独立指定 doc_type、date_from/date_to、ts_code、limit、offset
+  # 旧式 tasks 列表 (向后兼容)
+
+YAML 配置文件支持两种格式 (互斥, 不可同时出现):
+  1) tasks 列表 (旧式, 继续支持)
+     tasks:
+       - name: ...
+  2) scenarios 列表 (新式, 每项必含 name)
+     scenarios:
+       - name: <scenario_name>
+         ts_code: { type: list|select, ... }  # None 时整库扫
+         date_from: "20240101"
+         date_to: "20241231"
+         doc_type: ann|research|all
+         limit: 50
+         offset: 0
 """
 import argparse
 import sys
@@ -35,6 +50,7 @@ from oss_uploader import upload_doc
 from chunker import chunk_text
 from embedder import get_embeddings
 from ingest_client import ingest_vectors
+from ts_code_filter import ConfigError, TsCodeFilter
 
 
 def process_announcements(
@@ -44,7 +60,7 @@ def process_announcements(
     offset: int = 0,
     date_from: str = None,
     date_to: str = None,
-    ts_code: str = None,
+    ts_code=None,
     title_patterns: list = None,
 ):
     records = db.get_unprocessed_announcements(
@@ -129,7 +145,7 @@ def process_reports(
     offset: int = 0,
     date_from: str = None,
     date_to: str = None,
-    ts_code: str = None,
+    ts_code=None,
     title_patterns: list = None,
 ):
     records = db.get_unprocessed_reports(
@@ -222,7 +238,7 @@ def process_reports(
 
 
 def run_task(task: dict, db: DbClient, cfg):
-    """执行单个 YAML task 配置。"""
+    """执行单个 YAML task 配置 (旧式 tasks: 列表 路径)。"""
     name = task.get("name", "(未命名)")
     doc_type = task.get("doc_type", "all")
     date_from = str(task["date_from"]) if task.get("date_from") else None
@@ -237,34 +253,155 @@ def run_task(task: dict, db: DbClient, cfg):
     print(f"       ts_code={ts_code}  limit={limit}  offset={offset}  title_patterns={title_patterns}")
     print(f"{'='*60}")
 
+    _run_one_doc_type(
+        db, cfg, doc_type,
+        limit=limit, offset=offset,
+        date_from=date_from, date_to=date_to,
+        ts_code=ts_code, title_patterns=title_patterns,
+    )
+
+
+def _run_one_doc_type(
+    db: DbClient, cfg, doc_type: str, *,
+    limit: int, offset: int,
+    date_from, date_to, ts_code, title_patterns,
+):
+    """根据 doc_type 调度 process_announcements / process_reports (内部 helper, 不打印头)。"""
     if doc_type in ("ann", "all"):
-        process_announcements(db, cfg, limit=limit, offset=offset,
-                              date_from=date_from, date_to=date_to, ts_code=ts_code,
-                              title_patterns=title_patterns)
+        process_announcements(
+            db, cfg, limit=limit, offset=offset,
+            date_from=date_from, date_to=date_to, ts_code=ts_code,
+            title_patterns=title_patterns,
+        )
     if doc_type in ("research", "all"):
-        process_reports(db, cfg, limit=limit, offset=offset,
-                        date_from=date_from, date_to=date_to, ts_code=ts_code,
-                        title_patterns=title_patterns)
+        process_reports(
+            db, cfg, limit=limit, offset=offset,
+            date_from=date_from, date_to=date_to, ts_code=ts_code,
+            title_patterns=title_patterns,
+        )
 
 
-def run_from_task_config(task_config_path: str, db: DbClient, cfg):
-    """从 YAML 任务配置文件加载并依次执行所有 enabled task。"""
-    with open(task_config_path, "r", encoding="utf-8") as f:
-        config = yaml.safe_load(f)
+def run_scenario(scenario: dict, db: DbClient, cfg, *, index: int, total: int):
+    """执行单个 scenario 配置 (新式 scenarios: 列表 路径, name 来自 scenario['name'])。
 
-    tasks = config.get("tasks", [])
+    ts_code.type 决定 limit/offset 的语义:
+    - list:   limit/offset 作用于每个 ts_code (per-ts-code 分页)
+    - select: limit/offset 作用于全局 SQL 分页
+    - None:   limit/offset 作用于全局 SQL 分页 (与 select 同)
+
+    ts_code 配置错误时直接抛 ConfigError, 由 main() 捕获并退出码 1
+    (配置错了应停下来修, 不该静默跳过继续跑)。
+    """
+    name = scenario.get("name", f"scenario-{index}")
+    doc_type = scenario.get("doc_type", "all")
+    date_from = str(scenario["date_from"]) if scenario.get("date_from") else None
+    date_to = str(scenario["date_to"]) if scenario.get("date_to") else None
+    ts_code_raw = scenario.get("ts_code")
+    title_patterns = scenario.get("title_patterns") or None
+    limit = int(scenario.get("limit", 50))
+    offset = int(scenario.get("offset", 0))
+
+    # from_yaml 配置错误直接抛, 不静默跳过 (fail closed)
+    ts_filter = TsCodeFilter.from_yaml(ts_code_raw, scenario_name=name)
+
+    ts_type = ts_filter.type or "(none=全局)"
+    print(f"\n{'='*60}")
+    print(f"[scenario] {index}/{total}  name={name!r}  doc_type={doc_type}  ts_code_type={ts_type}")
+    print(f"           date_from={date_from}  date_to={date_to}")
+    print(f"           limit={limit}  offset={offset}  title_patterns={title_patterns}")
+    print(f"{'='*60}")
+
+    if ts_filter.type == "list":
+        for code_idx, code in enumerate(ts_filter.values, 1):
+            print(f"\n[scenario] {name!r} ── ts_code {code_idx}/{len(ts_filter.values)}: {code} ──")
+            _run_one_doc_type(
+                db, cfg, doc_type,
+                limit=limit, offset=offset,
+                date_from=date_from, date_to=date_to,
+                ts_code=code, title_patterns=title_patterns,
+            )
+    else:
+        # select / None: 全局 SQL 分页
+        _run_one_doc_type(
+            db, cfg, doc_type,
+            limit=limit, offset=offset,
+            date_from=date_from, date_to=date_to,
+            ts_code=ts_code_raw, title_patterns=title_patterns,
+        )
+
+
+def run_from_legacy_tasks(tasks: list, db: DbClient, cfg):
+    """旧式 tasks: 列表 路径, 100% 向后兼容。"""
     if not tasks:
-        print("[run] task config 中没有任何 task，退出。")
+        print("[run] task config 中没有任何 task, 退出。")
         return
-
     enabled = [t for t in tasks if t.get("enabled", True)]
-    print(f"[run] 共 {len(tasks)} 个 task，其中 {len(enabled)} 个已启用。")
-
+    print(f"[run] 共 {len(tasks)} 个 task, 其中 {len(enabled)} 个已启用。")
     for i, task in enumerate(enabled, 1):
         print(f"\n[run] ── Task {i}/{len(enabled)} ──")
         run_task(task, db, cfg)
-
     print("\n[run] 所有 task 执行完毕。")
+
+
+def run_from_scenarios(scenarios: list, db: DbClient, cfg):
+    """新式 scenarios: 列表 路径, 每个 item 是 dict, 必须含 'name' 字段。
+
+    失败模式 (fail closed): item 非 dict / 缺 name → 抛 ConfigError, 整体退出码 1。
+    """
+    if not scenarios:
+        print("[run] scenarios 配置为空, 退出。")
+        return
+    if not isinstance(scenarios, list):
+        raise ConfigError(
+            f"scenarios 必须是 list (每项是 dict, 含 'name' 字段), 收到 {type(scenarios).__name__}"
+        )
+    # 校验每项, 顺手把 name 提取出来
+    normalized: list = []
+    for i, item in enumerate(scenarios):
+        if not isinstance(item, dict):
+            raise ConfigError(
+                f"scenarios[{i}] 必须是 dict, 收到 {type(item).__name__}"
+            )
+        name = item.get("name")
+        if not name or not isinstance(name, str):
+            raise ConfigError(
+                f"scenarios[{i}] 缺少必填字段 'name' (非空字符串)"
+            )
+        normalized.append((name, item))
+
+    enabled = [(n, s) for n, s in normalized if s.get("enabled", True)]
+    print(f"[run] 共 {len(scenarios)} 个 scenario, 其中 {len(enabled)} 个已启用。")
+    for i, (name, scenario) in enumerate(enabled, 1):
+        run_scenario(scenario, db, cfg, index=i, total=len(enabled))
+    print("\n[run] 所有 scenario 执行完毕。")
+
+
+def dispatch_from_config(config_path: str, db: DbClient, cfg):
+    """加载 YAML 配置, 校验 tasks/scenarios 互斥, 分派到对应路径。
+
+    失败时抛 ConfigError (run.py 入口捕获并退出码 1)。
+    """
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f) or {}
+
+    has_tasks = "tasks" in config
+    has_scenarios = "scenarios" in config
+
+    if has_tasks and has_scenarios:
+        raise ConfigError(
+            f"配置文件 {config_path!r} 同时包含 'tasks' 和 'scenarios', 二者互斥, 请只保留一个"
+        )
+    if not has_tasks and not has_scenarios:
+        raise ConfigError(
+            f"配置文件 {config_path!r} 必须包含 'tasks' 或 'scenarios' 之一"
+        )
+
+    if has_tasks:
+        print(f"[run] 配置文件使用旧式 'tasks' 格式 (向后兼容)")
+        run_from_legacy_tasks(config["tasks"], db, cfg)
+    else:
+        print(f"[run] 配置文件使用新式 'scenarios' 格式")
+        run_from_scenarios(config["scenarios"], db, cfg)
 
 
 def main():
@@ -327,7 +464,11 @@ def main():
     db = DbClient(cfg)
 
     if args.task_config:
-        run_from_task_config(args.task_config, db, cfg)
+        try:
+            dispatch_from_config(args.task_config, db, cfg)
+        except ConfigError as e:
+            print(f"[run] [fatal] {e}")
+            sys.exit(1)
     else:
         # 传统 CLI 模式
         if args.doc_type in ("ann", "all"):

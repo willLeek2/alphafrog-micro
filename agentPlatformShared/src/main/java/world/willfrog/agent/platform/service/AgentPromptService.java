@@ -244,7 +244,12 @@ public class AgentPromptService {
         return composeSystemPrompt(specific);
     }
 
-    /** 并行执行结束后的最终汇总（final answer）System Prompt。 */
+    /**
+     * 并行执行结束后的最终汇总（final answer）System Prompt。
+     *
+     * <p>当一次 run 同时生成多个候选方案并执行完毕后，用此 prompt 引导 LLM
+     * 比较各方案结果并输出最终答案。</p>
+     */
     public String parallelFinalSystemPrompt() {
         return composeSystemPrompt(firstNonBlank(currentPrompts().getParallelFinalSystemPrompt(), ""));
     }
@@ -305,8 +310,12 @@ public class AgentPromptService {
         return composeSystemPrompt(firstNonBlank(currentPrompts().getSubAgentSummarySystemPrompt(), ""));
     }
 
-    /** Python 代码自动修正（refine）阶段的 System Prompt。
-     *  当 LLM 生成的 Python 代码执行出错时，用此 prompt 引导 LLM 修复代码。 */
+    /**
+     * Python 代码自动修正（refine）阶段的 System Prompt。
+     *
+     * <p>当 executePython 返回错误（如语法错误、依赖缺失、数据字段不对）时，
+     * 用此 prompt 引导 LLM 基于错误信息和原始代码生成修正版本。</p>
+     */
     public String pythonRefineSystemPrompt() {
         return composeSystemPrompt(firstNonBlank(currentPrompts().getPythonRefineSystemPrompt(), ""));
     }
