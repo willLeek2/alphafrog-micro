@@ -33,9 +33,20 @@ class _FakeCfg:
     pass
 
 
+class _FakeScenarioCfg:
+    """fake_override 返回的桩, 含 run.py:308-311 打印用的 3 个 embedding 属性。"""
+    embedding_model = ""
+    embedding_base_url = ""
+    embedding_provider_order: list = []
+
+
 @pytest.fixture
 def fake_call_recorder(monkeypatch):
-    """把 process_announcements / process_reports 替换成记录器, 返回 list of (func_name, kwargs)。"""
+    """把 process_announcements / process_reports 替换成记录器, 返回 list of (func_name, kwargs)。
+
+    顺手把 config_with_embedding_override 替换成一个返回 _FakeScenarioCfg 的桩, 避免
+    scenarios.example.yml 包含 embedding 字段时 _FakeCfg 缺 Config 字段而炸。
+    """
     calls: list = []
 
     def fake_process_announcements(db, cfg, **kwargs):
@@ -44,8 +55,12 @@ def fake_call_recorder(monkeypatch):
     def fake_process_reports(db, cfg, **kwargs):
         calls.append(("process_reports", kwargs))
 
+    def fake_override(cfg, emb):
+        return _FakeScenarioCfg()
+
     monkeypatch.setattr(run, "process_announcements", fake_process_announcements)
     monkeypatch.setattr(run, "process_reports", fake_process_reports)
+    monkeypatch.setattr(run, "config_with_embedding_override", fake_override)
     return calls
 
 

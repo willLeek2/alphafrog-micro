@@ -39,21 +39,82 @@ class DbClient:
 
     def __init__(self, cfg: Config):
         self.base_url = cfg.service_base_url.rstrip("/")
-        self.token = cfg.ingest_admin_token
+        self._admin_token = cfg.ingest_admin_token
+        self._login_username = cfg.login_username
+        self._login_password = cfg.login_password
+        self._jwt_token: Optional[str] = None
         self.session = requests.Session()
         # 默认超时：拉记录 60s，写状态 30s（写状态 1 行很快）
         self._read_timeout = 60.0
         self._write_timeout = 30.0
 
+    # ── 登录（/rag/records/* 需要 JWT 鉴权）─────────────────────
+
+    def _ensure_login(self) -> None:
+        """惰性登录：首次调用 records 端点前获取 JWT token。
+
+        优先用 login_username/login_password 走 /api/auth/login；
+        若未配置则回退到 admin-token（本地开发或旧配置兼容）。
+        """
+        if self._jwt_token:
+            return
+        if not self._login_username or not self._login_password:
+            # 未配登录凭据 → 回退到 admin-token（本地开发或旧配置）
+            return
+        self._jwt_token = self._do_login()
+        if self._jwt_token:
+            print(f"[DbClient] JWT login OK for {self._login_username}")
+
+    def _do_login(self) -> Optional[str]:
+        """POST /api/auth/login，返回 JWT token 字符串。
+
+        处理 "User already logged in"：先 logout 再重试一次。
+        """
+        url = f"{self.base_url}/api/auth/login"
+        payload = {
+            "username": self._login_username,
+            "password": self._login_password,
+        }
+        resp = self.session.post(url, json=payload, timeout=30.0)
+
+        if resp.status_code == 400 and "User already logged in" in resp.text:
+            print("[DbClient] User already logged in, force logout + retry")
+            self._do_logout()
+            resp = self.session.post(url, json=payload, timeout=30.0)
+
+        if resp.status_code != 200:
+            print(f"[DbClient] Login failed: HTTP {resp.status_code} body={resp.text!r}")
+            return None
+
+        token = resp.text.strip().strip('"')
+        print(f"[DbClient] Login OK, token prefix={token[:30]!r} len={len(token)}")
+        return token
+
+    def _do_logout(self) -> None:
+        """强制登出，清除服务端会话。"""
+        try:
+            self.session.post(
+                f"{self.base_url}/api/auth/logout",
+                json={"username": self._login_username},
+                timeout=10.0,
+            )
+        except Exception:
+            pass
+
     # ── 内部 HTTP helper ──────────────────────────────────────
 
     def _headers(self) -> Dict[str, str]:
         h = {"Content-Type": "application/json"}
-        if self.token:
-            h["Authorization"] = f"Bearer {self.token}"
+        # /rag/records/* 需要 JWT；优先用 JWT，fallback 到 admin-token
+        token = self._jwt_token or self._admin_token
+        if token:
+            h["Authorization"] = f"Bearer {token}"
         return h
 
     def _post(self, path: str, payload: Dict[str, Any], timeout: float) -> Dict[str, Any]:
+        # records 端点需要 JWT，惰性登录
+        if path.startswith("/rag/records"):
+            self._ensure_login()
         url = f"{self.base_url}{path}"
         resp = self.session.post(
             url, json=payload, headers=self._headers(), timeout=timeout

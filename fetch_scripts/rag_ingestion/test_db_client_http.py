@@ -245,7 +245,7 @@ def test_post_includes_bearer_header_when_token_set(monkeypatch):
 def test_post_omits_authorization_header_when_token_blank(monkeypatch):
     body = {"docType": "announcement", "count": 0, "records": []}
     client, rec = _patched_client(monkeypatch, _FakeResponse(200, body))
-    client.token = ""  # 模拟未配置 token (开发环境)
+    client._admin_token = ""  # 模拟未配置 token (开发环境)
 
     client.get_unprocessed_announcements()
 

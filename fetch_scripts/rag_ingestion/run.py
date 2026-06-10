@@ -40,10 +40,10 @@ import argparse
 import sys
 
 import yaml
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 from tqdm import tqdm
 
-from config import load_config
+from config import load_config, config_with_embedding_override, config_with_auth_override
 from db_client import DbClient
 from jina_reader import crawl_url
 from oss_uploader import upload_doc
@@ -281,13 +281,19 @@ def _run_one_doc_type(
         )
 
 
-def run_scenario(scenario: dict, db: DbClient, cfg, *, index: int, total: int):
+def run_scenario(
+    scenario: dict, db: DbClient, cfg, *, index: int, total: int,
+    global_embedding: dict = None,
+):
     """执行单个 scenario 配置 (新式 scenarios: 列表 路径, name 来自 scenario['name'])。
 
     ts_code.type 决定 limit/offset 的语义:
     - list:   limit/offset 作用于每个 ts_code (per-ts-code 分页)
     - select: limit/offset 作用于全局 SQL 分页
     - None:   limit/offset 作用于全局 SQL 分页 (与 select 同)
+
+    embedding 优先级: scenario 级别 > 全局级别 > env 变量。
+    global_embedding 为 YAML 顶层 `embedding:` 块, scenario 级别显式声明时覆盖它。
 
     ts_code 配置错误时直接抛 ConfigError, 由 main() 捕获并退出码 1
     (配置错了应停下来修, 不该静默跳过继续跑)。
@@ -300,6 +306,15 @@ def run_scenario(scenario: dict, db: DbClient, cfg, *, index: int, total: int):
     title_patterns = scenario.get("title_patterns") or None
     limit = int(scenario.get("limit", 50))
     offset = int(scenario.get("offset", 0))
+
+    # embedding 配置：scenario 级别 > 全局级别 > env 变量
+    emb_override = scenario.get("embedding") or global_embedding
+    scenario_cfg = config_with_embedding_override(cfg, emb_override)
+    if emb_override:
+        print(f"           embedding_model={scenario_cfg.embedding_model}")
+        print(f"           embedding_base_url={scenario_cfg.embedding_base_url}")
+        if scenario_cfg.embedding_provider_order:
+            print(f"           provider_order={scenario_cfg.embedding_provider_order}")
 
     # from_yaml 配置错误直接抛, 不静默跳过 (fail closed)
     ts_filter = TsCodeFilter.from_yaml(ts_code_raw, scenario_name=name)
@@ -315,7 +330,7 @@ def run_scenario(scenario: dict, db: DbClient, cfg, *, index: int, total: int):
         for code_idx, code in enumerate(ts_filter.values, 1):
             print(f"\n[scenario] {name!r} ── ts_code {code_idx}/{len(ts_filter.values)}: {code} ──")
             _run_one_doc_type(
-                db, cfg, doc_type,
+                db, scenario_cfg, doc_type,
                 limit=limit, offset=offset,
                 date_from=date_from, date_to=date_to,
                 ts_code=code, title_patterns=title_patterns,
@@ -323,7 +338,7 @@ def run_scenario(scenario: dict, db: DbClient, cfg, *, index: int, total: int):
     else:
         # select / None: 全局 SQL 分页
         _run_one_doc_type(
-            db, cfg, doc_type,
+            db, scenario_cfg, doc_type,
             limit=limit, offset=offset,
             date_from=date_from, date_to=date_to,
             ts_code=ts_code_raw, title_patterns=title_patterns,
@@ -343,8 +358,11 @@ def run_from_legacy_tasks(tasks: list, db: DbClient, cfg):
     print("\n[run] 所有 task 执行完毕。")
 
 
-def run_from_scenarios(scenarios: list, db: DbClient, cfg):
+def run_from_scenarios(scenarios: list, db: DbClient, cfg, global_embedding: dict = None):
     """新式 scenarios: 列表 路径, 每个 item 是 dict, 必须含 'name' 字段。
+
+    global_embedding 为 YAML 顶层 `embedding:` 块, 作为所有 scenario 的默认 embedding
+    配置; 单个 scenario 显式声明 `embedding` 时可覆盖它。
 
     失败模式 (fail closed): item 非 dict / 缺 name → 抛 ConfigError, 整体退出码 1。
     """
@@ -372,7 +390,10 @@ def run_from_scenarios(scenarios: list, db: DbClient, cfg):
     enabled = [(n, s) for n, s in normalized if s.get("enabled", True)]
     print(f"[run] 共 {len(scenarios)} 个 scenario, 其中 {len(enabled)} 个已启用。")
     for i, (name, scenario) in enumerate(enabled, 1):
-        run_scenario(scenario, db, cfg, index=i, total=len(enabled))
+        run_scenario(
+            scenario, db, cfg, index=i, total=len(enabled),
+            global_embedding=global_embedding,
+        )
     print("\n[run] 所有 scenario 执行完毕。")
 
 
@@ -396,12 +417,24 @@ def dispatch_from_config(config_path: str, db: DbClient, cfg):
             f"配置文件 {config_path!r} 必须包含 'tasks' 或 'scenarios' 之一"
         )
 
+    # auth 配置（全局，从 YAML 顶层读取，覆盖 env）
+    global_auth = config.get("auth")
+    if global_auth:
+        cfg = config_with_auth_override(cfg, global_auth)
+        if cfg.login_username:
+            print(f"[run] auth username={cfg.login_username}")
+        # db 在 main() 里用原始 cfg 创建，需同步更新凭据
+        db._login_username = cfg.login_username
+        db._login_password = cfg.login_password
+        db._jwt_token = None
+
     if has_tasks:
         print(f"[run] 配置文件使用旧式 'tasks' 格式 (向后兼容)")
         run_from_legacy_tasks(config["tasks"], db, cfg)
     else:
         print(f"[run] 配置文件使用新式 'scenarios' 格式")
-        run_from_scenarios(config["scenarios"], db, cfg)
+        global_embedding = config.get("embedding")
+        run_from_scenarios(config["scenarios"], db, cfg, global_embedding=global_embedding)
 
 
 def main():
@@ -459,7 +492,9 @@ def main():
     )
     args = parser.parse_args()
 
-    load_dotenv()
+    # override=True: .env 文件里的值优先于 shell 里已 export 的值
+    # 避免 "shell 里设了 localhost 但 .env 里改了地址不生效" 的情况
+    load_dotenv(find_dotenv(), override=True)
     cfg = load_config()
     db = DbClient(cfg)
 

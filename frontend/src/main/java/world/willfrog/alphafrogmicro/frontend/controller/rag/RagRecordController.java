@@ -7,6 +7,8 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
@@ -96,6 +98,12 @@ public class RagRecordController {
     }
 
     private boolean isAuthorized(String authHeader) {
+        // 如果已通过 Spring Security JWT 认证，直接放行
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        if (auth != null && auth.isAuthenticated()) {
+            return true;
+        }
+        // 否则回退到 admin token 检查（向后兼容）
         if (adminToken == null || adminToken.isBlank()) {
             return true;
         }
