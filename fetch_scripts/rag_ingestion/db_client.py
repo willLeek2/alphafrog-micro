@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 import requests
 
 from config import Config
+from title_match_filter import normalize_title_filters
 from ts_code_filter import TsCodeFilter
 
 log = logging.getLogger(__name__)
@@ -147,6 +148,7 @@ class DbClient:
         date_to: str = None,
         ts_code=None,
         title_patterns: list = None,
+        title_match: dict = None,
     ) -> List[Dict[str, Any]]:
         """查询 vectorized=FALSE 且 oss_url IS NULL 的公告记录。
 
@@ -157,7 +159,7 @@ class DbClient:
             doc_type="ann",
             limit=limit, offset=offset,
             date_from=date_from, date_to=date_to,
-            ts_code=ts_code, title_patterns=title_patterns,
+            ts_code=ts_code, title_patterns=title_patterns, title_match=title_match,
         )
         return self._renormalize_date_field(records, "ann_date")
 
@@ -179,13 +181,14 @@ class DbClient:
         date_to: str = None,
         ts_code=None,
         title_patterns: list = None,
+        title_match: dict = None,
     ) -> List[Dict[str, Any]]:
         """查询 vectorized=FALSE 且 oss_url IS NULL 的研报记录。"""
         records = self._post_unprocessed(
             doc_type="research",
             limit=limit, offset=offset,
             date_from=date_from, date_to=date_to,
-            ts_code=ts_code, title_patterns=title_patterns,
+            ts_code=ts_code, title_patterns=title_patterns, title_match=title_match,
         )
         return self._renormalize_date_field(records, "trade_date")
 
@@ -209,6 +212,7 @@ class DbClient:
         date_to: Optional[str],
         ts_code,
         title_patterns: Optional[List[str]],
+        title_match: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         api_doc_type = self._normalize_doc_type(doc_type)
         payload: Dict[str, Any] = {
@@ -223,8 +227,17 @@ class DbClient:
         if ts_code is not None:
             # 服务端会再次走 TsCodeFilter 等价校验；这里只规范化 dict/list 形态
             payload["tsCode"] = self._normalize_ts_code_for_http(ts_code, scenario_name=doc_type)
-        if title_patterns:
-            payload["titlePatterns"] = list(title_patterns)
+        title_patterns_payload, title_match_payload = normalize_title_filters(
+            title_patterns_present=title_patterns is not None,
+            title_patterns_raw=title_patterns,
+            title_match_present=title_match is not None,
+            title_match_raw=title_match,
+            scenario_name=doc_type,
+        )
+        if title_patterns_payload:
+            payload["titlePatterns"] = title_patterns_payload
+        if title_match_payload:
+            payload["titleMatch"] = title_match_payload
 
         body = self._post("/rag/records/list-unprocessed", payload, timeout=self._read_timeout)
         records = body.get("records", [])

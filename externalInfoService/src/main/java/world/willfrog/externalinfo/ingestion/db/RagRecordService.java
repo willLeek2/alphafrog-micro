@@ -145,7 +145,7 @@ public class RagRecordService {
 
         appendDateConditions(conditions, params, dateColumn, req.getDateFrom(), req.getDateTo());
         appendTsCodeConditions(conditions, params, req.getTsCode());
-        appendTitlePatternConditions(conditions, params, req.getTitlePatterns());
+        appendTitleConditions(conditions, params, req.getTitlePatterns(), req.getTitleMatch());
 
         String where = "WHERE " + String.join(" AND ", conditions) + " ";
         return new SqlAndParams(select + fromClause + where, params);
@@ -250,17 +250,96 @@ public class RagRecordService {
         params.addAll(innerParams);
     }
 
-    private void appendTitlePatternConditions(List<String> conditions, List<Object> params,
-                                              List<String> patterns) {
-        if (patterns == null || patterns.isEmpty()) {
+    private void appendTitleConditions(List<String> conditions, List<Object> params,
+                                       List<String> patterns, Map<String, Object> titleMatch) {
+        if (patterns != null && titleMatch != null) {
+            throw new IllegalArgumentException("titlePatterns and titleMatch are mutually exclusive");
+        }
+        if (patterns != null) {
+            appendTitleLikeGroup(conditions, params, patterns, "OR", false);
             return;
         }
-        String joined = String.join(" OR ",
-                Collections.nCopies(patterns.size(), "d.title LIKE ?"));
-        conditions.add("(" + joined + ")");
+        if (titleMatch != null) {
+            appendTitleMatchConditions(conditions, params, titleMatch);
+        }
+    }
+
+    private void appendTitleMatchConditions(List<String> conditions, List<Object> params,
+                                            Map<String, Object> titleMatch) {
+        String mode = stringValue(titleMatch.getOrDefault("mode", "contains"));
+        if (!"contains".equals(mode)) {
+            throw new IllegalArgumentException("titleMatch.mode currently only supports 'contains', got " + mode);
+        }
+
+        Object includeModeObj = titleMatch.containsKey("includeMode")
+                ? titleMatch.get("includeMode")
+                : titleMatch.getOrDefault("include_mode", "any");
+        String includeMode = stringValue(includeModeObj);
+        String includeJoiner;
+        if ("any".equals(includeMode)) {
+            includeJoiner = "OR";
+        } else if ("all".equals(includeMode)) {
+            includeJoiner = "AND";
+        } else {
+            throw new IllegalArgumentException("titleMatch.includeMode must be any or all, got " + includeMode);
+        }
+
+        List<String> include = stringList(titleMatch.get("include"), "titleMatch.include");
+        List<String> exclude = stringList(titleMatch.get("exclude"), "titleMatch.exclude");
+        if (include.isEmpty() && exclude.isEmpty()) {
+            throw new IllegalArgumentException("titleMatch.include/titleMatch.exclude must not both be empty");
+        }
+
+        if (!include.isEmpty()) {
+            appendTitleLikeGroup(conditions, params, include, includeJoiner, false);
+        }
+        if (!exclude.isEmpty()) {
+            appendTitleLikeGroup(conditions, params, exclude, "OR", true);
+        }
+    }
+
+    private void appendTitleLikeGroup(List<String> conditions, List<Object> params,
+                                      List<String> patterns, String joiner, boolean negated) {
+        List<String> cleaned = new ArrayList<>();
         for (String p : patterns) {
+            if (p != null && !p.isBlank()) {
+                cleaned.add(p.trim());
+            }
+        }
+        if (cleaned.isEmpty()) {
+            return;
+        }
+        String word = "AND".equals(joiner) ? " AND " : " OR ";
+        String joined = String.join(word, Collections.nCopies(cleaned.size(), "d.title LIKE ?"));
+        conditions.add((negated ? "NOT " : "") + "(" + joined + ")");
+        for (String p : cleaned) {
             params.add("%" + p + "%");
         }
+    }
+
+    private static String stringValue(Object value) {
+        return value == null ? "" : String.valueOf(value).trim();
+    }
+
+    private static List<String> stringList(Object raw, String fieldName) {
+        if (raw == null) {
+            return List.of();
+        }
+        if (!(raw instanceof List)) {
+            throw new IllegalArgumentException(fieldName + " must be a list");
+        }
+        List<String> result = new ArrayList<>();
+        for (Object item : (List<?>) raw) {
+            if (item == null) {
+                throw new IllegalArgumentException(fieldName + " contains null item");
+            }
+            String s = String.valueOf(item).trim();
+            if (s.isEmpty()) {
+                throw new IllegalArgumentException(fieldName + " contains blank item");
+            }
+            result.add(s);
+        }
+        return result;
     }
 
     /** 与 Python 侧 date_utils.yyyymmdd_to_ms 对齐：YYYYMMDD → Asia/Shanghai 午夜 Unix 毫秒 */

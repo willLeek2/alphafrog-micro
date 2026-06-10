@@ -25,8 +25,13 @@
 #   date_from      - 起始日期 (含), 格式 YYYYMMDD, 省略则不过滤
 #   date_to        - 截止日期 (含), 格式 YYYYMMDD, 省略则不过滤
 #   doc_type       - ann | research | all (默认 all)
-#   title_patterns - title 子串过滤列表, OR 关系 (含任一即满足), 省略则不过滤
-#                    未来支持 title_match: { mode, include, exclude } 复杂模式
+#   title_patterns - 旧式 title 子串过滤列表, OR 关系 (含任一即满足), 省略则不过滤
+#                    与 title_match 互斥
+#   title_match    - 新式 title 匹配配置, 与 title_patterns 互斥:
+#                    mode: contains          # 当前仅支持 contains
+#                    include_mode: any|all   # 可选, 默认 any
+#                    include: ["年度报告"]    # 命中条件
+#                    exclude: ["摘要"]        # 排除条件
 #   limit          - 最大处理条数 (默认 50); 语义取决于 ts_code.type:
 #                      list   → 作用于每个 ts_code (per-ts-code 分页)
 #                      select → 作用于全局 SQL 分页
@@ -65,8 +70,13 @@ scenarios:
     doc_type: ann
     date_from: "20240101"
     date_to: "20241231"
-    title_patterns:
-      - "年度报告"
+    title_match:
+      mode: contains
+      include:
+        - "年度报告"
+      exclude:
+        - "摘要"
+        - "英文版"
     ts_code:
       type: list
       values:
@@ -82,8 +92,13 @@ scenarios:
     doc_type: ann
     date_from: "20240101"
     date_to: "20241231"
-    title_patterns:
-      - "年度报告"
+    title_match:
+      mode: contains
+      include:
+        - "年度报告"
+      exclude:
+        - "摘要"
+        - "英文版"
     ts_code:
       type: select
       conditions:
@@ -111,8 +126,13 @@ scenarios:
     doc_type: ann
     date_from: "20260401"
     date_to: "20260607"
-    title_patterns:
-      - "季度报告"
-      - "一季度报告"
+    title_match:
+      mode: contains
+      include_mode: any
+      include:
+        - "季度报告"
+        - "一季度报告"
+      exclude:
+        - "摘要"
     limit: 200
     enabled: false

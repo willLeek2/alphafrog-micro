@@ -159,6 +159,39 @@ def test_get_unprocessed_announcements_passes_date_and_titles(monkeypatch):
     assert p["titlePatterns"] == ["年度报告", "annual"]
 
 
+def test_get_unprocessed_announcements_passes_title_match(monkeypatch):
+    body = {"docType": "announcement", "count": 0, "records": []}
+    client, rec = _patched_client(monkeypatch, _FakeResponse(200, body))
+
+    client.get_unprocessed_announcements(
+        title_match={
+            "mode": "contains",
+            "include": ["年度报告"],
+            "exclude": ["摘要"],
+        },
+    )
+
+    p = rec.calls[0]["json"]
+    assert "titlePatterns" not in p
+    assert p["titleMatch"] == {
+        "mode": "contains",
+        "includeMode": "any",
+        "include": ["年度报告"],
+        "exclude": ["摘要"],
+    }
+
+
+def test_get_unprocessed_rejects_title_patterns_and_title_match(monkeypatch):
+    body = {"docType": "announcement", "count": 0, "records": []}
+    client, _ = _patched_client(monkeypatch, _FakeResponse(200, body))
+
+    with pytest.raises(Exception, match="互斥"):
+        client.get_unprocessed_announcements(
+            title_patterns=["年度报告"],
+            title_match={"mode": "contains", "include": ["年度报告"]},
+        )
+
+
 def test_get_unprocessed_announcements_str_ts_code_passes_through(monkeypatch):
     body = {"docType": "announcement", "count": 0, "records": []}
     client, rec = _patched_client(monkeypatch, _FakeResponse(200, body))

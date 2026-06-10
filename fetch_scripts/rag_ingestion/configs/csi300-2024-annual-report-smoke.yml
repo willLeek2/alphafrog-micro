@@ -6,7 +6,7 @@
 # 筛选逻辑：
 #   - 指数成分股: 沪深300 (000300.SH)，member_date 覆盖 2024 全年
 #   - 日期范围: 2024-01-01 ~ 2024-12-31
-#   - title 过滤: 含 "年度报告"
+#   - title 过滤: 含 "年度报告", 排除 "摘要"
 #   - 冒烟测试: 仅处理 10 条
 
 scenarios:
@@ -14,8 +14,12 @@ scenarios:
     doc_type: ann
     date_from: "20240101"
     date_to: "20241231"
-    title_patterns:
-      - "年度报告"
+    title_match:
+      mode: contains
+      include:
+        - "年度报告"
+      exclude:
+        - "摘要"
     ts_code:
       type: select
       conditions:

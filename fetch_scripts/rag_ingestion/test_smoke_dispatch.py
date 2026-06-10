@@ -243,6 +243,83 @@ def test_scenarios_no_ts_code_global_pagination(tmp_yaml, fake_call_recorder):
     assert kwargs["limit"] == 200
 
 
+def test_scenarios_title_match_include_exclude_passes_payload(tmp_yaml, fake_call_recorder):
+    """title_match 新格式会标准化后传到 process_*。"""
+    p = tmp_yaml("title_match.yml", """
+        scenarios:
+          - name: annual-no-summary
+            doc_type: ann
+            title_match:
+              mode: contains
+              include:
+                - "年度报告"
+              exclude:
+                - "摘要"
+                - "英文版"
+            limit: 20
+    """)
+    run.dispatch_from_config(p, _FakeDb(), _FakeCfg())
+    assert len(fake_call_recorder) == 1
+    kwargs = fake_call_recorder[0][1]
+    assert kwargs["title_patterns"] is None
+    assert kwargs["title_match"] == {
+        "mode": "contains",
+        "includeMode": "any",
+        "include": ["年度报告"],
+        "exclude": ["摘要", "英文版"],
+    }
+
+
+def test_scenarios_title_match_include_mode_all(tmp_yaml, fake_call_recorder):
+    p = tmp_yaml("title_match_all.yml", """
+        scenarios:
+          - name: annual-2024
+            doc_type: ann
+            title_match:
+              mode: contains
+              include_mode: all
+              include:
+                - "2024"
+                - "年度报告"
+            limit: 20
+    """)
+    run.dispatch_from_config(p, _FakeDb(), _FakeCfg())
+    assert fake_call_recorder[0][1]["title_match"] == {
+        "mode": "contains",
+        "includeMode": "all",
+        "include": ["2024", "年度报告"],
+    }
+
+
+def test_scenarios_title_patterns_and_title_match_raises(tmp_yaml, fake_call_recorder):
+    p = tmp_yaml("both_title.yml", """
+        scenarios:
+          - name: bad-title
+            doc_type: ann
+            title_patterns: ["年度报告"]
+            title_match:
+              mode: contains
+              include: ["年度报告"]
+    """)
+    with pytest.raises(ConfigError, match="互斥"):
+        run.dispatch_from_config(p, _FakeDb(), _FakeCfg())
+    assert len(fake_call_recorder) == 0
+
+
+def test_scenarios_title_match_invalid_mode_raises(tmp_yaml, fake_call_recorder):
+    p = tmp_yaml("bad_title_mode.yml", """
+        scenarios:
+          - name: bad-title-mode
+            doc_type: ann
+            title_match:
+              mode: regex
+              include: [".*年度报告"]
+    """)
+    with pytest.raises(ConfigError, match="只支持 contains"):
+        run.dispatch_from_config(p, _FakeDb(), _FakeCfg())
+    assert len(fake_call_recorder) == 0
+
+
 # ── 新式 scenarios: 配置错误 → ConfigError 抛出 (fail closed) ──
 
 

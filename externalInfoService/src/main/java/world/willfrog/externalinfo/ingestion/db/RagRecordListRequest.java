@@ -48,6 +48,25 @@ public class RagRecordListRequest {
     /**
      * title LIKE 模糊匹配模式列表（OR 关系）。
      * 列表为空或 null 时不应用此过滤。
+     * 与 titleMatch 互斥。
      */
     private List<String> titlePatterns;
+
+    /**
+     * 结构化 title 匹配配置。
+     *
+     * <p>当前仅支持:
+     * <pre>
+     * {
+     *   "mode": "contains",
+     *   "includeMode": "any" | "all",
+     *   "include": ["年度报告"],
+     *   "exclude": ["摘要"]
+     * }
+     * </pre>
+     *
+     * <p>include 生成 LIKE 条件；exclude 生成 NOT LIKE 条件。
+     * 与 titlePatterns 互斥。
+     */
+    private Map<String, Object> titleMatch;
 }

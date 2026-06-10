@@ -33,6 +33,11 @@ YAML 配置文件支持两种格式 (互斥, 不可同时出现):
          date_from: "20240101"
          date_to: "20241231"
          doc_type: ann|research|all
+         title_patterns: ["年度报告"]  # 旧式 OR + contains, 与 title_match 互斥
+         title_match:                 # 新式 contains include/exclude, 与 title_patterns 互斥
+           mode: contains
+           include: ["年度报告"]
+           exclude: ["摘要"]
          limit: 50
          offset: 0
 """
@@ -50,6 +55,7 @@ from oss_uploader import upload_doc
 from chunker import chunk_text
 from embedder import get_embeddings
 from ingest_client import ingest_vectors
+from title_match_filter import normalize_title_filters
 from ts_code_filter import ConfigError, TsCodeFilter
 
 
@@ -62,6 +68,7 @@ def process_announcements(
     date_to: str = None,
     ts_code=None,
     title_patterns: list = None,
+    title_match: dict = None,
 ):
     records = db.get_unprocessed_announcements(
         limit=limit,
@@ -70,6 +77,7 @@ def process_announcements(
         date_to=date_to or None,
         ts_code=ts_code or None,
         title_patterns=title_patterns or None,
+        title_match=title_match or None,
     )
     if not records:
         print("[run] No unprocessed announcements found.")
@@ -147,6 +155,7 @@ def process_reports(
     date_to: str = None,
     ts_code=None,
     title_patterns: list = None,
+    title_match: dict = None,
 ):
     records = db.get_unprocessed_reports(
         limit=limit,
@@ -155,6 +164,7 @@ def process_reports(
         date_to=date_to or None,
         ts_code=ts_code or None,
         title_patterns=title_patterns or None,
+        title_match=title_match or None,
     )
     if not records:
         print("[run] No unprocessed research reports found.")
@@ -244,40 +254,46 @@ def run_task(task: dict, db: DbClient, cfg):
     date_from = str(task["date_from"]) if task.get("date_from") else None
     date_to = str(task["date_to"]) if task.get("date_to") else None
     ts_code = task.get("ts_code") or None
+    title_patterns, title_match = normalize_title_filters(
+        title_patterns_present="title_patterns" in task,
+        title_patterns_raw=task.get("title_patterns"),
+        title_match_present="title_match" in task,
+        title_match_raw=task.get("title_match"),
+        scenario_name=name,
+    )
     limit = int(task.get("limit", 50))
     offset = int(task.get("offset", 0))
-    title_patterns = task.get("title_patterns") or None
 
     print(f"\n{'='*60}")
     print(f"[task] {name!r}  doc_type={doc_type}  date_from={date_from}  date_to={date_to}")
-    print(f"       ts_code={ts_code}  limit={limit}  offset={offset}  title_patterns={title_patterns}")
+    print(f"       ts_code={ts_code}  limit={limit}  offset={offset}  title_patterns={title_patterns}  title_match={title_match}")
     print(f"{'='*60}")
 
     _run_one_doc_type(
         db, cfg, doc_type,
         limit=limit, offset=offset,
         date_from=date_from, date_to=date_to,
-        ts_code=ts_code, title_patterns=title_patterns,
+        ts_code=ts_code, title_patterns=title_patterns, title_match=title_match,
     )
 
 
 def _run_one_doc_type(
     db: DbClient, cfg, doc_type: str, *,
     limit: int, offset: int,
-    date_from, date_to, ts_code, title_patterns,
+    date_from, date_to, ts_code, title_patterns, title_match,
 ):
     """根据 doc_type 调度 process_announcements / process_reports (内部 helper, 不打印头)。"""
     if doc_type in ("ann", "all"):
         process_announcements(
             db, cfg, limit=limit, offset=offset,
             date_from=date_from, date_to=date_to, ts_code=ts_code,
-            title_patterns=title_patterns,
+            title_patterns=title_patterns, title_match=title_match,
         )
     if doc_type in ("research", "all"):
         process_reports(
             db, cfg, limit=limit, offset=offset,
             date_from=date_from, date_to=date_to, ts_code=ts_code,
-            title_patterns=title_patterns,
+            title_patterns=title_patterns, title_match=title_match,
         )
 
 
@@ -303,7 +319,13 @@ def run_scenario(
     date_from = str(scenario["date_from"]) if scenario.get("date_from") else None
     date_to = str(scenario["date_to"]) if scenario.get("date_to") else None
     ts_code_raw = scenario.get("ts_code")
-    title_patterns = scenario.get("title_patterns") or None
+    title_patterns, title_match = normalize_title_filters(
+        title_patterns_present="title_patterns" in scenario,
+        title_patterns_raw=scenario.get("title_patterns"),
+        title_match_present="title_match" in scenario,
+        title_match_raw=scenario.get("title_match"),
+        scenario_name=name,
+    )
     limit = int(scenario.get("limit", 50))
     offset = int(scenario.get("offset", 0))
 
@@ -323,7 +345,7 @@ def run_scenario(
     print(f"\n{'='*60}")
     print(f"[scenario] {index}/{total}  name={name!r}  doc_type={doc_type}  ts_code_type={ts_type}")
     print(f"           date_from={date_from}  date_to={date_to}")
-    print(f"           limit={limit}  offset={offset}  title_patterns={title_patterns}")
+    print(f"           limit={limit}  offset={offset}  title_patterns={title_patterns}  title_match={title_match}")
     print(f"{'='*60}")
 
     if ts_filter.type == "list":
@@ -333,7 +355,7 @@ def run_scenario(
                 db, scenario_cfg, doc_type,
                 limit=limit, offset=offset,
                 date_from=date_from, date_to=date_to,
-                ts_code=code, title_patterns=title_patterns,
+                ts_code=code, title_patterns=title_patterns, title_match=title_match,
             )
     else:
         # select / None: 全局 SQL 分页
@@ -341,7 +363,7 @@ def run_scenario(
             db, scenario_cfg, doc_type,
             limit=limit, offset=offset,
             date_from=date_from, date_to=date_to,
-            ts_code=ts_code_raw, title_patterns=title_patterns,
+            ts_code=ts_code_raw, title_patterns=title_patterns, title_match=title_match,
         )
 
 
@@ -515,6 +537,7 @@ def main():
                 date_to=args.date_to,
                 ts_code=args.ts_code,
                 title_patterns=args.title_pattern,
+                title_match=None,
             )
         if args.doc_type in ("research", "all"):
             process_reports(
@@ -525,6 +548,7 @@ def main():
                 date_to=args.date_to,
                 ts_code=args.ts_code,
                 title_patterns=args.title_pattern,
+                title_match=None,
             )
         print("[run] Done.")
 
