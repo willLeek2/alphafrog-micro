@@ -192,7 +192,7 @@ public class RagResearchReportFetchJob {
             if (items.size() < DEFAULT_PAGE_LIMIT) break;
             offset += items.size();
             try {
-                Thread.sleep(50);
+                Thread.sleep(500);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 break;
