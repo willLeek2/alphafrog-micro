@@ -1,0 +1,41 @@
+base_url: "http://localhost:8090"
+username: "stress_test_1"
+password: "replace-with-password"
+question: "帮我分析沪深300最近走势，并说明可能用到的数据。"
+
+login_endpoint: "/api/auth/login"
+logout_endpoint: "/api/auth/logout"
+create_endpoint: "/api/agent/runs"
+stream_endpoint_template: "/api/agent/runs/{run_id}/stream"
+status_endpoint_template: "/api/agent/runs/{run_id}/status"
+events_endpoint_template: "/api/agent/runs/{run_id}/events"
+timeline_endpoint_template: "/api/agent/runs/{run_id}/timeline"
+result_endpoint_template: "/api/agent/runs/{run_id}/result"
+cancel_endpoint_template: "/api/agent/runs/{run_id}:cancel"
+observability_full_endpoint_template: "/api/agent/runs/{run_id}/observability/full"
+
+request_timeout_seconds: 30
+stream_idle_timeout_seconds: 300
+refresh_seconds: 0.5
+max_trace_lines: 14
+max_warning_lines: 4
+result_preview_chars: 280
+
+debug:
+  logs: false
+  output_root: "af_light_client/output"
+
+create_body:
+  # endpointName 按后端配置选择；常见值包括 openrouter、linear-default、dag-default。
+  endpointName: openrouter
+  modelName: moonshotai/kimi-k2.6
+  # provider 传给 OpenRouter 路由，多个 provider 用英文逗号分隔，顺序代表业务侧偏好。
+  provider: fireworks,moonshotai/int4
+  captureLlmRequests: true
+  context:
+    locale: zh-CN
+    timezone: Asia/Shanghai
+    config:
+      webSearch:
+        enabled: true
+        backend: auto

@@ -85,6 +85,7 @@ CLAUDE.md
 /test_scripts
 /test_guide
 /docs
+/output/
 
 
 .env

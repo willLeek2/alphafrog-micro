@@ -1,0 +1,8 @@
+site_name: AlphaFrog v1.0 Agent Docs
+site_description: AlphaFrog v1.0 agent run API and observability reference
+docs_dir: docs
+theme:
+  name: readthedocs
+nav:
+  - Home: index.md
+  - Agent Run HTTP Endpoints: agent-run-endpoints.md
