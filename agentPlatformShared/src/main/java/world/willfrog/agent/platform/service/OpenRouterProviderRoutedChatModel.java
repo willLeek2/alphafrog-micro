@@ -291,15 +291,31 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
                 reasoningContent = aggregateResult.reasoningContent();
 
                 // 为了 HTTP 捕获，将聚合后的响应体序列化
-                String aggregatedBody = objectMapper.writeValueAsString(
-                        objectMapper.convertValue(completion, new TypeReference<Map<String, Object>>() {
-                        })
-                );
+                Map<String, Object> aggregatedPayload = objectMapper.convertValue(completion,
+                        new TypeReference<Map<String, Object>>() {
+                        });
+                if (aggregateResult.lastId() != null && !aggregateResult.lastId().isBlank()) {
+                    aggregatedPayload.put("id", aggregateResult.lastId());
+                }
+                if (aggregateResult.lastUsage() != null && !aggregateResult.lastUsage().isEmpty()) {
+                    aggregatedPayload.put("usage", aggregateResult.lastUsage());
+                }
+                String aggregatedBody = objectMapper.writeValueAsString(aggregatedPayload);
+                Map<String, String> responseHeaders = new java.util.HashMap<>();
+                responseHeaders.put("Content-Type", "application/json");
                 if (shouldCapture) {
-                    Map<String, String> responseHeaders = new java.util.HashMap<>();
-                    responseHeaders.put("Content-Type", "application/json");
                     responseRecord = httpLogger.recordResponse(statusCode, responseHeaders, aggregatedBody, durationMs);
                     curlCommand = httpLogger.toCurlCommand(requestRecord);
+                } else {
+                    // 计费元数据不属于 raw diagnostics：即使不开 raw capture，也要让
+                    // observability 从响应体中解析 usage.cost 与 generation id。
+                    responseRecord = RawHttpLogger.HttpResponseRecord.builder()
+                            .statusCode(statusCode)
+                            .headers(Map.of())
+                            .body(aggregatedBody)
+                            .durationMs(durationMs)
+                            .timestamp(System.currentTimeMillis())
+                            .build();
                 }
             } else {
                 String detail = "OpenRouter provider routed chat completion failed"
@@ -334,33 +350,9 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
                 AgentContext.setStreamingProgress(progressSnapshot);
             }
             
-            // 始终记录基本观测（llmCalls/token/duration），即使不开 raw HTTP capture。
-            //
-            // 这是 run 级统计的基础数据源。raw HTTP capture 可能因为配置、隐私或存储成本关闭，
-            // 但 llmCalls 和 token 预算不能因此缺失；否则 matrix 会看到模型实际在请求，
-            // observability 里却一直是 llm=1 之类的假象。
-            if (observabilityService != null) {
-                String runId = AgentContext.getRunId();
-                if (runId != null && !runId.isBlank()) {
-                    observabilityService.recordLlmCall(
-                            runId,
-                            AgentContext.getPhase() != null ? AgentContext.getPhase() : "unknown",
-                            tokenUsage,
-                            durationMs,
-                            requestStartedAt,
-                            requestStartedAt + durationMs,
-                            endpointName,
-                            modelName,
-                            null,
-                            null,
-                            null
-                    );
-                }
-            }
-
-            // ALP-25：上报成功观测（含 raw HTTP）
+            // 上报成功观测：minimal billing trace 始终记录，raw HTTP/detail 仍由 capture 开关控制。
             String observabilityTraceId = null;
-            if (shouldCapture && observabilityService != null) {
+            if (observabilityService != null) {
                 observabilityTraceId = reportLlmCall(llmTraceId, requestRecord, responseRecord, curlCommand, requestStartedAt, durationMs, null,
                         reasoningContent, progressSnapshot, attemptResult.attempts());
             }

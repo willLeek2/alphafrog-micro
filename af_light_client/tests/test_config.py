@@ -97,6 +97,64 @@ llm:
             '"providerOrder":["fireworks","moonshotai/int4"]}}',
         )
 
+    def test_provider_list_is_normalized_to_comma_separated_string(self) -> None:
+        cfg = _load("""
+base_url: "http://localhost:8090"
+username: "u"
+password: "p"
+question: "q"
+llm:
+  endpointName: openrouter
+  modelName: qwen/qwen3.7-max
+  provider: [alibaba, fireworks]
+""")
+        body = cfg.create_request_body()
+        self.assertEqual(body["provider"], "alibaba,fireworks")
+
+    def test_provider_order_is_normalized_to_comma_separated_string(self) -> None:
+        cfg = _load("""
+base_url: "http://localhost:8090"
+username: "u"
+password: "p"
+question: "q"
+llm:
+  endpointName: openrouter
+  modelName: qwen/qwen3.7-max
+  providerOrder: [alibaba, fireworks]
+""")
+        body = cfg.create_request_body()
+        self.assertEqual(body["provider"], "alibaba,fireworks")
+        self.assertNotIn("providerOrder", body)
+
+    def test_provider_order_takes_precedence_over_provider(self) -> None:
+        cfg = _load("""
+base_url: "http://localhost:8090"
+username: "u"
+password: "p"
+question: "q"
+llm:
+  endpointName: openrouter
+  modelName: qwen/qwen3.7-max
+  provider: moonshotai
+  providerOrder: [alibaba, fireworks]
+""")
+        body = cfg.create_request_body()
+        self.assertEqual(body["provider"], "alibaba,fireworks")
+
+    def test_provider_string_is_preserved(self) -> None:
+        cfg = _load("""
+base_url: "http://localhost:8090"
+username: "u"
+password: "p"
+question: "q"
+llm:
+  endpointName: openrouter
+  modelName: qwen/qwen3.7-max
+  provider: alibaba
+""")
+        body = cfg.create_request_body()
+        self.assertEqual(body["provider"], "alibaba")
+
     def test_create_body_overrides_llm_config(self) -> None:
         cfg = _load("""
 base_url: "http://localhost:8090"

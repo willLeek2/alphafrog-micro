@@ -181,6 +181,31 @@ class AgentLlmLocalConfigLoaderTest {
     }
 
     @Test
+    void load_shouldParseDataFreshnessFields() throws Exception {
+        Path configFile = tempDir.resolve("agent-llm.local.json");
+        Files.writeString(configFile, """
+                {
+                  "dataFreshness": {
+                    "startDate": "2020-01-01",
+                    "endDate": "2026-05-25",
+                    "asOfDate": "2026-05-25",
+                    "description": "覆盖股票、指数、ETF、基金等本地已爬取数据"
+                  }
+                }
+                """, StandardCharsets.UTF_8);
+
+        AgentLlmLocalConfigLoader loader = new AgentLlmLocalConfigLoader(new ObjectMapper());
+        ReflectionTestUtils.setField(loader, "configFile", configFile.toString());
+        loader.load();
+
+        AgentLlmProperties.DataFreshness freshness = loader.current().orElseThrow().getDataFreshness();
+        assertEquals("2020-01-01", freshness.getStartDate());
+        assertEquals("2026-05-25", freshness.getEndDate());
+        assertEquals("2026-05-25", freshness.getAsOfDate());
+        assertEquals("覆盖股票、指数、ETF、基金等本地已爬取数据", freshness.getDescription());
+    }
+
+    @Test
     void load_shouldResolveDagModeGuidancePromptFile() throws Exception {
         Path promptsDir = tempDir.resolve("prompts").resolve("todo");
         Files.createDirectories(promptsDir);

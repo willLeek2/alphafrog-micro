@@ -21,6 +21,7 @@ public class AgentLlmProperties {
     private OpenRouterConfig openrouter = new OpenRouterConfig();
     private ExecutorConfig executor = new ExecutorConfig();
     private EventStoreConfig eventStore = new EventStoreConfig();
+    private DataFreshness dataFreshness = new DataFreshness();
 
     public String getDefaultEndpoint() {
         return defaultEndpoint;
@@ -108,6 +109,57 @@ public class AgentLlmProperties {
 
     public void setEventStore(EventStoreConfig eventStore) {
         this.eventStore = eventStore == null ? new EventStoreConfig() : eventStore;
+    }
+
+    public DataFreshness getDataFreshness() {
+        return dataFreshness;
+    }
+
+    public void setDataFreshness(DataFreshness dataFreshness) {
+        this.dataFreshness = dataFreshness == null ? new DataFreshness() : dataFreshness;
+    }
+
+    public static class DataFreshness {
+        /** 部署者声明的本地已爬取数据起始日期，格式 YYYY-MM-DD。 */
+        private String startDate;
+        /** 部署者声明的本地已爬取数据截止日期，格式 YYYY-MM-DD。 */
+        private String endDate;
+        /** 可选：部署者声明的单点 as-of 日期，格式 YYYY-MM-DD。 */
+        private String asOfDate;
+        /** 可选：数据范围说明，例如覆盖的资产类型或口径。 */
+        private String description;
+
+        public String getStartDate() {
+            return startDate;
+        }
+
+        public void setStartDate(String startDate) {
+            this.startDate = startDate;
+        }
+
+        public String getEndDate() {
+            return endDate;
+        }
+
+        public void setEndDate(String endDate) {
+            this.endDate = endDate;
+        }
+
+        public String getAsOfDate() {
+            return asOfDate;
+        }
+
+        public void setAsOfDate(String asOfDate) {
+            this.asOfDate = asOfDate;
+        }
+
+        public String getDescription() {
+            return description;
+        }
+
+        public void setDescription(String description) {
+            this.description = description;
+        }
     }
 
     public static class Endpoint {

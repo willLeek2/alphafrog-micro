@@ -26,6 +26,7 @@ class AgentCallDetailPersistenceTest {
         trace.setHttpRequest(new AgentObservabilityService.RawHttpTrace());
         trace.setCurlCommand("curl secret");
         trace.setEndpoint("openrouter");
+        trace.setGenerationId("gen-1");
 
         AgentCallDetailPersistence.scrubLlmTrace(trace, true);
 
@@ -34,7 +35,8 @@ class AgentCallDetailPersistenceTest {
         assertNull(trace.getInputMessages());
         assertNull(trace.getHttpRequest());
         assertNull(trace.getCurlCommand());
-        assertNull(trace.getEndpoint());
+        assertEquals("openrouter", trace.getEndpoint());
+        assertEquals("gen-1", trace.getGenerationId());
     }
 
     @Test
@@ -69,6 +71,8 @@ class AgentCallDetailPersistenceTest {
         llmTrace.put("traceId", "llm-1");
         llmTrace.put("outputText", huge);
         llmTrace.put("httpRequest", Map.of("url", "http://x"));
+        llmTrace.put("endpoint", "openrouter");
+        llmTrace.put("generationId", "gen-map-1");
         llmTrace.put("detailBlobStored", true);
         Map<String, Object> diagnostics = new LinkedHashMap<>();
         diagnostics.put("llmTraces", List.of(llmTrace));
@@ -81,6 +85,8 @@ class AgentCallDetailPersistenceTest {
         Map<String, Object> scrubbed = ((List<Map<String, Object>>) diagnostics.get("llmTraces")).get(0);
         assertFalse(scrubbed.containsKey("outputText"));
         assertFalse(scrubbed.containsKey("httpRequest"));
+        assertEquals("openrouter", scrubbed.get("endpoint"));
+        assertEquals("gen-map-1", scrubbed.get("generationId"));
         assertEquals(true, scrubbed.get("detailBlobStored"));
         String preview = String.valueOf(scrubbed.get("responsePreview"));
         assertTrue(preview.length() <= OBSERVABILITY_PREVIEW_MAX_CHARS + 3);

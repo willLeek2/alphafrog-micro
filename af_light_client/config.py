@@ -130,6 +130,7 @@ class LightClientConfig:
         _deep_merge(body, self.create_body)
         body.setdefault("message", self.question)
         _serialize_stage_config(body)
+        _normalize_provider(body)
         return body
 
     def as_log_dict(self) -> Dict[str, Any]:
@@ -177,3 +178,26 @@ def _serialize_stage_config(body: Dict[str, Any]) -> None:
             ensure_ascii=False,
             separators=(",", ":"),
         )
+
+
+def _normalize_provider(body: Dict[str, Any]) -> None:
+    provider_order = body.pop("providerOrder", None)
+    provider = body.get("provider")
+
+    if provider_order is not None:
+        body["provider"] = _provider_order_to_string(provider_order)
+        return
+
+    if isinstance(provider, list):
+        body["provider"] = _provider_order_to_string(provider)
+    elif provider is not None and not isinstance(provider, str):
+        body["provider"] = str(provider)
+
+
+def _provider_order_to_string(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts = [str(item).strip() for item in value if item is not None]
+        return ",".join(parts)
+    return str(value) if value is not None else ""

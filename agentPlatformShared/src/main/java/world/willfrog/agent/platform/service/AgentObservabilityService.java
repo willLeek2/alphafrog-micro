@@ -1677,8 +1677,8 @@ public class AgentObservabilityService {
     /**
      * 向 diagnostics.llmTraces 追加一条不含原始 HTTP 的 LlmTrace。
      *
-     * <p>本方法不主动开启 trace 捕获：仅当 {@link #shouldCaptureLlmTrace} 判断当前 run
-     * 启用了 LLM trace 时才追加。同时检查并裁剪超过 {@link #llmTraceCallLimit()} 的最旧记录。</p>
+     * <p>本方法始终写入结算所需的 minimal trace；{@link #shouldCaptureLlmTrace} 只控制
+     * request/response/reasoning 等诊断详情是否保留到 detail blob。</p>
      */
     private void appendLlmTrace(Diagnostics diagnostics,
                                 String traceId,
@@ -1695,12 +1695,10 @@ public class AgentObservabilityService {
                                 Map<String, Object> requestSnapshot,
                                 String responsePreview,
                                 ReasoningExtraction reasoning) {
-        if (!shouldCaptureLlmTrace(diagnostics)) {
-            return;
-        }
         if (diagnostics.getLlmTraces() == null) {
             diagnostics.setLlmTraces(new ArrayList<>());
         }
+        boolean captureDetails = shouldCaptureLlmTrace(diagnostics);
         List<LlmTrace> traces = diagnostics.getLlmTraces();
         LlmTrace trace = new LlmTrace();
         trace.setTraceId(nvl(traceId));
@@ -1715,15 +1713,17 @@ public class AgentObservabilityService {
         trace.setModel(nvl(modelName));
         trace.setHasError(errorMessage != null && !errorMessage.isBlank());
         trace.setError(trim(errorMessage, 1000));
-        trace.setRequest(requestSnapshot);
-        trace.setResponsePreview(responsePreview);
-        trace.setInputMessages(requestSnapshot);
-        trace.setOutputText(responsePreview);
+        if (captureDetails) {
+            trace.setRequest(requestSnapshot);
+            trace.setResponsePreview(responsePreview);
+            trace.setInputMessages(requestSnapshot);
+            trace.setOutputText(responsePreview);
+            trace.setReasoningText(reasoning == null ? "" : reasoning.text());
+            trace.setReasoningDetails(reasoning == null ? null : reasoning.details());
+            trace.setReasoningTruncated(reasoning != null && reasoning.truncated());
+        }
         trace.setTodoId(nvl(AgentContext.getTodoId()));
         trace.setTodoSequence(AgentContext.getTodoSequence());
-        trace.setReasoningText(reasoning == null ? "" : reasoning.text());
-        trace.setReasoningDetails(reasoning == null ? null : reasoning.details());
-        trace.setReasoningTruncated(reasoning != null && reasoning.truncated());
         // 设置 Token 统计
         if (tokenUsage != null) {
             trace.setInputTokens(tokenUsage.inputTokenCount() != null ? tokenUsage.inputTokenCount().longValue() : null);
@@ -1741,7 +1741,7 @@ public class AgentObservabilityService {
     /**
      * 添加带有原始 HTTP 信息的 LLM Trace（ALP-25 内部方法）。
      * 
-     * <p>将完整的 HTTP 观测数据添加到 Diagnostics.llmTraces 列表中。</p>
+     * <p>始终添加结算所需的 minimal trace；完整 HTTP 观测数据仅在诊断采集开启时保留。</p>
      * 
      * <p><b>数据结构说明：</b></p>
      * <ul>
@@ -1788,14 +1788,11 @@ public class AgentObservabilityService {
             ReasoningExtraction reasoning,
             List<Map<String, Object>> attempts) {
 
-        if (!shouldCaptureLlmTrace(diagnostics)) {
-            return;
-        }
-
         if (diagnostics.getLlmTraces() == null) {
             diagnostics.setLlmTraces(new ArrayList<>());
         }
 
+        boolean captureDetails = shouldCaptureLlmTrace(diagnostics);
         List<LlmTrace> traces = diagnostics.getLlmTraces();
         LlmTrace trace = new LlmTrace();
         trace.setTraceId(nvl(traceId));
@@ -1810,10 +1807,12 @@ public class AgentObservabilityService {
         trace.setModel(nvl(modelName));
         trace.setHasError(errorMessage != null && !errorMessage.isBlank());
         trace.setError(trim(errorMessage, 1000));
-        trace.setReasoningText(thinkingContent != null ? thinkingContent : (reasoning == null ? "" : reasoning.text()));
-        trace.setReasoningDetails(reasoning == null ? null : reasoning.details());
-        trace.setReasoningTruncated(reasoning != null && reasoning.truncated());
-        if (streamingProgress != null) {
+        if (captureDetails) {
+            trace.setReasoningText(thinkingContent != null ? thinkingContent : (reasoning == null ? "" : reasoning.text()));
+            trace.setReasoningDetails(reasoning == null ? null : reasoning.details());
+            trace.setReasoningTruncated(reasoning != null && reasoning.truncated());
+        }
+        if (captureDetails && streamingProgress != null) {
             LlmTrace.StreamingProgress sp = new LlmTrace.StreamingProgress();
             sp.setContentCharCount(streamingProgress.contentCharCount());
             sp.setReasoningCharCount(streamingProgress.reasoningCharCount());
@@ -1840,7 +1839,7 @@ public class AgentObservabilityService {
         trace.setGenerationId(extractOpenRouterGenerationId(httpResponse == null ? null : httpResponse.getBody()));
         
         // 设置原始 HTTP 请求信息
-        if (httpRequest != null) {
+        if (captureDetails && httpRequest != null) {
             RawHttpTrace reqTrace = new RawHttpTrace();
             reqTrace.setUrl(httpRequest.getUrl());
             reqTrace.setMethod(httpRequest.getMethod());
@@ -1853,7 +1852,7 @@ public class AgentObservabilityService {
         }
         
         // 设置原始 HTTP 响应信息
-        if (httpResponse != null) {
+        if (captureDetails && httpResponse != null) {
             RawHttpTrace respTrace = new RawHttpTrace();
             respTrace.setUrl(null); // 响应没有 URL
             respTrace.setMethod(null); // 响应没有方法
@@ -1866,15 +1865,17 @@ public class AgentObservabilityService {
         }
         
         // 设置 curl 命令
-        trace.setCurlCommand(curlCommand);
-        trace.setAttempts(attempts == null ? List.of() : attempts);
+        if (captureDetails) {
+            trace.setCurlCommand(curlCommand);
+            trace.setAttempts(attempts == null ? List.of() : attempts);
+        }
         
         // 保留向后兼容的字段
         trace.setRequest(null);
-        trace.setResponsePreview(httpResponse != null ? preview(httpResponse.getBody(), llmTraceTextLimit()) : null);
+        trace.setResponsePreview(captureDetails && httpResponse != null ? preview(httpResponse.getBody(), llmTraceTextLimit()) : null);
         
         // 设置新的 inputMessages / outputText 字段
-        if (httpRequest != null && httpRequest.getBody() != null && !httpRequest.getBody().isBlank()) {
+        if (captureDetails && httpRequest != null && httpRequest.getBody() != null && !httpRequest.getBody().isBlank()) {
             try {
                 Map<String, Object> body = objectMapper.readValue(httpRequest.getBody(), new TypeReference<Map<String, Object>>() {});
                 trace.setInputMessages(sanitizeRequestSnapshot(body));
@@ -1885,7 +1886,7 @@ public class AgentObservabilityService {
                 trace.setInputMessages(fallback);
             }
         }
-        trace.setOutputText(httpResponse != null ? preview(httpResponse.getBody(), llmTraceTextLimit()) : null);
+        trace.setOutputText(captureDetails && httpResponse != null ? preview(httpResponse.getBody(), llmTraceTextLimit()) : null);
         trace.setTodoId(nvl(AgentContext.getTodoId()));
         trace.setTodoSequence(AgentContext.getTodoSequence());
 

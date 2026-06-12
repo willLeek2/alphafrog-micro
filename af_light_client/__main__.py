@@ -111,6 +111,9 @@ def main() -> int:
                 "debugOutputDir": str(debug.output_dir) if debug.output_dir else "",
             },
         )
+        answer = state.snapshot().final_answer
+        if answer:
+            debug.write_text("answer.md", answer)
         if not args.no_tui:
             renderer.finish(state.snapshot())
         if run_id:

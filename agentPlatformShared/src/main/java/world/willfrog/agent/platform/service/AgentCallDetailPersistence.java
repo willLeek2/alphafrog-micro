@@ -36,7 +36,6 @@ public final class AgentCallDetailPersistence {
         putIfPresent(blob, "attempts", trace.getAttempts());
         putIfPresent(blob, "request", trace.getRequest());
         putIfPresent(blob, "responsePreview", trace.getResponsePreview());
-        putIfPresent(blob, "generationId", trace.getGenerationId());
         return blob;
     }
 
@@ -70,8 +69,6 @@ public final class AgentCallDetailPersistence {
         trace.setCurlCommand(null);
         trace.setAttempts(null);
         trace.setRequest(null);
-        trace.setGenerationId(null);
-        trace.setEndpoint(null);
         trace.setDetailBlobStored(detailBlobStored);
     }
 
@@ -139,8 +136,6 @@ public final class AgentCallDetailPersistence {
         trace.remove("curlCommand");
         trace.remove("attempts");
         trace.remove("request");
-        trace.remove("generationId");
-        trace.remove("endpoint");
         String truncated = truncatePreview(preview == null ? null : String.valueOf(preview));
         if (truncated != null) {
             trace.put("responsePreview", truncated);

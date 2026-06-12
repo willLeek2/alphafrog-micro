@@ -32,9 +32,9 @@ question: "帮我分析沪深300最近走势。"
 
 需要固定本次 run 使用的模型时，在 YAML 里配置 `llm`。字段名和压测脚本保持一致；顶层模型字段会直接进入 create run 请求体，`stage_config` 会在请求体里序列化为 `stage_config_json` 字符串：
 
-- `endpointName` / `modelName` / `provider`：顶层默认模型。
+- `endpointName` / `modelName` / `provider`：顶层默认模型。`provider` 支持字符串或列表；列表会按顺序拼接为逗号分隔字符串传给后端。
 - `stage_config`：按阶段覆盖，目前支持 `planning` 和 `final_answer`；发送请求时会转换为 `stage_config_json`。
-- `providerOrder`：阶段内优先尝试的 provider 列表。
+- `providerOrder`：顶层或阶段内优先尝试的 provider 列表，语义与 `stage_config.*.providerOrder` 一致。当 `providerOrder` 与 `provider` 同时存在时，`providerOrder` 优先。
 
 ```yaml
 llm:
@@ -66,7 +66,7 @@ debug:
   output_root: "af_light_client/output"
 ```
 
-开启后会在 `debug.output_root/YYYYMMDD-HHMMSS/` 下写入脱敏配置、create run 响应、SSE 事件 jsonl、warnings、最终 status/result、可观测性全量数据，以及 Ctrl+C 或异常时的错误记录。Ctrl+C 会尽力取消当前 run，然后仍然拉取能拿到的终态观测数据。
+开启后会在 `debug.output_root/YYYYMMDD-HHMMSS/` 下写入脱敏配置、create run 响应、SSE 事件 jsonl、warnings、最终 status/result、可观测性全量数据，以及 Ctrl+C 或异常时的错误记录。如果 run 正常完成并拿到最终回答，还会额外写入 `answer.md`，直接打开就是完整答案。Ctrl+C 会尽力取消当前 run，然后仍然拉取能拿到的终态观测数据。
 
 ## 事件契约
 

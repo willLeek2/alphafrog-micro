@@ -924,6 +924,10 @@ public class AgentPromptService {
                 thisYear, thisYear,
                 lastYear, thisYear,
                 lastYear, yearBeforeLast));
+        String dataFreshnessPrompt = dataFreshnessPrompt();
+        if (!dataFreshnessPrompt.isBlank()) {
+            parts.add(dataFreshnessPrompt);
+        }
         // 第二段：全局 agent 角色定义（跨阶段共享，利于 KV 缓存）
         if (!global.isBlank()) {
             parts.add(global);
@@ -933,6 +937,34 @@ public class AgentPromptService {
             parts.add(specific);
         }
         return String.join("\n", parts).trim();
+    }
+
+    private String dataFreshnessPrompt() {
+        AgentLlmProperties.DataFreshness freshness = currentDataFreshness();
+        if (freshness == null) {
+            return "";
+        }
+        String startDate = firstNonBlank(freshness.getStartDate());
+        String endDate = firstNonBlank(freshness.getEndDate());
+        String asOfDate = firstNonBlank(freshness.getAsOfDate());
+        String description = firstNonBlank(freshness.getDescription());
+        if (startDate.isEmpty() && endDate.isEmpty() && asOfDate.isEmpty() && description.isEmpty()) {
+            return "";
+        }
+
+        List<String> clauses = new ArrayList<>();
+        if (!startDate.isEmpty() || !endDate.isEmpty()) {
+            clauses.add("范围：" + firstNonBlank(startDate, "未指定") + " 至 " + firstNonBlank(endDate, "未指定"));
+        }
+        if (!asOfDate.isEmpty()) {
+            clauses.add("as-of 日期：" + asOfDate);
+        }
+        if (!description.isEmpty()) {
+            clauses.add("说明：" + description);
+        }
+        return "当前已爬取/可用市场数据时效范围（部署者在 agent-llm 配置中指定，业务逻辑默认该日期正确）："
+                + String.join("；", clauses)
+                + "。涉及行情、基金、指数、ETF 等本地数据查询时，应将该范围视为当前数据覆盖边界，不要自行推断或改写该范围。";
     }
 
     /**
@@ -988,6 +1020,22 @@ public class AgentPromptService {
         merged.setPlanningTodosStage(firstNonBlank(local.getPlanningTodosStage(), base.getPlanningTodosStage()));
         merged.setDagRecoveryJudgeSystemPromptTemplate(firstNonBlank(local.getDagRecoveryJudgeSystemPromptTemplate(), base.getDagRecoveryJudgeSystemPromptTemplate()));
         merged.setDagRecoveryJudgeSystemPromptFile(firstNonBlank(local.getDagRecoveryJudgeSystemPromptFile(), base.getDagRecoveryJudgeSystemPromptFile()));
+        return merged;
+    }
+
+    private AgentLlmProperties.DataFreshness currentDataFreshness() {
+        AgentLlmProperties.DataFreshness base = properties.getDataFreshness();
+        AgentLlmProperties.DataFreshness local = localConfigLoader.current()
+                .map(AgentLlmProperties::getDataFreshness)
+                .orElse(null);
+        if (local == null) {
+            return base;
+        }
+        AgentLlmProperties.DataFreshness merged = new AgentLlmProperties.DataFreshness();
+        merged.setStartDate(firstNonBlank(local.getStartDate(), base == null ? null : base.getStartDate()));
+        merged.setEndDate(firstNonBlank(local.getEndDate(), base == null ? null : base.getEndDate()));
+        merged.setAsOfDate(firstNonBlank(local.getAsOfDate(), base == null ? null : base.getAsOfDate()));
+        merged.setDescription(firstNonBlank(local.getDescription(), base == null ? null : base.getDescription()));
         return merged;
     }
 

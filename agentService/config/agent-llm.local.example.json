@@ -11,6 +11,12 @@
     "qwen3.5-plus",
     "qwen3.5-flash"
   ],
+  "dataFreshness": {
+    "startDate": "2020-01-01",
+    "endDate": "2026-05-25",
+    "asOfDate": "2026-05-25",
+    "description": "部署者指定的当前本地已爬取市场数据覆盖范围；业务逻辑默认这些日期正确"
+  },
   "endpoints": {
     "openrouter": {
       "baseUrl": "https://openrouter.ai/api/v1",
