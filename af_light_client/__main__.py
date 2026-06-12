@@ -5,7 +5,8 @@ import json
 import sys
 import time
 from datetime import datetime
-from typing import Any, Dict
+from pathlib import Path
+from typing import Any, Dict, List
 
 from requests import exceptions as requests_exceptions
 
@@ -16,11 +17,16 @@ from .http_client import AgentHttpClient, WarningStore
 from .render import TerminalRenderer
 
 
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run one AlphaFrog agent request with a compact live TUI.")
     parser.add_argument("--config", required=True, help="YAML config path")
     parser.add_argument("--dry-run", action="store_true", help="validate config and print create body only")
     parser.add_argument("--no-tui", action="store_true", help="disable screen redraw; print event summaries")
+    parser.add_argument("--query-credits", action="store_true", help="query/refresh credits for an existing run output folder")
+    parser.add_argument("--output-dir", default="", help="existing run output folder (relative to project root) for --query-credits")
     return parser.parse_args()
 
 
@@ -30,6 +36,8 @@ def main() -> int:
     if args.dry_run:
         print(json.dumps(cfg.create_request_body(), ensure_ascii=False, indent=2))
         return 0
+    if args.query_credits:
+        return _query_credits_main(cfg, args)
 
     warnings = WarningStore(cfg.max_warning_lines)
     state = RunViewState(max_trace_lines=cfg.max_trace_lines, max_warnings=cfg.max_warning_lines)
@@ -234,6 +242,155 @@ def _print_credits_summary(
         f"(settlement: {settled_calls} settled = {immediate} immediate + {delayed} delayed; "
         f"{pending} pending; {missing} missing; total calls {total_calls})"
     )
+
+
+def _query_credits_main(cfg: LightClientConfig, args: argparse.Namespace) -> int:
+    output_dir = _resolve_output_dir(args.output_dir)
+    if output_dir is None:
+        print("[query-credits] 请指定 --output-dir 为本次 run 的输出文件夹路径", file=sys.stderr)
+        return 2
+    run_id = _load_run_id_from_output_dir(output_dir)
+    if not run_id:
+        print(f"[query-credits] 无法从 {output_dir / 'summary.json'} 读取 runId", file=sys.stderr)
+        return 2
+
+    warnings = WarningStore(cfg.max_warning_lines)
+    client = AgentHttpClient(
+        cfg.base_url,
+        request_timeout_seconds=cfg.request_timeout_seconds,
+        stream_idle_timeout_seconds=cfg.stream_idle_timeout_seconds,
+        warnings=warnings,
+    )
+    try:
+        client.login(cfg.login_endpoint, cfg.logout_endpoint, cfg.username, cfg.password)
+        result = _query_and_refresh_credits(cfg, client, run_id)
+        _print_query_credits_result(result)
+        _write_json(output_dir / "credits_query.json", result)
+        return 0
+    except Exception as exc:
+        print(f"[query-credits] 失败: {exc}", file=sys.stderr)
+        return 1
+
+
+def _resolve_output_dir(raw: str) -> Path | None:
+    text = (raw or "").strip()
+    if not text:
+        return None
+    path = Path(text)
+    if not path.is_absolute():
+        path = _PROJECT_ROOT / path
+    return path.resolve()
+
+
+def _load_run_id_from_output_dir(output_dir: Path) -> str:
+    summary_path = output_dir / "summary.json"
+    if not summary_path.exists():
+        return ""
+    try:
+        data = json.loads(summary_path.read_text(encoding="utf-8"))
+        return str(data.get("runId") or data.get("run_id") or "")
+    except Exception:
+        return ""
+
+
+def _write_json(path: Path, data: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _query_and_refresh_credits(
+    cfg: LightClientConfig,
+    client: AgentHttpClient,
+    run_id: str,
+) -> Dict[str, Any]:
+    credits = client.get_run_credits(
+        cfg.credits_endpoint_template,
+        run_id,
+        timeout=cfg.credits_fetch_timeout_seconds,
+    )
+    refreshed = False
+    if _needs_cost_refresh(credits):
+        credits = client.refresh_run_credits(
+            cfg.credits_refresh_endpoint_template,
+            run_id,
+            timeout=cfg.credits_fetch_timeout_seconds,
+        )
+        refreshed = True
+
+    user_credits: Dict[str, Any] = {}
+    try:
+        user_credits = client.get_user_credits(
+            cfg.user_credits_endpoint,
+            timeout=cfg.credits_fetch_timeout_seconds,
+        )
+    except Exception as exc:
+        user_credits = {"error": str(exc)}
+
+    summary = credits.get("summary") or {}
+    return {
+        "runId": run_id,
+        "refreshed": refreshed,
+        "totalCredits": credits.get("totalCredits") or summary.get("totalCredits") or "0",
+        "currency": credits.get("currency") or summary.get("currency") or "USD",
+        "summary": summary,
+        "records": credits.get("records") or [],
+        "userCredits": user_credits,
+        "queriedAt": datetime.now().isoformat(),
+    }
+
+
+def _needs_cost_refresh(credits: Dict[str, Any]) -> bool:
+    summary = credits.get("summary") or {}
+    total_call_count = int(summary.get("totalCallCount") or 0)
+    if total_call_count == 0:
+        return False
+    records = credits.get("records") or []
+    # 按 callId 取 attempt 最大的 effective 记录，避免 attempt=1 的 PENDING_RETRY 占位误导判断。
+    effective_by_call: Dict[str, Dict[str, Any]] = {}
+    for rec in records:
+        call_id = rec.get("callId") or ""
+        if not call_id:
+            continue
+        attempt = int(rec.get("settlementAttempt") or 0)
+        existing = effective_by_call.get(call_id)
+        if existing is None or attempt > int(existing.get("settlementAttempt") or 0):
+            effective_by_call[call_id] = rec
+    openrouter_effective = [
+        r for r in effective_by_call.values() if str(r.get("endpoint") or "").lower() == "openrouter"
+    ]
+    if not openrouter_effective:
+        return False
+    for rec in openrouter_effective:
+        if rec.get("costSource") == "OPENROUTER_ACTUAL" and rec.get("settlementStatus") == "SETTLED":
+            continue
+        return True
+    return False
+
+
+def _print_query_credits_result(result: Dict[str, Any]) -> None:
+    summary = result.get("summary") or {}
+    refreshed = result.get("refreshed")
+    print(
+        f"[query-credits] runId={result.get('runId')} "
+        f"总消耗 {result.get('totalCredits')} {result.get('currency')}"
+    )
+    print(
+        f"[query-credits] settlement: "
+        f"{summary.get('immediateCount', 0)} immediate + "
+        f"{summary.get('delayedCount', 0)} delayed, "
+        f"{summary.get('pendingCount', 0)} pending, "
+        f"{summary.get('missingCount', 0)} missing, "
+        f"共 {summary.get('totalCallCount', 0)} calls"
+    )
+    if refreshed:
+        print("[query-credits] 已触发一次 cost 刷新")
+    else:
+        print("[query-credits] 无需刷新，所有可追踪端点 cost 已到位")
+    user = result.get("userCredits") or {}
+    if "remainingCredits" in user:
+        print(f"[query-credits] 用户当前剩余 credit: {user.get('remainingCredits')} {user.get('currency', 'USD')}")
+    elif "error" in user:
+        print(f"[query-credits] 查询用户剩余 credit 失败: {user.get('error')}")
 
 
 if __name__ == "__main__":

@@ -39,6 +39,7 @@ import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCostRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCreditsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCreditsResponse;
+import world.willfrog.alphafrogmicro.agent.idl.RefreshAgentRunCreditsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunResultRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunStatusRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentConfigResponse;
@@ -512,6 +513,15 @@ public class AgentDubboServiceImpl extends DubboAgentDubboServiceTriple.AgentDub
         AgentRun run = request.getIsAdmin()
                 ? requireRunForAdmin(request.getId())
                 : requireRun(request.getId(), request.getUserId());
+        return runCreditQueryService.build(run);
+    }
+
+    @Override
+    public GetAgentRunCreditsResponse refreshRunCredits(RefreshAgentRunCreditsRequest request) {
+        AgentRun run = request.getIsAdmin()
+                ? requireRunForAdmin(request.getId())
+                : requireRun(request.getId(), request.getUserId());
+        creditSettlementService.refreshCosts(run.getId(), run.getUserId());
         return runCreditQueryService.build(run);
     }
 

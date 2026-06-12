@@ -47,6 +47,10 @@ public class EndpointCostAdapterRegistry {
         return Optional.ofNullable(adaptersByEndpoint.get(normalize(endpoint)));
     }
 
+    public boolean supportsCostFetch(String endpoint) {
+        return find(endpoint).map(EndpointCostAdapter::supportsCostFetch).orElse(false);
+    }
+
     public CostSettlementQuote quote(String endpoint, LlmCallBillingContext call, int settlementAttempt) {
         return find(endpoint)
                 .map(adapter -> adapter.quote(call, settlementAttempt))

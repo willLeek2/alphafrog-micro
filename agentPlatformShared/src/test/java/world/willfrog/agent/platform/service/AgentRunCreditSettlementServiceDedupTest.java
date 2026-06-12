@@ -158,6 +158,90 @@ class AgentRunCreditSettlementServiceDedupTest {
                 eq(new BigDecimal("0.300000")), eq(false), eq(42L));
     }
 
+    @Test
+    void repeatedRefreshAfterInitialMissingEventuallySettles() {
+        lenient().when(adapterRegistry.supportsCostFetch(anyString())).thenReturn(true);
+
+        // attempt=1：call-stable SETTLED；call-pending MISSING（retry 也拿不到 cost）
+        when(adapterRegistry.quote(anyString(), argMatches("call-stable"), eq(1)))
+                .thenReturn(settled("call-stable", "0.500000"));
+        when(adapterRegistry.quote(anyString(), argMatches("call-pending"), eq(1)))
+                .thenReturn(missingRetryExhausted("call-pending"));
+
+        // 第一次 refresh：call-pending 仍 missing -> 不写 attempt=3 占位
+        // 第二次 refresh：call-pending 终于拿到 cost -> 插入 attempt=3 SETTLED
+        when(adapterRegistry.quote(anyString(), argMatches("call-pending"), eq(3)))
+                .thenReturn(missingRetryExhausted("call-pending"),
+                        settled("call-pending", "0.200000"));
+
+        service.settleOnce(RUN_ID, USER_ID, 1);
+        assertEquals(2, persisted.size(), "attempt=1 写 2 条");
+
+        service.refreshCosts(RUN_ID, USER_ID);
+        assertEquals(2, persisted.size(), "第一次 refresh missing 不新增记录");
+
+        service.refreshCosts(RUN_ID, USER_ID);
+        assertEquals(3, persisted.size(), "第二次 refresh 新增 attempt=3 SETTLED");
+
+        AgentRunCreditSummary summary = captureLatestSummary();
+        assertEquals("SETTLED", summary.getSettlementStatus());
+        assertEquals(0, new BigDecimal("0.700000").compareTo(summary.getTotalCreditConsumed()));
+
+        verify(debitOperator).debitAndWriteLedger(
+                argLedgerWithIdem(RUN_ID + ":refresh:call-pending"),
+                eq(new BigDecimal("0.200000")), eq(false), eq(42L));
+    }
+
+    @Test
+    void refreshCostsFetchesMissingCallsAndWritesPerCallLedger() {
+        lenient().when(adapterRegistry.supportsCostFetch(anyString())).thenReturn(true);
+
+        // attempt=1：call-stable 已 SETTLED；call-pending 未拿到 cost -> MISSING
+        when(adapterRegistry.quote(anyString(), argMatches("call-stable"), eq(1)))
+                .thenReturn(settled("call-stable", "0.500000"));
+        when(adapterRegistry.quote(anyString(), argMatches("call-pending"), eq(1)))
+                .thenReturn(missingRetryExhausted("call-pending"));
+        // attempt=3 refresh：call-pending 这次拿到实际 cost
+        when(adapterRegistry.quote(anyString(), argMatches("call-pending"), eq(3)))
+                .thenReturn(settled("call-pending", "0.200000"));
+
+        service.settleOnce(RUN_ID, USER_ID, 1);
+        assertEquals(2, persisted.size(), "attempt=1 写 2 条");
+
+        service.refreshCosts(RUN_ID, USER_ID);
+
+        assertEquals(3, persisted.size(), "refresh 新增 call-pending 的 attempt=3 记录");
+        AgentRunLlmCallCredit refreshRecord = persisted.stream()
+                .filter(r -> r.getLlmCallId().equals("call-pending") && r.getSettlementAttempt() == 3)
+                .findFirst().orElseThrow();
+        assertEquals("SETTLED", refreshRecord.getSettlementStatus());
+        assertEquals(0, new BigDecimal("0.200000").compareTo(refreshRecord.getCreditDelta()));
+
+        verify(debitOperator).debitAndWriteLedger(
+                argLedgerWithIdem(RUN_ID + ":refresh:call-pending"),
+                eq(new BigDecimal("0.200000")), eq(false), eq(42L));
+
+        AgentRunCreditSummary summary = captureLatestSummary();
+        assertEquals("SETTLED", summary.getSettlementStatus());
+        assertEquals(0, new BigDecimal("0.700000").compareTo(summary.getTotalCreditConsumed()));
+    }
+
+    private CostSettlementQuote missingRetryExhausted(String callId) {
+        return CostSettlementQuote.builder()
+                .runId(RUN_ID)
+                .callId(callId)
+                .endpoint("openrouter")
+                .model("moonshotai/kimi-k2.6")
+                .costSource(CostSource.OPENROUTER_ACTUAL)
+                .currency("USD")
+                .costAmount(BigDecimal.ZERO)
+                .creditDelta(BigDecimal.ZERO)
+                .costAvailable(false)
+                .needsDelayedRetry(false)
+                .settlementAttempt(1)
+                .build();
+    }
+
     private AgentRunCreditSummary captureLatestSummary() {
         ArgumentCaptor<AgentRunCreditSummary> captor = ArgumentCaptor.forClass(AgentRunCreditSummary.class);
         verify(summaryDao, atLeastOnce()).upsert(captor.capture());

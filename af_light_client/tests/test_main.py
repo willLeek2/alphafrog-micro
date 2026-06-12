@@ -15,9 +15,14 @@ from __future__ import annotations
 import io
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from af_light_client.__main__ import _print_credits_summary
+from af_light_client.__main__ import (
+    _needs_cost_refresh,
+    _print_credits_summary,
+    _resolve_output_dir,
+)
 from af_light_client.config import LightClientConfig
 from af_light_client.debug import DebugRunLogger
 
@@ -111,6 +116,80 @@ class PrintCreditsSummaryTest(unittest.TestCase):
             )
         wj.assert_called_once()
         self.assertEqual(wj.call_args.args[0], "credits_error.json")
+
+
+class NeedsCostRefreshTest(unittest.TestCase):
+    def _record(self, call_id: str, endpoint: str, cost_source: str, status: str, attempt: int) -> dict:
+        return {
+            "callId": call_id,
+            "endpoint": endpoint,
+            "costSource": cost_source,
+            "settlementStatus": status,
+            "settlementAttempt": attempt,
+        }
+
+    def test_no_calls_never_refresh(self) -> None:
+        self.assertFalse(_needs_cost_refresh({"summary": {"totalCallCount": 0}, "records": []}))
+
+    def test_non_openrouter_run_never_refresh(self) -> None:
+        credits = {
+            "summary": {"totalCallCount": 1},
+            "records": [self._record("c1", "fireworks", "PER_CALL", "SETTLED", 1)],
+        }
+        self.assertFalse(_needs_cost_refresh(credits))
+
+    def test_all_openrouter_settled_no_refresh(self) -> None:
+        credits = {
+            "summary": {"totalCallCount": 2},
+            "records": [
+                self._record("c1", "openrouter", "OPENROUTER_ACTUAL", "SETTLED", 1),
+                self._record("c2", "openrouter", "OPENROUTER_ACTUAL", "SETTLED", 2),
+            ],
+        }
+        self.assertFalse(_needs_cost_refresh(credits))
+
+    def test_old_pending_with_new_settled_no_refresh(self) -> None:
+        credits = {
+            "summary": {"totalCallCount": 1},
+            "records": [
+                self._record("c1", "openrouter", "OPENROUTER_ACTUAL", "PENDING_RETRY", 1),
+                self._record("c1", "openrouter", "OPENROUTER_ACTUAL", "SETTLED", 3),
+            ],
+        }
+        self.assertFalse(_needs_cost_refresh(credits))
+
+    def test_openrouter_pending_needs_refresh(self) -> None:
+        credits = {
+            "summary": {"totalCallCount": 1},
+            "records": [self._record("c1", "openrouter", "OPENROUTER_ACTUAL", "PENDING_RETRY", 1)],
+        }
+        self.assertTrue(_needs_cost_refresh(credits))
+
+    def test_openrouter_missing_needs_refresh(self) -> None:
+        credits = {
+            "summary": {"totalCallCount": 1},
+            "records": [self._record("c1", "openrouter", "OPENROUTER_ACTUAL", "MISSING", 2)],
+        }
+        self.assertTrue(_needs_cost_refresh(credits))
+
+    def test_openrouter_non_actual_settled_needs_refresh(self) -> None:
+        credits = {
+            "summary": {"totalCallCount": 1},
+            "records": [self._record("c1", "openrouter", "PER_CALL", "SETTLED", 1)],
+        }
+        self.assertTrue(_needs_cost_refresh(credits))
+
+
+class ResolveOutputDirTest(unittest.TestCase):
+    def test_relative_path_resolves_to_project_root(self) -> None:
+        path = _resolve_output_dir("af_light_client/output/foo")
+        self.assertIsNotNone(path)
+        self.assertTrue(path.is_absolute())
+        self.assertTrue(path.name, "foo")
+
+    def test_absolute_path_unchanged(self) -> None:
+        path = _resolve_output_dir("/tmp/absolute/dir")
+        self.assertEqual(path, Path("/tmp/absolute/dir").resolve())
 
 
 if __name__ == "__main__":

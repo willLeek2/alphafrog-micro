@@ -7,6 +7,7 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.credit.CostSettlementQuote;
+import world.willfrog.agent.platform.credit.CostSource;
 import world.willfrog.agent.platform.credit.EndpointCostAdapterRegistry;
 import world.willfrog.agent.platform.credit.LlmCallBillingContext;
 import world.willfrog.agent.platform.entity.AgentRun;
@@ -70,6 +71,7 @@ public class AgentRunCreditSettlementService {
 
     public static final String LEDGER_BIZ_IMMEDIATE = "RUN_SETTLEMENT_IMMEDIATE";
     public static final String LEDGER_BIZ_DELAYED = "RUN_SETTLEMENT_DELAYED";
+    public static final String LEDGER_BIZ_REFRESH = "RUN_SETTLEMENT_REFRESH";
 
     public static final String SUMMARY_STATUS_SETTLED = "SETTLED";
     public static final String SUMMARY_STATUS_PENDING_RETRY = "PENDING_RETRY";
@@ -77,6 +79,7 @@ public class AgentRunCreditSettlementService {
 
     private static final int ATTEMPT_IMMEDIATE = 1;
     private static final int ATTEMPT_DELAYED = 2;
+    private static final int ATTEMPT_REFRESH = 3;
     private static final String DEFAULT_CURRENCY = "USD";
     private static final int ADMIN_USER_TYPE = 1127;
 
@@ -112,6 +115,103 @@ public class AgentRunCreditSettlementService {
                 log.error("Immediate settlement failed: runId={} userId={}", runId, userId, e);
             }
         });
+    }
+
+    /**
+     * 手动刷新：对 run 中所有支持 cost fetch 的 endpoint 且尚未拿到实际 cost 的 call，
+     * 重新 quote 一次（attempt=3）。拿到实际 cost 后补写 per-call 记录和 ledger，
+     * 利用 idempotency_key 的 ON CONFLICT DO NOTHING 防止重复扣费。
+     *
+     * @param runId  run id
+     * @param userId run owner user id
+     */
+    public void refreshCosts(String runId, String userId) {
+        if (runId == null || runId.isBlank()) {
+            return;
+        }
+        AgentRun run = runMapper.findById(runId);
+        String observabilityJson = "";
+        if (run != null) {
+            observabilityJson = observabilityService.loadObservabilityJson(runId, run.getSnapshotJson());
+        }
+        List<AgentObservabilityService.LlmTrace> traces = extractLlmTraces(observabilityJson);
+        if (traces.isEmpty()) {
+            rebuildSummary(runId, userId, OffsetDateTime.now(ZoneOffset.UTC));
+            return;
+        }
+
+        List<AgentRunLlmCallCredit> existingRecords = llmCallCreditDao.listByRunId(runId);
+        Map<String, AgentRunLlmCallCredit> effectiveByCallId = dedupByLatestAttempt(existingRecords);
+
+        OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
+        for (AgentObservabilityService.LlmTrace trace : traces) {
+            if (trace == null || trace.getTraceId() == null || trace.getTraceId().isBlank()) {
+                continue;
+            }
+            String endpoint = trace.getEndpoint();
+            if (!adapterRegistry.supportsCostFetch(endpoint)) {
+                continue;
+            }
+            String llmCallId = resolveLlmCallId(trace);
+            if (hasActualCostSettled(effectiveByCallId.get(llmCallId))) {
+                continue;
+            }
+            LlmCallBillingContext ctx = buildContext(runId, trace);
+            CostSettlementQuote quote = adapterRegistry.quote(endpoint, ctx, ATTEMPT_REFRESH);
+            String perCallStatus = resolvePerCallStatus(quote, ATTEMPT_REFRESH);
+            if (!SETTLEMENT_STATUS_SETTLED.equals(perCallStatus)) {
+                // refresh 只补实际拉到的 cost；没拉到的保持已有记录，不生成 attempt=3 MISSING 占位，
+                // 避免后续 refresh 真正拿到 cost 时被 ON CONFLICT 挡住。
+                continue;
+            }
+            AgentRunLlmCallCredit record = buildPerCallRecord(
+                    runId, userId, llmCallId, trace, quote, perCallStatus, ATTEMPT_REFRESH, now);
+            int inserted = llmCallCreditDao.insertIgnoreDuplicate(record);
+            if (inserted <= 0) {
+                continue;
+            }
+            if (quote.getCreditDelta() != null && quote.getCreditDelta().signum() > 0) {
+                writeRefreshLedger(runId, userId, llmCallId, quote.getCreditDelta(), now);
+            }
+        }
+        rebuildSummary(runId, userId, now);
+    }
+
+    private boolean hasActualCostSettled(AgentRunLlmCallCredit record) {
+        if (record == null) {
+            return false;
+        }
+        if (!SETTLEMENT_STATUS_SETTLED.equalsIgnoreCase(record.getSettlementStatus())) {
+            return false;
+        }
+        return CostSource.OPENROUTER_ACTUAL.name().equals(record.getCostSource())
+                && record.getCostAmount() != null
+                && record.getCostAmount().compareTo(BigDecimal.ZERO) > 0;
+    }
+
+    private void writeRefreshLedger(String runId, String userId, String llmCallId,
+                                    BigDecimal delta, OffsetDateTime now) {
+        if (delta == null || delta.signum() <= 0) {
+            return;
+        }
+        boolean isAdmin = isAdminUser(userId);
+        Long userIdLong = parseUserId(userId);
+        AgentCreditLedger ledger = new AgentCreditLedger();
+        ledger.setLedgerId(UUID.randomUUID().toString().replace("-", ""));
+        ledger.setUserId(userId == null ? "" : userId);
+        ledger.setBizType(LEDGER_BIZ_REFRESH);
+        ledger.setSourceType("AGENT_RUN");
+        ledger.setSourceId(runId);
+        ledger.setOperatorId("");
+        ledger.setIdempotencyKey(runId + ":refresh:" + llmCallId);
+        ledger.setReason("agent_run_refresh_settlement");
+        ledger.setExt("{\"llmCallId\":\"" + escape(llmCallId) + "\",\"isAdmin\":" + isAdmin + "}");
+        try {
+            debitOperator.debitAndWriteLedger(ledger, delta, isAdmin, userIdLong);
+        } catch (Exception e) {
+            log.warn("Refresh ledger debit failed (likely idempotency conflict): runId={} callId={} err={}",
+                    runId, llmCallId, e.getMessage());
+        }
     }
 
     /**
@@ -337,7 +437,7 @@ public class AgentRunCreditSettlementService {
                 if (attempt != null && attempt == ATTEMPT_IMMEDIATE) {
                     immediate = immediate.add(delta);
                     immediateSettled++;
-                } else if (attempt != null && attempt == ATTEMPT_DELAYED) {
+                } else if (attempt != null && (attempt == ATTEMPT_DELAYED || attempt == ATTEMPT_REFRESH)) {
                     delayed = delayed.add(delta);
                     delayedSettled++;
                 }

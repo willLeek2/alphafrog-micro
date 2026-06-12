@@ -309,6 +309,12 @@ message GetAgentRunCreditsRequest {
   bool is_admin = 3;
 }
 
+message RefreshAgentRunCreditsRequest {
+  string user_id = 1;
+  string id = 2;
+  bool is_admin = 3;
+}
+
 message AgentRunCreditRecordMessage {
   string call_id = 1;             // 对外标识 (llm_call_id)
   string phase = 2;               // planning / execution / sub_agent；可空
@@ -482,6 +488,7 @@ service AgentDubboService {
   rpc GetCredits(GetAgentCreditsRequest) returns (GetAgentCreditsResponse);
   rpc ApplyCredits(ApplyAgentCreditsRequest) returns (ApplyAgentCreditsResponse);
   rpc GetRunCredits(GetAgentRunCreditsRequest) returns (GetAgentRunCreditsResponse);
+  rpc RefreshRunCredits(RefreshAgentRunCreditsRequest) returns (GetAgentRunCreditsResponse);
   rpc SubmitFeedback(SubmitAgentFeedbackRequest) returns (AgentEmpty);
   rpc ExportRun(ExportAgentRunRequest) returns (ExportAgentRunResponse);
   rpc SendMessage(SendAgentMessageRequest) returns (SendAgentMessageResponse);

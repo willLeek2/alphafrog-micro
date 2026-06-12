@@ -17,6 +17,7 @@ import world.willfrog.agent.platform.service.AgentModelCatalogService;
 import world.willfrog.agent.platform.service.AgentObservabilityService;
 import world.willfrog.agent.platform.service.AgentRunCostService;
 import world.willfrog.agent.platform.service.AgentRunCreditQueryService;
+import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agent.platform.service.SnapshotPartService;
 import world.willfrog.agent.platform.service.SnapshotPartsMeta;
@@ -45,6 +46,7 @@ import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCostRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCreditsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCreditsResponse;
+import world.willfrog.alphafrogmicro.agent.idl.RefreshAgentRunCreditsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunResultRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunStatusRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentSnapshotPartRequest;
@@ -121,6 +123,7 @@ public class LangchainRunReadService {
     private final AgentCreditService creditService;
     private final AgentRunCostService runCostService;
     private final AgentRunCreditQueryService runCreditQueryService;
+    private final AgentRunCreditSettlementService creditSettlementService;
     private final AgentModelCatalogService modelCatalogService;
     private final AgentMessageService messageService;
     private final SnapshotPartService snapshotPartService;
@@ -252,6 +255,14 @@ public class LangchainRunReadService {
         AgentRun run = request.getIsAdmin()
                 ? requireReadableRunForAdmin(request.getId())
                 : requireReadableRun(request.getId(), request.getUserId());
+        return runCreditQueryService.build(run);
+    }
+
+    public GetAgentRunCreditsResponse refreshRunCredits(RefreshAgentRunCreditsRequest request) {
+        AgentRun run = request.getIsAdmin()
+                ? requireReadableRunForAdmin(request.getId())
+                : requireReadableRun(request.getId(), request.getUserId());
+        creditSettlementService.refreshCosts(run.getId(), run.getUserId());
         return runCreditQueryService.build(run);
     }
 

@@ -28,6 +28,7 @@ import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCostRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCreditsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCreditsResponse;
+import world.willfrog.alphafrogmicro.agent.idl.RefreshAgentRunCreditsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunStatusRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentSnapshotPartRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentSnapshotPartsRequest;
@@ -652,6 +653,29 @@ public class AgentController {
             return handleRpcError(e, "查询 agent run credits");
         } catch (Exception e) {
             return handleError(e, "查询 agent run credits");
+        }
+    }
+
+    @PostMapping(AGENT_RUNS + "/{runId}/credits:refresh")
+    public ResponseWrapper<AgentRunCreditsResponse> refreshRunCredits(Authentication authentication,
+                                                                       @PathVariable("runId") String runId) {
+        String userId = resolveUserId(authentication);
+        if (userId == null) {
+            return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
+        }
+        try {
+            GetAgentRunCreditsResponse resp = agentDubboServiceLangchain.refreshRunCredits(
+                    RefreshAgentRunCreditsRequest.newBuilder()
+                            .setUserId(userId)
+                            .setId(runId)
+                            .setIsAdmin(isAdmin(authentication))
+                            .build()
+            );
+            return ResponseWrapper.success(toRunCreditsResponse(resp));
+        } catch (RpcException e) {
+            return handleRpcError(e, "刷新 agent run credits");
+        } catch (Exception e) {
+            return handleError(e, "刷新 agent run credits");
         }
     }
 

@@ -179,6 +179,30 @@ class AgentHttpClient:
         data = unwrap_data(payload)
         return data if isinstance(data, dict) else {}
 
+    def refresh_run_credits(self, template: str, run_id: str, *, timeout: Optional[float] = None) -> Dict[str, Any]:
+        prev_timeout = self.request_timeout_seconds
+        if timeout is not None and timeout > 0:
+            self.request_timeout_seconds = float(timeout)
+        try:
+            resp = self._request("post", template.format(run_id=run_id), expected={200})
+        finally:
+            self.request_timeout_seconds = prev_timeout
+        payload = safe_json(resp)
+        data = unwrap_data(payload)
+        return data if isinstance(data, dict) else {}
+
+    def get_user_credits(self, endpoint: str, *, timeout: Optional[float] = None) -> Dict[str, Any]:
+        prev_timeout = self.request_timeout_seconds
+        if timeout is not None and timeout > 0:
+            self.request_timeout_seconds = float(timeout)
+        try:
+            resp = self._request("get", endpoint, expected={200})
+        finally:
+            self.request_timeout_seconds = prev_timeout
+        payload = safe_json(resp)
+        data = unwrap_data(payload)
+        return data if isinstance(data, dict) else {}
+
     def cancel_run(self, template: str, run_id: str) -> None:
         try:
             self._request("post", template.format(run_id=run_id), expected={200})

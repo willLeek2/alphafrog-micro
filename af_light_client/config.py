@@ -26,6 +26,8 @@ class LightClientConfig:
     cancel_endpoint_template: str = "/api/agent/runs/{run_id}:cancel"
     observability_full_endpoint_template: str = "/api/agent/runs/{run_id}/observability/full"
     credits_endpoint_template: str = "/api/agent/runs/{run_id}/credits"
+    credits_refresh_endpoint_template: str = "/api/agent/runs/{run_id}/credits:refresh"
+    user_credits_endpoint: str = "/api/agent/credits"
     credits_fetch_timeout_seconds: float = 5.0
     request_timeout_seconds: float = 30.0
     stream_idle_timeout_seconds: float = 300.0
@@ -79,6 +81,13 @@ class LightClientConfig:
                 raw.get("credits_endpoint_template")
                 or "/api/agent/runs/{run_id}/credits"
             ),
+            credits_refresh_endpoint_template=str(
+                raw.get("credits_refresh_endpoint_template")
+                or "/api/agent/runs/{run_id}/credits:refresh"
+            ),
+            user_credits_endpoint=str(
+                raw.get("user_credits_endpoint") or "/api/agent/credits"
+            ),
             credits_fetch_timeout_seconds=float(
                 raw.get("credits_fetch_timeout_seconds") or 5.0
             ),
@@ -116,6 +125,8 @@ class LightClientConfig:
             raise ValueError("result_endpoint_template must contain {run_id}")
         if "{run_id}" not in self.observability_full_endpoint_template:
             raise ValueError("observability_full_endpoint_template must contain {run_id}")
+        if "{run_id}" not in self.credits_refresh_endpoint_template:
+            raise ValueError("credits_refresh_endpoint_template must contain {run_id}")
         if "{run_id}" not in self.credits_endpoint_template:
             raise ValueError("credits_endpoint_template must contain {run_id}")
         if self.credits_fetch_timeout_seconds <= 0:
