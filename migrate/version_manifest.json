@@ -210,6 +210,33 @@
       "upgrades": [
         "v1.0/"
       ]
+    },
+    {
+      "tag": "v1.1",
+      "commit": "pending-v1.1",
+      "services": [
+        "domestic-stock",
+        "domestic-fund",
+        "domestic-index",
+        "domestic-listed-asset",
+        "domestic-fetch",
+        "portfolio",
+        "frontend",
+        "agent",
+        "python-sandbox",
+        "python-sandbox-gateway",
+        "admin",
+        "external-info"
+      ],
+      "infra": [
+        "redis",
+        "rabbitmq",
+        "meilisearch",
+        "nacos"
+      ],
+      "upgrades": [
+        "v1.1/"
+      ]
     }
   ]
 }

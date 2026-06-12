@@ -74,6 +74,10 @@ class AgentDubboServiceImplTest {
     @Mock
     private AgentRunCostService runCostService;
     @Mock
+    private AgentRunCreditSettlementService creditSettlementService;
+    @Mock
+    private AgentRunCreditQueryService runCreditQueryService;
+    @Mock
     private UserDao userDao;
     @Mock
     private AgentMessageService messageService;
@@ -114,6 +118,8 @@ class AgentDubboServiceImplTest {
                 modelCatalogService,
                 creditService,
                 runCostService,
+                creditSettlementService,
+                runCreditQueryService,
                 userDao,
                 new ObjectMapper(),
                 messageService,
@@ -168,6 +174,7 @@ class AgentDubboServiceImplTest {
     void createRun_shouldAppendRunEnqueuedAfterExecuteAsync() {
         User user = new User();
         user.setUserId(1127L);
+        user.setUserType(1127);
         when(userDao.getUserById(1127L)).thenReturn(user);
 
         AgentRun run = new AgentRun();
@@ -185,7 +192,8 @@ class AgentDubboServiceImplTest {
                 anyString(),
                 org.mockito.ArgumentMatchers.anyInt(),
                 org.mockito.ArgumentMatchers.anyBoolean(),
-                anyString()
+                anyString(),
+                org.mockito.ArgumentMatchers.anyBoolean()
         )).thenReturn(run);
 
         service.createRun(CreateAgentRunRequest.newBuilder()
@@ -207,6 +215,7 @@ class AgentDubboServiceImplTest {
     void createRun_shouldRecordEnqueueFailureWhenExecutorRejects() {
         User user = new User();
         user.setUserId(1127L);
+        user.setUserType(1127);
         when(userDao.getUserById(1127L)).thenReturn(user);
 
         AgentRun run = new AgentRun();
@@ -224,7 +233,8 @@ class AgentDubboServiceImplTest {
                 anyString(),
                 org.mockito.ArgumentMatchers.anyInt(),
                 org.mockito.ArgumentMatchers.anyBoolean(),
-                anyString()
+                anyString(),
+                org.mockito.ArgumentMatchers.anyBoolean()
         )).thenReturn(run);
         doThrow(new TaskRejectedException("queue full")).when(executor).executeAsync("run-reject");
 

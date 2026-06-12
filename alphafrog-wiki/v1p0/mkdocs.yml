@@ -1,8 +1,14 @@
-site_name: AlphaFrog v1.0 Agent Docs
-site_description: AlphaFrog v1.0 agent run API and observability reference
+site_name: AlphaFrog v1.0 Agent 文档
+site_description: AlphaFrog v1.0 Agent 运行接口与观测文档
 docs_dir: docs
 theme:
   name: readthedocs
 nav:
-  - Home: index.md
-  - Agent Run HTTP Endpoints: agent-run-endpoints.md
+  - 首页: index.md
+  - Agent 运行接口:
+      - 快速开始: agent-run/quick-start.md
+      - 认证与运行生命周期: agent-run/auth-and-lifecycle.md
+      - SSE 事件流: agent-run/sse-stream.md
+      - 查询与观测接口: agent-run/reads-and-observability.md
+      - 产物、反馈与追问: agent-run/artifacts-feedback-messages.md
+      - 错误与脚本覆盖: agent-run/errors-and-script-coverage.md

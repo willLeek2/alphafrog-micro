@@ -14,9 +14,11 @@ import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agent.platform.service.AgentCreditService;
 import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agent.platform.service.AgentMessageService;
 import world.willfrog.agent.platform.service.AgentObservabilityService;
+import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 import world.willfrog.agentlangchain.orchestration.dag.LangchainDagWorkflowExecutor;
@@ -70,6 +72,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
     private final AgentMessageService messageService;
     private final LangchainRunExecutionGuard executionGuard;
     private final LangchainRunConcurrencyScheduler runConcurrencyScheduler;
+    private final AgentCreditService creditService;
+    private final AgentRunCreditSettlementService creditSettlementService;
 
     public LangchainLinearRunPipelineImpl(LangchainAiPlanner planner,
                                           LangchainLinearWorkflowExecutor linearWorkflowExecutor,
@@ -85,7 +89,9 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                                           LangchainFollowUpContextSupport followUpContextSupport,
                                           AgentMessageService messageService,
                                           LangchainRunExecutionGuard executionGuard,
-                                          LangchainRunConcurrencyScheduler runConcurrencyScheduler) {
+                                          LangchainRunConcurrencyScheduler runConcurrencyScheduler,
+                                          AgentCreditService creditService,
+                                          AgentRunCreditSettlementService creditSettlementService) {
         this.planner = planner;
         this.linearWorkflowExecutor = linearWorkflowExecutor;
         this.dagWorkflowExecutor = dagWorkflowExecutor;
@@ -101,6 +107,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         this.messageService = messageService;
         this.executionGuard = executionGuard;
         this.runConcurrencyScheduler = runConcurrencyScheduler;
+        this.creditService = creditService;
+        this.creditSettlementService = creditSettlementService;
     }
 
     @Override
@@ -135,6 +143,24 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             AgentContext.setRunId(runId);
             AgentContext.setUserId(userId);
             if (!eventService.isRunnable(runId, userId)) {
+                return;
+            }
+            // 260612-01-02: 防御性跑前校验（HTTP/Dubbo 已校验，pipeline 再校验一次防漏）
+            if (!hasAdminCreditBypass(run) && !creditService.hasPositiveCredit(userId)) {
+                String reason = "insufficient_credit";
+                log.warn("LangChain run blocked by credit pre-check: runId={} userId={}", runId, userId);
+                AgentObservabilityService observability = observabilityServiceProvider.getIfAvailable();
+                if (observability != null) {
+                    observability.recordFailure(runId, "CREDIT_BLOCK", reason);
+                }
+                String blockedSnapshot = attachObservability(
+                        runId, run.getSnapshotJson(), AgentRunStatus.FAILED, "CreditBlocked", reason);
+                runMapper.updateSnapshot(runId, userId, AgentRunStatus.FAILED, blockedSnapshot, true, reason);
+                runMapper.updateStatusWithTtl(runId, userId, AgentRunStatus.FAILED,
+                        eventService.nextInterruptedExpiresAt());
+                eventService.append(runId, userId, "EXECUTION_BLOCKED",
+                        Map.of("reason", reason, "by", "credit_pre_check", "engine", "agentLangchainService"));
+                markRunStatus(runId, AgentRunStatus.FAILED);
                 return;
             }
             runMapper.updateStatus(runId, userId, AgentRunStatus.EXECUTING);
@@ -252,6 +278,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                         "engine", "agentLangchainService"
                 ));
                 persistAssistantMessage(runId, userId, stageModels, result.getFinalAnswer());
+                // 260612-01-02: 成功路径触发结算
+                tryScheduleSettlement(runId, userId);
             } else if (result.isPartial()) {
                 // DAG recovery judge 判定部分完成：写入 PARTIAL 状态 + 部分答案。
                 // PARTIAL 不是普通失败：它表示部分 todo 被明确跳过，最终答案可供用户参考，
@@ -277,8 +305,11 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 if (!isBlank(result.getFinalAnswer())) {
                     persistAssistantMessage(runId, userId, stageModels, result.getFinalAnswer());
                 }
+                // 260612-01-02: 部分完成也触发结算
+                tryScheduleSettlement(runId, userId);
             } else {
                 publishFailure(runId, userId, userGoal, result, null);
+                tryScheduleSettlement(runId, userId);
             }
         } catch (Exception e) {
             log.error("LangChain run failed: runId={}", runId, e);
@@ -291,6 +322,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                             .toolCallsUsed(0)
                             .build(),
                     e);
+            // 260612-01-02: 异常路径也触发结算
+            tryScheduleSettlement(runId, userId);
         } finally {
             // 异步线程会被线程池复用，必须清理 ThreadLocal（线程本地变量），避免下一个 run 继承上一个 run 的 phase/todo/provider 信息。
             AgentContext.clear();
@@ -483,6 +516,36 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         Map<String, Object> payload = new LinkedHashMap<>(decision.getEventPayload());
         payload.put("engine", "agentLangchainService");
         eventService.append(runId, userId, decision.getEventType(), payload);
+    }
+
+    private void tryScheduleSettlement(String runId, String userId) {
+        try {
+            creditSettlementService.settleAsync(runId, userId);
+        } catch (Exception e) {
+            log.warn("Failed to schedule credit settlement: runId={} err={}", runId, e.getMessage());
+        }
+    }
+
+    private boolean hasAdminCreditBypass(AgentRun run) {
+        if (run == null || isBlank(run.getExt())) {
+            return false;
+        }
+        try {
+            Map<?, ?> ext = objectMapper.readValue(run.getExt(), Map.class);
+            Object value = ext.get("is_admin");
+            if (value == null) {
+                value = ext.get("isAdmin");
+            }
+            if (value instanceof Boolean boolValue) {
+                return boolValue;
+            }
+            if (value instanceof Number numberValue) {
+                return numberValue.intValue() != 0;
+            }
+            return value != null && Boolean.parseBoolean(String.valueOf(value));
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     private String attachObservability(String runId,

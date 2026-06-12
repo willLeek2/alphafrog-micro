@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -39,6 +40,111 @@ password: "p"
 question: "q"
 """)
         self.assertEqual(cfg.as_log_dict()["password"], "<redacted>")
+
+    def test_llm_config_merges_into_create_request_body(self) -> None:
+        cfg = _load("""
+base_url: "http://localhost:8090"
+username: "u"
+password: "p"
+question: "q"
+llm:
+  endpointName: openrouter
+  modelName: qwen/qwen3.7-max
+  provider: alibaba
+""")
+        body = cfg.create_request_body()
+        self.assertEqual(body["message"], "q")
+        self.assertEqual(body["endpointName"], "openrouter")
+        self.assertEqual(body["modelName"], "qwen/qwen3.7-max")
+        self.assertEqual(body["provider"], "alibaba")
+
+    def test_llm_stage_config_is_preserved(self) -> None:
+        cfg = _load("""
+base_url: "http://localhost:8090"
+username: "u"
+password: "p"
+question: "q"
+llm:
+  endpointName: openrouter
+  modelName: qwen/qwen3.7-max
+  provider: alibaba
+  stage_config:
+    planning:
+      endpointName: openrouter
+      modelName: moonshotai/kimi-k2.6
+      providerOrder: [fireworks, moonshotai/int4]
+    final_answer:
+      endpointName: openrouter
+      modelName: moonshotai/kimi-k2.6
+      providerOrder: [fireworks, moonshotai/int4]
+""")
+        body = cfg.create_request_body()
+        stage_config = json.loads(body["stage_config_json"])
+        self.assertNotIn("stage_config", body)
+        self.assertEqual(
+            stage_config["planning"]["providerOrder"],
+            ["fireworks", "moonshotai/int4"],
+        )
+        self.assertEqual(
+            stage_config["final_answer"]["modelName"],
+            "moonshotai/kimi-k2.6",
+        )
+        self.assertEqual(
+            body["stage_config_json"],
+            '{"planning":{"endpointName":"openrouter","modelName":"moonshotai/kimi-k2.6",'
+            '"providerOrder":["fireworks","moonshotai/int4"]},"final_answer":'
+            '{"endpointName":"openrouter","modelName":"moonshotai/kimi-k2.6",'
+            '"providerOrder":["fireworks","moonshotai/int4"]}}',
+        )
+
+    def test_create_body_overrides_llm_config(self) -> None:
+        cfg = _load("""
+base_url: "http://localhost:8090"
+username: "u"
+password: "p"
+question: "q"
+llm:
+  endpointName: openrouter
+  modelName: qwen/qwen3.7-max
+  provider: alibaba
+  stage_config:
+    planning:
+      modelName: moonshotai/kimi-k2.6
+      providerOrder: [fireworks]
+create_body:
+  modelName: moonshotai/kimi-k2.6
+  stage_config:
+    planning:
+      providerOrder: [moonshotai/int4]
+""")
+        body = cfg.create_request_body()
+        stage_config = json.loads(body["stage_config_json"])
+        self.assertEqual(body["endpointName"], "openrouter")
+        self.assertEqual(body["modelName"], "moonshotai/kimi-k2.6")
+        self.assertEqual(body["provider"], "alibaba")
+        self.assertNotIn("stage_config", body)
+        self.assertEqual(stage_config["planning"]["modelName"], "moonshotai/kimi-k2.6")
+        self.assertEqual(stage_config["planning"]["providerOrder"], ["moonshotai/int4"])
+
+    def test_create_body_stage_config_json_overrides_llm_stage_config(self) -> None:
+        cfg = _load("""
+base_url: "http://localhost:8090"
+username: "u"
+password: "p"
+question: "q"
+llm:
+  stage_config:
+    planning:
+      providerOrder: [fireworks]
+create_body:
+  stage_config_json: '{"planning":{"providerOrder":["alibaba"]}}'
+""")
+        body = cfg.create_request_body()
+        self.assertNotIn("stage_config", body)
+        self.assertEqual(
+            json.loads(body["stage_config_json"])["planning"]["providerOrder"],
+            ["alibaba"],
+        )
 
 
 def _load(text: str) -> LightClientConfig:

@@ -124,7 +124,27 @@ public class AgentEventService {
                               int plannerCandidateCount,
                               boolean debugMode,
                               String stageConfigJson) {
-        log.info("[AgentEventService] 创建 Run: userId={}, stageConfigJson={}", userId, stageConfigJson);
+        return createRun(userId, message, contextJson, idempotencyKey, modelName, endpointName,
+                captureLlmRequests, provider, plannerCandidateCount, debugMode, stageConfigJson, false);
+    }
+
+    /**
+     * createRun 重载：接受 isAdmin 标志，落 ext.is_admin，
+     * 让 executor / pipeline 防御层有 admin 旁路信号。
+     */
+    public AgentRun createRun(String userId,
+                              String message,
+                              String contextJson,
+                              String idempotencyKey,
+                              String modelName,
+                              String endpointName,
+                              boolean captureLlmRequests,
+                              String provider,
+                              int plannerCandidateCount,
+                              boolean debugMode,
+                              String stageConfigJson,
+                              boolean isAdmin) {
+        log.info("[AgentEventService] 创建 Run: userId={}, stageConfigJson={}, isAdmin={}", userId, stageConfigJson, isAdmin);
         // 生成无连字符 UUID 作为 runId
         String runId = java.util.UUID.randomUUID().toString().replace("-", "");
 
@@ -142,6 +162,8 @@ public class AgentEventService {
             ext.put("planner_candidate_count", plannerCandidateCount);
         }
         ext.put("checkpoint_version", resolveCheckpointVersion());
+        // 260612-01-02: 落 admin 旁路信号，供 executor / pipeline 防御层使用
+        ext.put("is_admin", isAdmin);
         if (stageConfigJson != null && !stageConfigJson.isBlank()) {
             try {
                 // 存储为 JSON 对象而非字符串，便于后续解析

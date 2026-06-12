@@ -16,6 +16,7 @@ import world.willfrog.agent.platform.service.AgentMessageService;
 import world.willfrog.agent.platform.service.AgentModelCatalogService;
 import world.willfrog.agent.platform.service.AgentObservabilityService;
 import world.willfrog.agent.platform.service.AgentRunCostService;
+import world.willfrog.agent.platform.service.AgentRunCreditQueryService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agent.platform.service.SnapshotPartService;
 import world.willfrog.agent.platform.service.SnapshotPartsMeta;
@@ -42,6 +43,8 @@ import world.willfrog.alphafrogmicro.agent.idl.GetAgentCreditsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentCreditsResponse;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCostRequest;
+import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCreditsRequest;
+import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCreditsResponse;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunResultRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunStatusRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentSnapshotPartRequest;
@@ -117,6 +120,7 @@ public class LangchainRunReadService {
     private final AgentObservabilityService observabilityService;
     private final AgentCreditService creditService;
     private final AgentRunCostService runCostService;
+    private final AgentRunCreditQueryService runCreditQueryService;
     private final AgentModelCatalogService modelCatalogService;
     private final AgentMessageService messageService;
     private final SnapshotPartService snapshotPartService;
@@ -242,6 +246,13 @@ public class LangchainRunReadService {
         AgentRun run = requireReadableRun(request.getId(), request.getUserId());
         String observabilityJson = nvl(observabilityService.loadObservabilityJson(run.getId(), run.getSnapshotJson()));
         return runCostService.buildAndPersist(run, observabilityJson);
+    }
+
+    public GetAgentRunCreditsResponse getRunCredits(GetAgentRunCreditsRequest request) {
+        AgentRun run = request.getIsAdmin()
+                ? requireReadableRunForAdmin(request.getId())
+                : requireReadableRun(request.getId(), request.getUserId());
+        return runCreditQueryService.build(run);
     }
 
     /**
@@ -458,6 +469,10 @@ public class LangchainRunReadService {
         return singleWriterGuard.requireReadable(requireRun(id, userId));
     }
 
+    AgentRun requireReadableRunForAdmin(String id) {
+        return singleWriterGuard.requireReadable(requireRunForAdmin(id));
+    }
+
     AgentRun requireWritableRun(String id, String userId) {
         return singleWriterGuard.requireWritable(requireRun(id, userId));
     }
@@ -466,6 +481,15 @@ public class LangchainRunReadService {
         String safeId = requireId(id, "id");
         String safeUserId = requireUserId(userId);
         AgentRun run = runMapper.findByIdAndUser(safeId, safeUserId);
+        if (run == null) {
+            throw new IllegalArgumentException("run not found");
+        }
+        return markExpiredIfNeeded(run);
+    }
+
+    private AgentRun requireRunForAdmin(String id) {
+        String safeId = requireId(id, "id");
+        AgentRun run = runMapper.findById(safeId);
         if (run == null) {
             throw new IllegalArgumentException("run not found");
         }

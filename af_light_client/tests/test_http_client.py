@@ -418,5 +418,71 @@ class AgentHttpClientLogoutTest(unittest.TestCase):
         self.assertTrue(any("logout failed" in w for w in client.warnings.snapshot()))
 
 
+class AgentHttpClientGetRunCreditsTest(unittest.TestCase):
+    def _client(self, request_timeout: float = 5.0) -> AgentHttpClient:
+        client = AgentHttpClient("http://example.com", request_timeout_seconds=request_timeout)
+        client.token = "tok-1"
+        return client
+
+    def test_get_run_credits_substitutes_template_and_unwraps(self) -> None:
+        client = self._client()
+        ok = _mock_response(
+            200,
+            json_payload={
+                "data": {
+                    "runId": "run-7",
+                    "totalCredits": "12.34",
+                    "currency": "USD",
+                    "summary": {
+                        "immediateCount": 8,
+                        "delayedCount": 2,
+                        "pendingCount": 0,
+                        "missingCount": 1,
+                        "totalCallCount": 11,
+                        "currency": "USD",
+                        "totalCredits": "12.34",
+                    },
+                }
+            },
+        )
+        with patch.object(client.session, "request", return_value=ok) as req:
+            payload = client.get_run_credits("/api/agent/runs/{run_id}/credits", "run-7")
+        self.assertEqual(payload["runId"], "run-7")
+        self.assertEqual(payload["totalCredits"], "12.34")
+        # 模板替换后 path 不应残留 {run_id}
+        self.assertNotIn("{run_id}", req.call_args.args[1])
+        self.assertEqual(req.call_args.args[0], "GET")
+        # 默认 timeout=None 时不覆盖 request_timeout_seconds，请求仍用原值
+        self.assertEqual(req.call_args.kwargs["timeout"], 5.0)
+        self.assertEqual(client.request_timeout_seconds, 5.0)
+
+    def test_get_run_credits_overrides_timeout_and_restores(self) -> None:
+        client = self._client(request_timeout=30.0)
+        ok = _mock_response(200, json_payload={"data": {"runId": "run-1"}})
+        with patch.object(client.session, "request", return_value=ok) as req:
+            client.get_run_credits(
+                "/api/agent/runs/{run_id}/credits",
+                "run-1",
+                timeout=2.5,
+            )
+        # 调用期间 request_timeout_seconds 应被覆盖，请求用的是 2.5
+        self.assertEqual(req.call_args.kwargs["timeout"], 2.5)
+        # 调用结束后恢复原值
+        self.assertEqual(client.request_timeout_seconds, 30.0)
+
+    def test_get_run_credits_zero_timeout_does_not_override(self) -> None:
+        client = self._client(request_timeout=7.0)
+        ok = _mock_response(200, json_payload={"data": {"runId": "run-2"}})
+        with patch.object(client.session, "request", return_value=ok) as req:
+            client.get_run_credits(
+                "/api/agent/runs/{run_id}/credits",
+                "run-2",
+                timeout=0.0,
+            )
+        # 0/None/负值不覆盖，沿用原 request_timeout_seconds
+        self.assertEqual(req.call_args.kwargs["timeout"], 7.0)
+        self.assertEqual(client.request_timeout_seconds, 7.0)
+
+
 if __name__ == "__main__":
     unittest.main()

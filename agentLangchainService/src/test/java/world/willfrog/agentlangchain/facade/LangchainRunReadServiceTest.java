@@ -13,6 +13,7 @@ import world.willfrog.agent.platform.service.AgentMessageService;
 import world.willfrog.agent.platform.service.AgentModelCatalogService;
 import world.willfrog.agent.platform.service.AgentObservabilityService;
 import world.willfrog.agent.platform.service.AgentRunCostService;
+import world.willfrog.agent.platform.service.AgentRunCreditQueryService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agent.platform.service.SnapshotPartService;
 import world.willfrog.agentlangchain.routing.LangchainSingleWriterGuard;
@@ -36,6 +37,7 @@ class LangchainRunReadServiceTest {
     private final AgentObservabilityService observabilityService = mock(AgentObservabilityService.class);
     private final AgentCreditService creditService = mock(AgentCreditService.class);
     private final AgentRunCostService runCostService = mock(AgentRunCostService.class);
+    private final AgentRunCreditQueryService runCreditQueryService = mock(AgentRunCreditQueryService.class);
     private final AgentModelCatalogService modelCatalogService = mock(AgentModelCatalogService.class);
     private final AgentMessageService messageService = mock(AgentMessageService.class);
     private final SnapshotPartService snapshotPartService = mock(SnapshotPartService.class);
@@ -50,6 +52,7 @@ class LangchainRunReadServiceTest {
             observabilityService,
             creditService,
             runCostService,
+            runCreditQueryService,
             modelCatalogService,
             messageService,
             snapshotPartService,

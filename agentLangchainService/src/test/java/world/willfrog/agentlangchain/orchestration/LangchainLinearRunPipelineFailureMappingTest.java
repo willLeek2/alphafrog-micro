@@ -5,7 +5,9 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.ObjectProvider;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
+import world.willfrog.agent.platform.service.AgentCreditService;
 import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 import world.willfrog.agent.workflow.TodoItem;
 import world.willfrog.agentlangchain.failure.LangchainFailureMapper;
@@ -19,6 +21,7 @@ import java.util.Map;
 import static org.mockito.ArgumentMatchers.any;
 import static world.willfrog.agentlangchain.orchestration.LangchainRunSchedulerTestSupport.immediateScheduler;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -62,6 +65,9 @@ class LangchainLinearRunPipelineFailureMappingTest {
         when(followUpContextSupport.resolve(run)).thenReturn(
                 new LangchainFollowUpContextSupport.ExecutionContext("goal", ""));
 
+        AgentCreditService creditService = mock(AgentCreditService.class);
+        lenient().when(creditService.hasPositiveCredit("user-1")).thenReturn(true);
+
         LangchainLinearRunPipelineImpl pipeline = new LangchainLinearRunPipelineImpl(
                 planner,
                 linear,
@@ -77,7 +83,9 @@ class LangchainLinearRunPipelineFailureMappingTest {
                 followUpContextSupport,
                 mock(world.willfrog.agent.platform.service.AgentMessageService.class),
                 mock(LangchainRunExecutionGuard.class),
-                immediateScheduler()
+                immediateScheduler(),
+                creditService,
+                mock(AgentRunCreditSettlementService.class)
         );
 
         pipeline.executeRun(run);

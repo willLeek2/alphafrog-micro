@@ -58,7 +58,7 @@ public class UserController {
                 updated.getEmail(),
                 updated.getUserType(),
                 updated.getUserLevel(),
-                updated.getCredit(),
+                updated.getCredit() == null ? 0 : updated.getCredit().intValue(),
                 updated.getRegisterTime()
         );
         return ResponseEntity.ok(Map.of(

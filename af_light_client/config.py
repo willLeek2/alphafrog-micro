@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Union
@@ -24,12 +25,15 @@ class LightClientConfig:
     result_endpoint_template: str = "/api/agent/runs/{run_id}/result"
     cancel_endpoint_template: str = "/api/agent/runs/{run_id}:cancel"
     observability_full_endpoint_template: str = "/api/agent/runs/{run_id}/observability/full"
+    credits_endpoint_template: str = "/api/agent/runs/{run_id}/credits"
+    credits_fetch_timeout_seconds: float = 5.0
     request_timeout_seconds: float = 30.0
     stream_idle_timeout_seconds: float = 300.0
     refresh_seconds: float = 0.5
     max_trace_lines: int = 14
     max_warning_lines: int = 4
     result_preview_chars: int = 280
+    llm: Dict[str, Any] = field(default_factory=dict)
     create_body: Dict[str, Any] = field(default_factory=dict)
     debug_logs: bool = False
     debug_output_root: str = "af_light_client/output"
@@ -71,13 +75,21 @@ class LightClientConfig:
                 raw.get("observability_full_endpoint_template")
                 or "/api/agent/runs/{run_id}/observability/full"
             ),
+            credits_endpoint_template=str(
+                raw.get("credits_endpoint_template")
+                or "/api/agent/runs/{run_id}/credits"
+            ),
+            credits_fetch_timeout_seconds=float(
+                raw.get("credits_fetch_timeout_seconds") or 5.0
+            ),
             request_timeout_seconds=float(raw.get("request_timeout_seconds") or 30.0),
             stream_idle_timeout_seconds=float(raw.get("stream_idle_timeout_seconds") or 300.0),
             refresh_seconds=float(raw.get("refresh_seconds") or 0.5),
             max_trace_lines=int(raw.get("max_trace_lines") or 14),
             max_warning_lines=int(raw.get("max_warning_lines") or 4),
             result_preview_chars=int(raw.get("result_preview_chars") or 280),
-            create_body=copy.deepcopy(raw.get("create_body") or {}),
+            llm=_optional_dict(raw.get("llm"), "llm"),
+            create_body=_optional_dict(raw.get("create_body"), "create_body"),
             debug_logs=_debug_logs(raw.get("debug")),
             debug_output_root=_debug_output_root(raw.get("debug")),
         )
@@ -104,14 +116,20 @@ class LightClientConfig:
             raise ValueError("result_endpoint_template must contain {run_id}")
         if "{run_id}" not in self.observability_full_endpoint_template:
             raise ValueError("observability_full_endpoint_template must contain {run_id}")
+        if "{run_id}" not in self.credits_endpoint_template:
+            raise ValueError("credits_endpoint_template must contain {run_id}")
+        if self.credits_fetch_timeout_seconds <= 0:
+            raise ValueError("credits_fetch_timeout_seconds must be > 0")
         if self.refresh_seconds <= 0:
             raise ValueError("refresh_seconds must be > 0")
         if self.debug_logs and not self.debug_output_root.strip():
             raise ValueError("debug.output_root must be non-empty when debug.logs is true")
 
     def create_request_body(self) -> Dict[str, Any]:
-        body = copy.deepcopy(self.create_body)
+        body = copy.deepcopy(self.llm)
+        _deep_merge(body, self.create_body)
         body.setdefault("message", self.question)
+        _serialize_stage_config(body)
         return body
 
     def as_log_dict(self) -> Dict[str, Any]:
@@ -130,3 +148,32 @@ def _debug_output_root(raw: Any) -> str:
     if not isinstance(raw, dict):
         return "af_light_client/output"
     return str(raw.get("output_root") or "af_light_client/output")
+
+
+def _optional_dict(raw: Any, field_name: str) -> Dict[str, Any]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"{field_name} must be a YAML object")
+    return copy.deepcopy(raw)
+
+
+def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> None:
+    for key, value in override.items():
+        if isinstance(base.get(key), dict) and isinstance(value, dict):
+            _deep_merge(base[key], value)
+        else:
+            base[key] = copy.deepcopy(value)
+
+
+def _serialize_stage_config(body: Dict[str, Any]) -> None:
+    stage_config = body.get("stage_config")
+    if not isinstance(stage_config, dict):
+        return
+    body.pop("stage_config")
+    if "stage_config_json" not in body:
+        body["stage_config_json"] = json.dumps(
+            stage_config,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )

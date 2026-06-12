@@ -6,6 +6,7 @@ import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agent.platform.service.AgentObservabilityService;
+import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agentlangchain.orchestration.LangchainLinearRunPipeline;
 import world.willfrog.alphafrogmicro.agent.idl.CancelAgentRunRequest;
@@ -24,8 +25,9 @@ class LangchainRunControlServiceTest {
     private final AgentRunStateStore stateStore = mock(AgentRunStateStore.class);
     private final AgentObservabilityService observabilityService = mock(AgentObservabilityService.class);
     private final LangchainLinearRunPipeline pipeline = mock(LangchainLinearRunPipeline.class);
+    private final AgentRunCreditSettlementService creditSettlementService = mock(AgentRunCreditSettlementService.class);
     private final LangchainRunControlService service = new LangchainRunControlService(
-            readService, runMapper, eventService, stateStore, observabilityService, pipeline);
+            readService, runMapper, eventService, stateStore, observabilityService, pipeline, creditSettlementService);
 
     @Test
     void cancelFlushesObservabilityAndMarksCanceled() {

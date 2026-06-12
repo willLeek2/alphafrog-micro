@@ -526,6 +526,10 @@ public class AdminController {
         map.put("idempotencyKey", entry.getIdempotencyKey());
         map.put("ext", entry.getExt());
         map.put("createdAt", entry.getCreatedAt());
+        map.put("reason", entry.getReason());
+        map.put("deltaDecimal", entry.getDeltaDecimal());
+        map.put("balanceBeforeDecimal", entry.getBalanceBeforeDecimal());
+        map.put("balanceAfterDecimal", entry.getBalanceAfterDecimal());
         return map;
     }
 
@@ -734,6 +738,64 @@ public class AdminController {
         payload.put("ledgerId", response.getLedgerId());
         payload.put("auditId", response.getAuditId());
         payload.put("idempotentReplay", response.getIdempotentReplay());
+        payload.put("message", response.getMessage());
+        return ResponseEntity.ok(payload);
+    }
+
+    @PostMapping("/users/credit-add")
+    public ResponseEntity<?> addUserCredit(Authentication authentication,
+                                           @RequestHeader("Idempotency-Key") String idempotencyKey,
+                                           @RequestBody Map<String, Object> requestBody) {
+        if (!isAdmin(authentication)) {
+            return ResponseEntity.status(403).body(Map.of("error", "Forbidden"));
+        }
+        if (idempotencyKey == null || idempotencyKey.isBlank()) {
+            return ResponseEntity.badRequest().body(Map.of("error", "Idempotency-Key is required"));
+        }
+
+        String userId = requestBody == null ? "" : nvl(requestBody.get("userId"));
+        String username = requestBody == null ? "" : nvl(requestBody.get("username"));
+        String currency = requestBody == null ? "" : nvl(requestBody.get("currency"));
+        String amount = requestBody == null ? "" : nvl(requestBody.get("amount"));
+        String reason = requestBody == null ? "" : nvl(requestBody.get("reason"));
+        if ((userId.isBlank() && username.isBlank()) || (!userId.isBlank() && !username.isBlank())) {
+            return ResponseEntity.badRequest().body(Map.of("error", "exactly one of userId/username is required"));
+        }
+        if (currency.isBlank() || amount.isBlank() || reason.isBlank()) {
+            return ResponseEntity.badRequest().body(Map.of("error", "currency/amount/reason are required"));
+        }
+
+        User adminUser = authService.getUserByUsername(authentication.getName());
+        String operatorId = adminUser == null || adminUser.getUserId() == null ? "" : String.valueOf(adminUser.getUserId());
+
+        AddUserCreditResponse response = adminService.addUserCredit(
+                AddUserCreditRequest.newBuilder()
+                        .setUserId(userId)
+                        .setUsername(username)
+                        .setCurrency(currency)
+                        .setAmount(amount)
+                        .setReason(reason)
+                        .setOperatorId(operatorId)
+                        .setIdempotencyKey(idempotencyKey)
+                        .build()
+        );
+        if (!response.getSuccess()) {
+            return buildError(response.getErrorCode(), response.getMessage());
+        }
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("userId", response.getUserId());
+        payload.put("username", response.getUsername());
+        payload.put("currency", response.getCurrency());
+        payload.put("originalAmount", response.getOriginalAmount());
+        payload.put("exchangeRateToUsd", response.getExchangeRateToUsd());
+        payload.put("creditAmount", response.getCreditAmount());
+        payload.put("balanceBefore", response.getBalanceBefore());
+        payload.put("balanceAfter", response.getBalanceAfter());
+        payload.put("ledgerId", response.getLedgerId());
+        payload.put("rechargeId", response.getRechargeId());
+        payload.put("auditId", response.getAuditId());
+        payload.put("idempotentReplay", response.getIdempotentReplay());
+        payload.put("idempotencyKey", response.getIdempotencyKey());
         payload.put("message", response.getMessage());
         return ResponseEntity.ok(payload);
     }

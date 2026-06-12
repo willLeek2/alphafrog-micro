@@ -25,12 +25,25 @@ debug:
   logs: false
   output_root: "af_light_client/output"
 
-create_body:
-  # endpointName 按后端配置选择；常见值包括 openrouter、linear-default、dag-default。
+llm:
+  # endpointName / modelName / provider 会直接进入 create run 请求体。
+  # stage_config 保持压测配置写法，发送请求时会序列化为 stage_config_json 字符串。
+  # 字段名和 test_scripts/agent-v1p0 的压测配置保持一致。
   endpointName: openrouter
-  modelName: moonshotai/kimi-k2.6
-  # provider 传给 OpenRouter 路由，多个 provider 用英文逗号分隔，顺序代表业务侧偏好。
-  provider: fireworks,moonshotai/int4
+  modelName: qwen/qwen3.7-max
+  provider: alibaba
+  stage_config:
+    planning:
+      endpointName: openrouter
+      modelName: moonshotai/kimi-k2.6
+      providerOrder: [fireworks, moonshotai/int4]
+    final_answer:
+      endpointName: openrouter
+      modelName: moonshotai/kimi-k2.6
+      providerOrder: [fireworks, moonshotai/int4]
+
+create_body:
+  # 高级覆盖层：这里的同名字段会覆盖 llm，适合临时调整或传递后端新增字段。
   captureLlmRequests: true
   context:
     locale: zh-CN

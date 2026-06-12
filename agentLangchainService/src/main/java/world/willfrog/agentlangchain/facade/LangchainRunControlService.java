@@ -8,6 +8,7 @@ import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agent.platform.service.AgentObservabilityService;
+import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agentlangchain.orchestration.LangchainLinearRunPipeline;
 import world.willfrog.alphafrogmicro.agent.idl.AgentEmpty;
@@ -67,6 +68,7 @@ public class LangchainRunControlService {
     private final AgentRunStateStore stateStore;
     private final AgentObservabilityService observabilityService;
     private final LangchainLinearRunPipeline pipeline;
+    private final AgentRunCreditSettlementService creditSettlementService;
 
     /**
      * 删除 run 及其关联的状态数据（Redis）。
@@ -120,6 +122,12 @@ public class LangchainRunControlService {
                 "engine", "agentLangchainService"));
         // 7. 最后再把 Redis 状态从 CANCELING 改成 CANCELED（终态）
         stateStore.markRunStatus(runId, AgentRunStatus.CANCELED.name());
+        // 8. 260612-01-02: cancel 路径触发结算（可能已有部分 LLM 调用）
+        try {
+            creditSettlementService.settleAsync(runId, userId);
+        } catch (Exception settleEx) {
+            log.warn("Failed to schedule settlement on langchain cancel: runId={} err={}", runId, settleEx.getMessage());
+        }
         return AgentLangchainRunMessageMapper.toRunMessage(readService.requireReadableRun(runId, userId));
     }
 

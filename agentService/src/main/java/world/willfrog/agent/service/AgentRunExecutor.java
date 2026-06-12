@@ -99,6 +99,8 @@ public class AgentRunExecutor {
     private final AgentObservabilityService observabilityService;
     /** 额度消费服务，计算并记录 run 的资源消耗 */
     private final AgentCreditService creditService;
+    /** 异步 credit 结算服务，per-endpoint cost accounting (260612-01-02) */
+    private final AgentRunCreditSettlementService creditSettlementService;
     /** Todo Plan 生成器，让 LLM 将用户目标拆解为 Todo 列表 */
     private final TodoPlanner todoPlanner;
     /** 执行器工厂，基于 Plan 特征选择 LinearWorkflowExecutor 或 DagWorkflowExecutor */
@@ -236,6 +238,22 @@ public class AgentRunExecutor {
 
             // 再次检查是否可执行（eventService 内可能额外检查 run 状态约束）
             if (!eventService.isRunnable(runId, userId)) {
+                return;
+            }
+
+            // 260612-01-02: 防御性跑前校验（HTTP/Dubbo 已校验，executor 再校验一次防漏）
+            if (!hasAdminCreditBypass(run) && !creditService.hasPositiveCredit(userId)) {
+                String reason = "insufficient_credit";
+                log.warn("Agent run blocked by credit pre-check: runId={} userId={}", runId, userId);
+                observabilityService.recordFailure(runId, "CREDIT_BLOCK", reason);
+                String blockedSnapshotJson = observabilityService.attachObservabilityToSnapshot(
+                        runId, run.getSnapshotJson(), AgentRunStatus.FAILED);
+                runMapper.updateSnapshot(runId, userId, AgentRunStatus.FAILED, blockedSnapshotJson, true, reason);
+                runMapper.updateStatusWithTtl(runId, userId, AgentRunStatus.FAILED,
+                        eventService.nextInterruptedExpiresAt());
+                eventService.append(runId, userId, "EXECUTION_BLOCKED",
+                        mapOf("reason", reason, "by", "credit_pre_check"));
+                stateStore.markRunStatus(runId, AgentRunStatus.FAILED.name());
                 return;
             }
 
@@ -496,6 +514,12 @@ public class AgentRunExecutor {
             runMapper.updateStatusWithTtl(runId, userId, AgentRunStatus.FAILED, eventService.nextInterruptedExpiresAt());
             eventService.append(runId, userId, "WORKFLOW_FAILED", mapOf("error", err));
             stateStore.markRunStatus(runId, AgentRunStatus.FAILED.name());
+            // 260612-01-02: 异常路径也触发结算（可能已有部分 LLM 调用）
+            try {
+                creditSettlementService.settleAsync(runId, userId);
+            } catch (Exception settleEx) {
+                log.warn("Failed to schedule settlement on exception path: runId={} err={}", runId, settleEx.getMessage());
+            }
         } finally {
             // 确保清理 ThreadLocal，避免线程池复用时上下文串扰
             AgentContext.clear();
@@ -556,7 +580,7 @@ public class AgentRunExecutor {
                 log.warn("Failed to create assistant message for runId={}, but continuing: {}", runId, e.getMessage());
             }
 
-            creditService.recordRunConsumeLedger(runId, userId, totalCreditsConsumed);
+            creditSettlementService.settleAsync(runId, userId);
             stateStore.markRunStatus(runId, AgentRunStatus.COMPLETED.name());
             return;
         }
@@ -571,6 +595,43 @@ public class AgentRunExecutor {
                 "tool_calls_used", result.getToolCallsUsed()
         ));
         stateStore.markRunStatus(runId, AgentRunStatus.FAILED.name());
+        // 260612-01-02: 失败路径也触发结算（可能已有部分 LLM 调用）
+        try {
+            creditSettlementService.settleAsync(runId, userId);
+        } catch (Exception settleEx) {
+            log.warn("Failed to schedule settlement on failure path: runId={} err={}", runId, settleEx.getMessage());
+        }
+    }
+
+    /**
+     * 260612-01-02: 防御性跑前校验的 admin 旁路。
+     * 从 run.ext 读取 is_admin 标记（admin run）— 与 frontend 的 isAdmin(authentication) 语义一致；
+     * 默认 false（普通用户必校验）。注：admin 用户的 user_type=1127 也可走 creditService.hasPositiveCredit 旁路，
+     * 但本方法以 ext 标记为准，原因是某些 admin 调试场景下 user_type 不一定满足，但 ext 标记会带。
+     */
+    private boolean hasAdminCreditBypass(AgentRun run) {
+        if (run == null || run.getExt() == null || run.getExt().isBlank()) {
+            return false;
+        }
+        try {
+            Map<String, Object> ext = objectMapper.readValue(run.getExt(), Map.class);
+            Object v = ext.get("is_admin");
+            if (v == null) {
+                v = ext.get("isAdmin");
+            }
+            if (v instanceof Boolean boolVal) {
+                return boolVal;
+            }
+            if (v instanceof Number num) {
+                return num.intValue() != 0;
+            }
+            if (v != null) {
+                return Boolean.parseBoolean(String.valueOf(v));
+            }
+        } catch (Exception e) {
+            // ignore parse failure, treat as non-admin
+        }
+        return false;
     }
 
     private void enrichOpenRouterCosts(String runId, String endpointName, String endpointBaseUrl) {

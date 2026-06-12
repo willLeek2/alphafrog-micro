@@ -7,12 +7,15 @@ import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agent.platform.service.AgentCreditService;
 import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agentlangchain.orchestration.LangchainLinearRunPipeline;
 import world.willfrog.agentlangchain.orchestration.LangchainRunConcurrencyScheduler;
 import world.willfrog.agentlangchain.routing.LangchainSingleWriterGuard;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage;
 import world.willfrog.alphafrogmicro.agent.idl.CreateAgentRunRequest;
+import world.willfrog.alphafrogmicro.common.dao.user.UserDao;
+import world.willfrog.alphafrogmicro.common.pojo.user.User;
 
 import java.util.Map;
 
@@ -21,11 +24,15 @@ import java.util.Map;
 @Slf4j
 public class AgentLangchainRunService {
 
+    private static final int ADMIN_USER_TYPE = 1127;
+
     private final ObjectProvider<AgentEventService> eventServiceProvider;
     private final ObjectProvider<LangchainLinearRunPipeline> linearRunPipelineProvider;
     private final LangchainRunConcurrencyScheduler runConcurrencyScheduler;
     private final AgentRunMapper runMapper;
     private final LangchainSingleWriterGuard singleWriterGuard;
+    private final AgentCreditService creditService;
+    private final UserDao userDao;
 
     public AgentRunMessage createRun(CreateAgentRunRequest request) {
         String userId = request.getUserId();
@@ -35,6 +42,9 @@ public class AgentLangchainRunService {
         String message = request.getMessage();
         if (message == null || message.isBlank()) {
             throw new IllegalArgumentException("message is required");
+        }
+        if (!isAdminUser(userId) && !creditService.hasPositiveCredit(userId)) {
+            throw new IllegalStateException("credit 余额不足，无法创建新任务");
         }
 
         AgentEventService eventService = eventServiceProvider.getIfAvailable();
@@ -60,7 +70,8 @@ public class AgentLangchainRunService {
                     request.getProvider(),
                     request.getPlannerCandidateCount(),
                     request.getDebugMode(),
-                    request.getStageConfigJson()
+                    request.getStageConfigJson(),
+                    isAdminUser(userId)
             );
 
             run = singleWriterGuard.markLangchainOwner(run);
@@ -82,6 +93,17 @@ public class AgentLangchainRunService {
             }
             throw e;
         }
+    }
+
+    private boolean isAdminUser(String userId) {
+        Long userIdLong;
+        try {
+            userIdLong = Long.parseLong(userId.trim());
+        } catch (Exception e) {
+            return false;
+        }
+        User user = userDao.getUserById(userIdLong);
+        return user != null && user.getUserType() != null && user.getUserType() == ADMIN_USER_TYPE;
     }
 
     private void markEnqueueFailed(AgentEventService eventService, AgentRun run, RuntimeException error) {

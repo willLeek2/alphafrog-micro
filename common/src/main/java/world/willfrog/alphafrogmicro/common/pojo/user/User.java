@@ -5,6 +5,7 @@ import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
 
+import java.math.BigDecimal;
 import java.time.OffsetDateTime;
 
 @Entity
@@ -37,7 +38,7 @@ public class User {
 
     private Integer userLevel;
 
-    private Integer credit;
+    private BigDecimal credit;
 
     private String status;
 
@@ -46,4 +47,12 @@ public class User {
     private String disabledReason;
 
     private OffsetDateTime statusUpdatedAt;
+
+    public void setCredit(BigDecimal credit) {
+        this.credit = credit;
+    }
+
+    public void setCredit(Integer credit) {
+        this.credit = credit == null ? null : BigDecimal.valueOf(credit);
+    }
 }

@@ -19,6 +19,7 @@ import world.willfrog.alphafrogmicro.common.dao.agent.AdminAuditLogDao;
 import world.willfrog.alphafrogmicro.common.dao.agent.AdminIdempotencyDao;
 import world.willfrog.alphafrogmicro.common.dao.agent.AgentCreditApplicationDao;
 import world.willfrog.alphafrogmicro.common.dao.agent.AgentCreditLedgerDao;
+import world.willfrog.alphafrogmicro.common.dao.agent.AgentCreditRechargeDao;
 import world.willfrog.alphafrogmicro.common.dao.admin.AdminDataOverviewCacheDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.common.DataOverviewDao;
 import world.willfrog.alphafrogmicro.common.dao.user.UserDao;
@@ -26,9 +27,12 @@ import world.willfrog.alphafrogmicro.common.pojo.agent.AdminAuditLog;
 import world.willfrog.alphafrogmicro.common.pojo.agent.AdminIdempotency;
 import world.willfrog.alphafrogmicro.common.pojo.agent.AgentCreditApplication;
 import world.willfrog.alphafrogmicro.common.pojo.agent.AgentCreditLedger;
+import world.willfrog.alphafrogmicro.common.pojo.agent.AgentCreditRecharge;
 import world.willfrog.alphafrogmicro.common.pojo.admin.AdminDataOverviewCache;
 import world.willfrog.alphafrogmicro.common.pojo.user.User;
 
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.OffsetDateTime;
@@ -71,6 +75,10 @@ public class AdminServiceImpl extends AdminServiceImplBase {
     private static final String IDEM_STATUS_PROCESSING = "PROCESSING";
     private static final String IDEM_STATUS_COMPLETED = "COMPLETED";
     private static final String SOURCE_TYPE_CREDIT_APPLICATION = "CREDIT_APPLICATION";
+    private static final String TARGET_CREDIT_RECHARGE = "CREDIT_RECHARGE";
+    private static final String ACTION_ADD_USER_CREDIT = "ADD_USER_CREDIT";
+    private static final String BIZ_TYPE_ADMIN_CREDIT_ADD = "ADMIN_CREDIT_ADD";
+    private static final String SOURCE_TYPE_ADMIN_CREDIT_RECHARGE = "ADMIN_CREDIT_RECHARGE";
 
     private final UserDao userDao;
     private final DataOverviewDao dataOverviewDao;
@@ -78,6 +86,8 @@ public class AdminServiceImpl extends AdminServiceImplBase {
     private final PasswordEncoder passwordEncoder;
     private final AgentCreditApplicationDao creditApplicationDao;
     private final AgentCreditLedgerDao creditLedgerDao;
+    private final AgentCreditRechargeDao creditRechargeDao;
+    private final AdminCreditExchangeRateService exchangeRateService;
     private final AdminAuditLogDao adminAuditLogDao;
     private final AdminIdempotencyDao adminIdempotencyDao;
     private final TransactionTemplate transactionTemplate;
@@ -92,6 +102,8 @@ public class AdminServiceImpl extends AdminServiceImplBase {
                             PasswordEncoder passwordEncoder,
                             AgentCreditApplicationDao creditApplicationDao,
                             AgentCreditLedgerDao creditLedgerDao,
+                            AgentCreditRechargeDao creditRechargeDao,
+                            AdminCreditExchangeRateService exchangeRateService,
                             AdminAuditLogDao adminAuditLogDao,
                             AdminIdempotencyDao adminIdempotencyDao,
                             PlatformTransactionManager transactionManager) {
@@ -101,6 +113,8 @@ public class AdminServiceImpl extends AdminServiceImplBase {
         this.passwordEncoder = passwordEncoder;
         this.creditApplicationDao = creditApplicationDao;
         this.creditLedgerDao = creditLedgerDao;
+        this.creditRechargeDao = creditRechargeDao;
+        this.exchangeRateService = exchangeRateService;
         this.adminAuditLogDao = adminAuditLogDao;
         this.adminIdempotencyDao = adminIdempotencyDao;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
@@ -153,7 +167,7 @@ public class AdminServiceImpl extends AdminServiceImplBase {
                 .setEmail(nvl(user.getEmail()))
                 .setUserType(userType)
                 .setUserLevel(user.getUserLevel() == null ? 0 : user.getUserLevel())
-                .setCredit(user.getCredit() == null ? 0 : user.getCredit())
+                .setCredit(safeInt(user.getCredit()))
                 .setRegisterTime(user.getRegisterTime() == null ? 0 : user.getRegisterTime());
 
         return AdminLoginResponse.newBuilder()
@@ -433,6 +447,10 @@ public class AdminServiceImpl extends AdminServiceImplBase {
                         .setIdempotencyKey(nvl(ledger.getIdempotencyKey()))
                         .setExt(nvl(ledger.getExt()))
                         .setCreatedAt(toDateString(ledger.getCreatedAt()))
+                        .setReason(nvl(ledger.getReason()))
+                        .setDeltaDecimal(decimalString(ledger.getDelta()))
+                        .setBalanceBeforeDecimal(decimalString(ledger.getBalanceBefore()))
+                        .setBalanceAfterDecimal(decimalString(ledger.getBalanceAfter()))
                         .build());
             }
             return builder.build();
@@ -755,6 +773,7 @@ public class AdminServiceImpl extends AdminServiceImplBase {
         ledger.setSourceId(applicationId);
         ledger.setOperatorId(adminId);
         ledger.setIdempotencyKey(idempotencyKey);
+        ledger.setReason(processReason);
         ledger.setExt("{}");
         creditLedgerDao.insertIgnoreDuplicate(ledger);
 
@@ -1033,8 +1052,30 @@ public class AdminServiceImpl extends AdminServiceImplBase {
         return normalized.isEmpty() ? null : normalized;
     }
 
-    private int safeInt(Integer value) {
-        return value == null ? 0 : value;
+    private int safeInt(Number value) {
+        return value == null ? 0 : value.intValue();
+    }
+
+    private BigDecimal zeroIfNull(BigDecimal value) {
+        return value == null ? BigDecimal.ZERO.setScale(6, RoundingMode.HALF_UP) : value.setScale(6, RoundingMode.HALF_UP);
+    }
+
+    private BigDecimal parseMoney(String value) {
+        if (isBlank(value)) {
+            return null;
+        }
+        try {
+            return new BigDecimal(value.trim()).setScale(6, RoundingMode.HALF_UP);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private String decimalString(BigDecimal value) {
+        if (value == null) {
+            return "0";
+        }
+        return value.stripTrailingZeros().toPlainString();
     }
 
     private int toInt(Object value) {
@@ -1429,6 +1470,129 @@ public class AdminServiceImpl extends AdminServiceImplBase {
     // ========== 用户额度直接调整 ==========
 
     @Override
+    public AddUserCreditResponse addUserCredit(AddUserCreditRequest request) {
+        String userId = nvl(request.getUserId()).trim();
+        String username = nvl(request.getUsername()).trim();
+        String currency = nvl(request.getCurrency()).trim().toUpperCase(Locale.ROOT);
+        String amountText = nvl(request.getAmount()).trim();
+        String reason = nvl(request.getReason()).trim();
+        String operatorId = nvl(request.getOperatorId()).trim();
+        String idempotencyKey = nvl(request.getIdempotencyKey()).trim();
+
+        if ((userId.isBlank() && username.isBlank()) || (!userId.isBlank() && !username.isBlank())) {
+            return AddUserCreditResponse.newBuilder()
+                    .setSuccess(false)
+                    .setErrorCode(ERROR_INVALID_ARGUMENT)
+                    .setMessage("exactly one of userId/username is required")
+                    .build();
+        }
+        if (!"USD".equals(currency) && !"CNY".equals(currency)) {
+            return AddUserCreditResponse.newBuilder()
+                    .setSuccess(false)
+                    .setErrorCode(ERROR_INVALID_ARGUMENT)
+                    .setMessage("currency should be USD or CNY")
+                    .build();
+        }
+        BigDecimal originalAmount = parseMoney(amountText);
+        if (originalAmount == null || originalAmount.compareTo(BigDecimal.ZERO) <= 0) {
+            return AddUserCreditResponse.newBuilder()
+                    .setSuccess(false)
+                    .setErrorCode(ERROR_INVALID_ARGUMENT)
+                    .setMessage("amount should be a positive decimal")
+                    .build();
+        }
+        if (isBlank(reason) || isBlank(operatorId) || isBlank(idempotencyKey)) {
+            return AddUserCreditResponse.newBuilder()
+                    .setSuccess(false)
+                    .setErrorCode(ERROR_INVALID_ARGUMENT)
+                    .setMessage("reason/operatorId/idempotencyKey are required")
+                    .build();
+        }
+
+        User user = resolveTargetUser(userId, username);
+        if (user == null || user.getUserId() == null) {
+            return AddUserCreditResponse.newBuilder()
+                    .setSuccess(false)
+                    .setErrorCode(ERROR_NOT_FOUND)
+                    .setMessage("User not found")
+                    .build();
+        }
+        String resolvedUserId = String.valueOf(user.getUserId());
+        String resolvedUsername = nvl(user.getUsername());
+        BigDecimal exchangeRateToUsd;
+        try {
+            exchangeRateToUsd = exchangeRateService.exchangeRateToUsd(currency);
+        } catch (Exception e) {
+            return AddUserCreditResponse.newBuilder()
+                    .setSuccess(false)
+                    .setErrorCode(ERROR_INVALID_ARGUMENT)
+                    .setMessage(e.getMessage())
+                    .build();
+        }
+        BigDecimal creditAmount = originalAmount.multiply(exchangeRateToUsd).setScale(6, RoundingMode.HALF_UP);
+        if (creditAmount.compareTo(BigDecimal.ZERO) <= 0) {
+            return AddUserCreditResponse.newBuilder()
+                    .setSuccess(false)
+                    .setErrorCode(ERROR_INVALID_ARGUMENT)
+                    .setMessage("credit amount is zero after currency conversion")
+                    .build();
+        }
+
+        String requestHash = sha256Hex(resolvedUserId + "|" + currency + "|" + decimalString(originalAmount)
+                + "|" + decimalString(exchangeRateToUsd) + "|" + decimalString(creditAmount) + "|" + reason);
+        int inserted = adminIdempotencyDao.insertProcessing(
+                operatorId,
+                ACTION_ADD_USER_CREDIT,
+                resolvedUserId,
+                idempotencyKey,
+                requestHash,
+                IDEM_STATUS_PROCESSING,
+                "{}"
+        );
+        AdminIdempotency idemRecord = adminIdempotencyDao.find(operatorId, ACTION_ADD_USER_CREDIT, resolvedUserId, idempotencyKey);
+        if (idemRecord == null) {
+            return AddUserCreditResponse.newBuilder()
+                    .setSuccess(false)
+                    .setErrorCode(ERROR_INTERNAL)
+                    .setMessage("Failed to create idempotency record")
+                    .build();
+        }
+        if (inserted <= 0) {
+            return handleAddUserCreditIdempotentReplay(idemRecord, requestHash);
+        }
+
+        AddUserCreditResponse response;
+        try {
+            response = transactionTemplate.execute(status -> addUserCreditInTransaction(
+                    resolvedUserId,
+                    resolvedUsername,
+                    currency,
+                    originalAmount,
+                    exchangeRateToUsd,
+                    creditAmount,
+                    reason,
+                    operatorId,
+                    idempotencyKey));
+            if (response == null) {
+                response = AddUserCreditResponse.newBuilder()
+                        .setSuccess(false)
+                        .setErrorCode(ERROR_INTERNAL)
+                        .setMessage("Empty transaction result")
+                        .build();
+            }
+        } catch (Exception e) {
+            log.error("Failed to add user credit: userId={}, currency={}, amount={}", resolvedUserId, currency, amountText, e);
+            response = AddUserCreditResponse.newBuilder()
+                    .setSuccess(false)
+                    .setErrorCode(ERROR_INTERNAL)
+                    .setMessage("Failed to add credit: " + e.getMessage())
+                    .build();
+        }
+        adminIdempotencyDao.markCompleted(idemRecord.getId(), IDEM_STATUS_COMPLETED, serializeAddUserCreditResponse(response));
+        return response;
+    }
+
+    @Override
     public AdjustUserCreditResponse adjustUserCredit(AdjustUserCreditRequest request) {
         String userId = request.getUserId();
         int delta = request.getDelta();
@@ -1532,6 +1696,7 @@ public class AdminServiceImpl extends AdminServiceImplBase {
             ledger.setSourceId("");
             ledger.setOperatorId(operatorId);
             ledger.setIdempotencyKey(idempotencyKey);
+            ledger.setReason(reason);
             ledger.setExt(toJson(Map.of("reason", reason)));
             creditLedgerDao.insertIgnoreDuplicate(ledger);
 
@@ -1567,6 +1732,207 @@ public class AdminServiceImpl extends AdminServiceImplBase {
                     .setSuccess(false)
                     .setErrorCode(ERROR_INTERNAL)
                     .setMessage("Failed to adjust credit: " + e.getMessage())
+                    .build();
+        }
+    }
+
+    private AddUserCreditResponse addUserCreditInTransaction(String userId,
+                                                             String username,
+                                                             String currency,
+                                                             BigDecimal originalAmount,
+                                                             BigDecimal exchangeRateToUsd,
+                                                             BigDecimal creditAmount,
+                                                             String reason,
+                                                             String operatorId,
+                                                             String idempotencyKey) {
+        Long userIdLong = Long.parseLong(userId);
+        User lockedUser = userDao.getUserByIdForUpdate(userIdLong);
+        if (lockedUser == null) {
+            return AddUserCreditResponse.newBuilder()
+                    .setSuccess(false)
+                    .setErrorCode(ERROR_NOT_FOUND)
+                    .setMessage("User not found")
+                    .build();
+        }
+        BigDecimal balanceBefore = zeroIfNull(lockedUser.getCredit());
+        int affected = userDao.increaseCreditByUserIdDecimal(userIdLong, creditAmount);
+        if (affected <= 0) {
+            throw new IllegalStateException("Failed to increase user credit");
+        }
+        BigDecimal balanceAfter = balanceBefore.add(creditAmount).setScale(6, RoundingMode.HALF_UP);
+
+        String ledgerId = generateId();
+        String rechargeId = generateId();
+        Map<String, Object> ext = new HashMap<>();
+        ext.put("currency", currency);
+        ext.put("originalAmount", decimalString(originalAmount));
+        ext.put("exchangeRateToUsd", decimalString(exchangeRateToUsd));
+        ext.put("creditAmount", decimalString(creditAmount));
+        ext.put("rechargeId", rechargeId);
+
+        AgentCreditLedger ledger = new AgentCreditLedger();
+        ledger.setLedgerId(ledgerId);
+        ledger.setUserId(userId);
+        ledger.setBizType(BIZ_TYPE_ADMIN_CREDIT_ADD);
+        ledger.setDelta(creditAmount);
+        ledger.setBalanceBefore(balanceBefore);
+        ledger.setBalanceAfter(balanceAfter);
+        ledger.setSourceType(SOURCE_TYPE_ADMIN_CREDIT_RECHARGE);
+        ledger.setSourceId(rechargeId);
+        ledger.setOperatorId(operatorId);
+        ledger.setIdempotencyKey(idempotencyKey);
+        ledger.setReason(reason);
+        ledger.setExt(toJson(ext));
+        creditLedgerDao.insertIgnoreDuplicate(ledger);
+
+        AgentCreditRecharge recharge = new AgentCreditRecharge();
+        recharge.setRechargeId(rechargeId);
+        recharge.setLedgerId(ledgerId);
+        recharge.setUserId(userId);
+        recharge.setUsername(username);
+        recharge.setOperatorId(operatorId);
+        recharge.setCurrency(currency);
+        recharge.setOriginalAmount(originalAmount);
+        recharge.setExchangeRateToUsd(exchangeRateToUsd);
+        recharge.setCreditAmount(creditAmount);
+        recharge.setReason(reason);
+        recharge.setIdempotencyKey(idempotencyKey);
+        recharge.setExt(toJson(ext));
+        creditRechargeDao.insertIgnoreDuplicate(recharge);
+
+        String auditId = generateId();
+        Map<String, Object> before = Map.of(
+                "userId", userId,
+                "username", username,
+                "credit", decimalString(balanceBefore)
+        );
+        Map<String, Object> after = new HashMap<>(ext);
+        after.put("userId", userId);
+        after.put("username", username);
+        after.put("balanceBefore", decimalString(balanceBefore));
+        after.put("balanceAfter", decimalString(balanceAfter));
+        after.put("ledgerId", ledgerId);
+        after.put("rechargeId", rechargeId);
+        insertAudit(
+                auditId,
+                operatorId,
+                ACTION_ADD_USER_CREDIT,
+                TARGET_CREDIT_RECHARGE,
+                rechargeId,
+                toJson(before),
+                toJson(after),
+                reason,
+                idempotencyKey
+        );
+
+        return AddUserCreditResponse.newBuilder()
+                .setSuccess(true)
+                .setErrorCode(ERROR_OK)
+                .setMessage("Credit added successfully")
+                .setUserId(userId)
+                .setUsername(username)
+                .setCurrency(currency)
+                .setOriginalAmount(decimalString(originalAmount))
+                .setExchangeRateToUsd(decimalString(exchangeRateToUsd))
+                .setCreditAmount(decimalString(creditAmount))
+                .setBalanceBefore(decimalString(balanceBefore))
+                .setBalanceAfter(decimalString(balanceAfter))
+                .setLedgerId(ledgerId)
+                .setRechargeId(rechargeId)
+                .setAuditId(auditId)
+                .setIdempotentReplay(false)
+                .setIdempotencyKey(idempotencyKey)
+                .build();
+    }
+
+    private User resolveTargetUser(String userId, String username) {
+        if (!isBlank(userId)) {
+            try {
+                return userDao.getUserById(Long.parseLong(userId.trim()));
+            } catch (Exception e) {
+                return null;
+            }
+        }
+        List<User> users = userDao.getUserByUsername(username);
+        return users.isEmpty() ? null : users.get(0);
+    }
+
+    private AddUserCreditResponse handleAddUserCreditIdempotentReplay(AdminIdempotency record, String requestHash) {
+        if (!requestHash.equals(nvl(record.getRequestHash()))) {
+            return AddUserCreditResponse.newBuilder()
+                    .setSuccess(false)
+                    .setErrorCode(ERROR_INVALID_ARGUMENT)
+                    .setMessage("Idempotency key conflicts with another payload")
+                    .build();
+        }
+        if (!IDEM_STATUS_COMPLETED.equalsIgnoreCase(record.getStatus())) {
+            return AddUserCreditResponse.newBuilder()
+                    .setSuccess(false)
+                    .setErrorCode(ERROR_IDEMPOTENCY_IN_PROGRESS)
+                    .setMessage("Another request with same idempotency key is in progress")
+                    .build();
+        }
+        AddUserCreditResponse replay = deserializeAddUserCreditResponse(record.getResponseJson());
+        return replay.toBuilder()
+                .setIdempotentReplay(true)
+                .build();
+    }
+
+    private String serializeAddUserCreditResponse(AddUserCreditResponse response) {
+        Map<String, Object> map = new HashMap<>();
+        map.put("success", response.getSuccess());
+        map.put("message", response.getMessage());
+        map.put("errorCode", response.getErrorCode());
+        map.put("userId", response.getUserId());
+        map.put("username", response.getUsername());
+        map.put("currency", response.getCurrency());
+        map.put("originalAmount", response.getOriginalAmount());
+        map.put("exchangeRateToUsd", response.getExchangeRateToUsd());
+        map.put("creditAmount", response.getCreditAmount());
+        map.put("balanceBefore", response.getBalanceBefore());
+        map.put("balanceAfter", response.getBalanceAfter());
+        map.put("ledgerId", response.getLedgerId());
+        map.put("rechargeId", response.getRechargeId());
+        map.put("auditId", response.getAuditId());
+        map.put("idempotentReplay", response.getIdempotentReplay());
+        map.put("idempotencyKey", response.getIdempotencyKey());
+        return toJson(map);
+    }
+
+    private AddUserCreditResponse deserializeAddUserCreditResponse(String json) {
+        if (isBlank(json)) {
+            return AddUserCreditResponse.newBuilder()
+                    .setSuccess(false)
+                    .setErrorCode(ERROR_INTERNAL)
+                    .setMessage("Empty idempotency response")
+                    .build();
+        }
+        try {
+            Map<String, Object> map = objectMapper.readValue(json, new TypeReference<>() {});
+            return AddUserCreditResponse.newBuilder()
+                    .setSuccess(Boolean.TRUE.equals(map.get("success")))
+                    .setMessage(nvl(map.get("message")))
+                    .setErrorCode(nvl(map.get("errorCode")))
+                    .setUserId(nvl(map.get("userId")))
+                    .setUsername(nvl(map.get("username")))
+                    .setCurrency(nvl(map.get("currency")))
+                    .setOriginalAmount(nvl(map.get("originalAmount")))
+                    .setExchangeRateToUsd(nvl(map.get("exchangeRateToUsd")))
+                    .setCreditAmount(nvl(map.get("creditAmount")))
+                    .setBalanceBefore(nvl(map.get("balanceBefore")))
+                    .setBalanceAfter(nvl(map.get("balanceAfter")))
+                    .setLedgerId(nvl(map.get("ledgerId")))
+                    .setRechargeId(nvl(map.get("rechargeId")))
+                    .setAuditId(nvl(map.get("auditId")))
+                    .setIdempotentReplay(Boolean.TRUE.equals(map.get("idempotentReplay")))
+                    .setIdempotencyKey(nvl(map.get("idempotencyKey")))
+                    .build();
+        } catch (Exception e) {
+            log.error("Failed to deserialize add credit response", e);
+            return AddUserCreditResponse.newBuilder()
+                    .setSuccess(false)
+                    .setErrorCode(ERROR_INTERNAL)
+                    .setMessage("Broken idempotency response")
                     .build();
         }
     }

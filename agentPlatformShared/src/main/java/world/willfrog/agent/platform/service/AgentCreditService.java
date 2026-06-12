@@ -17,6 +17,7 @@ import world.willfrog.alphafrogmicro.common.pojo.user.User;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.time.temporal.ChronoUnit;
+import java.math.BigDecimal;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -47,7 +48,7 @@ public class AgentCreditService {
         if (user == null) {
             throw new IllegalArgumentException("user not found");
         }
-        int totalCredits = Math.max(0, user.getCredit() == null ? 0 : user.getCredit());
+        int totalCredits = Math.max(0, decimalToInt(user.getCredit()));
         int usedCredits = Math.max(0, runMapper.sumCompletedCreditsByUser(userId));
         int remainingCredits = Math.max(0, totalCredits - usedCredits);
         String nextResetAt = nextResetAt();
@@ -158,7 +159,7 @@ public class AgentCreditService {
         if (user == null) {
             return;
         }
-        int totalCredits = Math.max(0, user.getCredit() == null ? 0 : user.getCredit());
+        int totalCredits = Math.max(0, decimalToInt(user.getCredit()));
         int usedCreditsAfter = Math.max(0, runMapper.sumCompletedCreditsByUser(userId));
         int balanceAfter = Math.max(0, totalCredits - usedCreditsAfter);
         int balanceBefore = Math.max(0, balanceAfter + totalCreditsConsumed);
@@ -174,8 +175,26 @@ public class AgentCreditService {
         ledger.setSourceId(runId);
         ledger.setOperatorId("");
         ledger.setIdempotencyKey("");
+        ledger.setReason("legacy_run_consume");
         ledger.setExt("{}");
         creditLedgerDao.insertIgnoreDuplicate(ledger);
+    }
+
+    public BigDecimal currentCreditBalance(String userId) {
+        Long userIdLong = parseUserId(userId);
+        BigDecimal ledgerBalance = creditLedgerDao.latestBalanceByUserId(userId);
+        if (ledgerBalance != null) {
+            return ledgerBalance.max(BigDecimal.ZERO);
+        }
+        User user = userDao.getUserById(userIdLong);
+        if (user == null || user.getCredit() == null) {
+            return BigDecimal.ZERO;
+        }
+        return user.getCredit().max(BigDecimal.ZERO);
+    }
+
+    public boolean hasPositiveCredit(String userId) {
+        return currentCreditBalance(userId).compareTo(BigDecimal.ZERO) > 0;
     }
 
     private boolean extractCacheHit(Map<String, Object> payload) {
@@ -318,6 +337,10 @@ public class AgentCreditService {
 
     private String nvl(String value) {
         return value == null ? "" : value;
+    }
+
+    private int decimalToInt(BigDecimal value) {
+        return value == null ? 0 : value.intValue();
     }
 
     /**

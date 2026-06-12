@@ -4,7 +4,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.ObjectProvider;
 import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.service.AgentCreditService;
 import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
 
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -37,7 +39,9 @@ class LangchainLinearRunPipelineAsyncTest {
                 mock(LangchainFollowUpContextSupport.class),
                 mock(world.willfrog.agent.platform.service.AgentMessageService.class),
                 mock(LangchainRunExecutionGuard.class),
-                immediateScheduler()
+                immediateScheduler(),
+                mock(AgentCreditService.class),
+                mock(AgentRunCreditSettlementService.class)
         ) {
             @Override
             void executeRun(AgentRun initialRun) {

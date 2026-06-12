@@ -37,6 +37,8 @@ import world.willfrog.alphafrogmicro.agent.idl.GetAgentCreditsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentCreditsResponse;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCostRequest;
+import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCreditsRequest;
+import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCreditsResponse;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunResultRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunStatusRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentConfigResponse;
@@ -92,6 +94,8 @@ public class AgentDubboServiceImpl extends DubboAgentDubboServiceTriple.AgentDub
     private final AgentModelCatalogService modelCatalogService;
     private final AgentCreditService creditService;
     private final AgentRunCostService runCostService;
+    private final AgentRunCreditSettlementService creditSettlementService;
+    private final AgentRunCreditQueryService runCreditQueryService;
     private final UserDao userDao;
     private final ObjectMapper objectMapper;
     private final AgentMessageService messageService;
@@ -130,7 +134,10 @@ public class AgentDubboServiceImpl extends DubboAgentDubboServiceTriple.AgentDub
         if (userId == null || userId.isBlank()) {
             throw new IllegalArgumentException("user_id is required");
         }
-        ensureUserActive(userId);
+        User creator = ensureUserActive(userId);
+        if (!isAdminUser(creator) && !creditService.hasPositiveCredit(userId)) {
+            throw new IllegalStateException("credit 余额不足，无法创建新任务");
+        }
         String message = request.getMessage();
         if (message == null || message.isBlank()) {
             throw new IllegalArgumentException("message is required");
@@ -147,7 +154,8 @@ public class AgentDubboServiceImpl extends DubboAgentDubboServiceTriple.AgentDub
                 request.getProvider(),
                 request.getPlannerCandidateCount(),
                 request.getDebugMode(),
-                request.getStageConfigJson()
+                request.getStageConfigJson(),
+                isAdminUser(creator)
         );
         enqueueRunExecution(run.getId(), userId);
         return toRunMessage(run);
@@ -372,7 +380,7 @@ public class AgentDubboServiceImpl extends DubboAgentDubboServiceTriple.AgentDub
         
         eventService.append(runId, userId, "CANCELED", Map.of("run_id", runId));
         stateStore.markRunStatus(runId, AgentRunStatus.CANCELED.name());
-        
+        creditSettlementService.settleAsync(runId, userId);
         log.info("Canceling run {}: completed successfully", runId);
         return toRunMessage(requireRun(runId, userId));
     }
@@ -497,6 +505,14 @@ public class AgentDubboServiceImpl extends DubboAgentDubboServiceTriple.AgentDub
         AgentRun run = requireRun(request.getId(), request.getUserId());
         String observabilityJson = nvl(observabilityService.loadObservabilityJson(run.getId(), run.getSnapshotJson()));
         return runCostService.buildAndPersist(run, observabilityJson);
+    }
+
+    @Override
+    public GetAgentRunCreditsResponse getRunCredits(GetAgentRunCreditsRequest request) {
+        AgentRun run = request.getIsAdmin()
+                ? requireRunForAdmin(request.getId())
+                : requireRun(request.getId(), request.getUserId());
+        return runCreditQueryService.build(run);
     }
 
     /**
@@ -913,6 +929,17 @@ public class AgentDubboServiceImpl extends DubboAgentDubboServiceTriple.AgentDub
         return markExpiredIfNeeded(run);
     }
 
+    private AgentRun requireRunForAdmin(String id) {
+        if (id == null || id.isBlank()) {
+            throw new IllegalArgumentException("id is required");
+        }
+        AgentRun run = runMapper.findById(id);
+        if (run == null) {
+            throw new IllegalArgumentException("run not found");
+        }
+        return markExpiredIfNeeded(run);
+    }
+
     private AgentRun markExpiredIfNeeded(AgentRun run) {
         if (run == null) {
             return null;
@@ -1191,7 +1218,7 @@ public class AgentDubboServiceImpl extends DubboAgentDubboServiceTriple.AgentDub
         }
     }
 
-    private void ensureUserActive(String userId) {
+    private User ensureUserActive(String userId) {
         Long userIdLong;
         try {
             userIdLong = Long.parseLong(userId.trim());
@@ -1204,11 +1231,16 @@ public class AgentDubboServiceImpl extends DubboAgentDubboServiceTriple.AgentDub
         }
         String status = user.getStatus();
         if (status == null || status.isBlank()) {
-            return;
+            return user;
         }
         if (!"ACTIVE".equalsIgnoreCase(status.trim())) {
             throw new IllegalStateException("user disabled");
         }
+        return user;
+    }
+
+    private boolean isAdminUser(User user) {
+        return user != null && user.getUserType() != null && user.getUserType() == 1127;
     }
 
     /**

@@ -113,6 +113,8 @@ def main() -> int:
         )
         if not args.no_tui:
             renderer.finish(state.snapshot())
+        if run_id:
+            _print_credits_summary(cfg, client, run_id, interrupted, debug)
 
     snap = state.snapshot()
     if exit_code:
@@ -193,6 +195,42 @@ def _render(args: argparse.Namespace, renderer: TerminalRenderer, state: RunView
 def _print_event_line(event_type: str, trace: list[str]) -> None:
     summary = trace[-1] if trace else event_type
     print(f"{event_type}: {summary}")
+
+
+def _print_credits_summary(
+    cfg: LightClientConfig,
+    client: AgentHttpClient,
+    run_id: str,
+    interrupted: bool,
+    debug: DebugRunLogger,
+) -> None:
+    if interrupted:
+        return
+    try:
+        credits = client.get_run_credits(
+            cfg.credits_endpoint_template,
+            run_id,
+            timeout=cfg.credits_fetch_timeout_seconds,
+        )
+    except Exception as exc:
+        debug.write_json("credits_error.json", {"error": str(exc), "type": type(exc).__name__})
+        print(f"[credits] 查询失败: {exc}")
+        return
+    debug.write_json("credits.json", credits)
+    summary = credits.get("summary") or {}
+    total = credits.get("totalCredits") or summary.get("totalCredits") or "0"
+    currency = credits.get("currency") or summary.get("currency") or "USD"
+    immediate = summary.get("immediateCount") or 0
+    delayed = summary.get("delayedCount") or 0
+    pending = summary.get("pendingCount") or 0
+    missing = summary.get("missingCount") or 0
+    total_calls = summary.get("totalCallCount") or 0
+    settled_calls = int(immediate) + int(delayed)
+    print(
+        f"[credits] 本次 run 消耗 {total} {currency} "
+        f"(settlement: {settled_calls} settled = {immediate} immediate + {delayed} delayed; "
+        f"{pending} pending; {missing} missing; total calls {total_calls})"
+    )
 
 
 if __name__ == "__main__":

@@ -26,6 +26,8 @@ import world.willfrog.alphafrogmicro.agent.idl.DownloadAgentArtifactRequest;
 import world.willfrog.alphafrogmicro.agent.idl.DownloadAgentArtifactResponse;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCostRequest;
+import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCreditsRequest;
+import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCreditsResponse;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunStatusRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentSnapshotPartRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentSnapshotPartsRequest;
@@ -59,6 +61,7 @@ import world.willfrog.alphafrogmicro.frontend.model.agent.AgentRunEventsPageResp
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentRunResumeRequest;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentRunResponse;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentRunCostResponse;
+import world.willfrog.alphafrogmicro.frontend.model.agent.AgentRunCreditsResponse;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentRunResultResponse;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentRunListItemResponse;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentRunListResponse;
@@ -79,6 +82,7 @@ import world.willfrog.alphafrogmicro.frontend.service.agent.AgentCallDetailBlobR
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentCallDetailMapper;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentRunResultCacheService;
 
+import java.math.BigDecimal;
 import java.util.Optional;
 
 import java.nio.charset.StandardCharsets;
@@ -159,6 +163,10 @@ public class AgentController {
         if (!authService.isUserActive(user)) {
             return ResponseWrapper.error(ResponseCode.FORBIDDEN, "账号已被禁用，无法创建新任务");
         }
+        boolean admin = isAdmin(authentication);
+        if (!admin && !hasPositiveCredit(user)) {
+            return ResponseWrapper.error(ResponseCode.FORBIDDEN, "credit 余额不足，无法创建新任务");
+        }
         if (request == null || request.message() == null || request.message().isBlank()) {
             return ResponseWrapper.paramError("message 不能为空");
         }
@@ -174,7 +182,6 @@ public class AgentController {
             String modelName = nvl(request.modelName());
             String endpointName = nvl(request.endpointName());
             Integer plannerCandidateCount = request.plannerCandidateCount();
-            boolean admin = isAdmin(authentication);
             if (request.config() != null) {
                 contextMap.put("config", request.config());
                 ParsedModelSelection modelSelection = parseModelSelection(request.config().model());
@@ -622,6 +629,29 @@ public class AgentController {
             return handleRpcError(e, "查询 agent run cost");
         } catch (Exception e) {
             return handleError(e, "查询 agent run cost");
+        }
+    }
+
+    @GetMapping({AGENT_RUNS + "/{runId}/credits", AGENT_LEGACY_RUNS + "/{runId}/credits"})
+    public ResponseWrapper<AgentRunCreditsResponse> runCredits(Authentication authentication,
+                                                               @PathVariable("runId") String runId) {
+        String userId = resolveUserId(authentication);
+        if (userId == null) {
+            return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
+        }
+        try {
+            GetAgentRunCreditsResponse resp = resolveService().getRunCredits(
+                    GetAgentRunCreditsRequest.newBuilder()
+                            .setUserId(userId)
+                            .setId(runId)
+                            .setIsAdmin(isAdmin(authentication))
+                            .build()
+            );
+            return ResponseWrapper.success(toRunCreditsResponse(resp));
+        } catch (RpcException e) {
+            return handleRpcError(e, "查询 agent run credits");
+        } catch (Exception e) {
+            return handleError(e, "查询 agent run credits");
         }
     }
 
@@ -1398,8 +1428,54 @@ public class AgentController {
         );
     }
 
+    private AgentRunCreditsResponse toRunCreditsResponse(GetAgentRunCreditsResponse resp) {
+        AgentRunCreditsResponse.SettlementSummary summary = null;
+        if (resp.hasSummary()) {
+            var s = resp.getSummary();
+            summary = new AgentRunCreditsResponse.SettlementSummary(
+                    s.getImmediateCount(),
+                    s.getDelayedCount(),
+                    s.getPendingCount(),
+                    s.getMissingCount(),
+                    s.getTotalCallCount(),
+                    emptyToNull(s.getCurrency()),
+                    emptyToNull(s.getTotalCredits()),
+                    emptyToNull(s.getLastSettlementAt())
+            );
+        }
+        return new AgentRunCreditsResponse(
+                emptyToNull(resp.getRunId()),
+                emptyToNull(resp.getOwnerUserId()),
+                emptyToNull(resp.getTotalCredits()),
+                emptyToNull(resp.getCurrency()),
+                resp.getRecordsList().stream()
+                        .map(rec -> new AgentRunCreditsResponse.CallRecord(
+                                emptyToNull(rec.getCallId()),
+                                emptyToNull(rec.getPhase()),
+                                emptyToNull(rec.getTodoId()),
+                                emptyToNull(rec.getEndpoint()),
+                                emptyToNull(rec.getModel()),
+                                emptyToNull(rec.getCostSource()),
+                                emptyToNull(rec.getCurrency()),
+                                emptyToNull(rec.getCostAmount()),
+                                emptyToNull(rec.getCreditDelta()),
+                                rec.getSettlementAttempt() > 0 ? rec.getSettlementAttempt() : null,
+                                emptyToNull(rec.getSettlementStatus()),
+                                emptyToNull(rec.getReason()),
+                                emptyToNull(rec.getCreatedAt())))
+                        .toList(),
+                summary,
+                emptyToNull(resp.getUpdatedAt())
+        );
+    }
+
     private String nvl(String value) {
         return value == null ? "" : value;
+    }
+
+    private boolean hasPositiveCredit(User user) {
+        BigDecimal credit = user == null ? null : user.getCredit();
+        return credit != null && credit.signum() > 0;
     }
 
     private Object parseJsonOrNull(String json) {

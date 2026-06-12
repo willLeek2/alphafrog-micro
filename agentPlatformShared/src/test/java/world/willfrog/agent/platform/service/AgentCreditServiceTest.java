@@ -17,6 +17,7 @@ import world.willfrog.alphafrogmicro.common.dao.agent.AgentCreditLedgerDao;
 import world.willfrog.alphafrogmicro.common.dao.user.UserDao;
 import world.willfrog.alphafrogmicro.common.pojo.user.User;
 
+import java.math.BigDecimal;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -114,9 +115,10 @@ class AgentCreditServiceTest {
                 ArgumentCaptor.forClass(world.willfrog.alphafrogmicro.common.pojo.agent.AgentCreditLedger.class);
         verify(creditLedgerDao).insertIgnoreDuplicate(captor.capture());
         assertEquals("RUN_CONSUME", captor.getValue().getBizType());
-        assertEquals(-50, captor.getValue().getDelta());
-        assertEquals(800, captor.getValue().getBalanceBefore());
-        assertEquals(750, captor.getValue().getBalanceAfter());
+        assertEquals(BigDecimal.valueOf(-50), captor.getValue().getDelta());
+        assertEquals(BigDecimal.valueOf(800), captor.getValue().getBalanceBefore());
+        assertEquals(BigDecimal.valueOf(750), captor.getValue().getBalanceAfter());
         assertEquals("run-1", captor.getValue().getSourceId());
+        assertEquals("legacy_run_consume", captor.getValue().getReason());
     }
 }

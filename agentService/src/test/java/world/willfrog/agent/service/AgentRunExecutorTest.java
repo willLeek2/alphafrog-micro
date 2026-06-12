@@ -74,6 +74,8 @@ class AgentRunExecutorTest {
     @Mock
     private AgentCreditService creditService;
     @Mock
+    private AgentRunCreditSettlementService creditSettlementService;
+    @Mock
     private TodoPlanner todoPlanner;
     @Mock
     private WorkflowExecutorFactory workflowExecutorFactory;
@@ -109,6 +111,7 @@ class AgentRunExecutorTest {
                 stateStore,
                 observabilityService,
                 creditService,
+                creditSettlementService,
                 todoPlanner,
                 workflowExecutorFactory,
                 messageService,
@@ -141,6 +144,7 @@ class AgentRunExecutorTest {
         lenient().when(aiServiceFactory.buildChatModelWithProviderOrder(any(), any())).thenReturn(chatLanguageModel);
         when(aiServiceFactory.buildChatModelWithProviderOrder(any(), any(), any())).thenReturn(chatLanguageModel);
         lenient().when(creditService.calculateRunTotalCredits(anyString(), anyString(), any())).thenReturn(0);
+        lenient().when(creditService.hasPositiveCredit(anyString())).thenReturn(true);
         lenient().when(workflowExecutorFactory.select(any())).thenReturn(workflowExecutor);
     }
 
@@ -167,7 +171,7 @@ class AgentRunExecutorTest {
 
         verify(runMapper).updateSnapshot(eq("run-ok"), eq("u1"), eq(AgentRunStatus.COMPLETED), anyString(), eq(true), eq(null));
         verify(eventService).append(eq("run-ok"), eq("u1"), eq("WORKFLOW_COMPLETED"), anyMap());
-        verify(creditService).recordRunConsumeLedger(eq("run-ok"), eq("u1"), eq(0));
+        verify(creditSettlementService).settleAsync(eq("run-ok"), eq("u1"));
     }
 
     @Test
