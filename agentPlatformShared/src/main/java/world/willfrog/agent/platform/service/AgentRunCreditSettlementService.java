@@ -585,6 +585,7 @@ public class AgentRunCreditSettlementService {
                 .model(trace.getModel())
                 .generationId(trace.getGenerationId())
                 .actualCostUsd(trace.getActualCost())
+                .upstreamCostUsd(trace.getUpstreamCost())
                 .hasError(trace.isHasError())
                 .build();
     }

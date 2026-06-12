@@ -64,7 +64,7 @@ class EndpointCostAdapterTest {
     @Test
     void openRouterAdapterRequestsDelayedRetryWhenCostMissingOnFirstAttempt() {
         OpenRouterCostService costService = mock(OpenRouterCostService.class);
-        when(costService.fetchTotalCostUsd(anyString(), anyString(), anyString())).thenReturn(Optional.empty());
+        when(costService.fetchBillableCostUsd(anyString(), anyString(), anyString())).thenReturn(Optional.empty());
         OpenRouterEndpointCostAdapter adapter = createOpenRouterAdapter(costService);
 
         LlmCallBillingContext call = LlmCallBillingContext.builder()
@@ -110,7 +110,7 @@ class EndpointCostAdapterTest {
     @Test
     void openRouterAdapterFetchesGenerationCostWhenTraceMissingActualCost() {
         OpenRouterCostService costService = mock(OpenRouterCostService.class);
-        when(costService.fetchTotalCostUsd(eq("gen-abc"), anyString(), anyString()))
+        when(costService.fetchBillableCostUsd(eq("gen-abc"), anyString(), anyString()))
                 .thenReturn(Optional.of(new BigDecimal("0.050000")));
         OpenRouterEndpointCostAdapter adapter = createOpenRouterAdapter(costService);
 
@@ -126,6 +126,46 @@ class EndpointCostAdapterTest {
 
         assertEquals(new BigDecimal("0.050000"), quote.getCreditDelta());
         assertTrue(quote.isCostAvailable());
+    }
+
+    @Test
+    void openRouterAdapterUsesUpstreamCostWhenActualCostIsZero() {
+        OpenRouterEndpointCostAdapter adapter = createOpenRouterAdapter(mock(OpenRouterCostService.class));
+
+        LlmCallBillingContext call = LlmCallBillingContext.builder()
+                .runId("run-1")
+                .callId("call-1")
+                .endpoint("openrouter")
+                .model("gpt-5")
+                .actualCostUsd(0D)
+                .upstreamCostUsd(0.0045588D)
+                .build();
+
+        CostSettlementQuote quote = adapter.quote(call, 1);
+
+        assertEquals(BillingMode.ACTUAL_COST, quote.getBillingMode());
+        assertEquals(CostSource.OPENROUTER_ACTUAL, quote.getCostSource());
+        assertEquals(new BigDecimal("0.004559"), quote.getCreditDelta());
+        assertTrue(quote.isCostAvailable());
+        assertFalse(quote.isNeedsDelayedRetry());
+    }
+
+    @Test
+    void openRouterAdapterPrefersUpstreamCostOverActualCost() {
+        OpenRouterEndpointCostAdapter adapter = createOpenRouterAdapter(mock(OpenRouterCostService.class));
+
+        LlmCallBillingContext call = LlmCallBillingContext.builder()
+                .runId("run-1")
+                .callId("call-1")
+                .endpoint("openrouter")
+                .model("gpt-5")
+                .actualCostUsd(0.0123D)
+                .upstreamCostUsd(0.05D)
+                .build();
+
+        CostSettlementQuote quote = adapter.quote(call, 1);
+
+        assertEquals(new BigDecimal("0.050000"), quote.getCreditDelta());
     }
 
     private OpenRouterEndpointCostAdapter createOpenRouterAdapter(OpenRouterCostService costService) {

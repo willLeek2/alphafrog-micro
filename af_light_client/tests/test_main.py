@@ -13,14 +13,18 @@ that matter for the 260612-01-04 requirement:
 from __future__ import annotations
 
 import io
+import os
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from af_light_client.__main__ import (
+    main,
     _needs_cost_refresh,
     _print_credits_summary,
+    _query_credits_config,
     _resolve_output_dir,
 )
 from af_light_client.config import LightClientConfig
@@ -190,6 +194,50 @@ class ResolveOutputDirTest(unittest.TestCase):
     def test_absolute_path_unchanged(self) -> None:
         path = _resolve_output_dir("/tmp/absolute/dir")
         self.assertEqual(path, Path("/tmp/absolute/dir").resolve())
+
+
+class QueryCreditsConfigTest(unittest.TestCase):
+    @patch.dict(os.environ, {"AF_BASE_URL": "http://env.example", "AF_USERNAME": "eu", "AF_PASSWORD": "ep"}, clear=True)
+    def test_loads_from_environment_when_no_config_file(self) -> None:
+        cfg = _query_credits_config(None)
+        self.assertIsInstance(cfg, LightClientConfig)
+        self.assertEqual(cfg.base_url, "http://env.example")
+        self.assertEqual(cfg.username, "eu")
+        self.assertEqual(cfg.password, "ep")
+
+    def test_loads_config_path_from_output_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "prod.yml"
+            config_path.write_text(
+                "base_url: http://file.example\nusername: fu\npassword: fp\nquestion: q\n",
+                encoding="utf-8",
+            )
+            output_dir = Path(tmp) / "run"
+            output_dir.mkdir()
+            (output_dir / "client_config_path.txt").write_text(str(config_path), encoding="utf-8")
+            cfg = _query_credits_config(output_dir)
+            self.assertEqual(cfg.base_url, "http://file.example")
+            self.assertEqual(cfg.username, "fu")
+            self.assertEqual(cfg.password, "fp")
+
+    def test_raises_clear_error_when_nothing_available(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(ValueError) as ctx:
+                _query_credits_config(None)
+            msg = str(ctx.exception)
+            self.assertIn("--config", msg)
+            self.assertIn("AF_BASE_URL", msg)
+
+
+class MainEntryTest(unittest.TestCase):
+    @patch("sys.stderr", new_callable=io.StringIO)
+    def test_query_credits_without_config_or_env_prints_clean_error(self, stderr: io.StringIO) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            with patch("sys.argv", ["af_light_client", "--query-credits", "--output-dir", "/nonexistent/run"]):
+                exit_code = main()
+        self.assertEqual(exit_code, 2)
+        self.assertIn("[query-credits]", stderr.getvalue())
+        self.assertIn("AF_BASE_URL", stderr.getvalue())
 
 
 if __name__ == "__main__":

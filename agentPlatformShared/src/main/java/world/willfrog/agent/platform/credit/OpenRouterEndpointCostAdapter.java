@@ -48,9 +48,9 @@ public class OpenRouterEndpointCostAdapter implements EndpointCostAdapter {
 
     @Override
     public CostSettlementQuote quote(LlmCallBillingContext call, int settlementAttempt) {
-        Optional<BigDecimal> actualCost = resolveActualCostUsd(call);
-        if (actualCost.isPresent()) {
-            BigDecimal usd = actualCost.get();
+        Optional<BigDecimal> billableCost = resolveBillableCostUsd(call);
+        if (billableCost.isPresent()) {
+            BigDecimal usd = billableCost.get();
             return CostSettlementQuote.builder()
                     .runId(call.getRunId())
                     .callId(call.getCallId())
@@ -105,7 +105,15 @@ public class OpenRouterEndpointCostAdapter implements EndpointCostAdapter {
                 .build();
     }
 
-    private Optional<BigDecimal> resolveActualCostUsd(LlmCallBillingContext call) {
+    /**
+     * Resolve billable USD cost for an OpenRouter call.
+     * Priority (per frog): upstream_inference_cost > 0, then actual/total_cost > 0.
+     * This handles BYOK/provider-order scenarios where total_cost is 0 but upstream cost exists.
+     */
+    private Optional<BigDecimal> resolveBillableCostUsd(LlmCallBillingContext call) {
+        if (call.getUpstreamCostUsd() != null && call.getUpstreamCostUsd() > 0D) {
+            return Optional.of(BigDecimal.valueOf(call.getUpstreamCostUsd()).setScale(6, RoundingMode.HALF_UP));
+        }
         if (call.getActualCostUsd() != null && call.getActualCostUsd() > 0D) {
             return Optional.of(BigDecimal.valueOf(call.getActualCostUsd()).setScale(6, RoundingMode.HALF_UP));
         }
@@ -114,7 +122,7 @@ public class OpenRouterEndpointCostAdapter implements EndpointCostAdapter {
             return Optional.empty();
         }
         OpenRouterCredentials credentials = resolveOpenRouterCredentials();
-        return openRouterCostService.fetchTotalCostUsd(generationId, credentials.apiKey(), credentials.baseUrl());
+        return openRouterCostService.fetchBillableCostUsd(generationId, credentials.apiKey(), credentials.baseUrl());
     }
 
     private boolean shouldFallbackToPerCall() {

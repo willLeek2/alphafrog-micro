@@ -15,5 +15,6 @@ public class LlmCallBillingContext {
     String model;
     String generationId;
     Double actualCostUsd;
+    Double upstreamCostUsd;
     boolean hasError;
 }

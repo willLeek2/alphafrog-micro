@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from datetime import datetime
@@ -22,27 +23,43 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run one AlphaFrog agent request with a compact live TUI.")
-    parser.add_argument("--config", required=True, help="YAML config path")
+    parser.add_argument("--config", help="YAML config path (required unless --query-credits)")
     parser.add_argument("--dry-run", action="store_true", help="validate config and print create body only")
     parser.add_argument("--no-tui", action="store_true", help="disable screen redraw; print event summaries")
     parser.add_argument("--query-credits", action="store_true", help="query/refresh credits for an existing run output folder")
     parser.add_argument("--output-dir", default="", help="existing run output folder (relative to project root) for --query-credits")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not args.query_credits and not args.config:
+        parser.error("the following arguments are required: --config")
+    return args
 
 
 def main() -> int:
     args = parse_args()
+    if args.query_credits:
+        output_dir = _resolve_output_dir(args.output_dir)
+        try:
+            cfg = LightClientConfig.from_file(args.config) if args.config else _query_credits_config(output_dir)
+        except Exception as exc:
+            print(f"[query-credits] {exc}", file=sys.stderr)
+            return 2
+        return _query_credits_main(cfg, args, output_dir)
     cfg = LightClientConfig.from_file(args.config)
     if args.dry_run:
         print(json.dumps(cfg.create_request_body(), ensure_ascii=False, indent=2))
         return 0
-    if args.query_credits:
-        return _query_credits_main(cfg, args)
 
     warnings = WarningStore(cfg.max_warning_lines)
     state = RunViewState(max_trace_lines=cfg.max_trace_lines, max_warnings=cfg.max_warning_lines)
     renderer = TerminalRenderer(max_lines=cfg.max_trace_lines)
     debug = DebugRunLogger.from_config(cfg)
+    if args.config and debug.run_dir is not None:
+        try:
+            (debug.run_dir / "client_config_path.txt").write_text(
+                str(Path(args.config).resolve()), encoding="utf-8"
+            )
+        except Exception:
+            pass
     debug.write_json("config.json", cfg.as_log_dict())
     debug.write_json("create_request.json", cfg.create_request_body())
     client = AgentHttpClient(
@@ -244,8 +261,47 @@ def _print_credits_summary(
     )
 
 
-def _query_credits_main(cfg: LightClientConfig, args: argparse.Namespace) -> int:
-    output_dir = _resolve_output_dir(args.output_dir)
+def _query_credits_config(output_dir: Path | None) -> LightClientConfig:
+    """Build a config for --query-credits without an explicit --config.
+
+    First tries to reuse the config path recorded in the output directory.
+    Falls back to environment variables AF_BASE_URL, AF_USERNAME, AF_PASSWORD.
+    """
+    if output_dir is not None:
+        config_path_file = output_dir / "client_config_path.txt"
+        if config_path_file.exists():
+            try:
+                config_path = Path(config_path_file.read_text(encoding="utf-8").strip())
+                if config_path.exists():
+                    return LightClientConfig.from_file(config_path)
+            except Exception:
+                pass
+
+    base_url = os.getenv("AF_BASE_URL", "").strip()
+    username = os.getenv("AF_USERNAME", "").strip()
+    password = os.getenv("AF_PASSWORD", "").strip()
+    missing = [name for name, value in (
+        ("AF_BASE_URL", base_url),
+        ("AF_USERNAME", username),
+        ("AF_PASSWORD", password),
+    ) if not value]
+    if missing:
+        raise ValueError(
+            "--config 未提供，且无法从输出目录找到原 config 路径，也缺少环境变量: " +
+            ", ".join(missing) +
+            "；请提供 --config，或在原运行机器上执行，或设置上述环境变量"
+        )
+    cfg = LightClientConfig(
+        base_url=base_url,
+        username=username,
+        password=password,
+        question="query-credits",
+    )
+    cfg.validate()
+    return cfg
+
+
+def _query_credits_main(cfg: LightClientConfig, args: argparse.Namespace, output_dir: Path | None) -> int:
     if output_dir is None:
         print("[query-credits] 请指定 --output-dir 为本次 run 的输出文件夹路径", file=sys.stderr)
         return 2

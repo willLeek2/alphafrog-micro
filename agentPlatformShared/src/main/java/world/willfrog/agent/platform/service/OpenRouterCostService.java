@@ -199,6 +199,28 @@ public class OpenRouterCostService {
      * Fetches OpenRouter generation total cost in USD for credit settlement.
      * Does not require observability cost-enrichment to be enabled.
      */
+    /**
+     * Fetches OpenRouter billable cost in USD for credit settlement.
+     * For BYOK/provider-order scenarios total_cost may be 0 while upstream_inference_cost is non-zero.
+     * Priority: upstream_inference_cost > 0, then total_cost > 0.
+     */
+    public Optional<BigDecimal> fetchBillableCostUsd(String generationId, String apiKey, String baseUrl) {
+        Optional<GenerationResponse.GenerationData> data = fetchGenerationData(generationId, apiKey, baseUrl, false);
+        if (data.isEmpty()) {
+            return Optional.empty();
+        }
+        GenerationResponse.GenerationData costData = data.get();
+        Double upstream = costData.getUpstreamInferenceCost();
+        if (upstream != null && upstream > 0D) {
+            return Optional.of(BigDecimal.valueOf(upstream).setScale(6, RoundingMode.HALF_UP));
+        }
+        Double total = costData.getTotalCost();
+        if (total != null && total > 0D) {
+            return Optional.of(BigDecimal.valueOf(total).setScale(6, RoundingMode.HALF_UP));
+        }
+        return Optional.empty();
+    }
+
     public Optional<BigDecimal> fetchTotalCostUsd(String generationId, String apiKey, String baseUrl) {
         return fetchGenerationData(generationId, apiKey, baseUrl, false)
                 .map(GenerationResponse.GenerationData::getTotalCost)
