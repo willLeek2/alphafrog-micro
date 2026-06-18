@@ -515,6 +515,7 @@ services:
       no_proxy: ${NO_PROXY-localhost,127.0.0.1,nacos,redis,rabbitmq,meilisearch,host.docker.internal}
     volumes:
       - ./data/agent_datasets:/data/agent_datasets
+      - ./data/agent_workspaces:/data/agent_workspaces
       - ./agentLangchainService/config:/app/config:ro
       - ./data/agent-configs:/app/config-dynamic
     ports:
@@ -591,6 +592,7 @@ services:
       no_proxy: ${NO_PROXY-localhost,127.0.0.1,nacos,redis,rabbitmq,meilisearch,host.docker.internal}
     volumes:
       - ./data/agent_datasets:/data/agent_datasets
+      - ./data/agent_workspaces:/data/agent_workspaces
       - ./agentLangchainService/config:/app/config:ro
       - ./data/agent-configs:/app/config-dynamic
     ports:
