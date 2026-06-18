@@ -64,9 +64,15 @@ llm:
 debug:
   logs: true
   output_root: "af_light_client/output"
+  tui_snapshots:
+    enabled: true
+    interval_ms: 500
+    batch_interval_ms: 60000
 ```
 
 开启后会在 `debug.output_root/YYYYMMDD-HHMMSS/` 下写入脱敏配置、create run 响应、SSE 事件 jsonl、warnings、最终 status/result、可观测性全量数据，以及 Ctrl+C 或异常时的错误记录。如果 run 正常完成并拿到最终回答，还会额外写入 `answer.md`，直接打开就是完整答案。Ctrl+C 会尽力取消当前 run，然后仍然拉取能拿到的终态观测数据。
+
+`debug.tui_snapshots.enabled` 只在 TUI 模式生效；`interval_seconds` 要大于 1，或使用 `interval_ms` 且大于 200。快照会写入 `debug.output_root/YYYYMMDD-HHMMSS/debug/tui_batch0XX.txt`，并按 `batch_interval_ms` 滚动到新的 batch 文件。每个条目包含时间戳、当前完整 TUI 文本和 `---` 分隔线。
 
 ## 事件契约
 

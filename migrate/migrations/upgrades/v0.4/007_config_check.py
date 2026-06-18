@@ -13,9 +13,9 @@ from pathlib import Path
 import sys
 
 ENV_FILE = Path(".env")
-CONFIG_FILE = Path("agentService/config/agent-llm.local.json")
-EXAMPLE_FILE = Path("agentService/config/agent-llm.local.example.json")
-PROMPTS_DIR = Path("agentService/config/prompts")
+CONFIG_FILE = Path("agentLangchainService/config/agent-llm.local.json")
+EXAMPLE_FILE = Path("agentLangchainService/config/agent-llm.local.example.json")
+PROMPTS_DIR = Path("agentLangchainService/config/prompts")
 
 def check_env():
     """检查 .env 中 ADMIN_MAGIC_PASSWORD"""

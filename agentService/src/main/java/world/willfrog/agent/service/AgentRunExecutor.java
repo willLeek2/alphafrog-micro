@@ -28,6 +28,7 @@ import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
 import world.willfrog.agent.tools.rag.RagTools;
 import world.willfrog.agent.tools.search.SearchTools;
+import world.willfrog.agent.platform.event.AgentRunFinalizationService;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 import world.willfrog.agent.workflow.TodoPlan;
 import world.willfrog.agent.workflow.TodoPlanner;
@@ -127,6 +128,8 @@ public class AgentRunExecutor {
     private final AgentSimpleToolFastPathService simpleToolFastPathService;
     /** OpenRouter 费用补采集服务。 */
     private final OpenRouterCostService openRouterCostService;
+    /** 终态发布服务，workspace v0 落地：每次写终态后发布 AgentRunFinalizedEvent 触发 dump。 */
+    private final AgentRunFinalizationService finalizationService;
     @Qualifier("agentRunTaskExecutor")
     private final Executor agentRunTaskExecutor;
 
@@ -254,6 +257,8 @@ public class AgentRunExecutor {
                 eventService.append(runId, userId, "EXECUTION_BLOCKED",
                         mapOf("reason", reason, "by", "credit_pre_check"));
                 stateStore.markRunStatus(runId, AgentRunStatus.FAILED.name());
+                // 260618-workspace-v0: 触发终态事件，异步 dump workspace
+                finalizationService.publishFinalizedEvent(runId, userId, AgentRunStatus.FAILED.name());
                 return;
             }
 
@@ -514,6 +519,8 @@ public class AgentRunExecutor {
             runMapper.updateStatusWithTtl(runId, userId, AgentRunStatus.FAILED, eventService.nextInterruptedExpiresAt());
             eventService.append(runId, userId, "WORKFLOW_FAILED", mapOf("error", err));
             stateStore.markRunStatus(runId, AgentRunStatus.FAILED.name());
+            // 260618-workspace-v0: 触发终态事件，异步 dump workspace
+            finalizationService.publishFinalizedEvent(runId, userId, AgentRunStatus.FAILED.name());
             // 260612-01-02: 异常路径也触发结算（可能已有部分 LLM 调用）
             try {
                 creditSettlementService.settleAsync(runId, userId);
@@ -582,6 +589,8 @@ public class AgentRunExecutor {
 
             creditSettlementService.settleAsync(runId, userId);
             stateStore.markRunStatus(runId, AgentRunStatus.COMPLETED.name());
+            // 260618-workspace-v0: 触发终态事件，异步 dump workspace
+            finalizationService.publishFinalizedEvent(runId, userId, AgentRunStatus.COMPLETED.name());
             return;
         }
 
@@ -595,6 +604,8 @@ public class AgentRunExecutor {
                 "tool_calls_used", result.getToolCallsUsed()
         ));
         stateStore.markRunStatus(runId, AgentRunStatus.FAILED.name());
+        // 260618-workspace-v0: 触发终态事件，异步 dump workspace
+        finalizationService.publishFinalizedEvent(runId, userId, AgentRunStatus.FAILED.name());
         // 260612-01-02: 失败路径也触发结算（可能已有部分 LLM 调用）
         try {
             creditSettlementService.settleAsync(runId, userId);

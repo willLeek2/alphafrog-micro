@@ -15,6 +15,19 @@ import java.util.concurrent.TimeUnit;
 @Slf4j
 public class PythonSandboxTools {
     private static final int POLL_INTERVAL_MS = 1000;
+    private static final String TOOL_DESCRIPTION = "Execute Python code in a secure sandbox. REQUIRED: code, dataset_ids. "
+            + "OPTIONAL: libraries (comma-separated, e.g. 'numpy,pandas'), timeout_seconds. "
+            + "Prefer passing the top-level dataset_id returned by market-data batch tools; when that id is a dataset_manifest, "
+            + "the sandbox automatically expands its ready members and mounts the manifest directory plus atomic dataset directories. "
+            + "Dataset files are mounted under /sandbox/input/<dataset_id>/ (default: <dataset_id>.csv and <dataset_id>.meta.json); "
+            + "manifest metadata is under /sandbox/input/<manifest_id>/<manifest_id>.manifest.json. "
+            + "In Python, use from af_dataset_loader import load_manifest, load_datasets; result = load_manifest('<manifest_id>'); "
+            + "df = result.frame; inspect result.failed_members and result.skipped_members for partial batch failures. "
+            + "Multiple explicit dataset ids remain supported as comma-separated dataset_ids (e.g., 'ds1,ds2,ds3'), "
+            + "but do not manually expand a manifest unless needed. "
+            + "Runtime preinstalled: numpy==2.4.1, pandas==2.3.3, matplotlib==3.10.8, scipy==1.17.0. "
+            + "Service stack: fastapi==0.128.0, uvicorn[standard]==0.40.0, pydantic==2.12.5, llm-sandbox[docker]==0.3.33. "
+            + "Please prioritize using the preinstalled runtime libraries to reduce latency.";
 
     @DubboReference
     private PythonSandboxService pythonSandboxService;
@@ -25,7 +38,7 @@ public class PythonSandboxTools {
         this.objectMapper = objectMapper;
     }
 
-    @Tool("Execute Python code in a secure sandbox. REQUIRED: code, dataset_ids. OPTIONAL: libraries (comma-separated, e.g. 'numpy,pandas'), timeout_seconds. Dataset files are mounted under /sandbox/input/<dataset_id>/ (default: <dataset_id>.csv and <dataset_id>.meta.json). Multiple datasets: use comma-separated dataset_ids (e.g., 'ds1,ds2,ds3'). Runtime preinstalled: numpy==2.4.1, pandas==2.3.3, matplotlib==3.10.8, scipy==1.17.0. Service stack: fastapi==0.128.0, uvicorn[standard]==0.40.0, pydantic==2.12.5, llm-sandbox[docker]==0.3.33. Please prioritize using the preinstalled runtime libraries to reduce latency.")
+    @Tool(TOOL_DESCRIPTION)
     public String executePython(String code, String dataset_ids, String libraries, Integer timeout_seconds) {
         try {
             String[] parsedDatasetIds = parseDatasetIds(dataset_ids);

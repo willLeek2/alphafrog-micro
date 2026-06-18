@@ -10,6 +10,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.entity.AgentRunEvent;
+import world.willfrog.agent.platform.mapper.AgentRunEventMapper;
 import world.willfrog.alphafrogmicro.agent.idl.AgentArtifactMessage;
 
 import java.nio.charset.StandardCharsets;
@@ -39,6 +40,8 @@ public class AgentArtifactService {
     private static final DateTimeFormatter TIME_FORMATTER = DateTimeFormatter.ISO_OFFSET_DATE_TIME;
 
     private final AgentEventService eventService;
+    /** DB event mapper；workspace v0 走 DB，不依赖 Redis 事件流。 */
+    private final AgentRunEventMapper agentRunEventMapper;
     private final ObjectMapper objectMapper;
 
     @Value("${agent.tools.market-data.dataset.path:/data/agent_datasets}")
@@ -78,6 +81,43 @@ public class AgentArtifactService {
                     .build());
         }
         return result;
+    }
+
+    /**
+     * 公开入口：收集指定 run 的 parsed events（python scripts + dataset ids）。
+     *
+     * <p>给 workspace dump pipeline 用。内部走 {@link #parseEvents} 走完整事件解析，
+     * 然后映射成对外的 {@link ParsedEventsView}（避免把 internal record 暴露给跨模块 caller）。</p>
+     *
+     * <p>v0 走 {@link AgentRunEventMapper#listByRunId}（DB），不依赖 Redis 事件流
+     * （Redis ZSET TTL 7 天，旧 run 解析会丢事件，dump 稳定性不可接受）。</p>
+     *
+     * @param run 目标 run
+     * @return parsed events 公开视图
+     */
+    public ParsedEventsView collectParsedEvents(AgentRun run) {
+        if (run == null || run.getId() == null || run.getId().isBlank()) {
+            throw new IllegalArgumentException("run / runId 不能为空");
+        }
+        List<AgentRunEvent> events = agentRunEventMapper.listByRunId(run.getId());
+        ParsedEvents parsed = parseEvents(events);
+        List<PythonScript> scripts = new ArrayList<>();
+        if (parsed.invocations() != null) {
+            for (PythonInvocation invocation : parsed.invocations()) {
+                scripts.add(new PythonScript(
+                        invocation.ref(),
+                        invocation.seq(),
+                        invocation.createdAt(),
+                        invocation.code(),
+                        invocation.datasetIds() == null ? List.of() : new ArrayList<>(invocation.datasetIds()),
+                        invocation.success(),
+                        invocation.source()
+                ));
+            }
+        }
+        List<String> fallbackIds = parsed.fallbackDatasetIds() == null
+                ? List.of() : new ArrayList<>(parsed.fallbackDatasetIds());
+        return new ParsedEventsView(scripts, fallbackIds);
     }
 
     public ArtifactContent loadArtifact(AgentRun run, boolean isAdmin, String artifactId) {
@@ -267,7 +307,7 @@ public class AgentArtifactService {
                 }
                 String preview = readAsString(payload.get("result_preview"));
                 JsonNode outputNode = parseToolOutput(preview);
-                // FIFO pairing of STARTED/FINISHED by event order (legacy agentService behavior).
+                // FIFO pairing of STARTED/FINISHED by event order.
                 // Parallel executePython may interleave; precise match would need tool_execution_id in events.
                 if (!pendingToolRefs.isEmpty()) {
                     String ref = pendingToolRefs.remove(0);
@@ -923,5 +963,29 @@ public class AgentArtifactService {
     }
 
     public record ArtifactContent(String artifactId, String filename, String contentType, byte[] content) {
+    }
+
+    /**
+     * 给 workspace 用的 parsed events 投影（避免把 internal ParsedEvents 暴露给跨模块 caller）。
+     *
+     * @param pythonScripts       python invocation 列表
+     * @param fallbackDatasetIds  fallback 阶段抓到的 dataset id 列表
+     */
+    public record ParsedEventsView(
+            List<PythonScript> pythonScripts,
+            List<String> fallbackDatasetIds) {
+    }
+
+    /**
+     * python invocation 公开投影。
+     */
+    public record PythonScript(
+            String ref,
+            int seq,
+            OffsetDateTime createdAt,
+            String code,
+            List<String> datasetIds,
+            Boolean success,
+            String source) {
     }
 }

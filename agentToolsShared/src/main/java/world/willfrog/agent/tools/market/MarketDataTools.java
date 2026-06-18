@@ -5,12 +5,15 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.langchain4j.agent.tool.Tool;
 import org.apache.dubbo.config.annotation.DubboReference;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
+import world.willfrog.agent.tools.dataset.DatasetManifest;
 import world.willfrog.agent.tools.dataset.DatasetRegistry;
 import world.willfrog.agent.tools.dataset.DatasetWriter;
+import world.willfrog.agent.tools.dataset.ManifestWriter;
 import world.willfrog.alphafrogmicro.common.utils.DateConvertUtils;
 import world.willfrog.alphafrogmicro.domestic.idl.*;
 
@@ -60,6 +63,10 @@ public class MarketDataTools {
 
     private static final DateTimeFormatter BASIC_DATE_FORMATTER = DateTimeFormatter.BASIC_ISO_DATE;
     private static final ZoneId CHINA_ZONE = ZoneId.of("Asia/Shanghai");
+    private static final List<String> DAILY_DATASET_HEADERS = List.of(
+            "ts_code", "trade_date", "open", "high", "low", "close",
+            "pre_close", "change", "pct_chg", "vol", "amount"
+    );
 
     /**
      * Dubbo 引用的股票服务，提供股票基础信息、日线、财务数据查询。
@@ -91,6 +98,16 @@ public class MarketDataTools {
      */
     private final DatasetRegistry datasetRegistry;
 
+    /** Phase 1 manifest 写侧：batch 成功项上方生成逻辑 dataset_id。 */
+    private final ManifestWriter manifestWriter;
+
+    /**
+     * B 块专用：是否在 batch 日线结果上 emit manifest 顶层 dataset_id。
+     * A 块 {@link ManifestWriter} 只看 {@code agent.tools.market-data.dataset.enabled}。
+     */
+    @Value("${agent.tools.market-data.batch.emit-manifest:false}")
+    private boolean emitManifest;
+
     /** Nacos 热加载配置读取器，用于动态获取并行查询限制（maxParallelSearchQueries / maxParallelDailyQueries）。 */
     private final AgentLlmLocalConfigLoader localConfigLoader;
 
@@ -102,11 +119,13 @@ public class MarketDataTools {
 
     public MarketDataTools(DatasetWriter datasetWriter,
                            DatasetRegistry datasetRegistry,
+                           ManifestWriter manifestWriter,
                            AgentLlmLocalConfigLoader localConfigLoader,
                            AgentLlmProperties llmProperties,
                            ObjectMapper objectMapper) {
         this.datasetWriter = datasetWriter;
         this.datasetRegistry = datasetRegistry;
+        this.manifestWriter = manifestWriter;
         this.localConfigLoader = localConfigLoader;
         this.llmProperties = llmProperties;
         this.objectMapper = objectMapper;
@@ -916,6 +935,9 @@ public class MarketDataTools {
     /**
      * ETF 批量日线查询：通过 domesticListedAssetService 并发获取多只 ETF 的日线数据。
      *
+     * <p>Phase 1 manifest 仅由 {@link #getExchangeAssetDaily} 的 ETF 批量路径调用；
+     * {@link #getOffExchangeAssetDaily} 不走本方法，也不 emit manifest。</p>
+     *
      * <p>与 {@link #batchGetDaily} 的区别：
      * batchGetDaily 针对股票/指数，走 domesticStockService / domesticIndexService；
      * 而 ETF 属于「场内资产」，走 domesticListedAssetService，统一入口为 {@link #fetchListedAssetDailySingle}。</p>
@@ -939,17 +961,20 @@ public class MarketDataTools {
 
         List<Map<String, Object>> results = futures.stream().map(CompletableFuture::join).toList();
         long successCount = results.stream().filter(it -> Boolean.TRUE.equals(it.get("ok"))).count();
+        String normalizedStart = compactDate(startDateStr);
+        String normalizedEnd = compactDate(endDateStr);
 
-        return ok(toolName, Map.of(
-                "mode", "batch",
-                "ts_codes", tsCodes,
-                "asset_type", "etf",
-                "start_date", compactDate(startDateStr),
-                "end_date", compactDate(endDateStr),
-                "results", results,
-                "success_count", successCount,
-                "failure_count", Math.max(0, results.size() - successCount)
-        ));
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("mode", "batch");
+        data.put("ts_codes", tsCodes);
+        data.put("asset_type", "etf");
+        data.put("start_date", normalizedStart);
+        data.put("end_date", normalizedEnd);
+        data.put("results", results);
+        data.put("success_count", successCount);
+        data.put("failure_count", Math.max(0, results.size() - successCount));
+        attachManifestIfEnabled("etf_daily", normalizedStart, normalizedEnd, tsCodes, DAILY_DATASET_HEADERS, results, data);
+        return ok(toolName, data);
     }
 
     private String fetchListedAssetDailySingle(String tsCode,
@@ -1191,16 +1216,161 @@ public class MarketDataTools {
 
         List<Map<String, Object>> results = futures.stream().map(CompletableFuture::join).toList();
         long successCount = results.stream().filter(it -> Boolean.TRUE.equals(it.get("ok"))).count();
+        String normalizedStart = compactDate(startDateStr);
+        String normalizedEnd = compactDate(endDateStr);
+        String dataType = stock ? "stock_daily" : "index_daily";
 
-        return ok(toolName, Map.of(
-                "mode", "batch",
-                "ts_codes", tsCodes,
-                "start_date", compactDate(startDateStr),
-                "end_date", compactDate(endDateStr),
-                "results", results,
-                "success_count", successCount,
-                "failure_count", Math.max(0, results.size() - successCount)
-        ));
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("mode", "batch");
+        data.put("ts_codes", tsCodes);
+        data.put("start_date", normalizedStart);
+        data.put("end_date", normalizedEnd);
+        data.put("results", results);
+        data.put("success_count", successCount);
+        data.put("failure_count", Math.max(0, results.size() - successCount));
+        attachManifestIfEnabled(dataType, normalizedStart, normalizedEnd, tsCodes, DAILY_DATASET_HEADERS, results, data);
+        return ok(toolName, data);
+    }
+
+    /**
+     * batch 日线结果上附加 manifest 顶层 dataset_id（Phase 1 B 块）。
+     * flag off 或写失败时保留旧 batch 结构，仅补 atomic {@code dataset_ids}。
+     */
+    private void attachManifestIfEnabled(String dataType,
+                                         String startDate,
+                                         String endDate,
+                                         List<String> tsCodes,
+                                         List<String> columns,
+                                         List<Map<String, Object>> results,
+                                         Map<String, Object> data) {
+        data.put("dataset_ids", collectAtomicDatasetIds(results));
+
+        if (!emitManifest || !manifestWriter.isEnabled() || !datasetRegistry.isEnabled()) {
+            return;
+        }
+
+        List<DatasetManifest.ManifestMember> members = buildManifestMembers(results, startDate, endDate, columns);
+        long readyCount = members.stream()
+                .filter(member -> DatasetManifest.ManifestMember.STATUS_READY.equals(member.getStatus()))
+                .count();
+        if (readyCount <= 0) {
+            return;
+        }
+
+        int failedCount = (int) members.stream()
+                .filter(member -> DatasetManifest.ManifestMember.STATUS_FAILED.equals(member.getStatus()))
+                .count();
+        int totalRowCount = members.stream()
+                .filter(member -> DatasetManifest.ManifestMember.STATUS_READY.equals(member.getStatus()))
+                .mapToInt(DatasetManifest.ManifestMember::getRowCount)
+                .sum();
+
+        try {
+            Optional<DatasetRegistry.ManifestMeta> existing = datasetRegistry.findReusableManifest(
+                    dataType, startDate, endDate, tsCodes, columns);
+            String manifestId = existing.map(DatasetRegistry.ManifestMeta::getManifestId).orElseGet(() -> {
+                String id = manifestWriter.writeManifest(dataType, startDate, endDate, members, totalRowCount, columns);
+                if (id != null) {
+                    datasetRegistry.registerManifest(
+                            dataType,
+                            startDate,
+                            endDate,
+                            tsCodes,
+                            columns,
+                            id,
+                            members.size(),
+                            (int) readyCount,
+                            failedCount,
+                            totalRowCount);
+                }
+                return id;
+            });
+
+            if (manifestId != null && !manifestId.isBlank()) {
+                data.put("dataset_id", manifestId);
+                data.put("manifest_id", manifestId);
+                data.put("manifest", Map.of(
+                        "member_count", members.size(),
+                        "ready_count", readyCount,
+                        "failed_count", failedCount,
+                        "total_row_count", totalRowCount
+                ));
+            }
+        } catch (RuntimeException e) {
+            log.warn("Manifest write failed for batch {} {}-{}: {}", dataType, startDate, endDate, e.getMessage());
+        }
+    }
+
+    private List<String> collectAtomicDatasetIds(List<Map<String, Object>> results) {
+        List<String> datasetIds = new ArrayList<>();
+        for (Map<String, Object> row : results) {
+            if (!Boolean.TRUE.equals(row.get("ok"))) {
+                continue;
+            }
+            Map<String, Object> rowData = readNestedMap(row.get("data"));
+            String datasetId = nvl((String) rowData.get("dataset_id"));
+            if (!datasetId.isBlank()) {
+                datasetIds.add(datasetId);
+            }
+        }
+        return datasetIds;
+    }
+
+    private List<DatasetManifest.ManifestMember> buildManifestMembers(List<Map<String, Object>> results,
+                                                                        String startDate,
+                                                                        String endDate,
+                                                                        List<String> columns) {
+        List<DatasetManifest.ManifestMember> members = new ArrayList<>();
+        for (Map<String, Object> row : results) {
+            String tsCode = nvl((String) row.get("ts_code"));
+            boolean ok = Boolean.TRUE.equals(row.get("ok"));
+            Map<String, Object> rowData = readNestedMap(row.get("data"));
+            Map<String, Object> rowError = readNestedMap(row.get("error"));
+
+            if (ok) {
+                String datasetId = nvl((String) rowData.get("dataset_id"));
+                if (datasetId.isBlank()) {
+                    members.add(DatasetManifest.ManifestMember.builder()
+                            .tsCode(tsCode)
+                            .status(DatasetManifest.ManifestMember.STATUS_FAILED)
+                            .startDate(startDate)
+                            .endDate(endDate)
+                            .columns(columns)
+                            .errorCode("MISSING_DATASET_ID")
+                            .errorMessage("batch row ok but dataset_id missing")
+                            .build());
+                    continue;
+                }
+                int rowCount = 0;
+                Object rows = rowData.get("rows");
+                if (rows instanceof Number number) {
+                    rowCount = number.intValue();
+                }
+                members.add(DatasetManifest.ManifestMember.builder()
+                        .tsCode(tsCode)
+                        .datasetId(datasetId)
+                        .status(DatasetManifest.ManifestMember.STATUS_READY)
+                        .rowCount(rowCount)
+                        .startDate(startDate)
+                        .endDate(endDate)
+                        .columns(columns)
+                        .build());
+                continue;
+            }
+
+            String errorCode = nvl((String) rowError.get("code"));
+            String errorMessage = nvl((String) rowError.get("message"));
+            members.add(DatasetManifest.ManifestMember.builder()
+                    .tsCode(tsCode)
+                    .status(DatasetManifest.ManifestMember.STATUS_FAILED)
+                    .startDate(startDate)
+                    .endDate(endDate)
+                    .columns(columns)
+                    .errorCode(errorCode.isBlank() ? "BATCH_ITEM_FAILED" : errorCode)
+                    .errorMessage(errorMessage)
+                    .build());
+        }
+        return members;
     }
 
     /**

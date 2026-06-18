@@ -1,4 +1,4 @@
-# Shared agent.llm.prompts for agentService and agentLangchainService
+# Shared agent.llm.prompts for active agent runtimes
 agent:
   llm:
     prompts:

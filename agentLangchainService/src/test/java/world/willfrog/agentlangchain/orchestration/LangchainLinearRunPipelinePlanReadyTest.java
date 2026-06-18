@@ -105,7 +105,8 @@ class LangchainLinearRunPipelinePlanReadyTest {
                 executionGuard,
                 immediateScheduler(),
                 creditService,
-                mock(AgentRunCreditSettlementService.class)
+                mock(AgentRunCreditSettlementService.class),
+                mock(world.willfrog.agent.platform.event.AgentRunFinalizationService.class)
         );
 
         pipeline.executeRun(run);

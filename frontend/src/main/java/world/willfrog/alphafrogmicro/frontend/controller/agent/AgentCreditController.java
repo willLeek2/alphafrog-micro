@@ -1,10 +1,8 @@
 package world.willfrog.alphafrogmicro.frontend.controller.agent;
 
-import jakarta.servlet.http.HttpServletRequest;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.dubbo.config.annotation.DubboReference;
 import org.apache.dubbo.rpc.RpcException;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -28,12 +26,6 @@ public class AgentCreditController {
     @DubboReference(group = "langchain", check = false)
     private AgentDubboService agentDubboServiceLangchain;
 
-    @DubboReference(group = "legacy", check = false)
-    private AgentDubboService agentDubboServiceLegacy;
-
-    @Autowired
-    private HttpServletRequest request;
-
     private final AuthService authService;
 
     public AgentCreditController(AuthService authService) {
@@ -41,10 +33,6 @@ public class AgentCreditController {
     }
 
     private AgentDubboService resolveService() {
-        String uri = request.getRequestURI();
-        if (uri != null && uri.startsWith("/api/agent-legacy")) {
-            return agentDubboServiceLegacy;
-        }
         return agentDubboServiceLangchain;
     }
 
@@ -53,24 +41,9 @@ public class AgentCreditController {
         return creditsInternal(authentication);
     }
 
-    /** @deprecated Use {@code GET /api/agent/credits}. */
-    @Deprecated
-    @GetMapping("/api/agent-legacy/credits")
-    public ResponseWrapper<AgentCreditsResponse> creditsLegacy(Authentication authentication) {
-        return creditsInternal(authentication);
-    }
-
     @PostMapping("/api/agent/credits/apply")
     public ResponseWrapper<AgentCreditsApplyResponse> applyCredits(Authentication authentication,
                                                                    @RequestBody(required = false) AgentCreditsApplyRequest request) {
-        return applyCreditsInternal(authentication, request);
-    }
-
-    /** @deprecated Use {@code POST /api/agent/credits/apply}. */
-    @Deprecated
-    @PostMapping("/api/agent-legacy/credits/apply")
-    public ResponseWrapper<AgentCreditsApplyResponse> applyCreditsLegacy(Authentication authentication,
-                                                                         @RequestBody(required = false) AgentCreditsApplyRequest request) {
         return applyCreditsInternal(authentication, request);
     }
 

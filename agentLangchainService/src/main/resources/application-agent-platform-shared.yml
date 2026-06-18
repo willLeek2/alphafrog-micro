@@ -1,4 +1,4 @@
-# Shared agent platform config — aligned with legacy agentService (excluding legacy-only llm.prompts).
+# Shared agent platform config for active agent runtimes.
 agent:
   call-detail:
     ttl-seconds: ${AF_AGENT_CALL_DETAIL_TTL_SECONDS:86400}
@@ -89,6 +89,8 @@ agent:
         allow-range-reuse: ${AF_AGENT_MARKET_DATA_DATASET_ALLOW_RANGE_REUSE:true}
         cleanup-interval-ms: ${AF_AGENT_MARKET_DATA_DATASET_CLEANUP_INTERVAL_MS:600000}
         cleanup-scan-count: ${AF_AGENT_MARKET_DATA_DATASET_CLEANUP_SCAN_COUNT:500}
+      batch:
+        emit-manifest: ${AF_AGENT_MARKET_DATA_BATCH_EMIT_MANIFEST:false}
   flow:
     parallel:
       enabled: ${AF_AGENT_FLOW_PARALLEL_ENABLED:false}

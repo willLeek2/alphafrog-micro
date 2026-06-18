@@ -4,15 +4,17 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List
 
 from requests import exceptions as requests_exceptions
 
 from .config import LightClientConfig
-from .debug import DebugRunLogger
+from .debug import DebugRunLogger, TuiBatchSnapshotWriter
 from .events import RunViewState, final_answer_from_result, is_terminal
 from .http_client import AgentHttpClient, WarningStore
 from .render import TerminalRenderer
@@ -51,8 +53,17 @@ def main() -> int:
 
     warnings = WarningStore(cfg.max_warning_lines)
     state = RunViewState(max_trace_lines=cfg.max_trace_lines, max_warnings=cfg.max_warning_lines)
+    state_lock = threading.RLock()
     renderer = TerminalRenderer(max_lines=cfg.max_trace_lines)
+    snapshot_renderer = TerminalRenderer(max_lines=cfg.max_trace_lines, color=False)
     debug = DebugRunLogger.from_config(cfg)
+    tui_snapshots = TuiBatchSnapshotWriter.from_config(cfg, started_at=debug.started_at)
+    snapshot_loop = PeriodicTuiSnapshotLoop(
+        enabled=not args.no_tui and tui_snapshots.enabled,
+        interval_ms=cfg.debug_tui_snapshots.interval_ms,
+        snapshot_text=lambda: _snapshot_text(snapshot_renderer, state, state_lock),
+        writer=tui_snapshots,
+    )
     if args.config and debug.run_dir is not None:
         try:
             (debug.run_dir / "client_config_path.txt").write_text(
@@ -78,22 +89,37 @@ def main() -> int:
         run = client.create_run(cfg.create_endpoint, cfg.create_request_body())
         debug.write_json("create_response.json", run)
         run_id = str(run.get("runId") or run.get("run_id") or run.get("id"))
-        state.set_run_id(run_id)
+        with state_lock:
+            state.set_run_id(run_id)
         warnings.add(f"run created: {run_id}")
-        _render(args, renderer, state, warnings)
+        _render(args, renderer, snapshot_renderer, tui_snapshots, state, warnings, state_lock=state_lock)
+        snapshot_loop.start()
 
         for frame in client.stream_events(cfg.stream_endpoint_template, run_id):
             parsed = frame.parsed_data()
             debug.log_sse_frame(frame, parsed)
-            state.ingest_sse(frame.event_type, parsed)
-            _copy_warnings(state, warnings)
+            with state_lock:
+                state.ingest_sse(frame.event_type, parsed)
+                _copy_warnings(state, warnings)
             if args.no_tui:
-                _print_event_line(frame.event_type, state.snapshot().trace)
+                with state_lock:
+                    trace = state.snapshot().trace
+                _print_event_line(frame.event_type, trace)
             now = time.monotonic()
             if now - last_render >= cfg.refresh_seconds:
-                _render(args, renderer, state, warnings)
+                _render(
+                    args,
+                    renderer,
+                    snapshot_renderer,
+                    tui_snapshots,
+                    state,
+                    warnings,
+                    state_lock=state_lock,
+                    monotonic_now=now,
+                )
                 last_render = now
-            snap = state.snapshot()
+            with state_lock:
+                snap = state.snapshot()
             if is_terminal(snap.status):
                 break
 
@@ -113,38 +139,46 @@ def main() -> int:
         exit_code = 1
         warnings.add(str(exc))
         debug.write_json("error.json", {"error": str(exc), "type": type(exc).__name__})
-        _copy_warnings(state, warnings)
-        _render(args, renderer, state, warnings)
+        _render(args, renderer, snapshot_renderer, tui_snapshots, state, warnings, state_lock=state_lock)
     finally:
+        snapshot_loop.stop()
         if run_id:
             _finish_with_rest(cfg, client, state, warnings, run_id, debug)
-        _copy_warnings(state, warnings)
+        with state_lock:
+            _copy_warnings(state, warnings)
+            final_snapshot = state.snapshot()
         debug.log_warning_snapshot(warnings.snapshot())
         debug.write_json(
             "summary.json",
             {
                 "runId": run_id,
-                "status": state.snapshot().status,
-                "phase": state.snapshot().phase,
-                "lastSeq": state.snapshot().last_seq,
+                "status": final_snapshot.status,
+                "phase": final_snapshot.phase,
+                "lastSeq": final_snapshot.last_seq,
                 "startedAt": debug.started_at.isoformat(timespec="seconds"),
                 "finishedAt": datetime.now().isoformat(timespec="seconds"),
                 "interrupted": interrupted,
                 "exitCode": exit_code,
-                "answerPreview": state.snapshot().final_answer[:500],
+                "answerPreview": final_snapshot.final_answer[:500],
                 "files": debug.list_files(),
                 "debugOutputDir": str(debug.output_dir) if debug.output_dir else "",
             },
         )
-        answer = state.snapshot().final_answer
+        answer = final_snapshot.final_answer
         if answer:
             debug.write_text("answer.md", answer)
         if not args.no_tui:
-            renderer.finish(state.snapshot())
+            renderer.finish(final_snapshot)
+            tui_snapshots.write_if_due(
+                snapshot_renderer.snapshot_text(final_snapshot),
+                monotonic_now=time.monotonic(),
+                force=True,
+            )
         if run_id:
             _print_credits_summary(cfg, client, run_id, interrupted, debug)
 
-    snap = state.snapshot()
+    with state_lock:
+        snap = state.snapshot()
     if exit_code:
         return exit_code
     return 0 if snap.status.upper() == "COMPLETED" else 2
@@ -214,10 +248,73 @@ def _copy_warnings(state: RunViewState, warnings: WarningStore) -> None:
         state.add_warning(item)
 
 
-def _render(args: argparse.Namespace, renderer: TerminalRenderer, state: RunViewState, warnings: WarningStore) -> None:
-    _copy_warnings(state, warnings)
+class PeriodicTuiSnapshotLoop:
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        interval_ms: int,
+        snapshot_text: Callable[[], str],
+        writer: TuiBatchSnapshotWriter,
+    ) -> None:
+        self.enabled = enabled
+        self.interval_seconds = max(0.05, interval_ms / 1000.0) if interval_ms > 0 else 0.0
+        self.snapshot_text = snapshot_text
+        self.writer = writer
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if not self.enabled or self.interval_seconds <= 0 or self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._run, name="af-light-tui-snapshots", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval_seconds):
+            try:
+                self.writer.write_if_due(
+                    self.snapshot_text(),
+                    monotonic_now=time.monotonic(),
+                )
+            except Exception:
+                # Snapshot logging must never interrupt the active agent run.
+                pass
+
+
+def _snapshot_text(renderer: TerminalRenderer, state: RunViewState, state_lock: threading.RLock) -> str:
+    with state_lock:
+        snapshot = state.snapshot()
+    return renderer.snapshot_text(snapshot)
+
+
+def _render(
+    args: argparse.Namespace,
+    renderer: TerminalRenderer,
+    snapshot_renderer: TerminalRenderer,
+    tui_snapshots: TuiBatchSnapshotWriter,
+    state: RunViewState,
+    warnings: WarningStore,
+    *,
+    state_lock: threading.RLock | None = None,
+    monotonic_now: float | None = None,
+) -> None:
+    if state_lock is None:
+        state_lock = threading.RLock()
+    with state_lock:
+        _copy_warnings(state, warnings)
+        snapshot = state.snapshot()
     if not args.no_tui:
-        renderer.render(state.snapshot())
+        renderer.render(snapshot)
+        tui_snapshots.write_if_due(
+            snapshot_renderer.snapshot_text(snapshot),
+            monotonic_now=monotonic_now if monotonic_now is not None else time.monotonic(),
+        )
 
 
 def _print_event_line(event_type: str, trace: list[str]) -> None:
@@ -423,12 +520,19 @@ def _needs_cost_refresh(credits: Dict[str, Any]) -> bool:
     return False
 
 
+def _format_credit(value: Any) -> str:
+    try:
+        return str(Decimal(str(value)).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP))
+    except Exception:
+        return str(value)
+
+
 def _print_query_credits_result(result: Dict[str, Any]) -> None:
     summary = result.get("summary") or {}
     refreshed = result.get("refreshed")
     print(
         f"[query-credits] runId={result.get('runId')} "
-        f"总消耗 {result.get('totalCredits')} {result.get('currency')}"
+        f"总消耗 {_format_credit(result.get('totalCredits'))} {result.get('currency')}"
     )
     print(
         f"[query-credits] settlement: "
@@ -444,7 +548,7 @@ def _print_query_credits_result(result: Dict[str, Any]) -> None:
         print("[query-credits] 无需刷新，所有可追踪端点 cost 已到位")
     user = result.get("userCredits") or {}
     if "remainingCredits" in user:
-        print(f"[query-credits] 用户当前剩余 credit: {user.get('remainingCredits')} {user.get('currency', 'USD')}")
+        print(f"[query-credits] 用户当前剩余 credit: {_format_credit(user.get('remainingCredits'))} {user.get('currency', 'USD')}")
     elif "error" in user:
         print(f"[query-credits] 查询用户剩余 credit 失败: {user.get('error')}")
 

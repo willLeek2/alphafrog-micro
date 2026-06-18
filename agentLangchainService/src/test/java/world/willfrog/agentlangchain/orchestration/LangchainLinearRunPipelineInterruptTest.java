@@ -79,7 +79,8 @@ class LangchainLinearRunPipelineInterruptTest {
                 executionGuard,
                 immediateScheduler(),
                 mock(AgentCreditService.class),
-                mock(AgentRunCreditSettlementService.class)
+                mock(AgentRunCreditSettlementService.class),
+                mock(world.willfrog.agent.platform.event.AgentRunFinalizationService.class)
         );
 
         pipeline.executeRun(run);

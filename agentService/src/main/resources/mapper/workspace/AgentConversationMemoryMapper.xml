@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="world.willfrog.agent.service.workspace.memory.AgentConversationMemoryMapper">
+
+    <!-- 结果映射 -->
+    <resultMap id="AgentConversationMemoryResultMap" type="world.willfrog.agent.service.workspace.memory.AgentConversationMemory">
+        <id column="id" property="id"/>
+        <result column="tenant_id" property="tenantId"/>
+        <result column="user_id" property="userId"/>
+        <result column="conversation_scope" property="conversationScope"/>
+        <result column="memory_type" property="memoryType"/>
+        <result column="content" property="content"/>
+        <result column="source_run_id" property="sourceRunId"/>
+        <result column="source_message_seq_start" property="sourceMessageSeqStart"/>
+        <result column="source_message_seq_end" property="sourceMessageSeqEnd"/>
+        <result column="confidence" property="confidence"/>
+        <result column="verification_status" property="verificationStatus"/>
+        <result column="supersedes_memory_id" property="supersedesMemoryId"/>
+        <result column="expires_at" property="expiresAt"/>
+        <result column="status" property="status"/>
+        <result column="embedding_status" property="embeddingStatus"/>
+        <result column="created_at" property="createdAt"/>
+        <result column="updated_at" property="updatedAt"/>
+    </resultMap>
+
+    <!-- 插入单条 memory -->
+    <insert id="insert" parameterType="world.willfrog.agent.service.workspace.memory.AgentConversationMemory"
+            useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO alphafrog_agent_conversation_memory (
+            tenant_id, user_id, conversation_scope, memory_type, content,
+            source_run_id, source_message_seq_start, source_message_seq_end,
+            confidence, verification_status, supersedes_memory_id, expires_at,
+            status, embedding_status, created_at, updated_at
+        ) VALUES (
+            #{tenantId}, #{userId}, #{conversationScope}, #{memoryType}, #{content},
+            #{sourceRunId}, #{sourceMessageSeqStart}, #{sourceMessageSeqEnd},
+            #{confidence}, #{verificationStatus}, #{supersedesMemoryId}, #{expiresAt},
+            #{status}, #{embeddingStatus}, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+        )
+    </insert>
+
+    <!-- 按主键查询 -->
+    <select id="findById" resultMap="AgentConversationMemoryResultMap">
+        SELECT * FROM alphafrog_agent_conversation_memory WHERE id = #{id}
+    </select>
+
+    <!-- 按 user + scope + status + verification_status 列表查 -->
+    <select id="listByUserAndScope" resultMap="AgentConversationMemoryResultMap">
+        SELECT * FROM alphafrog_agent_conversation_memory
+        WHERE user_id = #{userId}
+          AND conversation_scope = #{conversationScope}
+          <if test="status != null">AND status = #{status}</if>
+          <if test="verificationStatuses != null and verificationStatuses.size() > 0">
+              AND verification_status IN
+              <foreach collection="verificationStatuses" item="vs" open="(" separator="," close=")">#{vs}</foreach>
+          </if>
+        ORDER BY created_at DESC
+        LIMIT #{limit}
+    </select>
+
+    <!-- 按 source_run_id 反查 -->
+    <select id="listBySourceRunId" resultMap="AgentConversationMemoryResultMap">
+        SELECT * FROM alphafrog_agent_conversation_memory
+        WHERE source_run_id = #{sourceRunId}
+        ORDER BY created_at ASC
+    </select>
+
+    <!-- 更新 memory 状态 -->
+    <update id="updateStatus">
+        UPDATE alphafrog_agent_conversation_memory
+        SET status = #{status}, updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+    </update>
+
+    <!-- supersede：把旧 memory 标 superseded 并记录取代关系 -->
+    <update id="supersede">
+        UPDATE alphafrog_agent_conversation_memory
+        SET status = 'superseded', supersedes_memory_id = COALESCE(supersedes_memory_id, #{newId}),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{oldId}
+    </update>
+
+</mapper>

@@ -20,6 +20,7 @@ import world.willfrog.agent.platform.service.AgentMessageService;
 import world.willfrog.agent.platform.service.AgentObservabilityService;
 import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
+import world.willfrog.agent.platform.event.AgentRunFinalizationService;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 import world.willfrog.agentlangchain.orchestration.dag.LangchainDagWorkflowExecutor;
 import world.willfrog.agentlangchain.planning.LangchainAiPlanner;
@@ -74,6 +75,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
     private final LangchainRunConcurrencyScheduler runConcurrencyScheduler;
     private final AgentCreditService creditService;
     private final AgentRunCreditSettlementService creditSettlementService;
+    private final AgentRunFinalizationService finalizationService;
 
     public LangchainLinearRunPipelineImpl(LangchainAiPlanner planner,
                                           LangchainLinearWorkflowExecutor linearWorkflowExecutor,
@@ -91,7 +93,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                                           LangchainRunExecutionGuard executionGuard,
                                           LangchainRunConcurrencyScheduler runConcurrencyScheduler,
                                           AgentCreditService creditService,
-                                          AgentRunCreditSettlementService creditSettlementService) {
+                                          AgentRunCreditSettlementService creditSettlementService,
+                                          AgentRunFinalizationService finalizationService) {
         this.planner = planner;
         this.linearWorkflowExecutor = linearWorkflowExecutor;
         this.dagWorkflowExecutor = dagWorkflowExecutor;
@@ -109,6 +112,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         this.runConcurrencyScheduler = runConcurrencyScheduler;
         this.creditService = creditService;
         this.creditSettlementService = creditSettlementService;
+        this.finalizationService = finalizationService;
     }
 
     @Override
@@ -280,6 +284,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 persistAssistantMessage(runId, userId, stageModels, result.getFinalAnswer());
                 // 260612-01-02: 成功路径触发结算
                 tryScheduleSettlement(runId, userId);
+                // 260618-workspace-v0: 触发终态事件，v0 在 agentService 侧监听（跨 JVM gap 详见 AgentRunFinalizedEvent）
+                finalizationService.publishFinalizedEvent(runId, userId, AgentRunStatus.COMPLETED.name());
             } else if (result.isPartial()) {
                 // DAG recovery judge 判定部分完成：写入 PARTIAL 状态 + 部分答案。
                 // PARTIAL 不是普通失败：它表示部分 todo 被明确跳过，最终答案可供用户参考，
@@ -307,6 +313,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 }
                 // 260612-01-02: 部分完成也触发结算
                 tryScheduleSettlement(runId, userId);
+                // 260618-workspace-v0: 触发终态事件
+                finalizationService.publishFinalizedEvent(runId, userId, AgentRunStatus.PARTIAL.name());
             } else {
                 publishFailure(runId, userId, userGoal, result, null);
                 tryScheduleSettlement(runId, userId);
@@ -513,6 +521,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 decision.getReason());
         runMapper.updateSnapshot(runId, userId, AgentRunStatus.FAILED, snapshot, true, decision.getReason());
         markRunStatus(runId, AgentRunStatus.FAILED);
+        // 260618-workspace-v0: 触发终态事件
+        finalizationService.publishFinalizedEvent(runId, userId, AgentRunStatus.FAILED.name());
         Map<String, Object> payload = new LinkedHashMap<>(decision.getEventPayload());
         payload.put("engine", "agentLangchainService");
         eventService.append(runId, userId, decision.getEventType(), payload);

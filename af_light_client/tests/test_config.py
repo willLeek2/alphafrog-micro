@@ -31,6 +31,81 @@ debug:
 """)
         self.assertTrue(cfg.debug_logs)
         self.assertEqual(cfg.debug_output_root, "output/sample")
+        self.assertFalse(cfg.debug_tui_snapshots.enabled)
+
+    def test_tui_snapshots_config_parsed_with_milliseconds(self) -> None:
+        cfg = _load("""
+base_url: "http://localhost:8090"
+username: "u"
+password: "p"
+question: "q"
+debug:
+  logs: false
+  output_root: "output/sample"
+  tui_snapshots:
+    enabled: true
+    interval_ms: 250
+    batch_interval_ms: 5000
+""")
+        self.assertTrue(cfg.debug_tui_snapshots.enabled)
+        self.assertEqual(cfg.debug_tui_snapshots.interval_ms, 250)
+        self.assertEqual(cfg.debug_tui_snapshots.batch_interval_ms, 5000)
+
+    def test_tui_snapshots_config_parsed_with_seconds(self) -> None:
+        cfg = _load("""
+base_url: "http://localhost:8090"
+username: "u"
+password: "p"
+question: "q"
+debug:
+  tui_snapshots:
+    enabled: true
+    interval_seconds: 2
+    batch_interval_seconds: 60
+""")
+        self.assertEqual(cfg.debug_tui_snapshots.interval_ms, 2000)
+        self.assertEqual(cfg.debug_tui_snapshots.batch_interval_ms, 60000)
+
+    def test_tui_snapshot_interval_seconds_must_be_greater_than_one(self) -> None:
+        with self.assertRaisesRegex(ValueError, "seconds must be > 1"):
+            _load("""
+base_url: "http://localhost:8090"
+username: "u"
+password: "p"
+question: "q"
+debug:
+  tui_snapshots:
+    enabled: true
+    interval_seconds: 1
+    batch_interval_ms: 5000
+""")
+
+    def test_tui_snapshot_interval_ms_must_be_greater_than_200(self) -> None:
+        with self.assertRaisesRegex(ValueError, "ms must be > 200"):
+            _load("""
+base_url: "http://localhost:8090"
+username: "u"
+password: "p"
+question: "q"
+debug:
+  tui_snapshots:
+    enabled: true
+    interval_ms: 200
+    batch_interval_ms: 5000
+""")
+
+    def test_tui_snapshot_batch_interval_required_when_enabled(self) -> None:
+        with self.assertRaisesRegex(ValueError, "batch interval must be configured"):
+            _load("""
+base_url: "http://localhost:8090"
+username: "u"
+password: "p"
+question: "q"
+debug:
+  tui_snapshots:
+    enabled: true
+    interval_ms: 250
+""")
 
     def test_as_log_dict_redacts_password(self) -> None:
         cfg = _load("""

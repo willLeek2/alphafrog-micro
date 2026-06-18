@@ -137,6 +137,37 @@
         </if>
     </select>
 
+    <!--
+        workspace v0 polling observer 用：列出处于终态集合、updated_at > fromTime 的 run。
+        终态集合由 caller 传入（避免硬编码；migration 加新终态时只需更新 caller）。
+    -->
+    <select id="listByStatusAndUpdatedAfter" resultMap="AgentRunResultMap">
+        SELECT id,
+               user_id,
+               status,
+               current_step,
+               max_steps,
+               plan_json::text AS plan_json,
+               snapshot_json::text AS snapshot_json,
+               last_error,
+               ttl_expires_at,
+               started_at,
+               updated_at,
+               completed_at,
+               ext::text AS ext,
+               0 AS duration_ms,
+               0 AS total_tokens,
+               0 AS tool_calls
+        FROM alphafrog_agent_run
+        WHERE status IN
+        <foreach collection="statuses" item="s" open="(" separator="," close=")">
+            CAST(#{s} AS VARCHAR)
+        </foreach>
+          AND updated_at &gt; #{fromTime}
+        ORDER BY updated_at ASC
+        LIMIT #{limit}
+    </select>
+
     <select id="sumCompletedCreditsByUser" resultType="int">
         SELECT COALESCE(SUM(
                    CASE

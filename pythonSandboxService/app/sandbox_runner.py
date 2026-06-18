@@ -11,6 +11,7 @@ from llm_sandbox import SandboxSession
 from llm_sandbox.exceptions import SandboxTimeoutError
 
 from .config import SandboxConfig
+from .dataset_manifest import expand_dataset_ids
 
 logger = logging.getLogger(__name__)
 
@@ -142,8 +143,29 @@ def _prepare_task_workspace(
         _exec_checked(session, f"rm -rf {config.workdir}/input", "remove_old_input")
         _exec_checked(session, f"ln -s {task_input} {config.workdir}/input", "create_input_symlink")
 
-    # Copy datasets into task workspace
-    for ds_id in dataset_id_list:
+    expanded = expand_dataset_ids(config.data_dir, dataset_id_list)
+    copy_ids: List[str] = []
+    for manifest_id in expanded.manifest_ids:
+        if manifest_id not in copy_ids:
+            copy_ids.append(manifest_id)
+    for atomic_id in expanded.atomic_ids:
+        if atomic_id not in copy_ids:
+            copy_ids.append(atomic_id)
+
+    if expanded.failed_members or expanded.skipped_members:
+        _log_in_container(
+            session,
+            task_id,
+            config,
+            "manifest_expand "
+            f"manifests={len(expanded.manifest_ids)} "
+            f"atomics={len(expanded.atomic_ids)} "
+            f"failed={len(expanded.failed_members)} "
+            f"skipped={len(expanded.skipped_members)}",
+        )
+
+    # Copy manifest directories and expanded atomic datasets into task workspace.
+    for ds_id in copy_ids:
         dataset_dir = _resolve_dataset_dir(config, ds_id)
         files_to_copy = _list_files(dataset_dir, files)
         dataset_mount = f"{task_input}/{ds_id}"

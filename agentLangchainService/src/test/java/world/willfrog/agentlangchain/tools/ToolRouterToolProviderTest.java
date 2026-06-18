@@ -57,6 +57,7 @@ class ToolRouterToolProviderTest {
         MarketDataTools marketDataTools = new MarketDataTools(
                 mock(DatasetWriter.class),
                 mock(DatasetRegistry.class),
+                mock(ManifestWriter.class),
                 null,
                 new AgentLlmProperties(),
                 objectMapper

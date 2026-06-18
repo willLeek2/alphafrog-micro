@@ -1,7 +1,6 @@
 package world.willfrog.alphafrogmicro.frontend.controller.agent;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import jakarta.servlet.http.HttpServletRequest;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -58,10 +57,6 @@ class AgentControllerTest {
         when(callDetailBlobReader.loadToolCallDetail(any(), any())).thenReturn(Optional.empty());
         controller = new AgentController(authService, new ObjectMapper(), runResultCacheService, callDetailBlobReader);
         ReflectionTestUtils.setField(controller, "agentDubboServiceLangchain", agentDubboService);
-        ReflectionTestUtils.setField(controller, "agentDubboServiceLegacy", agentDubboService);
-        HttpServletRequest request = mock(HttpServletRequest.class);
-        when(request.getRequestURI()).thenReturn("/api/agent/runs/run-1");
-        ReflectionTestUtils.setField(controller, "request", request);
 
         authentication = mock(Authentication.class);
         when(authentication.isAuthenticated()).thenReturn(true);

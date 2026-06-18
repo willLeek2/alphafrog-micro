@@ -22,8 +22,10 @@ from unittest.mock import MagicMock, patch
 
 from af_light_client.__main__ import (
     main,
+    _format_credit,
     _needs_cost_refresh,
     _print_credits_summary,
+    _print_query_credits_result,
     _query_credits_config,
     _resolve_output_dir,
 )
@@ -238,6 +240,48 @@ class MainEntryTest(unittest.TestCase):
         self.assertEqual(exit_code, 2)
         self.assertIn("[query-credits]", stderr.getvalue())
         self.assertIn("AF_BASE_URL", stderr.getvalue())
+
+
+class FormatCreditTest(unittest.TestCase):
+    def test_rounds_to_three_decimals(self) -> None:
+        self.assertEqual(_format_credit("49.963412"), "49.963")
+        self.assertEqual(_format_credit(49.963412), "49.963")
+
+    def test_pads_to_three_decimals(self) -> None:
+        self.assertEqual(_format_credit("50"), "50.000")
+        self.assertEqual(_format_credit(50.0), "50.000")
+
+    def test_rounds_half_up(self) -> None:
+        self.assertEqual(_format_credit("49.9995"), "50.000")
+        self.assertEqual(_format_credit("49.9994"), "49.999")
+
+
+class PrintQueryCreditsResultTest(unittest.TestCase):
+    def test_prints_credits_with_three_decimal_places(self) -> None:
+        result = {
+            "runId": "run-8",
+            "totalCredits": "0.017851",
+            "currency": "USD",
+            "summary": {
+                "immediateCount": 0,
+                "delayedCount": 0,
+                "pendingCount": 0,
+                "missingCount": 12,
+                "totalCallCount": 12,
+            },
+            "refreshed": True,
+            "userCredits": {
+                "remainingCredits": "49.963412",
+                "currency": "USD",
+            },
+        }
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            _print_query_credits_result(result)
+        output = buf.getvalue()
+        self.assertIn("总消耗 0.018 USD", output)
+        self.assertIn("用户当前剩余 credit: 49.963 USD", output)
+        self.assertIn("已触发一次 cost 刷新", output)
 
 
 if __name__ == "__main__":

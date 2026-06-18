@@ -65,7 +65,7 @@ public class AgentLlmLocalConfigLoader {
     @Value("${agent.llm.prompt-base-dir:}")
     private String promptBaseDir;
 
-    @Value("${spring.application.name:agent-service}")
+    @Value("${spring.application.name:agent-platform}")
     private String serviceName;
 
     @Value("${spring.application.instance-id:${HOSTNAME:unknown}}")

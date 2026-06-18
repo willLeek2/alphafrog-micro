@@ -24,6 +24,12 @@ result_preview_chars: 280
 debug:
   logs: false
   output_root: "af_light_client/output"
+  tui_snapshots:
+    enabled: false
+    # Use either interval_seconds (> 1) or interval_ms (> 200).
+    interval_seconds: 2
+    # Roll to a new tui_batch0XX.txt file on this cadence.
+    batch_interval_ms: 60000
 
 llm:
   # endpointName / modelName / provider 会直接进入 create run 请求体。

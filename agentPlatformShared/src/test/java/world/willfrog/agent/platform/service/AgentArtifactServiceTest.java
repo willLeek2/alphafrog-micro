@@ -10,6 +10,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.entity.AgentRunEvent;
+import world.willfrog.agent.platform.mapper.AgentRunEventMapper;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -24,6 +25,8 @@ class AgentArtifactServiceTest {
 
     @Mock
     private AgentEventService eventService;
+    @Mock
+    private AgentRunEventMapper agentRunEventMapper;
 
     private AgentArtifactService service;
 
@@ -32,7 +35,7 @@ class AgentArtifactServiceTest {
 
     @BeforeEach
     void setUp() {
-        service = new AgentArtifactService(eventService, new ObjectMapper());
+        service = new AgentArtifactService(eventService, agentRunEventMapper, new ObjectMapper());
         ReflectionTestUtils.setField(service, "artifactStoragePath", tempDir.resolve("artifacts").toString());
         ReflectionTestUtils.setField(service, "datasetPath", tempDir.resolve("datasets").toString());
         ReflectionTestUtils.setField(service, "normalRetentionDays", 7);

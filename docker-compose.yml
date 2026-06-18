@@ -468,7 +468,7 @@ services:
       AF_REDIS_PORT: 6379
       AF_REDIS_PASSWORD: ${AF_REDIS_PASSWORD:-Excited1s}
       NACOS_ADDRESS: nacos
-      # Agent Service LLM 配置
+      # Agent LLM 配置
       # 本地 JSON 配置文件（容器内路径）
       AF_AGENT_LLM_CONFIG_FILE: ${AF_AGENT_LLM_CONFIG_FILE:-/app/config-dynamic/agent-llm.local.json}
       AF_AGENT_LLM_PROMPT_BASE_DIR: ${AF_AGENT_LLM_PROMPT_BASE_DIR:-/app/config}
@@ -515,7 +515,7 @@ services:
       no_proxy: ${NO_PROXY-localhost,127.0.0.1,nacos,redis,rabbitmq,meilisearch,host.docker.internal}
     volumes:
       - ./data/agent_datasets:/data/agent_datasets
-      - ./agentService/config:/app/config:ro
+      - ./agentLangchainService/config:/app/config:ro
       - ./data/agent-configs:/app/config-dynamic
     ports:
       - "50058:50058"
@@ -555,7 +555,7 @@ services:
       AGENT_LANGCHAIN_TRAFFIC_CANARY_PERCENT: ${AGENT_LANGCHAIN_TRAFFIC_CANARY_PERCENT:-0}
       AGENT_LANGCHAIN_DUBBO_PORT: 50059
       AGENT_LANGCHAIN_SERVER_PORT: 50158
-      # Agent LLM 配置（对齐 agent-service）
+      # Agent LLM 配置（使用 agentLangchainService/config 作为共享静态 prompt/config 目录）
       AF_AGENT_LLM_CONFIG_FILE: ${AF_AGENT_LLM_CONFIG_FILE:-/app/config-dynamic/agent-llm.local.json}
       AF_AGENT_LLM_PROMPT_BASE_DIR: ${AF_AGENT_LLM_PROMPT_BASE_DIR:-/app/config}
       AF_AGENT_API_KEY: ${AF_AGENT_API_KEY:-demo}
@@ -585,13 +585,13 @@ services:
       AF_CONFIG_NACOS_DATA_ID: "code-refine.json"
       AF_CONFIG_NACOS_GROUP: "alphafrog-config"
       AF_AGENT_FLOW_CODE_REFINE_CONFIG_FILE: "/app/config-dynamic/code-refine.local.json"
-      JAVA_TOOL_OPTIONS: "-Xms512m -Xmx1g ${AF_JAVA_PROXY_OPTIONS--Dhttp.proxyHost=host.docker.internal -Dhttp.proxyPort=7890 -Dhttps.proxyHost=host.docker.internal -Dhttps.proxyPort=7890 -Dhttp.nonProxyHosts=localhost|127.0.0.1|nacos|redis|rabbitmq|meilisearch|agent-service|host.docker.internal}"
+      JAVA_TOOL_OPTIONS: "-Xms512m -Xmx1g ${AF_JAVA_PROXY_OPTIONS--Dhttp.proxyHost=host.docker.internal -Dhttp.proxyPort=7890 -Dhttps.proxyHost=host.docker.internal -Dhttps.proxyPort=7890 -Dhttp.nonProxyHosts=localhost|127.0.0.1|nacos|redis|rabbitmq|meilisearch|host.docker.internal}"
       <<: *agent-llm-proxy-env
-      NO_PROXY: ${NO_PROXY-localhost,127.0.0.1,nacos,redis,rabbitmq,meilisearch,agent-service,host.docker.internal}
-      no_proxy: ${NO_PROXY-localhost,127.0.0.1,nacos,redis,rabbitmq,meilisearch,agent-service,host.docker.internal}
+      NO_PROXY: ${NO_PROXY-localhost,127.0.0.1,nacos,redis,rabbitmq,meilisearch,host.docker.internal}
+      no_proxy: ${NO_PROXY-localhost,127.0.0.1,nacos,redis,rabbitmq,meilisearch,host.docker.internal}
     volumes:
       - ./data/agent_datasets:/data/agent_datasets
-      - ./agentService/config:/app/config:ro
+      - ./agentLangchainService/config:/app/config:ro
       - ./data/agent-configs:/app/config-dynamic
     ports:
       - "50059:50059"
@@ -768,8 +768,6 @@ services:
       admin-service:
         condition: service_started
       portfolio-service:
-        condition: service_started
-      agent-service:
         condition: service_started
       agent-langchain-service:
         condition: service_started

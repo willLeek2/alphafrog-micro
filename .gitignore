@@ -66,6 +66,7 @@ test-secrets.yml
 .kilocode/
 .github/
 .claude/
+.collab/
 
 # Coding Agent Files
 
@@ -89,8 +90,8 @@ CLAUDE.md
 
 
 .env
-agentService/config/agent-llm.local.json
-agentService/config/search-llm.local.json
+agentLangchainService/config/agent-llm.local.json
+agentLangchainService/config/code-refine.local.json
 externalInfoService/config/rag-fetch.local.json
 externalInfoService/config/rag-embedding.local.json
 

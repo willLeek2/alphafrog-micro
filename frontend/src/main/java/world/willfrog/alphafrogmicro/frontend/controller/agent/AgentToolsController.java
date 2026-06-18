@@ -1,10 +1,8 @@
 package world.willfrog.alphafrogmicro.frontend.controller.agent;
 
-import jakarta.servlet.http.HttpServletRequest;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.dubbo.config.annotation.DubboReference;
 import org.apache.dubbo.rpc.RpcException;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -36,12 +34,6 @@ public class AgentToolsController {
     @DubboReference(group = "langchain", check = false)
     private AgentDubboService agentDubboServiceLangchain;
 
-    @DubboReference(group = "legacy", check = false)
-    private AgentDubboService agentDubboServiceLegacy;
-
-    @Autowired
-    private HttpServletRequest request;
-
     private final AuthService authService;
 
     public AgentToolsController(AuthService authService) {
@@ -49,10 +41,6 @@ public class AgentToolsController {
     }
 
     private AgentDubboService resolveService() {
-        String uri = request.getRequestURI();
-        if (uri != null && uri.startsWith("/api/agent-legacy")) {
-            return agentDubboServiceLegacy;
-        }
         return agentDubboServiceLangchain;
     }
 
@@ -61,36 +49,14 @@ public class AgentToolsController {
         return toolsInternal(authentication);
     }
 
-    /** @deprecated Use {@code GET /api/agent/tools}. */
-    @Deprecated
-    @GetMapping("/api/agent-legacy/tools")
-    public ResponseWrapper<List<AgentToolResponse>> toolsLegacy(Authentication authentication) {
-        return toolsInternal(authentication);
-    }
-
     @GetMapping("/api/agent/config")
     public ResponseWrapper<AgentConfigResponse> config(Authentication authentication) {
-        return configInternal(authentication);
-    }
-
-    /** @deprecated Use {@code GET /api/agent/config}. */
-    @Deprecated
-    @GetMapping("/api/agent-legacy/config")
-    public ResponseWrapper<AgentConfigResponse> configLegacy(Authentication authentication) {
         return configInternal(authentication);
     }
 
     @GetMapping("/api/agent/artifacts/{artifactId}/download")
     public ResponseEntity<byte[]> download(Authentication authentication,
                                            @PathVariable("artifactId") String artifactId) {
-        return downloadInternal(authentication, artifactId);
-    }
-
-    /** @deprecated Use {@code GET /api/agent/artifacts/{artifactId}/download}. */
-    @Deprecated
-    @GetMapping("/api/agent-legacy/artifacts/{artifactId}/download")
-    public ResponseEntity<byte[]> downloadLegacy(Authentication authentication,
-                                                 @PathVariable("artifactId") String artifactId) {
         return downloadInternal(authentication, artifactId);
     }
 

@@ -11,10 +11,12 @@ import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 import world.willfrog.agent.tools.dataset.DatasetRegistry;
 import world.willfrog.agent.tools.dataset.DatasetWriter;
+import world.willfrog.agent.tools.dataset.ManifestWriter;
 import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.alphafrogmicro.common.utils.DateConvertUtils;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticIndexService;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticStockDailyItem;
+import world.willfrog.alphafrogmicro.domestic.idl.DomesticStockDailyByTsCodeAndDateRangeRequest;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticStockDailyByTsCodeAndDateRangeResponse;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticStockInfoSimpleItem;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticStockSearchResponse;
@@ -27,11 +29,19 @@ import java.util.Map;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
@@ -42,11 +52,14 @@ class MarketDataToolsBatchTest {
     @Mock
     private DatasetRegistry datasetRegistry;
     @Mock
+    private ManifestWriter manifestWriter;
+    @Mock
     private AgentLlmLocalConfigLoader localConfigLoader;
 
     private MarketDataTools tools;
     private ObjectMapper objectMapper;
     private DomesticIndexService indexService;
+    private DomesticStockService stockService;
 
     @BeforeEach
     void setUp() {
@@ -61,11 +74,13 @@ class MarketDataToolsBatchTest {
         properties.setRuntime(runtime);
         lenient().when(localConfigLoader.current()).thenReturn(Optional.of(properties));
 
-        tools = new MarketDataTools(datasetWriter, datasetRegistry, localConfigLoader, properties, objectMapper);
+        tools = new MarketDataTools(datasetWriter, datasetRegistry, manifestWriter, localConfigLoader, properties, objectMapper);
         lenient().when(datasetWriter.isEnabled()).thenReturn(false);
         lenient().when(datasetRegistry.isEnabled()).thenReturn(false);
+        lenient().when(manifestWriter.isEnabled()).thenReturn(false);
+        ReflectionTestUtils.setField(tools, "emitManifest", false);
 
-        DomesticStockService stockService = mock(DomesticStockService.class);
+        stockService = mock(DomesticStockService.class);
         ReflectionTestUtils.setField(tools, "domesticStockService", stockService);
         indexService = mock(DomesticIndexService.class);
         ReflectionTestUtils.setField(tools, "domesticIndexService", indexService);
@@ -256,6 +271,187 @@ class MarketDataToolsBatchTest {
 
         assertEquals(false, root.get("ok"));
         assertEquals("BATCH_LIMIT_EXCEEDED", error.get("code"));
+    }
+
+    @Test
+    void getStockDaily_batch_shouldNotEmitManifestWhenFlagOff() throws Exception {
+        String response = tools.getStockDaily("000001.SZ|000002.SZ", "20240101", "20240131");
+        Map<?, ?> root = objectMapper.readValue(response, Map.class);
+        Map<?, ?> data = (Map<?, ?>) root.get("data");
+
+        assertEquals(true, root.get("ok"));
+        assertEquals("batch", data.get("mode"));
+        assertTrue(data.containsKey("dataset_ids"));
+        assertTrue(!data.containsKey("dataset_id") || "".equals(data.get("dataset_id")));
+        verify(manifestWriter, never()).writeManifest(anyString(), anyString(), anyString(), anyList(), anyInt(), anyList());
+    }
+
+    @Test
+    void getStockDaily_batch_shouldEmitManifestWhenFlagOn() throws Exception {
+        ReflectionTestUtils.setField(tools, "emitManifest", true);
+        when(datasetWriter.isEnabled()).thenReturn(true);
+        when(datasetRegistry.isEnabled()).thenReturn(true);
+        when(manifestWriter.isEnabled()).thenReturn(true);
+        when(datasetRegistry.findReusable(eq("stock_daily"), anyString(), anyString(), anyString(), anyList()))
+                .thenReturn(Optional.empty());
+        when(datasetWriter.writeDataset(anyString(), anyString(), anyString(), anyString(), anyList(), anyList(), any()))
+                .thenReturn("atomic-ds-1", "atomic-ds-2");
+        when(datasetRegistry.findReusableManifest(anyString(), anyString(), anyString(), anyList(), anyList()))
+                .thenReturn(Optional.empty());
+        when(manifestWriter.writeManifest(
+                eq("stock_daily"),
+                eq("20240101"),
+                eq("20240131"),
+                anyList(),
+                anyInt(),
+                anyList()
+        )).thenReturn("manifest-stock_daily-20240101-20240131-deadbeef");
+
+        String response = tools.getStockDaily("000001.SZ|000002.SZ", "20240101", "20240131");
+        Map<?, ?> root = objectMapper.readValue(response, Map.class);
+        Map<?, ?> data = (Map<?, ?>) root.get("data");
+
+        assertEquals(true, root.get("ok"));
+        assertEquals("manifest-stock_daily-20240101-20240131-deadbeef", data.get("dataset_id"));
+        assertEquals("manifest-stock_daily-20240101-20240131-deadbeef", data.get("manifest_id"));
+        assertNotNull(data.get("manifest"));
+        verify(datasetRegistry).registerManifest(
+                eq("stock_daily"),
+                eq("20240101"),
+                eq("20240131"),
+                anyList(),
+                anyList(),
+                eq("manifest-stock_daily-20240101-20240131-deadbeef"),
+                anyInt(),
+                anyInt(),
+                anyInt(),
+                anyInt()
+        );
+    }
+
+    @Test
+    void getStockDaily_batch_shouldFallbackWhenManifestWriteFails() throws Exception {
+        ReflectionTestUtils.setField(tools, "emitManifest", true);
+        when(datasetWriter.isEnabled()).thenReturn(true);
+        when(datasetRegistry.isEnabled()).thenReturn(true);
+        when(manifestWriter.isEnabled()).thenReturn(true);
+        when(datasetRegistry.findReusable(eq("stock_daily"), anyString(), anyString(), anyString(), anyList()))
+                .thenReturn(Optional.empty());
+        when(datasetWriter.writeDataset(anyString(), anyString(), anyString(), anyString(), anyList(), anyList(), any()))
+                .thenReturn("atomic-ds-1", "atomic-ds-2");
+        when(datasetRegistry.findReusableManifest(anyString(), anyString(), anyString(), anyList(), anyList()))
+                .thenReturn(Optional.empty());
+        when(manifestWriter.writeManifest(anyString(), anyString(), anyString(), anyList(), anyInt(), anyList()))
+                .thenThrow(new RuntimeException("disk full"));
+
+        String response = tools.getStockDaily("000001.SZ|000002.SZ", "20240101", "20240131");
+        Map<?, ?> root = objectMapper.readValue(response, Map.class);
+        Map<?, ?> data = (Map<?, ?>) root.get("data");
+
+        assertEquals(true, root.get("ok"));
+        assertEquals("batch", data.get("mode"));
+        assertTrue(!data.containsKey("dataset_id") || data.get("dataset_id") == null);
+    }
+
+    @Test
+    void getStockDaily_batch_shouldReuseExistingManifestWithoutRewrite() throws Exception {
+        ReflectionTestUtils.setField(tools, "emitManifest", true);
+        when(datasetWriter.isEnabled()).thenReturn(true);
+        when(datasetRegistry.isEnabled()).thenReturn(true);
+        when(manifestWriter.isEnabled()).thenReturn(true);
+        when(datasetRegistry.findReusable(eq("stock_daily"), anyString(), anyString(), anyString(), anyList()))
+                .thenReturn(Optional.empty());
+        when(datasetWriter.writeDataset(anyString(), anyString(), anyString(), anyString(), anyList(), anyList(), any()))
+                .thenReturn("atomic-ds-1", "atomic-ds-2");
+        DatasetRegistry.ManifestMeta reused = DatasetRegistry.ManifestMeta.builder()
+                .manifestId("manifest-stock_daily-20240101-20240131-reused")
+                .build();
+        when(datasetRegistry.findReusableManifest(anyString(), anyString(), anyString(), anyList(), anyList()))
+                .thenReturn(Optional.of(reused));
+
+        String response = tools.getStockDaily("000001.SZ|000002.SZ", "20240101", "20240131");
+        Map<?, ?> root = objectMapper.readValue(response, Map.class);
+        Map<?, ?> data = (Map<?, ?>) root.get("data");
+
+        assertEquals(true, root.get("ok"));
+        assertEquals("manifest-stock_daily-20240101-20240131-reused", data.get("dataset_id"));
+        assertEquals("manifest-stock_daily-20240101-20240131-reused", data.get("manifest_id"));
+        verify(manifestWriter, never()).writeManifest(anyString(), anyString(), anyString(), anyList(), anyInt(), anyList());
+        verify(datasetRegistry, never()).registerManifest(anyString(), anyString(), anyString(), anyList(), anyList(),
+                anyString(), anyInt(), anyInt(), anyInt(), anyInt());
+    }
+
+    @Test
+    void getStockDaily_batch_partialFailure_shouldEmitManifestWhenReadyMembersExist() throws Exception {
+        ReflectionTestUtils.setField(tools, "emitManifest", true);
+        when(datasetWriter.isEnabled()).thenReturn(true);
+        when(datasetRegistry.isEnabled()).thenReturn(true);
+        when(manifestWriter.isEnabled()).thenReturn(true);
+        when(datasetRegistry.findReusable(eq("stock_daily"), anyString(), anyString(), anyString(), anyList()))
+                .thenReturn(Optional.empty());
+        when(datasetWriter.writeDataset(anyString(), anyString(), anyString(), anyString(), anyList(), anyList(), any()))
+                .thenReturn("atomic-ds-1");
+        when(datasetRegistry.findReusableManifest(anyString(), anyString(), anyString(), anyList(), anyList()))
+                .thenReturn(Optional.empty());
+        when(manifestWriter.writeManifest(anyString(), anyString(), anyString(), anyList(), anyInt(), anyList()))
+                .thenReturn("manifest-stock_daily-20240101-20240131-partial");
+
+        DomesticStockDailyByTsCodeAndDateRangeResponse successResponse = DomesticStockDailyByTsCodeAndDateRangeResponse.newBuilder()
+                .addItems(DomesticStockDailyItem.newBuilder()
+                        .setTsCode("000001.SZ")
+                        .setTradeDate(20240102L)
+                        .setOpen(10.0)
+                        .setHigh(10.5)
+                        .setLow(9.8)
+                        .setClose(10.2)
+                        .setPreClose(10.0)
+                        .setChange(0.2)
+                        .setPctChg(2.0)
+                        .setVol(1000.0)
+                        .setAmount(10000.0)
+                        .build())
+                .build();
+        when(stockService.getStockDailyByTsCodeAndDateRange(any())).thenAnswer(invocation -> {
+            DomesticStockDailyByTsCodeAndDateRangeRequest request = invocation.getArgument(0);
+            if ("000002.SZ".equals(request.getTsCode())) {
+                return DomesticStockDailyByTsCodeAndDateRangeResponse.newBuilder().build();
+            }
+            return successResponse;
+        });
+
+        String response = tools.getStockDaily("000001.SZ|000002.SZ", "20240101", "20240131");
+        Map<?, ?> root = objectMapper.readValue(response, Map.class);
+        Map<?, ?> data = (Map<?, ?>) root.get("data");
+
+        assertEquals(true, root.get("ok"));
+        assertEquals("batch", data.get("mode"));
+        assertEquals(1, data.get("success_count"));
+        assertEquals(1, data.get("failure_count"));
+        assertEquals("manifest-stock_daily-20240101-20240131-partial", data.get("dataset_id"));
+        List<?> datasetIds = (List<?>) data.get("dataset_ids");
+        assertEquals(1, datasetIds.size());
+        assertEquals("atomic-ds-1", datasetIds.get(0));
+    }
+
+    @Test
+    void getStockDaily_batch_allFailed_shouldNotEmitTopLevelManifest() throws Exception {
+        ReflectionTestUtils.setField(tools, "emitManifest", true);
+        when(datasetWriter.isEnabled()).thenReturn(true);
+        when(datasetRegistry.isEnabled()).thenReturn(true);
+        when(manifestWriter.isEnabled()).thenReturn(true);
+        when(stockService.getStockDailyByTsCodeAndDateRange(any()))
+                .thenReturn(DomesticStockDailyByTsCodeAndDateRangeResponse.newBuilder().build());
+
+        String response = tools.getStockDaily("000001.SZ|000002.SZ", "20240101", "20240131");
+        Map<?, ?> root = objectMapper.readValue(response, Map.class);
+        Map<?, ?> data = (Map<?, ?>) root.get("data");
+
+        assertEquals(true, root.get("ok"));
+        assertEquals(0, data.get("success_count"));
+        assertEquals(2, data.get("failure_count"));
+        assertFalse(data.containsKey("dataset_id"));
+        assertTrue(((List<?>) data.get("dataset_ids")).isEmpty());
+        verify(manifestWriter, never()).writeManifest(anyString(), anyString(), anyString(), anyList(), anyInt(), anyList());
     }
 
     private long toTimestamp(String date) {

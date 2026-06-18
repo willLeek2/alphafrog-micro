@@ -28,6 +28,9 @@ class TerminalRenderer:
         sys.stdout.write("\x1b[?25h")
         sys.stdout.flush()
 
+    def snapshot_text(self, snapshot: ViewSnapshot) -> str:
+        return "\n".join(self._build_lines(snapshot)) + "\n"
+
     def _build_lines(self, snapshot: ViewSnapshot) -> List[str]:
         width = max(72, min(120, shutil.get_terminal_size((100, 32)).columns))
         title = f"AlphaFrog Agent  {snapshot.status}"

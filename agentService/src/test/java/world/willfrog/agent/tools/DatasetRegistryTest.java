@@ -40,4 +40,38 @@ class DatasetRegistryTest {
         assertEquals(List.of("trade_date", "close"), meta.getColumns());
         assertEquals(126, meta.getRowCount());
     }
+
+    @Test
+    void manifestMeta_shouldDeserializeFromJson() throws Exception {
+        String json = "{"
+                + "\"manifestId\":\"manifest-stock_daily-20240101-20240131-abc12345\","
+                + "\"queryKey\":\"query-key-m1\","
+                + "\"dataType\":\"stock_daily\","
+                + "\"startDate\":\"20240101\","
+                + "\"endDate\":\"20240131\","
+                + "\"columns\":[\"trade_date\",\"close\"],"
+                + "\"columnsSignature\":\"trade_date,close\","
+                + "\"memberCount\":50,"
+                + "\"readyCount\":48,"
+                + "\"failedCount\":2,"
+                + "\"totalRowCount\":1234,"
+                + "\"path\":\"/data/agent_datasets/manifest-stock_daily-20240101-20240131-abc12345\","
+                + "\"createdAt\":1739428200000,"
+                + "\"lastAccessAt\":1739428300000,"
+                + "\"hitCount\":3,"
+                + "\"ttlSeconds\":604800,"
+                + "\"expireAt\":1739999999999"
+                + "}";
+
+        DatasetRegistry.ManifestMeta meta = objectMapper.readValue(json, DatasetRegistry.ManifestMeta.class);
+
+        assertEquals("manifest-stock_daily-20240101-20240131-abc12345", meta.getManifestId());
+        assertEquals("query-key-m1", meta.getQueryKey());
+        assertEquals("stock_daily", meta.getDataType());
+        assertEquals(50, meta.getMemberCount());
+        assertEquals(48, meta.getReadyCount());
+        assertEquals(2, meta.getFailedCount());
+        assertEquals(1234, meta.getTotalRowCount());
+        assertEquals(List.of("trade_date", "close"), meta.getColumns());
+    }
 }

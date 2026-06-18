@@ -58,6 +58,21 @@ public interface AgentRunMapper {
                        @Param("ttlExpiresAt") OffsetDateTime ttlExpiresAt);
 
     /**
+     * 列出处于指定终态集合、且 updated_at 大于 fromTime 的 run（polling observer 用）。
+     *
+     * <p>按 updated_at ASC 排序，保证先处理最早的 run；
+     * workspace polling observer 拿到结果后用最大 updated_at 推进 lastSeenAt，
+     * 避免重复 dump。</p>
+     *
+     * @param statuses 终态枚举集合（COMPLETED / PARTIAL / FAILED / CANCELED / EXPIRED）
+     * @param fromTime 起点（> fromTime）
+     * @param limit    单批上限
+     */
+    List<AgentRun> listByStatusAndUpdatedAfter(@Param("statuses") List<AgentRunStatus> statuses,
+                                               @Param("fromTime") OffsetDateTime fromTime,
+                                               @Param("limit") int limit);
+
+    /**
      * 根据 run ID 和用户 ID 删除指定的 Agent Run。
      * <p>
      * 说明：

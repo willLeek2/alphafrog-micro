@@ -10,6 +10,13 @@ import yaml
 
 
 @dataclass
+class TuiSnapshotDebugConfig:
+    enabled: bool = False
+    interval_ms: int = 0
+    batch_interval_ms: int = 0
+
+
+@dataclass
 class LightClientConfig:
     base_url: str
     username: str
@@ -39,6 +46,7 @@ class LightClientConfig:
     create_body: Dict[str, Any] = field(default_factory=dict)
     debug_logs: bool = False
     debug_output_root: str = "af_light_client/output"
+    debug_tui_snapshots: TuiSnapshotDebugConfig = field(default_factory=TuiSnapshotDebugConfig)
 
     @classmethod
     def from_file(cls, path: Union[str, Path]) -> "LightClientConfig":
@@ -47,6 +55,7 @@ class LightClientConfig:
             raw = yaml.safe_load(fh) or {}
         if not isinstance(raw, dict):
             raise ValueError(f"config must be a YAML object: {config_path}")
+        debug_raw = raw.get("debug")
         cfg = cls(
             base_url=str(raw.get("base_url") or "").rstrip("/"),
             username=str(raw.get("username") or raw.get("user") or ""),
@@ -99,8 +108,9 @@ class LightClientConfig:
             result_preview_chars=int(raw.get("result_preview_chars") or 280),
             llm=_optional_dict(raw.get("llm"), "llm"),
             create_body=_optional_dict(raw.get("create_body"), "create_body"),
-            debug_logs=_debug_logs(raw.get("debug")),
-            debug_output_root=_debug_output_root(raw.get("debug")),
+            debug_logs=_debug_logs(debug_raw),
+            debug_output_root=_debug_output_root(debug_raw),
+            debug_tui_snapshots=_debug_tui_snapshots(debug_raw),
         )
         cfg.validate()
         return cfg
@@ -135,6 +145,13 @@ class LightClientConfig:
             raise ValueError("refresh_seconds must be > 0")
         if self.debug_logs and not self.debug_output_root.strip():
             raise ValueError("debug.output_root must be non-empty when debug.logs is true")
+        if self.debug_tui_snapshots.enabled:
+            if not self.debug_output_root.strip():
+                raise ValueError("debug.output_root must be non-empty when debug.tui_snapshots.enabled is true")
+            if self.debug_tui_snapshots.interval_ms <= 0:
+                raise ValueError("debug.tui_snapshots interval must be configured")
+            if self.debug_tui_snapshots.batch_interval_ms <= 0:
+                raise ValueError("debug.tui_snapshots.batch_interval_ms must be > 0")
 
     def create_request_body(self) -> Dict[str, Any]:
         body = copy.deepcopy(self.llm)
@@ -160,6 +177,67 @@ def _debug_output_root(raw: Any) -> str:
     if not isinstance(raw, dict):
         return "af_light_client/output"
     return str(raw.get("output_root") or "af_light_client/output")
+
+
+def _debug_tui_snapshots(raw: Any) -> TuiSnapshotDebugConfig:
+    if not isinstance(raw, dict):
+        return TuiSnapshotDebugConfig()
+    snapshots = raw.get("tui_snapshots")
+    if not isinstance(snapshots, dict):
+        return TuiSnapshotDebugConfig()
+    enabled = bool(snapshots.get("enabled", False))
+    interval_ms = _duration_ms(
+        snapshots,
+        seconds_key="interval_seconds",
+        millis_key="interval_ms",
+        label="debug.tui_snapshots interval",
+        min_seconds=1.0,
+        min_millis=200,
+        required=enabled,
+    )
+    batch_interval_ms = _duration_ms(
+        snapshots,
+        seconds_key="batch_interval_seconds",
+        millis_key="batch_interval_ms",
+        label="debug.tui_snapshots batch interval",
+        min_seconds=0.0,
+        min_millis=0,
+        required=enabled,
+    )
+    return TuiSnapshotDebugConfig(
+        enabled=enabled,
+        interval_ms=interval_ms,
+        batch_interval_ms=batch_interval_ms,
+    )
+
+
+def _duration_ms(
+    raw: Dict[str, Any],
+    *,
+    seconds_key: str,
+    millis_key: str,
+    label: str,
+    min_seconds: float,
+    min_millis: int,
+    required: bool,
+) -> int:
+    has_seconds = raw.get(seconds_key) is not None
+    has_millis = raw.get(millis_key) is not None
+    if has_seconds and has_millis:
+        raise ValueError(f"{label} must use either {seconds_key} or {millis_key}, not both")
+    if not has_seconds and not has_millis:
+        if required:
+            raise ValueError(f"{label} must be configured")
+        return 0
+    if has_seconds:
+        seconds = float(raw.get(seconds_key))
+        if seconds <= min_seconds:
+            raise ValueError(f"{label} seconds must be > {min_seconds:g}")
+        return int(round(seconds * 1000))
+    millis = int(raw.get(millis_key))
+    if millis <= min_millis:
+        raise ValueError(f"{label} ms must be > {min_millis}")
+    return millis
 
 
 def _optional_dict(raw: Any, field_name: str) -> Dict[str, Any]:

@@ -99,8 +99,8 @@ public class AgentPromptService {
 
     /**
      * 返回 Agent Run 入口的完整 System Prompt（含时间基准 + 全局指令）。
-     * 主要供旧版调用方（如 legacy agentService）使用；新代码（agentLangchainService）
-     * 倾向使用 {@link #reactSystemPrompt()} 配合 stage instruction 注入到 User Message。
+     * 主要供完整 Agent Run 入口使用；DAG 节点执行倾向使用 {@link #reactSystemPrompt()}
+     * 配合 stage instruction 注入到 User Message。
      *
      * @return 时间基准 + agent_run_system.txt 全局指令的拼接结果
      */

@@ -5,14 +5,12 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.dubbo.config.annotation.DubboReference;
 import org.apache.dubbo.rpc.RpcException;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.*;
 
-import jakarta.servlet.http.HttpServletRequest;
 import world.willfrog.alphafrogmicro.agent.idl.AgentDubboService;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunCostMessage;
@@ -98,7 +96,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 /**
  * Agent run HTTP API.
  * {@code /api/agent/**} routes exclusively to the {@code langchain} Dubbo group.
- * {@code /api/agent-legacy/**} routes exclusively to the {@code legacy} Dubbo group.
  */
 @RestController
 @RequiredArgsConstructor
@@ -106,7 +103,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class AgentController {
 
     private static final String AGENT_RUNS = "/api/agent/runs";
-    private static final String AGENT_LEGACY_RUNS = "/api/agent-legacy/runs";
 
     private static final int ADMIN_USER_TYPE = 1127;
     private static final int OBSERVABILITY_FULL_MAX_BYTES = 5 * 1024 * 1024;
@@ -114,26 +110,12 @@ public class AgentController {
     @DubboReference(group = "langchain", check = false)
     private AgentDubboService agentDubboServiceLangchain;
 
-    @DubboReference(group = "legacy", check = false)
-    private AgentDubboService agentDubboServiceLegacy;
-
-    @Autowired
-    private HttpServletRequest request;
-
     private final AuthService authService;
     private final ObjectMapper objectMapper;
     private final AgentRunResultCacheService runResultCacheService;
     private final AgentCallDetailBlobReader callDetailBlobReader;
 
-    /**
-     * 根据当前 HTTP 请求路径选择对应的 Dubbo provider。
-     * /api/agent/** -> langchain；/api/agent-legacy/** -> legacy。
-     */
     private AgentDubboService resolveService() {
-        String uri = request.getRequestURI();
-        if (uri != null && uri.startsWith("/api/agent-legacy")) {
-            return agentDubboServiceLegacy;
-        }
         return agentDubboServiceLangchain;
     }
 
@@ -141,16 +123,6 @@ public class AgentController {
     public ResponseWrapper<AgentRunResponse> create(Authentication authentication,
                                                     @RequestBody AgentRunCreateRequest request) {
         return createRun(authentication, request, agentDubboServiceLangchain);
-    }
-
-    /**
-     * @deprecated Use {@link #create(Authentication, AgentRunCreateRequest)} ({@code POST /api/agent/runs}).
-     */
-    @Deprecated
-    @PostMapping(AGENT_LEGACY_RUNS)
-    public ResponseWrapper<AgentRunResponse> createLegacy(Authentication authentication,
-                                                          @RequestBody AgentRunCreateRequest request) {
-        return createRun(authentication, request, agentDubboServiceLegacy);
     }
 
     private ResponseWrapper<AgentRunResponse> createRun(Authentication authentication,
@@ -197,7 +169,6 @@ public class AgentController {
                 contextMap.put("captureLlmRequests", true);
             }
             if (debugMode) {
-                // 兼容 agentService 侧 ext/context 两种读取方式。
                 contextMap.put("debugMode", true);
             }
             if (!provider.isBlank()) {
@@ -236,7 +207,7 @@ public class AgentController {
         }
     }
 
-    @GetMapping({AGENT_RUNS, AGENT_LEGACY_RUNS})
+    @GetMapping(AGENT_RUNS)
     public ResponseWrapper<AgentRunListResponse> list(Authentication authentication,
                                                       @RequestParam(value = "limit", required = false) Integer limit,
                                                       @RequestParam(value = "offset", required = false) Integer offset,
@@ -283,7 +254,7 @@ public class AgentController {
         }
     }
 
-    @GetMapping({AGENT_RUNS + "/{runId}", AGENT_LEGACY_RUNS + "/{runId}"})
+    @GetMapping(AGENT_RUNS + "/{runId}")
     public ResponseWrapper<AgentRunResponse> get(Authentication authentication,
                                                 @PathVariable("runId") String runId) {
         String userId = resolveUserId(authentication);
@@ -300,7 +271,7 @@ public class AgentController {
         }
     }
 
-    @GetMapping({AGENT_RUNS + "/{runId}/snapshot/parts", AGENT_LEGACY_RUNS + "/{runId}/snapshot/parts"})
+    @GetMapping(AGENT_RUNS + "/{runId}/snapshot/parts")
     public ResponseWrapper<AgentSnapshotPartsMetaResponse> snapshotParts(Authentication authentication,
                                                                         @PathVariable("runId") String runId,
                                                                         @RequestParam(value = "maxPartSize", required = false, defaultValue = "0") int maxPartSize) {
@@ -324,8 +295,7 @@ public class AgentController {
         }
     }
 
-    @GetMapping({AGENT_RUNS + "/{runId}/snapshot/parts/{partIndex}",
-            AGENT_LEGACY_RUNS + "/{runId}/snapshot/parts/{partIndex}"})
+    @GetMapping(AGENT_RUNS + "/{runId}/snapshot/parts/{partIndex}")
     public ResponseEntity<byte[]> snapshotPart(Authentication authentication,
                                                @PathVariable("runId") String runId,
                                                @PathVariable("partIndex") int partIndex,
@@ -362,7 +332,7 @@ public class AgentController {
         }
     }
 
-    @PutMapping({AGENT_RUNS + "/{runId}", AGENT_LEGACY_RUNS + "/{runId}"})
+    @PutMapping(AGENT_RUNS + "/{runId}")
     public ResponseWrapper<AgentRunResponse> update(Authentication authentication,
                                                     @PathVariable("runId") String runId,
                                                     @RequestBody(required = false) AgentRunUpdateRequest request) {
@@ -414,7 +384,7 @@ public class AgentController {
      * @param runId          要删除的 run ID（路径参数）
      * @return 删除成功返回 "ok"，失败返回对应错误码
      */
-    @DeleteMapping({AGENT_RUNS + "/{runId}", AGENT_LEGACY_RUNS + "/{runId}"})
+    @DeleteMapping(AGENT_RUNS + "/{runId}")
     public ResponseWrapper<String> delete(Authentication authentication,
                                           @PathVariable("runId") String runId) {
         String userId = resolveUserId(authentication);
@@ -431,7 +401,7 @@ public class AgentController {
         }
     }
 
-    @GetMapping({AGENT_RUNS + "/{runId}/events", AGENT_LEGACY_RUNS + "/{runId}/events"})
+    @GetMapping(AGENT_RUNS + "/{runId}/events")
     public ResponseWrapper<AgentRunEventsPageResponse> events(Authentication authentication,
                                                              @PathVariable("runId") String runId,
                                                              @RequestParam(value = "after_seq", required = false, defaultValue = "0") int afterSeq,
@@ -468,7 +438,7 @@ public class AgentController {
         }
     }
 
-    @GetMapping({AGENT_RUNS + "/{runId}/timeline", AGENT_LEGACY_RUNS + "/{runId}/timeline"})
+    @GetMapping(AGENT_RUNS + "/{runId}/timeline")
     public ResponseWrapper<TimelineResponse> timeline(Authentication authentication,
                                                       @PathVariable("runId") String runId,
                                                       @RequestParam(value = "after_seq", required = false, defaultValue = "0") int afterSeq,
@@ -524,7 +494,7 @@ public class AgentController {
         }
     }
 
-    @PostMapping({AGENT_RUNS + "/{runId}:cancel", AGENT_LEGACY_RUNS + "/{runId}:cancel"})
+    @PostMapping(AGENT_RUNS + "/{runId}:cancel")
     public ResponseWrapper<AgentRunResponse> cancel(Authentication authentication,
                                                    @PathVariable("runId") String runId) {
         String userId = resolveUserId(authentication);
@@ -541,7 +511,7 @@ public class AgentController {
         }
     }
 
-    @PostMapping({AGENT_RUNS + "/{runId}:pause", AGENT_LEGACY_RUNS + "/{runId}:pause"})
+    @PostMapping(AGENT_RUNS + "/{runId}:pause")
     public ResponseWrapper<AgentRunResponse> pause(Authentication authentication,
                                                   @PathVariable("runId") String runId) {
         String userId = resolveUserId(authentication);
@@ -558,7 +528,7 @@ public class AgentController {
         }
     }
 
-    @PostMapping({AGENT_RUNS + "/{runId}:resume", AGENT_LEGACY_RUNS + "/{runId}:resume"})
+    @PostMapping(AGENT_RUNS + "/{runId}:resume")
     public ResponseWrapper<AgentRunResponse> resume(Authentication authentication,
                                                    @PathVariable("runId") String runId,
                                                    @RequestBody(required = false) AgentRunResumeRequest request) {
@@ -581,7 +551,7 @@ public class AgentController {
         }
     }
 
-    @GetMapping({AGENT_RUNS + "/{runId}/result", AGENT_LEGACY_RUNS + "/{runId}/result"})
+    @GetMapping(AGENT_RUNS + "/{runId}/result")
     public ResponseEntity<ResponseWrapper<AgentRunResultResponse>> result(Authentication authentication,
                                                                           @PathVariable("runId") String runId) {
         String userId = resolveUserId(authentication);
@@ -611,7 +581,7 @@ public class AgentController {
         }
     }
 
-    @GetMapping({AGENT_RUNS + "/{runId}/cost", AGENT_LEGACY_RUNS + "/{runId}/cost"})
+    @GetMapping(AGENT_RUNS + "/{runId}/cost")
     public ResponseWrapper<AgentRunCostResponse> cost(Authentication authentication,
                                                       @PathVariable("runId") String runId) {
         String userId = resolveUserId(authentication);
@@ -633,7 +603,7 @@ public class AgentController {
         }
     }
 
-    @GetMapping({AGENT_RUNS + "/{runId}/credits", AGENT_LEGACY_RUNS + "/{runId}/credits"})
+    @GetMapping(AGENT_RUNS + "/{runId}/credits")
     public ResponseWrapper<AgentRunCreditsResponse> runCredits(Authentication authentication,
                                                                @PathVariable("runId") String runId) {
         String userId = resolveUserId(authentication);
@@ -679,7 +649,7 @@ public class AgentController {
         }
     }
 
-    @GetMapping({AGENT_RUNS + "/{runId}/status", AGENT_LEGACY_RUNS + "/{runId}/status"})
+    @GetMapping(AGENT_RUNS + "/{runId}/status")
     public ResponseWrapper<AgentRunStatusResponse> status(Authentication authentication,
                                                           @PathVariable("runId") String runId) {
         String userId = resolveUserId(authentication);
@@ -719,7 +689,7 @@ public class AgentController {
         }
     }
 
-    @GetMapping({AGENT_RUNS + "/{runId}/observability/full", AGENT_LEGACY_RUNS + "/{runId}/observability/full"})
+    @GetMapping(AGENT_RUNS + "/{runId}/observability/full")
     public ResponseWrapper<Object> observabilityFull(Authentication authentication,
                                                      @PathVariable("runId") String runId) {
         String userId = resolveUserId(authentication);
@@ -748,7 +718,7 @@ public class AgentController {
         }
     }
 
-    @GetMapping({AGENT_RUNS + "/{runId}/traces", AGENT_LEGACY_RUNS + "/{runId}/traces"})
+    @GetMapping(AGENT_RUNS + "/{runId}/traces")
     public ResponseWrapper<TraceListResponse> traces(Authentication authentication,
                                                      @PathVariable("runId") String runId,
                                                      @RequestParam(value = "type", required = false, defaultValue = "") String type,
@@ -857,7 +827,7 @@ public class AgentController {
         }
     }
 
-    @GetMapping({AGENT_RUNS + "/{runId}/traces/{traceId}", AGENT_LEGACY_RUNS + "/{runId}/traces/{traceId}"})
+    @GetMapping(AGENT_RUNS + "/{runId}/traces/{traceId}")
     public ResponseWrapper<TraceDetailResponse> traceDetail(Authentication authentication,
                                                             @PathVariable("runId") String runId,
                                                             @PathVariable("traceId") String traceId) {
@@ -1002,7 +972,7 @@ public class AgentController {
         }
     }
 
-    @GetMapping({AGENT_RUNS + "/{runId}/artifacts", AGENT_LEGACY_RUNS + "/{runId}/artifacts"})
+    @GetMapping(AGENT_RUNS + "/{runId}/artifacts")
     public ResponseWrapper<List<AgentArtifactResponse>> artifacts(Authentication authentication,
                                                                   @PathVariable("runId") String runId) {
         String userId = resolveUserId(authentication);
@@ -1039,8 +1009,7 @@ public class AgentController {
         }
     }
 
-    @GetMapping({AGENT_RUNS + "/{runId}/artifacts/{artifactId}/download",
-            AGENT_LEGACY_RUNS + "/{runId}/artifacts/{artifactId}/download"})
+    @GetMapping(AGENT_RUNS + "/{runId}/artifacts/{artifactId}/download")
     public ResponseEntity<byte[]> downloadArtifact(Authentication authentication,
                                                    @PathVariable("runId") String runId,
                                                    @PathVariable("artifactId") String artifactId) {
@@ -1096,7 +1065,7 @@ public class AgentController {
         }
     }
 
-    @PostMapping({AGENT_RUNS + "/{runId}/feedback", AGENT_LEGACY_RUNS + "/{runId}/feedback"})
+    @PostMapping(AGENT_RUNS + "/{runId}/feedback")
     public ResponseWrapper<String> feedback(Authentication authentication,
                                            @PathVariable("runId") String runId,
                                            @RequestBody(required = false) AgentFeedbackRequest request) {
@@ -1126,7 +1095,7 @@ public class AgentController {
         }
     }
 
-    @PostMapping({AGENT_RUNS + "/{runId}:export", AGENT_LEGACY_RUNS + "/{runId}:export"})
+    @PostMapping(AGENT_RUNS + "/{runId}:export")
     public ResponseWrapper<AgentExportResponse> export(Authentication authentication,
                                                       @PathVariable("runId") String runId,
                                                       @RequestBody(required = false) AgentExportRequest request) {
@@ -1162,7 +1131,7 @@ public class AgentController {
      * @param request        发送消息请求
      * @return 发送结果
      */
-    @PostMapping({AGENT_RUNS + "/{runId}/messages", AGENT_LEGACY_RUNS + "/{runId}/messages"})
+    @PostMapping(AGENT_RUNS + "/{runId}/messages")
     public ResponseWrapper<AgentMessageSendResponse> sendMessage(Authentication authentication,
                                                                  @PathVariable("runId") String runId,
                                                                  @RequestBody AgentMessageSendRequest request) {
@@ -1220,7 +1189,7 @@ public class AgentController {
      * @param includeInitial   是否包含初始问题（默认 true）
      * @return 消息历史列表
      */
-    @GetMapping({AGENT_RUNS + "/{runId}/messages", AGENT_LEGACY_RUNS + "/{runId}/messages"})
+    @GetMapping(AGENT_RUNS + "/{runId}/messages")
     public ResponseWrapper<AgentMessageListResponse> listMessages(Authentication authentication,
                                                                   @PathVariable("runId") String runId,
                                                                   @RequestParam(value = "limit", required = false, defaultValue = "50") int limit,

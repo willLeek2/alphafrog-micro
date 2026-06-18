@@ -46,8 +46,8 @@ import java.util.stream.Collectors;
  * {@link #applyStructuredSpec} 设置 ThreadLocal，调用结束后在 finally 块中恢复/清理，
  * 避免污染后续执行阶段（execution）的 LLM 调用。
  *
- * <h2>与 legacy agentService 的关系</h2>
- * 本类的两阶段路径直接复用了 legacy 的 {@link StructuredPlanningSupport} 做 schema
+ * <h2>与共享规划组件的关系</h2>
+ * 本类的两阶段路径直接复用了 {@link StructuredPlanningSupport} 做 schema
  * 生成和 JSON 校验；provider 参数策略由 {@link LangchainPlanningStructuredOutputSettings}
  * 控制——其中 OpenRouter 的 {@code require_parameters} 默认设为 false，
  * 避免因 {@code stream_options} 等扩展字段导致 provider 路由错误。

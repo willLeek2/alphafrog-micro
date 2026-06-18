@@ -91,7 +91,7 @@ import java.util.Map;
  * </ul>
  *
  * <h2>读写一致性</h2>
- * langchain 服务和 legacy agentService 共享同一套 PG/Redis 存储。事件流目前由
+ * langchain 服务和 agent runtime 共享同一套 PG/Redis 存储。事件流目前由
  * {@link AgentEventService} 优先从 Redis ZSET 读取，只有 Redis 没有该 run 的事件时才回退 DB；
  * 这是压测后为了避免大量 event 长期堆在数据库中的过渡设计。
  * 本类的读操作依赖 {@link LangchainSingleWriterGuard} 保证：
