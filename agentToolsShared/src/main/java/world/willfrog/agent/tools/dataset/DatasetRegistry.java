@@ -7,12 +7,15 @@ import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.Cursor;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ScanOptions;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
+import world.willfrog.agent.platform.config.AgentLlmProperties;
+import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 import world.willfrog.alphafrogmicro.common.utils.DateConvertUtils;
 
 import java.io.File;
@@ -56,16 +59,19 @@ public class DatasetRegistry {
     @Value("${agent.tools.market-data.dataset.cleanup-scan-count:500}")
     private int scanCount;
 
+    @Autowired(required = false)
+    private AgentLlmLocalConfigLoader localConfigLoader;
+
     public DatasetRegistry(StringRedisTemplate redisTemplate) {
         this.redisTemplate = redisTemplate;
     }
 
     public boolean isEnabled() {
-        return enabled;
+        return resolveEnabled();
     }
 
     public Optional<DatasetMeta> findReusable(String type, String tsCode, String startDate, String endDate, List<String> columns) {
-        if (!enabled) {
+        if (!resolveEnabled()) {
             return Optional.empty();
         }
         String queryKey = buildQueryKey(type, tsCode, startDate, endDate, columns);
@@ -132,7 +138,7 @@ public class DatasetRegistry {
 
     public void registerDataset(String type, String tsCode, String startDate, String endDate,
                                 List<String> columns, String datasetId, int rowCount) {
-        if (!enabled || datasetId == null || datasetId.isEmpty()) {
+        if (!resolveEnabled() || datasetId == null || datasetId.isEmpty()) {
             return;
         }
         String queryKey = buildQueryKey(type, tsCode, startDate, endDate, columns);
@@ -174,7 +180,7 @@ public class DatasetRegistry {
      */
     public Optional<ManifestMeta> findReusableManifest(String dataType, String startDate, String endDate,
                                                        List<String> tsCodes, List<String> columns) {
-        if (!enabled) {
+        if (!resolveEnabled()) {
             return Optional.empty();
         }
         if (dataType == null || dataType.isEmpty()
@@ -204,7 +210,7 @@ public class DatasetRegistry {
                                  List<String> tsCodes, List<String> columns,
                                  String manifestId, int memberCount, int readyCount,
                                  int failedCount, int totalRowCount) {
-        if (!enabled || manifestId == null || manifestId.isEmpty()) {
+        if (!resolveEnabled() || manifestId == null || manifestId.isEmpty()) {
             return;
         }
         String queryKey = buildManifestQueryKey(dataType, startDate, endDate, tsCodes, columns);
@@ -242,7 +248,7 @@ public class DatasetRegistry {
 
     @Scheduled(fixedDelayString = "${agent.tools.market-data.dataset.cleanup-interval-ms:600000}")
     public void cleanupExpiredDatasets() {
-        if (!enabled) {
+        if (!resolveEnabled()) {
             return;
         }
         long now = Instant.now().toEpochMilli();
@@ -285,7 +291,7 @@ public class DatasetRegistry {
 
     @Scheduled(fixedDelayString = "${agent.tools.market-data.dataset.cleanup-interval-ms:600000}")
     public void cleanupExpiredManifests() {
-        if (!enabled) {
+        if (!resolveEnabled()) {
             return;
         }
         long now = Instant.now().toEpochMilli();
@@ -546,6 +552,18 @@ public class DatasetRegistry {
             return Long.MAX_VALUE;
         }
         return Math.abs(end - start);
+    }
+
+    private boolean resolveEnabled() {
+        if (localConfigLoader == null) {
+            return enabled;
+        }
+        return localConfigLoader.current()
+                .map(AgentLlmProperties::getTools)
+                .map(AgentLlmProperties.Tools::getMarketData)
+                .map(AgentLlmProperties.MarketData::getDataset)
+                .map(AgentLlmProperties.MarketDataDataset::getEnabled)
+                .orElse(enabled);
     }
 
     @Data

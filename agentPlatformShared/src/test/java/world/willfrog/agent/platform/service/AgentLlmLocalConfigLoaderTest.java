@@ -206,6 +206,34 @@ class AgentLlmLocalConfigLoaderTest {
     }
 
     @Test
+    void load_shouldParseMarketDataToolFlags() throws Exception {
+        Path configFile = tempDir.resolve("agent-llm.local.json");
+        Files.writeString(configFile, """
+                {
+                  "tools": {
+                    "market-data": {
+                      "dataset": {
+                        "enabled": true
+                      },
+                      "batch": {
+                        "emit-manifest": true
+                      }
+                    }
+                  }
+                }
+                """, StandardCharsets.UTF_8);
+
+        AgentLlmLocalConfigLoader loader = new AgentLlmLocalConfigLoader(new ObjectMapper());
+        ReflectionTestUtils.setField(loader, "configFile", configFile.toString());
+        loader.load();
+
+        AgentLlmProperties.MarketData marketData = loader.current().orElseThrow()
+                .getTools().getMarketData();
+        assertTrue(Boolean.TRUE.equals(marketData.getDataset().getEnabled()));
+        assertTrue(Boolean.TRUE.equals(marketData.getBatch().getEmitManifest()));
+    }
+
+    @Test
     void load_shouldResolveDagModeGuidancePromptFile() throws Exception {
         Path promptsDir = tempDir.resolve("prompts").resolve("todo");
         Files.createDirectories(promptsDir);

@@ -3,8 +3,11 @@ package world.willfrog.agent.tools.dataset;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
+import world.willfrog.agent.platform.config.AgentLlmProperties;
+import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 
 import java.io.File;
 import java.io.IOException;
@@ -38,10 +41,13 @@ public class ManifestWriter {
     @Value("${agent.tools.market-data.dataset.enabled:true}")
     private boolean enabled;
 
+    @Autowired(required = false)
+    private AgentLlmLocalConfigLoader localConfigLoader;
+
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     public boolean isEnabled() {
-        return enabled;
+        return resolveEnabled();
     }
 
     /**
@@ -65,7 +71,7 @@ public class ManifestWriter {
                                 List<DatasetManifest.ManifestMember> members,
                                 int totalRowCount,
                                 List<String> columns) {
-        if (!enabled) {
+        if (!resolveEnabled()) {
             return null;
         }
         if (dataType == null || dataType.isEmpty()
@@ -200,6 +206,18 @@ public class ManifestWriter {
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException("SHA-256 not available", e);
         }
+    }
+
+    private boolean resolveEnabled() {
+        if (localConfigLoader == null) {
+            return enabled;
+        }
+        return localConfigLoader.current()
+                .map(AgentLlmProperties::getTools)
+                .map(AgentLlmProperties.Tools::getMarketData)
+                .map(AgentLlmProperties.MarketData::getDataset)
+                .map(AgentLlmProperties.MarketDataDataset::getEnabled)
+                .orElse(enabled);
     }
 
     @lombok.Data

@@ -1245,7 +1245,7 @@ public class MarketDataTools {
                                          Map<String, Object> data) {
         data.put("dataset_ids", collectAtomicDatasetIds(results));
 
-        if (!emitManifest || !manifestWriter.isEnabled() || !datasetRegistry.isEnabled()) {
+        if (!resolveEmitManifest() || !manifestWriter.isEnabled() || !datasetRegistry.isEnabled()) {
             return;
         }
 
@@ -1476,6 +1476,25 @@ public class MarketDataTools {
             return clamp(base, 1, 20);
         }
         return 3;
+    }
+
+    /**
+     * 解析 batch manifest 输出开关。
+     *
+     * <p>配置优先级：Nacos 热加载 {@code tools.marketData.batch.emitManifest}
+     * ＞ Spring 启动配置 {@code agent.tools.market-data.batch.emit-manifest}
+     * ＞ 默认 false。这样新功能开关可以通过 agent-llm.json 推送热生效。</p>
+     */
+    private boolean resolveEmitManifest() {
+        if (localConfigLoader == null) {
+            return emitManifest;
+        }
+        return localConfigLoader.current()
+                .map(AgentLlmProperties::getTools)
+                .map(AgentLlmProperties.Tools::getMarketData)
+                .map(AgentLlmProperties.MarketData::getBatch)
+                .map(AgentLlmProperties.MarketDataBatch::getEmitManifest)
+                .orElse(emitManifest);
     }
 
     /**

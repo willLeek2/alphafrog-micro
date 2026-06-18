@@ -4,8 +4,11 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.Builder;
 import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
+import world.willfrog.agent.platform.config.AgentLlmProperties;
+import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 
 import java.io.BufferedWriter;
 import java.io.File;
@@ -26,17 +29,20 @@ public class DatasetWriter {
     @Value("${agent.tools.market-data.dataset.enabled:true}")
     private boolean enabled;
 
+    @Autowired(required = false)
+    private AgentLlmLocalConfigLoader localConfigLoader;
+
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     public boolean isEnabled() {
-        return enabled;
+        return resolveEnabled();
     }
 
     public <T> String writeDataset(String prefix, String tsCode, String start, String end, 
                                    List<T> data, 
                                    List<String> headers, 
                                    Function<T, List<Object>> rowMapper) {
-        if (!enabled) {
+        if (!resolveEnabled()) {
             return null;
         }
 
@@ -99,6 +105,18 @@ public class DatasetWriter {
         if (!dir.exists()) {
             dir.mkdirs();
         }
+    }
+
+    private boolean resolveEnabled() {
+        if (localConfigLoader == null) {
+            return enabled;
+        }
+        return localConfigLoader.current()
+                .map(AgentLlmProperties::getTools)
+                .map(AgentLlmProperties.Tools::getMarketData)
+                .map(AgentLlmProperties.MarketData::getDataset)
+                .map(AgentLlmProperties.MarketDataDataset::getEnabled)
+                .orElse(enabled);
     }
 
     @Data

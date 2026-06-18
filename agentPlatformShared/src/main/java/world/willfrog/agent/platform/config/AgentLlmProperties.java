@@ -1,5 +1,6 @@
 package world.willfrog.agent.platform.config;
 
+import com.fasterxml.jackson.annotation.JsonAlias;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
 import java.util.ArrayList;
@@ -22,6 +23,7 @@ public class AgentLlmProperties {
     private ExecutorConfig executor = new ExecutorConfig();
     private EventStoreConfig eventStore = new EventStoreConfig();
     private DataFreshness dataFreshness = new DataFreshness();
+    private Tools tools = new Tools();
 
     public String getDefaultEndpoint() {
         return defaultEndpoint;
@@ -117,6 +119,76 @@ public class AgentLlmProperties {
 
     public void setDataFreshness(DataFreshness dataFreshness) {
         this.dataFreshness = dataFreshness == null ? new DataFreshness() : dataFreshness;
+    }
+
+    public Tools getTools() {
+        return tools;
+    }
+
+    public void setTools(Tools tools) {
+        this.tools = tools == null ? new Tools() : tools;
+    }
+
+    /**
+     * Tool-level feature toggles that must hot-reload from agent-llm.json.
+     */
+    public static class Tools {
+        @JsonAlias({"market-data", "market_data"})
+        private MarketData marketData = new MarketData();
+
+        public MarketData getMarketData() {
+            return marketData;
+        }
+
+        public void setMarketData(MarketData marketData) {
+            this.marketData = marketData == null ? new MarketData() : marketData;
+        }
+    }
+
+    public static class MarketData {
+        private MarketDataDataset dataset = new MarketDataDataset();
+        private MarketDataBatch batch = new MarketDataBatch();
+
+        public MarketDataDataset getDataset() {
+            return dataset;
+        }
+
+        public void setDataset(MarketDataDataset dataset) {
+            this.dataset = dataset == null ? new MarketDataDataset() : dataset;
+        }
+
+        public MarketDataBatch getBatch() {
+            return batch;
+        }
+
+        public void setBatch(MarketDataBatch batch) {
+            this.batch = batch == null ? new MarketDataBatch() : batch;
+        }
+    }
+
+    public static class MarketDataDataset {
+        private Boolean enabled;
+
+        public Boolean getEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(Boolean enabled) {
+            this.enabled = enabled;
+        }
+    }
+
+    public static class MarketDataBatch {
+        @JsonAlias({"emit-manifest", "emit_manifest"})
+        private Boolean emitManifest;
+
+        public Boolean getEmitManifest() {
+            return emitManifest;
+        }
+
+        public void setEmitManifest(Boolean emitManifest) {
+            this.emitManifest = emitManifest;
+        }
     }
 
     public static class DataFreshness {

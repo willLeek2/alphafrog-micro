@@ -330,6 +330,26 @@ class MarketDataToolsBatchTest {
     }
 
     @Test
+    void resolveEmitManifest_shouldUseNacosFlagOnOverSpringFlagOff() {
+        when(localConfigLoader.current()).thenReturn(Optional.of(hotConfig(null, true)));
+        ReflectionTestUtils.setField(tools, "emitManifest", false);
+
+        Boolean effective = ReflectionTestUtils.invokeMethod(tools, "resolveEmitManifest");
+
+        assertEquals(Boolean.TRUE, effective);
+    }
+
+    @Test
+    void resolveEmitManifest_shouldUseNacosFlagOffOverSpringFlagOn() {
+        when(localConfigLoader.current()).thenReturn(Optional.of(hotConfig(null, false)));
+        ReflectionTestUtils.setField(tools, "emitManifest", true);
+
+        Boolean effective = ReflectionTestUtils.invokeMethod(tools, "resolveEmitManifest");
+
+        assertEquals(Boolean.FALSE, effective);
+    }
+
+    @Test
     void getStockDaily_batch_shouldFallbackWhenManifestWriteFails() throws Exception {
         ReflectionTestUtils.setField(tools, "emitManifest", true);
         when(datasetWriter.isEnabled()).thenReturn(true);
@@ -456,5 +476,20 @@ class MarketDataToolsBatchTest {
 
     private long toTimestamp(String date) {
         return DateConvertUtils.convertDateStrToLong(date, "yyyyMMdd");
+    }
+
+    private AgentLlmProperties hotConfig(Boolean datasetEnabled, Boolean emitManifest) {
+        AgentLlmProperties cfg = new AgentLlmProperties();
+        AgentLlmProperties.Tools toolsCfg = new AgentLlmProperties.Tools();
+        AgentLlmProperties.MarketData marketData = new AgentLlmProperties.MarketData();
+        AgentLlmProperties.MarketDataDataset dataset = new AgentLlmProperties.MarketDataDataset();
+        dataset.setEnabled(datasetEnabled);
+        AgentLlmProperties.MarketDataBatch batch = new AgentLlmProperties.MarketDataBatch();
+        batch.setEmitManifest(emitManifest);
+        marketData.setDataset(dataset);
+        marketData.setBatch(batch);
+        toolsCfg.setMarketData(marketData);
+        cfg.setTools(toolsCfg);
+        return cfg;
     }
 }
