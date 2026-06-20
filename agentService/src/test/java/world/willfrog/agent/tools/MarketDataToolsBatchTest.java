@@ -15,6 +15,11 @@ import world.willfrog.agent.tools.dataset.ManifestWriter;
 import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.alphafrogmicro.common.utils.DateConvertUtils;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticIndexService;
+import world.willfrog.alphafrogmicro.domestic.idl.DomesticIndexInfoFullItem;
+import world.willfrog.alphafrogmicro.domestic.idl.DomesticIndexInfoByTsCodeResponse;
+import world.willfrog.alphafrogmicro.domestic.idl.DomesticIndexWeightByConCodeAndDateRangeResponse;
+import world.willfrog.alphafrogmicro.domestic.idl.DomesticIndexWeightItem;
+import world.willfrog.alphafrogmicro.domestic.idl.DomesticListedAssetService;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticStockDailyItem;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticStockDailyByTsCodeAndDateRangeRequest;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticStockDailyByTsCodeAndDateRangeResponse;
@@ -23,6 +28,8 @@ import world.willfrog.alphafrogmicro.domestic.idl.DomesticStockSearchResponse;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticStockService;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticTradingDayStatusResponse;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticTradingDaysCountResponse;
+import world.willfrog.alphafrogmicro.domestic.idl.ListedAssetInfoItem;
+import world.willfrog.alphafrogmicro.domestic.idl.ListedAssetSearchResponse;
 
 import java.util.List;
 import java.util.Map;
@@ -60,6 +67,7 @@ class MarketDataToolsBatchTest {
     private ObjectMapper objectMapper;
     private DomesticIndexService indexService;
     private DomesticStockService stockService;
+    private DomesticListedAssetService listedAssetService;
 
     @BeforeEach
     void setUp() {
@@ -84,6 +92,8 @@ class MarketDataToolsBatchTest {
         ReflectionTestUtils.setField(tools, "domesticStockService", stockService);
         indexService = mock(DomesticIndexService.class);
         ReflectionTestUtils.setField(tools, "domesticIndexService", indexService);
+        listedAssetService = mock(DomesticListedAssetService.class);
+        ReflectionTestUtils.setField(tools, "domesticListedAssetService", listedAssetService);
 
         DomesticStockInfoSimpleItem searchItem = DomesticStockInfoSimpleItem.newBuilder()
                 .setTsCode("000001.SZ")
@@ -126,6 +136,13 @@ class MarketDataToolsBatchTest {
                 .setDate(toTimestamp("20240102"))
                 .setCalendarRecordFound(true)
                 .setTradingDay(true)
+                .build());
+        lenient().when(listedAssetService.searchListedAssets(any())).thenReturn(ListedAssetSearchResponse.newBuilder()
+                .addItems(ListedAssetInfoItem.newBuilder()
+                        .setAssetType("stock")
+                        .setTsCode("000001.SZ")
+                        .setName("平安银行")
+                        .build())
                 .build());
     }
 
@@ -474,6 +491,180 @@ class MarketDataToolsBatchTest {
         verify(manifestWriter, never()).writeManifest(anyString(), anyString(), anyString(), anyList(), anyInt(), anyList());
     }
 
+    @Test
+    void checkParallelLimits_shouldExposeAdvancedHotConfigAndClamp() throws Exception {
+        when(localConfigLoader.current()).thenReturn(Optional.of(hotConfigAdvanced(100, 7)));
+
+        String response = tools.checkParallelLimits();
+        Map<?, ?> root = objectMapper.readValue(response, Map.class);
+        Map<?, ?> advanced = (Map<?, ?>) ((Map<?, ?>) root.get("data")).get("advanced");
+
+        assertEquals(20, advanced.get("maxItems"));
+        assertEquals(7, advanced.get("previewRows"));
+
+        when(localConfigLoader.current()).thenReturn(Optional.of(hotConfigAdvanced(3, 0)));
+        response = tools.checkParallelLimits();
+        root = objectMapper.readValue(response, Map.class);
+        advanced = (Map<?, ?>) ((Map<?, ?>) root.get("data")).get("advanced");
+        assertEquals(0, advanced.get("previewRows"));
+
+        when(localConfigLoader.current()).thenReturn(Optional.of(hotConfigAdvanced(0, null)));
+        response = tools.checkParallelLimits();
+        root = objectMapper.readValue(response, Map.class);
+        advanced = (Map<?, ?>) ((Map<?, ?>) root.get("data")).get("advanced");
+        assertEquals(1, advanced.get("maxItems"));
+
+        when(localConfigLoader.current()).thenReturn(Optional.of(hotConfigAdvanced(-1, null)));
+        response = tools.checkParallelLimits();
+        root = objectMapper.readValue(response, Map.class);
+        advanced = (Map<?, ?>) ((Map<?, ?>) root.get("data")).get("advanced");
+        assertEquals(1, advanced.get("maxItems"));
+    }
+
+    @Test
+    void searchAssetInfoAdvanced_nameOnly_shouldReturnAdvancedDatasetAndPreview() throws Exception {
+        String response = tools.searchAssetInfoAdvanced(Map.of(
+                "mode", "advanced",
+                "asset_type", "stock",
+                "query", Map.of(
+                        "name", "平安",
+                        "conditions", List.of()
+                )
+        ));
+        Map<?, ?> root = objectMapper.readValue(response, Map.class);
+        Map<?, ?> data = (Map<?, ?>) root.get("data");
+
+        assertEquals(true, root.get("ok"));
+        assertEquals("advanced", data.get("mode"));
+        assertEquals("stock", data.get("asset_type"));
+        assertEquals(1, data.get("row_count"));
+        assertEquals("inline", data.get("dataset_status"));
+        assertEquals(1, ((List<?>) data.get("preview_rows")).size());
+    }
+
+    @Test
+    void searchIndexAdvanced_hasStock_shouldUseLatestTradeDateReason() throws Exception {
+        when(indexService.getDomesticIndexWeightByConCodeAndDateRange(any())).thenReturn(
+                DomesticIndexWeightByConCodeAndDateRangeResponse.newBuilder()
+                        .addItems(DomesticIndexWeightItem.newBuilder()
+                                .setIndexCode("000300.SH")
+                                .setConCode("000001.SZ")
+                                .setTradeDate(20240115L)
+                                .setWeight(4.0)
+                                .build())
+                        .addItems(DomesticIndexWeightItem.newBuilder()
+                                .setIndexCode("000300.SH")
+                                .setConCode("000001.SZ")
+                                .setTradeDate(20240201L)
+                                .setWeight(5.0)
+                                .build())
+                        .build());
+        when(indexService.getDomesticIndexInfoByTsCode(any())).thenReturn(
+                DomesticIndexInfoByTsCodeResponse.newBuilder()
+                        .setItem(DomesticIndexInfoFullItem.newBuilder()
+                                .setTsCode("000300.SH")
+                                .setName("沪深300")
+                                .setFullname("沪深300指数")
+                                .setMarket("SSE")
+                                .build())
+                        .build());
+
+        String response = tools.searchIndexAdvanced(Map.of(
+                "mode", "advanced",
+                "query", Map.of(
+                        "conditions", List.of(Map.of(
+                                "type", "has_stock",
+                                "stock_code", "000001.SZ",
+                                "start_date", "20240101",
+                                "end_date", "20241231"
+                        ))
+                )
+        ));
+        Map<?, ?> root = objectMapper.readValue(response, Map.class);
+        Map<?, ?> data = (Map<?, ?>) root.get("data");
+        Map<?, ?> preview = (Map<?, ?>) ((List<?>) data.get("preview_rows")).get(0);
+        List<?> reason = (List<?>) ((List<?>) preview.get("match_conditions")).get(0);
+
+        assertEquals(true, root.get("ok"));
+        assertEquals("沪深300", preview.get("name"));
+        assertEquals(20240201L, ((Number) reason.get(0)).longValue());
+        assertEquals(5.0, ((Number) reason.get(1)).doubleValue());
+    }
+
+    @Test
+    void searchIndexAdvanced_shouldRejectInvalidDatesAndLowercaseNone() throws Exception {
+        String invalidDate = tools.searchIndexAdvanced(Map.of(
+                "mode", "advanced",
+                "query", Map.of("conditions", List.of(Map.of(
+                        "type", "has_stock",
+                        "stock_code", "000001.SZ",
+                        "start_date", "20240230",
+                        "end_date", "20241231"
+                )))
+        ));
+        Map<?, ?> root = objectMapper.readValue(invalidDate, Map.class);
+        assertEquals(false, root.get("ok"));
+        assertEquals("INVALID_ARGUMENT", ((Map<?, ?>) root.get("error")).get("code"));
+
+        String lowercaseNone = tools.searchIndexAdvanced(Map.of(
+                "mode", "advanced",
+                "query", Map.of("conditions", List.of(Map.of(
+                        "type", "has_stock",
+                        "stock_code", "000001.SZ",
+                        "start_date", "none",
+                        "end_date", "NONE"
+                )))
+        ));
+        root = objectMapper.readValue(lowercaseNone, Map.class);
+        assertEquals(false, root.get("ok"));
+        assertEquals("INVALID_ARGUMENT", ((Map<?, ?>) root.get("error")).get("code"));
+    }
+
+    @Test
+    void searchIndexAdvanced_shouldAllowSinglePointAndNegativeWeight() throws Exception {
+        when(indexService.getDomesticIndexWeightByConCodeAndDateRange(any())).thenReturn(
+                DomesticIndexWeightByConCodeAndDateRangeResponse.newBuilder()
+                        .addItems(DomesticIndexWeightItem.newBuilder()
+                                .setIndexCode("000300.SH")
+                                .setConCode("000001.SZ")
+                                .setTradeDate(20240115L)
+                                .setWeight(-1.0)
+                                .build())
+                        .build());
+
+        String response = tools.searchIndexAdvanced(Map.of(
+                "mode", "advanced",
+                "query", Map.of("conditions", List.of(Map.of(
+                        "type", "has_stock",
+                        "stock_code", "000001.SZ",
+                        "start_date", "NONE",
+                        "end_date", "NONE",
+                        "min_weight", -1.0,
+                        "max_weight", -1.0
+                )))
+        ));
+        Map<?, ?> root = objectMapper.readValue(response, Map.class);
+        Map<?, ?> data = (Map<?, ?>) root.get("data");
+
+        assertEquals(true, root.get("ok"));
+        assertEquals(1, data.get("row_count"));
+
+        String invalidWeightRange = tools.searchIndexAdvanced(Map.of(
+                "mode", "advanced",
+                "query", Map.of("conditions", List.of(Map.of(
+                        "type", "has_stock",
+                        "stock_code", "000001.SZ",
+                        "start_date", "NONE",
+                        "end_date", "NONE",
+                        "min_weight", 2.0,
+                        "max_weight", 1.0
+                )))
+        ));
+        root = objectMapper.readValue(invalidWeightRange, Map.class);
+        assertEquals(false, root.get("ok"));
+        assertEquals("INVALID_ARGUMENT", ((Map<?, ?>) root.get("error")).get("code"));
+    }
+
     private long toTimestamp(String date) {
         return DateConvertUtils.convertDateStrToLong(date, "yyyyMMdd");
     }
@@ -488,6 +679,23 @@ class MarketDataToolsBatchTest {
         batch.setEmitManifest(emitManifest);
         marketData.setDataset(dataset);
         marketData.setBatch(batch);
+        toolsCfg.setMarketData(marketData);
+        cfg.setTools(toolsCfg);
+        return cfg;
+    }
+
+    private AgentLlmProperties hotConfigAdvanced(Integer maxParallelAdvanced, Integer previewRows) {
+        AgentLlmProperties cfg = new AgentLlmProperties();
+        AgentLlmProperties.Runtime runtime = new AgentLlmProperties.Runtime();
+        AgentLlmProperties.Parallel parallel = new AgentLlmProperties.Parallel();
+        parallel.setMaxParallelQueriesInAdvancedMode(maxParallelAdvanced);
+        runtime.setParallel(parallel);
+        cfg.setRuntime(runtime);
+        AgentLlmProperties.Tools toolsCfg = new AgentLlmProperties.Tools();
+        AgentLlmProperties.MarketData marketData = new AgentLlmProperties.MarketData();
+        AgentLlmProperties.MarketDataAdvanced advanced = new AgentLlmProperties.MarketDataAdvanced();
+        advanced.setPreviewRows(previewRows);
+        marketData.setAdvanced(advanced);
         toolsCfg.setMarketData(marketData);
         cfg.setTools(toolsCfg);
         return cfg;

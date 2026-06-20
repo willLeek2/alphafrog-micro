@@ -7,12 +7,14 @@ import org.mockito.ArgumentCaptor;
 import org.springframework.security.core.Authentication;
 import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.alphafrogmicro.agent.idl.AgentDubboService;
+import world.willfrog.alphafrogmicro.agent.idl.AgentArtifactMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunEventMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunResultMessage;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunResultRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentRunEventsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentRunEventsResponse;
+import world.willfrog.alphafrogmicro.agent.idl.ListAgentArtifactsResponse;
 import world.willfrog.alphafrogmicro.agent.idl.SendAgentMessageRequest;
 import world.willfrog.alphafrogmicro.agent.idl.SendAgentMessageResponse;
 import world.willfrog.alphafrogmicro.common.dto.ResponseCode;
@@ -26,6 +28,7 @@ import world.willfrog.alphafrogmicro.frontend.service.agent.AgentCallDetailBlobR
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentRunResultCacheService;
 
 import java.util.Optional;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -127,6 +130,35 @@ class AgentControllerTest {
         var response = controller.observabilityFull(authentication, "run-1");
 
         assertEquals(ResponseCode.BUSINESS_ERROR.getCode(), response.getCode());
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void observabilityFull_shouldIncludeDatasetArtifactIndex() {
+        when(agentDubboService.getResult(any(GetAgentRunResultRequest.class))).thenReturn(
+                AgentRunResultMessage.newBuilder().setObservabilityJson("{\"diagnostics\":{}}").build()
+        );
+        when(agentDubboService.listArtifacts(any())).thenReturn(
+                ListAgentArtifactsResponse.newBuilder()
+                        .addItems(AgentArtifactMessage.newBuilder()
+                                .setArtifactId("artifact-1")
+                                .setType("dataset_json")
+                                .setName("ds1.json")
+                                .setContentType("application/json")
+                                .setUrl("/api/agent/runs/run-1/artifacts/artifact-1/download")
+                                .setMetaJson("{\"dataset_id\":\"ds1\",\"file_name\":\"ds1.json\"}")
+                                .build())
+                        .build()
+        );
+
+        var response = controller.observabilityFull(authentication, "run-1");
+
+        assertEquals(ResponseCode.SUCCESS.getCode(), response.getCode());
+        Map<String, Object> data = (Map<String, Object>) response.getData();
+        assertTrue(data.containsKey("artifacts"));
+        assertTrue(data.containsKey("dataset_artifacts"));
+        assertTrue(data.toString().contains("ds1.json"));
+        assertTrue(data.toString().contains("/api/agent/runs/run-1/artifacts/artifact-1/parts"));
     }
 
     @Test

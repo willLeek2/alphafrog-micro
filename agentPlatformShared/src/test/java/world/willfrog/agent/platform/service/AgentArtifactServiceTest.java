@@ -17,6 +17,7 @@ import java.nio.file.Path;
 import java.time.OffsetDateTime;
 import java.util.List;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.when;
 
@@ -48,6 +49,7 @@ class AgentArtifactServiceTest {
         Path datasetDir = tempDir.resolve("datasets").resolve("ds1");
         Files.createDirectories(datasetDir);
         Files.writeString(datasetDir.resolve("ds1.csv"), "a,b\n1,2\n");
+        Files.writeString(datasetDir.resolve("ds1.json"), "{\"columns\":[\"a\"],\"rows\":[[1]]}");
         Files.writeString(datasetDir.resolve("ds1.meta.json"), "{\"id\":\"ds1\"}");
 
         AgentRun run = new AgentRun();
@@ -81,6 +83,17 @@ class AgentArtifactServiceTest {
         var artifacts = service.listArtifacts(run, false);
 
         assertTrue(artifacts.stream().anyMatch(a -> "python_script".equals(a.getType())));
+        assertTrue(artifacts.stream().anyMatch(a -> "dataset_csv".equals(a.getType()) && "ds1.csv".equals(a.getName())));
+        assertTrue(artifacts.stream().anyMatch(a -> "dataset_json".equals(a.getType()) && "ds1.json".equals(a.getName())));
+        assertTrue(artifacts.stream().anyMatch(a -> "dataset_meta".equals(a.getType()) && "ds1.meta.json".equals(a.getName())));
+        var jsonArtifact = artifacts.stream()
+                .filter(a -> "dataset_json".equals(a.getType()))
+                .findFirst()
+                .orElseThrow();
+        assertTrue(jsonArtifact.getMetaJson().contains("\"dataset_id\":\"ds1\""));
+        assertTrue(jsonArtifact.getMetaJson().contains("\"file_name\":\"ds1.json\""));
         assertTrue(artifacts.stream().allMatch(a -> a.getUrl().startsWith("/api/agent/runs/run-1/artifacts/")));
+        assertEquals("{\"columns\":[\"a\"],\"rows\":[[1]]}",
+                new String(service.loadArtifactForParts(run, false, jsonArtifact.getArtifactId()).content()));
     }
 }

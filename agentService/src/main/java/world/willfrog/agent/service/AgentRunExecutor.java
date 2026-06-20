@@ -296,6 +296,8 @@ public class AgentRunExecutor {
                 requestedEndpointName = execStageCfg.getEndpointName();
                 requestedModelName = execStageCfg.getModelName();
             }
+            // 将 execution 阶段生效配置存入上下文，供 search_evidence_judge 等无独立 stage 的环节退化使用
+            AgentContext.setEffectiveExecutionStageConfig(execStageCfg);
             // 解析 endpoint/model -> 得到 baseUrl 和该 endpoint 支持的 provider 列表
             AgentLlmResolver.ResolvedLlm resolvedLlm = aiServiceFactory.resolveLlm(requestedEndpointName, requestedModelName);
             String endpointName = resolvedLlm.endpointName();

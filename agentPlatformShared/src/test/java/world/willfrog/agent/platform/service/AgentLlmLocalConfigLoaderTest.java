@@ -234,6 +234,35 @@ class AgentLlmLocalConfigLoaderTest {
     }
 
     @Test
+    void load_shouldParseAdvancedMarketDataHotConfigAndTolerateInvalidParallelValue() throws Exception {
+        Path configFile = tempDir.resolve("agent-llm.local.json");
+        Files.writeString(configFile, """
+                {
+                  "runtime": {
+                    "parallel": {
+                      "maxParallelQueriesInAdvancedMode": "abc"
+                    }
+                  },
+                  "tools": {
+                    "market-data": {
+                      "advanced": {
+                        "preview-rows": 13
+                      }
+                    }
+                  }
+                }
+                """, StandardCharsets.UTF_8);
+
+        AgentLlmLocalConfigLoader loader = new AgentLlmLocalConfigLoader(new ObjectMapper());
+        ReflectionTestUtils.setField(loader, "configFile", configFile.toString());
+        loader.load();
+
+        var local = loader.current().orElseThrow();
+        assertEquals(1, local.getRuntime().getParallel().getMaxParallelQueriesInAdvancedMode());
+        assertEquals(13, local.getTools().getMarketData().getAdvanced().getPreviewRows());
+    }
+
+    @Test
     void load_shouldResolveDagModeGuidancePromptFile() throws Exception {
         Path promptsDir = tempDir.resolve("prompts").resolve("todo");
         Files.createDirectories(promptsDir);

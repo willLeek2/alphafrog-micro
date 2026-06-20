@@ -22,6 +22,7 @@ public class SearchEvidenceJudgeModelResolver {
     public enum ModelSource {
         SEARCH_JUDGE,
         INHERITED_STAGE,
+        RUN_EXECUTION,
         ROUTE_FALLBACK
     }
 
@@ -36,6 +37,11 @@ public class SearchEvidenceJudgeModelResolver {
         StageLlmConfig inherited = resolveInheritedStageConfig(stageConfig);
         if (inherited != null && inherited.isValid()) {
             return Optional.of(new ResolvedStageModel(inherited, ModelSource.INHERITED_STAGE));
+        }
+        // 无专用 stage 配置时，退化使用 run 的 execution 阶段生效配置（与 final_answer 行为一致）
+        StageLlmConfig runExecution = AgentContext.getEffectiveExecutionStageConfig();
+        if (runExecution != null && runExecution.isValid()) {
+            return Optional.of(new ResolvedStageModel(runExecution, ModelSource.RUN_EXECUTION));
         }
         return Optional.empty();
     }

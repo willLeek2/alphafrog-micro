@@ -148,6 +148,7 @@ public class AgentLlmProperties {
     public static class MarketData {
         private MarketDataDataset dataset = new MarketDataDataset();
         private MarketDataBatch batch = new MarketDataBatch();
+        private MarketDataAdvanced advanced = new MarketDataAdvanced();
 
         public MarketDataDataset getDataset() {
             return dataset;
@@ -163,6 +164,14 @@ public class AgentLlmProperties {
 
         public void setBatch(MarketDataBatch batch) {
             this.batch = batch == null ? new MarketDataBatch() : batch;
+        }
+
+        public MarketDataAdvanced getAdvanced() {
+            return advanced;
+        }
+
+        public void setAdvanced(MarketDataAdvanced advanced) {
+            this.advanced = advanced == null ? new MarketDataAdvanced() : advanced;
         }
     }
 
@@ -188,6 +197,19 @@ public class AgentLlmProperties {
 
         public void setEmitManifest(Boolean emitManifest) {
             this.emitManifest = emitManifest;
+        }
+    }
+
+    public static class MarketDataAdvanced {
+        @JsonAlias({"preview-rows", "preview_rows"})
+        private Integer previewRows;
+
+        public Integer getPreviewRows() {
+            return previewRows;
+        }
+
+        public void setPreviewRows(Integer previewRows) {
+            this.previewRows = previewRows;
         }
     }
 
@@ -776,6 +798,8 @@ public class AgentLlmProperties {
         private Integer maxParallelSearchQueries;
         private Integer maxParallelDailyQueries;
         private Integer maxParallelCalendarQueries;
+        @JsonAlias({"max-parallel-queries-in-advanced-mode", "max_parallel_queries_in_advanced_mode"})
+        private Integer maxParallelQueriesInAdvancedMode;
         private Integer dagThreadPoolSize;
         private ExternalSearch externalSearch = new ExternalSearch();
         private ToolWeightedLimit toolWeightedLimit = new ToolWeightedLimit();
@@ -804,6 +828,14 @@ public class AgentLlmProperties {
             this.maxParallelCalendarQueries = maxParallelCalendarQueries;
         }
 
+        public Integer getMaxParallelQueriesInAdvancedMode() {
+            return maxParallelQueriesInAdvancedMode;
+        }
+
+        public void setMaxParallelQueriesInAdvancedMode(Object maxParallelQueriesInAdvancedMode) {
+            this.maxParallelQueriesInAdvancedMode = parseIntegerOrOne(maxParallelQueriesInAdvancedMode);
+        }
+
         public Integer getDagThreadPoolSize() {
             return dagThreadPoolSize;
         }
@@ -826,6 +858,24 @@ public class AgentLlmProperties {
 
         public void setToolWeightedLimit(ToolWeightedLimit toolWeightedLimit) {
             this.toolWeightedLimit = toolWeightedLimit == null ? new ToolWeightedLimit() : toolWeightedLimit;
+        }
+    }
+
+    private static Integer parseIntegerOrOne(Object value) {
+        if (value == null) {
+            return null;
+        }
+        if (value instanceof Number number) {
+            return number.intValue();
+        }
+        String raw = String.valueOf(value).trim();
+        if (raw.isEmpty()) {
+            return null;
+        }
+        try {
+            return Integer.parseInt(raw);
+        } catch (NumberFormatException ignored) {
+            return 1;
         }
     }
 

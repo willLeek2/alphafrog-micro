@@ -138,6 +138,13 @@ public class DatasetRegistry {
 
     public void registerDataset(String type, String tsCode, String startDate, String endDate,
                                 List<String> columns, String datasetId, int rowCount) {
+        registerDataset(type, tsCode, startDate, endDate, columns, datasetId, rowCount, "csv",
+                datasetId == null || datasetId.isEmpty() ? "" : datasetId + ".csv");
+    }
+
+    public void registerDataset(String type, String tsCode, String startDate, String endDate,
+                                List<String> columns, String datasetId, int rowCount,
+                                String format, String dataFileName) {
         if (!resolveEnabled() || datasetId == null || datasetId.isEmpty()) {
             return;
         }
@@ -157,6 +164,8 @@ public class DatasetRegistry {
                 .columnsSignature(String.join(",", columns))
                 .rowCount(rowCount)
                 .path(datasetDir)
+                .format(format == null || format.isBlank() ? "csv" : format)
+                .dataFileName(dataFileName == null || dataFileName.isBlank() ? datasetId + ".csv" : dataFileName)
                 .createdAt(now)
                 .lastAccessAt(now)
                 .hitCount(1)
@@ -400,8 +409,12 @@ public class DatasetRegistry {
         if (!dir.exists() || !dir.isDirectory()) {
             return false;
         }
-        File csv = new File(dir, meta.getDatasetId() + ".csv");
-        return csv.exists();
+        String dataFileName = meta.getDataFileName();
+        if (dataFileName == null || dataFileName.isBlank()) {
+            dataFileName = meta.getDatasetId() + ".csv";
+        }
+        File dataFile = new File(dir, dataFileName);
+        return dataFile.exists();
     }
 
     private boolean manifestFilesExist(ManifestMeta meta) {
@@ -581,6 +594,8 @@ public class DatasetRegistry {
         private String columnsSignature;
         private int rowCount;
         private String path;
+        private String format;
+        private String dataFileName;
         private long createdAt;
         private long lastAccessAt;
         private int hitCount;

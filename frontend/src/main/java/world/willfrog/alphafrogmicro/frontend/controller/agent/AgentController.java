@@ -16,12 +16,16 @@ import world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunCostMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunResultMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunStatusMessage;
+import world.willfrog.alphafrogmicro.agent.idl.AgentArtifactPartMessage;
+import world.willfrog.alphafrogmicro.agent.idl.AgentArtifactPartsMetaMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentSnapshotPartMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentSnapshotPartsMetaMessage;
 import world.willfrog.alphafrogmicro.agent.idl.CreateAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.DeleteAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.DownloadAgentArtifactRequest;
 import world.willfrog.alphafrogmicro.agent.idl.DownloadAgentArtifactResponse;
+import world.willfrog.alphafrogmicro.agent.idl.GetAgentArtifactPartRequest;
+import world.willfrog.alphafrogmicro.agent.idl.GetAgentArtifactPartsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCostRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCreditsRequest;
@@ -52,6 +56,7 @@ import world.willfrog.alphafrogmicro.common.dto.ResponseWrapper;
 import world.willfrog.alphafrogmicro.common.pojo.user.User;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentRunCreateRequest;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentArtifactResponse;
+import world.willfrog.alphafrogmicro.frontend.model.agent.AgentArtifactPartsMetaResponse;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentExportRequest;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentExportResponse;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentFeedbackRequest;
@@ -710,7 +715,8 @@ public class AgentController {
             if (observability == null) {
                 return ResponseWrapper.error(ResponseCode.DATA_NOT_FOUND, "observability 不存在");
             }
-            return ResponseWrapper.success(observability);
+            List<AgentArtifactResponse> artifacts = loadArtifactResponses(userId, runId, isAdmin(authentication));
+            return ResponseWrapper.success(attachArtifactsToObservability(observability, runId, artifacts));
         } catch (RpcException e) {
             return handleRpcError(e, "查询完整 observability");
         } catch (Exception e) {
@@ -980,32 +986,82 @@ public class AgentController {
             return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
         }
         try {
-            boolean isAdmin = isAdmin(authentication);
-            ListAgentArtifactsResponse resp = resolveService().listArtifacts(
-                    ListAgentArtifactsRequest.newBuilder()
-                            .setUserId(userId)
-                            .setId(runId)
-                            .setIsAdmin(isAdmin)
-                            .build()
-            );
-            List<AgentArtifactResponse> items = new ArrayList<>();
-            for (var a : resp.getItemsList()) {
-                items.add(new AgentArtifactResponse(
-                        a.getArtifactId(),
-                        a.getType(),
-                        a.getName(),
-                        a.getContentType(),
-                        a.getUrl(),
-                        emptyToNull(a.getMetaJson()),
-                        emptyToNull(a.getCreatedAt()),
-                        a.getExpiresAtMillis() <= 0 ? null : a.getExpiresAtMillis()
-                ));
-            }
-            return ResponseWrapper.success(items);
+            return ResponseWrapper.success(loadArtifactResponses(userId, runId, isAdmin(authentication)));
         } catch (RpcException e) {
             return handleRpcError(e, "查询 artifacts");
         } catch (Exception e) {
             return handleError(e, "查询 artifacts");
+        }
+    }
+
+    @GetMapping(AGENT_RUNS + "/{runId}/artifacts/{artifactId}/parts")
+    public ResponseWrapper<AgentArtifactPartsMetaResponse> artifactParts(Authentication authentication,
+                                                                        @PathVariable("runId") String runId,
+                                                                        @PathVariable("artifactId") String artifactId,
+                                                                        @RequestParam(value = "maxPartSize", required = false, defaultValue = "0") int maxPartSize) {
+        String userId = resolveUserId(authentication);
+        if (userId == null) {
+            return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
+        }
+        try {
+            AgentArtifactPartsMetaMessage meta = resolveService().getArtifactPartsMeta(
+                    GetAgentArtifactPartsRequest.newBuilder()
+                            .setUserId(userId)
+                            .setArtifactId(artifactId)
+                            .setMaxPartSize(maxPartSize)
+                            .setIsAdmin(isAdmin(authentication))
+                            .build()
+            );
+            return ResponseWrapper.success(toArtifactPartsMetaResponse(meta));
+        } catch (RpcException e) {
+            return handleRpcError(e, "查询 artifact parts");
+        } catch (Exception e) {
+            return handleError(e, "查询 artifact parts");
+        }
+    }
+
+    @GetMapping(AGENT_RUNS + "/{runId}/artifacts/{artifactId}/parts/{partIndex}")
+    public ResponseEntity<byte[]> artifactPart(Authentication authentication,
+                                               @PathVariable("runId") String runId,
+                                               @PathVariable("artifactId") String artifactId,
+                                               @PathVariable("partIndex") int partIndex,
+                                               @RequestParam(value = "maxPartSize", required = false, defaultValue = "0") int maxPartSize) {
+        String userId = resolveUserId(authentication);
+        if (userId == null) {
+            return artifactPartError(401, "UNAUTHORIZED");
+        }
+        if (runId == null || runId.isBlank()) {
+            return artifactPartError(400, "BAD_REQUEST");
+        }
+        try {
+            AgentArtifactPartMessage part = resolveService().getArtifactPart(
+                    GetAgentArtifactPartRequest.newBuilder()
+                            .setUserId(userId)
+                            .setArtifactId(artifactId)
+                            .setPartIndex(partIndex)
+                            .setMaxPartSize(maxPartSize)
+                            .setIsAdmin(isAdmin(authentication))
+                            .build()
+            );
+            byte[] content = part.getContent().toByteArray();
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.APPLICATION_OCTET_STREAM);
+            headers.setContentLength(content.length);
+            headers.set(HttpHeaders.CACHE_CONTROL, "no-store");
+            headers.set("X-Artifact-Id", nvl(part.getArtifactId()));
+            headers.set("X-Artifact-Filename", nvl(part.getFilename()));
+            headers.set("X-Artifact-Content-Type", nvl(part.getContentType()));
+            headers.set("X-Artifact-Compression", nvl(part.getCompression()));
+            headers.set("X-Artifact-Part-Index", String.valueOf(part.getPartIndex()));
+            headers.set("X-Artifact-Part-Size", String.valueOf(part.getPartSize()));
+            headers.set("X-Artifact-Total-Parts", String.valueOf(part.getTotalParts()));
+            return ResponseEntity.ok().headers(headers).body(content);
+        } catch (RpcException e) {
+            log.error("查询 artifact part 失败: runId={}, artifactId={}, err={}", runId, artifactId, e.getMessage());
+            return artifactPartError(resolveArtifactPartErrorStatus(e.getMessage()), "RPC_ERROR");
+        } catch (Exception e) {
+            log.error("查询 artifact part 失败: runId={}, artifactId={}", runId, artifactId, e);
+            return artifactPartError(resolveArtifactPartErrorStatus(e.getMessage()), "ERROR");
         }
     }
 
@@ -1319,10 +1375,95 @@ public class AgentController {
         );
     }
 
+    private AgentArtifactPartsMetaResponse toArtifactPartsMetaResponse(AgentArtifactPartsMetaMessage meta) {
+        return new AgentArtifactPartsMetaResponse(
+                meta.getArtifactId(),
+                emptyToNull(meta.getFilename()),
+                emptyToNull(meta.getContentType()),
+                meta.getPartSize(),
+                meta.getTotalParts(),
+                meta.getUncompressedSize(),
+                meta.getCompressedSize(),
+                emptyToNull(meta.getCompression()),
+                emptyToNull(meta.getChecksum())
+        );
+    }
+
+    private List<AgentArtifactResponse> loadArtifactResponses(String userId, String runId, boolean isAdmin) {
+        ListAgentArtifactsResponse resp = resolveService().listArtifacts(
+                ListAgentArtifactsRequest.newBuilder()
+                        .setUserId(userId)
+                        .setId(runId)
+                        .setIsAdmin(isAdmin)
+                        .build()
+        );
+        List<AgentArtifactResponse> items = new ArrayList<>();
+        for (var a : resp.getItemsList()) {
+            items.add(new AgentArtifactResponse(
+                    a.getArtifactId(),
+                    a.getType(),
+                    a.getName(),
+                    a.getContentType(),
+                    a.getUrl(),
+                    emptyToNull(a.getMetaJson()),
+                    emptyToNull(a.getCreatedAt()),
+                    a.getExpiresAtMillis() <= 0 ? null : a.getExpiresAtMillis()
+            ));
+        }
+        return items;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Object attachArtifactsToObservability(Object observability,
+                                                  String runId,
+                                                  List<AgentArtifactResponse> artifacts) {
+        Map<String, Object> result;
+        if (observability instanceof Map<?, ?> map) {
+            result = new LinkedHashMap<>((Map<String, Object>) map);
+        } else {
+            result = new LinkedHashMap<>();
+            result.put("observability", observability);
+        }
+        List<Map<String, Object>> artifactMaps = new ArrayList<>();
+        List<Map<String, Object>> datasetArtifactMaps = new ArrayList<>();
+        for (AgentArtifactResponse artifact : artifacts) {
+            Map<String, Object> item = toArtifactMap(runId, artifact);
+            artifactMaps.add(item);
+            if (artifact.type() != null && artifact.type().startsWith("dataset_")) {
+                datasetArtifactMaps.add(item);
+            }
+        }
+        result.put("artifacts", artifactMaps);
+        result.put("dataset_artifacts", datasetArtifactMaps);
+        return result;
+    }
+
+    private Map<String, Object> toArtifactMap(String runId, AgentArtifactResponse artifact) {
+        Map<String, Object> item = new LinkedHashMap<>();
+        item.put("artifact_id", artifact.artifactId());
+        item.put("type", artifact.type());
+        item.put("name", artifact.name());
+        item.put("content_type", artifact.contentType());
+        item.put("download_url", artifact.url());
+        item.put("parts_url", AGENT_RUNS + "/" + runId + "/artifacts/" + artifact.artifactId() + "/parts");
+        item.put("created_at", artifact.createdAt());
+        item.put("expires_at_millis", artifact.expiresAtMillis());
+        Object meta = parseJsonOrNull(artifact.metaJson());
+        item.put("meta", meta == null ? Map.of() : meta);
+        return item;
+    }
+
     private ResponseEntity<byte[]> snapshotPartError(int status, String code) {
         HttpHeaders headers = new HttpHeaders();
         headers.setContentLength(0);
         headers.set("X-Snapshot-Error", code);
+        return ResponseEntity.status(status).headers(headers).body(new byte[0]);
+    }
+
+    private ResponseEntity<byte[]> artifactPartError(int status, String code) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentLength(0);
+        headers.set("X-Artifact-Error", code);
         return ResponseEntity.status(status).headers(headers).body(new byte[0]);
     }
 
@@ -1332,6 +1473,17 @@ public class AgentController {
             return 404;
         }
         if (msg.contains("part_index") || msg.contains("out of range") || msg.contains("snapshot has no parts")) {
+            return 400;
+        }
+        return 500;
+    }
+
+    private int resolveArtifactPartErrorStatus(String message) {
+        String msg = message == null ? "" : message.toLowerCase();
+        if (msg.contains("run not found") || msg.contains("artifact not found")) {
+            return 404;
+        }
+        if (msg.contains("part_index") || msg.contains("out of range") || msg.contains("has no parts")) {
             return 400;
         }
         return 500;

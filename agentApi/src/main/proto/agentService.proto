@@ -251,6 +251,44 @@ message DownloadAgentArtifactResponse {
   bytes content = 4;
 }
 
+message GetAgentArtifactPartsRequest {
+  string user_id = 1;
+  string artifact_id = 2;
+  int32 max_part_size = 3;
+  bool is_admin = 4;
+}
+
+message AgentArtifactPartsMetaMessage {
+  string artifact_id = 1;
+  string filename = 2;
+  string content_type = 3;
+  int32 part_size = 4;
+  int32 total_parts = 5;
+  int64 uncompressed_size = 6;
+  int64 compressed_size = 7;
+  string compression = 8;
+  string checksum = 9;
+}
+
+message GetAgentArtifactPartRequest {
+  string user_id = 1;
+  string artifact_id = 2;
+  int32 part_index = 3;
+  int32 max_part_size = 4;
+  bool is_admin = 5;
+}
+
+message AgentArtifactPartMessage {
+  string artifact_id = 1;
+  string filename = 2;
+  string content_type = 3;
+  int32 part_index = 4;
+  int32 part_size = 5;
+  int32 total_parts = 6;
+  bytes content = 7;
+  string compression = 8;
+}
+
 message GetAgentConfigRequest {
   string user_id = 1;
 }
@@ -483,6 +521,8 @@ service AgentDubboService {
   rpc ListTools(ListAgentToolsRequest) returns (ListAgentToolsResponse);
   rpc ListArtifacts(ListAgentArtifactsRequest) returns (ListAgentArtifactsResponse);
   rpc DownloadArtifact(DownloadAgentArtifactRequest) returns (DownloadAgentArtifactResponse);
+  rpc GetArtifactPartsMeta(GetAgentArtifactPartsRequest) returns (AgentArtifactPartsMetaMessage);
+  rpc GetArtifactPart(GetAgentArtifactPartRequest) returns (AgentArtifactPartMessage);
   rpc GetConfig(GetAgentConfigRequest) returns (GetAgentConfigResponse);
   rpc ListModels(ListAgentModelsRequest) returns (ListAgentModelsResponse);
   rpc GetCredits(GetAgentCreditsRequest) returns (GetAgentCreditsResponse);

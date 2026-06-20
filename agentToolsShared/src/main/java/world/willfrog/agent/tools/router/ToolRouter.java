@@ -17,6 +17,7 @@ import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 import world.willfrog.agent.platform.service.AgentObservabilityService;
 import world.willfrog.agent.platform.service.AgentRunBudgetService;
 import world.willfrog.agent.tools.market.MarketDataTools;
+import world.willfrog.agent.tools.market.advanced.AdvancedSearchRequest;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
 import world.willfrog.agent.tools.rag.RagTools;
 import world.willfrog.agent.tools.search.SearchTools;
@@ -504,10 +505,14 @@ public class ToolRouter {
                         dateStr(params.get("startDateStr"), params.get("startDate"), params.get("start_date"), params.get("arg1")),
                         dateStr(params.get("endDateStr"), params.get("endDate"), params.get("end_date"), params.get("arg2"))
                 );
-                case "searchIndex" -> marketDataTools.searchIndex(
+                case "searchIndex" -> AdvancedSearchRequest.isAdvancedMap(params)
+                        ? marketDataTools.searchIndexAdvanced(params)
+                        : marketDataTools.searchIndex(
                         str(params.get("keyword"), params.get("query"), params.get("arg0"))
                 );
-                case "searchAssetInfo" -> marketDataTools.searchAssetInfo(
+                case "searchAssetInfo" -> AdvancedSearchRequest.isAdvancedMap(params)
+                        ? marketDataTools.searchAssetInfoAdvanced(params)
+                        : marketDataTools.searchAssetInfo(
                         str(params.get("query"), params.get("keyword"), params.get("arg0")),
                         str(params.get("assetTypes"), params.get("asset_types"), params.get("arg1")),
                         str(params.get("marketScope"), params.get("market_scope"), params.get("arg2"), "domestic")

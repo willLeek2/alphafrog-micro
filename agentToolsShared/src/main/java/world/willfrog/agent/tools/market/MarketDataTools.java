@@ -14,6 +14,10 @@ import world.willfrog.agent.tools.dataset.DatasetManifest;
 import world.willfrog.agent.tools.dataset.DatasetRegistry;
 import world.willfrog.agent.tools.dataset.DatasetWriter;
 import world.willfrog.agent.tools.dataset.ManifestWriter;
+import world.willfrog.agent.tools.market.advanced.AdvancedSearchDatasetWriter;
+import world.willfrog.agent.tools.market.advanced.AdvancedSearchEngine;
+import world.willfrog.agent.tools.market.advanced.AdvancedSearchException;
+import world.willfrog.agent.tools.market.advanced.AdvancedSearchRequest;
 import world.willfrog.alphafrogmicro.common.utils.DateConvertUtils;
 import world.willfrog.alphafrogmicro.domestic.idl.*;
 
@@ -399,6 +403,15 @@ public class MarketDataTools {
 
     @Tool("按关键词搜索指数。参数要求：keyword 必须是非空字符串，建议长度 2-40；可输入指数代码片段或指数名称关键词（例如 000300、沪深300、中证500）。支持 | 分隔的多个关键词或 JSON 数组，具体批量上限必须先调用 checkParallelLimits 查询；如果没有 checkParallelLimits 工具，默认不要批量。批量示例：\"沪深300|中证500\"；批量返回 data.mode=batch、data.results、success_count、failure_count。")
     public String searchIndex(String keyword) {
+        Map<String, Object> advancedPayload;
+        try {
+            advancedPayload = parseAdvancedStringPayload(keyword);
+        } catch (AdvancedSearchException e) {
+            return fail("searchIndex", e.getCode(), e.getMessage(), Map.of());
+        }
+        if (advancedPayload != null) {
+            return searchIndexAdvanced(advancedPayload);
+        }
         int maxItems = resolveMaxParallelSearchQueries();
         List<String> queries = parseBatchValues(keyword);
         String limitError = batchLimitFailureIfExceeded("searchIndex", "keyword", queries, maxItems);
@@ -441,6 +454,10 @@ public class MarketDataTools {
         }
     }
 
+    public String searchIndexAdvanced(Map<String, Object> params) {
+        return executeAdvancedSearch("searchIndex", params);
+    }
+
     /**
      * 统一搜索股票/ETF/指数/场外基金基本信息。
      *
@@ -449,6 +466,18 @@ public class MarketDataTools {
      */
     @Tool("统一搜索股票/ETF/指数/场外基金基本信息。参数要求：query 支持 | 分隔或 JSON 数组，具体批量上限必须先调用 checkParallelLimits 查询；如果没有 checkParallelLimits 工具，默认不要批量；assetTypes 可选 stock,etf,index,off_exchange_fund（逗号分隔，默认全部）；marketScope 目前仅支持 domestic。")
     public String searchAssetInfo(String query, String assetTypes, String marketScope) {
+        Map<String, Object> advancedPayload;
+        try {
+            advancedPayload = parseAdvancedStringPayload(query);
+        } catch (AdvancedSearchException e) {
+            return fail("searchAssetInfo", e.getCode(), e.getMessage(), Map.of());
+        }
+        if (advancedPayload != null) {
+            if (assetTypes != null && !assetTypes.isBlank()) {
+                advancedPayload.putIfAbsent("asset_type", assetTypes);
+            }
+            return searchAssetInfoAdvanced(advancedPayload);
+        }
         String scope = nvl(marketScope).trim();
         if (!scope.isBlank() && !"domestic".equalsIgnoreCase(scope)) {
             return fail("searchAssetInfo", "INVALID_ARGUMENT", "Only marketScope=domestic is supported in v1",
@@ -466,6 +495,10 @@ public class MarketDataTools {
         }
         String single = queries.isEmpty() ? query : queries.get(0);
         return searchAssetInfoSingle(single, types);
+    }
+
+    public String searchAssetInfoAdvanced(Map<String, Object> params) {
+        return executeAdvancedSearch("searchAssetInfo", params);
     }
 
     private String searchAssetInfoSingle(String query, LinkedHashSet<String> types) {
@@ -761,10 +794,20 @@ public class MarketDataTools {
         ));
         calendar.put("argumentFormat", "Use | separated YYYYMMDD values or JSON arrays. Do not use comma-separated values.");
 
+        Map<String, Object> advanced = new LinkedHashMap<>();
+        advanced.put("maxItems", resolveMaxParallelQueriesInAdvancedMode());
+        advanced.put("previewRows", resolveAdvancedPreviewRows());
+        advanced.put("tools", List.of(
+                "searchIndex(mode=advanced)",
+                "searchAssetInfo(mode=advanced)"
+        ));
+        advanced.put("argumentFormat", "conditions use | separated index_code/stock_code values. Dates must be YYYYMMDD or NONE.");
+
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("search", search);
         data.put("daily", daily);
         data.put("calendar", calendar);
+        data.put("advanced", advanced);
         data.put("fallbackRule", "If checkParallelLimits is unavailable, assume batch/parallel querying is disabled and call tools with one item at a time.");
         data.put("source", "agent.llm.runtime.parallel from hot-loaded local config first, then application properties");
         return ok("checkParallelLimits", data);
@@ -1548,9 +1591,100 @@ public class MarketDataTools {
         return 50;
     }
 
+    private int resolveMaxParallelQueriesInAdvancedMode() {
+        Integer local = localConfigLoader == null ? null : localConfigLoader.current()
+                .map(AgentLlmProperties::getRuntime)
+                .map(AgentLlmProperties.Runtime::getParallel)
+                .map(AgentLlmProperties.Parallel::getMaxParallelQueriesInAdvancedMode)
+                .orElse(null);
+        if (local != null) {
+            return clamp(local, 1, 20);
+        }
+        Integer base = Optional.ofNullable(llmProperties.getRuntime())
+                .map(AgentLlmProperties.Runtime::getParallel)
+                .map(AgentLlmProperties.Parallel::getMaxParallelQueriesInAdvancedMode)
+                .orElse(null);
+        if (base != null) {
+            return clamp(base, 1, 20);
+        }
+        return 3;
+    }
+
+    private int resolveAdvancedPreviewRows() {
+        Integer local = localConfigLoader == null ? null : localConfigLoader.current()
+                .map(AgentLlmProperties::getTools)
+                .map(AgentLlmProperties.Tools::getMarketData)
+                .map(AgentLlmProperties.MarketData::getAdvanced)
+                .map(AgentLlmProperties.MarketDataAdvanced::getPreviewRows)
+                .orElse(null);
+        if (local != null) {
+            return clamp(local, 0, 100);
+        }
+        Integer base = Optional.ofNullable(llmProperties.getTools())
+                .map(AgentLlmProperties.Tools::getMarketData)
+                .map(AgentLlmProperties.MarketData::getAdvanced)
+                .map(AgentLlmProperties.MarketDataAdvanced::getPreviewRows)
+                .orElse(null);
+        if (base != null) {
+            return clamp(base, 0, 100);
+        }
+        return 10;
+    }
+
     /** 将数值限制在 [min, max] 区间，防止配置错误导致过大或过小的并行限制。 */
     private int clamp(int value, int min, int max) {
         return Math.max(min, Math.min(max, value));
+    }
+
+    private String executeAdvancedSearch(String toolName, Map<String, Object> params) {
+        try {
+            AdvancedSearchRequest request = AdvancedSearchRequest.from(toolName, params, objectMapper);
+            if ("searchIndex".equals(toolName) && request.getAssetType() != null && !request.getAssetType().isBlank()) {
+                log.info("searchIndex advanced ignores unexpected asset_type={}", request.getAssetType());
+            }
+            AdvancedSearchEngine engine = new AdvancedSearchEngine(domesticIndexService, domesticListedAssetService);
+            Map<String, Object> dataset = engine.execute(request, resolveMaxParallelQueriesInAdvancedMode());
+            AdvancedSearchDatasetWriter writer = new AdvancedSearchDatasetWriter(datasetWriter, datasetRegistry, objectMapper);
+            AdvancedSearchDatasetWriter.WriteResult writeResult = writer.writeOrReuse(
+                    toolName,
+                    String.valueOf(dataset.get("asset_type")),
+                    request.getCanonicalQuery(),
+                    dataset,
+                    resolveAdvancedPreviewRows()
+            );
+            Map<String, Object> data = new LinkedHashMap<>();
+            data.put("mode", "advanced");
+            data.put("asset_type", dataset.get("asset_type"));
+            data.put("row_count", dataset.get("row_count"));
+            data.put("dataset_id", writeResult.getDatasetId());
+            data.put("dataset_status", writeResult.getDatasetStatus());
+            data.put("reused", writeResult.isReused());
+            data.put("preview_rows", writeResult.getPreviewRows());
+            data.put("preview_limit", resolveAdvancedPreviewRows());
+            data.put("conditions_meta", dataset.get("conditions_meta"));
+            if (writeResult.getDatasetId() == null || writeResult.getDatasetId().isBlank()) {
+                data.put("dataset", dataset);
+            }
+            return ok(toolName, data);
+        } catch (AdvancedSearchException e) {
+            return fail(toolName, e.getCode(), e.getMessage(), Map.of());
+        } catch (Exception e) {
+            return fail(toolName, "TOOL_ERROR", "Error executing advanced search", Map.of("message", nvl(e.getMessage())));
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> parseAdvancedStringPayload(String value) {
+        String raw = nvl(value).trim();
+        if (!raw.startsWith("{")) {
+            return null;
+        }
+        try {
+            Map<String, Object> map = objectMapper.readValue(raw, new TypeReference<Map<String, Object>>() {});
+            return AdvancedSearchRequest.isAdvancedMap(map) ? map : null;
+        } catch (Exception e) {
+            throw new AdvancedSearchException("INVALID_ARGUMENT", "advanced JSON payload is invalid.");
+        }
     }
 
     /**

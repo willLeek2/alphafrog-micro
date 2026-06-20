@@ -9,6 +9,8 @@ import world.willfrog.alphafrogmicro.agent.idl.AgentRunCostMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunResultMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunStatusMessage;
+import world.willfrog.alphafrogmicro.agent.idl.AgentArtifactPartMessage;
+import world.willfrog.alphafrogmicro.agent.idl.AgentArtifactPartsMetaMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentSnapshotPartMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentSnapshotPartsMetaMessage;
 import world.willfrog.alphafrogmicro.agent.idl.ApplyAgentCreditsRequest;
@@ -32,6 +34,8 @@ import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCreditsResponse;
 import world.willfrog.alphafrogmicro.agent.idl.RefreshAgentRunCreditsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunResultRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunStatusRequest;
+import world.willfrog.alphafrogmicro.agent.idl.GetAgentArtifactPartRequest;
+import world.willfrog.alphafrogmicro.agent.idl.GetAgentArtifactPartsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentSnapshotPartRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentSnapshotPartsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentArtifactsRequest;
@@ -173,6 +177,16 @@ public class AgentLangchainDubboServiceImpl extends DubboAgentDubboServiceTriple
     @Override
     public DownloadAgentArtifactResponse downloadArtifact(DownloadAgentArtifactRequest request) {
         return artifactFacadeService.downloadArtifact(request);
+    }
+
+    @Override
+    public AgentArtifactPartsMetaMessage getArtifactPartsMeta(GetAgentArtifactPartsRequest request) {
+        return artifactFacadeService.getArtifactPartsMeta(request);
+    }
+
+    @Override
+    public AgentArtifactPartMessage getArtifactPart(GetAgentArtifactPartRequest request) {
+        return artifactFacadeService.getArtifactPart(request);
     }
 
     @Override

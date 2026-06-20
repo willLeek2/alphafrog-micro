@@ -16,6 +16,7 @@ import dev.langchain4j.model.chat.request.json.JsonStringSchema;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import world.willfrog.agent.tools.catalog.MarketDataAdvancedToolCatalog;
 import world.willfrog.agent.tools.catalog.ParallelLimitsToolCatalog;
 import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
@@ -46,7 +47,8 @@ public class LangchainToolCatalogService {
         addSpecs(specs, searchTools);
         addSpecs(specs, pythonSandboxTools);
 
-        List<ToolSpecification> merged = ParallelLimitsToolCatalog.mergeCanonical(new ArrayList<>(specs.values()));
+        List<ToolSpecification> merged = MarketDataAdvancedToolCatalog.mergeCanonical(
+                ParallelLimitsToolCatalog.mergeCanonical(new ArrayList<>(specs.values())));
 
         List<AgentToolMessage> messages = new ArrayList<>();
         for (ToolSpecification spec : merged) {

@@ -20,6 +20,8 @@ import world.willfrog.alphafrogmicro.agent.idl.AgentModelMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunCostMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunResultMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunStatusMessage;
+import world.willfrog.alphafrogmicro.agent.idl.AgentArtifactPartMessage;
+import world.willfrog.alphafrogmicro.agent.idl.AgentArtifactPartsMetaMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentToolMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentEmpty;
 import world.willfrog.alphafrogmicro.agent.idl.ApplyAgentCreditsRequest;
@@ -43,6 +45,8 @@ import world.willfrog.alphafrogmicro.agent.idl.RefreshAgentRunCreditsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunResultRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunStatusRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentConfigResponse;
+import world.willfrog.alphafrogmicro.agent.idl.GetAgentArtifactPartRequest;
+import world.willfrog.alphafrogmicro.agent.idl.GetAgentArtifactPartsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentArtifactsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentArtifactsResponse;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentModelsRequest;
@@ -617,6 +621,62 @@ public class AgentDubboServiceImpl extends DubboAgentDubboServiceTriple.AgentDub
                 .setFilename(nvl(artifact.filename()))
                 .setContentType(nvl(artifact.contentType()))
                 .setContent(com.google.protobuf.ByteString.copyFrom(artifact.content()))
+                .build();
+    }
+
+    @Override
+    public AgentArtifactPartsMetaMessage getArtifactPartsMeta(GetAgentArtifactPartsRequest request) {
+        String runId = artifactService.extractRunId(request.getArtifactId());
+        AgentRun run = requireRun(runId, request.getUserId());
+        AgentArtifactService.ArtifactContent artifact = artifactService.loadArtifactForParts(
+                run,
+                request.getIsAdmin(),
+                request.getArtifactId()
+        );
+        SnapshotPartsMeta meta = snapshotPartService.getOrBuildBytesMeta(
+                artifactPartKey(request.getArtifactId()),
+                artifact.content(),
+                request.getMaxPartSize());
+        return AgentArtifactPartsMetaMessage.newBuilder()
+                .setArtifactId(artifact.artifactId())
+                .setFilename(nvl(artifact.filename()))
+                .setContentType(nvl(artifact.contentType()))
+                .setPartSize(meta.getPartSize())
+                .setTotalParts(meta.getTotalParts())
+                .setUncompressedSize(meta.getUncompressedSize())
+                .setCompressedSize(meta.getCompressedSize())
+                .setCompression(nvl(meta.getCompression()))
+                .setChecksum(nvl(meta.getChecksum()))
+                .build();
+    }
+
+    @Override
+    public AgentArtifactPartMessage getArtifactPart(GetAgentArtifactPartRequest request) {
+        String runId = artifactService.extractRunId(request.getArtifactId());
+        AgentRun run = requireRun(runId, request.getUserId());
+        AgentArtifactService.ArtifactContent artifact = artifactService.loadArtifactForParts(
+                run,
+                request.getIsAdmin(),
+                request.getArtifactId()
+        );
+        SnapshotPartsMeta meta = snapshotPartService.getOrBuildBytesMeta(
+                artifactPartKey(request.getArtifactId()),
+                artifact.content(),
+                request.getMaxPartSize());
+        byte[] content = snapshotPartService.getBytesPart(
+                artifactPartKey(request.getArtifactId()),
+                artifact.content(),
+                request.getPartIndex(),
+                request.getMaxPartSize());
+        return AgentArtifactPartMessage.newBuilder()
+                .setArtifactId(artifact.artifactId())
+                .setFilename(nvl(artifact.filename()))
+                .setContentType(nvl(artifact.contentType()))
+                .setPartIndex(request.getPartIndex())
+                .setPartSize(meta.getPartSize())
+                .setTotalParts(meta.getTotalParts())
+                .setContent(com.google.protobuf.ByteString.copyFrom(content))
+                .setCompression(nvl(meta.getCompression()))
                 .build();
     }
 
@@ -1201,6 +1261,10 @@ public class AgentDubboServiceImpl extends DubboAgentDubboServiceTriple.AgentDub
 
     private String nvl(String v) {
         return v == null ? "" : v;
+    }
+
+    private String artifactPartKey(String artifactId) {
+        return "artifact:" + nvl(artifactId);
     }
 
     private long nonNegativeLong(Long v) {

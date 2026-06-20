@@ -5,6 +5,7 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 import world.willfrog.agent.platform.config.RunStageConfig;
+import world.willfrog.agent.platform.config.StageLlmConfig;
 
 /**
  * Agent 运行时上下文中枢 —— 跨组件共享的 {@link ThreadLocal} 容器。
@@ -113,6 +114,12 @@ public class AgentContext {
      * 当前 Run 的阶段级 LLM 配置(客户端+本地合并后的最终结果)。
      */
     private static final ThreadLocal<RunStageConfig> STAGE_CONFIG_HOLDER = new ThreadLocal<>();
+
+    /**
+     * 当前 Run 的 execution 阶段生效配置（endpoint / model / providerOrder 已合并请求参数与本地 fallback）。
+     * 供 search_evidence_judge 等没有独立 stage 配置的环节退化使用，避免落到 deprecated runtime.judge.routes。
+     */
+    private static final ThreadLocal<StageLlmConfig> EFFECTIVE_EXECUTION_STAGE_CONFIG_HOLDER = new ThreadLocal<>();
 
     /**
      * DashScope thinking 内容：从流式响应中提取的 reasoning_content。
@@ -408,6 +415,29 @@ public class AgentContext {
         STAGE_CONFIG_HOLDER.remove();
     }
 
+    /**
+     * 设置当前 Run 的 execution 阶段生效配置。
+     * 由 AgentRunExecutor 在解析合并完请求参数、本地 fallback 后写入，
+     * 供 search_evidence_judge 等无独立 stage 配置的环节退化使用。
+     */
+    public static void setEffectiveExecutionStageConfig(StageLlmConfig config) {
+        if (config == null) {
+            EFFECTIVE_EXECUTION_STAGE_CONFIG_HOLDER.remove();
+            return;
+        }
+        EFFECTIVE_EXECUTION_STAGE_CONFIG_HOLDER.set(config);
+    }
+
+    /** 获取 execution 阶段生效配置，可能为 null。 */
+    public static StageLlmConfig getEffectiveExecutionStageConfig() {
+        return EFFECTIVE_EXECUTION_STAGE_CONFIG_HOLDER.get();
+    }
+
+    /** 清理 execution 阶段生效配置。 */
+    public static void clearEffectiveExecutionStageConfig() {
+        EFFECTIVE_EXECUTION_STAGE_CONFIG_HOLDER.remove();
+    }
+
     /** 设置流式响应中提取的 thinking 内容(DashScope reasoning_content 等)。 */
     public static void setThinkingContent(String content) {
         THINKING_CONTENT_HOLDER.set(content);
@@ -551,7 +581,7 @@ public class AgentContext {
      * 用户没开搜索而拒绝执行。引入本方法后,子线程能正确继承父线程的所有能力配置。
      *
      * @return 包含 runId / userId / debugMode / webSearchEnabled / webSearchConfig /
-     *         extractedEntities / reasoningEffort / stageConfig 的不可变快照
+     *         extractedEntities / reasoningEffort / stageConfig / effectiveExecutionStageConfig 的不可变快照
      */
     public static ContextSnapshot captureRunContext() {
         return new ContextSnapshot(
@@ -563,6 +593,7 @@ public class AgentContext {
                 EXTRACTED_ENTITIES_HOLDER.get(),
                 getReasoningEffort(),
                 getStageConfig(),
+                getEffectiveExecutionStageConfig(),
                 getWorkflow()
         );
     }
@@ -626,6 +657,12 @@ public class AgentContext {
         } else {
             setStageConfig(snapshot.stageConfig());
         }
+        // execution 阶段生效配置：子线程的 search_evidence_judge 等需要退化为 run 主模型
+        if (snapshot.effectiveExecutionStageConfig() == null) {
+            clearEffectiveExecutionStageConfig();
+        } else {
+            setEffectiveExecutionStageConfig(snapshot.effectiveExecutionStageConfig());
+        }
         if (snapshot.workflow() == null) {
             clearWorkflow();
         } else {
@@ -661,6 +698,7 @@ public class AgentContext {
         clearExtractedEntities();
         clearReasoningEffort();
         clearStageConfig();
+        clearEffectiveExecutionStageConfig();
         clearThinkingContent();
         clearStreamingProgress();
     }
@@ -701,6 +739,7 @@ public class AgentContext {
      * @param extractedEntities   Planner 提取的实体列表
      * @param reasoningEffort     OpenRouter reasoning 强度
      * @param stageConfig         阶段级 LLM 配置
+     * @param effectiveExecutionStageConfig execution 阶段生效配置
      * @param workflow            工作流形态（linear / dag）
      */
     public record ContextSnapshot(
@@ -712,6 +751,7 @@ public class AgentContext {
             List<String> extractedEntities,
             String reasoningEffort,
             RunStageConfig stageConfig,
+            StageLlmConfig effectiveExecutionStageConfig,
             String workflow
     ) {
     }

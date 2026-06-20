@@ -53,7 +53,7 @@ public class SnapshotPartService {
         if (cached != null) {
             return cached;
         }
-        PreparedSnapshot prepared = prepareSnapshot(runId, snapshotJson, partSize);
+        PreparedSnapshot prepared = preparePayload(runId, nvl(snapshotJson).getBytes(StandardCharsets.UTF_8), partSize);
         cacheParts(runId, partSize, prepared);
         return prepared.meta();
     }
@@ -75,7 +75,7 @@ public class SnapshotPartService {
         if (cached != null) {
             return cached;
         }
-        PreparedSnapshot prepared = prepareSnapshot(runId, snapshotJson, partSize);
+        PreparedSnapshot prepared = preparePayload(runId, nvl(snapshotJson).getBytes(StandardCharsets.UTF_8), partSize);
         cacheParts(runId, partSize, prepared);
         if (partIndex >= prepared.parts().size()) {
             throw new IllegalArgumentException("part_index out of range");
@@ -83,8 +83,44 @@ public class SnapshotPartService {
         return prepared.parts().get(partIndex);
     }
 
-    private PreparedSnapshot prepareSnapshot(String runId, String snapshotJson, int partSize) {
-        byte[] raw = nvl(snapshotJson).getBytes(StandardCharsets.UTF_8);
+    public SnapshotPartsMeta getOrBuildBytesMeta(String keyId, byte[] raw, int requestedPartSize) {
+        validateRunId(keyId);
+        int partSize = resolvePartSize(requestedPartSize);
+        SnapshotPartsMeta cached = loadMetaFromCache(keyId, partSize);
+        if (cached != null) {
+            return cached;
+        }
+        PreparedSnapshot prepared = preparePayload(keyId, raw == null ? new byte[0] : raw, partSize);
+        cacheParts(keyId, partSize, prepared);
+        return prepared.meta();
+    }
+
+    public byte[] getBytesPart(String keyId, byte[] raw, int partIndex, int requestedPartSize) {
+        validateRunId(keyId);
+        if (partIndex < 0) {
+            throw new IllegalArgumentException("part_index must be >= 0");
+        }
+        SnapshotPartsMeta meta = getOrBuildBytesMeta(keyId, raw, requestedPartSize);
+        if (meta.getTotalParts() == 0) {
+            throw new IllegalArgumentException("snapshot has no parts");
+        }
+        if (partIndex >= meta.getTotalParts()) {
+            throw new IllegalArgumentException("part_index out of range");
+        }
+        int partSize = meta.getPartSize();
+        byte[] cached = snapshotPartRedisTemplate.opsForValue().get(partKey(keyId, partSize, partIndex));
+        if (cached != null) {
+            return cached;
+        }
+        PreparedSnapshot prepared = preparePayload(keyId, raw == null ? new byte[0] : raw, partSize);
+        cacheParts(keyId, partSize, prepared);
+        if (partIndex >= prepared.parts().size()) {
+            throw new IllegalArgumentException("part_index out of range");
+        }
+        return prepared.parts().get(partIndex);
+    }
+
+    private PreparedSnapshot preparePayload(String runId, byte[] raw, int partSize) {
         byte[] payload;
         String compression;
         if (properties.isGzipEnabled()) {

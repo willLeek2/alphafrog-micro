@@ -30,6 +30,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.regex.Pattern;
+import java.util.stream.Stream;
 
 @Service
 @RequiredArgsConstructor
@@ -121,6 +122,14 @@ public class AgentArtifactService {
     }
 
     public ArtifactContent loadArtifact(AgentRun run, boolean isAdmin, String artifactId) {
+        return loadArtifact(run, isAdmin, artifactId, true);
+    }
+
+    public ArtifactContent loadArtifactForParts(AgentRun run, boolean isAdmin, String artifactId) {
+        return loadArtifact(run, isAdmin, artifactId, false);
+    }
+
+    private ArtifactContent loadArtifact(AgentRun run, boolean isAdmin, String artifactId, boolean enforceDownloadMaxBytes) {
         List<ResolvedArtifact> artifacts = resolveArtifacts(run, isAdmin);
         ResolvedArtifact target = artifacts.stream()
                 .filter(item -> Objects.equals(item.getArtifactId(), artifactId))
@@ -133,7 +142,7 @@ public class AgentArtifactService {
 
         try {
             long size = Files.size(target.getFilePath());
-            if (downloadMaxBytes > 0 && size > downloadMaxBytes) {
+            if (enforceDownloadMaxBytes && downloadMaxBytes > 0 && size > downloadMaxBytes) {
                 throw new IllegalStateException("artifact too large to download");
             }
             byte[] bytes = Files.readAllBytes(target.getFilePath());
@@ -198,10 +207,7 @@ public class AgentArtifactService {
             if (!datasetDir.startsWith(baseDir)) {
                 continue;
             }
-            Path csvFile = datasetDir.resolve(datasetId + ".csv");
-            addDatasetFileArtifact(artifacts, run.getId(), datasetId, csvFile, "dataset_csv", "text/csv", isAdmin);
-            Path metaFile = datasetDir.resolve(datasetId + ".meta.json");
-            addDatasetFileArtifact(artifacts, run.getId(), datasetId, metaFile, "dataset_meta", "application/json", isAdmin);
+            addDatasetFileArtifacts(artifacts, run.getId(), datasetId, datasetDir, isAdmin);
         }
 
         artifacts.sort((a, b) -> Long.compare(
@@ -209,6 +215,29 @@ public class AgentArtifactService {
                 a.getCreatedAt() == null ? 0L : a.getCreatedAt().toInstant().toEpochMilli()
         ));
         return artifacts;
+    }
+
+    private void addDatasetFileArtifacts(List<ResolvedArtifact> artifacts,
+                                         String runId,
+                                         String datasetId,
+                                         Path datasetDir,
+                                         boolean isAdmin) {
+        try {
+            if (!Files.exists(datasetDir) || !Files.isDirectory(datasetDir)) {
+                return;
+            }
+            try (Stream<Path> stream = Files.list(datasetDir)) {
+                stream
+                        .filter(Files::isRegularFile)
+                        .sorted((a, b) -> a.getFileName().toString().compareTo(b.getFileName().toString()))
+                        .forEach(file -> {
+                            DatasetFileKind kind = resolveDatasetFileKind(datasetId, file.getFileName().toString());
+                            addDatasetFileArtifact(artifacts, runId, datasetId, file, kind.type(), kind.contentType(), isAdmin);
+                        });
+            }
+        } catch (Exception e) {
+            log.warn("Resolve dataset artifacts failed: runId={}, datasetId={}, dir={}", runId, datasetId, datasetDir, e);
+        }
     }
 
     private void addDatasetFileArtifact(List<ResolvedArtifact> artifacts,
@@ -231,10 +260,14 @@ public class AgentArtifactService {
             if (copiedFile == null) {
                 return;
             }
-            String artifactId = encodeArtifactId(type, runId, datasetId);
+            String fileName = copiedFile.getFileName().toString();
+            String artifactRef = canonicalDatasetArtifactRef(datasetId, fileName, type);
+            String artifactId = encodeArtifactId(type, runId, artifactRef);
             Map<String, Object> meta = new HashMap<>();
             meta.put("kind", type);
             meta.put("dataset_id", datasetId);
+            meta.put("file_name", fileName);
+            meta.put("format", datasetFormat(fileName, type));
             meta.put("scope", isAdmin ? "admin" : "normal");
             artifacts.add(ResolvedArtifact.builder()
                     .artifactId(artifactId)
@@ -249,6 +282,46 @@ public class AgentArtifactService {
         } catch (Exception e) {
             log.warn("Resolve dataset artifact failed: runId={}, datasetId={}, file={}", runId, datasetId, filePath, e);
         }
+    }
+
+    private DatasetFileKind resolveDatasetFileKind(String datasetId, String fileName) {
+        String safeFileName = fileName == null ? "" : fileName;
+        if (safeFileName.equals(datasetId + ".meta.json") || safeFileName.endsWith(".meta.json")) {
+            return new DatasetFileKind("dataset_meta", "application/json");
+        }
+        if (safeFileName.endsWith(".csv")) {
+            return new DatasetFileKind("dataset_csv", "text/csv");
+        }
+        if (safeFileName.endsWith(".json")) {
+            return new DatasetFileKind("dataset_json", "application/json");
+        }
+        return new DatasetFileKind("dataset_file", "application/octet-stream");
+    }
+
+    private String canonicalDatasetArtifactRef(String datasetId, String fileName, String type) {
+        if (fileName.equals(datasetId + ".csv") && "dataset_csv".equals(type)) {
+            return datasetId;
+        }
+        if (fileName.equals(datasetId + ".meta.json") && "dataset_meta".equals(type)) {
+            return datasetId;
+        }
+        if (fileName.equals(datasetId + ".json") && "dataset_json".equals(type)) {
+            return datasetId;
+        }
+        return datasetId + "/" + fileName;
+    }
+
+    private String datasetFormat(String fileName, String type) {
+        if ("dataset_meta".equals(type)) {
+            return "meta";
+        }
+        if (fileName.endsWith(".csv")) {
+            return "csv";
+        }
+        if (fileName.endsWith(".json")) {
+            return "json";
+        }
+        return "file";
     }
 
     private ParsedEvents parseEvents(List<AgentRunEvent> events) {
@@ -937,6 +1010,9 @@ public class AgentArtifactService {
     }
 
     private record ArtifactRef(String type, String runId, String ref) {
+    }
+
+    private record DatasetFileKind(String type, String contentType) {
     }
 
     @Getter

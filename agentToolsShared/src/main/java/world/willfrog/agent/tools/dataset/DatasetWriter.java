@@ -38,6 +38,10 @@ public class DatasetWriter {
         return resolveEnabled();
     }
 
+    public String getDatasetPath() {
+        return datasetPath;
+    }
+
     public <T> String writeDataset(String prefix, String tsCode, String start, String end, 
                                    List<T> data, 
                                    List<String> headers, 
