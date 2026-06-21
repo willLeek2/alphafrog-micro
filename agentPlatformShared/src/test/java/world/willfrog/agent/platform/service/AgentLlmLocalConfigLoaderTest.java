@@ -210,6 +210,11 @@ class AgentLlmLocalConfigLoaderTest {
         Path configFile = tempDir.resolve("agent-llm.local.json");
         Files.writeString(configFile, """
                 {
+                  "agent": {
+                    "call-raw-content": {
+                      "ttl-seconds": 7200
+                    }
+                  },
                   "tools": {
                     "market-data": {
                       "dataset": {
@@ -231,6 +236,8 @@ class AgentLlmLocalConfigLoaderTest {
                 .getTools().getMarketData();
         assertTrue(Boolean.TRUE.equals(marketData.getDataset().getEnabled()));
         assertTrue(Boolean.TRUE.equals(marketData.getBatch().getEmitManifest()));
+        assertEquals(7200L, loader.current().orElseThrow()
+                .getAgent().getCallRawContent().getTtlSeconds());
     }
 
     @Test

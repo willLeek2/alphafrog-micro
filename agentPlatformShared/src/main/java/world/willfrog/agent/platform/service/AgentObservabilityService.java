@@ -1909,6 +1909,15 @@ public class AgentObservabilityService {
         // trace index 留在 observability 列表中，detail blob 用 traceId 单独读取；
         // 这就是“列表可扫、详情按需展开”的容量保护边界。
         boolean detailBlobStored = false;
+        Map<String, Object> rawBlob = AgentCallDetailPersistence.toLlmRawContentBlob(runId, trace);
+        if (AgentCallDetailPersistence.hasPersistableLlmRawContentBlob(rawBlob)) {
+            try {
+                stateStore.saveLlmCallRawContent(runId, trace.getTraceId(), safeWrite(rawBlob));
+            } catch (Exception e) {
+                log.debug("Failed to persist LLM raw http detail blob: runId={}, traceId={}, error={}",
+                        runId, trace.getTraceId(), e.getMessage());
+            }
+        }
         Map<String, Object> blob = AgentCallDetailPersistence.toLlmDetailBlob(trace);
         if (AgentCallDetailPersistence.hasPersistableDetailBlob(blob)) {
             try {

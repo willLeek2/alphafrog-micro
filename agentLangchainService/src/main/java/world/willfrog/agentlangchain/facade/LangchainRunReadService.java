@@ -223,7 +223,9 @@ public class LangchainRunReadService {
     }
 
     public AgentRunResultMessage getResult(GetAgentRunResultRequest request) {
-        AgentRun run = requireReadableRun(request.getId(), request.getUserId());
+        AgentRun run = request.getIsAdmin()
+                ? requireReadableRunForAdmin(request.getId())
+                : requireReadableRun(request.getId(), request.getUserId());
         String snapshotJson = nvl(run.getSnapshotJson());
         String observabilityJson = nvl(observabilityService.loadObservabilityJson(run.getId(), snapshotJson));
         Map<String, Object> snapshot = readExtMap(snapshotJson);

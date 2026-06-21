@@ -103,6 +103,18 @@ class AgentCallDetailPersistenceTest {
     }
 
     @Test
+    void hasPersistableLlmRawContentBlob_requiresHttpRequestOrResponse() {
+        Map<String, Object> onlyIds = Map.of("type", "llm_raw_http", "runId", "run-1", "traceId", "a");
+        assertFalse(AgentCallDetailPersistence.hasPersistableLlmRawContentBlob(onlyIds));
+        Map<String, Object> withRequest = new LinkedHashMap<>(onlyIds);
+        withRequest.put("httpRequest", Map.of("url", "https://example.test"));
+        assertTrue(AgentCallDetailPersistence.hasPersistableLlmRawContentBlob(withRequest));
+        Map<String, Object> withResponse = new LinkedHashMap<>(onlyIds);
+        withResponse.put("httpResponse", Map.of("statusCode", 200));
+        assertTrue(AgentCallDetailPersistence.hasPersistableLlmRawContentBlob(withResponse));
+    }
+
+    @Test
     void toToolDetailBlob_capturesParamsAndOutput() {
         AgentObservabilityService.ToolTrace trace = new AgentObservabilityService.ToolTrace();
         trace.setTraceId("tool-1");

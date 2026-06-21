@@ -84,19 +84,25 @@ import world.willfrog.alphafrogmicro.frontend.model.agent.TimelineResponse;
 import world.willfrog.alphafrogmicro.frontend.service.AuthService;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentCallDetailBlobReader;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentCallDetailMapper;
+import world.willfrog.alphafrogmicro.frontend.service.agent.AgentRawTraceDetailMapper;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentRunResultCacheService;
 
 import java.math.BigDecimal;
 import java.util.Optional;
 
+import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
+import java.util.HexFormat;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.zip.GZIPOutputStream;
 
 /**
  * Agent run HTTP API.
@@ -111,6 +117,10 @@ public class AgentController {
 
     private static final int ADMIN_USER_TYPE = 1127;
     private static final int OBSERVABILITY_FULL_MAX_BYTES = 5 * 1024 * 1024;
+    private static final int INLINE_FULL_MAX_BYTES = 256 * 1024;
+    private static final int TRACE_FULL_DEFAULT_PART_SIZE = 512 * 1024;
+    private static final int TRACE_FULL_MIN_PART_SIZE = 64 * 1024;
+    private static final int TRACE_FULL_MAX_PART_SIZE = 2 * 1024 * 1024;
 
     @DubboReference(group = "langchain", check = false)
     private AgentDubboService agentDubboServiceLangchain;
@@ -836,13 +846,15 @@ public class AgentController {
     @GetMapping(AGENT_RUNS + "/{runId}/traces/{traceId}")
     public ResponseWrapper<TraceDetailResponse> traceDetail(Authentication authentication,
                                                             @PathVariable("runId") String runId,
-                                                            @PathVariable("traceId") String traceId) {
+                                                            @PathVariable("traceId") String traceId,
+                                                            @RequestParam(value = "full", defaultValue = "false") boolean full,
+                                                            @RequestParam(value = "maxPartSize", required = false, defaultValue = "0") int maxPartSize) {
         String userId = resolveUserId(authentication);
         if (userId == null) {
             return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
         }
         try {
-            AgentRunResultMessage result = loadRunResult(userId, runId);
+            AgentRunResultMessage result = loadRunResult(userId, runId, isAdmin(authentication));
             String obsJson = result.getObservabilityJson();
             if (obsJson == null || obsJson.isBlank()) {
                 return ResponseWrapper.error(ResponseCode.DATA_NOT_FOUND, "trace 不存在");
@@ -857,7 +869,7 @@ public class AgentController {
             if (llmTracesObj instanceof List<?> llmTraces) {
                 for (Object item : llmTraces) {
                     if (item instanceof Map<?, ?> m && traceId.equals(strVal(m.get("traceId")))) {
-                        return ResponseWrapper.success(TraceDetailResponse.builder()
+                        TraceDetailResponse response = TraceDetailResponse.builder()
                                 .type("llm")
                                 .traceId(strVal(m.get("traceId")))
                                 .phase(strVal(m.get("phase")))
@@ -880,7 +892,9 @@ public class AgentController {
                                 .httpRequest(m.get("httpRequest"))
                                 .httpResponse(m.get("httpResponse"))
                                 .curlCommand(emptyToNull(strVal(m.get("curlCommand"))))
-                                .build());
+                                .build();
+                        return full ? enrichFullTraceResponse(response, runId, traceId, m, maxPartSize)
+                                : ResponseWrapper.success(response);
                     }
                 }
             }
@@ -890,7 +904,7 @@ public class AgentController {
             if (toolTracesObj instanceof List<?> toolTraces) {
                 for (Object item : toolTraces) {
                     if (item instanceof Map<?, ?> m && traceId.equals(strVal(m.get("traceId")))) {
-                        return ResponseWrapper.success(TraceDetailResponse.builder()
+                        TraceDetailResponse response = TraceDetailResponse.builder()
                                 .type("tool")
                                 .traceId(strVal(m.get("traceId")))
                                 .phase(strVal(m.get("phase")))
@@ -907,7 +921,9 @@ public class AgentController {
                                 .cacheKey(emptyToNull(strVal(m.get("cacheKey"))))
                                 .decisionLlmTraceId(emptyToNull(strVal(m.get("decisionLlmTraceId"))))
                                 .decisionExcerpt(emptyToNull(strVal(m.get("decisionExcerpt"))))
-                                .build());
+                                .build();
+                        return full ? enrichFullTraceResponse(response, runId, traceId, m, maxPartSize)
+                                : ResponseWrapper.success(response);
                     }
                 }
             }
@@ -976,6 +992,238 @@ public class AgentController {
         } catch (Exception e) {
             return handleError(e, "查询 call 详情");
         }
+    }
+
+    @GetMapping(AGENT_RUNS + "/{runId}/traces/{traceId}/full/parts")
+    public ResponseWrapper<TraceDetailResponse.FullDetailParts> traceFullParts(Authentication authentication,
+                                                                              @PathVariable("runId") String runId,
+                                                                              @PathVariable("traceId") String traceId,
+                                                                              @RequestParam(value = "maxPartSize", required = false, defaultValue = "0") int maxPartSize) {
+        String userId = resolveUserId(authentication);
+        if (userId == null) {
+            return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
+        }
+        try {
+            AgentRunResultMessage result = loadRunResult(userId, runId, isAdmin(authentication));
+            Optional<TraceLookup> lookup = findTrace(result.getObservabilityJson(), traceId);
+            if (lookup.isEmpty()) {
+                return ResponseWrapper.error(ResponseCode.DATA_NOT_FOUND, "trace 不存在");
+            }
+            AgentRawTraceDetailMapper.FullTracePayload payload = resolveFullPayload(runId, traceId, lookup.get())
+                    .orElse(null);
+            if (payload == null) {
+                return rawTraceMissingResponse(runId, traceId, lookup.get());
+            }
+            return ResponseWrapper.success(buildFullParts(runId, traceId, payload, maxPartSize));
+        } catch (RpcException e) {
+            return handleRpcError(e, "查询 trace full parts");
+        } catch (Exception e) {
+            return handleError(e, "查询 trace full parts");
+        }
+    }
+
+    @GetMapping(AGENT_RUNS + "/{runId}/traces/{traceId}/full/parts/{partIndex}")
+    public ResponseEntity<byte[]> traceFullPart(Authentication authentication,
+                                                @PathVariable("runId") String runId,
+                                                @PathVariable("traceId") String traceId,
+                                                @PathVariable("partIndex") int partIndex,
+                                                @RequestParam(value = "maxPartSize", required = false, defaultValue = "0") int maxPartSize) {
+        String userId = resolveUserId(authentication);
+        if (userId == null) {
+            return traceFullPartError(401, "UNAUTHORIZED");
+        }
+        try {
+            AgentRunResultMessage result = loadRunResult(userId, runId, isAdmin(authentication));
+            Optional<TraceLookup> lookup = findTrace(result.getObservabilityJson(), traceId);
+            if (lookup.isEmpty()) {
+                return traceFullPartError(404, "TRACE_NOT_FOUND");
+            }
+            AgentRawTraceDetailMapper.FullTracePayload payload = resolveFullPayload(runId, traceId, lookup.get())
+                    .orElse(null);
+            if (payload == null) {
+                boolean expired = rawTraceExpired(runId, traceId, lookup.get());
+                return traceFullPartError(expired ? 410 : 404,
+                        expired ? "RAW_TRACE_EXPIRED" : "RAW_TRACE_NOT_FOUND");
+            }
+            PreparedFullParts prepared = prepareFullParts(payload, maxPartSize);
+            if (partIndex < 0 || partIndex >= prepared.totalParts()) {
+                return traceFullPartError(400, "PART_INDEX_OUT_OF_RANGE");
+            }
+            byte[] content = Arrays.copyOfRange(
+                    prepared.compressed(),
+                    partIndex * prepared.partSize(),
+                    Math.min(prepared.compressed().length, (partIndex + 1) * prepared.partSize()));
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.APPLICATION_OCTET_STREAM);
+            headers.setContentLength(content.length);
+            headers.set(HttpHeaders.CACHE_CONTROL, "no-store");
+            headers.set("X-Trace-Full-Run-Id", nvl(runId));
+            headers.set("X-Trace-Full-Trace-Id", nvl(traceId));
+            headers.set("X-Trace-Full-Compression", "gzip");
+            headers.set("X-Trace-Full-Part-Index", String.valueOf(partIndex));
+            headers.set("X-Trace-Full-Part-Size", String.valueOf(prepared.partSize()));
+            headers.set("X-Trace-Full-Total-Parts", String.valueOf(prepared.totalParts()));
+            headers.set("X-Trace-Full-Checksum", prepared.checksum());
+            return ResponseEntity.ok().headers(headers).body(content);
+        } catch (RpcException e) {
+            log.error("查询 trace full part 失败: runId={}, traceId={}, err={}", runId, traceId, e.getMessage());
+            return traceFullPartError(resolveArtifactPartErrorStatus(e.getMessage()), "RPC_ERROR");
+        } catch (Exception e) {
+            log.error("查询 trace full part 失败: runId={}, traceId={}", runId, traceId, e);
+            return traceFullPartError(500, "ERROR");
+        }
+    }
+
+    private ResponseWrapper<TraceDetailResponse> enrichFullTraceResponse(TraceDetailResponse response,
+                                                                         String runId,
+                                                                         String traceId,
+                                                                         Map<?, ?> trace,
+                                                                         int maxPartSize) {
+        TraceLookup lookup = new TraceLookup(response.getType(), (Map<?, ?>) trace);
+        Optional<AgentRawTraceDetailMapper.FullTracePayload> payloadOpt = resolveFullPayload(runId, traceId, lookup);
+        if (payloadOpt.isEmpty()) {
+            return rawTraceMissingResponse(runId, traceId, lookup);
+        }
+        AgentRawTraceDetailMapper.FullTracePayload payload = payloadOpt.get();
+        if (payload.thresholdBytes().length <= INLINE_FULL_MAX_BYTES) {
+            response.setFullDetail(payload.fullDetail());
+        } else {
+            response.setFullDetailParts(buildFullParts(runId, traceId, payload, maxPartSize));
+        }
+        return ResponseWrapper.success(response);
+    }
+
+    private Optional<AgentRawTraceDetailMapper.FullTracePayload> resolveFullPayload(String runId,
+                                                                                   String traceId,
+                                                                                   TraceLookup lookup) {
+        if ("llm".equals(lookup.type())) {
+            Optional<String> raw = callDetailBlobReader.loadLlmCallRawContent(runId, traceId);
+            if (raw.isEmpty()) {
+                return Optional.empty();
+            }
+            Map<String, Object> meta = callDetailBlobReader.loadLlmCallRawMeta(runId, traceId)
+                    .map(json -> AgentRawTraceDetailMapper.parseMeta(objectMapper, json))
+                    .orElseGet(LinkedHashMap::new);
+            return Optional.of(AgentRawTraceDetailMapper.buildLlmPayload(objectMapper, runId, traceId, raw.get(), meta));
+        }
+        if ("tool".equals(lookup.type())) {
+            Optional<String> detail = callDetailBlobReader.loadToolCallDetail(runId, traceId);
+            return detail.map(json -> AgentRawTraceDetailMapper.buildToolPayload(objectMapper, runId, traceId, json));
+        }
+        return Optional.empty();
+    }
+
+    private <T> ResponseWrapper<T> rawTraceMissingResponse(String runId, String traceId, TraceLookup lookup) {
+        if (rawTraceExpired(runId, traceId, lookup)) {
+            return ResponseWrapper.error(ResponseCode.DATA_EXPIRED, "RAW_TRACE_EXPIRED");
+        }
+        return ResponseWrapper.error(ResponseCode.DATA_NOT_FOUND, "RAW_TRACE_NOT_FOUND");
+    }
+
+    private boolean rawTraceExpired(String runId, String traceId, TraceLookup lookup) {
+        if ("llm".equals(lookup.type())) {
+            Optional<String> metaJson = callDetailBlobReader.loadLlmCallRawMeta(runId, traceId);
+            if (metaJson.isEmpty()) {
+                return false;
+            }
+            Map<String, Object> meta = AgentRawTraceDetailMapper.parseMeta(objectMapper, metaJson.get());
+            Long expiresAt = nullableLong(meta.get("expiresAtMillis"));
+            return expiresAt != null && System.currentTimeMillis() > expiresAt;
+        }
+        return boolVal(lookup.trace().get("detailBlobStored"));
+    }
+
+    private TraceDetailResponse.FullDetailParts buildFullParts(String runId,
+                                                               String traceId,
+                                                               AgentRawTraceDetailMapper.FullTracePayload payload,
+                                                               int maxPartSize) {
+        PreparedFullParts prepared = prepareFullParts(payload, maxPartSize);
+        return new TraceDetailResponse.FullDetailParts(
+                AGENT_RUNS + "/" + runId + "/traces/" + traceId + "/full/parts?maxPartSize=" + prepared.partSize(),
+                prepared.partSize(),
+                prepared.totalParts(),
+                (long) payload.fullDetailBytes().length,
+                (long) prepared.compressed().length,
+                "gzip",
+                prepared.checksum(),
+                nullableLong(payload.fullDetail().get("createdAtMillis")),
+                nullableLong(payload.fullDetail().get("expiresAtMillis"))
+        );
+    }
+
+    private PreparedFullParts prepareFullParts(AgentRawTraceDetailMapper.FullTracePayload payload, int maxPartSize) {
+        byte[] compressed = gzip(payload.fullDetailBytes());
+        int partSize = resolveTraceFullPartSize(maxPartSize);
+        int totalParts = compressed.length == 0 ? 0 : (compressed.length + partSize - 1) / partSize;
+        return new PreparedFullParts(compressed, partSize, totalParts, md5Hex(compressed));
+    }
+
+    private Optional<TraceLookup> findTrace(String obsJson, String traceId) {
+        if (obsJson == null || obsJson.isBlank()) {
+            return Optional.empty();
+        }
+        try {
+            Map<String, Object> obs = objectMapper.readValue(obsJson, Map.class);
+            Map<String, Object> diagnostics = obs.get("diagnostics") instanceof Map
+                    ? (Map<String, Object>) obs.get("diagnostics") : Map.of();
+            Object llmTracesObj = diagnostics.get("llmTraces");
+            if (llmTracesObj instanceof List<?> llmTraces) {
+                for (Object item : llmTraces) {
+                    if (item instanceof Map<?, ?> m && traceId.equals(strVal(m.get("traceId")))) {
+                        return Optional.of(new TraceLookup("llm", m));
+                    }
+                }
+            }
+            Object toolTracesObj = diagnostics.get("toolTraces");
+            if (toolTracesObj instanceof List<?> toolTraces) {
+                for (Object item : toolTraces) {
+                    if (item instanceof Map<?, ?> m && traceId.equals(strVal(m.get("traceId")))) {
+                        return Optional.of(new TraceLookup("tool", m));
+                    }
+                }
+            }
+        } catch (Exception ignore) {
+            return Optional.empty();
+        }
+        return Optional.empty();
+    }
+
+    private int resolveTraceFullPartSize(int requestedPartSize) {
+        int effective = requestedPartSize > 0 ? requestedPartSize : TRACE_FULL_DEFAULT_PART_SIZE;
+        return Math.max(TRACE_FULL_MIN_PART_SIZE, Math.min(TRACE_FULL_MAX_PART_SIZE, effective));
+    }
+
+    private ResponseEntity<byte[]> traceFullPartError(int status, String code) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentLength(0);
+        headers.set("X-Trace-Full-Error", code);
+        return ResponseEntity.status(status).headers(headers).body(new byte[0]);
+    }
+
+    private byte[] gzip(byte[] raw) {
+        try (ByteArrayOutputStream bos = new ByteArrayOutputStream(raw.length);
+             GZIPOutputStream gzip = new GZIPOutputStream(bos)) {
+            gzip.write(raw);
+            gzip.finish();
+            return bos.toByteArray();
+        } catch (Exception e) {
+            throw new IllegalStateException("failed to gzip trace full detail", e);
+        }
+    }
+
+    private String md5Hex(byte[] bytes) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("MD5");
+            return HexFormat.of().formatHex(digest.digest(bytes));
+        } catch (Exception e) {
+            throw new IllegalStateException("failed to compute trace full checksum", e);
+        }
+    }
+
+    private record TraceLookup(String type, Map<?, ?> trace) {
+    }
+
+    private record PreparedFullParts(byte[] compressed, int partSize, int totalParts, String checksum) {
     }
 
     @GetMapping(AGENT_RUNS + "/{runId}/artifacts")
@@ -1539,6 +1787,10 @@ public class AgentController {
 
     private AgentRunResultMessage loadRunResult(String userId, String runId) {
         return runResultCacheService.getRunResult(userId, runId);
+    }
+
+    private AgentRunResultMessage loadRunResult(String userId, String runId, boolean isAdmin) {
+        return runResultCacheService.getRunResult(userId, runId, isAdmin);
     }
 
     private AgentRunCostResponse toCostResponse(AgentRunCostMessage cost) {

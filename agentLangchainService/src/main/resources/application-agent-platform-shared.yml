@@ -2,6 +2,8 @@
 agent:
   call-detail:
     ttl-seconds: ${AF_AGENT_CALL_DETAIL_TTL_SECONDS:86400}
+  call-raw-content:
+    ttl-seconds: ${AF_AGENT_CALL_RAW_CONTENT_TTL_SECONDS:7200}
   run:
     interrupted-ttl-days: ${AF_AGENT_RUN_INTERRUPTED_TTL_DAYS:7}
     checkpoint-version: ${AF_AGENT_RUN_CHECKPOINT_VERSION:v2}

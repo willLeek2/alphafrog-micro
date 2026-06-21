@@ -449,7 +449,9 @@ public class AgentDubboServiceImpl extends DubboAgentDubboServiceTriple.AgentDub
      */
     @Override
     public AgentRunResultMessage getResult(GetAgentRunResultRequest request) {
-        AgentRun run = requireRun(request.getId(), request.getUserId());
+        AgentRun run = request.getIsAdmin()
+                ? requireRunForAdmin(request.getId())
+                : requireRun(request.getId(), request.getUserId());
         String snapshotJson = run.getSnapshotJson();
         String observabilityJson = nvl(observabilityService.loadObservabilityJson(run.getId(), snapshotJson));
         

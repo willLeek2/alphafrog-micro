@@ -39,6 +39,11 @@ public enum ResponseCode {
      * 数据已存在
      */
     DATA_EXIST(409, "数据已存在"),
+
+    /**
+     * 数据已过期
+     */
+    DATA_EXPIRED(410, "数据已过期"),
     
     /**
      * 业务处理异常

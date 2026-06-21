@@ -122,6 +122,7 @@ message ListAgentRunEventsResponse {
 message GetAgentRunResultRequest {
   string user_id = 1;
   string id = 2;
+  bool is_admin = 3;
 }
 
 message GetAgentRunCostRequest {

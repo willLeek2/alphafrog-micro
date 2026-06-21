@@ -23,12 +23,16 @@ public class AgentRunResultCacheService {
     private long cacheTtlSeconds;
 
     public AgentRunResultMessage getRunResult(String userId, String runId) {
+        return getRunResult(userId, runId, false);
+    }
+
+    public AgentRunResultMessage getRunResult(String userId, String runId, boolean isAdmin) {
         if (userId == null || userId.isBlank() || runId == null || runId.isBlank()) {
             throw new IllegalArgumentException("userId and runId are required");
         }
         long ttlMs = Math.max(1L, cacheTtlSeconds) * 1000L;
         long now = System.currentTimeMillis();
-        String key = cacheKey(userId, runId);
+        String key = cacheKey(userId, runId, isAdmin);
         CacheEntry hit = cache.get(key);
         if (hit != null && hit.expiresAtMs() > now) {
             return hit.result();
@@ -37,6 +41,7 @@ public class AgentRunResultCacheService {
                 GetAgentRunResultRequest.newBuilder()
                         .setUserId(userId)
                         .setId(runId)
+                        .setIsAdmin(isAdmin)
                         .build()
         );
         cache.put(key, new CacheEntry(result, now + ttlMs));
@@ -47,8 +52,8 @@ public class AgentRunResultCacheService {
         cache.clear();
     }
 
-    private static String cacheKey(String userId, String runId) {
-        return userId + ":" + runId;
+    private static String cacheKey(String userId, String runId, boolean isAdmin) {
+        return userId + ":" + runId + ":" + isAdmin;
     }
 
     private record CacheEntry(AgentRunResultMessage result, long expiresAtMs) {

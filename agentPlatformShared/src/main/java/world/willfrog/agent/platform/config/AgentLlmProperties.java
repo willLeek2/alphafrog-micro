@@ -24,6 +24,7 @@ public class AgentLlmProperties {
     private EventStoreConfig eventStore = new EventStoreConfig();
     private DataFreshness dataFreshness = new DataFreshness();
     private Tools tools = new Tools();
+    private Agent agent = new Agent();
 
     public String getDefaultEndpoint() {
         return defaultEndpoint;
@@ -127,6 +128,44 @@ public class AgentLlmProperties {
 
     public void setTools(Tools tools) {
         this.tools = tools == null ? new Tools() : tools;
+    }
+
+    public Agent getAgent() {
+        return agent;
+    }
+
+    public void setAgent(Agent agent) {
+        this.agent = agent == null ? new Agent() : agent;
+    }
+
+    /**
+     * Agent-level feature toggles loaded from agent-llm.json. This intentionally mirrors
+     * production-facing {@code agent.*} config names so Nacos pushes can hot-reload them.
+     */
+    public static class Agent {
+        @JsonAlias({"call-raw-content", "call_raw_content"})
+        private CallRawContent callRawContent = new CallRawContent();
+
+        public CallRawContent getCallRawContent() {
+            return callRawContent;
+        }
+
+        public void setCallRawContent(CallRawContent callRawContent) {
+            this.callRawContent = callRawContent == null ? new CallRawContent() : callRawContent;
+        }
+    }
+
+    public static class CallRawContent {
+        @JsonAlias({"ttl-seconds", "ttl_seconds"})
+        private Long ttlSeconds;
+
+        public Long getTtlSeconds() {
+            return ttlSeconds;
+        }
+
+        public void setTtlSeconds(Long ttlSeconds) {
+            this.ttlSeconds = ttlSeconds;
+        }
     }
 
     /**

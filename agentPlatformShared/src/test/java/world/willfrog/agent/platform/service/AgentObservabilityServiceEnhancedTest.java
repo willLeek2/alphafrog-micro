@@ -205,10 +205,18 @@ class AgentObservabilityServiceEnhancedTest {
         Map<String, Object> blob = objectMapper.readValue(blobCaptor.getValue(), Map.class);
         @SuppressWarnings("unchecked")
         Map<String, Object> inputMessages = (Map<String, Object>) blob.get("inputMessages");
-        assertNotNull(inputMessages, "HTTP body should be parsed into detail blob");
+        assertNotNull(inputMessages, "HTTP body should be parsed into safe detail blob");
         assertTrue(inputMessages.containsKey("messages"));
         assertNotNull(blob.get("outputText"));
-        assertNotNull(blob.get("httpRequest"));
+        assertNull(blob.get("httpRequest"), "raw httpRequest must live in raw content blob, not safe detail blob");
+        assertNull(blob.get("httpResponse"), "raw httpResponse must live in raw content blob, not safe detail blob");
+
+        ArgumentCaptor<String> rawCaptor = ArgumentCaptor.forClass(String.class);
+        verify(stateStore).saveLlmCallRawContent(eq(runId), eq(trace.getTraceId()), rawCaptor.capture());
+        @SuppressWarnings("unchecked")
+        Map<String, Object> rawBlob = objectMapper.readValue(rawCaptor.getValue(), Map.class);
+        assertNotNull(rawBlob.get("httpRequest"), "raw httpRequest should be persisted to raw content blob");
+        assertNotNull(rawBlob.get("httpResponse"), "raw httpResponse should be persisted to raw content blob");
     }
 
     // ==================== 5.3 DAG 节点 ID 写入 LlmTrace ====================

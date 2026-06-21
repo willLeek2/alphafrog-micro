@@ -10,6 +10,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
+import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.workflow.TodoStatus;
 import world.willfrog.agent.workflow.WorkflowState;
 
@@ -35,6 +36,8 @@ public class AgentRunStateStore {
     private static final String OBSERVABILITY_KEY = ":observability";
     private static final String DETAIL_LLM_KEY = ":detail:llm:";
     private static final String DETAIL_TOOL_KEY = ":detail:tool:";
+    private static final String RAW_DETAIL_SUFFIX = ":raw";
+    private static final String RAW_DETAIL_META_SUFFIX = ":raw:meta";
 
     private static final String WORKFLOW_STATE_KEY = ":workflow_state";
     private static final String TOOL_CALL_COUNT_KEY = ":tool_call_count";
@@ -46,6 +49,9 @@ public class AgentRunStateStore {
 
     private final StringRedisTemplate redisTemplate;
     private final ObjectMapper objectMapper;
+
+    @Autowired(required = false)
+    private AgentLlmLocalConfigLoader localConfigLoader;
 
     /** Micrometer 指标注册中心（可选，若服务未引入 actuator 则为 null） */
     @Autowired(required = false)
@@ -61,6 +67,10 @@ public class AgentRunStateStore {
      *  Default 6h to keep thinking/reasoning content short-lived while still useful for debugging. */
     @Value("${agent.call-detail.ttl-seconds:21600}")
     private long callDetailTtlSeconds;
+
+    /** Hot-reloadable via agent-llm.json agent.call-raw-content.ttl-seconds; this is only fallback. */
+    @Value("${agent.call-raw-content.ttl-seconds:7200}")
+    private long callRawContentTtlSeconds;
 
     public void recordPlan(String runId, String planJson, boolean valid) {
         if (blank(runId)) {
@@ -196,6 +206,26 @@ public class AgentRunStateStore {
         saveCallDetail(runId, toolCallId, detailJson, false);
     }
 
+    public void saveLlmCallRawContent(String runId, String llmCallId, String rawJson) {
+        if (blank(runId) || blank(llmCallId) || blank(rawJson)) {
+            return;
+        }
+        long ttl = resolveCallRawContentTtlSeconds();
+        long createdAtMillis = System.currentTimeMillis();
+        long expiresAtMillis = createdAtMillis + ttl * 1000L;
+        String rawKey = llmCallRawContentKey(runId, llmCallId);
+        String metaKey = llmCallRawMetaKey(runId, llmCallId);
+        redisTemplate.opsForValue().set(rawKey, nvl(rawJson), Duration.ofSeconds(ttl));
+        Map<String, Object> meta = new LinkedHashMap<>();
+        meta.put("type", "llm_raw_meta");
+        meta.put("runId", runId);
+        meta.put("traceId", llmCallId);
+        meta.put("createdAtMillis", createdAtMillis);
+        meta.put("expiresAtMillis", expiresAtMillis);
+        meta.put("ttlSeconds", ttl);
+        redisTemplate.opsForValue().set(metaKey, safeWrite(meta), Duration.ofSeconds(rawMetaTtlSeconds(ttl)));
+    }
+
     public Optional<String> loadLlmCallDetail(String runId, String llmCallId) {
         return loadCallDetail(runId, llmCallId, true);
     }
@@ -204,9 +234,27 @@ public class AgentRunStateStore {
         return loadCallDetail(runId, toolCallId, false);
     }
 
+    public Optional<String> loadLlmCallRawContent(String runId, String llmCallId) {
+        return loadRaw(rawContentKeyOrBlank(runId, llmCallId));
+    }
+
+    public Optional<String> loadLlmCallRawMeta(String runId, String llmCallId) {
+        return loadRaw(rawMetaKeyOrBlank(runId, llmCallId));
+    }
+
     /** Public for frontend Redis reader — keep in sync with detail key layout. */
     public String llmCallDetailKey(String runId, String llmCallId) {
         return PREFIX + runId + DETAIL_LLM_KEY + nvl(llmCallId);
+    }
+
+    /** Public for frontend Redis reader — keep in sync with raw detail key layout. */
+    public String llmCallRawContentKey(String runId, String llmCallId) {
+        return llmCallDetailKey(runId, llmCallId) + RAW_DETAIL_SUFFIX;
+    }
+
+    /** Public for frontend Redis reader — keep in sync with raw detail key layout. */
+    public String llmCallRawMetaKey(String runId, String llmCallId) {
+        return llmCallDetailKey(runId, llmCallId) + RAW_DETAIL_META_SUFFIX;
     }
 
     /** Public for frontend Redis reader — keep in sync with detail key layout. */
@@ -228,11 +276,44 @@ public class AgentRunStateStore {
             return Optional.empty();
         }
         String key = llm ? llmCallDetailKey(runId, callId) : toolCallDetailKey(runId, callId);
+        return loadRaw(key);
+    }
+
+    private Optional<String> loadRaw(String key) {
+        if (blank(key)) {
+            return Optional.empty();
+        }
         String json = redisTemplate.opsForValue().get(key);
         if (json == null || json.isBlank()) {
             return Optional.empty();
         }
         return Optional.of(json);
+    }
+
+    private String rawContentKeyOrBlank(String runId, String llmCallId) {
+        return blank(runId) || blank(llmCallId) ? "" : llmCallRawContentKey(runId, llmCallId);
+    }
+
+    private String rawMetaKeyOrBlank(String runId, String llmCallId) {
+        return blank(runId) || blank(llmCallId) ? "" : llmCallRawMetaKey(runId, llmCallId);
+    }
+
+    private long resolveCallRawContentTtlSeconds() {
+        Long hotValue = localConfigLoader == null ? null : localConfigLoader.current()
+                .map(AgentLlmProperties::getAgent)
+                .map(AgentLlmProperties.Agent::getCallRawContent)
+                .map(AgentLlmProperties.CallRawContent::getTtlSeconds)
+                .filter(value -> value != null && value > 0)
+                .orElse(null);
+        if (hotValue != null) {
+            return hotValue;
+        }
+        return callRawContentTtlSeconds > 0 ? callRawContentTtlSeconds : 7200L;
+    }
+
+    private long rawMetaTtlSeconds(long rawTtlSeconds) {
+        long detailTtl = callDetailTtlSeconds > 0 ? callDetailTtlSeconds : 86400L;
+        return Math.max(rawTtlSeconds, detailTtl);
     }
 
     public void saveWorkflowState(String runId, WorkflowState state) {
