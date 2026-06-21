@@ -13,8 +13,7 @@ public interface IndexWeightDao {
             "ON CONFLICT (index_code, con_code, trade_date) DO NOTHING")
     int insertIndexWeight(IndexWeight indexWeight);
 
-
-    @Select("SELECT * FROM alphafrog_index_weight WHERE index_code = #{tsCode} AND trade_date BETWEEN #{startDate} AND #{endDate}")
+    @Select("SELECT * FROM alphafrog_index_weight WHERE index_code = #{tsCode} AND trade_date BETWEEN #{startDate} AND #{endDate} ORDER BY trade_date DESC")
     @Results({
             @Result(property = "indexCode", column = "index_code"),
             @Result(property = "conCode", column = "con_code"),
@@ -23,7 +22,37 @@ public interface IndexWeightDao {
     })
     List<IndexWeight> getIndexWeightsByTsCodeAndDateRange(@Param("tsCode") String tsCode, @Param("startDate") long startDate, @Param("endDate") long endDate);
 
-    @Select("SELECT * FROM alphafrog_index_weight WHERE con_code = #{conCode} AND trade_date BETWEEN #{startDate} AND #{endDate}")
+    @Select("SELECT DISTINCT ON (con_code) * FROM alphafrog_index_weight WHERE index_code = #{tsCode} AND trade_date BETWEEN #{startDate} AND #{endDate} ORDER BY con_code, trade_date DESC")
+    @Results({
+            @Result(property = "indexCode", column = "index_code"),
+            @Result(property = "conCode", column = "con_code"),
+            @Result(property = "tradeDate", column = "trade_date"),
+            @Result(property = "weight", column = "weight")
+    })
+    List<IndexWeight> getLatestIndexWeightsByTsCodeAndDateRange(@Param("tsCode") String tsCode, @Param("startDate") long startDate, @Param("endDate") long endDate);
+
+    @Select("SELECT * FROM alphafrog_index_weight WHERE index_code = #{tsCode} AND trade_date = #{tradeDate}")
+    @Results({
+            @Result(property = "indexCode", column = "index_code"),
+            @Result(property = "conCode", column = "con_code"),
+            @Result(property = "tradeDate", column = "trade_date"),
+            @Result(property = "weight", column = "weight")
+    })
+    List<IndexWeight> getIndexWeightsByTsCodeAndTradeDate(@Param("tsCode") String tsCode, @Param("tradeDate") long tradeDate);
+
+    @Select("SELECT MAX(trade_date) FROM alphafrog_index_weight WHERE index_code = #{tsCode} AND trade_date BETWEEN #{startDate} AND #{endDate}")
+    Long getMaxTradeDateByTsCode(@Param("tsCode") String tsCode, @Param("startDate") long startDate, @Param("endDate") long endDate);
+
+    @Select("SELECT * FROM alphafrog_index_weight WHERE con_code = #{conCode} AND trade_date BETWEEN #{startDate} AND #{endDate} ORDER BY trade_date DESC")
     List<IndexWeight> getIndexWeightsByConCodeAndDateRange(@Param("conCode") String conCode, @Param("startDate") long startDate, @Param("endDate") long endDate);
+
+    @Select("SELECT DISTINCT ON (index_code) * FROM alphafrog_index_weight WHERE con_code = #{conCode} AND trade_date BETWEEN #{startDate} AND #{endDate} ORDER BY index_code, trade_date DESC")
+    @Results({
+            @Result(property = "indexCode", column = "index_code"),
+            @Result(property = "conCode", column = "con_code"),
+            @Result(property = "tradeDate", column = "trade_date"),
+            @Result(property = "weight", column = "weight")
+    })
+    List<IndexWeight> getLatestIndexWeightsByConCodeAndDateRange(@Param("conCode") String conCode, @Param("startDate") long startDate, @Param("endDate") long endDate);
 
 }

@@ -37,7 +37,7 @@ node dist/server.js
 - `remote_git_log(env, repo_path?, limit?)` — 远程 `git log`
 - `remote_docker_logs(env, container, tail?, grep?, timestamps?, max_bytes?, timeout_seconds?)` — 抓取容器日志
 - `remote_docker_follow(env, container, follow_seconds?, tail?, grep?, timestamps?, max_bytes?)` — 限时 follow 日志
-- `remote_pg_query(env, sql)` — 只读 `SELECT`（仅 `alphafrog_*` 表，最多 100 行）
+- `remote_pg_query(env, sql)` — 只读 `SELECT`（仅 `alphafrog_*` 表）。SQL 未写外层 `LIMIT` 时自动追加 `LIMIT 100`；已写且 `<= 100` 则保留；`> 100` 则截断为 `100`。`OFFSET` 保留不变。
 
 失败时返回的 `error` 为泛化说明，**不包含**服务端内部环境变量名或真实 SSH 主机名。SSH 类成功返回中**不包含**本地执行的 `command` 字段。
 

@@ -13,6 +13,8 @@ import world.willfrog.agent.tools.dataset.DatasetRegistry;
 import world.willfrog.agent.tools.dataset.DatasetWriter;
 import world.willfrog.agent.tools.dataset.ManifestWriter;
 import world.willfrog.agent.tools.market.MarketDataTools;
+import world.willfrog.alphafrogmicro.common.dao.domestic.index.IndexWeightDao;
+import world.willfrog.alphafrogmicro.common.pojo.domestic.index.IndexWeight;
 import world.willfrog.alphafrogmicro.common.utils.DateConvertUtils;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticIndexService;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticIndexInfoFullItem;
@@ -68,6 +70,7 @@ class MarketDataToolsBatchTest {
     private DomesticIndexService indexService;
     private DomesticStockService stockService;
     private DomesticListedAssetService listedAssetService;
+    private IndexWeightDao indexWeightDao;
 
     @BeforeEach
     void setUp() {
@@ -94,6 +97,8 @@ class MarketDataToolsBatchTest {
         ReflectionTestUtils.setField(tools, "domesticIndexService", indexService);
         listedAssetService = mock(DomesticListedAssetService.class);
         ReflectionTestUtils.setField(tools, "domesticListedAssetService", listedAssetService);
+        indexWeightDao = mock(IndexWeightDao.class);
+        ReflectionTestUtils.setField(tools, "indexWeightDao", indexWeightDao);
 
         DomesticStockInfoSimpleItem searchItem = DomesticStockInfoSimpleItem.newBuilder()
                 .setTsCode("000001.SZ")
@@ -544,21 +549,12 @@ class MarketDataToolsBatchTest {
 
     @Test
     void searchIndexAdvanced_hasStock_shouldUseLatestTradeDateReason() throws Exception {
-        when(indexService.getDomesticIndexWeightByConCodeAndDateRange(any())).thenReturn(
-                DomesticIndexWeightByConCodeAndDateRangeResponse.newBuilder()
-                        .addItems(DomesticIndexWeightItem.newBuilder()
-                                .setIndexCode("000300.SH")
-                                .setConCode("000001.SZ")
-                                .setTradeDate(20240115L)
-                                .setWeight(4.0)
-                                .build())
-                        .addItems(DomesticIndexWeightItem.newBuilder()
-                                .setIndexCode("000300.SH")
-                                .setConCode("000001.SZ")
-                                .setTradeDate(20240201L)
-                                .setWeight(5.0)
-                                .build())
-                        .build());
+        when(indexWeightDao.getLatestIndexWeightsByConCodeAndDateRange(
+                eq("000001.SZ"), eq(toTimestamp("20240101")), eq(toTimestamp("20241231"))))
+                .thenReturn(List.of(
+                        indexWeightPojo("000300.SH", "000001.SZ", "20240115", 4.0),
+                        indexWeightPojo("000300.SH", "000001.SZ", "20240201", 5.0)
+                ));
         when(indexService.getDomesticIndexInfoByTsCode(any())).thenReturn(
                 DomesticIndexInfoByTsCodeResponse.newBuilder()
                         .setItem(DomesticIndexInfoFullItem.newBuilder()
@@ -622,15 +618,11 @@ class MarketDataToolsBatchTest {
 
     @Test
     void searchIndexAdvanced_shouldAllowSinglePointAndNegativeWeight() throws Exception {
-        when(indexService.getDomesticIndexWeightByConCodeAndDateRange(any())).thenReturn(
-                DomesticIndexWeightByConCodeAndDateRangeResponse.newBuilder()
-                        .addItems(DomesticIndexWeightItem.newBuilder()
-                                .setIndexCode("000300.SH")
-                                .setConCode("000001.SZ")
-                                .setTradeDate(20240115L)
-                                .setWeight(-1.0)
-                                .build())
-                        .build());
+        when(indexWeightDao.getLatestIndexWeightsByConCodeAndDateRange(
+                eq("000001.SZ"), eq(toTimestamp("19000101")), eq(toTimestamp("20991231"))))
+                .thenReturn(List.of(
+                        indexWeightPojo("000300.SH", "000001.SZ", "20240115", -1.0)
+                ));
 
         String response = tools.searchIndexAdvanced(Map.of(
                 "mode", "advanced",
@@ -665,8 +657,63 @@ class MarketDataToolsBatchTest {
         assertEquals("INVALID_ARGUMENT", ((Map<?, ?>) root.get("error")).get("code"));
     }
 
+    @Test
+    void searchIndexAdvanced_upstreamError_returnsUpstreamErrorWithoutDataset() throws Exception {
+        when(indexWeightDao.getLatestIndexWeightsByConCodeAndDateRange(
+                eq("000001.SZ"), eq(toTimestamp("19000101")), eq(toTimestamp("20991231"))))
+                .thenThrow(new RuntimeException("index_weight_db_timeout"));
+
+        String response = tools.searchIndexAdvanced(Map.of(
+                "mode", "advanced",
+                "query", Map.of("conditions", List.of(Map.of(
+                        "type", "has_stock",
+                        "stock_code", "000001.SZ",
+                        "start_date", "NONE",
+                        "end_date", "NONE"
+                )))
+        ));
+        Map<?, ?> root = objectMapper.readValue(response, Map.class);
+
+        assertEquals(false, root.get("ok"));
+        Map<?, ?> error = (Map<?, ?>) root.get("error");
+        assertEquals("UPSTREAM_ERROR", error.get("code"));
+        assertTrue(String.valueOf(error.get("message")).contains("index_weight_db_timeout"));
+    }
+
+    @Test
+    void searchIndexAdvanced_emptyResult_exposesEmptyReason() throws Exception {
+        when(indexWeightDao.getLatestIndexWeightsByConCodeAndDateRange(
+                eq("000001.SZ"), eq(toTimestamp("20240101")), eq(toTimestamp("20241231"))))
+                .thenReturn(List.of());
+
+        String response = tools.searchIndexAdvanced(Map.of(
+                "mode", "advanced",
+                "query", Map.of("conditions", List.of(Map.of(
+                        "type", "has_stock",
+                        "stock_code", "000001.SZ",
+                        "start_date", "20240101",
+                        "end_date", "20241231"
+                )))
+        ));
+        Map<?, ?> root = objectMapper.readValue(response, Map.class);
+        Map<?, ?> data = (Map<?, ?>) root.get("data");
+
+        assertEquals(true, root.get("ok"));
+        assertEquals(0, data.get("row_count"));
+        assertEquals("no_matching_index_weights", data.get("empty_reason"));
+    }
+
     private long toTimestamp(String date) {
         return DateConvertUtils.convertDateStrToLong(date, "yyyyMMdd");
+    }
+
+    private IndexWeight indexWeightPojo(String indexCode, String conCode, String tradeDate, double weight) {
+        IndexWeight pojo = new IndexWeight();
+        pojo.setIndexCode(indexCode);
+        pojo.setConCode(conCode);
+        pojo.setTradeDate(toTimestamp(tradeDate));
+        pojo.setWeight(weight);
+        return pojo;
     }
 
     private AgentLlmProperties hotConfig(Boolean datasetEnabled, Boolean emitManifest) {

@@ -23,7 +23,13 @@
 | getStockInfo | `{"ts_code": "<股票代码>"}` |
 | checkParallelLimits | `{}` |
 | executePython | `{"code": "<Python代码>", "dataset_ids": "<数据集ID列表>"}` |
+| loadToolGuide | `{"topic": "python_sandbox|dataset_manifest|advanced_market_data|execute_python_tips"}` |
 | searchWeb | `{"query": "<搜索查询文本>", "scene": "general|finance|news", "backend": "perplexity|tavily|exa|", "strength": "<搜索强度，可空>", "skipHotCache": true|false, "skipRagPrefetch": true|false, "timeRangeStart": "<ISO8601，可空>", "timeRangeEnd": "<ISO8601，可空>", "maxResults": 5}` |
+
+## 数据查询时效性（全局）
+
+- 用户**未明确时效性**时，数据查询默认以数据截止日为基准，取**近一年**区间。
+- 对**指数成分股权重**等快照型数据，若用户未指定日期，优先取**最新公告期**的完整结果，不要全历史扫描或使用 `19000101`–`20991231` 之类占位区间。
 
 ## 工具使用详细规则
 
@@ -84,6 +90,15 @@
 - 若当前任务明确要求调用 searchWeb，不要用 searchStock、searchIndex、ragSearch 或其它工具替代。
 
 ### 3. Python执行工具（executePython） - **重点**
+
+#### 3.0 loadToolGuide 文档触发规则
+
+- 写 Python 代码或操作 dataset/manifest 前，若**当前上下文没有对应 guide 文档**，先调用：
+  - `loadToolGuide(topic=python_sandbox)` — 沙箱路径、loader API
+  - `loadToolGuide(topic=dataset_manifest)` — manifest 结构与 partial failure
+  - `loadToolGuide(topic=execute_python_tips)` — trade_date 解析等常见陷阱
+- 使用 `searchAssetInfo` / `searchIndex` 的 **advanced 模式**前，若上下文无 advanced 说明，调用 `loadToolGuide(topic=advanced_market_data)`。
+- 上下文**已有**对应 guide 全文时，直接写代码/查数，**不要重复调用** loadToolGuide。
 
 #### 3.1 必需参数
 - `dataset_ids`: 数据集ID列表

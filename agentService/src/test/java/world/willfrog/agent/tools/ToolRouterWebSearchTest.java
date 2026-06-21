@@ -8,6 +8,7 @@ import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.config.StressTestProperties;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.service.AgentObservabilityService;
+import world.willfrog.agent.tools.docs.LoadToolGuideTool;
 import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
 import world.willfrog.agent.tools.rag.RagTools;
@@ -59,6 +60,7 @@ class ToolRouterWebSearchTest {
                 mock(RagTools.class),
                 searchTools,
                 mock(PythonSandboxTools.class),
+                mock(LoadToolGuideTool.class),
                 new PythonStaticPrecheckService(),
                 new AgentLlmProperties(),
                 cacheService,
@@ -97,6 +99,7 @@ class ToolRouterWebSearchTest {
                 mock(RagTools.class),
                 searchTools,
                 mock(PythonSandboxTools.class),
+                mock(LoadToolGuideTool.class),
                 new PythonStaticPrecheckService(),
                 new AgentLlmProperties(),
                 cacheService,
@@ -135,6 +138,7 @@ class ToolRouterWebSearchTest {
                 mock(RagTools.class),
                 mock(SearchTools.class),
                 mock(PythonSandboxTools.class),
+                mock(LoadToolGuideTool.class),
                 new PythonStaticPrecheckService(),
                 new AgentLlmProperties(),
                 cacheService,
@@ -178,6 +182,7 @@ class ToolRouterWebSearchTest {
                 mock(RagTools.class),
                 mock(SearchTools.class),
                 mock(PythonSandboxTools.class),
+                mock(LoadToolGuideTool.class),
                 new PythonStaticPrecheckService(),
                 new AgentLlmProperties(),
                 cacheService,

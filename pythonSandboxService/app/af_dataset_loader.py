@@ -6,13 +6,22 @@ from typing import Any, Dict, List
 
 import pandas as pd
 
-from .dataset_manifest import (
-    ExpandedDatasets,
-    expand_dataset_ids,
-    is_manifest_dataset,
-    load_manifest_document,
-    manifest_file_path,
-)
+try:
+    from .dataset_manifest import (
+        ExpandedDatasets,
+        expand_dataset_ids,
+        is_manifest_dataset,
+        load_manifest_document,
+        manifest_file_path,
+    )
+except ImportError:
+    from dataset_manifest import (
+        ExpandedDatasets,
+        expand_dataset_ids,
+        is_manifest_dataset,
+        load_manifest_document,
+        manifest_file_path,
+    )
 
 
 class DatasetLoadResult:

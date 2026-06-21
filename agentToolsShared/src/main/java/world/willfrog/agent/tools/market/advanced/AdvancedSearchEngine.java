@@ -2,6 +2,9 @@ package world.willfrog.agent.tools.market.advanced;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import world.willfrog.alphafrogmicro.common.dao.domestic.index.IndexWeightDao;
+import world.willfrog.alphafrogmicro.common.pojo.domestic.index.IndexWeight;
+import world.willfrog.alphafrogmicro.common.utils.DateConvertUtils;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticIndexInfoByTsCodeRequest;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticIndexInfoByTsCodeResponse;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticIndexSearchRequest;
@@ -18,28 +21,57 @@ import world.willfrog.alphafrogmicro.domestic.idl.ListedAssetInfoResponse;
 import world.willfrog.alphafrogmicro.domestic.idl.ListedAssetSearchRequest;
 import world.willfrog.alphafrogmicro.domestic.idl.ListedAssetSearchResponse;
 
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.TimeZone;
 
 @RequiredArgsConstructor
 @Slf4j
 public class AdvancedSearchEngine {
 
     private static final int SEARCH_LIMIT = 200;
+    private static final long MIN_DATE_MS;
+    private static final long MAX_DATE_MS;
+
+    static {
+        MIN_DATE_MS = DateConvertUtils.convertDateStrToLong(String.valueOf(AdvancedSearchCondition.MIN_DATE), "yyyyMMdd");
+        MAX_DATE_MS = DateConvertUtils.convertDateStrToLong(String.valueOf(AdvancedSearchCondition.MAX_DATE), "yyyyMMdd");
+    }
 
     private final DomesticIndexService domesticIndexService;
     private final DomesticListedAssetService domesticListedAssetService;
+    private final IndexWeightDao indexWeightDao;
+
+    private List<String> upstreamErrors;
 
     public Map<String, Object> execute(AdvancedSearchRequest request, int maxCodes) {
-        if ("searchIndex".equals(request.getToolName())) {
-            return executeSearchIndex(request, maxCodes);
+        this.upstreamErrors = new ArrayList<>();
+        Map<String, Object> dataset;
+        try {
+            if ("searchIndex".equals(request.getToolName())) {
+                dataset = executeSearchIndex(request, maxCodes);
+            } else {
+                dataset = executeSearchAssetInfo(request, maxCodes);
+            }
+        } finally {
+            if (upstreamErrors == null) {
+                upstreamErrors = new ArrayList<>();
+            }
         }
-        return executeSearchAssetInfo(request, maxCodes);
+        if (!upstreamErrors.isEmpty()) {
+            dataset.put("upstream_error", String.join("; ", upstreamErrors));
+        }
+        int rowCount = dataset.get("row_count") instanceof Number n ? n.intValue() : 0;
+        if (rowCount == 0 && upstreamErrors.isEmpty()) {
+            dataset.put("empty_reason", "no_matching_index_weights");
+        }
+        return dataset;
     }
 
     private Map<String, Object> executeSearchIndex(AdvancedSearchRequest request, int maxCodes) {
@@ -83,16 +115,17 @@ public class AdvancedSearchEngine {
                                                                             int maxCodes,
                                                                             int conditionCount) {
         List<String> indexCodes = splitCodes(condition.getIndexCode(), "index_code", maxCodes);
-        Map<String, DomesticIndexWeightItem> latestByStock = new LinkedHashMap<>();
+        Map<String, AdvancedSearchResult> out = new LinkedHashMap<>();
         for (String indexCode : indexCodes) {
-            DomesticIndexWeightByTsCodeAndDateRangeResponse response =
-                    domesticIndexService.getDomesticIndexWeightByTsCodeAndDateRange(
-                            DomesticIndexWeightByTsCodeAndDateRangeRequest.newBuilder()
-                                    .setTsCode(indexCode)
-                                    .setStartDate(condition.effectiveStartDate())
-                                    .setEndDate(condition.effectiveEndDate())
-                                    .build());
-            for (DomesticIndexWeightItem item : response.getItemsList()) {
+            List<DomesticIndexWeightItem> items;
+            try {
+                items = queryIndexComponentWeights(indexCode, condition);
+            } catch (Exception e) {
+                recordUpstreamError("index_component query failed for " + indexCode, e);
+                continue;
+            }
+            Map<String, DomesticIndexWeightItem> latestByStock = new LinkedHashMap<>();
+            for (DomesticIndexWeightItem item : items) {
                 if (!weightMatches(condition, item)) {
                     continue;
                 }
@@ -101,15 +134,33 @@ public class AdvancedSearchEngine {
                     latestByStock.put(item.getConCode(), item);
                 }
             }
+            latestByStock.forEach((tsCode, item) -> {
+                AdvancedSearchResult result = base(tsCode, "stock", conditionCount);
+                result.setIndexCode(item.getIndexCode());
+                putReason(result, condition.getIndex(), item);
+                out.put(tsCode, result);
+            });
         }
-        Map<String, AdvancedSearchResult> out = new LinkedHashMap<>();
-        latestByStock.forEach((tsCode, item) -> {
-            AdvancedSearchResult result = base(tsCode, "stock", conditionCount);
-            result.setIndexCode(item.getIndexCode());
-            putReason(result, condition.getIndex(), item);
-            out.put(tsCode, result);
-        });
         return out;
+    }
+
+    private List<DomesticIndexWeightItem> queryIndexComponentWeights(String indexCode, AdvancedSearchCondition condition) {
+        if (condition.getStartDateValue() == null && condition.getEndDateValue() == null) {
+            Long maxTradeDate = indexWeightDao.getMaxTradeDateByTsCode(indexCode, MIN_DATE_MS, MAX_DATE_MS);
+            if (maxTradeDate == null) {
+                return List.of();
+            }
+            return indexWeightDao.getIndexWeightsByTsCodeAndTradeDate(indexCode, maxTradeDate)
+                    .stream()
+                    .map(this::toItem)
+                    .toList();
+        }
+        long startMs = yyyymmddToMillis(condition.effectiveStartDate());
+        long endMs = yyyymmddToMillis(condition.effectiveEndDate());
+        return indexWeightDao.getLatestIndexWeightsByTsCodeAndDateRange(indexCode, startMs, endMs)
+                .stream()
+                .map(this::toItem)
+                .toList();
     }
 
     private Map<String, AdvancedSearchResult> executeHasStockForIndices(AdvancedSearchCondition condition,
@@ -157,15 +208,20 @@ public class AdvancedSearchEngine {
     private Map<String, DomesticIndexWeightItem> findLatestIndicesForStocks(AdvancedSearchCondition condition,
                                                                             List<String> stockCodes) {
         Map<String, DomesticIndexWeightItem> latestByIndex = new LinkedHashMap<>();
+        long startMs = condition.getStartDateValue() == null ? MIN_DATE_MS : yyyymmddToMillis(condition.effectiveStartDate());
+        long endMs = condition.getEndDateValue() == null ? MAX_DATE_MS : yyyymmddToMillis(condition.effectiveEndDate());
         for (String stockCode : stockCodes) {
-            DomesticIndexWeightByConCodeAndDateRangeResponse response =
-                    domesticIndexService.getDomesticIndexWeightByConCodeAndDateRange(
-                            DomesticIndexWeightByConCodeAndDateRangeRequest.newBuilder()
-                                    .setConCode(stockCode)
-                                    .setStartDate(condition.effectiveStartDate())
-                                    .setEndDate(condition.effectiveEndDate())
-                                    .build());
-            for (DomesticIndexWeightItem item : response.getItemsList()) {
+            List<DomesticIndexWeightItem> items;
+            try {
+                items = indexWeightDao.getLatestIndexWeightsByConCodeAndDateRange(stockCode, startMs, endMs)
+                        .stream()
+                        .map(this::toItem)
+                        .toList();
+            } catch (Exception e) {
+                recordUpstreamError("has_stock query failed for " + stockCode, e);
+                continue;
+            }
+            for (DomesticIndexWeightItem item : items) {
                 if (!weightMatches(condition, item)) {
                     continue;
                 }
@@ -360,6 +416,34 @@ public class AdvancedSearchEngine {
             meta.add(row);
         }
         return meta;
+    }
+
+    private void recordUpstreamError(String message, Exception e) {
+        String detail = message + ": " + (e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
+        log.warn(detail, e);
+        if (upstreamErrors == null) {
+            upstreamErrors = new ArrayList<>();
+        }
+        upstreamErrors.add(detail);
+    }
+
+    private DomesticIndexWeightItem toItem(IndexWeight pojo) {
+        return DomesticIndexWeightItem.newBuilder()
+                .setIndexCode(pojo.getIndexCode())
+                .setConCode(pojo.getConCode())
+                .setTradeDate(millisToYyyymmdd(pojo.getTradeDate()))
+                .setWeight(pojo.getWeight())
+                .build();
+    }
+
+    private static long yyyymmddToMillis(long yyyymmdd) {
+        return DateConvertUtils.convertDateStrToLong(String.valueOf(yyyymmdd), "yyyyMMdd");
+    }
+
+    private static long millisToYyyymmdd(long millis) {
+        SimpleDateFormat dateFormat = new SimpleDateFormat("yyyyMMdd");
+        dateFormat.setTimeZone(TimeZone.getTimeZone("Asia/Shanghai"));
+        return Long.parseLong(dateFormat.format(new Date(millis)));
     }
 
     private String emptyToNull(String value) {

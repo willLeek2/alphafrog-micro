@@ -15,6 +15,8 @@ from .dataset_manifest import expand_dataset_ids
 
 logger = logging.getLogger(__name__)
 
+APP_DIR = Path(__file__).resolve().parent
+SANDBOX_LOADER_FILES = ("af_dataset_loader.py", "dataset_manifest.py")
 DATASET_ID_PATTERN = re.compile(r"^[a-zA-Z0-9._-]+$")
 SANDBOX_WORKER_LABELS = {
     "com.alphafrog.role": "python-sandbox-worker",
@@ -70,6 +72,46 @@ def _copy_dataset_file(
     dest_path: str,
 ) -> None:
     session.copy_to_runtime(str(source), dest_path)
+
+
+def _copy_runtime_loader_modules(
+    session: SandboxSession,
+    config: SandboxConfig,
+) -> None:
+    """Copy af_dataset_loader helpers into the sandbox execution container."""
+    sandbox_dir = config.workdir.rstrip("/")
+    _exec_checked(session, f"mkdir -p {sandbox_dir}", "create_sandbox_module_dir")
+    for filename in SANDBOX_LOADER_FILES:
+        source = APP_DIR / filename
+        if not source.is_file():
+            raise FileNotFoundError(f"sandbox loader module not found: {source}")
+        _copy_dataset_file(session, source, f"{sandbox_dir}/{filename}")
+
+
+def _loader_smoke_check_command(config: SandboxConfig) -> str:
+    """Build a shell command that smoke-imports af_dataset_loader in the sandbox."""
+    workdir = config.workdir.rstrip("/")
+    import_check = (
+        "import sys; "
+        f"sys.path.insert(0, {workdir!r}); "
+        "from af_dataset_loader import load_manifest; "
+        "print('sandbox_loader_ok')"
+    )
+    script = f"set -e\ncd {shlex.quote(workdir)}\npython -c {shlex.quote(import_check)}"
+    return f"sh -lc {shlex.quote(script)}"
+
+
+def _smoke_check_loader_modules(
+    session: SandboxSession,
+    config: SandboxConfig,
+    task_id: str,
+) -> None:
+    """Verify copied loader modules are importable without rewriting user code."""
+    _exec_checked(
+        session,
+        _loader_smoke_check_command(config),
+        f"loader_smoke_import task={task_id}",
+    )
 
 
 def _log_in_container(
@@ -180,6 +222,9 @@ def _prepare_task_workspace(
             elif file_path.name == f"{ds_id}.meta.json":
                 _copy_dataset_file(session, file_path, f"{dataset_mount}/data.meta.json")
         _log_in_container(session, task_id, config, f"dataset_ready dataset={ds_id} files={len(files_to_copy)}")
+
+    _copy_runtime_loader_modules(session, config)
+    _log_in_container(session, task_id, config, "sandbox_loader_modules_ready")
 
     return task_workspace
 
@@ -306,6 +351,7 @@ def run_in_open_session(
 
         _log_in_container(session, task_id, config, "script_start")
         t_run_start = time.monotonic()
+        _smoke_check_loader_modules(session, config, task_id)
         result = session.run(code, libraries=install_libraries, timeout=timeout)
         timings["script_run_ms"] = int((time.monotonic() - t_run_start) * 1000)
         _log_in_container(

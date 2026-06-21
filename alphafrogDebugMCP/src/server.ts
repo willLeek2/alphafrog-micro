@@ -242,8 +242,49 @@ const ALLOWED_TABLE_PREFIX = "alphafrog_";
 const DANGEROUS_KEYWORDS =
   /\b(INSERT|UPDATE|DELETE|DROP|CREATE|ALTER|TRUNCATE|GRANT|REVOKE|EXEC|EXECUTE|COPY|VACUUM|MERGE)\b/i;
 const TABLE_REF_RE = /\b(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_]*)/gi;
-const LIMIT_RE = /\bLIMIT\s+\d+\b/gi;
 const MAX_ROWS = 100;
+
+/** 解析最外层位于语句末尾的 LIMIT（忽略子查询内的 LIMIT）。 */
+function parseOuterLimit(sql: string): { limit: number; start: number; end: number } | null {
+  const trimmed = sql.trim();
+
+  let m = trimmed.match(/\bOFFSET\s+(\d+)\s+LIMIT\s+(\d+)\s*$/i);
+  if (m && m.index !== undefined) {
+    return { limit: parseInt(m[2], 10), start: m.index, end: trimmed.length };
+  }
+
+  m = trimmed.match(/\bLIMIT\s+(\d+)\s+OFFSET\s+(\d+)\s*$/i);
+  if (m && m.index !== undefined) {
+    return { limit: parseInt(m[1], 10), start: m.index, end: trimmed.length };
+  }
+
+  m = trimmed.match(/\bLIMIT\s+(\d+)\s*$/i);
+  if (m && m.index !== undefined) {
+    return { limit: parseInt(m[1], 10), start: m.index, end: trimmed.length };
+  }
+
+  return null;
+}
+
+/** 保留 <= MAX_ROWS 的外层 LIMIT；超过则截断为 MAX_ROWS；未写则追加 LIMIT MAX_ROWS。 */
+function applyRowLimit(sql: string): { sql: string; effectiveLimit: number } {
+  const safeSql = sql.trim().replace(/;+\s*$/, "").trim();
+  const outer = parseOuterLimit(safeSql);
+
+  if (!outer) {
+    return { sql: `${safeSql} LIMIT ${MAX_ROWS}`, effectiveLimit: MAX_ROWS };
+  }
+
+  const effectiveLimit = Math.min(outer.limit, MAX_ROWS);
+  if (outer.limit <= MAX_ROWS) {
+    return { sql: safeSql, effectiveLimit };
+  }
+
+  const before = safeSql.slice(0, outer.start);
+  const clause = safeSql.slice(outer.start, outer.end);
+  const cappedClause = clause.replace(/\bLIMIT\s+\d+/i, `LIMIT ${effectiveLimit}`);
+  return { sql: (before + cappedClause).trim(), effectiveLimit };
+}
 
 function validateSql(sql: string): string | null {
   const stripped = sql.trim();
@@ -442,7 +483,8 @@ server.registerTool(
 server.registerTool(
   "remote_pg_query",
   {
-    description: `Execute a read-only SELECT query against the alphafrog PostgreSQL database.`,
+    description: `Execute a read-only SELECT query against the alphafrog PostgreSQL database.
+Only alphafrog_* tables are allowed. Outer LIMIT in SQL is kept when <= 100; values above 100 are capped to 100. If no outer LIMIT is present, LIMIT 100 is appended. OFFSET is preserved.`,
     inputSchema: {
       env: envSchema,
       sql: z.string(),
@@ -462,9 +504,7 @@ server.registerTool(
       return toolJson({ ok: false, error: pgConfigErrorMessage(env) });
     }
 
-    let safeSql = sql.trim().replace(/;+\s*$/, "").trim();
-    safeSql = safeSql.replace(LIMIT_RE, "").trim();
-    safeSql = `${safeSql} LIMIT ${MAX_ROWS}`;
+    const { sql: safeSql, effectiveLimit } = applyRowLimit(sql);
 
     const client = new pg.Client({ connectionString: dsn });
     try {
@@ -477,7 +517,7 @@ server.registerTool(
         columns,
         rows,
         row_count: rows.length,
-        truncated: rows.length >= MAX_ROWS,
+        truncated: rows.length >= effectiveLimit,
       });
     } catch (e) {
       console.error("[remote_pg_query]", e);

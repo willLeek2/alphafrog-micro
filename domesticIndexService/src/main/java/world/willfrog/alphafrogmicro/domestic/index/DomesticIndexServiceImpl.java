@@ -471,10 +471,9 @@ public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
                     request.getTsCode(), request.getStartDate(), request.getEndDate()
             );
         } catch (Exception e) {
-            log.error("Error occurred while getting index weight data for tsCode: {}, dateRange: {}-{}", 
+            log.error("Error occurred while getting index weight data for tsCode: {}, dateRange: {}-{}",
                      request.getTsCode(), request.getStartDate(), request.getEndDate(), e);
-            // 数据库异常时返回空响应
-            return DomesticIndexWeightByTsCodeAndDateRangeResponse.newBuilder().build();
+            throw new RuntimeException("Failed to get index weight data for tsCode: " + request.getTsCode(), e);
         }
 
         if (indexWeightList.isEmpty()) {
@@ -509,10 +508,9 @@ public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
                     request.getConCode(), request.getStartDate(), request.getEndDate()
             );
         } catch (Exception e) {
-            log.error("Error occurred while getting index weight data for conCode: {}, dateRange: {}-{}", 
+            log.error("Error occurred while getting index weight data for conCode: {}, dateRange: {}-{}",
                      request.getConCode(), request.getStartDate(), request.getEndDate(), e);
-            // 数据库异常时返回空响应
-            return DomesticIndexWeightByConCodeAndDateRangeResponse.newBuilder().build();
+            throw new RuntimeException("Failed to get index weight data for conCode: " + request.getConCode(), e);
         }
 
         if (indexWeightList.isEmpty()) {

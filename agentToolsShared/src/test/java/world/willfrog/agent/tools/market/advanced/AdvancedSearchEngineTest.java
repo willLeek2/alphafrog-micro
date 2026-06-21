@@ -4,6 +4,10 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentMatcher;
+import world.willfrog.alphafrogmicro.common.dao.domestic.index.IndexWeightDao;
+import world.willfrog.alphafrogmicro.common.pojo.domestic.index.IndexWeight;
+import world.willfrog.alphafrogmicro.common.utils.DateConvertUtils;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticIndexInfoByTsCodeRequest;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticIndexInfoByTsCodeResponse;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticIndexInfoFullItem;
@@ -11,10 +15,6 @@ import world.willfrog.alphafrogmicro.domestic.idl.DomesticIndexInfoSimpleItem;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticIndexSearchRequest;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticIndexSearchResponse;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticIndexService;
-import world.willfrog.alphafrogmicro.domestic.idl.DomesticIndexWeightByConCodeAndDateRangeRequest;
-import world.willfrog.alphafrogmicro.domestic.idl.DomesticIndexWeightByConCodeAndDateRangeResponse;
-import world.willfrog.alphafrogmicro.domestic.idl.DomesticIndexWeightByTsCodeAndDateRangeRequest;
-import world.willfrog.alphafrogmicro.domestic.idl.DomesticIndexWeightByTsCodeAndDateRangeResponse;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticIndexWeightItem;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticListedAssetService;
 import world.willfrog.alphafrogmicro.domestic.idl.ListedAssetInfoRequest;
@@ -33,6 +33,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -44,7 +45,8 @@ class AdvancedSearchEngineTest {
 
     private final DomesticIndexService indexService = mock(DomesticIndexService.class);
     private final DomesticListedAssetService listedAssetService = mock(DomesticListedAssetService.class);
-    private final AdvancedSearchEngine engine = new AdvancedSearchEngine(indexService, listedAssetService);
+    private final IndexWeightDao indexWeightDao = mock(IndexWeightDao.class);
+    private final AdvancedSearchEngine engine = new AdvancedSearchEngine(indexService, listedAssetService, indexWeightDao);
 
     @Nested
     @DisplayName("searchIndex + has_stock")
@@ -53,11 +55,11 @@ class AdvancedSearchEngineTest {
         @Test
         @DisplayName("根据股票代码反查包含该股票的指数")
         void findsIndicesContainingStock() {
-            when(indexService.getDomesticIndexWeightByConCodeAndDateRange(any()))
-                    .thenReturn(DomesticIndexWeightByConCodeAndDateRangeResponse.newBuilder()
-                            .addItems(weightItem("000300.SH", "000001.SZ", 20240115L, 5.23))
-                            .addItems(weightItem("000905.SH", "000001.SZ", 20240110L, 1.2))
-                            .build());
+            when(indexWeightDao.getLatestIndexWeightsByConCodeAndDateRange("000001.SZ", ms("20240101"), ms("20241231")))
+                    .thenReturn(List.of(
+                            weightPojo("000300.SH", "000001.SZ", "20240115", 5.23),
+                            weightPojo("000905.SH", "000001.SZ", "20240110", 1.2)
+                    ));
             when(indexService.getDomesticIndexInfoByTsCode(any()))
                     .thenReturn(DomesticIndexInfoByTsCodeResponse.newBuilder()
                             .setItem(DomesticIndexInfoFullItem.newBuilder().setTsCode("000300.SH").setName("沪深300").build())
@@ -83,19 +85,13 @@ class AdvancedSearchEngineTest {
         @Test
         @DisplayName("多个 condition 对指数结果取 AND")
         void multipleConditionsIntersect() {
-            when(indexService.getDomesticIndexWeightByConCodeAndDateRange(
-                    DomesticIndexWeightByConCodeAndDateRangeRequest.newBuilder()
-                            .setConCode("000001.SZ").setStartDate(20240101L).setEndDate(20241231L).build()))
-                    .thenReturn(DomesticIndexWeightByConCodeAndDateRangeResponse.newBuilder()
-                            .addItems(weightItem("000300.SH", "000001.SZ", 20240115L, 5.0))
-                            .build());
-            when(indexService.getDomesticIndexWeightByConCodeAndDateRange(
-                    DomesticIndexWeightByConCodeAndDateRangeRequest.newBuilder()
-                            .setConCode("600519.SH").setStartDate(20240101L).setEndDate(20241231L).build()))
-                    .thenReturn(DomesticIndexWeightByConCodeAndDateRangeResponse.newBuilder()
-                            .addItems(weightItem("000300.SH", "600519.SH", 20240115L, 3.0))
-                            .addItems(weightItem("000905.SH", "600519.SH", 20240115L, 2.0))
-                            .build());
+            when(indexWeightDao.getLatestIndexWeightsByConCodeAndDateRange("000001.SZ", ms("20240101"), ms("20241231")))
+                    .thenReturn(List.of(weightPojo("000300.SH", "000001.SZ", "20240115", 5.0)));
+            when(indexWeightDao.getLatestIndexWeightsByConCodeAndDateRange("600519.SH", ms("20240101"), ms("20241231")))
+                    .thenReturn(List.of(
+                            weightPojo("000300.SH", "600519.SH", "20240115", 3.0),
+                            weightPojo("000905.SH", "600519.SH", "20240115", 2.0)
+                    ));
 
             Map<String, Object> dataset = engine.execute(request("searchIndex", null, null,
                     condition("has_stock", "", "000001.SZ", "20240101", "20241231", null, null),
@@ -131,12 +127,12 @@ class AdvancedSearchEngineTest {
         @Test
         @DisplayName("同一指数多 trade_date 保留最新日期")
         void keepsLatestTradeDatePerIndex() {
-            when(indexService.getDomesticIndexWeightByConCodeAndDateRange(any()))
-                    .thenReturn(DomesticIndexWeightByConCodeAndDateRangeResponse.newBuilder()
-                            .addItems(weightItem("000300.SH", "000001.SZ", 20240110L, 5.0))
-                            .addItems(weightItem("000300.SH", "000001.SZ", 20240115L, 5.23))
-                            .addItems(weightItem("000300.SH", "000001.SZ", 20240112L, 5.1))
-                            .build());
+            when(indexWeightDao.getLatestIndexWeightsByConCodeAndDateRange("000001.SZ", ms("20240101"), ms("20241231")))
+                    .thenReturn(List.of(
+                            weightPojo("000300.SH", "000001.SZ", "20240110", 5.0),
+                            weightPojo("000300.SH", "000001.SZ", "20240115", 5.23),
+                            weightPojo("000300.SH", "000001.SZ", "20240112", 5.1)
+                    ));
             when(indexService.getDomesticIndexInfoByTsCode(any()))
                     .thenReturn(DomesticIndexInfoByTsCodeResponse.newBuilder()
                             .setItem(DomesticIndexInfoFullItem.newBuilder().setTsCode("000300.SH").setName("沪深300").build())
@@ -158,11 +154,11 @@ class AdvancedSearchEngineTest {
         @Test
         @DisplayName("根据指数代码查询成分股")
         void findsConstituentStocks() {
-            when(indexService.getDomesticIndexWeightByTsCodeAndDateRange(any()))
-                    .thenReturn(DomesticIndexWeightByTsCodeAndDateRangeResponse.newBuilder()
-                            .addItems(weightItem("000300.SH", "000001.SZ", 20240115L, 5.23))
-                            .addItems(weightItem("000300.SH", "600519.SH", 20240115L, 3.1))
-                            .build());
+            when(indexWeightDao.getLatestIndexWeightsByTsCodeAndDateRange("000300.SH", ms("20240101"), ms("20241231")))
+                    .thenReturn(List.of(
+                            weightPojo("000300.SH", "000001.SZ", "20240115", 5.23),
+                            weightPojo("000300.SH", "600519.SH", "20240115", 3.1)
+                    ));
             when(listedAssetService.getListedAssetInfo(any()))
                     .thenReturn(ListedAssetInfoResponse.newBuilder()
                             .setItem(ListedAssetInfoItem.newBuilder().setTsCode("000001.SZ").setName("平安银行").build())
@@ -183,11 +179,11 @@ class AdvancedSearchEngineTest {
         @Test
         @DisplayName("权重过滤生效")
         void weightFilterExcludesOutOfRange() {
-            when(indexService.getDomesticIndexWeightByTsCodeAndDateRange(any()))
-                    .thenReturn(DomesticIndexWeightByTsCodeAndDateRangeResponse.newBuilder()
-                            .addItems(weightItem("000300.SH", "000001.SZ", 20240115L, 5.0))
-                            .addItems(weightItem("000300.SH", "600519.SH", 20240115L, 1.0))
-                            .build());
+            when(indexWeightDao.getLatestIndexWeightsByTsCodeAndDateRange("000300.SH", ms("20240101"), ms("20241231")))
+                    .thenReturn(List.of(
+                            weightPojo("000300.SH", "000001.SZ", "20240115", 5.0),
+                            weightPojo("000300.SH", "600519.SH", "20240115", 1.0)
+                    ));
             when(listedAssetService.getListedAssetInfo(any()))
                     .thenReturn(ListedAssetInfoResponse.getDefaultInstance());
 
@@ -201,10 +197,8 @@ class AdvancedSearchEngineTest {
         @Test
         @DisplayName("name 查询返回 null 时不崩溃，结果保留 ts_code")
         void nullNameResponseDoesNotCrash() {
-            when(indexService.getDomesticIndexWeightByTsCodeAndDateRange(any()))
-                    .thenReturn(DomesticIndexWeightByTsCodeAndDateRangeResponse.newBuilder()
-                            .addItems(weightItem("000300.SH", "000001.SZ", 20240115L, 5.23))
-                            .build());
+            when(indexWeightDao.getLatestIndexWeightsByTsCodeAndDateRange("000300.SH", ms("20240101"), ms("20241231")))
+                    .thenReturn(List.of(weightPojo("000300.SH", "000001.SZ", "20240115", 5.23)));
             when(listedAssetService.getListedAssetInfo(any()))
                     .thenReturn(null);
 
@@ -225,10 +219,8 @@ class AdvancedSearchEngineTest {
         @Test
         @DisplayName("根据股票代码找到跟踪对应指数的 ETF")
         void findsEtfsTrackingIndicesContainingStock() {
-            when(indexService.getDomesticIndexWeightByConCodeAndDateRange(any()))
-                    .thenReturn(DomesticIndexWeightByConCodeAndDateRangeResponse.newBuilder()
-                            .addItems(weightItem("000300.SH", "000001.SZ", 20240115L, 5.23))
-                            .build());
+            when(indexWeightDao.getLatestIndexWeightsByConCodeAndDateRange("000001.SZ", ms("20240101"), ms("20241231")))
+                    .thenReturn(List.of(weightPojo("000300.SH", "000001.SZ", "20240115", 5.23)));
             when(listedAssetService.searchListedAssets(any()))
                     .thenReturn(ListedAssetSearchResponse.newBuilder()
                             .addItems(ListedAssetInfoItem.newBuilder()
@@ -255,20 +247,21 @@ class AdvancedSearchEngineTest {
         @Test
         @DisplayName("单个股票命中多个指数时不按中间 index 数量触发 batch limit")
         void intermediateIndexCountDoesNotTriggerBatchLimit() {
-            when(indexService.getDomesticIndexWeightByConCodeAndDateRange(any()))
-                    .thenReturn(DomesticIndexWeightByConCodeAndDateRangeResponse.newBuilder()
-                            .addItems(weightItem("000300.SH", "000001.SZ", 20240115L, 5.23))
-                            .addItems(weightItem("000905.SH", "000001.SZ", 20240115L, 1.5))
-                            .addItems(weightItem("000852.SH", "000001.SZ", 20240115L, 0.9))
-                            .addItems(weightItem("399006.SZ", "000001.SZ", 20240115L, 0.4))
-                            .build());
-            when(listedAssetService.searchListedAssets(any()))
-                    .thenReturn(
-                            etfSearch("510300.SH", "000300.SH"),
-                            etfSearch("510500.SH", "000905.SH"),
-                            etfSearch("512100.SH", "000852.SH"),
-                            etfSearch("159915.SZ", "399006.SZ")
-                    );
+            when(indexWeightDao.getLatestIndexWeightsByConCodeAndDateRange("000001.SZ", ms("20240101"), ms("20241231")))
+                    .thenReturn(List.of(
+                            weightPojo("000300.SH", "000001.SZ", "20240115", 5.23),
+                            weightPojo("000905.SH", "000001.SZ", "20240115", 1.5),
+                            weightPojo("000852.SH", "000001.SZ", "20240115", 0.9),
+                            weightPojo("399006.SZ", "000001.SZ", "20240115", 0.4)
+                    ));
+            when(listedAssetService.searchListedAssets(argThat(queryIs("000300.SH"))))
+                    .thenReturn(etfSearch("510300.SH", "000300.SH"));
+            when(listedAssetService.searchListedAssets(argThat(queryIs("000905.SH"))))
+                    .thenReturn(etfSearch("510500.SH", "000905.SH"));
+            when(listedAssetService.searchListedAssets(argThat(queryIs("000852.SH"))))
+                    .thenReturn(etfSearch("512100.SH", "000852.SH"));
+            when(listedAssetService.searchListedAssets(argThat(queryIs("399006.SZ"))))
+                    .thenReturn(etfSearch("159915.SZ", "399006.SZ"));
 
             Map<String, Object> dataset = engine.execute(request("searchAssetInfo", "etf", null,
                     condition("has_stock", "", "000001.SZ", "20240101", "20241231", null, null)), MAX_CODES);
@@ -310,10 +303,8 @@ class AdvancedSearchEngineTest {
                             .addItems(simpleIndex("000300.SH", "沪深300"))
                             .addItems(simpleIndex("000905.SH", "中证500"))
                             .build());
-            when(indexService.getDomesticIndexWeightByConCodeAndDateRange(any()))
-                    .thenReturn(DomesticIndexWeightByConCodeAndDateRangeResponse.newBuilder()
-                            .addItems(weightItem("000300.SH", "000001.SZ", 20240115L, 5.0))
-                            .build());
+            when(indexWeightDao.getLatestIndexWeightsByConCodeAndDateRange("000001.SZ", ms("20240101"), ms("20241231")))
+                    .thenReturn(List.of(weightPojo("000300.SH", "000001.SZ", "20240115", 5.0)));
 
             Map<String, Object> dataset = engine.execute(request("searchIndex", null, "沪深",
                     condition("has_stock", "", "000001.SZ", "20240101", "20241231", null, null)), MAX_CODES);
@@ -331,15 +322,9 @@ class AdvancedSearchEngineTest {
         @Test
         @DisplayName("start_date=NONE 使用全局最小日期")
         void noneStartDateUsesMinBoundary() {
-            when(indexService.getDomesticIndexWeightByTsCodeAndDateRange(
-                    DomesticIndexWeightByTsCodeAndDateRangeRequest.newBuilder()
-                            .setTsCode("000300.SH")
-                            .setStartDate(19000101L)
-                            .setEndDate(20241231L)
-                            .build()))
-                    .thenReturn(DomesticIndexWeightByTsCodeAndDateRangeResponse.newBuilder()
-                            .addItems(weightItem("000300.SH", "000001.SZ", 20240115L, 5.0))
-                            .build());
+            when(indexWeightDao.getLatestIndexWeightsByTsCodeAndDateRange(
+                    "000300.SH", ms(AdvancedSearchCondition.MIN_DATE), ms("20241231")))
+                    .thenReturn(List.of(weightPojo("000300.SH", "000001.SZ", "20240115", 5.0)));
             when(listedAssetService.getListedAssetInfo(any()))
                     .thenReturn(ListedAssetInfoResponse.getDefaultInstance());
 
@@ -347,6 +332,25 @@ class AdvancedSearchEngineTest {
                     condition("index_component", "000300.SH", "", "NONE", "20241231", null, null)), MAX_CODES);
 
             assertEquals(1, results(dataset).size());
+        }
+
+        @Test
+        @DisplayName("NONE/NONE 取最新公告期完整快照")
+        void noneNoneUsesLatestSnapshot() {
+            when(indexWeightDao.getMaxTradeDateByTsCode("000300.SH", ms(AdvancedSearchCondition.MIN_DATE), ms(AdvancedSearchCondition.MAX_DATE)))
+                    .thenReturn(ms("20240601"));
+            when(indexWeightDao.getIndexWeightsByTsCodeAndTradeDate("000300.SH", ms("20240601")))
+                    .thenReturn(List.of(
+                            weightPojo("000300.SH", "000001.SZ", "20240601", 5.0),
+                            weightPojo("000300.SH", "600519.SH", "20240601", 3.0)
+                    ));
+            when(listedAssetService.getListedAssetInfo(any()))
+                    .thenReturn(ListedAssetInfoResponse.getDefaultInstance());
+
+            Map<String, Object> dataset = engine.execute(request("searchAssetInfo", "stock", null,
+                    condition("index_component", "000300.SH", "", "NONE", "NONE", null, null)), MAX_CODES);
+
+            assertEquals(2, results(dataset).size());
         }
     }
 
@@ -392,6 +396,23 @@ class AdvancedSearchEngineTest {
         return AdvancedSearchCondition.from(0, raw);
     }
 
+    private static long ms(String yyyymmdd) {
+        return DateConvertUtils.convertDateStrToLong(yyyymmdd, "yyyyMMdd");
+    }
+
+    private static long ms(long yyyymmdd) {
+        return DateConvertUtils.convertDateStrToLong(String.valueOf(yyyymmdd), "yyyyMMdd");
+    }
+
+    private static IndexWeight weightPojo(String indexCode, String conCode, String tradeDate, double weight) {
+        IndexWeight pojo = new IndexWeight();
+        pojo.setIndexCode(indexCode);
+        pojo.setConCode(conCode);
+        pojo.setTradeDate(ms(tradeDate));
+        pojo.setWeight(weight);
+        return pojo;
+    }
+
     private static DomesticIndexWeightItem weightItem(String indexCode, String conCode, long tradeDate, double weight) {
         return DomesticIndexWeightItem.newBuilder()
                 .setIndexCode(indexCode)
@@ -415,6 +436,10 @@ class AdvancedSearchEngineTest {
                         .setIndexName(indexCode + " index")
                         .build())
                 .build();
+    }
+
+    private static ArgumentMatcher<ListedAssetSearchRequest> queryIs(String expected) {
+        return req -> req != null && expected.equals(req.getQuery());
     }
 
     @SuppressWarnings("unchecked")

@@ -16,6 +16,7 @@ import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 import world.willfrog.agent.platform.service.AgentObservabilityService;
 import world.willfrog.agent.platform.service.AgentRunBudgetService;
+import world.willfrog.agent.tools.docs.LoadToolGuideTool;
 import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.agent.tools.market.advanced.AdvancedSearchRequest;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
@@ -101,6 +102,8 @@ public class ToolRouter {
     private final SearchTools searchTools;
     /** Python 沙箱执行工具集（executePython） */
     private final PythonSandboxTools pythonSandboxTools;
+    /** 平台工具指南加载工具（loadToolGuide） */
+    private final LoadToolGuideTool loadToolGuideTool;
     /** executePython 静态参数/代码预校验（B1） */
     private final PythonStaticPrecheckService pythonStaticPrecheckService;
     /** 运行时 LLM/执行配置（含 static-precheck-enabled） */
@@ -329,6 +332,7 @@ public class ToolRouter {
                 "loadDocument",
                 "searchWeb",
                 "executePython",
+                "loadToolGuide",
                 "spawnSubAgent",
                 "waitForSubAgent"
         );
@@ -594,6 +598,9 @@ public class ToolRouter {
                         toIntWithDefault(5, params.get("maxResults"), params.get("max_results"), params.get("arg8"))
                 );
                 case "executePython" -> invokeExecutePython(params);
+                case "loadToolGuide" -> loadToolGuideTool.loadToolGuide(
+                        str(params.get("topic"), params.get("arg0"))
+                );
                 default -> unsupported(toolName);
             };
         } catch (Exception e) {

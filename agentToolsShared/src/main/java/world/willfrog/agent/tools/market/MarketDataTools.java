@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.langchain4j.agent.tool.Tool;
 import org.apache.dubbo.config.annotation.DubboReference;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
@@ -18,6 +19,7 @@ import world.willfrog.agent.tools.market.advanced.AdvancedSearchDatasetWriter;
 import world.willfrog.agent.tools.market.advanced.AdvancedSearchEngine;
 import world.willfrog.agent.tools.market.advanced.AdvancedSearchException;
 import world.willfrog.agent.tools.market.advanced.AdvancedSearchRequest;
+import world.willfrog.alphafrogmicro.common.dao.domestic.index.IndexWeightDao;
 import world.willfrog.alphafrogmicro.common.utils.DateConvertUtils;
 import world.willfrog.alphafrogmicro.domestic.idl.*;
 
@@ -121,18 +123,33 @@ public class MarketDataTools {
     /** JSON 序列化器，用于工具返回值的 JSON 编码和批量结果解析。 */
     private final ObjectMapper objectMapper;
 
+    /** 指数成分权重 DAO，advanced 搜索使用本地查询以支持日期单位转换与最新快照。 */
+    private final IndexWeightDao indexWeightDao;
+
     public MarketDataTools(DatasetWriter datasetWriter,
                            DatasetRegistry datasetRegistry,
                            ManifestWriter manifestWriter,
                            AgentLlmLocalConfigLoader localConfigLoader,
                            AgentLlmProperties llmProperties,
                            ObjectMapper objectMapper) {
+        this(datasetWriter, datasetRegistry, manifestWriter, localConfigLoader, llmProperties, objectMapper, null);
+    }
+
+    @Autowired
+    public MarketDataTools(DatasetWriter datasetWriter,
+                           DatasetRegistry datasetRegistry,
+                           ManifestWriter manifestWriter,
+                           AgentLlmLocalConfigLoader localConfigLoader,
+                           AgentLlmProperties llmProperties,
+                           ObjectMapper objectMapper,
+                           IndexWeightDao indexWeightDao) {
         this.datasetWriter = datasetWriter;
         this.datasetRegistry = datasetRegistry;
         this.manifestWriter = manifestWriter;
         this.localConfigLoader = localConfigLoader;
         this.llmProperties = llmProperties;
         this.objectMapper = objectMapper;
+        this.indexWeightDao = indexWeightDao;
     }
 
     @Tool("查询单只或多只股票基础信息。参数要求：tsCode 支持 | 分隔的多个代码或 JSON 数组，每个代码必须是 TuShare 格式如 000001.SZ。具体批量上限必须先调用 checkParallelLimits 查询；如果没有 checkParallelLimits 工具，默认不要批量。批量示例：\"000001.SZ|600519.SH\"；批量返回 data.mode=batch、data.results、success_count、failure_count。")
@@ -1642,8 +1659,15 @@ public class MarketDataTools {
             if ("searchIndex".equals(toolName) && request.getAssetType() != null && !request.getAssetType().isBlank()) {
                 log.info("searchIndex advanced ignores unexpected asset_type={}", request.getAssetType());
             }
-            AdvancedSearchEngine engine = new AdvancedSearchEngine(domesticIndexService, domesticListedAssetService);
+            AdvancedSearchEngine engine = new AdvancedSearchEngine(domesticIndexService, domesticListedAssetService, indexWeightDao);
             Map<String, Object> dataset = engine.execute(request, resolveMaxParallelQueriesInAdvancedMode());
+            String upstreamError = dataset.get("upstream_error") instanceof String s ? s : null;
+            String emptyReason = dataset.get("empty_reason") instanceof String s ? s : null;
+            if (upstreamError != null) {
+                Map<String, Object> details = new LinkedHashMap<>();
+                details.put("empty_reason", emptyReason == null ? "" : emptyReason);
+                return fail(toolName, "UPSTREAM_ERROR", upstreamError, details);
+            }
             AdvancedSearchDatasetWriter writer = new AdvancedSearchDatasetWriter(datasetWriter, datasetRegistry, objectMapper);
             AdvancedSearchDatasetWriter.WriteResult writeResult = writer.writeOrReuse(
                     toolName,
@@ -1662,6 +1686,9 @@ public class MarketDataTools {
             data.put("preview_rows", writeResult.getPreviewRows());
             data.put("preview_limit", resolveAdvancedPreviewRows());
             data.put("conditions_meta", dataset.get("conditions_meta"));
+            if (emptyReason != null) {
+                data.put("empty_reason", emptyReason);
+            }
             if (writeResult.getDatasetId() == null || writeResult.getDatasetId().isBlank()) {
                 data.put("dataset", dataset);
             }

@@ -7,6 +7,7 @@ import org.junit.jupiter.api.Test;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.config.StressTestProperties;
 import world.willfrog.agent.platform.service.AgentObservabilityService;
+import world.willfrog.agent.tools.docs.LoadToolGuideTool;
 import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
 import world.willfrog.agent.tools.rag.RagTools;
@@ -51,6 +52,7 @@ class ToolRouterExecutePythonPrecheckTest {
                 mock(RagTools.class),
                 mock(SearchTools.class),
                 pythonSandboxTools,
+                mock(LoadToolGuideTool.class),
                 new PythonStaticPrecheckService(),
                 llmPropertiesWithStaticPrecheck(true),
                 cacheService,
@@ -94,6 +96,7 @@ class ToolRouterExecutePythonPrecheckTest {
                 mock(RagTools.class),
                 mock(SearchTools.class),
                 pythonSandboxTools,
+                mock(LoadToolGuideTool.class),
                 new PythonStaticPrecheckService(),
                 llmPropertiesWithStaticPrecheck(true),
                 cacheService,

@@ -519,6 +519,7 @@ services:
     volumes:
       - ./data/agent_datasets:/data/agent_datasets
       - ./data/agent_workspaces:/data/agent_workspaces
+      - ./agentPlatformShared/src/main/resources/agent_guides:/data/agent_guides:ro
       - ./agentLangchainService/config:/app/config:ro
       - ./data/agent-configs:/app/config-dynamic
     ports:
@@ -599,6 +600,7 @@ services:
     volumes:
       - ./data/agent_datasets:/data/agent_datasets
       - ./data/agent_workspaces:/data/agent_workspaces
+      - ./agentPlatformShared/src/main/resources/agent_guides:/data/agent_guides:ro
       - ./agentLangchainService/config:/app/config:ro
       - ./data/agent-configs:/app/config-dynamic
     ports:

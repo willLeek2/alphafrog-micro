@@ -22,6 +22,7 @@ import world.willfrog.agent.platform.service.SearchEvidenceJudgeService;
 import world.willfrog.agent.tools.dataset.DatasetRegistry;
 import world.willfrog.agent.tools.dataset.DatasetWriter;
 import world.willfrog.agent.tools.dataset.ManifestWriter;
+import world.willfrog.agent.tools.docs.LoadToolGuideTool;
 import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
 import world.willfrog.agent.tools.rag.RagTools;
@@ -66,6 +67,7 @@ class ToolRouterToolProviderTest {
         RagTools ragTools = new RagTools(objectMapper);
         SearchTools searchTools = new SearchTools(objectMapper, mock(SearchEvidenceJudgeService.class));
         PythonSandboxTools pythonSandboxTools = new PythonSandboxTools(objectMapper);
+        LoadToolGuideTool loadToolGuideTool = new LoadToolGuideTool(objectMapper);
 
         provider = new ToolRouterToolProvider(
                 toolRouter,
@@ -73,6 +75,7 @@ class ToolRouterToolProviderTest {
                 ragTools,
                 searchTools,
                 pythonSandboxTools,
+                loadToolGuideTool,
                 objectMapper,
                 eventService,
                 new LangchainToolConcurrencyThrottle(false, 20, 60)
