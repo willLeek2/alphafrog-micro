@@ -229,9 +229,10 @@ def load_datasets(
 ) -> Dict[str, pd.DataFrame]:
     """Load one manifest or atomic dataset as dict[ts_code, DataFrame].
 
-    Run-level mode: if /sandbox/paths_dataset.csv exists and dataset_id is a
-    positive integer, resolve the real file path from the run-level index.
-    Legacy mode: fall back to /sandbox/input/<dataset_id>/ structure.
+    Run-level mode: if /sandbox/paths_dataset.csv or /sandbox/path_manifest.csv
+    exists and dataset_id is a positive integer, resolve the real file path from
+    the run-level index. Legacy mode: fall back to /sandbox/input/<dataset_id>/
+    structure.
     """
     root = Path(input_root)
 
@@ -287,9 +288,9 @@ def load_manifest(
 ) -> DatasetLoadResult:
     """Concat ready manifest members into one DataFrame with ts_code column.
 
-    Run-level mode: if /sandbox/path_manifest.csv exists and manifest_id is a
-    positive integer, resolve the manifest JSON from the run-level index and
-    load member datasets via /sandbox/paths_dataset.csv.
+    Run-level mode: if /sandbox/path_manifest.csv or /sandbox/paths_dataset.csv
+    exists and manifest_id is a positive integer, resolve the manifest JSON from
+    the run-level index and load member datasets via /sandbox/paths_dataset.csv.
     Legacy mode: fall back to /sandbox/input/<manifest_id>/ structure.
     """
     root = Path(input_root)
