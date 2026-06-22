@@ -149,6 +149,26 @@ class ActivePromptRunLevelContractTest {
                 "guide 不得再正向 teaching 旧 /sandbox/input/<dataset_id>/ 路径");
     }
 
+    @Test
+    void executePythonTipsGuide_shouldTeachRunLevelContract() {
+        String guide = loadResourceAsString("agent_guides/execute_python_tips.md");
+        assertFalse(guide.isBlank(), "agent_guides/execute_python_tips.md 必须可加载");
+        assertTrue(guide.contains("run-level"),
+                "tips guide 必须说明 run-level 编号");
+        assertTrue(guide.contains("paths_dataset.csv"),
+                "tips guide 必须说明 paths_dataset.csv");
+        assertTrue(guide.contains("path_manifest.csv"),
+                "tips guide 必须说明 path_manifest.csv");
+        assertTrue(guide.contains("listMyData"),
+                "tips guide 必须说明 listMyData 恢复路径");
+        assertTrue(guide.contains("UNCERTAIN"),
+                "tips guide 必须说明 UNCERTAIN 语义");
+        assertFalse(guide.contains("glob.glob(\"/sandbox/input/*\")"),
+                "tips guide 不得要求 glob 遍历旧挂载目录");
+        assertFalse(guide.contains("<dataset_id>.csv"),
+                "tips guide 不得使用旧 <dataset_id>.csv 模板");
+    }
+
     private static boolean containsRunLevelInstruction(String prompt) {
         return prompt.contains("run-level") || prompt.contains("run level") || prompt.contains("run-level 整数编号");
     }

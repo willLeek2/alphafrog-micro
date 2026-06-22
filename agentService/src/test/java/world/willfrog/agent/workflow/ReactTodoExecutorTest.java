@@ -584,6 +584,25 @@ class ReactTodoExecutorTest {
         assertFalse(spec.contains("dataset_xxx"), "executePython schema 不得使用旧 dataset_xxx 示例");
     }
 
+    @Test
+    @SuppressWarnings("unchecked")
+    void buildRetryContext_genericErrorBranchShouldTeachRunLevelIds() {
+        ReactTodoExecutor.TodoExecutionContext ctx = context();
+        ReactTodoExecutor.TodoExecutionContext retryCtx = ReflectionTestUtils.invokeMethod(
+                executor, "buildRetryContext", ctx, "some generic failure");
+        assertNotNull(retryCtx);
+        List<CompletedTodoInfo> todos = retryCtx.getCompletedTodos();
+        CompletedTodoInfo hint = todos.get(todos.size() - 1);
+        String output = hint.getOutput();
+        assertTrue(output.contains("run-level"), "generic retry hint 必须说明 run-level 编号");
+        assertTrue(output.contains("manifest_ids"), "generic retry hint 必须说明 manifest_ids");
+        assertTrue(output.contains("listMyData"), "generic retry hint 必须说明 listMyData 恢复路径");
+        assertTrue(output.contains("dataset_ids 或 manifest_ids 至少一个"),
+                "generic retry hint 必须说明 dataset_ids / manifest_ids 至少一个");
+        assertFalse(output.contains("dataset_ids 参数是必需"),
+                "generic retry hint 不得再说 dataset_ids 参数是必需的");
+    }
+
     // ─────────────────────────────────────────────────────────────────────
     // Sub-Agent Tests (#36 §4.3)
     // ─────────────────────────────────────────────────────────────────────

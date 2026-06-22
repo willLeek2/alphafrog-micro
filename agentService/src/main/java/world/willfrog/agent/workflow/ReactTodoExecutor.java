@@ -558,7 +558,7 @@ public class ReactTodoExecutor {
         } else {
             detailedHint.append("修正建议：\n");
             detailedHint.append("请确保使用正确的参数名，参考 System Prompt 中的工具规范。\n");
-            detailedHint.append("特别注意 executePython 的 dataset_ids 参数是必需的！");
+            detailedHint.append("特别注意：executePython 需传 dataset_ids 或 manifest_ids 至少一个；数据已打包成 manifest 时优先 manifest_ids；编号必须是当前 agent run 的 run-level 整数编号；不确定时先调用 listMyData 查询。");
         }
 
         updatedTodos.add(CompletedTodoInfo.builder()
