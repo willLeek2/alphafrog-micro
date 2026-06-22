@@ -478,8 +478,8 @@ public class ReactTodoExecutor {
      * <ul>
      *   <li>提示这是第 N 次重试。</li>
      *   <li>提醒 LLM 检查工具参数名是否与规范完全一致。</li>
-     *   <li>提醒 LLM 检查是否遗漏必需参数（如 executePython 的 dataset_ids）。</li>
-     *   <li>提醒 LLM 数据集 ID 必须来自已有数据集列表。</li>
+     *   <li>提醒 LLM executePython 需传 dataset_ids 或 manifest_ids 至少一个；数据已打包成 manifest 时优先 manifest_ids；编号必须是当前 run 的 run-level 整数编号；不确定先调用 listMyData。</li>
+     *   <li>提醒 LLM 数据集编号必须是 run-level 整数编号，不能直接使用原始 dataset_id 或文件路径。</li>
      *   <li>建议 LLM 参考上下文中的 _retry_hint_ 获取详细修正建议。</li>
      * </ul>
      *
@@ -501,8 +501,8 @@ public class ReactTodoExecutor {
             retryHint.append("╚══════════════════════════════════════════════════════════════╝\n\n");
             retryHint.append("之前的尝试失败了。请仔细检查：\n");
             retryHint.append("1. 工具参数名是否与 System Prompt 中的规范完全一致\n");
-            retryHint.append("2. 是否遗漏了必需参数（如 executePython 的 dataset_ids）\n");
-            retryHint.append("3. 数据集ID是否来自'已有数据集'列表\n\n");
+            retryHint.append("2. executePython 是否传了 dataset_ids 或 manifest_ids 至少一个；数据已打包成 manifest 时优先 manifest_ids；编号必须是当前 agent run 的 run-level 整数编号；不确定先调用 listMyData 查询\n");
+            retryHint.append("3. 数据集编号必须是 run-level 整数编号，不能直接使用原始 dataset_id 或文件路径\n\n");
             retryHint.append("如果再次失败，请参考 '_retry_hint_' 中的详细修正建议。");
 
             // 找到最后一条 UserMessage，在其文本末尾附加重试提示
@@ -525,7 +525,7 @@ public class ReactTodoExecutor {
      * <p>在原始执行上下文的基础上，追加一条标记为 {@code _retry_hint_} 的 CompletedTodoInfo，
      * 其内容为针对特定错误类型的修正建议：</p>
      * <ul>
-     *   <li>{@code dataset_ids / MISSING_DATASET_IDS} — 提示 executePython 必须传入 dataset_ids，
+     *   <li>{@code dataset_ids / manifest_ids / MISSING_DATASET_IDS} — 提示 executePython 必须传入 dataset_ids 或 manifest_ids 中的至少一个，
      *       并给出正确示例。</li>
      *   <li>{@code keyword} — 提示搜索工具参数名应为 keyword。</li>
      *   <li>其他错误 — 给出通用建议，强调参数名必须匹配。</li>

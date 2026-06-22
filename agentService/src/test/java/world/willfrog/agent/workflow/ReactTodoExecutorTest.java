@@ -603,6 +603,28 @@ class ReactTodoExecutorTest {
                 "generic retry hint 不得再说 dataset_ids 参数是必需的");
     }
 
+    @Test
+    @SuppressWarnings("unchecked")
+    void buildMessagesWithRetryContext_retryWrapperShouldTeachRunLevelIds() {
+        ReactTodoExecutor.TodoExecutionContext ctx = context();
+        List<dev.langchain4j.data.message.ChatMessage> msgs = ReflectionTestUtils.invokeMethod(
+                executor, "buildMessagesWithRetryContext", "任务", ctx, 1);
+        assertNotNull(msgs);
+        String joined = msgs.stream()
+                .filter(msg -> msg instanceof dev.langchain4j.data.message.UserMessage)
+                .map(msg -> ((dev.langchain4j.data.message.UserMessage) msg).singleText())
+                .collect(java.util.stream.Collectors.joining("\n"));
+        assertTrue(joined.contains("run-level"), "retry wrapper 必须说明 run-level 编号");
+        assertTrue(joined.contains("manifest_ids"), "retry wrapper 必须说明 manifest_ids");
+        assertTrue(joined.contains("listMyData"), "retry wrapper 必须说明 listMyData 恢复路径");
+        assertTrue(joined.contains("dataset_ids 或 manifest_ids 至少一个"),
+                "retry wrapper 必须说明 dataset_ids / manifest_ids 至少一个");
+        assertFalse(joined.contains("executePython 的 dataset_ids"),
+                "retry wrapper 不得再说 executePython 的 dataset_ids");
+        assertFalse(joined.contains("数据集ID是否来自'已有数据集'列表"),
+                "retry wrapper 不得再说旧数据集 ID 列表口径");
+    }
+
     // ─────────────────────────────────────────────────────────────────────
     // Sub-Agent Tests (#36 §4.3)
     // ─────────────────────────────────────────────────────────────────────
