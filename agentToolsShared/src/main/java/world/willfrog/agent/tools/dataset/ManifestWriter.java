@@ -38,6 +38,9 @@ public class ManifestWriter {
     @Value("${agent.tools.market-data.dataset.path:/data/agent_datasets}")
     private String datasetPath;
 
+    @Value("${agent.tools.market-data.dataset.manifests-path:/data/manifests}")
+    private String manifestsPath;
+
     @Value("${agent.tools.market-data.dataset.enabled:true}")
     private boolean enabled;
 
@@ -129,7 +132,8 @@ public class ManifestWriter {
                 .createdAt(createdAt)
                 .build();
 
-        Path manifestDir = Paths.get(datasetPath, manifestId);
+        Path manifestDir = DatabaseFetchedPathStrategy.resolveManifestPath(
+                Paths.get(manifestsPath), manifestId);
         try {
             Files.createDirectories(manifestDir);
         } catch (IOException e) {
@@ -137,8 +141,8 @@ public class ManifestWriter {
             throw new RuntimeException("Failed to create manifest directory: " + manifestDir, e);
         }
 
-        Path manifestJson = manifestDir.resolve(manifestId + ".manifest.json");
-        Path metaJson = manifestDir.resolve(manifestId + ".meta.json");
+        Path manifestJson = manifestDir.resolve("manifest.json");
+        Path metaJson = manifestDir.resolve("meta.json");
 
         try {
             objectMapper.writeValue(manifestJson.toFile(), manifest);

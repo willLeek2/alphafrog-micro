@@ -12,11 +12,13 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.Cursor;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ScanOptions;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.artifact.PersistentArtifactRegistry;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
+import world.willfrog.agent.workflow.DatasetPersistedEvent;
 import world.willfrog.alphafrogmicro.common.utils.DateConvertUtils;
 
 import java.io.File;
@@ -48,6 +50,12 @@ public class DatasetRegistry {
     @Value("${agent.tools.market-data.dataset.path:/data/agent_datasets}")
     private String datasetPath;
 
+    @Value("${agent.tools.market-data.dataset.database-fetched-path:/data/database_fetched}")
+    private String databaseFetchedPath;
+
+    @Value("${agent.tools.market-data.dataset.manifests-path:/data/manifests}")
+    private String manifestsPath;
+
     @Value("${agent.tools.market-data.dataset.enabled:true}")
     private boolean enabled;
 
@@ -66,8 +74,11 @@ public class DatasetRegistry {
     @Autowired(required = false)
     private PersistentArtifactRegistry artifactRegistry;
 
-    public DatasetRegistry(StringRedisTemplate redisTemplate) {
+    private final ApplicationEventPublisher eventPublisher;
+
+    public DatasetRegistry(StringRedisTemplate redisTemplate, ApplicationEventPublisher eventPublisher) {
         this.redisTemplate = redisTemplate;
+        this.eventPublisher = eventPublisher;
     }
 
     public boolean isEnabled() {
@@ -155,9 +166,12 @@ public class DatasetRegistry {
         String queryKey = buildQueryKey(type, tsCode, startDate, endDate, columns);
         long now = Instant.now().toEpochMilli();
         long expireAt = ttlSeconds > 0 ? now + ttlSeconds * 1000L : Long.MAX_VALUE;
-        // 使用三层路径：{toolType}/{scopeHash}/{datasetId}
-        String scopeHash = DatasetPathStrategy.scopeHash(type, tsCode, startDate, endDate);
-        Path datasetDirPath = DatasetPathStrategy.resolvePath(Paths.get(datasetPath), type, scopeHash, datasetId);
+        // 使用四层路径：database_fetched/<topic>/<tsCode>/<encodedString>/<tsCode>.csv
+        String topic = DatabaseFetchedPathStrategy.resolveTopic(type);
+        String encodedStr = DatabaseFetchedPathStrategy.encodedString(type, tsCode, startDate, endDate, columns);
+        Path datasetDirPath = DatabaseFetchedPathStrategy.resolveDataPath(
+                Paths.get(databaseFetchedPath), topic, tsCode, encodedStr);
+        // meta.path = directory (for cleanup walking); event.getPersistedPath() = file (for 02 sandbox)
         String datasetDir = datasetDirPath.toAbsolutePath().toString();
 
         DatasetMeta meta = DatasetMeta.builder()
@@ -185,6 +199,17 @@ public class DatasetRegistry {
             redisTemplate.opsForValue().set(metaKey, objectMapper.writeValueAsString(meta));
             redisTemplate.opsForSet().add(indexKey(type, tsCode), queryKey);
             registerPersistentArtifacts(meta);
+
+            // 01 → 02 contract: publish dataset persisted event
+            if (eventPublisher != null) {
+                String runId = world.willfrog.agent.platform.context.AgentContext.getRunId();
+                if (runId != null) {
+                    String persistedPath = datasetDirPath.resolve(dataFileName).toAbsolutePath().toString();
+                    eventPublisher.publishEvent(new DatasetPersistedEvent(
+                            this, runId, datasetId, persistedPath, tsCode,
+                            dataFileName != null ? dataFileName : datasetId + ".csv"));
+                }
+            }
         } catch (JsonProcessingException e) {
             log.error("Failed to serialize dataset meta: {}", datasetId, e);
         }
@@ -233,7 +258,9 @@ public class DatasetRegistry {
         String queryKey = buildManifestQueryKey(dataType, startDate, endDate, tsCodes, columns);
         long now = Instant.now().toEpochMilli();
         long expireAt = ttlSeconds > 0 ? now + ttlSeconds * 1000L : Long.MAX_VALUE;
-        String manifestDir = Paths.get(datasetPath, manifestId).toAbsolutePath().toString();
+        Path manifestDirPath = DatabaseFetchedPathStrategy.resolveManifestPath(
+                Paths.get(manifestsPath), manifestId);
+        String manifestDir = manifestDirPath.toAbsolutePath().toString();
 
         ManifestMeta meta = ManifestMeta.builder()
                 .manifestId(manifestId)
@@ -258,6 +285,22 @@ public class DatasetRegistry {
         String metaKey = manifestMetaKey(queryKey);
         try {
             redisTemplate.opsForValue().set(metaKey, objectMapper.writeValueAsString(meta));
+
+            // 01 → 02 contract: publish manifest persisted event
+            if (eventPublisher != null) {
+                String runId = world.willfrog.agent.platform.context.AgentContext.getRunId();
+                if (runId != null) {
+                    String persistedPath = Paths.get(manifestDir, "manifest.json").toAbsolutePath().toString();
+                    // from_ts_code: infer from tsCodes list or UNCERTAIN
+                    String fromTsCode = (tsCodes != null && !tsCodes.isEmpty())
+                            ? String.join("#", tsCodes) : "UNCERTAIN";
+                    // relatedDatasetIds: not available in current registerManifest signature;
+                    // 02 consumers should treat empty list as "query manifest for members"
+                    eventPublisher.publishEvent(new DatasetPersistedEvent(
+                            this, runId, manifestId, persistedPath, fromTsCode,
+                            List.of(), "manifest.json"));
+                }
+            }
         } catch (JsonProcessingException e) {
             log.error("Failed to serialize manifest meta: {}", manifestId, e);
         }
@@ -475,12 +518,8 @@ public class DatasetRegistry {
     private void deleteDatasetFiles(DatasetMeta meta) {
         Path dir = Paths.get(meta.getPath());
         if (!Files.exists(dir)) {
-            // 目录已不存在，清理残存的 compat symlink（避免 dangling）
-            cleanupCompatSymlink(meta.getDatasetId());
             return;
         }
-        // 先删 compat symlink，再删 target 目录，避免 dangling symlink
-        cleanupCompatSymlink(meta.getDatasetId());
         try {
             Files.walk(dir)
                     .sorted(Comparator.reverseOrder())
@@ -510,14 +549,7 @@ public class DatasetRegistry {
                     ttlHours,
                     false
             );
-            artifactRegistry.registerExternal(
-                    "dataset-symlink",
-                    meta.getDatasetId(),
-                    "compat_symlink",
-                    Paths.get(datasetPath, meta.getDatasetId()).toAbsolutePath().normalize(),
-                    ttlHours,
-                    true
-            );
+            // dataset-symlink artifact removed — no compat symlinks in new 4-layer structure
         } catch (Exception e) {
             log.warn("Failed to register dataset persistent artifacts for {}: {}",
                     meta.getDatasetId(), e.getMessage());
@@ -540,23 +572,17 @@ public class DatasetRegistry {
         return Math.max(1L, (seconds + 3599L) / 3600L);
     }
 
-    private void cleanupCompatSymlink(String datasetId) {
-        Path flatLink = Paths.get(datasetPath, datasetId);
-        try {
-            if (Files.isSymbolicLink(flatLink) || Files.exists(flatLink)) {
-                Files.deleteIfExists(flatLink);
-            }
-        } catch (IOException e) {
-            log.debug("Compat symlink cleanup skipped for {}: {}", datasetId, e.getMessage());
-        }
-    }
+    // cleanupCompatSymlink removed — compat symlinks deleted entirely.
+    // New 4-layer database_fetched path structure eliminates flat symlinks.
 
     private String metaKey(String queryKey) {
         return META_PREFIX + queryKey;
     }
 
     private String indexKey(String type, String tsCode) {
-        return INDEX_PREFIX + type + ":" + tsCode;
+        // Migrated from <type>:<tsCode> to <topic>:<tsCode> per spec §A.4
+        String topic = DatabaseFetchedPathStrategy.resolveTopic(type);
+        return INDEX_PREFIX + topic + ":" + tsCode;
     }
 
     private String manifestMetaKey(String queryKey) {

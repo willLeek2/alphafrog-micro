@@ -28,6 +28,12 @@ public class DatasetWriter {
     @Value("${agent.tools.market-data.dataset.path:/data/agent_datasets}")
     private String datasetPath;
 
+    @Value("${agent.tools.market-data.dataset.database-fetched-path:/data/database_fetched}")
+    private String databaseFetchedPath;
+
+    @Value("${agent.tools.market-data.dataset.manifests-path:/data/manifests}")
+    private String manifestsPath;
+
     @Value("${agent.tools.market-data.dataset.enabled:true}")
     private boolean enabled;
 
@@ -60,24 +66,22 @@ public class DatasetWriter {
         String safeTsCode = tsCode.replaceAll("[^a-zA-Z0-9.]", "_");
         String datasetId = String.format("%s-%s-%s-%s-%s", prefix, safeTsCode, start, end, uuid);
 
-        String scopeHash = DatasetPathStrategy.scopeHash(prefix, tsCode, start, end);
-        Path datasetDirPath = DatasetPathStrategy.resolvePath(Path.of(datasetPath), prefix, scopeHash, datasetId);
+        // New 4-layer path: database_fetched/<topic>/<tsCode>/<encodedString>/
+        String topic = DatabaseFetchedPathStrategy.resolveTopic(prefix);
+        String encodedStr = DatabaseFetchedPathStrategy.encodedString(prefix, safeTsCode, start, end, headers);
+        Path datasetDirPath = DatabaseFetchedPathStrategy.resolveDataPath(
+                Path.of(databaseFetchedPath), topic, safeTsCode, encodedStr);
         File datasetDir = datasetDirPath.toFile();
         if (!datasetDir.exists()) {
             datasetDir.mkdirs();
         }
 
-        // Compatibility symlink: old flat path → new hierarchical path
-        DatasetPathStrategy.validateDatasetId(datasetId);
-        Path flatLinkPath = Path.of(datasetPath, datasetId);
-        try {
-            Files.createSymbolicLink(flatLinkPath, datasetDirPath);
-        } catch (IOException e) {
-            log.warn("Failed to create compat symlink {} → {}: {}", flatLinkPath, datasetDirPath, e.getMessage());
-        }
+        // NO compat symlink — old flat-path symlink deleted in this version
+        // (see task #39 V4: compat symlink was a source of broken dataset references)
 
-        File csvFile = new File(datasetDir, datasetId + ".csv");
-        File metaFile = new File(datasetDir, datasetId + ".meta.json");
+        String csvFileName = safeTsCode + ".csv";
+        File csvFile = new File(datasetDir, csvFileName);
+        File metaFile = new File(datasetDir, safeTsCode + ".meta.json");
 
         try (BufferedWriter writer = new BufferedWriter(new FileWriter(csvFile))) {
             // Write Header
