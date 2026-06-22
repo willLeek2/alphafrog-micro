@@ -84,16 +84,32 @@ public class PythonSandboxTools {
     }
 
     @Tool(TOOL_DESCRIPTION_SHORT)
+    public String executePython(String code, String dataset_ids, String manifest_ids, String libraries, Integer timeout_seconds) {
+        return executePythonInternal(code, dataset_ids, manifest_ids, libraries, timeout_seconds);
+    }
+
+    /**
+     * 4-arg backward-compat shim：把 dataset_ids + libraries 走 5-arg 入口（manifest_ids=null）。
+     * 注意：5-arg 模式下 dataset_ids 走"dataset 空间"，不再"先 dataset 后 manifest"双重解析。
+     * 业务路径走 5-arg（LLM-facing @Tool），4-arg 仅供其他 Java 模块或历史测试调用。
+     */
     public String executePython(String code, String dataset_ids, String libraries, Integer timeout_seconds) {
+        return executePythonInternal(code, dataset_ids, null, libraries, timeout_seconds);
+    }
+
+    private String executePythonInternal(String code, String dataset_ids, String manifest_ids, String libraries, Integer timeout_seconds) {
         try {
-            String[] parsedNumbers = parseDatasetIds(dataset_ids);
-            if (parsedNumbers.length == 0) {
-                return fail("executePython", "MISSING_DATASET_IDS",
-                        "dataset_ids is required and cannot be empty", Map.of());
+            String[] parsedDatasetNumbers = parseDatasetIds(dataset_ids);
+            String[] parsedManifestNumbers = parseDatasetIds(manifest_ids);
+            if (parsedDatasetNumbers.length == 0 && parsedManifestNumbers.length == 0) {
+                return fail("executePython", "MISSING_IDS",
+                        "dataset_ids and manifest_ids are both empty; at least one is required",
+                        Map.of());
             }
 
-            // 260623-harness-optimization-02: dataset_ids 现在是 agent run 级别编号。
+            // 260623-harness-optimization-02: dataset_ids / manifest_ids 都是 agent run 级别编号。
             // 走 registry 解析为 01 持久化条目（originalId / sortKey / fromTsCode）。
+            // Q4 拍板：dataset 和 manifest 各自独立编号空间，独立解析。
             // Q12: 非法编号报错并列出合法编号列表。
             String runId = AgentContext.getRunId();
             AgentRunDatasetRegistry registry = this.agentRunDatasetRegistry;
@@ -107,43 +123,25 @@ public class PythonSandboxTools {
             List<Integer> legalDatasetNumbers = registry.listDatasetNumbers(runId);
             List<Integer> legalManifestNumbers = registry.listManifestNumbers(runId);
 
+            // 独立解析 dataset 和 manifest 空间
             List<AgentRunDatasetEntry> resolvedDatasets = new ArrayList<>();
             List<AgentRunDatasetEntry> resolvedManifests = new ArrayList<>();
-            List<Map<String, Object>> illegalRefs = new ArrayList<>();
+            List<Map<String, Object>> illegalDatasetRefs = new ArrayList<>();
+            List<Map<String, Object>> illegalManifestRefs = new ArrayList<>();
 
-            for (String token : parsedNumbers) {
-                int number;
-                try {
-                    number = Integer.parseInt(token);
-                } catch (NumberFormatException nfe) {
-                    illegalRefs.add(Map.of("input", token, "reason", "not_an_integer"));
-                    continue;
-                }
-                Optional<AgentRunDatasetEntry> ds = registry.findDatasetByNumber(runId, number);
-                if (ds.isPresent()) {
-                    resolvedDatasets.add(ds.get());
-                    continue;
-                }
-                Optional<AgentRunDatasetEntry> mf = registry.findManifestByNumber(runId, number);
-                if (mf.isPresent()) {
-                    resolvedManifests.add(mf.get());
-                    continue;
-                }
-                illegalRefs.add(Map.of(
-                        "input", token,
-                        "reason", "no_dataset_or_manifest_with_this_run_level_number",
-                        "legal_dataset_numbers", legalDatasetNumbers,
-                        "legal_manifest_numbers", legalManifestNumbers
-                ));
-            }
+            resolveRunLevelNumbers(parsedDatasetNumbers, registry, runId, "dataset",
+                    resolvedDatasets, illegalDatasetRefs, false);
+            resolveRunLevelNumbers(parsedManifestNumbers, registry, runId, "manifest",
+                    resolvedManifests, illegalManifestRefs, true);
 
-            if (!illegalRefs.isEmpty()) {
+            if (!illegalDatasetRefs.isEmpty() || !illegalManifestRefs.isEmpty()) {
                 Map<String, Object> details = new LinkedHashMap<>();
-                details.put("illegal_refs", illegalRefs);
+                details.put("illegal_dataset_refs", illegalDatasetRefs);
+                details.put("illegal_manifest_refs", illegalManifestRefs);
                 details.put("legal_dataset_numbers", legalDatasetNumbers);
                 details.put("legal_manifest_numbers", legalManifestNumbers);
                 return fail("executePython", "ILLEGAL_RUN_LEVEL_IDS",
-                        "Some dataset_ids are not valid run-level numbers; pass values from the legal lists below",
+                        "Some dataset_ids / manifest_ids are not valid run-level numbers; pass values from the legal lists below",
                         details);
             }
 
@@ -157,7 +155,7 @@ public class PythonSandboxTools {
             }
             if (originalIdsToMount.isEmpty()) {
                 return fail("executePython", "EMPTY_RESOLVED_IDS",
-                        "No dataset / manifest resolved from dataset_ids", Map.of());
+                        "No dataset / manifest resolved from dataset_ids / manifest_ids", Map.of());
             }
 
             // 构造 snapshot 形态供 CSV writer（只覆盖本 run 当前 sub-selection，避免跟 listMyData 等独立查询混淆）
@@ -227,6 +225,50 @@ public class PythonSandboxTools {
         } catch (Exception e) {
             log.error("Execute python tool error", e);
             return fail("executePython", "TOOL_ERROR", "Python sandbox invocation error", Map.of("message", nvl(e.getMessage())));
+        }
+    }
+
+    /**
+     * 把 caller 传的 token 列表解析为 resolved entries + illegal refs（Q4 拍板：dataset / manifest 各自独立空间）。
+     *
+     * @param tokens caller 传的 token 字符串（parseDatasetIds 后的结果，可能含非数字）
+     * @param registry registry
+     * @param runId agent run id
+     * @param kind "dataset" 或 "manifest"，用于在 illegal ref 标 reason
+     * @param resolved 成功解析的 entry 列表
+     * @param illegal 解析失败的 ref 列表（input + reason）
+     * @param allowEmptyTokens 是否允许空 token（实际两个空间都不允许，留 false）
+     */
+    private void resolveRunLevelNumbers(
+            String[] tokens,
+            AgentRunDatasetRegistry registry,
+            String runId,
+            String kind,
+            List<AgentRunDatasetEntry> resolved,
+            List<Map<String, Object>> illegal,
+            boolean allowEmptyTokens) {
+        for (String token : tokens) {
+            if (!allowEmptyTokens && (token == null || token.isBlank())) {
+                continue;
+            }
+            int number;
+            try {
+                number = Integer.parseInt(token);
+            } catch (NumberFormatException nfe) {
+                illegal.add(Map.of("input", token, "reason", "not_an_integer"));
+                continue;
+            }
+            Optional<AgentRunDatasetEntry> hit = "manifest".equals(kind)
+                    ? registry.findManifestByNumber(runId, number)
+                    : registry.findDatasetByNumber(runId, number);
+            if (hit.isPresent()) {
+                resolved.add(hit.get());
+            } else {
+                illegal.add(Map.of(
+                        "input", token,
+                        "reason", "no_" + kind + "_with_this_run_level_number"
+                ));
+            }
         }
     }
 
