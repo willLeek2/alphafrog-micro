@@ -15,10 +15,12 @@ import world.willfrog.agent.workflow.AgentRunDatasetSnapshot;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
@@ -140,6 +142,32 @@ public class PythonSandboxTools {
             resolveRunLevelNumbers(parsedManifestNumbers, registry, runId, "manifest",
                     resolvedManifests, illegalManifestRefs, true);
 
+            // 260623-harness-optimization-03: manifest 是 dataset 的分组，选中 manifest 时
+            // 必须把其 member datasets 也 mount 进 sandbox 并写入 paths_dataset.csv，
+            // 否则 Python 端 load_manifest 无法通过 run-level 编号反查成员文件。
+            Set<Integer> explicitDatasetNumbers = new HashSet<>(resolvedDatasets.size() * 2);
+            for (AgentRunDatasetEntry ds : resolvedDatasets) {
+                explicitDatasetNumbers.add(ds.number());
+            }
+            List<AgentRunDatasetEntry> relatedDatasets = new ArrayList<>();
+            for (AgentRunDatasetEntry mf : resolvedManifests) {
+                for (String relatedNumberStr : mf.relatedDatasetIds()) {
+                    try {
+                        int relatedNumber = Integer.parseInt(relatedNumberStr);
+                        if (explicitDatasetNumbers.contains(relatedNumber)) {
+                            continue;
+                        }
+                        registry.findDatasetByNumber(runId, relatedNumber).ifPresent(relatedDs -> {
+                            explicitDatasetNumbers.add(relatedNumber);
+                            relatedDatasets.add(relatedDs);
+                        });
+                    } catch (NumberFormatException e) {
+                        log.warn("Manifest related_dataset_id is not a run-level number: runId={} manifestId={} value={}",
+                                runId, mf.originalId(), relatedNumberStr);
+                    }
+                }
+            }
+
             if (!illegalDatasetRefs.isEmpty() || !illegalManifestRefs.isEmpty()) {
                 Map<String, Object> details = new LinkedHashMap<>();
                 details.put("illegal_dataset_refs", illegalDatasetRefs);
@@ -151,7 +179,8 @@ public class PythonSandboxTools {
                         details);
             }
 
-            // 收集要 mount 的 originalIds（Python 端 sandbox_runner.py 用现有 datasetIds 字段做 mount）
+            // 收集要 mount 的 originalIds：显式 dataset → 显式 manifest → 隐式 related dataset
+            // 顺序保证 primaryOriginalId 是第一个显式选中项（与旧行为一致）
             List<String> originalIdsToMount = new ArrayList<>();
             for (AgentRunDatasetEntry ds : resolvedDatasets) {
                 originalIdsToMount.add(ds.originalId());
@@ -159,16 +188,21 @@ public class PythonSandboxTools {
             for (AgentRunDatasetEntry mf : resolvedManifests) {
                 originalIdsToMount.add(mf.originalId());
             }
+            for (AgentRunDatasetEntry ds : relatedDatasets) {
+                originalIdsToMount.add(ds.originalId());
+            }
             if (originalIdsToMount.isEmpty()) {
                 return fail("executePython", "EMPTY_RESOLVED_IDS",
                         "No dataset / manifest resolved from dataset_ids / manifest_ids", Map.of());
             }
 
-            // 构造 snapshot 形态供 CSV writer（只覆盖本 run 当前 sub-selection，避免跟 listMyData 等独立查询混淆）
-            AgentRunDatasetSnapshot subSnapshot = new AgentRunDatasetSnapshot(resolvedDatasets, resolvedManifests);
+            // 构造 snapshot 形态供 CSV writer：paths_dataset.csv 包含显式 dataset + manifest 隐式 member dataset
+            List<AgentRunDatasetEntry> allDatasets = new ArrayList<>(resolvedDatasets);
+            allDatasets.addAll(relatedDatasets);
+            AgentRunDatasetSnapshot subSnapshot = new AgentRunDatasetSnapshot(allDatasets, resolvedManifests);
             String pathsDatasetCsv = AgentRunDatasetCsvWriter.writePathsDatasetCsv(subSnapshot);
             String pathManifestCsv = AgentRunDatasetCsvWriter.writePathManifestCsv(snapshot);
-            // paths_dataset.csv 只反映本次 executePython 选中的子集；
+            // paths_dataset.csv 只反映本次 executePython 需要访问的数据集（显式 + manifest member）；
             // path_manifest.csv 反映当前 run 全量 manifest，方便 sandbox 内 manifest cross-ref。
             // 这是 Q13 snapshot 行为的 Java 形态。
 

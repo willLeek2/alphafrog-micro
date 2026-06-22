@@ -92,8 +92,8 @@ def _run_level_csv_paths(input_root: Path) -> tuple[Path, Path]:
 
 
 def _is_run_level_mode(input_root: Path) -> bool:
-    paths_csv, _ = _run_level_csv_paths(input_root)
-    return paths_csv.is_file()
+    paths_csv, manifests_csv = _run_level_csv_paths(input_root)
+    return paths_csv.is_file() or manifests_csv.is_file()
 
 
 def _load_run_level_dataset_index(paths_csv: Path) -> pd.DataFrame:

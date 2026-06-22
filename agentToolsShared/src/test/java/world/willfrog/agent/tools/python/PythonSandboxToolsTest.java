@@ -232,12 +232,14 @@ class PythonSandboxToolsTest {
     }
 
     @Test
-    void manifestIdsOnlyShouldResolveManifestsAndNotDatasets() throws Exception {
-        // MF1: dataset_ids=null + manifest_ids="1" → 只解析 manifest 1, 不查 dataset 空间
+    void manifestIdsOnlyShouldResolveManifestAndItsRelatedDatasets() throws Exception {
+        // MF1 + 03 闭环：dataset_ids=null + manifest_ids="1" → manifest 及其 member datasets
+        // 必须一起 mount，否则 Python 端 load_manifest 无法反查成员文件。
         AgentRunDatasetEntry ds1 = AgentRunDatasetEntry.forDataset(
                 1, "ds-a", "/p/ds-a", "000300.SH", "a.csv");
+        // related_dataset_ids 已由 registry 翻译成 run-level 编号（spec §4.2.2）
         AgentRunDatasetEntry mf1 = AgentRunDatasetEntry.forManifest(
-                1, "m-x", "/p/m-x", "UNCERTAIN", "manifest.json", List.of("ds-a"));
+                1, "m-x", "/p/m-x", "UNCERTAIN", "manifest.json", List.of("1"));
 
         when(registry.listDatasetNumbers("run-test")).thenReturn(List.of(1));
         when(registry.listManifestNumbers("run-test")).thenReturn(List.of(1));
@@ -256,28 +258,30 @@ class PythonSandboxToolsTest {
         when(sandboxService.getTaskStatus(any(GetTaskStatusRequest.class))).thenReturn(doneStatus);
         when(sandboxService.getTaskResult(any(GetTaskResultRequest.class))).thenReturn(resultResp);
 
-        // 只传 manifest_ids="1", 不传 dataset_ids → dataset 空间不应被查询
+        // 只传 manifest_ids="1", 不传 dataset_ids
         String result = tools.executePython("print('m')", null, "1", null, null);
         assertNotNull(result);
 
-        // dataset_ids 没传 → pathsDatasetCsv 应该只含 header, 没有数据行
         ArgumentCaptor<ExecuteRequest> captor = ArgumentCaptor.forClass(ExecuteRequest.class);
         verify(sandboxService, times(1)).createTask(captor.capture());
         ExecuteRequest sent = captor.getValue();
         String dsCsv = sent.getPathsDatasetCsv();
         assertTrue(dsCsv.contains("agent_run_dataset_id"),
                 "pathsDatasetCsv 应有 header; got: " + dsCsv);
-        // header-only CSV 不应含 ds-a
-        assertFalse(dsCsv.contains("ds-a"),
-                "manifest-only 模式下 pathsDatasetCsv 不应有数据行; got: " + dsCsv);
+        // manifest-only 时，member dataset 仍须写入 pathsDatasetCsv 并 mount
+        assertTrue(dsCsv.contains("ds-a"),
+                "manifest-only 模式下 pathsDatasetCsv 应包含 member dataset; got: " + dsCsv);
 
         // pathManifestCsv 含 manifest 1
         String mfCsv = sent.getPathManifestCsv();
         assertTrue(mfCsv.contains("m-x"),
                 "pathManifestCsv 应含 m-x; got: " + mfCsv);
 
-        // datasetId (旧字段) 取唯一 mount 的 m-x
+        // datasetId (旧字段) 取第一个 mount 的 originalId，仍是 manifest 的 m-x
         assertEquals("m-x", sent.getDatasetId());
+        // datasetIds 包含 manifest + 其 member datasets
+        assertTrue(sent.getDatasetIdsList().contains("m-x"));
+        assertTrue(sent.getDatasetIdsList().contains("ds-a"));
     }
 
     @Test
