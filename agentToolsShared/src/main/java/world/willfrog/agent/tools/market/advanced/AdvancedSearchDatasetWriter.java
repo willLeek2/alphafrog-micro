@@ -5,11 +5,12 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.Builder;
 import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
-import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.tools.dataset.DatabaseFetchedPathStrategy;
 import world.willfrog.agent.tools.dataset.DatasetRegistry;
 import world.willfrog.agent.tools.dataset.DatasetWriter;
 
 import java.io.File;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -22,7 +23,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.UUID;
 
 @Slf4j
 public class AdvancedSearchDatasetWriter {
@@ -70,12 +70,16 @@ public class AdvancedSearchDatasetWriter {
                     .build();
         }
 
-        String datasetId = buildDatasetId(toolName, assetType);
-        String jsonFileName = datasetId + ".json";
-        Path dir = Paths.get(datasetWriter.getDatasetPath(), datasetId).toAbsolutePath().normalize();
+        String datasetId = "adv-" + querySignature.substring(0, 12);
+        String dataFileName = "data.json";
+        String topic = DatabaseFetchedPathStrategy.resolveTopic(DATASET_TYPE);
+        String encodedStr = DatabaseFetchedPathStrategy.encodedString(DATASET_TYPE, querySignature,
+                "NONE", "NONE", COLUMNS);
+        Path dir = DatabaseFetchedPathStrategy.resolveDataPath(
+                Paths.get(datasetWriter.getDatabaseFetchedPath()), topic, querySignature, encodedStr);
         try {
             Files.createDirectories(dir);
-            Path jsonFile = dir.resolve(jsonFileName);
+            Path jsonFile = dir.resolve(dataFileName);
             objectMapper.writerWithDefaultPrettyPrinter().writeValue(jsonFile.toFile(), dataset);
 
             Map<String, Object> meta = new LinkedHashMap<>();
@@ -86,14 +90,14 @@ public class AdvancedSearchDatasetWriter {
             meta.put("tool", toolName);
             meta.put("asset_type", assetType);
             meta.put("row_count", dataset.get("row_count"));
-            meta.put("data_file", jsonFileName);
+            meta.put("data_file", dataFileName);
             meta.put("created_at", Instant.now().toEpochMilli());
             objectMapper.writerWithDefaultPrettyPrinter().writeValue(dir.resolve(datasetId + ".meta.json").toFile(), meta);
 
             if (datasetRegistry.isEnabled()) {
                 int rowCount = ((Number) dataset.getOrDefault("row_count", 0)).intValue();
                 datasetRegistry.registerDataset(DATASET_TYPE, querySignature, "NONE", "NONE",
-                        COLUMNS, datasetId, rowCount, "json", jsonFileName);
+                        COLUMNS, datasetId, rowCount, "json", dataFileName);
             }
             return WriteResult.builder()
                     .datasetId(datasetId)
@@ -101,7 +105,7 @@ public class AdvancedSearchDatasetWriter {
                     .reused(false)
                     .previewRows(previewRows(dataset, previewLimit))
                     .build();
-        } catch (Exception e) {
+        } catch (IOException e) {
             throw new AdvancedSearchException("TOOL_ERROR", "Failed to write advanced search dataset: " + e.getMessage());
         }
     }
@@ -140,14 +144,6 @@ public class AdvancedSearchDatasetWriter {
             }
         }
         return preview;
-    }
-
-    private String buildDatasetId(String toolName, String assetType) {
-        String runId = AgentContext.getRunId();
-        String prefix = runId == null || runId.isBlank() ? "unknown" : runId;
-        String type = assetType == null || assetType.isBlank() ? "index" : assetType;
-        return "%s-advanced-%s-%s-%s".formatted(prefix, toolName, type, UUID.randomUUID().toString().substring(0, 8))
-                .replaceAll("[^a-zA-Z0-9._-]", "_");
     }
 
     private String querySignature(String toolName, String assetType, Map<String, Object> canonicalQuery) {
