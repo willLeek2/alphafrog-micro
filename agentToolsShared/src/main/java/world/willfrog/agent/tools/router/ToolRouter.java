@@ -620,9 +620,11 @@ public class ToolRouter {
                         str(params.get("query_type"), params.get("arg0")),
                         str(params.get("from_ts_code"), params.get("arg1")),
                         str(params.get("grep"), params.get("arg2")),
-                        toIntOrNull(params.get("offset"), params.get("arg3")),
-                        toIntOrNull(params.get("limit"), params.get("arg4")),
-                        str(params.get("related_dataset_ids"), params.get("arg5"))
+                        toIntOrNull(params.get("file_offset"), params.get("arg3")),
+                        toIntOrNull(params.get("file_limit"), params.get("arg4")),
+                        toIntOrNull(params.get("offset"), params.get("arg5")),
+                        toIntOrNull(params.get("limit"), params.get("arg6")),
+                        str(params.get("related_dataset_ids"), params.get("arg7"))
                 );
                 case "rereadToolResult" -> rereadToolHandler.reread(
                         str(params.get("rawRef"), params.get("raw_ref"), params.get("arg0")),
@@ -692,9 +694,21 @@ public class ToolRouter {
      * 260623-harness-optimization-02: 收集 executePython 的 manifestIds 参数（兼容多种命名风格）。
      *
      * <p>与 {@link #collectExecutePythonDatasetIds} 形态一致，但走 manifest 命名空间：
-     * manifest_ids / manifestIds / manifests / manifest_refs / manifestRefs / 位置参数 arg1。
+     * manifest_ids / manifestIds / manifests / manifest_refs / manifestRefs。
      * 拼接为逗号分隔字符串供 {@code PythonStaticPrecheckService.check} 与
      * {@code PythonSandboxTools.executePython} 5 形参 overload 使用。</p>
+     *
+     * <p><b>非对称契约（Cindy round 2 review cleanup 拍板）</b>：legacy 位置参数
+     * {@code arg1} <b>不</b>进 manifest 命名空间 — 历史上 dataset / manifest 共用
+     * {@code arg1} 时存在「同一 {@code arg1=1} 同时进 dataset_ids 和 manifest_ids」的
+     * 歧义。修正后：
+     * <ul>
+     *   <li>{@code arg1} 只进 {@link #collectExecutePythonDatasetIds}（向后兼容老 prompt 风格）</li>
+     *   <li>manifest_ids 只能由显式命名 key（{@code manifest_ids} / {@code manifestIds} /
+     *       {@code manifests} / {@code manifest_refs} / {@code manifestRefs}）触发</li>
+     * </ul>
+     * 这样 {@code arg1=1} 不会意外 leak 到 manifest_ids 空间，避免模型把 dataset 编号
+     * 错填成 manifest 编号。
      */
     private String collectExecutePythonManifestIds(Map<String, Object> params) {
         LinkedHashSet<String> manifestIds = new LinkedHashSet<>();
@@ -703,8 +717,8 @@ public class ToolRouter {
                 params.get("manifestIds"),
                 params.get("manifests"),
                 params.get("manifest_refs"),
-                params.get("manifestRefs"),
-                params.get("arg1")
+                params.get("manifestRefs")
+                // arg1 故意不在此列表中 — 见 Javadoc 非对称契约
         );
         return String.join(",", manifestIds);
     }

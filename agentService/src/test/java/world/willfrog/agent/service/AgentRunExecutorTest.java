@@ -24,6 +24,7 @@ import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
 import world.willfrog.agent.tools.rag.RagTools;
 import world.willfrog.agent.tools.search.SearchTools;
+import world.willfrog.agent.tools.dataset.ListMyDataTool;
 import world.willfrog.agent.platform.event.AgentRunFinalizationService;
 import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
 
@@ -101,6 +102,8 @@ class AgentRunExecutorTest {
     private AgentRunFinalizationService finalizationService;
     @Mock
     private AgentRunDatasetRegistry agentRunDatasetRegistry;
+    @Mock
+    private ListMyDataTool listMyDataTool;
 
     private AgentRunExecutor executor;
 
@@ -114,6 +117,7 @@ class AgentRunExecutorTest {
                 pythonSandboxTools,
                 ragTools,
                 searchTools,
+                listMyDataTool,
                 stateStore,
                 observabilityService,
                 creditService,
@@ -660,5 +664,84 @@ class AgentRunExecutorTest {
                 .toolCallsUsed(1)
                 .build());
         when(observabilityService.attachObservabilityToSnapshot(anyString(), anyString(), any())).thenReturn("{}");
+    }
+
+    /**
+     * 260623-harness-optimization-02 MF-new-1（Cindy round 2 review 拍板）：
+     * listMyData 必须在 run 的 tool specs 中（无论 webSearch / codeInterpreter 开关如何）。
+     */
+    @Test
+    void execute_shouldIncludeListMyDataInToolSpecs() {
+        AgentRun run = run("run-listmydata");
+        when(runMapper.findById("run-listmydata")).thenReturn(run);
+        when(eventService.isRunnable("run-listmydata", "u1")).thenReturn(true);
+
+        TodoPlan plan = new TodoPlan();
+        plan.setItems(List.of(TodoItem.builder().id("todo_1").sequence(1).build()));
+        when(todoPlanner.plan(any())).thenReturn(plan);
+        when(workflowExecutor.execute(any())).thenReturn(WorkflowExecutionResult.builder()
+                .success(true)
+                .paused(false)
+                .finalAnswer("answer")
+                .completedItems(plan.getItems())
+                .context(Map.of())
+                .toolCallsUsed(1)
+                .build());
+        when(observabilityService.attachObservabilityToSnapshot(anyString(), anyString(), any())).thenReturn("{}");
+
+        executor.execute("run-listmydata");
+
+        ArgumentCaptor<TodoPlanner.PlanRequest> captor = ArgumentCaptor.forClass(TodoPlanner.PlanRequest.class);
+        verify(todoPlanner).plan(captor.capture());
+        List<String> toolNames = captor.getValue().getToolSpecifications().stream()
+                .map(ToolSpecification::name)
+                .toList();
+        assertTrue(toolNames.contains("listMyData"),
+                "listMyData must be in run's tool specs (Cindy MF-new-1)");
+    }
+
+    /**
+     * MF-new-1：即使 webSearch + codeInterpreter 都关闭，listMyData 仍必须在 tool specs 中。
+     */
+    @Test
+    void execute_shouldIncludeListMyDataEvenWhenBothCapabilitiesDisabled() {
+        AgentRun run = run("run-listmydata-capoff");
+        when(runMapper.findById("run-listmydata-capoff")).thenReturn(run);
+        when(eventService.isRunnable("run-listmydata-capoff", "u1")).thenReturn(true);
+        when(eventService.extractRunConfig(anyString()))
+                .thenReturn(new AgentEventService.RunConfig(
+                        false,
+                        AgentContext.WebSearchConfig.empty(),
+                        false,
+                        0,
+                        false
+                ));
+
+        TodoPlan plan = new TodoPlan();
+        plan.setItems(List.of(TodoItem.builder().id("todo_1").sequence(1).build()));
+        when(todoPlanner.plan(any())).thenReturn(plan);
+        when(workflowExecutor.execute(any())).thenReturn(WorkflowExecutionResult.builder()
+                .success(true)
+                .paused(false)
+                .finalAnswer("answer")
+                .completedItems(plan.getItems())
+                .context(Map.of())
+                .toolCallsUsed(1)
+                .build());
+        when(observabilityService.attachObservabilityToSnapshot(anyString(), anyString(), any())).thenReturn("{}");
+
+        executor.execute("run-listmydata-capoff");
+
+        ArgumentCaptor<TodoPlanner.PlanRequest> captor = ArgumentCaptor.forClass(TodoPlanner.PlanRequest.class);
+        verify(todoPlanner).plan(captor.capture());
+        List<String> toolNames = captor.getValue().getToolSpecifications().stream()
+                .map(ToolSpecification::name)
+                .toList();
+        // webSearch / executePython 关闭
+        assertFalse(toolNames.contains("executePython"));
+        assertFalse(toolNames.contains("searchWeb"));
+        // listMyData 仍必须在
+        assertTrue(toolNames.contains("listMyData"),
+                "listMyData 不受能力开关约束（仅消费 in-memory registry）");
     }
 }

@@ -29,30 +29,42 @@ import java.util.Map;
  * <p>用于 agent 不确定当前 run 有哪些可用 dataset / manifest，或 executePython 收到
  * 非法编号错误时的恢复路径。直接消费 {@link AgentRunDatasetRegistry} 的 snapshot。
  *
- * <p>输入参数（6 形参版 — ToolRouter 调用入口，向后兼容）：
+ * <p>单一 LLM-facing 签名（Cindy round 2 review MF-new-1 拍板）：
+ * 8 形参 {@code @Tool} 公开方法是唯一 LLM 可见入口，同时支持：
+ * <ul>
+ *   <li>普通列表：按 query_type / from_ts_code / offset / limit / related_dataset_ids
+ *       过滤当前 run 已落盘 dataset / manifest</li>
+ *   <li>原始文件 grep（spec Q10）：当 query_type=dataset 且 grep 非空时，
+ *       对每个 dataset 的原始文件全文做大小写不敏感子串搜索，
+ *       返回每个命中 dataset 的匹配行数 + snippet preview，按命中次数降序</li>
+ * </ul>
+ *
+ * <p>参数说明：
  * <ul>
  *   <li>{@code query_type} — {@code dataset} 或 {@code manifest}，必填</li>
  *   <li>{@code from_ts_code} — 可选，过滤 ts_code 包含该子串的条目（含 {@code #} 多 ts_code）</li>
- *   <li>{@code grep} — 可选，对 {@code originalId} 做大小写不敏感子串匹配（原始语义，保留兼容）</li>
- *   <li>{@code offset} / {@code limit} — 可选，分页（默认 offset=0, limit=50，limit 上限 200）</li>
- *   <li>{@code related_dataset_ids} — 可选（manifest only），用 {@code #} 分隔，过滤 related 包含任一指定 id 的 manifest</li>
- * </ul>
- *
- * <p>MF5 新增 8 形参 overload（spec Q10 raw file content grep）：
- * <ul>
- *   <li>{@code grep} — 对每个 dataset 的原始文件全文做大小写不敏感子串搜索</li>
- *   <li>{@code file_offset} / {@code file_limit} — 限定从 dataset 列表第 file_offset 个开始扫描，最多 file_limit 个
- *       （仅 grep 模式生效，默认 offset=0、limit=全部）</li>
- *   <li>其余参数语义同 6 形参版</li>
+ *   <li>{@code grep} — 可选（仅 dataset 模式生效），对每个 dataset 的原始文件全文做
+ *       大小写不敏感子串搜索；非 dataset 模式 / 空 grep 走非 grep 路径（listMyData 老语义）</li>
+ *   <li>{@code file_offset} / {@code file_limit} — 可选，仅 grep 模式生效，限定从
+ *       dataset 列表第 file_offset 个开始扫描，最多 file_limit 个（默认 0 / 全部）</li>
+ *   <li>{@code offset} / {@code limit} — 可选，非 grep 模式分页（默认 0/50，上限 200）</li>
+ *   <li>{@code related_dataset_ids} — 可选（manifest only），用 {@code #} 分隔，
+ *       过滤 related 包含任一指定 id 的 manifest</li>
  * </ul>
  *
  * <p>输出字段：
  * <ul>
- *   <li>普通模式：{@code data.total_matched} / {@code data.returned_count} / {@code data.offset} / {@code data.limit} / {@code data.entries[]}</li>
- *   <li>grep 模式（仅 8 形参版、仅 dataset 模式、且 grep 非空）：{@code data.matched_count} /
- *       {@code data.file_offset} / {@code data.file_limit} / {@code data.matches[]}，每个 match 含
- *       {@code dataset_number / dataset_id / from_ts_code / match_count / snippet_preview}，按 match_count 降序、相同则按 dataset_number 升序</li>
+ *   <li>非 grep 模式：{@code data.total_matched} / {@code data.returned_count} /
+ *       {@code data.offset} / {@code data.limit} / {@code data.entries[]}</li>
+ *   <li>grep 模式：{@code data.matched_count} / {@code data.file_offset} /
+ *       {@code data.file_limit} / {@code data.matches[]}，每个 match 含
+ *       {@code dataset_number / dataset_id / from_ts_code / match_count / snippet_preview}，
+ *       按 match_count 降序、相同则按 dataset_number 升序</li>
  * </ul>
+ *
+ * <p>ToolRouter 入口：本类还提供一个无 {@code @Tool} 注解的 {@link #listMyData6(String, String, String, Integer, Integer, String)}
+ * 旧 6 形参入口供内部 ToolRouter 调用（避免破坏既有 routing 逻辑）。两个入口最终都走
+ * {@link #executeCore} 核心实现，行为一致；唯一区别是 grep 分支的 file_offset / file_limit 默认值。
  */
 @Component
 @Slf4j
@@ -85,37 +97,87 @@ public class ListMyDataTool {
         this.agentRunDatasetRegistry = registry;
     }
 
+    /**
+     * 唯一 LLM-facing 入口（Cindy round 2 review MF-new-1）。
+     * 8 形参 {@code @Tool} 公开方法：覆盖普通列表 + raw file grep 双模式。
+     * 行为同 {@link #executeCore}；ToolRouter 内部也调用同一个底层实现。
+     */
     @Tool("""
-        列出当前 agent run 已落盘的 dataset / manifest。仅依赖 in-memory registry（不消耗外部配额），用于：
+        列出当前 agent run 已落盘的 dataset / manifest，提供 raw file content grep 能力。
 
+        用于：
         1. executePython 收到 ILLEGAL_RUN_LEVEL_IDS 错误时恢复（先 listMyData 查合法编号）
         2. 多步工作流中回顾前面步骤落下了什么数据
         3. 发现某个 manifest 包含哪些相关 dataset
+        4. 在 dataset 原始文件里搜索某关键字（grep 模式）
 
         参数：
           query_type          - 必填，取值 "dataset" 或 "manifest"
           from_ts_code        - 可选，过滤 from_ts_code 包含该子串的条目（multi-ts-code 用 # 分隔）
-          grep                - 可选，对 originalId 做大小写不敏感子串匹配
-          offset              - 可选，分页起始（默认 0）
-          limit               - 可选，单页返回上限（默认 50，上限 200）
+          grep                - 可选（仅 dataset 模式），对 dataset 原始文件全文做大小写不敏感子串搜索
+                                非 dataset 模式 / 空 grep 时走非 grep 路径
+          file_offset         - 可选（仅 grep 时生效），从第 file_offset 个 dataset 开始扫描（默认 0）
+          file_limit          - 可选（仅 grep 时生效），最多扫描 file_limit 个 dataset（默认全部）
+          offset              - 可选，非 grep 模式分页起始（默认 0）
+          limit               - 可选，非 grep 模式单页返回上限（默认 50，上限 200）
           related_dataset_ids - 可选（manifest only），用 # 分隔，过滤 related 包含任一指定 id 的 manifest
 
-        返回：{ ok, data: { query_type, run_id, total_matched, returned_count, offset, limit, entries: [...] }, error }
+        返回（grep 模式）：{ ok, data: { query_type, run_id, matched_count, file_offset, file_limit, matches: [...] }, error }
+        返回（非 grep 模式）：{ ok, data: { query_type, run_id, total_matched, returned_count, offset, limit, entries: [...] }, error }
         """)
     public String listMyData(
             @P(value = "查询类型：dataset | manifest", required = true) String query_type,
             @P(value = "可选，过滤 from_ts_code 包含该子串的条目", required = false) String from_ts_code,
-            @P(value = "可选，对 originalId 做大小写不敏感子串匹配", required = false) String grep,
+            @P(value = "可选（仅 dataset 模式），对 dataset 原始文件全文做大小写不敏感子串搜索", required = false) String grep,
+            @P(value = "可选（仅 grep 时生效），从第 file_offset 个 dataset 开始扫描（默认 0）", required = false) Integer file_offset,
+            @P(value = "可选（仅 grep 时生效），最多扫描 file_limit 个 dataset（默认全部）", required = false) Integer file_limit,
             @P(value = "可选，分页起始（默认 0）", required = false) Integer offset,
             @P(value = "可选，单页返回上限（默认 50，上限 200）", required = false) Integer limit,
             @P(value = "可选（manifest only），用 # 分隔，过滤 related 包含任一指定 id 的 manifest", required = false) String related_dataset_ids
     ) {
+        return executeCore(query_type, from_ts_code, grep, file_offset, file_limit,
+                offset, limit, related_dataset_ids);
+    }
+
+    /**
+     * ToolRouter 入口（Cindy round 2 review MF-new-1）：保留 6 形参入口以避免破坏既有
+     * routing 逻辑，行为同 8 形参版，但 grep 视为对 originalId 子串匹配（与原始 listMyData 6 形参
+     * 语义一致：不做 raw file grep）。不是 {@code @Tool} 注解方法，仅供 ToolRouter 内部调用。
+     *
+     * <p>本入口走 {@link #executeLegacy6Core} 旧语义实现，与 8 形参 LLM-facing
+     * {@code @Tool} 入口 {@link #listMyData(String, String, String, Integer, Integer, Integer, Integer, String)}
+     * 行为在「非 grep 模式」下一致；区别仅在 grep 参数：6 形参版对 originalId 子串匹配，
+     * 8 形参版对原始文件全文 grep。
+     */
+    public String listMyData6(
+            String query_type,
+            String from_ts_code,
+            String grep,
+            Integer offset,
+            Integer limit,
+            String related_dataset_ids
+    ) {
+        return executeLegacy6Core(query_type, from_ts_code, grep, offset, limit, related_dataset_ids);
+    }
+
+    /**
+     * 8 形参版的核心实现：合并「非 grep 列表」和「grep raw file content」两种语义。
+     * 同时被 {@code @Tool} 公开方法和 ToolRouter 路由调用，确保两种入口行为一致。
+     */
+    private String executeCore(String queryType,
+                               String fromTsCode,
+                               String grep,
+                               Integer fileOffset,
+                               Integer fileLimit,
+                               Integer offset,
+                               Integer limit,
+                               String relatedDatasetIds) {
         try {
-            String qType = normalizeQueryType(query_type);
+            String qType = normalizeQueryType(queryType);
             if (qType == null) {
                 return fail("INVALID_QUERY_TYPE",
                         "query_type must be 'dataset' or 'manifest'",
-                        Map.of("query_type", nvl(query_type)));
+                        Map.of("query_type", nvl(queryType)));
             }
 
             String runId = AgentContext.getRunId();
@@ -128,15 +190,32 @@ public class ListMyDataTool {
 
             int off = (offset == null || offset < 0) ? 0 : offset;
             int lim = (limit == null || limit <= 0) ? DEFAULT_LIMIT : Math.min(limit, MAX_LIMIT);
-            String tsFilter = from_ts_code == null ? "" : from_ts_code.trim();
-            String grepFilter = grep == null ? "" : grep.trim().toLowerCase();
-            List<String> relatedFilter = splitHash(related_dataset_ids);
+            String tsFilter = fromTsCode == null ? "" : fromTsCode.trim();
+            String grepQuery = grep == null ? "" : grep.trim();
+            List<String> relatedFilter = splitHash(relatedDatasetIds);
 
             AgentRunDatasetSnapshot snapshot = registry.snapshot(runId);
             List<AgentRunDatasetEntry> candidates = "dataset".equals(qType)
                     ? snapshot.datasets()
                     : snapshot.manifests();
 
+            // grep 模式：仅 dataset 模式 + grep 非空；走 raw file content 全文搜索。
+            if ("dataset".equals(qType) && !grepQuery.isEmpty()) {
+                int fileOff = (fileOffset == null || fileOffset < 0) ? 0 : fileOffset;
+                int fileLim = (fileLimit == null || fileLimit <= 0) ? Integer.MAX_VALUE : fileLimit;
+                return ok(buildGrepResult(runId, candidates, grepQuery, tsFilter, fileOff, fileLim));
+            }
+
+            // 非 grep 模式：按 (from_ts_code, related) 过滤
+            String grepFilter;
+            if ("dataset".equals(qType)) {
+                // dataset 非 grep：8 形参版 grep 视为空（grep 已走上面 raw 分支）
+                grepFilter = "";
+            } else {
+                // manifest 模式：8 形参版不应用 originalId 过滤（grep 在本 overload 是 raw file content，
+                // 与 manifest 不适用；保留 6 形参版 ToolRouter 入口对 manifest+grep 的 originalId 过滤语义）
+                grepFilter = "";
+            }
             List<AgentRunDatasetEntry> filtered = new ArrayList<>();
             for (AgentRunDatasetEntry entry : candidates) {
                 if (!legacyMatches(entry, tsFilter, grepFilter, relatedFilter, "dataset".equals(qType))) {
@@ -145,7 +224,6 @@ public class ListMyDataTool {
                 filtered.add(entry);
             }
 
-            // Q5: 稳定顺序 = 落盘时编号（已由 registry 保证）。此处仅做分页切片。
             int from = Math.min(off, filtered.size());
             int to = Math.min(from + lim, filtered.size());
             List<Map<String, Object>> entries = new ArrayList<>(to - from);
@@ -170,55 +248,21 @@ public class ListMyDataTool {
     }
 
     /**
-     * 260623-harness-optimization-02 MF5: 8 形参 overload，提供 raw file content grep（spec Q10）。
-     * 与 6 形参版不同：当 {@code query_type=dataset} 且 {@code grep} 非空时，
-     * 不再走 originalId 子串匹配，而是对每个 dataset 的原始文件全文做大小写不敏感子串搜索，
-     * 返回每个命中 dataset 的匹配行数 + snippet preview，按命中次数降序。
-     *
-     * <p>file_offset / file_limit 仅 grep 模式生效：限定从 dataset 列表第 file_offset 个开始扫描，
-     * 最多扫描 file_limit 个 dataset（默认 offset=0、limit=全部）。
-     *
-     * <p>返回形态与 6 形参版不同：grep 模式输出 {@code data.matched_count / data.matches[]}；
-     * 非 grep 模式仍走 originalId 子串匹配（manifest 模式忽略 grep）。
-     *
-     * <p>本 overload 已挂到 LangChain {@code @Tool} 注解；ToolRouter 入口仍走 6 形参契约以
-     * 避免破坏既有 routing 逻辑，LLM 走 raw grep 时按本签名 8 形参调用。
+     * 6 形参版的核心实现：保留旧 ToolRouter 入口的 originalId grep 语义，避免破坏既有 routing 逻辑。
+     * 行为与原始 commit ec2b31e 完全一致：grep 对 originalId 做大小写不敏感子串匹配。
      */
-    @Tool("""
-        列出当前 agent run 已落盘的 dataset / manifest，提供 raw file content grep 能力（区别于 6 形参版）。
-
-        与 6 形参版的差异：当 query_type=dataset 且 grep 非空时，对每个 dataset 的原始文件全文
-        做大小写不敏感子串搜索，返回每 dataset 的匹配行数 + snippet preview，按命中次数降序。
-
-        参数：
-          query_type          - 必填，取值 "dataset" 或 "manifest"（manifest 模式 + grep 时走非 grep 分支）
-          from_ts_code        - 可选，过滤 from_ts_code 包含该子串的条目（multi-ts-code 用 # 分隔）
-          grep                - 可选（仅 dataset 模式），对原始文件全文做大小写不敏感子串搜索
-          file_offset         - 可选（仅 grep 时生效），从第 file_offset 个 dataset 开始扫描（默认 0）
-          file_limit          - 可选（仅 grep 时生效），最多扫描 file_limit 个 dataset（默认全部）
-          offset              - 可选，非 grep 模式分页起始（默认 0）
-          limit               - 可选，非 grep 模式单页返回上限（默认 50，上限 200）
-          related_dataset_ids - 可选（manifest only），用 # 分隔，过滤 related 包含任一指定 id 的 manifest
-
-        返回（grep 模式）：{ ok, data: { query_type, run_id, matched_count, file_offset, file_limit, matches: [...] }, error }
-        返回（非 grep 模式）：{ ok, data: { query_type, run_id, total_matched, returned_count, offset, limit, entries: [...] }, error }
-        """)
-    public String listMyData(
-            @P(value = "查询类型：dataset | manifest", required = true) String query_type,
-            @P(value = "可选，过滤 from_ts_code 包含该子串的条目", required = false) String from_ts_code,
-            @P(value = "可选（仅 dataset 模式），对 dataset 原始文件全文做大小写不敏感子串搜索", required = false) String grep,
-            @P(value = "可选（仅 grep 时生效），从第 file_offset 个 dataset 开始扫描（默认 0）", required = false) Integer file_offset,
-            @P(value = "可选（仅 grep 时生效），最多扫描 file_limit 个 dataset（默认全部）", required = false) Integer file_limit,
-            @P(value = "可选，分页起始（默认 0）", required = false) Integer offset,
-            @P(value = "可选，单页返回上限（默认 50，上限 200）", required = false) Integer limit,
-            @P(value = "可选（manifest only），用 # 分隔，过滤 related 包含任一指定 id 的 manifest", required = false) String related_dataset_ids
-    ) {
+    private String executeLegacy6Core(String queryType,
+                                      String fromTsCode,
+                                      String grep,
+                                      Integer offset,
+                                      Integer limit,
+                                      String relatedDatasetIds) {
         try {
-            String qType = normalizeQueryType(query_type);
+            String qType = normalizeQueryType(queryType);
             if (qType == null) {
                 return fail("INVALID_QUERY_TYPE",
                         "query_type must be 'dataset' or 'manifest'",
-                        Map.of("query_type", nvl(query_type)));
+                        Map.of("query_type", nvl(queryType)));
             }
 
             String runId = AgentContext.getRunId();
@@ -231,32 +275,15 @@ public class ListMyDataTool {
 
             int off = (offset == null || offset < 0) ? 0 : offset;
             int lim = (limit == null || limit <= 0) ? DEFAULT_LIMIT : Math.min(limit, MAX_LIMIT);
-            String tsFilter = from_ts_code == null ? "" : from_ts_code.trim();
-            String grepQuery = grep == null ? "" : grep.trim();
-            List<String> relatedFilter = splitHash(related_dataset_ids);
+            String tsFilter = fromTsCode == null ? "" : fromTsCode.trim();
+            String grepFilter = grep == null ? "" : grep.trim().toLowerCase();
+            List<String> relatedFilter = splitHash(relatedDatasetIds);
 
             AgentRunDatasetSnapshot snapshot = registry.snapshot(runId);
             List<AgentRunDatasetEntry> candidates = "dataset".equals(qType)
                     ? snapshot.datasets()
                     : snapshot.manifests();
 
-            // MF5: 8 形参版的 grep 是「全文搜索」（spec Q10），仅 dataset 模式生效
-            if ("dataset".equals(qType) && !grepQuery.isEmpty()) {
-                int fileOff = (file_offset == null || file_offset < 0) ? 0 : file_offset;
-                int fileLim = (file_limit == null || file_limit <= 0) ? Integer.MAX_VALUE : file_limit;
-                return ok(buildGrepResult(runId, candidates, grepQuery, tsFilter, fileOff, fileLim));
-            }
-
-            // 非 grep 模式：行为同 6 形参版（保留 originalId 子串匹配 + offset/limit 分页）
-            // MF5: 但 manifest 模式 + 8 形参版本：忽略 grep（grep 在本 overload 是 raw file content，
-            // 与 manifest 不适用；保留 6 形参版 ToolRouter 入口对 manifest+grep 的 originalId 过滤语义）
-            String grepFilter;
-            if ("dataset".equals(qType)) {
-                grepFilter = grep == null ? "" : grep.trim().toLowerCase();
-            } else {
-                // manifest 模式：8 形参版不应用 originalId 过滤（避免与 6 形参版的 manifest+grep 行为混淆）
-                grepFilter = "";
-            }
             List<AgentRunDatasetEntry> filtered = new ArrayList<>();
             for (AgentRunDatasetEntry entry : candidates) {
                 if (!legacyMatches(entry, tsFilter, grepFilter, relatedFilter, "dataset".equals(qType))) {
@@ -265,6 +292,7 @@ public class ListMyDataTool {
                 filtered.add(entry);
             }
 
+            // Q5: 稳定顺序 = 落盘时编号（已由 registry 保证）。此处仅做分页切片。
             int from = Math.min(off, filtered.size());
             int to = Math.min(from + lim, filtered.size());
             List<Map<String, Object>> entries = new ArrayList<>(to - from);
@@ -402,8 +430,8 @@ public class ListMyDataTool {
     }
 
     /**
-     * 6 形参版的 grep 语义：对 {@code originalId} 做大小写不敏感子串匹配。
-     * 保留以保持 ToolRouter 调用入口的旧行为（避免破坏既有 routing 逻辑）。
+     * 6 形参版（保留旧 ToolRouter 入口）的 grep 语义：对 {@code originalId} 做大小写不敏感子串匹配。
+     * 8 形参版的 grep 是 raw file content 全文搜索（不走本函数）。
      */
     private static boolean legacyMatches(AgentRunDatasetEntry entry,
                                          String tsFilter,

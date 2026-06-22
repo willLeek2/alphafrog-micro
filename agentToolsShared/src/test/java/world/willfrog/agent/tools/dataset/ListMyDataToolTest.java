@@ -84,11 +84,13 @@ class ListMyDataToolTest {
     }
 
     // ----- 6 形参版（ToolRouter 入口，旧语义） -----
+    // Cindy round 2 review MF-new-1：6 形参入口改名为 listMyData6（非 @Tool 注解），
+    // 避免与唯一 LLM-facing 8 形参 @Tool 入口同名歧义；行为不变（grep 对 originalId 子串匹配）。
 
     @Test
     void listDatasetShouldReturnAllDatasetsByDefault() throws Exception {
         when(registry.snapshot("run-1")).thenReturn(snapshot());
-        String result = tool.listMyData("dataset", null, null, null, null, null);
+        String result = tool.listMyData6("dataset", null, null, null, null, null);
         JsonNode root = mapper.readTree(result);
         assertTrue(root.path("ok").asBoolean(), "expected ok=true; got: " + result);
         assertEquals("dataset", root.path("data").path("query_type").asText());
@@ -100,7 +102,7 @@ class ListMyDataToolTest {
     @Test
     void listManifestShouldReturnAllManifestsByDefault() throws Exception {
         when(registry.snapshot("run-1")).thenReturn(snapshot());
-        String result = tool.listMyData("manifest", null, null, null, null, null);
+        String result = tool.listMyData6("manifest", null, null, null, null, null);
         JsonNode root = mapper.readTree(result);
         assertTrue(root.path("ok").asBoolean());
         assertEquals("manifest", root.path("data").path("query_type").asText());
@@ -116,7 +118,7 @@ class ListMyDataToolTest {
     void filterByFromTsCodeShouldMatchSubstring() throws Exception {
         when(registry.snapshot("run-1")).thenReturn(snapshot());
         // ds-beta 的 fromTsCode 是 "000300.SH#510300.SH"，子串 "510300" 应命中
-        String result = tool.listMyData("dataset", "510300", null, null, null, null);
+        String result = tool.listMyData6("dataset", "510300", null, null, null, null);
         JsonNode root = mapper.readTree(result);
         assertTrue(root.path("ok").asBoolean());
         assertEquals(1, root.path("data").path("total_matched").asInt());
@@ -128,7 +130,7 @@ class ListMyDataToolTest {
         // 6 形参版语义：grep 对 originalId 做大小写不敏感子串匹配（保留旧行为）
         when(registry.snapshot("run-1")).thenReturn(snapshot());
         // 子串 "ALPHA" 大写应匹配 "ds-alpha"
-        String result = tool.listMyData("dataset", null, "ALPHA", null, null, null);
+        String result = tool.listMyData6("dataset", null, "ALPHA", null, null, null);
         JsonNode root = mapper.readTree(result);
         assertTrue(root.path("ok").asBoolean());
         assertEquals(1, root.path("data").path("total_matched").asInt());
@@ -138,7 +140,7 @@ class ListMyDataToolTest {
     @Test
     void paginationShouldRespectOffsetAndLimit() throws Exception {
         when(registry.snapshot("run-1")).thenReturn(snapshot());
-        String result = tool.listMyData("dataset", null, null, 1, 1, null);
+        String result = tool.listMyData6("dataset", null, null, 1, 1, null);
         JsonNode root = mapper.readTree(result);
         assertEquals(3, root.path("data").path("total_matched").asInt());
         assertEquals(1, root.path("data").path("returned_count").asInt());
@@ -148,7 +150,7 @@ class ListMyDataToolTest {
     @Test
     void limitShouldBeCappedAtMax() throws Exception {
         when(registry.snapshot("run-1")).thenReturn(snapshot());
-        String result = tool.listMyData("dataset", null, null, 0, 9999, null);
+        String result = tool.listMyData6("dataset", null, null, 0, 9999, null);
         JsonNode root = mapper.readTree(result);
         assertEquals(200, root.path("data").path("limit").asInt(),
                 "limit should be clamped to MAX_LIMIT=200");
@@ -157,7 +159,7 @@ class ListMyDataToolTest {
     @Test
     void invalidQueryTypeShouldReturnError() throws Exception {
         when(registry.snapshot("run-1")).thenReturn(snapshot());
-        String result = tool.listMyData("bogus", null, null, null, null, null);
+        String result = tool.listMyData6("bogus", null, null, null, null, null);
         JsonNode root = mapper.readTree(result);
         assertFalse(root.path("ok").asBoolean());
         assertEquals("INVALID_QUERY_TYPE", root.path("error").path("code").asText());
@@ -166,7 +168,7 @@ class ListMyDataToolTest {
     @Test
     void blankRunIdShouldReturnRunLevelIdsUnavailable() throws Exception {
         AgentContext.clear();
-        String result = tool.listMyData("dataset", null, null, null, null, null);
+        String result = tool.listMyData6("dataset", null, null, null, null, null);
         JsonNode root = mapper.readTree(result);
         assertFalse(root.path("ok").asBoolean());
         assertEquals("RUN_LEVEL_IDS_UNAVAILABLE", root.path("error").path("code").asText());
@@ -176,7 +178,7 @@ class ListMyDataToolTest {
     void relatedDatasetIdsShouldFilterManifests() throws Exception {
         when(registry.snapshot("run-1")).thenReturn(snapshot());
         // 只匹配 related 包含 ds-alpha 的 manifest → manifest-mix
-        String result = tool.listMyData("manifest", null, null, null, null, "ds-alpha");
+        String result = tool.listMyData6("manifest", null, null, null, null, "ds-alpha");
         JsonNode root = mapper.readTree(result);
         assertEquals(1, root.path("data").path("total_matched").asInt());
         assertEquals("manifest-mix", root.path("data").path("entries").get(0).path("originalId").asText());
@@ -186,7 +188,7 @@ class ListMyDataToolTest {
     void relatedDatasetIdsShouldIgnoreForDatasetQuery() throws Exception {
         // dataset 查询传 related_dataset_ids 应当被忽略（不报错也不过滤）
         when(registry.snapshot("run-1")).thenReturn(snapshot());
-        String result = tool.listMyData("dataset", null, null, null, null, "ds-alpha");
+        String result = tool.listMyData6("dataset", null, null, null, null, "ds-alpha");
         JsonNode root = mapper.readTree(result);
         assertEquals(3, root.path("data").path("total_matched").asInt(),
                 "related_dataset_ids 不应影响 dataset 查询");

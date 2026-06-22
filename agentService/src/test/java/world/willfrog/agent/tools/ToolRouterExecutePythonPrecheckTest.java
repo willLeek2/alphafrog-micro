@@ -304,6 +304,57 @@ class ToolRouterExecutePythonPrecheckTest {
         verify(pythonSandboxTools).executePython(eq("print(1)"), eq(""), eq("1,2,3"), anyString(), any());
     }
 
+    @SuppressWarnings("unchecked")
+    @Test
+    void invoke_shouldNotLeakArg1IntoManifestIds() throws Exception {
+        // Cindy round 2 review cleanup 拍板：legacy 位置参数 arg1 不进 manifest_ids 命名空间。
+        // dataset_ids 通过 arg1 走 dataset 命名空间；manifest_ids 必须用显式命名 key。
+        // 这里只传 arg1 不传任何 manifest_* 命名 key → manifestIds 必须是空串 ""。
+        PythonSandboxTools pythonSandboxTools = mock(PythonSandboxTools.class);
+        // 用 lenient 兜底，因为 dataset_id="1" 是有效值但 stub 顺序可能影响匹配
+        when(pythonSandboxTools.executePython(eq("print(1)"), eq("1"), eq(""), anyString(), any()))
+                .thenReturn("{\"ok\":true,\"tool\":\"executePython\",\"data\":{},\"error\":null}");
+
+        ToolResultCacheService cacheService = mock(ToolResultCacheService.class);
+        when(cacheService.executeWithCache(anyString(), any(), anyString(), any())).thenAnswer(inv -> {
+            Supplier<ToolResultCacheService.ToolExecutionOutcome> supplier = inv.getArgument(3);
+            ToolResultCacheService.ToolExecutionOutcome outcome = supplier.get();
+            return ToolResultCacheService.CachedToolCallResult.builder()
+                    .result(outcome.getResult())
+                    .durationMs(outcome.getDurationMs())
+                    .success(outcome.isSuccess())
+                    .build();
+        });
+
+        ToolRouter router = new ToolRouter(
+                mock(MarketDataTools.class),
+                mock(RagTools.class),
+                mock(SearchTools.class),
+                pythonSandboxTools,
+                mock(LoadToolGuideTool.class),
+                mock(ListMyDataTool.class),
+                new PythonStaticPrecheckService(),
+                llmPropertiesWithStaticPrecheck(true),
+                cacheService,
+                mock(world.willfrog.agent.tools.compaction.RereadToolHandler.class),
+                mock(AgentObservabilityService.class),
+                new ObjectMapper(),
+                new SimpleMeterRegistry(),
+                new StressTestProperties()
+        );
+
+        // 仅传 arg1="1"（dataset 位置参数），不传任何 manifest 命名 key
+        ToolRouter.ToolInvocationResult result = router.invokeWithMeta(
+                "executePython",
+                Map.of("code", "print(1)", "arg1", "1")
+        );
+
+        // 关键 verify：datasetIds 应是 "1"（arg1 进 dataset 空间），manifestIds 应是 ""（arg1 不 leak）
+        // 这里只 verify 关键 3 个参数（code, datasetIds, manifestIds），剩余 libraries/timeout 任意匹配
+        verify(pythonSandboxTools).executePython(eq("print(1)"), eq("1"), eq(""), anyString(), any());
+        assertTrue(result.isSuccess());
+    }
+
     private AgentLlmProperties llmPropertiesWithStaticPrecheck(boolean enabled) {
         AgentLlmProperties properties = new AgentLlmProperties();
         AgentLlmProperties.Runtime runtime = new AgentLlmProperties.Runtime();

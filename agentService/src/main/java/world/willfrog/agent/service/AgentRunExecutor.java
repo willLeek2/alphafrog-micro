@@ -24,6 +24,7 @@ import world.willfrog.agent.platform.entity.AgentRunMessage;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.tools.catalog.ParallelLimitsToolCatalog;
+import world.willfrog.agent.tools.dataset.ListMyDataTool;
 import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
 import world.willfrog.agent.tools.rag.RagTools;
@@ -95,6 +96,8 @@ public class AgentRunExecutor {
     private final RagTools ragTools;
     /** 网页搜索工具 */
     private final SearchTools searchTools;
+    /** 260623-harness-optimization-02 MF-new-1: listMyData 工具（run-level dataset/manifest 列表 / grep） */
+    private final ListMyDataTool listMyDataTool;
     /** Run 级 Redis 状态缓存（运行状态、工作流中间态） */
     private final AgentRunStateStore stateStore;
     /** 观测数据服务，管理 LLM/工具调用的 trace 记录和观测视图 */
@@ -436,6 +439,9 @@ public class AgentRunExecutor {
             if (runConfig.codeInterpreterEnabled()) {
                 toolSpecifications.addAll(ToolSpecifications.toolSpecificationsFrom(pythonSandboxTools));
             }
+            // 260623-harness-optimization-02 MF-new-1: listMyData 始终对 LLM 可见，
+            // 不受能力开关约束（无副作用、仅消费 AgentRunDatasetRegistry in-memory 状态）。
+            toolSpecifications.addAll(ToolSpecifications.toolSpecificationsFrom(listMyDataTool));
             toolSpecifications = new ArrayList<>(ParallelLimitsToolCatalog.mergeCanonical(toolSpecifications));
 
             // ── 6a. 简单单工具查询 fast-path ──

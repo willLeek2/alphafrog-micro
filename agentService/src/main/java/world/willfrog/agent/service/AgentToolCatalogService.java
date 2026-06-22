@@ -18,6 +18,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.tools.catalog.MarketDataAdvancedToolCatalog;
 import world.willfrog.agent.tools.catalog.ParallelLimitsToolCatalog;
+import world.willfrog.agent.tools.dataset.ListMyDataTool;
 import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
 import world.willfrog.agent.tools.rag.RagTools;
@@ -38,6 +39,8 @@ public class AgentToolCatalogService {
     private final RagTools ragTools;
     private final SearchTools searchTools;
     private final PythonSandboxTools pythonSandboxTools;
+    /** 260623-harness-optimization-02 MF-new-1: listMyData 工具（run-level dataset/manifest 列表 / grep） */
+    private final ListMyDataTool listMyDataTool;
     private final ObjectMapper objectMapper;
 
     public List<AgentToolMessage> listToolMessages() {
@@ -46,6 +49,7 @@ public class AgentToolCatalogService {
         addSpecs(specs, ragTools);
         addSpecs(specs, searchTools);
         addSpecs(specs, pythonSandboxTools);
+        addSpecs(specs, listMyDataTool);
 
         List<ToolSpecification> merged = MarketDataAdvancedToolCatalog.mergeCanonical(
                 ParallelLimitsToolCatalog.mergeCanonical(new ArrayList<>(specs.values())));
