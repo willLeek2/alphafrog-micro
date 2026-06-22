@@ -510,5 +510,125 @@ class SandboxRunnerCsvMaterializeTest(unittest.TestCase):
         )
 
 
+class SandboxRunnerCsvSourcePathCopyTest(unittest.TestCase):
+    """260623-harness-optimization-02: MF3 — 第 4 列 source_path 直接 cp 测试。
+
+    验证 _copy_via_csv_source_paths 从 CSV 4 列读 source_path，
+    用 _copy_dataset_file 直接 cp（绕过 _resolve_dataset_dir + _list_files）。
+    """
+
+    def test_dataset_source_path_copies_via_source(self) -> None:
+        """MF3: paths_dataset.csv 第 4 列非空 → 直接 cp source_path → sandbox path。"""
+        from app.sandbox_runner import _copy_via_csv_source_paths
+        config = _test_config(Path("/tmp/none"))
+        session = _FakeSession()
+        ds_csv = (
+            "agent_run_dataset_id,dataset_file_path,from_ts_code,source_path\n"
+            "1,/__AF_INPUT__/ds-a/a.csv,000300.SH,/data/database_fetched/7D3A/000300.SH.csv\n"
+            "2,/__AF_INPUT__/ds-b/b.csv,000002.SZ,/data/database_fetched/abc/000002.SZ.csv\n"
+        )
+        count = _copy_via_csv_source_paths(
+            session, config, "task-mf3", "/sandbox/runs/task-mf3/input", ds_csv, ""
+        )
+        self.assertEqual(count, 2)
+        writes_by_dest = {w[1]: w[0] for w in session.writes}
+        self.assertIn("/sandbox/runs/task-mf3/input/ds-a/000300.SH.csv", writes_by_dest)
+        self.assertIn("/sandbox/runs/task-mf3/input/ds-b/000002.SZ.csv", writes_by_dest)
+
+    def test_manifest_source_path_copies_via_source(self) -> None:
+        """MF3: path_manifest.csv 第 4 列非空 → cp source_path → sandbox path。"""
+        from app.sandbox_runner import _copy_via_csv_source_paths
+        config = _test_config(Path("/tmp/none"))
+        session = _FakeSession()
+        mf_csv = (
+            "agent_run_manifest_id,manifest_file_path,related_dataset_ids,source_path\n"
+            "1,/__AF_INPUT__/m-x/manifest.json,1,/data/manifests/v1/manifest-x/manifest.json\n"
+        )
+        count = _copy_via_csv_source_paths(
+            session, config, "task-mf3", "/sandbox/runs/task-mf3/input", "", mf_csv
+        )
+        self.assertEqual(count, 1)
+        writes_by_dest = {w[1]: w[0] for w in session.writes}
+        self.assertIn(
+            "/sandbox/runs/task-mf3/input/m-x/manifest.json",
+            writes_by_dest,
+        )
+
+    def test_none_manifest_row_skipped_in_source_copy(self) -> None:
+        """MF3: NONE 行（manifest_file_path=NONE）由 _materialize_none_manifest 处理，不在此 cp。"""
+        from app.sandbox_runner import _copy_via_csv_source_paths
+        config = _test_config(Path("/tmp/none"))
+        session = _FakeSession()
+        mf_csv = (
+            "agent_run_manifest_id,manifest_file_path,related_dataset_ids,source_path\n"
+            f"1,{MANIFEST_NONE_MARKER},1#,/data/should-be-ignored.json\n"
+        )
+        count = _copy_via_csv_source_paths(
+            session, config, "task-mf3", "/sandbox/runs/task-mf3/input", "", mf_csv
+        )
+        # NONE 行不复制（即使 source_path 不为空）
+        self.assertEqual(count, 0)
+        self.assertEqual(session.writes, [])
+
+    def test_empty_source_path_returns_zero(self) -> None:
+        """MF3: 第 4 列为空 → 0 次复制（调用方决定是否走 legacy data_dir fallback）。"""
+        from app.sandbox_runner import _copy_via_csv_source_paths
+        config = _test_config(Path("/tmp/none"))
+        session = _FakeSession()
+        ds_csv = (
+            "agent_run_dataset_id,dataset_file_path,from_ts_code,source_path\n"
+            "1,/__AF_INPUT__/ds-a/a.csv,000300.SH,\n"  # 空 source_path
+        )
+        count = _copy_via_csv_source_paths(
+            session, config, "task-mf3", "/sandbox/runs/task-mf3/input", ds_csv, ""
+        )
+        self.assertEqual(count, 0)
+        self.assertEqual(session.writes, [])
+
+    def test_three_column_legacy_csv_returns_zero(self) -> None:
+        """MF3: 旧 3 列 CSV（无 source_path）→ 0 次复制（保持向后兼容）。"""
+        from app.sandbox_runner import _copy_via_csv_source_paths
+        config = _test_config(Path("/tmp/none"))
+        session = _FakeSession()
+        ds_csv = (
+            "agent_run_dataset_id,dataset_file_path,from_ts_code\n"
+            "1,/__AF_INPUT__/ds-a/a.csv,000300.SH\n"
+        )
+        count = _copy_via_csv_source_paths(
+            session, config, "task-mf3", "/sandbox/runs/task-mf3/input", ds_csv, ""
+        )
+        self.assertEqual(count, 0)
+        self.assertEqual(session.writes, [])
+
+    def test_combined_dataset_and_manifest(self) -> None:
+        """MF3: paths_dataset + path_manifest 同时给 → 两边都 cp。"""
+        from app.sandbox_runner import _copy_via_csv_source_paths
+        config = _test_config(Path("/tmp/none"))
+        session = _FakeSession()
+        ds_csv = (
+            "agent_run_dataset_id,dataset_file_path,from_ts_code,source_path\n"
+            "1,/__AF_INPUT__/ds-a/a.csv,000300.SH,/data/ds-a/a.csv\n"
+        )
+        mf_csv = (
+            "agent_run_manifest_id,manifest_file_path,related_dataset_ids,source_path\n"
+            "1,/__AF_INPUT__/m-x/manifest.json,1,/data/m-x/manifest.json\n"
+        )
+        count = _copy_via_csv_source_paths(
+            session, config, "task-mf3", "/sandbox/runs/task-mf3/input", ds_csv, mf_csv
+        )
+        self.assertEqual(count, 2)
+
+    def test_empty_csvs_return_zero(self) -> None:
+        """MF3: 两个 CSV 都为空 → 0 次复制。"""
+        from app.sandbox_runner import _copy_via_csv_source_paths
+        config = _test_config(Path("/tmp/none"))
+        session = _FakeSession()
+        count = _copy_via_csv_source_paths(
+            session, config, "task-mf3", "/sandbox/runs/task-mf3/input", "", ""
+        )
+        self.assertEqual(count, 0)
+        self.assertEqual(session.writes, [])
+
+
 if __name__ == "__main__":
     unittest.main()

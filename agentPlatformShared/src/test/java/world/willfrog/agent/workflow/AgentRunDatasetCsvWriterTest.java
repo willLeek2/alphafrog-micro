@@ -37,17 +37,17 @@ class AgentRunDatasetCsvWriterTest {
                 List.of());
         String csv = AgentRunDatasetCsvWriter.writePathsDatasetCsv(snap);
         String[] lines = csv.split("\n");
-        assertEquals("agent_run_dataset_id,dataset_file_path,from_ts_code", lines[0]);
-        assertEquals("1,/__AF_INPUT__/ds-a/a.csv,000300.SH", lines[1]);
+        assertEquals("agent_run_dataset_id,dataset_file_path,from_ts_code,source_path", lines[0]);
+        assertEquals("1,/__AF_INPUT__/ds-a/a.csv,000300.SH,/data/database_fetched/ds-a/a.csv", lines[1]);
         // multi-ts-code 含 `#`，按 spec §4.1.2 不强制 quote，保持简单
-        assertEquals("2,/__AF_INPUT__/ds-b/b.csv,000300.SH#510300.SH", lines[2]);
+        assertEquals("2,/__AF_INPUT__/ds-b/b.csv,000300.SH#510300.SH,/data/database_fetched/ds-b/b.csv", lines[2]);
     }
 
     @Test
     void pathsDatasetCsvWithEmptySnapshotShouldOnlyEmitHeader() {
         AgentRunDatasetSnapshot snap = AgentRunDatasetSnapshot.empty();
         String csv = AgentRunDatasetCsvWriter.writePathsDatasetCsv(snap);
-        assertEquals("agent_run_dataset_id,dataset_file_path,from_ts_code\n", csv);
+        assertEquals("agent_run_dataset_id,dataset_file_path,from_ts_code,source_path\n", csv);
     }
 
     @Test
@@ -61,9 +61,9 @@ class AgentRunDatasetCsvWriterTest {
         );
         String csv = AgentRunDatasetCsvWriter.writePathManifestCsv(snap);
         String[] lines = csv.split("\n");
-        assertEquals("agent_run_manifest_id,manifest_file_path,related_dataset_ids", lines[0]);
-        assertEquals("1,/__AF_INPUT__/m-x/manifest.json,ds-1#ds-2#ds-3", lines[1]);
-        assertEquals("2,/__AF_INPUT__/m-y/manifest.json,ds-4", lines[2]);
+        assertEquals("agent_run_manifest_id,manifest_file_path,related_dataset_ids,source_path", lines[0]);
+        assertEquals("1,/__AF_INPUT__/m-x/manifest.json,ds-1#ds-2#ds-3,/data/manifests/v1/manifest-m-x/manifest.json", lines[1]);
+        assertEquals("2,/__AF_INPUT__/m-y/manifest.json,ds-4,/data/manifests/v1/manifest-m-y/manifest.json", lines[2]);
     }
 
     @Test
@@ -74,7 +74,7 @@ class AgentRunDatasetCsvWriterTest {
         );
         String csv = AgentRunDatasetCsvWriter.writePathManifestCsv(snap);
         String[] lines = csv.split("\n");
-        assertEquals("1,NONE,ds-1", lines[1]);
+        assertEquals("1,NONE,ds-1,", lines[1]);
     }
 
     @Test

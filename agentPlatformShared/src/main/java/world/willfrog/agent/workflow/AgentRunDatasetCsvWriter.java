@@ -8,16 +8,24 @@ import java.util.List;
 /**
  * 把 {@link AgentRunDatasetSnapshot} 渲染成 sandbox 注入用的 CSV 字符串。
  *
- * <p>两张表的 schema（§4 拍板）：
+ * <p>两张表的 schema（§4 拍板 + MF3 扩展）：
  * <ul>
- *   <li>{@code paths_dataset.csv} — 列：{@code agent_run_dataset_id, dataset_file_path, from_ts_code}</li>
- *   <li>{@code path_manifest.csv} — 列：{@code agent_run_manifest_id, manifest_file_path, related_dataset_ids}</li>
+ *   <li>{@code paths_dataset.csv} — 列：
+ *       {@code agent_run_dataset_id, dataset_file_path, from_ts_code, source_path}</li>
+ *   <li>{@code path_manifest.csv} — 列：
+ *       {@code agent_run_manifest_id, manifest_file_path, related_dataset_ids, source_path}</li>
  * </ul>
  *
  * <p>关键设计：{@code dataset_file_path} 和 {@code manifest_file_path} 在 CSV 字符串里使用
  * 占位符 {@link #SANDBOX_INPUT_PLACEHOLDER}（默认 {@code /__AF_INPUT__/}），由 Python 端
  * 在 sandbox 启动时（已知 task_id / compat_input_path 配置）替换成实际可访问的绝对路径。
  * Java 不参与 sandbox 路径解析，避免 Java/Python 双侧维护 mount 规则。</p>
+ *
+ * <p>MF3：新增第 4 列 {@code source_path}，由 Java 端从
+ * {@link AgentRunDatasetEntry#persistedPath()} 取值（来自 T1 contract V2
+ * {@code DatasetPersistedEvent.getPersistedPath()}），传给 sandbox_runner 做单文件 cp。
+ * Python 端优先用 source_path 直接 cp；source_path 为空时回落老 data_dir 目录扫描逻辑，
+ * 保留向后兼容。</p>
  *
  * <p>Q7 拍板：{@code manifest_file_path = NONE} 时由 Python 转译层物化临时 manifest.json，
  * CSV 字串保留 {@code NONE} 标记，Python 端识别后做物化。</p>
@@ -28,8 +36,8 @@ public final class AgentRunDatasetCsvWriter {
     private AgentRunDatasetCsvWriter() {
     }
 
-    public static final String PATHS_DATASET_HEADER = "agent_run_dataset_id,dataset_file_path,from_ts_code";
-    public static final String PATH_MANIFEST_HEADER = "agent_run_manifest_id,manifest_file_path,related_dataset_ids";
+    public static final String PATHS_DATASET_HEADER = "agent_run_dataset_id,dataset_file_path,from_ts_code,source_path";
+    public static final String PATH_MANIFEST_HEADER = "agent_run_manifest_id,manifest_file_path,related_dataset_ids,source_path";
 
     /** Python 端替换的占位符前缀。 */
     public static final String SANDBOX_INPUT_PLACEHOLDER = "/__AF_INPUT__/";
@@ -48,7 +56,8 @@ public final class AgentRunDatasetCsvWriter {
         lines.add(PATHS_DATASET_HEADER);
         for (AgentRunDatasetEntry entry : snapshot.datasets()) {
             String sandboxPath = SANDBOX_INPUT_PLACEHOLDER + entry.originalId() + "/" + entry.sortKey();
-            lines.add(csvRow(entry.number(), sandboxPath, entry.fromTsCode()));
+            String sourcePath = entry.persistedPath() == null ? "" : entry.persistedPath();
+            lines.add(csvRow(entry.number(), sandboxPath, entry.fromTsCode(), sourcePath));
         }
         return String.join("\n", lines) + "\n";
     }
@@ -65,7 +74,9 @@ public final class AgentRunDatasetCsvWriter {
                     ? MANIFEST_NONE_MARKER
                     : SANDBOX_INPUT_PLACEHOLDER + entry.originalId() + "/manifest.json";
             String related = String.join("#", entry.relatedDatasetIds());
-            lines.add(csvRow(entry.number(), sandboxPath, related));
+            // MF3: persistedPath 充当 source_path；NONE marker 行 source_path 也保持空（sandbox 走物化路径）
+            String sourcePath = entry.persistedPath() == null ? "" : entry.persistedPath();
+            lines.add(csvRow(entry.number(), sandboxPath, related, sourcePath));
         }
         return String.join("\n", lines) + "\n";
     }

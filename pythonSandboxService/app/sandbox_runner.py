@@ -201,43 +201,56 @@ def _prepare_task_workspace(
         _exec_checked(session, f"rm -rf {config.workdir}/input", "remove_old_input")
         _exec_checked(session, f"ln -s {task_input} {config.workdir}/input", "create_input_symlink")
 
-    expanded = expand_dataset_ids(config.data_dir, dataset_id_list)
-    copy_ids: List[str] = []
-    for manifest_id in expanded.manifest_ids:
-        if manifest_id not in copy_ids:
-            copy_ids.append(manifest_id)
-    for atomic_id in expanded.atomic_ids:
-        if atomic_id not in copy_ids:
-            copy_ids.append(atomic_id)
+    # MF3: agent run 模式走 CSV 4 列 source_path 直接 cp，跳过 data_dir 目录展开。
+    # 旧调用（无 CSV / CSV 第 4 列为空）继续走 data_dir 兼容路径。
+    source_copy_count = _copy_via_csv_source_paths(
+        session,
+        config,
+        task_id,
+        task_input,
+        paths_dataset_csv or "",
+        path_manifest_csv or "",
+    )
 
-    if expanded.failed_members or expanded.skipped_members:
-        _log_in_container(
-            session,
-            task_id,
-            config,
-            "manifest_expand "
-            f"manifests={len(expanded.manifest_ids)} "
-            f"atomics={len(expanded.atomic_ids)} "
-            f"failed={len(expanded.failed_members)} "
-            f"skipped={len(expanded.skipped_members)}",
-        )
+    if source_copy_count == 0:
+        # Legacy path: 用 data_dir 目录展开（无 CSV source_path 信息的旧请求兼容）
+        expanded = expand_dataset_ids(config.data_dir, dataset_id_list)
+        copy_ids: List[str] = []
+        for manifest_id in expanded.manifest_ids:
+            if manifest_id not in copy_ids:
+                copy_ids.append(manifest_id)
+        for atomic_id in expanded.atomic_ids:
+            if atomic_id not in copy_ids:
+                copy_ids.append(atomic_id)
 
-    # Copy manifest directories and expanded atomic datasets into task workspace.
-    for ds_id in copy_ids:
-        dataset_dir = _resolve_dataset_dir(config, ds_id)
-        files_to_copy = _list_files(dataset_dir, files)
-        dataset_mount = f"{task_input}/{ds_id}"
-        _exec_checked(session, f"mkdir -p {dataset_mount}", "create_dataset_mount")
-        for file_path in files_to_copy:
-            dest = f"{dataset_mount}/{file_path.name}"
-            _copy_dataset_file(session, file_path, dest)
-            # Compatibility copies for common read patterns
-            if file_path.name == f"{ds_id}.csv":
-                _copy_dataset_file(session, file_path, f"{dataset_mount}/data.csv")
-                _copy_dataset_file(session, file_path, f"{task_workspace}/{ds_id}.csv")
-            elif file_path.name == f"{ds_id}.meta.json":
-                _copy_dataset_file(session, file_path, f"{dataset_mount}/data.meta.json")
-        _log_in_container(session, task_id, config, f"dataset_ready dataset={ds_id} files={len(files_to_copy)}")
+        if expanded.failed_members or expanded.skipped_members:
+            _log_in_container(
+                session,
+                task_id,
+                config,
+                "manifest_expand "
+                f"manifests={len(expanded.manifest_ids)} "
+                f"atomics={len(expanded.atomic_ids)} "
+                f"failed={len(expanded.failed_members)} "
+                f"skipped={len(expanded.skipped_members)}",
+            )
+
+        # Copy manifest directories and expanded atomic datasets into task workspace.
+        for ds_id in copy_ids:
+            dataset_dir = _resolve_dataset_dir(config, ds_id)
+            files_to_copy = _list_files(dataset_dir, files)
+            dataset_mount = f"{task_input}/{ds_id}"
+            _exec_checked(session, f"mkdir -p {dataset_mount}", "create_dataset_mount")
+            for file_path in files_to_copy:
+                dest = f"{dataset_mount}/{file_path.name}"
+                _copy_dataset_file(session, file_path, dest)
+                # Compatibility copies for common read patterns
+                if file_path.name == f"{ds_id}.csv":
+                    _copy_dataset_file(session, file_path, f"{dataset_mount}/data.csv")
+                    _copy_dataset_file(session, file_path, f"{task_workspace}/{ds_id}.csv")
+                elif file_path.name == f"{ds_id}.meta.json":
+                    _copy_dataset_file(session, file_path, f"{dataset_mount}/data.meta.json")
+            _log_in_container(session, task_id, config, f"dataset_ready dataset={ds_id} files={len(files_to_copy)}")
 
     _copy_runtime_loader_modules(session, config)
     _log_in_container(session, task_id, config, "sandbox_loader_modules_ready")
@@ -256,6 +269,99 @@ def _prepare_task_workspace(
         )
 
     return task_workspace
+
+
+def _copy_via_csv_source_paths(
+    session: SandboxSession,
+    config: SandboxConfig,
+    task_id: str,
+    task_input: str,
+    paths_dataset_csv: str,
+    path_manifest_csv: str,
+) -> int:
+    """MF3: 从 paths_dataset.csv / path_manifest.csv 第 4 列读 source_path，直接 cp 到 sandbox。
+
+    输入 CSV schema（Java AgentRunDatasetCsvWriter 写）：
+      paths_dataset.csv: agent_run_dataset_id, dataset_file_path, from_ts_code, source_path
+      path_manifest.csv: agent_run_manifest_id, manifest_file_path, related_dataset_ids, source_path
+
+    行为：
+      - 第 4 列非空行 → 用 source_path 做 _copy_dataset_file（绕过 _resolve_dataset_dir + _list_files）
+      - 目的路径 = 第 2 列 placeholder 替换为 task_input
+      - sandbox path = `<task_input>/<originalId>/<sortKey>`，filename = sortKey
+      - NONE 行（manifest_file_path == NONE）由 _materialize_agent_run_csvs 单独物化，不在此 cp
+      - 至少一行成功 cp 才返回正数；调用方据此决定是否走 legacy data_dir fallback
+
+    Returns:
+        实际 copy 的文件数（0 表示无 source_path → 走 legacy）
+    """
+    task_input_prefix = task_input.rstrip("/") + "/"
+    count = 0
+
+    def _copy_row(sandbox_path_field: str, source_path_field: str, kind: str, row_number: str) -> bool:
+        nonlocal count
+        if not source_path_field or not source_path_field.strip():
+            return False
+        if sandbox_path_field == MANIFEST_NONE_MARKER:
+            # NONE 行走 _materialize_none_manifest，不在此 cp
+            return False
+        dest = sandbox_path_field.replace(SANDBOX_INPUT_PLACEHOLDER, task_input_prefix)
+        source = source_path_field.strip()
+        # filename = basename(source)
+        try:
+            filename = source.rsplit("/", 1)[-1]
+        except Exception:
+            filename = dest.rsplit("/", 1)[-1]
+        # 实际写入 dest（dest 已是绝对路径，含完整 filename）；sortKey == basename(source) 通常成立
+        # 但 spec 保证 sandbox_path 的 basename 跟 source 一致；不一致时 fallback 到 dest 的 basename
+        if filename and not dest.endswith(filename):
+            dest = f"{dest.rsplit('/', 1)[0]}/{filename}"
+        try:
+            _copy_dataset_file(session, Path(source), dest)
+            count += 1
+            _log_in_container(
+                session,
+                task_id,
+                config,
+                f"mf3_source_copy kind={kind} row={row_number} src={source} dest={dest}",
+            )
+            return True
+        except Exception as e:  # noqa: BLE001 — 单文件失败不阻断整个 task
+            logger.warning(
+                "mf3_source_copy 失败：kind=%s row=%s src=%s err=%s",
+                kind, row_number, source, e,
+            )
+            return False
+
+    # paths_dataset.csv 行
+    if paths_dataset_csv.strip():
+        reader = csv.reader(io.StringIO(paths_dataset_csv))
+        for row in reader:
+            if not row:
+                continue
+            if len(row) < 2:
+                continue
+            if row[0].strip() == "agent_run_dataset_id":
+                continue  # header
+            if len(row) < 4:
+                continue
+            _copy_row(row[1], row[3], "dataset", row[0])
+
+    # path_manifest.csv 行（不含 NONE 行）
+    if path_manifest_csv.strip():
+        reader = csv.reader(io.StringIO(path_manifest_csv))
+        for row in reader:
+            if not row:
+                continue
+            if len(row) < 2:
+                continue
+            if row[0].strip() == "agent_run_manifest_id":
+                continue  # header
+            if len(row) < 4:
+                continue
+            _copy_row(row[1], row[3], "manifest", row[0])
+
+    return count
 
 
 def _materialize_agent_run_csvs(
