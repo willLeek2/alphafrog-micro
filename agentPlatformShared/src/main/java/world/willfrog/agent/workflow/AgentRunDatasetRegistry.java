@@ -5,12 +5,12 @@ import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.workflow.DatasetPersistedEvent.PersistedArtifactType;
 
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * 给定 agent run 期间，订阅 {@link DatasetPersistedEvent}，分配「run 级别编号」并维护映射。
@@ -19,11 +19,17 @@ import java.util.concurrent.atomic.AtomicInteger;
  * <ul>
  *   <li>Q3 整个 agent run 期间稳定（同一 datasetId / manifestId 多次出现，编号不变）</li>
  *   <li>Q4 dataset 与 manifest 各自独立递增</li>
- *   <li>Q5 编号按事件到达顺序分配（与 sortKey 字典序等价：单批次内 sortKey 排序 == 到达顺序）</li>
- *   <li>失败幂等：同一 (runId, artifactType, originalId) 多次事件只分配一次编号</li>
+ *   <li>Q5 编号按 sortKey 字典序作为稳定全局序（不是事件到达顺序；
+ *       DAG 并行节点可能乱序到达，sortKey = 落盘文件名 = 字典序全局唯一）</li>
+ *   <li>失败幂等：同一 (runId, artifactType, originalId) 多次事件只入一次</li>
  * </ul>
  *
- * <p>线程安全：所有状态在 {@code ConcurrentMap} 内，{@link AtomicInteger} 保证 counter 单调。
+ * <p>实现要点（260623 Cindy review MF4 改造）：
+ * 内部存储只保留 raw entry（无 number），不立即按到达顺序分配编号。
+ * 编号分配推迟到 {@link #snapshot(String)} 调用时刻：sort by sortKey 后
+ * 按出现顺序递增分配，确保乱序到达的事件也能得到字典序的稳定编号。
+ *
+ * <p>线程安全：所有状态在 {@code ConcurrentMap} 内；putIfAbsent 保证 raw entry 入池幂等。
  */
 @Component
 @Slf4j
@@ -32,7 +38,8 @@ public class AgentRunDatasetRegistry {
     private final ConcurrentMap<String, RunState> runStates = new ConcurrentHashMap<>();
 
     /**
-     * 订阅 01 contract V2 事件。同一 datasetId / manifestId 重复事件会复用首次分配的编号。
+     * 订阅 01 contract V2 事件。同一 datasetId / manifestId 重复事件只入一次（保留 sortKey 首次）。
+     * 编号分配推迟到 snapshot 时（按 sortKey 字典序）。
      */
     @EventListener
     public void onDatasetPersisted(DatasetPersistedEvent event) {
@@ -42,69 +49,74 @@ public class AgentRunDatasetRegistry {
         }
         RunState state = runStates.computeIfAbsent(event.getRunId(), k -> new RunState());
         if (event.getArtifactType() == PersistedArtifactType.DATASET) {
-            assignDataset(state, event);
+            ingestDataset(state, event);
         } else {
-            assignManifest(state, event);
+            ingestManifest(state, event);
         }
     }
 
-    private void assignDataset(RunState state, DatasetPersistedEvent event) {
+    private void ingestDataset(RunState state, DatasetPersistedEvent event) {
         String datasetId = event.getDatasetId();
         if (datasetId == null || datasetId.isBlank()) {
             log.warn("DATASET event missing datasetId, ignored: {}", event);
             return;
         }
-        Integer existing = state.datasetIdToNumber.putIfAbsent(datasetId, Integer.MIN_VALUE);
-        if (existing != null) {
-            log.debug("Dataset already registered, skip re-assign: runId={} datasetId={} number={}",
-                    event.getRunId(), datasetId, existing);
-            return;
-        }
-        int number = state.datasetCounter.incrementAndGet();
-        state.datasetIdToNumber.put(datasetId, number);
-        AgentRunDatasetEntry entry = AgentRunDatasetEntry.forDataset(
-                number, datasetId, event.getPersistedPath(),
-                event.getFromTsCode(), event.getSortKey());
-        AgentRunDatasetEntry prior = state.datasetsByNumber.putIfAbsent(number, entry);
+        RawEntry raw = new RawEntry(
+                datasetId,
+                event.getPersistedPath(),
+                event.getFromTsCode(),
+                event.getSortKey(),
+                List.of(),
+                PersistedArtifactType.DATASET);
+        RawEntry prior = state.rawDatasets.putIfAbsent(datasetId, raw);
         if (prior != null) {
-            log.warn("Dataset number collision: runId={} number={} existing={} new={}",
-                    event.getRunId(), number, prior.originalId(), datasetId);
+            log.debug("Dataset already ingested (raw), skip re-ingest: runId={} datasetId={} sortKey={}",
+                    event.getRunId(), datasetId, prior.sortKey());
+        } else {
+            log.info("Ingested dataset raw entry: runId={} datasetId={} sortKey={}",
+                    event.getRunId(), datasetId, event.getSortKey());
         }
-        log.info("Assigned dataset run-level number: runId={} number={} datasetId={} sortKey={}",
-                event.getRunId(), number, datasetId, event.getSortKey());
     }
 
-    private void assignManifest(RunState state, DatasetPersistedEvent event) {
+    private void ingestManifest(RunState state, DatasetPersistedEvent event) {
         String manifestId = event.getManifestId();
         if (manifestId == null || manifestId.isBlank()) {
             log.warn("MANIFEST event missing manifestId, ignored: {}", event);
             return;
         }
-        Integer existing = state.manifestIdToNumber.putIfAbsent(manifestId, Integer.MIN_VALUE);
-        if (existing != null) {
-            log.debug("Manifest already registered, skip re-assign: runId={} manifestId={} number={}",
-                    event.getRunId(), manifestId, existing);
-            return;
-        }
-        int number = state.manifestCounter.incrementAndGet();
-        state.manifestIdToNumber.put(manifestId, number);
-        AgentRunDatasetEntry entry = AgentRunDatasetEntry.forManifest(
-                number, manifestId, event.getPersistedPath(),
-                event.getFromTsCode(), event.getSortKey(),
-                List.copyOf(event.getRelatedDatasetIds()));
-        AgentRunDatasetEntry prior = state.manifestsByNumber.putIfAbsent(number, entry);
+        List<String> related = event.getRelatedDatasetIds() == null
+                ? List.of()
+                : List.copyOf(event.getRelatedDatasetIds());
+        RawEntry raw = new RawEntry(
+                manifestId,
+                event.getPersistedPath(),
+                event.getFromTsCode(),
+                event.getSortKey(),
+                related,
+                PersistedArtifactType.MANIFEST);
+        RawEntry prior = state.rawManifests.putIfAbsent(manifestId, raw);
         if (prior != null) {
-            log.warn("Manifest number collision: runId={} number={} existing={} new={}",
-                    event.getRunId(), number, prior.originalId(), manifestId);
+            log.debug("Manifest already ingested (raw), skip re-ingest: runId={} manifestId={} sortKey={}",
+                    event.getRunId(), manifestId, prior.sortKey());
+        } else {
+            log.info("Ingested manifest raw entry: runId={} manifestId={} sortKey={} relatedCount={}",
+                    event.getRunId(), manifestId, event.getSortKey(), related.size());
         }
-        log.info("Assigned manifest run-level number: runId={} number={} manifestId={} sortKey={} relatedCount={}",
-                event.getRunId(), number, manifestId, event.getSortKey(),
-                event.getRelatedDatasetIds().size());
     }
 
     /**
-     * 当前 agent run 状态下所有 dataset / manifest 的稳定快照（按 number 升序）。
-     * 每次返回一个新的 immutable snapshot 对象，不暴露内部 mutable 状态。
+     * 当前 agent run 状态下所有 dataset / manifest 的稳定快照。
+     *
+     * <p>编号在 snapshot 时按 sortKey 字典序分配（Cindy MF4 改造）：
+     * <ol>
+     *   <li>把所有 raw dataset entry 按 sortKey 升序排 → 编号 1..N</li>
+     *   <li>把所有 raw manifest entry 按 sortKey 升序排 → 编号 1..M（独立编号空间，Q4）</li>
+     *   <li>用 {@link AgentRunDatasetEntry#forDataset} / {@link AgentRunDatasetEntry#forManifest}
+     *       构造 snapshot entry（保留 number / originalId / sortKey / fromTsCode /
+     *       originalId 形式的 relatedDatasetIds —— MF2 改造会再加一步翻译成 run-level 编号）</li>
+     * </ol>
+     *
+     * <p>每次返回一个新的 immutable snapshot 对象，不暴露内部 mutable 状态。
      */
     public AgentRunDatasetSnapshot snapshot(String runId) {
         if (runId == null || runId.isBlank()) {
@@ -114,66 +126,90 @@ public class AgentRunDatasetRegistry {
         if (state == null) {
             return AgentRunDatasetSnapshot.empty();
         }
-        List<AgentRunDatasetEntry> datasets = state.datasetsByNumber.values().stream()
-                .sorted(Comparator.comparingInt(AgentRunDatasetEntry::number))
+
+        List<RawEntry> sortedDatasets = state.rawDatasets.values().stream()
+                .sorted(Comparator.comparing(RawEntry::sortKey, Comparator.nullsLast(Comparator.naturalOrder())))
                 .toList();
-        List<AgentRunDatasetEntry> manifests = state.manifestsByNumber.values().stream()
-                .sorted(Comparator.comparingInt(AgentRunDatasetEntry::number))
+        List<AgentRunDatasetEntry> datasetEntries = new ArrayList<>(sortedDatasets.size());
+        for (int i = 0; i < sortedDatasets.size(); i++) {
+            int number = i + 1;
+            RawEntry raw = sortedDatasets.get(i);
+            datasetEntries.add(AgentRunDatasetEntry.forDataset(
+                    number, raw.originalId(), raw.persistedPath(),
+                    raw.fromTsCode(), raw.sortKey()));
+        }
+
+        List<RawEntry> sortedManifests = state.rawManifests.values().stream()
+                .sorted(Comparator.comparing(RawEntry::sortKey, Comparator.nullsLast(Comparator.naturalOrder())))
                 .toList();
-        return new AgentRunDatasetSnapshot(datasets, manifests);
+        List<AgentRunDatasetEntry> manifestEntries = new ArrayList<>(sortedManifests.size());
+        for (int i = 0; i < sortedManifests.size(); i++) {
+            int number = i + 1;
+            RawEntry raw = sortedManifests.get(i);
+            AgentRunDatasetEntry mf = AgentRunDatasetEntry.forManifest(
+                    number, raw.originalId(), raw.persistedPath(),
+                    raw.fromTsCode(), raw.sortKey(), raw.relatedDatasetIds());
+            manifestEntries.add(mf);
+        }
+
+        return new AgentRunDatasetSnapshot(datasetEntries, manifestEntries);
     }
 
     public Optional<AgentRunDatasetEntry> findDatasetByNumber(String runId, int number) {
-        RunState state = runStates.get(runId);
-        if (state == null) {
-            return Optional.empty();
-        }
-        return Optional.ofNullable(state.datasetsByNumber.get(number));
+        return snapshot(runId).datasets().stream()
+                .filter(e -> e.number() == number)
+                .findFirst();
     }
 
     public Optional<AgentRunDatasetEntry> findManifestByNumber(String runId, int number) {
-        RunState state = runStates.get(runId);
-        if (state == null) {
-            return Optional.empty();
-        }
-        return Optional.ofNullable(state.manifestsByNumber.get(number));
+        return snapshot(runId).manifests().stream()
+                .filter(e -> e.number() == number)
+                .findFirst();
     }
 
+    /**
+     * 把 raw dataset originalId 翻译成 snapshot 时的 run-level 编号。
+     * O(N) 实现（遍历当前 snapshot）；调用方应优先用 {@link #findDatasetByNumber} 直接查 number。
+     */
     public Optional<Integer> resolveDatasetNumber(String runId, String datasetId) {
-        RunState state = runStates.get(runId);
-        if (state == null) {
+        if (runId == null || runId.isBlank() || datasetId == null) {
             return Optional.empty();
         }
-        Integer n = state.datasetIdToNumber.get(datasetId);
-        return n == null || n == Integer.MIN_VALUE ? Optional.empty() : Optional.of(n);
+        return snapshot(runId).datasets().stream()
+                .filter(e -> datasetId.equals(e.originalId()))
+                .map(AgentRunDatasetEntry::number)
+                .findFirst();
     }
 
+    /**
+     * 把 raw manifest originalId 翻译成 snapshot 时的 run-level 编号。
+     * O(N) 实现（遍历当前 snapshot）；调用方应优先用 {@link #findManifestByNumber} 直接查 number。
+     */
     public Optional<Integer> resolveManifestNumber(String runId, String manifestId) {
-        RunState state = runStates.get(runId);
-        if (state == null) {
+        if (runId == null || runId.isBlank() || manifestId == null) {
             return Optional.empty();
         }
-        Integer n = state.manifestIdToNumber.get(manifestId);
-        return n == null || n == Integer.MIN_VALUE ? Optional.empty() : Optional.of(n);
+        return snapshot(runId).manifests().stream()
+                .filter(e -> manifestId.equals(e.originalId()))
+                .map(AgentRunDatasetEntry::number)
+                .findFirst();
     }
 
     /**
      * 返回当前合法 dataset 编号列表（升序）。用于 Q12 错误反馈：「合法 dataset 编号 = [1,2,3]」。
      */
     public List<Integer> listDatasetNumbers(String runId) {
-        RunState state = runStates.get(runId);
-        if (state == null) {
-            return List.of();
-        }
-        return state.datasetsByNumber.keySet().stream().sorted().toList();
+        return snapshot(runId).datasets().stream()
+                .map(AgentRunDatasetEntry::number)
+                .sorted()
+                .toList();
     }
 
     public List<Integer> listManifestNumbers(String runId) {
-        RunState state = runStates.get(runId);
-        if (state == null) {
-            return List.of();
-        }
-        return state.manifestsByNumber.keySet().stream().sorted().toList();
+        return snapshot(runId).manifests().stream()
+                .map(AgentRunDatasetEntry::number)
+                .sorted()
+                .toList();
     }
 
     public boolean hasRunState(String runId) {
@@ -192,11 +228,21 @@ public class AgentRunDatasetRegistry {
     }
 
     private static final class RunState {
-        final AtomicInteger datasetCounter = new AtomicInteger(0);
-        final AtomicInteger manifestCounter = new AtomicInteger(0);
-        final ConcurrentMap<Integer, AgentRunDatasetEntry> datasetsByNumber = new ConcurrentHashMap<>();
-        final ConcurrentMap<Integer, AgentRunDatasetEntry> manifestsByNumber = new ConcurrentHashMap<>();
-        final ConcurrentMap<String, Integer> datasetIdToNumber = new ConcurrentHashMap<>();
-        final ConcurrentMap<String, Integer> manifestIdToNumber = new ConcurrentHashMap<>();
+        final ConcurrentMap<String, RawEntry> rawDatasets = new ConcurrentHashMap<>();
+        final ConcurrentMap<String, RawEntry> rawManifests = new ConcurrentHashMap<>();
+    }
+
+    /**
+     * 内部 raw entry：事件入池后未分配 number 的形态。
+     * number 推迟到 snapshot 时按 sortKey 字典序分配。
+     */
+    private record RawEntry(
+            String originalId,
+            String persistedPath,
+            String fromTsCode,
+            String sortKey,
+            List<String> relatedDatasetIds,
+            PersistedArtifactType artifactType
+    ) {
     }
 }

@@ -57,6 +57,46 @@ class AgentRunDatasetRegistryTest {
         assertEquals("ds-c", snap.datasets().get(2).originalId());
     }
 
+    /**
+     * MF4 拍板：Q5 sortKey 字典序作为稳定全局序（不是事件到达顺序）。
+     * 故意乱序到达 (b, c, a) → snapshot 编号必须按 sortKey 升序 (a=1, b=2, c=3)。
+     */
+    @Test
+    void outOfOrderArrivalShouldAssignNumbersBySortKeyLexicographic() {
+        registry.onDatasetPersisted(datasetEvent("run-1", "ds-b", "b.csv"));
+        registry.onDatasetPersisted(datasetEvent("run-1", "ds-c", "c.csv"));
+        registry.onDatasetPersisted(datasetEvent("run-1", "ds-a", "a.csv"));
+
+        AgentRunDatasetSnapshot snap = registry.snapshot("run-1");
+        assertEquals(3, snap.datasets().size());
+        // 编号必须按 sortKey 升序：a.csv=1, b.csv=2, c.csv=3
+        assertEquals(1, snap.datasets().get(0).number());
+        assertEquals("a.csv", snap.datasets().get(0).sortKey());
+        assertEquals("ds-a", snap.datasets().get(0).originalId());
+        assertEquals(2, snap.datasets().get(1).number());
+        assertEquals("b.csv", snap.datasets().get(1).sortKey());
+        assertEquals("ds-b", snap.datasets().get(1).originalId());
+        assertEquals(3, snap.datasets().get(2).number());
+        assertEquals("c.csv", snap.datasets().get(2).sortKey());
+        assertEquals("ds-c", snap.datasets().get(2).originalId());
+    }
+
+    /**
+     * MF4 拍板：manifest 编号同样按 sortKey 字典序，与 dataset 编号空间独立（Q4）。
+     */
+    @Test
+    void outOfOrderArrivalShouldAssignManifestNumbersBySortKeyLexicographic() {
+        registry.onDatasetPersisted(manifestEvent("run-1", "m-z", "z.manifest.json", List.of()));
+        registry.onDatasetPersisted(manifestEvent("run-1", "m-a", "a.manifest.json", List.of()));
+
+        AgentRunDatasetSnapshot snap = registry.snapshot("run-1");
+        assertEquals(2, snap.manifests().size());
+        assertEquals(1, snap.manifests().get(0).number());
+        assertEquals("a.manifest.json", snap.manifests().get(0).sortKey());
+        assertEquals(2, snap.manifests().get(1).number());
+        assertEquals("z.manifest.json", snap.manifests().get(1).sortKey());
+    }
+
     @Test
     void datasetAndManifestShouldHaveIndependentNumberSpaces() {
         registry.onDatasetPersisted(datasetEvent("run-1", "ds-a", "a.csv"));
