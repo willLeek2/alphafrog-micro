@@ -1,39 +1,47 @@
-Execute Python code in a secure sandbox.
+Execute Python code in a secure sandbox to analyze datasets or manifests that have already been produced in the current agent run.
 
-INPUTS (REQUIRED):
-- code: Python source code to execute.
-- At least one of dataset_ids or manifest_ids (see IDs section below).
+REQUIRED parameters:
+- code: the Python source code to execute.
+- At least one of dataset_ids or manifest_ids must be non-empty.
 
-INPUTS (OPTIONAL):
-- libraries: comma-separated pip packages, e.g. "numpy,pandas". Prefer preinstalled runtime libs to reduce latency.
+IDs are agent run-level numbers (NOT original datasetId strings):
+- dataset_ids: comma-separated run-level dataset numbers, e.g. "1" or "1,3". Get these from listMyData or from the legal_dataset_numbers list in an ILLEGAL_RUN_LEVEL_IDS error.
+- manifest_ids: comma-separated run-level manifest numbers, e.g. "1" or "1,2". Prefer manifest_ids when the data you need is already grouped into a manifest. Dataset and manifest counters are independent; both start at 1 within the same run.
+- Pass numbers only. If you only have a raw dataset id string or a file path, call listMyData first to resolve it.
+
+OPTIONAL parameters:
+- libraries: comma-separated pip packages, e.g. "numpy,pandas". Prefer preinstalled runtime libraries to reduce latency.
 - timeout_seconds: integer timeout override (default 30).
 
-IDs (agent run-level — see §4 of run-level ID spec):
-- dataset_ids: comma-separated agent run-level dataset numbers (e.g. "1,3"). Get these from listMyData; they are NOT original datasetId strings.
-- manifest_ids: comma-separated agent run-level manifest numbers (e.g. "1"). Dataset and manifest counters are independent — both start at 1 within the same run.
-- Pass numbers, not originalId strings. If you only have an originalId, call listMyData first to resolve it.
+SANDBOX INPUT SURFACE (injected automatically):
+- /sandbox/paths_dataset.csv maps agent_run_dataset_id → sandbox file path + from_ts_code.
+- /sandbox/path_manifest.csv maps agent_run_manifest_id → manifest file path + related_dataset_ids.
+- Manifests with no on-disk file are materialized at <task_input>/_agent_run_manifest_<id>/manifest.json.
+- Read these CSVs in your code, or use the helper: from af_dataset_loader import load_manifest, load_datasets.
 
-SANDBOX INPUT SURFACE (resolved automatically):
-- paths_dataset.csv: maps agent_run_dataset_id → sandbox file path + from_ts_code. Read this CSV in your code to discover dataset paths.
-- path_manifest.csv: maps agent_run_manifest_id → manifest file path + related dataset numbers. Manifests with no on-disk file are materialized at <task_input>/_agent_run_manifest_<id>/manifest.json.
-- Use the Python helper: `from af_dataset_loader import load_manifest, load_datasets`. See examples below.
-
-USAGE EXAMPLES:
-- Single dataset:
-    executePython(code="print(pd.read_csv('/sandbox/...').head())", dataset_ids="1")
-- Manifest cross-ref:
-    executePython(code="from af_dataset_loader import load_manifest; m=load_manifest('1'); print(m.frame.head())", manifest_ids="1")
-- Dataset + manifest in one task:
-    executePython(code="...", dataset_ids="1,2", manifest_ids="1")
-- Library installation:
-    executePython(code="import sklearn; ...", dataset_ids="1", libraries="scikit-learn")
+PYTHON HELPER EXAMPLES:
+- Single dataset by number:
+    from af_dataset_loader import load_datasets
+    df = load_datasets("1")["000300.SH"]
+- Manifest by number:
+    from af_dataset_loader import load_manifest
+    result = load_manifest("1")
+    df = result.frame
+    print(result.failed_members, result.skipped_members)
+- Read CSV indexes directly:
+    import pandas as pd
+    ds_idx = pd.read_csv("/sandbox/paths_dataset.csv")
+    path = ds_idx[ds_idx["agent_run_dataset_id"] == 1].iloc[0]["dataset_file_path"]
+    df = pd.read_csv(path)
 
 RUNTIME (preinstalled, no install needed):
 - numpy==2.4.1, pandas==2.3.3, matplotlib==3.10.8, scipy==1.17.0
 - Service stack: fastapi==0.128.0, uvicorn[standard]==0.40.0, pydantic==2.12.5, llm-sandbox[docker]==0.3.33
 
-ERROR FEEDBACK:
-- MISSING_IDS: dataset_ids and manifest_ids both empty → provide at least one.
+ERROR FEEDBACK AND RECOVERY:
+- MISSING_IDS: dataset_ids and manifest_ids are both empty → provide at least one.
 - RUN_LEVEL_IDS_UNAVAILABLE: no active agent run / registry not wired → wait for run start.
-- ILLEGAL_RUN_LEVEL_IDS: a number is not in the run's legal set → response details list legal_dataset_numbers and legal_manifest_numbers; pass values from those lists.
-- TASK_FAILED / NON_ZERO_EXIT: code raised → fix and retry with the same IDs.
+- ILLEGAL_RUN_LEVEL_IDS: a number is not in the run's legal set → response lists legal_dataset_numbers and legal_manifest_numbers; pass values from those lists. If you are unsure, call listMyData first.
+- TASK_FAILED / NON_ZERO_EXIT: code raised → fix and retry. If you hit this twice due to IDs or paths, stop and call listMyData or switch strategy.
+
+from_ts_code may be UNCERTAIN in paths_dataset.csv; this only means the asset code could not be inferred from the tool arguments, NOT that the data is corrupted.
