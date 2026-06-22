@@ -4,18 +4,43 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.langchain4j.agent.tool.Tool;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.dubbo.config.annotation.DubboReference;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
+import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.util.PromptFileLoader;
+import world.willfrog.agent.workflow.AgentRunDatasetCsvWriter;
+import world.willfrog.agent.workflow.AgentRunDatasetEntry;
+import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
+import world.willfrog.agent.workflow.AgentRunDatasetSnapshot;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 @Component
 @Slf4j
 public class PythonSandboxTools {
+
     private static final int POLL_INTERVAL_MS = 1000;
-    private static final String TOOL_DESCRIPTION = "Execute Python code in a secure sandbox. REQUIRED: code, dataset_ids. "
+
+    /**
+     * 260623-harness-optimization-02: TOOL_DESCRIPTION 文案现在通过 classpath 文件 {@link #TOOL_DESCRIPTION_PATH} 维护（03 owner）。
+     * Java {@code @Tool} annotation 必须是 compile-time 常量，所以下面用 {@link #TOOL_DESCRIPTION_SHORT} 作为
+     * 注入到 LLM 的简短提示语。文件加载的完整长文案通过 {@link #loadToolDescription()} 暴露给其他调用方
+     * （例如 ToolRouter 在做工具描述拼接时），文件不存在时静默回落 {@link #FALLBACK_TOOL_DESCRIPTION}。
+     * 部署阶段 NPE 风险面由 fallback 兜底。
+     */
+    private static final String TOOL_DESCRIPTION_PATH = "prompts/python/execute_python_tool_description.txt";
+
+    private static final String TOOL_DESCRIPTION_SHORT =
+            "Execute Python code in a secure sandbox. See loadToolDescription() for full parameter / mount-path docs.";
+
+    private static final String FALLBACK_TOOL_DESCRIPTION = "Execute Python code in a secure sandbox. REQUIRED: code, dataset_ids. "
             + "OPTIONAL: libraries (comma-separated, e.g. 'numpy,pandas'), timeout_seconds. "
             + "Prefer passing the top-level dataset_id returned by market-data batch tools; when that id is a dataset_manifest, "
             + "the sandbox automatically expands its ready members and mounts the manifest directory plus atomic dataset directories. "
@@ -29,32 +54,130 @@ public class PythonSandboxTools {
             + "Service stack: fastapi==0.128.0, uvicorn[standard]==0.40.0, pydantic==2.12.5, llm-sandbox[docker]==0.3.33. "
             + "Please prioritize using the preinstalled runtime libraries to reduce latency.";
 
+    /**
+     * 暴露给 ToolRouter / 同包注入 / 单元测试的完整描述加载入口。
+     * 先尝试 classpath 文件 {@link #TOOL_DESCRIPTION_PATH}，缺失 / 空白时回落到 {@link #FALLBACK_TOOL_DESCRIPTION}。
+     */
+    public static String loadToolDescription() {
+        String loaded = PromptFileLoader.load(TOOL_DESCRIPTION_PATH);
+        if (loaded == null || loaded.isBlank()) {
+            log.warn("TOOL_DESCRIPTION classpath resource missing: {} — falling back to hardcoded text", TOOL_DESCRIPTION_PATH);
+            return FALLBACK_TOOL_DESCRIPTION;
+        }
+        return loaded;
+    }
+
     @DubboReference
     private PythonSandboxService pythonSandboxService;
 
     private final ObjectMapper objectMapper;
 
+    /**
+     * 260623-harness-optimization-02: 订阅 DatasetPersistedEvent 并提供 run 级别编号转译。
+     * 可选注入（{@code required=false}），便于纯单元测试启动。
+     */
+    @Autowired(required = false)
+    private AgentRunDatasetRegistry agentRunDatasetRegistry;
+
     public PythonSandboxTools(ObjectMapper objectMapper) {
         this.objectMapper = objectMapper;
     }
 
-    @Tool(TOOL_DESCRIPTION)
+    @Tool(TOOL_DESCRIPTION_SHORT)
     public String executePython(String code, String dataset_ids, String libraries, Integer timeout_seconds) {
         try {
-            String[] parsedDatasetIds = parseDatasetIds(dataset_ids);
-            if (parsedDatasetIds.length == 0) {
-                return fail("executePython", "MISSING_DATASET_IDS", "dataset_ids is required and cannot be empty", Map.of());
+            String[] parsedNumbers = parseDatasetIds(dataset_ids);
+            if (parsedNumbers.length == 0) {
+                return fail("executePython", "MISSING_DATASET_IDS",
+                        "dataset_ids is required and cannot be empty", Map.of());
             }
-            String primaryDatasetId = parsedDatasetIds[0];
-            log.info("Executing python task for datasets: primary={}, total={}", primaryDatasetId, parsedDatasetIds.length);
+
+            // 260623-harness-optimization-02: dataset_ids 现在是 agent run 级别编号。
+            // 走 registry 解析为 01 持久化条目（originalId / sortKey / fromTsCode）。
+            // Q12: 非法编号报错并列出合法编号列表。
+            String runId = AgentContext.getRunId();
+            AgentRunDatasetRegistry registry = this.agentRunDatasetRegistry;
+            if (runId == null || runId.isBlank() || registry == null) {
+                return fail("executePython", "RUN_LEVEL_IDS_UNAVAILABLE",
+                        "Agent run-level dataset ids require an active run and AgentRunDatasetRegistry",
+                        Map.of("runId", nvl(runId)));
+            }
+
+            AgentRunDatasetSnapshot snapshot = registry.snapshot(runId);
+            List<Integer> legalDatasetNumbers = registry.listDatasetNumbers(runId);
+            List<Integer> legalManifestNumbers = registry.listManifestNumbers(runId);
+
+            List<AgentRunDatasetEntry> resolvedDatasets = new ArrayList<>();
+            List<AgentRunDatasetEntry> resolvedManifests = new ArrayList<>();
+            List<Map<String, Object>> illegalRefs = new ArrayList<>();
+
+            for (String token : parsedNumbers) {
+                int number;
+                try {
+                    number = Integer.parseInt(token);
+                } catch (NumberFormatException nfe) {
+                    illegalRefs.add(Map.of("input", token, "reason", "not_an_integer"));
+                    continue;
+                }
+                Optional<AgentRunDatasetEntry> ds = registry.findDatasetByNumber(runId, number);
+                if (ds.isPresent()) {
+                    resolvedDatasets.add(ds.get());
+                    continue;
+                }
+                Optional<AgentRunDatasetEntry> mf = registry.findManifestByNumber(runId, number);
+                if (mf.isPresent()) {
+                    resolvedManifests.add(mf.get());
+                    continue;
+                }
+                illegalRefs.add(Map.of(
+                        "input", token,
+                        "reason", "no_dataset_or_manifest_with_this_run_level_number",
+                        "legal_dataset_numbers", legalDatasetNumbers,
+                        "legal_manifest_numbers", legalManifestNumbers
+                ));
+            }
+
+            if (!illegalRefs.isEmpty()) {
+                Map<String, Object> details = new LinkedHashMap<>();
+                details.put("illegal_refs", illegalRefs);
+                details.put("legal_dataset_numbers", legalDatasetNumbers);
+                details.put("legal_manifest_numbers", legalManifestNumbers);
+                return fail("executePython", "ILLEGAL_RUN_LEVEL_IDS",
+                        "Some dataset_ids are not valid run-level numbers; pass values from the legal lists below",
+                        details);
+            }
+
+            // 收集要 mount 的 originalIds（Python 端 sandbox_runner.py 用现有 datasetIds 字段做 mount）
+            List<String> originalIdsToMount = new ArrayList<>();
+            for (AgentRunDatasetEntry ds : resolvedDatasets) {
+                originalIdsToMount.add(ds.originalId());
+            }
+            for (AgentRunDatasetEntry mf : resolvedManifests) {
+                originalIdsToMount.add(mf.originalId());
+            }
+            if (originalIdsToMount.isEmpty()) {
+                return fail("executePython", "EMPTY_RESOLVED_IDS",
+                        "No dataset / manifest resolved from dataset_ids", Map.of());
+            }
+
+            // 构造 snapshot 形态供 CSV writer（只覆盖本 run 当前 sub-selection，避免跟 listMyData 等独立查询混淆）
+            AgentRunDatasetSnapshot subSnapshot = new AgentRunDatasetSnapshot(resolvedDatasets, resolvedManifests);
+            String pathsDatasetCsv = AgentRunDatasetCsvWriter.writePathsDatasetCsv(subSnapshot);
+            String pathManifestCsv = AgentRunDatasetCsvWriter.writePathManifestCsv(snapshot);
+            // paths_dataset.csv 只反映本次 executePython 选中的子集；
+            // path_manifest.csv 反映当前 run 全量 manifest，方便 sandbox 内 manifest cross-ref。
+            // 这是 Q13 snapshot 行为的 Java 形态。
+
+            String primaryOriginalId = originalIdsToMount.get(0);
+            log.info("Executing python task for run-level ids: primary={}, total={}, datasetCount={}, manifestCount={}",
+                    primaryOriginalId, originalIdsToMount.size(), resolvedDatasets.size(), resolvedManifests.size());
 
             ExecuteRequest.Builder requestBuilder = ExecuteRequest.newBuilder()
                     .setCode(nvl(code))
-                    .setDatasetId(primaryDatasetId);
+                    .setDatasetId(primaryOriginalId);
 
-            // Add all datasets (including primary for consistency)
-            for (String datasetId : parsedDatasetIds) {
-                requestBuilder.addDatasetIds(datasetId);
+            for (String oid : originalIdsToMount) {
+                requestBuilder.addDatasetIds(oid);
             }
 
             if (libraries != null && !libraries.isBlank()) {
@@ -69,11 +192,15 @@ public class PythonSandboxTools {
             int timeout = (timeout_seconds != null && timeout_seconds > 0) ? timeout_seconds : 30;
             requestBuilder.setTimeoutSeconds(timeout);
 
+            // 260623-harness-optimization-02: 注入 run-level CSV (Python 端 sandbox_runner.py 替换占位符并落盘)
+            requestBuilder.setPathsDatasetCsv(pathsDatasetCsv);
+            requestBuilder.setPathManifestCsv(pathManifestCsv);
+
             ExecuteResponse createResp = pythonSandboxService.createTask(requestBuilder.build());
             if (createResp.getError() != null && !createResp.getError().isEmpty()) {
                 return fail("executePython", "CREATE_TASK_FAILED", "Failed to create python sandbox task", Map.of(
                         "message", createResp.getError(),
-                        "dataset_id", primaryDatasetId
+                        "dataset_id", primaryOriginalId
                 ));
             }
 
@@ -233,5 +360,13 @@ public class PythonSandboxTools {
                 .replace("\"", "\\\"")
                 .replace("\n", "\\n")
                 .replace("\r", "\\r");
+    }
+
+    /**
+     * 暴露给单测 / 同包注入：构造完成后 setter 注入 registry。
+     * 业务路径走 Spring {@code @Autowired(required=false)}。
+     */
+    void setAgentRunDatasetRegistry(AgentRunDatasetRegistry registry) {
+        this.agentRunDatasetRegistry = registry;
     }
 }
