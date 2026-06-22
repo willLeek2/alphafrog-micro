@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import logging
 import re
 import shlex
@@ -29,8 +30,12 @@ SANDBOX_WORKER_LABELS = {
 # sandbox 端在写入 CSV 前必须替换为实际 task_input 路径。
 SANDBOX_INPUT_PLACEHOLDER = "/__AF_INPUT__/"
 # Java 端在写 path_manifest.csv 时如果 manifest 还没落盘，用此标记（Q7 拍板）。
-# sandbox 端目前按原文保留（行内只有 agent_run 编号，没有 original manifest_id，无法物化）。
+# MF6 (Cindy 拍板 path C): sandbox 端从 paths_dataset.csv 反查 related_dataset_ids 的 from_ts_code,
+# 物化临时 manifest.json 到 <task_input>/_agent_run_manifest_<id>/manifest.json,
+# 然后把 CSV 行内的 NONE 替换为该 temp 路径。完全 derive 自两张现有 CSV，无 side-channel。
 MANIFEST_NONE_MARKER = "NONE"
+# MF6: NONE 行物化产物子目录前缀（与 run_id / agent_run_manifest_id 拼接成 sandbox 内绝对路径）。
+TEMP_MANIFEST_DIR_PREFIX = "_agent_run_manifest_"
 
 
 def _normalize_library_name(library: str) -> str:
@@ -260,21 +265,60 @@ def _materialize_agent_run_csvs(
     paths_dataset_csv: str,
     path_manifest_csv: str,
 ) -> None:
-    """把 Java 端的 run-level CSV（含 /__AF_INPUT__/ placeholder + NONE marker）物化到 sandbox workdir。
+    """把 Java 端的 run-level CSV 物化到 sandbox workdir（Cindy 拍板 path C，260623-02 MF6）。
 
-    1. paths_dataset.csv: 把每行 dataset_file_path 的 placeholder 替换成 task_input，
-       然后写到 {workdir}/paths_dataset.csv。
-    2. path_manifest.csv:
-       - manifest_file_path != NONE 的行：placeholder 替换 + 校验 data_dir 下 <manifest_id>.manifest.json 存在
-       - manifest_file_path == NONE 的行：尝试从 data_dir 物化（manifest_id == agent_run_manifest_id），
-         找不到 warn + skip；行被剔除（None marker 不写入，避免误导 sandbox 内 af_dataset_loader）。
+    输入 CSV 形态（来自 Java AgentRunDatasetCsvWriter）：
+      - paths_dataset.csv: agent_run_dataset_id, dataset_file_path, from_ts_code
+        dataset_file_path 中含 /__AF_INPUT__/ placeholder
+      - path_manifest.csv: agent_run_manifest_id, manifest_file_path, related_dataset_ids
+        manifest_file_path 中含 /__AF_INPUT__/ placeholder 或 NONE marker（Q7 拍板）
+
+    物化规则：
+      1. paths_dataset.csv:
+         - placeholder 替换 → 写到 {workdir}/paths_dataset.csv
+         - 同时在内存里构建 (agent_run_dataset_id → from_ts_code) 映射，供 NONE 行反查
+      2. path_manifest.csv:
+         - manifest_file_path != NONE 的行：placeholder 替换
+         - manifest_file_path == NONE 的行（Q7 拍板）：从 related_dataset_ids（run-level 编号 # 串）
+           在 dataset_by_number 映射里查 from_ts_code，构造最小 manifest schema
+           （Cindy 拍板：manifestId / kind / memberCount / readyCount / failedCount / members），
+           写到 <task_input>/_agent_run_manifest_<id>/manifest.json，
+           再把 CSV 行内的 NONE 替换为该 temp 路径。
+           找不到 related dataset number → member 标 status="broken" + errorCode +
+           errorMessage，但 manifest 仍生成（fail loud, not fail silent）。
+
+    完全 derive 自两张现有 CSV，无 side-channel；CSV 落盘后 sandbox 内
+    af_dataset_loader 看到的全是 run-level 抽象（agent_run_manifest_id, 临时路径）。
     """
     workdir = config.workdir.rstrip("/")
-    # task_input 没有 trailing slash；placeholder 以 "/" 结尾，所以补一个 "/" 让
-    # `/__AF_INPUT__/<id>/<file>` 替换为 `<task_input>/<id>/<file>`。
     task_input_prefix = task_input.rstrip("/") + "/"
 
-    # paths_dataset.csv 直接走 placeholder 替换（行内可能有逗号，但 sandbox 内 af_dataset_loader 用 csv 解析）
+    # 1. 解析 paths_dataset.csv，构建 (run-level number → from_ts_code) 映射
+    #    多 ts_code（"A#B"）取第一个 segment；空 / 纯空白 → UNCERTAIN
+    dataset_by_number: Dict[str, str] = {}
+    if paths_dataset_csv.strip():
+        reader = csv.reader(io.StringIO(paths_dataset_csv))
+        header: List[str] | None = None
+        for row in reader:
+            if not row:
+                continue
+            if header is None:
+                header = row
+                continue
+            if len(row) < 3:
+                logger.warning(
+                    "agent_run paths_dataset.csv 行字段不足，skip: row=%r",
+                    row,
+                )
+                continue
+            number = row[0].strip()
+            raw_ts_code = row[2] or ""
+            if not number:
+                continue
+            first_segment = raw_ts_code.split("#", 1)[0].strip()
+            dataset_by_number[number] = first_segment if first_segment else "UNCERTAIN"
+
+    # 2. placeholder 替换后落盘 paths_dataset.csv
     materialized_ds = paths_dataset_csv.replace(SANDBOX_INPUT_PLACEHOLDER, task_input_prefix)
     if materialized_ds.strip():
         session.copy_to_runtime(
@@ -282,7 +326,7 @@ def _materialize_agent_run_csvs(
             f"{workdir}/paths_dataset.csv",
         )
 
-    # path_manifest.csv 行级处理
+    # 3. path_manifest.csv 行级处理
     materialized_mf_lines: List[str] = []
     if path_manifest_csv.strip():
         reader = csv.reader(io.StringIO(path_manifest_csv))
@@ -292,9 +336,7 @@ def _materialize_agent_run_csvs(
                 continue
             if header is None:
                 header = row
-                # header 也存一份，最终落盘时再决定
                 continue
-            # 列对齐检查（与 AgentRunDatasetCsvWriter.PATH_MANIFEST_HEADER 对齐）
             if len(row) < 3:
                 logger.warning(
                     "agent_run path_manifest.csv 行字段不足，skip: row=%r",
@@ -303,16 +345,16 @@ def _materialize_agent_run_csvs(
                 continue
             agent_run_manifest_id, manifest_file_path_field, related = row[0], row[1], row[2]
             if manifest_file_path_field == MANIFEST_NONE_MARKER:
-                # NONE marker 表示 manifest 元数据已声明但落盘文件未生成（Q7 拍板）。
-                # 行内只含 agent_run 编号（不是 original manifest_id），无法定位 data_dir 物化，
-                # 所以 sandbox 端按 NONE 原文保留（sandbox 内 af_dataset_loader 会给出明确错误）。
-                materialized_mf_lines.append(
-                    ",".join([agent_run_manifest_id, MANIFEST_NONE_MARKER, related])
-                )
-                logger.warning(
-                    "agent_run manifest NONE marker 保留原样（未落盘）：agent_run_manifest_id=%s related=%s",
+                # MF6: 物化 NONE 行 → 临时 manifest.json
+                temp_path = _materialize_none_manifest(
+                    session,
+                    task_input_prefix,
                     agent_run_manifest_id,
                     related,
+                    dataset_by_number,
+                )
+                materialized_mf_lines.append(
+                    ",".join([agent_run_manifest_id, temp_path, related])
                 )
                 continue
             # 正常行：placeholder 替换
@@ -331,25 +373,130 @@ def _materialize_agent_run_csvs(
         )
 
 
-def _try_materialize_none_manifest(
+def _materialize_none_manifest(
     session: SandboxSession,
-    config: SandboxConfig,
-    workdir: str,
-    manifest_id: str,
+    task_input_prefix: str,
+    manifest_number: str,
     related_dataset_ids: str,
-) -> bool:
-    """NONE marker 物化尝试：目前不实现（CSV 行只含 agent_run 编号，没有 original manifest_id）。
+    dataset_by_number: Dict[str, str],
+) -> str:
+    """Q7 + Cindy MF6 path C: 物化 NONE marker → 写临时 manifest.json 到 sandbox 内 task_input。
 
-    保留接口以备后续 Java 端在 CSV 增加 `original_manifest_id` 列后启用。
-    返回 False 表示未物化（sandbox 端将看到 NONE marker 行）。
+    字段来源：
+      - related_dataset_ids 提供 run-level dataset number（#-split）
+      - dataset_by_number 来自 paths_dataset.csv 反查，提供对应 from_ts_code
+
+    Schema（Cindy 拍板）：
+      {
+        "manifestId": "agent-run-manifest-<id>",
+        "kind": "agent_run_manifest",
+        "memberCount": 2,
+        "readyCount": 2,
+        "failedCount": 0,
+        "members": [
+          {"tsCode": "000300.SH", "datasetId": "1", "status": "ready"},
+          ...
+        ]
+      }
+
+    找不到 related dataset number（paths_dataset.csv 中不存在该编号）→ member 标
+    status="broken" + errorCode="MISSING_DATASET_NUMBER" + errorMessage，但 manifest 仍生成
+    （fail loud: 不生成假 ready member，count 进 failedCount）。
+
+    Returns:
+        物化成功：sandbox 内绝对路径（``<task_input>/_agent_run_manifest_<id>/manifest.json``）
+        物化失败（mkdir 失败 / JSON 失败 / copy_to_runtime 失败 / manifest_number 非数字）：返回
+        ``MANIFEST_NONE_MARKER`` 原文，让 sandbox 内 af_dataset_loader 报明确错误。
     """
-    logger.warning(
-        "agent_run manifest NONE marker 物化未启用：agent_run_manifest_id=%s related=%s"
-        "（待 Java 端 CSV 增加 original_manifest_id 列后支持）",
-        manifest_id,
-        related_dataset_ids,
+    safe_id = (manifest_number or "").strip()
+    if not safe_id or not safe_id.isdigit():
+        logger.warning(
+            "agent_run NONE manifest_number 不是数字，跳过物化：manifest_number=%r",
+            manifest_number,
+        )
+        return MANIFEST_NONE_MARKER
+
+    # 解析 related_dataset_ids（#-split，过滤空段）
+    related_numbers: List[str] = [
+        n.strip() for n in (related_dataset_ids or "").split("#") if n and n.strip()
+    ]
+
+    members: List[Dict[str, Any]] = []
+    ready_count = 0
+    failed_count = 0
+    for rel_num in related_numbers:
+        ts_code = dataset_by_number.get(rel_num)
+        if ts_code is None:
+            # 找不到对应 dataset → broken member（Cindy 拍板：不要生成假 ready member）
+            members.append({
+                "tsCode": "UNCERTAIN",
+                "datasetId": rel_num,
+                "status": "broken",
+                "errorCode": "MISSING_DATASET_NUMBER",
+                "errorMessage": (
+                    f"related_dataset_ids 引用了 paths_dataset.csv 中不存在的 "
+                    f"agent_run_dataset_id={rel_num}"
+                ),
+            })
+            failed_count += 1
+        else:
+            members.append({
+                "tsCode": ts_code,
+                "datasetId": rel_num,
+                "status": "ready",
+            })
+            ready_count += 1
+
+    manifest_payload = {
+        "manifestId": f"agent-run-manifest-{safe_id}",
+        "kind": "agent_run_manifest",
+        "memberCount": len(members),
+        "readyCount": ready_count,
+        "failedCount": failed_count,
+        "members": members,
+    }
+
+    # 写临时 manifest.json：先 mkdir（copy_to_runtime 不创建父目录），再 copy_to_runtime
+    temp_dir = f"{task_input_prefix}{TEMP_MANIFEST_DIR_PREFIX}{safe_id}"
+    temp_path = f"{temp_dir}/manifest.json"
+    try:
+        output = session.execute_command(f"mkdir -p {shlex.quote(temp_dir)}")
+        if getattr(output, "exit_code", 0) != 0:
+            stderr = getattr(output, "stderr", "") or ""
+            logger.warning(
+                "agent_run NONE manifest mkdir 失败：path=%s exit=%s stderr=%s",
+                temp_dir, getattr(output, "exit_code", "?"), stderr,
+            )
+            return MANIFEST_NONE_MARKER
+    except Exception as e:  # noqa: BLE001 — sandbox mkdir 容错
+        logger.warning(
+            "agent_run NONE manifest mkdir 异常：path=%s err=%s", temp_dir, e
+        )
+        return MANIFEST_NONE_MARKER
+
+    try:
+        json_bytes = json.dumps(manifest_payload, ensure_ascii=False).encode("utf-8")
+    except (TypeError, ValueError) as e:
+        logger.warning(
+            "agent_run NONE manifest JSON 序列化失败：manifest_number=%s err=%s",
+            safe_id, e,
+        )
+        return MANIFEST_NONE_MARKER
+
+    try:
+        session.copy_to_runtime(json_bytes, temp_path)
+    except Exception as e:  # noqa: BLE001 — sandbox 写入容错
+        logger.warning(
+            "agent_run NONE manifest copy_to_runtime 失败：path=%s err=%s",
+            temp_path, e,
+        )
+        return MANIFEST_NONE_MARKER
+
+    logger.info(
+        "agent_run NONE manifest 物化成功：manifest_id=%s temp_path=%s ready=%s failed=%s",
+        safe_id, temp_path, ready_count, failed_count,
     )
-    return False
+    return temp_path
 
 
 def _cleanup_task_workspace(
