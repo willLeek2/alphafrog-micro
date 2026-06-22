@@ -38,7 +38,13 @@ public class PythonSandboxTools {
     private static final String TOOL_DESCRIPTION_PATH = "prompts/python/execute_python_tool_description.txt";
 
     private static final String TOOL_DESCRIPTION_SHORT =
-            "Execute Python code in a secure sandbox. See loadToolDescription() for full parameter / mount-path docs.";
+            "Execute Python code in a secure sandbox. Inputs: code (required); at least one of "
+            + "dataset_ids / manifest_ids (comma-separated agent run-level numbers from listMyData); "
+            + "libraries (comma-separated, e.g. 'numpy,pandas'); timeout_seconds (default 30). "
+            + "Sandbox input: paths_dataset.csv + path_manifest.csv; use "
+            + "`from af_dataset_loader import load_manifest, load_datasets`. "
+            + "Runtime preinstalled: numpy==2.4.1, pandas==2.3.3, matplotlib==3.10.8, scipy==1.17.0. "
+            + "See loadToolDescription() for full docs (load failure falls back to a hardcoded equivalent).";
 
     private static final String FALLBACK_TOOL_DESCRIPTION = "Execute Python code in a secure sandbox. REQUIRED: code, dataset_ids. "
             + "OPTIONAL: libraries (comma-separated, e.g. 'numpy,pandas'), timeout_seconds. "

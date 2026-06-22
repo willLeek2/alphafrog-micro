@@ -214,12 +214,21 @@ class PythonSandboxToolsTest {
     }
 
     @Test
-    void loadToolDescriptionShouldFallbackWhenResourceMissing() {
-        // 资源路径 prompts/python/execute_python_tool_description.txt 不存在 → 走 fallback
+    void loadToolDescriptionShouldLoadFromClasspathResource() {
+        // 资源路径 prompts/python/execute_python_tool_description.txt 已由 02 owner 维护（cleanup 阶段）
         String desc = PythonSandboxTools.loadToolDescription();
         assertNotNull(desc);
+        assertFalse(desc.isBlank(), "loaded description should not be blank");
         assertTrue(desc.contains("Execute Python code in a secure sandbox"),
-                "fallback description 应该以原句开头; got: " + desc);
+                "description should start with that line; got: " + desc);
+        // 02 spec §5.2: 必须体现 agent run-level dataset_ids / manifest_ids 语义
+        assertTrue(desc.contains("dataset_ids") && desc.contains("manifest_ids"),
+                "description should mention both dataset_ids and manifest_ids; got: " + desc);
+        assertTrue(desc.contains("agent run-level") || desc.contains("run-level"),
+                "description should mention run-level numbering; got: " + desc);
+        // sandbox 输入面明示（paths_dataset.csv / path_manifest.csv）
+        assertTrue(desc.contains("paths_dataset.csv") && desc.contains("path_manifest.csv"),
+                "description should mention both CSV input surfaces; got: " + desc);
     }
 
     @Test
