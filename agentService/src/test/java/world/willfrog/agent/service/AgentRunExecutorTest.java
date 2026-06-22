@@ -25,6 +25,7 @@ import world.willfrog.agent.tools.python.PythonSandboxTools;
 import world.willfrog.agent.tools.rag.RagTools;
 import world.willfrog.agent.tools.search.SearchTools;
 import world.willfrog.agent.platform.event.AgentRunFinalizationService;
+import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
 
 import world.willfrog.agent.workflow.TodoItem;
 import world.willfrog.agent.workflow.TodoPlan;
@@ -98,6 +99,8 @@ class AgentRunExecutorTest {
     private OpenRouterCostService openRouterCostService;
     @Mock
     private AgentRunFinalizationService finalizationService;
+    @Mock
+    private AgentRunDatasetRegistry agentRunDatasetRegistry;
 
     private AgentRunExecutor executor;
 
@@ -127,6 +130,7 @@ class AgentRunExecutorTest {
                 new AgentFinalAnswerParser(new ObjectMapper()),
                 new AgentCitationService(new ObjectMapper()),
                 simpleToolFastPathService,
+                agentRunDatasetRegistry,
                 openRouterCostService,
                 finalizationService,
                 new ThreadPoolTaskExecutor()
