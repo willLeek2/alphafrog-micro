@@ -30,11 +30,15 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
         // 260605-2 §3: gateway-side observability — log entry + RestTemplate duration.
         // We log code length (not content) and counts to keep INFO lines bounded and avoid PII/code leakage.
         int codeLen = request.getCode() == null ? 0 : request.getCode().length();
+        // 260623-harness-optimization-02: pathsDatasetCsv / pathManifestCsv 由 Java 端 AgentRunDatasetRegistry
+        // 生成（含 /__AF_INPUT__/ placeholder + NONE marker），透传到 sandbox runner 做 placeholder 替换 + NONE 物化。
+        int pathsCsvLen = request.getPathsDatasetCsv() == null ? 0 : request.getPathsDatasetCsv().length();
+        int manifestCsvLen = request.getPathManifestCsv() == null ? 0 : request.getPathManifestCsv().length();
         log.info("sandbox.createTask: datasetId={}, datasetIds={}, timeoutSeconds={}, filesCount={}, "
-                        + "librariesCount={}, codeLen={}",
+                        + "librariesCount={}, codeLen={}, pathsCsvLen={}, manifestCsvLen={}",
                 request.getDatasetId(), request.getDatasetIdsList(),
                 request.getTimeoutSeconds(), request.getFilesCount(),
-                request.getLibrariesCount(), codeLen);
+                request.getLibrariesCount(), codeLen, pathsCsvLen, manifestCsvLen);
         try {
             HttpExecuteRequest httpRequest = new HttpExecuteRequest();
             httpRequest.setDataset_id(request.getDatasetId());
@@ -45,6 +49,10 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
             if (request.getTimeoutSeconds() > 0) {
                 httpRequest.setTimeout_seconds(request.getTimeoutSeconds());
             }
+            // CSV 透传：可能为空字符串（agent run 没有 manifest 时 pathManifestCsv 为空），
+            // Python 端必须能区分 "未传" 和 "传了空字符串"，所以这里 setXxx 始终调用（默认值 "" 即可）。
+            httpRequest.setPaths_dataset_csv(request.getPathsDatasetCsv());
+            httpRequest.setPath_manifest_csv(request.getPathManifestCsv());
 
             String endpoint = sandboxUrl + "/tasks";
             long httpStart = System.currentTimeMillis();
@@ -174,6 +182,11 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
         private List<String> files;
         private List<String> libraries;
         private Double timeout_seconds;
+        // 260623-harness-optimization-02: agent run 级 dataset / manifest CSV 注入。
+        // Java 端 AgentRunDatasetRegistry 生成（含 /__AF_INPUT__/ placeholder + NONE marker），
+        // Python 端在 _prepare_task_workspace 替换 placeholder 并把 CSVs 落到 workdir。
+        private String paths_dataset_csv;
+        private String path_manifest_csv;
     }
 
     @Data

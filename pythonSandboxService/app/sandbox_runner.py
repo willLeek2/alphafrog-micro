@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import io
 import logging
 import re
 import shlex
@@ -22,6 +24,13 @@ SANDBOX_WORKER_LABELS = {
     "com.alphafrog.role": "python-sandbox-worker",
     "com.alphafrog.owner": "python-sandbox-service",
 }
+
+# 260623-harness-optimization-02: 与 Java 端 AgentRunDatasetCsvWriter.SANDBOX_INPUT_PLACEHOLDER 对齐。
+# sandbox 端在写入 CSV 前必须替换为实际 task_input 路径。
+SANDBOX_INPUT_PLACEHOLDER = "/__AF_INPUT__/"
+# Java 端在写 path_manifest.csv 时如果 manifest 还没落盘，用此标记（Q7 拍板）。
+# sandbox 端目前按原文保留（行内只有 agent_run 编号，没有 original manifest_id，无法物化）。
+MANIFEST_NONE_MARKER = "NONE"
 
 
 def _normalize_library_name(library: str) -> str:
@@ -171,6 +180,8 @@ def _prepare_task_workspace(
     config: SandboxConfig,
     dataset_id_list: List[str],
     files: List[str] | None,
+    paths_dataset_csv: str | None = None,
+    path_manifest_csv: str | None = None,
 ) -> str:
     """Create task-scoped workspace and copy datasets. Returns the task workspace path."""
     task_workspace = f"{config.workspace_root}/{task_id}"
@@ -226,7 +237,119 @@ def _prepare_task_workspace(
     _copy_runtime_loader_modules(session, config)
     _log_in_container(session, task_id, config, "sandbox_loader_modules_ready")
 
+    # 260623-harness-optimization-02: 把 Java 端 AgentRunDatasetRegistry 生成的 run-level CSV 落到 workdir。
+    # - paths_dataset.csv：caller 选中的 dataset 子集（sub-snapshot）
+    # - path_manifest.csv：当前 run 全量 manifest（用于 sandbox 内 cross-ref）
+    # sandbox 内 af_dataset_loader 用这两份 CSV 解析 agent_run_*_id → 实际路径。
+    if paths_dataset_csv or path_manifest_csv:
+        _materialize_agent_run_csvs(
+            session,
+            config,
+            task_input,
+            paths_dataset_csv or "",
+            path_manifest_csv or "",
+        )
+
     return task_workspace
+
+
+def _materialize_agent_run_csvs(
+    session: SandboxSession,
+    config: SandboxConfig,
+    task_input: str,
+    paths_dataset_csv: str,
+    path_manifest_csv: str,
+) -> None:
+    """把 Java 端的 run-level CSV（含 /__AF_INPUT__/ placeholder + NONE marker）物化到 sandbox workdir。
+
+    1. paths_dataset.csv: 把每行 dataset_file_path 的 placeholder 替换成 task_input，
+       然后写到 {workdir}/paths_dataset.csv。
+    2. path_manifest.csv:
+       - manifest_file_path != NONE 的行：placeholder 替换 + 校验 data_dir 下 <manifest_id>.manifest.json 存在
+       - manifest_file_path == NONE 的行：尝试从 data_dir 物化（manifest_id == agent_run_manifest_id），
+         找不到 warn + skip；行被剔除（None marker 不写入，避免误导 sandbox 内 af_dataset_loader）。
+    """
+    workdir = config.workdir.rstrip("/")
+    # task_input 没有 trailing slash；placeholder 以 "/" 结尾，所以补一个 "/" 让
+    # `/__AF_INPUT__/<id>/<file>` 替换为 `<task_input>/<id>/<file>`。
+    task_input_prefix = task_input.rstrip("/") + "/"
+
+    # paths_dataset.csv 直接走 placeholder 替换（行内可能有逗号，但 sandbox 内 af_dataset_loader 用 csv 解析）
+    materialized_ds = paths_dataset_csv.replace(SANDBOX_INPUT_PLACEHOLDER, task_input_prefix)
+    if materialized_ds.strip():
+        session.copy_to_runtime(
+            materialized_ds.encode("utf-8"),
+            f"{workdir}/paths_dataset.csv",
+        )
+
+    # path_manifest.csv 行级处理
+    materialized_mf_lines: List[str] = []
+    if path_manifest_csv.strip():
+        reader = csv.reader(io.StringIO(path_manifest_csv))
+        header: List[str] | None = None
+        for row in reader:
+            if not row:
+                continue
+            if header is None:
+                header = row
+                # header 也存一份，最终落盘时再决定
+                continue
+            # 列对齐检查（与 AgentRunDatasetCsvWriter.PATH_MANIFEST_HEADER 对齐）
+            if len(row) < 3:
+                logger.warning(
+                    "agent_run path_manifest.csv 行字段不足，skip: row=%r",
+                    row,
+                )
+                continue
+            agent_run_manifest_id, manifest_file_path_field, related = row[0], row[1], row[2]
+            if manifest_file_path_field == MANIFEST_NONE_MARKER:
+                # NONE marker 表示 manifest 元数据已声明但落盘文件未生成（Q7 拍板）。
+                # 行内只含 agent_run 编号（不是 original manifest_id），无法定位 data_dir 物化，
+                # 所以 sandbox 端按 NONE 原文保留（sandbox 内 af_dataset_loader 会给出明确错误）。
+                materialized_mf_lines.append(
+                    ",".join([agent_run_manifest_id, MANIFEST_NONE_MARKER, related])
+                )
+                logger.warning(
+                    "agent_run manifest NONE marker 保留原样（未落盘）：agent_run_manifest_id=%s related=%s",
+                    agent_run_manifest_id,
+                    related,
+                )
+                continue
+            # 正常行：placeholder 替换
+            materialized_path = manifest_file_path_field.replace(
+                SANDBOX_INPUT_PLACEHOLDER, task_input_prefix
+            )
+            materialized_mf_lines.append(
+                ",".join([agent_run_manifest_id, materialized_path, related])
+            )
+    # 只有在至少有 1 行可解析的数据时才写 path_manifest.csv（header-only 没意义）。
+    if materialized_mf_lines and header:
+        materialized_mf = "\n".join([",".join(header), *materialized_mf_lines]) + "\n"
+        session.copy_to_runtime(
+            materialized_mf.encode("utf-8"),
+            f"{workdir}/path_manifest.csv",
+        )
+
+
+def _try_materialize_none_manifest(
+    session: SandboxSession,
+    config: SandboxConfig,
+    workdir: str,
+    manifest_id: str,
+    related_dataset_ids: str,
+) -> bool:
+    """NONE marker 物化尝试：目前不实现（CSV 行只含 agent_run 编号，没有 original manifest_id）。
+
+    保留接口以备后续 Java 端在 CSV 增加 `original_manifest_id` 列后启用。
+    返回 False 表示未物化（sandbox 端将看到 NONE marker 行）。
+    """
+    logger.warning(
+        "agent_run manifest NONE marker 物化未启用：agent_run_manifest_id=%s related=%s"
+        "（待 Java 端 CSV 增加 original_manifest_id 列后支持）",
+        manifest_id,
+        related_dataset_ids,
+    )
+    return False
 
 
 def _cleanup_task_workspace(
@@ -317,6 +440,8 @@ def run_in_open_session(
     libraries: List[str] | None,
     timeout_seconds: float | None,
     *,
+    paths_dataset_csv: str | None = None,
+    path_manifest_csv: str | None = None,
     queue_wait_ms: int | None = None,
     container_id: str | None = None,
     pool_enabled: bool = True,
@@ -346,7 +471,15 @@ def run_in_open_session(
 
     try:
         t_workspace_start = time.monotonic()
-        _prepare_task_workspace(session, task_id, config, dataset_id_list, files)
+        _prepare_task_workspace(
+            session,
+            task_id,
+            config,
+            dataset_id_list,
+            files,
+            paths_dataset_csv=paths_dataset_csv,
+            path_manifest_csv=path_manifest_csv,
+        )
         timings["workspace_prepare_ms"] = int((time.monotonic() - t_workspace_start) * 1000)
 
         _log_in_container(session, task_id, config, "script_start")
@@ -419,6 +552,9 @@ def run_in_sandbox(
     files: List[str] | None,
     libraries: List[str] | None,
     timeout_seconds: float | None,
+    *,
+    paths_dataset_csv: str | None = None,
+    path_manifest_csv: str | None = None,
 ) -> dict:
     timeout = timeout_seconds or config.execution_timeout_seconds
     t0 = time.monotonic()
@@ -437,6 +573,8 @@ def run_in_sandbox(
             files,
             libraries,
             timeout_seconds,
+            paths_dataset_csv=paths_dataset_csv,
+            path_manifest_csv=path_manifest_csv,
             queue_wait_ms=0,
             container_id=container_id,
             pool_enabled=False,
