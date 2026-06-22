@@ -168,10 +168,7 @@ public class DatasetRegistry {
         long now = Instant.now().toEpochMilli();
         long expireAt = ttlSeconds > 0 ? now + ttlSeconds * 1000L : Long.MAX_VALUE;
         // 使用四层路径：database_fetched/<topic>/<tsCode>/<encodedString>/<tsCode>.csv
-        String topic = DatabaseFetchedPathStrategy.resolveTopic(type);
-        String encodedStr = DatabaseFetchedPathStrategy.encodedString(type, tsCode, startDate, endDate, columns);
-        Path datasetDirPath = DatabaseFetchedPathStrategy.resolveDataPath(
-                Paths.get(databaseFetchedPath), topic, tsCode, encodedStr);
+        Path datasetDirPath = resolveDatasetDir(databaseFetchedPath, type, tsCode, startDate, endDate, columns);
         // meta.path = directory (for cleanup walking); event.getPersistedPath() = file (for 02 sandbox)
         String datasetDir = datasetDirPath.toAbsolutePath().toString();
 
@@ -618,6 +615,20 @@ public class DatasetRegistry {
                     manifestJsonPath, e.getMessage());
             return List.of();
         }
+    }
+
+    /**
+     * Shared helper: compute the 4-layer dataset directory path from clean type.
+     * Package-private so tests can call the exact same method registry uses when
+     * constructing {@code persistedPath} for {@link DatasetPersistedEvent}.
+     * Both {@link #registerDataset} and the event publish code path go through this.
+     */
+    static Path resolveDatasetDir(String databaseFetchedPath, String type, String tsCode,
+                                   String startDate, String endDate, List<String> columns) {
+        String topic = DatabaseFetchedPathStrategy.resolveTopic(type);
+        String encodedStr = DatabaseFetchedPathStrategy.encodedString(type, tsCode, startDate, endDate, columns);
+        return DatabaseFetchedPathStrategy.resolveDataPath(
+                Paths.get(databaseFetchedPath), topic, tsCode, encodedStr);
     }
 
     private String buildQueryKey(String type, String tsCode, String startDate, String endDate, List<String> columns) {

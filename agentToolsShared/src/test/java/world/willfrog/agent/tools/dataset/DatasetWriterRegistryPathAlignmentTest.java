@@ -154,8 +154,8 @@ class DatasetWriterRegistryPathAlignmentTest {
     }
 
     @Test
-    @DisplayName("实际写盘文件路径 = registry persistedPath 公式结果 — 端到端一致性")
-    void actualWrittenFilePathMatchesRegistryPersistedPathFormula() throws Exception {
+    @DisplayName("实际写盘文件路径 = 调用 DatasetRegistry.resolveDatasetDir 的结果")
+    void actualWrittenFilePathMatchesRegistryResolvedPath() throws Exception {
         String type = "stock_daily";
         String tsCode = "600000.SH";
         String start = "20240101";
@@ -174,23 +174,19 @@ class DatasetWriterRegistryPathAlignmentTest {
                 .orElseThrow();
         String actualFilePath = actualCsv.toAbsolutePath().toString();
 
-        // Compute what registry would use for the event's persistedPath
-        // (DatasetRegistry.registerDataset L172-175 + event publishing L206-209)
-        String registryTopic = DatabaseFetchedPathStrategy.resolveTopic(type);
-        String registryEncoded = DatabaseFetchedPathStrategy.encodedString(type, tsCode, start, end, columns);
-        Path registryDir = DatabaseFetchedPathStrategy.resolveDataPath(dbRoot, registryTopic, tsCode, registryEncoded);
+        // Call the SAME helper registry.registerDataset calls internally
+        // to compute the event persistedPath — not a copy of the formula
+        Path registryDir = DatasetRegistry.resolveDatasetDir(
+                dbRoot.toString(), type, tsCode, start, end, columns);
         String registryFileName = tsCode.replaceAll("[^a-zA-Z0-9.]", "_") + ".csv";
         String registryPersistedPath = registryDir.resolve(registryFileName).toAbsolutePath().toString();
 
-        // THE KEY ASSERTION: writer's actual file == registry's persistedPath formula
         assertEquals(registryPersistedPath, actualFilePath,
-                "registry persistedPath formula must produce the same path as writer's actual file");
+                "registry's own resolveDatasetDir + <tsCode>.csv must match writer's actual file");
 
-        // Verify the file really exists at the registry-computed path
         assertTrue(Files.exists(Path.of(registryPersistedPath)),
                 "file must exist at registry-computed persistedPath");
 
-        // Verify CSV content is readable
         String content = Files.readString(Path.of(registryPersistedPath));
         assertTrue(content.contains("open,high,low,close"));
         assertTrue(content.contains("20240101"));
