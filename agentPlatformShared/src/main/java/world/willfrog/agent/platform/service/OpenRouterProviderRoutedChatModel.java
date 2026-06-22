@@ -257,9 +257,9 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
             // agent 语义重试会重新让模型思考，而 HTTP retry 只是同一份请求体重发。
             // 因此 retry 次数由 run budget 单独限制，避免一个 LLM step 因 provider 抖动
             // 消耗过多 wall-clock。
-            int maxAttempts = budgetService == null ? 3 : budgetService.maxHttpAttemptsPerLogicalCall();
+            LlmRequestRetryPolicy retryPolicy = resolveRetryPolicy();
             AttemptResult attemptResult = sendWithRetry(requestJson, requestUrl, apiKey, customHeaders,
-                    shouldCapture, requestStartedAt, maxAttempts, requestTimeout);
+                    shouldCapture, requestStartedAt, retryPolicy, requestTimeout);
             attempts = attemptResult.attempts();
             HttpResponse<java.io.InputStream> httpResponse = attemptResult.response();
             responseRecord = attemptResult.responseRecord();
@@ -538,7 +538,7 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
                                         Map<String, String> customHeaders,
                                         boolean shouldCapture,
                                         long logicalStartedAt,
-                                        int maxAttempts,
+                                        LlmRequestRetryPolicy retryPolicy,
                                         Duration requestTimeout) throws IOException, InterruptedException {
         /*
          * 这里把多个 HTTP attempt 包装成一个 AttemptResult 返回给 doChat。
@@ -556,7 +556,10 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
         RawHttpLogger.HttpResponseRecord lastResponseRecord = null;
         String lastErrorBody = null;
         int lastStatusCode = -1;
-        int cappedAttempts = Math.max(1, maxAttempts);
+        LlmRequestRetryPolicy effectivePolicy = retryPolicy == null
+                ? LlmRequestRetryPolicy.withMaxRetries(null)
+                : retryPolicy;
+        int cappedAttempts = effectivePolicy.maxAttempts();
 
         // 当前请求体（可能在重试时被修改）和 provider 顺序
         String currentRequestJson = requestJson;
@@ -565,6 +568,7 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
         boolean isOpenRouter = isOpenRouterEndpoint(baseUrl);
 
         for (int attempt = 1; attempt <= cappedAttempts; attempt++) {
+            effectivePolicy.checkAttemptBudget(attempt);
             if (budgetService != null) {
                 // HTTP attempt 预算和 LLM call 预算分开：一次逻辑 LLM 调用可能因为网络/供应商抖动重发。
                 // 如果不单独计数，单个 LLM step 可能在 provider 层消耗过多时间而业务层看不出来。
@@ -629,9 +633,9 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
                     lastResponseRecord = httpLogger.recordResponse(
                             status, responseHeaders, body, System.currentTimeMillis() - logicalStartedAt);
                 }
-                attemptMeta.put("retryable", isRetryableStatus(status));
+                attemptMeta.put("retryable", effectivePolicy.isRetryableStatus(status));
                 attemptMeta.put("error", OpenAiCompatibleChatModelSupport.shorten(body));
-                if (!isRetryableStatus(status) || attempt >= cappedAttempts) {
+                if (!effectivePolicy.shouldRetryStatus(status, attempt)) {
                     // 不可重试状态或次数耗尽时，把最后一次 HTTP response 连同 attempts 返回，
                     // doChat 统一转换成异常观测和 LLM_CALL_FINISHED(error) 事件。
                     return new AttemptResult(httpResponse, lastResponseRecord, status, body, attempts);
@@ -643,22 +647,20 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
                 attemptMeta.put("attempt", attempt);
                 attemptMeta.put("durationMs", attemptDuration);
                 attemptMeta.put("timeoutSeconds", requestTimeout.toSeconds());
-                attemptMeta.put("retryable", true);
+                attemptMeta.put("retryable", effectivePolicy.isRetryableException(e));
                 attemptMeta.put("error", e.getClass().getSimpleName() + ": " + e.getMessage());
                 if (currentProviderOrder != null) {
                     attemptMeta.put("providerOrder", currentProviderOrder);
                 }
                 attempts.add(attemptMeta);
-                if (attempt >= cappedAttempts) {
+                if (!effectivePolicy.shouldRetryException(e, attempt)) {
                     // IOException 没有 HTTP status，也可能没有 response record。
                     // 仍然返回 AttemptResult，是为了让 observability 展示完整 attempts，而不是只看到最后异常。
                     return new AttemptResult(null, lastResponseRecord, -1,
                             e.getClass().getSimpleName() + ": " + e.getMessage(), attempts);
                 }
             }
-            // 固定短等待，避免 provider 瞬时抖动时立即打满同一个后端。
-            // 这里不做指数退避，是因为 agent run 本身有 wall-clock 预算，重试窗口必须可预期。
-            sleepBeforeRetry();
+            effectivePolicy.sleepBeforeRetry(attempt);
         }
         if (lastException instanceof IOException ioException) {
             throw ioException;
@@ -729,16 +731,37 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
         }
     }
 
-    private boolean isRetryableStatus(int status) {
-        return status == 408 || status == 429 || (status >= 500 && status <= 599);
-    }
-
-    private void sleepBeforeRetry() throws InterruptedException {
-        Thread.sleep(2000L);
-    }
-
     private Duration resolveRequestTimeout() {
         return resolveRequestTimeout(AgentContext.getStage(), AgentContext.getPhase());
+    }
+
+    private LlmRequestRetryPolicy resolveRetryPolicy() {
+        AgentLlmProperties.Request requestConfig = resolveRequestConfig();
+        return LlmRequestRetryPolicy.withConfig(
+                resolveRequestMaxRetries(requestConfig),
+                requestConfig == null ? null : requestConfig.getRetry()
+        );
+    }
+
+    private Integer resolveRequestMaxRetries(AgentLlmProperties.Request requestConfig) {
+        Integer configured = requestConfig == null ? null : requestConfig.getMaxRetries();
+        if (configured != null && configured >= 0) {
+            return configured;
+        }
+        if (budgetService != null) {
+            return Math.max(0, budgetService.maxHttpAttemptsPerLogicalCall() - 1);
+        }
+        return LlmRequestRetryPolicy.DEFAULT_MAX_RETRIES;
+    }
+
+    private AgentLlmProperties.Request resolveRequestConfig() {
+        if (localConfigLoader == null) {
+            return null;
+        }
+        return localConfigLoader.current()
+                .map(AgentLlmProperties::getRuntime)
+                .map(AgentLlmProperties.Runtime::getRequest)
+                .orElse(null);
     }
 
     public static Duration resolveRequestTimeout(String stageValue, String phaseValue) {

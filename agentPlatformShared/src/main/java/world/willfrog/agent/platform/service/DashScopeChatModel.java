@@ -54,7 +54,6 @@ public class DashScopeChatModel implements ChatModel {
             .connectTimeout(Duration.ofSeconds(45))
             .build();
     private static final int DEFAULT_THINKING_BUDGET = 38912;
-    private static final int DEFAULT_HTTP_ATTEMPTS_PER_LOGICAL_CALL = 3;
     private static final Duration STREAM_IDLE_TIMEOUT = Duration.ofSeconds(25);
 
     private final ObjectMapper objectMapper;
@@ -152,11 +151,9 @@ public class DashScopeChatModel implements ChatModel {
 
             emitLlmCallStarted(llmTraceId, useStream);
             liveEventStarted = true;
-            int maxAttempts = budgetService == null
-                    ? DEFAULT_HTTP_ATTEMPTS_PER_LOGICAL_CALL
-                    : budgetService.maxHttpAttemptsPerLogicalCall();
+            LlmRequestRetryPolicy retryPolicy = resolveRetryPolicy();
             AttemptResult attemptResult = sendWithRetry(httpRequestBuilder, shouldCapture, requestRecord, requestStartedAt,
-                    maxAttempts, requestTimeout);
+                    retryPolicy, requestTimeout);
             attempts = attemptResult.attempts();
             HttpResponse<java.io.InputStream> httpResponse = attemptResult.response();
 
@@ -341,14 +338,18 @@ public class DashScopeChatModel implements ChatModel {
                                         boolean shouldCapture,
                                         RawHttpLogger.HttpRequestRecord requestRecord,
                                         long logicalStartedAt,
-                                        int maxAttempts,
+                                        LlmRequestRetryPolicy retryPolicy,
                                         Duration requestTimeout) throws IOException, InterruptedException {
         List<Map<String, Object>> attempts = new ArrayList<>();
         RawHttpLogger.HttpResponseRecord lastResponseRecord = null;
         String lastErrorBody = null;
         int lastStatusCode = -1;
-        int cappedAttempts = Math.max(1, maxAttempts);
+        LlmRequestRetryPolicy effectivePolicy = retryPolicy == null
+                ? LlmRequestRetryPolicy.withMaxRetries(null)
+                : retryPolicy;
+        int cappedAttempts = effectivePolicy.maxAttempts();
         for (int attempt = 1; attempt <= cappedAttempts; attempt++) {
+            effectivePolicy.checkAttemptBudget(attempt);
             if (budgetService != null) {
                 budgetService.checkHttpAttempt(attempt);
             }
@@ -383,9 +384,9 @@ public class DashScopeChatModel implements ChatModel {
                     lastResponseRecord = httpLogger.recordResponse(
                             status, responseHeaders, body, System.currentTimeMillis() - logicalStartedAt);
                 }
-                attemptMeta.put("retryable", isRetryableStatus(status));
+                attemptMeta.put("retryable", effectivePolicy.isRetryableStatus(status));
                 attemptMeta.put("error", OpenAiCompatibleChatModelSupport.shorten(body));
-                if (!isRetryableStatus(status) || attempt >= cappedAttempts) {
+                if (!effectivePolicy.shouldRetryStatus(status, attempt)) {
                     return new AttemptResult(httpResponse, lastResponseRecord, status, body, attempts);
                 }
             } catch (IOException e) {
@@ -394,25 +395,17 @@ public class DashScopeChatModel implements ChatModel {
                 attemptMeta.put("attempt", attempt);
                 attemptMeta.put("durationMs", attemptDuration);
                 attemptMeta.put("timeoutSeconds", requestTimeout.toSeconds());
-                attemptMeta.put("retryable", true);
+                attemptMeta.put("retryable", effectivePolicy.isRetryableException(e));
                 attemptMeta.put("error", e.getClass().getSimpleName() + ": " + e.getMessage());
                 attempts.add(attemptMeta);
-                if (attempt >= cappedAttempts) {
+                if (!effectivePolicy.shouldRetryException(e, attempt)) {
                     return new AttemptResult(null, lastResponseRecord, -1,
                             e.getClass().getSimpleName() + ": " + e.getMessage(), attempts);
                 }
             }
-            sleepBeforeRetry();
+            effectivePolicy.sleepBeforeRetry(attempt);
         }
         return new AttemptResult(null, lastResponseRecord, lastStatusCode, lastErrorBody, attempts);
-    }
-
-    private boolean isRetryableStatus(int status) {
-        return status == 408 || status == 429 || (status >= 500 && status <= 599);
-    }
-
-    private void sleepBeforeRetry() throws InterruptedException {
-        Thread.sleep(2000L);
     }
 
     private record AttemptResult(
@@ -422,6 +415,35 @@ public class DashScopeChatModel implements ChatModel {
             String errorBody,
             List<Map<String, Object>> attempts
     ) {
+    }
+
+    private LlmRequestRetryPolicy resolveRetryPolicy() {
+        AgentLlmProperties.Request requestConfig = resolveRequestConfig();
+        return LlmRequestRetryPolicy.withConfig(
+                resolveRequestMaxRetries(requestConfig),
+                requestConfig == null ? null : requestConfig.getRetry()
+        );
+    }
+
+    private Integer resolveRequestMaxRetries(AgentLlmProperties.Request requestConfig) {
+        Integer configured = requestConfig == null ? null : requestConfig.getMaxRetries();
+        if (configured != null && configured >= 0) {
+            return configured;
+        }
+        if (budgetService != null) {
+            return Math.max(0, budgetService.maxHttpAttemptsPerLogicalCall() - 1);
+        }
+        return LlmRequestRetryPolicy.DEFAULT_MAX_RETRIES;
+    }
+
+    private AgentLlmProperties.Request resolveRequestConfig() {
+        if (localConfigLoader == null) {
+            return null;
+        }
+        return localConfigLoader.current()
+                .map(AgentLlmProperties::getRuntime)
+                .map(AgentLlmProperties.Runtime::getRequest)
+                .orElse(null);
     }
 
     private String reportLlmCall(

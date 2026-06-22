@@ -145,6 +145,8 @@ public class AgentLlmProperties {
     public static class Agent {
         @JsonAlias({"call-raw-content", "call_raw_content"})
         private CallRawContent callRawContent = new CallRawContent();
+        private Workspace workspace = new Workspace();
+        private Dataset dataset = new Dataset();
 
         public CallRawContent getCallRawContent() {
             return callRawContent;
@@ -152,6 +154,22 @@ public class AgentLlmProperties {
 
         public void setCallRawContent(CallRawContent callRawContent) {
             this.callRawContent = callRawContent == null ? new CallRawContent() : callRawContent;
+        }
+
+        public Workspace getWorkspace() {
+            return workspace;
+        }
+
+        public void setWorkspace(Workspace workspace) {
+            this.workspace = workspace == null ? new Workspace() : workspace;
+        }
+
+        public Dataset getDataset() {
+            return dataset;
+        }
+
+        public void setDataset(Dataset dataset) {
+            this.dataset = dataset == null ? new Dataset() : dataset;
         }
     }
 
@@ -168,12 +186,55 @@ public class AgentLlmProperties {
         }
     }
 
+    public static class Workspace {
+        private Dump dump = new Dump();
+
+        public Dump getDump() {
+            return dump;
+        }
+
+        public void setDump(Dump dump) {
+            this.dump = dump == null ? new Dump() : dump;
+        }
+    }
+
+    public static class Dump {
+        @JsonAlias({"ttl-hours", "ttl_hours"})
+        private Integer ttlHours;
+
+        public Integer getTtlHours() {
+            return ttlHours;
+        }
+
+        public void setTtlHours(Integer ttlHours) {
+            this.ttlHours = ttlHours;
+        }
+    }
+
+    public static class Dataset {
+        @JsonAlias({"ttl-hours", "ttl_hours"})
+        private Integer ttlHours;
+
+        public Integer getTtlHours() {
+            return ttlHours;
+        }
+
+        public void setTtlHours(Integer ttlHours) {
+            this.ttlHours = ttlHours;
+        }
+    }
+
     /**
      * Tool-level feature toggles that must hot-reload from agent-llm.json.
      */
     public static class Tools {
         @JsonAlias({"market-data", "market_data"})
         private MarketData marketData = new MarketData();
+        private ToolResult result = new ToolResult();
+        private ToolSummary summary = new ToolSummary();
+        private ToolReread reread = new ToolReread();
+        @JsonAlias({"raw-ref", "raw_ref"})
+        private ToolRawRef rawRef = new ToolRawRef();
 
         public MarketData getMarketData() {
             return marketData;
@@ -181,6 +242,110 @@ public class AgentLlmProperties {
 
         public void setMarketData(MarketData marketData) {
             this.marketData = marketData == null ? new MarketData() : marketData;
+        }
+
+        public ToolResult getResult() {
+            return result;
+        }
+
+        public void setResult(ToolResult result) {
+            this.result = result == null ? new ToolResult() : result;
+        }
+
+        public ToolSummary getSummary() {
+            return summary;
+        }
+
+        public void setSummary(ToolSummary summary) {
+            this.summary = summary == null ? new ToolSummary() : summary;
+        }
+
+        public ToolReread getReread() {
+            return reread;
+        }
+
+        public void setReread(ToolReread reread) {
+            this.reread = reread == null ? new ToolReread() : reread;
+        }
+
+        public ToolRawRef getRawRef() {
+            return rawRef;
+        }
+
+        public void setRawRef(ToolRawRef rawRef) {
+            this.rawRef = rawRef == null ? new ToolRawRef() : rawRef;
+        }
+    }
+
+    public static class ToolResult {
+        @JsonAlias({"max-string-length", "max_string_length"})
+        private Integer maxStringLength;
+        @JsonAlias({"summary-model", "summary_model"})
+        private String summaryModel;
+        @JsonAlias({"summary-endpoint", "summary_endpoint"})
+        private String summaryEndpoint;
+
+        public Integer getMaxStringLength() {
+            return maxStringLength;
+        }
+
+        public void setMaxStringLength(Integer maxStringLength) {
+            this.maxStringLength = maxStringLength;
+        }
+
+        public String getSummaryModel() {
+            return summaryModel;
+        }
+
+        public void setSummaryModel(String summaryModel) {
+            this.summaryModel = summaryModel;
+        }
+
+        public String getSummaryEndpoint() {
+            return summaryEndpoint;
+        }
+
+        public void setSummaryEndpoint(String summaryEndpoint) {
+            this.summaryEndpoint = summaryEndpoint;
+        }
+    }
+
+    public static class ToolSummary {
+        @JsonAlias({"max-retries", "max_retries"})
+        private Integer maxRetries;
+
+        public Integer getMaxRetries() {
+            return maxRetries;
+        }
+
+        public void setMaxRetries(Integer maxRetries) {
+            this.maxRetries = maxRetries;
+        }
+    }
+
+    public static class ToolReread {
+        @JsonAlias({"max-limit", "max_limit"})
+        private Integer maxLimit;
+
+        public Integer getMaxLimit() {
+            return maxLimit;
+        }
+
+        public void setMaxLimit(Integer maxLimit) {
+            this.maxLimit = maxLimit;
+        }
+    }
+
+    public static class ToolRawRef {
+        @JsonAlias({"ttl-hours", "ttl_hours"})
+        private Integer ttlHours;
+
+        public Integer getTtlHours() {
+            return ttlHours;
+        }
+
+        public void setTtlHours(Integer ttlHours) {
+            this.ttlHours = ttlHours;
         }
     }
 
@@ -398,6 +563,7 @@ public class AgentLlmProperties {
         private MultiTurn multiTurn = new MultiTurn();
         private RunBudget runBudget = new RunBudget();
         private FinalAnswerStage finalAnswer = new FinalAnswerStage();
+        private Request request = new Request();
 
         public Resume getResume() {
             return resume;
@@ -477,6 +643,79 @@ public class AgentLlmProperties {
 
         public void setFinalAnswer(FinalAnswerStage finalAnswer) {
             this.finalAnswer = finalAnswer == null ? new FinalAnswerStage() : finalAnswer;
+        }
+
+        public Request getRequest() {
+            return request;
+        }
+
+        public void setRequest(Request request) {
+            this.request = request == null ? new Request() : request;
+        }
+    }
+
+    public static class Request {
+        @JsonAlias({"max-retries", "max_retries"})
+        private Integer maxRetries;
+        private Retry retry = new Retry();
+
+        public Integer getMaxRetries() {
+            return maxRetries;
+        }
+
+        public void setMaxRetries(Integer maxRetries) {
+            this.maxRetries = maxRetries;
+        }
+
+        public Retry getRetry() {
+            return retry;
+        }
+
+        public void setRetry(Retry retry) {
+            this.retry = retry == null ? new Retry() : retry;
+        }
+    }
+
+    public static class Retry {
+        @JsonAlias({"backoff-type", "backoff_type"})
+        private String backoffType;
+        @JsonAlias({"base-delay-ms", "base_delay_ms"})
+        private Long baseDelayMs;
+        @JsonAlias({"max-delay-ms", "max_delay_ms"})
+        private Long maxDelayMs;
+        @JsonAlias({"jitter-ms", "jitter_ms"})
+        private Long jitterMs;
+
+        public String getBackoffType() {
+            return backoffType;
+        }
+
+        public void setBackoffType(String backoffType) {
+            this.backoffType = backoffType;
+        }
+
+        public Long getBaseDelayMs() {
+            return baseDelayMs;
+        }
+
+        public void setBaseDelayMs(Long baseDelayMs) {
+            this.baseDelayMs = baseDelayMs;
+        }
+
+        public Long getMaxDelayMs() {
+            return maxDelayMs;
+        }
+
+        public void setMaxDelayMs(Long maxDelayMs) {
+            this.maxDelayMs = maxDelayMs;
+        }
+
+        public Long getJitterMs() {
+            return jitterMs;
+        }
+
+        public void setJitterMs(Long jitterMs) {
+            this.jitterMs = jitterMs;
         }
     }
 

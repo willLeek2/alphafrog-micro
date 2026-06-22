@@ -14,6 +14,7 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ScanOptions;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
+import world.willfrog.agent.platform.artifact.PersistentArtifactRegistry;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 import world.willfrog.alphafrogmicro.common.utils.DateConvertUtils;
@@ -61,6 +62,9 @@ public class DatasetRegistry {
 
     @Autowired(required = false)
     private AgentLlmLocalConfigLoader localConfigLoader;
+
+    @Autowired(required = false)
+    private PersistentArtifactRegistry artifactRegistry;
 
     public DatasetRegistry(StringRedisTemplate redisTemplate) {
         this.redisTemplate = redisTemplate;
@@ -177,6 +181,7 @@ public class DatasetRegistry {
         try {
             redisTemplate.opsForValue().set(metaKey, objectMapper.writeValueAsString(meta));
             redisTemplate.opsForSet().add(indexKey(type, tsCode), queryKey);
+            registerPersistentArtifacts(meta);
         } catch (JsonProcessingException e) {
             log.error("Failed to serialize dataset meta: {}", datasetId, e);
         }
@@ -482,6 +487,50 @@ public class DatasetRegistry {
         } catch (IOException e) {
             log.warn("Failed to walk dataset dir {}", dir, e);
         }
+    }
+
+    private void registerPersistentArtifacts(DatasetMeta meta) {
+        if (artifactRegistry == null || meta == null || meta.getDatasetId() == null || meta.getDatasetId().isBlank()) {
+            return;
+        }
+        long ttlHours = resolveDatasetTtlHours(meta.getTtlSeconds());
+        try {
+            artifactRegistry.registerExternal(
+                    "dataset",
+                    meta.getDatasetId(),
+                    meta.getType(),
+                    Paths.get(meta.getPath()).toAbsolutePath().normalize(),
+                    ttlHours,
+                    false
+            );
+            artifactRegistry.registerExternal(
+                    "dataset-symlink",
+                    meta.getDatasetId(),
+                    "compat_symlink",
+                    Paths.get(datasetPath, meta.getDatasetId()).toAbsolutePath().normalize(),
+                    ttlHours,
+                    true
+            );
+        } catch (Exception e) {
+            log.warn("Failed to register dataset persistent artifacts for {}: {}",
+                    meta.getDatasetId(), e.getMessage());
+        }
+    }
+
+    private long resolveDatasetTtlHours(long metaTtlSeconds) {
+        Integer configured = localConfigLoader == null ? null : localConfigLoader.current()
+                .map(AgentLlmProperties::getAgent)
+                .map(AgentLlmProperties.Agent::getDataset)
+                .map(AgentLlmProperties.Dataset::getTtlHours)
+                .orElse(null);
+        if (configured != null && configured > 0) {
+            return configured;
+        }
+        long seconds = metaTtlSeconds > 0 ? metaTtlSeconds : ttlSeconds;
+        if (seconds <= 0) {
+            return 12L;
+        }
+        return Math.max(1L, (seconds + 3599L) / 3600L);
     }
 
     private String metaKey(String queryKey) {

@@ -1,7 +1,9 @@
 package world.willfrog.agent.platform.service;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -14,6 +16,7 @@ import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.alphafrogmicro.common.config.ConfigLoadStateReporter;
 import world.willfrog.alphafrogmicro.common.utils.PlaceholderResolver;
 
+import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -123,7 +126,9 @@ public class AgentLlmLocalConfigLoader {
                 }
                 try (InputStream in = Files.newInputStream(path)) {
                     byte[] bytes = in.readAllBytes();
-                    AgentLlmProperties parsed = objectMapper.readValue(bytes, AgentLlmProperties.class);
+                    JsonNode tree = objectMapper.readTree(bytes);
+                    tree = preprocessAliasTree(tree);
+                    AgentLlmProperties parsed = objectMapper.treeToValue(tree, AgentLlmProperties.class);
                     PlaceholderResolver.resolve(parsed);
                     AgentLlmProperties sanitized = sanitize(parsed);
                     Map<String, Long> promptFileTimes = resolvePromptFiles(sanitized, resolvePromptBaseDir(path));
@@ -148,7 +153,7 @@ public class AgentLlmLocalConfigLoader {
                             sanitized.getModels().size(),
                             endpointModels);
                 }
-            } catch (Exception e) {
+            } catch (IOException e) {
                 log.error("Failed to load local llm config from {}", path, e);
             }
         }
@@ -157,6 +162,50 @@ public class AgentLlmLocalConfigLoader {
     private void reportState(byte[] contentBytes) {
         ConfigLoadStateReporter.report(redisTemplate, serviceName, instanceId,
                 "agent-llm.json", loadedConfigPath, contentBytes);
+    }
+
+    /**
+     * 在 Jackson 反序列化前预处理 JSON 树，支持跨层别名映射。
+     * <p>例如历史配置或 Nacos 推送可能使用 {@code "tool"} 而非 {@code "tools"}，
+     * 或 {@code agent.llm.request} 路径而非 {@code runtime.request}；本方法统一转为对象结构接受的字段名。</p>
+     */
+    private JsonNode preprocessAliasTree(JsonNode root) {
+        if (root == null || !root.isObject()) {
+            return root;
+        }
+        ObjectNode obj = (ObjectNode) root;
+
+        // tool -> tools
+        if (obj.has("tool") && !obj.has("tools")) {
+            obj.set("tools", obj.remove("tool"));
+        }
+
+        // agent.llm.request -> runtime.request
+        JsonNode agentNode = obj.path("agent");
+        if (agentNode.isObject()) {
+            ObjectNode agentObj = (ObjectNode) agentNode;
+            JsonNode llmNode = agentObj.path("llm");
+            if (llmNode.isObject()) {
+                ObjectNode llmObj = (ObjectNode) llmNode;
+                if (llmObj.has("request")) {
+                    if (!runtimeHasRequest(obj)) {
+                        ObjectNode runtimeObj = obj.has("runtime") && obj.path("runtime").isObject()
+                                ? (ObjectNode) obj.path("runtime")
+                                : obj.putObject("runtime");
+                        runtimeObj.set("request", llmObj.path("request"));
+                    }
+                    // 无论是否发生移动，agent.llm 都不是合法路径，移除以避免 Jackson 未知字段失败
+                    agentObj.remove("llm");
+                }
+            }
+        }
+
+        return obj;
+    }
+
+    private boolean runtimeHasRequest(ObjectNode root) {
+        JsonNode runtime = root.path("runtime");
+        return runtime.isObject() && runtime.has("request");
     }
 
     /**
@@ -440,6 +489,16 @@ public class AgentLlmLocalConfigLoader {
         if (cfg.getPrompts().getDatasetFieldSpecs() == null) {
             cfg.getPrompts().setDatasetFieldSpecs(null);
         }
+        if (cfg.getAgent() == null) {
+            cfg.setAgent(null);
+        } else {
+            sanitizeAgent(cfg.getAgent());
+        }
+        if (cfg.getTools() == null) {
+            cfg.setTools(null);
+        } else {
+            sanitizeTools(cfg.getTools());
+        }
         if (cfg.getObservability() == null) {
             cfg.setObservability(null);
         }
@@ -471,6 +530,31 @@ public class AgentLlmLocalConfigLoader {
         if (runtime.getExecution() != null && runtime.getExecution().getAdjFactorEnabled() == null) {
             runtime.getExecution().setAdjFactorEnabled(false);
         }
+        if (runtime.getRequest() == null) {
+            runtime.setRequest(null);
+        } else {
+            AgentLlmProperties.Request request = runtime.getRequest();
+            if (request.getMaxRetries() == null) {
+                request.setMaxRetries(3);
+            }
+            if (request.getRetry() == null) {
+                request.setRetry(null);
+            } else {
+                AgentLlmProperties.Retry retry = request.getRetry();
+                if (retry.getBackoffType() == null) {
+                    retry.setBackoffType("exponential");
+                }
+                if (retry.getBaseDelayMs() == null) {
+                    retry.setBaseDelayMs(1000L);
+                }
+                if (retry.getMaxDelayMs() == null) {
+                    retry.setMaxDelayMs(4000L);
+                }
+                if (retry.getJitterMs() == null) {
+                    retry.setJitterMs(100L);
+                }
+            }
+        }
         if (runtime.getParallel() == null || runtime.getParallel().getToolWeightedLimit() == null) {
             return;
         }
@@ -481,6 +565,65 @@ public class AgentLlmLocalConfigLoader {
         for (AgentLlmProperties.ToolWeightEntry entry : limit.getTools().values()) {
             if (entry != null && entry.getRequiresAdjFactorEnabled() == null) {
                 entry.setRequiresAdjFactorEnabled(false);
+            }
+        }
+    }
+
+    private void sanitizeAgent(AgentLlmProperties.Agent agent) {
+        if (agent.getWorkspace() == null) {
+            agent.setWorkspace(null);
+        } else {
+            AgentLlmProperties.Workspace workspace = agent.getWorkspace();
+            if (workspace.getDump() == null) {
+                workspace.setDump(null);
+            } else {
+                AgentLlmProperties.Dump dump = workspace.getDump();
+                if (dump.getTtlHours() == null) {
+                    dump.setTtlHours(12);
+                }
+            }
+        }
+        if (agent.getDataset() == null) {
+            agent.setDataset(null);
+        } else {
+            AgentLlmProperties.Dataset dataset = agent.getDataset();
+            if (dataset.getTtlHours() == null) {
+                dataset.setTtlHours(12);
+            }
+        }
+    }
+
+    private void sanitizeTools(AgentLlmProperties.Tools tools) {
+        if (tools.getResult() == null) {
+            tools.setResult(null);
+        } else {
+            AgentLlmProperties.ToolResult result = tools.getResult();
+            if (result.getMaxStringLength() == null) {
+                result.setMaxStringLength(2000);
+            }
+        }
+        if (tools.getSummary() == null) {
+            tools.setSummary(null);
+        } else {
+            AgentLlmProperties.ToolSummary summary = tools.getSummary();
+            if (summary.getMaxRetries() == null) {
+                summary.setMaxRetries(3);
+            }
+        }
+        if (tools.getReread() == null) {
+            tools.setReread(null);
+        } else {
+            AgentLlmProperties.ToolReread reread = tools.getReread();
+            if (reread.getMaxLimit() == null) {
+                reread.setMaxLimit(2000);
+            }
+        }
+        if (tools.getRawRef() == null) {
+            tools.setRawRef(null);
+        } else {
+            AgentLlmProperties.ToolRawRef rawRef = tools.getRawRef();
+            if (rawRef.getTtlHours() == null) {
+                rawRef.setTtlHours(12);
             }
         }
     }
