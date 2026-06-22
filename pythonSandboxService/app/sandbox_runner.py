@@ -201,8 +201,13 @@ def _prepare_task_workspace(
         _exec_checked(session, f"rm -rf {config.workdir}/input", "remove_old_input")
         _exec_checked(session, f"ln -s {task_input} {config.workdir}/input", "create_input_symlink")
 
-    # MF3: agent run 模式走 CSV 4 列 source_path 直接 cp，跳过 data_dir 目录展开。
-    # 旧调用（无 CSV / CSV 第 4 列为空）继续走 data_dir 兼容路径。
+    # MF5 (260623-02 round 1 review fix): agent run 模式下，CSVs 非空表示 caller 显式
+    # 选了 run-level dataset/manifest 路径，必须走 CSV source_path cp。如果 CSVs 给到了
+    # 但 source_copy_count == 0，意味着 01 DatasetPersistedEvent 漏带 persistedPath 或文件
+    # 不在磁盘上——这种 config 错误必须 fail loud，不能 silently 退回 legacy data_dir
+    # 扫描（那会让 sandbox 重新看到 originalId，违反 run-level 抽象）。
+    # legacy non-agent-run 调用：CSVs 都空 → 走 data_dir 兼容路径保持向后兼容。
+    has_csv = bool((paths_dataset_csv or "").strip() or (path_manifest_csv or "").strip())
     source_copy_count = _copy_via_csv_source_paths(
         session,
         config,
@@ -211,6 +216,17 @@ def _prepare_task_workspace(
         paths_dataset_csv or "",
         path_manifest_csv or "",
     )
+    if has_csv and source_copy_count == 0:
+        # Agent run 模式 contract 被破坏：caller 给了 CSVs 但 sandbox 拿不到 source 文件。
+        # 不要悄悄 fallback 到 legacy data_dir 扫描——那会让 sandbox 看到 originalId，
+        # 跟"agent run = run-level 抽象"的设计目标冲突。直接抛 RuntimeError 让上层
+        # pool/gateway 把它当成 TOOL_ERROR 返回给 caller。
+        raise RuntimeError(
+            "agent_run mode but no source files were copied from CSVs: "
+            f"paths_dataset_csv provided={bool((paths_dataset_csv or '').strip())} "
+            f"path_manifest_csv provided={bool((path_manifest_csv or '').strip())}. "
+            "Check that DatasetPersistedEvent carries persistedPath for all entries."
+        )
 
     if source_copy_count == 0:
         # Legacy path: 用 data_dir 目录展开（无 CSV source_path 信息的旧请求兼容）
@@ -373,10 +389,10 @@ def _materialize_agent_run_csvs(
 ) -> None:
     """把 Java 端的 run-level CSV 物化到 sandbox workdir（Cindy 拍板 path C，260623-02 MF6）。
 
-    输入 CSV 形态（来自 Java AgentRunDatasetCsvWriter）：
-      - paths_dataset.csv: agent_run_dataset_id, dataset_file_path, from_ts_code
+    输入 CSV 形态（来自 Java AgentRunDatasetCsvWriter，可能带第 4 列 source_path）：
+      - paths_dataset.csv: agent_run_dataset_id, dataset_file_path, from_ts_code [, source_path]
         dataset_file_path 中含 /__AF_INPUT__/ placeholder
-      - path_manifest.csv: agent_run_manifest_id, manifest_file_path, related_dataset_ids
+      - path_manifest.csv: agent_run_manifest_id, manifest_file_path, related_dataset_ids [, source_path]
         manifest_file_path 中含 /__AF_INPUT__/ placeholder 或 NONE marker（Q7 拍板）
 
     物化规则：
@@ -393,6 +409,12 @@ def _materialize_agent_run_csvs(
            找不到 related dataset number → member 标 status="broken" + errorCode +
            errorMessage，但 manifest 仍生成（fail loud, not fail silent）。
 
+    MF4（260623-02 round 1 review fix）：sandbox 内 on-disk CSV 必须 strip 回 3 列 public
+    schema（agent_run_*_id / *_file_path / related_dataset_ids 或 from_ts_code）。
+    第 4 列 source_path 是 Java→sandbox request 内部 helper（host-side copy 用），落到
+    sandbox on-disk 后会污染 tool description 描述的 schema，也会让 sandbox 内
+    af_dataset_loader 的 csv.reader 取错列。本函数落盘时强制只写前 3 列。
+
     完全 derive 自两张现有 CSV，无 side-channel；CSV 落盘后 sandbox 内
     af_dataset_loader 看到的全是 run-level 抽象（agent_run_manifest_id, 临时路径）。
     """
@@ -401,15 +423,18 @@ def _materialize_agent_run_csvs(
 
     # 1. 解析 paths_dataset.csv，构建 (run-level number → from_ts_code) 映射
     #    多 ts_code（"A#B"）取第一个 segment；空 / 纯空白 → UNCERTAIN
+    #    同时收集已 strip 后的 3 列 data rows，供落盘用（避免二次 parse）。
     dataset_by_number: Dict[str, str] = {}
+    materialized_ds_lines: List[str] = [
+        "agent_run_dataset_id,dataset_file_path,from_ts_code"
+    ]
     if paths_dataset_csv.strip():
         reader = csv.reader(io.StringIO(paths_dataset_csv))
-        header: List[str] | None = None
         for row in reader:
             if not row:
                 continue
-            if header is None:
-                header = row
+            if row[0].strip() == "agent_run_dataset_id":
+                # header（容忍 4 列 header，第 4 列 source_path 落盘时丢弃）
                 continue
             if len(row) < 3:
                 logger.warning(
@@ -418,30 +443,39 @@ def _materialize_agent_run_csvs(
                 )
                 continue
             number = row[0].strip()
+            sandbox_path = row[1]
             raw_ts_code = row[2] or ""
             if not number:
                 continue
             first_segment = raw_ts_code.split("#", 1)[0].strip()
             dataset_by_number[number] = first_segment if first_segment else "UNCERTAIN"
+            # placeholder 替换 + strip 第 4 列 → 3 列 public schema
+            materialized_path = sandbox_path.replace(
+                SANDBOX_INPUT_PLACEHOLDER, task_input_prefix
+            )
+            materialized_ds_lines.append(
+                ",".join([number, materialized_path, raw_ts_code])
+            )
 
-    # 2. placeholder 替换后落盘 paths_dataset.csv
-    materialized_ds = paths_dataset_csv.replace(SANDBOX_INPUT_PLACEHOLDER, task_input_prefix)
-    if materialized_ds.strip():
+    # 2. 落盘 paths_dataset.csv（3 列 public schema）
+    if len(materialized_ds_lines) > 1:  # 至少 1 行 data row
         session.copy_to_runtime(
-            materialized_ds.encode("utf-8"),
+            ("\n".join(materialized_ds_lines) + "\n").encode("utf-8"),
             f"{workdir}/paths_dataset.csv",
         )
 
-    # 3. path_manifest.csv 行级处理
-    materialized_mf_lines: List[str] = []
+    # 3. path_manifest.csv 行级处理（NONE 行由 _materialize_none_manifest 物化）
+    #    落盘 header 强制用 3 列 literal（不沿用 input header，避免 4 列污染）。
+    materialized_mf_lines: List[str] = [
+        "agent_run_manifest_id,manifest_file_path,related_dataset_ids"
+    ]
     if path_manifest_csv.strip():
         reader = csv.reader(io.StringIO(path_manifest_csv))
-        header: List[str] | None = None
         for row in reader:
             if not row:
                 continue
-            if header is None:
-                header = row
+            if row[0].strip() == "agent_run_manifest_id":
+                # header（4 列 input 也跳过，落盘用 3 列 literal header）
                 continue
             if len(row) < 3:
                 logger.warning(
@@ -463,7 +497,7 @@ def _materialize_agent_run_csvs(
                     ",".join([agent_run_manifest_id, temp_path, related])
                 )
                 continue
-            # 正常行：placeholder 替换
+            # 正常行：placeholder 替换（strip 第 4 列不写盘）
             materialized_path = manifest_file_path_field.replace(
                 SANDBOX_INPUT_PLACEHOLDER, task_input_prefix
             )
@@ -471,10 +505,9 @@ def _materialize_agent_run_csvs(
                 ",".join([agent_run_manifest_id, materialized_path, related])
             )
     # 只有在至少有 1 行可解析的数据时才写 path_manifest.csv（header-only 没意义）。
-    if materialized_mf_lines and header:
-        materialized_mf = "\n".join([",".join(header), *materialized_mf_lines]) + "\n"
+    if len(materialized_mf_lines) > 1:  # 至少 1 行 data row
         session.copy_to_runtime(
-            materialized_mf.encode("utf-8"),
+            ("\n".join(materialized_mf_lines) + "\n").encode("utf-8"),
             f"{workdir}/path_manifest.csv",
         )
 

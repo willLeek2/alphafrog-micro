@@ -1,9 +1,15 @@
 """260623-harness-optimization-02: 锁定 sandbox_runner._materialize_agent_run_csvs 的 placeholder 替换 +
 NONE marker 物化（Cindy 拍板 path C，no side-channel，derive 自 paths_dataset.csv）。
+
+MF4（round 1 review fix）：on-disk CSV 强制 strip 第 4 列 source_path，落到 sandbox
+workdir 的 schema 跟 tool description 描述的 3 列 public schema 一致。
+MF5（round 1 review fix）：agent run 模式下 CSVs 非空但 0 次 cp → RuntimeError fail loud，
+不再 silently fallback 到 legacy data_dir 目录扫描。
 """
 
 from __future__ import annotations
 
+import io
 import json
 import sys
 import types
@@ -509,6 +515,143 @@ class SandboxRunnerCsvMaterializeTest(unittest.TestCase):
             MANIFEST_NONE_MARKER,
         )
 
+    # ----- MF4: 4 列 input → on-disk 3 列 public schema -----
+
+    def test_materialized_paths_dataset_csv_is_three_columns(self) -> None:
+        """MF4: paths_dataset.csv input 带 4 列（host-internal source_path）→
+        sandbox on-disk paths_dataset.csv 强制 3 列 public schema（header + rows）。
+        """
+        import csv as _csv
+
+        config = _test_config(Path("/tmp/none"))
+        session = _FakeSession()
+        ds_csv = (
+            "agent_run_dataset_id,dataset_file_path,from_ts_code,source_path\n"
+            "1,/__AF_INPUT__/ds-a/a.csv,000300.SH,/data/database_fetched/7D3A/000300.SH.csv\n"
+            "2,/__AF_INPUT__/ds-b/b.csv,000002.SZ,/data/database_fetched/abc/000002.SZ.csv\n"
+        )
+        _materialize_agent_run_csvs(
+            session, config, "/sandbox/runs/task-mf4/input", ds_csv, ""
+        )
+        paths_writes = [w for w in session.writes if w[1].endswith("paths_dataset.csv")]
+        self.assertEqual(len(paths_writes), 1, "exactly one paths_dataset.csv write")
+        content = paths_writes[0][0].decode("utf-8")
+        # 不再含 placeholder
+        self.assertNotIn(SANDBOX_INPUT_PLACEHOLDER, content)
+        # 不再含 source_path 字段值（4 列数据被 strip 掉）
+        self.assertNotIn("/data/database_fetched/", content)
+        # 解析 row count + 列数：header 1 行 + 2 行数据
+        reader = _csv.reader(io.StringIO(content))
+        rows = [r for r in reader if r]
+        self.assertEqual(len(rows), 3, "expected header + 2 data rows")
+        # header 是 3 列 public schema
+        self.assertEqual(
+            rows[0],
+            ["agent_run_dataset_id", "dataset_file_path", "from_ts_code"],
+            "on-disk header must be 3 columns",
+        )
+        # 数据行也必须 3 列
+        for row in rows[1:]:
+            self.assertEqual(
+                len(row), 3,
+                f"data row must be 3 columns, got {len(row)}: {row!r}",
+            )
+        # 数据行内容正确（placeholder 替换 + source_path strip）
+        self.assertEqual(rows[1][0], "1")
+        self.assertEqual(rows[1][1], "/sandbox/runs/task-mf4/input/ds-a/a.csv")
+        self.assertEqual(rows[1][2], "000300.SH")
+        self.assertEqual(rows[2][0], "2")
+        self.assertEqual(rows[2][1], "/sandbox/runs/task-mf4/input/ds-b/b.csv")
+        self.assertEqual(rows[2][2], "000002.SZ")
+
+    def test_materialized_path_manifest_csv_is_three_columns(self) -> None:
+        """MF4: path_manifest.csv input 带 4 列 → sandbox on-disk 强制 3 列 public schema。
+
+        包含 NONE 行物化路径也必须是 3 列（id / temp_path / related）。
+        """
+        import csv as _csv
+
+        config = _test_config(Path("/tmp/none"))
+        session = _FakeSession()
+        ds_csv = (
+            "agent_run_dataset_id,dataset_file_path,from_ts_code,source_path\n"
+            "1,/__AF_INPUT__/ds-a/a.csv,000300.SH,/data/ds.csv\n"
+        )
+        # 1 行 NONE + 1 行正常 manifest，都带第 4 列 source_path
+        mf_csv = (
+            "agent_run_manifest_id,manifest_file_path,related_dataset_ids,source_path\n"
+            f"1,{MANIFEST_NONE_MARKER},1,/data/should-be-ignored.json\n"
+            "2,/__AF_INPUT__/m-real/manifest.json,1,/data/m-real/manifest.json\n"
+        )
+        _materialize_agent_run_csvs(
+            session, config, "/sandbox/runs/task-mf4/input", ds_csv, mf_csv
+        )
+        manifest_writes = [w for w in session.writes if w[1].endswith("path_manifest.csv")]
+        self.assertEqual(len(manifest_writes), 1, "exactly one path_manifest.csv write")
+        content = manifest_writes[0][0].decode("utf-8")
+        # 解析 row count + 列数
+        reader = _csv.reader(io.StringIO(content))
+        rows = [r for r in reader if r]
+        self.assertEqual(len(rows), 3, "expected header + 2 data rows")
+        # header 是 3 列 public schema
+        self.assertEqual(
+            rows[0],
+            ["agent_run_manifest_id", "manifest_file_path", "related_dataset_ids"],
+            "on-disk header must be 3 columns",
+        )
+        # 所有数据行必须 3 列
+        for row in rows[1:]:
+            self.assertEqual(
+                len(row), 3,
+                f"data row must be 3 columns, got {len(row)}: {row!r}",
+            )
+        # NONE 行被物化为 temp 路径，仍是 3 列
+        self.assertEqual(rows[1][0], "1")
+        self.assertIn("_agent_run_manifest_1/manifest.json", rows[1][1])
+        self.assertEqual(rows[1][2], "1")
+        # 正常 manifest 行：placeholder 替换 + strip 第 4 列
+        self.assertEqual(rows[2][0], "2")
+        self.assertEqual(rows[2][1], "/sandbox/runs/task-mf4/input/m-real/manifest.json")
+        self.assertEqual(rows[2][2], "1")
+        # source_path 数据不应出现在 on-disk CSV
+        self.assertNotIn("/data/should-be-ignored", content)
+        self.assertNotIn("/data/m-real/manifest.json", content)
+
+    def test_materialized_csvs_drop_source_path_when_legacy_3_column_input(self) -> None:
+        """MF4 兼容路径: input 是 3 列 legacy CSV（无 source_path）→ on-disk 也是 3 列。
+
+        确保 strip 逻辑不会破坏已经 3 列的输入（向后兼容）。
+        """
+        import csv as _csv
+
+        config = _test_config(Path("/tmp/none"))
+        session = _FakeSession()
+        ds_csv = (
+            "agent_run_dataset_id,dataset_file_path,from_ts_code\n"
+            "1,/__AF_INPUT__/ds-a/a.csv,000300.SH\n"
+        )
+        mf_csv = (
+            "agent_run_manifest_id,manifest_file_path,related_dataset_ids\n"
+            "1,/__AF_INPUT__/m-x/manifest.json,1\n"
+        )
+        _materialize_agent_run_csvs(
+            session, config, "/sandbox/runs/task-mf4/input", ds_csv, mf_csv
+        )
+        # paths_dataset.csv
+        paths_writes = [w for w in session.writes if w[1].endswith("paths_dataset.csv")]
+        self.assertEqual(len(paths_writes), 1)
+        reader = _csv.reader(io.StringIO(paths_writes[0][0].decode("utf-8")))
+        rows = [r for r in reader if r]
+        for row in rows:
+            self.assertEqual(len(row), 3, f"row must be 3 columns: {row!r}")
+        # path_manifest.csv
+        mf_writes = [w for w in session.writes if w[1].endswith("path_manifest.csv")]
+        self.assertEqual(len(mf_writes), 1)
+        reader = _csv.reader(io.StringIO(mf_writes[0][0].decode("utf-8")))
+        rows = [r for r in reader if r]
+        for row in rows:
+            self.assertEqual(len(row), 3, f"row must be 3 columns: {row!r}")
+
 
 class SandboxRunnerCsvSourcePathCopyTest(unittest.TestCase):
     """260623-harness-optimization-02: MF3 — 第 4 列 source_path 直接 cp 测试。
@@ -628,6 +771,219 @@ class SandboxRunnerCsvSourcePathCopyTest(unittest.TestCase):
         )
         self.assertEqual(count, 0)
         self.assertEqual(session.writes, [])
+
+
+class SandboxRunnerPrepareWorkspaceFailLoudTest(unittest.TestCase):
+    """260623-harness-optimization-02: MF5 — agent run 模式下 source_path 0 次 cp → fail loud。
+
+    验证 _prepare_task_workspace：
+      - CSVs 非空（agent run 模式）但 source_copy_count == 0 → RuntimeError，不再 silently
+        fallback 到 legacy data_dir 扫描
+      - CSVs 都空（legacy non-agent-run 调用）→ 走 data_dir 兼容路径，不报错
+
+    _copy_via_csv_source_paths 的 row-level 行为保持不变（单 row 失败只 log warning + false）。
+    关键区分在 _prepare_task_workspace 这一层做 fail loud 兜底。
+    """
+
+    def _patch_expand_dataset_ids(self, expanded_dict: Dict[str, List]):
+        """Patch expand_dataset_ids via monkeypatch on imported reference in sandbox_runner module."""
+        from app import sandbox_runner
+
+        class _StubExpanded:
+            def __init__(self, d: Dict[str, List]) -> None:
+                self.manifest_ids = d.get("manifest_ids", [])
+                self.atomic_ids = d.get("atomic_ids", [])
+                self.failed_members = d.get("failed_members", [])
+                self.skipped_members = d.get("skipped_members", [])
+
+        def _fake_expand(data_dir, dataset_id_list):
+            return _StubExpanded(expanded_dict)
+
+        return sandbox_runner.expand_dataset_ids, _fake_expand
+
+    def test_agent_run_mode_fails_loud_when_no_source_path(self) -> None:
+        """MF5: CSVs 非空但所有行 source_path 为空 → RuntimeError fail loud。
+
+        不能 silently fallback 到 legacy data_dir 扫描（那会让 sandbox 看到 originalId，
+        违反 run-level 抽象）。
+        """
+        from app.sandbox_runner import _prepare_task_workspace
+
+        config = _test_config(Path("/tmp/none"))
+        session = _FakeSession()
+        ds_csv = (
+            "agent_run_dataset_id,dataset_file_path,from_ts_code,source_path\n"
+            "1,/__AF_INPUT__/ds-a/a.csv,000300.SH,\n"  # 空 source_path
+            "2,/__AF_INPUT__/ds-b/b.csv,000002.SZ,\n"  # 空 source_path
+        )
+        # 不管 expand_dataset_ids 是否被调用，都不应该 silently 走 legacy 路径。
+        # 此处 mock 让 expand_dataset_ids 即使被调也返回一个干净结果，确保是 fail loud 触发。
+        _orig, fake_expand = self._patch_expand_dataset_ids(
+            {"manifest_ids": [], "atomic_ids": []}
+        )
+        from app import sandbox_runner
+        sandbox_runner.expand_dataset_ids = fake_expand
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                _prepare_task_workspace(
+                    session,
+                    "task-mf5-fail-loud",
+                    config,
+                    [],
+                    None,
+                    paths_dataset_csv=ds_csv,
+                    path_manifest_csv="",
+                )
+            msg = str(ctx.exception)
+            self.assertIn("agent_run mode", msg)
+            self.assertIn("paths_dataset_csv provided=True", msg)
+            self.assertIn("path_manifest_csv provided=False", msg)
+            self.assertIn("DatasetPersistedEvent", msg)
+            # CSVs 没有被 materialize（fail fast，workspace 没准备好）
+            paths_writes = [w for w in session.writes if w[1].endswith("paths_dataset.csv")]
+            self.assertEqual(paths_writes, [], "no CSV written when fail loud")
+        finally:
+            sandbox_runner.expand_dataset_ids = _orig
+
+    def test_agent_run_mode_fails_loud_when_only_manifest_csv_provided(self) -> None:
+        """MF5: 只给 path_manifest_csv（paths_dataset_csv 为空）也走 agent run 模式 contract。"""
+        from app.sandbox_runner import _prepare_task_workspace
+
+        config = _test_config(Path("/tmp/none"))
+        session = _FakeSession()
+        mf_csv = (
+            "agent_run_manifest_id,manifest_file_path,related_dataset_ids,source_path\n"
+            f"1,{MANIFEST_NONE_MARKER},1,\n"  # NONE 行 + 空 source_path
+        )
+        _orig, fake_expand = self._patch_expand_dataset_ids(
+            {"manifest_ids": [], "atomic_ids": []}
+        )
+        from app import sandbox_runner
+        sandbox_runner.expand_dataset_ids = fake_expand
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                _prepare_task_workspace(
+                    session,
+                    "task-mf5-mf-only",
+                    config,
+                    [],
+                    None,
+                    paths_dataset_csv="",
+                    path_manifest_csv=mf_csv,
+                )
+            msg = str(ctx.exception)
+            self.assertIn("paths_dataset_csv provided=False", msg)
+            self.assertIn("path_manifest_csv provided=True", msg)
+        finally:
+            sandbox_runner.expand_dataset_ids = _orig
+
+    def test_agent_run_mode_succeeds_when_source_path_copies_succeed(self) -> None:
+        """MF5 sanity: CSVs 非空且有可 cp 的 source_path → 不抛异常，正常走流程。"""
+        from app.sandbox_runner import _prepare_task_workspace
+
+        config = _test_config(Path("/tmp/none"))
+        session = _FakeSession()
+        ds_csv = (
+            "agent_run_dataset_id,dataset_file_path,from_ts_code,source_path\n"
+            "1,/__AF_INPUT__/ds-a/a.csv,000300.SH,/tmp/_af_mf5_ok.csv\n"
+        )
+        # 把 source_path 指向一个真实存在的临时文件
+        tmp_src = Path("/tmp/_af_mf5_ok.csv")
+        tmp_src.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            tmp_src.write_text("dummy\n")
+            ds_csv = (
+                "agent_run_dataset_id,dataset_file_path,from_ts_code,source_path\n"
+                f"1,/__AF_INPUT__/ds-a/a.csv,000300.SH,{tmp_src}\n"
+            )
+            workspace = _prepare_task_workspace(
+                session,
+                "task-mf5-ok",
+                config,
+                [],
+                None,
+                paths_dataset_csv=ds_csv,
+                path_manifest_csv="",
+            )
+            self.assertTrue(workspace.endswith("task-mf5-ok"))
+            # paths_dataset.csv 应该被 materialize（strip 后的 3 列 public schema）
+            paths_writes = [w for w in session.writes if w[1].endswith("paths_dataset.csv")]
+            self.assertEqual(len(paths_writes), 1)
+        finally:
+            tmp_src.unlink(missing_ok=True)
+
+    def test_legacy_mode_falls_back_to_data_dir_when_csvs_empty(self) -> None:
+        """MF5: CSVs 都空 → 走 legacy data_dir 兼容路径（保持向后兼容），不抛异常。
+
+        expand_dataset_ids 应被调用；不被 RuntimeError 兜底。
+        """
+        from app.sandbox_runner import _prepare_task_workspace
+        from app.dataset_manifest import ExpandedDatasets
+
+        config = _test_config(Path("/tmp/none"))
+        session = _FakeSession()
+
+        # mock expand_dataset_ids 让它返回一个空 result（不抛异常），且不被 RuntimeError 拦截
+        from app import sandbox_runner
+        called_with: List[List[str]] = []
+
+        def _fake_expand(data_dir, dataset_id_list):
+            called_with.append(list(dataset_id_list))
+            return ExpandedDatasets(manifest_ids=[], atomic_ids=[])
+
+        _orig = sandbox_runner.expand_dataset_ids
+        sandbox_runner.expand_dataset_ids = _fake_expand
+        try:
+            workspace = _prepare_task_workspace(
+                session,
+                "task-mf5-legacy",
+                config,
+                ["ds-x"],
+                None,
+                paths_dataset_csv="",
+                path_manifest_csv="",
+            )
+            # legacy 路径 → expand_dataset_ids 被调用
+            self.assertEqual(len(called_with), 1)
+            self.assertEqual(called_with[0], ["ds-x"])
+            self.assertTrue(workspace.endswith("task-mf5-legacy"))
+        finally:
+            sandbox_runner.expand_dataset_ids = _orig
+
+    def test_agent_run_mode_fails_loud_only_when_both_csvs_provided_and_no_copy(self) -> None:
+        """MF5 boundary: CSVs 一个非空 + source_path 部分 cp → 不抛 RuntimeError（正常 agent run）。
+
+        关键区分：MF5 fail loud 只在 (has_csv && source_copy_count == 0) 时触发。
+        哪怕只有 1 行 cp 成功，也不抛异常（_copy_via_csv_source_paths 内部单 row 失败
+        仍 log warning + false，但 source_copy_count > 0 → 上层不 fail loud）。
+        """
+        from app.sandbox_runner import _prepare_task_workspace
+
+        config = _test_config(Path("/tmp/none"))
+        session = _FakeSession()
+        # 1 行有 source_path + 1 行 source_path 为空 → source_copy_count == 1
+        tmp_src = Path("/tmp/_af_mf5_partial.csv")
+        tmp_src.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            tmp_src.write_text("partial\n")
+            ds_csv = (
+                "agent_run_dataset_id,dataset_file_path,from_ts_code,source_path\n"
+                f"1,/__AF_INPUT__/ds-a/a.csv,000300.SH,{tmp_src}\n"
+                "2,/__AF_INPUT__/ds-b/b.csv,000002.SZ,\n"
+            )
+            workspace = _prepare_task_workspace(
+                session,
+                "task-mf5-partial",
+                config,
+                [],
+                None,
+                paths_dataset_csv=ds_csv,
+                path_manifest_csv="",
+            )
+            self.assertTrue(workspace.endswith("task-mf5-partial"))
+            # 没抛异常即符合预期
+        finally:
+            tmp_src.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
