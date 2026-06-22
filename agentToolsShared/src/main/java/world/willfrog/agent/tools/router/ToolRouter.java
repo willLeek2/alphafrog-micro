@@ -18,6 +18,7 @@ import world.willfrog.agent.platform.service.AgentObservabilityService;
 import world.willfrog.agent.platform.service.AgentRunBudgetService;
 import world.willfrog.agent.platform.artifact.RawPayloadLocator;
 import world.willfrog.agent.tools.docs.LoadToolGuideTool;
+import world.willfrog.agent.tools.dataset.ListMyDataTool;
 import world.willfrog.agent.tools.compaction.RereadToolHandler;
 import world.willfrog.agent.tools.compaction.ToolOutputCompactionService;
 import world.willfrog.agent.tools.market.MarketDataTools;
@@ -107,6 +108,8 @@ public class ToolRouter {
     private final PythonSandboxTools pythonSandboxTools;
     /** 平台工具指南加载工具（loadToolGuide） */
     private final LoadToolGuideTool loadToolGuideTool;
+    /** 260623-harness-optimization-02: 列出当前 agent run 已落盘 dataset / manifest（listMyData） */
+    private final ListMyDataTool listMyDataTool;
     /** executePython 静态参数/代码预校验（B1） */
     private final PythonStaticPrecheckService pythonStaticPrecheckService;
     /** 运行时 LLM/执行配置（含 static-precheck-enabled） */
@@ -341,7 +344,8 @@ public class ToolRouter {
                 "loadToolGuide",
                 "rereadToolResult",
                 "spawnSubAgent",
-                "waitForSubAgent"
+                "waitForSubAgent",
+                "listMyData"
         );
     }
 
@@ -607,6 +611,14 @@ public class ToolRouter {
                 case "executePython" -> invokeExecutePython(params);
                 case "loadToolGuide" -> loadToolGuideTool.loadToolGuide(
                         str(params.get("topic"), params.get("arg0"))
+                );
+                case "listMyData" -> listMyDataTool.listMyData(
+                        str(params.get("query_type"), params.get("arg0")),
+                        str(params.get("from_ts_code"), params.get("arg1")),
+                        str(params.get("grep"), params.get("arg2")),
+                        toIntOrNull(params.get("offset"), params.get("arg3")),
+                        toIntOrNull(params.get("limit"), params.get("arg4")),
+                        str(params.get("related_dataset_ids"), params.get("arg5"))
                 );
                 case "rereadToolResult" -> rereadToolHandler.reread(
                         str(params.get("rawRef"), params.get("raw_ref"), params.get("arg0")),
