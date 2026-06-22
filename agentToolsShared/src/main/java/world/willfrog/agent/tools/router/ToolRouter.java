@@ -383,14 +383,17 @@ public class ToolRouter {
     private String invokeExecutePython(Map<String, Object> params) {
         /*
          * executePython 是最容易把上游数据、模型生成代码和沙箱执行耦合在一起的工具。
-         * 这里先收集 dataset ids，再做静态预校验，最后才交给 PythonSandboxTools。
-         * 这样可以在真正执行前拦截明显危险或无效的代码，失败结果也仍然走统一 JSON 格式。
+         * 260623-harness-optimization-02: dataset_ids / manifest_ids 是两个独立编号空间，
+         * 这里先分别收集，再做静态预校验（要求至少一个非空），最后才交给 PythonSandboxTools
+         * 的 5 形参 overload。这样可以在真正执行前拦截明显危险或无效的代码，
+         * 失败结果也仍然走统一 JSON 格式。
          */
         String code = str(params.get("code"), params.get("arg0"));
         String datasetIds = collectExecutePythonDatasetIds(params);
+        String manifestIds = collectExecutePythonManifestIds(params);
         if (isStaticPrecheckEnabled()) {
             PythonStaticPrecheckService.Result precheck =
-                    pythonStaticPrecheckService.check(code, datasetIds, params);
+                    pythonStaticPrecheckService.check(code, datasetIds, manifestIds, params);
             if (!precheck.isPassed()) {
                 return precheckFailure("executePython", precheck);
             }
@@ -398,6 +401,7 @@ public class ToolRouter {
         return pythonSandboxTools.executePython(
                 code,
                 datasetIds,
+                manifestIds,
                 str(params.get("libraries"), params.get("arg3")),
                 toNullableInt(params.get("timeout_seconds"), params.get("timeoutSeconds"), params.get("arg4"))
         );
@@ -682,6 +686,27 @@ public class ToolRouter {
                 params.get("arg1")
         );
         return String.join(",", datasetIds);
+    }
+
+    /**
+     * 260623-harness-optimization-02: 收集 executePython 的 manifestIds 参数（兼容多种命名风格）。
+     *
+     * <p>与 {@link #collectExecutePythonDatasetIds} 形态一致，但走 manifest 命名空间：
+     * manifest_ids / manifestIds / manifests / manifest_refs / manifestRefs / 位置参数 arg1。
+     * 拼接为逗号分隔字符串供 {@code PythonStaticPrecheckService.check} 与
+     * {@code PythonSandboxTools.executePython} 5 形参 overload 使用。</p>
+     */
+    private String collectExecutePythonManifestIds(Map<String, Object> params) {
+        LinkedHashSet<String> manifestIds = new LinkedHashSet<>();
+        addDatasetIds(manifestIds,
+                params.get("manifest_ids"),
+                params.get("manifestIds"),
+                params.get("manifests"),
+                params.get("manifest_refs"),
+                params.get("manifestRefs"),
+                params.get("arg1")
+        );
+        return String.join(",", manifestIds);
     }
 
     /**

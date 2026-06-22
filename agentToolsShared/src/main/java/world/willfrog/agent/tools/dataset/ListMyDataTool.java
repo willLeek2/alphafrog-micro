@@ -178,10 +178,31 @@ public class ListMyDataTool {
      * <p>file_offset / file_limit 仅 grep 模式生效：限定从 dataset 列表第 file_offset 个开始扫描，
      * 最多扫描 file_limit 个 dataset（默认 offset=0、limit=全部）。
      *
-     * <p>此 overload 未挂到 LangChain {@code @Tool} 注解，原因是 ToolRouter 的 listMyData
-     * 调用站点需保持 6 形参契约以避免破坏既有 routing 逻辑；上层若要使用本功能，
-     * 应通过 PythonSandboxTools 的 executePython 链路或单独暴露的入口调到此 overload。
+     * <p>返回形态与 6 形参版不同：grep 模式输出 {@code data.matched_count / data.matches[]}；
+     * 非 grep 模式仍走 originalId 子串匹配（manifest 模式忽略 grep）。
+     *
+     * <p>本 overload 已挂到 LangChain {@code @Tool} 注解；ToolRouter 入口仍走 6 形参契约以
+     * 避免破坏既有 routing 逻辑，LLM 走 raw grep 时按本签名 8 形参调用。
      */
+    @Tool("""
+        列出当前 agent run 已落盘的 dataset / manifest，提供 raw file content grep 能力（区别于 6 形参版）。
+
+        与 6 形参版的差异：当 query_type=dataset 且 grep 非空时，对每个 dataset 的原始文件全文
+        做大小写不敏感子串搜索，返回每 dataset 的匹配行数 + snippet preview，按命中次数降序。
+
+        参数：
+          query_type          - 必填，取值 "dataset" 或 "manifest"（manifest 模式 + grep 时走非 grep 分支）
+          from_ts_code        - 可选，过滤 from_ts_code 包含该子串的条目（multi-ts-code 用 # 分隔）
+          grep                - 可选（仅 dataset 模式），对原始文件全文做大小写不敏感子串搜索
+          file_offset         - 可选（仅 grep 时生效），从第 file_offset 个 dataset 开始扫描（默认 0）
+          file_limit          - 可选（仅 grep 时生效），最多扫描 file_limit 个 dataset（默认全部）
+          offset              - 可选，非 grep 模式分页起始（默认 0）
+          limit               - 可选，非 grep 模式单页返回上限（默认 50，上限 200）
+          related_dataset_ids - 可选（manifest only），用 # 分隔，过滤 related 包含任一指定 id 的 manifest
+
+        返回（grep 模式）：{ ok, data: { query_type, run_id, matched_count, file_offset, file_limit, matches: [...] }, error }
+        返回（非 grep 模式）：{ ok, data: { query_type, run_id, total_matched, returned_count, offset, limit, entries: [...] }, error }
+        """)
     public String listMyData(
             @P(value = "查询类型：dataset | manifest", required = true) String query_type,
             @P(value = "可选，过滤 from_ts_code 包含该子串的条目", required = false) String from_ts_code,
