@@ -41,6 +41,9 @@ public final class DatabaseFetchedPathStrategy {
         if (toolType.startsWith("fund_")) {
             return "domestic_fund";
         }
+        if ("market_data_advanced_search".equals(toolType)) {
+            return "advanced_search";
+        }
         // Fallback for unknown toolTypes — keeps data accessible under a generic topic
         return "domestic_listed_asset";
     }

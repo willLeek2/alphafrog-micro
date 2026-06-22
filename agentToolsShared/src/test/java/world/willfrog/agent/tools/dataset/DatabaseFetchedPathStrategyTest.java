@@ -120,6 +120,12 @@ class DatabaseFetchedPathStrategyTest {
     }
 
     @Test
+    void resolveTopicAdvancedSearchShouldMapToAdvancedSearch() {
+        assertEquals("advanced_search",
+                DatabaseFetchedPathStrategy.resolveTopic("market_data_advanced_search"));
+    }
+
+    @Test
     void resolveTopicShouldRejectNull() {
         assertThrows(NullPointerException.class,
                 () -> DatabaseFetchedPathStrategy.resolveTopic(null));

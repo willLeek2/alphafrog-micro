@@ -50,6 +50,10 @@ public class DatasetWriter {
         return datasetPath;
     }
 
+    public String getDatabaseFetchedPath() {
+        return databaseFetchedPath;
+    }
+
     public <T> String writeDataset(String prefix, String tsCode, String start, String end, 
                                    List<T> data, 
                                    List<String> headers, 

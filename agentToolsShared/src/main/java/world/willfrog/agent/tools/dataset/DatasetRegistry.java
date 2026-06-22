@@ -290,15 +290,18 @@ public class DatasetRegistry {
             if (eventPublisher != null) {
                 String runId = world.willfrog.agent.platform.context.AgentContext.getRunId();
                 if (runId != null) {
-                    String persistedPath = Paths.get(manifestDir, "manifest.json").toAbsolutePath().toString();
+                    Path persistedJsonPath = manifestDirPath.resolve("manifest.json");
+                    String persistedPath = persistedJsonPath.toAbsolutePath().toString();
                     // from_ts_code: infer from tsCodes list or UNCERTAIN
                     String fromTsCode = (tsCodes != null && !tsCodes.isEmpty())
                             ? String.join("#", tsCodes) : "UNCERTAIN";
-                    // relatedDatasetIds: not available in current registerManifest signature;
-                    // 02 consumers should treat empty list as "query manifest for members"
+                    // Read relatedDatasetIds from just-written manifest.json
+                    List<String> relatedDatasetIds = readManifestDatasetIds(persistedJsonPath);
+                    // sortKey: includes manifestId for stable ordering
+                    String sortKey = "manifest-" + manifestId + ".json";
                     eventPublisher.publishEvent(new DatasetPersistedEvent(
                             this, runId, manifestId, persistedPath, fromTsCode,
-                            List.of(), "manifest.json"));
+                            relatedDatasetIds, sortKey));
                 }
             }
         } catch (JsonProcessingException e) {
@@ -473,8 +476,9 @@ public class DatasetRegistry {
         if (!dir.exists() || !dir.isDirectory()) {
             return false;
         }
-        File manifestJson = new File(dir, meta.getManifestId() + ".manifest.json");
-        File metaJson = new File(dir, meta.getManifestId() + ".meta.json");
+        // Matches ManifestWriter: manifest.json / meta.json (spec §A.5, no manifestId prefix)
+        File manifestJson = new File(dir, "manifest.json");
+        File metaJson = new File(dir, "meta.json");
         return manifestJson.exists() && metaJson.exists();
     }
 
@@ -587,6 +591,32 @@ public class DatasetRegistry {
 
     private String manifestMetaKey(String queryKey) {
         return MANIFEST_META_PREFIX + queryKey;
+    }
+
+    /**
+     * Read dataset IDs from a just-written manifest.json.
+     * Returns empty list on any error (file missing, malformed JSON, etc.) —
+     * 02 consumers handle empty relatedDatasetIds gracefully.
+     */
+    private List<String> readManifestDatasetIds(Path manifestJsonPath) {
+        try {
+            if (!Files.exists(manifestJsonPath)) {
+                return List.of();
+            }
+            DatasetManifest manifest = objectMapper.readValue(
+                    manifestJsonPath.toFile(), DatasetManifest.class);
+            if (manifest == null || manifest.getMembers() == null) {
+                return List.of();
+            }
+            return manifest.getMembers().stream()
+                    .map(DatasetManifest.ManifestMember::getDatasetId)
+                    .filter(id -> id != null && !id.isBlank())
+                    .toList();
+        } catch (Exception e) {
+            log.debug("Failed to read manifest dataset IDs from {}: {}",
+                    manifestJsonPath, e.getMessage());
+            return List.of();
+        }
     }
 
     private String buildQueryKey(String type, String tsCode, String startDate, String endDate, List<String> columns) {
