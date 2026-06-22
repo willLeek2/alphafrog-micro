@@ -1,12 +1,13 @@
-你可以在本轮修正 run_args，尤其是 dataset_ids（多数据集用逗号分隔）。
+你可以在本轮修正 run_args，尤其是 dataset_ids / manifest_ids（多编号用逗号分隔）。
 代码中不要假设未定义变量，必须从文件读取数据。
-数据文件路径固定为 /sandbox/input/<dataset_id>/<dataset_id>.csv（优先）或 /sandbox/input/<dataset_id>/data.csv（兼容）。
-读取数据时必须使用 pd.read_csv(f"/sandbox/input/{dataset_id}/{dataset_id}.csv")，禁止使用未定义的函数如 load_dataset() 或 get_dataset()。
-若存在 dataset_ids，请逐个读取对应 csv，不要写死 /mnt/data 等路径。
+数据文件路径不再固定为 /sandbox/input/<dataset_id>/<dataset_id>.csv；executePython 启动后会在 /sandbox/paths_dataset.csv 与 /sandbox/path_manifest.csv 中注入 run-level 编号到真实路径的映射。
+读取数据时应先读 CSV 索引：pd.read_csv("/sandbox/paths_dataset.csv") 或 pd.read_csv("/sandbox/path_manifest.csv")，根据 run-level 编号拿到 dataset_file_path / manifest_file_path，再用 pd.read_csv(path) 加载。
+也可使用 from af_dataset_loader import load_manifest, load_datasets；load_datasets("1") 按 run-level dataset 编号返回 dict[ts_code, DataFrame]；load_manifest("1") 按 run-level manifest 编号返回 DatasetLoadResult（含 frame / failed_members / skipped_members）。
+from_ts_code 字段可能为 UNCERTAIN，不代表数据损坏；若需按资产过滤，用 listMyData 查询。
 日期字段请先排序后再取首尾行，不要硬编码某个交易日一定存在。
-trade_date 可能是 YYYYMMDD（8位）或 13 位毫秒时间戳；必须先做长度判断：8 位用字符串排序或 to_datetime(format="%Y%m%d")，13 位必须用 pd.to_datetime(..., unit="ms", utc=True) 后转 Asia/Shanghai。
-严禁直接对原始整数执行 pd.to_datetime（会被当作纳秒导致 1970 年日期）；若发现 13 位时间戳未使用 unit="ms"，视为错误，必须立刻修正。
+trade_date 常见为 YYYYMMDD 数字串；优先使用 astype(str) 后提取 8 位数字并按字符串排序。
+非必要不要使用 pd.to_datetime；若上轮出现 to_datetime/Overflow/unconverted 错误，本轮必须改为字符串排序方案。
 价格字段请优先使用 close/open 等数值列，避免把 ts_code 当作价格。
 ts_code 是数据库内区分不同资产的标识字段，不可用于涨跌幅数值计算。
 优先输出 JSON 结果，便于后续流程消费。
-若上轮报 dataset_ids 相关错误，必须优先修正 run_args 再生成代码。
+若上轮报 dataset_ids / manifest_ids 相关错误，必须优先调用 listMyData 获取合法编号并修正 run_args 再生成代码；连续 2 次同类失败后应停止重试并换策略。
