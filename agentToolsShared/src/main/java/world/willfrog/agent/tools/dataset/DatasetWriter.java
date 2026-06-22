@@ -54,9 +54,9 @@ public class DatasetWriter {
         return databaseFetchedPath;
     }
 
-    public <T> String writeDataset(String prefix, String tsCode, String start, String end, 
-                                   List<T> data, 
-                                   List<String> headers, 
+    public <T> String writeDataset(String type, String prefix, String tsCode, String start, String end,
+                                   List<T> data,
+                                   List<String> headers,
                                    Function<T, List<Object>> rowMapper) {
         if (!resolveEnabled()) {
             return null;
@@ -71,8 +71,10 @@ public class DatasetWriter {
         String datasetId = String.format("%s-%s-%s-%s-%s", prefix, safeTsCode, start, end, uuid);
 
         // New 4-layer path: database_fetched/<topic>/<tsCode>/<encodedString>/
-        String topic = DatabaseFetchedPathStrategy.resolveTopic(prefix);
-        String encodedStr = DatabaseFetchedPathStrategy.encodedString(prefix, safeTsCode, start, end, headers);
+        // type is the clean data type (e.g. "stock_daily") — NOT the runId-prefixed prefix
+        // This ensures writer and registry compute the same path.
+        String topic = DatabaseFetchedPathStrategy.resolveTopic(type);
+        String encodedStr = DatabaseFetchedPathStrategy.encodedString(type, safeTsCode, start, end, headers);
         Path datasetDirPath = DatabaseFetchedPathStrategy.resolveDataPath(
                 Path.of(databaseFetchedPath), topic, safeTsCode, encodedStr);
         File datasetDir = datasetDirPath.toFile();

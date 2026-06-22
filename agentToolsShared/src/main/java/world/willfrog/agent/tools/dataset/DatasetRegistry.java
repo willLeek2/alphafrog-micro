@@ -153,8 +153,9 @@ public class DatasetRegistry {
 
     public void registerDataset(String type, String tsCode, String startDate, String endDate,
                                 List<String> columns, String datasetId, int rowCount) {
+        String safeTsCode = tsCode != null ? tsCode.replaceAll("[^a-zA-Z0-9.]", "_") : "data";
         registerDataset(type, tsCode, startDate, endDate, columns, datasetId, rowCount, "csv",
-                datasetId == null || datasetId.isEmpty() ? "" : datasetId + ".csv");
+                safeTsCode + ".csv");
     }
 
     public void registerDataset(String type, String tsCode, String startDate, String endDate,
