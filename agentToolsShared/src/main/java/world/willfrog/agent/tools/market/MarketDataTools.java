@@ -174,14 +174,17 @@ public class MarketDataTools {
                     .build();
             DomesticStockInfoByTsCodeResponse response = domesticStockService.getStockInfoByTsCode(request);
             if (!response.hasItem()) {
-                return fail("getStockInfo", "NO_DATA", "No stock found for ts_code", Map.of("ts_code", nvl(tsCode)));
+                return fail("getStockInfo", "ASSET_NOT_FOUND",
+                        "资产 " + nvl(tsCode) + " 不存在，请检查代码是否正确或更换查询标的。",
+                        Map.of("ts_code", nvl(tsCode)));
             }
             Map<String, Object> data = new LinkedHashMap<>();
             data.put("ts_code", nvl(tsCode));
             data.put("item_text", response.getItem().toString());
             return ok("getStockInfo", data);
         } catch (Exception e) {
-            return fail("getStockInfo", "TOOL_ERROR", "Error fetching stock info", Map.of("message", nvl(e.getMessage())));
+            return fail("getStockInfo", "TOOL_ERROR", "查询失败，请重试或更换工具。如果持续失败，请换一种方式完成任务。",
+                    Map.of("message", nvl(e.getMessage())));
         }
     }
 
@@ -240,7 +243,8 @@ public class MarketDataTools {
             }
             return fetchStockDaily(normalizedTsCode, normalizedStart, normalizedEnd, headers);
         } catch (Exception e) {
-            return fail("getStockDaily", "TOOL_ERROR", "Error fetching stock daily data", Map.of("message", nvl(e.getMessage())));
+            return fail("getStockDaily", "TOOL_ERROR", "查询失败，请重试或更换工具。如果持续失败，请换一种方式完成任务。",
+                    Map.of("message", nvl(e.getMessage())));
         }
     }
 
@@ -349,14 +353,17 @@ public class MarketDataTools {
                     .build();
             DomesticIndexInfoByTsCodeResponse response = domesticIndexService.getDomesticIndexInfoByTsCode(request);
             if (!response.hasItem()) {
-                return fail("getIndexInfo", "NO_DATA", "No index found for ts_code", Map.of("ts_code", nvl(tsCode)));
+                return fail("getIndexInfo", "ASSET_NOT_FOUND",
+                        "资产 " + nvl(tsCode) + " 不存在，请检查代码是否正确或更换查询标的。",
+                        Map.of("ts_code", nvl(tsCode)));
             }
             Map<String, Object> data = new LinkedHashMap<>();
             data.put("ts_code", nvl(tsCode));
             data.put("item_text", response.getItem().toString());
             return ok("getIndexInfo", data);
         } catch (Exception e) {
-            return fail("getIndexInfo", "TOOL_ERROR", "Error fetching index info", Map.of("message", nvl(e.getMessage())));
+            return fail("getIndexInfo", "TOOL_ERROR", "查询失败，请重试或更换工具。如果持续失败，请换一种方式完成任务。",
+                    Map.of("message", nvl(e.getMessage())));
         }
     }
 
@@ -1764,11 +1771,14 @@ public class MarketDataTools {
                     .build();
             DomesticStockDailyByTsCodeAndDateRangeResponse response = domesticStockService.getStockDailyByTsCodeAndDateRange(request);
             if (response.getItemsCount() <= 0) {
-                return fail("getStockDaily", "NO_DATA", "No daily stock data found", Map.of(
-                        "ts_code", tsCode,
-                        "start_date", startDateStr,
-                        "end_date", endDateStr
-                ));
+                if (!stockExists(tsCode)) {
+                    return fail("getStockDaily", "ASSET_NOT_FOUND",
+                            "资产 " + tsCode + " 不存在，请检查代码是否正确或更换查询标的。",
+                            Map.of("ts_code", tsCode, "start_date", startDateStr, "end_date", endDateStr));
+                }
+                return fail("getStockDaily", "TIME_SERIES_EMPTY",
+                        "该资产在指定日期范围内无日线记录，请考虑调整起止日期或更换资产。",
+                        Map.of("ts_code", tsCode, "start_date", startDateStr, "end_date", endDateStr));
             }
 
             if (datasetWriter.isEnabled()) {
@@ -1813,7 +1823,8 @@ public class MarketDataTools {
                     previewRows
             ));
         } catch (Exception e) {
-            return fail("getStockDaily", "TOOL_ERROR", "Error fetching stock daily data", Map.of("message", nvl(e.getMessage())));
+            return fail("getStockDaily", "TOOL_ERROR", "查询失败，请重试或更换工具。如果持续失败，请换一种方式完成任务。",
+                    Map.of("message", nvl(e.getMessage())));
         }
     }
 
@@ -1834,11 +1845,14 @@ public class MarketDataTools {
                     .build();
             DomesticIndexDailyByTsCodeAndDateRangeResponse response = domesticIndexService.getDomesticIndexDailyByTsCodeAndDateRange(request);
             if (response.getItemsCount() <= 0) {
-                return fail("getIndexDaily", "NO_DATA", "No daily index data found", Map.of(
-                        "ts_code", tsCode,
-                        "start_date", startDateStr,
-                        "end_date", endDateStr
-                ));
+                if (!indexExists(tsCode)) {
+                    return fail("getIndexDaily", "ASSET_NOT_FOUND",
+                            "资产 " + tsCode + " 不存在，请检查代码是否正确或更换查询标的。",
+                            Map.of("ts_code", tsCode, "start_date", startDateStr, "end_date", endDateStr));
+                }
+                return fail("getIndexDaily", "TIME_SERIES_EMPTY",
+                        "该资产在指定日期范围内无日线记录，请考虑调整起止日期或更换资产。",
+                        Map.of("ts_code", tsCode, "start_date", startDateStr, "end_date", endDateStr));
             }
 
             if (datasetWriter.isEnabled()) {
@@ -1883,7 +1897,30 @@ public class MarketDataTools {
                     previewRows
             ));
         } catch (Exception e) {
-            return fail("getIndexDaily", "TOOL_ERROR", "Error fetching index daily data", Map.of("message", nvl(e.getMessage())));
+            return fail("getIndexDaily", "TOOL_ERROR", "查询失败，请重试或更换工具。如果持续失败，请换一种方式完成任务。",
+                    Map.of("message", nvl(e.getMessage())));
+        }
+    }
+
+    private boolean stockExists(String tsCode) {
+        try {
+            DomesticStockInfoByTsCodeRequest request = DomesticStockInfoByTsCodeRequest.newBuilder()
+                    .setTsCode(nvl(tsCode))
+                    .build();
+            return domesticStockService.getStockInfoByTsCode(request).hasItem();
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private boolean indexExists(String tsCode) {
+        try {
+            DomesticIndexInfoByTsCodeRequest request = DomesticIndexInfoByTsCodeRequest.newBuilder()
+                    .setTsCode(nvl(tsCode))
+                    .build();
+            return domesticIndexService.getDomesticIndexInfoByTsCode(request).hasItem();
+        } catch (Exception e) {
+            return false;
         }
     }
 

@@ -16,7 +16,10 @@ import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 import world.willfrog.agent.platform.service.AgentObservabilityService;
 import world.willfrog.agent.platform.service.AgentRunBudgetService;
+import world.willfrog.agent.platform.artifact.RawPayloadLocator;
 import world.willfrog.agent.tools.docs.LoadToolGuideTool;
+import world.willfrog.agent.tools.compaction.RereadToolHandler;
+import world.willfrog.agent.tools.compaction.ToolOutputCompactionService;
 import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.agent.tools.market.advanced.AdvancedSearchRequest;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
@@ -110,6 +113,8 @@ public class ToolRouter {
     private final AgentLlmProperties llmProperties;
     /** 工具结果缓存服务，按 toolName + params + scope 做去重缓存 */
     private final ToolResultCacheService toolResultCacheService;
+    /** rawRef 重读工具 */
+    private final RereadToolHandler rereadToolHandler;
     /** 观测数据服务，记录每次工具调用的 trace（参数、结果、耗时、缓存元数据等） */
     private final AgentObservabilityService observabilityService;
     /** JSON 序列化/反序列化，用于构建标准响应和判断工具成功状态 */
@@ -249,6 +254,7 @@ public class ToolRouter {
                 () -> executeDirect(toolName, params)
         );
         String result = nvl(cached.getResult());
+        String observabilityResult = isBlank(cached.getObservabilityResult()) ? result : cached.getObservabilityResult();
         boolean success = cached.isSuccess();
         long durationMs = Math.max(0L, cached.getDurationMs());
         ToolResultCacheService.CacheMeta cacheMeta = cached.getCacheMeta();
@@ -256,7 +262,7 @@ public class ToolRouter {
         // AgentObservabilityService 会把大输出拆到 Redis detail blob，snapshot 中只保留安全索引。
         // checkParallelLimits 是工具目录自检，不计入 run 级 tool_calls 预算/统计，也不提供展开详情。
         if (!"checkParallelLimits".equals(toolName)) {
-            recordObservability(toolName, params, result, durationMs, success, cacheMeta);
+            recordObservability(toolName, params, observabilityResult, durationMs, success, cacheMeta);
         }
 
         // 按 toolName 分桶上报耗时指标
@@ -333,6 +339,7 @@ public class ToolRouter {
                 "searchWeb",
                 "executePython",
                 "loadToolGuide",
+                "rereadToolResult",
                 "spawnSubAgent",
                 "waitForSubAgent"
         );
@@ -601,6 +608,12 @@ public class ToolRouter {
                 case "loadToolGuide" -> loadToolGuideTool.loadToolGuide(
                         str(params.get("topic"), params.get("arg0"))
                 );
+                case "rereadToolResult" -> rereadToolHandler.reread(
+                        str(params.get("rawRef"), params.get("raw_ref"), params.get("arg0")),
+                        str(params.get("keyword"), params.get("arg1")),
+                        toIntOrNull(params.get("offset"), params.get("arg2")),
+                        toIntOrNull(params.get("limit"), params.get("arg3"))
+                );
                 default -> unsupported(toolName);
             };
         } catch (Exception e) {
@@ -737,6 +750,23 @@ public class ToolRouter {
         } catch (NumberFormatException e) {
             return defaultValue;
         }
+    }
+
+    /** 解析可选整数参数，无有效值时返回 null。 */
+    private Integer toIntOrNull(Object... candidates) {
+        String value = str(candidates);
+        if (value.isEmpty()) {
+            return null;
+        }
+        try {
+            return Integer.parseInt(value);
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    private boolean isBlank(String text) {
+        return text == null || text.isBlank();
     }
 
     /**

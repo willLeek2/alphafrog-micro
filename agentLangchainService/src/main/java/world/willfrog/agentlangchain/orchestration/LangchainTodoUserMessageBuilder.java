@@ -35,7 +35,7 @@ final class LangchainTodoUserMessageBuilder {
             for (LangchainCompletedTodo todo : completedTodos) {
                 message.append("已完成: ").append(safe(todo.getDescription())).append("\n");
                 message.append("摘要: ").append(safe(todo.getSummary())).append("\n");
-                message.append("输出: ").append(safe(todo.getOutput())).append("\n\n");
+                message.append("输出: ").append(safe(todo.displayOutput())).append("\n\n");
             }
         }
         message.append("当前任务: ").append(safe(todoDescription)).append("\n\n");
@@ -65,8 +65,8 @@ final class LangchainTodoUserMessageBuilder {
             for (LangchainCompletedTodo todo : completedTodos) {
                 context.append("- ").append(safe(todo.getDescription())).append(": ")
                         .append(safe(todo.getSummary())).append("\n");
-                if (todo.getOutput() != null && !todo.getOutput().isBlank()) {
-                    context.append("  输出: ").append(todo.getOutput()).append("\n");
+                if (!todo.displayOutput().isBlank()) {
+                    context.append("  输出: ").append(todo.displayOutput()).append("\n");
                 }
             }
         }
