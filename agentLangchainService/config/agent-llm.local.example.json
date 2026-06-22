@@ -300,6 +300,15 @@
         "minMessagesForSummary": 6,
         "summaryMaxMessages": 20
       }
+    },
+    "request": {
+      "max-retries": 3,
+      "retry": {
+        "backoff-type": "exponential",
+        "base-delay-ms": 1000,
+        "max-delay-ms": 4000,
+        "jitter-ms": 100
+      }
     }
   },
   "observability": {
@@ -349,6 +358,43 @@
   "eventStore": {
     "redisFlushBatchSize": 20,
     "redisFlushStaleMs": 3000
+  },
+  "agent": {
+    "call-raw-content": {
+      "ttl-seconds": 7200
+    },
+    "workspace": {
+      "dump": {
+        "ttl-hours": 12
+      }
+    },
+    "dataset": {
+      "ttl-hours": 12
+    }
+  },
+  "tools": {
+    "market-data": {
+      "dataset": {
+        "enabled": true
+      },
+      "batch": {
+        "emit-manifest": true
+      }
+    },
+    "result": {
+      "max-string-length": 2000,
+      "summary-model": "moonshotai/kimi-k2.5",
+      "summary-endpoint": "openrouter"
+    },
+    "summary": {
+      "max-retries": 3
+    },
+    "reread": {
+      "max-limit": 2000
+    },
+    "raw-ref": {
+      "ttl-hours": 12
+    }
   },
   "prompts": {
     "agentRunSystemPrompt": "file:prompts/agent/agent_run_system.txt",

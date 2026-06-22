@@ -14,6 +14,8 @@ import java.io.BufferedWriter;
 import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.UUID;
 import java.util.function.Function;
@@ -58,9 +60,20 @@ public class DatasetWriter {
         String safeTsCode = tsCode.replaceAll("[^a-zA-Z0-9.]", "_");
         String datasetId = String.format("%s-%s-%s-%s-%s", prefix, safeTsCode, start, end, uuid);
 
-        File datasetDir = new File(datasetPath, datasetId);
+        String scopeHash = DatasetPathStrategy.scopeHash(prefix, tsCode, start, end);
+        Path datasetDirPath = DatasetPathStrategy.resolvePath(Path.of(datasetPath), prefix, scopeHash, datasetId);
+        File datasetDir = datasetDirPath.toFile();
         if (!datasetDir.exists()) {
             datasetDir.mkdirs();
+        }
+
+        // Compatibility symlink: old flat path → new hierarchical path
+        DatasetPathStrategy.validateDatasetId(datasetId);
+        Path flatLinkPath = Path.of(datasetPath, datasetId);
+        try {
+            Files.createSymbolicLink(flatLinkPath, datasetDirPath);
+        } catch (IOException e) {
+            log.warn("Failed to create compat symlink {} → {}: {}", flatLinkPath, datasetDirPath, e.getMessage());
         }
 
         File csvFile = new File(datasetDir, datasetId + ".csv");

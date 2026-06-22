@@ -155,7 +155,10 @@ public class DatasetRegistry {
         String queryKey = buildQueryKey(type, tsCode, startDate, endDate, columns);
         long now = Instant.now().toEpochMilli();
         long expireAt = ttlSeconds > 0 ? now + ttlSeconds * 1000L : Long.MAX_VALUE;
-        String datasetDir = Paths.get(datasetPath, datasetId).toAbsolutePath().toString();
+        // 使用三层路径：{toolType}/{scopeHash}/{datasetId}
+        String scopeHash = DatasetPathStrategy.scopeHash(type, tsCode, startDate, endDate);
+        Path datasetDirPath = DatasetPathStrategy.resolvePath(Paths.get(datasetPath), type, scopeHash, datasetId);
+        String datasetDir = datasetDirPath.toAbsolutePath().toString();
 
         DatasetMeta meta = DatasetMeta.builder()
                 .datasetId(datasetId)
@@ -472,8 +475,12 @@ public class DatasetRegistry {
     private void deleteDatasetFiles(DatasetMeta meta) {
         Path dir = Paths.get(meta.getPath());
         if (!Files.exists(dir)) {
+            // 目录已不存在，清理残存的 compat symlink（避免 dangling）
+            cleanupCompatSymlink(meta.getDatasetId());
             return;
         }
+        // 先删 compat symlink，再删 target 目录，避免 dangling symlink
+        cleanupCompatSymlink(meta.getDatasetId());
         try {
             Files.walk(dir)
                     .sorted(Comparator.reverseOrder())
@@ -531,6 +538,17 @@ public class DatasetRegistry {
             return 12L;
         }
         return Math.max(1L, (seconds + 3599L) / 3600L);
+    }
+
+    private void cleanupCompatSymlink(String datasetId) {
+        Path flatLink = Paths.get(datasetPath, datasetId);
+        try {
+            if (Files.isSymbolicLink(flatLink) || Files.exists(flatLink)) {
+                Files.deleteIfExists(flatLink);
+            }
+        } catch (IOException e) {
+            log.debug("Compat symlink cleanup skipped for {}: {}", datasetId, e.getMessage());
+        }
     }
 
     private String metaKey(String queryKey) {

@@ -166,8 +166,16 @@ public class AgentLlmLocalConfigLoader {
 
     /**
      * 在 Jackson 反序列化前预处理 JSON 树，支持跨层别名映射。
-     * <p>例如历史配置或 Nacos 推送可能使用 {@code "tool"} 而非 {@code "tools"}，
-     * 或 {@code agent.llm.request} 路径而非 {@code runtime.request}；本方法统一转为对象结构接受的字段名。</p>
+     *
+     * <p>T6 canonical 字段与历史/兼容性别名的映射关系如下（canonical 优先）：</p>
+     * <ul>
+     *   <li>{@code "tool"} 别名 → canonical {@code "tools"}</li>
+     *   <li>{@code "agent.llm.request"} 别名 → canonical {@code "runtime.request"}</li>
+     * </ul>
+     *
+     * <p>当 canonical 字段已存在时，alias 只被移除而不会被覆盖，确保配置语义以 canonical 为准。
+     * 例如同时出现 {@code "agent.llm.request.maxRetries": 2} 和
+     * {@code "runtime.request.maxRetries": 3} 时，最终生效值为 {@code 3}。</p>
      */
     private JsonNode preprocessAliasTree(JsonNode root) {
         if (root == null || !root.isObject()) {
