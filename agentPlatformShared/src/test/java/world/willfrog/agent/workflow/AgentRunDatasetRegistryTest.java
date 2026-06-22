@@ -137,12 +137,86 @@ class AgentRunDatasetRegistryTest {
 
     @Test
     void manifestRelatedDatasetIdsShouldBeImmutableInSnapshot() {
+        // 260623 MF2: relatedDatasetIds 在 snapshot 时翻译成 run-level 编号；为保证翻译出 3 个 ref，
+        // 先注册对应 3 个 dataset。
+        registry.onDatasetPersisted(datasetEvent("run-1", "ds-1", "1.csv"));
+        registry.onDatasetPersisted(datasetEvent("run-1", "ds-2", "2.csv"));
+        registry.onDatasetPersisted(datasetEvent("run-1", "ds-3", "3.csv"));
         registry.onDatasetPersisted(manifestEvent("run-1", "m-x", "manifest.json", List.of("ds-1", "ds-2", "ds-3")));
         AgentRunDatasetSnapshot snap = registry.snapshot("run-1");
         AgentRunDatasetEntry m = snap.manifests().get(0);
         assertEquals(3, m.relatedDatasetIds().size());
         assertThrows(UnsupportedOperationException.class,
-                () -> m.relatedDatasetIds().add("ds-4"));
+                () -> m.relatedDatasetIds().add("4"));
+    }
+
+    /**
+     * MF2 拍板（spec §4.2.2）：manifest.related_dataset_ids 在 CSV 里必须是 agent run 级别
+     * dataset 编号（不是 originalId），且必须用同 snapshot 的编号（按 sortKey 排序后）。
+     *
+     * <p>用例：先注册 dataset ds-a (sortKey a.csv) 和 ds-b (sortKey b.csv)，但事件到达顺序为
+     * 「ds-b 先到 → ds-a 后到」。再注册 manifest 引用 [originalB, originalA]。Snapshot 编号
+     * 应按 sortKey 升序：ds-a=1, ds-b=2；manifest.relatedDatasetIds 必须翻译成 [2, 1]，
+     * 不是 [1, 2]（那会是到达顺序而非字典序）。
+     */
+    @Test
+    void manifestRelatedDatasetIdsShouldTranslateToSnapshotNumbers() {
+        // 乱序到达：b 先到、a 后到
+        registry.onDatasetPersisted(datasetEvent("run-1", "ds-b", "b.csv"));
+        registry.onDatasetPersisted(datasetEvent("run-1", "ds-a", "a.csv"));
+        // manifest 引用 [originalB, originalA]，按原始字符串顺序传入
+        registry.onDatasetPersisted(manifestEvent("run-1", "m-1", "manifest.json",
+                List.of("ds-b", "ds-a")));
+
+        AgentRunDatasetSnapshot snap = registry.snapshot("run-1");
+        assertEquals(2, snap.datasets().size());
+        // snapshot 按 sortKey 升序：a.csv=1, b.csv=2
+        assertEquals(1, snap.datasets().get(0).number());
+        assertEquals("ds-a", snap.datasets().get(0).originalId());
+        assertEquals(2, snap.datasets().get(1).number());
+        assertEquals("ds-b", snap.datasets().get(1).originalId());
+
+        AgentRunDatasetEntry mf = snap.manifests().get(0);
+        // 关键：manifest.relatedDatasetIds 必须翻译成 ["2", "1"]（按 originalB, originalA 的输入顺序），
+        // 而不是保留原字符串 [ds-b, ds-a]
+        assertEquals(List.of("2", "1"), mf.relatedDatasetIds(),
+                "relatedDatasetIds 应翻译成同 snapshot 的 run-level 编号字符串（按输入顺序）");
+    }
+
+    /**
+     * MF2 边界：manifest 引用的 originalId 在 snapshot 时如果不存在（dataset 还没注册），
+     * 该引用必须被丢弃并 log warning，manifest 注册本身不失败。
+     */
+    @Test
+    void manifestWithUnknownRelatedDatasetIdShouldDropRefAndKeepManifest() {
+        registry.onDatasetPersisted(datasetEvent("run-1", "ds-a", "a.csv"));
+        registry.onDatasetPersisted(manifestEvent("run-1", "m-1", "manifest.json",
+                List.of("ds-a", "ds-unknown")));
+
+        AgentRunDatasetSnapshot snap = registry.snapshot("run-1");
+        assertEquals(1, snap.manifests().size());
+        AgentRunDatasetEntry mf = snap.manifests().get(0);
+        // 已知 ref 翻译成 ["1"]，未知 ref 被丢弃
+        assertEquals(List.of("1"), mf.relatedDatasetIds(),
+                "未知 originalId 必须被丢弃，已知 originalId 翻译成 run-level 编号字符串");
+    }
+
+    /**
+     * MF2 端到端：转译后的 relatedDatasetIds 通过 CsvWriter 输出 CSV 时呈现为编号 join（不是 originalId）。
+     */
+    @Test
+    void csvShouldEmitTranslatedNumbersForRelatedDatasetIds() {
+        registry.onDatasetPersisted(datasetEvent("run-1", "ds-b", "b.csv"));
+        registry.onDatasetPersisted(datasetEvent("run-1", "ds-a", "a.csv"));
+        registry.onDatasetPersisted(manifestEvent("run-1", "m-1", "manifest.json",
+                List.of("ds-b", "ds-a")));
+
+        AgentRunDatasetSnapshot snap = registry.snapshot("run-1");
+        String manifestCsv = AgentRunDatasetCsvWriter.writePathManifestCsv(snap);
+        // manifest number=1, related 翻译成 ["2", "1"]（按输入顺序 originalB, originalA） → CSV "2#1"
+        String[] lines = manifestCsv.split("\n");
+        assertEquals(2, lines.length);
+        assertEquals("1,/__AF_INPUT__/m-1/manifest.json,2#1", lines[1]);
     }
 
     @Test

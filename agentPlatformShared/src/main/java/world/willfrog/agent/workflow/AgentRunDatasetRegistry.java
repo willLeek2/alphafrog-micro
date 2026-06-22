@@ -29,6 +29,11 @@ import java.util.concurrent.ConcurrentMap;
  * 编号分配推迟到 {@link #snapshot(String)} 调用时刻：sort by sortKey 后
  * 按出现顺序递增分配，确保乱序到达的事件也能得到字典序的稳定编号。
  *
+ * <p>实现要点（260623 Cindy review MF2 改造）：
+ * snapshot 时把 manifest.relatedDatasetIds（原始 originalId 列表）翻译成
+ * 同 snapshot 的 dataset run-level 编号，保证 CSV 里 related_dataset_ids 是
+ * 「run 级别编号」而不是 originalId（spec §4.2.2）。
+ *
  * <p>线程安全：所有状态在 {@code ConcurrentMap} 内；putIfAbsent 保证 raw entry 入池幂等。
  */
 @Component
@@ -107,13 +112,16 @@ public class AgentRunDatasetRegistry {
     /**
      * 当前 agent run 状态下所有 dataset / manifest 的稳定快照。
      *
-     * <p>编号在 snapshot 时按 sortKey 字典序分配（Cindy MF4 改造）：
+     * <p>编号在 snapshot 时按 sortKey 字典序分配（MF4 改造）：
      * <ol>
      *   <li>把所有 raw dataset entry 按 sortKey 升序排 → 编号 1..N</li>
      *   <li>把所有 raw manifest entry 按 sortKey 升序排 → 编号 1..M（独立编号空间，Q4）</li>
+     *   <li>对每个 manifest entry，把它的 {@code relatedDatasetIds}（存的是 originalId 列表）
+     *       用 (1) 的映射翻译成 dataset run-level 编号（MF2 改造，spec §4.2.2）；
+     *       翻译不到（dataset 还没注册）的 originalId 被丢弃并 log warning，
+     *       manifest 注册本身不失败</li>
      *   <li>用 {@link AgentRunDatasetEntry#forDataset} / {@link AgentRunDatasetEntry#forManifest}
-     *       构造 snapshot entry（保留 number / originalId / sortKey / fromTsCode /
-     *       originalId 形式的 relatedDatasetIds —— MF2 改造会再加一步翻译成 run-level 编号）</li>
+     *       构造 snapshot entry，relatedDatasetIds 存的是已翻译的编号字符串</li>
      * </ol>
      *
      * <p>每次返回一个新的 immutable snapshot 对象，不暴露内部 mutable 状态。
@@ -130,10 +138,12 @@ public class AgentRunDatasetRegistry {
         List<RawEntry> sortedDatasets = state.rawDatasets.values().stream()
                 .sorted(Comparator.comparing(RawEntry::sortKey, Comparator.nullsLast(Comparator.naturalOrder())))
                 .toList();
+        java.util.Map<String, Integer> datasetIdToNumber = new java.util.HashMap<>(sortedDatasets.size() * 2);
         List<AgentRunDatasetEntry> datasetEntries = new ArrayList<>(sortedDatasets.size());
         for (int i = 0; i < sortedDatasets.size(); i++) {
             int number = i + 1;
             RawEntry raw = sortedDatasets.get(i);
+            datasetIdToNumber.put(raw.originalId(), number);
             datasetEntries.add(AgentRunDatasetEntry.forDataset(
                     number, raw.originalId(), raw.persistedPath(),
                     raw.fromTsCode(), raw.sortKey()));
@@ -146,9 +156,21 @@ public class AgentRunDatasetRegistry {
         for (int i = 0; i < sortedManifests.size(); i++) {
             int number = i + 1;
             RawEntry raw = sortedManifests.get(i);
+            // MF2: 把 originalId 形式的 relatedDatasetIds 翻译成同 snapshot 的 run-level 编号。
+            // 翻译不到的 originalId 丢弃（dataset 还没注册），不阻断 manifest。
+            List<String> translated = new ArrayList<>(raw.relatedDatasetIds().size());
+            for (String relatedOriginalId : raw.relatedDatasetIds()) {
+                Integer relatedNumber = datasetIdToNumber.get(relatedOriginalId);
+                if (relatedNumber == null) {
+                    log.warn("Manifest references unknown dataset, drop ref: runId={} manifestId={} missingDatasetId={}",
+                            runId, raw.originalId(), relatedOriginalId);
+                    continue;
+                }
+                translated.add(Integer.toString(relatedNumber));
+            }
             AgentRunDatasetEntry mf = AgentRunDatasetEntry.forManifest(
                     number, raw.originalId(), raw.persistedPath(),
-                    raw.fromTsCode(), raw.sortKey(), raw.relatedDatasetIds());
+                    raw.fromTsCode(), raw.sortKey(), translated);
             manifestEntries.add(mf);
         }
 
