@@ -16,6 +16,16 @@ import static org.junit.jupiter.api.Assertions.*;
  * Focused test proving DatasetWriter and DatasetRegistry compute the same 4-layer path
  * when given the same clean type. This addresses Cindy's merge-readiness blocker:
  * persistedPath must point to the actual written file.
+ *
+ * <p>Both DatasetWriter and DatasetRegistry use the same DatabaseFetchedPathStrategy
+ * static methods (resolveTopic, encodedString, resolveDataPath) with the same clean
+ * type input. This test proves:
+ * <ol>
+ *   <li>Writer actually writes to the path computed from clean type (not runId prefix)</li>
+ *   <li>Writer and registry's path formulas produce identical results</li>
+ *   <li>Different types don't collide</li>
+ *   <li>Real file at writer path == registry's expected persistedPath</li>
+ * </ol>
  */
 class DatasetWriterRegistryPathAlignmentTest {
 
@@ -27,12 +37,11 @@ class DatasetWriterRegistryPathAlignmentTest {
     @BeforeEach
     void setUp() {
         writer = new DatasetWriter();
-        // Point writer at temp directories so it doesn't touch real /data
         ReflectionTestUtils.setField(writer, "datasetPath", tempDir.resolve("agent_datasets").toString());
         ReflectionTestUtils.setField(writer, "databaseFetchedPath", tempDir.resolve("database_fetched").toString());
         ReflectionTestUtils.setField(writer, "manifestsPath", tempDir.resolve("manifests").toString());
         ReflectionTestUtils.setField(writer, "enabled", true);
-        ReflectionTestUtils.setField(writer, "localConfigLoader", null); // disable dynamic config
+        ReflectionTestUtils.setField(writer, "localConfigLoader", null);
     }
 
     @Test
@@ -55,7 +64,6 @@ class DatasetWriterRegistryPathAlignmentTest {
         assertNotNull(datasetId);
         assertTrue(datasetId.contains("run123-stock"), "prefix should appear in datasetId");
 
-        // Compute expected path using the same strategy (clean type)
         String topic = DatabaseFetchedPathStrategy.resolveTopic("stock_daily");
         String encodedStr = DatabaseFetchedPathStrategy.encodedString("stock_daily", "000001.SZ",
                 "20240101", "20240131", headers);
@@ -78,31 +86,29 @@ class DatasetWriterRegistryPathAlignmentTest {
         String end = "20240131";
         List<String> columns = List.of("close", "volume");
 
-        // Writer's path formula (DatasetWriter L74-75, L86)
         String writerTopic = DatabaseFetchedPathStrategy.resolveTopic(type);
         String writerEncoded = DatabaseFetchedPathStrategy.encodedString(type, tsCode, start, end, columns);
         Path writerDir = DatabaseFetchedPathStrategy.resolveDataPath(
                 Path.of("/data/database_fetched"), writerTopic, tsCode, writerEncoded);
-        String writerFileName = tsCode + ".csv"; // writer uses safeTsCode + ".csv"
+        String writerFileName = tsCode + ".csv";
         Path writerPath = writerDir.resolve(writerFileName);
 
-        // Registry's path formula (DatasetRegistry L170-175, dataFileName from 6-arg default)
         String registryTopic = DatabaseFetchedPathStrategy.resolveTopic(type);
         String registryEncoded = DatabaseFetchedPathStrategy.encodedString(type, tsCode, start, end, columns);
         Path registryDir = DatabaseFetchedPathStrategy.resolveDataPath(
                 Path.of("/data/database_fetched"), registryTopic, tsCode, registryEncoded);
-        String registryFileName = tsCode.replaceAll("[^a-zA-Z0-9.]", "_") + ".csv"; // 6-arg default
+        String registryFileName = tsCode.replaceAll("[^a-zA-Z0-9.]", "_") + ".csv";
         Path registryPath = registryDir.resolve(registryFileName);
 
         assertEquals(writerTopic, registryTopic, "topic should match");
         assertEquals(writerEncoded, registryEncoded, "encodedString should match");
         assertEquals(writerDir, registryDir, "4-layer directory should match");
-        assertEquals(writerFileName, registryFileName, "data file name should match (both <tsCode>.csv)");
+        assertEquals(writerFileName, registryFileName, "data file name should match");
         assertEquals(writerPath, registryPath, "full persisted path should match");
     }
 
     @Test
-    @DisplayName("不同 type 不会碰巧撞目录 — type 变化改变 encodedString")
+    @DisplayName("不同 type 不会碰巧撞目录")
     void differentTypesShouldProduceDifferentPaths() {
         List<String> columns = List.of("close");
         String tsCode = "000001.SZ";
@@ -130,32 +136,66 @@ class DatasetWriterRegistryPathAlignmentTest {
         List<String> headers = List.of("close");
         List<TestRow> data = List.of(new TestRow("20240101", "10.0"));
 
-        // Write stock_daily
         writer.writeDataset("stock_daily", "run-stock", "000001.SZ",
                 "20240101", "20240131", data, headers, row -> List.of(row.date, row.open));
-
-        // Write index_daily with same tsCode and date range
         writer.writeDataset("index_daily", "run-index", "000001.SZ",
                 "20240101", "20240131", data, headers, row -> List.of(row.date, row.open));
 
-        // Verify they landed in different directories
         Path dbRoot = tempDir.resolve("database_fetched");
-        // stock_daily → domestic_listed_asset (stock_ prefix)
         Path stockDir = dbRoot.resolve("domestic_listed_asset").resolve("000001.SZ");
-        // index_daily → domestic_index (index_ prefix)
         Path indexDir = dbRoot.resolve("domestic_index").resolve("000001.SZ");
 
-        // Each dir should have one encodedString subdir
         assertTrue(Files.exists(stockDir));
         assertTrue(Files.exists(indexDir));
-        // Walk to count files
         long stockCsvCount = Files.walk(stockDir).filter(p -> p.toString().endsWith(".csv")).count();
         long indexCsvCount = Files.walk(indexDir).filter(p -> p.toString().endsWith(".csv")).count();
         assertEquals(1, stockCsvCount, "one stock CSV");
         assertEquals(1, indexCsvCount, "one index CSV");
     }
 
-    // Minimal row class for test data
+    @Test
+    @DisplayName("实际写盘文件路径 = registry persistedPath 公式结果 — 端到端一致性")
+    void actualWrittenFilePathMatchesRegistryPersistedPathFormula() throws Exception {
+        String type = "stock_daily";
+        String tsCode = "600000.SH";
+        String start = "20240101";
+        String end = "20240131";
+        List<String> columns = List.of("open", "high", "low", "close");
+
+        List<TestRow> data = List.of(new TestRow("20240101", "10.0", "11.0"));
+        writer.writeDataset(type, "run-stock", tsCode, start, end, data, columns,
+                row -> List.of(row.date, row.open, row.close));
+
+        // Find the actual written file
+        Path dbRoot = tempDir.resolve("database_fetched");
+        Path actualCsv = Files.walk(dbRoot)
+                .filter(p -> p.toString().endsWith(".csv"))
+                .findFirst()
+                .orElseThrow();
+        String actualFilePath = actualCsv.toAbsolutePath().toString();
+
+        // Compute what registry would use for the event's persistedPath
+        // (DatasetRegistry.registerDataset L172-175 + event publishing L206-209)
+        String registryTopic = DatabaseFetchedPathStrategy.resolveTopic(type);
+        String registryEncoded = DatabaseFetchedPathStrategy.encodedString(type, tsCode, start, end, columns);
+        Path registryDir = DatabaseFetchedPathStrategy.resolveDataPath(dbRoot, registryTopic, tsCode, registryEncoded);
+        String registryFileName = tsCode.replaceAll("[^a-zA-Z0-9.]", "_") + ".csv";
+        String registryPersistedPath = registryDir.resolve(registryFileName).toAbsolutePath().toString();
+
+        // THE KEY ASSERTION: writer's actual file == registry's persistedPath formula
+        assertEquals(registryPersistedPath, actualFilePath,
+                "registry persistedPath formula must produce the same path as writer's actual file");
+
+        // Verify the file really exists at the registry-computed path
+        assertTrue(Files.exists(Path.of(registryPersistedPath)),
+                "file must exist at registry-computed persistedPath");
+
+        // Verify CSV content is readable
+        String content = Files.readString(Path.of(registryPersistedPath));
+        assertTrue(content.contains("open,high,low,close"));
+        assertTrue(content.contains("20240101"));
+    }
+
     record TestRow(String date, String open, String close) {
         TestRow(String date, String value) { this(date, value, null); }
     }
