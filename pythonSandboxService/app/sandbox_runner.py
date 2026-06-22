@@ -321,11 +321,11 @@ def _copy_via_csv_source_paths(
       - 目的路径 = 第 2 列 placeholder 替换为 task_input
       - sandbox path = `<task_input>/<originalId>/<sortKey>`，filename = sortKey
       - NONE 行（manifest_file_path == NONE）由 _materialize_agent_run_csvs 单独物化，不在此 cp
-      - 至少一行成功 cp 才返回正数；调用方据此决定是否走 legacy data_dir fallback
 
-    MF-new-3（260623-02 round 2 review fix）：agent-run 模式下任何"应该被 cp 但没 cp"
-    的非 NONE 行（空 source_path / copy 抛异常）都必须 fail loud，不能 silently 跳过
-    让 sandbox 接着启动后才发现文件缺失（delayed Python load failure）。
+    MF-new-3（260623-02 round 3 review fix，commit `6450c2a`）：agent-run 模式下任何
+    "应该被 cp 但没 cp" 的非 NONE 行（空 source_path / copy 抛异常）都必须 fail loud，
+    不能 silently 跳过让 sandbox 接着启动后才发现文件缺失（delayed Python load failure）。
+    返回 failed_rows 列表，由调用方 _prepare_task_workspace 决定是否抛 RuntimeError。
 
     Returns:
         (count, expected_count, failed_rows)

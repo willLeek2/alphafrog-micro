@@ -140,12 +140,16 @@ public class ListMyDataTool {
     }
 
     /**
-     * ToolRouter 入口（Cindy round 2 review MF-new-1）：保留 6 形参入口以避免破坏既有
-     * routing 逻辑，行为同 8 形参版，但 grep 视为对 originalId 子串匹配（与原始 listMyData 6 形参
-     * 语义一致：不做 raw file grep）。不是 {@code @Tool} 注解方法，仅供 ToolRouter 内部调用。
+     * Legacy helper（MF-new-1 后已不被 ToolRouter 使用）：保留 6 形参入口以避免破坏既有
+     * 调用方（其他模块或历史测试），grep 视为对 originalId 子串匹配（与原始 listMyData 6 形参
+     * 语义一致：不做 raw file grep）。不是 {@code @Tool} 注解方法。
      *
-     * <p>本入口走 {@link #executeLegacy6Core} 旧语义实现，与 8 形参 LLM-facing
-     * {@code @Tool} 入口 {@link #listMyData(String, String, String, Integer, Integer, Integer, Integer, String)}
+     * <p>ToolRouter 当前 route 走 8 形参 {@code @Tool} 入口（见 round 3 commit {@code d1f4440}），
+     * 旧 6 形参语义由本方法 + {@link #executeLegacy6Core} 提供向后兼容，仅供其他 Java 模块
+     * 或历史测试调用。
+     *
+     * <p>本入口与 8 形参 LLM-facing {@code @Tool} 入口
+     * {@link #listMyData(String, String, String, Integer, Integer, Integer, Integer, String)}
      * 行为在「非 grep 模式」下一致；区别仅在 grep 参数：6 形参版对 originalId 子串匹配，
      * 8 形参版对原始文件全文 grep。
      */
