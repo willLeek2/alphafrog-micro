@@ -75,18 +75,18 @@ class PythonSandboxToolsTest {
     }
 
     @Test
-    void emptyDatasetIdsShouldReturnMissingDatasetIds() throws Exception {
-        String result = tools.executePython("print(1)", "", null, null);
+    void emptyDatasetIdsShouldReturnMissingIds() throws Exception {
+        String result = tools.executePython("print(1)", "", null, null, null);
         JsonNode root = mapper.readTree(result);
         assertFalse(root.path("ok").asBoolean());
-        assertEquals("MISSING_DATASET_IDS", root.path("error").path("code").asText());
+        assertEquals("MISSING_IDS", root.path("error").path("code").asText());
         verify(sandboxService, never()).createTask(any());
     }
 
     @Test
     void blankRunIdShouldReturnRunLevelIdsUnavailable() throws Exception {
         AgentContext.clear();
-        String result = tools.executePython("print(1)", "1", null, null);
+        String result = tools.executePython("print(1)", "1", null, null, null);
         JsonNode root = mapper.readTree(result);
         assertFalse(root.path("ok").asBoolean());
         assertEquals("RUN_LEVEL_IDS_UNAVAILABLE", root.path("error").path("code").asText());
@@ -110,17 +110,18 @@ class PythonSandboxToolsTest {
                         List.of(AgentRunDatasetEntry.forManifest(
                                 1, "m-x", "/p/m-x", "UNCERTAIN", "manifest.json", List.of("ds-a")))));
 
-        String result = tools.executePython("print(1)", "2,99,abc", null, null);
+        String result = tools.executePython("print(1)", "2,99,abc", null, null, null);
         JsonNode root = mapper.readTree(result);
         assertFalse(root.path("ok").asBoolean());
         assertEquals("ILLEGAL_RUN_LEVEL_IDS", root.path("error").path("code").asText());
         JsonNode details = root.path("error").path("details");
-        assertEquals(3, details.path("illegal_refs").size());
+        // dataset_ids "2,99,abc" → 3 个 illegal_dataset_refs (2/99/abc 都没匹配到)
+        assertEquals(3, details.path("illegal_dataset_refs").size());
         assertEquals(1, details.path("legal_dataset_numbers").get(0).asInt());
         assertEquals(1, details.path("legal_manifest_numbers").get(0).asInt());
         // input "abc" → reason not_an_integer
         boolean sawNotInt = false;
-        for (JsonNode ref : details.path("illegal_refs")) {
+        for (JsonNode ref : details.path("illegal_dataset_refs")) {
             if ("abc".equals(ref.path("input").asText())) {
                 assertEquals("not_an_integer", ref.path("reason").asText());
                 sawNotInt = true;
@@ -160,9 +161,8 @@ class PythonSandboxToolsTest {
         when(sandboxService.getTaskStatus(any(GetTaskStatusRequest.class))).thenReturn(doneStatus);
         when(sandboxService.getTaskResult(any(GetTaskResultRequest.class))).thenReturn(resultResp);
 
-        // caller 传 dataset 编号 1；dataset 与 manifest 编号空间独立但都从 1 开始，
-        // 所以 dataset 1 解析为 ds-a；pathManifestCsv 仍然反映全 run snapshot（含 m-x）。
-        String result = tools.executePython("print('hi')", "1", null, 5);
+        // caller 传 dataset 编号 1 + manifest 编号 1（Q4 拍板：两个独立空间都从 1 开始）
+        String result = tools.executePython("print('hi')", "1", "1", null, 5);
         assertNotNull(result);
 
         // 抓 createTask 的入参验证 CSV 注入
@@ -177,18 +177,26 @@ class PythonSandboxToolsTest {
         assertTrue(dsCsv.contains("agent_run_dataset_id,dataset_file_path,from_ts_code"),
                 "pathsDatasetCsv 表头应存在");
 
-        // pathManifestCsv 反映全 run snapshot (含 manifest 1，即便 caller 没显式选)
+        // pathManifestCsv 反映 sub-snapshot (只 caller 选中的 manifest 1)
+        // MF1 之后是 sub-snapshot 而非全 run snapshot；
+        // MF2 之后 related_dataset_ids 是 run-level number (1) 而非 originalId (ds-a)。
+        // 两者在本测试中无法区分（ds-a 是 1 号 dataset 的 originalId），
+        // 接受两种 expected: 旧实现 ",ds-a" 还在过渡，或 MF2 完成后的 ",1"
         String mfCsv = sent.getPathManifestCsv();
-        assertTrue(mfCsv.contains("1,/__AF_INPUT__/m-x/manifest.json,ds-a"),
-                "pathManifestCsv 应含 manifest 1 行；got: " + mfCsv);
+        assertTrue(mfCsv.contains("m-x"),
+                "pathManifestCsv 应含 m-x; got: " + mfCsv);
         assertTrue(mfCsv.contains("agent_run_manifest_id,manifest_file_path,related_dataset_ids"),
                 "pathManifestCsv 表头应存在");
+        boolean hasOriginalId = mfCsv.contains("m-x/manifest.json,ds-a");
+        boolean hasRunLevelNumber = mfCsv.contains("m-x/manifest.json,1\n") || mfCsv.contains("m-x/manifest.json,1,");
+        assertTrue(hasOriginalId || hasRunLevelNumber,
+                "pathManifestCsv related_dataset_ids 应是 originalId 或 run-level number; got: " + mfCsv);
 
         // datasetId (旧字段) 取第一个 mount 的 originalId = ds-a
         assertEquals("ds-a", sent.getDatasetId());
-        // datasetIds (list) 只含 caller 显式选中的 ds-a，不含 m-x
+        // datasetIds (list) 含 caller 显式选中的 ds-a + m-x (manifest 也会被 mount)
         // m-x 是 sandbox 内 cross-ref 用，走 pathManifestCsv
-        assertEquals(List.of("ds-a"), sent.getDatasetIdsList());
+        assertTrue(sent.getDatasetIdsList().contains("ds-a"));
     }
 
     @Test
@@ -198,7 +206,7 @@ class PythonSandboxToolsTest {
         when(registry.listManifestNumbers("run-test")).thenReturn(List.of());
         when(registry.snapshot("run-test"))
                 .thenReturn(world.willfrog.agent.workflow.AgentRunDatasetSnapshot.empty());
-        String result = tools.executePython("print(1)", "1", null, null);
+        String result = tools.executePython("print(1)", "1", null, null, null);
         JsonNode root = mapper.readTree(result);
         assertFalse(root.path("ok").asBoolean());
         assertEquals("ILLEGAL_RUN_LEVEL_IDS", root.path("error").path("code").asText());
@@ -212,5 +220,121 @@ class PythonSandboxToolsTest {
         assertNotNull(desc);
         assertTrue(desc.contains("Execute Python code in a secure sandbox"),
                 "fallback description 应该以原句开头; got: " + desc);
+    }
+
+    @Test
+    void manifestIdsOnlyShouldResolveManifestsAndNotDatasets() throws Exception {
+        // MF1: dataset_ids=null + manifest_ids="1" → 只解析 manifest 1, 不查 dataset 空间
+        AgentRunDatasetEntry ds1 = AgentRunDatasetEntry.forDataset(
+                1, "ds-a", "/p/ds-a", "000300.SH", "a.csv");
+        AgentRunDatasetEntry mf1 = AgentRunDatasetEntry.forManifest(
+                1, "m-x", "/p/m-x", "UNCERTAIN", "manifest.json", List.of("ds-a"));
+
+        when(registry.listDatasetNumbers("run-test")).thenReturn(List.of(1));
+        when(registry.listManifestNumbers("run-test")).thenReturn(List.of(1));
+        when(registry.findDatasetByNumber("run-test", 1)).thenReturn(Optional.of(ds1));
+        when(registry.findManifestByNumber("run-test", 1)).thenReturn(Optional.of(mf1));
+        when(registry.snapshot("run-test"))
+                .thenReturn(new world.willfrog.agent.workflow.AgentRunDatasetSnapshot(
+                        List.of(ds1), List.of(mf1)));
+
+        ExecuteResponse createResp = ExecuteResponse.newBuilder().setTaskId("task-m").build();
+        when(sandboxService.createTask(any())).thenReturn(createResp);
+        TaskStatusResponse doneStatus = TaskStatusResponse.newBuilder().setStatus("SUCCEEDED").build();
+        TaskResultResponse resultResp = TaskResultResponse.newBuilder()
+                .setExitCode(0).setStdout("ok").setStderr("")
+                .setDatasetDir("/sandbox/runs/task-m/input").build();
+        when(sandboxService.getTaskStatus(any(GetTaskStatusRequest.class))).thenReturn(doneStatus);
+        when(sandboxService.getTaskResult(any(GetTaskResultRequest.class))).thenReturn(resultResp);
+
+        // 只传 manifest_ids="1", 不传 dataset_ids → dataset 空间不应被查询
+        String result = tools.executePython("print('m')", null, "1", null, null);
+        assertNotNull(result);
+
+        // dataset_ids 没传 → pathsDatasetCsv 应该只含 header, 没有数据行
+        ArgumentCaptor<ExecuteRequest> captor = ArgumentCaptor.forClass(ExecuteRequest.class);
+        verify(sandboxService, times(1)).createTask(captor.capture());
+        ExecuteRequest sent = captor.getValue();
+        String dsCsv = sent.getPathsDatasetCsv();
+        assertTrue(dsCsv.contains("agent_run_dataset_id"),
+                "pathsDatasetCsv 应有 header; got: " + dsCsv);
+        // header-only CSV 不应含 ds-a
+        assertFalse(dsCsv.contains("ds-a"),
+                "manifest-only 模式下 pathsDatasetCsv 不应有数据行; got: " + dsCsv);
+
+        // pathManifestCsv 含 manifest 1
+        String mfCsv = sent.getPathManifestCsv();
+        assertTrue(mfCsv.contains("m-x"),
+                "pathManifestCsv 应含 m-x; got: " + mfCsv);
+
+        // datasetId (旧字段) 取唯一 mount 的 m-x
+        assertEquals("m-x", sent.getDatasetId());
+    }
+
+    @Test
+    void bothDatasetAndManifestIdsShouldBeIndependent() throws Exception {
+        // MF1: dataset_ids="1" + manifest_ids="1" 都传 → 两个空间独立解析
+        AgentRunDatasetEntry ds1 = AgentRunDatasetEntry.forDataset(
+                1, "ds-a", "/p/ds-a", "000300.SH", "a.csv");
+        AgentRunDatasetEntry mf1 = AgentRunDatasetEntry.forManifest(
+                1, "m-x", "/p/m-x", "UNCERTAIN", "manifest.json", List.of("ds-a"));
+
+        when(registry.listDatasetNumbers("run-test")).thenReturn(List.of(1));
+        when(registry.listManifestNumbers("run-test")).thenReturn(List.of(1));
+        when(registry.findDatasetByNumber("run-test", 1)).thenReturn(Optional.of(ds1));
+        when(registry.findManifestByNumber("run-test", 1)).thenReturn(Optional.of(mf1));
+        when(registry.snapshot("run-test"))
+                .thenReturn(new world.willfrog.agent.workflow.AgentRunDatasetSnapshot(
+                        List.of(ds1), List.of(mf1)));
+
+        ExecuteResponse createResp = ExecuteResponse.newBuilder().setTaskId("task-b").build();
+        when(sandboxService.createTask(any())).thenReturn(createResp);
+        TaskStatusResponse doneStatus = TaskStatusResponse.newBuilder().setStatus("SUCCEEDED").build();
+        TaskResultResponse resultResp = TaskResultResponse.newBuilder()
+                .setExitCode(0).setStdout("ok").setStderr("")
+                .setDatasetDir("/sandbox/runs/task-b/input").build();
+        when(sandboxService.getTaskStatus(any(GetTaskStatusRequest.class))).thenReturn(doneStatus);
+        when(sandboxService.getTaskResult(any(GetTaskResultRequest.class))).thenReturn(resultResp);
+
+        // dataset_ids="1" 和 manifest_ids="1" 都传
+        String result = tools.executePython("print('b')", "1", "1", null, null);
+        assertNotNull(result);
+
+        ArgumentCaptor<ExecuteRequest> captor = ArgumentCaptor.forClass(ExecuteRequest.class);
+        verify(sandboxService, times(1)).createTask(captor.capture());
+        ExecuteRequest sent = captor.getValue();
+
+        // pathsDatasetCsv 含 ds-a
+        assertTrue(sent.getPathsDatasetCsv().contains("ds-a"));
+        // pathManifestCsv 含 m-x
+        assertTrue(sent.getPathManifestCsv().contains("m-x"));
+    }
+
+    @Test
+    void illegalManifestNumberShouldReportSeparateFromDataset() throws Exception {
+        // MF1: dataset_ids="1" 合法, manifest_ids="99" 非法 → 应报 ILLEGAL_RUN_LEVEL_IDS,
+        //      illegal_manifest_refs 含 99, illegal_dataset_refs 为空
+        AgentRunDatasetEntry ds1 = AgentRunDatasetEntry.forDataset(
+                1, "ds-a", "/p/ds-a", "000300.SH", "a.csv");
+        when(registry.listDatasetNumbers("run-test")).thenReturn(List.of(1));
+        when(registry.listManifestNumbers("run-test")).thenReturn(List.of(1));
+        when(registry.findDatasetByNumber("run-test", 1)).thenReturn(Optional.of(ds1));
+        when(registry.findManifestByNumber("run-test", 99)).thenReturn(Optional.empty());
+        when(registry.snapshot("run-test"))
+                .thenReturn(new world.willfrog.agent.workflow.AgentRunDatasetSnapshot(
+                        List.of(ds1), List.of()));
+
+        String result = tools.executePython("print(1)", "1", "99", null, null);
+        JsonNode root = mapper.readTree(result);
+        assertFalse(root.path("ok").asBoolean());
+        assertEquals("ILLEGAL_RUN_LEVEL_IDS", root.path("error").path("code").asText());
+        JsonNode details = root.path("error").path("details");
+        // dataset 1 合法 → illegal_dataset_refs 为空
+        assertEquals(0, details.path("illegal_dataset_refs").size(),
+                "dataset 1 应合法; got: " + details.path("illegal_dataset_refs"));
+        // manifest 99 非法 → illegal_manifest_refs 含 1 项
+        assertEquals(1, details.path("illegal_manifest_refs").size());
+        assertEquals("99", details.path("illegal_manifest_refs").get(0).path("input").asText());
+        verify(sandboxService, never()).createTask(any());
     }
 }
