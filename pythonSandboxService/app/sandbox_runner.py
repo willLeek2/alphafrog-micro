@@ -8,7 +8,7 @@ import re
 import shlex
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from llm_sandbox import SandboxSession
 from llm_sandbox.exceptions import SandboxTimeoutError
@@ -208,7 +208,7 @@ def _prepare_task_workspace(
     # 扫描（那会让 sandbox 重新看到 originalId，违反 run-level 抽象）。
     # legacy non-agent-run 调用：CSVs 都空 → 走 data_dir 兼容路径保持向后兼容。
     has_csv = bool((paths_dataset_csv or "").strip() or (path_manifest_csv or "").strip())
-    source_copy_count = _copy_via_csv_source_paths(
+    source_copy_count, expected_copy_count, failed_rows = _copy_via_csv_source_paths(
         session,
         config,
         task_id,
@@ -216,11 +216,26 @@ def _prepare_task_workspace(
         paths_dataset_csv or "",
         path_manifest_csv or "",
     )
-    if has_csv and source_copy_count == 0:
-        # Agent run 模式 contract 被破坏：caller 给了 CSVs 但 sandbox 拿不到 source 文件。
-        # 不要悄悄 fallback 到 legacy data_dir 扫描——那会让 sandbox 看到 originalId，
-        # 跟"agent run = run-level 抽象"的设计目标冲突。直接抛 RuntimeError 让上层
-        # pool/gateway 把它当成 TOOL_ERROR 返回给 caller。
+    if has_csv and failed_rows:
+        # MF-new-3 (260623-02 round 2 review fix): agent-run 模式下任何"应该被 cp 但没 cp"
+        # 的非 NONE 行（空 source_path / copy 抛异常）都必须 fail loud，
+        # 不能 silently 跳过让 sandbox 启动后才发现文件缺失（delayed Python load failure）。
+        # 列出 failed row(s) 的 originalId / source_path / reason 便于 caller 定位。
+        rendered = ", ".join(
+            f"kind={r['kind']} original_id={r['original_id']} "
+            f"source_path={r['source_path']!r} reason={r['reason']}"
+            for r in failed_rows
+        )
+        raise RuntimeError(
+            f"agent_run mode but {len(failed_rows)} row(s) failed to copy from CSVs: "
+            f"{rendered}. paths_dataset_csv provided={bool((paths_dataset_csv or '').strip())} "
+            f"path_manifest_csv provided={bool((path_manifest_csv or '').strip())}. "
+            "Check that DatasetPersistedEvent carries persistedPath for all entries and "
+            "every source file exists on disk."
+        )
+    if has_csv and source_copy_count == 0 and expected_copy_count == 0:
+        # MF5 fail loud：CSVs 非空但没有任何"应当被 cp"的非 NONE 行（既无 source_path 也无 NONE 物化）。
+        # 这种情况意味着 caller 给了空 CSVs（只有 header / 完全没数据行）——同样是 config 错误。
         raise RuntimeError(
             "agent_run mode but no source files were copied from CSVs: "
             f"paths_dataset_csv provided={bool((paths_dataset_csv or '').strip())} "
@@ -294,7 +309,7 @@ def _copy_via_csv_source_paths(
     task_input: str,
     paths_dataset_csv: str,
     path_manifest_csv: str,
-) -> int:
+) -> Tuple[int, int, List[Dict[str, str]]]:
     """MF3: 从 paths_dataset.csv / path_manifest.csv 第 4 列读 source_path，直接 cp 到 sandbox。
 
     输入 CSV schema（Java AgentRunDatasetCsvWriter 写）：
@@ -308,19 +323,44 @@ def _copy_via_csv_source_paths(
       - NONE 行（manifest_file_path == NONE）由 _materialize_agent_run_csvs 单独物化，不在此 cp
       - 至少一行成功 cp 才返回正数；调用方据此决定是否走 legacy data_dir fallback
 
+    MF-new-3（260623-02 round 2 review fix）：agent-run 模式下任何"应该被 cp 但没 cp"
+    的非 NONE 行（空 source_path / copy 抛异常）都必须 fail loud，不能 silently 跳过
+    让 sandbox 接着启动后才发现文件缺失（delayed Python load failure）。
+
     Returns:
-        实际 copy 的文件数（0 表示无 source_path → 走 legacy）
+        (count, expected_count, failed_rows)
+        - count: 实际成功 copy 的文件数
+        - expected_count: 应当被 copy 的行数（非 NONE 且 source_path 非空）
+        - failed_rows: 每条 {"kind": "dataset"|"manifest", "original_id": str,
+          "source_path": str, "reason": str}——空 source_path 与 copy 异常都计入，
+          NONE 行豁免（在 _materialize_agent_run_csvs 单独处理）
     """
     task_input_prefix = task_input.rstrip("/") + "/"
     count = 0
+    expected_count = 0
+    failed_rows: List[Dict[str, str]] = []
 
-    def _copy_row(sandbox_path_field: str, source_path_field: str, kind: str, row_number: str) -> bool:
-        nonlocal count
-        if not source_path_field or not source_path_field.strip():
-            return False
+    def _copy_row(sandbox_path_field: str, source_path_field: str, kind: str, row_number: str) -> None:
+        nonlocal count, expected_count, failed_rows
         if sandbox_path_field == MANIFEST_NONE_MARKER:
-            # NONE 行走 _materialize_none_manifest，不在此 cp
-            return False
+            # NONE 行走 _materialize_none_manifest，不在此 cp，也不算失败
+            return
+        if not source_path_field or not source_path_field.strip():
+            # agent-run 模式下 CSVs 由 caller 显式提供 source_path，
+            # 空 source_path 表示 caller 漏带 persistedPath —— 视为失败
+            expected_count += 1
+            failed_rows.append({
+                "kind": kind,
+                "original_id": row_number,
+                "source_path": "",
+                "reason": "empty_source_path",
+            })
+            logger.warning(
+                "mf3_source_copy 空 source_path：kind=%s row=%s",
+                kind, row_number,
+            )
+            return
+        expected_count += 1
         dest = sandbox_path_field.replace(SANDBOX_INPUT_PLACEHOLDER, task_input_prefix)
         source = source_path_field.strip()
         # filename = basename(source)
@@ -341,13 +381,17 @@ def _copy_via_csv_source_paths(
                 config,
                 f"mf3_source_copy kind={kind} row={row_number} src={source} dest={dest}",
             )
-            return True
-        except Exception as e:  # noqa: BLE001 — 单文件失败不阻断整个 task
+        except Exception as e:  # noqa: BLE001 — 失败原因记录到 failed_rows
             logger.warning(
                 "mf3_source_copy 失败：kind=%s row=%s src=%s err=%s",
                 kind, row_number, source, e,
             )
-            return False
+            failed_rows.append({
+                "kind": kind,
+                "original_id": row_number,
+                "source_path": source,
+                "reason": f"copy_failed:{type(e).__name__}",
+            })
 
     # paths_dataset.csv 行
     if paths_dataset_csv.strip():
@@ -377,7 +421,7 @@ def _copy_via_csv_source_paths(
                 continue
             _copy_row(row[1], row[3], "manifest", row[0])
 
-    return count
+    return count, expected_count, failed_rows
 
 
 def _materialize_agent_run_csvs(

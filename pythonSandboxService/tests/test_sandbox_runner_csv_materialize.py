@@ -670,10 +670,12 @@ class SandboxRunnerCsvSourcePathCopyTest(unittest.TestCase):
             "1,/__AF_INPUT__/ds-a/a.csv,000300.SH,/data/database_fetched/7D3A/000300.SH.csv\n"
             "2,/__AF_INPUT__/ds-b/b.csv,000002.SZ,/data/database_fetched/abc/000002.SZ.csv\n"
         )
-        count = _copy_via_csv_source_paths(
+        count, expected, failed = _copy_via_csv_source_paths(
             session, config, "task-mf3", "/sandbox/runs/task-mf3/input", ds_csv, ""
         )
         self.assertEqual(count, 2)
+        self.assertEqual(expected, 2)
+        self.assertEqual(failed, [])
         writes_by_dest = {w[1]: w[0] for w in session.writes}
         self.assertIn("/sandbox/runs/task-mf3/input/ds-a/000300.SH.csv", writes_by_dest)
         self.assertIn("/sandbox/runs/task-mf3/input/ds-b/000002.SZ.csv", writes_by_dest)
@@ -687,10 +689,12 @@ class SandboxRunnerCsvSourcePathCopyTest(unittest.TestCase):
             "agent_run_manifest_id,manifest_file_path,related_dataset_ids,source_path\n"
             "1,/__AF_INPUT__/m-x/manifest.json,1,/data/manifests/v1/manifest-x/manifest.json\n"
         )
-        count = _copy_via_csv_source_paths(
+        count, expected, failed = _copy_via_csv_source_paths(
             session, config, "task-mf3", "/sandbox/runs/task-mf3/input", "", mf_csv
         )
         self.assertEqual(count, 1)
+        self.assertEqual(expected, 1)
+        self.assertEqual(failed, [])
         writes_by_dest = {w[1]: w[0] for w in session.writes}
         self.assertIn(
             "/sandbox/runs/task-mf3/input/m-x/manifest.json",
@@ -706,15 +710,21 @@ class SandboxRunnerCsvSourcePathCopyTest(unittest.TestCase):
             "agent_run_manifest_id,manifest_file_path,related_dataset_ids,source_path\n"
             f"1,{MANIFEST_NONE_MARKER},1#,/data/should-be-ignored.json\n"
         )
-        count = _copy_via_csv_source_paths(
+        count, expected, failed = _copy_via_csv_source_paths(
             session, config, "task-mf3", "/sandbox/runs/task-mf3/input", "", mf_csv
         )
-        # NONE 行不复制（即使 source_path 不为空）
+        # NONE 行不复制（即使 source_path 不为空），也不算 failure
         self.assertEqual(count, 0)
+        self.assertEqual(expected, 0)
+        self.assertEqual(failed, [])
         self.assertEqual(session.writes, [])
 
     def test_empty_source_path_returns_zero(self) -> None:
-        """MF3: 第 4 列为空 → 0 次复制（调用方决定是否走 legacy data_dir fallback）。"""
+        """MF3: 第 4 列为空 → 0 次复制 + recorded as failure（caller 应 fail loud 上层）。
+
+        单 helper 调用视角：count=0，expected=1（行存在但 source_path 空），failed=[...]。
+        上层 _prepare_task_workspace 看到 failed_rows 非空 → 在 agent-run 模式下抛 RuntimeError。
+        """
         from app.sandbox_runner import _copy_via_csv_source_paths
         config = _test_config(Path("/tmp/none"))
         session = _FakeSession()
@@ -722,10 +732,16 @@ class SandboxRunnerCsvSourcePathCopyTest(unittest.TestCase):
             "agent_run_dataset_id,dataset_file_path,from_ts_code,source_path\n"
             "1,/__AF_INPUT__/ds-a/a.csv,000300.SH,\n"  # 空 source_path
         )
-        count = _copy_via_csv_source_paths(
+        count, expected, failed = _copy_via_csv_source_paths(
             session, config, "task-mf3", "/sandbox/runs/task-mf3/input", ds_csv, ""
         )
         self.assertEqual(count, 0)
+        self.assertEqual(expected, 1)
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["kind"], "dataset")
+        self.assertEqual(failed[0]["original_id"], "1")
+        self.assertEqual(failed[0]["source_path"], "")
+        self.assertEqual(failed[0]["reason"], "empty_source_path")
         self.assertEqual(session.writes, [])
 
     def test_three_column_legacy_csv_returns_zero(self) -> None:
@@ -737,10 +753,13 @@ class SandboxRunnerCsvSourcePathCopyTest(unittest.TestCase):
             "agent_run_dataset_id,dataset_file_path,from_ts_code\n"
             "1,/__AF_INPUT__/ds-a/a.csv,000300.SH\n"
         )
-        count = _copy_via_csv_source_paths(
+        count, expected, failed = _copy_via_csv_source_paths(
             session, config, "task-mf3", "/sandbox/runs/task-mf3/input", ds_csv, ""
         )
         self.assertEqual(count, 0)
+        # 3 列 legacy CSV 第 4 列不存在 → 既不算 cp 也不算 failure（仅当 4 列存在才解析）
+        self.assertEqual(expected, 0)
+        self.assertEqual(failed, [])
         self.assertEqual(session.writes, [])
 
     def test_combined_dataset_and_manifest(self) -> None:
@@ -756,21 +775,52 @@ class SandboxRunnerCsvSourcePathCopyTest(unittest.TestCase):
             "agent_run_manifest_id,manifest_file_path,related_dataset_ids,source_path\n"
             "1,/__AF_INPUT__/m-x/manifest.json,1,/data/m-x/manifest.json\n"
         )
-        count = _copy_via_csv_source_paths(
+        count, expected, failed = _copy_via_csv_source_paths(
             session, config, "task-mf3", "/sandbox/runs/task-mf3/input", ds_csv, mf_csv
         )
         self.assertEqual(count, 2)
+        self.assertEqual(expected, 2)
+        self.assertEqual(failed, [])
 
     def test_empty_csvs_return_zero(self) -> None:
         """MF3: 两个 CSV 都为空 → 0 次复制。"""
         from app.sandbox_runner import _copy_via_csv_source_paths
         config = _test_config(Path("/tmp/none"))
         session = _FakeSession()
-        count = _copy_via_csv_source_paths(
+        count, expected, failed = _copy_via_csv_source_paths(
             session, config, "task-mf3", "/sandbox/runs/task-mf3/input", "", ""
         )
         self.assertEqual(count, 0)
+        self.assertEqual(expected, 0)
+        self.assertEqual(failed, [])
         self.assertEqual(session.writes, [])
+
+    def test_copy_exception_recorded_as_failure(self) -> None:
+        """MF-new-3: copy_to_runtime 抛异常 → 记入 failed_rows（reason=copy_failed:*）。
+
+        helper 视角：count=0（实际没 cp 成功），expected=1，failed=[1 row]。
+        """
+        from app.sandbox_runner import _copy_via_csv_source_paths
+        config = _test_config(Path("/tmp/none"))
+        session = _FakeSession()
+        # make copy_to_runtime raise
+        def _boom(payload, dest):
+            raise OSError("disk gone")
+        session.copy_to_runtime = _boom  # type: ignore[assignment]
+        ds_csv = (
+            "agent_run_dataset_id,dataset_file_path,from_ts_code,source_path\n"
+            "1,/__AF_INPUT__/ds-a/a.csv,000300.SH,/data/ds-a/a.csv\n"
+        )
+        count, expected, failed = _copy_via_csv_source_paths(
+            session, config, "task-mf3", "/sandbox/runs/task-mf3/input", ds_csv, ""
+        )
+        self.assertEqual(count, 0)
+        self.assertEqual(expected, 1)
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["kind"], "dataset")
+        self.assertEqual(failed[0]["original_id"], "1")
+        self.assertEqual(failed[0]["source_path"], "/data/ds-a/a.csv")
+        self.assertTrue(failed[0]["reason"].startswith("copy_failed:"))
 
 
 class SandboxRunnerPrepareWorkspaceFailLoudTest(unittest.TestCase):
@@ -950,18 +1000,18 @@ class SandboxRunnerPrepareWorkspaceFailLoudTest(unittest.TestCase):
         finally:
             sandbox_runner.expand_dataset_ids = _orig
 
-    def test_agent_run_mode_fails_loud_only_when_both_csvs_provided_and_no_copy(self) -> None:
-        """MF5 boundary: CSVs 一个非空 + source_path 部分 cp → 不抛 RuntimeError（正常 agent run）。
+    def test_agent_run_mode_partial_fail_loud_includes_empty_source_path(self) -> None:
+        """MF-new-3 boundary: 1 行 cp 成功 + 1 行空 source_path → 必须抛 RuntimeError。
 
-        关键区分：MF5 fail loud 只在 (has_csv && source_copy_count == 0) 时触发。
-        哪怕只有 1 行 cp 成功，也不抛异常（_copy_via_csv_source_paths 内部单 row 失败
-        仍 log warning + false，但 source_copy_count > 0 → 上层不 fail loud）。
+        Cindy round 2 拍板：empty source_path 同样视作 failure 计入 failed_rows。
+        哪怕有部分 row cp 成功，只要有任何"应当被 cp 但没 cp"的非 NONE 行，
+        上层 _prepare_task_workspace 就要 fail loud 列出 failed row(s)。
+        错误消息应包含 failed row 的 kind / original_id / source_path / reason。
         """
         from app.sandbox_runner import _prepare_task_workspace
 
         config = _test_config(Path("/tmp/none"))
         session = _FakeSession()
-        # 1 行有 source_path + 1 行 source_path 为空 → source_copy_count == 1
         tmp_src = Path("/tmp/_af_mf5_partial.csv")
         tmp_src.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -969,21 +1019,214 @@ class SandboxRunnerPrepareWorkspaceFailLoudTest(unittest.TestCase):
             ds_csv = (
                 "agent_run_dataset_id,dataset_file_path,from_ts_code,source_path\n"
                 f"1,/__AF_INPUT__/ds-a/a.csv,000300.SH,{tmp_src}\n"
-                "2,/__AF_INPUT__/ds-b/b.csv,000002.SZ,\n"
+                "2,/__AF_INPUT__/ds-b/b.csv,000002.SZ,\n"  # 空 source_path → failure
             )
-            workspace = _prepare_task_workspace(
+            with self.assertRaises(RuntimeError) as ctx:
+                _prepare_task_workspace(
+                    session,
+                    "task-mf5-partial",
+                    config,
+                    [],
+                    None,
+                    paths_dataset_csv=ds_csv,
+                    path_manifest_csv="",
+                )
+            msg = str(ctx.exception)
+            self.assertIn("agent_run mode", msg)
+            self.assertIn("1 row(s) failed to copy", msg)
+            self.assertIn("original_id=2", msg)
+            self.assertIn("reason=empty_source_path", msg)
+            # 成功 cp 的行（original_id=1）的 source_path 也被记在 cp log/Container，
+            # 不应在错误消息里被当作 failure 列出
+            self.assertNotIn("original_id=1", msg)
+        finally:
+            tmp_src.unlink(missing_ok=True)
+
+    def test_agent_run_mode_fails_loud_when_single_row_copy_fails(self) -> None:
+        """MF-new-3: 1 个 selected non-NONE 行 copy 抛异常 → RuntimeError 含 failed row 详情。
+
+        错误消息应包含 kind=dataset / original_id=1 / source_path / reason=copy_failed:*。
+        """
+        from app.sandbox_runner import _prepare_task_workspace
+
+        config = _test_config(Path("/tmp/none"))
+        session = _FakeSession()
+
+        def _boom(payload, dest):
+            raise OSError("disk gone")
+        session.copy_to_runtime = _boom  # type: ignore[assignment]
+
+        ds_csv = (
+            "agent_run_dataset_id,dataset_file_path,from_ts_code,source_path\n"
+            "1,/__AF_INPUT__/ds-a/a.csv,000300.SH,/data/ds-a/a.csv\n"
+        )
+        with self.assertRaises(RuntimeError) as ctx:
+            _prepare_task_workspace(
                 session,
-                "task-mf5-partial",
+                "task-mfnew3-single",
                 config,
                 [],
                 None,
                 paths_dataset_csv=ds_csv,
                 path_manifest_csv="",
             )
-            self.assertTrue(workspace.endswith("task-mf5-partial"))
-            # 没抛异常即符合预期
+        msg = str(ctx.exception)
+        self.assertIn("agent_run mode", msg)
+        self.assertIn("1 row(s) failed to copy", msg)
+        self.assertIn("kind=dataset", msg)
+        self.assertIn("original_id=1", msg)
+        self.assertIn("source_path='/data/ds-a/a.csv'", msg)
+        self.assertIn("reason=copy_failed:", msg)
+        # 重要：sandbox 没被建好（fail fast）
+        # input 目录可能已建好（mkdir 在 _copy 之前），但 copy 没成功
+        self.assertEqual(
+            [w for w in session.writes if "ds-a" in w[1]],
+            [],
+            "no write to ds-a/ when copy failed",
+        )
+
+    def test_agent_run_mode_fails_loud_listing_one_of_three(self) -> None:
+        """MF-new-3: 3 个 selected rows 中 1 个 copy 失败 → RuntimeError 列出 failed row。
+
+        验证多行场景：只报 failed 的那 1 行（不是所有 3 行）。
+        """
+        from app.sandbox_runner import _prepare_task_workspace
+
+        config = _test_config(Path("/tmp/none"))
+        session = _FakeSession()
+
+        # 准备 2 个真实存在的 source，1 个不存在的 source（copy 会 raise）
+        tmp_src_a = Path("/tmp/_af_mfnew3_ok_a.csv")
+        tmp_src_b = Path("/tmp/_af_mfnew3_ok_b.csv")
+        tmp_src_a.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            tmp_src_a.write_text("a\n")
+            tmp_src_b.write_text("b\n")
+
+            real_fail_session = _FakeSession()
+            # Wrap copy_to_runtime 让第 3 次 cp 时抛异常（精确控制失败时机）
+            original_copy = real_fail_session.copy_to_runtime
+            call_count = {"n": 0}
+
+            def _maybe_fail(payload, dest):
+                call_count["n"] += 1
+                if call_count["n"] == 3:  # 第 3 次 cp 失败
+                    raise OSError("permission denied")
+                original_copy(payload, dest)
+
+            real_fail_session.copy_to_runtime = _maybe_fail  # type: ignore[assignment]
+
+            ds_csv = (
+                "agent_run_dataset_id,dataset_file_path,from_ts_code,source_path\n"
+                f"1,/__AF_INPUT__/ds-a/a.csv,000300.SH,{tmp_src_a}\n"
+                f"2,/__AF_INPUT__/ds-b/b.csv,000002.SZ,{tmp_src_b}\n"
+                "3,/__AF_INPUT__/ds-c/c.csv,600000.SH,/data/nonexistent/c.csv\n"
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                _prepare_task_workspace(
+                    real_fail_session,
+                    "task-mfnew3-three",
+                    config,
+                    [],
+                    None,
+                    paths_dataset_csv=ds_csv,
+                    path_manifest_csv="",
+                )
+            msg = str(ctx.exception)
+            self.assertIn("agent_run mode", msg)
+            self.assertIn("1 row(s) failed to copy", msg)
+            # 失败的是 original_id=3
+            self.assertIn("original_id=3", msg)
+            self.assertIn("source_path='/data/nonexistent/c.csv'", msg)
+            self.assertIn("reason=copy_failed:", msg)
+            # 成功 cp 的 row (original_id=1/2) 不在 failure 列表里
+            self.assertNotIn("original_id=1", msg)
+            self.assertNotIn("original_id=2", msg)
+        finally:
+            tmp_src_a.unlink(missing_ok=True)
+            tmp_src_b.unlink(missing_ok=True)
+
+    def test_agent_run_mode_all_none_rows_no_fail(self) -> None:
+        """MF-new-3: 全部 NONE 行 → 不 fail（NONE 行豁免，单独由 _materialize 物化）。
+
+        即使 path_manifest.csv 全是 NONE（source_copy_count == 0），
+        NONE 行豁免不算 failure，valid paths_dataset 行成功 cp → 不抛 RuntimeError。
+        """
+        from app.sandbox_runner import _prepare_task_workspace
+
+        config = _test_config(Path("/tmp/none"))
+        session = _FakeSession()
+        # paths_dataset.csv 有 1 个有效行（实际 cp 成功），无空 source_path
+        tmp_src = Path("/tmp/_af_mfnew3_all_none.csv")
+        tmp_src.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            tmp_src.write_text("ok\n")
+            ds_csv = (
+                "agent_run_dataset_id,dataset_file_path,from_ts_code,source_path\n"
+                f"1,/__AF_INPUT__/ds-a/a.csv,000300.SH,{tmp_src}\n"
+            )
+            # path_manifest.csv 全部 NONE 行（豁免，不计 cp 也不计 failure）
+            mf_csv = (
+                "agent_run_manifest_id,manifest_file_path,related_dataset_ids,source_path\n"
+                f"1,{MANIFEST_NONE_MARKER},1,\n"
+                f"2,{MANIFEST_NONE_MARKER},1,\n"
+            )
+            # 不抛异常——NONE 行豁免，1 行成功 cp
+            workspace = _prepare_task_workspace(
+                session,
+                "task-mfnew3-all-none",
+                config,
+                [],
+                None,
+                paths_dataset_csv=ds_csv,
+                path_manifest_csv=mf_csv,
+            )
+            self.assertTrue(workspace.endswith("task-mfnew3-all-none"))
+            # 验证 paths_dataset.csv 被 materialize（agent-run 模式正常推进）
+            paths_writes = [w for w in session.writes if w[1].endswith("paths_dataset.csv")]
+            self.assertEqual(len(paths_writes), 1, "paths_dataset.csv should still be materialized")
         finally:
             tmp_src.unlink(missing_ok=True)
+
+    def test_legacy_mode_no_fail_when_copy_fails(self) -> None:
+        """MF-new-3: legacy 模式（CSVs 都空）→ 即使后续逻辑遇到异常也不抛 RuntimeError。
+
+        legacy 模式下 _copy_via_csv_source_paths 返回 count=0 / failed=[]，
+        _prepare_task_workspace 走 data_dir fallback 路径，不触发 fail loud。
+        """
+        from app.sandbox_runner import _prepare_task_workspace
+        from app.dataset_manifest import ExpandedDatasets
+        from app import sandbox_runner
+
+        config = _test_config(Path("/tmp/none"))
+        session = _FakeSession()
+
+        # mock expand_dataset_ids → 返回空（不抛异常）
+        called_with: List[List[str]] = []
+
+        def _fake_expand(data_dir, dataset_id_list):
+            called_with.append(list(dataset_id_list))
+            return ExpandedDatasets(manifest_ids=[], atomic_ids=[])
+
+        _orig = sandbox_runner.expand_dataset_ids
+        sandbox_runner.expand_dataset_ids = _fake_expand
+        try:
+            # legacy: CSVs 都空 → 不应该有任何 fail loud 行为
+            workspace = _prepare_task_workspace(
+                session,
+                "task-legacy-no-fail",
+                config,
+                ["ds-x"],
+                None,
+                paths_dataset_csv="",
+                path_manifest_csv="",
+            )
+            self.assertTrue(workspace.endswith("task-legacy-no-fail"))
+            # expand_dataset_ids 被调用（legacy 路径走了 data_dir fallback）
+            self.assertEqual(len(called_with), 1)
+            self.assertEqual(called_with[0], ["ds-x"])
+        finally:
+            sandbox_runner.expand_dataset_ids = _orig
 
 
 if __name__ == "__main__":
