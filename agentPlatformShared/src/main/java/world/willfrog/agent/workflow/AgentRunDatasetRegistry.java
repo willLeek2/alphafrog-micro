@@ -34,7 +34,18 @@ import java.util.concurrent.ConcurrentMap;
  * 同 snapshot 的 dataset run-level 编号，保证 CSV 里 related_dataset_ids 是
  * 「run 级别编号」而不是 originalId（spec §4.2.2）。
  *
- * <p>线程安全：所有状态在 {@code ConcurrentMap} 内；putIfAbsent 保证 raw entry 入池幂等。
+ * <p>线程安全（Cindy round 2 review MF-new-2 改造）：
+ * <ul>
+ *   <li>raw entry 入池（{@code rawDatasets} / {@code rawManifests}）走
+ *       {@code ConcurrentMap.putIfAbsent}，并发安全；事件入池不需要加锁。</li>
+ *   <li>编号分配（{@code datasetNumbering} / {@code manifestNumbering}）走
+ *       {@code putIfAbsent}，但「size() + 1」分配时存在 TOCTOU 竞态：两个并发
+ *       snapshot 可能同时看到同一个 {@code size()} 并对不同 originalId 分配相同 number，
+ *       后续 {@code datasetByNumber.put(n, raw)} 会互相覆盖。</li>
+ *   <li>本类修复：snapshot 内部用 per-RunState lock 包住「读 raw → 分配 missing
+ *       number → build snapshot」这一段，保证并发 snapshot 出来的 number 仍然
+ *       是 1..N 唯一序列，且 run 期间 raw event 入池不被阻塞。</li>
+ * </ul>
  */
 @Component
 @Slf4j
@@ -128,6 +139,13 @@ public class AgentRunDatasetRegistry {
      * </ol>
      *
      * <p>每次返回一个新的 immutable snapshot 对象，不暴露内部 mutable 状态。
+     *
+     * <p>线程安全（Cindy round 2 review MF-new-2 改造）：
+     * 整个「读 raw → 分配 missing number → build snapshot」段都在 per-RunState
+     * 锁内执行。raw event 入池（{@link #onDatasetPersisted}）走
+     * {@code ConcurrentMap.putIfAbsent}，不进入此锁，因此并发事件入池不被阻塞。
+     * 但两个 snapshot 之间的「读 rawDatasets.size() / 分配下一个 number」会序列化，
+     * 保证并发 snapshot 也输出 1..N 唯一 number 序列。
      */
     public AgentRunDatasetSnapshot snapshot(String runId) {
         if (runId == null || runId.isBlank()) {
@@ -138,73 +156,78 @@ public class AgentRunDatasetRegistry {
             return AgentRunDatasetSnapshot.empty();
         }
 
-        // MF3 lock-after-snapshot (visible-after-freeze)：
-        // 已分配的 number 一旦暴露就 frozen 不变，迟到 raw event 拿下一个可用 number（追加到尾部）。
-        // 先按 sortKey 字典序遍历，对不在 numbering map 里的 originalId 用「map.size() + 1」分配。
-        List<RawEntry> sortedDatasets = state.rawDatasets.values().stream()
-                .sorted(Comparator.comparing(RawEntry::sortKey, Comparator.nullsLast(Comparator.naturalOrder())))
-                .toList();
-        for (RawEntry raw : sortedDatasets) {
-            state.datasetNumbering.putIfAbsent(raw.originalId(), state.datasetNumbering.size() + 1);
-        }
-
-        List<RawEntry> sortedManifests = state.rawManifests.values().stream()
-                .sorted(Comparator.comparing(RawEntry::sortKey, Comparator.nullsLast(Comparator.naturalOrder())))
-                .toList();
-        for (RawEntry raw : sortedManifests) {
-            state.manifestNumbering.putIfAbsent(raw.originalId(), state.manifestNumbering.size() + 1);
-        }
-
-        // 按 number 升序构建 entry 列表：existing #1, #2 顺序不变，late entries 追加到尾部
-        java.util.Map<Integer, RawEntry> datasetByNumber = new java.util.HashMap<>(sortedDatasets.size() * 2);
-        for (RawEntry raw : sortedDatasets) {
-            Integer n = state.datasetNumbering.get(raw.originalId());
-            datasetByNumber.put(n, raw);
-        }
-        List<Integer> sortedDatasetNumbers = new ArrayList<>(datasetByNumber.keySet());
-        java.util.Collections.sort(sortedDatasetNumbers);
-        List<AgentRunDatasetEntry> datasetEntries = new ArrayList<>(sortedDatasets.size());
-        for (Integer n : sortedDatasetNumbers) {
-            RawEntry raw = datasetByNumber.get(n);
-            datasetEntries.add(AgentRunDatasetEntry.forDataset(
-                    n, raw.originalId(), raw.persistedPath(),
-                    raw.fromTsCode(), raw.sortKey()));
-        }
-
-        // MF2: manifest.relatedDatasetIds 用同 snapshot 的 dataset run-level 编号翻译。
-        // 由于 dataset numbering 是 frozen 的，跨 snapshot 翻译是稳定的。
-        java.util.Map<String, Integer> datasetIdToNumber = new java.util.HashMap<>(state.datasetNumbering.size() * 2);
-        for (java.util.Map.Entry<String, Integer> e : state.datasetNumbering.entrySet()) {
-            datasetIdToNumber.put(e.getKey(), e.getValue());
-        }
-
-        java.util.Map<Integer, RawEntry> manifestByNumber = new java.util.HashMap<>(sortedManifests.size() * 2);
-        for (RawEntry raw : sortedManifests) {
-            Integer n = state.manifestNumbering.get(raw.originalId());
-            manifestByNumber.put(n, raw);
-        }
-        List<Integer> sortedManifestNumbers = new ArrayList<>(manifestByNumber.keySet());
-        java.util.Collections.sort(sortedManifestNumbers);
-        List<AgentRunDatasetEntry> manifestEntries = new ArrayList<>(sortedManifests.size());
-        for (Integer n : sortedManifestNumbers) {
-            RawEntry raw = manifestByNumber.get(n);
-            List<String> translated = new ArrayList<>(raw.relatedDatasetIds().size());
-            for (String relatedOriginalId : raw.relatedDatasetIds()) {
-                Integer relatedNumber = datasetIdToNumber.get(relatedOriginalId);
-                if (relatedNumber == null) {
-                    log.warn("Manifest references unknown dataset, drop ref: runId={} manifestId={} missingDatasetId={}",
-                            runId, raw.originalId(), relatedOriginalId);
-                    continue;
-                }
-                translated.add(Integer.toString(relatedNumber));
+        // MF-new-2: 在 per-RunState 锁内做「读 raw → 分配 missing number → build snapshot」，
+        // 防止两个并发 snapshot 看到同一个 size() 并对不同 originalId 分配相同 number。
+        // raw event 入池仍走 ConcurrentMap.putIfAbsent，不被本锁阻塞。
+        synchronized (state) {
+            // MF3 lock-after-snapshot (visible-after-freeze)：
+            // 已分配的 number 一旦暴露就 frozen 不变，迟到 raw event 拿下一个可用 number（追加到尾部）。
+            // 先按 sortKey 字典序遍历，对不在 numbering map 里的 originalId 用「map.size() + 1」分配。
+            List<RawEntry> sortedDatasets = state.rawDatasets.values().stream()
+                    .sorted(Comparator.comparing(RawEntry::sortKey, Comparator.nullsLast(Comparator.naturalOrder())))
+                    .toList();
+            for (RawEntry raw : sortedDatasets) {
+                state.datasetNumbering.putIfAbsent(raw.originalId(), state.datasetNumbering.size() + 1);
             }
-            AgentRunDatasetEntry mf = AgentRunDatasetEntry.forManifest(
-                    n, raw.originalId(), raw.persistedPath(),
-                    raw.fromTsCode(), raw.sortKey(), translated);
-            manifestEntries.add(mf);
-        }
 
-        return new AgentRunDatasetSnapshot(datasetEntries, manifestEntries);
+            List<RawEntry> sortedManifests = state.rawManifests.values().stream()
+                    .sorted(Comparator.comparing(RawEntry::sortKey, Comparator.nullsLast(Comparator.naturalOrder())))
+                    .toList();
+            for (RawEntry raw : sortedManifests) {
+                state.manifestNumbering.putIfAbsent(raw.originalId(), state.manifestNumbering.size() + 1);
+            }
+
+            // 按 number 升序构建 entry 列表：existing #1, #2 顺序不变，late entries 追加到尾部
+            java.util.Map<Integer, RawEntry> datasetByNumber = new java.util.HashMap<>(sortedDatasets.size() * 2);
+            for (RawEntry raw : sortedDatasets) {
+                Integer n = state.datasetNumbering.get(raw.originalId());
+                datasetByNumber.put(n, raw);
+            }
+            List<Integer> sortedDatasetNumbers = new ArrayList<>(datasetByNumber.keySet());
+            java.util.Collections.sort(sortedDatasetNumbers);
+            List<AgentRunDatasetEntry> datasetEntries = new ArrayList<>(sortedDatasets.size());
+            for (Integer n : sortedDatasetNumbers) {
+                RawEntry raw = datasetByNumber.get(n);
+                datasetEntries.add(AgentRunDatasetEntry.forDataset(
+                        n, raw.originalId(), raw.persistedPath(),
+                        raw.fromTsCode(), raw.sortKey()));
+            }
+
+            // MF2: manifest.relatedDatasetIds 用同 snapshot 的 dataset run-level 编号翻译。
+            // 由于 dataset numbering 是 frozen 的，跨 snapshot 翻译是稳定的。
+            java.util.Map<String, Integer> datasetIdToNumber = new java.util.HashMap<>(state.datasetNumbering.size() * 2);
+            for (java.util.Map.Entry<String, Integer> e : state.datasetNumbering.entrySet()) {
+                datasetIdToNumber.put(e.getKey(), e.getValue());
+            }
+
+            java.util.Map<Integer, RawEntry> manifestByNumber = new java.util.HashMap<>(sortedManifests.size() * 2);
+            for (RawEntry raw : sortedManifests) {
+                Integer n = state.manifestNumbering.get(raw.originalId());
+                manifestByNumber.put(n, raw);
+            }
+            List<Integer> sortedManifestNumbers = new ArrayList<>(manifestByNumber.keySet());
+            java.util.Collections.sort(sortedManifestNumbers);
+            List<AgentRunDatasetEntry> manifestEntries = new ArrayList<>(sortedManifests.size());
+            for (Integer n : sortedManifestNumbers) {
+                RawEntry raw = manifestByNumber.get(n);
+                List<String> translated = new ArrayList<>(raw.relatedDatasetIds().size());
+                for (String relatedOriginalId : raw.relatedDatasetIds()) {
+                    Integer relatedNumber = datasetIdToNumber.get(relatedOriginalId);
+                    if (relatedNumber == null) {
+                        log.warn("Manifest references unknown dataset, drop ref: runId={} manifestId={} missingDatasetId={}",
+                                runId, raw.originalId(), relatedOriginalId);
+                        continue;
+                    }
+                    translated.add(Integer.toString(relatedNumber));
+                }
+                AgentRunDatasetEntry mf = AgentRunDatasetEntry.forManifest(
+                        n, raw.originalId(), raw.persistedPath(),
+                        raw.fromTsCode(), raw.sortKey(), translated);
+                manifestEntries.add(mf);
+            }
+
+            return new AgentRunDatasetSnapshot(datasetEntries, manifestEntries);
+        }
     }
 
     public Optional<AgentRunDatasetEntry> findDatasetByNumber(String runId, int number) {

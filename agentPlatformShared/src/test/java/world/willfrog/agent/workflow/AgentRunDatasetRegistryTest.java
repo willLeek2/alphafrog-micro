@@ -320,6 +320,141 @@ class AgentRunDatasetRegistryTest {
         assertEquals(total, seen.size());
     }
 
+    /**
+     * MF-new-2（Cindy round 2 review）：并发 snapshot 不应分配到相同 number 给不同 originalId。
+     *
+     * <p>验证 {@code snapshot()} 内的 per-RunState 锁：两个 thread 同时调用 snapshot
+     * 必须序列化（一个先走完「读 raw → 分配 missing number → build snapshot」，另一个再走），
+     * 不能出现 race 条件让两个 thread 看到同一个 {@code size()} 并对不同 originalId 分配相同 number。
+     *
+     * <p>如果不加锁，size() + 1 的 TOCTOU 会让并发 snapshot 输出 number 不在 1..N 唯一序列中。
+     */
+    @Test
+    void concurrentSnapshotsShouldAssignUniqueNumbers() throws InterruptedException {
+        String runId = "run-concurrent-snap";
+        int eventCount = 50;
+        // 先把所有 event 一次性灌进去（避免 snapshot 期间的入池干扰）
+        for (int i = 0; i < eventCount; i++) {
+            String datasetId = "ds-" + i;
+            registry.onDatasetPersisted(datasetEvent(runId, datasetId, datasetId + ".csv"));
+        }
+
+        int snapThreads = 6;
+        int snapPerThread = 20;
+        ExecutorService pool = Executors.newFixedThreadPool(snapThreads);
+        CountDownLatch startLatch = new CountDownLatch(1);
+        CountDownLatch doneLatch = new CountDownLatch(snapThreads);
+
+        try {
+            for (int t = 0; t < snapThreads; t++) {
+                pool.submit(() -> {
+                    try {
+                        startLatch.await();
+                        for (int i = 0; i < snapPerThread; i++) {
+                            AgentRunDatasetSnapshot snap = registry.snapshot(runId);
+                            // 校验 number 唯一且覆盖 1..eventCount
+                            assertEquals(eventCount, snap.datasets().size(),
+                                    "snapshot 应输出全部 " + eventCount + " 条 dataset");
+                            java.util.Set<Integer> seen = new java.util.HashSet<>();
+                            for (AgentRunDatasetEntry entry : snap.datasets()) {
+                                assertTrue(seen.add(entry.number()),
+                                        "concurrent snapshot 分配到重复 number: " + entry.number()
+                                                + " for " + entry.originalId());
+                            }
+                            assertEquals(eventCount, seen.size());
+                        }
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                    } finally {
+                        doneLatch.countDown();
+                    }
+                });
+            }
+            startLatch.countDown();
+            assertTrue(doneLatch.await(10, TimeUnit.SECONDS), "concurrent snapshot threads 应完成");
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    /**
+     * MF-new-2（Cindy round 2 review）：并发 snapshot + 边入池边 snapshot 也应保持 number 1..N 唯一。
+     */
+    @Test
+    void concurrentSnapshotAndIngestShouldAssignUniqueNumbers() throws InterruptedException {
+        String runId = "run-mixed";
+        int preloaded = 30;
+        for (int i = 0; i < preloaded; i++) {
+            String datasetId = "ds-pre-" + i;
+            registry.onDatasetPersisted(datasetEvent(runId, datasetId, datasetId + ".csv"));
+        }
+
+        int ingestThreads = 4;
+        int eventsPerIngestThread = 30;
+        int snapThreads = 4;
+        int snapsPerThread = 50;
+        ExecutorService pool = Executors.newFixedThreadPool(ingestThreads + snapThreads);
+        CountDownLatch startLatch = new CountDownLatch(1);
+        CountDownLatch ingestDone = new CountDownLatch(ingestThreads);
+        CountDownLatch snapDone = new CountDownLatch(snapThreads);
+        java.util.concurrent.atomic.AtomicReference<Throwable> failure = new java.util.concurrent.atomic.AtomicReference<>();
+
+        try {
+            for (int t = 0; t < ingestThreads; t++) {
+                int idx = t;
+                pool.submit(() -> {
+                    try {
+                        startLatch.await();
+                        for (int i = 0; i < eventsPerIngestThread; i++) {
+                            String datasetId = "ds-new-" + idx + "-" + i;
+                            registry.onDatasetPersisted(datasetEvent(runId, datasetId, datasetId + ".csv"));
+                        }
+                    } catch (Exception e) {
+                        failure.set(e);
+                    } finally {
+                        ingestDone.countDown();
+                    }
+                });
+            }
+            for (int t = 0; t < snapThreads; t++) {
+                pool.submit(() -> {
+                    try {
+                        startLatch.await();
+                        for (int i = 0; i < snapsPerThread; i++) {
+                            AgentRunDatasetSnapshot snap = registry.snapshot(runId);
+                            // 校验每个 snapshot 的 number 都是 1..N 唯一序列
+                            java.util.Set<Integer> seen = new java.util.HashSet<>();
+                            for (AgentRunDatasetEntry entry : snap.datasets()) {
+                                assertTrue(seen.add(entry.number()),
+                                        "concurrent snapshot+ingest 分配到重复 number: " + entry.number());
+                            }
+                        }
+                    } catch (Exception e) {
+                        failure.set(e);
+                    } finally {
+                        snapDone.countDown();
+                    }
+                });
+            }
+            startLatch.countDown();
+            assertTrue(ingestDone.await(10, TimeUnit.SECONDS), "ingest threads 应完成");
+            assertTrue(snapDone.await(10, TimeUnit.SECONDS), "snapshot threads 应完成");
+            assertNull(failure.get(), "并发 snapshot+ingest 出现异常: " + failure.get());
+        } finally {
+            pool.shutdownNow();
+        }
+
+        // 最终状态：preloaded + 全部 ingest = preloaded + ingestThreads * eventsPerIngestThread
+        int finalCount = preloaded + ingestThreads * eventsPerIngestThread;
+        AgentRunDatasetSnapshot finalSnap = registry.snapshot(runId);
+        assertEquals(finalCount, finalSnap.datasets().size());
+        java.util.Set<Integer> finalSeen = new java.util.HashSet<>();
+        for (AgentRunDatasetEntry entry : finalSnap.datasets()) {
+            assertTrue(finalSeen.add(entry.number()),
+                    "最终 snapshot number 重复: " + entry.number());
+        }
+    }
+
     @Test
     void concurrentEventsAcrossRunsShouldBeIsolated() throws InterruptedException {
         ExecutorService pool = Executors.newFixedThreadPool(4);
