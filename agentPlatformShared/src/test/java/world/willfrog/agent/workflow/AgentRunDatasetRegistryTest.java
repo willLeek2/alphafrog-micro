@@ -382,4 +382,64 @@ class AgentRunDatasetRegistryTest {
         assertEquals(1, s1.datasets().size());
         assertEquals(2, s2.datasets().size());
     }
+
+    /**
+     * MF3 lock-after-snapshot (visible-after-freeze)：
+     * 先 snapshot 暴露 ds-a=1, ds-b=2；之后迟到 ds-c (sortKey "aa.csv"，字典序在 a.csv 和 b.csv 之间)，
+     * 再次 snapshot，ds-a 和 ds-b 的 number 必须不变，ds-c 拿到下一个 number (= 3)。
+     */
+    @Test
+    void snapshotShouldFreezeDatasetNumbersAfterFirstExposure() {
+        registry.onDatasetPersisted(datasetEvent("run-1", "ds-a", "a.csv"));
+        registry.onDatasetPersisted(datasetEvent("run-1", "ds-b", "b.csv"));
+        AgentRunDatasetSnapshot snap1 = registry.snapshot("run-1");
+        assertEquals(2, snap1.datasets().size());
+        assertEquals(1, snap1.datasets().get(0).number());
+        assertEquals("ds-a", snap1.datasets().get(0).originalId());
+        assertEquals(2, snap1.datasets().get(1).number());
+        assertEquals("ds-b", snap1.datasets().get(1).originalId());
+
+        // 迟到 ds-c，sortKey "aa.csv" 字典序在 a.csv 和 b.csv 之间
+        registry.onDatasetPersisted(datasetEvent("run-1", "ds-c", "aa.csv"));
+        AgentRunDatasetSnapshot snap2 = registry.snapshot("run-1");
+
+        // ds-a 和 ds-b 编号 frozen 不变，仍在原位置
+        assertEquals(3, snap2.datasets().size());
+        assertEquals(1, snap2.datasets().get(0).number());
+        assertEquals("ds-a", snap2.datasets().get(0).originalId());
+        assertEquals(2, snap2.datasets().get(1).number());
+        assertEquals("ds-b", snap2.datasets().get(1).originalId());
+        // late ds-c 追加到尾部，新 number = 3
+        assertEquals(3, snap2.datasets().get(2).number());
+        assertEquals("ds-c", snap2.datasets().get(2).originalId());
+    }
+
+    /**
+     * MF3 lock-after-snapshot: manifest 编号也有同样的 freeze 语义，迟到 manifest 追加到尾部。
+     */
+    @Test
+    void snapshotShouldFreezeManifestNumbersAfterFirstExposure() {
+        registry.onDatasetPersisted(manifestEvent("run-1", "m-x", "x.manifest.json", List.of()));
+        registry.onDatasetPersisted(manifestEvent("run-1", "m-z", "z.manifest.json", List.of()));
+        AgentRunDatasetSnapshot snap1 = registry.snapshot("run-1");
+        assertEquals(2, snap1.manifests().size());
+        assertEquals(1, snap1.manifests().get(0).number());
+        assertEquals("m-x", snap1.manifests().get(0).originalId());
+        assertEquals(2, snap1.manifests().get(1).number());
+        assertEquals("m-z", snap1.manifests().get(1).originalId());
+
+        // 迟到 m-a，sortKey 字典序在最前
+        registry.onDatasetPersisted(manifestEvent("run-1", "m-a", "a.manifest.json", List.of()));
+        AgentRunDatasetSnapshot snap2 = registry.snapshot("run-1");
+
+        // 原有 number frozen 不变
+        assertEquals(3, snap2.manifests().size());
+        assertEquals(1, snap2.manifests().get(0).number());
+        assertEquals("m-x", snap2.manifests().get(0).originalId());
+        assertEquals(2, snap2.manifests().get(1).number());
+        assertEquals("m-z", snap2.manifests().get(1).originalId());
+        // late m-a 追加到尾部
+        assertEquals(3, snap2.manifests().get(2).number());
+        assertEquals("m-a", snap2.manifests().get(2).originalId());
+    }
 }
