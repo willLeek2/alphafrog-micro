@@ -791,6 +791,11 @@ public class SubAgentRunner {
         if (!datasetIds.isBlank()) {
             runArgs.put("dataset_ids", datasetIds);
         }
+        // 260623-harness-optimization-03: 保留 manifest_ids 走 run-level manifest 编号
+        String manifestIds = firstNonBlank(args.get("manifest_ids"), args.get("manifestIds"), args.get("manifest_id"), args.get("manifestId"));
+        if (!manifestIds.isBlank()) {
+            runArgs.put("manifest_ids", manifestIds);
+        }
         String libraries = firstNonBlank(args.get("libraries"), args.get("arg3"));
         if (!libraries.isBlank()) {
             runArgs.put("libraries", libraries);

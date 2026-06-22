@@ -121,10 +121,32 @@ class ActivePromptRunLevelContractTest {
                 "application-agent-llm-prompts.yml 不得出现 scopeHash");
         assertFalse(yaml.contains("originalId"),
                 "application-agent-llm-prompts.yml 不得向 LLM 暴露 originalId");
+        assertFalse(yaml.contains("coding_context"),
+                "application-agent-llm-prompts.yml 不得再鼓励 LLM 传 coding_context");
         assertTrue(yaml.contains("run-level"),
                 "application-agent-llm-prompts.yml 必须说明 run-level 编号");
         assertTrue(yaml.contains("listMyData"),
                 "application-agent-llm-prompts.yml 必须说明 listMyData");
+    }
+
+    @Test
+    void pythonSandboxGuide_shouldTeachRunLevelContract() {
+        String guide = loadResourceAsString("agent_guides/python_sandbox.md");
+        assertFalse(guide.isBlank(), "agent_guides/python_sandbox.md 必须可加载");
+        assertTrue(guide.contains("run-level"),
+                "guide 必须说明 run-level 编号");
+        assertTrue(guide.contains("paths_dataset.csv"),
+                "guide 必须说明 paths_dataset.csv");
+        assertTrue(guide.contains("path_manifest.csv"),
+                "guide 必须说明 path_manifest.csv");
+        assertTrue(guide.contains("listMyData"),
+                "guide 必须说明 listMyData 恢复路径");
+        assertTrue(guide.contains("UNCERTAIN"),
+                "guide 必须说明 UNCERTAIN 语义");
+        assertFalse(guide.contains("dataset_ids` 必填"),
+                "guide 不得再说 dataset_ids 必填（现在 dataset_ids / manifest_ids 至少一个）");
+        assertFalse(guide.contains("/sandbox/input/<dataset_id>/<dataset_id>.csv") || guide.contains("/sandbox/input/<dataset_id>/"),
+                "guide 不得再正向 teaching 旧 /sandbox/input/<dataset_id>/ 路径");
     }
 
     private static boolean containsRunLevelInstruction(String prompt) {

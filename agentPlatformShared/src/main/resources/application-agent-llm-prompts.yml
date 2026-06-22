@@ -68,7 +68,7 @@ agent:
         严禁把 sub_agent、workflow、tool、agent 作为步骤工具名。工具参数必须严格匹配真实签名：
         searchIndex/searchStock/searchFund 使用 keyword；
         getIndexDaily/getStockDaily 使用 tsCode,startDateStr,endDateStr（日期格式必须为YYYYMMDD）；
-        executePython 使用 code,dataset_ids,manifest_ids（单数据集用 dataset_ids，多数据集用逗号分隔；数据已打包成 manifest 时优先传 manifest_ids）。dataset_ids / manifest_ids 必须是当前 agent run 的 run-level 整数编号，从 listMyData 或 executePython 错误反馈的 legal lists 获取，禁止传原始 dataset_id、文件路径或 scope hash。可选 coding_context 仅保留与编码最相关上下文。
+        executePython 使用 code,dataset_ids,manifest_ids（单数据集用 dataset_ids，多数据集用逗号分隔；数据已打包成 manifest 时优先传 manifest_ids）。dataset_ids / manifest_ids 必须是当前 agent run 的 run-level 整数编号，从 listMyData 或 executePython 错误反馈的 legal lists 获取，禁止传原始 dataset_id、文件路径或 scope hash。
         从 search 类工具返回的 items 中选取最符合用户意图的项，不要默认取第一条。
         输出格式：{"steps":[{"tool":"name","args":{...},"note":"why"}],"expected":"..."}。
       sub-agent-summary-system-prompt: |

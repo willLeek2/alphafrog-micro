@@ -401,6 +401,12 @@ public class PythonCodeRefinementNode {
         if (!datasetIds.isBlank()) {
             out.put("dataset_ids", datasetIds);
         }
+        // 260623-harness-optimization-03: 保留 manifest_ids 走 run-level manifest 编号
+        String manifestIds = firstNonBlank(raw.get("manifest_ids"), raw.get("manifestIds"), raw.get("manifest_id"), raw.get("manifestId"));
+        manifestIds = normalizeDatasetIds(manifestIds);
+        if (!manifestIds.isBlank()) {
+            out.put("manifest_ids", manifestIds);
+        }
         String libraries = firstNonBlank(raw.get("libraries"));
         if (!libraries.isBlank()) {
             out.put("libraries", libraries);
