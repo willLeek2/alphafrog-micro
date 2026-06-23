@@ -225,4 +225,33 @@ class ToolRouterToolExecutorTest {
         assertTrue(preview.length() <= 500 + "... (truncated, length=2000)".length(),
                 "Preview should not exceed OUTPUT_PREVIEW_MAX_CHARS + suffix");
     }
+
+    @Test
+    void execute_pythonCallWithRunLevelIdsUnavailableError_appendsRunLevelRetryHint() {
+        ToolExecutionRequest request = ToolExecutionRequest.builder()
+                .name("executePython")
+                .arguments("{\"dataset_ids\":\"1\",\"code\":\"print(1)\"}")
+                .build();
+
+        String failureOutput = "RUN_LEVEL_IDS_UNAVAILABLE: Agent run-level dataset ids require an active run and AgentRunDatasetRegistry";
+        ToolRouter.ToolInvocationResult result = ToolRouter.ToolInvocationResult.builder()
+                .output(failureOutput)
+                .success(false)
+                .durationMs(100L)
+                .build();
+
+        when(toolRouter.invokeWithMeta("executePython", Map.of("dataset_ids", "1", "code", "print(1)")))
+                .thenReturn(result);
+
+        String output = executor.execute(request, null);
+
+        assertTrue(output.contains(failureOutput));
+        assertTrue(output.contains("_retry_hint_"));
+        assertTrue(output.contains("run-level"));
+        assertTrue(output.contains("listMyData"));
+        assertTrue(output.contains("dataset_ids"));
+        assertTrue(output.contains("manifest_ids"));
+        assertTrue(output.contains("RUN_LEVEL_IDS_UNAVAILABLE"));
+        assertTrue(output.contains("do not keep retrying the same raw ids"));
+    }
 }

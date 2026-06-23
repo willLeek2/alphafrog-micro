@@ -199,8 +199,8 @@ final class ToolRouterToolExecutor implements ToolExecutor {
     }
 
     /**
-     * executePython 等工具若因 dataset_ids 错误失败，把当前 run 已知的 ref 列表写进 hint，
-     * 减少模型编造 placeholder dataset_id。
+     * executePython 等工具若因 dataset_ids / manifest_ids 错误失败，把当前 run 已知的 ref 列表写进 hint，
+     * 引导模型先用 listMyData 解析 run-level 整数 ID，避免继续重试 raw id / path / placeholder。
      */
     private String appendDatasetRetryHintIfNeeded(String output, Map<String, String> datasetRefs) {
         if (output == null || output.isBlank()) {
@@ -210,19 +210,30 @@ final class ToolRouterToolExecutor implements ToolExecutor {
         boolean datasetError = lower.contains("missing_dataset_ids")
                 || lower.contains("missing dataset_ids")
                 || lower.contains("invalid dataset_ids")
+                || lower.contains("missing_manifest_ids")
+                || lower.contains("missing manifest_ids")
+                || lower.contains("invalid_manifest_ids")
+                || lower.contains("invalid manifest_ids")
+                || lower.contains("run_level_ids_unavailable")
                 || lower.contains("dataset_id directory not found")
-                || (lower.contains("dataset_ids") && containsFailureWord(lower));
+                || (lower.contains("dataset_ids") && containsFailureWord(lower))
+                || (lower.contains("manifest_ids") && containsFailureWord(lower));
         if (!datasetError) {
             return output;
         }
         StringBuilder hint = new StringBuilder(output);
-        hint.append("\n\n_retry_hint_: executePython failed because dataset_ids was missing or invalid. ");
+        hint.append("\n\n_retry_hint_: executePython failed because the run-level dataset_ids/manifest_ids are missing, invalid, or unavailable. ");
+        hint.append("executePython expects current run-level integer dataset_ids / manifest_ids, not raw dataset_id / manifest_id strings, paths, or scope hashes. ");
+        hint.append("Call listMyData first (query_type=dataset or query_type=manifest) to resolve the integer ids for this run before retrying. ");
+        if (lower.contains("run_level_ids_unavailable")) {
+            hint.append("RUN_LEVEL_IDS_UNAVAILABLE means the active run registry is not available; do not keep retrying the same raw ids. ");
+        }
         if (datasetRefs != null && !datasetRefs.isEmpty()) {
-            hint.append("Use only these existing dataset_ids exactly: ");
+            hint.append("Observed raw ids available for lookup: ");
             hint.append(String.join(",", datasetRefs.keySet()));
-            hint.append(". Do not use placeholders such as placeholder/data/test and do not hand-code market data.");
+            hint.append(". Resolve them through listMyData instead of passing them directly.");
         } else {
-            hint.append("Call a market data tool first and use the returned data.dataset_id or data.dataset_ids exactly.");
+            hint.append("If listMyData has no data, call a market data tool first, then listMyData, and do not use placeholders such as placeholder/data/test or hand-code market data.");
         }
         return hint.toString();
     }

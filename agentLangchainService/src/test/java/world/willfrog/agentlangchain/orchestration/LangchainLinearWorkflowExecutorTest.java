@@ -124,9 +124,10 @@ class LangchainLinearWorkflowExecutorTest {
         assertThat(result.isSuccess()).isTrue();
         assertThat(model.requests()).hasSize(4);
         assertThat(model.requests().get(2).toString())
-                .contains("已有数据集")
+                .contains("已有原始数据集 ID")
                 .contains("dataset-hs300")
-                .contains("dataset_ids");
+                .contains("run-level dataset_ids/manifest_ids")
+                .contains("listMyData");
     }
 
     static class QueueChatModel implements ChatModel {

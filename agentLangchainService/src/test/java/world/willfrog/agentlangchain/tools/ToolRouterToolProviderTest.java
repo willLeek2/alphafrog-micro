@@ -223,7 +223,11 @@ class ToolRouterToolProviderTest {
         assertTrue(output.contains("_retry_hint_"));
         assertTrue(output.contains("dataset-hs300"));
         assertTrue(output.contains("dataset-zz500"));
-        assertTrue(output.contains("placeholder/data/test"));
+        assertTrue(output.contains("run-level"));
+        assertTrue(output.contains("listMyData"));
+        assertTrue(output.contains("dataset_ids"));
+        assertTrue(output.contains("manifest_ids"));
+        assertTrue(output.contains("Resolve them through listMyData instead of passing them directly."));
     }
 
     @Test
