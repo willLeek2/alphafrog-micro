@@ -21,6 +21,7 @@ import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agent.platform.service.SearchEvidenceJudgeService;
 import world.willfrog.agent.tools.dataset.DatasetRegistry;
 import world.willfrog.agent.tools.dataset.DatasetWriter;
+import world.willfrog.agent.tools.dataset.ListMyDataTool;
 import world.willfrog.agent.tools.dataset.ManifestWriter;
 import world.willfrog.agent.tools.docs.LoadToolGuideTool;
 import world.willfrog.agent.tools.market.MarketDataTools;
@@ -67,6 +68,7 @@ class ToolRouterToolProviderTest {
         RagTools ragTools = new RagTools(objectMapper);
         SearchTools searchTools = new SearchTools(objectMapper, mock(SearchEvidenceJudgeService.class));
         PythonSandboxTools pythonSandboxTools = new PythonSandboxTools(objectMapper);
+        ListMyDataTool listMyDataTool = new ListMyDataTool(objectMapper);
         LoadToolGuideTool loadToolGuideTool = new LoadToolGuideTool(objectMapper);
 
         provider = new ToolRouterToolProvider(
@@ -75,6 +77,7 @@ class ToolRouterToolProviderTest {
                 ragTools,
                 searchTools,
                 pythonSandboxTools,
+                listMyDataTool,
                 loadToolGuideTool,
                 objectMapper,
                 eventService,
@@ -105,6 +108,24 @@ class ToolRouterToolProviderTest {
         assertTrue(toolNames.contains("getStockInfo"));
         assertTrue(toolNames.contains("checkParallelLimits"));
         assertTrue(toolNames.contains("ragSearch"));
+        assertTrue(toolNames.contains("listMyData"));
+    }
+
+    @Test
+    void provideTools_shouldExposeListMyDataEvenWhenSearchAndCodeInterpreterDisabled() {
+        ToolProviderResult result = provider.provideTools(request(Map.of(
+                LangchainToolInvocationKeys.WEB_SEARCH_ENABLED, false,
+                LangchainToolInvocationKeys.CODE_INTERPRETER_ENABLED, false
+        )));
+
+        Set<String> toolNames = result.tools().keySet().stream()
+                .map(ToolSpecification::name)
+                .collect(Collectors.toSet());
+
+        assertTrue(toolNames.contains("listMyData"),
+                "listMyData is a run metadata tool and must not depend on webSearch/codeInterpreter flags");
+        assertNotNull(result.toolExecutorByName("listMyData"),
+                "AiService must be able to execute a listMyData tool_call instead of treating it as hallucinated");
     }
 
     @Test

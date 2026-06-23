@@ -6,6 +6,7 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.tools.dataset.ListMyDataTool;
 import world.willfrog.agent.tools.docs.LoadToolGuideTool;
 import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
@@ -18,7 +19,7 @@ import world.willfrog.agentlangchain.tools.ToolRouterToolProvider;
  * Registers the ToolRouter-backed {@link ToolProvider} for AiServices (P1 A2).
  */
 @Configuration
-@ConditionalOnBean({ToolRouter.class, MarketDataTools.class, RagTools.class, SearchTools.class, PythonSandboxTools.class, LoadToolGuideTool.class, AgentEventService.class})
+@ConditionalOnBean({ToolRouter.class, MarketDataTools.class, RagTools.class, SearchTools.class, PythonSandboxTools.class, ListMyDataTool.class, LoadToolGuideTool.class, AgentEventService.class})
 public class LangchainToolsConfiguration {
 
     @Bean
@@ -27,6 +28,7 @@ public class LangchainToolsConfiguration {
                                        RagTools ragTools,
                                        SearchTools searchTools,
                                        PythonSandboxTools pythonSandboxTools,
+                                       ListMyDataTool listMyDataTool,
                                        LoadToolGuideTool loadToolGuideTool,
                                        ObjectMapper objectMapper,
                                        AgentEventService eventService,
@@ -37,6 +39,7 @@ public class LangchainToolsConfiguration {
                 ragTools,
                 searchTools,
                 pythonSandboxTools,
+                listMyDataTool,
                 loadToolGuideTool,
                 objectMapper,
                 eventService,

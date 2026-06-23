@@ -10,6 +10,7 @@ import dev.langchain4j.service.tool.ToolProviderResult;
 import lombok.RequiredArgsConstructor;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.tools.dataset.ListMyDataTool;
 import world.willfrog.agent.tools.docs.LoadToolGuideTool;
 import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
@@ -71,6 +72,7 @@ public class ToolRouterToolProvider implements ToolProvider {
     private final RagTools ragTools;
     private final SearchTools searchTools;
     private final PythonSandboxTools pythonSandboxTools;
+    private final ListMyDataTool listMyDataTool;
     private final LoadToolGuideTool loadToolGuideTool;
     private final ObjectMapper objectMapper;
     /**
@@ -109,6 +111,7 @@ public class ToolRouterToolProvider implements ToolProvider {
                 ragTools,
                 searchTools,
                 pythonSandboxTools,
+                listMyDataTool,
                 loadToolGuideTool,
                 webSearchEnabled,
                 codeInterpreterEnabled

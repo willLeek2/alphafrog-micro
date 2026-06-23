@@ -7,6 +7,7 @@ import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 import world.willfrog.agent.tools.dataset.DatasetRegistry;
 import world.willfrog.agent.tools.dataset.DatasetWriter;
+import world.willfrog.agent.tools.dataset.ListMyDataTool;
 import world.willfrog.agent.tools.dataset.ManifestWriter;
 import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.alphafrogmicro.agent.idl.AgentToolMessage;
@@ -35,6 +36,7 @@ class LangchainToolCatalogServiceTest {
                 null,
                 null,
                 null,
+                new ListMyDataTool(objectMapper),
                 objectMapper
         );
 
@@ -58,5 +60,27 @@ class LangchainToolCatalogServiceTest {
         assertTrue(searchAssetProps.has("assetTypes"));
         assertTrue(searchAssetProps.has("asset_type"));
         assertTrue(searchAssetProps.has("conditions"));
+    }
+
+    @Test
+    void listToolMessages_shouldExposeListMyData() throws Exception {
+        LangchainToolCatalogService service = new LangchainToolCatalogService(
+                null,
+                null,
+                null,
+                null,
+                new ListMyDataTool(objectMapper),
+                objectMapper
+        );
+
+        AgentToolMessage listMyData = service.listToolMessages().stream()
+                .filter(tool -> "listMyData".equals(tool.getName()))
+                .findFirst()
+                .orElseThrow();
+
+        JsonNode props = objectMapper.readTree(listMyData.getParametersJson()).path("properties");
+        assertTrue(props.has("query_type"));
+        assertTrue(props.has("grep"));
+        assertTrue(props.has("related_dataset_ids"));
     }
 }
