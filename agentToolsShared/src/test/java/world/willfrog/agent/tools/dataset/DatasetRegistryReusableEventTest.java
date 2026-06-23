@@ -14,6 +14,7 @@ import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.workflow.DatasetPersistedEvent;
 
+import java.util.ArrayList;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
@@ -25,6 +26,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.anyString;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -112,6 +114,41 @@ class DatasetRegistryReusableEventTest {
                 event.getPersistedPath());
     }
 
+    @Test
+    void reusableManifestHitPublishesMemberDatasetAndManifestEvents() throws Exception {
+        List<String> columns = List.of("trade_date", "close");
+        DatasetRegistry.DatasetMeta dsMeta = reusableMeta(
+                "stock_daily", "000001.SZ", "20240101", "20240131", columns, "ds-member");
+        String dsQueryKey = queryKey("stock_daily", "000001.SZ", "20240101", "20240131", columns);
+        dsMeta.setQueryKey(dsQueryKey);
+
+        DatasetRegistry.ManifestMeta manifestMeta = reusableManifestMeta(
+                "stock_daily", "20240101", "20240131", List.of("000001.SZ"), columns, "manifest-reuse");
+        String manifestQueryKey = manifestQueryKey("stock_daily", "20240101", "20240131",
+                List.of("000001.SZ"), columns);
+        manifestMeta.setQueryKey(manifestQueryKey);
+
+        when(valueOps.get(manifestMetaKey(manifestQueryKey))).thenReturn(MAPPER.writeValueAsString(manifestMeta));
+        when(valueOps.get(metaKey(dsQueryKey))).thenReturn(MAPPER.writeValueAsString(dsMeta));
+
+        Optional<DatasetRegistry.ManifestMeta> found = registry.findReusableManifest(
+                "stock_daily", "20240101", "20240131", List.of("000001.SZ"), columns);
+
+        assertTrue(found.isPresent());
+        List<DatasetPersistedEvent> events = captureDatasetEvents(2);
+        DatasetPersistedEvent datasetEvent = events.get(0);
+        DatasetPersistedEvent manifestEvent = events.get(1);
+
+        assertEquals("run-reuse", datasetEvent.getRunId());
+        assertEquals("ds-member", datasetEvent.getDatasetId());
+        assertEquals("000001.SZ", datasetEvent.getFromTsCode());
+
+        assertEquals("run-reuse", manifestEvent.getRunId());
+        assertEquals("manifest-reuse", manifestEvent.getManifestId());
+        assertEquals(List.of("ds-member"), manifestEvent.getRelatedDatasetIds());
+        assertEquals("000001.SZ", manifestEvent.getFromTsCode());
+    }
+
     private DatasetRegistry.DatasetMeta reusableMeta(String type, String tsCode, String startDate, String endDate,
                                                      List<String> columns, String datasetId) throws Exception {
         Path dir = tempDir.resolve(datasetId);
@@ -139,6 +176,61 @@ class DatasetRegistryReusableEventTest {
                 .build();
     }
 
+    private DatasetRegistry.ManifestMeta reusableManifestMeta(String dataType, String startDate, String endDate,
+                                                             List<String> tsCodes, List<String> columns,
+                                                             String manifestId) throws Exception {
+        Path dir = tempDir.resolve(manifestId);
+        Files.createDirectories(dir);
+        List<DatasetManifest.ManifestMember> members = new ArrayList<>();
+        for (String tsCode : tsCodes) {
+            members.add(DatasetManifest.ManifestMember.builder()
+                    .tsCode(tsCode)
+                    .datasetId("ds-member")
+                    .status(DatasetManifest.ManifestMember.STATUS_READY)
+                    .rowCount(1)
+                    .startDate(startDate)
+                    .endDate(endDate)
+                    .columns(columns)
+                    .build());
+        }
+        DatasetManifest manifest = DatasetManifest.builder()
+                .manifestId(manifestId)
+                .kind(DatasetManifest.KIND)
+                .dataType(dataType)
+                .startDate(startDate)
+                .endDate(endDate)
+                .memberCount(members.size())
+                .readyCount(members.size())
+                .failedCount(0)
+                .totalRowCount(members.size())
+                .columns(columns)
+                .columnsSignature(String.join(",", columns))
+                .members(members)
+                .createdAt(Instant.now().toEpochMilli())
+                .build();
+        MAPPER.writeValue(dir.resolve("manifest.json").toFile(), manifest);
+        MAPPER.writeValue(dir.resolve("meta.json").toFile(), manifest);
+        long now = Instant.now().toEpochMilli();
+        return DatasetRegistry.ManifestMeta.builder()
+                .manifestId(manifestId)
+                .dataType(dataType)
+                .startDate(startDate)
+                .endDate(endDate)
+                .columns(columns)
+                .columnsSignature(String.join(",", columns))
+                .memberCount(members.size())
+                .readyCount(members.size())
+                .failedCount(0)
+                .totalRowCount(members.size())
+                .path(dir.toString())
+                .createdAt(now)
+                .lastAccessAt(now)
+                .hitCount(1)
+                .ttlSeconds(604800L)
+                .expireAt(now + 604800000L)
+                .build();
+    }
+
     private DatasetPersistedEvent captureDatasetEvent() {
         org.mockito.ArgumentCaptor<ApplicationEvent> captor =
                 org.mockito.ArgumentCaptor.forClass(ApplicationEvent.class);
@@ -146,13 +238,32 @@ class DatasetRegistryReusableEventTest {
         return (DatasetPersistedEvent) captor.getValue();
     }
 
+    private List<DatasetPersistedEvent> captureDatasetEvents(int count) {
+        org.mockito.ArgumentCaptor<ApplicationEvent> captor =
+                org.mockito.ArgumentCaptor.forClass(ApplicationEvent.class);
+        verify(eventPublisher, times(count)).publishEvent(captor.capture());
+        return captor.getAllValues().stream()
+                .map(event -> (DatasetPersistedEvent) event)
+                .toList();
+    }
+
     private String queryKey(String type, String tsCode, String startDate, String endDate, List<String> columns) {
         return ReflectionTestUtils.invokeMethod(registry, "buildQueryKey",
                 type, tsCode, startDate, endDate, columns);
     }
 
+    private String manifestQueryKey(String dataType, String startDate, String endDate,
+                                    List<String> tsCodes, List<String> columns) {
+        return ReflectionTestUtils.invokeMethod(registry, "buildManifestQueryKey",
+                dataType, startDate, endDate, tsCodes, columns);
+    }
+
     private static String metaKey(String queryKey) {
         return "dataset:meta:" + queryKey;
+    }
+
+    private static String manifestMetaKey(String queryKey) {
+        return "manifest:meta:" + queryKey;
     }
 
     private static String indexKey(String type, String tsCode) {

@@ -234,6 +234,8 @@ public class DatasetRegistry {
             return Optional.empty();
         }
         touchManifestMeta(meta);
+        publishManifestMemberDatasetEvents(meta);
+        publishManifestPersistedEvent(meta);
         return Optional.of(meta);
     }
 
@@ -279,24 +281,8 @@ public class DatasetRegistry {
         try {
             redisTemplate.opsForValue().set(metaKey, objectMapper.writeValueAsString(meta));
 
-            // 01 → 02 contract: publish manifest persisted event
-            if (eventPublisher != null) {
-                String runId = world.willfrog.agent.platform.context.AgentContext.getRunId();
-                if (runId != null) {
-                    Path persistedJsonPath = manifestDirPath.resolve("manifest.json");
-                    String persistedPath = persistedJsonPath.toAbsolutePath().toString();
-                    // from_ts_code: infer from tsCodes list or UNCERTAIN
-                    String fromTsCode = (tsCodes != null && !tsCodes.isEmpty())
-                            ? String.join("#", tsCodes) : "UNCERTAIN";
-                    // Read relatedDatasetIds from just-written manifest.json
-                    List<String> relatedDatasetIds = readManifestDatasetIds(persistedJsonPath);
-                    // sortKey: includes manifestId for stable ordering
-                    String sortKey = "manifest-" + manifestId + ".json";
-                    eventPublisher.publishEvent(new DatasetPersistedEvent(
-                            this, runId, manifestId, persistedPath, fromTsCode,
-                            relatedDatasetIds, sortKey));
-                }
-            }
+            publishManifestMemberDatasetEvents(meta);
+            publishManifestPersistedEvent(meta);
         } catch (JsonProcessingException e) {
             log.error("Failed to serialize manifest meta: {}", manifestId, e);
         }
@@ -443,6 +429,78 @@ public class DatasetRegistry {
         String persistedPath = Paths.get(meta.getPath()).resolve(dataFileName).toAbsolutePath().toString();
         eventPublisher.publishEvent(new DatasetPersistedEvent(
                 this, runId, meta.getDatasetId(), persistedPath, meta.getTsCode(), dataFileName));
+    }
+
+    private void publishManifestPersistedEvent(ManifestMeta meta) {
+        if (eventPublisher == null || meta == null || meta.getManifestId() == null || meta.getManifestId().isBlank()) {
+            return;
+        }
+        String runId = AgentContext.getRunId();
+        if (runId == null || runId.isBlank()) {
+            return;
+        }
+        Path persistedJsonPath = Paths.get(meta.getPath()).resolve("manifest.json");
+        String persistedPath = persistedJsonPath.toAbsolutePath().toString();
+        List<String> relatedDatasetIds = readManifestDatasetIds(persistedJsonPath);
+        String fromTsCode = readManifestTsCodes(persistedJsonPath);
+        String sortKey = "manifest-" + meta.getManifestId() + ".json";
+        eventPublisher.publishEvent(new DatasetPersistedEvent(
+                this, runId, meta.getManifestId(), persistedPath, fromTsCode,
+                relatedDatasetIds, sortKey));
+    }
+
+    private void publishManifestMemberDatasetEvents(ManifestMeta meta) {
+        if (eventPublisher == null || meta == null || meta.getPath() == null || meta.getPath().isBlank()) {
+            return;
+        }
+        String runId = AgentContext.getRunId();
+        if (runId == null || runId.isBlank()) {
+            return;
+        }
+        Path manifestJsonPath = Paths.get(meta.getPath()).resolve("manifest.json");
+        Optional<DatasetManifest> manifestOpt = readManifestDocument(manifestJsonPath);
+        if (manifestOpt.isEmpty()) {
+            return;
+        }
+        DatasetManifest manifest = manifestOpt.get();
+        List<DatasetManifest.ManifestMember> members = manifest.getMembers();
+        if (members == null || members.isEmpty()) {
+            return;
+        }
+        String dataType = firstNonBlank(manifest.getDataType(), meta.getDataType());
+        if (dataType.isBlank()) {
+            return;
+        }
+        for (DatasetManifest.ManifestMember member : members) {
+            if (member == null || !DatasetManifest.ManifestMember.STATUS_READY.equals(member.getStatus())) {
+                continue;
+            }
+            String datasetId = member.getDatasetId();
+            String tsCode = member.getTsCode();
+            if (datasetId == null || datasetId.isBlank() || tsCode == null || tsCode.isBlank()) {
+                continue;
+            }
+            String startDate = firstNonBlank(member.getStartDate(), manifest.getStartDate(), meta.getStartDate());
+            String endDate = firstNonBlank(member.getEndDate(), manifest.getEndDate(), meta.getEndDate());
+            List<String> columns = member.getColumns() != null ? member.getColumns() : manifest.getColumns();
+            if (startDate.isBlank() || endDate.isBlank() || columns == null) {
+                continue;
+            }
+            String queryKey = buildQueryKey(dataType, tsCode, startDate, endDate, columns);
+            Optional<DatasetMeta> datasetMeta = loadMeta(queryKey);
+            if (datasetMeta.isEmpty()) {
+                log.warn("Manifest member dataset meta not found: manifestId={} datasetId={} tsCode={}",
+                        meta.getManifestId(), datasetId, tsCode);
+                continue;
+            }
+            DatasetMeta dsMeta = datasetMeta.get();
+            if (isExpired(dsMeta) || !datasetFilesExist(dsMeta)) {
+                log.warn("Manifest member dataset meta expired or missing file: manifestId={} datasetId={} tsCode={}",
+                        meta.getManifestId(), dsMeta.getDatasetId(), tsCode);
+                continue;
+            }
+            publishDatasetPersistedEvent(dsMeta);
+        }
     }
 
     private void touchManifestMeta(ManifestMeta meta) {
@@ -609,24 +667,55 @@ public class DatasetRegistry {
      * 02 consumers handle empty relatedDatasetIds gracefully.
      */
     private List<String> readManifestDatasetIds(Path manifestJsonPath) {
+        Optional<DatasetManifest> manifestOpt = readManifestDocument(manifestJsonPath);
+        if (manifestOpt.isEmpty() || manifestOpt.get().getMembers() == null) {
+            return List.of();
+        }
+        return manifestOpt.get().getMembers().stream()
+                .map(DatasetManifest.ManifestMember::getDatasetId)
+                .filter(id -> id != null && !id.isBlank())
+                .toList();
+    }
+
+    private String readManifestTsCodes(Path manifestJsonPath) {
+        Optional<DatasetManifest> manifestOpt = readManifestDocument(manifestJsonPath);
+        if (manifestOpt.isEmpty() || manifestOpt.get().getMembers() == null) {
+            return "UNCERTAIN";
+        }
+        String joined = manifestOpt.get().getMembers().stream()
+                .map(DatasetManifest.ManifestMember::getTsCode)
+                .filter(code -> code != null && !code.isBlank())
+                .distinct()
+                .reduce((left, right) -> left + "#" + right)
+                .orElse("");
+        return joined.isBlank() ? "UNCERTAIN" : joined;
+    }
+
+    private Optional<DatasetManifest> readManifestDocument(Path manifestJsonPath) {
         try {
             if (!Files.exists(manifestJsonPath)) {
-                return List.of();
+                return Optional.empty();
             }
             DatasetManifest manifest = objectMapper.readValue(
                     manifestJsonPath.toFile(), DatasetManifest.class);
-            if (manifest == null || manifest.getMembers() == null) {
-                return List.of();
-            }
-            return manifest.getMembers().stream()
-                    .map(DatasetManifest.ManifestMember::getDatasetId)
-                    .filter(id -> id != null && !id.isBlank())
-                    .toList();
+            return Optional.ofNullable(manifest);
         } catch (Exception e) {
-            log.debug("Failed to read manifest dataset IDs from {}: {}",
+            log.debug("Failed to read manifest document from {}: {}",
                     manifestJsonPath, e.getMessage());
-            return List.of();
+            return Optional.empty();
         }
+    }
+
+    private String firstNonBlank(String... values) {
+        if (values == null) {
+            return "";
+        }
+        for (String value : values) {
+            if (value != null && !value.isBlank()) {
+                return value;
+            }
+        }
+        return "";
     }
 
     /**

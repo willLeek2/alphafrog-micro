@@ -338,7 +338,8 @@ def _copy_via_csv_source_paths(
       - 第 4 列非空行 → 用 source_path 做 _copy_dataset_file（绕过 _resolve_dataset_dir + _list_files）
       - 目的路径 = 第 2 列 placeholder 替换为 task_input
       - sandbox path = `<task_input>/<originalId>/<sortKey>`，filename = sortKey
-      - NONE 行（manifest_file_path == NONE）由 _materialize_agent_run_csvs 单独物化，不在此 cp
+      - manifest 行统一由 _materialize_agent_run_csvs 物化为 run-level manifest，
+        不在此 cp；真实 manifest JSON 内 members[].datasetId 是 shared/original id
 
     MF-new-3（260623-02 round 3 review fix，commit `6450c2a`）：agent-run 模式下任何
     "应该被 cp 但没 cp" 的非 NONE 行（空 source_path / copy 抛异常）都必须 fail loud，
@@ -349,9 +350,9 @@ def _copy_via_csv_source_paths(
         (count, expected_count, failed_rows)
         - count: 实际成功 copy 的文件数
         - expected_count: 应当被 copy 的行数（非 NONE 且 source_path 非空）
-        - failed_rows: 每条 {"kind": "dataset"|"manifest", "original_id": str,
-          "source_path": str, "reason": str}——空 source_path 与 copy 异常都计入，
-          NONE 行豁免（在 _materialize_agent_run_csvs 单独处理）
+        - failed_rows: 每条 {"kind": "dataset", "original_id": str,
+          "source_path": str, "reason": str}——dataset 行空 source_path 与 copy 异常计入；
+          manifest 行统一由 _materialize_agent_run_csvs 根据 related_dataset_ids 物化
     """
     task_input_prefix = task_input.rstrip("/") + "/"
     count = 0
@@ -425,20 +426,6 @@ def _copy_via_csv_source_paths(
                 continue
             _copy_row(row[1], row[3], "dataset", row[0])
 
-    # path_manifest.csv 行（不含 NONE 行）
-    if path_manifest_csv.strip():
-        reader = csv.reader(io.StringIO(path_manifest_csv))
-        for row in reader:
-            if not row:
-                continue
-            if len(row) < 2:
-                continue
-            if row[0].strip() == "agent_run_manifest_id":
-                continue  # header
-            if len(row) < 4:
-                continue
-            _copy_row(row[1], row[3], "manifest", row[0])
-
     return count, expected_count, failed_rows
 
 
@@ -462,12 +449,14 @@ def _materialize_agent_run_csvs(
          - placeholder 替换 → 写到 {workdir}/paths_dataset.csv
          - 同时在内存里构建 (agent_run_dataset_id → from_ts_code) 映射，供 NONE 行反查
       2. path_manifest.csv:
-         - manifest_file_path != NONE 的行：placeholder 替换
-         - manifest_file_path == NONE 的行（Q7 拍板）：从 related_dataset_ids（run-level 编号 # 串）
-           在 dataset_by_number 映射里查 from_ts_code，构造最小 manifest schema
+         - 所有行都从 related_dataset_ids（run-level 编号 # 串）物化为 task-local
+           manifest.json，不再直接暴露 persisted manifest_file_path。真实 manifest
+           JSON 内 members[].datasetId 是 shared/original id，直接给 run-level loader
+           会破坏 spec §4.2.2。
+         - 在 dataset_by_number 映射里查 from_ts_code，构造最小 manifest schema
            （Cindy 拍板：manifestId / kind / memberCount / readyCount / failedCount / members），
            写到 <task_input>/_agent_run_manifest_<id>/manifest.json，
-           再把 CSV 行内的 NONE 替换为该 temp 路径。
+           再把 CSV 行内路径替换为该 temp 路径。
            找不到 related dataset number → member 标 status="broken" + errorCode +
            errorMessage，但 manifest 仍生成（fail loud, not fail silent）。
 
@@ -527,7 +516,7 @@ def _materialize_agent_run_csvs(
             f"{workdir}/paths_dataset.csv",
         )
 
-    # 3. path_manifest.csv 行级处理（NONE 行由 _materialize_none_manifest 物化）
+    # 3. path_manifest.csv 行级处理（所有行都物化为 run-level manifest）
     #    落盘 header 强制用 3 列 literal（不沿用 input header，避免 4 列污染）。
     materialized_mf_lines: List[str] = [
         "agent_run_manifest_id,manifest_file_path,related_dataset_ids"
@@ -546,26 +535,18 @@ def _materialize_agent_run_csvs(
                     row,
                 )
                 continue
-            agent_run_manifest_id, manifest_file_path_field, related = row[0], row[1], row[2]
-            if manifest_file_path_field == MANIFEST_NONE_MARKER:
-                # MF6: 物化 NONE 行 → 临时 manifest.json
-                temp_path = _materialize_none_manifest(
-                    session,
-                    task_input_prefix,
-                    agent_run_manifest_id,
-                    related,
-                    dataset_by_number,
-                )
-                materialized_mf_lines.append(
-                    ",".join([agent_run_manifest_id, temp_path, related])
-                )
-                continue
-            # 正常行：placeholder 替换（strip 第 4 列不写盘）
-            materialized_path = manifest_file_path_field.replace(
-                SANDBOX_INPUT_PLACEHOLDER, task_input_prefix
+            agent_run_manifest_id, _manifest_file_path_field, related = row[0], row[1], row[2]
+            # MF7: 所有 manifest 行统一物化。真实 persisted manifest 的
+            # members[].datasetId 是 original/shared id；run-level loader 需要的是 1/2/3。
+            temp_path = _materialize_none_manifest(
+                session,
+                task_input_prefix,
+                agent_run_manifest_id,
+                related,
+                dataset_by_number,
             )
             materialized_mf_lines.append(
-                ",".join([agent_run_manifest_id, materialized_path, related])
+                ",".join([agent_run_manifest_id, temp_path, related])
             )
     # 只有在至少有 1 行可解析的数据时才写 path_manifest.csv（header-only 没意义）。
     if len(materialized_mf_lines) > 1:  # 至少 1 行 data row

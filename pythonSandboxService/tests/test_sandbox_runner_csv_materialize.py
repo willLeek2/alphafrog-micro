@@ -116,7 +116,8 @@ class SandboxRunnerCsvMaterializeTest(unittest.TestCase):
         self.assertNotIn(SANDBOX_INPUT_PLACEHOLDER, content)
 
     def test_path_manifest_csv_placeholder_substitution(self) -> None:
-        # MF2 后 related_dataset_ids 是 run-level number 列表（# 拼接）
+        # MF2 后 related_dataset_ids 是 run-level number 列表（# 拼接）。
+        # MF7 后真实 manifest 行也统一物化为 task-local run-level manifest。
         config = _test_config(Path("/tmp/none"))
         session = _FakeSession()
         mf_csv = (
@@ -127,7 +128,8 @@ class SandboxRunnerCsvMaterializeTest(unittest.TestCase):
         manifest_writes = [w for w in session.writes if w[1].endswith("path_manifest.csv")]
         self.assertEqual(len(manifest_writes), 1)
         content = manifest_writes[0][0].decode("utf-8")
-        self.assertIn("/sandbox/runs/task-1/input/m-x/manifest.json", content)
+        self.assertIn("/sandbox/runs/task-1/input/_agent_run_manifest_1/manifest.json", content)
+        self.assertNotIn("/sandbox/runs/task-1/input/m-x/manifest.json", content)
         self.assertIn("1#2", content)
         self.assertNotIn(SANDBOX_INPUT_PLACEHOLDER, content)
 
@@ -219,8 +221,9 @@ class SandboxRunnerCsvMaterializeTest(unittest.TestCase):
                          "NONE marker should be replaced after materialization")
         expected_temp_path = _temp_manifest_path("/sandbox/runs/task-mf6/input", "1")
         self.assertIn(expected_temp_path, content)
-        # 真实 manifest 行保留
-        self.assertIn("/sandbox/runs/task-mf6/input/m-real/manifest.json", content)
+        # 真实 manifest 行也被替换为 run-level temp manifest
+        self.assertIn(_temp_manifest_path("/sandbox/runs/task-mf6/input", "2"), content)
+        self.assertNotIn("/sandbox/runs/task-mf6/input/m-real/manifest.json", content)
         # 2 行数据
         data_lines = [l for l in content.splitlines() if l and not l.startswith("agent_run_manifest_id")]
         self.assertEqual(2, len(data_lines), "expected 2 data rows in materialized csv")
@@ -618,9 +621,10 @@ class SandboxRunnerCsvMaterializeTest(unittest.TestCase):
         self.assertEqual(rows[1][0], "1")
         self.assertIn("_agent_run_manifest_1/manifest.json", rows[1][1])
         self.assertEqual(rows[1][2], "1")
-        # 正常 manifest 行：placeholder 替换 + strip 第 4 列
+        # 正常 manifest 行也统一物化，strip 第 4 列
         self.assertEqual(rows[2][0], "2")
-        self.assertEqual(rows[2][1], "/sandbox/runs/task-mf4/input/m-real/manifest.json")
+        self.assertIn("_agent_run_manifest_2/manifest.json", rows[2][1])
+        self.assertNotIn("/m-real/manifest.json", rows[2][1])
         self.assertEqual(rows[2][2], "1")
         # source_path 数据不应出现在 on-disk CSV
         self.assertNotIn("/data/should-be-ignored", content)
@@ -694,8 +698,8 @@ class SandboxRunnerCsvSourcePathCopyTest(unittest.TestCase):
         self.assertIn("/sandbox/runs/task-mf3/input/ds-a/000300.SH.csv", writes_by_dest)
         self.assertIn("/sandbox/runs/task-mf3/input/ds-b/000002.SZ.csv", writes_by_dest)
 
-    def test_manifest_source_path_copies_via_source(self) -> None:
-        """MF3: path_manifest.csv 第 4 列非空 → cp source_path → sandbox path。"""
+    def test_manifest_source_path_is_not_required_for_source_copy(self) -> None:
+        """MF7: path_manifest.csv 不再 cp persisted manifest，后续统一物化。"""
         from app.sandbox_runner import _copy_via_csv_source_paths
         config = _test_config(Path("/tmp/none"))
         session = _FakeSession()
@@ -709,14 +713,10 @@ class SandboxRunnerCsvSourcePathCopyTest(unittest.TestCase):
             count, expected, failed = _copy_via_csv_source_paths(
                 session, config, "task-mf3", "/sandbox/runs/task-mf3/input", "", mf_csv
             )
-        self.assertEqual(count, 1)
-        self.assertEqual(expected, 1)
+        self.assertEqual(count, 0)
+        self.assertEqual(expected, 0)
         self.assertEqual(failed, [])
-        writes_by_dest = {w[1]: w[0] for w in session.writes}
-        self.assertIn(
-            "/sandbox/runs/task-mf3/input/m-x/manifest.json",
-            writes_by_dest,
-        )
+        self.assertEqual(session.writes, [])
 
     def test_none_manifest_row_skipped_in_source_copy(self) -> None:
         """MF3: NONE 行（manifest_file_path=NONE）由 _materialize_none_manifest 处理，不在此 cp。"""
@@ -780,7 +780,7 @@ class SandboxRunnerCsvSourcePathCopyTest(unittest.TestCase):
         self.assertEqual(session.writes, [])
 
     def test_combined_dataset_and_manifest(self) -> None:
-        """MF3: paths_dataset + path_manifest 同时给 → 两边都 cp。"""
+        """MF3/MF7: paths_dataset 被 cp，path_manifest 由后续物化生成。"""
         from app.sandbox_runner import _copy_via_csv_source_paths
         config = _test_config(Path("/tmp/none"))
         session = _FakeSession()
@@ -800,8 +800,8 @@ class SandboxRunnerCsvSourcePathCopyTest(unittest.TestCase):
             count, expected, failed = _copy_via_csv_source_paths(
                 session, config, "task-mf3", "/sandbox/runs/task-mf3/input", ds_csv, mf_csv
             )
-        self.assertEqual(count, 2)
-        self.assertEqual(expected, 2)
+        self.assertEqual(count, 1)
+        self.assertEqual(expected, 1)
         self.assertEqual(failed, [])
 
     def test_empty_csvs_return_zero(self) -> None:
