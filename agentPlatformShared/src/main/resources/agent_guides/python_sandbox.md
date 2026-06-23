@@ -14,6 +14,7 @@
 - dataset 编号空间与 manifest 编号空间相互独立，均从 1 开始。
 - 单数据集：`dataset_ids: "1"`；多数据集：`dataset_ids: "1,3"`。
 - 数据已打包成 manifest 时，优先使用 `manifest_ids`，例如 `manifest_ids: "1"` 或 `"1,2"`。
+- `dataset_ids` / `manifest_ids` 工具参数可以逗号分隔；Python 代码里推荐每次向 `load_datasets` / `load_manifest` 传一个编号，多个编号用循环逐个加载后合并。
 - 不确定编号时，先调用 `listMyData(query_type="dataset")` 或 `listMyData(query_type="manifest")` 查询。
 - executePython 报错 `ILLEGAL_RUN_LEVEL_IDS` 时，错误详情会给出 `legal_dataset_numbers` / `legal_manifest_numbers`，从这两个列表取值重试。
 
@@ -33,6 +34,11 @@ print(result.failed_members, result.skipped_members)
 dfs = load_datasets("1")
 for ts_code, df in dfs.items():
     print(ts_code, df.shape)
+
+# 多 dataset 对比：工具参数传 dataset_ids="1,3"，代码里逐个加载更稳妥
+datasets = {}
+for ds_id in ["1", "3"]:
+    datasets.update(load_datasets(ds_id))
 ```
 
 `load_datasets("1")` 返回 `dict[from_ts_code, DataFrame]`；`from_ts_code` 可能为 `UNCERTAIN`，仅表示系统无法从工具入参简单判定资产代码，不代表数据损坏。

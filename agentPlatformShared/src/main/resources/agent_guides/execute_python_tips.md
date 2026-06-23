@@ -6,6 +6,7 @@
 - dataset 编号空间与 manifest 编号空间相互独立，均从 1 开始。
 - 单数据集：`dataset_ids: "1"`；多数据集：`dataset_ids: "1,3"`。
 - 数据已打包成 manifest 时，优先使用 `manifest_ids`，例如 `manifest_ids: "1"`。
+- `dataset_ids` / `manifest_ids` 工具参数可以逗号分隔；Python 代码里推荐每次向 `load_datasets` / `load_manifest` 传一个编号，多个编号用循环逐个加载后合并。
 - 不确定编号时，先调用 `listMyData(query_type="dataset")` 或 `listMyData(query_type="manifest")`。
 - executePython 报错 `ILLEGAL_RUN_LEVEL_IDS` 时，用错误详情里的 `legal_dataset_numbers` / `legal_manifest_numbers` 重试。
 
@@ -25,6 +26,11 @@ if result:
 result = load_manifest("1")
 df = result.frame
 print(result.failed_members, result.skipped_members)
+
+# 多 dataset 对比：工具参数传 dataset_ids="1,3"，代码里逐个加载更稳妥
+datasets = {}
+for ds_id in ["1", "3"]:
+    datasets.update(load_datasets(ds_id))
 ```
 
 **fallback**：读取 CSV 索引。

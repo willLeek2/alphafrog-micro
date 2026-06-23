@@ -16,9 +16,11 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
+import world.willfrog.agent.platform.artifact.ToolOutputRefService;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agent.platform.service.SearchEvidenceJudgeService;
+import world.willfrog.agent.tools.compaction.RereadToolHandler;
 import world.willfrog.agent.tools.dataset.DatasetRegistry;
 import world.willfrog.agent.tools.dataset.DatasetWriter;
 import world.willfrog.agent.tools.dataset.ListMyDataTool;
@@ -70,6 +72,7 @@ class ToolRouterToolProviderTest {
         PythonSandboxTools pythonSandboxTools = new PythonSandboxTools(objectMapper);
         ListMyDataTool listMyDataTool = new ListMyDataTool(objectMapper);
         LoadToolGuideTool loadToolGuideTool = new LoadToolGuideTool(objectMapper);
+        RereadToolHandler rereadToolHandler = new RereadToolHandler(mock(ToolOutputRefService.class), objectMapper);
 
         provider = new ToolRouterToolProvider(
                 toolRouter,
@@ -79,6 +82,7 @@ class ToolRouterToolProviderTest {
                 pythonSandboxTools,
                 listMyDataTool,
                 loadToolGuideTool,
+                rereadToolHandler,
                 objectMapper,
                 eventService,
                 new LangchainToolConcurrencyThrottle(false, 20, 60)
@@ -109,6 +113,7 @@ class ToolRouterToolProviderTest {
         assertTrue(toolNames.contains("checkParallelLimits"));
         assertTrue(toolNames.contains("ragSearch"));
         assertTrue(toolNames.contains("listMyData"));
+        assertTrue(toolNames.contains("rereadToolResult"));
     }
 
     @Test
@@ -126,6 +131,10 @@ class ToolRouterToolProviderTest {
                 "listMyData is a run metadata tool and must not depend on webSearch/codeInterpreter flags");
         assertNotNull(result.toolExecutorByName("listMyData"),
                 "AiService must be able to execute a listMyData tool_call instead of treating it as hallucinated");
+        assertTrue(toolNames.contains("rereadToolResult"),
+                "rereadToolResult is a rawRef metadata tool and must not depend on webSearch/codeInterpreter flags");
+        assertNotNull(result.toolExecutorByName("rereadToolResult"),
+                "AiService must be able to execute a rereadToolResult tool_call instead of treating it as hallucinated");
     }
 
     @Test
@@ -142,6 +151,9 @@ class ToolRouterToolProviderTest {
         assertTrue(specsByName.get("isTradingDay").description().contains("calendar_record_found"));
         assertTrue(specsByName.get("isTradingDay").description().contains("calendar.maxItems"));
         assertTrue(specsByName.get("isTradingDay").description().contains("data.mode=batch"));
+        assertTrue(specsByName.containsKey("rereadToolResult"));
+        assertTrue(specsByName.get("rereadToolResult").description().contains("rawRef"));
+        assertTrue(specsByName.get("rereadToolResult").description().contains("loadDocument"));
 
         String dailyDescription = specsByName.get("getExchangeAssetDaily").description();
         assertTrue(dailyDescription.contains("checkParallelLimits"));

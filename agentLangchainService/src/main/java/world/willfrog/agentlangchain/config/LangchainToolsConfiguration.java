@@ -6,6 +6,7 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.tools.compaction.RereadToolHandler;
 import world.willfrog.agent.tools.dataset.ListMyDataTool;
 import world.willfrog.agent.tools.docs.LoadToolGuideTool;
 import world.willfrog.agent.tools.market.MarketDataTools;
@@ -19,7 +20,7 @@ import world.willfrog.agentlangchain.tools.ToolRouterToolProvider;
  * Registers the ToolRouter-backed {@link ToolProvider} for AiServices (P1 A2).
  */
 @Configuration
-@ConditionalOnBean({ToolRouter.class, MarketDataTools.class, RagTools.class, SearchTools.class, PythonSandboxTools.class, ListMyDataTool.class, LoadToolGuideTool.class, AgentEventService.class})
+@ConditionalOnBean({ToolRouter.class, MarketDataTools.class, RagTools.class, SearchTools.class, PythonSandboxTools.class, ListMyDataTool.class, LoadToolGuideTool.class, RereadToolHandler.class, AgentEventService.class})
 public class LangchainToolsConfiguration {
 
     @Bean
@@ -30,6 +31,7 @@ public class LangchainToolsConfiguration {
                                        PythonSandboxTools pythonSandboxTools,
                                        ListMyDataTool listMyDataTool,
                                        LoadToolGuideTool loadToolGuideTool,
+                                       RereadToolHandler rereadToolHandler,
                                        ObjectMapper objectMapper,
                                        AgentEventService eventService,
                                        LangchainToolConcurrencyThrottle toolThrottle) {
@@ -41,6 +43,7 @@ public class LangchainToolsConfiguration {
                 pythonSandboxTools,
                 listMyDataTool,
                 loadToolGuideTool,
+                rereadToolHandler,
                 objectMapper,
                 eventService,
                 toolThrottle

@@ -13,12 +13,14 @@ agent:
            - /sandbox/paths_dataset.csv：agent_run_dataset_id, dataset_file_path, from_ts_code
            - /sandbox/path_manifest.csv：agent_run_manifest_id, manifest_file_path, related_dataset_ids
            Python 代码应先读取这两个 CSV 取得真实文件路径，再用 pd.read_csv(path) 加载。from_ts_code 可能为 UNCERTAIN，仅表示系统无法从工具入参简单判定资产代码，不代表数据损坏或不可用。
+           dataset_ids / manifest_ids 工具参数可用逗号分隔；Python 代码里推荐每次向 load_datasets / load_manifest 传一个编号，多个编号用循环逐个加载后合并。
         6. 如果你不确定该用哪些编号，或在沙箱中遇到 dataset/manifest 相关错误，先调用 listMyData 工具查询当前 run 中可用的 dataset / manifest 编号。
         7. 如果 executePython 连续失败 2 次及以上且均与 dataset/manifest 编号或路径有关，必须停止继续尝试同类代码，改为调用 listMyData 或换用其他工具策略。
-        8. Python 环境预装 numpy、pandas、matplotlib、scipy，优先使用这些库完成数据处理与计算。
-        9. 所有工具输出均为 JSON：{"ok":boolean,"tool":"...","data":{...},"error":{...}|null}。读取字段必须从 data 中取值，禁止按自然语言文本解析。
-        10. 工作时，并行查询工具的并行限制请调用 checkParallelLimits 查询。searchAssetInfo、searchStock、searchIndex、searchFund、getStockInfo、getIndexInfo、getExchangeAssetDaily、getStockDaily、getIndexDaily 均支持 | 或 JSON 数组批量传参，但必须按 checkParallelLimits 返回的 maxItems 拆批；若工具列表中没有 checkParallelLimits 或调用失败，默认并行查询关闭，每次只查 1 个标的或关键词。请合理规划入参合并同类查询，减少 tool call 次数；发现式检索仍允许逐步查询，不必强行合并。
-        11. 所有输出内容须标明具体公历年份（如 2025年、20250101~20251231）；禁止使用仅含「去年」「明年」「上一年」「再上一年」等未标明具体年份的表述。
+        8. 工具结果里若出现 data.rawRef（形如 raw-ref:...），需要完整原始输出时调用 rereadToolResult(rawRef=...)；不要把 rawRef 传给 loadDocument，loadDocument 只接收 ragSearch 返回的 oss_url。
+        9. Python 环境预装 numpy、pandas、matplotlib、scipy，优先使用这些库完成数据处理与计算。
+        10. 所有工具输出均为 JSON：{"ok":boolean,"tool":"...","data":{...},"error":{...}|null}。读取字段必须从 data 中取值，禁止按自然语言文本解析。
+        11. 工作时，并行查询工具的并行限制请调用 checkParallelLimits 查询。searchAssetInfo、searchStock、searchIndex、searchFund、getStockInfo、getIndexInfo、getExchangeAssetDaily、getStockDaily、getIndexDaily 均支持 | 或 JSON 数组批量传参，但必须按 checkParallelLimits 返回的 maxItems 拆批；若工具列表中没有 checkParallelLimits 或调用失败，默认并行查询关闭，每次只查 1 个标的或关键词。请合理规划入参合并同类查询，减少 tool call 次数；发现式检索仍允许逐步查询，不必强行合并。
+        12. 所有输出内容须标明具体公历年份（如 2025年、20250101~20251231）；禁止使用仅含「去年」「明年」「上一年」「再上一年」等未标明具体年份的表述。
       todo-planner-system-prompt-template: >
         你是任务规划器。请将用户目标拆解为 Todo List，只输出 JSON。
         格式：{"analysis":"...","items":[{"id":"todo_1","sequence":1,"type":"TOOL_CALL","toolName":"searchIndex","params":{"keyword":"沪深300"},"reasoning":"...","executionMode":"AUTO"}]}。
@@ -84,6 +86,7 @@ agent:
         - 数据文件路径不再固定为 /sandbox/input/<dataset_id>/<dataset_id>.csv；executePython 启动后会在 /sandbox/paths_dataset.csv 与 /sandbox/path_manifest.csv 中注入 run-level 编号到真实路径的映射。
         - 读取数据时应先读 CSV 索引：pd.read_csv("/sandbox/paths_dataset.csv") 或 pd.read_csv("/sandbox/path_manifest.csv")，根据 run-level 编号拿到 dataset_file_path / manifest_file_path，再用 pd.read_csv(path) 加载。
         - 也可使用 from af_dataset_loader import load_manifest, load_datasets；load_datasets("1") 按 run-level dataset 编号返回 dict[ts_code, DataFrame]；load_manifest("1") 按 run-level manifest 编号返回 DatasetLoadResult（含 frame / failed_members / skipped_members）。
+        - dataset_ids / manifest_ids 工具参数可用逗号分隔；Python 代码里推荐每次向 load_datasets / load_manifest 传一个编号，多个编号用循环逐个加载后合并。
         - from_ts_code 字段可能为 UNCERTAIN，不代表数据损坏；若需按资产过滤，用 listMyData 查询。
         - 日期字段请先排序后再取首尾行，不要硬编码某个交易日一定存在。
         - trade_date 常见为 YYYYMMDD 数字串；优先使用 astype(str) 后提取 8 位数字并按字符串排序。

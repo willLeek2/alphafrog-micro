@@ -105,6 +105,38 @@ class RunLevelDatasetLoaderTest(unittest.TestCase):
         df = result["1"]
         self.assertEqual(len(df), 2)
 
+    def test_load_run_level_dataset_comma_separated_numbers(self) -> None:
+        ds1 = _write_run_dataset(self.sandbox, "1", "000001.SZ")
+        ds3 = _write_run_dataset(self.sandbox, "3", "000003.SZ")
+        _write_run_dataset_index(
+            self.sandbox,
+            [
+                {"agent_run_dataset_id": "1", "dataset_file_path": str(ds1), "from_ts_code": "000001.SZ"},
+                {"agent_run_dataset_id": "3", "dataset_file_path": str(ds3), "from_ts_code": "000003.SZ"},
+            ],
+        )
+
+        result = load_datasets("1,3", input_root=str(self.input_root))
+        self.assertEqual(set(result.keys()), {"000001.SZ", "000003.SZ"})
+        self.assertEqual(len(result["000001.SZ"]), 2)
+        self.assertEqual(len(result["000003.SZ"]), 2)
+
+    def test_load_run_level_dataset_duplicate_keys_keep_both_frames(self) -> None:
+        ds1 = _write_run_dataset(self.sandbox, "1", "UNCERTAIN", file_name="one.csv")
+        ds2 = _write_run_dataset(self.sandbox, "2", "UNCERTAIN", file_name="two.csv")
+        _write_run_dataset_index(
+            self.sandbox,
+            [
+                {"agent_run_dataset_id": "1", "dataset_file_path": str(ds1), "from_ts_code": "UNCERTAIN"},
+                {"agent_run_dataset_id": "2", "dataset_file_path": str(ds2), "from_ts_code": "UNCERTAIN"},
+            ],
+        )
+
+        result = load_datasets("1,2", input_root=str(self.input_root))
+        self.assertEqual(set(result.keys()), {"1", "2"})
+        self.assertEqual(len(result["1"]), 2)
+        self.assertEqual(len(result["2"]), 2)
+
     def test_load_run_level_manifest(self) -> None:
         ds1 = _write_run_dataset(self.sandbox, "1", "000001.SZ")
         ds2 = _write_run_dataset(self.sandbox, "2", "000002.SZ")
@@ -161,6 +193,44 @@ class RunLevelDatasetLoaderTest(unittest.TestCase):
         self.assertEqual(len(result.frame), 2)
         self.assertEqual(len(result.failed_members), 1)
         self.assertEqual(result.failed_members[0]["tsCode"], "000002.SZ")
+
+    def test_load_run_level_manifest_comma_separated_numbers(self) -> None:
+        ds1 = _write_run_dataset(self.sandbox, "1", "000001.SZ")
+        ds2 = _write_run_dataset(self.sandbox, "2", "000002.SZ")
+        _write_run_dataset_index(
+            self.sandbox,
+            [
+                {"agent_run_dataset_id": "1", "dataset_file_path": str(ds1), "from_ts_code": "000001.SZ"},
+                {"agent_run_dataset_id": "2", "dataset_file_path": str(ds2), "from_ts_code": "000002.SZ"},
+            ],
+        )
+
+        manifest_path_1 = self.sandbox / "_agent_run_manifest_1" / "manifest.json"
+        manifest_path_2 = self.sandbox / "_agent_run_manifest_2" / "manifest.json"
+        _write_run_manifest_json(
+            manifest_path_1,
+            [{"tsCode": "000001.SZ", "datasetId": "1", "status": "ready"}],
+        )
+        _write_run_manifest_json(
+            manifest_path_2,
+            [
+                {"tsCode": "000002.SZ", "datasetId": "2", "status": "ready"},
+                {"tsCode": "000003.SZ", "datasetId": "3", "status": "failed", "errorCode": "MISS"},
+            ],
+        )
+        _write_run_manifest_index(
+            self.sandbox,
+            [
+                {"agent_run_manifest_id": "1", "manifest_file_path": str(manifest_path_1), "related_dataset_ids": "1"},
+                {"agent_run_manifest_id": "2", "manifest_file_path": str(manifest_path_2), "related_dataset_ids": "2"},
+            ],
+        )
+
+        result = load_manifest("1,2", input_root=str(self.input_root))
+        self.assertEqual(len(result.frame), 4)
+        self.assertEqual(set(result.frame["ts_code"].unique()), {"000001.SZ", "000002.SZ"})
+        self.assertEqual(len(result.failed_members), 1)
+        self.assertEqual(result.failed_members[0]["tsCode"], "000003.SZ")
 
     def test_invalid_run_level_dataset_raises(self) -> None:
         _write_run_dataset_index(

@@ -3,6 +3,7 @@
 数据文件路径不再固定为 /sandbox/input/<dataset_id>/<dataset_id>.csv；executePython 启动后会在 /sandbox/paths_dataset.csv 与 /sandbox/path_manifest.csv 中注入 run-level 编号到真实路径的映射。
 读取数据时应先读 CSV 索引：pd.read_csv("/sandbox/paths_dataset.csv") 或 pd.read_csv("/sandbox/path_manifest.csv")，根据 run-level 编号拿到 dataset_file_path / manifest_file_path，再用 pd.read_csv(path) 加载。
 也可使用 from af_dataset_loader import load_manifest, load_datasets；load_datasets("1") 按 run-level dataset 编号返回 dict[ts_code, DataFrame]；load_manifest("1") 按 run-level manifest 编号返回 DatasetLoadResult（含 frame / failed_members / skipped_members）。
+dataset_ids / manifest_ids 工具参数可用逗号分隔；Python 代码里推荐每次向 load_datasets / load_manifest 传一个编号，多个编号用循环逐个加载后合并。
 from_ts_code 字段可能为 UNCERTAIN，不代表数据损坏；若需按资产过滤，用 listMyData 查询。
 日期字段请先排序后再取首尾行，不要硬编码某个交易日一定存在。
 trade_date 常见为 YYYYMMDD 数字串；优先使用 astype(str) 后提取 8 位数字并按字符串排序。

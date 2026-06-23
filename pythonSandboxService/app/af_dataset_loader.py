@@ -109,6 +109,12 @@ def _looks_like_run_level_id(value: str) -> bool:
     return value.isdigit() and int(value) > 0
 
 
+def _split_run_level_ids(value: str) -> List[str]:
+    """Accept comma-separated run-level numbers produced by executePython args."""
+    parts = [part.strip() for part in str(value or "").split(",")]
+    return [part for part in parts if part]
+
+
 def _resolve_run_dataset_file_path(
     dataset_number: str, paths_df: pd.DataFrame
 ) -> str | None:
@@ -154,6 +160,19 @@ def _load_run_datasets_by_number(
         from_ts_code = dataset_number
     frame = _read_run_dataset_csv(file_path, from_ts_code)
     return {from_ts_code: frame}
+
+
+def _merge_dataset_maps(
+    target: Dict[str, pd.DataFrame],
+    addition: Dict[str, pd.DataFrame],
+    *,
+    suffix: str,
+) -> None:
+    for key, frame in addition.items():
+        out_key = key
+        if out_key in target:
+            out_key = f"{key}#{suffix}"
+        target[out_key] = frame
 
 
 def _load_run_manifest_by_number(
@@ -237,9 +256,17 @@ def load_datasets(
     root = Path(input_root)
 
     # Run-level fast path
-    if _looks_like_run_level_id(dataset_id) and _is_run_level_mode(root):
+    run_level_ids = _split_run_level_ids(dataset_id)
+    if run_level_ids and all(_looks_like_run_level_id(item) for item in run_level_ids) and _is_run_level_mode(root):
         paths_csv, _ = _run_level_csv_paths(root)
-        return _load_run_datasets_by_number(dataset_id, paths_csv)
+        result: Dict[str, pd.DataFrame] = {}
+        for number in run_level_ids:
+            _merge_dataset_maps(
+                result,
+                _load_run_datasets_by_number(number, paths_csv),
+                suffix=number,
+            )
+        return result
 
     if data_dir is not None and is_manifest_dataset(Path(data_dir), dataset_id):
         expanded = expand_dataset_ids(Path(data_dir), [dataset_id])
@@ -296,9 +323,25 @@ def load_manifest(
     root = Path(input_root)
 
     # Run-level fast path
-    if _looks_like_run_level_id(manifest_id) and _is_run_level_mode(root):
+    run_level_ids = _split_run_level_ids(manifest_id)
+    if run_level_ids and all(_looks_like_run_level_id(item) for item in run_level_ids) and _is_run_level_mode(root):
         paths_csv, manifests_csv = _run_level_csv_paths(root)
-        return _load_run_manifest_by_number(manifest_id, paths_csv, manifests_csv)
+        results = [
+            _load_run_manifest_by_number(number, paths_csv, manifests_csv)
+            for number in run_level_ids
+        ]
+        frames = [result.frame for result in results if not result.frame.empty]
+        frame = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        failed_members: List[Dict[str, Any]] = []
+        skipped_members: List[Dict[str, Any]] = []
+        for result in results:
+            failed_members.extend(result.failed_members)
+            skipped_members.extend(result.skipped_members)
+        return DatasetLoadResult(
+            frame,
+            failed_members=failed_members,
+            skipped_members=skipped_members,
+        )
 
     by_ts = load_datasets(manifest_id, input_root=input_root, data_dir=data_dir)
     if not by_ts:

@@ -14,7 +14,7 @@
 - {"tool":"getIndexDaily","args":{"tsCode":"${step_0.output.data.items.0.ts_code}","startDateStr":"20250101","endDateStr":"20251231"},"note":"先查指数后取日线"}
 - {"tool":"listMyData","args":{"query_type":"dataset"},"note":"获取当前 run 可用 dataset 编号"}
 - {"tool":"executePython","args":{"dataset_ids":"1","code":"from af_dataset_loader import load_datasets\nresult = load_datasets('1')\nif result:\n    df = list(result.values())[0]\n    ..."},"note":"根据日线数据计算结果"}
-- {"tool":"executePython","args":{"dataset_ids":"1,3","code":"from af_dataset_loader import load_datasets\ndatasets = load_datasets('1,3')\nfor ts_code, df in datasets.items():\n    ..."},"note":"多数据集对比分析"}
+- {"tool":"executePython","args":{"dataset_ids":"1,3","code":"from af_dataset_loader import load_datasets\ndatasets = {}\nfor ds_id in ['1','3']:\n    datasets.update(load_datasets(ds_id))\nfor ts_code, df in datasets.items():\n    ..."},"note":"多数据集对比分析"}
 - {"tool":"executePython","args":{"manifest_ids":"1","code":"from af_dataset_loader import load_manifest\nresult = load_manifest('1')\ndf = result.frame\nprint(result.failed_members, result.skipped_members)\n..."},"note":"分析 manifest"}
 
 非法示例：
@@ -22,6 +22,7 @@
 - {"tool":"getIndexDaily","args":{"tsCode":"{todo_1.output.data.items.0.ts_code}"}}
 
 从 search 类工具返回的 items 中选取最符合用户意图的项，不要默认取第一条。若需要执行 executePython：dataset_ids / manifest_ids 必须是当前 run 的 run-level 整数编号，code 应使用 `load_datasets` / `load_manifest` 或读取 `/sandbox/paths_dataset.csv` / `/sandbox/path_manifest.csv` 加载数据。
+工具结果里若出现 data.rawRef（raw-ref:...），需要完整原始输出时应调用 rereadToolResult，不要把 rawRef 传给 loadDocument。
 
 输出格式（只输出 JSON）：
 {"steps":[{"tool":"name","args":{...},"note":"why"}],"expected":"..."}

@@ -1,6 +1,8 @@
 package world.willfrog.agent.tools.compaction;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import dev.langchain4j.agent.tool.P;
+import dev.langchain4j.agent.tool.Tool;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.artifact.ToolOutputReadResult;
@@ -18,6 +20,21 @@ public class RereadToolHandler {
 
     private final ToolOutputRefService toolOutputRefService;
     private final ObjectMapper objectMapper;
+
+    @Tool("""
+        重新读取被压缩的大型工具输出。
+        当某个工具结果包含 data.rawRef（形如 raw-ref:...）且 summary 不够用时，调用本工具读取原始内容。
+        rawRef 必须来自工具结果的 data.rawRef；不要把 rawRef 传给 loadDocument，loadDocument 只接收 ragSearch 返回的 oss_url。
+        可选 keyword 用于在原始内容中搜索；offset/limit 用于分页读取。
+        """)
+    public String rereadToolResult(
+            @P(value = "工具结果 data.rawRef 字段，形如 raw-ref:...", required = true) String rawRef,
+            @P(value = "可选关键词；非空时只返回匹配片段", required = false) String keyword,
+            @P(value = "可选读取偏移，默认 0", required = false) Integer offset,
+            @P(value = "可选读取长度，0 表示使用服务默认", required = false) Integer limit
+    ) {
+        return reread(rawRef, keyword, offset, limit);
+    }
 
     public String reread(String rawRef, String keyword, Integer offset, Integer limit) {
         if (rawRef == null || rawRef.isBlank()) {

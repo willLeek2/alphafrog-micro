@@ -105,6 +105,10 @@ class ActivePromptRunLevelContractTest {
                 path + " 不得声明旧固定路径");
         assertFalse(prompt.contains("必须来自已完成依赖任务的 `data.dataset_id`"),
                 path + " 不得要求从 data.dataset_id 获取 ID");
+        assertFalse(prompt.contains("load_datasets(\"1,3\")"),
+                path + " 不得示例把逗号分隔编号直接传给 load_datasets");
+        assertFalse(prompt.contains("load_datasets('1,3')"),
+                path + " 不得示例把逗号分隔编号直接传给 load_datasets");
     }
 
     @Test
@@ -127,6 +131,27 @@ class ActivePromptRunLevelContractTest {
                 "application-agent-llm-prompts.yml 必须说明 run-level 编号");
         assertTrue(yaml.contains("listMyData"),
                 "application-agent-llm-prompts.yml 必须说明 listMyData");
+        assertTrue(yaml.contains("rereadToolResult"),
+                "application-agent-llm-prompts.yml 必须说明 rawRef 使用 rereadToolResult");
+        assertTrue(yaml.contains("loadDocument 只接收"),
+                "application-agent-llm-prompts.yml 必须说明 rawRef 不传给 loadDocument");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "prompts/agent/agent_run_system.txt",
+            "prompts/todo/dag_react_system.txt",
+            "prompts/todo/dag_react_system_default.txt",
+            "prompts/workflow/workflow_todo_recovery_system.txt",
+            "prompts/sub_agent/sub_agent_planner_system.txt",
+    })
+    void activePromptFiles_shouldTeachRawRefRereadTool(String path) {
+        String prompt = PromptFileLoader.load(path);
+        assertFalse(prompt.isBlank(), path + " 必须可加载");
+        assertTrue(prompt.contains("rereadToolResult"),
+                path + " 必须说明 rawRef 使用 rereadToolResult");
+        assertTrue(prompt.contains("loadDocument"),
+                path + " 必须说明 rawRef 不传给 loadDocument");
     }
 
     @Test
@@ -167,6 +192,22 @@ class ActivePromptRunLevelContractTest {
                 "tips guide 不得要求 glob 遍历旧挂载目录");
         assertFalse(guide.contains("<dataset_id>.csv"),
                 "tips guide 不得使用旧 <dataset_id>.csv 模板");
+    }
+
+    @Test
+    void datasetManifestGuide_shouldTeachRunLevelManifestIds() {
+        String guide = loadResourceAsString("agent_guides/dataset_manifest.md");
+        assertFalse(guide.isBlank(), "agent_guides/dataset_manifest.md 必须可加载");
+        assertTrue(guide.contains("manifest_ids"),
+                "manifest guide 必须说明 manifest_ids");
+        assertTrue(guide.contains("run-level"),
+                "manifest guide 必须说明 run-level 编号");
+        assertTrue(guide.contains("load_manifest(\"1\")"),
+                "manifest guide 必须示例按 run-level 编号读取 manifest");
+        assertFalse(guide.contains("/sandbox/input/<manifest_id>"),
+                "manifest guide 不得 teaching 旧 /sandbox/input/<manifest_id> 路径");
+        assertFalse(guide.contains("executePython` 的 `dataset_ids` 可只传 manifest id"),
+                "manifest guide 不得要求用 dataset_ids 传 manifest");
     }
 
     private static boolean containsRunLevelInstruction(String prompt) {

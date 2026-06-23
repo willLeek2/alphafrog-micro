@@ -2,6 +2,7 @@ package world.willfrog.agentlangchain.tools;
 
 import dev.langchain4j.agent.tool.ToolSpecification;
 import dev.langchain4j.agent.tool.ToolSpecifications;
+import world.willfrog.agent.tools.compaction.RereadToolHandler;
 import world.willfrog.agent.tools.catalog.MarketDataAdvancedToolCatalog;
 import world.willfrog.agent.tools.catalog.ParallelLimitsToolCatalog;
 import world.willfrog.agent.tools.dataset.ListMyDataTool;
@@ -28,6 +29,7 @@ final class ToolCatalogBuilder {
                                                        PythonSandboxTools pythonSandboxTools,
                                                        ListMyDataTool listMyDataTool,
                                                        LoadToolGuideTool loadToolGuideTool,
+                                                       RereadToolHandler rereadToolHandler,
                                                        boolean webSearchEnabled,
                                                        boolean codeInterpreterEnabled) {
         List<ToolSpecification> specifications = new ArrayList<>();
@@ -41,6 +43,7 @@ final class ToolCatalogBuilder {
         }
         specifications.addAll(ToolSpecifications.toolSpecificationsFrom(listMyDataTool));
         specifications.addAll(ToolSpecifications.toolSpecificationsFrom(loadToolGuideTool));
+        specifications.addAll(ToolSpecifications.toolSpecificationsFrom(rereadToolHandler));
         return MarketDataAdvancedToolCatalog.mergeCanonical(ParallelLimitsToolCatalog.mergeCanonical(specifications));
     }
 }

@@ -10,6 +10,7 @@ import dev.langchain4j.service.tool.ToolProviderResult;
 import lombok.RequiredArgsConstructor;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.tools.compaction.RereadToolHandler;
 import world.willfrog.agent.tools.dataset.ListMyDataTool;
 import world.willfrog.agent.tools.docs.LoadToolGuideTool;
 import world.willfrog.agent.tools.market.MarketDataTools;
@@ -74,6 +75,7 @@ public class ToolRouterToolProvider implements ToolProvider {
     private final PythonSandboxTools pythonSandboxTools;
     private final ListMyDataTool listMyDataTool;
     private final LoadToolGuideTool loadToolGuideTool;
+    private final RereadToolHandler rereadToolHandler;
     private final ObjectMapper objectMapper;
     /**
      * 事件服务，传递给 {@link ToolRouterToolExecutor} 用于发射 TOOL_CALL_STARTED / TOOL_CALL_FINISHED
@@ -113,6 +115,7 @@ public class ToolRouterToolProvider implements ToolProvider {
                 pythonSandboxTools,
                 listMyDataTool,
                 loadToolGuideTool,
+                rereadToolHandler,
                 webSearchEnabled,
                 codeInterpreterEnabled
         );

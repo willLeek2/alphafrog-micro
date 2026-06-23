@@ -8,6 +8,7 @@ IDs are agent run-level numbers (NOT original datasetId strings):
 - dataset_ids: comma-separated run-level dataset numbers, e.g. "1" or "1,3". Get these from listMyData or from the legal_dataset_numbers list in an ILLEGAL_RUN_LEVEL_IDS error.
 - manifest_ids: comma-separated run-level manifest numbers, e.g. "1" or "1,2". Prefer manifest_ids when the data you need is already grouped into a manifest. Dataset and manifest counters are independent; both start at 1 within the same run.
 - Pass numbers only. If you only have a raw dataset id string or a file path, call listMyData first to resolve it.
+- The tool arguments can use comma-separated numbers. In Python helper code, prefer loading one number at a time and merging results when you need multiple datasets/manifests.
 
 OPTIONAL parameters:
 - libraries: comma-separated pip packages, e.g. "numpy,pandas". Prefer preinstalled runtime libraries to reduce latency.
@@ -23,6 +24,11 @@ PYTHON HELPER EXAMPLES:
 - Single dataset by number:
     from af_dataset_loader import load_datasets
     df = load_datasets("1")["000300.SH"]
+- Multiple datasets by number:
+    from af_dataset_loader import load_datasets
+    datasets = {}
+    for ds_id in ["1", "3"]:
+        datasets.update(load_datasets(ds_id))
 - Manifest by number:
     from af_dataset_loader import load_manifest
     result = load_manifest("1")
