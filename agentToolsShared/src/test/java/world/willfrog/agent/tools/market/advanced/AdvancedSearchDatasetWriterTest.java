@@ -75,7 +75,7 @@ class AdvancedSearchDatasetWriterTest {
             when(datasetRegistry.findReusable(eq(AdvancedSearchDatasetWriter.DATASET_TYPE), anyString(),
                     eq("NONE"), eq("NONE"), eq(AdvancedSearchDatasetWriter.COLUMNS)))
                     .thenReturn(Optional.empty());
-            when(datasetWriter.getDatasetPath()).thenReturn(tempDir.toString());
+            when(datasetWriter.getDatabaseFetchedPath()).thenReturn(tempDir.toString());
 
             Map<String, Object> dataset = Map.of(
                     "results", List.of(Map.of("ts_code", "000300.SH")),
@@ -89,13 +89,12 @@ class AdvancedSearchDatasetWriterTest {
             assertEquals("created", result.getDatasetStatus());
             assertFalse(result.isReused());
             assertNotNull(result.getDatasetId());
-            assertTrue(result.getDatasetId().contains("test-run-001"));
-            assertTrue(result.getDatasetId().contains("searchIndex"));
-            assertTrue(result.getDatasetId().contains("index"));
+            assertTrue(result.getDatasetId().startsWith("adv-"), "datasetId should use query-based prefix, not runId");
+            assertEquals(16, result.getDatasetId().length(), "adv- prefix (4) + 12 hex chars");
             assertEquals(1, result.getPreviewRows().size());
             assertEquals("000300.SH", result.getPreviewRows().get(0).get("ts_code"));
 
-            verify(datasetWriter).getDatasetPath();
+            verify(datasetWriter).getDatabaseFetchedPath();
             verify(datasetRegistry).registerDataset(
                     eq(AdvancedSearchDatasetWriter.DATASET_TYPE),
                     anyString(),
@@ -105,11 +104,17 @@ class AdvancedSearchDatasetWriterTest {
                     eq(result.getDatasetId()),
                     eq(1),
                     eq("json"),
-                    eq(result.getDatasetId() + ".json"));
+                    eq("data.json"));
 
-            Path jsonFile = tempDir.resolve(result.getDatasetId()).resolve(result.getDatasetId() + ".json");
-            assertTrue(Files.exists(jsonFile), "json file should be written under tempDir");
-            String written = Files.readString(jsonFile);
+            // Verify 4-layer path: database_fetched/<topic>/<tsCode>/<encodedString>/data.json
+            Path advancedSearchDir = tempDir.resolve("advanced_search");
+            assertTrue(Files.exists(advancedSearchDir), "advanced_search topic dir should exist");
+            // Walk to find the data.json
+            List<Path> jsonFiles = Files.walk(tempDir)
+                    .filter(p -> p.getFileName().toString().equals("data.json"))
+                    .toList();
+            assertEquals(1, jsonFiles.size(), "one data.json should be written under 4-layer path");
+            String written = Files.readString(jsonFiles.get(0));
             assertTrue(written.contains("000300.SH"), "written json should contain dataset content");
         }
     }
@@ -159,7 +164,7 @@ class AdvancedSearchDatasetWriterTest {
 
             verify(datasetRegistry, never()).registerDataset(anyString(), anyString(), anyString(),
                     anyString(), anyList(), anyString(), anyInt(), anyString(), anyString());
-            verify(datasetWriter, never()).getDatasetPath();
+            verify(datasetWriter, never()).getDatabaseFetchedPath();
         }
     }
 
@@ -202,7 +207,7 @@ class AdvancedSearchDatasetWriterTest {
             when(datasetRegistry.isEnabled()).thenReturn(true);
             when(datasetRegistry.findReusable(anyString(), anyString(), anyString(),
                     anyString(), anyList())).thenReturn(Optional.empty());
-            when(datasetWriter.getDatasetPath()).thenReturn(tempDir.toString());
+            when(datasetWriter.getDatabaseFetchedPath()).thenReturn(tempDir.toString());
 
             List<Map<String, Object>> rows = new ArrayList<>();
             for (int i = 0; i < 30; i++) {
@@ -225,7 +230,7 @@ class AdvancedSearchDatasetWriterTest {
             when(datasetRegistry.isEnabled()).thenReturn(true);
             when(datasetRegistry.findReusable(anyString(), anyString(), anyString(),
                     anyString(), anyList())).thenReturn(Optional.empty());
-            when(datasetWriter.getDatasetPath()).thenReturn(tempDir.toString());
+            when(datasetWriter.getDatabaseFetchedPath()).thenReturn(tempDir.toString());
 
             List<Map<String, Object>> rows = List.of(Map.of("ts_code", "000001.SZ"));
             Map<String, Object> dataset = Map.of("results", rows);
@@ -268,67 +273,71 @@ class AdvancedSearchDatasetWriterTest {
     }
 
     @Nested
-    @DisplayName("buildDatasetId 命名规则")
+    @DisplayName("datasetId 基于 querySignature，不含 runId")
     class DatasetIdComposition {
 
         @Test
-        @DisplayName("runId + toolName + assetType 三段都会出现在 datasetId 中")
-        void shouldEmbedRunIdToolNameAssetType() {
+        @DisplayName("相同 query 产生相同 datasetId，不含 runId")
+        void shouldBeDeterministicAndRunIdFree() {
             when(datasetWriter.isEnabled()).thenReturn(true);
             when(datasetRegistry.isEnabled()).thenReturn(true);
             when(datasetRegistry.findReusable(anyString(), anyString(), anyString(),
                     anyString(), anyList())).thenReturn(Optional.empty());
-            when(datasetWriter.getDatasetPath()).thenReturn(tempDir.toString());
+            when(datasetWriter.getDatabaseFetchedPath()).thenReturn(tempDir.toString());
 
-            AgentContext.setRunId("my-run");
+            Map<String, Object> dataset = Map.of("results", List.of(Map.of("ts_code", "510300.SH")));
+            Map<String, Object> query = Map.of("name", "沪深300");
 
-            AdvancedSearchDatasetWriter.WriteResult result = writer.writeOrReuse(
-                    "searchAssetInfo", "etf", Map.of("name", "X"),
-                    Map.of("results", List.of(Map.of("ts_code", "510300.SH"))), 10);
+            AgentContext.setRunId("run-A");
+            AdvancedSearchDatasetWriter.WriteResult r1 = writer.writeOrReuse(
+                    "searchIndex", "stock", query, dataset, 10);
 
-            assertEquals("created", result.getDatasetStatus());
-            assertTrue(result.getDatasetId().contains("my-run"));
-            assertTrue(result.getDatasetId().contains("searchAssetInfo"));
-            assertTrue(result.getDatasetId().contains("etf"));
-            assertTrue(result.getDatasetId().startsWith("my-run-advanced-searchAssetInfo-etf-"));
+            AgentContext.setRunId("run-B");
+            AdvancedSearchDatasetWriter.WriteResult r2 = writer.writeOrReuse(
+                    "searchIndex", "stock", query, dataset, 10);
+
+            assertEquals(r1.getDatasetId(), r2.getDatasetId(),
+                    "same query must yield same datasetId regardless of runId");
+            assertTrue(r1.getDatasetId().startsWith("adv-"), "datasetId should start with adv-");
+            assertFalse(r1.getDatasetId().contains("run-A"));
+            assertFalse(r2.getDatasetId().contains("run-B"));
         }
 
         @Test
-        @DisplayName("runId 为 null/blank 时使用 unknown 前缀")
-        void shouldUseUnknownPrefixWhenRunIdBlank() {
+        @DisplayName("不同 toolName/assetType/query 产生不同 datasetId")
+        void shouldDifferByQueryInputs() {
             when(datasetWriter.isEnabled()).thenReturn(true);
             when(datasetRegistry.isEnabled()).thenReturn(true);
             when(datasetRegistry.findReusable(anyString(), anyString(), anyString(),
                     anyString(), anyList())).thenReturn(Optional.empty());
-            when(datasetWriter.getDatasetPath()).thenReturn(tempDir.toString());
+            when(datasetWriter.getDatabaseFetchedPath()).thenReturn(tempDir.toString());
 
-            AgentContext.setRunId("");
+            Map<String, Object> dataset = Map.of("results", List.of(Map.of("ts_code", "000001.SZ")));
 
-            AdvancedSearchDatasetWriter.WriteResult result = writer.writeOrReuse(
-                    "searchIndex", "stock", Map.of("name", "X"),
-                    Map.of("results", List.of(Map.of("ts_code", "000001.SZ"))), 10);
+            AdvancedSearchDatasetWriter.WriteResult r1 = writer.writeOrReuse(
+                    "searchIndex", "stock", Map.of("name", "X"), dataset, 10);
+            AdvancedSearchDatasetWriter.WriteResult r2 = writer.writeOrReuse(
+                    "searchAssetInfo", "stock", Map.of("name", "X"), dataset, 10);
 
-            assertTrue(result.getDatasetId().startsWith("unknown-advanced-searchIndex-stock-"));
+            assertFalse(r1.getDatasetId().equals(r2.getDatasetId()),
+                    "different toolName must produce different datasetId");
         }
 
         @Test
-        @DisplayName("assetType 为 null 时默认为 index")
-        void shouldDefaultAssetTypeToIndex() {
+        @DisplayName("assetType 为 null 时仍可生成稳定 datasetId")
+        void shouldHandleNullAssetType() {
             when(datasetWriter.isEnabled()).thenReturn(true);
             when(datasetRegistry.isEnabled()).thenReturn(true);
             when(datasetRegistry.findReusable(anyString(), anyString(), anyString(),
                     anyString(), anyList())).thenReturn(Optional.empty());
-            when(datasetWriter.getDatasetPath()).thenReturn(tempDir.toString());
-
-            AgentContext.setRunId("r1");
+            when(datasetWriter.getDatabaseFetchedPath()).thenReturn(tempDir.toString());
 
             AdvancedSearchDatasetWriter.WriteResult result = writer.writeOrReuse(
                     "searchIndex", null, Map.of("name", "X"),
                     Map.of("results", List.of(Map.of("ts_code", "000001.SZ"))), 10);
 
-            assertTrue(result.getDatasetId().contains("-index-"));
-            assertFalse(result.getDatasetId().contains("-null-"));
-            assertTrue(result.getDatasetId().startsWith("r1-advanced-searchIndex-index-"));
+            assertTrue(result.getDatasetId().startsWith("adv-"));
+            assertEquals(16, result.getDatasetId().length());
         }
     }
 
@@ -343,7 +352,7 @@ class AdvancedSearchDatasetWriterTest {
             when(datasetRegistry.isEnabled()).thenReturn(true);
             when(datasetRegistry.findReusable(anyString(), anyString(), anyString(),
                     anyString(), anyList())).thenReturn(Optional.empty());
-            when(datasetWriter.getDatasetPath()).thenReturn(tempDir.toString());
+            when(datasetWriter.getDatabaseFetchedPath()).thenReturn(tempDir.toString());
 
             Map<String, Object> dataset = Map.of("results", List.of(Map.of("ts_code", "000001.SZ")));
             Map<String, Object> queryX = Map.of("name", "X");
@@ -386,7 +395,7 @@ class AdvancedSearchDatasetWriterTest {
             lenient().when(datasetRegistry.isEnabled()).thenReturn(true);
             lenient().when(datasetRegistry.findReusable(anyString(), anyString(), anyString(),
                     anyString(), anyList())).thenReturn(Optional.empty());
-            lenient().when(datasetWriter.getDatasetPath()).thenReturn(tempDir.toString());
+            lenient().when(datasetWriter.getDatabaseFetchedPath()).thenReturn(tempDir.toString());
 
             Map<String, Object> dataset = Map.of("results", "not-a-list");
 
@@ -403,7 +412,7 @@ class AdvancedSearchDatasetWriterTest {
             lenient().when(datasetRegistry.isEnabled()).thenReturn(true);
             lenient().when(datasetRegistry.findReusable(anyString(), anyString(), anyString(),
                     anyString(), anyList())).thenReturn(Optional.empty());
-            lenient().when(datasetWriter.getDatasetPath()).thenReturn(tempDir.toString());
+            lenient().when(datasetWriter.getDatabaseFetchedPath()).thenReturn(tempDir.toString());
 
             Map<String, Object> dataset = Map.of();
 

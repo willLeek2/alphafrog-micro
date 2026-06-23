@@ -316,7 +316,7 @@ class MarketDataToolsBatchTest {
         when(manifestWriter.isEnabled()).thenReturn(true);
         when(datasetRegistry.findReusable(eq("stock_daily"), anyString(), anyString(), anyString(), anyList()))
                 .thenReturn(Optional.empty());
-        when(datasetWriter.writeDataset(anyString(), anyString(), anyString(), anyString(), anyList(), anyList(), any()))
+        when(datasetWriter.writeDataset(anyString(), anyString(), anyString(), anyString(), anyString(), anyList(), anyList(), any()))
                 .thenReturn("atomic-ds-1", "atomic-ds-2");
         when(datasetRegistry.findReusableManifest(anyString(), anyString(), anyString(), anyList(), anyList()))
                 .thenReturn(Optional.empty());
@@ -379,7 +379,7 @@ class MarketDataToolsBatchTest {
         when(manifestWriter.isEnabled()).thenReturn(true);
         when(datasetRegistry.findReusable(eq("stock_daily"), anyString(), anyString(), anyString(), anyList()))
                 .thenReturn(Optional.empty());
-        when(datasetWriter.writeDataset(anyString(), anyString(), anyString(), anyString(), anyList(), anyList(), any()))
+        when(datasetWriter.writeDataset(anyString(), anyString(), anyString(), anyString(), anyString(), anyList(), anyList(), any()))
                 .thenReturn("atomic-ds-1", "atomic-ds-2");
         when(datasetRegistry.findReusableManifest(anyString(), anyString(), anyString(), anyList(), anyList()))
                 .thenReturn(Optional.empty());
@@ -403,7 +403,7 @@ class MarketDataToolsBatchTest {
         when(manifestWriter.isEnabled()).thenReturn(true);
         when(datasetRegistry.findReusable(eq("stock_daily"), anyString(), anyString(), anyString(), anyList()))
                 .thenReturn(Optional.empty());
-        when(datasetWriter.writeDataset(anyString(), anyString(), anyString(), anyString(), anyList(), anyList(), any()))
+        when(datasetWriter.writeDataset(anyString(), anyString(), anyString(), anyString(), anyString(), anyList(), anyList(), any()))
                 .thenReturn("atomic-ds-1", "atomic-ds-2");
         DatasetRegistry.ManifestMeta reused = DatasetRegistry.ManifestMeta.builder()
                 .manifestId("manifest-stock_daily-20240101-20240131-reused")
@@ -431,7 +431,7 @@ class MarketDataToolsBatchTest {
         when(manifestWriter.isEnabled()).thenReturn(true);
         when(datasetRegistry.findReusable(eq("stock_daily"), anyString(), anyString(), anyString(), anyList()))
                 .thenReturn(Optional.empty());
-        when(datasetWriter.writeDataset(anyString(), anyString(), anyString(), anyString(), anyList(), anyList(), any()))
+        when(datasetWriter.writeDataset(anyString(), anyString(), anyString(), anyString(), anyString(), anyList(), anyList(), any()))
                 .thenReturn("atomic-ds-1");
         when(datasetRegistry.findReusableManifest(anyString(), anyString(), anyString(), anyList(), anyList()))
                 .thenReturn(Optional.empty());

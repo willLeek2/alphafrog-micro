@@ -12,11 +12,13 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.Cursor;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ScanOptions;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.artifact.PersistentArtifactRegistry;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
+import world.willfrog.agent.workflow.DatasetPersistedEvent;
 import world.willfrog.alphafrogmicro.common.utils.DateConvertUtils;
 
 import java.io.File;
@@ -48,6 +50,12 @@ public class DatasetRegistry {
     @Value("${agent.tools.market-data.dataset.path:/data/agent_datasets}")
     private String datasetPath;
 
+    @Value("${agent.tools.market-data.dataset.database-fetched-path:/data/database_fetched}")
+    private String databaseFetchedPath;
+
+    @Value("${agent.tools.market-data.dataset.manifests-path:/data/manifests}")
+    private String manifestsPath;
+
     @Value("${agent.tools.market-data.dataset.enabled:true}")
     private boolean enabled;
 
@@ -66,8 +74,11 @@ public class DatasetRegistry {
     @Autowired(required = false)
     private PersistentArtifactRegistry artifactRegistry;
 
-    public DatasetRegistry(StringRedisTemplate redisTemplate) {
+    private final ApplicationEventPublisher eventPublisher;
+
+    public DatasetRegistry(StringRedisTemplate redisTemplate, ApplicationEventPublisher eventPublisher) {
         this.redisTemplate = redisTemplate;
+        this.eventPublisher = eventPublisher;
     }
 
     public boolean isEnabled() {
@@ -142,8 +153,9 @@ public class DatasetRegistry {
 
     public void registerDataset(String type, String tsCode, String startDate, String endDate,
                                 List<String> columns, String datasetId, int rowCount) {
+        String safeTsCode = tsCode != null ? tsCode.replaceAll("[^a-zA-Z0-9.]", "_") : "data";
         registerDataset(type, tsCode, startDate, endDate, columns, datasetId, rowCount, "csv",
-                datasetId == null || datasetId.isEmpty() ? "" : datasetId + ".csv");
+                safeTsCode + ".csv");
     }
 
     public void registerDataset(String type, String tsCode, String startDate, String endDate,
@@ -155,9 +167,9 @@ public class DatasetRegistry {
         String queryKey = buildQueryKey(type, tsCode, startDate, endDate, columns);
         long now = Instant.now().toEpochMilli();
         long expireAt = ttlSeconds > 0 ? now + ttlSeconds * 1000L : Long.MAX_VALUE;
-        // 使用三层路径：{toolType}/{scopeHash}/{datasetId}
-        String scopeHash = DatasetPathStrategy.scopeHash(type, tsCode, startDate, endDate);
-        Path datasetDirPath = DatasetPathStrategy.resolvePath(Paths.get(datasetPath), type, scopeHash, datasetId);
+        // 使用四层路径：database_fetched/<topic>/<tsCode>/<encodedString>/<tsCode>.csv
+        Path datasetDirPath = resolveDatasetDir(databaseFetchedPath, type, tsCode, startDate, endDate, columns);
+        // meta.path = directory (for cleanup walking); event.getPersistedPath() = file (for 02 sandbox)
         String datasetDir = datasetDirPath.toAbsolutePath().toString();
 
         DatasetMeta meta = DatasetMeta.builder()
@@ -185,6 +197,17 @@ public class DatasetRegistry {
             redisTemplate.opsForValue().set(metaKey, objectMapper.writeValueAsString(meta));
             redisTemplate.opsForSet().add(indexKey(type, tsCode), queryKey);
             registerPersistentArtifacts(meta);
+
+            // 01 → 02 contract: publish dataset persisted event
+            if (eventPublisher != null) {
+                String runId = world.willfrog.agent.platform.context.AgentContext.getRunId();
+                if (runId != null) {
+                    String persistedPath = datasetDirPath.resolve(dataFileName).toAbsolutePath().toString();
+                    eventPublisher.publishEvent(new DatasetPersistedEvent(
+                            this, runId, datasetId, persistedPath, tsCode,
+                            dataFileName != null ? dataFileName : datasetId + ".csv"));
+                }
+            }
         } catch (JsonProcessingException e) {
             log.error("Failed to serialize dataset meta: {}", datasetId, e);
         }
@@ -233,7 +256,9 @@ public class DatasetRegistry {
         String queryKey = buildManifestQueryKey(dataType, startDate, endDate, tsCodes, columns);
         long now = Instant.now().toEpochMilli();
         long expireAt = ttlSeconds > 0 ? now + ttlSeconds * 1000L : Long.MAX_VALUE;
-        String manifestDir = Paths.get(datasetPath, manifestId).toAbsolutePath().toString();
+        Path manifestDirPath = DatabaseFetchedPathStrategy.resolveManifestPath(
+                Paths.get(manifestsPath), manifestId);
+        String manifestDir = manifestDirPath.toAbsolutePath().toString();
 
         ManifestMeta meta = ManifestMeta.builder()
                 .manifestId(manifestId)
@@ -258,6 +283,25 @@ public class DatasetRegistry {
         String metaKey = manifestMetaKey(queryKey);
         try {
             redisTemplate.opsForValue().set(metaKey, objectMapper.writeValueAsString(meta));
+
+            // 01 → 02 contract: publish manifest persisted event
+            if (eventPublisher != null) {
+                String runId = world.willfrog.agent.platform.context.AgentContext.getRunId();
+                if (runId != null) {
+                    Path persistedJsonPath = manifestDirPath.resolve("manifest.json");
+                    String persistedPath = persistedJsonPath.toAbsolutePath().toString();
+                    // from_ts_code: infer from tsCodes list or UNCERTAIN
+                    String fromTsCode = (tsCodes != null && !tsCodes.isEmpty())
+                            ? String.join("#", tsCodes) : "UNCERTAIN";
+                    // Read relatedDatasetIds from just-written manifest.json
+                    List<String> relatedDatasetIds = readManifestDatasetIds(persistedJsonPath);
+                    // sortKey: includes manifestId for stable ordering
+                    String sortKey = "manifest-" + manifestId + ".json";
+                    eventPublisher.publishEvent(new DatasetPersistedEvent(
+                            this, runId, manifestId, persistedPath, fromTsCode,
+                            relatedDatasetIds, sortKey));
+                }
+            }
         } catch (JsonProcessingException e) {
             log.error("Failed to serialize manifest meta: {}", manifestId, e);
         }
@@ -430,8 +474,9 @@ public class DatasetRegistry {
         if (!dir.exists() || !dir.isDirectory()) {
             return false;
         }
-        File manifestJson = new File(dir, meta.getManifestId() + ".manifest.json");
-        File metaJson = new File(dir, meta.getManifestId() + ".meta.json");
+        // Matches ManifestWriter: manifest.json / meta.json (spec §A.5, no manifestId prefix)
+        File manifestJson = new File(dir, "manifest.json");
+        File metaJson = new File(dir, "meta.json");
         return manifestJson.exists() && metaJson.exists();
     }
 
@@ -475,12 +520,8 @@ public class DatasetRegistry {
     private void deleteDatasetFiles(DatasetMeta meta) {
         Path dir = Paths.get(meta.getPath());
         if (!Files.exists(dir)) {
-            // 目录已不存在，清理残存的 compat symlink（避免 dangling）
-            cleanupCompatSymlink(meta.getDatasetId());
             return;
         }
-        // 先删 compat symlink，再删 target 目录，避免 dangling symlink
-        cleanupCompatSymlink(meta.getDatasetId());
         try {
             Files.walk(dir)
                     .sorted(Comparator.reverseOrder())
@@ -510,14 +551,7 @@ public class DatasetRegistry {
                     ttlHours,
                     false
             );
-            artifactRegistry.registerExternal(
-                    "dataset-symlink",
-                    meta.getDatasetId(),
-                    "compat_symlink",
-                    Paths.get(datasetPath, meta.getDatasetId()).toAbsolutePath().normalize(),
-                    ttlHours,
-                    true
-            );
+            // dataset-symlink artifact removed — no compat symlinks in new 4-layer structure
         } catch (Exception e) {
             log.warn("Failed to register dataset persistent artifacts for {}: {}",
                     meta.getDatasetId(), e.getMessage());
@@ -540,27 +574,61 @@ public class DatasetRegistry {
         return Math.max(1L, (seconds + 3599L) / 3600L);
     }
 
-    private void cleanupCompatSymlink(String datasetId) {
-        Path flatLink = Paths.get(datasetPath, datasetId);
-        try {
-            if (Files.isSymbolicLink(flatLink) || Files.exists(flatLink)) {
-                Files.deleteIfExists(flatLink);
-            }
-        } catch (IOException e) {
-            log.debug("Compat symlink cleanup skipped for {}: {}", datasetId, e.getMessage());
-        }
-    }
+    // cleanupCompatSymlink removed — compat symlinks deleted entirely.
+    // New 4-layer database_fetched path structure eliminates flat symlinks.
 
     private String metaKey(String queryKey) {
         return META_PREFIX + queryKey;
     }
 
     private String indexKey(String type, String tsCode) {
-        return INDEX_PREFIX + type + ":" + tsCode;
+        // Migrated from <type>:<tsCode> to <topic>:<tsCode> per spec §A.4
+        String topic = DatabaseFetchedPathStrategy.resolveTopic(type);
+        return INDEX_PREFIX + topic + ":" + tsCode;
     }
 
     private String manifestMetaKey(String queryKey) {
         return MANIFEST_META_PREFIX + queryKey;
+    }
+
+    /**
+     * Read dataset IDs from a just-written manifest.json.
+     * Returns empty list on any error (file missing, malformed JSON, etc.) —
+     * 02 consumers handle empty relatedDatasetIds gracefully.
+     */
+    private List<String> readManifestDatasetIds(Path manifestJsonPath) {
+        try {
+            if (!Files.exists(manifestJsonPath)) {
+                return List.of();
+            }
+            DatasetManifest manifest = objectMapper.readValue(
+                    manifestJsonPath.toFile(), DatasetManifest.class);
+            if (manifest == null || manifest.getMembers() == null) {
+                return List.of();
+            }
+            return manifest.getMembers().stream()
+                    .map(DatasetManifest.ManifestMember::getDatasetId)
+                    .filter(id -> id != null && !id.isBlank())
+                    .toList();
+        } catch (Exception e) {
+            log.debug("Failed to read manifest dataset IDs from {}: {}",
+                    manifestJsonPath, e.getMessage());
+            return List.of();
+        }
+    }
+
+    /**
+     * Shared helper: compute the 4-layer dataset directory path from clean type.
+     * Package-private so tests can call the exact same method registry uses when
+     * constructing {@code persistedPath} for {@link DatasetPersistedEvent}.
+     * Both {@link #registerDataset} and the event publish code path go through this.
+     */
+    static Path resolveDatasetDir(String databaseFetchedPath, String type, String tsCode,
+                                   String startDate, String endDate, List<String> columns) {
+        String topic = DatabaseFetchedPathStrategy.resolveTopic(type);
+        String encodedStr = DatabaseFetchedPathStrategy.encodedString(type, tsCode, startDate, endDate, columns);
+        return DatabaseFetchedPathStrategy.resolveDataPath(
+                Paths.get(databaseFetchedPath), topic, tsCode, encodedStr);
     }
 
     private String buildQueryKey(String type, String tsCode, String startDate, String endDate, List<String> columns) {

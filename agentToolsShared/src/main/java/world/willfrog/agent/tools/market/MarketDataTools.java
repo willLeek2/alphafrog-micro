@@ -1138,7 +1138,7 @@ public class MarketDataTools {
             if (datasetWriter.isEnabled()) {
                 String runId = AgentContext.getRunId();
                 String prefix = (runId != null ? runId : "unknown") + "-" + assetType;
-                String datasetId = datasetWriter.writeDataset(prefix, tsCode, startDateStr, endDateStr, response.getItemsList(), effectiveHeaders, item -> {
+                String datasetId = datasetWriter.writeDataset(datasetKind, prefix, tsCode, startDateStr, endDateStr, response.getItemsList(), effectiveHeaders, item -> {
                     List<Object> row = new ArrayList<>(Arrays.asList(
                             item.getTsCode(), item.getTradeDate(), item.getOpen(), item.getHigh(), item.getLow(), item.getClose(),
                             item.hasPreClose() ? item.getPreClose() : null,
@@ -1784,7 +1784,7 @@ public class MarketDataTools {
             if (datasetWriter.isEnabled()) {
                 String runId = AgentContext.getRunId();
                 String prefix = (runId != null ? runId : "unknown") + "-stock";
-                String datasetId = datasetWriter.writeDataset(prefix, tsCode, startDateStr, endDateStr, response.getItemsList(), headers, item -> Arrays.asList(
+                String datasetId = datasetWriter.writeDataset("stock_daily", prefix, tsCode, startDateStr, endDateStr, response.getItemsList(), headers, item -> Arrays.asList(
                         item.getTsCode(), item.getTradeDate(), item.getOpen(), item.getHigh(), item.getLow(), item.getClose(),
                         item.getPreClose(), item.getChange(), item.getPctChg(), item.getVol(), item.getAmount()
                 ));
@@ -1858,7 +1858,7 @@ public class MarketDataTools {
             if (datasetWriter.isEnabled()) {
                 String runId = AgentContext.getRunId();
                 String prefix = (runId != null ? runId : "unknown") + "-index";
-                String datasetId = datasetWriter.writeDataset(prefix, tsCode, startDateStr, endDateStr, response.getItemsList(), headers, item -> Arrays.asList(
+                String datasetId = datasetWriter.writeDataset("index_daily", prefix, tsCode, startDateStr, endDateStr, response.getItemsList(), headers, item -> Arrays.asList(
                         item.getTsCode(), item.getTradeDate(), item.getOpen(), item.getHigh(), item.getLow(), item.getClose(),
                         item.getPreClose(), item.getChange(), item.getPctChg(), item.getVol(), item.getAmount()
                 ));
@@ -2363,7 +2363,7 @@ public class MarketDataTools {
                 };
                 
                 datasetId = datasetWriter.writeDataset(
-                        prefix, tsCode, startStr, endStr, items, headers,
+                        "financial_" + type, prefix, tsCode, startStr, endStr, items, headers,
                         row -> headers.stream().map(h -> row.getOrDefault(h, "")).toList()
                 );
                 
