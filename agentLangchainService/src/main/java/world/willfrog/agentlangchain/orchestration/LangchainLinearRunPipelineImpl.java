@@ -21,6 +21,7 @@ import world.willfrog.agent.platform.service.AgentObservabilityService;
 import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agent.platform.event.AgentRunFinalizationService;
+import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 import world.willfrog.agentlangchain.orchestration.dag.LangchainDagWorkflowExecutor;
 import world.willfrog.agentlangchain.planning.LangchainAiPlanner;
@@ -76,6 +77,13 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
     private final AgentCreditService creditService;
     private final AgentRunCreditSettlementService creditSettlementService;
     private final AgentRunFinalizationService finalizationService;
+    /**
+     * 260623-agent-service-deprecation task #47 (P0-2)：agentLangchainService 的 run 级执行
+     * 完毕后清理 {@link AgentRunDatasetRegistry} 的 per-run 状态，避免长生命周期进程里
+     * registry 无限累积。{@link ObjectProvider} 模式与 {@link #toolProviderProvider} 等
+     * 可选依赖保持一致：bean 不存在时静默跳过（如单元测试场景）。
+     */
+    private final ObjectProvider<AgentRunDatasetRegistry> agentRunDatasetRegistryProvider;
 
     public LangchainLinearRunPipelineImpl(LangchainAiPlanner planner,
                                           LangchainLinearWorkflowExecutor linearWorkflowExecutor,
@@ -94,7 +102,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                                           LangchainRunConcurrencyScheduler runConcurrencyScheduler,
                                           AgentCreditService creditService,
                                           AgentRunCreditSettlementService creditSettlementService,
-                                          AgentRunFinalizationService finalizationService) {
+                                          AgentRunFinalizationService finalizationService,
+                                          ObjectProvider<AgentRunDatasetRegistry> agentRunDatasetRegistryProvider) {
         this.planner = planner;
         this.linearWorkflowExecutor = linearWorkflowExecutor;
         this.dagWorkflowExecutor = dagWorkflowExecutor;
@@ -113,6 +122,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         this.creditService = creditService;
         this.creditSettlementService = creditSettlementService;
         this.finalizationService = finalizationService;
+        this.agentRunDatasetRegistryProvider = agentRunDatasetRegistryProvider;
     }
 
     @Override
@@ -333,6 +343,18 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             // 260612-01-02: 异常路径也触发结算
             tryScheduleSettlement(runId, userId);
         } finally {
+            // 260623-agent-service-deprecation task #47 (P0-2)：清理当前 run 的 dataset/manifest 编号转译层状态。
+            // 长生命周期进程里若不清理，registry 会无限累积；run 终态后下一个 run 串到上一个 run 的编号 → 错位。
+            // ObjectProvider 兜底：bean 不存在时静默跳过（保持纯单元测试启动）。
+            try {
+                AgentRunDatasetRegistry registry = agentRunDatasetRegistryProvider.getIfAvailable();
+                if (registry != null) {
+                    registry.reset(runId);
+                }
+            } catch (Exception cleanupEx) {
+                log.warn("Failed to reset AgentRunDatasetRegistry for runId={}: {}",
+                        runId, cleanupEx.getMessage());
+            }
             // 异步线程会被线程池复用，必须清理 ThreadLocal（线程本地变量），避免下一个 run 继承上一个 run 的 phase/todo/provider 信息。
             AgentContext.clear();
         }
