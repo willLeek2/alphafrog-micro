@@ -514,6 +514,7 @@ services:
       no_proxy: ${NO_PROXY-localhost,127.0.0.1,nacos,redis,rabbitmq,meilisearch,host.docker.internal}
     volumes:
       - ./data/agent_datasets:/data/agent_datasets
+      - ./data/database_fetched:/data/database_fetched
       - ./data/agent_workspaces:/data/agent_workspaces
       - ./agentPlatformShared/src/main/resources/agent_guides:/data/agent_guides:ro
       - ./agentLangchainService/config:/app/config:ro
@@ -609,7 +610,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
-      AF_SANDBOX_DATA_DIR: /data/agent_datasets
+      AF_SANDBOX_DATA_DIR: /data/database_fetched
       AF_SANDBOX_DEBUG: ${AF_SANDBOX_DEBUG:-false}
       AF_SANDBOX_MAX_CONCURRENCY: ${AF_SANDBOX_MAX_CONCURRENCY:-20}
       AF_SANDBOX_EXECUTION_TIMEOUT: ${AF_SANDBOX_EXECUTION_TIMEOUT:-5}
@@ -633,6 +634,7 @@ services:
       AF_SANDBOX_COMPAT_INPUT_PATH: "true"
     volumes:
       - ./data/agent_datasets:/data/agent_datasets
+      - ./data/database_fetched:/data/database_fetched
       - /var/run/docker.sock:/var/run/docker.sock
     expose:
       - "8095"
