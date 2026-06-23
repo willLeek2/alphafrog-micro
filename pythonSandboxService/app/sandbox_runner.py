@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import shlex
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -86,6 +87,23 @@ def _copy_dataset_file(
     dest_path: str,
 ) -> None:
     session.copy_to_runtime(str(source), dest_path)
+
+
+def _copy_text_to_runtime(
+    session: SandboxSession,
+    content: str,
+    dest_path: str,
+) -> None:
+    """Copy generated text into the runtime via llm-sandbox's source-path API."""
+    temp_path: Path | None = None
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
+        handle.write(content)
+        temp_path = Path(handle.name)
+    try:
+        _copy_dataset_file(session, temp_path, dest_path)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
 
 def _copy_runtime_loader_modules(
@@ -503,8 +521,9 @@ def _materialize_agent_run_csvs(
 
     # 2. 落盘 paths_dataset.csv（3 列 public schema）
     if len(materialized_ds_lines) > 1:  # 至少 1 行 data row
-        session.copy_to_runtime(
-            ("\n".join(materialized_ds_lines) + "\n").encode("utf-8"),
+        _copy_text_to_runtime(
+            session,
+            "\n".join(materialized_ds_lines) + "\n",
             f"{workdir}/paths_dataset.csv",
         )
 
@@ -550,8 +569,9 @@ def _materialize_agent_run_csvs(
             )
     # 只有在至少有 1 行可解析的数据时才写 path_manifest.csv（header-only 没意义）。
     if len(materialized_mf_lines) > 1:  # 至少 1 行 data row
-        session.copy_to_runtime(
-            ("\n".join(materialized_mf_lines) + "\n").encode("utf-8"),
+        _copy_text_to_runtime(
+            session,
+            "\n".join(materialized_mf_lines) + "\n",
             f"{workdir}/path_manifest.csv",
         )
 
@@ -658,7 +678,7 @@ def _materialize_none_manifest(
         return MANIFEST_NONE_MARKER
 
     try:
-        json_bytes = json.dumps(manifest_payload, ensure_ascii=False).encode("utf-8")
+        manifest_json = json.dumps(manifest_payload, ensure_ascii=False)
     except (TypeError, ValueError) as e:
         logger.warning(
             "agent_run NONE manifest JSON 序列化失败：manifest_number=%s err=%s",
@@ -667,7 +687,7 @@ def _materialize_none_manifest(
         return MANIFEST_NONE_MARKER
 
     try:
-        session.copy_to_runtime(json_bytes, temp_path)
+        _copy_text_to_runtime(session, manifest_json, temp_path)
     except Exception as e:  # noqa: BLE001 — sandbox 写入容错
         logger.warning(
             "agent_run NONE manifest copy_to_runtime 失败：path=%s err=%s",

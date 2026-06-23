@@ -19,6 +19,17 @@ import {
   truncateResponseFields,
   truncateTextByBytes,
 } from "./logCapture.js";
+import {
+  buildGetValuesRemoteScript,
+  buildScanKeysRemoteScript,
+  normalizeScanParams,
+  parseCommandPrefix,
+  parseGetValuesOutput,
+  parseScanKeysOutput,
+  redisConfigForEnv,
+  truncateRedisPayload,
+  type RedisOperation,
+} from "./redisQuery.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import dotenv from "dotenv";
@@ -117,6 +128,10 @@ function dockerCmd(): string[] {
 
 function gitCmd(): string[] {
   return parseShellArgs(process.env.ALPHAFROG_DEBUG_GIT_CMD ?? "git");
+}
+
+function redisCliCmd(): string[] {
+  return parseCommandPrefix(process.env.ALPHAFROG_DEBUG_REDIS_CLI_CMD, "redis-cli");
 }
 
 function clampInt(
@@ -893,6 +908,105 @@ Only alphafrog_* tables are allowed. Outer LIMIT in SQL is kept when <= 100; val
     } finally {
       await client.end().catch(() => {});
     }
+  }
+);
+
+const redisOperationSchema = z.enum(["scan_keys", "get_values"]);
+
+server.registerTool(
+  "remote_redis_query",
+  {
+    description: `Read-only Redis query on the remote host via docker exec redis-cli inside the Redis container.
+env: "test" or "prod". operation: scan_keys | get_values.
+scan_keys: requires pattern; supports limit (default 100, max 500) and offset (default 0, max 10000).
+get_values: requires keys array (max 50); reads string/hash/list/set/zset with collection cap 100 items.
+Response is truncated to 2000 chars when too large; narrow pattern or reduce keys/limit if truncated.`,
+    inputSchema: {
+      env: envSchema,
+      operation: redisOperationSchema,
+      pattern: z.string().optional().nullable(),
+      limit: z.number().int().optional().nullable(),
+      offset: z.number().int().optional().nullable(),
+      keys: z.array(z.string()).optional().nullable(),
+      timeout_seconds: z.number().int().optional().nullable(),
+    },
+  },
+  async ({ env, operation, pattern, limit, offset, keys, timeout_seconds }) => {
+    const resolved = resolveEnvToHost(env);
+    if ("error" in resolved) {
+      return toolJson({ ok: false, error: resolved.error });
+    }
+
+    const redisCfg = redisConfigForEnv(env);
+    if ("error" in redisCfg) {
+      return toolJson({ ok: false, error: redisCfg.error });
+    }
+
+    const remoteBase = {
+      dockerPrefix: dockerCmd(),
+      redisCliPrefix: redisCliCmd(),
+      container: redisCfg.container,
+      password: redisCfg.password,
+    };
+    const timeoutVal = clampInt(timeout_seconds, 30, 1, 120);
+    const sshMaxBytes = 500_000;
+
+    const op = operation as RedisOperation;
+
+    if (op === "scan_keys") {
+      const scriptResult = buildScanKeysRemoteScript({
+        ...remoteBase,
+        pattern,
+        limit,
+        offset,
+      });
+      if (!scriptResult.ok) {
+        return toolJson({ ok: false, error: scriptResult.error });
+      }
+      const { pattern: safePattern, limit: safeLimit, offset: safeOffset } = normalizeScanParams({
+        pattern,
+        limit,
+        offset,
+      });
+      const raw = await runSsh(resolved.host, ["bash", "-lc", scriptResult.script], {
+        timeoutSeconds: timeoutVal,
+        maxBytes: sshMaxBytes,
+      });
+      if (!raw.ok) {
+        console.error("[remote_redis_query] scan_keys ssh failed", raw.exit_code, raw.stderr);
+        return toolJson({
+          ok: false,
+          error: "Redis 查询执行失败，详情请查看 MCP 服务端日志",
+          duration_ms: raw.duration_ms,
+        });
+      }
+      const parsed = parseScanKeysOutput(raw.stdout, safePattern, safeOffset, safeLimit);
+      const payload = truncateRedisPayload(parsed);
+      return toolJson({ ...payload, env, duration_ms: raw.duration_ms });
+    }
+
+    const valuesResult = buildGetValuesRemoteScript({
+      ...remoteBase,
+      keys,
+    });
+    if (!valuesResult.ok) {
+      return toolJson({ ok: false, error: valuesResult.error });
+    }
+    const raw = await runSsh(resolved.host, ["bash", "-lc", valuesResult.script], {
+      timeoutSeconds: timeoutVal,
+      maxBytes: sshMaxBytes,
+    });
+    if (!raw.ok) {
+      console.error("[remote_redis_query] get_values ssh failed", raw.exit_code, raw.stderr);
+      return toolJson({
+        ok: false,
+        error: "Redis 查询执行失败，详情请查看 MCP 服务端日志",
+        duration_ms: raw.duration_ms,
+      });
+    }
+    const parsed = parseGetValuesOutput(raw.stdout);
+    const payload = truncateRedisPayload(parsed);
+    return toolJson({ ...payload, env, duration_ms: raw.duration_ms });
   }
 );
 

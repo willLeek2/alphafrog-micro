@@ -38,6 +38,11 @@ node dist/server.js
 - `remote_docker_logs(env, container, tail?, grep?, timestamps?, since?, until?, max_bytes?, timeout_seconds?, save_to_file?)` — 抓取容器日志
 - `remote_docker_follow(env, container, follow_seconds?, tail?, grep?, timestamps?, max_bytes?, save_to_file?)` — 限时 follow 日志
 - `remote_pg_query(env, sql)` — 只读 `SELECT`（仅 `alphafrog_*` 表）。SQL 未写外层 `LIMIT` 时自动追加 `LIMIT 100`；已写且 `<= 100` 则保留；`> 100` 则截断为 `100`。`OFFSET` 保留不变。
+- `remote_redis_query(env, operation, pattern?, limit?, offset?, keys?, timeout_seconds?)` — 只读 Redis 查询（经 SSH 在远程 Redis 容器内执行 `redis-cli`）。`operation` 支持：
+  - `scan_keys`：按 `pattern` 列出 key，支持 `limit`（默认 100，最大 500）与 `offset`（默认 0，最大 10000）
+  - `get_values`：按 `keys` 数组（最多 50 个）批量读取键值；支持 string/hash/list/set/zset，集合类最多返回 100 项
+  - 返回 JSON 超过 2000 字符时会截断并提示缩小查询范围
+  - 需在 MCP 环境变量中配置 `ALPHAFROG_REDIS_CONTAINER_*` 与 `ALPHAFROG_REDIS_PASSWORD_*`
 - `remote_agent_data_query(env, operation, relative_path?, ...)` — 只读查询远程 agent 相关宿主机 data 目录（如 `agent_datasets`、`agent_workspaces`）。`operation` 支持：
   - 目录与元信息：`list`、`tree`、`find_name`、`stat`、`du`
   - 文件读取：`head`、`tail`、`read_range`
@@ -117,7 +122,11 @@ Cursor 启动 MCP 时，**`cwd` 有时不会按预期生效**。若用 `npx --pa
         "ALPHAFROG_DEBUG_DATA_ROOT_PROD": "/root/alphafrog/alphafrog-micro/data",
         "ALPHAFROG_DEBUG_LOG_SAVE_DIR": "/tmp/alphafrog-debug-logs",
         "ALPHAFROG_PG_TEST_DSN": "postgresql://...",
-        "ALPHAFROG_PG_PROD_DSN": "postgresql://..."
+        "ALPHAFROG_PG_PROD_DSN": "postgresql://...",
+        "ALPHAFROG_REDIS_CONTAINER_TEST": "alphafrog-redis",
+        "ALPHAFROG_REDIS_CONTAINER_PROD": "alphafrog-redis",
+        "ALPHAFROG_REDIS_PASSWORD_TEST": "your-redis-password",
+        "ALPHAFROG_REDIS_PASSWORD_PROD": "your-redis-password"
       }
     }
   }
@@ -153,6 +162,9 @@ Cursor 启动 MCP 时，**`cwd` 有时不会按预期生效**。若用 `npx --pa
 | 测试/生产 SSH Host 别名 | `ALPHAFROG_DEBUG_SSH_HOST_TEST`、`ALPHAFROG_DEBUG_SSH_HOST_PROD` |
 | 允许的 SSH 别名白名单（逗号分隔；非空则校验） | `ALPHAFROG_DEBUG_SSH_HOSTS` |
 | SSH config / 额外参数 / docker、git 命令前缀 | `ALPHAFROG_DEBUG_SSH_CONFIG`、`ALPHAFROG_DEBUG_SSH_ARGS`、`ALPHAFROG_DEBUG_DOCKER_CMD`、`ALPHAFROG_DEBUG_GIT_CMD` |
+| 远程 Redis 容器名（`remote_redis_query`） | `ALPHAFROG_REDIS_CONTAINER_TEST`、`ALPHAFROG_REDIS_CONTAINER_PROD` |
+| 远程 Redis 密码（`remote_redis_query`） | `ALPHAFROG_REDIS_PASSWORD_TEST`、`ALPHAFROG_REDIS_PASSWORD_PROD` |
+| redis-cli 命令前缀（可选） | `ALPHAFROG_DEBUG_REDIS_CLI_CMD`（默认 `redis-cli`） |
 | 远程仓库路径 | `ALPHAFROG_DEBUG_REPO_PATH_TEST`、`ALPHAFROG_DEBUG_REPO_PATH_PROD`、`ALPHAFROG_DEBUG_DEFAULT_REPO_PATH` |
 | 远程 agent data 根目录（`remote_agent_data_query`；按 env 分别配置，均为可选；未配置时调用该工具会报错） | `ALPHAFROG_DEBUG_DATA_ROOT_TEST`、`ALPHAFROG_DEBUG_DATA_ROOT_PROD` |
 | Docker 日志落盘目录（`remote_docker_logs` / `remote_docker_follow` 的 `save_to_file=true`） | `ALPHAFROG_DEBUG_LOG_SAVE_DIR` |

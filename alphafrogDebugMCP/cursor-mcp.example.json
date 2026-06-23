@@ -15,7 +15,11 @@
         "ALPHAFROG_DEBUG_DATA_ROOT_PROD": "/root/alphafrog/alphafrog-micro/data",
         "ALPHAFROG_DEBUG_LOG_SAVE_DIR": "/tmp/alphafrog-debug-logs",
         "ALPHAFROG_PG_TEST_DSN": "postgresql://user:pass@host:5432/db",
-        "ALPHAFROG_PG_PROD_DSN": "postgresql://user:pass@host:5432/db"
+        "ALPHAFROG_PG_PROD_DSN": "postgresql://user:pass@host:5432/db",
+        "ALPHAFROG_REDIS_CONTAINER_TEST": "alphafrog-redis",
+        "ALPHAFROG_REDIS_CONTAINER_PROD": "alphafrog-redis",
+        "ALPHAFROG_REDIS_PASSWORD_TEST": "your-redis-password",
+        "ALPHAFROG_REDIS_PASSWORD_PROD": "your-redis-password"
       }
     }
   }

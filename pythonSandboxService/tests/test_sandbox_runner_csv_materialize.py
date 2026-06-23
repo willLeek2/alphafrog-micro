@@ -12,6 +12,7 @@ from __future__ import annotations
 import io
 import json
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -69,10 +70,18 @@ class _FakeSession:
 
     def __init__(self) -> None:
         self.writes: list[tuple[bytes, str]] = []
+        self.copy_sources: list[str] = []
         self.exec_calls: list[str] = []
         self.exec_responses: dict[str, _ExecResult] = {}
 
-    def copy_to_runtime(self, payload: bytes, dest: str) -> None:
+    def copy_to_runtime(self, source_path: str, dest: str) -> None:
+        if isinstance(source_path, bytes):
+            raise TypeError(
+                "argument should be a str or an os.PathLike object where "
+                "__fspath__ returns a str, not 'bytes'"
+            )
+        self.copy_sources.append(str(source_path))
+        payload = Path(source_path).read_bytes()
         self.writes.append((payload, dest))
 
     def execute_command(self, cmd: str) -> _ExecResult:
@@ -665,14 +674,19 @@ class SandboxRunnerCsvSourcePathCopyTest(unittest.TestCase):
         from app.sandbox_runner import _copy_via_csv_source_paths
         config = _test_config(Path("/tmp/none"))
         session = _FakeSession()
-        ds_csv = (
-            "agent_run_dataset_id,dataset_file_path,from_ts_code,source_path\n"
-            "1,/__AF_INPUT__/ds-a/a.csv,000300.SH,/data/database_fetched/7D3A/000300.SH.csv\n"
-            "2,/__AF_INPUT__/ds-b/b.csv,000002.SZ,/data/database_fetched/abc/000002.SZ.csv\n"
-        )
-        count, expected, failed = _copy_via_csv_source_paths(
-            session, config, "task-mf3", "/sandbox/runs/task-mf3/input", ds_csv, ""
-        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_a = Path(tmpdir) / "000300.SH.csv"
+            source_b = Path(tmpdir) / "000002.SZ.csv"
+            source_a.write_text("a\n", encoding="utf-8")
+            source_b.write_text("b\n", encoding="utf-8")
+            ds_csv = (
+                "agent_run_dataset_id,dataset_file_path,from_ts_code,source_path\n"
+                f"1,/__AF_INPUT__/ds-a/a.csv,000300.SH,{source_a}\n"
+                f"2,/__AF_INPUT__/ds-b/b.csv,000002.SZ,{source_b}\n"
+            )
+            count, expected, failed = _copy_via_csv_source_paths(
+                session, config, "task-mf3", "/sandbox/runs/task-mf3/input", ds_csv, ""
+            )
         self.assertEqual(count, 2)
         self.assertEqual(expected, 2)
         self.assertEqual(failed, [])
@@ -685,13 +699,16 @@ class SandboxRunnerCsvSourcePathCopyTest(unittest.TestCase):
         from app.sandbox_runner import _copy_via_csv_source_paths
         config = _test_config(Path("/tmp/none"))
         session = _FakeSession()
-        mf_csv = (
-            "agent_run_manifest_id,manifest_file_path,related_dataset_ids,source_path\n"
-            "1,/__AF_INPUT__/m-x/manifest.json,1,/data/manifests/v1/manifest-x/manifest.json\n"
-        )
-        count, expected, failed = _copy_via_csv_source_paths(
-            session, config, "task-mf3", "/sandbox/runs/task-mf3/input", "", mf_csv
-        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "manifest.json"
+            source.write_text('{"ok":true}\n', encoding="utf-8")
+            mf_csv = (
+                "agent_run_manifest_id,manifest_file_path,related_dataset_ids,source_path\n"
+                f"1,/__AF_INPUT__/m-x/manifest.json,1,{source}\n"
+            )
+            count, expected, failed = _copy_via_csv_source_paths(
+                session, config, "task-mf3", "/sandbox/runs/task-mf3/input", "", mf_csv
+            )
         self.assertEqual(count, 1)
         self.assertEqual(expected, 1)
         self.assertEqual(failed, [])
@@ -767,17 +784,22 @@ class SandboxRunnerCsvSourcePathCopyTest(unittest.TestCase):
         from app.sandbox_runner import _copy_via_csv_source_paths
         config = _test_config(Path("/tmp/none"))
         session = _FakeSession()
-        ds_csv = (
-            "agent_run_dataset_id,dataset_file_path,from_ts_code,source_path\n"
-            "1,/__AF_INPUT__/ds-a/a.csv,000300.SH,/data/ds-a/a.csv\n"
-        )
-        mf_csv = (
-            "agent_run_manifest_id,manifest_file_path,related_dataset_ids,source_path\n"
-            "1,/__AF_INPUT__/m-x/manifest.json,1,/data/m-x/manifest.json\n"
-        )
-        count, expected, failed = _copy_via_csv_source_paths(
-            session, config, "task-mf3", "/sandbox/runs/task-mf3/input", ds_csv, mf_csv
-        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_ds = Path(tmpdir) / "a.csv"
+            source_mf = Path(tmpdir) / "manifest.json"
+            source_ds.write_text("a\n", encoding="utf-8")
+            source_mf.write_text('{"ok":true}\n', encoding="utf-8")
+            ds_csv = (
+                "agent_run_dataset_id,dataset_file_path,from_ts_code,source_path\n"
+                f"1,/__AF_INPUT__/ds-a/a.csv,000300.SH,{source_ds}\n"
+            )
+            mf_csv = (
+                "agent_run_manifest_id,manifest_file_path,related_dataset_ids,source_path\n"
+                f"1,/__AF_INPUT__/m-x/manifest.json,1,{source_mf}\n"
+            )
+            count, expected, failed = _copy_via_csv_source_paths(
+                session, config, "task-mf3", "/sandbox/runs/task-mf3/input", ds_csv, mf_csv
+            )
         self.assertEqual(count, 2)
         self.assertEqual(expected, 2)
         self.assertEqual(failed, [])
