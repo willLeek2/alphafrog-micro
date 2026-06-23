@@ -1,4 +1,4 @@
-package world.willfrog.agent.service.workspace;
+package world.willfrog.agentlangchain.workspace;
 
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;

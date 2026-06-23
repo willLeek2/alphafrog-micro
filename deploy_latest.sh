@@ -31,7 +31,6 @@ BUSINESS_SERVICES=(
   domestic-fetch-service
   admin-service
   portfolio-service
-  agent-service
   agent-langchain-service
   external-info-service
   python-sandbox-gateway-service
@@ -64,7 +63,6 @@ Services:
   domestic-fetch-service
   admin-service
   portfolio-service
-  agent-service
   agent-langchain-service
   external-info-service
   python-sandbox-gateway-service
@@ -90,7 +88,6 @@ service_build_script() {
     domestic-fetch-service) echo "domesticFetchService/docker_build.sh" ;;
     admin-service) echo "adminService/docker_build.sh" ;;
     portfolio-service) echo "portfolioService/docker_build.sh" ;;
-    agent-service) echo "agentService/docker_build.sh" ;;
     agent-langchain-service) echo "agentLangchainService/docker_build.sh" ;;
     external-info-service) echo "externalInfoService/docker_build.sh" ;;
     python-sandbox-service) echo "pythonSandboxService/docker_build.sh" ;;
@@ -110,7 +107,6 @@ service_module() {
     domestic-fetch-service) echo "domesticFetchService" ;;
     admin-service) echo "adminService" ;;
     portfolio-service) echo "portfolioService" ;;
-    agent-service) echo "agentService" ;;
     agent-langchain-service) echo "agentLangchainService" ;;
     external-info-service) echo "externalInfoService" ;;
     python-sandbox-gateway-service) echo "pythonSandboxGatewayService" ;;

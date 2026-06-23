@@ -138,7 +138,6 @@
         <module>adminService</module>
         <module>portfolioService</module>
         <module>frontend</module>
-        <module>agentService</module>
         <module>agentPlatformShared</module>
         <module>agentToolsShared</module>
         <module>agentLangchainService</module>

@@ -284,7 +284,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 persistAssistantMessage(runId, userId, stageModels, result.getFinalAnswer());
                 // 260612-01-02: 成功路径触发结算
                 tryScheduleSettlement(runId, userId);
-                // 260618-workspace-v0: 触发终态事件，v0 在 agentService 侧监听（跨 JVM gap 详见 AgentRunFinalizedEvent）
+                // 260623-agent-service-delete: workspace listener 已迁移到 agentLangchainService，同 JVM 触发 dump。
                 finalizationService.publishFinalizedEvent(runId, userId, AgentRunStatus.COMPLETED.name());
             } else if (result.isPartial()) {
                 // DAG recovery judge 判定部分完成：写入 PARTIAL 状态 + 部分答案。

@@ -1,4 +1,4 @@
-package world.willfrog.agent.service.workspace;
+package world.willfrog.agentlangchain.workspace;
 
 /**
  * 校验出的 broken reference。

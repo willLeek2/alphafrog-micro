@@ -1,4 +1,4 @@
-package world.willfrog.agent.service.workspace;
+package world.willfrog.agentlangchain.workspace;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -59,7 +59,7 @@ public class WorkspaceDumpService {
         } catch (Exception e) {
             throw new IllegalStateException("run.userId 解析失败: " + run.getUserId(), e);
         }
-        // 使用 _by_run_id_index 模式（无 username 时也能 resolve），与 WorkspaceReadService 读取侧对齐
+        // 使用 _by_run_id_index 模式（无 username 时也能 resolve），便于终态 run 补偿扫描。
         Path runDir = pathResolver.runBaseDir(runId);
         CollectedAssets assets = collector.collectWorkspaceAssets(run);
         WorkspaceHealth health = verifier.verify(assets);

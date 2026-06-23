@@ -1,4 +1,4 @@
-package world.willfrog.agent.service.workspace;
+package world.willfrog.agentlangchain.workspace;
 
 import world.willfrog.agent.platform.entity.AgentRunMessage;
 import world.willfrog.agent.platform.service.AgentArtifactService.PythonScript;

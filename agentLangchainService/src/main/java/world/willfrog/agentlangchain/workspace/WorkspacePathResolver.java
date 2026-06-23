@@ -1,4 +1,4 @@
-package world.willfrog.agent.service.workspace;
+package world.willfrog.agentlangchain.workspace;
 
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
@@ -139,29 +139,17 @@ public class WorkspacePathResolver {
     }
 
     /**
-     * admin API 下载路径解析。上层 WorkspaceReadService 已调 runMapper.load + authorizeRunAccess，
-     * 这里只做路径解析。
-     */
-    public Path resolveAndAuthorize(String runId, String relativePath) {
-        if (runId == null || runId.isBlank()) {
-            throw new IllegalArgumentException("runId 不能为空");
-        }
-        Path runDir = runBaseDir(runId);
-        return validateRelativePath(runDir, relativePath);
-    }
-
-    /**
-     * run 基础目录（仅供 admin API 下载用，与 resolveRunDir 走不同索引避免暴露用户名）。
+     * run 基础目录（按 runId 走索引目录，供 dump/reconciliation 使用）。
      *
      * <h3>v0 布局偏差（已知 / 评审接受）</h3>
      * <p>计划文档（user-workspace-memory-v0-final.md）原始布局是
      * {@code {userId}_{username}/runs/{runId}/}。v0 落地改为
      * {@code _by_run_id_index/{runId}/} 走 workspaceRoot 根目录下，理由：
      * <ol>
-     *   <li>agentService 落 dump 时 {@code AgentRun} 实体暂无 username 字段，v0 不查外部 user service；</li>
-     *   <li>admin API 只读、不修改，按 runId 寻址比按 userId 寻址更直接；</li>
-     *   <li>v0.1 计划补 {@code resolveRunDir(runId, userId, username)} 同时写到 {@code runs/{runId}/}，
-     *       _by_run_id_index 仅作 admin fallback 索引。</li>
+     *   <li>dump 时 {@code AgentRun} 实体暂无 username 字段，不查外部 user service；</li>
+     *   <li>按 runId 寻址比按 userId + username 寻址更直接，便于终态 run 补偿扫描；</li>
+     *   <li>保留 {@code resolveRunDir(runId, userId, username)} 作为未来用户目录布局入口，
+     *       _by_run_id_index 仍作为当前落盘索引。</li>
      * </ol>
      * 该偏差 Tracy 二轮 code review 接受，详见 task #14 thread msg a79b46d3 S1。
      */

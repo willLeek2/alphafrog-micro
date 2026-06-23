@@ -13,9 +13,9 @@ import java.util.Set;
  * <p>挂载点（v0）：AgentRunExecutor 和 LangchainLinearRunPipelineImpl 各分支调用 publishFinalizedEvent。
  * 成功/部分完成/失败/取消/过期 各调用一次。
  *
- * <p>放在 agentPlatformShared 是为了同时被 agentService 和 agentLangchainService 引用；
- * 实际监听器只在 agentService 侧（WorkspaceFinalizedEventListener），
- * 详见 {@link AgentRunFinalizedEvent} 类的 v0 跨 JVM 限制说明。
+ * <p>放在 agentPlatformShared 是为了提供终态发布的共享入口。workspace 监听器已迁移到
+ * agentLangchainService 侧，同 JVM 消费 langchain 主链路发布的终态事件；
+ * 详见 {@link AgentRunFinalizedEvent} 的事件边界说明。
  *
  * <h3>PARTIAL schema blocker</h3>
  * <p>PARTIAL 状态在 alphafrog_agent_run.status CHECK 约束里默认未包含（migration v1.1/002 已加）；

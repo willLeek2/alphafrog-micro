@@ -1,4 +1,4 @@
-package world.willfrog.agent.service.workspace;
+package world.willfrog.agentlangchain.workspace;
 
 /**
  * manifest member 视图（带 broken 后的 effective status）。
