@@ -9,6 +9,7 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/server.js",
+    "test": "npm run build && node --test dist/**/*.test.js",
     "prepare": "npm run build"
   },
   "engines": {

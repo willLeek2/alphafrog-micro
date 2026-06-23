@@ -1137,7 +1137,7 @@ public class MarketDataTools {
 
             if (datasetWriter.isEnabled()) {
                 String runId = AgentContext.getRunId();
-                String prefix = (runId != null ? runId : "unknown") + "-" + assetType;
+                String prefix = (runId != null ? runId : "shared") + "-" + assetType;
                 String datasetId = datasetWriter.writeDataset(datasetKind, prefix, tsCode, startDateStr, endDateStr, response.getItemsList(), effectiveHeaders, item -> {
                     List<Object> row = new ArrayList<>(Arrays.asList(
                             item.getTsCode(), item.getTradeDate(), item.getOpen(), item.getHigh(), item.getLow(), item.getClose(),
@@ -1783,7 +1783,7 @@ public class MarketDataTools {
 
             if (datasetWriter.isEnabled()) {
                 String runId = AgentContext.getRunId();
-                String prefix = (runId != null ? runId : "unknown") + "-stock";
+                String prefix = (runId != null ? runId : "shared") + "-stock";
                 String datasetId = datasetWriter.writeDataset("stock_daily", prefix, tsCode, startDateStr, endDateStr, response.getItemsList(), headers, item -> Arrays.asList(
                         item.getTsCode(), item.getTradeDate(), item.getOpen(), item.getHigh(), item.getLow(), item.getClose(),
                         item.getPreClose(), item.getChange(), item.getPctChg(), item.getVol(), item.getAmount()
@@ -1857,7 +1857,7 @@ public class MarketDataTools {
 
             if (datasetWriter.isEnabled()) {
                 String runId = AgentContext.getRunId();
-                String prefix = (runId != null ? runId : "unknown") + "-index";
+                String prefix = (runId != null ? runId : "shared") + "-index";
                 String datasetId = datasetWriter.writeDataset("index_daily", prefix, tsCode, startDateStr, endDateStr, response.getItemsList(), headers, item -> Arrays.asList(
                         item.getTsCode(), item.getTradeDate(), item.getOpen(), item.getHigh(), item.getLow(), item.getClose(),
                         item.getPreClose(), item.getChange(), item.getPctChg(), item.getVol(), item.getAmount()
@@ -2349,7 +2349,7 @@ public class MarketDataTools {
             String datasetId = null;
             if (datasetWriter.isEnabled()) {
                 String runId = AgentContext.getRunId();
-                String prefix = (runId != null ? runId : "unknown") + "-" + type;
+                String prefix = (runId != null ? runId : "shared") + "-" + type;
                 String startStr = compactDate(startPeriod);
                 String endStr = compactDate(endPeriod);
                 

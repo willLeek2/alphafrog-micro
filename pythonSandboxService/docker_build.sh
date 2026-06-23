@@ -31,42 +31,46 @@ esac
 export DOCKER_BUILDKIT=1
 
 USE_PROXY=${USE_PROXY:-1}
-DOCKER_PROXY_PORT=${DOCKER_PROXY_PORT:-7890}
 
-# Linux 宿主机（如阿里云 ECS）代理多绑定 127.0.0.1，构建须 --network=host；macOS 可用 host.docker.internal
-if [ "$(uname -s)" = "Linux" ]; then
-  USE_PROXY_HOST_NETWORK=${USE_PROXY_HOST_NETWORK:-1}
-  DOCKER_PROXY_HOST=${DOCKER_PROXY_HOST:-127.0.0.1}
-else
-  USE_PROXY_HOST_NETWORK=${USE_PROXY_HOST_NETWORK:-0}
-  DOCKER_PROXY_HOST=${DOCKER_PROXY_HOST:-host.docker.internal}
-fi
-
-# 必须初始化为数组；用空字符串会导致 docker buildx 参数错位、丢失构建上下文 PATH
 NETWORK_ARGS=()
 HOST_ARGS=()
 PROXY_ARGS=()
 
 if [ "$USE_PROXY" = "1" ] || [ "$USE_PROXY" = "true" ]; then
-  if [ "$USE_PROXY_HOST_NETWORK" = "1" ] || [ "$USE_PROXY_HOST_NETWORK" = "true" ]; then
-    PROXY_URL="http://127.0.0.1:${DOCKER_PROXY_PORT}"
-    NETWORK_ARGS=(--network=host)
-    echo "[pythonSandbox] USE_PROXY=1, --network=host, proxy=${PROXY_URL}"
+  # 优先使用系统环境变量中的代理地址，不再硬编码 127.0.0.1:7890
+  if [ -n "${http_proxy:-}" ]; then
+    PROXY_URL="$http_proxy"
+  elif [ -n "${https_proxy:-}" ]; then
+    PROXY_URL="$https_proxy"
   else
+    # 回退：仍可通过 DOCKER_PROXY_HOST / DOCKER_PROXY_PORT 覆盖
+    DOCKER_PROXY_PORT=${DOCKER_PROXY_PORT:-7890}
+    if [ "$(uname -s)" = "Linux" ]; then
+      DOCKER_PROXY_HOST=${DOCKER_PROXY_HOST:-127.0.0.1}
+    else
+      DOCKER_PROXY_HOST=${DOCKER_PROXY_HOST:-host.docker.internal}
+    fi
     PROXY_URL="http://${DOCKER_PROXY_HOST}:${DOCKER_PROXY_PORT}"
-    HOST_ARGS=(--add-host=host.docker.internal:host-gateway)
-    echo "[pythonSandbox] USE_PROXY=1, proxy=${PROXY_URL} (host-gateway)"
   fi
+
+  # 代理地址指向 loopback 且是 Linux 时，docker build 须 --network=host
+  if [ "$(uname -s)" = "Linux" ] && echo "$PROXY_URL" | grep -qE '://(127\.0\.0\.1|localhost)[:/]'; then
+    NETWORK_ARGS=(--network=host)
+    echo "[pythonSandbox] proxy=${PROXY_URL}, --network=host (auto-detected loopback proxy)"
+  else
+    echo "[pythonSandbox] proxy=${PROXY_URL}"
+  fi
+
   export https_proxy="$PROXY_URL" http_proxy="$PROXY_URL"
   PROXY_ARGS=(
     --build-arg "http_proxy=${PROXY_URL}"
     --build-arg "https_proxy=${PROXY_URL}"
   )
 
-  if ! (echo >/dev/tcp/127.0.0.1/"${DOCKER_PROXY_PORT}") 2>/dev/null; then
-    echo "[pythonSandbox] ERROR: 宿主机 127.0.0.1:${DOCKER_PROXY_PORT} 无进程监听，请先启动 Clash 等代理。" >&2
-    echo "  无代理时可: USE_PROXY=0 PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ bash $0" >&2
-    exit 1
+  # 探活检查（curl 替代 /dev/tcp），失败只警告不退出
+  if ! curl -s --max-time 3 "$PROXY_URL" >/dev/null 2>&1; then
+    echo "[pythonSandbox] WARNING: 代理 ${PROXY_URL} 不可达，构建可能失败。" >&2
+    echo "  跳过代理可: USE_PROXY=0 PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ bash $0" >&2
   fi
 else
   unset https_proxy http_proxy all_proxy

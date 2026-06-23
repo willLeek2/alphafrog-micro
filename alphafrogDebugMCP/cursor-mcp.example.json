@@ -13,6 +13,7 @@
         "ALPHAFROG_DEBUG_DEFAULT_REPO_PATH": "~/alphafrog/alphafrog-micro",
         "ALPHAFROG_DEBUG_DATA_ROOT_TEST": "/srv/alphafrog/alphafrog-micro/data",
         "ALPHAFROG_DEBUG_DATA_ROOT_PROD": "/root/alphafrog/alphafrog-micro/data",
+        "ALPHAFROG_DEBUG_LOG_SAVE_DIR": "/tmp/alphafrog-debug-logs",
         "ALPHAFROG_PG_TEST_DSN": "postgresql://user:pass@host:5432/db",
         "ALPHAFROG_PG_PROD_DSN": "postgresql://user:pass@host:5432/db"
       }

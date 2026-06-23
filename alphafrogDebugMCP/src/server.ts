@@ -7,6 +7,18 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { buildDockerLogsRemoteArgs } from "./dockerLogs.js";
+import {
+  buildLogBody,
+  buildLogFileName,
+  formatSaveFileContent,
+  generateLogNonce,
+  resolveLogSaveDir,
+  SAVE_MAX_BYTES,
+  saveLogToFile,
+  truncateResponseFields,
+  truncateTextByBytes,
+} from "./logCapture.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import dotenv from "dotenv";
@@ -313,6 +325,60 @@ function toolJson(data: Record<string, unknown>) {
   return {
     content: [{ type: "text" as const, text: JSON.stringify(data) }],
     structuredContent: data,
+  };
+}
+
+/** 远程 docker 日志工具：可选落盘 + 响应字符截断。 */
+async function finalizeDockerLogResult(
+  toolName: string,
+  inputArgs: Record<string, unknown>,
+  result: SshRunResult,
+  host: string,
+  options: { saveToFile: boolean }
+): Promise<Record<string, unknown>> {
+  const invokedAt = new Date();
+  const redacted = redactSshToolResult(result, host);
+  const logBodyFull = buildLogBody(redacted.stdout, redacted.stderr);
+
+  let log_saved = false;
+  let log_saved_path: string | undefined;
+  let log_saved_file: string | undefined;
+  let log_save_truncated: boolean | undefined;
+
+  if (options.saveToFile) {
+    const dirResult = resolveLogSaveDir();
+    if ("error" in dirResult) {
+      return { ok: false, error: dirResult.error };
+    }
+    const nonce = generateLogNonce();
+    const fileName = buildLogFileName(invokedAt, toolName, inputArgs, nonce);
+    const { text: saveText, truncated: saveTruncated } = truncateTextByBytes(logBodyFull, SAVE_MAX_BYTES);
+    log_save_truncated = saveTruncated;
+    const fileContent = formatSaveFileContent(invokedAt, toolName, inputArgs, saveText);
+    const saveResult = saveLogToFile(dirResult.dir, fileName, fileContent);
+    if (!saveResult.ok) {
+      return { ok: false, error: saveResult.error };
+    }
+    log_saved = true;
+    log_saved_path = saveResult.filePath;
+    log_saved_file = saveResult.fileName;
+  }
+
+  const truncated = truncateResponseFields(redacted.stdout, redacted.stderr);
+
+  return {
+    ...redacted,
+    stdout: truncated.stdout,
+    stderr: truncated.stderr,
+    log_saved,
+    ...(log_saved_path ? { log_saved_path, log_saved_file } : {}),
+    ...(log_save_truncated ? { log_save_truncated: true } : {}),
+    ...(truncated.response_truncated
+      ? {
+          response_truncated: true,
+          response_truncation_hint: truncated.response_truncation_hint,
+        }
+      : {}),
   };
 }
 
@@ -666,45 +732,68 @@ server.registerTool(
 server.registerTool(
   "remote_docker_logs",
   {
-    description: `Fetch docker logs on the remote host (non-follow).`,
+    description: `Fetch docker logs on the remote host (non-follow). Optional since/until filter logs by time window (RFC3339 or relative like 10m). When since or until is set and tail is omitted, returns the full window (--tail=all). Response stdout/stderr are capped at 5000 chars; set save_to_file=true (requires ALPHAFROG_DEBUG_LOG_SAVE_DIR) to persist up to 1MB to disk.`,
     inputSchema: {
       env: envSchema,
       container: z.string().default(""),
       tail: z.number().int().optional().nullable(),
       grep: z.string().optional().nullable(),
       timestamps: z.boolean().optional().nullable(),
+      since: z.string().optional().nullable(),
+      until: z.string().optional().nullable(),
       max_bytes: z.number().int().optional().nullable(),
       timeout_seconds: z.number().int().optional().nullable(),
+      save_to_file: z.boolean().optional().nullable(),
     },
   },
-  async ({ env, container, tail, grep, timestamps, max_bytes, timeout_seconds }) => {
-    if (!container?.trim()) {
-      return toolJson({ ok: false, error: "container 参数不能为空" });
+  async ({ env, container, tail, grep, timestamps, since, until, max_bytes, timeout_seconds, save_to_file }) => {
+    const argsResult = buildDockerLogsRemoteArgs({
+      dockerPrefix: dockerCmd(),
+      container: container ?? "",
+      tail,
+      timestamps,
+      since,
+      until,
+    });
+    if (!argsResult.ok) {
+      return toolJson({ ok: false, error: argsResult.error });
     }
     const resolved = resolveEnvToHost(env);
     if ("error" in resolved) {
       return toolJson({ ok: false, error: resolved.error });
     }
-    const tailVal = clampInt(tail, 200, 1, 10000);
-    const ts = timestamps ?? true;
-    const args = [...dockerCmd(), "logs", `--tail=${tailVal}`];
-    if (ts) args.push("--timestamps");
-    args.push(container.trim());
-    let result = await runSsh(resolved.host, args, {
+    const saveToFile = save_to_file === true;
+    const fetchMaxBytes = saveToFile ? SAVE_MAX_BYTES : (max_bytes ?? 20000);
+    let result = await runSsh(resolved.host, argsResult.args, {
       timeoutSeconds: timeout_seconds ?? 30,
-      maxBytes: max_bytes ?? 20000,
+      maxBytes: fetchMaxBytes,
     });
     if (grep) {
       result = { ...result, stdout: filterOutput(result.stdout, grep) };
     }
-    return toolJson(redactSshToolResult(result, resolved.host) as unknown as Record<string, unknown>);
+    const inputArgs = {
+      env,
+      container,
+      tail,
+      grep,
+      timestamps,
+      since,
+      until,
+      max_bytes,
+      timeout_seconds,
+      save_to_file,
+    };
+    const payload = await finalizeDockerLogResult("remote_docker_logs", inputArgs, result, resolved.host, {
+      saveToFile,
+    });
+    return toolJson(payload);
   }
 );
 
 server.registerTool(
   "remote_docker_follow",
   {
-    description: `Follow docker logs on the remote host for a limited time.`,
+    description: `Follow docker logs on the remote host for a limited time. Response stdout/stderr are capped at 5000 chars; set save_to_file=true (requires ALPHAFROG_DEBUG_LOG_SAVE_DIR) to persist up to 1MB to disk.`,
     inputSchema: {
       env: envSchema,
       container: z.string().default(""),
@@ -713,9 +802,10 @@ server.registerTool(
       grep: z.string().optional().nullable(),
       timestamps: z.boolean().optional().nullable(),
       max_bytes: z.number().int().optional().nullable(),
+      save_to_file: z.boolean().optional().nullable(),
     },
   },
-  async ({ env, container, follow_seconds, tail, grep, timestamps, max_bytes }) => {
+  async ({ env, container, follow_seconds, tail, grep, timestamps, max_bytes, save_to_file }) => {
     if (!container?.trim()) {
       return toolJson({ ok: false, error: "container 参数不能为空" });
     }
@@ -723,20 +813,35 @@ server.registerTool(
     if ("error" in resolved) {
       return toolJson({ ok: false, error: resolved.error });
     }
+    const saveToFile = save_to_file === true;
     const followVal = clampInt(follow_seconds, 15, 1, 300);
     const tailVal = clampInt(tail, 200, 1, 10000);
     const ts = timestamps ?? true;
     const args = [...dockerCmd(), "logs", "-f", `--tail=${tailVal}`];
     if (ts) args.push("--timestamps");
     args.push(container.trim());
+    const fetchMaxBytes = saveToFile ? SAVE_MAX_BYTES : (max_bytes ?? 50000);
     let result = await runSsh(resolved.host, args, {
       timeoutSeconds: followVal,
-      maxBytes: max_bytes ?? 50000,
+      maxBytes: fetchMaxBytes,
     });
     if (grep) {
       result = { ...result, stdout: filterOutput(result.stdout, grep) };
     }
-    return toolJson(redactSshToolResult(result, resolved.host) as unknown as Record<string, unknown>);
+    const inputArgs = {
+      env,
+      container,
+      follow_seconds,
+      tail,
+      grep,
+      timestamps,
+      max_bytes,
+      save_to_file,
+    };
+    const payload = await finalizeDockerLogResult("remote_docker_follow", inputArgs, result, resolved.host, {
+      saveToFile,
+    });
+    return toolJson(payload);
   }
 );
 

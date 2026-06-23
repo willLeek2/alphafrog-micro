@@ -15,6 +15,7 @@ import org.springframework.data.redis.core.ScanOptions;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
+import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.artifact.PersistentArtifactRegistry;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
@@ -97,6 +98,7 @@ public class DatasetRegistry {
                 cleanupMeta(meta);
             } else {
                 touchMeta(meta);
+                publishDatasetPersistedEvent(meta);
                 return Optional.of(meta);
             }
         }
@@ -148,6 +150,7 @@ public class DatasetRegistry {
         candidates.sort(Comparator.comparingLong(meta -> rangeLength(meta)));
         DatasetMeta selected = candidates.get(0);
         touchMeta(selected);
+        publishDatasetPersistedEvent(selected);
         return Optional.of(selected);
     }
 
@@ -199,15 +202,7 @@ public class DatasetRegistry {
             registerPersistentArtifacts(meta);
 
             // 01 → 02 contract: publish dataset persisted event
-            if (eventPublisher != null) {
-                String runId = world.willfrog.agent.platform.context.AgentContext.getRunId();
-                if (runId != null) {
-                    String persistedPath = datasetDirPath.resolve(dataFileName).toAbsolutePath().toString();
-                    eventPublisher.publishEvent(new DatasetPersistedEvent(
-                            this, runId, datasetId, persistedPath, tsCode,
-                            dataFileName != null ? dataFileName : datasetId + ".csv"));
-                }
-            }
+            publishDatasetPersistedEvent(meta);
         } catch (JsonProcessingException e) {
             log.error("Failed to serialize dataset meta: {}", datasetId, e);
         }
@@ -431,6 +426,23 @@ public class DatasetRegistry {
         } catch (JsonProcessingException e) {
             log.warn("Failed to update dataset meta for key {}", meta.getQueryKey(), e);
         }
+    }
+
+    private void publishDatasetPersistedEvent(DatasetMeta meta) {
+        if (eventPublisher == null || meta == null || meta.getDatasetId() == null || meta.getDatasetId().isBlank()) {
+            return;
+        }
+        String runId = AgentContext.getRunId();
+        if (runId == null || runId.isBlank()) {
+            return;
+        }
+        String dataFileName = meta.getDataFileName();
+        if (dataFileName == null || dataFileName.isBlank()) {
+            dataFileName = meta.getDatasetId() + ".csv";
+        }
+        String persistedPath = Paths.get(meta.getPath()).resolve(dataFileName).toAbsolutePath().toString();
+        eventPublisher.publishEvent(new DatasetPersistedEvent(
+                this, runId, meta.getDatasetId(), persistedPath, meta.getTsCode(), dataFileName));
     }
 
     private void touchManifestMeta(ManifestMeta meta) {
