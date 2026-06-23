@@ -24,11 +24,13 @@ import world.willfrog.agent.platform.entity.AgentRunMessage;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.tools.catalog.ParallelLimitsToolCatalog;
+import world.willfrog.agent.tools.dataset.ListMyDataTool;
 import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
 import world.willfrog.agent.tools.rag.RagTools;
 import world.willfrog.agent.tools.search.SearchTools;
 import world.willfrog.agent.platform.event.AgentRunFinalizationService;
+import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 import world.willfrog.agent.workflow.TodoPlan;
 import world.willfrog.agent.workflow.TodoPlanner;
@@ -94,6 +96,8 @@ public class AgentRunExecutor {
     private final RagTools ragTools;
     /** 网页搜索工具 */
     private final SearchTools searchTools;
+    /** 260623-harness-optimization-02 MF-new-1: listMyData 工具（run-level dataset/manifest 列表 / grep） */
+    private final ListMyDataTool listMyDataTool;
     /** Run 级 Redis 状态缓存（运行状态、工作流中间态） */
     private final AgentRunStateStore stateStore;
     /** 观测数据服务，管理 LLM/工具调用的 trace 记录和观测视图 */
@@ -126,6 +130,8 @@ public class AgentRunExecutor {
     private final AgentCitationService citationService;
     /** 简单单工具查询 fast-path，命中时跳过 Planning/ReAct。 */
     private final AgentSimpleToolFastPathService simpleToolFastPathService;
+    /** 260623-harness-optimization-02: agent run 级 dataset / manifest registry（executePython / listMyData 同源数据） */
+    private final AgentRunDatasetRegistry agentRunDatasetRegistry;
     /** OpenRouter 费用补采集服务。 */
     private final OpenRouterCostService openRouterCostService;
     /** 终态发布服务，workspace v0 落地：每次写终态后发布 AgentRunFinalizedEvent 触发 dump。 */
@@ -199,6 +205,17 @@ public class AgentRunExecutor {
         } finally {
             activeRuns.decrementAndGet();
             runDurationTimer.record(System.currentTimeMillis() - startedAt, TimeUnit.MILLISECONDS);
+            // 260623-harness-optimization-02: 清理当前 run 的 dataset/manifest 编号转译层状态，
+            // 避免长生命周期进程里 registry 无限累积；同时 run 终态后 executePython 报
+            // RUN_LEVEL_IDS_UNAVAILABLE 即可符合预期（不会再读到上一个 run 的编号）。
+            try {
+                if (agentRunDatasetRegistry != null) {
+                    agentRunDatasetRegistry.reset(runId);
+                }
+            } catch (Exception cleanupEx) {
+                log.warn("Failed to reset AgentRunDatasetRegistry for runId={}: {}",
+                        runId, cleanupEx.getMessage());
+            }
         }
     }
 
@@ -422,6 +439,9 @@ public class AgentRunExecutor {
             if (runConfig.codeInterpreterEnabled()) {
                 toolSpecifications.addAll(ToolSpecifications.toolSpecificationsFrom(pythonSandboxTools));
             }
+            // 260623-harness-optimization-02 MF-new-1: listMyData 始终对 LLM 可见，
+            // 不受能力开关约束（无副作用、仅消费 AgentRunDatasetRegistry in-memory 状态）。
+            toolSpecifications.addAll(ToolSpecifications.toolSpecificationsFrom(listMyDataTool));
             toolSpecifications = new ArrayList<>(ParallelLimitsToolCatalog.mergeCanonical(toolSpecifications));
 
             // ── 6a. 简单单工具查询 fast-path ──

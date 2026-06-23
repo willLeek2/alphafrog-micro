@@ -16,6 +16,7 @@ import world.willfrog.agent.tools.router.PythonStaticPrecheckService;
 import world.willfrog.agent.tools.router.ToolRouter;
 import world.willfrog.agent.tools.router.ToolResultCacheService;
 import world.willfrog.agent.tools.search.SearchTools;
+import world.willfrog.agent.tools.dataset.ListMyDataTool;
 
 import java.util.Map;
 import java.util.function.Supplier;
@@ -61,9 +62,11 @@ class ToolRouterWebSearchTest {
                 searchTools,
                 mock(PythonSandboxTools.class),
                 mock(LoadToolGuideTool.class),
+                mock(ListMyDataTool.class),
                 new PythonStaticPrecheckService(),
                 new AgentLlmProperties(),
                 cacheService,
+                mock(world.willfrog.agent.tools.compaction.RereadToolHandler.class),
                 mock(AgentObservabilityService.class),
                 new ObjectMapper(),
                 new SimpleMeterRegistry(),
@@ -100,9 +103,11 @@ class ToolRouterWebSearchTest {
                 searchTools,
                 mock(PythonSandboxTools.class),
                 mock(LoadToolGuideTool.class),
+                mock(ListMyDataTool.class),
                 new PythonStaticPrecheckService(),
                 new AgentLlmProperties(),
                 cacheService,
+                mock(world.willfrog.agent.tools.compaction.RereadToolHandler.class),
                 mock(AgentObservabilityService.class),
                 new ObjectMapper(),
                 new SimpleMeterRegistry(),
@@ -139,9 +144,11 @@ class ToolRouterWebSearchTest {
                 mock(SearchTools.class),
                 mock(PythonSandboxTools.class),
                 mock(LoadToolGuideTool.class),
+                mock(ListMyDataTool.class),
                 new PythonStaticPrecheckService(),
                 new AgentLlmProperties(),
                 cacheService,
+                mock(world.willfrog.agent.tools.compaction.RereadToolHandler.class),
                 observabilityService,
                 new ObjectMapper(),
                 new SimpleMeterRegistry(),
@@ -183,9 +190,11 @@ class ToolRouterWebSearchTest {
                 mock(SearchTools.class),
                 mock(PythonSandboxTools.class),
                 mock(LoadToolGuideTool.class),
+                mock(world.willfrog.agent.tools.dataset.ListMyDataTool.class),
                 new PythonStaticPrecheckService(),
                 new AgentLlmProperties(),
                 cacheService,
+                mock(world.willfrog.agent.tools.compaction.RereadToolHandler.class),
                 mock(AgentObservabilityService.class),
                 new ObjectMapper(),
                 new SimpleMeterRegistry(),

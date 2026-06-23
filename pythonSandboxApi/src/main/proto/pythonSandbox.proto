@@ -13,6 +13,10 @@ message ExecuteRequest {
   repeated string libraries = 4;
   double timeoutSeconds = 5;
   repeated string datasetIds = 6;
+  // 260623-harness-optimization-02: paths_dataset.csv 内容（run 级编号 → sandbox 路径映射）
+  string pathsDatasetCsv = 7;
+  // 260623-harness-optimization-02: path_manifest.csv 内容（manifest 元信息）
+  string pathManifestCsv = 8;
 }
 
 message ExecuteResponse {

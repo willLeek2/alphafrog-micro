@@ -117,6 +117,8 @@ async def process_task(task: Task, worker_id: int):
                 task.request.files,
                 task.request.libraries,
                 task.request.timeout_seconds,
+                task.request.paths_dataset_csv,
+                task.request.path_manifest_csv,
             )
         else:
             result_dict = await asyncio.to_thread(
@@ -129,6 +131,8 @@ async def process_task(task: Task, worker_id: int):
                 task.request.files,
                 task.request.libraries,
                 task.request.timeout_seconds,
+                paths_dataset_csv=task.request.paths_dataset_csv,
+                path_manifest_csv=task.request.path_manifest_csv,
             )
         task.result = ExecuteResult(
             exit_code=result_dict["exit_code"],

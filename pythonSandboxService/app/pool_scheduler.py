@@ -36,6 +36,9 @@ class SandboxJob:
     timeout_seconds: float | None
     enqueued_at: float
     future: Future
+    # 260623-harness-optimization-02: agent run 级 dataset / manifest CSV 注入
+    paths_dataset_csv: str | None = None
+    path_manifest_csv: str | None = None
 
 
 class ContainerWorker:
@@ -150,6 +153,8 @@ class ContainerWorker:
                         job.files,
                         job.libraries,
                         job.timeout_seconds,
+                        paths_dataset_csv=job.paths_dataset_csv,
+                        path_manifest_csv=job.path_manifest_csv,
                         queue_wait_ms=queue_wait_ms,
                         container_id=self.container_id,
                     )
@@ -222,6 +227,8 @@ class ContainerPoolScheduler:
         files: List[str] | None,
         libraries: List[str] | None,
         timeout_seconds: float | None,
+        paths_dataset_csv: str | None = None,
+        path_manifest_csv: str | None = None,
     ) -> dict:
         if self._closing:
             raise RuntimeError("sandbox pool is closing")
@@ -240,6 +247,8 @@ class ContainerPoolScheduler:
                 timeout_seconds=timeout_seconds,
                 enqueued_at=time.monotonic(),
                 future=future,
+                paths_dataset_csv=paths_dataset_csv,
+                path_manifest_csv=path_manifest_csv,
             )
         )
         self._maybe_scale_up()

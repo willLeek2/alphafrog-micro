@@ -18,6 +18,7 @@ import world.willfrog.agent.platform.service.AgentObservabilityService;
 import world.willfrog.agent.platform.service.AgentRunBudgetService;
 import world.willfrog.agent.platform.artifact.RawPayloadLocator;
 import world.willfrog.agent.tools.docs.LoadToolGuideTool;
+import world.willfrog.agent.tools.dataset.ListMyDataTool;
 import world.willfrog.agent.tools.compaction.RereadToolHandler;
 import world.willfrog.agent.tools.compaction.ToolOutputCompactionService;
 import world.willfrog.agent.tools.market.MarketDataTools;
@@ -107,6 +108,8 @@ public class ToolRouter {
     private final PythonSandboxTools pythonSandboxTools;
     /** 平台工具指南加载工具（loadToolGuide） */
     private final LoadToolGuideTool loadToolGuideTool;
+    /** 260623-harness-optimization-02: 列出当前 agent run 已落盘 dataset / manifest（listMyData） */
+    private final ListMyDataTool listMyDataTool;
     /** executePython 静态参数/代码预校验（B1） */
     private final PythonStaticPrecheckService pythonStaticPrecheckService;
     /** 运行时 LLM/执行配置（含 static-precheck-enabled） */
@@ -341,7 +344,8 @@ public class ToolRouter {
                 "loadToolGuide",
                 "rereadToolResult",
                 "spawnSubAgent",
-                "waitForSubAgent"
+                "waitForSubAgent",
+                "listMyData"
         );
     }
 
@@ -379,14 +383,17 @@ public class ToolRouter {
     private String invokeExecutePython(Map<String, Object> params) {
         /*
          * executePython 是最容易把上游数据、模型生成代码和沙箱执行耦合在一起的工具。
-         * 这里先收集 dataset ids，再做静态预校验，最后才交给 PythonSandboxTools。
-         * 这样可以在真正执行前拦截明显危险或无效的代码，失败结果也仍然走统一 JSON 格式。
+         * 260623-harness-optimization-02: dataset_ids / manifest_ids 是两个独立编号空间，
+         * 这里先分别收集，再做静态预校验（要求至少一个非空），最后才交给 PythonSandboxTools
+         * 的 5 形参 overload。这样可以在真正执行前拦截明显危险或无效的代码，
+         * 失败结果也仍然走统一 JSON 格式。
          */
         String code = str(params.get("code"), params.get("arg0"));
         String datasetIds = collectExecutePythonDatasetIds(params);
+        String manifestIds = collectExecutePythonManifestIds(params);
         if (isStaticPrecheckEnabled()) {
             PythonStaticPrecheckService.Result precheck =
-                    pythonStaticPrecheckService.check(code, datasetIds, params);
+                    pythonStaticPrecheckService.check(code, datasetIds, manifestIds, params);
             if (!precheck.isPassed()) {
                 return precheckFailure("executePython", precheck);
             }
@@ -394,6 +401,7 @@ public class ToolRouter {
         return pythonSandboxTools.executePython(
                 code,
                 datasetIds,
+                manifestIds,
                 str(params.get("libraries"), params.get("arg3")),
                 toNullableInt(params.get("timeout_seconds"), params.get("timeoutSeconds"), params.get("arg4"))
         );
@@ -608,6 +616,16 @@ public class ToolRouter {
                 case "loadToolGuide" -> loadToolGuideTool.loadToolGuide(
                         str(params.get("topic"), params.get("arg0"))
                 );
+                case "listMyData" -> listMyDataTool.listMyData(
+                        str(params.get("query_type"), params.get("arg0")),
+                        str(params.get("from_ts_code"), params.get("arg1")),
+                        str(params.get("grep"), params.get("arg2")),
+                        toIntOrNull(params.get("file_offset"), params.get("arg3")),
+                        toIntOrNull(params.get("file_limit"), params.get("arg4")),
+                        toIntOrNull(params.get("offset"), params.get("arg5")),
+                        toIntOrNull(params.get("limit"), params.get("arg6")),
+                        str(params.get("related_dataset_ids"), params.get("arg7"))
+                );
                 case "rereadToolResult" -> rereadToolHandler.reread(
                         str(params.get("rawRef"), params.get("raw_ref"), params.get("arg0")),
                         str(params.get("keyword"), params.get("arg1")),
@@ -670,6 +688,39 @@ public class ToolRouter {
                 params.get("arg1")
         );
         return String.join(",", datasetIds);
+    }
+
+    /**
+     * 260623-harness-optimization-02: 收集 executePython 的 manifestIds 参数（兼容多种命名风格）。
+     *
+     * <p>与 {@link #collectExecutePythonDatasetIds} 形态一致，但走 manifest 命名空间：
+     * manifest_ids / manifestIds / manifests / manifest_refs / manifestRefs。
+     * 拼接为逗号分隔字符串供 {@code PythonStaticPrecheckService.check} 与
+     * {@code PythonSandboxTools.executePython} 5 形参 overload 使用。</p>
+     *
+     * <p><b>非对称契约（Cindy round 2 review cleanup 拍板）</b>：legacy 位置参数
+     * {@code arg1} <b>不</b>进 manifest 命名空间 — 历史上 dataset / manifest 共用
+     * {@code arg1} 时存在「同一 {@code arg1=1} 同时进 dataset_ids 和 manifest_ids」的
+     * 歧义。修正后：
+     * <ul>
+     *   <li>{@code arg1} 只进 {@link #collectExecutePythonDatasetIds}（向后兼容老 prompt 风格）</li>
+     *   <li>manifest_ids 只能由显式命名 key（{@code manifest_ids} / {@code manifestIds} /
+     *       {@code manifests} / {@code manifest_refs} / {@code manifestRefs}）触发</li>
+     * </ul>
+     * 这样 {@code arg1=1} 不会意外 leak 到 manifest_ids 空间，避免模型把 dataset 编号
+     * 错填成 manifest 编号。
+     */
+    private String collectExecutePythonManifestIds(Map<String, Object> params) {
+        LinkedHashSet<String> manifestIds = new LinkedHashSet<>();
+        addDatasetIds(manifestIds,
+                params.get("manifest_ids"),
+                params.get("manifestIds"),
+                params.get("manifests"),
+                params.get("manifest_refs"),
+                params.get("manifestRefs")
+                // arg1 故意不在此列表中 — 见 Javadoc 非对称契约
+        );
+        return String.join(",", manifestIds);
     }
 
     /**
