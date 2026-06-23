@@ -38,6 +38,14 @@ node dist/server.js
 - `remote_docker_logs(env, container, tail?, grep?, timestamps?, max_bytes?, timeout_seconds?)` — 抓取容器日志
 - `remote_docker_follow(env, container, follow_seconds?, tail?, grep?, timestamps?, max_bytes?)` — 限时 follow 日志
 - `remote_pg_query(env, sql)` — 只读 `SELECT`（仅 `alphafrog_*` 表）。SQL 未写外层 `LIMIT` 时自动追加 `LIMIT 100`；已写且 `<= 100` 则保留；`> 100` 则截断为 `100`。`OFFSET` 保留不变。
+- `remote_agent_data_query(env, operation, relative_path?, ...)` — 只读查询远程 agent 相关宿主机 data 目录（如 `agent_datasets`、`agent_workspaces`）。`operation` 支持：
+  - 目录与元信息：`list`、`tree`、`find_name`、`stat`、`du`
+  - 文件读取：`head`、`tail`、`read_range`
+  - 按内容查找：`find_content`（子串匹配，`grep -F` 语义）
+  - `relative_path` 相对 data root，禁止绝对路径与 `..`；远程侧用 `realpath -m` 校验仍在 root 内
+  - `ALPHAFROG_DEBUG_DATA_ROOT_TEST` / `ALPHAFROG_DEBUG_DATA_ROOT_PROD` 均为可选；调用 `env=test|prod` 时若对应变量未配置，返回「没配置 xxx 环境变量，目前该工具不可用，请咨询人类用户获取信息」
+  - `agent-configs` 及敏感文件名（`.env`、`*secret*`、`*credential*`、`*.pem`、`*.key`）禁止读内容与内容搜索
+  - 默认限流：`max_depth`（`find_content` 默认 4，其余默认 2）、`limit`（默认 200）、`max_file_bytes`（默认 1MB）、`timeout_seconds`（默认 10）、`max_bytes`（默认 20000）
 
 失败时返回的 `error` 为泛化说明，**不包含**服务端内部环境变量名或真实 SSH 主机名。SSH 类成功返回中**不包含**本地执行的 `command` 字段。
 
@@ -69,6 +77,8 @@ Cursor 启动 MCP 时，**`cwd` 有时不会按预期生效**。若用 `npx --pa
         "ALPHAFROG_DEBUG_SSH_HOST_TEST": "别名1",
         "ALPHAFROG_DEBUG_SSH_HOST_PROD": "别名2",
         "ALPHAFROG_DEBUG_DEFAULT_REPO_PATH": "~/alphafrog/alphafrog-micro",
+        "ALPHAFROG_DEBUG_DATA_ROOT_TEST": "/srv/alphafrog/alphafrog-micro/data",
+        "ALPHAFROG_DEBUG_DATA_ROOT_PROD": "/root/alphafrog/alphafrog-micro/data",
         "ALPHAFROG_PG_TEST_DSN": "postgresql://...",
         "ALPHAFROG_PG_PROD_DSN": "postgresql://..."
       }
@@ -107,6 +117,7 @@ Cursor 启动 MCP 时，**`cwd` 有时不会按预期生效**。若用 `npx --pa
 | 允许的 SSH 别名白名单（逗号分隔；非空则校验） | `ALPHAFROG_DEBUG_SSH_HOSTS` |
 | SSH config / 额外参数 / docker、git 命令前缀 | `ALPHAFROG_DEBUG_SSH_CONFIG`、`ALPHAFROG_DEBUG_SSH_ARGS`、`ALPHAFROG_DEBUG_DOCKER_CMD`、`ALPHAFROG_DEBUG_GIT_CMD` |
 | 远程仓库路径 | `ALPHAFROG_DEBUG_REPO_PATH_TEST`、`ALPHAFROG_DEBUG_REPO_PATH_PROD`、`ALPHAFROG_DEBUG_DEFAULT_REPO_PATH` |
+| 远程 agent data 根目录（`remote_agent_data_query`；按 env 分别配置，均为可选；未配置时调用该工具会报错） | `ALPHAFROG_DEBUG_DATA_ROOT_TEST`、`ALPHAFROG_DEBUG_DATA_ROOT_PROD` |
 | PostgreSQL DSN | `ALPHAFROG_PG_TEST_DSN`、`ALPHAFROG_PG_PROD_DSN` |
 
 ## 历史说明

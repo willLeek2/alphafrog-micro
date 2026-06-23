@@ -11,6 +11,7 @@ import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.context.AgentContext;
 
 import java.io.ByteArrayInputStream;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.LinkedHashMap;
@@ -412,6 +413,49 @@ class OpenRouterProviderRoutedChatModelTest {
         assertEquals("POST", request.method());
         assertTrue(request.headers().firstValue("X-Custom").isPresent());
         assertEquals("value", request.headers().firstValue("X-Custom").get());
+    }
+
+    @Test
+    void isRetryableStreamingException_shouldTreatSseReadIOExceptionAsRetryable() {
+        OpenRouterProviderRoutedChatModel model = createMinimalModel(List.of("deepseek", "fireworks"));
+        IllegalStateException streamError = new IllegalStateException(
+                "SSE 流读取失败",
+                new IOException("SSE stream idle timeout after 25s")
+        );
+
+        Boolean retryable = (Boolean) ReflectionTestUtils.invokeMethod(
+                model, "isRetryableStreamingException", streamError
+        );
+        Boolean shouldRetryFirstAttempt = (Boolean) ReflectionTestUtils.invokeMethod(
+                model,
+                "shouldRetryStreamingException",
+                streamError,
+                LlmRequestRetryPolicy.withMaxRetries(2),
+                1
+        );
+        Boolean shouldRetryLastAttempt = (Boolean) ReflectionTestUtils.invokeMethod(
+                model,
+                "shouldRetryStreamingException",
+                streamError,
+                LlmRequestRetryPolicy.withMaxRetries(2),
+                3
+        );
+
+        assertEquals(true, retryable);
+        assertEquals(true, shouldRetryFirstAttempt);
+        assertEquals(false, shouldRetryLastAttempt);
+    }
+
+    @Test
+    void isRetryableStreamingException_shouldNotRetryProviderErrorChunk() {
+        OpenRouterProviderRoutedChatModel model = createMinimalModel(List.of("deepseek", "fireworks"));
+        IllegalStateException providerError = new IllegalStateException("SSE 流中收到错误 chunk: {}");
+
+        Boolean retryable = (Boolean) ReflectionTestUtils.invokeMethod(
+                model, "isRetryableStreamingException", providerError
+        );
+
+        assertEquals(false, retryable);
     }
 
     private OpenRouterProviderRoutedChatModel createMinimalModel(List<String> providerOrder) {

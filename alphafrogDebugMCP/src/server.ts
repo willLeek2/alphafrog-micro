@@ -316,6 +316,266 @@ function toolJson(data: Record<string, unknown>) {
   };
 }
 
+// ---------- Agent data 目录只读查询 ----------
+const DATA_OPERATIONS = [
+  "list",
+  "tree",
+  "find_name",
+  "find_content",
+  "stat",
+  "du",
+  "head",
+  "tail",
+  "read_range",
+] as const;
+
+type DataOperation = (typeof DATA_OPERATIONS)[number];
+
+const READ_CONTENT_OPERATIONS: ReadonlySet<DataOperation> = new Set([
+  "head",
+  "tail",
+  "read_range",
+  "find_content",
+]);
+
+/** 远程 agent data 根目录（test/prod 分环境配置，均为可选；调用时按 env 校验）。 */
+function dataRootForEnv(env: string): { path: string } | { error: string } {
+  const envVar =
+    env === "test" ? "ALPHAFROG_DEBUG_DATA_ROOT_TEST" : "ALPHAFROG_DEBUG_DATA_ROOT_PROD";
+  const p = (process.env[envVar] ?? "").trim();
+  if (!p) {
+    return {
+      error: `没配置 ${envVar} 环境变量，目前该工具不可用，请咨询人类用户获取信息`,
+    };
+  }
+  return { path: p };
+}
+
+/** 校验相对路径，拒绝绝对路径、.. 与 shell 元字符。 */
+function validateRelativePath(rel: string | null | undefined): { path: string } | { error: string } {
+  const trimmed = (rel ?? ".").trim() || ".";
+  if (trimmed.includes("\0")) {
+    return { error: "路径包含非法字符" };
+  }
+  if (path.isAbsolute(trimmed) || trimmed.startsWith("~")) {
+    return { error: "仅允许相对 data root 的路径" };
+  }
+  const segments = trimmed.split(/[/\\]+/).filter(Boolean);
+  for (const seg of segments) {
+    if (seg === "..") {
+      return { error: "路径不允许包含 .." };
+    }
+    if (/[$`;&|<>(){}!\n\r\t]/.test(seg)) {
+      return { error: "路径包含非法字符" };
+    }
+  }
+  return { path: segments.length === 0 ? "." : segments.join("/") };
+}
+
+/** bash 单引号转义。 */
+function bashSingleQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/** 是否命中敏感文件名（禁止读内容 / 内容搜索）。 */
+function isSensitiveRelativePath(relativePath: string): boolean {
+  const lower = relativePath.toLowerCase();
+  const basename = relativePath.split("/").pop() ?? relativePath;
+  if (basename === ".env") return true;
+  if (/secret|credential/.test(lower)) return true;
+  if (/\.(pem|key)$/i.test(basename)) return true;
+  return false;
+}
+
+/** agent-configs 下默认禁止读内容与内容搜索。 */
+function isAgentConfigsRelativePath(relativePath: string): boolean {
+  const normalized = relativePath.replace(/^\.(\/|$)/, "");
+  return normalized === "agent-configs" || normalized.startsWith("agent-configs/");
+}
+
+/** 读内容类操作的路径准入校验。 */
+function validateReadContentPath(relativePath: string): string | null {
+  if (isAgentConfigsRelativePath(relativePath)) {
+    return "agent-configs 目录下不允许读取文件内容，请使用 list/stat/tree";
+  }
+  if (isSensitiveRelativePath(relativePath)) {
+    return "该路径命中敏感文件规则，不允许读取内容";
+  }
+  return null;
+}
+
+function validateFindNamePattern(pattern: string | null | undefined): string | null {
+  if (!pattern?.trim()) {
+    return "find_name 操作需要 pattern 参数";
+  }
+  const p = pattern.trim();
+  if (p.length > 200) {
+    return "pattern 过长";
+  }
+  if (/[\0\n\r\t$`;&|<>(){}!]/.test(p)) {
+    return "pattern 包含非法字符";
+  }
+  return null;
+}
+
+function validateContentQuery(query: string | null | undefined): string | null {
+  if (!query?.trim()) {
+    return "find_content 操作需要 query 参数";
+  }
+  if (query.length > 500) {
+    return "query 过长";
+  }
+  if (query.includes("\0")) {
+    return "query 包含非法字符";
+  }
+  return null;
+}
+
+/** 构造远程 bash 脚本：解析路径并校验仍在 data root 下，再执行 body（可使用 $TARGET）。 */
+function buildDataQueryScript(dataRoot: string, relativePath: string, body: string): string {
+  const rootLiteral = bashSingleQuote(dataRoot);
+  const relLiteral = bashSingleQuote(relativePath);
+  return [
+    "set -euo pipefail",
+    `ROOT=${rootLiteral}`,
+    `REL=${relLiteral}`,
+    'TARGET="$(realpath -m "${ROOT}/${REL}")"',
+    'case "${TARGET}" in',
+    '  "${ROOT}"|"${ROOT}"/*) ;;',
+    "  *) echo 'ERROR:PATH_ESCAPE' >&2; exit 2 ;;",
+    "esac",
+    body,
+  ].join("\n");
+}
+
+type DataQueryCommandOptions = {
+  operation: DataOperation;
+  dataRoot: string;
+  relativePath: string;
+  maxDepth: number;
+  limit: number;
+  pattern?: string | null;
+  query?: string | null;
+  headLines?: number;
+  tailLines?: number;
+  startLine?: number;
+  lineCount?: number;
+  maxFileBytes?: number;
+  readMaxBytes?: number;
+};
+
+/** 根据 operation 构造远程只读 bash 脚本。 */
+function buildDataQueryRemoteScript(opts: DataQueryCommandOptions): string {
+  const { operation, dataRoot, relativePath, maxDepth, limit } = opts;
+
+  switch (operation) {
+    case "list":
+      return buildDataQueryScript(
+        dataRoot,
+        relativePath,
+        [
+          'if [ ! -d "$TARGET" ]; then echo "ERROR:NOT_DIR" >&2; exit 1; fi',
+          'ls -la -- "$TARGET"',
+        ].join("\n")
+      );
+    case "tree":
+      return buildDataQueryScript(
+        dataRoot,
+        relativePath,
+        `find -P "$TARGET" -maxdepth ${maxDepth} -print 2>/dev/null | head -n ${limit}`
+      );
+    case "find_name": {
+      const patternLit = bashSingleQuote(opts.pattern!.trim());
+      return buildDataQueryScript(
+        dataRoot,
+        relativePath,
+        `find -P "$TARGET" -maxdepth ${maxDepth} -name ${patternLit} -print 2>/dev/null | head -n ${limit}`
+      );
+    }
+    case "stat":
+      return buildDataQueryScript(dataRoot, relativePath, 'stat "$TARGET" 2>/dev/null || ls -ld "$TARGET"');
+    case "du":
+      return buildDataQueryScript(
+        dataRoot,
+        relativePath,
+        `du -h --max-depth=1 "$TARGET" 2>/dev/null | head -n ${limit}`
+      );
+    case "head": {
+      const lines = opts.headLines ?? 80;
+      const maxB = opts.readMaxBytes ?? 20000;
+      return buildDataQueryScript(
+        dataRoot,
+        relativePath,
+        [
+          'if [ ! -f "$TARGET" ]; then echo "ERROR:NOT_FILE" >&2; exit 1; fi',
+          `head -n ${lines} -c ${maxB} "$TARGET"`,
+        ].join("\n")
+      );
+    }
+    case "tail": {
+      const lines = opts.tailLines ?? 80;
+      const maxB = opts.readMaxBytes ?? 20000;
+      return buildDataQueryScript(
+        dataRoot,
+        relativePath,
+        [
+          'if [ ! -f "$TARGET" ]; then echo "ERROR:NOT_FILE" >&2; exit 1; fi',
+          `tail -n ${lines} "$TARGET" | head -c ${maxB}`,
+        ].join("\n")
+      );
+    }
+    case "read_range": {
+      const start = opts.startLine ?? 1;
+      const count = opts.lineCount ?? 100;
+      const end = start + count - 1;
+      const maxB = opts.readMaxBytes ?? 20000;
+      return buildDataQueryScript(
+        dataRoot,
+        relativePath,
+        [
+          'if [ ! -f "$TARGET" ]; then echo "ERROR:NOT_FILE" >&2; exit 1; fi',
+          `sed -n '${start},${end}p' "$TARGET" | head -c ${maxB}`,
+        ].join("\n")
+      );
+    }
+    case "find_content": {
+      const maxFileBytes = opts.maxFileBytes ?? 1048576;
+      const fileLimit = Math.min(limit, 2000);
+      const perFileMatch = 5;
+      const queryLit = bashSingleQuote(opts.query!.trim());
+      const body = [
+        `find -P "$TARGET" -maxdepth ${maxDepth} -type f -size -${maxFileBytes}c \\`,
+        "  ! -name '.env' ! -name '*.pem' ! -name '*.key' \\",
+        "  ! -path '*/agent-configs/*' ! -path '*/agent-configs' \\",
+        "  ! -iname '*secret*' ! -iname '*credential*' \\",
+        "  -print 2>/dev/null | head -n " + fileLimit + " | \\",
+        `  xargs -r grep -n -I -F -m ${perFileMatch} -- ${queryLit} 2>/dev/null | head -n ${limit} || true`,
+      ].join("\n");
+      return buildDataQueryScript(dataRoot, relativePath, body);
+    }
+    default:
+      throw new Error(`unsupported operation: ${operation}`);
+  }
+}
+
+function defaultMaxDepthForOperation(operation: DataOperation): number {
+  return operation === "find_content" ? 4 : 2;
+}
+
+function mapRemoteDataQueryError(stderr: string, stdout: string): string | null {
+  const combined = `${stderr}\n${stdout}`;
+  if (combined.includes("ERROR:PATH_ESCAPE")) {
+    return "目标路径超出允许的 data 根目录范围";
+  }
+  if (combined.includes("ERROR:NOT_DIR")) {
+    return "目标不是目录";
+  }
+  if (combined.includes("ERROR:NOT_FILE")) {
+    return "目标不是文件";
+  }
+  return null;
+}
+
 // ---------- MCP 注册 ----------
 const server = new McpServer({
   name: "alphafrog-debug-mcp",
@@ -528,6 +788,140 @@ Only alphafrog_* tables are allowed. Outer LIMIT in SQL is kept when <= 100; val
     } finally {
       await client.end().catch(() => {});
     }
+  }
+);
+
+const dataOperationSchema = z.enum(DATA_OPERATIONS);
+
+server.registerTool(
+  "remote_agent_data_query",
+  {
+    description: `Read-only query of agent-related host data directories mounted into containers (e.g. agent_datasets, agent_workspaces).
+env: "test" or "prod". operation: list | tree | find_name | find_content | stat | du | head | tail | read_range.
+relative_path is relative to the configured data root. Content read and find_content are blocked for agent-configs and sensitive filenames.`,
+    inputSchema: {
+      env: envSchema,
+      operation: dataOperationSchema.default("list"),
+      relative_path: z.string().optional().nullable(),
+      pattern: z.string().optional().nullable(),
+      query: z.string().optional().nullable(),
+      max_depth: z.number().int().optional().nullable(),
+      limit: z.number().int().optional().nullable(),
+      head_lines: z.number().int().optional().nullable(),
+      tail_lines: z.number().int().optional().nullable(),
+      start_line: z.number().int().optional().nullable(),
+      line_count: z.number().int().optional().nullable(),
+      max_file_bytes: z.number().int().optional().nullable(),
+      max_bytes: z.number().int().optional().nullable(),
+      timeout_seconds: z.number().int().optional().nullable(),
+    },
+  },
+  async ({
+    env,
+    operation,
+    relative_path,
+    pattern,
+    query,
+    max_depth,
+    limit,
+    head_lines,
+    tail_lines,
+    start_line,
+    line_count,
+    max_file_bytes,
+    max_bytes,
+    timeout_seconds,
+  }) => {
+    const resolved = resolveEnvToHost(env);
+    if ("error" in resolved) {
+      return toolJson({ ok: false, error: resolved.error });
+    }
+
+    const rootResult = dataRootForEnv(env);
+    if ("error" in rootResult) {
+      return toolJson({ ok: false, error: rootResult.error });
+    }
+
+    const relResult = validateRelativePath(relative_path);
+    if ("error" in relResult) {
+      return toolJson({ ok: false, error: relResult.error });
+    }
+    const relativePath = relResult.path;
+
+    const op = operation as DataOperation;
+    const defaultDepth = defaultMaxDepthForOperation(op);
+    const maxDepth = clampInt(max_depth, defaultDepth, 1, 8);
+    const limitVal = clampInt(limit, 200, 1, 1000);
+    const timeoutVal = clampInt(timeout_seconds, 10, 1, 60);
+    const outputMaxBytes = clampInt(max_bytes, 20000, 1024, 200000);
+
+    if (op === "find_name") {
+      const patternErr = validateFindNamePattern(pattern);
+      if (patternErr) {
+        return toolJson({ ok: false, error: patternErr });
+      }
+    }
+
+    if (op === "find_content") {
+      const queryErr = validateContentQuery(query);
+      if (queryErr) {
+        return toolJson({ ok: false, error: queryErr });
+      }
+      if (isAgentConfigsRelativePath(relativePath)) {
+        return toolJson({
+          ok: false,
+          error: "agent-configs 目录下不允许按内容搜索，请换用其他目录",
+        });
+      }
+    }
+
+    if (READ_CONTENT_OPERATIONS.has(op) && op !== "find_content") {
+      const readErr = validateReadContentPath(relativePath);
+      if (readErr) {
+        return toolJson({ ok: false, error: readErr });
+      }
+    }
+
+    let script: string;
+    try {
+      script = buildDataQueryRemoteScript({
+        operation: op,
+        dataRoot: rootResult.path,
+        relativePath,
+        maxDepth,
+        limit: limitVal,
+        pattern,
+        query,
+        headLines: clampInt(head_lines, 80, 1, 500),
+        tailLines: clampInt(tail_lines, 80, 1, 500),
+        startLine: clampInt(start_line, 1, 1, 1_000_000),
+        lineCount: clampInt(line_count, 100, 1, 500),
+        maxFileBytes: clampInt(max_file_bytes, 1048576, 1024, 10485760),
+        readMaxBytes: outputMaxBytes,
+      });
+    } catch (e) {
+      console.error("[remote_agent_data_query] build script", e);
+      return toolJson({ ok: false, error: "无法构造远程查询命令" });
+    }
+
+    const raw = await runSsh(resolved.host, ["bash", "-lc", script], {
+      timeoutSeconds: timeoutVal,
+      maxBytes: outputMaxBytes,
+    });
+
+    const mappedErr = mapRemoteDataQueryError(raw.stderr, raw.stdout);
+    if (mappedErr) {
+      return toolJson({ ok: false, error: mappedErr, duration_ms: raw.duration_ms });
+    }
+
+    const redacted = redactSshToolResult(raw, resolved.host);
+    const effectiveOk = raw.ok || (op === "find_content" && raw.exit_code === 1 && !raw.timed_out);
+    return toolJson({
+      ...redacted,
+      ok: effectiveOk,
+      operation: op,
+      relative_path: relativePath,
+    });
   }
 );
 

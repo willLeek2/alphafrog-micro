@@ -259,7 +259,7 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
             // 消耗过多 wall-clock。
             LlmRequestRetryPolicy retryPolicy = resolveRetryPolicy();
             AttemptResult attemptResult = sendWithRetry(requestJson, requestUrl, apiKey, customHeaders,
-                    shouldCapture, requestStartedAt, retryPolicy, requestTimeout);
+                    shouldCapture, requestStartedAt, retryPolicy, requestTimeout, llmTraceId);
             attempts = attemptResult.attempts();
             HttpResponse<java.io.InputStream> httpResponse = attemptResult.response();
             responseRecord = attemptResult.responseRecord();
@@ -273,20 +273,21 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
             OpenAiCompatibleChatModelSupport.SseAggregateResult aggregateResult = null;
 
             if (statusCode >= 200 && statusCode < 300) {
-                // 流式响应：解析 SSE。
-                //
-                // OpenRouter/Fireworks 的流式响应会把 content、reasoning、tool_calls、
-                // usage 等信息拆在多个 chunk 中返回。这里用聚合器还原成一个
-                // ChatCompletionResponse，后续 LangChain4j 才能像非流式响应一样读取
-                // AiMessage 和 TokenUsage。
-                StreamingProgressTracker tracker = createStreamingProgressTracker(llmTraceId);
-                aggregateResult =
-                        OpenAiCompatibleChatModelSupport.aggregateSseStream(
-                                httpResponse.body(), objectMapper, log, tracker, STREAM_IDLE_TIMEOUT
-                        );
+                if (attemptResult.streamError() != null || attemptResult.aggregateResult() == null) {
+                    if (attemptResult.streamError() instanceof RuntimeException runtimeException) {
+                        throw runtimeException;
+                    }
+                    throw new IllegalStateException(
+                            attemptResult.streamError() == null
+                                    ? "SSE stream aggregation returned no result"
+                                    : attemptResult.streamError().getMessage(),
+                            attemptResult.streamError()
+                    );
+                }
                 durationMs = System.currentTimeMillis() - requestStartedAt;
                 latencyWindow.record(durationMs);
-                progressSnapshot = tracker.onStreamComplete(durationMs);
+                progressSnapshot = attemptResult.streamingProgress();
+                aggregateResult = attemptResult.aggregateResult();
                 completion = aggregateResult.completionResponse();
                 reasoningContent = aggregateResult.reasoningContent();
 
@@ -539,7 +540,8 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
                                         boolean shouldCapture,
                                         long logicalStartedAt,
                                         LlmRequestRetryPolicy retryPolicy,
-                                        Duration requestTimeout) throws IOException, InterruptedException {
+                                        Duration requestTimeout,
+                                        String llmTraceId) throws IOException, InterruptedException {
         /*
          * 这里把多个 HTTP attempt 包装成一个 AttemptResult 返回给 doChat。
          * 调用方只看到一次 ChatResponse；observability 才会看到每次 attempt 的细节。
@@ -550,6 +552,10 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
          *   每次重试前将上次首选的 provider 移到 order 末尾，尝试下一个 provider。
          * - 始终保持 allow_fallbacks=false，不把 provider 选择权交给 OpenRouter。
          * - 单 provider 时跳过重排，避免无意义循环。
+         *
+         * 2xx 后的 SSE body 读取也属于同一次 provider HTTP attempt。此前 2xx
+         * 一返回就结束 retry，导致 stream 中途断开不会重试；现在只有完整聚合
+         * SSE 成功才算 attempt 成功。
          */
         List<Map<String, Object>> attempts = new ArrayList<>();
         Exception lastException = null;
@@ -614,31 +620,61 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
                 attempts.add(attemptMeta);
 
                 if (status >= 200 && status < 300) {
-                    // 成功时直接把流式 InputStream 交回 doChat，由上层 SSE 聚合器读取。
-                    // 这里不能提前读 body，否则会破坏 streaming 解析。
-                    return new AttemptResult(httpResponse, null, status, null, attempts);
-                }
-
-                // 非 2xx 响应通常不是 SSE 流，而是一次性错误 JSON。必须先读出 body，
-                // 否则 raw HTTP capture 和失败 payload 都拿不到 provider 返回的真实原因。
-                String body;
-                try (BufferedReader reader = new BufferedReader(
-                        new InputStreamReader(httpResponse.body(), StandardCharsets.UTF_8))) {
-                    body = reader.lines().collect(java.util.stream.Collectors.joining("\n"));
-                }
-                lastErrorBody = body;
-                lastStatusCode = status;
-                if (shouldCapture && httpLogger != null) {
-                    Map<String, String> responseHeaders = httpLogger.extractHeaders(httpResponse);
-                    lastResponseRecord = httpLogger.recordResponse(
-                            status, responseHeaders, body, System.currentTimeMillis() - logicalStartedAt);
-                }
-                attemptMeta.put("retryable", effectivePolicy.isRetryableStatus(status));
-                attemptMeta.put("error", OpenAiCompatibleChatModelSupport.shorten(body));
-                if (!effectivePolicy.shouldRetryStatus(status, attempt)) {
-                    // 不可重试状态或次数耗尽时，把最后一次 HTTP response 连同 attempts 返回，
-                    // doChat 统一转换成异常观测和 LLM_CALL_FINISHED(error) 事件。
-                    return new AttemptResult(httpResponse, lastResponseRecord, status, body, attempts);
+                    // 流式响应：解析 SSE。
+                    //
+                    // OpenRouter/Fireworks 的流式响应会把 content、reasoning、tool_calls、
+                    // usage 等信息拆在多个 chunk 中返回。这里用聚合器还原成一个
+                    // ChatCompletionResponse，后续 LangChain4j 才能像非流式响应一样读取
+                    // AiMessage 和 TokenUsage。
+                    StreamingProgressTracker tracker = createStreamingProgressTracker(llmTraceId);
+                    try {
+                        OpenAiCompatibleChatModelSupport.SseAggregateResult aggregateResult =
+                                OpenAiCompatibleChatModelSupport.aggregateSseStream(
+                                        httpResponse.body(), objectMapper, log, tracker, STREAM_IDLE_TIMEOUT
+                                );
+                        long streamDuration = System.currentTimeMillis() - attemptStarted;
+                        attemptMeta.put("streamDurationMs", streamDuration);
+                        StreamingProgressTracker.StreamingProgressSnapshot progressSnapshot =
+                                tracker.onStreamComplete(System.currentTimeMillis() - logicalStartedAt);
+                        return new AttemptResult(httpResponse, null, status, null, attempts,
+                                aggregateResult, progressSnapshot, null);
+                    } catch (RuntimeException e) {
+                        long streamDuration = System.currentTimeMillis() - attemptStarted;
+                        lastException = e;
+                        lastStatusCode = status;
+                        lastErrorBody = e.getClass().getSimpleName() + ": " + e.getMessage();
+                        boolean retryable = isRetryableStreamingException(e);
+                        attemptMeta.put("streamDurationMs", streamDuration);
+                        attemptMeta.put("retryable", retryable);
+                        attemptMeta.put("error", OpenAiCompatibleChatModelSupport.shorten(lastErrorBody));
+                        if (!shouldRetryStreamingException(e, effectivePolicy, attempt)) {
+                            return new AttemptResult(httpResponse, lastResponseRecord, status, lastErrorBody,
+                                    attempts, null, null, e);
+                        }
+                    }
+                } else {
+                    // 非 2xx 响应通常不是 SSE 流，而是一次性错误 JSON。必须先读出 body，
+                    // 否则 raw HTTP capture 和失败 payload 都拿不到 provider 返回的真实原因。
+                    String body;
+                    try (BufferedReader reader = new BufferedReader(
+                            new InputStreamReader(httpResponse.body(), StandardCharsets.UTF_8))) {
+                        body = reader.lines().collect(java.util.stream.Collectors.joining("\n"));
+                    }
+                    lastErrorBody = body;
+                    lastStatusCode = status;
+                    if (shouldCapture && httpLogger != null) {
+                        Map<String, String> responseHeaders = httpLogger.extractHeaders(httpResponse);
+                        lastResponseRecord = httpLogger.recordResponse(
+                                status, responseHeaders, body, System.currentTimeMillis() - logicalStartedAt);
+                    }
+                    attemptMeta.put("retryable", effectivePolicy.isRetryableStatus(status));
+                    attemptMeta.put("error", OpenAiCompatibleChatModelSupport.shorten(body));
+                    if (!effectivePolicy.shouldRetryStatus(status, attempt)) {
+                        // 不可重试状态或次数耗尽时，把最后一次 HTTP response 连同 attempts 返回，
+                        // doChat 统一转换成异常观测和 LLM_CALL_FINISHED(error) 事件。
+                        return new AttemptResult(httpResponse, lastResponseRecord, status, body,
+                                attempts, null, null, null);
+                    }
                 }
             } catch (IOException e) {
                 long attemptDuration = System.currentTimeMillis() - attemptStarted;
@@ -657,7 +693,8 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
                     // IOException 没有 HTTP status，也可能没有 response record。
                     // 仍然返回 AttemptResult，是为了让 observability 展示完整 attempts，而不是只看到最后异常。
                     return new AttemptResult(null, lastResponseRecord, -1,
-                            e.getClass().getSimpleName() + ": " + e.getMessage(), attempts);
+                            e.getClass().getSimpleName() + ": " + e.getMessage(),
+                            attempts, null, null, null);
                 }
             }
             effectivePolicy.sleepBeforeRetry(attempt);
@@ -665,7 +702,24 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
         if (lastException instanceof IOException ioException) {
             throw ioException;
         }
-        return new AttemptResult(null, lastResponseRecord, lastStatusCode, lastErrorBody, attempts);
+        return new AttemptResult(null, lastResponseRecord, lastStatusCode, lastErrorBody, attempts,
+                null, null, lastException);
+    }
+
+    private boolean shouldRetryStreamingException(Exception e, LlmRequestRetryPolicy policy, int attempt) {
+        return isRetryableStreamingException(e)
+                && policy != null
+                && attempt < policy.maxAttempts();
+    }
+
+    private boolean isRetryableStreamingException(Exception e) {
+        if (e instanceof IOException) {
+            return true;
+        }
+        if (e instanceof IllegalStateException && e.getCause() instanceof IOException) {
+            return true;
+        }
+        return false;
     }
 
     /**
@@ -796,7 +850,10 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
             RawHttpLogger.HttpResponseRecord responseRecord,
             int statusCode,
             String errorBody,
-            List<Map<String, Object>> attempts
+            List<Map<String, Object>> attempts,
+            OpenAiCompatibleChatModelSupport.SseAggregateResult aggregateResult,
+            StreamingProgressTracker.StreamingProgressSnapshot streamingProgress,
+            Exception streamError
     ) {
     }
 
