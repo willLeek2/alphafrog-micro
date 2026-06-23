@@ -478,8 +478,8 @@ public class ReactTodoExecutor {
      * <ul>
      *   <li>提示这是第 N 次重试。</li>
      *   <li>提醒 LLM 检查工具参数名是否与规范完全一致。</li>
-     *   <li>提醒 LLM 检查是否遗漏必需参数（如 executePython 的 dataset_ids）。</li>
-     *   <li>提醒 LLM 数据集 ID 必须来自已有数据集列表。</li>
+     *   <li>提醒 LLM executePython 需传 dataset_ids 或 manifest_ids 至少一个；数据已打包成 manifest 时优先 manifest_ids；编号必须是当前 run 的 run-level 整数编号；不确定先调用 listMyData。</li>
+     *   <li>提醒 LLM 数据集编号必须是 run-level 整数编号，不能直接使用原始 dataset_id 或文件路径。</li>
      *   <li>建议 LLM 参考上下文中的 _retry_hint_ 获取详细修正建议。</li>
      * </ul>
      *
@@ -501,8 +501,8 @@ public class ReactTodoExecutor {
             retryHint.append("╚══════════════════════════════════════════════════════════════╝\n\n");
             retryHint.append("之前的尝试失败了。请仔细检查：\n");
             retryHint.append("1. 工具参数名是否与 System Prompt 中的规范完全一致\n");
-            retryHint.append("2. 是否遗漏了必需参数（如 executePython 的 dataset_ids）\n");
-            retryHint.append("3. 数据集ID是否来自'已有数据集'列表\n\n");
+            retryHint.append("2. executePython 是否传了 dataset_ids 或 manifest_ids 至少一个；数据已打包成 manifest 时优先 manifest_ids；编号必须是当前 agent run 的 run-level 整数编号；不确定先调用 listMyData 查询\n");
+            retryHint.append("3. 数据集编号必须是 run-level 整数编号，不能直接使用原始 dataset_id 或文件路径\n\n");
             retryHint.append("如果再次失败，请参考 '_retry_hint_' 中的详细修正建议。");
 
             // 找到最后一条 UserMessage，在其文本末尾附加重试提示
@@ -525,7 +525,7 @@ public class ReactTodoExecutor {
      * <p>在原始执行上下文的基础上，追加一条标记为 {@code _retry_hint_} 的 CompletedTodoInfo，
      * 其内容为针对特定错误类型的修正建议：</p>
      * <ul>
-     *   <li>{@code dataset_ids / MISSING_DATASET_IDS} — 提示 executePython 必须传入 dataset_ids，
+     *   <li>{@code dataset_ids / manifest_ids / MISSING_DATASET_IDS} — 提示 executePython 必须传入 dataset_ids 或 manifest_ids 中的至少一个，
      *       并给出正确示例。</li>
      *   <li>{@code keyword} — 提示搜索工具参数名应为 keyword。</li>
      *   <li>其他错误 — 给出通用建议，强调参数名必须匹配。</li>
@@ -541,15 +541,16 @@ public class ReactTodoExecutor {
         StringBuilder detailedHint = new StringBuilder();
         detailedHint.append("错误信息：").append(errorHint).append("\n\n");
 
-        if (errorHint.contains("dataset_ids") || errorHint.contains("MISSING_DATASET_IDS")) {
+        if (errorHint.contains("dataset_ids") || errorHint.contains("manifest_ids") || errorHint.contains("MISSING_DATASET_IDS")) {
             detailedHint.append("修正建议：\n");
-            detailedHint.append("1. executePython 工具需要 dataset_ids 参数，该参数是必需的\n");
-            detailedHint.append("2. dataset_ids 必须使用上述'已有数据集'中的ID\n");
-            detailedHint.append("3. 单数据集：dataset_ids: \"dataset_xxx\"\n");
-            detailedHint.append("4. 多数据集：dataset_ids: \"dataset_xxx,dataset_yyy\"（逗号分隔）\n");
-            detailedHint.append("5. 代码中需要遍历 /sandbox/input/*/ 读取数据\n\n");
+            detailedHint.append("1. executePython 必须传入 dataset_ids 或 manifest_ids 中的至少一个\n");
+            detailedHint.append("2. dataset_ids / manifest_ids 必须是当前 agent run 的 run-level 整数编号（不是原始 dataset_id 或文件路径）\n");
+            detailedHint.append("3. 单数据集：dataset_ids: \"1\"；多数据集：dataset_ids: \"1,3\"（逗号分隔）\n");
+            detailedHint.append("4. 数据已打包成 manifest 时优先使用 manifest_ids，例如 manifest_ids: \"1\" 或 \"1,2\"\n");
+            detailedHint.append("5. 不确定编号时先调用 listMyData(query_type=\"dataset\") 或 listMyData(query_type=\"manifest\") 查询\n");
+            detailedHint.append("6. 代码中应使用沙箱预置 helper：from af_dataset_loader import load_datasets, load_manifest；或读取 /sandbox/paths_dataset.csv / /sandbox/path_manifest.csv 获取真实路径\n\n");
             detailedHint.append("正确示例：\n");
-            detailedHint.append("通过原生工具调用 executePython，并传入 dataset_ids=\"xxx\"、code=\"import pandas as pd; ...\"");
+            detailedHint.append("通过原生工具调用 executePython，并传入 dataset_ids=\"1\"、code=\"from af_dataset_loader import load_datasets; ...\"");
         } else if (errorHint.contains("keyword")) {
             detailedHint.append("修正建议：\n");
             detailedHint.append("搜索类工具必须使用 'keyword' 参数（不是 'keywords' 或 'query'）\n");
@@ -557,7 +558,7 @@ public class ReactTodoExecutor {
         } else {
             detailedHint.append("修正建议：\n");
             detailedHint.append("请确保使用正确的参数名，参考 System Prompt 中的工具规范。\n");
-            detailedHint.append("特别注意 executePython 的 dataset_ids 参数是必需的！");
+            detailedHint.append("特别注意：executePython 需传 dataset_ids 或 manifest_ids 至少一个；数据已打包成 manifest 时优先 manifest_ids；编号必须是当前 agent run 的 run-level 整数编号；不确定时先调用 listMyData 查询。");
         }
 
         updatedTodos.add(CompletedTodoInfo.builder()
@@ -988,13 +989,13 @@ public class ReactTodoExecutor {
         StringBuilder userMsg = new StringBuilder();
         userMsg.append("当前任务: ").append(description).append("\n\n");
 
-        // 列出已有数据集，提醒 LLM 引用这些 ID
+        // 列出已有数据集，提醒 LLM 引用 run-level 编号
         if (!context.getDatasetRefs().isEmpty()) {
-            userMsg.append("已有数据集 (可用于 dataset_ids 参数):\n");
+            userMsg.append("已有数据集（原始 dataset_id，不可直接传入 executePython）：\n");
             context.getDatasetRefs().forEach((id, path) ->
                     userMsg.append(String.format("  - %s\n", id)));
             userMsg.append("\n");
-            userMsg.append("⚠️ 注意：如果调用 executePython，必须将上述 dataset ID 通过 dataset_ids 参数传入！\n\n");
+            userMsg.append("⚠️ 注意：如果调用 executePython，必须通过 dataset_ids / manifest_ids 传入当前 run 的 run-level 整数编号（不是上述原始 ID）。编号不确定时先调用 listMyData 查询。\n\n");
         }
 
         userMsg.append("请决定如何完成。\n");
@@ -1179,7 +1180,7 @@ public class ReactTodoExecutor {
             case "getEtfAdj" -> "{\"tsCode\": \"<ETF代码>\", \"startDate\": \"YYYYMMDD\", \"endDate\": \"YYYYMMDD\"}";
             case "getIndexInfo" -> "{\"ts_code\": \"<指数代码>\"}";
             case "getStockInfo" -> "{\"ts_code\": \"<股票代码>\"}";
-            case "executePython" -> "{\"code\": \"<Python代码>\", \"dataset_ids\": \"<必需：数据集ID，逗号分隔>\", \"libraries\": \"<可选：库名逗号分隔>\"}";
+            case "executePython" -> "{\"code\": \"<Python代码>\", \"dataset_ids\": \"<可选：run-level dataset 编号，逗号分隔>\", \"manifest_ids\": \"<可选：run-level manifest 编号，逗号分隔>\", \"libraries\": \"<可选：库名逗号分隔>\", \"timeout_seconds\": \"<可选：整数>\"}";
             case "searchWeb" -> "{\"query\": \"<搜索查询文本>\", \"scene\": \"general|finance|news\", \"backend\": \"perplexity|tavily|exa|\", \"strength\": \"<可选>\", \"skipHotCache\": true, \"skipRagPrefetch\": true, \"timeRangeStart\": \"\", \"timeRangeEnd\": \"\", \"maxResults\": 5}";
             default -> "{...}";
         };

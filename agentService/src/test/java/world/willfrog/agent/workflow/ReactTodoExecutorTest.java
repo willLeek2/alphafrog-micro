@@ -28,6 +28,7 @@ import java.util.Set;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -527,6 +528,101 @@ class ReactTodoExecutorTest {
                         .additionalProperties(false)
                         .build())
                 .build();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Run-level ID contract regression (#43)
+    // ─────────────────────────────────────────────────────────────────────
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void buildRetryContext_executePythonHintShouldTeachRunLevelIds() {
+        ReactTodoExecutor.TodoExecutionContext ctx = context();
+        ReactTodoExecutor.TodoExecutionContext retryCtx = ReflectionTestUtils.invokeMethod(
+                executor, "buildRetryContext", ctx, "MISSING_DATASET_IDS");
+        assertNotNull(retryCtx);
+        List<CompletedTodoInfo> todos = retryCtx.getCompletedTodos();
+        CompletedTodoInfo hint = todos.get(todos.size() - 1);
+        String output = hint.getOutput();
+        assertTrue(output.contains("run-level"), "retry hint 必须说明 run-level 编号");
+        assertTrue(output.contains("manifest_ids"), "retry hint 必须说明 manifest_ids");
+        assertTrue(output.contains("listMyData"), "retry hint 必须说明 listMyData 恢复路径");
+        assertFalse(output.contains("/sandbox/input/*/"), "retry hint 不得要求旧 glob 路径");
+        assertFalse(output.contains("dataset_xxx"), "retry hint 不得使用旧 dataset_xxx 示例");
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void buildMessages_datasetRefsHintShouldRequireRunLevelNumbers() {
+        Map<String, String> refs = Map.of("ds-001", "/path/to/ds-001.csv");
+        ReactTodoExecutor.TodoExecutionContext ctx = ReactTodoExecutor.TodoExecutionContext.builder()
+                .userGoal("分析")
+                .availableTools(Set.of("executePython"))
+                .completedTodos(List.of())
+                .datasetRefs(new java.util.HashMap<>(refs))
+                .build();
+
+        List<dev.langchain4j.data.message.ChatMessage> msgs = ReflectionTestUtils.invokeMethod(
+                executor, "buildMessages", "当前任务", ctx);
+        assertNotNull(msgs);
+        String userText = msgs.stream()
+                .filter(msg -> msg instanceof dev.langchain4j.data.message.UserMessage)
+                .map(msg -> ((dev.langchain4j.data.message.UserMessage) msg).singleText())
+                .collect(java.util.stream.Collectors.joining("\n"));
+        assertTrue(userText.contains("run-level"), "当前任务提示必须说明 run-level 编号");
+        assertTrue(userText.contains("listMyData"), "当前任务提示必须说明 listMyData");
+        assertFalse(userText.contains("可用于 dataset_ids 参数"), "当前任务提示不得再说原始 ID 可直接用于 dataset_ids");
+        assertFalse(userText.contains("/sandbox/input/*/"), "当前任务提示不得出现旧路径");
+    }
+
+    @Test
+    void getToolParamSpec_executePythonShouldContainRunLevelManifestIds() {
+        String spec = ReflectionTestUtils.invokeMethod(executor, "getToolParamSpec", "executePython");
+        assertNotNull(spec);
+        assertTrue(spec.contains("manifest_ids"), "executePython schema 必须包含 manifest_ids");
+        assertTrue(spec.contains("run-level"), "executePython schema 必须说明 run-level 编号");
+        assertFalse(spec.contains("dataset_xxx"), "executePython schema 不得使用旧 dataset_xxx 示例");
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void buildRetryContext_genericErrorBranchShouldTeachRunLevelIds() {
+        ReactTodoExecutor.TodoExecutionContext ctx = context();
+        ReactTodoExecutor.TodoExecutionContext retryCtx = ReflectionTestUtils.invokeMethod(
+                executor, "buildRetryContext", ctx, "some generic failure");
+        assertNotNull(retryCtx);
+        List<CompletedTodoInfo> todos = retryCtx.getCompletedTodos();
+        CompletedTodoInfo hint = todos.get(todos.size() - 1);
+        String output = hint.getOutput();
+        assertTrue(output.contains("run-level"), "generic retry hint 必须说明 run-level 编号");
+        assertTrue(output.contains("manifest_ids"), "generic retry hint 必须说明 manifest_ids");
+        assertTrue(output.contains("listMyData"), "generic retry hint 必须说明 listMyData 恢复路径");
+        assertTrue(output.contains("dataset_ids 或 manifest_ids 至少一个"),
+                "generic retry hint 必须说明 dataset_ids / manifest_ids 至少一个");
+        assertFalse(output.contains("dataset_ids 参数是必需"),
+                "generic retry hint 不得再说 dataset_ids 参数是必需的");
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void buildMessagesWithRetryContext_retryWrapperShouldTeachRunLevelIds() {
+        ReactTodoExecutor.TodoExecutionContext ctx = context();
+        List<dev.langchain4j.data.message.ChatMessage> msgs = ReflectionTestUtils.invokeMethod(
+                executor, "buildMessagesWithRetryContext", "任务", ctx, 1);
+        assertNotNull(msgs);
+        String joined = msgs.stream()
+                .filter(msg -> msg instanceof dev.langchain4j.data.message.UserMessage)
+                .map(msg -> ((dev.langchain4j.data.message.UserMessage) msg).singleText())
+                .collect(java.util.stream.Collectors.joining("\n"));
+        assertTrue(joined.contains("run-level"), "retry wrapper 必须说明 run-level 编号");
+        assertTrue(joined.contains("manifest_ids"), "retry wrapper 必须说明 manifest_ids");
+        assertTrue(joined.contains("listMyData"), "retry wrapper 必须说明 listMyData 恢复路径");
+        assertTrue(joined.contains("dataset_ids 或 manifest_ids 至少一个"),
+                "retry wrapper 必须说明 dataset_ids / manifest_ids 至少一个");
+        assertFalse(joined.contains("executePython 的 dataset_ids"),
+                "retry wrapper 不得再说 executePython 的 dataset_ids");
+        assertFalse(joined.contains("数据集ID是否来自'已有数据集'列表"),
+                "retry wrapper 不得再说旧数据集 ID 列表口径");
     }
 
     // ─────────────────────────────────────────────────────────────────────

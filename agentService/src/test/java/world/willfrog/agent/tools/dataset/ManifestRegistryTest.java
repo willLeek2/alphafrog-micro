@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.data.redis.core.SetOperations;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ValueOperations;
@@ -39,7 +40,7 @@ class ManifestRegistryTest {
 
     @BeforeEach
     void setUp() {
-        registry = new DatasetRegistry(mock(StringRedisTemplate.class));
+        registry = new DatasetRegistry(mock(StringRedisTemplate.class), mock(ApplicationEventPublisher.class));
         redisTemplate = mock(StringRedisTemplate.class);
         valueOps = mock(ValueOperations.class);
         when(redisTemplate.opsForValue()).thenReturn(valueOps);
@@ -66,6 +67,7 @@ class ManifestRegistryTest {
 
         ReflectionTestUtils.setField(registry, "redisTemplate", redisTemplate);
         ReflectionTestUtils.setField(registry, "datasetPath", tempDir.toString());
+        ReflectionTestUtils.setField(registry, "manifestsPath", tempDir.toString());
         ReflectionTestUtils.setField(registry, "enabled", true);
         ReflectionTestUtils.setField(registry, "ttlSeconds", 3600L);
         ReflectionTestUtils.setField(registry, "scanCount", 100);
