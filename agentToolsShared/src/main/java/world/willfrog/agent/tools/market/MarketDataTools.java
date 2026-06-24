@@ -228,17 +228,8 @@ public class MarketDataTools {
         try {
             if (datasetWriter.isEnabled() && datasetRegistry.isEnabled()) {
                 return datasetRegistry.findReusable("stock_daily", normalizedTsCode, normalizedStart, normalizedEnd, headers)
-                        .map(meta -> ok("getStockDaily", datasetData(
-                                normalizedTsCode,
-                                normalizedStart,
-                                normalizedEnd,
-                                headers,
-                                meta.getDatasetId(),
-                                meta.getRowCount(),
-                                "reused",
-                                true,
-                                List.of()
-                        )))
+                        .map(meta -> ok("getStockDaily", datasetDataFromMeta(
+                                normalizedTsCode, normalizedStart, normalizedEnd, headers, meta)))
                         .orElseGet(() -> fetchStockDaily(normalizedTsCode, normalizedStart, normalizedEnd, headers));
             }
             return fetchStockDaily(normalizedTsCode, normalizedStart, normalizedEnd, headers);
@@ -406,17 +397,8 @@ public class MarketDataTools {
         try {
             if (datasetWriter.isEnabled() && datasetRegistry.isEnabled()) {
                 return datasetRegistry.findReusable("index_daily", normalizedTsCode, normalizedStart, normalizedEnd, headers)
-                        .map(meta -> ok("getIndexDaily", datasetData(
-                                normalizedTsCode,
-                                normalizedStart,
-                                normalizedEnd,
-                                headers,
-                                meta.getDatasetId(),
-                                meta.getRowCount(),
-                                "reused",
-                                true,
-                                List.of()
-                        )))
+                        .map(meta -> ok("getIndexDaily", datasetDataFromMeta(
+                                normalizedTsCode, normalizedStart, normalizedEnd, headers, meta)))
                         .orElseGet(() -> fetchIndexDaily(normalizedTsCode, normalizedStart, normalizedEnd, headers));
             }
             return fetchIndexDaily(normalizedTsCode, normalizedStart, normalizedEnd, headers);
@@ -1068,17 +1050,8 @@ public class MarketDataTools {
         try {
             if (datasetWriter.isEnabled() && datasetRegistry.isEnabled()) {
                 return datasetRegistry.findReusable(datasetKind, normalizedTsCode, normalizedStart, normalizedEnd, headers)
-                        .map(meta -> ok(toolName, datasetData(
-                                normalizedTsCode,
-                                normalizedStart,
-                                normalizedEnd,
-                                headers,
-                                meta.getDatasetId(),
-                                meta.getRowCount(),
-                                "reused",
-                                true,
-                                List.of()
-                        )))
+                        .map(meta -> ok(toolName, datasetDataFromMeta(
+                                normalizedTsCode, normalizedStart, normalizedEnd, headers, meta)))
                         .orElseGet(() -> fetchListedAssetDailyFromService(
                                 normalizedTsCode, normalizedStart, normalizedEnd, assetType, toolName, headers, datasetKind));
             }
@@ -1397,12 +1370,14 @@ public class MarketDataTools {
 
             if (ok) {
                 String datasetId = nvl((String) rowData.get("dataset_id"));
+                String memberStartDate = firstNonBlankString(rowData.get("start_date"), startDate);
+                String memberEndDate = firstNonBlankString(rowData.get("end_date"), endDate);
                 if (datasetId.isBlank()) {
                     members.add(DatasetManifest.ManifestMember.builder()
                             .tsCode(tsCode)
                             .status(DatasetManifest.ManifestMember.STATUS_FAILED)
-                            .startDate(startDate)
-                            .endDate(endDate)
+                            .startDate(memberStartDate)
+                            .endDate(memberEndDate)
                             .columns(columns)
                             .errorCode("MISSING_DATASET_ID")
                             .errorMessage("batch row ok but dataset_id missing")
@@ -1419,8 +1394,8 @@ public class MarketDataTools {
                         .datasetId(datasetId)
                         .status(DatasetManifest.ManifestMember.STATUS_READY)
                         .rowCount(rowCount)
-                        .startDate(startDate)
-                        .endDate(endDate)
+                        .startDate(memberStartDate)
+                        .endDate(memberEndDate)
                         .columns(columns)
                         .build());
                 continue;
@@ -1997,6 +1972,24 @@ public class MarketDataTools {
         return data;
     }
 
+    private Map<String, Object> datasetDataFromMeta(String tsCode,
+                                                    String requestedStartDate,
+                                                    String requestedEndDate,
+                                                    List<String> fields,
+                                                    DatasetRegistry.DatasetMeta meta) {
+        return datasetData(
+                tsCode,
+                firstNonBlankString(meta.getStartDate(), requestedStartDate),
+                firstNonBlankString(meta.getEndDate(), requestedEndDate),
+                fields,
+                meta.getDatasetId(),
+                meta.getRowCount(),
+                "reused",
+                true,
+                List.of()
+        );
+    }
+
     private long convertToMsTimestamp(String dateStr) {
         if (dateStr == null) {
             return -1;
@@ -2123,6 +2116,22 @@ public class MarketDataTools {
 
     private String nvl(String text) {
         return text == null ? "" : text;
+    }
+
+    private String firstNonBlankString(Object... values) {
+        if (values == null) {
+            return "";
+        }
+        for (Object value : values) {
+            if (value == null) {
+                continue;
+            }
+            String text = String.valueOf(value);
+            if (!text.isBlank()) {
+                return text;
+            }
+        }
+        return "";
     }
 
     private String escapeJson(String text) {

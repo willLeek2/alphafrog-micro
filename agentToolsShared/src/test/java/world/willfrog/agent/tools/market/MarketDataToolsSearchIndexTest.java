@@ -5,6 +5,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
+import world.willfrog.agent.tools.dataset.DatasetManifest;
+import world.willfrog.agent.tools.dataset.DatasetRegistry;
 import world.willfrog.agent.tools.dataset.DatasetWriter;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticIndexDailyByTsCodeAndDateRangeRequest;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticIndexDailyByTsCodeAndDateRangeResponse;
@@ -108,6 +110,46 @@ class MarketDataToolsSearchIndexTest {
         assertEquals(1, ((Number) summary.get("amount")).intValue());
         List<Map<String, Object>> previewRows = castList(data.get("preview_rows"));
         assertEquals(1000.0, ((Number) previewRows.get(0).get("close")).doubleValue(), 0.0001);
+    }
+
+    @Test
+    void manifestMemberUsesActualReusableDatasetRange() {
+        List<String> headers = List.of("ts_code", "trade_date", "open", "high", "low", "close",
+                "pre_close", "change", "pct_chg", "vol", "amount");
+        DatasetRegistry.DatasetMeta meta = DatasetRegistry.DatasetMeta.builder()
+                .datasetId("shared-stock-000001.SZ-20240101-20240131-abc")
+                .type("stock_daily")
+                .tsCode("000001.SZ")
+                .startDate("20240101")
+                .endDate("20240131")
+                .columns(headers)
+                .rowCount(20)
+                .build();
+        MarketDataTools tools = new MarketDataTools(
+                null,
+                null,
+                null,
+                null,
+                new AgentLlmProperties(),
+                objectMapper
+        );
+
+        Map<String, Object> data = ReflectionTestUtils.invokeMethod(
+                tools, "datasetDataFromMeta", "000001.SZ", "20240110", "20240120", headers, meta);
+        List<Map<String, Object>> results = List.of(Map.of(
+                "ts_code", "000001.SZ",
+                "ok", true,
+                "data", data
+        ));
+
+        List<DatasetManifest.ManifestMember> members = ReflectionTestUtils.invokeMethod(
+                tools, "buildManifestMembers", results, "20240110", "20240120", headers);
+
+        assertEquals(1, members.size());
+        DatasetManifest.ManifestMember member = members.get(0);
+        assertEquals("shared-stock-000001.SZ-20240101-20240131-abc", member.getDatasetId());
+        assertEquals("20240101", member.getStartDate());
+        assertEquals("20240131", member.getEndDate());
     }
 
     private boolean queryIsHs300(DomesticIndexSearchRequest request) {
