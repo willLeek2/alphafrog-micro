@@ -88,6 +88,7 @@ message DomesticIndexDailyItem {
   double pctChg = 9;
   optional double vol = 10;
   optional double amount = 11;
+  repeated string missingFields = 12;
 }
 
 /**

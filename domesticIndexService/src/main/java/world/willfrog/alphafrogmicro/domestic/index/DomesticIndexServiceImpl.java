@@ -24,10 +24,12 @@ import world.willfrog.alphafrogmicro.domestic.idl.DubboDomesticIndexServiceTripl
 import world.willfrog.alphafrogmicro.domestic.index.service.IndexDataCompletenessService;
 
 import jakarta.annotation.PostConstruct;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.function.Consumer;
 import java.util.function.Function;
 
 @DubboService
@@ -390,13 +392,20 @@ public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
                 DomesticIndexDailyByTsCodeAndDateRangeResponse.newBuilder();
 
         for (IndexDaily indexDaily : indexDailyList) {
+            List<String> missingFields = new ArrayList<>();
             DomesticIndexDailyItem.Builder itemBuilder = DomesticIndexDailyItem.newBuilder()
-                    .setTsCode(indexDaily.getTsCode()).setTradeDate(indexDaily.getTradeDate())
-                    .setClose(indexDaily.getClose()).setOpen(indexDaily.getOpen())
-                    .setHigh(indexDaily.getHigh()).setLow(indexDaily.getLow())
-                    .setPreClose(indexDaily.getPreClose()).setChange(indexDaily.getChange())
-                    .setPctChg(indexDaily.getPctChg()).setVol(indexDaily.getVol())
-                    .setAmount(indexDaily.getAmount());
+                    .setTsCode(Objects.toString(indexDaily.getTsCode(), ""));
+            setLongIfPresent(itemBuilder::setTradeDate, indexDaily.getTradeDate(), "trade_date", missingFields);
+            setDoubleIfPresent(itemBuilder::setClose, indexDaily.getClose(), "close", missingFields);
+            setDoubleIfPresent(itemBuilder::setOpen, indexDaily.getOpen(), "open", missingFields);
+            setDoubleIfPresent(itemBuilder::setHigh, indexDaily.getHigh(), "high", missingFields);
+            setDoubleIfPresent(itemBuilder::setLow, indexDaily.getLow(), "low", missingFields);
+            setDoubleIfPresent(itemBuilder::setPreClose, indexDaily.getPreClose(), "pre_close", missingFields);
+            setDoubleIfPresent(itemBuilder::setChange, indexDaily.getChange(), "change", missingFields);
+            setDoubleIfPresent(itemBuilder::setPctChg, indexDaily.getPctChg(), "pct_chg", missingFields);
+            setDoubleIfPresent(itemBuilder::setVol, indexDaily.getVol(), "vol", missingFields);
+            setDoubleIfPresent(itemBuilder::setAmount, indexDaily.getAmount(), "amount", missingFields);
+            itemBuilder.addAllMissingFields(missingFields);
 
             responseBuilder.addItems(itemBuilder.build());
         }
@@ -419,6 +428,28 @@ public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
         }
 
         return responseBuilder.build();
+    }
+
+    private static void setDoubleIfPresent(Consumer<Double> setter,
+                                           Double value,
+                                           String field,
+                                           List<String> missingFields) {
+        if (value == null) {
+            missingFields.add(field);
+            return;
+        }
+        setter.accept(value);
+    }
+
+    private static void setLongIfPresent(Consumer<Long> setter,
+                                         Long value,
+                                         String field,
+                                         List<String> missingFields) {
+        if (value == null) {
+            missingFields.add(field);
+            return;
+        }
+        setter.accept(value);
     }
 
     @Override

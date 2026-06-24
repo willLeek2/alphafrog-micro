@@ -1860,13 +1860,22 @@ public class MarketDataTools {
                 String runId = AgentContext.getRunId();
                 String prefix = (runId != null ? runId : "shared") + "-index";
                 String datasetId = datasetWriter.writeDataset("index_daily", prefix, tsCode, startDateStr, endDateStr, response.getItemsList(), headers, item -> Arrays.asList(
-                        item.getTsCode(), item.getTradeDate(), item.getOpen(), item.getHigh(), item.getLow(), item.getClose(),
-                        item.getPreClose(), item.getChange(), item.getPctChg(), item.getVol(), item.getAmount()
+                        item.getTsCode(),
+                        indexDailyValue(item, "trade_date", item.getTradeDate()),
+                        indexDailyValue(item, "open", item.hasOpen() ? item.getOpen() : null),
+                        indexDailyValue(item, "high", item.hasHigh() ? item.getHigh() : null),
+                        indexDailyValue(item, "low", item.hasLow() ? item.getLow() : null),
+                        indexDailyValue(item, "close", item.getClose()),
+                        indexDailyValue(item, "pre_close", item.getPreClose()),
+                        indexDailyValue(item, "change", item.getChange()),
+                        indexDailyValue(item, "pct_chg", item.getPctChg()),
+                        indexDailyValue(item, "vol", item.hasVol() ? item.getVol() : null),
+                        indexDailyValue(item, "amount", item.hasAmount() ? item.getAmount() : null)
                 ));
                 if (datasetRegistry.isEnabled()) {
                     datasetRegistry.registerDataset("index_daily", tsCode, startDateStr, endDateStr, headers, datasetId, response.getItemsCount());
                 }
-                return ok("getIndexDaily", datasetData(
+                Map<String, Object> data = datasetData(
                         tsCode,
                         startDateStr,
                         endDateStr,
@@ -1876,17 +1885,19 @@ public class MarketDataTools {
                         "created",
                         false,
                         List.of()
-                ));
+                );
+                attachIndexDailyMissingSummary(data, response.getItemsList());
+                return ok("getIndexDaily", data);
             }
 
             List<Map<String, Object>> previewRows = new ArrayList<>();
             response.getItemsList().stream().limit(20).forEach(item -> {
                 Map<String, Object> row = new LinkedHashMap<>();
                 row.put("trade_date", item.getTradeDate());
-                row.put("close", item.getClose());
+                row.put("close", indexDailyValue(item, "close", item.getClose()));
                 previewRows.add(row);
             });
-            return ok("getIndexDaily", datasetData(
+            Map<String, Object> data = datasetData(
                     tsCode,
                     startDateStr,
                     endDateStr,
@@ -1896,10 +1907,32 @@ public class MarketDataTools {
                     "inline",
                     false,
                     previewRows
-            ));
+            );
+            attachIndexDailyMissingSummary(data, response.getItemsList());
+            return ok("getIndexDaily", data);
         } catch (Exception e) {
             return fail("getIndexDaily", "TOOL_ERROR", "查询失败，请重试或更换工具。如果持续失败，请换一种方式完成任务。",
                     Map.of("message", nvl(e.getMessage())));
+        }
+    }
+
+    private Object indexDailyValue(DomesticIndexDailyItem item, String field, Object value) {
+        return item.getMissingFieldsList().contains(field) ? null : value;
+    }
+
+    private void attachIndexDailyMissingSummary(Map<String, Object> data, List<DomesticIndexDailyItem> items) {
+        Map<String, Integer> missingCounts = new LinkedHashMap<>();
+        for (DomesticIndexDailyItem item : items) {
+            for (String field : item.getMissingFieldsList()) {
+                missingCounts.merge(field, 1, Integer::sum);
+            }
+        }
+        boolean hasMissing = !missingCounts.isEmpty();
+        data.put("has_missing_values", hasMissing);
+        if (hasMissing) {
+            data.put("missing_fields_summary", missingCounts);
+            data.put("data_quality_note",
+                    "本次工具调用落盘的数据存在部分字段缺失；Python 分析时请按缺失值处理，不要把空值当成 0。");
         }
     }
 

@@ -98,7 +98,7 @@ public class DatasetWriter {
             for (T item : data) {
                 List<Object> row = rowMapper.apply(item);
                 String line = row.stream()
-                        .map(String::valueOf)
+                        .map(value -> value == null ? "" : String.valueOf(value))
                         .collect(Collectors.joining(","));
                 writer.write(line);
                 writer.newLine();

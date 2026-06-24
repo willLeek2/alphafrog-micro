@@ -67,6 +67,7 @@
 - `ts_code` 必须从搜索结果中获取，不要猜测
 - 多个已知代码使用同一日期区间时，优先合并为一次批量调用：`ts_code="000300.SH|000905.SH"`，也可传 JSON 数组字符串；不要改用逗号分隔
 - 批量返回 `data.mode=batch`、`data.results`、`success_count`、`failure_count`
+- 如果返回 `data.has_missing_values=true`、`data.missing_fields_summary` 或 `data.data_quality_note`，说明本次落盘数据有部分字段缺失；后续 `executePython` 必须按缺失值处理，不要把空值默认当成 0，最终回答也要说明数据存在部分缺失。
 
 #### ETF 复权因子说明
 - 调用 `getExchangeAssetDaily(assetType="etf")` 时，若数据库中存在该 ETF 的复权因子数据，返回的 dataset CSV 会**自动追加 `adj_factor` 列**
