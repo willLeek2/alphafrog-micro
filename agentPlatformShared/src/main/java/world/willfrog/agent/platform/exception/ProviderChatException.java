@@ -52,7 +52,7 @@ public class ProviderChatException extends IllegalStateException {
         String normalized = raw.replace('\n', ' ').replace('\r', ' ');
         // 移除 Authorization header 等敏感片段（不区分大小写；兼容 JSON 键值两侧的引号）
         normalized = normalized.replaceAll("(?i)Authorization[\"']?\\s*[:=]\\s*[\"']?Bearer\\s+[^\\s\"']+", "<redacted>");
-        normalized = normalized.replaceAll("(?i)\\b[sk]-[a-zA-Z0-9_-]{10,}\\b", "<redacted>");
+        normalized = normalized.replaceAll("(?i)\\bsk-[a-zA-Z0-9_-]{10,}\\b", "<redacted>");
         if (normalized.length() <= RAW_MESSAGE_MAX_LENGTH) {
             return normalized;
         }

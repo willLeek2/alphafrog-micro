@@ -33,6 +33,27 @@ class ProviderChatExceptionTest {
     }
 
     @Test
+    void of_shouldScrubStandaloneApiKeyInRawBody() {
+        String raw = "{\"error\":\"invalid api_key=sk-live-xxxxxxxxxx in request\"}";
+
+        ProviderChatException ex = ProviderChatException.of(
+                401,
+                "unauthorized",
+                List.of("openrouter"),
+                "model",
+                "endpoint",
+                raw,
+                ProviderFailureCategory.AUTH_REJECTED,
+                null
+        );
+
+        assertFalse(ex.getRawProviderMessage().contains("sk-live-xxxxxxxxxx"));
+        assertFalse(ex.getMessage().contains("sk-live-xxxxxxxxxx"));
+        assertTrue(ex.getRawProviderMessage().contains("<redacted>"));
+        assertTrue(ex.getMessage().contains("<redacted>"));
+    }
+
+    @Test
     void of_shouldBoundRawProviderMessage() {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < 2000; i++) {

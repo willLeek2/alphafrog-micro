@@ -149,7 +149,30 @@ class LangchainFailureMapperTest {
     }
 
     @Test
-    void map_shouldMapUnknownToWorkflowFailed() {
+    void map_shouldScrubProviderApiKeyFromMapperPayload() {
+        String raw = "api_key=sk-live-xxxxxxxxxx in provider error body";
+        ProviderChatException ex = ProviderChatException.of(
+                401,
+                "unauthorized",
+                List.of("openrouter"),
+                "model",
+                "endpoint",
+                raw,
+                ProviderFailureCategory.AUTH_REJECTED,
+                null
+        );
+
+        LangchainFailureDecision decision = mapper.map(
+                "execution", "todo_secret", null, null, null, ex, 1);
+
+        assertFalse(decision.getReason().contains("sk-live-xxxxxxxxxx"));
+        assertFalse(String.valueOf(decision.getEventPayload().get("raw_message")).contains("sk-live-xxxxxxxxxx"));
+        assertFalse(String.valueOf(decision.getEventPayload().get("reason")).contains("sk-live-xxxxxxxxxx"));
+        assertTrue(String.valueOf(decision.getEventPayload().get("raw_message")).contains("<redacted>"));
+    }
+
+    @Test
+    void map_shouldMapUnknownException() {
         LangchainFailureDecision decision = mapper.map(
                 "summarizing",
                 null,
