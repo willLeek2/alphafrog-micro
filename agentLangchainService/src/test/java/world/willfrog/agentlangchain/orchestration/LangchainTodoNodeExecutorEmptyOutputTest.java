@@ -141,12 +141,16 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
 
     @Test
     void execute_shouldNotRecoverWhenBudgetHit() {
-        // budget 服务有任一上限 > 0 → budgetHit=true → 不走 recovery
+        // ccmax #59 round 2: budgetHit 改为基于实际用量（>= 80% limit）而不是"配置存在"。
+        // 这里设 maxLlmCalls=10 + 实际 llmCalls=8（>= 8 阈值 = 80%×10）→ hit=true → 不走 recovery
         AgentRunBudgetService budget = mock(AgentRunBudgetService.class);
-        when(budget.effectiveConfig()).thenReturn(new AgentRunBudgetService.EffectiveRunBudget(600_000L, 0, 0, 0, 0));
+        when(budget.effectiveConfig()).thenReturn(new AgentRunBudgetService.EffectiveRunBudget(0L, 10, 0, 0, 0));
+        world.willfrog.agent.platform.service.AgentRunStateStore stateStore = mock(world.willfrog.agent.platform.service.AgentRunStateStore.class);
+        when(stateStore.loadObservability(any())).thenReturn(java.util.Optional.of(
+                "{\"summary\":{\"llmCalls\":8,\"toolCalls\":0,\"totalTokens\":100,\"startedAtMillis\":0}}"));
         ObjectProvider<dev.langchain4j.service.tool.ToolProvider> provider = emptyToolProvider();
         LangchainTodoNodeExecutor executor = new LangchainTodoNodeExecutor(
-                LangchainTestFixtures.promptService(), provider, noopExecutionGuard(), budget);
+                LangchainTestFixtures.promptService(), provider, noopExecutionGuard(), budget, stateStore);
 
         QueueChatModel model = new QueueChatModel("   ");
         LangchainLinearWorkflowRequest request = baseRequest(model);
@@ -158,6 +162,92 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
 
         assertThat(result.isSuccess()).isFalse();
         assertThat(result.getFailureReason()).isEqualTo("empty_todo_output:todo_5");
+        assertThat(result.getFailureMetadata().get("budget_hit")).isEqualTo(true);
+        assertThat(result.getFailureMetadata().get("recovery_outcome")).isEqualTo("not_attempted");
+        assertThat(model.requests()).hasSize(1);
+    }
+
+    @Test
+    void execute_shouldStillRecoverWhenBudgetConfiguredButUsageLow() {
+        // codex 必须改：非 0 默认预算配置 + 当前用量很低 → 仍应触发一次 no-tool recovery
+        AgentRunBudgetService budget = mock(AgentRunBudgetService.class);
+        when(budget.effectiveConfig()).thenReturn(new AgentRunBudgetService.EffectiveRunBudget(600_000L, 50, 30, 300_000, 3));
+        world.willfrog.agent.platform.service.AgentRunStateStore stateStore = mock(world.willfrog.agent.platform.service.AgentRunStateStore.class);
+        // 实际用量都低：llmCalls=2 (< 50×0.8=40), toolCalls=0, totalTokens=100 (< 240000)
+        when(stateStore.loadObservability(any())).thenReturn(java.util.Optional.of(
+                "{\"summary\":{\"llmCalls\":2,\"toolCalls\":0,\"totalTokens\":100,\"startedAtMillis\":0}}"));
+        ObjectProvider<dev.langchain4j.service.tool.ToolProvider> provider = emptyToolProvider();
+        LangchainTodoNodeExecutor executor = new LangchainTodoNodeExecutor(
+                LangchainTestFixtures.promptService(), provider, noopExecutionGuard(), budget, stateStore);
+
+        QueueChatModel model = new QueueChatModel("   ", "RECOVERED");
+        LangchainLinearWorkflowRequest request = baseRequest(model);
+        TodoItem item = todo("todo_low_usage", 1, "分析");
+        AtomicInteger toolCalls = new AtomicInteger();
+
+        LangchainTodoNodeResult result = executor.execute(
+                request, item, Collections.emptyList(), new LinkedHashMap<>(), toolCalls);
+
+        // 关键断言：虽然配置了完整预算上限，但用量低 → recovery 仍触发并成功
+        assertThat(result.isSuccess()).isTrue();
+        assertThat(result.isRecovered()).isTrue();
+        assertThat(result.getRecoveryOutcome()).isEqualTo("success");
+        assertThat(result.getFailureMetadata()).isNull();
+        assertThat(model.requests()).hasSize(2);
+    }
+
+    @Test
+    void execute_shouldNotRecoverWhenUsageNearThreshold() {
+        // codex 必须改：用量接近/超过阈值（80% 比例）时，不触发 recovery，observation budget_hit=true
+        AgentRunBudgetService budget = mock(AgentRunBudgetService.class);
+        when(budget.effectiveConfig()).thenReturn(new AgentRunBudgetService.EffectiveRunBudget(600_000L, 50, 30, 300_000, 3));
+        world.willfrog.agent.platform.service.AgentRunStateStore stateStore = mock(world.willfrog.agent.platform.service.AgentRunStateStore.class);
+        // 用量达到 80%：llmCalls=40 (50×0.8=40 → 触发) + totalTokens=240000 (300000×0.8=240000 → 也触发)
+        when(stateStore.loadObservability(any())).thenReturn(java.util.Optional.of(
+                "{\"summary\":{\"llmCalls\":40,\"toolCalls\":0,\"totalTokens\":240000,\"startedAtMillis\":0}}"));
+        ObjectProvider<dev.langchain4j.service.tool.ToolProvider> provider = emptyToolProvider();
+        LangchainTodoNodeExecutor executor = new LangchainTodoNodeExecutor(
+                LangchainTestFixtures.promptService(), provider, noopExecutionGuard(), budget, stateStore);
+
+        QueueChatModel model = new QueueChatModel("   ");
+        LangchainLinearWorkflowRequest request = baseRequest(model);
+        TodoItem item = todo("todo_near_threshold", 1, "分析");
+        AtomicInteger toolCalls = new AtomicInteger();
+
+        LangchainTodoNodeResult result = executor.execute(
+                request, item, Collections.emptyList(), new LinkedHashMap<>(), toolCalls);
+
+        assertThat(result.isSuccess()).isFalse();
+        assertThat(result.getFailureReason()).isEqualTo("empty_todo_output:todo_near_threshold");
+        Map<String, Object> obs = result.getFailureMetadata();
+        assertThat(obs.get("budget_hit")).isEqualTo(true);
+        assertThat(obs.get("recovery_attempted")).isEqualTo(false);
+        assertThat(obs.get("recovery_outcome")).isEqualTo("not_attempted");
+        assertThat(model.requests()).hasSize(1); // 没走 recovery
+    }
+
+    @Test
+    void execute_shouldNotRecoverWhenUsageExceedsLimit() {
+        // codex 必须改：用量 >= 100% limit（已超）→ 不走 recovery
+        AgentRunBudgetService budget = mock(AgentRunBudgetService.class);
+        when(budget.effectiveConfig()).thenReturn(new AgentRunBudgetService.EffectiveRunBudget(600_000L, 50, 30, 300_000, 3));
+        world.willfrog.agent.platform.service.AgentRunStateStore stateStore = mock(world.willfrog.agent.platform.service.AgentRunStateStore.class);
+        // 已超：toolCalls=30 = maxToolCalls（>= 30×0.8=24 → 触发）
+        when(stateStore.loadObservability(any())).thenReturn(java.util.Optional.of(
+                "{\"summary\":{\"llmCalls\":0,\"toolCalls\":30,\"totalTokens\":0,\"startedAtMillis\":0}}"));
+        ObjectProvider<dev.langchain4j.service.tool.ToolProvider> provider = emptyToolProvider();
+        LangchainTodoNodeExecutor executor = new LangchainTodoNodeExecutor(
+                LangchainTestFixtures.promptService(), provider, noopExecutionGuard(), budget, stateStore);
+
+        QueueChatModel model = new QueueChatModel("   ");
+        LangchainLinearWorkflowRequest request = baseRequest(model);
+        TodoItem item = todo("todo_exceeded", 1, "分析");
+        AtomicInteger toolCalls = new AtomicInteger();
+
+        LangchainTodoNodeResult result = executor.execute(
+                request, item, Collections.emptyList(), new LinkedHashMap<>(), toolCalls);
+
+        assertThat(result.isSuccess()).isFalse();
         assertThat(result.getFailureMetadata().get("budget_hit")).isEqualTo(true);
         assertThat(result.getFailureMetadata().get("recovery_outcome")).isEqualTo("not_attempted");
         assertThat(model.requests()).hasSize(1);

@@ -86,6 +86,13 @@ public class LangchainTodoNodeExecutor {
     private static final boolean BUDGET_CONFIG_ONLY = true;
 
     /**
+     * budget_hit 触发阈值：实际用量达到 limit 的 80% 即认为 hit。
+     * 关键口径：仅"配置存在"不算 hit（否则生产默认有上限会让 recovery 永远不触发）。
+     * 80% 留 20% 给 recovery 一次 LLM 调用，避免 hit 时还尝试 recovery 浪费预算。
+     */
+    private static final double BUDGET_HIT_RATIO = 0.8;
+
+    /**
      * empty_todo_output 结构化观测的内部记录。承载在 {@code LangchainTodoNodeResult.failureMetadata} 中传递到 pipeline，最终写入 event payload 的 {@code empty_output_observation} 子 map。
      */
     private record EmptyOutputObservation(
@@ -153,6 +160,13 @@ public class LangchainTodoNodeExecutor {
      */
     private final AgentRunBudgetService budgetService;
 
+    /**
+     * Run 状态存储。side-effect-free 读取 observability summary (llmCalls / toolCalls / totalTokens / startedAtMillis)，
+     * 用于计算当前实际用量 → 判定 budget_hit。仅当任一维度实际用量已达 limit 的 80%（或 >= 100%）时认为 budget_hit=true；
+     * 读不到时 fail-soft 为未命中，避免配置存在就误报 hit 阻断 recovery。
+     */
+    private final world.willfrog.agent.platform.service.AgentRunStateStore stateStore;
+
 
     /**
      * 执行单个 DAG todo 节点：构建 user message → 启动 LC4j tool loop → 收集结果。
@@ -217,7 +231,7 @@ public class LangchainTodoNodeExecutor {
         String capturedModel = modelClassName(request.executionModelOrDefault());
         String capturedProvider = capturedModel;
         // side-effect-free 预算观测：只读 effectiveConfig()，不调用 check()/exceeded() 主路径
-        BudgetStatus budgetStatus = readBudgetStatus();
+        BudgetStatus budgetStatus = readBudgetStatus(request == null ? null : request.getRunId());
 
         long previousTodoTotalLength = completedTodos == null ? 0L
                 : completedTodos.stream()
@@ -375,21 +389,99 @@ public class LangchainTodoNodeExecutor {
     }
 
     /**
-     * Side-effect-free 读取当前生效的预算配置，构造 BudgetStatus。
-     * 仅读 Nacos + Spring 配置 + 静态 @Value 默认值，不调用 {@code check()} / {@code exceeded()} / {@code incrementToolCallCount()}。
-     * 失败时返回 NONE（fail-soft，不影响 todo 正常执行）。
+     * Side-effect-free 计算 budget_hit：基于当前 run 的实际用量（llmCalls / toolCalls / totalTokens / startedAtMillis）
+     * 对比 effectiveConfig 中的上限，任一维度实际用量达到 80% 阈值（{@link #BUDGET_HIT_RATIO}）即认为 hit。
+     * <p>
+     * <b>关键口径</b>：仅"配置存在"不等于 hit。生产默认有 wall_clock / llm-calls / tool-calls / tokens 上限，
+     * 如果只看配置存在就当 hit，{@link #shouldRecover} 会因为 {@code !budgetStatus.budgetHit} 不满足而一直不走 recovery。
+     * <p>
+     * Fail-soft 行为：
+     * <ul>
+     *   <li>runId 为空（如非 run 上下文）→ NONE，不阻止 recovery</li>
+     *   <li>observability summary 读不到（新 run / 还没首次 LLM 上报）→ NONE，不阻止 recovery</li>
+     *   <li>summary 字段缺失或非数字 → 该维度视为 0（不影响其它维度判定）</li>
+     *   <li>JSON 解析失败 / Redis 异常 → NONE，不阻止 recovery</li>
+     * </ul>
+     * 不调用 {@code check()} / {@code exceeded()} 主路径（避免 #60 的 {@code exceeded()} 改 RunBudgetException 时连带受影响）。
+     *
+     * @param runId 当前 todo 所属 run 的 ID（来自 request.getRunId()）；null/blank 时返回 NONE
      */
-    private BudgetStatus readBudgetStatus() {
+    private BudgetStatus readBudgetStatus(String runId) {
+        if (runId == null || runId.isBlank()) {
+            return BudgetStatus.NONE;
+        }
         try {
             AgentRunBudgetService.EffectiveRunBudget budget = budgetService.effectiveConfig();
-            boolean anyLimit = budget.maxWallClockMs() > 0
-                    || budget.maxLlmCalls() > 0
-                    || budget.maxToolCalls() > 0
-                    || budget.maxTokens() > 0;
-            return new BudgetStatus(anyLimit, BUDGET_CONFIG_ONLY);
+            Map<String, Object> summary = loadSummary(runId);
+            if (summary.isEmpty()) {
+                // 新 run / 还没首次 LLM 上报：actual = 0 → 任一 limit > 0 也不命中
+                return BudgetStatus.NONE;
+            }
+            long llmCalls = toLong(summary.get("llmCalls"));
+            long toolCalls = toLong(summary.get("toolCalls"));
+            long tokens = toLong(summary.get("totalTokens"));
+            long startedAt = toLong(summary.get("startedAtMillis"));
+            long elapsed = startedAt <= 0 ? 0L : Math.max(0L, System.currentTimeMillis() - startedAt);
+
+            boolean hit = false;
+            if (budget.maxLlmCalls() > 0 && llmCalls >= ratio(budget.maxLlmCalls())) {
+                hit = true;
+            } else if (budget.maxToolCalls() > 0 && toolCalls >= ratio(budget.maxToolCalls())) {
+                hit = true;
+            } else if (budget.maxTokens() > 0 && tokens >= ratio(budget.maxTokens())) {
+                hit = true;
+            } else if (budget.maxWallClockMs() > 0 && elapsed >= ratio(budget.maxWallClockMs())) {
+                hit = true;
+            }
+            return new BudgetStatus(hit, BUDGET_CONFIG_ONLY);
         } catch (Exception e) {
             log.debug("budget observation read failed (will treat as no budget): {}", e.getMessage());
             return BudgetStatus.NONE;
+        }
+    }
+
+    /**
+     * 80% 阈值：把 limit 转成 80% 的临界值。实际用量超过这个值就认为 hit。
+     * 注意：{@code ratio} 在调用前已经先判过 limit > 0，所以这里可以放心做乘法。
+     */
+    private static long ratio(long limit) {
+        return Math.max(1L, (long) Math.ceil(limit * BUDGET_HIT_RATIO));
+    }
+
+    /**
+     * 从 AgentRunStateStore 读取 observability JSON 并抽出 summary 子 map。
+     * 失败时返回空 map，调用方按 NONE 处理（fail-soft）。
+     */
+    private Map<String, Object> loadSummary(String runId) {
+        try {
+            String json = stateStore.loadObservability(runId).orElse("");
+            if (json.isBlank()) {
+                return Map.of();
+            }
+            com.fasterxml.jackson.databind.ObjectMapper om = new com.fasterxml.jackson.databind.ObjectMapper();
+            Map<String, Object> root = om.readValue(json, new com.fasterxml.jackson.core.type.TypeReference<Map<String, Object>>() {});
+            Object summary = root.get("summary");
+            if (summary instanceof Map<?, ?> map) {
+                Map<String, Object> out = new LinkedHashMap<>();
+                for (Map.Entry<?, ?> entry : map.entrySet()) {
+                    out.put(String.valueOf(entry.getKey()), entry.getValue());
+                }
+                return out;
+            }
+        } catch (Exception ignored) {
+            // fail-soft
+        }
+        return Map.of();
+    }
+
+    private static long toLong(Object value) {
+        if (value instanceof Number n) {
+            return n.longValue();
+        }
+        try {
+            return Long.parseLong(String.valueOf(value));
+        } catch (Exception e) {
+            return 0L;
         }
     }
 
