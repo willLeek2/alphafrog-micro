@@ -79,6 +79,8 @@ public class AgentEventService {
     private final AgentLlmLocalConfigLoader llmLocalConfigLoader;
     /** 消息服务:用于在 run 创建时写入初始用户消息 */
     private final AgentMessageService messageService;
+    /** 提示词服务：用于在 run 创建时快照当前 dataFreshness */
+    private final AgentPromptService agentPromptService;
 
     /** Run 正常生命周期 TTL(分钟),默认 60 分钟,过期后视为 EXPIRED */
     @Value("${agent.run.ttl-minutes:60}")
@@ -182,6 +184,17 @@ public class AgentEventService {
         String executionMode = extractExecutionModeFromContext(contextJson);
         if (executionMode != null && !executionMode.isBlank()) {
             ext.put("execution_mode", executionMode);
+        }
+
+        // 快照当前数据时效配置（run 启动时冻结，保证 run 内 dataFreshness 语义一致）
+        AgentLlmProperties.DataFreshness freshness = agentPromptService.snapshotDataFreshness();
+        if (freshness != null) {
+            Map<String, String> freshnessMap = new HashMap<>();
+            freshnessMap.put("start_date", freshness.getStartDate());
+            freshnessMap.put("end_date", freshness.getEndDate());
+            freshnessMap.put("as_of_date", freshness.getAsOfDate());
+            freshnessMap.put("description", freshness.getDescription());
+            ext.put("data_freshness", freshnessMap);
         }
 
         // ── 构建 run 实体并写入 DB ──

@@ -4,6 +4,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
+import world.willfrog.agent.platform.context.AgentContext;
 
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
@@ -939,8 +940,19 @@ public class AgentPromptService {
         return String.join("\n", parts).trim();
     }
 
+    /**
+     * 数据时效 Prompt 注入。
+     *
+     * <p>优先级：AgentContext 快照（run 启动时从 ext.data_freshness 反序列化）> Nacos 热加载 > 静态配置。
+     * ext 快照由 {@code AgentEventService.createRun()} 写入、{@code LangchainLinearRunPipelineImpl.executeRun()}
+     * 入口从 ext 解析回 ThreadLocal。快照为 null 时 fallback 到 {@link #currentDataFreshness()}。</p>
+     */
     private String dataFreshnessPrompt() {
-        AgentLlmProperties.DataFreshness freshness = currentDataFreshness();
+        // 优先使用 run 启动时冻结的快照（AgentContext），保证同一 run 内 dataFreshness 语义一致
+        AgentLlmProperties.DataFreshness freshness = AgentContext.getDataFreshness();
+        if (freshness == null) {
+            freshness = currentDataFreshness();
+        }
         if (freshness == null) {
             return "";
         }
@@ -1037,6 +1049,17 @@ public class AgentPromptService {
         merged.setAsOfDate(firstNonBlank(local.getAsOfDate(), base == null ? null : base.getAsOfDate()));
         merged.setDescription(firstNonBlank(local.getDescription(), base == null ? null : base.getDescription()));
         return merged;
+    }
+
+    /**
+     * 公开的快照方法：返回当前生效的合并后 DataFreshness 的防御性副本。
+     * 调用方（如 {@code AgentEventService.createRun()}）在 run 创建时调用一次，
+     * 写入 ext JSON 作为该 run 的不可变快照，保证 run 生命周期内数据时效语义稳定。
+     *
+     * @return 合并后的 DataFreshness 副本，不会随后续 Nacos 热加载变化
+     */
+    public AgentLlmProperties.DataFreshness snapshotDataFreshness() {
+        return currentDataFreshness();
     }
 
     /**

@@ -10,6 +10,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ValueOperations;
+import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunEventMapper;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
@@ -43,6 +44,8 @@ class AgentEventServiceTest {
     private AgentMessageService messageService;
     @Mock
     private AgentRunEventRedisStore eventRedisStore;
+    @Mock
+    private AgentPromptService mockPromptService;
 
     private AgentEventService service;
     private ObjectMapper objectMapper;
@@ -57,7 +60,8 @@ class AgentEventServiceTest {
                 objectMapper,
                 redisTemplate,
                 llmLocalConfigLoader,
-                messageService
+                messageService,
+                mockPromptService
         );
     }
 
@@ -152,6 +156,52 @@ class AgentEventServiceTest {
         assertTrue(config.codeInterpreterEnabled());
         assertEquals(0, config.codeInterpreterMaxCredits());
         assertFalse(config.smartRetrievalEnabled());
+    }
+
+    @Test
+    void createRun_shouldSnapshotDataFreshnessIntoExt() throws Exception {
+        AgentLlmProperties.DataFreshness freshness = new AgentLlmProperties.DataFreshness();
+        freshness.setStartDate("2020-01-01");
+        freshness.setEndDate("2026-06-24");
+        freshness.setAsOfDate("2026-06-24");
+        freshness.setDescription("test snapshot");
+        when(mockPromptService.snapshotDataFreshness()).thenReturn(freshness);
+        when(redisTemplate.opsForValue()).thenReturn(valueOperations);
+        when(valueOperations.increment(anyString())).thenReturn(1L);
+        when(eventMapper.insert(any())).thenReturn(1);
+
+        AgentRun run = run("r-test", "u-test");
+        when(runMapper.findByIdAndUser(anyString(), anyString())).thenReturn(run);
+
+        service.createRun("u-test", "hello", "{}", "idem", "m", "e", false, "openrouter", 2, false, "{}", false);
+
+        ArgumentCaptor<AgentRun> runCaptor = ArgumentCaptor.forClass(AgentRun.class);
+        verify(runMapper).insert(runCaptor.capture());
+        AgentRun captured = runCaptor.getValue();
+        Map<?, ?> ext = objectMapper.readValue(captured.getExt(), Map.class);
+        Map<?, ?> df = (Map<?, ?>) ext.get("data_freshness");
+        assertEquals("2020-01-01", df.get("start_date"));
+        assertEquals("2026-06-24", df.get("end_date"));
+        assertEquals("2026-06-24", df.get("as_of_date"));
+        assertEquals("test snapshot", df.get("description"));
+    }
+
+    @Test
+    void createRun_shouldNotWriteDataFreshnessWhenSnapshotReturnsNull() throws Exception {
+        when(mockPromptService.snapshotDataFreshness()).thenReturn(null);
+        when(redisTemplate.opsForValue()).thenReturn(valueOperations);
+        when(valueOperations.increment(anyString())).thenReturn(1L);
+        when(eventMapper.insert(any())).thenReturn(1);
+
+        AgentRun run = run("r-test2", "u-test2");
+        when(runMapper.findByIdAndUser(anyString(), anyString())).thenReturn(run);
+
+        service.createRun("u-test2", "hello", "{}", "idem", "m", "e", false, "openrouter", 2, false, "{}", false);
+
+        ArgumentCaptor<AgentRun> runCaptor = ArgumentCaptor.forClass(AgentRun.class);
+        verify(runMapper).insert(runCaptor.capture());
+        Map<?, ?> ext = objectMapper.readValue(runCaptor.getValue().getExt(), Map.class);
+        assertFalse(ext.containsKey("data_freshness"));
     }
 
     private AgentRun run(String runId, String userId) {

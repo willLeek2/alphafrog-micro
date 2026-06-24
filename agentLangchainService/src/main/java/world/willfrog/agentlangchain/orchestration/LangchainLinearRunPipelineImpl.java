@@ -10,6 +10,7 @@ import dev.langchain4j.service.tool.ToolProviderRequest;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
+import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
@@ -209,7 +210,10 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             AgentContext.setWebSearchEnabled(runConfig.webSearchEnabled());
             AgentContext.setWebSearchConfig(runConfig.webSearchConfig());
 
-            // 这里先解析“当前 run 允许暴露给模型的工具列表”，planning（规划）阶段会把这些工具能力写进 prompt，
+            // 从 ext 反序列化 run 启动时冻结的 dataFreshness 快照
+            setDataFreshnessFromExt(run.getExt());
+
+            // 这里先解析”当前 run 允许暴露给模型的工具列表”，planning（规划）阶段会把这些工具能力写进 prompt，
             // execution（执行）阶段也会用同一套 ToolSpecification 注册到 LC4j（LangChain4j）AiServices。
             // 如果两处工具目录不一致，planner 可能安排一个执行阶段拿不到的工具，这是最难排查的类型之一。
             List<ToolSpecification> toolSpecifications = resolveToolSpecifications(runConfig, userGoal);
@@ -487,6 +491,32 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         } catch (Exception e) {
             return "{}";
         }
+    }
+
+    /**
+     * 从 run.ext JSON 反序列化 run 启动时冻结的 dataFreshness 快照并设置到 AgentContext。
+     * 旧 run 无此字段时跳过，AgentPromptService 会 fallback 到热加载配置。
+     */
+    private void setDataFreshnessFromExt(String extJson) {
+        try {
+            if (extJson == null || extJson.isBlank()) return;
+            var extNode = objectMapper.readTree(extJson);
+            var freshnessNode = extNode.get("data_freshness");
+            if (freshnessNode == null || freshnessNode.isNull()) return;
+            AgentLlmProperties.DataFreshness freshness = new AgentLlmProperties.DataFreshness();
+            freshness.setStartDate(textOrNull(freshnessNode, "start_date"));
+            freshness.setEndDate(textOrNull(freshnessNode, "end_date"));
+            freshness.setAsOfDate(textOrNull(freshnessNode, "as_of_date"));
+            freshness.setDescription(textOrNull(freshnessNode, "description"));
+            AgentContext.setDataFreshness(freshness);
+        } catch (Exception e) {
+            log.warn("Failed to parse data_freshness from ext for agent run, falling back to live config", e);
+        }
+    }
+
+    private static String textOrNull(com.fasterxml.jackson.databind.JsonNode parent, String field) {
+        var node = parent.get(field);
+        return node != null && !node.isNull() ? node.asText() : null;
     }
 
     private boolean isBlank(String value) {

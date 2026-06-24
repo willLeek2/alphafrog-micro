@@ -4,6 +4,7 @@ import java.util.List;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
+import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.config.RunStageConfig;
 import world.willfrog.agent.platform.config.StageLlmConfig;
 
@@ -120,6 +121,12 @@ public class AgentContext {
      * 供 search_evidence_judge 等没有独立 stage 配置的环节退化使用，避免落到 deprecated runtime.judge.routes。
      */
     private static final ThreadLocal<StageLlmConfig> EFFECTIVE_EXECUTION_STAGE_CONFIG_HOLDER = new ThreadLocal<>();
+
+    /**
+     * 当前 Run 的数据时效快照，在 executeRun 入口从 ext.data_freshness 反序列化设置。
+     * 同一 run 内不变，确保 planning → execution → final 看到的 dataFreshness 语义一致。
+     */
+    private static final ThreadLocal<AgentLlmProperties.DataFreshness> DATA_FRESHNESS_HOLDER = new ThreadLocal<>();
 
     /**
      * DashScope thinking 内容：从流式响应中提取的 reasoning_content。
@@ -438,6 +445,30 @@ public class AgentContext {
         EFFECTIVE_EXECUTION_STAGE_CONFIG_HOLDER.remove();
     }
 
+    /** 获取当前线程的 Run 级数据时效快照（run 启动时冻结），可能为 null。 */
+    public static AgentLlmProperties.DataFreshness getDataFreshness() {
+        return DATA_FRESHNESS_HOLDER.get();
+    }
+
+    /** 设置当前线程的 Run 级数据时效快照（做字段级 defensive copy，避免外部修改影响冻结语义）。 */
+    public static void setDataFreshness(AgentLlmProperties.DataFreshness dataFreshness) {
+        if (dataFreshness == null) {
+            DATA_FRESHNESS_HOLDER.remove();
+            return;
+        }
+        AgentLlmProperties.DataFreshness copy = new AgentLlmProperties.DataFreshness();
+        copy.setStartDate(dataFreshness.getStartDate());
+        copy.setEndDate(dataFreshness.getEndDate());
+        copy.setAsOfDate(dataFreshness.getAsOfDate());
+        copy.setDescription(dataFreshness.getDescription());
+        DATA_FRESHNESS_HOLDER.set(copy);
+    }
+
+    /** 清理当前线程的数据时效快照。 */
+    public static void clearDataFreshness() {
+        DATA_FRESHNESS_HOLDER.remove();
+    }
+
     /** 设置流式响应中提取的 thinking 内容(DashScope reasoning_content 等)。 */
     public static void setThinkingContent(String content) {
         THINKING_CONTENT_HOLDER.set(content);
@@ -594,7 +625,8 @@ public class AgentContext {
                 getReasoningEffort(),
                 getStageConfig(),
                 getEffectiveExecutionStageConfig(),
-                getWorkflow()
+                getWorkflow(),
+                getDataFreshness()
         );
     }
 
@@ -668,6 +700,11 @@ public class AgentContext {
         } else {
             setWorkflow(snapshot.workflow());
         }
+        if (snapshot.dataFreshness() == null) {
+            clearDataFreshness();
+        } else {
+            setDataFreshness(snapshot.dataFreshness());
+        }
     }
 
     /**
@@ -699,6 +736,7 @@ public class AgentContext {
         clearReasoningEffort();
         clearStageConfig();
         clearEffectiveExecutionStageConfig();
+        clearDataFreshness();
         clearThinkingContent();
         clearStreamingProgress();
     }
@@ -752,7 +790,8 @@ public class AgentContext {
             String reasoningEffort,
             RunStageConfig stageConfig,
             StageLlmConfig effectiveExecutionStageConfig,
-            String workflow
+            String workflow,
+            AgentLlmProperties.DataFreshness dataFreshness
     ) {
     }
 
