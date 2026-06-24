@@ -8,6 +8,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.exception.RunBudgetException;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -209,7 +210,7 @@ public class AgentRunBudgetService {
         if (runId != null && userId != null) {
             eventService.append(runId, userId, "RUN_BUDGET_EXCEEDED", payload);
         }
-        return new IllegalStateException("RUN_BUDGET_EXCEEDED:" + dimension + ":" + actual + "/" + limit);
+        return new RunBudgetException(dimension, actual, limit, false);
     }
 
     /** 从 Nacos 热加载配置读取 {@code runtime.runBudget}。 */
