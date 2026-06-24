@@ -89,8 +89,8 @@ public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
                 client,
                 "indices",
                 new String[]{"name", "ts_code", "full_name", "market", "publisher"}, // 可搜索字段
-                new String[]{"market", "publisher"}, // 可过滤字段
-                new String[]{"name", "ts_code"} // 可排序字段
+                new String[]{"market", "publisher", "has_daily"}, // 可过滤字段
+                new String[]{"has_daily", "name", "ts_code"} // 可排序字段
             );
             
             // 初始化索引（创建 + 配置）
@@ -130,7 +130,7 @@ public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
         
         // 定义数据获取函数
         MeiliSearchDataSyncService.FetchFunction<IndexInfo> fetchFunction = 
-            (offset, limit) -> indexInfoDao.getAllIndexInfo(offset, limit);
+            (offset, limit) -> indexInfoDao.getAllIndexInfoWithDaily(offset, limit);
         
         // 定义文档转换函数
         Function<IndexInfo, Map<String, Object>> docConverter = this::convertToMeiliDocument;
@@ -173,6 +173,7 @@ public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
         doc.put("publisher", index.getPublisher());
         doc.put("index_type", index.getIndexType());
         doc.put("category", index.getCategory());
+        doc.put("has_daily", resolveHasDaily(index));
         return doc;
     }
 
@@ -247,7 +248,11 @@ public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
             try {
                 Index index = getMeiliClient().index("indices");
                 SearchResult searchResult = (SearchResult) index.search(
-                        SearchRequest.builder().q(normalizedQuery).limit(200).build());
+                        SearchRequest.builder()
+                                .q(normalizedQuery)
+                                .limit(200)
+                                .sort(new String[]{"has_daily:desc"})
+                                .build());
                 for (Object hitObj : searchResult.getHits()) {
                     if (!(hitObj instanceof Map<?, ?> hit)) {
                         continue;
@@ -259,7 +264,8 @@ public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
                             .setTsCode(originalTsCode)
                             .setName(stringValue(hit.get("name")))
                             .setFullname(stringValue(hit.get("full_name")))
-                            .setMarket(stringValue(hit.get("market")));
+                            .setMarket(stringValue(hit.get("market")))
+                            .setHasDaily(intValue(hit.get("has_daily")));
                     responseBuilder.addItems(itemBuilder.build());
                 }
                 if (responseBuilder.getItemsCount() > 0) {
@@ -272,7 +278,7 @@ public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
         List<IndexInfo> indexInfoList;
         try {
             // 单条 SQL + 相关性排序，避免高热度关键词下"随机截断"导致基础指数缺失
-            indexInfoList = indexInfoDao.searchIndexInfo(normalizedQuery, 200, 0);
+            indexInfoList = indexInfoDao.searchIndexInfoWithDaily(normalizedQuery, 200, 0);
         } catch (Exception e) {
             log.error("Error occurred while searching index info with query: {}", normalizedQuery, e);
             // 搜索异常时返回空响应
@@ -281,7 +287,8 @@ public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
         for (IndexInfo indexInfo : indexInfoList) {
             DomesticIndexInfoSimpleItem.Builder itemBuilder = DomesticIndexInfoSimpleItem.newBuilder()
                     .setTsCode(indexInfo.getTsCode()).setName(indexInfo.getName())
-                    .setFullname(indexInfo.getFullName()).setMarket(indexInfo.getMarket());
+                    .setFullname(indexInfo.getFullName()).setMarket(indexInfo.getMarket())
+                    .setHasDaily(resolveHasDaily(indexInfo));
             responseBuilder.addItems(itemBuilder.build());
         }
 
@@ -290,6 +297,39 @@ public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
 
     private String stringValue(Object value) {
         return value == null ? "" : String.valueOf(value);
+    }
+
+    private int intValue(Object value) {
+        if (value instanceof Number number) {
+            return number.intValue();
+        }
+        if (value instanceof Boolean bool) {
+            return bool ? 1 : 0;
+        }
+        if (value != null) {
+            try {
+                return Integer.parseInt(String.valueOf(value));
+            } catch (NumberFormatException ignored) {
+                return 0;
+            }
+        }
+        return 0;
+    }
+
+    private int resolveHasDaily(IndexInfo index) {
+        if (index == null) {
+            return 0;
+        }
+        Integer hasDaily = index.getHasDaily();
+        if (hasDaily != null) {
+            return hasDaily > 0 ? 1 : 0;
+        }
+        try {
+            return indexQuoteDao != null && indexQuoteDao.hasAnyIndexDaily(index.getTsCode()) ? 1 : 0;
+        } catch (Exception e) {
+            log.warn("Failed to resolve index has_daily for tsCode={}", index.getTsCode(), e);
+            return 0;
+        }
     }
 
     private boolean isMeiliEnabled() {

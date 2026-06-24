@@ -58,6 +58,7 @@
 - 同一任务需要搜索多个关键词时，优先合并为一次批量调用：`keyword="沪深300|中证500"`，也可传 JSON 数组字符串；不要改用逗号分隔
 - 批量返回 `data.mode=batch`、`data.results`、`success_count`、`failure_count`，从每个 result 的 `data.items` 中选取匹配项
 - 从返回的 `data.items` 中选取最符合用户意图的项（比对 `name` 与用户目标）
+- searchIndex 结果中的 `has_daily=1` 表示本地库存在该指数任意时间点行情；多个候选都匹配用户目标时，优先选择 `has_daily=1`，`has_daily=0` 的候选可能导致 getIndexDaily 无行情
 - **不要默认取第一条**，要根据用户意图选择
 
 ### 2. 日线数据工具（getIndexDaily/getStockDaily/getExchangeAssetDaily/getOffExchangeAssetDaily）

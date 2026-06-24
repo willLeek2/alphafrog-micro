@@ -33,4 +33,7 @@ public interface IndexQuoteDao {
             @Result(column = "amount", property = "amount")
     })
     List<IndexDaily> getIndexDailiesByTsCodeAndDateRange(@Param("tsCode") String tsCode, @Param("startDate") Long startDate, @Param("endDate") Long endDate);
+
+    @Select("SELECT EXISTS(SELECT 1 FROM alphafrog_index_daily WHERE ts_code = #{tsCode} LIMIT 1)")
+    boolean hasAnyIndexDaily(@Param("tsCode") String tsCode);
 }

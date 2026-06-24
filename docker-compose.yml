@@ -516,6 +516,7 @@ services:
       - ./data/agent_datasets:/data/agent_datasets
       - ./data/database_fetched:/data/database_fetched
       - ./data/manifests:/data/manifests
+      - ./data/agent_artifacts:/data/agent_artifacts
       - ./data/agent_workspaces:/data/agent_workspaces
       - ./agentPlatformShared/src/main/resources/agent_guides:/data/agent_guides:ro
       - ./agentLangchainService/config:/app/config:ro
@@ -637,6 +638,7 @@ services:
       - ./data/agent_datasets:/data/agent_datasets
       - ./data/database_fetched:/data/database_fetched
       - ./data/manifests:/data/manifests
+      - ./data/agent_artifacts:/data/agent_artifacts
       - /var/run/docker.sock:/var/run/docker.sock
     expose:
       - "8095"

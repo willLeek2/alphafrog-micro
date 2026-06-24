@@ -36,6 +36,7 @@ message DomesticIndexInfoSimpleItem {
   string name = 2;
   string fullname = 3;
   string market = 4;
+  int32 hasDaily = 5;
 }
 
 /**

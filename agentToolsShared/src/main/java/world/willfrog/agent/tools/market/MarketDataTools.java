@@ -465,6 +465,7 @@ public class MarketDataTools {
                 row.put("name", item.getName());
                 row.put("full_name", item.getFullname());
                 row.put("market", item.getMarket());
+                row.put("has_daily", item.getHasDaily());
                 items.add(row);
             });
             return ok("searchIndex", Map.of(

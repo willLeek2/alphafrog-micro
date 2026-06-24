@@ -21,7 +21,7 @@
 - {"tool":"getIndexDaily","args":{"tsCode":"${step_0.output.data.items[0].ts_code}"}}
 - {"tool":"getIndexDaily","args":{"tsCode":"{todo_1.output.data.items.0.ts_code}"}}
 
-从 search 类工具返回的 items 中选取最符合用户意图的项，不要默认取第一条。若需要执行 executePython：dataset_ids / manifest_ids 必须是当前 run 的 run-level 整数编号，code 应使用 `load_datasets` / `load_manifest` 或读取 `/sandbox/paths_dataset.csv` / `/sandbox/path_manifest.csv` 加载数据。
+从 search 类工具返回的 items 中选取最符合用户意图的项，不要默认取第一条。searchIndex 结果中 has_daily=1 表示本地库存在该指数任意时间点行情，多个指数都匹配用户意图时优先选择 has_daily=1。若需要执行 executePython：dataset_ids / manifest_ids 必须是当前 run 的 run-level 整数编号，code 应使用 `load_datasets` / `load_manifest` 或读取 `/sandbox/paths_dataset.csv` / `/sandbox/path_manifest.csv` 加载数据。
 工具结果里若出现 data.rawRef（raw-ref:...），需要完整原始输出时应调用 rereadToolResult，不要把 rawRef 传给 loadDocument。
 
 输出格式（只输出 JSON）：
