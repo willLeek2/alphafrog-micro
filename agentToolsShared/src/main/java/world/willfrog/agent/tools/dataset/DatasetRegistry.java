@@ -489,6 +489,9 @@ public class DatasetRegistry {
             String queryKey = buildQueryKey(dataType, tsCode, startDate, endDate, columns);
             Optional<DatasetMeta> datasetMeta = loadMeta(queryKey);
             if (datasetMeta.isEmpty()) {
+                datasetMeta = loadMetaByDatasetId(dataType, tsCode, datasetId);
+            }
+            if (datasetMeta.isEmpty()) {
                 log.warn("Manifest member dataset meta not found: manifestId={} datasetId={} tsCode={}",
                         meta.getManifestId(), datasetId, tsCode);
                 continue;
@@ -501,6 +504,29 @@ public class DatasetRegistry {
             }
             publishDatasetPersistedEvent(dsMeta);
         }
+    }
+
+    private Optional<DatasetMeta> loadMetaByDatasetId(String type, String tsCode, String datasetId) {
+        if (type == null || type.isBlank()
+                || tsCode == null || tsCode.isBlank()
+                || datasetId == null || datasetId.isBlank()) {
+            return Optional.empty();
+        }
+        Set<String> queryKeys = redisTemplate.opsForSet().members(indexKey(type, tsCode));
+        if (queryKeys == null || queryKeys.isEmpty()) {
+            return Optional.empty();
+        }
+        for (String candidateKey : queryKeys) {
+            Optional<DatasetMeta> candidate = loadMeta(candidateKey);
+            if (candidate.isEmpty()) {
+                continue;
+            }
+            DatasetMeta candidateMeta = candidate.get();
+            if (datasetId.equals(candidateMeta.getDatasetId())) {
+                return Optional.of(candidateMeta);
+            }
+        }
+        return Optional.empty();
     }
 
     private void touchManifestMeta(ManifestMeta meta) {

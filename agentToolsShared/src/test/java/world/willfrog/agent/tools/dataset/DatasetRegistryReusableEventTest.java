@@ -149,6 +149,43 @@ class DatasetRegistryReusableEventTest {
         assertEquals("000001.SZ", manifestEvent.getFromTsCode());
     }
 
+    @Test
+    void manifestMemberRangeMismatchFallsBackToDatasetIdIndex() throws Exception {
+        List<String> columns = List.of("trade_date", "close");
+        DatasetRegistry.DatasetMeta dsMeta = reusableMeta(
+                "stock_daily", "000001.SZ", "20240101", "20240131", columns, "ds-range-member");
+        String dsQueryKey = queryKey("stock_daily", "000001.SZ", "20240101", "20240131", columns);
+        dsMeta.setQueryKey(dsQueryKey);
+
+        DatasetRegistry.ManifestMeta manifestMeta = reusableManifestMeta(
+                "stock_daily", "20240110", "20240120", List.of("000001.SZ"), columns,
+                "manifest-range-reuse", "ds-range-member", "20240110", "20240120");
+        String manifestQueryKey = manifestQueryKey("stock_daily", "20240110", "20240120",
+                List.of("000001.SZ"), columns);
+        manifestMeta.setQueryKey(manifestQueryKey);
+
+        String requestedMemberQueryKey = queryKey(
+                "stock_daily", "000001.SZ", "20240110", "20240120", columns);
+        when(valueOps.get(manifestMetaKey(manifestQueryKey))).thenReturn(MAPPER.writeValueAsString(manifestMeta));
+        when(valueOps.get(metaKey(requestedMemberQueryKey))).thenReturn(null);
+        when(setOps.members(indexKey("stock_daily", "000001.SZ"))).thenReturn(Set.of(dsQueryKey));
+        when(valueOps.get(metaKey(dsQueryKey))).thenReturn(MAPPER.writeValueAsString(dsMeta));
+
+        Optional<DatasetRegistry.ManifestMeta> found = registry.findReusableManifest(
+                "stock_daily", "20240110", "20240120", List.of("000001.SZ"), columns);
+
+        assertTrue(found.isPresent());
+        List<DatasetPersistedEvent> events = captureDatasetEvents(2);
+        DatasetPersistedEvent datasetEvent = events.get(0);
+        DatasetPersistedEvent manifestEvent = events.get(1);
+
+        assertEquals("ds-range-member", datasetEvent.getDatasetId());
+        assertEquals(Path.of(dsMeta.getPath()).resolve(dsMeta.getDataFileName()).toAbsolutePath().toString(),
+                datasetEvent.getPersistedPath());
+        assertEquals("manifest-range-reuse", manifestEvent.getManifestId());
+        assertEquals(List.of("ds-range-member"), manifestEvent.getRelatedDatasetIds());
+    }
+
     private DatasetRegistry.DatasetMeta reusableMeta(String type, String tsCode, String startDate, String endDate,
                                                      List<String> columns, String datasetId) throws Exception {
         Path dir = tempDir.resolve(datasetId);
@@ -179,17 +216,26 @@ class DatasetRegistryReusableEventTest {
     private DatasetRegistry.ManifestMeta reusableManifestMeta(String dataType, String startDate, String endDate,
                                                              List<String> tsCodes, List<String> columns,
                                                              String manifestId) throws Exception {
+        return reusableManifestMeta(dataType, startDate, endDate, tsCodes, columns, manifestId,
+                "ds-member", startDate, endDate);
+    }
+
+    private DatasetRegistry.ManifestMeta reusableManifestMeta(String dataType, String startDate, String endDate,
+                                                             List<String> tsCodes, List<String> columns,
+                                                             String manifestId, String datasetId,
+                                                             String memberStartDate, String memberEndDate)
+            throws Exception {
         Path dir = tempDir.resolve(manifestId);
         Files.createDirectories(dir);
         List<DatasetManifest.ManifestMember> members = new ArrayList<>();
         for (String tsCode : tsCodes) {
             members.add(DatasetManifest.ManifestMember.builder()
                     .tsCode(tsCode)
-                    .datasetId("ds-member")
+                    .datasetId(datasetId)
                     .status(DatasetManifest.ManifestMember.STATUS_READY)
                     .rowCount(1)
-                    .startDate(startDate)
-                    .endDate(endDate)
+                    .startDate(memberStartDate)
+                    .endDate(memberEndDate)
                     .columns(columns)
                     .build());
         }
