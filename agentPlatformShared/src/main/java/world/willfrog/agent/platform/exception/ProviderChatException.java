@@ -1,7 +1,6 @@
 package world.willfrog.agent.platform.exception;
 
 import lombok.Getter;
-import world.willfrog.agent.platform.service.OpenAiCompatibleChatModelSupport;
 
 import java.util.List;
 
@@ -51,8 +50,8 @@ public class ProviderChatException extends IllegalStateException {
             return "";
         }
         String normalized = raw.replace('\n', ' ').replace('\r', ' ');
-        // 移除 Authorization header 等敏感片段（不区分大小写）
-        normalized = normalized.replaceAll("(?i)Authorization\\s*[:=]\\s*Bearer\\s+[^\\s\"']+", "Authorization: Bearer <redacted>");
+        // 移除 Authorization header 等敏感片段（不区分大小写；兼容 JSON 键值两侧的引号）
+        normalized = normalized.replaceAll("(?i)Authorization[\"']?\\s*[:=]\\s*[\"']?Bearer\\s+[^\\s\"']+", "<redacted>");
         normalized = normalized.replaceAll("(?i)\\b[sk]-[a-zA-Z0-9_-]{10,}\\b", "<redacted>");
         if (normalized.length() <= RAW_MESSAGE_MAX_LENGTH) {
             return normalized;
@@ -61,7 +60,7 @@ public class ProviderChatException extends IllegalStateException {
     }
 
     /**
-     * 便捷构造：使用 {@link OpenAiCompatibleChatModelSupport#shorten(String)} 生成 detail message。
+     * 便捷构造：detail message 中的 raw 同样经过 scrub + bounded 处理。
      */
     public static ProviderChatException of(int statusCode,
                                             String errorCode,
@@ -71,14 +70,15 @@ public class ProviderChatException extends IllegalStateException {
                                             String rawProviderMessage,
                                             ProviderFailureCategory category,
                                             Throwable cause) {
+        String scrubbedRaw = scrubRawMessage(rawProviderMessage);
         String detail = "Provider chat failed (http=" + statusCode
                 + ", category=" + category
                 + ", errorCode=" + (errorCode == null ? "" : errorCode)
                 + ", providers=" + providerOrder
                 + ", model=" + modelName
                 + ", endpoint=" + endpointName
-                + ", raw=" + OpenAiCompatibleChatModelSupport.shorten(rawProviderMessage) + ")";
+                + ", raw=" + scrubbedRaw + ")";
         return new ProviderChatException(statusCode, errorCode, providerOrder, modelName, endpointName,
-                rawProviderMessage, category, detail, cause);
+                scrubbedRaw, category, detail, cause);
     }
 }
