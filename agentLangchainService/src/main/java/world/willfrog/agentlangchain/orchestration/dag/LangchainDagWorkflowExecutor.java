@@ -411,7 +411,8 @@ public class LangchainDagWorkflowExecutor {
                 stateRecorder.persistNodeState(runId, items, workflowStateLock, nodeStates,
                         item, TodoStatus.FAILED, interrupted, toolCalls.get());
                 emitEventBestEffort(runId, userId, "TODO_NODE_FAILED", todoNodeResultPayload(
-                        item, false, interrupted.getSummary(), 0, 0, "RUN_CANCELED"));
+                        item, false, interrupted.getSummary(), 0, 0, "RUN_CANCELED",
+                        null, false, null));
                 return;
             }
             // 2. 恢复父线程的 AgentContext，确保 observability trace 关联正确
@@ -479,7 +480,8 @@ public class LangchainDagWorkflowExecutor {
                         "tool_calls_used", record.getToolCallsUsed()
                 ));
                 emitEventBestEffort(runId, userId, "TODO_NODE_COMPLETED", todoNodeResultPayload(
-                        item, true, record.getSummary(), durationMs, record.getToolCallsUsed()));
+                        item, true, record.getSummary(), durationMs, record.getToolCallsUsed(),
+                        null, null, record.isRecovered(), record.getRecoveryOutcome()));
             } else {
                 long durationMs = System.currentTimeMillis() - nodeStartMs;
                 // 失败：状态记录和事件通知，下游节点会因 nodeSuccess=false 而被跳过
@@ -490,7 +492,8 @@ public class LangchainDagWorkflowExecutor {
                         "summary", nvl(record.getSummary())
                 ));
                 emitEventBestEffort(runId, userId, "TODO_NODE_FAILED", todoNodeResultPayload(
-                        item, false, record.getSummary(), durationMs, 0));
+                        item, false, record.getSummary(), durationMs, 0,
+                        null, record.getFailureMetadata(), false, null));
             }
         } catch (Throwable t) {
             // 捕获所有未处理异常和错误（Throwable 比 Exception 更宽，能捕获 Error 如 OOM），
@@ -504,7 +507,8 @@ public class LangchainDagWorkflowExecutor {
             stateRecorder.persistNodeState(runId, items, workflowStateLock, nodeStates,
                     item, TodoStatus.FAILED, failed, toolCalls.get());
             emitEventBestEffort(runId, userId, "TODO_NODE_FAILED", todoNodeResultPayload(
-                    item, false, failed.getSummary(), catchDurationMs, 0));
+                    item, false, failed.getSummary(), catchDurationMs, 0,
+                    null, null, false, null));
         } finally {
             // 增加完成计数（用于监控和调试），并清理 ThreadLocal
             completedCount.incrementAndGet();
@@ -971,7 +975,7 @@ public class LangchainDagWorkflowExecutor {
      */
     private Map<String, Object> todoNodeResultPayload(TodoItem item, boolean success,
                                                        String summary, long durationMs, int toolCalls) {
-        return todoNodeResultPayload(item, success, summary, durationMs, toolCalls, null);
+        return todoNodeResultPayload(item, success, summary, durationMs, toolCalls, null, null, false, null);
     }
 
     /**
@@ -982,6 +986,23 @@ public class LangchainDagWorkflowExecutor {
     private Map<String, Object> todoNodeResultPayload(TodoItem item, boolean success,
                                                        String summary, long durationMs, int toolCalls,
                                                        String errorCode) {
+        return todoNodeResultPayload(item, success, summary, durationMs, toolCalls, errorCode,
+                null, false, null);
+    }
+
+    /**
+     * 带结构化观测 + recovery 标记的完整重载。
+     * <ul>
+     *   <li>{@code failureMetadata} 非空时写入 payload 的 {@code empty_output_observation} 子 map；</li>
+     *   <li>{@code recovered=true} 时写入 {@code recovered=true} + {@code recovery_outcome}，便于压测报告统计 success after recovery；</li>
+     *   <li>{@code errorCode} 与 RUN_CANCELED 推断逻辑保持兼容。</li>
+     * </ul>
+     */
+    private Map<String, Object> todoNodeResultPayload(TodoItem item, boolean success,
+                                                       String summary, long durationMs, int toolCalls,
+                                                       String errorCode,
+                                                       Map<String, Object> failureMetadata,
+                                                       boolean recovered, String recoveryOutcome) {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("todo_id", item.getId());
         payload.put("todo_sequence", item.getSequence());
@@ -1001,6 +1022,15 @@ public class LangchainDagWorkflowExecutor {
         }
         if (!success && !isBlank(summary)) {
             payload.put("failure_reason", summary);
+        }
+        if (success && recovered) {
+            payload.put("recovered", true);
+            if (!isBlank(recoveryOutcome)) {
+                payload.put("recovery_outcome", recoveryOutcome);
+            }
+        }
+        if (failureMetadata != null && !failureMetadata.isEmpty()) {
+            payload.put("empty_output_observation", failureMetadata);
         }
         return payload;
     }

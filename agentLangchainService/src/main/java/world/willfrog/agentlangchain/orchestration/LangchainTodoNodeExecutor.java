@@ -3,15 +3,18 @@ package world.willfrog.agentlangchain.orchestration;
 import dev.langchain4j.service.AiServices;
 import dev.langchain4j.service.tool.ToolProvider;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.service.AgentPromptService;
+import world.willfrog.agent.platform.service.AgentRunBudgetService;
 import world.willfrog.agent.workflow.DatasetRefRegistry;
 import world.willfrog.agent.workflow.TodoItem;
 import world.willfrog.agentlangchain.tools.LangchainDatasetRefContext;
 import world.willfrog.agentlangchain.tools.LangchainRepeatedToolCallContext;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -51,6 +54,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 @Component
 @RequiredArgsConstructor
+@Slf4j
 public class LangchainTodoNodeExecutor {
 
     /**
@@ -64,7 +68,71 @@ public class LangchainTodoNodeExecutor {
      */
     private static final int DEFAULT_MAX_TOOL_ROUND_TRIPS = 30;
 
-    /** Prompt 装配服务，负责提供 system prompt 及各类 stage prompt。 */
+    /**
+     * 附加到 user message 末尾的安全 recovery 提示。仅在第一次返回空输出后追加一次。
+     * 设计为 50+ 字符强制回答 + 明确禁止再次调用工具，让模型直接给文字结论。
+     */
+    private static final String RECOVERY_HINT = "\n\n[SYSTEM_RECOVERY_HINT]\n"
+            + "上一次你返回了空内容。请用至少 50 个字符直接回答：\n"
+            + "1) 你的判断结论（成功 / 失败 / 需要更多信息）；\n"
+            + "2) 如果是工具问题，列出调用过的工具及结果摘要；\n"
+            + "3) 如果是数据问题，列出具体哪些字段缺失。\n"
+            + "不要调用任何工具，直接给文字回答。";
+
+    /**
+     * recovery 触发的预算阈值观察口径：当前预算任一维度上限 > 0 时认为本次 todo 输出可能受预算约束。
+     * 这是 config-only 粗粒度信号（避免在观测阶段调用 check()/exceeded() 主路径，#60 会改 AgentRunBudgetService.exceeded() 抛 RunBudgetException）。
+     */
+    private static final boolean BUDGET_CONFIG_ONLY = true;
+
+    /**
+     * empty_todo_output 结构化观测的内部记录。承载在 {@code LangchainTodoNodeResult.failureMetadata} 中传递到 pipeline，最终写入 event payload 的 {@code empty_output_observation} 子 map。
+     */
+    private record EmptyOutputObservation(
+            String todoId,
+            Integer todoSequence,
+            String stage,
+            String model,
+            String provider,
+            String finishReason,
+            Integer rawOutputLength,
+            Integer trimmedOutputLength,
+            boolean budgetHit,
+            String lastNonEmptyTodoId,
+            long previousTodoTotalLength,
+            int currentTodoPromptBudgetChars,
+            boolean recoveryAttempted,
+            String recoveryOutcome
+    ) {
+        Map<String, Object> toMap() {
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("todo_id", todoId);
+            out.put("todo_sequence", todoSequence);
+            out.put("stage", stage);
+            out.put("model", model);
+            out.put("provider", provider);
+            out.put("finish_reason", finishReason);
+            out.put("raw_output_length", rawOutputLength);
+            out.put("trimmed_output_length", trimmedOutputLength);
+            out.put("budget_hit", budgetHit);
+            out.put("last_non_empty_todo_id", lastNonEmptyTodoId);
+            out.put("previous_todo_total_length", previousTodoTotalLength);
+            out.put("current_todo_prompt_budget_chars", currentTodoPromptBudgetChars);
+            out.put("recovery_attempted", recoveryAttempted);
+            out.put("recovery_outcome", recoveryOutcome);
+            return out;
+        }
+    }
+
+    /**
+     * Side-effect-free budget 观测封装：只读 Nacos / Spring 配置，不触发 check() / exceeded() / increment()。
+     */
+    private record BudgetStatus(boolean budgetHit, boolean configOnly) {
+        static final BudgetStatus NONE = new BudgetStatus(false, true);
+    }
+
+    /**
+     * Prompt 装配服务，负责提供 system prompt 及各类 stage prompt。 */
     private final AgentPromptService promptService;
 
     /**
@@ -75,9 +143,16 @@ public class LangchainTodoNodeExecutor {
 
     /**
      * 执行守卫，用于检查当前 run 是否被用户取消（cancel）或暂停（pause）。
-     * 在 tool loop 的每次往返前后都会检查，防止 run 已中断但仍在发 LLM 请求。
+     * 在 tool loop 的每次往返前后都会检查，防止 run 被中断后仍在发 LLM 请求。
      */
     private final LangchainRunExecutionGuard executionGuard;
+
+    /**
+     * Run 级预算服务。当前仅用于 side-effect-free 读取 effectiveConfig() 判定 budget_hit，
+     * 不调用 check() / exceeded() 主路径（避免 #60 的 AgentRunBudgetService.exceeded() 改 RunBudgetException 时连带受影响）。
+     */
+    private final AgentRunBudgetService budgetService;
+
 
     /**
      * 执行单个 DAG todo 节点：构建 user message → 启动 LC4j tool loop → 收集结果。
@@ -136,13 +211,35 @@ public class LangchainTodoNodeExecutor {
         LangchainDatasetRefContext.set(datasetRefs);
         // 清除上一节点残留的重复调用标记，防止历史状态干扰当前 todo 的执行逻辑
         LangchainRepeatedToolCallContext.clear();
+
+        // 在 try 之前捕获观测相关上下文（stage/todoId/model），避免 finally 清 ThreadLocal 后取到 null。
+        String capturedStage = AgentContext.getStage() != null ? AgentContext.getStage() : "todo_execution";
+        String capturedModel = modelClassName(request.executionModelOrDefault());
+        String capturedProvider = capturedModel;
+        // side-effect-free 预算观测：只读 effectiveConfig()，不调用 check()/exceeded() 主路径
+        BudgetStatus budgetStatus = readBudgetStatus();
+
+        long previousTodoTotalLength = completedTodos == null ? 0L
+                : completedTodos.stream()
+                        .mapToLong(t -> {
+                            String out = t.displayOutput();
+                            return out == null ? 0L : out.length();
+                        })
+                        .sum();
+        int currentPromptBudget = userMessage.length();
+        String lastNonEmptyTodoId = lastNonEmptyTodoId(completedTodos);
+
         try {
             // 发 LLM 请求前先检查 run 是否已被取消
             ensureRunnable(request);
             String output = buildTodoAiService(request, toolCalls, datasetRefs).execute(userMessage);
             // 极端情况：LLM 返回了空字符串（例如被安全过滤或模型异常），视为失败
             if (isBlank(output)) {
-                return LangchainTodoNodeResult.failure("empty_todo_output:" + item.getId());
+                return handleEmptyOutput(
+                        request, item, datasetRefs, toolCalls, callsBefore,
+                        output, userMessage,
+                        capturedStage, capturedModel, capturedProvider, budgetStatus,
+                        previousTodoTotalLength, currentPromptBudget, lastNonEmptyTodoId);
             }
             String trimmed = output.trim();
             // 把 LLM 返回结果中的 dataset ref（JSON 片段）注册到引用表，后续节点可通过 datasetRefs 读取复用
@@ -158,6 +255,170 @@ public class LangchainTodoNodeExecutor {
             LangchainDatasetRefContext.clear();
             AgentContext.clearTodoContext();
         }
+    }
+
+    /**
+     * 空输出统一处理：判定是否触发 recovery，构造 observation 并返回结果。
+     * 入口条件：第一次 LLM 返回 null 或 trim 后为空的字符串。
+     * 行为：
+     * <ul>
+     *   <li>不可恢复（带工具 / 预算触发 / 配置不允许）→ 直接返回 {@code empty_todo_output:<id>} 失败并附 observation；</li>
+     *   <li>可恢复 → 走 {@link #buildRecoveryAiService} 第二次调用；success → 标 recovered=true，still blank / exception → 走 {@code empty_todo_output_after_recovery} 失败并附 observation。</li>
+     * </ul>
+     */
+    private LangchainTodoNodeResult handleEmptyOutput(LangchainLinearWorkflowRequest request,
+                                                       TodoItem item,
+                                                       Map<String, String> datasetRefs,
+                                                       AtomicInteger toolCalls,
+                                                       int callsBefore,
+                                                       String firstOutput,
+                                                       String userMessage,
+                                                       String capturedStage,
+                                                       String capturedModel,
+                                                       String capturedProvider,
+                                                       BudgetStatus budgetStatus,
+                                                       long previousTodoTotalLength,
+                                                       int currentPromptBudget,
+                                                       String lastNonEmptyTodoId) {
+        String finishReason = firstOutput == null ? "no_response" : "blank_after_trim";
+        int rawOutputLength = firstOutput == null ? 0 : firstOutput.length();
+        int trimmedOutputLength = firstOutput == null ? 0 : firstOutput.trim().length();
+
+        if (!shouldRecover(request, budgetStatus)) {
+            EmptyOutputObservation observation = new EmptyOutputObservation(
+                    item.getId(), item.getSequence(), capturedStage, capturedModel, capturedProvider,
+                    finishReason, rawOutputLength, trimmedOutputLength, budgetStatus.budgetHit,
+                    lastNonEmptyTodoId, previousTodoTotalLength, currentPromptBudget,
+                    false, "not_attempted");
+            return LangchainTodoNodeResult.failure(
+                    "empty_todo_output:" + item.getId(), observation.toMap());
+        }
+
+        // 走一次 recovery
+        String recoveredOutput;
+        String recoveryOutcome;
+        try {
+            recoveredOutput = buildRecoveryAiService(request).execute(userMessage + RECOVERY_HINT);
+        } catch (Exception recEx) {
+            recoveredOutput = null;
+            recoveryOutcome = "exception";
+            log.warn("empty_todo_output recovery exception for todo={} (runId={}): {}",
+                    item.getId(), request.getRunId(), recEx.getMessage());
+            EmptyOutputObservation observation = new EmptyOutputObservation(
+                    item.getId(), item.getSequence(), capturedStage, capturedModel, capturedProvider,
+                    finishReason, rawOutputLength, trimmedOutputLength, budgetStatus.budgetHit,
+                    lastNonEmptyTodoId, previousTodoTotalLength, currentPromptBudget,
+                    true, recoveryOutcome);
+            return LangchainTodoNodeResult.failure(
+                    "empty_todo_output_after_recovery:" + item.getId(), observation.toMap());
+        }
+
+        if (!isBlank(recoveredOutput)) {
+            String trimmed = recoveredOutput.trim();
+            DatasetRefRegistry.registerFromJson(trimmed, datasetRefs);
+            // 成功 recovery：success(recovered=true)，不构造 observation（成功路径不带 failureMetadata）
+            return LangchainTodoNodeResult.success(
+                    trimmed, Math.max(0, toolCalls.get() - callsBefore), true, "success");
+        }
+
+        // recovery 仍空 → terminal
+        recoveryOutcome = "still_blank";
+        EmptyOutputObservation observation = new EmptyOutputObservation(
+                item.getId(), item.getSequence(), capturedStage, capturedModel, capturedProvider,
+                finishReason, rawOutputLength, trimmedOutputLength, budgetStatus.budgetHit,
+                lastNonEmptyTodoId, previousTodoTotalLength, currentPromptBudget,
+                true, recoveryOutcome);
+        return LangchainTodoNodeResult.failure(
+                "empty_todo_output_after_recovery:" + item.getId(), observation.toMap());
+    }
+
+    /**
+     * 判定是否允许走一次安全 recovery。
+     * 三条件 AND：
+     * <ol>
+     *   <li>请求级工具规范为空（{@code request.getToolSpecifications() == null || isEmpty()}）——
+     *       这是 per-todo 真实可用工具的更准确信号，比 class 级 Spring toolProvider 更可靠。</li>
+     *   <li>预算未被触发（{@code budgetHit == false}）—— 避免在预算紧时白消耗 LLM 调用；</li>
+     *   <li>非 null 防御。</li>
+     * </ol>
+     * 注意：这里故意不看 {@link LangchainTodoNodeExecutor#toolProvider}（class 级 ObjectProvider），
+     * 因为它可能包含该 run 全局可用的工具，但本次 todo 实际未被授权调用。
+     */
+    private boolean shouldRecover(LangchainLinearWorkflowRequest request, BudgetStatus budgetStatus) {
+        if (request == null) {
+            return false;
+        }
+        List<dev.langchain4j.agent.tool.ToolSpecification> specs = request.getToolSpecifications();
+        boolean noTools = specs == null || specs.isEmpty();
+        return noTools && !budgetStatus.budgetHit;
+    }
+
+    /**
+     * 构建 recovery 专用的 no-tool AiService。
+     * 与 {@link #buildTodoAiService} 的关键差异：
+     * <ul>
+     *   <li>不注入 {@code toolProvider} —— 严格禁止调用工具；</li>
+     *   <li>不设置 {@code maxToolCallingRoundTrips} / {@code beforeToolExecution} / {@code afterToolExecution} / {@code toolExecutionErrorHandler}；
+     *       recovery 是单轮纯文本生成。</li>
+     *   <li>仅保留 {@code chatRequestTransformer -> ensureRunnable(request)}，防止用户在 recovery 中途点 cancel。</li>
+     * </ul>
+     */
+    private LangchainTodoExecutionAiService buildRecoveryAiService(LangchainLinearWorkflowRequest request) {
+        return AiServices.builder(LangchainTodoExecutionAiService.class)
+                .chatModel(request.executionModelOrDefault())
+                .systemMessageProvider(ignored -> promptService.dagReactSystemPrompt())
+                .chatRequestTransformer(chatRequest -> {
+                    ensureRunnable(request);
+                    return chatRequest;
+                })
+                .build();
+    }
+
+    /**
+     * Side-effect-free 读取当前生效的预算配置，构造 BudgetStatus。
+     * 仅读 Nacos + Spring 配置 + 静态 @Value 默认值，不调用 {@code check()} / {@code exceeded()} / {@code incrementToolCallCount()}。
+     * 失败时返回 NONE（fail-soft，不影响 todo 正常执行）。
+     */
+    private BudgetStatus readBudgetStatus() {
+        try {
+            AgentRunBudgetService.EffectiveRunBudget budget = budgetService.effectiveConfig();
+            boolean anyLimit = budget.maxWallClockMs() > 0
+                    || budget.maxLlmCalls() > 0
+                    || budget.maxToolCalls() > 0
+                    || budget.maxTokens() > 0;
+            return new BudgetStatus(anyLimit, BUDGET_CONFIG_ONLY);
+        } catch (Exception e) {
+            log.debug("budget observation read failed (will treat as no budget): {}", e.getMessage());
+            return BudgetStatus.NONE;
+        }
+    }
+
+    /**
+     * 从已完成 todo 列表反推最后一个非空 todo 的 id。注意不是 eventType，是 todo id。
+     * 仅用于辅助排障定位上下文挤压源，不参与决策。
+     */
+    private static String lastNonEmptyTodoId(List<LangchainCompletedTodo> completedTodos) {
+        if (completedTodos == null || completedTodos.isEmpty()) {
+            return null;
+        }
+        for (int i = completedTodos.size() - 1; i >= 0; i--) {
+            LangchainCompletedTodo t = completedTodos.get(i);
+            if (t != null && t.displayOutput() != null && !t.displayOutput().isBlank()) {
+                return t.getTodoId();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Best-effort 取执行模型的 class 简名（如 {@code OpenRouterProviderRoutedChatModel}）。
+     * LC4j ChatModel 接口没有暴露 model name / provider 字段，这里仅做 class 维度的可读性记录。
+     */
+    private static String modelClassName(dev.langchain4j.model.chat.ChatModel model) {
+        if (model == null) {
+            return null;
+        }
+        return model.getClass().getSimpleName();
     }
 
     /**

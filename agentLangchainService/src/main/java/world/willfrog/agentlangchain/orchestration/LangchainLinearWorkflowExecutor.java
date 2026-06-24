@@ -116,7 +116,8 @@ public class LangchainLinearWorkflowExecutor {
                 for (TodoItem remaining : plan.getItems()) {
                     if (remaining.getSequence() >= item.getSequence()) {
                         emitTodoNodeEvent(request.getRunId(), request.getUserId(),
-                                "TODO_NODE_SKIPPED", remaining, "run_canceled", 0);
+                                "TODO_NODE_SKIPPED", remaining, "run_canceled", 0,
+                                null, false, null);
                     }
                 }
                 return interrupted(plan, completedTodos, stop.get(), toolCalls.get());
@@ -124,20 +125,21 @@ public class LangchainLinearWorkflowExecutor {
             AgentContext.setPhase("linear_execution");
             AgentContext.setStage("todo_execution");
             emitTodoNodeEvent(request.getRunId(), request.getUserId(),
-                    "TODO_NODE_STARTED", item, null, 0);
+                    "TODO_NODE_STARTED", item, null, 0, null, false, null);
             long nodeStartMs = System.currentTimeMillis();
             LangchainTodoNodeResult nodeResult = todoNodeExecutor.execute(
                     request, item, completedTodos, datasetRefs, toolCalls);
             long nodeDurationMs = System.currentTimeMillis() - nodeStartMs;
             if (!nodeResult.isSuccess()) {
+                String reason = nvl(nodeResult.getFailureReason(), nodeResult.getSummary());
                 emitTodoNodeEvent(request.getRunId(), request.getUserId(),
-                        "TODO_NODE_FAILED", item,
-                        nvl(nodeResult.getFailureReason(), nodeResult.getSummary()), nodeDurationMs);
-                return failure(plan, completedTodos,
-                        nvl(nodeResult.getFailureReason(), nodeResult.getSummary()), toolCalls.get());
+                        "TODO_NODE_FAILED", item, reason, nodeDurationMs,
+                        nodeResult.getFailureMetadata(), false, null);
+                return failure(plan, completedTodos, reason, toolCalls.get(), nodeResult.getFailureMetadata());
             }
             emitTodoNodeEvent(request.getRunId(), request.getUserId(),
-                    "TODO_NODE_COMPLETED", item, null, nodeDurationMs);
+                    "TODO_NODE_COMPLETED", item, null, nodeDurationMs,
+                    null, nodeResult.isRecovered(), nodeResult.getRecoveryOutcome());
             String trimmed = nodeResult.getOutput();
             DatasetRefRegistry.registerFromJson(trimmed, datasetRefs);
             completedTodos.add(LangchainCompletedTodo.builder()
@@ -158,7 +160,7 @@ public class LangchainLinearWorkflowExecutor {
         AgentContext.setStage("final_answer");
         String finalAnswer = todoNodeExecutor.writeFinalAnswer(request, completedTodos);
         if (isBlank(finalAnswer)) {
-            return failure(plan, completedTodos, "empty_final_answer", toolCalls.get());
+            return failure(plan, completedTodos, "empty_final_answer", toolCalls.get(), null);
         }
         return LangchainLinearWorkflowResult.builder()
                 .success(true)
@@ -172,13 +174,15 @@ public class LangchainLinearWorkflowExecutor {
     private LangchainLinearWorkflowResult failure(LangchainTodoPlan plan,
                                                   List<LangchainCompletedTodo> completedTodos,
                                                   String reason,
-                                                  int toolCallsUsed) {
+                                                  int toolCallsUsed,
+                                                  Map<String, Object> failureMetadata) {
         return LangchainLinearWorkflowResult.builder()
                 .success(false)
                 .failureReason(reason)
                 .plan(plan)
                 .completedTodos(completedTodos)
                 .toolCallsUsed(toolCallsUsed)
+                .failureMetadata(failureMetadata)
                 .build();
     }
 
@@ -230,7 +234,9 @@ public class LangchainLinearWorkflowExecutor {
     }
 
     private void emitTodoNodeEvent(String runId, String userId, String eventType,
-                                    TodoItem item, String reason, long durationMs) {
+                                    TodoItem item, String reason, long durationMs,
+                                    Map<String, Object> failureMetadata,
+                                    boolean recovered, String recoveryOutcome) {
         if (isBlank(runId) || isBlank(userId)) {
             return;
         }
@@ -254,6 +260,18 @@ public class LangchainLinearWorkflowExecutor {
             } else {
                 payload.put("reason", reason);
             }
+        }
+        // recovery 成功标记：仅 TODO_NODE_COMPLETED 时填，TODO_NODE_FAILED 的 recovery 信息在 failureMetadata 里
+        if (!isStarted && recovered) {
+            payload.put("recovered", true);
+            if (!isBlank(recoveryOutcome)) {
+                payload.put("recovery_outcome", recoveryOutcome);
+            }
+        }
+        // empty_todo_output 结构化观测：failureMetadata 非空时写入子 map，
+        // 让压测报告 / dashboard 能直接消费，不必回 trace 翻
+        if (failureMetadata != null && !failureMetadata.isEmpty()) {
+            payload.put("empty_output_observation", failureMetadata);
         }
         try {
             eventService.append(runId, userId, eventType, payload);
