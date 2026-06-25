@@ -10,6 +10,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.exception.RunBudgetException;
 import world.willfrog.agent.platform.service.AgentPromptService;
 import world.willfrog.agent.platform.service.AgentRunBudgetService;
 import world.willfrog.agent.workflow.DatasetRefRegistry;
@@ -266,7 +267,8 @@ public class LangchainTodoNodeExecutor {
         } catch (Exception e) {
             // ensureRunnable 抛出的 RUN_INTERRUPTED 异常、tool loop 内的工具异常、LLM 超时等都会在这里捕获，
             // 统一转为失败结果；上层 DagWorkflowExecutor 根据 isSuccess() 决定是否 skip 下游节点
-            return LangchainTodoNodeResult.failure(e.getMessage());
+            Map<String, Object> budgetMetadata = extractBudgetFailureMetadata(e);
+            return LangchainTodoNodeResult.failure(e.getMessage(), budgetMetadata);
         } finally {
             // 清理 ThreadLocal，防止线程池复用时上下文串扰到下一个 run
             LangchainRepeatedToolCallContext.clear();
@@ -747,5 +749,68 @@ public class LangchainTodoNodeExecutor {
             out.add(0, SystemMessage.from(hint));
         }
         return out;
+    }
+
+    /**
+     * Phase 3.2 A3 M2 path: 从 catch 的异常中提取 budget 超限结构化字段，供 LangchainLinearWorkflowExecutor /
+     * LangchainDagWorkflowExecutor 在 partial / fail-fast 决策时识别。
+     * <p>
+     * 触发链路：{@link AgentRunBudgetService#checkBeforeLlmCall()} / {@link AgentRunBudgetService#checkBeforeToolCall()}
+     * 在 budget 超限时抛 {@link RunBudgetException}（继承 {@link IllegalStateException}），消息格式
+     * {@code RUN_BUDGET_EXCEEDED:<dimension>:<actual>/<limit>}。
+     * 旧版 catch 直接 {@code LangchainTodoNodeResult.failure(e.getMessage())} 把异常吞成普通 reason string，
+     * workflow 层无法区分 budget 超限 vs 其他 IllegalStateException。
+     * <p>
+     * 这里特判：如果 cause chain 任一环是 {@link RunBudgetException} 或异常消息以 {@code RUN_BUDGET_EXCEEDED:} 开头，
+     * 返回一个带 {@code budget_exceeded=true} + dimension/actual/limit/ratio 字段的 metadata map，
+     * 透传到 LangchainTodoNodeResult.failureMetadata → LangchainLinearWorkflowResult.failureMetadata →
+     * pipeline WORKFLOW_PARTIAL_BUDGET / WORKFLOW_FAILED_BUDGET event payload。
+     * <p>
+     * 非 budget 异常返回 null，与现有空 failureMetadata 行为一致。
+     */
+    static Map<String, Object> extractBudgetFailureMetadata(Throwable t) {
+        Throwable cur = t;
+        int depth = 0;
+        while (cur != null && depth < 8) {
+            if (cur instanceof RunBudgetException rbe) {
+                Map<String, Object> meta = new LinkedHashMap<>();
+                meta.put("budget_exceeded", true);
+                meta.put("dimension", rbe.getDimension());
+                meta.put("actual", rbe.getActual());
+                meta.put("limit", rbe.getLimit());
+                meta.put("ratio", rbe.getRatio());
+                meta.put("partial", rbe.isPartial());
+                return meta;
+            }
+            String msg = cur.getMessage();
+            if (msg != null && msg.startsWith("RUN_BUDGET_EXCEEDED:")) {
+                // 兜底路径：当上游包了一层（如 RuntimeException 套 RunBudgetException），
+                // 从 message 里拆出 dimension / actual / limit 三段（format = RUN_BUDGET_EXCEEDED:<dim>:<actual>/<limit>）
+                Map<String, Object> meta = new LinkedHashMap<>();
+                meta.put("budget_exceeded", true);
+                String[] parts = msg.split(":", 3);
+                if (parts.length >= 2) {
+                    meta.put("dimension", parts[1]);
+                }
+                if (parts.length >= 3) {
+                    String[] ratio = parts[2].split("/");
+                    if (ratio.length == 2) {
+                        try {
+                            long actual = Long.parseLong(ratio[0]);
+                            long limit = Long.parseLong(ratio[1]);
+                            meta.put("actual", actual);
+                            meta.put("limit", limit);
+                            meta.put("ratio", limit > 0 ? ((double) actual) / limit : 0.0);
+                        } catch (NumberFormatException nfe) {
+                            // 解析失败保留 dimension 字段，actual/limit/ratio 省略
+                        }
+                    }
+                }
+                return meta;
+            }
+            cur = cur.getCause();
+            depth++;
+        }
+        return null;
     }
 }

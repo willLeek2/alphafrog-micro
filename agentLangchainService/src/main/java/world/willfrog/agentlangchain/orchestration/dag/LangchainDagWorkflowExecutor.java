@@ -16,6 +16,7 @@ import world.willfrog.agentlangchain.orchestration.LangchainLinearWorkflowResult
 import world.willfrog.agentlangchain.orchestration.LangchainRunExecutionGuard;
 import world.willfrog.agentlangchain.orchestration.LangchainTodoNodeExecutor;
 import world.willfrog.agentlangchain.orchestration.LangchainTodoNodeResult;
+import world.willfrog.agentlangchain.orchestration.LangchainBudgetPartialAnswerBuilder;
 
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.SystemMessage;
@@ -158,14 +159,23 @@ public class LangchainDagWorkflowExecutor {
             }
 
             // DAG recovery judge：开关开启 + 存在失败节点时，用 LLM 判定能否温和降级（跳过部分失败节点、用已完成节点生成部分答案）
-            if (recoveryJudgeEnabled && hasFailedNode(parallelRun.results(), items)) {
-                LangchainLinearWorkflowResult judgeResult = tryRecoveryJudge(
-                        request, plan, graph, items, parallelRun.results(), sharedContext,
-                        completedTodos, toolCalls, runId, userId);
-                if (judgeResult != null) {
-                    return judgeResult;
+            // Phase 3.2 A3 G1: budget 触顶时**绕过** recovery judge —— budget 已超限，再让 LLM 判定会立即再触发 RunBudgetException。
+            // 直接走 handleBudgetExhaustion 路径（partial if completedTodos 非空 / fail-fast 否则）。
+            if (hasFailedNode(parallelRun.results(), items)) {
+                Map<String, Object> budgetMeta = findBudgetFailureMetadata(parallelRun.results());
+                if (budgetMeta != null) {
+                    return handleBudgetExhaustion(request, plan, completedTodos,
+                            nvl(firstFailedReason(parallelRun.results())), budgetMeta, toolCalls.get());
                 }
-                // judge 返回 null = NO 判定 → 不走降级，继续走下方普通失败路径
+                if (recoveryJudgeEnabled) {
+                    LangchainLinearWorkflowResult judgeResult = tryRecoveryJudge(
+                            request, plan, graph, items, parallelRun.results(), sharedContext,
+                            completedTodos, toolCalls, runId, userId);
+                    if (judgeResult != null) {
+                        return judgeResult;
+                    }
+                    // judge 返回 null = NO 判定 → 不走降级，继续走下方普通失败路径
+                }
             }
 
             // 遍历所有节点结果。这里需要区分三种情况：
@@ -874,6 +884,25 @@ public class LangchainDagWorkflowExecutor {
     }
 
     /**
+     * Phase 3.2 A3 G2: 带 failureMetadata 的 failure overload，让 budget 等结构化失败原因能透传到 pipeline。
+     * 原 4 参 failure() 保留，供 DAG 普通失败路径（非 budget）继续走。
+     */
+    private LangchainLinearWorkflowResult failure(LangchainTodoPlan plan,
+                                                  List<LangchainCompletedTodo> completedTodos,
+                                                  String reason,
+                                                  int toolCallsUsed,
+                                                  Map<String, Object> failureMetadata) {
+        return LangchainLinearWorkflowResult.builder()
+                .success(false)
+                .failureReason(reason)
+                .plan(plan)
+                .completedTodos(completedTodos)
+                .toolCallsUsed(toolCallsUsed)
+                .failureMetadata(failureMetadata)
+                .build();
+    }
+
+    /**
      * 构建被中断结果对象（用户 cancel/pause）。
      */
     private LangchainLinearWorkflowResult interrupted(LangchainTodoPlan plan,
@@ -888,6 +917,147 @@ public class LangchainDagWorkflowExecutor {
                 .completedTodos(completedTodos)
                 .toolCallsUsed(toolCallsUsed)
                 .build();
+    }
+
+    // ========== Phase 3.2 A3 G1/G3: budget 触顶时的确定性降级（DAG 端） ==========
+
+    /**
+     * 扫描所有节点结果，返回第一个带 {@code budget_exceeded=true} 的 failureMetadata；无则返 null。
+     * 与 Linear 端的 {@code handleBudgetExhaustion} 入口共用；Linear 端在 single-node 失败时直接拿到，
+     * DAG 端需要遍历是因为多节点并行时可能有多个失败。
+     */
+    private Map<String, Object> findBudgetFailureMetadata(Map<String, LangchainTodoNodeResult> results) {
+        if (results == null) return null;
+        for (LangchainTodoNodeResult r : results.values()) {
+            if (r == null) continue;
+            Map<String, Object> meta = r.getFailureMetadata();
+            if (meta != null && Boolean.TRUE.equals(meta.get("budget_exceeded"))) {
+                return meta;
+            }
+        }
+        return null;
+    }
+
+    /** 取首个失败节点的 summary/failureReason 作为 budget exhausted 的对外 reason。 */
+    private String firstFailedReason(Map<String, LangchainTodoNodeResult> results) {
+        if (results == null) return "RUN_BUDGET_EXCEEDED";
+        for (LangchainTodoNodeResult r : results.values()) {
+            if (r != null && !r.isSuccess()) {
+                String s = r.getFailureReason();
+                if (s == null) s = r.getSummary();
+                if (s != null && !s.isBlank()) return s;
+            }
+        }
+        return "RUN_BUDGET_EXCEEDED";
+    }
+
+    /**
+     * Phase 3.2 A3 G3: DAG 端 budget 触顶降级，逻辑与 Linear 一致（共用 {@link LangchainBudgetPartialAnswerBuilder}）。
+     * 区别：还会发 {@code DAG_EXECUTION_COMPLETED} 事件（partial/fail-fast 状态）保持与普通 DAG 完成事件兼容。
+     */
+    private LangchainLinearWorkflowResult handleBudgetExhaustion(LangchainLinearWorkflowRequest request,
+                                                                  LangchainTodoPlan plan,
+                                                                  List<LangchainCompletedTodo> completedTodos,
+                                                                  String reason,
+                                                                  Map<String, Object> budgetMetadata,
+                                                                  int toolCallsUsed) {
+        String runId = request.getRunId();
+        String userId = request.getUserId();
+        String dimension = nvl(String.valueOf(budgetMetadata.get("dimension")), "unknown");
+        long actual = toLong(budgetMetadata.get("actual"));
+        long limit = toLong(budgetMetadata.get("limit"));
+        double ratio = toDouble(budgetMetadata.get("ratio"));
+
+        if (!completedTodos.isEmpty()) {
+            LangchainBudgetPartialAnswerBuilder.PartialAnswer partial =
+                    LangchainBudgetPartialAnswerBuilder.build(completedTodos);
+            String partialReason = "RUN_BUDGET_EXCEEDED:" + dimension + ":" + actual + "/" + limit
+                    + " — partial answer built from " + partial.includedTodoCount() + " completed todo(s)";
+            LangchainLinearWorkflowResult result = LangchainLinearWorkflowResult.builder()
+                    .success(false)
+                    .partial(true)
+                    .failureReason(partialReason)
+                    .finalAnswer(partial.finalAnswer())
+                    .plan(plan)
+                    .completedTodos(completedTodos)
+                    .toolCallsUsed(toolCallsUsed)
+                    .failureMetadata(budgetMetadata)
+                    .build();
+            if (!isBlank(runId) && !isBlank(userId)) {
+                Map<String, Object> payload = new LinkedHashMap<>();
+                payload.putAll(LangchainBudgetPartialAnswerBuilder.completedTodoIdsPayload(completedTodos));
+                payload.put("dimension", dimension);
+                payload.put("actual", actual);
+                payload.put("limit", limit);
+                payload.put("ratio", ratio);
+                payload.put("final_answer", partial.finalAnswer());
+                payload.put("final_answer_length", partial.finalAnswerLength());
+                payload.put("final_answer_included_todo_count", partial.includedTodoCount());
+                payload.put("final_answer_skipped_todo_count", partial.skippedTodoCount());
+                payload.put("final_answer_original_total_length", partial.originalTotalLength());
+                payload.put("tool_calls_used", toolCallsUsed);
+                payload.put("failure_reason", partialReason);
+                try {
+                    eventService.append(runId, userId, "WORKFLOW_PARTIAL_BUDGET", payload);
+                } catch (Exception e) {
+                    // 事件失败不影响降级结果
+                }
+                appendDagCompletedPartial(runId, userId, partialReason, toolCallsUsed);
+            }
+            return result;
+        }
+
+        String failedReason = "RUN_BUDGET_EXCEEDED:" + dimension + ":" + actual + "/" + limit
+                + " — no completed todo, fail-fast";
+        LangchainLinearWorkflowResult result = LangchainLinearWorkflowResult.builder()
+                .success(false)
+                .failureReason(failedReason)
+                .plan(plan)
+                .completedTodos(completedTodos)
+                .toolCallsUsed(toolCallsUsed)
+                .failureMetadata(budgetMetadata)
+                .build();
+        if (!isBlank(runId) && !isBlank(userId)) {
+            Map<String, Object> payload = new LinkedHashMap<>();
+            payload.put("dimension", dimension);
+            payload.put("actual", actual);
+            payload.put("limit", limit);
+            payload.put("ratio", ratio);
+            payload.put("completed_todo_count", 0);
+            payload.put("tool_calls_used", toolCallsUsed);
+            payload.put("failure_reason", failedReason);
+            try {
+                eventService.append(runId, userId, "WORKFLOW_FAILED_BUDGET", payload);
+            } catch (Exception e) {
+                // 事件失败不影响降级结果
+            }
+            appendDagCompleted(runId, userId, false, failedReason, toolCallsUsed);
+        }
+        return result;
+    }
+
+    private static long toLong(Object value) {
+        if (value instanceof Number n) return n.longValue();
+        if (value instanceof String s) {
+            try {
+                return Long.parseLong(s);
+            } catch (NumberFormatException nfe) {
+                return 0L;
+            }
+        }
+        return 0L;
+    }
+
+    private static double toDouble(Object value) {
+        if (value instanceof Number n) return n.doubleValue();
+        if (value instanceof String s) {
+            try {
+                return Double.parseDouble(s);
+            } catch (NumberFormatException nfe) {
+                return 0.0;
+            }
+        }
+        return 0.0;
     }
 
     /**
