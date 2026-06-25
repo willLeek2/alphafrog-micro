@@ -14,7 +14,6 @@ import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.exception.RunBudgetException;
 
-import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
@@ -120,7 +119,7 @@ class AgentRunBudgetServiceTest {
         local.getRuntime().setRunBudget(runBudget);
         when(localConfigLoader.current()).thenReturn(Optional.of(local));
         stubObservability(8L, 0L, 0L);
-        lenient().when(stateStore.hasBudgetProgressWarned("run-1", "tool_calls")).thenReturn(false);
+        when(stateStore.tryMarkBudgetProgressWarned("run-1", "tool_calls")).thenReturn(true);
 
         service.checkBeforeToolCall();
 
@@ -131,7 +130,7 @@ class AgentRunBudgetServiceTest {
         assertEquals(8L, payload.get("actual"));
         assertEquals(10L, payload.get("limit"));
         assertEquals(0.8, ((Number) payload.get("ratio")).doubleValue(), 0.001);
-        verify(stateStore).markBudgetProgressWarned("run-1", "tool_calls");
+        verify(stateStore).tryMarkBudgetProgressWarned("run-1", "tool_calls");
     }
 
     @Test
@@ -146,23 +145,24 @@ class AgentRunBudgetServiceTest {
         service.checkBeforeToolCall();
 
         verify(eventService, never()).append(eq("run-1"), eq("user-1"), eq("BUDGET_PROGRESS"), any(Map.class));
-        verify(stateStore, never()).markBudgetProgressWarned(any(), any());
+        verify(stateStore, never()).tryMarkBudgetProgressWarned(any(), any());
     }
 
     @Test
-    void check_shouldNotReEmitBudgetProgressForSameRunIdDimension() {
+    void check_shouldNotEmitWhenAtomicGateReturnsFalse() {
+        // 模拟并发场景：另一个线程抢先 SADD 成功，本线程拿不到原子 gate → 不发事件
         AgentLlmProperties local = new AgentLlmProperties();
         AgentLlmProperties.RunBudget runBudget = new AgentLlmProperties.RunBudget();
         runBudget.setMaxToolCalls(10L);
         local.getRuntime().setRunBudget(runBudget);
         when(localConfigLoader.current()).thenReturn(Optional.of(local));
         stubObservability(8L, 0L, 0L);
-        lenient().when(stateStore.hasBudgetProgressWarned("run-1", "tool_calls")).thenReturn(true);
+        when(stateStore.tryMarkBudgetProgressWarned("run-1", "tool_calls")).thenReturn(false);
 
         service.checkBeforeToolCall();
 
         verify(eventService, never()).append(eq("run-1"), eq("user-1"), eq("BUDGET_PROGRESS"), any(Map.class));
-        verify(stateStore, never()).markBudgetProgressWarned(any(), any());
+        verify(stateStore).tryMarkBudgetProgressWarned("run-1", "tool_calls");
     }
 
     @Test
@@ -173,26 +173,11 @@ class AgentRunBudgetServiceTest {
         local.getRuntime().setRunBudget(runBudget);
         when(localConfigLoader.current()).thenReturn(Optional.of(local));
         stubObservability(10L, 0L, 0L);
-        lenient().when(stateStore.hasBudgetProgressWarned("run-1", "tool_calls")).thenReturn(false);
 
         assertThrows(RunBudgetException.class, service::checkBeforeToolCall);
 
         verify(eventService, never()).append(eq("run-1"), eq("user-1"), eq("BUDGET_PROGRESS"), any(Map.class));
         verify(eventService).append(eq("run-1"), eq("user-1"), eq("RUN_BUDGET_EXCEEDED"), any(Map.class));
-    }
-
-    private AgentLlmProperties localBudget(long maxWallClockMs,
-                                            long maxLlmCalls,
-                                            long maxToolCalls,
-                                            long maxTokens) {
-        AgentLlmProperties local = new AgentLlmProperties();
-        AgentLlmProperties.RunBudget runBudget = new AgentLlmProperties.RunBudget();
-        runBudget.setMaxWallClockMs(maxWallClockMs);
-        runBudget.setMaxLlmCalls(maxLlmCalls);
-        runBudget.setMaxToolCalls(maxToolCalls);
-        runBudget.setMaxTokens(maxTokens);
-        local.getRuntime().setRunBudget(runBudget);
-        return local;
     }
 
     private void stubObservability(long toolCalls, long llmCalls, long totalTokens) {

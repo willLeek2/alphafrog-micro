@@ -242,8 +242,10 @@ public class AgentRunBudgetService {
 
     /**
      * 单维度 80% 阈值检查：未告警且 {@code ratio ∈ [0.80, 1.00)} 时写 {@code BUDGET_PROGRESS} 并打标。
-     * 去重基于 {@link AgentRunStateStore#hasBudgetProgressWarned} / {@link AgentRunStateStore#markBudgetProgressWarned}，
-     * 保证同一 runId + dimension 组合只发一次。
+     * 去重基于 {@link AgentRunStateStore#tryMarkBudgetProgressWarned} 的 Redis SADD 原子语义，
+     * 保证同一 {@code (runId, dimension)} 组合在并发场景（并行 DAG 节点、并发 LLM/tool 入口）下也只发一次事件。
+     * <p>不能用 {@code hasBudgetProgressWarned → markBudgetProgressWarned} 两步走——
+     * 两步之间会被其他线程插队，导致同维度重复发 {@code BUDGET_PROGRESS}。</p>
      */
     private void checkDimension(String runId, String userId, String dimension, long actual, long limit) {
         if (limit <= 0 || actual < 0) {
@@ -253,10 +255,10 @@ public class AgentRunBudgetService {
         if (ratio < 0.80 || ratio >= 1.00) {
             return;
         }
-        if (stateStore.hasBudgetProgressWarned(runId, dimension)) {
+        if (!stateStore.tryMarkBudgetProgressWarned(runId, dimension)) {
+            // 已被其它线程抢先标记 → 本轮跳过，不再发事件
             return;
         }
-        stateStore.markBudgetProgressWarned(runId, dimension);
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("dimension", dimension);
         payload.put("actual", actual);

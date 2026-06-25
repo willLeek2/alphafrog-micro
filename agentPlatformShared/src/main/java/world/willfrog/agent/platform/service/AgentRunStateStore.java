@@ -422,22 +422,29 @@ public class AgentRunStateStore {
     }
 
     /**
-     * 标记某个 dimension 在本 run 已发过 80% 预算进度告警。
-     * 写入 Redis Set（key = {@code agent:run:{runId}:budget_progress_warned}），元素名为 dimension（wall_clock_ms / llm_calls / tool_calls / tokens）。
-     * 配合 {@link #hasBudgetProgressWarned} 实现"首次跨过 80% 才发一次"的去重。
+     * 原子地尝试标记某个 dimension 在本 run 已发过 80% 预算进度告警。
+     * 利用 Redis {@code SADD} 的原子语义（元素不存在时返回 1，已存在时返回 0），
+     * 保证同 {@code (runId, dimension)} 组合在并发场景（并行 DAG 节点、并发 LLM/tool 入口）下也只发一次 {@code BUDGET_PROGRESS} 事件。
+     * <p>调用方应只在返回 {@code true} 时发出事件；返回 {@code false} 表示已被其它线程抢先标记，应跳过。</p>
+     *
+     * @return true 表示本次新加入（应当前调用方发事件）；false 表示已存在（应跳过）
      */
-    public void markBudgetProgressWarned(String runId, String dimension) {
+    public boolean tryMarkBudgetProgressWarned(String runId, String dimension) {
         if (blank(runId) || blank(dimension)) {
-            return;
+            return false;
         }
-        redisTemplate.opsForSet().add(budgetProgressWarnedKey(runId), dimension);
+        Long added = redisTemplate.opsForSet().add(budgetProgressWarnedKey(runId), dimension);
         touch(budgetProgressWarnedKey(runId));
+        return added != null && added > 0;
     }
 
     /**
-     * 查询某 dimension 是否已发过 80% 预算进度告警。
+     * 非破坏性查询某 dimension 是否已发过 80% 预算进度告警。
+     * 不修改 Redis 状态，用于监控/测试的只读场景。
+     * <p>注意：发事件路径请使用 {@link #tryMarkBudgetProgressWarned} 原子 gate，
+     * 不要先 {@code has} 再 {@code mark} 两步走——并发下两步之间会被其他线程插队导致重复事件。</p>
      *
-     * @return true 表示已发过（应跳过再次发送），false 表示尚未发过（可触发 BUDGET_PROGRESS 事件）
+     * @return true 表示已发过，false 表示尚未发过
      */
     public boolean hasBudgetProgressWarned(String runId, String dimension) {
         if (blank(runId) || blank(dimension)) {
