@@ -1,7 +1,12 @@
 package world.willfrog.agentlangchain.failure;
 
 import org.junit.jupiter.api.Test;
+import world.willfrog.agent.platform.exception.ProviderChatException;
+import world.willfrog.agent.platform.exception.ProviderFailureCategory;
+import world.willfrog.agent.platform.exception.RunBudgetException;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -27,6 +32,76 @@ class LangchainFailureMapperTest {
         assertEquals("RunBudgetExceeded", decision.getObservabilityFailureType());
         assertEquals("todo_1", decision.getEventPayload().get("todo_id"));
         assertEquals(12, decision.getEventPayload().get("tool_calls_used"));
+        assertEquals("budget_exceeded_wall_clock", decision.getEventPayload().get("failure_category"));
+        assertEquals("wall_clock_ms", decision.getEventPayload().get("dimension"));
+    }
+
+    @Test
+    void map_shouldMapTypedRunBudgetException() {
+        RunBudgetException ex = new RunBudgetException("llm_calls", 50, 50, false);
+
+        LangchainFailureDecision decision = mapper.map(
+                "execution", "todo_2", null, null, null, ex, 5);
+
+        assertEquals(AgentRunStatus.FAILED, decision.getRunStatus());
+        assertEquals("RUN_BUDGET_EXCEEDED", decision.getEventType());
+        assertEquals(LangchainFailureCategory.BUDGET_EXCEEDED_LLM_CALLS, decision.getCategory());
+        assertFalse(decision.isRetryable());
+        assertEquals("budget_exceeded_llm_calls", decision.getEventPayload().get("failure_category"));
+        assertEquals("llm_calls", decision.getEventPayload().get("dimension"));
+        assertEquals(50L, decision.getEventPayload().get("actual"));
+        assertEquals(50L, decision.getEventPayload().get("limit"));
+        assertEquals(false, decision.getEventPayload().get("partial"));
+    }
+
+    @Test
+    void map_shouldMapTypedProviderChatException() {
+        ProviderChatException ex = ProviderChatException.of(
+                502,
+                "bad_gateway",
+                List.of("fireworks"),
+                "moonshotai/kimi-k2.5",
+                "openrouter",
+                "bad gateway",
+                ProviderFailureCategory.TRANSIENT_NETWORK,
+                null
+        );
+
+        LangchainFailureDecision decision = mapper.map(
+                "execution", "todo_3", null, null, null, ex, 2);
+
+        assertEquals(AgentRunStatus.FAILED, decision.getRunStatus());
+        assertEquals("WORKFLOW_FAILED", decision.getEventType());
+        assertEquals(LangchainFailureCategory.PROVIDER_TRANSIENT, decision.getCategory());
+        assertTrue(decision.isRetryable());
+        assertEquals("ProviderTransientNetwork", decision.getObservabilityFailureType());
+        assertEquals("provider_transient_network", decision.getEventPayload().get("failure_category"));
+        assertEquals("bad_gateway", decision.getEventPayload().get("error_code"));
+        assertEquals(List.of("fireworks"), decision.getEventPayload().get("provider_order"));
+        assertEquals("moonshotai/kimi-k2.5", decision.getEventPayload().get("model"));
+        assertEquals("openrouter", decision.getEventPayload().get("endpoint"));
+    }
+
+    @Test
+    void map_shouldFindTypedProviderCauseThroughWrapper() {
+        ProviderChatException inner = ProviderChatException.of(
+                429,
+                "rate_limit_exceeded",
+                List.of("fireworks"),
+                "moonshotai/kimi-k2.5",
+                "openrouter",
+                "rate limited",
+                ProviderFailureCategory.RATE_LIMIT,
+                null
+        );
+        RuntimeException wrapper = new RuntimeException("wrapper", inner);
+
+        LangchainFailureDecision decision = mapper.map(
+                "execution", "todo_4", null, "some failure", null, wrapper, 1);
+
+        assertEquals(LangchainFailureCategory.PROVIDER_RATE_LIMIT, decision.getCategory());
+        assertTrue(decision.isRetryable());
+        assertEquals("provider_rate_limit", decision.getEventPayload().get("failure_category"));
     }
 
     @Test
@@ -74,7 +149,30 @@ class LangchainFailureMapperTest {
     }
 
     @Test
-    void map_shouldMapUnknownToWorkflowFailed() {
+    void map_shouldScrubProviderApiKeyFromMapperPayload() {
+        String raw = "api_key=sk-live-xxxxxxxxxx in provider error body";
+        ProviderChatException ex = ProviderChatException.of(
+                401,
+                "unauthorized",
+                List.of("openrouter"),
+                "model",
+                "endpoint",
+                raw,
+                ProviderFailureCategory.AUTH_REJECTED,
+                null
+        );
+
+        LangchainFailureDecision decision = mapper.map(
+                "execution", "todo_secret", null, null, null, ex, 1);
+
+        assertFalse(decision.getReason().contains("sk-live-xxxxxxxxxx"));
+        assertFalse(String.valueOf(decision.getEventPayload().get("raw_message")).contains("sk-live-xxxxxxxxxx"));
+        assertFalse(String.valueOf(decision.getEventPayload().get("reason")).contains("sk-live-xxxxxxxxxx"));
+        assertTrue(String.valueOf(decision.getEventPayload().get("raw_message")).contains("<redacted>"));
+    }
+
+    @Test
+    void map_shouldMapUnknownException() {
         LangchainFailureDecision decision = mapper.map(
                 "summarizing",
                 null,

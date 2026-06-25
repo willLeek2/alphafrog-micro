@@ -9,6 +9,7 @@ import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.exception.ProviderFailureCategory;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -476,6 +477,101 @@ class OpenRouterProviderRoutedChatModelTest {
                 null,
                 null
         );
+    }
+
+    // ── Provider error classification tests (Phase 3.1) ──
+
+    @Test
+    void classifyProviderError_shouldMap400ContextLengthExceededToBadRequestTokenLimit() {
+        OpenRouterProviderRoutedChatModel model = createMinimalModel(List.of("fireworks"));
+        String body = "{\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"context too long\"}}";
+
+        ProviderFailureCategory category = (ProviderFailureCategory) ReflectionTestUtils.invokeMethod(
+                model, "classifyProviderError", 400, body, null, List.of("fireworks")
+        );
+
+        assertEquals(ProviderFailureCategory.BAD_REQUEST_TOKEN_LIMIT, category);
+    }
+
+    @Test
+    void classifyProviderError_shouldMap429ToRateLimit() {
+        OpenRouterProviderRoutedChatModel model = createMinimalModel(List.of("fireworks"));
+        String body = "{\"error\":{\"code\":\"rate_limit_exceeded\"}}";
+
+        ProviderFailureCategory category = (ProviderFailureCategory) ReflectionTestUtils.invokeMethod(
+                model, "classifyProviderError", 429, body, null, List.of("fireworks")
+        );
+
+        assertEquals(ProviderFailureCategory.RATE_LIMIT, category);
+    }
+
+    @Test
+    void classifyProviderError_shouldMap502ToTransientNetwork() {
+        OpenRouterProviderRoutedChatModel model = createMinimalModel(List.of("fireworks"));
+
+        ProviderFailureCategory category = (ProviderFailureCategory) ReflectionTestUtils.invokeMethod(
+                model, "classifyProviderError", 502, "bad gateway", null, List.of("fireworks")
+        );
+
+        assertEquals(ProviderFailureCategory.TRANSIENT_NETWORK, category);
+    }
+
+    @Test
+    void classifyProviderError_shouldMapNetworkConnectionLostToTransientNetwork() {
+        OpenRouterProviderRoutedChatModel model = createMinimalModel(List.of("fireworks"));
+
+        ProviderFailureCategory category = (ProviderFailureCategory) ReflectionTestUtils.invokeMethod(
+                model, "classifyProviderError", -1, "Network connection lost", null, List.of("fireworks")
+        );
+
+        assertEquals(ProviderFailureCategory.TRANSIENT_NETWORK, category);
+    }
+
+    @Test
+    void classifyProviderError_shouldMapSseIOExceptionToTransientNetwork() {
+        OpenRouterProviderRoutedChatModel model = createMinimalModel(List.of("fireworks"));
+
+        ProviderFailureCategory category = (ProviderFailureCategory) ReflectionTestUtils.invokeMethod(
+                model, "classifyProviderError", 200, "SSE stream idle timeout after 25s",
+                new IOException("SSE broken pipe"), List.of("fireworks")
+        );
+
+        assertEquals(ProviderFailureCategory.TRANSIENT_NETWORK, category);
+    }
+
+    @Test
+    void classifyProviderError_shouldMap404ModelNotFoundToModelUnavailable() {
+        OpenRouterProviderRoutedChatModel model = createMinimalModel(List.of("fireworks"));
+        String body = "{\"error\":{\"code\":\"model_not_found\"}}";
+
+        ProviderFailureCategory category = (ProviderFailureCategory) ReflectionTestUtils.invokeMethod(
+                model, "classifyProviderError", 404, body, null, List.of("fireworks")
+        );
+
+        assertEquals(ProviderFailureCategory.MODEL_UNAVAILABLE, category);
+    }
+
+    @Test
+    void extractErrorCodeFromBody_shouldReadNestedErrorCode() {
+        OpenRouterProviderRoutedChatModel model = createMinimalModel(List.of("fireworks"));
+
+        String code = (String) ReflectionTestUtils.invokeMethod(
+                model, "extractErrorCodeFromBody",
+                "{\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"x\"}}"
+        );
+
+        assertEquals("context_length_exceeded", code);
+    }
+
+    @Test
+    void extractErrorCodeFromBody_shouldReturnEmptyForNonJson() {
+        OpenRouterProviderRoutedChatModel model = createMinimalModel(List.of("fireworks"));
+
+        String code = (String) ReflectionTestUtils.invokeMethod(
+                model, "extractErrorCodeFromBody", "not json"
+        );
+
+        assertEquals("", code);
     }
 
 }

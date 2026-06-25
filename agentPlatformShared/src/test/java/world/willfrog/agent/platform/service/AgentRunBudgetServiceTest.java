@@ -11,12 +11,15 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.exception.RunBudgetException;
 
 import java.util.Map;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.when;
 
@@ -93,6 +96,13 @@ class AgentRunBudgetServiceTest {
 
         IllegalStateException ex = assertThrows(IllegalStateException.class, service::checkBeforeToolCall);
 
+        assertTrue(ex instanceof RunBudgetException);
+        RunBudgetException rbe = (RunBudgetException) ex;
+        assertEquals("tool_calls", rbe.getDimension());
+        assertEquals(2L, rbe.getActual());
+        assertEquals(2L, rbe.getLimit());
+        assertEquals(1.0, rbe.getRatio(), 0.001);
+        assertFalse(rbe.isPartial());
         assertEquals("RUN_BUDGET_EXCEEDED:tool_calls:2/2", ex.getMessage());
     }
 }

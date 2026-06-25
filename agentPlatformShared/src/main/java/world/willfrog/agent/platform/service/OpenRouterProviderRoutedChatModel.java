@@ -19,6 +19,9 @@ import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.exception.ProviderChatException;
+import world.willfrog.agent.platform.exception.ProviderFailureCategory;
+import world.willfrog.agent.platform.exception.RunBudgetException;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -34,6 +37,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 /**
@@ -274,14 +278,21 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
 
             if (statusCode >= 200 && statusCode < 300) {
                 if (attemptResult.streamError() != null || attemptResult.aggregateResult() == null) {
-                    if (attemptResult.streamError() instanceof RuntimeException runtimeException) {
-                        throw runtimeException;
-                    }
-                    throw new IllegalStateException(
-                            attemptResult.streamError() == null
-                                    ? "SSE stream aggregation returned no result"
-                                    : attemptResult.streamError().getMessage(),
-                            attemptResult.streamError()
+                    Exception streamError = attemptResult.streamError();
+                    String streamErrorMessage = streamError == null
+                            ? "SSE stream aggregation returned no result"
+                            : streamError.getMessage();
+                    ProviderFailureCategory category = classifyProviderError(
+                            statusCode, streamErrorMessage, streamError, providerOrder);
+                    throw ProviderChatException.of(
+                            statusCode,
+                            extractErrorCodeFromBody(streamErrorMessage),
+                            providerOrder,
+                            modelName,
+                            endpointName,
+                            streamErrorMessage,
+                            category,
+                            streamError
                     );
                 }
                 durationMs = System.currentTimeMillis() - requestStartedAt;
@@ -319,14 +330,26 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
                             .build();
                 }
             } else {
-                String detail = "OpenRouter provider routed chat completion failed"
+                ProviderFailureCategory category = classifyProviderError(
+                        statusCode, responseJson, null, providerOrder);
+                String errorCode = extractErrorCodeFromBody(responseJson);
+                String logDetail = "OpenRouter provider routed chat completion failed"
                         + " (http=" + statusCode
                         + ", providers=" + providerOrder
                         + ", model=" + OpenAiCompatibleChatModelSupport.nvl(modelName)
                         + ", error=" + OpenAiCompatibleChatModelSupport.shorten(responseJson)
                         + ", request=" + OpenAiCompatibleChatModelSupport.shorten(requestJson) + ")";
-                log.warn(detail);
-                throw new IllegalStateException(detail);
+                log.warn(logDetail);
+                throw ProviderChatException.of(
+                        statusCode,
+                        errorCode,
+                        providerOrder,
+                        modelName,
+                        endpointName,
+                        responseJson,
+                        category,
+                        null
+                );
             }
             
             // 解析响应体
@@ -372,6 +395,20 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
                             .build())
                     .build();
             
+        } catch (ProviderChatException | RunBudgetException e) {
+            // SSE live event: LLM call finished (typed error)
+            long durationMs = System.currentTimeMillis() - requestStartedAt;
+            String errorType = e.getClass().getSimpleName();
+            emitLlmCallFinished(llmTraceId, null, durationMs, null, null, errorType + ": " + e.getMessage(), null, attempts);
+
+            // ALP-25：上报 typed 异常
+            if (shouldCapture && observabilityService != null) {
+                reportLlmCall(llmTraceId, requestRecord, responseRecord, curlCommand, requestStartedAt, durationMs,
+                        errorType + ": " + e.getMessage(), null, null, attempts);
+            }
+
+            throw e;
+
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
 
@@ -699,9 +736,7 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
             }
             effectivePolicy.sleepBeforeRetry(attempt);
         }
-        if (lastException instanceof IOException ioException) {
-            throw ioException;
-        }
+        // 不再向上抛 raw IOException，让 doChat 统一包装成 ProviderChatException 并分类。
         return new AttemptResult(null, lastResponseRecord, lastStatusCode, lastErrorBody, attempts,
                 null, null, lastException);
     }
@@ -744,6 +779,115 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
             }
         }
         return builder;
+    }
+
+    /**
+     * 对 provider 返回的错误进行分类，产生稳定的 {@link ProviderFailureCategory}。
+     *
+     * <p>分类优先级（从高到低）：
+     * token limit / bad request → rate limit → auth rejected → model unavailable →
+     * transient network → unknown。</p>
+     */
+    private ProviderFailureCategory classifyProviderError(int statusCode,
+                                                          String errorBody,
+                                                          Throwable cause,
+                                                          List<String> currentProviderOrder) {
+        String code = extractErrorCodeFromBody(errorBody);
+        String bodyLower = errorBody == null ? "" : errorBody.toLowerCase(Locale.ROOT);
+        String codeLower = code.toLowerCase(Locale.ROOT);
+
+        // 1. Token / context length / bad request
+        if (statusCode == 400
+                || "bad_request".equals(codeLower)
+                || "invalid_request_error".equals(codeLower)) {
+            if (codeLower.contains("context_length_exceeded")
+                    || codeLower.contains("max_tokens")
+                    || codeLower.contains("token")
+                    || bodyLower.contains("context_length_exceeded")
+                    || bodyLower.contains("max_tokens")
+                    || bodyLower.contains("context length")) {
+                return ProviderFailureCategory.BAD_REQUEST_TOKEN_LIMIT;
+            }
+        }
+
+        // 2. Rate limit
+        if (statusCode == 429
+                || codeLower.contains("rate_limit")
+                || codeLower.contains("rate limit")
+                || bodyLower.contains("rate limit")
+                || bodyLower.contains("too many requests")) {
+            return ProviderFailureCategory.RATE_LIMIT;
+        }
+
+        // 3. Auth rejected
+        if (statusCode == 401 || statusCode == 403
+                || codeLower.contains("unauthorized")
+                || codeLower.contains("forbidden")
+                || codeLower.contains("auth")
+                || codeLower.contains("api_key")) {
+            return ProviderFailureCategory.AUTH_REJECTED;
+        }
+
+        // 4. Model unavailable
+        if (statusCode == 404
+                || codeLower.contains("model_not_found")
+                || codeLower.contains("model_unavailable")
+                || codeLower.contains("not_found")
+                || bodyLower.contains("model_not_found")
+                || bodyLower.contains("model_unavailable")) {
+            return ProviderFailureCategory.MODEL_UNAVAILABLE;
+        }
+
+        // 5. Transient network
+        if (statusCode == -1
+                || (statusCode >= 500 && statusCode <= 599)
+                || codeLower.contains("timeout")
+                || codeLower.contains("connection")
+                || codeLower.contains("internal server error")
+                || bodyLower.contains("network connection lost")
+                || bodyLower.contains("connection reset")
+                || bodyLower.contains("connection refused")
+                || bodyLower.contains("timeout")
+                || bodyLower.contains("timed out")
+                || bodyLower.contains("upstream unavailable")
+                || cause instanceof IOException) {
+            return ProviderFailureCategory.TRANSIENT_NETWORK;
+        }
+
+        return ProviderFailureCategory.UNKNOWN;
+    }
+
+    /**
+     * 从 provider 错误 JSON 中提取结构化错误码（{@code code} 或 {@code error.code}）。
+     * 解析失败时返回空串。
+     */
+    @SuppressWarnings("unchecked")
+    private String extractErrorCodeFromBody(String errorBody) {
+        if (errorBody == null || errorBody.isBlank()) {
+            return "";
+        }
+        try {
+            Map<String, Object> root = objectMapper.readValue(errorBody, new TypeReference<Map<String, Object>>() {
+            });
+            Object code = root.get("code");
+            if (code instanceof String s) {
+                return s;
+            }
+            Object error = root.get("error");
+            if (error instanceof Map<?, ?> errorMap) {
+                Object nestedCode = ((Map<String, Object>) errorMap).get("code");
+                if (nestedCode instanceof String s) {
+                    return s;
+                }
+                Object nestedMessage = ((Map<String, Object>) errorMap).get("message");
+                if (nestedMessage instanceof String s) {
+                    return s;
+                }
+            }
+        } catch (Exception ignored) {
+            // 非 JSON 错误体返回空串，后续用 keyword fallback
+        }
+        return "";
     }
 
     /**
