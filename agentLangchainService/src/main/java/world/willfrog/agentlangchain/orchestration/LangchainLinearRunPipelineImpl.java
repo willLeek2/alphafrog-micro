@@ -576,6 +576,16 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         // 260618-workspace-v0: 触发终态事件
         finalizationService.publishFinalizedEvent(runId, userId, AgentRunStatus.FAILED.name());
         Map<String, Object> payload = new LinkedHashMap<>(decision.getEventPayload());
+        // ccmax #59: empty_todo_output 结构化观测透传到最终 WORKFLOW_FAILED event payload。
+        // 主路径：以 result.failureMetadata 非空为准（executor 在 try 块内构造，不依赖 failureReason 字符串协议）。
+        // Fallback：failureReason 含 empty_todo_output 时也允许兼容（针对历史 / 未来 executor 还没填 metadata 的场景，但 fallback 不伪造 observation）。
+        Map<String, Object> failureMetadata = result == null ? null : result.getFailureMetadata();
+        if (failureMetadata != null && !failureMetadata.isEmpty()) {
+            payload.put("empty_output_observation", failureMetadata);
+        } else if (failureReason != null && failureReason.contains("empty_todo_output")) {
+            // legacy / 兼容路径：不写 observation 子 map，仅保留 failureReason 让 mapper 已经归类即可。
+            log.debug("empty_todo_output fallback path (no failureMetadata available), failureReason={}", failureReason);
+        }
         payload.put("engine", "agentLangchainService");
         eventService.append(runId, userId, decision.getEventType(), payload);
     }

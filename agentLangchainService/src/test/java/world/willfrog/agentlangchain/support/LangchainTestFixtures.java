@@ -76,7 +76,7 @@ public final class LangchainTestFixtures {
                 return null;
             }
         };
-        return new LangchainTodoNodeExecutor(promptService(), provider, noopExecutionGuard());
+        return new LangchainTodoNodeExecutor(promptService(), provider, noopExecutionGuard(), noopBudgetService(), noopStateStore());
     }
 
     public static LangchainTodoNodeExecutor todoNodeExecutor(Optional<dev.langchain4j.service.tool.ToolProvider> toolProvider) {
@@ -101,7 +101,26 @@ public final class LangchainTestFixtures {
                 return toolProvider.orElse(null);
             }
         };
-        return new LangchainTodoNodeExecutor(promptService(), provider, noopExecutionGuard());
+        return new LangchainTodoNodeExecutor(promptService(), provider, noopExecutionGuard(), noopBudgetService(), noopStateStore());
+    }
+
+    /**
+     * ccmax #59: noop budget service. effectiveConfig() returns all-zero (no limit) so shouldRecover() sees budgetHit=false.
+     */
+    public static world.willfrog.agent.platform.service.AgentRunBudgetService noopBudgetService() {
+        world.willfrog.agent.platform.service.AgentRunBudgetService budget = mock(world.willfrog.agent.platform.service.AgentRunBudgetService.class);
+        world.willfrog.agent.platform.service.AgentRunBudgetService.EffectiveRunBudget empty = new world.willfrog.agent.platform.service.AgentRunBudgetService.EffectiveRunBudget(0L, 0, 0, 0, 0);
+        when(budget.effectiveConfig()).thenReturn(empty);
+        return budget;
+    }
+
+    /**
+     * ccmax #59: noop state store. loadObservability() returns empty Optional so readBudgetStatus() fail-soft 为未命中。
+     */
+    public static world.willfrog.agent.platform.service.AgentRunStateStore noopStateStore() {
+        world.willfrog.agent.platform.service.AgentRunStateStore store = mock(world.willfrog.agent.platform.service.AgentRunStateStore.class);
+        when(store.loadObservability(any())).thenReturn(java.util.Optional.empty());
+        return store;
     }
 
     private static LangchainRunExecutionGuard noopExecutionGuard() {

@@ -66,11 +66,13 @@ class LangchainLinearWorkflowExecutorTest {
 
     @Test
     void execute_shouldFailWhenTodoOutputIsBlank() {
+        // ccmax #59: 第一次返回空 → executor 走 recovery（第二次）→ recovery 也空 → failure(empty_todo_output_after_recovery:...)
         QueueChatModel model = new QueueChatModel(
                 """
                 {"analysis":"linear","items":[{"id":"todo_1","sequence":1,"description":"查询"}],"extractedEntities":[]}
                 """,
-                "   "
+                "   ",  // 第一次：todo 执行返回空
+                "   "   // 第二次：recovery 也返回空 → empty_todo_output_after_recovery
         );
         LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
                 LangchainTestFixtures.planner(),
@@ -85,7 +87,7 @@ class LangchainLinearWorkflowExecutorTest {
                 .build());
 
         assertThat(result.isSuccess()).isFalse();
-        assertThat(result.getFailureReason()).isEqualTo("empty_todo_output:todo_1");
+        assertThat(result.getFailureReason()).isEqualTo("empty_todo_output_after_recovery:todo_1");
         assertThat(result.getFinalAnswer()).isNull();
     }
 
