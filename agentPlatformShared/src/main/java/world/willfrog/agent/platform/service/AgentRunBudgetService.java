@@ -178,6 +178,9 @@ public class AgentRunBudgetService {
         // 0. 预算进度告警（80% 阈值）：先发 BUDGET_PROGRESS，再做超限检查，
         //    这样在跨过 80% 的同一轮既能产出进度事件，也能在后续真正超限时正常抛 exceeded
         emitBudgetProgressIfNeeded(runId, userId, summary, budget, elapsed);
+        // 0b. 90% last-mile 提示：跨过 90% 时写 BUDGET_LAST_MILE 事件 + 写入 AgentContext.lastMileHint，
+        //     下一次 LLM 调用时 chatRequestTransformer 会读取并注入到 SystemMessage 促使 LLM 尽快给出最终结论
+        emitBudgetLastMileIfNeeded(runId, userId, summary, budget, elapsed);
         // 1. 挂钟时间检查：从 run 启动到当前的毫秒数
         if (budget.maxWallClockMs() > 0 && elapsed > budget.maxWallClockMs()) {
             throw exceeded("wall_clock_ms", elapsed, budget.maxWallClockMs());
@@ -265,6 +268,72 @@ public class AgentRunBudgetService {
         payload.put("limit", limit);
         payload.put("ratio", ratio);
         eventService.append(runId, userId, "BUDGET_PROGRESS", payload);
+    }
+
+    /**
+     * 90% last-mile 提示 —— 对四个维度逐一检查首次跨过 90% 阈值的情况，
+     * 对未提示过的 dimension 写入 {@code BUDGET_LAST_MILE} 事件并写入 {@link AgentContext#setLastMileHint} ThreadLocal，
+     * 促使 {@code LangchainTodoNodeExecutor} 下一次 {@code chatRequestTransformer} 把 hint 注入到 SystemMessage。
+     * 阈值逻辑：{@code ratio ∈ [0.90, 1.00)} 触发一次；其它情况跳过。
+     */
+    private void emitBudgetLastMileIfNeeded(String runId, String userId,
+                                            Map<String, Object> summary,
+                                            EffectiveRunBudget budget, long elapsed) {
+        if (runId == null || userId == null) {
+            return;
+        }
+        checkDimension90(runId, userId, "wall_clock_ms", elapsed, budget.maxWallClockMs());
+        checkDimension90(runId, userId, "llm_calls", toLong(summary.get("llmCalls")), budget.maxLlmCalls());
+        checkDimension90(runId, userId, "tool_calls", toLong(summary.get("toolCalls")), budget.maxToolCalls());
+        checkDimension90(runId, userId, "tokens", toLong(summary.get("totalTokens")), budget.maxTokens());
+    }
+
+    /**
+     * 单维度 90% 阈值检查：未提示且 {@code ratio ∈ [0.90, 1.00)} 时写 {@code BUDGET_LAST_MILE} 事件 + 写 last-mile hint。
+     * 去重基于 {@link AgentRunStateStore#tryMarkBudgetLastMileWarned} 的原子语义（同 80%）。
+     */
+    private void checkDimension90(String runId, String userId, String dimension, long actual, long limit) {
+        if (limit <= 0 || actual < 0) {
+            return;
+        }
+        double ratio = (double) actual / (double) limit;
+        if (ratio < 0.90 || ratio >= 1.00) {
+            return;
+        }
+        if (!stateStore.tryMarkBudgetLastMileWarned(runId, dimension)) {
+            return;
+        }
+        long ratioPct = (long) Math.floor(ratio * 100);
+        AgentContext.setLastMileHint(buildLastMileHint(dimension, actual, limit, ratioPct));
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("dimension", dimension);
+        payload.put("actual", actual);
+        payload.put("limit", limit);
+        payload.put("ratio", ratio);
+        payload.put("ratioPct", ratioPct);
+        eventService.append(runId, userId, "BUDGET_LAST_MILE", payload);
+    }
+
+    /**
+     * 拼装 90% last-mile hint 中文文本。
+     * 模板：{@code [last_mile_hint] 本 run 已使用 <pct>% <dim> 预算（<act>/<limit>），<advice>}
+     * advice 按维度区分：tokens 提示精简输出；tool_calls 提示精简工具调用；llm_calls 提示本轮直接给结论；wall_clock_ms 提示尽快完成。
+     */
+    private String buildLastMileHint(String dimension, long actual, long limit, long ratioPct) {
+        String advice;
+        if ("tokens".equals(dimension)) {
+            advice = "请精简回复，直接给出最终结论，避免长推理和重复工具调用。";
+        } else if ("tool_calls".equals(dimension)) {
+            advice = "请精简工具调用，必要时直接基于已有信息给出结论。";
+        } else if ("llm_calls".equals(dimension)) {
+            advice = "请尽量在当前调用内直接给出最终结论，避免再发起新一轮 LLM 调用。";
+        } else {
+            // wall_clock_ms
+            advice = "请尽快完成剩余 todo 并给出最终结论。";
+        }
+        return String.format(
+                "[last_mile_hint] 本 run 已使用 %d%% %s 预算（%d/%d），%s",
+                ratioPct, dimension, actual, limit, advice);
     }
 
     /** 从 Nacos 热加载配置读取 {@code runtime.runBudget}。 */

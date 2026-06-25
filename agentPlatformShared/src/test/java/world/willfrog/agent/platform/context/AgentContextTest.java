@@ -111,6 +111,51 @@ class AgentContextTest {
         assertFalse(childHasFreshness.get());
     }
 
+    // ── lastMileHint (Phase 3.2 A2: 90% budget progress) ──
+
+    @Test
+    void setAndGetLastMileHint_shouldReturnSameText() {
+        AgentContext.setLastMileHint("[last_mile_hint] 90% tool_calls budget");
+        assertEquals("[last_mile_hint] 90% tool_calls budget", AgentContext.getLastMileHint());
+    }
+
+    @Test
+    void setLastMileHintNullOrBlank_shouldRemoveHolder() {
+        AgentContext.setLastMileHint("anything");
+        AgentContext.setLastMileHint(null);
+        assertNull(AgentContext.getLastMileHint());
+
+        AgentContext.setLastMileHint("anything");
+        AgentContext.setLastMileHint("   ");
+        assertNull(AgentContext.getLastMileHint());
+    }
+
+    @Test
+    void clear_shouldRemoveLastMileHint() {
+        AgentContext.setLastMileHint("hint");
+        AgentContext.clear();
+        assertNull(AgentContext.getLastMileHint());
+    }
+
+    @Test
+    void captureAndRestore_shouldPreserveLastMileHintInChildThread() throws Exception {
+        AgentContext.setRunId("run-1");
+        AgentContext.setLastMileHint("[last_mile_hint] 92% tokens");
+        AgentContext.ContextSnapshot snapshot = AgentContext.captureRunContext();
+
+        CountDownLatch latch = new CountDownLatch(1);
+        AtomicReference<String> childHint = new AtomicReference<>();
+        new Thread(() -> {
+            AgentContext.restoreRunContext(snapshot);
+            childHint.set(AgentContext.getLastMileHint());
+            AgentContext.clear();
+            latch.countDown();
+        }).start();
+
+        latch.await();
+        assertEquals("[last_mile_hint] 92% tokens", childHint.get());
+    }
+
     // ── helper ──
 
     private static AgentLlmProperties.DataFreshness freshness(String start, String end, String asOf, String desc) {

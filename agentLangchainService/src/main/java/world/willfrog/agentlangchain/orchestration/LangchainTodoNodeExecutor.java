@@ -1,5 +1,8 @@
 package world.willfrog.agentlangchain.orchestration;
 
+import dev.langchain4j.data.message.ChatMessage;
+import dev.langchain4j.data.message.SystemMessage;
+import dev.langchain4j.model.chat.request.ChatRequest;
 import dev.langchain4j.service.AiServices;
 import dev.langchain4j.service.tool.ToolProvider;
 import lombok.RequiredArgsConstructor;
@@ -14,6 +17,7 @@ import world.willfrog.agent.workflow.TodoItem;
 import world.willfrog.agentlangchain.tools.LangchainDatasetRefContext;
 import world.willfrog.agentlangchain.tools.LangchainRepeatedToolCallContext;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -383,7 +387,7 @@ public class LangchainTodoNodeExecutor {
                 .systemMessageProvider(ignored -> promptService.dagReactSystemPrompt())
                 .chatRequestTransformer(chatRequest -> {
                     ensureRunnable(request);
-                    return chatRequest;
+                    return maybeInjectLastMileHint(chatRequest);
                 })
                 .build();
     }
@@ -580,7 +584,7 @@ public class LangchainTodoNodeExecutor {
                 .maxToolCallingRoundTrips(resolveMaxToolRoundTrips(request.getMaxToolRoundTrips()))
                 .chatRequestTransformer(chatRequest -> {
                     ensureRunnable(request);
-                    return chatRequest;
+                    return maybeInjectLastMileHint(chatRequest);
                 })
                 .beforeToolExecution(ignored -> ensureRunnable(request))
                 .toolExecutionErrorHandler(LangchainTerminalToolErrorHandler::handle)
@@ -615,7 +619,7 @@ public class LangchainTodoNodeExecutor {
                 .systemMessageProvider(ignored -> promptService.dagReactSystemPrompt())
                 .chatRequestTransformer(chatRequest -> {
                     ensureRunnable(request);
-                    return chatRequest;
+                    return maybeInjectLastMileHint(chatRequest);
                 })
                 .build();
     }
@@ -685,5 +689,63 @@ public class LangchainTodoNodeExecutor {
      */
     private boolean isBlank(String value) {
         return value == null || value.trim().isEmpty();
+    }
+
+    /**
+     * 把 {@link AgentContext#getLastMileHint()} 里待注入的 budget last-mile 提示合并到下一次 LLM 请求中。
+     * <p>
+     * 触发条件：{@link AgentRunBudgetService} 在 run 用量首次跨过 90% 阈值时把提示写入
+     * {@link AgentContext#setLastMileHint(String)}（per-run 一次性，原子 SADD gate 守门）。
+     * <p>
+     * 注入位置：拼到 ChatRequest.messages 的第一个 {@link SystemMessage} 末尾；
+     * 如果当前消息列表里没有 SystemMessage，则在列表头部新增一条承载提示的 SystemMessage。
+     * 注入后立即调用 {@link AgentContext#clearLastMileHint()} 清空 ThreadLocal，避免下次 tool-loop 再次消费同一份提示。
+     * <p>
+     * ChatRequest 的其他字段（{@code modelName} / {@code temperature} / {@code toolSpecifications} / {@code parameters} 等）
+     * 通过 LC4j 1.15.0 的 {@link ChatRequest#toBuilder()} 整体继承，只覆盖 {@code messages} 一项。
+     *
+     * @param chatRequest 本次 LLM 调用的原始请求对象
+     * @return 注入提示后的新 ChatRequest；ThreadLocal 无提示时原样返回
+     */
+    static ChatRequest maybeInjectLastMileHint(ChatRequest chatRequest) {
+        if (chatRequest == null) {
+            return null;
+        }
+        String hint = AgentContext.getLastMileHint();
+        if (hint == null || hint.isBlank()) {
+            return chatRequest;
+        }
+        List<ChatMessage> original = chatRequest.messages();
+        List<ChatMessage> rebuilt = rebuildMessagesWithHint(
+                original == null ? List.of() : original,
+                hint);
+        AgentContext.clearLastMileHint();
+        return chatRequest.toBuilder()
+                .messages(rebuilt)
+                .build();
+    }
+
+    /**
+     * 把 hint 文本合并到消息列表的第一个 SystemMessage；如果没有则前置一条新的 SystemMessage。
+     * <p>
+     * 仅对当前 list 做浅拷贝（{@link ArrayList#ArrayList(java.util.Collection)}），不动原引用。
+     * SystemMessage 文本拼接时使用 {@code "\n\n"} 分隔，保证与已有 prompt 之间有空行可读。
+     */
+    private static List<ChatMessage> rebuildMessagesWithHint(List<ChatMessage> original, String hint) {
+        List<ChatMessage> out = new ArrayList<>(original.size() + 1);
+        boolean injected = false;
+        for (ChatMessage msg : original) {
+            if (!injected && msg instanceof SystemMessage sm) {
+                String appended = sm.text() + "\n\n" + hint;
+                out.add(SystemMessage.from(appended));
+                injected = true;
+            } else {
+                out.add(msg);
+            }
+        }
+        if (!injected) {
+            out.add(0, SystemMessage.from(hint));
+        }
+        return out;
     }
 }
