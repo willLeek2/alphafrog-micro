@@ -6,6 +6,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.test.util.ReflectionTestUtils;
@@ -13,6 +14,7 @@ import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.exception.RunBudgetException;
 
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
@@ -20,7 +22,11 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
@@ -104,5 +110,95 @@ class AgentRunBudgetServiceTest {
         assertEquals(1.0, rbe.getRatio(), 0.001);
         assertFalse(rbe.isPartial());
         assertEquals("RUN_BUDGET_EXCEEDED:tool_calls:2/2", ex.getMessage());
+    }
+
+    @Test
+    void check_shouldEmitBudgetProgressEventWhenUsageCrosses80Pct() {
+        AgentLlmProperties local = new AgentLlmProperties();
+        AgentLlmProperties.RunBudget runBudget = new AgentLlmProperties.RunBudget();
+        runBudget.setMaxToolCalls(10L);
+        local.getRuntime().setRunBudget(runBudget);
+        when(localConfigLoader.current()).thenReturn(Optional.of(local));
+        stubObservability(8L, 0L, 0L);
+        lenient().when(stateStore.hasBudgetProgressWarned("run-1", "tool_calls")).thenReturn(false);
+
+        service.checkBeforeToolCall();
+
+        ArgumentCaptor<Map<String, Object>> captor = ArgumentCaptor.forClass(Map.class);
+        verify(eventService).append(eq("run-1"), eq("user-1"), eq("BUDGET_PROGRESS"), captor.capture());
+        Map<String, Object> payload = captor.getValue();
+        assertEquals("tool_calls", payload.get("dimension"));
+        assertEquals(8L, payload.get("actual"));
+        assertEquals(10L, payload.get("limit"));
+        assertEquals(0.8, ((Number) payload.get("ratio")).doubleValue(), 0.001);
+        verify(stateStore).markBudgetProgressWarned("run-1", "tool_calls");
+    }
+
+    @Test
+    void check_shouldNotEmitBudgetProgressBelowThreshold() {
+        AgentLlmProperties local = new AgentLlmProperties();
+        AgentLlmProperties.RunBudget runBudget = new AgentLlmProperties.RunBudget();
+        runBudget.setMaxToolCalls(10L);
+        local.getRuntime().setRunBudget(runBudget);
+        when(localConfigLoader.current()).thenReturn(Optional.of(local));
+        stubObservability(5L, 0L, 0L);
+
+        service.checkBeforeToolCall();
+
+        verify(eventService, never()).append(eq("run-1"), eq("user-1"), eq("BUDGET_PROGRESS"), any(Map.class));
+        verify(stateStore, never()).markBudgetProgressWarned(any(), any());
+    }
+
+    @Test
+    void check_shouldNotReEmitBudgetProgressForSameRunIdDimension() {
+        AgentLlmProperties local = new AgentLlmProperties();
+        AgentLlmProperties.RunBudget runBudget = new AgentLlmProperties.RunBudget();
+        runBudget.setMaxToolCalls(10L);
+        local.getRuntime().setRunBudget(runBudget);
+        when(localConfigLoader.current()).thenReturn(Optional.of(local));
+        stubObservability(8L, 0L, 0L);
+        lenient().when(stateStore.hasBudgetProgressWarned("run-1", "tool_calls")).thenReturn(true);
+
+        service.checkBeforeToolCall();
+
+        verify(eventService, never()).append(eq("run-1"), eq("user-1"), eq("BUDGET_PROGRESS"), any(Map.class));
+        verify(stateStore, never()).markBudgetProgressWarned(any(), any());
+    }
+
+    @Test
+    void check_shouldNotEmitBudgetProgressWhenAlreadyExceeded() {
+        AgentLlmProperties local = new AgentLlmProperties();
+        AgentLlmProperties.RunBudget runBudget = new AgentLlmProperties.RunBudget();
+        runBudget.setMaxToolCalls(10L);
+        local.getRuntime().setRunBudget(runBudget);
+        when(localConfigLoader.current()).thenReturn(Optional.of(local));
+        stubObservability(10L, 0L, 0L);
+        lenient().when(stateStore.hasBudgetProgressWarned("run-1", "tool_calls")).thenReturn(false);
+
+        assertThrows(RunBudgetException.class, service::checkBeforeToolCall);
+
+        verify(eventService, never()).append(eq("run-1"), eq("user-1"), eq("BUDGET_PROGRESS"), any(Map.class));
+        verify(eventService).append(eq("run-1"), eq("user-1"), eq("RUN_BUDGET_EXCEEDED"), any(Map.class));
+    }
+
+    private AgentLlmProperties localBudget(long maxWallClockMs,
+                                            long maxLlmCalls,
+                                            long maxToolCalls,
+                                            long maxTokens) {
+        AgentLlmProperties local = new AgentLlmProperties();
+        AgentLlmProperties.RunBudget runBudget = new AgentLlmProperties.RunBudget();
+        runBudget.setMaxWallClockMs(maxWallClockMs);
+        runBudget.setMaxLlmCalls(maxLlmCalls);
+        runBudget.setMaxToolCalls(maxToolCalls);
+        runBudget.setMaxTokens(maxTokens);
+        local.getRuntime().setRunBudget(runBudget);
+        return local;
+    }
+
+    private void stubObservability(long toolCalls, long llmCalls, long totalTokens) {
+        String json = """
+                {"summary":{"startedAtMillis":%d,"toolCalls":%d,"llmCalls":%d,"totalTokens":%d}}
+                """.formatted(System.currentTimeMillis(), toolCalls, llmCalls, totalTokens);
+        lenient().when(stateStore.loadObservability("run-1")).thenReturn(Optional.of(json));
     }
 }

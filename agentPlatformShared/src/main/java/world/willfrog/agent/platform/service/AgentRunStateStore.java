@@ -43,6 +43,12 @@ public class AgentRunStateStore {
     private static final String TOOL_CALL_COUNT_KEY = ":tool_call_count";
     private static final String PATCHED_PLAN_KEY = ":patched_plan";
 
+    /**
+     * 预算进度告警去重 key（Set 结构，元素为已发过 80% 告警的 dimension 名）。
+     * 用于保证 {@code BUDGET_PROGRESS} 事件在单个 run 内对每个 dimension 只发一次（首次跨过 80% 阈值时触发）。
+     */
+    private static final String BUDGET_PROGRESS_WARNED_KEY = ":budget_progress_warned";
+
     // legacy keys for read compatibility
     private static final String TASK_INDEX_KEY = ":tasks";
     private static final String TASK_KEY_PREFIX = ":task:";
@@ -415,6 +421,43 @@ public class AgentRunStateStore {
         touch(toolCallCountKey(runId));
     }
 
+    /**
+     * 标记某个 dimension 在本 run 已发过 80% 预算进度告警。
+     * 写入 Redis Set（key = {@code agent:run:{runId}:budget_progress_warned}），元素名为 dimension（wall_clock_ms / llm_calls / tool_calls / tokens）。
+     * 配合 {@link #hasBudgetProgressWarned} 实现"首次跨过 80% 才发一次"的去重。
+     */
+    public void markBudgetProgressWarned(String runId, String dimension) {
+        if (blank(runId) || blank(dimension)) {
+            return;
+        }
+        redisTemplate.opsForSet().add(budgetProgressWarnedKey(runId), dimension);
+        touch(budgetProgressWarnedKey(runId));
+    }
+
+    /**
+     * 查询某 dimension 是否已发过 80% 预算进度告警。
+     *
+     * @return true 表示已发过（应跳过再次发送），false 表示尚未发过（可触发 BUDGET_PROGRESS 事件）
+     */
+    public boolean hasBudgetProgressWarned(String runId, String dimension) {
+        if (blank(runId) || blank(dimension)) {
+            return false;
+        }
+        Boolean member = redisTemplate.opsForSet().isMember(budgetProgressWarnedKey(runId), dimension);
+        return Boolean.TRUE.equals(member);
+    }
+
+    /**
+     * 清空本 run 的 80% 预算进度告警去重 Set。
+     * 由 {@link #clear} 在 run 结束时统一调用；单独暴露用于测试和运维手工清理。
+     */
+    public void clearBudgetProgressWarned(String runId) {
+        if (blank(runId)) {
+            return;
+        }
+        redisTemplate.delete(budgetProgressWarnedKey(runId));
+    }
+
     public String buildProgressJson(String runId, String planJson) {
         JsonNode root = parseJson(planJson);
         if (root != null && root.path("items").isArray()) {
@@ -439,6 +482,7 @@ public class AgentRunStateStore {
         redisTemplate.delete(workflowStateKey(runId));
         redisTemplate.delete(toolCallCountKey(runId));
         redisTemplate.delete(patchedPlanKey(runId));
+        redisTemplate.delete(budgetProgressWarnedKey(runId));
     }
 
     public void clearTasks(String runId) {
@@ -669,6 +713,10 @@ public class AgentRunStateStore {
 
     private String patchedPlanKey(String runId) {
         return PREFIX + runId + PATCHED_PLAN_KEY;
+    }
+
+    private String budgetProgressWarnedKey(String runId) {
+        return PREFIX + runId + BUDGET_PROGRESS_WARNED_KEY;
     }
 
     private String taskIndexKey(String runId) {

@@ -169,11 +169,15 @@ public class AgentRunBudgetService {
         if (runId == null || runId.isBlank()) {
             return;
         }
+        String userId = AgentContext.getUserId();
         EffectiveRunBudget budget = effectiveConfig();
         Map<String, Object> summary = loadSummary(runId);
         // startedAtMillis 由 Pipeline 在 run 开始时写入 observability，用于计算挂钟时间
         long startedAt = toLong(summary.get("startedAtMillis"));
         long elapsed = startedAt <= 0 ? 0 : Math.max(0, System.currentTimeMillis() - startedAt);
+        // 0. 预算进度告警（80% 阈值）：先发 BUDGET_PROGRESS，再做超限检查，
+        //    这样在跨过 80% 的同一轮既能产出进度事件，也能在后续真正超限时正常抛 exceeded
+        emitBudgetProgressIfNeeded(runId, userId, summary, budget, elapsed);
         // 1. 挂钟时间检查：从 run 启动到当前的毫秒数
         if (budget.maxWallClockMs() > 0 && elapsed > budget.maxWallClockMs()) {
             throw exceeded("wall_clock_ms", elapsed, budget.maxWallClockMs());
@@ -211,6 +215,54 @@ public class AgentRunBudgetService {
             eventService.append(runId, userId, "RUN_BUDGET_EXCEEDED", payload);
         }
         return new RunBudgetException(dimension, actual, limit, false);
+    }
+
+    /**
+     * 80% 预算进度告警 —— 对四个维度逐一检查首次跨过 80% 阈值的情况，
+     * 对未告警过的 dimension 写入 {@code BUDGET_PROGRESS} 事件并打点去重标记。
+     * 阈值逻辑：{@code ratio ∈ [0.80, 1.00)} 触发一次；
+     * ratio < 0.80 或 limit <= 0 时跳过；ratio >= 1.00 由后续 exceeded 检查接管（不再触发本事件）。
+     *
+     * <p>为什么 ratio >= 1.00 不发 BUDGET_PROGRESS：
+     * 此时已处于"超限态"，下一步将立即抛 {@link RunBudgetException} 并写入 {@code RUN_BUDGET_EXCEEDED} 事件。
+     * 为了避免在同一个 check 轮内同维度发 2 条事件（BUDGET_PROGRESS + RUN_BUDGET_EXCEEDED），
+     * 此处只覆盖 80%~99% 这段"接近但尚未超限"的告警窗口。</p>
+     */
+    private void emitBudgetProgressIfNeeded(String runId, String userId,
+                                            Map<String, Object> summary,
+                                            EffectiveRunBudget budget, long elapsed) {
+        if (runId == null || userId == null) {
+            return;
+        }
+        checkDimension(runId, userId, "wall_clock_ms", elapsed, budget.maxWallClockMs());
+        checkDimension(runId, userId, "llm_calls", toLong(summary.get("llmCalls")), budget.maxLlmCalls());
+        checkDimension(runId, userId, "tool_calls", toLong(summary.get("toolCalls")), budget.maxToolCalls());
+        checkDimension(runId, userId, "tokens", toLong(summary.get("totalTokens")), budget.maxTokens());
+    }
+
+    /**
+     * 单维度 80% 阈值检查：未告警且 {@code ratio ∈ [0.80, 1.00)} 时写 {@code BUDGET_PROGRESS} 并打标。
+     * 去重基于 {@link AgentRunStateStore#hasBudgetProgressWarned} / {@link AgentRunStateStore#markBudgetProgressWarned}，
+     * 保证同一 runId + dimension 组合只发一次。
+     */
+    private void checkDimension(String runId, String userId, String dimension, long actual, long limit) {
+        if (limit <= 0 || actual < 0) {
+            return;
+        }
+        double ratio = (double) actual / (double) limit;
+        if (ratio < 0.80 || ratio >= 1.00) {
+            return;
+        }
+        if (stateStore.hasBudgetProgressWarned(runId, dimension)) {
+            return;
+        }
+        stateStore.markBudgetProgressWarned(runId, dimension);
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("dimension", dimension);
+        payload.put("actual", actual);
+        payload.put("limit", limit);
+        payload.put("ratio", ratio);
+        eventService.append(runId, userId, "BUDGET_PROGRESS", payload);
     }
 
     /** 从 Nacos 热加载配置读取 {@code runtime.runBudget}。 */
