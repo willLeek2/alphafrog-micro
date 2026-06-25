@@ -43,6 +43,13 @@ security:
     task-creation-window-minutes: 60
 
 alphafrog:
+  debug:
+    observability:
+      output-root: ${AF_DEBUG_OBSERVABILITY_OUTPUT_ROOT:/app/logs/agent-debug-observability}
+      auth:
+        default-ttl-seconds: 1800
+        max-bytes-per-session: 209715200
+        max-file-size-bytes: 52428800
   config:
     nacos:
       enabled: ${AF_CONFIG_NACOS_ENABLED:true}

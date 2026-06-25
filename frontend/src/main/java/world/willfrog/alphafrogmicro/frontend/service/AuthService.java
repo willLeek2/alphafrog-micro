@@ -13,6 +13,7 @@ import world.willfrog.alphafrogmicro.common.dao.user.UserInviteCodeDao;
 import world.willfrog.alphafrogmicro.common.pojo.user.User;
 import world.willfrog.alphafrogmicro.common.pojo.user.UserInviteCode;
 import world.willfrog.alphafrogmicro.frontend.config.JwtConfig;
+import world.willfrog.alphafrogmicro.frontend.service.debug.AuthObservabilityManager;
 
 import javax.crypto.SecretKey;
 import java.time.OffsetDateTime;
@@ -33,6 +34,7 @@ public class AuthService {
     private final UserInviteCodeDao userInviteCodeDao;
     private final RedisTemplate<String, Object> redisTemplate;
     private final PasswordEncoder passwordEncoder;
+    private final AuthObservabilityManager authObservabilityManager;
 
     private static final String LOGIN_STATUS_PREFIX = "login_status:";
     private static final String PASSWORD_RESET_PREFIX = "password_reset:";
@@ -113,18 +115,55 @@ public class AuthService {
 
     public int markAsLoggedIn(String username) {
         String key = LOGIN_STATUS_PREFIX + username;
+        boolean setCalled = true;
+        boolean setSuccess = false;
+        String errorClass = null;
+        Boolean keyExistsAfterWrite = null;
+        Long ttlAfterWriteMs = null;
+        Long configuredTtlMinutes = jwtConfig.getExpirationByMinutes();
+        Long actualTtlMs = null;
         try {
-            redisTemplate.opsForValue().set(key, true, jwtConfig.getExpirationByMinutes(), TimeUnit.MINUTES);
-            return 1;
+            redisTemplate.opsForValue().set(key, true, configuredTtlMinutes, TimeUnit.MINUTES);
+            setSuccess = true;
         } catch (Exception e) {
+            errorClass = e.getClass().getName();
             log.error("Failed to mark user as logged in", e);
-            return -1;
         }
+        if (setSuccess) {
+            try {
+                keyExistsAfterWrite = Boolean.TRUE.equals(redisTemplate.hasKey(key));
+                Long ttlSeconds = redisTemplate.getExpire(key, TimeUnit.SECONDS);
+                ttlAfterWriteMs = ttlSeconds != null ? ttlSeconds * 1000L : null;
+                actualTtlMs = ttlAfterWriteMs;
+            } catch (Exception e) {
+                if (errorClass == null) {
+                    errorClass = e.getClass().getName();
+                }
+                log.warn("Failed to verify login_status after write: {}", username, e);
+            }
+        }
+        try {
+            authObservabilityManager.emitLoginStatusWrite(
+                    username, setCalled, setSuccess, null, configuredTtlMinutes,
+                    actualTtlMs, keyExistsAfterWrite, ttlAfterWriteMs, errorClass);
+        } catch (Exception e) {
+            log.warn("Failed to emit login status write observability", e);
+        }
+        return setSuccess ? 1 : -1;
     }
 
     public boolean checkIfLoggedIn(String username) {
         String key = LOGIN_STATUS_PREFIX + username;
-        return Boolean.TRUE.equals(redisTemplate.hasKey(key));
+        try {
+            boolean exists = Boolean.TRUE.equals(redisTemplate.hasKey(key));
+            Long ttlSeconds = redisTemplate.getExpire(key, TimeUnit.SECONDS);
+            Long ttlMs = ttlSeconds != null && ttlSeconds >= 0 ? ttlSeconds * 1000L : null;
+            authObservabilityManager.emitLoginStatusCheck(username, exists, ttlMs, null);
+            return exists;
+        } catch (Exception e) {
+            authObservabilityManager.emitLoginStatusCheck(username, false, null, e.getClass().getName());
+            return false;
+        }
     }
 
     public int markAsLoggedOut(String username) {
