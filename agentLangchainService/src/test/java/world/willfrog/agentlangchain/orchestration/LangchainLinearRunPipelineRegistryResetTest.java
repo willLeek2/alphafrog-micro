@@ -103,7 +103,8 @@ class LangchainLinearRunPipelineRegistryResetTest {
                 creditService,
                 mock(AgentRunCreditSettlementService.class),
                 mock(world.willfrog.agent.platform.event.AgentRunFinalizationService.class),
-                registryProvider
+                registryProvider,
+                mock(ObjectProvider.class)
         );
     }
 
@@ -212,7 +213,8 @@ class LangchainLinearRunPipelineRegistryResetTest {
                 creditService,
                 mock(AgentRunCreditSettlementService.class),
                 mock(world.willfrog.agent.platform.event.AgentRunFinalizationService.class),
-                registryProvider
+                registryProvider,
+                mock(ObjectProvider.class)
         );
     }
 

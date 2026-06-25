@@ -8,6 +8,8 @@ import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.service.AgentCreditService;
 import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agent.platform.service.AgentObservabilityService;
+import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
+import world.willfrog.agent.platform.debug.DebugObservabilityService;
 import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 import world.willfrog.agent.workflow.TodoItem;
@@ -53,6 +55,11 @@ class LangchainLinearRunPipelineObservabilityTest {
         ObjectProvider<AgentObservabilityService> observabilityProvider = mock(ObjectProvider.class);
         when(observabilityProvider.getIfAvailable()).thenReturn(observabilityService);
 
+        @SuppressWarnings("unchecked")
+        ObjectProvider<AgentRunDatasetRegistry> datasetRegistryProvider = mock(ObjectProvider.class);
+        @SuppressWarnings("unchecked")
+        ObjectProvider<DebugObservabilityService> debugObservabilityProvider = mock(ObjectProvider.class);
+
         LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
         when(planner.plan(any())).thenReturn(LangchainTodoPlan.builder()
                 .executionMode(PlanExecutionMode.LINEAR)
@@ -88,7 +95,8 @@ class LangchainLinearRunPipelineObservabilityTest {
                 creditService,
                 mock(AgentRunCreditSettlementService.class),
                 mock(world.willfrog.agent.platform.event.AgentRunFinalizationService.class),
-                mock(ObjectProvider.class)
+                datasetRegistryProvider,
+                debugObservabilityProvider
         );
 
         pipeline.executeRun(run);
