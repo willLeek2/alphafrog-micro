@@ -12,6 +12,8 @@ import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.debug.DebugObservabilityRequest;
+import world.willfrog.agent.platform.debug.DebugObservabilityService;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
@@ -85,6 +87,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
      * 可选依赖保持一致：bean 不存在时静默跳过（如单元测试场景）。
      */
     private final ObjectProvider<AgentRunDatasetRegistry> agentRunDatasetRegistryProvider;
+    private final ObjectProvider<DebugObservabilityService> debugObservabilityServiceProvider;
 
     public LangchainLinearRunPipelineImpl(LangchainAiPlanner planner,
                                           LangchainLinearWorkflowExecutor linearWorkflowExecutor,
@@ -104,7 +107,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                                           AgentCreditService creditService,
                                           AgentRunCreditSettlementService creditSettlementService,
                                           AgentRunFinalizationService finalizationService,
-                                          ObjectProvider<AgentRunDatasetRegistry> agentRunDatasetRegistryProvider) {
+                                          ObjectProvider<AgentRunDatasetRegistry> agentRunDatasetRegistryProvider,
+                                          ObjectProvider<DebugObservabilityService> debugObservabilityServiceProvider) {
         this.planner = planner;
         this.linearWorkflowExecutor = linearWorkflowExecutor;
         this.dagWorkflowExecutor = dagWorkflowExecutor;
@@ -124,6 +128,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         this.creditSettlementService = creditSettlementService;
         this.finalizationService = finalizationService;
         this.agentRunDatasetRegistryProvider = agentRunDatasetRegistryProvider;
+        this.debugObservabilityServiceProvider = debugObservabilityServiceProvider;
     }
 
     @Override
@@ -157,6 +162,11 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             // 后续 OpenRouterProviderRoutedChatModel、ToolRouterToolProvider、可观测服务都会从这里取 runId/userId/phase。
             AgentContext.setRunId(runId);
             AgentContext.setUserId(userId);
+            DebugObservabilityService debugObservabilityService = debugObservabilityServiceProvider.getIfAvailable();
+            if (debugObservabilityService != null) {
+                DebugObservabilityRequest debugRequest = debugObservabilityService.parseFromExt(run.getExt());
+                debugObservabilityService.openRunSession(debugRequest, runId, userId);
+            }
             if (!eventService.isRunnable(runId, userId)) {
                 return;
             }
@@ -347,6 +357,15 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             // 260612-01-02: 异常路径也触发结算
             tryScheduleSettlement(runId, userId);
         } finally {
+            try {
+                DebugObservabilityService debugObservabilityService = debugObservabilityServiceProvider.getIfAvailable();
+                if (debugObservabilityService != null) {
+                    debugObservabilityService.closeRunSession(runId);
+                }
+            } catch (Exception debugCloseEx) {
+                log.warn("Failed to close debug observability session for runId={}: {}",
+                        runId, debugCloseEx.getMessage());
+            }
             // 260623-agent-service-deprecation task #47 (P0-2)：清理当前 run 的 dataset/manifest 编号转译层状态。
             // 长生命周期进程里若不清理，registry 会无限累积；run 终态后下一个 run 串到上一个 run 的编号 → 错位。
             // ObjectProvider 兜底：bean 不存在时静默跳过（保持纯单元测试启动）。

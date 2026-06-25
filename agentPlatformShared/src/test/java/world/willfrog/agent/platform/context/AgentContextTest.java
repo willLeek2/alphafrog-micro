@@ -111,6 +111,27 @@ class AgentContextTest {
         assertFalse(childHasFreshness.get());
     }
 
+    // ── debugObservabilitySessionId (task #62 A) ──
+
+    @Test
+    void captureAndRestore_shouldPreserveDebugObservabilitySessionIdInChildThread() throws Exception {
+        AgentContext.setRunId("run-1");
+        AgentContext.setDebugObservabilitySessionId("debug-session-abc");
+        AgentContext.ContextSnapshot snapshot = AgentContext.captureRunContext();
+
+        CountDownLatch latch = new CountDownLatch(1);
+        AtomicReference<String> childSessionId = new AtomicReference<>();
+        new Thread(() -> {
+            AgentContext.restoreRunContext(snapshot);
+            childSessionId.set(AgentContext.getDebugObservabilitySessionId());
+            AgentContext.clear();
+            latch.countDown();
+        }).start();
+
+        latch.await();
+        assertEquals("debug-session-abc", childSessionId.get());
+    }
+
     // ── lastMileHint (Phase 3.2 A2: 90% budget progress) ──
 
     @Test

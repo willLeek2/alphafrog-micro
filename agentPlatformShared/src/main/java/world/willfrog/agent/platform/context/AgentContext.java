@@ -87,6 +87,8 @@ public class AgentContext {
      * 每个 run 在执行线程(含并行子线程)里独立保存,避免跨 run 串扰。
      */
     private static final ThreadLocal<Boolean> DEBUG_MODE_HOLDER = new ThreadLocal<>();
+    /** task #62 A: run-scoped debug observability session id for JSONL writer. */
+    private static final ThreadLocal<String> DEBUG_OBSERVABILITY_SESSION_ID_HOLDER = new ThreadLocal<>();
     /**
      * 网页搜索能力开关。
      * 由 AgentRunExecutor 根据 run 请求中的 webSearchEnabled 字段设置。
@@ -396,6 +398,22 @@ public class AgentContext {
         DEBUG_MODE_HOLDER.remove();
     }
 
+    public static void setDebugObservabilitySessionId(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) {
+            clearDebugObservabilitySessionId();
+            return;
+        }
+        DEBUG_OBSERVABILITY_SESSION_ID_HOLDER.set(sessionId);
+    }
+
+    public static String getDebugObservabilitySessionId() {
+        return DEBUG_OBSERVABILITY_SESSION_ID_HOLDER.get();
+    }
+
+    public static void clearDebugObservabilitySessionId() {
+        DEBUG_OBSERVABILITY_SESSION_ID_HOLDER.remove();
+    }
+
     /**
      * 设置 OpenRouter reasoning effort(如 "high"、"medium"、"low")。
      * LLM 包装器据此为 OpenRouter 端点注入 reasoning 参数。
@@ -663,7 +681,8 @@ public class AgentContext {
                 getEffectiveExecutionStageConfig(),
                 getWorkflow(),
                 getDataFreshness(),
-                getLastMileHint()
+                getLastMileHint(),
+                getDebugObservabilitySessionId()
         );
     }
 
@@ -748,6 +767,11 @@ public class AgentContext {
         } else {
             setLastMileHint(snapshot.lastMileHint());
         }
+        if (snapshot.debugObservabilitySessionId() == null) {
+            clearDebugObservabilitySessionId();
+        } else {
+            setDebugObservabilitySessionId(snapshot.debugObservabilitySessionId());
+        }
     }
 
     /**
@@ -783,6 +807,7 @@ public class AgentContext {
         clearThinkingContent();
         clearStreamingProgress();
         clearLastMileHint();
+        clearDebugObservabilitySessionId();
     }
 
     /**
@@ -836,7 +861,8 @@ public class AgentContext {
             StageLlmConfig effectiveExecutionStageConfig,
             String workflow,
             AgentLlmProperties.DataFreshness dataFreshness,
-            String lastMileHint
+            String lastMileHint,
+            String debugObservabilitySessionId
     ) {
     }
 

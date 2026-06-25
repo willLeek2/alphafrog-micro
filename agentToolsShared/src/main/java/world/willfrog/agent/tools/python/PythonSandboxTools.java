@@ -4,9 +4,12 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.langchain4j.agent.tool.Tool;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.dubbo.config.annotation.DubboReference;
+import org.apache.dubbo.rpc.RpcContext;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.debug.DebugObservabilityRpcKeys;
+import world.willfrog.agent.platform.debug.DebugObservabilityService;
 import world.willfrog.agent.platform.util.PromptFileLoader;
 import world.willfrog.agent.workflow.AgentRunDatasetCsvWriter;
 import world.willfrog.agent.workflow.AgentRunDatasetEntry;
@@ -87,6 +90,9 @@ public class PythonSandboxTools {
     @Autowired(required = false)
     private AgentRunDatasetRegistry agentRunDatasetRegistry;
 
+    @Autowired(required = false)
+    private DebugObservabilityService debugObservabilityService;
+
     public PythonSandboxTools(ObjectMapper objectMapper) {
         this.objectMapper = objectMapper;
     }
@@ -106,7 +112,9 @@ public class PythonSandboxTools {
     }
 
     private String executePythonInternal(String code, String dataset_ids, String manifest_ids, String libraries, Integer timeout_seconds) {
+        long toolStartMs = System.currentTimeMillis();
         try {
+            long prepareStartMs = System.currentTimeMillis();
             String[] parsedDatasetNumbers = parseDatasetIds(dataset_ids);
             String[] parsedManifestNumbers = parseDatasetIds(manifest_ids);
             if (parsedDatasetNumbers.length == 0 && parsedManifestNumbers.length == 0) {
@@ -219,6 +227,16 @@ public class PythonSandboxTools {
             String pathsDatasetCsv = AgentRunDatasetCsvWriter.writePathsDatasetCsv(subSnapshot);
             String pathManifestCsv = AgentRunDatasetCsvWriter.writePathManifestCsv(snapshot);
 
+            emitSandboxEvent("sandbox_prepare_registry", Map.of(
+                    "durationMs", System.currentTimeMillis() - prepareStartMs,
+                    "status", "OK",
+                    "datasetCount", resolvedDatasets.size(),
+                    "manifestCount", resolvedManifests.size(),
+                    "relatedDatasetCount", relatedDatasets.size(),
+                    "pathsCsvBytes", pathsDatasetCsv.length(),
+                    "manifestCsvBytes", pathManifestCsv.length()
+            ));
+
             String primaryOriginalId = originalIdsToMount.get(0);
             log.info("Executing python task for run-level ids: primary={}, total={}, datasetCount={}, manifestCount={}, relatedDatasetCount={}",
                     primaryOriginalId, originalIdsToMount.size(), resolvedDatasets.size(), resolvedManifests.size(), relatedDatasets.size());
@@ -247,7 +265,16 @@ public class PythonSandboxTools {
             requestBuilder.setPathsDatasetCsv(pathsDatasetCsv);
             requestBuilder.setPathManifestCsv(pathManifestCsv);
 
+            long createStartMs = System.currentTimeMillis();
+            installDebugRpcAttachments();
             ExecuteResponse createResp = pythonSandboxService.createTask(requestBuilder.build());
+            emitSandboxEvent("sandbox_create_task", Map.of(
+                    "durationMs", System.currentTimeMillis() - createStartMs,
+                    "status", createResp.getError() == null || createResp.getError().isEmpty() ? "OK" : "ERROR",
+                    "errorCategory", createResp.getError() == null || createResp.getError().isEmpty() ? "" : "CREATE_TASK_FAILED",
+                    "taskId", nvl(createResp.getTaskId()),
+                    "datasetMountCount", originalIdsToMount.size()
+            ));
             if (createResp.getError() != null && !createResp.getError().isEmpty()) {
                 return fail("executePython", "CREATE_TASK_FAILED", "Failed to create python sandbox task", Map.of(
                         "message", createResp.getError(),
@@ -260,10 +287,28 @@ public class PythonSandboxTools {
 
             long maxWaitMs = timeout * 1000L + 5000;
             long startTime = System.currentTimeMillis();
+            int pollIndex = 0;
+            String lastRemoteStatus = "";
             while (System.currentTimeMillis() - startTime < maxWaitMs) {
+                long pollStartMs = System.currentTimeMillis();
                 TaskStatusResponse statusResp = getTaskStatus(taskId);
+                String remoteStatus = statusResp == null ? "" : nvl(statusResp.getStatus());
+                boolean statusChanged = !remoteStatus.equals(lastRemoteStatus);
+                if (pollIndex == 0 || statusChanged || pollIndex % 5 == 0) {
+                    emitSandboxEvent("sandbox_poll", Map.of(
+                            "durationMs", System.currentTimeMillis() - pollStartMs,
+                            "status", "OK",
+                            "pollIndex", pollIndex,
+                            "sinceCreateMs", System.currentTimeMillis() - startTime,
+                            "remoteStatus", remoteStatus,
+                            "taskId", taskId
+                    ));
+                }
+                lastRemoteStatus = remoteStatus;
+                pollIndex++;
                 String terminal = terminalOutput(taskId, statusResp);
                 if (terminal != null) {
+                    emitSandboxToolTotal(toolStartMs, "OK", "");
                     return terminal;
                 }
                 try {
@@ -274,10 +319,73 @@ public class PythonSandboxTools {
                 }
             }
 
+            emitSandboxToolTotal(toolStartMs, "TIMEOUT", "TIMEOUT");
             return fail("executePython", "TIMEOUT", "Sandbox task timed out after " + timeout + "s", Map.of("task_id", taskId));
         } catch (Exception e) {
             log.error("Execute python tool error", e);
+            emitSandboxToolTotal(toolStartMs, "ERROR", "TOOL_ERROR");
             return fail("executePython", "TOOL_ERROR", "Python sandbox invocation error", Map.of("message", nvl(e.getMessage())));
+        }
+    }
+
+    private void emitSandboxEvent(String eventType, Map<String, Object> fields) {
+        if (debugObservabilityService == null || !debugObservabilityService.isEnabled()) {
+            return;
+        }
+        try {
+            Map<String, Object> payload = new LinkedHashMap<>(fields);
+            payload.put("eventType", eventType);
+            debugObservabilityService.emit(payload);
+        } catch (Exception ignored) {
+            // debug path must not affect tool execution
+        }
+    }
+
+    private void installDebugRpcAttachments() {
+        if (debugObservabilityService == null || !debugObservabilityService.isEnabled()) {
+            return;
+        }
+        try {
+            String sessionId = AgentContext.getDebugObservabilitySessionId();
+            if (sessionId == null || sessionId.isBlank()) {
+                return;
+            }
+            RpcContext.getClientAttachment().setAttachment(DebugObservabilityRpcKeys.SESSION_ID, sessionId);
+            String runId = AgentContext.getRunId();
+            if (runId != null && !runId.isBlank()) {
+                RpcContext.getClientAttachment().setAttachment(DebugObservabilityRpcKeys.RUN_ID, runId);
+            }
+            String sessionDir = debugObservabilityService.sessionDirFor(sessionId);
+            if (sessionDir != null) {
+                RpcContext.getClientAttachment().setAttachment(DebugObservabilityRpcKeys.SESSION_DIR, sessionDir);
+            }
+        } catch (Exception ignored) {
+            // debug path must not affect tool execution
+        }
+    }
+
+    private void emitSandboxToolTotal(long toolStartMs, String status, String errorCategory) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("durationMs", System.currentTimeMillis() - toolStartMs);
+        payload.put("status", status);
+        if (errorCategory != null && !errorCategory.isBlank()) {
+            payload.put("errorCategory", errorCategory);
+        }
+        appendHostSnapshot(payload);
+        emitSandboxEvent("sandbox_tool_total", payload);
+    }
+
+    private void appendHostSnapshot(Map<String, Object> payload) {
+        try {
+            Runtime runtime = Runtime.getRuntime();
+            payload.put("heapFreeBytes", runtime.freeMemory());
+            payload.put("heapTotalBytes", runtime.totalMemory());
+            payload.put("heapMaxBytes", runtime.maxMemory());
+            java.lang.management.OperatingSystemMXBean osBean = java.lang.management.ManagementFactory.getOperatingSystemMXBean();
+            payload.put("systemLoadAverage", osBean.getSystemLoadAverage());
+            payload.put("availableProcessors", osBean.getAvailableProcessors());
+        } catch (Exception ignored) {
+            // optional host snapshot
         }
     }
 
@@ -326,6 +434,7 @@ public class PythonSandboxTools {
     }
 
     private TaskStatusResponse getTaskStatus(String taskId) {
+        installDebugRpcAttachments();
         return pythonSandboxService.getTaskStatus(
                 GetTaskStatusRequest.newBuilder().setTaskId(taskId).build()
         );
@@ -334,9 +443,19 @@ public class PythonSandboxTools {
     private String terminalOutput(String taskId, TaskStatusResponse statusResp) {
         String status = statusResp.getStatus();
         if ("SUCCEEDED".equals(status)) {
+            long fetchStartMs = System.currentTimeMillis();
+            installDebugRpcAttachments();
             TaskResultResponse result = pythonSandboxService.getTaskResult(
                     GetTaskResultRequest.newBuilder().setTaskId(taskId).build()
             );
+            emitSandboxEvent("sandbox_fetch_result", Map.of(
+                    "durationMs", System.currentTimeMillis() - fetchStartMs,
+                    "status", "OK",
+                    "taskId", taskId,
+                    "exitCode", result == null ? -1 : result.getExitCode(),
+                    "stdoutLen", result == null || result.getStdout() == null ? 0 : result.getStdout().length(),
+                    "stderrLen", result == null || result.getStderr() == null ? 0 : result.getStderr().length()
+            ));
             return formatResult(taskId, status, result);
         }
         if ("FAILED".equals(status)) {

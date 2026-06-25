@@ -508,6 +508,7 @@ services:
       AF_CONFIG_NACOS_DATA_ID: "code-refine.json"
       AF_CONFIG_NACOS_GROUP: "alphafrog-config"
       AF_AGENT_FLOW_CODE_REFINE_CONFIG_FILE: "/app/config-dynamic/code-refine.local.json"
+      AF_DEBUG_OBSERVABILITY_ROOT: /app/logs/agent-debug-observability
       JAVA_TOOL_OPTIONS: "-Xms512m -Xmx1g ${AF_JAVA_PROXY_OPTIONS--Dhttp.proxyHost=host.docker.internal -Dhttp.proxyPort=7890 -Dhttps.proxyHost=host.docker.internal -Dhttps.proxyPort=7890 -Dhttp.nonProxyHosts=localhost|127.0.0.1|nacos|redis|rabbitmq|meilisearch|host.docker.internal}"
       <<: *agent-llm-proxy-env
       NO_PROXY: ${NO_PROXY-localhost,127.0.0.1,nacos,redis,rabbitmq,meilisearch,host.docker.internal}
@@ -521,6 +522,7 @@ services:
       - ./agentPlatformShared/src/main/resources/agent_guides:/data/agent_guides:ro
       - ./agentLangchainService/config:/app/config:ro
       - ./data/agent-configs:/app/config-dynamic
+      - ./data/agent-debug-observability:/app/logs/agent-debug-observability
     ports:
       - "50059:50059"
       - "50158:50158"
@@ -664,8 +666,11 @@ services:
       TZ: Asia/Shanghai
       NACOS_ADDRESS: nacos
       AF_SANDBOX_SERVICE_URL: http://python-sandbox-service:8095
+      AF_DEBUG_OBSERVABILITY_ROOT: /app/logs/agent-debug-observability
       # Memory Optimization (Light)
       JAVA_TOOL_OPTIONS: "-Xms256m -Xmx256m"
+    volumes:
+      - ./data/agent-debug-observability:/app/logs/agent-debug-observability
     ports:
       - "50060:50060"
     deploy:

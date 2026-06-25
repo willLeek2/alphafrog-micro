@@ -186,6 +186,12 @@ public class AgentEventService {
             ext.put("execution_mode", executionMode);
         }
 
+        world.willfrog.agent.platform.debug.DebugObservabilityRequest debugObservability =
+                world.willfrog.agent.platform.debug.DebugObservabilityRequest.parseContextJson(contextJson, objectMapper);
+        if (debugObservability.enabled()) {
+            ext.put(world.willfrog.agent.platform.debug.DebugObservabilityRequest.EXT_KEY, debugObservability.toExtMap());
+        }
+
         // 快照当前数据时效配置（run 启动时冻结，保证 run 内 dataFreshness 语义一致）
         AgentLlmProperties.DataFreshness freshness = agentPromptService.snapshotDataFreshness();
         if (freshness != null) {

@@ -1,27 +1,36 @@
 package world.willfrog.sandbox.service;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.dubbo.config.annotation.DubboService;
+import org.apache.dubbo.rpc.RpcContext;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.client.HttpClientErrorException;
 import org.springframework.web.client.RestTemplate;
+import world.willfrog.agent.platform.debug.DebugObservabilityJsonlAppender;
+import world.willfrog.agent.platform.debug.DebugObservabilityRpcKeys;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
 
+import java.nio.file.Path;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 @DubboService
 @Slf4j
 public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTriple.PythonSandboxServiceImplBase {
 
     private final RestTemplate restTemplate;
+    private final ObjectMapper objectMapper;
 
     @Value("${sandbox.service.url}")
     private String sandboxUrl;
 
-    public PythonSandboxGatewayServiceImpl(RestTemplate restTemplate) {
+    public PythonSandboxGatewayServiceImpl(RestTemplate restTemplate, ObjectMapper objectMapper) {
         this.restTemplate = restTemplate;
+        this.objectMapper = objectMapper;
     }
 
     @Override
@@ -60,6 +69,8 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
                     endpoint, httpRequest, HttpCreateTaskResponse.class);
             log.info("sandbox.http: endpoint=POST {}, httpStatus={}, durationMs={}",
                     endpoint, response.getStatusCode().value(), System.currentTimeMillis() - httpStart);
+            emitSandboxHttp("POST", endpoint, response.getStatusCode().value(),
+                    System.currentTimeMillis() - httpStart, "OK", null);
 
             if (response.getBody() != null) {
                 log.info("sandbox.createTask.result: taskId={}, status={}, totalDurationMs={}",
@@ -76,6 +87,8 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
         } catch (Exception e) {
             log.error("sandbox.createTask.failed: totalDurationMs={}, error={}",
                     System.currentTimeMillis() - startMs, e.getMessage(), e);
+            emitSandboxHttp("POST", sandboxUrl + "/tasks", -1,
+                    System.currentTimeMillis() - startMs, "ERROR", "CREATE_TASK_FAILED");
             return ExecuteResponse.newBuilder().setError(e.getMessage()).build();
         }
     }
@@ -90,6 +103,8 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
             ResponseEntity<HttpTask> response = restTemplate.getForEntity(endpoint, HttpTask.class);
             log.info("sandbox.http: endpoint=GET {}, httpStatus={}, durationMs={}",
                     endpoint, response.getStatusCode().value(), System.currentTimeMillis() - httpStart);
+            emitSandboxHttp("GET", endpoint, response.getStatusCode().value(),
+                    System.currentTimeMillis() - httpStart, "OK", null);
 
             if (response.getBody() != null) {
                 HttpTask task = response.getBody();
@@ -110,10 +125,14 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
         } catch (HttpClientErrorException.NotFound e) {
             log.info("sandbox.getTaskStatus.notFound: taskId={}, totalDurationMs={}",
                     request.getTaskId(), System.currentTimeMillis() - startMs);
+            emitSandboxHttp("GET", sandboxUrl + "/tasks/" + request.getTaskId(), 404,
+                    System.currentTimeMillis() - startMs, "OK", "NOT_FOUND");
             return TaskStatusResponse.newBuilder().setStatus("UNKNOWN").setError("Task not found").build();
         } catch (Exception e) {
             log.error("sandbox.getTaskStatus.failed: taskId={}, totalDurationMs={}, error={}",
                     request.getTaskId(), System.currentTimeMillis() - startMs, e.getMessage(), e);
+            emitSandboxHttp("GET", sandboxUrl + "/tasks/" + request.getTaskId(), -1,
+                    System.currentTimeMillis() - startMs, "ERROR", "GET_STATUS_FAILED");
             return TaskStatusResponse.newBuilder().setStatus("UNKNOWN").setError(e.getMessage()).build();
         }
     }
@@ -131,6 +150,8 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
                 ResponseEntity<HttpExecuteResult> response = restTemplate.getForEntity(endpoint, HttpExecuteResult.class);
                 log.info("sandbox.http: endpoint=GET {}, httpStatus={}, durationMs={}",
                         endpoint, response.getStatusCode().value(), System.currentTimeMillis() - httpStart);
+                emitSandboxHttp("GET", endpoint, response.getStatusCode().value(),
+                        System.currentTimeMillis() - httpStart, "OK", null);
                 if (response.getBody() != null) {
                     HttpExecuteResult res = response.getBody();
                     int stdoutLen = res.getStdout() == null ? 0 : res.getStdout().length();
@@ -169,7 +190,47 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
         } catch (Exception e) {
             log.error("sandbox.getTaskResult.failed: taskId={}, totalDurationMs={}, error={}",
                     request.getTaskId(), System.currentTimeMillis() - startMs, e.getMessage(), e);
+            emitSandboxHttp("GET", sandboxUrl + "/tasks/" + request.getTaskId() + "/result", -1,
+                    System.currentTimeMillis() - startMs, "ERROR", "GET_RESULT_FAILED");
             return TaskResultResponse.newBuilder().setError(e.getMessage()).build();
+        }
+    }
+
+    private void emitSandboxHttp(String method,
+                                 String endpoint,
+                                 int httpStatus,
+                                 long durationMs,
+                                 String status,
+                                 String errorCategory) {
+        try {
+            RpcContext context = RpcContext.getServiceContext();
+            if (context == null) {
+                return;
+            }
+            String sessionDir = context.getAttachment(DebugObservabilityRpcKeys.SESSION_DIR);
+            if (sessionDir == null || sessionDir.isBlank()) {
+                return;
+            }
+            Map<String, Object> fields = new LinkedHashMap<>();
+            fields.put("eventType", "sandbox_http");
+            fields.put("method", method);
+            fields.put("endpoint", endpoint);
+            fields.put("httpStatus", httpStatus);
+            fields.put("durationMs", durationMs);
+            fields.put("status", status);
+            if (errorCategory != null && !errorCategory.isBlank()) {
+                fields.put("errorCategory", errorCategory);
+            }
+            DebugObservabilityJsonlAppender.append(
+                    Path.of(sessionDir),
+                    context.getAttachment(DebugObservabilityRpcKeys.RUN_ID),
+                    context.getAttachment(DebugObservabilityRpcKeys.SESSION_ID),
+                    "pythonSandboxGatewayService",
+                    objectMapper,
+                    fields
+            );
+        } catch (Exception ignored) {
+            // debug path must not affect gateway RPC
         }
     }
 
