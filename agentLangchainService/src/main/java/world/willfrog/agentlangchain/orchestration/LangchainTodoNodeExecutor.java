@@ -98,7 +98,9 @@ public class LangchainTodoNodeExecutor {
     private static final double BUDGET_HIT_RATIO = 0.8;
 
     /**
-     * empty_todo_output 结构化观测的内部记录。承载在 {@code LangchainTodoNodeResult.failureMetadata} 中传递到 pipeline，最终写入 event payload 的 {@code empty_output_observation} 子 map。
+     * empty_todo_output 结构化观测的内部记录。承载在 {@code LangchainTodoNodeResult.failureMetadata} 中传递到 pipeline，
+     * 最终由 {@link LangchainTodoNodeResult#routeFailureMetadataField} 按语义路由到 event payload 的对应子 map
+     * （empty output 走 {@code empty_output_observation}，budget failure 走 {@code budget_failure}）。
      */
     private record EmptyOutputObservation(
             String todoId,

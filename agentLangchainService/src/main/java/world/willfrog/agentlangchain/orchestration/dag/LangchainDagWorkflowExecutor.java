@@ -1163,7 +1163,9 @@ public class LangchainDagWorkflowExecutor {
     /**
      * 带结构化观测 + recovery 标记的完整重载。
      * <ul>
-     *   <li>{@code failureMetadata} 非空时写入 payload 的 {@code empty_output_observation} 子 map；</li>
+     *   <li>{@code failureMetadata} 非空时按 {@link LangchainTodoNodeResult#routeFailureMetadataField} 语义路由
+     *       到 {@code budget_failure} / {@code empty_output_observation} / {@code failure_metadata} 子 map
+     *       （Phase 3.2 A3 防止 budget metadata 误挂 empty_output_observation）；</li>
      *   <li>{@code recovered=true} 时写入 {@code recovered=true} + {@code recovery_outcome}，便于压测报告统计 success after recovery；</li>
      *   <li>{@code errorCode} 与 RUN_CANCELED 推断逻辑保持兼容。</li>
      * </ul>
@@ -1200,7 +1202,12 @@ public class LangchainDagWorkflowExecutor {
             }
         }
         if (failureMetadata != null && !failureMetadata.isEmpty()) {
-            payload.put("empty_output_observation", failureMetadata);
+            // Phase 3.2 A3: failureMetadata 按语义路由到 budget_failure / empty_output_observation / failure_metadata，
+            // 避免 budget failure 被误挂 empty_output_observation。
+            String field = LangchainTodoNodeResult.routeFailureMetadataField(failureMetadata);
+            if (field != null) {
+                payload.put(field, failureMetadata);
+            }
         }
         return payload;
     }

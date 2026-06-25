@@ -33,7 +33,8 @@ public final class LangchainBudgetPartialAnswerBuilder {
     /** 每个 todo output 截断到多少字符。 */
     public static final int MAX_PER_TODO_CHARS = 4096;
 
-    /** 拼接后 finalAnswer 总长上限（chars）。 */
+    /** finalAnswer **正文** 截断上限（chars）。当拼接总长超过此值时，substring 截断到 8192 字符 + 追加 "[... truncated, ...]" 提示
+     *  说明被省略的 todo 数 / 完整长度 / 截断长度。包含 truncation note 后 finalAnswer 总长会超过 8192（当前测试边界 ≤ 8492）。 */
     public static final int MAX_TOTAL_CHARS = 8192;
 
     /**

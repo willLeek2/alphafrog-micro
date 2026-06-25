@@ -391,10 +391,14 @@ public class LangchainLinearWorkflowExecutor {
                 payload.put("recovery_outcome", recoveryOutcome);
             }
         }
-        // empty_todo_output 结构化观测：failureMetadata 非空时写入子 map，
-        // 让压测报告 / dashboard 能直接消费，不必回 trace 翻
+        // failureMetadata 结构化观测：按语义路由到对应子字段（budget_failure / empty_output_observation / failure_metadata），
+        // 让压测报告 / dashboard 能直接消费，不必回 trace 翻。
+        // Phase 3.2 A3: budget metadata 不再误挂 empty_output_observation，避免 budget failure 被误归类为 empty_todo_output。
         if (failureMetadata != null && !failureMetadata.isEmpty()) {
-            payload.put("empty_output_observation", failureMetadata);
+            String field = LangchainTodoNodeResult.routeFailureMetadataField(failureMetadata);
+            if (field != null) {
+                payload.put(field, failureMetadata);
+            }
         }
         try {
             eventService.append(runId, userId, eventType, payload);

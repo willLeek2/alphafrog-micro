@@ -40,16 +40,22 @@ import static org.mockito.Mockito.when;
  * <p>
  * 覆盖 4 个场景：
  * <ul>
- *   <li><b>G1 bypass recovery judge</b>：节点失败 + failureMetadata.budget_exceeded=true → 不调用 recovery judge；</li>
+ *   <li><b>G1 bypass recovery judge</b>：节点失败 + failureMetadata.budget_exceeded=true
+ *       → 即使 {@code recoveryJudgeEnabled=true}，recovery judge 也不被调用
+ *       （验证注入的 promptService.dagRecoveryJudgeSystemPrompt() 永远 never）；</li>
  *   <li><b>G2 partial 路径</b>：completedTodos 非空 → deterministic partial answer + WORKFLOW_PARTIAL_BUDGET；</li>
  *   <li><b>G3 fail-fast 路径</b>：completedTodos 空 → 无 finalAnswer + WORKFLOW_FAILED_BUDGET；</li>
  *   <li><b>non-LLM</b>：writeFinalAnswer 不被调用（budget 已触顶，再触发 LLM 会再抛 RunBudgetException）。</li>
  * </ul>
+ * <p>
+ * 关键设计：{@code promptService} 作为字段保存（不内联 mock），让 {@code verify()} 能验证真正注入 executor 的 mock。
+ * 所有测试统一开 {@code recoveryJudgeEnabled=true}，保证 G1 bypass 真的在带开关状态下被覆盖。
  */
 class LangchainDagWorkflowExecutorBudgetExhaustionTest {
 
     private AgentEventService eventService;
     private LangchainTodoNodeExecutor nodeExecutor;
+    private world.willfrog.agent.platform.service.AgentPromptService promptService;
     private LangchainDagWorkflowExecutor executor;
 
     @BeforeEach
@@ -63,17 +69,18 @@ class LangchainDagWorkflowExecutorBudgetExhaustionTest {
         when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
         ObjectProvider<world.willfrog.agent.platform.service.AgentRunStateStore> emptyProvider =
                 new EmptyStateStoreProvider();
+        promptService = mock(world.willfrog.agent.platform.service.AgentPromptService.class);
         executor = new LangchainDagWorkflowExecutor(
                 nodeExecutor,
                 stateRecorder,
                 eventService,
                 guard,
-                mock(world.willfrog.agent.platform.service.AgentPromptService.class),
+                promptService,
                 new ObjectMapper(),
                 emptyProvider);
         ReflectionTestUtils.setField(executor, "dagThreadPoolSize", 2);
-        // 关闭 recovery judge：测试 G1 时不依赖 switch，默认 false 即可；显式 set 一下明确意图
-        ReflectionTestUtils.setField(executor, "recoveryJudgeEnabled", false);
+        // 关键：开启 recovery judge 开关，让 G1 bypass 测试真正有"如果不 bypass 就会调"的反事实覆盖
+        ReflectionTestUtils.setField(executor, "recoveryJudgeEnabled", true);
     }
 
     @AfterEach
@@ -106,9 +113,9 @@ class LangchainDagWorkflowExecutorBudgetExhaustionTest {
         assertThat(result.getFailureMetadata()).containsEntry("budget_exceeded", true);
         assertThat(result.getFailureMetadata()).containsEntry("dimension", "tool_calls");
 
-        // G1: recovery judge 没被调用（promptService 不应被触发 dagRecoveryJudgeSystemPrompt）
-        verify(mock(world.willfrog.agent.platform.service.AgentPromptService.class),
-                never()).dagRecoveryJudgeSystemPrompt();
+        // G1: 即使 recoveryJudgeEnabled=true，recovery judge 也不被调用。
+        // 关键：verify 的是注入 executor 的 promptService 字段，不是新建 mock
+        verify(promptService, never()).dagRecoveryJudgeSystemPrompt();
 
         // WORKFLOW_PARTIAL_BUDGET 事件发出
         ArgumentCaptor<String> eventTypeCaptor = ArgumentCaptor.forClass(String.class);
@@ -118,6 +125,17 @@ class LangchainDagWorkflowExecutorBudgetExhaustionTest {
 
         // M3: writeFinalAnswer 不被调用（budget 触顶，再调 LLM 会立即再被 budget check 拦截）
         verify(nodeExecutor, never()).writeFinalAnswer(any(), any());
+
+        // MF1: TODO_NODE_FAILED event payload 含 budget_failure 字段，**不**含 empty_output_observation
+        ArgumentCaptor<Map<String, Object>> payloadCaptor = ArgumentCaptor.forClass(Map.class);
+        verify(eventService, atLeastOnce()).append(eq("run-dag-budget-partial"), eq("user-1"),
+                eq("TODO_NODE_FAILED"), payloadCaptor.capture());
+        Map<String, Object> failedPayload = payloadCaptor.getValue();
+        assertThat(failedPayload).containsKey("budget_failure");
+        assertThat(failedPayload).doesNotContainKey("empty_output_observation");
+        @SuppressWarnings("unchecked")
+        Map<String, Object> budgetField = (Map<String, Object>) failedPayload.get("budget_failure");
+        assertThat(budgetField).containsEntry("budget_exceeded", true);
     }
 
     @Test

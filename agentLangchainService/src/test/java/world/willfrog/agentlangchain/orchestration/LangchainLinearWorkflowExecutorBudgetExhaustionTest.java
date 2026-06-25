@@ -90,6 +90,17 @@ class LangchainLinearWorkflowExecutorBudgetExhaustionTest {
                 eventTypeCaptor.capture(), any(Map.class));
         assertThat(eventTypeCaptor.getAllValues()).contains("WORKFLOW_PARTIAL_BUDGET");
         assertThat(eventTypeCaptor.getAllValues()).contains("TODO_NODE_FAILED");
+
+        // MF1: TODO_NODE_FAILED event payload 含 budget_failure 字段，**不**含 empty_output_observation
+        ArgumentCaptor<Map<String, Object>> payloadCaptor = ArgumentCaptor.forClass(Map.class);
+        verify(eventService, atLeastOnce()).append(eq("run-budget-partial"), eq("user-1"),
+                eq("TODO_NODE_FAILED"), payloadCaptor.capture());
+        Map<String, Object> failedPayload = payloadCaptor.getValue();
+        assertThat(failedPayload).containsKey("budget_failure");
+        assertThat(failedPayload).doesNotContainKey("empty_output_observation");
+        @SuppressWarnings("unchecked")
+        Map<String, Object> budgetField = (Map<String, Object>) failedPayload.get("budget_failure");
+        assertThat(budgetField).containsEntry("budget_exceeded", true);
     }
 
     @Test
@@ -118,6 +129,13 @@ class LangchainLinearWorkflowExecutorBudgetExhaustionTest {
                 eventTypeCaptor.capture(), any(Map.class));
         assertThat(eventTypeCaptor.getAllValues()).contains("WORKFLOW_FAILED_BUDGET");
         assertThat(eventTypeCaptor.getAllValues()).contains("TODO_NODE_FAILED");
+
+        // MF1: TODO_NODE_FAILED event payload 含 budget_failure，**不**含 empty_output_observation
+        ArgumentCaptor<Map<String, Object>> payloadCaptor = ArgumentCaptor.forClass(Map.class);
+        verify(eventService, atLeastOnce()).append(eq("run-budget-failfast"), eq("user-1"),
+                eq("TODO_NODE_FAILED"), payloadCaptor.capture());
+        assertThat(payloadCaptor.getValue()).containsKey("budget_failure");
+        assertThat(payloadCaptor.getValue()).doesNotContainKey("empty_output_observation");
     }
 
     @Test

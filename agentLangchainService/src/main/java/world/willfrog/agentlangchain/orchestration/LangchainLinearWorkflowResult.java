@@ -32,7 +32,8 @@ public class LangchainLinearWorkflowResult {
     /**
      * 失败时的结构化观测数据（透传自首个失败 todo 的 failureMetadata）。
      * 仅在 {@link #failureReason} 为 empty_todo_output / empty_todo_output_after_recovery 时由 linear executor 填入。
-     * pipeline 层 publishFailure 会把它写入 WORKFLOW_FAILED event payload 的 empty_output_observation 子 map。
+     * pipeline 层 publishFailure 会按 {@link LangchainTodoNodeResult#routeFailureMetadataField} 语义
+     * 把它路由到 WORKFLOW_FAILED event payload 的 {@code budget_failure} / {@code empty_output_observation} / {@code failure_metadata} 之一。
      */
     private Map<String, Object> failureMetadata;
 }
