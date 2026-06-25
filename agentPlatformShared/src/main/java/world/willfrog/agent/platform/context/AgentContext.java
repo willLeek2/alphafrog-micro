@@ -138,6 +138,16 @@ public class AgentContext {
      */
     private static final ThreadLocal<world.willfrog.agent.platform.service.StreamingProgressTracker.StreamingProgressSnapshot> STREAMING_PROGRESS_HOLDER = new ThreadLocal<>();
 
+    /**
+     * 90% last-mile hint：当本 run 的任意预算维度首次跨过 90% 时，
+     * {@code AgentRunBudgetService} 写入一段中文提示文本到本 ThreadLocal；
+     * 下一次 {@code LangchainTodoNodeExecutor} 的 {@code chatRequestTransformer} 读取并注入到 SystemMessage，
+     * 促使 LLM 在剩余预算内尽快给出最终结论。
+     * <p>字符串内容由 budget service 拼装（含维度名 / 实际值 / 上限 / 建议话术），
+     * transformer 只负责"读到就注入、读不到就透传"。</p>
+     */
+    private static final ThreadLocal<String> LAST_MILE_HINT_HOLDER = new ThreadLocal<>();
+
     /** 设置当前线程的 Run ID。 */
     public static void setRunId(String runId) {
         RUN_ID_HOLDER.set(runId);
@@ -499,6 +509,32 @@ public class AgentContext {
         STREAMING_PROGRESS_HOLDER.remove();
     }
 
+    /**
+     * 设置 90% last-mile hint 文本（由 {@code AgentRunBudgetService} 在首次跨过 90% 阈值时调用）。
+     * 空白值等价于清理,避免误把空字符串当成有效 hint 注入到 SystemMessage。
+     */
+    public static void setLastMileHint(String hint) {
+        if (hint == null || hint.isBlank()) {
+            LAST_MILE_HINT_HOLDER.remove();
+            return;
+        }
+        LAST_MILE_HINT_HOLDER.set(hint);
+    }
+
+    /**
+     * 获取 90% last-mile hint,可能为 null(未设置或已清理)。
+     * 由 {@code LangchainTodoNodeExecutor#chatRequestTransformer} 读取,
+     * 读到非空字符串时拼接到 SystemMessage 末尾促使 LLM 尽快给出最终结论。
+     */
+    public static String getLastMileHint() {
+        return LAST_MILE_HINT_HOLDER.get();
+    }
+
+    /** 清理 last-mile hint(在 chatRequestTransformer 注入完成后立即清,避免下次 LLM 调用误注入)。 */
+    public static void clearLastMileHint() {
+        LAST_MILE_HINT_HOLDER.remove();
+    }
+
     /** 清理 phase。 */
     public static void clearPhase() {
         PHASE_HOLDER.remove();
@@ -626,7 +662,8 @@ public class AgentContext {
                 getStageConfig(),
                 getEffectiveExecutionStageConfig(),
                 getWorkflow(),
-                getDataFreshness()
+                getDataFreshness(),
+                getLastMileHint()
         );
     }
 
@@ -705,6 +742,12 @@ public class AgentContext {
         } else {
             setDataFreshness(snapshot.dataFreshness());
         }
+        // last-mile hint:子线程的 LLM 调用也需要继承,否则在并行 DAG 子节点里 hint 看不到
+        if (snapshot.lastMileHint() == null) {
+            clearLastMileHint();
+        } else {
+            setLastMileHint(snapshot.lastMileHint());
+        }
     }
 
     /**
@@ -739,6 +782,7 @@ public class AgentContext {
         clearDataFreshness();
         clearThinkingContent();
         clearStreamingProgress();
+        clearLastMileHint();
     }
 
     /**
@@ -791,7 +835,8 @@ public class AgentContext {
             RunStageConfig stageConfig,
             StageLlmConfig effectiveExecutionStageConfig,
             String workflow,
-            AgentLlmProperties.DataFreshness dataFreshness
+            AgentLlmProperties.DataFreshness dataFreshness,
+            String lastMileHint
     ) {
     }
 

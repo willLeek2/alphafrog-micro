@@ -169,11 +169,18 @@ public class AgentRunBudgetService {
         if (runId == null || runId.isBlank()) {
             return;
         }
+        String userId = AgentContext.getUserId();
         EffectiveRunBudget budget = effectiveConfig();
         Map<String, Object> summary = loadSummary(runId);
         // startedAtMillis 由 Pipeline 在 run 开始时写入 observability，用于计算挂钟时间
         long startedAt = toLong(summary.get("startedAtMillis"));
         long elapsed = startedAt <= 0 ? 0 : Math.max(0, System.currentTimeMillis() - startedAt);
+        // 0. 预算进度告警（80% 阈值）：先发 BUDGET_PROGRESS，再做超限检查，
+        //    这样在跨过 80% 的同一轮既能产出进度事件，也能在后续真正超限时正常抛 exceeded
+        emitBudgetProgressIfNeeded(runId, userId, summary, budget, elapsed);
+        // 0b. 90% last-mile 提示：跨过 90% 时写 BUDGET_LAST_MILE 事件 + 写入 AgentContext.lastMileHint，
+        //     下一次 LLM 调用时 chatRequestTransformer 会读取并注入到 SystemMessage 促使 LLM 尽快给出最终结论
+        emitBudgetLastMileIfNeeded(runId, userId, summary, budget, elapsed);
         // 1. 挂钟时间检查：从 run 启动到当前的毫秒数
         if (budget.maxWallClockMs() > 0 && elapsed > budget.maxWallClockMs()) {
             throw exceeded("wall_clock_ms", elapsed, budget.maxWallClockMs());
@@ -211,6 +218,122 @@ public class AgentRunBudgetService {
             eventService.append(runId, userId, "RUN_BUDGET_EXCEEDED", payload);
         }
         return new RunBudgetException(dimension, actual, limit, false);
+    }
+
+    /**
+     * 80% 预算进度告警 —— 对四个维度逐一检查首次跨过 80% 阈值的情况，
+     * 对未告警过的 dimension 写入 {@code BUDGET_PROGRESS} 事件并打点去重标记。
+     * 阈值逻辑：{@code ratio ∈ [0.80, 1.00)} 触发一次；
+     * ratio < 0.80 或 limit <= 0 时跳过；ratio >= 1.00 由后续 exceeded 检查接管（不再触发本事件）。
+     *
+     * <p>为什么 ratio >= 1.00 不发 BUDGET_PROGRESS：
+     * 此时已处于"超限态"，下一步将立即抛 {@link RunBudgetException} 并写入 {@code RUN_BUDGET_EXCEEDED} 事件。
+     * 为了避免在同一个 check 轮内同维度发 2 条事件（BUDGET_PROGRESS + RUN_BUDGET_EXCEEDED），
+     * 此处只覆盖 80%~99% 这段"接近但尚未超限"的告警窗口。</p>
+     */
+    private void emitBudgetProgressIfNeeded(String runId, String userId,
+                                            Map<String, Object> summary,
+                                            EffectiveRunBudget budget, long elapsed) {
+        if (runId == null || userId == null) {
+            return;
+        }
+        checkDimension(runId, userId, "wall_clock_ms", elapsed, budget.maxWallClockMs());
+        checkDimension(runId, userId, "llm_calls", toLong(summary.get("llmCalls")), budget.maxLlmCalls());
+        checkDimension(runId, userId, "tool_calls", toLong(summary.get("toolCalls")), budget.maxToolCalls());
+        checkDimension(runId, userId, "tokens", toLong(summary.get("totalTokens")), budget.maxTokens());
+    }
+
+    /**
+     * 单维度 80% 阈值检查：未告警且 {@code ratio ∈ [0.80, 1.00)} 时写 {@code BUDGET_PROGRESS} 并打标。
+     * 去重基于 {@link AgentRunStateStore#tryMarkBudgetProgressWarned} 的 Redis SADD 原子语义，
+     * 保证同一 {@code (runId, dimension)} 组合在并发场景（并行 DAG 节点、并发 LLM/tool 入口）下也只发一次事件。
+     * <p>不能用 {@code hasBudgetProgressWarned → markBudgetProgressWarned} 两步走——
+     * 两步之间会被其他线程插队，导致同维度重复发 {@code BUDGET_PROGRESS}。</p>
+     */
+    private void checkDimension(String runId, String userId, String dimension, long actual, long limit) {
+        if (limit <= 0 || actual < 0) {
+            return;
+        }
+        double ratio = (double) actual / (double) limit;
+        if (ratio < 0.80 || ratio >= 1.00) {
+            return;
+        }
+        if (!stateStore.tryMarkBudgetProgressWarned(runId, dimension)) {
+            // 已被其它线程抢先标记 → 本轮跳过，不再发事件
+            return;
+        }
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("dimension", dimension);
+        payload.put("actual", actual);
+        payload.put("limit", limit);
+        payload.put("ratio", ratio);
+        eventService.append(runId, userId, "BUDGET_PROGRESS", payload);
+    }
+
+    /**
+     * 90% last-mile 提示 —— 对四个维度逐一检查首次跨过 90% 阈值的情况，
+     * 对未提示过的 dimension 写入 {@code BUDGET_LAST_MILE} 事件并写入 {@link AgentContext#setLastMileHint} ThreadLocal，
+     * 促使 {@code LangchainTodoNodeExecutor} 下一次 {@code chatRequestTransformer} 把 hint 注入到 SystemMessage。
+     * 阈值逻辑：{@code ratio ∈ [0.90, 1.00)} 触发一次；其它情况跳过。
+     */
+    private void emitBudgetLastMileIfNeeded(String runId, String userId,
+                                            Map<String, Object> summary,
+                                            EffectiveRunBudget budget, long elapsed) {
+        if (runId == null || userId == null) {
+            return;
+        }
+        checkDimension90(runId, userId, "wall_clock_ms", elapsed, budget.maxWallClockMs());
+        checkDimension90(runId, userId, "llm_calls", toLong(summary.get("llmCalls")), budget.maxLlmCalls());
+        checkDimension90(runId, userId, "tool_calls", toLong(summary.get("toolCalls")), budget.maxToolCalls());
+        checkDimension90(runId, userId, "tokens", toLong(summary.get("totalTokens")), budget.maxTokens());
+    }
+
+    /**
+     * 单维度 90% 阈值检查：未提示且 {@code ratio ∈ [0.90, 1.00)} 时写 {@code BUDGET_LAST_MILE} 事件 + 写 last-mile hint。
+     * 去重基于 {@link AgentRunStateStore#tryMarkBudgetLastMileWarned} 的原子语义（同 80%）。
+     */
+    private void checkDimension90(String runId, String userId, String dimension, long actual, long limit) {
+        if (limit <= 0 || actual < 0) {
+            return;
+        }
+        double ratio = (double) actual / (double) limit;
+        if (ratio < 0.90 || ratio >= 1.00) {
+            return;
+        }
+        if (!stateStore.tryMarkBudgetLastMileWarned(runId, dimension)) {
+            return;
+        }
+        long ratioPct = (long) Math.floor(ratio * 100);
+        AgentContext.setLastMileHint(buildLastMileHint(dimension, actual, limit, ratioPct));
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("dimension", dimension);
+        payload.put("actual", actual);
+        payload.put("limit", limit);
+        payload.put("ratio", ratio);
+        payload.put("ratioPct", ratioPct);
+        eventService.append(runId, userId, "BUDGET_LAST_MILE", payload);
+    }
+
+    /**
+     * 拼装 90% last-mile hint 中文文本。
+     * 模板：{@code [last_mile_hint] 本 run 已使用 <pct>% <dim> 预算（<act>/<limit>），<advice>}
+     * advice 按维度区分：tokens 提示精简输出；tool_calls 提示精简工具调用；llm_calls 提示本轮直接给结论；wall_clock_ms 提示尽快完成。
+     */
+    private String buildLastMileHint(String dimension, long actual, long limit, long ratioPct) {
+        String advice;
+        if ("tokens".equals(dimension)) {
+            advice = "请精简回复，直接给出最终结论，避免长推理和重复工具调用。";
+        } else if ("tool_calls".equals(dimension)) {
+            advice = "请精简工具调用，必要时直接基于已有信息给出结论。";
+        } else if ("llm_calls".equals(dimension)) {
+            advice = "请尽量在当前调用内直接给出最终结论，避免再发起新一轮 LLM 调用。";
+        } else {
+            // wall_clock_ms
+            advice = "请尽快完成剩余 todo 并给出最终结论。";
+        }
+        return String.format(
+                "[last_mile_hint] 本 run 已使用 %d%% %s 预算（%d/%d），%s",
+                ratioPct, dimension, actual, limit, advice);
     }
 
     /** 从 Nacos 热加载配置读取 {@code runtime.runBudget}。 */

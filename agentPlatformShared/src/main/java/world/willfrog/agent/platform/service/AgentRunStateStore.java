@@ -43,6 +43,18 @@ public class AgentRunStateStore {
     private static final String TOOL_CALL_COUNT_KEY = ":tool_call_count";
     private static final String PATCHED_PLAN_KEY = ":patched_plan";
 
+    /**
+     * 预算进度告警去重 key（Set 结构，元素为已发过 80% 告警的 dimension 名）。
+     * 用于保证 {@code BUDGET_PROGRESS} 事件在单个 run 内对每个 dimension 只发一次（首次跨过 80% 阈值时触发）。
+     */
+    private static final String BUDGET_PROGRESS_WARNED_KEY = ":budget_progress_warned";
+
+    /**
+     * 90% last-mile 提示去重 key（Set 结构，元素为已发过 90% 提示的 dimension 名）。
+     * 用于保证 {@code BUDGET_LAST_MILE} 事件 + {@code AgentContext.lastMileHint} 注入在单个 run 内对每个 dimension 只触发一次（首次跨过 90% 阈值时触发）。
+     */
+    private static final String BUDGET_LAST_MILE_WARNED_KEY = ":budget_last_mile_warned";
+
     // legacy keys for read compatibility
     private static final String TASK_INDEX_KEY = ":tasks";
     private static final String TASK_KEY_PREFIX = ":task:";
@@ -415,6 +427,89 @@ public class AgentRunStateStore {
         touch(toolCallCountKey(runId));
     }
 
+    /**
+     * 原子地尝试标记某个 dimension 在本 run 已发过 80% 预算进度告警。
+     * 利用 Redis {@code SADD} 的原子语义（元素不存在时返回 1，已存在时返回 0），
+     * 保证同 {@code (runId, dimension)} 组合在并发场景（并行 DAG 节点、并发 LLM/tool 入口）下也只发一次 {@code BUDGET_PROGRESS} 事件。
+     * <p>调用方应只在返回 {@code true} 时发出事件；返回 {@code false} 表示已被其它线程抢先标记，应跳过。</p>
+     *
+     * @return true 表示本次新加入（应当前调用方发事件）；false 表示已存在（应跳过）
+     */
+    public boolean tryMarkBudgetProgressWarned(String runId, String dimension) {
+        if (blank(runId) || blank(dimension)) {
+            return false;
+        }
+        Long added = redisTemplate.opsForSet().add(budgetProgressWarnedKey(runId), dimension);
+        touch(budgetProgressWarnedKey(runId));
+        return added != null && added > 0;
+    }
+
+    /**
+     * 非破坏性查询某 dimension 是否已发过 80% 预算进度告警。
+     * 不修改 Redis 状态，用于监控/测试的只读场景。
+     * <p>注意：发事件路径请使用 {@link #tryMarkBudgetProgressWarned} 原子 gate，
+     * 不要先 {@code has} 再 {@code mark} 两步走——并发下两步之间会被其他线程插队导致重复事件。</p>
+     *
+     * @return true 表示已发过，false 表示尚未发过
+     */
+    public boolean hasBudgetProgressWarned(String runId, String dimension) {
+        if (blank(runId) || blank(dimension)) {
+            return false;
+        }
+        Boolean member = redisTemplate.opsForSet().isMember(budgetProgressWarnedKey(runId), dimension);
+        return Boolean.TRUE.equals(member);
+    }
+
+    /**
+     * 清空本 run 的 80% 预算进度告警去重 Set。
+     * 由 {@link #clear} 在 run 结束时统一调用；单独暴露用于测试和运维手工清理。
+     */
+    public void clearBudgetProgressWarned(String runId) {
+        if (blank(runId)) {
+            return;
+        }
+        redisTemplate.delete(budgetProgressWarnedKey(runId));
+    }
+
+    /**
+     * 原子地尝试标记某个 dimension 在本 run 已发过 90% last-mile 提示。
+     * 与 {@link #tryMarkBudgetProgressWarned} 同语义（Redis SADD 返回值做 check-and-set），
+     * 保证同 {@code (runId, dimension)} 在并发场景下只触发一次 {@code BUDGET_LAST_MILE} 事件 + {@code AgentContext.lastMileHint} 写入。
+     *
+     * @return true 表示本次新加入（应当前调用方发事件 + 写 hint）；false 表示已存在（应跳过）
+     */
+    public boolean tryMarkBudgetLastMileWarned(String runId, String dimension) {
+        if (blank(runId) || blank(dimension)) {
+            return false;
+        }
+        Long added = redisTemplate.opsForSet().add(budgetLastMileWarnedKey(runId), dimension);
+        touch(budgetLastMileWarnedKey(runId));
+        return added != null && added > 0;
+    }
+
+    /**
+     * 非破坏性查询某 dimension 是否已发过 90% last-mile 提示。
+     * 不修改 Redis 状态，用于监控/测试的只读场景。
+     */
+    public boolean hasBudgetLastMileWarned(String runId, String dimension) {
+        if (blank(runId) || blank(dimension)) {
+            return false;
+        }
+        Boolean member = redisTemplate.opsForSet().isMember(budgetLastMileWarnedKey(runId), dimension);
+        return Boolean.TRUE.equals(member);
+    }
+
+    /**
+     * 清空本 run 的 90% last-mile 提示去重 Set。
+     * 由 {@link #clear} 在 run 结束时统一调用；单独暴露用于测试和运维手工清理。
+     */
+    public void clearBudgetLastMileWarned(String runId) {
+        if (blank(runId)) {
+            return;
+        }
+        redisTemplate.delete(budgetLastMileWarnedKey(runId));
+    }
+
     public String buildProgressJson(String runId, String planJson) {
         JsonNode root = parseJson(planJson);
         if (root != null && root.path("items").isArray()) {
@@ -439,6 +534,8 @@ public class AgentRunStateStore {
         redisTemplate.delete(workflowStateKey(runId));
         redisTemplate.delete(toolCallCountKey(runId));
         redisTemplate.delete(patchedPlanKey(runId));
+        redisTemplate.delete(budgetProgressWarnedKey(runId));
+        redisTemplate.delete(budgetLastMileWarnedKey(runId));
     }
 
     public void clearTasks(String runId) {
@@ -669,6 +766,14 @@ public class AgentRunStateStore {
 
     private String patchedPlanKey(String runId) {
         return PREFIX + runId + PATCHED_PLAN_KEY;
+    }
+
+    private String budgetProgressWarnedKey(String runId) {
+        return PREFIX + runId + BUDGET_PROGRESS_WARNED_KEY;
+    }
+
+    private String budgetLastMileWarnedKey(String runId) {
+        return PREFIX + runId + BUDGET_LAST_MILE_WARNED_KEY;
     }
 
     private String taskIndexKey(String runId) {

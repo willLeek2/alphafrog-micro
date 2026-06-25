@@ -1,5 +1,8 @@
 package world.willfrog.agentlangchain.orchestration;
 
+import dev.langchain4j.data.message.ChatMessage;
+import dev.langchain4j.data.message.SystemMessage;
+import dev.langchain4j.model.chat.request.ChatRequest;
 import dev.langchain4j.service.AiServices;
 import dev.langchain4j.service.tool.ToolProvider;
 import lombok.RequiredArgsConstructor;
@@ -7,6 +10,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.exception.RunBudgetException;
 import world.willfrog.agent.platform.service.AgentPromptService;
 import world.willfrog.agent.platform.service.AgentRunBudgetService;
 import world.willfrog.agent.workflow.DatasetRefRegistry;
@@ -14,6 +18,7 @@ import world.willfrog.agent.workflow.TodoItem;
 import world.willfrog.agentlangchain.tools.LangchainDatasetRefContext;
 import world.willfrog.agentlangchain.tools.LangchainRepeatedToolCallContext;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -93,7 +98,9 @@ public class LangchainTodoNodeExecutor {
     private static final double BUDGET_HIT_RATIO = 0.8;
 
     /**
-     * empty_todo_output 结构化观测的内部记录。承载在 {@code LangchainTodoNodeResult.failureMetadata} 中传递到 pipeline，最终写入 event payload 的 {@code empty_output_observation} 子 map。
+     * empty_todo_output 结构化观测的内部记录。承载在 {@code LangchainTodoNodeResult.failureMetadata} 中传递到 pipeline，
+     * 最终由 {@link LangchainTodoNodeResult#routeFailureMetadataField} 按语义路由到 event payload 的对应子 map
+     * （empty output 走 {@code empty_output_observation}，budget failure 走 {@code budget_failure}）。
      */
     private record EmptyOutputObservation(
             String todoId,
@@ -262,7 +269,8 @@ public class LangchainTodoNodeExecutor {
         } catch (Exception e) {
             // ensureRunnable 抛出的 RUN_INTERRUPTED 异常、tool loop 内的工具异常、LLM 超时等都会在这里捕获，
             // 统一转为失败结果；上层 DagWorkflowExecutor 根据 isSuccess() 决定是否 skip 下游节点
-            return LangchainTodoNodeResult.failure(e.getMessage());
+            Map<String, Object> budgetMetadata = extractBudgetFailureMetadata(e);
+            return LangchainTodoNodeResult.failure(e.getMessage(), budgetMetadata);
         } finally {
             // 清理 ThreadLocal，防止线程池复用时上下文串扰到下一个 run
             LangchainRepeatedToolCallContext.clear();
@@ -383,7 +391,7 @@ public class LangchainTodoNodeExecutor {
                 .systemMessageProvider(ignored -> promptService.dagReactSystemPrompt())
                 .chatRequestTransformer(chatRequest -> {
                     ensureRunnable(request);
-                    return chatRequest;
+                    return maybeInjectLastMileHint(chatRequest);
                 })
                 .build();
     }
@@ -580,7 +588,7 @@ public class LangchainTodoNodeExecutor {
                 .maxToolCallingRoundTrips(resolveMaxToolRoundTrips(request.getMaxToolRoundTrips()))
                 .chatRequestTransformer(chatRequest -> {
                     ensureRunnable(request);
-                    return chatRequest;
+                    return maybeInjectLastMileHint(chatRequest);
                 })
                 .beforeToolExecution(ignored -> ensureRunnable(request))
                 .toolExecutionErrorHandler(LangchainTerminalToolErrorHandler::handle)
@@ -615,7 +623,7 @@ public class LangchainTodoNodeExecutor {
                 .systemMessageProvider(ignored -> promptService.dagReactSystemPrompt())
                 .chatRequestTransformer(chatRequest -> {
                     ensureRunnable(request);
-                    return chatRequest;
+                    return maybeInjectLastMileHint(chatRequest);
                 })
                 .build();
     }
@@ -685,5 +693,126 @@ public class LangchainTodoNodeExecutor {
      */
     private boolean isBlank(String value) {
         return value == null || value.trim().isEmpty();
+    }
+
+    /**
+     * 把 {@link AgentContext#getLastMileHint()} 里待注入的 budget last-mile 提示合并到下一次 LLM 请求中。
+     * <p>
+     * 触发条件：{@link AgentRunBudgetService} 在 run 用量首次跨过 90% 阈值时把提示写入
+     * {@link AgentContext#setLastMileHint(String)}（per-run 一次性，原子 SADD gate 守门）。
+     * <p>
+     * 注入位置：拼到 ChatRequest.messages 的第一个 {@link SystemMessage} 末尾；
+     * 如果当前消息列表里没有 SystemMessage，则在列表头部新增一条承载提示的 SystemMessage。
+     * 注入后立即调用 {@link AgentContext#clearLastMileHint()} 清空 ThreadLocal，避免下次 tool-loop 再次消费同一份提示。
+     * <p>
+     * ChatRequest 的其他字段（{@code modelName} / {@code temperature} / {@code toolSpecifications} / {@code parameters} 等）
+     * 通过 LC4j 1.15.0 的 {@link ChatRequest#toBuilder()} 整体继承，只覆盖 {@code messages} 一项。
+     *
+     * @param chatRequest 本次 LLM 调用的原始请求对象
+     * @return 注入提示后的新 ChatRequest；ThreadLocal 无提示时原样返回
+     */
+    static ChatRequest maybeInjectLastMileHint(ChatRequest chatRequest) {
+        if (chatRequest == null) {
+            return null;
+        }
+        String hint = AgentContext.getLastMileHint();
+        if (hint == null || hint.isBlank()) {
+            return chatRequest;
+        }
+        List<ChatMessage> original = chatRequest.messages();
+        List<ChatMessage> rebuilt = rebuildMessagesWithHint(
+                original == null ? List.of() : original,
+                hint);
+        AgentContext.clearLastMileHint();
+        return chatRequest.toBuilder()
+                .messages(rebuilt)
+                .build();
+    }
+
+    /**
+     * 把 hint 文本合并到消息列表的第一个 SystemMessage；如果没有则前置一条新的 SystemMessage。
+     * <p>
+     * 仅对当前 list 做浅拷贝（{@link ArrayList#ArrayList(java.util.Collection)}），不动原引用。
+     * SystemMessage 文本拼接时使用 {@code "\n\n"} 分隔，保证与已有 prompt 之间有空行可读。
+     */
+    private static List<ChatMessage> rebuildMessagesWithHint(List<ChatMessage> original, String hint) {
+        List<ChatMessage> out = new ArrayList<>(original.size() + 1);
+        boolean injected = false;
+        for (ChatMessage msg : original) {
+            if (!injected && msg instanceof SystemMessage sm) {
+                String appended = sm.text() + "\n\n" + hint;
+                out.add(SystemMessage.from(appended));
+                injected = true;
+            } else {
+                out.add(msg);
+            }
+        }
+        if (!injected) {
+            out.add(0, SystemMessage.from(hint));
+        }
+        return out;
+    }
+
+    /**
+     * Phase 3.2 A3 M2 path: 从 catch 的异常中提取 budget 超限结构化字段，供 LangchainLinearWorkflowExecutor /
+     * LangchainDagWorkflowExecutor 在 partial / fail-fast 决策时识别。
+     * <p>
+     * 触发链路：{@link AgentRunBudgetService#checkBeforeLlmCall()} / {@link AgentRunBudgetService#checkBeforeToolCall()}
+     * 在 budget 超限时抛 {@link RunBudgetException}（继承 {@link IllegalStateException}），消息格式
+     * {@code RUN_BUDGET_EXCEEDED:<dimension>:<actual>/<limit>}。
+     * 旧版 catch 直接 {@code LangchainTodoNodeResult.failure(e.getMessage())} 把异常吞成普通 reason string，
+     * workflow 层无法区分 budget 超限 vs 其他 IllegalStateException。
+     * <p>
+     * 这里特判：如果 cause chain 任一环是 {@link RunBudgetException} 或异常消息以 {@code RUN_BUDGET_EXCEEDED:} 开头，
+     * 返回一个带 {@code budget_exceeded=true} + dimension/actual/limit/ratio 字段的 metadata map，
+     * 透传到 LangchainTodoNodeResult.failureMetadata → LangchainLinearWorkflowResult.failureMetadata →
+     * pipeline WORKFLOW_PARTIAL_BUDGET / WORKFLOW_FAILED_BUDGET event payload。
+     * <p>
+     * 非 budget 异常返回 null，与现有空 failureMetadata 行为一致。
+     */
+    static Map<String, Object> extractBudgetFailureMetadata(Throwable t) {
+        Throwable cur = t;
+        int depth = 0;
+        while (cur != null && depth < 8) {
+            if (cur instanceof RunBudgetException rbe) {
+                Map<String, Object> meta = new LinkedHashMap<>();
+                meta.put("budget_exceeded", true);
+                meta.put("dimension", rbe.getDimension());
+                meta.put("actual", rbe.getActual());
+                meta.put("limit", rbe.getLimit());
+                meta.put("ratio", rbe.getRatio());
+                meta.put("partial", rbe.isPartial());
+                return meta;
+            }
+            String msg = cur.getMessage();
+            if (msg != null && msg.startsWith("RUN_BUDGET_EXCEEDED:")) {
+                // 兜底路径：当上游包了一层（如 RuntimeException 套 RunBudgetException），
+                // 从 message 里拆出 dimension / actual / limit 三段（format = RUN_BUDGET_EXCEEDED:<dim>:<actual>/<limit>）
+                Map<String, Object> meta = new LinkedHashMap<>();
+                meta.put("budget_exceeded", true);
+                String[] parts = msg.split(":", 3);
+                if (parts.length >= 2) {
+                    meta.put("dimension", parts[1]);
+                }
+                if (parts.length >= 3) {
+                    String[] ratio = parts[2].split("/");
+                    if (ratio.length == 2) {
+                        try {
+                            long actual = Long.parseLong(ratio[0]);
+                            long limit = Long.parseLong(ratio[1]);
+                            meta.put("actual", actual);
+                            meta.put("limit", limit);
+                            meta.put("ratio", limit > 0 ? ((double) actual) / limit : 0.0);
+                        } catch (NumberFormatException nfe) {
+                            // 解析失败保留 dimension 字段，actual/limit/ratio 省略
+                        }
+                    }
+                }
+                return meta;
+            }
+            cur = cur.getCause();
+            depth++;
+        }
+        return null;
     }
 }

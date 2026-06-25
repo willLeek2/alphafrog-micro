@@ -132,10 +132,17 @@ public class LangchainLinearWorkflowExecutor {
             long nodeDurationMs = System.currentTimeMillis() - nodeStartMs;
             if (!nodeResult.isSuccess()) {
                 String reason = nvl(nodeResult.getFailureReason(), nodeResult.getSummary());
+                Map<String, Object> failureMetadata = nodeResult.getFailureMetadata();
                 emitTodoNodeEvent(request.getRunId(), request.getUserId(),
                         "TODO_NODE_FAILED", item, reason, nodeDurationMs,
-                        nodeResult.getFailureMetadata(), false, null);
-                return failure(plan, completedTodos, reason, toolCalls.get(), nodeResult.getFailureMetadata());
+                        failureMetadata, false, null);
+                // Phase 3.2 A3 M2/G2/G3: budget 超限分支 — 区分 partial (有产出) 与 fail-fast (零产出)，
+                // 跳过 writeFinalAnswer() 的 LLM 调用（budget 已触顶，再发 LLM 会立即再触发 RunBudgetException）。
+                if (failureMetadata != null && Boolean.TRUE.equals(failureMetadata.get("budget_exceeded"))) {
+                    return handleBudgetExhaustion(request, plan, completedTodos, reason,
+                            failureMetadata, toolCalls.get());
+                }
+                return failure(plan, completedTodos, reason, toolCalls.get(), failureMetadata);
             }
             emitTodoNodeEvent(request.getRunId(), request.getUserId(),
                     "TODO_NODE_COMPLETED", item, null, nodeDurationMs,
@@ -184,6 +191,122 @@ public class LangchainLinearWorkflowExecutor {
                 .toolCallsUsed(toolCallsUsed)
                 .failureMetadata(failureMetadata)
                 .build();
+    }
+
+    /**
+     * Phase 3.2 A3 M3/G3: budget 触顶时的确定性降级路径。
+     * <ul>
+     *   <li>已完成 todo ≥ 1 → 用 {@link LangchainBudgetPartialAnswerBuilder} 拼 deterministic finalAnswer
+     *       （受 MAX_TODOS / MAX_PER_TODO_CHARS / MAX_TOTAL_CHARS 三重上限保护），发 WORKFLOW_PARTIAL_BUDGET；</li>
+     *   <li>已完成 todo = 0 → 无 partial 内容可拼，发 WORKFLOW_FAILED_BUDGET（completed_todo_count=0）；</li>
+     *   <li>两条路径都不调用 {@code todoNodeExecutor.writeFinalAnswer()} —— budget 已超限，再触发 LLM
+     *       会立即再被 {@code AgentRunBudgetService.check()} 拦截抛 {@code RunBudgetException}。</li>
+     * </ul>
+     * failureMetadata 来源：{@link LangchainTodoNodeExecutor#extractBudgetFailureMetadata} 写入的
+     * {@code budget_exceeded=true, dimension, actual, limit, ratio, partial} 子 map。
+     */
+    private LangchainLinearWorkflowResult handleBudgetExhaustion(LangchainLinearWorkflowRequest request,
+                                                                  LangchainTodoPlan plan,
+                                                                  List<LangchainCompletedTodo> completedTodos,
+                                                                  String reason,
+                                                                  Map<String, Object> budgetMetadata,
+                                                                  int toolCallsUsed) {
+        String runId = request.getRunId();
+        String userId = request.getUserId();
+        String dimension = nvl(String.valueOf(budgetMetadata.get("dimension")), "unknown");
+        long actual = toLong(budgetMetadata.get("actual"));
+        long limit = toLong(budgetMetadata.get("limit"));
+        double ratio = toDouble(budgetMetadata.get("ratio"));
+
+        if (!completedTodos.isEmpty()) {
+            LangchainBudgetPartialAnswerBuilder.PartialAnswer partial =
+                    LangchainBudgetPartialAnswerBuilder.build(completedTodos);
+            String partialReason = "RUN_BUDGET_EXCEEDED:" + dimension + ":" + actual + "/" + limit
+                    + " — partial answer built from " + partial.includedTodoCount() + " completed todo(s)";
+            LangchainLinearWorkflowResult result = LangchainLinearWorkflowResult.builder()
+                    .success(false)
+                    .partial(true)
+                    .failureReason(partialReason)
+                    .finalAnswer(partial.finalAnswer())
+                    .plan(plan)
+                    .completedTodos(completedTodos)
+                    .toolCallsUsed(toolCallsUsed)
+                    .failureMetadata(budgetMetadata)
+                    .build();
+            if (!isBlank(runId) && !isBlank(userId)) {
+                Map<String, Object> payload = new LinkedHashMap<>();
+                payload.putAll(LangchainBudgetPartialAnswerBuilder.completedTodoIdsPayload(completedTodos));
+                payload.put("dimension", dimension);
+                payload.put("actual", actual);
+                payload.put("limit", limit);
+                payload.put("ratio", ratio);
+                payload.put("final_answer", partial.finalAnswer());
+                payload.put("final_answer_length", partial.finalAnswerLength());
+                payload.put("final_answer_included_todo_count", partial.includedTodoCount());
+                payload.put("final_answer_skipped_todo_count", partial.skippedTodoCount());
+                payload.put("final_answer_original_total_length", partial.originalTotalLength());
+                payload.put("tool_calls_used", toolCallsUsed);
+                payload.put("failure_reason", partialReason);
+                try {
+                    eventService.append(runId, userId, "WORKFLOW_PARTIAL_BUDGET", payload);
+                } catch (Exception e) {
+                    // 事件失败不影响降级结果
+                }
+            }
+            return result;
+        }
+
+        // completedTodos 空：fail-fast，无 partial 可拼
+        String failedReason = "RUN_BUDGET_EXCEEDED:" + dimension + ":" + actual + "/" + limit
+                + " — no completed todo, fail-fast";
+        LangchainLinearWorkflowResult result = LangchainLinearWorkflowResult.builder()
+                .success(false)
+                .failureReason(failedReason)
+                .plan(plan)
+                .completedTodos(completedTodos)
+                .toolCallsUsed(toolCallsUsed)
+                .failureMetadata(budgetMetadata)
+                .build();
+        if (!isBlank(runId) && !isBlank(userId)) {
+            Map<String, Object> payload = new LinkedHashMap<>();
+            payload.put("dimension", dimension);
+            payload.put("actual", actual);
+            payload.put("limit", limit);
+            payload.put("ratio", ratio);
+            payload.put("completed_todo_count", 0);
+            payload.put("tool_calls_used", toolCallsUsed);
+            payload.put("failure_reason", failedReason);
+            try {
+                eventService.append(runId, userId, "WORKFLOW_FAILED_BUDGET", payload);
+            } catch (Exception e) {
+                // 事件失败不影响降级结果
+            }
+        }
+        return result;
+    }
+
+    private static long toLong(Object value) {
+        if (value instanceof Number n) return n.longValue();
+        if (value instanceof String s) {
+            try {
+                return Long.parseLong(s);
+            } catch (NumberFormatException nfe) {
+                return 0L;
+            }
+        }
+        return 0L;
+    }
+
+    private static double toDouble(Object value) {
+        if (value instanceof Number n) return n.doubleValue();
+        if (value instanceof String s) {
+            try {
+                return Double.parseDouble(s);
+            } catch (NumberFormatException nfe) {
+                return 0.0;
+            }
+        }
+        return 0.0;
     }
 
     private LangchainLinearWorkflowResult interrupted(LangchainTodoPlan plan,
@@ -268,10 +391,14 @@ public class LangchainLinearWorkflowExecutor {
                 payload.put("recovery_outcome", recoveryOutcome);
             }
         }
-        // empty_todo_output 结构化观测：failureMetadata 非空时写入子 map，
-        // 让压测报告 / dashboard 能直接消费，不必回 trace 翻
+        // failureMetadata 结构化观测：按语义路由到对应子字段（budget_failure / empty_output_observation / failure_metadata），
+        // 让压测报告 / dashboard 能直接消费，不必回 trace 翻。
+        // Phase 3.2 A3: budget metadata 不再误挂 empty_output_observation，避免 budget failure 被误归类为 empty_todo_output。
         if (failureMetadata != null && !failureMetadata.isEmpty()) {
-            payload.put("empty_output_observation", failureMetadata);
+            String field = LangchainTodoNodeResult.routeFailureMetadataField(failureMetadata);
+            if (field != null) {
+                payload.put(field, failureMetadata);
+            }
         }
         try {
             eventService.append(runId, userId, eventType, payload);
