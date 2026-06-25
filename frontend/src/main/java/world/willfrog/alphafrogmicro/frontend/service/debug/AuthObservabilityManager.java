@@ -46,7 +46,7 @@ public class AuthObservabilityManager {
         if (scope == null) {
             scope = new AuthObservabilityScope();
         }
-        if (scope.isEmpty() && !forceAllUsers) {
+        if (scope.isEffectivelyAllUsers() && !forceAllUsers) {
             return EnableResult.error("Scope is empty or equivalent to all users; set forceAllUsers=true to enable.");
         }
 

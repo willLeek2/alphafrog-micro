@@ -72,6 +72,54 @@ class AuthObservabilityManagerTest {
     }
 
     @Test
+    void enable_withBroadUsernamePatternWithoutForceAllUsers_shouldReject(@TempDir Path tempDir) {
+        AuthObservabilityManager manager = new AuthObservabilityManager(
+                new ObjectMapper(), properties(tempDir));
+        AuthObservabilityScope scope = new AuthObservabilityScope();
+        scope.setUsernamePattern(".*");
+
+        AuthObservabilityManager.EnableResult result = manager.enable(
+                "admin", "debug", null, scope, false, false);
+
+        assertFalse(result.isSuccess());
+        assertFalse(result.isConflict());
+        assertNotNull(result.getError());
+    }
+
+    @Test
+    void enable_withRootPathIncludesWithoutForceAllUsers_shouldReject(@TempDir Path tempDir) {
+        AuthObservabilityManager manager = new AuthObservabilityManager(
+                new ObjectMapper(), properties(tempDir));
+        AuthObservabilityScope scope = new AuthObservabilityScope();
+        scope.setPathIncludes(java.util.List.of("/"));
+
+        AuthObservabilityManager.EnableResult result = manager.enable(
+                "admin", "debug", null, scope, false, false);
+
+        assertFalse(result.isSuccess());
+        assertFalse(result.isConflict());
+        assertNotNull(result.getError());
+    }
+
+    @Test
+    void enable_withForceAllUsers_shouldCapTtlAndAllowBroadScope(@TempDir Path tempDir) {
+        AuthObservabilityProperties props = properties(tempDir);
+        props.getAuth().setDefaultTtlSeconds(10);
+        AuthObservabilityManager manager = new AuthObservabilityManager(
+                new ObjectMapper(), props);
+        AuthObservabilityScope scope = new AuthObservabilityScope();
+        scope.setUsernamePattern(".*");
+
+        AuthObservabilityManager.EnableResult result = manager.enable(
+                "admin", "debug", 3600, scope, false, true);
+
+        assertTrue(result.isSuccess());
+        AuthObservabilitySession session = result.getSession();
+        long ttlSeconds = (session.getTtlDeadline() - session.getCreatedAt()) / 1000L;
+        assertTrue(ttlSeconds <= 10, "requested TTL should be capped to default");
+    }
+
+    @Test
     void disable_shouldCloseSessionAndStopWriter(@TempDir Path tempDir) {
         AuthObservabilityManager manager = new AuthObservabilityManager(
                 new ObjectMapper(), properties(tempDir));

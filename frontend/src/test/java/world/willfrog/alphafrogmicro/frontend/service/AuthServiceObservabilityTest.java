@@ -112,6 +112,31 @@ class AuthServiceObservabilityTest {
     }
 
     @Test
+    void checkIfLoggedIn_shouldReturnTrueWhenTtlProbeFails() {
+        when(redisTemplate.hasKey("login_status:alice")).thenReturn(true);
+        when(redisTemplate.getExpire("login_status:alice", TimeUnit.SECONDS))
+                .thenThrow(new RuntimeException("Redis unavailable"));
+
+        boolean result = authService.checkIfLoggedIn("alice");
+
+        assertTrue(result);
+        verify(authObservabilityManager).emitLoginStatusCheck(
+                eq("alice"), eq(true), isNull(), eq(RuntimeException.class.getName()));
+    }
+
+    @Test
+    void checkIfLoggedIn_shouldReturnTrueWhenEmitFails() {
+        when(redisTemplate.hasKey("login_status:alice")).thenReturn(true);
+        when(redisTemplate.getExpire("login_status:alice", TimeUnit.SECONDS)).thenReturn(1200L);
+        doThrow(new RuntimeException("emit failed"))
+                .when(authObservabilityManager).emitLoginStatusCheck(anyString(), anyBoolean(), any(), any());
+
+        boolean result = authService.checkIfLoggedIn("alice");
+
+        assertTrue(result);
+    }
+
+    @Test
     void generateToken_shouldCreateSignedJwt() {
         when(jwtConfig.getExpiration()).thenReturn(3600_000L);
 

@@ -154,16 +154,35 @@ public class AuthService {
 
     public boolean checkIfLoggedIn(String username) {
         String key = LOGIN_STATUS_PREFIX + username;
+        boolean exists = false;
         try {
-            boolean exists = Boolean.TRUE.equals(redisTemplate.hasKey(key));
-            Long ttlSeconds = redisTemplate.getExpire(key, TimeUnit.SECONDS);
-            Long ttlMs = ttlSeconds != null && ttlSeconds >= 0 ? ttlSeconds * 1000L : null;
-            authObservabilityManager.emitLoginStatusCheck(username, exists, ttlMs, null);
-            return exists;
+            exists = Boolean.TRUE.equals(redisTemplate.hasKey(key));
         } catch (Exception e) {
-            authObservabilityManager.emitLoginStatusCheck(username, false, null, e.getClass().getName());
+            log.warn("Failed to check login_status existence: {}", username, e);
+            try {
+                authObservabilityManager.emitLoginStatusCheck(username, false, null, e.getClass().getName());
+            } catch (Exception emitEx) {
+                log.warn("Failed to emit login status check observability", emitEx);
+            }
             return false;
         }
+
+        Long ttlMs = null;
+        String errorClass = null;
+        try {
+            Long ttlSeconds = redisTemplate.getExpire(key, TimeUnit.SECONDS);
+            ttlMs = ttlSeconds != null && ttlSeconds >= 0 ? ttlSeconds * 1000L : null;
+        } catch (Exception e) {
+            errorClass = e.getClass().getName();
+            log.warn("Failed to probe login_status TTL: {}", username, e);
+        }
+
+        try {
+            authObservabilityManager.emitLoginStatusCheck(username, exists, ttlMs, errorClass);
+        } catch (Exception e) {
+            log.warn("Failed to emit login status check observability", e);
+        }
+        return exists;
     }
 
     public int markAsLoggedOut(String username) {
