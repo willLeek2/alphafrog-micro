@@ -730,8 +730,12 @@ services:
       AF_CONFIG_NACOS_ENABLED: "true"
       AF_CONFIG_NACOS_NAMESPACE: ${AF_CONFIG_NACOS_NAMESPACE:-}
       AGENT_LANGCHAIN_PROVIDER_DUBBO_GROUP: ${AGENT_LANGCHAIN_PROVIDER_DUBBO_GROUP:-langchain}
+      # Auth debug observability output root (must match volume mount below)
+      AF_DEBUG_OBSERVABILITY_OUTPUT_ROOT: /app/logs/agent-debug-observability
       # Memory Optimization (Medium)
       JAVA_TOOL_OPTIONS: "-Xms384m -Xmx512m"
+    volumes:
+      - ./data/agent-debug-observability:/app/logs/agent-debug-observability
     ports:
       - "8090:8090"
     deploy:

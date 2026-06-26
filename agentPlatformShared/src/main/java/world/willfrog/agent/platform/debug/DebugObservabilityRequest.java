@@ -35,6 +35,11 @@ public record DebugObservabilityRequest(
             if (node == null || node.isNull()) {
                 return disabled();
             }
+            if (node.isBoolean()) {
+                return node.booleanValue()
+                        ? new DebugObservabilityRequest(true, null, null)
+                        : disabled();
+            }
             boolean enabled = node.path("enabled").asBoolean(false);
             if (!enabled) {
                 return disabled();

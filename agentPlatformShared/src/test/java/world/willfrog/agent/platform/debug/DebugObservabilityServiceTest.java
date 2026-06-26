@@ -72,6 +72,13 @@ class DebugObservabilityServiceTest {
     }
 
     @Test
+    void parseContextJsonShouldAcceptBooleanShorthand() {
+        DebugObservabilityRequest request = DebugObservabilityRequest.parseContextJson(
+                "{\"debugObservability\":true}", objectMapper);
+        assertTrue(request.enabled());
+    }
+
+    @Test
     void parseContextJsonShouldReadDebugObservabilityBlock() {
         String contextJson = """
                 {"debugObservability":{"enabled":true,"stressBatchId":"batch-1"}}
