@@ -168,6 +168,7 @@ async def process_task(task: Task, worker_id: int):
             "TASK_COMPLETED task=%s worker=%s status=%s duration_ms=%s "
             "queued_ms=%s pool_enabled=%s queue_wait_ms=%s container_id=%s container_create_ms=%s "
             "workspace_prepare_ms=%s script_run_ms=%s workspace_cleanup_ms=%s "
+            "env_load_ms=%s code_exec_ms=%s artifact_collect_ms=%s "
             "total_runner_ms=%s total_duration_ms=%s container_recycled=%s recycle_reason=%s",
             task.task_id,
             worker_id,
@@ -181,6 +182,9 @@ async def process_task(task: Task, worker_id: int):
             timings.get("workspace_prepare_ms", "-"),
             timings.get("script_run_ms", "-"),
             timings.get("workspace_cleanup_ms", "-"),
+            timings.get("env_load_ms", "-"),
+            timings.get("code_exec_ms", "-"),
+            timings.get("artifact_collect_ms", "-"),
             timings.get("total_runner_ms", "-"),
             timings.get("total_duration_ms", "-"),
             container_recycled,

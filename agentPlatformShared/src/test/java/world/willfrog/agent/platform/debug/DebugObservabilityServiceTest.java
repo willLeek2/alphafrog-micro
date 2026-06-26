@@ -8,6 +8,7 @@ import world.willfrog.agent.platform.context.AgentContext;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Instant;
 import java.util.Map;
 import java.util.stream.Stream;
 
@@ -51,10 +52,15 @@ class DebugObservabilityServiceTest {
         ));
         service.closeRunSession("run-abc");
 
-        try (Stream<Path> sessionDirs = Files.list(tempDir)) {
-            Path sessionDir = sessionDirs.findFirst().orElseThrow();
+        Path sandboxRoot = tempDir.resolve("sandbox");
+        try (Stream<Path> runFiles = Files.find(sandboxRoot, 3,
+                (path, attrs) -> path.getFileName().toString().equals("sandbox-run-abc.jsonl"))) {
+            Path runFile = runFiles.findFirst().orElseThrow();
+            Path sessionDir = runFile.getParent();
             assertTrue(Files.exists(sessionDir.resolve("manifest.json")));
-            Path runFile = sessionDir.resolve("sandbox-run-abc.jsonl");
+            assertEquals("sandbox", sessionDir.getParent().getParent().getFileName().toString());
+            assertTrue(sessionDir.getParent().getFileName().toString().matches("\\d{8}-\\d{2}"));
+            assertTrue(sessionDir.getFileName().toString().matches("\\d{8}-\\d{6}_run-run-abc-[0-9a-f-]+"));
             assertTrue(Files.exists(runFile));
             String content = Files.readString(runFile);
             assertTrue(content.contains("sandbox_poll"));
@@ -86,6 +92,16 @@ class DebugObservabilityServiceTest {
         DebugObservabilityRequest request = DebugObservabilityRequest.parseContextJson(contextJson, objectMapper);
         assertTrue(request.enabled());
         assertEquals("batch-1", request.stressBatchId());
+    }
+
+    @Test
+    void buildSessionDirShouldUseUtcPlusEightHourBuckets() {
+        DebugObservabilityService service = newService(tempDir);
+        Path sessionDir = service.buildSessionDir("session-1", Instant.parse("2026-06-26T04:50:32Z"));
+
+        assertEquals(tempDir.resolve("sandbox")
+                .resolve("20260626-12")
+                .resolve("20260626-125032_session-1"), sessionDir);
     }
 
     @Test

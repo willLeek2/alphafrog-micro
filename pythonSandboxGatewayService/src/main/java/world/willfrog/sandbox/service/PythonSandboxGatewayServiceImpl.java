@@ -156,10 +156,15 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
                     HttpExecuteResult res = response.getBody();
                     int stdoutLen = res.getStdout() == null ? 0 : res.getStdout().length();
                     int stderrLen = res.getStderr() == null ? 0 : res.getStderr().length();
+                    Map<String, Object> timingFields = extractTimingFields(res);
                     log.info("sandbox.getTaskResult.succeeded: taskId={}, exitCode={}, stdoutLen={}, stderrLen={}, "
-                                    + "totalDurationMs={}",
+                                    + "envLoadMs={}, codeExecMs={}, artifactCollectMs={}, totalDurationMs={}",
                             request.getTaskId(), res.getExit_code(), stdoutLen, stderrLen,
+                            timingFields.getOrDefault("env_load_ms", "-"),
+                            timingFields.getOrDefault("code_exec_ms", "-"),
+                            timingFields.getOrDefault("artifact_collect_ms", "-"),
                             System.currentTimeMillis() - startMs);
+                    emitSandboxResultTiming(request.getTaskId(), res, System.currentTimeMillis() - httpStart);
                     return TaskResultResponse.newBuilder()
                             .setTaskId(request.getTaskId())
                             .setStatus("SUCCEEDED")
@@ -196,12 +201,100 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
         }
     }
 
+    private void emitSandboxResultTiming(String taskId, HttpExecuteResult result, long durationMs) {
+        Map<String, Object> timingFields = extractTimingFields(result);
+        if (timingFields.isEmpty()) {
+            return;
+        }
+        Map<String, Object> fields = new LinkedHashMap<>();
+        fields.put("eventType", "sandbox_result_timing");
+        fields.put("taskId", taskId);
+        fields.put("durationMs", durationMs);
+        fields.put("exitCode", result == null ? -1 : result.getExit_code());
+        fields.putAll(timingFields);
+        emitSandboxDebug(fields);
+    }
+
+    static Map<String, Object> extractTimingFields(HttpExecuteResult result) {
+        Map<String, Object> fields = new LinkedHashMap<>();
+        if (result == null || result.getArtifacts() == null) {
+            return fields;
+        }
+        Object rawTimings = result.getArtifacts().get("timings");
+        if (!(rawTimings instanceof Map<?, ?> timings)) {
+            return fields;
+        }
+
+        putTimingAlias(fields, timings, "env_load_ms", "workspace_prepare_ms");
+        putTimingAlias(fields, timings, "code_exec_ms", "script_run_ms");
+        putTimingAlias(fields, timings, "artifact_collect_ms", "workspace_cleanup_ms");
+
+        putTiming(fields, timings, "queue_wait_ms");
+        putTiming(fields, timings, "container_create_ms");
+        putTiming(fields, timings, "workspace_prepare_ms");
+        putTiming(fields, timings, "script_run_ms");
+        putTiming(fields, timings, "workspace_cleanup_ms");
+        putTiming(fields, timings, "total_runner_ms");
+        putTiming(fields, timings, "total_duration_ms");
+        return fields;
+    }
+
+    private static void putTimingAlias(Map<String, Object> fields, Map<?, ?> timings, String preferred, String fallback) {
+        Object value = timingValue(timings, preferred);
+        if (value == null) {
+            value = timingValue(timings, fallback);
+        }
+        if (value != null) {
+            fields.put(preferred, value);
+        }
+    }
+
+    private static void putTiming(Map<String, Object> fields, Map<?, ?> timings, String key) {
+        Object value = timingValue(timings, key);
+        if (value != null) {
+            fields.put(key, value);
+        }
+    }
+
+    private static Object timingValue(Map<?, ?> timings, String key) {
+        Object value = timings.get(key);
+        if (value instanceof Number) {
+            return value;
+        }
+        if (value instanceof String text && !text.isBlank()) {
+            try {
+                return Long.parseLong(text);
+            } catch (NumberFormatException ignoredLong) {
+                try {
+                    return Double.parseDouble(text);
+                } catch (NumberFormatException ignoredDouble) {
+                    return null;
+                }
+            }
+        }
+        return null;
+    }
+
     private void emitSandboxHttp(String method,
                                  String endpoint,
                                  int httpStatus,
                                  long durationMs,
                                  String status,
                                  String errorCategory) {
+        Map<String, Object> fields = new LinkedHashMap<>();
+        fields.put("eventType", "sandbox_http");
+        fields.put("method", method);
+        fields.put("endpoint", endpoint);
+        fields.put("httpStatus", httpStatus);
+        fields.put("durationMs", durationMs);
+        fields.put("status", status);
+        if (errorCategory != null && !errorCategory.isBlank()) {
+            fields.put("errorCategory", errorCategory);
+        }
+        emitSandboxDebug(fields);
+    }
+
+    private void emitSandboxDebug(Map<String, Object> fields) {
         try {
             RpcContext context = RpcContext.getServiceContext();
             if (context == null) {
@@ -210,16 +303,6 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
             String sessionDir = context.getAttachment(DebugObservabilityRpcKeys.SESSION_DIR);
             if (sessionDir == null || sessionDir.isBlank()) {
                 return;
-            }
-            Map<String, Object> fields = new LinkedHashMap<>();
-            fields.put("eventType", "sandbox_http");
-            fields.put("method", method);
-            fields.put("endpoint", endpoint);
-            fields.put("httpStatus", httpStatus);
-            fields.put("durationMs", durationMs);
-            fields.put("status", status);
-            if (errorCategory != null && !errorCategory.isBlank()) {
-                fields.put("errorCategory", errorCategory);
             }
             DebugObservabilityJsonlAppender.append(
                     Path.of(sessionDir),
@@ -271,5 +354,6 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
         private String stdout;
         private String stderr;
         private String dataset_dir;
+        private Map<String, Object> artifacts;
     }
 }

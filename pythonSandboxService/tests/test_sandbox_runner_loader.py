@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import types
 import unittest
+from dataclasses import replace
+from pathlib import Path
 
 llm_sandbox = types.ModuleType("llm_sandbox")
 llm_sandbox.SandboxSession = object
@@ -15,6 +18,7 @@ from app.config import SandboxConfig
 from app.sandbox_runner import (
     SANDBOX_LOADER_FILES,
     _loader_smoke_check_command,
+    run_in_open_session,
 )
 
 
@@ -57,6 +61,58 @@ class SandboxRunnerLoaderTest(unittest.TestCase):
     def test_user_code_with_future_import_is_not_rewritten(self) -> None:
         user_code = 'from __future__ import annotations\nprint("ok")\n'
         compile(user_code, "<user>", "exec")
+
+    def test_run_in_open_session_exposes_observability_phase_timings(self) -> None:
+        class FakeOutput:
+            exit_code = 0
+            stdout = ""
+            stderr = ""
+
+        class FakeRunResult:
+            exit_code = 0
+            stdout = "done"
+            stderr = ""
+
+        class FakeSession:
+            container_id = "container-test"
+
+            def execute_command(self, command: str) -> FakeOutput:
+                return FakeOutput()
+
+            def copy_to_runtime(self, source: str, dest_path: str) -> None:
+                return None
+
+            def run(self, code: str, libraries: list[str], timeout: float) -> FakeRunResult:
+                return FakeRunResult()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir)
+            dataset_dir = data_dir / "ds1"
+            dataset_dir.mkdir()
+            (dataset_dir / "ds1.csv").write_text("x\n1\n", encoding="utf-8")
+            (dataset_dir / "ds1.meta.json").write_text("{}", encoding="utf-8")
+
+            config = replace(_test_config(), data_dir=data_dir)
+
+            result = run_in_open_session(
+                config,
+                FakeSession(),
+                "task-1",
+                "ds1",
+                None,
+                "print('done')",
+                None,
+                None,
+                5,
+            )
+
+        timings = result["timings"]
+        self.assertIn("env_load_ms", timings)
+        self.assertIn("code_exec_ms", timings)
+        self.assertIn("artifact_collect_ms", timings)
+        self.assertEqual(timings["env_load_ms"], timings["workspace_prepare_ms"])
+        self.assertEqual(timings["code_exec_ms"], timings["script_run_ms"])
+        self.assertGreaterEqual(timings["artifact_collect_ms"], 0)
 
 
 if __name__ == "__main__":

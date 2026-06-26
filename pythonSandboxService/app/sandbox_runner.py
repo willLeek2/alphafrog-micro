@@ -818,6 +818,8 @@ def run_in_open_session(
         _smoke_check_loader_modules(session, config, task_id)
         result = session.run(code, libraries=install_libraries, timeout=timeout)
         timings["script_run_ms"] = int((time.monotonic() - t_run_start) * 1000)
+        timings["env_load_ms"] = timings["workspace_prepare_ms"]
+        timings["code_exec_ms"] = timings["script_run_ms"]
         _log_in_container(
             session,
             task_id,
@@ -825,7 +827,9 @@ def run_in_open_session(
             f"script_end exit_code={result.exit_code} stdout_len={len(result.stdout or '')} stderr_len={len(result.stderr or '')}",
         )
 
+        t_artifact_start = time.monotonic()
         _flush_container_log(session, task_id, config)
+        timings["artifact_collect_ms"] = int((time.monotonic() - t_artifact_start) * 1000)
 
         t_cleanup_start = time.monotonic()
         cleanup_ok = _cleanup_task_workspace(session, task_id, config)

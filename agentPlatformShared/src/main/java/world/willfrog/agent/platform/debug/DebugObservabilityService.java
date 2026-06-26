@@ -7,7 +7,7 @@ import world.willfrog.agent.platform.context.AgentContext;
 import java.net.InetAddress;
 import java.nio.file.Path;
 import java.time.Instant;
-import java.time.ZoneOffset;
+import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -21,6 +21,11 @@ public class DebugObservabilityService {
 
     static final String ENV_ROOT = "AF_DEBUG_OBSERVABILITY_ROOT";
     static final String DEFAULT_ROOT = "/app/logs/agent-debug-observability";
+    static final ZoneId OUTPUT_ZONE = ZoneId.of("Asia/Shanghai");
+    private static final DateTimeFormatter HOUR_DIR_FORMATTER =
+            DateTimeFormatter.ofPattern("yyyyMMdd-HH").withZone(OUTPUT_ZONE);
+    private static final DateTimeFormatter SESSION_DIR_FORMATTER =
+            DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss").withZone(OUTPUT_ZONE);
 
     private final ObjectMapper objectMapper;
     private final Path rootDir;
@@ -60,10 +65,7 @@ public class DebugObservabilityService {
             String sessionId = request.resolveSessionId(runId);
             DebugObservabilitySession session = sessions.computeIfAbsent(sessionId, id -> {
                 try {
-                    String dirName = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss")
-                            .withZone(ZoneOffset.UTC)
-                            .format(Instant.now()) + "_" + id;
-                    Path sessionDir = rootDir().resolve(dirName);
+                    Path sessionDir = buildSessionDir(id, Instant.now());
                     return new DebugObservabilitySession(id, sessionDir, objectMapper, 0, 0);
                 } catch (Exception e) {
                     throw new IllegalStateException("Failed to create debug observability session", e);
@@ -128,6 +130,13 @@ public class DebugObservabilityService {
         }
         DebugObservabilitySession session = sessions.get(sessionId);
         return session == null ? null : session.sessionDir().toString();
+    }
+
+    Path buildSessionDir(String sessionId, Instant now) {
+        return rootDir()
+                .resolve("sandbox")
+                .resolve(HOUR_DIR_FORMATTER.format(now))
+                .resolve(SESSION_DIR_FORMATTER.format(now) + "_" + sessionId);
     }
 
     public void emit(Map<String, Object> fields) {
