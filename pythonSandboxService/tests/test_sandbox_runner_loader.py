@@ -35,6 +35,7 @@ def _test_config() -> SandboxConfig:
         sandbox_image="alphafrog-sandbox-runtime:latest",
         skip_environment_setup=True,
         preinstalled_libraries=frozenset(),
+        container_max_concurrency=1,
         pool_enabled=False,
         pool_min_size=0,
         pool_max_size=1,

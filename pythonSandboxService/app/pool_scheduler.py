@@ -5,7 +5,7 @@ import queue
 import threading
 import time
 from collections import Counter
-from concurrent.futures import Future, TimeoutError as FutureTimeoutError
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from typing import List
 
@@ -14,6 +14,7 @@ from .sandbox_runner import (
     SANDBOX_WORKER_LABELS,
     create_sandbox_session,
     get_session_container_id,
+    prepare_container_loader_modules,
     run_in_open_session,
     smoke_check_session,
 )
@@ -53,8 +54,17 @@ class ContainerWorker:
         self.last_used_at: float | None = None
         self.processed_count = 0
         self._stop_event = threading.Event()
+        self._draining = threading.Event()
         self._thread: threading.Thread | None = None
         self._state_lock = threading.Lock()
+        # Intra-container concurrency: one worker container can run N Python tasks
+        # concurrently using independent task workspaces. We use a semaphore to
+        # track available slots and a thread pool to execute tasks.
+        self._slot_semaphore = threading.Semaphore(config.container_max_concurrency)
+        self._executor = ThreadPoolExecutor(max_workers=config.container_max_concurrency)
+        self._in_flight = 0
+        self._in_flight_lock = threading.Lock()
+        self._recycle_reason: str | None = None
 
     def start(self, *, block_until_ready: bool) -> None:
         if block_until_ready:
@@ -70,11 +80,13 @@ class ContainerWorker:
         self._thread.start()
 
     def stop(self) -> None:
+        self._draining.set()
         self._stop_event.set()
 
     def join(self, timeout: float | None = None) -> None:
         if self._thread is not None:
             self._thread.join(timeout)
+        self._executor.shutdown(wait=timeout is not None)
 
     def snapshot_state(self) -> str:
         with self._state_lock:
@@ -83,6 +95,15 @@ class ContainerWorker:
     def mark_stopping(self) -> None:
         with self._state_lock:
             self.state = "stopping"
+
+    def available_slots(self) -> int:
+        """Number of additional tasks this container can accept right now."""
+        with self._in_flight_lock:
+            if self.state in ("starting", "stopping", "closed"):
+                return 0
+            if self._draining.is_set() or self._stop_event.is_set():
+                return 0
+            return self.config.container_max_concurrency - self._in_flight
 
     def _set_state(self, state: str) -> None:
         with self._state_lock:
@@ -94,6 +115,9 @@ class ContainerWorker:
         container_id = get_session_container_id(session)
         try:
             smoke_check_session(self.config, session, container_id)
+            # Copy static loader modules once per warm container so concurrent
+            # tasks do not race copying the same files into /sandbox.
+            prepare_container_loader_modules(session, self.config)
         except Exception:
             session.close()
             raise
@@ -103,9 +127,10 @@ class ContainerWorker:
         self.last_used_at = self.started_at
         self._set_state("idle")
         logger.info(
-            "POOL_WORKER_READY worker=%s container=%s create_ms=%s",
+            "POOL_WORKER_READY worker=%s container=%s slots=%s create_ms=%s",
             self.worker_id,
             self.container_id,
+            self.config.container_max_concurrency,
             int((time.monotonic() - start) * 1000),
         )
 
@@ -120,82 +145,132 @@ class ContainerWorker:
         self._loop()
 
     def _loop(self) -> None:
-        replace_reason: str | None = None
         try:
-            while not self._stop_event.is_set():
+            while True:
+                if self._stop_event.is_set() or self._draining.is_set():
+                    with self._in_flight_lock:
+                        in_flight = self._in_flight
+                    if in_flight == 0:
+                        break
+                    time.sleep(0.1)
+                    continue
+                acquired = self._slot_semaphore.acquire(timeout=1.0)
+                if not acquired:
+                    continue
+                if self._stop_event.is_set() or self._draining.is_set():
+                    self._slot_semaphore.release()
+                    continue
+
                 try:
                     job = self.manager.next_job(timeout=1.0)
                 except queue.Empty:
+                    self._slot_semaphore.release()
                     if self.manager.should_retire_idle(self):
-                        replace_reason = None
-                        logger.info("POOL_WORKER_RETIRE_IDLE worker=%s container=%s", self.worker_id, self.container_id)
+                        logger.info(
+                            "POOL_WORKER_RETIRE_IDLE worker=%s container=%s",
+                            self.worker_id,
+                            self.container_id,
+                        )
                         break
                     continue
 
                 if job is None:
+                    self._slot_semaphore.release()
                     self.manager.job_done()
                     break
+                if self._stop_event.is_set() or self._draining.is_set():
+                    self._slot_semaphore.release()
+                    self.manager.requeue_job(job)
+                    self.manager.job_done()
+                    continue
                 if not job.future.set_running_or_notify_cancel():
+                    self._slot_semaphore.release()
                     self.manager.job_done()
                     continue
 
-                queue_wait_ms = int((time.monotonic() - job.enqueued_at) * 1000)
-                self._set_state("busy")
-                self.last_used_at = time.monotonic()
-                try:
-                    result = run_in_open_session(
-                        self.config,
-                        self.session,
-                        job.task_id,
-                        job.dataset_id,
-                        job.dataset_ids,
-                        job.code,
-                        job.files,
-                        job.libraries,
-                        job.timeout_seconds,
-                        paths_dataset_csv=job.paths_dataset_csv,
-                        path_manifest_csv=job.path_manifest_csv,
-                        queue_wait_ms=queue_wait_ms,
-                        container_id=self.container_id,
-                    )
-                    self.processed_count += 1
-                    if not job.future.done():
-                        job.future.set_result(result)
-
-                    if result.get("container_recycled"):
-                        replace_reason = result.get("recycle_reason") or "task_requested_recycle"
-                        break
-                    if (
-                        self.config.pool_max_container_uses is not None
-                        and self.processed_count >= self.config.pool_max_container_uses
-                    ):
-                        replace_reason = "max_container_uses"
-                        break
-
+                with self._in_flight_lock:
+                    self._in_flight += 1
                     self.last_used_at = time.monotonic()
-                    self._set_state("idle")
-                except Exception as exc:
-                    if not job.future.done():
-                        job.future.set_exception(exc)
-                    replace_reason = f"execution_error:{type(exc).__name__}"
-                    break
-                finally:
-                    self.manager.job_done()
+                    if self._in_flight >= self.config.container_max_concurrency:
+                        self._set_state("busy")
+                    else:
+                        self._set_state("partial")
+
+                submit_future = self._executor.submit(self._run_job, job)
+                submit_future.add_done_callback(lambda f, j=job: self._on_job_done(j, f))
         finally:
             self._set_state("closed")
             if self.session is not None:
                 try:
                     self.session.close()
                 except Exception:
-                    logger.exception("POOL_WORKER_CLOSE_FAILED worker=%s container=%s", self.worker_id, self.container_id)
-            self.manager.worker_stopped(self, replace_reason)
+                    logger.exception(
+                        "POOL_WORKER_CLOSE_FAILED worker=%s container=%s",
+                        self.worker_id,
+                        self.container_id,
+                    )
+            self.manager.worker_stopped(self, self._recycle_reason)
+
+    def _run_job(self, job: SandboxJob) -> dict:
+        queue_wait_ms = int((time.monotonic() - job.enqueued_at) * 1000)
+        return run_in_open_session(
+            self.config,
+            self.session,
+            job.task_id,
+            job.dataset_id,
+            job.dataset_ids,
+            job.code,
+            job.files,
+            job.libraries,
+            job.timeout_seconds,
+            paths_dataset_csv=job.paths_dataset_csv,
+            path_manifest_csv=job.path_manifest_csv,
+            queue_wait_ms=queue_wait_ms,
+            container_id=self.container_id,
+            prepare_loader_modules=False,
+        )
+
+    def _on_job_done(self, job: SandboxJob, future: Future) -> None:
+        try:
+            result = future.result()
+            if not job.future.done():
+                job.future.set_result(result)
+            self.processed_count += 1
+
+            if result.get("container_recycled"):
+                self._recycle_reason = result.get("recycle_reason") or "task_requested_recycle"
+                self._draining.set()
+            elif (
+                self.config.pool_max_container_uses is not None
+                and self.processed_count >= self.config.pool_max_container_uses
+            ):
+                self._recycle_reason = "max_container_uses"
+                self._draining.set()
+        except Exception as exc:
+            if not job.future.done():
+                job.future.set_exception(exc)
+            self._recycle_reason = f"execution_error:{type(exc).__name__}"
+            self._draining.set()
+        finally:
+            self.manager.job_done()
+            with self._in_flight_lock:
+                self._in_flight = max(0, self._in_flight - 1)
+                self.last_used_at = time.monotonic()
+                if self._in_flight == 0:
+                    self._set_state("idle")
+                elif self._in_flight >= self.config.container_max_concurrency:
+                    self._set_state("busy")
+                else:
+                    self._set_state("partial")
+            self._slot_semaphore.release()
 
 
 class ContainerPoolScheduler:
     """Small owned scheduler around llm-sandbox SandboxSession containers."""
 
-    def __init__(self, config: SandboxConfig) -> None:
+    def __init__(self, config: SandboxConfig, dynamic_config=None) -> None:
         self.config = config
+        self.dynamic_config = dynamic_config
         self._jobs: queue.Queue[SandboxJob | None] = queue.Queue()
         self._workers: list[ContainerWorker] = []
         self._lock = threading.Lock()
@@ -204,16 +279,28 @@ class ContainerPoolScheduler:
         self._next_worker_id = 1
         self._starting_count = 0
 
+    def _effective_config(self) -> SandboxConfig:
+        """Return config with current dynamic values applied.
+
+        Existing workers keep the config they were created with; new workers
+        pick up runtime configuration changes (e.g. from Nacos).
+        """
+        if self.dynamic_config is None:
+            return self.config
+        return self.dynamic_config.apply_to(self.config)
+
     def start(self) -> None:
         self._cleanup_stale_worker_containers()
+        effective = self._effective_config()
         logger.info(
-            "POOL_WARMING min=%s max=%s max_concurrency=%s image=%s",
-            self.config.pool_min_size,
-            self.config.pool_max_size,
-            self.config.max_concurrency,
-            self.config.sandbox_image,
+            "POOL_WARMING min=%s max=%s max_concurrency=%s container_slots=%s image=%s",
+            effective.pool_min_size,
+            effective.pool_max_size,
+            effective.max_concurrency,
+            effective.container_max_concurrency,
+            effective.sandbox_image,
         )
-        for _ in range(self.config.pool_min_size):
+        for _ in range(effective.pool_min_size):
             self._start_worker(block_until_ready=True)
         self._started = True
         logger.info("POOL_READY %s", self.get_stats())
@@ -267,20 +354,26 @@ class ContainerPoolScheduler:
     def job_done(self) -> None:
         self._jobs.task_done()
 
+    def requeue_job(self, job: SandboxJob) -> None:
+        """Put a job back on the queue after it was dequeued but not started."""
+        self._jobs.put(job)
+
     def worker_ready(self, worker: ContainerWorker) -> None:
         with self._lock:
             self._starting_count = max(0, self._starting_count - 1)
 
     def worker_failed_to_start(self, worker: ContainerWorker, exc: Exception) -> None:
+        effective = self._effective_config()
         with self._lock:
             self._starting_count = max(0, self._starting_count - 1)
             if worker in self._workers:
                 self._workers.remove(worker)
-            should_replace = not self._closing and self._total_worker_slots_locked() < self.config.pool_min_size
+            should_replace = not self._closing and self._total_worker_slots_locked() < effective.pool_min_size
         if should_replace:
             self._maybe_scale_up(force_min=True)
 
     def worker_stopped(self, worker: ContainerWorker, replace_reason: str | None) -> None:
+        effective = self._effective_config()
         with self._lock:
             if worker in self._workers:
                 self._workers.remove(worker)
@@ -290,9 +383,9 @@ class ContainerPoolScheduler:
             live_slots = self._total_worker_slots_locked()
             should_replace = (
                 replace_reason is not None
-                or live_slots < self.config.pool_min_size
+                or live_slots < effective.pool_min_size
                 or queued > 0
-            ) and live_slots < self.config.pool_max_size
+            ) and live_slots < effective.pool_max_size
 
         if replace_reason is not None:
             logger.warning(
@@ -311,7 +404,7 @@ class ContainerPoolScheduler:
         if idle_seconds < self.config.pool_idle_timeout_seconds:
             return False
         with self._lock:
-            return not self._closing and len(self._workers) > self.config.pool_min_size
+            return not self._closing and len(self._workers) > self.config.pool_min_size and worker.available_slots() == worker.config.container_max_concurrency
 
     def close(self) -> None:
         with self._lock:
@@ -333,18 +426,24 @@ class ContainerPoolScheduler:
             worker.join(timeout=10)
 
     def get_stats(self) -> dict:
+        effective = self._effective_config()
         with self._lock:
             workers = list(self._workers)
             starting = self._starting_count
         states = Counter(worker.snapshot_state() for worker in workers)
+        available_slots = sum(worker.available_slots() for worker in workers)
+        total_slots = sum(worker.config.container_max_concurrency for worker in workers)
         return {
             "total_size": len(workers),
-            "min_size": self.config.pool_min_size,
-            "max_size": self.config.pool_max_size,
+            "min_size": effective.pool_min_size,
+            "max_size": effective.pool_max_size,
             "queued": self._jobs.qsize(),
-            "ready": states.get("idle", 0) + states.get("busy", 0),
+            "ready": states.get("idle", 0) + states.get("partial", 0),
             "busy": states.get("busy", 0),
             "starting": starting,
+            "available_slots": available_slots,
+            "total_slots": total_slots,
+            "container_max_concurrency": effective.container_max_concurrency,
             "state_counts": dict(states),
             "workers": [
                 {
@@ -352,21 +451,26 @@ class ContainerPoolScheduler:
                     "container_id": worker.container_id,
                     "state": worker.snapshot_state(),
                     "processed_count": worker.processed_count,
+                    "available_slots": worker.available_slots(),
+                    "total_slots": worker.config.container_max_concurrency,
                 }
                 for worker in workers
             ],
         }
 
     def _maybe_scale_up(self, *, force_min: bool = False) -> None:
+        effective = self._effective_config()
         with self._lock:
             if self._closing:
                 return
             queued = self._jobs.qsize()
             slots = self._total_worker_slots_locked()
-            states = Counter(worker.snapshot_state() for worker in self._workers)
-            available_capacity = states.get("idle", 0)
-            need_min = force_min and slots < self.config.pool_min_size
-            need_queue_capacity = queued > available_capacity and slots < self.config.pool_max_size
+            # Load balancing: capacity-first / min-container. We keep tasks on
+            # existing warm containers until their total available slots can no
+            # longer cover the queued workload, then start a new container.
+            available_capacity = sum(worker.available_slots() for worker in self._workers)
+            need_min = force_min and slots < effective.pool_min_size
+            need_queue_capacity = queued > available_capacity and slots < effective.pool_max_size
             if not need_min and not need_queue_capacity:
                 return
         self._start_worker(block_until_ready=False)
@@ -411,14 +515,15 @@ class ContainerPoolScheduler:
         return max((timeout_seconds or self.config.execution_timeout_seconds) * 2, 30)
 
     def _start_worker(self, *, block_until_ready: bool) -> None:
+        effective = self._effective_config()
         with self._lock:
             if self._closing:
                 return
-            if self._total_worker_slots_locked() >= self.config.pool_max_size:
+            if self._total_worker_slots_locked() >= effective.pool_max_size:
                 return
             worker_id = self._next_worker_id
             self._next_worker_id += 1
-            worker = ContainerWorker(worker_id, self.config, self)
+            worker = ContainerWorker(worker_id, effective, self)
             self._workers.append(worker)
             self._starting_count += 1
         try:

@@ -11,6 +11,7 @@ from fastapi import FastAPI, HTTPException
 
 from .config import load_config
 from .models import CreateTaskResponse, ExecuteRequest, ExecuteResult, Task, TaskStatus
+from .nacos_config import DynamicSandboxConfig, start_nacos_listener
 from .pool_scheduler import ContainerPoolScheduler
 from .sandbox_runner import run_in_sandbox
 
@@ -43,6 +44,7 @@ uvicorn_access.setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 config = load_config()
+dynamic_config = DynamicSandboxConfig(config)
 
 # In-memory storage
 tasks: Dict[str, Task] = {}
@@ -197,9 +199,12 @@ async def lifespan(app: FastAPI):
     global pool
     worker_count = max(1, config.max_concurrency)
 
+    # Start Nacos config listener for hot-reloadable values.
+    start_nacos_listener(config, dynamic_config)
+
     # Create container pool if enabled
     if config.pool_enabled:
-        pool = ContainerPoolScheduler(config)
+        pool = ContainerPoolScheduler(config, dynamic_config=dynamic_config)
         pool.start()
         logger.info("Container scheduler initialized for sandbox runner")
     else:

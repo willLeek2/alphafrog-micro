@@ -626,6 +626,7 @@ services:
       AF_SANDBOX_IMAGE: ${AF_SANDBOX_IMAGE:-alphafrog-sandbox-runtime:latest}
       AF_SANDBOX_SKIP_ENVIRONMENT_SETUP: ${AF_SANDBOX_SKIP_ENVIRONMENT_SETUP:-true}
       AF_SANDBOX_PREINSTALLED_LIBRARIES: ${AF_SANDBOX_PREINSTALLED_LIBRARIES:-numpy,pandas,matplotlib,scipy}
+      AF_SANDBOX_CONTAINER_MAX_CONCURRENCY: ${AF_SANDBOX_CONTAINER_MAX_CONCURRENCY:-5}
       # Compose/default deployment exercises the pooled runner. Set
       # AF_SANDBOX_POOL_ENABLED=false in the host env/.env to force the legacy per-task SandboxSession path.
       AF_SANDBOX_POOL_ENABLED: ${AF_SANDBOX_POOL_ENABLED:-true}
@@ -636,6 +637,14 @@ services:
       AF_SANDBOX_POOL_MAX_CONTAINER_USES: ${AF_SANDBOX_POOL_MAX_CONTAINER_USES:-}
       AF_SANDBOX_WORKSPACE_ROOT: /sandbox/runs
       AF_SANDBOX_COMPAT_INPUT_PATH: "true"
+      # Nacos dynamic config (mirrors Java services)
+      AF_CONFIG_NACOS_ENABLED: ${AF_CONFIG_NACOS_ENABLED:-false}
+      AF_CONFIG_NACOS_NAMESPACE: ${AF_CONFIG_NACOS_NAMESPACE:-}
+      AF_CONFIG_NACOS_GROUP: ${AF_CONFIG_NACOS_GROUP:-alphafrog-config}
+      AF_CONFIG_NACOS_DATA_ID: ${AF_CONFIG_NACOS_DATA_ID:-python-sandbox.json}
+      NACOS_ADDRESS: ${NACOS_ADDRESS:-nacos}
+      NACOS_USER: ${NACOS_USER:-nacos}
+      NACOS_PASSWORD: ${NACOS_PASSWORD:-nacos}
     volumes:
       - ./data/agent_datasets:/data/agent_datasets
       - ./data/database_fetched:/data/database_fetched

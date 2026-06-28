@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -18,6 +22,11 @@ class SandboxConfig:
     sandbox_image: str
     skip_environment_setup: bool
     preinstalled_libraries: frozenset[str]
+    # Per-container concurrency: how many Python tasks may execute concurrently
+    # inside a single warm container. Default 5; set to 1 for the legacy serial
+    # behavior. Values >1 require compat_input_path_enabled=False (global symlink
+    # would otherwise collide across concurrent tasks).
+    container_max_concurrency: int
     # Pool config
     pool_enabled: bool
     pool_min_size: int
@@ -48,6 +57,11 @@ def load_config() -> SandboxConfig:
         ).split(",")
         if item.strip()
     )
+    container_max_concurrency = int(os.getenv("AF_SANDBOX_CONTAINER_MAX_CONCURRENCY", "5"))
+    if container_max_concurrency < 1:
+        raise ValueError(
+            f"Invalid container_max_concurrency ({container_max_concurrency}): must be >= 1."
+        )
     # Pool config (default disabled for safe rollout)
     pool_enabled = _parse_bool(os.getenv("AF_SANDBOX_POOL_ENABLED"), default=False)
     pool_min_size = int(os.getenv("AF_SANDBOX_POOL_MIN_SIZE", "2"))
@@ -64,6 +78,14 @@ def load_config() -> SandboxConfig:
             f"Invalid pool config: pool_min_size ({pool_min_size}) > pool_max_size ({pool_max_size}). "
             f"Ensure AF_SANDBOX_POOL_MIN_SIZE <= AF_SANDBOX_POOL_MAX_SIZE."
         )
+    if container_max_concurrency > 1 and compat_input_path_enabled:
+        # The global /sandbox/input symlink would be overwritten by concurrent tasks.
+        logger.warning(
+            "container_max_concurrency=%s > 1 is incompatible with compat_input_path_enabled=True; "
+            "disabling compat_input_path_enabled automatically.",
+            container_max_concurrency,
+        )
+        compat_input_path_enabled = False
     return SandboxConfig(
         data_dir=data_dir,
         max_concurrency=max_concurrency,
@@ -76,6 +98,7 @@ def load_config() -> SandboxConfig:
         sandbox_image=sandbox_image,
         skip_environment_setup=skip_environment_setup,
         preinstalled_libraries=preinstalled_libraries,
+        container_max_concurrency=container_max_concurrency,
         pool_enabled=pool_enabled,
         pool_min_size=pool_min_size,
         pool_max_size=pool_max_size,

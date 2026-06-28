@@ -120,6 +120,20 @@ def _copy_runtime_loader_modules(
         _copy_dataset_file(session, source, f"{sandbox_dir}/{filename}")
 
 
+def prepare_container_loader_modules(
+    session: SandboxSession,
+    config: SandboxConfig,
+) -> None:
+    """Copy static loader modules once per warm container.
+
+    In the pooled path, concurrent tasks share the same container; copying the
+    same files for every task is redundant and races on /sandbox/*. Copy them
+    once at container warm-up time instead.
+    """
+    _copy_runtime_loader_modules(session, config)
+    logger.info("CONTAINER_LOADER_MODULES_READY container=%s", get_session_container_id(session))
+
+
 def _loader_smoke_check_command(config: SandboxConfig) -> str:
     """Build a shell command that smoke-imports af_dataset_loader in the sandbox."""
     workdir = config.workdir.rstrip("/")
@@ -205,6 +219,8 @@ def _prepare_task_workspace(
     files: List[str] | None,
     paths_dataset_csv: str | None = None,
     path_manifest_csv: str | None = None,
+    *,
+    copy_loader_modules: bool = True,
 ) -> str:
     """Create task-scoped workspace and copy datasets. Returns the task workspace path."""
     task_workspace = f"{config.workspace_root}/{task_id}"
@@ -301,8 +317,9 @@ def _prepare_task_workspace(
                     _copy_dataset_file(session, file_path, f"{dataset_mount}/data.meta.json")
             _log_in_container(session, task_id, config, f"dataset_ready dataset={ds_id} files={len(files_to_copy)}")
 
-    _copy_runtime_loader_modules(session, config)
-    _log_in_container(session, task_id, config, "sandbox_loader_modules_ready")
+    if copy_loader_modules:
+        _copy_runtime_loader_modules(session, config)
+        _log_in_container(session, task_id, config, "sandbox_loader_modules_ready")
 
     # 260623-harness-optimization-02: 把 Java 端 AgentRunDatasetRegistry 生成的 run-level CSV 落到 workdir。
     # - paths_dataset.csv：caller 选中的 dataset 子集（sub-snapshot）
@@ -776,6 +793,7 @@ def run_in_open_session(
     queue_wait_ms: int | None = None,
     container_id: str | None = None,
     pool_enabled: bool = True,
+    prepare_loader_modules: bool = True,
 ) -> dict:
     """Run one task inside an already-open session.
 
@@ -810,6 +828,7 @@ def run_in_open_session(
             files,
             paths_dataset_csv=paths_dataset_csv,
             path_manifest_csv=path_manifest_csv,
+            copy_loader_modules=prepare_loader_modules,
         )
         timings["workspace_prepare_ms"] = int((time.monotonic() - t_workspace_start) * 1000)
 
