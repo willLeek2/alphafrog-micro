@@ -14,10 +14,10 @@ import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
-import java.util.Optional;
-import java.util.Optional;
 
 /**
  * 工具结果进入模型前的截断/摘要/rawRef 绑定。
@@ -53,8 +53,9 @@ public class ToolOutputCompactionService {
         if (truncated) {
             summary = "[summary 生成失败，以下为截断内容] " + truncate(rawOutput, FALLBACK_TRUNCATE_CHARS);
         }
-        String modelOutput = buildModelOutput(toolName, summary, rawRef, truncated);
-        String cacheTemplate = buildModelOutput(toolName, summary, "", truncated);
+        Map<String, Object> compactSearchItems = buildCompactSearchItems(toolName, rawOutput, effectiveMaxLength());
+        String modelOutput = buildModelOutput(toolName, summary, rawRef, truncated, compactSearchItems);
+        String cacheTemplate = buildModelOutput(toolName, summary, "", truncated, compactSearchItems);
         return CompactionResult.builder()
                 .modelOutput(modelOutput)
                 .cacheTemplate(cacheTemplate)
@@ -105,13 +106,17 @@ public class ToolOutputCompactionService {
                 .build();
     }
 
-    private String buildModelOutput(String toolName, String summary, String rawRef, boolean truncated) {
+    private String buildModelOutput(String toolName, String summary, String rawRef, boolean truncated,
+                                    Map<String, Object> compactSearchItems) {
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("format", truncated ? "tool_result truncated" : "tool_result summary");
         if (!blank(rawRef)) {
             data.put("rawRef", rawRef);
         }
         data.put("summary", summary);
+        if (compactSearchItems != null && !compactSearchItems.isEmpty()) {
+            data.put("compactSearchItems", compactSearchItems);
+        }
         if (truncated) {
             data.put("truncated", true);
         }
@@ -124,6 +129,98 @@ public class ToolOutputCompactionService {
         } catch (Exception e) {
             return rawRef;
         }
+    }
+
+    private Map<String, Object> buildCompactSearchItems(String toolName, String rawOutput, int maxStringLength) {
+        if (!isSearchTool(toolName) || blank(rawOutput)) {
+            return Map.of();
+        }
+        List<Map<String, Object>> dailyItems = new ArrayList<>();
+        try {
+            JsonNode root = objectMapper.readTree(rawOutput);
+            collectHasDailyItems(root.path("data"), dailyItems);
+        } catch (Exception e) {
+            return Map.of();
+        }
+        if (dailyItems.isEmpty()) {
+            return Map.of();
+        }
+        int budget = Math.max(128, maxStringLength / 4);
+        List<Map<String, Object>> visibleItems = new ArrayList<>();
+        int omitted = 0;
+        for (Map<String, Object> item : dailyItems) {
+            visibleItems.add(item);
+            Map<String, Object> candidate = compactPayload(visibleItems, Math.max(0, dailyItems.size() - visibleItems.size()));
+            if (jsonLength(candidate) > budget) {
+                visibleItems.remove(visibleItems.size() - 1);
+                omitted = Math.max(1, dailyItems.size() - visibleItems.size());
+                break;
+            }
+        }
+        return compactPayload(visibleItems, omitted);
+    }
+
+    private void collectHasDailyItems(JsonNode node, List<Map<String, Object>> out) {
+        if (node == null || node.isMissingNode() || node.isNull()) {
+            return;
+        }
+        if (node.isObject()) {
+            JsonNode hasDaily = node.get("has_daily");
+            if (isHasDailyOne(hasDaily)) {
+                String tsCode = text(node.get("ts_code"));
+                String name = text(node.get("name"));
+                if (!blank(tsCode) || !blank(name)) {
+                    Map<String, Object> item = new LinkedHashMap<>();
+                    item.put("ts_code", tsCode);
+                    item.put("name", name);
+                    out.add(item);
+                }
+            }
+            node.fields().forEachRemaining(entry -> collectHasDailyItems(entry.getValue(), out));
+        } else if (node.isArray()) {
+            node.forEach(child -> collectHasDailyItems(child, out));
+        }
+    }
+
+    private Map<String, Object> compactPayload(List<Map<String, Object>> items, int omitted) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("filter", "has_daily=1");
+        payload.put("fields", List.of("ts_code", "name"));
+        payload.put("items", items);
+        if (omitted > 0) {
+            payload.put("omitted", omitted);
+        }
+        return payload;
+    }
+
+    private boolean isSearchTool(String toolName) {
+        return switch (nvl(toolName)) {
+            case "searchStock", "searchFund", "searchIndex", "searchAssetInfo" -> true;
+            default -> false;
+        };
+    }
+
+    private boolean isHasDailyOne(JsonNode node) {
+        if (node == null || node.isMissingNode() || node.isNull()) {
+            return false;
+        }
+        if (node.isNumber()) {
+            return node.asInt() == 1;
+        }
+        String text = node.asText("");
+        return "1".equals(text) || "true".equalsIgnoreCase(text);
+    }
+
+    private int jsonLength(Object value) {
+        try {
+            return objectMapper.writeValueAsString(value).length();
+        } catch (Exception e) {
+            return Integer.MAX_VALUE;
+        }
+    }
+
+    private String text(JsonNode node) {
+        return node == null || node.isMissingNode() || node.isNull() ? "" : node.asText("");
     }
 
     private String injectRawRef(String template, String rawRef) {
