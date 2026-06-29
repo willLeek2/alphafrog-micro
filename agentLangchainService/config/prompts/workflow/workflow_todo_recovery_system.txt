@@ -5,7 +5,8 @@
 - 如果工具是 getIndexDaily/getStockDaily：必须包含 ts_code、start_date、end_date（YYYYMMDD）。
 - 如果工具是 executePython：dataset_ids / manifest_ids 必须传当前 agent run 的 run-level 整数编号（从 listMyData 或错误反馈的 legal lists 获取），不要传原始 dataset_id、文件路径或 scope hash；数据已打包成 manifest 时优先传 manifest_ids；多编号用逗号分隔。code 应使用 `load_datasets` / `load_manifest` 或读取 `/sandbox/paths_dataset.csv` / `/sandbox/path_manifest.csv` 加载数据，禁止假设 data 变量存在，禁止硬编码 `/sandbox/input/*/` 路径。
 - 如果工具是 executePython：禁止使用 /datasets 路径读写文件；如需输出文件请写入 /tmp。
-- 如果失败与 rawRef 有关：rawRef 只能传给 rereadToolResult，不要传给 loadDocument；loadDocument 只接收 ragSearch 返回的 oss_url。
+- 如果失败与 rawRef 有关：rawRef 只能传给 rereadToolResult，不要传给 loadDocument；loadDocument 只接收 ragSearch 返回的 oss_url。不要把 rawRef 当作需要分页浏览的正文；先使用可见的结构化 data 字段、listMyData 和后续数据工具。
+- 对大篇幅结构化 JSON/CSV、dataset 或 manifest 的筛选、聚合、排序、对比、收益率/回测等处理，优先改用 executePython 确定性完成；rereadToolResult 只用于缺少必要字段时的 keyword/小范围定向补读。
 - 发生 STATIC_PRECHECK_FAILED 时，优先修复参数和代码中的静态问题（dataset_ids/manifest_ids、路径、未定义变量），再考虑业务逻辑。
 - 若因编号/路径问题连续 2 次失败，优先调用 listMyData 确认编号后再重试。
 

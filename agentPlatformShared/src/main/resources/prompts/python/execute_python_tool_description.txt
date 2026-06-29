@@ -1,5 +1,7 @@
 Execute Python code in a secure sandbox to analyze datasets or manifests that have already been produced in the current agent run.
 
+Prefer this tool for deterministic processing of large structured JSON/CSV-style market data, datasets, or manifests: filtering, sorting, joining, aggregation, comparison, return calculation, and backtesting. Do not repeatedly page through long structured outputs with rereadToolResult when the data is available as a dataset or manifest; resolve run-level numbers with listMyData and process them here.
+
 REQUIRED parameters:
 - code: the Python source code to execute.
 - At least one of dataset_ids or manifest_ids must be non-empty.

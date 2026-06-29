@@ -81,6 +81,7 @@ df = df.sort_values("date")
 
 ## 执行策略
 
+- **大篇幅结构化数据**：遇到 JSON/CSV、dataset 或 manifest 的筛选、聚合、排序、对比、收益率/回测等任务时，优先把数据交给 `executePython` 确定性处理。不要为了浏览长输出而反复调用 `rereadToolResult` 翻页。
 - **简单任务**：一次 `executePython` 完成加载 + 计算 + 输出。
 - **复杂多阶段任务**：可分次调用，每次输出明确中间结果。
 

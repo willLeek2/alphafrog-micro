@@ -24,7 +24,8 @@ public class RereadToolHandler {
     @Tool("""
         重新读取被压缩的大型工具输出。
         当某个工具结果包含 data.rawRef（形如 raw-ref:...）且 summary 不够用时，调用本工具读取原始内容。
-        rawRef 必须来自工具结果的 data.rawRef；不要把 rawRef 传给 loadDocument，loadDocument 只接收 ragSearch 返回的 oss_url。
+        优先使用工具结果中可见的结构化 data 字段；对于 JSON/CSV、dataset 或 manifest 的筛选、聚合、排序、对比、回测等任务，优先使用 listMyData + executePython 确定性处理，不要用本工具反复分页浏览。
+        仅在缺少必要字段时，用 keyword/offset/limit 做少量定向补读。rawRef 必须来自工具结果的 data.rawRef；不要把 rawRef 传给 loadDocument，loadDocument 只接收 ragSearch 返回的 oss_url。
         可选 keyword 用于在原始内容中搜索；offset/limit 用于分页读取。
         """)
     public String rereadToolResult(

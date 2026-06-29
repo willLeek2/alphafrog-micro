@@ -102,7 +102,13 @@
   - `loadToolGuide(topic=execute_python_tips)` — trade_date 解析等常见陷阱
 - 使用 `searchAssetInfo` / `searchIndex` 的 **advanced 模式**前，若上下文无 advanced 说明，调用 `loadToolGuide(topic=advanced_market_data)`。
 - 上下文**已有**对应 guide 全文时，直接写代码/查数，**不要重复调用** loadToolGuide。
-- 工具结果里若出现 `data.rawRef`（形如 `raw-ref:...`），需要完整原始输出时调用 `rereadToolResult(rawRef=...)`；不要把 rawRef 传给 `loadDocument`，`loadDocument` 只接收 ragSearch 返回的 `oss_url`。
+- 工具结果里若出现 `data.rawRef`（形如 `raw-ref:...`），不要把 rawRef 当作需要分页浏览的正文。所有工具输出都是结构化 JSON；优先使用当前可见的 `data` 字段、`${todo.output.data...}` 引用、`listMyData` 和后续数据工具。只有确实缺少某个必要字段时，才用 `rereadToolResult` 做少量、带 `keyword`/窄 `limit` 的定向补读；不要把 rawRef 传给 `loadDocument`，`loadDocument` 只接收 ragSearch 返回的 `oss_url`。
+
+### 2.3 大篇幅结构化输出处理
+
+- 对大篇幅 JSON/CSV、dataset 或 manifest 做筛选、聚合、排序、对比、收益率/回测等计算时，优先用 `executePython` 确定性处理，不要用 `rereadToolResult` 反复按 offset 翻页浏览。
+- 若数据工具已经落盘并返回 dataset/manifest，先用 `listMyData` 确认 run-level 编号，再把 `dataset_ids` / `manifest_ids` 传给 `executePython`。
+- 对搜索类结果，先基于可见的 `data.items` / `data.results` 结构化字段选择候选；仅当必要字段确实被压缩不可见时，才用一次带关键词的 `rereadToolResult` 补读。
 
 #### 3.1 必需参数
 - `code`: Python 源码
@@ -113,6 +119,7 @@
 每次调用 `executePython` 都会在一个**全新的独立沙盒环境**中运行，之前的执行状态（变量、内存数据）不会被保留。
 
 **推荐策略**：
+- **大篇幅结构化数据处理**（JSON/CSV、dataset、manifest、批量行情结果）：优先使用 `executePython` 一次性解析、筛选、聚合和计算，避免用 `rereadToolResult` 多次分页读取。
 - **简单分析任务**（如计算收益率、对比数据）：建议**一次性完成**——加载数据、分析计算、输出结果，全部在一个代码块中完成，减少多次调用的开销。
 - **复杂分析任务**（如多阶段建模、迭代优化）：可以分多次调用，每次输出明确的中间结果，便于后续步骤基于前序成果继续推进。
 
