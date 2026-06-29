@@ -29,7 +29,7 @@ services:
   redis:
     image: redis:7-alpine
     container_name: alphafrog-redis
-    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${AF_REDIS_PASSWORD:-Excited1s}", "--maxmemory", "200mb", "--maxmemory-policy", "allkeys-lru"]
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${AF_REDIS_PASSWORD:-Excited1s}", "--maxmemory", "1gb", "--maxmemory-policy", "allkeys-lru"]
     ports:
       - "6379:6379"
     volumes:
@@ -42,7 +42,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 256M
+          memory: 1280M
     networks:
       - alphafrog-network
 
@@ -750,7 +750,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 768M
+          memory: 1280M
     networks:
       - alphafrog-network
 
