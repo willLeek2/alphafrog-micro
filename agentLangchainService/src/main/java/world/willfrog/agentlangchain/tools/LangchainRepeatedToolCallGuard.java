@@ -6,16 +6,37 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
 
 public final class LangchainRepeatedToolCallGuard {
 
     static final int DEFAULT_MAX_IDENTICAL_CALLS = 2;
+    private static final Set<String> GUARDED_DATABASE_TOOLS = Set.of(
+            "getStockInfo",
+            "getStockDaily",
+            "searchStock",
+            "searchFund",
+            "getIndexInfo",
+            "getIndexDaily",
+            "searchIndex",
+            "searchAssetInfo",
+            "getTradingDaysSummary",
+            "isTradingDay",
+            "getExchangeAssetDaily",
+            "getOffExchangeAssetDaily",
+            "getEtfAdj",
+            "getListedAssetShareSize",
+            "getFinancialReport"
+    );
 
     private LangchainRepeatedToolCallGuard() {
     }
 
     static Decision beforeInvoke(String toolName, Map<String, Object> arguments, ObjectMapper objectMapper) {
+        if (!isGuardedDatabaseTool(toolName)) {
+            return Decision.allowed(toolName, 1);
+        }
         LangchainToolCallSignature signature = new LangchainToolCallSignature(
                 toolName == null ? "" : toolName,
                 canonicalArguments(arguments, objectMapper));
@@ -27,6 +48,10 @@ public final class LangchainRepeatedToolCallGuard {
             return Decision.repeated(toolName, count, repeatedHint(toolName, count));
         }
         return Decision.allowed(toolName, count);
+    }
+
+    private static boolean isGuardedDatabaseTool(String toolName) {
+        return toolName != null && GUARDED_DATABASE_TOOLS.contains(toolName);
     }
 
     private static String canonicalArguments(Map<String, Object> arguments, ObjectMapper objectMapper) {

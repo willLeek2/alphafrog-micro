@@ -2,6 +2,8 @@ package world.willfrog.agent.tools.market;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.protobuf.MessageOrBuilder;
+import com.google.protobuf.util.JsonFormat;
 import dev.langchain4j.agent.tool.Tool;
 import org.apache.dubbo.config.annotation.DubboReference;
 import lombok.extern.slf4j.Slf4j;
@@ -180,7 +182,7 @@ public class MarketDataTools {
             }
             Map<String, Object> data = new LinkedHashMap<>();
             data.put("ts_code", nvl(tsCode));
-            data.put("item_text", response.getItem().toString());
+            putReadableProtoItem(data, response.getItem());
             return ok("getStockInfo", data);
         } catch (Exception e) {
             return fail("getStockInfo", "TOOL_ERROR", "查询失败，请重试或更换工具。如果持续失败，请换一种方式完成任务。",
@@ -350,7 +352,7 @@ public class MarketDataTools {
             }
             Map<String, Object> data = new LinkedHashMap<>();
             data.put("ts_code", nvl(tsCode));
-            data.put("item_text", response.getItem().toString());
+            putReadableProtoItem(data, response.getItem());
             return ok("getIndexInfo", data);
         } catch (Exception e) {
             return fail("getIndexInfo", "TOOL_ERROR", "查询失败，请重试或更换工具。如果持续失败，请换一种方式完成任务。",
@@ -2430,5 +2432,61 @@ public class MarketDataTools {
         } catch (Exception e) {
             return fail("getFinancialReport", "TOOL_ERROR", "Error fetching financial report", Map.of("message", nvl(e.getMessage())));
         }
+    }
+
+    private void putReadableProtoItem(Map<String, Object> data, MessageOrBuilder item) {
+        if (data == null || item == null) {
+            return;
+        }
+        try {
+            String json = JsonFormat.printer()
+                    .preservingProtoFieldNames()
+                    .omittingInsignificantWhitespace()
+                    .print(item);
+            Map<String, Object> itemMap = objectMapper.readValue(
+                    json,
+                    new TypeReference<LinkedHashMap<String, Object>>() {}
+            );
+            data.put("item", itemMap);
+            data.put("item_text", objectMapper.writeValueAsString(itemMap));
+        } catch (Exception e) {
+            data.put("item_text", decodeProtoText(item.toString()));
+        }
+    }
+
+    private String decodeProtoText(String text) {
+        if (text == null || text.isEmpty()) {
+            return "";
+        }
+        StringBuilder result = new StringBuilder(text.length());
+        java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
+        for (int i = 0; i < text.length();) {
+            if (i + 3 < text.length()
+                    && text.charAt(i) == '\\'
+                    && isOctalDigit(text.charAt(i + 1))
+                    && isOctalDigit(text.charAt(i + 2))
+                    && isOctalDigit(text.charAt(i + 3))) {
+                bytes.write(Integer.parseInt(text.substring(i + 1, i + 4), 8));
+                i += 4;
+                continue;
+            }
+            flushDecodedBytes(result, bytes);
+            result.append(text.charAt(i));
+            i++;
+        }
+        flushDecodedBytes(result, bytes);
+        return result.toString();
+    }
+
+    private boolean isOctalDigit(char c) {
+        return c >= '0' && c <= '7';
+    }
+
+    private void flushDecodedBytes(StringBuilder result, java.io.ByteArrayOutputStream bytes) {
+        if (bytes.size() <= 0) {
+            return;
+        }
+        result.append(bytes.toString(java.nio.charset.StandardCharsets.UTF_8));
+        bytes.reset();
     }
 }

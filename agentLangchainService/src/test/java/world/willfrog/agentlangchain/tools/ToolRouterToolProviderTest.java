@@ -243,7 +243,7 @@ class ToolRouterToolProviderTest {
     }
 
     @Test
-    void toolExecutor_shouldWarnThenBlockRepeatedIdenticalToolCalls() {
+    void toolExecutor_shouldNotBlockRepeatedNonDatabaseToolCalls() {
         when(toolRouter.invokeWithMeta(eq("searchWeb"), anyMap()))
                 .thenReturn(ToolRouter.ToolInvocationResult.builder()
                         .output("{\"ok\":true}")
@@ -266,11 +266,42 @@ class ToolRouterToolProviderTest {
         String third = executor.execute(toolRequest, "memory-1");
 
         assertEquals("{\"ok\":true}", first);
+        assertEquals("{\"ok\":true}", second);
+        assertEquals("{\"ok\":true}", third);
+        verify(toolRouter, times(3)).invokeWithMeta(eq("searchWeb"), eq(Map.of("query", "512800", "limit", 3)));
+    }
+
+    @Test
+    void toolExecutor_shouldWarnThenBlockRepeatedIdenticalDatabaseToolCalls() {
+        when(toolRouter.invokeWithMeta(eq("getIndexDaily"), anyMap()))
+                .thenReturn(ToolRouter.ToolInvocationResult.builder()
+                        .output("{\"ok\":true}")
+                        .success(true)
+                        .durationMs(1)
+                        .build());
+
+        ToolProviderResult result = provider.provideTools(request(Map.of()));
+        ToolExecutor executor = result.toolExecutorByName("getIndexDaily");
+        assertNotNull(executor);
+        ToolExecutionRequest toolRequest = ToolExecutionRequest.builder()
+                .name("getIndexDaily")
+                .arguments("{\"tsCode\":\"000300.SH\",\"startDateStr\":\"20250101\",\"endDateStr\":\"20250630\"}")
+                .build();
+
+        String first = executor.execute(toolRequest, "memory-1");
+        String second = executor.execute(toolRequest, "memory-1");
+        String third = executor.execute(toolRequest, "memory-1");
+
+        assertEquals("{\"ok\":true}", first);
         assertTrue(second.contains("_retry_hint_"));
-        assertTrue(second.contains("Do not call searchWeb again with identical arguments"));
+        assertTrue(second.contains("Do not call getIndexDaily again with identical arguments"));
         assertTrue(third.contains("\"code\":\"REPEATED_TOOL_CALL\""));
         assertTrue(third.contains("_retry_hint_"));
-        verify(toolRouter, times(2)).invokeWithMeta(eq("searchWeb"), eq(Map.of("query", "512800", "limit", 3)));
+        verify(toolRouter, times(2)).invokeWithMeta(eq("getIndexDaily"), eq(Map.of(
+                "tsCode", "000300.SH",
+                "startDateStr", "20250101",
+                "endDateStr", "20250630"
+        )));
     }
 
     @Test
