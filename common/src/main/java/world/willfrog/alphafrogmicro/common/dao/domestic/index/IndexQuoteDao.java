@@ -4,6 +4,7 @@ import org.apache.ibatis.annotations.*;
 import world.willfrog.alphafrogmicro.common.pojo.domestic.index.IndexDaily;
 
 import java.util.List;
+import java.util.Map;
 
 public interface IndexQuoteDao {
     @Insert("INSERT INTO alphafrog_index_daily (ts_code, trade_date, close, open, high, low, pre_close, change, pct_chg, vol, amount) " +
@@ -36,4 +37,20 @@ public interface IndexQuoteDao {
 
     @Select("SELECT EXISTS(SELECT 1 FROM alphafrog_index_daily WHERE ts_code = #{tsCode} LIMIT 1)")
     boolean hasAnyIndexDaily(@Param("tsCode") String tsCode);
+
+    @Select("SELECT sample.ts_code AS ts_code, COALESCE(i.name, sample.ts_code) AS name " +
+            "FROM (" +
+            "  SELECT DISTINCT ts_code " +
+            "  FROM alphafrog_index_daily " +
+            "  WHERE trade_date BETWEEN #{startDate} AND #{endDate} " +
+            "    AND amount >= #{minAmount} " +
+            "    AND ts_code IS NOT NULL" +
+            ") sample " +
+            "LEFT JOIN alphafrog_index_info i ON i.ts_code = sample.ts_code " +
+            "ORDER BY random() " +
+            "LIMIT #{limit}")
+    List<Map<String, Object>> getRandomIndexNamesByAmountRange(@Param("startDate") Long startDate,
+                                                               @Param("endDate") Long endDate,
+                                                               @Param("minAmount") Double minAmount,
+                                                               @Param("limit") int limit);
 }

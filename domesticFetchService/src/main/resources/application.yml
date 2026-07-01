@@ -25,6 +25,9 @@ spring:
       port: 6379
       password: ${AF_REDIS_PASSWORD:default}
 
+server:
+  port: ${AF_DOMESTIC_FETCH_HTTP_PORT:18082}
+
 af:
   fetch:
     concurrency: ${AF_FETCH_CONCURRENCY:3}
@@ -33,6 +36,8 @@ af:
       config-refresh-interval-ms: ${AF_FETCH_JOBS_CONFIG_REFRESH_INTERVAL_MS:10000}
 
 alphafrog:
+  debug:
+    admin-token: ${ALPHAFROG_DEBUG_ADMIN_TOKEN:}
   config:
     nacos:
       enabled: ${AF_CONFIG_NACOS_ENABLED:false}

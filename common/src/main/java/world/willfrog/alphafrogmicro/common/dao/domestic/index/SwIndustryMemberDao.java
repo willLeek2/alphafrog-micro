@@ -51,6 +51,16 @@ public interface SwIndustryMemberDao {
     })
     List<SwIndustryMember> getByL1Code(@Param("l1Code") String l1Code);
 
+    @Select("SELECT l3_name FROM (" +
+            "  SELECT DISTINCT l3_name " +
+            "  FROM alphafrog_index_sw_member " +
+            "  WHERE l3_name IS NOT NULL " +
+            "    AND l3_name <> ''" +
+            ") names " +
+            "ORDER BY random() " +
+            "LIMIT #{limit}")
+    List<String> getRandomL3IndustryNames(@Param("limit") int limit);
+
     @Delete("DELETE FROM alphafrog_index_sw_member")
     int deleteAll();
 

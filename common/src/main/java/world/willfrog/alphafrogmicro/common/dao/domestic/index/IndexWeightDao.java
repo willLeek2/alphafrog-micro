@@ -4,6 +4,7 @@ import org.apache.ibatis.annotations.*;
 import world.willfrog.alphafrogmicro.common.pojo.domestic.index.IndexWeight;
 
 import java.util.List;
+import java.util.Map;
 
 @Mapper
 public interface IndexWeightDao {
@@ -54,5 +55,22 @@ public interface IndexWeightDao {
             @Result(property = "weight", column = "weight")
     })
     List<IndexWeight> getLatestIndexWeightsByConCodeAndDateRange(@Param("conCode") String conCode, @Param("startDate") long startDate, @Param("endDate") long endDate);
+
+    @Select("SELECT latest.con_code AS ts_code, COALESCE(s.name, latest.con_code) AS name " +
+            "FROM (" +
+            "  SELECT DISTINCT ON (con_code) con_code, trade_date " +
+            "  FROM alphafrog_index_weight " +
+            "  WHERE index_code = #{tsCode} " +
+            "    AND trade_date BETWEEN #{startDate} AND #{endDate} " +
+            "    AND con_code IS NOT NULL " +
+            "  ORDER BY con_code, trade_date DESC" +
+            ") latest " +
+            "LEFT JOIN alphafrog_stock_info s ON s.ts_code = latest.con_code " +
+            "ORDER BY random() " +
+            "LIMIT #{limit}")
+    List<Map<String, Object>> getRandomConstituentStocksByIndexAndDateRange(@Param("tsCode") String tsCode,
+                                                                            @Param("startDate") long startDate,
+                                                                            @Param("endDate") long endDate,
+                                                                            @Param("limit") int limit);
 
 }

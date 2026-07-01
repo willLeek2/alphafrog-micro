@@ -338,6 +338,8 @@ services:
       NACOS_USER: ${NACOS_USER:-nacos}
       NACOS_PASSWORD: ${NACOS_PASSWORD:-nacos}
       TUSHARE_TOKEN: ${TUSHARE_TOKEN}
+      ALPHAFROG_DEBUG_ADMIN_TOKEN: ${ALPHAFROG_DEBUG_ADMIN_TOKEN:-}
+      AF_DOMESTIC_FETCH_HTTP_PORT: 18082
       LOGGING_LEVEL_APP: ${LOGGING_LEVEL_APP:-INFO}
       AF_FETCH_CONCURRENCY: ${AF_FETCH_CONCURRENCY:-3}
       AF_CONFIG_NACOS_ENABLED: "true"
@@ -358,6 +360,7 @@ services:
       - ./data/domestic-fetch-configs:/app/config-dynamic
     ports:
       - "20882:20882"
+      - "18082:18082"
     deploy:
       resources:
         limits:
