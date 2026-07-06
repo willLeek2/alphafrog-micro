@@ -1,6 +1,7 @@
 package world.willfrog.agent.platform.service;
 
 import world.willfrog.agent.platform.service.*;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.langchain4j.model.output.TokenUsage;
 import org.junit.jupiter.api.BeforeEach;
@@ -10,10 +11,12 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.model.AgentRunStatus;
 
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -342,6 +345,56 @@ class AgentObservabilityServiceEnhancedTest {
         @SuppressWarnings("unchecked")
         Map<String, Object> blob = objectMapper.readValue(blobCaptor.getValue(), Map.class);
         assertEquals(shortOutput, blob.get("output"));
+    }
+
+    @Test
+    void attachObservabilityToSnapshot_shouldAttachRagObservabilityFromToolDetailBlob() throws Exception {
+        String runId = "test-rag-observability-1";
+        setupStateStore(runId);
+        Map<String, String> toolDetails = new ConcurrentHashMap<>();
+        doAnswer(inv -> {
+            toolDetails.put(inv.getArgument(1), inv.getArgument(2));
+            return null;
+        }).when(stateStore).saveToolCallDetail(eq(runId), anyString(), anyString());
+        when(stateStore.loadToolCallDetail(eq(runId), anyString()))
+                .thenAnswer(inv -> Optional.ofNullable(toolDetails.get(inv.getArgument(1))));
+
+        AgentContext.setToolCallId("rag-call-1");
+        service.recordToolCall(runId, "tool_execution", "ragSearch",
+                Map.of("query", "Alpha"),
+                """
+                {"ok":true,"data":{"summary":{"hit_count":1,"omitted_count":0,"visible_chars":120},"rawRef":"raw_ref_001","top_refs":[{"ref_id":"rag_ref_001","source_key":"oss://a#chunk=0"}]}}
+                """,
+                100L, true, false, false, null, null, 0, 0, null);
+        AgentContext.clearToolCallId();
+
+        String output = service.attachObservabilityToSnapshot(
+                runId,
+                "{\"answer_markdown\":\"答案 <rag-cite ref=\\\"rag_ref_001\\\" />\"}",
+                AgentRunStatus.COMPLETED
+        );
+
+        JsonNode root = objectMapper.readTree(output);
+        JsonNode rag = root.path("observability").path("rag_observability");
+        assertFalse(rag.isMissingNode(), "RAG observability should be attached when RAG signal exists");
+        assertEquals("rag_ref_001", rag.path("aggregate").path("final_answer_cited_refs").get(0).asText());
+        assertEquals(1, rag.path("aggregate").path("visible_count").asInt());
+    }
+
+    @Test
+    void attachObservabilityToSnapshot_withoutRagSignalShouldKeepNoRagField() throws Exception {
+        String runId = "test-rag-observability-empty";
+        setupStateStore(runId);
+
+        service.initializeRun(runId, "endpoint", "model");
+        String output = service.attachObservabilityToSnapshot(
+                runId,
+                "{\"answer_markdown\":\"普通答案 [1]\"}",
+                AgentRunStatus.COMPLETED
+        );
+
+        JsonNode root = objectMapper.readTree(output);
+        assertTrue(root.path("observability").path("rag_observability").isMissingNode());
     }
 
     // ==================== ToolTrace backward compat ====================

@@ -376,6 +376,43 @@ class AgentLlmLocalConfigLoaderTest {
     }
 
     @Test
+    void load_shouldParseRagRawRefAndRereadHotConfigFields() throws Exception {
+        Path configFile = tempDir.resolve("agent-llm.local.json");
+        Files.writeString(configFile, """
+                {
+                  "tools": {
+                    "raw-ref": { "ttl-seconds": 21600 },
+                    "reread": {
+                      "keyword-char-limit": 3000,
+                      "range-max-limit": 6000,
+                      "range-min-limit-without-keyword": 3000
+                    },
+                    "rag": {
+                      "visible-chars": 3000,
+                      "preview-chars": 500,
+                      "snippet-cap-per-doc": 3,
+                      "short-doc-full-threshold": 2000
+                    }
+                  }
+                }
+                """, StandardCharsets.UTF_8);
+
+        AgentLlmLocalConfigLoader loader = new AgentLlmLocalConfigLoader(new ObjectMapper());
+        ReflectionTestUtils.setField(loader, "configFile", configFile.toString());
+        loader.load();
+
+        var tools = loader.current().orElseThrow().getTools();
+        assertEquals(21600, tools.getRawRef().getTtlSeconds());
+        assertEquals(3000, tools.getReread().getKeywordCharLimit());
+        assertEquals(6000, tools.getReread().getRangeMaxLimit());
+        assertEquals(3000, tools.getReread().getRangeMinLimitWithoutKeyword());
+        assertEquals(3000, tools.getRag().getVisibleChars());
+        assertEquals(500, tools.getRag().getPreviewChars());
+        assertEquals(3, tools.getRag().getSnippetCapPerDoc());
+        assertEquals(2000, tools.getRag().getShortDocFullThreshold());
+    }
+
+    @Test
     void load_shouldSupportFieldAliases() throws Exception {
         Path configFile = tempDir.resolve("agent-llm.local.json");
         Files.writeString(configFile, """

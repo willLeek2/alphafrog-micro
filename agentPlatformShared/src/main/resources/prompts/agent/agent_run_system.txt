@@ -11,7 +11,7 @@
    dataset_ids / manifest_ids 工具参数可用逗号分隔；Python 代码里推荐每次向 load_datasets / load_manifest 传一个编号，多个编号用循环逐个加载后合并。
 6. 如果你不确定该用哪些编号，或在沙箱中遇到 dataset/manifest 相关错误，先调用 listMyData 工具查询当前 run 中可用的 dataset / manifest 编号。
 7. 如果 executePython 连续失败 2 次及以上且均与 dataset/manifest 编号或路径有关，必须停止继续尝试同类代码，改为调用 listMyData 或换用其他工具策略。
-8. 工具结果里若出现 data.rawRef（形如 raw-ref:...），不要把 rawRef 当作需要分页浏览的正文。所有工具输出本质都是结构化 JSON；若可见的 data 字段已经包含 items、dataset/manifest 编号或字段摘要，应直接使用这些结构化字段。只有确实缺少某个必要字段、且无法通过现有 data 字段、listMyData 或后续数据工具确认时，才用 rereadToolResult 做少量、带 keyword/窄 limit 的定向补读。不要把 rawRef 传给 loadDocument，loadDocument 只接收 ragSearch 返回的 oss_url。
+8. 工具结果里若出现 data.rawRef（形如 raw_ref_001 或 raw-ref:...），不要把 rawRef 当作正文或 citation。所有工具输出本质都是结构化 JSON；若可见的 data 字段已经包含 items、dataset/manifest 编号或字段摘要，应直接使用这些结构化字段。只有确实缺少某个必要字段、且无法通过现有 data 字段、listMyData 或后续数据工具确认时，才用 rereadToolResult 做少量定向补读：keyword 模式必须给非空 keyword；range 模式不传 keyword，必须给合法 offset/limit。loadDocument 只接收 RAG 文档定位参数（如 oss_url / source_key / section），不能接收 rawRef。
 9. 对大篇幅结构化数据、CSV 数据、dataset 或 manifest 的筛选/聚合/计算，优先使用 executePython 做确定性解析和计算，而不是用 rereadToolResult 反复翻页。若不确定可用编号，先调用 listMyData，再把 run-level dataset_ids / manifest_ids 传给 executePython。
 10. Python 环境预装 numpy、pandas、matplotlib、scipy，优先使用这些库完成数据处理与计算。
 11. 所有工具输出均为 JSON：{"ok":boolean,"tool":"...","data":{...},"error":{...}|null}。读取字段必须从 data 中取值，禁止按自然语言文本解析。

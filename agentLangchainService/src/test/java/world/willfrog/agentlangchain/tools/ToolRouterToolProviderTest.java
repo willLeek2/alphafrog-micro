@@ -152,8 +152,10 @@ class ToolRouterToolProviderTest {
         assertTrue(specsByName.get("isTradingDay").description().contains("calendar.maxItems"));
         assertTrue(specsByName.get("isTradingDay").description().contains("data.mode=batch"));
         assertTrue(specsByName.containsKey("rereadToolResult"));
-        assertTrue(specsByName.get("rereadToolResult").description().contains("rawRef"));
-        assertTrue(specsByName.get("rereadToolResult").description().contains("loadDocument"));
+        String rereadDescription = specsByName.get("rereadToolResult").description();
+        assertTrue(rereadDescription.contains("rawRef"));
+        assertTrue(rereadDescription.contains("keyword"));
+        assertTrue(rereadDescription.contains("offset"));
 
         String dailyDescription = specsByName.get("getExchangeAssetDaily").description();
         assertTrue(dailyDescription.contains("checkParallelLimits"));

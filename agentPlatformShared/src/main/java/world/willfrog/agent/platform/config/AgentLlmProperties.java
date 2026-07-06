@@ -235,6 +235,7 @@ public class AgentLlmProperties {
         private ToolReread reread = new ToolReread();
         @JsonAlias({"raw-ref", "raw_ref"})
         private ToolRawRef rawRef = new ToolRawRef();
+        private Rag rag = new Rag();
 
         public MarketData getMarketData() {
             return marketData;
@@ -275,6 +276,34 @@ public class AgentLlmProperties {
         public void setRawRef(ToolRawRef rawRef) {
             this.rawRef = rawRef == null ? new ToolRawRef() : rawRef;
         }
+
+        public Rag getRag() {
+            return rag;
+        }
+
+        public void setRag(Rag rag) {
+            this.rag = rag == null ? new Rag() : rag;
+        }
+    }
+
+    public static class Rag {
+        @JsonAlias({"visible-chars", "visible_chars"})
+        private Integer visibleChars;
+        @JsonAlias({"preview-chars", "preview_chars"})
+        private Integer previewChars;
+        @JsonAlias({"snippet-cap-per-doc", "snippet_cap_per_doc"})
+        private Integer snippetCapPerDoc;
+        @JsonAlias({"short-doc-full-threshold", "short_doc_full_threshold"})
+        private Integer shortDocFullThreshold;
+
+        public Integer getVisibleChars() { return visibleChars; }
+        public void setVisibleChars(Integer visibleChars) { this.visibleChars = visibleChars; }
+        public Integer getPreviewChars() { return previewChars; }
+        public void setPreviewChars(Integer previewChars) { this.previewChars = previewChars; }
+        public Integer getSnippetCapPerDoc() { return snippetCapPerDoc; }
+        public void setSnippetCapPerDoc(Integer snippetCapPerDoc) { this.snippetCapPerDoc = snippetCapPerDoc; }
+        public Integer getShortDocFullThreshold() { return shortDocFullThreshold; }
+        public void setShortDocFullThreshold(Integer shortDocFullThreshold) { this.shortDocFullThreshold = shortDocFullThreshold; }
     }
 
     public static class ToolResult {
@@ -326,27 +355,33 @@ public class AgentLlmProperties {
     public static class ToolReread {
         @JsonAlias({"max-limit", "max_limit"})
         private Integer maxLimit;
+        @JsonAlias({"keyword-char-limit", "keyword_char_limit"})
+        private Integer keywordCharLimit;
+        @JsonAlias({"range-max-limit", "range_max_limit"})
+        private Integer rangeMaxLimit;
+        @JsonAlias({"range-min-limit-without-keyword", "range_min_limit_without_keyword"})
+        private Integer rangeMinLimitWithoutKeyword;
 
-        public Integer getMaxLimit() {
-            return maxLimit;
-        }
-
-        public void setMaxLimit(Integer maxLimit) {
-            this.maxLimit = maxLimit;
-        }
+        public Integer getMaxLimit() { return maxLimit; }
+        public void setMaxLimit(Integer maxLimit) { this.maxLimit = maxLimit; }
+        public Integer getKeywordCharLimit() { return keywordCharLimit; }
+        public void setKeywordCharLimit(Integer keywordCharLimit) { this.keywordCharLimit = keywordCharLimit; }
+        public Integer getRangeMaxLimit() { return rangeMaxLimit; }
+        public void setRangeMaxLimit(Integer rangeMaxLimit) { this.rangeMaxLimit = rangeMaxLimit; }
+        public Integer getRangeMinLimitWithoutKeyword() { return rangeMinLimitWithoutKeyword; }
+        public void setRangeMinLimitWithoutKeyword(Integer rangeMinLimitWithoutKeyword) { this.rangeMinLimitWithoutKeyword = rangeMinLimitWithoutKeyword; }
     }
 
     public static class ToolRawRef {
         @JsonAlias({"ttl-hours", "ttl_hours"})
         private Integer ttlHours;
+        @JsonAlias({"ttl-seconds", "ttl_seconds"})
+        private Integer ttlSeconds;
 
-        public Integer getTtlHours() {
-            return ttlHours;
-        }
-
-        public void setTtlHours(Integer ttlHours) {
-            this.ttlHours = ttlHours;
-        }
+        public Integer getTtlHours() { return ttlHours; }
+        public void setTtlHours(Integer ttlHours) { this.ttlHours = ttlHours; }
+        public Integer getTtlSeconds() { return ttlSeconds; }
+        public void setTtlSeconds(Integer ttlSeconds) { this.ttlSeconds = ttlSeconds; }
     }
 
     public static class MarketData {

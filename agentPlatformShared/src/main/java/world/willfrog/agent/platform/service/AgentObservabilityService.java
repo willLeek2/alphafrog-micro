@@ -12,6 +12,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agent.platform.rag.RagObservabilityBuilder;
 
 import java.util.ArrayList;
 import java.util.Collection;
@@ -1204,6 +1205,7 @@ public class AgentObservabilityService {
         Map<String, Object> snapshot = parseJsonObject(snapshotJson);
         Map<String, Object> observabilityMap = objectMapper.convertValue(state, new TypeReference<Map<String, Object>>() {
         });
+        attachRagObservability(runId, snapshot, state, observabilityMap);
         // DB snapshot 只保存可长期查看的安全索引。
         // raw HTTP、reasoning、完整工具输出等大字段已在 finalize*TraceForPersistence 中拆到 Redis detail blob。
         AgentCallDetailPersistence.scrubObservabilityMap(observabilityMap);
@@ -1225,6 +1227,42 @@ public class AgentObservabilityService {
             locks.remove(runId);
         }
         return output;
+    }
+
+    private void attachRagObservability(String runId,
+                                        Map<String, Object> snapshot,
+                                        ObservabilityState state,
+                                        Map<String, Object> observabilityMap) {
+        try {
+            List<ToolTrace> toolTraces = state != null
+                    && state.getDiagnostics() != null
+                    && state.getDiagnostics().getToolTraces() != null
+                    ? state.getDiagnostics().getToolTraces()
+                    : List.of();
+            Map<String, Object> ragObservability = new RagObservabilityBuilder(objectMapper).build(
+                    runId,
+                    extractFinalAnswerText(snapshot),
+                    toolTraces,
+                    traceId -> stateStore.loadToolCallDetail(runId, traceId)
+            );
+            if (!ragObservability.isEmpty()) {
+                observabilityMap.put("rag_observability", ragObservability);
+            }
+        } catch (Exception e) {
+            log.debug("Failed to attach RAG observability: runId={}, error={}", runId, e.getMessage());
+        }
+    }
+
+    private String extractFinalAnswerText(Map<String, Object> snapshot) {
+        if (snapshot == null || snapshot.isEmpty()) {
+            return "";
+        }
+        Object answerMarkdown = snapshot.get("answer_markdown");
+        if (answerMarkdown instanceof String text && !text.isBlank()) {
+            return text;
+        }
+        Object answer = snapshot.get("answer");
+        return answer instanceof String text ? text : "";
     }
     
     /**

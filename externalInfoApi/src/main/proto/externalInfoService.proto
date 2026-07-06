@@ -48,6 +48,7 @@ message RagSearchResultItem {
   string date       = 6;        // 公告日期或研报日期（YYYYMMDD）
   string chunk_text = 7;        // 命中的文本片段
   string oss_url    = 8;        // 原文全文 OSS URL（Markdown），供 loadDocument 工具使用
+  int32  chunk_index = 9;       // 文档内 chunk 序号，用于 source_key / citation 过渡定位
 }
 
 message RagSearchResponse {

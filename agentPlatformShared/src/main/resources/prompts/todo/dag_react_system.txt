@@ -24,7 +24,7 @@
 | checkParallelLimits | `{}` |
 | executePython | `{"code": "<Python代码>", "dataset_ids": "<run-level dataset 编号列表，可选>", "manifest_ids": "<run-level manifest 编号列表，可选>", "libraries": "<可选，逗号分隔>", "timeout_seconds": "<可选，整数>"}` |
 | loadToolGuide | `{"topic": "python_sandbox|dataset_manifest|advanced_market_data|execute_python_tips"}` |
-| rereadToolResult | `{"rawRef": "raw-ref:...", "keyword": "<可选关键词>", "offset": 0, "limit": 0}` |
+| rereadToolResult | keyword: `{"rawRef": "raw_ref_001", "keyword": "<非空关键词>", "limit": 3000}`；range: `{"rawRef": "raw_ref_001", "offset": 0, "limit": 3000}` |
 | searchWeb | `{"query": "<搜索查询文本>", "scene": "general|finance|news", "backend": "perplexity|tavily|exa|", "strength": "<搜索强度，可空>", "skipHotCache": true|false, "skipRagPrefetch": true|false, "timeRangeStart": "<ISO8601，可空>", "timeRangeEnd": "<ISO8601，可空>", "maxResults": 5}` |
 
 ## 数据查询时效性（全局）
@@ -101,7 +101,7 @@
   - `loadToolGuide(topic=execute_python_tips)` — trade_date 解析等常见陷阱
 - 使用 `searchAssetInfo` / `searchIndex` 的 **advanced 模式**前，若上下文无 advanced 说明，调用 `loadToolGuide(topic=advanced_market_data)`。
 - 上下文**已有**对应 guide 全文时，直接写代码/查数，**不要重复调用** loadToolGuide。
-- 工具结果里若出现 `data.rawRef`（形如 `raw-ref:...`），不要把 rawRef 当作需要分页浏览的正文。所有工具输出都是结构化 JSON；优先使用当前可见的 `data` 字段、`${todo.output.data...}` 引用、`listMyData` 和后续数据工具。只有确实缺少某个必要字段时，才用 `rereadToolResult` 做少量、带 `keyword`/窄 `limit` 的定向补读；不要把 rawRef 传给 `loadDocument`，`loadDocument` 只接收 ragSearch 返回的 `oss_url`。
+- 工具结果里若出现 `data.rawRef`（形如 `raw_ref_001` 或 `raw-ref:...`），不要把 rawRef 当作正文或 citation。优先使用当前可见的 `data` 字段、`${todo.output.data...}` 引用、`listMyData` 和后续数据工具。只有确实缺少某个必要字段时，才用 `rereadToolResult` 做少量定向补读：keyword 模式必须给非空 `keyword`；range 模式不传 `keyword`，必须给合法 `offset/limit`。loadDocument 只接收 RAG 文档定位参数（如 oss_url / source_key / section），不能接收 rawRef。
 
 ### 2.3 大篇幅结构化输出处理
 
