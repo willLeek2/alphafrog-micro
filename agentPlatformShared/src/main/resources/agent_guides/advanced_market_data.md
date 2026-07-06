@@ -142,7 +142,7 @@ ETF 不在 `IndexWeightDao` 索引表里。`searchAssetInfo(asset_type=etf, has_
 | `NO_DATA` | `row_count = 0` 且无上游错误，附带 `empty_reason: "no_matching_index_weights"` | 时间区间内无成分股记录 |
 | `TOOL_ERROR` | 写 dataset 文件失败、签名构造失败、`objectMapper.readValue` 失败 | 落盘 / 序列化异常 |
 
-错误响应统一结构 `{ok: false, tool, data: {}, error: {code, message, details}}`；`details` 在 `BATCH_LIMIT_EXCEEDED` 时含 `actual_items` / `max_items` / `requested_values` / `hint`。
+错误响应统一结构 `{ok: false, tool, data: {}, error: {code, message, details}}`；`BATCH_LIMIT_EXCEEDED` 当前在 advanced 模式下 `details` 为空对象 `{}`（`splitCodes` 仅抛 `(code, message)`，`MarketDataTools` catch 后 `Map.of()` 透传），不包含 `actual_items` / `max_items` / `requested_values` 等结构化字段；如需这些结构化信息，应先调 `checkParallelLimits` 拆批。
 
 ## 示例
 
@@ -206,7 +206,7 @@ ETF 不在 `IndexWeightDao` 索引表里。`searchAssetInfo(asset_type=etf, has_
 }
 ```
 
-响应：`ok=false`、`error.code="BATCH_LIMIT_EXCEEDED"`、`error.details` 含 `argument="stock_code"`、`actual_items=4`、`max_items=3`、`requested_values=[...]`。修法是先调 `checkParallelLimits`，按 `advanced.maxItems` 拆批（每批 ≤3 个），多批结果在 LLM 侧合并。
+响应：`ok=false`、`error.code="BATCH_LIMIT_EXCEEDED"`、`error.message="stock_code count exceeds maxParallelQueriesInAdvancedMode"`、`error.details={}`（当前 advanced 模式下不填 details）。修法是先调 `checkParallelLimits`，按 `advanced.maxItems` 拆批（每批 ≤3 个），多批结果在 LLM 侧合并。
 
 ### 示例 5：NONE/NONE 最新公告期快照
 
