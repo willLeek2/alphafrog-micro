@@ -7,7 +7,10 @@ import world.willfrog.agent.workflow.DatasetPersistedEvent.PersistedArtifactType
 
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -230,6 +233,136 @@ public class AgentRunDatasetRegistry {
         }
     }
 
+    /**
+     * Restores the durable run-level dataset mapping before a suspended tool call resumes.
+     *
+     * <p>The operation is atomic per run and idempotent for an identical snapshot. A reused number,
+     * original id, or artifact payload with different content is rejected instead of silently changing the
+     * mapping that was previously exposed to the Agent/Sandbox. Manifest references in the public snapshot
+     * are run-level dataset numbers; they are translated back to internal original ids while rebuilding the
+     * registry so subsequent snapshots preserve the same public mapping.
+     */
+    public void restore(String runId, AgentRunDatasetSnapshot snapshot) {
+        if (runId == null || runId.isBlank()) {
+            throw new IllegalArgumentException("runId must not be blank");
+        }
+        Objects.requireNonNull(snapshot, "snapshot");
+
+        RestoredState restored = validateRestoreSnapshot(snapshot);
+        RunState state = runStates.computeIfAbsent(runId, ignored -> new RunState());
+        synchronized (state) {
+            verifyCompatible("dataset", state.rawDatasets, state.datasetNumbering,
+                    restored.datasets(), restored.datasetNumbering());
+            verifyCompatible("manifest", state.rawManifests, state.manifestNumbering,
+                    restored.manifests(), restored.manifestNumbering());
+
+            state.rawDatasets.putAll(restored.datasets());
+            state.rawManifests.putAll(restored.manifests());
+            state.datasetNumbering.putAll(restored.datasetNumbering());
+            state.manifestNumbering.putAll(restored.manifestNumbering());
+        }
+        log.info("Restored dataset registry: runId={} datasets={} manifests={} digest={}",
+                runId, snapshot.datasets().size(), snapshot.manifests().size(), snapshot.immutableDigest());
+    }
+
+    private RestoredState validateRestoreSnapshot(AgentRunDatasetSnapshot snapshot) {
+        Map<String, RawEntry> datasets = new HashMap<>();
+        Map<String, Integer> datasetNumbering = new HashMap<>();
+        Map<Integer, String> datasetIdsByNumber = new HashMap<>();
+        for (AgentRunDatasetEntry entry : snapshot.datasets()) {
+            requireArtifactType(entry, PersistedArtifactType.DATASET, "datasets");
+            putUnique(datasetIdsByNumber, entry.number(), entry.originalId(), "dataset number");
+            putUnique(datasetNumbering, entry.originalId(), entry.number(), "dataset originalId");
+            putUnique(datasets, entry.originalId(), new RawEntry(
+                    entry.originalId(), entry.persistedPath(), entry.fromTsCode(), entry.sortKey(),
+                    List.of(), PersistedArtifactType.DATASET), "dataset originalId");
+        }
+
+        Map<String, RawEntry> manifests = new HashMap<>();
+        Map<String, Integer> manifestNumbering = new HashMap<>();
+        Map<Integer, String> manifestIdsByNumber = new HashMap<>();
+        for (AgentRunDatasetEntry entry : snapshot.manifests()) {
+            requireArtifactType(entry, PersistedArtifactType.MANIFEST, "manifests");
+            putUnique(manifestIdsByNumber, entry.number(), entry.originalId(), "manifest number");
+            putUnique(manifestNumbering, entry.originalId(), entry.number(), "manifest originalId");
+
+            List<String> relatedOriginalIds = new ArrayList<>(entry.relatedDatasetIds().size());
+            for (String value : entry.relatedDatasetIds()) {
+                int datasetNumber;
+                try {
+                    datasetNumber = Integer.parseInt(value);
+                } catch (NumberFormatException invalid) {
+                    throw new IllegalArgumentException("manifest " + entry.originalId()
+                            + " has non-numeric related dataset number: " + value, invalid);
+                }
+                String relatedOriginalId = datasetIdsByNumber.get(datasetNumber);
+                if (relatedOriginalId == null) {
+                    throw new IllegalArgumentException("manifest " + entry.originalId()
+                            + " references unknown dataset number: " + datasetNumber);
+                }
+                relatedOriginalIds.add(relatedOriginalId);
+            }
+            putUnique(manifests, entry.originalId(), new RawEntry(
+                    entry.originalId(), entry.persistedPath(), entry.fromTsCode(), entry.sortKey(),
+                    List.copyOf(relatedOriginalIds), PersistedArtifactType.MANIFEST), "manifest originalId");
+        }
+        return new RestoredState(datasets, manifests, datasetNumbering, manifestNumbering);
+    }
+
+    private void requireArtifactType(AgentRunDatasetEntry entry, PersistedArtifactType expected, String listName) {
+        if (entry.artifactType() != expected) {
+            throw new IllegalArgumentException(listName + " contains " + entry.artifactType()
+                    + " entry: " + entry.originalId());
+        }
+    }
+
+    private <K, V> void putUnique(Map<K, V> target, K key, V value, String label) {
+        V prior = target.putIfAbsent(key, value);
+        if (prior != null && !prior.equals(value)) {
+            throw new IllegalArgumentException("conflicting " + label + ": " + key);
+        }
+        if (prior != null) {
+            throw new IllegalArgumentException("duplicate " + label + ": " + key);
+        }
+    }
+
+    private void verifyCompatible(String label,
+                                  Map<String, RawEntry> currentRaw,
+                                  Map<String, Integer> currentNumbering,
+                                  Map<String, RawEntry> restoredRaw,
+                                  Map<String, Integer> restoredNumbering) {
+        Map<Integer, String> currentIdsByNumber = invert(currentNumbering, label);
+        for (Map.Entry<String, Integer> entry : restoredNumbering.entrySet()) {
+            Integer currentNumber = currentNumbering.get(entry.getKey());
+            if (currentNumber != null && !currentNumber.equals(entry.getValue())) {
+                throw new IllegalStateException("conflicting " + label + " number for " + entry.getKey()
+                        + ": current=" + currentNumber + " restored=" + entry.getValue());
+            }
+            String currentId = currentIdsByNumber.get(entry.getValue());
+            if (currentId != null && !currentId.equals(entry.getKey())) {
+                throw new IllegalStateException("conflicting " + label + " number " + entry.getValue()
+                        + ": current=" + currentId + " restored=" + entry.getKey());
+            }
+        }
+        for (Map.Entry<String, RawEntry> entry : restoredRaw.entrySet()) {
+            RawEntry current = currentRaw.get(entry.getKey());
+            if (current != null && !current.equals(entry.getValue())) {
+                throw new IllegalStateException("conflicting " + label + " payload for " + entry.getKey());
+            }
+        }
+    }
+
+    private Map<Integer, String> invert(Map<String, Integer> numbering, String label) {
+        Map<Integer, String> result = new HashMap<>();
+        for (Map.Entry<String, Integer> entry : numbering.entrySet()) {
+            String prior = result.putIfAbsent(entry.getValue(), entry.getKey());
+            if (prior != null && !prior.equals(entry.getKey())) {
+                throw new IllegalStateException("current " + label + " state reuses number " + entry.getValue());
+            }
+        }
+        return result;
+    }
+
     public Optional<AgentRunDatasetEntry> findDatasetByNumber(String runId, int number) {
         return snapshot(runId).datasets().stream()
                 .filter(e -> e.number() == number)
@@ -308,6 +441,14 @@ public class AgentRunDatasetRegistry {
         // MF3 lock-after-snapshot: 已分配的 dataset / manifest 编号冻结，迟到 raw event 拿下一个可用编号。
         final ConcurrentMap<String, Integer> datasetNumbering = new ConcurrentHashMap<>();
         final ConcurrentMap<String, Integer> manifestNumbering = new ConcurrentHashMap<>();
+    }
+
+    private record RestoredState(
+            Map<String, RawEntry> datasets,
+            Map<String, RawEntry> manifests,
+            Map<String, Integer> datasetNumbering,
+            Map<String, Integer> manifestNumbering
+    ) {
     }
 
     /**

@@ -577,4 +577,83 @@ class AgentRunDatasetRegistryTest {
         assertEquals(3, snap2.manifests().get(2).number());
         assertEquals("m-a", snap2.manifests().get(2).originalId());
     }
+
+    @Test
+    void restoreShouldRebuildStableDatasetAndManifestMappings() {
+        registry.onDatasetPersisted(datasetEvent("run-source", "ds-b", "b.csv"));
+        registry.onDatasetPersisted(datasetEvent("run-source", "ds-a", "a.csv"));
+        registry.onDatasetPersisted(manifestEvent("run-source", "m-1", "manifest.json",
+                List.of("ds-b", "ds-a")));
+        AgentRunDatasetSnapshot durable = registry.snapshot("run-source");
+
+        registry.restore("run-restored", durable);
+
+        AgentRunDatasetSnapshot restored = registry.snapshot("run-restored");
+        assertEquals(durable, restored);
+        assertEquals(List.of("2", "1"), restored.manifests().get(0).relatedDatasetIds());
+        assertEquals(durable.immutableDigest(), restored.immutableDigest());
+    }
+
+    @Test
+    void restoreShouldBeIdempotentForSameSnapshot() {
+        AgentRunDatasetSnapshot durable = new AgentRunDatasetSnapshot(
+                List.of(AgentRunDatasetEntry.forDataset(1, "ds-1", "/host/a.csv", "000001.SZ", "a.csv")),
+                List.of());
+
+        registry.restore("run-restore", durable);
+        registry.restore("run-restore", durable);
+
+        assertEquals(durable, registry.snapshot("run-restore"));
+    }
+
+    @Test
+    void restoreShouldRejectSameOriginalIdWithDifferentNumber() {
+        registry.restore("run-restore", new AgentRunDatasetSnapshot(
+                List.of(AgentRunDatasetEntry.forDataset(1, "ds-1", "/host/a.csv", "ts", "a.csv")),
+                List.of()));
+
+        AgentRunDatasetSnapshot conflicting = new AgentRunDatasetSnapshot(
+                List.of(AgentRunDatasetEntry.forDataset(2, "ds-1", "/host/a.csv", "ts", "a.csv")),
+                List.of());
+        assertThrows(IllegalStateException.class, () -> registry.restore("run-restore", conflicting));
+    }
+
+    @Test
+    void restoreShouldRejectDifferentOriginalIdReusingNumber() {
+        registry.restore("run-restore", new AgentRunDatasetSnapshot(
+                List.of(AgentRunDatasetEntry.forDataset(1, "ds-1", "/host/a.csv", "ts", "a.csv")),
+                List.of()));
+
+        AgentRunDatasetSnapshot conflicting = new AgentRunDatasetSnapshot(
+                List.of(AgentRunDatasetEntry.forDataset(1, "ds-2", "/host/b.csv", "ts", "b.csv")),
+                List.of());
+        assertThrows(IllegalStateException.class, () -> registry.restore("run-restore", conflicting));
+    }
+
+    @Test
+    void restoreShouldRejectManifestReferenceToUnknownDatasetNumber() {
+        AgentRunDatasetSnapshot invalid = new AgentRunDatasetSnapshot(
+                List.of(),
+                List.of(AgentRunDatasetEntry.forManifest(
+                        1, "m-1", "/host/manifest.json", "UNCERTAIN", "manifest.json", List.of("9"))));
+
+        assertThrows(IllegalArgumentException.class, () -> registry.restore("run-restore", invalid));
+        assertFalse(registry.hasRunState("run-restore"));
+    }
+
+    @Test
+    void immutableDigestShouldIgnorePersistedHostPathAndListOrder() {
+        AgentRunDatasetEntry firstPath = AgentRunDatasetEntry.forDataset(
+                1, "ds-1", "/host-one/a.csv", "000001.SZ", "a.csv");
+        AgentRunDatasetEntry secondPath = AgentRunDatasetEntry.forDataset(
+                1, "ds-1", "/host-two/copied.csv", "000001.SZ", "a.csv");
+        AgentRunDatasetEntry datasetTwo = AgentRunDatasetEntry.forDataset(
+                2, "ds-2", "/host-one/b.csv", "000002.SZ", "b.csv");
+
+        AgentRunDatasetSnapshot left = new AgentRunDatasetSnapshot(List.of(firstPath, datasetTwo), List.of());
+        AgentRunDatasetSnapshot right = new AgentRunDatasetSnapshot(List.of(datasetTwo, secondPath), List.of());
+
+        assertEquals(left.immutableDigest(), right.immutableDigest());
+        assertTrue(left.immutableDigest().matches("sha256:[0-9a-f]{64}"));
+    }
 }
