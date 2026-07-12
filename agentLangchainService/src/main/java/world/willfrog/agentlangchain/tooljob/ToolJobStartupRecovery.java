@@ -92,6 +92,7 @@ public class ToolJobStartupRecovery {
      */
     private void recoverToolJobAnchors() {
         List<AgentRun> activeRuns = anchorService.listActive(200);
+        List<AgentRun> resumeReadyRuns = anchorService.listResumeReady(200);
 
         for (AgentRun run : activeRuns) {
             ToolJobAnchor anchor = anchorService.loadAnchor(run.getId());
@@ -131,6 +132,17 @@ public class ToolJobStartupRecovery {
             } catch (Exception e) {
                 log.error("Failed to recover anchor for run={}", run.getId(), e);
             }
+        }
+
+        // Resume-ready runs: CAS-ed to RECEIVED but not yet launched.
+        // Rebuild Redis so Codex resume coordinator can find them.
+        for (AgentRun run : resumeReadyRuns) {
+            ToolJobAnchor anchor = anchorService.loadAnchor(run.getId());
+            if (anchor == null) {
+                continue;
+            }
+            log.info("Recovery found resume-ready run={}, resumeState={}", run.getId(), anchor.getResumeState());
+            redisCache.atomicWritePendingAndDue(run.getId(), anchor);
         }
     }
 

@@ -118,4 +118,10 @@ public interface AgentRunMapper {
      * 返回非终态 + WAITING_TOOL_JOB + RESULT_FETCH_PENDING 的 run。
      */
     List<AgentRun> listActiveToolJobAnchors(@Param("limit") int limit);
+
+    /**
+     * 列出 status=RECEIVED 且 tool_job_anchor_json 中 resumeState 为 READY 或 LAUNCHING 的 run，
+     * 用于启动恢复和 reconciler 扫描在 CAS 之后但 launch 之前崩溃的 run。
+     */
+    List<AgentRun> listResumeReadyAnchors(@Param("limit") int limit);
 }

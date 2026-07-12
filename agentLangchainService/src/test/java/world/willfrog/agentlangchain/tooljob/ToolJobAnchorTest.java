@@ -16,7 +16,7 @@ class ToolJobAnchorTest {
         original.setTaskId("sandbox-task-123");
         original.setToolCallId("tc-1");
         original.setAttempt(1);
-        original.setTodoId(3);
+        original.setTodoId("todo_3");
         original.setSequence(5);
         original.setNextPollAt(Instant.parse("2026-07-12T10:00:00Z"));
         original.setTimeoutAt(Instant.parse("2026-07-12T10:05:00Z"));
@@ -29,7 +29,7 @@ class ToolJobAnchorTest {
         assertThat(restored.getTaskId()).isEqualTo("sandbox-task-123");
         assertThat(restored.getToolCallId()).isEqualTo("tc-1");
         assertThat(restored.getAttempt()).isEqualTo(1);
-        assertThat(restored.getTodoId()).isEqualTo(3);
+        assertThat(restored.getTodoId()).isEqualTo("todo_3");
         assertThat(restored.getSequence()).isEqualTo(5);
         assertThat(restored.getResumeState()).isEqualTo("READY");
         assertThat(restored.getNextPollAt()).isEqualTo("2026-07-12T10:00:00Z");

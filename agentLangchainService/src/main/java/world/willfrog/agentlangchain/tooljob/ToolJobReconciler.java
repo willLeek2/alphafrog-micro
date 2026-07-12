@@ -92,6 +92,19 @@ public class ToolJobReconciler {
         } catch (Exception e) {
             log.error("Reconciler rebuild-cycle error", e);
         }
+
+        // Scan for resume-ready runs (CAS-ed to RECEIVED but launch may have been lost)
+        try {
+            var resumeReadyRuns = anchorService.listResumeReady(50);
+            for (AgentRun run : resumeReadyRuns) {
+                ToolJobAnchor anchor = anchorService.loadAnchor(run.getId());
+                if (anchor != null) {
+                    redisCache.atomicWritePendingAndDue(run.getId(), anchor);
+                }
+            }
+        } catch (Exception e) {
+            log.error("Reconciler resume-ready scan error", e);
+        }
     }
 
     private void processItem(String runId) {

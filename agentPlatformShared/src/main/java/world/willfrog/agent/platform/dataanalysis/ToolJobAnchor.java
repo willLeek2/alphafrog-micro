@@ -21,7 +21,7 @@ public class ToolJobAnchor {
     private String taskId;
     private String toolCallId;
     private int attempt;
-    private int todoId;
+    private String todoId;
     private int sequence;
     private String runDisposition;
     private boolean autoResume = true;
@@ -96,8 +96,8 @@ public class ToolJobAnchor {
     public int getAttempt() { return attempt; }
     public void setAttempt(int attempt) { this.attempt = attempt; }
 
-    public int getTodoId() { return todoId; }
-    public void setTodoId(int todoId) { this.todoId = todoId; }
+    public String getTodoId() { return todoId; }
+    public void setTodoId(String todoId) { this.todoId = todoId; }
 
     public int getSequence() { return sequence; }
     public void setSequence(int sequence) { this.sequence = sequence; }

@@ -72,4 +72,13 @@ public class ToolJobAnchorService {
     public List<AgentRun> listActive(int limit) {
         return agentRunMapper.listActiveToolJobAnchors(limit);
     }
+
+    /**
+     * Lists runs with status=RECEIVED and resumeState=READY/LAUNCHING,
+     * i.e. runs that were CAS-ed back to RECEIVED but may not have been
+     * picked up by the resume launcher (crash recovery).
+     */
+    public List<AgentRun> listResumeReady(int limit) {
+        return agentRunMapper.listResumeReadyAnchors(limit);
+    }
 }
