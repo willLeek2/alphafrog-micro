@@ -35,6 +35,7 @@ class ToolJobFinalizerCheckpointFailureTest {
         ToolJobAnchor anchor = new ToolJobAnchor();
         anchor.setAutoResume(false);
         anchor.setRunDisposition("CHECKPOINT_FAILED");
+        anchor.setTerminalRetryable(false);
 
         finalizer.handleTerminal("run-1", anchor, "SUCCEEDED", null, false);
 

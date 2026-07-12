@@ -1,0 +1,279 @@
+package world.willfrog.agentlangchain.tooljob;
+
+import org.junit.jupiter.api.Test;
+import world.willfrog.agent.platform.dataanalysis.*;
+import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.alphafrogmicro.sandbox.idl.SandboxResourceUsage;
+import world.willfrog.alphafrogmicro.sandbox.idl.TaskResultResponse;
+
+import java.lang.reflect.Field;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.*;
+
+/**
+ * C-slice: durable Harness retryable classification into terminal envelope.
+ * Verifies presence-aware nullable Boolean terminalRetryable flows from
+ * TaskResultResponse through ENVELOPE step into buildEnvelope, with
+ * fail-closed on missing classification.
+ */
+class ToolJobFinalizerRetryableTest {
+
+    // ===== presence-aware: retryable from result → anchor → envelope =====
+
+    @Test
+    void oomResultHasRetryableTrue_passesGateAndBuildsEnvelope() throws Exception {
+        ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
+        when(anchorService.updateAnchor(eq("run-1"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.WAITING_TOOL_JOB))).thenReturn(true);
+        when(anchorService.updateAnchorAndStatus(eq("run-1"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.WAITING_TOOL_JOB))).thenReturn(true);
+        DataAnalysisCapacityService capacityService = mock(DataAnalysisCapacityService.class);
+        when(capacityService.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(capacityService.releaseReservation(any())).thenReturn(DataAnalysisReleaseOutcome.RELEASED);
+        ToolJobUsageHook usageHook = mock(ToolJobUsageHook.class);
+        when(usageHook.upsertUsage(eq("run-1"), any())).thenReturn(true);
+        ToolJobEventHook eventHook = mock(ToolJobEventHook.class);
+        when(eventHook.emitTerminalEvent(eq("run-1"), any())).thenReturn(true);
+
+        ToolJobFinalizer finalizer = new ToolJobFinalizer(anchorService, mock(ToolJobRedisCache.class),
+                capacityService, mock(ToolJobResumeService.class), mock(ToolJobConfig.class));
+        inject(finalizer, "usageHook", usageHook);
+        inject(finalizer, "eventHook", eventHook);
+
+        // OOM result with retryable=true
+        TaskResultResponse resp = TaskResultResponse.newBuilder()
+                .setStatus("FAILED")
+                .setError("oom_killed")
+                .setRetryable(true) // proto3 optional presence
+                .setResourceUsage(SandboxResourceUsage.newBuilder()
+                        .setExitReason("OOM_KILLED").build())
+                .build();
+
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId("run-1:tc-1:1");
+        anchor.setToolCallId("tc-1");
+        anchor.setAttempt(1);
+        anchor.setTaskId("task-1");
+        anchor.setAutoResume(true);
+        anchor.setEstimateJson("{\"estimatedRows\":1000,\"estimatedBytes\":10000,\"fileCount\":1,"
+                + "\"selectedColumnRatio\":0.5,\"manifestMemberCount\":1,"
+                + "\"heavyOperationHints\":[],\"resourceClass\":\"STANDARD\",\"capacityUnits\":1}");
+        // Reservation in RELEASED state so RELEASE step is trivial
+        anchor.setReservationJson(buildReleasedJson("run-1", "tc-1", 1, "task-1"));
+
+        finalizer.handleTerminal("run-1", anchor, "FAILED", resp, true);
+
+        // Gate passed: terminalRetryable was set from result
+        assertThat(anchor.getTerminalRetryable()).isTrue();
+        // Pipeline completed
+        verify(anchorService).updateAnchorAndStatus(eq("run-1"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.WAITING_TOOL_JOB));
+        // Envelope consumed from anchor, not from status formula (FAILED but OOM → retryable=true)
+        verify(usageHook).upsertUsage(eq("run-1"), any(ToolJobAnchor.class));
+    }
+
+    @Test
+    void successResultHasRetryableFalse_passesGateAndBuildsEnvelope() throws Exception {
+        ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
+        when(anchorService.updateAnchor(eq("run-2"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.WAITING_TOOL_JOB))).thenReturn(true);
+        when(anchorService.updateAnchorAndStatus(eq("run-2"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.WAITING_TOOL_JOB))).thenReturn(true);
+        DataAnalysisCapacityService capacityService = mock(DataAnalysisCapacityService.class);
+        when(capacityService.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(capacityService.releaseReservation(any())).thenReturn(DataAnalysisReleaseOutcome.RELEASED);
+        ToolJobUsageHook usageHook = mock(ToolJobUsageHook.class);
+        when(usageHook.upsertUsage(eq("run-2"), any())).thenReturn(true);
+        ToolJobEventHook eventHook = mock(ToolJobEventHook.class);
+        when(eventHook.emitTerminalEvent(eq("run-2"), any())).thenReturn(true);
+
+        ToolJobFinalizer finalizer = new ToolJobFinalizer(anchorService, mock(ToolJobRedisCache.class),
+                capacityService, mock(ToolJobResumeService.class), mock(ToolJobConfig.class));
+        inject(finalizer, "usageHook", usageHook);
+        inject(finalizer, "eventHook", eventHook);
+
+        TaskResultResponse resp = TaskResultResponse.newBuilder()
+                .setStatus("SUCCEEDED")
+                .setStdout("ok")
+                .setRetryable(false)
+                .setResourceUsage(SandboxResourceUsage.newBuilder()
+                        .setExitReason("ok").build())
+                .build();
+
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId("run-2:tc-2:1");
+        anchor.setToolCallId("tc-2");
+        anchor.setAttempt(1);
+        anchor.setTaskId("task-2");
+        anchor.setAutoResume(true);
+        anchor.setEstimateJson("{\"estimatedRows\":1000,\"estimatedBytes\":10000,\"fileCount\":1,"
+                + "\"selectedColumnRatio\":0.5,\"manifestMemberCount\":1,"
+                + "\"heavyOperationHints\":[],\"resourceClass\":\"STANDARD\",\"capacityUnits\":1}");
+        anchor.setReservationJson(buildReleasedJson("run-2", "tc-2", 1, "task-2"));
+
+        finalizer.handleTerminal("run-2", anchor, "SUCCEEDED", resp, true);
+
+        assertThat(anchor.getTerminalRetryable()).isFalse();
+        verify(anchorService).updateAnchorAndStatus(eq("run-2"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.WAITING_TOOL_JOB));
+    }
+
+    @Test
+    void canceledResultHasRetryableFalse_passesGate() throws Exception {
+        ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
+        when(anchorService.updateAnchor(eq("run-c"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.WAITING_TOOL_JOB))).thenReturn(true);
+        when(anchorService.updateAnchorAndStatus(eq("run-c"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.WAITING_TOOL_JOB))).thenReturn(true);
+        DataAnalysisCapacityService capacityService = mock(DataAnalysisCapacityService.class);
+        when(capacityService.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(capacityService.releaseReservation(any())).thenReturn(DataAnalysisReleaseOutcome.RELEASED);
+        ToolJobUsageHook usageHook = mock(ToolJobUsageHook.class);
+        when(usageHook.upsertUsage(eq("run-c"), any())).thenReturn(true);
+        ToolJobEventHook eventHook = mock(ToolJobEventHook.class);
+        when(eventHook.emitTerminalEvent(eq("run-c"), any())).thenReturn(true);
+
+        ToolJobFinalizer finalizer = new ToolJobFinalizer(anchorService, mock(ToolJobRedisCache.class),
+                capacityService, mock(ToolJobResumeService.class), mock(ToolJobConfig.class));
+        inject(finalizer, "usageHook", usageHook);
+        inject(finalizer, "eventHook", eventHook);
+
+        TaskResultResponse resp = TaskResultResponse.newBuilder()
+                .setStatus("CANCELED")
+                .setRetryable(false)
+                .setResourceUsage(SandboxResourceUsage.newBuilder()
+                        .setExitReason("CANCELED").build())
+                .build();
+
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId("run-c:tc-c:1");
+        anchor.setToolCallId("tc-c");
+        anchor.setAttempt(1);
+        anchor.setTaskId("task-c");
+        anchor.setAutoResume(true);
+        anchor.setEstimateJson("{\"estimatedRows\":1000,\"estimatedBytes\":10000,\"fileCount\":1,"
+                + "\"selectedColumnRatio\":0.5,\"manifestMemberCount\":1,"
+                + "\"heavyOperationHints\":[],\"resourceClass\":\"STANDARD\",\"capacityUnits\":1}");
+        anchor.setReservationJson(buildReleasedJson("run-c", "tc-c", 1, "task-c"));
+
+        finalizer.handleTerminal("run-c", anchor, "CANCELED", resp, true);
+
+        // CANCELED → retryable=false, NOT incorrectly true (MF2 fix)
+        assertThat(anchor.getTerminalRetryable()).isFalse();
+        verify(anchorService).updateAnchorAndStatus(eq("run-c"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.WAITING_TOOL_JOB));
+    }
+
+    // ===== fail-closed: missing classification =====
+
+    @Test
+    void missingRetryableInResult_failClosedWithDiagnostic() throws Exception {
+        ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
+        when(anchorService.updateAnchor(eq("run-fc"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.WAITING_TOOL_JOB))).thenReturn(true);
+        DataAnalysisCapacityService capacityService = mock(DataAnalysisCapacityService.class);
+        ToolJobUsageHook usageHook = mock(ToolJobUsageHook.class);
+        ToolJobEventHook eventHook = mock(ToolJobEventHook.class);
+
+        ToolJobFinalizer finalizer = new ToolJobFinalizer(anchorService, mock(ToolJobRedisCache.class),
+                capacityService, mock(ToolJobResumeService.class), mock(ToolJobConfig.class));
+        inject(finalizer, "usageHook", usageHook);
+        inject(finalizer, "eventHook", eventHook);
+
+        // Result WITHOUT retryable (no setRetryable call on builder)
+        TaskResultResponse resp = TaskResultResponse.newBuilder()
+                .setStatus("FAILED")
+                .setError("some_error")
+                .setResourceUsage(SandboxResourceUsage.newBuilder()
+                        .setExitReason("EXECUTION_ERROR").build())
+                .build();
+
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId("run-fc:tc-fc:1");
+        anchor.setToolCallId("tc-fc");
+        anchor.setAttempt(1);
+        anchor.setTaskId("task-fc");
+        anchor.setAutoResume(true);
+
+        finalizer.handleTerminal("run-fc", anchor, "FAILED", resp, true);
+
+        // terminalRetryable stays null — not silently defaulted to false
+        assertThat(anchor.getTerminalRetryable()).isNull();
+        // Fail-closed: diagnostic written
+        assertThat(anchor.getFinalizerError()).isEqualTo("terminal_retryability_missing");
+        // ENVELOPE persisted + fail-closed diagnostic write (2 calls total)
+        verify(anchorService, times(2)).updateAnchor(eq("run-fc"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.WAITING_TOOL_JOB));
+        // Did NOT proceed to RELEASE (no second updateAnchor call)
+        verify(anchorService, never()).updateAnchorAndStatus(eq("run-fc"), any(ToolJobAnchor.class),
+                any(), any());
+        // Usage/event hooks never called
+        verify(usageHook, never()).upsertUsage(any(), any());
+        verify(eventHook, never()).emitTerminalEvent(any(), any());
+    }
+
+    // ===== RESULT_LOST synthetic classification =====
+
+    @Test
+    void resultLost_setsTerminalRetryableFalse() throws Exception {
+        ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
+        when(anchorService.updateAnchor(eq("run-rl"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.WAITING_TOOL_JOB))).thenReturn(true);
+        when(anchorService.updateAnchorAndStatus(eq("run-rl"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.WAITING_TOOL_JOB))).thenReturn(true);
+        DataAnalysisCapacityService capacityService = mock(DataAnalysisCapacityService.class);
+        when(capacityService.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(capacityService.releaseReservation(any())).thenReturn(DataAnalysisReleaseOutcome.RELEASED);
+        ToolJobUsageHook usageHook = mock(ToolJobUsageHook.class);
+        when(usageHook.upsertUsage(eq("run-rl"), any())).thenReturn(true);
+        ToolJobEventHook eventHook = mock(ToolJobEventHook.class);
+        when(eventHook.emitTerminalEvent(eq("run-rl"), any())).thenReturn(true);
+
+        ToolJobFinalizer finalizer = new ToolJobFinalizer(anchorService, mock(ToolJobRedisCache.class),
+                capacityService, mock(ToolJobResumeService.class), mock(ToolJobConfig.class));
+        inject(finalizer, "usageHook", usageHook);
+        inject(finalizer, "eventHook", eventHook);
+
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId("run-rl:tc-rl:1");
+        anchor.setToolCallId("tc-rl");
+        anchor.setAttempt(1);
+        anchor.setTaskId("task-rl");
+        anchor.setAutoResume(true);
+        anchor.setEstimateJson("{\"estimatedRows\":1000,\"estimatedBytes\":10000,\"fileCount\":1,"
+                + "\"selectedColumnRatio\":0.5,\"manifestMemberCount\":1,"
+                + "\"heavyOperationHints\":[],\"resourceClass\":\"STANDARD\",\"capacityUnits\":1}");
+        // No reservation → RELEASE is no-op
+        anchor.setReservationJson(null);
+
+        // RESULT_LOST: resultResp is null, terminalStatus is RESULT_LOST
+        finalizer.handleTerminal("run-rl", anchor, "RESULT_LOST", null, true);
+
+        // Synthetic explicit false — not Harness source, not missing
+        assertThat(anchor.getTerminalRetryable()).isFalse();
+        // Pipeline completed through RESUME_READY
+        verify(anchorService).updateAnchorAndStatus(eq("run-rl"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.WAITING_TOOL_JOB));
+    }
+
+    // ===== helpers =====
+
+    private static void inject(Object target, String name, Object value) throws Exception {
+        Field field = target.getClass().getDeclaredField(name);
+        field.setAccessible(true);
+        field.set(target, value);
+    }
+
+    private static String buildReleasedJson(String runId, String toolCallId, int attempt,
+                                             String taskId) throws Exception {
+        var mapper = new com.fasterxml.jackson.databind.ObjectMapper().findAndRegisterModules();
+        var identity = new DataAnalysisOperationIdentity(runId, toolCallId, attempt);
+        var reservation = new DataAnalysisReservation(
+                identity.operationId(), identity, DataAnalysisResourceClass.STANDARD, 1,
+                DataAnalysisReservationState.RELEASED, taskId, java.time.Instant.now());
+        return mapper.writeValueAsString(reservation);
+    }
+}

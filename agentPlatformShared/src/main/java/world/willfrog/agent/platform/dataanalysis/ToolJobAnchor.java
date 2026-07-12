@@ -53,6 +53,7 @@ public class ToolJobAnchor {
     private String terminalErrorCode;
     private String terminalUsageJson;
     private Instant terminalAt;
+    private Boolean terminalRetryable; // nullable: presence-aware Harness classification
 
     // result fetch
     private String resultFetchState; // PENDING, LOST
@@ -173,6 +174,9 @@ public class ToolJobAnchor {
 
     public Instant getTerminalAt() { return terminalAt; }
     public void setTerminalAt(Instant terminalAt) { this.terminalAt = terminalAt; }
+
+    public Boolean getTerminalRetryable() { return terminalRetryable; }
+    public void setTerminalRetryable(Boolean terminalRetryable) { this.terminalRetryable = terminalRetryable; }
 
     public String getResultFetchState() { return resultFetchState; }
     public void setResultFetchState(String resultFetchState) { this.resultFetchState = resultFetchState; }

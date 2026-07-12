@@ -83,12 +83,25 @@ public class ToolJobFinalizer {
                 } catch (Exception e) {
                     log.warn("Failed to serialize resourceUsage for run={}", runId, e);
                 }
+                if (resultResp.hasRetryable()) {
+                    anchor.setTerminalRetryable(resultResp.getRetryable());
+                }
+            } else if ("RESULT_LOST".equals(terminalStatus)) {
+                anchor.setTerminalRetryable(false);
             }
             anchor.setFinalizerStep(STEP_ENVELOPE);
             if (!anchorService.updateAnchor(runId, anchor, AgentRunStatus.WAITING_TOOL_JOB)) {
                 log.warn("ENVELOPE CAS failed for run={}", runId);
                 return;
             }
+        }
+
+        // Fail-closed gate: terminalRetryable must be present before RELEASE
+        if (anchor.getTerminalRetryable() == null) {
+            log.warn("terminalRetryable missing for run={}, fail-closed before RELEASE", runId);
+            anchor.setFinalizerError("terminal_retryability_missing");
+            anchorService.updateAnchor(runId, anchor, AgentRunStatus.WAITING_TOOL_JOB);
+            return;
         }
 
         // Step 2: RELEASE — capacity release, return value gate
@@ -295,7 +308,7 @@ public class ToolJobFinalizer {
                     reservation.identity().attempt(), reservation.operationId(), reservation.taskId(),
                     status, success, preview, rawRef, errorCode,
                     success ? null : "sandbox " + status,
-                    !success && !"RESULT_LOST".equals(status),
+                    Boolean.TRUE.equals(anchor.getTerminalRetryable()),
                     estimate, reservation, usage, anchor.getTerminalAt(), true);
         } catch (Exception e) {
             log.error("buildEnvelope failed for reservationId={}, status={}",
