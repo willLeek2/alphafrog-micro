@@ -399,6 +399,7 @@ class ToolJobFinalizerDbWriteFailureTest {
                 + "\"selectedColumnRatio\":0.5,\"manifestMemberCount\":1,"
                 + "\"heavyOperationHints\":[],\"resourceClass\":\"STANDARD\",\"capacityUnits\":1}");
         anchor.setReservationJson(reservationJson);
+        anchor.setTerminalRetryable(false); // SUCCEEDED runs are not retryable
         return anchor;
     }
 }

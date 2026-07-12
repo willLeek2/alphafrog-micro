@@ -71,6 +71,9 @@ message TaskResultResponse {
   string datasetDir = 6;
   string error = 7;
   SandboxResourceUsage resourceUsage = 8;
+  // Harness-owned terminal classification. Presence is required: missing must
+  // never be interpreted as the proto3 default false by downstream finalizers.
+  optional bool retryable = 9;
 }
 
 message SandboxResourceUsage {
