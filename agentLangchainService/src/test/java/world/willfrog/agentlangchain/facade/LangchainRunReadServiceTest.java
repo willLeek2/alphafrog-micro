@@ -1,6 +1,7 @@
 package world.willfrog.agentlangchain.facade;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.entity.AgentRunEvent;
@@ -19,6 +20,7 @@ import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agent.platform.service.SnapshotPartService;
 import world.willfrog.agentlangchain.routing.LangchainSingleWriterGuard;
 import world.willfrog.agentlangchain.tools.LangchainToolCatalogService;
+import world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilityQuery;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunResultRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunStatusRequest;
@@ -26,6 +28,7 @@ import world.willfrog.alphafrogmicro.agent.idl.ListAgentRunEventsRequest;
 
 import java.time.OffsetDateTime;
 import java.util.List;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
@@ -46,6 +49,8 @@ class LangchainRunReadServiceTest {
     private final LangchainToolCatalogService toolCatalogService = mock(LangchainToolCatalogService.class);
     private final LangchainSingleWriterGuard guard = new LangchainSingleWriterGuard();
     private final AgentArtifactService artifactService = mock(AgentArtifactService.class);
+    private final DataAnalysisObservabilityQuery dataAnalysisQuery = mock(DataAnalysisObservabilityQuery.class);
+    private final DataAnalysisReadResponseSerializer dataAnalysisSerializer = new DataAnalysisReadResponseSerializer(new ObjectMapper());
 
     private final LangchainRunReadService service = new LangchainRunReadService(
             runMapper,
@@ -62,7 +67,14 @@ class LangchainRunReadServiceTest {
             toolCatalogService,
             guard,
             artifactService,
-            new ObjectMapper());
+            new ObjectMapper(),
+            dataAnalysisQuery,
+            dataAnalysisSerializer);
+
+    @BeforeEach
+    void stubDataAnalysisQuery() {
+        when(dataAnalysisQuery.findByRunId(anyString())).thenReturn(Optional.empty());
+    }
 
     @Test
     void getRunAllowsExistingRunWithoutOwnerMarker() {
