@@ -126,9 +126,11 @@ async def process_task(task: Task, worker_id: int):
             missing_fields=[
                 "cpuMillis",
                 "memoryPeakBytes",
+                "logicalBytesScanned",
                 "prepareMillis",
                 "executionWallMillis",
                 "cleanupMillis",
+                "datasetOpenCount",
             ],
         )
         task.result = ExecuteResult(

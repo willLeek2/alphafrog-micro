@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 from dataclasses import dataclass
 from typing import Callable
 
 from .models import SandboxResourceUsage
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -101,7 +105,7 @@ class SandboxResourceUsageCollector:
         cpu_millis = None
         memory_peak = None
         memory_byte_millis = None
-        if self._samples:
+        if self._samples and not self._sample_error:
             cpu_millis = max(0, self._samples[-1].cpu_total_nanos - self._samples[0].cpu_total_nanos) // 1_000_000
             memory_peak = max(sample.memory_bytes for sample in self._samples)
             integral = 0.0
@@ -110,14 +114,27 @@ class SandboxResourceUsageCollector:
                 integral += left.memory_bytes * elapsed_millis
             memory_byte_millis = int(integral)
         else:
-            missing.extend(["cpuMillis", "memoryPeakBytes", "memoryByteMillis"])
-        if self._sample_error and "containerSampling" not in missing:
-            missing.append("containerSampling")
+            # A failed sampling stream may contain a prefix of plausible values, but the
+            # terminal contract cannot call that attribution complete. Keep the affected
+            # P0 metrics absent instead of publishing a partial number as measured-zero.
+            missing.extend(["cpuMillis", "memoryPeakBytes"])
+            if self._sample_error:
+                logger.warning("Sandbox container sampling was incomplete for %s", container_id)
 
         logical_bytes, open_count, loader_complete, loader_missing = parse_loader_metrics_jsonl(
             loader_metrics_jsonl
         )
-        missing.extend(loader_missing)
+        if not loader_complete:
+            # Partial JSONL aggregation is diagnostic-only. The stable terminal usage
+            # contract exposes only P0 field names, so both affected aggregates are null.
+            logical_bytes = None
+            open_count = None
+            missing.extend(["logicalBytesScanned", "datasetOpenCount"])
+            logger.warning(
+                "Sandbox loader metrics were incomplete for %s: %s",
+                container_id,
+                ",".join(loader_missing) or "unknown",
+            )
         for field, value in (
             ("queueWaitMillis", queue_wait_millis),
             ("prepareMillis", prepare_millis),
@@ -126,6 +143,8 @@ class SandboxResourceUsageCollector:
         ):
             if value is None:
                 missing.append(field)
+        if not exit_reason or not exit_reason.strip():
+            missing.append("exitReason")
 
         return SandboxResourceUsage(
             resource_class=self.resource_class,
@@ -143,7 +162,7 @@ class SandboxResourceUsageCollector:
             exit_reason=exit_reason,
             oom_killed=oom_killed,
             timed_out=timed_out,
-            attribution_complete=not missing and loader_complete,
+            attribution_complete=not missing,
             sampling_interval_millis=self.sampling_interval_millis,
             missing_fields=list(dict.fromkeys(missing)),
         )
