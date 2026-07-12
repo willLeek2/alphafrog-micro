@@ -108,8 +108,16 @@ public class ToolJobReconciler {
 
     private TaskResultResponse fetchResult(String taskId, String runId) {
         try {
-            return sandboxService.getTaskResult(
+            TaskResultResponse resp = sandboxService.getTaskResult(
                     GetTaskResultRequest.newBuilder().setTaskId(taskId).build());
+            if (resp == null) return null;
+            // Validate: response must have status and non-empty payload
+            String status = resp.getStatus();
+            if (status == null || status.isBlank()) {
+                log.warn("fetchResult: empty status for taskId={}, run={}", taskId, runId);
+                return null;
+            }
+            return resp;
         } catch (Exception e) {
             log.error("Failed to fetch result for taskId={}, run={}", taskId, runId, e);
             return null;

@@ -133,16 +133,17 @@ public class ToolJobResumeService {
 
         // Token-gated durable clear FIRST, then Redis (DB before cache)
         String token = anchor.getResumeToken();
+        boolean cleared;
         if (token != null && !token.isBlank()) {
-            if (!anchorService.clearAnchorWithToken(runId, token)) {
-                log.warn("Token-gated clear failed for run={}, token mismatch — another consumer already cleared", runId);
-                // Still clean Redis (best-effort: anchor already cleared by winner)
-                redisCache.removeDue(runId);
-                redisCache.deletePendingCache(runId);
-                return;
+            cleared = anchorService.clearAnchorWithToken(runId, token);
+            if (!cleared) {
+                log.warn("Token-gated clear failed for run={} — token mismatch, retrying", runId);
+                return; // keep Redis cache, retry on next cycle
             }
         } else {
+            log.warn("No resumeToken for run={}, using non-gated clear", runId);
             anchorService.clearAnchor(runId);
+            cleared = true;
         }
         redisCache.removeDue(runId);
         redisCache.deletePendingCache(runId);

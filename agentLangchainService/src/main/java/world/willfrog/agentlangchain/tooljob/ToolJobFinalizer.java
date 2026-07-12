@@ -3,6 +3,7 @@ package world.willfrog.agentlangchain.tooljob;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.dataanalysis.*;
 import world.willfrog.agent.platform.model.AgentRunStatus;
@@ -39,6 +40,12 @@ public class ToolJobFinalizer {
     private final ToolJobResumeService resumeService;
     private final ToolJobConfig config;
     private final ObjectMapper objectMapper = new ObjectMapper().findAndRegisterModules();
+
+    @Autowired(required = false)
+    private ToolJobUsageHook usageHook;
+
+    @Autowired(required = false)
+    private ToolJobEventHook eventHook;
 
     public ToolJobFinalizer(ToolJobAnchorService anchorService,
                             ToolJobRedisCache redisCache,
@@ -94,16 +101,34 @@ public class ToolJobFinalizer {
             if (!anchorService.updateAnchor(runId, anchor, AgentRunStatus.WAITING_TOOL_JOB)) return;
         }
 
-        // Step 3: USAGE — true gate, T4 hook not yet wired
+        // Step 3: USAGE — true gate, blocks if hook absent or fails
         if (!isStepDone(anchor, STEP_USAGE)) {
-            anchor.setUsagePersisted(false);
+            if (usageHook == null) {
+                log.warn("USAGE hook not wired — blocking finalizer for run={}", runId);
+                return;
+            }
+            boolean ok = usageHook.upsertUsage(runId, anchor);
+            if (!ok) {
+                log.warn("USAGE hook failed for run={}, will retry", runId);
+                return;
+            }
+            anchor.setUsagePersisted(true);
             anchor.setFinalizerStep(STEP_USAGE);
             if (!anchorService.updateAnchor(runId, anchor, AgentRunStatus.WAITING_TOOL_JOB)) return;
         }
 
-        // Step 4: EVENT — true gate, Codex hook not yet wired
+        // Step 4: EVENT — true gate, blocks if hook absent or fails
         if (!isStepDone(anchor, STEP_EVENT)) {
-            anchor.setTerminalEventEmitted(false);
+            if (eventHook == null) {
+                log.warn("EVENT hook not wired — blocking finalizer for run={}", runId);
+                return;
+            }
+            boolean ok = eventHook.emitTerminalEvent(runId, anchor);
+            if (!ok) {
+                log.warn("EVENT hook failed for run={}, will retry", runId);
+                return;
+            }
+            anchor.setTerminalEventEmitted(true);
             anchor.setFinalizerStep(STEP_EVENT);
             if (!anchorService.updateAnchor(runId, anchor, AgentRunStatus.WAITING_TOOL_JOB)) return;
         }
@@ -159,7 +184,7 @@ public class ToolJobFinalizer {
             anchor.setTerminalConfirmedAt(now);
             anchor.setResultFetchAttempts(1);
         }
-        anchor.setNextPollAt(now.plusMillis(5000));
+        anchor.setNextPollAt(now.plusMillis(config.getReconcilerIntervalMs()));
         anchorService.updateAnchor(runId, anchor, AgentRunStatus.WAITING_TOOL_JOB);
         redisCache.upsertDue(runId, anchor);
         redisCache.writePendingCache(runId, anchor);
@@ -175,7 +200,8 @@ public class ToolJobFinalizer {
                     anchor.getReservationJson(), DataAnalysisReservation.class);
             if (current.state() == DataAnalysisReservationState.RELEASED) return true;
 
-            DataAnalysisReservation confirmed = current;
+            // Transition to TERMINAL_CONFIRMED (required for Terminal proof)
+            DataAnalysisReservation confirmed;
             if (current.state() != DataAnalysisReservationState.TERMINAL_CONFIRMED) {
                 confirmed = new DataAnalysisReservation(current.reservationId(), current.identity(),
                         current.resourceClass(), current.capacityUnits(),
@@ -183,16 +209,25 @@ public class ToolJobFinalizer {
                         current.taskId(), current.acquiredAt());
                 DataAnalysisRestoreOutcome ro = capacityService.restoreReservation(confirmed);
                 if (ro == DataAnalysisRestoreOutcome.CONFLICT) {
-                    log.warn("Reservation restore CONFLICT for id={}", current.reservationId());
+                    // Crash recovery: may already be RELEASED by prior attempt
+                    // Try releaseReservation directly to detect ALREADY_RELEASED
+                    DataAnalysisTerminalEnvelope env = buildEnvelope(confirmed, anchor);
+                    if (env != null) {
+                        DataAnalysisReleaseRequest req = new DataAnalysisReleaseRequest(confirmed,
+                                new DataAnalysisReleaseProof.Terminal(env),
+                                DataAnalysisReleaseReason.SANDBOX_TERMINAL_CONFIRMED);
+                        DataAnalysisReleaseOutcome oo = capacityService.releaseReservation(req);
+                        if (oo == DataAnalysisReleaseOutcome.ALREADY_RELEASED) return true;
+                    }
+                    log.warn("Reservation restore CONFLICT for id={}, release also failed", current.reservationId());
                     return false;
                 }
+            } else {
+                confirmed = current;
             }
 
             DataAnalysisTerminalEnvelope envelope = buildEnvelope(confirmed, anchor);
-            if (envelope == null) {
-                log.error("Failed to build terminal envelope for reservationId={}", confirmed.reservationId());
-                return false;
-            }
+            if (envelope == null) return false;
 
             DataAnalysisReleaseRequest req = new DataAnalysisReleaseRequest(confirmed,
                     new DataAnalysisReleaseProof.Terminal(envelope),
