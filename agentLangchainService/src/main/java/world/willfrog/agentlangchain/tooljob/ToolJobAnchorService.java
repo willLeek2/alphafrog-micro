@@ -99,6 +99,20 @@ public class ToolJobAnchorService {
     }
 
     /**
+     * Atomic checkpoint merge: updates anchor only if identity fields AND
+     * checkpointVersion all match. The SQL bumps checkpointVersion atomically.
+     * @return true if exactly one row was updated
+     */
+    public boolean checkpointUpdate(String runId, ToolJobAnchor anchor,
+                                     AgentRunStatus expectedStatus) {
+        int rows = agentRunMapper.updateToolJobCheckpoint(
+                runId, anchor.toJson(), expectedStatus,
+                anchor.getOperationId(), anchor.getToolCallId(),
+                anchor.getAttempt(), anchor.getCheckpointVersion());
+        return rows == 1;
+    }
+
+    /**
      * Token+state+version-gated clear: only clears if the anchor's resumeState,
      * resumeToken, and resumeLeaseVersion all match. Prevents stale consumers
      * from clearing an anchor that has been re-claimed with a new lease.

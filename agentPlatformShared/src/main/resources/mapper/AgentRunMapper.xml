@@ -355,6 +355,26 @@
           AND (tool_job_anchor_json #>> '{resumeLeaseVersion}')::bigint = #{expectedLeaseVersion}
     </update>
 
+    <!--
+        Atomic checkpoint merge: binds identity + version in WHERE to prevent
+        lost updates. The caller constructs the full anchor JSON with checkpoint
+        fields merged in (preserving reservation/terminal/finalizer). The version
+        is atomically bumped via jsonb || concat.
+    -->
+    <update id="updateToolJobCheckpoint">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = CAST(#{toolJobAnchorJson} AS jsonb)
+                || jsonb_build_object('checkpointVersion',
+                       (COALESCE((tool_job_anchor_json #>> '{checkpointVersion}')::int, 0) + 1)::text::jsonb),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status = #{expectedStatus}
+          AND tool_job_anchor_json #>> '{operationId}' = #{expectedOperationId}
+          AND tool_job_anchor_json #>> '{toolCallId}' = #{expectedToolCallId}
+          AND (tool_job_anchor_json #>> '{attempt}')::int = #{expectedAttempt}
+          AND (tool_job_anchor_json #>> '{checkpointVersion}')::int = #{expectedCheckpointVersion}
+    </update>
+
     <update id="clearToolJobAnchorWithToken">
         UPDATE alphafrog_agent_run
         SET tool_job_anchor_json = CAST('{}' AS jsonb),

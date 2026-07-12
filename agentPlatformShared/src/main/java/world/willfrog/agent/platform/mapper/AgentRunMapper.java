@@ -137,6 +137,20 @@ public interface AgentRunMapper {
                                    @Param("expectedLeaseVersion") long expectedLeaseVersion);
 
     /**
+     * Atomic checkpoint merge: updates the anchor JSON only if identity fields
+     * (operationId, toolCallId, attempt) AND checkpointVersion all match.
+     * The SQL atomically bumps checkpointVersion via jsonb || concat.
+     * Prevents lost updates from concurrent checkpoint writers.
+     */
+    int updateToolJobCheckpoint(@Param("id") String id,
+                                 @Param("toolJobAnchorJson") String toolJobAnchorJson,
+                                 @Param("expectedStatus") AgentRunStatus expectedStatus,
+                                 @Param("expectedOperationId") String expectedOperationId,
+                                 @Param("expectedToolCallId") String expectedToolCallId,
+                                 @Param("expectedAttempt") int expectedAttempt,
+                                 @Param("expectedCheckpointVersion") int expectedCheckpointVersion);
+
+    /**
      * Token+state+version-gated clear: only clears if resumeState, resumeToken,
      * AND resumeLeaseVersion all match. Prevents stale consumers from clearing
      * an anchor that has already been re-claimed with a new token/version.

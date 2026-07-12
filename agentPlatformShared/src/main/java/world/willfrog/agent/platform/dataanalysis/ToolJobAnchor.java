@@ -17,6 +17,7 @@ public class ToolJobAnchor {
             .findAndRegisterModules();
 
     private int schemaVersion = 1;
+    private int checkpointVersion; // incremented on each atomic checkpoint merge
     private String operationId;
     private String taskId;
     private String toolCallId;
@@ -94,6 +95,9 @@ public class ToolJobAnchor {
 
     public int getSchemaVersion() { return schemaVersion; }
     public void setSchemaVersion(int schemaVersion) { this.schemaVersion = schemaVersion; }
+
+    public int getCheckpointVersion() { return checkpointVersion; }
+    public void setCheckpointVersion(int checkpointVersion) { this.checkpointVersion = checkpointVersion; }
 
     public String getOperationId() { return operationId; }
     public void setOperationId(String operationId) { this.operationId = operationId; }

@@ -58,7 +58,7 @@ class ToolJobCheckpointServiceTest {
     void shouldCaptureAndSaveValidCheckpoint() {
         AgentRun run = buildRun();
         when(agentRunMapper.findById("run-1")).thenReturn(run);
-        when(anchorService.updateAnchor(eq("run-1"), any(ToolJobAnchor.class),
+        when(anchorService.checkpointUpdate(eq("run-1"), any(ToolJobAnchor.class),
                 eq(AgentRunStatus.EXECUTING))).thenReturn(true);
 
         ToolJobCheckpointRequest req = ToolJobCheckpointRequest.builder("run-1")
@@ -77,7 +77,7 @@ class ToolJobCheckpointServiceTest {
 
         boolean result = service.captureAndSave(req);
         assertThat(result).isTrue();
-        verify(anchorService).updateAnchor(eq("run-1"), any(ToolJobAnchor.class),
+        verify(anchorService).checkpointUpdate(eq("run-1"), any(ToolJobAnchor.class),
                 eq(AgentRunStatus.EXECUTING));
     }
 
@@ -105,7 +105,7 @@ class ToolJobCheckpointServiceTest {
 
         boolean result = service.captureAndSave(req);
         assertThat(result).isFalse();
-        verify(anchorService, never()).updateAnchor(any(), any(), any());
+        verify(anchorService, never()).checkpointUpdate(any(), any(), any());
     }
 
     @Test
@@ -148,7 +148,7 @@ class ToolJobCheckpointServiceTest {
     void shouldReturnFalseWhenCasFails() {
         AgentRun run = buildRun();
         when(agentRunMapper.findById("run-1")).thenReturn(run);
-        when(anchorService.updateAnchor(eq("run-1"), any(ToolJobAnchor.class),
+        when(anchorService.checkpointUpdate(eq("run-1"), any(ToolJobAnchor.class),
                 eq(AgentRunStatus.EXECUTING))).thenReturn(false);
 
         ToolJobCheckpointRequest req = ToolJobCheckpointRequest.builder("run-1")
@@ -171,7 +171,7 @@ class ToolJobCheckpointServiceTest {
         // Fields not set in request → identity check is skipped (graceful)
         AgentRun run = buildRun();
         when(agentRunMapper.findById("run-1")).thenReturn(run);
-        when(anchorService.updateAnchor(eq("run-1"), any(ToolJobAnchor.class),
+        when(anchorService.checkpointUpdate(eq("run-1"), any(ToolJobAnchor.class),
                 eq(AgentRunStatus.EXECUTING))).thenReturn(true);
 
         ToolJobCheckpointRequest req = ToolJobCheckpointRequest.builder("run-1")
@@ -187,7 +187,7 @@ class ToolJobCheckpointServiceTest {
     void shouldAcceptCheckpointWithTodos() {
         AgentRun run = buildRun();
         when(agentRunMapper.findById("run-1")).thenReturn(run);
-        when(anchorService.updateAnchor(eq("run-1"), any(ToolJobAnchor.class),
+        when(anchorService.checkpointUpdate(eq("run-1"), any(ToolJobAnchor.class),
                 eq(AgentRunStatus.EXECUTING))).thenReturn(true);
 
         CompletedTodoRecord t1 = new CompletedTodoRecord();
