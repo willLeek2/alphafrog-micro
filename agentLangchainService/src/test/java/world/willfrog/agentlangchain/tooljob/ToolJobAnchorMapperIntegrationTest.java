@@ -326,10 +326,10 @@ class ToolJobAnchorMapperIntegrationTest {
     @Test
     void checkpointFailureMergeOwnsWaitingRunAndPreservesAnchor() throws Exception {
         insertRun("run-f1", "WAITING_TOOL_JOB", """
-            {"operationId":"run-f1:tc-1:1","toolCallId":"tc-1","taskId":"task-A","attempt":1,"checkpointVersion":3,"reservationJson":"keep","terminalStatus":"SUCCEEDED"}""");
+            {"operationId":"run-f1:tc-1:1","toolCallId":"tc-1","attempt":1,"checkpointVersion":3,"reservationJson":"keep","terminalStatus":"SUCCEEDED"}""");
 
         int rows = newMapper().markToolJobCheckpointFailed(
-                "run-f1", "run-f1:tc-1:1", "tc-1", "task-A", 1, 3,
+                "run-f1", "run-f1:tc-1:1", "tc-1", 1, 3,
                 "durable_checkpoint_write_failed");
 
         assertThat(rows).isEqualTo(1);
@@ -345,17 +345,12 @@ class ToolJobAnchorMapperIntegrationTest {
     @Test
     void checkpointFailureMergeRejectsStaleIdentityAndVersion() throws Exception {
         insertRun("run-f2", "WAITING_TOOL_JOB", """
-            {"operationId":"run-f2:tc-1:1","toolCallId":"tc-1","taskId":"task-B","attempt":1,"checkpointVersion":4}""");
+            {"operationId":"run-f2:tc-1:1","toolCallId":"tc-1","attempt":1,"checkpointVersion":4}""");
 
-        // wrong version → 0
         assertThat(newMapper().markToolJobCheckpointFailed(
-                "run-f2", "run-f2:tc-1:1", "tc-1", "task-B", 1, 3, "err")).isZero();
-        // wrong operationId + toolCallId → 0
+                "run-f2", "run-f2:tc-1:1", "tc-1", 1, 3, "err")).isZero();
         assertThat(newMapper().markToolJobCheckpointFailed(
-                "run-f2", "run-f2:tc-2:1", "tc-2", "task-B", 1, 4, "err")).isZero();
-        // wrong taskId → 0
-        assertThat(newMapper().markToolJobCheckpointFailed(
-                "run-f2", "run-f2:tc-1:1", "tc-1", "wrong-task", 1, 4, "err")).isZero();
+                "run-f2", "run-f2:tc-2:1", "tc-2", 1, 4, "err")).isZero();
     }
 
     // ========== casUpdateAnchorResumeState: claim CAS ==========

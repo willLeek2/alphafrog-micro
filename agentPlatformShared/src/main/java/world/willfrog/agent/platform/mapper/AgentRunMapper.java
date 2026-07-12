@@ -109,7 +109,6 @@ public interface AgentRunMapper {
     int markToolJobCheckpointFailed(@Param("id") String id,
                                     @Param("operationId") String operationId,
                                     @Param("toolCallId") String toolCallId,
-                                    @Param("taskId") String taskId,
                                     @Param("attempt") int attempt,
                                     @Param("checkpointVersion") int checkpointVersion,
                                     @Param("finalizerError") String finalizerError);

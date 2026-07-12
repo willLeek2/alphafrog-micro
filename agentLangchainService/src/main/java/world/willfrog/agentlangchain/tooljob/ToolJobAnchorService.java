@@ -64,7 +64,7 @@ public class ToolJobAnchorService {
     public boolean markCheckpointFailed(String runId, ToolJobAnchor anchor, String error) {
         return agentRunMapper.markToolJobCheckpointFailed(
                 runId, anchor.getOperationId(), anchor.getToolCallId(),
-                anchor.getTaskId(), anchor.getAttempt(), anchor.getCheckpointVersion(), error) == 1;
+                anchor.getAttempt(), anchor.getCheckpointVersion(), error) == 1;
     }
 
     /**

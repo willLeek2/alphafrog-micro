@@ -297,7 +297,6 @@
           AND tool_job_anchor_json &lt;&gt; '{}'::jsonb
           AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{operationId}
           AND tool_job_anchor_json -&gt;&gt; 'toolCallId' = #{toolCallId}
-          AND tool_job_anchor_json -&gt;&gt; 'taskId' = #{taskId}
           AND COALESCE((tool_job_anchor_json -&gt;&gt; 'attempt')::integer, 0) = #{attempt}
           AND COALESCE((tool_job_anchor_json -&gt;&gt; 'checkpointVersion')::integer, 0) = #{checkpointVersion}
     </update>
