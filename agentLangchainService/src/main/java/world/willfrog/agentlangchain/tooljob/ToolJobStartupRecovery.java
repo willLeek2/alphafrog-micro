@@ -9,16 +9,13 @@ import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.dataanalysis.*;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agent.tools.python.DataAnalysisCapacityProperties;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
 
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 
-/**
- * On startup, scans all DB anchors and rebuilds Redis cache/due ZSET,
- * resolves PREPARING anchors against the sandbox, and rebuilds the capacity ledger.
- */
 @Service
 public class ToolJobStartupRecovery {
 
@@ -27,7 +24,9 @@ public class ToolJobStartupRecovery {
     private final ToolJobAnchorService anchorService;
     private final ToolJobRedisCache redisCache;
     private final DataAnalysisCapacityService capacityService;
+    private final DataAnalysisCapacityProperties capacityProperties;
     private final ToolJobFinalizer finalizer;
+    private final ToolJobResumeService resumeService;
     private final ToolJobConfig config;
 
     @DubboReference
@@ -36,12 +35,16 @@ public class ToolJobStartupRecovery {
     public ToolJobStartupRecovery(ToolJobAnchorService anchorService,
                                   ToolJobRedisCache redisCache,
                                   DataAnalysisCapacityService capacityService,
+                                  DataAnalysisCapacityProperties capacityProperties,
                                   ToolJobFinalizer finalizer,
+                                  ToolJobResumeService resumeService,
                                   ToolJobConfig config) {
         this.anchorService = anchorService;
         this.redisCache = redisCache;
         this.capacityService = capacityService;
+        this.capacityProperties = capacityProperties;
         this.finalizer = finalizer;
+        this.resumeService = resumeService;
         this.config = config;
     }
 
@@ -57,21 +60,18 @@ public class ToolJobStartupRecovery {
         }
     }
 
-    /**
-     * Rebuild capacity ledger: collect all non-RELEASED reservations from DB anchors
-     * and feed them to the capacity service.
-     */
     private void recoverCapacityLedger() {
         List<AgentRun> activeRuns = anchorService.listActive(200);
         List<DataAnalysisReservation> durableReservations = new ArrayList<>();
 
         for (AgentRun run : activeRuns) {
             ToolJobAnchor anchor = anchorService.loadAnchor(run.getId());
-            if (anchor == null || anchor.getReservationJson() == null) {
-                continue;
-            }
+            if (anchor == null || anchor.getReservationJson() == null) continue;
             try {
-                DataAnalysisReservation reservation = parseReservationJson(anchor.getReservationJson());
+                com.fasterxml.jackson.databind.ObjectMapper mapper =
+                        new com.fasterxml.jackson.databind.ObjectMapper().findAndRegisterModules();
+                DataAnalysisReservation reservation = mapper.readValue(
+                        anchor.getReservationJson(), DataAnalysisReservation.class);
                 if (reservation != null && reservation.state() != DataAnalysisReservationState.RELEASED) {
                     durableReservations.add(reservation);
                 }
@@ -80,69 +80,56 @@ public class ToolJobStartupRecovery {
             }
         }
 
-        if (!durableReservations.isEmpty()) {
-            DataAnalysisCapacityRecoveryReport report = capacityService.recover(
-                    durableReservations, 100, 5);
-            log.info("Capacity recovery: restored={} state={}", report.restoredReservations(), report.admissionState());
-        }
+        // Always call recover (even with empty list) to flip admission from RECOVERING → OPEN
+        int maxUnits = capacityProperties.getMaxUnits();
+        int maxHeavyActive = capacityProperties.getMaxHeavyActive();
+        DataAnalysisCapacityRecoveryReport report = capacityService.recover(
+                durableReservations, maxUnits, maxHeavyActive);
+        log.info("Capacity recovery: restored={} active={} heavyActive={} usedUnits={}/{} state={} conflicts={}",
+                report.restoredReservations(), report.activeCount(),
+                report.heavyActiveCount(), report.usedUnits(),
+                report.configuredMaxUnits(), report.admissionState(), report.conflicts());
     }
 
-    /**
-     * Scan all anchors and resolve each based on its state.
-     */
     private void recoverToolJobAnchors() {
         List<AgentRun> activeRuns = anchorService.listActive(200);
         List<AgentRun> resumeReadyRuns = anchorService.listResumeReady(200);
 
         for (AgentRun run : activeRuns) {
             ToolJobAnchor anchor = anchorService.loadAnchor(run.getId());
-            if (anchor == null) {
-                continue;
-            }
+            if (anchor == null) continue;
 
             try {
                 String resumeState = anchor.getResumeState();
                 if ("CONSUMED".equals(resumeState)) {
-                    // Clean up leftover cache
                     redisCache.removeDue(run.getId());
                     redisCache.deletePendingCache(run.getId());
                     continue;
                 }
                 if ("READY".equals(resumeState) || "LAUNCHING".equals(resumeState)) {
-                    // Resume was in progress — rebuild Redis and let the pipeline continue
                     redisCache.atomicWritePendingAndDue(run.getId(), anchor);
                     continue;
                 }
-
-                // RESULT_FETCH_PENDING: continue polling for result
                 if ("PENDING".equals(anchor.getResultFetchState())) {
                     redisCache.atomicWritePendingAndDue(run.getId(), anchor);
                     continue;
                 }
-
-                // TERMINAL/FINALIZING: continue from last finalizer step
                 if (anchor.getFinalizerStep() != null && !anchor.getFinalizerStep().isBlank()) {
                     redisCache.atomicWritePendingAndDue(run.getId(), anchor);
                     continue;
                 }
-
-                // ATTACHED/PENDING: rebuild reservation and due/cache
                 resolveActiveAnchor(run, anchor);
-
             } catch (Exception e) {
                 log.error("Failed to recover anchor for run={}", run.getId(), e);
             }
         }
 
-        // Resume-ready runs: CAS-ed to RECEIVED but not yet launched.
-        // Rebuild Redis so Codex resume coordinator can find them.
         for (AgentRun run : resumeReadyRuns) {
             ToolJobAnchor anchor = anchorService.loadAnchor(run.getId());
-            if (anchor == null) {
-                continue;
-            }
+            if (anchor == null) continue;
             log.info("Recovery found resume-ready run={}, resumeState={}", run.getId(), anchor.getResumeState());
             redisCache.atomicWritePendingAndDue(run.getId(), anchor);
+            resumeService.tryResume(run.getId());
         }
     }
 
@@ -159,7 +146,6 @@ public class ToolJobStartupRecovery {
             String status = statusResp.getStatus();
 
             if ("NOT_FOUND".equals(status)) {
-                // Sandbox task gone — check if we should retry or mark lost
                 if (anchor.getTerminalConfirmedAt() == null) {
                     anchor.setResultFetchState("PENDING");
                     anchor.setTerminalConfirmedAt(Instant.now());
@@ -172,12 +158,10 @@ public class ToolJobStartupRecovery {
             }
 
             if ("SUCCEEDED".equals(status) || "FAILED".equals(status) || "CANCELED".equals(status)) {
-                // Terminal — run through finalizer
-                finalizer.handleTerminal(run.getId(), anchor, statusResp);
+                finalizer.handleTerminal(run.getId(), anchor, status);
                 return;
             }
 
-            // Still running — rebuild due/cache and resume polling
             if (anchor.isAutoResume()) {
                 anchor.setNextPollAt(Instant.now().plusMillis(config.getReconcilerIntervalMs()));
             }
@@ -186,20 +170,8 @@ public class ToolJobStartupRecovery {
 
         } catch (Exception e) {
             log.error("Failed to resolve anchor for run={}, taskId={}", run.getId(), taskId, e);
-            // Rebuild Redis with next poll in the future so reconciler will retry
             anchor.setNextPollAt(Instant.now().plusMillis(config.getReconcilerIntervalMs()));
             redisCache.atomicWritePendingAndDue(run.getId(), anchor);
-        }
-    }
-
-    private DataAnalysisReservation parseReservationJson(String json) {
-        try {
-            com.fasterxml.jackson.databind.ObjectMapper mapper =
-                    new com.fasterxml.jackson.databind.ObjectMapper().findAndRegisterModules();
-            return mapper.readValue(json, DataAnalysisReservation.class);
-        } catch (Exception e) {
-            log.error("Failed to parse reservation JSON", e);
-            return null;
         }
     }
 }

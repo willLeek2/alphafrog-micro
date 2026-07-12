@@ -87,7 +87,7 @@ class ToolJobResumeServiceTest {
         assertThat(ctx.getTodoId()).isEqualTo("todo_3");
         assertThat(ctx.getCompletedTodos()).hasSize(2);
         assertThat(ctx.getCompletedTodos().get(0).getTodoId()).isEqualTo("todo_1");
-        assertThat(ctx.getCompletedTodos().get(0).getSummary()).isEqualTo("done");
+        assertThat(ctx.getCompletedTodos().get(0).getDescription()).isEqualTo("fetch data");
         assertThat(ctx.getToolCallsUsed()).isEqualTo(2);
         assertThat(ctx.isTerminalSuccess()).isTrue();
     }
@@ -178,8 +178,6 @@ class ToolJobResumeServiceTest {
         when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
         when(anchorService.updateAnchor(eq("run-1"), any(ToolJobAnchor.class), eq(AgentRunStatus.RECEIVED)))
                 .thenReturn(true);
-        when(anchorService.updateAnchorAndStatus(eq("run-1"), any(ToolJobAnchor.class),
-                eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.RECEIVED))).thenReturn(true);
 
         resumeService.markConsumed("run-1");
 
@@ -187,6 +185,7 @@ class ToolJobResumeServiceTest {
         assertThat(anchor.isResultConsumed()).isTrue();
         verify(redisCache).removeDue("run-1");
         verify(redisCache).deletePendingCache("run-1");
+        verify(anchorService).clearAnchor("run-1");
     }
 
     @Test
@@ -202,11 +201,9 @@ class ToolJobResumeServiceTest {
         resumeService.markConsumed("run-1");
 
         assertThat(anchor.getResumeState()).isEqualTo("CONSUMED");
-        // Redis NOT cleaned up — deferred
         verify(redisCache, never()).removeDue("run-1");
         verify(redisCache, never()).deletePendingCache("run-1");
-        // DB anchor NOT cleared — still has tool_job_anchor_json
-        verify(anchorService, never()).updateAnchorAndStatus(any(), any(), any(), any());
+        verify(anchorService, never()).clearAnchor(any());
     }
 
     // ---- helpers ----
@@ -219,8 +216,8 @@ class ToolJobResumeServiceTest {
         anchor.setAttempt(1);
         anchor.setTodoId("todo_3");
         anchor.setCompletedTodosJson(
-                "[{\"todoId\":\"todo_1\",\"summary\":\"done\",\"sequence\":1,\"toolCalls\":1}," +
-                 "{\"todoId\":\"todo_2\",\"summary\":\"done\",\"sequence\":2,\"toolCalls\":0}]");
+                "[{\"todoId\":\"todo_1\",\"description\":\"fetch data\",\"summary\":\"done\",\"modelOutput\":\"ok\",\"sequence\":1,\"toolCalls\":1}," +
+                 "{\"todoId\":\"todo_2\",\"description\":\"analyze\",\"summary\":\"done\",\"output\":\"result\",\"sequence\":2,\"toolCalls\":0}]");
         anchor.setDatasetSnapshotJson("{\"digest\":\"abc123\"}");
         anchor.setToolCallsUsed(2);
         anchor.setTerminalStatus("SUCCEEDED");

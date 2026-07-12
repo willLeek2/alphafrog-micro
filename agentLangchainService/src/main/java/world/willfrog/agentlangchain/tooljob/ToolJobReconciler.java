@@ -13,22 +13,11 @@ import world.willfrog.alphafrogmicro.sandbox.idl.*;
 import java.time.Instant;
 import java.util.Set;
 
-/**
- * Periodically polls due tool jobs, queries sandbox status, and hands terminal
- * jobs to the shared reentrant finalizer.
- * <p>
- * Two trigger paths:
- * <ol>
- *   <li>ZRANGEBYSCORE on the Redis due ZSET (short-cycle).</li>
- *   <li>Periodic full scan of DB anchors (long-cycle, rebuilds Redis if lost).</li>
- * </ol>
- */
 @Service
 public class ToolJobReconciler {
 
     private static final Logger log = LoggerFactory.getLogger(ToolJobReconciler.class);
 
-    // Known sandbox terminal status strings
     private static final String SUCCEEDED = "SUCCEEDED";
     private static final String FAILED = "FAILED";
     private static final String CANCELED = "CANCELED";
@@ -55,17 +44,11 @@ public class ToolJobReconciler {
         this.config = config;
     }
 
-    /**
-     * Short-cycle reconciliation from the Redis due ZSET.
-     */
     @Scheduled(fixedDelayString = "${agent.tool-job.reconciler-interval-ms:5000}")
     public void reconcileFromDue() {
         try {
             Set<String> dueRunIds = redisCache.fetchDue(20);
-            if (dueRunIds.isEmpty()) {
-                return;
-            }
-            log.debug("Reconciler found {} due items", dueRunIds.size());
+            if (dueRunIds.isEmpty()) return;
             for (String runId : dueRunIds) {
                 processItem(runId);
             }
@@ -74,21 +57,15 @@ public class ToolJobReconciler {
         }
     }
 
-    /**
-     * Long-cycle rebuild: scans all DB anchors and rebuilds Redis due/cache.
-     */
     @Scheduled(fixedDelayString = "${agent.tool-job.rebuild-interval-ms:60000}")
     public void rebuildFromAnchors() {
         try {
             var activeRuns = anchorService.listActive(100);
             for (AgentRun run : activeRuns) {
                 ToolJobAnchor anchor = anchorService.loadAnchor(run.getId());
-                if (anchor == null) {
-                    continue;
-                }
+                if (anchor == null) continue;
                 redisCache.atomicWritePendingAndDue(run.getId(), anchor);
-                if (anchor.getNextPollAt() != null
-                        && !anchor.getNextPollAt().isAfter(Instant.now())) {
+                if (anchor.getNextPollAt() != null && !anchor.getNextPollAt().isAfter(Instant.now())) {
                     processItem(run.getId());
                 }
             }
@@ -96,7 +73,6 @@ public class ToolJobReconciler {
             log.error("Reconciler rebuild-cycle error", e);
         }
 
-        // Scan for resume-ready runs (CAS-ed to RECEIVED but launch may have been lost)
         try {
             var resumeReadyRuns = anchorService.listResumeReady(50);
             for (AgentRun run : resumeReadyRuns) {
@@ -121,17 +97,24 @@ public class ToolJobReconciler {
             }
 
             if (!anchor.isAutoResume()) {
-                checkSandboxAndReleaseCapacity(runId, anchor);
+                checkSandboxTerminal(runId, anchor);
+                return;
+            }
+
+            String taskId = anchor.getTaskId();
+            if (taskId == null || taskId.isBlank()) {
+                log.warn("Anchor for run={} has no taskId", runId);
                 return;
             }
 
             TaskStatusResponse statusResp = sandboxService.getTaskStatus(
-                    GetTaskStatusRequest.newBuilder().setTaskId(anchor.getTaskId()).build());
-
+                    GetTaskStatusRequest.newBuilder().setTaskId(taskId).build());
             String status = statusResp.getStatus();
 
             if (SUCCEEDED.equals(status) || FAILED.equals(status) || CANCELED.equals(status)) {
-                finalizer.handleTerminal(runId, anchor, statusResp);
+                // Pass the real sandbox terminal status to the finalizer
+                // (not a reservation state name like "TERMINAL_CONFIRMED")
+                finalizer.handleTerminal(runId, anchor, status);
             } else if (NOT_FOUND.equals(status)) {
                 finalizer.handleNotFound(runId, anchor);
             } else {
@@ -145,17 +128,21 @@ public class ToolJobReconciler {
         }
     }
 
-    private void checkSandboxAndReleaseCapacity(String runId, ToolJobAnchor anchor) {
+    private void checkSandboxTerminal(String runId, ToolJobAnchor anchor) {
         try {
+            String taskId = anchor.getTaskId();
+            if (taskId == null) return;
             TaskStatusResponse statusResp = sandboxService.getTaskStatus(
-                    GetTaskStatusRequest.newBuilder().setTaskId(anchor.getTaskId()).build());
+                    GetTaskStatusRequest.newBuilder().setTaskId(taskId).build());
             String status = statusResp.getStatus();
             if (SUCCEEDED.equals(status) || FAILED.equals(status)
                     || CANCELED.equals(status) || NOT_FOUND.equals(status)) {
                 anchor.setTerminalStatus(status);
                 anchor.setTerminalAt(Instant.now());
                 anchorService.updateAnchor(runId, anchor, AgentRunStatus.WAITING_TOOL_JOB);
-                finalizer.releaseCapacityAndCleanup(runId, anchor);
+                // For paused/canceled runs, just clean up Redis without auto-resume
+                redisCache.removeDue(runId);
+                redisCache.deletePendingCache(runId);
             }
         } catch (Exception e) {
             log.error("Capacity-tracking error for paused run={}", runId, e);

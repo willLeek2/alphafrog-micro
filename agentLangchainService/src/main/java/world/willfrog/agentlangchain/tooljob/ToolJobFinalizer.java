@@ -3,12 +3,12 @@ package world.willfrog.agentlangchain.tooljob;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
-import world.willfrog.agent.platform.dataanalysis.*;
+import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
 
 import java.time.Instant;
-import java.util.List;
+import java.util.Map;
 
 /**
  * Shared reentrant finalizer for external tool jobs.
@@ -17,59 +17,56 @@ import java.util.List;
  * this finalizer. Each step records its outcome in the durable anchor; on re-entry
  * the finalizer resumes from the first incomplete step.
  * <p>
- * P0 scope:
+ * P0 steps:
  * <ol>
- *   <li>Persist terminal envelope to anchor</li>
- *   <li>Release reservation (best-effort via capacity service)</li>
+ *   <li>Persist terminal envelope to anchor (real data from sandbox)</li>
  *   <li>CAS run status WAITING_TOOL_JOB → RECEIVED</li>
- *   <li>Mark resumeState READY (Codex pipeline consumes this)</li>
- *   <li>Cleanup anchor/cache after CONSUMED</li>
+ *   <li>Mark resumeState READY, try synchronous resume launch</li>
  * </ol>
- * Steps 3-4 (usage upsert and appendOnce event) are T4 and Codex slices, wired later.
+ * Capacity release, usage upsert, and appendOnce event are separate concerns:
+ * capacity release is done by the reconciler using real sandbox result data;
+ * usage upsert is T4 recorder; appendOnce is Codex event slice.
  */
 @Service
 public class ToolJobFinalizer {
 
     private static final Logger log = LoggerFactory.getLogger(ToolJobFinalizer.class);
 
-    // Finalizer step names (ordered)
     static final String STEP_ENVELOPE = "ENVELOPE";
-    static final String STEP_RELEASE = "RELEASE";
-    static final String STEP_USAGE = "USAGE";
-    static final String STEP_EVENT = "EVENT";
     static final String STEP_CAS_STATUS = "CAS_STATUS";
     static final String STEP_RESUME_READY = "RESUME_READY";
-    static final String STEP_CLEANUP = "CLEANUP";
+
+    private static final Map<String, Integer> STEP_ORDER = Map.of(
+            STEP_ENVELOPE, 1,
+            STEP_CAS_STATUS, 2,
+            STEP_RESUME_READY, 3);
 
     private final ToolJobAnchorService anchorService;
     private final ToolJobRedisCache redisCache;
-    private final DataAnalysisCapacityService capacityService;
     private final ToolJobResumeService resumeService;
     private final ToolJobConfig config;
 
     public ToolJobFinalizer(ToolJobAnchorService anchorService,
                             ToolJobRedisCache redisCache,
-                            DataAnalysisCapacityService capacityService,
                             ToolJobResumeService resumeService,
                             ToolJobConfig config) {
         this.anchorService = anchorService;
         this.redisCache = redisCache;
-        this.capacityService = capacityService;
         this.resumeService = resumeService;
         this.config = config;
     }
 
     /**
      * Entry point when sandbox reports terminal (SUCCEEDED / FAILED / CANCELED).
+     * {@code terminalStatus} is the real sandbox status string, not a reservation state name.
      */
-    public void handleTerminal(String runId, ToolJobAnchor anchor, TaskStatusResponse statusResp) {
-        String status = statusResp.getStatus();
+    public void handleTerminal(String runId, ToolJobAnchor anchor, String terminalStatus) {
         Instant now = Instant.now();
 
-        // Step 1: persist terminal envelope to anchor
+        // Step 1: persist terminal status to anchor
         if (!isBeyond(anchor, STEP_ENVELOPE)) {
-            anchor.setTerminalStatus(status);
-            anchor.setSandboxTerminalStatus(status);
+            anchor.setTerminalStatus(terminalStatus);
+            anchor.setSandboxTerminalStatus(terminalStatus);
             anchor.setTerminalAt(now);
             anchor.setFinalizerStep(STEP_ENVELOPE);
             if (!anchorService.updateAnchor(runId, anchor, AgentRunStatus.WAITING_TOOL_JOB)) {
@@ -78,26 +75,7 @@ public class ToolJobFinalizer {
             }
         }
 
-        // Step 2: release reservation (best-effort, idempotent)
-        if (!isBeyond(anchor, STEP_RELEASE)) {
-            tryReleaseReservation(anchor);
-            anchor.setFinalizerStep(STEP_RELEASE);
-            anchorService.updateAnchor(runId, anchor, AgentRunStatus.WAITING_TOOL_JOB);
-        }
-
-        // Steps 3-4: usage + event — P0 stubs, advanced by T4 and Codex
-        if (!isBeyond(anchor, STEP_USAGE)) {
-            anchor.setUsagePersisted(false);
-            anchor.setFinalizerStep(STEP_USAGE);
-            anchorService.updateAnchor(runId, anchor, AgentRunStatus.WAITING_TOOL_JOB);
-        }
-        if (!isBeyond(anchor, STEP_EVENT)) {
-            anchor.setTerminalEventEmitted(false);
-            anchor.setFinalizerStep(STEP_EVENT);
-            anchorService.updateAnchor(runId, anchor, AgentRunStatus.WAITING_TOOL_JOB);
-        }
-
-        // Step 5: CAS run status WAITING_TOOL_JOB → RECEIVED
+        // Step 2: CAS run status WAITING_TOOL_JOB → RECEIVED
         if (!isBeyond(anchor, STEP_CAS_STATUS)) {
             boolean casOk = anchorService.casUpdateStatus(runId, AgentRunStatus.RECEIVED, AgentRunStatus.WAITING_TOOL_JOB);
             if (!casOk) {
@@ -107,26 +85,24 @@ public class ToolJobFinalizer {
                 return;
             }
             anchor.setFinalizerStep(STEP_CAS_STATUS);
-            anchorService.updateAnchor(runId, anchor, AgentRunStatus.RECEIVED);
+            if (!anchorService.updateAnchor(runId, anchor, AgentRunStatus.RECEIVED)) {
+                log.warn("Finalizer CAS_STATUS anchor update failed for run={}", runId);
+                return;
+            }
         }
 
-        // Step 6: mark resumeState READY and attempt synchronous resume launch
+        // Step 3: mark resumeState READY, try synchronous resume launch
         if (!isBeyond(anchor, STEP_RESUME_READY)) {
             anchor.setResumeState("READY");
             anchor.setFinalizerStep(STEP_RESUME_READY);
             anchorService.updateAnchor(runId, anchor, AgentRunStatus.RECEIVED);
             redisCache.writePendingCache(runId, anchor);
-
-            // Attempt synchronous resume. If launcher is not wired or rejects,
-            // the READY state remains and will be picked up by periodic scan.
             resumeService.tryResume(runId);
         }
-
-        // Step 7 (CLEANUP) is deferred — invoked by Codex after CONSUMED
     }
 
     /**
-     * Entry point when sandbox reports NOT_FOUND.
+     * Entry point when sandbox reports NOT_FOUND for the task.
      */
     public void handleNotFound(String runId, ToolJobAnchor anchor) {
         Instant now = Instant.now();
@@ -141,18 +117,16 @@ public class ToolJobFinalizer {
                 anchor.setResultFetchState("LOST");
                 anchor.setTerminalStatus("RESULT_LOST");
                 anchor.setTerminalAt(now);
-                log.error("Result lost for run={}, taskId={}, attempts={}", runId, anchor.getTaskId(), attempts);
-                handleTerminalLost(runId, anchor);
+                log.error("Result permanently lost for run={}, taskId={}, attempts={}", runId, anchor.getTaskId(), attempts);
+                handleTerminal(runId, anchor, "RESULT_LOST");
                 return;
             }
             anchor.setNextPollAt(now.plusMillis(config.getReconcilerIntervalMs()));
         } else {
-            // First NOT_FOUND: mark RESULT_FETCH_PENDING, release capacity
             anchor.setResultFetchState("PENDING");
             anchor.setTerminalConfirmedAt(now);
             anchor.setResultFetchAttempts(1);
             anchor.setNextPollAt(now.plusMillis(config.getReconcilerIntervalMs()));
-            tryReleaseReservation(anchor);
         }
 
         anchorService.updateAnchor(runId, anchor, AgentRunStatus.WAITING_TOOL_JOB);
@@ -160,48 +134,8 @@ public class ToolJobFinalizer {
         redisCache.writePendingCache(runId, anchor);
     }
 
-    private void handleTerminalLost(String runId, ToolJobAnchor anchor) {
-        anchor.setFinalizerStep(STEP_ENVELOPE);
-        anchorService.updateAnchor(runId, anchor, AgentRunStatus.WAITING_TOOL_JOB);
-        tryReleaseReservation(anchor);
-        anchorService.casUpdateStatus(runId, AgentRunStatus.FAILED, AgentRunStatus.WAITING_TOOL_JOB);
-        releaseCapacityAndCleanup(runId, anchor);
-    }
-
-    /**
-     * Release capacity and clean up after terminal handling is complete.
-     * Called for paused/canceled runs after sandbox terminal confirmed,
-     * or after Codex pipeline marks resumeState CONSUMED.
-     */
-    public void releaseCapacityAndCleanup(String runId, ToolJobAnchor anchor) {
-        tryReleaseReservation(anchor);
-        anchor.setResultConsumed(true);
-        anchor.setFinalizerStep(STEP_CLEANUP);
-        anchorService.updateAnchor(runId, anchor, AgentRunStatus.WAITING_TOOL_JOB);
-
-        redisCache.removeDue(runId);
-        redisCache.deletePendingCache(runId);
-
-        // Clear anchor from DB
-        anchorService.updateAnchorAndStatus(runId, new ToolJobAnchor(),
-                anchor.getRunDisposition() != null
-                        && List.of("PAUSED", "CANCELED", "CAS_REJECTED").contains(anchor.getRunDisposition())
-                        ? AgentRunStatus.WAITING : AgentRunStatus.RECEIVED,
-                AgentRunStatus.WAITING_TOOL_JOB);
-    }
-
     // ---- internal helpers ----
 
-    private static final java.util.Map<String, Integer> STEP_ORDER = java.util.Map.of(
-            STEP_ENVELOPE, 1,
-            STEP_RELEASE, 2,
-            STEP_USAGE, 3,
-            STEP_EVENT, 4,
-            STEP_CAS_STATUS, 5,
-            STEP_RESUME_READY, 6,
-            STEP_CLEANUP, 7);
-
-    /** Returns true if the anchor's current finalizer step is past the given step. */
     private boolean isBeyond(ToolJobAnchor anchor, String step) {
         String current = anchor.getFinalizerStep();
         if (current == null) {
@@ -210,91 +144,5 @@ public class ToolJobFinalizer {
         int currentOrdinal = STEP_ORDER.getOrDefault(current, 0);
         int stepOrdinal = STEP_ORDER.getOrDefault(step, 0);
         return currentOrdinal > stepOrdinal;
-    }
-
-    private void tryReleaseReservation(ToolJobAnchor anchor) {
-        if (anchor.getReservationJson() == null || anchor.getReservationJson().isBlank()) {
-            return;
-        }
-        try {
-            DataAnalysisReservation current = parseReservationFromJson(anchor.getReservationJson());
-            if (current == null || current.state() == DataAnalysisReservationState.RELEASED) {
-                return;
-            }
-
-            // Transition to TERMINAL_CONFIRMED if not already
-            DataAnalysisReservation confirmed;
-            if (current.state() != DataAnalysisReservationState.TERMINAL_CONFIRMED) {
-                confirmed = new DataAnalysisReservation(
-                        current.reservationId(), current.identity(),
-                        current.resourceClass(), current.capacityUnits(),
-                        DataAnalysisReservationState.TERMINAL_CONFIRMED,
-                        current.taskId(), current.acquiredAt());
-                DataAnalysisRestoreOutcome restored = capacityService.restoreReservation(confirmed);
-                if (restored == DataAnalysisRestoreOutcome.CONFLICT) {
-                    log.warn("Failed to transition reservation to TERMINAL_CONFIRMED, id={}", current.reservationId());
-                    return;
-                }
-            } else {
-                confirmed = current;
-            }
-
-            DataAnalysisTerminalEnvelope envelope = buildMinimalEnvelope(confirmed);
-            if (envelope == null) {
-                return;
-            }
-            DataAnalysisReleaseRequest releaseRequest = new DataAnalysisReleaseRequest(
-                    confirmed,
-                    new DataAnalysisReleaseProof.Terminal(envelope),
-                    DataAnalysisReleaseReason.SANDBOX_TERMINAL_CONFIRMED);
-            DataAnalysisReleaseOutcome outcome = capacityService.releaseReservation(releaseRequest);
-            log.info("Reservation release outcome={} for reservationId={}", outcome, confirmed.reservationId());
-        } catch (Exception e) {
-            log.error("Failed to release reservation for operationId={}", anchor.getOperationId(), e);
-        }
-    }
-
-    private DataAnalysisTerminalEnvelope buildMinimalEnvelope(DataAnalysisReservation reservation) {
-        try {
-            DataAnalysisResourceUsage usage = DataAnalysisResourceUsage.missing(reservation.resourceClass());
-            DataAnalysisEstimate estimate = new DataAnalysisEstimate(
-                    0, 0, 0, 0.0, 0,
-                    java.util.List.of(),
-                    reservation.resourceClass(),
-                    reservation.capacityUnits());
-            Instant now = Instant.now();
-            return new DataAnalysisTerminalEnvelope(
-                    reservation.identity().runId(),
-                    reservation.identity().toolCallId(),
-                    reservation.identity().attempt(),
-                    reservation.operationId(),
-                    reservation.taskId(),
-                    "TERMINAL_CONFIRMED",
-                    true,
-                    null,
-                    null,
-                    null,
-                    null,
-                    false,
-                    estimate,
-                    reservation,
-                    usage,
-                    now,
-                    true);
-        } catch (Exception e) {
-            log.error("Failed to construct terminal envelope for reservationId={}", reservation.reservationId(), e);
-            return null;
-        }
-    }
-
-    private DataAnalysisReservation parseReservationFromJson(String json) {
-        try {
-            com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper()
-                    .findAndRegisterModules();
-            return mapper.readValue(json, DataAnalysisReservation.class);
-        } catch (Exception e) {
-            log.error("Failed to parse reservation JSON", e);
-            return null;
-        }
     }
 }

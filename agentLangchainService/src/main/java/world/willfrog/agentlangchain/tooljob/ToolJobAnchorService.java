@@ -94,4 +94,9 @@ public class ToolJobAnchorService {
                 runId, anchor.toJson(), expectedStatus, expectedResumeState);
         return rows == 1;
     }
+
+    /** Clear the anchor to {} so the partial index stops matching. */
+    public void clearAnchor(String runId) {
+        agentRunMapper.clearToolJobAnchor(runId);
+    }
 }

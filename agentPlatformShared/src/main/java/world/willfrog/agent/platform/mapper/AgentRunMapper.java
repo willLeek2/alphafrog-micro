@@ -133,4 +133,7 @@ public interface AgentRunMapper {
                                    @Param("toolJobAnchorJson") String toolJobAnchorJson,
                                    @Param("expectedStatus") AgentRunStatus expectedStatus,
                                    @Param("expectedResumeState") String expectedResumeState);
+
+    /** Clear tool_job_anchor_json to {} so the partial index stops matching. */
+    int clearToolJobAnchor(@Param("id") String id);
 }

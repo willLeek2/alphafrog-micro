@@ -84,9 +84,6 @@ public class ToolJobResumeService {
      * First launch attempt: atomic CAS READY → LAUNCHING, then launch.
      */
     private boolean launchFromReady(String runId, ToolJobAnchor anchor) {
-        // Restore dataset registry before claiming (best-effort, failure is non-fatal)
-        restoreDatasetRegistry(anchor);
-
         // Atomic CAS: claim READY → LAUNCHING
         anchor.setResumeState("LAUNCHING");
         boolean claimed = anchorService.casResumeState(runId, anchor, AgentRunStatus.RECEIVED, "READY");
@@ -94,6 +91,10 @@ public class ToolJobResumeService {
             log.info("Resume CAS READY→LAUNCHING failed for run={}, another process claimed it", runId);
             return false;
         }
+
+        // Restore dataset registry AFTER claiming (only the winner restores).
+        // Failure is non-fatal but logged; the run continues with whatever is available.
+        restoreDatasetRegistry(runId, anchor);
 
         return doLaunch(runId, anchor);
     }
@@ -181,16 +182,15 @@ public class ToolJobResumeService {
         // Full cleanup: clear Redis cache + DB anchor
         redisCache.removeDue(runId);
         redisCache.deletePendingCache(runId);
-        anchorService.updateAnchorAndStatus(runId, new ToolJobAnchor(),
-                AgentRunStatus.RECEIVED, AgentRunStatus.RECEIVED);
+        anchorService.clearAnchor(runId);
         log.info("Full cleanup completed for run={}", runId);
     }
 
     // ---- internal ----
 
-    private void restoreDatasetRegistry(ToolJobAnchor anchor) {
+    private void restoreDatasetRegistry(String runId, ToolJobAnchor anchor) {
         if (datasetRegistry == null) {
-            log.debug("No AgentRunDatasetRegistry wired, skipping restore for run={}", anchor.getOperationId());
+            log.debug("No AgentRunDatasetRegistry wired, skipping restore for run={}", runId);
             return;
         }
         String snapshotJson = anchor.getDatasetSnapshotJson();
@@ -200,13 +200,12 @@ public class ToolJobResumeService {
         try {
             world.willfrog.agent.workflow.AgentRunDatasetSnapshot snapshot =
                     objectMapper.readValue(snapshotJson, world.willfrog.agent.workflow.AgentRunDatasetSnapshot.class);
-            datasetRegistry.restore(anchor.getOperationId(), snapshot);
-            log.info("Dataset registry restored for run={}", anchor.getOperationId());
+            datasetRegistry.restore(runId, snapshot);
+            log.info("Dataset registry restored for run={}", runId);
         } catch (Exception e) {
-            // Restore failure is non-fatal for resume — the run will use
-            // what's available; the error is logged for debugging.
-            log.error("Dataset registry restore failed for run={}, continuing with launch",
-                    anchor.getOperationId(), e);
+            // Restore failure is logged but does not block resume — the run
+            // continues with available datasets; error is visible in logs.
+            log.error("Dataset registry restore failed for run={}, continuing with launch", runId, e);
         }
     }
 
@@ -235,7 +234,11 @@ public class ToolJobResumeService {
             try {
                 List<String> ids = objectMapper.readValue(json, new TypeReference<List<String>>() {});
                 return ids.stream()
-                        .map(id -> new CompletedTodoRecord(id, null, 0, 0))
+                        .map(id -> {
+                            CompletedTodoRecord r = new CompletedTodoRecord();
+                            r.setTodoId(id);
+                            return r;
+                        })
                         .toList();
             } catch (JsonProcessingException ex2) {
                 log.warn("Failed to parse completedTodosJson", ex2);
