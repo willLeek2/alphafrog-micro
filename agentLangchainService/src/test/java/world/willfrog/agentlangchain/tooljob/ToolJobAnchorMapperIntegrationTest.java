@@ -10,9 +10,12 @@ import org.junit.jupiter.api.Test;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
+import world.willfrog.agent.platform.dataanalysis.DataAnalysisEstimate;
+import world.willfrog.agent.platform.dataanalysis.DataAnalysisResourceClass;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agent.workflow.AgentRunDatasetSnapshot;
 
 import javax.sql.DataSource;
 import org.postgresql.ds.PGSimpleDataSource;
@@ -20,6 +23,8 @@ import org.postgresql.ds.PGSimpleDataSource;
 import java.sql.Connection;
 import java.sql.Statement;
 import java.util.List;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -36,6 +41,25 @@ class ToolJobAnchorMapperIntegrationTest {
             .withDatabaseName("testdb")
             .withUsername("test")
             .withPassword("test");
+
+    private static final ObjectMapper om = new ObjectMapper().findAndRegisterModules();
+    private static final String VALID_SNAPSHOT_JSON;
+    private static final String VALID_SNAPSHOT_DIGEST;
+    private static final String VALID_ESTIMATE_JSON;
+
+    static {
+        try {
+            var snapshot = AgentRunDatasetSnapshot.empty();
+            VALID_SNAPSHOT_JSON = om.writeValueAsString(snapshot);
+            VALID_SNAPSHOT_DIGEST = snapshot.immutableDigest();
+
+            var estimate = new DataAnalysisEstimate(0, 0, 0, 0.0, 0,
+                    List.of(), DataAnalysisResourceClass.STANDARD, 1);
+            VALID_ESTIMATE_JSON = om.writeValueAsString(estimate);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
 
     @BeforeAll
     static void createTable() throws Exception {
@@ -394,7 +418,6 @@ class ToolJobAnchorMapperIntegrationTest {
 
     @Test
     void staleCheckpointRequestCannotBorrowNewerDbVersion() throws Exception {
-        // Anchor at v0, first request at v0 succeeds, stale request at v0 rejected
         insertRun("run-s1", "EXECUTING", """
             {"operationId":"run-s1:tc-1:1","toolCallId":"tc-1","attempt":1,"taskId":"task-123","checkpointVersion":0}""");
 
@@ -404,8 +427,8 @@ class ToolJobAnchorMapperIntegrationTest {
                 .operationId("run-s1:tc-1:1").toolCallId("tc-1").attempt(1).taskId("task-123")
                 .expectedCheckpointVersion(0)
                 .todoId("todo_A").sequence(1).completedTodos(List.of())
-                .datasetSnapshotJson("{\"v\":1}").datasetSnapshotDigest("d1")
-                .datasetRefsJson("[]").toolCallsUsed(1).estimateJson("{\"c\":10}")
+                .datasetSnapshotJson(VALID_SNAPSHOT_JSON).datasetSnapshotDigest(VALID_SNAPSHOT_DIGEST)
+                .datasetRefsJson("[]").toolCallsUsed(1).estimateJson(VALID_ESTIMATE_JSON)
                 .build();
         assertThat(svc.captureAndSave(req1)).isTrue();
 
@@ -414,12 +437,11 @@ class ToolJobAnchorMapperIntegrationTest {
                 .operationId("run-s1:tc-1:1").toolCallId("tc-1").attempt(1).taskId("task-123")
                 .expectedCheckpointVersion(0) // stale: captured before first write
                 .todoId("todo_B").sequence(2).completedTodos(List.of())
-                .datasetSnapshotJson("{\"v\":2}").datasetSnapshotDigest("d2")
-                .datasetRefsJson("[]").toolCallsUsed(2).estimateJson("{\"c\":20}")
+                .datasetSnapshotJson(VALID_SNAPSHOT_JSON).datasetSnapshotDigest(VALID_SNAPSHOT_DIGEST)
+                .datasetRefsJson("[]").toolCallsUsed(2).estimateJson(VALID_ESTIMATE_JSON)
                 .build();
         assertThat(svc.captureAndSave(req2)).isFalse();
 
-        // Verify first write's data survived
         ToolJobAnchor a = ToolJobAnchor.fromJson(newMapper().findById("run-s1").getToolJobAnchorJson());
         assertThat(a.getTodoId()).isEqualTo("todo_A");
         assertThat(a.getCheckpointVersion()).isEqualTo(1);
@@ -430,20 +452,17 @@ class ToolJobAnchorMapperIntegrationTest {
         insertRun("run-s2", "EXECUTING", """
             {"operationId":"run-s2:tc-1:1","toolCallId":"tc-1","attempt":1,"taskId":"task-123","checkpointVersion":0}""");
 
-        // Both requests captured at v0 concurrently
         var req = ToolJobCheckpointRequest.builder("run-s2")
                 .operationId("run-s2:tc-1:1").toolCallId("tc-1").attempt(1).taskId("task-123")
                 .expectedCheckpointVersion(0)
                 .todoId("todo_1").sequence(1).completedTodos(List.of())
-                .datasetSnapshotJson("{}").datasetSnapshotDigest("d").datasetRefsJson("[]")
-                .toolCallsUsed(1).estimateJson("{}")
+                .datasetSnapshotJson(VALID_SNAPSHOT_JSON).datasetSnapshotDigest(VALID_SNAPSHOT_DIGEST)
+                .datasetRefsJson("[]").toolCallsUsed(1).estimateJson(VALID_ESTIMATE_JSON)
                 .build();
 
-        // First caller succeeds (builder is immutable, reuse is safe)
         ToolJobCheckpointService svc1 = newServiceChain();
         assertThat(svc1.captureAndSave(req)).isTrue();
 
-        // Second caller with same version → service-level version mismatch (DB now v1)
         ToolJobCheckpointService svc2 = newServiceChain();
         assertThat(svc2.captureAndSave(req)).isFalse();
     }

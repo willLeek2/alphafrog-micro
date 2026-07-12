@@ -1,14 +1,17 @@
 package world.willfrog.agentlangchain.tooljob;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.dataanalysis.CompletedTodoRecord;
+import world.willfrog.agent.platform.dataanalysis.DataAnalysisEstimate;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
+import world.willfrog.agent.workflow.AgentRunDatasetSnapshot;
 
 import java.util.List;
 
@@ -24,7 +27,9 @@ public class ToolJobCheckpointService implements ToolJobCheckpointWriter {
 
     private final AgentRunMapper agentRunMapper;
     private final ToolJobAnchorService anchorService;
-    private final ObjectMapper objectMapper = new ObjectMapper().findAndRegisterModules();
+    private final ObjectMapper objectMapper = new ObjectMapper()
+            .findAndRegisterModules()
+            .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
 
     public ToolJobCheckpointService(AgentRunMapper agentRunMapper,
                                      ToolJobAnchorService anchorService) {
@@ -193,44 +198,89 @@ public class ToolJobCheckpointService implements ToolJobCheckpointWriter {
             log.warn("Checkpoint rejected: toolCallsUsed={} < 0 for run={}", request.getToolCallsUsed(), runId);
             return false;
         }
-        if (request.getDatasetSnapshotJson() == null || request.getDatasetSnapshotJson().isBlank()) {
+
+        // Typed validation: each JSON field must parse as the expected domain type.
+        // Syntax-only check (readTree) is insufficient — literal null, wrong root type,
+        // missing required fields would pass readTree but break launcher/finalizer recovery.
+        if (!validateSnapshotType(request, runId)) return false;
+        if (!validateRefsType(request, runId)) return false;
+        if (!validateEstimateType(request, runId)) return false;
+
+        return true;
+    }
+
+    private boolean validateSnapshotType(ToolJobCheckpointRequest request, String runId) {
+        String json = request.getDatasetSnapshotJson();
+        if (json == null || json.isBlank()) {
             log.warn("Checkpoint rejected: missing datasetSnapshotJson for run={}", runId);
             return false;
         }
-        if (!isValidJson(request.getDatasetSnapshotJson())) {
-            log.warn("Checkpoint rejected: invalid datasetSnapshotJson for run={}", runId);
+        AgentRunDatasetSnapshot snapshot;
+        try {
+            snapshot = objectMapper.readValue(json, AgentRunDatasetSnapshot.class);
+        } catch (Exception e) {
+            log.warn("Checkpoint rejected: datasetSnapshotJson not a valid AgentRunDatasetSnapshot for run={} err={}",
+                    runId, e.getMessage());
             return false;
         }
-        if (request.getDatasetSnapshotDigest() == null || request.getDatasetSnapshotDigest().isBlank()) {
-            log.warn("Checkpoint rejected: missing datasetSnapshotDigest for run={}", runId);
+        if (snapshot == null) {
+            log.warn("Checkpoint rejected: datasetSnapshotJson deserialized to null for run={}", runId);
             return false;
         }
-        if (request.getDatasetRefsJson() == null || request.getDatasetRefsJson().isBlank()) {
-            log.warn("Checkpoint rejected: missing datasetRefsJson for run={}", runId);
-            return false;
-        }
-        if (!isValidJson(request.getDatasetRefsJson())) {
-            log.warn("Checkpoint rejected: invalid datasetRefsJson for run={}", runId);
-            return false;
-        }
-        // estimateJson must be present and valid — never silently inherit old estimate
-        if (request.getEstimateJson() == null || request.getEstimateJson().isBlank()) {
-            log.warn("Checkpoint rejected: missing estimateJson for run={}", runId);
-            return false;
-        }
-        if (!isValidJson(request.getEstimateJson())) {
-            log.warn("Checkpoint rejected: invalid estimateJson for run={}", runId);
+        String digest = request.getDatasetSnapshotDigest();
+        String computed = snapshot.immutableDigest();
+        if (!computed.equals(digest)) {
+            log.warn("Checkpoint rejected: datasetSnapshotDigest mismatch expected={} computed={} for run={}",
+                    digest, computed, runId);
             return false;
         }
         return true;
     }
 
-    private boolean isValidJson(String json) {
-        try {
-            objectMapper.readTree(json);
-            return true;
-        } catch (Exception e) {
+    private boolean validateRefsType(ToolJobCheckpointRequest request, String runId) {
+        String json = request.getDatasetRefsJson();
+        if (json == null || json.isBlank()) {
+            log.warn("Checkpoint rejected: missing datasetRefsJson for run={}", runId);
             return false;
         }
+        try {
+            List<String> refs = objectMapper.readValue(json,
+                    objectMapper.getTypeFactory().constructCollectionType(List.class, String.class));
+            if (refs == null) {
+                log.warn("Checkpoint rejected: datasetRefsJson deserialized to null for run={}", runId);
+                return false;
+            }
+            for (String ref : refs) {
+                if (ref == null) {
+                    log.warn("Checkpoint rejected: datasetRefsJson contains null element for run={}", runId);
+                    return false;
+                }
+            }
+        } catch (Exception e) {
+            log.warn("Checkpoint rejected: datasetRefsJson not a valid List<String> for run={} err={}",
+                    runId, e.getMessage());
+            return false;
+        }
+        return true;
+    }
+
+    private boolean validateEstimateType(ToolJobCheckpointRequest request, String runId) {
+        String json = request.getEstimateJson();
+        if (json == null || json.isBlank()) {
+            log.warn("Checkpoint rejected: missing estimateJson for run={}", runId);
+            return false;
+        }
+        try {
+            DataAnalysisEstimate estimate = objectMapper.readValue(json, DataAnalysisEstimate.class);
+            if (estimate == null) {
+                log.warn("Checkpoint rejected: estimateJson deserialized to null for run={}", runId);
+                return false;
+            }
+        } catch (Exception e) {
+            log.warn("Checkpoint rejected: estimateJson not a valid DataAnalysisEstimate for run={} err={}",
+                    runId, e.getMessage());
+            return false;
+        }
+        return true;
     }
 }

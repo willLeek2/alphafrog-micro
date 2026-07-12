@@ -26,6 +26,7 @@ public class ToolJobCheckpointRequest {
     private final String datasetRefsJson;
     private final int toolCallsUsed;
     private final String estimateJson;
+    private final boolean versionExplicitlySet;
 
     private ToolJobCheckpointRequest(Builder builder) {
         this.runId = builder.runId;
@@ -33,6 +34,7 @@ public class ToolJobCheckpointRequest {
         this.toolCallId = builder.toolCallId;
         this.attempt = builder.attempt;
         this.taskId = builder.taskId;
+        this.versionExplicitlySet = builder.versionExplicitlySet;
         this.expectedCheckpointVersion = builder.expectedCheckpointVersion;
         this.todoId = builder.todoId;
         this.sequence = builder.sequence;
@@ -51,6 +53,7 @@ public class ToolJobCheckpointRequest {
     public int getAttempt() { return attempt; }
     public String getTaskId() { return taskId; }
     public int getExpectedCheckpointVersion() { return expectedCheckpointVersion; }
+    public boolean isVersionExplicitlySet() { return versionExplicitlySet; }
     public String getTodoId() { return todoId; }
     public int getSequence() { return sequence; }
     public List<CompletedTodoRecord> getCompletedTodos() { return completedTodos; }
@@ -71,6 +74,7 @@ public class ToolJobCheckpointRequest {
         private int attempt;
         private String taskId;
         private int expectedCheckpointVersion;
+        private boolean versionExplicitlySet;
         private String todoId;
         private int sequence;
         private List<CompletedTodoRecord> completedTodos = Collections.emptyList();
@@ -86,7 +90,11 @@ public class ToolJobCheckpointRequest {
         public Builder toolCallId(String toolCallId) { this.toolCallId = toolCallId; return this; }
         public Builder attempt(int attempt) { this.attempt = attempt; return this; }
         public Builder taskId(String taskId) { this.taskId = taskId; return this; }
-        public Builder expectedCheckpointVersion(int expectedCheckpointVersion) { this.expectedCheckpointVersion = expectedCheckpointVersion; return this; }
+        public Builder expectedCheckpointVersion(int expectedCheckpointVersion) {
+            this.expectedCheckpointVersion = expectedCheckpointVersion;
+            this.versionExplicitlySet = true;
+            return this;
+        }
         public Builder todoId(String todoId) { this.todoId = todoId; return this; }
         public Builder sequence(int sequence) { this.sequence = sequence; return this; }
         public Builder completedTodos(List<CompletedTodoRecord> completedTodos) { this.completedTodos = completedTodos; return this; }
@@ -97,6 +105,10 @@ public class ToolJobCheckpointRequest {
         public Builder estimateJson(String estimateJson) { this.estimateJson = estimateJson; return this; }
 
         public ToolJobCheckpointRequest build() {
+            if (!versionExplicitlySet) {
+                throw new IllegalStateException(
+                        "expectedCheckpointVersion must be explicitly set; missing value may silently accept wrong version");
+            }
             return new ToolJobCheckpointRequest(this);
         }
     }
