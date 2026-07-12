@@ -98,13 +98,10 @@ public class ToolJobAnchorService {
         return rows == 1;
     }
 
-    /** Clear the anchor to {} so the partial index stops matching. */
-    public void clearAnchor(String runId) {
-        agentRunMapper.clearToolJobAnchor(runId);
-    }
-
     /**
      * Token-gated clear: only clears if the anchor's resumeToken matches.
+     * There is no non-token-gated clear path — cleanup without a valid token
+     * is always rejected to prevent accidental data loss.
      * @return true if exactly one row was cleared (token matched)
      */
     public boolean clearAnchorWithToken(String runId, String expectedToken) {

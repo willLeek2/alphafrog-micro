@@ -146,20 +146,23 @@ public class ToolJobStartupRecovery {
             String status = statusResp.getStatus();
 
             if ("NOT_FOUND".equals(status)) {
-                if (anchor.getTerminalConfirmedAt() == null) {
-                    anchor.setResultFetchState("PENDING");
-                    anchor.setTerminalConfirmedAt(Instant.now());
-                    anchor.setResultFetchAttempts(1);
-                    anchor.setNextPollAt(Instant.now().plusMillis(config.getReconcilerIntervalMs()));
-                    anchorService.updateAnchor(run.getId(), anchor, AgentRunStatus.WAITING_TOOL_JOB);
-                    redisCache.atomicWritePendingAndDue(run.getId(), anchor);
-                }
+                // Delegate to shared finalizer for NOT_FOUND retry/backoff logic
+                finalizer.handleNotFound(run.getId(), anchor);
                 return;
             }
 
             if ("SUCCEEDED".equals(status) || "FAILED".equals(status) || "CANCELED".equals(status)) {
                 TaskResultResponse resultResp = sandboxService.getTaskResult(
                         GetTaskResultRequest.newBuilder().setTaskId(taskId).build());
+                // Validate result before passing to finalizer (matching reconciler.fetchResult)
+                if (!isValidTerminalResult(resultResp, status)) {
+                    log.warn("Startup recovery: invalid terminal result for run={}, taskId={}, will retry",
+                            run.getId(), taskId);
+                    anchor.setNextPollAt(Instant.now().plusMillis(config.getReconcilerIntervalMs()));
+                    anchorService.updateAnchor(run.getId(), anchor, AgentRunStatus.WAITING_TOOL_JOB);
+                    redisCache.atomicWritePendingAndDue(run.getId(), anchor);
+                    return;
+                }
                 finalizer.handleTerminal(run.getId(), anchor, status, resultResp, anchor.isAutoResume());
                 return;
             }
@@ -175,5 +178,19 @@ public class ToolJobStartupRecovery {
             anchor.setNextPollAt(Instant.now().plusMillis(config.getReconcilerIntervalMs()));
             redisCache.atomicWritePendingAndDue(run.getId(), anchor);
         }
+    }
+
+    /** Validates terminal result payload matches reconciler.fetchResult checks. */
+    private boolean isValidTerminalResult(TaskResultResponse resp, String expectedStatus) {
+        if (resp == null) return false;
+        String status = resp.getStatus();
+        if (status == null || status.isBlank()) return false;
+        if (!status.equals(expectedStatus)) return false;
+        if ("SUCCEEDED".equals(status)) {
+            String stdout = resp.getStdout();
+            String ds = resp.getDatasetDir();
+            return (stdout != null && !stdout.isBlank()) || (ds != null && !ds.isBlank());
+        }
+        return true;
     }
 }

@@ -355,13 +355,6 @@
           AND (tool_job_anchor_json #>> '{resumeLeaseVersion}')::bigint = #{expectedLeaseVersion}
     </update>
 
-    <update id="clearToolJobAnchor">
-        UPDATE alphafrog_agent_run
-        SET tool_job_anchor_json = CAST('{}' AS jsonb),
-            updated_at = CURRENT_TIMESTAMP
-        WHERE id = #{id}
-    </update>
-
     <update id="clearToolJobAnchorWithToken">
         UPDATE alphafrog_agent_run
         SET tool_job_anchor_json = CAST('{}' AS jsonb),

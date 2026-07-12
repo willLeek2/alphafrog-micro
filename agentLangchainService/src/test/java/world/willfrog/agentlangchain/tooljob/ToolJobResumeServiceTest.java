@@ -210,7 +210,7 @@ class ToolJobResumeServiceTest {
         assertThat(anchor.getResumeState()).isEqualTo("CONSUMED");
         verify(redisCache, never()).removeDue("run-1");
         verify(redisCache, never()).deletePendingCache("run-1");
-        verify(anchorService, never()).clearAnchor(any());
+        verify(anchorService, never()).clearAnchorWithToken(any(), any());
     }
 
     // ---- double-claim prevention (§9.11 token+version CAS) ----
