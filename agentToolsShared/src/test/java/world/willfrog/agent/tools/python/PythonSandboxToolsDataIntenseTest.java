@@ -233,6 +233,60 @@ class PythonSandboxToolsDataIntenseTest {
                 "task-existing".equals(anchor.getTaskId())));
     }
 
+    @Test
+    void terminalTaskIdMismatchDefersToPendingWithoutRelease() throws Exception {
+        assertInvalidTerminalResultDefersToPending(
+                "SUCCEEDED",
+                TaskResultResponse.newBuilder()
+                        .setTaskId("task-other").setStatus("SUCCEEDED")
+                        .setStdout("ok").setRetryable(false)
+                        .setResourceUsage(completeUsage()).build());
+    }
+
+    @Test
+    void terminalStatusMismatchDefersToPendingWithoutRelease() throws Exception {
+        assertInvalidTerminalResultDefersToPending(
+                "SUCCEEDED",
+                TaskResultResponse.newBuilder()
+                        .setTaskId("task-1").setStatus("FAILED").setError("boom")
+                        .setRetryable(true).setResourceUsage(completeUsage()).build());
+    }
+
+    @Test
+    void successfulTerminalWithoutPayloadDefersToPendingWithoutRelease() throws Exception {
+        assertInvalidTerminalResultDefersToPending(
+                "SUCCEEDED",
+                TaskResultResponse.newBuilder()
+                        .setTaskId("task-1").setStatus("SUCCEEDED")
+                        .setRetryable(false).setResourceUsage(completeUsage()).build());
+    }
+
+    private void assertInvalidTerminalResultDefersToPending(
+            String polledStatus,
+            TaskResultResponse terminalResult) throws Exception {
+        fixtureDataset();
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
+        when(dispatchStore.persistAttached(eq("run-test"), any())).thenReturn(true);
+        when(dispatchStore.transferToPending(eq("run-test"), any())).thenReturn(true);
+        when(sandbox.createTask(any())).thenAnswer(invocation -> {
+            ExecuteRequest request = invocation.getArgument(0);
+            return ExecuteResponse.newBuilder().setTaskId("task-1")
+                    .setRequestFingerprint(request.getRequestFingerprint()).build();
+        });
+        when(sandbox.getTaskStatus(any())).thenReturn(
+                TaskStatusResponse.newBuilder().setStatus(polledStatus).build());
+        when(sandbox.getTaskResult(any())).thenReturn(terminalResult);
+
+        assertThrows(ExternalToolJobPendingException.class,
+                () -> tools.executePython("print(1)", "1", null, null, 30));
+
+        verify(dispatchStore).transferToPending(eq("run-test"), any());
+        verify(capacity, never()).releaseReservation(any());
+        verifyNoInteractions(recorder);
+    }
+
     private void fixtureDataset() throws Exception {
         Path csv = tempDir.resolve("prices.csv");
         Files.writeString(csv, "ts_code,close\n600000.SH,10\n600001.SH,11\n");

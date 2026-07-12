@@ -600,7 +600,7 @@ public class PythonSandboxTools {
             TaskStatusResponse statusResp = getTaskStatus(taskId);
             String status = statusResp == null ? "" : nvl(statusResp.getStatus());
             if (isTerminal(status)) {
-                TaskResultResponse result = fetchTerminalResult(taskId);
+                TaskResultResponse result = fetchTerminalResult(runId, taskId, status);
                 if (result != null && result.hasRetryable()) {
                     try {
                         String completed = completeSynchronously(
@@ -720,12 +720,15 @@ public class PythonSandboxTools {
                 "Python Sandbox task continues in background: " + taskId);
     }
 
-    private TaskResultResponse fetchTerminalResult(String taskId) {
+    private TaskResultResponse fetchTerminalResult(
+            String runId,
+            String taskId,
+            String expectedStatus) {
         installDebugRpcAttachments();
         TaskResultResponse result = pythonSandboxService.getTaskResult(
                 GetTaskResultRequest.newBuilder().setTaskId(taskId).build());
-        return result == null || !result.getError().isBlank() && result.getStatus().isBlank()
-                ? null : result;
+        return SandboxTerminalResultValidator.validate(
+                taskId, runId, result, expectedStatus);
     }
 
     private static boolean isTerminal(String status) {
