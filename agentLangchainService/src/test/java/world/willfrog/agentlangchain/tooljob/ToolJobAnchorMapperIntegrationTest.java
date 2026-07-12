@@ -154,6 +154,17 @@ class ToolJobAnchorMapperIntegrationTest {
         }
     }
 
+    private static void updateLastError(String id, String lastError) throws Exception {
+        DataSource ds = dataSource();
+        try (Connection conn = ds.getConnection();
+             var ps = conn.prepareStatement(
+                     "UPDATE alphafrog_agent_run SET last_error = ? WHERE id = ?")) {
+            ps.setString(1, lastError);
+            ps.setString(2, id);
+            ps.executeUpdate();
+        }
+    }
+
     // ========== updateToolJobCheckpoint: atomic merge CAS ==========
 
     @Test
@@ -378,11 +389,56 @@ class ToolJobAnchorMapperIntegrationTest {
         AgentRunMapper mapper = newMapper();
         String marker = ToolJobCheckpointFailureRecoveryService.MARKER_PREFIX + "{\"runId\":\"run-fr\"}";
 
-        assertThat(mapper.markToolJobCheckpointFailurePending("run-fr", marker)).isEqualTo(1);
+        assertThat(mapper.markToolJobCheckpointFailurePending(
+                "run-fr", "run-fr:tc-1:1", "tc-1", 1, "task-123", 0, marker)).isEqualTo(1);
         assertThat(newMapper().findById("run-fr").getLastError()).isEqualTo(marker);
         assertThat(newMapper().clearToolJobCheckpointFailurePending("run-fr", "wrong")).isZero();
         assertThat(newMapper().clearToolJobCheckpointFailurePending("run-fr", marker)).isEqualTo(1);
         assertThat(newMapper().findById("run-fr").getLastError()).isNull();
+    }
+
+    @Test
+    void checkpointFailureRetryMarkerRejectsReplacedOwnerTuple() throws Exception {
+        insertRun("run-fr-stale", "WAITING_TOOL_JOB", """
+            {"operationId":"run-fr-stale:tc-old:1","toolCallId":"tc-old","attempt":1,"taskId":"task-old","checkpointVersion":3}""");
+        AgentRunMapper mapper = newMapper();
+        ToolJobAnchor replacement = new ToolJobAnchor();
+        replacement.setOperationId("run-fr-stale:tc-new:1");
+        replacement.setToolCallId("tc-new");
+        replacement.setAttempt(1);
+        replacement.setTaskId("task-new");
+        replacement.setCheckpointVersion(4);
+        assertThat(mapper.updateToolJobAnchor(
+                "run-fr-stale", replacement.toJson(), AgentRunStatus.WAITING_TOOL_JOB)).isEqualTo(1);
+
+        String staleMarker = ToolJobCheckpointFailureRecoveryService.MARKER_PREFIX + "{\"runId\":\"run-fr-stale\"}";
+        assertThat(newMapper().markToolJobCheckpointFailurePending(
+                "run-fr-stale", "run-fr-stale:tc-old:1", "tc-old", 1, "task-old", 3, staleMarker))
+                .isZero();
+        assertThat(newMapper().findById("run-fr-stale").getLastError()).isNull();
+        ToolJobAnchor current = ToolJobAnchor.fromJson(
+                newMapper().findById("run-fr-stale").getToolJobAnchorJson());
+        assertThat(current.getOperationId()).isEqualTo("run-fr-stale:tc-new:1");
+        assertThat(current.getTaskId()).isEqualTo("task-new");
+        assertThat(current.getCheckpointVersion()).isEqualTo(4);
+    }
+
+    @Test
+    void checkpointFailureRetryMarkerDoesNotOverwriteDifferentErrorOrMarker() throws Exception {
+        insertRun("run-fr-error", "WAITING_TOOL_JOB", """
+            {"operationId":"run-fr-error:tc-1:1","toolCallId":"tc-1","attempt":1,"taskId":"task-1","checkpointVersion":2}""");
+        String marker = ToolJobCheckpointFailureRecoveryService.MARKER_PREFIX + "{\"runId\":\"run-fr-error\"}";
+
+        updateLastError("run-fr-error", "existing_error");
+        assertThat(newMapper().markToolJobCheckpointFailurePending(
+                "run-fr-error", "run-fr-error:tc-1:1", "tc-1", 1, "task-1", 2, marker)).isZero();
+        assertThat(newMapper().findById("run-fr-error").getLastError()).isEqualTo("existing_error");
+
+        String otherMarker = ToolJobCheckpointFailureRecoveryService.MARKER_PREFIX + "{\"runId\":\"other\"}";
+        updateLastError("run-fr-error", otherMarker);
+        assertThat(newMapper().markToolJobCheckpointFailurePending(
+                "run-fr-error", "run-fr-error:tc-1:1", "tc-1", 1, "task-1", 2, marker)).isZero();
+        assertThat(newMapper().findById("run-fr-error").getLastError()).isEqualTo(otherMarker);
     }
 
     // ========== casUpdateAnchorResumeState: claim CAS ==========

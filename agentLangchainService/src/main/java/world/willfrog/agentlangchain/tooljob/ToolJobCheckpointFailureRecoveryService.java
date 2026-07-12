@@ -8,6 +8,7 @@ import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
+import world.willfrog.agent.platform.model.AgentRunStatus;
 
 import java.util.List;
 import java.util.Objects;
@@ -44,8 +45,29 @@ public class ToolJobCheckpointFailureRecoveryService {
         }
         if (hasEquivalentOrNewerCheckpoint(request)) return Outcome.HEALTHY_CHECKPOINT;
         String marker = marker(request);
-        return runMapper.markToolJobCheckpointFailurePending(request.getRunId(), marker) == 1
-                ? Outcome.RETRY_OWNED : Outcome.UNOWNED;
+        if (writePendingMarker(request, marker) == 1) return Outcome.RETRY_OWNED;
+
+        // The marker CAS deliberately fails after another tool job/version takes ownership.
+        // Treat that as superseded so the stale writer cannot block the new owner's polling.
+        if (!hasSameFrozenOwner(request)) return Outcome.SUPERSEDED;
+
+        AgentRun current = runMapper.findById(request.getRunId());
+        if (current != null && markerOwnsSameTuple(current.getLastError(), request)) {
+            return Outcome.RETRY_OWNED;
+        }
+
+        // Same owner still exists but marker CAS lost for a transient reason. One bounded
+        // retry of the narrow failure merge gives this path a durable disposition without
+        // overwriting an unrelated last_error.
+        try {
+            if (anchorService.markCheckpointFailed(request, "durable_checkpoint_write_failed")) {
+                return Outcome.FAILURE_OWNED;
+            }
+        } catch (Exception e) {
+            log.warn("Checkpoint-failure bounded retry failed run={}: {}",
+                    request.getRunId(), e.getMessage());
+        }
+        return hasSameFrozenOwner(request) ? Outcome.UNOWNED : Outcome.SUPERSEDED;
     }
 
     /** @return true when no pending marker exists or this call durably resolved it. */
@@ -65,9 +87,59 @@ public class ToolJobCheckpointFailureRecoveryService {
             log.error("Invalid checkpoint-failure retry marker run={}", runId, e);
             return false;
         }
-        boolean resolved = hasEquivalentOrNewerCheckpoint(request)
-                || anchorService.markCheckpointFailed(request, "durable_checkpoint_write_failed");
+        boolean resolved = hasEquivalentOrNewerCheckpoint(request);
+        if (!resolved && !hasSameFrozenOwner(request)) {
+            // The marker belongs to an old owner. Compare-clear it and let the current
+            // tool job resume normal polling instead of retrying an impossible old tuple.
+            resolved = true;
+        } else if (!resolved) {
+            resolved = anchorService.markCheckpointFailed(
+                    request, "durable_checkpoint_write_failed");
+        }
         return resolved && runMapper.clearToolJobCheckpointFailurePending(runId, marker) == 1;
+    }
+
+    private int writePendingMarker(ToolJobCheckpointRequest request, String marker) {
+        return runMapper.markToolJobCheckpointFailurePending(
+                request.getRunId(), request.getOperationId(), request.getToolCallId(),
+                request.getAttempt(), request.getTaskId(), request.getExpectedCheckpointVersion(), marker);
+    }
+
+    private boolean hasSameFrozenOwner(ToolJobCheckpointRequest request) {
+        try {
+            AgentRun run = runMapper.findById(request.getRunId());
+            if (run == null || run.getStatus() != AgentRunStatus.WAITING_TOOL_JOB
+                    || blank(run.getToolJobAnchorJson())) {
+                return false;
+            }
+            ToolJobAnchor anchor = ToolJobAnchor.fromJson(run.getToolJobAnchorJson());
+            return anchor != null
+                    && Objects.equals(anchor.getOperationId(), request.getOperationId())
+                    && Objects.equals(anchor.getToolCallId(), request.getToolCallId())
+                    && anchor.getAttempt() == request.getAttempt()
+                    && Objects.equals(anchor.getTaskId(), request.getTaskId())
+                    && anchor.getCheckpointVersion() == request.getExpectedCheckpointVersion();
+        } catch (Exception e) {
+            log.warn("Failed to classify checkpoint-failure owner run={}: {}",
+                    request.getRunId(), e.getMessage());
+            return true;
+        }
+    }
+
+    private boolean markerOwnsSameTuple(String marker, ToolJobCheckpointRequest request) {
+        if (marker == null || !marker.startsWith(MARKER_PREFIX)) return false;
+        try {
+            PendingFailure pending = objectMapper.readValue(
+                    marker.substring(MARKER_PREFIX.length()), PendingFailure.class);
+            return Objects.equals(pending.runId(), request.getRunId())
+                    && Objects.equals(pending.operationId(), request.getOperationId())
+                    && Objects.equals(pending.toolCallId(), request.getToolCallId())
+                    && pending.attempt() == request.getAttempt()
+                    && Objects.equals(pending.taskId(), request.getTaskId())
+                    && pending.expectedVersion() == request.getExpectedCheckpointVersion();
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     boolean hasEquivalentOrNewerCheckpoint(ToolJobCheckpointRequest request) {
@@ -115,7 +187,7 @@ public class ToolJobCheckpointFailureRecoveryService {
         return value == null || value.isBlank();
     }
 
-    public enum Outcome { HEALTHY_CHECKPOINT, FAILURE_OWNED, RETRY_OWNED, UNOWNED }
+    public enum Outcome { HEALTHY_CHECKPOINT, FAILURE_OWNED, RETRY_OWNED, SUPERSEDED, UNOWNED }
 
     public record PendingFailure(String runId, String operationId, String toolCallId, int attempt,
                                  String taskId, int expectedVersion, String todoId, int sequence,
