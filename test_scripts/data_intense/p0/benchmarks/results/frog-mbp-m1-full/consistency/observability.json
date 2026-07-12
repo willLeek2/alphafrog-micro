@@ -1,0 +1,76 @@
+{
+  "data_analysis_observability": {
+    "calls": [
+      {
+        "attempt": 1,
+        "background": false,
+        "estimate": {
+          "capacityUnits": 1,
+          "estimatedBytes": 10496047,
+          "estimatedRows": 150000,
+          "fileCount": 1,
+          "heavyOperationHints": [],
+          "manifestMemberCount": 1,
+          "resourceClass": "STANDARD",
+          "selectedColumnRatio": 1.0
+        },
+        "operationId": "consistency-run-1:consistency-call-1:1",
+        "reservation": {
+          "capacityUnits": 1,
+          "reservationId": "consistency-run-1:consistency-call-1:1",
+          "resourceClass": "STANDARD",
+          "state": "TERMINAL_CONFIRMED",
+          "taskId": "consistency-task-1"
+        },
+        "resourceUsage": {
+          "artifactBytesWritten": 19,
+          "attributionComplete": true,
+          "cleanupMillis": 17,
+          "cpuMillis": 5,
+          "datasetOpenCount": 1,
+          "executionWallMillis": 13,
+          "exitReason": "SUCCESS",
+          "logicalBytesScanned": 10496047,
+          "memoryByteMillis": 11422096,
+          "memoryPeakBytes": 69206016,
+          "missingFields": [],
+          "oomKilled": false,
+          "prepareMillis": 11,
+          "queueWaitMillis": 7,
+          "resourceClass": "STANDARD",
+          "samplingIntervalMillis": 60000,
+          "temporaryBytesWritten": 23,
+          "timedOut": false
+        },
+        "retryable": false,
+        "success": true,
+        "taskId": "consistency-task-1",
+        "terminalAt": "2026-07-13T00:00:00Z",
+        "terminalStatus": "COMPLETED",
+        "toolCallId": "consistency-call-1"
+      }
+    ],
+    "runId": "consistency-run-1",
+    "summary": {
+      "attemptCount": 1,
+      "attributionComplete": true,
+      "capacityUnits": 1,
+      "cleanupMillis": 17,
+      "cpuMillis": 5,
+      "datasetOpenCount": 1,
+      "estimatedBytes": 10496047,
+      "estimatedRows": 150000,
+      "executionWallMillis": 13,
+      "fileCount": 1,
+      "logicalBytesScanned": 10496047,
+      "memoryPeakBytes": 69206016,
+      "missingFields": [],
+      "oomCount": 0,
+      "prepareMillis": 11,
+      "queueWaitMillis": 7,
+      "timeoutCount": 0,
+      "toolCallCount": 1
+    },
+    "version": 1
+  }
+}

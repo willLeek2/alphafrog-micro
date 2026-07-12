@@ -1,0 +1,20 @@
+{
+  "artifact_bytes_written": 19,
+  "attribution_complete": true,
+  "cleanup_millis": 17,
+  "cpu_millis": 5,
+  "dataset_open_count": 1,
+  "execution_wall_millis": 13,
+  "exit_reason": "SUCCESS",
+  "logical_bytes_scanned": 10496047,
+  "memory_byte_millis": 11422096,
+  "memory_peak_bytes": 69206016,
+  "missing_fields": [],
+  "oom_killed": false,
+  "prepare_millis": 11,
+  "queue_wait_millis": 7,
+  "resource_class": "STANDARD",
+  "sampling_interval_millis": 60000,
+  "temporary_bytes_written": 23,
+  "timed_out": false
+}

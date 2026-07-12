@@ -1,0 +1,23 @@
+{
+  "classes": [
+    {
+      "capacityUnits": 1,
+      "collectorAttributionComplete": true,
+      "collectorResourceClass": "STANDARD",
+      "memoryLimitBytes": 536870912,
+      "resourceClass": "STANDARD"
+    },
+    {
+      "capacityUnits": 3,
+      "collectorAttributionComplete": true,
+      "collectorResourceClass": "HEAVY",
+      "memoryLimitBytes": 1610612736,
+      "resourceClass": "HEAVY"
+    }
+  ],
+  "containerMaxConcurrency": 1,
+  "measurementScope": "configuration_and_collector_identity_not_live_container_throughput",
+  "poolEnabled": false,
+  "schemaVersion": "data_intense_resource_class_probe_v1",
+  "status": "PASS"
+}

@@ -1,0 +1,40 @@
+{
+  "checks": [
+    {
+      "name": "loader_metrics_schema",
+      "status": "PASS"
+    },
+    {
+      "name": "terminal_usage_presence",
+      "status": "PASS"
+    },
+    {
+      "name": "loader_to_terminal_usage",
+      "status": "PASS"
+    },
+    {
+      "name": "observability_call_contract",
+      "status": "PASS"
+    },
+    {
+      "name": "observability_summary_aggregation",
+      "status": "PASS"
+    },
+    {
+      "name": "terminal_usage_to_observability",
+      "status": "PASS"
+    }
+  ],
+  "inputs": {
+    "loaderMetrics": "typed.jsonl",
+    "observability": "observability.json",
+    "resourceUsage": "resource_usage.json"
+  },
+  "metrics": {
+    "datasetOpenCount": 1,
+    "logicalBytesScanned": 10496047,
+    "metricRows": 1
+  },
+  "schemaVersion": "data_intense_consistency_report_v1",
+  "status": "PASS"
+}
