@@ -312,7 +312,7 @@
         FROM alphafrog_agent_run
         WHERE tool_job_anchor_json IS NOT NULL
           AND tool_job_anchor_json &lt;&gt; '{}'::jsonb
-          AND status IN ('WAITING_TOOL_JOB', 'CANCELED')
+          AND status IN ('WAITING_TOOL_JOB', 'WAITING', 'CANCELED')
         ORDER BY updated_at ASC
         LIMIT #{limit}
     </select>

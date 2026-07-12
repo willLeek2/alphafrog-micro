@@ -217,7 +217,10 @@ public class ToolJobFinalizer {
                                 new DataAnalysisReleaseProof.Terminal(env),
                                 DataAnalysisReleaseReason.SANDBOX_TERMINAL_CONFIRMED);
                         DataAnalysisReleaseOutcome oo = capacityService.releaseReservation(req);
-                        if (oo == DataAnalysisReleaseOutcome.ALREADY_RELEASED) return true;
+                        if (oo == DataAnalysisReleaseOutcome.ALREADY_RELEASED) {
+                            writeReleasedReservation(anchor, confirmed);
+                            return true;
+                        }
                     }
                     log.warn("Reservation restore CONFLICT for id={}, release also failed", current.reservationId());
                     return false;
@@ -242,22 +245,23 @@ public class ToolJobFinalizer {
 
             // Write RELEASED state back to anchor so restart recovery doesn't
             // re-occupy capacity from stale PENDING/CONFIRMED reservation JSON
-            DataAnalysisReservation released = new DataAnalysisReservation(
-                    confirmed.reservationId(), confirmed.identity(),
-                    confirmed.resourceClass(), confirmed.capacityUnits(),
-                    DataAnalysisReservationState.RELEASED,
-                    confirmed.taskId(), confirmed.acquiredAt());
-            try {
-                anchor.setReservationJson(objectMapper.writeValueAsString(released));
-            } catch (Exception e) {
-                log.error("Failed to serialize RELEASED reservation for op={}", anchor.getOperationId(), e);
-                return false;
-            }
-            return true;
+            return writeReleasedReservation(anchor, confirmed);
         } catch (Exception e) {
             log.error("releaseCapacity failed for reservation", e);
             return false;
         }
+    }
+
+    /** Serialize RELEASED state back to anchor.reservationJson so restart skips it. */
+    private boolean writeReleasedReservation(ToolJobAnchor anchor,
+                                              DataAnalysisReservation confirmed) throws Exception {
+        DataAnalysisReservation released = new DataAnalysisReservation(
+                confirmed.reservationId(), confirmed.identity(),
+                confirmed.resourceClass(), confirmed.capacityUnits(),
+                DataAnalysisReservationState.RELEASED,
+                confirmed.taskId(), confirmed.acquiredAt());
+        anchor.setReservationJson(objectMapper.writeValueAsString(released));
+        return true;
     }
 
     private DataAnalysisTerminalEnvelope buildEnvelope(DataAnalysisReservation reservation, ToolJobAnchor anchor) {

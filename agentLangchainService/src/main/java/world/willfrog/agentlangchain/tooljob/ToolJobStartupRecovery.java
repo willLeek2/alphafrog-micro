@@ -102,6 +102,12 @@ public class ToolJobStartupRecovery {
             try {
                 String resumeState = anchor.getResumeState();
                 if ("CONSUMED".equals(resumeState)) {
+                    // Token-gated durable clear before Redis (same order as tryResume)
+                    String token = anchor.getResumeToken();
+                    if (token != null && !token.isBlank()) {
+                        anchorService.clearAnchorWithToken(run.getId(), "CONSUMED", token,
+                                anchor.getResumeLeaseVersion());
+                    }
                     redisCache.removeDue(run.getId());
                     redisCache.deletePendingCache(run.getId());
                     continue;

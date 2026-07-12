@@ -46,13 +46,16 @@ public class ToolJobResumeService {
 
         String state = anchor.getResumeState();
         if ("CONSUMED".equals(state)) {
-            // Durable clear FIRST (DB before cache). If we crash after Redis delete
-            // but before DB clear, the anchor becomes a zombie (CONSUMED + no Redis
-            // trigger). Token+state+version-gated clear ensures only the rightful consumer clears.
+            // Durable clear FIRST (DB before cache). Only delete Redis if the
+            // token-gated durable clear succeeds. If it fails, leave Redis intact
+            // so the next scan cycle retries. Never delete Redis before DB clear.
             String token = anchor.getResumeToken();
             if (token != null && !token.isBlank()) {
-                anchorService.clearAnchorWithToken(runId, "CONSUMED", token,
-                        anchor.getResumeLeaseVersion());
+                if (!anchorService.clearAnchorWithToken(runId, "CONSUMED", token,
+                        anchor.getResumeLeaseVersion())) {
+                    log.warn("CONSUMED durable clear failed for run={}, leaving Redis for retry", runId);
+                    return true; // anchor still CONSUMED, will retry next scan
+                }
             }
             redisCache.removeDue(runId);
             redisCache.deletePendingCache(runId);
@@ -107,16 +110,22 @@ public class ToolJobResumeService {
     private boolean reenterLaunching(String runId, ToolJobAnchor anchor) {
         log.info("Re-entering LAUNCHING resume for run={}", runId);
 
-        // Stale detection: if claimedAt + TTL has passed, roll back to READY
-        // so a fresh claim with new token can be attempted on next scan
+        // Stale detection: if claimedAt + TTL has passed AND launcher reports
+        // inactive, roll back to READY for a fresh claim attempt
         if (anchor.getResumeClaimedAt() != null) {
             long staleDeadline = anchor.getResumeClaimedAt().toEpochMilli()
                     + config.getLaunchingStaleSeconds() * 1000;
             if (System.currentTimeMillis() > staleDeadline) {
-                log.warn("LAUNCHING claim stale for run={}, claimedAt={}, rolling back to READY",
-                        runId, anchor.getResumeClaimedAt());
                 long claimedVersion = anchor.getResumeLeaseVersion();
                 String claimedToken = anchor.getResumeToken();
+                // Check if launcher still considers this token active before rolling back
+                if (resumeLauncher != null && resumeLauncher.isActive(runId, claimedToken, claimedVersion)) {
+                    log.info("LAUNCHING claim past TTL but launcher still active for run={} token={} v{}",
+                            runId, claimedToken, claimedVersion);
+                    return false; // don't roll back — launcher is still running
+                }
+                log.warn("LAUNCHING claim stale for run={}, claimedAt={}, rolling back to READY",
+                        runId, anchor.getResumeClaimedAt());
                 // Bump version and set back to READY for fresh claim
                 anchor.setResumeState("READY");
                 anchor.setResumeLeaseVersion(claimedVersion + 1);

@@ -10,8 +10,7 @@ import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
  * <p><b>Idempotency:</b> The finalizer may re-enter this hook if the subsequent
  * DB step-marker write fails after a successful event emission. Implementations
  * MUST be idempotent on the stable key
- * {@code (runId, anchor.getToolCallId(), "terminal")} —
- * i.e. {@code runId:toolCallId:logical_terminal}.
+ * {@code runId + ":" + anchor.getToolCallId() + ":logical_terminal"}.
  * A repeated call with the same key must produce a single durable event,
  * not a duplicate.</p>
  */
@@ -20,7 +19,7 @@ public interface ToolJobEventHook {
     /**
      * @param runId  the agent run identifier
      * @param anchor the durable anchor (use {@code runId + ":" + anchor.getToolCallId()
-     *               + ":terminal"} as the stable idempotency key)
+     *               + ":logical_terminal"} as the stable idempotency key)
      * @return true if the terminal event was successfully emitted
      */
     boolean emitTerminalEvent(String runId, ToolJobAnchor anchor);
