@@ -137,18 +137,26 @@ public interface AgentRunMapper {
                                    @Param("expectedLeaseVersion") long expectedLeaseVersion);
 
     /**
-     * Atomic checkpoint merge: updates the anchor JSON only if identity fields
-     * (operationId, toolCallId, attempt) AND checkpointVersion all match.
-     * The SQL atomically bumps checkpointVersion via jsonb || concat.
-     * Prevents lost updates from concurrent checkpoint writers.
+     * Atomic checkpoint merge: merges only checkpoint whitelist fields into the
+     * anchor JSON via jsonb || concat (preserving reservation/terminal/finalizer).
+     * WHERE binds id, status, operationId, toolCallId, attempt, taskId, AND
+     * checkpointVersion to prevent lost updates. checkpointVersion is atomically bumped.
      */
     int updateToolJobCheckpoint(@Param("id") String id,
-                                 @Param("toolJobAnchorJson") String toolJobAnchorJson,
                                  @Param("expectedStatus") AgentRunStatus expectedStatus,
                                  @Param("expectedOperationId") String expectedOperationId,
                                  @Param("expectedToolCallId") String expectedToolCallId,
                                  @Param("expectedAttempt") int expectedAttempt,
-                                 @Param("expectedCheckpointVersion") int expectedCheckpointVersion);
+                                 @Param("expectedTaskId") String expectedTaskId,
+                                 @Param("expectedCheckpointVersion") int expectedCheckpointVersion,
+                                 @Param("todoId") String todoId,
+                                 @Param("sequence") int sequence,
+                                 @Param("completedTodosJson") String completedTodosJson,
+                                 @Param("datasetSnapshotJson") String datasetSnapshotJson,
+                                 @Param("datasetSnapshotDigest") String datasetSnapshotDigest,
+                                 @Param("datasetRefsJson") String datasetRefsJson,
+                                 @Param("toolCallsUsed") int toolCallsUsed,
+                                 @Param("estimateJson") String estimateJson);
 
     /**
      * Token+state+version-gated clear: only clears if resumeState, resumeToken,

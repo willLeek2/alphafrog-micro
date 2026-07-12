@@ -85,10 +85,16 @@ public class ToolJobCheckpointService implements ToolJobCheckpointWriter {
             anchor.setEstimateJson(request.getEstimateJson());
         }
 
-        // Atomic checkpoint merge: binds identity + checkpointVersion in WHERE.
-        // The SQL bumps checkpointVersion atomically via jsonb || concat.
-        // If another writer changed the anchor (different version), rows=0.
-        boolean ok = anchorService.checkpointUpdate(runId, anchor, run.getStatus());
+        // Atomic checkpoint merge: SQL merges only checkpoint whitelist fields
+        // via jsonb || concat, preserving reservation/terminal/finalizer.
+        // WHERE binds identity + taskId + checkpointVersion. If another writer
+        // changed the anchor (different version), rows=0.
+        boolean ok = anchorService.checkpointUpdate(runId, anchor, run.getStatus(),
+                request.getTodoId(), request.getSequence(),
+                todosJson,
+                request.getDatasetSnapshotJson(), request.getDatasetSnapshotDigest(),
+                request.getDatasetRefsJson(), request.getToolCallsUsed(),
+                request.getEstimateJson());
         if (!ok) {
             log.warn("Checkpoint CAS failed for run={} status={} op={} v={}",
                     runId, run.getStatus(), anchor.getOperationId(), anchor.getCheckpointVersion());

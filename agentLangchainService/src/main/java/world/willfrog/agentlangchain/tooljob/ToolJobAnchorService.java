@@ -99,16 +99,29 @@ public class ToolJobAnchorService {
     }
 
     /**
-     * Atomic checkpoint merge: updates anchor only if identity fields AND
-     * checkpointVersion all match. The SQL bumps checkpointVersion atomically.
+     * Atomic checkpoint merge: merges only checkpoint fields into anchor via
+     * jsonb || concat. WHERE binds identity + taskId + checkpointVersion.
+     * The SQL bumps checkpointVersion atomically. Preserves reservation,
+     * terminal, and finalizer fields from concurrent writes.
      * @return true if exactly one row was updated
      */
     public boolean checkpointUpdate(String runId, ToolJobAnchor anchor,
-                                     AgentRunStatus expectedStatus) {
+                                     AgentRunStatus expectedStatus,
+                                     String todoId, int sequence,
+                                     String completedTodosJson,
+                                     String datasetSnapshotJson, String datasetSnapshotDigest,
+                                     String datasetRefsJson, int toolCallsUsed,
+                                     String estimateJson) {
         int rows = agentRunMapper.updateToolJobCheckpoint(
-                runId, anchor.toJson(), expectedStatus,
+                runId, expectedStatus,
                 anchor.getOperationId(), anchor.getToolCallId(),
-                anchor.getAttempt(), anchor.getCheckpointVersion());
+                anchor.getAttempt(), anchor.getTaskId(),
+                anchor.getCheckpointVersion(),
+                todoId, sequence,
+                completedTodosJson,
+                datasetSnapshotJson, datasetSnapshotDigest,
+                datasetRefsJson, toolCallsUsed,
+                estimateJson);
         return rows == 1;
     }
 

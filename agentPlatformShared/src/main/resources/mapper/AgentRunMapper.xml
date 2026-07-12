@@ -357,22 +357,40 @@
 
     <!--
         Atomic checkpoint merge: binds identity + version in WHERE to prevent
-        lost updates. The caller constructs the full anchor JSON with checkpoint
-        fields merged in (preserving reservation/terminal/finalizer). The version
-        is atomically bumped via jsonb || concat.
+        lost updates. SET merges only checkpoint whitelist fields via jsonb ||
+        concat, preserving concurrent reservation/terminal/finalizer fields.
+        checkpointVersion is atomically bumped. COALESCE handles NULL→0 for old anchors.
     -->
     <update id="updateToolJobCheckpoint">
         UPDATE alphafrog_agent_run
-        SET tool_job_anchor_json = CAST(#{toolJobAnchorJson} AS jsonb)
+        SET tool_job_anchor_json = tool_job_anchor_json
                 || jsonb_build_object('checkpointVersion',
-                       (COALESCE((tool_job_anchor_json #>> '{checkpointVersion}')::int, 0) + 1)::text::jsonb),
+                       (COALESCE((tool_job_anchor_json #>> '{checkpointVersion}')::int, 0) + 1)::text::jsonb)
+                || jsonb_build_object('todoId', #{todoId}::text::jsonb)
+                || jsonb_build_object('sequence', #{sequence}::text::jsonb)
+                || CASE WHEN #{completedTodosJson} IS NULL
+                       THEN '{}'::jsonb
+                       ELSE jsonb_build_object('completedTodosJson', CAST(#{completedTodosJson} AS jsonb))
+                  END
+                || jsonb_build_object('datasetSnapshotJson', CAST(#{datasetSnapshotJson} AS jsonb))
+                || jsonb_build_object('datasetSnapshotDigest', #{datasetSnapshotDigest}::text::jsonb)
+                || CASE WHEN #{datasetRefsJson} IS NULL
+                       THEN '{}'::jsonb
+                       ELSE jsonb_build_object('datasetRefsJson', CAST(#{datasetRefsJson} AS jsonb))
+                  END
+                || jsonb_build_object('toolCallsUsed', #{toolCallsUsed}::text::jsonb)
+                || CASE WHEN #{estimateJson} IS NULL
+                       THEN '{}'::jsonb
+                       ELSE jsonb_build_object('estimateJson', CAST(#{estimateJson} AS jsonb))
+                  END,
             updated_at = CURRENT_TIMESTAMP
         WHERE id = #{id}
           AND status = #{expectedStatus}
           AND tool_job_anchor_json #>> '{operationId}' = #{expectedOperationId}
           AND tool_job_anchor_json #>> '{toolCallId}' = #{expectedToolCallId}
           AND (tool_job_anchor_json #>> '{attempt}')::int = #{expectedAttempt}
-          AND (tool_job_anchor_json #>> '{checkpointVersion}')::int = #{expectedCheckpointVersion}
+          AND tool_job_anchor_json #>> '{taskId}' = #{expectedTaskId}
+          AND COALESCE((tool_job_anchor_json #>> '{checkpointVersion}')::int, 0) = #{expectedCheckpointVersion}
     </update>
 
     <update id="clearToolJobAnchorWithToken">
