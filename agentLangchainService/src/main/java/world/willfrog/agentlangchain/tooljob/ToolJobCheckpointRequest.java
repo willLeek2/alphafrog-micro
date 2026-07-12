@@ -17,6 +17,7 @@ public class ToolJobCheckpointRequest {
     private final String toolCallId;
     private final int attempt;
     private final String taskId;
+    private final int expectedCheckpointVersion;
     private final String todoId;
     private final int sequence;
     private final List<CompletedTodoRecord> completedTodos;
@@ -32,9 +33,11 @@ public class ToolJobCheckpointRequest {
         this.toolCallId = builder.toolCallId;
         this.attempt = builder.attempt;
         this.taskId = builder.taskId;
+        this.expectedCheckpointVersion = builder.expectedCheckpointVersion;
         this.todoId = builder.todoId;
         this.sequence = builder.sequence;
-        this.completedTodos = Collections.unmodifiableList(builder.completedTodos);
+        this.completedTodos = builder.completedTodos != null
+                ? Collections.unmodifiableList(builder.completedTodos) : null;
         this.datasetSnapshotJson = builder.datasetSnapshotJson;
         this.datasetSnapshotDigest = builder.datasetSnapshotDigest;
         this.datasetRefsJson = builder.datasetRefsJson;
@@ -47,6 +50,7 @@ public class ToolJobCheckpointRequest {
     public String getToolCallId() { return toolCallId; }
     public int getAttempt() { return attempt; }
     public String getTaskId() { return taskId; }
+    public int getExpectedCheckpointVersion() { return expectedCheckpointVersion; }
     public String getTodoId() { return todoId; }
     public int getSequence() { return sequence; }
     public List<CompletedTodoRecord> getCompletedTodos() { return completedTodos; }
@@ -66,6 +70,7 @@ public class ToolJobCheckpointRequest {
         private String toolCallId;
         private int attempt;
         private String taskId;
+        private int expectedCheckpointVersion;
         private String todoId;
         private int sequence;
         private List<CompletedTodoRecord> completedTodos = Collections.emptyList();
@@ -81,6 +86,7 @@ public class ToolJobCheckpointRequest {
         public Builder toolCallId(String toolCallId) { this.toolCallId = toolCallId; return this; }
         public Builder attempt(int attempt) { this.attempt = attempt; return this; }
         public Builder taskId(String taskId) { this.taskId = taskId; return this; }
+        public Builder expectedCheckpointVersion(int expectedCheckpointVersion) { this.expectedCheckpointVersion = expectedCheckpointVersion; return this; }
         public Builder todoId(String todoId) { this.todoId = todoId; return this; }
         public Builder sequence(int sequence) { this.sequence = sequence; return this; }
         public Builder completedTodos(List<CompletedTodoRecord> completedTodos) { this.completedTodos = completedTodos; return this; }

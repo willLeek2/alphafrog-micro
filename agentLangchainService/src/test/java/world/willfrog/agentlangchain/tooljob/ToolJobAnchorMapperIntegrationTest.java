@@ -1,7 +1,9 @@
 package world.willfrog.agentlangchain.tooljob;
 
+import org.apache.ibatis.session.SqlSession;
 import org.apache.ibatis.session.SqlSessionFactory;
 import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -17,6 +19,7 @@ import org.postgresql.ds.PGSimpleDataSource;
 
 import java.sql.Connection;
 import java.sql.Statement;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -62,6 +65,16 @@ class ToolJobAnchorMapperIntegrationTest {
     @AfterAll
     static void closeContainer() { /* @Container handles cleanup */ }
 
+    private SqlSession currentSession;
+
+    @AfterEach
+    void closeSession() {
+        if (currentSession != null) {
+            currentSession.close();
+            currentSession = null;
+        }
+    }
+
     @BeforeEach
     void cleanTable() throws Exception {
         DataSource ds = dataSource();
@@ -79,22 +92,30 @@ class ToolJobAnchorMapperIntegrationTest {
         return ds;
     }
 
-    private static AgentRunMapper newMapper() throws Exception {
-        var config = new org.apache.ibatis.session.Configuration();
-        config.setMapUnderscoreToCamelCase(true);
-        var env = new org.apache.ibatis.mapping.Environment("test",
-                new org.apache.ibatis.transaction.jdbc.JdbcTransactionFactory(), dataSource());
-        config.setEnvironment(env);
-        config.addMapper(AgentRunMapper.class);
-        // Load production mapper XML (different module, must be explicit)
-        String res = "mapper/AgentRunMapper.xml";
-        try (java.io.Reader r = org.apache.ibatis.io.Resources.getResourceAsReader(res)) {
-            new org.apache.ibatis.builder.xml.XMLMapperBuilder(
-                    r, config, res, config.getSqlFragments()).parse();
+    private static SqlSessionFactory sqlSessionFactory;
+
+    private AgentRunMapper newMapper() throws Exception {
+        // Close previous session before opening a new one
+        if (currentSession != null) {
+            currentSession.close();
+            currentSession = null;
         }
-        SqlSessionFactory factory = new org.apache.ibatis.session.SqlSessionFactoryBuilder().build(config);
-        var session = factory.openSession(true);
-        return session.getMapper(AgentRunMapper.class);
+        if (sqlSessionFactory == null) {
+            var config = new org.apache.ibatis.session.Configuration();
+            config.setMapUnderscoreToCamelCase(true);
+            var env = new org.apache.ibatis.mapping.Environment("test",
+                    new org.apache.ibatis.transaction.jdbc.JdbcTransactionFactory(), dataSource());
+            config.setEnvironment(env);
+            config.addMapper(AgentRunMapper.class);
+            String res = "mapper/AgentRunMapper.xml";
+            try (java.io.Reader r = org.apache.ibatis.io.Resources.getResourceAsReader(res)) {
+                new org.apache.ibatis.builder.xml.XMLMapperBuilder(
+                        r, config, res, config.getSqlFragments()).parse();
+            }
+            sqlSessionFactory = new org.apache.ibatis.session.SqlSessionFactoryBuilder().build(config);
+        }
+        currentSession = sqlSessionFactory.openSession(true);
+        return currentSession.getMapper(AgentRunMapper.class);
     }
 
     private static void insertRun(String id, String status, String anchorJson) throws Exception {
@@ -361,5 +382,69 @@ class ToolJobAnchorMapperIntegrationTest {
 
         int rows = newMapper().clearToolJobAnchorWithToken("run-cl3", "CONSUMED", "stale-tok", 5);
         assertThat(rows).isEqualTo(0);
+    }
+
+    // ========== Production service chain: version race ==========
+
+    private ToolJobCheckpointService newServiceChain() throws Exception {
+        AgentRunMapper mapper = newMapper();
+        ToolJobAnchorService anchorService = new ToolJobAnchorService(mapper);
+        return new ToolJobCheckpointService(mapper, anchorService);
+    }
+
+    @Test
+    void staleCheckpointRequestCannotBorrowNewerDbVersion() throws Exception {
+        // Anchor at v0, first request at v0 succeeds, stale request at v0 rejected
+        insertRun("run-s1", "EXECUTING", """
+            {"operationId":"run-s1:tc-1:1","toolCallId":"tc-1","attempt":1,"taskId":"task-123","checkpointVersion":0}""");
+
+        ToolJobCheckpointService svc = newServiceChain();
+
+        var req1 = ToolJobCheckpointRequest.builder("run-s1")
+                .operationId("run-s1:tc-1:1").toolCallId("tc-1").attempt(1).taskId("task-123")
+                .expectedCheckpointVersion(0)
+                .todoId("todo_A").sequence(1).completedTodos(List.of())
+                .datasetSnapshotJson("{\"v\":1}").datasetSnapshotDigest("d1")
+                .datasetRefsJson("[]").toolCallsUsed(1).estimateJson("{\"c\":10}")
+                .build();
+        assertThat(svc.captureAndSave(req1)).isTrue();
+
+        // DB version now 1; stale request still expects 0 → rejected
+        var req2 = ToolJobCheckpointRequest.builder("run-s1")
+                .operationId("run-s1:tc-1:1").toolCallId("tc-1").attempt(1).taskId("task-123")
+                .expectedCheckpointVersion(0) // stale: captured before first write
+                .todoId("todo_B").sequence(2).completedTodos(List.of())
+                .datasetSnapshotJson("{\"v\":2}").datasetSnapshotDigest("d2")
+                .datasetRefsJson("[]").toolCallsUsed(2).estimateJson("{\"c\":20}")
+                .build();
+        assertThat(svc.captureAndSave(req2)).isFalse();
+
+        // Verify first write's data survived
+        ToolJobAnchor a = ToolJobAnchor.fromJson(newMapper().findById("run-s1").getToolJobAnchorJson());
+        assertThat(a.getTodoId()).isEqualTo("todo_A");
+        assertThat(a.getCheckpointVersion()).isEqualTo(1);
+    }
+
+    @Test
+    void twoSameVersionServiceRequestsOnlyFirstSucceeds() throws Exception {
+        insertRun("run-s2", "EXECUTING", """
+            {"operationId":"run-s2:tc-1:1","toolCallId":"tc-1","attempt":1,"taskId":"task-123","checkpointVersion":0}""");
+
+        // Both requests captured at v0 concurrently
+        var req = ToolJobCheckpointRequest.builder("run-s2")
+                .operationId("run-s2:tc-1:1").toolCallId("tc-1").attempt(1).taskId("task-123")
+                .expectedCheckpointVersion(0)
+                .todoId("todo_1").sequence(1).completedTodos(List.of())
+                .datasetSnapshotJson("{}").datasetSnapshotDigest("d").datasetRefsJson("[]")
+                .toolCallsUsed(1).estimateJson("{}")
+                .build();
+
+        // First caller succeeds (builder is immutable, reuse is safe)
+        ToolJobCheckpointService svc1 = newServiceChain();
+        assertThat(svc1.captureAndSave(req)).isTrue();
+
+        // Second caller with same version → service-level version mismatch (DB now v1)
+        ToolJobCheckpointService svc2 = newServiceChain();
+        assertThat(svc2.captureAndSave(req)).isFalse();
     }
 }

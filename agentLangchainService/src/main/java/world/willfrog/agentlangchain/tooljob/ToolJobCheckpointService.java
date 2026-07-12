@@ -57,23 +57,39 @@ public class ToolJobCheckpointService implements ToolJobCheckpointWriter {
             return false;
         }
 
-        // Serialize completedTodos (fail-closed: null on error blocks checkpoint)
+        // Validate checkpointVersion: request version must match anchor's current version.
+        // The caller captured this version at checkpoint time; using anchor's latest DB
+        // version would let a stale (delayed) request borrow a newer version and silently
+        // overwrite a more recent checkpoint. Reject on mismatch.
+        int requestVersion = request.getExpectedCheckpointVersion();
+        int anchorVersion = anchor.getCheckpointVersion();
+        if (requestVersion != anchorVersion) {
+            log.warn("Checkpoint rejected: checkpointVersion mismatch request={} anchor={} for run={}",
+                    requestVersion, anchorVersion, runId);
+            return false;
+        }
+
+        // Fail-closed: validate all required checkpoint fields before writing.
+        // Launcher recovery depends on dataset snapshot; finalizer depends on estimate.
+        // Missing or invalid fields must reject the checkpoint — never silently inherit old values.
+        if (!validateCheckpointFields(request, runId)) {
+            return false;
+        }
+
+        // Serialize completedTodos (null → empty array string, fail-closed on error)
         String todosJson = serializeTodos(request.getCompletedTodos());
         if (request.getCompletedTodos() != null && !request.getCompletedTodos().isEmpty()
                 && todosJson == null) {
             log.error("Checkpoint rejected: failed to serialize completedTodos for run={}", runId);
             return false;
         }
-
-        // Validate required fields are non-null before writing
-        if (request.getDatasetSnapshotJson() == null || request.getDatasetSnapshotJson().isBlank()) {
-            log.warn("Checkpoint: missing datasetSnapshotJson for run={}, continuing", runId);
-        }
-        if (request.getDatasetSnapshotDigest() == null || request.getDatasetSnapshotDigest().isBlank()) {
-            log.warn("Checkpoint: missing datasetSnapshotDigest for run={}, continuing", runId);
+        if (todosJson == null) {
+            todosJson = "[]";
         }
 
-        // Write all checkpoint fields atomically into anchor
+        // Write all checkpoint fields atomically into anchor.
+        // Use request's expectedCheckpointVersion (not anchor's) for CAS — prevents
+        // a delayed request from borrowing the DB's newer version to overwrite.
         anchor.setTodoId(request.getTodoId());
         anchor.setSequence(request.getSequence());
         anchor.setCompletedTodosJson(todosJson);
@@ -81,13 +97,12 @@ public class ToolJobCheckpointService implements ToolJobCheckpointWriter {
         anchor.setDatasetSnapshotDigest(request.getDatasetSnapshotDigest());
         anchor.setDatasetRefsJson(request.getDatasetRefsJson());
         anchor.setToolCallsUsed(request.getToolCallsUsed());
-        if (request.getEstimateJson() != null && !request.getEstimateJson().isBlank()) {
-            anchor.setEstimateJson(request.getEstimateJson());
-        }
+        anchor.setEstimateJson(request.getEstimateJson());
+        anchor.setCheckpointVersion(requestVersion);
 
         // Atomic checkpoint merge: SQL merges only checkpoint whitelist fields
         // via jsonb || concat, preserving reservation/terminal/finalizer.
-        // WHERE binds identity + taskId + checkpointVersion. If another writer
+        // WHERE binds identity + taskId + expectedCheckpointVersion. If another writer
         // changed the anchor (different version), rows=0.
         boolean ok = anchorService.checkpointUpdate(runId, anchor, run.getStatus(),
                 request.getTodoId(), request.getSequence(),
@@ -158,6 +173,64 @@ public class ToolJobCheckpointService implements ToolJobCheckpointWriter {
         } catch (JsonProcessingException e) {
             log.error("Failed to serialize completedTodos", e);
             return null;
+        }
+    }
+
+    private boolean validateCheckpointFields(ToolJobCheckpointRequest request, String runId) {
+        if (request.getTodoId() == null || request.getTodoId().isBlank()) {
+            log.warn("Checkpoint rejected: missing todoId for run={}", runId);
+            return false;
+        }
+        if (request.getCompletedTodos() == null) {
+            log.warn("Checkpoint rejected: completedTodos is null for run={}", runId);
+            return false;
+        }
+        if (request.getSequence() < 0) {
+            log.warn("Checkpoint rejected: sequence={} < 0 for run={}", request.getSequence(), runId);
+            return false;
+        }
+        if (request.getToolCallsUsed() < 0) {
+            log.warn("Checkpoint rejected: toolCallsUsed={} < 0 for run={}", request.getToolCallsUsed(), runId);
+            return false;
+        }
+        if (request.getDatasetSnapshotJson() == null || request.getDatasetSnapshotJson().isBlank()) {
+            log.warn("Checkpoint rejected: missing datasetSnapshotJson for run={}", runId);
+            return false;
+        }
+        if (!isValidJson(request.getDatasetSnapshotJson())) {
+            log.warn("Checkpoint rejected: invalid datasetSnapshotJson for run={}", runId);
+            return false;
+        }
+        if (request.getDatasetSnapshotDigest() == null || request.getDatasetSnapshotDigest().isBlank()) {
+            log.warn("Checkpoint rejected: missing datasetSnapshotDigest for run={}", runId);
+            return false;
+        }
+        if (request.getDatasetRefsJson() == null || request.getDatasetRefsJson().isBlank()) {
+            log.warn("Checkpoint rejected: missing datasetRefsJson for run={}", runId);
+            return false;
+        }
+        if (!isValidJson(request.getDatasetRefsJson())) {
+            log.warn("Checkpoint rejected: invalid datasetRefsJson for run={}", runId);
+            return false;
+        }
+        // estimateJson must be present and valid — never silently inherit old estimate
+        if (request.getEstimateJson() == null || request.getEstimateJson().isBlank()) {
+            log.warn("Checkpoint rejected: missing estimateJson for run={}", runId);
+            return false;
+        }
+        if (!isValidJson(request.getEstimateJson())) {
+            log.warn("Checkpoint rejected: invalid estimateJson for run={}", runId);
+            return false;
+        }
+        return true;
+    }
+
+    private boolean isValidJson(String json) {
+        try {
+            objectMapper.readTree(json);
+            return true;
+        } catch (Exception e) {
+            return false;
         }
     }
 }

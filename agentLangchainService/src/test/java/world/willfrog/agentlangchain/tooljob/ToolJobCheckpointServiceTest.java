@@ -54,29 +54,206 @@ class ToolJobCheckpointServiceTest {
         return r;
     }
 
-    @Test
-    void shouldCaptureAndSaveValidCheckpoint() {
-        AgentRun run = buildRun();
-        when(agentRunMapper.findById("run-1")).thenReturn(run);
-        when(anchorService.checkpointUpdate(eq("run-1"), any(ToolJobAnchor.class),
-                eq(AgentRunStatus.EXECUTING), any(), anyInt(), any(),
-                any(), any(), any(), anyInt(), any())).thenReturn(true);
-
-        ToolJobCheckpointRequest req = ToolJobCheckpointRequest.builder("run-1")
+    private static ToolJobCheckpointRequest validRequest() {
+        return ToolJobCheckpointRequest.builder("run-1")
                 .operationId("run-1:tc-1:1")
                 .toolCallId("tc-1")
                 .attempt(1)
                 .taskId("task-123")
+                .expectedCheckpointVersion(0)
                 .todoId("todo_3")
                 .sequence(3)
                 .completedTodos(List.of())
                 .datasetSnapshotJson("{\"digest\":\"abc\"}")
                 .datasetSnapshotDigest("abc123")
+                .datasetRefsJson("[]")
                 .toolCallsUsed(2)
                 .estimateJson("{\"cpu\":100}")
                 .build();
+    }
 
-        assertThat(service.captureAndSave(req)).isTrue();
+    // ========== Gap 2: fail-closed validation ==========
+
+    @Test
+    void shouldRejectMissingTodoId() {
+        when(agentRunMapper.findById("run-1")).thenReturn(buildRun());
+        var req = ToolJobCheckpointRequest.builder("run-1")
+                .operationId("run-1:tc-1:1").toolCallId("tc-1").attempt(1).taskId("task-123")
+                .expectedCheckpointVersion(0)
+                .sequence(3).completedTodos(List.of())
+                .datasetSnapshotJson("{}").datasetSnapshotDigest("d").datasetRefsJson("[]")
+                .toolCallsUsed(0).estimateJson("{}").build();
+        assertThat(service.captureAndSave(req)).isFalse();
+        verify(anchorService, never()).checkpointUpdate(any(), any(), any(),
+                any(), anyInt(), any(), any(), any(), any(), anyInt(), any());
+    }
+
+    @Test
+    void shouldRejectNullCompletedTodos() {
+        when(agentRunMapper.findById("run-1")).thenReturn(buildRun());
+        var req = ToolJobCheckpointRequest.builder("run-1")
+                .operationId("run-1:tc-1:1").toolCallId("tc-1").attempt(1).taskId("task-123")
+                .expectedCheckpointVersion(0)
+                .todoId("todo_3").sequence(3).completedTodos(null)
+                .datasetSnapshotJson("{}").datasetSnapshotDigest("d").datasetRefsJson("[]")
+                .toolCallsUsed(0).estimateJson("{}").build();
+        assertThat(service.captureAndSave(req)).isFalse();
+        verify(anchorService, never()).checkpointUpdate(any(), any(), any(),
+                any(), anyInt(), any(), any(), any(), any(), anyInt(), any());
+    }
+
+    @Test
+    void shouldRejectNegativeSequence() {
+        when(agentRunMapper.findById("run-1")).thenReturn(buildRun());
+        var req = ToolJobCheckpointRequest.builder("run-1")
+                .operationId("run-1:tc-1:1").toolCallId("tc-1").attempt(1).taskId("task-123")
+                .expectedCheckpointVersion(0)
+                .todoId("todo_3").sequence(-1).completedTodos(List.of())
+                .datasetSnapshotJson("{}").datasetSnapshotDigest("d").datasetRefsJson("[]")
+                .toolCallsUsed(0).estimateJson("{}").build();
+        assertThat(service.captureAndSave(req)).isFalse();
+    }
+
+    @Test
+    void shouldRejectNegativeToolCallsUsed() {
+        when(agentRunMapper.findById("run-1")).thenReturn(buildRun());
+        var req = ToolJobCheckpointRequest.builder("run-1")
+                .operationId("run-1:tc-1:1").toolCallId("tc-1").attempt(1).taskId("task-123")
+                .expectedCheckpointVersion(0)
+                .todoId("todo_3").sequence(3).completedTodos(List.of())
+                .datasetSnapshotJson("{}").datasetSnapshotDigest("d").datasetRefsJson("[]")
+                .toolCallsUsed(-1).estimateJson("{}").build();
+        assertThat(service.captureAndSave(req)).isFalse();
+    }
+
+    @Test
+    void shouldRejectMissingDatasetSnapshotJson() {
+        when(agentRunMapper.findById("run-1")).thenReturn(buildRun());
+        var req = ToolJobCheckpointRequest.builder("run-1")
+                .operationId("run-1:tc-1:1").toolCallId("tc-1").attempt(1).taskId("task-123")
+                .expectedCheckpointVersion(0)
+                .todoId("todo_3").sequence(3).completedTodos(List.of())
+                .datasetSnapshotDigest("d").datasetRefsJson("[]")
+                .toolCallsUsed(0).estimateJson("{}").build();
+        assertThat(service.captureAndSave(req)).isFalse();
+    }
+
+    @Test
+    void shouldRejectInvalidDatasetSnapshotJson() {
+        when(agentRunMapper.findById("run-1")).thenReturn(buildRun());
+        var req = ToolJobCheckpointRequest.builder("run-1")
+                .operationId("run-1:tc-1:1").toolCallId("tc-1").attempt(1).taskId("task-123")
+                .expectedCheckpointVersion(0)
+                .todoId("todo_3").sequence(3).completedTodos(List.of())
+                .datasetSnapshotJson("not-json").datasetSnapshotDigest("d").datasetRefsJson("[]")
+                .toolCallsUsed(0).estimateJson("{}").build();
+        assertThat(service.captureAndSave(req)).isFalse();
+    }
+
+    @Test
+    void shouldRejectMissingDatasetSnapshotDigest() {
+        when(agentRunMapper.findById("run-1")).thenReturn(buildRun());
+        var req = ToolJobCheckpointRequest.builder("run-1")
+                .operationId("run-1:tc-1:1").toolCallId("tc-1").attempt(1).taskId("task-123")
+                .expectedCheckpointVersion(0)
+                .todoId("todo_3").sequence(3).completedTodos(List.of())
+                .datasetSnapshotJson("{}").datasetRefsJson("[]")
+                .toolCallsUsed(0).estimateJson("{}").build();
+        assertThat(service.captureAndSave(req)).isFalse();
+    }
+
+    @Test
+    void shouldRejectMissingDatasetRefsJson() {
+        when(agentRunMapper.findById("run-1")).thenReturn(buildRun());
+        var req = ToolJobCheckpointRequest.builder("run-1")
+                .operationId("run-1:tc-1:1").toolCallId("tc-1").attempt(1).taskId("task-123")
+                .expectedCheckpointVersion(0)
+                .todoId("todo_3").sequence(3).completedTodos(List.of())
+                .datasetSnapshotJson("{}").datasetSnapshotDigest("d")
+                .toolCallsUsed(0).estimateJson("{}").build();
+        assertThat(service.captureAndSave(req)).isFalse();
+    }
+
+    @Test
+    void shouldRejectInvalidDatasetRefsJson() {
+        when(agentRunMapper.findById("run-1")).thenReturn(buildRun());
+        var req = ToolJobCheckpointRequest.builder("run-1")
+                .operationId("run-1:tc-1:1").toolCallId("tc-1").attempt(1).taskId("task-123")
+                .expectedCheckpointVersion(0)
+                .todoId("todo_3").sequence(3).completedTodos(List.of())
+                .datasetSnapshotJson("{}").datasetSnapshotDigest("d").datasetRefsJson("bad")
+                .toolCallsUsed(0).estimateJson("{}").build();
+        assertThat(service.captureAndSave(req)).isFalse();
+    }
+
+    @Test
+    void shouldRejectMissingEstimateJson() {
+        when(agentRunMapper.findById("run-1")).thenReturn(buildRun());
+        var req = ToolJobCheckpointRequest.builder("run-1")
+                .operationId("run-1:tc-1:1").toolCallId("tc-1").attempt(1).taskId("task-123")
+                .expectedCheckpointVersion(0)
+                .todoId("todo_3").sequence(3).completedTodos(List.of())
+                .datasetSnapshotJson("{}").datasetSnapshotDigest("d").datasetRefsJson("[]")
+                .toolCallsUsed(0).build();
+        assertThat(service.captureAndSave(req)).isFalse();
+    }
+
+    @Test
+    void shouldRejectInvalidEstimateJson() {
+        when(agentRunMapper.findById("run-1")).thenReturn(buildRun());
+        var req = ToolJobCheckpointRequest.builder("run-1")
+                .operationId("run-1:tc-1:1").toolCallId("tc-1").attempt(1).taskId("task-123")
+                .expectedCheckpointVersion(0)
+                .todoId("todo_3").sequence(3).completedTodos(List.of())
+                .datasetSnapshotJson("{}").datasetSnapshotDigest("d").datasetRefsJson("[]")
+                .toolCallsUsed(0).estimateJson("not-json").build();
+        assertThat(service.captureAndSave(req)).isFalse();
+    }
+
+    // ========== Gap 1: checkpointVersion CAS + stale request ==========
+
+    @Test
+    void shouldRejectCheckpointVersionMismatch() {
+        ToolJobAnchor anchor = buildAnchor();
+        anchor.setCheckpointVersion(3); // anchor already at v3
+        AgentRun run = new AgentRun();
+        run.setId("run-1");
+        run.setStatus(AgentRunStatus.EXECUTING);
+        run.setToolJobAnchorJson(anchor.toJson());
+
+        when(agentRunMapper.findById("run-1")).thenReturn(run);
+
+        var req = ToolJobCheckpointRequest.builder("run-1")
+                .operationId("run-1:tc-1:1").toolCallId("tc-1").attempt(1).taskId("task-123")
+                .expectedCheckpointVersion(0) // stale: request captured at v0
+                .todoId("todo_3").sequence(3).completedTodos(List.of())
+                .datasetSnapshotJson("{}").datasetSnapshotDigest("d").datasetRefsJson("[]")
+                .toolCallsUsed(0).estimateJson("{}").build();
+
+        assertThat(service.captureAndSave(req)).isFalse();
+        verify(anchorService, never()).checkpointUpdate(any(), any(), any(),
+                any(), anyInt(), any(), any(), any(), any(), anyInt(), any());
+    }
+
+    @Test
+    void shouldPassCheckpointVersionMatchAndWriteWithRequestVersion() {
+        AgentRun run = buildRun(); // anchor at v0
+        when(agentRunMapper.findById("run-1")).thenReturn(run);
+        when(anchorService.checkpointUpdate(eq("run-1"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.EXECUTING), any(), anyInt(), any(),
+                any(), any(), any(), anyInt(), any())).thenReturn(true);
+
+        assertThat(service.captureAndSave(validRequest())).isTrue();
+    }
+
+    @Test
+    void shouldReturnFalseWhenCasFails() {
+        when(agentRunMapper.findById("run-1")).thenReturn(buildRun());
+        when(anchorService.checkpointUpdate(eq("run-1"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.EXECUTING), any(), anyInt(), any(),
+                any(), any(), any(), anyInt(), any())).thenReturn(false);
+
+        assertThat(service.captureAndSave(validRequest())).isFalse();
     }
 
     @Test
@@ -90,15 +267,18 @@ class ToolJobCheckpointServiceTest {
         assertThat(service.captureAndSave(ToolJobCheckpointRequest.builder("run-99").build())).isFalse();
     }
 
+    // ========== immutable identity: still fail-closed ==========
+
     @Test
     void shouldRejectOperationIdMismatch() {
         when(agentRunMapper.findById("run-1")).thenReturn(buildRun());
         var req = ToolJobCheckpointRequest.builder("run-1")
                 .operationId("run-1:tc-2:1").toolCallId("tc-1").attempt(1).taskId("task-123")
-                .datasetSnapshotJson("{}").datasetSnapshotDigest("d").toolCallsUsed(0).build();
+                .expectedCheckpointVersion(0)
+                .todoId("todo_3").sequence(3).completedTodos(List.of())
+                .datasetSnapshotJson("{}").datasetSnapshotDigest("d").datasetRefsJson("[]")
+                .toolCallsUsed(0).estimateJson("{}").build();
         assertThat(service.captureAndSave(req)).isFalse();
-        verify(anchorService, never()).checkpointUpdate(any(), any(), any(),
-                any(), anyInt(), any(), any(), any(), any(), anyInt(), any());
     }
 
     @Test
@@ -106,7 +286,10 @@ class ToolJobCheckpointServiceTest {
         when(agentRunMapper.findById("run-1")).thenReturn(buildRun());
         var req = ToolJobCheckpointRequest.builder("run-1")
                 .operationId("run-1:tc-1:1").toolCallId("tc-2").attempt(1).taskId("task-123")
-                .datasetSnapshotJson("{}").datasetSnapshotDigest("d").toolCallsUsed(0).build();
+                .expectedCheckpointVersion(0)
+                .todoId("todo_3").sequence(3).completedTodos(List.of())
+                .datasetSnapshotJson("{}").datasetSnapshotDigest("d").datasetRefsJson("[]")
+                .toolCallsUsed(0).estimateJson("{}").build();
         assertThat(service.captureAndSave(req)).isFalse();
     }
 
@@ -115,7 +298,10 @@ class ToolJobCheckpointServiceTest {
         when(agentRunMapper.findById("run-1")).thenReturn(buildRun());
         var req = ToolJobCheckpointRequest.builder("run-1")
                 .operationId("run-1:tc-1:1").toolCallId("tc-1").attempt(2).taskId("task-123")
-                .datasetSnapshotJson("{}").datasetSnapshotDigest("d").toolCallsUsed(0).build();
+                .expectedCheckpointVersion(0)
+                .todoId("todo_3").sequence(3).completedTodos(List.of())
+                .datasetSnapshotJson("{}").datasetSnapshotDigest("d").datasetRefsJson("[]")
+                .toolCallsUsed(0).estimateJson("{}").build();
         assertThat(service.captureAndSave(req)).isFalse();
     }
 
@@ -124,38 +310,22 @@ class ToolJobCheckpointServiceTest {
         when(agentRunMapper.findById("run-1")).thenReturn(buildRun());
         var req = ToolJobCheckpointRequest.builder("run-1")
                 .operationId("run-1:tc-1:1").toolCallId("tc-1").attempt(1).taskId("task-999")
-                .datasetSnapshotJson("{}").datasetSnapshotDigest("d").toolCallsUsed(0).build();
-        assertThat(service.captureAndSave(req)).isFalse();
-    }
-
-    @Test
-    void shouldReturnFalseWhenCasFails() {
-        when(agentRunMapper.findById("run-1")).thenReturn(buildRun());
-        when(anchorService.checkpointUpdate(eq("run-1"), any(ToolJobAnchor.class),
-                eq(AgentRunStatus.EXECUTING), any(), anyInt(), any(),
-                any(), any(), any(), anyInt(), any())).thenReturn(false);
-
-        var req = ToolJobCheckpointRequest.builder("run-1")
-                .operationId("run-1:tc-1:1").toolCallId("tc-1").attempt(1).taskId("task-123")
-                .todoId("todo_3").sequence(3)
-                .datasetSnapshotJson("{\"digest\":\"abc\"}").datasetSnapshotDigest("abc123")
-                .toolCallsUsed(2).build();
-
+                .expectedCheckpointVersion(0)
+                .todoId("todo_3").sequence(3).completedTodos(List.of())
+                .datasetSnapshotJson("{}").datasetSnapshotDigest("d").datasetRefsJson("[]")
+                .toolCallsUsed(0).estimateJson("{}").build();
         assertThat(service.captureAndSave(req)).isFalse();
     }
 
     @Test
     void shouldRejectWhenIdentityMissing() {
         when(agentRunMapper.findById("run-1")).thenReturn(buildRun());
-
         var req = ToolJobCheckpointRequest.builder("run-1")
-                .datasetSnapshotJson("{\"digest\":\"abc\"}").datasetSnapshotDigest("abc123")
-                .toolCallsUsed(2).build();
-
-        // Mandatory identity — all 4 fields must be present
+                .expectedCheckpointVersion(0)
+                .todoId("todo_3").sequence(3).completedTodos(List.of())
+                .datasetSnapshotJson("{}").datasetSnapshotDigest("d").datasetRefsJson("[]")
+                .toolCallsUsed(0).estimateJson("{}").build();
         assertThat(service.captureAndSave(req)).isFalse();
-        verify(anchorService, never()).checkpointUpdate(any(), any(), any(),
-                any(), anyInt(), any(), any(), any(), any(), anyInt(), any());
     }
 
     @Test
@@ -172,9 +342,10 @@ class ToolJobCheckpointServiceTest {
 
         var req = ToolJobCheckpointRequest.builder("run-1")
                 .operationId("run-1:tc-1:1").toolCallId("tc-1").attempt(1).taskId("task-123")
+                .expectedCheckpointVersion(0)
                 .todoId("todo_2").completedTodos(List.of(t1))
-                .datasetSnapshotJson("{\"digest\":\"abc\"}").datasetSnapshotDigest("abc123")
-                .toolCallsUsed(1).build();
+                .datasetSnapshotJson("{}").datasetSnapshotDigest("d").datasetRefsJson("[]")
+                .toolCallsUsed(1).estimateJson("{\"cpu\":50}").build();
 
         assertThat(service.captureAndSave(req)).isTrue();
     }
