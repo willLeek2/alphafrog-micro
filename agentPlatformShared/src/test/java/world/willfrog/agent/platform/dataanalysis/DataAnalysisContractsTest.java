@@ -5,7 +5,9 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import java.time.Instant;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import org.junit.jupiter.api.Test;
 import world.willfrog.agent.workflow.AgentRunDatasetSnapshot;
 
@@ -301,6 +303,31 @@ class DataAnalysisContractsTest {
                         DataAnalysisReservationState.RELEASED));
     }
 
+    @Test
+    void restoreContractDistinguishesAddedSameAndConflict() {
+        StubCapacityService service = new StubCapacityService();
+        DataAnalysisReservation first = preparingReservation(
+                DataAnalysisResourceClass.STANDARD,
+                1);
+        DataAnalysisReservation conflicting = preparingReservation(
+                DataAnalysisResourceClass.HEAVY,
+                3);
+
+        assertEquals(DataAnalysisRestoreOutcome.ADDED, service.restoreReservation(first));
+        assertEquals(
+                DataAnalysisRestoreOutcome.ALREADY_PRESENT_SAME,
+                service.restoreReservation(first));
+        assertEquals(
+                DataAnalysisRestoreOutcome.CONFLICT,
+                service.restoreReservation(conflicting));
+    }
+
+    @Test
+    void resourceClassCapacityUnitsAreFrozen() {
+        assertEquals(1, DataAnalysisResourceClass.STANDARD.defaultCapacityUnits());
+        assertEquals(3, DataAnalysisResourceClass.HEAVY.defaultCapacityUnits());
+    }
+
     private CanonicalSandboxCreateSpec createSpec(long timeoutMillis) {
         return new CanonicalSandboxCreateSpec(
                 CanonicalSandboxCreateSpec.CURRENT_SCHEMA_VERSION,
@@ -342,6 +369,19 @@ class DataAnalysisContractsTest {
                 Instant.parse("2026-07-12T00:00:00Z"));
     }
 
+    private DataAnalysisReservation preparingReservation(
+            DataAnalysisResourceClass resourceClass,
+            int capacityUnits) {
+        return new DataAnalysisReservation(
+                identity().reservationId(),
+                identity(),
+                resourceClass,
+                capacityUnits,
+                DataAnalysisReservationState.PREPARING,
+                null,
+                Instant.parse("2026-07-12T00:00:00Z"));
+    }
+
     private DataAnalysisResourceUsage usage(
             boolean complete,
             Long cpuMillis,
@@ -365,5 +405,48 @@ class DataAnalysisContractsTest {
                 complete,
                 null,
                 missingFields);
+    }
+
+    private static final class StubCapacityService implements DataAnalysisCapacityService {
+
+        private final Map<String, DataAnalysisReservation> reservations = new HashMap<>();
+
+        @Override
+        public DataAnalysisReservation reserve(
+                DataAnalysisOperationIdentity identity,
+                DataAnalysisEstimate estimate) {
+            throw new UnsupportedOperationException("not needed by restore contract test");
+        }
+
+        @Override
+        public DataAnalysisRestoreOutcome restoreReservation(DataAnalysisReservation reservation) {
+            DataAnalysisReservation existing = reservations.putIfAbsent(
+                    reservation.reservationId(),
+                    reservation);
+            if (existing == null) {
+                return DataAnalysisRestoreOutcome.ADDED;
+            }
+            return existing.equals(reservation)
+                    ? DataAnalysisRestoreOutcome.ALREADY_PRESENT_SAME
+                    : DataAnalysisRestoreOutcome.CONFLICT;
+        }
+
+        @Override
+        public DataAnalysisReleaseOutcome releaseReservation(DataAnalysisReleaseRequest request) {
+            throw new UnsupportedOperationException("not needed by restore contract test");
+        }
+
+        @Override
+        public DataAnalysisCapacityRecoveryReport recover(
+                List<DataAnalysisReservation> durableReservations,
+                int configuredMaxUnits,
+                int configuredMaxHeavyActive) {
+            throw new UnsupportedOperationException("not needed by restore contract test");
+        }
+
+        @Override
+        public DataAnalysisAdmissionState admissionState() {
+            return DataAnalysisAdmissionState.OPEN;
+        }
     }
 }
