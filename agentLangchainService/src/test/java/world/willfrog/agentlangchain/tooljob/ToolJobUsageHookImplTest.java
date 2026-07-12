@@ -86,6 +86,7 @@ class ToolJobUsageHookImplTest {
                 .setCleanupMillis(4)
                 .setDatasetOpenCount(5)
                 .setExitReason("SUCCESS")
+                .setAttributionComplete(true)
                 .build();
         anchor.setTerminalUsageJson(JsonFormat.printer()
                 .omittingInsignificantWhitespace()

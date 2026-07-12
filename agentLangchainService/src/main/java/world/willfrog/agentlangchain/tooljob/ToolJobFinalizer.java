@@ -307,47 +307,8 @@ public class ToolJobFinalizer {
         }
     }
 
-    private DataAnalysisResourceUsage buildResourceUsage(DataAnalysisResourceClass rc, String usageJson) {
-        if (usageJson == null || usageJson.isBlank()) return DataAnalysisResourceUsage.missing(rc);
-        try {
-            SandboxResourceUsage s = objectMapper.readValue(usageJson, SandboxResourceUsage.class);
-
-            Long cpu = s.hasCpuMillis() ? s.getCpuMillis() : null;
-            Long mem = s.hasMemoryPeakBytes() ? s.getMemoryPeakBytes() : null;
-            Long memMs = s.hasMemoryByteMillis() ? s.getMemoryByteMillis() : null;
-            Long scan = s.hasLogicalBytesScanned() ? s.getLogicalBytesScanned() : null;
-            Long art = s.hasArtifactBytesWritten() ? s.getArtifactBytesWritten() : null;
-            Long tmp = s.hasTemporaryBytesWritten() ? s.getTemporaryBytesWritten() : null;
-            Long qwait = s.hasQueueWaitMillis() ? s.getQueueWaitMillis() : null;
-            Long prep = s.hasPrepareMillis() ? s.getPrepareMillis() : null;
-            Long exec = s.hasExecutionWallMillis() ? s.getExecutionWallMillis() : null;
-            Long clean = s.hasCleanupMillis() ? s.getCleanupMillis() : null;
-            Integer dsOpen = s.hasDatasetOpenCount() ? s.getDatasetOpenCount() : null;
-
-            List<String> missing = new ArrayList<>();
-            if (cpu == null) missing.add("cpuMillis");
-            if (mem == null) missing.add("memoryPeakBytes");
-            if (scan == null) missing.add("logicalBytesScanned");
-            if (qwait == null) missing.add("queueWaitMillis");
-            if (prep == null) missing.add("prepareMillis");
-            if (exec == null) missing.add("executionWallMillis");
-            if (clean == null) missing.add("cleanupMillis");
-            if (dsOpen == null) missing.add("datasetOpenCount");
-            if (s.getExitReason().isBlank()) missing.add("exitReason");
-
-            if (missing.isEmpty()) {
-                return new DataAnalysisResourceUsage(rc, cpu, mem, memMs, scan, art, tmp,
-                        qwait, prep, exec, clean, dsOpen, s.getExitReason(),
-                        s.getOomKilled(), s.getTimedOut(), true, null, null);
-            }
-            // Partial: keep measured values, declare only actually-missing fields
-            return new DataAnalysisResourceUsage(rc, cpu, mem, memMs, scan, art, tmp,
-                    qwait, prep, exec, clean, dsOpen, s.getExitReason(),
-                    s.getOomKilled(), s.getTimedOut(), false, null, missing);
-        } catch (Exception e) {
-            log.warn("Failed to parse resourceUsage, using missing", e);
-            return DataAnalysisResourceUsage.missing(rc);
-        }
+    DataAnalysisResourceUsage buildResourceUsage(DataAnalysisResourceClass rc, String usageJson) {
+        return ToolJobResourceUsageParser.parse(objectMapper, rc, usageJson);
     }
 
     /** @return parsed estimate or null (fail-closed: blocks RELEASE) */

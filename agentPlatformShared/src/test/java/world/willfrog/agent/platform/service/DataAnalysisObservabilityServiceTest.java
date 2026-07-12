@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisEstimate;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilitySnapshot;
+import world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilityReadMode;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisOperationIdentity;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisReservation;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisReservationState;
@@ -86,7 +87,9 @@ class DataAnalysisObservabilityServiceTest {
         when(stateStore.loadDataAnalysisObservabilitySummary("run-1"))
                 .thenReturn(Optional.of(summaryJson));
 
-        assertThat(service.findSummaryByRunId("run-1")).contains(snapshot.summary());
+        assertThat(service.findSummaryByRunId(
+                "run-1", DataAnalysisObservabilityReadMode.RUNNING_CACHE_FIRST))
+                .contains(snapshot.summary());
         verify(stateStore, never()).loadDataAnalysisObservability(anyString());
         verify(mapper, never()).findDataAnalysisObservabilityJsonById(anyString());
         verify(mapper, never()).findById(anyString());
@@ -101,7 +104,9 @@ class DataAnalysisObservabilityServiceTest {
         when(stateStore.loadDataAnalysisObservability("run-1")).thenReturn(Optional.empty());
         when(mapper.findDataAnalysisObservabilityJsonById("run-1")).thenReturn(json);
 
-        assertThat(service.findByRunId("run-1")).contains(snapshot);
+        assertThat(service.findByRunId(
+                "run-1", DataAnalysisObservabilityReadMode.RUNNING_CACHE_FIRST))
+                .contains(snapshot);
         verify(stateStore).saveDataAnalysisObservability(
                 eq("run-1"), eq(json), contains("\"attemptCount\":1"));
     }
@@ -115,7 +120,9 @@ class DataAnalysisObservabilityServiceTest {
         when(stateStore.loadDataAnalysisObservabilitySummary("run-1")).thenReturn(Optional.empty());
         when(mapper.findDataAnalysisObservabilitySummaryJsonById("run-1")).thenReturn(summaryJson);
 
-        assertThat(service.findSummaryByRunId("run-1")).contains(snapshot.summary());
+        assertThat(service.findSummaryByRunId(
+                "run-1", DataAnalysisObservabilityReadMode.RUNNING_CACHE_FIRST))
+                .contains(snapshot.summary());
         verify(stateStore).saveDataAnalysisObservabilitySummary("run-1", summaryJson);
         verify(stateStore, never()).saveDataAnalysisObservability(eq("run-1"), anyString(), anyString());
     }
@@ -131,7 +138,51 @@ class DataAnalysisObservabilityServiceTest {
         doThrow(new IllegalStateException("redis unavailable"))
                 .when(stateStore).saveDataAnalysisObservabilitySummary("run-1", summaryJson);
 
-        assertThat(service.findSummaryByRunId("run-1")).contains(snapshot.summary());
+        assertThat(service.findSummaryByRunId(
+                "run-1", DataAnalysisObservabilityReadMode.RUNNING_CACHE_FIRST))
+                .contains(snapshot.summary());
+    }
+
+    @Test
+    void terminalSummarySkipsStaleRedisAndReturnsDbTruthWithoutWarm() throws Exception {
+        DataAnalysisObservabilitySnapshot stale = DataAnalysisObservabilitySnapshot.of(
+                "run-1", List.of(world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilityCall
+                        .fromEnvelope(envelope("run-1", "call-1", 1, 10L))));
+        DataAnalysisObservabilitySnapshot current = DataAnalysisObservabilitySnapshot.of(
+                "run-1", List.of(world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilityCall
+                        .fromEnvelope(envelope("run-1", "call-1", 1, 99L))));
+        when(stateStore.loadDataAnalysisObservabilitySummary("run-1"))
+                .thenReturn(Optional.of(objectMapper.writeValueAsString(stale.summary())));
+        when(mapper.findDataAnalysisObservabilitySummaryJsonById("run-1"))
+                .thenReturn(objectMapper.writeValueAsString(current.summary()));
+
+        assertThat(service.findSummaryByRunId(
+                "run-1", DataAnalysisObservabilityReadMode.TERMINAL_DB_ONLY))
+                .contains(current.summary());
+        verify(stateStore, never()).loadDataAnalysisObservabilitySummary(anyString());
+        verify(stateStore, never()).saveDataAnalysisObservabilitySummary(anyString(), anyString());
+        verify(stateStore, never()).loadDataAnalysisObservability(anyString());
+    }
+
+    @Test
+    void terminalFullSkipsStaleRedisAndReturnsDbTruthWithoutWarm() throws Exception {
+        DataAnalysisObservabilitySnapshot stale = DataAnalysisObservabilitySnapshot.of(
+                "run-1", List.of(world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilityCall
+                        .fromEnvelope(envelope("run-1", "call-1", 1, 10L))));
+        DataAnalysisObservabilitySnapshot current = DataAnalysisObservabilitySnapshot.of(
+                "run-1", List.of(world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilityCall
+                        .fromEnvelope(envelope("run-1", "call-1", 1, 99L))));
+        when(stateStore.loadDataAnalysisObservability("run-1"))
+                .thenReturn(Optional.of(objectMapper.writeValueAsString(stale)));
+        when(mapper.findDataAnalysisObservabilityJsonById("run-1"))
+                .thenReturn(objectMapper.writeValueAsString(current));
+
+        assertThat(service.findByRunId(
+                "run-1", DataAnalysisObservabilityReadMode.TERMINAL_DB_ONLY))
+                .contains(current);
+        verify(stateStore, never()).loadDataAnalysisObservability(anyString());
+        verify(stateStore, never()).saveDataAnalysisObservability(anyString(), anyString(), anyString());
+        verify(stateStore, never()).loadDataAnalysisObservabilitySummary(anyString());
     }
 
     private DataAnalysisTerminalEnvelope envelope(

@@ -7,6 +7,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilityCall;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilityQuery;
+import world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilityReadMode;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilitySnapshot;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilitySummary;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisTerminalEnvelope;
@@ -101,16 +102,22 @@ public class DataAnalysisObservabilityService
     }
 
     @Override
-    public Optional<DataAnalysisObservabilitySummary> findSummaryByRunId(String runId) {
+    public Optional<DataAnalysisObservabilitySummary> findSummaryByRunId(
+            String runId,
+            DataAnalysisObservabilityReadMode mode) {
         if (runId == null || runId.isBlank()) {
             return Optional.empty();
         }
-        Optional<String> cached = stateStore.loadDataAnalysisObservabilitySummary(runId);
-        if (cached.isPresent()) {
-            try {
-                return Optional.of(objectMapper.readValue(cached.get(), DataAnalysisObservabilitySummary.class));
-            } catch (Exception e) {
-                log.warn("Redis data-analysis summary 无法解析，回退 DB: runId={}", runId);
+        DataAnalysisObservabilityReadMode effectiveMode = requireMode(mode);
+        if (effectiveMode == DataAnalysisObservabilityReadMode.RUNNING_CACHE_FIRST) {
+            Optional<String> cached = stateStore.loadDataAnalysisObservabilitySummary(runId);
+            if (cached.isPresent()) {
+                try {
+                    return Optional.of(objectMapper.readValue(
+                            cached.get(), DataAnalysisObservabilitySummary.class));
+                } catch (Exception e) {
+                    log.warn("Redis data-analysis summary 无法解析，回退 DB: runId={}", runId);
+                }
             }
         }
         String json = runMapper.findDataAnalysisObservabilitySummaryJsonById(runId);
@@ -120,10 +127,12 @@ public class DataAnalysisObservabilityService
         try {
             DataAnalysisObservabilitySummary summary = objectMapper.readValue(
                     json, DataAnalysisObservabilitySummary.class);
-            try {
-                stateStore.saveDataAnalysisObservabilitySummary(runId, write(summary));
-            } catch (Exception e) {
-                log.warn("Data-analysis summary Redis cache 写入失败，继续返回 DB 数据: runId={}", runId);
+            if (effectiveMode == DataAnalysisObservabilityReadMode.RUNNING_CACHE_FIRST) {
+                try {
+                    stateStore.saveDataAnalysisObservabilitySummary(runId, write(summary));
+                } catch (Exception e) {
+                    log.warn("Data-analysis summary Redis cache 写入失败，继续返回 DB 数据: runId={}", runId);
+                }
             }
             return Optional.of(summary);
         } catch (Exception e) {
@@ -133,16 +142,21 @@ public class DataAnalysisObservabilityService
     }
 
     @Override
-    public Optional<DataAnalysisObservabilitySnapshot> findByRunId(String runId) {
+    public Optional<DataAnalysisObservabilitySnapshot> findByRunId(
+            String runId,
+            DataAnalysisObservabilityReadMode mode) {
         if (runId == null || runId.isBlank()) {
             return Optional.empty();
         }
-        Optional<String> cached = stateStore.loadDataAnalysisObservability(runId);
-        if (cached.isPresent()) {
-            try {
-                return Optional.of(readSnapshot(runId, cached.get()));
-            } catch (Exception e) {
-                log.warn("Redis data-analysis snapshot 无法解析，回退 DB: runId={}", runId);
+        DataAnalysisObservabilityReadMode effectiveMode = requireMode(mode);
+        if (effectiveMode == DataAnalysisObservabilityReadMode.RUNNING_CACHE_FIRST) {
+            Optional<String> cached = stateStore.loadDataAnalysisObservability(runId);
+            if (cached.isPresent()) {
+                try {
+                    return Optional.of(readSnapshot(runId, cached.get()));
+                } catch (Exception e) {
+                    log.warn("Redis data-analysis snapshot 无法解析，回退 DB: runId={}", runId);
+                }
             }
         }
         String json = runMapper.findDataAnalysisObservabilityJsonById(runId);
@@ -151,7 +165,9 @@ public class DataAnalysisObservabilityService
         }
         try {
             DataAnalysisObservabilitySnapshot snapshot = readSnapshot(runId, json);
-            cache(snapshot);
+            if (effectiveMode == DataAnalysisObservabilityReadMode.RUNNING_CACHE_FIRST) {
+                cache(snapshot);
+            }
             return Optional.of(snapshot);
         } catch (Exception e) {
             log.warn("DB data-analysis snapshot 无法解析: runId={}, error={}", runId, e.getMessage());
@@ -182,6 +198,13 @@ public class DataAnalysisObservabilityService
             throw new IllegalArgumentException("snapshot runId mismatch");
         }
         return snapshot;
+    }
+
+    private DataAnalysisObservabilityReadMode requireMode(DataAnalysisObservabilityReadMode mode) {
+        if (mode == null) {
+            throw new IllegalArgumentException("read mode must not be null");
+        }
+        return mode;
     }
 
     private void cache(DataAnalysisObservabilitySnapshot snapshot) {

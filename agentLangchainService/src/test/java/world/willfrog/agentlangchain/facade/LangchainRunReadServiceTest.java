@@ -22,6 +22,7 @@ import world.willfrog.agentlangchain.routing.LangchainSingleWriterGuard;
 import world.willfrog.agentlangchain.tools.LangchainToolCatalogService;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilityContractFixtures;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilityQuery;
+import world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilityReadMode;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilitySnapshot;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunResultRequest;
@@ -75,7 +76,7 @@ class LangchainRunReadServiceTest {
 
     @BeforeEach
     void stubDataAnalysisQuery() {
-        when(dataAnalysisQuery.findByRunId(anyString())).thenReturn(Optional.empty());
+        when(dataAnalysisQuery.findByRunId(anyString(), any())).thenReturn(Optional.empty());
     }
 
     @Test
@@ -208,7 +209,9 @@ class LangchainRunReadServiceTest {
         when(eventService.listByRunId("r1")).thenReturn(List.of());
         when(eventService.findMaxSeq("r1")).thenReturn(5);
         DataAnalysisObservabilitySnapshot snapshot = DataAnalysisObservabilityContractFixtures.canonicalV1();
-        when(dataAnalysisQuery.findSummaryByRunId("r1")).thenReturn(Optional.of(snapshot.summary()));
+        when(dataAnalysisQuery.findSummaryByRunId(
+                "r1", DataAnalysisObservabilityReadMode.TERMINAL_DB_ONLY))
+                .thenReturn(Optional.of(snapshot.summary()));
 
         var status = service.getStatus(GetAgentRunStatusRequest.newBuilder()
                 .setUserId("u1").setId("r1").build());
@@ -218,8 +221,9 @@ class LangchainRunReadServiceTest {
         assertTrue(obsJson.contains("\"summary\""));
         assertTrue(!obsJson.contains("\"calls\""));
         assertTrue(obsJson.contains("\"existing\":true"));
-        verify(dataAnalysisQuery).findSummaryByRunId("r1");
-        verify(dataAnalysisQuery, never()).findByRunId(anyString());
+        verify(dataAnalysisQuery).findSummaryByRunId(
+                "r1", DataAnalysisObservabilityReadMode.TERMINAL_DB_ONLY);
+        verify(dataAnalysisQuery, never()).findByRunId(anyString(), any());
     }
 
     @Test
@@ -230,7 +234,9 @@ class LangchainRunReadServiceTest {
                 .thenReturn("{\"existing\":true}");
         when(eventService.listByRunId("r1")).thenReturn(List.of());
         DataAnalysisObservabilitySnapshot snapshot = DataAnalysisObservabilityContractFixtures.canonicalV1();
-        when(dataAnalysisQuery.findByRunId("r1")).thenReturn(Optional.of(snapshot));
+        when(dataAnalysisQuery.findByRunId(
+                "r1", DataAnalysisObservabilityReadMode.TERMINAL_DB_ONLY))
+                .thenReturn(Optional.of(snapshot));
 
         var result = service.getResult(GetAgentRunResultRequest.newBuilder()
                 .setUserId("u1").setId("r1").build());
@@ -272,7 +278,8 @@ class LangchainRunReadServiceTest {
                 .thenReturn("{\"existing\":true}");
         when(eventService.listByRunId("r1")).thenReturn(List.of());
         when(eventService.findMaxSeq("r1")).thenReturn(5);
-        when(dataAnalysisQuery.findSummaryByRunId("r1"))
+        when(dataAnalysisQuery.findSummaryByRunId(
+                "r1", DataAnalysisObservabilityReadMode.TERMINAL_DB_ONLY))
                 .thenThrow(new RuntimeException("模拟查询失败"));
 
         var status = service.getStatus(GetAgentRunStatusRequest.newBuilder()
@@ -294,7 +301,9 @@ class LangchainRunReadServiceTest {
         when(eventService.listByRunId("r1")).thenReturn(List.of());
         when(eventService.findMaxSeq("r1")).thenReturn(5);
         DataAnalysisObservabilitySnapshot snapshot = DataAnalysisObservabilityContractFixtures.canonicalV1();
-        when(dataAnalysisQuery.findSummaryByRunId("r1")).thenReturn(Optional.of(snapshot.summary()));
+        when(dataAnalysisQuery.findSummaryByRunId(
+                "r1", DataAnalysisObservabilityReadMode.TERMINAL_DB_ONLY))
+                .thenReturn(Optional.of(snapshot.summary()));
 
         var status = service.getStatus(GetAgentRunStatusRequest.newBuilder()
                 .setUserId("u1").setId("r1").build());
@@ -315,13 +324,36 @@ class LangchainRunReadServiceTest {
         when(eventService.listByRunId("r1")).thenReturn(List.of());
         when(eventService.findMaxSeq("r1")).thenReturn(5);
         var snapshot = DataAnalysisObservabilityContractFixtures.canonicalV1();
-        when(dataAnalysisQuery.findSummaryByRunId("r1")).thenReturn(Optional.of(snapshot.summary()));
+        when(dataAnalysisQuery.findSummaryByRunId(
+                "r1", DataAnalysisObservabilityReadMode.TERMINAL_DB_ONLY))
+                .thenReturn(Optional.of(snapshot.summary()));
 
         var status = service.getStatus(GetAgentRunStatusRequest.newBuilder()
                 .setUserId("u1").setId("r1").build());
 
         String obsJson = status.getObservabilitySummaryJson();
         assertTrue(obsJson.contains("data_analysis_observability"));
+    }
+
+    @Test
+    void runningStatusUsesCacheFirstSummaryModeAndNeverLoadsFullSnapshot() {
+        AgentRun run = run("{\"run_provider\":\"legacy\"}");
+        run.setStatus(AgentRunStatus.EXECUTING);
+        when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(run);
+        when(stateStore.loadPlan("r1")).thenReturn(Optional.empty());
+        when(observabilityService.loadObservabilitySummaryJson(eq("r1"), any())).thenReturn("{}");
+        when(eventService.listByRunId("r1")).thenReturn(List.of());
+        DataAnalysisObservabilitySnapshot snapshot = DataAnalysisObservabilityContractFixtures.canonicalV1();
+        when(dataAnalysisQuery.findSummaryByRunId(
+                "r1", DataAnalysisObservabilityReadMode.RUNNING_CACHE_FIRST))
+                .thenReturn(Optional.of(snapshot.summary()));
+
+        service.getStatus(GetAgentRunStatusRequest.newBuilder()
+                .setUserId("u1").setId("r1").build());
+
+        verify(dataAnalysisQuery).findSummaryByRunId(
+                "r1", DataAnalysisObservabilityReadMode.RUNNING_CACHE_FIRST);
+        verify(dataAnalysisQuery, never()).findByRunId(anyString(), any());
     }
 
     private AgentRun run(String ext) {

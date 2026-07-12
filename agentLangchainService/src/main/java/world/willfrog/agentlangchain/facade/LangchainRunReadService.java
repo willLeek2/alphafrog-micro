@@ -13,6 +13,7 @@ import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentArtifactService;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilityQuery;
+import world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilityReadMode;
 import world.willfrog.agent.platform.service.AgentCreditService;
 import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agent.platform.service.AgentMessageService;
@@ -235,7 +236,7 @@ public class LangchainRunReadService {
                 : requireReadableRun(request.getId(), request.getUserId());
         String snapshotJson = nvl(run.getSnapshotJson());
         String observabilityJson = nvl(observabilityService.loadObservabilityJson(run.getId(), snapshotJson));
-        observabilityJson = mergeDataAnalysisResultView(run.getId(), observabilityJson);
+        observabilityJson = mergeDataAnalysisResultView(run, observabilityJson);
         Map<String, Object> snapshot = readExtMap(snapshotJson);
         String answerMarkdown = firstNonBlank(stringValue(snapshot.get("answer_markdown")), stringValue(snapshot.get("answer")));
         String structuredAnswerJson = "";
@@ -308,7 +309,7 @@ public class LangchainRunReadService {
         // status 是高频轮询接口，只返回 summary，不拉完整 observability。
         // 完整 trace 可能很大，应该由详情页或 matrix 按需读取。
         String observabilitySummaryJson = observabilityService.loadObservabilitySummaryJson(run.getId(), run.getSnapshotJson());
-        observabilitySummaryJson = mergeDataAnalysisStatusView(run.getId(), observabilitySummaryJson);
+        observabilitySummaryJson = mergeDataAnalysisStatusView(run, observabilitySummaryJson);
         boolean observabilityFullAvailable = observabilityService.isFullObservabilityAvailable(run.getId(), run.getSnapshotJson());
         int totalCredits = creditService.calculateRunTotalCredits(run, eventService.listByRunId(run.getId()), observabilitySummaryJson);
         Integer maxSeq = eventService.findMaxSeq(run.getId());
@@ -729,11 +730,13 @@ public class LangchainRunReadService {
         return value == null ? "" : value;
     }
 
-    private String mergeDataAnalysisStatusView(String runId, String existingJson) {
+    private String mergeDataAnalysisStatusView(AgentRun run, String existingJson) {
+        String runId = run.getId();
         try {
             String dataAnalysisJson = dataAnalysisSerializer.serializeStatusFromSummary(
                     runId,
-                    dataAnalysisObservabilityQuery.findSummaryByRunId(runId));
+                    dataAnalysisObservabilityQuery.findSummaryByRunId(
+                            runId, dataAnalysisReadMode(run.getStatus())));
             if (dataAnalysisJson.equals("{}")) {
                 return existingJson;
             }
@@ -745,10 +748,12 @@ public class LangchainRunReadService {
         }
     }
 
-    private String mergeDataAnalysisResultView(String runId, String existingJson) {
+    private String mergeDataAnalysisResultView(AgentRun run, String existingJson) {
+        String runId = run.getId();
         try {
             String dataAnalysisJson = dataAnalysisSerializer.serializeResultView(
-                    dataAnalysisObservabilityQuery.findByRunId(runId));
+                    dataAnalysisObservabilityQuery.findByRunId(
+                            runId, dataAnalysisReadMode(run.getStatus())));
             if (dataAnalysisJson.equals("{}")) {
                 return existingJson;
             }
@@ -758,6 +763,15 @@ public class LangchainRunReadService {
                     runId, e.getClass().getSimpleName(), e.getMessage());
             return existingJson;
         }
+    }
+
+    private DataAnalysisObservabilityReadMode dataAnalysisReadMode(AgentRunStatus status) {
+        if (status == AgentRunStatus.COMPLETED || status == AgentRunStatus.PARTIAL
+                || status == AgentRunStatus.FAILED || status == AgentRunStatus.CANCELED
+                || status == AgentRunStatus.EXPIRED) {
+            return DataAnalysisObservabilityReadMode.TERMINAL_DB_ONLY;
+        }
+        return DataAnalysisObservabilityReadMode.RUNNING_CACHE_FIRST;
     }
 
     private String mergeJsonObjects(String runId, String view, String baseJson, String overlayJson) {
