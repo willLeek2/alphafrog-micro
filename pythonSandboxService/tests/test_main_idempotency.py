@@ -20,7 +20,7 @@ from fastapi import HTTPException  # noqa: E402
 
 from app import main  # noqa: E402
 from app.canonical_fingerprint import CanonicalSandboxCreateSpec  # noqa: E402
-from app.models import ExecuteRequest, Task, TaskStatus  # noqa: E402
+from app.models import ExecuteRequest, ExecuteResult, Task, TaskStatus  # noqa: E402
 from app.task_store import DurableTaskStore  # noqa: E402
 
 
@@ -160,6 +160,42 @@ class MainIdempotencyTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(task.resource_usage.exit_reason, "EXECUTION_ERROR")
         self.assertIs(task.retryable, False)
         self.assertIs(task.result.retryable, False)
+
+    async def test_canceled_task_returns_durable_non_retryable_result(self) -> None:
+        task = Task(
+            task_id="task-canceled",
+            status=TaskStatus.CANCELED,
+            request=ExecuteRequest(dataset_id="dataset-1", code="print(1)"),
+            result=ExecuteResult(
+                exit_code=-1,
+                stdout="",
+                stderr="canceled",
+                dataset_dir="/sandbox/input/dataset-1",
+                retryable=False,
+            ),
+            retryable=False,
+        )
+        self.store.save(task)
+
+        result = await main.get_task_result(task.task_id)
+
+        self.assertIs(result.retryable, False)
+        self.assertIs(result.model_dump(mode="json", exclude_none=True)["retryable"], False)
+
+    async def test_canceled_task_without_result_does_not_invent_retryability(self) -> None:
+        task = Task(
+            task_id="task-canceled-without-result",
+            status=TaskStatus.CANCELED,
+            request=ExecuteRequest(dataset_id="dataset-1", code="print(1)"),
+            error="cancellation producer did not persist a result",
+        )
+        self.store.save(task)
+
+        with self.assertRaises(HTTPException) as raised:
+            await main.get_task_result(task.task_id)
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertIsNone(self.store.get(task.task_id).retryable)
 
 
 if __name__ == "__main__":

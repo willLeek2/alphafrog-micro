@@ -423,9 +423,10 @@ async def get_task_result(task_id: str):
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
     if task.status != TaskStatus.SUCCEEDED:
-        if task.status == TaskStatus.FAILED:
+        if task.status in {TaskStatus.FAILED, TaskStatus.CANCELED}:
             if task.result is not None:
                 return task.result
-            raise HTTPException(status_code=400, detail=f"Task failed: {task.error}")
+            terminal_status = task.status.value.lower()
+            raise HTTPException(status_code=400, detail=f"Task {terminal_status}: {task.error}")
         raise HTTPException(status_code=409, detail=f"Task not finished. Status: {task.status}")
     return task.result
