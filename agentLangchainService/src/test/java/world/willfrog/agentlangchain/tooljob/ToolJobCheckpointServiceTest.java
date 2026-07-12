@@ -168,6 +168,8 @@ class ToolJobCheckpointServiceTest {
                 .datasetRefsJson("{}")
                 .toolCallsUsed(0).estimateJson(VALID_ESTIMATE_JSON).build();
         assertThat(service.captureAndSave(req)).isFalse();
+        verify(anchorService, never()).checkpointUpdate(any(), any(), any(),
+                any(), anyInt(), any(), any(), any(), any(), anyInt(), any());
     }
 
     @Test
@@ -181,6 +183,8 @@ class ToolJobCheckpointServiceTest {
                 .datasetRefsJson("[\"a\", 1]")
                 .toolCallsUsed(0).estimateJson(VALID_ESTIMATE_JSON).build();
         assertThat(service.captureAndSave(req)).isFalse();
+        verify(anchorService, never()).checkpointUpdate(any(), any(), any(),
+                any(), anyInt(), any(), any(), any(), any(), anyInt(), any());
     }
 
     @Test
@@ -194,6 +198,8 @@ class ToolJobCheckpointServiceTest {
                 .datasetRefsJson("[\"a\", null]")
                 .toolCallsUsed(0).estimateJson(VALID_ESTIMATE_JSON).build();
         assertThat(service.captureAndSave(req)).isFalse();
+        verify(anchorService, never()).checkpointUpdate(any(), any(), any(),
+                any(), anyInt(), any(), any(), any(), any(), anyInt(), any());
     }
 
     @Test

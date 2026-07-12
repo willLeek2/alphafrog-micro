@@ -2,6 +2,7 @@ package world.willfrog.agentlangchain.tooljob;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -244,20 +245,24 @@ public class ToolJobCheckpointService implements ToolJobCheckpointWriter {
             return false;
         }
         try {
-            List<String> refs = objectMapper.readValue(json,
-                    objectMapper.getTypeFactory().constructCollectionType(List.class, String.class));
-            if (refs == null) {
-                log.warn("Checkpoint rejected: datasetRefsJson deserialized to null for run={}", runId);
+            JsonNode root = objectMapper.readTree(json);
+            if (!root.isArray()) {
+                log.warn("Checkpoint rejected: datasetRefsJson is not a JSON array for run={}", runId);
                 return false;
             }
-            for (String ref : refs) {
-                if (ref == null) {
+            for (JsonNode element : root) {
+                if (element.isNull()) {
                     log.warn("Checkpoint rejected: datasetRefsJson contains null element for run={}", runId);
+                    return false;
+                }
+                if (!element.isTextual()) {
+                    log.warn("Checkpoint rejected: datasetRefsJson contains non-string element for run={}",
+                            runId);
                     return false;
                 }
             }
         } catch (Exception e) {
-            log.warn("Checkpoint rejected: datasetRefsJson not a valid List<String> for run={} err={}",
+            log.warn("Checkpoint rejected: datasetRefsJson not valid JSON for run={} err={}",
                     runId, e.getMessage());
             return false;
         }
