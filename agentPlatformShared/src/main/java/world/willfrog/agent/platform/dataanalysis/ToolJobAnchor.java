@@ -26,6 +26,7 @@ public class ToolJobAnchor {
     private String runDisposition;
     private boolean autoResume = true;
     private String resumeState; // READY, LAUNCHING, CONSUMED
+    private String resumeToken; // UUID for idempotent launch dedupe
 
     // resume context (§9.10): saved when tool job goes pending
     private String completedTodosJson;   // completed todo id list
@@ -115,6 +116,9 @@ public class ToolJobAnchor {
 
     public String getResumeState() { return resumeState; }
     public void setResumeState(String resumeState) { this.resumeState = resumeState; }
+
+    public String getResumeToken() { return resumeToken; }
+    public void setResumeToken(String resumeToken) { this.resumeToken = resumeToken; }
 
     public String getCompletedTodosJson() { return completedTodosJson; }
     public void setCompletedTodosJson(String completedTodosJson) { this.completedTodosJson = completedTodosJson; }

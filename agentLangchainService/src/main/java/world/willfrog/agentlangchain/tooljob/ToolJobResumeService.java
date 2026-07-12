@@ -15,17 +15,6 @@ import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
 import java.util.Collections;
 import java.util.List;
 
-/**
- * Reads the durable anchor, restores dataset state via T1 registry,
- * builds a resume context, and delegates to the Codex pipeline launcher.
- * <p>
- * CAS protocol:
- * <ul>
- *   <li>READY → LAUNCHING: atomic CAS on both status=RECEIVED AND resumeState=READY</li>
- *   <li>LAUNCHING: idempotent re-launch if launcher supports it (crash recovery)</li>
- *   <li>CONSUMED: no-op, already finished</li>
- * </ul>
- */
 @Service
 public class ToolJobResumeService {
 
@@ -42,132 +31,92 @@ public class ToolJobResumeService {
     private ToolJobResumeLauncher resumeLauncher;
 
     public ToolJobResumeService(ToolJobAnchorService anchorService,
-                                ToolJobRedisCache redisCache,
-                                ObjectMapper objectMapper) {
+                                ToolJobRedisCache redisCache, ObjectMapper objectMapper) {
         this.anchorService = anchorService;
         this.redisCache = redisCache;
         this.objectMapper = objectMapper;
     }
 
-    /**
-     * Attempt to resume a run. Handles READY (first launch attempt) and
-     * LAUNCHING (crash recovery via idempotent re-launch).
-     *
-     * @return true if the resume was launched or already in progress
-     */
     public boolean tryResume(String runId) {
         ToolJobAnchor anchor = anchorService.loadAnchor(runId);
-        if (anchor == null) {
-            return false;
-        }
+        if (anchor == null) return false;
 
-        String resumeState = anchor.getResumeState();
-        if ("CONSUMED".equals(resumeState)) {
-            // Already done — just clean up Redis
+        String state = anchor.getResumeState();
+        if ("CONSUMED".equals(state)) {
             redisCache.removeDue(runId);
             redisCache.deletePendingCache(runId);
             return true;
         }
-
-        if ("READY".equals(resumeState)) {
-            return launchFromReady(runId, anchor);
-        }
-
-        if ("LAUNCHING".equals(resumeState)) {
-            return reenterLaunching(runId, anchor);
-        }
-
+        if ("READY".equals(state)) return launchFromReady(runId, anchor);
+        if ("LAUNCHING".equals(state)) return reenterLaunching(runId, anchor);
         return false;
     }
 
-    /**
-     * First launch attempt: atomic CAS READY → LAUNCHING, then launch.
-     */
     private boolean launchFromReady(String runId, ToolJobAnchor anchor) {
-        // Atomic CAS: claim READY → LAUNCHING
         anchor.setResumeState("LAUNCHING");
-        boolean claimed = anchorService.casResumeState(runId, anchor, AgentRunStatus.RECEIVED, "READY");
-        if (!claimed) {
-            log.info("Resume CAS READY→LAUNCHING failed for run={}, another process claimed it", runId);
+        if (!anchorService.casResumeState(runId, anchor, AgentRunStatus.RECEIVED, "READY")) {
+            log.info("Resume CAS READY→LAUNCHING failed for run={}", runId);
             return false;
         }
-
-        // Restore dataset registry AFTER claiming (only the winner restores).
-        // Failure is non-fatal but logged; the run continues with whatever is available.
-        restoreDatasetRegistry(runId, anchor);
-
+        // Fail-closed: restore failure blocks resume
+        if (!restoreDatasetRegistry(runId, anchor)) {
+            log.error("Dataset restore failed for run={}, rolling back to READY", runId);
+            anchor.setResumeState("READY");
+            anchorService.casResumeState(runId, anchor, AgentRunStatus.RECEIVED, "LAUNCHING");
+            return false;
+        }
         return doLaunch(runId, anchor);
     }
 
-    /**
-     * Crash recovery: re-enter a LAUNCHING anchor.
-     * The launcher must be idempotent — if the run is already executing, it should
-     * return true (already launched). If it was never started, it starts it now.
-     */
     private boolean reenterLaunching(String runId, ToolJobAnchor anchor) {
         log.info("Re-entering LAUNCHING resume for run={}", runId);
-
+        // Restore registry on reentry too (may have crashed before restore completed)
+        if (!restoreDatasetRegistry(runId, anchor)) {
+            log.error("Dataset restore failed on LAUNCHING reentry for run={}, will retry", runId);
+            return false; // retry on next scan
+        }
         if (resumeLauncher == null) {
             log.warn("No resumeLauncher wired — cannot recover LAUNCHING run={}", runId);
             return false;
         }
-
         ToolJobResumeContext ctx = buildResumeContext(runId, anchor);
         try {
-            boolean accepted = resumeLauncher.launch(runId, ctx);
-            if (accepted) {
-                log.info("Re-launch accepted for run={}", runId);
-                return true;
-            }
-            log.warn("Re-launch rejected for run={}", runId);
-            return false;
+            return resumeLauncher.launch(runId, ctx);
         } catch (Exception e) {
-            log.error("Re-launch threw for run={}, will retry on next scan", runId, e);
+            log.error("Re-launch threw for run={}, will retry", runId, e);
             return false;
         }
     }
 
     private boolean doLaunch(String runId, ToolJobAnchor anchor) {
         if (resumeLauncher == null) {
-            log.warn("No ToolJobResumeLauncher wired — cannot launch run={}, rolling back to READY", runId);
+            log.warn("No resumeLauncher wired — rolling back run={}", runId);
             anchor.setResumeState("READY");
             anchorService.casResumeState(runId, anchor, AgentRunStatus.RECEIVED, "LAUNCHING");
             return false;
         }
-
         ToolJobResumeContext ctx = buildResumeContext(runId, anchor);
         try {
-            boolean accepted = resumeLauncher.launch(runId, ctx);
-            if (!accepted) {
-                log.warn("Resume launcher rejected run={}, rolling back to READY", runId);
+            if (!resumeLauncher.launch(runId, ctx)) {
                 anchor.setResumeState("READY");
                 anchorService.casResumeState(runId, anchor, AgentRunStatus.RECEIVED, "LAUNCHING");
                 return false;
             }
-            log.info("Resume launched for run={}, todoId={}", runId, ctx.getTodoId());
             return true;
         } catch (Exception e) {
-            log.error("Resume launcher threw for run={}, rolling back to READY", runId, e);
+            log.error("Launch threw for run={}, rolling back", runId, e);
             anchor.setResumeState("READY");
             anchorService.casResumeState(runId, anchor, AgentRunStatus.RECEIVED, "LAUNCHING");
             return false;
         }
     }
 
-    /**
-     * Mark a successfully resumed run as CONSUMED.
-     * Only clears the anchor if both usage and terminal event have been persisted
-     * (§9.3 / §9.8 — anchor cleanup must wait for usagePersisted && terminalEventEmitted).
-     */
     public void markConsumed(String runId) {
         ToolJobAnchor anchor = anchorService.loadAnchor(runId);
-        if (anchor == null) {
-            return;
-        }
+        if (anchor == null) return;
 
-        // Guard: do not clean up until usage and event are done
         if (!anchor.isUsagePersisted() || !anchor.isTerminalEventEmitted()) {
-            log.info("Deferring cleanup for run={}: usagePersisted={}, terminalEventEmitted={}",
+            log.info("Deferring cleanup for run={}: usagePersisted={} terminalEventEmitted={}",
                     runId, anchor.isUsagePersisted(), anchor.isTerminalEventEmitted());
             anchor.setResumeState("CONSUMED");
             anchor.setResultConsumed(true);
@@ -177,35 +126,34 @@ public class ToolJobResumeService {
 
         anchor.setResumeState("CONSUMED");
         anchor.setResultConsumed(true);
-        anchorService.updateAnchor(runId, anchor, AgentRunStatus.RECEIVED);
+        if (!anchorService.updateAnchor(runId, anchor, AgentRunStatus.RECEIVED)) {
+            log.warn("markConsumed anchor update CAS failed for run={}, will retry", runId);
+            return;
+        }
 
-        // Full cleanup: clear Redis cache + DB anchor
+        // Durable clear FIRST, then Redis (order: DB before cache)
+        anchorService.clearAnchor(runId);
         redisCache.removeDue(runId);
         redisCache.deletePendingCache(runId);
-        anchorService.clearAnchor(runId);
         log.info("Full cleanup completed for run={}", runId);
     }
 
     // ---- internal ----
 
-    private void restoreDatasetRegistry(String runId, ToolJobAnchor anchor) {
-        if (datasetRegistry == null) {
-            log.debug("No AgentRunDatasetRegistry wired, skipping restore for run={}", runId);
-            return;
-        }
+    /** @return true if restore succeeded or no snapshot to restore */
+    private boolean restoreDatasetRegistry(String runId, ToolJobAnchor anchor) {
+        if (datasetRegistry == null) return true;
         String snapshotJson = anchor.getDatasetSnapshotJson();
-        if (snapshotJson == null || snapshotJson.isBlank()) {
-            return;
-        }
+        if (snapshotJson == null || snapshotJson.isBlank()) return true;
         try {
             world.willfrog.agent.workflow.AgentRunDatasetSnapshot snapshot =
                     objectMapper.readValue(snapshotJson, world.willfrog.agent.workflow.AgentRunDatasetSnapshot.class);
             datasetRegistry.restore(runId, snapshot);
             log.info("Dataset registry restored for run={}", runId);
+            return true;
         } catch (Exception e) {
-            // Restore failure is logged but does not block resume — the run
-            // continues with available datasets; error is visible in logs.
-            log.error("Dataset registry restore failed for run={}, continuing with launch", runId, e);
+            log.error("Dataset registry restore FAILED for run={}, blocking resume", runId, e);
+            return false;
         }
     }
 
@@ -213,6 +161,7 @@ public class ToolJobResumeService {
         ToolJobResumeContext ctx = new ToolJobResumeContext();
         ctx.setRunId(runId);
         ctx.setTodoId(anchor.getTodoId());
+        ctx.setResumeToken(anchor.getResumeToken());
         ctx.setCompletedTodos(parseCompletedTodos(anchor.getCompletedTodosJson()));
         ctx.setDatasetSnapshotJson(anchor.getDatasetSnapshotJson());
         ctx.setDatasetSnapshotDigest(anchor.getDatasetSnapshotDigest());
@@ -224,22 +173,13 @@ public class ToolJobResumeService {
     }
 
     List<CompletedTodoRecord> parseCompletedTodos(String json) {
-        if (json == null || json.isBlank()) {
-            return Collections.emptyList();
-        }
+        if (json == null || json.isBlank()) return Collections.emptyList();
         try {
             return objectMapper.readValue(json, new TypeReference<List<CompletedTodoRecord>>() {});
         } catch (JsonProcessingException e) {
-            // Fall back to legacy string-list format
             try {
                 List<String> ids = objectMapper.readValue(json, new TypeReference<List<String>>() {});
-                return ids.stream()
-                        .map(id -> {
-                            CompletedTodoRecord r = new CompletedTodoRecord();
-                            r.setTodoId(id);
-                            return r;
-                        })
-                        .toList();
+                return ids.stream().map(id -> { var r = new CompletedTodoRecord(); r.setTodoId(id); return r; }).toList();
             } catch (JsonProcessingException ex2) {
                 log.warn("Failed to parse completedTodosJson", ex2);
                 return Collections.emptyList();

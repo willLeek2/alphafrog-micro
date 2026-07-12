@@ -158,7 +158,9 @@ public class ToolJobStartupRecovery {
             }
 
             if ("SUCCEEDED".equals(status) || "FAILED".equals(status) || "CANCELED".equals(status)) {
-                finalizer.handleTerminal(run.getId(), anchor, status);
+                TaskResultResponse resultResp = sandboxService.getTaskResult(
+                        GetTaskResultRequest.newBuilder().setTaskId(taskId).build());
+                finalizer.handleTerminal(run.getId(), anchor, status, resultResp);
                 return;
             }
 

@@ -14,6 +14,7 @@ public class ToolJobResumeContext {
 
     private String runId;
     private String todoId;
+    private String resumeToken;       // UUID for idempotent launch dedupe
     private List<CompletedTodoRecord> completedTodos = Collections.emptyList();
     private String datasetSnapshotJson;
     private String datasetSnapshotDigest;
@@ -29,6 +30,9 @@ public class ToolJobResumeContext {
 
     public String getTodoId() { return todoId; }
     public void setTodoId(String todoId) { this.todoId = todoId; }
+
+    public String getResumeToken() { return resumeToken; }
+    public void setResumeToken(String resumeToken) { this.resumeToken = resumeToken; }
 
     public List<CompletedTodoRecord> getCompletedTodos() { return completedTodos; }
     public void setCompletedTodos(List<CompletedTodoRecord> completedTodos) { this.completedTodos = completedTodos; }
