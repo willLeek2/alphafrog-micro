@@ -4,7 +4,6 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.dataanalysis.CompletedTodoRecord;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
@@ -27,9 +26,6 @@ public class ToolJobCheckpointService implements ToolJobCheckpointWriter {
     private final ToolJobAnchorService anchorService;
     private final ObjectMapper objectMapper = new ObjectMapper().findAndRegisterModules();
 
-    @Autowired(required = false)
-    private ToolJobCheckpointWriter customWriter;
-
     public ToolJobCheckpointService(AgentRunMapper agentRunMapper,
                                      ToolJobAnchorService anchorService) {
         this.agentRunMapper = agentRunMapper;
@@ -38,15 +34,6 @@ public class ToolJobCheckpointService implements ToolJobCheckpointWriter {
 
     @Override
     public boolean captureAndSave(ToolJobCheckpointRequest request) {
-        // Delegate to custom writer if wired (e.g. for testing)
-        if (customWriter != null) {
-            return customWriter.captureAndSave(request);
-        }
-        return doCaptureAndSave(request);
-    }
-
-    private boolean doCaptureAndSave(ToolJobCheckpointRequest request) {
-        // Validate immutable identity
         String runId = request.getRunId();
         if (runId == null || runId.isBlank()) {
             log.warn("Checkpoint rejected: blank runId");
@@ -65,15 +52,36 @@ public class ToolJobCheckpointService implements ToolJobCheckpointWriter {
             return false;
         }
 
+        // Validate immutable identity: operationId/toolCallId/attempt/taskId must not drift
+        if (!validateIdentity(anchor, request)) {
+            return false;
+        }
+
+        // Serialize completedTodos (fail-closed: null on error blocks checkpoint)
+        String todosJson = serializeTodos(request.getCompletedTodos());
+        if (request.getCompletedTodos() != null && !request.getCompletedTodos().isEmpty()
+                && todosJson == null) {
+            log.error("Checkpoint rejected: failed to serialize completedTodos for run={}", runId);
+            return false;
+        }
+
+        // Validate required fields are non-null before writing
+        if (request.getDatasetSnapshotJson() == null || request.getDatasetSnapshotJson().isBlank()) {
+            log.warn("Checkpoint: missing datasetSnapshotJson for run={}, continuing", runId);
+        }
+        if (request.getDatasetSnapshotDigest() == null || request.getDatasetSnapshotDigest().isBlank()) {
+            log.warn("Checkpoint: missing datasetSnapshotDigest for run={}, continuing", runId);
+        }
+
         // Write all checkpoint fields atomically into anchor
         anchor.setTodoId(request.getTodoId());
         anchor.setSequence(request.getSequence());
-        anchor.setCompletedTodosJson(serializeTodos(request.getCompletedTodos()));
+        anchor.setCompletedTodosJson(todosJson);
         anchor.setDatasetSnapshotJson(request.getDatasetSnapshotJson());
         anchor.setDatasetSnapshotDigest(request.getDatasetSnapshotDigest());
         anchor.setDatasetRefsJson(request.getDatasetRefsJson());
         anchor.setToolCallsUsed(request.getToolCallsUsed());
-        if (request.getEstimateJson() != null) {
+        if (request.getEstimateJson() != null && !request.getEstimateJson().isBlank()) {
             anchor.setEstimateJson(request.getEstimateJson());
         }
 
@@ -83,9 +91,39 @@ public class ToolJobCheckpointService implements ToolJobCheckpointWriter {
             log.warn("Checkpoint CAS failed for run={} status={}", runId, run.getStatus());
             return false;
         }
-        log.info("Checkpoint persisted for run={} todo={} todos={} tools={}",
-                runId, request.getTodoId(),
+        log.info("Checkpoint persisted for run={} op={} todo={} todos={} tools={}",
+                runId, anchor.getOperationId(), request.getTodoId(),
                 request.getCompletedTodos().size(), request.getToolCallsUsed());
+        return true;
+    }
+
+    private boolean validateIdentity(ToolJobAnchor anchor, ToolJobCheckpointRequest request) {
+        String reqOpId = request.getOperationId();
+        if (reqOpId != null && !reqOpId.isBlank()
+                && !reqOpId.equals(anchor.getOperationId())) {
+            log.error("Checkpoint rejected: operationId mismatch anchor={} request={}",
+                    anchor.getOperationId(), reqOpId);
+            return false;
+        }
+        String reqTcId = request.getToolCallId();
+        if (reqTcId != null && !reqTcId.isBlank()
+                && !reqTcId.equals(anchor.getToolCallId())) {
+            log.error("Checkpoint rejected: toolCallId mismatch anchor={} request={}",
+                    anchor.getToolCallId(), reqTcId);
+            return false;
+        }
+        if (request.getAttempt() > 0 && request.getAttempt() != anchor.getAttempt()) {
+            log.error("Checkpoint rejected: attempt mismatch anchor={} request={}",
+                    anchor.getAttempt(), request.getAttempt());
+            return false;
+        }
+        String reqTaskId = request.getTaskId();
+        if (reqTaskId != null && !reqTaskId.isBlank()
+                && !reqTaskId.equals(anchor.getTaskId())) {
+            log.error("Checkpoint rejected: taskId mismatch anchor={} request={}",
+                    anchor.getTaskId(), reqTaskId);
+            return false;
+        }
         return true;
     }
 

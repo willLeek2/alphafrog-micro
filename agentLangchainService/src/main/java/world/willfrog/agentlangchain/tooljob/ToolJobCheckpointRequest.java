@@ -13,6 +13,10 @@ import java.util.List;
 public class ToolJobCheckpointRequest {
 
     private final String runId;
+    private final String operationId;
+    private final String toolCallId;
+    private final int attempt;
+    private final String taskId;
     private final String todoId;
     private final int sequence;
     private final List<CompletedTodoRecord> completedTodos;
@@ -24,6 +28,10 @@ public class ToolJobCheckpointRequest {
 
     private ToolJobCheckpointRequest(Builder builder) {
         this.runId = builder.runId;
+        this.operationId = builder.operationId;
+        this.toolCallId = builder.toolCallId;
+        this.attempt = builder.attempt;
+        this.taskId = builder.taskId;
         this.todoId = builder.todoId;
         this.sequence = builder.sequence;
         this.completedTodos = Collections.unmodifiableList(builder.completedTodos);
@@ -35,6 +43,10 @@ public class ToolJobCheckpointRequest {
     }
 
     public String getRunId() { return runId; }
+    public String getOperationId() { return operationId; }
+    public String getToolCallId() { return toolCallId; }
+    public int getAttempt() { return attempt; }
+    public String getTaskId() { return taskId; }
     public String getTodoId() { return todoId; }
     public int getSequence() { return sequence; }
     public List<CompletedTodoRecord> getCompletedTodos() { return completedTodos; }
@@ -50,6 +62,10 @@ public class ToolJobCheckpointRequest {
 
     public static class Builder {
         private final String runId;
+        private String operationId;
+        private String toolCallId;
+        private int attempt;
+        private String taskId;
         private String todoId;
         private int sequence;
         private List<CompletedTodoRecord> completedTodos = Collections.emptyList();
@@ -61,6 +77,10 @@ public class ToolJobCheckpointRequest {
 
         private Builder(String runId) { this.runId = runId; }
 
+        public Builder operationId(String operationId) { this.operationId = operationId; return this; }
+        public Builder toolCallId(String toolCallId) { this.toolCallId = toolCallId; return this; }
+        public Builder attempt(int attempt) { this.attempt = attempt; return this; }
+        public Builder taskId(String taskId) { this.taskId = taskId; return this; }
         public Builder todoId(String todoId) { this.todoId = todoId; return this; }
         public Builder sequence(int sequence) { this.sequence = sequence; return this; }
         public Builder completedTodos(List<CompletedTodoRecord> completedTodos) { this.completedTodos = completedTodos; return this; }

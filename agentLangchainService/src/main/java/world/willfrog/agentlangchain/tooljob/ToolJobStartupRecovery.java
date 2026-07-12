@@ -84,20 +84,22 @@ public class ToolJobStartupRecovery {
 
         if (!quarantinedRuns.isEmpty()) {
             log.error("CAPACITY QUARANTINE: {} run(s) have unparseable reservationJson — "
-                    + "capacity may be over-admitted. Runs: {}",
+                    + "BLOCKING admission recovery to prevent over-admission. Runs: {}",
                     quarantinedRuns.size(), quarantinedRuns);
+            // Fail-closed: keep admission in RECOVERING, do NOT flip to OPEN.
+            // Operator must investigate and manually resolve quarantined runs.
+            return;
         }
 
-        // Always call recover (even with empty list) to flip admission from RECOVERING → OPEN
+        // Only call recover when no quarantine — safe to flip admission from RECOVERING → OPEN
         int maxUnits = capacityProperties.getMaxUnits();
         int maxHeavyActive = capacityProperties.getMaxHeavyActive();
         DataAnalysisCapacityRecoveryReport report = capacityService.recover(
                 durableReservations, maxUnits, maxHeavyActive);
-        log.info("Capacity recovery: restored={} active={} heavyActive={} usedUnits={}/{} state={} conflicts={} quarantined={}",
+        log.info("Capacity recovery: restored={} active={} heavyActive={} usedUnits={}/{} state={} conflicts={}",
                 report.restoredReservations(), report.activeCount(),
                 report.heavyActiveCount(), report.usedUnits(),
-                report.configuredMaxUnits(), report.admissionState(), report.conflicts(),
-                quarantinedRuns.size());
+                report.configuredMaxUnits(), report.admissionState(), report.conflicts());
     }
 
     private void recoverToolJobAnchors() {
@@ -111,11 +113,18 @@ public class ToolJobStartupRecovery {
             try {
                 String resumeState = anchor.getResumeState();
                 if ("CONSUMED".equals(resumeState)) {
-                    // Token-gated durable clear before Redis (same order as tryResume)
+                    // Token-gated durable clear before Redis. Only delete Redis if
+                    // the durable clear succeeds. Same contract as tryResume(CONSUMED).
                     String token = anchor.getResumeToken();
+                    boolean cleared = false;
                     if (token != null && !token.isBlank()) {
-                        anchorService.clearAnchorWithToken(run.getId(), "CONSUMED", token,
-                                anchor.getResumeLeaseVersion());
+                        cleared = anchorService.clearAnchorWithToken(run.getId(), "CONSUMED",
+                                token, anchor.getResumeLeaseVersion());
+                    }
+                    if (!cleared && token != null && !token.isBlank()) {
+                        // Durable clear failed — leave Redis intact for retry
+                        log.warn("Startup CONSUMED clear failed for run={}, leaving Redis for retry", run.getId());
+                        continue;
                     }
                     redisCache.removeDue(run.getId());
                     redisCache.deletePendingCache(run.getId());
