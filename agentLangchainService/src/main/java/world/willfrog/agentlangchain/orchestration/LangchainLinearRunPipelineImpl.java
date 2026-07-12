@@ -319,8 +319,10 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
 
             if (result.isSuspended()) {
                 if (!persistToolJobCheckpoint(runId, result)) {
-                    log.error("Durable tool-job checkpoint failed for run={} todo={}",
+                    log.error("Durable tool-job checkpoint failed for run={} todo={} — " +
+                            "refusing to publish TOOL_CALL_SUSPENDED; run remains in current state for retry",
                             runId, result.getSuspendedTodoId());
+                    return;
                 }
                 Map<String, Object> payload = new LinkedHashMap<>();
                 payload.put("run_id", runId);
@@ -496,11 +498,21 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             ));
 
             BooleanSupplier consumeAndEnterExecution = () -> {
+                // Phase 1: durably persist EXECUTING before clearing the anchor.
+                // If we crash after clearing but before status update, the anchor is lost
+                // and the run is stuck in RECEIVED — unrecoverable.
+                int rows = runMapper.updateStatus(runId, userId, AgentRunStatus.EXECUTING);
+                if (rows == 0) {
+                    log.error("Resumed run={} status CAS to EXECUTING returned 0 rows; " +
+                            "refusing to consume terminal result", runId);
+                    return false;
+                }
+                markRunStatus(runId, AgentRunStatus.EXECUTING);
+                // Phase 2: now it is safe to clear the old anchor.
+                // If consume fails, restart sees EXECUTING + anchor and can retry.
                 if (terminalConsumed == null || !terminalConsumed.getAsBoolean()) {
                     return false;
                 }
-                runMapper.updateStatus(runId, userId, AgentRunStatus.EXECUTING);
-                markRunStatus(runId, AgentRunStatus.EXECUTING);
                 return true;
             };
             LangchainLinearWorkflowResult result = linearWorkflowExecutor.resumePlanned(
@@ -535,7 +547,11 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         String runId = run.getId();
         String userId = run.getUserId();
         if (result.isSuspended()) {
-            persistToolJobCheckpoint(runId, result);
+            if (!persistToolJobCheckpoint(runId, result)) {
+                log.error("Durable tool-job checkpoint failed for resumed run={} — " +
+                        "refusing to publish TOOL_CALL_SUSPENDED", runId);
+                return;
+            }
             eventService.append(runId, userId, "TOOL_CALL_SUSPENDED", Map.of(
                     "run_id", runId,
                     "tool_call_id", nvl(result.getPendingToolCallId()),

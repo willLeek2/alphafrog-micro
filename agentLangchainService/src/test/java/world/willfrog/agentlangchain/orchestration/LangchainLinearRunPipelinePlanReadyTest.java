@@ -17,6 +17,7 @@ import world.willfrog.agentlangchain.failure.LangchainFailureMapper;
 import world.willfrog.agentlangchain.orchestration.dag.LangchainDagWorkflowExecutor;
 import world.willfrog.agentlangchain.planning.LangchainAiPlanner;
 import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
+import world.willfrog.agentlangchain.tooljob.ToolJobCheckpointWriter;
 
 import java.util.List;
 import java.util.Map;
@@ -38,7 +39,7 @@ class LangchainLinearRunPipelinePlanReadyTest {
 
     @Test
     @SuppressWarnings("unchecked")
-    void executeRun_shouldEmitSuspendedAndNotPersistTerminalState() {
+    void executeRun_shouldEmitSuspendedAndNotPersistTerminalState() throws Exception {
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
         AgentEventService eventService = mock(AgentEventService.class);
         AgentRunStateStore stateStore = mock(AgentRunStateStore.class);
@@ -50,6 +51,9 @@ class LangchainLinearRunPipelinePlanReadyTest {
         run.setId("run-pending-1");
         run.setUserId("user-1");
         run.setExt("{}");
+        run.setToolJobAnchorJson("""
+                {"operationId":"run-pending-1:tc-pending:1","toolCallId":"tc-pending",\
+                "attempt":1,"taskId":"task-1","checkpointVersion":0}""");
         when(runMapper.findById("run-pending-1")).thenReturn(run);
         when(eventService.isRunnable("run-pending-1", "user-1")).thenReturn(true);
         when(eventService.extractRunConfig("{}")).thenReturn(AgentEventService.RunConfig.defaults());
@@ -77,6 +81,10 @@ class LangchainLinearRunPipelinePlanReadyTest {
         when(followUp.resolve(run)).thenReturn(new LangchainFollowUpContextSupport.ExecutionContext("goal", ""));
         AgentCreditService creditService = mock(AgentCreditService.class);
         when(creditService.hasPositiveCredit("user-1")).thenReturn(true);
+        var registry = mock(world.willfrog.agent.workflow.AgentRunDatasetRegistry.class);
+        when(registry.snapshot("run-pending-1")).thenReturn(world.willfrog.agent.workflow.AgentRunDatasetSnapshot.empty());
+        ObjectProvider<world.willfrog.agent.workflow.AgentRunDatasetRegistry> registryProvider = mock(ObjectProvider.class);
+        when(registryProvider.getIfAvailable()).thenReturn(registry);
         LangchainLinearRunPipelineImpl pipeline = new LangchainLinearRunPipelineImpl(
                 planner, linear, mock(LangchainDagWorkflowExecutor.class), stageModelResolver,
                 runMapper, eventService, new ObjectMapper(), mock(ObjectProvider.class), stateStoreProvider,
@@ -84,7 +92,12 @@ class LangchainLinearRunPipelinePlanReadyTest {
                 mock(world.willfrog.agent.platform.service.AgentMessageService.class), executionGuard,
                 immediateScheduler(), creditService, mock(AgentRunCreditSettlementService.class),
                 mock(world.willfrog.agent.platform.event.AgentRunFinalizationService.class),
-                mock(ObjectProvider.class), mock(ObjectProvider.class));
+                registryProvider, mock(ObjectProvider.class));
+        ToolJobCheckpointWriter checkpointWriter = mock(ToolJobCheckpointWriter.class);
+        when(checkpointWriter.captureAndSave(any())).thenReturn(true);
+        java.lang.reflect.Field cwField = LangchainLinearRunPipelineImpl.class.getDeclaredField("toolJobCheckpointWriter");
+        cwField.setAccessible(true);
+        cwField.set(pipeline, checkpointWriter);
 
         pipeline.executeRun(run);
 
