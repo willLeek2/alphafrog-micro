@@ -84,7 +84,7 @@ public class ToolJobReconciler {
             String status = statusResp.getStatus();
 
             if (SUCCEEDED.equals(status) || FAILED.equals(status) || CANCELED.equals(status)) {
-                TaskResultResponse resultResp = fetchResult(taskId, runId);
+                TaskResultResponse resultResp = fetchResult(taskId, runId, status);
                 if (resultResp == null) {
                     // Result not yet available — retry later
                     anchor.setNextPollAt(Instant.now().plusMillis(config.getPollIntervalMs()));
@@ -106,16 +106,33 @@ public class ToolJobReconciler {
         }
     }
 
-    private TaskResultResponse fetchResult(String taskId, String runId) {
+    private TaskResultResponse fetchResult(String taskId, String runId, String expectedStatus) {
         try {
             TaskResultResponse resp = sandboxService.getTaskResult(
                     GetTaskResultRequest.newBuilder().setTaskId(taskId).build());
             if (resp == null) return null;
-            // Validate: response must have status and non-empty payload
             String status = resp.getStatus();
             if (status == null || status.isBlank()) {
                 log.warn("fetchResult: empty status for taskId={}, run={}", taskId, runId);
                 return null;
+            }
+            if (!status.equals(expectedStatus)) {
+                log.warn("fetchResult: status mismatch for taskId={} expected={} got={}", taskId, expectedStatus, status);
+                return null;
+            }
+            // Validate: SUCCEEDED must have stdout or datasetDir; FAILED/CANCELED must have error
+            if ("SUCCEEDED".equals(status)) {
+                String stdout = resp.getStdout();
+                String ds = resp.getDatasetDir();
+                if ((stdout == null || stdout.isBlank()) && (ds == null || ds.isBlank())) {
+                    log.warn("fetchResult: SUCCEEDED with no stdout/datasetDir for taskId={}", taskId);
+                    return null;
+                }
+            } else if ("FAILED".equals(status) || "CANCELED".equals(status)) {
+                if ((resp.getError() == null || resp.getError().isBlank())
+                        && (resp.getStderr() == null || resp.getStderr().isBlank())) {
+                    log.warn("fetchResult: {} with no error/stderr for taskId={}", status, taskId);
+                }
             }
             return resp;
         } catch (Exception e) {
@@ -133,7 +150,7 @@ public class ToolJobReconciler {
             String status = statusResp.getStatus();
             if (SUCCEEDED.equals(status) || FAILED.equals(status)
                     || CANCELED.equals(status) || NOT_FOUND.equals(status)) {
-                TaskResultResponse resultResp = fetchResult(taskId, runId);
+                TaskResultResponse resultResp = fetchResult(taskId, runId, status);
                 if (resultResp != null) {
                     // Envelope + release but autoResume=false (no CAS/READY)
                     finalizer.handleTerminal(runId, anchor, status, resultResp, false);

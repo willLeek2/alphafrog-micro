@@ -83,15 +83,18 @@ public class ToolJobAnchorService {
     }
 
     /**
-     * Atomic CAS: updates the anchor JSON only if both the run status AND the
-     * anchor's resumeState match expected values. Prevents dual-launch races.
+     * Atomic CAS: updates the anchor JSON only if the run status, resumeState,
+     * resumeToken, AND resumeLeaseVersion all match expected values.
+     * Prevents dual-launch races and stale-claim replays.
      *
      * @return true if exactly one row was updated (this caller won the claim)
      */
     public boolean casResumeState(String runId, ToolJobAnchor anchor,
-                                   AgentRunStatus expectedStatus, String expectedResumeState) {
+                                   AgentRunStatus expectedStatus, String expectedResumeState,
+                                   String expectedResumeToken, long expectedLeaseVersion) {
         int rows = agentRunMapper.casUpdateAnchorResumeState(
-                runId, anchor.toJson(), expectedStatus, expectedResumeState);
+                runId, anchor.toJson(), expectedStatus, expectedResumeState,
+                expectedResumeToken, expectedLeaseVersion);
         return rows == 1;
     }
 

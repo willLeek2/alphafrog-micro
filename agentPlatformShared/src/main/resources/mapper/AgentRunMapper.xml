@@ -351,6 +351,8 @@
         WHERE id = #{id}
           AND status = #{expectedStatus}
           AND tool_job_anchor_json #>> '{resumeState}' = #{expectedResumeState}
+          AND tool_job_anchor_json #>> '{resumeToken}' = #{expectedResumeToken}
+          AND (tool_job_anchor_json #>> '{resumeLeaseVersion}')::bigint = #{expectedLeaseVersion}
     </update>
 
     <update id="clearToolJobAnchor">

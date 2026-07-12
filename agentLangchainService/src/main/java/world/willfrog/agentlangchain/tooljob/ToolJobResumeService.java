@@ -53,19 +53,41 @@ public class ToolJobResumeService {
     }
 
     private boolean launchFromReady(String runId, ToolJobAnchor anchor) {
+        // Snapshot pre-claim identity for optimistic-lock CAS
+        String expectedToken = anchor.getResumeToken();
+        long expectedVersion = anchor.getResumeLeaseVersion();
+
+        // Increment version atomically in the claim so stale replays fail
         anchor.setResumeState("LAUNCHING");
-        if (!anchorService.casResumeState(runId, anchor, AgentRunStatus.RECEIVED, "READY")) {
+        anchor.setResumeLeaseVersion(expectedVersion + 1);
+        anchor.setResumeClaimedAt(java.time.Instant.now());
+
+        if (!anchorService.casResumeState(runId, anchor, AgentRunStatus.RECEIVED, "READY",
+                expectedToken, expectedVersion)) {
             log.info("Resume CAS READY→LAUNCHING failed for run={}", runId);
             return false;
         }
+
+        // Track claimed identity for rollback
+        String claimedToken = anchor.getResumeToken();
+        long claimedVersion = anchor.getResumeLeaseVersion();
+
         // Fail-closed: restore failure blocks resume
         if (!restoreDatasetRegistry(runId, anchor)) {
             log.error("Dataset restore failed for run={}, rolling back to READY", runId);
-            anchor.setResumeState("READY");
-            anchorService.casResumeState(runId, anchor, AgentRunStatus.RECEIVED, "LAUNCHING");
+            rollbackToReady(runId, anchor, expectedVersion, claimedToken, claimedVersion);
             return false;
         }
-        return doLaunch(runId, anchor);
+        return doLaunch(runId, anchor, expectedVersion, claimedToken, claimedVersion);
+    }
+
+    private void rollbackToReady(String runId, ToolJobAnchor anchor, long originalVersion,
+                                  String claimedToken, long claimedVersion) {
+        anchor.setResumeState("READY");
+        anchor.setResumeLeaseVersion(originalVersion);
+        anchor.setResumeClaimedAt(null);
+        anchorService.casResumeState(runId, anchor, AgentRunStatus.RECEIVED, "LAUNCHING",
+                claimedToken, claimedVersion);
     }
 
     private boolean reenterLaunching(String runId, ToolJobAnchor anchor) {
@@ -88,25 +110,23 @@ public class ToolJobResumeService {
         }
     }
 
-    private boolean doLaunch(String runId, ToolJobAnchor anchor) {
+    private boolean doLaunch(String runId, ToolJobAnchor anchor,
+                              long originalVersion, String claimedToken, long claimedVersion) {
         if (resumeLauncher == null) {
             log.warn("No resumeLauncher wired — rolling back run={}", runId);
-            anchor.setResumeState("READY");
-            anchorService.casResumeState(runId, anchor, AgentRunStatus.RECEIVED, "LAUNCHING");
+            rollbackToReady(runId, anchor, originalVersion, claimedToken, claimedVersion);
             return false;
         }
         ToolJobResumeContext ctx = buildResumeContext(runId, anchor);
         try {
             if (!resumeLauncher.launch(runId, ctx)) {
-                anchor.setResumeState("READY");
-                anchorService.casResumeState(runId, anchor, AgentRunStatus.RECEIVED, "LAUNCHING");
+                rollbackToReady(runId, anchor, originalVersion, claimedToken, claimedVersion);
                 return false;
             }
             return true;
         } catch (Exception e) {
             log.error("Launch threw for run={}, rolling back", runId, e);
-            anchor.setResumeState("READY");
-            anchorService.casResumeState(runId, anchor, AgentRunStatus.RECEIVED, "LAUNCHING");
+            rollbackToReady(runId, anchor, originalVersion, claimedToken, claimedVersion);
             return false;
         }
     }
@@ -133,17 +153,13 @@ public class ToolJobResumeService {
 
         // Token-gated durable clear FIRST, then Redis (DB before cache)
         String token = anchor.getResumeToken();
-        boolean cleared;
-        if (token != null && !token.isBlank()) {
-            cleared = anchorService.clearAnchorWithToken(runId, token);
-            if (!cleared) {
-                log.warn("Token-gated clear failed for run={} — token mismatch, retrying", runId);
-                return; // keep Redis cache, retry on next cycle
-            }
-        } else {
-            log.warn("No resumeToken for run={}, using non-gated clear", runId);
-            anchorService.clearAnchor(runId);
-            cleared = true;
+        if (token == null || token.isBlank()) {
+            log.warn("No resumeToken for run={} — refusing to clear anchor, will retry", runId);
+            return;
+        }
+        if (!anchorService.clearAnchorWithToken(runId, token)) {
+            log.warn("Token-gated clear failed for run={} — token mismatch, retrying", runId);
+            return; // keep Redis cache, retry on next cycle
         }
         redisCache.removeDue(runId);
         redisCache.deletePendingCache(runId);

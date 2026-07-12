@@ -126,13 +126,15 @@ public interface AgentRunMapper {
     List<AgentRun> listResumeReadyAnchors(@Param("limit") int limit);
 
     /**
-     * 原子 CAS 更新 resmeState：同时约束 status 和 JSON 内的 resumeState 字段。
-     * 防止两个进程同时读取 READY 后双 launch。
+     * 原子 CAS 更新 resmeState：同时约束 status、JSON 内的 resumeState、resumeToken、resumeLeaseVersion 字段。
+     * 防止两个进程同时读取 READY 后双 launch，以及过期 token/version 的陈旧声明。
      */
     int casUpdateAnchorResumeState(@Param("id") String id,
                                    @Param("toolJobAnchorJson") String toolJobAnchorJson,
                                    @Param("expectedStatus") AgentRunStatus expectedStatus,
-                                   @Param("expectedResumeState") String expectedResumeState);
+                                   @Param("expectedResumeState") String expectedResumeState,
+                                   @Param("expectedResumeToken") String expectedResumeToken,
+                                   @Param("expectedLeaseVersion") long expectedLeaseVersion);
 
     /** Clear tool_job_anchor_json to {} so the partial index stops matching. */
     int clearToolJobAnchor(@Param("id") String id);
