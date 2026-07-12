@@ -12,10 +12,13 @@ import world.willfrog.agent.platform.model.AgentRunStatus;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+
+import org.mockito.ArgumentCaptor;
 
 @ExtendWith(MockitoExtension.class)
 class ToolJobAnchorServiceTest {
@@ -102,6 +105,117 @@ class ToolJobAnchorServiceTest {
                 .thenReturn(0);
 
         boolean result = anchorService.casUpdateStatus("run-1", AgentRunStatus.RECEIVED, AgentRunStatus.WAITING_TOOL_JOB);
+        assertThat(result).isFalse();
+    }
+
+    // ---- CAS predicate binding tests (verify SQL WHERE clause arguments) ----
+
+    @Test
+    void shouldBindTokenVersionAndStateInClaimCas() {
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId("run-1:tc-1:1");
+        anchor.setResumeState("LAUNCHING");
+        anchor.setResumeToken("claim-token-xyz");
+        anchor.setResumeLeaseVersion(7);
+
+        when(agentRunMapper.casUpdateAnchorResumeState(eq("run-1"), anyString(),
+                eq(AgentRunStatus.RECEIVED), eq("READY"), eq("claim-token-xyz"), eq(6L)))
+                .thenReturn(1);
+
+        boolean result = anchorService.casResumeState("run-1", anchor,
+                AgentRunStatus.RECEIVED, "READY", "claim-token-xyz", 6L);
+        assertThat(result).isTrue();
+    }
+
+    @Test
+    void shouldFailClaimWhenTokenMismatchInPredicate() {
+        // DB has token-v2, but caller passes token-v1 → 0 rows matched
+        when(agentRunMapper.casUpdateAnchorResumeState(eq("run-1"), anyString(),
+                eq(AgentRunStatus.RECEIVED), eq("READY"), eq("token-v1"), eq(5L)))
+                .thenReturn(0);
+
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setResumeToken("token-v1");
+        anchor.setResumeLeaseVersion(5);
+
+        boolean result = anchorService.casResumeState("run-1", anchor,
+                AgentRunStatus.RECEIVED, "READY", "token-v1", 5L);
+        assertThat(result).isFalse();
+    }
+
+    @Test
+    void shouldFailClaimWhenVersionMismatchInPredicate() {
+        // DB has version 8, but caller passes version 5 → 0 rows
+        when(agentRunMapper.casUpdateAnchorResumeState(eq("run-1"), anyString(),
+                eq(AgentRunStatus.RECEIVED), eq("LAUNCHING"), eq("token-v1"), eq(5L)))
+                .thenReturn(0);
+
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setResumeToken("token-v1");
+        anchor.setResumeLeaseVersion(5);
+
+        boolean result = anchorService.casResumeState("run-1", anchor,
+                AgentRunStatus.RECEIVED, "LAUNCHING", "token-v1", 5L);
+        assertThat(result).isFalse();
+    }
+
+    @Test
+    void shouldDoubleClaimOnlyFirstWins() {
+        // Two callers race on same READY anchor; first gets rows=1, second gets rows=0
+        when(agentRunMapper.casUpdateAnchorResumeState(eq("run-1"), anyString(),
+                eq(AgentRunStatus.RECEIVED), eq("READY"), eq("token-race"), eq(3L)))
+                .thenReturn(1)  // first caller wins
+                .thenReturn(0); // second caller loses
+
+        ToolJobAnchor a1 = new ToolJobAnchor();
+        a1.setResumeToken("token-race");
+        a1.setResumeLeaseVersion(3);
+
+        ToolJobAnchor a2 = new ToolJobAnchor();
+        a2.setResumeToken("token-race");
+        a2.setResumeLeaseVersion(3);
+
+        boolean first = anchorService.casResumeState("run-1", a1,
+                AgentRunStatus.RECEIVED, "READY", "token-race", 3L);
+        boolean second = anchorService.casResumeState("run-1", a2,
+                AgentRunStatus.RECEIVED, "READY", "token-race", 3L);
+
+        assertThat(first).isTrue();
+        assertThat(second).isFalse();
+    }
+
+    @Test
+    void shouldBindStateTokenVersionInConsumedClear() {
+        when(agentRunMapper.clearToolJobAnchorWithToken(
+                eq("run-1"), eq("CONSUMED"), eq("clear-token-99"), eq(12L)))
+                .thenReturn(1);
+
+        boolean result = anchorService.clearAnchorWithToken("run-1", "CONSUMED",
+                "clear-token-99", 12L);
+        assertThat(result).isTrue();
+    }
+
+    @Test
+    void shouldFailConsumedClearWhenStateMismatch() {
+        // Anchor was re-claimed (state no longer CONSUMED) → 0 rows
+        when(agentRunMapper.clearToolJobAnchorWithToken(
+                eq("run-1"), eq("CONSUMED"), eq("old-token"), eq(5L)))
+                .thenReturn(0);
+
+        boolean result = anchorService.clearAnchorWithToken("run-1", "CONSUMED",
+                "old-token", 5L);
+        assertThat(result).isFalse();
+    }
+
+    @Test
+    void shouldFailConsumedClearWhenVersionMismatch() {
+        // Version was bumped by a new claim → 0 rows
+        when(agentRunMapper.clearToolJobAnchorWithToken(
+                eq("run-1"), eq("CONSUMED"), eq("token-v1"), eq(3L)))
+                .thenReturn(0);
+
+        boolean result = anchorService.clearAnchorWithToken("run-1", "CONSUMED",
+                "token-v1", 3L);
         assertThat(result).isFalse();
     }
 }
