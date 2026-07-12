@@ -11,5 +11,6 @@ public enum AgentRunStatus {
     FAILED,
     CANCELING,  // 正在取消中，用于通知执行线程停止
     CANCELED,
-    EXPIRED;
+    EXPIRED,
+    WAITING_TOOL_JOB; // 外部工具作业未结束，完成后允许自动恢复
 }

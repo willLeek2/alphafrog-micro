@@ -17,6 +17,7 @@
         <result property="updatedAt" column="updated_at"/>
         <result property="completedAt" column="completed_at"/>
         <result property="ext" column="ext"/>
+        <result property="toolJobAnchorJson" column="tool_job_anchor_json"/>
         <result property="durationMs" column="duration_ms"/>
         <result property="totalTokens" column="total_tokens"/>
         <result property="toolCalls" column="tool_calls"/>
@@ -24,10 +25,10 @@
 
     <insert id="insert" parameterType="world.willfrog.agent.platform.entity.AgentRun">
         INSERT INTO alphafrog_agent_run
-        (id, user_id, status, current_step, max_steps, plan_json, snapshot_json, last_error, ttl_expires_at, ext)
+        (id, user_id, status, current_step, max_steps, plan_json, snapshot_json, last_error, ttl_expires_at, ext, tool_job_anchor_json)
         VALUES
         (#{id}, #{userId}, #{status}, #{currentStep}, #{maxSteps},
-         CAST(#{planJson} AS jsonb), CAST(#{snapshotJson} AS jsonb), #{lastError}, #{ttlExpiresAt}, CAST(#{ext} AS jsonb))
+         CAST(#{planJson} AS jsonb), CAST(#{snapshotJson} AS jsonb), #{lastError}, #{ttlExpiresAt}, CAST(#{ext} AS jsonb), CAST(#{toolJobAnchorJson} AS jsonb))
     </insert>
 
     <select id="findById" resultMap="AgentRunResultMap">
@@ -43,7 +44,8 @@
                started_at,
                updated_at,
                completed_at,
-               ext::text AS ext
+               ext::text AS ext,
+               tool_job_anchor_json::text AS tool_job_anchor_json
         FROM alphafrog_agent_run
         WHERE id = #{id}
         LIMIT 1
@@ -62,7 +64,8 @@
                started_at,
                updated_at,
                completed_at,
-               ext::text AS ext
+               ext::text AS ext,
+               tool_job_anchor_json::text AS tool_job_anchor_json
         FROM alphafrog_agent_run
         WHERE id = #{id}
           AND user_id = #{userId}
@@ -155,6 +158,7 @@
                updated_at,
                completed_at,
                ext::text AS ext,
+               tool_job_anchor_json::text AS tool_job_anchor_json,
                0 AS duration_ms,
                0 AS total_tokens,
                0 AS tool_calls
@@ -259,5 +263,58 @@
         WHERE id = #{id}
           AND user_id = #{userId}
     </delete>
+
+    <!-- ===== Tool Job Anchor ===== -->
+
+    <update id="updateToolJobAnchor">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = CAST(#{toolJobAnchorJson} AS jsonb),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status = #{expectedStatus}
+    </update>
+
+    <update id="updateToolJobAnchorAndStatus">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = CAST(#{toolJobAnchorJson} AS jsonb),
+            status = #{newStatus},
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status = #{expectedStatus}
+    </update>
+
+    <update id="casUpdateStatus">
+        UPDATE alphafrog_agent_run
+        SET status = #{newStatus},
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status = #{expectedStatus}
+    </update>
+
+    <select id="listActiveToolJobAnchors" resultMap="AgentRunResultMap">
+        SELECT id,
+               user_id,
+               status,
+               current_step,
+               max_steps,
+               plan_json::text AS plan_json,
+               snapshot_json::text AS snapshot_json,
+               last_error,
+               ttl_expires_at,
+               started_at,
+               updated_at,
+               completed_at,
+               ext::text AS ext,
+               tool_job_anchor_json::text AS tool_job_anchor_json,
+               0 AS duration_ms,
+               0 AS total_tokens,
+               0 AS tool_calls
+        FROM alphafrog_agent_run
+        WHERE tool_job_anchor_json IS NOT NULL
+          AND tool_job_anchor_json &lt;&gt; '{}'::jsonb
+          AND status IN ('WAITING_TOOL_JOB')
+        ORDER BY updated_at ASC
+        LIMIT #{limit}
+    </select>
 
 </mapper>

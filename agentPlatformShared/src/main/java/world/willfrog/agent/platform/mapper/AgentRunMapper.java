@@ -86,4 +86,36 @@ public interface AgentRunMapper {
      * @return 实际删除的记录数（成功为 1，未找到匹配记录为 0）
      */
     int deleteByIdAndUser(@Param("id") String id, @Param("userId") String userId);
+
+    // ===== Tool Job Anchor =====
+
+    /**
+     * 原子更新 tool_job_anchor_json，带前置状态条件（Compare-And-Set）。
+     * 更新 1 行表示当前调用者获得更新权；更新 0 行表示状态已变更。
+     */
+    int updateToolJobAnchor(@Param("id") String id,
+                            @Param("toolJobAnchorJson") String toolJobAnchorJson,
+                            @Param("expectedStatus") AgentRunStatus expectedStatus);
+
+    /**
+     * 原子更新 tool_job_anchor_json 和 status，带前置状态条件。
+     */
+    int updateToolJobAnchorAndStatus(@Param("id") String id,
+                                     @Param("toolJobAnchorJson") String toolJobAnchorJson,
+                                     @Param("newStatus") AgentRunStatus newStatus,
+                                     @Param("expectedStatus") AgentRunStatus expectedStatus);
+
+    /**
+     * 条件更新 status（CAS）：只有当前状态等于 expectedStatus 时才更新。
+     * 返回 1 表示获得变更权，0 表示已被其他流程变更。
+     */
+    int casUpdateStatus(@Param("id") String id,
+                        @Param("newStatus") AgentRunStatus newStatus,
+                        @Param("expectedStatus") AgentRunStatus expectedStatus);
+
+    /**
+     * 列出存在活跃 tool job anchor 的 run，用于 reconciler 周期补扫。
+     * 返回非终态 + WAITING_TOOL_JOB + RESULT_FETCH_PENDING 的 run。
+     */
+    List<AgentRun> listActiveToolJobAnchors(@Param("limit") int limit);
 }
