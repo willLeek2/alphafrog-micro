@@ -57,6 +57,17 @@ public class ToolJobAnchorService {
     }
 
     /**
+     * Narrow PostgreSQL JSONB merge for checkpoint-failure ownership. It does
+     * not replace reservation/terminal fields and binds the failed checkpoint
+     * identity so a stale pipeline cannot poison a newer external job.
+     */
+    public boolean markCheckpointFailed(String runId, ToolJobAnchor anchor, String error) {
+        return agentRunMapper.markToolJobCheckpointFailed(
+                runId, anchor.getOperationId(), anchor.getToolCallId(),
+                anchor.getAttempt(), anchor.getCheckpointVersion(), error) == 1;
+    }
+
+    /**
      * CAS-update only the run status.
      *
      * @return true if the status was changed by this call

@@ -283,6 +283,24 @@
           AND status = #{expectedStatus}
     </update>
 
+    <update id="markToolJobCheckpointFailed">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = tool_job_anchor_json || jsonb_build_object(
+                'autoResume', false,
+                'runDisposition', 'CHECKPOINT_FAILED',
+                'finalizerError', #{finalizerError}
+            ),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status = 'WAITING_TOOL_JOB'
+          AND tool_job_anchor_json IS NOT NULL
+          AND tool_job_anchor_json &lt;&gt; '{}'::jsonb
+          AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{operationId}
+          AND tool_job_anchor_json -&gt;&gt; 'toolCallId' = #{toolCallId}
+          AND COALESCE((tool_job_anchor_json -&gt;&gt; 'attempt')::integer, 0) = #{attempt}
+          AND COALESCE((tool_job_anchor_json -&gt;&gt; 'checkpointVersion')::integer, 0) = #{checkpointVersion}
+    </update>
+
     <update id="casUpdateStatus">
         UPDATE alphafrog_agent_run
         SET status = #{newStatus},

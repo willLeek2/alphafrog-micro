@@ -323,6 +323,36 @@ class ToolJobAnchorMapperIntegrationTest {
         assertThat(a.getCheckpointVersion()).isEqualTo(1);
     }
 
+    @Test
+    void checkpointFailureMergeOwnsWaitingRunAndPreservesAnchor() throws Exception {
+        insertRun("run-f1", "WAITING_TOOL_JOB", """
+            {"operationId":"run-f1:tc-1:1","toolCallId":"tc-1","attempt":1,"checkpointVersion":3,"reservationJson":"keep","terminalStatus":"SUCCEEDED"}""");
+
+        int rows = newMapper().markToolJobCheckpointFailed(
+                "run-f1", "run-f1:tc-1:1", "tc-1", 1, 3,
+                "durable_checkpoint_write_failed");
+
+        assertThat(rows).isEqualTo(1);
+        ToolJobAnchor anchor = ToolJobAnchor.fromJson(
+                newMapper().findById("run-f1").getToolJobAnchorJson());
+        assertThat(anchor.isAutoResume()).isFalse();
+        assertThat(anchor.getRunDisposition()).isEqualTo("CHECKPOINT_FAILED");
+        assertThat(anchor.getFinalizerError()).isEqualTo("durable_checkpoint_write_failed");
+        assertThat(anchor.getReservationJson()).isEqualTo("keep");
+        assertThat(anchor.getTerminalStatus()).isEqualTo("SUCCEEDED");
+    }
+
+    @Test
+    void checkpointFailureMergeRejectsStaleIdentityAndVersion() throws Exception {
+        insertRun("run-f2", "WAITING_TOOL_JOB", """
+            {"operationId":"run-f2:tc-1:1","toolCallId":"tc-1","attempt":1,"checkpointVersion":4}""");
+
+        assertThat(newMapper().markToolJobCheckpointFailed(
+                "run-f2", "run-f2:tc-1:1", "tc-1", 1, 3, "err")).isZero();
+        assertThat(newMapper().markToolJobCheckpointFailed(
+                "run-f2", "run-f2:tc-2:1", "tc-2", 1, 4, "err")).isZero();
+    }
+
     // ========== casUpdateAnchorResumeState: claim CAS ==========
 
     @Test

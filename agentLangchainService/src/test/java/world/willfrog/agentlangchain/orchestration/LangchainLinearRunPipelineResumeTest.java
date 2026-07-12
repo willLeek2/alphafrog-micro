@@ -22,6 +22,7 @@ import java.lang.reflect.Field;
 import java.util.List;
 import java.util.Optional;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
@@ -48,6 +49,9 @@ class LangchainLinearRunPipelineResumeTest {
         run.setExt("{}");
         run.setPlanJson(objectMapper.writeValueAsString(plan));
         when(runMapper.findById("run-1")).thenReturn(run);
+        when(runMapper.updateSnapshot(eq("run-1"), eq("user-1"),
+                eq(world.willfrog.agent.platform.model.AgentRunStatus.COMPLETED),
+                any(), eq(true), isNull())).thenReturn(1);
         when(events.isRunnable("run-1", "user-1")).thenReturn(true);
         when(events.extractRunConfig("{}")).thenReturn(AgentEventService.RunConfig.defaults());
         ChatModel model = mock(ChatModel.class);
@@ -79,7 +83,7 @@ class LangchainLinearRunPipelineResumeTest {
         context.setResumeLeaseVersion(3);
         context.setToolCallsUsed(4);
 
-        pipeline.executeResumedRun(run, context, () -> true);
+        assertThat(pipeline.executeResumedRun(run, context, () -> true)).isTrue();
 
         verifyNoInteractions(planner);
         verify(linear).resumePlanned(any(), eq(plan), same(context), any());
@@ -112,11 +116,25 @@ class LangchainLinearRunPipelineResumeTest {
         anchorServiceField.set(pipeline, anchorService);
         clearInvocations(events);
 
-        pipeline.executeResumedRun(run, context, () -> true);
+        assertThat(pipeline.executeResumedRun(run, context, () -> true)).isFalse();
 
         verify(events, never()).append(eq("run-1"), eq("user-1"),
                 eq("TOOL_CALL_SUSPENDED"), any());
         verify(events).appendOnce(eq("run-1"), eq("user-1"),
                 eq("TOOL_JOB_CHECKPOINT_FAILED"), any(), any());
+
+        when(linear.resumePlanned(any(), any(), any(), any())).thenReturn(
+                LangchainLinearWorkflowResult.builder()
+                        .success(true).finalAnswer("not-durable").plan(plan)
+                        .completedTodos(List.of()).build());
+        when(runMapper.updateSnapshot(eq("run-1"), eq("user-1"),
+                eq(world.willfrog.agent.platform.model.AgentRunStatus.COMPLETED),
+                any(), eq(true), isNull())).thenReturn(0);
+        assertThat(pipeline.executeResumedRun(run, context, () -> true)).isFalse();
+
+        when(runMapper.updateSnapshot(eq("run-1"), eq("user-1"),
+                eq(world.willfrog.agent.platform.model.AgentRunStatus.COMPLETED),
+                any(), eq(true), isNull())).thenThrow(new IllegalStateException("db-write-failed"));
+        assertThat(pipeline.executeResumedRun(run, context, () -> true)).isFalse();
     }
 }
