@@ -41,6 +41,9 @@ public class ToolJobUsageHookImpl implements ToolJobUsageHook {
         if (anchor == null) {
             throw new IllegalArgumentException("anchor must not be null");
         }
+        if (anchor.getTerminalRetryable() == null) {
+            throw new IllegalArgumentException("terminalRetryable must be durably classified");
+        }
         DataAnalysisReservation stored = objectMapper.readValue(
                 anchor.getReservationJson(), DataAnalysisReservation.class);
         DataAnalysisReservation confirmed = new DataAnalysisReservation(
@@ -73,7 +76,7 @@ public class ToolJobUsageHookImpl implements ToolJobUsageHook {
                 rawRef,
                 errorCode,
                 success ? null : "sandbox " + terminalStatus,
-                !success && !"RESULT_LOST".equals(terminalStatus),
+                Boolean.TRUE.equals(anchor.getTerminalRetryable()),
                 estimate,
                 confirmed,
                 usage,

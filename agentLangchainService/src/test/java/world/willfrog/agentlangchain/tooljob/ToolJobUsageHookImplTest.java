@@ -127,6 +127,32 @@ class ToolJobUsageHookImplTest {
         verify(recorder, never()).upsert(any());
     }
 
+    @Test
+    void consumesDurableRetryabilityInsteadOfGuessingFromTerminalStatus() throws Exception {
+        ToolJobAnchor canceled = anchor();
+        canceled.setTerminalStatus("CANCELED");
+        canceled.setTerminalRetryable(false);
+        ToolJobAnchor oom = anchor();
+        oom.setTerminalStatus("FAILED");
+        oom.setTerminalRetryable(true);
+        ToolJobAnchor resultLost = anchor();
+        resultLost.setTerminalStatus("RESULT_LOST");
+        resultLost.setTerminalRetryable(false);
+
+        assertThat(hook.toEnvelope("run-1", canceled).retryable()).isFalse();
+        assertThat(hook.toEnvelope("run-1", oom).retryable()).isTrue();
+        assertThat(hook.toEnvelope("run-1", resultLost).retryable()).isFalse();
+    }
+
+    @Test
+    void missingDurableRetryabilityFailsClosedBeforeRecorder() throws Exception {
+        ToolJobAnchor anchor = anchor();
+        anchor.setTerminalRetryable(null);
+
+        assertThat(hook.upsertUsage("run-1", anchor)).isFalse();
+        verify(recorder, never()).upsert(any());
+    }
+
     private ToolJobAnchor anchor() throws Exception {
         DataAnalysisOperationIdentity identity = new DataAnalysisOperationIdentity("run-1", "call-1", 1);
         DataAnalysisReservation released = new DataAnalysisReservation(
@@ -143,6 +169,7 @@ class ToolJobUsageHookImplTest {
         anchor.setReservationJson(objectMapper.writeValueAsString(released));
         anchor.setEstimateJson(objectMapper.writeValueAsString(estimate));
         anchor.setTerminalStatus("SUCCEEDED");
+        anchor.setTerminalRetryable(false);
         anchor.setTerminalResultPreview("ok");
         anchor.setTerminalAt(Instant.parse("2026-07-12T00:01:00Z"));
         anchor.setTerminalUsageJson("""
