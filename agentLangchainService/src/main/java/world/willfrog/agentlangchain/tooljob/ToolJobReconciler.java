@@ -110,33 +110,7 @@ public class ToolJobReconciler {
         try {
             TaskResultResponse resp = sandboxService.getTaskResult(
                     GetTaskResultRequest.newBuilder().setTaskId(taskId).build());
-            if (resp == null) return null;
-            String status = resp.getStatus();
-            if (status == null || status.isBlank()) {
-                log.warn("fetchResult: empty status for taskId={}, run={}", taskId, runId);
-                return null;
-            }
-            if (!status.equals(expectedStatus)) {
-                log.warn("fetchResult: status mismatch for taskId={} expected={} got={}", taskId, expectedStatus, status);
-                return null;
-            }
-            // Validate: SUCCEEDED must have stdout or datasetDir; FAILED/CANCELED must have error
-            if ("SUCCEEDED".equals(status)) {
-                String stdout = resp.getStdout();
-                String ds = resp.getDatasetDir();
-                if ((stdout == null || stdout.isBlank()) && (ds == null || ds.isBlank())) {
-                    log.warn("fetchResult: SUCCEEDED with no stdout/datasetDir for taskId={}", taskId);
-                    return null;
-                }
-            } else if ("FAILED".equals(status) || "CANCELED".equals(status)) {
-                if ((resp.getError() == null || resp.getError().isBlank())
-                        && (resp.getStderr() == null || resp.getStderr().isBlank())) {
-                    log.warn("fetchResult: {} with no error/stderr for taskId={}, retrying",
-                            status, taskId);
-                    return null;
-                }
-            }
-            return resp;
+            return ToolJobResultValidator.validate(taskId, runId, resp, expectedStatus);
         } catch (Exception e) {
             log.error("Failed to fetch result for taskId={}, run={}", taskId, runId, e);
             return null;

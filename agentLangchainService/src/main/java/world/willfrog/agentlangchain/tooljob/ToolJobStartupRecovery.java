@@ -160,8 +160,8 @@ public class ToolJobStartupRecovery {
             if ("SUCCEEDED".equals(status) || "FAILED".equals(status) || "CANCELED".equals(status)) {
                 TaskResultResponse resultResp = sandboxService.getTaskResult(
                         GetTaskResultRequest.newBuilder().setTaskId(taskId).build());
-                // Validate result before passing to finalizer (matching reconciler.fetchResult)
-                if (!isValidTerminalResult(resultResp, status)) {
+                // Shared validator (same as Reconciler.fetchResult)
+                if (ToolJobResultValidator.validate(taskId, run.getId(), resultResp, status) == null) {
                     log.warn("Startup recovery: invalid terminal result for run={}, taskId={}, will retry",
                             run.getId(), taskId);
                     anchor.setNextPollAt(Instant.now().plusMillis(config.getReconcilerIntervalMs()));
@@ -186,21 +186,4 @@ public class ToolJobStartupRecovery {
         }
     }
 
-    /** Validates terminal result payload matches reconciler.fetchResult checks. */
-    private boolean isValidTerminalResult(TaskResultResponse resp, String expectedStatus) {
-        if (resp == null) return false;
-        String status = resp.getStatus();
-        if (status == null || status.isBlank()) return false;
-        if (!status.equals(expectedStatus)) return false;
-        if ("SUCCEEDED".equals(status)) {
-            String stdout = resp.getStdout();
-            String ds = resp.getDatasetDir();
-            return (stdout != null && !stdout.isBlank()) || (ds != null && !ds.isBlank());
-        }
-        if ("FAILED".equals(status) || "CANCELED".equals(status)) {
-            return (resp.getError() != null && !resp.getError().isBlank())
-                    || (resp.getStderr() != null && !resp.getStderr().isBlank());
-        }
-        return false;
-    }
 }

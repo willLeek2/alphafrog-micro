@@ -296,6 +296,66 @@ class ToolJobResumeServiceTest {
         verify(resumeLauncher, never()).launch(any(), any());
     }
 
+    // ---- active-token contract (§9.11 stale LAUNCHING) ----
+
+    @Test
+    void shouldNotRollbackStaleLaunchingWhenLauncherActive() {
+        // LAUNCHING past TTL, but launcher reports isActive=true → no rollback
+        ToolJobAnchor anchor = buildReadyAnchor();
+        anchor.setResumeState("LAUNCHING");
+        anchor.setResumeClaimedAt(java.time.Instant.now().minusSeconds(300)); // well past 120s TTL
+        anchor.setResumeToken("active-token");
+        anchor.setResumeLeaseVersion(10);
+
+        when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
+        when(resumeLauncher.isActive("run-1", "active-token", 10L)).thenReturn(true);
+
+        boolean result = resumeService.tryResume("run-1");
+        // Launcher still active → don't roll back, don't re-launch; launcher handles it
+        assertThat(result).isFalse();
+        verify(resumeLauncher).isActive("run-1", "active-token", 10L);
+        verify(resumeLauncher, never()).launch(any(), any());
+    }
+
+    @Test
+    void shouldRollbackStaleLaunchingWhenLauncherInactive() {
+        // LAUNCHING past TTL, launcher reports isActive=false → rollback to READY
+        ToolJobAnchor anchor = buildReadyAnchor();
+        anchor.setResumeState("LAUNCHING");
+        anchor.setResumeClaimedAt(java.time.Instant.now().minusSeconds(300)); // well past 120s TTL
+        anchor.setResumeToken("stale-token");
+        anchor.setResumeLeaseVersion(8);
+
+        when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
+        when(resumeLauncher.isActive("run-1", "stale-token", 8L)).thenReturn(false);
+        // Rollback CAS: LAUNCHING → READY with version 9
+        when(anchorService.casResumeState(eq("run-1"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.RECEIVED), eq("LAUNCHING"), eq("stale-token"), eq(8L)))
+                .thenReturn(true);
+
+        boolean result = resumeService.tryResume("run-1");
+        assertThat(result).isFalse(); // rollback, will retry as READY on next scan
+        assertThat(anchor.getResumeState()).isEqualTo("READY");
+        assertThat(anchor.getResumeLeaseVersion()).isEqualTo(9); // monotonic bump
+        assertThat(anchor.getResumeToken()).isNotEqualTo("stale-token"); // new token generated
+    }
+
+    @Test
+    void shouldConsiderActiveLaunchingWithoutClaimedAtAsStale() {
+        // LAUNCHING without claimedAt → don't rollback (claimedAt is null, skip stale check)
+        ToolJobAnchor anchor = buildReadyAnchor();
+        anchor.setResumeState("LAUNCHING");
+        anchor.setResumeClaimedAt(null); // no claimedAt set
+        anchor.setResumeToken("no-claimed-at-token");
+        anchor.setResumeLeaseVersion(3);
+
+        when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
+        when(resumeLauncher.launch(eq("run-1"), any(ToolJobResumeContext.class))).thenReturn(true);
+
+        boolean result = resumeService.tryResume("run-1");
+        assertThat(result).isTrue();
+    }
+
     // ---- helpers ----
 
     private ToolJobAnchor buildReadyAnchor() {
