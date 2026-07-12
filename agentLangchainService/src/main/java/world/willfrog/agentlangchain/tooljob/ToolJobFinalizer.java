@@ -185,21 +185,24 @@ public class ToolJobFinalizer {
 
     // ---- internal helpers ----
 
+    private static final java.util.Map<String, Integer> STEP_ORDER = java.util.Map.of(
+            STEP_ENVELOPE, 1,
+            STEP_RELEASE, 2,
+            STEP_USAGE, 3,
+            STEP_EVENT, 4,
+            STEP_CAS_STATUS, 5,
+            STEP_RESUME_READY, 6,
+            STEP_CLEANUP, 7);
+
+    /** Returns true if the anchor's current finalizer step is past the given step. */
     private boolean isBeyond(ToolJobAnchor anchor, String step) {
         String current = anchor.getFinalizerStep();
         if (current == null) {
             return false;
         }
-        return switch (current) {
-            case STEP_ENVELOPE -> !step.equals(STEP_ENVELOPE);
-            case STEP_RELEASE -> step.equals(STEP_ENVELOPE) || step.equals(STEP_RELEASE);
-            case STEP_USAGE -> !step.equals(STEP_CAS_STATUS) && !step.equals(STEP_RESUME_READY) && !step.equals(STEP_CLEANUP);
-            case STEP_EVENT -> step.equals(STEP_ENVELOPE) || step.equals(STEP_RELEASE) || step.equals(STEP_USAGE) || step.equals(STEP_EVENT);
-            case STEP_CAS_STATUS -> !step.equals(STEP_RESUME_READY) && !step.equals(STEP_CLEANUP);
-            case STEP_RESUME_READY -> !step.equals(STEP_CLEANUP);
-            case STEP_CLEANUP -> true;
-            default -> false;
-        };
+        int currentOrdinal = STEP_ORDER.getOrDefault(current, 0);
+        int stepOrdinal = STEP_ORDER.getOrDefault(step, 0);
+        return currentOrdinal > stepOrdinal;
     }
 
     private void tryReleaseReservation(ToolJobAnchor anchor) {
