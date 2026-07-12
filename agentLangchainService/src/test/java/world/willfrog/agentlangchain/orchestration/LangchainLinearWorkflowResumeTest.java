@@ -1,0 +1,121 @@
+package world.willfrog.agentlangchain.orchestration;
+
+import dev.langchain4j.model.chat.ChatModel;
+import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
+import world.willfrog.agent.platform.dataanalysis.CompletedTodoRecord;
+import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.workflow.PlanExecutionMode;
+import world.willfrog.agent.workflow.TodoItem;
+import world.willfrog.agentlangchain.planning.LangchainAiPlanner;
+import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
+import world.willfrog.agentlangchain.tooljob.ToolJobResumeContext;
+
+import java.util.List;
+import java.util.Optional;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.*;
+
+class LangchainLinearWorkflowResumeTest {
+
+    @Test
+    void resumeSkipsPlannerAndPriorTodosInjectsCurrentResultWithoutExtraToolCall() {
+        LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
+        LangchainTodoNodeExecutor nodeExecutor = mock(LangchainTodoNodeExecutor.class);
+        LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
+        AgentEventService events = mock(AgentEventService.class);
+        when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
+        when(nodeExecutor.execute(any(), any(), any(), any(), any()))
+                .thenReturn(LangchainTodoNodeResult.success("todo-3-output", 6));
+        when(nodeExecutor.writeFinalAnswer(any(), any())).thenReturn("final-answer");
+
+        LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
+                planner, nodeExecutor, guard, events);
+        LangchainTodoPlan plan = LangchainTodoPlan.builder()
+                .executionMode(PlanExecutionMode.LINEAR)
+                .items(List.of(item("todo-1", 1), item("todo-2", 2), item("todo-3", 3)))
+                .build();
+        CompletedTodoRecord prior = new CompletedTodoRecord();
+        prior.setTodoId("todo-1");
+        prior.setSequence(1);
+        prior.setDescription("todo-1-description");
+        prior.setOutput("prior-output");
+        ToolJobResumeContext context = new ToolJobResumeContext();
+        context.setRunId("run-1");
+        context.setTodoId("todo-2");
+        context.setResumeToken("token-1");
+        context.setResumeLeaseVersion(2);
+        context.setCompletedTodos(List.of(prior));
+        context.setToolCallsUsed(5);
+        context.setTerminalSuccess(true);
+        context.setTerminalResultPreview("terminal-preview");
+        context.setTerminalRawRef("artifact://result-1");
+        AtomicInteger consumed = new AtomicInteger();
+
+        LangchainLinearWorkflowResult result = executor.resumePlanned(
+                request(), plan, context, () -> {
+                    consumed.incrementAndGet();
+                    return true;
+                });
+
+        assertThat(result.isSuccess()).isTrue();
+        assertThat(result.getFinalAnswer()).isEqualTo("final-answer");
+        assertThat(result.getToolCallsUsed()).isEqualTo(5);
+        assertThat(result.getCompletedTodos()).extracting(LangchainCompletedTodo::getTodoId)
+                .containsExactly("todo-1", "todo-2", "todo-3");
+        assertThat(result.getCompletedTodos().get(1).displayOutput())
+                .contains("terminal-preview", "artifact://result-1");
+        assertThat(consumed.get()).isEqualTo(1);
+        verifyNoInteractions(planner);
+
+        ArgumentCaptor<TodoItem> executed = ArgumentCaptor.forClass(TodoItem.class);
+        verify(nodeExecutor, times(1)).execute(any(), executed.capture(), any(), any(), any());
+        assertThat(executed.getValue().getId()).isEqualTo("todo-3");
+        verify(nodeExecutor, times(1)).writeFinalAnswer(any(), any());
+    }
+
+    @Test
+    void consumeFailureStopsBeforeAnyLaterTodoAndRemainsRetryable() {
+        LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
+        LangchainTodoNodeExecutor nodeExecutor = mock(LangchainTodoNodeExecutor.class);
+        LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
+        when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
+        LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
+                planner, nodeExecutor, guard, mock(AgentEventService.class));
+        LangchainTodoPlan plan = LangchainTodoPlan.builder()
+                .executionMode(PlanExecutionMode.LINEAR)
+                .items(List.of(item("todo-2", 2), item("todo-3", 3)))
+                .build();
+        ToolJobResumeContext context = new ToolJobResumeContext();
+        context.setRunId("run-1");
+        context.setTodoId("todo-2");
+        context.setToolCallsUsed(5);
+        context.setTerminalSuccess(true);
+        context.setTerminalResultPreview("terminal-preview");
+
+        LangchainLinearWorkflowResult result = executor.resumePlanned(request(), plan, context, () -> false);
+
+        assertThat(result.isSuccess()).isFalse();
+        assertThat(result.getFailureReason()).isEqualTo("resume_result_consume_failed");
+        assertThat(result.getToolCallsUsed()).isEqualTo(5);
+        verifyNoInteractions(planner);
+        verify(nodeExecutor, never()).execute(any(), any(), any(), any(), any());
+        verify(nodeExecutor, never()).writeFinalAnswer(any(), any());
+    }
+
+    private static TodoItem item(String id, int sequence) {
+        return TodoItem.builder().id(id).sequence(sequence).description(id + "-description").build();
+    }
+
+    private static LangchainLinearWorkflowRequest request() {
+        return LangchainLinearWorkflowRequest.builder()
+                .runId("run-1")
+                .userId("user-1")
+                .userGoal("goal")
+                .model(mock(ChatModel.class))
+                .build();
+    }
+}

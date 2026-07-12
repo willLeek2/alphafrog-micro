@@ -50,12 +50,14 @@ public class ToolJobResumeService {
             // token-gated durable clear succeeds. If it fails, leave Redis intact
             // so the next scan cycle retries. Never delete Redis before DB clear.
             String token = anchor.getResumeToken();
-            if (token != null && !token.isBlank()) {
-                if (!anchorService.clearAnchorWithToken(runId, "CONSUMED", token,
-                        anchor.getResumeLeaseVersion())) {
-                    log.warn("CONSUMED durable clear failed for run={}, leaving Redis for retry", runId);
-                    return true; // anchor still CONSUMED, will retry next scan
-                }
+            if (token == null || token.isBlank()) {
+                log.warn("CONSUMED anchor has no resumeToken for run={}, leaving Redis for retry", runId);
+                return true;
+            }
+            if (!anchorService.clearAnchorWithToken(runId, "CONSUMED", token,
+                    anchor.getResumeLeaseVersion())) {
+                log.warn("CONSUMED durable clear failed for run={}, leaving Redis for retry", runId);
+                return true; // anchor still CONSUMED, will retry next scan
             }
             redisCache.removeDue(runId);
             redisCache.deletePendingCache(runId);
@@ -176,40 +178,40 @@ public class ToolJobResumeService {
         }
     }
 
-    public void markConsumed(String runId) {
+    public boolean markConsumed(String runId) {
         ToolJobAnchor anchor = anchorService.loadAnchor(runId);
-        if (anchor == null) return;
+        if (anchor == null) return false;
 
         if (!anchor.isUsagePersisted() || !anchor.isTerminalEventEmitted()) {
             log.info("Deferring cleanup for run={}: usagePersisted={} terminalEventEmitted={}",
                     runId, anchor.isUsagePersisted(), anchor.isTerminalEventEmitted());
             anchor.setResumeState("CONSUMED");
             anchor.setResultConsumed(true);
-            anchorService.updateAnchor(runId, anchor, AgentRunStatus.RECEIVED);
-            return;
+            return anchorService.updateAnchor(runId, anchor, AgentRunStatus.RECEIVED);
         }
 
         anchor.setResumeState("CONSUMED");
         anchor.setResultConsumed(true);
         if (!anchorService.updateAnchor(runId, anchor, AgentRunStatus.RECEIVED)) {
             log.warn("markConsumed anchor update CAS failed for run={}, will retry", runId);
-            return;
+            return false;
         }
 
         // Token+state+version-gated durable clear FIRST, then Redis (DB before cache)
         String token = anchor.getResumeToken();
         if (token == null || token.isBlank()) {
             log.warn("No resumeToken for run={} — refusing to clear anchor, will retry", runId);
-            return;
+            return false;
         }
         if (!anchorService.clearAnchorWithToken(runId, "CONSUMED", token,
                 anchor.getResumeLeaseVersion())) {
             log.warn("Token+state+version-gated clear failed for run={} — mismatch, retrying", runId);
-            return; // keep Redis cache, retry on next cycle
+            return false; // keep Redis cache, retry on next cycle
         }
         redisCache.removeDue(runId);
         redisCache.deletePendingCache(runId);
         log.info("Full cleanup completed for run={}", runId);
+        return true;
     }
 
     // ---- internal ----
