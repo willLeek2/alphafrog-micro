@@ -84,9 +84,15 @@ public class ToolJobReconciler {
             String status = statusResp.getStatus();
 
             if (SUCCEEDED.equals(status) || FAILED.equals(status) || CANCELED.equals(status)) {
-                // Fetch real result before calling finalizer
                 TaskResultResponse resultResp = fetchResult(taskId, runId);
-                finalizer.handleTerminal(runId, anchor, status, resultResp);
+                if (resultResp == null) {
+                    // Result not yet available — retry later
+                    anchor.setNextPollAt(Instant.now().plusMillis(config.getPollIntervalMs()));
+                    anchorService.updateAnchor(runId, anchor, AgentRunStatus.WAITING_TOOL_JOB);
+                    redisCache.upsertDue(runId, anchor);
+                    return;
+                }
+                finalizer.handleTerminal(runId, anchor, status, resultResp, true);
             } else if (NOT_FOUND.equals(status)) {
                 finalizer.handleNotFound(runId, anchor);
             } else {
@@ -119,16 +125,12 @@ public class ToolJobReconciler {
             String status = statusResp.getStatus();
             if (SUCCEEDED.equals(status) || FAILED.equals(status)
                     || CANCELED.equals(status) || NOT_FOUND.equals(status)) {
-                anchor.setTerminalStatus(status);
-                anchor.setTerminalAt(Instant.now());
-                anchorService.updateAnchor(runId, anchor, AgentRunStatus.WAITING_TOOL_JOB);
-                // Fetch result so we can release capacity
                 TaskResultResponse resultResp = fetchResult(taskId, runId);
-                finalizer.handleTerminal(runId, anchor, status, resultResp);
-                // Don't auto-resume paused runs
-                anchor.setAutoResume(false);
-                anchorService.updateAnchor(runId, anchor, AgentRunStatus.WAITING);
-            }
+                if (resultResp != null) {
+                    // Envelope + release but autoResume=false (no CAS/READY)
+                    finalizer.handleTerminal(runId, anchor, status, resultResp, false);
+                }
+        }
         } catch (Exception e) {
             log.error("Paused-terminal check error run={}", runId, e);
         }

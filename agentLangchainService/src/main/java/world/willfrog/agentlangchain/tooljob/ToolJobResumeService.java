@@ -131,8 +131,19 @@ public class ToolJobResumeService {
             return;
         }
 
-        // Durable clear FIRST, then Redis (order: DB before cache)
-        anchorService.clearAnchor(runId);
+        // Token-gated durable clear FIRST, then Redis (DB before cache)
+        String token = anchor.getResumeToken();
+        if (token != null && !token.isBlank()) {
+            if (!anchorService.clearAnchorWithToken(runId, token)) {
+                log.warn("Token-gated clear failed for run={}, token mismatch — another consumer already cleared", runId);
+                // Still clean Redis (best-effort: anchor already cleared by winner)
+                redisCache.removeDue(runId);
+                redisCache.deletePendingCache(runId);
+                return;
+            }
+        } else {
+            anchorService.clearAnchor(runId);
+        }
         redisCache.removeDue(runId);
         redisCache.deletePendingCache(runId);
         log.info("Full cleanup completed for run={}", runId);
@@ -162,6 +173,7 @@ public class ToolJobResumeService {
         ctx.setRunId(runId);
         ctx.setTodoId(anchor.getTodoId());
         ctx.setResumeToken(anchor.getResumeToken());
+        ctx.setResumeLeaseVersion(anchor.getResumeLeaseVersion());
         ctx.setCompletedTodos(parseCompletedTodos(anchor.getCompletedTodosJson()));
         ctx.setDatasetSnapshotJson(anchor.getDatasetSnapshotJson());
         ctx.setDatasetSnapshotDigest(anchor.getDatasetSnapshotDigest());

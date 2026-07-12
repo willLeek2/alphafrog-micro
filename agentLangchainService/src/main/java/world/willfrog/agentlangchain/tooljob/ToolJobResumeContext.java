@@ -14,7 +14,8 @@ public class ToolJobResumeContext {
 
     private String runId;
     private String todoId;
-    private String resumeToken;       // UUID for idempotent launch dedupe
+    private String resumeToken;
+    private long resumeLeaseVersion;  // incremented on each new claim
     private List<CompletedTodoRecord> completedTodos = Collections.emptyList();
     private String datasetSnapshotJson;
     private String datasetSnapshotDigest;
@@ -33,6 +34,9 @@ public class ToolJobResumeContext {
 
     public String getResumeToken() { return resumeToken; }
     public void setResumeToken(String resumeToken) { this.resumeToken = resumeToken; }
+
+    public long getResumeLeaseVersion() { return resumeLeaseVersion; }
+    public void setResumeLeaseVersion(long resumeLeaseVersion) { this.resumeLeaseVersion = resumeLeaseVersion; }
 
     public List<CompletedTodoRecord> getCompletedTodos() { return completedTodos; }
     public void setCompletedTodos(List<CompletedTodoRecord> completedTodos) { this.completedTodos = completedTodos; }

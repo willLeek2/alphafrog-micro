@@ -99,4 +99,12 @@ public class ToolJobAnchorService {
     public void clearAnchor(String runId) {
         agentRunMapper.clearToolJobAnchor(runId);
     }
+
+    /**
+     * Token-gated clear: only clears if the anchor's resumeToken matches.
+     * @return true if exactly one row was cleared (token matched)
+     */
+    public boolean clearAnchorWithToken(String runId, String expectedToken) {
+        return agentRunMapper.clearToolJobAnchorWithToken(runId, expectedToken) == 1;
+    }
 }

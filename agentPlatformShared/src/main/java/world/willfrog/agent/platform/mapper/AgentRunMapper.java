@@ -136,4 +136,10 @@ public interface AgentRunMapper {
 
     /** Clear tool_job_anchor_json to {} so the partial index stops matching. */
     int clearToolJobAnchor(@Param("id") String id);
+
+    /**
+     * Token-gated clear: only clears the anchor if the resumeToken matches.
+     * Returns 1 if cleared, 0 if token mismatch (another consumer already cleared).
+     */
+    int clearToolJobAnchorWithToken(@Param("id") String id, @Param("expectedToken") String expectedToken);
 }

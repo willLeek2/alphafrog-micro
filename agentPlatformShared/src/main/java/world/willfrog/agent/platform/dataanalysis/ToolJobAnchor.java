@@ -27,6 +27,10 @@ public class ToolJobAnchor {
     private boolean autoResume = true;
     private String resumeState; // READY, LAUNCHING, CONSUMED
     private String resumeToken; // UUID for idempotent launch dedupe
+    private long resumeLeaseVersion; // incremented on each new claim
+    private Instant resumeClaimedAt;
+
+    // durable estimate from admission (reused in terminal envelope)
 
     // resume context (§9.10): saved when tool job goes pending
     private String completedTodosJson;   // completed todo id list
@@ -35,6 +39,7 @@ public class ToolJobAnchor {
 
     // reservation snapshot
     private String reservationJson;
+    private String estimateJson; // durable estimate from admission (reused in terminal envelope)
 
     // dataset snapshot
     private String datasetSnapshotJson;
@@ -119,6 +124,15 @@ public class ToolJobAnchor {
 
     public String getResumeToken() { return resumeToken; }
     public void setResumeToken(String resumeToken) { this.resumeToken = resumeToken; }
+
+    public long getResumeLeaseVersion() { return resumeLeaseVersion; }
+    public void setResumeLeaseVersion(long resumeLeaseVersion) { this.resumeLeaseVersion = resumeLeaseVersion; }
+
+    public Instant getResumeClaimedAt() { return resumeClaimedAt; }
+    public void setResumeClaimedAt(Instant resumeClaimedAt) { this.resumeClaimedAt = resumeClaimedAt; }
+
+    public String getEstimateJson() { return estimateJson; }
+    public void setEstimateJson(String estimateJson) { this.estimateJson = estimateJson; }
 
     public String getCompletedTodosJson() { return completedTodosJson; }
     public void setCompletedTodosJson(String completedTodosJson) { this.completedTodosJson = completedTodosJson; }

@@ -8,21 +8,14 @@ import world.willfrog.agent.platform.dataanalysis.*;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
-import java.util.Map;
-import java.util.UUID;
+import java.util.*;
 
 /**
- * Shared reentrant finalizer for external tool jobs. Full step gate per §9.7/§9.8:
- * <ol>
- *   <li>ENVELOPE — persist sandbox terminal data (status + result/rawRef/error/usage)</li>
- *   <li>RELEASE — transition reservation → TERMINAL_CONFIRMED, build real envelope, release</li>
- *   <li>USAGE — T4 upsertUsage stub (P0: mark usagePersisted=false, T4 fills later)</li>
- *   <li>EVENT — Codex appendOnce stub (P0: mark terminalEventEmitted=false)</li>
- *   <li>CAS_STATUS — WAITING_TOOL_JOB → RECEIVED</li>
- *   <li>RESUME_READY — mark ready + generate token + try resume</li>
- * </ol>
- * Cleanup is deferred until usagePersisted && terminalEventEmitted.
+ * Shared reentrant finalizer per §9.7/§9.8. Each step records outcome in the
+ * durable anchor; re-entry resumes from the first incomplete step (isStepDone
+ * uses {@code >=} so a completed step is not re-executed).
  */
 @Service
 public class ToolJobFinalizer {
@@ -44,37 +37,35 @@ public class ToolJobFinalizer {
     private final ToolJobRedisCache redisCache;
     private final DataAnalysisCapacityService capacityService;
     private final ToolJobResumeService resumeService;
-    private final ToolJobConfig config;
     private final ObjectMapper objectMapper = new ObjectMapper().findAndRegisterModules();
 
     public ToolJobFinalizer(ToolJobAnchorService anchorService,
                             ToolJobRedisCache redisCache,
                             DataAnalysisCapacityService capacityService,
-                            ToolJobResumeService resumeService,
-                            ToolJobConfig config) {
+                            ToolJobResumeService resumeService) {
         this.anchorService = anchorService;
         this.redisCache = redisCache;
         this.capacityService = capacityService;
         this.resumeService = resumeService;
-        this.config = config;
     }
 
+    // ========== public entry points ==========
+
     /**
-     * Entry point when sandbox reports terminal.
-     * {@code terminalStatus} is the real sandbox status string.
-     * {@code resultResp} is the result of getTaskResult (may be null for RESULT_LOST).
+     * @param autoResume false for paused/canceled runs (envelope+release but no CAS/READY)
      */
     public void handleTerminal(String runId, ToolJobAnchor anchor,
-                                String terminalStatus, TaskResultResponse resultResp) {
+                                String terminalStatus, TaskResultResponse resultResp,
+                                boolean autoResume) {
         Instant now = Instant.now();
 
-        // Step 1: ENVELOPE — persist sandbox terminal data
-        if (!isBeyond(anchor, STEP_ENVELOPE)) {
+        // Step 1: ENVELOPE
+        if (!isStepDone(anchor, STEP_ENVELOPE)) {
             anchor.setTerminalStatus(terminalStatus);
             anchor.setSandboxTerminalStatus(terminalStatus);
             anchor.setTerminalAt(now);
             if (resultResp != null) {
-                anchor.setTerminalResultPreview(emptyToNull(resultResp.getStdout()));
+                anchor.setTerminalResultPreview(boundedPreview(resultResp.getStdout()));
                 anchor.setTerminalRawRef(emptyToNull(resultResp.getDatasetDir()));
                 anchor.setTerminalErrorCode(emptyToNull(resultResp.getError()));
                 try {
@@ -85,63 +76,56 @@ public class ToolJobFinalizer {
             }
             anchor.setFinalizerStep(STEP_ENVELOPE);
             if (!anchorService.updateAnchor(runId, anchor, AgentRunStatus.WAITING_TOOL_JOB)) {
-                log.warn("ENVELOPE CAS failed for run={}, will retry", runId);
+                log.warn("ENVELOPE CAS failed for run={}", runId);
                 return;
             }
         }
 
-        // Step 2: RELEASE — capacity release via real reservation
-        if (!isBeyond(anchor, STEP_RELEASE)) {
-            if (anchor.getReservationJson() != null && !anchor.getReservationJson().isBlank()) {
-                try {
-                    DataAnalysisReservation current = objectMapper.readValue(
-                            anchor.getReservationJson(), DataAnalysisReservation.class);
-                    releaseCapacity(current, anchor);
-                } catch (Exception e) {
-                    log.error("RELEASE failed for run={}, will retry", runId, e);
-                    return; // retry on next reconciler cycle
-                }
+        // Step 2: RELEASE — capacity release, return value gate
+        if (!isStepDone(anchor, STEP_RELEASE)) {
+            if (!releaseCapacity(anchor)) {
+                log.warn("RELEASE failed for run={}, will retry", runId);
+                return;
             }
             anchor.setFinalizerStep(STEP_RELEASE);
-            if (!anchorService.updateAnchor(runId, anchor, AgentRunStatus.WAITING_TOOL_JOB)) {
-                return;
-            }
+            if (!anchorService.updateAnchor(runId, anchor, AgentRunStatus.WAITING_TOOL_JOB)) return;
         }
 
-        // Step 3: USAGE — T4 stub (P0 placeholder)
-        if (!isBeyond(anchor, STEP_USAGE)) {
+        // Step 3: USAGE — true gate, T4 hook not yet wired
+        if (!isStepDone(anchor, STEP_USAGE)) {
             anchor.setUsagePersisted(false);
             anchor.setFinalizerStep(STEP_USAGE);
             if (!anchorService.updateAnchor(runId, anchor, AgentRunStatus.WAITING_TOOL_JOB)) return;
         }
 
-        // Step 4: EVENT — Codex stub (P0 placeholder)
-        if (!isBeyond(anchor, STEP_EVENT)) {
+        // Step 4: EVENT — true gate, Codex hook not yet wired
+        if (!isStepDone(anchor, STEP_EVENT)) {
             anchor.setTerminalEventEmitted(false);
             anchor.setFinalizerStep(STEP_EVENT);
             if (!anchorService.updateAnchor(runId, anchor, AgentRunStatus.WAITING_TOOL_JOB)) return;
         }
 
-        // Step 5: CAS run status WAITING_TOOL_JOB → RECEIVED
-        if (!isBeyond(anchor, STEP_CAS_STATUS)) {
-            boolean casOk = anchorService.casUpdateStatus(runId, AgentRunStatus.RECEIVED, AgentRunStatus.WAITING_TOOL_JOB);
-            if (!casOk) {
-                log.warn("CAS_STATUS failed for run={} — paused/canceled", runId);
-                anchor.setAutoResume(false);
-                anchorService.updateAnchor(runId, anchor, AgentRunStatus.WAITING_TOOL_JOB);
-                return;
-            }
+        if (!autoResume) {
+            // Paused/canceled: stop here, keep WAITING_TOOL_JOB, no CAS/READY
+            log.info("Terminal handled for paused run={}, not auto-resuming", runId);
+            return;
+        }
+
+        // Step 5: CAS_STATUS atomically with step
+        if (!isStepDone(anchor, STEP_CAS_STATUS)) {
             anchor.setFinalizerStep(STEP_CAS_STATUS);
-            if (!anchorService.updateAnchor(runId, anchor, AgentRunStatus.RECEIVED)) {
-                log.warn("CAS_STATUS anchor update failed for run={}", runId);
+            if (!anchorService.updateAnchorAndStatus(runId, anchor, AgentRunStatus.RECEIVED, AgentRunStatus.WAITING_TOOL_JOB)) {
+                log.warn("CAS_STATUS atomic update failed for run={}", runId);
                 return;
             }
         }
 
-        // Step 6: RESUME_READY — mark ready, generate token, try resume
-        if (!isBeyond(anchor, STEP_RESUME_READY)) {
+        // Step 6: RESUME_READY
+        if (!isStepDone(anchor, STEP_RESUME_READY)) {
             anchor.setResumeState("READY");
             anchor.setResumeToken(UUID.randomUUID().toString());
+            anchor.setResumeLeaseVersion(anchor.getResumeLeaseVersion() + 1);
+            anchor.setResumeClaimedAt(now);
             anchor.setFinalizerStep(STEP_RESUME_READY);
             if (!anchorService.updateAnchor(runId, anchor, AgentRunStatus.RECEIVED)) {
                 log.warn("RESUME_READY anchor update failed for run={}", runId);
@@ -152,136 +136,176 @@ public class ToolJobFinalizer {
         }
     }
 
-    /**
-     * Entry point when sandbox reports NOT_FOUND.
-     */
     public void handleNotFound(String runId, ToolJobAnchor anchor) {
         Instant now = Instant.now();
         if (anchor.getTerminalConfirmedAt() != null) {
             long elapsed = java.time.Duration.between(anchor.getTerminalConfirmedAt(), now).toSeconds();
             int attempts = anchor.getResultFetchAttempts() + 1;
             anchor.setResultFetchAttempts(attempts);
-            if (elapsed > config.getResultRetentionDeadlineSeconds()
-                    || attempts >= config.getResultFetchMaxAttempts()) {
+            if (elapsed > 600 || attempts >= 10) {
                 anchor.setResultFetchState("LOST");
                 anchor.setTerminalStatus("RESULT_LOST");
                 anchor.setTerminalAt(now);
                 log.error("Result permanently lost for run={}, taskId={}", runId, anchor.getTaskId());
-                handleTerminal(runId, anchor, "RESULT_LOST", null);
+                handleTerminal(runId, anchor, "RESULT_LOST", null, anchor.isAutoResume());
                 return;
             }
-            anchor.setNextPollAt(now.plusMillis(config.getReconcilerIntervalMs()));
         } else {
             anchor.setResultFetchState("PENDING");
             anchor.setTerminalConfirmedAt(now);
             anchor.setResultFetchAttempts(1);
-            anchor.setNextPollAt(now.plusMillis(config.getReconcilerIntervalMs()));
         }
+        anchor.setNextPollAt(now.plusMillis(5000));
         anchorService.updateAnchor(runId, anchor, AgentRunStatus.WAITING_TOOL_JOB);
         redisCache.upsertDue(runId, anchor);
         redisCache.writePendingCache(runId, anchor);
     }
 
-    // ---- capacity release ----
+    // ========== capacity release ==========
 
-    private void releaseCapacity(DataAnalysisReservation current, ToolJobAnchor anchor) {
-        if (current.state() == DataAnalysisReservationState.RELEASED) return;
+    /** @return true if capacity was released (or already released) */
+    private boolean releaseCapacity(ToolJobAnchor anchor) {
+        if (anchor.getReservationJson() == null || anchor.getReservationJson().isBlank()) return true;
+        try {
+            DataAnalysisReservation current = objectMapper.readValue(
+                    anchor.getReservationJson(), DataAnalysisReservation.class);
+            if (current.state() == DataAnalysisReservationState.RELEASED) return true;
 
-        // Transition to TERMINAL_CONFIRMED
-        DataAnalysisReservation confirmed;
-        if (current.state() != DataAnalysisReservationState.TERMINAL_CONFIRMED) {
-            confirmed = new DataAnalysisReservation(current.reservationId(), current.identity(),
-                    current.resourceClass(), current.capacityUnits(),
-                    DataAnalysisReservationState.TERMINAL_CONFIRMED,
-                    current.taskId(), current.acquiredAt());
-            DataAnalysisRestoreOutcome restored = capacityService.restoreReservation(confirmed);
-            if (restored == DataAnalysisRestoreOutcome.CONFLICT) {
-                log.warn("Failed to transition reservation to TERMINAL_CONFIRMED, id={}", current.reservationId());
-                return;
+            DataAnalysisReservation confirmed = current;
+            if (current.state() != DataAnalysisReservationState.TERMINAL_CONFIRMED) {
+                confirmed = new DataAnalysisReservation(current.reservationId(), current.identity(),
+                        current.resourceClass(), current.capacityUnits(),
+                        DataAnalysisReservationState.TERMINAL_CONFIRMED,
+                        current.taskId(), current.acquiredAt());
+                DataAnalysisRestoreOutcome ro = capacityService.restoreReservation(confirmed);
+                if (ro == DataAnalysisRestoreOutcome.CONFLICT) {
+                    log.warn("Reservation restore CONFLICT for id={}", current.reservationId());
+                    return false;
+                }
             }
-        } else {
-            confirmed = current;
+
+            DataAnalysisTerminalEnvelope envelope = buildEnvelope(confirmed, anchor);
+            if (envelope == null) {
+                log.error("Failed to build terminal envelope for reservationId={}", confirmed.reservationId());
+                return false;
+            }
+
+            DataAnalysisReleaseRequest req = new DataAnalysisReleaseRequest(confirmed,
+                    new DataAnalysisReleaseProof.Terminal(envelope),
+                    DataAnalysisReleaseReason.SANDBOX_TERMINAL_CONFIRMED);
+            DataAnalysisReleaseOutcome oo = capacityService.releaseReservation(req);
+            boolean ok = oo == DataAnalysisReleaseOutcome.RELEASED
+                    || oo == DataAnalysisReleaseOutcome.ALREADY_RELEASED;
+            if (!ok) log.warn("Release outcome {} for reservationId={}", oo, confirmed.reservationId());
+            return ok;
+        } catch (Exception e) {
+            log.error("releaseCapacity failed for reservation", e);
+            return false;
         }
-
-        // Build real terminal envelope and release
-        DataAnalysisTerminalEnvelope envelope = buildEnvelope(confirmed, anchor);
-        if (envelope == null) return;
-
-        DataAnalysisReleaseRequest req = new DataAnalysisReleaseRequest(confirmed,
-                new DataAnalysisReleaseProof.Terminal(envelope),
-                DataAnalysisReleaseReason.SANDBOX_TERMINAL_CONFIRMED);
-        DataAnalysisReleaseOutcome outcome = capacityService.releaseReservation(req);
-        log.info("Capacity release outcome={} for reservationId={}", outcome, confirmed.reservationId());
     }
 
     private DataAnalysisTerminalEnvelope buildEnvelope(DataAnalysisReservation reservation, ToolJobAnchor anchor) {
         try {
-            DataAnalysisResourceUsage usage = buildResourceUsage(reservation.resourceClass(), anchor.getTerminalUsageJson());
-            DataAnalysisEstimate estimate = new DataAnalysisEstimate(0, 0, 0, 0.0, 0,
-                    java.util.List.of(), reservation.resourceClass(), reservation.capacityUnits());
+            DataAnalysisResourceUsage usage = buildResourceUsage(reservation.resourceClass(),
+                    anchor.getTerminalUsageJson());
+            DataAnalysisEstimate estimate = parseEstimate(anchor.getEstimateJson(), reservation);
             String status = anchor.getTerminalStatus();
             boolean success = "SUCCEEDED".equals(status);
             String rawRef = anchor.getTerminalRawRef();
-            String resultPreview = anchor.getTerminalResultPreview();
+            String preview = boundedPreview(anchor.getTerminalResultPreview());
             String errorCode = anchor.getTerminalErrorCode();
 
-            // Validate: success needs resultPreview or rawRef; failure needs error info
-            if (success && rawRef == null && resultPreview == null) {
-                log.warn("SUCCEEDED without resultPreview/rawRef for run={}, using empty preview",
-                        anchor.getOperationId());
-                resultPreview = "(no preview available)";
+            if (success && rawRef == null && preview == null) {
+                log.warn("SUCCEEDED without preview/rawRef for op={}", anchor.getOperationId());
+                preview = "(preview unavailable)";
             }
-            if (!success && errorCode == null) {
-                errorCode = status; // use sandbox status as error code
-            }
+            if (!success && errorCode == null) errorCode = status;
 
             return new DataAnalysisTerminalEnvelope(
                     reservation.identity().runId(), reservation.identity().toolCallId(),
                     reservation.identity().attempt(), reservation.operationId(), reservation.taskId(),
-                    status, success, resultPreview, rawRef, errorCode,
-                    success ? null : (resultPreview != null ? resultPreview : "sandbox " + status),
+                    status, success, preview, rawRef, errorCode,
+                    success ? null : "sandbox " + status,
                     !success && !"RESULT_LOST".equals(status),
                     estimate, reservation, usage, anchor.getTerminalAt(), true);
         } catch (Exception e) {
-            log.error("Failed to build terminal envelope for reservationId={}, terminalStatus={}",
+            log.error("buildEnvelope failed for reservationId={}, status={}",
                     reservation.reservationId(), anchor.getTerminalStatus(), e);
             return null;
         }
     }
 
     private DataAnalysisResourceUsage buildResourceUsage(DataAnalysisResourceClass rc, String usageJson) {
-        if (usageJson == null) return DataAnalysisResourceUsage.missing(rc);
+        if (usageJson == null || usageJson.isBlank()) return DataAnalysisResourceUsage.missing(rc);
         try {
             SandboxResourceUsage s = objectMapper.readValue(usageJson, SandboxResourceUsage.class);
-            return new DataAnalysisResourceUsage(rc,
-                    s.hasCpuMillis() ? s.getCpuMillis() : null,
-                    s.hasMemoryPeakBytes() ? s.getMemoryPeakBytes() : null,
-                    s.hasMemoryByteMillis() ? s.getMemoryByteMillis() : null,
-                    s.hasLogicalBytesScanned() ? s.getLogicalBytesScanned() : null,
-                    s.hasArtifactBytesWritten() ? s.getArtifactBytesWritten() : null,
-                    s.hasTemporaryBytesWritten() ? s.getTemporaryBytesWritten() : null,
-                    s.hasQueueWaitMillis() ? s.getQueueWaitMillis() : null,
-                    s.hasPrepareMillis() ? s.getPrepareMillis() : null,
-                    s.hasExecutionWallMillis() ? s.getExecutionWallMillis() : null,
-                    s.hasCleanupMillis() ? s.getCleanupMillis() : null,
-                    s.hasDatasetOpenCount() ? s.getDatasetOpenCount() : null,
-                    s.getExitReason(),
-                    s.getOomKilled(), s.getTimedOut(), false, null, null);
+
+            Long cpu = s.hasCpuMillis() ? s.getCpuMillis() : null;
+            Long mem = s.hasMemoryPeakBytes() ? s.getMemoryPeakBytes() : null;
+            Long memMs = s.hasMemoryByteMillis() ? s.getMemoryByteMillis() : null;
+            Long scan = s.hasLogicalBytesScanned() ? s.getLogicalBytesScanned() : null;
+            Long art = s.hasArtifactBytesWritten() ? s.getArtifactBytesWritten() : null;
+            Long tmp = s.hasTemporaryBytesWritten() ? s.getTemporaryBytesWritten() : null;
+            Long qwait = s.hasQueueWaitMillis() ? s.getQueueWaitMillis() : null;
+            Long prep = s.hasPrepareMillis() ? s.getPrepareMillis() : null;
+            Long exec = s.hasExecutionWallMillis() ? s.getExecutionWallMillis() : null;
+            Long clean = s.hasCleanupMillis() ? s.getCleanupMillis() : null;
+            Integer dsOpen = s.hasDatasetOpenCount() ? s.getDatasetOpenCount() : null;
+
+            List<String> missing = new ArrayList<>();
+            if (cpu == null) missing.add("cpuMillis");
+            if (mem == null) missing.add("memoryPeakBytes");
+            if (scan == null) missing.add("logicalBytesScanned");
+            if (qwait == null) missing.add("queueWaitMillis");
+            if (prep == null) missing.add("prepareMillis");
+            if (exec == null) missing.add("executionWallMillis");
+            if (clean == null) missing.add("cleanupMillis");
+            if (dsOpen == null) missing.add("datasetOpenCount");
+            if (s.getExitReason().isBlank()) missing.add("exitReason");
+
+            if (missing.isEmpty()) {
+                return new DataAnalysisResourceUsage(rc, cpu, mem, memMs, scan, art, tmp,
+                        qwait, prep, exec, clean, dsOpen, s.getExitReason(),
+                        s.getOomKilled(), s.getTimedOut(), true, null, null);
+            }
+            return new DataAnalysisResourceUsage(rc, null, null, null, null, null, null,
+                    null, null, null, null, null, null,
+                    false, false, false, null, missing);
         } catch (Exception e) {
-            log.warn("Failed to parse resourceUsage JSON, using missing", e);
+            log.warn("Failed to parse resourceUsage, using missing", e);
             return DataAnalysisResourceUsage.missing(rc);
         }
     }
 
-    // ---- helpers ----
-
-    private boolean isBeyond(ToolJobAnchor anchor, String step) {
-        String current = anchor.getFinalizerStep();
-        if (current == null) return false;
-        return STEP_ORDER.getOrDefault(current, 0) > STEP_ORDER.getOrDefault(step, 0);
+    private DataAnalysisEstimate parseEstimate(String estimateJson, DataAnalysisReservation reservation) {
+        if (estimateJson != null && !estimateJson.isBlank()) {
+            try {
+                return objectMapper.readValue(estimateJson, DataAnalysisEstimate.class);
+            } catch (Exception e) {
+                log.warn("Failed to parse estimateJson, using fallback", e);
+            }
+        }
+        return new DataAnalysisEstimate(0, 0, 0, 0.0, 0,
+                List.of(), reservation.resourceClass(), reservation.capacityUnits());
     }
 
-    private static String emptyToNull(String s) {
-        return s == null || s.isBlank() ? null : s.trim();
+    // ========== helpers ==========
+
+    private boolean isStepDone(ToolJobAnchor anchor, String step) {
+        String current = anchor.getFinalizerStep();
+        if (current == null) return false;
+        return STEP_ORDER.getOrDefault(current, 0) >= STEP_ORDER.getOrDefault(step, 0);
+    }
+
+    private static String emptyToNull(String s) { return s == null || s.isBlank() ? null : s.trim(); }
+
+    /** Truncate to 16KB UTF-8 to respect MAX_RESULT_PREVIEW_BYTES. */
+    static String boundedPreview(String s) {
+        if (s == null) return null;
+        byte[] bytes = s.getBytes(StandardCharsets.UTF_8);
+        if (bytes.length <= DataAnalysisTerminalEnvelope.MAX_RESULT_PREVIEW_BYTES) return s;
+        int cut = DataAnalysisTerminalEnvelope.MAX_RESULT_PREVIEW_BYTES;
+        while (cut > 0 && (bytes[cut] & 0xC0) == 0x80) cut--;
+        return new String(bytes, 0, cut, StandardCharsets.UTF_8) + "…(truncated)";
     }
 }
