@@ -34,6 +34,21 @@ final class ToolJobResourceUsageParser {
             JsonFormat.parser().merge(usageJson, builder);
             SandboxResourceUsage usage = builder.build();
 
+            String actualResourceClass = usage.getResourceClass().trim();
+            if (!actualResourceClass.isEmpty()) {
+                DataAnalysisResourceClass parsedResourceClass;
+                try {
+                    parsedResourceClass = DataAnalysisResourceClass.valueOf(actualResourceClass);
+                } catch (IllegalArgumentException e) {
+                    throw new IllegalArgumentException(
+                            "resourceUsage resourceClass is unsupported: " + actualResourceClass, e);
+                }
+                if (parsedResourceClass != resourceClass) {
+                    throw new IllegalArgumentException(
+                            "resourceUsage resourceClass does not match reservation resourceClass");
+                }
+            }
+
             Set<String> declaredMissing = new LinkedHashSet<>(usage.getMissingFieldsList());
             if (!DataAnalysisResourceUsage.P0_REQUIRED_MEASURED_FIELDS.containsAll(declaredMissing)) {
                 throw new IllegalArgumentException(

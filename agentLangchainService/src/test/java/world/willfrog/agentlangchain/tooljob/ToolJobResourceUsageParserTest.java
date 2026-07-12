@@ -86,6 +86,26 @@ class ToolJobResourceUsageParserTest {
                 .hasMessageContaining("unknown or non-P0");
     }
 
+    @Test
+    void actualResourceClassMismatchFailsClosedInsteadOfBeingOverwrittenByReservation() throws Exception {
+        SandboxResourceUsage usage = completeUsage().setResourceClass("HEAVY").build();
+
+        assertThatThrownBy(() -> ToolJobResourceUsageParser.parse(
+                objectMapper, DataAnalysisResourceClass.STANDARD, json(usage)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("does not match reservation");
+    }
+
+    @Test
+    void legacyBlankResourceClassUsesDurableReservationClass() throws Exception {
+        SandboxResourceUsage usage = completeUsage().clearResourceClass().build();
+
+        DataAnalysisResourceUsage parsed = ToolJobResourceUsageParser.parse(
+                objectMapper, DataAnalysisResourceClass.HEAVY, json(usage));
+
+        assertThat(parsed.resourceClass()).isEqualTo(DataAnalysisResourceClass.HEAVY);
+    }
+
     private SandboxResourceUsage.Builder completeUsage() {
         return SandboxResourceUsage.newBuilder()
                 .setResourceClass("STANDARD")

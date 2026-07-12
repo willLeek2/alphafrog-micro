@@ -103,6 +103,30 @@ class ToolJobUsageHookImplTest {
         assertThat(captor.getValue().resourceUsage().datasetOpenCount()).isEqualTo(5);
     }
 
+    @Test
+    void resourceClassMismatchFailsClosedBeforeRecorder() throws Exception {
+        ToolJobAnchor anchor = anchor();
+        SandboxResourceUsage usage = SandboxResourceUsage.newBuilder()
+                .setResourceClass("HEAVY")
+                .setCpuMillis(1)
+                .setMemoryPeakBytes(1)
+                .setLogicalBytesScanned(1)
+                .setQueueWaitMillis(1)
+                .setPrepareMillis(1)
+                .setExecutionWallMillis(1)
+                .setCleanupMillis(1)
+                .setDatasetOpenCount(1)
+                .setExitReason("SUCCESS")
+                .setAttributionComplete(true)
+                .build();
+        anchor.setTerminalUsageJson(JsonFormat.printer()
+                .omittingInsignificantWhitespace()
+                .print(usage));
+
+        assertThat(hook.upsertUsage("run-1", anchor)).isFalse();
+        verify(recorder, never()).upsert(any());
+    }
+
     private ToolJobAnchor anchor() throws Exception {
         DataAnalysisOperationIdentity identity = new DataAnalysisOperationIdentity("run-1", "call-1", 1);
         DataAnalysisReservation released = new DataAnalysisReservation(
