@@ -621,6 +621,9 @@ public class LangchainRunReadService {
         if (status == AgentRunStatus.WAITING) {
             return "PAUSED";
         }
+        if (status == AgentRunStatus.WAITING_TOOL_JOB) {
+            return "WAITING_TOOL_JOB";
+        }
         if ("PLAN_READY".equals(lastEventType)
                 || "PLANNING_STARTED".equals(lastEventType)
                 || "TODO_LIST_CREATED".equals(lastEventType)) {

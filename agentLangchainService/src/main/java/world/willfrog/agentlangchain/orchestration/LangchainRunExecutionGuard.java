@@ -53,7 +53,8 @@ public class LangchainRunExecutionGuard {
     private static boolean isControlStopStatus(String status) {
         return AgentRunStatus.CANCELING.name().equals(status)
                 || AgentRunStatus.CANCELED.name().equals(status)
-                || AgentRunStatus.WAITING.name().equals(status);
+                || AgentRunStatus.WAITING.name().equals(status)
+                || AgentRunStatus.WAITING_TOOL_JOB.name().equals(status);
     }
 
     private static boolean isBlank(String value) {

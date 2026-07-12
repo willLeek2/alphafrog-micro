@@ -22,6 +22,7 @@ public class AgentRun {
     private OffsetDateTime updatedAt;
     private OffsetDateTime completedAt;
     private String ext; // JSON string
+    private String toolJobAnchorJson; // JSON string: durable external tool job anchor
 
     // List view metrics extracted from snapshot_json.observability.summary
     private Long durationMs;

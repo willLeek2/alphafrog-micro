@@ -9,12 +9,15 @@ import dev.langchain4j.service.tool.ToolProvider;
 import dev.langchain4j.service.tool.ToolProviderRequest;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.debug.DebugObservabilityRequest;
 import world.willfrog.agent.platform.debug.DebugObservabilityService;
 import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.dataanalysis.CompletedTodoRecord;
+import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentCreditService;
@@ -33,10 +36,17 @@ import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
 import world.willfrog.agentlangchain.failure.LangchainFailureDecision;
 import world.willfrog.agentlangchain.failure.LangchainFailureMapper;
 import world.willfrog.agentlangchain.tools.LangchainToolInvocationKeys;
+import world.willfrog.agentlangchain.tooljob.ToolJobCheckpointRequest;
+import world.willfrog.agentlangchain.tooljob.ToolJobCheckpointWriter;
+import world.willfrog.agentlangchain.tooljob.ToolJobResumeContext;
+import world.willfrog.agentlangchain.tooljob.ToolJobCheckpointFailureRecoveryService;
 
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.ArrayList;
+import java.util.function.Consumer;
+import java.util.function.BooleanSupplier;
 
 /**
  * agentLangchainService 的 run 级总控流水线。
@@ -88,6 +98,12 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
      */
     private final ObjectProvider<AgentRunDatasetRegistry> agentRunDatasetRegistryProvider;
     private final ObjectProvider<DebugObservabilityService> debugObservabilityServiceProvider;
+
+    @Autowired(required = false)
+    private ToolJobCheckpointWriter toolJobCheckpointWriter;
+
+    @Autowired(required = false)
+    private ToolJobCheckpointFailureRecoveryService checkpointFailureRecoveryService;
 
     public LangchainLinearRunPipelineImpl(LangchainAiPlanner planner,
                                           LangchainLinearWorkflowExecutor linearWorkflowExecutor,
@@ -141,6 +157,30 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         // 入口层只把 run 交给并发调度器，不直接开线程。
         // hard/current 并发闸门、排队顺序和队列容量都集中在 scheduler，pipeline 只负责拿到执行权后的业务流程。
         runConcurrencyScheduler.submit(reservation, run, () -> executeRun(run));
+    }
+
+    /**
+     * Schedules a durable tool-job resume on the same bounded run executor used
+     * by normal runs. The planner is never invoked on this path.
+     */
+    public boolean launchResumedAsync(AgentRun run,
+                                      ToolJobResumeContext context,
+                                      BooleanSupplier terminalConsumed,
+                                      Consumer<Boolean> completion) {
+        if (run == null || context == null || isBlank(run.getId())) {
+            return false;
+        }
+        runConcurrencyScheduler.submit(null, run, () -> {
+            boolean durable = false;
+            try {
+                durable = executeResumedRun(run, context, terminalConsumed);
+            } finally {
+                if (completion != null) {
+                    completion.accept(durable);
+                }
+            }
+        });
+        return true;
     }
 
     void executeRun(AgentRun initialRun) {
@@ -283,6 +323,30 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                     ? dagWorkflowExecutor.executePlanned(workflowRequest, plan)
                     : linearWorkflowExecutor.executePlanned(workflowRequest, plan);
 
+            if (result.isSuspended()) {
+                ToolJobCheckpointAttempt checkpoint = persistToolJobCheckpoint(runId, result);
+                if (!checkpoint.persisted()) {
+                    log.error("Durable tool-job checkpoint failed for run={} todo={}",
+                            runId, result.getSuspendedTodoId());
+                    if (recordCheckpointFailure(runId, userId, result, checkpoint.request())
+                            != ToolJobCheckpointFailureRecoveryService.Outcome.HEALTHY_CHECKPOINT) {
+                        return;
+                    }
+                }
+                Map<String, Object> payload = new LinkedHashMap<>();
+                payload.put("run_id", runId);
+                payload.put("tool_call_id", nvl(result.getPendingToolCallId()));
+                payload.put("attempt", result.getPendingAttempt());
+                payload.put("todo_id", nvl(result.getSuspendedTodoId()));
+                payload.put("todo_sequence", result.getSuspendedTodoSequence() == null
+                        ? 0 : result.getSuspendedTodoSequence());
+                payload.put("workflow", useDag ? "dag" : "linear");
+                eventService.append(runId, userId, "TOOL_CALL_SUSPENDED", payload);
+                log.info("LangChain run {} suspended for external tool job {}",
+                        runId, result.getPendingToolCallId());
+                return;
+            }
+
             // cancel/pause 可能发生在 todo 执行和最终落库之间。
             // 这里再次检查，避免用户已经取消后 pipeline 又把 run 覆盖成 COMPLETED/FAILED。
             if (result.isInterrupted() || abortIfStopped(runId, userId, "before_persist")) {
@@ -382,6 +446,329 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             AgentContext.clear();
         }
     }
+
+    boolean executeResumedRun(AgentRun initialRun,
+                              ToolJobResumeContext resumeContext,
+                              BooleanSupplier terminalConsumed) {
+        AgentRun run = runMapper.findById(initialRun.getId());
+        if (run == null) {
+            return false;
+        }
+        String runId = run.getId();
+        String userId = run.getUserId();
+        String userGoal = "";
+        try {
+            AgentContext.setRunId(runId);
+            AgentContext.setUserId(userId);
+            if (!eventService.isRunnable(runId, userId)) {
+                return hasDurableStopState(runId);
+            }
+            if (isBlank(run.getPlanJson())) {
+                throw new IllegalStateException("resume_plan_missing");
+            }
+            LangchainTodoPlan plan = objectMapper.readValue(run.getPlanJson(), LangchainTodoPlan.class);
+            if (LangchainWorkflowRouting.shouldUseDag(plan)) {
+                throw new IllegalStateException("resume_dag_not_supported");
+            }
+
+            LangchainRunStageModelResolver.StageModels stageModels = stageModelResolver.resolve(run);
+            LangchainFollowUpContextSupport.ExecutionContext executionContext = followUpContextSupport.resolve(run);
+            userGoal = executionContext.userGoal();
+            AgentEventService.RunConfig runConfig = eventService.extractRunConfig(run.getExt());
+            AgentContext.setWebSearchEnabled(runConfig.webSearchEnabled());
+            AgentContext.setWebSearchConfig(runConfig.webSearchConfig());
+            setDataFreshnessFromExt(run.getExt());
+            List<ToolSpecification> toolSpecifications = resolveToolSpecifications(runConfig, userGoal);
+            LangchainLinearWorkflowRequest workflowRequest = LangchainLinearWorkflowRequest.builder()
+                    .runId(runId)
+                    .userId(userId)
+                    .userGoal(userGoal)
+                    .dialogueContext(executionContext.dialogueContext())
+                    .model(stageModels.executionModel())
+                    .planningModel(stageModels.planningModel())
+                    .executionModel(stageModels.executionModel())
+                    .finalAnswerModel(stageModels.finalAnswerModel())
+                    .planningEndpointName(stageModels.planningEndpointName())
+                    .planningModelName(stageModels.planningModelName())
+                    .planningProviderOrder(stageModels.planningProviderOrder())
+                    .toolSpecifications(toolSpecifications)
+                    .webSearchEnabled(runConfig.webSearchEnabled())
+                    .codeInterpreterEnabled(runConfig.codeInterpreterEnabled())
+                    .build();
+
+            String resumedDedupeKey = runId + ":" + resumeContext.getResumeToken()
+                    + ":" + resumeContext.getResumeLeaseVersion() + ":workflow_resumed";
+            eventService.appendOnce(runId, userId, "WORKFLOW_RESUMED", resumedDedupeKey, Map.of(
+                    "run_id", runId,
+                    "todo_id", nvl(resumeContext.getTodoId()),
+                    "resume_token", nvl(resumeContext.getResumeToken()),
+                    "resume_lease_version", resumeContext.getResumeLeaseVersion(),
+                    "planner_skipped", true
+            ));
+
+            LangchainLinearWorkflowResult result = linearWorkflowExecutor.resumePlanned(
+                    workflowRequest, plan, resumeContext, terminalConsumed);
+            return persistResumedResult(run, userGoal, stageModels, result);
+        } catch (Exception e) {
+            log.error("Resumed LangChain run failed: runId={}", runId, e);
+            try {
+                return publishResumedFailure(runId, userId, userGoal,
+                        LangchainLinearWorkflowResult.builder()
+                                .success(false)
+                                .failureReason(e.getMessage())
+                                .toolCallsUsed(resumeContext.getToolCallsUsed())
+                                .build(), e);
+            } catch (Exception persistEx) {
+                log.error("Resumed failure could not be persisted runId={}", runId, persistEx);
+                return false;
+            }
+        } finally {
+            try {
+                AgentRunDatasetRegistry registry = agentRunDatasetRegistryProvider.getIfAvailable();
+                if (registry != null) {
+                    registry.reset(runId);
+                }
+            } catch (Exception cleanupEx) {
+                log.warn("Failed to reset resumed dataset registry runId={}: {}",
+                        runId, cleanupEx.getMessage());
+            }
+            AgentContext.clear();
+        }
+    }
+
+    private boolean persistResumedResult(AgentRun run,
+                                         String userGoal,
+                                         LangchainRunStageModelResolver.StageModels stageModels,
+                                         LangchainLinearWorkflowResult result) {
+        String runId = run.getId();
+        String userId = run.getUserId();
+        if (result.isSuspended()) {
+            ToolJobCheckpointAttempt checkpoint = persistToolJobCheckpoint(runId, result);
+            if (!checkpoint.persisted()
+                    && recordCheckpointFailure(runId, userId, result, checkpoint.request())
+                    != ToolJobCheckpointFailureRecoveryService.Outcome.HEALTHY_CHECKPOINT) {
+                return false;
+            }
+            eventService.append(runId, userId, "TOOL_CALL_SUSPENDED", Map.of(
+                    "run_id", runId,
+                    "tool_call_id", nvl(result.getPendingToolCallId()),
+                    "attempt", result.getPendingAttempt(),
+                    "todo_id", nvl(result.getSuspendedTodoId()),
+                    "todo_sequence", result.getSuspendedTodoSequence() == null
+                            ? 0 : result.getSuspendedTodoSequence(),
+                    "workflow", "linear"
+            ));
+            return true;
+        }
+        if (result.isInterrupted() || abortIfStopped(runId, userId, "resume_before_persist")) {
+            return hasDurableStopState(runId);
+        }
+        runMapper.updatePlanJson(runId, userId, writeJson(result.getPlan()));
+        if (result.isSuccess()) {
+            String snapshot = attachObservability(runId,
+                    buildSnapshot(userGoal, result, AgentRunStatus.COMPLETED),
+                    AgentRunStatus.COMPLETED, null, null);
+            if (runMapper.updateSnapshot(runId, userId, AgentRunStatus.COMPLETED,
+                    snapshot, true, null) != 1) {
+                log.warn("Resumed COMPLETED snapshot was not persisted for run={}", runId);
+                return false;
+            }
+            try {
+                markRunStatus(runId, AgentRunStatus.COMPLETED);
+                eventService.append(runId, userId, "WORKFLOW_COMPLETED", Map.of(
+                        "answer", result.getFinalAnswer(),
+                        "toolCallsUsed", result.getToolCallsUsed(),
+                        "engine", "agentLangchainService",
+                        "resumed", true
+                ));
+                persistAssistantMessage(runId, userId, stageModels, result.getFinalAnswer());
+                tryScheduleSettlement(runId, userId);
+                finalizationService.publishFinalizedEvent(
+                        runId, userId, AgentRunStatus.COMPLETED.name());
+            } catch (Exception sideEffect) {
+                log.warn("Resumed COMPLETED side effect failed after durable snapshot run={}: {}",
+                        runId, sideEffect.getMessage());
+            }
+            return true;
+        }
+        if (result.isPartial()) {
+            String snapshot = attachObservability(runId, buildPartialSnapshot(userGoal, result),
+                    AgentRunStatus.PARTIAL, null, result.getFailureReason());
+            if (runMapper.updateSnapshot(runId, userId, AgentRunStatus.PARTIAL, snapshot, true,
+                    result.getFailureReason()) != 1) {
+                log.warn("Resumed PARTIAL snapshot was not persisted for run={}", runId);
+                return false;
+            }
+            try {
+                markRunStatus(runId, AgentRunStatus.PARTIAL);
+                eventService.append(runId, userId, "WORKFLOW_PARTIAL_COMPLETED", Map.of(
+                        "answer", nvl(result.getFinalAnswer()),
+                        "toolCallsUsed", result.getToolCallsUsed(),
+                        "engine", "agentLangchainService",
+                        "partial", true,
+                        "resumed", true
+                ));
+                if (!isBlank(result.getFinalAnswer())) {
+                    persistAssistantMessage(runId, userId, stageModels, result.getFinalAnswer());
+                }
+                tryScheduleSettlement(runId, userId);
+                finalizationService.publishFinalizedEvent(
+                        runId, userId, AgentRunStatus.PARTIAL.name());
+            } catch (Exception sideEffect) {
+                log.warn("Resumed PARTIAL side effect failed after durable snapshot run={}: {}",
+                        runId, sideEffect.getMessage());
+            }
+            return true;
+        }
+        if ("resume_result_consume_failed".equals(result.getFailureReason())) {
+            // Durable consume/clear is retryable. Keep the run and LAUNCHING
+            // anchor non-terminal so the reconciler can re-enter the same claim.
+            log.warn("Resume result consume failed for run={}, leaving claim for retry", runId);
+            return false;
+        }
+        boolean durable = publishResumedFailure(runId, userId, userGoal, result, null);
+        if (durable) {
+            tryScheduleSettlement(runId, userId);
+        }
+        return durable;
+    }
+
+    private boolean hasDurableStopState(String runId) {
+        AgentRun latest = runMapper.findById(runId);
+        if (latest == null || latest.getStatus() == null) {
+            return false;
+        }
+        return latest.getStatus() == AgentRunStatus.WAITING
+                || latest.getStatus() == AgentRunStatus.CANCELING
+                || latest.getStatus() == AgentRunStatus.CANCELED
+                || latest.getStatus() == AgentRunStatus.EXPIRED
+                || latest.getStatus() == AgentRunStatus.FAILED
+                || latest.getStatus() == AgentRunStatus.COMPLETED
+                || latest.getStatus() == AgentRunStatus.PARTIAL;
+    }
+
+    private ToolJobCheckpointAttempt persistToolJobCheckpoint(String runId,
+                                                              LangchainLinearWorkflowResult result) {
+        if (result == null || !result.isSuspended()) {
+            return new ToolJobCheckpointAttempt(false, null);
+        }
+        ToolJobCheckpointRequest request = null;
+        try {
+            AgentRun latest = runMapper.findById(runId);
+            if (latest == null || isBlank(latest.getToolJobAnchorJson())) {
+                return new ToolJobCheckpointAttempt(false, null);
+            }
+            ToolJobAnchor anchor = ToolJobAnchor.fromJson(latest.getToolJobAnchorJson());
+            request = ToolJobCheckpointRequest.builder(runId)
+                    .operationId(anchor.getOperationId())
+                    .toolCallId(anchor.getToolCallId())
+                    .attempt(anchor.getAttempt())
+                    .taskId(anchor.getTaskId())
+                    .expectedCheckpointVersion(anchor.getCheckpointVersion())
+                    .todoId(result.getSuspendedTodoId())
+                    .sequence(result.getSuspendedTodoSequence() == null
+                            ? 0 : result.getSuspendedTodoSequence())
+                    .completedTodos(List.of())
+                    .toolCallsUsed(result.getToolCallsUsed())
+                    .build();
+            if (toolJobCheckpointWriter == null) {
+                return new ToolJobCheckpointAttempt(false, request);
+            }
+            AgentRunDatasetRegistry registry = agentRunDatasetRegistryProvider.getIfAvailable();
+            if (registry == null) {
+                return new ToolJobCheckpointAttempt(false, request);
+            }
+            var datasetSnapshot = registry.snapshot(runId);
+            List<CompletedTodoRecord> records = new ArrayList<>();
+            if (result.getCompletedTodos() != null) {
+                for (LangchainCompletedTodo todo : result.getCompletedTodos()) {
+                    CompletedTodoRecord record = new CompletedTodoRecord();
+                    record.setTodoId(todo.getTodoId());
+                    record.setSequence(todo.getSequence());
+                    record.setDescription(todo.getDescription());
+                    record.setModelOutput(todo.getModelOutput());
+                    record.setOutput(todo.getOutput());
+                    record.setSummary(todo.getSummary());
+                    records.add(record);
+                }
+            }
+            String refsJson = isBlank(anchor.getDatasetRefsJson()) ? "[]" : anchor.getDatasetRefsJson();
+            request = ToolJobCheckpointRequest.builder(runId)
+                    .operationId(anchor.getOperationId())
+                    .toolCallId(anchor.getToolCallId())
+                    .attempt(anchor.getAttempt())
+                    .taskId(anchor.getTaskId())
+                    .expectedCheckpointVersion(anchor.getCheckpointVersion())
+                    .todoId(result.getSuspendedTodoId())
+                    .sequence(result.getSuspendedTodoSequence() == null
+                            ? 0 : result.getSuspendedTodoSequence())
+                    .completedTodos(records)
+                    .datasetSnapshotJson(objectMapper.writeValueAsString(datasetSnapshot))
+                    .datasetSnapshotDigest(datasetSnapshot.immutableDigest())
+                    .datasetRefsJson(refsJson)
+                    .toolCallsUsed(result.getToolCallsUsed())
+                    .estimateJson(anchor.getEstimateJson())
+                    .build();
+            return new ToolJobCheckpointAttempt(
+                    toolJobCheckpointWriter.captureAndSave(request), request);
+        } catch (Exception e) {
+            log.error("Failed to persist tool-job checkpoint runId={}: {}", runId, e.getMessage());
+            return new ToolJobCheckpointAttempt(false, request);
+        }
+    }
+
+    private ToolJobCheckpointFailureRecoveryService.Outcome recordCheckpointFailure(
+            String runId,
+            String userId,
+            LangchainLinearWorkflowResult result,
+            ToolJobCheckpointRequest failedRequest) {
+        ToolJobCheckpointFailureRecoveryService.Outcome outcome =
+                ToolJobCheckpointFailureRecoveryService.Outcome.UNOWNED;
+        if (failedRequest == null) {
+            boolean failed = runMapper.updateSnapshot(runId, userId, AgentRunStatus.FAILED,
+                    "{\"failure\":\"tool_job_checkpoint_anchor_missing\"}", true,
+                    "tool_job_checkpoint_anchor_missing") == 1;
+            emitCheckpointFailure(runId, userId, result, failed, false);
+            return failed ? ToolJobCheckpointFailureRecoveryService.Outcome.FAILURE_OWNED
+                    : ToolJobCheckpointFailureRecoveryService.Outcome.UNOWNED;
+        }
+        if (checkpointFailureRecoveryService != null && failedRequest != null) {
+            try {
+                outcome = checkpointFailureRecoveryService.handleFailure(failedRequest);
+            } catch (Exception e) {
+                log.error("Failed to establish checkpoint-failure owner runId={}: {}",
+                        runId, e.getMessage());
+            }
+        }
+        if (outcome == ToolJobCheckpointFailureRecoveryService.Outcome.HEALTHY_CHECKPOINT) {
+            log.info("Checkpoint failure superseded by healthy durable owner run={} todo={}",
+                    runId, result.getSuspendedTodoId());
+            return outcome;
+        }
+        emitCheckpointFailure(runId, userId, result,
+                outcome == ToolJobCheckpointFailureRecoveryService.Outcome.FAILURE_OWNED,
+                outcome == ToolJobCheckpointFailureRecoveryService.Outcome.RETRY_OWNED);
+        return outcome;
+    }
+
+    private void emitCheckpointFailure(String runId,
+                                       String userId,
+                                       LangchainLinearWorkflowResult result,
+                                       boolean durable,
+                                       boolean retryable) {
+        String dedupeKey = runId + ":" + nvl(result.getPendingToolCallId())
+                + ":" + result.getPendingAttempt() + ":checkpoint_failed";
+        eventService.appendOnce(runId, userId, "TOOL_JOB_CHECKPOINT_FAILED", dedupeKey, Map.of(
+                "run_id", runId,
+                "tool_call_id", nvl(result.getPendingToolCallId()),
+                "attempt", result.getPendingAttempt(),
+                "todo_id", nvl(result.getSuspendedTodoId()),
+                "durable_failure_disposition", durable,
+                "retryable", retryable
+        ));
+    }
+
+    private record ToolJobCheckpointAttempt(boolean persisted, ToolJobCheckpointRequest request) {}
 
     private void persistPlan(String runId, String userId, LangchainTodoPlan plan) {
         String planJson = writeJson(plan);
@@ -569,8 +956,25 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                                 String userGoal,
                                 LangchainLinearWorkflowResult result,
                                 Throwable throwable) {
+        publishFailureInternal(runId, userId, userGoal, result, throwable, false);
+    }
+
+    private boolean publishResumedFailure(String runId,
+                                          String userId,
+                                          String userGoal,
+                                          LangchainLinearWorkflowResult result,
+                                          Throwable throwable) {
+        return publishFailureInternal(runId, userId, userGoal, result, throwable, true);
+    }
+
+    private boolean publishFailureInternal(String runId,
+                                           String userId,
+                                           String userGoal,
+                                           LangchainLinearWorkflowResult result,
+                                           Throwable throwable,
+                                           boolean requireDurableWrite) {
         if (abortIfStopped(runId, userId, "before_failure_persist")) {
-            return;
+            return !requireDurableWrite || hasDurableStopState(runId);
         }
         String failureReason = nvl(result == null ? null : result.getFailureReason());
         // FailureMapper 把底层异常字符串翻译成业务事件。
@@ -590,28 +994,42 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 AgentRunStatus.FAILED,
                 decision.getObservabilityFailureType(),
                 decision.getReason());
-        runMapper.updateSnapshot(runId, userId, AgentRunStatus.FAILED, snapshot, true, decision.getReason());
-        markRunStatus(runId, AgentRunStatus.FAILED);
-        // 260618-workspace-v0: 触发终态事件
-        finalizationService.publishFinalizedEvent(runId, userId, AgentRunStatus.FAILED.name());
-        Map<String, Object> payload = new LinkedHashMap<>(decision.getEventPayload());
-        // ccmax #59: empty_todo_output 结构化观测透传到最终 WORKFLOW_FAILED event payload。
-        // 主路径：以 result.failureMetadata 非空为准（executor 在 try 块内构造，不依赖 failureReason 字符串协议）。
-        // Phase 3.2 A3: failureMetadata 按语义路由到不同子字段（budget_failure / empty_output_observation / failure_metadata），
-        // 避免 budget failure 被误归类为 empty_todo_output。
-        // Fallback：failureReason 含 empty_todo_output 时也允许兼容（针对历史 / 未来 executor 还没填 metadata 的场景，但 fallback 不伪造 observation）。
-        Map<String, Object> failureMetadata = result == null ? null : result.getFailureMetadata();
-        if (failureMetadata != null && !failureMetadata.isEmpty()) {
-            String field = LangchainTodoNodeResult.routeFailureMetadataField(failureMetadata);
-            if (field != null) {
-                payload.put(field, failureMetadata);
-            }
-        } else if (failureReason != null && failureReason.contains("empty_todo_output")) {
-            // legacy / 兼容路径：不写 observation 子 map，仅保留 failureReason 让 mapper 已经归类即可。
-            log.debug("empty_todo_output fallback path (no failureMetadata available), failureReason={}", failureReason);
+        int updated = runMapper.updateSnapshot(runId, userId, AgentRunStatus.FAILED,
+                snapshot, true, decision.getReason());
+        if (requireDurableWrite && updated != 1) {
+            log.warn("FAILED snapshot was not persisted for run={}", runId);
+            return false;
         }
-        payload.put("engine", "agentLangchainService");
-        eventService.append(runId, userId, decision.getEventType(), payload);
+        try {
+            markRunStatus(runId, AgentRunStatus.FAILED);
+            // 260618-workspace-v0: 触发终态事件
+            finalizationService.publishFinalizedEvent(runId, userId, AgentRunStatus.FAILED.name());
+            Map<String, Object> payload = new LinkedHashMap<>(decision.getEventPayload());
+            // ccmax #59: empty_todo_output 结构化观测透传到最终 WORKFLOW_FAILED event payload。
+            // 主路径：以 result.failureMetadata 非空为准（executor 在 try 块内构造，不依赖 failureReason 字符串协议）。
+            // Phase 3.2 A3: failureMetadata 按语义路由到不同子字段（budget_failure / empty_output_observation / failure_metadata），
+            // 避免 budget failure 被误归类为 empty_todo_output。
+            // Fallback：failureReason 含 empty_todo_output 时也允许兼容（针对历史 / 未来 executor 还没填 metadata 的场景，但 fallback 不伪造 observation）。
+            Map<String, Object> failureMetadata = result == null ? null : result.getFailureMetadata();
+            if (failureMetadata != null && !failureMetadata.isEmpty()) {
+                String field = LangchainTodoNodeResult.routeFailureMetadataField(failureMetadata);
+                if (field != null) {
+                    payload.put(field, failureMetadata);
+                }
+            } else if (failureReason != null && failureReason.contains("empty_todo_output")) {
+                // legacy / 兼容路径：不写 observation 子 map，仅保留 failureReason 让 mapper 已经归类即可。
+                log.debug("empty_todo_output fallback path (no failureMetadata available), failureReason={}", failureReason);
+            }
+            payload.put("engine", "agentLangchainService");
+            eventService.append(runId, userId, decision.getEventType(), payload);
+        } catch (RuntimeException sideEffect) {
+            if (!requireDurableWrite) {
+                throw sideEffect;
+            }
+            log.warn("Resumed FAILED side effect failed after durable snapshot run={}: {}",
+                    runId, sideEffect.getMessage());
+        }
+        return true;
     }
 
     private void tryScheduleSettlement(String runId, String userId) {

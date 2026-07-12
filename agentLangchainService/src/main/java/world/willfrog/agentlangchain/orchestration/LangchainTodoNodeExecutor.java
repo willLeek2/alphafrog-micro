@@ -10,6 +10,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingException;
 import world.willfrog.agent.platform.exception.RunBudgetException;
 import world.willfrog.agent.platform.service.AgentPromptService;
 import world.willfrog.agent.platform.service.AgentRunBudgetService;
@@ -267,6 +268,10 @@ public class LangchainTodoNodeExecutor {
             DatasetRefRegistry.registerFromJson(trimmed, datasetRefs);
             return LangchainTodoNodeResult.success(trimmed, Math.max(0, toolCalls.get() - callsBefore));
         } catch (Exception e) {
+            ExternalToolJobPendingException pending = findPending(e);
+            if (pending != null) {
+                return LangchainTodoNodeResult.suspended(pending);
+            }
             // ensureRunnable 抛出的 RUN_INTERRUPTED 异常、tool loop 内的工具异常、LLM 超时等都会在这里捕获，
             // 统一转为失败结果；上层 DagWorkflowExecutor 根据 isSuccess() 决定是否 skip 下游节点
             Map<String, Object> budgetMetadata = extractBudgetFailureMetadata(e);
@@ -277,6 +282,17 @@ public class LangchainTodoNodeExecutor {
             LangchainDatasetRefContext.clear();
             AgentContext.clearTodoContext();
         }
+    }
+
+    private ExternalToolJobPendingException findPending(Throwable throwable) {
+        Throwable current = throwable;
+        while (current != null) {
+            if (current instanceof ExternalToolJobPendingException pending) {
+                return pending;
+            }
+            current = current.getCause();
+        }
+        return null;
     }
 
     /**

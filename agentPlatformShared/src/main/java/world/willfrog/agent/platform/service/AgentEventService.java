@@ -266,6 +266,10 @@ public class AgentEventService {
             log.info("Run paused (waiting), stop: {}", runId);
             return false;
         }
+        if (run.getStatus() == AgentRunStatus.WAITING_TOOL_JOB) {
+            log.info("Run suspended for external tool job, stop: {}", runId);
+            return false;
+        }
         if (run.getTtlExpiresAt() != null && OffsetDateTime.now().isAfter(run.getTtlExpiresAt())) {
             log.info("Run expired (ttl), stop: {}", runId);
             return false;
@@ -320,6 +324,54 @@ public class AgentEventService {
             throw new IllegalStateException(msg, e);
         }
         publishLiveEvent(runId, nextSeq, eventType, normalizedPayloadJson, publishedAt);
+    }
+
+    /**
+     * Appends one logical event exactly once. PostgreSQL is the idempotency authority;
+     * a duplicate call heals the Redis event stream from the already persisted row
+     * without republishing the live event.
+     *
+     * @return {@code true} when this call inserted the logical event, {@code false}
+     *         when an earlier call already persisted the same dedupe key
+     */
+    public boolean appendOnce(String runId,
+                              String userId,
+                              String eventType,
+                              String dedupeKey,
+                              Object payload) {
+        if (dedupeKey == null || dedupeKey.isBlank()) {
+            throw new IllegalArgumentException("dedupeKey is required");
+        }
+        AgentRun run = runMapper.findByIdAndUser(runId, userId);
+        if (run == null) {
+            return false;
+        }
+        AgentRunEvent event = new AgentRunEvent();
+        event.setRunId(runId);
+        event.setSeq(nextSeq(runId));
+        event.setEventType(eventType);
+        event.setDedupeKey(dedupeKey.trim());
+        String payloadJson = payload instanceof String ? (String) payload : writeJson(payload);
+        event.setPayloadJson(normalizePayloadJson(eventType, payloadJson));
+        event.setCreatedAt(OffsetDateTime.now());
+
+        int inserted = eventMapper.insertOnce(event);
+        if (inserted == 0) {
+            AgentRunEvent existing = eventMapper.findByRunIdAndDedupeKey(runId, event.getDedupeKey());
+            if (existing == null) {
+                throw new IllegalStateException("Dedupe conflict without persisted event: runId=" + runId
+                        + ", dedupeKey=" + event.getDedupeKey());
+            }
+            eventRedisStore.append(existing);
+            return false;
+        }
+
+        eventRedisStore.append(event);
+        if (isTerminalEventType(eventType) || "TOOL_CALL_FINISHED".equals(eventType)) {
+            eventRedisStore.flush(runId);
+        }
+        publishLiveEvent(runId, event.getSeq(), eventType, event.getPayloadJson(), event.getCreatedAt());
+        return true;
     }
 
     /**

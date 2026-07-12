@@ -16,6 +16,7 @@ from llm_sandbox.exceptions import SandboxTimeoutError
 
 from .config import SandboxConfig
 from .dataset_manifest import expand_dataset_ids
+from .resource_usage import SandboxResourceUsageCollector
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,96 @@ SANDBOX_INPUT_PLACEHOLDER = "/__AF_INPUT__/"
 MANIFEST_NONE_MARKER = "NONE"
 # MF6: NONE 行物化产物子目录前缀（与 run_id / agent_run_manifest_id 拼接成 sandbox 内绝对路径）。
 TEMP_MANIFEST_DIR_PREFIX = "_agent_run_manifest_"
+
+
+def _read_json_file(path: Path) -> Dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except Exception:
+        return {}
+
+
+def _dataset_public_metadata(source_path: str) -> Dict[str, Any]:
+    source = Path(source_path)
+    document: Dict[str, Any] = {}
+    candidates = [source.with_suffix(".meta.json"), source.parent / "meta.json"]
+    for candidate in candidates:
+        if candidate.is_file():
+            document = _read_json_file(candidate)
+            if document:
+                break
+    columns = document.get("columns") if isinstance(document.get("columns"), list) else []
+    if not columns and source.is_file() and source.suffix.lower() == ".csv":
+        try:
+            with source.open("r", encoding="utf-8", newline="") as handle:
+                columns = next(csv.reader(handle), [])
+        except Exception:
+            columns = []
+    try:
+        byte_count = source.stat().st_size
+    except OSError:
+        byte_count = document.get("bytes")
+    row_count = document.get("rowCount")
+    return {
+        "rowCount": row_count if isinstance(row_count, int) else None,
+        "bytes": byte_count if isinstance(byte_count, int) else None,
+        "columns": columns,
+        "recommendedUsecols": document.get("recommendedUsecols") or columns,
+        "recommendedDtype": document.get("recommendedDtype") or {},
+        "readProfiles": document.get("readProfiles") or {},
+        "metadataStatus": "complete" if isinstance(row_count, int) and isinstance(byte_count, int) and columns else "partial",
+    }
+
+
+def _build_agent_run_metadata_documents(
+    paths_dataset_csv: str,
+    path_manifest_csv: str,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    datasets: Dict[str, Dict[str, Any]] = {}
+    if paths_dataset_csv.strip():
+        for row in csv.reader(io.StringIO(paths_dataset_csv)):
+            if not row or row[0].strip() == "agent_run_dataset_id" or len(row) < 4:
+                continue
+            number = row[0].strip()
+            if number:
+                datasets[number] = _dataset_public_metadata(row[3].strip())
+
+    manifests: Dict[str, Dict[str, Any]] = {}
+    if path_manifest_csv.strip():
+        for row in csv.reader(io.StringIO(path_manifest_csv)):
+            if not row or row[0].strip() == "agent_run_manifest_id" or len(row) < 3:
+                continue
+            number = row[0].strip()
+            member_numbers = [int(value) for value in row[2].split("#") if value.strip().isdigit()]
+            member_meta = [datasets.get(str(value), {}) for value in member_numbers]
+            complete_members = [value for value in member_meta if value]
+            row_counts = [value.get("rowCount") for value in complete_members]
+            byte_counts = [value.get("bytes") for value in complete_members]
+            columns = complete_members[0].get("columns", []) if complete_members else []
+            usecols = complete_members[0].get("recommendedUsecols", []) if complete_members else []
+            dtypes = complete_members[0].get("recommendedDtype", {}) if complete_members else {}
+            profiles = complete_members[0].get("readProfiles", {}) if complete_members else {}
+            metadata_complete = (
+                len(complete_members) == len(member_numbers)
+                and all(isinstance(value, int) for value in row_counts)
+                and all(isinstance(value, int) for value in byte_counts)
+                and bool(columns)
+            )
+            manifests[number] = {
+                "totalRowCount": sum(row_counts) if metadata_complete else None,
+                "totalBytes": sum(byte_counts) if byte_counts and all(isinstance(value, int) for value in byte_counts) else None,
+                "columns": columns,
+                "recommendedUsecols": usecols,
+                "recommendedDtype": dtypes,
+                "readProfiles": profiles,
+                "memberNumbers": member_numbers,
+                "metadataStatus": "complete" if metadata_complete else "partial",
+            }
+    return (
+        {"schema_version": "agent_run_dataset_meta_v1", "datasets": datasets},
+        {"schema_version": "agent_run_manifest_meta_v1", "manifests": manifests},
+    )
 
 
 def _normalize_library_name(library: str) -> str:
@@ -104,6 +195,20 @@ def _copy_text_to_runtime(
     finally:
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
+
+
+def _atomic_copy_text_to_runtime(
+    session: SandboxSession,
+    content: str,
+    dest_path: str,
+) -> None:
+    temp_dest = dest_path + ".tmp"
+    _copy_text_to_runtime(session, content, temp_dest)
+    _exec_checked(
+        session,
+        f"mv {shlex.quote(temp_dest)} {shlex.quote(dest_path)}",
+        "atomic_metadata_rename",
+    )
 
 
 def _copy_runtime_loader_modules(
@@ -333,6 +438,22 @@ def _prepare_task_workspace(
             paths_dataset_csv or "",
             path_manifest_csv or "",
         )
+
+    metrics_path = f"{task_workspace}/metrics/loader_metrics.jsonl"
+    artifact_dir = f"{task_workspace}/artifacts"
+    temporary_dir = f"{task_workspace}/tmp"
+    sitecustomize = (
+        "import os, sys\n"
+        f"os.environ['AF_TASK_METRICS_PATH'] = {metrics_path!r}\n"
+        f"os.environ['AF_TASK_WORKSPACE'] = {task_workspace!r}\n"
+        f"os.environ['AF_TASK_ARTIFACT_DIR'] = {artifact_dir!r}\n"
+        f"os.environ['AF_TASK_TMP_DIR'] = {temporary_dir!r}\n"
+        f"os.makedirs({artifact_dir!r}, exist_ok=True)\n"
+        f"os.makedirs({temporary_dir!r}, exist_ok=True)\n"
+        f"sys.path.insert(0, {config.workdir.rstrip('/')!r})\n"
+        f"os.chdir({task_workspace!r})\n"
+    )
+    _copy_text_to_runtime(session, sitecustomize, f"{config.workdir.rstrip('/')}/sitecustomize.py")
 
     return task_workspace
 
@@ -573,6 +694,22 @@ def _materialize_agent_run_csvs(
             f"{workdir}/path_manifest.csv",
         )
 
+    dataset_metadata, manifest_metadata = _build_agent_run_metadata_documents(
+        paths_dataset_csv, path_manifest_csv
+    )
+    if dataset_metadata["datasets"]:
+        _atomic_copy_text_to_runtime(
+            session,
+            json.dumps(dataset_metadata, ensure_ascii=False, separators=(",", ":")),
+            f"{workdir}/paths_dataset_meta.json",
+        )
+    if manifest_metadata["manifests"]:
+        _atomic_copy_text_to_runtime(
+            session,
+            json.dumps(manifest_metadata, ensure_ascii=False, separators=(",", ":")),
+            f"{workdir}/path_manifest_meta.json",
+        )
+
 
 def _materialize_none_manifest(
     session: SandboxSession,
@@ -714,20 +851,36 @@ def _cleanup_task_workspace(
         # Remove compatibility symlink
         if config.compat_input_path_enabled:
             _exec_checked(session, f"rm -rf {config.workdir}/input", "cleanup_input_symlink")
+        _exec_checked(
+            session,
+            "rm -f "
+            f"{shlex.quote(config.workdir.rstrip('/') + '/sitecustomize.py')} "
+            f"{shlex.quote(config.workdir.rstrip('/') + '/paths_dataset.csv')} "
+            f"{shlex.quote(config.workdir.rstrip('/') + '/path_manifest.csv')} "
+            f"{shlex.quote(config.workdir.rstrip('/') + '/paths_dataset_meta.json')} "
+            f"{shlex.quote(config.workdir.rstrip('/') + '/path_manifest_meta.json')}",
+            "cleanup_public_task_files",
+        )
         return True
     except Exception as e:
         logger.warning("Workspace cleanup failed for task %s: %s", task_id, e)
         return False
 
 
-def create_sandbox_session(config: SandboxConfig, *, execution_timeout: float | None = None) -> SandboxSession:
+def create_sandbox_session(
+    config: SandboxConfig,
+    *,
+    execution_timeout: float | None = None,
+    memory_limit_bytes: int | None = None,
+) -> SandboxSession:
     """Create and open one llm-sandbox session.
 
     The caller owns the returned session and must close it.
     """
+    effective_memory_limit: int | str = memory_limit_bytes or config.memory_limit
     runtime_configs = {
-        "mem_limit": config.memory_limit,
-        "memswap_limit": config.memswap_limit,
+        "mem_limit": effective_memory_limit,
+        "memswap_limit": effective_memory_limit if memory_limit_bytes else config.memswap_limit,
         "labels": SANDBOX_WORKER_LABELS,
     }
     session = SandboxSession(
@@ -777,6 +930,65 @@ test -w {shlex.quote(config.workdir)}
     _exec_checked(session, smoke_cmd, f"ready_check container={container_id}")
 
 
+def _read_runtime_text(session: SandboxSession, command: str) -> str:
+    try:
+        output = session.execute_command(command)
+        return output.stdout or ""
+    except Exception:
+        return ""
+
+
+def _read_runtime_size(session: SandboxSession, path: str) -> int:
+    text = _read_runtime_text(
+        session,
+        f"if [ -e {shlex.quote(path)} ]; then "
+        f"find {shlex.quote(path)} -type f -exec stat -c %s {{}} + 2>/dev/null | "
+        "awk '{total += $1} END {print total + 0}'; else echo 0; fi",
+    ).strip()
+    try:
+        return max(0, int(text.splitlines()[-1]))
+    except (ValueError, IndexError):
+        return 0
+
+
+def _read_task_temporary_bytes(session: SandboxSession, task_workspace: str) -> int:
+    quoted = shlex.quote(task_workspace)
+    command = (
+        f"find {quoted} -type f "
+        f"! -path {shlex.quote(task_workspace + '/input/*')} "
+        f"! -path {shlex.quote(task_workspace + '/metrics/*')} "
+        f"! -path {shlex.quote(task_workspace + '/artifacts/*')} "
+        f"! -name task.log -exec stat -c %s {{}} + 2>/dev/null | "
+        "awk '{total += $1} END {print total + 0}'"
+    )
+    text = _read_runtime_text(session, command).strip()
+    try:
+        return max(0, int(text.splitlines()[-1]))
+    except (ValueError, IndexError):
+        return 0
+
+
+def _container_oom_killed(container_id: str) -> bool:
+    if not container_id or container_id == "unknown":
+        return False
+    client = None
+    try:
+        import docker
+
+        client = docker.from_env()
+        container = client.containers.get(container_id)
+        container.reload()
+        return bool((container.attrs.get("State") or {}).get("OOMKilled"))
+    except Exception:
+        return False
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+
 def run_in_open_session(
     config: SandboxConfig,
     session: SandboxSession,
@@ -794,6 +1006,8 @@ def run_in_open_session(
     container_id: str | None = None,
     pool_enabled: bool = True,
     prepare_loader_modules: bool = True,
+    resource_class: str = "STANDARD",
+    usage_sampling_interval_millis: int | None = None,
 ) -> dict:
     """Run one task inside an already-open session.
 
@@ -812,14 +1026,29 @@ def run_in_open_session(
 
     t0 = time.monotonic()
     timings: Dict[str, float] = {}
-    if queue_wait_ms is not None:
-        timings["queue_wait_ms"] = queue_wait_ms
+    timings["queue_wait_ms"] = queue_wait_ms if queue_wait_ms is not None else 0
     result = None
     container_recycled = False
     recycle_reason: str | None = None
+    actual_container_id = container_id or get_session_container_id(session)
+    collector = SandboxResourceUsageCollector(
+        resource_class,
+        usage_sampling_interval_millis or config.usage_sampling_interval_millis,
+    )
+    collector.start(actual_container_id)
+    workspace_created = False
+    execution_error: Exception | None = None
+    loader_metrics_jsonl = ""
+    artifact_bytes_written = 0
+    temporary_bytes_written = 0
+    timed_out = False
+    oom_killed = False
+    exit_reason = "UNKNOWN"
+    resource_usage = None
 
     try:
         t_workspace_start = time.monotonic()
+        workspace_created = True
         _prepare_task_workspace(
             session,
             task_id,
@@ -845,36 +1074,66 @@ def run_in_open_session(
             config,
             f"script_end exit_code={result.exit_code} stdout_len={len(result.stdout or '')} stderr_len={len(result.stderr or '')}",
         )
+        exit_reason = "SUCCEEDED" if result.exit_code == 0 else "NON_ZERO_EXIT"
 
         t_artifact_start = time.monotonic()
         _flush_container_log(session, task_id, config)
         timings["artifact_collect_ms"] = int((time.monotonic() - t_artifact_start) * 1000)
 
-        t_cleanup_start = time.monotonic()
-        cleanup_ok = _cleanup_task_workspace(session, task_id, config)
-        timings["workspace_cleanup_ms"] = int((time.monotonic() - t_cleanup_start) * 1000)
-        if cleanup_ok:
-            _log_in_container(session, task_id, config, "cleanup_end ok")
-        else:
-            container_recycled = True
-            recycle_reason = "cleanup_failed"
-            _log_in_container(session, task_id, config, f"cleanup_failed recycle={recycle_reason}")
-
     except SandboxTimeoutError as e:
+        execution_error = e
+        timed_out = True
+        exit_reason = "TIMEOUT"
+        timings.setdefault("script_run_ms", int((time.monotonic() - t_run_start) * 1000) if "t_run_start" in locals() else 0)
         logger.error("Task %s timed out: %s", task_id, e)
         _flush_container_log(session, task_id, config)
         _log_in_container(session, task_id, config, "script_timeout recycle=timeout")
-        raise
     except Exception as e:
+        execution_error = e
+        exit_reason = "EXECUTION_ERROR"
         logger.error("Task %s execution error: %s", task_id, e)
         _flush_container_log(session, task_id, config)
         _log_in_container(session, task_id, config, f"script_error error={type(e).__name__}")
-        raise
     finally:
+        task_workspace = f"{config.workspace_root}/{task_id}"
+        loader_metrics_jsonl = _read_runtime_text(
+            session,
+            f"cat {shlex.quote(task_workspace + '/metrics/loader_metrics.jsonl')} 2>/dev/null || true",
+        )
+        artifact_bytes_written = _read_runtime_size(session, task_workspace + "/artifacts")
+        temporary_bytes_written = _read_task_temporary_bytes(session, task_workspace)
+        oom_killed = _container_oom_killed(actual_container_id)
+        if oom_killed:
+            exit_reason = "OOM_KILLED"
+        t_cleanup_start = time.monotonic()
+        cleanup_ok = True
+        if workspace_created:
+            cleanup_ok = _cleanup_task_workspace(session, task_id, config)
+        timings["workspace_cleanup_ms"] = int((time.monotonic() - t_cleanup_start) * 1000)
+        if not cleanup_ok:
+            container_recycled = True
+            recycle_reason = "cleanup_failed"
+        resource_usage = collector.finish(
+            container_id=actual_container_id,
+            queue_wait_millis=int(timings.get("queue_wait_ms", 0)),
+            prepare_millis=int(timings["workspace_prepare_ms"]) if "workspace_prepare_ms" in timings else None,
+            execution_wall_millis=int(timings["script_run_ms"]) if "script_run_ms" in timings else None,
+            cleanup_millis=int(timings["workspace_cleanup_ms"]),
+            loader_metrics_jsonl=loader_metrics_jsonl,
+            artifact_bytes_written=artifact_bytes_written,
+            temporary_bytes_written=temporary_bytes_written,
+            exit_reason=exit_reason,
+            oom_killed=oom_killed,
+            timed_out=timed_out,
+        )
         timings["total_runner_ms"] = int((time.monotonic() - t0) * 1000)
 
+    if execution_error is not None:
+        setattr(execution_error, "resource_usage", resource_usage.model_dump(mode="json"))
+        setattr(execution_error, "timings", timings)
+        raise execution_error
+
     primary_mount = f"{config.workdir}/input/{dataset_id}"
-    actual_container_id = container_id or get_session_container_id(session)
     logger.info(
         "Sandbox task=%s container=%s pool_enabled=%s %s recycled=%s recycle_reason=%s",
         task_id,
@@ -894,6 +1153,7 @@ def run_in_open_session(
         "container_recycled": container_recycled,
         "recycle_reason": recycle_reason,
         "container_id": actual_container_id,
+        "resource_usage": resource_usage.model_dump(mode="json"),
     }
 
 
@@ -909,11 +1169,18 @@ def run_in_sandbox(
     *,
     paths_dataset_csv: str | None = None,
     path_manifest_csv: str | None = None,
+    queue_wait_ms: int = 0,
+    resource_class: str = "STANDARD",
+    memory_limit_bytes: int | None = None,
 ) -> dict:
     timeout = timeout_seconds or config.execution_timeout_seconds
     t0 = time.monotonic()
     t_create_start = time.monotonic()
-    session = create_sandbox_session(config, execution_timeout=timeout)
+    session = create_sandbox_session(
+        config,
+        execution_timeout=timeout,
+        memory_limit_bytes=memory_limit_bytes,
+    )
     container_create_ms = int((time.monotonic() - t_create_start) * 1000)
     container_id = get_session_container_id(session)
     try:
@@ -929,9 +1196,10 @@ def run_in_sandbox(
             timeout_seconds,
             paths_dataset_csv=paths_dataset_csv,
             path_manifest_csv=path_manifest_csv,
-            queue_wait_ms=0,
+            queue_wait_ms=queue_wait_ms,
             container_id=container_id,
             pool_enabled=False,
+            resource_class=resource_class,
         )
         timings = result.setdefault("timings", {})
         timings["container_create_ms"] = container_create_ms

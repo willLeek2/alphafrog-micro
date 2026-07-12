@@ -1,0 +1,152 @@
+package world.willfrog.agentlangchain.tooljob;
+
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
+import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.mapper.AgentRunMapper;
+import world.willfrog.agent.platform.model.AgentRunStatus;
+
+import java.util.Collections;
+import java.util.List;
+
+/**
+ * Reads and writes {@link ToolJobAnchor} on {@code alphafrog_agent_run.tool_job_anchor_json}.
+ * All mutation methods use CAS (Compare-And-Set) via expected-status preconditions.
+ */
+@Service
+public class ToolJobAnchorService {
+
+    private final AgentRunMapper agentRunMapper;
+
+    public ToolJobAnchorService(AgentRunMapper agentRunMapper) {
+        this.agentRunMapper = agentRunMapper;
+    }
+
+    /**
+     * Reads the anchor for a run. Returns null when no active tool job exists.
+     */
+    public ToolJobAnchor loadAnchor(String runId) {
+        AgentRun run = agentRunMapper.findById(runId);
+        if (run == null || run.getToolJobAnchorJson() == null || run.getToolJobAnchorJson().isBlank()) {
+            return null;
+        }
+        return ToolJobAnchor.fromJson(run.getToolJobAnchorJson());
+    }
+
+    /**
+     * CAS-update the anchor JSON only, requiring the run to be in {@code expectedStatus}.
+     *
+     * @return true if the update succeeded, false if the status had changed
+     */
+    public boolean updateAnchor(String runId, ToolJobAnchor anchor, AgentRunStatus expectedStatus) {
+        int rows = agentRunMapper.updateToolJobAnchor(runId, anchor.toJson(), expectedStatus);
+        return rows == 1;
+    }
+
+    /**
+     * CAS-update both the anchor JSON and the run status atomically.
+     *
+     * @return true if the update succeeded
+     */
+    @Transactional
+    public boolean updateAnchorAndStatus(String runId, ToolJobAnchor anchor,
+                                          AgentRunStatus newStatus, AgentRunStatus expectedStatus) {
+        int rows = agentRunMapper.updateToolJobAnchorAndStatus(runId, anchor.toJson(), newStatus, expectedStatus);
+        return rows == 1;
+    }
+
+    /**
+     * Narrow PostgreSQL JSONB merge for checkpoint-failure ownership. It does
+     * not replace reservation/terminal fields and binds the failed checkpoint
+     * identity so a stale pipeline cannot poison a newer external job.
+     */
+    public boolean markCheckpointFailed(ToolJobCheckpointRequest request, String error) {
+        return agentRunMapper.markToolJobCheckpointFailed(
+                request.getRunId(), request.getOperationId(), request.getToolCallId(),
+                request.getAttempt(), request.getTaskId(),
+                request.getExpectedCheckpointVersion(), error) == 1;
+    }
+
+    /**
+     * CAS-update only the run status.
+     *
+     * @return true if the status was changed by this call
+     */
+    public boolean casUpdateStatus(String runId, AgentRunStatus newStatus, AgentRunStatus expectedStatus) {
+        int rows = agentRunMapper.casUpdateStatus(runId, newStatus, expectedStatus);
+        return rows == 1;
+    }
+
+    /**
+     * Lists all runs with non-empty tool job anchors in WAITING_TOOL_JOB status.
+     */
+    public List<AgentRun> listActive(int limit) {
+        return agentRunMapper.listActiveToolJobAnchors(limit);
+    }
+
+    /**
+     * Lists runs with status=RECEIVED and resumeState=READY/LAUNCHING,
+     * i.e. runs that were CAS-ed back to RECEIVED but may not have been
+     * picked up by the resume launcher (crash recovery).
+     */
+    public List<AgentRun> listResumeReady(int limit) {
+        return agentRunMapper.listResumeReadyAnchors(limit);
+    }
+
+    /**
+     * Atomic CAS: updates the anchor JSON only if the run status, resumeState,
+     * resumeToken, AND resumeLeaseVersion all match expected values.
+     * Prevents dual-launch races and stale-claim replays.
+     *
+     * @return true if exactly one row was updated (this caller won the claim)
+     */
+    public boolean casResumeState(String runId, ToolJobAnchor anchor,
+                                   AgentRunStatus expectedStatus, String expectedResumeState,
+                                   String expectedResumeToken, long expectedLeaseVersion) {
+        int rows = agentRunMapper.casUpdateAnchorResumeState(
+                runId, anchor.toJson(), expectedStatus, expectedResumeState,
+                expectedResumeToken, expectedLeaseVersion);
+        return rows == 1;
+    }
+
+    /**
+     * Atomic checkpoint merge: merges only checkpoint fields into anchor via
+     * jsonb || concat. WHERE binds identity + taskId + checkpointVersion.
+     * The SQL bumps checkpointVersion atomically. Preserves reservation,
+     * terminal, and finalizer fields from concurrent writes.
+     * @return true if exactly one row was updated
+     */
+    public boolean checkpointUpdate(String runId, ToolJobAnchor anchor,
+                                     AgentRunStatus expectedStatus,
+                                     String todoId, int sequence,
+                                     String completedTodosJson,
+                                     String datasetSnapshotJson, String datasetSnapshotDigest,
+                                     String datasetRefsJson, int toolCallsUsed,
+                                     String estimateJson) {
+        int rows = agentRunMapper.updateToolJobCheckpoint(
+                runId, expectedStatus,
+                anchor.getOperationId(), anchor.getToolCallId(),
+                anchor.getAttempt(), anchor.getTaskId(),
+                anchor.getCheckpointVersion(),
+                todoId, sequence,
+                completedTodosJson,
+                datasetSnapshotJson, datasetSnapshotDigest,
+                datasetRefsJson, toolCallsUsed,
+                estimateJson);
+        return rows == 1;
+    }
+
+    /**
+     * Token+state+version-gated clear: only clears if the anchor's resumeState,
+     * resumeToken, and resumeLeaseVersion all match. Prevents stale consumers
+     * from clearing an anchor that has been re-claimed with a new lease.
+     * There is no non-token-gated clear path.
+     * @return true if exactly one row was cleared
+     */
+    public boolean clearAnchorWithToken(String runId, String expectedResumeState,
+                                         String expectedToken, long expectedLeaseVersion) {
+        return agentRunMapper.clearToolJobAnchorWithToken(
+                runId, expectedResumeState, expectedToken, expectedLeaseVersion) == 1;
+    }
+}

@@ -11,6 +11,11 @@ public interface AgentRunEventMapper {
 
     int insert(AgentRunEvent event);
 
+    int insertOnce(AgentRunEvent event);
+
+    AgentRunEvent findByRunIdAndDedupeKey(@Param("runId") String runId,
+                                          @Param("dedupeKey") String dedupeKey);
+
     List<AgentRunEvent> listByRunIdAfterSeq(@Param("runId") String runId,
                                            @Param("afterSeq") int afterSeq,
                                            @Param("limit") int limit);

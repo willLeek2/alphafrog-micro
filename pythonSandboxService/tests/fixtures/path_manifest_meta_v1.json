@@ -1,0 +1,23 @@
+{
+  "schema_version": "agent_run_manifest_meta_v1",
+  "manifests": {
+    "3": {
+      "totalRowCount": 2000,
+      "totalBytes": 174000,
+      "columns": ["ts_code", "trade_date", "close", "vol", "amount"],
+      "recommendedUsecols": ["ts_code", "trade_date", "close", "vol", "amount"],
+      "recommendedDtype": {
+        "ts_code": "category",
+        "trade_date": "Int64",
+        "close": "float64",
+        "vol": "float64",
+        "amount": "float64"
+      },
+      "readProfiles": {
+        "price_volume": ["ts_code", "trade_date", "close", "vol", "amount"]
+      },
+      "memberNumbers": [7, 9],
+      "metadataStatus": "complete"
+    }
+  }
+}

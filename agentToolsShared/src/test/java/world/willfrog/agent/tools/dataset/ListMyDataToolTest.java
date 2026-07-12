@@ -63,10 +63,10 @@ class ListMyDataToolTest {
                 "UNCERTAIN", "g.csv");
         AgentRunDatasetEntry mf1 = AgentRunDatasetEntry.forManifest(
                 1, "manifest-mix", "/data/manifests/v1/manifest-manifest-mix/m.json",
-                "000300.SH", "manifest.json", List.of("ds-alpha", "ds-beta"));
+                "000300.SH", "manifest.json", List.of("1", "2"));
         AgentRunDatasetEntry mf2 = AgentRunDatasetEntry.forManifest(
                 2, "manifest-gamma-only", "/data/manifests/v1/manifest-gamma-only/m.json",
-                "UNCERTAIN", "manifest.json", List.of("ds-gamma-uncertain"));
+                "UNCERTAIN", "manifest.json", List.of("3"));
         return new AgentRunDatasetSnapshot(
                 List.of(ds1, ds2, ds3),
                 List.of(mf1, mf2));
@@ -108,9 +108,10 @@ class ListMyDataToolTest {
         assertEquals("manifest", root.path("data").path("query_type").asText());
         assertEquals(2, root.path("data").path("total_matched").asInt());
         JsonNode entries = root.path("data").path("entries");
-        // manifest entries 应带 relatedDatasetIds 字段
+        // manifest entries 只暴露 run-level related dataset numbers，不泄漏内部 ids。
         for (JsonNode e : entries) {
-            assertTrue(e.has("relatedDatasetIds"));
+            assertTrue(e.has("relatedDatasetNumbers"));
+            assertFalse(e.has("relatedDatasetIds"));
         }
     }
 
@@ -122,7 +123,7 @@ class ListMyDataToolTest {
         JsonNode root = mapper.readTree(result);
         assertTrue(root.path("ok").asBoolean());
         assertEquals(1, root.path("data").path("total_matched").asInt());
-        assertEquals("ds-beta", root.path("data").path("entries").get(0).path("originalId").asText());
+        assertEquals(2, root.path("data").path("entries").get(0).path("number").asInt());
     }
 
     @Test
@@ -134,7 +135,7 @@ class ListMyDataToolTest {
         JsonNode root = mapper.readTree(result);
         assertTrue(root.path("ok").asBoolean());
         assertEquals(1, root.path("data").path("total_matched").asInt());
-        assertEquals("ds-alpha", root.path("data").path("entries").get(0).path("originalId").asText());
+        assertEquals(1, root.path("data").path("entries").get(0).path("number").asInt());
     }
 
     @Test
@@ -144,7 +145,7 @@ class ListMyDataToolTest {
         JsonNode root = mapper.readTree(result);
         assertEquals(3, root.path("data").path("total_matched").asInt());
         assertEquals(1, root.path("data").path("returned_count").asInt());
-        assertEquals("ds-beta", root.path("data").path("entries").get(0).path("originalId").asText());
+        assertEquals(2, root.path("data").path("entries").get(0).path("number").asInt());
     }
 
     @Test
@@ -178,17 +179,17 @@ class ListMyDataToolTest {
     void relatedDatasetIdsShouldFilterManifests() throws Exception {
         when(registry.snapshot("run-1")).thenReturn(snapshot());
         // 只匹配 related 包含 ds-alpha 的 manifest → manifest-mix
-        String result = tool.listMyData6("manifest", null, null, null, null, "ds-alpha");
+        String result = tool.listMyData6("manifest", null, null, null, null, "1");
         JsonNode root = mapper.readTree(result);
         assertEquals(1, root.path("data").path("total_matched").asInt());
-        assertEquals("manifest-mix", root.path("data").path("entries").get(0).path("originalId").asText());
+        assertEquals(1, root.path("data").path("entries").get(0).path("number").asInt());
     }
 
     @Test
     void relatedDatasetIdsShouldIgnoreForDatasetQuery() throws Exception {
         // dataset 查询传 related_dataset_ids 应当被忽略（不报错也不过滤）
         when(registry.snapshot("run-1")).thenReturn(snapshot());
-        String result = tool.listMyData6("dataset", null, null, null, null, "ds-alpha");
+        String result = tool.listMyData6("dataset", null, null, null, null, "1");
         JsonNode root = mapper.readTree(result);
         assertEquals(3, root.path("data").path("total_matched").asInt(),
                 "related_dataset_ids 不应影响 dataset 查询");
@@ -216,7 +217,6 @@ class ListMyDataToolTest {
         assertEquals(2, matches.size());
         // 第一名应是 ds-alpha（match_count=2）
         assertEquals(1, matches.get(0).path("dataset_number").asInt());
-        assertEquals("ds-alpha", matches.get(0).path("dataset_id").asText());
         assertEquals(2, matches.get(0).path("match_count").asInt());
         assertEquals("000300.SH", matches.get(0).path("from_ts_code").asText());
         assertTrue(matches.get(0).path("snippet_preview").asText().contains("alpha"));
@@ -238,9 +238,9 @@ class ListMyDataToolTest {
         JsonNode root = mapper.readTree(result);
         JsonNode matches = root.path("data").path("matches");
         assertEquals(2, matches.size());
-        assertEquals("ds-many", matches.get(0).path("dataset_id").asText());
+        assertEquals(1, matches.get(0).path("dataset_number").asInt());
         assertEquals(4, matches.get(0).path("match_count").asInt());
-        assertEquals("ds-few", matches.get(1).path("dataset_id").asText());
+        assertEquals(2, matches.get(1).path("dataset_number").asInt());
         assertEquals(1, matches.get(1).path("match_count").asInt());
     }
 
@@ -330,5 +330,20 @@ class ListMyDataToolTest {
         assertTrue(root.path("ok").asBoolean());
         assertEquals(1, root.path("data").path("matched_count").asInt(),
                 "missing file 应被静默跳过，ds2 命中");
+    }
+
+    @Test
+    void defaultViewShouldHideInternalIdsAndHostPaths() throws Exception {
+        when(registry.snapshot("run-1")).thenReturn(snapshot());
+
+        JsonNode root = mapper.readTree(tool.listMyData6("dataset", null, null, null, null, null));
+        JsonNode entry = root.path("data").path("entries").get(0);
+
+        assertFalse(entry.has("originalId"));
+        assertFalse(entry.has("persistedPath"));
+        assertFalse(entry.has("sortKey"));
+        assertEquals(1, entry.path("number").asInt());
+        assertTrue(entry.has("bytes"));
+        assertTrue(entry.has("metadataStatus"));
     }
 }

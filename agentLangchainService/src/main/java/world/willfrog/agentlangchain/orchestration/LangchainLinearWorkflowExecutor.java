@@ -7,6 +7,8 @@ import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agent.workflow.DatasetRefRegistry;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 import world.willfrog.agent.workflow.TodoItem;
+import world.willfrog.agent.platform.dataanalysis.CompletedTodoRecord;
+import world.willfrog.agentlangchain.tooljob.ToolJobResumeContext;
 import world.willfrog.agentlangchain.planning.LangchainAiPlanner;
 import world.willfrog.agentlangchain.planning.LangchainPlanningRequest;
 import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
@@ -18,6 +20,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BooleanSupplier;
+import java.util.stream.Collectors;
 
 /**
  * LINEAR（线性）工作流执行器 —— 按顺序逐个执行 Todo，一步失败则整个 run 失败。
@@ -71,7 +75,7 @@ public class LangchainLinearWorkflowExecutor {
                     .executionMode(PlanExecutionMode.LINEAR)
                     .maxTodos(request.getMaxTodos())
                     .build());
-            return executePlanned(request, plan, toolCalls);
+            return executePlanned(request, plan, toolCalls, null, null);
         } catch (Exception e) {
             return LangchainLinearWorkflowResult.builder()
                     .success(false)
@@ -89,7 +93,37 @@ public class LangchainLinearWorkflowExecutor {
         AtomicInteger toolCalls = new AtomicInteger();
         try {
             applyRunContext(request);
-            return executePlanned(request, plan, toolCalls);
+            return executePlanned(request, plan, toolCalls, null, null);
+        } catch (Exception e) {
+            return LangchainLinearWorkflowResult.builder()
+                    .success(false)
+                    .failureReason(e.getMessage())
+                    .plan(plan)
+                    .toolCallsUsed(toolCalls.get())
+                    .build();
+        } finally {
+            AgentContext.clear();
+        }
+    }
+
+    /**
+     * Resumes a previously planned LINEAR workflow without invoking the planner or
+     * re-running already completed todos. The suspended todo's durable terminal
+     * result is injected as its completion and therefore does not increment the
+     * logical tool-call counter.
+     */
+    public LangchainLinearWorkflowResult resumePlanned(LangchainLinearWorkflowRequest request,
+                                                       LangchainTodoPlan plan,
+                                                       ToolJobResumeContext context,
+                                                       BooleanSupplier terminalConsumed) {
+        validate(request);
+        if (plan == null || context == null) {
+            throw new IllegalArgumentException("resume_plan_and_context_required");
+        }
+        AtomicInteger toolCalls = new AtomicInteger(Math.max(0, context.getToolCallsUsed()));
+        try {
+            applyRunContext(request);
+            return executePlanned(request, plan, toolCalls, context, terminalConsumed);
         } catch (Exception e) {
             return LangchainLinearWorkflowResult.builder()
                     .success(false)
@@ -104,12 +138,83 @@ public class LangchainLinearWorkflowExecutor {
 
     private LangchainLinearWorkflowResult executePlanned(LangchainLinearWorkflowRequest request,
                                                          LangchainTodoPlan plan,
-                                                         AtomicInteger toolCalls) {
+                                                         AtomicInteger toolCalls,
+                                                         ToolJobResumeContext resumeContext,
+                                                         BooleanSupplier terminalConsumed) {
         AgentContext.setWorkflow("linear");
         AgentContext.setExtractedEntities(plan.getExtractedEntities());
-        List<LangchainCompletedTodo> completedTodos = new ArrayList<>();
+        List<LangchainCompletedTodo> completedTodos = resumeContext == null
+                ? new ArrayList<>()
+                : restoreCompletedTodos(resumeContext.getCompletedTodos());
         Map<String, String> datasetRefs = LangchainTodoUserMessageBuilder.newDatasetRefMap();
+        completedTodos.forEach(todo -> DatasetRefRegistry.registerFromJson(todo.displayOutput(), datasetRefs));
+        java.util.Set<String> completedIds = completedTodos.stream()
+                .map(LangchainCompletedTodo::getTodoId)
+                .filter(java.util.Objects::nonNull)
+                .collect(Collectors.toCollection(java.util.LinkedHashSet::new));
+        boolean handoffAccepted = resumeContext != null && resumeContext.isResultConsumed();
+        boolean resumeAtFinal = handoffAccepted
+                && ToolJobResumeContext.FINAL_TODO_ID.equals(resumeContext.getTodoId());
+        TodoItem suspendedItem = resumeContext == null || resumeAtFinal ? null : plan.getItems().stream()
+                .filter(item -> java.util.Objects.equals(item.getId(), resumeContext.getTodoId()))
+                .findFirst()
+                .orElse(null);
+        if (resumeContext != null && suspendedItem == null && !resumeAtFinal) {
+            return failure(plan, completedTodos, "resume_todo_not_in_plan", toolCalls.get(), null);
+        }
+        int resumeSequence = resumeAtFinal ? Integer.MAX_VALUE : suspendedItem == null
+                ? Integer.MIN_VALUE : suspendedItem.getSequence();
+        if (resumeContext != null && completedTodos.stream()
+                .anyMatch(todo -> todo.getSequence() >= resumeSequence)) {
+            return failure(plan, completedTodos, "resume_completed_todo_out_of_order",
+                    toolCalls.get(), null);
+        }
+        if (handoffAccepted && !resumeContext.isTerminalSuccess()) {
+            return failure(plan, completedTodos, "external_tool_terminal_failure",
+                    toolCalls.get(), null);
+        }
         for (TodoItem item : plan.getItems()) {
+            if (resumeContext != null && completedIds.contains(item.getId())) {
+                continue;
+            }
+            if (resumeContext != null && item.getSequence() < resumeSequence) {
+                continue;
+            }
+            if (resumeContext != null && !handoffAccepted
+                    && java.util.Objects.equals(item.getId(), suspendedItem.getId())) {
+                long nodeStartMs = System.currentTimeMillis();
+                String injectedOutput = resumeTerminalOutput(resumeContext);
+                if (!resumeContext.isTerminalSuccess()) {
+                    emitTodoNodeEvent(request.getRunId(), request.getUserId(),
+                            "TODO_NODE_FAILED", item, "external_tool_terminal_failure", 0,
+                            null, false, null);
+                    prepareAcceptedHandoff(resumeContext, plan, completedTodos, item, toolCalls.get(), false);
+                    if (terminalConsumed == null || !terminalConsumed.getAsBoolean()) {
+                        return failure(plan, completedTodos, "resume_result_consume_failed",
+                                toolCalls.get(), null);
+                    }
+                    return failure(plan, completedTodos, "external_tool_terminal_failure",
+                            toolCalls.get(), null);
+                }
+                DatasetRefRegistry.registerFromJson(injectedOutput, datasetRefs);
+                completedTodos.add(LangchainCompletedTodo.builder()
+                        .todoId(item.getId())
+                        .sequence(item.getSequence())
+                        .description(item.getDescription())
+                        .modelOutput(injectedOutput)
+                        .output(injectedOutput)
+                        .summary("external_tool_result")
+                        .build());
+                emitTodoNodeEvent(request.getRunId(), request.getUserId(),
+                        "TODO_NODE_COMPLETED", item, null,
+                        System.currentTimeMillis() - nodeStartMs, null, false, null);
+                prepareAcceptedHandoff(resumeContext, plan, completedTodos, item, toolCalls.get(), true);
+                if (terminalConsumed == null || !terminalConsumed.getAsBoolean()) {
+                    return failure(plan, completedTodos, "resume_result_consume_failed",
+                            toolCalls.get(), null);
+                }
+                continue;
+            }
             Optional<String> stop = executionGuard.stopReason(request.getRunId(), request.getUserId());
             if (stop.isPresent()) {
                 // Cancel/pause：当前剩余节点全部标记为 SKIPPED
@@ -130,6 +235,23 @@ public class LangchainLinearWorkflowExecutor {
             LangchainTodoNodeResult nodeResult = todoNodeExecutor.execute(
                     request, item, completedTodos, datasetRefs, toolCalls);
             long nodeDurationMs = System.currentTimeMillis() - nodeStartMs;
+            if (nodeResult.isSuspended()) {
+                emitTodoNodeEvent(request.getRunId(), request.getUserId(),
+                        "TODO_NODE_SUSPENDED", item, "external_tool_job_pending", nodeDurationMs,
+                        null, false, null);
+                return LangchainLinearWorkflowResult.builder()
+                        .success(false)
+                        .suspended(true)
+                        .plan(plan)
+                        .completedTodos(completedTodos)
+                        .toolCallsUsed(toolCalls.get())
+                        .suspendedTodoId(item.getId())
+                        .suspendedTodoSequence(item.getSequence())
+                        .pendingRunId(nodeResult.getPendingRunId())
+                        .pendingToolCallId(nodeResult.getPendingToolCallId())
+                        .pendingAttempt(nodeResult.getPendingAttempt())
+                        .build();
+            }
             if (!nodeResult.isSuccess()) {
                 String reason = nvl(nodeResult.getFailureReason(), nodeResult.getSummary());
                 Map<String, Object> failureMetadata = nodeResult.getFailureMetadata();
@@ -176,6 +298,63 @@ public class LangchainLinearWorkflowExecutor {
                 .completedTodos(completedTodos)
                 .toolCallsUsed(toolCalls.get())
                 .build();
+    }
+
+    private void prepareAcceptedHandoff(ToolJobResumeContext context,
+                                        LangchainTodoPlan plan,
+                                        List<LangchainCompletedTodo> completedTodos,
+                                        TodoItem current,
+                                        int toolCallsUsed,
+                                        boolean continueWorkflow) {
+        List<CompletedTodoRecord> records = completedTodos.stream().map(todo -> {
+            CompletedTodoRecord record = new CompletedTodoRecord();
+            record.setTodoId(todo.getTodoId());
+            record.setSequence(todo.getSequence());
+            record.setDescription(todo.getDescription());
+            record.setModelOutput(todo.getModelOutput());
+            record.setOutput(todo.getOutput());
+            record.setSummary(todo.getSummary());
+            return record;
+        }).toList();
+        context.setCompletedTodos(records);
+        context.setToolCallsUsed(toolCallsUsed);
+        TodoItem next = continueWorkflow ? plan.getItems().stream()
+                .filter(item -> item.getSequence() > current.getSequence())
+                .min(java.util.Comparator.comparingInt(TodoItem::getSequence))
+                .orElse(null) : null;
+        context.setTodoId(next == null ? ToolJobResumeContext.FINAL_TODO_ID : next.getId());
+        context.setTodoSequence(next == null ? current.getSequence() : next.getSequence());
+        context.setResultConsumed(true);
+    }
+
+    private List<LangchainCompletedTodo> restoreCompletedTodos(List<CompletedTodoRecord> records) {
+        if (records == null || records.isEmpty()) {
+            return new ArrayList<>();
+        }
+        return records.stream().map(record -> LangchainCompletedTodo.builder()
+                        .todoId(record.getTodoId())
+                        .sequence(record.getSequence())
+                        .description(record.getDescription())
+                        .modelOutput(record.getModelOutput())
+                        .output(record.getOutput())
+                        .summary(record.getSummary())
+                        .build())
+                .collect(Collectors.toCollection(ArrayList::new));
+    }
+
+    private String resumeTerminalOutput(ToolJobResumeContext context) {
+        String preview = context.getTerminalResultPreview();
+        String rawRef = context.getTerminalRawRef();
+        if (!isBlank(preview) && !isBlank(rawRef)) {
+            return preview.trim() + "\nrawRef: " + rawRef.trim();
+        }
+        if (!isBlank(preview)) {
+            return preview.trim();
+        }
+        if (!isBlank(rawRef)) {
+            return "rawRef: " + rawRef.trim();
+        }
+        return context.isTerminalSuccess() ? "external tool completed" : "external tool failed";
     }
 
     private LangchainLinearWorkflowResult failure(LangchainTodoPlan plan,

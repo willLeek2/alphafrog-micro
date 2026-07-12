@@ -2,6 +2,7 @@ package world.willfrog.agentlangchain.orchestration;
 
 import lombok.Builder;
 import lombok.Data;
+import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingException;
 
 import java.util.Map;
 
@@ -9,6 +10,8 @@ import java.util.Map;
 @Builder
 public class LangchainTodoNodeResult {
     private boolean success;
+    @Builder.Default
+    private boolean suspended = false;
     private String output;
     private String summary;
     private String failureReason;
@@ -33,6 +36,9 @@ public class LangchainTodoNodeResult {
      * （按 {@link #routeFailureMetadataField} 语义路由到 {@code budget_failure} / {@code empty_output_observation} / {@code failure_metadata} 之一）。
      */
     private Map<String, Object> failureMetadata;
+    private String pendingRunId;
+    private String pendingToolCallId;
+    private int pendingAttempt;
 
     public static LangchainTodoNodeResult success(String output, int toolCallsUsed) {
         return success(output, toolCallsUsed, false, null);
@@ -72,6 +78,18 @@ public class LangchainTodoNodeResult {
                 .failureReason(reason)
                 .summary(reason)
                 .output("")
+                .build();
+    }
+
+    public static LangchainTodoNodeResult suspended(ExternalToolJobPendingException pending) {
+        return LangchainTodoNodeResult.builder()
+                .success(false)
+                .suspended(true)
+                .summary("external_tool_job_pending")
+                .output("")
+                .pendingRunId(pending.getRunId())
+                .pendingToolCallId(pending.getToolCallId())
+                .pendingAttempt(pending.getAttempt())
                 .build();
     }
 

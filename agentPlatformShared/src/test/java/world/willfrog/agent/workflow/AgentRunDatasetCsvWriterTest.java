@@ -38,9 +38,9 @@ class AgentRunDatasetCsvWriterTest {
         String csv = AgentRunDatasetCsvWriter.writePathsDatasetCsv(snap);
         String[] lines = csv.split("\n");
         assertEquals("agent_run_dataset_id,dataset_file_path,from_ts_code,source_path", lines[0]);
-        assertEquals("1,/__AF_INPUT__/ds-a/a.csv,000300.SH,/data/database_fetched/ds-a/a.csv", lines[1]);
+        assertEquals("1,/__AF_INPUT__/_run_dataset_1/a.csv,000300.SH,/data/database_fetched/ds-a/a.csv", lines[1]);
         // multi-ts-code 含 `#`，按 spec §4.1.2 不强制 quote，保持简单
-        assertEquals("2,/__AF_INPUT__/ds-b/b.csv,000300.SH#510300.SH,/data/database_fetched/ds-b/b.csv", lines[2]);
+        assertEquals("2,/__AF_INPUT__/_run_dataset_2/b.csv,000300.SH#510300.SH,/data/database_fetched/ds-b/b.csv", lines[2]);
     }
 
     @Test
@@ -53,28 +53,33 @@ class AgentRunDatasetCsvWriterTest {
     @Test
     void pathManifestCsvShouldJoinRelatedDatasetIdsWithHash() {
         AgentRunDatasetSnapshot snap = new AgentRunDatasetSnapshot(
-                List.of(),
                 List.of(
-                        manifestEntry(1, "m-x", "manifest.json", List.of("ds-1", "ds-2", "ds-3")),
-                        manifestEntry(2, "m-y", "manifest.json", List.of("ds-4"))
+                        datasetEntry(7, "ds-1", "one.csv", "1"),
+                        datasetEntry(9, "ds-2", "two.csv", "2"),
+                        datasetEntry(11, "ds-3", "three.csv", "3"),
+                        datasetEntry(13, "ds-4", "four.csv", "4")
+                ),
+                List.of(
+                        manifestEntry(1, "m-x", "manifest.json", List.of("7", "9", "11")),
+                        manifestEntry(2, "m-y", "manifest.json", List.of("13"))
                 )
         );
         String csv = AgentRunDatasetCsvWriter.writePathManifestCsv(snap);
         String[] lines = csv.split("\n");
         assertEquals("agent_run_manifest_id,manifest_file_path,related_dataset_ids,source_path", lines[0]);
-        assertEquals("1,/__AF_INPUT__/m-x/manifest.json,ds-1#ds-2#ds-3,/data/manifests/v1/manifest-m-x/manifest.json", lines[1]);
-        assertEquals("2,/__AF_INPUT__/m-y/manifest.json,ds-4,/data/manifests/v1/manifest-m-y/manifest.json", lines[2]);
+        assertEquals("1,/__AF_INPUT__/_run_manifest_1/manifest.json,7#9#11,/data/manifests/v1/manifest-m-x/manifest.json", lines[1]);
+        assertEquals("2,/__AF_INPUT__/_run_manifest_2/manifest.json,13,/data/manifests/v1/manifest-m-y/manifest.json", lines[2]);
     }
 
     @Test
     void pathManifestCsvWithNoneMarkerShouldEmitNoneLiteral() {
         AgentRunDatasetSnapshot snap = new AgentRunDatasetSnapshot(
-                List.of(),
-                List.of(manifestNone(1, "m-virtual", List.of("ds-1")))
+                List.of(datasetEntry(5, "ds-1", "one.csv", "1")),
+                List.of(manifestNone(1, "m-virtual", List.of("5")))
         );
         String csv = AgentRunDatasetCsvWriter.writePathManifestCsv(snap);
         String[] lines = csv.split("\n");
-        assertEquals("1,NONE,ds-1,", lines[1]);
+        assertEquals("1,NONE,5,", lines[1]);
     }
 
     @Test
@@ -85,7 +90,7 @@ class AgentRunDatasetCsvWriterTest {
         AgentRunDatasetSnapshot snap = new AgentRunDatasetSnapshot(List.of(e), List.of());
         String csv = AgentRunDatasetCsvWriter.writePathsDatasetCsv(snap);
         String[] lines = csv.split("\n");
-        assertTrue(lines[1].contains("\"/__AF_INPUT__/ds-x/a, b.csv\""),
+        assertTrue(lines[1].contains("\"/__AF_INPUT__/_run_dataset_1/a, b.csv\""),
                 "field with comma should be quoted; got: " + lines[1]);
     }
 
@@ -122,7 +127,7 @@ class AgentRunDatasetCsvWriterTest {
         assertFalse(dsCsv.contains("manifest-beta"));
         assertFalse(dsCsv.contains("manifest.json"));
         // manifest CSV 不应包含 dataset file path 字段
-        assertFalse(mfCsv.contains("/__AF_INPUT__/ds-alpha/alpha.csv"));
+        assertFalse(mfCsv.contains("/__AF_INPUT__/_run_dataset_1/alpha.csv"));
     }
 
     @Test

@@ -40,6 +40,7 @@ class SandboxJob:
     # 260623-harness-optimization-02: agent run 级 dataset / manifest CSV 注入
     paths_dataset_csv: str | None = None
     path_manifest_csv: str | None = None
+    resource_class: str = "STANDARD"
 
 
 class ContainerWorker:
@@ -228,6 +229,8 @@ class ContainerWorker:
             queue_wait_ms=queue_wait_ms,
             container_id=self.container_id,
             prepare_loader_modules=False,
+            resource_class=job.resource_class,
+            usage_sampling_interval_millis=self.config.usage_sampling_interval_millis,
         )
 
     def _on_job_done(self, job: SandboxJob, future: Future) -> None:
@@ -316,6 +319,7 @@ class ContainerPoolScheduler:
         timeout_seconds: float | None,
         paths_dataset_csv: str | None = None,
         path_manifest_csv: str | None = None,
+        resource_class: str = "STANDARD",
     ) -> dict:
         if self._closing:
             raise RuntimeError("sandbox pool is closing")
@@ -336,6 +340,7 @@ class ContainerPoolScheduler:
                 future=future,
                 paths_dataset_csv=paths_dataset_csv,
                 path_manifest_csv=path_manifest_csv,
+                resource_class=resource_class,
             )
         )
         self._maybe_scale_up()
@@ -512,7 +517,7 @@ class ContainerPoolScheduler:
                     pass
 
     def _task_wait_timeout(self, timeout_seconds: float | None) -> float:
-        return max((timeout_seconds or self.config.execution_timeout_seconds) * 2, 30)
+        return (timeout_seconds or self.config.execution_timeout_seconds) + self.config.queue_wait_timeout_seconds
 
     def _start_worker(self, *, block_until_ready: bool) -> None:
         effective = self._effective_config()

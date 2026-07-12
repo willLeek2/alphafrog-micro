@@ -14,8 +14,8 @@ llm_sandbox_exceptions.SandboxTimeoutError = TimeoutError
 sys.modules.setdefault("llm_sandbox", llm_sandbox)
 sys.modules.setdefault("llm_sandbox.exceptions", llm_sandbox_exceptions)
 
-from app.config import SandboxConfig
-from app.sandbox_runner import (
+from app.config import SandboxConfig  # noqa: E402
+from app.sandbox_runner import (  # noqa: E402
     SANDBOX_LOADER_FILES,
     _loader_smoke_check_command,
     run_in_open_session,
@@ -114,6 +114,11 @@ class SandboxRunnerLoaderTest(unittest.TestCase):
         self.assertEqual(timings["env_load_ms"], timings["workspace_prepare_ms"])
         self.assertEqual(timings["code_exec_ms"], timings["script_run_ms"])
         self.assertGreaterEqual(timings["artifact_collect_ms"], 0)
+        usage = result["resource_usage"]
+        self.assertEqual(usage["resource_class"], "STANDARD")
+        self.assertEqual(usage["exit_reason"], "SUCCEEDED")
+        self.assertEqual(usage["queue_wait_millis"], 0)
+        self.assertIn("attribution_complete", usage)
 
 
 if __name__ == "__main__":

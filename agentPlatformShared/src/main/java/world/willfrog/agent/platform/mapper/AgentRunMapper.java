@@ -86,4 +86,106 @@ public interface AgentRunMapper {
      * @return 实际删除的记录数（成功为 1，未找到匹配记录为 0）
      */
     int deleteByIdAndUser(@Param("id") String id, @Param("userId") String userId);
+
+    // ===== Tool Job Anchor =====
+
+    /**
+     * 原子更新 tool_job_anchor_json，带前置状态条件（Compare-And-Set）。
+     * 更新 1 行表示当前调用者获得更新权；更新 0 行表示状态已变更。
+     */
+    int updateToolJobAnchor(@Param("id") String id,
+                            @Param("toolJobAnchorJson") String toolJobAnchorJson,
+                            @Param("expectedStatus") AgentRunStatus expectedStatus);
+
+    /**
+     * 原子更新 tool_job_anchor_json 和 status，带前置状态条件。
+     */
+    int updateToolJobAnchorAndStatus(@Param("id") String id,
+                                     @Param("toolJobAnchorJson") String toolJobAnchorJson,
+                                     @Param("newStatus") AgentRunStatus newStatus,
+                                     @Param("expectedStatus") AgentRunStatus expectedStatus);
+
+    /** Whitelist merge used when a full checkpoint write fails. */
+    int markToolJobCheckpointFailed(@Param("id") String id,
+                                    @Param("operationId") String operationId,
+                                    @Param("toolCallId") String toolCallId,
+                                    @Param("attempt") int attempt,
+                                    @Param("taskId") String taskId,
+                                    @Param("checkpointVersion") int checkpointVersion,
+                                    @Param("finalizerError") String finalizerError);
+
+    int markToolJobCheckpointFailurePending(@Param("id") String id,
+                                            @Param("operationId") String operationId,
+                                            @Param("toolCallId") String toolCallId,
+                                            @Param("attempt") int attempt,
+                                            @Param("taskId") String taskId,
+                                            @Param("checkpointVersion") int checkpointVersion,
+                                            @Param("marker") String marker);
+
+    int clearToolJobCheckpointFailurePending(@Param("id") String id,
+                                             @Param("marker") String marker);
+
+    /**
+     * 条件更新 status（CAS）：只有当前状态等于 expectedStatus 时才更新。
+     * 返回 1 表示获得变更权，0 表示已被其他流程变更。
+     */
+    int casUpdateStatus(@Param("id") String id,
+                        @Param("newStatus") AgentRunStatus newStatus,
+                        @Param("expectedStatus") AgentRunStatus expectedStatus);
+
+    /**
+     * 列出存在活跃 tool job anchor 的 run，用于 reconciler 周期补扫。
+     * 返回非终态 + WAITING_TOOL_JOB + RESULT_FETCH_PENDING 的 run。
+     */
+    List<AgentRun> listActiveToolJobAnchors(@Param("limit") int limit);
+
+    /**
+     * 列出 status=RECEIVED 且 tool_job_anchor_json 中 resumeState 为 READY 或 LAUNCHING 的 run，
+     * 用于启动恢复和 reconciler 扫描在 CAS 之后但 launch 之前崩溃的 run。
+     */
+    List<AgentRun> listResumeReadyAnchors(@Param("limit") int limit);
+
+    /**
+     * 原子 CAS 更新 resmeState：同时约束 status、JSON 内的 resumeState、resumeToken、resumeLeaseVersion 字段。
+     * 防止两个进程同时读取 READY 后双 launch，以及过期 token/version 的陈旧声明。
+     */
+    int casUpdateAnchorResumeState(@Param("id") String id,
+                                   @Param("toolJobAnchorJson") String toolJobAnchorJson,
+                                   @Param("expectedStatus") AgentRunStatus expectedStatus,
+                                   @Param("expectedResumeState") String expectedResumeState,
+                                   @Param("expectedResumeToken") String expectedResumeToken,
+                                   @Param("expectedLeaseVersion") long expectedLeaseVersion);
+
+    /**
+     * Atomic checkpoint merge: merges only checkpoint whitelist fields into the
+     * anchor JSON via jsonb || concat (preserving reservation/terminal/finalizer).
+     * WHERE binds id, status, operationId, toolCallId, attempt, taskId, AND
+     * checkpointVersion to prevent lost updates. checkpointVersion is atomically bumped.
+     */
+    int updateToolJobCheckpoint(@Param("id") String id,
+                                 @Param("expectedStatus") AgentRunStatus expectedStatus,
+                                 @Param("expectedOperationId") String expectedOperationId,
+                                 @Param("expectedToolCallId") String expectedToolCallId,
+                                 @Param("expectedAttempt") int expectedAttempt,
+                                 @Param("expectedTaskId") String expectedTaskId,
+                                 @Param("expectedCheckpointVersion") int expectedCheckpointVersion,
+                                 @Param("todoId") String todoId,
+                                 @Param("sequence") int sequence,
+                                 @Param("completedTodosJson") String completedTodosJson,
+                                 @Param("datasetSnapshotJson") String datasetSnapshotJson,
+                                 @Param("datasetSnapshotDigest") String datasetSnapshotDigest,
+                                 @Param("datasetRefsJson") String datasetRefsJson,
+                                 @Param("toolCallsUsed") int toolCallsUsed,
+                                 @Param("estimateJson") String estimateJson);
+
+    /**
+     * Token+state+version-gated clear: only clears if resumeState, resumeToken,
+     * AND resumeLeaseVersion all match. Prevents stale consumers from clearing
+     * an anchor that has already been re-claimed with a new token/version.
+     * There is no non-token-gated clear — cleanup without valid token is rejected.
+     */
+    int clearToolJobAnchorWithToken(@Param("id") String id,
+                                    @Param("expectedResumeState") String expectedResumeState,
+                                    @Param("expectedToken") String expectedToken,
+                                    @Param("expectedLeaseVersion") long expectedLeaseVersion);
 }

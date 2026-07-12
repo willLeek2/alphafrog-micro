@@ -17,6 +17,7 @@
         <result property="updatedAt" column="updated_at"/>
         <result property="completedAt" column="completed_at"/>
         <result property="ext" column="ext"/>
+        <result property="toolJobAnchorJson" column="tool_job_anchor_json"/>
         <result property="durationMs" column="duration_ms"/>
         <result property="totalTokens" column="total_tokens"/>
         <result property="toolCalls" column="tool_calls"/>
@@ -24,10 +25,10 @@
 
     <insert id="insert" parameterType="world.willfrog.agent.platform.entity.AgentRun">
         INSERT INTO alphafrog_agent_run
-        (id, user_id, status, current_step, max_steps, plan_json, snapshot_json, last_error, ttl_expires_at, ext)
+        (id, user_id, status, current_step, max_steps, plan_json, snapshot_json, last_error, ttl_expires_at, ext, tool_job_anchor_json)
         VALUES
         (#{id}, #{userId}, #{status}, #{currentStep}, #{maxSteps},
-         CAST(#{planJson} AS jsonb), CAST(#{snapshotJson} AS jsonb), #{lastError}, #{ttlExpiresAt}, CAST(#{ext} AS jsonb))
+         CAST(#{planJson} AS jsonb), CAST(#{snapshotJson} AS jsonb), #{lastError}, #{ttlExpiresAt}, CAST(#{ext} AS jsonb), CAST(#{toolJobAnchorJson} AS jsonb))
     </insert>
 
     <select id="findById" resultMap="AgentRunResultMap">
@@ -43,7 +44,8 @@
                started_at,
                updated_at,
                completed_at,
-               ext::text AS ext
+               ext::text AS ext,
+               tool_job_anchor_json::text AS tool_job_anchor_json
         FROM alphafrog_agent_run
         WHERE id = #{id}
         LIMIT 1
@@ -62,7 +64,8 @@
                started_at,
                updated_at,
                completed_at,
-               ext::text AS ext
+               ext::text AS ext,
+               tool_job_anchor_json::text AS tool_job_anchor_json
         FROM alphafrog_agent_run
         WHERE id = #{id}
           AND user_id = #{userId}
@@ -155,6 +158,7 @@
                updated_at,
                completed_at,
                ext::text AS ext,
+               tool_job_anchor_json::text AS tool_job_anchor_json,
                0 AS duration_ms,
                0 AS total_tokens,
                0 AS tool_calls
@@ -259,5 +263,187 @@
         WHERE id = #{id}
           AND user_id = #{userId}
     </delete>
+
+    <!-- ===== Tool Job Anchor ===== -->
+
+    <update id="updateToolJobAnchor">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = CAST(#{toolJobAnchorJson} AS jsonb),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status = #{expectedStatus}
+    </update>
+
+    <update id="updateToolJobAnchorAndStatus">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = CAST(#{toolJobAnchorJson} AS jsonb),
+            status = #{newStatus},
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status = #{expectedStatus}
+    </update>
+
+    <update id="markToolJobCheckpointFailed">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = tool_job_anchor_json || jsonb_build_object(
+                'autoResume', false,
+                'runDisposition', 'CHECKPOINT_FAILED',
+                'finalizerError', #{finalizerError}
+            ),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status = 'WAITING_TOOL_JOB'
+          AND tool_job_anchor_json IS NOT NULL
+          AND tool_job_anchor_json &lt;&gt; '{}'::jsonb
+          AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{operationId}
+          AND tool_job_anchor_json -&gt;&gt; 'toolCallId' = #{toolCallId}
+          AND COALESCE((tool_job_anchor_json -&gt;&gt; 'attempt')::integer, 0) = #{attempt}
+          AND tool_job_anchor_json -&gt;&gt; 'taskId' = #{taskId}
+          AND COALESCE((tool_job_anchor_json -&gt;&gt; 'checkpointVersion')::integer, 0) = #{checkpointVersion}
+    </update>
+
+    <update id="markToolJobCheckpointFailurePending">
+        UPDATE alphafrog_agent_run
+        SET last_error = #{marker},
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status = 'WAITING_TOOL_JOB'
+          AND tool_job_anchor_json IS NOT NULL
+          AND tool_job_anchor_json &lt;&gt; '{}'::jsonb
+          AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{operationId}
+          AND tool_job_anchor_json -&gt;&gt; 'toolCallId' = #{toolCallId}
+          AND COALESCE((tool_job_anchor_json -&gt;&gt; 'attempt')::integer, 0) = #{attempt}
+          AND tool_job_anchor_json -&gt;&gt; 'taskId' = #{taskId}
+          AND COALESCE((tool_job_anchor_json -&gt;&gt; 'checkpointVersion')::integer, 0) = #{checkpointVersion}
+          AND (last_error IS NULL OR last_error = #{marker})
+    </update>
+
+    <update id="clearToolJobCheckpointFailurePending">
+        UPDATE alphafrog_agent_run
+        SET last_error = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND last_error = #{marker}
+    </update>
+
+    <update id="casUpdateStatus">
+        UPDATE alphafrog_agent_run
+        SET status = #{newStatus},
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status = #{expectedStatus}
+    </update>
+
+    <select id="listActiveToolJobAnchors" resultMap="AgentRunResultMap">
+        SELECT id,
+               user_id,
+               status,
+               current_step,
+               max_steps,
+               plan_json::text AS plan_json,
+               snapshot_json::text AS snapshot_json,
+               last_error,
+               ttl_expires_at,
+               started_at,
+               updated_at,
+               completed_at,
+               ext::text AS ext,
+               tool_job_anchor_json::text AS tool_job_anchor_json,
+               0 AS duration_ms,
+               0 AS total_tokens,
+               0 AS tool_calls
+        FROM alphafrog_agent_run
+        WHERE tool_job_anchor_json IS NOT NULL
+          AND tool_job_anchor_json &lt;&gt; '{}'::jsonb
+          AND status IN ('WAITING_TOOL_JOB', 'WAITING', 'CANCELED')
+        ORDER BY updated_at ASC
+        LIMIT #{limit}
+    </select>
+
+    <select id="listResumeReadyAnchors" resultMap="AgentRunResultMap">
+        SELECT id,
+               user_id,
+               status,
+               current_step,
+               max_steps,
+               plan_json::text AS plan_json,
+               snapshot_json::text AS snapshot_json,
+               last_error,
+               ttl_expires_at,
+               started_at,
+               updated_at,
+               completed_at,
+               ext::text AS ext,
+               tool_job_anchor_json::text AS tool_job_anchor_json,
+               0 AS duration_ms,
+               0 AS total_tokens,
+               0 AS tool_calls
+        FROM alphafrog_agent_run
+        WHERE status = 'RECEIVED'
+          AND tool_job_anchor_json IS NOT NULL
+          AND tool_job_anchor_json &lt;&gt; '{}'::jsonb
+          AND tool_job_anchor_json #>> '{resumeState}' IN ('READY', 'LAUNCHING')
+        ORDER BY updated_at ASC
+        LIMIT #{limit}
+    </select>
+
+    <update id="casUpdateAnchorResumeState">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = CAST(#{toolJobAnchorJson} AS jsonb),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status = #{expectedStatus}
+          AND tool_job_anchor_json #>> '{resumeState}' = #{expectedResumeState}
+          AND tool_job_anchor_json #>> '{resumeToken}' = #{expectedResumeToken}
+          AND (tool_job_anchor_json #>> '{resumeLeaseVersion}')::bigint = #{expectedLeaseVersion}
+    </update>
+
+    <!--
+        Atomic checkpoint merge: binds identity + version in WHERE to prevent
+        lost updates. SET merges only checkpoint whitelist fields via jsonb ||
+        concat, preserving concurrent reservation/terminal/finalizer fields.
+        checkpointVersion is atomically bumped. COALESCE handles NULL→0 for old anchors.
+    -->
+    <update id="updateToolJobCheckpoint">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = tool_job_anchor_json
+                || jsonb_build_object('checkpointVersion',
+                       (COALESCE((tool_job_anchor_json #>> '{checkpointVersion}')::int, 0) + 1)::text::jsonb)
+                || jsonb_build_object('todoId', #{todoId}::text)
+                || jsonb_build_object('sequence', #{sequence,jdbcType=INTEGER})
+                || CASE WHEN #{completedTodosJson}::text IS NULL
+                       THEN jsonb_build_object('completedTodosJson', '[]'::text)
+                       ELSE jsonb_build_object('completedTodosJson', #{completedTodosJson}::text)
+                  END
+                || jsonb_build_object('datasetSnapshotJson', #{datasetSnapshotJson}::text)
+                || jsonb_build_object('datasetSnapshotDigest', #{datasetSnapshotDigest}::text)
+                || CASE WHEN #{datasetRefsJson}::text IS NULL
+                       THEN jsonb_build_object('datasetRefsJson', '[]'::text)
+                       ELSE jsonb_build_object('datasetRefsJson', #{datasetRefsJson}::text)
+                  END
+                || jsonb_build_object('toolCallsUsed', #{toolCallsUsed,jdbcType=INTEGER})
+                || CASE WHEN #{estimateJson}::text IS NULL
+                       THEN '{}'::jsonb
+                       ELSE jsonb_build_object('estimateJson', #{estimateJson}::text)
+                  END,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status = #{expectedStatus}
+          AND tool_job_anchor_json #>> '{operationId}' = #{expectedOperationId}
+          AND tool_job_anchor_json #>> '{toolCallId}' = #{expectedToolCallId}
+          AND (tool_job_anchor_json #>> '{attempt}')::int = #{expectedAttempt}
+          AND tool_job_anchor_json #>> '{taskId}' = #{expectedTaskId}
+          AND COALESCE((tool_job_anchor_json #>> '{checkpointVersion}')::int, 0) = #{expectedCheckpointVersion}
+    </update>
+
+    <update id="clearToolJobAnchorWithToken">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = CAST('{}' AS jsonb),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND tool_job_anchor_json #>> '{resumeState}' = #{expectedResumeState}
+          AND tool_job_anchor_json #>> '{resumeToken}' = #{expectedToken}
+          AND (tool_job_anchor_json #>> '{resumeLeaseVersion}')::bigint = #{expectedLeaseVersion}
+    </update>
 
 </mapper>

@@ -2,6 +2,7 @@ package world.willfrog.agentlangchain.orchestration;
 
 import dev.langchain4j.service.tool.ToolErrorContext;
 import dev.langchain4j.service.tool.ToolErrorHandlerResult;
+import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingException;
 
 /**
  * Converts recoverable tool execution exceptions into ordinary tool error text,
@@ -22,6 +23,9 @@ final class LangchainTerminalToolErrorHandler {
     static boolean isTerminalSignal(Throwable throwable) {
         Throwable current = throwable;
         while (current != null) {
+            if (current instanceof ExternalToolJobPendingException) {
+                return true;
+            }
             String message = current.getMessage();
             if (message != null
                     && (message.startsWith("RUN_BUDGET_EXCEEDED:")

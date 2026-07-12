@@ -9,6 +9,7 @@ import dev.langchain4j.service.tool.ToolExecutor;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingException;
 import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agent.platform.service.AgentSsePayloadSupport;
 import world.willfrog.agent.workflow.DatasetRefRegistry;
@@ -127,6 +128,11 @@ final class ToolRouterToolExecutor implements ToolExecutor {
                     ToolRouter.ToolInvocationResult result = toolRouter.invokeWithMeta(request.name(), params);
                     output = result.getOutput();
                     success = result.isSuccess();
+                } catch (ExternalToolJobPendingException pending) {
+                    // Pending is a control-flow signal, not a failed tool result. In particular,
+                    // do not emit TOOL_CALL_FINISHED here; the reconciler/finalizer owns the
+                    // single logical terminal event after the external job completes.
+                    throw pending;
                 } catch (Exception e) {
                     output = e.getMessage();
                     success = false;
