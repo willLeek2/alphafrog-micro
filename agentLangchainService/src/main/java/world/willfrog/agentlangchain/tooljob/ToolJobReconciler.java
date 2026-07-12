@@ -4,6 +4,7 @@ import org.apache.dubbo.config.annotation.DubboReference;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.entity.AgentRun;
@@ -27,6 +28,9 @@ public class ToolJobReconciler {
     private final ToolJobFinalizer finalizer;
     private final ToolJobResumeService resumeService;
     private final ToolJobConfig config;
+
+    @Autowired(required = false)
+    private ToolJobCheckpointFailureRecoveryService checkpointFailureRecoveryService;
 
     @DubboReference
     private PythonSandboxService sandboxService;
@@ -72,6 +76,11 @@ public class ToolJobReconciler {
 
     private void processItem(String runId) {
         try {
+            if (checkpointFailureRecoveryService != null
+                    && !checkpointFailureRecoveryService.retryPending(runId)) {
+                log.warn("Checkpoint-failure retry remains pending run={}", runId);
+                return;
+            }
             ToolJobAnchor anchor = anchorService.loadAnchor(runId);
             if (anchor == null) { redisCache.removeDue(runId); redisCache.deletePendingCache(runId); return; }
             String taskId = anchor.getTaskId();

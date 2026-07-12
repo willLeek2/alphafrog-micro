@@ -114,6 +114,12 @@ public interface AgentRunMapper {
                                     @Param("checkpointVersion") int checkpointVersion,
                                     @Param("finalizerError") String finalizerError);
 
+    int markToolJobCheckpointFailurePending(@Param("id") String id,
+                                            @Param("marker") String marker);
+
+    int clearToolJobCheckpointFailurePending(@Param("id") String id,
+                                             @Param("marker") String marker);
+
     /**
      * 条件更新 status（CAS）：只有当前状态等于 expectedStatus 时才更新。
      * 返回 1 表示获得变更权，0 表示已被其他流程变更。

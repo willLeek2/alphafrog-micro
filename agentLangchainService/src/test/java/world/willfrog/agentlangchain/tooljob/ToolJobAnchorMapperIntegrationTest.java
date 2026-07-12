@@ -371,6 +371,20 @@ class ToolJobAnchorMapperIntegrationTest {
         assertThat(healthy.isAutoResume()).isTrue();
     }
 
+    @Test
+    void checkpointFailureRetryMarkerIsDurableAndCompareCleared() throws Exception {
+        insertRun("run-fr", "WAITING_TOOL_JOB", """
+            {"operationId":"run-fr:tc-1:1","toolCallId":"tc-1","attempt":1,"taskId":"task-123"}""");
+        AgentRunMapper mapper = newMapper();
+        String marker = ToolJobCheckpointFailureRecoveryService.MARKER_PREFIX + "{\"runId\":\"run-fr\"}";
+
+        assertThat(mapper.markToolJobCheckpointFailurePending("run-fr", marker)).isEqualTo(1);
+        assertThat(newMapper().findById("run-fr").getLastError()).isEqualTo(marker);
+        assertThat(newMapper().clearToolJobCheckpointFailurePending("run-fr", "wrong")).isZero();
+        assertThat(newMapper().clearToolJobCheckpointFailurePending("run-fr", marker)).isEqualTo(1);
+        assertThat(newMapper().findById("run-fr").getLastError()).isNull();
+    }
+
     // ========== casUpdateAnchorResumeState: claim CAS ==========
 
     @Test

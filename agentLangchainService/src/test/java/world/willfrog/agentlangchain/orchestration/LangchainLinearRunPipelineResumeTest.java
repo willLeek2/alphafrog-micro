@@ -15,7 +15,7 @@ import world.willfrog.agentlangchain.orchestration.dag.LangchainDagWorkflowExecu
 import world.willfrog.agentlangchain.planning.LangchainAiPlanner;
 import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
 import world.willfrog.agentlangchain.tooljob.ToolJobResumeContext;
-import world.willfrog.agentlangchain.tooljob.ToolJobAnchorService;
+import world.willfrog.agentlangchain.tooljob.ToolJobCheckpointFailureRecoveryService;
 import world.willfrog.agentlangchain.tooljob.ToolJobCheckpointWriter;
 
 import java.lang.reflect.Field;
@@ -106,14 +106,14 @@ class LangchainLinearRunPipelineResumeTest {
                 .getDeclaredField("toolJobCheckpointWriter");
         writerField.setAccessible(true);
         writerField.set(pipeline, mock(ToolJobCheckpointWriter.class));
-        ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
-        when(anchorService.updateAnchor(eq("run-1"), any(ToolJobAnchor.class),
-                eq(world.willfrog.agent.platform.model.AgentRunStatus.WAITING_TOOL_JOB)))
-                .thenReturn(true);
-        Field anchorServiceField = LangchainLinearRunPipelineImpl.class
-                .getDeclaredField("toolJobAnchorService");
-        anchorServiceField.setAccessible(true);
-        anchorServiceField.set(pipeline, anchorService);
+        ToolJobCheckpointFailureRecoveryService recoveryService =
+                mock(ToolJobCheckpointFailureRecoveryService.class);
+        when(recoveryService.handleFailure(any()))
+                .thenReturn(ToolJobCheckpointFailureRecoveryService.Outcome.FAILURE_OWNED);
+        Field recoveryField = LangchainLinearRunPipelineImpl.class
+                .getDeclaredField("checkpointFailureRecoveryService");
+        recoveryField.setAccessible(true);
+        recoveryField.set(pipeline, recoveryService);
         clearInvocations(events);
 
         assertThat(pipeline.executeResumedRun(run, context, () -> true)).isFalse();

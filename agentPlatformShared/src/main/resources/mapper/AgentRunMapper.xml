@@ -302,6 +302,24 @@
           AND COALESCE((tool_job_anchor_json -&gt;&gt; 'checkpointVersion')::integer, 0) = #{checkpointVersion}
     </update>
 
+    <update id="markToolJobCheckpointFailurePending">
+        UPDATE alphafrog_agent_run
+        SET last_error = #{marker},
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status = 'WAITING_TOOL_JOB'
+          AND tool_job_anchor_json IS NOT NULL
+          AND tool_job_anchor_json &lt;&gt; '{}'::jsonb
+    </update>
+
+    <update id="clearToolJobCheckpointFailurePending">
+        UPDATE alphafrog_agent_run
+        SET last_error = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND last_error = #{marker}
+    </update>
+
     <update id="casUpdateStatus">
         UPDATE alphafrog_agent_run
         SET status = #{newStatus},

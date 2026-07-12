@@ -18,7 +18,7 @@ import world.willfrog.agentlangchain.planning.LangchainAiPlanner;
 import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
 import world.willfrog.agentlangchain.tooljob.ToolJobCheckpointRequest;
 import world.willfrog.agentlangchain.tooljob.ToolJobCheckpointWriter;
-import world.willfrog.agentlangchain.tooljob.ToolJobAnchorService;
+import world.willfrog.agentlangchain.tooljob.ToolJobCheckpointFailureRecoveryService;
 
 import java.lang.reflect.Field;
 import java.util.List;
@@ -116,13 +116,14 @@ class LangchainLinearRunPipelineCheckpointTest {
         when(events.isRunnable("run-1", "user-1")).thenReturn(true);
         when(events.extractRunConfig("{}")).thenReturn(AgentEventService.RunConfig.defaults());
         when(writer.captureAndSave(any())).thenReturn(false);
-        ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
-        when(anchorService.markCheckpointFailed(any(ToolJobCheckpointRequest.class), any()))
-                .thenReturn(true);
-        Field anchorServiceField = LangchainLinearRunPipelineImpl.class
-                .getDeclaredField("toolJobAnchorService");
-        anchorServiceField.setAccessible(true);
-        anchorServiceField.set(pipeline, anchorService);
+        ToolJobCheckpointFailureRecoveryService recoveryService =
+                mock(ToolJobCheckpointFailureRecoveryService.class);
+        when(recoveryService.handleFailure(any(ToolJobCheckpointRequest.class)))
+                .thenReturn(ToolJobCheckpointFailureRecoveryService.Outcome.FAILURE_OWNED);
+        Field recoveryField = LangchainLinearRunPipelineImpl.class
+                .getDeclaredField("checkpointFailureRecoveryService");
+        recoveryField.setAccessible(true);
+        recoveryField.set(pipeline, recoveryService);
 
         pipeline.executeRun(run);
 
@@ -132,7 +133,7 @@ class LangchainLinearRunPipelineCheckpointTest {
                 eq("TOOL_JOB_CHECKPOINT_FAILED"), any(), any());
 
         reset(events);
-        clearInvocations(anchorService);
+        clearInvocations(recoveryService);
         ToolJobAnchor newerAnchor = ToolJobAnchor.fromJson(anchor.toJson());
         newerAnchor.setCheckpointVersion(5);
         newerAnchor.setTodoId("todo-2");
@@ -146,26 +147,64 @@ class LangchainLinearRunPipelineCheckpointTest {
         when(runMapper.findById("run-1")).thenReturn(run, anchored, newer);
         when(events.isRunnable("run-1", "user-1")).thenReturn(true);
         when(events.extractRunConfig("{}")).thenReturn(AgentEventService.RunConfig.defaults());
-        when(anchorService.markCheckpointFailed(any(ToolJobCheckpointRequest.class), any()))
-                .thenReturn(false);
+        when(recoveryService.handleFailure(any(ToolJobCheckpointRequest.class)))
+                .thenReturn(ToolJobCheckpointFailureRecoveryService.Outcome.HEALTHY_CHECKPOINT);
         pipeline.executeRun(run);
-        verify(anchorService).markCheckpointFailed(any(ToolJobCheckpointRequest.class),
-                eq("durable_checkpoint_write_failed"));
+        verify(recoveryService).handleFailure(any(ToolJobCheckpointRequest.class));
         verify(events).append(eq("run-1"), eq("user-1"),
                 eq("TOOL_CALL_SUSPENDED"), any());
         verify(events, never()).appendOnce(eq("run-1"), eq("user-1"),
                 eq("TOOL_JOB_CHECKPOINT_FAILED"), any(), any());
 
         reset(events);
-        clearInvocations(anchorService);
+        clearInvocations(recoveryService);
         when(runMapper.findById("run-1")).thenReturn(run, anchored, anchored);
         when(events.isRunnable("run-1", "user-1")).thenReturn(true);
         when(events.extractRunConfig("{}")).thenReturn(AgentEventService.RunConfig.defaults());
-        when(anchorService.markCheckpointFailed(any(ToolJobCheckpointRequest.class), any()))
+        when(recoveryService.handleFailure(any(ToolJobCheckpointRequest.class)))
                 .thenThrow(new IllegalStateException("conflict"));
         pipeline.executeRun(run);
         verify(events).appendOnce(eq("run-1"), eq("user-1"),
                 eq("TOOL_JOB_CHECKPOINT_FAILED"), any(), any());
+        verify(events, never()).append(eq("run-1"), eq("user-1"),
+                eq("TOOL_CALL_SUSPENDED"), any());
+
+        reset(events);
+        clearInvocations(recoveryService);
+        when(runMapper.findById("run-1")).thenReturn(run, anchored);
+        when(events.isRunnable("run-1", "user-1")).thenReturn(true);
+        when(events.extractRunConfig("{}")).thenReturn(AgentEventService.RunConfig.defaults());
+        when(recoveryService.handleFailure(any(ToolJobCheckpointRequest.class)))
+                .thenReturn(ToolJobCheckpointFailureRecoveryService.Outcome.FAILURE_OWNED);
+        field.set(pipeline, null);
+        pipeline.executeRun(run);
+        verify(recoveryService).handleFailure(argThat(r -> r.getExpectedCheckpointVersion() == 4
+                && "task-1".equals(r.getTaskId())));
+
+        reset(events);
+        clearInvocations(recoveryService);
+        field.set(pipeline, writer);
+        when(registryProvider.getIfAvailable()).thenReturn(null);
+        when(runMapper.findById("run-1")).thenReturn(run, anchored);
+        when(events.isRunnable("run-1", "user-1")).thenReturn(true);
+        when(events.extractRunConfig("{}")).thenReturn(AgentEventService.RunConfig.defaults());
+        pipeline.executeRun(run);
+        verify(recoveryService).handleFailure(any(ToolJobCheckpointRequest.class));
+
+        reset(events);
+        AgentRun missingAnchor = new AgentRun();
+        missingAnchor.setId("run-1");
+        when(registryProvider.getIfAvailable()).thenReturn(registry);
+        when(runMapper.findById("run-1")).thenReturn(run, missingAnchor);
+        when(runMapper.updateSnapshot(eq("run-1"), eq("user-1"),
+                eq(world.willfrog.agent.platform.model.AgentRunStatus.FAILED),
+                any(), eq(true), eq("tool_job_checkpoint_anchor_missing"))).thenReturn(1);
+        when(events.isRunnable("run-1", "user-1")).thenReturn(true);
+        when(events.extractRunConfig("{}")).thenReturn(AgentEventService.RunConfig.defaults());
+        pipeline.executeRun(run);
+        verify(runMapper).updateSnapshot(eq("run-1"), eq("user-1"),
+                eq(world.willfrog.agent.platform.model.AgentRunStatus.FAILED),
+                any(), eq(true), eq("tool_job_checkpoint_anchor_missing"));
         verify(events, never()).append(eq("run-1"), eq("user-1"),
                 eq("TOOL_CALL_SUSPENDED"), any());
     }
