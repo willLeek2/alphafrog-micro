@@ -27,6 +27,11 @@ public class ToolJobAnchor {
     private boolean autoResume = true;
     private String resumeState; // READY, LAUNCHING, CONSUMED
 
+    // resume context (§9.10): saved when tool job goes pending
+    private String completedTodosJson;   // completed todo id list
+    private String datasetRefsJson;      // dataset references
+    private int toolCallsUsed;           // tool call count at suspend point
+
     // reservation snapshot
     private String reservationJson;
 
@@ -110,6 +115,15 @@ public class ToolJobAnchor {
 
     public String getResumeState() { return resumeState; }
     public void setResumeState(String resumeState) { this.resumeState = resumeState; }
+
+    public String getCompletedTodosJson() { return completedTodosJson; }
+    public void setCompletedTodosJson(String completedTodosJson) { this.completedTodosJson = completedTodosJson; }
+
+    public String getDatasetRefsJson() { return datasetRefsJson; }
+    public void setDatasetRefsJson(String datasetRefsJson) { this.datasetRefsJson = datasetRefsJson; }
+
+    public int getToolCallsUsed() { return toolCallsUsed; }
+    public void setToolCallsUsed(int toolCallsUsed) { this.toolCallsUsed = toolCallsUsed; }
 
     public String getReservationJson() { return reservationJson; }
     public void setReservationJson(String reservationJson) { this.reservationJson = reservationJson; }

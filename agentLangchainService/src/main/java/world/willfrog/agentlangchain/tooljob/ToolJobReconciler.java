@@ -37,6 +37,7 @@ public class ToolJobReconciler {
     private final ToolJobRedisCache redisCache;
     private final ToolJobAnchorService anchorService;
     private final ToolJobFinalizer finalizer;
+    private final ToolJobResumeService resumeService;
     private final ToolJobConfig config;
 
     @DubboReference
@@ -45,10 +46,12 @@ public class ToolJobReconciler {
     public ToolJobReconciler(ToolJobRedisCache redisCache,
                              ToolJobAnchorService anchorService,
                              ToolJobFinalizer finalizer,
+                             ToolJobResumeService resumeService,
                              ToolJobConfig config) {
         this.redisCache = redisCache;
         this.anchorService = anchorService;
         this.finalizer = finalizer;
+        this.resumeService = resumeService;
         this.config = config;
     }
 
@@ -100,6 +103,7 @@ public class ToolJobReconciler {
                 ToolJobAnchor anchor = anchorService.loadAnchor(run.getId());
                 if (anchor != null) {
                     redisCache.atomicWritePendingAndDue(run.getId(), anchor);
+                    resumeService.tryResume(run.getId());
                 }
             }
         } catch (Exception e) {

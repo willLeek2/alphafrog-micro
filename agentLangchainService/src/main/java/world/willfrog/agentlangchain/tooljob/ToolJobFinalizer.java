@@ -44,15 +44,18 @@ public class ToolJobFinalizer {
     private final ToolJobAnchorService anchorService;
     private final ToolJobRedisCache redisCache;
     private final DataAnalysisCapacityService capacityService;
+    private final ToolJobResumeService resumeService;
     private final ToolJobConfig config;
 
     public ToolJobFinalizer(ToolJobAnchorService anchorService,
                             ToolJobRedisCache redisCache,
                             DataAnalysisCapacityService capacityService,
+                            ToolJobResumeService resumeService,
                             ToolJobConfig config) {
         this.anchorService = anchorService;
         this.redisCache = redisCache;
         this.capacityService = capacityService;
+        this.resumeService = resumeService;
         this.config = config;
     }
 
@@ -107,12 +110,16 @@ public class ToolJobFinalizer {
             anchorService.updateAnchor(runId, anchor, AgentRunStatus.RECEIVED);
         }
 
-        // Step 6: mark resumeState READY (Codex pipeline reads this to launch resume)
+        // Step 6: mark resumeState READY and attempt synchronous resume launch
         if (!isBeyond(anchor, STEP_RESUME_READY)) {
             anchor.setResumeState("READY");
             anchor.setFinalizerStep(STEP_RESUME_READY);
             anchorService.updateAnchor(runId, anchor, AgentRunStatus.RECEIVED);
             redisCache.writePendingCache(runId, anchor);
+
+            // Attempt synchronous resume. If launcher is not wired or rejects,
+            // the READY state remains and will be picked up by periodic scan.
+            resumeService.tryResume(runId);
         }
 
         // Step 7 (CLEANUP) is deferred — invoked by Codex after CONSUMED
