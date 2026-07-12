@@ -108,28 +108,42 @@ public class ToolJobCheckpointService implements ToolJobCheckpointWriter {
     }
 
     private boolean validateIdentity(ToolJobAnchor anchor, ToolJobCheckpointRequest request) {
+        // All four identity fields are mandatory — missing or mismatch = fail-closed
         String reqOpId = request.getOperationId();
-        if (reqOpId != null && !reqOpId.isBlank()
-                && !reqOpId.equals(anchor.getOperationId())) {
+        if (reqOpId == null || reqOpId.isBlank()) {
+            log.error("Checkpoint rejected: missing operationId for run={}", request.getRunId());
+            return false;
+        }
+        if (!reqOpId.equals(anchor.getOperationId())) {
             log.error("Checkpoint rejected: operationId mismatch anchor={} request={}",
                     anchor.getOperationId(), reqOpId);
             return false;
         }
         String reqTcId = request.getToolCallId();
-        if (reqTcId != null && !reqTcId.isBlank()
-                && !reqTcId.equals(anchor.getToolCallId())) {
+        if (reqTcId == null || reqTcId.isBlank()) {
+            log.error("Checkpoint rejected: missing toolCallId for run={}", request.getRunId());
+            return false;
+        }
+        if (!reqTcId.equals(anchor.getToolCallId())) {
             log.error("Checkpoint rejected: toolCallId mismatch anchor={} request={}",
                     anchor.getToolCallId(), reqTcId);
             return false;
         }
-        if (request.getAttempt() > 0 && request.getAttempt() != anchor.getAttempt()) {
+        if (request.getAttempt() <= 0) {
+            log.error("Checkpoint rejected: missing attempt for run={}", request.getRunId());
+            return false;
+        }
+        if (request.getAttempt() != anchor.getAttempt()) {
             log.error("Checkpoint rejected: attempt mismatch anchor={} request={}",
                     anchor.getAttempt(), request.getAttempt());
             return false;
         }
         String reqTaskId = request.getTaskId();
-        if (reqTaskId != null && !reqTaskId.isBlank()
-                && !reqTaskId.equals(anchor.getTaskId())) {
+        if (reqTaskId == null || reqTaskId.isBlank()) {
+            log.error("Checkpoint rejected: missing taskId for run={}", request.getRunId());
+            return false;
+        }
+        if (!reqTaskId.equals(anchor.getTaskId())) {
             log.error("Checkpoint rejected: taskId mismatch anchor={} request={}",
                     anchor.getTaskId(), reqTaskId);
             return false;

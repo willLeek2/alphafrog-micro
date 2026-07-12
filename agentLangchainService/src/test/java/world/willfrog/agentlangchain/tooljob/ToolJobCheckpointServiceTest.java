@@ -94,7 +94,8 @@ class ToolJobCheckpointServiceTest {
     void shouldRejectOperationIdMismatch() {
         when(agentRunMapper.findById("run-1")).thenReturn(buildRun());
         var req = ToolJobCheckpointRequest.builder("run-1")
-                .operationId("run-1:tc-2:1").build();
+                .operationId("run-1:tc-2:1").toolCallId("tc-1").attempt(1).taskId("task-123")
+                .datasetSnapshotJson("{}").datasetSnapshotDigest("d").toolCallsUsed(0).build();
         assertThat(service.captureAndSave(req)).isFalse();
         verify(anchorService, never()).checkpointUpdate(any(), any(), any(),
                 any(), anyInt(), any(), any(), any(), any(), anyInt(), any());
@@ -103,21 +104,27 @@ class ToolJobCheckpointServiceTest {
     @Test
     void shouldRejectToolCallIdMismatch() {
         when(agentRunMapper.findById("run-1")).thenReturn(buildRun());
-        var req = ToolJobCheckpointRequest.builder("run-1").toolCallId("tc-2").build();
+        var req = ToolJobCheckpointRequest.builder("run-1")
+                .operationId("run-1:tc-1:1").toolCallId("tc-2").attempt(1).taskId("task-123")
+                .datasetSnapshotJson("{}").datasetSnapshotDigest("d").toolCallsUsed(0).build();
         assertThat(service.captureAndSave(req)).isFalse();
     }
 
     @Test
     void shouldRejectAttemptMismatch() {
         when(agentRunMapper.findById("run-1")).thenReturn(buildRun());
-        var req = ToolJobCheckpointRequest.builder("run-1").attempt(2).build();
+        var req = ToolJobCheckpointRequest.builder("run-1")
+                .operationId("run-1:tc-1:1").toolCallId("tc-1").attempt(2).taskId("task-123")
+                .datasetSnapshotJson("{}").datasetSnapshotDigest("d").toolCallsUsed(0).build();
         assertThat(service.captureAndSave(req)).isFalse();
     }
 
     @Test
     void shouldRejectTaskIdMismatch() {
         when(agentRunMapper.findById("run-1")).thenReturn(buildRun());
-        var req = ToolJobCheckpointRequest.builder("run-1").taskId("task-999").build();
+        var req = ToolJobCheckpointRequest.builder("run-1")
+                .operationId("run-1:tc-1:1").toolCallId("tc-1").attempt(1).taskId("task-999")
+                .datasetSnapshotJson("{}").datasetSnapshotDigest("d").toolCallsUsed(0).build();
         assertThat(service.captureAndSave(req)).isFalse();
     }
 
@@ -138,17 +145,17 @@ class ToolJobCheckpointServiceTest {
     }
 
     @Test
-    void shouldPassIdentityWhenFieldsNotSet() {
+    void shouldRejectWhenIdentityMissing() {
         when(agentRunMapper.findById("run-1")).thenReturn(buildRun());
-        when(anchorService.checkpointUpdate(eq("run-1"), any(ToolJobAnchor.class),
-                eq(AgentRunStatus.EXECUTING), any(), anyInt(), any(),
-                any(), any(), any(), anyInt(), any())).thenReturn(true);
 
         var req = ToolJobCheckpointRequest.builder("run-1")
                 .datasetSnapshotJson("{\"digest\":\"abc\"}").datasetSnapshotDigest("abc123")
                 .toolCallsUsed(2).build();
 
-        assertThat(service.captureAndSave(req)).isTrue();
+        // Mandatory identity — all 4 fields must be present
+        assertThat(service.captureAndSave(req)).isFalse();
+        verify(anchorService, never()).checkpointUpdate(any(), any(), any(),
+                any(), anyInt(), any(), any(), any(), any(), anyInt(), any());
     }
 
     @Test
@@ -164,7 +171,7 @@ class ToolJobCheckpointServiceTest {
         t1.setSequence(1);
 
         var req = ToolJobCheckpointRequest.builder("run-1")
-                .operationId("run-1:tc-1:1").taskId("task-123")
+                .operationId("run-1:tc-1:1").toolCallId("tc-1").attempt(1).taskId("task-123")
                 .todoId("todo_2").completedTodos(List.of(t1))
                 .datasetSnapshotJson("{\"digest\":\"abc\"}").datasetSnapshotDigest("abc123")
                 .toolCallsUsed(1).build();
