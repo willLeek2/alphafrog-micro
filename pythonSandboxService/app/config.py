@@ -36,6 +36,11 @@ class SandboxConfig:
     pool_max_container_uses: int | None
     workspace_root: str
     compat_input_path_enabled: bool
+    standard_memory_limit_bytes: int = 512 * 1024 * 1024
+    heavy_memory_limit_bytes: int = 1536 * 1024 * 1024
+    queue_wait_timeout_seconds: float = 30.0
+    usage_sampling_interval_millis: int = 200
+    task_store_path: Path = Path("/data/sandbox_tasks/state.json")
 
 
 def load_config() -> SandboxConfig:
@@ -57,7 +62,7 @@ def load_config() -> SandboxConfig:
         ).split(",")
         if item.strip()
     )
-    container_max_concurrency = int(os.getenv("AF_SANDBOX_CONTAINER_MAX_CONCURRENCY", "5"))
+    container_max_concurrency = int(os.getenv("AF_SANDBOX_CONTAINER_MAX_CONCURRENCY", "1"))
     if container_max_concurrency < 1:
         raise ValueError(
             f"Invalid container_max_concurrency ({container_max_concurrency}): must be >= 1."
@@ -71,6 +76,11 @@ def load_config() -> SandboxConfig:
     pool_max_container_uses = _parse_int_or_none(os.getenv("AF_SANDBOX_POOL_MAX_CONTAINER_USES"))
     workspace_root = os.getenv("AF_SANDBOX_WORKSPACE_ROOT", "/sandbox/runs")
     compat_input_path_enabled = _parse_bool(os.getenv("AF_SANDBOX_COMPAT_INPUT_PATH"), default=True)
+    standard_memory_limit_bytes = int(os.getenv("AF_SANDBOX_STANDARD_MEMORY_BYTES", str(512 * 1024 * 1024)))
+    heavy_memory_limit_bytes = int(os.getenv("AF_SANDBOX_HEAVY_MEMORY_BYTES", str(1536 * 1024 * 1024)))
+    queue_wait_timeout_seconds = float(os.getenv("AF_SANDBOX_QUEUE_WAIT_TIMEOUT", "30"))
+    usage_sampling_interval_millis = int(os.getenv("AF_SANDBOX_USAGE_SAMPLE_MILLIS", "200"))
+    task_store_path = Path(os.getenv("AF_SANDBOX_TASK_STORE_PATH", "/data/sandbox_tasks/state.json"))
 
     # Config validation
     if pool_enabled and pool_min_size > pool_max_size:
@@ -78,6 +88,12 @@ def load_config() -> SandboxConfig:
             f"Invalid pool config: pool_min_size ({pool_min_size}) > pool_max_size ({pool_max_size}). "
             f"Ensure AF_SANDBOX_POOL_MIN_SIZE <= AF_SANDBOX_POOL_MAX_SIZE."
         )
+    if standard_memory_limit_bytes <= 0 or heavy_memory_limit_bytes <= standard_memory_limit_bytes:
+        raise ValueError("Sandbox memory limits must be positive and HEAVY must exceed STANDARD")
+    if queue_wait_timeout_seconds <= 0:
+        raise ValueError("AF_SANDBOX_QUEUE_WAIT_TIMEOUT must be positive")
+    if usage_sampling_interval_millis <= 0:
+        raise ValueError("AF_SANDBOX_USAGE_SAMPLE_MILLIS must be positive")
     if container_max_concurrency > 1 and compat_input_path_enabled:
         # The global /sandbox/input symlink would be overwritten by concurrent tasks.
         logger.warning(
@@ -107,6 +123,11 @@ def load_config() -> SandboxConfig:
         pool_max_container_uses=pool_max_container_uses,
         workspace_root=workspace_root,
         compat_input_path_enabled=compat_input_path_enabled,
+        standard_memory_limit_bytes=standard_memory_limit_bytes,
+        heavy_memory_limit_bytes=heavy_memory_limit_bytes,
+        queue_wait_timeout_seconds=queue_wait_timeout_seconds,
+        usage_sampling_interval_millis=usage_sampling_interval_millis,
+        task_store_path=task_store_path,
     )
 
 
