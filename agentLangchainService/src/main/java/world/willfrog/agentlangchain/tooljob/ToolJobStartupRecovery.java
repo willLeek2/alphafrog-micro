@@ -63,6 +63,7 @@ public class ToolJobStartupRecovery {
     private void recoverCapacityLedger() {
         List<AgentRun> activeRuns = anchorService.listActive(200);
         List<DataAnalysisReservation> durableReservations = new ArrayList<>();
+        List<String> quarantinedRuns = new ArrayList<>();
 
         for (AgentRun run : activeRuns) {
             ToolJobAnchor anchor = anchorService.loadAnchor(run.getId());
@@ -76,8 +77,15 @@ public class ToolJobStartupRecovery {
                     durableReservations.add(reservation);
                 }
             } catch (Exception e) {
-                log.error("Failed to parse reservation for run={}", run.getId(), e);
+                log.error("Failed to parse reservation for run={} — QUARANTINED (capacity may be over-admitted)", run.getId(), e);
+                quarantinedRuns.add(run.getId());
             }
+        }
+
+        if (!quarantinedRuns.isEmpty()) {
+            log.error("CAPACITY QUARANTINE: {} run(s) have unparseable reservationJson — "
+                    + "capacity may be over-admitted. Runs: {}",
+                    quarantinedRuns.size(), quarantinedRuns);
         }
 
         // Always call recover (even with empty list) to flip admission from RECOVERING → OPEN
@@ -85,10 +93,11 @@ public class ToolJobStartupRecovery {
         int maxHeavyActive = capacityProperties.getMaxHeavyActive();
         DataAnalysisCapacityRecoveryReport report = capacityService.recover(
                 durableReservations, maxUnits, maxHeavyActive);
-        log.info("Capacity recovery: restored={} active={} heavyActive={} usedUnits={}/{} state={} conflicts={}",
+        log.info("Capacity recovery: restored={} active={} heavyActive={} usedUnits={}/{} state={} conflicts={} quarantined={}",
                 report.restoredReservations(), report.activeCount(),
                 report.heavyActiveCount(), report.usedUnits(),
-                report.configuredMaxUnits(), report.admissionState(), report.conflicts());
+                report.configuredMaxUnits(), report.admissionState(), report.conflicts(),
+                quarantinedRuns.size());
     }
 
     private void recoverToolJobAnchors() {
