@@ -37,16 +37,19 @@ public class ToolJobFinalizer {
     private final ToolJobRedisCache redisCache;
     private final DataAnalysisCapacityService capacityService;
     private final ToolJobResumeService resumeService;
+    private final ToolJobConfig config;
     private final ObjectMapper objectMapper = new ObjectMapper().findAndRegisterModules();
 
     public ToolJobFinalizer(ToolJobAnchorService anchorService,
                             ToolJobRedisCache redisCache,
                             DataAnalysisCapacityService capacityService,
-                            ToolJobResumeService resumeService) {
+                            ToolJobResumeService resumeService,
+                            ToolJobConfig config) {
         this.anchorService = anchorService;
         this.redisCache = redisCache;
         this.capacityService = capacityService;
         this.resumeService = resumeService;
+        this.config = config;
     }
 
     // ========== public entry points ==========
@@ -142,7 +145,8 @@ public class ToolJobFinalizer {
             long elapsed = java.time.Duration.between(anchor.getTerminalConfirmedAt(), now).toSeconds();
             int attempts = anchor.getResultFetchAttempts() + 1;
             anchor.setResultFetchAttempts(attempts);
-            if (elapsed > 600 || attempts >= 10) {
+            if (elapsed > config.getResultRetentionDeadlineSeconds()
+                    || attempts >= config.getResultFetchMaxAttempts()) {
                 anchor.setResultFetchState("LOST");
                 anchor.setTerminalStatus("RESULT_LOST");
                 anchor.setTerminalAt(now);
@@ -208,7 +212,8 @@ public class ToolJobFinalizer {
         try {
             DataAnalysisResourceUsage usage = buildResourceUsage(reservation.resourceClass(),
                     anchor.getTerminalUsageJson());
-            DataAnalysisEstimate estimate = parseEstimate(anchor.getEstimateJson(), reservation);
+            DataAnalysisEstimate estimate = parseEstimate(anchor.getEstimateJson());
+            if (estimate == null) return null;
             String status = anchor.getTerminalStatus();
             boolean success = "SUCCEEDED".equals(status);
             String rawRef = anchor.getTerminalRawRef();
@@ -268,25 +273,28 @@ public class ToolJobFinalizer {
                         qwait, prep, exec, clean, dsOpen, s.getExitReason(),
                         s.getOomKilled(), s.getTimedOut(), true, null, null);
             }
-            return new DataAnalysisResourceUsage(rc, null, null, null, null, null, null,
-                    null, null, null, null, null, null,
-                    false, false, false, null, missing);
+            // Partial: keep measured values, declare only actually-missing fields
+            return new DataAnalysisResourceUsage(rc, cpu, mem, memMs, scan, art, tmp,
+                    qwait, prep, exec, clean, dsOpen, s.getExitReason(),
+                    s.getOomKilled(), s.getTimedOut(), false, null, missing);
         } catch (Exception e) {
             log.warn("Failed to parse resourceUsage, using missing", e);
             return DataAnalysisResourceUsage.missing(rc);
         }
     }
 
-    private DataAnalysisEstimate parseEstimate(String estimateJson, DataAnalysisReservation reservation) {
-        if (estimateJson != null && !estimateJson.isBlank()) {
-            try {
-                return objectMapper.readValue(estimateJson, DataAnalysisEstimate.class);
-            } catch (Exception e) {
-                log.warn("Failed to parse estimateJson, using fallback", e);
-            }
+    /** @return parsed estimate or null (fail-closed: blocks RELEASE) */
+    private DataAnalysisEstimate parseEstimate(String estimateJson) {
+        if (estimateJson == null || estimateJson.isBlank()) {
+            log.warn("estimateJson missing — cannot build valid envelope");
+            return null;
         }
-        return new DataAnalysisEstimate(0, 0, 0, 0.0, 0,
-                List.of(), reservation.resourceClass(), reservation.capacityUnits());
+        try {
+            return objectMapper.readValue(estimateJson, DataAnalysisEstimate.class);
+        } catch (Exception e) {
+            log.error("Failed to parse estimateJson", e);
+            return null;
+        }
     }
 
     // ========== helpers ==========
@@ -299,13 +307,17 @@ public class ToolJobFinalizer {
 
     private static String emptyToNull(String s) { return s == null || s.isBlank() ? null : s.trim(); }
 
-    /** Truncate to 16KB UTF-8 to respect MAX_RESULT_PREVIEW_BYTES. */
+    /** Truncate to 16KB UTF-8 respecting MAX_RESULT_PREVIEW_BYTES including suffix. */
     static String boundedPreview(String s) {
         if (s == null) return null;
-        byte[] bytes = s.getBytes(StandardCharsets.UTF_8);
-        if (bytes.length <= DataAnalysisTerminalEnvelope.MAX_RESULT_PREVIEW_BYTES) return s;
-        int cut = DataAnalysisTerminalEnvelope.MAX_RESULT_PREVIEW_BYTES;
-        while (cut > 0 && (bytes[cut] & 0xC0) == 0x80) cut--;
-        return new String(bytes, 0, cut, StandardCharsets.UTF_8) + "…(truncated)";
+        String suffix = "…(truncated)";
+        byte[] raw = s.getBytes(StandardCharsets.UTF_8);
+        int max = DataAnalysisTerminalEnvelope.MAX_RESULT_PREVIEW_BYTES;
+        if (raw.length <= max) return s;
+        byte[] suffixBytes = suffix.getBytes(StandardCharsets.UTF_8);
+        int cut = max - suffixBytes.length;
+        if (cut <= 0) return suffix;
+        while (cut > 0 && (raw[cut] & 0xC0) == 0x80) cut--;
+        return new String(raw, 0, cut, StandardCharsets.UTF_8) + suffix;
     }
 }
