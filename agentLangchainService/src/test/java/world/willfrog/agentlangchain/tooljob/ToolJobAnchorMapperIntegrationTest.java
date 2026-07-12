@@ -526,6 +526,26 @@ class ToolJobAnchorMapperIntegrationTest {
         assertThat(rows).isEqualTo(0);
     }
 
+    @Test
+    void dataAnalysisObservabilityCasSupportsMissingExpectedAndRejectsStaleWriter() throws Exception {
+        insertRun("run-obs-1", "EXECUTING", "{}");
+        AgentRunMapper mapper = newMapper();
+        String first = """
+                {"version":1,"runId":"run-obs-1","summary":{"toolCallCount":0},"calls":[]}
+                """;
+        String second = """
+                {"version":1,"runId":"run-obs-1","summary":{"toolCallCount":1},"calls":[{"id":"a"}]}
+                """;
+
+        assertThat(mapper.casUpdateDataAnalysisObservability("run-obs-1", null, first)).isEqualTo(1);
+        assertThat(mapper.casUpdateDataAnalysisObservability("run-obs-1", null, second)).isEqualTo(0);
+        assertThat(mapper.casUpdateDataAnalysisObservability("run-obs-1", first, second)).isEqualTo(1);
+        assertThat(mapper.findDataAnalysisObservabilityJsonById("run-obs-1"))
+                .contains("\"toolCallCount\": 1");
+        assertThat(mapper.findDataAnalysisObservabilitySummaryJsonById("run-obs-1"))
+                .contains("\"toolCallCount\": 1");
+    }
+
     // ========== Production service chain: version race ==========
 
     private ToolJobCheckpointService newServiceChain() throws Exception {

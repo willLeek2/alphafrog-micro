@@ -58,6 +58,20 @@ public interface AgentRunMapper {
                        @Param("ttlExpiresAt") OffsetDateTime ttlExpiresAt);
 
     /**
+     * 仅在当前 data-analysis observability 子树仍等于 expectedJson 时写入下一版。
+     * expectedJson 为 null 表示该子树尚不存在；该 CAS 避免并发 recorder 丢失 attempt。
+     */
+    int casUpdateDataAnalysisObservability(@Param("id") String id,
+                                           @Param("expectedJson") String expectedJson,
+                                           @Param("nextJson") String nextJson);
+
+    /** 高频 status 查询只读取 summary JSON，不加载 calls。 */
+    String findDataAnalysisObservabilitySummaryJsonById(@Param("id") String id);
+
+    /** result/full 查询读取完整 data-analysis observability 子树。 */
+    String findDataAnalysisObservabilityJsonById(@Param("id") String id);
+
+    /**
      * 列出处于指定终态集合、且 updated_at 大于 fromTime 的 run（polling observer 用）。
      *
      * <p>按 updated_at ASC 排序，保证先处理最早的 run；

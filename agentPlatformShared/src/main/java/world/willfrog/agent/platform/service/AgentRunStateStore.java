@@ -34,6 +34,8 @@ public class AgentRunStateStore {
     private static final String PLAN_OVERRIDE_KEY = ":plan_override";
     private static final String STATUS_KEY = ":status";
     private static final String OBSERVABILITY_KEY = ":observability";
+    private static final String DATA_ANALYSIS_OBSERVABILITY_KEY = ":data_analysis_observability";
+    private static final String DATA_ANALYSIS_SUMMARY_KEY = ":data_analysis_observability:summary";
     private static final String DETAIL_LLM_KEY = ":detail:llm:";
     private static final String DETAIL_TOOL_KEY = ":detail:tool:";
     private static final String RAW_DETAIL_SUFFIX = ":raw";
@@ -210,6 +212,48 @@ public class AgentRunStateStore {
         }
     }
 
+    public void saveDataAnalysisObservability(String runId, String snapshotJson, String summaryJson) {
+        if (blank(runId)) {
+            return;
+        }
+        String fullKey = dataAnalysisObservabilityKey(runId);
+        String summaryKey = dataAnalysisSummaryKey(runId);
+        redisTemplate.opsForValue().set(fullKey, nvl(snapshotJson));
+        redisTemplate.opsForValue().set(summaryKey, nvl(summaryJson));
+        touch(fullKey);
+        touch(summaryKey);
+    }
+
+    public void saveDataAnalysisObservabilitySummary(String runId, String summaryJson) {
+        if (blank(runId)) {
+            return;
+        }
+        String key = dataAnalysisSummaryKey(runId);
+        redisTemplate.opsForValue().set(key, nvl(summaryJson));
+        touch(key);
+    }
+
+    public Optional<String> loadDataAnalysisObservability(String runId) {
+        return loadNonBlankValue(dataAnalysisObservabilityKey(runId));
+    }
+
+    public Optional<String> loadDataAnalysisObservabilitySummary(String runId) {
+        return loadNonBlankValue(dataAnalysisSummaryKey(runId));
+    }
+
+    private Optional<String> loadNonBlankValue(String key) {
+        if (blank(key)) {
+            return Optional.empty();
+        }
+        try {
+            String json = redisTemplate.opsForValue().get(key);
+            return json == null || json.isBlank() ? Optional.empty() : Optional.of(json);
+        } catch (Exception e) {
+            log.warn("load data-analysis observability failed: key={}, error={}", key, e.getMessage());
+            return Optional.empty();
+        }
+    }
+
     public void saveLlmCallDetail(String runId, String llmCallId, String detailJson) {
         saveCallDetail(runId, llmCallId, detailJson, true);
     }
@@ -272,6 +316,14 @@ public class AgentRunStateStore {
     /** Public for frontend Redis reader — keep in sync with detail key layout. */
     public String toolCallDetailKey(String runId, String toolCallId) {
         return PREFIX + runId + DETAIL_TOOL_KEY + nvl(toolCallId);
+    }
+
+    public String dataAnalysisObservabilityKey(String runId) {
+        return blank(runId) ? "" : PREFIX + runId + DATA_ANALYSIS_OBSERVABILITY_KEY;
+    }
+
+    public String dataAnalysisSummaryKey(String runId) {
+        return blank(runId) ? "" : PREFIX + runId + DATA_ANALYSIS_SUMMARY_KEY;
     }
 
     private void saveCallDetail(String runId, String callId, String detailJson, boolean llm) {

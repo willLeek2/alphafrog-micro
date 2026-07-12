@@ -1,6 +1,7 @@
 package world.willfrog.agentlangchain.tooljob;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.protobuf.util.JsonFormat;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -79,7 +80,9 @@ public class ToolJobFinalizer {
                 anchor.setTerminalRawRef(emptyToNull(resultResp.getDatasetDir()));
                 anchor.setTerminalErrorCode(emptyToNull(resultResp.getError()));
                 try {
-                    anchor.setTerminalUsageJson(objectMapper.writeValueAsString(resultResp.getResourceUsage()));
+                    anchor.setTerminalUsageJson(JsonFormat.printer()
+                            .omittingInsignificantWhitespace()
+                            .print(resultResp.getResourceUsage()));
                 } catch (Exception e) {
                     log.warn("Failed to serialize resourceUsage for run={}", runId, e);
                 }

@@ -246,6 +246,31 @@
           AND user_id = #{userId}
     </update>
 
+    <update id="casUpdateDataAnalysisObservability">
+        UPDATE alphafrog_agent_run
+        SET snapshot_json = jsonb_set(
+                COALESCE(snapshot_json, '{}'::jsonb),
+                '{data_analysis_observability}',
+                CAST(#{nextJson} AS jsonb),
+                true),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND (COALESCE(snapshot_json, '{}'::jsonb) -&gt; 'data_analysis_observability')
+              IS NOT DISTINCT FROM CAST(#{expectedJson,jdbcType=VARCHAR} AS jsonb)
+    </update>
+
+    <select id="findDataAnalysisObservabilitySummaryJsonById" resultType="string">
+        SELECT (snapshot_json -&gt; 'data_analysis_observability' -&gt; 'summary')::text
+        FROM alphafrog_agent_run
+        WHERE id = #{id}
+    </select>
+
+    <select id="findDataAnalysisObservabilityJsonById" resultType="string">
+        SELECT (snapshot_json -&gt; 'data_analysis_observability')::text
+        FROM alphafrog_agent_run
+        WHERE id = #{id}
+    </select>
+
     <!--
         根据 run ID 和用户 ID 删除 Agent Run 记录。
         
