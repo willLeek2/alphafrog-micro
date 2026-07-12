@@ -131,7 +131,9 @@ public class ToolJobReconciler {
             } else if ("FAILED".equals(status) || "CANCELED".equals(status)) {
                 if ((resp.getError() == null || resp.getError().isBlank())
                         && (resp.getStderr() == null || resp.getStderr().isBlank())) {
-                    log.warn("fetchResult: {} with no error/stderr for taskId={}", status, taskId);
+                    log.warn("fetchResult: {} with no error/stderr for taskId={}, retrying",
+                            status, taskId);
+                    return null;
                 }
             }
             return resp;
@@ -148,8 +150,9 @@ public class ToolJobReconciler {
             TaskStatusResponse statusResp = sandboxService.getTaskStatus(
                     GetTaskStatusRequest.newBuilder().setTaskId(taskId).build());
             String status = statusResp.getStatus();
-            if (SUCCEEDED.equals(status) || FAILED.equals(status)
-                    || CANCELED.equals(status) || NOT_FOUND.equals(status)) {
+            if (NOT_FOUND.equals(status)) {
+                finalizer.handleNotFound(runId, anchor);
+            } else if (SUCCEEDED.equals(status) || FAILED.equals(status) || CANCELED.equals(status)) {
                 TaskResultResponse resultResp = fetchResult(taskId, runId, status);
                 if (resultResp != null) {
                     // Envelope + release but autoResume=false (no CAS/READY)

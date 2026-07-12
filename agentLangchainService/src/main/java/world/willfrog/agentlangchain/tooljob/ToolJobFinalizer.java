@@ -235,8 +235,25 @@ public class ToolJobFinalizer {
             DataAnalysisReleaseOutcome oo = capacityService.releaseReservation(req);
             boolean ok = oo == DataAnalysisReleaseOutcome.RELEASED
                     || oo == DataAnalysisReleaseOutcome.ALREADY_RELEASED;
-            if (!ok) log.warn("Release outcome {} for reservationId={}", oo, confirmed.reservationId());
-            return ok;
+            if (!ok) {
+                log.warn("Release outcome {} for reservationId={}", oo, confirmed.reservationId());
+                return false;
+            }
+
+            // Write RELEASED state back to anchor so restart recovery doesn't
+            // re-occupy capacity from stale PENDING/CONFIRMED reservation JSON
+            DataAnalysisReservation released = new DataAnalysisReservation(
+                    confirmed.reservationId(), confirmed.identity(),
+                    confirmed.resourceClass(), confirmed.capacityUnits(),
+                    DataAnalysisReservationState.RELEASED,
+                    confirmed.taskId(), confirmed.acquiredAt());
+            try {
+                anchor.setReservationJson(objectMapper.writeValueAsString(released));
+            } catch (Exception e) {
+                log.error("Failed to serialize RELEASED reservation for op={}", anchor.getOperationId(), e);
+                return false;
+            }
+            return true;
         } catch (Exception e) {
             log.error("releaseCapacity failed for reservation", e);
             return false;

@@ -28,6 +28,9 @@ public class ToolJobConfig {
     /** Extra time after timeout before the job is considered abandoned. */
     private long terminalRetentionSeconds = 300;
 
+    /** Max time a LAUNCHING claim can stay unacknowledged before it's considered stale. */
+    private long launchingStaleSeconds = 120;
+
     public long getFastPathMs() { return fastPathMs; }
     public void setFastPathMs(long fastPathMs) { this.fastPathMs = fastPathMs; }
 
@@ -48,4 +51,7 @@ public class ToolJobConfig {
 
     public long getTerminalRetentionSeconds() { return terminalRetentionSeconds; }
     public void setTerminalRetentionSeconds(long terminalRetentionSeconds) { this.terminalRetentionSeconds = terminalRetentionSeconds; }
+
+    public long getLaunchingStaleSeconds() { return launchingStaleSeconds; }
+    public void setLaunchingStaleSeconds(long launchingStaleSeconds) { this.launchingStaleSeconds = launchingStaleSeconds; }
 }

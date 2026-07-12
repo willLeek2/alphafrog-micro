@@ -15,7 +15,9 @@ import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -32,12 +34,16 @@ class ToolJobResumeServiceTest {
     @Mock
     private ToolJobResumeLauncher resumeLauncher;
 
+    @Mock
+    private ToolJobConfig config;
+
     private ToolJobResumeService resumeService;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     @BeforeEach
     void setUp() {
-        resumeService = new ToolJobResumeService(anchorService, redisCache, objectMapper);
+        lenient().when(config.getLaunchingStaleSeconds()).thenReturn(120L);
+        resumeService = new ToolJobResumeService(anchorService, redisCache, config, objectMapper);
         try {
             var field = ToolJobResumeService.class.getDeclaredField("resumeLauncher");
             field.setAccessible(true);
@@ -59,7 +65,11 @@ class ToolJobResumeServiceTest {
     void shouldCleanupRedisForAlreadyConsumed() {
         ToolJobAnchor anchor = buildReadyAnchor();
         anchor.setResumeState("CONSUMED");
+        anchor.setResumeToken("consumed-token");
+        anchor.setResumeLeaseVersion(10);
         when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
+        when(anchorService.clearAnchorWithToken(eq("run-1"), eq("CONSUMED"),
+                eq("consumed-token"), eq(10L))).thenReturn(true);
 
         assertThat(resumeService.tryResume("run-1")).isTrue();
         verify(redisCache).removeDue("run-1");
@@ -121,7 +131,7 @@ class ToolJobResumeServiceTest {
         boolean result = resumeService.tryResume("run-1");
         assertThat(result).isFalse();
         assertThat(anchor.getResumeState()).isEqualTo("READY");
-        assertThat(anchor.getResumeLeaseVersion()).isEqualTo(5); // rolled back to original
+        assertThat(anchor.getResumeLeaseVersion()).isEqualTo(7); // monotonic: claimedVersion+1, not reverted
     }
 
     @Test
@@ -139,6 +149,7 @@ class ToolJobResumeServiceTest {
         boolean result = resumeService.tryResume("run-1");
         assertThat(result).isFalse();
         assertThat(anchor.getResumeState()).isEqualTo("READY");
+        assertThat(anchor.getResumeLeaseVersion()).isEqualTo(7); // monotonic: claimedVersion+1
     }
 
     // ---- LAUNCHING reentry (crash recovery, §9.11) ----
@@ -147,6 +158,7 @@ class ToolJobResumeServiceTest {
     void shouldReenterLaunchingAndRelunch() {
         ToolJobAnchor anchor = buildReadyAnchor();
         anchor.setResumeState("LAUNCHING");
+        anchor.setResumeClaimedAt(java.time.Instant.now()); // active, not stale
         when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
         when(resumeLauncher.launch(eq("run-1"), any(ToolJobResumeContext.class))).thenReturn(true);
 
@@ -167,6 +179,7 @@ class ToolJobResumeServiceTest {
 
         ToolJobAnchor anchor = buildReadyAnchor();
         anchor.setResumeState("LAUNCHING");
+        anchor.setResumeClaimedAt(java.time.Instant.now()); // active, not stale
         when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
 
         boolean result = resumeService.tryResume("run-1");
@@ -185,7 +198,8 @@ class ToolJobResumeServiceTest {
         when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
         when(anchorService.updateAnchor(eq("run-1"), any(ToolJobAnchor.class), eq(AgentRunStatus.RECEIVED)))
                 .thenReturn(true);
-        when(anchorService.clearAnchorWithToken("run-1", "test-token-123")).thenReturn(true);
+        when(anchorService.clearAnchorWithToken(eq("run-1"), eq("CONSUMED"),
+                eq("test-token-123"), eq(5L))).thenReturn(true);
 
         resumeService.markConsumed("run-1");
 
@@ -210,7 +224,7 @@ class ToolJobResumeServiceTest {
         assertThat(anchor.getResumeState()).isEqualTo("CONSUMED");
         verify(redisCache, never()).removeDue("run-1");
         verify(redisCache, never()).deletePendingCache("run-1");
-        verify(anchorService, never()).clearAnchorWithToken(any(), any());
+        verify(anchorService, never()).clearAnchorWithToken(any(), any(), any(), anyLong());
     }
 
     // ---- double-claim prevention (§9.11 token+version CAS) ----

@@ -22,6 +22,7 @@ public class ToolJobResumeService {
 
     private final ToolJobAnchorService anchorService;
     private final ToolJobRedisCache redisCache;
+    private final ToolJobConfig config;
     private final ObjectMapper objectMapper;
 
     @Autowired(required = false)
@@ -31,9 +32,11 @@ public class ToolJobResumeService {
     private ToolJobResumeLauncher resumeLauncher;
 
     public ToolJobResumeService(ToolJobAnchorService anchorService,
-                                ToolJobRedisCache redisCache, ObjectMapper objectMapper) {
+                                ToolJobRedisCache redisCache, ToolJobConfig config,
+                                ObjectMapper objectMapper) {
         this.anchorService = anchorService;
         this.redisCache = redisCache;
+        this.config = config;
         this.objectMapper = objectMapper;
     }
 
@@ -43,6 +46,14 @@ public class ToolJobResumeService {
 
         String state = anchor.getResumeState();
         if ("CONSUMED".equals(state)) {
+            // Durable clear FIRST (DB before cache). If we crash after Redis delete
+            // but before DB clear, the anchor becomes a zombie (CONSUMED + no Redis
+            // trigger). Token+state+version-gated clear ensures only the rightful consumer clears.
+            String token = anchor.getResumeToken();
+            if (token != null && !token.isBlank()) {
+                anchorService.clearAnchorWithToken(runId, "CONSUMED", token,
+                        anchor.getResumeLeaseVersion());
+            }
             redisCache.removeDue(runId);
             redisCache.deletePendingCache(runId);
             return true;
@@ -83,8 +94,11 @@ public class ToolJobResumeService {
 
     private void rollbackToReady(String runId, ToolJobAnchor anchor, long originalVersion,
                                   String claimedToken, long claimedVersion) {
+        // Monotonic: bump version again on rollback. Never revert to originalVersion —
+        // that would create an ABA gap where the old token/version pair becomes valid again.
+        long nextVersion = claimedVersion + 1;
         anchor.setResumeState("READY");
-        anchor.setResumeLeaseVersion(originalVersion);
+        anchor.setResumeLeaseVersion(nextVersion);
         anchor.setResumeClaimedAt(null);
         anchorService.casResumeState(runId, anchor, AgentRunStatus.RECEIVED, "LAUNCHING",
                 claimedToken, claimedVersion);
@@ -92,10 +106,32 @@ public class ToolJobResumeService {
 
     private boolean reenterLaunching(String runId, ToolJobAnchor anchor) {
         log.info("Re-entering LAUNCHING resume for run={}", runId);
-        // Restore registry on reentry too (may have crashed before restore completed)
+
+        // Stale detection: if claimedAt + TTL has passed, roll back to READY
+        // so a fresh claim with new token can be attempted on next scan
+        if (anchor.getResumeClaimedAt() != null) {
+            long staleDeadline = anchor.getResumeClaimedAt().toEpochMilli()
+                    + config.getLaunchingStaleSeconds() * 1000;
+            if (System.currentTimeMillis() > staleDeadline) {
+                log.warn("LAUNCHING claim stale for run={}, claimedAt={}, rolling back to READY",
+                        runId, anchor.getResumeClaimedAt());
+                long claimedVersion = anchor.getResumeLeaseVersion();
+                String claimedToken = anchor.getResumeToken();
+                // Bump version and set back to READY for fresh claim
+                anchor.setResumeState("READY");
+                anchor.setResumeLeaseVersion(claimedVersion + 1);
+                anchor.setResumeToken(java.util.UUID.randomUUID().toString());
+                anchor.setResumeClaimedAt(null);
+                anchorService.casResumeState(runId, anchor, AgentRunStatus.RECEIVED, "LAUNCHING",
+                        claimedToken, claimedVersion);
+                return false; // will retry as READY on next scan
+            }
+        }
+
+        // Active LAUNCHING: re-call the launcher (idempotent on token+version)
         if (!restoreDatasetRegistry(runId, anchor)) {
             log.error("Dataset restore failed on LAUNCHING reentry for run={}, will retry", runId);
-            return false; // retry on next scan
+            return false;
         }
         if (resumeLauncher == null) {
             log.warn("No resumeLauncher wired — cannot recover LAUNCHING run={}", runId);
@@ -151,14 +187,15 @@ public class ToolJobResumeService {
             return;
         }
 
-        // Token-gated durable clear FIRST, then Redis (DB before cache)
+        // Token+state+version-gated durable clear FIRST, then Redis (DB before cache)
         String token = anchor.getResumeToken();
         if (token == null || token.isBlank()) {
             log.warn("No resumeToken for run={} — refusing to clear anchor, will retry", runId);
             return;
         }
-        if (!anchorService.clearAnchorWithToken(runId, token)) {
-            log.warn("Token-gated clear failed for run={} — token mismatch, retrying", runId);
+        if (!anchorService.clearAnchorWithToken(runId, "CONSUMED", token,
+                anchor.getResumeLeaseVersion())) {
+            log.warn("Token+state+version-gated clear failed for run={} — mismatch, retrying", runId);
             return; // keep Redis cache, retry on next cycle
         }
         redisCache.removeDue(runId);

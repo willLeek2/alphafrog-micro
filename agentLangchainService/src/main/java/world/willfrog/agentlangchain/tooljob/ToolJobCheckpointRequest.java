@@ -1,0 +1,77 @@
+package world.willfrog.agentlangchain.tooljob;
+
+import world.willfrog.agent.platform.dataanalysis.CompletedTodoRecord;
+
+import java.util.Collections;
+import java.util.List;
+
+/**
+ * Immutable checkpoint payload captured by the pipeline before suspending
+ * for a slow tool job. Contains everything needed to restore execution state
+ * when the sandbox result arrives and the resume launcher takes over.
+ */
+public class ToolJobCheckpointRequest {
+
+    private final String runId;
+    private final String todoId;
+    private final int sequence;
+    private final List<CompletedTodoRecord> completedTodos;
+    private final String datasetSnapshotJson;
+    private final String datasetSnapshotDigest;
+    private final String datasetRefsJson;
+    private final int toolCallsUsed;
+    private final String estimateJson;
+
+    private ToolJobCheckpointRequest(Builder builder) {
+        this.runId = builder.runId;
+        this.todoId = builder.todoId;
+        this.sequence = builder.sequence;
+        this.completedTodos = Collections.unmodifiableList(builder.completedTodos);
+        this.datasetSnapshotJson = builder.datasetSnapshotJson;
+        this.datasetSnapshotDigest = builder.datasetSnapshotDigest;
+        this.datasetRefsJson = builder.datasetRefsJson;
+        this.toolCallsUsed = builder.toolCallsUsed;
+        this.estimateJson = builder.estimateJson;
+    }
+
+    public String getRunId() { return runId; }
+    public String getTodoId() { return todoId; }
+    public int getSequence() { return sequence; }
+    public List<CompletedTodoRecord> getCompletedTodos() { return completedTodos; }
+    public String getDatasetSnapshotJson() { return datasetSnapshotJson; }
+    public String getDatasetSnapshotDigest() { return datasetSnapshotDigest; }
+    public String getDatasetRefsJson() { return datasetRefsJson; }
+    public int getToolCallsUsed() { return toolCallsUsed; }
+    public String getEstimateJson() { return estimateJson; }
+
+    public static Builder builder(String runId) {
+        return new Builder(runId);
+    }
+
+    public static class Builder {
+        private final String runId;
+        private String todoId;
+        private int sequence;
+        private List<CompletedTodoRecord> completedTodos = Collections.emptyList();
+        private String datasetSnapshotJson;
+        private String datasetSnapshotDigest;
+        private String datasetRefsJson;
+        private int toolCallsUsed;
+        private String estimateJson;
+
+        private Builder(String runId) { this.runId = runId; }
+
+        public Builder todoId(String todoId) { this.todoId = todoId; return this; }
+        public Builder sequence(int sequence) { this.sequence = sequence; return this; }
+        public Builder completedTodos(List<CompletedTodoRecord> completedTodos) { this.completedTodos = completedTodos; return this; }
+        public Builder datasetSnapshotJson(String datasetSnapshotJson) { this.datasetSnapshotJson = datasetSnapshotJson; return this; }
+        public Builder datasetSnapshotDigest(String datasetSnapshotDigest) { this.datasetSnapshotDigest = datasetSnapshotDigest; return this; }
+        public Builder datasetRefsJson(String datasetRefsJson) { this.datasetRefsJson = datasetRefsJson; return this; }
+        public Builder toolCallsUsed(int toolCallsUsed) { this.toolCallsUsed = toolCallsUsed; return this; }
+        public Builder estimateJson(String estimateJson) { this.estimateJson = estimateJson; return this; }
+
+        public ToolJobCheckpointRequest build() {
+            return new ToolJobCheckpointRequest(this);
+        }
+    }
+}

@@ -99,12 +99,15 @@ public class ToolJobAnchorService {
     }
 
     /**
-     * Token-gated clear: only clears if the anchor's resumeToken matches.
-     * There is no non-token-gated clear path — cleanup without a valid token
-     * is always rejected to prevent accidental data loss.
-     * @return true if exactly one row was cleared (token matched)
+     * Token+state+version-gated clear: only clears if the anchor's resumeState,
+     * resumeToken, and resumeLeaseVersion all match. Prevents stale consumers
+     * from clearing an anchor that has been re-claimed with a new lease.
+     * There is no non-token-gated clear path.
+     * @return true if exactly one row was cleared
      */
-    public boolean clearAnchorWithToken(String runId, String expectedToken) {
-        return agentRunMapper.clearToolJobAnchorWithToken(runId, expectedToken) == 1;
+    public boolean clearAnchorWithToken(String runId, String expectedResumeState,
+                                         String expectedToken, long expectedLeaseVersion) {
+        return agentRunMapper.clearToolJobAnchorWithToken(
+                runId, expectedResumeState, expectedToken, expectedLeaseVersion) == 1;
     }
 }

@@ -312,7 +312,7 @@
         FROM alphafrog_agent_run
         WHERE tool_job_anchor_json IS NOT NULL
           AND tool_job_anchor_json &lt;&gt; '{}'::jsonb
-          AND status IN ('WAITING_TOOL_JOB')
+          AND status IN ('WAITING_TOOL_JOB', 'CANCELED')
         ORDER BY updated_at ASC
         LIMIT #{limit}
     </select>
@@ -360,7 +360,9 @@
         SET tool_job_anchor_json = CAST('{}' AS jsonb),
             updated_at = CURRENT_TIMESTAMP
         WHERE id = #{id}
+          AND tool_job_anchor_json #>> '{resumeState}' = #{expectedResumeState}
           AND tool_job_anchor_json #>> '{resumeToken}' = #{expectedToken}
+          AND (tool_job_anchor_json #>> '{resumeLeaseVersion}')::bigint = #{expectedLeaseVersion}
     </update>
 
 </mapper>

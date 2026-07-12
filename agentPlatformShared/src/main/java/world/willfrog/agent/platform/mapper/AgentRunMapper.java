@@ -137,9 +137,13 @@ public interface AgentRunMapper {
                                    @Param("expectedLeaseVersion") long expectedLeaseVersion);
 
     /**
-     * Token-gated clear: only clears the anchor if the resumeToken matches.
-     * Returns 1 if cleared, 0 if token mismatch (another consumer already cleared).
-     * There is no non-token-gated clear — cleanup without a valid token is rejected.
+     * Token+state+version-gated clear: only clears if resumeState, resumeToken,
+     * AND resumeLeaseVersion all match. Prevents stale consumers from clearing
+     * an anchor that has already been re-claimed with a new token/version.
+     * There is no non-token-gated clear — cleanup without valid token is rejected.
      */
-    int clearToolJobAnchorWithToken(@Param("id") String id, @Param("expectedToken") String expectedToken);
+    int clearToolJobAnchorWithToken(@Param("id") String id,
+                                    @Param("expectedResumeState") String expectedResumeState,
+                                    @Param("expectedToken") String expectedToken,
+                                    @Param("expectedLeaseVersion") long expectedLeaseVersion);
 }

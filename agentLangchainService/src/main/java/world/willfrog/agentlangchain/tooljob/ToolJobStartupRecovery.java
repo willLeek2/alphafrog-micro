@@ -191,6 +191,10 @@ public class ToolJobStartupRecovery {
             String ds = resp.getDatasetDir();
             return (stdout != null && !stdout.isBlank()) || (ds != null && !ds.isBlank());
         }
-        return true;
+        if ("FAILED".equals(status) || "CANCELED".equals(status)) {
+            return (resp.getError() != null && !resp.getError().isBlank())
+                    || (resp.getStderr() != null && !resp.getStderr().isBlank());
+        }
+        return false;
     }
 }

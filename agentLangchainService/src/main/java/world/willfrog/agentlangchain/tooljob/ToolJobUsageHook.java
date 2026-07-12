@@ -9,11 +9,18 @@ import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
  *
  * <p><b>Idempotency:</b> The finalizer may re-enter this hook if the subsequent
  * DB step-marker write fails after a successful upsert. Implementations MUST be
- * idempotent on {@code runId} — a repeated call with the same runId and anchor
- * must produce a single durable record, not a duplicate.</p>
+ * idempotent on the stable key
+ * {@code (anchor.getOperationId())} — {@code runId:toolCallId:attempt}.
+ * A repeated call with the same key must produce a single durable record,
+ * not a duplicate.</p>
  */
 @FunctionalInterface
 public interface ToolJobUsageHook {
-    /** @return true if usage was successfully persisted (idempotent on runId) */
+    /**
+     * @param runId  the agent run identifier
+     * @param anchor the durable anchor (use {@code anchor.getOperationId()}
+     *               as the stable idempotency key: runId:toolCallId:attempt)
+     * @return true if usage was successfully persisted
+     */
     boolean upsertUsage(String runId, ToolJobAnchor anchor);
 }
