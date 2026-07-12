@@ -324,11 +324,14 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                     : linearWorkflowExecutor.executePlanned(workflowRequest, plan);
 
             if (result.isSuspended()) {
-                if (!persistToolJobCheckpoint(runId, result)) {
+                ToolJobCheckpointAttempt checkpoint = persistToolJobCheckpoint(runId, result);
+                if (!checkpoint.persisted()) {
                     log.error("Durable tool-job checkpoint failed for run={} todo={}",
                             runId, result.getSuspendedTodoId());
-                    recordCheckpointFailure(runId, userId, result);
-                    return;
+                    if (recordCheckpointFailure(runId, userId, result, checkpoint.request())
+                            != CheckpointFailureOutcome.HEALTHY_CHECKPOINT) {
+                        return;
+                    }
                 }
                 Map<String, Object> payload = new LinkedHashMap<>();
                 payload.put("run_id", runId);
@@ -540,8 +543,10 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         String runId = run.getId();
         String userId = run.getUserId();
         if (result.isSuspended()) {
-            if (!persistToolJobCheckpoint(runId, result)) {
-                recordCheckpointFailure(runId, userId, result);
+            ToolJobCheckpointAttempt checkpoint = persistToolJobCheckpoint(runId, result);
+            if (!checkpoint.persisted()
+                    && recordCheckpointFailure(runId, userId, result, checkpoint.request())
+                    != CheckpointFailureOutcome.HEALTHY_CHECKPOINT) {
                 return false;
             }
             eventService.append(runId, userId, "TOOL_CALL_SUSPENDED", Map.of(
@@ -642,19 +647,36 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 || latest.getStatus() == AgentRunStatus.PARTIAL;
     }
 
-    private boolean persistToolJobCheckpoint(String runId, LangchainLinearWorkflowResult result) {
-        if (toolJobCheckpointWriter == null || result == null || !result.isSuspended()) {
-            return false;
+    private ToolJobCheckpointAttempt persistToolJobCheckpoint(String runId,
+                                                              LangchainLinearWorkflowResult result) {
+        if (result == null || !result.isSuspended()) {
+            return new ToolJobCheckpointAttempt(false, null);
         }
+        ToolJobCheckpointRequest request = null;
         try {
             AgentRun latest = runMapper.findById(runId);
             if (latest == null || isBlank(latest.getToolJobAnchorJson())) {
-                return false;
+                return new ToolJobCheckpointAttempt(false, null);
             }
             ToolJobAnchor anchor = ToolJobAnchor.fromJson(latest.getToolJobAnchorJson());
+            request = ToolJobCheckpointRequest.builder(runId)
+                    .operationId(anchor.getOperationId())
+                    .toolCallId(anchor.getToolCallId())
+                    .attempt(anchor.getAttempt())
+                    .taskId(anchor.getTaskId())
+                    .expectedCheckpointVersion(anchor.getCheckpointVersion())
+                    .todoId(result.getSuspendedTodoId())
+                    .sequence(result.getSuspendedTodoSequence() == null
+                            ? 0 : result.getSuspendedTodoSequence())
+                    .completedTodos(List.of())
+                    .toolCallsUsed(result.getToolCallsUsed())
+                    .build();
+            if (toolJobCheckpointWriter == null) {
+                return new ToolJobCheckpointAttempt(false, request);
+            }
             AgentRunDatasetRegistry registry = agentRunDatasetRegistryProvider.getIfAvailable();
             if (registry == null) {
-                return false;
+                return new ToolJobCheckpointAttempt(false, request);
             }
             var datasetSnapshot = registry.snapshot(runId);
             List<CompletedTodoRecord> records = new ArrayList<>();
@@ -671,7 +693,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 }
             }
             String refsJson = isBlank(anchor.getDatasetRefsJson()) ? "[]" : anchor.getDatasetRefsJson();
-            return toolJobCheckpointWriter.captureAndSave(ToolJobCheckpointRequest.builder(runId)
+            request = ToolJobCheckpointRequest.builder(runId)
                     .operationId(anchor.getOperationId())
                     .toolCallId(anchor.getToolCallId())
                     .attempt(anchor.getAttempt())
@@ -686,41 +708,48 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                     .datasetRefsJson(refsJson)
                     .toolCallsUsed(result.getToolCallsUsed())
                     .estimateJson(anchor.getEstimateJson())
-                    .build());
+                    .build();
+            return new ToolJobCheckpointAttempt(
+                    toolJobCheckpointWriter.captureAndSave(request), request);
         } catch (Exception e) {
             log.error("Failed to persist tool-job checkpoint runId={}: {}", runId, e.getMessage());
-            return false;
+            return new ToolJobCheckpointAttempt(false, request);
         }
     }
 
-    private void recordCheckpointFailure(String runId,
-                                         String userId,
-                                         LangchainLinearWorkflowResult result) {
+    private CheckpointFailureOutcome recordCheckpointFailure(
+            String runId,
+            String userId,
+            LangchainLinearWorkflowResult result,
+            ToolJobCheckpointRequest failedRequest) {
         boolean durable = false;
-        try {
-            AgentRun latest = runMapper.findById(runId);
-            if (toolJobAnchorService != null && latest != null
-                    && !isBlank(latest.getToolJobAnchorJson())) {
-                ToolJobAnchor anchor = ToolJobAnchor.fromJson(latest.getToolJobAnchorJson());
-                anchor.setAutoResume(false);
-                anchor.setRunDisposition("CHECKPOINT_FAILED");
-                anchor.setFinalizerError("durable_checkpoint_write_failed");
-                try {
-                    durable = toolJobAnchorService.updateAnchor(
-                            runId, anchor, AgentRunStatus.WAITING_TOOL_JOB);
-                } catch (Exception updateEx) {
-                    log.warn("Full anchor checkpoint-failure update failed runId={}, using narrow merge: {}",
-                            runId, updateEx.getMessage());
-                }
-                if (!durable) {
-                    durable = toolJobAnchorService.markCheckpointFailed(
-                            runId, anchor, "durable_checkpoint_write_failed");
-                }
+        if (toolJobAnchorService != null && failedRequest != null) {
+            try {
+                durable = toolJobAnchorService.markCheckpointFailed(
+                        failedRequest, "durable_checkpoint_write_failed");
+            } catch (Exception e) {
+                log.error("Failed to persist checkpoint-failure disposition runId={}: {}",
+                        runId, e.getMessage());
             }
-        } catch (Exception e) {
-            log.error("Failed to persist checkpoint-failure disposition runId={}: {}",
-                    runId, e.getMessage());
         }
+        if (durable) {
+            emitCheckpointFailure(runId, userId, result, true, false);
+            return CheckpointFailureOutcome.FAILURE_OWNED;
+        }
+        if (hasEquivalentOrNewerCheckpoint(runId, result, failedRequest)) {
+            log.info("Checkpoint failure superseded by healthy durable owner run={} todo={}",
+                    runId, result.getSuspendedTodoId());
+            return CheckpointFailureOutcome.HEALTHY_CHECKPOINT;
+        }
+        emitCheckpointFailure(runId, userId, result, false, true);
+        return CheckpointFailureOutcome.UNOWNED;
+    }
+
+    private void emitCheckpointFailure(String runId,
+                                       String userId,
+                                       LangchainLinearWorkflowResult result,
+                                       boolean durable,
+                                       boolean retryable) {
         String dedupeKey = runId + ":" + nvl(result.getPendingToolCallId())
                 + ":" + result.getPendingAttempt() + ":checkpoint_failed";
         eventService.appendOnce(runId, userId, "TOOL_JOB_CHECKPOINT_FAILED", dedupeKey, Map.of(
@@ -729,8 +758,46 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 "attempt", result.getPendingAttempt(),
                 "todo_id", nvl(result.getSuspendedTodoId()),
                 "durable_failure_disposition", durable,
-                "retryable", !durable
+                "retryable", retryable
         ));
+    }
+
+    private boolean hasEquivalentOrNewerCheckpoint(
+            String runId,
+            LangchainLinearWorkflowResult result,
+            ToolJobCheckpointRequest failedRequest) {
+        if (failedRequest == null) {
+            return false;
+        }
+        try {
+            AgentRun latest = runMapper.findById(runId);
+            if (latest == null || isBlank(latest.getToolJobAnchorJson())) {
+                return false;
+            }
+            ToolJobAnchor anchor = ToolJobAnchor.fromJson(latest.getToolJobAnchorJson());
+            return java.util.Objects.equals(anchor.getOperationId(), failedRequest.getOperationId())
+                    && java.util.Objects.equals(anchor.getToolCallId(), failedRequest.getToolCallId())
+                    && anchor.getAttempt() == failedRequest.getAttempt()
+                    && java.util.Objects.equals(anchor.getTaskId(), failedRequest.getTaskId())
+                    && anchor.getCheckpointVersion() > failedRequest.getExpectedCheckpointVersion()
+                    && java.util.Objects.equals(anchor.getTodoId(), result.getSuspendedTodoId())
+                    && anchor.getSequence() == (result.getSuspendedTodoSequence() == null
+                            ? 0 : result.getSuspendedTodoSequence())
+                    && !isBlank(anchor.getDatasetSnapshotJson())
+                    && !isBlank(anchor.getDatasetSnapshotDigest())
+                    && !isBlank(anchor.getEstimateJson());
+        } catch (Exception e) {
+            log.warn("Failed to verify newer checkpoint owner run={}: {}", runId, e.getMessage());
+            return false;
+        }
+    }
+
+    private record ToolJobCheckpointAttempt(boolean persisted, ToolJobCheckpointRequest request) {}
+
+    private enum CheckpointFailureOutcome {
+        FAILURE_OWNED,
+        HEALTHY_CHECKPOINT,
+        UNOWNED
     }
 
     private void persistPlan(String runId, String userId, LangchainTodoPlan plan) {

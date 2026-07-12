@@ -61,10 +61,11 @@ public class ToolJobAnchorService {
      * not replace reservation/terminal fields and binds the failed checkpoint
      * identity so a stale pipeline cannot poison a newer external job.
      */
-    public boolean markCheckpointFailed(String runId, ToolJobAnchor anchor, String error) {
+    public boolean markCheckpointFailed(ToolJobCheckpointRequest request, String error) {
         return agentRunMapper.markToolJobCheckpointFailed(
-                runId, anchor.getOperationId(), anchor.getToolCallId(),
-                anchor.getAttempt(), anchor.getCheckpointVersion(), error) == 1;
+                request.getRunId(), request.getOperationId(), request.getToolCallId(),
+                request.getAttempt(), request.getTaskId(),
+                request.getExpectedCheckpointVersion(), error) == 1;
     }
 
     /**

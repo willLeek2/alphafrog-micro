@@ -326,13 +326,15 @@ class ToolJobAnchorMapperIntegrationTest {
     @Test
     void checkpointFailureMergeOwnsWaitingRunAndPreservesAnchor() throws Exception {
         insertRun("run-f1", "WAITING_TOOL_JOB", """
-            {"operationId":"run-f1:tc-1:1","toolCallId":"tc-1","attempt":1,"checkpointVersion":3,"reservationJson":"keep","terminalStatus":"SUCCEEDED"}""");
+            {"operationId":"run-f1:tc-1:1","toolCallId":"tc-1","attempt":1,"taskId":"task-123","checkpointVersion":3,"reservationJson":"keep","terminalStatus":"SUCCEEDED","finalizerStep":"EVENT"}""");
 
-        int rows = newMapper().markToolJobCheckpointFailed(
-                "run-f1", "run-f1:tc-1:1", "tc-1", 1, 3,
-                "durable_checkpoint_write_failed");
+        ToolJobCheckpointRequest request = ToolJobCheckpointRequest.builder("run-f1")
+                .operationId("run-f1:tc-1:1").toolCallId("tc-1").attempt(1)
+                .taskId("task-123").expectedCheckpointVersion(3).build();
+        boolean persisted = new ToolJobAnchorService(newMapper()).markCheckpointFailed(
+                request, "durable_checkpoint_write_failed");
 
-        assertThat(rows).isEqualTo(1);
+        assertThat(persisted).isTrue();
         ToolJobAnchor anchor = ToolJobAnchor.fromJson(
                 newMapper().findById("run-f1").getToolJobAnchorJson());
         assertThat(anchor.isAutoResume()).isFalse();
@@ -340,17 +342,33 @@ class ToolJobAnchorMapperIntegrationTest {
         assertThat(anchor.getFinalizerError()).isEqualTo("durable_checkpoint_write_failed");
         assertThat(anchor.getReservationJson()).isEqualTo("keep");
         assertThat(anchor.getTerminalStatus()).isEqualTo("SUCCEEDED");
+        assertThat(anchor.getFinalizerStep()).isEqualTo("EVENT");
     }
 
     @Test
     void checkpointFailureMergeRejectsStaleIdentityAndVersion() throws Exception {
         insertRun("run-f2", "WAITING_TOOL_JOB", """
-            {"operationId":"run-f2:tc-1:1","toolCallId":"tc-1","attempt":1,"checkpointVersion":4}""");
+            {"operationId":"run-f2:tc-1:1","toolCallId":"tc-1","attempt":1,"taskId":"task-123","checkpointVersion":4}""");
 
-        assertThat(newMapper().markToolJobCheckpointFailed(
-                "run-f2", "run-f2:tc-1:1", "tc-1", 1, 3, "err")).isZero();
-        assertThat(newMapper().markToolJobCheckpointFailed(
-                "run-f2", "run-f2:tc-2:1", "tc-2", 1, 4, "err")).isZero();
+        ToolJobAnchorService service = new ToolJobAnchorService(newMapper());
+        ToolJobCheckpointRequest stale = ToolJobCheckpointRequest.builder("run-f2")
+                .operationId("run-f2:tc-1:1").toolCallId("tc-1").attempt(1)
+                .taskId("task-123").expectedCheckpointVersion(3).build();
+        ToolJobCheckpointRequest wrongOperation = ToolJobCheckpointRequest.builder("run-f2")
+                .operationId("run-f2:tc-2:1").toolCallId("tc-2").attempt(1)
+                .taskId("task-123").expectedCheckpointVersion(4).build();
+        ToolJobCheckpointRequest wrongTask = ToolJobCheckpointRequest.builder("run-f2")
+                .operationId("run-f2:tc-1:1").toolCallId("tc-1").attempt(1)
+                .taskId("task-other").expectedCheckpointVersion(4).build();
+
+        assertThat(service.markCheckpointFailed(stale, "err")).isFalse();
+        assertThat(service.markCheckpointFailed(wrongOperation, "err")).isFalse();
+        assertThat(service.markCheckpointFailed(wrongTask, "err")).isFalse();
+        ToolJobAnchor healthy = ToolJobAnchor.fromJson(
+                newMapper().findById("run-f2").getToolJobAnchorJson());
+        assertThat(healthy.getCheckpointVersion()).isEqualTo(4);
+        assertThat(healthy.getRunDisposition()).isNull();
+        assertThat(healthy.isAutoResume()).isTrue();
     }
 
     // ========== casUpdateAnchorResumeState: claim CAS ==========

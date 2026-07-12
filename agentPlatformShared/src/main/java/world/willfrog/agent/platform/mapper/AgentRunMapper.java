@@ -110,6 +110,7 @@ public interface AgentRunMapper {
                                     @Param("operationId") String operationId,
                                     @Param("toolCallId") String toolCallId,
                                     @Param("attempt") int attempt,
+                                    @Param("taskId") String taskId,
                                     @Param("checkpointVersion") int checkpointVersion,
                                     @Param("finalizerError") String finalizerError);
 
