@@ -2,8 +2,6 @@ package world.willfrog.agentlangchain.facade;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import java.util.Map;
@@ -18,8 +16,6 @@ import world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilitySumma
  */
 @Component
 public class DataAnalysisReadResponseSerializer {
-
-    private static final Logger log = LoggerFactory.getLogger(DataAnalysisReadResponseSerializer.class);
 
     private final ObjectMapper objectMapper;
 

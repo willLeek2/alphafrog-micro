@@ -303,6 +303,27 @@ class LangchainRunReadServiceTest {
         assertEquals("\"not-an-object\"", obsJson);
     }
 
+    @Test
+    void emptyObjectJsonWithWhitespaceMergesCorrectly() {
+        AgentRun run = run("{\"run_provider\":\"legacy\"}");
+        when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(run);
+        when(stateStore.loadPlan("r1")).thenReturn(Optional.empty());
+        when(eventService.findLatestByRunId("r1")).thenReturn(event(1, "EXECUTION_STARTED"));
+        // 合法空对象带空白，必须以 isObject() 接受
+        when(observabilityService.loadObservabilitySummaryJson(eq("r1"), any()))
+                .thenReturn("{ }");
+        when(eventService.listByRunId("r1")).thenReturn(List.of());
+        when(eventService.findMaxSeq("r1")).thenReturn(5);
+        var snapshot = DataAnalysisObservabilityContractFixtures.canonicalV1();
+        when(dataAnalysisQuery.findSummaryByRunId("r1")).thenReturn(Optional.of(snapshot.summary()));
+
+        var status = service.getStatus(GetAgentRunStatusRequest.newBuilder()
+                .setUserId("u1").setId("r1").build());
+
+        String obsJson = status.getObservabilitySummaryJson();
+        assertTrue(obsJson.contains("data_analysis_observability"));
+    }
+
     private AgentRun run(String ext) {
         AgentRun run = new AgentRun();
         run.setId("r1");

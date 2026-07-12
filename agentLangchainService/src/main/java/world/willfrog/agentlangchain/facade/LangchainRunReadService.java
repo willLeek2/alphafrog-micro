@@ -761,17 +761,25 @@ public class LangchainRunReadService {
         if (baseJson == null || baseJson.isBlank()) {
             return overlayJson;
         }
-        Map<String, Object> base = readExtMap(baseJson);
-        if (base.isEmpty() && !baseJson.trim().equals("{}")) {
-            log.warn("base JSON 解析为非对象或非法 runId={} view={}，保留原始响应", runId, view);
+        try {
+            com.fasterxml.jackson.databind.JsonNode baseNode = objectMapper.readTree(baseJson);
+            if (!baseNode.isObject()) {
+                log.warn("base JSON 非对象 runId={} view={}，保留原始响应", runId, view);
+                return baseJson;
+            }
+            com.fasterxml.jackson.databind.JsonNode overlayNode = objectMapper.readTree(overlayJson);
+            if (!overlayNode.isObject()) {
+                log.warn("overlay JSON 非对象 runId={} view={}，保留原始响应", runId, view);
+                return baseJson;
+            }
+            Map<String, Object> base = objectMapper.convertValue(baseNode, Map.class);
+            Map<String, Object> overlay = objectMapper.convertValue(overlayNode, Map.class);
+            base.putAll(overlay);
+            return objectMapper.writeValueAsString(base);
+        } catch (Exception e) {
+            log.warn("JSON merge 失败 runId={} view={} 异常={}/{}，保留原始响应",
+                    runId, view, e.getClass().getSimpleName(), e.getMessage());
             return baseJson;
         }
-        Map<String, Object> overlay = readExtMap(overlayJson);
-        if (overlay.isEmpty() && !overlayJson.trim().equals("{}")) {
-            log.warn("overlay JSON 解析为非对象或非法 runId={} view={}，保留原始响应", runId, view);
-            return baseJson;
-        }
-        base.putAll(overlay);
-        return writeJson(base);
     }
 }
