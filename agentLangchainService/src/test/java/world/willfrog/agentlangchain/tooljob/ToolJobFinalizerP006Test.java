@@ -247,12 +247,20 @@ class ToolJobFinalizerP006Test {
         // No resume on failed call (finalizer returned early at RELEASE)
         verify(resumeService, never()).tryResume(any());
 
-        // === Second call: re-entry with fresh real ToolJobAnchorService ===
+        // === Second call: re-entry with NEW SqlSession (simulates process restart) ===
         //     ENVELOPE isStepDone -> skip
         //     RELEASE: restoreReservation CONFLICT, releaseReservation -> ALREADY_RELEASED,
         //     then updateAnchor(RELEASE) succeeds via real PG -> finalizer proceeds ===
-        // Use the same mapper from the same session for the reentry service
-        ToolJobAnchorService reentryService = new ToolJobAnchorService(mapper);
+        // Open a fresh SqlSession to simulate a process restart — codex "new SqlSession/new mapper"
+        SqlSession reentrySession = sqlSessionFactory.openSession(true);
+        activeSessions.add(reentrySession);
+        AgentRunMapper reentryMapper = reentrySession.getMapper(AgentRunMapper.class);
+        ToolJobAnchorService reentryService = new ToolJobAnchorService(reentryMapper);
+
+        // Reload anchor from PG via the new session (simulates startup recovery load)
+        ToolJobAnchor reentryAnchor = reentryService.loadAnchor("run-p06");
+        assertThat(reentryAnchor).isNotNull();
+        assertThat(reentryAnchor.getFinalizerStep()).isEqualTo(ToolJobFinalizer.STEP_ENVELOPE);
 
         ToolJobFinalizer finalizer2 = new ToolJobFinalizer(
                 reentryService, redisCache, capacityFake, resumeService,
@@ -260,8 +268,8 @@ class ToolJobFinalizerP006Test {
         inject(finalizer2, "usageHook", (ToolJobUsageHook) usageFake);
         inject(finalizer2, "eventHook", (ToolJobEventHook) eventFake);
 
-        // pgAnchor has finalizerStep=ENVELOPE from PG; pass it to re-entry
-        finalizer2.handleTerminal("run-p06", pgAnchor, "SUCCEEDED", null, true);
+        // reentryAnchor loaded from new session; pass it to re-entry
+        finalizer2.handleTerminal("run-p06", reentryAnchor, "SUCCEEDED", null, true);
 
         // Oracle: capacity release called twice, but only one ledger transition
         assertThat(capacityFake.releaseCallCount).isEqualTo(2);
@@ -273,7 +281,8 @@ class ToolJobFinalizerP006Test {
         // (proved by releaseCallCount=2, transitionCount=1 -- second call was a no-op)
 
         // Oracle: anchor advances past RELEASE on re-entry
-        ToolJobAnchor finalAnchor = verifyService.loadAnchor("run-p06");
+        // Read back through the reentry session to verify
+        ToolJobAnchor finalAnchor = reentryService.loadAnchor("run-p06");
         assertThat(finalAnchor.getFinalizerStep())
                 .isEqualTo(ToolJobFinalizer.STEP_RESUME_READY);
 
