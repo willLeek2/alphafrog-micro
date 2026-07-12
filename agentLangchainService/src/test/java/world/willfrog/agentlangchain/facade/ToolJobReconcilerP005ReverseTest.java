@@ -1,4 +1,4 @@
-package world.willfrog.agentlangchain.tooljob;
+package world.willfrog.agentlangchain.facade;
 
 import org.apache.ibatis.session.SqlSession;
 import org.apache.ibatis.session.SqlSessionFactory;
@@ -19,6 +19,18 @@ import world.willfrog.agent.platform.dataanalysis.*;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentObservabilityService;
+import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
+import world.willfrog.agent.platform.service.AgentRunStateStore;
+import world.willfrog.agentlangchain.orchestration.LangchainLinearRunPipeline;
+import world.willfrog.agentlangchain.tooljob.ToolJobAnchorService;
+import world.willfrog.agentlangchain.tooljob.ToolJobConfig;
+import world.willfrog.agentlangchain.tooljob.ToolJobFinalizer;
+import world.willfrog.agentlangchain.tooljob.ToolJobReconciler;
+import world.willfrog.agentlangchain.tooljob.ToolJobRedisCache;
+import world.willfrog.agentlangchain.tooljob.ToolJobResumeService;
+import world.willfrog.alphafrogmicro.agent.idl.CancelAgentRunRequest;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
 
 import javax.sql.DataSource;
@@ -26,7 +38,10 @@ import java.lang.reflect.Field;
 import java.sql.Connection;
 import java.sql.Statement;
 import java.time.Instant;
+import java.time.OffsetDateTime;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -34,9 +49,12 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 /**
  * P0-05 reverse: cancel with active task -> capacity leak evidence.
@@ -54,7 +72,8 @@ import static org.mockito.Mockito.verify;
  *   <li>Seed run with status=WAITING_TOOL_JOB, PENDING anchor with
  *       autoResume=true, reservation, and nextPollAt in the past</li>
  *   <li>Write run into Redis due ZSET</li>
- *   <li>Directly update run status to CANCELED via SQL</li>
+ *   <li>Call real {@link LangchainRunControlService#cancelRun(CancelAgentRunRequest)}
+ *       which updates DB status to CANCELED via real AgentRunMapper</li>
  *   <li>Stub sandboxService.getTaskStatus() -- returns SUCCEEDED</li>
  *   <li>Stub sandboxService.getTaskResult() -- returns valid result</li>
  *   <li>Call reconciler.reconcileFromDue()</li>
@@ -63,10 +82,11 @@ import static org.mockito.Mockito.verify;
  * Oracles (Path A):
  * <ol>
  *   <li>Anchor finalizerStep is null in DB (ENVELOPE CAS failed, not persisted)</li>
- *   <li>Capacity NOT released (reservationJson preserved)</li>
+ *   <li>Capacity NOT released (reservationJson preserved, releaseCallCount==0)</li>
  *   <li>Anchor terminalStatus, terminalAt, sandboxTerminalStatus remain null</li>
  *   <li>finalizerSpy.handleTerminal WAS called (reconciler tried)</li>
  *   <li>Anchor still PENDING (no state advancement)</li>
+ *   <li>Ledger identity still active (distinctReservationIds == 1)</li>
  * </ol>
  * <p>
  * Path B -- direct finalizer (narrow evidence):
@@ -93,6 +113,7 @@ class ToolJobReconcilerP005ReverseTest {
 
     private static final ObjectMapper om = new ObjectMapper().findAndRegisterModules();
     private static final String RUN_ID = "run-p005";
+    private static final String USER_ID = "u1";
     private static final String DUE_ZSET_KEY = "agent:tool-job:due";
 
     // Redis infra -- shared across tests
@@ -107,6 +128,18 @@ class ToolJobReconcilerP005ReverseTest {
     private ToolJobRedisCache redisCache;
     private ToolJobReconciler reconciler;
     private ToolJobFinalizer finalizerSpy;
+
+    // LangchainRunControlService with real mapper + mocked dependencies
+    private LangchainRunControlService controlService;
+    private StatefulCapacityFake capacityFake;
+
+    // Mocked dependencies for LangchainRunControlService
+    private LangchainRunReadService readService;
+    private AgentEventService eventService;
+    private AgentRunStateStore stateStore;
+    private AgentObservabilityService observabilityService;
+    private LangchainLinearRunPipeline pipeline;
+    private AgentRunCreditSettlementService creditSettlementService;
 
     // ---- Infrastructure lifecycle ----
 
@@ -170,7 +203,46 @@ class ToolJobReconcilerP005ReverseTest {
         // MyBatis mapper
         mapper = newMapper();
 
-        // Real services
+        // ---- Mocked dependencies for LangchainRunControlService ----
+        readService = mock(LangchainRunReadService.class);
+        eventService = mock(AgentEventService.class);
+        stateStore = mock(AgentRunStateStore.class);
+        observabilityService = mock(AgentObservabilityService.class);
+        pipeline = mock(LangchainLinearRunPipeline.class);
+        creditSettlementService = mock(AgentRunCreditSettlementService.class);
+
+        // Configure mocks for cancelRun:
+        // - requireWritableRun / requireReadableRun: load from real DB
+        when(readService.requireWritableRun(anyString(), anyString())).thenAnswer(inv -> {
+            AgentRun run = mapper.findById(inv.getArgument(0));
+            if (run == null) {
+                throw new IllegalArgumentException("run not found");
+            }
+            return run;
+        });
+        when(readService.requireReadableRun(anyString(), anyString())).thenAnswer(inv -> {
+            AgentRun run = mapper.findById(inv.getArgument(0));
+            if (run == null) {
+                throw new IllegalArgumentException("run not found");
+            }
+            return run;
+        });
+        // - observabilityService.forceFlush: void, mock does nothing by default
+        // - observabilityService.attachObservabilityToSnapshot: return simple JSON
+        when(observabilityService.attachObservabilityToSnapshot(anyString(), anyString(), any()))
+                .thenReturn("{\"status\":\"CANCELED\"}");
+        // - eventService.nextInterruptedExpiresAt: return a future timestamp
+        when(eventService.nextInterruptedExpiresAt()).thenReturn(OffsetDateTime.now().plusDays(7));
+        // - eventService.append: void, mock does nothing by default
+        // - stateStore.markRunStatus: void, mock does nothing by default
+        // - creditSettlementService.settleAsync: void, mock does nothing by default
+
+        // Construct LangchainRunControlService with REAL mapper + mocked dependencies
+        controlService = new LangchainRunControlService(
+                readService, mapper, eventService, stateStore,
+                observabilityService, pipeline, creditSettlementService);
+
+        // Real services for reconciler/finalizer
         ToolJobConfig config = new ToolJobConfig();
         redisCache = new ToolJobRedisCache(redisTemplate, om, config);
         ToolJobAnchorService anchorService = new ToolJobAnchorService(mapper);
@@ -178,36 +250,13 @@ class ToolJobReconcilerP005ReverseTest {
         ToolJobResumeService resumeService = new ToolJobResumeService(
                 anchorService, redisCache, config, om);
 
-        // Capacity service stub (required for ToolJobFinalizer construction)
-        DataAnalysisCapacityService capacityService = new DataAnalysisCapacityService() {
-            @Override
-            public DataAnalysisReservation reserve(DataAnalysisOperationIdentity i,
-                                                    DataAnalysisEstimate e) {
-                return null;
-            }
-            @Override
-            public DataAnalysisRestoreOutcome restoreReservation(DataAnalysisReservation r) {
-                return DataAnalysisRestoreOutcome.CONFLICT;
-            }
-            @Override
-            public DataAnalysisReleaseOutcome releaseReservation(DataAnalysisReleaseRequest r) {
-                return DataAnalysisReleaseOutcome.CONFLICT;
-            }
-            @Override
-            public DataAnalysisCapacityRecoveryReport recover(
-                    List<DataAnalysisReservation> dr, int cmu, int cmha) {
-                return null;
-            }
-            @Override
-            public DataAnalysisAdmissionState admissionState() {
-                return DataAnalysisAdmissionState.OPEN;
-            }
-        };
+        // Stateful capacity ledger (tracks release call count and ledger identity)
+        capacityFake = new StatefulCapacityFake();
 
         // Real ToolJobFinalizer wrapped in a spy so we can verify handleTerminal
         // was called (proving the reconciler tried)
         ToolJobFinalizer realFinalizer = new ToolJobFinalizer(
-                anchorService, redisCache, capacityService, resumeService, config);
+                anchorService, redisCache, capacityFake, resumeService, config);
         finalizerSpy = spy(realFinalizer);
 
         // Create the reconciler with the spy finalizer (5-arg constructor)
@@ -231,20 +280,27 @@ class ToolJobReconcilerP005ReverseTest {
 
     @Test
     void shouldFailEnvelopeCasWhenRunIsCanceled() throws Exception {
-        // Step 1: Seed -- insert run with WAITING_TOOL_JOB and a PENDING anchor
+        // Step 1: Seed -- insert run with WAITING_TOOL_JOB, a PENDING anchor,
+        //         and a real DataAnalysisReservation
         Instant originalNextPollAt = Instant.now().minusSeconds(60); // in the past
 
-        String reservationJson = "{\"reservationId\":\"res-p005\","
-                + "\"identity\":{\"operationId\":\"" + RUN_ID + ":tc-1:1\","
-                + "\"runId\":\"" + RUN_ID + "\",\"toolCallId\":\"tc-1\",\"attempt\":1,"
-                + "\"reservationId\":\"res-p005\"},"
-                + "\"resourceClass\":\"CPU\",\"capacityUnits\":1,"
-                + "\"state\":\"PENDING\",\"taskId\":\"task-p005\","
-                + "\"acquiredAt\":\"" + Instant.now().minusSeconds(120) + "\"}";
+        DataAnalysisOperationIdentity identity =
+                new DataAnalysisOperationIdentity(RUN_ID, "tc-1", 1);
+        DataAnalysisReservation reservation = new DataAnalysisReservation(
+                identity.operationId(), identity,
+                DataAnalysisResourceClass.STANDARD, 1,
+                DataAnalysisReservationState.PENDING_TRANSFERRED,
+                "task-p005", Instant.now().minusSeconds(120));
+        String reservationJson = om.writeValueAsString(reservation);
+
+        // Pre-seed the stateful capacity ledger with the real reservation
+        capacityFake.restoreReservation(reservation);
+        assertThat(capacityFake.releaseCallCount).isEqualTo(0);
+        assertThat(capacityFake.distinctReservationIds()).isEqualTo(1);
 
         ToolJobAnchor anchor = new ToolJobAnchor();
         anchor.setAnchorState("PENDING");
-        anchor.setOperationId(RUN_ID + ":tc-1:1");
+        anchor.setOperationId(identity.operationId());
         anchor.setToolCallId("tc-1");
         anchor.setAttempt(1);
         anchor.setTaskId("task-p005");
@@ -253,7 +309,7 @@ class ToolJobReconcilerP005ReverseTest {
         anchor.setNextPollAt(originalNextPollAt);
         anchor.setTimeoutAt(Instant.now().plusSeconds(600));
 
-        insertRun(RUN_ID, AgentRunStatus.WAITING_TOOL_JOB.name(), anchor.toJson());
+        insertRun(RUN_ID, USER_ID, AgentRunStatus.WAITING_TOOL_JOB.name(), anchor.toJson());
 
         // Step 2: Write into Redis due ZSET with nextPollAt in the past
         redisCache.upsertDue(RUN_ID, anchor);
@@ -275,17 +331,27 @@ class ToolJobReconcilerP005ReverseTest {
         assertThat(dbAnchor.getReservationJson()).isNotNull().isNotBlank();
         assertThat(dbAnchor.getFinalizerStep()).isNull();
 
-        // Step 3: Directly update run status to CANCELED via SQL
-        // (simulating cancelRun() without needing all its dependencies)
-        updateRunStatus(RUN_ID, AgentRunStatus.CANCELED.name());
+        // Step 3: Call real LangchainRunControlService.cancelRun()
+        //         This uses the REAL AgentRunMapper to update DB status to CANCELED.
+        CancelAgentRunRequest cancelRequest = CancelAgentRunRequest.newBuilder()
+                .setId(RUN_ID)
+                .setUserId(USER_ID)
+                .build();
+        controlService.cancelRun(cancelRequest);
 
-        // Step 4: Verify status is CANCELED via JDBC (bypass MyBatis session cache)
-        assertThat(queryRunStatus(RUN_ID)).isEqualTo(AgentRunStatus.CANCELED);
-        // Reload anchor from fresh JDBC read
+        // Step 4: Verify DB state after cancelRun -- status is truly CANCELED
+        //         (using fresh mapper load, not cached)
+        run = mapper.findById(RUN_ID);
+        assertThat(run).isNotNull();
+        assertThat(run.getStatus()).isEqualTo(AgentRunStatus.CANCELED);
+
+        // Reload anchor from DB: anchor itself is still PENDING (cancelRun does not
+        // touch the tool_job_anchor_json column)
+        dbAnchor = ToolJobAnchor.fromJson(run.getToolJobAnchorJson());
         assertThat(dbAnchor.getAnchorState()).isEqualTo("PENDING");
         assertThat(dbAnchor.isAutoResume()).isTrue();
         assertThat(dbAnchor.getReservationJson()).isNotNull().isNotBlank();
-        assertThat(dbAnchor.getReservationJson()).contains("res-p005");
+        assertThat(dbAnchor.getReservationJson()).contains("task-p005");
         assertThat(dbAnchor.getFinalizerStep()).isNull();
 
         // Step 5: Call reconcileFromDue -- this triggers processItem which:
@@ -319,17 +385,23 @@ class ToolJobReconcilerP005ReverseTest {
 
         // Oracle 5: capacity NOT released (reservationJson preserved)
         assertThat(dbAnchor.getReservationJson()).isNotNull().isNotBlank();
-        assertThat(dbAnchor.getReservationJson()).contains("res-p005");
+        assertThat(dbAnchor.getReservationJson()).contains("task-p005");
 
-        // Oracle 6: anchor still PENDING (no state advancement past ENVELOPE)
+        // Oracle 6: releaseCallCount == 0 (releaseReservation never called)
+        assertThat(capacityFake.releaseCallCount).isEqualTo(0);
+
+        // Oracle 7: ledger identity still active (distinctReservationIds == 1)
+        assertThat(capacityFake.distinctReservationIds()).isEqualTo(1);
+
+        // Oracle 8: anchor still PENDING (no state advancement past ENVELOPE)
         assertThat(dbAnchor.getAnchorState()).isEqualTo("PENDING");
 
-        // Oracle 7: terminal result fields remain null
+        // Oracle 9: terminal result fields remain null
         assertThat(dbAnchor.getTerminalResultPreview()).isNull();
         assertThat(dbAnchor.getTerminalRawRef()).isNull();
         assertThat(dbAnchor.getTerminalErrorCode()).isNull();
 
-        // Oracle 8: resultFetchState still null (no result fetch state recorded)
+        // Oracle 10: resultFetchState still null (no result fetch state recorded)
         assertThat(dbAnchor.getResultFetchState()).isNull();
     }
 
@@ -358,7 +430,7 @@ class ToolJobReconcilerP005ReverseTest {
         anchor.setNextPollAt(Instant.now().minusSeconds(60));
         anchor.setTimeoutAt(Instant.now().plusSeconds(600));
 
-        insertRun(runIdB, AgentRunStatus.WAITING_TOOL_JOB.name(), anchor.toJson());
+        insertRun(runIdB, USER_ID, AgentRunStatus.WAITING_TOOL_JOB.name(), anchor.toJson());
 
         // Directly set run status to CANCELED
         updateRunStatus(runIdB, AgentRunStatus.CANCELED.name());
@@ -435,20 +507,25 @@ class ToolJobReconcilerP005ReverseTest {
         return currentSession.getMapper(AgentRunMapper.class);
     }
 
-    private static void insertRun(String id, String status, String anchorJson)
+    private static void insertRun(String id, String userId, String status, String anchorJson)
             throws Exception {
         DataSource ds = dataSource();
         try (Connection conn = ds.getConnection();
              var ps = conn.prepareStatement(
-                     "INSERT INTO alphafrog_agent_run (id, status, tool_job_anchor_json) "
-                             + "VALUES (?, ?, CAST(? AS jsonb))")) {
+                     "INSERT INTO alphafrog_agent_run (id, user_id, status, tool_job_anchor_json) "
+                             + "VALUES (?, ?, ?, CAST(? AS jsonb))")) {
             ps.setString(1, id);
-            ps.setString(2, status);
-            ps.setString(3, anchorJson);
+            ps.setString(2, userId);
+            ps.setString(3, status);
+            ps.setString(4, anchorJson);
             ps.executeUpdate();
         }
     }
 
+    /**
+     * Direct SQL status update used only by Path B (narrow direct-finalizer test).
+     * Path A uses real {@link LangchainRunControlService#cancelRun} instead.
+     */
     private static void updateRunStatus(String id, String status) throws Exception {
         DataSource ds = dataSource();
         try (Connection conn = ds.getConnection();
@@ -458,21 +535,6 @@ class ToolJobReconcilerP005ReverseTest {
             ps.setString(2, id);
             ps.executeUpdate();
         }
-    }
-
-    private static AgentRunStatus queryRunStatus(String id) throws Exception {
-        DataSource ds = dataSource();
-        try (Connection conn = ds.getConnection();
-             var ps = conn.prepareStatement(
-                     "SELECT status FROM alphafrog_agent_run WHERE id = ?")) {
-            ps.setString(1, id);
-            try (var rs = ps.executeQuery()) {
-                if (rs.next()) {
-                    return AgentRunStatus.valueOf(rs.getString("status"));
-                }
-            }
-        }
-        return null;
     }
 
     /**
@@ -556,6 +618,63 @@ class ToolJobReconcilerP005ReverseTest {
         public CompletableFuture<GetTaskByOperationIdResponse> getTaskByOperationIdAsync(
                 GetTaskByOperationIdRequest request) {
             throw new UnsupportedOperationException("Not implemented in stub");
+        }
+    }
+
+    /**
+     * Stateful capacity ledger that tracks actual reserved-to-released transitions.
+     * <p>
+     * Unlike a Mockito mock, this proves the ledger state changes at most once
+     * even when {@code releaseReservation} is called multiple times during
+     * crash/re-entry. In this test, releaseReservation is never called at all
+     * (the finalizer ENVELOPE CAS fails because run is CANCELED), so
+     * {@code releaseCallCount} stays 0 and the pre-seeded reservation stays in
+     * the ledger with its original state.
+     */
+    static class StatefulCapacityFake implements DataAnalysisCapacityService {
+        private final Map<String, DataAnalysisReservationState> ledger = new LinkedHashMap<>();
+        int releaseCallCount;
+        int transitionCount;
+
+        int distinctReservationIds() {
+            return ledger.size();
+        }
+
+        @Override
+        public DataAnalysisRestoreOutcome restoreReservation(DataAnalysisReservation reservation) {
+            String id = reservation.reservationId();
+            if (ledger.containsKey(id)) {
+                return DataAnalysisRestoreOutcome.CONFLICT;
+            }
+            ledger.put(id, reservation.state());
+            return DataAnalysisRestoreOutcome.ADDED;
+        }
+
+        @Override
+        public DataAnalysisReleaseOutcome releaseReservation(DataAnalysisReleaseRequest request) {
+            releaseCallCount++;
+            String id = request.reservation().reservationId();
+            DataAnalysisReservationState current = ledger.getOrDefault(id, request.reservation().state());
+            if (current == DataAnalysisReservationState.RELEASED) {
+                return DataAnalysisReleaseOutcome.ALREADY_RELEASED;
+            }
+            ledger.put(id, DataAnalysisReservationState.RELEASED);
+            transitionCount++;
+            return DataAnalysisReleaseOutcome.RELEASED;
+        }
+
+        // ---- unused in this fixture ----
+        @Override public DataAnalysisReservation reserve(DataAnalysisOperationIdentity identity,
+                                                          DataAnalysisEstimate estimate) {
+            throw new UnsupportedOperationException();
+        }
+        @Override public DataAnalysisCapacityRecoveryReport recover(
+                List<DataAnalysisReservation> durableReservations, int configuredMaxUnits,
+                int configuredMaxHeavyActive) {
+            throw new UnsupportedOperationException();
+        }
+        @Override public DataAnalysisAdmissionState admissionState() {
+            throw new UnsupportedOperationException();
         }
     }
 }
