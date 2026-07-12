@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import sys
 import tempfile
 import types
@@ -18,11 +19,9 @@ sys.modules.setdefault("llm_sandbox.exceptions", llm_sandbox_exceptions)
 from fastapi import HTTPException  # noqa: E402
 
 from app import main  # noqa: E402
+from app.canonical_fingerprint import CanonicalSandboxCreateSpec  # noqa: E402
 from app.models import ExecuteRequest  # noqa: E402
 from app.task_store import DurableTaskStore  # noqa: E402
-
-
-FINGERPRINT = "sha256:" + "a" * 64
 
 
 class MainIdempotencyTest(unittest.IsolatedAsyncioTestCase):
@@ -44,15 +43,34 @@ class MainIdempotencyTest(unittest.IsolatedAsyncioTestCase):
         self.temp_dir.cleanup()
 
     def request(self, code: str = "print(1)") -> ExecuteRequest:
+        code_hash = "sha256:" + hashlib.sha256(code.encode("utf-8")).hexdigest()
+        spec = CanonicalSandboxCreateSpec(
+            schema_version="sandbox_create_v1",
+            operation_id="run-1:call-1:1",
+            code_hash=code_hash,
+            immutable_dataset_snapshot_digest="sha256:" + "c" * 64,
+            resource_class="STANDARD",
+            memory_limit_bytes=512 * 1024 * 1024,
+            timeout_millis=60_000,
+            runtime_environment_version="python-runtime-v1",
+            libraries_digest="sha256:" + "d" * 64,
+            sandbox_options_digest="sha256:" + "e" * 64,
+        )
         return ExecuteRequest(
             dataset_id="dataset-1",
             code=code,
             operation_id="run-1:call-1:1",
-            request_fingerprint=FINGERPRINT,
+            request_fingerprint=spec.request_fingerprint(),
             resource_class="STANDARD",
             capacity_units=1,
             memory_limit_bytes=512 * 1024 * 1024,
             timeout_millis=60_000,
+            runtime_environment_version="python-runtime-v1",
+            canonical_spec_schema_version="sandbox_create_v1",
+            code_hash=code_hash,
+            immutable_dataset_snapshot_digest="sha256:" + "c" * 64,
+            libraries_digest="sha256:" + "d" * 64,
+            sandbox_options_digest="sha256:" + "e" * 64,
         )
 
     async def test_duplicate_create_returns_existing_without_duplicate_queue_entry(self) -> None:
@@ -68,10 +86,13 @@ class MainIdempotencyTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(lookup.task_id, first.task_id)
 
     async def test_same_fingerprint_with_changed_payload_returns_conflict(self) -> None:
-        await main.create_task(self.request())
+        original = self.request()
+        await main.create_task(original)
+        changed = self.request(code="print(2)")
+        changed.request_fingerprint = original.request_fingerprint
 
         with self.assertRaises(HTTPException) as raised:
-            await main.create_task(self.request(code="print(2)"))
+            await main.create_task(changed)
 
         self.assertEqual(raised.exception.status_code, 409)
         self.assertEqual(self.queue.qsize(), 1)

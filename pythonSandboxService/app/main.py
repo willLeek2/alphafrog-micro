@@ -9,6 +9,11 @@ from typing import Dict
 
 from fastapi import FastAPI, HTTPException
 
+from .canonical_fingerprint import (
+    CanonicalFingerprintMismatch,
+    CanonicalSpecError,
+    verify_request_fingerprint,
+)
 from .config import load_config
 from .models import (
     CreateTaskResponse,
@@ -330,6 +335,12 @@ async def create_task(request: ExecuteRequest):
         if request.timeout_seconds is not None and abs(request.timeout_seconds - timeout_seconds) > 0.001:
             raise HTTPException(status_code=400, detail="timeout_seconds conflicts with timeout_millis")
         request.timeout_seconds = timeout_seconds
+    try:
+        verify_request_fingerprint(request)
+    except CanonicalFingerprintMismatch as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except CanonicalSpecError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
     task_id = str(uuid.uuid4())
     task = Task(task_id=task_id, status=TaskStatus.QUEUED, request=request)
     try:

@@ -54,11 +54,28 @@ class ExecuteRequest(BaseModel):
     memory_limit_bytes: Optional[int] = Field(default=None, gt=0)
     timeout_millis: Optional[int] = Field(default=None, gt=0)
     runtime_environment_version: Optional[str] = None
+    canonical_spec_schema_version: Optional[str] = None
+    code_hash: Optional[str] = None
+    immutable_dataset_snapshot_digest: Optional[str] = None
+    libraries_digest: Optional[str] = None
+    sandbox_options_digest: Optional[str] = None
 
     @model_validator(mode="after")
     def validate_idempotency_identity(self) -> "ExecuteRequest":
         if bool(self.operation_id) != bool(self.request_fingerprint):
             raise ValueError("operation_id and request_fingerprint must be provided together")
+        if self.operation_id:
+            required = {
+                "canonical_spec_schema_version": self.canonical_spec_schema_version,
+                "code_hash": self.code_hash,
+                "immutable_dataset_snapshot_digest": self.immutable_dataset_snapshot_digest,
+                "runtime_environment_version": self.runtime_environment_version,
+                "libraries_digest": self.libraries_digest,
+                "sandbox_options_digest": self.sandbox_options_digest,
+            }
+            missing = [name for name, value in required.items() if not value or not value.strip()]
+            if missing:
+                raise ValueError("canonical create spec fields are required: " + ", ".join(missing))
         return self
 
 
