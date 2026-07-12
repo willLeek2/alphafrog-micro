@@ -107,6 +107,7 @@ class ExecuteResult(BaseModel):
     dataset_dir: str
     artifacts: Optional[dict] = None
     resource_usage: Optional[SandboxResourceUsage] = None
+    retryable: Optional[bool] = None
 
 
 class Task(BaseModel):
@@ -121,6 +122,7 @@ class Task(BaseModel):
     request_fingerprint: Optional[str] = None
     payload_digest: Optional[str] = None
     resource_usage: Optional[SandboxResourceUsage] = None
+    retryable: Optional[bool] = None
 
 
 class CreateTaskResponse(BaseModel):

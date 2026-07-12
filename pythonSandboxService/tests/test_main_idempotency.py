@@ -20,7 +20,7 @@ from fastapi import HTTPException  # noqa: E402
 
 from app import main  # noqa: E402
 from app.canonical_fingerprint import CanonicalSandboxCreateSpec  # noqa: E402
-from app.models import ExecuteRequest  # noqa: E402
+from app.models import ExecuteRequest, Task, TaskStatus  # noqa: E402
 from app.task_store import DurableTaskStore  # noqa: E402
 
 
@@ -107,6 +107,59 @@ class MainIdempotencyTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(raised.exception.status_code, 400)
         self.assertEqual(len(self.store.tasks), 0)
+
+    async def test_process_task_persists_non_retryable_terminal_result(self) -> None:
+        task = Task(
+            task_id="task-terminal",
+            status=TaskStatus.QUEUED,
+            request=ExecuteRequest(dataset_id="dataset-1", code="raise SystemExit(2)"),
+        )
+        runner_result = {
+            "exit_code": 2,
+            "stdout": "",
+            "stderr": "failed",
+            "dataset_dir": "/sandbox/input/dataset-1",
+            "resource_usage": {
+                "resource_class": "STANDARD",
+                "cpu_millis": 0,
+                "memory_peak_bytes": 0,
+                "logical_bytes_scanned": 0,
+                "queue_wait_millis": 0,
+                "prepare_millis": 0,
+                "execution_wall_millis": 0,
+                "cleanup_millis": 0,
+                "dataset_open_count": 0,
+                "exit_reason": "NON_ZERO_EXIT",
+                "attribution_complete": True,
+                "missing_fields": [],
+            },
+        }
+
+        with patch.object(main, "pool", None), patch.object(
+            main, "run_in_sandbox", return_value=runner_result
+        ):
+            await main.process_task(task, 1)
+
+        self.assertEqual(task.status, TaskStatus.FAILED)
+        self.assertIs(task.retryable, False)
+        self.assertIs(task.result.retryable, False)
+        self.assertIs(self.store.get(task.task_id).retryable, False)
+
+    async def test_unclassified_runner_exception_becomes_explicit_execution_error(self) -> None:
+        task = Task(
+            task_id="task-exception",
+            status=TaskStatus.QUEUED,
+            request=ExecuteRequest(dataset_id="dataset-1", code="print(1)"),
+        )
+
+        with patch.object(main, "pool", None), patch.object(
+            main, "run_in_sandbox", side_effect=RuntimeError("runner failed before usage")
+        ):
+            await main.process_task(task, 1)
+
+        self.assertEqual(task.resource_usage.exit_reason, "EXECUTION_ERROR")
+        self.assertIs(task.retryable, False)
+        self.assertIs(task.result.retryable, False)
 
 
 if __name__ == "__main__":

@@ -26,6 +26,7 @@ from .models import (
 )
 from .nacos_config import DynamicSandboxConfig, start_nacos_listener
 from .pool_scheduler import ContainerPoolScheduler
+from .retry_classification import classify_terminal_retryable
 from .sandbox_runner import run_in_sandbox
 from .task_store import DurableTaskStore, OperationConflictError
 
@@ -133,12 +134,18 @@ async def process_task(task: Task, worker_id: int):
                 "datasetOpenCount",
             ],
         )
+        task.retryable = classify_terminal_retryable(
+            status=task.status,
+            exit_code=-1,
+            resource_usage=task.resource_usage,
+        )
         task.result = ExecuteResult(
             exit_code=-1,
             stdout="",
             stderr=task.error,
             dataset_dir=f"{config.workdir}/input/{task.request.dataset_id}",
             resource_usage=task.resource_usage,
+            retryable=task.retryable,
         )
         task_store.save(task)
         return
@@ -188,6 +195,12 @@ async def process_task(task: Task, worker_id: int):
         usage_payload = result_dict.get("resource_usage")
         if usage_payload:
             task.resource_usage = SandboxResourceUsage.model_validate(usage_payload)
+        task.status = TaskStatus.SUCCEEDED if result_dict["exit_code"] == 0 else TaskStatus.FAILED
+        task.retryable = classify_terminal_retryable(
+            status=task.status,
+            exit_code=result_dict["exit_code"],
+            resource_usage=task.resource_usage,
+        )
         task.result = ExecuteResult(
             exit_code=result_dict["exit_code"],
             stdout=result_dict["stdout"],
@@ -200,8 +213,8 @@ async def process_task(task: Task, worker_id: int):
                 "recycle_reason": result_dict.get("recycle_reason"),
             },
             resource_usage=task.resource_usage,
+            retryable=task.retryable,
         )
-        task.status = TaskStatus.SUCCEEDED if result_dict["exit_code"] == 0 else TaskStatus.FAILED
         if task.status == TaskStatus.FAILED:
             task.error = f"sandbox exited with code {result_dict['exit_code']}"
     except Exception as e:
@@ -211,6 +224,27 @@ async def process_task(task: Task, worker_id: int):
         usage_payload = getattr(e, "resource_usage", None)
         if usage_payload:
             task.resource_usage = SandboxResourceUsage.model_validate(usage_payload)
+        else:
+            task.resource_usage = SandboxResourceUsage(
+                resource_class=task.request.resource_class,
+                queue_wait_millis=queued_ms,
+                exit_reason="EXECUTION_ERROR",
+                attribution_complete=False,
+                missing_fields=[
+                    "cpuMillis",
+                    "memoryPeakBytes",
+                    "logicalBytesScanned",
+                    "prepareMillis",
+                    "executionWallMillis",
+                    "cleanupMillis",
+                    "datasetOpenCount",
+                ],
+            )
+        task.retryable = classify_terminal_retryable(
+            status=task.status,
+            exit_code=-1,
+            resource_usage=task.resource_usage,
+        )
         task.result = ExecuteResult(
             exit_code=-1,
             stdout="",
@@ -218,6 +252,7 @@ async def process_task(task: Task, worker_id: int):
             dataset_dir=f"{config.workdir}/input/{task.request.dataset_id}",
             artifacts={"timings": getattr(e, "timings", {})},
             resource_usage=task.resource_usage,
+            retryable=task.retryable,
         )
     finally:
         task.finished_at = datetime.utcnow()
