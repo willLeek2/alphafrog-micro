@@ -144,7 +144,7 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
         try {
             // Check status first to ensure we don't hit 409
             TaskStatusResponse status = getTaskStatus(GetTaskStatusRequest.newBuilder().setTaskId(request.getTaskId()).build());
-            if ("SUCCEEDED".equals(status.getStatus())) {
+            if (isResultBearingTerminal(status.getStatus())) {
                 String endpoint = sandboxUrl + "/tasks/" + request.getTaskId() + "/result";
                 long httpStart = System.currentTimeMillis();
                 ResponseEntity<HttpExecuteResult> response = restTemplate.getForEntity(endpoint, HttpExecuteResult.class);
@@ -157,31 +157,33 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
                     int stdoutLen = res.getStdout() == null ? 0 : res.getStdout().length();
                     int stderrLen = res.getStderr() == null ? 0 : res.getStderr().length();
                     Map<String, Object> timingFields = extractTimingFields(res);
-                    log.info("sandbox.getTaskResult.succeeded: taskId={}, exitCode={}, stdoutLen={}, stderrLen={}, "
+                    log.info("sandbox.getTaskResult.terminal: taskId={}, status={}, exitCode={}, stdoutLen={}, stderrLen={}, "
                                     + "envLoadMs={}, codeExecMs={}, artifactCollectMs={}, totalDurationMs={}",
-                            request.getTaskId(), res.getExit_code(), stdoutLen, stderrLen,
+                            request.getTaskId(), status.getStatus(), res.getExit_code(), stdoutLen, stderrLen,
                             timingFields.getOrDefault("env_load_ms", "-"),
                             timingFields.getOrDefault("code_exec_ms", "-"),
                             timingFields.getOrDefault("artifact_collect_ms", "-"),
                             System.currentTimeMillis() - startMs);
                     emitSandboxResultTiming(request.getTaskId(), res, System.currentTimeMillis() - httpStart);
-                    return TaskResultResponse.newBuilder()
+                    TaskResultResponse.Builder builder = TaskResultResponse.newBuilder()
                             .setTaskId(request.getTaskId())
-                            .setStatus("SUCCEEDED")
+                            .setStatus(status.getStatus())
                             .setExitCode(res.getExit_code())
                             .setStdout(res.getStdout() != null ? res.getStdout() : "")
                             .setStderr(res.getStderr() != null ? res.getStderr() : "")
-                            .setDatasetDir(res.getDataset_dir() != null ? res.getDataset_dir() : "")
-                            .build();
+                            .setDatasetDir(res.getDataset_dir() != null ? res.getDataset_dir() : "");
+                    if (status.getError() != null && !status.getError().isBlank()) {
+                        builder.setError(status.getError());
+                    }
+                    if (res.getRetryable() != null) {
+                        builder.setRetryable(res.getRetryable());
+                    }
+                    SandboxResourceUsage usage = toProtoUsage(res.getResource_usage());
+                    if (usage != null) {
+                        builder.setResourceUsage(usage);
+                    }
+                    return builder.build();
                 }
-            } else if ("FAILED".equals(status.getStatus())) {
-                log.info("sandbox.getTaskResult.failedStatus: taskId={}, totalDurationMs={}",
-                        request.getTaskId(), System.currentTimeMillis() - startMs);
-                return TaskResultResponse.newBuilder()
-                        .setTaskId(request.getTaskId())
-                        .setStatus("FAILED")
-                        .setError(status.getError())
-                        .build();
             }
 
             log.info("sandbox.getTaskResult.notReady: taskId={}, status={}, totalDurationMs={}",
@@ -199,6 +201,40 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
                     System.currentTimeMillis() - startMs, "ERROR", "GET_RESULT_FAILED");
             return TaskResultResponse.newBuilder().setError(e.getMessage()).build();
         }
+    }
+
+    private static boolean isResultBearingTerminal(String status) {
+        return "SUCCEEDED".equals(status) || "FAILED".equals(status) || "CANCELED".equals(status);
+    }
+
+    static SandboxResourceUsage toProtoUsage(HttpSandboxResourceUsage usage) {
+        if (usage == null) {
+            return null;
+        }
+        SandboxResourceUsage.Builder builder = SandboxResourceUsage.newBuilder();
+        if (usage.getResource_class() != null) builder.setResourceClass(usage.getResource_class());
+        if (usage.getCpu_millis() != null) builder.setCpuMillis(usage.getCpu_millis());
+        if (usage.getMemory_peak_bytes() != null) builder.setMemoryPeakBytes(usage.getMemory_peak_bytes());
+        if (usage.getMemory_byte_millis() != null) builder.setMemoryByteMillis(usage.getMemory_byte_millis());
+        if (usage.getLogical_bytes_scanned() != null) builder.setLogicalBytesScanned(usage.getLogical_bytes_scanned());
+        if (usage.getArtifact_bytes_written() != null) builder.setArtifactBytesWritten(usage.getArtifact_bytes_written());
+        if (usage.getTemporary_bytes_written() != null) builder.setTemporaryBytesWritten(usage.getTemporary_bytes_written());
+        if (usage.getQueue_wait_millis() != null) builder.setQueueWaitMillis(usage.getQueue_wait_millis());
+        if (usage.getPrepare_millis() != null) builder.setPrepareMillis(usage.getPrepare_millis());
+        if (usage.getExecution_wall_millis() != null) builder.setExecutionWallMillis(usage.getExecution_wall_millis());
+        if (usage.getCleanup_millis() != null) builder.setCleanupMillis(usage.getCleanup_millis());
+        if (usage.getDataset_open_count() != null) builder.setDatasetOpenCount(usage.getDataset_open_count());
+        if (usage.getExit_reason() != null) builder.setExitReason(usage.getExit_reason());
+        builder.setOomKilled(Boolean.TRUE.equals(usage.getOom_killed()));
+        builder.setTimedOut(Boolean.TRUE.equals(usage.getTimed_out()));
+        builder.setAttributionComplete(Boolean.TRUE.equals(usage.getAttribution_complete()));
+        if (usage.getSampling_interval_millis() != null) {
+            builder.setSamplingIntervalMillis(usage.getSampling_interval_millis());
+        }
+        if (usage.getMissing_fields() != null) {
+            builder.addAllMissingFields(usage.getMissing_fields());
+        }
+        return builder.build();
     }
 
     private void emitSandboxResultTiming(String taskId, HttpExecuteResult result, long durationMs) {
@@ -355,5 +391,29 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
         private String stderr;
         private String dataset_dir;
         private Map<String, Object> artifacts;
+        private HttpSandboxResourceUsage resource_usage;
+        private Boolean retryable;
+    }
+
+    @Data
+    static class HttpSandboxResourceUsage {
+        private String resource_class;
+        private Long cpu_millis;
+        private Long memory_peak_bytes;
+        private Long memory_byte_millis;
+        private Long logical_bytes_scanned;
+        private Long artifact_bytes_written;
+        private Long temporary_bytes_written;
+        private Long queue_wait_millis;
+        private Long prepare_millis;
+        private Long execution_wall_millis;
+        private Long cleanup_millis;
+        private Integer dataset_open_count;
+        private String exit_reason;
+        private Boolean oom_killed;
+        private Boolean timed_out;
+        private Boolean attribution_complete;
+        private Long sampling_interval_millis;
+        private List<String> missing_fields;
     }
 }
