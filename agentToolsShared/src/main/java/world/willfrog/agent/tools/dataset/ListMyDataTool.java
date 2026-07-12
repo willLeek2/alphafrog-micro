@@ -78,6 +78,7 @@ public class ListMyDataTool {
     private static final int GREP_SNIPPET_PREVIEW_MAX = 200;
 
     private final ObjectMapper objectMapper;
+    private final DatasetEntryMetadataReader metadataReader;
 
     /**
      * 260623-harness-optimization-02: 复用 {@link AgentRunDatasetRegistry} 拿 run-scope snapshot。
@@ -87,7 +88,12 @@ public class ListMyDataTool {
     private AgentRunDatasetRegistry agentRunDatasetRegistry;
 
     public ListMyDataTool(ObjectMapper objectMapper) {
+        this(objectMapper, new DatasetEntryMetadataReader(objectMapper));
+    }
+
+    ListMyDataTool(ObjectMapper objectMapper, DatasetEntryMetadataReader metadataReader) {
         this.objectMapper = objectMapper;
+        this.metadataReader = metadataReader;
     }
 
     /**
@@ -351,7 +357,6 @@ public class ListMyDataTool {
             }
             Map<String, Object> view = new LinkedHashMap<>();
             view.put("dataset_number", entry.number());
-            view.put("dataset_id", entry.originalId());
             view.put("from_ts_code", entry.fromTsCode());
             view.put("match_count", r.matchCount);
             view.put("snippet_preview", r.snippetPreview);
@@ -475,16 +480,23 @@ public class ListMyDataTool {
         return true;
     }
 
-    private static Map<String, Object> toEntryView(AgentRunDatasetEntry entry) {
+    private Map<String, Object> toEntryView(AgentRunDatasetEntry entry) {
+        DatasetEntryMetadataReader.EntryMetadata metadata = metadataReader.read(entry);
         Map<String, Object> view = new LinkedHashMap<>();
         view.put("number", entry.number());
-        view.put("originalId", entry.originalId());
-        view.put("persistedPath", entry.persistedPath());
         view.put("fromTsCode", entry.fromTsCode());
-        view.put("sortKey", entry.sortKey());
         view.put("artifactType", entry.artifactType().name());
+        view.put("rowCount", metadata.rowCount());
+        view.put("bytes", metadata.bytes());
+        view.put("columns", metadata.columns());
+        view.put("recommendedUsecols", metadata.recommendedUsecols());
+        view.put("recommendedDtype", metadata.recommendedDtype());
+        view.put("readProfiles", metadata.readProfiles());
+        view.put("metadataStatus", metadata.metadataStatus());
         if (entry.isManifest()) {
-            view.put("relatedDatasetIds", entry.relatedDatasetIds());
+            view.put("relatedDatasetNumbers", entry.relatedDatasetIds().stream()
+                    .map(Integer::valueOf)
+                    .toList());
         }
         return view;
     }

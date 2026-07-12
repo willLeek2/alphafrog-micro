@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import os
+import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterator, List, Mapping
 
 import pandas as pd
 
@@ -61,7 +64,14 @@ def _member_dicts(members) -> List[Dict[str, Any]]:
     return rows
 
 
-def _read_atomic_csv(input_root: Path, dataset_id: str, ts_code: str | None = None) -> pd.DataFrame:
+def _read_atomic_csv(
+    input_root: Path,
+    dataset_id: str,
+    ts_code: str | None = None,
+    *,
+    usecols=None,
+    dtype=None,
+) -> pd.DataFrame:
     dataset_mount = input_root / dataset_id
     csv_candidates = [
         dataset_mount / f"{dataset_id}.csv",
@@ -70,7 +80,7 @@ def _read_atomic_csv(input_root: Path, dataset_id: str, ts_code: str | None = No
     csv_path = next((path for path in csv_candidates if path.is_file()), None)
     if csv_path is None:
         raise FileNotFoundError(f"atomic dataset csv not found under {dataset_mount}")
-    frame = pd.read_csv(csv_path)
+    frame = _read_csv(csv_path, dataset_id, "load_datasets", usecols=usecols, dtype=dtype)
     if ts_code and "ts_code" not in frame.columns:
         frame = frame.copy()
         frame.insert(0, "ts_code", ts_code)
@@ -136,9 +146,17 @@ def _resolve_run_manifest_file_path(
 
 
 def _read_run_dataset_csv(
-    file_path: str, from_ts_code: str | None
+    file_path: str,
+    from_ts_code: str | None,
+    dataset_number: str,
+    loader_method: str,
+    *,
+    usecols=None,
+    dtype=None,
 ) -> pd.DataFrame:
-    frame = pd.read_csv(file_path)
+    frame = _read_csv(
+        Path(file_path), dataset_number, loader_method, usecols=usecols, dtype=dtype
+    )
     if from_ts_code and "ts_code" not in frame.columns:
         frame = frame.copy()
         frame.insert(0, "ts_code", from_ts_code)
@@ -146,7 +164,12 @@ def _read_run_dataset_csv(
 
 
 def _load_run_datasets_by_number(
-    dataset_number: str, paths_csv: Path
+    dataset_number: str,
+    paths_csv: Path,
+    *,
+    usecols=None,
+    dtype=None,
+    loader_method: str = "load_datasets",
 ) -> Dict[str, pd.DataFrame]:
     paths_df = _load_run_level_dataset_index(paths_csv)
     file_path = _resolve_run_dataset_file_path(dataset_number, paths_df)
@@ -158,7 +181,14 @@ def _load_run_datasets_by_number(
     from_ts_code = str(row.get("from_ts_code") or "")
     if not from_ts_code or from_ts_code.upper() == "UNCERTAIN":
         from_ts_code = dataset_number
-    frame = _read_run_dataset_csv(file_path, from_ts_code)
+    frame = _read_run_dataset_csv(
+        file_path,
+        from_ts_code,
+        dataset_number,
+        loader_method,
+        usecols=usecols,
+        dtype=dtype,
+    )
     return {from_ts_code: frame}
 
 
@@ -179,6 +209,9 @@ def _load_run_manifest_by_number(
     manifest_number: str,
     paths_csv: Path,
     manifests_csv: Path,
+    *,
+    usecols=None,
+    dtype=None,
 ) -> DatasetLoadResult:
     manifests_df = _load_run_level_manifest_index(manifests_csv)
     manifest_path = _resolve_run_manifest_file_path(manifest_number, manifests_df)
@@ -216,7 +249,13 @@ def _load_run_manifest_by_number(
                 failed_members.append({**payload, "status": "broken", "errorMessage": "missing datasetId"})
                 continue
             try:
-                by_ts = _load_run_datasets_by_number(member_dataset_id, paths_csv)
+                by_ts = _load_run_datasets_by_number(
+                    member_dataset_id,
+                    paths_csv,
+                    usecols=usecols,
+                    dtype=dtype,
+                    loader_method="load_manifest",
+                )
                 frame = next(iter(by_ts.values()))
                 part = frame.copy()
                 if "ts_code" not in part.columns:
@@ -241,10 +280,80 @@ def _load_run_manifest_by_number(
 # Public API
 # ---------------------------------------------------------------------------
 
+def _read_csv(
+    path: Path,
+    dataset_number: str,
+    loader_method: str,
+    *,
+    usecols=None,
+    dtype=None,
+) -> pd.DataFrame:
+    frame = pd.read_csv(path, usecols=usecols, dtype=dtype)
+    _append_loader_metric(path, dataset_number, loader_method, frame.columns, usecols)
+    return frame
+
+
+def _iter_csv(
+    path: Path,
+    dataset_number: str,
+    loader_method: str,
+    chunksize: int,
+    *,
+    usecols=None,
+    dtype=None,
+) -> Iterator[pd.DataFrame]:
+    if chunksize <= 0:
+        raise ValueError("chunksize must be a positive number of complete rows")
+    opened = False
+    for chunk in pd.read_csv(path, usecols=usecols, dtype=dtype, chunksize=chunksize):
+        if not opened:
+            _append_loader_metric(path, dataset_number, loader_method, chunk.columns, usecols)
+            opened = True
+        yield chunk
+    if not opened:
+        columns = pd.read_csv(path, nrows=0, usecols=usecols, dtype=dtype).columns
+        _append_loader_metric(path, dataset_number, loader_method, columns, usecols)
+
+
+def _append_loader_metric(
+    path: Path,
+    dataset_number: str,
+    loader_method: str,
+    selected_columns,
+    requested_usecols,
+) -> None:
+    metrics_path = os.getenv("AF_TASK_METRICS_PATH", "").strip()
+    if not metrics_path:
+        return
+    try:
+        total_columns = list(pd.read_csv(path, nrows=0).columns)
+        selected = list(selected_columns)
+        payload = {
+            "schema_version": "loader_metric_v1",
+            "datasetNumber": str(dataset_number),
+            "pathHash": "sha256:" + hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest(),
+            "logicalBytes": path.stat().st_size,
+            "openCount": 1,
+            "loaderMethod": loader_method,
+            "selectedColumnCount": len(selected),
+            "totalColumnCount": len(total_columns),
+            "timeMillis": int(time.time() * 1000),
+        }
+        target = Path(metrics_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    except Exception:
+        # Usage attribution must never replace the user's script result.
+        return
+
 def load_datasets(
     dataset_id: str,
     input_root: str = "/sandbox/input",
     data_dir: str | None = None,
+    *,
+    usecols=None,
+    dtype=None,
 ) -> Dict[str, pd.DataFrame]:
     """Load one manifest or atomic dataset as dict[ts_code, DataFrame].
 
@@ -263,7 +372,9 @@ def load_datasets(
         for number in run_level_ids:
             _merge_dataset_maps(
                 result,
-                _load_run_datasets_by_number(number, paths_csv),
+                _load_run_datasets_by_number(
+                    number, paths_csv, usecols=usecols, dtype=dtype
+                ),
                 suffix=number,
             )
         return result
@@ -281,7 +392,9 @@ def load_datasets(
             ts_code = str(member.get("tsCode") or member_id)
             if not member_id:
                 continue
-            result[ts_code] = _read_atomic_csv(root, member_id, ts_code)
+            result[ts_code] = _read_atomic_csv(
+                root, member_id, ts_code, usecols=usecols, dtype=dtype
+            )
         for info in expanded.failed_members + expanded.skipped_members:
             key = info.ts_code or info.dataset_id
             if key and key not in result:
@@ -300,10 +413,12 @@ def load_datasets(
             ts_code = str(member.get("tsCode") or member_id)
             if not member_id:
                 continue
-            result[ts_code] = _read_atomic_csv(root, member_id, ts_code)
+            result[ts_code] = _read_atomic_csv(
+                root, member_id, ts_code, usecols=usecols, dtype=dtype
+            )
         return result
 
-    frame = _read_atomic_csv(root, dataset_id)
+    frame = _read_atomic_csv(root, dataset_id, usecols=usecols, dtype=dtype)
     ts_code = str(frame["ts_code"].iloc[0]) if "ts_code" in frame.columns and not frame.empty else dataset_id
     return {ts_code: frame}
 
@@ -312,6 +427,9 @@ def load_manifest(
     manifest_id: str,
     input_root: str = "/sandbox/input",
     data_dir: str | None = None,
+    *,
+    usecols=None,
+    dtype=None,
 ) -> DatasetLoadResult:
     """Concat ready manifest members into one DataFrame with ts_code column.
 
@@ -327,7 +445,9 @@ def load_manifest(
     if run_level_ids and all(_looks_like_run_level_id(item) for item in run_level_ids) and _is_run_level_mode(root):
         paths_csv, manifests_csv = _run_level_csv_paths(root)
         results = [
-            _load_run_manifest_by_number(number, paths_csv, manifests_csv)
+            _load_run_manifest_by_number(
+                number, paths_csv, manifests_csv, usecols=usecols, dtype=dtype
+            )
             for number in run_level_ids
         ]
         frames = [result.frame for result in results if not result.frame.empty]
@@ -343,7 +463,13 @@ def load_manifest(
             skipped_members=skipped_members,
         )
 
-    by_ts = load_datasets(manifest_id, input_root=input_root, data_dir=data_dir)
+    by_ts = load_datasets(
+        manifest_id,
+        input_root=input_root,
+        data_dir=data_dir,
+        usecols=usecols,
+        dtype=dtype,
+    )
     if not by_ts:
         frame = pd.DataFrame()
     else:
@@ -386,3 +512,111 @@ def load_manifest(
         failed_members=failed_members,
         skipped_members=skipped_members,
     )
+
+
+def iter_datasets(
+    dataset_id: str,
+    chunksize: int,
+    input_root: str = "/sandbox/input",
+    *,
+    usecols=None,
+    dtype=None,
+) -> Iterator[pd.DataFrame]:
+    """Yield complete-row DataFrame chunks without loading the whole run-level dataset."""
+    if chunksize <= 0:
+        raise ValueError("chunksize must be a positive number of complete rows")
+    root = Path(input_root)
+    run_level_ids = _split_run_level_ids(dataset_id)
+    if run_level_ids and all(_looks_like_run_level_id(item) for item in run_level_ids) and _is_run_level_mode(root):
+        paths_csv, _ = _run_level_csv_paths(root)
+        paths_df = _load_run_level_dataset_index(paths_csv)
+        for number in run_level_ids:
+            file_path = _resolve_run_dataset_file_path(number, paths_df)
+            if file_path is None:
+                raise FileNotFoundError(f"run-level dataset #{number} not found in {paths_csv}")
+            row = paths_df[paths_df["agent_run_dataset_id"].astype(str) == number].iloc[0]
+            from_ts_code = str(row.get("from_ts_code") or "")
+            if not from_ts_code or from_ts_code.upper() == "UNCERTAIN":
+                from_ts_code = number
+            for chunk in _iter_csv(
+                Path(file_path), number, "iter_datasets", chunksize, usecols=usecols, dtype=dtype
+            ):
+                if "ts_code" not in chunk.columns:
+                    chunk = chunk.copy()
+                    chunk.insert(0, "ts_code", from_ts_code)
+                yield chunk
+        return
+
+    for frame in load_datasets(
+        dataset_id, input_root=input_root, usecols=usecols, dtype=dtype
+    ).values():
+        for start in range(0, len(frame), chunksize):
+            yield frame.iloc[start:start + chunksize].copy()
+
+
+def iter_manifest_chunks(
+    manifest_id: str,
+    chunksize: int,
+    input_root: str = "/sandbox/input",
+    *,
+    usecols=None,
+    dtype=None,
+) -> Iterator[pd.DataFrame]:
+    """Yield complete-row chunks for each ready member of a run-level manifest."""
+    if chunksize <= 0:
+        raise ValueError("chunksize must be a positive number of complete rows")
+    root = Path(input_root)
+    run_level_ids = _split_run_level_ids(manifest_id)
+    if run_level_ids and all(_looks_like_run_level_id(item) for item in run_level_ids) and _is_run_level_mode(root):
+        _, manifests_csv = _run_level_csv_paths(root)
+        manifests_df = _load_run_level_manifest_index(manifests_csv)
+        for number in run_level_ids:
+            manifest_path = _resolve_run_manifest_file_path(number, manifests_df)
+            if manifest_path is None:
+                raise FileNotFoundError(f"run-level manifest #{number} not found in {manifests_csv}")
+            with Path(manifest_path).open("r", encoding="utf-8") as handle:
+                document = json.load(handle)
+            for member in document.get("members") or []:
+                if isinstance(member, dict) and str(member.get("status") or "").lower() == "ready":
+                    member_number = str(member.get("datasetId") or "")
+                    if member_number:
+                        yield from iter_datasets(
+                            member_number,
+                            chunksize,
+                            input_root=input_root,
+                            usecols=usecols,
+                            dtype=dtype,
+                        )
+        return
+
+    result = load_manifest(
+        manifest_id, input_root=input_root, usecols=usecols, dtype=dtype
+    ).frame
+    for start in range(0, len(result), chunksize):
+        yield result.iloc[start:start + chunksize].copy()
+
+
+def load_read_profile(
+    dataset_id: str,
+    profile: str,
+    input_root: str = "/sandbox/input",
+    *,
+    manifest: bool = False,
+):
+    """Load a run-level dataset/manifest using a named profile from its public metadata file."""
+    root = Path(input_root)
+    sandbox_root = root.parent
+    metadata_path = sandbox_root / ("path_manifest_meta.json" if manifest else "paths_dataset_meta.json")
+    with metadata_path.open("r", encoding="utf-8") as handle:
+        document = json.load(handle)
+    collection = document.get("manifests" if manifest else "datasets") or {}
+    metadata = collection.get(str(dataset_id)) or {}
+    profiles: Mapping[str, List[str]] = metadata.get("readProfiles") or {}
+    usecols = profiles.get(profile)
+    if not usecols:
+        raise KeyError(f"read profile {profile!r} not found for run-level id {dataset_id}")
+    recommended_dtype: Mapping[str, str] = metadata.get("recommendedDtype") or {}
+    dtype = {column: value for column, value in recommended_dtype.items() if column in usecols}
+    if manifest:
+        return load_manifest(dataset_id, input_root=input_root, usecols=usecols, dtype=dtype)
+    return load_datasets(dataset_id, input_root=input_root, usecols=usecols, dtype=dtype)

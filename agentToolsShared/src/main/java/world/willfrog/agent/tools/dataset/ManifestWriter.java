@@ -41,6 +41,9 @@ public class ManifestWriter {
     @Value("${agent.tools.market-data.dataset.manifests-path:/data/manifests}")
     private String manifestsPath;
 
+    @Value("${agent.tools.market-data.dataset.database-fetched-path:/data/database_fetched}")
+    private String databaseFetchedPath;
+
     @Value("${agent.tools.market-data.dataset.enabled:true}")
     private boolean enabled;
 
@@ -94,6 +97,9 @@ public class ManifestWriter {
                 .sorted(Comparator.comparing(DatasetManifest.ManifestMember::getTsCode,
                         Comparator.nullsLast(Comparator.naturalOrder())))
                 .collect(Collectors.toList());
+        for (DatasetManifest.ManifestMember member : sortedMembers) {
+            populateMemberBytes(member, dataType, startDate, endDate, columns);
+        }
 
         String columnsSignature = String.join(",", columns);
         String sortedTsCodesSignature = sortedMembers.stream()
@@ -114,6 +120,8 @@ public class ManifestWriter {
                 .filter(m -> DatasetManifest.ManifestMember.STATUS_BROKEN.equals(m.getStatus()))
                 .count();
         long createdAt = Instant.now().toEpochMilli();
+        long totalBytes = sortedMembers.stream().mapToLong(DatasetManifest.ManifestMember::getBytes).sum();
+        DatasetSchemaHintResolver.SchemaHints hints = DatasetSchemaHintResolver.resolve(columns);
 
         DatasetManifest manifest = DatasetManifest.builder()
                 .manifestId(manifestId)
@@ -126,8 +134,13 @@ public class ManifestWriter {
                 .failedCount(failedCount)
                 .brokenCount(brokenCount)
                 .totalRowCount(totalRowCount)
+                .totalBytes(totalBytes)
                 .columns(new ArrayList<>(columns))
                 .columnsSignature(columnsSignature)
+                .recommendedUsecols(hints.recommendedUsecols())
+                .recommendedDtype(hints.recommendedDtype())
+                .readProfiles(hints.readProfiles())
+                .metadataStatus(totalRowCount >= 0 ? "complete" : "partial")
                 .members(sortedMembers)
                 .createdAt(createdAt)
                 .build();
@@ -164,6 +177,7 @@ public class ManifestWriter {
                 .readyCount(readyCount)
                 .failedCount(failedCount)
                 .totalRowCount(totalRowCount)
+                .totalBytes(totalBytes)
                 .path(manifestDir.toAbsolutePath().toString())
                 .createdAt(createdAt)
                 .build();
@@ -196,6 +210,37 @@ public class ManifestWriter {
                                  String sortedTsCodesSignature, String columnsSignature) {
         return "manifest|" + dataType + "|" + startDate + "|" + endDate
                 + "|" + sortedTsCodesSignature + "|" + columnsSignature;
+    }
+
+    private void populateMemberBytes(DatasetManifest.ManifestMember member,
+                                     String dataType,
+                                     String defaultStartDate,
+                                     String defaultEndDate,
+                                     List<String> defaultColumns) {
+        if (member == null || member.getBytes() > 0
+                || !DatasetManifest.ManifestMember.STATUS_READY.equals(member.getStatus())
+                || member.getTsCode() == null || member.getTsCode().isBlank()) {
+            return;
+        }
+        String start = member.getStartDate() == null || member.getStartDate().isBlank()
+                ? defaultStartDate : member.getStartDate();
+        String end = member.getEndDate() == null || member.getEndDate().isBlank()
+                ? defaultEndDate : member.getEndDate();
+        List<String> memberColumns = member.getColumns() == null || member.getColumns().isEmpty()
+                ? defaultColumns : member.getColumns();
+        String topic = DatabaseFetchedPathStrategy.resolveTopic(dataType);
+        String encoded = DatabaseFetchedPathStrategy.encodedString(
+                dataType, member.getTsCode(), start, end, memberColumns);
+        Path dataFile = DatabaseFetchedPathStrategy.resolveDataPath(
+                        Paths.get(databaseFetchedPath), topic, member.getTsCode(), encoded)
+                .resolve(member.getTsCode().replaceAll("[^a-zA-Z0-9.]", "_") + ".csv");
+        try {
+            if (Files.isRegularFile(dataFile)) {
+                member.setBytes(Files.size(dataFile));
+            }
+        } catch (IOException error) {
+            log.warn("Failed to read manifest member bytes: datasetId={}", member.getDatasetId(), error);
+        }
     }
 
     private String sha256Hex(String raw) {
@@ -238,6 +283,7 @@ public class ManifestWriter {
         private int readyCount;
         private int failedCount;
         private int totalRowCount;
+        private long totalBytes;
         private String path;
         private long createdAt;
     }

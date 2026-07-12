@@ -217,7 +217,7 @@ class AgentRunDatasetRegistryTest {
         String[] lines = manifestCsv.split("\n");
         assertEquals(2, lines.length);
         // MF3: 4 列 (manifest_file_path, related_dataset_ids, source_path) — 末尾 source_path 是 datasetEvent 提供的 path
-        assertTrue(lines[1].startsWith("1,/__AF_INPUT__/m-1/manifest.json,2#1,"),
+        assertTrue(lines[1].startsWith("1,/__AF_INPUT__/_run_manifest_1/manifest.json,2#1,"),
                 "MF3 schema: lines[1] = " + lines[1]);
     }
 

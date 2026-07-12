@@ -6,6 +6,9 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.springframework.test.util.ReflectionTestUtils;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -75,6 +78,12 @@ class DatasetWriterRegistryPathAlignmentTest {
         String content = Files.readString(expectedFile);
         assertTrue(content.contains("trade_date,open,close"), "CSV should contain header");
         assertTrue(content.contains("20240101,10.0,11.0"), "CSV should contain data row");
+        JsonNode metadata = new ObjectMapper().readTree(
+                expectedDir.resolve("000001.SZ.meta.json").toFile());
+        assertEquals(Files.size(expectedFile), metadata.path("bytes").asLong());
+        assertEquals("Int64", metadata.path("recommendedDtype").path("trade_date").asText());
+        assertEquals("float64", metadata.path("recommendedDtype").path("close").asText());
+        assertEquals("complete", metadata.path("metadataStatus").asText());
     }
 
     @Test

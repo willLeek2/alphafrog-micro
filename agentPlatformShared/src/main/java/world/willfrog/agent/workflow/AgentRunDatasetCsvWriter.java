@@ -48,14 +48,16 @@ public final class AgentRunDatasetCsvWriter {
     /**
      * 生成 paths_dataset.csv 内容。
      *
-     * <p>{@code dataset_file_path} = {@code <SANDBOX_INPUT_PLACEHOLDER><originalId>/<sortKey>}
-     * 其中 sortKey 是 01 落盘时的文件名（{@code DatasetPersistedEvent.getSortKey()}）。
+     * <p>{@code dataset_file_path} =
+     * {@code <SANDBOX_INPUT_PLACEHOLDER>_run_dataset_<number>/<sortKey>}.
+     * Internal original ids never enter the task-local public path.
      */
     public static String writePathsDatasetCsv(AgentRunDatasetSnapshot snapshot) {
         List<String> lines = new ArrayList<>();
         lines.add(PATHS_DATASET_HEADER);
         for (AgentRunDatasetEntry entry : snapshot.datasets()) {
-            String sandboxPath = SANDBOX_INPUT_PLACEHOLDER + entry.originalId() + "/" + entry.sortKey();
+            String sandboxPath = SANDBOX_INPUT_PLACEHOLDER + "_run_dataset_" + entry.number()
+                    + "/" + entry.sortKey();
             String sourcePath = entry.persistedPath() == null ? "" : entry.persistedPath();
             lines.add(csvRow(entry.number(), sandboxPath, entry.fromTsCode(), sourcePath));
         }
@@ -72,7 +74,7 @@ public final class AgentRunDatasetCsvWriter {
         for (AgentRunDatasetEntry entry : snapshot.manifests()) {
             String sandboxPath = entry.persistedPath() == null || entry.persistedPath().isBlank()
                     ? MANIFEST_NONE_MARKER
-                    : SANDBOX_INPUT_PLACEHOLDER + entry.originalId() + "/manifest.json";
+                    : SANDBOX_INPUT_PLACEHOLDER + "_run_manifest_" + entry.number() + "/manifest.json";
             String related = String.join("#", entry.relatedDatasetIds());
             // MF3: persistedPath 充当 source_path；NONE marker 行 source_path 也保持空（sandbox 走物化路径）
             String sourcePath = entry.persistedPath() == null ? "" : entry.persistedPath();

@@ -110,13 +110,19 @@ public class DatasetWriter {
 
         // Write Metadata
         try {
+            DatasetSchemaHintResolver.SchemaHints hints = DatasetSchemaHintResolver.resolve(headers);
             DatasetMetadata meta = DatasetMetadata.builder()
                     .datasetId(datasetId)
                     .tsCode(tsCode)
                     .startDate(start)
                     .endDate(end)
                     .rowCount(data.size())
+                    .bytes(Files.size(csvFile.toPath()))
                     .columns(headers)
+                    .recommendedUsecols(hints.recommendedUsecols())
+                    .recommendedDtype(hints.recommendedDtype())
+                    .readProfiles(hints.readProfiles())
+                    .metadataStatus("complete")
                     .format("csv")
                     .build();
             objectMapper.writeValue(metaFile, meta);
@@ -154,7 +160,12 @@ public class DatasetWriter {
         private String startDate;
         private String endDate;
         private int rowCount;
+        private long bytes;
         private List<String> columns;
+        private List<String> recommendedUsecols;
+        private java.util.Map<String, String> recommendedDtype;
+        private java.util.Map<String, List<String>> readProfiles;
+        private String metadataStatus;
         private String format;
     }
 }

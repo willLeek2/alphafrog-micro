@@ -39,9 +39,14 @@ public class DatasetManifest {
     private int brokenCount;
 
     private int totalRowCount;
+    private long totalBytes;
 
     private List<String> columns;
     private String columnsSignature;
+    private List<String> recommendedUsecols;
+    private java.util.Map<String, String> recommendedDtype;
+    private java.util.Map<String, List<String>> readProfiles;
+    private String metadataStatus;
 
     /** members 按 tsCode 升序排列；落盘前由 writer 内部排序。 */
     @Builder.Default
@@ -63,6 +68,7 @@ public class DatasetManifest {
         private String datasetId;
         private String status;
         private int rowCount;
+        private long bytes;
         private String startDate;
         private String endDate;
         private List<String> columns;
