@@ -28,18 +28,24 @@ import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
+/**
+ * LangChain4j 工具：在隔离 Python 沙箱中执行代码，并把当前 agent 运行选中的 dataset / manifest 挂载进沙箱。
+ * 调用方传入的是 {@code listMyData} 返回的 run 级局部编号，本类负责解析编号、生成路径映射 CSV、
+ * 创建沙箱任务并轮询直至成功、失败或超时。
+ */
 @Component
 @Slf4j
 public class PythonSandboxTools {
 
+    /** 轮询沙箱任务状态的间隔（毫秒）。 */
     private static final int POLL_INTERVAL_MS = 1000;
 
     /**
-     * 260623-harness-optimization-02: TOOL_DESCRIPTION 文案现在通过 classpath 文件 {@link #TOOL_DESCRIPTION_PATH} 维护（03 owner）。
-     * Java {@code @Tool} annotation 必须是 compile-time 常量，所以下面用 {@link #TOOL_DESCRIPTION_SHORT} 作为
-     * 注入到 LLM 的简短提示语。文件加载的完整长文案通过 {@link #loadToolDescription()} 暴露给其他调用方
-     * （例如 ToolRouter 在做工具描述拼接时），文件不存在时静默回落 {@link #FALLBACK_TOOL_DESCRIPTION}。
-     * 部署阶段 NPE 风险面由 fallback 兜底。
+     * 工具说明正文维护在 classpath 文件 {@link #TOOL_DESCRIPTION_PATH} 中。
+     * LangChain4j 的 {@code @Tool} 注解要求 description 为编译期常量，因此注解上只能放
+     * {@link #TOOL_DESCRIPTION_SHORT} 这段简短提示；完整长文案由 {@link #loadToolDescription()} 在运行时加载，
+     * 供 ToolRouter 拼接工具说明等场景使用。文件缺失或内容为空时，回落到 {@link #FALLBACK_TOOL_DESCRIPTION}，
+     * 避免部署后因描述为空触发空指针。
      */
     private static final String TOOL_DESCRIPTION_PATH = "prompts/python/execute_python_tool_description.txt";
 
@@ -66,8 +72,8 @@ public class PythonSandboxTools {
             + "Please prioritize using the preinstalled runtime libraries to reduce latency.";
 
     /**
-     * 暴露给 ToolRouter / 同包注入 / 单元测试的完整描述加载入口。
-     * 先尝试 classpath 文件 {@link #TOOL_DESCRIPTION_PATH}，缺失 / 空白时回落到 {@link #FALLBACK_TOOL_DESCRIPTION}。
+     * 加载完整工具说明，供 ToolRouter、同包代码与单元测试调用。
+     * 优先读取 {@link #TOOL_DESCRIPTION_PATH}；读不到或内容为空白时，使用 {@link #FALLBACK_TOOL_DESCRIPTION}。
      */
     public static String loadToolDescription() {
         String loaded = PromptFileLoader.load(TOOL_DESCRIPTION_PATH);
@@ -84,8 +90,8 @@ public class PythonSandboxTools {
     private final ObjectMapper objectMapper;
 
     /**
-     * 260623-harness-optimization-02: 订阅 DatasetPersistedEvent 并提供 run 级别编号转译。
-     * 可选注入（{@code required=false}），便于纯单元测试启动。
+     * 订阅数据集持久化事件，并在单次 agent 运行内维护「局部编号 → 条目」映射。
+     * 标记为可选注入（{@code required=false}），便于单元测试在不启动完整 Spring 上下文时运行。
      */
     @Autowired(required = false)
     private AgentRunDatasetRegistry agentRunDatasetRegistry;
@@ -97,49 +103,74 @@ public class PythonSandboxTools {
         this.objectMapper = objectMapper;
     }
 
+    /**
+     * LangChain4j 暴露给 LLM 的五参数入口；参数名与工具描述中的字段一一对应。
+     */
     @Tool(TOOL_DESCRIPTION_SHORT)
     public String executePython(String code, String dataset_ids, String manifest_ids, String libraries, Integer timeout_seconds) {
         return executePythonInternal(code, dataset_ids, manifest_ids, libraries, timeout_seconds);
     }
 
     /**
-     * 4-arg backward-compat shim：把 dataset_ids + libraries 走 5-arg 入口（manifest_ids=null）。
-     * 注意：5-arg 模式下 dataset_ids 走"dataset 空间"，不再"先 dataset 后 manifest"双重解析。
-     * 业务路径走 5-arg（LLM-facing @Tool），4-arg 仅供其他 Java 模块或历史测试调用。
+     * 四参数重载，供历史 Java 调用方与旧测试使用；内部转调五参数入口，{@code manifest_ids} 传 {@code null}。
+     * 五参数入口才是面向 LLM 的 {@code @Tool} 路径：{@code dataset_ids} 与 {@code manifest_ids}
+     * 分别在各自编号空间中解析，不会再按旧逻辑串行混查。
      */
     public String executePython(String code, String dataset_ids, String libraries, Integer timeout_seconds) {
         return executePythonInternal(code, dataset_ids, null, libraries, timeout_seconds);
     }
 
+    /**
+     * {@code executePython} 的实际执行体，整体分为六个阶段：
+     * <ol>
+     *   <li>解析并校验 {@code dataset_ids} / {@code manifest_ids} 入参</li>
+     *   <li>借助 {@link AgentRunDatasetRegistry} 把 run 级局部编号解析为持久化条目</li>
+     *   <li>根据已选 manifest 补全其成员 dataset（避免 paths CSV 只有表头）</li>
+     *   <li>生成路径映射 CSV，并汇总待挂载的 {@code originalId} 列表</li>
+     *   <li>组装 {@link ExecuteRequest}，经 Dubbo 创建沙箱任务</li>
+     *   <li>轮询任务状态，直至成功、失败、取消、不存在或超时</li>
+     * </ol>
+     * 返回值始终是 JSON 字符串：{@code ok=true} 时 {@code data} 含 stdout/stderr 等字段；
+     * {@code ok=false} 时 {@code error.code} 标识失败类型，{@code error.details} 附带结构化上下文。
+     */
     private String executePythonInternal(String code, String dataset_ids, String manifest_ids, String libraries, Integer timeout_seconds) {
         long toolStartMs = System.currentTimeMillis();
         try {
             long prepareStartMs = System.currentTimeMillis();
+
+            // --- 第一阶段：解析入参中的编号字符串 ---
+            // LLM 可能传入逗号分隔数字，也可能传入 JSON 数组形态（如 "[1, 3]"），统一经 parseDatasetIds 规范化。
             String[] parsedDatasetNumbers = parseDatasetIds(dataset_ids);
             String[] parsedManifestNumbers = parseDatasetIds(manifest_ids);
+            // 两个参数至少填一个；都为空则无法确定要挂载哪些数据，直接返回 MISSING_IDS。
             if (parsedDatasetNumbers.length == 0 && parsedManifestNumbers.length == 0) {
                 return fail("executePython", "MISSING_IDS",
                         "dataset_ids and manifest_ids are both empty; at least one is required",
                         Map.of());
             }
 
-            // 260623-harness-optimization-02: dataset_ids / manifest_ids 都是 agent run 级别编号。
-            // 走 registry 解析为 01 持久化条目（originalId / sortKey / fromTsCode）。
-            // Q4 拍板：dataset 和 manifest 各自独立编号空间，独立解析。
-            // Q12: 非法编号报错并列出合法编号列表。
+            // --- 第二阶段：读取当前 agent 运行的 registry 快照 ---
+            // dataset_ids 与 manifest_ids 均为当前 agent 运行内的局部编号（由 listMyData 分配），
+            // 不是持久化层的 originalId，也不是磁盘路径。registry 负责把编号映射为
+            // AgentRunDatasetEntry（含 originalId、sortKey、fromTsCode 等字段）。
+            // dataset 与 manifest 使用两套独立编号空间，各自单独解析。
             String runId = AgentContext.getRunId();
             AgentRunDatasetRegistry registry = this.agentRunDatasetRegistry;
+            // 编号解析依赖「正在进行的 run」以及已注入的 registry；单元测试或未在 run 内调用时会失败。
             if (runId == null || runId.isBlank() || registry == null) {
                 return fail("executePython", "RUN_LEVEL_IDS_UNAVAILABLE",
                         "Agent run-level dataset ids require an active run and AgentRunDatasetRegistry",
                         Map.of("runId", nvl(runId)));
             }
 
+            // snapshot 含本 run 已注册的全部 dataset / manifest，后续补全成员 dataset 时要查表。
             AgentRunDatasetSnapshot snapshot = registry.snapshot(runId);
+            // 合法编号列表仅用于错误提示：解析失败时告诉 LLM 当前 run 里有哪些编号可选。
             List<Integer> legalDatasetNumbers = registry.listDatasetNumbers(runId);
             List<Integer> legalManifestNumbers = registry.listManifestNumbers(runId);
 
-            // 独立解析 dataset 和 manifest 空间
+            // resolvedDatasets / resolvedManifests：调用方显式选中的条目，顺序与入参 token 顺序一致。
+            // illegalDatasetRefs / illegalManifestRefs：无法解析的 token 及原因，供 fail 响应回填。
             List<AgentRunDatasetEntry> resolvedDatasets = new ArrayList<>();
             List<AgentRunDatasetEntry> resolvedManifests = new ArrayList<>();
             List<Map<String, Object>> illegalDatasetRefs = new ArrayList<>();
@@ -161,16 +192,19 @@ public class PythonSandboxTools {
                         details);
             }
 
-            // 260623-harness-optimization-02 round 4 (Option A 拍板):
-            // manifest-only 时 resolvedDatasets=[] → writePathsDatasetCsv 只出 header →
-            // sandbox_runner 不落盘 /sandbox/paths_dataset.csv → loader 退 legacy → 找不到 member 文件。
-            // 这里隐式 walk 每个 selected manifest 的 related_dataset_ids（run-level number 空间，
-            // spec §A.4 + Q1 拍板），把 member dataset entry 加到 resolvedDatasets 进 subSnapshot。
-            // mount 顺序：显式 dataset → 显式 manifest → 隐式 related dataset（保持 primaryOriginalId 是第一个显式选中项）。
+            // --- 第三阶段：根据 manifest 补全成员 dataset ---
+            // 若调用方只选了 manifest、未显式选 dataset，resolvedDatasets 会为空，
+            // writePathsDatasetCsv 只会写出表头。sandbox_runner 因此不会落盘 /sandbox/paths_dataset.csv，
+            // Python 侧 af_dataset_loader 会改走旧路径，最终找不到 manifest 成员对应的文件。
+            // 此处遍历每个已选 manifest 的 related_dataset_ids（同样使用 run 级编号），
+            // 将关联的成员 dataset 写入 relatedDatasets，再与显式选中项合并进 subSnapshot。
+            // 挂载顺序为：显式 dataset → 显式 manifest → 由 manifest 推断出的关联 dataset；
+            // primaryOriginalId 仍取第一个显式选中项，不受此处补全影响。
             Map<Integer, AgentRunDatasetEntry> datasetByNumber = new HashMap<>();
             for (AgentRunDatasetEntry ds : snapshot.datasets()) {
                 datasetByNumber.put(ds.number(), ds);
             }
+            // explicitNumbers 记录「已经纳入挂载计划」的 dataset 编号，避免同一成员被多个 manifest 重复添加。
             Set<Integer> explicitNumbers = new HashSet<>(resolvedDatasets.size() * 2);
             for (AgentRunDatasetEntry ds : resolvedDatasets) {
                 explicitNumbers.add(ds.number());
@@ -182,6 +216,7 @@ public class PythonSandboxTools {
                     try {
                         relatedNumber = Integer.parseInt(relatedNumberStr);
                     } catch (NumberFormatException nfe) {
+                        // manifest 元数据异常：related_dataset_ids 里出现了非整数，跳过并打 warn，不阻断整个任务。
                         log.warn("Manifest related_dataset_id is not a run-level number: runId={} manifestId={} value={}",
                                 runId, mf.originalId(), relatedNumberStr);
                         continue;
@@ -191,6 +226,7 @@ public class PythonSandboxTools {
                     }
                     AgentRunDatasetEntry relatedDs = datasetByNumber.get(relatedNumber);
                     if (relatedDs == null) {
+                        // manifest 引用了本 run 中不存在的 dataset 编号，同样跳过并打 warn。
                         log.warn("Manifest related_dataset_id not in registry: runId={} manifestId={} number={}",
                                 runId, mf.originalId(), relatedNumber);
                         continue;
@@ -200,7 +236,9 @@ public class PythonSandboxTools {
                 }
             }
 
-            // 收集要 mount 的 originalIds（Python 端 sandbox_runner.py 用现有 datasetIds 字段做 mount）
+            // --- 第四阶段：汇总挂载列表并生成路径映射 CSV ---
+            // originalIdsToMount 的顺序决定 Dubbo 请求里 datasetIds 的排列，也影响 primaryOriginalId 的选取。
+            // Python 端 sandbox_runner 按该列表把持久化目录挂载进容器。
             List<String> originalIdsToMount = new ArrayList<>();
             for (AgentRunDatasetEntry ds : resolvedDatasets) {
                 originalIdsToMount.add(ds.originalId());
@@ -216,11 +254,9 @@ public class PythonSandboxTools {
                         "No dataset / manifest resolved from dataset_ids / manifest_ids", Map.of());
             }
 
-            // 构造 snapshot 形态供 CSV writer：
-            // - paths_dataset.csv 包含显式 dataset + manifest 隐式 member dataset
-            //   （manifest-only 时也是数据行，sandbox 才落盘 /sandbox/paths_dataset.csv）
-            // - path_manifest.csv 反映当前 run 全量 manifest，方便 sandbox 内 manifest cross-ref。
-            // 这是 Q13 snapshot 行为的 Java 形态，round 4 把 manifest 隐式 member 算进 sub-snapshot。
+            // subSnapshot 供 paths_dataset.csv 使用：行集 = 显式 dataset + 推断出的成员 dataset。
+            // path_manifest.csv 则写入 snapshot 中的全量 manifest（不仅是调用方选中的那几个），
+            // 方便沙箱内 Python 代码按 run 级编号交叉引用任意 manifest。
             List<AgentRunDatasetEntry> allDatasets = new ArrayList<>(resolvedDatasets);
             allDatasets.addAll(relatedDatasets);
             AgentRunDatasetSnapshot subSnapshot = new AgentRunDatasetSnapshot(allDatasets, resolvedManifests);
@@ -237,10 +273,12 @@ public class PythonSandboxTools {
                     "manifestCsvBytes", pathManifestCsv.length()
             ));
 
+            // datasetId（单数）字段保留兼容旧接口，取挂载列表首项；完整列表通过 datasetIds（复数）重复字段传递。
             String primaryOriginalId = originalIdsToMount.get(0);
             log.info("Executing python task for run-level ids: primary={}, total={}, datasetCount={}, manifestCount={}, relatedDatasetCount={}",
                     primaryOriginalId, originalIdsToMount.size(), resolvedDatasets.size(), resolvedManifests.size(), relatedDatasets.size());
 
+            // --- 第五阶段：组装 ExecuteRequest 并创建沙箱任务 ---
             ExecuteRequest.Builder requestBuilder = ExecuteRequest.newBuilder()
                     .setCode(nvl(code))
                     .setDatasetId(primaryOriginalId);
@@ -249,6 +287,7 @@ public class PythonSandboxTools {
                 requestBuilder.addDatasetIds(oid);
             }
 
+            // libraries 为可选的额外 pip 包列表；沙箱镜像已预装 numpy/pandas 等，未指定则不再安装。
             if (libraries != null && !libraries.isBlank()) {
                 for (String lib : libraries.split(",")) {
                     String normalized = lib == null ? "" : lib.trim();
@@ -261,7 +300,7 @@ public class PythonSandboxTools {
             int timeout = (timeout_seconds != null && timeout_seconds > 0) ? timeout_seconds : 30;
             requestBuilder.setTimeoutSeconds(timeout);
 
-            // 260623-harness-optimization-02: 注入 run-level CSV (Python 端 sandbox_runner.py 替换占位符并落盘)
+            // pathsDatasetCsv / pathManifestCsv 随请求下发，sandbox_runner 写入 /sandbox/ 下供 loader 读取。
             requestBuilder.setPathsDatasetCsv(pathsDatasetCsv);
             requestBuilder.setPathManifestCsv(pathManifestCsv);
 
@@ -285,6 +324,8 @@ public class PythonSandboxTools {
             String taskId = createResp.getTaskId();
             log.info("Task created: {}", taskId);
 
+            // --- 第六阶段：轮询任务直至终态或超时 ---
+            // maxWaitMs 在声明的 timeout 基础上额外留 5 秒，覆盖沙箱侧排队与收尾延迟。
             long maxWaitMs = timeout * 1000L + 5000;
             long startTime = System.currentTimeMillis();
             int pollIndex = 0;
@@ -294,6 +335,7 @@ public class PythonSandboxTools {
                 TaskStatusResponse statusResp = getTaskStatus(taskId);
                 String remoteStatus = statusResp == null ? "" : nvl(statusResp.getStatus());
                 boolean statusChanged = !remoteStatus.equals(lastRemoteStatus);
+                // 调试事件采样：首次、状态变化、以及每 5 次轮询各打一条，避免日志过密。
                 if (pollIndex == 0 || statusChanged || pollIndex % 5 == 0) {
                     emitSandboxEvent("sandbox_poll", Map.of(
                             "durationMs", System.currentTimeMillis() - pollStartMs,
@@ -306,6 +348,7 @@ public class PythonSandboxTools {
                 }
                 lastRemoteStatus = remoteStatus;
                 pollIndex++;
+                // terminalOutput 对终态返回 JSON 字符串，对 RUNNING 等中间态返回 null，继续轮询。
                 String terminal = terminalOutput(taskId, statusResp);
                 if (terminal != null) {
                     emitSandboxToolTotal(toolStartMs, "OK", "");
@@ -328,6 +371,12 @@ public class PythonSandboxTools {
         }
     }
 
+    /**
+     * 向调试观测服务发送结构化事件。未启用 {@link DebugObservabilityService} 时不执行任何操作。
+     *
+     * @param eventType 事件类型，如 {@code sandbox_poll}、{@code sandbox_create_task}
+     * @param fields 与 eventType 配套的键值对，方法内会追加 {@code eventType} 字段
+     */
     private void emitSandboxEvent(String eventType, Map<String, Object> fields) {
         if (debugObservabilityService == null || !debugObservabilityService.isEnabled()) {
             return;
@@ -337,10 +386,14 @@ public class PythonSandboxTools {
             payload.put("eventType", eventType);
             debugObservabilityService.emit(payload);
         } catch (Exception ignored) {
-            // debug path must not affect tool execution
+            // 调试观测路径上的异常不应影响工具主流程
         }
     }
 
+    /**
+     * 在发起 Dubbo 调用前，把调试会话 id、run id、会话目录写入 RpcContext attachment，
+     * 以便沙箱服务侧把日志与产物归档到同一调试目录。
+     */
     private void installDebugRpcAttachments() {
         if (debugObservabilityService == null || !debugObservabilityService.isEnabled()) {
             return;
@@ -360,10 +413,11 @@ public class PythonSandboxTools {
                 RpcContext.getClientAttachment().setAttachment(DebugObservabilityRpcKeys.SESSION_DIR, sessionDir);
             }
         } catch (Exception ignored) {
-            // debug path must not affect tool execution
+            // 调试观测路径上的异常不应影响工具主流程
         }
     }
 
+    /** 工具调用结束时发送汇总事件，附带总耗时、终态 status，以及可选的主机堆内存快照。 */
     private void emitSandboxToolTotal(long toolStartMs, String status, String errorCategory) {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("durationMs", System.currentTimeMillis() - toolStartMs);
@@ -375,6 +429,7 @@ public class PythonSandboxTools {
         emitSandboxEvent("sandbox_tool_total", payload);
     }
 
+    /** 把当前 JVM 堆使用与 OS 负载写入 payload，供性能排查时对照沙箱耗时。 */
     private void appendHostSnapshot(Map<String, Object> payload) {
         try {
             Runtime runtime = Runtime.getRuntime();
@@ -385,20 +440,21 @@ public class PythonSandboxTools {
             payload.put("systemLoadAverage", osBean.getSystemLoadAverage());
             payload.put("availableProcessors", osBean.getAvailableProcessors());
         } catch (Exception ignored) {
-            // optional host snapshot
+            // 主机资源快照为可选项，采集失败时忽略
         }
     }
 
     /**
-     * 把 caller 传的 token 列表解析为 resolved entries + illegal refs（Q4 拍板：dataset / manifest 各自独立空间）。
+     * 将调用方传入的编号 token 解析为 registry 条目；解析失败的 token 记入 illegal 列表。
+     * dataset 与 manifest 使用独立编号空间，由 {@code kind} 参数决定查哪一侧。
      *
-     * @param tokens caller 传的 token 字符串（parseDatasetIds 后的结果，可能含非数字）
-     * @param registry registry
-     * @param runId agent run id
-     * @param kind "dataset" 或 "manifest"，用于在 illegal ref 标 reason
-     * @param resolved 成功解析的 entry 列表
-     * @param illegal 解析失败的 ref 列表（input + reason）
-     * @param allowEmptyTokens 是否允许空 token（实际两个空间都不允许，留 false）
+     * @param tokens 经 {@link #parseDatasetIds} 拆分后的字符串，可能含非数字
+     * @param registry 当前 run 的数据集注册表
+     * @param runId agent 运行 id
+     * @param kind {@code "dataset"} 或 {@code "manifest"}，决定查询哪条编号空间，并写入 illegal 的 reason
+     * @param resolved 解析成功的条目，按输入顺序追加
+     * @param illegal 解析失败的引用，元素含 {@code input} 与 {@code reason}
+     * @param allowEmptyTokens 是否跳过空 token；当前两个编号空间均传 {@code false}
      */
     private void resolveRunLevelNumbers(
             String[] tokens,
@@ -416,6 +472,7 @@ public class PythonSandboxTools {
             try {
                 number = Integer.parseInt(token);
             } catch (NumberFormatException nfe) {
+                // 非整数 token 无法对应 run 级编号，记入 illegal 并继续处理后续 token。
                 illegal.add(Map.of("input", token, "reason", "not_an_integer"));
                 continue;
             }
@@ -425,6 +482,7 @@ public class PythonSandboxTools {
             if (hit.isPresent()) {
                 resolved.add(hit.get());
             } else {
+                // 整数合法但当前 run 的对应编号空间里不存在该编号。
                 illegal.add(Map.of(
                         "input", token,
                         "reason", "no_" + kind + "_with_this_run_level_number"
@@ -433,6 +491,7 @@ public class PythonSandboxTools {
         }
     }
 
+    /** 查询沙箱任务当前状态；每次 Dubbo 调用前都会尝试安装调试 attachment。 */
     private TaskStatusResponse getTaskStatus(String taskId) {
         installDebugRpcAttachments();
         return pythonSandboxService.getTaskStatus(
@@ -440,6 +499,14 @@ public class PythonSandboxTools {
         );
     }
 
+    /**
+     * 根据远程任务状态决定是否已到达终态。
+     * <ul>
+     *   <li>{@code SUCCEEDED}：拉取 stdout/stderr，经 {@link #formatResult} 包装为 JSON 返回</li>
+     *   <li>{@code FAILED} / {@code CANCELED} / {@code NOT_FOUND}：构造带 error.code 的失败 JSON</li>
+     *   <li>其余状态（如 RUNNING）：返回 {@code null}，由轮询循环继续等待</li>
+     * </ul>
+     */
     private String terminalOutput(String taskId, TaskStatusResponse statusResp) {
         String status = statusResp.getStatus();
         if ("SUCCEEDED".equals(status)) {
@@ -480,6 +547,11 @@ public class PythonSandboxTools {
         return null;
     }
 
+    /**
+     * 把 LLM 或 Java 调用方传入的编号字符串拆成 token 数组。
+     * 兼容两种常见形态：逗号分隔的纯数字串，以及 JSON 数组字符串（含可选的双引号包裹）。
+     * 会去重并保持首次出现顺序，避免重复挂载同一 dataset。
+     */
     private String[] parseDatasetIds(String datasetIds) {
         if (datasetIds == null) {
             return new String[0];
@@ -488,6 +560,7 @@ public class PythonSandboxTools {
         if (trimmed.isEmpty()) {
             return new String[0];
         }
+        // 去掉 JSON 数组外层的方括号，后续仍按逗号拆分。
         if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
             trimmed = trimmed.substring(1, trimmed.length() - 1);
         }
@@ -495,6 +568,7 @@ public class PythonSandboxTools {
                 .map(String::trim)
                 .map(item -> {
                     String id = item;
+                    // 去掉 JSON 字符串元素两侧的双引号。
                     if (id.startsWith("\"") && id.endsWith("\"") && id.length() >= 2) {
                         id = id.substring(1, id.length() - 1).trim();
                     }
@@ -505,6 +579,11 @@ public class PythonSandboxTools {
                 .toArray(String[]::new);
     }
 
+    /**
+     * 把沙箱执行结果转为工具统一的 JSON 响应。
+     * 进程 exit code 为 0 时走 {@link #ok}；非零时仍附带 stdout/stderr 到 {@code data}，但 {@code ok=false}，
+     * 方便 LLM 读取输出内容的同时识别执行失败。
+     */
     private String formatResult(String taskId, String status, TaskResultResponse result) {
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("task_id", taskId);
@@ -526,6 +605,7 @@ public class PythonSandboxTools {
         ), data);
     }
 
+    /** 构造 {@code ok=true} 的标准 JSON 工具响应。 */
     private String ok(String tool, Map<String, Object> data) {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("ok", true);
@@ -535,10 +615,15 @@ public class PythonSandboxTools {
         return writeJson(payload);
     }
 
+    /** 构造 {@code ok=false} 的标准 JSON 工具响应；{@code details} 供 LLM 或上层做结构化重试。 */
     private String fail(String tool, String code, String message, Map<String, Object> details) {
         return fail(tool, code, message, details, Map.of());
     }
 
+    /**
+     * 构造 {@code ok=false} 的 JSON 工具响应，可在失败时仍附带部分 {@code data}
+     *（例如 exit code 非零但 stdout 有内容的场景）。
+     */
     private String fail(String tool,
                         String code,
                         String message,
@@ -556,6 +641,7 @@ public class PythonSandboxTools {
         return writeJson(payload);
     }
 
+    /** 序列化工具响应；序列化本身失败时返回最小可用的硬编码 JSON 错误串。 */
     private String writeJson(Object payload) {
         try {
             return objectMapper.writeValueAsString(payload);
@@ -577,8 +663,7 @@ public class PythonSandboxTools {
     }
 
     /**
-     * 暴露给单测 / 同包注入：构造完成后 setter 注入 registry。
-     * 业务路径走 Spring {@code @Autowired(required=false)}。
+     * 供单元测试与同包代码在构造完成后注入 registry；生产路径走 Spring {@code @Autowired(required=false)}。
      */
     void setAgentRunDatasetRegistry(AgentRunDatasetRegistry registry) {
         this.agentRunDatasetRegistry = registry;
