@@ -629,16 +629,16 @@ services:
       AF_SANDBOX_IMAGE: ${AF_SANDBOX_IMAGE:-alphafrog-sandbox-runtime:latest}
       AF_SANDBOX_SKIP_ENVIRONMENT_SETUP: ${AF_SANDBOX_SKIP_ENVIRONMENT_SETUP:-true}
       AF_SANDBOX_PREINSTALLED_LIBRARIES: ${AF_SANDBOX_PREINSTALLED_LIBRARIES:-numpy,pandas,matplotlib,scipy}
-      AF_SANDBOX_CONTAINER_MAX_CONCURRENCY: ${AF_SANDBOX_CONTAINER_MAX_CONCURRENCY:-5}
-      # Compose/default deployment exercises the pooled runner. Set
-      # AF_SANDBOX_POOL_ENABLED=false in the host env/.env to force the legacy per-task SandboxSession path.
-      AF_SANDBOX_POOL_ENABLED: ${AF_SANDBOX_POOL_ENABLED:-true}
+      # Data-intense P0 保持一任务一容器，使内存上限与 resourceUsage 可归属到单个 attempt。
+      AF_SANDBOX_CONTAINER_MAX_CONCURRENCY: ${AF_SANDBOX_CONTAINER_MAX_CONCURRENCY:-1}
+      AF_SANDBOX_POOL_ENABLED: ${AF_SANDBOX_POOL_ENABLED:-false}
       AF_SANDBOX_POOL_MIN_SIZE: ${AF_SANDBOX_POOL_MIN_SIZE:-3}
       AF_SANDBOX_POOL_MAX_SIZE: ${AF_SANDBOX_POOL_MAX_SIZE:-8}
       AF_SANDBOX_POOL_ACQUIRE_TIMEOUT: ${AF_SANDBOX_POOL_ACQUIRE_TIMEOUT:-30}
       AF_SANDBOX_POOL_IDLE_TIMEOUT: ${AF_SANDBOX_POOL_IDLE_TIMEOUT:-300}
       AF_SANDBOX_POOL_MAX_CONTAINER_USES: ${AF_SANDBOX_POOL_MAX_CONTAINER_USES:-}
       AF_SANDBOX_WORKSPACE_ROOT: /sandbox/runs
+      AF_SANDBOX_TASK_STORE_PATH: /data/sandbox_tasks/state.json
       AF_SANDBOX_COMPAT_INPUT_PATH: "true"
       # Nacos dynamic config (mirrors Java services)
       AF_CONFIG_NACOS_ENABLED: ${AF_CONFIG_NACOS_ENABLED:-false}
@@ -653,6 +653,7 @@ services:
       - ./data/database_fetched:/data/database_fetched
       - ./data/manifests:/data/manifests
       - ./data/agent_artifacts:/data/agent_artifacts
+      - ./data/sandbox_tasks:/data/sandbox_tasks
       - /var/run/docker.sock:/var/run/docker.sock
     expose:
       - "8095"
