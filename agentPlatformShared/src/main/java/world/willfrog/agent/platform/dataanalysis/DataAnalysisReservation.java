@@ -4,6 +4,7 @@ import java.time.Instant;
 
 public record DataAnalysisReservation(
         String reservationId,
+        DataAnalysisOperationIdentity identity,
         DataAnalysisResourceClass resourceClass,
         int capacityUnits,
         DataAnalysisReservationState state,
@@ -12,6 +13,12 @@ public record DataAnalysisReservation(
 
     public DataAnalysisReservation {
         reservationId = DataAnalysisContractSupport.requireText(reservationId, "reservationId");
+        if (identity == null) {
+            throw new IllegalArgumentException("identity must not be null");
+        }
+        if (!identity.reservationId().equals(reservationId)) {
+            throw new IllegalArgumentException("reservationId must match identity reservationId");
+        }
         if (resourceClass == null) {
             throw new IllegalArgumentException("resourceClass must not be null");
         }
@@ -25,10 +32,17 @@ public record DataAnalysisReservation(
             throw new IllegalArgumentException("acquiredAt must not be null");
         }
         taskId = taskId == null || taskId.isBlank() ? null : taskId.trim();
-        if ((state == DataAnalysisReservationState.ATTACHED
-                || state == DataAnalysisReservationState.ACTIVE)
-                && taskId == null) {
-            throw new IllegalArgumentException("taskId is required for attached or active reservations");
+        if (state == DataAnalysisReservationState.PREPARING && taskId != null) {
+            throw new IllegalArgumentException("taskId must be absent for preparing reservations");
         }
+        if (state != DataAnalysisReservationState.PREPARING
+                && state != DataAnalysisReservationState.RELEASED
+                && taskId == null) {
+            throw new IllegalArgumentException("taskId is required after task attachment");
+        }
+    }
+
+    public String operationId() {
+        return identity.operationId();
     }
 }

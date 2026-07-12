@@ -7,17 +7,18 @@ import java.util.List;
  */
 public interface DataAnalysisCapacityService {
 
-    DataAnalysisReservation reserve(String reservationId, DataAnalysisEstimate estimate);
+    DataAnalysisReservation reserve(
+            DataAnalysisOperationIdentity identity,
+            DataAnalysisEstimate estimate);
 
     DataAnalysisRestoreOutcome restoreReservation(DataAnalysisReservation reservation);
 
-    DataAnalysisReleaseOutcome releaseReservation(
-            String reservationId,
-            DataAnalysisReleaseReason reason);
+    DataAnalysisReleaseOutcome releaseReservation(DataAnalysisReleaseRequest request);
 
     DataAnalysisCapacityRecoveryReport recover(
             List<DataAnalysisReservation> durableReservations,
-            int configuredMaxUnits);
+            int configuredMaxUnits,
+            int configuredMaxHeavyActive);
 
     DataAnalysisAdmissionState admissionState();
 }
