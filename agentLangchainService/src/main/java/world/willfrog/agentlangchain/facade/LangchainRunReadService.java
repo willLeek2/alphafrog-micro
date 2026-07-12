@@ -2,6 +2,8 @@ package world.willfrog.agentlangchain.facade;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.entity.AgentRun;
@@ -116,6 +118,8 @@ import java.util.Map;
 @Service
 @RequiredArgsConstructor
 public class LangchainRunReadService {
+
+    private static final Logger log = LoggerFactory.getLogger(LangchainRunReadService.class);
 
     private final AgentRunMapper runMapper;
     private final AgentEventService eventService;
@@ -724,13 +728,16 @@ public class LangchainRunReadService {
 
     private String mergeDataAnalysisStatusView(String runId, String existingJson) {
         try {
-            String dataAnalysisJson = dataAnalysisSerializer.serializeStatusView(
-                    dataAnalysisObservabilityQuery.findByRunId(runId));
+            String dataAnalysisJson = dataAnalysisSerializer.serializeStatusFromSummary(
+                    runId,
+                    dataAnalysisObservabilityQuery.findSummaryByRunId(runId));
             if (dataAnalysisJson.equals("{}")) {
                 return existingJson;
             }
-            return mergeJsonObjects(existingJson, dataAnalysisJson);
+            return mergeJsonObjects(runId, "status", existingJson, dataAnalysisJson);
         } catch (Exception e) {
+            log.warn("合并 data-analysis status 视图失败 runId={} 异常={}/{}",
+                    runId, e.getClass().getSimpleName(), e.getMessage());
             return existingJson;
         }
     }
@@ -742,15 +749,28 @@ public class LangchainRunReadService {
             if (dataAnalysisJson.equals("{}")) {
                 return existingJson;
             }
-            return mergeJsonObjects(existingJson, dataAnalysisJson);
+            return mergeJsonObjects(runId, "result", existingJson, dataAnalysisJson);
         } catch (Exception e) {
+            log.warn("合并 data-analysis result 视图失败 runId={} 异常={}/{}",
+                    runId, e.getClass().getSimpleName(), e.getMessage());
             return existingJson;
         }
     }
 
-    private String mergeJsonObjects(String baseJson, String overlayJson) {
+    private String mergeJsonObjects(String runId, String view, String baseJson, String overlayJson) {
+        if (baseJson == null || baseJson.isBlank()) {
+            return overlayJson;
+        }
         Map<String, Object> base = readExtMap(baseJson);
+        if (base.isEmpty() && !baseJson.trim().equals("{}")) {
+            log.warn("base JSON 解析为非对象或非法 runId={} view={}，保留原始响应", runId, view);
+            return baseJson;
+        }
         Map<String, Object> overlay = readExtMap(overlayJson);
+        if (overlay.isEmpty() && !overlayJson.trim().equals("{}")) {
+            log.warn("overlay JSON 解析为非对象或非法 runId={} view={}，保留原始响应", runId, view);
+            return baseJson;
+        }
         base.putAll(overlay);
         return writeJson(base);
     }

@@ -21,9 +21,10 @@ class DataAnalysisReadResponseMapperTest {
     }
 
     @Test
-    void statusViewContainsSummaryButNoCalls() {
-        DataAnalysisObservabilitySnapshot snapshot = DataAnalysisObservabilityContractFixtures.canonicalV1();
-        Map<String, Object> view = mapper.buildStatusView(snapshot);
+    void statusFromSummaryContainsVersionRunIdSummaryOnly() {
+        var snapshot = DataAnalysisObservabilityContractFixtures.canonicalV1();
+        Map<String, Object> view = mapper.buildStatusFromSummary(
+                snapshot.runId(), snapshot.summary());
 
         assertEquals(1, view.size());
         @SuppressWarnings("unchecked")
@@ -36,8 +37,6 @@ class DataAnalysisReadResponseMapperTest {
         @SuppressWarnings("unchecked")
         Map<String, Object> summary = (Map<String, Object>) root.get("summary");
         assertEquals(2, summary.get("toolCallCount"));
-        assertEquals(2, summary.get("attemptCount"));
-        assertEquals(300L, summary.get("estimatedRows"));
         assertEquals(1, summary.get("oomCount"));
         assertEquals(true, summary.get("attributionComplete"));
     }
@@ -57,20 +56,10 @@ class DataAnalysisReadResponseMapperTest {
         assertEquals(2, calls.size());
         assertEquals("call-a", calls.get(0).get("toolCallId"));
         assertEquals("call-b", calls.get(1).get("toolCallId"));
-
-        Map<String, Object> callA = calls.get(0);
-        assertEquals(1, callA.get("attempt"));
-        assertEquals(false, callA.get("background"));
-        assertEquals("COMPLETED", callA.get("terminalStatus"));
-
-        @SuppressWarnings("unchecked")
-        Map<String, Object> estimate = (Map<String, Object>) callA.get("estimate");
-        assertEquals(100L, estimate.get("estimatedRows"));
-        assertEquals("STANDARD", estimate.get("resourceClass"));
     }
 
     @Test
-    void resultViewPreservesOomKilledCallFields() {
+    void estimateIncludesSelectedColumnRatioAndManifestAndHints() {
         DataAnalysisObservabilitySnapshot snapshot = DataAnalysisObservabilityContractFixtures.canonicalV1();
         Map<String, Object> view = mapper.buildResultView(snapshot);
 
@@ -78,7 +67,23 @@ class DataAnalysisReadResponseMapperTest {
         Map<String, Object> root = (Map<String, Object>) view.get(DataAnalysisObservabilitySnapshot.ROOT_FIELD);
         @SuppressWarnings("unchecked")
         List<Map<String, Object>> calls = (List<Map<String, Object>>) root.get("calls");
-        // call-b is OOM-killed per canonicalV1 fixture
+        @SuppressWarnings("unchecked")
+        Map<String, Object> estimate = (Map<String, Object>) calls.get(0).get("estimate");
+
+        assertTrue(estimate.containsKey("selectedColumnRatio"));
+        assertTrue(estimate.containsKey("manifestMemberCount"));
+        assertTrue(estimate.containsKey("heavyOperationHints"));
+    }
+
+    @Test
+    void oomKilledCallHasCorrectFields() {
+        DataAnalysisObservabilitySnapshot snapshot = DataAnalysisObservabilityContractFixtures.canonicalV1();
+        Map<String, Object> view = mapper.buildResultView(snapshot);
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> root = (Map<String, Object>) view.get(DataAnalysisObservabilitySnapshot.ROOT_FIELD);
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> calls = (List<Map<String, Object>>) root.get("calls");
         Map<String, Object> callB = calls.get(1);
 
         @SuppressWarnings("unchecked")

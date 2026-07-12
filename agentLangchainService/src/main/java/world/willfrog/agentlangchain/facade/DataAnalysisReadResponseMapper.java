@@ -10,28 +10,24 @@ import world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilitySnaps
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilitySummary;
 
 /**
- * Builds the {@code data_analysis_observability} response structure for status
- * (summary-only) and result (full) read paths. Does not access Redis/DB directly.
+ * 构造 {@code data_analysis_observability} 响应结构，分别提供 status（仅 summary）和 result（完整快照）两种视图。
+ * 不直接访问 Redis/DB。
  */
 public final class DataAnalysisReadResponseMapper {
 
     DataAnalysisReadResponseMapper() {
     }
 
-    /**
-     * Status (high-frequency polling) view: version + summary only, no calls.
-     */
-    public Map<String, Object> buildStatusView(DataAnalysisObservabilitySnapshot snapshot) {
+    /** 高频轮询 status 视图：仅 version + runId + summary，不含 calls。 */
+    public Map<String, Object> buildStatusFromSummary(String runId, DataAnalysisObservabilitySummary summary) {
         Map<String, Object> root = new LinkedHashMap<>();
-        root.put("version", snapshot.version());
-        root.put("runId", snapshot.runId());
-        root.put("summary", serializeSummary(snapshot.summary()));
+        root.put("version", DataAnalysisObservabilitySnapshot.CURRENT_VERSION);
+        root.put("runId", runId);
+        root.put("summary", serializeSummary(summary));
         return Map.of(DataAnalysisObservabilitySnapshot.ROOT_FIELD, root);
     }
 
-    /**
-     * Result / full observability view: version + summary + calls.
-     */
+    /** result / full observability 视图：version + summary + calls。 */
     public Map<String, Object> buildResultView(DataAnalysisObservabilitySnapshot snapshot) {
         Map<String, Object> root = new LinkedHashMap<>();
         root.put("version", snapshot.version());
@@ -41,9 +37,7 @@ public final class DataAnalysisReadResponseMapper {
         return Map.of(DataAnalysisObservabilitySnapshot.ROOT_FIELD, root);
     }
 
-    /**
-     * Empty response for runs with no data-analysis activity.
-     */
+    /** 无 data-analysis 数据的 run 返回空 map。 */
     public Map<String, Object> buildEmptyView() {
         return Map.of();
     }
@@ -93,6 +87,9 @@ public final class DataAnalysisReadResponseMapper {
         estimate.put("estimatedRows", c.estimate().estimatedRows());
         estimate.put("estimatedBytes", c.estimate().estimatedBytes());
         estimate.put("fileCount", c.estimate().fileCount());
+        estimate.put("selectedColumnRatio", c.estimate().selectedColumnRatio());
+        estimate.put("manifestMemberCount", c.estimate().manifestMemberCount());
+        estimate.put("heavyOperationHints", c.estimate().heavyOperationHints());
         estimate.put("resourceClass", c.estimate().resourceClass().name());
         estimate.put("capacityUnits", c.estimate().capacityUnits());
         map.put("estimate", estimate);

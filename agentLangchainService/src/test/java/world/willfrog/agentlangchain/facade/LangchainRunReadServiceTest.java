@@ -20,7 +20,9 @@ import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agent.platform.service.SnapshotPartService;
 import world.willfrog.agentlangchain.routing.LangchainSingleWriterGuard;
 import world.willfrog.agentlangchain.tools.LangchainToolCatalogService;
+import world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilityContractFixtures;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilityQuery;
+import world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilitySnapshot;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunResultRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunStatusRequest;
@@ -193,6 +195,112 @@ class LangchainRunReadServiceTest {
         assertEquals(0.012, response.getTotalCost());
         assertTrue(response.getPersisted());
         verify(runCostService).buildAndPersist(run, "{\"diagnostics\":{}}");
+    }
+
+    @Test
+    void statusMergesDataAnalysisSummaryOnly() {
+        AgentRun run = run("{\"run_provider\":\"legacy\"}");
+        when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(run);
+        when(stateStore.loadPlan("r1")).thenReturn(Optional.empty());
+        when(eventService.findLatestByRunId("r1")).thenReturn(event(1, "EXECUTION_STARTED"));
+        when(observabilityService.loadObservabilitySummaryJson(eq("r1"), any()))
+                .thenReturn("{\"existing\":true}");
+        when(eventService.listByRunId("r1")).thenReturn(List.of());
+        when(eventService.findMaxSeq("r1")).thenReturn(5);
+        DataAnalysisObservabilitySnapshot snapshot = DataAnalysisObservabilityContractFixtures.canonicalV1();
+        when(dataAnalysisQuery.findSummaryByRunId("r1")).thenReturn(Optional.of(snapshot.summary()));
+
+        var status = service.getStatus(GetAgentRunStatusRequest.newBuilder()
+                .setUserId("u1").setId("r1").build());
+
+        String obsJson = status.getObservabilitySummaryJson();
+        assertTrue(obsJson.contains("data_analysis_observability"));
+        assertTrue(obsJson.contains("\"summary\""));
+        assertTrue(!obsJson.contains("\"calls\""));
+        assertTrue(obsJson.contains("\"existing\":true"));
+        verify(dataAnalysisQuery).findSummaryByRunId("r1");
+        verify(dataAnalysisQuery, never()).findByRunId(anyString());
+    }
+
+    @Test
+    void resultMergesDataAnalysisFullSnapshot() {
+        AgentRun run = run("{\"run_provider\":\"legacy\"}");
+        when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(run);
+        when(observabilityService.loadObservabilityJson(eq("r1"), any()))
+                .thenReturn("{\"existing\":true}");
+        when(eventService.listByRunId("r1")).thenReturn(List.of());
+        DataAnalysisObservabilitySnapshot snapshot = DataAnalysisObservabilityContractFixtures.canonicalV1();
+        when(dataAnalysisQuery.findByRunId("r1")).thenReturn(Optional.of(snapshot));
+
+        var result = service.getResult(GetAgentRunResultRequest.newBuilder()
+                .setUserId("u1").setId("r1").build());
+
+        String obsJson = result.getObservabilityJson();
+        assertTrue(obsJson.contains("data_analysis_observability"));
+        assertTrue(obsJson.contains("\"summary\""));
+        assertTrue(obsJson.contains("\"calls\""));
+        assertTrue(obsJson.contains("\"call-a\""));
+        assertTrue(obsJson.contains("\"existing\":true"));
+    }
+
+    @Test
+    void dataAnalysisQueryEmptyPreservesExistingJson() {
+        AgentRun run = run("{\"run_provider\":\"legacy\"}");
+        when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(run);
+        when(stateStore.loadPlan("r1")).thenReturn(Optional.empty());
+        when(eventService.findLatestByRunId("r1")).thenReturn(event(1, "EXECUTION_STARTED"));
+        when(observabilityService.loadObservabilitySummaryJson(eq("r1"), any()))
+                .thenReturn("{\"existing\":true}");
+        when(eventService.listByRunId("r1")).thenReturn(List.of());
+        when(eventService.findMaxSeq("r1")).thenReturn(5);
+
+        var status = service.getStatus(GetAgentRunStatusRequest.newBuilder()
+                .setUserId("u1").setId("r1").build());
+
+        String obsJson = status.getObservabilitySummaryJson();
+        assertTrue(obsJson.contains("\"existing\":true"));
+        assertTrue(!obsJson.contains("data_analysis_observability"));
+    }
+
+    @Test
+    void queryExceptionPreservesExistingJson() {
+        AgentRun run = run("{\"run_provider\":\"legacy\"}");
+        when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(run);
+        when(stateStore.loadPlan("r1")).thenReturn(Optional.empty());
+        when(eventService.findLatestByRunId("r1")).thenReturn(event(1, "EXECUTION_STARTED"));
+        when(observabilityService.loadObservabilitySummaryJson(eq("r1"), any()))
+                .thenReturn("{\"existing\":true}");
+        when(eventService.listByRunId("r1")).thenReturn(List.of());
+        when(eventService.findMaxSeq("r1")).thenReturn(5);
+        when(dataAnalysisQuery.findSummaryByRunId("r1"))
+                .thenThrow(new RuntimeException("模拟查询失败"));
+
+        var status = service.getStatus(GetAgentRunStatusRequest.newBuilder()
+                .setUserId("u1").setId("r1").build());
+
+        String obsJson = status.getObservabilitySummaryJson();
+        assertEquals("{\"existing\":true}", obsJson);
+    }
+
+    @Test
+    void invalidExistingJsonPreservedAsIs() {
+        AgentRun run = run("{\"run_provider\":\"legacy\"}");
+        when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(run);
+        when(stateStore.loadPlan("r1")).thenReturn(Optional.empty());
+        when(eventService.findLatestByRunId("r1")).thenReturn(event(1, "EXECUTION_STARTED"));
+        // 非法 JSON（非对象）
+        when(observabilityService.loadObservabilitySummaryJson(eq("r1"), any()))
+                .thenReturn("\"not-an-object\"");
+        when(eventService.listByRunId("r1")).thenReturn(List.of());
+        when(eventService.findMaxSeq("r1")).thenReturn(5);
+        DataAnalysisObservabilitySnapshot snapshot = DataAnalysisObservabilityContractFixtures.canonicalV1();
+        when(dataAnalysisQuery.findSummaryByRunId("r1")).thenReturn(Optional.of(snapshot.summary()));
+
+        var status = service.getStatus(GetAgentRunStatusRequest.newBuilder()
+                .setUserId("u1").setId("r1").build());
+
+        String obsJson = status.getObservabilitySummaryJson();
+        assertEquals("\"not-an-object\"", obsJson);
     }
 
     private AgentRun run(String ext) {
