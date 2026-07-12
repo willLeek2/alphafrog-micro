@@ -81,4 +81,17 @@ public class ToolJobAnchorService {
     public List<AgentRun> listResumeReady(int limit) {
         return agentRunMapper.listResumeReadyAnchors(limit);
     }
+
+    /**
+     * Atomic CAS: updates the anchor JSON only if both the run status AND the
+     * anchor's resumeState match expected values. Prevents dual-launch races.
+     *
+     * @return true if exactly one row was updated (this caller won the claim)
+     */
+    public boolean casResumeState(String runId, ToolJobAnchor anchor,
+                                   AgentRunStatus expectedStatus, String expectedResumeState) {
+        int rows = agentRunMapper.casUpdateAnchorResumeState(
+                runId, anchor.toJson(), expectedStatus, expectedResumeState);
+        return rows == 1;
+    }
 }

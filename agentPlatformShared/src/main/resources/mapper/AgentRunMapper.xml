@@ -344,4 +344,13 @@
         LIMIT #{limit}
     </select>
 
+    <update id="casUpdateAnchorResumeState">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = CAST(#{toolJobAnchorJson} AS jsonb),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status = #{expectedStatus}
+          AND tool_job_anchor_json #>> '{resumeState}' = #{expectedResumeState}
+    </update>
+
 </mapper>

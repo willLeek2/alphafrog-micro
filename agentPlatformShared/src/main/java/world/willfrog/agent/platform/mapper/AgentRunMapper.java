@@ -124,4 +124,13 @@ public interface AgentRunMapper {
      * 用于启动恢复和 reconciler 扫描在 CAS 之后但 launch 之前崩溃的 run。
      */
     List<AgentRun> listResumeReadyAnchors(@Param("limit") int limit);
+
+    /**
+     * 原子 CAS 更新 resmeState：同时约束 status 和 JSON 内的 resumeState 字段。
+     * 防止两个进程同时读取 READY 后双 launch。
+     */
+    int casUpdateAnchorResumeState(@Param("id") String id,
+                                   @Param("toolJobAnchorJson") String toolJobAnchorJson,
+                                   @Param("expectedStatus") AgentRunStatus expectedStatus,
+                                   @Param("expectedResumeState") String expectedResumeState);
 }

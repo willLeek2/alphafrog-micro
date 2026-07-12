@@ -1,5 +1,8 @@
 package world.willfrog.agentlangchain.tooljob;
 
+import world.willfrog.agent.platform.dataanalysis.CompletedTodoRecord;
+
+import java.util.Collections;
 import java.util.List;
 
 /**
@@ -10,12 +13,13 @@ import java.util.List;
 public class ToolJobResumeContext {
 
     private String runId;
-    private String todoId;           // suspended todo to resume from
-    private List<String> completedTodoIds;  // todos completed before suspend
-    private String datasetRefsJson;  // dataset references to restore
-    private int toolCallsUsed;       // tool call count at suspend point
-    private boolean terminalSuccess; // whether sandbox succeeded
-    private String terminalResultPreview; // tool result to inject into current todo
+    private String todoId;
+    private List<CompletedTodoRecord> completedTodos = Collections.emptyList();
+    private String datasetSnapshotJson;
+    private String datasetSnapshotDigest;
+    private int toolCallsUsed;
+    private boolean terminalSuccess;
+    private String terminalResultPreview;
     private String terminalRawRef;
 
     public ToolJobResumeContext() {}
@@ -26,11 +30,14 @@ public class ToolJobResumeContext {
     public String getTodoId() { return todoId; }
     public void setTodoId(String todoId) { this.todoId = todoId; }
 
-    public List<String> getCompletedTodoIds() { return completedTodoIds; }
-    public void setCompletedTodoIds(List<String> completedTodoIds) { this.completedTodoIds = completedTodoIds; }
+    public List<CompletedTodoRecord> getCompletedTodos() { return completedTodos; }
+    public void setCompletedTodos(List<CompletedTodoRecord> completedTodos) { this.completedTodos = completedTodos; }
 
-    public String getDatasetRefsJson() { return datasetRefsJson; }
-    public void setDatasetRefsJson(String datasetRefsJson) { this.datasetRefsJson = datasetRefsJson; }
+    public String getDatasetSnapshotJson() { return datasetSnapshotJson; }
+    public void setDatasetSnapshotJson(String datasetSnapshotJson) { this.datasetSnapshotJson = datasetSnapshotJson; }
+
+    public String getDatasetSnapshotDigest() { return datasetSnapshotDigest; }
+    public void setDatasetSnapshotDigest(String datasetSnapshotDigest) { this.datasetSnapshotDigest = datasetSnapshotDigest; }
 
     public int getToolCallsUsed() { return toolCallsUsed; }
     public void setToolCallsUsed(int toolCallsUsed) { this.toolCallsUsed = toolCallsUsed; }
