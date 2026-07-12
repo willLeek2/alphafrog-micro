@@ -207,12 +207,111 @@ class ToolJobFinalizerRetryableTest {
         // ENVELOPE persisted + fail-closed diagnostic write (2 calls total)
         verify(anchorService, times(2)).updateAnchor(eq("run-fc"), any(ToolJobAnchor.class),
                 eq(AgentRunStatus.WAITING_TOOL_JOB));
-        // Did NOT proceed to RELEASE (no second updateAnchor call)
+        // Did NOT proceed to RELEASE
         verify(anchorService, never()).updateAnchorAndStatus(eq("run-fc"), any(ToolJobAnchor.class),
                 any(), any());
+        // Capacity never touched — no release
+        verifyNoInteractions(capacityService);
         // Usage/event hooks never called
         verify(usageHook, never()).upsertUsage(any(), any());
         verify(eventHook, never()).emitTerminalEvent(any(), any());
+    }
+
+    // ===== recovery: backfill on refetch after missing =====
+
+    @Test
+    void missingThenRefetchWithRetryable_backfillCompletesPipeline() throws Exception {
+        ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
+        DataAnalysisCapacityService capacityService = mock(DataAnalysisCapacityService.class);
+        ToolJobResumeService resumeService = mock(ToolJobResumeService.class);
+        ToolJobRedisCache redisCache = mock(ToolJobRedisCache.class);
+        ToolJobUsageHook usageHook = mock(ToolJobUsageHook.class);
+        ToolJobEventHook eventHook = mock(ToolJobEventHook.class);
+
+        // Call 1: ENVELOPE succeeds → fail-closed diagnostic write
+        // Call 2: backfill write → RELEASE → USAGE → EVENT + CAS/RESUME
+        when(anchorService.updateAnchor(eq("run-bf"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.WAITING_TOOL_JOB)))
+                .thenReturn(true)   // ENVELOPE
+                .thenReturn(true)   // fail-closed diagnostic
+                .thenReturn(true)   // backfill
+                .thenReturn(true)   // RELEASE
+                .thenReturn(true)   // USAGE
+                .thenReturn(true);  // EVENT
+        when(anchorService.updateAnchor(eq("run-bf"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.RECEIVED))).thenReturn(true);
+        when(anchorService.updateAnchorAndStatus(eq("run-bf"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.WAITING_TOOL_JOB)))
+                .thenReturn(true);
+        when(capacityService.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(capacityService.releaseReservation(any())).thenReturn(DataAnalysisReleaseOutcome.RELEASED);
+        when(usageHook.upsertUsage(eq("run-bf"), any())).thenReturn(true);
+        when(eventHook.emitTerminalEvent(eq("run-bf"), any())).thenReturn(true);
+
+        ToolJobFinalizer finalizer = new ToolJobFinalizer(anchorService, redisCache,
+                capacityService, resumeService, mock(ToolJobConfig.class));
+        inject(finalizer, "usageHook", usageHook);
+        inject(finalizer, "eventHook", eventHook);
+
+        String reservationJson = buildReleasedJson("run-bf", "tc-bf", 1, "task-bf");
+        String estimateJson = "{\"estimatedRows\":1000,\"estimatedBytes\":10000,\"fileCount\":1,"
+                + "\"selectedColumnRatio\":0.5,\"manifestMemberCount\":1,"
+                + "\"heavyOperationHints\":[],\"resourceClass\":\"STANDARD\",\"capacityUnits\":1}";
+
+        // === Call 1: legacy result without retryable → fail-closed ===
+        TaskResultResponse legacyResp = TaskResultResponse.newBuilder()
+                .setStatus("FAILED")
+                .setError("execution_error")
+                .setResourceUsage(SandboxResourceUsage.newBuilder()
+                        .setExitReason("EXECUTION_ERROR").build())
+                .build(); // no setRetryable
+
+        ToolJobAnchor anchor1 = new ToolJobAnchor();
+        anchor1.setOperationId("run-bf:tc-bf:1");
+        anchor1.setToolCallId("tc-bf");
+        anchor1.setAttempt(1);
+        anchor1.setTaskId("task-bf");
+        anchor1.setAutoResume(true);
+
+        finalizer.handleTerminal("run-bf", anchor1, "FAILED", legacyResp, true);
+
+        assertThat(anchor1.getTerminalRetryable()).isNull();
+        assertThat(anchor1.getFinalizerError()).isEqualTo("terminal_retryability_missing");
+        verifyNoInteractions(capacityService);
+
+        // === Call 2: refetch with retryable → backfill → full pipeline ===
+        TaskResultResponse refetchedResp = TaskResultResponse.newBuilder()
+                .setStatus("FAILED")
+                .setError("execution_error")
+                .setRetryable(false)
+                .setResourceUsage(SandboxResourceUsage.newBuilder()
+                        .setExitReason("EXECUTION_ERROR").build())
+                .build();
+
+        // Simulate DB reload: ENVELOPE step is done, terminalRetryable still null
+        ToolJobAnchor anchor2 = new ToolJobAnchor();
+        anchor2.setOperationId("run-bf:tc-bf:1");
+        anchor2.setToolCallId("tc-bf");
+        anchor2.setAttempt(1);
+        anchor2.setTaskId("task-bf");
+        anchor2.setAutoResume(true);
+        anchor2.setFinalizerStep("ENVELOPE");
+        anchor2.setFinalizerError("terminal_retryability_missing");
+        anchor2.setTerminalStatus("FAILED");
+        anchor2.setEstimateJson(estimateJson);
+        anchor2.setReservationJson(reservationJson);
+
+        finalizer.handleTerminal("run-bf", anchor2, "FAILED", refetchedResp, true);
+
+        // Backfill succeeded: terminalRetryable set, diagnostic cleared
+        assertThat(anchor2.getTerminalRetryable()).isFalse();
+        assertThat(anchor2.getFinalizerError()).isNull();
+        // Pipeline completed through RESUME_READY
+        verify(anchorService, atLeast(4)).updateAnchor(eq("run-bf"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.WAITING_TOOL_JOB));
+        verify(anchorService).updateAnchorAndStatus(eq("run-bf"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.WAITING_TOOL_JOB));
+        verify(resumeService).tryResume("run-bf");
     }
 
     // ===== RESULT_LOST synthetic classification =====

@@ -96,6 +96,25 @@ public class ToolJobFinalizer {
             }
         }
 
+        // Backfill: refetch may deliver retryable after ENVELOPE was already persisted
+        if (anchor.getTerminalRetryable() == null && isStepDone(anchor, STEP_ENVELOPE)) {
+            boolean backfilled = false;
+            if (resultResp != null && resultResp.hasRetryable()) {
+                anchor.setTerminalRetryable(resultResp.getRetryable());
+                backfilled = true;
+            } else if (resultResp == null && "RESULT_LOST".equals(terminalStatus)) {
+                anchor.setTerminalRetryable(false);
+                backfilled = true;
+            }
+            if (backfilled) {
+                anchor.setFinalizerError(null); // clear missing diagnostic
+                if (!anchorService.updateAnchor(runId, anchor, AgentRunStatus.WAITING_TOOL_JOB)) {
+                    log.warn("terminalRetryable backfill CAS failed for run={}", runId);
+                    return;
+                }
+            }
+        }
+
         // Fail-closed gate: terminalRetryable must be present before RELEASE
         if (anchor.getTerminalRetryable() == null) {
             log.warn("terminalRetryable missing for run={}, fail-closed before RELEASE", runId);
