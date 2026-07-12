@@ -358,6 +358,109 @@ class ToolJobFinalizerRetryableTest {
                 eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.WAITING_TOOL_JOB));
     }
 
+    // ===== backfill branches =====
+
+    @Test
+    void envelopeDoneThenResultLostBackfill_falseContinuesPipeline() throws Exception {
+        ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
+        DataAnalysisCapacityService capacityService = mock(DataAnalysisCapacityService.class);
+        when(capacityService.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(capacityService.releaseReservation(any())).thenReturn(DataAnalysisReleaseOutcome.RELEASED);
+        ToolJobResumeService resumeService = mock(ToolJobResumeService.class);
+        ToolJobUsageHook usageHook = mock(ToolJobUsageHook.class);
+        ToolJobEventHook eventHook = mock(ToolJobEventHook.class);
+        when(usageHook.upsertUsage(eq("run-rlb"), any())).thenReturn(true);
+        when(eventHook.emitTerminalEvent(eq("run-rlb"), any())).thenReturn(true);
+
+        // ENVELOPE already done → backfill writes false → RELEASE/USAGE/EVENT/CAS/READY
+        when(anchorService.updateAnchor(eq("run-rlb"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.WAITING_TOOL_JOB)))
+                .thenReturn(true)   // backfill
+                .thenReturn(true)   // RELEASE
+                .thenReturn(true)   // USAGE
+                .thenReturn(true);  // EVENT
+        when(anchorService.updateAnchor(eq("run-rlb"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.RECEIVED))).thenReturn(true);
+        when(anchorService.updateAnchorAndStatus(eq("run-rlb"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.WAITING_TOOL_JOB)))
+                .thenReturn(true);
+
+        ToolJobFinalizer finalizer = new ToolJobFinalizer(anchorService, mock(ToolJobRedisCache.class),
+                capacityService, resumeService, mock(ToolJobConfig.class));
+        inject(finalizer, "usageHook", usageHook);
+        inject(finalizer, "eventHook", eventHook);
+
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId("run-rlb:tc-rlb:1");
+        anchor.setToolCallId("tc-rlb");
+        anchor.setAttempt(1);
+        anchor.setTaskId("task-rlb");
+        anchor.setAutoResume(true);
+        anchor.setFinalizerStep("ENVELOPE"); // ENVELOPE already persisted
+        anchor.setTerminalRetryable(null);   // missing
+        anchor.setEstimateJson("{\"estimatedRows\":1000,\"estimatedBytes\":10000,\"fileCount\":1,"
+                + "\"selectedColumnRatio\":0.5,\"manifestMemberCount\":1,"
+                + "\"heavyOperationHints\":[],\"resourceClass\":\"STANDARD\",\"capacityUnits\":1}");
+        anchor.setReservationJson(buildReleasedJson("run-rlb", "tc-rlb", 1, "task-rlb"));
+
+        // RESULT_LOST: resultResp=null, terminalStatus=RESULT_LOST
+        finalizer.handleTerminal("run-rlb", anchor, "RESULT_LOST", null, true);
+
+        // Backfill wrote explicit false
+        assertThat(anchor.getTerminalRetryable()).isFalse();
+        // Pipeline completed
+        verify(anchorService).updateAnchorAndStatus(eq("run-rlb"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.WAITING_TOOL_JOB));
+        verify(resumeService).tryResume("run-rlb");
+    }
+
+    @Test
+    void backfillUpdateAnchorFails_doesNotReleaseCapacity() throws Exception {
+        ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
+        DataAnalysisCapacityService capacityService = mock(DataAnalysisCapacityService.class);
+        ToolJobResumeService resumeService = mock(ToolJobResumeService.class);
+        ToolJobUsageHook usageHook = mock(ToolJobUsageHook.class);
+        ToolJobEventHook eventHook = mock(ToolJobEventHook.class);
+
+        // backfill updateAnchor FAILS
+        when(anchorService.updateAnchor(eq("run-bff"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.WAITING_TOOL_JOB)))
+                .thenReturn(false); // backfill write fails
+
+        ToolJobFinalizer finalizer = new ToolJobFinalizer(anchorService, mock(ToolJobRedisCache.class),
+                capacityService, resumeService, mock(ToolJobConfig.class));
+        inject(finalizer, "usageHook", usageHook);
+        inject(finalizer, "eventHook", eventHook);
+
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId("run-bff:tc-bff:1");
+        anchor.setToolCallId("tc-bff");
+        anchor.setAttempt(1);
+        anchor.setTaskId("task-bff");
+        anchor.setAutoResume(true);
+        anchor.setFinalizerStep("ENVELOPE");
+        anchor.setTerminalRetryable(null);
+
+        TaskResultResponse resp = TaskResultResponse.newBuilder()
+                .setStatus("FAILED")
+                .setRetryable(true)
+                .setResourceUsage(SandboxResourceUsage.newBuilder()
+                        .setExitReason("OOM_KILLED").build())
+                .build();
+
+        finalizer.handleTerminal("run-bff", anchor, "FAILED", resp, true);
+
+        // Backfill attempted but CAS failed → returned without modifying in-memory state
+        verify(anchorService, times(1)).updateAnchor(eq("run-bff"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.WAITING_TOOL_JOB));
+        // Never proceeded to RELEASE
+        verifyNoInteractions(capacityService);
+        verify(usageHook, never()).upsertUsage(any(), any());
+        verify(eventHook, never()).emitTerminalEvent(any(), any());
+        verify(resumeService, never()).tryResume(any());
+        verify(anchorService, never()).updateAnchorAndStatus(any(), any(), any(), any());
+    }
+
     // ===== helpers =====
 
     private static void inject(Object target, String name, Object value) throws Exception {
