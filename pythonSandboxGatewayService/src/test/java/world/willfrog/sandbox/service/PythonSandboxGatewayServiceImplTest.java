@@ -1,12 +1,36 @@
 package world.willfrog.sandbox.service;
 
 import org.junit.jupiter.api.Test;
+import world.willfrog.alphafrogmicro.sandbox.idl.ExecuteRequest;
 
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 class PythonSandboxGatewayServiceImplTest {
+
+    @Test
+    void canonicalCreateComponentsShouldKeepFrozenProtoNumbers() {
+        assertEquals(19, ExecuteRequest.CANONICALSPECSCHEMAVERSION_FIELD_NUMBER);
+        assertEquals(20, ExecuteRequest.CODEHASH_FIELD_NUMBER);
+        assertEquals(21, ExecuteRequest.IMMUTABLEDATASETSNAPSHOTDIGEST_FIELD_NUMBER);
+        assertEquals(22, ExecuteRequest.LIBRARIESDIGEST_FIELD_NUMBER);
+        assertEquals(23, ExecuteRequest.SANDBOXOPTIONSDIGEST_FIELD_NUMBER);
+
+        ExecuteRequest request = ExecuteRequest.newBuilder()
+                .setCanonicalSpecSchemaVersion("sandbox_create_v1")
+                .setCodeHash("sha256:" + "a".repeat(64))
+                .setImmutableDatasetSnapshotDigest("sha256:" + "b".repeat(64))
+                .setLibrariesDigest("sha256:" + "c".repeat(64))
+                .setSandboxOptionsDigest("sha256:" + "d".repeat(64))
+                .build();
+
+        assertEquals("sandbox_create_v1", request.getCanonicalSpecSchemaVersion());
+        assertEquals("sha256:" + "a".repeat(64), request.getCodeHash());
+        assertEquals("sha256:" + "b".repeat(64), request.getImmutableDatasetSnapshotDigest());
+        assertEquals("sha256:" + "c".repeat(64), request.getLibrariesDigest());
+        assertEquals("sha256:" + "d".repeat(64), request.getSandboxOptionsDigest());
+    }
 
     @Test
     void extractTimingFieldsShouldExposeSandboxPhaseTimings() {

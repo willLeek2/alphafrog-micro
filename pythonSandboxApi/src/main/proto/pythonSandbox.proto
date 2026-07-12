@@ -29,6 +29,13 @@ message ExecuteRequest {
   int64 memoryLimitBytes = 16;
   int64 timeoutMillis = 17;
   string runtimeEnvironmentVersion = 18;
+  // CanonicalSandboxCreateSpec 剩余组件。Sandbox 必须结合 14/9/16/17/18
+  // 按共享 UTF-8 length-prefix 契约重算 requestFingerprint，不得直接信任字段 15。
+  string canonicalSpecSchemaVersion = 19;
+  string codeHash = 20;
+  string immutableDatasetSnapshotDigest = 21;
+  string librariesDigest = 22;
+  string sandboxOptionsDigest = 23;
 }
 
 message ExecuteResponse {
