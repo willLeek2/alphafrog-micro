@@ -12,6 +12,7 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ValueOperations;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.entity.AgentRunEvent;
 import world.willfrog.agent.platform.mapper.AgentRunEventMapper;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 
@@ -24,6 +25,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -98,6 +100,49 @@ class AgentEventServiceTest {
                 .convertAndSend(anyString(), anyString());
 
         Assertions.assertDoesNotThrow(() -> service.append("r1", "u1", "PLAN_READY", Map.of("ok", true)));
+    }
+
+    @Test
+    void appendOnce_shouldPersistAndPublishFirstLogicalEvent() {
+        when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(run("r1", "u1"));
+        when(redisTemplate.opsForValue()).thenReturn(valueOperations);
+        when(valueOperations.increment("agent:run:event_seq:r1")).thenReturn(8L);
+        when(eventMapper.insertOnce(any())).thenReturn(1);
+
+        boolean inserted = service.appendOnce(
+                "r1", "u1", "TOOL_CALL_FINISHED", "r1:tc1:logical_terminal", Map.of("success", true));
+
+        assertTrue(inserted);
+        ArgumentCaptor<AgentRunEvent> eventCaptor = ArgumentCaptor.forClass(AgentRunEvent.class);
+        verify(eventMapper).insertOnce(eventCaptor.capture());
+        assertEquals("r1:tc1:logical_terminal", eventCaptor.getValue().getDedupeKey());
+        assertEquals(8, eventCaptor.getValue().getSeq());
+        verify(eventRedisStore).append(eventCaptor.getValue());
+        verify(eventRedisStore).flush("r1");
+        verify(redisTemplate).convertAndSend(eq("agent:events:r1"), anyString());
+    }
+
+    @Test
+    void appendOnce_shouldHealRedisWithoutRepublishingDuplicate() {
+        when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(run("r1", "u1"));
+        when(redisTemplate.opsForValue()).thenReturn(valueOperations);
+        when(valueOperations.increment("agent:run:event_seq:r1")).thenReturn(9L);
+        when(eventMapper.insertOnce(any())).thenReturn(0);
+        AgentRunEvent persisted = new AgentRunEvent();
+        persisted.setRunId("r1");
+        persisted.setSeq(4);
+        persisted.setEventType("TOOL_CALL_FINISHED");
+        persisted.setDedupeKey("r1:tc1:logical_terminal");
+        persisted.setPayloadJson("{\"success\":true}");
+        when(eventMapper.findByRunIdAndDedupeKey("r1", "r1:tc1:logical_terminal")).thenReturn(persisted);
+
+        boolean inserted = service.appendOnce(
+                "r1", "u1", "TOOL_CALL_FINISHED", "r1:tc1:logical_terminal", Map.of("success", true));
+
+        assertFalse(inserted);
+        verify(eventRedisStore).append(persisted);
+        verify(eventRedisStore, never()).flush(anyString());
+        verify(redisTemplate, never()).convertAndSend(anyString(), anyString());
     }
 
     @Test

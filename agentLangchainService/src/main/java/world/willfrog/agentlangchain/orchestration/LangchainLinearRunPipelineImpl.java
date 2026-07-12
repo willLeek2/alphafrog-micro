@@ -283,6 +283,21 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                     ? dagWorkflowExecutor.executePlanned(workflowRequest, plan)
                     : linearWorkflowExecutor.executePlanned(workflowRequest, plan);
 
+            if (result.isSuspended()) {
+                Map<String, Object> payload = new LinkedHashMap<>();
+                payload.put("run_id", runId);
+                payload.put("tool_call_id", nvl(result.getPendingToolCallId()));
+                payload.put("attempt", result.getPendingAttempt());
+                payload.put("todo_id", nvl(result.getSuspendedTodoId()));
+                payload.put("todo_sequence", result.getSuspendedTodoSequence() == null
+                        ? 0 : result.getSuspendedTodoSequence());
+                payload.put("workflow", useDag ? "dag" : "linear");
+                eventService.append(runId, userId, "TOOL_CALL_SUSPENDED", payload);
+                log.info("LangChain run {} suspended for external tool job {}",
+                        runId, result.getPendingToolCallId());
+                return;
+            }
+
             // cancel/pause 可能发生在 todo 执行和最终落库之间。
             // 这里再次检查，避免用户已经取消后 pipeline 又把 run 覆盖成 COMPLETED/FAILED。
             if (result.isInterrupted() || abortIfStopped(runId, userId, "before_persist")) {

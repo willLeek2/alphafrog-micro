@@ -130,6 +130,23 @@ public class LangchainLinearWorkflowExecutor {
             LangchainTodoNodeResult nodeResult = todoNodeExecutor.execute(
                     request, item, completedTodos, datasetRefs, toolCalls);
             long nodeDurationMs = System.currentTimeMillis() - nodeStartMs;
+            if (nodeResult.isSuspended()) {
+                emitTodoNodeEvent(request.getRunId(), request.getUserId(),
+                        "TODO_NODE_SUSPENDED", item, "external_tool_job_pending", nodeDurationMs,
+                        null, false, null);
+                return LangchainLinearWorkflowResult.builder()
+                        .success(false)
+                        .suspended(true)
+                        .plan(plan)
+                        .completedTodos(completedTodos)
+                        .toolCallsUsed(toolCalls.get())
+                        .suspendedTodoId(item.getId())
+                        .suspendedTodoSequence(item.getSequence())
+                        .pendingRunId(nodeResult.getPendingRunId())
+                        .pendingToolCallId(nodeResult.getPendingToolCallId())
+                        .pendingAttempt(nodeResult.getPendingAttempt())
+                        .build();
+            }
             if (!nodeResult.isSuccess()) {
                 String reason = nvl(nodeResult.getFailureReason(), nodeResult.getSummary());
                 Map<String, Object> failureMetadata = nodeResult.getFailureMetadata();

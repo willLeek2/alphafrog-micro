@@ -10,6 +10,7 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingException;
 import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agent.tools.router.ToolRouter;
 import world.willfrog.agentlangchain.config.LangchainToolConcurrencyThrottle;
@@ -161,6 +162,26 @@ class ToolRouterToolExecutorTest {
         assertEquals("getStockInfo", finishedPayload.get("tool_name"));
         assertEquals(false, finishedPayload.get("success"));
         assertEquals("API timeout", finishedPayload.get("result_preview"));
+    }
+
+    @Test
+    void execute_pendingToolCall_rethrowsWithoutFinishedEvent() {
+        ToolExecutionRequest request = ToolExecutionRequest.builder()
+                .id("tool-call-pending")
+                .name("executePython")
+                .arguments("{\"code\":\"print(1)\"}")
+                .build();
+        ExternalToolJobPendingException pending =
+                new ExternalToolJobPendingException("run-123", "tool-call-pending", 1, "external job pending");
+        when(toolRouter.invokeWithMeta("executePython", Map.of("code", "print(1)"))).thenThrow(pending);
+
+        ExternalToolJobPendingException thrown = assertThrows(
+                ExternalToolJobPendingException.class,
+                () -> executor.execute(request, null));
+
+        assertSame(pending, thrown);
+        verify(eventService).append(eq("run-123"), eq("user-456"), eq("TOOL_CALL_STARTED"), any());
+        verify(eventService, never()).append(eq("run-123"), eq("user-456"), eq("TOOL_CALL_FINISHED"), any());
     }
 
     @Test

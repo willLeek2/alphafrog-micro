@@ -6,16 +6,21 @@ import dev.langchain4j.model.chat.request.ChatRequest;
 import dev.langchain4j.model.chat.response.ChatResponse;
 import org.junit.jupiter.api.Test;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingException;
 import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.workflow.TodoItem;
+import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
 import world.willfrog.agentlangchain.support.LangchainTestFixtures;
 
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class LangchainLinearWorkflowExecutorTest {
@@ -130,6 +135,65 @@ class LangchainLinearWorkflowExecutorTest {
                 .contains("dataset-hs300")
                 .contains("run-level dataset_ids/manifest_ids")
                 .contains("listMyData");
+    }
+
+    @Test
+    void executePlanned_shouldReturnSuspendedAtCurrentTodo() {
+        LangchainTodoNodeExecutor nodeExecutor = mock(LangchainTodoNodeExecutor.class);
+        AgentEventService events = mock(AgentEventService.class);
+        ExternalToolJobPendingException pending =
+                new ExternalToolJobPendingException("run-pending", "tc-pending", 3, "pending");
+        when(nodeExecutor.execute(any(), any(), any(), any(), any()))
+                .thenReturn(LangchainTodoNodeResult.suspended(pending));
+        LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
+                LangchainTestFixtures.planner(), nodeExecutor, noopExecutionGuard(), events);
+        TodoItem todo = TodoItem.builder().id("todo_2").sequence(2).description("long python").build();
+        LangchainTodoPlan plan = LangchainTodoPlan.builder().items(List.of(todo)).build();
+
+        LangchainLinearWorkflowResult result = executor.executePlanned(
+                LangchainLinearWorkflowRequest.builder()
+                        .runId("run-pending")
+                        .userId("user-1")
+                        .userGoal("analyze")
+                        .model(new QueueChatModel("unused"))
+                        .build(),
+                plan);
+
+        assertThat(result.isSuspended()).isTrue();
+        assertThat(result.getSuspendedTodoId()).isEqualTo("todo_2");
+        assertThat(result.getPendingToolCallId()).isEqualTo("tc-pending");
+        assertThat(result.getPendingAttempt()).isEqualTo(3);
+        verify(events).append(org.mockito.ArgumentMatchers.eq("run-pending"),
+                org.mockito.ArgumentMatchers.eq("user-1"),
+                org.mockito.ArgumentMatchers.eq("TODO_NODE_SUSPENDED"), any());
+    }
+
+    @Test
+    void todoNodeExecutor_shouldConvertWrappedPendingIntoSuspendedResult() {
+        ExternalToolJobPendingException pending =
+                new ExternalToolJobPendingException("run-pending", "tc-pending", 2, "pending");
+        ChatModel pendingModel = new ChatModel() {
+            @Override
+            public ChatResponse doChat(ChatRequest request) {
+                throw new RuntimeException("lc4j wrapper", pending);
+            }
+        };
+
+        LangchainTodoNodeResult result = LangchainTestFixtures.todoNodeExecutor().execute(
+                LangchainLinearWorkflowRequest.builder()
+                        .runId("run-pending")
+                        .userId("user-1")
+                        .userGoal("analyze")
+                        .model(pendingModel)
+                        .build(),
+                TodoItem.builder().id("todo_2").sequence(2).description("long python").build(),
+                List.of(),
+                new java.util.LinkedHashMap<>(),
+                new AtomicInteger());
+
+        assertThat(result.isSuspended()).isTrue();
+        assertThat(result.getPendingToolCallId()).isEqualTo("tc-pending");
+        assertThat(result.getPendingAttempt()).isEqualTo(2);
     }
 
     static class QueueChatModel implements ChatModel {

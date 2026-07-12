@@ -30,10 +30,73 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class LangchainLinearRunPipelinePlanReadyTest {
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void executeRun_shouldEmitSuspendedAndNotPersistTerminalState() {
+        AgentRunMapper runMapper = mock(AgentRunMapper.class);
+        AgentEventService eventService = mock(AgentEventService.class);
+        AgentRunStateStore stateStore = mock(AgentRunStateStore.class);
+        LangchainRunStageModelResolver stageModelResolver = mock(LangchainRunStageModelResolver.class);
+        LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
+        LangchainLinearWorkflowExecutor linear = mock(LangchainLinearWorkflowExecutor.class);
+        LangchainRunExecutionGuard executionGuard = mock(LangchainRunExecutionGuard.class);
+        AgentRun run = new AgentRun();
+        run.setId("run-pending-1");
+        run.setUserId("user-1");
+        run.setExt("{}");
+        when(runMapper.findById("run-pending-1")).thenReturn(run);
+        when(eventService.isRunnable("run-pending-1", "user-1")).thenReturn(true);
+        when(eventService.extractRunConfig("{}")).thenReturn(AgentEventService.RunConfig.defaults());
+        when(eventService.extractUserGoal("{}")).thenReturn("goal");
+        when(stageModelResolver.resolve(run)).thenReturn(new LangchainRunStageModelResolver.StageModels(
+                null, null, null, "openrouter", "kimi", List.of()));
+        when(executionGuard.stopReason(any(), any())).thenReturn(Optional.empty());
+        LangchainTodoPlan plan = LangchainTodoPlan.builder()
+                .executionMode(PlanExecutionMode.LINEAR)
+                .items(List.of(TodoItem.builder().id("todo_2").sequence(2).description("python").build()))
+                .build();
+        when(planner.plan(any())).thenReturn(plan);
+        when(linear.executePlanned(any(), eq(plan))).thenReturn(LangchainLinearWorkflowResult.builder()
+                .success(false)
+                .suspended(true)
+                .plan(plan)
+                .suspendedTodoId("todo_2")
+                .suspendedTodoSequence(2)
+                .pendingToolCallId("tc-pending")
+                .pendingAttempt(1)
+                .build());
+        ObjectProvider<AgentRunStateStore> stateStoreProvider = mock(ObjectProvider.class);
+        when(stateStoreProvider.getIfAvailable()).thenReturn(stateStore);
+        LangchainFollowUpContextSupport followUp = mock(LangchainFollowUpContextSupport.class);
+        when(followUp.resolve(run)).thenReturn(new LangchainFollowUpContextSupport.ExecutionContext("goal", ""));
+        AgentCreditService creditService = mock(AgentCreditService.class);
+        when(creditService.hasPositiveCredit("user-1")).thenReturn(true);
+        LangchainLinearRunPipelineImpl pipeline = new LangchainLinearRunPipelineImpl(
+                planner, linear, mock(LangchainDagWorkflowExecutor.class), stageModelResolver,
+                runMapper, eventService, new ObjectMapper(), mock(ObjectProvider.class), stateStoreProvider,
+                mock(ObjectProvider.class), new LangchainFailureMapper(), followUp,
+                mock(world.willfrog.agent.platform.service.AgentMessageService.class), executionGuard,
+                immediateScheduler(), creditService, mock(AgentRunCreditSettlementService.class),
+                mock(world.willfrog.agent.platform.event.AgentRunFinalizationService.class),
+                mock(ObjectProvider.class), mock(ObjectProvider.class));
+
+        pipeline.executeRun(run);
+
+        ArgumentCaptor<Object> payload = ArgumentCaptor.forClass(Object.class);
+        verify(eventService).append(eq("run-pending-1"), eq("user-1"),
+                eq("TOOL_CALL_SUSPENDED"), payload.capture());
+        assertThat((Map<String, Object>) payload.getValue())
+                .containsEntry("tool_call_id", "tc-pending")
+                .containsEntry("todo_id", "todo_2")
+                .containsEntry("todo_sequence", 2);
+        verify(runMapper, never()).updateSnapshot(any(), any(), any(), any(), anyBoolean(), any());
+    }
 
     @Test
     @SuppressWarnings("unchecked")

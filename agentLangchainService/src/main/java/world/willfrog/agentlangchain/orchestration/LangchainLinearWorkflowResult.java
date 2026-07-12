@@ -16,6 +16,8 @@ public class LangchainLinearWorkflowResult {
     private boolean partial;
     /** True when canceled/paused mid-flight; pipeline must not overwrite control terminal state. */
     private boolean interrupted;
+    /** External tool job is still running; the pipeline must preserve WAITING_TOOL_JOB. */
+    private boolean suspended;
     private String failureReason;
     private String finalAnswer;
     private LangchainTodoPlan plan;
@@ -36,4 +38,9 @@ public class LangchainLinearWorkflowResult {
      * 把它路由到 WORKFLOW_FAILED event payload 的 {@code budget_failure} / {@code empty_output_observation} / {@code failure_metadata} 之一。
      */
     private Map<String, Object> failureMetadata;
+    private String suspendedTodoId;
+    private Integer suspendedTodoSequence;
+    private String pendingRunId;
+    private String pendingToolCallId;
+    private int pendingAttempt;
 }
