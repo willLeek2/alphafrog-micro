@@ -106,6 +106,57 @@ class LangchainLinearWorkflowResumeTest {
         verify(nodeExecutor, never()).writeFinalAnswer(any(), any());
     }
 
+    @Test
+    void restartAfterAcceptedHandoffDoesNotRepeatCurrentToolCall() {
+        LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
+        LangchainTodoNodeExecutor nodeExecutor = mock(LangchainTodoNodeExecutor.class);
+        LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
+        when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
+        when(nodeExecutor.execute(any(), any(), any(), any(), any()))
+                .thenReturn(LangchainTodoNodeResult.success("todo-3-output", 6));
+        when(nodeExecutor.writeFinalAnswer(any(), any())).thenReturn("final-answer");
+        LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
+                planner, nodeExecutor, guard, mock(AgentEventService.class));
+        LangchainTodoPlan plan = LangchainTodoPlan.builder()
+                .executionMode(PlanExecutionMode.LINEAR)
+                .items(List.of(item("todo-2", 2), item("todo-3", 3)))
+                .build();
+        ToolJobResumeContext first = new ToolJobResumeContext();
+        first.setRunId("run-1");
+        first.setTodoId("todo-2");
+        first.setTerminalSuccess(true);
+        first.setTerminalResultPreview("terminal-preview");
+
+        LangchainLinearWorkflowResult crashed = executor.resumePlanned(
+                request(), plan, first, () -> false);
+        assertThat(crashed.getFailureReason()).isEqualTo("resume_result_consume_failed");
+        assertThat(first.isResultConsumed()).isTrue();
+        assertThat(first.getTodoId()).isEqualTo("todo-3");
+        assertThat(first.getCompletedTodos()).extracting(CompletedTodoRecord::getTodoId)
+                .containsExactly("todo-2");
+
+        ToolJobResumeContext restarted = new ToolJobResumeContext();
+        restarted.setRunId("run-1");
+        restarted.setTodoId(first.getTodoId());
+        restarted.setTodoSequence(first.getTodoSequence());
+        restarted.setCompletedTodos(first.getCompletedTodos());
+        restarted.setResultConsumed(true);
+        restarted.setTerminalSuccess(true);
+        AtomicInteger consumedAgain = new AtomicInteger();
+        LangchainLinearWorkflowResult resumed = executor.resumePlanned(
+                request(), plan, restarted, () -> {
+                    consumedAgain.incrementAndGet();
+                    return true;
+                });
+
+        assertThat(resumed.isSuccess()).isTrue();
+        assertThat(consumedAgain.get()).isZero();
+        ArgumentCaptor<TodoItem> executed = ArgumentCaptor.forClass(TodoItem.class);
+        verify(nodeExecutor, times(1)).execute(any(), executed.capture(), any(), any(), any());
+        assertThat(executed.getValue().getId()).isEqualTo("todo-3");
+        verifyNoInteractions(planner);
+    }
+
     private static TodoItem item(String id, int sequence) {
         return TodoItem.builder().id(id).sequence(sequence).description(id + "-description").build();
     }

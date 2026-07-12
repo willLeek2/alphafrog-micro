@@ -39,6 +39,7 @@ import world.willfrog.agentlangchain.tools.LangchainToolInvocationKeys;
 import world.willfrog.agentlangchain.tooljob.ToolJobCheckpointRequest;
 import world.willfrog.agentlangchain.tooljob.ToolJobCheckpointWriter;
 import world.willfrog.agentlangchain.tooljob.ToolJobResumeContext;
+import world.willfrog.agentlangchain.tooljob.ToolJobAnchorService;
 
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -99,6 +100,9 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
 
     @Autowired(required = false)
     private ToolJobCheckpointWriter toolJobCheckpointWriter;
+
+    @Autowired(required = false)
+    private ToolJobAnchorService toolJobAnchorService;
 
     public LangchainLinearRunPipelineImpl(LangchainAiPlanner planner,
                                           LangchainLinearWorkflowExecutor linearWorkflowExecutor,
@@ -321,6 +325,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 if (!persistToolJobCheckpoint(runId, result)) {
                     log.error("Durable tool-job checkpoint failed for run={} todo={}",
                             runId, result.getSuspendedTodoId());
+                    recordCheckpointFailure(runId, userId, result);
+                    return;
                 }
                 Map<String, Object> payload = new LinkedHashMap<>();
                 payload.put("run_id", runId);
@@ -495,16 +501,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                     "planner_skipped", true
             ));
 
-            BooleanSupplier consumeAndEnterExecution = () -> {
-                if (terminalConsumed == null || !terminalConsumed.getAsBoolean()) {
-                    return false;
-                }
-                runMapper.updateStatus(runId, userId, AgentRunStatus.EXECUTING);
-                markRunStatus(runId, AgentRunStatus.EXECUTING);
-                return true;
-            };
             LangchainLinearWorkflowResult result = linearWorkflowExecutor.resumePlanned(
-                    workflowRequest, plan, resumeContext, consumeAndEnterExecution);
+                    workflowRequest, plan, resumeContext, terminalConsumed);
             persistResumedResult(run, userGoal, stageModels, result);
         } catch (Exception e) {
             log.error("Resumed LangChain run failed: runId={}", runId, e);
@@ -535,7 +533,10 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         String runId = run.getId();
         String userId = run.getUserId();
         if (result.isSuspended()) {
-            persistToolJobCheckpoint(runId, result);
+            if (!persistToolJobCheckpoint(runId, result)) {
+                recordCheckpointFailure(runId, userId, result);
+                return;
+            }
             eventService.append(runId, userId, "TOOL_CALL_SUSPENDED", Map.of(
                     "run_id", runId,
                     "tool_call_id", nvl(result.getPendingToolCallId()),
@@ -647,6 +648,37 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             log.error("Failed to persist tool-job checkpoint runId={}: {}", runId, e.getMessage());
             return false;
         }
+    }
+
+    private void recordCheckpointFailure(String runId,
+                                         String userId,
+                                         LangchainLinearWorkflowResult result) {
+        boolean durable = false;
+        try {
+            AgentRun latest = runMapper.findById(runId);
+            if (toolJobAnchorService != null && latest != null
+                    && !isBlank(latest.getToolJobAnchorJson())) {
+                ToolJobAnchor anchor = ToolJobAnchor.fromJson(latest.getToolJobAnchorJson());
+                anchor.setAutoResume(false);
+                anchor.setRunDisposition("CHECKPOINT_FAILED");
+                anchor.setFinalizerError("durable_checkpoint_write_failed");
+                durable = toolJobAnchorService.updateAnchor(
+                        runId, anchor, AgentRunStatus.WAITING_TOOL_JOB);
+            }
+        } catch (Exception e) {
+            log.error("Failed to persist checkpoint-failure disposition runId={}: {}",
+                    runId, e.getMessage());
+        }
+        String dedupeKey = runId + ":" + nvl(result.getPendingToolCallId())
+                + ":" + result.getPendingAttempt() + ":checkpoint_failed";
+        eventService.appendOnce(runId, userId, "TOOL_JOB_CHECKPOINT_FAILED", dedupeKey, Map.of(
+                "run_id", runId,
+                "tool_call_id", nvl(result.getPendingToolCallId()),
+                "attempt", result.getPendingAttempt(),
+                "todo_id", nvl(result.getSuspendedTodoId()),
+                "durable_failure_disposition", durable,
+                "retryable", durable
+        ));
     }
 
     private void persistPlan(String runId, String userId, LangchainTodoPlan plan) {

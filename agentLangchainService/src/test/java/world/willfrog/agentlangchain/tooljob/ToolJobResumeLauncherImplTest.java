@@ -23,7 +23,7 @@ class ToolJobResumeLauncherImplTest {
         ObjectProvider<ToolJobResumeService> provider = mock(ObjectProvider.class);
         ToolJobResumeService resumeService = mock(ToolJobResumeService.class);
         when(provider.getIfAvailable()).thenReturn(resumeService);
-        when(resumeService.markConsumed("run-1")).thenReturn(true);
+        when(resumeService.markHandoffAccepted(eq("run-1"), any())).thenReturn(true);
         AgentRun run = new AgentRun();
         run.setId("run-1");
         when(runMapper.findById("run-1")).thenReturn(run);
@@ -43,8 +43,9 @@ class ToolJobResumeLauncherImplTest {
         verify(pipeline, times(1)).launchResumedAsync(eq(run), same(context), any(), any());
 
         assertThat(consumed.get().getAsBoolean()).isTrue();
-        verify(resumeService).markConsumed("run-1");
+        verify(resumeService).markHandoffAccepted("run-1", context);
         completion.get().run();
+        verify(resumeService).completeHandoff("run-1", "token-1", 7);
         assertThat(launcher.isActive("run-1", "token-1", 7)).isFalse();
     }
 

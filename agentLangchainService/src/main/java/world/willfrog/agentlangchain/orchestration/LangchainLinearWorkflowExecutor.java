@@ -152,32 +152,43 @@ public class LangchainLinearWorkflowExecutor {
                 .map(LangchainCompletedTodo::getTodoId)
                 .filter(java.util.Objects::nonNull)
                 .collect(Collectors.toCollection(java.util.LinkedHashSet::new));
-        TodoItem suspendedItem = resumeContext == null ? null : plan.getItems().stream()
+        boolean handoffAccepted = resumeContext != null && resumeContext.isResultConsumed();
+        boolean resumeAtFinal = handoffAccepted
+                && ToolJobResumeContext.FINAL_TODO_ID.equals(resumeContext.getTodoId());
+        TodoItem suspendedItem = resumeContext == null || resumeAtFinal ? null : plan.getItems().stream()
                 .filter(item -> java.util.Objects.equals(item.getId(), resumeContext.getTodoId()))
                 .findFirst()
                 .orElse(null);
-        if (resumeContext != null && suspendedItem == null) {
+        if (resumeContext != null && suspendedItem == null && !resumeAtFinal) {
             return failure(plan, completedTodos, "resume_todo_not_in_plan", toolCalls.get(), null);
         }
+        int resumeSequence = resumeAtFinal ? Integer.MAX_VALUE : suspendedItem == null
+                ? Integer.MIN_VALUE : suspendedItem.getSequence();
         if (resumeContext != null && completedTodos.stream()
-                .anyMatch(todo -> todo.getSequence() >= suspendedItem.getSequence())) {
+                .anyMatch(todo -> todo.getSequence() >= resumeSequence)) {
             return failure(plan, completedTodos, "resume_completed_todo_out_of_order",
+                    toolCalls.get(), null);
+        }
+        if (handoffAccepted && !resumeContext.isTerminalSuccess()) {
+            return failure(plan, completedTodos, "external_tool_terminal_failure",
                     toolCalls.get(), null);
         }
         for (TodoItem item : plan.getItems()) {
             if (resumeContext != null && completedIds.contains(item.getId())) {
                 continue;
             }
-            if (resumeContext != null && item.getSequence() < suspendedItem.getSequence()) {
+            if (resumeContext != null && item.getSequence() < resumeSequence) {
                 continue;
             }
-            if (resumeContext != null && java.util.Objects.equals(item.getId(), suspendedItem.getId())) {
+            if (resumeContext != null && !handoffAccepted
+                    && java.util.Objects.equals(item.getId(), suspendedItem.getId())) {
                 long nodeStartMs = System.currentTimeMillis();
                 String injectedOutput = resumeTerminalOutput(resumeContext);
                 if (!resumeContext.isTerminalSuccess()) {
                     emitTodoNodeEvent(request.getRunId(), request.getUserId(),
                             "TODO_NODE_FAILED", item, "external_tool_terminal_failure", 0,
                             null, false, null);
+                    prepareAcceptedHandoff(resumeContext, plan, completedTodos, item, toolCalls.get(), false);
                     if (terminalConsumed == null || !terminalConsumed.getAsBoolean()) {
                         return failure(plan, completedTodos, "resume_result_consume_failed",
                                 toolCalls.get(), null);
@@ -197,6 +208,7 @@ public class LangchainLinearWorkflowExecutor {
                 emitTodoNodeEvent(request.getRunId(), request.getUserId(),
                         "TODO_NODE_COMPLETED", item, null,
                         System.currentTimeMillis() - nodeStartMs, null, false, null);
+                prepareAcceptedHandoff(resumeContext, plan, completedTodos, item, toolCalls.get(), true);
                 if (terminalConsumed == null || !terminalConsumed.getAsBoolean()) {
                     return failure(plan, completedTodos, "resume_result_consume_failed",
                             toolCalls.get(), null);
@@ -286,6 +298,33 @@ public class LangchainLinearWorkflowExecutor {
                 .completedTodos(completedTodos)
                 .toolCallsUsed(toolCalls.get())
                 .build();
+    }
+
+    private void prepareAcceptedHandoff(ToolJobResumeContext context,
+                                        LangchainTodoPlan plan,
+                                        List<LangchainCompletedTodo> completedTodos,
+                                        TodoItem current,
+                                        int toolCallsUsed,
+                                        boolean continueWorkflow) {
+        List<CompletedTodoRecord> records = completedTodos.stream().map(todo -> {
+            CompletedTodoRecord record = new CompletedTodoRecord();
+            record.setTodoId(todo.getTodoId());
+            record.setSequence(todo.getSequence());
+            record.setDescription(todo.getDescription());
+            record.setModelOutput(todo.getModelOutput());
+            record.setOutput(todo.getOutput());
+            record.setSummary(todo.getSummary());
+            return record;
+        }).toList();
+        context.setCompletedTodos(records);
+        context.setToolCallsUsed(toolCallsUsed);
+        TodoItem next = continueWorkflow ? plan.getItems().stream()
+                .filter(item -> item.getSequence() > current.getSequence())
+                .min(java.util.Comparator.comparingInt(TodoItem::getSequence))
+                .orElse(null) : null;
+        context.setTodoId(next == null ? ToolJobResumeContext.FINAL_TODO_ID : next.getId());
+        context.setTodoSequence(next == null ? current.getSequence() : next.getSequence());
+        context.setResultConsumed(true);
     }
 
     private List<LangchainCompletedTodo> restoreCompletedTodos(List<CompletedTodoRecord> records) {

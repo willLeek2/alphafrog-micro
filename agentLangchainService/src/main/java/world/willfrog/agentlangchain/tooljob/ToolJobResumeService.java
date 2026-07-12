@@ -214,6 +214,63 @@ public class ToolJobResumeService {
         return true;
     }
 
+    /**
+     * Persists the first half of the resume handoff. The terminal result has
+     * been accepted by the workflow, but the old anchor is deliberately kept
+     * until the resumed workflow has durably reached either a final result or
+     * a later tool-job checkpoint.
+     */
+    public boolean markHandoffAccepted(String runId, ToolJobResumeContext context) {
+        if (runId == null || runId.isBlank() || context == null || !runId.equals(context.getRunId())
+                || context.getResumeToken() == null || context.getResumeToken().isBlank()
+                || context.getResumeLeaseVersion() <= 0 || !context.isResultConsumed()
+                || context.getTodoId() == null || context.getTodoId().isBlank()
+                || context.getCompletedTodos() == null) {
+            return false;
+        }
+        ToolJobAnchor anchor = anchorService.loadAnchor(runId);
+        if (anchor == null || !"LAUNCHING".equals(anchor.getResumeState())
+                || !context.getResumeToken().equals(anchor.getResumeToken())
+                || context.getResumeLeaseVersion() != anchor.getResumeLeaseVersion()) {
+            return false;
+        }
+        try {
+            anchor.setCompletedTodosJson(objectMapper.writeValueAsString(context.getCompletedTodos()));
+        } catch (JsonProcessingException e) {
+            log.warn("Failed to serialize accepted resume handoff for run={}", runId, e);
+            return false;
+        }
+        anchor.setTodoId(context.getTodoId());
+        anchor.setSequence(context.getTodoSequence());
+        anchor.setToolCallsUsed(context.getToolCallsUsed());
+        anchor.setResultConsumed(true);
+        return anchorService.casResumeState(runId, anchor, AgentRunStatus.RECEIVED, "LAUNCHING",
+                context.getResumeToken(), context.getResumeLeaseVersion());
+    }
+
+    /**
+     * Clears only the exact old handoff claim, after the pipeline callback has
+     * returned from durable result/checkpoint persistence. A later suspension
+     * has a different state/token/version and is therefore never cleared here.
+     */
+    public boolean completeHandoff(String runId, String token, long version) {
+        ToolJobAnchor anchor = anchorService.loadAnchor(runId);
+        if (anchor == null) {
+            return true;
+        }
+        if (!"LAUNCHING".equals(anchor.getResumeState()) || !anchor.isResultConsumed()
+                || token == null || !token.equals(anchor.getResumeToken())
+                || version != anchor.getResumeLeaseVersion()) {
+            return false;
+        }
+        if (!anchorService.clearAnchorWithToken(runId, "LAUNCHING", token, version)) {
+            return false;
+        }
+        redisCache.removeDue(runId);
+        redisCache.deletePendingCache(runId);
+        return true;
+    }
+
     // ---- internal ----
 
     /** @return true if restore succeeded or no snapshot to restore */
@@ -237,6 +294,7 @@ public class ToolJobResumeService {
         ToolJobResumeContext ctx = new ToolJobResumeContext();
         ctx.setRunId(runId);
         ctx.setTodoId(anchor.getTodoId());
+        ctx.setTodoSequence(anchor.getSequence());
         ctx.setResumeToken(anchor.getResumeToken());
         ctx.setResumeLeaseVersion(anchor.getResumeLeaseVersion());
         ctx.setCompletedTodos(parseCompletedTodos(anchor.getCompletedTodosJson()));
@@ -246,6 +304,7 @@ public class ToolJobResumeService {
         ctx.setTerminalSuccess("SUCCEEDED".equals(anchor.getTerminalStatus()));
         ctx.setTerminalResultPreview(anchor.getTerminalResultPreview());
         ctx.setTerminalRawRef(anchor.getTerminalRawRef());
+        ctx.setResultConsumed(anchor.isResultConsumed());
         return ctx;
     }
 

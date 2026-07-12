@@ -18,6 +18,7 @@ import world.willfrog.agentlangchain.planning.LangchainAiPlanner;
 import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
 import world.willfrog.agentlangchain.tooljob.ToolJobCheckpointRequest;
 import world.willfrog.agentlangchain.tooljob.ToolJobCheckpointWriter;
+import world.willfrog.agentlangchain.tooljob.ToolJobAnchorService;
 
 import java.lang.reflect.Field;
 import java.util.List;
@@ -109,5 +110,26 @@ class LangchainLinearRunPipelineCheckpointTest {
         assertThat(request.getValue().getDatasetSnapshotDigest())
                 .isEqualTo(AgentRunDatasetSnapshot.empty().immutableDigest());
         assertThat(request.getValue().getToolCallsUsed()).isEqualTo(3);
+
+        reset(events);
+        when(runMapper.findById("run-1")).thenReturn(run, anchored);
+        when(events.isRunnable("run-1", "user-1")).thenReturn(true);
+        when(events.extractRunConfig("{}")).thenReturn(AgentEventService.RunConfig.defaults());
+        when(writer.captureAndSave(any())).thenReturn(false);
+        ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
+        when(anchorService.updateAnchor(eq("run-1"), any(ToolJobAnchor.class),
+                eq(world.willfrog.agent.platform.model.AgentRunStatus.WAITING_TOOL_JOB)))
+                .thenReturn(true);
+        Field anchorServiceField = LangchainLinearRunPipelineImpl.class
+                .getDeclaredField("toolJobAnchorService");
+        anchorServiceField.setAccessible(true);
+        anchorServiceField.set(pipeline, anchorService);
+
+        pipeline.executeRun(run);
+
+        verify(events, never()).append(eq("run-1"), eq("user-1"),
+                eq("TOOL_CALL_SUSPENDED"), any());
+        verify(events).appendOnce(eq("run-1"), eq("user-1"),
+                eq("TOOL_JOB_CHECKPOINT_FAILED"), any(), any());
     }
 }

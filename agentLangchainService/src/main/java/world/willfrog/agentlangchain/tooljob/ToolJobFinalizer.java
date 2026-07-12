@@ -134,6 +134,14 @@ public class ToolJobFinalizer {
         }
 
         if (!autoResume) {
+            if ("CHECKPOINT_FAILED".equals(anchor.getRunDisposition())) {
+                anchor.setFinalizerError("durable_checkpoint_write_failed");
+                if (!anchorService.updateAnchorAndStatus(runId, anchor,
+                        AgentRunStatus.FAILED, AgentRunStatus.WAITING_TOOL_JOB)) {
+                    log.warn("CHECKPOINT_FAILED terminal transition failed for run={}", runId);
+                }
+                return;
+            }
             // Paused/canceled: stop here, keep WAITING_TOOL_JOB, no CAS/READY
             log.info("Terminal handled for paused run={}, not auto-resuming", runId);
             return;

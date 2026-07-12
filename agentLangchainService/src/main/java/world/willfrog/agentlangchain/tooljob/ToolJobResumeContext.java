@@ -12,8 +12,11 @@ import java.util.List;
  */
 public class ToolJobResumeContext {
 
+    public static final String FINAL_TODO_ID = "__FINAL__";
+
     private String runId;
     private String todoId;
+    private int todoSequence;
     private String resumeToken;
     private long resumeLeaseVersion;  // incremented on each new claim
     private List<CompletedTodoRecord> completedTodos = Collections.emptyList();
@@ -23,6 +26,7 @@ public class ToolJobResumeContext {
     private boolean terminalSuccess;
     private String terminalResultPreview;
     private String terminalRawRef;
+    private boolean resultConsumed;
 
     public ToolJobResumeContext() {}
 
@@ -31,6 +35,9 @@ public class ToolJobResumeContext {
 
     public String getTodoId() { return todoId; }
     public void setTodoId(String todoId) { this.todoId = todoId; }
+
+    public int getTodoSequence() { return todoSequence; }
+    public void setTodoSequence(int todoSequence) { this.todoSequence = todoSequence; }
 
     public String getResumeToken() { return resumeToken; }
     public void setResumeToken(String resumeToken) { this.resumeToken = resumeToken; }
@@ -58,4 +65,7 @@ public class ToolJobResumeContext {
 
     public String getTerminalRawRef() { return terminalRawRef; }
     public void setTerminalRawRef(String terminalRawRef) { this.terminalRawRef = terminalRawRef; }
+
+    public boolean isResultConsumed() { return resultConsumed; }
+    public void setResultConsumed(boolean resultConsumed) { this.resultConsumed = resultConsumed; }
 }

@@ -5,6 +5,7 @@ import dev.langchain4j.model.chat.ChatModel;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.ObjectProvider;
 import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.service.*;
 import world.willfrog.agent.workflow.PlanExecutionMode;
@@ -14,7 +15,10 @@ import world.willfrog.agentlangchain.orchestration.dag.LangchainDagWorkflowExecu
 import world.willfrog.agentlangchain.planning.LangchainAiPlanner;
 import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
 import world.willfrog.agentlangchain.tooljob.ToolJobResumeContext;
+import world.willfrog.agentlangchain.tooljob.ToolJobAnchorService;
+import world.willfrog.agentlangchain.tooljob.ToolJobCheckpointWriter;
 
+import java.lang.reflect.Field;
 import java.util.List;
 import java.util.Optional;
 
@@ -82,5 +86,37 @@ class LangchainLinearRunPipelineResumeTest {
         verify(events).appendOnce(eq("run-1"), eq("user-1"), eq("WORKFLOW_RESUMED"),
                 eq("run-1:token-1:3:workflow_resumed"), any());
         verify(events, never()).append(eq("run-1"), eq("user-1"), eq("PLAN_READY"), any());
+
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId("run-1:tc-2:1");
+        anchor.setToolCallId("tc-2");
+        anchor.setTaskId("task-2");
+        anchor.setAttempt(1);
+        run.setToolJobAnchorJson(anchor.toJson());
+        when(linear.resumePlanned(any(), any(), any(), any())).thenReturn(
+                LangchainLinearWorkflowResult.builder()
+                        .suspended(true).plan(plan).completedTodos(List.of())
+                        .suspendedTodoId("todo-2").suspendedTodoSequence(2)
+                        .pendingToolCallId("tc-2").pendingAttempt(1).build());
+        Field writerField = LangchainLinearRunPipelineImpl.class
+                .getDeclaredField("toolJobCheckpointWriter");
+        writerField.setAccessible(true);
+        writerField.set(pipeline, mock(ToolJobCheckpointWriter.class));
+        ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
+        when(anchorService.updateAnchor(eq("run-1"), any(ToolJobAnchor.class),
+                eq(world.willfrog.agent.platform.model.AgentRunStatus.WAITING_TOOL_JOB)))
+                .thenReturn(true);
+        Field anchorServiceField = LangchainLinearRunPipelineImpl.class
+                .getDeclaredField("toolJobAnchorService");
+        anchorServiceField.setAccessible(true);
+        anchorServiceField.set(pipeline, anchorService);
+        clearInvocations(events);
+
+        pipeline.executeResumedRun(run, context, () -> true);
+
+        verify(events, never()).append(eq("run-1"), eq("user-1"),
+                eq("TOOL_CALL_SUSPENDED"), any());
+        verify(events).appendOnce(eq("run-1"), eq("user-1"),
+                eq("TOOL_JOB_CHECKPOINT_FAILED"), any(), any());
     }
 }

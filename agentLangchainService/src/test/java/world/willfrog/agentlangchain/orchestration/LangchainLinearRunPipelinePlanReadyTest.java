@@ -38,7 +38,7 @@ class LangchainLinearRunPipelinePlanReadyTest {
 
     @Test
     @SuppressWarnings("unchecked")
-    void executeRun_shouldEmitSuspendedAndNotPersistTerminalState() {
+    void executeRun_shouldFailClosedWhenSuspensionCheckpointIsUnavailable() {
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
         AgentEventService eventService = mock(AgentEventService.class);
         AgentRunStateStore stateStore = mock(AgentRunStateStore.class);
@@ -89,12 +89,14 @@ class LangchainLinearRunPipelinePlanReadyTest {
         pipeline.executeRun(run);
 
         ArgumentCaptor<Object> payload = ArgumentCaptor.forClass(Object.class);
-        verify(eventService).append(eq("run-pending-1"), eq("user-1"),
-                eq("TOOL_CALL_SUSPENDED"), payload.capture());
+        verify(eventService).appendOnce(eq("run-pending-1"), eq("user-1"),
+                eq("TOOL_JOB_CHECKPOINT_FAILED"), any(), payload.capture());
         assertThat((Map<String, Object>) payload.getValue())
                 .containsEntry("tool_call_id", "tc-pending")
                 .containsEntry("todo_id", "todo_2")
-                .containsEntry("todo_sequence", 2);
+                .containsEntry("durable_failure_disposition", false);
+        verify(eventService, never()).append(eq("run-pending-1"), eq("user-1"),
+                eq("TOOL_CALL_SUSPENDED"), any());
         verify(runMapper, never()).updateSnapshot(any(), any(), any(), any(), anyBoolean(), any());
     }
 

@@ -44,9 +44,19 @@ public class ToolJobResumeLauncherImpl implements ToolJobResumeLauncher {
                     context,
                     () -> {
                         ToolJobResumeService service = resumeServiceProvider.getIfAvailable();
-                        return service != null && service.markConsumed(runId);
+                        return service != null && service.markHandoffAccepted(runId, context);
                     },
-                    () -> activeClaims.remove(key));
+                    () -> {
+                        try {
+                            ToolJobResumeService service = resumeServiceProvider.getIfAvailable();
+                            if (service != null) {
+                                service.completeHandoff(runId, context.getResumeToken(),
+                                        context.getResumeLeaseVersion());
+                            }
+                        } finally {
+                            activeClaims.remove(key);
+                        }
+                    });
             if (!accepted) {
                 activeClaims.remove(key);
             }

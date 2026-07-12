@@ -227,6 +227,52 @@ class ToolJobResumeServiceTest {
         verify(anchorService, never()).clearAnchorWithToken(any(), any(), any(), anyLong());
     }
 
+    @Test
+    void acceptedHandoffPersistsNextTodoAndKeepsOldAnchor() {
+        ToolJobAnchor anchor = buildReadyAnchor();
+        anchor.setResumeState("LAUNCHING");
+        when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
+        when(anchorService.casResumeState(eq("run-1"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.RECEIVED), eq("LAUNCHING"), eq("token-v1"), eq(5L)))
+                .thenReturn(true);
+        CompletedTodoRecord completed = new CompletedTodoRecord();
+        completed.setTodoId("todo_3");
+        completed.setSequence(3);
+        completed.setOutput("terminal-result");
+        ToolJobResumeContext context = new ToolJobResumeContext();
+        context.setRunId("run-1");
+        context.setResumeToken("token-v1");
+        context.setResumeLeaseVersion(5);
+        context.setTodoId("todo_4");
+        context.setTodoSequence(4);
+        context.setCompletedTodos(List.of(completed));
+        context.setToolCallsUsed(3);
+        context.setResultConsumed(true);
+
+        assertThat(resumeService.markHandoffAccepted("run-1", context)).isTrue();
+        assertThat(anchor.getResumeState()).isEqualTo("LAUNCHING");
+        assertThat(anchor.isResultConsumed()).isTrue();
+        assertThat(anchor.getTodoId()).isEqualTo("todo_4");
+        assertThat(anchor.getSequence()).isEqualTo(4);
+        assertThat(anchor.getCompletedTodosJson()).contains("todo_3", "terminal-result");
+        verify(anchorService, never()).clearAnchorWithToken(any(), any(), any(), anyLong());
+        verify(redisCache, never()).deletePendingCache(any());
+    }
+
+    @Test
+    void completionClearsOnlyMatchingAcceptedHandoff() {
+        ToolJobAnchor anchor = buildReadyAnchor();
+        anchor.setResumeState("LAUNCHING");
+        anchor.setResultConsumed(true);
+        when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
+        when(anchorService.clearAnchorWithToken("run-1", "LAUNCHING", "token-v1", 5L))
+                .thenReturn(true);
+
+        assertThat(resumeService.completeHandoff("run-1", "token-v1", 5L)).isTrue();
+        verify(redisCache).removeDue("run-1");
+        verify(redisCache).deletePendingCache("run-1");
+    }
+
     // ---- double-claim prevention (§9.11 token+version CAS) ----
 
     @Test
