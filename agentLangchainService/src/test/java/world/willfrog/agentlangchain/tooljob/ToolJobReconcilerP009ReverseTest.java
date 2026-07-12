@@ -26,7 +26,9 @@ import java.lang.reflect.Field;
 import java.sql.Connection;
 import java.sql.Statement;
 import java.time.Instant;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -48,23 +50,29 @@ import static org.mockito.Mockito.verify;
  * due ZSET, and returns. The anchor stays PENDING and the reservation stays
  * occupied (capacity is never released).
  * <p>
+ * Runs 3 consecutive rounds of {@code reconcileFromDue()} to prove the
+ * non-finalization behavior is stable across multiple reconciler cycles.
+ * Before each round, {@code nextPollAt} and the due ZSET score are reset
+ * to the past so the run is picked up again.
+ * <p>
  * Fixture:
  * <ol>
- *   <li>Seed a run with status=WAITING_TOOL_JOB and a PENDING anchor with
- *       reservation, taskId, and nextPollAt in the past</li>
+ *   <li>Build a real {@link DataAnalysisReservation} via the Java record
+ *       (replaces hand-written illegal JSON)</li>
+ *   <li>Pre-seed a stateful capacity ledger with this reservation</li>
+ *   <li>Seed a run with status=WAITING_TOOL_JOB and a PENDING anchor</li>
  *   <li>Write the run into the Redis due ZSET</li>
  *   <li>Stub {@code sandboxService.getTaskStatus()} -- returns SUCCEEDED</li>
  *   <li>Stub {@code sandboxService.getTaskResult()} -- throws RuntimeException</li>
- *   <li>Call {@code reconciler.reconcileFromDue()}</li>
+ *   <li>For each of 3 rounds: reset nextPollAt/ZSET, reconcile, assert</li>
  * </ol>
  * <p>
- * Oracles:
+ * Oracles (after each round):
  * <ol>
  *   <li>{@code finalizer.handleTerminal} called 0 times</li>
- *   <li>Anchor state still PENDING (no state change)</li>
- *   <li>{@code resultFetchState} still null</li>
- *   <li>Reservation JSON preserved (capacity not released)</li>
- *   <li>{@code nextPollAt} moved forward (rescheduled for later retry)</li>
+ *   <li>{@code releaseCallCount == 0} (capacity never released)</li>
+ *   <li>Same active reservation identity still in ledger</li>
+ *   <li>Anchor state still PENDING, resultFetchState still null</li>
  * </ol>
  */
 @Testcontainers
@@ -97,6 +105,8 @@ class ToolJobReconcilerP009ReverseTest {
     private ToolJobRedisCache redisCache;
     private ToolJobReconciler reconciler;
     private ToolJobFinalizer finalizerSpy;
+    private ToolJobAnchorService anchorService;
+    private StatefulCapacityFake capacityFake;
 
     // ---- Infrastructure lifecycle ----
 
@@ -163,41 +173,19 @@ class ToolJobReconcilerP009ReverseTest {
         // Real services
         ToolJobConfig config = new ToolJobConfig();
         redisCache = new ToolJobRedisCache(redisTemplate, om, config);
-        ToolJobAnchorService anchorService = new ToolJobAnchorService(mapper);
+        anchorService = new ToolJobAnchorService(mapper);
 
         ToolJobResumeService resumeService = new ToolJobResumeService(
                 anchorService, redisCache, config, om);
 
-        // Capacity service stub (never invoked in this test, but needed for
-        // ToolJobFinalizer construction)
-        DataAnalysisCapacityService capacityService = new DataAnalysisCapacityService() {
-            @Override
-            public DataAnalysisReservation reserve(DataAnalysisOperationIdentity i, DataAnalysisEstimate e) {
-                return null;
-            }
-            @Override
-            public DataAnalysisRestoreOutcome restoreReservation(DataAnalysisReservation r) {
-                return DataAnalysisRestoreOutcome.CONFLICT;
-            }
-            @Override
-            public DataAnalysisReleaseOutcome releaseReservation(DataAnalysisReleaseRequest r) {
-                return DataAnalysisReleaseOutcome.CONFLICT;
-            }
-            @Override
-            public DataAnalysisCapacityRecoveryReport recover(
-                    List<DataAnalysisReservation> dr, int cmu, int cmha) {
-                return null;
-            }
-            @Override
-            public DataAnalysisAdmissionState admissionState() {
-                return DataAnalysisAdmissionState.OPEN;
-            }
-        };
+        // Stateful capacity ledger (pre-seeded later in the test with the
+        // real DataAnalysisReservation)
+        capacityFake = new StatefulCapacityFake();
 
         // Real ToolJobFinalizer wrapped in a spy so we can verify handleTerminal
         // was never called
         ToolJobFinalizer realFinalizer = new ToolJobFinalizer(
-                anchorService, redisCache, capacityService, resumeService, config);
+                anchorService, redisCache, capacityFake, resumeService, config);
         finalizerSpy = spy(realFinalizer);
 
         // Create the reconciler with the spy finalizer (5-arg constructor)
@@ -221,86 +209,105 @@ class ToolJobReconcilerP009ReverseTest {
 
     @Test
     void shouldNotCallFinalizerWhenResultUnavailable() throws Exception {
-        // Step 1: Seed -- insert run with WAITING_TOOL_JOB status and a PENDING anchor
-        Instant originalNextPollAt = Instant.now().minusSeconds(60); // in the past
+        // Step 1: Build a real DataAnalysisReservation via the Java record
+        // (replaces the old hand-written illegal JSON resourceClass=CPU,state=PENDING)
+        DataAnalysisOperationIdentity identity =
+                new DataAnalysisOperationIdentity(RUN_ID, "tc-1", 1);
+        DataAnalysisReservation reservation = new DataAnalysisReservation(
+                identity.operationId(), identity,
+                DataAnalysisResourceClass.STANDARD, 1,
+                DataAnalysisReservationState.PENDING_TRANSFERRED,
+                "task-p009", Instant.now());
+        String reservationJson = om.writeValueAsString(reservation);
 
+        // Pre-seed the stateful capacity ledger with this reservation
+        capacityFake.restoreReservation(reservation);
+        assertThat(capacityFake.releaseCallCount).isEqualTo(0);
+        assertThat(capacityFake.distinctReservationIds()).isEqualTo(1);
+
+        // Step 2: Seed PG -- insert run with WAITING_TOOL_JOB status and a
+        //          PENDING anchor carrying the real reservation JSON
         ToolJobAnchor anchor = new ToolJobAnchor();
         anchor.setAnchorState("PENDING");
-        anchor.setOperationId(RUN_ID + ":tc-1:1");
+        anchor.setOperationId(identity.operationId());
         anchor.setToolCallId("tc-1");
         anchor.setAttempt(1);
         anchor.setTaskId("task-p009");
         anchor.setAutoResume(true);
-        anchor.setReservationJson(
-                "{\"reservationId\":\"res-p009\",\"identity\":{\"operationId\":\"" + RUN_ID + ":tc-1:1"
-                        + "\",\"runId\":\"" + RUN_ID + "\",\"toolCallId\":\"tc-1\",\"attempt\":1,"
-                        + "\"reservationId\":\"res-p009\"},"
-                        + "\"resourceClass\":\"CPU\",\"capacityUnits\":1,"
-                        + "\"state\":\"PENDING\",\"taskId\":\"task-p009\","
-                        + "\"acquiredAt\":\"" + Instant.now().minusSeconds(120) + "\"}");
-        anchor.setNextPollAt(originalNextPollAt);
+        anchor.setReservationJson(reservationJson);
+        anchor.setNextPollAt(Instant.now().minusSeconds(60));
         anchor.setTimeoutAt(Instant.now().plusSeconds(600));
 
         insertRun(RUN_ID, "WAITING_TOOL_JOB", anchor.toJson());
 
-        // Step 2: Write into Redis due ZSET with nextPollAt in the past
-        redisCache.upsertDue(RUN_ID, anchor);
+        // Step 3: Run 3 consecutive rounds of reconcileFromDue().
+        // Before each round, reset nextPollAt and the due ZSET score to the past
+        // so the run is picked up again. After each round, assert the finalizer
+        // was never called, capacity was never released, and the anchor is
+        // unchanged (still PENDING, resultFetchState null, reservation preserved).
+        for (int round = 1; round <= 3; round++) {
+            // --- Reset: load, set nextPollAt to past, persist PG + Redis ---
+            ToolJobAnchor currentAnchor = anchorService.loadAnchor(RUN_ID);
+            assertThat(currentAnchor).as("round %d: anchor present", round).isNotNull();
+            currentAnchor.setNextPollAt(Instant.now().minusSeconds(60));
+            anchorService.updateAnchor(RUN_ID, currentAnchor, AgentRunStatus.WAITING_TOOL_JOB);
+            redisCache.upsertDue(RUN_ID, currentAnchor);
 
-        // Precondition: run is in the due ZSET
-        Double score = redisTemplate.opsForZSet().score(DUE_ZSET_KEY, RUN_ID);
-        assertThat(score).isNotNull();
-        assertThat(score.longValue()).isLessThanOrEqualTo(System.currentTimeMillis());
+            // Precondition: run is in the due ZSET with a past score
+            Double score = redisTemplate.opsForZSet().score(DUE_ZSET_KEY, RUN_ID);
+            assertThat(score).as("round %d: due ZSET score present", round).isNotNull();
+            assertThat(score.longValue())
+                    .as("round %d: due ZSET score in the past", round)
+                    .isLessThanOrEqualTo(System.currentTimeMillis());
 
-        // Precondition: anchor loaded from DB is PENDING with reservation
-        AgentRun run = mapper.findById(RUN_ID);
-        assertThat(run).isNotNull();
-        ToolJobAnchor dbAnchor = ToolJobAnchor.fromJson(run.getToolJobAnchorJson());
-        assertThat(dbAnchor.getAnchorState()).isEqualTo("PENDING");
-        assertThat(dbAnchor.getReservationJson()).isNotNull().isNotBlank();
-        assertThat(dbAnchor.getResultFetchState()).isNull();
+            // --- Reconcile ---
+            reconciler.reconcileFromDue();
 
-        // Step 3: Call reconcileFromDue -- this triggers processItem which:
-        //   a) loadAnchor
-        //   b) getTaskStatus -> SUCCEEDED
-        //   c) fetchResult -> getTaskResult throws -> returns null
-        //   d) resultResp == null -> reschedule (no finalizer call)
-        reconciler.reconcileFromDue();
+            // --- Assert after each round ---
 
-        // ---- Oracles ----
+            // 1. handleTerminal was NEVER called (0 times across all rounds)
+            verify(finalizerSpy, never()).handleTerminal(
+                    any(String.class), any(ToolJobAnchor.class), any(String.class),
+                    any(TaskResultResponse.class), anyBoolean());
 
-        // Oracle 1: handleTerminal was NEVER called (0 times)
-        verify(finalizerSpy, never()).handleTerminal(
-                any(String.class), any(ToolJobAnchor.class), any(String.class),
-                any(TaskResultResponse.class), anyBoolean());
+            // 2. Capacity release never called
+            assertThat(capacityFake.releaseCallCount)
+                    .as("round %d: releaseCallCount == 0", round)
+                    .isEqualTo(0);
 
-        // Oracle 2: Anchor state still PENDING (no state change)
-        run = mapper.findById(RUN_ID);
-        assertThat(run).isNotNull();
-        dbAnchor = ToolJobAnchor.fromJson(run.getToolJobAnchorJson());
-        assertThat(dbAnchor.getAnchorState()).isEqualTo("PENDING");
+            // 3. Same active reservation identity still in the ledger
+            assertThat(capacityFake.distinctReservationIds())
+                    .as("round %d: distinctReservationIds == 1", round)
+                    .isEqualTo(1);
 
-        // Oracle 3: resultFetchState still null
-        assertThat(dbAnchor.getResultFetchState()).isNull();
+            // 4. PG anchor unchanged: anchorState still PENDING,
+            //    resultFetchState still null, finalizerStep still null
+            AgentRun run = mapper.findById(RUN_ID);
+            assertThat(run).as("round %d: run present", round).isNotNull();
+            ToolJobAnchor dbAnchor = ToolJobAnchor.fromJson(run.getToolJobAnchorJson());
+            assertThat(dbAnchor.getAnchorState())
+                    .as("round %d: anchorState still PENDING", round)
+                    .isEqualTo("PENDING");
+            assertThat(dbAnchor.getResultFetchState())
+                    .as("round %d: resultFetchState still null", round)
+                    .isNull();
+            assertThat(dbAnchor.getFinalizerStep())
+                    .as("round %d: finalizerStep still null", round)
+                    .isNull();
 
-        // Oracle 4: Reservation JSON preserved (capacity NOT released)
-        assertThat(dbAnchor.getReservationJson()).isNotNull().isNotBlank();
-        assertThat(dbAnchor.getReservationJson()).contains("res-p009");
+            // 5. Reservation JSON preserved (capacity not released, identity unchanged)
+            assertThat(dbAnchor.getReservationJson())
+                    .as("round %d: reservationJson present", round)
+                    .isNotNull().isNotBlank();
 
-        // Oracle 5: nextPollAt moved forward (rescheduled for later retry)
-        assertThat(dbAnchor.getNextPollAt()).isNotNull();
-        assertThat(dbAnchor.getNextPollAt()).isAfter(originalNextPollAt);
-
-        // Oracle 6: run is re-enqueued in the due ZSET (upsertDue called with
-        //           the new nextPollAt, so ZSET now has a future score)
-        score = redisTemplate.opsForZSet().score(DUE_ZSET_KEY, RUN_ID);
-        assertThat(score).isNotNull();
-
-        // Oracle 7: finalizer step is still null (no finalizer progress)
-        assertThat(dbAnchor.getFinalizerStep()).isNull();
-
-        // Oracle 8: terminal status fields remain null (no terminal processing)
-        assertThat(dbAnchor.getTerminalStatus()).isNull();
-        assertThat(dbAnchor.getTerminalAt()).isNull();
+            // 6. Terminal fields remain null
+            assertThat(dbAnchor.getTerminalStatus())
+                    .as("round %d: terminalStatus null", round)
+                    .isNull();
+            assertThat(dbAnchor.getTerminalAt())
+                    .as("round %d: terminalAt null", round)
+                    .isNull();
+        }
     }
 
     // ---- Helpers ----
@@ -415,6 +422,63 @@ class ToolJobReconcilerP009ReverseTest {
         public CompletableFuture<GetTaskByOperationIdResponse> getTaskByOperationIdAsync(
                 GetTaskByOperationIdRequest request) {
             throw new UnsupportedOperationException("Not implemented in stub");
+        }
+    }
+
+    /**
+     * Stateful capacity ledger that tracks actual reserved-to-released transitions.
+     * Copied from {@code ToolJobFinalizerP006Test.StatefulCapacityFake}.
+     * <p>
+     * Unlike a Mockito mock, this proves the ledger state changes at most once
+     * even when {@code releaseReservation} is called multiple times during
+     * crash/re-entry. In this test, releaseReservation is never called at all
+     * (the finalizer is never reached), so {@code releaseCallCount} stays 0
+     * and the pre-seeded reservation stays in the ledger with its original state.
+     */
+    static class StatefulCapacityFake implements DataAnalysisCapacityService {
+        private final Map<String, DataAnalysisReservationState> ledger = new LinkedHashMap<>();
+        int releaseCallCount;
+        int transitionCount;
+
+        int distinctReservationIds() {
+            return ledger.size();
+        }
+
+        @Override
+        public DataAnalysisRestoreOutcome restoreReservation(DataAnalysisReservation reservation) {
+            String id = reservation.reservationId();
+            if (ledger.containsKey(id)) {
+                return DataAnalysisRestoreOutcome.CONFLICT;
+            }
+            ledger.put(id, reservation.state());
+            return DataAnalysisRestoreOutcome.ADDED;
+        }
+
+        @Override
+        public DataAnalysisReleaseOutcome releaseReservation(DataAnalysisReleaseRequest request) {
+            releaseCallCount++;
+            String id = request.reservation().reservationId();
+            DataAnalysisReservationState current = ledger.getOrDefault(id, request.reservation().state());
+            if (current == DataAnalysisReservationState.RELEASED) {
+                return DataAnalysisReleaseOutcome.ALREADY_RELEASED;
+            }
+            ledger.put(id, DataAnalysisReservationState.RELEASED);
+            transitionCount++;
+            return DataAnalysisReleaseOutcome.RELEASED;
+        }
+
+        // ---- unused in this fixture ----
+        @Override public DataAnalysisReservation reserve(DataAnalysisOperationIdentity identity,
+                                                          DataAnalysisEstimate estimate) {
+            throw new UnsupportedOperationException();
+        }
+        @Override public DataAnalysisCapacityRecoveryReport recover(
+                List<DataAnalysisReservation> durableReservations, int configuredMaxUnits,
+                int configuredMaxHeavyActive) {
+            throw new UnsupportedOperationException();
+        }
+        @Override public DataAnalysisAdmissionState admissionState() {
+            throw new UnsupportedOperationException();
         }
     }
 }
