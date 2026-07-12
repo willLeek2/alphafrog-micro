@@ -1,5 +1,6 @@
 package world.willfrog.agentlangchain.tooljob;
 
+import org.apache.ibatis.session.SqlSessionFactory;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -7,15 +8,23 @@ import org.junit.jupiter.api.Test;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
+import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
+import world.willfrog.agent.platform.mapper.AgentRunMapper;
+import world.willfrog.agent.platform.model.AgentRunStatus;
+
+import javax.sql.DataSource;
+import org.postgresql.ds.PGSimpleDataSource;
 
 import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
 import java.sql.Statement;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+/**
+ * PostgreSQL integration tests using real MyBatis AgentRunMapper mapped statements.
+ * Every test calls production AgentRunMapper methods — not hand-copied SQL.
+ * Verifies JSONB predicates and ToolJobAnchor.fromJson roundtrip after each write.
+ */
 @Testcontainers
 class ToolJobAnchorMapperIntegrationTest {
 
@@ -25,50 +34,78 @@ class ToolJobAnchorMapperIntegrationTest {
             .withUsername("test")
             .withPassword("test");
 
-    private static Connection conn;
-
     @BeforeAll
-    static void setUpDatabase() throws Exception {
-        conn = DriverManager.getConnection(
-                postgres.getJdbcUrl(), postgres.getUsername(), postgres.getPassword());
-        try (Statement stmt = conn.createStatement()) {
+    static void createTable() throws Exception {
+        DataSource ds = dataSource();
+        try (Connection conn = ds.getConnection();
+             Statement stmt = conn.createStatement()) {
             stmt.execute("""
                 CREATE TABLE alphafrog_agent_run (
                     id VARCHAR(64) PRIMARY KEY,
+                    user_id VARCHAR(64),
                     status VARCHAR(32) NOT NULL,
+                    current_step INT DEFAULT 0,
+                    max_steps INT DEFAULT 20,
+                    plan_json JSONB DEFAULT '{}',
+                    snapshot_json JSONB DEFAULT '{}',
+                    last_error TEXT,
+                    ttl_expires_at TIMESTAMPTZ,
+                    started_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                    completed_at TIMESTAMPTZ,
+                    ext JSONB DEFAULT '{}',
                     tool_job_anchor_json JSONB DEFAULT '{}'
                 )""");
         }
     }
 
     @AfterAll
-    static void tearDown() throws Exception {
-        if (conn != null) conn.close();
-    }
+    static void closeContainer() { /* @Container handles cleanup */ }
 
     @BeforeEach
     void cleanTable() throws Exception {
-        try (Statement stmt = conn.createStatement()) {
+        DataSource ds = dataSource();
+        try (Connection conn = ds.getConnection();
+             Statement stmt = conn.createStatement()) {
             stmt.execute("DELETE FROM alphafrog_agent_run");
         }
     }
 
-    private void insertRun(String id, String status, String anchorJson) throws Exception {
-        try (PreparedStatement ps = conn.prepareStatement(
-                "INSERT INTO alphafrog_agent_run (id, status, tool_job_anchor_json) VALUES (?, ?, CAST(? AS jsonb))")) {
+    private static DataSource dataSource() {
+        PGSimpleDataSource ds = new PGSimpleDataSource();
+        ds.setUrl(postgres.getJdbcUrl());
+        ds.setUser(postgres.getUsername());
+        ds.setPassword(postgres.getPassword());
+        return ds;
+    }
+
+    private static AgentRunMapper newMapper() throws Exception {
+        var config = new org.apache.ibatis.session.Configuration();
+        config.setMapUnderscoreToCamelCase(true);
+        var env = new org.apache.ibatis.mapping.Environment("test",
+                new org.apache.ibatis.transaction.jdbc.JdbcTransactionFactory(), dataSource());
+        config.setEnvironment(env);
+        config.addMapper(AgentRunMapper.class);
+        // Load production mapper XML (different module, must be explicit)
+        String res = "mapper/AgentRunMapper.xml";
+        try (java.io.Reader r = org.apache.ibatis.io.Resources.getResourceAsReader(res)) {
+            new org.apache.ibatis.builder.xml.XMLMapperBuilder(
+                    r, config, res, config.getSqlFragments()).parse();
+        }
+        SqlSessionFactory factory = new org.apache.ibatis.session.SqlSessionFactoryBuilder().build(config);
+        var session = factory.openSession(true);
+        return session.getMapper(AgentRunMapper.class);
+    }
+
+    private static void insertRun(String id, String status, String anchorJson) throws Exception {
+        DataSource ds = dataSource();
+        try (Connection conn = ds.getConnection();
+             var ps = conn.prepareStatement(
+                     "INSERT INTO alphafrog_agent_run (id, status, tool_job_anchor_json) VALUES (?, ?, CAST(? AS jsonb))")) {
             ps.setString(1, id);
             ps.setString(2, status);
             ps.setString(3, anchorJson);
             ps.executeUpdate();
-        }
-    }
-
-    private String getAnchorJson(String id) throws Exception {
-        try (PreparedStatement ps = conn.prepareStatement(
-                "SELECT tool_job_anchor_json::text FROM alphafrog_agent_run WHERE id = ?")) {
-            ps.setString(1, id);
-            ResultSet rs = ps.executeQuery();
-            return rs.next() ? rs.getString(1) : null;
         }
     }
 
@@ -79,45 +116,31 @@ class ToolJobAnchorMapperIntegrationTest {
         insertRun("run-1", "EXECUTING", """
             {"operationId":"run-1:tc-1:1","toolCallId":"tc-1","attempt":1,"taskId":"task-123","checkpointVersion":0,"reservationJson":"r1"}""");
 
-        int rows;
-        try (PreparedStatement ps = conn.prepareStatement("""
-                UPDATE alphafrog_agent_run
-                SET tool_job_anchor_json = tool_job_anchor_json
-                    || jsonb_build_object('checkpointVersion', (COALESCE((tool_job_anchor_json #>> '{checkpointVersion}')::int, 0) + 1)::text::jsonb)
-                    || jsonb_build_object('todoId', to_jsonb(?::text))
-                    || jsonb_build_object('sequence', to_jsonb(?::text))
-                    || jsonb_build_object('datasetSnapshotJson', CAST(? AS jsonb))
-                    || jsonb_build_object('datasetSnapshotDigest', to_jsonb(?::text))
-                    || jsonb_build_object('toolCallsUsed', to_jsonb(?::text))
-                WHERE id = ? AND status = ?
-                  AND tool_job_anchor_json #>> '{operationId}' = ?
-                  AND tool_job_anchor_json #>> '{toolCallId}' = ?
-                  AND (tool_job_anchor_json #>> '{attempt}')::int = ?
-                  AND tool_job_anchor_json #>> '{taskId}' = ?
-                  AND COALESCE((tool_job_anchor_json #>> '{checkpointVersion}')::int, 0) = ?""")) {
-            ps.setString(1, "todo_3");
-            ps.setString(2, "3");
-            ps.setString(3, "{\"digest\":\"abc\"}");
-            ps.setString(4, "abc123");
-            ps.setString(5, "2");
-            ps.setString(6, "run-1");
-            ps.setString(7, "EXECUTING");
-            ps.setString(8, "run-1:tc-1:1");
-            ps.setString(9, "tc-1");
-            ps.setInt(10, 1);
-            ps.setString(11, "task-123");
-            ps.setInt(12, 0);
-            rows = ps.executeUpdate();
-        }
+        AgentRunMapper m = newMapper();
+        int rows = m.updateToolJobCheckpoint(
+                "run-1", AgentRunStatus.EXECUTING,
+                "run-1:tc-1:1", "tc-1", 1, "task-123", 0,
+                "todo_3", 3,
+                "[{\"todoId\":\"todo_1\"}]",
+                "{\"digest\":\"abc\"}", "abc123",
+                "[\"ds1\"]", 2,
+                "{\"cpu\":100}");
 
         assertThat(rows).isEqualTo(1);
 
-        String json = getAnchorJson("run-1");
-        assertThat(json).contains("\"checkpointVersion\": 1");
-        assertThat(json).contains("\"todoId\": \"todo_3\"");
-        assertThat(json).contains("\"datasetSnapshotDigest\": \"abc123\"");
-        assertThat(json).contains("\"reservationJson\"");
-        assertThat(json).contains("\"operationId\"");
+        // fromJson roundtrip: all String fields survive
+        ToolJobAnchor a = ToolJobAnchor.fromJson(newMapper().findById("run-1").getToolJobAnchorJson());
+        assertThat(a.getCheckpointVersion()).isEqualTo(1);
+        assertThat(a.getTodoId()).isEqualTo("todo_3");
+        assertThat(a.getSequence()).isEqualTo(3);
+        assertThat(a.getCompletedTodosJson()).isEqualTo("[{\"todoId\":\"todo_1\"}]");
+        assertThat(a.getDatasetSnapshotJson()).isEqualTo("{\"digest\":\"abc\"}");
+        assertThat(a.getDatasetSnapshotDigest()).isEqualTo("abc123");
+        assertThat(a.getDatasetRefsJson()).isEqualTo("[\"ds1\"]");
+        assertThat(a.getToolCallsUsed()).isEqualTo(2);
+        assertThat(a.getEstimateJson()).isEqualTo("{\"cpu\":100}");
+        assertThat(a.getOperationId()).isEqualTo("run-1:tc-1:1");
+        assertThat(a.getReservationJson()).isNotNull();
     }
 
     @Test
@@ -125,239 +148,134 @@ class ToolJobAnchorMapperIntegrationTest {
         insertRun("run-2", "EXECUTING", """
             {"operationId":"run-2:tc-1:1","toolCallId":"tc-1","attempt":1,"taskId":"task-123","checkpointVersion":0}""");
 
-        try (PreparedStatement ps = conn.prepareStatement("""
-                UPDATE alphafrog_agent_run SET tool_job_anchor_json = tool_job_anchor_json
-                    || jsonb_build_object('checkpointVersion', (COALESCE((tool_job_anchor_json #>> '{checkpointVersion}')::int, 0) + 1)::text::jsonb)
-                    || jsonb_build_object('todoId', to_jsonb(?::text))
-                    || jsonb_build_object('datasetSnapshotJson', CAST(? AS jsonb))
-                    || jsonb_build_object('datasetSnapshotDigest', to_jsonb(?::text))
-                    || jsonb_build_object('toolCallsUsed', to_jsonb(?::text))
-                WHERE id = ? AND status = ? AND tool_job_anchor_json #>> '{operationId}' = ?
-                  AND tool_job_anchor_json #>> '{toolCallId}' = ?
-                  AND (tool_job_anchor_json #>> '{attempt}')::int = ?
-                  AND tool_job_anchor_json #>> '{taskId}' = ?
-                  AND COALESCE((tool_job_anchor_json #>> '{checkpointVersion}')::int, 0) = ?""")) {
-            ps.setString(1, "todo_1");
-            ps.setString(2, "{}");
-            ps.setString(3, "d1");
-            ps.setString(4, "0");
-            ps.setString(5, "run-2");
-            ps.setString(6, "EXECUTING");
-            ps.setString(7, "run-2:tc-2:1");  // wrong operationId
-            ps.setString(8, "tc-1");
-            ps.setInt(9, 1);
-            ps.setString(10, "task-123");
-            ps.setInt(11, 0);
-            assertThat(ps.executeUpdate()).isEqualTo(0);
-        }
+        int rows = newMapper().updateToolJobCheckpoint(
+                "run-2", AgentRunStatus.EXECUTING,
+                "run-2:tc-2:1", "tc-1", 1, "task-123", 0,  // wrong operationId
+                "todo_1", 1, null, "{}", "d1", null, 0, null);
+        assertThat(rows).isEqualTo(0);
     }
 
     @Test
-    void checkpointShouldRejectWhenVersionMismatch() throws Exception {
+    void checkpointShouldRejectWhenToolCallIdMismatch() throws Exception {
         insertRun("run-3", "EXECUTING", """
-            {"operationId":"run-3:tc-1:1","toolCallId":"tc-1","attempt":1,"taskId":"task-123","checkpointVersion":5}""");
+            {"operationId":"run-3:tc-1:1","toolCallId":"tc-1","attempt":1,"taskId":"task-123","checkpointVersion":0}""");
 
-        try (PreparedStatement ps = conn.prepareStatement("""
-                UPDATE alphafrog_agent_run SET tool_job_anchor_json = tool_job_anchor_json
-                    || jsonb_build_object('checkpointVersion', (COALESCE((tool_job_anchor_json #>> '{checkpointVersion}')::int, 0) + 1)::text::jsonb)
-                    || jsonb_build_object('todoId', to_jsonb(?::text))
-                    || jsonb_build_object('datasetSnapshotJson', CAST(? AS jsonb))
-                    || jsonb_build_object('datasetSnapshotDigest', to_jsonb(?::text))
-                    || jsonb_build_object('toolCallsUsed', to_jsonb(?::text))
-                WHERE id = ? AND status = ? AND tool_job_anchor_json #>> '{operationId}' = ?
-                  AND tool_job_anchor_json #>> '{toolCallId}' = ?
-                  AND (tool_job_anchor_json #>> '{attempt}')::int = ?
-                  AND tool_job_anchor_json #>> '{taskId}' = ?
-                  AND COALESCE((tool_job_anchor_json #>> '{checkpointVersion}')::int, 0) = ?""")) {
-            ps.setString(1, "todo_1");
-            ps.setString(2, "{}");
-            ps.setString(3, "d1");
-            ps.setString(4, "0");
-            ps.setString(5, "run-3");
-            ps.setString(6, "EXECUTING");
-            ps.setString(7, "run-3:tc-1:1");
-            ps.setString(8, "tc-1");
-            ps.setInt(9, 1);
-            ps.setString(10, "task-123");
-            ps.setInt(11, 3);  // expected 3, DB has 5 → mismatch
-            assertThat(ps.executeUpdate()).isEqualTo(0);
-        }
+        int rows = newMapper().updateToolJobCheckpoint(
+                "run-3", AgentRunStatus.EXECUTING,
+                "run-3:tc-1:1", "tc-2", 1, "task-123", 0,  // wrong toolCallId
+                "todo_1", 1, null, "{}", "d1", null, 0, null);
+        assertThat(rows).isEqualTo(0);
+    }
+
+    @Test
+    void checkpointShouldRejectWhenAttemptMismatch() throws Exception {
+        insertRun("run-4", "EXECUTING", """
+            {"operationId":"run-4:tc-1:1","toolCallId":"tc-1","attempt":1,"taskId":"task-123","checkpointVersion":0}""");
+
+        int rows = newMapper().updateToolJobCheckpoint(
+                "run-4", AgentRunStatus.EXECUTING,
+                "run-4:tc-1:1", "tc-1", 2, "task-123", 0,  // wrong attempt
+                "todo_1", 1, null, "{}", "d1", null, 0, null);
+        assertThat(rows).isEqualTo(0);
     }
 
     @Test
     void checkpointShouldRejectWhenTaskIdMismatch() throws Exception {
-        insertRun("run-4", "EXECUTING", """
-            {"operationId":"run-4:tc-1:1","toolCallId":"tc-1","attempt":1,"taskId":"task-999","checkpointVersion":0}""");
+        insertRun("run-5", "EXECUTING", """
+            {"operationId":"run-5:tc-1:1","toolCallId":"tc-1","attempt":1,"taskId":"task-999","checkpointVersion":0}""");
 
-        try (PreparedStatement ps = conn.prepareStatement("""
-                UPDATE alphafrog_agent_run SET tool_job_anchor_json = tool_job_anchor_json
-                    || jsonb_build_object('checkpointVersion', (COALESCE((tool_job_anchor_json #>> '{checkpointVersion}')::int, 0) + 1)::text::jsonb)
-                    || jsonb_build_object('todoId', to_jsonb(?::text))
-                    || jsonb_build_object('datasetSnapshotJson', CAST(? AS jsonb))
-                    || jsonb_build_object('datasetSnapshotDigest', to_jsonb(?::text))
-                    || jsonb_build_object('toolCallsUsed', to_jsonb(?::text))
-                WHERE id = ? AND status = ? AND tool_job_anchor_json #>> '{operationId}' = ?
-                  AND tool_job_anchor_json #>> '{toolCallId}' = ?
-                  AND (tool_job_anchor_json #>> '{attempt}')::int = ?
-                  AND tool_job_anchor_json #>> '{taskId}' = ?
-                  AND COALESCE((tool_job_anchor_json #>> '{checkpointVersion}')::int, 0) = ?""")) {
-            ps.setString(1, "todo_1");
-            ps.setString(2, "{}");
-            ps.setString(3, "d1");
-            ps.setString(4, "0");
-            ps.setString(5, "run-4");
-            ps.setString(6, "EXECUTING");
-            ps.setString(7, "run-4:tc-1:1");
-            ps.setString(8, "tc-1");
-            ps.setInt(9, 1);
-            ps.setString(10, "task-123");  // wrong taskId
-            ps.setInt(11, 0);
-            assertThat(ps.executeUpdate()).isEqualTo(0);
-        }
+        int rows = newMapper().updateToolJobCheckpoint(
+                "run-5", AgentRunStatus.EXECUTING,
+                "run-5:tc-1:1", "tc-1", 1, "task-123", 0,  // wrong taskId
+                "todo_1", 1, null, "{}", "d1", null, 0, null);
+        assertThat(rows).isEqualTo(0);
     }
 
     @Test
-    void dualCheckpointWritersOnlyOneSucceeds() throws Exception {
-        insertRun("run-5", "EXECUTING", """
-            {"operationId":"run-5:tc-1:1","toolCallId":"tc-1","attempt":1,"taskId":"task-123","checkpointVersion":0,"reservationJson":"r5"}""");
+    void checkpointShouldRejectWhenVersionMismatch() throws Exception {
+        insertRun("run-6", "EXECUTING", """
+            {"operationId":"run-6:tc-1:1","toolCallId":"tc-1","attempt":1,"taskId":"task-123","checkpointVersion":5}""");
 
-        // First writer: version 0 → bumps to 1
-        int rows1;
-        try (PreparedStatement ps = conn.prepareStatement("""
-                UPDATE alphafrog_agent_run SET tool_job_anchor_json = tool_job_anchor_json
-                    || jsonb_build_object('checkpointVersion', (COALESCE((tool_job_anchor_json #>> '{checkpointVersion}')::int, 0) + 1)::text::jsonb)
-                    || jsonb_build_object('todoId', to_jsonb(?::text))
-                    || jsonb_build_object('datasetSnapshotJson', CAST(? AS jsonb))
-                    || jsonb_build_object('datasetSnapshotDigest', to_jsonb(?::text))
-                    || jsonb_build_object('toolCallsUsed', to_jsonb(?::text))
-                WHERE id = ? AND status = ? AND tool_job_anchor_json #>> '{operationId}' = ?
-                  AND tool_job_anchor_json #>> '{toolCallId}' = ?
-                  AND (tool_job_anchor_json #>> '{attempt}')::int = ?
-                  AND tool_job_anchor_json #>> '{taskId}' = ?
-                  AND COALESCE((tool_job_anchor_json #>> '{checkpointVersion}')::int, 0) = ?""")) {
-            ps.setString(1, "todo_A");
-            ps.setString(2, "{\"w\":\"A\"}");
-            ps.setString(3, "dA");
-            ps.setString(4, "0");
-            ps.setString(5, "run-5");
-            ps.setString(6, "EXECUTING");
-            ps.setString(7, "run-5:tc-1:1");
-            ps.setString(8, "tc-1");
-            ps.setInt(9, 1);
-            ps.setString(10, "task-123");
-            ps.setInt(11, 0);
-            rows1 = ps.executeUpdate();
-        }
+        int rows = newMapper().updateToolJobCheckpoint(
+                "run-6", AgentRunStatus.EXECUTING,
+                "run-6:tc-1:1", "tc-1", 1, "task-123", 3,  // expected 3, DB has 5
+                "todo_1", 1, null, "{}", "d1", null, 0, null);
+        assertThat(rows).isEqualTo(0);
+    }
+
+    @Test
+    void checkpointShouldRejectWhenStatusMismatch() throws Exception {
+        insertRun("run-7", "WAITING_TOOL_JOB", """
+            {"operationId":"run-7:tc-1:1","toolCallId":"tc-1","attempt":1,"taskId":"task-123","checkpointVersion":0}""");
+
+        int rows = newMapper().updateToolJobCheckpoint(
+                "run-7", AgentRunStatus.EXECUTING,  // DB has WAITING_TOOL_JOB
+                "run-7:tc-1:1", "tc-1", 1, "task-123", 0,
+                "todo_1", 1, null, "{}", "d1", null, 0, null);
+        assertThat(rows).isEqualTo(0);
+    }
+
+    @Test
+    void dualCheckpointWritersOnlyFirstSucceeds() throws Exception {
+        insertRun("run-8", "EXECUTING", """
+            {"operationId":"run-8:tc-1:1","toolCallId":"tc-1","attempt":1,"taskId":"task-123","checkpointVersion":0,"reservationJson":"r8"}""");
+
+        int rows1 = newMapper().updateToolJobCheckpoint(
+                "run-8", AgentRunStatus.EXECUTING,
+                "run-8:tc-1:1", "tc-1", 1, "task-123", 0,
+                "todo_A", 1, null, "{\"w\":\"A\"}", "dA", null, 0, null);
         assertThat(rows1).isEqualTo(1);
 
-        // Second writer: also expects version 0 → FAILS (DB now has version 1)
-        int rows2;
-        try (PreparedStatement ps = conn.prepareStatement("""
-                UPDATE alphafrog_agent_run SET tool_job_anchor_json = tool_job_anchor_json
-                    || jsonb_build_object('checkpointVersion', (COALESCE((tool_job_anchor_json #>> '{checkpointVersion}')::int, 0) + 1)::text::jsonb)
-                    || jsonb_build_object('todoId', to_jsonb(?::text))
-                    || jsonb_build_object('datasetSnapshotJson', CAST(? AS jsonb))
-                    || jsonb_build_object('datasetSnapshotDigest', to_jsonb(?::text))
-                    || jsonb_build_object('toolCallsUsed', to_jsonb(?::text))
-                WHERE id = ? AND status = ? AND tool_job_anchor_json #>> '{operationId}' = ?
-                  AND tool_job_anchor_json #>> '{toolCallId}' = ?
-                  AND (tool_job_anchor_json #>> '{attempt}')::int = ?
-                  AND tool_job_anchor_json #>> '{taskId}' = ?
-                  AND COALESCE((tool_job_anchor_json #>> '{checkpointVersion}')::int, 0) = ?""")) {
-            ps.setString(1, "todo_B");
-            ps.setString(2, "{\"w\":\"B\"}");
-            ps.setString(3, "dB");
-            ps.setString(4, "0");
-            ps.setString(5, "run-5");
-            ps.setString(6, "EXECUTING");
-            ps.setString(7, "run-5:tc-1:1");
-            ps.setString(8, "tc-1");
-            ps.setInt(9, 1);
-            ps.setString(10, "task-123");
-            ps.setInt(11, 0);  // expects version 0 → DB has 1 → 0 rows
-            rows2 = ps.executeUpdate();
-        }
+        int rows2 = newMapper().updateToolJobCheckpoint(
+                "run-8", AgentRunStatus.EXECUTING,
+                "run-8:tc-1:1", "tc-1", 1, "task-123", 0,  // same version → fails
+                "todo_B", 1, null, "{\"w\":\"B\"}", "dB", null, 0, null);
         assertThat(rows2).isEqualTo(0);
 
-        String json = getAnchorJson("run-5");
-        assertThat(json).contains("\"todoId\": \"todo_A\"");
-        assertThat(json).contains("\"checkpointVersion\": 1");
-        assertThat(json).doesNotContain("todo_B");
-        assertThat(json).contains("\"reservationJson\"");
+        ToolJobAnchor a = ToolJobAnchor.fromJson(newMapper().findById("run-8").getToolJobAnchorJson());
+        assertThat(a.getTodoId()).isEqualTo("todo_A");
+        assertThat(a.getCheckpointVersion()).isEqualTo(1);
+        assertThat(a.getReservationJson()).isNotNull();
     }
 
     @Test
-    void checkpointMergePreservesReservationAndTerminalFields() throws Exception {
-        insertRun("run-6", "EXECUTING", """
-            {"operationId":"run-6:tc-1:1","toolCallId":"tc-1","attempt":1,"taskId":"task-123","checkpointVersion":0,"reservationJson":"r99","terminalStatus":"SUCCEEDED","finalizerStep":"ENVELOPE"}""");
+    void checkpointMergePreservesNonCheckpointFields() throws Exception {
+        insertRun("run-9", "EXECUTING", """
+            {"operationId":"run-9:tc-1:1","toolCallId":"tc-1","attempt":1,"taskId":"task-123","checkpointVersion":0,"reservationJson":"r99","terminalStatus":"SUCCEEDED","finalizerStep":"ENVELOPE","resumeState":"READY","resumeToken":"tok-xyz"}""");
 
-        try (PreparedStatement ps = conn.prepareStatement("""
-                UPDATE alphafrog_agent_run SET tool_job_anchor_json = tool_job_anchor_json
-                    || jsonb_build_object('checkpointVersion', (COALESCE((tool_job_anchor_json #>> '{checkpointVersion}')::int, 0) + 1)::text::jsonb)
-                    || jsonb_build_object('todoId', to_jsonb(?::text))
-                    || jsonb_build_object('datasetSnapshotJson', CAST(? AS jsonb))
-                    || jsonb_build_object('datasetSnapshotDigest', to_jsonb(?::text))
-                    || jsonb_build_object('toolCallsUsed', to_jsonb(?::text))
-                WHERE id = ? AND status = ? AND tool_job_anchor_json #>> '{operationId}' = ?
-                  AND tool_job_anchor_json #>> '{toolCallId}' = ?
-                  AND (tool_job_anchor_json #>> '{attempt}')::int = ?
-                  AND tool_job_anchor_json #>> '{taskId}' = ?
-                  AND COALESCE((tool_job_anchor_json #>> '{checkpointVersion}')::int, 0) = ?""")) {
-            ps.setString(1, "todo_99");
-            ps.setString(2, "{\"d\":\"data\"}");
-            ps.setString(3, "digest99");
-            ps.setString(4, "0");
-            ps.setString(5, "run-6");
-            ps.setString(6, "EXECUTING");
-            ps.setString(7, "run-6:tc-1:1");
-            ps.setString(8, "tc-1");
-            ps.setInt(9, 1);
-            ps.setString(10, "task-123");
-            ps.setInt(11, 0);
-            assertThat(ps.executeUpdate()).isEqualTo(1);
-        }
+        int rows = newMapper().updateToolJobCheckpoint(
+                "run-9", AgentRunStatus.EXECUTING,
+                "run-9:tc-1:1", "tc-1", 1, "task-123", 0,
+                "todo_new", 5, null, "{\"d\":\"data\"}", "dig99", null, 3, null);
+        assertThat(rows).isEqualTo(1);
 
-        String json = getAnchorJson("run-6");
-        assertThat(json).contains("\"todoId\": \"todo_99\"");
-        assertThat(json).contains("\"checkpointVersion\": 1");
-        assertThat(json).contains("\"reservationJson\": \"r99\"");
-        assertThat(json).contains("\"terminalStatus\": \"SUCCEEDED\"");
-        assertThat(json).contains("\"finalizerStep\": \"ENVELOPE\"");
-        assertThat(json).contains("\"operationId\"");
+        ToolJobAnchor a = ToolJobAnchor.fromJson(newMapper().findById("run-9").getToolJobAnchorJson());
+        assertThat(a.getTodoId()).isEqualTo("todo_new");
+        assertThat(a.getToolCallsUsed()).isEqualTo(3);
+        assertThat(a.getCheckpointVersion()).isEqualTo(1);
+        assertThat(a.getDatasetSnapshotJson()).isEqualTo("{\"d\":\"data\"}");
+        // Non-checkpoint preserved after fromJson roundtrip
+        assertThat(a.getOperationId()).isEqualTo("run-9:tc-1:1");
+        assertThat(a.getReservationJson()).isNotNull();
+        assertThat(a.getTerminalStatus()).isEqualTo("SUCCEEDED");
+        assertThat(a.getFinalizerStep()).isEqualTo("ENVELOPE");
+        assertThat(a.getResumeState()).isEqualTo("READY");
+        assertThat(a.getResumeToken()).isEqualTo("tok-xyz");
     }
 
     @Test
-    void checkpointShouldHandleNullVersionAsZero() throws Exception {
-        insertRun("run-7", "EXECUTING", """
-            {"operationId":"run-7:tc-1:1","toolCallId":"tc-1","attempt":1,"taskId":"task-123"}""");
+    void checkpointNullVersionHandledAsZero() throws Exception {
+        insertRun("run-10", "EXECUTING", """
+            {"operationId":"run-10:tc-1:1","toolCallId":"tc-1","attempt":1,"taskId":"task-123"}""");
 
-        try (PreparedStatement ps = conn.prepareStatement("""
-                UPDATE alphafrog_agent_run SET tool_job_anchor_json = tool_job_anchor_json
-                    || jsonb_build_object('checkpointVersion', (COALESCE((tool_job_anchor_json #>> '{checkpointVersion}')::int, 0) + 1)::text::jsonb)
-                    || jsonb_build_object('todoId', to_jsonb(?::text))
-                    || jsonb_build_object('datasetSnapshotJson', CAST(? AS jsonb))
-                    || jsonb_build_object('datasetSnapshotDigest', to_jsonb(?::text))
-                    || jsonb_build_object('toolCallsUsed', to_jsonb(?::text))
-                WHERE id = ? AND status = ? AND tool_job_anchor_json #>> '{operationId}' = ?
-                  AND tool_job_anchor_json #>> '{toolCallId}' = ?
-                  AND (tool_job_anchor_json #>> '{attempt}')::int = ?
-                  AND tool_job_anchor_json #>> '{taskId}' = ?
-                  AND COALESCE((tool_job_anchor_json #>> '{checkpointVersion}')::int, 0) = ?""")) {
-            ps.setString(1, "todo_nullv");
-            ps.setString(2, "{}");
-            ps.setString(3, "d_nullv");
-            ps.setString(4, "0");
-            ps.setString(5, "run-7");
-            ps.setString(6, "EXECUTING");
-            ps.setString(7, "run-7:tc-1:1");
-            ps.setString(8, "tc-1");
-            ps.setInt(9, 1);
-            ps.setString(10, "task-123");
-            ps.setInt(11, 0);
-            assertThat(ps.executeUpdate()).isEqualTo(1);
-        }
+        int rows = newMapper().updateToolJobCheckpoint(
+                "run-10", AgentRunStatus.EXECUTING,
+                "run-10:tc-1:1", "tc-1", 1, "task-123", 0,
+                "todo_z", 1, null, "{}", "dz", null, 0, null);
+        assertThat(rows).isEqualTo(1);
 
-        assertThat(getAnchorJson("run-7")).contains("\"checkpointVersion\": 1");
+        ToolJobAnchor a = ToolJobAnchor.fromJson(newMapper().findById("run-10").getToolJobAnchorJson());
+        assertThat(a.getCheckpointVersion()).isEqualTo(1);
     }
 
     // ========== casUpdateAnchorResumeState: claim CAS ==========
@@ -365,71 +283,54 @@ class ToolJobAnchorMapperIntegrationTest {
     @Test
     void claimCasShouldSucceedOnMatchingTokenVersionState() throws Exception {
         insertRun("run-c1", "RECEIVED", """
-            {"operationId":"run-c1:tc-1:1","resumeState":"READY","resumeToken":"tok-abc","resumeLeaseVersion":5}""");
+            {"resumeState":"READY","resumeToken":"tok-abc","resumeLeaseVersion":5}""");
 
-        try (PreparedStatement ps = conn.prepareStatement("""
-                UPDATE alphafrog_agent_run
-                SET tool_job_anchor_json = CAST(? AS jsonb)
-                WHERE id = ? AND status = ?
-                  AND tool_job_anchor_json #>> '{resumeState}' = ?
-                  AND tool_job_anchor_json #>> '{resumeToken}' = ?
-                  AND (tool_job_anchor_json #>> '{resumeLeaseVersion}')::bigint = ?""")) {
-            ps.setString(1, "{\"resumeState\":\"LAUNCHING\",\"resumeToken\":\"tok-abc\",\"resumeLeaseVersion\":6}");
-            ps.setString(2, "run-c1");
-            ps.setString(3, "RECEIVED");
-            ps.setString(4, "READY");
-            ps.setString(5, "tok-abc");
-            ps.setLong(6, 5);
-            assertThat(ps.executeUpdate()).isEqualTo(1);
-        }
+        ToolJobAnchor na = new ToolJobAnchor();
+        na.setResumeState("LAUNCHING");
+        na.setResumeToken("tok-abc");
+        na.setResumeLeaseVersion(6);
 
-        String json = getAnchorJson("run-c1");
-        assertThat(json).contains("\"resumeState\": \"LAUNCHING\"");
-        assertThat(json).contains("\"resumeLeaseVersion\": 6");
+        int rows = newMapper().casUpdateAnchorResumeState(
+                "run-c1", na.toJson(), AgentRunStatus.RECEIVED, "READY", "tok-abc", 5);
+        assertThat(rows).isEqualTo(1);
+
+        ToolJobAnchor a = ToolJobAnchor.fromJson(newMapper().findById("run-c1").getToolJobAnchorJson());
+        assertThat(a.getResumeState()).isEqualTo("LAUNCHING");
+        assertThat(a.getResumeLeaseVersion()).isEqualTo(6);
     }
 
     @Test
     void claimCasShouldRejectWrongToken() throws Exception {
         insertRun("run-c2", "RECEIVED", """
-            {"operationId":"run-c2:tc-1:1","resumeState":"READY","resumeToken":"tok-xyz","resumeLeaseVersion":3}""");
+            {"resumeState":"READY","resumeToken":"tok-xyz","resumeLeaseVersion":3}""");
 
-        try (PreparedStatement ps = conn.prepareStatement("""
-                UPDATE alphafrog_agent_run
-                SET tool_job_anchor_json = CAST(? AS jsonb)
-                WHERE id = ? AND status = ?
-                  AND tool_job_anchor_json #>> '{resumeState}' = ?
-                  AND tool_job_anchor_json #>> '{resumeToken}' = ?
-                  AND (tool_job_anchor_json #>> '{resumeLeaseVersion}')::bigint = ?""")) {
-            ps.setString(1, "{\"resumeState\":\"LAUNCHING\",\"resumeToken\":\"tok-xyz\",\"resumeLeaseVersion\":4}");
-            ps.setString(2, "run-c2");
-            ps.setString(3, "RECEIVED");
-            ps.setString(4, "READY");
-            ps.setString(5, "tok-wrong");  // wrong token
-            ps.setLong(6, 3);
-            assertThat(ps.executeUpdate()).isEqualTo(0);
-        }
+        ToolJobAnchor na = new ToolJobAnchor();
+        na.setResumeState("LAUNCHING");
+        int rows = newMapper().casUpdateAnchorResumeState(
+                "run-c2", na.toJson(), AgentRunStatus.RECEIVED, "READY", "tok-wrong", 3);
+        assertThat(rows).isEqualTo(0);
     }
 
     @Test
     void claimCasShouldRejectWrongVersion() throws Exception {
         insertRun("run-c3", "RECEIVED", """
-            {"operationId":"run-c3:tc-1:1","resumeState":"READY","resumeToken":"tok-v","resumeLeaseVersion":10}""");
+            {"resumeState":"READY","resumeToken":"tok-v","resumeLeaseVersion":10}""");
 
-        try (PreparedStatement ps = conn.prepareStatement("""
-                UPDATE alphafrog_agent_run
-                SET tool_job_anchor_json = CAST(? AS jsonb)
-                WHERE id = ? AND status = ?
-                  AND tool_job_anchor_json #>> '{resumeState}' = ?
-                  AND tool_job_anchor_json #>> '{resumeToken}' = ?
-                  AND (tool_job_anchor_json #>> '{resumeLeaseVersion}')::bigint = ?""")) {
-            ps.setString(1, "{\"resumeState\":\"LAUNCHING\",\"resumeToken\":\"tok-v\",\"resumeLeaseVersion\":11}");
-            ps.setString(2, "run-c3");
-            ps.setString(3, "RECEIVED");
-            ps.setString(4, "READY");
-            ps.setString(5, "tok-v");
-            ps.setLong(6, 7);  // wrong version: DB has 10, expected 7
-            assertThat(ps.executeUpdate()).isEqualTo(0);
-        }
+        ToolJobAnchor na = new ToolJobAnchor();
+        int rows = newMapper().casUpdateAnchorResumeState(
+                "run-c3", na.toJson(), AgentRunStatus.RECEIVED, "READY", "tok-v", 7);
+        assertThat(rows).isEqualTo(0);
+    }
+
+    @Test
+    void claimCasShouldRejectWrongResumeState() throws Exception {
+        insertRun("run-c4", "RECEIVED", """
+            {"resumeState":"LAUNCHING","resumeToken":"tok-abc","resumeLeaseVersion":5}""");
+
+        ToolJobAnchor na = new ToolJobAnchor();
+        int rows = newMapper().casUpdateAnchorResumeState(
+                "run-c4", na.toJson(), AgentRunStatus.RECEIVED, "READY", "tok-abc", 5);
+        assertThat(rows).isEqualTo(0);
     }
 
     // ========== clearToolJobAnchorWithToken ==========
@@ -439,20 +340,9 @@ class ToolJobAnchorMapperIntegrationTest {
         insertRun("run-cl1", "RECEIVED", """
             {"resumeState":"CONSUMED","resumeToken":"clear-tok","resumeLeaseVersion":8}""");
 
-        try (PreparedStatement ps = conn.prepareStatement("""
-                UPDATE alphafrog_agent_run
-                SET tool_job_anchor_json = CAST('{}' AS jsonb)
-                WHERE id = ?
-                  AND tool_job_anchor_json #>> '{resumeState}' = ?
-                  AND tool_job_anchor_json #>> '{resumeToken}' = ?
-                  AND (tool_job_anchor_json #>> '{resumeLeaseVersion}')::bigint = ?""")) {
-            ps.setString(1, "run-cl1");
-            ps.setString(2, "CONSUMED");
-            ps.setString(3, "clear-tok");
-            ps.setLong(4, 8);
-            assertThat(ps.executeUpdate()).isEqualTo(1);
-        }
-        assertThat(getAnchorJson("run-cl1")).isEqualTo("{}");
+        int rows = newMapper().clearToolJobAnchorWithToken("run-cl1", "CONSUMED", "clear-tok", 8);
+        assertThat(rows).isEqualTo(1);
+        assertThat(newMapper().findById("run-cl1").getToolJobAnchorJson()).isEqualTo("{}");
     }
 
     @Test
@@ -460,19 +350,8 @@ class ToolJobAnchorMapperIntegrationTest {
         insertRun("run-cl2", "RECEIVED", """
             {"resumeState":"READY","resumeToken":"old-tok","resumeLeaseVersion":9}""");
 
-        try (PreparedStatement ps = conn.prepareStatement("""
-                UPDATE alphafrog_agent_run
-                SET tool_job_anchor_json = CAST('{}' AS jsonb)
-                WHERE id = ?
-                  AND tool_job_anchor_json #>> '{resumeState}' = ?
-                  AND tool_job_anchor_json #>> '{resumeToken}' = ?
-                  AND (tool_job_anchor_json #>> '{resumeLeaseVersion}')::bigint = ?""")) {
-            ps.setString(1, "run-cl2");
-            ps.setString(2, "CONSUMED");  // expects CONSUMED, DB has READY
-            ps.setString(3, "old-tok");
-            ps.setLong(4, 9);
-            assertThat(ps.executeUpdate()).isEqualTo(0);
-        }
+        int rows = newMapper().clearToolJobAnchorWithToken("run-cl2", "CONSUMED", "old-tok", 9);
+        assertThat(rows).isEqualTo(0);
     }
 
     @Test
@@ -480,18 +359,7 @@ class ToolJobAnchorMapperIntegrationTest {
         insertRun("run-cl3", "RECEIVED", """
             {"resumeState":"CONSUMED","resumeToken":"real-tok","resumeLeaseVersion":5}""");
 
-        try (PreparedStatement ps = conn.prepareStatement("""
-                UPDATE alphafrog_agent_run
-                SET tool_job_anchor_json = CAST('{}' AS jsonb)
-                WHERE id = ?
-                  AND tool_job_anchor_json #>> '{resumeState}' = ?
-                  AND tool_job_anchor_json #>> '{resumeToken}' = ?
-                  AND (tool_job_anchor_json #>> '{resumeLeaseVersion}')::bigint = ?""")) {
-            ps.setString(1, "run-cl3");
-            ps.setString(2, "CONSUMED");
-            ps.setString(3, "stale-tok");  // wrong token
-            ps.setLong(4, 5);
-            assertThat(ps.executeUpdate()).isEqualTo(0);
-        }
+        int rows = newMapper().clearToolJobAnchorWithToken("run-cl3", "CONSUMED", "stale-tok", 5);
+        assertThat(rows).isEqualTo(0);
     }
 }

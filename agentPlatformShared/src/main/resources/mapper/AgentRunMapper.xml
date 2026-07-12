@@ -367,19 +367,19 @@
                 || jsonb_build_object('checkpointVersion',
                        (COALESCE((tool_job_anchor_json #>> '{checkpointVersion}')::int, 0) + 1)::text::jsonb)
                 || jsonb_build_object('todoId', #{todoId}::text)
-                || jsonb_build_object('sequence', to_jsonb(#{sequence}))
-                || CASE WHEN #{completedTodosJson} IS NULL
+                || jsonb_build_object('sequence', #{sequence,jdbcType=INTEGER})
+                || CASE WHEN #{completedTodosJson}::text IS NULL
                        THEN jsonb_build_object('completedTodosJson', '[]'::text)
                        ELSE jsonb_build_object('completedTodosJson', #{completedTodosJson}::text)
                   END
                 || jsonb_build_object('datasetSnapshotJson', #{datasetSnapshotJson}::text)
                 || jsonb_build_object('datasetSnapshotDigest', #{datasetSnapshotDigest}::text)
-                || CASE WHEN #{datasetRefsJson} IS NULL
+                || CASE WHEN #{datasetRefsJson}::text IS NULL
                        THEN jsonb_build_object('datasetRefsJson', '[]'::text)
                        ELSE jsonb_build_object('datasetRefsJson', #{datasetRefsJson}::text)
                   END
-                || jsonb_build_object('toolCallsUsed', to_jsonb(#{toolCallsUsed}))
-                || CASE WHEN #{estimateJson} IS NULL
+                || jsonb_build_object('toolCallsUsed', #{toolCallsUsed,jdbcType=INTEGER})
+                || CASE WHEN #{estimateJson}::text IS NULL
                        THEN '{}'::jsonb
                        ELSE jsonb_build_object('estimateJson', #{estimateJson}::text)
                   END,
