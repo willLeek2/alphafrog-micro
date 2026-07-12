@@ -119,6 +119,30 @@ public interface AgentRunMapper {
                                      @Param("newStatus") AgentRunStatus newStatus,
                                      @Param("expectedStatus") AgentRunStatus expectedStatus);
 
+    /** Claim an empty Run anchor for the first PREPARING dispatch. */
+    int claimPreparingToolJobAnchor(@Param("id") String id,
+                                    @Param("toolJobAnchorJson") String toolJobAnchorJson,
+                                    @Param("expectedStatus") AgentRunStatus expectedStatus);
+
+    /** Replace only the active dispatch still owned by operationId. */
+    int updateActiveToolJobAnchor(@Param("id") String id,
+                                  @Param("toolJobAnchorJson") String toolJobAnchorJson,
+                                  @Param("expectedStatus") AgentRunStatus expectedStatus,
+                                  @Param("expectedOperationId") String expectedOperationId);
+
+    /** Atomically transfer only the active operation owner to a new Run status. */
+    int updateToolJobAnchorAndStatusByOperation(
+            @Param("id") String id,
+            @Param("toolJobAnchorJson") String toolJobAnchorJson,
+            @Param("newStatus") AgentRunStatus newStatus,
+            @Param("expectedStatus") AgentRunStatus expectedStatus,
+            @Param("expectedOperationId") String expectedOperationId);
+
+    /** Clear only the still-active dispatch identified by operationId. */
+    int clearActiveToolJobAnchor(@Param("id") String id,
+                                 @Param("expectedStatus") AgentRunStatus expectedStatus,
+                                 @Param("expectedOperationId") String expectedOperationId);
+
     /** Whitelist merge used when a full checkpoint write fails. */
     int markToolJobCheckpointFailed(@Param("id") String id,
                                     @Param("operationId") String operationId,

@@ -13,6 +13,7 @@ import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.config.StressTestProperties;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingException;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 import world.willfrog.agent.platform.service.AgentObservabilityService;
 import world.willfrog.agent.platform.service.AgentRunBudgetService;
@@ -634,6 +635,8 @@ public class ToolRouter {
                 );
                 default -> unsupported(toolName);
             };
+        } catch (ExternalToolJobPendingException pending) {
+            throw pending;
         } catch (Exception e) {
             // 任意工具实现抛出的异常都收敛为标准失败 JSON，避免对 LLM 暴露 Java 异常信息
             // 具体堆栈仍在服务日志中，模型只拿到可解释的 error.message。

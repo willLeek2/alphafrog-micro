@@ -85,7 +85,8 @@ class ToolRouterToolProviderTest {
                 rereadToolHandler,
                 objectMapper,
                 eventService,
-                new LangchainToolConcurrencyThrottle(false, 20, 60)
+                new LangchainToolConcurrencyThrottle(false, 20, 60),
+                mock(world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore.class)
         );
     }
 

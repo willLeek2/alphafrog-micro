@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Test;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.config.StressTestProperties;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingException;
 import world.willfrog.agent.platform.service.AgentObservabilityService;
 import world.willfrog.agent.tools.compaction.RereadToolHandler;
 import world.willfrog.agent.tools.docs.LoadToolGuideTool;
@@ -22,6 +23,7 @@ import java.util.function.Supplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
@@ -38,6 +40,36 @@ import static org.mockito.Mockito.verify;
  * ToolRouter 路由层：参数别名 / 位置参数 arg0..arg7 → 8 形参 listMyData 方法对应形参。
  */
 class ToolRouterListMyDataRouteTest {
+
+    @Test
+    void executePythonPendingSignalIsRethrownWithoutFailureJson() {
+        PythonSandboxTools python = mock(PythonSandboxTools.class);
+        ExternalToolJobPendingException pending =
+                new ExternalToolJobPendingException("run-1", "call-1", 1, "pending");
+        when(python.executePython(anyString(), anyString(), anyString(), any(), any()))
+                .thenThrow(pending);
+        ToolResultCacheService cacheService = mock(ToolResultCacheService.class);
+        when(cacheService.executeWithCache(anyString(), any(), anyString(), any())).thenAnswer(inv -> {
+            Supplier<ToolResultCacheService.ToolExecutionOutcome> supplier = inv.getArgument(3);
+            ToolResultCacheService.ToolExecutionOutcome outcome = supplier.get();
+            return ToolResultCacheService.CachedToolCallResult.builder()
+                    .result(outcome.getResult()).durationMs(outcome.getDurationMs())
+                    .success(outcome.isSuccess()).build();
+        });
+        ToolRouter router = new ToolRouter(
+                mock(MarketDataTools.class), mock(RagTools.class), mock(SearchTools.class), python,
+                mock(LoadToolGuideTool.class), mock(ListMyDataTool.class),
+                new PythonStaticPrecheckService(), llmPropertiesWithStaticPrecheck(false),
+                cacheService, mock(RereadToolHandler.class), mock(AgentObservabilityService.class),
+                new ObjectMapper(), new SimpleMeterRegistry(), new StressTestProperties());
+
+        ExternalToolJobPendingException thrown = assertThrows(
+                ExternalToolJobPendingException.class,
+                () -> router.invokeWithMeta("executePython", Map.of(
+                        "code", "print(1)", "dataset_ids", "1")));
+
+        assertEquals(pending, thrown);
+    }
 
     @SuppressWarnings("unchecked")
     @Test

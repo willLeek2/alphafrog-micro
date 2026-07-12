@@ -308,6 +308,43 @@
           AND status = #{expectedStatus}
     </update>
 
+    <update id="claimPreparingToolJobAnchor">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = CAST(#{toolJobAnchorJson} AS jsonb),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status = #{expectedStatus}
+          AND (tool_job_anchor_json IS NULL OR tool_job_anchor_json = '{}'::jsonb)
+    </update>
+
+    <update id="updateActiveToolJobAnchor">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = CAST(#{toolJobAnchorJson} AS jsonb),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status = #{expectedStatus}
+          AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{expectedOperationId}
+    </update>
+
+    <update id="updateToolJobAnchorAndStatusByOperation">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = CAST(#{toolJobAnchorJson} AS jsonb),
+            status = #{newStatus},
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status = #{expectedStatus}
+          AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{expectedOperationId}
+    </update>
+
+    <update id="clearActiveToolJobAnchor">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = CAST('{}' AS jsonb),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status = #{expectedStatus}
+          AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{expectedOperationId}
+    </update>
+
     <update id="markToolJobCheckpointFailed">
         UPDATE alphafrog_agent_run
         SET tool_job_anchor_json = tool_job_anchor_json || jsonb_build_object(
@@ -380,7 +417,7 @@
         FROM alphafrog_agent_run
         WHERE tool_job_anchor_json IS NOT NULL
           AND tool_job_anchor_json &lt;&gt; '{}'::jsonb
-          AND status IN ('WAITING_TOOL_JOB', 'WAITING', 'CANCELED')
+          AND status IN ('EXECUTING', 'WAITING_TOOL_JOB', 'WAITING', 'CANCELED')
         ORDER BY updated_at ASC
         LIMIT #{limit}
     </select>

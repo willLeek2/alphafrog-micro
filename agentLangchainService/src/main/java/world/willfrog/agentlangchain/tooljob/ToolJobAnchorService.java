@@ -56,6 +56,29 @@ public class ToolJobAnchorService {
         return rows == 1;
     }
 
+    public boolean claimPreparing(String runId, ToolJobAnchor anchor, AgentRunStatus expectedStatus) {
+        return agentRunMapper.claimPreparingToolJobAnchor(
+                runId, anchor.toJson(), expectedStatus) == 1;
+    }
+
+    public boolean updateActive(String runId, ToolJobAnchor anchor,
+                                AgentRunStatus expectedStatus, String operationId) {
+        return agentRunMapper.updateActiveToolJobAnchor(
+                runId, anchor.toJson(), expectedStatus, operationId) == 1;
+    }
+
+    public boolean updateActiveAndStatus(String runId, ToolJobAnchor anchor,
+                                         AgentRunStatus newStatus,
+                                         AgentRunStatus expectedStatus,
+                                         String operationId) {
+        return agentRunMapper.updateToolJobAnchorAndStatusByOperation(
+                runId, anchor.toJson(), newStatus, expectedStatus, operationId) == 1;
+    }
+
+    public boolean clearActive(String runId, AgentRunStatus expectedStatus, String operationId) {
+        return agentRunMapper.clearActiveToolJobAnchor(runId, expectedStatus, operationId) == 1;
+    }
+
     /**
      * Narrow PostgreSQL JSONB merge for checkpoint-failure ownership. It does
      * not replace reservation/terminal fields and binds the failed checkpoint

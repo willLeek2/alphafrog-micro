@@ -19,6 +19,10 @@ public class ToolJobAnchor {
     private int schemaVersion = 1;
     private int checkpointVersion; // incremented on each atomic checkpoint merge
     private String operationId;
+    private String requestFingerprint;
+    private String canonicalCreateSpecJson;
+    private String createRequestJson;
+    private String anchorState; // PREPARING, ATTACHED, PENDING, TERMINAL, FINALIZING, CONSUMED
     private String taskId;
     private String toolCallId;
     private int attempt;
@@ -102,6 +106,18 @@ public class ToolJobAnchor {
 
     public String getOperationId() { return operationId; }
     public void setOperationId(String operationId) { this.operationId = operationId; }
+
+    public String getRequestFingerprint() { return requestFingerprint; }
+    public void setRequestFingerprint(String requestFingerprint) { this.requestFingerprint = requestFingerprint; }
+
+    public String getCanonicalCreateSpecJson() { return canonicalCreateSpecJson; }
+    public void setCanonicalCreateSpecJson(String canonicalCreateSpecJson) { this.canonicalCreateSpecJson = canonicalCreateSpecJson; }
+
+    public String getCreateRequestJson() { return createRequestJson; }
+    public void setCreateRequestJson(String createRequestJson) { this.createRequestJson = createRequestJson; }
+
+    public String getAnchorState() { return anchorState; }
+    public void setAnchorState(String anchorState) { this.anchorState = anchorState; }
 
     public String getTaskId() { return taskId; }
     public void setTaskId(String taskId) { this.taskId = taskId; }

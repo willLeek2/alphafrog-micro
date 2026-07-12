@@ -10,6 +10,7 @@ import dev.langchain4j.service.tool.ToolProviderResult;
 import lombok.RequiredArgsConstructor;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore;
 import world.willfrog.agent.tools.compaction.RereadToolHandler;
 import world.willfrog.agent.tools.dataset.ListMyDataTool;
 import world.willfrog.agent.tools.docs.LoadToolGuideTool;
@@ -83,6 +84,7 @@ public class ToolRouterToolProvider implements ToolProvider {
      */
     private final AgentEventService eventService;
     private final LangchainToolConcurrencyThrottle toolThrottle;
+    private final PythonSandboxDispatchStore pythonSandboxDispatchStore;
 
     /**
      * 为当前 LC4j 调用构建「工具名 → ToolExecutor」映射。
@@ -120,7 +122,8 @@ public class ToolRouterToolProvider implements ToolProvider {
                 codeInterpreterEnabled
         );
 
-        ToolExecutor executor = new ToolRouterToolExecutor(toolRouter, objectMapper, eventService, toolThrottle);
+        ToolExecutor executor = new ToolRouterToolExecutor(
+                toolRouter, objectMapper, eventService, toolThrottle, pythonSandboxDispatchStore);
         Map<ToolSpecification, ToolExecutor> tools = new LinkedHashMap<>();
         for (ToolSpecification specification : specifications) {
             tools.put(specification, executor);

@@ -527,6 +527,65 @@ class ToolJobAnchorMapperIntegrationTest {
     }
 
     @Test
+    void activeDispatchClearRequiresStatusAndOperationIdentity() throws Exception {
+        insertRun("run-dispatch-clear", "EXECUTING", """
+            {"operationId":"run-dispatch-clear:call-1:1","anchorState":"TERMINAL"}""");
+
+        AgentRunMapper mapper = newMapper();
+        assertThat(mapper.clearActiveToolJobAnchor(
+                "run-dispatch-clear", AgentRunStatus.WAITING_TOOL_JOB,
+                "run-dispatch-clear:call-1:1")).isEqualTo(0);
+        assertThat(mapper.clearActiveToolJobAnchor(
+                "run-dispatch-clear", AgentRunStatus.EXECUTING,
+                "run-dispatch-clear:call-stale:1")).isEqualTo(0);
+        assertThat(mapper.clearActiveToolJobAnchor(
+                "run-dispatch-clear", AgentRunStatus.EXECUTING,
+                "run-dispatch-clear:call-1:1")).isEqualTo(1);
+        assertThat(mapper.findById("run-dispatch-clear").getToolJobAnchorJson()).isEqualTo("{}");
+    }
+
+    @Test
+    void dispatchClaimUpdateAndTransferAreOperationFenced() throws Exception {
+        insertRun("run-dispatch-cas", "EXECUTING", "{}");
+        AgentRunMapper mapper = newMapper();
+        String preparing = """
+            {"operationId":"run-dispatch-cas:call-1:1","anchorState":"PREPARING"}""";
+        String attached = """
+            {"operationId":"run-dispatch-cas:call-1:1","anchorState":"ATTACHED","taskId":"task-1"}""";
+        String pending = """
+            {"operationId":"run-dispatch-cas:call-1:1","anchorState":"PENDING","taskId":"task-1"}""";
+
+        assertThat(mapper.claimPreparingToolJobAnchor(
+                "run-dispatch-cas", preparing, AgentRunStatus.EXECUTING)).isEqualTo(1);
+        assertThat(mapper.claimPreparingToolJobAnchor(
+                "run-dispatch-cas", preparing, AgentRunStatus.EXECUTING)).isEqualTo(0);
+        assertThat(mapper.updateActiveToolJobAnchor(
+                "run-dispatch-cas", attached, AgentRunStatus.EXECUTING,
+                "run-dispatch-cas:stale:1")).isEqualTo(0);
+        assertThat(mapper.updateActiveToolJobAnchor(
+                "run-dispatch-cas", attached, AgentRunStatus.EXECUTING,
+                "run-dispatch-cas:call-1:1")).isEqualTo(1);
+        assertThat(mapper.updateToolJobAnchorAndStatusByOperation(
+                "run-dispatch-cas", pending, AgentRunStatus.WAITING_TOOL_JOB,
+                AgentRunStatus.EXECUTING, "run-dispatch-cas:stale:1")).isEqualTo(0);
+        assertThat(mapper.updateToolJobAnchorAndStatusByOperation(
+                "run-dispatch-cas", pending, AgentRunStatus.WAITING_TOOL_JOB,
+                AgentRunStatus.EXECUTING, "run-dispatch-cas:call-1:1")).isEqualTo(1);
+        assertThat(mapper.findById("run-dispatch-cas").getStatus())
+                .isEqualTo(AgentRunStatus.WAITING_TOOL_JOB);
+    }
+
+    @Test
+    void activeDispatchScanIncludesExecutingAnchorForCrashRecovery() throws Exception {
+        insertRun("run-dispatch-active", "EXECUTING", """
+            {"operationId":"run-dispatch-active:call-1:1","anchorState":"PREPARING"}""");
+
+        assertThat(newMapper().listActiveToolJobAnchors(10))
+                .extracting(run -> run.getId())
+                .contains("run-dispatch-active");
+    }
+
+    @Test
     void dataAnalysisObservabilityCasSupportsMissingExpectedAndRejectsStaleWriter() throws Exception {
         insertRun("run-obs-1", "EXECUTING", "{}");
         AgentRunMapper mapper = newMapper();

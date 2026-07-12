@@ -11,6 +11,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingException;
+import world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore;
 import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agent.tools.router.ToolRouter;
 import world.willfrog.agentlangchain.config.LangchainToolConcurrencyThrottle;
@@ -33,6 +34,9 @@ class ToolRouterToolExecutorTest {
     @Mock
     private AgentEventService eventService;
 
+    @Mock
+    private PythonSandboxDispatchStore pythonSandboxDispatchStore;
+
     private ObjectMapper objectMapper;
     private ToolRouterToolExecutor executor;
 
@@ -40,7 +44,8 @@ class ToolRouterToolExecutorTest {
     void setUp() {
         objectMapper = new ObjectMapper();
         executor = new ToolRouterToolExecutor(toolRouter, objectMapper, eventService,
-                new LangchainToolConcurrencyThrottle(false, 20, 60));
+                new LangchainToolConcurrencyThrottle(false, 20, 60),
+                pythonSandboxDispatchStore);
         // 设置 AgentContext
         AgentContext.setRunId("run-123");
         AgentContext.setUserId("user-456");
@@ -182,6 +187,32 @@ class ToolRouterToolExecutorTest {
         assertSame(pending, thrown);
         verify(eventService).append(eq("run-123"), eq("user-456"), eq("TOOL_CALL_STARTED"), any());
         verify(eventService, never()).append(eq("run-123"), eq("user-456"), eq("TOOL_CALL_FINISHED"), any());
+        verify(eventService, never()).appendOnce(anyString(), anyString(), anyString(), anyString(), any());
+        verifyNoInteractions(pythonSandboxDispatchStore);
+    }
+
+    @Test
+    void execute_synchronousPythonTerminalAppendsOnceBeforeClearingAnchor() {
+        ToolExecutionRequest request = ToolExecutionRequest.builder()
+                .id("call-python-1")
+                .name("executePython")
+                .arguments("{\"dataset_ids\":\"1\",\"code\":\"print(1)\"}")
+                .build();
+        when(toolRouter.invokeWithMeta(
+                "executePython", Map.of("dataset_ids", "1", "code", "print(1)")))
+                .thenReturn(ToolRouter.ToolInvocationResult.builder()
+                        .output("{\"ok\":true}").success(true).durationMs(1L).build());
+        when(pythonSandboxDispatchStore.clearActive(
+                "run-123", "run-123:call-python-1:1")).thenReturn(true);
+
+        executor.execute(request, null);
+
+        var order = inOrder(eventService, pythonSandboxDispatchStore);
+        order.verify(eventService).appendOnce(
+                eq("run-123"), eq("user-456"), eq("TOOL_CALL_FINISHED"),
+                eq("run-123:call-python-1:logical_terminal"), any());
+        order.verify(pythonSandboxDispatchStore).clearActive(
+                "run-123", "run-123:call-python-1:1");
     }
 
     @Test

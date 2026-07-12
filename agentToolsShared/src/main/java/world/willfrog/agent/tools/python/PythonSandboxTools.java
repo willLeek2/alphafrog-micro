@@ -6,7 +6,9 @@ import lombok.extern.slf4j.Slf4j;
 import org.apache.dubbo.config.annotation.DubboReference;
 import org.apache.dubbo.rpc.RpcContext;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
+import world.willfrog.agent.platform.dataanalysis.*;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.debug.DebugObservabilityRpcKeys;
 import world.willfrog.agent.platform.debug.DebugObservabilityService;
@@ -15,8 +17,14 @@ import world.willfrog.agent.workflow.AgentRunDatasetCsvWriter;
 import world.willfrog.agent.workflow.AgentRunDatasetEntry;
 import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
 import world.willfrog.agent.workflow.AgentRunDatasetSnapshot;
+import world.willfrog.agent.tools.dataset.DatasetEntryMetadataReader;
+import world.willfrog.agent.tools.python.DataAnalysisCapacityServiceImpl.CapacityAdmissionException;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
 
+import com.google.protobuf.util.JsonFormat;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -99,8 +107,29 @@ public class PythonSandboxTools {
     @Autowired(required = false)
     private DebugObservabilityService debugObservabilityService;
 
+    @Autowired(required = false)
+    private DataAnalysisCapacityService dataAnalysisCapacityService;
+
+    @Autowired(required = false)
+    private DataAnalysisCapacityProperties dataAnalysisCapacityProperties;
+
+    @Autowired(required = false)
+    private PythonSandboxDispatchStore pythonSandboxDispatchStore;
+
+    @Autowired(required = false)
+    private DataAnalysisTerminalRecorder dataAnalysisTerminalRecorder;
+
+    @Value("${agent.tool-job.fast-path-ms:1500}")
+    private long fastPathMs = 1500L;
+
+    @Value("${sandbox.runtime-environment-version:python-sandbox-v1}")
+    private String runtimeEnvironmentVersion = "python-sandbox-v1";
+
+    private final DatasetEntryMetadataReader metadataReader;
+
     public PythonSandboxTools(ObjectMapper objectMapper) {
         this.objectMapper = objectMapper;
+        this.metadataReader = new DatasetEntryMetadataReader(objectMapper);
     }
 
     /**
@@ -304,9 +333,16 @@ public class PythonSandboxTools {
             requestBuilder.setPathsDatasetCsv(pathsDatasetCsv);
             requestBuilder.setPathManifestCsv(pathManifestCsv);
 
+            ExecuteRequest legacyRequest = requestBuilder.build();
+            if (dataIntenseWiringAvailable()) {
+                return executeDataIntense(
+                        runId, subSnapshot, allDatasets, resolvedManifests,
+                        legacyRequest, timeout, toolStartMs);
+            }
+
             long createStartMs = System.currentTimeMillis();
             installDebugRpcAttachments();
-            ExecuteResponse createResp = pythonSandboxService.createTask(requestBuilder.build());
+            ExecuteResponse createResp = pythonSandboxService.createTask(legacyRequest);
             emitSandboxEvent("sandbox_create_task", Map.of(
                     "durationMs", System.currentTimeMillis() - createStartMs,
                     "status", createResp.getError() == null || createResp.getError().isEmpty() ? "OK" : "ERROR",
@@ -364,11 +400,394 @@ public class PythonSandboxTools {
 
             emitSandboxToolTotal(toolStartMs, "TIMEOUT", "TIMEOUT");
             return fail("executePython", "TIMEOUT", "Sandbox task timed out after " + timeout + "s", Map.of("task_id", taskId));
+        } catch (ExternalToolJobPendingException pending) {
+            throw pending;
         } catch (Exception e) {
             log.error("Execute python tool error", e);
             emitSandboxToolTotal(toolStartMs, "ERROR", "TOOL_ERROR");
             return fail("executePython", "TOOL_ERROR", "Python sandbox invocation error", Map.of("message", nvl(e.getMessage())));
         }
+    }
+
+    private boolean dataIntenseWiringAvailable() {
+        return dataAnalysisCapacityService != null
+                && dataAnalysisCapacityProperties != null
+                && pythonSandboxDispatchStore != null
+                && dataAnalysisTerminalRecorder != null;
+    }
+
+    private String executeDataIntense(
+            String runId,
+            AgentRunDatasetSnapshot datasetSnapshot,
+            List<AgentRunDatasetEntry> datasets,
+            List<AgentRunDatasetEntry> manifests,
+            ExecuteRequest baseRequest,
+            int timeoutSeconds,
+            long toolStartMs) throws Exception {
+        String toolCallId = AgentContext.getToolCallId();
+        if (toolCallId == null || toolCallId.isBlank()) {
+            return fail("executePython", "TOOL_JOB_IDENTITY_UNAVAILABLE",
+                    "executePython requires a stable tool call id", Map.of("run_id", runId));
+        }
+        int attempt = 1;
+        DataAnalysisOperationIdentity identity = new DataAnalysisOperationIdentity(
+                runId, toolCallId, attempt);
+
+        DataAnalysisEstimate estimate;
+        DataAnalysisCapacityProperties.DataAnalysisResourceClassDecision decision;
+        try {
+            long rows = 0L;
+            long bytes = 0L;
+            for (AgentRunDatasetEntry dataset : datasets) {
+                DatasetEntryMetadataReader.EntryMetadata metadata = metadataReader.read(dataset);
+                if (metadata.rowCount() == null || metadata.bytes() == null) {
+                    return fail("executePython", "DATA_ANALYSIS_ESTIMATE_UNAVAILABLE",
+                            "Dataset row/byte metadata is required before Sandbox admission",
+                            Map.of("dataset_id", dataset.originalId(),
+                                    "metadata_status", metadata.metadataStatus()));
+                }
+                rows = Math.addExact(rows, metadata.rowCount());
+                bytes = Math.addExact(bytes, metadata.bytes());
+            }
+            int manifestMembers = manifests.stream()
+                    .mapToInt(entry -> entry.relatedDatasetIds().size())
+                    .sum();
+            decision = dataAnalysisCapacityProperties.classify(
+                    rows, bytes, baseRequest.getLibrariesList());
+            if (decision.outcome()
+                    == DataAnalysisCapacityProperties.DataAnalysisResourceClassDecision.Outcome.REJECTED) {
+                return fail("executePython", "DATA_ANALYSIS_TASK_TOO_LARGE",
+                        "Dataset estimate exceeds Sandbox hard limits",
+                        Map.of("estimated_rows", rows, "estimated_bytes", bytes));
+            }
+            estimate = new DataAnalysisEstimate(
+                    rows, bytes, datasets.size(), 1.0d, manifestMembers, List.of(),
+                    decision.resourceClass(), decision.capacityUnits());
+        } catch (ArithmeticException overflow) {
+            return fail("executePython", "DATA_ANALYSIS_TASK_TOO_LARGE",
+                    "Dataset estimate overflowed admission counters", Map.of());
+        }
+
+        DataAnalysisReservation reservation;
+        try {
+            reservation = dataAnalysisCapacityService.reserve(identity, estimate);
+        } catch (CapacityAdmissionException admission) {
+            String code = admission.reason() == CapacityAdmissionException.Reason.TASK_TOO_LARGE
+                    ? "DATA_ANALYSIS_TASK_TOO_LARGE"
+                    : "DATA_ANALYSIS_SERVER_BUSY";
+            return fail("executePython", code, admission.getMessage(), Map.of("retryable",
+                    admission.reason() != CapacityAdmissionException.Reason.TASK_TOO_LARGE));
+        }
+
+        long timeoutMillis = timeoutSeconds * 1000L;
+        CanonicalSandboxCreateSpec spec = new CanonicalSandboxCreateSpec(
+                CanonicalSandboxCreateSpec.CURRENT_SCHEMA_VERSION,
+                identity.operationId(),
+                sha256(baseRequest.getCode()),
+                datasetSnapshot.immutableDigest(),
+                reservation.resourceClass(),
+                decision.memoryLimitBytes(),
+                timeoutMillis,
+                runtimeEnvironmentVersion,
+                sha256(baseRequest.getLibrariesList().stream().sorted().collect(Collectors.joining("\n"))),
+                sha256(""));
+        ExecuteRequest request = baseRequest.toBuilder()
+                .setResourceClass(reservation.resourceClass().name())
+                .setEstimatedRows(estimate.estimatedRows())
+                .setEstimatedBytes(estimate.estimatedBytes())
+                .setFileCount(estimate.fileCount())
+                .setCapacityUnits(estimate.capacityUnits())
+                .setOperationId(identity.operationId())
+                .setRequestFingerprint(spec.requestFingerprint())
+                .setMemoryLimitBytes(spec.memoryLimitBytes())
+                .setTimeoutMillis(spec.timeoutMillis())
+                .setRuntimeEnvironmentVersion(spec.runtimeEnvironmentVersion())
+                .setCanonicalSpecSchemaVersion(spec.schemaVersion())
+                .setCodeHash(spec.codeHash())
+                .setImmutableDatasetSnapshotDigest(spec.immutableDatasetSnapshotDigest())
+                .setLibrariesDigest(spec.librariesDigest())
+                .setSandboxOptionsDigest(spec.sandboxOptionsDigest())
+                .build();
+
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId(identity.operationId());
+        anchor.setRequestFingerprint(spec.requestFingerprint());
+        anchor.setCanonicalCreateSpecJson(objectMapper.writeValueAsString(spec));
+        anchor.setCreateRequestJson(JsonFormat.printer()
+                .omittingInsignificantWhitespace().print(request));
+        anchor.setAnchorState("PREPARING");
+        anchor.setToolCallId(toolCallId);
+        anchor.setAttempt(attempt);
+        anchor.setTodoId(AgentContext.getTodoId());
+        anchor.setSequence(AgentContext.getTodoSequence() == null ? 0 : AgentContext.getTodoSequence());
+        anchor.setRunDisposition("AUTO_RESUME");
+        anchor.setAutoResume(true);
+        anchor.setReservationJson(objectMapper.writeValueAsString(reservation));
+        anchor.setEstimateJson(objectMapper.writeValueAsString(estimate));
+        anchor.setDatasetSnapshotJson(objectMapper.writeValueAsString(datasetSnapshot));
+        anchor.setDatasetSnapshotDigest(datasetSnapshot.immutableDigest());
+        anchor.setTimeoutAt(Instant.now().plusMillis(timeoutMillis));
+        anchor.setNextPollAt(Instant.now().plusMillis(POLL_INTERVAL_MS));
+
+        if (!pythonSandboxDispatchStore.persistPreparing(runId, anchor)) {
+            releasePreDispatch(reservation);
+            return fail("executePython", "TOOL_JOB_ANCHOR_INVALID",
+                    "Failed to persist PREPARING tool-job anchor", Map.of("operation_id", identity.operationId()));
+        }
+
+        ExecuteResponse createResp;
+        try {
+            installDebugRpcAttachments();
+            createResp = pythonSandboxService.createTask(request);
+        } catch (Exception createFailure) {
+            try {
+                GetTaskByOperationIdResponse lookup = pythonSandboxService.getTaskByOperationId(
+                        GetTaskByOperationIdRequest.newBuilder()
+                                .setOperationId(identity.operationId()).build());
+                if (lookup != null && lookup.getFound()
+                        && !lookup.getTaskId().isBlank()
+                        && (lookup.getRequestFingerprint().isBlank()
+                                || spec.requestFingerprint().equals(lookup.getRequestFingerprint()))) {
+                    createResp = ExecuteResponse.newBuilder()
+                            .setTaskId(lookup.getTaskId())
+                            .setRequestFingerprint(spec.requestFingerprint())
+                            .build();
+                } else if (lookup != null && !lookup.getFound()) {
+                    if (releasePreDispatch(reservation)) {
+                        pythonSandboxDispatchStore.clearActive(runId, identity.operationId());
+                    }
+                    throw createFailure;
+                } else {
+                    throw new IllegalStateException(
+                            "createTask outcome is ambiguous; PREPARING anchor retained", createFailure);
+                }
+            } catch (Exception lookupFailure) {
+                if (lookupFailure != createFailure) {
+                    createFailure.addSuppressed(lookupFailure);
+                }
+                throw createFailure;
+            }
+        }
+        if (createResp == null || createResp.getError() != null && !createResp.getError().isEmpty()
+                || createResp.getTaskId() == null || createResp.getTaskId().isBlank()) {
+            if (releasePreDispatch(reservation)) {
+                pythonSandboxDispatchStore.clearActive(runId, identity.operationId());
+            }
+            return fail("executePython", "CREATE_TASK_FAILED",
+                    "Failed to create python sandbox task",
+                    Map.of("message", createResp == null ? "empty response" : nvl(createResp.getError())));
+        }
+        String taskId = createResp.getTaskId();
+        reservation = transitionReservation(reservation, DataAnalysisReservationState.TASK_ATTACHED, taskId);
+        if (dataAnalysisCapacityService.restoreReservation(reservation) == DataAnalysisRestoreOutcome.CONFLICT) {
+            throw new IllegalStateException("capacity reservation attachment conflicted for task=" + taskId);
+        }
+        anchor.setTaskId(taskId);
+        anchor.setAnchorState("ATTACHED");
+        anchor.setReservationJson(objectMapper.writeValueAsString(reservation));
+        pythonSandboxDispatchStore.persistAttached(runId, anchor);
+
+        if (!createResp.getRequestFingerprint().isBlank()
+                && !spec.requestFingerprint().equals(createResp.getRequestFingerprint())) {
+            log.error("Sandbox response fingerprint mismatch for run={}, operationId={}, taskId={}; "
+                            + "transferring to durable pending for operator-safe recovery",
+                    runId, identity.operationId(), taskId);
+            return suspend(runId, anchor, reservation, taskId);
+        }
+
+        long fastDeadline = System.currentTimeMillis() + Math.max(1L, fastPathMs);
+        while (System.currentTimeMillis() < fastDeadline) {
+            TaskStatusResponse statusResp = getTaskStatus(taskId);
+            String status = statusResp == null ? "" : nvl(statusResp.getStatus());
+            if (isTerminal(status)) {
+                TaskResultResponse result = fetchTerminalResult(taskId);
+                if (result != null && result.hasRetryable()) {
+                    try {
+                        String completed = completeSynchronously(
+                                runId, identity, estimate, reservation, anchor, status, result);
+                        if (completed != null) {
+                            emitSandboxToolTotal(toolStartMs, "OK", "");
+                            return completed;
+                        }
+                    } catch (Exception terminalFailure) {
+                        log.warn("Synchronous terminal finalization deferred to durable reconciler: "
+                                        + "run={}, taskId={}, error={}",
+                                runId, taskId, terminalFailure.getMessage());
+                    }
+                }
+                return suspend(runId, anchor, reservation, taskId);
+            }
+            TimeUnit.MILLISECONDS.sleep(Math.min(100L, Math.max(1L, fastDeadline - System.currentTimeMillis())));
+        }
+        return suspend(runId, anchor, reservation, taskId);
+    }
+
+    private String completeSynchronously(
+            String runId,
+            DataAnalysisOperationIdentity identity,
+            DataAnalysisEstimate estimate,
+            DataAnalysisReservation attached,
+            ToolJobAnchor anchor,
+            String status,
+            TaskResultResponse result) throws Exception {
+        DataAnalysisReservation confirmed = transitionReservation(
+                attached, DataAnalysisReservationState.TERMINAL_CONFIRMED, attached.taskId());
+        if (dataAnalysisCapacityService.restoreReservation(confirmed) == DataAnalysisRestoreOutcome.CONFLICT) {
+            return null;
+        }
+        String preview = boundedPreview(result.getStdout());
+        String rawRef = blankToNull(result.getDatasetDir());
+        String errorCode = blankToNull(result.getError());
+        if (!"SUCCEEDED".equals(status) && errorCode == null) {
+            errorCode = status;
+        }
+        Instant terminalAt = Instant.now();
+        anchor.setAnchorState("TERMINAL");
+        anchor.setTerminalStatus(status);
+        anchor.setSandboxTerminalStatus(status);
+        anchor.setTerminalResultPreview(preview);
+        anchor.setTerminalRawRef(rawRef);
+        anchor.setTerminalErrorCode(errorCode);
+        anchor.setTerminalRetryable(result.getRetryable());
+        anchor.setTerminalAt(terminalAt);
+        anchor.setTerminalUsageJson(JsonFormat.printer()
+                .omittingInsignificantWhitespace().print(result.getResourceUsage()));
+        anchor.setReservationJson(objectMapper.writeValueAsString(confirmed));
+        anchor.setFinalizerStep("ENVELOPE");
+        if (!pythonSandboxDispatchStore.persistAttached(runId, anchor)) {
+            return null;
+        }
+
+        DataAnalysisResourceUsage usage = toUsage(confirmed.resourceClass(), result);
+        String output = formatResult(attached.taskId(), status, result);
+        DataAnalysisTerminalEnvelope envelope = new DataAnalysisTerminalEnvelope(
+                runId, identity.toolCallId(), identity.attempt(), identity.operationId(),
+                attached.taskId(), status, "SUCCEEDED".equals(status), preview, rawRef,
+                errorCode, "SUCCEEDED".equals(status) ? null : "sandbox " + status,
+                result.getRetryable(), estimate, confirmed, usage, terminalAt, false);
+
+        DataAnalysisReleaseOutcome released = dataAnalysisCapacityService.releaseReservation(
+                new DataAnalysisReleaseRequest(confirmed,
+                        new DataAnalysisReleaseProof.Terminal(envelope),
+                        DataAnalysisReleaseReason.SANDBOX_TERMINAL_CONFIRMED));
+        if (released != DataAnalysisReleaseOutcome.RELEASED
+                && released != DataAnalysisReleaseOutcome.ALREADY_RELEASED) {
+            return null;
+        }
+        DataAnalysisReservation releasedReservation = transitionReservation(
+                confirmed, DataAnalysisReservationState.RELEASED, confirmed.taskId());
+        anchor.setReservationJson(objectMapper.writeValueAsString(releasedReservation));
+        anchor.setFinalizerStep("RELEASE");
+        if (!pythonSandboxDispatchStore.persistAttached(runId, anchor)) {
+            return null;
+        }
+        DataAnalysisUpsertOutcome recorded = dataAnalysisTerminalRecorder.upsert(envelope);
+        if (recorded != DataAnalysisUpsertOutcome.INSERTED
+                && recorded != DataAnalysisUpsertOutcome.ALREADY_PRESENT_SAME) {
+            return null;
+        }
+        anchor.setUsagePersisted(true);
+        anchor.setFinalizerStep("USAGE");
+        if (!pythonSandboxDispatchStore.persistAttached(runId, anchor)) {
+            return null;
+        }
+        return output;
+    }
+
+    private String suspend(
+            String runId,
+            ToolJobAnchor anchor,
+            DataAnalysisReservation current,
+            String taskId) throws Exception {
+        if (anchor.getReservationJson() != null && !anchor.getReservationJson().isBlank()) {
+            current = objectMapper.readValue(anchor.getReservationJson(), DataAnalysisReservation.class);
+        }
+        DataAnalysisReservation pending = current.state() == DataAnalysisReservationState.TASK_ATTACHED
+                ? transitionReservation(current, DataAnalysisReservationState.PENDING_TRANSFERRED, taskId)
+                : current;
+        if (current.state() == DataAnalysisReservationState.TASK_ATTACHED
+                && dataAnalysisCapacityService.restoreReservation(pending) == DataAnalysisRestoreOutcome.CONFLICT) {
+            throw new IllegalStateException("capacity transfer to pending conflicted");
+        }
+        anchor.setAnchorState("PENDING");
+        anchor.setReservationJson(objectMapper.writeValueAsString(pending));
+        anchor.setNextPollAt(Instant.now().plusMillis(POLL_INTERVAL_MS));
+        if (!pythonSandboxDispatchStore.transferToPending(runId, anchor)) {
+            throw new IllegalStateException("durable transfer to WAITING_TOOL_JOB failed");
+        }
+        throw new ExternalToolJobPendingException(
+                runId, anchor.getToolCallId(), anchor.getAttempt(),
+                "Python Sandbox task continues in background: " + taskId);
+    }
+
+    private TaskResultResponse fetchTerminalResult(String taskId) {
+        installDebugRpcAttachments();
+        TaskResultResponse result = pythonSandboxService.getTaskResult(
+                GetTaskResultRequest.newBuilder().setTaskId(taskId).build());
+        return result == null || !result.getError().isBlank() && result.getStatus().isBlank()
+                ? null : result;
+    }
+
+    private static boolean isTerminal(String status) {
+        return "SUCCEEDED".equals(status) || "FAILED".equals(status) || "CANCELED".equals(status);
+    }
+
+    private DataAnalysisResourceUsage toUsage(
+            DataAnalysisResourceClass resourceClass,
+            TaskResultResponse result) throws Exception {
+        if (!result.hasResourceUsage()) {
+            return DataAnalysisResourceUsage.missing(resourceClass);
+        }
+        return SandboxResourceUsageParser.parse(
+                objectMapper,
+                resourceClass,
+                JsonFormat.printer().omittingInsignificantWhitespace()
+                        .print(result.getResourceUsage()));
+    }
+
+    private boolean releasePreDispatch(DataAnalysisReservation reservation) {
+        DataAnalysisReleaseOutcome outcome = dataAnalysisCapacityService.releaseReservation(
+                new DataAnalysisReleaseRequest(
+                reservation,
+                new DataAnalysisReleaseProof.PreDispatchAbort(reservation.identity()),
+                DataAnalysisReleaseReason.CREATE_NOT_STARTED));
+        return outcome == DataAnalysisReleaseOutcome.RELEASED
+                || outcome == DataAnalysisReleaseOutcome.ALREADY_RELEASED;
+    }
+
+    private static DataAnalysisReservation transitionReservation(
+            DataAnalysisReservation current,
+            DataAnalysisReservationState state,
+            String taskId) {
+        return new DataAnalysisReservation(
+                current.reservationId(), current.identity(), current.resourceClass(),
+                current.capacityUnits(), state, taskId, current.acquiredAt());
+    }
+
+    private static String sha256(String value) {
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256")
+                    .digest((value == null ? "" : value).getBytes(StandardCharsets.UTF_8));
+            return "sha256:" + java.util.HexFormat.of().formatHex(digest);
+        } catch (Exception impossible) {
+            throw new IllegalStateException("SHA-256 unavailable", impossible);
+        }
+    }
+
+    private static String boundedPreview(String value) {
+        if (value == null || value.isBlank()) return null;
+        byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
+        if (bytes.length <= DataAnalysisTerminalEnvelope.MAX_RESULT_PREVIEW_BYTES) return value;
+        int limit = DataAnalysisTerminalEnvelope.MAX_RESULT_PREVIEW_BYTES - 3;
+        String prefix = new String(bytes, 0, limit, StandardCharsets.UTF_8);
+        while (prefix.getBytes(StandardCharsets.UTF_8).length > limit) {
+            prefix = prefix.substring(0, prefix.length() - 1);
+        }
+        return prefix + "...";
+    }
+
+    private static String blankToNull(String value) {
+        return value == null || value.isBlank() ? null : value.trim();
     }
 
     /**

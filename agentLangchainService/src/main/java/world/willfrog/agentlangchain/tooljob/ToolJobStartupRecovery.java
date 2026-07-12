@@ -6,6 +6,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Service;
+import com.google.protobuf.util.JsonFormat;
 import world.willfrog.agent.platform.dataanalysis.*;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.model.AgentRunStatus;
@@ -73,6 +74,14 @@ public class ToolJobStartupRecovery {
                         new com.fasterxml.jackson.databind.ObjectMapper().findAndRegisterModules();
                 DataAnalysisReservation reservation = mapper.readValue(
                         anchor.getReservationJson(), DataAnalysisReservation.class);
+                if (reservation != null
+                        && reservation.state() == DataAnalysisReservationState.PREPARING) {
+                    reservation = resolvePreparingDispatch(run, anchor, reservation);
+                    if (reservation == null) {
+                        quarantinedRuns.add(run.getId());
+                        continue;
+                    }
+                }
                 if (reservation != null && reservation.state() != DataAnalysisReservationState.RELEASED) {
                     durableReservations.add(reservation);
                 }
@@ -111,6 +120,12 @@ public class ToolJobStartupRecovery {
             if (anchor == null) continue;
 
             try {
+                if (run.getStatus() == AgentRunStatus.EXECUTING) {
+                    if (!transferRecoveredAttached(run.getId(), anchor)) {
+                        log.warn("Startup dispatch transfer remains unresolved for run={}", run.getId());
+                    }
+                    continue;
+                }
                 String resumeState = anchor.getResumeState();
                 if ("CONSUMED".equals(resumeState)) {
                     // Token-gated durable clear before Redis. Only delete Redis if
@@ -201,6 +216,102 @@ public class ToolJobStartupRecovery {
             log.error("Failed to resolve anchor for run={}, taskId={}", run.getId(), taskId, e);
             anchor.setNextPollAt(Instant.now().plusMillis(config.getReconcilerIntervalMs()));
             redisCache.atomicWritePendingAndDue(run.getId(), anchor);
+        }
+    }
+
+    private DataAnalysisReservation resolvePreparingDispatch(
+            AgentRun run,
+            ToolJobAnchor anchor,
+            DataAnalysisReservation preparing) {
+        if (run.getStatus() != AgentRunStatus.EXECUTING
+                || anchor.getOperationId() == null
+                || anchor.getOperationId().isBlank()) {
+            return null;
+        }
+        try {
+            GetTaskByOperationIdResponse lookup = sandboxService.getTaskByOperationId(
+                    GetTaskByOperationIdRequest.newBuilder()
+                            .setOperationId(anchor.getOperationId()).build());
+            String taskId = null;
+            String fingerprint = null;
+            if (lookup != null && lookup.getFound()) {
+                taskId = lookup.getTaskId();
+                fingerprint = lookup.getRequestFingerprint();
+            } else {
+                if (anchor.getCreateRequestJson() == null || anchor.getCreateRequestJson().isBlank()) {
+                    return null;
+                }
+                ExecuteRequest.Builder request = ExecuteRequest.newBuilder();
+                JsonFormat.parser().merge(anchor.getCreateRequestJson(), request);
+                ExecuteResponse created = sandboxService.createTask(request.build());
+                if (created == null || !created.getError().isBlank()) {
+                    return null;
+                }
+                taskId = created.getTaskId();
+                fingerprint = created.getRequestFingerprint();
+            }
+            if (taskId == null || taskId.isBlank()
+                    || anchor.getRequestFingerprint() == null
+                    || fingerprint != null && !fingerprint.isBlank()
+                    && !anchor.getRequestFingerprint().equals(fingerprint)) {
+                return null;
+            }
+            DataAnalysisReservation attached = new DataAnalysisReservation(
+                    preparing.reservationId(), preparing.identity(), preparing.resourceClass(),
+                    preparing.capacityUnits(), DataAnalysisReservationState.TASK_ATTACHED,
+                    taskId, preparing.acquiredAt());
+            anchor.setTaskId(taskId);
+            anchor.setAnchorState("ATTACHED");
+            anchor.setReservationJson(new com.fasterxml.jackson.databind.ObjectMapper()
+                    .findAndRegisterModules().writeValueAsString(attached));
+            return anchorService.updateActive(
+                    run.getId(), anchor, AgentRunStatus.EXECUTING, anchor.getOperationId())
+                    ? attached : null;
+        } catch (Exception unresolved) {
+            log.error("Failed to resolve PREPARING dispatch for run={}", run.getId(), unresolved);
+            return null;
+        }
+    }
+
+    private boolean transferRecoveredAttached(String runId, ToolJobAnchor anchor) {
+        if (anchor.getReservationJson() == null || anchor.getReservationJson().isBlank()) {
+            return false;
+        }
+        try {
+            com.fasterxml.jackson.databind.ObjectMapper mapper =
+                    new com.fasterxml.jackson.databind.ObjectMapper().findAndRegisterModules();
+            DataAnalysisReservation current = mapper.readValue(
+                    anchor.getReservationJson(), DataAnalysisReservation.class);
+            DataAnalysisReservation pending = current;
+            if (current.state() == DataAnalysisReservationState.TASK_ATTACHED) {
+                pending = new DataAnalysisReservation(
+                        current.reservationId(), current.identity(), current.resourceClass(),
+                        current.capacityUnits(), DataAnalysisReservationState.PENDING_TRANSFERRED,
+                        current.taskId(), current.acquiredAt());
+                if (capacityService.restoreReservation(pending) == DataAnalysisRestoreOutcome.CONFLICT) {
+                    return false;
+                }
+            }
+            if (pending.state() != DataAnalysisReservationState.PENDING_TRANSFERRED
+                    && pending.state() != DataAnalysisReservationState.TERMINAL_CONFIRMED
+                    && pending.state() != DataAnalysisReservationState.RELEASED) {
+                return false;
+            }
+            anchor.setAnchorState("PENDING");
+            anchor.setReservationJson(mapper.writeValueAsString(pending));
+            if (anchor.getNextPollAt() == null) {
+                anchor.setNextPollAt(Instant.now().plusMillis(config.getPollIntervalMs()));
+            }
+            if (!anchorService.updateActiveAndStatus(
+                    runId, anchor, AgentRunStatus.WAITING_TOOL_JOB,
+                    AgentRunStatus.EXECUTING, anchor.getOperationId())) {
+                return false;
+            }
+            redisCache.atomicWritePendingAndDue(runId, anchor);
+            return true;
+        } catch (Exception failure) {
+            log.error("Failed to transfer recovered dispatch for run={}", runId, failure);
+            return false;
         }
     }
 

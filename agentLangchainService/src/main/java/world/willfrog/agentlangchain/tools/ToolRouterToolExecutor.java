@@ -9,7 +9,9 @@ import dev.langchain4j.service.tool.ToolExecutor;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.dataanalysis.DataAnalysisOperationIdentity;
 import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingException;
+import world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore;
 import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agent.platform.service.AgentSsePayloadSupport;
 import world.willfrog.agent.workflow.DatasetRefRegistry;
@@ -76,6 +78,7 @@ final class ToolRouterToolExecutor implements ToolExecutor {
     private final ObjectMapper objectMapper;
     private final AgentEventService eventService;
     private final LangchainToolConcurrencyThrottle toolThrottle;
+    private final PythonSandboxDispatchStore pythonSandboxDispatchStore;
 
     /**
      * 执行一次 LC4j tool call 并把结果返回给模型。
@@ -147,6 +150,7 @@ final class ToolRouterToolExecutor implements ToolExecutor {
             long durationMs = Duration.between(start, Instant.now()).toMillis();
             toolThrottle.recordExecution(request.name(), durationMs);
             emitToolCallFinished(toolCallId, request.name(), params, success, output, durationMs);
+            acknowledgeSynchronousPythonCompletion(toolCallId, request.name());
 
             Map<String, String> datasetRefs = LangchainDatasetRefContext.snapshot();
             DatasetRefRegistry.registerFromJson(output, datasetRefs);
@@ -331,7 +335,27 @@ final class ToolRouterToolExecutor implements ToolExecutor {
             payload.put("phase", phase);
         }
         AgentSsePayloadSupport.putExecutionAttribution(payload);
-        eventService.append(runId, userId, "TOOL_CALL_FINISHED", payload);
+        if ("executePython".equals(toolName)) {
+            String dedupeKey = runId + ":" + toolCallId + ":logical_terminal";
+            eventService.appendOnce(runId, userId, "TOOL_CALL_FINISHED", dedupeKey, payload);
+        } else {
+            eventService.append(runId, userId, "TOOL_CALL_FINISHED", payload);
+        }
+    }
+
+    private void acknowledgeSynchronousPythonCompletion(String toolCallId, String toolName) {
+        if (!"executePython".equals(toolName) || pythonSandboxDispatchStore == null) {
+            return;
+        }
+        String runId = AgentContext.getRunId();
+        if (runId == null || runId.isBlank()) {
+            return;
+        }
+        String operationId = new DataAnalysisOperationIdentity(runId, toolCallId, 1).operationId();
+        if (!pythonSandboxDispatchStore.clearActive(runId, operationId)) {
+            log.debug("No synchronous Python anchor cleared for run={}, operationId={}",
+                    runId, operationId);
+        }
     }
 
     /**
