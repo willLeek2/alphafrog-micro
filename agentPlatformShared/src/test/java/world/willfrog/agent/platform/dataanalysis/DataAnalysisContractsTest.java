@@ -192,6 +192,31 @@ class DataAnalysisContractsTest {
     }
 
     @Test
+    void completeUsageRejectsMissingPhaseWallTime() {
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> new DataAnalysisResourceUsage(
+                        DataAnalysisResourceClass.STANDARD,
+                        1L,
+                        1L,
+                        null,
+                        1L,
+                        null,
+                        null,
+                        null,
+                        1L,
+                        1L,
+                        1L,
+                        1,
+                        "SUCCESS",
+                        false,
+                        false,
+                        true,
+                        null,
+                        List.of()));
+    }
+
+    @Test
     void partialUsageRejectsEmptyOrInconsistentMissingFields() {
         assertThrows(
                 IllegalArgumentException.class,

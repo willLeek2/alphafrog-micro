@@ -29,7 +29,10 @@ public record DataAnalysisResourceUsage(
             "cpuMillis",
             "memoryPeakBytes",
             "logicalBytesScanned",
+            "queueWaitMillis",
+            "prepareMillis",
             "executionWallMillis",
+            "cleanupMillis",
             "datasetOpenCount",
             "exitReason");
 
@@ -62,7 +65,10 @@ public record DataAnalysisResourceUsage(
                 "cpuMillis", nullableSentinel(cpuMillis),
                 "memoryPeakBytes", nullableSentinel(memoryPeakBytes),
                 "logicalBytesScanned", nullableSentinel(logicalBytesScanned),
+                "queueWaitMillis", nullableSentinel(queueWaitMillis),
+                "prepareMillis", nullableSentinel(prepareMillis),
                 "executionWallMillis", nullableSentinel(executionWallMillis),
+                "cleanupMillis", nullableSentinel(cleanupMillis),
                 "datasetOpenCount", nullableSentinel(datasetOpenCount),
                 "exitReason", nullableSentinel(exitReason));
         Set<String> actuallyMissing = new TreeSet<>();
