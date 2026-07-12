@@ -172,7 +172,7 @@ class PythonSandboxToolsTest {
 
         // pathsDatasetCsv 反映 sub-snapshot (只 caller 选中的 dataset 1)
         String dsCsv = sent.getPathsDatasetCsv();
-        assertTrue(dsCsv.contains("1,/__AF_INPUT__/ds-a/a.csv,000300.SH"),
+        assertTrue(dsCsv.contains("1,/__AF_INPUT__/_run_dataset_1/a.csv,000300.SH"),
                 "pathsDatasetCsv 应含 dataset 1 行；got: " + dsCsv);
         assertTrue(dsCsv.contains("agent_run_dataset_id,dataset_file_path,from_ts_code"),
                 "pathsDatasetCsv 表头应存在");
@@ -185,7 +185,8 @@ class PythonSandboxToolsTest {
                 "pathManifestCsv 应含 m-x; got: " + mfCsv);
         assertTrue(mfCsv.contains("agent_run_manifest_id,manifest_file_path,related_dataset_ids"),
                 "pathManifestCsv 表头应存在");
-        boolean hasRunLevelNumber = mfCsv.contains("m-x/manifest.json,1\n") || mfCsv.contains("m-x/manifest.json,1,");
+        boolean hasRunLevelNumber = mfCsv.contains("_run_manifest_1/manifest.json,1\n")
+                || mfCsv.contains("_run_manifest_1/manifest.json,1,");
         assertTrue(hasRunLevelNumber,
                 "pathManifestCsv related_dataset_ids 应该是 run-level number; got: " + mfCsv);
 
