@@ -453,25 +453,32 @@ class PythonSandboxToolsP001FastPathTest {
         ToolJobAnchorService realAnchorService = new ToolJobAnchorService(newMapper());
         assertThat(realAnchorService.updateAnchor(RUN_ID, seedAnchor, AgentRunStatus.WAITING_TOOL_JOB)).isTrue();
 
-        // Mock anchorService: EVENT step write fails once, then succeeds
-        ToolJobAnchorService anchorMock = mock(ToolJobAnchorService.class);
-        when(anchorMock.updateAnchor(eq(RUN_ID), any(ToolJobAnchor.class),
-                eq(AgentRunStatus.WAITING_TOOL_JOB)))
-                .thenReturn(false).thenReturn(true);
-        when(anchorMock.updateAnchorAndStatus(eq(RUN_ID), any(ToolJobAnchor.class),
-                eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.WAITING_TOOL_JOB)))
-                .thenReturn(true);
+        // AnchorService delegate: real PG for all writes EXCEPT EVENT step (fails once)
+        var eventCallCount = new java.util.concurrent.atomic.AtomicInteger(0);
+        ToolJobAnchorService anchorDelegate = new ToolJobAnchorService(newMapper()) {
+            @Override
+            public boolean updateAnchor(String runId, ToolJobAnchor anchor, AgentRunStatus expectedStatus) {
+                if ("EVENT".equals(anchor.getFinalizerStep())) {
+                    int n = eventCallCount.incrementAndGet();
+                    if (n == 1) return false;
+                }
+                boolean result = super.updateAnchor(runId, anchor, expectedStatus);
+                return result;
+            }
+        };
 
-        // Track hook calls — simple counter
+        // Track hook calls
         var hookCallCount = new java.util.concurrent.atomic.AtomicInteger(0);
-        String dedupeKey = RUN_ID + ":" + TOOL_CALL_ID + ":logical_terminal";
-        ToolJobEventHook eventHook = (runId, anchor) -> {
-            hookCallCount.incrementAndGet();
-            return true; // hook fires successfully (event persisted, DB step write fails separately)
+        ToolJobEventHook eventHook = new ToolJobEventHook() {
+            @Override
+            public boolean emitTerminalEvent(String rId, ToolJobAnchor a) {
+                hookCallCount.incrementAndGet();
+                return true;
+            }
         };
 
         ToolJobFinalizer finalizer = new ToolJobFinalizer(
-                anchorMock, mock(ToolJobRedisCache.class),
+                anchorDelegate, mock(ToolJobRedisCache.class),
                 capacity, mock(ToolJobResumeService.class), new ToolJobConfig());
         java.lang.reflect.Field usageField = ToolJobFinalizer.class.getDeclaredField("usageHook");
         usageField.setAccessible(true);
@@ -482,13 +489,14 @@ class PythonSandboxToolsP001FastPathTest {
         evtField.setAccessible(true);
         evtField.set(finalizer, eventHook);
 
-        // First call: ENVELOPE+RELEASE+USAGE skip, EVENT fires hook, DB write FAILS
-        ToolJobAnchor loaded = realAnchorService.loadAnchor(RUN_ID);
+        // First call: EVENT step fires hook, DB write FAILS
+        ToolJobAnchor loaded = anchorDelegate.loadAnchor(RUN_ID);
         assertThat(loaded.getFinalizerStep()).isEqualTo("USAGE");
         finalizer.handleTerminal(RUN_ID, loaded, "SUCCEEDED", null, true);
 
-        // Oracle 1: hook called once
-        assertThat(hookCallCount.get()).isEqualTo(1);
+        // Oracle 1: hook called once, EVENT step intercepted
+        assertThat(hookCallCount.get()).as("hook call count").isEqualTo(1);
+        assertThat(eventCallCount.get()).as("event step write attempts").isEqualTo(1);
 
         // Oracle 2: PG reload → anchor still USAGE (EVENT write NOT persisted)
         ToolJobAnchorService reloadService = new ToolJobAnchorService(newMapper());
@@ -496,16 +504,27 @@ class PythonSandboxToolsP001FastPathTest {
         assertThat(afterCrash).isNotNull();
         assertThat(afterCrash.getFinalizerStep()).isEqualTo("USAGE");
 
-        // Re-entry: fresh PG reload, EVENT step now succeeds
+        // Re-entry: fresh PG reload, EVENT step now succeeds (writes to real PG)
         ToolJobAnchor freshFromPg = reloadService.loadAnchor(RUN_ID);
+        assertThat(freshFromPg.getFinalizerStep()).isEqualTo("USAGE");
         finalizer.handleTerminal(RUN_ID, freshFromPg, "SUCCEEDED", null, true);
 
-        // Oracle 3: hook called twice (1st fired, 2nd re-entry)
+        // Oracle 3: hook called twice
         assertThat(hookCallCount.get()).isEqualTo(2);
 
-        // Oracle 4: after reentry, anchor in PG has EVENT persisted
-        ToolJobAnchor afterReentry = reloadService.loadAnchor(RUN_ID);
-        assertThat(afterReentry.isTerminalEventEmitted()).isTrue();
+        // Oracle 4: direct JDBC check — anchor in PG reflects EVENT/CAS/RESUME_READY
+        try (Connection c = ds.getConnection();
+             var ps = c.prepareStatement(
+                 "SELECT tool_job_anchor_json::text FROM alphafrog_agent_run WHERE id = ?")) {
+            ps.setString(1, RUN_ID);
+            var rs2 = ps.executeQuery();
+            assertThat(rs2.next()).isTrue();
+            String rawJson = rs2.getString(1);
+            ToolJobAnchor directFromDb = ToolJobAnchor.fromJson(rawJson);
+            // After re-entry with delegate writing to real PG, anchor advanced past USAGE
+            assertThat(directFromDb.getFinalizerStep()).isIn("EVENT", "CAS_STATUS", "RESUME_READY");
+            assertThat(directFromDb.isTerminalEventEmitted()).isTrue();
+        }
     }
 
     /** Build anchor with ENVELOPE+RELEASE+USAGE steps already done */
