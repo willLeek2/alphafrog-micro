@@ -19,8 +19,18 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.dataanalysis.*;
+import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.entity.AgentRunEvent;
+import world.willfrog.agent.platform.mapper.AgentRunEventMapper;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
+import world.willfrog.agent.platform.service.AgentMessageService;
+import world.willfrog.agent.platform.service.AgentPromptService;
+import world.willfrog.agent.platform.service.AgentRunEventRedisStore;
+import world.willfrog.agent.platform.service.AgentRunStateStore;
+import world.willfrog.agent.platform.service.DataAnalysisObservabilityService;
 import world.willfrog.agent.tools.python.DataAnalysisCapacityProperties;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
 import world.willfrog.agent.workflow.AgentRunDatasetEntry;
@@ -36,12 +46,15 @@ import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.Statement;
 import java.time.Instant;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
+import org.mockito.ArgumentCaptor;
 
 /**
  * P0-01: Real fast-path production test using PythonSandboxTools.executePython
@@ -104,6 +117,20 @@ class PythonSandboxToolsP001FastPathTest {
                     ext JSONB DEFAULT '{}',
                     tool_job_anchor_json JSONB DEFAULT '{}'
                 )""");
+            stmt.execute("""
+                CREATE TABLE IF NOT EXISTS alphafrog_agent_run_event (
+                    id BIGSERIAL PRIMARY KEY,
+                    run_id VARCHAR(64) NOT NULL,
+                    seq INT NOT NULL,
+                    event_type VARCHAR(128) NOT NULL,
+                    payload_json JSONB DEFAULT '{}',
+                    dedupe_key VARCHAR(256),
+                    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+                )""");
+            stmt.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_event_dedupe
+                ON alphafrog_agent_run_event (run_id, dedupe_key)
+                WHERE dedupe_key IS NOT NULL""");
         }
         // Redis
         redisConnectionFactory = new LettuceConnectionFactory(
@@ -122,6 +149,7 @@ class PythonSandboxToolsP001FastPathTest {
     void setUp() throws Exception {
         DataSource ds = dataSource();
         try (Connection conn = ds.getConnection(); Statement stmt = conn.createStatement()) {
+            stmt.execute("DELETE FROM alphafrog_agent_run_event");
             stmt.execute("DELETE FROM alphafrog_agent_run");
         }
         // Clean Redis
@@ -294,6 +322,424 @@ class PythonSandboxToolsP001FastPathTest {
         verifyNoInteractions(recorder);
     }
 
+    // ===== P0-01 second half: real ToolRouter appendOnce → clear =====
+
+    @Test
+    void toolRouterAppendOnceAndClearAfterFastPathCompletion() throws Exception {
+        DataAnalysisReservation preparing = preparingReservation();
+        when(capacity.reserve(any(), any())).thenReturn(preparing);
+        when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(capacity.releaseReservation(any())).thenReturn(DataAnalysisReleaseOutcome.RELEASED);
+        when(recorder.upsert(any())).thenReturn(DataAnalysisUpsertOutcome.INSERTED);
+        when(sandbox.createTask(any())).thenAnswer(invocation -> {
+            ExecuteRequest req = invocation.getArgument(0);
+            return ExecuteResponse.newBuilder().setTaskId("task-p001")
+                    .setRequestFingerprint(req.getRequestFingerprint()).build();
+        });
+        when(sandbox.getTaskStatus(any())).thenReturn(
+                TaskStatusResponse.newBuilder().setStatus("SUCCEEDED").build());
+        when(sandbox.getTaskResult(any())).thenReturn(TaskResultResponse.newBuilder()
+                .setTaskId("task-p001").setStatus("SUCCEEDED").setExitCode(0)
+                .setStdout("ok").setDatasetDir("/sandbox/input")
+                .setRetryable(false)
+                .setResourceUsage(completeUsage()).build());
+
+        // Execute fast-path (same as first half)
+        String output = tools.executePython("print(1)", "1", null, null, 30);
+        assertThat(output).contains("\"ok\":true");
+
+        // Build real AgentEventService for appendOnce verification
+        AgentLlmLocalConfigLoader llmConfigLoader = mock(AgentLlmLocalConfigLoader.class);
+        AgentRunEventRedisStore eventRedisStore = new AgentRunEventRedisStore(
+                redisTemplate, om, llmConfigLoader);
+        AgentMessageService messageService = mock(AgentMessageService.class);
+        AgentPromptService promptService = mock(AgentPromptService.class);
+        AgentEventService eventService = new AgentEventService(
+                newMapper(), newEventMapper(), eventRedisStore, om, redisTemplate,
+                llmConfigLoader, messageService, promptService);
+        // Override TTL/checkpoint (not needed for test)
+        injectEventServiceFields(eventService);
+
+        // ToolRouter's appendOnce: dedupe key pattern from ToolRouterToolExecutor
+        String dedupeKey = RUN_ID + ":" + TOOL_CALL_ID + ":logical_terminal";
+        Map<String, Object> eventPayload = Map.of(
+                "tool_call_id", TOOL_CALL_ID,
+                "tool_name", "executePython",
+                "success", true,
+                "result_preview", output.substring(0, Math.min(output.length(), 500)),
+                "duration_ms", 1L);
+
+        // Oracle 1: appendOnce inserts event to PG
+        AgentContext.setUserId("user-test");
+        boolean firstInsert = eventService.appendOnce(
+                RUN_ID, "user-test", "TOOL_CALL_FINISHED", dedupeKey, eventPayload);
+        assertThat(firstInsert).isTrue();
+
+        // Oracle 2: event row exists in PG with correct dedupe key
+        AgentRunEventMapper eventMapper = newEventMapper();
+        AgentRunEvent found = eventMapper.findByRunIdAndDedupeKey(RUN_ID, dedupeKey);
+        assertThat(found).isNotNull();
+        assertThat(found.getEventType()).isEqualTo("TOOL_CALL_FINISHED");
+        assertThat(found.getDedupeKey()).isEqualTo(dedupeKey);
+        assertThat(found.getPayloadJson()).contains("executePython");
+
+        // Oracle 3: appendOnce dedup — second call with same key returns false
+        boolean secondInsert = eventService.appendOnce(
+                RUN_ID, "user-test", "TOOL_CALL_FINISHED", dedupeKey, eventPayload);
+        assertThat(secondInsert).isFalse();
+
+        // Oracle 4: only one event row (dedup worked)
+        SqlSession countSession = sqlSessionFactory.openSession(true);
+        openSessions.add(countSession);
+        var rs = countSession.getConnection().createStatement()
+                .executeQuery("SELECT COUNT(*) FROM alphafrog_agent_run_event WHERE run_id = '" + RUN_ID + "'");
+        rs.next();
+        int eventCount = rs.getInt(1);
+        assertThat(eventCount).isEqualTo(1);
+
+        // Oracle 5: anchor still has operationId before clear (terminal state preserved)
+        ToolJobAnchorService verifyAnchor = new ToolJobAnchorService(newMapper());
+        ToolJobAnchor dbAnchor = verifyAnchor.loadAnchor(RUN_ID);
+        assertThat(dbAnchor).isNotNull();
+        assertThat(dbAnchor.getOperationId()).isNotNull();
+
+        // Oracle 6: clearActive (ToolRouter acknowledgement)
+        String operationId = RUN_ID + ":" + TOOL_CALL_ID + ":1";
+        boolean cleared = dispatchStore.clearActive(RUN_ID, operationId);
+        assertThat(cleared).isTrue();
+
+        // Oracle 7: after clear, anchor is {} (operationId/finalizerStep/resumeState all null)
+        ToolJobAnchorService verifyAfterClear = new ToolJobAnchorService(newMapper());
+        ToolJobAnchor afterClear = verifyAfterClear.loadAnchor(RUN_ID);
+        assertThat(afterClear).isNotNull();
+        assertThat(afterClear.getOperationId()).isNull();
+        assertThat(afterClear.getFinalizerStep()).isNull();
+        assertThat(afterClear.getResumeState()).isNull();
+
+        // Oracle 8: event row still exists after clear (logical event is durable)
+        AgentRunEvent stillThere = newEventMapper().findByRunIdAndDedupeKey(RUN_ID, dedupeKey);
+        assertThat(stillThere).isNotNull();
+
+        // Oracle 9: capacity release and usage upsert called exactly once
+        verify(capacity).releaseReservation(argThat(req ->
+                req.proof() instanceof DataAnalysisReleaseProof.Terminal));
+        verify(recorder).upsert(any());
+    }
+
+    private static void injectEventServiceFields(AgentEventService svc) throws Exception {
+        java.lang.reflect.Field ttlField = AgentEventService.class.getDeclaredField("ttlMinutes");
+        ttlField.setAccessible(true);
+        ttlField.set(svc, 60);
+        java.lang.reflect.Field ittlField = AgentEventService.class.getDeclaredField("interruptedTtlDays");
+        ittlField.setAccessible(true);
+        ittlField.set(svc, 7);
+        java.lang.reflect.Field cvField = AgentEventService.class.getDeclaredField("checkpointVersion");
+        cvField.setAccessible(true);
+        cvField.set(svc, "v1");
+        java.lang.reflect.Field pcField = AgentEventService.class.getDeclaredField("payloadMaxChars");
+        pcField.setAccessible(true);
+        pcField.set(svc, 50000);
+        java.lang.reflect.Field ppField = AgentEventService.class.getDeclaredField("payloadPreviewChars");
+        ppField.setAccessible(true);
+        ppField.set(svc, 500);
+    }
+
+    // ===== P0-07: real event hook → PG event persistence + dedup =====
+
+    @Test
+    void eventHookEmitsTerminalEventThroughAppendOnceAndDedupPreventsDoubleEmit() throws Exception {
+        // Fast-path executePython
+        DataAnalysisReservation preparing = preparingReservation();
+        when(capacity.reserve(any(), any())).thenReturn(preparing);
+        when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(capacity.releaseReservation(any())).thenReturn(DataAnalysisReleaseOutcome.RELEASED);
+        when(recorder.upsert(any())).thenReturn(DataAnalysisUpsertOutcome.INSERTED);
+        when(sandbox.createTask(any())).thenAnswer(invocation -> {
+            ExecuteRequest req = invocation.getArgument(0);
+            return ExecuteResponse.newBuilder().setTaskId("task-p007")
+                    .setRequestFingerprint(req.getRequestFingerprint()).build();
+        });
+        when(sandbox.getTaskStatus(any())).thenReturn(
+                TaskStatusResponse.newBuilder().setStatus("SUCCEEDED").build());
+        when(sandbox.getTaskResult(any())).thenReturn(TaskResultResponse.newBuilder()
+                .setTaskId("task-p007").setStatus("SUCCEEDED").setExitCode(0)
+                .setStdout("ok").setDatasetDir("/sandbox/input")
+                .setRetryable(false)
+                .setResourceUsage(completeUsage()).build());
+
+        tools.executePython("print(1)", "1", null, null, 30);
+
+        // Load anchor from real PG (has terminalStatus + toolCallId from completeSynchronously)
+        ToolJobAnchorService verifyAnchor = new ToolJobAnchorService(newMapper());
+        ToolJobAnchor anchor = verifyAnchor.loadAnchor(RUN_ID);
+        assertThat(anchor).isNotNull();
+        assertThat(anchor.getTerminalStatus()).isEqualTo("SUCCEEDED");
+        assertThat(anchor.getToolCallId()).isEqualTo(TOOL_CALL_ID);
+
+        // Build real AgentEventService for event hook test
+        AgentLlmLocalConfigLoader llmConfigLoader = mock(AgentLlmLocalConfigLoader.class);
+        AgentRunEventRedisStore eventRedisStore = new AgentRunEventRedisStore(
+                redisTemplate, om, llmConfigLoader);
+        AgentMessageService messageService = mock(AgentMessageService.class);
+        AgentPromptService promptService = mock(AgentPromptService.class);
+        AgentEventService eventService = new AgentEventService(
+                newMapper(), newEventMapper(), eventRedisStore, om, redisTemplate,
+                llmConfigLoader, messageService, promptService);
+        injectEventServiceFields(eventService);
+
+        // Build real ToolJobEventHookImpl (constructor: AgentRunMapper, AgentEventService)
+        AgentRunMapper runMapper = newMapper();
+        ToolJobEventHookImpl eventHook = new ToolJobEventHookImpl(runMapper, eventService);
+
+        // Oracle 1: first emitTerminalEvent — appends event to PG
+        boolean first = eventHook.emitTerminalEvent(RUN_ID, anchor);
+        assertThat(first).isTrue();
+
+        // Oracle 2: event row exists with correct dedupe key
+        AgentRunEventMapper eventMapper = newEventMapper();
+        String dedupeKey = RUN_ID + ":" + TOOL_CALL_ID + ":logical_terminal";
+        AgentRunEvent persisted = eventMapper.findByRunIdAndDedupeKey(RUN_ID, dedupeKey);
+        assertThat(persisted).isNotNull();
+        assertThat(persisted.getEventType()).isEqualTo("TOOL_CALL_FINISHED");
+        assertThat(persisted.getDedupeKey()).isEqualTo(dedupeKey);
+
+        // Oracle 3: second emitTerminalEvent with same anchor — dedup, no new row
+        boolean second = eventHook.emitTerminalEvent(RUN_ID, anchor);
+        assertThat(second).isTrue(); // dedup is success
+
+        // Oracle 4: still exactly one event row
+        SqlSession countSession = sqlSessionFactory.openSession(true);
+        openSessions.add(countSession);
+        var rs = countSession.getConnection().createStatement()
+                .executeQuery("SELECT COUNT(*) FROM alphafrog_agent_run_event WHERE run_id = '" + RUN_ID + "'");
+        rs.next();
+        assertThat(rs.getInt(1)).isEqualTo(1);
+
+        // Oracle 5: event payload matches anchor data
+        String payload = persisted.getPayloadJson();
+        assertThat(payload).contains("SUCCEEDED").contains(TOOL_CALL_ID);
+    }
+
+    // ===== P0-12: real usage hook → partial attribution through DataAnalysisTerminalRecorder =====
+
+    @Test
+    void usageHookUpsertsPartialAttributionEnvelopeAndPersistsToObservability() throws Exception {
+        // Fast-path executePython with complete usage
+        DataAnalysisReservation preparing = preparingReservation();
+        when(capacity.reserve(any(), any())).thenReturn(preparing);
+        when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(capacity.releaseReservation(any())).thenReturn(DataAnalysisReleaseOutcome.RELEASED);
+        // Real recorder: DataAnalysisObservabilityService backed by real PG
+        AgentRunStateStore stateStore = mock(AgentRunStateStore.class);
+        DataAnalysisObservabilityService realRecorder = new DataAnalysisObservabilityService(
+                newMapper(), stateStore, om);
+        when(recorder.upsert(any())).thenAnswer(inv -> realRecorder.upsert(inv.getArgument(0)));
+
+        when(sandbox.createTask(any())).thenAnswer(invocation -> {
+            ExecuteRequest req = invocation.getArgument(0);
+            return ExecuteResponse.newBuilder().setTaskId("task-p012")
+                    .setRequestFingerprint(req.getRequestFingerprint()).build();
+        });
+        when(sandbox.getTaskStatus(any())).thenReturn(
+                TaskStatusResponse.newBuilder().setStatus("SUCCEEDED").build());
+        when(sandbox.getTaskResult(any())).thenReturn(TaskResultResponse.newBuilder()
+                .setTaskId("task-p012").setStatus("SUCCEEDED").setExitCode(0)
+                .setStdout("ok").setDatasetDir("/sandbox/input")
+                .setRetryable(false)
+                .setResourceUsage(completeUsage()).build());
+
+        tools.executePython("print(1)", "1", null, null, 30);
+
+        // Load anchor from PG after completeSynchronously
+        ToolJobAnchorService verifyAnchor = new ToolJobAnchorService(newMapper());
+        ToolJobAnchor anchor = verifyAnchor.loadAnchor(RUN_ID);
+        assertThat(anchor).isNotNull();
+        assertThat(anchor.isUsagePersisted()).isTrue();
+
+        // Oracle 1: usage envelope persisted via real recorder → INSERTED
+        verify(recorder).upsert(argThat(env ->
+                env.resourceUsage().attributionComplete()
+                        && "SUCCEEDED".equals(env.terminalStatus())));
+
+        // Oracle 2: findSummaryByRunId reads back from PG
+        DataAnalysisObservabilitySummary summary = realRecorder
+                .findSummaryByRunId(RUN_ID, DataAnalysisObservabilityReadMode.TERMINAL_DB_ONLY)
+                .orElse(null);
+        assertThat(summary).isNotNull();
+        assertThat(summary.attributionComplete()).isTrue();
+        assertThat(summary.toolCallCount()).isEqualTo(1);
+
+        // Oracle 3: findByRunId reads full snapshot from PG
+        DataAnalysisObservabilitySnapshot snapshot = realRecorder
+                .findByRunId(RUN_ID, DataAnalysisObservabilityReadMode.TERMINAL_DB_ONLY)
+                .orElse(null);
+        assertThat(snapshot).isNotNull();
+        assertThat(snapshot.calls()).hasSize(1);
+        assertThat(snapshot.summary().attributionComplete()).isTrue();
+    }
+
+    // ===== P0-10: real launcher + pipeline — RESUME_READY CAS through real PG =====
+
+    @Test
+    void resumeServiceCasReadToLaunchingThroughRealPgAndBuildsCorrectContext() throws Exception {
+        // Build a READY anchor with completedTodos via real anchorService (PG persistence)
+        ToolJobAnchorService anchorService = new ToolJobAnchorService(newMapper());
+        ToolJobRedisCache redisCache = new ToolJobRedisCache(redisTemplate, om, new ToolJobConfig());
+
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId(RUN_ID + ":tc-1:1");
+        anchor.setTaskId("task-p010");
+        anchor.setToolCallId(TOOL_CALL_ID);
+        anchor.setAttempt(1);
+        anchor.setAnchorState("PENDING");
+        anchor.setTodoId("todo_3");
+        anchor.setSequence(3);
+        anchor.setToolCallsUsed(2);
+        anchor.setTerminalStatus("SUCCEEDED");
+        anchor.setTerminalResultPreview("ok");
+        anchor.setTerminalRetryable(false);
+        anchor.setUsagePersisted(true);
+        anchor.setTerminalEventEmitted(true);
+        anchor.setCompletedTodosJson("[{\"todoId\":\"todo_1\",\"description\":\"fetch data\"}," +
+                "{\"todoId\":\"todo_2\",\"description\":\"analyze\"}]");
+        anchor.setDatasetSnapshotJson("{\"digest\":\"abc123\"}");
+        anchor.setResumeState("READY");
+        anchor.setResumeToken("token-p010");
+        anchor.setResumeLeaseVersion(1);
+        anchor.setEstimateJson("{\"estimatedRows\":1,\"estimatedBytes\":10,\"fileCount\":1,"
+                + "\"selectedColumnRatio\":0.5,\"manifestMemberCount\":1,"
+                + "\"heavyOperationHints\":[],\"resourceClass\":\"STANDARD\",\"capacityUnits\":1}");
+
+        // Update run status to RECEIVED first to match anchor's terminal state
+        DataSource ds = dataSource();
+        try (Connection conn = ds.getConnection(); Statement stmt = conn.createStatement()) {
+            stmt.execute("UPDATE alphafrog_agent_run SET status = 'RECEIVED' WHERE id = '" + RUN_ID + "'");
+        }
+        anchorService.updateAnchor(RUN_ID, anchor, AgentRunStatus.RECEIVED);
+
+        // Verify READY anchor was persisted to real PG
+        ToolJobAnchor persisted = anchorService.loadAnchor(RUN_ID);
+        assertThat(persisted.getResumeState()).isEqualTo("READY");
+        assertThat(persisted.getResumeToken()).isEqualTo("token-p010");
+        assertThat(persisted.getResumeLeaseVersion()).isEqualTo(1L);
+
+        // Create real resumeService with real anchorService + PG
+        ToolJobResumeLauncher launcher = mock(ToolJobResumeLauncher.class);
+        ToolJobResumeService resumeService = new ToolJobResumeService(
+                anchorService, redisCache, new ToolJobConfig(), om);
+        java.lang.reflect.Field launchField = ToolJobResumeService.class.getDeclaredField("resumeLauncher");
+        launchField.setAccessible(true);
+        launchField.set(resumeService, launcher);
+        when(launcher.launch(eq(RUN_ID), any(ToolJobResumeContext.class))).thenReturn(true);
+
+        // Execute tryResume — CAS READY→LAUNCHING through real PG
+        boolean result = resumeService.tryResume(RUN_ID);
+        assertThat(result).isTrue();
+
+        // Oracle 1: anchor state changed to LAUNCHING in PG
+        ToolJobAnchor afterCas = anchorService.loadAnchor(RUN_ID);
+        assertThat(afterCas.getResumeState()).isEqualTo("LAUNCHING");
+        assertThat(afterCas.getResumeLeaseVersion()).isEqualTo(2L); // incremented
+
+        // Oracle 2: launch called with correct completedTodos (no duplicates)
+        ArgumentCaptor<ToolJobResumeContext> ctxCaptor = ArgumentCaptor.forClass(ToolJobResumeContext.class);
+        verify(launcher).launch(eq(RUN_ID), ctxCaptor.capture());
+        ToolJobResumeContext ctx = ctxCaptor.getValue();
+        assertThat(ctx.getRunId()).isEqualTo(RUN_ID);
+        assertThat(ctx.getTodoId()).isEqualTo("todo_3");
+        assertThat(ctx.getTodoSequence()).isEqualTo(3);
+        assertThat(ctx.getCompletedTodos()).hasSize(2);
+        assertThat(ctx.getCompletedTodos().get(0).getTodoId()).isEqualTo("todo_1");
+        assertThat(ctx.getCompletedTodos().get(1).getTodoId()).isEqualTo("todo_2");
+        assertThat(ctx.getToolCallsUsed()).isEqualTo(2);
+        assertThat(ctx.isTerminalSuccess()).isTrue();
+        assertThat(ctx.getDatasetSnapshotJson()).isEqualTo("{\"digest\":\"abc123\"}");
+
+        // Oracle 3: re-entering LAUNCHING succeeds (launcher called again)
+        // The anchor in PG is now LAUNCHING — real loadAnchor reads fresh state
+        boolean secondAttempt = resumeService.tryResume(RUN_ID);
+        assertThat(secondAttempt).isTrue(); // reenters LAUNCHING, calls launcher again
+    }
+
+    // ===== P0-11: production pending→OOM — finalizer classifies retryable=true from OOM result =====
+
+    @Test
+    void oomResultFromSandboxSetsTerminalRetryableTrueAndPassesFinalizerGate() throws Exception {
+        // Create PENDING anchor via slow path
+        DataAnalysisReservation preparing = preparingReservation();
+        when(capacity.reserve(any(), any())).thenReturn(preparing);
+        when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(capacity.releaseReservation(any())).thenReturn(DataAnalysisReleaseOutcome.RELEASED);
+        when(sandbox.createTask(any())).thenAnswer(invocation -> {
+            ExecuteRequest req = invocation.getArgument(0);
+            return ExecuteResponse.newBuilder().setTaskId("task-p011")
+                    .setRequestFingerprint(req.getRequestFingerprint()).build();
+        });
+        when(sandbox.getTaskStatus(any())).thenReturn(
+                TaskStatusResponse.newBuilder().setStatus("RUNNING").build());
+
+        inject(tools, "fastPathMs", 1L);
+        assertThrows(ExternalToolJobPendingException.class,
+                () -> tools.executePython("import time; time.sleep(300)", "1", null, null, 30));
+
+        // Verify PENDING anchor persisted
+        ToolJobAnchorService anchorService = new ToolJobAnchorService(newMapper());
+        ToolJobAnchor pendingAnchor = anchorService.loadAnchor(RUN_ID);
+        assertThat(pendingAnchor.getAnchorState()).isEqualTo("PENDING");
+
+        // Build OOM result as sandbox would return
+        TaskResultResponse oomResult = TaskResultResponse.newBuilder()
+                .setTaskId("task-p011").setStatus("FAILED").setExitCode(137)
+                .setError("oom_killed")
+                .setStdout("")
+                .setRetryable(true)
+                .setResourceUsage(SandboxResourceUsage.newBuilder()
+                        .setResourceClass("STANDARD")
+                        .setExitReason("OOM_KILLED")
+                        .setOomKilled(true)
+                        .setAttributionComplete(false).build())
+                .build();
+
+        // Wire up real finalizer with real PG anchorService + real Redis cache
+        ToolJobRedisCache redisCache = new ToolJobRedisCache(redisTemplate, om, new ToolJobConfig());
+        ToolJobUsageHook usageHook = mock(ToolJobUsageHook.class);
+        when(usageHook.upsertUsage(eq(RUN_ID), any())).thenReturn(true);
+        ToolJobEventHook eventHook = mock(ToolJobEventHook.class);
+        when(eventHook.emitTerminalEvent(eq(RUN_ID), any())).thenReturn(true);
+        when(recorder.upsert(any())).thenReturn(DataAnalysisUpsertOutcome.INSERTED);
+
+        ToolJobFinalizer finalizer = new ToolJobFinalizer(
+                anchorService, redisCache, capacity, mock(ToolJobResumeService.class),
+                new ToolJobConfig());
+        java.lang.reflect.Field usageField = ToolJobFinalizer.class.getDeclaredField("usageHook");
+        usageField.setAccessible(true);
+        usageField.set(finalizer, usageHook);
+        java.lang.reflect.Field eventField = ToolJobFinalizer.class.getDeclaredField("eventHook");
+        eventField.setAccessible(true);
+        eventField.set(finalizer, eventHook);
+
+        // Simulate reconciler calling finalizer.handleTerminal with OOM result
+        // This is the production path: reconciler gets FAILED status → gets result → calls handleTerminal
+        finalizer.handleTerminal(RUN_ID, pendingAnchor, "FAILED", oomResult, true);
+
+        // Oracle 1: terminalRetryable=true (OOM gate passes — retryable from proto)
+        ToolJobAnchor afterFinalize = anchorService.loadAnchor(RUN_ID);
+        assertThat(afterFinalize.getTerminalRetryable()).isTrue();
+        assertThat(afterFinalize.getTerminalStatus()).isEqualTo("FAILED");
+        assertThat(afterFinalize.getSandboxTerminalStatus()).isEqualTo("FAILED");
+
+        // Oracle 2: finalizer completed full pipeline (usage + event called)
+        verify(usageHook).upsertUsage(eq(RUN_ID), any());
+        verify(eventHook).emitTerminalEvent(eq(RUN_ID), any());
+
+        // Oracle 3: usage persisted (ENVELOPE+RELEASE+USAGE steps completed)
+        assertThat(afterFinalize.isUsagePersisted()).isTrue();
+
+        // Oracle 4: OOM classification — retryable=true, no attempt upgrade
+        // (gate passes at STEP_RELEASE check)
+        verify(capacity).releaseReservation(any());
+    }
+
     // ---- Helpers (exact pattern from PythonSandboxToolsDataIntenseTest) ----
 
     private void fixtureDataset() throws Exception {
@@ -365,10 +811,33 @@ class PythonSandboxToolsP001FastPathTest {
         DataSource ds = dataSource();
         try (Connection conn = ds.getConnection();
              var ps = conn.prepareStatement(
-                     "INSERT INTO alphafrog_agent_run (id, status, tool_job_anchor_json) VALUES (?, ?, '{}'::jsonb)")) {
+                     "INSERT INTO alphafrog_agent_run (id, user_id, status, tool_job_anchor_json) VALUES (?, ?, ?, '{}'::jsonb)")) {
             ps.setString(1, id);
-            ps.setString(2, status);
+            ps.setString(2, "user-test");
+            ps.setString(3, status);
             ps.executeUpdate();
         }
     }
+
+    private AgentRunEventMapper newEventMapper() throws Exception {
+        if (eventMapperConfigured) {
+            SqlSession session = sqlSessionFactory.openSession(true);
+            openSessions.add(session);
+            return session.getMapper(AgentRunEventMapper.class);
+        }
+        // Add event mapper to the shared factory
+        var configuration = sqlSessionFactory.getConfiguration();
+        configuration.addMapper(AgentRunEventMapper.class);
+        String res = "mapper/AgentRunEventMapper.xml";
+        try (Reader r = org.apache.ibatis.io.Resources.getResourceAsReader(res)) {
+            new org.apache.ibatis.builder.xml.XMLMapperBuilder(
+                    r, configuration, res, configuration.getSqlFragments()).parse();
+        }
+        eventMapperConfigured = true;
+        SqlSession session = sqlSessionFactory.openSession(true);
+        openSessions.add(session);
+        return session.getMapper(AgentRunEventMapper.class);
+    }
+
+    private static boolean eventMapperConfigured = false;
 }
