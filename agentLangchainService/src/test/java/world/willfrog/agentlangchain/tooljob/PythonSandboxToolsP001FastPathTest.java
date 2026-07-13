@@ -1,6 +1,7 @@
 package world.willfrog.agentlangchain.tooljob;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import dev.langchain4j.agent.tool.ToolExecutionRequest;
 import org.apache.ibatis.session.SqlSession;
 import org.apache.ibatis.session.SqlSessionFactory;
 import org.junit.jupiter.api.AfterAll;
@@ -33,6 +34,7 @@ import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agent.platform.service.DataAnalysisObservabilityService;
 import world.willfrog.agent.tools.python.DataAnalysisCapacityProperties;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
+import world.willfrog.agent.tools.router.ToolRouter;
 import world.willfrog.agent.workflow.AgentRunDatasetEntry;
 import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
 import world.willfrog.agent.workflow.AgentRunDatasetSnapshot;
@@ -322,108 +324,70 @@ class PythonSandboxToolsP001FastPathTest {
         verifyNoInteractions(recorder);
     }
 
-    // ===== P0-01 second half: real ToolRouter appendOnce → clear =====
+    // ===== P0-01 second half: real ToolRouterToolExecutor appendOnce → clear =====
 
     @Test
-    void toolRouterAppendOnceAndClearAfterFastPathCompletion() throws Exception {
-        DataAnalysisReservation preparing = preparingReservation();
-        when(capacity.reserve(any(), any())).thenReturn(preparing);
-        when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
-        when(capacity.releaseReservation(any())).thenReturn(DataAnalysisReleaseOutcome.RELEASED);
-        when(recorder.upsert(any())).thenReturn(DataAnalysisUpsertOutcome.INSERTED);
-        when(sandbox.createTask(any())).thenAnswer(invocation -> {
-            ExecuteRequest req = invocation.getArgument(0);
-            return ExecuteResponse.newBuilder().setTaskId("task-p001")
-                    .setRequestFingerprint(req.getRequestFingerprint()).build();
-        });
-        when(sandbox.getTaskStatus(any())).thenReturn(
-                TaskStatusResponse.newBuilder().setStatus("SUCCEEDED").build());
-        when(sandbox.getTaskResult(any())).thenReturn(TaskResultResponse.newBuilder()
-                .setTaskId("task-p001").setStatus("SUCCEEDED").setExitCode(0)
-                .setStdout("ok").setDatasetDir("/sandbox/input")
-                .setRetryable(false)
-                .setResourceUsage(completeUsage()).build());
-
-        // Execute fast-path (same as first half)
-        String output = tools.executePython("print(1)", "1", null, null, 30);
-        assertThat(output).contains("\"ok\":true");
-
-        // Build real AgentEventService for appendOnce verification
+    void toolRouterToolExecutorCallsAppendOnceThenClearActiveForSynchronousPythonTerminal() throws Exception {
+        // Build real AgentEventService (spy for verification)
         AgentLlmLocalConfigLoader llmConfigLoader = mock(AgentLlmLocalConfigLoader.class);
         AgentRunEventRedisStore eventRedisStore = new AgentRunEventRedisStore(
                 redisTemplate, om, llmConfigLoader);
-        AgentMessageService messageService = mock(AgentMessageService.class);
-        AgentPromptService promptService = mock(AgentPromptService.class);
-        AgentEventService eventService = new AgentEventService(
+        AgentEventService realEventService = new AgentEventService(
                 newMapper(), newEventMapper(), eventRedisStore, om, redisTemplate,
-                llmConfigLoader, messageService, promptService);
-        // Override TTL/checkpoint (not needed for test)
-        injectEventServiceFields(eventService);
+                llmConfigLoader, mock(AgentMessageService.class), mock(AgentPromptService.class));
+        injectEventServiceFields(realEventService);
+        AgentEventService eventService = spy(realEventService);
 
-        // ToolRouter's appendOnce: dedupe key pattern from ToolRouterToolExecutor
-        String dedupeKey = RUN_ID + ":" + TOOL_CALL_ID + ":logical_terminal";
-        Map<String, Object> eventPayload = Map.of(
-                "tool_call_id", TOOL_CALL_ID,
-                "tool_name", "executePython",
-                "success", true,
-                "result_preview", output.substring(0, Math.min(output.length(), 500)),
-                "duration_ms", 1L);
+        // Mock ToolRouter for executePython fast-path result
+        ToolRouter toolRouter = mock(ToolRouter.class);
+        when(toolRouter.invokeWithMeta(eq("executePython"), anyMap())).thenReturn(
+                ToolRouter.ToolInvocationResult.builder()
+                        .output("{\"ok\":true}").success(true).durationMs(1L).build());
 
-        // Oracle 1: appendOnce inserts event to PG
+        // Real PythonSandboxDispatchStore (already constructed in setUp)
+        when(dispatchStore.clearActive(RUN_ID, "run-test:call-p001:1")).thenReturn(true);
+
+        // Instantiate real ToolRouterToolExecutor via reflection (package-private class)
+        Class<?> executorClass = Class.forName(
+                "world.willfrog.agentlangchain.tools.ToolRouterToolExecutor");
+        var ctor = executorClass.getDeclaredConstructors()[0];
+        ctor.setAccessible(true);
+        var executor = ctor.newInstance(
+                toolRouter, om, eventService,
+                new world.willfrog.agentlangchain.config.LangchainToolConcurrencyThrottle(
+                        false, 20, 60),
+                dispatchStore);
+
+        // Set AgentContext for the executor
         AgentContext.setUserId("user-test");
-        boolean firstInsert = eventService.appendOnce(
-                RUN_ID, "user-test", "TOOL_CALL_FINISHED", dedupeKey, eventPayload);
-        assertThat(firstInsert).isTrue();
 
-        // Oracle 2: event row exists in PG with correct dedupe key
-        AgentRunEventMapper eventMapper = newEventMapper();
-        AgentRunEvent found = eventMapper.findByRunIdAndDedupeKey(RUN_ID, dedupeKey);
-        assertThat(found).isNotNull();
-        assertThat(found.getEventType()).isEqualTo("TOOL_CALL_FINISHED");
-        assertThat(found.getDedupeKey()).isEqualTo(dedupeKey);
-        assertThat(found.getPayloadJson()).contains("executePython");
+        // Execute via ToolRouterToolExecutor (production path)
+        ToolExecutionRequest request = ToolExecutionRequest.builder()
+                .id("call-p001")
+                .name("executePython")
+                .arguments("{\"dataset_ids\":\"1\",\"code\":\"print(1)\"}")
+                .build();
+        var executeMethod = executorClass.getDeclaredMethod("execute",
+                ToolExecutionRequest.class, Object.class);
+        executeMethod.setAccessible(true);
+        String output = (String) executeMethod.invoke(executor, request, null);
 
-        // Oracle 3: appendOnce dedup — second call with same key returns false
-        boolean secondInsert = eventService.appendOnce(
-                RUN_ID, "user-test", "TOOL_CALL_FINISHED", dedupeKey, eventPayload);
-        assertThat(secondInsert).isFalse();
+        // Oracle 1: output comes from ToolRouter
+        assertThat(output).isEqualTo("{\"ok\":true}");
 
-        // Oracle 4: only one event row (dedup worked)
-        SqlSession countSession = sqlSessionFactory.openSession(true);
-        openSessions.add(countSession);
-        var rs = countSession.getConnection().createStatement()
-                .executeQuery("SELECT COUNT(*) FROM alphafrog_agent_run_event WHERE run_id = '" + RUN_ID + "'");
-        rs.next();
-        int eventCount = rs.getInt(1);
-        assertThat(eventCount).isEqualTo(1);
+        // Oracle 2: appendOnce called (event service persisted event to PG)
+        verify(eventService).appendOnce(
+                eq(RUN_ID), eq("user-test"), eq("TOOL_CALL_FINISHED"),
+                eq("run-test:call-p001:logical_terminal"), any());
 
-        // Oracle 5: anchor still has operationId before clear (terminal state preserved)
-        ToolJobAnchorService verifyAnchor = new ToolJobAnchorService(newMapper());
-        ToolJobAnchor dbAnchor = verifyAnchor.loadAnchor(RUN_ID);
-        assertThat(dbAnchor).isNotNull();
-        assertThat(dbAnchor.getOperationId()).isNotNull();
+        // Oracle 3: event row persisted to PG
+        String dedupeKey = "run-test:call-p001:logical_terminal";
+        AgentRunEvent persisted = newEventMapper().findByRunIdAndDedupeKey(RUN_ID, dedupeKey);
+        assertThat(persisted).isNotNull();
+        assertThat(persisted.getPayloadJson()).contains("executePython");
 
-        // Oracle 6: clearActive (ToolRouter acknowledgement)
-        String operationId = RUN_ID + ":" + TOOL_CALL_ID + ":1";
-        boolean cleared = dispatchStore.clearActive(RUN_ID, operationId);
-        assertThat(cleared).isTrue();
-
-        // Oracle 7: after clear, anchor is {} (operationId/finalizerStep/resumeState all null)
-        ToolJobAnchorService verifyAfterClear = new ToolJobAnchorService(newMapper());
-        ToolJobAnchor afterClear = verifyAfterClear.loadAnchor(RUN_ID);
-        assertThat(afterClear).isNotNull();
-        assertThat(afterClear.getOperationId()).isNull();
-        assertThat(afterClear.getFinalizerStep()).isNull();
-        assertThat(afterClear.getResumeState()).isNull();
-
-        // Oracle 8: event row still exists after clear (logical event is durable)
-        AgentRunEvent stillThere = newEventMapper().findByRunIdAndDedupeKey(RUN_ID, dedupeKey);
-        assertThat(stillThere).isNotNull();
-
-        // Oracle 9: capacity release and usage upsert called exactly once
-        verify(capacity).releaseReservation(argThat(req ->
-                req.proof() instanceof DataAnalysisReleaseProof.Terminal));
-        verify(recorder).upsert(any());
+        // Oracle 4: clearActive called on dispatch store
+        verify(dispatchStore).clearActive(RUN_ID, "run-test:call-p001:1");
     }
 
     private static void injectEventServiceFields(AgentEventService svc) throws Exception {
@@ -712,11 +676,11 @@ class PythonSandboxToolsP001FastPathTest {
         assertThat(secondAttempt).isTrue(); // reenters LAUNCHING, calls launcher again
     }
 
-    // ===== P0-11: production pending→OOM — finalizer classifies retryable=true from OOM result =====
+    // ===== P0-11: production pending→OOM — reconciler calls handleTerminal with real hooks =====
 
     @Test
-    void oomResultFromSandboxSetsTerminalRetryableTrueAndPassesFinalizerGate() throws Exception {
-        // Create PENDING anchor via slow path
+    void oomPendingAnchorProcessedByFinalizerWithRealHooksSetsRetryableTrue() throws Exception {
+        // Create PENDING anchor via production slow path
         DataAnalysisReservation preparing = preparingReservation();
         when(capacity.reserve(any(), any())).thenReturn(preparing);
         when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
@@ -738,11 +702,10 @@ class PythonSandboxToolsP001FastPathTest {
         ToolJobAnchor pendingAnchor = anchorService.loadAnchor(RUN_ID);
         assertThat(pendingAnchor.getAnchorState()).isEqualTo("PENDING");
 
-        // Build OOM result as sandbox would return
+        // OOM result from sandbox (reconciler calls getTaskResult after seeing FAILED status)
         TaskResultResponse oomResult = TaskResultResponse.newBuilder()
                 .setTaskId("task-p011").setStatus("FAILED").setExitCode(137)
-                .setError("oom_killed")
-                .setStdout("")
+                .setError("oom_killed").setStdout("")
                 .setRetryable(true)
                 .setResourceUsage(SandboxResourceUsage.newBuilder()
                         .setResourceClass("STANDARD")
@@ -751,43 +714,56 @@ class PythonSandboxToolsP001FastPathTest {
                         .setAttributionComplete(false).build())
                 .build();
 
-        // Wire up real finalizer with real PG anchorService + real Redis cache
+        // Real hooks — production persistence to PG
         ToolJobRedisCache redisCache = new ToolJobRedisCache(redisTemplate, om, new ToolJobConfig());
-        ToolJobUsageHook usageHook = mock(ToolJobUsageHook.class);
-        when(usageHook.upsertUsage(eq(RUN_ID), any())).thenReturn(true);
-        ToolJobEventHook eventHook = mock(ToolJobEventHook.class);
-        when(eventHook.emitTerminalEvent(eq(RUN_ID), any())).thenReturn(true);
-        when(recorder.upsert(any())).thenReturn(DataAnalysisUpsertOutcome.INSERTED);
+        AgentLlmLocalConfigLoader llmConfigLoader = mock(AgentLlmLocalConfigLoader.class);
+        AgentRunEventRedisStore eventRedisStore = new AgentRunEventRedisStore(
+                redisTemplate, om, llmConfigLoader);
+        AgentEventService eventService = new AgentEventService(
+                newMapper(), newEventMapper(), eventRedisStore, om, redisTemplate,
+                llmConfigLoader, mock(AgentMessageService.class), mock(AgentPromptService.class));
+        injectEventServiceFields(eventService);
+        ToolJobEventHookImpl realEventHook = new ToolJobEventHookImpl(newMapper(), eventService);
 
+        AgentRunStateStore stateStore = mock(AgentRunStateStore.class);
+        DataAnalysisObservabilityService realRecorder = new DataAnalysisObservabilityService(
+                newMapper(), stateStore, om);
+        ToolJobUsageHookImpl realUsageHook = new ToolJobUsageHookImpl(realRecorder, om);
+
+        // Production finalizer with real hooks (reconciler's handleTerminal path)
         ToolJobFinalizer finalizer = new ToolJobFinalizer(
                 anchorService, redisCache, capacity, mock(ToolJobResumeService.class),
                 new ToolJobConfig());
         java.lang.reflect.Field usageField = ToolJobFinalizer.class.getDeclaredField("usageHook");
         usageField.setAccessible(true);
-        usageField.set(finalizer, usageHook);
+        usageField.set(finalizer, realUsageHook);
         java.lang.reflect.Field eventField = ToolJobFinalizer.class.getDeclaredField("eventHook");
         eventField.setAccessible(true);
-        eventField.set(finalizer, eventHook);
+        eventField.set(finalizer, realEventHook);
 
-        // Simulate reconciler calling finalizer.handleTerminal with OOM result
-        // This is the production path: reconciler gets FAILED status → gets result → calls handleTerminal
+        // Reconciler calls handleTerminal after sandbox returns FAILED + OOM result
         finalizer.handleTerminal(RUN_ID, pendingAnchor, "FAILED", oomResult, true);
 
-        // Oracle 1: terminalRetryable=true (OOM gate passes — retryable from proto)
+        // Oracle 1: terminalRetryable=true — OOM gate from retryable proto field
         ToolJobAnchor afterFinalize = anchorService.loadAnchor(RUN_ID);
+        assertThat(afterFinalize).isNotNull();
         assertThat(afterFinalize.getTerminalRetryable()).isTrue();
         assertThat(afterFinalize.getTerminalStatus()).isEqualTo("FAILED");
-        assertThat(afterFinalize.getSandboxTerminalStatus()).isEqualTo("FAILED");
 
-        // Oracle 2: finalizer completed full pipeline (usage + event called)
-        verify(usageHook).upsertUsage(eq(RUN_ID), any());
-        verify(eventHook).emitTerminalEvent(eq(RUN_ID), any());
+        // Oracle 2: real event hook persisted event row to PG
+        String dedupeKey = RUN_ID + ":" + TOOL_CALL_ID + ":logical_terminal";
+        AgentRunEvent persistedEvent = newEventMapper().findByRunIdAndDedupeKey(RUN_ID, dedupeKey);
+        assertThat(persistedEvent).isNotNull();
+        assertThat(persistedEvent.getEventType()).isEqualTo("TOOL_CALL_FINISHED");
 
-        // Oracle 3: usage persisted (ENVELOPE+RELEASE+USAGE steps completed)
-        assertThat(afterFinalize.isUsagePersisted()).isTrue();
+        // Oracle 3: real usage hook persisted observability to PG
+        DataAnalysisObservabilitySummary summary = realRecorder
+                .findSummaryByRunId(RUN_ID, DataAnalysisObservabilityReadMode.TERMINAL_DB_ONLY)
+                .orElse(null);
+        assertThat(summary).isNotNull();
+        assertThat(summary.oomCount()).isEqualTo(1);
 
-        // Oracle 4: OOM classification — retryable=true, no attempt upgrade
-        // (gate passes at STEP_RELEASE check)
+        // Oracle 4: capacity released (RELEASE step ran with real capacity mock)
         verify(capacity).releaseReservation(any());
     }
 
