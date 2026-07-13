@@ -101,12 +101,11 @@ public class LangchainRunControlService {
         }
         String runId = run.getId();
         String userId = run.getUserId();
-        // 1. 先写 Redis 状态为 CANCELING —— todo loop 中的 ExecutionGuard 通过轮询 Redis 检测到这个状态后自行停止
-        stateStore.markRunStatus(runId, AgentRunStatus.CANCELING.name());
-        // 1a. If there's an active tool-job anchor, persist cancel disposition so the
-        //     reconciler routes through checkPausedTerminal and the finalizer releases
-        //     capacity. The anchor keeps WAITING_TOOL_JOB for the finalizer CAS; the
-        //     finalizer transitions to CANCELED after terminal sinks are complete.
+
+        // 0. Durable disposition FIRST: detect active anchor and persist cancel
+        //    disposition before any Redis/DB mutation. If this fails, the run is
+        //    left untouched so the reconciler can still process when the sandbox
+        //    terminal arrives. Order matters: durable before volatile.
         boolean hasActiveAnchor = false;
         try {
             ToolJobAnchor toolAnchor = anchorService.loadAnchor(runId);
@@ -116,12 +115,8 @@ public class LangchainRunControlService {
                 toolAnchor.setRunDisposition("CANCELED");
                 boolean persisted = anchorService.updateAnchor(runId, toolAnchor, run.getStatus());
                 if (!persisted) {
-                    // CAS failure means the anchor/status changed concurrently.
-                    // Fail-closed: do NOT continue with normal cancel (which would
-                    // set CANCELED status and leak the reservation). Let the caller
-                    // retry — the anchor may still be processable by the reconciler.
                     log.warn("Cancel CAS failed for run={}: unable to persist anchor disposition — "
-                            + "run will NOT be transitioned to CANCELED to prevent capacity leak. "
+                            + "run left untouched to prevent capacity leak. "
                             + "The reconciler will process when sandbox terminal arrives.", runId);
                     throw new IllegalStateException(
                             "cancel_anchor_cas_failed: unable to persist cancel disposition");
@@ -132,9 +127,17 @@ public class LangchainRunControlService {
         } catch (IllegalStateException e) {
             throw e;
         } catch (Exception e) {
-            log.warn("Failed to persist cancel disposition on tool-job anchor for run={}, "
-                    + "falling back to standard cancel (capacity may leak): {}", runId, e.getMessage());
+            // Fail-closed: any anchor load/update failure prevents cancel entirely.
+            // Do NOT fall back to standard cancel — that would set CANCELED status
+            // and leak the reservation exactly like the original bug.
+            log.error("Failed to persist cancel disposition on tool-job anchor for run={} — "
+                    + "cancel aborted to prevent capacity leak: {}", runId, e.getMessage());
+            throw new IllegalStateException(
+                    "cancel_anchor_disposition_failed: " + e.getMessage(), e);
         }
+
+        // 1. 先写 Redis 状态为 CANCELING —— todo loop 中的 ExecutionGuard 通过轮询 Redis 检测到这个状态后自行停止
+        stateStore.markRunStatus(runId, AgentRunStatus.CANCELING.name());
         // 2. sleep 200ms 给正在执行的 todo loop 一个窗口去感知并响应 CANCELING 状态。
         //    这比硬 kill 线程更安全——正在执行的工具调用可以自然完成当前轮，避免留下半成品状态
         try {
