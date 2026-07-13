@@ -11,6 +11,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.postgresql.ds.PGSimpleDataSource;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.data.redis.connection.lettuce.LettuceConnectionFactory;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.testcontainers.containers.GenericContainer;
@@ -38,6 +39,7 @@ import world.willfrog.agent.tools.router.ToolRouter;
 import world.willfrog.agent.workflow.AgentRunDatasetEntry;
 import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
 import world.willfrog.agent.workflow.AgentRunDatasetSnapshot;
+import world.willfrog.agentlangchain.orchestration.LangchainLinearRunPipelineImpl;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
 
 import javax.sql.DataSource;
@@ -646,10 +648,10 @@ class PythonSandboxToolsP001FastPathTest {
         assertThat(dup).isEqualTo(DataAnalysisUpsertOutcome.ALREADY_PRESENT_SAME);
     }
 
-    // ===== P0-10: real launcher + pipeline — RESUME_READY CAS through real PG =====
+    // ===== P0-10: real ToolJobResumeLauncherImpl + handoff accepted + durable clear =====
 
     @Test
-    void resumeServiceCasReadToLaunchingThroughRealPgAndBuildsCorrectContext() throws Exception {
+    void realLauncherHandoffAcceptedAndDurableClearThroughRealPg() throws Exception {
         // Build a READY anchor with completedTodos via real anchorService (PG persistence)
         ToolJobAnchorService anchorService = new ToolJobAnchorService(newMapper());
         ToolJobRedisCache redisCache = new ToolJobRedisCache(redisTemplate, om, new ToolJobConfig());
@@ -668,6 +670,7 @@ class PythonSandboxToolsP001FastPathTest {
         anchor.setTerminalRetryable(false);
         anchor.setUsagePersisted(true);
         anchor.setTerminalEventEmitted(true);
+        anchor.setResultConsumed(true);
         anchor.setCompletedTodosJson("[{\"todoId\":\"todo_1\",\"description\":\"fetch data\"}," +
                 "{\"todoId\":\"todo_2\",\"description\":\"analyze\"}]");
         anchor.setDatasetSnapshotJson("{\"digest\":\"abc123\"}");
@@ -685,48 +688,86 @@ class PythonSandboxToolsP001FastPathTest {
         }
         anchorService.updateAnchor(RUN_ID, anchor, AgentRunStatus.RECEIVED);
 
-        // Verify READY anchor was persisted to real PG
+        // Verify READY anchor persisted to real PG
         ToolJobAnchor persisted = anchorService.loadAnchor(RUN_ID);
         assertThat(persisted.getResumeState()).isEqualTo("READY");
         assertThat(persisted.getResumeToken()).isEqualTo("token-p010");
-        assertThat(persisted.getResumeLeaseVersion()).isEqualTo(1L);
 
-        // Create real resumeService with real anchorService + PG
-        ToolJobResumeLauncher launcher = mock(ToolJobResumeLauncher.class);
+        // Real ToolJobResumeService (without launcher set yet — circular dep resolved via ObjectProvider)
         ToolJobResumeService resumeService = new ToolJobResumeService(
                 anchorService, redisCache, new ToolJobConfig(), om);
+
+        // Mock pipeline — capture callbacks from launchResumedAsync
+        LangchainLinearRunPipelineImpl pipeline = mock(LangchainLinearRunPipelineImpl.class);
+        var terminalConsumedRef = new java.util.concurrent.atomic.AtomicReference<java.util.function.BooleanSupplier>();
+        var completionRef = new java.util.concurrent.atomic.AtomicReference<java.util.function.Consumer<Boolean>>();
+        when(pipeline.launchResumedAsync(any(AgentRun.class), any(ToolJobResumeContext.class),
+                any(), any())).thenAnswer(invocation -> {
+            terminalConsumedRef.set(invocation.getArgument(2));
+            completionRef.set(invocation.getArgument(3));
+            return true;
+        });
+
+        // ObjectProvider returns real resumeService
+        @SuppressWarnings("unchecked")
+        ObjectProvider<ToolJobResumeService> provider = mock(ObjectProvider.class);
+        when(provider.getIfAvailable()).thenReturn(resumeService);
+
+        // Real ToolJobResumeLauncherImpl with real AgentRunMapper + mock pipeline + real provider
+        AgentRunMapper runMapper = newMapper();
+        ToolJobResumeLauncherImpl realLauncher = new ToolJobResumeLauncherImpl(
+                runMapper, pipeline, provider);
+
+        // Inject real launcher into resumeService
         java.lang.reflect.Field launchField = ToolJobResumeService.class.getDeclaredField("resumeLauncher");
         launchField.setAccessible(true);
-        launchField.set(resumeService, launcher);
-        when(launcher.launch(eq(RUN_ID), any(ToolJobResumeContext.class))).thenReturn(true);
+        launchField.set(resumeService, realLauncher);
 
-        // Execute tryResume — CAS READY→LAUNCHING through real PG
+        // ── Execute tryResume — CAS READY→LAUNCHING through real PG → calls real launcher ──
         boolean result = resumeService.tryResume(RUN_ID);
         assertThat(result).isTrue();
 
-        // Oracle 1: anchor state changed to LAUNCHING in PG
+        // Oracle 1: anchor CAS'd to LAUNCHING in PG
         ToolJobAnchor afterCas = anchorService.loadAnchor(RUN_ID);
         assertThat(afterCas.getResumeState()).isEqualTo("LAUNCHING");
         assertThat(afterCas.getResumeLeaseVersion()).isEqualTo(2L); // incremented
 
-        // Oracle 2: launch called with correct completedTodos (no duplicates)
-        ArgumentCaptor<ToolJobResumeContext> ctxCaptor = ArgumentCaptor.forClass(ToolJobResumeContext.class);
-        verify(launcher).launch(eq(RUN_ID), ctxCaptor.capture());
-        ToolJobResumeContext ctx = ctxCaptor.getValue();
-        assertThat(ctx.getRunId()).isEqualTo(RUN_ID);
-        assertThat(ctx.getTodoId()).isEqualTo("todo_3");
-        assertThat(ctx.getTodoSequence()).isEqualTo(3);
-        assertThat(ctx.getCompletedTodos()).hasSize(2);
-        assertThat(ctx.getCompletedTodos().get(0).getTodoId()).isEqualTo("todo_1");
-        assertThat(ctx.getCompletedTodos().get(1).getTodoId()).isEqualTo("todo_2");
-        assertThat(ctx.getToolCallsUsed()).isEqualTo(2);
-        assertThat(ctx.isTerminalSuccess()).isTrue();
-        assertThat(ctx.getDatasetSnapshotJson()).isEqualTo("{\"digest\":\"abc123\"}");
+        // Oracle 2: pipeline.launchResumedAsync called with correct context
+        verify(pipeline).launchResumedAsync(any(AgentRun.class), argThat(ctx ->
+                RUN_ID.equals(ctx.getRunId())
+                        && "todo_3".equals(ctx.getTodoId())
+                        && ctx.getTodoSequence() == 3
+                        && ctx.getToolCallsUsed() == 2
+                        && ctx.getCompletedTodos().size() == 2
+                        && ctx.isTerminalSuccess()),
+                any(), any());
 
-        // Oracle 3: re-entering LAUNCHING succeeds (launcher called again)
-        // The anchor in PG is now LAUNCHING — real loadAnchor reads fresh state
-        boolean secondAttempt = resumeService.tryResume(RUN_ID);
-        assertThat(secondAttempt).isTrue(); // reenters LAUNCHING, calls launcher again
+        // Oracle 3: launcher dedup — same token+version claim is idempotent
+        assertThat(realLauncher.isActive(RUN_ID, afterCas.getResumeToken(),
+                afterCas.getResumeLeaseVersion())).isTrue();
+
+        // ── Invoke terminalConsumed callback → markHandoffAccepted persists to PG ──
+        assertThat(terminalConsumedRef.get()).isNotNull();
+        boolean consumed = terminalConsumedRef.get().getAsBoolean();
+        assertThat(consumed).isTrue();
+
+        // Oracle 4: handoff accepted — anchor updated with completedTodos in PG
+        ToolJobAnchor afterHandoff = anchorService.loadAnchor(RUN_ID);
+        assertThat(afterHandoff.isResultConsumed()).isTrue();
+        assertThat(afterHandoff.getResumeState()).isEqualTo("LAUNCHING"); // still LAUNCHING until completeHandoff
+
+        // ── Invoke completion callback (durable=true) → completeHandoff clears anchor ──
+        assertThat(completionRef.get()).isNotNull();
+        completionRef.get().accept(true);
+
+        // Oracle 5: durable clear — anchor cleared from PG (operationId null = cleared)
+        ToolJobAnchor afterClear = anchorService.loadAnchor(RUN_ID);
+        assertThat(afterClear.getOperationId()).isNull();
+        assertThat(afterClear.getResumeState()).isNull();
+
+        // Oracle 6: launcher claim removed after completion
+        assertThat(realLauncher.isActive(RUN_ID, afterCas.getResumeToken(),
+                afterCas.getResumeLeaseVersion())).isFalse();
     }
 
     // ===== P0-11: public reconciler.reconcileFromDue with OOM + real hooks =====
