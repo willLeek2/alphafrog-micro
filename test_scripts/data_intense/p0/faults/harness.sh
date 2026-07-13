@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# T5 contract harness: runs JDK17 Maven fixture suites + Python tests,
-# produces machine-readable JSON summary. REQUIRED failures → non-zero exit.
-# SUPPORTING_ONLY cases are informational and do NOT affect exit code.
+# T5 contract harness: validates exact candidate SHA, runs JDK17 Maven fixtures
+# + Python tests on the current checkout, produces machine-readable JSON summary.
+# REQUIRED failures -> non-zero exit. SUPPORTING_ONLY cases are informational.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -21,26 +21,48 @@ CANDIDATE_SHA="${1:-$(git rev-parse HEAD)}"
 echo "=== T5 Contract Harness ==="
 echo "CANDIDATE_SHA=$CANDIDATE_SHA"
 echo "PROJECT_ROOT=$PROJECT_ROOT"
+echo "HEAD=$(git rev-parse HEAD)"
 
-if ! git cat-file -t "$CANDIDATE_SHA" >/dev/null 2>&1; then
-  echo "{\"error\":\"CANDIDATE_SHA $CANDIDATE_SHA not in object database\"}" > "$SUMMARY_FILE"
+# Verify CANDIDATE_SHA is exactly HEAD (testing the wrong tree is a fatal error)
+if ! git cat-file -t "$CANDIDATE_SHA^{commit}" >/dev/null 2>&1; then
+  echo "{\"error\":\"CANDIDATE_SHA $CANDIDATE_SHA is not a valid commit\"}" > "$SUMMARY_FILE"
+  exit 1
+fi
+HEAD_SHA=$(git rev-parse HEAD)
+if [ "$(git rev-parse "$CANDIDATE_SHA^{commit}")" != "$HEAD_SHA" ]; then
+  echo "{\"error\":\"CANDIDATE_SHA $CANDIDATE_SHA is not HEAD ($HEAD_SHA). Harness only tests the current checkout.\"}" > "$SUMMARY_FILE"
+  exit 1
+fi
+
+# Tree must be clean (allow harness_result.json as expected artifact)
+DIRTY=$(git status --porcelain --untracked-files=all | grep -v 'harness_result.json' || true)
+if [ -n "$DIRTY" ]; then
+  echo "{\"error\":\"working tree is not clean at HEAD $HEAD_SHA\"}" > "$SUMMARY_FILE"
+  echo "$DIRTY"
   exit 1
 fi
 
 BASE_SHA="9fe4fbdd7b233d6bc7b74bba8128ea2769ae0647"
-if ! git merge-base --is-ancestor "$BASE_SHA" "$CANDIDATE_SHA" 2>/dev/null; then
-  echo "{\"error\":\"$CANDIDATE_SHA is not a descendant of BASE $BASE_SHA\"}" > "$SUMMARY_FILE"
+if ! git merge-base --is-ancestor "$BASE_SHA" "$HEAD_SHA" 2>/dev/null; then
+  echo "{\"error\":\"HEAD $HEAD_SHA is not a descendant of BASE $BASE_SHA\"}" > "$SUMMARY_FILE"
   exit 1
 fi
 
 RESULTS="{}"
+
+record_required_failure() {
+  local name="$1" note="$2"
+  echo "--- FAIL ($name): $note ---"
+  RESULTS=$(echo "$RESULTS" | jq --arg n "$name" --arg d "$note" \
+    '.[$n] = {pass: false, required: true, note: $d}')
+}
 
 run_maven() {
   local name="$1" classes="$2" required="${3:-true}"
   echo "--- $name ---"
   local start_ts=$(date +%s)
   local ec=0
-  mvn test -pl agentLangchainService -Dtest="$classes" \
+  mvn test -pl agentLangchainService -am -Dtest="$classes" \
     -Dsurefire.failIfNoSpecifiedTests=false -q 2>&1 || ec=$?
   local elapsed=$(($(date +%s) - start_ts))
   local pass="false"; [ "$ec" -eq 0 ] && pass="true"
@@ -62,13 +84,6 @@ run_python() {
     '.[$n] = {pass: $p, required: $r, elapsed_s: $e}')
 }
 
-supporting() {
-  local name="$1" note="$2"
-  echo "--- SKIP ($name): SUPPORTING_ONLY — $note ---"
-  RESULTS=$(echo "$RESULTS" | jq --arg n "$name" --arg d "$note" \
-    '.[$n] = {pass: null, required: false, supporting_only: true, note: $d}')
-}
-
 # === REQUIRED suites ===
 run_maven "P001_FastPath" \
   "PythonSandboxToolsP001FastPathTest" true
@@ -79,35 +94,47 @@ run_maven "P009_ResultFetchRepair" \
 run_maven "PipelineResume" \
   "LangchainLinearRunPipelineResumeTest,LangchainLinearWorkflowResumeTest" true
 
-# Python retry classification (REQUIRED, venv if needed)
+# Python retry classification — REQUIRED, fail-closed on any missing dependency
 PYTHON_DIR="${PROJECT_ROOT}/pythonSandboxService"
-if [ -f "${PYTHON_DIR}/tests/test_retry_classification.py" ]; then
+if [ ! -f "${PYTHON_DIR}/tests/test_retry_classification.py" ]; then
+  record_required_failure "Python_RetryClassification" \
+    "test file not found at pythonSandboxService/tests/test_retry_classification.py"
+else
   echo "--- Python_RetryClassification ---"
+  PYTHON_OK=true
   if ! python3 -c "import pydantic" 2>/dev/null; then
     VENV_DIR="/tmp/t5-harness-venv"
-    if ! python3 -m venv "$VENV_DIR" 2>/dev/null; then
-      supporting "Python_RetryClassification" "cannot create venv for pydantic"
-    else
-      "$VENV_DIR/bin/pip" install pydantic pytest -q 2>/dev/null || true
-      if "$VENV_DIR/bin/python" -c "import pydantic" 2>/dev/null; then
-        PYTHON_BIN="$VENV_DIR/bin/python"
-        pushd "$PYTHON_DIR" > /dev/null
-        run_python "Python_RetryClassification" "tests/test_retry_classification.py" true
-        popd > /dev/null
+    if python3 -m venv "$VENV_DIR" 2>/dev/null; then
+      if "$VENV_DIR/bin/pip" install pydantic pytest -q 2>/dev/null; then
+        if "$VENV_DIR/bin/python" -c "import pydantic" 2>/dev/null; then
+          PYTHON_BIN="$VENV_DIR/bin/python"
+        else
+          PYTHON_OK=false
+        fi
       else
-        supporting "Python_RetryClassification" "pydantic install failed in venv"
+        PYTHON_OK=false
       fi
+    else
+      PYTHON_OK=false
     fi
+  fi
+  if [ "$PYTHON_OK" = "false" ]; then
+    record_required_failure "Python_RetryClassification" \
+      "pydantic not available and venv setup failed"
   else
     pushd "$PYTHON_DIR" > /dev/null
     run_python "Python_RetryClassification" "tests/test_retry_classification.py" true
     popd > /dev/null
   fi
-else
-  supporting "Python_RetryClassification" "pythonSandboxService not available"
 fi
 
-# === SUPPORTING_ONLY ===
+# === SUPPORTING_ONLY (informational, NOT required) ===
+supporting() {
+  local name="$1" note="$2"
+  echo "--- SKIP ($name): SUPPORTING_ONLY — $note ---"
+  RESULTS=$(echo "$RESULTS" | jq --arg n "$name" --arg d "$note" \
+    '.[$n] = {pass: null, required: false, supporting_only: true, note: $d}')
+}
 supporting "Live_DB_FaultInjection" "requires production DB; not executed"
 supporting "Live_Sandbox_Restart" "requires Docker sandbox runtime; not executed"
 supporting "Capacity_Admission_Integration" "requires full Spring+Nacos; unit-tested"
