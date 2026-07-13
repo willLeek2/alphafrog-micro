@@ -92,6 +92,8 @@ run_maven "P005_CancelRepair" \
 run_maven "P009_ResultFetchRepair" \
   "ToolJobReconcilerP009ReverseTest,ToolJobReconcilerP009ForwardTest" true
 run_maven "PipelineResume" \
+run_maven "T5_FaultFixtures" \
+  "ToolJobFinalizerP001Test,ToolJobFinalizerP002Test,ToolJobReconcilerP004Test,ToolJobFinalizerP006Test" true
   "LangchainLinearRunPipelineResumeTest,LangchainLinearWorkflowResumeTest" true
 
 # Python retry classification — REQUIRED, fail-closed on any missing dependency
@@ -128,6 +130,43 @@ else
   fi
 fi
 
+
+# Python benchmark tools — REQUIRED, fail-closed on any missing dependency
+BENCHMARK_TEST="${PROJECT_ROOT}/test_scripts/data_intense/p0/benchmarks/test_benchmark_tools.py"
+BENCHMARK_PYTHON=false
+if [ ! -f "$BENCHMARK_TEST" ]; then
+  record_required_failure "Python_BenchmarkTools" \
+    "test file not found at $BENCHMARK_TEST"
+else
+  # Reuse venv from retry-classification if available; otherwise create one
+  if [ "$PYTHON_OK" = "true" ] && [ -n "${PYTHON_BIN:-}" ]; then
+    "${PYTHON_BIN}" -c "import pandas" 2>/dev/null || \
+      "${PYTHON_BIN}" -m pip install pandas -q 2>/dev/null || true
+    if "${PYTHON_BIN}" -c "import pandas" 2>/dev/null; then
+      BENCHMARK_PYTHON=true
+    fi
+  else
+    # No venv yet; create one with pandas+pytest
+    VENV_DIR="/tmp/t5-harness-venv"
+    if python3 -m venv "$VENV_DIR" 2>/dev/null; then
+      if "$VENV_DIR/bin/pip" install pandas pytest -q 2>/dev/null; then
+        if "$VENV_DIR/bin/python" -c "import pandas" 2>/dev/null; then
+          PYTHON_BIN="$VENV_DIR/bin/python"
+          BENCHMARK_PYTHON=true
+        fi
+      fi
+    fi
+  fi
+  if [ "$BENCHMARK_PYTHON" = "true" ]; then
+    export PYTHONPATH="${PYTHON_DIR}:${PROJECT_ROOT}"
+    pushd "$PROJECT_ROOT" > /dev/null
+    run_python "Python_BenchmarkTools" "$BENCHMARK_TEST" true
+    popd > /dev/null
+  else
+    record_required_failure "Python_BenchmarkTools" \
+      "pandas not available and venv setup failed"
+  fi
+fi
 # === SUPPORTING_ONLY (informational, NOT required) ===
 supporting() {
   local name="$1" note="$2"
