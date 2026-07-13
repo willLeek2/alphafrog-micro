@@ -96,11 +96,6 @@ public class ToolJobReconciler {
             if (SUCCEEDED.equals(status) || FAILED.equals(status) || CANCELED.equals(status)) {
                 TaskResultResponse resultResp = fetchResult(taskId, runId, status);
                 if (resultResp == null) {
-                    // Already exhausted — finalizer has been triggered via RESULT_LOST
-                    if ("LOST".equals(anchor.getResultFetchState())) {
-                        log.debug("Result already LOST for run={}, skipping", runId);
-                        return;
-                    }
                     Instant now = Instant.now();
                     if (anchor.getTerminalConfirmedAt() != null) {
                         long elapsed = Duration.between(anchor.getTerminalConfirmedAt(), now).toSeconds();
@@ -121,7 +116,12 @@ public class ToolJobReconciler {
                         anchor.setResultFetchAttempts(1);
                     }
                     anchor.setNextPollAt(now.plusMillis(config.getPollIntervalMs()));
-                    anchorService.updateAnchor(runId, anchor, AgentRunStatus.WAITING_TOOL_JOB);
+                    boolean updated = anchorService.updateAnchor(runId, anchor, AgentRunStatus.WAITING_TOOL_JOB);
+                    if (!updated) {
+                        log.warn("Retry-state CAS failed for run={}, will reload from PG next cycle", runId);
+                        redisCache.removeDue(runId);
+                        return;
+                    }
                     redisCache.upsertDue(runId, anchor);
                     redisCache.writePendingCache(runId, anchor);
                     return;
