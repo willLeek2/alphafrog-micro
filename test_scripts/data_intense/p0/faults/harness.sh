@@ -23,22 +23,19 @@ echo "CANDIDATE_SHA=$CANDIDATE_SHA"
 echo "PROJECT_ROOT=$PROJECT_ROOT"
 echo "HEAD=$(git rev-parse HEAD)"
 
-# Verify CANDIDATE_SHA is exactly HEAD (testing the wrong tree is a fatal error)
 if ! git cat-file -t "$CANDIDATE_SHA^{commit}" >/dev/null 2>&1; then
   echo "{\"error\":\"CANDIDATE_SHA $CANDIDATE_SHA is not a valid commit\"}" > "$SUMMARY_FILE"
   exit 1
 fi
 HEAD_SHA=$(git rev-parse HEAD)
 if [ "$(git rev-parse "$CANDIDATE_SHA^{commit}")" != "$HEAD_SHA" ]; then
-  echo "{\"error\":\"CANDIDATE_SHA $CANDIDATE_SHA is not HEAD ($HEAD_SHA). Harness only tests the current checkout.\"}" > "$SUMMARY_FILE"
+  echo "{\"error\":\"CANDIDATE_SHA $CANDIDATE_SHA is not HEAD ($HEAD_SHA)\"}" > "$SUMMARY_FILE"
   exit 1
 fi
 
-# Tree must be clean (allow harness_result.json as expected artifact)
 DIRTY=$(git status --porcelain --untracked-files=all | grep -v 'harness_result.json' || true)
 if [ -n "$DIRTY" ]; then
-  echo "{\"error\":\"working tree is not clean at HEAD $HEAD_SHA\"}" > "$SUMMARY_FILE"
-  echo "$DIRTY"
+  echo "{\"error\":\"working tree not clean at HEAD $HEAD_SHA\"}" > "$SUMMARY_FILE"
   exit 1
 fi
 
@@ -84,7 +81,57 @@ run_python() {
     '.[$n] = {pass: $p, required: $r, elapsed_s: $e}')
 }
 
-# === REQUIRED suites ===
+supporting() {
+  local name="$1" note="$2"
+  echo "--- SKIP ($name): SUPPORTING_ONLY — $note ---"
+  RESULTS=$(echo "$RESULTS" | jq --arg n "$name" --arg d "$note" \
+    '.[$n] = {pass: null, required: false, supporting_only: true, note: $d}')
+}
+
+# ---- Unified Python environment setup ----
+# Single decision: either the ambient python3 has pydantic + pytest + pandas,
+# or we build an isolated venv with all three. Shared by retry-classification
+# and benchmark-tools. Any failure records required/pass=false.
+PYTHON_DIR="${PROJECT_ROOT}/pythonSandboxService"
+REQUIREMENTS_FILE="${PYTHON_DIR}/requirements.txt"
+PYTHON_BIN=""
+PYTHON_OK=false
+
+setup_python_env() {
+  # Already set up (idempotent)
+  if [ "$PYTHON_OK" = "true" ] && [ -n "$PYTHON_BIN" ]; then
+    return 0
+  fi
+
+  # Try ambient python3: must have pydantic + pytest + pandas ALL present
+  if python3 -c "import pydantic, pytest, pandas" 2>/dev/null; then
+    PYTHON_BIN="python3"
+    PYTHON_OK=true
+    return 0
+  fi
+
+  # Build isolated venv with all required packages
+  VENV_DIR="/tmp/t5-harness-venv"
+  echo "--- Python env: building venv at $VENV_DIR ---"
+  if ! python3 -m venv "$VENV_DIR" 2>/dev/null; then
+    return 1
+  fi
+  PIP="$VENV_DIR/bin/pip"
+  # Install repo requirements (if present) + pytest + pandas
+  if [ -f "$REQUIREMENTS_FILE" ]; then
+    "$PIP" install -r "$REQUIREMENTS_FILE" -q 2>/dev/null || true
+  fi
+  "$PIP" install pytest pandas -q 2>/dev/null || true
+  # All three must be importable
+  if "$VENV_DIR/bin/python" -c "import pydantic, pytest, pandas" 2>/dev/null; then
+    PYTHON_BIN="$VENV_DIR/bin/python"
+    PYTHON_OK=true
+    return 0
+  fi
+  return 1
+}
+
+# === REQUIRED Java suites ===
 run_maven "P001_FastPath" \
   "PythonSandboxToolsP001FastPathTest" true
 run_maven "P005_CancelRepair" \
@@ -96,84 +143,41 @@ run_maven "PipelineResume" \
 run_maven "T5_FaultFixtures" \
   "ToolJobFinalizerP001Test,ToolJobFinalizerP002Test,ToolJobReconcilerP004Test,ToolJobFinalizerP006Test" true
 
-# Python retry classification — REQUIRED, fail-closed on any missing dependency
-PYTHON_DIR="${PROJECT_ROOT}/pythonSandboxService"
+# === Python: retry classification (REQUIRED) ===
 if [ ! -f "${PYTHON_DIR}/tests/test_retry_classification.py" ]; then
   record_required_failure "Python_RetryClassification" \
-    "test file not found at pythonSandboxService/tests/test_retry_classification.py"
+    "test file not found"
 else
   echo "--- Python_RetryClassification ---"
-  PYTHON_OK=true
-  if ! python3 -c "import pydantic" 2>/dev/null; then
-    VENV_DIR="/tmp/t5-harness-venv"
-    if python3 -m venv "$VENV_DIR" 2>/dev/null; then
-      if "$VENV_DIR/bin/pip" install pydantic pytest -q 2>/dev/null; then
-        if "$VENV_DIR/bin/python" -c "import pydantic" 2>/dev/null; then
-          PYTHON_BIN="$VENV_DIR/bin/python"
-        else
-          PYTHON_OK=false
-        fi
-      else
-        PYTHON_OK=false
-      fi
-    else
-      PYTHON_OK=false
-    fi
-  fi
-  if [ "$PYTHON_OK" = "false" ]; then
-    record_required_failure "Python_RetryClassification" \
-      "pydantic not available and venv setup failed"
-  else
+  if setup_python_env; then
     pushd "$PYTHON_DIR" > /dev/null
     run_python "Python_RetryClassification" "tests/test_retry_classification.py" true
     popd > /dev/null
+  else
+    record_required_failure "Python_RetryClassification" \
+      "unified Python env unavailable (need pydantic + pytest + pandas)"
   fi
 fi
 
-
-# Python benchmark tools — REQUIRED, fail-closed on any missing dependency
+# === Python: benchmark tools (REQUIRED) ===
 BENCHMARK_TEST="${PROJECT_ROOT}/test_scripts/data_intense/p0/benchmarks/test_benchmark_tools.py"
-BENCHMARK_PYTHON=false
 if [ ! -f "$BENCHMARK_TEST" ]; then
   record_required_failure "Python_BenchmarkTools" \
-    "test file not found at $BENCHMARK_TEST"
+    "test file not found"
 else
-  # Reuse venv from retry-classification if available; otherwise create one
-  if [ "$PYTHON_OK" = "true" ] && [ -n "${PYTHON_BIN:-}" ]; then
-    "${PYTHON_BIN}" -c "import pandas" 2>/dev/null || \
-      "${PYTHON_BIN}" -m pip install pandas -q 2>/dev/null || true
-    if "${PYTHON_BIN}" -c "import pandas" 2>/dev/null; then
-      BENCHMARK_PYTHON=true
-    fi
-  else
-    # No venv yet; create one with pandas+pytest
-    VENV_DIR="/tmp/t5-harness-venv"
-    if python3 -m venv "$VENV_DIR" 2>/dev/null; then
-      if "$VENV_DIR/bin/pip" install pandas pytest -q 2>/dev/null; then
-        if "$VENV_DIR/bin/python" -c "import pandas" 2>/dev/null; then
-          PYTHON_BIN="$VENV_DIR/bin/python"
-          BENCHMARK_PYTHON=true
-        fi
-      fi
-    fi
-  fi
-  if [ "$BENCHMARK_PYTHON" = "true" ]; then
+  echo "--- Python_BenchmarkTools ---"
+  if setup_python_env; then
     export PYTHONPATH="${PYTHON_DIR}:${PROJECT_ROOT}"
     pushd "$PROJECT_ROOT" > /dev/null
     run_python "Python_BenchmarkTools" "$BENCHMARK_TEST" true
     popd > /dev/null
   else
     record_required_failure "Python_BenchmarkTools" \
-      "pandas not available and venv setup failed"
+      "unified Python env unavailable (need pydantic + pytest + pandas)"
   fi
 fi
-# === SUPPORTING_ONLY (informational, NOT required) ===
-supporting() {
-  local name="$1" note="$2"
-  echo "--- SKIP ($name): SUPPORTING_ONLY — $note ---"
-  RESULTS=$(echo "$RESULTS" | jq --arg n "$name" --arg d "$note" \
-    '.[$n] = {pass: null, required: false, supporting_only: true, note: $d}')
-}
+
+# === SUPPORTING_ONLY ===
 supporting "Live_DB_FaultInjection" "requires production DB; not executed"
 supporting "Live_Sandbox_Restart" "requires Docker sandbox runtime; not executed"
 supporting "Capacity_Admission_Integration" "requires full Spring+Nacos; unit-tested"
