@@ -8,9 +8,11 @@ import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agent.platform.service.AgentObservabilityService;
+import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agentlangchain.orchestration.LangchainLinearRunPipeline;
+import world.willfrog.agentlangchain.tooljob.ToolJobAnchorService;
 import world.willfrog.alphafrogmicro.agent.idl.AgentEmpty;
 import world.willfrog.alphafrogmicro.agent.idl.CancelAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.DeleteAgentRunRequest;
@@ -69,6 +71,7 @@ public class LangchainRunControlService {
     private final AgentObservabilityService observabilityService;
     private final LangchainLinearRunPipeline pipeline;
     private final AgentRunCreditSettlementService creditSettlementService;
+    private final ToolJobAnchorService anchorService;
 
     /**
      * 删除 run 及其关联的状态数据（Redis）。
@@ -100,6 +103,25 @@ public class LangchainRunControlService {
         String userId = run.getUserId();
         // 1. 先写 Redis 状态为 CANCELING —— todo loop 中的 ExecutionGuard 通过轮询 Redis 检测到这个状态后自行停止
         stateStore.markRunStatus(runId, AgentRunStatus.CANCELING.name());
+        // 1a. If there's an active tool-job anchor, persist cancel disposition so the
+        //     reconciler routes through checkPausedTerminal and the finalizer releases
+        //     capacity. The anchor keeps WAITING_TOOL_JOB for the finalizer CAS; the
+        //     finalizer transitions to CANCELED after terminal sinks are complete.
+        boolean hasActiveAnchor = false;
+        try {
+            ToolJobAnchor toolAnchor = anchorService.loadAnchor(runId);
+            if (toolAnchor != null && toolAnchor.getOperationId() != null
+                    && !toolAnchor.getOperationId().isBlank()) {
+                toolAnchor.setAutoResume(false);
+                toolAnchor.setRunDisposition("CANCELED");
+                anchorService.updateAnchor(runId, toolAnchor, run.getStatus());
+                hasActiveAnchor = true;
+                log.info("Cancel run={} with active tool-job anchor: persisted cancel disposition", runId);
+            }
+        } catch (Exception e) {
+            log.warn("Failed to persist cancel disposition on tool-job anchor for run={}, "
+                    + "continuing with cancel: {}", runId, e.getMessage());
+        }
         // 2. sleep 200ms 给正在执行的 todo loop 一个窗口去感知并响应 CANCELING 状态。
         //    这比硬 kill 线程更安全——正在执行的工具调用可以自然完成当前轮，避免留下半成品状态
         try {
@@ -114,8 +136,14 @@ public class LangchainRunControlService {
         String snapshot = observabilityService.attachObservabilityToSnapshot(
                 runId, run.getSnapshotJson(), AgentRunStatus.CANCELED);
         // 5. 更新 DB：snapshot、status、TTL（中断的 run 过期时间比正常完成的短）
-        runMapper.updateSnapshot(runId, userId, AgentRunStatus.CANCELED, snapshot, false, null);
-        runMapper.updateStatusWithTtl(runId, userId, AgentRunStatus.CANCELED, eventService.nextInterruptedExpiresAt());
+        if (hasActiveAnchor) {
+            // Keep current DB status for finalizer CAS (the reconciler will finalize
+            // terminal sinks and transition to CANCELED after capacity release).
+            runMapper.updateSnapshot(runId, userId, run.getStatus(), snapshot, false, null);
+        } else {
+            runMapper.updateSnapshot(runId, userId, AgentRunStatus.CANCELED, snapshot, false, null);
+            runMapper.updateStatusWithTtl(runId, userId, AgentRunStatus.CANCELED, eventService.nextInterruptedExpiresAt());
+        }
         // 6. 发 CANCELED 事件 → 前端 SSE 收到后更新 UI 为已取消
         eventService.append(runId, userId, "CANCELED", Map.of(
                 "run_id", runId,

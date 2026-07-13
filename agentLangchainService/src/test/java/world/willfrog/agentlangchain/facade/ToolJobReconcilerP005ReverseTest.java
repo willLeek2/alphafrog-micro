@@ -26,10 +26,12 @@ import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agentlangchain.orchestration.LangchainLinearRunPipeline;
 import world.willfrog.agentlangchain.tooljob.ToolJobAnchorService;
 import world.willfrog.agentlangchain.tooljob.ToolJobConfig;
+import world.willfrog.agentlangchain.tooljob.ToolJobEventHook;
 import world.willfrog.agentlangchain.tooljob.ToolJobFinalizer;
 import world.willfrog.agentlangchain.tooljob.ToolJobReconciler;
 import world.willfrog.agentlangchain.tooljob.ToolJobRedisCache;
 import world.willfrog.agentlangchain.tooljob.ToolJobResumeService;
+import world.willfrog.agentlangchain.tooljob.ToolJobUsageHook;
 import world.willfrog.alphafrogmicro.agent.idl.CancelAgentRunRequest;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
 
@@ -237,15 +239,15 @@ class ToolJobReconcilerP005ReverseTest {
         // - stateStore.markRunStatus: void, mock does nothing by default
         // - creditSettlementService.settleAsync: void, mock does nothing by default
 
-        // Construct LangchainRunControlService with REAL mapper + mocked dependencies
-        controlService = new LangchainRunControlService(
-                readService, mapper, eventService, stateStore,
-                observabilityService, pipeline, creditSettlementService);
-
-        // Real services for reconciler/finalizer
+        // Real anchor service (used by both controlService and reconciler/finalizer)
         ToolJobConfig config = new ToolJobConfig();
         redisCache = new ToolJobRedisCache(redisTemplate, om, config);
         ToolJobAnchorService anchorService = new ToolJobAnchorService(mapper);
+
+        // Construct LangchainRunControlService with REAL mapper + anchor service + mocked dependencies
+        controlService = new LangchainRunControlService(
+                readService, mapper, eventService, stateStore,
+                observabilityService, pipeline, creditSettlementService, anchorService);
 
         ToolJobResumeService resumeService = new ToolJobResumeService(
                 anchorService, redisCache, config, om);
@@ -257,6 +259,17 @@ class ToolJobReconcilerP005ReverseTest {
         // was called (proving the reconciler tried)
         ToolJobFinalizer realFinalizer = new ToolJobFinalizer(
                 anchorService, redisCache, capacityFake, resumeService, config);
+        // Wire usage/event hooks (mocked — return success)
+        ToolJobUsageHook usageHook = mock(ToolJobUsageHook.class);
+        when(usageHook.upsertUsage(anyString(), any())).thenReturn(true);
+        java.lang.reflect.Field usageField = ToolJobFinalizer.class.getDeclaredField("usageHook");
+        usageField.setAccessible(true);
+        usageField.set(realFinalizer, usageHook);
+        ToolJobEventHook eventHook = mock(ToolJobEventHook.class);
+        when(eventHook.emitTerminalEvent(anyString(), any())).thenReturn(true);
+        java.lang.reflect.Field eventField = ToolJobFinalizer.class.getDeclaredField("eventHook");
+        eventField.setAccessible(true);
+        eventField.set(realFinalizer, eventHook);
         finalizerSpy = spy(realFinalizer);
 
         // Create the reconciler with the spy finalizer (5-arg constructor)
@@ -279,7 +292,7 @@ class ToolJobReconcilerP005ReverseTest {
     // ---- Test: Path A -- reconcileFromDue ----
 
     @Test
-    void shouldFailEnvelopeCasWhenRunIsCanceled() throws Exception {
+    void shouldCancelRunPersistsAnchorDispositionThenReconcilerReleasesCapacity() throws Exception {
         // Step 1: Seed -- insert run with WAITING_TOOL_JOB, a PENDING anchor,
         //         and a real DataAnalysisReservation
         Instant originalNextPollAt = Instant.now().minusSeconds(60); // in the past
@@ -306,6 +319,9 @@ class ToolJobReconcilerP005ReverseTest {
         anchor.setTaskId("task-p005");
         anchor.setAutoResume(true);
         anchor.setReservationJson(reservationJson);
+        anchor.setEstimateJson("{\"estimatedRows\":1,\"estimatedBytes\":10,\"fileCount\":1,"
+                + "\"selectedColumnRatio\":0.5,\"manifestMemberCount\":1,"
+                + "\"heavyOperationHints\":[],\"resourceClass\":\"STANDARD\",\"capacityUnits\":1}");
         anchor.setNextPollAt(originalNextPollAt);
         anchor.setTimeoutAt(Instant.now().plusSeconds(600));
 
@@ -324,7 +340,7 @@ class ToolJobReconcilerP005ReverseTest {
         assertThat(run).isNotNull();
         assertThat(run.getStatus()).isEqualTo(AgentRunStatus.WAITING_TOOL_JOB);
 
-        // Precondition: anchor is PENDING with reservation
+        // Precondition: anchor is PENDING with autoResume=true
         ToolJobAnchor dbAnchor = ToolJobAnchor.fromJson(run.getToolJobAnchorJson());
         assertThat(dbAnchor.getAnchorState()).isEqualTo("PENDING");
         assertThat(dbAnchor.isAutoResume()).isTrue();
@@ -332,144 +348,138 @@ class ToolJobReconcilerP005ReverseTest {
         assertThat(dbAnchor.getFinalizerStep()).isNull();
 
         // Step 3: Call real LangchainRunControlService.cancelRun()
-        //         This uses the REAL AgentRunMapper to update DB status to CANCELED.
         CancelAgentRunRequest cancelRequest = CancelAgentRunRequest.newBuilder()
                 .setId(RUN_ID)
                 .setUserId(USER_ID)
                 .build();
         controlService.cancelRun(cancelRequest);
 
-        // Step 4: Verify DB state after cancelRun -- status is truly CANCELED
-        //         (using fresh mapper load, not cached)
+        // Step 4: After cancelRun — anchor has cancel disposition, run status kept for CAS
+        run = mapper.findById(RUN_ID);
+        assertThat(run).isNotNull();
+        // Status still WAITING_TOOL_JOB (not CANCELED) — finalizer CAS needs it
+        assertThat(run.getStatus()).isEqualTo(AgentRunStatus.WAITING_TOOL_JOB);
+
+        dbAnchor = ToolJobAnchor.fromJson(run.getToolJobAnchorJson());
+        assertThat(dbAnchor.getAnchorState()).isEqualTo("PENDING");
+        assertThat(dbAnchor.isAutoResume()).isFalse(); // cancel disposition persisted
+        assertThat(dbAnchor.getRunDisposition()).isEqualTo("CANCELED");
+        assertThat(dbAnchor.getReservationJson()).isNotNull().isNotBlank();
+        assertThat(dbAnchor.getFinalizerStep()).isNull();
+
+        // Step 5: Call reconcileFromDue — sees autoResume=false, routes via
+        //         checkPausedTerminal → finalizer.handleTerminal(autoResume=false)
+        //         → ENVELOPE/RELEASE/USAGE/EVENT succeed (CAS with WAITING_TOOL_JOB)
+        //         → CANCELED disposition → transition to CANCELED status
+        reconciler.reconcileFromDue();
+
+        // ---- Oracles (flipped: capacity IS released after fix) ----
+
+        // Oracle 1: handleTerminal WAS called (reconciler tried) with autoResume=false
+        verify(finalizerSpy).handleTerminal(
+                eq(RUN_ID), any(ToolJobAnchor.class), eq("SUCCEEDED"),
+                any(TaskResultResponse.class), eq(false));
+
+        // Oracle 2: finalizerStep = CANCELED (finalizer completed, not null)
         run = mapper.findById(RUN_ID);
         assertThat(run).isNotNull();
         assertThat(run.getStatus()).isEqualTo(AgentRunStatus.CANCELED);
 
-        // Reload anchor from DB: anchor itself is still PENDING (cancelRun does not
-        // touch the tool_job_anchor_json column)
         dbAnchor = ToolJobAnchor.fromJson(run.getToolJobAnchorJson());
-        assertThat(dbAnchor.getAnchorState()).isEqualTo("PENDING");
-        assertThat(dbAnchor.isAutoResume()).isTrue();
-        assertThat(dbAnchor.getReservationJson()).isNotNull().isNotBlank();
-        assertThat(dbAnchor.getReservationJson()).contains("task-p005");
-        assertThat(dbAnchor.getFinalizerStep()).isNull();
+        assertThat(dbAnchor.getFinalizerStep()).isEqualTo("CANCELED");
 
-        // Step 5: Call reconcileFromDue -- this triggers processItem which:
-        //   a) loadAnchor (finds PENDING anchor with autoResume=true)
-        //   b) getTaskStatus -> SUCCEEDED (stub)
-        //   c) fetchResult -> valid TaskResultResponse (stub)
-        //   d) finalizer.handleTerminal(runId, anchor, "SUCCEEDED", result, true)
-        //      -> ENVELOPE step CAS (updateAnchor expects WAITING_TOOL_JOB, but
-        //         status is CANCELED so 0 rows updated) -> returns early
+        // Oracle 3: terminalStatus, terminalAt ARE set (ENVELOPE succeeded)
+        assertThat(dbAnchor.getTerminalStatus()).isEqualTo("SUCCEEDED");
+        assertThat(dbAnchor.getTerminalAt()).isNotNull();
+
+        // Oracle 4: sandboxTerminalStatus is set
+        assertThat(dbAnchor.getSandboxTerminalStatus()).isEqualTo("SUCCEEDED");
+
+        // Oracle 5: capacity WAS released (releaseCallCount == 1)
+        assertThat(capacityFake.releaseCallCount).isEqualTo(1);
+
+        // Oracle 6: reservation released — transition from PENDING to RELEASED counted
+        assertThat(capacityFake.transitionCount).isEqualTo(1);
+
+        // Oracle 7: terminal result fields ARE set
+        assertThat(dbAnchor.getTerminalResultPreview()).isNotNull();
+
+        // Oracle 8: repeat reconcile does NOT double-release
+        int releaseBefore = capacityFake.releaseCallCount;
         reconciler.reconcileFromDue();
-
-        // ---- Oracles ----
-
-        // Oracle 1: handleTerminal WAS called (reconciler tried)
-        verify(finalizerSpy).handleTerminal(
-                eq(RUN_ID), any(ToolJobAnchor.class), eq("SUCCEEDED"),
-                any(TaskResultResponse.class), eq(true));
-
-        // Oracle 2: finalizerStep is null in DB (ENVELOPE CAS failed, not persisted)
-        run = mapper.findById(RUN_ID);
-        assertThat(run).isNotNull();
-        dbAnchor = ToolJobAnchor.fromJson(run.getToolJobAnchorJson());
-        assertThat(dbAnchor.getFinalizerStep()).isNull();
-
-        // Oracle 3: terminalStatus, terminalAt remain null
-        assertThat(dbAnchor.getTerminalStatus()).isNull();
-        assertThat(dbAnchor.getTerminalAt()).isNull();
-
-        // Oracle 4: sandboxTerminalStatus remains null
-        assertThat(dbAnchor.getSandboxTerminalStatus()).isNull();
-
-        // Oracle 5: capacity NOT released (reservationJson preserved)
-        assertThat(dbAnchor.getReservationJson()).isNotNull().isNotBlank();
-        assertThat(dbAnchor.getReservationJson()).contains("task-p005");
-
-        // Oracle 6: releaseCallCount == 0 (releaseReservation never called)
-        assertThat(capacityFake.releaseCallCount).isEqualTo(0);
-
-        // Oracle 7: ledger identity still active (distinctReservationIds == 1)
-        assertThat(capacityFake.distinctReservationIds()).isEqualTo(1);
-
-        // Oracle 8: anchor still PENDING (no state advancement past ENVELOPE)
-        assertThat(dbAnchor.getAnchorState()).isEqualTo("PENDING");
-
-        // Oracle 9: terminal result fields remain null
-        assertThat(dbAnchor.getTerminalResultPreview()).isNull();
-        assertThat(dbAnchor.getTerminalRawRef()).isNull();
-        assertThat(dbAnchor.getTerminalErrorCode()).isNull();
-
-        // Oracle 10: resultFetchState still null (no result fetch state recorded)
-        assertThat(dbAnchor.getResultFetchState()).isNull();
+        assertThat(capacityFake.releaseCallCount).isEqualTo(releaseBefore);
     }
 
     // ---- Test: Path B -- direct finalizer (narrow evidence) ----
 
     @Test
-    void shouldFailEnvelopeCasOnDirectFinalizerCall() throws Exception {
+    void shouldFinalizerProcessCancelDispositionAndTransitionToCanceled() throws Exception {
         String runIdB = RUN_ID + "-b";
 
-        String reservationJson = "{\"reservationId\":\"res-p005b\","
-                + "\"identity\":{\"operationId\":\"" + runIdB + ":tc-1:1\","
-                + "\"runId\":\"" + runIdB + "\",\"toolCallId\":\"tc-1\",\"attempt\":1,"
-                + "\"reservationId\":\"res-p005b\"},"
-                + "\"resourceClass\":\"CPU\",\"capacityUnits\":1,"
-                + "\"state\":\"PENDING\",\"taskId\":\"task-p005b\","
-                + "\"acquiredAt\":\"" + Instant.now().minusSeconds(120) + "\"}";
+        DataAnalysisOperationIdentity identityB =
+                new DataAnalysisOperationIdentity(runIdB, "tc-1", 1);
+        DataAnalysisReservation reservationB = new DataAnalysisReservation(
+                identityB.operationId(), identityB,
+                DataAnalysisResourceClass.STANDARD, 1,
+                DataAnalysisReservationState.PENDING_TRANSFERRED,
+                "task-p005b", Instant.now().minusSeconds(120));
+        String reservationJsonB = om.writeValueAsString(reservationB);
+
+        // Pre-seed capacity ledger
+        capacityFake.restoreReservation(reservationB);
 
         ToolJobAnchor anchor = new ToolJobAnchor();
         anchor.setAnchorState("PENDING");
-        anchor.setOperationId(runIdB + ":tc-1:1");
+        anchor.setOperationId(identityB.operationId());
         anchor.setToolCallId("tc-1");
         anchor.setAttempt(1);
         anchor.setTaskId("task-p005b");
-        anchor.setAutoResume(true);
-        anchor.setReservationJson(reservationJson);
+        anchor.setAutoResume(false);  // cancel disposition already set
+        anchor.setRunDisposition("CANCELED");
+        anchor.setReservationJson(reservationJsonB);
+        anchor.setEstimateJson("{\"estimatedRows\":1,\"estimatedBytes\":10,\"fileCount\":1,"
+                + "\"selectedColumnRatio\":0.5,\"manifestMemberCount\":1,"
+                + "\"heavyOperationHints\":[],\"resourceClass\":\"STANDARD\",\"capacityUnits\":1}");
         anchor.setNextPollAt(Instant.now().minusSeconds(60));
         anchor.setTimeoutAt(Instant.now().plusSeconds(600));
 
         insertRun(runIdB, USER_ID, AgentRunStatus.WAITING_TOOL_JOB.name(), anchor.toJson());
 
-        // Directly set run status to CANCELED
-        updateRunStatus(runIdB, AgentRunStatus.CANCELED.name());
-
-        // Build a valid terminal result (so ENVELOPE sets terminalStatus)
+        // Build a valid terminal result
         TaskResultResponse result = TaskResultResponse.newBuilder()
                 .setTaskId("task-p005b")
                 .setStatus("SUCCEEDED")
                 .setStdout("some output data")
+                .setRetryable(false)
                 .setResourceUsage(SandboxResourceUsage.newBuilder()
                         .setExitReason("OK").build())
                 .build();
 
-        // Directly call handleTerminal on the spy (delegates to real method)
-        finalizerSpy.handleTerminal(runIdB, anchor, "SUCCEEDED", result, true);
+        // Directly call handleTerminal on the spy with autoResume=false
+        finalizerSpy.handleTerminal(runIdB, anchor, "SUCCEEDED", result, false);
 
-        // In-memory evidence: finalizerStep was set to ENVELOPE before CAS
-        assertThat(anchor.getFinalizerStep()).isEqualTo("ENVELOPE");
+        // In-memory evidence: finalizer set STEP_CANCELED
+        assertThat(anchor.getFinalizerStep()).isEqualTo("CANCELED");
         assertThat(anchor.getTerminalStatus()).isEqualTo("SUCCEEDED");
 
-        // DB evidence: ENVELOPE CAS failed, nothing persisted
+        // DB evidence: finalizer completed, status transitioned to CANCELED
         AgentRun run = mapper.findById(runIdB);
         assertThat(run).isNotNull();
+        assertThat(run.getStatus()).isEqualTo(AgentRunStatus.CANCELED);
+
         ToolJobAnchor dbAnchor = ToolJobAnchor.fromJson(run.getToolJobAnchorJson());
-        assertThat(dbAnchor.getFinalizerStep()).isNull();
-        assertThat(dbAnchor.getTerminalStatus()).isNull();
-        assertThat(dbAnchor.getTerminalAt()).isNull();
+        assertThat(dbAnchor.getFinalizerStep()).isEqualTo("CANCELED");
+        assertThat(dbAnchor.getTerminalStatus()).isEqualTo("SUCCEEDED");
+        assertThat(dbAnchor.getTerminalAt()).isNotNull();
 
-        // Capacity unchanged (releaseCapacity never reached)
+        // Capacity released
         assertThat(dbAnchor.getReservationJson()).isNotNull().isNotBlank();
-        assertThat(dbAnchor.getReservationJson()).contains("res-p005b");
+        assertThat(capacityFake.releaseCallCount).isEqualTo(1);
 
-        // Anchor still PENDING
-        assertThat(dbAnchor.getAnchorState()).isEqualTo("PENDING");
-
-        // Verify handleTerminal was invoked on spy
+        // Verify handleTerminal was invoked with autoResume=false
         verify(finalizerSpy).handleTerminal(
                 eq(runIdB), any(ToolJobAnchor.class), eq("SUCCEEDED"),
-                any(TaskResultResponse.class), eq(true));
+                any(TaskResultResponse.class), eq(false));
     }
 
     // ---- Helpers ----
@@ -587,6 +597,7 @@ class ToolJobReconcilerP005ReverseTest {
                     .setTaskId(request.getTaskId())
                     .setStatus("SUCCEEDED")
                     .setStdout("mock output for " + request.getTaskId())
+                    .setRetryable(false)
                     .setResourceUsage(SandboxResourceUsage.newBuilder()
                             .setExitReason("OK").build())
                     .build();
@@ -643,8 +654,9 @@ class ToolJobReconcilerP005ReverseTest {
         @Override
         public DataAnalysisRestoreOutcome restoreReservation(DataAnalysisReservation reservation) {
             String id = reservation.reservationId();
-            if (ledger.containsKey(id)) {
-                return DataAnalysisRestoreOutcome.CONFLICT;
+            DataAnalysisReservationState current = ledger.get(id);
+            if (current != null && current == reservation.state()) {
+                return DataAnalysisRestoreOutcome.ALREADY_PRESENT_SAME;
             }
             ledger.put(id, reservation.state());
             return DataAnalysisRestoreOutcome.ADDED;

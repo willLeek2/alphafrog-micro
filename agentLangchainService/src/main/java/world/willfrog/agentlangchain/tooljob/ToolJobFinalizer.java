@@ -30,6 +30,7 @@ public class ToolJobFinalizer {
     static final String STEP_EVENT = "EVENT";
     static final String STEP_CAS_STATUS = "CAS_STATUS";
     static final String STEP_RESUME_READY = "RESUME_READY";
+    static final String STEP_CANCELED = "CANCELED";
 
     private static final Map<String, Integer> STEP_ORDER = Map.of(
             STEP_ENVELOPE, 1, STEP_RELEASE, 2, STEP_USAGE, 3,
@@ -177,7 +178,17 @@ public class ToolJobFinalizer {
                 }
                 return;
             }
-            // Paused/canceled: stop here, keep WAITING_TOOL_JOB, no CAS/READY
+            if ("CANCELED".equals(anchor.getRunDisposition())) {
+                anchor.setFinalizerStep(STEP_CANCELED);
+                if (!anchorService.updateAnchorAndStatus(runId, anchor,
+                        AgentRunStatus.CANCELED, AgentRunStatus.WAITING_TOOL_JOB)) {
+                    log.warn("CANCELED terminal transition failed for run={}, will retry", runId);
+                    return;
+                }
+                log.info("Canceled terminal finalized for run={}, capacity released", runId);
+                return;
+            }
+            // Paused: stop here, keep WAITING_TOOL_JOB, no CAS/READY
             log.info("Terminal handled for paused run={}, not auto-resuming", runId);
             return;
         }
