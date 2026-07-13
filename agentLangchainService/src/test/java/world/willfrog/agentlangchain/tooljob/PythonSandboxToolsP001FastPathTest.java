@@ -444,39 +444,14 @@ class PythonSandboxToolsP001FastPathTest {
         ppField.set(svc, 500);
     }
 
-    // ===== P0-07: real event hook → PG event persistence + dedup =====
+    // ===== P0-07: EVENT step crash → re-entry → event hook dedup prevents double-emit =====
 
     @Test
-    void eventHookEmitsTerminalEventThroughAppendOnceAndDedupPreventsDoubleEmit() throws Exception {
-        // Fast-path executePython
-        DataAnalysisReservation preparing = preparingReservation();
-        when(capacity.reserve(any(), any())).thenReturn(preparing);
-        when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
-        when(capacity.releaseReservation(any())).thenReturn(DataAnalysisReleaseOutcome.RELEASED);
-        when(recorder.upsert(any())).thenReturn(DataAnalysisUpsertOutcome.INSERTED);
-        when(sandbox.createTask(any())).thenAnswer(invocation -> {
-            ExecuteRequest req = invocation.getArgument(0);
-            return ExecuteResponse.newBuilder().setTaskId("task-p007")
-                    .setRequestFingerprint(req.getRequestFingerprint()).build();
-        });
-        when(sandbox.getTaskStatus(any())).thenReturn(
-                TaskStatusResponse.newBuilder().setStatus("SUCCEEDED").build());
-        when(sandbox.getTaskResult(any())).thenReturn(TaskResultResponse.newBuilder()
-                .setTaskId("task-p007").setStatus("SUCCEEDED").setExitCode(0)
-                .setStdout("ok").setDatasetDir("/sandbox/input")
-                .setRetryable(false)
-                .setResourceUsage(completeUsage()).build());
+    void eventStepWriteFailsOnceThenReentryEmitsEventViaDedup() throws Exception {
+        // Seed anchor with finalizerStep=USAGE (ENVELOPE+RELEASE+USAGE done, EVENT pending)
+        ToolJobAnchor anchor = buildTerminalAnchorWithUsagesDone();
 
-        tools.executePython("print(1)", "1", null, null, 30);
-
-        // Load anchor from real PG (has terminalStatus + toolCallId from completeSynchronously)
-        ToolJobAnchorService verifyAnchor = new ToolJobAnchorService(newMapper());
-        ToolJobAnchor anchor = verifyAnchor.loadAnchor(RUN_ID);
-        assertThat(anchor).isNotNull();
-        assertThat(anchor.getTerminalStatus()).isEqualTo("SUCCEEDED");
-        assertThat(anchor.getToolCallId()).isEqualTo(TOOL_CALL_ID);
-
-        // Build real AgentEventService for event hook test
+        // Build real AgentEventService + real event hook
         AgentLlmLocalConfigLoader llmConfigLoader = mock(AgentLlmLocalConfigLoader.class);
         AgentRunEventRedisStore eventRedisStore = new AgentRunEventRedisStore(
                 redisTemplate, om, llmConfigLoader);
@@ -487,95 +462,171 @@ class PythonSandboxToolsP001FastPathTest {
                 llmConfigLoader, messageService, promptService);
         injectEventServiceFields(eventService);
 
-        // Build real ToolJobEventHookImpl (constructor: AgentRunMapper, AgentEventService)
         AgentRunMapper runMapper = newMapper();
-        ToolJobEventHookImpl eventHook = new ToolJobEventHookImpl(runMapper, eventService);
+        ToolJobEventHookImpl realEventHook = new ToolJobEventHookImpl(runMapper, eventService);
 
-        // Oracle 1: first emitTerminalEvent — appends event to PG
-        boolean first = eventHook.emitTerminalEvent(RUN_ID, anchor);
-        assertThat(first).isTrue();
+        // AnchorService mock: seed has finalizerStep=USAGE, so ENVELOPE/RELEASE/USAGE skip.
+        // Only EVENT step calls updateAnchor → fail ONCE (crash), then succeed on re-entry.
+        ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
+        when(anchorService.updateAnchor(eq(RUN_ID), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.WAITING_TOOL_JOB)))
+                .thenReturn(false)  // EVENT step — DB write FAILS (crash)
+                .thenReturn(true);  // Re-entry: EVENT step succeeds
+        when(anchorService.updateAnchorAndStatus(eq(RUN_ID), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.WAITING_TOOL_JOB)))
+                .thenReturn(true);
 
-        // Oracle 2: event row exists with correct dedupe key
-        AgentRunEventMapper eventMapper = newEventMapper();
+        ToolJobFinalizer finalizer = new ToolJobFinalizer(
+                anchorService, mock(ToolJobRedisCache.class),
+                capacity, mock(ToolJobResumeService.class), new ToolJobConfig());
+        java.lang.reflect.Field usageField = ToolJobFinalizer.class.getDeclaredField("usageHook");
+        usageField.setAccessible(true);
+        ToolJobUsageHook usageHook = mock(ToolJobUsageHook.class);
+        when(usageHook.upsertUsage(eq(RUN_ID), any())).thenReturn(true);
+        usageField.set(finalizer, usageHook);
+        java.lang.reflect.Field eventField = ToolJobFinalizer.class.getDeclaredField("eventHook");
+        eventField.setAccessible(true);
+        eventField.set(finalizer, realEventHook);
+
+        // First call: ENVELOPE+RELEASE+USAGE skip, EVENT step fires hook but write FAILS
+        finalizer.handleTerminal(RUN_ID, anchor, "SUCCEEDED", null, true);
+
+        // Oracle 1: event hook fired (side effect), event row exists in PG
         String dedupeKey = RUN_ID + ":" + TOOL_CALL_ID + ":logical_terminal";
-        AgentRunEvent persisted = eventMapper.findByRunIdAndDedupeKey(RUN_ID, dedupeKey);
-        assertThat(persisted).isNotNull();
-        assertThat(persisted.getEventType()).isEqualTo("TOOL_CALL_FINISHED");
-        assertThat(persisted.getDedupeKey()).isEqualTo(dedupeKey);
+        AgentRunEventMapper eventMapper = newEventMapper();
+        AgentRunEvent afterCrash = eventMapper.findByRunIdAndDedupeKey(RUN_ID, dedupeKey);
+        assertThat(afterCrash).isNotNull(); // hook wrote event row
 
-        // Oracle 3: second emitTerminalEvent with same anchor — dedup, no new row
-        boolean second = eventHook.emitTerminalEvent(RUN_ID, anchor);
-        assertThat(second).isTrue(); // dedup is success
+        // Oracle 2: anchorService.updateAnchor called once (EVENT step) and returned false
+        verify(anchorService).updateAnchor(eq(RUN_ID), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.WAITING_TOOL_JOB));
 
-        // Oracle 4: still exactly one event row
+        // Re-entry: fresh anchor from PG (still finalizerStep=USAGE)
+        ToolJobAnchor freshAnchor = buildTerminalAnchorWithUsagesDone();
+        finalizer.handleTerminal(RUN_ID, freshAnchor, "SUCCEEDED", null, true);
+
+        // Oracle 3: EVENT step called again (now succeeds)
+        verify(anchorService, times(2)).updateAnchor(eq(RUN_ID), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.WAITING_TOOL_JOB));
+
+        // Oracle 4: still exactly one event row (dedup prevented double-emit)
+        AgentRunEvent afterReentry = eventMapper.findByRunIdAndDedupeKey(RUN_ID, dedupeKey);
+        assertThat(afterReentry).isNotNull();
         SqlSession countSession = sqlSessionFactory.openSession(true);
         openSessions.add(countSession);
         var rs = countSession.getConnection().createStatement()
-                .executeQuery("SELECT COUNT(*) FROM alphafrog_agent_run_event WHERE run_id = '" + RUN_ID + "'");
+                .executeQuery("SELECT COUNT(*) FROM alphafrog_agent_run_event WHERE dedupe_key = '"
+                        + dedupeKey + "'");
         rs.next();
-        assertThat(rs.getInt(1)).isEqualTo(1);
+        assertThat(rs.getInt(1)).isEqualTo(1); // dedup: single event row
 
-        // Oracle 5: event payload matches anchor data
-        String payload = persisted.getPayloadJson();
-        assertThat(payload).contains("SUCCEEDED").contains(TOOL_CALL_ID);
+        // Oracle 5: event payload contains terminal status from anchor
+        assertThat(afterReentry.getPayloadJson()).contains("SUCCEEDED").contains(TOOL_CALL_ID);
     }
 
-    // ===== P0-12: real usage hook → partial attribution through DataAnalysisTerminalRecorder =====
+    /** Build anchor with ENVELOPE+RELEASE+USAGE steps already done */
+    private ToolJobAnchor buildTerminalAnchorWithUsagesDone() throws Exception {
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId(RUN_ID + ":" + TOOL_CALL_ID + ":1");
+        anchor.setToolCallId(TOOL_CALL_ID);
+        anchor.setAttempt(1);
+        anchor.setTaskId("task-p007");
+        anchor.setAnchorState("TERMINAL");
+        anchor.setFinalizerStep("USAGE"); // ENVELOPE+RELEASE+USAGE done
+        anchor.setTerminalStatus("SUCCEEDED");
+        anchor.setTerminalRetryable(false);
+        anchor.setUsagePersisted(true);
+        anchor.setTerminalAt(Instant.now());
+        anchor.setEstimateJson("{\"estimatedRows\":1,\"estimatedBytes\":10,\"fileCount\":1,"
+                + "\"selectedColumnRatio\":0.5,\"manifestMemberCount\":1,"
+                + "\"heavyOperationHints\":[],\"resourceClass\":\"STANDARD\",\"capacityUnits\":1}");
+        anchor.setReservationJson(buildReleasedJson(RUN_ID, TOOL_CALL_ID, 1, "task-p007"));
+        return anchor;
+    }
+
+    private static String buildReleasedJson(String runId, String tcId, int attempt, String taskId) throws Exception {
+        DataAnalysisOperationIdentity id = new DataAnalysisOperationIdentity(runId, tcId, attempt);
+        DataAnalysisReservation r = new DataAnalysisReservation(
+                id.reservationId(), id, DataAnalysisResourceClass.STANDARD, 1,
+                DataAnalysisReservationState.RELEASED, taskId, Instant.now());
+        return om.writeValueAsString(r);
+    }
+
+    // ===== P0-12: real DataAnalysisObservabilityService.upsert with partial attribution (cpuMillis=null) =====
 
     @Test
-    void usageHookUpsertsPartialAttributionEnvelopeAndPersistsToObservability() throws Exception {
-        // Fast-path executePython with complete usage
-        DataAnalysisReservation preparing = preparingReservation();
-        when(capacity.reserve(any(), any())).thenReturn(preparing);
-        when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
-        when(capacity.releaseReservation(any())).thenReturn(DataAnalysisReleaseOutcome.RELEASED);
+    void partialAttributionEnvelopeWithMissingCpuMillisUpsertsAndReadsBack() throws Exception {
         // Real recorder: DataAnalysisObservabilityService backed by real PG
         AgentRunStateStore stateStore = mock(AgentRunStateStore.class);
         DataAnalysisObservabilityService realRecorder = new DataAnalysisObservabilityService(
                 newMapper(), stateStore, om);
-        when(recorder.upsert(any())).thenAnswer(inv -> realRecorder.upsert(inv.getArgument(0)));
 
-        when(sandbox.createTask(any())).thenAnswer(invocation -> {
-            ExecuteRequest req = invocation.getArgument(0);
-            return ExecuteResponse.newBuilder().setTaskId("task-p012")
-                    .setRequestFingerprint(req.getRequestFingerprint()).build();
-        });
-        when(sandbox.getTaskStatus(any())).thenReturn(
-                TaskStatusResponse.newBuilder().setStatus("SUCCEEDED").build());
-        when(sandbox.getTaskResult(any())).thenReturn(TaskResultResponse.newBuilder()
-                .setTaskId("task-p012").setStatus("SUCCEEDED").setExitCode(0)
-                .setStdout("ok").setDatasetDir("/sandbox/input")
-                .setRetryable(false)
-                .setResourceUsage(completeUsage()).build());
+        // Build partial DataAnalysisResourceUsage — cpuMillis=null (Docker stats failure)
+        DataAnalysisResourceUsage partialUsage = new DataAnalysisResourceUsage(
+                DataAnalysisResourceClass.STANDARD,
+                null,         // cpuMillis — MISSING (collector failure)
+                100L * 1024 * 1024, // memoryPeakBytes
+                null,         // memoryByteMillis
+                10L * 1024 * 1024,  // logicalBytesScanned
+                null, null,   // artifact/temporary
+                150L, 200L,   // queueWait, prepare
+                5000L,        // executionWall
+                100L,         // cleanup
+                3,            // datasetOpenCount
+                "SUCCEEDED",  // exitReason
+                false, false, // oomKilled, timedOut
+                false,        // attributionComplete
+                null,         // samplingInterval
+                List.of("cpuMillis"));
 
-        tools.executePython("print(1)", "1", null, null, 30);
+        assertThat(partialUsage.attributionComplete()).isFalse();
+        assertThat(partialUsage.missingFields()).containsExactly("cpuMillis");
 
-        // Load anchor from PG after completeSynchronously
-        ToolJobAnchorService verifyAnchor = new ToolJobAnchorService(newMapper());
-        ToolJobAnchor anchor = verifyAnchor.loadAnchor(RUN_ID);
-        assertThat(anchor).isNotNull();
-        assertThat(anchor.isUsagePersisted()).isTrue();
+        // Build envelope with partial usage
+        DataAnalysisOperationIdentity identity = new DataAnalysisOperationIdentity(
+                RUN_ID, TOOL_CALL_ID, 1);
+        DataAnalysisEstimate estimate = new DataAnalysisEstimate(
+                1000, 5000, 1, 1.0, 1, List.of(),
+                DataAnalysisResourceClass.STANDARD, 1);
+        DataAnalysisReservation reservation = new DataAnalysisReservation(
+                identity.reservationId(), identity, DataAnalysisResourceClass.STANDARD, 1,
+                DataAnalysisReservationState.TERMINAL_CONFIRMED, "task-p012",
+                Instant.now());
+        DataAnalysisTerminalEnvelope envelope = new DataAnalysisTerminalEnvelope(
+                RUN_ID, TOOL_CALL_ID, 1, identity.operationId(), "task-p012",
+                "SUCCEEDED", true, "ok", null, null, null, false,
+                estimate, reservation, partialUsage,
+                Instant.now(), false);
 
-        // Oracle 1: usage envelope persisted via real recorder → INSERTED
-        verify(recorder).upsert(argThat(env ->
-                env.resourceUsage().attributionComplete()
-                        && "SUCCEEDED".equals(env.terminalStatus())));
+        // Oracle 1: upsert inserts via real PG CAS
+        DataAnalysisUpsertOutcome outcome = realRecorder.upsert(envelope);
+        assertThat(outcome).isEqualTo(DataAnalysisUpsertOutcome.INSERTED);
 
-        // Oracle 2: findSummaryByRunId reads back from PG
+        // Oracle 2: findSummaryByRunId reads back — attributionComplete=false, cpuMillis=null
         DataAnalysisObservabilitySummary summary = realRecorder
                 .findSummaryByRunId(RUN_ID, DataAnalysisObservabilityReadMode.TERMINAL_DB_ONLY)
                 .orElse(null);
         assertThat(summary).isNotNull();
-        assertThat(summary.attributionComplete()).isTrue();
+        assertThat(summary.attributionComplete()).isFalse();
+        assertThat(summary.missingFields()).containsExactly("cpuMillis");
+        assertThat(summary.cpuMillis()).isNull();
         assertThat(summary.toolCallCount()).isEqualTo(1);
 
-        // Oracle 3: findByRunId reads full snapshot from PG
+        // Oracle 3: findByRunId reads full snapshot — call-level attributionComplete false
         DataAnalysisObservabilitySnapshot snapshot = realRecorder
                 .findByRunId(RUN_ID, DataAnalysisObservabilityReadMode.TERMINAL_DB_ONLY)
                 .orElse(null);
         assertThat(snapshot).isNotNull();
         assertThat(snapshot.calls()).hasSize(1);
-        assertThat(snapshot.summary().attributionComplete()).isTrue();
+        assertThat(snapshot.summary().attributionComplete()).isFalse();
+        DataAnalysisResourceUsage callUsage = snapshot.calls().get(0).resourceUsage();
+        assertThat(callUsage.attributionComplete()).isFalse();
+        assertThat(callUsage.missingFields()).containsExactly("cpuMillis");
+        assertThat(callUsage.cpuMillis()).isNull();
+
+        // Oracle 4: dup call with same envelope returns ALREADY_PRESENT_SAME
+        DataAnalysisUpsertOutcome dup = realRecorder.upsert(envelope);
+        assertThat(dup).isEqualTo(DataAnalysisUpsertOutcome.ALREADY_PRESENT_SAME);
     }
 
     // ===== P0-10: real launcher + pipeline — RESUME_READY CAS through real PG =====
