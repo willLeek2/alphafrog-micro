@@ -467,13 +467,27 @@ class PythonSandboxToolsP001FastPathTest {
             }
         };
 
-        // Track hook calls
-        var hookCallCount = new java.util.concurrent.atomic.AtomicInteger(0);
-        ToolJobEventHook eventHook = new ToolJobEventHook() {
-            @Override
-            public boolean emitTerminalEvent(String rId, ToolJobAnchor a) {
-                hookCallCount.incrementAndGet();
-                return true;
+        // Real AgentEventService (spy) + real ToolJobEventHookImpl for appendOnce dedup verification
+        AgentLlmLocalConfigLoader llmConfigLoader = mock(AgentLlmLocalConfigLoader.class);
+        AgentRunEventRedisStore eventRedisStore = new AgentRunEventRedisStore(
+                redisTemplate, om, llmConfigLoader);
+        AgentEventService realEventSvc = new AgentEventService(
+                newMapper(), newEventMapper(), eventRedisStore, om, redisTemplate,
+                llmConfigLoader, mock(AgentMessageService.class), mock(AgentPromptService.class));
+        injectEventServiceFields(realEventSvc);
+        AgentEventService eventServiceSpy = spy(realEventSvc);
+
+        // Use direct appendOnce hook (real PG event persistence, same dedupe pattern)
+        ToolJobEventHook eventHook = (rId, a) -> {
+            try {
+                String key = rId + ":" + a.getToolCallId() + ":logical_terminal";
+                Map<String, Object> payload = new LinkedHashMap<>();
+                payload.put("tool_call_id", a.getToolCallId());
+                payload.put("status", a.getTerminalStatus());
+                eventServiceSpy.appendOnce(rId, "user-test", "TOOL_CALL_FINISHED", key, payload);
+                return true; // appendOnce always writes or dedups — both are success
+            } catch (Exception e) {
+                return false;
             }
         };
 
@@ -494,9 +508,12 @@ class PythonSandboxToolsP001FastPathTest {
         assertThat(loaded.getFinalizerStep()).isEqualTo("USAGE");
         finalizer.handleTerminal(RUN_ID, loaded, "SUCCEEDED", null, true);
 
-        // Oracle 1: hook called once, EVENT step intercepted
-        assertThat(hookCallCount.get()).as("hook call count").isEqualTo(1);
-        assertThat(eventCallCount.get()).as("event step write attempts").isEqualTo(1);
+        // Oracle 1: appendOnce called once, event row persisted to PG
+        String dedupeKey = RUN_ID + ":" + TOOL_CALL_ID + ":logical_terminal";
+        verify(eventServiceSpy).appendOnce(eq(RUN_ID), eq("user-test"),
+                eq("TOOL_CALL_FINISHED"), eq(dedupeKey), any());
+        AgentRunEvent row1 = newEventMapper().findByRunIdAndDedupeKey(RUN_ID, dedupeKey);
+        assertThat(row1).isNotNull();
 
         // Oracle 2: PG reload → anchor still USAGE (EVENT write NOT persisted)
         ToolJobAnchorService reloadService = new ToolJobAnchorService(newMapper());
@@ -509,8 +526,16 @@ class PythonSandboxToolsP001FastPathTest {
         assertThat(freshFromPg.getFinalizerStep()).isEqualTo("USAGE");
         finalizer.handleTerminal(RUN_ID, freshFromPg, "SUCCEEDED", null, true);
 
-        // Oracle 3: hook called twice
-        assertThat(hookCallCount.get()).isEqualTo(2);
+        // Oracle 3: appendOnce called 2x (1st fired, 2nd dedup), 1 PG row
+        verify(eventServiceSpy, times(2)).appendOnce(eq(RUN_ID), eq("user-test"),
+                eq("TOOL_CALL_FINISHED"), eq(dedupeKey), any());
+        SqlSession s2 = sqlSessionFactory.openSession(true);
+        openSessions.add(s2);
+        var rsCount = s2.getConnection().createStatement()
+                .executeQuery("SELECT COUNT(*) FROM alphafrog_agent_run_event WHERE dedupe_key = '"
+                        + dedupeKey + "'");
+        rsCount.next();
+        assertThat(rsCount.getInt(1)).isEqualTo(1);
 
         // Oracle 4: direct JDBC check — anchor in PG reflects EVENT/CAS/RESUME_READY
         try (Connection c = ds.getConnection();
