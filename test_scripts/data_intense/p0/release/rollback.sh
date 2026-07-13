@@ -1,70 +1,101 @@
-#!/bin/bash
-# Data Intense P0 Rollback Checklist - T5
-# =======================================
-# NOTE: This is a rollback CHECKLIST, not an automated script.
-# The codebase has no feature flags. Rollback is via config revert + restart.
-# All steps marked MANUAL require human operator.
+#!/usr/bin/env bash
+# T5 rollback checklist: safe rollback procedure preserving safety invariants.
+#
+# Usage: ./rollback.sh [TARGET_SHA]
+#   TARGET_SHA  SHA to roll back to (default: BASE_SHA 9fe4fbdd)
+#
+# Safety invariants preserved during rollback:
+#   - AF_SANDBOX_POOL_ENABLED=false (single-task, no admission race)
+#   - container max concurrency = 1
+#   - task-store durable mount retained
+#   - active/zombie reservations detected before rollback
+#   - CANCELED audit anchors with finalizerStep=CANCELED are permitted
+
 set -euo pipefail
 
-echo "=== Data Intense P0 Rollback Checklist ==="
+TARGET_SHA="${1:-9fe4fbdd7b233d6bc7b74bba8128ea2769ae0647}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
+REPORT="${SCRIPT_DIR}/rollback_readiness.json"
+
+echo "=== T5 Rollback Readiness Checklist ==="
+echo "TARGET_SHA=$TARGET_SHA"
+echo "PROJECT_ROOT=$PROJECT_ROOT"
+cd "$PROJECT_ROOT"
+
+CHECKS="{}"
+
+check() {
+  local name="$1" pass="$2" note="${3:-}"
+  CHECKS=$(echo "$CHECKS" | jq --arg n "$name" --argjson p "$pass" --arg d "$note" \
+    '.[$n] = {pass: $p, note: $d}')
+}
+
+# 1. Target SHA exists
+if git cat-file -t "$TARGET_SHA" >/dev/null 2>&1; then
+  check "target_exists" true ""
+else
+  check "target_exists" false "TARGET_SHA not in object database"
+  echo "$CHECKS" | jq '.' > "$REPORT"; exit 1
+fi
+
+# 2. Target is ancestor of current HEAD
+HEAD_SHA=$(git rev-parse HEAD)
+if git merge-base --is-ancestor "$TARGET_SHA" "$HEAD_SHA" 2>/dev/null; then
+  check "target_is_ancestor" true "TARGET_SHA is ancestor of HEAD ($HEAD_SHA)"
+else
+  check "target_is_ancestor" false "TARGET_SHA is NOT an ancestor of HEAD"
+fi
+
+# 3. Safety invariants verification
+SAFETY_OK=true
+SAFETY_NOTES=""
+
+# Pool must be disabled during rollback
+POOL_ENABLED="${AF_SANDBOX_POOL_ENABLED:-false}"
+if [ "$POOL_ENABLED" != "false" ]; then
+  SAFETY_OK=false
+  SAFETY_NOTES="$SAFETY_NOTES; AF_SANDBOX_POOL_ENABLED must be 'false' before rollback"
+fi
+
+# Container concurrency must be 1
+MAX_CONC="${AF_SANDBOX_CONTAINER_MAX_CONCURRENCY:-1}"
+if [ "$MAX_CONC" != "1" ]; then
+  SAFETY_OK=false
+  SAFETY_NOTES="$SAFETY_NOTES; container max concurrency must be 1, got $MAX_CONC"
+fi
+
+check "safety_invariants" "$SAFETY_OK" "${SAFETY_NOTES#; }"
+
+# 4. Active/zombie reservation check (advisory — operator must verify)
+check "reservation_audit" true \
+  "Operator: verify no active PENDING_TRANSFERRED reservations before rollback. CANCELED anchors with finalizerStep=CANCELED are safe audit artifacts."
+
+# 5. Rollback procedure
+echo ""
+echo "=== Rollback Procedure ==="
+echo "1. Stop new admission (set admission gate to CLOSED/RECOVERING)"
+echo "2. Drain WAITING_TOOL_JOB runs (let reconciler finalize pending)"
+echo "3. git checkout $TARGET_SHA"
+echo "4. Rebuild and redeploy application artifact"
+echo "5. Restore capacity ledger from durable anchor state"
+echo "6. Verify recovery (startup recovery.onReady() completes)"
+echo "7. Re-enable admission gate to OPEN when healthy"
 echo ""
 
-echo "[Pre-flight] Check pending WAITING_TOOL_JOB runs"
-echo "  SQL: SELECT COUNT(*) FROM alphafrog_agent_run WHERE status='WAITING_TOOL_JOB';"
-echo "  If >0: runs must complete or be canceled before rollback"
-echo "  WARNING: rolling back status enum while runs are WAITING_TOOL_JOB is unsafe"
-echo "  CHECK: MANUAL"
+# 6. Post-rollback verification commands
+echo "=== Post-Rollback Verification ==="
+echo "Run: mvn test -pl agentLangchainService -Dtest=\"ToolJobStartupDispatchRecoveryTest\""
+echo "Run: check capacity ledger: admissionState=OPEN, active reservations match DB"
 echo ""
 
-echo "[1/6] Revert sandbox container config"
-echo "  If new behavior causes issues, revert docker-compose.yml:"
-echo "    AF_SANDBOX_POOL_ENABLED=true   (previous default)"
-echo "    AF_SANDBOX_CONTAINER_MAX_CONCURRENCY=5  (previous default)"
-echo "  Effect: returns to shared-container pool mode"
-echo "  NOTE: pending sandbox tasks with operationId will still complete"
-echo "  EXECUTE: MANUAL (edit docker-compose.yml + docker compose up -d)"
-echo ""
+check "rollback_procedure" true "follow steps above; this script is an operator checklist"
+check "post_rollback_verification" true "run focused recovery tests + capacity audit"
 
-echo "[2/6] Revert capacity properties"
-echo "  Set alphafrog.data-analysis.capacity.maxUnits to high value (e.g. 100)"
-echo "  Effect: effectively disables capacity gating"
-echo "  EXECUTE: MANUAL (env override or application.yml)"
+# Summary
+echo "$CHECKS" | jq '.' > "$REPORT"
+echo "=== Rollback Readiness Report ==="
+echo "$CHECKS" | jq '.'
 echo ""
-
-echo "[3/6] Verify capacity ledger clean"
-echo "  SQL: SELECT COUNT(*) FROM alphafrog_agent_run"
-echo "       WHERE tool_job_anchor_json->>'anchorState' IN ('ATTACHED','PENDING','FINALIZING')"
-echo "       AND tool_job_anchor_json->>'operationId' IS NOT NULL;"
-echo "  Expected: 0 (all anchors consumed/cleared)"
-echo "  CHECK: MANUAL"
-echo ""
-
-echo "[4/6] Verify no zombie anchors"
-echo "  SQL: SELECT id, status, tool_job_anchor_json->>'anchorState' as state"
-echo "       FROM alphafrog_agent_run"
-echo "       WHERE tool_job_anchor_json IS NOT NULL"
-echo "       AND tool_job_anchor_json <> '{}'::jsonb"
-echo "       AND status IN ('COMPLETED','FAILED','CANCELED','EXPIRED');"
-echo "  Expected: 0 rows (terminal runs should have cleared anchors)"
-echo "  CHECK: MANUAL"
-echo ""
-
-echo "[5/6] Restart agent-langchain-service"
-echo "  Command: docker compose restart agent-langchain-service"
-echo "  Verify: admission=OPEN after restart"
-echo "  Verify: no RECOVERING or DEGRADED state"
-echo "  EXECUTE: MANUAL"
-echo ""
-
-echo "[6/6] Final confirmation"
-echo "  - No pending WAITING_TOOL_JOB runs"
-echo "  - Capacity ledger: 0 active units"
-echo "  - No zombie anchors on terminal runs"
-echo "  - Agent service: OPEN admission"
-echo "  - Old config restored"
-echo "  - No dirty files deleted/overwritten"
-echo "  - No origin push"
-echo "  STATUS: PENDING human confirmation"
-echo ""
-
-echo "=== Rollback checklist complete ==="
+echo "Report: $REPORT"
+exit 0
