@@ -88,20 +88,26 @@ supporting() {
     '.[$n] = {pass: null, required: false, supporting_only: true, note: $d}')
 }
 
-# ---- Unified Python environment setup ----
-# Single decision: either the ambient python3 has pydantic + pytest + pandas,
-# or we build an isolated venv with all three. Shared by retry-classification
-# and benchmark-tools. Any failure records required/pass=false.
+# ---- Unified Python environment setup (cached, isolated, strict) ----
 PYTHON_DIR="${PROJECT_ROOT}/pythonSandboxService"
 REQUIREMENTS_FILE="${PYTHON_DIR}/requirements.txt"
 PYTHON_BIN=""
 PYTHON_OK=false
+PYTHON_SETUP_ATTEMPTED=false
+VENV_DIR=""
+
+cleanup_venv() {
+  if [ -n "$VENV_DIR" ] && [ -d "$VENV_DIR" ]; then
+    rm -rf "$VENV_DIR"
+  fi
+}
 
 setup_python_env() {
-  # Already set up (idempotent)
-  if [ "$PYTHON_OK" = "true" ] && [ -n "$PYTHON_BIN" ]; then
-    return 0
+  # Already attempted — return cached result
+  if [ "$PYTHON_SETUP_ATTEMPTED" = "true" ]; then
+    [ "$PYTHON_OK" = "true" ] && return 0 || return 1
   fi
+  PYTHON_SETUP_ATTEMPTED=true
 
   # Try ambient python3: must have pydantic + pytest + pandas ALL present
   if python3 -c "import pydantic, pytest, pandas" 2>/dev/null; then
@@ -110,19 +116,29 @@ setup_python_env() {
     return 0
   fi
 
-  # Build isolated venv with all required packages
-  VENV_DIR="/tmp/t5-harness-venv"
+  # Build isolated venv with unique path (safe for parallel runners)
+  if ! command -v mktemp >/dev/null 2>&1; then
+    return 1
+  fi
+  VENV_DIR=$(mktemp -d "${TMPDIR:-/tmp}/t5-harness-venv.XXXXXX")
+  trap cleanup_venv EXIT
+
   echo "--- Python env: building venv at $VENV_DIR ---"
   if ! python3 -m venv "$VENV_DIR" 2>/dev/null; then
     return 1
   fi
-  PIP="$VENV_DIR/bin/pip"
-  # Install repo requirements (if present) + pytest + pandas
-  if [ -f "$REQUIREMENTS_FILE" ]; then
-    "$PIP" install -r "$REQUIREMENTS_FILE" -q 2>/dev/null || true
+
+  # Strict: requirements.txt must exist and install must succeed
+  if [ ! -f "$REQUIREMENTS_FILE" ]; then
+    echo "--- Python env: ERROR — $REQUIREMENTS_FILE not found ---"
+    return 1
   fi
-  "$PIP" install pytest pandas -q 2>/dev/null || true
-  # All three must be importable
+  if ! "$VENV_DIR/bin/python" -m pip install -r "$REQUIREMENTS_FILE" pytest pandas -q 2>/dev/null; then
+    echo "--- Python env: ERROR — pip install failed ---"
+    return 1
+  fi
+
+  # Final three-import check
   if "$VENV_DIR/bin/python" -c "import pydantic, pytest, pandas" 2>/dev/null; then
     PYTHON_BIN="$VENV_DIR/bin/python"
     PYTHON_OK=true
@@ -144,37 +160,39 @@ run_maven "T5_FaultFixtures" \
   "ToolJobFinalizerP001Test,ToolJobFinalizerP002Test,ToolJobReconcilerP004Test,ToolJobFinalizerP006Test" true
 
 # === Python: retry classification (REQUIRED) ===
+PYTHON_ERROR_MSG=""
 if [ ! -f "${PYTHON_DIR}/tests/test_retry_classification.py" ]; then
-  record_required_failure "Python_RetryClassification" \
-    "test file not found"
+  PYTHON_ERROR_MSG="test file not found"
+fi
+if [ -z "$PYTHON_ERROR_MSG" ] && ! setup_python_env; then
+  PYTHON_ERROR_MSG="unified Python env unavailable (need pydantic + pytest + pandas)"
+fi
+if [ -n "$PYTHON_ERROR_MSG" ]; then
+  record_required_failure "Python_RetryClassification" "$PYTHON_ERROR_MSG"
 else
   echo "--- Python_RetryClassification ---"
-  if setup_python_env; then
-    pushd "$PYTHON_DIR" > /dev/null
-    run_python "Python_RetryClassification" "tests/test_retry_classification.py" true
-    popd > /dev/null
-  else
-    record_required_failure "Python_RetryClassification" \
-      "unified Python env unavailable (need pydantic + pytest + pandas)"
-  fi
+  pushd "$PYTHON_DIR" > /dev/null
+  run_python "Python_RetryClassification" "tests/test_retry_classification.py" true
+  popd > /dev/null
 fi
 
 # === Python: benchmark tools (REQUIRED) ===
 BENCHMARK_TEST="${PROJECT_ROOT}/test_scripts/data_intense/p0/benchmarks/test_benchmark_tools.py"
+BENCHMARK_ERROR_MSG=""
 if [ ! -f "$BENCHMARK_TEST" ]; then
-  record_required_failure "Python_BenchmarkTools" \
-    "test file not found"
+  BENCHMARK_ERROR_MSG="test file not found"
+fi
+if [ -z "$BENCHMARK_ERROR_MSG" ] && ! setup_python_env; then
+  BENCHMARK_ERROR_MSG="unified Python env unavailable (need pydantic + pytest + pandas)"
+fi
+if [ -n "$BENCHMARK_ERROR_MSG" ]; then
+  record_required_failure "Python_BenchmarkTools" "$BENCHMARK_ERROR_MSG"
 else
   echo "--- Python_BenchmarkTools ---"
-  if setup_python_env; then
-    export PYTHONPATH="${PYTHON_DIR}:${PROJECT_ROOT}"
-    pushd "$PROJECT_ROOT" > /dev/null
-    run_python "Python_BenchmarkTools" "$BENCHMARK_TEST" true
-    popd > /dev/null
-  else
-    record_required_failure "Python_BenchmarkTools" \
-      "unified Python env unavailable (need pydantic + pytest + pandas)"
-  fi
+  export PYTHONPATH="${PYTHON_DIR}:${PROJECT_ROOT}"
+  pushd "$PROJECT_ROOT" > /dev/null
+  run_python "Python_BenchmarkTools" "$BENCHMARK_TEST" true
+  popd > /dev/null
 fi
 
 # === SUPPORTING_ONLY ===
