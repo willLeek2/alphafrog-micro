@@ -280,19 +280,23 @@ class ToolJobReconcilerP009ReverseTest {
                     .as("round %d: distinctReservationIds == 1", round)
                     .isEqualTo(1);
 
-            // 4. PG anchor unchanged: anchorState still PENDING,
-            //    resultFetchState still null, finalizerStep still null
+            // 4. PG anchor: retry tracking initialized (resultFetchState=PENDING,
+            //    terminalConfirmedAt set, attempts counting), but finalizer never called.
+            //    anchorState unchanged (not modified by retry path).
             AgentRun run = mapper.findById(RUN_ID);
             assertThat(run).as("round %d: run present", round).isNotNull();
             ToolJobAnchor dbAnchor = ToolJobAnchor.fromJson(run.getToolJobAnchorJson());
-            assertThat(dbAnchor.getAnchorState())
-                    .as("round %d: anchorState still PENDING", round)
-                    .isEqualTo("PENDING");
             assertThat(dbAnchor.getResultFetchState())
-                    .as("round %d: resultFetchState still null", round)
-                    .isNull();
+                    .as("round %d: resultFetchState=PENDING (retry tracking active)", round)
+                    .isEqualTo("PENDING");
+            assertThat(dbAnchor.getResultFetchAttempts())
+                    .as("round %d: resultFetchAttempts=%d", round, round)
+                    .isEqualTo(round);
+            assertThat(dbAnchor.getTerminalConfirmedAt())
+                    .as("round %d: terminalConfirmedAt set", round)
+                    .isNotNull();
             assertThat(dbAnchor.getFinalizerStep())
-                    .as("round %d: finalizerStep still null", round)
+                    .as("round %d: finalizerStep still null (finalizer never called)", round)
                     .isNull();
 
             // 5. Reservation JSON preserved (capacity not released, identity unchanged)
@@ -300,9 +304,10 @@ class ToolJobReconcilerP009ReverseTest {
                     .as("round %d: reservationJson present", round)
                     .isNotNull().isNotBlank();
 
-            // 6. Terminal fields remain null
+            // 6. Terminal fields: terminalStatus remains null (no RESULT_LOST yet —
+            //    exhaustion budget not reached within 3 rounds)
             assertThat(dbAnchor.getTerminalStatus())
-                    .as("round %d: terminalStatus null", round)
+                    .as("round %d: terminalStatus null (budget not exhausted)", round)
                     .isNull();
             assertThat(dbAnchor.getTerminalAt())
                     .as("round %d: terminalAt null", round)

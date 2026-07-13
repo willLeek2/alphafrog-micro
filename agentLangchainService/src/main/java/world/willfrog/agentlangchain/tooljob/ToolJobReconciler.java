@@ -11,6 +11,7 @@ import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.Set;
 
@@ -95,10 +96,34 @@ public class ToolJobReconciler {
             if (SUCCEEDED.equals(status) || FAILED.equals(status) || CANCELED.equals(status)) {
                 TaskResultResponse resultResp = fetchResult(taskId, runId, status);
                 if (resultResp == null) {
-                    // Result not yet available — retry later
-                    anchor.setNextPollAt(Instant.now().plusMillis(config.getPollIntervalMs()));
+                    // Already exhausted — finalizer has been triggered via RESULT_LOST
+                    if ("LOST".equals(anchor.getResultFetchState())) {
+                        log.debug("Result already LOST for run={}, skipping", runId);
+                        return;
+                    }
+                    Instant now = Instant.now();
+                    if (anchor.getTerminalConfirmedAt() != null) {
+                        long elapsed = Duration.between(anchor.getTerminalConfirmedAt(), now).toSeconds();
+                        int attempts = anchor.getResultFetchAttempts() + 1;
+                        anchor.setResultFetchAttempts(attempts);
+                        if (elapsed > config.getResultRetentionDeadlineSeconds()
+                                || attempts >= config.getResultFetchMaxAttempts()) {
+                            anchor.setResultFetchState("LOST");
+                            anchor.setTerminalStatus("RESULT_LOST");
+                            anchor.setTerminalAt(now);
+                            log.error("Result permanently lost for run={}, taskId={}", runId, taskId);
+                            finalizer.handleTerminal(runId, anchor, "RESULT_LOST", null, anchor.isAutoResume());
+                            return;
+                        }
+                    } else {
+                        anchor.setResultFetchState("PENDING");
+                        anchor.setTerminalConfirmedAt(now);
+                        anchor.setResultFetchAttempts(1);
+                    }
+                    anchor.setNextPollAt(now.plusMillis(config.getPollIntervalMs()));
                     anchorService.updateAnchor(runId, anchor, AgentRunStatus.WAITING_TOOL_JOB);
                     redisCache.upsertDue(runId, anchor);
+                    redisCache.writePendingCache(runId, anchor);
                     return;
                 }
                 finalizer.handleTerminal(runId, anchor, status, resultResp, true);
