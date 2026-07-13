@@ -38,6 +38,7 @@ import java.time.Instant;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
@@ -233,8 +234,59 @@ class PythonSandboxToolsP001FastPathTest {
         AgentRunMapper runMapper = newMapper();
         assertThat(runMapper.findById(RUN_ID).getStatus()).isEqualTo(AgentRunStatus.EXECUTING);
 
-        // Oracle 10: no resume/Redis pending (fast path never sets resume)
-        assertThat(dbAnchor.getResumeState()).isNull();
+        // Oracle 10: no transferToPending (fast path never suspends)
+        verify(dispatchStore, never()).transferToPending(anyString(), any());
+    }
+
+    @Test
+    void slowTaskTimeoutThrowsPendingExceptionAndPersistsPendingAnchor() throws Exception {
+        DataAnalysisReservation preparing = preparingReservation();
+        when(capacity.reserve(any(), any())).thenReturn(preparing);
+        when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(sandbox.createTask(any())).thenAnswer(invocation -> {
+            ExecuteRequest req = invocation.getArgument(0);
+            return ExecuteResponse.newBuilder().setTaskId("task-p002")
+                    .setRequestFingerprint(req.getRequestFingerprint()).build();
+        });
+        // Sandbox stays RUNNING — fast poll times out at 1ms
+        when(sandbox.getTaskStatus(any())).thenReturn(
+                TaskStatusResponse.newBuilder().setStatus("RUNNING").build());
+
+        // Set fastPathMs to 1ms to force immediate timeout
+        inject(tools, "fastPathMs", 1L);
+
+        ExternalToolJobPendingException pending = assertThrows(
+                ExternalToolJobPendingException.class,
+                () -> tools.executePython("import time; time.sleep(300)", "1", null, null, 30));
+
+        assertThat(pending.getRunId()).isEqualTo(RUN_ID);
+        assertThat(pending.getToolCallId()).isEqualTo(TOOL_CALL_ID);
+
+        // Oracle: anchor persisted with PENDING state via real PG
+        ToolJobAnchorService verifyAnchor2 = new ToolJobAnchorService(newMapper());
+        ToolJobAnchor dbAnchor = verifyAnchor2.loadAnchor(RUN_ID);
+        assertThat(dbAnchor).isNotNull();
+        assertThat(dbAnchor.getAnchorState()).isEqualTo("PENDING");
+
+        // Oracle: run status = WAITING_TOOL_JOB (suspend transitions from EXECUTING)
+        AgentRunMapper runMapper2 = newMapper();
+        assertThat(runMapper2.findById(RUN_ID).getStatus()).isEqualTo(AgentRunStatus.WAITING_TOOL_JOB);
+
+        // Oracle: reservation state = PENDING_TRANSFERRED
+        assertThat(dbAnchor.getReservationJson()).contains("PENDING_TRANSFERRED");
+
+        // Oracle: Redis pending cache + due entries exist
+        ToolJobRedisCache verifyCache = new ToolJobRedisCache(redisTemplate, om, new ToolJobConfig());
+        ToolJobAnchor cached = verifyCache.readPendingCache(RUN_ID);
+        assertThat(cached).isNotNull();
+        assertThat(cached.getAnchorState()).isEqualTo("PENDING");
+
+        // Oracle: createTask called exactly once
+        verify(sandbox, times(1)).createTask(any());
+
+        // Oracle: no capacity release (task not terminal)
+        verify(capacity, never()).releaseReservation(any());
+        verifyNoInteractions(recorder);
     }
 
     // ---- Helpers (exact pattern from PythonSandboxToolsDataIntenseTest) ----
