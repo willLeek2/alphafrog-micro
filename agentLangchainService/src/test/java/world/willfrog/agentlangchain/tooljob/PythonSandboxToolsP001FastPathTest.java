@@ -467,7 +467,7 @@ class PythonSandboxToolsP001FastPathTest {
             }
         };
 
-        // Real AgentEventService (spy) + real ToolJobEventHookImpl for appendOnce dedup verification
+        // Real AgentEventService (spy) + real ToolJobEventHookImpl
         AgentLlmLocalConfigLoader llmConfigLoader = mock(AgentLlmLocalConfigLoader.class);
         AgentRunEventRedisStore eventRedisStore = new AgentRunEventRedisStore(
                 redisTemplate, om, llmConfigLoader);
@@ -477,19 +477,8 @@ class PythonSandboxToolsP001FastPathTest {
         injectEventServiceFields(realEventSvc);
         AgentEventService eventServiceSpy = spy(realEventSvc);
 
-        // Use direct appendOnce hook (real PG event persistence, same dedupe pattern)
-        ToolJobEventHook eventHook = (rId, a) -> {
-            try {
-                String key = rId + ":" + a.getToolCallId() + ":logical_terminal";
-                Map<String, Object> payload = new LinkedHashMap<>();
-                payload.put("tool_call_id", a.getToolCallId());
-                payload.put("status", a.getTerminalStatus());
-                eventServiceSpy.appendOnce(rId, "user-test", "TOOL_CALL_FINISHED", key, payload);
-                return true; // appendOnce always writes or dedups — both are success
-            } catch (Exception e) {
-                return false;
-            }
-        };
+        // Production ToolJobEventHookImpl with real runMapper + spy eventService
+        ToolJobEventHookImpl eventHook = new ToolJobEventHookImpl(newMapper(), eventServiceSpy);
 
         ToolJobFinalizer finalizer = new ToolJobFinalizer(
                 anchorDelegate, mock(ToolJobRedisCache.class),
@@ -761,10 +750,13 @@ class PythonSandboxToolsP001FastPathTest {
         assertThrows(ExternalToolJobPendingException.class,
                 () -> tools.executePython("import time; time.sleep(300)", "1", null, null, 30));
 
-        // Verify PENDING anchor persisted
+        // Verify PENDING anchor persisted + capture pre-reconcile identity
         ToolJobAnchorService anchorService = new ToolJobAnchorService(newMapper());
         ToolJobAnchor pendingAnchor = anchorService.loadAnchor(RUN_ID);
         assertThat(pendingAnchor.getAnchorState()).isEqualTo("PENDING");
+        String preOperationId = pendingAnchor.getOperationId();
+        String preReservationId = new DataAnalysisOperationIdentity(RUN_ID, TOOL_CALL_ID, 1).reservationId();
+        int preAttempt = pendingAnchor.getAttempt();
 
         // IMPORTANT: override due ZSET score to 0 (past) so reconcileFromDue fetches it now.
         // transferToPending set score = nextPollAt (future), but reconcileFromDue filters
@@ -800,24 +792,8 @@ class PythonSandboxToolsP001FastPathTest {
                 newMapper(), stateStore, om);
         ToolJobUsageHookImpl realUsageHook = new ToolJobUsageHookImpl(realRecorder, om);
 
-        // Event hook: direct PG insert via JDBC (avoids ToolJobEventHookImpl run-userId lookup)
-        ToolJobEventHook eventHook = new ToolJobEventHook() {
-            @Override
-            public boolean emitTerminalEvent(String rId, ToolJobAnchor a) {
-                try (Connection c = dataSource().getConnection();
-                     var ps = c.prepareStatement(
-                         "INSERT INTO alphafrog_agent_run_event (run_id, seq, event_type, "
-                         + "payload_json, dedupe_key) VALUES (?, 1, 'TOOL_CALL_FINISHED', "
-                         + "CAST(? AS jsonb), ?) ON CONFLICT (run_id, dedupe_key) "
-                         + "WHERE dedupe_key IS NOT NULL DO NOTHING")) {
-                    ps.setString(1, rId);
-                    ps.setString(2, "{\"status\":\"" + a.getTerminalStatus()
-                            + "\",\"tool_call_id\":\"" + a.getToolCallId() + "\"}");
-                    ps.setString(3, rId + ":" + a.getToolCallId() + ":logical_terminal");
-                    return ps.executeUpdate() >= 0; // 1=inserted, 0=dedup, both success
-                } catch (Exception e) { return false; }
-            }
-        };
+        // Production event hook: real ToolJobEventHookImpl
+        ToolJobEventHookImpl realEventHook = new ToolJobEventHookImpl(newMapper(), eventService);
 
         // Production finalizer with real hooks
         ToolJobFinalizer finalizer = new ToolJobFinalizer(
@@ -826,9 +802,9 @@ class PythonSandboxToolsP001FastPathTest {
         java.lang.reflect.Field usageField = ToolJobFinalizer.class.getDeclaredField("usageHook");
         usageField.setAccessible(true);
         usageField.set(finalizer, realUsageHook);
-        java.lang.reflect.Field evtField = ToolJobFinalizer.class.getDeclaredField("eventHook");
-        evtField.setAccessible(true);
-        evtField.set(finalizer, eventHook);
+        java.lang.reflect.Field evtField11 = ToolJobFinalizer.class.getDeclaredField("eventHook");
+        evtField11.setAccessible(true);
+        evtField11.set(finalizer, realEventHook);
 
         // Build reconciler → public reconcileFromDue path
         ToolJobReconciler reconciler = new ToolJobReconciler(
@@ -863,6 +839,15 @@ class PythonSandboxToolsP001FastPathTest {
 
         // Oracle 4: capacity released
         verify(capacity).releaseReservation(any());
+
+        // Oracle 5: no-upgrade identity — attempt unchanged, operationId/reservationId preserved
+        assertThat(afterReconcile.getAttempt()).isEqualTo(preAttempt);
+        assertThat(afterReconcile.getOperationId()).isEqualTo(preOperationId);
+        String postReservationId = new DataAnalysisOperationIdentity(RUN_ID, TOOL_CALL_ID, 1).reservationId();
+        assertThat(postReservationId).isEqualTo(preReservationId);
+
+        // Oracle 6: createTask called exactly once (during initial executePython, not re-created)
+        verify(sandbox, times(1)).createTask(any());
     }
 
     // ---- Helpers (exact pattern from PythonSandboxToolsDataIntenseTest) ----
