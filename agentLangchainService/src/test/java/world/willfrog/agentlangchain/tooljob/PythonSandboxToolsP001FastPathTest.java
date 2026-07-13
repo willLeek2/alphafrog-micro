@@ -31,6 +31,7 @@ import world.willfrog.alphafrogmicro.sandbox.idl.*;
 import javax.sql.DataSource;
 import java.io.Reader;
 import java.nio.file.Files;
+import java.util.ArrayList;
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.Statement;
@@ -73,7 +74,7 @@ class PythonSandboxToolsP001FastPathTest {
     private static final String TOOL_CALL_ID = "call-1";
 
     private static SqlSessionFactory sqlSessionFactory;
-    private SqlSession currentSession;
+    private final List<SqlSession> openSessions = new ArrayList<>();
 
     private PythonSandboxTools tools;
     private PythonSandboxService sandbox;
@@ -158,10 +159,10 @@ class PythonSandboxToolsP001FastPathTest {
     @AfterEach
     void tearDown() {
         AgentContext.clear();
-        if (currentSession != null) {
-            currentSession.close();
-            currentSession = null;
+        for (SqlSession s : openSessions) {
+            try { s.close(); } catch (Exception ignored) {}
         }
+        openSessions.clear();
     }
 
     @Test
@@ -281,6 +282,10 @@ class PythonSandboxToolsP001FastPathTest {
         assertThat(cached).isNotNull();
         assertThat(cached.getAnchorState()).isEqualTo("PENDING");
 
+        // Oracle: Redis due ZSET entry exists with valid score
+        Double dueScore = redisTemplate.opsForZSet().score("agent:tool-job:due", RUN_ID);
+        assertThat(dueScore).isNotNull().isGreaterThan(0.0);
+
         // Oracle: createTask called exactly once
         verify(sandbox, times(1)).createTask(any());
 
@@ -352,6 +357,7 @@ class PythonSandboxToolsP001FastPathTest {
             sqlSessionFactory = new org.apache.ibatis.session.SqlSessionFactoryBuilder().build(config);
         }
         SqlSession session = sqlSessionFactory.openSession(true);
+        openSessions.add(session);
         return session.getMapper(AgentRunMapper.class);
     }
 
