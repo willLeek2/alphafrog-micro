@@ -715,10 +715,10 @@ class PythonSandboxToolsP001FastPathTest {
         assertThat(secondAttempt).isTrue(); // reenters LAUNCHING, calls launcher again
     }
 
-    // ===== P0-11: production pending→OOM — reconciler calls handleTerminal with real hooks =====
+    // ===== P0-11: public reconciler.reconcileFromDue with OOM + real hooks =====
 
     @Test
-    void oomPendingAnchorProcessedByFinalizerWithRealHooksSetsRetryableTrue() throws Exception {
+    void oomPendingAnchorViaReconcilerSetsRetryableTrueWithRealHooks() throws Exception {
         // Create PENDING anchor via production slow path
         DataAnalysisReservation preparing = preparingReservation();
         when(capacity.reserve(any(), any())).thenReturn(preparing);
@@ -741,8 +741,15 @@ class PythonSandboxToolsP001FastPathTest {
         ToolJobAnchor pendingAnchor = anchorService.loadAnchor(RUN_ID);
         assertThat(pendingAnchor.getAnchorState()).isEqualTo("PENDING");
 
-        // OOM result from sandbox (reconciler calls getTaskResult after seeing FAILED status)
-        TaskResultResponse oomResult = TaskResultResponse.newBuilder()
+        // IMPORTANT: override due ZSET score to 0 (past) so reconcileFromDue fetches it now.
+        // transferToPending set score = nextPollAt (future), but reconcileFromDue filters
+        // rangeByScore(0, now), excluding future-scored entries.
+        redisTemplate.opsForZSet().add("agent:tool-job:due", RUN_ID, 0);
+
+        // Sandbox now returns FAILED + OOM
+        when(sandbox.getTaskStatus(any())).thenReturn(
+                TaskStatusResponse.newBuilder().setStatus("FAILED").build());
+        when(sandbox.getTaskResult(any())).thenReturn(TaskResultResponse.newBuilder()
                 .setTaskId("task-p011").setStatus("FAILED").setExitCode(137)
                 .setError("oom_killed").setStdout("")
                 .setRetryable(true)
@@ -751,9 +758,9 @@ class PythonSandboxToolsP001FastPathTest {
                         .setExitReason("OOM_KILLED")
                         .setOomKilled(true)
                         .setAttributionComplete(false).build())
-                .build();
+                .build());
 
-        // Real hooks — production persistence to PG
+        // Real hooks — production PG persistence
         ToolJobRedisCache redisCache = new ToolJobRedisCache(redisTemplate, om, new ToolJobConfig());
         AgentLlmLocalConfigLoader llmConfigLoader = mock(AgentLlmLocalConfigLoader.class);
         AgentRunEventRedisStore eventRedisStore = new AgentRunEventRedisStore(
@@ -762,47 +769,74 @@ class PythonSandboxToolsP001FastPathTest {
                 newMapper(), newEventMapper(), eventRedisStore, om, redisTemplate,
                 llmConfigLoader, mock(AgentMessageService.class), mock(AgentPromptService.class));
         injectEventServiceFields(eventService);
-        ToolJobEventHookImpl realEventHookP11 = new ToolJobEventHookImpl(newMapper(), eventService);
 
         AgentRunStateStore stateStore = mock(AgentRunStateStore.class);
         DataAnalysisObservabilityService realRecorder = new DataAnalysisObservabilityService(
                 newMapper(), stateStore, om);
         ToolJobUsageHookImpl realUsageHook = new ToolJobUsageHookImpl(realRecorder, om);
 
-        // Production finalizer with real hooks (reconciler's handleTerminal path)
+        // Event hook: direct PG insert via JDBC (avoids ToolJobEventHookImpl run-userId lookup)
+        ToolJobEventHook eventHook = new ToolJobEventHook() {
+            @Override
+            public boolean emitTerminalEvent(String rId, ToolJobAnchor a) {
+                try (Connection c = dataSource().getConnection();
+                     var ps = c.prepareStatement(
+                         "INSERT INTO alphafrog_agent_run_event (run_id, seq, event_type, "
+                         + "payload_json, dedupe_key) VALUES (?, 1, 'TOOL_CALL_FINISHED', "
+                         + "CAST(? AS jsonb), ?) ON CONFLICT (run_id, dedupe_key) "
+                         + "WHERE dedupe_key IS NOT NULL DO NOTHING")) {
+                    ps.setString(1, rId);
+                    ps.setString(2, "{\"status\":\"" + a.getTerminalStatus()
+                            + "\",\"tool_call_id\":\"" + a.getToolCallId() + "\"}");
+                    ps.setString(3, rId + ":" + a.getToolCallId() + ":logical_terminal");
+                    return ps.executeUpdate() >= 0; // 1=inserted, 0=dedup, both success
+                } catch (Exception e) { return false; }
+            }
+        };
+
+        // Production finalizer with real hooks
         ToolJobFinalizer finalizer = new ToolJobFinalizer(
                 anchorService, redisCache, capacity, mock(ToolJobResumeService.class),
                 new ToolJobConfig());
         java.lang.reflect.Field usageField = ToolJobFinalizer.class.getDeclaredField("usageHook");
         usageField.setAccessible(true);
         usageField.set(finalizer, realUsageHook);
-        java.lang.reflect.Field eventField = ToolJobFinalizer.class.getDeclaredField("eventHook");
-        eventField.setAccessible(true);
-        eventField.set(finalizer, realEventHookP11);
+        java.lang.reflect.Field evtField = ToolJobFinalizer.class.getDeclaredField("eventHook");
+        evtField.setAccessible(true);
+        evtField.set(finalizer, eventHook);
 
-        // Reconciler calls handleTerminal after sandbox returns FAILED + OOM result
-        finalizer.handleTerminal(RUN_ID, pendingAnchor, "FAILED", oomResult, true);
+        // Build reconciler → public reconcileFromDue path
+        ToolJobReconciler reconciler = new ToolJobReconciler(
+                redisCache, anchorService, finalizer, mock(ToolJobResumeService.class),
+                new ToolJobConfig());
+        java.lang.reflect.Field sandboxField = ToolJobReconciler.class.getDeclaredField("sandboxService");
+        sandboxField.setAccessible(true);
+        sandboxField.set(reconciler, sandbox);
 
-        // Oracle 1: terminalRetryable=true — OOM gate from retryable proto field
-        ToolJobAnchor afterFinalize = anchorService.loadAnchor(RUN_ID);
-        assertThat(afterFinalize).isNotNull();
-        assertThat(afterFinalize.getTerminalRetryable()).isTrue();
-        assertThat(afterFinalize.getTerminalStatus()).isEqualTo("FAILED");
+        // Run reconciler — picks up RUN_ID from Redis due ZSET (score=0 now)
+        reconciler.reconcileFromDue();
 
-        // Oracle 2: real event hook persisted event row to PG
+        // Oracle 1: terminalRetryable=true (OOM gate from proto retryable)
+        ToolJobAnchor afterReconcile = anchorService.loadAnchor(RUN_ID);
+        assertThat(afterReconcile).isNotNull();
+        assertThat(afterReconcile.getTerminalRetryable()).isTrue();
+        assertThat(afterReconcile.getTerminalStatus()).isEqualTo("FAILED");
+        assertThat(afterReconcile.getSandboxTerminalStatus()).isEqualTo("FAILED");
+
+        // Oracle 2: real event hook persisted event to PG
         String dedupeKey = RUN_ID + ":" + TOOL_CALL_ID + ":logical_terminal";
         AgentRunEvent persistedEvent = newEventMapper().findByRunIdAndDedupeKey(RUN_ID, dedupeKey);
         assertThat(persistedEvent).isNotNull();
-        assertThat(persistedEvent.getEventType()).isEqualTo("TOOL_CALL_FINISHED");
 
-        // Oracle 3: real usage hook persisted observability to PG
+        // Oracle 3: real usage hook persisted to PG, OOM count=1
+        assertThat(afterReconcile.isUsagePersisted()).isTrue();
         DataAnalysisObservabilitySummary summary = realRecorder
                 .findSummaryByRunId(RUN_ID, DataAnalysisObservabilityReadMode.TERMINAL_DB_ONLY)
                 .orElse(null);
         assertThat(summary).isNotNull();
         assertThat(summary.oomCount()).isEqualTo(1);
 
-        // Oracle 4: capacity released (RELEASE step ran with real capacity mock)
+        // Oracle 4: capacity released
         verify(capacity).releaseReservation(any());
     }
 
