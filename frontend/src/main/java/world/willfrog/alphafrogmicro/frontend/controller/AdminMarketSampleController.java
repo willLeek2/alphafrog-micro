@@ -97,6 +97,6 @@ public class AdminMarketSampleController {
             return false;
         }
         String status = user.getStatus();
-        return status == null || status.isBlank() || STATUS_ACTIVE.equalsIgnoreCase(status);
+        return status != null && STATUS_ACTIVE.equalsIgnoreCase(status.trim());
     }
 }

@@ -82,6 +82,30 @@ class AdminMarketSampleControllerTest {
         assertEquals(403, response.getStatusCode().value());
     }
 
+    @Test
+    void adminAccountWithoutExplicitStatusIsRejected() {
+        Authentication authentication = authentication("statusless-admin");
+        when(userDao.getUserByUsername("statusless-admin"))
+                .thenReturn(List.of(user(1127, null)));
+
+        ResponseEntity<?> response = controller.randomSwL3Industries(authentication, 1);
+
+        assertEquals(403, response.getStatusCode().value());
+        verify(marketSampleClient, never()).randomSwL3Industries(1);
+    }
+
+    @Test
+    void adminAccountWithBlankStatusIsRejected() {
+        Authentication authentication = authentication("blank-status-admin");
+        when(userDao.getUserByUsername("blank-status-admin"))
+                .thenReturn(List.of(user(1127, "  ")));
+
+        ResponseEntity<?> response = controller.randomSwL3Industries(authentication, 1);
+
+        assertEquals(403, response.getStatusCode().value());
+        verify(marketSampleClient, never()).randomSwL3Industries(1);
+    }
+
     private Authentication authentication(String username) {
         Authentication authentication = mock(Authentication.class);
         when(authentication.isAuthenticated()).thenReturn(true);
