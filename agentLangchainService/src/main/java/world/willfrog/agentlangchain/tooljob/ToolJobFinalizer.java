@@ -34,7 +34,8 @@ public class ToolJobFinalizer {
 
     private static final Map<String, Integer> STEP_ORDER = Map.of(
             STEP_ENVELOPE, 1, STEP_RELEASE, 2, STEP_USAGE, 3,
-            STEP_EVENT, 4, STEP_CAS_STATUS, 5, STEP_RESUME_READY, 6);
+            STEP_EVENT, 4, STEP_CAS_STATUS, 5, STEP_RESUME_READY, 6,
+            STEP_CANCELED, 7);
 
     private final ToolJobAnchorService anchorService;
     private final ToolJobRedisCache redisCache;
@@ -185,6 +186,11 @@ public class ToolJobFinalizer {
                     log.warn("CANCELED terminal transition failed for run={}, will retry", runId);
                     return;
                 }
+                // Durable success — clean up Redis so no stale due re-entry.
+                // STEP_CANCELED in STEP_ORDER ensures isStepDone treats all steps
+                // as complete on re-entry.
+                redisCache.removeDue(runId);
+                redisCache.deletePendingCache(runId);
                 log.info("Canceled terminal finalized for run={}, capacity released", runId);
                 return;
             }

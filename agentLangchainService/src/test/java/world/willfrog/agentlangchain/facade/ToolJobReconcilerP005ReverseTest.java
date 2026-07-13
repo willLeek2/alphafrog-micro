@@ -482,6 +482,64 @@ class ToolJobReconcilerP005ReverseTest {
                 any(TaskResultResponse.class), eq(false));
     }
 
+    // ---- Test: Repeat reconcile after cancel (due/pending cleanup + idempotent) ----
+
+    @Test
+    void repeatReconcileAfterCancelDoesNotDoubleReleaseOrLeaveStaleDue() throws Exception {
+        // Seed and cancel (same setup as Path A)
+        DataAnalysisOperationIdentity identity =
+                new DataAnalysisOperationIdentity(RUN_ID + "-rpt", "tc-1", 1);
+        DataAnalysisReservation reservation = new DataAnalysisReservation(
+                identity.operationId(), identity,
+                DataAnalysisResourceClass.STANDARD, 1,
+                DataAnalysisReservationState.PENDING_TRANSFERRED,
+                "task-rpt", Instant.now().minusSeconds(120));
+        capacityFake.restoreReservation(reservation);
+
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setAnchorState("PENDING");
+        anchor.setOperationId(identity.operationId());
+        anchor.setToolCallId("tc-1");
+        anchor.setAttempt(1);
+        anchor.setTaskId("task-rpt");
+        anchor.setAutoResume(true);
+        anchor.setReservationJson(om.writeValueAsString(reservation));
+        anchor.setEstimateJson("{\"estimatedRows\":1,\"estimatedBytes\":10,\"fileCount\":1,"
+                + "\"selectedColumnRatio\":0.5,\"manifestMemberCount\":1,"
+                + "\"heavyOperationHints\":[],\"resourceClass\":\"STANDARD\",\"capacityUnits\":1}");
+        anchor.setNextPollAt(Instant.now().minusSeconds(60));
+        anchor.setTimeoutAt(Instant.now().plusSeconds(600));
+
+        String runIdRpt = RUN_ID + "-rpt";
+        insertRun(runIdRpt, USER_ID, AgentRunStatus.WAITING_TOOL_JOB.name(), anchor.toJson());
+        redisCache.upsertDue(runIdRpt, anchor);
+
+        // Cancel
+        controlService.cancelRun(CancelAgentRunRequest.newBuilder()
+                .setId(runIdRpt).setUserId(USER_ID).build());
+
+        // First reconcile — terminal finalize + CANCELED transition
+        reconciler.reconcileFromDue();
+        assertThat(capacityFake.releaseCallCount).isGreaterThanOrEqualTo(1);
+        int releaseAfterFirst = capacityFake.releaseCallCount;
+        int transitionAfterFirst = capacityFake.transitionCount;
+
+        // Verify due ZSET is empty (cleaned up by finalizer)
+        Double dueScore = redisTemplate.opsForZSet().score(DUE_ZSET_KEY, runIdRpt);
+        assertThat(dueScore).isNull();
+
+        // Second reconcile — should be a no-op (no due entry, nothing to process)
+        reconciler.reconcileFromDue();
+
+        // Oracle: no additional release or transition
+        assertThat(capacityFake.releaseCallCount).isEqualTo(releaseAfterFirst);
+        assertThat(capacityFake.transitionCount).isEqualTo(transitionAfterFirst);
+
+        // Oracle: run still CANCELED (not changed by re-entry)
+        AgentRun run = mapper.findById(runIdRpt);
+        assertThat(run.getStatus()).isEqualTo(AgentRunStatus.CANCELED);
+    }
+
     // ---- Helpers ----
 
     private static DataSource dataSource() {

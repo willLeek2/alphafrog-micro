@@ -114,13 +114,26 @@ public class LangchainRunControlService {
                     && !toolAnchor.getOperationId().isBlank()) {
                 toolAnchor.setAutoResume(false);
                 toolAnchor.setRunDisposition("CANCELED");
-                anchorService.updateAnchor(runId, toolAnchor, run.getStatus());
+                boolean persisted = anchorService.updateAnchor(runId, toolAnchor, run.getStatus());
+                if (!persisted) {
+                    // CAS failure means the anchor/status changed concurrently.
+                    // Fail-closed: do NOT continue with normal cancel (which would
+                    // set CANCELED status and leak the reservation). Let the caller
+                    // retry — the anchor may still be processable by the reconciler.
+                    log.warn("Cancel CAS failed for run={}: unable to persist anchor disposition — "
+                            + "run will NOT be transitioned to CANCELED to prevent capacity leak. "
+                            + "The reconciler will process when sandbox terminal arrives.", runId);
+                    throw new IllegalStateException(
+                            "cancel_anchor_cas_failed: unable to persist cancel disposition");
+                }
                 hasActiveAnchor = true;
                 log.info("Cancel run={} with active tool-job anchor: persisted cancel disposition", runId);
             }
+        } catch (IllegalStateException e) {
+            throw e;
         } catch (Exception e) {
             log.warn("Failed to persist cancel disposition on tool-job anchor for run={}, "
-                    + "continuing with cancel: {}", runId, e.getMessage());
+                    + "falling back to standard cancel (capacity may leak): {}", runId, e.getMessage());
         }
         // 2. sleep 200ms 给正在执行的 todo loop 一个窗口去感知并响应 CANCELING 状态。
         //    这比硬 kill 线程更安全——正在执行的工具调用可以自然完成当前轮，避免留下半成品状态
@@ -156,7 +169,16 @@ public class LangchainRunControlService {
         } catch (Exception settleEx) {
             log.warn("Failed to schedule settlement on langchain cancel: runId={} err={}", runId, settleEx.getMessage());
         }
-        return AgentLangchainRunMessageMapper.toRunMessage(readService.requireReadableRun(runId, userId));
+        AgentRun refreshed = readService.requireReadableRun(runId, userId);
+        if (hasActiveAnchor) {
+            // API response must show CANCELED even though DB stays WAITING_TOOL_JOB
+            // for the finalizer CAS. The finalizer transitions to CANCELED after
+            // terminal sinks complete.
+            return AgentLangchainRunMessageMapper.toRunMessage(refreshed).toBuilder()
+                    .setStatus(AgentRunStatus.CANCELED.name())
+                    .build();
+        }
+        return AgentLangchainRunMessageMapper.toRunMessage(refreshed);
     }
 
     /**
