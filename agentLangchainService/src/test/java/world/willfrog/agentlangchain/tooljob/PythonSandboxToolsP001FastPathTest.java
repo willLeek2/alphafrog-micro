@@ -750,12 +750,15 @@ class PythonSandboxToolsP001FastPathTest {
         assertThrows(ExternalToolJobPendingException.class,
                 () -> tools.executePython("import time; time.sleep(300)", "1", null, null, 30));
 
-        // Verify PENDING anchor persisted + capture pre-reconcile identity
+        // Verify PENDING anchor persisted + capture pre-reconcile identity from durable anchor
         ToolJobAnchorService anchorService = new ToolJobAnchorService(newMapper());
         ToolJobAnchor pendingAnchor = anchorService.loadAnchor(RUN_ID);
         assertThat(pendingAnchor.getAnchorState()).isEqualTo("PENDING");
         String preOperationId = pendingAnchor.getOperationId();
-        String preReservationId = new DataAnalysisOperationIdentity(RUN_ID, TOOL_CALL_ID, 1).reservationId();
+        DataAnalysisReservation preReservation = om.readValue(
+                pendingAnchor.getReservationJson(), DataAnalysisReservation.class);
+        String preReservationId = preReservation.reservationId();
+        assertThat(preReservation.state()).isEqualTo(DataAnalysisReservationState.PENDING_TRANSFERRED);
         int preAttempt = pendingAnchor.getAttempt();
 
         // IMPORTANT: override due ZSET score to 0 (past) so reconcileFromDue fetches it now.
@@ -840,11 +843,13 @@ class PythonSandboxToolsP001FastPathTest {
         // Oracle 4: capacity released
         verify(capacity).releaseReservation(any());
 
-        // Oracle 5: no-upgrade identity — attempt unchanged, operationId/reservationId preserved
+        // Oracle 5: no-upgrade identity — attempt unchanged, operationId preserved, reservation durable
         assertThat(afterReconcile.getAttempt()).isEqualTo(preAttempt);
         assertThat(afterReconcile.getOperationId()).isEqualTo(preOperationId);
-        String postReservationId = new DataAnalysisOperationIdentity(RUN_ID, TOOL_CALL_ID, 1).reservationId();
-        assertThat(postReservationId).isEqualTo(preReservationId);
+        DataAnalysisReservation postReservation = om.readValue(
+                afterReconcile.getReservationJson(), DataAnalysisReservation.class);
+        assertThat(postReservation.reservationId()).isEqualTo(preReservationId);
+        assertThat(postReservation.state()).isEqualTo(DataAnalysisReservationState.RELEASED);
 
         // Oracle 6: createTask called exactly once (during initial executePython, not re-created)
         verify(sandbox, times(1)).createTask(any());
