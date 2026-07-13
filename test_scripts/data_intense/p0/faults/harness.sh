@@ -92,9 +92,9 @@ run_maven "P005_CancelRepair" \
 run_maven "P009_ResultFetchRepair" \
   "ToolJobReconcilerP009ReverseTest,ToolJobReconcilerP009ForwardTest" true
 run_maven "PipelineResume" \
+  "LangchainLinearRunPipelineResumeTest,LangchainLinearWorkflowResumeTest" true
 run_maven "T5_FaultFixtures" \
   "ToolJobFinalizerP001Test,ToolJobFinalizerP002Test,ToolJobReconcilerP004Test,ToolJobFinalizerP006Test" true
-  "LangchainLinearRunPipelineResumeTest,LangchainLinearWorkflowResumeTest" true
 
 # Python retry classification — REQUIRED, fail-closed on any missing dependency
 PYTHON_DIR="${PROJECT_ROOT}/pythonSandboxService"
