@@ -43,6 +43,10 @@ security:
     task-creation-window-minutes: 60
 
 alphafrog:
+  domestic-fetch:
+    debug-base-url: ${AF_DOMESTIC_FETCH_DEBUG_BASE_URL:http://domestic-fetch-service:18082}
+    # 仅供 frontend -> domestic-fetch 内网调用；外部调用使用管理员账户 JWT。
+    debug-admin-token: ${ALPHAFROG_DEBUG_ADMIN_TOKEN:}
   debug:
     observability:
       output-root: ${AF_DEBUG_OBSERVABILITY_OUTPUT_ROOT:/app/logs/agent-debug-observability}

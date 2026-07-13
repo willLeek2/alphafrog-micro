@@ -360,7 +360,8 @@ services:
       - ./data/domestic-fetch-configs:/app/config-dynamic
     ports:
       - "20882:20882"
-      - "18082:18082"
+    expose:
+      - "18082"
     deploy:
       resources:
         limits:
@@ -722,6 +723,8 @@ services:
         condition: service_started
       external-info-service:
         condition: service_started
+      domestic-fetch-service:
+        condition: service_started
     environment:
       TZ: Asia/Shanghai
       AF_DB_MAIN_HOST: ${AF_DB_MAIN_HOST:-host.docker.internal}
@@ -740,6 +743,9 @@ services:
       # 可选：覆盖 JWT 密钥（默认值在 frontend 的 application.yml 里）
       # AF_JWT_SECRET: ${AF_JWT_SECRET}
       AF_RAG_INGEST_TOKEN: ${AF_RAG_INGEST_TOKEN:-}
+      AF_DOMESTIC_FETCH_DEBUG_BASE_URL: http://domestic-fetch-service:18082
+      # 仅限 frontend -> domestic-fetch 内部鉴权；浏览器/脚本不应读取该值。
+      ALPHAFROG_DEBUG_ADMIN_TOKEN: ${ALPHAFROG_DEBUG_ADMIN_TOKEN:-}
       AF_CONFIG_NACOS_ENABLED: "true"
       AF_CONFIG_NACOS_NAMESPACE: ${AF_CONFIG_NACOS_NAMESPACE:-}
       AGENT_LANGCHAIN_PROVIDER_DUBBO_GROUP: ${AGENT_LANGCHAIN_PROVIDER_DUBBO_GROUP:-langchain}
