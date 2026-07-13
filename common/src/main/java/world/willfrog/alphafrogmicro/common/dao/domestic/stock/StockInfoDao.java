@@ -5,6 +5,7 @@ import org.springframework.cache.annotation.Cacheable;
 import world.willfrog.alphafrogmicro.common.pojo.domestic.stock.StockInfo;
 
 import java.util.List;
+import java.util.Map;
 
 @Mapper
 public interface StockInfoDao {
@@ -75,5 +76,13 @@ public interface StockInfoDao {
             @Result(column = "act_ent_type", property = "actEntType")
     })
     List<StockInfo> getAllStockInfo(@Param("offset") int offset, @Param("limit") int limit);
+
+    @Select("SELECT stock.ts_code AS ts_code, stock.name AS name " +
+            "FROM alphafrog_stock_info stock " +
+            "WHERE stock.list_status = 'L' AND stock.ts_code IS NOT NULL AND stock.name IS NOT NULL " +
+            "AND EXISTS (SELECT 1 FROM alphafrog_stock_daily daily " +
+            "WHERE daily.ts_code = stock.ts_code) " +
+            "ORDER BY random() LIMIT #{limit}")
+    List<Map<String, Object>> getRandomListedStocks(@Param("limit") int limit);
 
 }

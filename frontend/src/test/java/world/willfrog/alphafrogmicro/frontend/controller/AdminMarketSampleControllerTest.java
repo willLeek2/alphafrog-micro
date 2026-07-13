@@ -53,6 +53,25 @@ class AdminMarketSampleControllerTest {
     }
 
     @Test
+    void adminAccountCanFetchRandomStocksAndEtfs() {
+        Authentication authentication = authentication("admin-assets");
+        when(userDao.getUserByUsername("admin-assets"))
+                .thenReturn(List.of(user(1127, "ACTIVE")));
+        when(marketSampleClient.randomListedStocks(1))
+                .thenReturn(List.of(Map.of("tsCode", "600519.SH", "name", "贵州茅台")));
+        when(marketSampleClient.randomListedEtfs(1))
+                .thenReturn(List.of(Map.of("tsCode", "510300.SH", "name", "沪深300ETF")));
+
+        ResponseEntity<?> stocks = controller.randomListedStocks(authentication, 1);
+        ResponseEntity<?> etfs = controller.randomListedEtfs(authentication, 1);
+
+        assertEquals(200, stocks.getStatusCode().value());
+        assertEquals(200, etfs.getStatusCode().value());
+        assertEquals(List.of(Map.of("tsCode", "600519.SH", "name", "贵州茅台")), stocks.getBody());
+        assertEquals(List.of(Map.of("tsCode", "510300.SH", "name", "沪深300ETF")), etfs.getBody());
+    }
+
+    @Test
     void normalAccountIsRejectedBeforeCallingUpstream() {
         Authentication authentication = authentication("normal");
         when(userDao.getUserByUsername("normal")).thenReturn(List.of(user(1, "ACTIVE")));

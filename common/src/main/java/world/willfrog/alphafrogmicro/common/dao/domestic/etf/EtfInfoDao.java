@@ -4,6 +4,7 @@ import org.apache.ibatis.annotations.*;
 import world.willfrog.alphafrogmicro.common.pojo.domestic.etf.EtfInfo;
 
 import java.util.List;
+import java.util.Map;
 
 @Mapper
 public interface EtfInfoDao {
@@ -51,4 +52,12 @@ public interface EtfInfoDao {
 
     @Select("SELECT ts_code FROM alphafrog_domestic_etf ORDER BY ts_code LIMIT #{limit} OFFSET #{offset}")
     List<String> getEtfTsCodes(@Param("offset") int offset, @Param("limit") int limit);
+
+    @Select("SELECT etf.ts_code AS ts_code, etf.name AS name " +
+            "FROM alphafrog_domestic_etf etf " +
+            "WHERE etf.list_status = 'L' AND etf.ts_code IS NOT NULL AND etf.name IS NOT NULL " +
+            "AND EXISTS (SELECT 1 FROM alphafrog_domestic_etf_daily daily " +
+            "WHERE daily.ts_code = etf.ts_code) " +
+            "ORDER BY random() LIMIT #{limit}")
+    List<Map<String, Object>> getRandomListedEtfs(@Param("limit") int limit);
 }

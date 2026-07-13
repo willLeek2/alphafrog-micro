@@ -83,6 +83,24 @@ public class DomesticMarketSampleClient {
         return exchange(uri, ASSET_LIST_TYPE);
     }
 
+    public List<Map<String, Object>> randomListedStocks(int count) {
+        URI uri = uri("/debug/stocks/random")
+                .queryParam("count", count)
+                .build()
+                .encode()
+                .toUri();
+        return exchange(uri, ASSET_LIST_TYPE);
+    }
+
+    public List<Map<String, Object>> randomListedEtfs(int count) {
+        URI uri = uri("/debug/etfs/random")
+                .queryParam("count", count)
+                .build()
+                .encode()
+                .toUri();
+        return exchange(uri, ASSET_LIST_TYPE);
+    }
+
     private UriComponentsBuilder uri(String path) {
         return UriComponentsBuilder.fromUriString(baseUrl).path(path);
     }

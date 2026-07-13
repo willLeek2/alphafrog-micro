@@ -17,10 +17,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import world.willfrog.alphafrogmicro.common.dao.domestic.etf.EtfInfoDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.index.IndexQuoteDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.index.IndexWeightDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.index.SwIndustryClassifyDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.index.SwIndustryMemberDao;
+import world.willfrog.alphafrogmicro.common.dao.domestic.stock.StockInfoDao;
 import world.willfrog.alphafrogmicro.domestic.fetch.utils.TuShareRequestUtils;
 
 @Service
@@ -33,17 +35,23 @@ public class DomesticDebugQueryService {
     private final SwIndustryClassifyDao swIndustryClassifyDao;
     private final SwIndustryMemberDao swIndustryMemberDao;
     private final IndexQuoteDao indexQuoteDao;
+    private final StockInfoDao stockInfoDao;
+    private final EtfInfoDao etfInfoDao;
     private final TuShareRequestUtils tuShareRequestUtils;
 
     public DomesticDebugQueryService(IndexWeightDao indexWeightDao,
                                      SwIndustryClassifyDao swIndustryClassifyDao,
                                      SwIndustryMemberDao swIndustryMemberDao,
                                      IndexQuoteDao indexQuoteDao,
+                                     StockInfoDao stockInfoDao,
+                                     EtfInfoDao etfInfoDao,
                                      TuShareRequestUtils tuShareRequestUtils) {
         this.indexWeightDao = indexWeightDao;
         this.swIndustryClassifyDao = swIndustryClassifyDao;
         this.swIndustryMemberDao = swIndustryMemberDao;
         this.indexQuoteDao = indexQuoteDao;
+        this.stockInfoDao = stockInfoDao;
+        this.etfInfoDao = etfInfoDao;
         this.tuShareRequestUtils = tuShareRequestUtils;
     }
 
@@ -87,6 +95,14 @@ public class DomesticDebugQueryService {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "min_amount must be >= 0");
         }
         return toAssetNames(indexQuoteDao.getRandomIndexNamesByAmountRange(start, end, minAmount, limit));
+    }
+
+    public List<DebugAssetNameResponse> randomListedStocks(int count) {
+        return toAssetNames(stockInfoDao.getRandomListedStocks(requireCount(count)));
+    }
+
+    public List<DebugAssetNameResponse> randomListedEtfs(int count) {
+        return toAssetNames(etfInfoDao.getRandomListedEtfs(requireCount(count)));
     }
 
     private int requireCount(int count) {

@@ -65,6 +65,20 @@ public class AdminMarketSampleController {
                         startDate, endDate, minAmount, count));
     }
 
+    @GetMapping("/stocks/random")
+    public ResponseEntity<?> randomListedStocks(
+            Authentication authentication,
+            @RequestParam(value = "count", defaultValue = "1") int count) {
+        return adminCall(authentication, () -> marketSampleClient.randomListedStocks(count));
+    }
+
+    @GetMapping("/etfs/random")
+    public ResponseEntity<?> randomListedEtfs(
+            Authentication authentication,
+            @RequestParam(value = "count", defaultValue = "1") int count) {
+        return adminCall(authentication, () -> marketSampleClient.randomListedEtfs(count));
+    }
+
     private ResponseEntity<?> adminCall(Authentication authentication, Supplier<?> action) {
         if (!isAdmin(authentication)) {
             return ResponseEntity.status(HttpStatus.FORBIDDEN)

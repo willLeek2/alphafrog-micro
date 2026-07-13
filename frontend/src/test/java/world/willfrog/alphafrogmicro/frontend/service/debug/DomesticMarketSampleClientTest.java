@@ -49,4 +49,26 @@ class DomesticMarketSampleClientTest {
 
         assertThrows(IllegalStateException.class, () -> client.randomSwL3Industries(1));
     }
+
+    @Test
+    void forwardsRandomStockAndEtfRequestsWithInternalToken() {
+        RestTemplate restTemplate = new RestTemplate();
+        MockRestServiceServer server = MockRestServiceServer.bindTo(restTemplate).build();
+        DomesticMarketSampleClient client = new DomesticMarketSampleClient(
+                restTemplate, "http://domestic-fetch-service:18082", "internal-secret");
+        server.expect(requestTo("http://domestic-fetch-service:18082/debug/stocks/random?count=2"))
+                .andExpect(header("X-Admin-Token", "internal-secret"))
+                .andRespond(withSuccess(
+                        "[{\"tsCode\":\"600519.SH\",\"name\":\"贵州茅台\"}]",
+                        MediaType.APPLICATION_JSON));
+        server.expect(requestTo("http://domestic-fetch-service:18082/debug/etfs/random?count=2"))
+                .andExpect(header("X-Admin-Token", "internal-secret"))
+                .andRespond(withSuccess(
+                        "[{\"tsCode\":\"510300.SH\",\"name\":\"沪深300ETF\"}]",
+                        MediaType.APPLICATION_JSON));
+
+        assertEquals("600519.SH", client.randomListedStocks(2).get(0).get("tsCode"));
+        assertEquals("510300.SH", client.randomListedEtfs(2).get(0).get("tsCode"));
+        server.verify();
+    }
 }

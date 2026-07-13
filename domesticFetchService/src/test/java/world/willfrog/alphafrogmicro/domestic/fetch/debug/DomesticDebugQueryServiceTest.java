@@ -6,10 +6,12 @@ import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.server.ResponseStatusException;
+import world.willfrog.alphafrogmicro.common.dao.domestic.etf.EtfInfoDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.index.IndexQuoteDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.index.IndexWeightDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.index.SwIndustryClassifyDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.index.SwIndustryMemberDao;
+import world.willfrog.alphafrogmicro.common.dao.domestic.stock.StockInfoDao;
 import world.willfrog.alphafrogmicro.domestic.fetch.utils.TuShareRequestUtils;
 
 import java.util.Arrays;
@@ -20,6 +22,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -31,6 +34,8 @@ class DomesticDebugQueryServiceTest {
     private final SwIndustryClassifyDao swIndustryClassifyDao = mock(SwIndustryClassifyDao.class);
     private final SwIndustryMemberDao swIndustryMemberDao = mock(SwIndustryMemberDao.class);
     private final IndexQuoteDao indexQuoteDao = mock(IndexQuoteDao.class);
+    private final StockInfoDao stockInfoDao = mock(StockInfoDao.class);
+    private final EtfInfoDao etfInfoDao = mock(EtfInfoDao.class);
     private final TuShareRequestUtils tuShareRequestUtils = mock(TuShareRequestUtils.class);
 
     private final DomesticDebugQueryService service = new DomesticDebugQueryService(
@@ -38,6 +43,8 @@ class DomesticDebugQueryServiceTest {
             swIndustryClassifyDao,
             swIndustryMemberDao,
             indexQuoteDao,
+            stockInfoDao,
+            etfInfoDao,
             tuShareRequestUtils
     );
 
@@ -122,6 +129,44 @@ class DomesticDebugQueryServiceTest {
         assertBadRequest(() -> service.randomIndexNamesByAmountRange("20250132", "20251231", 1.0, 1));
         assertBadRequest(() -> service.randomIndexNamesByAmountRange("20251231", "20250101", 1.0, 1));
         assertBadRequest(() -> service.randomIndexNamesByAmountRange("20250101", "20251231", -1.0, 1));
+    }
+
+    @Test
+    void randomListedStocksShouldReturnActiveStockNamesFromDao() {
+        when(stockInfoDao.getRandomListedStocks(2)).thenReturn(List.of(
+                Map.of("ts_code", "600519.SH", "name", "贵州茅台"),
+                Map.of("ts_code", "000001.SZ", "name", "平安银行")
+        ));
+
+        List<DebugAssetNameResponse> result = service.randomListedStocks(2);
+
+        assertEquals(List.of(
+                new DebugAssetNameResponse("600519.SH", "贵州茅台"),
+                new DebugAssetNameResponse("000001.SZ", "平安银行")
+        ), result);
+    }
+
+    @Test
+    void randomListedEtfsShouldReturnActiveEtfNamesFromDao() {
+        when(etfInfoDao.getRandomListedEtfs(2)).thenReturn(List.of(
+                Map.of("ts_code", "510300.SH", "name", "沪深300ETF"),
+                Map.of("ts_code", "159915.SZ", "name", "创业板ETF")
+        ));
+
+        List<DebugAssetNameResponse> result = service.randomListedEtfs(2);
+
+        assertEquals(List.of(
+                new DebugAssetNameResponse("510300.SH", "沪深300ETF"),
+                new DebugAssetNameResponse("159915.SZ", "创业板ETF")
+        ), result);
+    }
+
+    @Test
+    void randomListedAssetsShouldRejectOutOfRangeCountBeforeQueryingDao() {
+        assertBadRequest(() -> service.randomListedStocks(0));
+        assertBadRequest(() -> service.randomListedEtfs(6));
+        verify(stockInfoDao, never()).getRandomListedStocks(anyInt());
+        verify(etfInfoDao, never()).getRandomListedEtfs(anyInt());
     }
 
     private static void assertBadRequest(Runnable runnable) {

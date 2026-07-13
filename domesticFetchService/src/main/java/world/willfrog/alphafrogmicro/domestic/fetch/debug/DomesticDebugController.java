@@ -52,4 +52,22 @@ public class DomesticDebugController {
         debugAdminGuard.requireAdmin(authorization, adminToken);
         return queryService.randomIndexNamesByAmountRange(startDate, endDate, minAmount, count);
     }
+
+    @GetMapping("/stocks/random")
+    public List<DebugAssetNameResponse> randomListedStocks(
+            @RequestHeader(value = "Authorization", required = false) String authorization,
+            @RequestHeader(value = "X-Admin-Token", required = false) String adminToken,
+            @RequestParam(value = "count", defaultValue = "1") int count) {
+        debugAdminGuard.requireAdmin(authorization, adminToken);
+        return queryService.randomListedStocks(count);
+    }
+
+    @GetMapping("/etfs/random")
+    public List<DebugAssetNameResponse> randomListedEtfs(
+            @RequestHeader(value = "Authorization", required = false) String authorization,
+            @RequestHeader(value = "X-Admin-Token", required = false) String adminToken,
+            @RequestParam(value = "count", defaultValue = "1") int count) {
+        debugAdminGuard.requireAdmin(authorization, adminToken);
+        return queryService.randomListedEtfs(count);
+    }
 }
