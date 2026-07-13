@@ -2,6 +2,9 @@
 # T5 contract harness: validates exact candidate SHA, runs JDK17 Maven fixtures
 # + Python tests on the current checkout, produces machine-readable JSON summary.
 # REQUIRED failures -> non-zero exit. SUPPORTING_ONLY cases are informational.
+#
+# Python suites use the ambient python3 interpreter; they require pydantic + pandas.
+# The test files use unittest.TestCase and are executed via `python -m unittest`.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -68,12 +71,12 @@ run_maven() {
     '.[$n] = {pass: $p, required: $r, elapsed_s: $e}')
 }
 
-run_python() {
-  local name="$1" path="$2" required="${3:-true}"
+run_python_unittest() {
+  local name="$1" module="$2" required="${3:-true}"
   echo "--- $name ---"
   local start_ts=$(date +%s)
   local ec=0
-  ${PYTHON_BIN:-python3} -m pytest "$path" -q 2>&1 || ec=$?
+  ${PYTHON_BIN:-python3} -m unittest "$module" -q 2>&1 || ec=$?
   local elapsed=$(($(date +%s) - start_ts))
   local pass="false"; [ "$ec" -eq 0 ] && pass="true"
   RESULTS=$(echo "$RESULTS" | jq --arg n "$name" --argjson p "$pass" \
@@ -88,63 +91,30 @@ supporting() {
     '.[$n] = {pass: null, required: false, supporting_only: true, note: $d}')
 }
 
-# ---- Unified Python environment setup (cached, isolated, strict) ----
+# ---- Python env check (cached) ----
+# Uses ambient python3; requires pydantic + pandas (not pytest — tests use unittest).
 PYTHON_DIR="${PROJECT_ROOT}/pythonSandboxService"
-REQUIREMENTS_FILE="${PYTHON_DIR}/requirements.txt"
 PYTHON_BIN=""
 PYTHON_OK=false
-PYTHON_SETUP_ATTEMPTED=false
-VENV_DIR=""
+PYTHON_CHECKED=false
 
-cleanup_venv() {
-  if [ -n "$VENV_DIR" ] && [ -d "$VENV_DIR" ]; then
-    rm -rf "$VENV_DIR"
-  fi
-}
-
-setup_python_env() {
-  # Already attempted — return cached result
-  if [ "$PYTHON_SETUP_ATTEMPTED" = "true" ]; then
+check_python_env() {
+  if [ "$PYTHON_CHECKED" = "true" ]; then
     [ "$PYTHON_OK" = "true" ] && return 0 || return 1
   fi
-  PYTHON_SETUP_ATTEMPTED=true
+  PYTHON_CHECKED=true
 
-  # Try ambient python3: must have pydantic + pytest + pandas ALL present
-  if python3 -c "import pydantic, pytest, pandas" 2>/dev/null; then
-    PYTHON_BIN="python3"
-    PYTHON_OK=true
-    return 0
-  fi
-
-  # Build isolated venv with unique path (safe for parallel runners)
-  if ! command -v mktemp >/dev/null 2>&1; then
+  # Resolve interpreter (respect PYTHON_BIN override from caller)
+  local py="${PYTHON_BIN:-python3}"
+  if ! command -v "$py" >/dev/null 2>&1; then
     return 1
   fi
-  VENV_DIR=$(mktemp -d "${TMPDIR:-/tmp}/t5-harness-venv.XXXXXX")
-  trap cleanup_venv EXIT
-
-  echo "--- Python env: building venv at $VENV_DIR ---"
-  if ! python3 -m venv "$VENV_DIR" 2>/dev/null; then
+  if ! "$py" -c "import pydantic, pandas" 2>/dev/null; then
     return 1
   fi
-
-  # Strict: requirements.txt must exist and install must succeed
-  if [ ! -f "$REQUIREMENTS_FILE" ]; then
-    echo "--- Python env: ERROR — $REQUIREMENTS_FILE not found ---"
-    return 1
-  fi
-  if ! "$VENV_DIR/bin/python" -m pip install -r "$REQUIREMENTS_FILE" pytest pandas -q 2>/dev/null; then
-    echo "--- Python env: ERROR — pip install failed ---"
-    return 1
-  fi
-
-  # Final three-import check
-  if "$VENV_DIR/bin/python" -c "import pydantic, pytest, pandas" 2>/dev/null; then
-    PYTHON_BIN="$VENV_DIR/bin/python"
-    PYTHON_OK=true
-    return 0
-  fi
-  return 1
+  PYTHON_BIN="$py"
+  PYTHON_OK=true
+  return 0
 }
 
 # === REQUIRED Java suites ===
@@ -160,38 +130,36 @@ run_maven "T5_FaultFixtures" \
   "ToolJobFinalizerP001Test,ToolJobFinalizerP002Test,ToolJobReconcilerP004Test,ToolJobFinalizerP006Test" true
 
 # === Python: retry classification (REQUIRED) ===
-PYTHON_ERROR_MSG=""
+PYTHON_ERR=""
 if [ ! -f "${PYTHON_DIR}/tests/test_retry_classification.py" ]; then
-  PYTHON_ERROR_MSG="test file not found"
+  PYTHON_ERR="test file not found"
+elif ! check_python_env; then
+  PYTHON_ERR="python env missing pydantic or pandas"
 fi
-if [ -z "$PYTHON_ERROR_MSG" ] && ! setup_python_env; then
-  PYTHON_ERROR_MSG="unified Python env unavailable (need pydantic + pytest + pandas)"
-fi
-if [ -n "$PYTHON_ERROR_MSG" ]; then
-  record_required_failure "Python_RetryClassification" "$PYTHON_ERROR_MSG"
+if [ -n "$PYTHON_ERR" ]; then
+  record_required_failure "Python_RetryClassification" "$PYTHON_ERR"
 else
   echo "--- Python_RetryClassification ---"
   pushd "$PYTHON_DIR" > /dev/null
-  run_python "Python_RetryClassification" "tests/test_retry_classification.py" true
+  run_python_unittest "Python_RetryClassification" "tests.test_retry_classification" true
   popd > /dev/null
 fi
 
 # === Python: benchmark tools (REQUIRED) ===
 BENCHMARK_TEST="${PROJECT_ROOT}/test_scripts/data_intense/p0/benchmarks/test_benchmark_tools.py"
-BENCHMARK_ERROR_MSG=""
+BENCHMARK_ERR=""
 if [ ! -f "$BENCHMARK_TEST" ]; then
-  BENCHMARK_ERROR_MSG="test file not found"
+  BENCHMARK_ERR="test file not found"
+elif ! check_python_env; then
+  BENCHMARK_ERR="python env missing pydantic or pandas"
 fi
-if [ -z "$BENCHMARK_ERROR_MSG" ] && ! setup_python_env; then
-  BENCHMARK_ERROR_MSG="unified Python env unavailable (need pydantic + pytest + pandas)"
-fi
-if [ -n "$BENCHMARK_ERROR_MSG" ]; then
-  record_required_failure "Python_BenchmarkTools" "$BENCHMARK_ERROR_MSG"
+if [ -n "$BENCHMARK_ERR" ]; then
+  record_required_failure "Python_BenchmarkTools" "$BENCHMARK_ERR"
 else
   echo "--- Python_BenchmarkTools ---"
   export PYTHONPATH="${PYTHON_DIR}:${PROJECT_ROOT}"
   pushd "$PROJECT_ROOT" > /dev/null
-  run_python "Python_BenchmarkTools" "$BENCHMARK_TEST" true
+  run_python_unittest "Python_BenchmarkTools" "test_scripts.data_intense.p0.benchmarks.test_benchmark_tools" true
   popd > /dev/null
 fi
 
