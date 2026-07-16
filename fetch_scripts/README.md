@@ -41,4 +41,4 @@ fetch_scripts/
 - `POST {base}/rag/records/mark-oss-uploaded` — 标记已上传
 - `POST {base}/rag/records/mark-vectorized` — 标记已向量化
 
-鉴权方式：`Authorization: Bearer <AF_RAG_INGEST_TOKEN>`
+鉴权方式：使用管理员用户名/密码调用 `/api/auth/login`，后续请求携带登录返回的 JWT。

@@ -65,8 +65,7 @@ class _RecorderSession:
 # ── 工具: 构造最小 Config + 替换 session ───────────────────────
 
 
-def _make_config(base_url: str = "http://localhost:8090",
-                 token: str = "tok123") -> Config:
+def _make_config(base_url: str = "http://localhost:8090") -> Config:
     return Config(
         service_base_url=base_url,
         jina_api_key="",
@@ -74,13 +73,15 @@ def _make_config(base_url: str = "http://localhost:8090",
         embedding_api_key="ek",
         embedding_model="m",
         embedding_dim=1024,
-        ingest_admin_token=token,
+        login_username="admin",
+        login_password="password",
     )
 
 
 def _patched_client(monkeypatch, response: _FakeResponse) -> DbClient:
     cfg = _make_config()
     client = DbClient(cfg)
+    client._jwt = "jwt123"
     recorder = _RecorderSession(response)
     client.session = recorder
     return client, recorder
@@ -264,25 +265,15 @@ def test_get_unprocessed_rejects_unknown_doc_type():
 # ── Bearer / 鉴权头 ──────────────────────────────────────────
 
 
-def test_post_includes_bearer_header_when_token_set(monkeypatch):
+def test_post_includes_admin_jwt_header(monkeypatch):
     body = {"docType": "announcement", "count": 0, "records": []}
     client, rec = _patched_client(monkeypatch, _FakeResponse(200, body))
 
     client.get_unprocessed_announcements()
 
     headers = rec.calls[0]["headers"]
-    assert headers["Authorization"] == "Bearer tok123"
+    assert headers["Authorization"] == "Bearer jwt123"
     assert headers["Content-Type"] == "application/json"
-
-
-def test_post_omits_authorization_header_when_token_blank(monkeypatch):
-    body = {"docType": "announcement", "count": 0, "records": []}
-    client, rec = _patched_client(monkeypatch, _FakeResponse(200, body))
-    client._admin_token = ""  # 模拟未配置 token (开发环境)
-
-    client.get_unprocessed_announcements()
-
-    assert "Authorization" not in rec.calls[0]["headers"]
 
 
 # ── 错误响应: 必须 raise 不吞错 ──────────────────────────────
@@ -290,6 +281,7 @@ def test_post_omits_authorization_header_when_token_blank(monkeypatch):
 
 def test_post_raises_on_4xx(monkeypatch):
     client = DbClient(_make_config())
+    client._jwt = "jwt123"
     client.session = _RecorderSession(_FakeResponse(400, {"error": "docType is required"}))
 
     with pytest.raises(RuntimeError, match="HTTP 400"):
@@ -298,6 +290,7 @@ def test_post_raises_on_4xx(monkeypatch):
 
 def test_post_raises_on_5xx(monkeypatch):
     client = DbClient(_make_config())
+    client._jwt = "jwt123"
     client.session = _RecorderSession(_FakeResponse(500, "boom"))
 
     with pytest.raises(RuntimeError, match="HTTP 500"):

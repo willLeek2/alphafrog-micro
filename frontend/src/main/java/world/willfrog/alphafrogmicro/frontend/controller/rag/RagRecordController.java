@@ -1,5 +1,6 @@
 package world.willfrog.alphafrogmicro.frontend.controller.rag;
 
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpEntity;
@@ -8,20 +9,19 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.security.core.Authentication;
-import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.client.RestTemplate;
+import world.willfrog.alphafrogmicro.frontend.service.AdminUserAccessService;
 
 import java.util.Map;
 
 /**
  * RAG 元数据查询 / 状态更新公网侧入口。
  *
- * <p>校验客户端 Bearer token（AF_RAG_INGEST_TOKEN），通过后将请求体
+ * <p>校验当前 JWT 主体为启用状态的管理员用户，通过后将请求体
  * 原样转发给 externalInfoService 内部 HTTP 端点，由其负责 DB 读写。
  *
  * <p>3 个转发端点（路径与外部接口完全对齐）：
@@ -33,11 +33,11 @@ import java.util.Map;
  */
 @RestController
 @RequestMapping("/rag/records")
+@RequiredArgsConstructor
 @Slf4j
 public class RagRecordController {
 
-    @Value("${alphafrog.rag.ingest.admin-token:}")
-    private String adminToken;
+    private final AdminUserAccessService adminUserAccessService;
 
     @Value("${alphafrog.rag.ingest.external-info-service-url:http://alphafrog-external-info-service:18096}")
     private String externalInfoServiceUrl;
@@ -53,30 +53,30 @@ public class RagRecordController {
 
     @PostMapping("/list-unprocessed")
     public ResponseEntity<?> listUnprocessed(
-            @RequestHeader(value = "Authorization", required = false) String authHeader,
+            Authentication authentication,
             @RequestBody Map<String, Object> body) {
-        return forward(authHeader, body, "/list-unprocessed", "listUnprocessed");
+        return forward(authentication, body, "/list-unprocessed", "listUnprocessed");
     }
 
     @PostMapping("/mark-oss-uploaded")
     public ResponseEntity<?> markOssUploaded(
-            @RequestHeader(value = "Authorization", required = false) String authHeader,
+            Authentication authentication,
             @RequestBody Map<String, Object> body) {
-        return forward(authHeader, body, "/mark-oss-uploaded", "markOssUploaded");
+        return forward(authentication, body, "/mark-oss-uploaded", "markOssUploaded");
     }
 
     @PostMapping("/mark-vectorized")
     public ResponseEntity<?> markVectorized(
-            @RequestHeader(value = "Authorization", required = false) String authHeader,
+            Authentication authentication,
             @RequestBody Map<String, Object> body) {
-        return forward(authHeader, body, "/mark-vectorized", "markVectorized");
+        return forward(authentication, body, "/mark-vectorized", "markVectorized");
     }
 
-    private ResponseEntity<?> forward(String authHeader, Map<String, Object> body,
+    private ResponseEntity<?> forward(Authentication authentication, Map<String, Object> body,
                                       String path, String opName) {
-        if (!isAuthorized(authHeader)) {
+        if (!adminUserAccessService.isActiveAdmin(authentication)) {
             log.warn("[RagRecordController] Unauthorized {} attempt", opName);
-            return ResponseEntity.status(401).body(Map.of("error", "Unauthorized"));
+            return ResponseEntity.status(403).body(Map.of("error", "Forbidden"));
         }
 
         String forwardUrl = externalInfoServiceUrl.stripTrailing() + "/rag/records" + path;
@@ -97,19 +97,4 @@ public class RagRecordController {
         }
     }
 
-    private boolean isAuthorized(String authHeader) {
-        // 如果已通过 Spring Security JWT 认证，直接放行
-        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
-        if (auth != null && auth.isAuthenticated()) {
-            return true;
-        }
-        // 否则回退到 admin token 检查（向后兼容）
-        if (adminToken == null || adminToken.isBlank()) {
-            return true;
-        }
-        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
-            return false;
-        }
-        return adminToken.equals(authHeader.substring(7));
-    }
 }

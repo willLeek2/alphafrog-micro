@@ -6,6 +6,7 @@ AK/SK 仅保存在服务端，本地脚本不再持有 OSS 凭证。
 import requests
 
 from config import Config
+from auth_client import get_admin_jwt
 
 
 def upload_doc(
@@ -30,7 +31,7 @@ def upload_doc(
         "content": content,
         "fileExtension": file_extension,
     }
-    headers = {"Authorization": f"Bearer {cfg.ingest_admin_token}"}
+    headers = {"Authorization": f"Bearer {get_admin_jwt(cfg)}"}
 
     url = cfg.service_base_url.rstrip("/") + "/rag/upload-doc"
     resp = requests.post(

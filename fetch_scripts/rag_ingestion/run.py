@@ -448,7 +448,7 @@ def dispatch_from_config(config_path: str, db: DbClient, cfg):
         # db 在 main() 里用原始 cfg 创建，需同步更新凭据
         db._login_username = cfg.login_username
         db._login_password = cfg.login_password
-        db._jwt_token = None
+        db._jwt = None
 
     if has_tasks:
         print(f"[run] 配置文件使用旧式 'tasks' 格式 (向后兼容)")

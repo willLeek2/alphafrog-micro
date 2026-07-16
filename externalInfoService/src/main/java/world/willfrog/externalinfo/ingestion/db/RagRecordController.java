@@ -16,7 +16,7 @@ import java.util.Map;
  * RAG 元数据查询 / 状态更新内部端点：接收 frontend 转发的请求，DB 读写。
  *
  * <p>此端点仅在 Docker 内网（alphafrog-network）可访问，18096 端口未对外暴露。
- * 鉴权由 frontend 层统一处理（AF_RAG_INGEST_TOKEN），此处直接信任来自内网的请求。
+ * 鉴权由 frontend 层统一校验管理员用户 JWT，此处直接信任来自内网的请求。
  *
  * <p>3 个端点：
  * <ul>

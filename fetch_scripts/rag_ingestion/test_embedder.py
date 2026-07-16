@@ -74,7 +74,8 @@ def _make_config(base_url: str = "https://openrouter.ai/api/v1",
         embedding_api_key="ek_test",
         embedding_model=model,
         embedding_dim=dim,
-        ingest_admin_token="t",
+        login_username="admin",
+        login_password="password",
         embedding_provider_order=provider_order if provider_order is not None else [],
     )
 

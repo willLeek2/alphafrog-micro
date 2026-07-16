@@ -36,8 +36,6 @@ af:
       config-refresh-interval-ms: ${AF_FETCH_JOBS_CONFIG_REFRESH_INTERVAL_MS:10000}
 
 alphafrog:
-  debug:
-    admin-token: ${ALPHAFROG_DEBUG_ADMIN_TOKEN:}
   config:
     nacos:
       enabled: ${AF_CONFIG_NACOS_ENABLED:false}

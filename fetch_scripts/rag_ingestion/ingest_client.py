@@ -6,6 +6,7 @@ from typing import List
 import httpx
 
 from config import Config
+from auth_client import get_admin_jwt
 
 
 def ingest_vectors(
@@ -22,7 +23,7 @@ def ingest_vectors(
     """
     url = cfg.service_base_url.rstrip("/") + "/rag/ingest"
     headers = {
-        "Authorization": f"Bearer {cfg.ingest_admin_token}",
+        "Authorization": f"Bearer {get_admin_jwt(cfg)}",
         "Content-Type": "application/json",
     }
     payload = {

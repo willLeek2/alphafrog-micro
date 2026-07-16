@@ -10,11 +10,9 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.client.RestClientException;
-import world.willfrog.alphafrogmicro.common.dao.user.UserDao;
-import world.willfrog.alphafrogmicro.common.pojo.user.User;
+import world.willfrog.alphafrogmicro.frontend.service.AdminUserAccessService;
 import world.willfrog.alphafrogmicro.frontend.service.debug.DomesticMarketSampleClient;
 
-import java.util.List;
 import java.util.Map;
 import java.util.function.Supplier;
 
@@ -22,7 +20,7 @@ import java.util.function.Supplier;
  * 管理员随机抽样 facade。
  *
  * <p>{@code /admin/**} 先由 JWT 过滤器认证，本控制器再校验账户类型与状态，
- * 然后通过内部共享密钥访问 domestic-fetch。</p>
+ * 然后通过仅在容器网络开放的 HTTP 接口访问 domestic-fetch。</p>
  */
 @RestController
 @RequestMapping("/admin/debug/market-samples")
@@ -30,10 +28,7 @@ import java.util.function.Supplier;
 @Slf4j
 public class AdminMarketSampleController {
 
-    private static final int ADMIN_USER_TYPE = 1127;
-    private static final String STATUS_ACTIVE = "ACTIVE";
-
-    private final UserDao userDao;
+    private final AdminUserAccessService adminUserAccessService;
     private final DomesticMarketSampleClient marketSampleClient;
 
     @GetMapping("/index-constituents/random")
@@ -80,7 +75,7 @@ public class AdminMarketSampleController {
     }
 
     private ResponseEntity<?> adminCall(Authentication authentication, Supplier<?> action) {
-        if (!isAdmin(authentication)) {
+        if (!adminUserAccessService.isActiveAdmin(authentication)) {
             return ResponseEntity.status(HttpStatus.FORBIDDEN)
                     .body(Map.of("error", "Forbidden"));
         }
@@ -97,20 +92,4 @@ public class AdminMarketSampleController {
         }
     }
 
-    private boolean isAdmin(Authentication authentication) {
-        if (authentication == null || !authentication.isAuthenticated()) {
-            return false;
-        }
-        List<User> users = userDao.getUserByUsername(authentication.getName());
-        if (users == null || users.isEmpty()) {
-            return false;
-        }
-        User user = users.get(0);
-        Integer userType = user.getUserType();
-        if (userType == null || userType != ADMIN_USER_TYPE) {
-            return false;
-        }
-        String status = user.getStatus();
-        return status != null && STATUS_ACTIVE.equalsIgnoreCase(status.trim());
-    }
 }

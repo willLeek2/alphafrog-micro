@@ -4,7 +4,6 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.http.HttpEntity;
-import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
@@ -19,7 +18,8 @@ import java.util.Map;
 /**
  * frontend 到 domestic-fetch 随机抽样接口的内部客户端。
  *
- * <p>外部调用者只提交正常登录得到的 JWT；内部共享密钥不会暴露给脚本或浏览器。</p>
+ * <p>外部调用者只提交正常登录得到的 JWT。管理员校验由 frontend 完成，
+ * domestic-fetch 端口仅在容器网络内开放。</p>
  */
 @Service
 public class DomesticMarketSampleClient {
@@ -33,20 +33,17 @@ public class DomesticMarketSampleClient {
 
     private final RestTemplate restTemplate;
     private final String baseUrl;
-    private final String internalAdminToken;
 
     @Autowired
     public DomesticMarketSampleClient(
             @Value("${alphafrog.domestic-fetch.debug-base-url:http://domestic-fetch-service:18082}")
-            String baseUrl,
-            @Value("${alphafrog.domestic-fetch.debug-admin-token:}") String internalAdminToken) {
-        this(buildRestTemplate(), baseUrl, internalAdminToken);
+            String baseUrl) {
+        this(buildRestTemplate(), baseUrl);
     }
 
-    DomesticMarketSampleClient(RestTemplate restTemplate, String baseUrl, String internalAdminToken) {
+    DomesticMarketSampleClient(RestTemplate restTemplate, String baseUrl) {
         this.restTemplate = restTemplate;
         this.baseUrl = normalizeBaseUrl(baseUrl);
-        this.internalAdminToken = internalAdminToken == null ? "" : internalAdminToken.trim();
     }
 
     public List<Map<String, Object>> randomIndexConstituents(
@@ -106,13 +103,8 @@ public class DomesticMarketSampleClient {
     }
 
     private <T> T exchange(URI uri, ParameterizedTypeReference<T> type) {
-        if (internalAdminToken.isBlank()) {
-            throw new IllegalStateException("domestic-fetch debug internal token is not configured");
-        }
-        HttpHeaders headers = new HttpHeaders();
-        headers.set("X-Admin-Token", internalAdminToken);
         ResponseEntity<T> response = restTemplate.exchange(
-                uri, HttpMethod.GET, new HttpEntity<>(headers), type);
+                uri, HttpMethod.GET, HttpEntity.EMPTY, type);
         T body = response.getBody();
         if (body == null) {
             throw new IllegalStateException("domestic-fetch debug endpoint returned an empty body");

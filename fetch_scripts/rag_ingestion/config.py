@@ -18,13 +18,8 @@ class Config:
     embedding_model: str
     embedding_dim: int
 
-    # frontend Bearer token（对应 Java 侧 alphafrog.rag.ingest.admin-token，
-    # 通常从环境变量 AF_RAG_INGEST_TOKEN 同步过来）
-    # 注意：/rag/records/* 端点现在需要 JWT 登录，admin-token 仅用于 /rag/ingest 和 /rag/upload-doc
-    ingest_admin_token: str
-
-    # 登录凭据（用于 /api/auth/login 获取 JWT token）
-    # /rag/records/* 端点需要 JWT 鉴权（Spring Security），不再接受纯 admin-token
+    # 管理员登录凭据（用于 /api/auth/login 获取 JWT）
+    # 所有 RAG 管理端点只接受管理员用户 JWT。
     login_username: str = ""
     login_password: str = ""
 
@@ -61,12 +56,8 @@ def load_config() -> Config:
             os.environ.get("EMBEDDING_PROVIDER_ORDER", "")
         ),
 
-        ingest_admin_token=os.environ.get("INGEST_ADMIN_TOKEN", ""),
-
-        # 登录凭据（/rag/records/* 需要 JWT 鉴权）
-        # 不再从 env 读取；由 YAML 全局 auth 块覆盖
-        login_username="",
-        login_password="",
+        login_username=os.environ.get("ALPHAFROG_ADMIN_USERNAME", ""),
+        login_password=os.environ.get("ALPHAFROG_ADMIN_PASSWORD", ""),
 
         # OCR 相关（可选，当前不使用）
         pdf_parser_provider=os.environ.get("PDF_PARSER_PROVIDER", ""),
@@ -106,7 +97,6 @@ def config_with_embedding_override(cfg: Config, emb: dict) -> Config:
         embedding_api_key=emb.get("api_key") or cfg.embedding_api_key,
         embedding_model=emb.get("model") or cfg.embedding_model,
         embedding_dim=int(emb.get("dim") or cfg.embedding_dim),
-        ingest_admin_token=cfg.ingest_admin_token,
         login_username=cfg.login_username,
         login_password=cfg.login_password,
         pdf_parser_provider=cfg.pdf_parser_provider,
@@ -137,7 +127,6 @@ def config_with_auth_override(cfg: Config, auth: dict) -> Config:
         embedding_api_key=cfg.embedding_api_key,
         embedding_model=cfg.embedding_model,
         embedding_dim=cfg.embedding_dim,
-        ingest_admin_token=cfg.ingest_admin_token,
         login_username=auth.get("username") or cfg.login_username,
         login_password=auth.get("password") or cfg.login_password,
         pdf_parser_provider=cfg.pdf_parser_provider,

@@ -154,7 +154,7 @@ public class AdminFetchJobExpansionService {
         Set<String> skipKeys = Set.of("task_name", "task_type", "task_sub_type", "task_subtype", "taskSubType",
                 "task_set_sub_type", "task_params", "trade_dates", "date_range",
                 "task_set_mode", "expand_mode", "offset_range", "offset_start", "offset_end", "offset_step",
-                "ingest_token", "execution_options");
+                "execution_options");
         for (Map.Entry<String, Object> entry : rawTask.entrySet()) {
             if (skipKeys.contains(entry.getKey())) continue;
             if (!baseParams.containsKey(entry.getKey())) {
@@ -499,7 +499,7 @@ public class AdminFetchJobExpansionService {
         @SuppressWarnings("unchecked")
         Map<String, Object> taskParams = raw.get("task_params") == null ? new LinkedHashMap<>() : new LinkedHashMap<>((Map<String, Object>) raw.get("task_params"));
 
-        Set<String> skipKeys = Set.of("task_name", "task_type", "task_sub_type", "task_subtype", "taskSubType", "task_params", "ingest_token", "execution_options");
+        Set<String> skipKeys = Set.of("task_name", "task_type", "task_sub_type", "task_subtype", "taskSubType", "task_params", "execution_options");
         for (Map.Entry<String, Object> entry : raw.entrySet()) {
             if (skipKeys.contains(entry.getKey())) continue;
             if (!taskParams.containsKey(entry.getKey())) {

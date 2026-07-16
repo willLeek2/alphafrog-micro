@@ -7,8 +7,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.Authentication;
-import world.willfrog.alphafrogmicro.common.dao.user.UserDao;
-import world.willfrog.alphafrogmicro.common.pojo.user.User;
+import world.willfrog.alphafrogmicro.frontend.service.AdminUserAccessService;
 import world.willfrog.alphafrogmicro.frontend.service.debug.DomesticMarketSampleClient;
 
 import java.util.List;
@@ -24,7 +23,7 @@ import static org.mockito.Mockito.when;
 class AdminMarketSampleControllerTest {
 
     @Mock
-    private UserDao userDao;
+    private AdminUserAccessService adminUserAccessService;
     @Mock
     private DomesticMarketSampleClient marketSampleClient;
 
@@ -32,14 +31,13 @@ class AdminMarketSampleControllerTest {
 
     @BeforeEach
     void setUp() {
-        controller = new AdminMarketSampleController(userDao, marketSampleClient);
+        controller = new AdminMarketSampleController(adminUserAccessService, marketSampleClient);
     }
 
     @Test
     void adminAccountCanFetchRandomIndexNames() {
         Authentication authentication = authentication("admin");
-        User user = user(1127, "ACTIVE");
-        when(userDao.getUserByUsername("admin")).thenReturn(List.of(user));
+        when(adminUserAccessService.isActiveAdmin(authentication)).thenReturn(true);
         when(marketSampleClient.randomIndexNamesByAmount(
                 "20250101", "20251231", 100000, 2))
                 .thenReturn(List.of(Map.of("tsCode", "000300.SH", "name", "沪深300")));
@@ -55,8 +53,7 @@ class AdminMarketSampleControllerTest {
     @Test
     void adminAccountCanFetchRandomStocksAndEtfs() {
         Authentication authentication = authentication("admin-assets");
-        when(userDao.getUserByUsername("admin-assets"))
-                .thenReturn(List.of(user(1127, "ACTIVE")));
+        when(adminUserAccessService.isActiveAdmin(authentication)).thenReturn(true);
         when(marketSampleClient.randomListedStocks(1))
                 .thenReturn(List.of(Map.of("tsCode", "600519.SH", "name", "贵州茅台")));
         when(marketSampleClient.randomListedEtfs(1))
@@ -74,7 +71,7 @@ class AdminMarketSampleControllerTest {
     @Test
     void normalAccountIsRejectedBeforeCallingUpstream() {
         Authentication authentication = authentication("normal");
-        when(userDao.getUserByUsername("normal")).thenReturn(List.of(user(1, "ACTIVE")));
+        when(adminUserAccessService.isActiveAdmin(authentication)).thenReturn(false);
 
         ResponseEntity<?> response = controller.randomSwL3Industries(authentication, 2);
 
@@ -93,8 +90,7 @@ class AdminMarketSampleControllerTest {
     @Test
     void disabledAdminAccountIsRejected() {
         Authentication authentication = authentication("disabled-admin");
-        when(userDao.getUserByUsername("disabled-admin"))
-                .thenReturn(List.of(user(1127, "DISABLED")));
+        when(adminUserAccessService.isActiveAdmin(authentication)).thenReturn(false);
 
         ResponseEntity<?> response = controller.randomSwL3Industries(authentication, 1);
 
@@ -104,8 +100,7 @@ class AdminMarketSampleControllerTest {
     @Test
     void adminAccountWithoutExplicitStatusIsRejected() {
         Authentication authentication = authentication("statusless-admin");
-        when(userDao.getUserByUsername("statusless-admin"))
-                .thenReturn(List.of(user(1127, null)));
+        when(adminUserAccessService.isActiveAdmin(authentication)).thenReturn(false);
 
         ResponseEntity<?> response = controller.randomSwL3Industries(authentication, 1);
 
@@ -116,8 +111,7 @@ class AdminMarketSampleControllerTest {
     @Test
     void adminAccountWithBlankStatusIsRejected() {
         Authentication authentication = authentication("blank-status-admin");
-        when(userDao.getUserByUsername("blank-status-admin"))
-                .thenReturn(List.of(user(1127, "  ")));
+        when(adminUserAccessService.isActiveAdmin(authentication)).thenReturn(false);
 
         ResponseEntity<?> response = controller.randomSwL3Industries(authentication, 1);
 
@@ -126,16 +120,7 @@ class AdminMarketSampleControllerTest {
     }
 
     private Authentication authentication(String username) {
-        Authentication authentication = mock(Authentication.class);
-        when(authentication.isAuthenticated()).thenReturn(true);
-        when(authentication.getName()).thenReturn(username);
-        return authentication;
+        return mock(Authentication.class, username);
     }
 
-    private User user(int userType, String status) {
-        User user = new User();
-        user.setUserType(userType);
-        user.setStatus(status);
-        return user;
-    }
 }

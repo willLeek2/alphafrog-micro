@@ -10,8 +10,6 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.springframework.test.web.client.match.MockRestRequestMatchers.header;
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.method;
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.requestTo;
 import static org.springframework.test.web.client.response.MockRestResponseCreators.withSuccess;
@@ -19,17 +17,16 @@ import static org.springframework.test.web.client.response.MockRestResponseCreat
 class DomesticMarketSampleClientTest {
 
     @Test
-    void forwardsRequestWithInternalToken() {
+    void forwardsRequestInsideContainerNetwork() {
         RestTemplate restTemplate = new RestTemplate();
         MockRestServiceServer server = MockRestServiceServer.bindTo(restTemplate).build();
         DomesticMarketSampleClient client = new DomesticMarketSampleClient(
-                restTemplate, "http://domestic-fetch-service:18082", "internal-secret");
+                restTemplate, "http://domestic-fetch-service:18082");
 
         server.expect(requestTo(
                         "http://domestic-fetch-service:18082/debug/index-names/random-by-amount"
                                 + "?start_date=20250101&end_date=20251231&min_amount=100000.0&count=2"))
                 .andExpect(method(HttpMethod.GET))
-                .andExpect(header("X-Admin-Token", "internal-secret"))
                 .andRespond(withSuccess(
                         "[{\"tsCode\":\"000300.SH\",\"name\":\"沪深300\"}]",
                         MediaType.APPLICATION_JSON));
@@ -43,26 +40,16 @@ class DomesticMarketSampleClientTest {
     }
 
     @Test
-    void missingInternalTokenFailsClosedBeforeHttpCall() {
-        DomesticMarketSampleClient client = new DomesticMarketSampleClient(
-                new RestTemplate(), "http://domestic-fetch-service:18082", "");
-
-        assertThrows(IllegalStateException.class, () -> client.randomSwL3Industries(1));
-    }
-
-    @Test
-    void forwardsRandomStockAndEtfRequestsWithInternalToken() {
+    void forwardsRandomStockAndEtfRequestsInsideContainerNetwork() {
         RestTemplate restTemplate = new RestTemplate();
         MockRestServiceServer server = MockRestServiceServer.bindTo(restTemplate).build();
         DomesticMarketSampleClient client = new DomesticMarketSampleClient(
-                restTemplate, "http://domestic-fetch-service:18082", "internal-secret");
+                restTemplate, "http://domestic-fetch-service:18082");
         server.expect(requestTo("http://domestic-fetch-service:18082/debug/stocks/random?count=2"))
-                .andExpect(header("X-Admin-Token", "internal-secret"))
                 .andRespond(withSuccess(
                         "[{\"tsCode\":\"600519.SH\",\"name\":\"贵州茅台\"}]",
                         MediaType.APPLICATION_JSON));
         server.expect(requestTo("http://domestic-fetch-service:18082/debug/etfs/random?count=2"))
-                .andExpect(header("X-Admin-Token", "internal-secret"))
                 .andRespond(withSuccess(
                         "[{\"tsCode\":\"510300.SH\",\"name\":\"沪深300ETF\"}]",
                         MediaType.APPLICATION_JSON));
