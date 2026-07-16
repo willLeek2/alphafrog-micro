@@ -424,21 +424,27 @@ public class PythonSandboxTools {
             ExecuteRequest baseRequest,
             int timeoutSeconds,
             long toolStartMs) throws Exception {
+        // toolCallId 来自当前 Todo 的 AgentContext，是跨 worker 恢复的稳定逻辑调用身份。
         String toolCallId = AgentContext.getToolCallId();
         if (toolCallId == null || toolCallId.isBlank()) {
             return fail("executePython", "TOOL_JOB_IDENTITY_UNAVAILABLE",
                     "executePython requires a stable tool call id", Map.of("run_id", runId));
         }
+        // 当前 durable executePython 首次调用从 attempt=1 开始；后续重试必须使用新轮次。
         int attempt = 1;
+        // operationId 由 runId/toolCallId/attempt 确定性派生，Sandbox create 可据此幂等查找。
         DataAnalysisOperationIdentity identity = new DataAnalysisOperationIdentity(
                 runId, toolCallId, attempt);
 
+        // estimate 同时用于准入、reservation 和终态 release proof，必须在分发前冻结。
         DataAnalysisEstimate estimate;
         DataAnalysisCapacityProperties.DataAnalysisResourceClassDecision decision;
         try {
+            // 聚合所有输入数据集的行数与字节数，不能只看用户传入的逻辑数量。
             long rows = 0L;
             long bytes = 0L;
             for (AgentRunDatasetEntry dataset : datasets) {
+                // metadata 不完整时 fail-closed，避免低估资源后超卖 Sandbox。
                 DatasetEntryMetadataReader.EntryMetadata metadata = metadataReader.read(dataset);
                 if (metadata.rowCount() == null || metadata.bytes() == null) {
                     return fail("executePython", "DATA_ANALYSIS_ESTIMATE_UNAVAILABLE",
@@ -452,6 +458,7 @@ public class PythonSandboxTools {
             int manifestMembers = manifests.stream()
                     .mapToInt(entry -> entry.relatedDatasetIds().size())
                     .sum();
+            // 按冻结配置把任务分类为资源档位和 capacity units。
             decision = dataAnalysisCapacityProperties.classify(
                     rows, bytes, baseRequest.getLibrariesList());
             if (decision.outcome()
@@ -460,6 +467,7 @@ public class PythonSandboxTools {
                         "Dataset estimate exceeds Sandbox hard limits",
                         Map.of("estimated_rows", rows, "estimated_bytes", bytes));
             }
+            // 构造 immutable estimate，后续写入 anchor 并在 finalizer 再使用。
             estimate = new DataAnalysisEstimate(
                     rows, bytes, datasets.size(), 1.0d, manifestMembers, List.of(),
                     decision.resourceClass(), decision.capacityUnits());
@@ -468,8 +476,10 @@ public class PythonSandboxTools {
                     "Dataset estimate overflowed admission counters", Map.of());
         }
 
+        // reservation 是实际容量所有权；取得后任何退出路径都必须释放或转交 pending。
         DataAnalysisReservation reservation;
         try {
+            // reserve 在容量账本中创建 PREPARING 状态，可能因服务繁忙拒绝。
             reservation = dataAnalysisCapacityService.reserve(identity, estimate);
         } catch (CapacityAdmissionException admission) {
             String code = admission.reason() == CapacityAdmissionException.Reason.TASK_TOO_LARGE
@@ -479,7 +489,9 @@ public class PythonSandboxTools {
                     admission.reason() != CapacityAdmissionException.Reason.TASK_TOO_LARGE));
         }
 
+        // timeout 同时用于 Sandbox 任务和 anchor 的最大等待期限。
         long timeoutMillis = timeoutSeconds * 1000L;
+        // canonical spec 冻结代码、数据、依赖、资源和运行时版本，用于幂等 fingerprint。
         CanonicalSandboxCreateSpec spec = new CanonicalSandboxCreateSpec(
                 CanonicalSandboxCreateSpec.CURRENT_SCHEMA_VERSION,
                 identity.operationId(),
@@ -491,6 +503,7 @@ public class PythonSandboxTools {
                 runtimeEnvironmentVersion,
                 sha256(baseRequest.getLibrariesList().stream().sorted().collect(Collectors.joining("\n"))),
                 sha256(""));
+        // 把准入结果与 canonical identity 写入真正发送给 Sandbox 的请求。
         ExecuteRequest request = baseRequest.toBuilder()
                 .setResourceClass(reservation.resourceClass().name())
                 .setEstimatedRows(estimate.estimatedRows())
@@ -509,38 +522,50 @@ public class PythonSandboxTools {
                 .setSandboxOptionsDigest(spec.sandboxOptionsDigest())
                 .build();
 
+        // 在调用 createTask 之前先构造完整 PREPARING anchor，覆盖 RPC 成败不确定窗口。
         ToolJobAnchor anchor = new ToolJobAnchor();
+        // 幂等操作身份与请求指纹用于启动恢复查询/重放。
         anchor.setOperationId(identity.operationId());
         anchor.setRequestFingerprint(spec.requestFingerprint());
         anchor.setCanonicalCreateSpecJson(objectMapper.writeValueAsString(spec));
+        // createRequestJson 允许进程在 RPC 前后崩溃后重放同一 canonical 请求。
         anchor.setCreateRequestJson(JsonFormat.printer()
                 .omittingInsignificantWhitespace().print(request));
+        // PREPARING 表示容量已占用，但 Sandbox taskId 尚未确认附着。
         anchor.setAnchorState("PREPARING");
         anchor.setToolCallId(toolCallId);
         anchor.setAttempt(attempt);
+        // 保存当前 Todo 位置，后续 pipeline 完整 checkpoint 会补充已完成前缀。
         anchor.setTodoId(AgentContext.getTodoId());
         anchor.setSequence(AgentContext.getTodoSequence() == null ? 0 : AgentContext.getTodoSequence());
         anchor.setRunDisposition("AUTO_RESUME");
         anchor.setAutoResume(true);
+        // reservation/estimate/dataset snapshot 都先写 anchor，确保旧 worker 退出前真相完整。
         anchor.setReservationJson(objectMapper.writeValueAsString(reservation));
         anchor.setEstimateJson(objectMapper.writeValueAsString(estimate));
         anchor.setDatasetSnapshotJson(objectMapper.writeValueAsString(datasetSnapshot));
         anchor.setDatasetSnapshotDigest(datasetSnapshot.immutableDigest());
+        // timeoutAt 和 nextPollAt 都是 durable 时间，重启后不重新计时。
         anchor.setTimeoutAt(Instant.now().plusMillis(timeoutMillis));
         anchor.setNextPollAt(Instant.now().plusMillis(POLL_INTERVAL_MS));
 
+        // 必须先 CAS 占有空 anchor，再调用有副作用的 createTask。
         if (!pythonSandboxDispatchStore.persistPreparing(runId, anchor)) {
+            // 未取得 anchor owner 时释放尚未转交的容量。
             releasePreDispatch(reservation);
             return fail("executePython", "TOOL_JOB_ANCHOR_INVALID",
                     "Failed to persist PREPARING tool-job anchor", Map.of("operation_id", identity.operationId()));
         }
 
+        // createResp 可能来自首次 RPC，也可能来自 operationId 灾后查询。
         ExecuteResponse createResp;
         try {
             installDebugRpcAttachments();
+            // Sandbox 必须按 operationId/requestFingerprint 幂等创建。
             createResp = pythonSandboxService.createTask(request);
         } catch (Exception createFailure) {
             try {
+                // RPC 异常不代表服务端未创建；先按 operationId 查找，禁止立即重建第二任务。
                 GetTaskByOperationIdResponse lookup = pythonSandboxService.getTaskByOperationId(
                         GetTaskByOperationIdRequest.newBuilder()
                                 .setOperationId(identity.operationId()).build());
@@ -548,16 +573,19 @@ public class PythonSandboxTools {
                         && !lookup.getTaskId().isBlank()
                         && (lookup.getRequestFingerprint().isBlank()
                                 || spec.requestFingerprint().equals(lookup.getRequestFingerprint()))) {
+                    // 找到相同 fingerprint 的任务时，把查询结果转换成正常 createResp 继续附着。
                     createResp = ExecuteResponse.newBuilder()
                             .setTaskId(lookup.getTaskId())
                             .setRequestFingerprint(spec.requestFingerprint())
                             .build();
                 } else if (lookup != null && !lookup.getFound()) {
+                    // 明确未创建时才释放 PREPARING reservation 并清理当前 operation anchor。
                     if (releasePreDispatch(reservation)) {
                         pythonSandboxDispatchStore.clearActive(runId, identity.operationId());
                     }
                     throw createFailure;
                 } else {
+                    // 查询也无法证明结果时保留 PREPARING，交给 startup recovery 决定，不能猜测释放。
                     throw new IllegalStateException(
                             "createTask outcome is ambiguous; PREPARING anchor retained", createFailure);
                 }
@@ -568,6 +596,7 @@ public class PythonSandboxTools {
                 throw createFailure;
             }
         }
+        // create 响应必须包含无错误的 taskId，否则在确认释放成功后清 active anchor。
         if (createResp == null || createResp.getError() != null && !createResp.getError().isEmpty()
                 || createResp.getTaskId() == null || createResp.getTaskId().isBlank()) {
             if (releasePreDispatch(reservation)) {
@@ -577,16 +606,20 @@ public class PythonSandboxTools {
                     "Failed to create python sandbox task",
                     Map.of("message", createResp == null ? "empty response" : nvl(createResp.getError())));
         }
+        // taskId 确认后把 reservation 从 PREPARING 转为 TASK_ATTACHED。
         String taskId = createResp.getTaskId();
         reservation = transitionReservation(reservation, DataAnalysisReservationState.TASK_ATTACHED, taskId);
+        // 容量账本必须接受同一 reservation 的附着状态，冲突时停止推进。
         if (dataAnalysisCapacityService.restoreReservation(reservation) == DataAnalysisRestoreOutcome.CONFLICT) {
             throw new IllegalStateException("capacity reservation attachment conflicted for task=" + taskId);
         }
+        // taskId、ATTACHED 和 reservation 状态一起落入 durable anchor。
         anchor.setTaskId(taskId);
         anchor.setAnchorState("ATTACHED");
         anchor.setReservationJson(objectMapper.writeValueAsString(reservation));
         pythonSandboxDispatchStore.persistAttached(runId, anchor);
 
+        // Sandbox 回传 fingerprint 漂移时不能同步消费结果，转 durable pending 等待安全审计/恢复。
         if (!createResp.getRequestFingerprint().isBlank()
                 && !spec.requestFingerprint().equals(createResp.getRequestFingerprint())) {
             log.error("Sandbox response fingerprint mismatch for run={}, operationId={}, taskId={}; "
@@ -595,14 +628,18 @@ public class PythonSandboxTools {
             return suspend(runId, anchor, reservation, taskId);
         }
 
+        // 只在极短 fast-path 窗口内同步轮询；超过窗口就让出 Agent worker。
         long fastDeadline = System.currentTimeMillis() + Math.max(1L, fastPathMs);
         while (System.currentTimeMillis() < fastDeadline) {
+            // 状态查询短而轻量，终态时再拉取结果体。
             TaskStatusResponse statusResp = getTaskStatus(taskId);
             String status = statusResp == null ? "" : nvl(statusResp.getStatus());
             if (isTerminal(status)) {
+                // 快速完成也要校验终态结果的任务身份和状态。
                 TaskResultResponse result = fetchTerminalResult(runId, taskId, status);
                 if (result != null && result.hasRetryable()) {
                     try {
+                        // 同步路径完成 envelope/release/usage 后才直接向模型返回 output。
                         String completed = completeSynchronously(
                                 runId, identity, estimate, reservation, anchor, status, result);
                         if (completed != null) {
@@ -615,10 +652,13 @@ public class PythonSandboxTools {
                                 runId, taskId, terminalFailure.getMessage());
                     }
                 }
+                // 任一步不能安全同步完成时转 durable pending，由共享 finalizer 重入。
                 return suspend(runId, anchor, reservation, taskId);
             }
+            // 每次最多睡 100ms，并且不越过 fastDeadline。
             TimeUnit.MILLISECONDS.sleep(Math.min(100L, Math.max(1L, fastDeadline - System.currentTimeMillis())));
         }
+        // fast-path 到期：后台任务继续，当前 Run 进入上下文切换。
         return suspend(runId, anchor, reservation, taskId);
     }
 
@@ -699,22 +739,31 @@ public class PythonSandboxTools {
             ToolJobAnchor anchor,
             DataAnalysisReservation current,
             String taskId) throws Exception {
+        // 同步终态尝试可能已经推进 reservation；优先以 anchor 中的 durable 快照为准。
         if (anchor.getReservationJson() != null && !anchor.getReservationJson().isBlank()) {
             current = objectMapper.readValue(anchor.getReservationJson(), DataAnalysisReservation.class);
         }
+        // 只有 TASK_ATTACHED 需要转 PENDING_TRANSFERRED；已更靠后的状态保持原样以支持重入。
         DataAnalysisReservation pending = current.state() == DataAnalysisReservationState.TASK_ATTACHED
                 ? transitionReservation(current, DataAnalysisReservationState.PENDING_TRANSFERRED, taskId)
                 : current;
+        // 把容量所有权从当前同步调用转交给后台 pending 生命周期。
         if (current.state() == DataAnalysisReservationState.TASK_ATTACHED
                 && dataAnalysisCapacityService.restoreReservation(pending) == DataAnalysisRestoreOutcome.CONFLICT) {
+            // 转交冲突时绝不能释放 worker，否则容量/任务可能失去 owner。
             throw new IllegalStateException("capacity transfer to pending conflicted");
         }
+        // 在内存 anchor 中写明后台 pending 与最新 reservation 快照。
         anchor.setAnchorState("PENDING");
         anchor.setReservationJson(objectMapper.writeValueAsString(pending));
+        // 安排第一次后台轮询，时间会同时写入 DB 与 Redis due ZSET。
         anchor.setNextPollAt(Instant.now().plusMillis(POLL_INTERVAL_MS));
+        // 单条 CAS 原子完成 anchor 更新和 Run EXECUTING→WAITING_TOOL_JOB。
         if (!pythonSandboxDispatchStore.transferToPending(runId, anchor)) {
+            // durable transfer 失败时不抛 pending 控制信号，防止上层释放 worker。
             throw new IllegalStateException("durable transfer to WAITING_TOOL_JOB failed");
         }
+        // 到这里后台任务、容量 owner 和 Run 状态都已持久化，可以安全展开栈并让出 worker。
         throw new ExternalToolJobPendingException(
                 runId, anchor.getToolCallId(), anchor.getAttempt(),
                 "Python Sandbox task continues in background: " + taskId);

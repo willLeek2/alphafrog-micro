@@ -268,8 +268,10 @@ public class LangchainTodoNodeExecutor {
             DatasetRefRegistry.registerFromJson(trimmed, datasetRefs);
             return LangchainTodoNodeResult.success(trimmed, Math.max(0, toolCalls.get() - callsBefore));
         } catch (Exception e) {
+            // LangChain4j 可能把工具异常包进多层运行时异常，先沿 cause 链查找 pending 信号。
             ExternalToolJobPendingException pending = findPending(e);
             if (pending != null) {
+                // 转成结构化 suspended 结果而不是失败；LINEAR executor 会停止当前 Todo 循环。
                 return LangchainTodoNodeResult.suspended(pending);
             }
             // ensureRunnable 抛出的 RUN_INTERRUPTED 异常、tool loop 内的工具异常、LLM 超时等都会在这里捕获，
@@ -285,13 +287,17 @@ public class LangchainTodoNodeExecutor {
     }
 
     private ExternalToolJobPendingException findPending(Throwable throwable) {
+        // 从最外层异常开始；不同 LC4j 版本的包装层数可能不同。
         Throwable current = throwable;
         while (current != null) {
+            // 一旦找到原始 pending 对象，直接返回以保留不可变任务身份。
             if (current instanceof ExternalToolJobPendingException pending) {
                 return pending;
             }
+            // 继续检查 cause；不依赖异常 message 做脆弱的字符串判断。
             current = current.getCause();
         }
+        // cause 链中不存在 pending，调用方按真正失败处理。
         return null;
     }
 

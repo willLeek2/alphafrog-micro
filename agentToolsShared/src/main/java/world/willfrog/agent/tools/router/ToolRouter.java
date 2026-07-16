@@ -636,6 +636,29 @@ public class ToolRouter {
                 default -> unsupported(toolName);
             };
         } catch (ExternalToolJobPendingException pending) {
+            // pending 是跨层控制信号，不是可缓存的工具失败结果。
+            // PythonSandboxTools 在抛出前已经把后台任务、reservation 与 WAITING_TOOL_JOB handoff
+            // 持久化；这里必须原样重抛，使 LangChain executor 能构造 suspended result 并让旧 worker
+            // 退出。若落入下面的通用 Exception 分支，信号会被改写成 JSON，旧执行链将错误地继续。
+            //
+            // 此处分层的完整因果链如下：
+            // 1. PythonSandboxTools 已经取得 operationId，并在 createTask 前抢占 PREPARING anchor；
+            // 2. Sandbox 接受后台任务后，anchor 记录 taskId、estimate 与 reservation；
+            // 3. fast-path 未得到终态时，单条 CAS 同时写 PENDING anchor 与 WAITING_TOOL_JOB；
+            // 4. 只有上述 CAS 成功，工具层才构造这个 pending 异常；
+            // 5. 当前 router 原样透传，禁止生成 ToolExecutionOutcome；
+            // 6. 上层 todo executor 捕获稳定身份并返回 suspended workflow result；
+            // 7. pipeline 保存 plan、completedTodos、dataset snapshot 与工具预算检查点；
+            // 8. scheduler 的 Runnable finally 最终归还 Agent worker；
+            // 9. terminal webhook/reconciler 后续独立接管结果并创建恢复租约；
+            // 10. resume launcher 重新经过同一个有界 scheduler 获取新 worker。
+            //
+            // 因此这里还刻意不做四件事：
+            // - 不记录普通失败指标，pending 并未失败；
+            // - 不写工具结果缓存，当前没有 terminal result；
+            // - 不清理 anchor，清理权属于带 token/version 的恢复消费者；
+            // - 不释放 Sandbox reservation，它会在 finalizer 确认终态后准确释放。
+            // 任一“方便的统一异常处理”都会破坏上述 durable handoff 顺序。
             throw pending;
         } catch (Exception e) {
             // 任意工具实现抛出的异常都收敛为标准失败 JSON，避免对 LLM 暴露 Java 异常信息

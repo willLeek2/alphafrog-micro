@@ -308,6 +308,10 @@
           AND status = #{expectedStatus}
     </update>
 
+    <!--
+        首次分发的所有权获取：只有 Run 状态匹配且 anchor 仍为空时才写 PREPARING。
+        两个 worker 并发创建同一工具任务时，最多一个 UPDATE 命中，另一个必须重读。
+    -->
     <update id="claimPreparingToolJobAnchor">
         UPDATE alphafrog_agent_run
         SET tool_job_anchor_json = CAST(#{toolJobAnchorJson} AS jsonb),
@@ -317,6 +321,10 @@
           AND (tool_job_anchor_json IS NULL OR tool_job_anchor_json = '{}'::jsonb)
     </update>
 
+    <!--
+        PREPARING 之后的每次推进都绑定 operationId。
+        旧 operation 的迟到回调即使 Run 状态相同，也无法覆盖新 dispatch。
+    -->
     <update id="updateActiveToolJobAnchor">
         UPDATE alphafrog_agent_run
         SET tool_job_anchor_json = CAST(#{toolJobAnchorJson} AS jsonb),
@@ -336,6 +344,9 @@
           AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{expectedOperationId}
     </update>
 
+    <!--
+        清理 active anchor 仍需 operationId 所有权；不存在“按 runId 无条件清空”的旁路。
+    -->
     <update id="clearActiveToolJobAnchor">
         UPDATE alphafrog_agent_run
         SET tool_job_anchor_json = CAST('{}' AS jsonb),
@@ -345,6 +356,11 @@
           AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{expectedOperationId}
     </update>
 
+    <!--
+        完整 checkpoint 写失败后的窄合并：只关闭 autoResume、冻结 disposition 和错误。
+        WHERE 绑定 Run 状态、operation、tool call、attempt、task 与 checkpointVersion，
+        因此失败 worker 不能污染另一轮工具任务，也不会覆盖 reservation/terminal 字段。
+    -->
     <update id="markToolJobCheckpointFailed">
         UPDATE alphafrog_agent_run
         SET tool_job_anchor_json = tool_job_anchor_json || jsonb_build_object(
@@ -364,6 +380,10 @@
           AND COALESCE((tool_job_anchor_json -&gt;&gt; 'checkpointVersion')::integer, 0) = #{checkpointVersion}
     </update>
 
+    <!--
+        窄合并仍未获得所有权时，把完整失败请求写进 last_error 交给 reconciler。
+        last_error 只能从 null 写入同一个 marker，避免覆盖其他故障诊断。
+    -->
     <update id="markToolJobCheckpointFailurePending">
         UPDATE alphafrog_agent_run
         SET last_error = #{marker},
@@ -380,6 +400,7 @@
           AND (last_error IS NULL OR last_error = #{marker})
     </update>
 
+    <!-- compare-clear：只删除本次读取到的原 marker，不会误删随后写入的新错误。 -->
     <update id="clearToolJobCheckpointFailurePending">
         UPDATE alphafrog_agent_run
         SET last_error = NULL,
@@ -396,6 +417,10 @@
           AND status = #{expectedStatus}
     </update>
 
+    <!--
+        补扫真相源中的 active anchor。这里包含 EXECUTING/WAITING_TOOL_JOB/WAITING/CANCELED，
+        因为进程可能在状态推进或取消收尾的任意一步崩溃，不能只扫理想状态。
+    -->
     <select id="listActiveToolJobAnchors" resultMap="AgentRunResultMap">
         SELECT id,
                user_id,
@@ -422,6 +447,10 @@
         LIMIT #{limit}
     </select>
 
+    <!--
+        结果已经 finalizer 到 RECEIVED 后，READY 表示待 claim；LAUNCHING 表示可能在 launch 前崩溃。
+        启动恢复会再次检查 lease 时间和 token，不会直接执行查询结果。
+    -->
     <select id="listResumeReadyAnchors" resultMap="AgentRunResultMap">
         SELECT id,
                user_id,
@@ -449,6 +478,10 @@
         LIMIT #{limit}
     </select>
 
+    <!--
+        恢复租约 CAS：Run 状态、resumeState、resumeToken 和 resumeLeaseVersion 必须全相等。
+        任何一个旧 launcher 成功推进后，其余进程的 UPDATE 都返回 0。
+    -->
     <update id="casUpdateAnchorResumeState">
         UPDATE alphafrog_agent_run
         SET tool_job_anchor_json = CAST(#{toolJobAnchorJson} AS jsonb),
@@ -461,10 +494,10 @@
     </update>
 
     <!--
-        Atomic checkpoint merge: binds identity + version in WHERE to prevent
-        lost updates. SET merges only checkpoint whitelist fields via jsonb ||
-        concat, preserving concurrent reservation/terminal/finalizer fields.
-        checkpointVersion is atomically bumped. COALESCE handles NULL→0 for old anchors.
+        checkpoint 原子合并：SET 只通过 jsonb || 更新恢复白名单字段，
+        并在数据库内把 checkpointVersion 加一；reservation、terminal、finalizer 保持不变。
+        WHERE 绑定完整任务身份和 expected version，防止延迟 worker 覆盖新 checkpoint。
+        COALESCE 仅为旧 anchor 的缺省版本提供 0，不会绕过调用方显式版本校验。
     -->
     <update id="updateToolJobCheckpoint">
         UPDATE alphafrog_agent_run
@@ -498,6 +531,10 @@
           AND COALESCE((tool_job_anchor_json #>> '{checkpointVersion}')::int, 0) = #{expectedCheckpointVersion}
     </update>
 
+    <!--
+        结果消费后的最终清理：必须仍是调用方持有的 state/token/leaseVersion。
+        如果租约已被重新 claim，本次清理 rows=0，旧 worker 不能删除新 owner 的上下文。
+    -->
     <update id="clearToolJobAnchorWithToken">
         UPDATE alphafrog_agent_run
         SET tool_job_anchor_json = CAST('{}' AS jsonb),

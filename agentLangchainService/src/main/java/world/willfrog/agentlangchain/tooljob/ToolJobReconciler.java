@@ -15,6 +15,12 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.Set;
 
+/**
+ * 后台工具任务的周期协调器。
+ *
+ * <p>Redis due 集合负责低延迟轮询，PostgreSQL anchor 周期补扫负责灾后恢复。
+ * 本类只发现状态并调用 finalizer/resume service；所有持久化所有权仍由数据库 CAS 决定。</p>
+ */
 @Service
 public class ToolJobReconciler {
 
@@ -49,7 +55,9 @@ public class ToolJobReconciler {
     @Scheduled(fixedDelayString = "${agent.tool-job.reconciler-interval-ms:5000}")
     public void reconcileFromDue() {
         try {
+            // 每轮最多取 20 个到期 Run，限制单次调度耗时和 Sandbox 压力。
             Set<String> due = redisCache.fetchDue(20);
+            // 每个 runId 独立处理；单项异常由 processItem 捕获，不阻塞其他 Run。
             for (String runId : due) processItem(runId);
         } catch (Exception e) {
             log.error("Reconciler due-cycle error", e);
@@ -59,17 +67,23 @@ public class ToolJobReconciler {
     @Scheduled(fixedDelayString = "${agent.tool-job.rebuild-interval-ms:60000}")
     public void rebuildFromAnchors() {
         try {
+            // 第一段从 PostgreSQL 真相源重建 pending cache 与 due 索引。
             for (AgentRun run : anchorService.listActive(100)) {
+                // 再按 id 读取最新 anchor，避免列表查询后的状态漂移。
                 ToolJobAnchor a = anchorService.loadAnchor(run.getId());
                 if (a == null) continue;
+                // Redis 丢失或重启后可由完整 anchor 重建，不承担真相源职责。
                 redisCache.atomicWritePendingAndDue(run.getId(), a);
+                // 已到期任务立即处理，不等待下一轮 due 定时器。
                 if (a.getNextPollAt() != null && !a.getNextPollAt().isAfter(Instant.now()))
                     processItem(run.getId());
             }
         } catch (Exception e) { log.error("Reconciler rebuild error", e); }
         try {
+            // 第二段专扫 READY/LAUNCHING，覆盖 finalizer 写 READY 后进程崩溃的窗口。
             for (AgentRun run : anchorService.listResumeReady(50)) {
                 ToolJobAnchor a = anchorService.loadAnchor(run.getId());
+                // 先补热副本，再由 ResumeService 执行 token/lease CAS claim。
                 if (a != null) { redisCache.atomicWritePendingAndDue(run.getId(), a); resumeService.tryResume(run.getId()); }
             }
         } catch (Exception e) { log.error("Resume-ready scan error", e); }
@@ -77,32 +91,43 @@ public class ToolJobReconciler {
 
     private void processItem(String runId) {
         try {
+            // checkpoint 写失败 marker 优先处理；未解决前不能继续轮询并恢复一个缺上下文的 Run。
             if (checkpointFailureRecoveryService != null
                     && !checkpointFailureRecoveryService.retryPending(runId)) {
                 log.warn("Checkpoint-failure retry remains pending run={}", runId);
                 return;
             }
+            // 每轮都从 DB 读取最新 anchor，不能信任 due 成员对应的旧 Redis JSON。
             ToolJobAnchor anchor = anchorService.loadAnchor(runId);
+            // DB 已无 active anchor 时清理 Redis 残留，幂等结束。
             if (anchor == null) { redisCache.removeDue(runId); redisCache.deletePendingCache(runId); return; }
+            // taskId 是查询 Sandbox 的真实任务主键。
             String taskId = anchor.getTaskId();
             if (taskId == null || taskId.isBlank()) return;
 
+            // 暂停/取消/checkpoint 失败仍需确认终态并释放容量，但禁止自动恢复。
             if (!anchor.isAutoResume()) { checkPausedTerminal(runId, anchor); return; }
 
+            // 先取轻量状态，只有确认终态后才拉取可能较大的结果体。
             TaskStatusResponse statusResp = sandboxService.getTaskStatus(
                     GetTaskStatusRequest.newBuilder().setTaskId(taskId).build());
             String status = statusResp.getStatus();
 
+            // 三个规范终态进入结果拉取与 finalizer 链路。
             if (SUCCEEDED.equals(status) || FAILED.equals(status) || CANCELED.equals(status)) {
+                // fetchResult 还会核对 taskId/runId/expectedStatus，拒绝错配响应。
                 TaskResultResponse resultResp = fetchResult(taskId, runId, status);
                 if (resultResp == null) {
+                    // 状态已终态但结果体暂不可用，进入有界 RESULT_FETCH_PENDING。
                     Instant now = Instant.now();
                     if (anchor.getTerminalConfirmedAt() != null) {
+                        // 从首次终态确认时间累计期限，不因进程重启重置窗口。
                         long elapsed = Duration.between(anchor.getTerminalConfirmedAt(), now).toSeconds();
                         int attempts = anchor.getResultFetchAttempts() + 1;
                         anchor.setResultFetchAttempts(attempts);
                         if (elapsed > config.getResultRetentionDeadlineSeconds()
                                 || attempts >= config.getResultFetchMaxAttempts()) {
+                            // 达到期限/次数后冻结 RESULT_LOST，仍由 finalizer 释放容量并恢复为失败。
                             anchor.setResultFetchState("LOST");
                             anchor.setTerminalStatus("RESULT_LOST");
                             anchor.setTerminalAt(now);
@@ -111,25 +136,32 @@ public class ToolJobReconciler {
                             return;
                         }
                     } else {
+                        // 第一次缺结果时持久化起点和 attempt=1。
                         anchor.setResultFetchState("PENDING");
                         anchor.setTerminalConfirmedAt(now);
                         anchor.setResultFetchAttempts(1);
                     }
+                    // 计算下一次轮询时间并先 CAS 写 DB。
                     anchor.setNextPollAt(now.plusMillis(config.getPollIntervalMs()));
                     boolean updated = anchorService.updateAnchor(runId, anchor, AgentRunStatus.WAITING_TOOL_JOB);
                     if (!updated) {
+                        // 所有权已变化时删除本轮 due，让下一周期从 PG 重建新状态。
                         log.warn("Retry-state CAS failed for run={}, will reload from PG next cycle", runId);
                         redisCache.removeDue(runId);
                         return;
                     }
+                    // DB 成功后再更新 Redis 索引与热副本。
                     redisCache.upsertDue(runId, anchor);
                     redisCache.writePendingCache(runId, anchor);
                     return;
                 }
+                // 结果体完整时进入可重入六步 finalizer，最终生成 READY 并重新入队。
                 finalizer.handleTerminal(runId, anchor, status, resultResp, true);
             } else if (NOT_FOUND.equals(status)) {
+                // NOT_FOUND 可能是传播延迟或结果保留过期，交给有界丢失判定。
                 finalizer.handleNotFound(runId, anchor);
             } else {
+                // 非终态只推进 nextPollAt，不占用任何 Agent worker 等待。
                 anchor.setNextPollAt(Instant.now().plusMillis(config.getPollIntervalMs()));
                 anchorService.updateAnchor(runId, anchor, AgentRunStatus.WAITING_TOOL_JOB);
                 redisCache.upsertDue(runId, anchor);
@@ -142,8 +174,10 @@ public class ToolJobReconciler {
 
     private TaskResultResponse fetchResult(String taskId, String runId, String expectedStatus) {
         try {
+            // 只在已知终态后请求结果，减少大响应和无效轮询。
             TaskResultResponse resp = sandboxService.getTaskResult(
                     GetTaskResultRequest.newBuilder().setTaskId(taskId).build());
+            // validator 对任务身份与终态做 fail-closed 校验，错结果不会注入另一个 Run。
             return ToolJobResultValidator.validate(taskId, runId, resp, expectedStatus);
         } catch (Exception e) {
             log.error("Failed to fetch result for taskId={}, run={}", taskId, runId, e);
@@ -153,17 +187,19 @@ public class ToolJobReconciler {
 
     private void checkPausedTerminal(String runId, ToolJobAnchor anchor) {
         try {
+            // paused/canceled 仍轮询真实 Sandbox 任务，以便及时释放资源。
             String taskId = anchor.getTaskId();
             if (taskId == null) return;
             TaskStatusResponse statusResp = sandboxService.getTaskStatus(
                     GetTaskStatusRequest.newBuilder().setTaskId(taskId).build());
             String status = statusResp.getStatus();
             if (NOT_FOUND.equals(status)) {
+                // 仍使用同一结果丢失期限，不因 autoResume=false 跳过资源收尾。
                 finalizer.handleNotFound(runId, anchor);
             } else if (SUCCEEDED.equals(status) || FAILED.equals(status) || CANCELED.equals(status)) {
                 TaskResultResponse resultResp = fetchResult(taskId, runId, status);
                 if (resultResp != null) {
-                    // Envelope + release but autoResume=false (no CAS/READY)
+                    // 只执行 envelope/release/usage/event，不 CAS RECEIVED、不生成 READY。
                     finalizer.handleTerminal(runId, anchor, status, resultResp, false);
                 }
         }

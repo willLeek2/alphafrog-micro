@@ -1,30 +1,24 @@
 package world.willfrog.agentlangchain.tooljob;
 
 /**
- * Atomically persists a {@link ToolJobCheckpointRequest} to the durable anchor
- * before the pipeline suspends for a slow tool job.
+ * 慢工具挂起前，将 {@link ToolJobCheckpointRequest} 原子写入 durable anchor 的边界接口。
  *
- * <p>Default stub returns false (fail-closed: blocks the pending transition).
- * When the pipeline wires a real implementation, it captures the registry
- * snapshot via {@code AgentRunDatasetRegistry.snapshot(runId)} and writes
- * {@code datasetSnapshotJson}, {@code datasetSnapshotDigest}, completed todos,
- * estimate, dataset refs, and other resume context to the anchor via
- * {@code ToolJobAnchorService.updateAnchor}.</p>
+ * <p>调用顺序是硬约束：先持久化完整检查点，确认 CAS 成功，再允许 pipeline 返回并释放 Agent worker。
+ * 如果实现缺失或写入失败，调用方必须 fail-closed，不能只把 Run 标成 WAITING_TOOL_JOB 后丢失内存中的
+ * plan、completed todos、dataset registry 与工具预算。</p>
  *
- * <p>The checkpoint is consumed on resume by
- * {@link ToolJobResumeService#tryResume(String)} → buildResumeContext →
- * restoreDatasetRegistry, which calls
- * {@code AgentRunDatasetRegistry.restore(runId, snapshot)}.</p>
+ * <p>真实实现会从 {@code AgentRunDatasetRegistry.snapshot(runId)} 捕获数据集注册表，并连同摘要、
+ * 已完成 todo、估算结果、数据集引用和已用工具次数写入 anchor。恢复时
+ * {@link ToolJobResumeService#tryResume(String)} 读取同一版本的检查点，先校验 digest，再恢复 registry，
+ * 最后才把 resume context 交给新的 worker。</p>
  */
 @FunctionalInterface
 public interface ToolJobCheckpointWriter {
     /**
-     * Atomically writes the complete checkpoint to the anchor.
-     * Called by the pipeline before suspending for a slow tool job.
+     * 将完整恢复检查点原子写入 anchor；由 pipeline 在让出 worker 之前调用。
      *
-     * @param request the checkpoint payload (runId, todoId, completedTodos,
-     *                dataset snapshot, estimate, dataset refs, toolCallsUsed)
-     * @return true if the checkpoint was atomically persisted to the anchor
+     * @param request 检查点载荷，包含 Run/todo 身份、已完成结果、数据集快照、估算与工具预算
+     * @return 仅当带身份约束的原子写入成功时返回 true
      */
     boolean captureAndSave(ToolJobCheckpointRequest request);
 }

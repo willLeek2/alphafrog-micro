@@ -36,8 +36,12 @@ public class LangchainTodoNodeResult {
      * （按 {@link #routeFailureMetadataField} 语义路由到 {@code budget_failure} / {@code empty_output_observation} / {@code failure_metadata} 之一）。
      */
     private Map<String, Object> failureMetadata;
+    // 以下三个字段只在 suspended=true 时使用，组成后台任务稳定身份。
+    // pendingRunId 防止恢复结果跨 Agent Run 注入。
     private String pendingRunId;
+    // pendingToolCallId 定位原逻辑工具调用。
     private String pendingToolCallId;
+    // pendingAttempt 隔离同一调用的不同重试轮次。
     private int pendingAttempt;
 
     public static LangchainTodoNodeResult success(String output, int toolCallsUsed) {
@@ -82,11 +86,16 @@ public class LangchainTodoNodeResult {
     }
 
     public static LangchainTodoNodeResult suspended(ExternalToolJobPendingException pending) {
+        // suspended 与 success/failure 正交；这里明确 success=false 但不设置 failureReason。
         return LangchainTodoNodeResult.builder()
                 .success(false)
+                // 上层必须优先检查该标记，不能落普通失败终态。
                 .suspended(true)
+                // summary 只用于事件/诊断，不作为恢复身份。
                 .summary("external_tool_job_pending")
+                // 后台任务尚无可消费 output，避免把占位文本注册成 dataset。
                 .output("")
+                // 原样复制异常携带的三元身份，后续会写进 workflow result/checkpoint。
                 .pendingRunId(pending.getRunId())
                 .pendingToolCallId(pending.getToolCallId())
                 .pendingAttempt(pending.getAttempt())

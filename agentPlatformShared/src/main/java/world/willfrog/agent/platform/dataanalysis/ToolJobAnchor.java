@@ -7,8 +7,15 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import java.time.Instant;
 
 /**
- * Durable external tool job state persisted in alphafrog_agent_run.tool_job_anchor_json.
- * This is the source of truth; Redis cache/index can be rebuilt from this column.
+ * 外部工具上下文切换的持久化锚点，存放在
+ * {@code alphafrog_agent_run.tool_job_anchor_json}。
+ *
+ * <p>数据库中的本对象是恢复真相源：Redis 只保存到期索引和热副本，丢失后可以
+ * 从这里重建。对象同时冻结任务身份、挂起点、已完成 Todo、dataset 快照、
+ * Sandbox 容量 reservation、终态结果、finalizer 进度和恢复租约。</p>
+ *
+ * <p>所有写入都必须带 operation/toolCall/attempt/checkpointVersion 等 CAS 条件，
+ * 这样旧 worker、重复回调和进程重启后的扫描器不会覆盖新一轮恢复。</p>
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public class ToolJobAnchor {
@@ -16,82 +23,120 @@ public class ToolJobAnchor {
     private static final ObjectMapper MAPPER = new ObjectMapper()
             .findAndRegisterModules();
 
+    // schemaVersion 允许未来升级 JSON 结构时保留兼容读取路径。
     private int schemaVersion = 1;
-    private int checkpointVersion; // incremented on each atomic checkpoint merge
+    // checkpointVersion 每次原子合并后递增，是防止丢失更新的版本栅栏。
+    private int checkpointVersion;
+    // operationId 标识一次可幂等创建的外部操作，不随进程重启变化。
     private String operationId;
+    // requestFingerprint 绑定本次工具入参，阻止同一 operationId 被不同请求复用。
     private String requestFingerprint;
+    // canonicalCreateSpecJson 保存规范化创建参数，用于故障恢复时验证任务身份。
     private String canonicalCreateSpecJson;
+    // createRequestJson 保存向 Sandbox 提交的原始创建请求，必要时可重放创建协议。
     private String createRequestJson;
-    private String anchorState; // PREPARING, ATTACHED, PENDING, TERMINAL, FINALIZING, CONSUMED
+    // anchorState 描述 PREPARING 到 CONSUMED 的任务生命周期，不等同于 Run 状态。
+    private String anchorState;
+    // taskId 是 Sandbox 返回的真实后台任务标识，轮询终态时使用。
     private String taskId;
+    // toolCallId 是 Agent 侧逻辑调用标识，与 attempt 一起隔离重试轮次。
     private String toolCallId;
+    // attempt 标记第几次调用尝试，旧尝试的终态不能恢复新尝试。
     private int attempt;
+    // todoId 保存 LINEAR 工作流的挂起节点。
     private String todoId;
+    // sequence 保存该节点在原 plan 中的顺序，恢复时用于顺序校验。
     private int sequence;
+    // runDisposition 冻结 RUNNING、PAUSED、CANCELED 或 CHECKPOINT_FAILED 等处置。
     private String runDisposition;
+    // autoResume=false 时只做终态收尾和容量释放，不自动重新入队。
     private boolean autoResume = true;
-    private String resumeState; // READY, LAUNCHING, CONSUMED
-    private String resumeToken; // UUID for idempotent launch dedupe
-    private long resumeLeaseVersion; // incremented on each new claim
+    // resumeState 表示 READY、LAUNCHING、CONSUMED 三阶段交接状态。
+    private String resumeState;
+    // resumeToken 为每轮 READY 生成随机令牌，提供启动幂等身份。
+    private String resumeToken;
+    // resumeLeaseVersion 每次 claim 加一，作为跨进程 launcher 的 fencing token。
+    private long resumeLeaseVersion;
+    // resumeClaimedAt 用来识别 LAUNCHING 卡死并允许启动恢复重新接管。
     private Instant resumeClaimedAt;
 
-    // durable estimate from admission (reused in terminal envelope)
+    // 以下字段是在工具进入 pending 时冻结的工作流上下文。
+    // completedTodosJson 保存完整的已完成 Todo 记录，而不只是 id 列表。
+    private String completedTodosJson;
+    // datasetRefsJson 保留 Todo 输出中已注册的数据引用，兼容早期 checkpoint。
+    private String datasetRefsJson;
+    // toolCallsUsed 保存挂起点的 run 级工具调用计数，恢复后继续累计。
+    private int toolCallsUsed;
 
-    // resume context (§9.10): saved when tool job goes pending
-    private String completedTodosJson;   // completed todo id list
-    private String datasetRefsJson;      // dataset references
-    private int toolCallsUsed;           // tool call count at suspend point
-
-    // reservation snapshot
+    // reservationJson 是 Sandbox 容量账本快照，终态确认后据此精确释放容量。
     private String reservationJson;
-    private String estimateJson; // durable estimate from admission (reused in terminal envelope)
+    // estimateJson 保存准入估算，构造终态 envelope 时复用并校验资源类别。
+    private String estimateJson;
 
-    // dataset snapshot
+    // datasetSnapshotJson 保存可恢复的数据集注册表快照。
     private String datasetSnapshotJson;
+    // datasetSnapshotDigest 校验快照内容，阻止损坏或错配快照被恢复。
     private String datasetSnapshotDigest;
 
-    // terminal envelope
+    // terminalStatus 是规范化后的 Sandbox 终态，如 SUCCEEDED、FAILED、RESULT_LOST。
     private String terminalStatus;
+    // terminalResultPreview 是限定大小的可读摘要，供恢复节点直接注入。
     private String terminalResultPreview;
+    // terminalRawRef 指向完整结果产物，避免大对象进入 anchor。
     private String terminalRawRef;
+    // terminalErrorCode 保存失败分类，供工作流决定失败语义。
     private String terminalErrorCode;
+    // terminalUsageJson 保存实际资源用量，finalizer 会幂等落账。
     private String terminalUsageJson;
+    // terminalAt 保存 Sandbox 终态发生时间，不使用轮询发现时间替代。
     private Instant terminalAt;
-    private Boolean terminalRetryable; // nullable: presence-aware Harness classification
+    // nullable 用于区分“明确不可重试”和“旧协议未返回分类”；缺失时 fail-closed。
+    private Boolean terminalRetryable;
 
-    // result fetch
-    private String resultFetchState; // PENDING, LOST
+    // resultFetchState 区分等待结果体与已经确认丢失。
+    private String resultFetchState;
+    // resultFetchAttempts 驱动有界重试，达到阈值后转 RESULT_LOST。
     private int resultFetchAttempts;
+    // terminalConfirmedAt 是首次确认任务终态的时间，用于结果保留期限计算。
     private Instant terminalConfirmedAt;
+    // sandboxTerminalStatus 保留 Sandbox 原始终态，便于契约审计。
     private String sandboxTerminalStatus;
 
-    // finalizer progress
+    // finalizerStep 是可重入收尾状态机最后一个已持久化步骤。
     private String finalizerStep;
+    // finalizerError 保存 fail-closed 的阻塞原因，重启扫描后仍可诊断。
     private String finalizerError;
 
-    // post-terminal flags
+    // usagePersisted 防止资源用量重复落账。
     private boolean usagePersisted;
+    // terminalEventEmitted 防止终态事件重复写入事件流。
     private boolean terminalEventEmitted;
+    // resultConsumed 表示工作流已接受终态结果，anchor 才可安全清理。
     private boolean resultConsumed;
 
-    // timing
+    // nextPollAt 决定 Redis due 索引中的下一次检查时间。
     private Instant nextPollAt;
+    // timeoutAt 是外部任务最大等待期限，超时后进入终态收尾。
     private Instant timeoutAt;
 
     public ToolJobAnchor() {}
 
     public static ToolJobAnchor fromJson(String json) {
         try {
+            // 统一使用注册 Java Time 模块的 mapper，确保 Instant 可跨重启还原。
             return MAPPER.readValue(json, ToolJobAnchor.class);
         } catch (JsonProcessingException e) {
+            // 锚点损坏必须显式失败；静默构造空对象会绕过 CAS 身份保护。
             throw new IllegalArgumentException("Failed to parse ToolJobAnchor", e);
         }
     }
 
     public String toJson() {
         try {
+            // 每次写库前序列化完整状态，数据库 CAS 决定是否接受这份新快照。
             return MAPPER.writeValueAsString(this);
         } catch (JsonProcessingException e) {
+            // 序列化失败时不允许写空 JSON，否则恢复所需上下文会永久丢失。
             throw new IllegalArgumentException("Failed to serialize ToolJobAnchor", e);
         }
     }

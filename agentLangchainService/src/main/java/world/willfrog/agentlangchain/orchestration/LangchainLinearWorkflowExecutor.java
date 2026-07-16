@@ -107,24 +107,33 @@ public class LangchainLinearWorkflowExecutor {
     }
 
     /**
-     * Resumes a previously planned LINEAR workflow without invoking the planner or
-     * re-running already completed todos. The suspended todo's durable terminal
-     * result is injected as its completion and therefore does not increment the
-     * logical tool-call counter.
+     * 从持久化 checkpoint 恢复已经规划过的 LINEAR 工作流。
+     *
+     * @param request 在新 worker 上重建的 Run/模型/工具配置
+     * @param plan 挂起前已经落库的原计划；恢复过程绝不重新调用 planner
+     * @param context 已完成 Todo、dataset 快照、挂起点、终态结果及恢复租约
+     * @param terminalConsumed 结果注入内存后执行的持久化消费确认
+     * @return 继续执行后的工作流结果，也可能再次 suspended
      */
     public LangchainLinearWorkflowResult resumePlanned(LangchainLinearWorkflowRequest request,
                                                        LangchainTodoPlan plan,
                                                        ToolJobResumeContext context,
                                                        BooleanSupplier terminalConsumed) {
+        // 使用普通执行相同的 Run 身份和模型配置校验。
         validate(request);
+        // plan/context 任一缺失都不能猜测恢复点或重新规划。
         if (plan == null || context == null) {
             throw new IllegalArgumentException("resume_plan_and_context_required");
         }
+        // 从挂起点延续工具调用计数，避免上下文切换绕过 run 预算。
         AtomicInteger toolCalls = new AtomicInteger(Math.max(0, context.getToolCallsUsed()));
         try {
+            // 新 worker 需要重新建立 AgentContext，旧线程已经在 finally 中清理。
             applyRunContext(request);
+            // 传入原计划与恢复上下文，执行器会跳过已完成前缀。
             return executePlanned(request, plan, toolCalls, context, terminalConsumed);
         } catch (Exception e) {
+            // 把恢复异常转换为普通 workflow result，由 pipeline 统一持久化。
             return LangchainLinearWorkflowResult.builder()
                     .success(false)
                     .failureReason(e.getMessage())
@@ -132,6 +141,7 @@ public class LangchainLinearWorkflowExecutor {
                     .toolCallsUsed(toolCalls.get())
                     .build();
         } finally {
+            // 方法也可被测试或同步调用，因此在这里再次保证 ThreadLocal 清理。
             AgentContext.clear();
         }
     }
@@ -141,54 +151,74 @@ public class LangchainLinearWorkflowExecutor {
                                                          AtomicInteger toolCalls,
                                                          ToolJobResumeContext resumeContext,
                                                          BooleanSupplier terminalConsumed) {
+        // 恢复和首次执行共享本方法；resumeContext 为 null 表示首次执行。
         AgentContext.setWorkflow("linear");
+        // extractedEntities 来自原 plan，不重新运行 planning LLM。
         AgentContext.setExtractedEntities(plan.getExtractedEntities());
+        // 首次执行从空列表开始；恢复执行从 anchor 还原已完成前缀。
         List<LangchainCompletedTodo> completedTodos = resumeContext == null
                 ? new ArrayList<>()
                 : restoreCompletedTodos(resumeContext.getCompletedTodos());
+        // datasetRefs 是当前 worker 的堆内映射，必须从已完成输出重新注册。
         Map<String, String> datasetRefs = LangchainTodoUserMessageBuilder.newDatasetRefMap();
         completedTodos.forEach(todo -> DatasetRefRegistry.registerFromJson(todo.displayOutput(), datasetRefs));
+        // completedIds 用于 O(1) 跳过已经落稳的 Todo，防止重复工具副作用。
         java.util.Set<String> completedIds = completedTodos.stream()
                 .map(LangchainCompletedTodo::getTodoId)
                 .filter(java.util.Objects::nonNull)
                 .collect(Collectors.toCollection(java.util.LinkedHashSet::new));
+        // resultConsumed=true 表示上一次恢复已确认消费终态，当前应从下一节点继续。
         boolean handoffAccepted = resumeContext != null && resumeContext.isResultConsumed();
+        // FINAL_TODO_ID 表示所有 Todo 已完成，本轮只需要生成最终答案。
         boolean resumeAtFinal = handoffAccepted
                 && ToolJobResumeContext.FINAL_TODO_ID.equals(resumeContext.getTodoId());
+        // 未消费终态时找到原挂起 Todo，稍后把终态输出注入该节点。
         TodoItem suspendedItem = resumeContext == null || resumeAtFinal ? null : plan.getItems().stream()
                 .filter(item -> java.util.Objects.equals(item.getId(), resumeContext.getTodoId()))
                 .findFirst()
                 .orElse(null);
+        // checkpoint 指向原 plan 中不存在的节点说明上下文损坏，必须 fail-closed。
         if (resumeContext != null && suspendedItem == null && !resumeAtFinal) {
             return failure(plan, completedTodos, "resume_todo_not_in_plan", toolCalls.get(), null);
         }
+        // resumeSequence 是恢复前缀的严格边界；最终回答哨兵放在所有 Todo 之后。
         int resumeSequence = resumeAtFinal ? Integer.MAX_VALUE : suspendedItem == null
                 ? Integer.MIN_VALUE : suspendedItem.getSequence();
+        // 已完成快照不能包含挂起节点或其后节点，否则说明 checkpoint 顺序自相矛盾。
         if (resumeContext != null && completedTodos.stream()
                 .anyMatch(todo -> todo.getSequence() >= resumeSequence)) {
             return failure(plan, completedTodos, "resume_completed_todo_out_of_order",
                     toolCalls.get(), null);
         }
+        // 已消费的失败终态不允许继续后续 Todo，直接恢复为确定性失败。
         if (handoffAccepted && !resumeContext.isTerminalSuccess()) {
             return failure(plan, completedTodos, "external_tool_terminal_failure",
                     toolCalls.get(), null);
         }
+        // 从原 plan 开头遍历，依靠 completedIds/sequence 精确跳过持久化前缀。
         for (TodoItem item : plan.getItems()) {
+            // 已完成节点已经在 completedTodos 中恢复，绝不重复执行。
             if (resumeContext != null && completedIds.contains(item.getId())) {
                 continue;
             }
+            // 对旧格式 checkpoint，sequence 边界提供第二层跳过保护。
             if (resumeContext != null && item.getSequence() < resumeSequence) {
                 continue;
             }
+            // 只有尚未消费终态且正好到原挂起节点时，执行结果注入分支。
             if (resumeContext != null && !handoffAccepted
                     && java.util.Objects.equals(item.getId(), suspendedItem.getId())) {
+                // 注入不调用 LLM/tool，仍记录本节点恢复耗时与节点事件。
                 long nodeStartMs = System.currentTimeMillis();
+                // preview/rawRef 被整理成与普通工具输出兼容的文本。
                 String injectedOutput = resumeTerminalOutput(resumeContext);
+                // 失败终态先发节点失败，再推进/持久化消费位置，保证重入幂等。
                 if (!resumeContext.isTerminalSuccess()) {
                     emitTodoNodeEvent(request.getRunId(), request.getUserId(),
                             "TODO_NODE_FAILED", item, "external_tool_terminal_failure", 0,
                             null, false, null);
                     prepareAcceptedHandoff(resumeContext, plan, completedTodos, item, toolCalls.get(), false);
+                    // 消费确认是 durable gate；失败则保留 LAUNCHING anchor 供再次恢复。
                     if (terminalConsumed == null || !terminalConsumed.getAsBoolean()) {
                         return failure(plan, completedTodos, "resume_result_consume_failed",
                                 toolCalls.get(), null);
@@ -196,7 +226,9 @@ public class LangchainLinearWorkflowExecutor {
                     return failure(plan, completedTodos, "external_tool_terminal_failure",
                             toolCalls.get(), null);
                 }
+                // 成功输出可能包含 dataset ref，必须在后续 Todo 执行前重新注册。
                 DatasetRefRegistry.registerFromJson(injectedOutput, datasetRefs);
+                // 把挂起 Todo 追加为已完成，但不增加 toolCalls：那次调用在挂起前已经计数。
                 completedTodos.add(LangchainCompletedTodo.builder()
                         .todoId(item.getId())
                         .sequence(item.getSequence())
@@ -208,11 +240,14 @@ public class LangchainLinearWorkflowExecutor {
                 emitTodoNodeEvent(request.getRunId(), request.getUserId(),
                         "TODO_NODE_COMPLETED", item, null,
                         System.currentTimeMillis() - nodeStartMs, null, false, null);
+                // 在内存 context 中把恢复点推进到下一 Todo 或 FINAL 哨兵。
                 prepareAcceptedHandoff(resumeContext, plan, completedTodos, item, toolCalls.get(), true);
+                // 先持久化推进后的 checkpoint，成功后才允许继续执行后续 Todo。
                 if (terminalConsumed == null || !terminalConsumed.getAsBoolean()) {
                     return failure(plan, completedTodos, "resume_result_consume_failed",
                             toolCalls.get(), null);
                 }
+                // 当前节点已经通过注入完成，进入原 plan 的下一节点。
                 continue;
             }
             Optional<String> stop = executionGuard.stopReason(request.getRunId(), request.getUserId());
@@ -235,10 +270,12 @@ public class LangchainLinearWorkflowExecutor {
             LangchainTodoNodeResult nodeResult = todoNodeExecutor.execute(
                     request, item, completedTodos, datasetRefs, toolCalls);
             long nodeDurationMs = System.currentTimeMillis() - nodeStartMs;
+            // 外部工具 pending 不属于节点失败：保存挂起身份并立刻返回到 pipeline。
             if (nodeResult.isSuspended()) {
                 emitTodoNodeEvent(request.getRunId(), request.getUserId(),
                         "TODO_NODE_SUSPENDED", item, "external_tool_job_pending", nodeDurationMs,
                         null, false, null);
+                // result 只携带堆内上下文；pipeline 下一步负责原子写入 durable anchor。
                 return LangchainLinearWorkflowResult.builder()
                         .success(false)
                         .suspended(true)
@@ -306,7 +343,9 @@ public class LangchainLinearWorkflowExecutor {
                                         TodoItem current,
                                         int toolCallsUsed,
                                         boolean continueWorkflow) {
+        // 把当前堆内 completedTodos 再次转换成可写回 anchor 的稳定 DTO。
         List<CompletedTodoRecord> records = completedTodos.stream().map(todo -> {
+            // 每个字段都来自已完成节点，不从当前模型或工具重新计算。
             CompletedTodoRecord record = new CompletedTodoRecord();
             record.setTodoId(todo.getTodoId());
             record.setSequence(todo.getSequence());
@@ -314,23 +353,32 @@ public class LangchainLinearWorkflowExecutor {
             record.setModelOutput(todo.getModelOutput());
             record.setOutput(todo.getOutput());
             record.setSummary(todo.getSummary());
+            // map 返回的新对象会被序列化进下一版 checkpoint。
             return record;
         }).toList();
+        // 更新 context 后，terminalConsumed 回调会把这些字段原子写回 durable anchor。
         context.setCompletedTodos(records);
+        // 保存最新 run 级计数，下一次 worker 接管时从这里继续。
         context.setToolCallsUsed(toolCallsUsed);
+        // 成功消费时选择 sequence 更大的最早节点；失败消费不继续 workflow。
         TodoItem next = continueWorkflow ? plan.getItems().stream()
                 .filter(item -> item.getSequence() > current.getSequence())
                 .min(java.util.Comparator.comparingInt(TodoItem::getSequence))
                 .orElse(null) : null;
+        // 没有后续 Todo 时使用 FINAL 哨兵，防止恢复时重新命中当前节点。
         context.setTodoId(next == null ? ToolJobResumeContext.FINAL_TODO_ID : next.getId());
+        // 哨兵沿用当前 sequence；有下一节点时保存其真实 sequence。
         context.setTodoSequence(next == null ? current.getSequence() : next.getSequence());
+        // 最后置 resultConsumed，表示以上上下文字段已经准备好交给 durable consume CAS。
         context.setResultConsumed(true);
     }
 
     private List<LangchainCompletedTodo> restoreCompletedTodos(List<CompletedTodoRecord> records) {
+        // 空 checkpoint 前缀恢复为空可变列表，后续仍可追加当前节点。
         if (records == null || records.isEmpty()) {
             return new ArrayList<>();
         }
+        // 保持持久化顺序逐项还原，不重新运行 Todo 或重新生成摘要。
         return records.stream().map(record -> LangchainCompletedTodo.builder()
                         .todoId(record.getTodoId())
                         .sequence(record.getSequence())
@@ -339,21 +387,27 @@ public class LangchainLinearWorkflowExecutor {
                         .output(record.getOutput())
                         .summary(record.getSummary())
                         .build())
+                // 需要 ArrayList，因为恢复执行会把后续完成节点继续 append。
                 .collect(Collectors.toCollection(ArrayList::new));
     }
 
     private String resumeTerminalOutput(ToolJobResumeContext context) {
+        // preview 是有界可读内容，rawRef 是完整产物位置；优先同时保留。
         String preview = context.getTerminalResultPreview();
         String rawRef = context.getTerminalRawRef();
+        // 与普通工具结果格式保持一致，后续节点可以继续识别 rawRef。
         if (!isBlank(preview) && !isBlank(rawRef)) {
             return preview.trim() + "\nrawRef: " + rawRef.trim();
         }
+        // 只有 preview 时直接注入文本，不制造空 rawRef。
         if (!isBlank(preview)) {
             return preview.trim();
         }
+        // 大结果可能只有 rawRef，仍提供可被 DatasetRefRegistry 识别的标记。
         if (!isBlank(rawRef)) {
             return "rawRef: " + rawRef.trim();
         }
+        // 终态缺少可见正文时给确定性占位，避免 null 破坏后续 prompt 构建。
         return context.isTerminalSuccess() ? "external tool completed" : "external tool failed";
     }
 

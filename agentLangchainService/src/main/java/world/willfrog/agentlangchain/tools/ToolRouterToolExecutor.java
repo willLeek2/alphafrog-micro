@@ -128,13 +128,16 @@ final class ToolRouterToolExecutor implements ToolExecutor {
                 success = false;
             } else {
                 try {
+                    // invokeWithMeta 可能快速返回普通结果，也可能在超时阈值后抛出 pending 控制信号。
                     ToolRouter.ToolInvocationResult result = toolRouter.invokeWithMeta(request.name(), params);
+                    // 只有真正终态结果才进入普通 output/success 收尾链路。
                     output = result.getOutput();
                     success = result.isSuccess();
                 } catch (ExternalToolJobPendingException pending) {
-                    // Pending is a control-flow signal, not a failed tool result. In particular,
-                    // do not emit TOOL_CALL_FINISHED here; the reconciler/finalizer owns the
-                    // single logical terminal event after the external job completes.
+                    // pending 表示 Sandbox 后台任务仍在运行，不是工具失败。
+                    // 这里不能转成字符串 output，否则 LLM 会误以为工具已经完成。
+                    // 这里也不能写 TOOL_CALL_FINISHED；唯一终态事件归 reconciler/finalizer 所有。
+                    // 原样重抛可保留 runId/toolCallId/attempt，供上层生成可恢复挂起结果。
                     throw pending;
                 } catch (Exception e) {
                     output = e.getMessage();

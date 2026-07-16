@@ -623,6 +623,9 @@ public class LangchainRunReadService {
             return "PAUSED";
         }
         if (status == AgentRunStatus.WAITING_TOOL_JOB) {
+            // 直接暴露持久阶段，避免把“已释放 worker、等待外部结果”误显示成普通 PAUSED 或 EXECUTING。
+            // 这里的 phase 只用于读取/UI，不参与 resume 决策；真正的重入资格仍来自 anchor 的
+            // READY/LAUNCHING、resumeToken 与 leaseVersion，客户端刷新不会触发任何执行副作用。
             return "WAITING_TOOL_JOB";
         }
         if ("PLAN_READY".equals(lastEventType)

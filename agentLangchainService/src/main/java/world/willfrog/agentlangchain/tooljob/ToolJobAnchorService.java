@@ -11,8 +11,10 @@ import java.util.Collections;
 import java.util.List;
 
 /**
- * Reads and writes {@link ToolJobAnchor} on {@code alphafrog_agent_run.tool_job_anchor_json}.
- * All mutation methods use CAS (Compare-And-Set) via expected-status preconditions.
+ * {@code tool_job_anchor_json} 的唯一业务写入口。
+ *
+ * <p>方法返回值都表示数据库 CAS 是否真正更新一行，而不是“调用没有抛异常”。
+ * 调用方必须把 false 当作失去所有权，重新读取当前 anchor 后再决定重入或退场。</p>
  */
 @Service
 public class ToolJobAnchorService {
@@ -27,10 +29,13 @@ public class ToolJobAnchorService {
      * Reads the anchor for a run. Returns null when no active tool job exists.
      */
     public ToolJobAnchor loadAnchor(String runId) {
+        // 每次从 PostgreSQL 真相源读取；不使用可能丢失的 Redis 热副本。
         AgentRun run = agentRunMapper.findById(runId);
+        // 空 JSON 表示当前 Run 没有可恢复的外部工具任务。
         if (run == null || run.getToolJobAnchorJson() == null || run.getToolJobAnchorJson().isBlank()) {
             return null;
         }
+        // 解析失败显式抛出，避免把损坏 anchor 当成“没有任务”。
         return ToolJobAnchor.fromJson(run.getToolJobAnchorJson());
     }
 
@@ -40,7 +45,9 @@ public class ToolJobAnchorService {
      * @return true if the update succeeded, false if the status had changed
      */
     public boolean updateAnchor(String runId, ToolJobAnchor anchor, AgentRunStatus expectedStatus) {
+        // expectedStatus 防止终态/暂停流程被旧 finalizer 覆盖。
         int rows = agentRunMapper.updateToolJobAnchor(runId, anchor.toJson(), expectedStatus);
+        // 只有恰好一行表示本调用仍拥有写权限。
         return rows == 1;
     }
 
@@ -52,17 +59,20 @@ public class ToolJobAnchorService {
     @Transactional
     public boolean updateAnchorAndStatus(String runId, ToolJobAnchor anchor,
                                           AgentRunStatus newStatus, AgentRunStatus expectedStatus) {
+        // anchor 与 Run status 在同一条 UPDATE 中提交，不产生“状态已变但上下文未变”的中间窗口。
         int rows = agentRunMapper.updateToolJobAnchorAndStatus(runId, anchor.toJson(), newStatus, expectedStatus);
         return rows == 1;
     }
 
     public boolean claimPreparing(String runId, ToolJobAnchor anchor, AgentRunStatus expectedStatus) {
+        // 只有空 anchor 才能创建 PREPARING owner，重复分发会返回 false。
         return agentRunMapper.claimPreparingToolJobAnchor(
                 runId, anchor.toJson(), expectedStatus) == 1;
     }
 
     public boolean updateActive(String runId, ToolJobAnchor anchor,
                                 AgentRunStatus expectedStatus, String operationId) {
+        // operationId 绑定当前 active dispatch，旧 operation 无法替换新任务。
         return agentRunMapper.updateActiveToolJobAnchor(
                 runId, anchor.toJson(), expectedStatus, operationId) == 1;
     }
@@ -71,11 +81,13 @@ public class ToolJobAnchorService {
                                          AgentRunStatus newStatus,
                                          AgentRunStatus expectedStatus,
                                          String operationId) {
+        // 同时转移 anchor 和 Run 状态，并保留 operationId 所有权条件。
         return agentRunMapper.updateToolJobAnchorAndStatusByOperation(
                 runId, anchor.toJson(), newStatus, expectedStatus, operationId) == 1;
     }
 
     public boolean clearActive(String runId, AgentRunStatus expectedStatus, String operationId) {
+        // 仅当前 operation owner 可以清空；旧回调不能删除新任务 anchor。
         return agentRunMapper.clearActiveToolJobAnchor(runId, expectedStatus, operationId) == 1;
     }
 
@@ -85,6 +97,7 @@ public class ToolJobAnchorService {
      * identity so a stale pipeline cannot poison a newer external job.
      */
     public boolean markCheckpointFailed(ToolJobCheckpointRequest request, String error) {
+        // SQL 只合并 disposition/autoResume/error 三个字段，不覆盖终态或 reservation。
         return agentRunMapper.markToolJobCheckpointFailed(
                 request.getRunId(), request.getOperationId(), request.getToolCallId(),
                 request.getAttempt(), request.getTaskId(),
@@ -105,6 +118,7 @@ public class ToolJobAnchorService {
      * Lists all runs with non-empty tool job anchors in WAITING_TOOL_JOB status.
      */
     public List<AgentRun> listActive(int limit) {
+        // limit 约束单轮补扫工作量，避免恢复风暴长期占用调度线程。
         return agentRunMapper.listActiveToolJobAnchors(limit);
     }
 
@@ -114,6 +128,7 @@ public class ToolJobAnchorService {
      * picked up by the resume launcher (crash recovery).
      */
     public List<AgentRun> listResumeReady(int limit) {
+        // READY 与超时 LAUNCHING 都需要启动恢复扫描，具体租约判断在 ResumeService。
         return agentRunMapper.listResumeReadyAnchors(limit);
     }
 
@@ -127,6 +142,7 @@ public class ToolJobAnchorService {
     public boolean casResumeState(String runId, ToolJobAnchor anchor,
                                    AgentRunStatus expectedStatus, String expectedResumeState,
                                    String expectedResumeToken, long expectedLeaseVersion) {
+        // state + token + leaseVersion 三重条件共同阻止双 launcher 和陈旧重放。
         int rows = agentRunMapper.casUpdateAnchorResumeState(
                 runId, anchor.toJson(), expectedStatus, expectedResumeState,
                 expectedResumeToken, expectedLeaseVersion);
@@ -147,6 +163,7 @@ public class ToolJobAnchorService {
                                      String datasetSnapshotJson, String datasetSnapshotDigest,
                                      String datasetRefsJson, int toolCallsUsed,
                                      String estimateJson) {
+        // 把所有 checkpoint 字段一次性交给单条 SQL，禁止逐字段产生半成品状态。
         int rows = agentRunMapper.updateToolJobCheckpoint(
                 runId, expectedStatus,
                 anchor.getOperationId(), anchor.getToolCallId(),
@@ -157,6 +174,7 @@ public class ToolJobAnchorService {
                 datasetSnapshotJson, datasetSnapshotDigest,
                 datasetRefsJson, toolCallsUsed,
                 estimateJson);
+        // rows=0 表示身份、状态或版本任一已变化，调用方必须进入失败归属判断。
         return rows == 1;
     }
 
@@ -169,6 +187,7 @@ public class ToolJobAnchorService {
      */
     public boolean clearAnchorWithToken(String runId, String expectedResumeState,
                                          String expectedToken, long expectedLeaseVersion) {
+        // 没有非 token clear 旁路；只有已消费当前 lease 的 launcher 可以清理。
         return agentRunMapper.clearToolJobAnchorWithToken(
                 runId, expectedResumeState, expectedToken, expectedLeaseVersion) == 1;
     }

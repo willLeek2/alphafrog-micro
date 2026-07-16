@@ -267,6 +267,8 @@ public class AgentEventService {
             return false;
         }
         if (run.getStatus() == AgentRunStatus.WAITING_TOOL_JOB) {
+            // 这是长工具主动让出 Agent worker 的持久状态。旧 pipeline 必须在所有后续入口停下；
+            // 工具完成后的继续执行由 token/version 保护的 resume launcher 重新排队，不能在此原地恢复。
             log.info("Run suspended for external tool job, stop: {}", runId);
             return false;
         }

@@ -13,7 +13,13 @@ import world.willfrog.agent.platform.model.AgentRunStatus;
 import java.util.List;
 import java.util.Objects;
 
-/** Durable owner for checkpoint-write failures that cannot be resolved inline. */
+/**
+ * 为无法在旧 worker 内解决的 checkpoint 写失败建立持久化 owner。
+ *
+ * <p>目标不是盲目重试整份 anchor，而是在冻结的任务身份和版本上做窄合并；
+ * 若并发写者已经产生等价或更新 checkpoint，则把本写者判为 superseded。
+ * 若暂时无法写失败处置，则把完整请求编码进 last_error marker，交给 reconciler 重试。</p>
+ */
 @Service
 public class ToolJobCheckpointFailureRecoveryService {
 
@@ -33,9 +39,12 @@ public class ToolJobCheckpointFailureRecoveryService {
     }
 
     public Outcome handleFailure(ToolJobCheckpointRequest request) {
+        // 没有冻结请求就无法确认所有权，返回 UNOWNED 交给 pipeline 走缺 anchor 失败路径。
         if (request == null) return Outcome.UNOWNED;
+        // 首先检查是否已有并发写者落稳等价/更新 checkpoint，避免把健康 Run 标失败。
         if (hasEquivalentOrNewerCheckpoint(request)) return Outcome.HEALTHY_CHECKPOINT;
         try {
+            // 第一次尝试在相同身份/版本上窄写 CHECKPOINT_FAILED disposition。
             if (anchorService.markCheckpointFailed(request, "durable_checkpoint_write_failed")) {
                 return Outcome.FAILURE_OWNED;
             }
@@ -43,22 +52,25 @@ public class ToolJobCheckpointFailureRecoveryService {
             log.warn("Checkpoint-failure narrow merge failed run={}: {}",
                     request.getRunId(), e.getMessage());
         }
+        // 窄写失败后再次读取，覆盖“刚好有并发健康写入”的竞态窗口。
         if (hasEquivalentOrNewerCheckpoint(request)) return Outcome.HEALTHY_CHECKPOINT;
+        // 把冻结请求编码成可重启恢复的 marker。
         String marker = marker(request);
+        // marker CAS 成功后，reconciler 成为明确的 retry owner。
         if (writePendingMarker(request, marker) == 1) return Outcome.RETRY_OWNED;
 
-        // The marker CAS deliberately fails after another tool job/version takes ownership.
-        // Treat that as superseded so the stale writer cannot block the new owner's polling.
+        // marker CAS 在任务身份或版本已经变化时会故意失败。
+        // 此时旧写者必须退场，不能阻塞新 owner 的正常轮询。
         if (!hasSameFrozenOwner(request)) return Outcome.SUPERSEDED;
 
+        // CAS 也可能因为同一 marker 已由另一个线程写入；读取 last_error 识别幂等成功。
         AgentRun current = runMapper.findById(request.getRunId());
         if (current != null && markerOwnsSameTuple(current.getLastError(), request)) {
             return Outcome.RETRY_OWNED;
         }
 
-        // Same owner still exists but marker CAS lost for a transient reason. One bounded
-        // retry of the narrow failure merge gives this path a durable disposition without
-        // overwriting an unrelated last_error.
+        // 同一 owner 仍存在但 marker 因瞬时原因失败，只允许一次有界窄写重试。
+        // 不能无界循环，也不能覆盖不相关 last_error。
         try {
             if (anchorService.markCheckpointFailed(request, "durable_checkpoint_write_failed")) {
                 return Outcome.FAILURE_OWNED;
@@ -67,19 +79,24 @@ public class ToolJobCheckpointFailureRecoveryService {
             log.warn("Checkpoint-failure bounded retry failed run={}: {}",
                     request.getRunId(), e.getMessage());
         }
+        // 最后一次重读区分“仍无人持有”与“已被新任务取代”。
         return hasSameFrozenOwner(request) ? Outcome.UNOWNED : Outcome.SUPERSEDED;
     }
 
     /** @return true when no pending marker exists or this call durably resolved it. */
     public boolean retryPending(String runId) {
+        // 重启/周期扫描从数据库读取 marker；Redis 不参与所有权判断。
         AgentRun run = runMapper.findById(runId);
+        // 没有 marker 代表无需重试，幂等返回 true。
         if (run == null || run.getLastError() == null
                 || !run.getLastError().startsWith(MARKER_PREFIX)) {
             return true;
         }
+        // 保留原 marker 字符串，最终 compare-clear 必须精确匹配它。
         String marker = run.getLastError();
         ToolJobCheckpointRequest request;
         try {
+            // marker 中含完整冻结元组和 checkpoint 上下文，可跨进程重建请求。
             PendingFailure pending = objectMapper.readValue(
                     marker.substring(MARKER_PREFIX.length()), PendingFailure.class);
             request = pending.toRequest();
@@ -87,15 +104,17 @@ public class ToolJobCheckpointFailureRecoveryService {
             log.error("Invalid checkpoint-failure retry marker run={}", runId, e);
             return false;
         }
+        // 如果健康的新 checkpoint 已经存在，marker 可以直接清理。
         boolean resolved = hasEquivalentOrNewerCheckpoint(request);
         if (!resolved && !hasSameFrozenOwner(request)) {
-            // The marker belongs to an old owner. Compare-clear it and let the current
-            // tool job resume normal polling instead of retrying an impossible old tuple.
+            // marker 属于旧 owner：把它视为已解决并 compare-clear，当前工具继续正常轮询。
             resolved = true;
         } else if (!resolved) {
+            // 同一冻结 owner 仍有效，再次执行窄失败合并。
             resolved = anchorService.markCheckpointFailed(
                     request, "durable_checkpoint_write_failed");
         }
+        // 只有处置已落稳且 last_error 仍等于原 marker 时才清理，避免删掉新错误。
         return resolved && runMapper.clearToolJobCheckpointFailurePending(runId, marker) == 1;
     }
 
@@ -107,11 +126,13 @@ public class ToolJobCheckpointFailureRecoveryService {
 
     private boolean hasSameFrozenOwner(ToolJobCheckpointRequest request) {
         try {
+            // 每次都从数据库读取当前 anchor，判断旧请求是否仍拥有同一元组。
             AgentRun run = runMapper.findById(request.getRunId());
             if (run == null || run.getStatus() != AgentRunStatus.WAITING_TOOL_JOB
                     || blank(run.getToolJobAnchorJson())) {
                 return false;
             }
+            // operation/toolCall/attempt/task/version 任一变化都表示所有权已经转移。
             ToolJobAnchor anchor = ToolJobAnchor.fromJson(run.getToolJobAnchorJson());
             return anchor != null
                     && Objects.equals(anchor.getOperationId(), request.getOperationId())
@@ -122,6 +143,7 @@ public class ToolJobCheckpointFailureRecoveryService {
         } catch (Exception e) {
             log.warn("Failed to classify checkpoint-failure owner run={}: {}",
                     request.getRunId(), e.getMessage());
+            // 分类异常时保守返回 true，避免把仍有效的失败 owner 错判为 superseded 后丢失处置。
             return true;
         }
     }
@@ -144,6 +166,7 @@ public class ToolJobCheckpointFailureRecoveryService {
 
     boolean hasEquivalentOrNewerCheckpoint(ToolJobCheckpointRequest request) {
         try {
+            // 先校验身份、版本推进和所有标量字段；任一不一致都不是等价 checkpoint。
             ToolJobAnchor anchor = anchorService.loadAnchor(request.getRunId());
             if (anchor == null
                     || !Objects.equals(anchor.getOperationId(), request.getOperationId())
@@ -160,12 +183,14 @@ public class ToolJobCheckpointFailureRecoveryService {
                     || blank(request.getEstimateJson())) {
                 return false;
             }
+            // JSON 使用结构等价比较，忽略字段顺序但不忽略实际内容差异。
             return Objects.equals(anchor.getDatasetSnapshotDigest(), request.getDatasetSnapshotDigest())
                     && jsonEquals(anchor.getCompletedTodosJson(), objectMapper.valueToTree(request.getCompletedTodos()))
                     && jsonEquals(anchor.getDatasetSnapshotJson(), objectMapper.readTree(request.getDatasetSnapshotJson()))
                     && jsonEquals(anchor.getDatasetRefsJson(), objectMapper.readTree(request.getDatasetRefsJson()))
                     && jsonEquals(anchor.getEstimateJson(), objectMapper.readTree(request.getEstimateJson()));
         } catch (Exception e) {
+            // 无法证明等价时返回 false，绝不以解析失败为理由清理失败 owner。
             log.warn("Failed to verify newer checkpoint owner run={}: {}", request.getRunId(), e.getMessage());
             return false;
         }

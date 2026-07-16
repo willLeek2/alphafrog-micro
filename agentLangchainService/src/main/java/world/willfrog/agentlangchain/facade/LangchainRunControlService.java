@@ -102,10 +102,10 @@ public class LangchainRunControlService {
         String runId = run.getId();
         String userId = run.getUserId();
 
-        // 0. Durable disposition FIRST: detect active anchor and persist cancel
-        //    disposition before any Redis/DB mutation. If this fails, the run is
-        //    left untouched so the reconciler can still process when the sandbox
-        //    terminal arrives. Order matters: durable before volatile.
+        // 0. 先处理 durable disposition：取消一个正在等待长工具的 Run 时，不能直接把数据库状态改成
+        //    CANCELED。finalizer 后续仍需以 WAITING_TOOL_JOB 为 CAS 前置条件接管 terminal result、释放
+        //    Sandbox 容量并完成幂等收口，因此这里只在 anchor 中关闭 autoResume、记录 CANCELED 意图。
+        //    任何 anchor 读写失败都保持 Run 原状，让 reconciler 未来仍能处理，顺序必须是持久层先于 Redis。
         boolean hasActiveAnchor = false;
         try {
             ToolJobAnchor toolAnchor = anchorService.loadAnchor(runId);
@@ -127,9 +127,8 @@ public class LangchainRunControlService {
         } catch (IllegalStateException e) {
             throw e;
         } catch (Exception e) {
-            // Fail-closed: any anchor load/update failure prevents cancel entirely.
-            // Do NOT fall back to standard cancel — that would set CANCELED status
-            // and leak the reservation exactly like the original bug.
+            // fail-closed：不能退化到普通取消路径；否则 WAITING_TOOL_JOB 被提前覆盖后，finalizer CAS
+            // 永远失败，外部工具 reservation 也就失去唯一的释放责任人。
             log.error("Failed to persist cancel disposition on tool-job anchor for run={} — "
                     + "cancel aborted to prevent capacity leak: {}", runId, e.getMessage());
             throw new IllegalStateException(
@@ -153,8 +152,8 @@ public class LangchainRunControlService {
                 runId, run.getSnapshotJson(), AgentRunStatus.CANCELED);
         // 5. 更新 DB：snapshot、status、TTL（中断的 run 过期时间比正常完成的短）
         if (hasActiveAnchor) {
-            // Keep current DB status for finalizer CAS (the reconciler will finalize
-            // terminal sinks and transition to CANCELED after capacity release).
+            // 有活跃 anchor 时保留数据库现状，给 finalizer 留住 CAS 前置条件；这里只更新可观测快照。
+            // terminal sinks 与容量释放完成后，finalizer 才把持久状态收口为 CANCELED。
             runMapper.updateSnapshot(runId, userId, run.getStatus(), snapshot, false, null);
         } else {
             runMapper.updateSnapshot(runId, userId, AgentRunStatus.CANCELED, snapshot, false, null);
@@ -174,9 +173,8 @@ public class LangchainRunControlService {
         }
         AgentRun refreshed = readService.requireReadableRun(runId, userId);
         if (hasActiveAnchor) {
-            // API response must show CANCELED even though DB stays WAITING_TOOL_JOB
-            // for the finalizer CAS. The finalizer transitions to CANCELED after
-            // terminal sinks complete.
+            // API 立即展示 CANCELED 以响应用户，但数据库暂时仍是 WAITING_TOOL_JOB；这是展示态与
+            // 收口态的有意分离，不代表 worker 仍被占用。最终持久状态由 finalizer 在释放容量后写入。
             return AgentLangchainRunMessageMapper.toRunMessage(refreshed).toBuilder()
                     .setStatus(AgentRunStatus.CANCELED.name())
                     .build();

@@ -6,29 +6,41 @@ import java.util.Collections;
 import java.util.List;
 
 /**
- * Immutable checkpoint payload captured by the pipeline before suspending
- * for a slow tool job. Contains everything needed to restore execution state
- * when the sandbox result arrives and the resume launcher takes over.
+ * pipeline 在让出 worker 之前捕获的不可变 checkpoint 写入请求。
+ *
+ * <p>身份字段用于数据库 CAS；上下文字段用于新 worker 恢复；版本必须由调用方
+ * 显式传入，禁止 Builder 的默认 0 被误认为合法 expected version。</p>
  */
 public class ToolJobCheckpointRequest {
 
+    // runId 定位数据库 Run 行。
     private final String runId;
+    // operationId、toolCallId、attempt、taskId 组成冻结的外部任务身份。
     private final String operationId;
     private final String toolCallId;
     private final int attempt;
     private final String taskId;
+    // expectedCheckpointVersion 是本写者捕获时的版本栅栏。
     private final int expectedCheckpointVersion;
+    // todoId + sequence 描述恢复注入位置。
     private final String todoId;
     private final int sequence;
+    // completedTodos 保存不会重新执行的计划前缀。
     private final List<CompletedTodoRecord> completedTodos;
+    // snapshot 正文与 digest 成对保存并在写入/恢复两端校验。
     private final String datasetSnapshotJson;
     private final String datasetSnapshotDigest;
+    // datasetRefsJson 兼容恢复已注册的结果引用。
     private final String datasetRefsJson;
+    // toolCallsUsed 延续 Run 工具调用预算。
     private final int toolCallsUsed;
+    // estimateJson 供终态 envelope 和容量释放使用。
     private final String estimateJson;
+    // 单独记录 setter 是否调用，区分“明确期望 0”与“忘记设置版本”。
     private final boolean versionExplicitlySet;
 
     private ToolJobCheckpointRequest(Builder builder) {
+        // 构造后所有字段均不可变，写库期间不会被 pipeline 线程继续修改。
         this.runId = builder.runId;
         this.operationId = builder.operationId;
         this.toolCallId = builder.toolCallId;
@@ -38,6 +50,7 @@ public class ToolJobCheckpointRequest {
         this.expectedCheckpointVersion = builder.expectedCheckpointVersion;
         this.todoId = builder.todoId;
         this.sequence = builder.sequence;
+        // 包装为不可修改列表，避免 capture 与 SQL 写入之间发生内容漂移。
         this.completedTodos = builder.completedTodos != null
                 ? Collections.unmodifiableList(builder.completedTodos) : null;
         this.datasetSnapshotJson = builder.datasetSnapshotJson;
@@ -91,7 +104,9 @@ public class ToolJobCheckpointRequest {
         public Builder attempt(int attempt) { this.attempt = attempt; return this; }
         public Builder taskId(String taskId) { this.taskId = taskId; return this; }
         public Builder expectedCheckpointVersion(int expectedCheckpointVersion) {
+            // 保存捕获时版本；数据库 SQL 会以它作为 WHERE 条件。
             this.expectedCheckpointVersion = expectedCheckpointVersion;
+            // 即使版本值为 0，也要记住调用方确实显式提供过。
             this.versionExplicitlySet = true;
             return this;
         }
@@ -105,10 +120,12 @@ public class ToolJobCheckpointRequest {
         public Builder estimateJson(String estimateJson) { this.estimateJson = estimateJson; return this; }
 
         public ToolJobCheckpointRequest build() {
+            // 忘记版本会把默认 0 当 CAS 条件，可能在旧数据上意外成功，因此构造期即拒绝。
             if (!versionExplicitlySet) {
                 throw new IllegalStateException(
                         "expectedCheckpointVersion must be explicitly set; missing value may silently accept wrong version");
             }
+            // 所有业务字段的完整类型校验由 CheckpointService 在读取最新 anchor 后执行。
             return new ToolJobCheckpointRequest(this);
         }
     }

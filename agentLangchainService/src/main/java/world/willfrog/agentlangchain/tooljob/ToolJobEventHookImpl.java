@@ -11,7 +11,7 @@ import world.willfrog.agent.platform.service.AgentEventService;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
-/** Emits the logical external-tool terminal event exactly once. */
+/** 把后台工具终态转换为唯一一条 {@code TOOL_CALL_FINISHED} 事件。 */
 @Service
 @RequiredArgsConstructor
 @Slf4j
@@ -22,14 +22,18 @@ public class ToolJobEventHookImpl implements ToolJobEventHook {
 
     @Override
     public boolean emitTerminalEvent(String runId, ToolJobAnchor anchor) {
+        // 事件至少需要 Run 和 toolCall 身份；缺失时阻塞 finalizer 而不是发匿名事件。
         if (isBlank(runId) || anchor == null || isBlank(anchor.getToolCallId())) {
             return false;
         }
+        // userId 从数据库 Run 读取，避免信任旧 worker 的 ThreadLocal。
         AgentRun run = runMapper.findById(runId);
         if (run == null || isBlank(run.getUserId())) {
             return false;
         }
+        // 同一逻辑工具调用只有一个终态事件，finalizer 重入复用该 key。
         String dedupeKey = runId + ":" + anchor.getToolCallId() + ":logical_terminal";
+        // LinkedHashMap 保持诊断输出字段顺序稳定。
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("run_id", runId);
         payload.put("tool_call_id", anchor.getToolCallId());
@@ -43,8 +47,7 @@ public class ToolJobEventHookImpl implements ToolJobEventHook {
         put(payload, "error_code", anchor.getTerminalErrorCode());
         put(payload, "resource_usage", anchor.getTerminalUsageJson());
         try {
-            // false means the same logical event already exists; that is still a
-            // successful idempotent hook outcome and must not block the finalizer.
+            // appendOnce 若发现同一 key 已存在仍是幂等成功，不阻塞 finalizer 后续恢复。
             eventService.appendOnce(runId, run.getUserId(), "TOOL_CALL_FINISHED", dedupeKey, payload);
             return true;
         } catch (Exception e) {
