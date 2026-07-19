@@ -1,5 +1,0 @@
-schemaVersion,status,case,preset,elapsedMillis,processPeakRssKiB,rowCount,datasetCount,chunkCount,logicalBytesScanned,datasetOpenCount
-data_intense_loader_benchmark_result_v1,PASS,typed,full,44,120464,150000,1,0,10496047,1
-data_intense_loader_benchmark_result_v1,PASS,usecols,full,110,125808,500000,1,0,35039435,1
-data_intense_loader_benchmark_result_v1,PASS,chunk,full,143,123968,500000,1,10,35039435,1
-data_intense_loader_benchmark_result_v1,PASS,small_files,full,155,82800,100000,100,0,6700000,100
