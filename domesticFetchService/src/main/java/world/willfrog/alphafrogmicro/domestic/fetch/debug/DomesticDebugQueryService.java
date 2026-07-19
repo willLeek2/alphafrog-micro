@@ -23,6 +23,7 @@ import world.willfrog.alphafrogmicro.common.dao.domestic.index.IndexWeightDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.index.SwIndustryClassifyDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.index.SwIndustryMemberDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.stock.StockInfoDao;
+import world.willfrog.alphafrogmicro.common.utils.DateConvertUtils;
 import world.willfrog.alphafrogmicro.domestic.fetch.utils.TuShareRequestUtils;
 
 @Service
@@ -86,8 +87,8 @@ public class DomesticDebugQueryService {
                                                                       double minAmount,
                                                                       int count) {
         int limit = requireCount(count);
-        Long start = requireDate(startDate, "start_date");
-        Long end = requireDate(endDate, "end_date");
+        Long start = requireDateTimestamp(startDate, "start_date");
+        Long end = requireDateTimestamp(endDate, "end_date");
         if (start > end) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "start_date must be <= end_date");
         }
@@ -119,17 +120,18 @@ public class DomesticDebugQueryService {
         return value.trim();
     }
 
-    private Long requireDate(String value, String name) {
+    private Long requireDateTimestamp(String value, String name) {
         String normalized = requireText(value, name);
         if (!normalized.matches("\\d{8}")) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, name + " must be YYYYMMDD");
         }
         try {
-            LocalDate.parse(normalized, DateTimeFormatter.BASIC_ISO_DATE);
+            LocalDate date = LocalDate.parse(normalized, DateTimeFormatter.BASIC_ISO_DATE);
+            // HTTP 请求保持 yyyyMMdd；行情表按 Asia/Shanghai 当日零点的毫秒时间戳存储。
+            return DateConvertUtils.convertLocalDateToMsTimestamp(date);
         } catch (DateTimeException e) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, name + " must be a valid YYYYMMDD date");
         }
-        return Long.parseLong(normalized);
     }
 
     private List<DebugAssetNameResponse> toAssetNames(List<Map<String, Object>> rows) {

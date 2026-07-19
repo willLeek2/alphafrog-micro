@@ -108,8 +108,9 @@ class DomesticDebugQueryServiceTest {
     }
 
     @Test
-    void randomIndexNamesByAmountRangeShouldValidateDatesAndQueryDao() {
-        when(indexQuoteDao.getRandomIndexNamesByAmountRange(20250101L, 20251231L, 100000.0, 2))
+    void randomIndexNamesByAmountRangeShouldConvertYyyyMmDdToShanghaiEpochMilliseconds() {
+        when(indexQuoteDao.getRandomIndexNamesByAmountRange(
+                1735660800000L, 1767110400000L, 100000.0, 2))
                 .thenReturn(List.of(
                         Map.of("ts_code", "000300.SH", "name", "沪深300"),
                         Map.of("ts_code", "000905.SH", "name", "中证500")
@@ -122,6 +123,8 @@ class DomesticDebugQueryServiceTest {
                 new DebugAssetNameResponse("000300.SH", "沪深300"),
                 new DebugAssetNameResponse("000905.SH", "中证500")
         ), result);
+        verify(indexQuoteDao).getRandomIndexNamesByAmountRange(
+                1735660800000L, 1767110400000L, 100000.0, 2);
     }
 
     @Test
