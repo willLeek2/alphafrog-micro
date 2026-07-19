@@ -46,7 +46,7 @@ class AdvancedSearchEngineTest {
     private final DomesticIndexService indexService = mock(DomesticIndexService.class);
     private final DomesticListedAssetService listedAssetService = mock(DomesticListedAssetService.class);
     private final IndexWeightDao indexWeightDao = mock(IndexWeightDao.class);
-    private final AdvancedSearchEngine engine = new AdvancedSearchEngine(indexService, listedAssetService, indexWeightDao);
+    private final AdvancedSearchEngine engine = new AdvancedSearchEngine(indexService, listedAssetService, indexWeightDao, null);
 
     @Nested
     @DisplayName("searchIndex + has_stock")

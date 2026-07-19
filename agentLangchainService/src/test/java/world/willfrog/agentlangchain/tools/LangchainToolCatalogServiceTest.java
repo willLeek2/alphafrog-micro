@@ -48,7 +48,8 @@ class LangchainToolCatalogServiceTest {
         JsonNode searchIndexProps = objectMapper.readTree(searchIndex.getParametersJson()).path("properties");
         assertTrue(searchIndexProps.has("keyword"));
         assertTrue(searchIndexProps.has("mode"));
-        assertTrue(searchIndexProps.path("query").path("properties").has("conditions"));
+        assertTrue(searchIndexProps.has("advancedQuery"));
+        assertTrue(searchIndexProps.path("advancedQuery").path("properties").has("conditions"));
 
         AgentToolMessage searchAssetInfo = tools.stream()
                 .filter(tool -> "searchAssetInfo".equals(tool.getName()))
@@ -56,10 +57,11 @@ class LangchainToolCatalogServiceTest {
                 .orElseThrow();
         JsonNode searchAssetProps = objectMapper.readTree(searchAssetInfo.getParametersJson()).path("properties");
         assertTrue(searchAssetProps.has("query"));
-        assertTrue(searchAssetProps.path("query").path("anyOf").get(1).path("properties").has("conditions"));
+        assertTrue(searchAssetProps.has("advancedQuery"));
+        assertTrue(searchAssetProps.path("advancedQuery").path("properties").has("asset_type"));
+        assertTrue(searchAssetProps.path("advancedQuery").path("properties").has("conditions"));
         assertTrue(searchAssetProps.has("assetTypes"));
-        assertTrue(searchAssetProps.has("asset_type"));
-        assertTrue(searchAssetProps.has("conditions"));
+        assertTrue(searchAssetProps.has("mode"));
     }
 
     @Test

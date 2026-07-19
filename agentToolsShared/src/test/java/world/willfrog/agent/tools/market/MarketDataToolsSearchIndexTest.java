@@ -62,7 +62,7 @@ class MarketDataToolsSearchIndexTest {
         ReflectionTestUtils.setField(tools, "domesticIndexService", indexService);
 
         Map<String, Object> response = objectMapper.readValue(
-                tools.searchIndex("沪深300"),
+                tools.searchIndex("沪深300", null, null),
                 new TypeReference<>() {}
         );
 

@@ -23,52 +23,42 @@ public class AdvancedSearchRequest {
         if (params == null) {
             return false;
         }
-        String mode = str(params.get("mode"));
-        if ("advanced".equalsIgnoreCase(mode)) {
-            return true;
-        }
-        Object query = params.get("query");
-        return query instanceof Map<?, ?> map && "advanced".equalsIgnoreCase(str(map.get("mode")));
+        return "advanced".equalsIgnoreCase(str(params.get("mode")));
     }
 
     public static AdvancedSearchRequest from(String toolName, Map<String, Object> params, ObjectMapper objectMapper) {
         Map<String, Object> root = params == null ? new LinkedHashMap<>() : new LinkedHashMap<>(params);
-        Object queryObject = root.get("query");
-        if (queryObject instanceof String raw && raw.trim().startsWith("{")) {
-            try {
-                queryObject = objectMapper.readValue(raw, new TypeReference<Map<String, Object>>() {});
-            } catch (Exception e) {
-                throw new AdvancedSearchException("INVALID_ARGUMENT", "query JSON is invalid.");
-            }
-        }
-        Map<String, Object> query = queryObject instanceof Map<?, ?> rawMap ? stringifyKeys(rawMap) : new LinkedHashMap<>();
-        if ("advanced".equalsIgnoreCase(str(query.get("mode")))) {
-            root.putAll(query);
-            Object nested = query.get("query");
-            query = nested instanceof Map<?, ?> nestedMap ? stringifyKeys(nestedMap) : query;
-        } else if (query.containsKey("conditions") || query.containsKey("name")) {
-            root.put("mode", "advanced");
-        }
-
         if (!"advanced".equalsIgnoreCase(str(root.get("mode")))) {
             throw new AdvancedSearchException("INVALID_ARGUMENT", "mode=advanced is required.");
         }
 
+        Object advancedQueryObject = root.get("advancedQuery");
+        if (advancedQueryObject instanceof String raw && raw.trim().startsWith("{")) {
+            try {
+                advancedQueryObject = objectMapper.readValue(raw, new TypeReference<Map<String, Object>>() {});
+            } catch (Exception e) {
+                throw new AdvancedSearchException("INVALID_ARGUMENT", "advancedQuery JSON is invalid.");
+            }
+        }
+        Map<String, Object> advancedQuery = advancedQueryObject instanceof Map<?, ?> rawMap
+                ? stringifyKeys(rawMap)
+                : new LinkedHashMap<>();
+
         AdvancedSearchRequest request = new AdvancedSearchRequest();
         request.toolName = toolName;
-        request.assetType = normalizeAssetType(firstString(root, "asset_type", "assetType", "assetTypes", "asset_types"));
-        request.name = firstString(query, "name", "keyword");
+        request.assetType = normalizeAssetType(firstString(advancedQuery, "asset_type", "assetType", "assetTypes", "asset_types"));
+        request.name = firstString(advancedQuery, "name", "keyword");
         if (request.name.isBlank()) {
             request.name = firstString(root, "name", "keyword");
         }
 
-        Object conditionsRaw = query.containsKey("conditions") ? query.get("conditions") : root.get("conditions");
+        Object conditionsRaw = advancedQuery.get("conditions");
         if (conditionsRaw instanceof List<?> list) {
             for (int i = 0; i < list.size(); i++) {
                 request.conditions.add(AdvancedSearchCondition.from(i, list.get(i)));
             }
         } else if (conditionsRaw != null) {
-            throw new AdvancedSearchException("INVALID_ARGUMENT", "query.conditions must be an array.");
+            throw new AdvancedSearchException("INVALID_ARGUMENT", "advancedQuery.conditions must be an array.");
         }
         if (request.name.isBlank() && request.conditions.isEmpty()) {
             throw new AdvancedSearchException("INVALID_ARGUMENT", "advanced query requires name or conditions.");
@@ -82,6 +72,7 @@ public class AdvancedSearchRequest {
             row.put("type", condition.getType());
             row.put("index_code", condition.getIndexCode());
             row.put("stock_code", condition.getStockCode());
+            row.put("industry_code", condition.getIndustryCode());
             row.put("start_date", condition.getStartDate());
             row.put("end_date", condition.getEndDate());
             row.put("min_weight", condition.getMinWeight());

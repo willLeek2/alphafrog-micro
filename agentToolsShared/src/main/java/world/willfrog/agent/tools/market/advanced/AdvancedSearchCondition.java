@@ -15,6 +15,7 @@ public class AdvancedSearchCondition {
     private String type;
     private String indexCode;
     private String stockCode;
+    private String industryCode;
     private String startDate;
     private String endDate;
     private Long startDateValue;
@@ -32,6 +33,7 @@ public class AdvancedSearchCondition {
         condition.type = normalizeString(source.get("type")).toLowerCase(Locale.ROOT);
         condition.indexCode = normalizeString(first(source, "index_code", "indexCode"));
         condition.stockCode = normalizeString(first(source, "stock_code", "stockCode"));
+        condition.industryCode = normalizeString(first(source, "industry_code", "industryCode"));
         condition.startDate = normalizeDateBoundary(first(source, "start_date", "startDate"), "start_date");
         condition.endDate = normalizeDateBoundary(first(source, "end_date", "endDate"), "end_date");
         condition.startDateValue = dateValue(condition.startDate);

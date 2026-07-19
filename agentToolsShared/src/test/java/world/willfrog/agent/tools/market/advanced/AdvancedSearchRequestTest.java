@@ -48,13 +48,7 @@ class AdvancedSearchRequestTest {
         @Test
         @DisplayName("顶层 mode=advanced 应识别为 advanced")
         void topLevelAdvancedDetected() {
-            assertTrue(AdvancedSearchRequest.isAdvancedMap(Map.of("mode", "advanced", "keyword", "X")));
-        }
-
-        @Test
-        @DisplayName("query 内 mode=advanced 应识别为 advanced")
-        void nestedAdvancedDetected() {
-            assertTrue(AdvancedSearchRequest.isAdvancedMap(Map.of("query", Map.of("mode", "advanced"))));
+            assertTrue(AdvancedSearchRequest.isAdvancedMap(Map.of("mode", "advanced", "advancedQuery", Map.of())));
         }
 
         @Test
@@ -65,7 +59,7 @@ class AdvancedSearchRequestTest {
     }
 
     @Nested
-    @DisplayName("顶层 mode=advanced 正常解析")
+    @DisplayName("顶层 mode=advanced + advancedQuery 正常解析")
     class TopLevelModeAdvanced {
 
         private final ObjectMapper objectMapper = new ObjectMapper();
@@ -73,19 +67,19 @@ class AdvancedSearchRequestTest {
         @Test
         @DisplayName("完整 ETF 查询字段映射到 request 与 canonicalQuery")
         void parsesTopLevelAdvancedFields() {
-            Map<String, Object> params = new LinkedHashMap<>();
-            params.put("mode", "advanced");
-            params.put("asset_type", "ETF");
-            params.put("name", "沪深300");
-            Map<String, Object> query = new LinkedHashMap<>();
-            query.put("name", "沪深300");
-            query.put("conditions", List.of(Map.of(
+            Map<String, Object> advancedQuery = new LinkedHashMap<>();
+            advancedQuery.put("asset_type", "ETF");
+            advancedQuery.put("name", "沪深300");
+            advancedQuery.put("conditions", List.of(Map.of(
                     "type", "has_stock",
                     "stock_code", "000001.SZ",
                     "start_date", "20240101",
                     "end_date", "20241231"
             )));
-            params.put("query", query);
+
+            Map<String, Object> params = new LinkedHashMap<>();
+            params.put("mode", "advanced");
+            params.put("advancedQuery", advancedQuery);
 
             AdvancedSearchRequest req = AdvancedSearchRequest.from(TOOL_NAME, params, objectMapper);
 
@@ -102,55 +96,26 @@ class AdvancedSearchRequestTest {
     }
 
     @Nested
-    @DisplayName("query 内嵌套 mode=advanced")
-    class NestedModeAdvanced {
+    @DisplayName("advancedQuery 作为 JSON 字符串")
+    class AdvancedQueryAsJsonString {
 
         private final ObjectMapper objectMapper = new ObjectMapper();
 
         @Test
-        @DisplayName("query.mode=advanced 应展开为顶层")
-        void parsesNestedAdvancedFields() {
-            Map<String, Object> query = new LinkedHashMap<>();
-            query.put("mode", "advanced");
-            query.put("asset_type", "stock");
-            query.put("name", "银行");
-            query.put("conditions", List.of(Map.of(
-                    "type", "index_component",
-                    "index_code", "000300.SH",
-                    "start_date", "20240101",
-                    "end_date", "20241231"
-            )));
-            Map<String, Object> params = Map.of("query", query);
-
-            AdvancedSearchRequest req = AdvancedSearchRequest.from(TOOL_NAME, params, objectMapper);
-
-            assertEquals("stock", req.getAssetType());
-            assertEquals("银行", req.getName());
-            assertEquals("index_component", req.getConditions().get(0).getType());
-            assertEquals("000300.SH", req.getConditions().get(0).getIndexCode());
-        }
-    }
-
-    @Nested
-    @DisplayName("query 作为 JSON 字符串")
-    class QueryAsJsonString {
-
-        private final ObjectMapper objectMapper = new ObjectMapper();
-
-        @Test
-        @DisplayName("query 字符串应被反序列化后用于解析")
-        void parsesQueryJsonString() throws Exception {
-            Map<String, Object> inner = new LinkedHashMap<>();
-            inner.put("mode", "advanced");
-            inner.put("name", "Y");
-            inner.put("conditions", List.of());
+        @DisplayName("advancedQuery 字符串应被反序列化后用于解析")
+        void parsesAdvancedQueryJsonString() throws Exception {
+            Map<String, Object> advancedQuery = new LinkedHashMap<>();
+            advancedQuery.put("asset_type", "stock");
+            advancedQuery.put("name", "Y");
+            advancedQuery.put("conditions", List.of());
             Map<String, Object> params = Map.of(
                     "mode", "advanced",
-                    "query", objectMapper.writeValueAsString(inner)
+                    "advancedQuery", objectMapper.writeValueAsString(advancedQuery)
             );
 
             AdvancedSearchRequest req = AdvancedSearchRequest.from(TOOL_NAME, params, objectMapper);
 
+            assertEquals("stock", req.getAssetType());
             assertEquals("Y", req.getName());
             assertTrue(req.getConditions().isEmpty());
             assertTrue(((List<?>) req.getCanonicalQuery().get("conditions")).isEmpty());
@@ -168,7 +133,7 @@ class AdvancedSearchRequestTest {
         void nameOnlyShouldPass() {
             Map<String, Object> params = Map.of(
                     "mode", "advanced",
-                    "name", "沪深300"
+                    "advancedQuery", Map.of("name", "沪深300")
             );
 
             AdvancedSearchRequest req = AdvancedSearchRequest.from(TOOL_NAME, params, objectMapper);
@@ -183,12 +148,12 @@ class AdvancedSearchRequestTest {
         void conditionsOnlyShouldPass() {
             Map<String, Object> params = Map.of(
                     "mode", "advanced",
-                    "conditions", List.of(Map.of(
+                    "advancedQuery", Map.of("conditions", List.of(Map.of(
                             "type", "has_stock",
                             "stock_code", "000001.SZ",
                             "start_date", "20240101",
                             "end_date", "20241231"
-                    ))
+                    )))
             );
 
             AdvancedSearchRequest req = AdvancedSearchRequest.from(TOOL_NAME, params, objectMapper);
@@ -221,13 +186,13 @@ class AdvancedSearchRequestTest {
     }
 
     @Nested
-    @DisplayName("name 与 conditions 都为空时的拒绝行为")
+    @DisplayName("advancedQuery 为空时的拒绝行为")
     class BothBlank {
 
         private final ObjectMapper objectMapper = new ObjectMapper();
 
         @Test
-        @DisplayName("空 body 应抛 INVALID_ARGUMENT")
+        @DisplayName("mode=advanced 但 advancedQuery 为空应抛 INVALID_ARGUMENT")
         void emptyAdvancedBodyRejected() {
             Map<String, Object> params = Map.of("mode", "advanced");
 
@@ -251,15 +216,17 @@ class AdvancedSearchRequestTest {
         void nonArrayConditionsRejected() {
             Map<String, Object> params = new LinkedHashMap<>();
             params.put("mode", "advanced");
-            params.put("name", "X");
-            params.put("conditions", "not-an-array");
+            params.put("advancedQuery", Map.of(
+                    "name", "X",
+                    "conditions", "not-an-array"
+            ));
 
             AdvancedSearchException ex = invalid(() ->
                     AdvancedSearchRequest.from(TOOL_NAME, params, objectMapper));
 
             assertEquals("INVALID_ARGUMENT", ex.getCode());
-            assertTrue(ex.getMessage().contains("query.conditions must be an array"),
-                    "异常消息应包含 query.conditions must be an array，实际: " + ex.getMessage());
+            assertTrue(ex.getMessage().contains("advancedQuery.conditions must be an array"),
+                    "异常消息应包含 advancedQuery.conditions must be an array，实际: " + ex.getMessage());
         }
     }
 
@@ -270,12 +237,14 @@ class AdvancedSearchRequestTest {
         private final ObjectMapper objectMapper = new ObjectMapper();
 
         @Test
-        @DisplayName("asset_type=ETF 应小写为 etf")
+        @DisplayName("advancedQuery.asset_type=ETF 应小写为 etf")
         void uppercaseEtfLowercased() {
             Map<String, Object> params = Map.of(
                     "mode", "advanced",
-                    "name", "X",
-                    "asset_type", "ETF"
+                    "advancedQuery", Map.of(
+                            "name", "X",
+                            "asset_type", "ETF"
+                    )
             );
 
             AdvancedSearchRequest req = AdvancedSearchRequest.from(TOOL_NAME, params, objectMapper);
@@ -284,12 +253,14 @@ class AdvancedSearchRequestTest {
         }
 
         @Test
-        @DisplayName("assetType=Stock 应小写为 stock")
+        @DisplayName("advancedQuery.assetType=Stock 应小写为 stock")
         void camelCaseStockLowercased() {
             Map<String, Object> params = Map.of(
                     "mode", "advanced",
-                    "name", "X",
-                    "assetType", "Stock"
+                    "advancedQuery", Map.of(
+                            "name", "X",
+                            "assetType", "Stock"
+                    )
             );
 
             AdvancedSearchRequest req = AdvancedSearchRequest.from(TOOL_NAME, params, objectMapper);
@@ -298,12 +269,14 @@ class AdvancedSearchRequestTest {
         }
 
         @Test
-        @DisplayName("assetTypes 多值应取第一段并小写")
+        @DisplayName("advancedQuery.assetTypes 多值应取第一段并小写")
         void multiValueAssetTypesFirstSegment() {
             Map<String, Object> params = Map.of(
                     "mode", "advanced",
-                    "name", "X",
-                    "assetTypes", "INDEX,stock"
+                    "advancedQuery", Map.of(
+                            "name", "X",
+                            "assetTypes", "INDEX,stock"
+                    )
             );
 
             AdvancedSearchRequest req = AdvancedSearchRequest.from(TOOL_NAME, params, objectMapper);
@@ -312,12 +285,14 @@ class AdvancedSearchRequestTest {
         }
 
         @Test
-        @DisplayName("asset_type=fund 在工厂层不被拒绝，原样小写返回")
+        @DisplayName("advancedQuery.asset_type=fund 在工厂层不被拒绝，原样小写返回")
         void unknownAssetTypePassesThroughLowercased() {
             Map<String, Object> params = Map.of(
                     "mode", "advanced",
-                    "name", "X",
-                    "asset_type", "fund"
+                    "advancedQuery", Map.of(
+                            "name", "X",
+                            "asset_type", "fund"
+                    )
             );
 
             AdvancedSearchRequest req = AdvancedSearchRequest.from(TOOL_NAME, params, objectMapper);
@@ -337,12 +312,12 @@ class AdvancedSearchRequestTest {
         void canonicalKeysAreSnakeCase() {
             Map<String, Object> params = Map.of(
                     "mode", "advanced",
-                    "conditions", List.of(Map.of(
+                    "advancedQuery", Map.of("conditions", List.of(Map.of(
                             "type", "has_stock",
                             "stock_code", "000001.SZ",
                             "start_date", "20240101",
                             "end_date", "20241231"
-                    ))
+                    )))
             );
 
             AdvancedSearchRequest req = AdvancedSearchRequest.from(TOOL_NAME, params, objectMapper);
@@ -354,7 +329,7 @@ class AdvancedSearchRequestTest {
             assertEquals(1, rows.size());
             Map<String, Object> row = rows.get(0);
             assertEquals(
-                    List.of("type", "index_code", "stock_code", "start_date", "end_date", "min_weight", "max_weight"),
+                    List.of("type", "index_code", "stock_code", "industry_code", "start_date", "end_date", "min_weight", "max_weight"),
                     new java.util.ArrayList<>(row.keySet())
             );
             assertEquals("has_stock", row.get("type"));
@@ -365,56 +340,25 @@ class AdvancedSearchRequestTest {
     }
 
     @Nested
-    @DisplayName("conditions 来源优先级")
-    class ConditionsSourcePrecedence {
+    @DisplayName("advancedQuery JSON 字符串解析失败")
+    class AdvancedQueryJsonParseFailure {
 
         private final ObjectMapper objectMapper = new ObjectMapper();
 
         @Test
-        @DisplayName("query.conditions 应优先于 root.conditions")
-        void queryConditionsWinOverRootConditions() {
-            Map<String, Object> goodCondition = new LinkedHashMap<>();
-            goodCondition.put("type", "has_stock");
-            goodCondition.put("stock_code", "000001.SZ");
-            goodCondition.put("start_date", "20240101");
-            goodCondition.put("end_date", "20241231");
-
-            Map<String, Object> params = new LinkedHashMap<>();
-            params.put("mode", "advanced");
-            params.put("name", "A");
-            params.put("conditions", List.of("bad-c1"));
-            Map<String, Object> query = new LinkedHashMap<>();
-            query.put("conditions", List.of(goodCondition));
-            params.put("query", query);
-
-            AdvancedSearchRequest req = AdvancedSearchRequest.from(TOOL_NAME, params, objectMapper);
-
-            assertEquals(1, req.getConditions().size());
-            assertEquals("has_stock", req.getConditions().get(0).getType());
-            assertEquals("000001.SZ", req.getConditions().get(0).getStockCode());
-        }
-    }
-
-    @Nested
-    @DisplayName("query JSON 字符串解析失败")
-    class QueryJsonParseFailure {
-
-        private final ObjectMapper objectMapper = new ObjectMapper();
-
-        @Test
-        @DisplayName("非法 query JSON 应抛 INVALID_ARGUMENT")
-        void malformedQueryJsonRejected() {
+        @DisplayName("非法 advancedQuery JSON 应抛 INVALID_ARGUMENT")
+        void malformedAdvancedQueryJsonRejected() {
             Map<String, Object> params = Map.of(
                     "mode", "advanced",
-                    "query", "{not valid json"
+                    "advancedQuery", "{not valid json"
             );
 
             AdvancedSearchException ex = invalid(() ->
                     AdvancedSearchRequest.from(TOOL_NAME, params, objectMapper));
 
             assertEquals("INVALID_ARGUMENT", ex.getCode());
-            assertTrue(ex.getMessage().contains("query JSON is invalid"),
-                    "异常消息应包含 query JSON is invalid，实际: " + ex.getMessage());
+            assertTrue(ex.getMessage().contains("advancedQuery JSON is invalid"),
+                    "异常消息应包含 advancedQuery JSON is invalid，实际: " + ex.getMessage());
         }
     }
 
@@ -429,11 +373,11 @@ class AdvancedSearchRequestTest {
         void badStartDatePropagates() {
             Map<String, Object> params = Map.of(
                     "mode", "advanced",
-                    "conditions", List.of(Map.of(
+                    "advancedQuery", Map.of("conditions", List.of(Map.of(
                             "type", "has_stock",
                             "start_date", "bad",
                             "end_date", "20241231"
-                    ))
+                    )))
             );
 
             AdvancedSearchException ex = invalid(() ->

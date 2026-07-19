@@ -3,7 +3,9 @@ package world.willfrog.agent.tools.market.advanced;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import world.willfrog.alphafrogmicro.common.dao.domestic.index.IndexWeightDao;
+import world.willfrog.alphafrogmicro.common.dao.domestic.index.SwIndustryMemberDao;
 import world.willfrog.alphafrogmicro.common.pojo.domestic.index.IndexWeight;
+import world.willfrog.alphafrogmicro.common.pojo.domestic.index.SwIndustryMember;
 import world.willfrog.alphafrogmicro.common.utils.DateConvertUtils;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticIndexInfoByTsCodeRequest;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticIndexInfoByTsCodeResponse;
@@ -47,6 +49,7 @@ public class AdvancedSearchEngine {
     private final DomesticIndexService domesticIndexService;
     private final DomesticListedAssetService domesticListedAssetService;
     private final IndexWeightDao indexWeightDao;
+    private final SwIndustryMemberDao swIndustryMemberDao;
 
     private List<String> upstreamErrors;
 
@@ -74,6 +77,41 @@ public class AdvancedSearchEngine {
         return dataset;
     }
 
+    /**
+     * 仅解析 advanced 条件，返回匹配的股票代码列表（用于 getExchangeAssetDaily advanced 批量拉日线）。
+     *
+     * <p>与 {@link #execute} 的区别：不组装搜索展示 dataset，也不调用 listedAssetService 补名称，
+     * 只返回去重后的 ts_code 列表；调用方负责后续日线拉取。</p>
+     */
+    public List<String> resolveStockCodes(AdvancedSearchRequest request, int maxCodes) {
+        this.upstreamErrors = new ArrayList<>();
+        try {
+            Map<String, AdvancedSearchResult> candidates = null;
+            for (AdvancedSearchCondition condition : request.getConditions()) {
+                Map<String, AdvancedSearchResult> matches = switch (condition.getType()) {
+                    case "index_component" -> executeIndexComponentForStocks(condition, maxCodes, request.getConditions().size());
+                    case "sw_industry_l2_component" -> executeSwIndustryComponentForStocks(condition, maxCodes, request.getConditions().size(), 2);
+                    case "sw_industry_l3_component" -> executeSwIndustryComponentForStocks(condition, maxCodes, request.getConditions().size(), 3);
+                    default -> throw new AdvancedSearchException("INVALID_ARGUMENT",
+                            "Unsupported daily-fetch condition type: " + condition.getType());
+                };
+                candidates = intersect(candidates, matches);
+            }
+            if (candidates == null || candidates.isEmpty()) {
+                return List.of();
+            }
+            return new ArrayList<>(candidates.keySet());
+        } finally {
+            if (upstreamErrors == null) {
+                upstreamErrors = new ArrayList<>();
+            }
+        }
+    }
+
+    public List<String> getUpstreamErrors() {
+        return upstreamErrors == null ? List.of() : upstreamErrors;
+    }
+
     private Map<String, Object> executeSearchIndex(AdvancedSearchRequest request, int maxCodes) {
         Map<String, AdvancedSearchResult> candidates = request.getName().isBlank()
                 ? null : searchIndexByName(request.getName(), request.getConditions().size());
@@ -99,6 +137,10 @@ public class AdvancedSearchEngine {
             Map<String, AdvancedSearchResult> matches;
             if ("stock".equals(assetType) && "index_component".equals(condition.getType())) {
                 matches = executeIndexComponentForStocks(condition, maxCodes, request.getConditions().size());
+            } else if ("stock".equals(assetType) && "sw_industry_l2_component".equals(condition.getType())) {
+                matches = executeSwIndustryComponentForStocks(condition, maxCodes, request.getConditions().size(), 2);
+            } else if ("stock".equals(assetType) && "sw_industry_l3_component".equals(condition.getType())) {
+                matches = executeSwIndustryComponentForStocks(condition, maxCodes, request.getConditions().size(), 3);
             } else if ("etf".equals(assetType) && "has_stock".equals(condition.getType())) {
                 matches = executeHasStockForEtfs(condition, maxCodes, request.getConditions().size());
             } else {
@@ -140,6 +182,38 @@ public class AdvancedSearchEngine {
                 putReason(result, condition.getIndex(), item);
                 out.put(tsCode, result);
             });
+        }
+        return out;
+    }
+
+    private Map<String, AdvancedSearchResult> executeSwIndustryComponentForStocks(AdvancedSearchCondition condition,
+                                                                                  int maxCodes,
+                                                                                  int conditionCount,
+                                                                                  int level) {
+        String fieldName = level == 2 ? "l2_code" : "l3_code";
+        List<String> industryCodes = splitCodes(condition.getIndustryCode(), fieldName, maxCodes);
+        Map<String, AdvancedSearchResult> out = new LinkedHashMap<>();
+        for (String industryCode : industryCodes) {
+            List<SwIndustryMember> members;
+            try {
+                members = level == 2
+                        ? swIndustryMemberDao.getByL2Code(industryCode)
+                        : swIndustryMemberDao.getByL3Code(industryCode);
+            } catch (Exception e) {
+                recordUpstreamError("sw_industry_l" + level + "_component query failed for " + industryCode, e);
+                continue;
+            }
+            for (SwIndustryMember member : members) {
+                if (!"Y".equals(member.getIsNew())) {
+                    continue;
+                }
+                AdvancedSearchResult result = base(member.getTsCode(), "stock", conditionCount);
+                result.setName(member.getName());
+                result.setIndexCode(level == 2 ? member.getL2Code() : member.getL3Code());
+                result.setIndexName(level == 2 ? member.getL2Name() : member.getL3Name());
+                putSwIndustryReason(result, condition.getIndex(), member, level);
+                out.put(member.getTsCode(), result);
+            }
         }
         return out;
     }
@@ -345,6 +419,13 @@ public class AdvancedSearchEngine {
 
     private void putReason(AdvancedSearchResult result, int conditionIndex, DomesticIndexWeightItem item) {
         result.getMatchConditions().set(conditionIndex, new ArrayList<>(List.of(item.getTradeDate(), item.getWeight())));
+    }
+
+    private void putSwIndustryReason(AdvancedSearchResult result, int conditionIndex, SwIndustryMember member, int level) {
+        String code = level == 2 ? member.getL2Code() : member.getL3Code();
+        String name = level == 2 ? member.getL2Name() : member.getL3Name();
+        String l1Info = member.getL1Code() + "|" + member.getL1Name();
+        result.getMatchConditions().set(conditionIndex, new ArrayList<>(List.of(code, name, l1Info)));
     }
 
     private List<String> splitCodes(String raw, String field, int maxCodes) {

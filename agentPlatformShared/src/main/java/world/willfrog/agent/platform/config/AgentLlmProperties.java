@@ -1113,6 +1113,8 @@ public class AgentLlmProperties {
         private Integer maxParallelCalendarQueries;
         @JsonAlias({"max-parallel-queries-in-advanced-mode", "max_parallel_queries_in_advanced_mode"})
         private Integer maxParallelQueriesInAdvancedMode;
+        @JsonAlias({"max-advanced-daily-constituent-stocks", "max_advanced_daily_constituent_stocks"})
+        private Integer maxAdvancedDailyConstituentStocks;
         private Integer dagThreadPoolSize;
         private ExternalSearch externalSearch = new ExternalSearch();
         private ToolWeightedLimit toolWeightedLimit = new ToolWeightedLimit();
@@ -1147,6 +1149,14 @@ public class AgentLlmProperties {
 
         public void setMaxParallelQueriesInAdvancedMode(Object maxParallelQueriesInAdvancedMode) {
             this.maxParallelQueriesInAdvancedMode = parseIntegerOrOne(maxParallelQueriesInAdvancedMode);
+        }
+
+        public Integer getMaxAdvancedDailyConstituentStocks() {
+            return maxAdvancedDailyConstituentStocks;
+        }
+
+        public void setMaxAdvancedDailyConstituentStocks(Integer maxAdvancedDailyConstituentStocks) {
+            this.maxAdvancedDailyConstituentStocks = maxAdvancedDailyConstituentStocks;
         }
 
         public Integer getDagThreadPoolSize() {

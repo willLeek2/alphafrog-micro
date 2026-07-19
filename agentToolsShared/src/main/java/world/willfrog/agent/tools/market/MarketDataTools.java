@@ -17,11 +17,14 @@ import world.willfrog.agent.tools.dataset.DatasetManifest;
 import world.willfrog.agent.tools.dataset.DatasetRegistry;
 import world.willfrog.agent.tools.dataset.DatasetWriter;
 import world.willfrog.agent.tools.dataset.ManifestWriter;
+import world.willfrog.agent.tools.market.advanced.AdvancedSearchCondition;
 import world.willfrog.agent.tools.market.advanced.AdvancedSearchDatasetWriter;
 import world.willfrog.agent.tools.market.advanced.AdvancedSearchEngine;
 import world.willfrog.agent.tools.market.advanced.AdvancedSearchException;
 import world.willfrog.agent.tools.market.advanced.AdvancedSearchRequest;
 import world.willfrog.alphafrogmicro.common.dao.domestic.index.IndexWeightDao;
+import world.willfrog.alphafrogmicro.common.dao.domestic.index.SwIndustryMemberDao;
+import world.willfrog.alphafrogmicro.common.pojo.domestic.index.SwIndustryMember;
 import world.willfrog.alphafrogmicro.common.utils.DateConvertUtils;
 import world.willfrog.alphafrogmicro.domestic.idl.*;
 
@@ -40,6 +43,10 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 
 /**
@@ -128,13 +135,26 @@ public class MarketDataTools {
     /** 指数成分权重 DAO，advanced 搜索使用本地查询以支持日期单位转换与最新快照。 */
     private final IndexWeightDao indexWeightDao;
 
+    /** 申万行业成分 DAO，用于新工具 getStockSwIndustryInfo 及 advanced 行业成分日线拉取。 */
+    private final SwIndustryMemberDao swIndustryMemberDao;
+
     public MarketDataTools(DatasetWriter datasetWriter,
                            DatasetRegistry datasetRegistry,
                            ManifestWriter manifestWriter,
                            AgentLlmLocalConfigLoader localConfigLoader,
                            AgentLlmProperties llmProperties,
                            ObjectMapper objectMapper) {
-        this(datasetWriter, datasetRegistry, manifestWriter, localConfigLoader, llmProperties, objectMapper, null);
+        this(datasetWriter, datasetRegistry, manifestWriter, localConfigLoader, llmProperties, objectMapper, null, null);
+    }
+
+    public MarketDataTools(DatasetWriter datasetWriter,
+                           DatasetRegistry datasetRegistry,
+                           ManifestWriter manifestWriter,
+                           AgentLlmLocalConfigLoader localConfigLoader,
+                           AgentLlmProperties llmProperties,
+                           ObjectMapper objectMapper,
+                           IndexWeightDao indexWeightDao) {
+        this(datasetWriter, datasetRegistry, manifestWriter, localConfigLoader, llmProperties, objectMapper, indexWeightDao, null);
     }
 
     @Autowired
@@ -144,7 +164,8 @@ public class MarketDataTools {
                            AgentLlmLocalConfigLoader localConfigLoader,
                            AgentLlmProperties llmProperties,
                            ObjectMapper objectMapper,
-                           IndexWeightDao indexWeightDao) {
+                           IndexWeightDao indexWeightDao,
+                           SwIndustryMemberDao swIndustryMemberDao) {
         this.datasetWriter = datasetWriter;
         this.datasetRegistry = datasetRegistry;
         this.manifestWriter = manifestWriter;
@@ -152,6 +173,7 @@ public class MarketDataTools {
         this.llmProperties = llmProperties;
         this.objectMapper = objectMapper;
         this.indexWeightDao = indexWeightDao;
+        this.swIndustryMemberDao = swIndustryMemberDao;
     }
 
     @Tool("查询单只或多只股票基础信息。参数要求：tsCode 支持 | 分隔的多个代码或 JSON 数组，每个代码必须是 TuShare 格式如 000001.SZ。具体批量上限必须先调用 checkParallelLimits 查询；如果没有 checkParallelLimits 工具，默认不要批量。批量示例：\"000001.SZ|600519.SH\"；批量返回 data.mode=batch、data.results、success_count、failure_count。")
@@ -187,6 +209,53 @@ public class MarketDataTools {
         } catch (Exception e) {
             return fail("getStockInfo", "TOOL_ERROR", "查询失败，请重试或更换工具。如果持续失败，请换一种方式完成任务。",
                     Map.of("message", nvl(e.getMessage())));
+        }
+    }
+
+    @Tool("查询指定股票的申万一级、二级、三级行业信息。参数要求：tsCode 支持 | 分隔的多个代码或 JSON 数组，每个代码必须是 TuShare 格式如 000001.SZ。返回每只股票的申万行业层级映射，包含 l1_code/l1_name、l2_code/l2_name、l3_code/l3_name；如果某只股票没有申万行业数据，则对应结果项的 items 为空数组。")
+    public String getStockSwIndustryInfo(String tsCode) {
+        if (swIndustryMemberDao == null) {
+            return serviceUnavailable("getStockSwIndustryInfo", "SwIndustryMemberDao is not available");
+        }
+        int maxItems = resolveMaxParallelSearchQueries();
+        List<String> tsCodes = parseBatchValues(tsCode);
+        String limitError = batchLimitFailureIfExceeded("getStockSwIndustryInfo", "tsCode", tsCodes, maxItems);
+        if (limitError != null) {
+            return limitError;
+        }
+        if (tsCodes.size() > 1) {
+            return batchSearch("getStockSwIndustryInfo", tsCodes, this::getStockSwIndustryInfoSingle);
+        }
+        String single = tsCodes.isEmpty() ? tsCode : tsCodes.get(0);
+        return getStockSwIndustryInfoSingle(single);
+    }
+
+    private String getStockSwIndustryInfoSingle(String tsCode) {
+        String normalizedTsCode = nvl(tsCode).trim();
+        try {
+            List<SwIndustryMember> members = swIndustryMemberDao.getByTsCode(normalizedTsCode);
+            List<Map<String, Object>> items = new ArrayList<>();
+            for (SwIndustryMember member : members) {
+                Map<String, Object> row = new LinkedHashMap<>();
+                row.put("l1_code", member.getL1Code());
+                row.put("l1_name", member.getL1Name());
+                row.put("l2_code", member.getL2Code());
+                row.put("l2_name", member.getL2Name());
+                row.put("l3_code", member.getL3Code());
+                row.put("l3_name", member.getL3Name());
+                row.put("in_date", member.getInDate());
+                row.put("out_date", member.getOutDate());
+                row.put("is_new", member.getIsNew());
+                items.add(row);
+            }
+            return ok("getStockSwIndustryInfo", Map.of(
+                    "ts_code", normalizedTsCode,
+                    "count", items.size(),
+                    "items", items
+            ));
+        } catch (Exception e) {
+            return fail("getStockSwIndustryInfo", "TOOL_ERROR", "查询失败，请重试或更换工具。",
+                    Map.of("ts_code", normalizedTsCode, "message", nvl(e.getMessage())));
         }
     }
 
@@ -409,16 +478,11 @@ public class MarketDataTools {
         }
     }
 
-    @Tool("按关键词搜索指数。参数要求：keyword 必须是非空字符串，建议长度 2-40；可输入指数代码片段或指数名称关键词（例如 000300、沪深300、中证500）。支持 | 分隔的多个关键词或 JSON 数组，具体批量上限必须先调用 checkParallelLimits 查询；如果没有 checkParallelLimits 工具，默认不要批量。批量示例：\"沪深300|中证500\"；批量返回 data.mode=batch、data.results、success_count、failure_count。")
-    public String searchIndex(String keyword) {
-        Map<String, Object> advancedPayload;
-        try {
-            advancedPayload = parseAdvancedStringPayload(keyword);
-        } catch (AdvancedSearchException e) {
-            return fail("searchIndex", e.getCode(), e.getMessage(), Map.of());
-        }
-        if (advancedPayload != null) {
-            return searchIndexAdvanced(advancedPayload);
+    @Tool("按关键词搜索指数。simple 模式：keyword 必须是非空字符串，建议长度 2-40；可输入指数代码片段或指数名称关键词（例如 000300、沪深300、中证500）。支持 | 分隔的多个关键词或 JSON 数组，具体批量上限必须先调用 checkParallelLimits 查询；如果没有 checkParallelLimits 工具，默认不要批量。advanced 模式：mode=advanced，advancedQuery 传 {name?, conditions}，仅支持 has_stock 条件。批量返回 data.mode=batch、data.results、success_count、failure_count。")
+    public String searchIndex(String keyword, String mode, String advancedQuery) {
+        if (isAdvancedMode(mode)) {
+            Map<String, Object> params = buildAdvancedParams(mode, advancedQuery);
+            return searchIndexAdvanced(params);
         }
         int maxItems = resolveMaxParallelSearchQueries();
         List<String> queries = parseBatchValues(keyword);
@@ -473,19 +537,11 @@ public class MarketDataTools {
      * <p>通过 assetTypes 参数控制搜索范围，未指定时默认覆盖全部四类资产。
      * 不同资产类型会并发查询对应 Dubbo 服务，最后合并为统一结果列表。</p>
      */
-    @Tool("统一搜索股票/ETF/指数/场外基金基本信息。参数要求：query 支持 | 分隔或 JSON 数组，具体批量上限必须先调用 checkParallelLimits 查询；如果没有 checkParallelLimits 工具，默认不要批量；assetTypes 可选 stock,etf,index,off_exchange_fund（逗号分隔，默认全部）；marketScope 目前仅支持 domestic。")
-    public String searchAssetInfo(String query, String assetTypes, String marketScope) {
-        Map<String, Object> advancedPayload;
-        try {
-            advancedPayload = parseAdvancedStringPayload(query);
-        } catch (AdvancedSearchException e) {
-            return fail("searchAssetInfo", e.getCode(), e.getMessage(), Map.of());
-        }
-        if (advancedPayload != null) {
-            if (assetTypes != null && !assetTypes.isBlank()) {
-                advancedPayload.putIfAbsent("asset_type", assetTypes);
-            }
-            return searchAssetInfoAdvanced(advancedPayload);
+    @Tool("统一搜索股票/ETF/指数/场外基金基本信息。simple 模式：query 支持 | 分隔或 JSON 数组，具体批量上限必须先调用 checkParallelLimits 查询；如果没有 checkParallelLimits 工具，默认不要批量；assetTypes 可选 stock,etf,index,off_exchange_fund（逗号分隔，默认全部）；marketScope 目前仅支持 domestic。advanced 模式：mode=advanced，advancedQuery 传 {asset_type, name?, conditions}，stock 支持 index_component / sw_industry_l2_component / sw_industry_l3_component，etf 支持 has_stock。")
+    public String searchAssetInfo(String query, String assetTypes, String marketScope, String mode, String advancedQuery) {
+        if (isAdvancedMode(mode)) {
+            Map<String, Object> params = buildAdvancedParams(mode, advancedQuery);
+            return searchAssetInfoAdvanced(params);
         }
         String scope = nvl(marketScope).trim();
         if (!scope.isBlank() && !"domestic".equalsIgnoreCase(scope)) {
@@ -551,7 +607,7 @@ public class MarketDataTools {
         return ok("searchAssetInfo", data);
     }
 
-    @Tool("查询场内资产日线（股票/ETF/指数）。参数要求：tsCode 支持 | 分隔或 JSON 数组，具体批量上限必须先调用 checkParallelLimits 查询；如果没有 checkParallelLimits 工具，默认不要批量；assetType 必填 stock|etf|index；startDate/endDate 为 YYYYMMDD；priceMode 目前仅支持 raw_ohlc。对于 ETF，若数据库中有复权因子数据，返回的 dataset 会额外包含 adj_factor 列，可用于后复权计算。")
+    @Tool("查询场内资产日线（股票/ETF/指数）。simple 模式：tsCode 支持 | 分隔或 JSON 数组，assetType 必填 stock|etf|index，startDate/endDate 为 YYYYMMDD，priceMode 目前仅支持 raw_ohlc；批量上限必须先调用 checkParallelLimits 查询。advanced 模式：mode=advanced，advancedQuery 传 {asset_type, name?, conditions}，通过 index_component / sw_industry_l2_component / sw_industry_l3_component 条件批量拉取成分股日线；startDate/endDate 仍为日线日期范围；ETF 复权因子数据会额外包含 adj_factor 列。")
     /**
      * 查询场内资产日线（股票/ETF/指数），统一入口方法。
      *
@@ -562,14 +618,18 @@ public class MarketDataTools {
      *   <li>etf → 走 domesticListedAssetService，支持批量并发、复权因子补充、dataset 产物。</li>
      * </ul>
      */
-    public String getExchangeAssetDaily(String tsCode, String assetType, String startDate, String endDate, String priceMode) {
+    public String getExchangeAssetDaily(String tsCode, String assetType, String startDate, String endDate, String priceMode, String mode, String advancedQuery) {
+        if (isAdvancedMode(mode)) {
+            Map<String, Object> params = buildAdvancedParams(mode, advancedQuery);
+            return getExchangeAssetDailyAdvanced(params, assetType, startDate, endDate, priceMode);
+        }
         String type = normalizeAssetType(assetType);
         if (type.isBlank()) {
             return fail("getExchangeAssetDaily", "INVALID_ARGUMENT", "assetType is required: stock|etf|index",
                     Map.of("assetType", nvl(assetType)));
         }
-        String mode = nvl(priceMode).trim().toLowerCase();
-        if (!mode.isBlank() && !"raw_ohlc".equals(mode)) {
+        String priceModeValue = nvl(priceMode).trim().toLowerCase();
+        if (!priceModeValue.isBlank() && !"raw_ohlc".equals(priceModeValue)) {
             return fail("getExchangeAssetDaily", "INVALID_ARGUMENT", "Only priceMode=raw_ohlc is supported in v1",
                     Map.of("priceMode", nvl(priceMode)));
         }
@@ -594,6 +654,116 @@ public class MarketDataTools {
         }
         return fail("getExchangeAssetDaily", "INVALID_ARGUMENT", "Unsupported assetType: " + type,
                 Map.of("assetType", type));
+    }
+
+    /**
+     * getExchangeAssetDaily 的 advanced 模式：根据指数成分或申万行业成分批量拉取股票日线。
+     *
+     * <p>输入参数 {@code tsCode} 需为 JSON 字符串，结构示例：
+     * <pre>
+     * {
+     *   "mode": "advanced",
+     *   "asset_type": "stock",
+     *   "query": {
+     *     "conditions": [
+     *       {"type": "index_component", "index_code": "000300.SH", "start_date": "20240101", "end_date": "20241231"}
+     *     ]
+     *   }
+     * }
+     * </pre>
+     * 支持的条件类型：{@code index_component}、{@code sw_industry_l2_component}、{@code sw_industry_l3_component}。
+     * 日期范围 {@code startDate}/{@code endDate} 用于日线拉取；conditions 中的日期用于确定成分股快照区间。</p>
+     */
+    public String getExchangeAssetDailyAdvanced(Map<String, Object> advancedPayload,
+                                                 String assetType,
+                                                 String startDate,
+                                                 String endDate,
+                                                 String priceMode) {
+        String mode = nvl(priceMode).trim().toLowerCase();
+        if (!mode.isBlank() && !"raw_ohlc".equals(mode)) {
+            return fail("getExchangeAssetDaily", "INVALID_ARGUMENT", "Only priceMode=raw_ohlc is supported in v1",
+                    Map.of("priceMode", nvl(priceMode)));
+        }
+        if (indexWeightDao == null || swIndustryMemberDao == null) {
+            return serviceUnavailable("getExchangeAssetDaily", "Advanced daily fetch DAOs are not available");
+        }
+        try {
+            AdvancedSearchRequest request = AdvancedSearchRequest.from("getExchangeAssetDaily", advancedPayload, objectMapper);
+            if (!"stock".equals(request.getAssetType())) {
+                throw new AdvancedSearchException("INVALID_ARGUMENT",
+                        "getExchangeAssetDaily advanced only supports asset_type=stock.");
+            }
+            if (request.getConditions().isEmpty()) {
+                throw new AdvancedSearchException("INVALID_ARGUMENT",
+                        "getExchangeAssetDaily advanced requires at least one condition.");
+            }
+            for (AdvancedSearchCondition condition : request.getConditions()) {
+                if (!Set.of("index_component", "sw_industry_l2_component", "sw_industry_l3_component")
+                        .contains(condition.getType())) {
+                    throw new AdvancedSearchException("INVALID_ARGUMENT",
+                            "Unsupported daily-fetch condition type: " + condition.getType());
+                }
+            }
+
+            AdvancedSearchEngine engine = new AdvancedSearchEngine(
+                    domesticIndexService, domesticListedAssetService, indexWeightDao, swIndustryMemberDao);
+            int maxCodes = resolveMaxParallelQueriesInAdvancedMode();
+            List<String> stockCodes = engine.resolveStockCodes(request, maxCodes);
+            List<String> upstreamErrors = engine.getUpstreamErrors();
+            if (!upstreamErrors.isEmpty()) {
+                return fail("getExchangeAssetDaily", "UPSTREAM_ERROR", String.join("; ", upstreamErrors), Map.of());
+            }
+            if (stockCodes.isEmpty()) {
+                return fail("getExchangeAssetDaily", "NO_DATA", "No constituent stocks matched the advanced conditions",
+                        Map.of("conditions", request.getCanonicalQuery().get("conditions")));
+            }
+            int maxConstituents = resolveMaxAdvancedDailyConstituentStocks();
+            if (stockCodes.size() > maxConstituents) {
+                return fail("getExchangeAssetDaily", "BATCH_LIMIT_EXCEEDED",
+                        "Matched constituent stock count exceeds advanced daily limit: " + maxConstituents,
+                        Map.of("matched_stock_count", stockCodes.size(), "limit", maxConstituents));
+            }
+
+            String normalizedStart = compactDate(startDate);
+            String normalizedEnd = compactDate(endDate);
+            if (convertToMsTimestamp(normalizedStart) <= 0 || convertToMsTimestamp(normalizedEnd) <= 0) {
+                return fail("getExchangeAssetDaily", "INVALID_ARGUMENT",
+                        "Invalid daily date range, please use YYYYMMDD format (Asia/Shanghai).",
+                        Map.of("start_date", normalizedStart, "end_date", normalizedEnd));
+            }
+
+            AdvancedDailyFetchResult fetchResult = fetchStockDailyForCodes(
+                    stockCodes, normalizedStart, normalizedEnd);
+            if (!fetchResult.errors().isEmpty()) {
+                return fail("getExchangeAssetDaily", "UPSTREAM_ERROR",
+                        String.join("; ", fetchResult.errors()), Map.of("matched_stocks", stockCodes));
+            }
+            if (fetchResult.items().isEmpty()) {
+                return fail("getExchangeAssetDaily", "NO_DATA",
+                        "No daily data returned for matched constituent stocks",
+                        Map.of("matched_stocks", stockCodes));
+            }
+
+            List<String> headers = new ArrayList<>(DAILY_DATASET_HEADERS);
+            String datasetId = writeAdvancedDailyDataset(
+                    "stock_daily_advanced", request.getCanonicalQuery(), normalizedStart, normalizedEnd, headers, fetchResult.items());
+            Map<String, Object> data = new LinkedHashMap<>();
+            data.put("mode", "advanced");
+            data.put("asset_type", "stock");
+            data.put("row_count", fetchResult.items().size());
+            data.put("dataset_id", nvl(datasetId));
+            data.put("matched_stocks", stockCodes);
+            data.put("matched_stock_count", stockCodes.size());
+            data.put("start_date", normalizedStart);
+            data.put("end_date", normalizedEnd);
+            data.put("conditions_meta", request.getCanonicalQuery().get("conditions"));
+            return ok("getExchangeAssetDaily", data);
+        } catch (AdvancedSearchException e) {
+            return fail("getExchangeAssetDaily", e.getCode(), e.getMessage(), Map.of());
+        } catch (Exception e) {
+            return fail("getExchangeAssetDaily", "TOOL_ERROR", "Error executing advanced daily fetch",
+                    Map.of("message", nvl(e.getMessage())));
+        }
     }
 
     @Tool("查询场外基金净值序列。参数要求：tsCode 为基金代码；startDate/endDate 为 YYYYMMDD。不用于 ETF 场内日线回测。")
@@ -783,7 +953,8 @@ public class MarketDataTools {
                 "searchIndex",
                 "searchFund",
                 "getStockInfo",
-                "getIndexInfo"
+                "getIndexInfo",
+                "getStockSwIndustryInfo"
         ));
         search.put("argumentFormat", "Use | separated values or JSON arrays. Do not use comma-separated values.");
 
@@ -808,9 +979,10 @@ public class MarketDataTools {
         advanced.put("previewRows", resolveAdvancedPreviewRows());
         advanced.put("tools", List.of(
                 "searchIndex(mode=advanced)",
-                "searchAssetInfo(mode=advanced)"
+                "searchAssetInfo(mode=advanced)",
+                "getExchangeAssetDaily(mode=advanced)"
         ));
-        advanced.put("argumentFormat", "conditions use | separated index_code/stock_code values. Dates must be YYYYMMDD or NONE.");
+        advanced.put("argumentFormat", "conditions use | separated index_code/stock_code/industry_code values. Dates must be YYYYMMDD or NONE. getExchangeAssetDaily advanced only supports stock asset_type.");
 
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("search", search);
@@ -1593,6 +1765,31 @@ public class MarketDataTools {
         return 50;
     }
 
+    /**
+     * 解析 getExchangeAssetDaily advanced 模式允许匹配的最大成分股只数。
+     *
+     * <p>硬编码默认 500；可通过 Nacos 配置 {@code runtime.parallel.maxAdvancedDailyConstituentStocks}
+     * 覆盖，最终值钳制在 [1, 1000]。</p>
+     */
+    private int resolveMaxAdvancedDailyConstituentStocks() {
+        int local = localConfigLoader == null ? 0 : localConfigLoader.current()
+                .map(AgentLlmProperties::getRuntime)
+                .map(AgentLlmProperties.Runtime::getParallel)
+                .map(AgentLlmProperties.Parallel::getMaxAdvancedDailyConstituentStocks)
+                .orElse(0);
+        if (local > 0) {
+            return clamp(local, 1, 1000);
+        }
+        int base = Optional.ofNullable(llmProperties.getRuntime())
+                .map(AgentLlmProperties.Runtime::getParallel)
+                .map(AgentLlmProperties.Parallel::getMaxAdvancedDailyConstituentStocks)
+                .orElse(0);
+        if (base > 0) {
+            return clamp(base, 1, 1000);
+        }
+        return 500;
+    }
+
     private int resolveMaxParallelQueriesInAdvancedMode() {
         Integer local = localConfigLoader == null ? null : localConfigLoader.current()
                 .map(AgentLlmProperties::getRuntime)
@@ -1644,7 +1841,7 @@ public class MarketDataTools {
             if ("searchIndex".equals(toolName) && request.getAssetType() != null && !request.getAssetType().isBlank()) {
                 log.info("searchIndex advanced ignores unexpected asset_type={}", request.getAssetType());
             }
-            AdvancedSearchEngine engine = new AdvancedSearchEngine(domesticIndexService, domesticListedAssetService, indexWeightDao);
+            AdvancedSearchEngine engine = new AdvancedSearchEngine(domesticIndexService, domesticListedAssetService, indexWeightDao, swIndustryMemberDao);
             Map<String, Object> dataset = engine.execute(request, resolveMaxParallelQueriesInAdvancedMode());
             String upstreamError = dataset.get("upstream_error") instanceof String s ? s : null;
             String emptyReason = dataset.get("empty_reason") instanceof String s ? s : null;
@@ -1685,18 +1882,26 @@ public class MarketDataTools {
         }
     }
 
+    private boolean isAdvancedMode(String mode) {
+        return "advanced".equalsIgnoreCase(nvl(mode).trim());
+    }
+
     @SuppressWarnings("unchecked")
-    private Map<String, Object> parseAdvancedStringPayload(String value) {
-        String raw = nvl(value).trim();
-        if (!raw.startsWith("{")) {
-            return null;
+    private Map<String, Object> buildAdvancedParams(String mode, String advancedQuery) {
+        Map<String, Object> params = new LinkedHashMap<>();
+        params.put("mode", nvl(mode).trim());
+        String raw = nvl(advancedQuery).trim();
+        if (raw.startsWith("{")) {
+            try {
+                Map<String, Object> queryMap = objectMapper.readValue(raw, new TypeReference<Map<String, Object>>() {});
+                params.put("advancedQuery", queryMap);
+            } catch (Exception e) {
+                throw new AdvancedSearchException("INVALID_ARGUMENT", "advancedQuery JSON is invalid.");
+            }
+        } else if (!raw.isBlank()) {
+            throw new AdvancedSearchException("INVALID_ARGUMENT", "advancedQuery must be a JSON object.");
         }
-        try {
-            Map<String, Object> map = objectMapper.readValue(raw, new TypeReference<Map<String, Object>>() {});
-            return AdvancedSearchRequest.isAdvancedMap(map) ? map : null;
-        } catch (Exception e) {
-            throw new AdvancedSearchException("INVALID_ARGUMENT", "advanced JSON payload is invalid.");
-        }
+        return params;
     }
 
     /**
@@ -2488,5 +2693,143 @@ public class MarketDataTools {
         }
         result.append(bytes.toString(java.nio.charset.StandardCharsets.UTF_8));
         bytes.reset();
+    }
+
+    /**
+     * advanced 日线拉取结果封装：合并后的日线 items 与上游错误列表。
+     */
+    private static final class AdvancedDailyFetchResult {
+        private final List<DomesticStockDailyItem> items;
+        private final List<String> errors;
+
+        AdvancedDailyFetchResult(List<DomesticStockDailyItem> items, List<String> errors) {
+            this.items = items;
+            this.errors = errors;
+        }
+
+        List<DomesticStockDailyItem> items() {
+            return items;
+        }
+
+        List<String> errors() {
+            return errors;
+        }
+    }
+
+    /**
+     * 为多个股票代码拉取日线数据并合并为一个 item 列表。
+     *
+     * <p>每个股票并发调用 domesticStockService；单只股票无数据不算整体失败，但会记录到 errors。
+     * 调用方应检查 errors 与 items 是否都为空。</p>
+     */
+    private AdvancedDailyFetchResult fetchStockDailyForCodes(List<String> stockCodes,
+                                                             String startDateStr,
+                                                             String endDateStr) {
+        if (stockCodes == null || stockCodes.isEmpty()) {
+            return new AdvancedDailyFetchResult(List.of(), List.of());
+        }
+        long startMs = convertToMsTimestamp(startDateStr);
+        long endMs = convertToMsTimestamp(endDateStr);
+        int maxConcurrency = Math.max(1, resolveMaxParallelDailyQueries());
+        Semaphore semaphore = new Semaphore(maxConcurrency);
+        ExecutorService executor = Executors.newFixedThreadPool(maxConcurrency);
+        try {
+            List<CompletableFuture<AdvancedDailyFetchResult>> futures = stockCodes.stream()
+                    .map(code -> CompletableFuture.supplyAsync(() -> {
+                        List<String> errors = new ArrayList<>();
+                        try {
+                            semaphore.acquire();
+                            DomesticStockDailyByTsCodeAndDateRangeRequest request =
+                                    DomesticStockDailyByTsCodeAndDateRangeRequest.newBuilder()
+                                            .setTsCode(code)
+                                            .setStartDate(startMs)
+                                            .setEndDate(endMs)
+                                            .build();
+                            DomesticStockDailyByTsCodeAndDateRangeResponse response =
+                                    domesticStockService.getStockDailyByTsCodeAndDateRange(request);
+                            return new AdvancedDailyFetchResult(response.getItemsList(), errors);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            errors.add(code + ": interrupted");
+                            return new AdvancedDailyFetchResult(List.of(), errors);
+                        } catch (Exception e) {
+                            errors.add(code + ": " + nvl(e.getMessage()));
+                            return new AdvancedDailyFetchResult(List.of(), errors);
+                        } finally {
+                            semaphore.release();
+                        }
+                    }, executor))
+                    .toList();
+
+            List<DomesticStockDailyItem> allItems = new ArrayList<>();
+            List<String> allErrors = new ArrayList<>();
+            for (CompletableFuture<AdvancedDailyFetchResult> future : futures) {
+                AdvancedDailyFetchResult result = future.join();
+                allItems.addAll(result.items());
+                allErrors.addAll(result.errors());
+            }
+            return new AdvancedDailyFetchResult(allItems, allErrors);
+        } finally {
+            executor.shutdown();
+            try {
+                if (!executor.awaitTermination(30, TimeUnit.SECONDS)) {
+                    executor.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                executor.shutdownNow();
+            }
+        }
+    }
+
+    /**
+     * 将 advanced 日线拉取结果写入 dataset，返回 dataset_id。
+     *
+     * <p>dataset kind 使用 {@code stock_daily_advanced}，与单股 {@code stock_daily} 区分，
+     * 前缀使用当前 runId 与条件摘要，便于追踪来源。</p>
+     */
+    private String writeAdvancedDailyDataset(String datasetKind,
+                                             Map<String, Object> canonicalQuery,
+                                             String startDateStr,
+                                             String endDateStr,
+                                             List<String> headers,
+                                             List<DomesticStockDailyItem> items) {
+        if (!datasetWriter.isEnabled()) {
+            return "";
+        }
+        String runId = AgentContext.getRunId();
+        String prefix = (runId != null ? runId : "unknown") + "-advanced-" + summarizeAdvancedQuery(canonicalQuery);
+        return datasetWriter.writeDataset(datasetKind, prefix, "multiple", startDateStr, endDateStr, items, headers, item -> Arrays.asList(
+                item.getTsCode(), item.getTradeDate(), item.getOpen(), item.getHigh(), item.getLow(), item.getClose(),
+                item.getPreClose(), item.getChange(), item.getPctChg(), item.getVol(), item.getAmount()
+        ));
+    }
+
+    /**
+     * 生成 advanced query 的简短摘要，用于 dataset 前缀（避免过长的 JSON 串）。
+     */
+    private String summarizeAdvancedQuery(Map<String, Object> canonicalQuery) {
+        Object conditions = canonicalQuery == null ? null : canonicalQuery.get("conditions");
+        if (!(conditions instanceof List<?> list) || list.isEmpty()) {
+            return "mixed";
+        }
+        List<String> parts = new ArrayList<>();
+        for (Object raw : list) {
+            if (!(raw instanceof Map<?, ?> rawMap)) {
+                continue;
+            }
+            Map<String, Object> map = new LinkedHashMap<>();
+            rawMap.forEach((k, v) -> map.put(String.valueOf(k), v));
+            String type = String.valueOf(map.getOrDefault("type", ""));
+            Object codeObj = map.get("index_code");
+            if (codeObj == null) {
+                codeObj = map.get("industry_code");
+            }
+            String code = String.valueOf(codeObj == null ? "" : codeObj);
+            if (!type.isBlank() && !"null".equals(code) && !code.isBlank()) {
+                parts.add(type + "-" + code);
+            }
+        }
+        return parts.isEmpty() ? "mixed" : String.join("-", parts);
     }
 }
