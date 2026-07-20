@@ -24,8 +24,12 @@ import java.util.Map;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -220,6 +224,70 @@ class MarketDataToolsAdvancedTest {
         Map<String, Object> error = castMap(root.get("error"));
         assertEquals("BATCH_LIMIT_EXCEEDED", error.get("code"));
         verify(stockService, never()).getStockDailyByTsCodeAndDateRange(any());
+    }
+
+    @Test
+    void getExchangeAssetDaily_advanced_withWriterEnabled_shouldReturnDatasetIdAndDatasetIds() throws Exception {
+        // Setup mocks with writer+registry ENABLED
+        DatasetWriter datasetWriter = mock(DatasetWriter.class);
+        DatasetRegistry datasetRegistry = mock(DatasetRegistry.class);
+        when(datasetWriter.isEnabled()).thenReturn(true);
+        when(datasetRegistry.isEnabled()).thenReturn(true);
+        when(datasetWriter.writeDataset(
+                anyString(), anyString(), anyString(), anyString(), anyString(), anyList(), anyList(), any()
+        )).thenReturn("test-dataset-id-789");
+
+        MarketDataTools toolsWithWriter = new MarketDataTools(
+                datasetWriter, datasetRegistry, null,
+                null, new AgentLlmProperties(), objectMapper
+        );
+        ReflectionTestUtils.setField(toolsWithWriter, "domesticStockService", stockService);
+        ReflectionTestUtils.setField(toolsWithWriter, "indexWeightDao", indexWeightDao);
+        ReflectionTestUtils.setField(toolsWithWriter, "swIndustryMemberDao", swIndustryMemberDao);
+        ReflectionTestUtils.setField(toolsWithWriter, "localConfigLoader", localConfigLoader);
+
+        when(indexWeightDao.getLatestIndexWeightsByTsCodeAndDateRange(
+                eq("000300.SH"), eq(toTimestamp("20240101")), eq(toTimestamp("20241231"))))
+                .thenReturn(List.of(
+                        indexWeightPojo("000300.SH", "000001.SZ", "20240115", 5.0),
+                        indexWeightPojo("000300.SH", "600519.SH", "20240115", 3.0)
+                ));
+        DomesticStockDailyItem item1 = DomesticStockDailyItem.newBuilder()
+                .setTsCode("000001.SZ").setTradeDate(20240102L)
+                .setOpen(10.0).setHigh(10.5).setLow(9.8).setClose(10.2)
+                .setPreClose(10.0).setChange(0.2).setPctChg(2.0).setVol(1000.0).setAmount(10000.0)
+                .build();
+        DomesticStockDailyItem item2 = DomesticStockDailyItem.newBuilder()
+                .setTsCode("600519.SH").setTradeDate(20240102L)
+                .setOpen(100.0).setHigh(101.0).setLow(99.0).setClose(100.5)
+                .setPreClose(100.0).setChange(0.5).setPctChg(0.5).setVol(500.0).setAmount(50000.0)
+                .build();
+        when(stockService.getStockDailyByTsCodeAndDateRange(any()))
+                .thenReturn(DomesticStockDailyByTsCodeAndDateRangeResponse.newBuilder().addItems(item1).build())
+                .thenReturn(DomesticStockDailyByTsCodeAndDateRangeResponse.newBuilder().addItems(item2).build());
+
+        String advancedQuery = """
+                {"asset_type":"stock","conditions":[{"type":"index_component","index_code":"000300.SH","start_date":"20240101","end_date":"20241231"}]}
+                """;
+        String response = toolsWithWriter.getExchangeAssetDaily(null, "stock", "20240101", "20240131", "raw_ohlc", "advanced", advancedQuery);
+        Map<String, Object> root = objectMapper.readValue(response, new TypeReference<>() {});
+        Map<String, Object> data = castMap(root.get("data"));
+
+        assertEquals(Boolean.TRUE, root.get("ok"));
+        assertEquals("advanced", data.get("mode"));
+        assertEquals("test-dataset-id-789", data.get("dataset_id"));
+
+        @SuppressWarnings("unchecked")
+        List<String> datasetIds = (List<String>) data.get("dataset_ids");
+        assertNotNull(datasetIds);
+        assertEquals(1, datasetIds.size());
+        assertEquals("test-dataset-id-789", datasetIds.get(0));
+
+        // Verify registry.registerDataset was called with the same stable identity as writer
+        verify(datasetRegistry).registerDataset(
+                eq("stock_daily_advanced"), anyString(), eq("20240101"), eq("20240131"), anyList(),
+                eq("test-dataset-id-789"), anyInt()
+        );
     }
 
     private long toTimestamp(String date) {
