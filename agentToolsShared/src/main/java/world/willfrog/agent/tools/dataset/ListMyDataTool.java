@@ -87,6 +87,7 @@ public class ListMyDataTool {
     @Autowired(required = false)
     private AgentRunDatasetRegistry agentRunDatasetRegistry;
 
+    @Autowired
     public ListMyDataTool(ObjectMapper objectMapper) {
         this(objectMapper, new DatasetEntryMetadataReader(objectMapper));
     }
