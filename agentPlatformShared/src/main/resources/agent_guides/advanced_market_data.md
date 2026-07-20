@@ -74,7 +74,7 @@ advanced 模式由以下工具承担，统一通过 **顶层 `mode=advanced` + `
 | `mode` | 固定 `"advanced"` |
 | `asset_type` | 与请求一致 |
 | `row_count` | 结果行数 |
-| `dataset_id` | `{runId}-advanced-{toolName}-{assetType}-{8位 uuid}`；writer 关闭时为 `""` |
+| `dataset_id` | 搜索类：`adv-{12位 SHA-256}`；`getExchangeAssetDaily` advanced：稳定 group identity（`group-<canonicalQuery+sortedCodes的SHA-256摘要前16位hex>`），相同条件+相同成员集合生成同一 identity，避免 collision 和重复落盘；writer 关闭时为 `""` |
 | `dataset_status` | `created` / `reused` / `inline` |
 | `reused` | 是否命中既有 dataset（bool） |
 | `preview_rows` | 前 N 条预览（默认 10，可在 Nacos 改） |
@@ -83,7 +83,9 @@ advanced 模式由以下工具承担，统一通过 **顶层 `mode=advanced` + `
 | `empty_reason` | 仅 0 行时存在；例如 `no_matching_index_weights` |
 | `upstream_error` | 上游 IDL 失败时存在 |
 
-`dataset_id` 为空时，`data.dataset` 内联完整 dataset map（含 `schema_version=1`、`tool`、`asset_type`、`query`（canonicalQuery）、`conditions_meta`、`row_count`、`results[]`）。
+`dataset_id` 为空时，`data.dataset` 内联完整 dataset map（含 `schema_version=1`、`tool`、`asset_type`、`query`（canonicalQuery，只保留 `name` 与 `conditions` 两层键，condition 行内字段固定为 `type/index_code/stock_code/industry_code/start_date/end_date/min_weight/max_weight` 七项，snake_case）、`conditions_meta`、`row_count`、`results[]`）。dataset 落盘路径由 `DatabaseFetchedPathStrategy` 决定，搜索类走 `market_data_advanced_search` topic，`getExchangeAssetDaily` advanced 走 `stock_daily_advanced` topic。
+
+`conditions_meta[]` 每条 condition 对应一项，字段：`condition_index`、`type`、`slot_type`（含 `date_match_reason: "long"` 与 `weight_match_reason: "float|null"`）、`start_date`、`end_date`、`min_weight`、`max_weight`。
 
 行结构：
 
@@ -109,13 +111,14 @@ advanced 模式由以下工具承担，统一通过 **顶层 `mode=advanced` + `
 | `mode` | 固定 `"advanced"` |
 | `asset_type` | 固定 `"stock"` |
 | `row_count` | 实际拉到的日线行数（不是股票只数） |
-| `dataset_id` | 日线 dataset 的 ID |
+| `dataset_id` | 日线 dataset 的 ID；同时可通过 `dataset_ids` 数组获取 |
+| `dataset_ids` | 含 `dataset_id` 的单元素数组，便于 executePython 等下游统一消费 |
 | `matched_stocks` | 命中条件的成分股代码列表 |
 | `matched_stock_count` | 命中条件的成分股只数 |
 | `start_date` / `end_date` | 日线日期范围 |
 | `conditions_meta` | 请求的 conditions 原样回显 |
 
-无 `preview_rows`；结果通过 `dataset_id` 落盘供后续 `executePython` 等 todo 复用。
+无 `preview_rows`；结果通过 `dataset_id` 落盘供后续 `executePython` 等 todo 消费。
 
 ## ETF 两跳链
 

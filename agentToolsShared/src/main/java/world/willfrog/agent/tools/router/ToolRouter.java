@@ -324,6 +324,7 @@ public class ToolRouter {
         return Set.of(
                 "getStockInfo",
                 "getStockDaily",
+                "getStockSwIndustryInfo",
                 "searchStock",
                 "searchFund",
                 "getIndexInfo",
@@ -510,6 +511,9 @@ public class ToolRouter {
                         str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("stock_code"), params.get("arg0")),
                         dateStr(params.get("startDateStr"), params.get("startDate"), params.get("start_date"), params.get("arg1")),
                         dateStr(params.get("endDateStr"), params.get("endDate"), params.get("end_date"), params.get("arg2"))
+                );
+                case "getStockSwIndustryInfo" -> marketDataTools.getStockSwIndustryInfo(
+                        str(params.get("tsCode"), params.get("ts_code"), params.get("code"), params.get("stock_code"), params.get("arg0"))
                 );
                 case "searchStock" -> marketDataTools.searchStock(
                         str(params.get("keyword"), params.get("query"), params.get("arg0"))

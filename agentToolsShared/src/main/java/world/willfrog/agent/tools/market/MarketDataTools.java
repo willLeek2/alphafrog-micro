@@ -35,6 +35,7 @@ import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -659,16 +660,13 @@ public class MarketDataTools {
     /**
      * getExchangeAssetDaily 的 advanced 模式：根据指数成分或申万行业成分批量拉取股票日线。
      *
-     * <p>输入参数 {@code tsCode} 需为 JSON 字符串，结构示例：
+     * <p>输入参数 {@code advancedPayload} 为 JSON 对象/字符串，结构示例：
      * <pre>
      * {
-     *   "mode": "advanced",
      *   "asset_type": "stock",
-     *   "query": {
-     *     "conditions": [
-     *       {"type": "index_component", "index_code": "000300.SH", "start_date": "20240101", "end_date": "20241231"}
-     *     ]
-     *   }
+     *   "conditions": [
+     *     {"type": "index_component", "index_code": "000300.SH", "start_date": "20240101", "end_date": "20241231"}
+     *   ]
      * }
      * </pre>
      * 支持的条件类型：{@code index_component}、{@code sw_industry_l2_component}、{@code sw_industry_l3_component}。
@@ -746,12 +744,13 @@ public class MarketDataTools {
 
             List<String> headers = new ArrayList<>(DAILY_DATASET_HEADERS);
             String datasetId = writeAdvancedDailyDataset(
-                    "stock_daily_advanced", request.getCanonicalQuery(), normalizedStart, normalizedEnd, headers, fetchResult.items());
+                    "stock_daily_advanced", request.getCanonicalQuery(), stockCodes, normalizedStart, normalizedEnd, headers, fetchResult.items());
             Map<String, Object> data = new LinkedHashMap<>();
             data.put("mode", "advanced");
             data.put("asset_type", "stock");
             data.put("row_count", fetchResult.items().size());
             data.put("dataset_id", nvl(datasetId));
+            data.put("dataset_ids", datasetId == null || datasetId.isBlank() ? List.of() : List.of(datasetId));
             data.put("matched_stocks", stockCodes);
             data.put("matched_stock_count", stockCodes.size());
             data.put("start_date", normalizedStart);
@@ -2737,8 +2736,10 @@ public class MarketDataTools {
             List<CompletableFuture<AdvancedDailyFetchResult>> futures = stockCodes.stream()
                     .map(code -> CompletableFuture.supplyAsync(() -> {
                         List<String> errors = new ArrayList<>();
+                        boolean acquired = false;
                         try {
                             semaphore.acquire();
+                            acquired = true;
                             DomesticStockDailyByTsCodeAndDateRangeRequest request =
                                     DomesticStockDailyByTsCodeAndDateRangeRequest.newBuilder()
                                             .setTsCode(code)
@@ -2756,7 +2757,9 @@ public class MarketDataTools {
                             errors.add(code + ": " + nvl(e.getMessage()));
                             return new AdvancedDailyFetchResult(List.of(), errors);
                         } finally {
-                            semaphore.release();
+                            if (acquired) {
+                                semaphore.release();
+                            }
                         }
                     }, executor))
                     .toList();
@@ -2783,13 +2786,20 @@ public class MarketDataTools {
     }
 
     /**
-     * 将 advanced 日线拉取结果写入 dataset，返回 dataset_id。
+     * 将 advanced 日线拉取结果写入 dataset 并注册到 registry，返回 dataset_id。
      *
-     * <p>dataset kind 使用 {@code stock_daily_advanced}，与单股 {@code stock_daily} 区分，
-     * 前缀使用当前 runId 与条件摘要，便于追踪来源。</p>
+     * <p>dataset kind 使用 {@code stock_daily_advanced}，与单股 {@code stock_daily} 区分。
+     * 为了生成稳定的 group identity（避免相同查询条件+相同成分股集合产生不同 dataset），
+     * 对确定性序列化后的完整 canonicalQuery + 排序去重后的 stockCodes 整体做 SHA-256 digest，
+     * 生成 {@code group-<digest>} 作为 tsCode。writer 与 registry 使用完全相同的 identity，
+     * 避免 collision 和重复落盘。</p>
+     *
+     * <p><b>注意</b>：当前实现不隐式复用已有 dataset（每次调用都会生成新的 datasetId 并写入），
+     * 但 stable identity 保证 registry 中不会积累指向不同文件的重复 meta 条目。</p>
      */
     private String writeAdvancedDailyDataset(String datasetKind,
                                              Map<String, Object> canonicalQuery,
+                                             List<String> stockCodes,
                                              String startDateStr,
                                              String endDateStr,
                                              List<String> headers,
@@ -2797,12 +2807,57 @@ public class MarketDataTools {
         if (!datasetWriter.isEnabled()) {
             return "";
         }
+        // 稳定的 group identity：对完整 canonicalQuery + 排序去重 stockCodes 做 SHA-256 digest
+        String stableTsCode = buildAdvancedStableIdentity(canonicalQuery, stockCodes);
+
         String runId = AgentContext.getRunId();
+        // prefix 保留 runId 用于文件路径追踪和人工排查
         String prefix = (runId != null ? runId : "unknown") + "-advanced-" + summarizeAdvancedQuery(canonicalQuery);
-        return datasetWriter.writeDataset(datasetKind, prefix, "multiple", startDateStr, endDateStr, items, headers, item -> Arrays.asList(
+        String datasetId = datasetWriter.writeDataset(datasetKind, prefix, stableTsCode, startDateStr, endDateStr, items, headers, item -> Arrays.asList(
                 item.getTsCode(), item.getTradeDate(), item.getOpen(), item.getHigh(), item.getLow(), item.getClose(),
                 item.getPreClose(), item.getChange(), item.getPctChg(), item.getVol(), item.getAmount()
         ));
+
+        if (datasetId != null && !datasetId.isBlank() && datasetRegistry.isEnabled()) {
+            datasetRegistry.registerDataset(datasetKind, stableTsCode, startDateStr, endDateStr, headers, datasetId, items.size());
+        }
+        return datasetId;
+    }
+
+    /**
+     * 对完整 canonicalQuery + 排序去重后的 stockCodes 做 SHA-256 digest，生成稳定 identity。
+     * 输出格式：{@code group-<前16位hex>}，长度受控，适合作为 registry tsCode 和文件路径组件。
+     */
+    private String buildAdvancedStableIdentity(Map<String, Object> canonicalQuery, List<String> stockCodes) {
+        try {
+            java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
+            // 1. 序列化 canonicalQuery（确定性：按 key 排序）
+            if (canonicalQuery != null && !canonicalQuery.isEmpty()) {
+                List<String> sortedKeys = new ArrayList<>(canonicalQuery.keySet());
+                sortedKeys.sort(Comparator.naturalOrder());
+                for (String key : sortedKeys) {
+                    Object value = canonicalQuery.get(key);
+                    digest.update(key.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                    digest.update(value == null ? new byte[0] : String.valueOf(value).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                }
+            }
+            // 2. 序列化排序去重后的 stockCodes
+            List<String> sortedCodes = stockCodes == null ? List.of() : new ArrayList<>(stockCodes);
+            sortedCodes.sort(Comparator.naturalOrder());
+            for (String code : sortedCodes) {
+                digest.update(code.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            }
+            byte[] hashed = digest.digest();
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < Math.min(8, hashed.length); i++) {
+                sb.append(String.format("%02x", hashed[i]));
+            }
+            return "group-" + sb;
+        } catch (Exception e) {
+            // fallback: 条件摘要 + 代码数
+            String fallback = summarizeAdvancedQuery(canonicalQuery) + "-" + (stockCodes == null ? 0 : stockCodes.size());
+            return "group-" + fallback.hashCode();
+        }
     }
 
     /**
