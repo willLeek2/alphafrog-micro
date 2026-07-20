@@ -26,7 +26,7 @@ advanced 模式由以下工具承担，统一通过 **顶层 `mode=advanced` + `
 |---|---|---|
 | `asset_type` | 视工具而定 | `stock` / `etf` / `index` / `off_exchange_fund`；别名 `assetType` / `assetTypes` / `asset_types` 都接受 |
 | `name` | 否 | 资产名称搜索词，与 `has_stock` / `index_component` 等一起用 |
-| `conditions` | 是 | 至少 1 条；多条时 AND 关系 |
+| `conditions` | 视工具而定 | `searchAssetInfo` / `searchIndex`：与 `name` 至少其一；`getExchangeAssetDaily` advanced：必填，至少 1 条；多条时 AND 关系 |
 
 `asset_type` 与 `condition.type` 必须匹配，否则抛 `INVALID_ARGUMENT`：
 
@@ -47,15 +47,17 @@ advanced 模式由以下工具承担，统一通过 **顶层 `mode=advanced` + `
 | `industry_code` | `sw_industry_l2_component` / `sw_industry_l3_component` 必填 | `sw_industry_l2_component` / `sw_industry_l3_component` | 申万行业代码；支持 `\|` 分隔多值 |
 | `start_date` | 否 | `index_component` / `has_stock` | `YYYYMMDD` 或字面量 `"NONE"` |
 | `end_date` | 否 | `index_component` / `has_stock` | `YYYYMMDD` 或字面量 `"NONE"` |
-| `min_weight` | 否 | `index_component` | 0.00–1.00；不传表示不设下限 |
-| `max_weight` | 否 | `index_component` | 0.00–1.00；不传表示不设上限 |
+| `min_weight` | 否 | `index_component` | 浮点下限；不传表示不设下限；当前实现不限制负值 |
+| `max_weight` | 否 | `index_component` | 浮点上限；不传表示不设上限；当前实现不限制负值 |
 
-**日期语义说明**：
+**日期语义与校验说明**：
 
 - `index_component` / `has_stock`：`start_date` / `end_date` 控制指数成分权重快照的日期区间。
   - 两者都为 `NONE` 时，工具取该指数最新公告期单日快照（`getMaxTradeDateByTsCode` + `getIndexWeightsByTsCodeAndTradeDate`），不是全历史扫描。
   - 单边 `NONE` 表示不限制该侧边界。
+  - `start_date > end_date` 抛 `INVALID_ARGUMENT`。
 - `sw_industry_l2_component` / `sw_industry_l3_component`：代码当前仅取 `is_new='Y'` 的最新行业成员；`start_date` / `end_date` 会被解析验证但不参与过滤（保留字段，后续可能扩展）。
+- `min_weight > max_weight` 抛 `INVALID_ARGUMENT`（两者都传时）。
 
 ## 组合语义
 
@@ -74,7 +76,7 @@ advanced 模式由以下工具承担，统一通过 **顶层 `mode=advanced` + `
 | `mode` | 固定 `"advanced"` |
 | `asset_type` | 与请求一致 |
 | `row_count` | 结果行数 |
-| `dataset_id` | 搜索类：`adv-{12位 SHA-256}`；`getExchangeAssetDaily` advanced：稳定 group identity（`group-<canonicalQuery+sortedCodes的SHA-256摘要前16位hex>`），相同条件+相同成员集合生成同一 identity，避免 collision 和重复落盘；writer 关闭时为 `""` |
+| `dataset_id` | 搜索类：`adv-{12位 SHA-256}`；`getExchangeAssetDaily` advanced：由 `DatasetWriter` 生成的 ID（格式 `<runId>-advanced-<conditionSummary>-<group-digest>-<start>-<end>-<8位uuid>`），其中 `<group-digest>` 是内部稳定的 storage/registry key；writer 关闭时为 `""` |
 | `dataset_status` | `created` / `reused` / `inline` |
 | `reused` | 是否命中既有 dataset（bool） |
 | `preview_rows` | 前 N 条预览（默认 10，可在 Nacos 改） |
@@ -111,7 +113,7 @@ advanced 模式由以下工具承担，统一通过 **顶层 `mode=advanced` + `
 | `mode` | 固定 `"advanced"` |
 | `asset_type` | 固定 `"stock"` |
 | `row_count` | 实际拉到的日线行数（不是股票只数） |
-| `dataset_id` | 日线 dataset 的 ID；同时可通过 `dataset_ids` 数组获取 |
+| `dataset_id` | 日线 dataset 的 ID（格式见上）；同时可通过 `dataset_ids` 数组获取 |
 | `dataset_ids` | 含 `dataset_id` 的单元素数组，便于 executePython 等下游统一消费 |
 | `matched_stocks` | 命中条件的成分股代码列表 |
 | `matched_stock_count` | 命中条件的成分股只数 |
@@ -163,12 +165,14 @@ Nacos 热加载配置（`agent-llm.local.json`，由 `agent.llm.config-file` 指
 - `runtime.parallel.maxParallelQueriesInAdvancedMode` → 单 condition `\|` 上限
 - `runtime.parallel.maxAdvancedDailyConstituentStocks` → `getExchangeAssetDaily` advanced 单次允许匹配的最大成分股只数（默认 500）
 
+**热加载失败行为**：若某次轮询 Nacos 返回异常或 JSON 解析失败，保留上一轮成功加载的配置，不抛错中断运行。
+
 ## 错误码
 
 | 码 | 触发 |
 |---|---|
 | `INVALID_ARGUMENT` | 日期格式错 / asset_type 与 condition.type 不匹配 / 缺 `mode` / `advancedQuery` 不是合法 JSON / `getExchangeAssetDaily` 传了非 `stock` 的 asset_type |
-| `BATCH_LIMIT_EXCEEDED` | 单 condition `\|` 拆分 > `maxItems`；或 `getExchangeAssetDaily` advanced 匹配到的成分股只数超过 `maxAdvancedDailyConstituentStocks`（默认 500，可配） |
+| `BATCH_LIMIT_EXCEEDED` | 单 condition `\|` 拆分 > `maxItems`；或 `getExchangeAssetDaily` advanced 匹配到的成分股只数超过 `maxAdvancedDailyConstituentStocks`（默认 500，可配）。**建议**：调用方应先 `checkParallelLimits` 查询当前限制，再按需拆批；当前 `details` 为空，错误消息含超限数量和限制值。 |
 | `UPSTREAM_ERROR` | 上游 IDL 调用失败（`data` 上同时含 `upstream_error` / `matched_stocks` 等上下文） |
 | `NO_DATA` | 没找到任何结果 |
 | `TOOL_ERROR` | writer / dao 内部异常 |

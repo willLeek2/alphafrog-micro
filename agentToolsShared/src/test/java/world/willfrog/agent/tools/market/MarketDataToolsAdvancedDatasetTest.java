@@ -139,6 +139,38 @@ class MarketDataToolsAdvancedDatasetTest {
 
     @Test
     @SuppressWarnings("unchecked")
+    void writeAdvancedDailyDataset_differentConditions_shouldProduceDifferentIdentity() throws Exception {
+        List<String> stockCodes = List.of("600519.SH");
+        String startDate = "20240101";
+        String endDate = "20240131";
+        List<String> headers = List.of("ts_code", "trade_date");
+        List<DomesticStockDailyItem> items = List.of();
+
+        // Condition A: min_weight = 0.01
+        Map<String, Object> queryA = new LinkedHashMap<>();
+        queryA.put("asset_type", "stock");
+        queryA.put("conditions", List.of(
+                Map.of("type", "index_component", "index_code", "000300.SH",
+                        "start_date", "20240101", "end_date", "20241231", "min_weight", 0.01)
+        ));
+
+        // Condition B: same index but different min_weight = 0.05
+        Map<String, Object> queryB = new LinkedHashMap<>();
+        queryB.put("asset_type", "stock");
+        queryB.put("conditions", List.of(
+                Map.of("type", "index_component", "index_code", "000300.SH",
+                        "start_date", "20240101", "end_date", "20241231", "min_weight", 0.05)
+        ));
+
+        String tsCodeA = invokeAndCaptureTsCode(queryA, stockCodes, startDate, endDate, headers, items);
+        String tsCodeB = invokeAndCaptureTsCode(queryB, stockCodes, startDate, endDate, headers, items);
+
+        // Different canonical conditions → different identity
+        assertNotEquals(tsCodeA, tsCodeB, "Different conditions should produce different stable identity");
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
     void writeAdvancedDailyDataset_sameQueryAndCodesDifferentOrder_shouldProduceSameIdentity() throws Exception {
         Map<String, Object> canonicalQuery = new LinkedHashMap<>();
         canonicalQuery.put("asset_type", "stock");

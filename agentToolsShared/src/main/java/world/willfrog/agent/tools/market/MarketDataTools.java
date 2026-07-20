@@ -2789,13 +2789,14 @@ public class MarketDataTools {
      * 将 advanced 日线拉取结果写入 dataset 并注册到 registry，返回 dataset_id。
      *
      * <p>dataset kind 使用 {@code stock_daily_advanced}，与单股 {@code stock_daily} 区分。
-     * 为了生成稳定的 group identity（避免相同查询条件+相同成分股集合产生不同 dataset），
-     * 对确定性序列化后的完整 canonicalQuery + 排序去重后的 stockCodes 整体做 SHA-256 digest，
-     * 生成 {@code group-<digest>} 作为 tsCode。writer 与 registry 使用完全相同的 identity，
-     * 避免 collision 和重复落盘。</p>
+     * 内部使用稳定的 group identity（{@code group-<digest>}）作为 writer 的 tsCode 和
+     * registry 的查询 key，避免不同查询条件/成员集合意外共享同一路径。返回的
+     * {@code dataset_id} 由 {@link DatasetWriter} 生成（格式含 runId 前缀和 UUID），
+     * 与内部 group identity 是不同概念。</p>
      *
-     * <p><b>注意</b>：当前实现不隐式复用已有 dataset（每次调用都会生成新的 datasetId 并写入），
-     * 但 stable identity 保证 registry 中不会积累指向不同文件的重复 meta 条目。</p>
+     * <p><b>注意</b>：当前实现不隐式复用已有 dataset（每次调用都会生成新的 datasetId
+     * 并写入）。stable identity 的作用是避免相同条件+相同成员集合因调用时机不同而
+     * 产生不同的 registry meta 路径。</p>
      */
     private String writeAdvancedDailyDataset(String datasetKind,
                                              Map<String, Object> canonicalQuery,
@@ -2807,7 +2808,7 @@ public class MarketDataTools {
         if (!datasetWriter.isEnabled()) {
             return "";
         }
-        // 稳定的 group identity：对完整 canonicalQuery + 排序去重 stockCodes 做 SHA-256 digest
+        // 稳定的 group identity：对确定性序列化后的完整 canonicalQuery + 去重排序 stockCodes 做 SHA-256 digest
         String stableTsCode = buildAdvancedStableIdentity(canonicalQuery, stockCodes);
 
         String runId = AgentContext.getRunId();
@@ -2825,26 +2826,27 @@ public class MarketDataTools {
     }
 
     /**
-     * 对完整 canonicalQuery + 排序去重后的 stockCodes 做 SHA-256 digest，生成稳定 identity。
-     * 输出格式：{@code group-<前16位hex>}，长度受控，适合作为 registry tsCode 和文件路径组件。
+     * 对完整 canonicalQuery + 去重排序后的 stockCodes 做 SHA-256 digest，生成稳定 identity。
+     * 输出格式：{@code group-<前16位hex>}，长度受控，适合作为 writer tsCode 和 registry 查询 key。
+     *
+     * <p>canonicalQuery 使用 ObjectMapper 递归确定性序列化（map 所有层级 key 排序、
+     * list 保序、scalar 按 JSON 编码），确保嵌套结构的变化也能反映到 digest 中。</p>
      */
     private String buildAdvancedStableIdentity(Map<String, Object> canonicalQuery, List<String> stockCodes) {
         try {
             java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
-            // 1. 序列化 canonicalQuery（确定性：按 key 排序）
+            // 1. 递归确定性序列化 canonicalQuery（ObjectMapper 会递归排序所有 map 的 key）
             if (canonicalQuery != null && !canonicalQuery.isEmpty()) {
-                List<String> sortedKeys = new ArrayList<>(canonicalQuery.keySet());
-                sortedKeys.sort(Comparator.naturalOrder());
-                for (String key : sortedKeys) {
-                    Object value = canonicalQuery.get(key);
-                    digest.update(key.getBytes(java.nio.charset.StandardCharsets.UTF_8));
-                    digest.update(value == null ? new byte[0] : String.valueOf(value).getBytes(java.nio.charset.StandardCharsets.UTF_8));
-                }
+                byte[] canonicalBytes = objectMapper.writeValueAsBytes(canonicalizeForDigest(canonicalQuery));
+                digest.update(canonicalBytes);
             }
-            // 2. 序列化排序去重后的 stockCodes
-            List<String> sortedCodes = stockCodes == null ? List.of() : new ArrayList<>(stockCodes);
-            sortedCodes.sort(Comparator.naturalOrder());
-            for (String code : sortedCodes) {
+            // 2. 序列化去重排序后的 stockCodes
+            List<String> dedupedSortedCodes = stockCodes == null ? List.of() : stockCodes.stream()
+                    .filter(c -> c != null && !c.isBlank())
+                    .distinct()
+                    .sorted(Comparator.naturalOrder())
+                    .toList();
+            for (String code : dedupedSortedCodes) {
                 digest.update(code.getBytes(java.nio.charset.StandardCharsets.UTF_8));
             }
             byte[] hashed = digest.digest();
@@ -2858,6 +2860,39 @@ public class MarketDataTools {
             String fallback = summarizeAdvancedQuery(canonicalQuery) + "-" + (stockCodes == null ? 0 : stockCodes.size());
             return "group-" + fallback.hashCode();
         }
+    }
+
+    /**
+     * 将 canonicalQuery 转换为适合 digest 的确定性结构：递归排序所有 map 的 key，
+     * 过滤 null/blank scalar，保留 list 顺序。
+     */
+    @SuppressWarnings("unchecked")
+    private Object canonicalizeForDigest(Object value) {
+        if (value == null) {
+            return null;
+        }
+        if (value instanceof Map<?, ?> map) {
+            Map<String, Object> sorted = new java.util.TreeMap<>();
+            map.forEach((k, v) -> {
+                String key = k == null ? "" : String.valueOf(k);
+                sorted.put(key, canonicalizeForDigest(v));
+            });
+            return sorted;
+        }
+        if (value instanceof List<?> list) {
+            return list.stream()
+                    .map(this::canonicalizeForDigest)
+                    .filter(v -> {
+                        if (v == null) return false;
+                        if (v instanceof String s) return !s.isBlank();
+                        return true;
+                    })
+                    .toList();
+        }
+        if (value instanceof String s) {
+            return s.trim();
+        }
+        return value;
     }
 
     /**
