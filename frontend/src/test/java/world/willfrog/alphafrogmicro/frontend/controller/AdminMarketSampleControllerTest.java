@@ -5,8 +5,10 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.Authentication;
+import org.springframework.web.client.HttpClientErrorException;
 import world.willfrog.alphafrogmicro.frontend.service.AdminUserAccessService;
 import world.willfrog.alphafrogmicro.frontend.service.debug.DomesticMarketSampleClient;
 
@@ -39,14 +41,18 @@ class AdminMarketSampleControllerTest {
         Authentication authentication = authentication("admin");
         when(adminUserAccessService.isActiveAdmin(authentication)).thenReturn(true);
         when(marketSampleClient.randomIndexNamesByAmount(
-                "20250101", "20251231", 100000, 2))
-                .thenReturn(List.of(Map.of("tsCode", "000300.SH", "name", "沪深300")));
+                2021, 2025, 100000.0, 2))
+                .thenReturn(Map.of(
+                        "status", "complete",
+                        "items", List.of(Map.of("tsCode", "000300.SH", "name", "沪深300"))));
 
         ResponseEntity<?> response = controller.randomIndexNamesByAmount(
-                authentication, "20250101", "20251231", 100000, 2);
+                authentication, 2021, 2025, 100000.0, 2);
 
         assertEquals(200, response.getStatusCode().value());
-        assertEquals(List.of(Map.of("tsCode", "000300.SH", "name", "沪深300")),
+        assertEquals(Map.of(
+                "status", "complete",
+                "items", List.of(Map.of("tsCode", "000300.SH", "name", "沪深300"))),
                 response.getBody());
     }
 
@@ -54,18 +60,39 @@ class AdminMarketSampleControllerTest {
     void adminAccountCanFetchRandomStocksAndEtfs() {
         Authentication authentication = authentication("admin-assets");
         when(adminUserAccessService.isActiveAdmin(authentication)).thenReturn(true);
-        when(marketSampleClient.randomListedStocks(1))
-                .thenReturn(List.of(Map.of("tsCode", "600519.SH", "name", "贵州茅台")));
-        when(marketSampleClient.randomListedEtfs(1))
-                .thenReturn(List.of(Map.of("tsCode", "510300.SH", "name", "沪深300ETF")));
+        when(marketSampleClient.randomListedStocks(2021, 2025, null, 1))
+                .thenReturn(Map.of("status", "complete", "items",
+                        List.of(Map.of("tsCode", "600519.SH", "name", "贵州茅台"))));
+        when(marketSampleClient.randomListedEtfs(2021, 2025, null, 1))
+                .thenReturn(Map.of("status", "complete", "items",
+                        List.of(Map.of("tsCode", "510300.SH", "name", "沪深300ETF"))));
 
-        ResponseEntity<?> stocks = controller.randomListedStocks(authentication, 1);
-        ResponseEntity<?> etfs = controller.randomListedEtfs(authentication, 1);
+        ResponseEntity<?> stocks = controller.randomListedStocks(
+                authentication, 2021, 2025, null, 1);
+        ResponseEntity<?> etfs = controller.randomListedEtfs(
+                authentication, 2021, 2025, null, 1);
 
         assertEquals(200, stocks.getStatusCode().value());
         assertEquals(200, etfs.getStatusCode().value());
-        assertEquals(List.of(Map.of("tsCode", "600519.SH", "name", "贵州茅台")), stocks.getBody());
-        assertEquals(List.of(Map.of("tsCode", "510300.SH", "name", "沪深300ETF")), etfs.getBody());
+        assertEquals(Map.of("status", "complete", "items",
+                List.of(Map.of("tsCode", "600519.SH", "name", "贵州茅台"))), stocks.getBody());
+        assertEquals(Map.of("status", "complete", "items",
+                List.of(Map.of("tsCode", "510300.SH", "name", "沪深300ETF"))), etfs.getBody());
+    }
+
+    @Test
+    void zeroEligibleAssetsShouldRemainUnprocessableEntity() {
+        Authentication authentication = authentication("admin-zero-assets");
+        when(adminUserAccessService.isActiveAdmin(authentication)).thenReturn(true);
+        when(marketSampleClient.randomListedStocks(2021, 2025, null, 1))
+                .thenThrow(new HttpClientErrorException(HttpStatus.UNPROCESSABLE_ENTITY));
+
+        ResponseEntity<?> response = controller.randomListedStocks(
+                authentication, 2021, 2025, null, 1);
+
+        assertEquals(422, response.getStatusCode().value());
+        assertEquals(Map.of("error", "Random market sample request was rejected"),
+                response.getBody());
     }
 
     @Test

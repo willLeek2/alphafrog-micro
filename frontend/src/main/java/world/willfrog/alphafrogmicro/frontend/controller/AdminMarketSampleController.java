@@ -9,6 +9,7 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.client.HttpStatusCodeException;
 import org.springframework.web.client.RestClientException;
 import world.willfrog.alphafrogmicro.frontend.service.AdminUserAccessService;
 import world.willfrog.alphafrogmicro.frontend.service.debug.DomesticMarketSampleClient;
@@ -51,27 +52,35 @@ public class AdminMarketSampleController {
     @GetMapping("/index-names/random-by-amount")
     public ResponseEntity<?> randomIndexNamesByAmount(
             Authentication authentication,
-            @RequestParam("start_date") String startDate,
-            @RequestParam("end_date") String endDate,
-            @RequestParam("min_amount") double minAmount,
+            @RequestParam("start_year") int startYear,
+            @RequestParam("end_year") int endYear,
+            @RequestParam(value = "min_avg_amount", required = false) Double minAverageAmount,
             @RequestParam(value = "count", defaultValue = "1") int count) {
         return adminCall(authentication,
                 () -> marketSampleClient.randomIndexNamesByAmount(
-                        startDate, endDate, minAmount, count));
+                        startYear, endYear, minAverageAmount, count));
     }
 
     @GetMapping("/stocks/random")
     public ResponseEntity<?> randomListedStocks(
             Authentication authentication,
+            @RequestParam("start_year") int startYear,
+            @RequestParam("end_year") int endYear,
+            @RequestParam(value = "min_avg_amount", required = false) Double minAverageAmount,
             @RequestParam(value = "count", defaultValue = "1") int count) {
-        return adminCall(authentication, () -> marketSampleClient.randomListedStocks(count));
+        return adminCall(authentication, () -> marketSampleClient.randomListedStocks(
+                startYear, endYear, minAverageAmount, count));
     }
 
     @GetMapping("/etfs/random")
     public ResponseEntity<?> randomListedEtfs(
             Authentication authentication,
+            @RequestParam("start_year") int startYear,
+            @RequestParam("end_year") int endYear,
+            @RequestParam(value = "min_avg_amount", required = false) Double minAverageAmount,
             @RequestParam(value = "count", defaultValue = "1") int count) {
-        return adminCall(authentication, () -> marketSampleClient.randomListedEtfs(count));
+        return adminCall(authentication, () -> marketSampleClient.randomListedEtfs(
+                startYear, endYear, minAverageAmount, count));
     }
 
     private ResponseEntity<?> adminCall(Authentication authentication, Supplier<?> action) {
@@ -85,6 +94,17 @@ public class AdminMarketSampleController {
             log.error("Random market sample upstream is not configured", e);
             return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
                     .body(Map.of("error", "Random market sample service is unavailable"));
+        } catch (HttpStatusCodeException e) {
+            int upstreamStatus = e.getStatusCode().value();
+            if (upstreamStatus == HttpStatus.BAD_REQUEST.value()
+                    || upstreamStatus == HttpStatus.UNPROCESSABLE_ENTITY.value()) {
+                log.warn("Random market sample request rejected by upstream: status={}", upstreamStatus);
+                return ResponseEntity.status(e.getStatusCode())
+                        .body(Map.of("error", "Random market sample request was rejected"));
+            }
+            log.error("Random market sample upstream returned an unexpected HTTP status", e);
+            return ResponseEntity.status(HttpStatus.BAD_GATEWAY)
+                    .body(Map.of("error", "Random market sample upstream request failed"));
         } catch (RestClientException e) {
             log.error("Random market sample upstream request failed", e);
             return ResponseEntity.status(HttpStatus.BAD_GATEWAY)

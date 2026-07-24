@@ -6,16 +6,17 @@ import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.web.server.ResponseStatusException;
 
-import java.time.DateTimeException;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.IntFunction;
 
 import world.willfrog.alphafrogmicro.common.dao.domestic.etf.EtfInfoDao;
 import world.willfrog.alphafrogmicro.common.dao.domestic.index.IndexQuoteDao;
@@ -30,6 +31,9 @@ import world.willfrog.alphafrogmicro.domestic.fetch.utils.TuShareRequestUtils;
 public class DomesticDebugQueryService {
 
     private static final int MAX_COUNT = 5;
+    private static final int TRADING_DAYS_PER_YEAR = 250;
+    private static final int MIN_DAILY_COVERAGE_PERCENT = 90;
+    private static final int MAX_ASSET_SAMPLE_ATTEMPTS = 5;
     private static final String SW2021 = "SW2021";
 
     private final IndexWeightDao indexWeightDao;
@@ -82,28 +86,55 @@ public class DomesticDebugQueryService {
         return mergeNames(names, fetchSwL3IndustryNamesFromTushare(limit), limit);
     }
 
-    public List<DebugAssetNameResponse> randomIndexNamesByAmountRange(String startDate,
-                                                                      String endDate,
-                                                                      double minAmount,
-                                                                      int count) {
-        int limit = requireCount(count);
-        Long start = requireDateTimestamp(startDate, "start_date");
-        Long end = requireDateTimestamp(endDate, "end_date");
-        if (start > end) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "start_date must be <= end_date");
-        }
-        if (minAmount < 0) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "min_amount must be >= 0");
-        }
-        return toIndexNames(indexQuoteDao.getRandomIndexNamesByAmountRange(start, end, minAmount, limit));
+    public DebugAssetSampleResponse randomIndexNamesByCoverage(int startYear,
+                                                                int endYear,
+                                                                Double minAverageAmount,
+                                                                int count) {
+        YearRange range = requireYearRange(startYear, endYear);
+        Double amountThreshold = requireAmountThreshold(minAverageAmount);
+        return sampleEligibleAssets(
+                count,
+                range,
+                candidateLimit -> toIndexNames(indexQuoteDao.getEligibleRandomIndices(
+                        range.startTimestamp(),
+                        range.endTimestamp(),
+                        range.requiredDailyCount(),
+                        amountThreshold,
+                        candidateLimit)));
     }
 
-    public List<DebugAssetNameResponse> randomListedStocks(int count) {
-        return toAssetNames(stockInfoDao.getRandomListedStocks(requireCount(count)));
+    public DebugAssetSampleResponse randomListedStocks(int startYear,
+                                                       int endYear,
+                                                       Double minAverageAmount,
+                                                       int count) {
+        YearRange range = requireYearRange(startYear, endYear);
+        Double amountThreshold = requireAmountThreshold(minAverageAmount);
+        return sampleEligibleAssets(
+                count,
+                range,
+                candidateLimit -> toAssetNames(stockInfoDao.getEligibleRandomStocks(
+                        range.startTimestamp(),
+                        range.endTimestamp(),
+                        range.requiredDailyCount(),
+                        amountThreshold,
+                        candidateLimit)));
     }
 
-    public List<DebugAssetNameResponse> randomListedEtfs(int count) {
-        return toAssetNames(etfInfoDao.getRandomListedEtfs(requireCount(count)));
+    public DebugAssetSampleResponse randomListedEtfs(int startYear,
+                                                     int endYear,
+                                                     Double minAverageAmount,
+                                                     int count) {
+        YearRange range = requireYearRange(startYear, endYear);
+        Double amountThreshold = requireAmountThreshold(minAverageAmount);
+        return sampleEligibleAssets(
+                count,
+                range,
+                candidateLimit -> toAssetNames(etfInfoDao.getEligibleRandomEtfs(
+                        range.startTimestamp(),
+                        range.endTimestamp(),
+                        range.requiredDailyCount(),
+                        amountThreshold,
+                        candidateLimit)));
     }
 
     private int requireCount(int count) {
@@ -120,18 +151,92 @@ public class DomesticDebugQueryService {
         return value.trim();
     }
 
-    private Long requireDateTimestamp(String value, String name) {
-        String normalized = requireText(value, name);
-        if (!normalized.matches("\\d{8}")) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, name + " must be YYYYMMDD");
+    private YearRange requireYearRange(int startYear, int endYear) {
+        if (startYear < 1900 || startYear > 3000) {
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_REQUEST, "start_year must be between 1900 and 3000");
         }
-        try {
-            LocalDate date = LocalDate.parse(normalized, DateTimeFormatter.BASIC_ISO_DATE);
-            // HTTP 请求保持 yyyyMMdd；行情表按 Asia/Shanghai 当日零点的毫秒时间戳存储。
-            return DateConvertUtils.convertLocalDateToMsTimestamp(date);
-        } catch (DateTimeException e) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, name + " must be a valid YYYYMMDD date");
+        if (endYear < 1900 || endYear > 3000) {
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_REQUEST, "end_year must be between 1900 and 3000");
         }
+        if (startYear > endYear) {
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_REQUEST, "start_year must be <= end_year");
+        }
+        LocalDate startDate = LocalDate.of(startYear, 1, 1);
+        LocalDate endDate = LocalDate.of(endYear, 12, 31);
+        int yearCount = endYear - startYear + 1;
+        int idealDailyCount = Math.multiplyExact(yearCount, TRADING_DAYS_PER_YEAR);
+        int requiredDailyCount = (idealDailyCount * MIN_DAILY_COVERAGE_PERCENT + 99) / 100;
+        return new YearRange(
+                startDate.format(DateTimeFormatter.BASIC_ISO_DATE),
+                endDate.format(DateTimeFormatter.BASIC_ISO_DATE),
+                DateConvertUtils.convertLocalDateToMsTimestamp(startDate),
+                DateConvertUtils.convertLocalDateToMsTimestamp(endDate),
+                idealDailyCount,
+                requiredDailyCount);
+    }
+
+    private Double requireAmountThreshold(Double minAverageAmount) {
+        if (minAverageAmount == null) {
+            return null;
+        }
+        if (!Double.isFinite(minAverageAmount) || minAverageAmount < 0) {
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_REQUEST, "min_avg_amount must be a finite number >= 0");
+        }
+        return minAverageAmount;
+    }
+
+    private DebugAssetSampleResponse sampleEligibleAssets(
+            int count,
+            YearRange range,
+            IntFunction<List<DebugAssetNameResponse>> candidateLoader) {
+        int limit = requireCount(count);
+        int candidateLimit = Math.multiplyExact(limit, 2);
+        Map<String, DebugAssetNameResponse> collected = new LinkedHashMap<>();
+        int attempts = 0;
+
+        while (attempts < MAX_ASSET_SAMPLE_ATTEMPTS && collected.size() < limit) {
+            attempts++;
+            List<DebugAssetNameResponse> candidates = candidateLoader.apply(candidateLimit);
+            if (candidates == null) {
+                continue;
+            }
+            for (DebugAssetNameResponse candidate : candidates) {
+                if (candidate == null || candidate.tsCode() == null || candidate.tsCode().isBlank()) {
+                    continue;
+                }
+                collected.putIfAbsent(candidate.tsCode(), candidate);
+                if (collected.size() >= limit) {
+                    break;
+                }
+            }
+        }
+
+        if (collected.isEmpty()) {
+            throw new ResponseStatusException(
+                    HttpStatus.UNPROCESSABLE_ENTITY,
+                    "no asset satisfies the requested daily coverage and average amount filters");
+        }
+
+        List<DebugAssetNameResponse> items = new ArrayList<>(collected.values());
+        if (items.size() > limit) {
+            items = items.subList(0, limit);
+        }
+        String status = items.size() == limit ? "complete" : "partial";
+        return new DebugAssetSampleResponse(
+                status,
+                limit,
+                items.size(),
+                attempts,
+                MAX_ASSET_SAMPLE_ATTEMPTS,
+                range.startDate(),
+                range.endDate(),
+                range.idealDailyCount(),
+                range.requiredDailyCount(),
+                items);
     }
 
     private List<DebugAssetNameResponse> toAssetNames(List<Map<String, Object>> rows) {
@@ -143,7 +248,12 @@ public class DomesticDebugQueryService {
             String tsCode = stringValue(row, "ts_code");
             String name = stringValue(row, "name");
             if (!tsCode.isBlank()) {
-                result.add(new DebugAssetNameResponse(tsCode, name.isBlank() ? tsCode : name));
+                result.add(new DebugAssetNameResponse(
+                        tsCode,
+                        name.isBlank() ? tsCode : name,
+                        null,
+                        longValue(row, "daily_count"),
+                        doubleValue(row, "average_amount")));
             }
         }
         return result;
@@ -160,7 +270,12 @@ public class DomesticDebugQueryService {
             String fullName = stringValue(row, "full_name");
             // DAO 已先过滤；这里再次校验，避免调试接口把代码或空名称暴露给数据生成器。
             if (!tsCode.isBlank() && hasChineseText(name) && hasChineseText(fullName)) {
-                result.add(new DebugAssetNameResponse(tsCode, name, fullName));
+                result.add(new DebugAssetNameResponse(
+                        tsCode,
+                        name,
+                        fullName,
+                        longValue(row, "daily_count"),
+                        doubleValue(row, "average_amount")));
             }
         }
         return result;
@@ -187,6 +302,52 @@ public class DomesticDebugQueryService {
             }
         }
         return "";
+    }
+
+    private Long longValue(Map<String, Object> row, String key) {
+        Object value = mapValue(row, key);
+        if (value instanceof Number number) {
+            return number.longValue();
+        }
+        if (value == null) {
+            return null;
+        }
+        try {
+            return Long.parseLong(String.valueOf(value));
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
+    }
+
+    private Double doubleValue(Map<String, Object> row, String key) {
+        Object value = mapValue(row, key);
+        if (value instanceof Number number) {
+            return number.doubleValue();
+        }
+        if (value == null) {
+            return null;
+        }
+        try {
+            return Double.parseDouble(String.valueOf(value));
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
+    }
+
+    private Object mapValue(Map<String, Object> row, String key) {
+        if (row == null || row.isEmpty()) {
+            return null;
+        }
+        Object exact = row.get(key);
+        if (exact != null) {
+            return exact;
+        }
+        for (Map.Entry<String, Object> entry : row.entrySet()) {
+            if (entry.getKey() != null && entry.getKey().equalsIgnoreCase(key)) {
+                return entry.getValue();
+            }
+        }
+        return null;
     }
 
     private List<String> nonBlank(List<String> names) {
@@ -259,5 +420,14 @@ public class DomesticDebugQueryService {
         }
         Collections.shuffle(names);
         return names.size() <= limit ? names : names.subList(0, limit);
+    }
+
+    private record YearRange(
+            String startDate,
+            String endDate,
+            long startTimestamp,
+            long endTimestamp,
+            int idealDailyCount,
+            int requiredDailyCount) {
     }
 }

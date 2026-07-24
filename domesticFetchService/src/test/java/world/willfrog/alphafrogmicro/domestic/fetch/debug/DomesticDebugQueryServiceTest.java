@@ -25,8 +25,10 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -110,105 +112,147 @@ class DomesticDebugQueryServiceTest {
     }
 
     @Test
-    void randomIndexNamesByAmountRangeShouldConvertYyyyMmDdToShanghaiEpochMilliseconds() {
-        when(indexQuoteDao.getRandomIndexNamesByAmountRange(
-                1735660800000L, 1767110400000L, 100000.0, 2))
+    void randomIndexNamesByCoverageShouldApplyFiveYearCoverageAndAverageAmount() {
+        when(indexQuoteDao.getEligibleRandomIndices(
+                1609430400000L, 1767110400000L, 1125, 100000.0, 4))
                 .thenReturn(List.of(
                         Map.of("ts_code", "000300.SH", "name", "沪深300",
-                                "full_name", "沪深300指数"),
+                                "full_name", "沪深300指数",
+                                "daily_count", 1218L, "average_amount", 200000.0),
                         Map.of("ts_code", "000905.SH", "name", "中证500",
-                                "full_name", "中证小盘500指数")
+                                "full_name", "中证小盘500指数",
+                                "daily_count", 1216L, "average_amount", 180000.0)
                 ));
 
-        List<DebugAssetNameResponse> result =
-                service.randomIndexNamesByAmountRange("20250101", "20251231", 100000.0, 2);
+        DebugAssetSampleResponse result =
+                service.randomIndexNamesByCoverage(2021, 2025, 100000.0, 2);
 
+        assertEquals("complete", result.status());
+        assertEquals(2, result.requestedCount());
+        assertEquals(2, result.returnedCount());
+        assertEquals(1, result.attempts());
+        assertEquals(1250, result.idealDailyCount());
+        assertEquals(1125, result.requiredDailyCount());
+        assertEquals("20210101", result.startDate());
+        assertEquals("20251231", result.endDate());
         assertEquals(List.of(
-                new DebugAssetNameResponse("000300.SH", "沪深300", "沪深300指数"),
-                new DebugAssetNameResponse("000905.SH", "中证500", "中证小盘500指数")
-        ), result);
-        verify(indexQuoteDao).getRandomIndexNamesByAmountRange(
-                1735660800000L, 1767110400000L, 100000.0, 2);
+                new DebugAssetNameResponse(
+                        "000300.SH", "沪深300", "沪深300指数", 1218L, 200000.0),
+                new DebugAssetNameResponse(
+                        "000905.SH", "中证500", "中证小盘500指数", 1216L, 180000.0)
+        ), result.items());
+        verify(indexQuoteDao).getEligibleRandomIndices(
+                1609430400000L, 1767110400000L, 1125, 100000.0, 4);
     }
 
     @Test
-    void randomIndexNamesByAmountRangeShouldDropRowsWithoutChineseNameOrFullName() {
-        when(indexQuoteDao.getRandomIndexNamesByAmountRange(
-                1735660800000L, 1767110400000L, 100000.0, 5))
+    void randomIndexNamesByCoverageShouldReturnPartialAfterFiveAttempts() {
+        when(indexQuoteDao.getEligibleRandomIndices(
+                1609430400000L, 1767110400000L, 1125, null, 10))
                 .thenReturn(List.of(
                         Map.of("ts_code", "000300.SH", "name", "沪深300",
-                                "full_name", "沪深300指数"),
+                                "full_name", "沪深300指数",
+                                "daily_count", 1218L, "average_amount", 200000.0),
                         Map.of("ts_code", "H21118.CSI", "name", "H21118.CSI",
-                                "full_name", "H21118.CSI"),
+                                "full_name", "H21118.CSI",
+                                "daily_count", 1218L, "average_amount", 200000.0),
                         Map.of("ts_code", "930997.CSI", "name", "CSSW电子",
-                                "full_name", "中证申万电子主题指数"),
-                        Map.of("ts_code", "000905.SH", "name", "中证500",
-                                "full_name", " "),
-                        Map.of("ts_code", "931643.CSI", "name", " ",
-                                "full_name", "中证龙头指数")
+                                "full_name", "中证申万电子主题指数",
+                                "daily_count", 1210L, "average_amount", 150000.0)
                 ));
 
-        List<DebugAssetNameResponse> result =
-                service.randomIndexNamesByAmountRange("20250101", "20251231", 100000.0, 5);
+        DebugAssetSampleResponse result =
+                service.randomIndexNamesByCoverage(2021, 2025, null, 5);
 
-        assertEquals(List.of(
-                new DebugAssetNameResponse("000300.SH", "沪深300", "沪深300指数"),
-                new DebugAssetNameResponse("930997.CSI", "CSSW电子", "中证申万电子主题指数")
-        ), result);
+        assertEquals("partial", result.status());
+        assertEquals(2, result.returnedCount());
+        assertEquals(5, result.attempts());
+        assertEquals(List.of("000300.SH", "930997.CSI"),
+                result.items().stream().map(DebugAssetNameResponse::tsCode).toList());
+        verify(indexQuoteDao, times(5)).getEligibleRandomIndices(
+                1609430400000L, 1767110400000L, 1125, null, 10);
     }
 
     @Test
-    void debugAssetNameResponseShouldSerializeFullNameAsSnakeCase() throws Exception {
+    void debugAssetNameResponseShouldSerializeCoverageFieldsAsSnakeCase() throws Exception {
         JsonNode json = new ObjectMapper().readTree(new ObjectMapper().writeValueAsString(
-                new DebugAssetNameResponse("000300.SH", "沪深300", "沪深300指数")));
+                new DebugAssetNameResponse(
+                        "000300.SH", "沪深300", "沪深300指数", 1218L, 200000.0)));
 
         assertEquals("沪深300指数", json.get("full_name").asText());
+        assertEquals(1218L, json.get("daily_count").asLong());
+        assertEquals(200000.0, json.get("average_amount").asDouble());
         assertTrue(!json.has("fullName"));
     }
 
     @Test
-    void randomIndexNamesByAmountRangeShouldRejectInvalidRangeOrAmount() {
-        assertBadRequest(() -> service.randomIndexNamesByAmountRange("20250132", "20251231", 1.0, 1));
-        assertBadRequest(() -> service.randomIndexNamesByAmountRange("20251231", "20250101", 1.0, 1));
-        assertBadRequest(() -> service.randomIndexNamesByAmountRange("20250101", "20251231", -1.0, 1));
+    void randomCoverageSamplingShouldRejectInvalidYearRangeOrAmount() {
+        assertBadRequest(() -> service.randomIndexNamesByCoverage(1899, 2025, null, 1));
+        assertBadRequest(() -> service.randomIndexNamesByCoverage(2025, 2024, null, 1));
+        assertBadRequest(() -> service.randomIndexNamesByCoverage(2021, 2025, -1.0, 1));
+        assertBadRequest(() -> service.randomIndexNamesByCoverage(
+                2021, 2025, Double.POSITIVE_INFINITY, 1));
     }
 
     @Test
-    void randomListedStocksShouldReturnActiveStockNamesFromDao() {
-        when(stockInfoDao.getRandomListedStocks(2)).thenReturn(List.of(
-                Map.of("ts_code", "600519.SH", "name", "贵州茅台"),
-                Map.of("ts_code", "000001.SZ", "name", "平安银行")
+    void randomListedStocksShouldReturnCoveredStockNamesFromDao() {
+        when(stockInfoDao.getEligibleRandomStocks(
+                1609430400000L, 1767110400000L, 1125, null, 4)).thenReturn(List.of(
+                Map.of("ts_code", "600519.SH", "name", "贵州茅台",
+                        "daily_count", 1218L, "average_amount", 300000.0),
+                Map.of("ts_code", "000001.SZ", "name", "平安银行",
+                        "daily_count", 1217L, "average_amount", 250000.0)
         ));
 
-        List<DebugAssetNameResponse> result = service.randomListedStocks(2);
+        DebugAssetSampleResponse result =
+                service.randomListedStocks(2021, 2025, null, 2);
 
-        assertEquals(List.of(
-                new DebugAssetNameResponse("600519.SH", "贵州茅台"),
-                new DebugAssetNameResponse("000001.SZ", "平安银行")
-        ), result);
+        assertEquals("complete", result.status());
+        assertEquals(List.of("600519.SH", "000001.SZ"),
+                result.items().stream().map(DebugAssetNameResponse::tsCode).toList());
     }
 
     @Test
-    void randomListedEtfsShouldReturnActiveEtfNamesFromDao() {
-        when(etfInfoDao.getRandomListedEtfs(2)).thenReturn(List.of(
-                Map.of("ts_code", "510300.SH", "name", "沪深300ETF"),
-                Map.of("ts_code", "159915.SZ", "name", "创业板ETF")
+    void randomListedEtfsShouldReturnCoveredEtfNamesFromDao() {
+        when(etfInfoDao.getEligibleRandomEtfs(
+                1609430400000L, 1767110400000L, 1125, 50000.0, 4)).thenReturn(List.of(
+                Map.of("ts_code", "510300.SH", "name", "沪深300ETF",
+                        "daily_count", 1218L, "average_amount", 300000.0),
+                Map.of("ts_code", "159915.SZ", "name", "创业板ETF",
+                        "daily_count", 1217L, "average_amount", 250000.0)
         ));
 
-        List<DebugAssetNameResponse> result = service.randomListedEtfs(2);
+        DebugAssetSampleResponse result =
+                service.randomListedEtfs(2021, 2025, 50000.0, 2);
 
-        assertEquals(List.of(
-                new DebugAssetNameResponse("510300.SH", "沪深300ETF"),
-                new DebugAssetNameResponse("159915.SZ", "创业板ETF")
-        ), result);
+        assertEquals("complete", result.status());
+        assertEquals(List.of("510300.SH", "159915.SZ"),
+                result.items().stream().map(DebugAssetNameResponse::tsCode).toList());
+    }
+
+    @Test
+    void randomCoverageSamplingShouldReturnErrorWhenNoAssetQualifies() {
+        when(stockInfoDao.getEligibleRandomStocks(
+                1609430400000L, 1767110400000L, 1125, null, 2))
+                .thenReturn(List.of());
+
+        ResponseStatusException exception = assertThrows(
+                ResponseStatusException.class,
+                () -> service.randomListedStocks(2021, 2025, null, 1));
+
+        assertEquals(HttpStatus.UNPROCESSABLE_ENTITY, exception.getStatusCode());
+        verify(stockInfoDao, times(5)).getEligibleRandomStocks(
+                1609430400000L, 1767110400000L, 1125, null, 2);
     }
 
     @Test
     void randomListedAssetsShouldRejectOutOfRangeCountBeforeQueryingDao() {
-        assertBadRequest(() -> service.randomListedStocks(0));
-        assertBadRequest(() -> service.randomListedEtfs(6));
-        verify(stockInfoDao, never()).getRandomListedStocks(anyInt());
-        verify(etfInfoDao, never()).getRandomListedEtfs(anyInt());
+        assertBadRequest(() -> service.randomListedStocks(2021, 2025, null, 0));
+        assertBadRequest(() -> service.randomListedEtfs(2021, 2025, null, 6));
+        verify(stockInfoDao, never()).getEligibleRandomStocks(
+                anyLong(), anyLong(), anyInt(), any(), anyInt());
+        verify(etfInfoDao, never()).getEligibleRandomEtfs(
+                anyLong(), anyLong(), anyInt(), any(), anyInt());
     }
 
     private static void assertBadRequest(Runnable runnable) {

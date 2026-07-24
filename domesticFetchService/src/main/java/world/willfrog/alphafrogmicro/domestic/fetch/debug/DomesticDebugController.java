@@ -32,23 +32,32 @@ public class DomesticDebugController {
     }
 
     @GetMapping("/index-names/random-by-amount")
-    public List<DebugAssetNameResponse> randomIndexNamesByAmount(
-            @RequestParam("start_date") String startDate,
-            @RequestParam("end_date") String endDate,
-            @RequestParam("min_amount") double minAmount,
+    public DebugAssetSampleResponse randomIndexNamesByAmount(
+            @RequestParam("start_year") int startYear,
+            @RequestParam("end_year") int endYear,
+            @RequestParam(value = "min_avg_amount", required = false) Double minAverageAmount,
             @RequestParam(value = "count", defaultValue = "1") int count) {
-        return queryService.randomIndexNamesByAmountRange(startDate, endDate, minAmount, count);
+        return queryService.randomIndexNamesByCoverage(
+                startYear, endYear, minAverageAmount, count);
     }
 
     @GetMapping("/stocks/random")
-    public List<DebugAssetNameResponse> randomListedStocks(
+    public DebugAssetSampleResponse randomListedStocks(
+            @RequestParam("start_year") int startYear,
+            @RequestParam("end_year") int endYear,
+            @RequestParam(value = "min_avg_amount", required = false) Double minAverageAmount,
             @RequestParam(value = "count", defaultValue = "1") int count) {
-        return queryService.randomListedStocks(count);
+        return queryService.randomListedStocks(
+                startYear, endYear, minAverageAmount, count);
     }
 
     @GetMapping("/etfs/random")
-    public List<DebugAssetNameResponse> randomListedEtfs(
+    public DebugAssetSampleResponse randomListedEtfs(
+            @RequestParam("start_year") int startYear,
+            @RequestParam("end_year") int endYear,
+            @RequestParam(value = "min_avg_amount", required = false) Double minAverageAmount,
             @RequestParam(value = "count", defaultValue = "1") int count) {
-        return queryService.randomListedEtfs(count);
+        return queryService.randomListedEtfs(
+                startYear, endYear, minAverageAmount, count);
     }
 }

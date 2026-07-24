@@ -27,6 +27,9 @@ public class DomesticMarketSampleClient {
     private static final ParameterizedTypeReference<List<Map<String, Object>>> ASSET_LIST_TYPE =
             new ParameterizedTypeReference<>() {
             };
+    private static final ParameterizedTypeReference<Map<String, Object>> ASSET_SAMPLE_TYPE =
+            new ParameterizedTypeReference<>() {
+            };
     private static final ParameterizedTypeReference<List<String>> STRING_LIST_TYPE =
             new ParameterizedTypeReference<>() {
             };
@@ -67,35 +70,40 @@ public class DomesticMarketSampleClient {
         return exchange(uri, STRING_LIST_TYPE);
     }
 
-    public List<Map<String, Object>> randomIndexNamesByAmount(
-            String startDate, String endDate, double minAmount, int count) {
-        URI uri = uri("/debug/index-names/random-by-amount")
-                .queryParam("start_date", startDate)
-                .queryParam("end_date", endDate)
-                .queryParam("min_amount", minAmount)
-                .queryParam("count", count)
-                .build()
-                .encode()
-                .toUri();
-        return exchange(uri, ASSET_LIST_TYPE);
+    public Map<String, Object> randomIndexNamesByAmount(
+            int startYear, int endYear, Double minAverageAmount, int count) {
+        UriComponentsBuilder builder = uri("/debug/index-names/random-by-amount")
+                .queryParam("start_year", startYear)
+                .queryParam("end_year", endYear)
+                .queryParam("count", count);
+        addAverageAmount(builder, minAverageAmount);
+        return exchange(builder.build().encode().toUri(), ASSET_SAMPLE_TYPE);
     }
 
-    public List<Map<String, Object>> randomListedStocks(int count) {
-        URI uri = uri("/debug/stocks/random")
-                .queryParam("count", count)
-                .build()
-                .encode()
-                .toUri();
-        return exchange(uri, ASSET_LIST_TYPE);
+    public Map<String, Object> randomListedStocks(
+            int startYear, int endYear, Double minAverageAmount, int count) {
+        UriComponentsBuilder builder = uri("/debug/stocks/random")
+                .queryParam("start_year", startYear)
+                .queryParam("end_year", endYear)
+                .queryParam("count", count);
+        addAverageAmount(builder, minAverageAmount);
+        return exchange(builder.build().encode().toUri(), ASSET_SAMPLE_TYPE);
     }
 
-    public List<Map<String, Object>> randomListedEtfs(int count) {
-        URI uri = uri("/debug/etfs/random")
-                .queryParam("count", count)
-                .build()
-                .encode()
-                .toUri();
-        return exchange(uri, ASSET_LIST_TYPE);
+    public Map<String, Object> randomListedEtfs(
+            int startYear, int endYear, Double minAverageAmount, int count) {
+        UriComponentsBuilder builder = uri("/debug/etfs/random")
+                .queryParam("start_year", startYear)
+                .queryParam("end_year", endYear)
+                .queryParam("count", count);
+        addAverageAmount(builder, minAverageAmount);
+        return exchange(builder.build().encode().toUri(), ASSET_SAMPLE_TYPE);
+    }
+
+    private void addAverageAmount(UriComponentsBuilder builder, Double minAverageAmount) {
+        if (minAverageAmount != null) {
+            builder.queryParam("min_avg_amount", minAverageAmount);
+        }
     }
 
     private UriComponentsBuilder uri(String path) {

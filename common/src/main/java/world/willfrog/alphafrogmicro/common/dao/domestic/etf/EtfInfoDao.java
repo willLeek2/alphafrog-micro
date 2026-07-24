@@ -53,11 +53,29 @@ public interface EtfInfoDao {
     @Select("SELECT ts_code FROM alphafrog_domestic_etf ORDER BY ts_code LIMIT #{limit} OFFSET #{offset}")
     List<String> getEtfTsCodes(@Param("offset") int offset, @Param("limit") int limit);
 
-    @Select("SELECT etf.ts_code AS ts_code, etf.name AS name " +
-            "FROM alphafrog_domestic_etf etf " +
-            "WHERE etf.list_status = 'L' AND etf.ts_code IS NOT NULL AND etf.name IS NOT NULL " +
-            "AND EXISTS (SELECT 1 FROM alphafrog_domestic_etf_daily daily " +
-            "WHERE daily.ts_code = etf.ts_code) " +
-            "ORDER BY random() LIMIT #{limit}")
-    List<Map<String, Object>> getRandomListedEtfs(@Param("limit") int limit);
+    @Select("WITH candidates AS (" +
+            "  SELECT etf.ts_code, BTRIM(etf.name) AS name " +
+            "  FROM alphafrog_domestic_etf etf " +
+            "  WHERE etf.list_status = 'L' " +
+            "    AND etf.ts_code IS NOT NULL " +
+            "    AND NULLIF(BTRIM(etf.name), '') IS NOT NULL " +
+            "  ORDER BY random() " +
+            "  LIMIT #{candidateLimit}" +
+            ") " +
+            "SELECT c.ts_code AS ts_code, c.name AS name, " +
+            "       COUNT(*) AS daily_count, AVG(d.amount) AS average_amount " +
+            "FROM candidates c " +
+            "JOIN alphafrog_domestic_etf_daily d ON d.ts_code = c.ts_code " +
+            "WHERE d.trade_date BETWEEN #{startDate} AND #{endDate} " +
+            "GROUP BY c.ts_code, c.name " +
+            "HAVING COUNT(*) >= #{requiredDailyCount} " +
+            "   AND (CAST(#{minAverageAmount} AS DOUBLE PRECISION) IS NULL " +
+            "        OR AVG(d.amount) >= CAST(#{minAverageAmount} AS DOUBLE PRECISION)) " +
+            "ORDER BY random()")
+    List<Map<String, Object>> getEligibleRandomEtfs(
+            @Param("startDate") Long startDate,
+            @Param("endDate") Long endDate,
+            @Param("requiredDailyCount") int requiredDailyCount,
+            @Param("minAverageAmount") Double minAverageAmount,
+            @Param("candidateLimit") int candidateLimit);
 }
