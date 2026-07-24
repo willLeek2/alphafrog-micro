@@ -95,7 +95,7 @@ public class DomesticDebugQueryService {
         if (minAmount < 0) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "min_amount must be >= 0");
         }
-        return toAssetNames(indexQuoteDao.getRandomIndexNamesByAmountRange(start, end, minAmount, limit));
+        return toIndexNames(indexQuoteDao.getRandomIndexNamesByAmountRange(start, end, minAmount, limit));
     }
 
     public List<DebugAssetNameResponse> randomListedStocks(int count) {
@@ -147,6 +147,30 @@ public class DomesticDebugQueryService {
             }
         }
         return result;
+    }
+
+    private List<DebugAssetNameResponse> toIndexNames(List<Map<String, Object>> rows) {
+        if (rows == null || rows.isEmpty()) {
+            return List.of();
+        }
+        List<DebugAssetNameResponse> result = new ArrayList<>();
+        for (Map<String, Object> row : rows) {
+            String tsCode = stringValue(row, "ts_code");
+            String name = stringValue(row, "name");
+            String fullName = stringValue(row, "full_name");
+            // DAO 已先过滤；这里再次校验，避免调试接口把代码或空名称暴露给数据生成器。
+            if (!tsCode.isBlank() && hasChineseText(name) && hasChineseText(fullName)) {
+                result.add(new DebugAssetNameResponse(tsCode, name, fullName));
+            }
+        }
+        return result;
+    }
+
+    private boolean hasChineseText(String value) {
+        return value != null
+                && !value.isBlank()
+                && value.codePoints().anyMatch(codePoint ->
+                Character.UnicodeScript.of(codePoint) == Character.UnicodeScript.HAN);
     }
 
     private String stringValue(Map<String, Object> row, String key) {

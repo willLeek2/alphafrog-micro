@@ -38,7 +38,7 @@ public interface IndexQuoteDao {
     @Select("SELECT EXISTS(SELECT 1 FROM alphafrog_index_daily WHERE ts_code = #{tsCode} LIMIT 1)")
     boolean hasAnyIndexDaily(@Param("tsCode") String tsCode);
 
-    @Select("SELECT sample.ts_code AS ts_code, COALESCE(i.name, sample.ts_code) AS name " +
+    @Select("SELECT sample.ts_code AS ts_code, BTRIM(i.name) AS name, BTRIM(i.fullname) AS full_name " +
             "FROM (" +
             "  SELECT DISTINCT ts_code " +
             "  FROM alphafrog_index_daily " +
@@ -46,7 +46,11 @@ public interface IndexQuoteDao {
             "    AND amount >= #{minAmount} " +
             "    AND ts_code IS NOT NULL" +
             ") sample " +
-            "LEFT JOIN alphafrog_index_info i ON i.ts_code = sample.ts_code " +
+            "JOIN alphafrog_index_info i ON i.ts_code = sample.ts_code " +
+            "WHERE NULLIF(BTRIM(i.name), '') IS NOT NULL " +
+            "  AND NULLIF(BTRIM(i.fullname), '') IS NOT NULL " +
+            "  AND BTRIM(i.name) ~ '[一-龥]' " +
+            "  AND BTRIM(i.fullname) ~ '[一-龥]' " +
             "ORDER BY random() " +
             "LIMIT #{limit}")
     List<Map<String, Object>> getRandomIndexNamesByAmountRange(@Param("startDate") Long startDate,

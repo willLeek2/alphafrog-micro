@@ -2,6 +2,8 @@ package world.willfrog.alphafrogmicro.domestic.fetch.debug;
 
 import com.alibaba.fastjson.JSONArray;
 import com.alibaba.fastjson.JSONObject;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.springframework.http.HttpStatus;
@@ -112,19 +114,56 @@ class DomesticDebugQueryServiceTest {
         when(indexQuoteDao.getRandomIndexNamesByAmountRange(
                 1735660800000L, 1767110400000L, 100000.0, 2))
                 .thenReturn(List.of(
-                        Map.of("ts_code", "000300.SH", "name", "沪深300"),
-                        Map.of("ts_code", "000905.SH", "name", "中证500")
+                        Map.of("ts_code", "000300.SH", "name", "沪深300",
+                                "full_name", "沪深300指数"),
+                        Map.of("ts_code", "000905.SH", "name", "中证500",
+                                "full_name", "中证小盘500指数")
                 ));
 
         List<DebugAssetNameResponse> result =
                 service.randomIndexNamesByAmountRange("20250101", "20251231", 100000.0, 2);
 
         assertEquals(List.of(
-                new DebugAssetNameResponse("000300.SH", "沪深300"),
-                new DebugAssetNameResponse("000905.SH", "中证500")
+                new DebugAssetNameResponse("000300.SH", "沪深300", "沪深300指数"),
+                new DebugAssetNameResponse("000905.SH", "中证500", "中证小盘500指数")
         ), result);
         verify(indexQuoteDao).getRandomIndexNamesByAmountRange(
                 1735660800000L, 1767110400000L, 100000.0, 2);
+    }
+
+    @Test
+    void randomIndexNamesByAmountRangeShouldDropRowsWithoutChineseNameOrFullName() {
+        when(indexQuoteDao.getRandomIndexNamesByAmountRange(
+                1735660800000L, 1767110400000L, 100000.0, 5))
+                .thenReturn(List.of(
+                        Map.of("ts_code", "000300.SH", "name", "沪深300",
+                                "full_name", "沪深300指数"),
+                        Map.of("ts_code", "H21118.CSI", "name", "H21118.CSI",
+                                "full_name", "H21118.CSI"),
+                        Map.of("ts_code", "930997.CSI", "name", "CSSW电子",
+                                "full_name", "中证申万电子主题指数"),
+                        Map.of("ts_code", "000905.SH", "name", "中证500",
+                                "full_name", " "),
+                        Map.of("ts_code", "931643.CSI", "name", " ",
+                                "full_name", "中证龙头指数")
+                ));
+
+        List<DebugAssetNameResponse> result =
+                service.randomIndexNamesByAmountRange("20250101", "20251231", 100000.0, 5);
+
+        assertEquals(List.of(
+                new DebugAssetNameResponse("000300.SH", "沪深300", "沪深300指数"),
+                new DebugAssetNameResponse("930997.CSI", "CSSW电子", "中证申万电子主题指数")
+        ), result);
+    }
+
+    @Test
+    void debugAssetNameResponseShouldSerializeFullNameAsSnakeCase() throws Exception {
+        JsonNode json = new ObjectMapper().readTree(new ObjectMapper().writeValueAsString(
+                new DebugAssetNameResponse("000300.SH", "沪深300", "沪深300指数")));
+
+        assertEquals("沪深300指数", json.get("full_name").asText());
+        assertTrue(!json.has("fullName"));
     }
 
     @Test

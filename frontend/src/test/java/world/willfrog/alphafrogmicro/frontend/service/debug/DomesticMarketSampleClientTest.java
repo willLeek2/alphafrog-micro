@@ -28,7 +28,8 @@ class DomesticMarketSampleClientTest {
                                 + "?start_date=20250101&end_date=20251231&min_amount=100000.0&count=2"))
                 .andExpect(method(HttpMethod.GET))
                 .andRespond(withSuccess(
-                        "[{\"tsCode\":\"000300.SH\",\"name\":\"沪深300\"}]",
+                        "[{\"tsCode\":\"000300.SH\",\"name\":\"沪深300\","
+                                + "\"full_name\":\"沪深300指数\"}]",
                         MediaType.APPLICATION_JSON));
 
         List<Map<String, Object>> result = client.randomIndexNamesByAmount(
@@ -36,6 +37,7 @@ class DomesticMarketSampleClientTest {
 
         assertEquals("000300.SH", result.get(0).get("tsCode"));
         assertEquals("沪深300", result.get(0).get("name"));
+        assertEquals("沪深300指数", result.get(0).get("full_name"));
         server.verify();
     }
 
