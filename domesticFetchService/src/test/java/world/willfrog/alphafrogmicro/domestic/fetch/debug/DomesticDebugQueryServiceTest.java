@@ -125,7 +125,8 @@ class DomesticDebugQueryServiceTest {
                 ));
 
         DebugAssetSampleResponse result =
-                service.randomIndexNamesByCoverage(2021, 2025, 100000.0, 7, 3, 2);
+                service.randomIndexNamesByCoverage(
+                        2021, 2025, 100000.0, false, 7, 3, 2);
 
         assertEquals("complete", result.status());
         assertEquals(2, result.requestedCount());
@@ -164,7 +165,8 @@ class DomesticDebugQueryServiceTest {
                 ));
 
         DebugAssetSampleResponse result =
-                service.randomIndexNamesByCoverage(2021, 2025, null, 7, 3, 5);
+                service.randomIndexNamesByCoverage(
+                        2021, 2025, null, false, 7, 3, 5);
 
         assertEquals("partial", result.status());
         assertEquals(2, result.returnedCount());
@@ -175,6 +177,101 @@ class DomesticDebugQueryServiceTest {
                 result.items().stream().map(DebugAssetNameResponse::tsCode).toList());
         verify(indexQuoteDao, times(3)).getEligibleRandomIndices(
                 1609430400000L, 1767110400000L, 1125, null, 7);
+    }
+
+    @Test
+    void randomIndexNamesByCoverageShouldExcludeNonCnyMarkersWhenCnyOnlyIsEnabled() {
+        when(indexQuoteDao.getEligibleRandomIndices(
+                1609430400000L, 1767110400000L, 1125, null, 20))
+                .thenReturn(List.of(
+                        Map.of("ts_code", "H001.CSI", "name", "恒生科技HKD",
+                                "full_name", "恒生科技指数",
+                                "daily_count", 1218L, "average_amount", 200000.0),
+                        Map.of("ts_code", "H002.CSI", "name", "港元债券",
+                                "full_name", "港元债券指数",
+                                "daily_count", 1218L, "average_amount", 200000.0),
+                        Map.of("ts_code", "H003.CSI", "name", "深港通综指",
+                                "full_name", "深港通综合指数(港币)",
+                                "daily_count", 1218L, "average_amount", 200000.0),
+                        Map.of("ts_code", "H004.CSI", "name", "半导体15USD",
+                                "full_name", "中证半导体15美元指数",
+                                "daily_count", 1218L, "average_amount", 200000.0),
+                        Map.of("ts_code", "H005.CSI", "name", "中国互联网1040(EUR)",
+                                "full_name", "中证海外中国互联网1040欧元指数",
+                                "daily_count", 1218L, "average_amount", 200000.0),
+                        Map.of("ts_code", "H006.CSI", "name", "创业板R(CNH)",
+                                "full_name", "创业板离岸人民币全收益指数",
+                                "daily_count", 1218L, "average_amount", 200000.0),
+                        Map.of("ts_code", "H007.CSI", "name", "亚洲精选100SGD",
+                                "full_name", "亚洲精选100新加坡元指数",
+                                "daily_count", 1218L, "average_amount", 200000.0),
+                        Map.of("ts_code", "H008.CSI", "name", "中国主题AUD",
+                                "full_name", "中国主题澳元指数",
+                                "daily_count", 1218L, "average_amount", 200000.0),
+                        Map.of("ts_code", "931409.CSI", "name", "沪深港创新药",
+                                "full_name", "沪深港创新药产业指数",
+                                "daily_count", 1218L, "average_amount", 200000.0),
+                        Map.of("ts_code", "931410.CSI", "name", "中国质量成长(CNY)",
+                                "full_name", "中证中国质量成长指数(CNY)",
+                                "daily_count", 1218L, "average_amount", 200000.0),
+                        Map.of("ts_code", "931411.CSI", "name", "港股50(人民币)",
+                                "full_name", "国证港股50人民币指数",
+                                "daily_count", 1218L, "average_amount", 200000.0)
+                ));
+
+        DebugAssetSampleResponse result =
+                service.randomIndexNamesByCoverage(
+                        2021, 2025, null, true, 20, 3, 3);
+
+        assertEquals("complete", result.status());
+        assertEquals(List.of("931409.CSI", "931410.CSI", "931411.CSI"),
+                result.items().stream().map(DebugAssetNameResponse::tsCode).toList());
+        assertEquals(List.of("沪深港创新药", "中国质量成长(CNY)", "港股50(人民币)"),
+                result.items().stream().map(DebugAssetNameResponse::name).toList());
+        verify(indexQuoteDao).getEligibleRandomIndices(
+                1609430400000L, 1767110400000L, 1125, null, 20);
+    }
+
+    @Test
+    void randomIndexNamesByCoverageShouldKeepHkdMarkersWhenCnyOnlyIsDisabled() {
+        when(indexQuoteDao.getEligibleRandomIndices(
+                1609430400000L, 1767110400000L, 1125, null, 1))
+                .thenReturn(List.of(
+                        Map.of("ts_code", "H001.CSI", "name", "恒生科技HKD",
+                                "full_name", "港元计价恒生科技指数",
+                                "daily_count", 1218L, "average_amount", 200000.0)
+                ));
+
+        DebugAssetSampleResponse result =
+                service.randomIndexNamesByCoverage(
+                        2021, 2025, null, false, 1, 1, 1);
+
+        assertEquals("complete", result.status());
+        assertEquals(List.of("H001.CSI"),
+                result.items().stream().map(DebugAssetNameResponse::tsCode).toList());
+    }
+
+    @Test
+    void randomIndexNamesByCoverageShouldReturnErrorWhenCnyOnlyRejectsEveryCandidate() {
+        when(indexQuoteDao.getEligibleRandomIndices(
+                1609430400000L, 1767110400000L, 1125, null, 2))
+                .thenReturn(List.of(
+                        Map.of("ts_code", "H001.CSI", "name", "深港通综指",
+                                "full_name", "深港通综合指数(港币)",
+                                "daily_count", 1218L, "average_amount", 200000.0),
+                        Map.of("ts_code", "H002.CSI", "name", "创业板R(CNH)",
+                                "full_name", "创业板离岸人民币全收益指数",
+                                "daily_count", 1218L, "average_amount", 200000.0)
+                ));
+
+        ResponseStatusException exception = assertThrows(
+                ResponseStatusException.class,
+                () -> service.randomIndexNamesByCoverage(
+                        2021, 2025, null, true, 2, 3, 1));
+
+        assertEquals(HttpStatus.UNPROCESSABLE_ENTITY, exception.getStatusCode());
+        verify(indexQuoteDao, times(3)).getEligibleRandomIndices(
+                1609430400000L, 1767110400000L, 1125, null, 2);
     }
 
     @Test
@@ -192,13 +289,13 @@ class DomesticDebugQueryServiceTest {
     @Test
     void randomCoverageSamplingShouldRejectInvalidYearRangeOrAmount() {
         assertBadRequest(() -> service.randomIndexNamesByCoverage(
-                1899, 2025, null, 7, 3, 1));
+                1899, 2025, null, false, 7, 3, 1));
         assertBadRequest(() -> service.randomIndexNamesByCoverage(
-                2025, 2024, null, 7, 3, 1));
+                2025, 2024, null, false, 7, 3, 1));
         assertBadRequest(() -> service.randomIndexNamesByCoverage(
-                2021, 2025, -1.0, 7, 3, 1));
+                2021, 2025, -1.0, false, 7, 3, 1));
         assertBadRequest(() -> service.randomIndexNamesByCoverage(
-                2021, 2025, Double.POSITIVE_INFINITY, 7, 3, 1));
+                2021, 2025, Double.POSITIVE_INFINITY, false, 7, 3, 1));
     }
 
     @Test

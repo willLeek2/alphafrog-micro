@@ -14,6 +14,7 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.IntFunction;
@@ -35,6 +36,13 @@ public class DomesticDebugQueryService {
     private static final int MIN_DAILY_COVERAGE_PERCENT = 90;
     private static final int MAX_CANDIDATE_COUNT = 100;
     private static final int MAX_SAMPLE_ATTEMPTS = 20;
+    private static final List<String> NON_CNY_CURRENCY_CODES = List.of(
+            "HKD", "USD", "EUR", "CNH", "SGD", "AUD", "GBP",
+            "JPY", "CAD", "CHF", "KRW", "TWD", "MOP");
+    private static final List<String> NON_CNY_CURRENCY_NAMES = List.of(
+            "港元", "港币", "美元", "欧元", "离岸人民币", "新加坡元", "新币",
+            "澳元", "英镑", "日元", "加元", "瑞士法郎", "韩元",
+            "台币", "新台币", "澳门元", "澳门币");
     private static final String SW2021 = "SW2021";
 
     private final IndexWeightDao indexWeightDao;
@@ -90,6 +98,7 @@ public class DomesticDebugQueryService {
     public DebugAssetSampleResponse randomIndexNamesByCoverage(int startYear,
                                                                 int endYear,
                                                                 Double minAverageAmount,
+                                                                boolean cnyOnly,
                                                                 int candidateCount,
                                                                 int maxAttempts,
                                                                 int count) {
@@ -105,7 +114,7 @@ public class DomesticDebugQueryService {
                         range.endTimestamp(),
                         range.requiredDailyCount(),
                         amountThreshold,
-                        limit)));
+                        limit), cnyOnly));
     }
 
     public DebugAssetSampleResponse randomListedStocks(int startYear,
@@ -294,7 +303,9 @@ public class DomesticDebugQueryService {
         return result;
     }
 
-    private List<DebugAssetNameResponse> toIndexNames(List<Map<String, Object>> rows) {
+    private List<DebugAssetNameResponse> toIndexNames(
+            List<Map<String, Object>> rows,
+            boolean cnyOnly) {
         if (rows == null || rows.isEmpty()) {
             return List.of();
         }
@@ -304,7 +315,10 @@ public class DomesticDebugQueryService {
             String name = stringValue(row, "name");
             String fullName = stringValue(row, "full_name");
             // DAO 已先过滤；这里再次校验，避免调试接口把代码或空名称暴露给数据生成器。
-            if (!tsCode.isBlank() && hasChineseText(name) && hasChineseText(fullName)) {
+            if (!tsCode.isBlank()
+                    && hasChineseText(name)
+                    && hasChineseText(fullName)
+                    && (!cnyOnly || hasNoNonCnyMarker(name, fullName))) {
                 result.add(new DebugAssetNameResponse(
                         tsCode,
                         name,
@@ -314,6 +328,19 @@ public class DomesticDebugQueryService {
             }
         }
         return result;
+    }
+
+    private boolean hasNoNonCnyMarker(String name, String fullName) {
+        return !hasNonCnyMarker(name) && !hasNonCnyMarker(fullName);
+    }
+
+    private boolean hasNonCnyMarker(String value) {
+        if (value == null) {
+            return false;
+        }
+        String upperValue = value.toUpperCase(Locale.ROOT);
+        return NON_CNY_CURRENCY_CODES.stream().anyMatch(upperValue::contains)
+                || NON_CNY_CURRENCY_NAMES.stream().anyMatch(value::contains);
     }
 
     private boolean hasChineseText(String value) {

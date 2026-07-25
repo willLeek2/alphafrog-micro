@@ -74,12 +74,14 @@ public class DomesticMarketSampleClient {
             int startYear,
             int endYear,
             Double minAverageAmount,
+            boolean cnyOnly,
             int candidateCount,
             int maxAttempts,
             int count) {
         UriComponentsBuilder builder = uri("/debug/index-names/random-by-amount")
                 .queryParam("start_year", startYear)
                 .queryParam("end_year", endYear)
+                .queryParam("cny_only", cnyOnly)
                 .queryParam("candidate_count", candidateCount)
                 .queryParam("max_attempts", maxAttempts)
                 .queryParam("count", count);

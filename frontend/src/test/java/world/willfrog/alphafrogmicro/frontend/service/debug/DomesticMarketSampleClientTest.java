@@ -29,6 +29,7 @@ class DomesticMarketSampleClientTest {
         server.expect(requestTo(
                         "http://domestic-fetch-service:18082/debug/index-names/random-by-amount"
                                 + "?start_year=2021&end_year=2025"
+                                + "&cny_only=true"
                                 + "&candidate_count=7&max_attempts=3"
                                 + "&count=2&min_avg_amount=100000.0"))
                 .andExpect(method(HttpMethod.GET))
@@ -40,7 +41,7 @@ class DomesticMarketSampleClientTest {
                         MediaType.APPLICATION_JSON));
 
         Map<String, Object> result = client.randomIndexNamesByAmount(
-                2021, 2025, 100000.0, 7, 3, 2);
+                2021, 2025, 100000.0, true, 7, 3, 2);
 
         @SuppressWarnings("unchecked")
         Map<String, Object> item = ((java.util.List<Map<String, Object>>) result.get("items")).get(0);

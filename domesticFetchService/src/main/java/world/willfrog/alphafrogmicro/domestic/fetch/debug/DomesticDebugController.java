@@ -36,11 +36,13 @@ public class DomesticDebugController {
             @RequestParam("start_year") int startYear,
             @RequestParam("end_year") int endYear,
             @RequestParam(value = "min_avg_amount", required = false) Double minAverageAmount,
+            @RequestParam(value = "cny_only", defaultValue = "false") boolean cnyOnly,
             @RequestParam("candidate_count") int candidateCount,
             @RequestParam("max_attempts") int maxAttempts,
             @RequestParam(value = "count", defaultValue = "1") int count) {
         return queryService.randomIndexNamesByCoverage(
-                startYear, endYear, minAverageAmount, candidateCount, maxAttempts, count);
+                startYear, endYear, minAverageAmount, cnyOnly,
+                candidateCount, maxAttempts, count);
     }
 
     @GetMapping("/stocks/random")

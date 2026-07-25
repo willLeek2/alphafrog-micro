@@ -41,13 +41,13 @@ class AdminMarketSampleControllerTest {
         Authentication authentication = authentication("admin");
         when(adminUserAccessService.isActiveAdmin(authentication)).thenReturn(true);
         when(marketSampleClient.randomIndexNamesByAmount(
-                2021, 2025, 100000.0, 7, 3, 2))
+                2021, 2025, 100000.0, true, 7, 3, 2))
                 .thenReturn(Map.of(
                         "status", "complete",
                         "items", List.of(Map.of("tsCode", "000300.SH", "name", "沪深300"))));
 
         ResponseEntity<?> response = controller.randomIndexNamesByAmount(
-                authentication, 2021, 2025, 100000.0, 7, 3, 2);
+                authentication, 2021, 2025, 100000.0, true, 7, 3, 2);
 
         assertEquals(200, response.getStatusCode().value());
         assertEquals(Map.of(
