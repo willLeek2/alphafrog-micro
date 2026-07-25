@@ -33,7 +33,8 @@ public class DomesticDebugQueryService {
     private static final int MAX_COUNT = 5;
     private static final int TRADING_DAYS_PER_YEAR = 250;
     private static final int MIN_DAILY_COVERAGE_PERCENT = 90;
-    private static final int MAX_ASSET_SAMPLE_ATTEMPTS = 5;
+    private static final int MAX_CANDIDATE_COUNT = 100;
+    private static final int MAX_SAMPLE_ATTEMPTS = 20;
     private static final String SW2021 = "SW2021";
 
     private final IndexWeightDao indexWeightDao;
@@ -89,52 +90,64 @@ public class DomesticDebugQueryService {
     public DebugAssetSampleResponse randomIndexNamesByCoverage(int startYear,
                                                                 int endYear,
                                                                 Double minAverageAmount,
+                                                                int candidateCount,
+                                                                int maxAttempts,
                                                                 int count) {
         YearRange range = requireYearRange(startYear, endYear);
         Double amountThreshold = requireAmountThreshold(minAverageAmount);
         return sampleEligibleAssets(
                 count,
+                candidateCount,
+                maxAttempts,
                 range,
-                candidateLimit -> toIndexNames(indexQuoteDao.getEligibleRandomIndices(
+                limit -> toIndexNames(indexQuoteDao.getEligibleRandomIndices(
                         range.startTimestamp(),
                         range.endTimestamp(),
                         range.requiredDailyCount(),
                         amountThreshold,
-                        candidateLimit)));
+                        limit)));
     }
 
     public DebugAssetSampleResponse randomListedStocks(int startYear,
                                                        int endYear,
                                                        Double minAverageAmount,
+                                                       int candidateCount,
+                                                       int maxAttempts,
                                                        int count) {
         YearRange range = requireYearRange(startYear, endYear);
         Double amountThreshold = requireAmountThreshold(minAverageAmount);
         return sampleEligibleAssets(
                 count,
+                candidateCount,
+                maxAttempts,
                 range,
-                candidateLimit -> toAssetNames(stockInfoDao.getEligibleRandomStocks(
+                limit -> toAssetNames(stockInfoDao.getEligibleRandomStocks(
                         range.startTimestamp(),
                         range.endTimestamp(),
                         range.requiredDailyCount(),
                         amountThreshold,
-                        candidateLimit)));
+                        limit)));
     }
 
     public DebugAssetSampleResponse randomListedEtfs(int startYear,
                                                      int endYear,
                                                      Double minAverageAmount,
+                                                     int candidateCount,
+                                                     int maxAttempts,
                                                      int count) {
         YearRange range = requireYearRange(startYear, endYear);
         Double amountThreshold = requireAmountThreshold(minAverageAmount);
         return sampleEligibleAssets(
                 count,
+                candidateCount,
+                maxAttempts,
                 range,
-                candidateLimit -> toAssetNames(etfInfoDao.getEligibleRandomEtfs(
+                limit -> toAssetNames(etfInfoDao.getEligibleRandomEtfs(
                         range.startTimestamp(),
                         range.endTimestamp(),
                         range.requiredDailyCount(),
                         amountThreshold,
-                        candidateLimit)));
+                        limit)));
     }
 
     private int requireCount(int count) {
@@ -191,16 +204,19 @@ public class DomesticDebugQueryService {
 
     private DebugAssetSampleResponse sampleEligibleAssets(
             int count,
+            int candidateCount,
+            int maxAttempts,
             YearRange range,
             IntFunction<List<DebugAssetNameResponse>> candidateLoader) {
         int limit = requireCount(count);
-        int candidateLimit = Math.multiplyExact(limit, 2);
+        int validatedCandidateCount = requireCandidateCount(candidateCount);
+        int validatedMaxAttempts = requireMaxAttempts(maxAttempts);
         Map<String, DebugAssetNameResponse> collected = new LinkedHashMap<>();
         int attempts = 0;
 
-        while (attempts < MAX_ASSET_SAMPLE_ATTEMPTS && collected.size() < limit) {
+        while (attempts < validatedMaxAttempts && collected.size() < limit) {
             attempts++;
-            List<DebugAssetNameResponse> candidates = candidateLoader.apply(candidateLimit);
+            List<DebugAssetNameResponse> candidates = candidateLoader.apply(validatedCandidateCount);
             if (candidates == null) {
                 continue;
             }
@@ -230,13 +246,32 @@ public class DomesticDebugQueryService {
                 status,
                 limit,
                 items.size(),
+                validatedCandidateCount,
                 attempts,
-                MAX_ASSET_SAMPLE_ATTEMPTS,
+                validatedMaxAttempts,
                 range.startDate(),
                 range.endDate(),
                 range.idealDailyCount(),
                 range.requiredDailyCount(),
                 items);
+    }
+
+    private int requireCandidateCount(int candidateCount) {
+        if (candidateCount < 1 || candidateCount > MAX_CANDIDATE_COUNT) {
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_REQUEST,
+                    "candidate_count must be between 1 and " + MAX_CANDIDATE_COUNT);
+        }
+        return candidateCount;
+    }
+
+    private int requireMaxAttempts(int maxAttempts) {
+        if (maxAttempts < 1 || maxAttempts > MAX_SAMPLE_ATTEMPTS) {
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_REQUEST,
+                    "max_attempts must be between 1 and " + MAX_SAMPLE_ATTEMPTS);
+        }
+        return maxAttempts;
     }
 
     private List<DebugAssetNameResponse> toAssetNames(List<Map<String, Object>> rows) {

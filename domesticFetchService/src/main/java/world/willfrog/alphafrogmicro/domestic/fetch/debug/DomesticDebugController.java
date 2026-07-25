@@ -36,9 +36,11 @@ public class DomesticDebugController {
             @RequestParam("start_year") int startYear,
             @RequestParam("end_year") int endYear,
             @RequestParam(value = "min_avg_amount", required = false) Double minAverageAmount,
+            @RequestParam("candidate_count") int candidateCount,
+            @RequestParam("max_attempts") int maxAttempts,
             @RequestParam(value = "count", defaultValue = "1") int count) {
         return queryService.randomIndexNamesByCoverage(
-                startYear, endYear, minAverageAmount, count);
+                startYear, endYear, minAverageAmount, candidateCount, maxAttempts, count);
     }
 
     @GetMapping("/stocks/random")
@@ -46,9 +48,11 @@ public class DomesticDebugController {
             @RequestParam("start_year") int startYear,
             @RequestParam("end_year") int endYear,
             @RequestParam(value = "min_avg_amount", required = false) Double minAverageAmount,
+            @RequestParam("candidate_count") int candidateCount,
+            @RequestParam("max_attempts") int maxAttempts,
             @RequestParam(value = "count", defaultValue = "1") int count) {
         return queryService.randomListedStocks(
-                startYear, endYear, minAverageAmount, count);
+                startYear, endYear, minAverageAmount, candidateCount, maxAttempts, count);
     }
 
     @GetMapping("/etfs/random")
@@ -56,8 +60,10 @@ public class DomesticDebugController {
             @RequestParam("start_year") int startYear,
             @RequestParam("end_year") int endYear,
             @RequestParam(value = "min_avg_amount", required = false) Double minAverageAmount,
+            @RequestParam("candidate_count") int candidateCount,
+            @RequestParam("max_attempts") int maxAttempts,
             @RequestParam(value = "count", defaultValue = "1") int count) {
         return queryService.randomListedEtfs(
-                startYear, endYear, minAverageAmount, count);
+                startYear, endYear, minAverageAmount, candidateCount, maxAttempts, count);
     }
 }

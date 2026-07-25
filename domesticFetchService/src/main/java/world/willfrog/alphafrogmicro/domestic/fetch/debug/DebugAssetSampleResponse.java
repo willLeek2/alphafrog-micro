@@ -8,6 +8,7 @@ public record DebugAssetSampleResponse(
         String status,
         @JsonProperty("requested_count") int requestedCount,
         @JsonProperty("returned_count") int returnedCount,
+        @JsonProperty("candidate_count") int candidateCount,
         int attempts,
         @JsonProperty("max_attempts") int maxAttempts,
         @JsonProperty("start_date") String startDate,

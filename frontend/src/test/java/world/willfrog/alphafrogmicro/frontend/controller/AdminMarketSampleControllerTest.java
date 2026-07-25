@@ -41,13 +41,13 @@ class AdminMarketSampleControllerTest {
         Authentication authentication = authentication("admin");
         when(adminUserAccessService.isActiveAdmin(authentication)).thenReturn(true);
         when(marketSampleClient.randomIndexNamesByAmount(
-                2021, 2025, 100000.0, 2))
+                2021, 2025, 100000.0, 7, 3, 2))
                 .thenReturn(Map.of(
                         "status", "complete",
                         "items", List.of(Map.of("tsCode", "000300.SH", "name", "沪深300"))));
 
         ResponseEntity<?> response = controller.randomIndexNamesByAmount(
-                authentication, 2021, 2025, 100000.0, 2);
+                authentication, 2021, 2025, 100000.0, 7, 3, 2);
 
         assertEquals(200, response.getStatusCode().value());
         assertEquals(Map.of(
@@ -60,17 +60,17 @@ class AdminMarketSampleControllerTest {
     void adminAccountCanFetchRandomStocksAndEtfs() {
         Authentication authentication = authentication("admin-assets");
         when(adminUserAccessService.isActiveAdmin(authentication)).thenReturn(true);
-        when(marketSampleClient.randomListedStocks(2021, 2025, null, 1))
+        when(marketSampleClient.randomListedStocks(2021, 2025, null, 7, 3, 1))
                 .thenReturn(Map.of("status", "complete", "items",
                         List.of(Map.of("tsCode", "600519.SH", "name", "贵州茅台"))));
-        when(marketSampleClient.randomListedEtfs(2021, 2025, null, 1))
+        when(marketSampleClient.randomListedEtfs(2021, 2025, null, 7, 3, 1))
                 .thenReturn(Map.of("status", "complete", "items",
                         List.of(Map.of("tsCode", "510300.SH", "name", "沪深300ETF"))));
 
         ResponseEntity<?> stocks = controller.randomListedStocks(
-                authentication, 2021, 2025, null, 1);
+                authentication, 2021, 2025, null, 7, 3, 1);
         ResponseEntity<?> etfs = controller.randomListedEtfs(
-                authentication, 2021, 2025, null, 1);
+                authentication, 2021, 2025, null, 7, 3, 1);
 
         assertEquals(200, stocks.getStatusCode().value());
         assertEquals(200, etfs.getStatusCode().value());
@@ -84,11 +84,11 @@ class AdminMarketSampleControllerTest {
     void zeroEligibleAssetsShouldRemainUnprocessableEntity() {
         Authentication authentication = authentication("admin-zero-assets");
         when(adminUserAccessService.isActiveAdmin(authentication)).thenReturn(true);
-        when(marketSampleClient.randomListedStocks(2021, 2025, null, 1))
+        when(marketSampleClient.randomListedStocks(2021, 2025, null, 7, 3, 1))
                 .thenThrow(new HttpClientErrorException(HttpStatus.UNPROCESSABLE_ENTITY));
 
         ResponseEntity<?> response = controller.randomListedStocks(
-                authentication, 2021, 2025, null, 1);
+                authentication, 2021, 2025, null, 7, 3, 1);
 
         assertEquals(422, response.getStatusCode().value());
         assertEquals(Map.of("error", "Random market sample request was rejected"),

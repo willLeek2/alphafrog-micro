@@ -55,10 +55,13 @@ public class AdminMarketSampleController {
             @RequestParam("start_year") int startYear,
             @RequestParam("end_year") int endYear,
             @RequestParam(value = "min_avg_amount", required = false) Double minAverageAmount,
+            @RequestParam("candidate_count") int candidateCount,
+            @RequestParam("max_attempts") int maxAttempts,
             @RequestParam(value = "count", defaultValue = "1") int count) {
         return adminCall(authentication,
                 () -> marketSampleClient.randomIndexNamesByAmount(
-                        startYear, endYear, minAverageAmount, count));
+                        startYear, endYear, minAverageAmount,
+                        candidateCount, maxAttempts, count));
     }
 
     @GetMapping("/stocks/random")
@@ -67,9 +70,11 @@ public class AdminMarketSampleController {
             @RequestParam("start_year") int startYear,
             @RequestParam("end_year") int endYear,
             @RequestParam(value = "min_avg_amount", required = false) Double minAverageAmount,
+            @RequestParam("candidate_count") int candidateCount,
+            @RequestParam("max_attempts") int maxAttempts,
             @RequestParam(value = "count", defaultValue = "1") int count) {
         return adminCall(authentication, () -> marketSampleClient.randomListedStocks(
-                startYear, endYear, minAverageAmount, count));
+                startYear, endYear, minAverageAmount, candidateCount, maxAttempts, count));
     }
 
     @GetMapping("/etfs/random")
@@ -78,9 +83,11 @@ public class AdminMarketSampleController {
             @RequestParam("start_year") int startYear,
             @RequestParam("end_year") int endYear,
             @RequestParam(value = "min_avg_amount", required = false) Double minAverageAmount,
+            @RequestParam("candidate_count") int candidateCount,
+            @RequestParam("max_attempts") int maxAttempts,
             @RequestParam(value = "count", defaultValue = "1") int count) {
         return adminCall(authentication, () -> marketSampleClient.randomListedEtfs(
-                startYear, endYear, minAverageAmount, count));
+                startYear, endYear, minAverageAmount, candidateCount, maxAttempts, count));
     }
 
     private ResponseEntity<?> adminCall(Authentication authentication, Supplier<?> action) {

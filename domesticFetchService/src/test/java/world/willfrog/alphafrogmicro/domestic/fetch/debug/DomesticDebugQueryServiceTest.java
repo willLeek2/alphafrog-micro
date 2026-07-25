@@ -114,7 +114,7 @@ class DomesticDebugQueryServiceTest {
     @Test
     void randomIndexNamesByCoverageShouldApplyFiveYearCoverageAndAverageAmount() {
         when(indexQuoteDao.getEligibleRandomIndices(
-                1609430400000L, 1767110400000L, 1125, 100000.0, 4))
+                1609430400000L, 1767110400000L, 1125, 100000.0, 7))
                 .thenReturn(List.of(
                         Map.of("ts_code", "000300.SH", "name", "沪深300",
                                 "full_name", "沪深300指数",
@@ -125,12 +125,14 @@ class DomesticDebugQueryServiceTest {
                 ));
 
         DebugAssetSampleResponse result =
-                service.randomIndexNamesByCoverage(2021, 2025, 100000.0, 2);
+                service.randomIndexNamesByCoverage(2021, 2025, 100000.0, 7, 3, 2);
 
         assertEquals("complete", result.status());
         assertEquals(2, result.requestedCount());
         assertEquals(2, result.returnedCount());
+        assertEquals(7, result.candidateCount());
         assertEquals(1, result.attempts());
+        assertEquals(3, result.maxAttempts());
         assertEquals(1250, result.idealDailyCount());
         assertEquals(1125, result.requiredDailyCount());
         assertEquals("20210101", result.startDate());
@@ -142,13 +144,13 @@ class DomesticDebugQueryServiceTest {
                         "000905.SH", "中证500", "中证小盘500指数", 1216L, 180000.0)
         ), result.items());
         verify(indexQuoteDao).getEligibleRandomIndices(
-                1609430400000L, 1767110400000L, 1125, 100000.0, 4);
+                1609430400000L, 1767110400000L, 1125, 100000.0, 7);
     }
 
     @Test
-    void randomIndexNamesByCoverageShouldReturnPartialAfterFiveAttempts() {
+    void randomIndexNamesByCoverageShouldReturnPartialAfterConfiguredAttempts() {
         when(indexQuoteDao.getEligibleRandomIndices(
-                1609430400000L, 1767110400000L, 1125, null, 10))
+                1609430400000L, 1767110400000L, 1125, null, 7))
                 .thenReturn(List.of(
                         Map.of("ts_code", "000300.SH", "name", "沪深300",
                                 "full_name", "沪深300指数",
@@ -162,15 +164,17 @@ class DomesticDebugQueryServiceTest {
                 ));
 
         DebugAssetSampleResponse result =
-                service.randomIndexNamesByCoverage(2021, 2025, null, 5);
+                service.randomIndexNamesByCoverage(2021, 2025, null, 7, 3, 5);
 
         assertEquals("partial", result.status());
         assertEquals(2, result.returnedCount());
-        assertEquals(5, result.attempts());
+        assertEquals(7, result.candidateCount());
+        assertEquals(3, result.attempts());
+        assertEquals(3, result.maxAttempts());
         assertEquals(List.of("000300.SH", "930997.CSI"),
                 result.items().stream().map(DebugAssetNameResponse::tsCode).toList());
-        verify(indexQuoteDao, times(5)).getEligibleRandomIndices(
-                1609430400000L, 1767110400000L, 1125, null, 10);
+        verify(indexQuoteDao, times(3)).getEligibleRandomIndices(
+                1609430400000L, 1767110400000L, 1125, null, 7);
     }
 
     @Test
@@ -187,17 +191,20 @@ class DomesticDebugQueryServiceTest {
 
     @Test
     void randomCoverageSamplingShouldRejectInvalidYearRangeOrAmount() {
-        assertBadRequest(() -> service.randomIndexNamesByCoverage(1899, 2025, null, 1));
-        assertBadRequest(() -> service.randomIndexNamesByCoverage(2025, 2024, null, 1));
-        assertBadRequest(() -> service.randomIndexNamesByCoverage(2021, 2025, -1.0, 1));
         assertBadRequest(() -> service.randomIndexNamesByCoverage(
-                2021, 2025, Double.POSITIVE_INFINITY, 1));
+                1899, 2025, null, 7, 3, 1));
+        assertBadRequest(() -> service.randomIndexNamesByCoverage(
+                2025, 2024, null, 7, 3, 1));
+        assertBadRequest(() -> service.randomIndexNamesByCoverage(
+                2021, 2025, -1.0, 7, 3, 1));
+        assertBadRequest(() -> service.randomIndexNamesByCoverage(
+                2021, 2025, Double.POSITIVE_INFINITY, 7, 3, 1));
     }
 
     @Test
     void randomListedStocksShouldReturnCoveredStockNamesFromDao() {
         when(stockInfoDao.getEligibleRandomStocks(
-                1609430400000L, 1767110400000L, 1125, null, 4)).thenReturn(List.of(
+                1609430400000L, 1767110400000L, 1125, null, 7)).thenReturn(List.of(
                 Map.of("ts_code", "600519.SH", "name", "贵州茅台",
                         "daily_count", 1218L, "average_amount", 300000.0),
                 Map.of("ts_code", "000001.SZ", "name", "平安银行",
@@ -205,7 +212,7 @@ class DomesticDebugQueryServiceTest {
         ));
 
         DebugAssetSampleResponse result =
-                service.randomListedStocks(2021, 2025, null, 2);
+                service.randomListedStocks(2021, 2025, null, 7, 3, 2);
 
         assertEquals("complete", result.status());
         assertEquals(List.of("600519.SH", "000001.SZ"),
@@ -215,7 +222,7 @@ class DomesticDebugQueryServiceTest {
     @Test
     void randomListedEtfsShouldReturnCoveredEtfNamesFromDao() {
         when(etfInfoDao.getEligibleRandomEtfs(
-                1609430400000L, 1767110400000L, 1125, 50000.0, 4)).thenReturn(List.of(
+                1609430400000L, 1767110400000L, 1125, 50000.0, 7)).thenReturn(List.of(
                 Map.of("ts_code", "510300.SH", "name", "沪深300ETF",
                         "daily_count", 1218L, "average_amount", 300000.0),
                 Map.of("ts_code", "159915.SZ", "name", "创业板ETF",
@@ -223,7 +230,7 @@ class DomesticDebugQueryServiceTest {
         ));
 
         DebugAssetSampleResponse result =
-                service.randomListedEtfs(2021, 2025, 50000.0, 2);
+                service.randomListedEtfs(2021, 2025, 50000.0, 7, 3, 2);
 
         assertEquals("complete", result.status());
         assertEquals(List.of("510300.SH", "159915.SZ"),
@@ -233,22 +240,34 @@ class DomesticDebugQueryServiceTest {
     @Test
     void randomCoverageSamplingShouldReturnErrorWhenNoAssetQualifies() {
         when(stockInfoDao.getEligibleRandomStocks(
-                1609430400000L, 1767110400000L, 1125, null, 2))
+                1609430400000L, 1767110400000L, 1125, null, 3))
                 .thenReturn(List.of());
 
         ResponseStatusException exception = assertThrows(
                 ResponseStatusException.class,
-                () -> service.randomListedStocks(2021, 2025, null, 1));
+                () -> service.randomListedStocks(2021, 2025, null, 3, 4, 1));
 
         assertEquals(HttpStatus.UNPROCESSABLE_ENTITY, exception.getStatusCode());
-        verify(stockInfoDao, times(5)).getEligibleRandomStocks(
-                1609430400000L, 1767110400000L, 1125, null, 2);
+        verify(stockInfoDao, times(4)).getEligibleRandomStocks(
+                1609430400000L, 1767110400000L, 1125, null, 3);
     }
 
     @Test
     void randomListedAssetsShouldRejectOutOfRangeCountBeforeQueryingDao() {
-        assertBadRequest(() -> service.randomListedStocks(2021, 2025, null, 0));
-        assertBadRequest(() -> service.randomListedEtfs(2021, 2025, null, 6));
+        assertBadRequest(() -> service.randomListedStocks(2021, 2025, null, 7, 3, 0));
+        assertBadRequest(() -> service.randomListedEtfs(2021, 2025, null, 7, 3, 6));
+        verify(stockInfoDao, never()).getEligibleRandomStocks(
+                anyLong(), anyLong(), anyInt(), any(), anyInt());
+        verify(etfInfoDao, never()).getEligibleRandomEtfs(
+                anyLong(), anyLong(), anyInt(), any(), anyInt());
+    }
+
+    @Test
+    void randomCoverageSamplingShouldRejectUnsafeCandidateCountOrAttemptCount() {
+        assertBadRequest(() -> service.randomListedStocks(2021, 2025, null, 0, 3, 1));
+        assertBadRequest(() -> service.randomListedStocks(2021, 2025, null, 101, 3, 1));
+        assertBadRequest(() -> service.randomListedEtfs(2021, 2025, null, 7, 0, 1));
+        assertBadRequest(() -> service.randomListedEtfs(2021, 2025, null, 7, 21, 1));
         verify(stockInfoDao, never()).getEligibleRandomStocks(
                 anyLong(), anyLong(), anyInt(), any(), anyInt());
         verify(etfInfoDao, never()).getEligibleRandomEtfs(

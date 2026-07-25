@@ -71,30 +71,51 @@ public class DomesticMarketSampleClient {
     }
 
     public Map<String, Object> randomIndexNamesByAmount(
-            int startYear, int endYear, Double minAverageAmount, int count) {
+            int startYear,
+            int endYear,
+            Double minAverageAmount,
+            int candidateCount,
+            int maxAttempts,
+            int count) {
         UriComponentsBuilder builder = uri("/debug/index-names/random-by-amount")
                 .queryParam("start_year", startYear)
                 .queryParam("end_year", endYear)
+                .queryParam("candidate_count", candidateCount)
+                .queryParam("max_attempts", maxAttempts)
                 .queryParam("count", count);
         addAverageAmount(builder, minAverageAmount);
         return exchange(builder.build().encode().toUri(), ASSET_SAMPLE_TYPE);
     }
 
     public Map<String, Object> randomListedStocks(
-            int startYear, int endYear, Double minAverageAmount, int count) {
+            int startYear,
+            int endYear,
+            Double minAverageAmount,
+            int candidateCount,
+            int maxAttempts,
+            int count) {
         UriComponentsBuilder builder = uri("/debug/stocks/random")
                 .queryParam("start_year", startYear)
                 .queryParam("end_year", endYear)
+                .queryParam("candidate_count", candidateCount)
+                .queryParam("max_attempts", maxAttempts)
                 .queryParam("count", count);
         addAverageAmount(builder, minAverageAmount);
         return exchange(builder.build().encode().toUri(), ASSET_SAMPLE_TYPE);
     }
 
     public Map<String, Object> randomListedEtfs(
-            int startYear, int endYear, Double minAverageAmount, int count) {
+            int startYear,
+            int endYear,
+            Double minAverageAmount,
+            int candidateCount,
+            int maxAttempts,
+            int count) {
         UriComponentsBuilder builder = uri("/debug/etfs/random")
                 .queryParam("start_year", startYear)
                 .queryParam("end_year", endYear)
+                .queryParam("candidate_count", candidateCount)
+                .queryParam("max_attempts", maxAttempts)
                 .queryParam("count", count);
         addAverageAmount(builder, minAverageAmount);
         return exchange(builder.build().encode().toUri(), ASSET_SAMPLE_TYPE);
