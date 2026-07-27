@@ -171,6 +171,15 @@ public class LangchainAiPlanner {
             ctx.setSystemMessage(reactSystem);
             try {
                 String strategyStage = promptService.planningStrategyStageInstruction(toolList, maxTodos, maxDetailLength);
+                if (mode == PlanExecutionMode.LINEAR) {
+                    /*
+                     * durable ToolJob 的 checkpoint 只保存顺序完成前缀，因此强制 LINEAR 不能
+                     * 只存在于最终 plan 字段；strategy LLM 必须先按 LINEAR 思考，避免第二阶段
+                     * 根据一个 DAG strategy 生成分支/汇合依赖。
+                     */
+                    strategyStage += "\n\n本次执行模式由调度器强制为 LINEAR。"
+                            + "overallPlan.mode 必须返回 LINEAR，策略必须描述可按顺序执行的步骤。";
+                }
                 String strategyContent = dialogueContext.isBlank()
                         ? dynamicPrefix + "\n" + strategyStage + "\n\n用户需求：" + request.getUserGoal()
                         : dynamicPrefix + "\n" + strategyStage + "\n\n历史对话压缩内容：\n" + dialogueContext
@@ -195,10 +204,25 @@ public class LangchainAiPlanner {
                             strategyValidation.category(), strategyValidation.message());
                 }
                 StructuredPlanningSupport.OverallPlan overallPlan = strategyValidation.data();
-                ctx.addAssistantMessage(strategyRaw);
+                String effectiveStrategyMode = mode == PlanExecutionMode.LINEAR
+                        ? PlanExecutionMode.LINEAR.name()
+                        : overallPlan.mode();
+                if (mode == PlanExecutionMode.LINEAR) {
+                    /*
+                     * 即便 provider 忽略第一阶段指令返回 DAG，也不能把自相矛盾的 assistant
+                     * 消息带入 Todo 阶段；先把 strategy 正规化为 LINEAR，再生成真正的顺序计划。
+                     */
+                    var normalizedStrategy = objectMapper.createObjectNode();
+                    var normalizedOverallPlan = normalizedStrategy.putObject("overallPlan");
+                    normalizedOverallPlan.put("mode", PlanExecutionMode.LINEAR.name());
+                    normalizedOverallPlan.put("detail", nvl(overallPlan.detail()));
+                    ctx.addAssistantMessage(normalizedStrategy.toString());
+                } else {
+                    ctx.addAssistantMessage(strategyRaw);
+                }
 
                 String todosStage = promptService.planningTodosStageInstruction(
-                        overallPlan.mode(), overallPlan.detail(), toolList, maxTodos);
+                        effectiveStrategyMode, overallPlan.detail(), toolList, maxTodos);
                 ctx.addUserMessage(todosStage);
 
                 AgentContext.setStage("planning_todos");
@@ -219,6 +243,7 @@ public class LangchainAiPlanner {
                             todosValidation.category(), todosValidation.message());
                 }
                 LangchainTodoPlan plan = LangchainTodoPlanParser.fromJsonRoot(todosRoot, mode, maxTodos);
+                requireLinearShape(plan, mode);
                 if (overallPlan.detail() != null && !overallPlan.detail().isBlank()) {
                     plan = LangchainTodoPlan.builder()
                             .analysis(overallPlan.detail())
@@ -315,9 +340,32 @@ public class LangchainAiPlanner {
                         + "\n\n当前轮次用户需求：" + request.getUserGoal();
             }
             LangchainTodoPlanResponse response = service.plan(userMessage);
-            return normalizeResponse(response, maxTodos, mode);
+            LangchainTodoPlan plan = normalizeResponse(response, maxTodos, mode);
+            requireLinearShape(plan, mode);
+            return plan;
         } finally {
             AgentContext.clearStructuredOutputSpec();
+        }
+    }
+
+    /**
+     * 强制 LINEAR 时拒绝任何 DAG 元数据，不能靠删除 dependsOn 来猜测拓扑顺序。
+     *
+     * <p>planner 的 items 数组并不保证已经拓扑排序；若把 DAG 计划机械去边后顺序执行，
+     * join/branch 可能在依赖完成前运行。这里 fail-closed，让规划重试或直接失败。</p>
+     */
+    private static void requireLinearShape(LangchainTodoPlan plan, PlanExecutionMode mode) {
+        if (mode != PlanExecutionMode.LINEAR || plan == null || plan.getItems() == null) {
+            return;
+        }
+        boolean containsDagMetadata = plan.getItems().stream().anyMatch(item ->
+                item != null && ((item.getDependsOn() != null && !item.getDependsOn().isEmpty())
+                        || item.getGroupKey() != null && !item.getGroupKey().isBlank()
+                        || item.isParallelizable()));
+        if (containsDagMetadata) {
+            throw new StructuredPlanningSupport.StructuredPlanningException(
+                    StructuredPlanningSupport.CATEGORY_SCHEMA_VALIDATION_ERROR,
+                    "linear_plan_contains_dag_metadata");
         }
     }
 

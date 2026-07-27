@@ -270,11 +270,14 @@ public class ToolJobStartupRecovery {
             String taskId = null;
             String fingerprint = null;
             if (lookup != null && lookup.getFound()) {
-                // 找到已创建任务时直接附着，不重复 createTask。
+                // 找到已创建任务时先取身份字段，后面的成对校验通过后才允许附着。
                 taskId = lookup.getTaskId();
                 fingerprint = lookup.getRequestFingerprint();
-            } else {
-                // Sandbox 未找到 operation 时，只能使用 durable createRequestJson 重放同一幂等请求。
+            } else if (lookup != null && !lookup.getFound() && lookup.getError().isBlank()) {
+                /*
+                 * 只有“权威未找到且无查询错误”才允许重放。found=false + error 表示 Gateway/
+                 * Sandbox 暂时不可用，不代表服务端没有创建；此时保留 PREPARING 给下次恢复。
+                 */
                 if (anchor.getCreateRequestJson() == null || anchor.getCreateRequestJson().isBlank()) {
                     return null;
                 }
@@ -288,12 +291,17 @@ public class ToolJobStartupRecovery {
                 }
                 taskId = created.getTaskId();
                 fingerprint = created.getRequestFingerprint();
+            } else {
+                // 查询不可用或响应损坏时没有否定证明，严禁重放 create。
+                return null;
             }
-            // 缺 taskId 或 fingerprint 漂移都进入 quarantine，避免附着错误任务。
+            // canonical operation 要求 taskId 与精确、非空 fingerprint 成对出现。
             if (taskId == null || taskId.isBlank()
                     || anchor.getRequestFingerprint() == null
-                    || fingerprint != null && !fingerprint.isBlank()
-                    && !anchor.getRequestFingerprint().equals(fingerprint)) {
+                    || anchor.getRequestFingerprint().isBlank()
+                    || fingerprint == null
+                    || fingerprint.isBlank()
+                    || !anchor.getRequestFingerprint().equals(fingerprint)) {
                 return null;
             }
             // 构造 TASK_ATTACHED reservation，保持原 reservationId/identity/units。

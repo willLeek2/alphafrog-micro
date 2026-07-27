@@ -1,5 +1,8 @@
 # Shared agent platform config for active agent runtimes.
 agent:
+  tool-job:
+    # durable 工具的同步快路径；超过该阈值后 Run 先落 checkpoint，再转 WAITING_TOOL_JOB。
+    fast-path-ms: ${AF_AGENT_TOOL_JOB_FAST_PATH_MS:1500}
   call-detail:
     ttl-seconds: ${AF_AGENT_CALL_DETAIL_TTL_SECONDS:86400}
   call-raw-content:
@@ -7,17 +10,20 @@ agent:
   run:
     interrupted-ttl-days: ${AF_AGENT_RUN_INTERRUPTED_TTL_DAYS:7}
     checkpoint-version: ${AF_AGENT_RUN_CHECKPOINT_VERSION:v2}
-    executor:
-      core-pool-size: ${AF_AGENT_RUN_EXECUTOR_CORE_POOL_SIZE:10}
-      max-pool-size: ${AF_AGENT_RUN_EXECUTOR_MAX_POOL_SIZE:10}
-      queue-capacity: ${AF_AGENT_RUN_EXECUTOR_QUEUE_CAPACITY:100}
-      thread-name-prefix: ${AF_AGENT_RUN_EXECUTOR_THREAD_NAME_PREFIX:agent-run-}
     budget:
       max-wall-clock-ms: ${AF_AGENT_RUN_BUDGET_MAX_WALL_CLOCK_MS:600000}
       max-llm-calls: ${AF_AGENT_RUN_BUDGET_MAX_LLM_CALLS:50}
       max-tool-calls: ${AF_AGENT_RUN_BUDGET_MAX_TOOL_CALLS:30}
       max-tokens: ${AF_AGENT_RUN_BUDGET_MAX_TOKENS:300000}
       max-http-attempts-per-logical-call: ${AF_AGENT_RUN_BUDGET_MAX_HTTP_ATTEMPTS_PER_LOGICAL_CALL:3}
+  langchain:
+    run:
+      # 这是 LangchainRunExecutorLimitsResolver 实际读取的命名空间。
+      executor:
+        core-pool-size: ${AF_AGENT_RUN_EXECUTOR_CORE_POOL_SIZE:10}
+        max-pool-size: ${AF_AGENT_RUN_EXECUTOR_MAX_POOL_SIZE:10}
+        queue-capacity: ${AF_AGENT_RUN_EXECUTOR_QUEUE_CAPACITY:100}
+        thread-name-prefix: ${AF_AGENT_RUN_EXECUTOR_THREAD_NAME_PREFIX:agent-run-}
   tool-cache:
     version: ${AF_AGENT_TOOL_CACHE_VERSION:v1}
     search-ttl-seconds: ${AF_AGENT_TOOL_CACHE_SEARCH_TTL_SECONDS:3600}
@@ -115,3 +121,13 @@ agent:
     max-part-size: ${AF_AGENT_SNAPSHOT_MAX_PART_SIZE:2097152}
     cache-ttl-seconds: ${AF_AGENT_SNAPSHOT_CACHE_TTL_SECONDS:3600}
     gzip-enabled: ${AF_AGENT_SNAPSHOT_GZIP_ENABLED:true}
+
+# Java 侧在调用 Sandbox 之前先做容量准入。默认值与 docker-compose 中
+# AF_SANDBOX_MAX_CONCURRENCY=20 对齐，避免 Java maxUnits=4 把请求提前挡在伸缩器之外；
+# 生产环境仍可根据宿主机内存独立下调这三个显式变量。
+alphafrog:
+  data-analysis:
+    capacity:
+      max-units: ${AF_DATA_ANALYSIS_CAPACITY_MAX_UNITS:20}
+      max-active: ${AF_DATA_ANALYSIS_CAPACITY_MAX_ACTIVE:20}
+      max-heavy-active: ${AF_DATA_ANALYSIS_CAPACITY_MAX_HEAVY_ACTIVE:6}

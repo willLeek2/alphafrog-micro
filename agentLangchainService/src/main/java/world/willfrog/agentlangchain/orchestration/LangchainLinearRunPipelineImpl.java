@@ -295,8 +295,18 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                     .codeInterpreterEnabled(runConfig.codeInterpreterEnabled())
                     .build();
 
+            /*
+             * durable ToolJob 目前只保存 LINEAR 的完成前缀，尚不能保存 DAG frontier。只要
+             * 本 Run 暴露代码解释器，就必须在发起 planning 前请求 LINEAR；不能先让 planner
+             * 生成 DAG，再只把 executor 临时切成 LINEAR，否则持久化 plan 与恢复路由会分裂。
+             */
+            boolean forceLinearForDurableTool = runConfig.codeInterpreterEnabled();
+            PlanExecutionMode requestedExecutionMode = forceLinearForDurableTool
+                    ? PlanExecutionMode.LINEAR
+                    : PlanExecutionMode.AUTO;
+
             // planning（规划）阶段只负责把用户目标变成 todo plan（任务计划）。
-            // 计划是否跑 DAG（有向无环图）是后置决策：planner 可以输出 AUTO/LINEAR/DAG，最终由 LangchainWorkflowRouting 统一裁决。
+            // 不暴露代码解释器时，planner 仍可输出 AUTO/DAG，由 LangchainWorkflowRouting 统一裁决。
             AgentContext.setPhase("planning");
             LangchainTodoPlan plan = planner.plan(LangchainPlanningRequest.builder()
                     .runId(runId)
@@ -308,10 +318,22 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                     .planningModelName(stageModels.planningModelName())
                     .planningProviderOrder(stageModels.planningProviderOrder())
                     .toolSpecifications(toolSpecifications)
-                    .executionMode(PlanExecutionMode.AUTO)
+                    .executionMode(requestedExecutionMode)
                     .build());
 
+            /*
+             * 即使 planner/mock 违反请求返回 DAG 字段，也要生成一份真正可恢复的 effective
+             * LINEAR plan：executionMode 固定为 LINEAR，并清空 dependsOn/groupKey/
+             * parallelizable。后续持久化、PLAN_READY、首次执行和 resume 全部只使用这份
+             * effective plan，确保数据库真相与 executor 语义一致。
+             */
+            LangchainTodoPlan planned = plan;
+            plan = LangchainWorkflowRouting.effectivePlan(plan, forceLinearForDurableTool);
             boolean useDag = LangchainWorkflowRouting.shouldUseDag(plan);
+            if (forceLinearForDurableTool && planned != plan) {
+                log.info("Normalized plan to durable LINEAR: runId={} requestedMode={}",
+                        runId, planned.getExecutionMode());
+            }
             // PLAN_READY 既是实时 UI 的启动信号，也是断线重连后的恢复锚点。
             // 因此先把 plan 写入 DB/Redis，再发带完整 plan payload 的事件；这样前端收到事件后，
             // 即使立刻调用 snapshot/status，也能读到同一份计划。

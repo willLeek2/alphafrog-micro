@@ -103,9 +103,44 @@ class PythonSandboxToolsDataIntenseTest {
         assertThat(request.getValue().getEstimatedBytes()).isPositive();
         assertThat(observedAnchors).extracting(ToolJobAnchor::getAnchorState)
                 .containsExactly("PREPARING", "ATTACHED", "PENDING");
+        assertThat(observedAnchors).extracting(ToolJobAnchor::getSchemaVersion)
+                .containsOnly(2);
         assertThat(observedAnchors.get(0).getTaskId()).isNull();
         assertThat(observedAnchors.get(1).getTaskId()).isEqualTo("task-1");
         verifyNoInteractions(recorder);
+    }
+
+    @Test
+    void commonLibrariesDoNotBecomeHeavyHintsAndEstimateStaysStandard() throws Exception {
+        fixtureDataset();
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
+        when(dispatchStore.persistAttached(eq("run-test"), any())).thenReturn(true);
+        when(dispatchStore.transferToPending(eq("run-test"), any())).thenReturn(true);
+        when(sandbox.createTask(any())).thenAnswer(invocation -> {
+            ExecuteRequest request = invocation.getArgument(0);
+            return ExecuteResponse.newBuilder().setTaskId("task-1")
+                    .setRequestFingerprint(request.getRequestFingerprint()).build();
+        });
+        when(sandbox.getTaskStatus(any())).thenReturn(
+                TaskStatusResponse.newBuilder().setStatus("RUNNING").build());
+
+        assertThrows(ExternalToolJobPendingException.class,
+                () -> tools.executePython("import numpy, pandas", "1",
+                        null, "numpy,pandas", 30));
+
+        ArgumentCaptor<DataAnalysisEstimate> estimate =
+                ArgumentCaptor.forClass(DataAnalysisEstimate.class);
+        verify(capacity).reserve(any(), estimate.capture());
+        assertThat(estimate.getValue().heavyOperationHints()).isEmpty();
+        assertThat(estimate.getValue().resourceClass())
+                .isEqualTo(DataAnalysisResourceClass.STANDARD);
+        assertThat(estimate.getValue().capacityUnits()).isEqualTo(1);
+        verify(sandbox).createTask(argThat(request ->
+                "STANDARD".equals(request.getResourceClass())
+                        && request.getCapacityUnits() == 1
+                        && request.getLibrariesList().equals(List.of("numpy", "pandas"))));
     }
 
     @Test
@@ -231,6 +266,95 @@ class PythonSandboxToolsDataIntenseTest {
         verify(capacity, never()).releaseReservation(any());
         verify(dispatchStore).transferToPending(eq("run-test"), argThat(anchor ->
                 "task-existing".equals(anchor.getTaskId())));
+    }
+
+    @Test
+    void lookupTransportErrorKeepsPreparingReservationAndDoesNotClearAnchor() throws Exception {
+        fixtureDataset();
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
+        when(sandbox.createTask(any())).thenThrow(new IllegalStateException("rpc response lost"));
+        when(sandbox.getTaskByOperationId(any())).thenReturn(
+                GetTaskByOperationIdResponse.newBuilder()
+                        .setFound(false)
+                        .setError("sandbox temporarily unavailable")
+                        .build());
+
+        String result = tools.executePython("print(1)", "1", null, null, 30);
+
+        assertThat(result).contains("\"ok\":false", "\"code\":\"TOOL_ERROR\"");
+        verify(capacity, never()).releaseReservation(any());
+        verify(dispatchStore, never()).clearActive(any(), any());
+        verify(dispatchStore, never()).persistAttached(any(), any());
+        verify(dispatchStore, never()).transferToPending(any(), any());
+    }
+
+    @Test
+    void foundOperationWithoutFingerprintKeepsPreparingReservation() throws Exception {
+        fixtureDataset();
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
+        when(sandbox.createTask(any())).thenThrow(new IllegalStateException("rpc response lost"));
+        when(sandbox.getTaskByOperationId(any())).thenReturn(
+                GetTaskByOperationIdResponse.newBuilder()
+                        .setFound(true)
+                        .setTaskId("task-existing")
+                        .build());
+
+        String result = tools.executePython("print(1)", "1", null, null, 30);
+
+        assertThat(result).contains("\"ok\":false", "\"code\":\"TOOL_ERROR\"");
+        verify(capacity, never()).releaseReservation(any());
+        verify(dispatchStore, never()).clearActive(any(), any());
+        verify(dispatchStore, never()).persistAttached(any(), any());
+    }
+
+    @Test
+    void createResponseWithoutFingerprintKeepsPreparingWithoutRelease() throws Exception {
+        fixtureDataset();
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
+        when(sandbox.createTask(any())).thenReturn(
+                ExecuteResponse.newBuilder().setTaskId("task-no-fingerprint").build());
+        when(sandbox.getTaskByOperationId(any())).thenReturn(
+                GetTaskByOperationIdResponse.newBuilder().setFound(false).build());
+
+        String result = tools.executePython("print(1)", "1", null, null, 30);
+
+        assertThat(result).contains("\"ok\":false", "\"code\":\"TOOL_ERROR\"");
+        verify(dispatchStore, never()).persistAttached(any(), any());
+        verify(dispatchStore, never()).transferToPending(any(), any());
+        verify(capacity, never()).releaseReservation(any());
+    }
+
+    @Test
+    void createResponseWithoutFingerprintMayAttachAfterExactOperationLookup() throws Exception {
+        fixtureDataset();
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
+        when(dispatchStore.persistAttached(eq("run-test"), any())).thenReturn(true);
+        when(dispatchStore.transferToPending(eq("run-test"), any())).thenReturn(true);
+        AtomicReference<String> fingerprint = new AtomicReference<>();
+        when(sandbox.createTask(any())).thenAnswer(invocation -> {
+            ExecuteRequest request = invocation.getArgument(0);
+            fingerprint.set(request.getRequestFingerprint());
+            return ExecuteResponse.newBuilder().setTaskId("task-confirmed").build();
+        });
+        when(sandbox.getTaskByOperationId(any())).thenAnswer(invocation ->
+                GetTaskByOperationIdResponse.newBuilder()
+                        .setFound(true)
+                        .setTaskId("task-confirmed")
+                        .setRequestFingerprint(fingerprint.get())
+                        .build());
+
+        assertThrows(ExternalToolJobPendingException.class,
+                () -> tools.executePython("print(1)", "1", null, null, 30));
+
+        verify(dispatchStore).persistAttached(eq("run-test"), argThat(anchor ->
+                "task-confirmed".equals(anchor.getTaskId())));
+        verify(dispatchStore).transferToPending(eq("run-test"), any());
+        verify(capacity, never()).releaseReservation(any());
     }
 
     @Test

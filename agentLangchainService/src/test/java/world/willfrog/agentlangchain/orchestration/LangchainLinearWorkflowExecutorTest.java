@@ -33,7 +33,7 @@ class LangchainLinearWorkflowExecutorTest {
                   "analysis": "linear",
                   "items": [
                     {"id":"todo_1","sequence":1,"description":"查询沪深300"},
-                    {"id":"todo_2","sequence":2,"description":"总结走势","dependsOn":["todo_1"]}
+                    {"id":"todo_2","sequence":2,"description":"总结走势"}
                   ],
                   "extractedEntities": ["沪深300"]
                 }
@@ -104,7 +104,7 @@ class LangchainLinearWorkflowExecutorTest {
                   "analysis": "linear",
                   "items": [
                     {"id":"todo_1","sequence":1,"description":"获取指数数据"},
-                    {"id":"todo_2","sequence":2,"description":"用 Python 计算收益","dependsOn":["todo_1"]}
+                    {"id":"todo_2","sequence":2,"description":"用 Python 计算收益"}
                   ],
                   "extractedEntities": ["沪深300"]
                 }

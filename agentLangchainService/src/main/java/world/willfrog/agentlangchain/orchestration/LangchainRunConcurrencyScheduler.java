@@ -108,7 +108,12 @@ public class LangchainRunConcurrencyScheduler {
             }
             // 队列名额用尽后，允许在 core 与 max 之间临时扩容。
             // 若已有排队任务，先提升队首，再把当前请求保留为 QUEUED，保持先来先服务。
-            if (running <= limits.getCorePoolSize() && running < limits.getMaxPoolSize()) {
+            /*
+             * 只要还没达到 max 就可以继续逐个启用弹性槽。旧条件额外要求
+             * running<=core，导致第一次从 core 扩到 core+1 后后续弹性槽永久不可达，
+             * 例如 core=1/max=3 实际最多只能跑 2 个。
+             */
+            if (running < limits.getMaxPoolSize()) {
                 if (!queue.isEmpty()) {
                     // poll 与计数扣减在锁内完成，队首只能被一个线程提升。
                     PendingRun pending = queue.poll();

@@ -65,6 +65,40 @@ class ToolJobStartupDispatchRecoveryTest {
                 eq("run-1:call-1:1"));
     }
 
+    @Test
+    void preparingAnchorDoesNotReplayWhenLookupIsUnavailable() throws Exception {
+        Fixture fixture = fixture();
+        when(fixture.sandbox.getTaskByOperationId(any())).thenReturn(
+                GetTaskByOperationIdResponse.newBuilder()
+                        .setFound(false)
+                        .setError("gateway timeout")
+                        .build());
+
+        fixture.recovery.onReady();
+
+        verify(fixture.sandbox, never()).createTask(any());
+        verify(fixture.anchorService, never()).updateActiveAndStatus(
+                any(), any(), any(), any(), any());
+        verify(fixture.capacity, never()).recover(anyList(), anyInt(), anyInt());
+    }
+
+    @Test
+    void preparingAnchorDoesNotAttachFoundTaskWithoutFingerprint() throws Exception {
+        Fixture fixture = fixture();
+        when(fixture.sandbox.getTaskByOperationId(any())).thenReturn(
+                GetTaskByOperationIdResponse.newBuilder()
+                        .setFound(true)
+                        .setTaskId("task-existing")
+                        .build());
+
+        fixture.recovery.onReady();
+
+        verify(fixture.sandbox, never()).createTask(any());
+        verify(fixture.anchorService, never()).updateActiveAndStatus(
+                any(), any(), any(), any(), any());
+        verify(fixture.capacity, never()).recover(anyList(), anyInt(), anyInt());
+    }
+
     private Fixture fixture() throws Exception {
         ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
         ToolJobRedisCache redisCache = mock(ToolJobRedisCache.class);

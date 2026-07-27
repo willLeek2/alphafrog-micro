@@ -47,6 +47,8 @@ public class PythonSandboxTools {
 
     /** 轮询沙箱任务状态的间隔（毫秒）。 */
     private static final int POLL_INTERVAL_MS = 1000;
+    /** schema 2 起保证 estimate 与 reservation 同源；旧错配兼容只能处理 schema 1。 */
+    private static final int DATA_INTENSE_ANCHOR_SCHEMA_VERSION = 2;
 
     /**
      * 工具说明正文维护在 classpath 文件 {@link #TOOL_DESCRIPTION_PATH} 中。
@@ -458,9 +460,21 @@ public class PythonSandboxTools {
             int manifestMembers = manifests.stream()
                     .mapToInt(entry -> entry.relatedDatasetIds().size())
                     .sum();
-            // 按冻结配置把任务分类为资源档位和 capacity units。
+            /*
+             * heavyOperationHints 只能描述“代码将执行高成本操作”这一事实，例如全量排序、
+             * 大规模 join 或模型训练；它不是依赖库列表。旧实现把 numpy/pandas 等 libraries
+             * 直接塞进 hints，导致任何声明依赖库的小任务先被判为 HEAVY/3，随后容量服务又根据
+             * 被清空的 hints 判成 STANDARD/1。estimate 与 reservation 的 class/units 因而漂移，
+             * terminal envelope 无法通过一致性校验，容量也永远无法 RELEASE。
+             *
+             * 当前工具协议尚未提供可信的重操作提示，因此这里显式使用空列表。以后如果要增加
+             * 静态代码分析或调用方声明，必须先得到同一个 immutable hints 列表，再同时用于
+             * classify 和 DataAnalysisEstimate；严禁在两个阶段分别推断。
+             */
+            List<String> heavyOperationHints = List.of();
+            // 资源档位只在这里冻结一次；后续 reservation、Sandbox request 和终态证明都复用它。
             decision = dataAnalysisCapacityProperties.classify(
-                    rows, bytes, baseRequest.getLibrariesList());
+                    rows, bytes, heavyOperationHints);
             if (decision.outcome()
                     == DataAnalysisCapacityProperties.DataAnalysisResourceClassDecision.Outcome.REJECTED) {
                 return fail("executePython", "DATA_ANALYSIS_TASK_TOO_LARGE",
@@ -469,7 +483,7 @@ public class PythonSandboxTools {
             }
             // 构造 immutable estimate，后续写入 anchor 并在 finalizer 再使用。
             estimate = new DataAnalysisEstimate(
-                    rows, bytes, datasets.size(), 1.0d, manifestMembers, List.of(),
+                    rows, bytes, datasets.size(), 1.0d, manifestMembers, heavyOperationHints,
                     decision.resourceClass(), decision.capacityUnits());
         } catch (ArithmeticException overflow) {
             return fail("executePython", "DATA_ANALYSIS_TASK_TOO_LARGE",
@@ -524,6 +538,8 @@ public class PythonSandboxTools {
 
         // 在调用 createTask 之前先构造完整 PREPARING anchor，覆盖 RPC 成败不确定窗口。
         ToolJobAnchor anchor = new ToolJobAnchor();
+        // schema 2 是资源分类同源与 canonical fingerprint fail-closed 的 cutover fence。
+        anchor.setSchemaVersion(DATA_INTENSE_ANCHOR_SCHEMA_VERSION);
         // 幂等操作身份与请求指纹用于启动恢复查询/重放。
         anchor.setOperationId(identity.operationId());
         anchor.setRequestFingerprint(spec.requestFingerprint());
@@ -571,15 +587,20 @@ public class PythonSandboxTools {
                                 .setOperationId(identity.operationId()).build());
                 if (lookup != null && lookup.getFound()
                         && !lookup.getTaskId().isBlank()
-                        && (lookup.getRequestFingerprint().isBlank()
-                                || spec.requestFingerprint().equals(lookup.getRequestFingerprint()))) {
-                    // 找到相同 fingerprint 的任务时，把查询结果转换成正常 createResp 继续附着。
+                        && !lookup.getRequestFingerprint().isBlank()
+                        && spec.requestFingerprint().equals(lookup.getRequestFingerprint())) {
+                    // canonical operation 必须返回完全相同且非空的 fingerprint，才能附着已有任务。
                     createResp = ExecuteResponse.newBuilder()
                             .setTaskId(lookup.getTaskId())
                             .setRequestFingerprint(spec.requestFingerprint())
                             .build();
-                } else if (lookup != null && !lookup.getFound()) {
-                    // 明确未创建时才释放 PREPARING reservation 并清理当前 operation anchor。
+                } else if (lookup != null && !lookup.getFound()
+                        && lookup.getError().isBlank()) {
+                    /*
+                     * 只有权威响应“未找到且无查询错误”才能证明 create 未发生。Gateway transport/
+                     * 5xx/解析异常会返回 found=false + error；该状态不具备否定证明，必须保留
+                     * PREPARING，避免真实 Sandbox task 已创建却被 Java 释放容量并清 anchor。
+                     */
                     if (releasePreDispatch(reservation)) {
                         pythonSandboxDispatchStore.clearActive(runId, identity.operationId());
                     }
@@ -606,8 +627,39 @@ public class PythonSandboxTools {
                     "Failed to create python sandbox task",
                     Map.of("message", createResp == null ? "empty response" : nvl(createResp.getError())));
         }
-        // taskId 确认后把 reservation 从 PREPARING 转为 TASK_ATTACHED。
         String taskId = createResp.getTaskId();
+        /*
+         * create 响应里的 canonical fingerprint 是 taskId 的身份凭据，不是可选诊断字段。
+         * 直接响应若为空或漂移，必须先用 operationId 做一次权威回读；只有同 taskId、精确且
+         * 非空的 fingerprint 才允许 PREPARING→ATTACHED。查询错误、未找到、taskId 漂移
+         * 都保留 PREPARING，严禁转普通 PENDING 后让 reconciler 消费未验证任务。
+         */
+        if (createResp.getRequestFingerprint().isBlank()
+                || !spec.requestFingerprint().equals(createResp.getRequestFingerprint())) {
+            GetTaskByOperationIdResponse lookup = null;
+            try {
+                lookup = pythonSandboxService.getTaskByOperationId(
+                        GetTaskByOperationIdRequest.newBuilder()
+                                .setOperationId(identity.operationId()).build());
+            } catch (Exception lookupFailure) {
+                log.error("Sandbox create identity lookup failed for run={}, operationId={}, taskId={}",
+                        runId, identity.operationId(), taskId, lookupFailure);
+            }
+            boolean canonicalIdentityConfirmed = lookup != null
+                    && lookup.getFound()
+                    && taskId.equals(lookup.getTaskId())
+                    && !lookup.getRequestFingerprint().isBlank()
+                    && spec.requestFingerprint().equals(lookup.getRequestFingerprint());
+            if (!canonicalIdentityConfirmed) {
+                log.error("Sandbox create identity unverified for run={}, operationId={}, taskId={}; "
+                                + "PREPARING anchor retained for fail-closed recovery",
+                        runId, identity.operationId(), taskId);
+                throw new IllegalStateException(
+                        "createTask identity is unverified; PREPARING anchor retained");
+            }
+        }
+
+        // taskId 与 canonical fingerprint 同时确认后，才把 reservation 转为 TASK_ATTACHED。
         reservation = transitionReservation(reservation, DataAnalysisReservationState.TASK_ATTACHED, taskId);
         // 容量账本必须接受同一 reservation 的附着状态，冲突时停止推进。
         if (dataAnalysisCapacityService.restoreReservation(reservation) == DataAnalysisRestoreOutcome.CONFLICT) {
@@ -618,15 +670,6 @@ public class PythonSandboxTools {
         anchor.setAnchorState("ATTACHED");
         anchor.setReservationJson(objectMapper.writeValueAsString(reservation));
         pythonSandboxDispatchStore.persistAttached(runId, anchor);
-
-        // Sandbox 回传 fingerprint 漂移时不能同步消费结果，转 durable pending 等待安全审计/恢复。
-        if (!createResp.getRequestFingerprint().isBlank()
-                && !spec.requestFingerprint().equals(createResp.getRequestFingerprint())) {
-            log.error("Sandbox response fingerprint mismatch for run={}, operationId={}, taskId={}; "
-                            + "transferring to durable pending for operator-safe recovery",
-                    runId, identity.operationId(), taskId);
-            return suspend(runId, anchor, reservation, taskId);
-        }
 
         // 只在极短 fast-path 窗口内同步轮询；超过窗口就让出 Agent worker。
         long fastDeadline = System.currentTimeMillis() + Math.max(1L, fastPathMs);

@@ -190,9 +190,10 @@ class DataAnalysisCapacityServiceImplTest {
 
         @Test
         void reserveRejectsOverUnitsCap() {
+            properties.setMaxActive(4);
+            service = new DataAnalysisCapacityServiceImpl(properties);
             openAfterEmptyRecover();
-            // Two STANDARD reservations equal maxUnits=4 (1+1+1+1) but we only allow 4 total units
-            // and the ledger reserves on PREPARING already. Adding a 5th unit would exceed maxUnits=4.
+            // 本用例只验证 maxUnits，所以把 maxActive 同步放到 4，避免先触发活动任务数上限。
             service.reserve(identity("run-1", "call-1", 1), standardEstimate());
             service.reserve(identity("run-1", "call-2", 1), standardEstimate());
             service.reserve(identity("run-1", "call-3", 1), standardEstimate());
@@ -581,25 +582,28 @@ class DataAnalysisCapacityServiceImplTest {
         void secondHeavyRejectedWhenHeavyCapReached() {
             openAfterEmptyRecover();
             service.reserve(identity("run-1", "call-1", 1), heavyEstimate());
-            // Now heavyActive=1 = maxHeavyActive → next HEAVY rejected.
+            // 第一个 HEAVY 仍处于 PREPARING，但已经拿到 pre-create 名额；第二个必须在
+            // Sandbox create 之前被拒绝。
             CapacityAdmissionException ex = assertThrows(CapacityAdmissionException.class,
                     () -> service.reserve(identity("run-2", "call-2", 1), heavyEstimate()));
             assertEquals(CapacityAdmissionException.Reason.SERVER_BUSY, ex.reason());
         }
 
         @Test
-        void activeCapEnforcedWhenTransitioningToAttached() {
+        void activeCapEnforcedBeforeSandboxCreate() {
             properties.setMaxActive(2);
             service = new DataAnalysisCapacityServiceImpl(properties);
             openAfterEmptyRecover();
-            // Three PREPARING reservations are allowed (no active cap yet); they just consume
-            // units from the pool.
+            // PREPARING 已经代表下一步可创建真实 Sandbox task；因此第三个请求必须在
+            // reserve 阶段拒绝，不能等到 TASK_ATTACHED 才留下 orphan task。
             service.reserve(identity("run-1", "call-1", 1), standardEstimate());
             service.reserve(identity("run-1", "call-2", 1), standardEstimate());
-            service.reserve(identity("run-1", "call-3", 1), standardEstimate());
-            assertEquals(3, service.usedUnitsSnapshot());
+            CapacityAdmissionException ex = assertThrows(CapacityAdmissionException.class,
+                    () -> service.reserve(identity("run-1", "call-3", 1), standardEstimate()));
+            assertEquals(CapacityAdmissionException.Reason.SERVER_BUSY, ex.reason());
+            assertEquals(2, service.usedUnitsSnapshot());
             assertEquals(0, service.activeCountSnapshot());
-            // Promote two reservations to TASK_ATTACHED; the third promotion must be refused.
+            // 已获准的两个 reservation 可以正常附着 taskId。
             assertEquals(DataAnalysisRestoreOutcome.ADDED,
                     service.restoreReservation(attachedReservation("run-1", "call-1", 1, "task-1",
                             DataAnalysisResourceClass.STANDARD, 1)));
@@ -607,10 +611,19 @@ class DataAnalysisCapacityServiceImplTest {
                     service.restoreReservation(attachedReservation("run-1", "call-2", 1, "task-2",
                             DataAnalysisResourceClass.STANDARD, 1)));
             assertEquals(2, service.activeCountSnapshot());
-            CapacityAdmissionException ex = assertThrows(CapacityAdmissionException.class,
-                    () -> service.restoreReservation(attachedReservation("run-1", "call-3", 1, "task-3",
-                            DataAnalysisResourceClass.STANDARD, 1)));
-            assertEquals(CapacityAdmissionException.Reason.SERVER_BUSY, ex.reason());
+        }
+
+        @Test
+        void inconsistentFrozenEstimateIsRejectedWithoutLedgerMutation() {
+            openAfterEmptyRecover();
+            DataAnalysisEstimate inconsistent = new DataAnalysisEstimate(
+                    100_000L, 16L * 1024L * 1024L, 1, 0.2d, 0,
+                    List.of(), DataAnalysisResourceClass.HEAVY, 3);
+
+            assertThrows(IllegalArgumentException.class,
+                    () -> service.reserve(identity("run-1", "call-1", 1), inconsistent));
+            assertEquals(0, service.usedUnitsSnapshot());
+            assertEquals(0, service.activeCountSnapshot());
         }
     }
 

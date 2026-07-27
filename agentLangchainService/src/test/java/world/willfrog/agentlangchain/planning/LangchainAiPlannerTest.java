@@ -7,11 +7,15 @@ import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.chat.request.ChatRequest;
 import dev.langchain4j.model.chat.response.ChatResponse;
 import org.junit.jupiter.api.Test;
+import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
+import world.willfrog.agent.platform.service.AgentPromptService;
 import world.willfrog.agentlangchain.support.LangchainTestFixtures;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 import world.willfrog.agent.workflow.TodoStatus;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -71,11 +75,11 @@ class LangchainAiPlannerTest {
                 .dialogueContext("无")
                 .model(model)
                 .toolSpecifications(ToolSpecifications.toolSpecificationsFrom(new DemoTools()))
-                .executionMode(PlanExecutionMode.LINEAR)
+                .executionMode(PlanExecutionMode.DAG)
                 .maxTodos(5)
                 .build());
 
-        assertThat(plan.getExecutionMode()).isEqualTo(PlanExecutionMode.LINEAR);
+        assertThat(plan.getExecutionMode()).isEqualTo(PlanExecutionMode.DAG);
         assertThat(plan.getAnalysis()).contains("查数据");
         assertThat(plan.getExtractedEntities()).containsExactly("沪深300", "2025");
         assertThat(plan.getItems()).hasSize(2);
@@ -86,6 +90,79 @@ class LangchainAiPlannerTest {
         assertThat(plan.getItems().get(0).isParallelizable()).isTrue();
         assertThat(model.lastRequest.toString()).contains("searchIndex");
         assertThat(model.lastRequest.toString()).contains("步骤数尽可能少，上限 5");
+    }
+
+    @Test
+    void twoStagePlannerShouldPropagateForcedLinearIntoBothPrompts() {
+        SequentialRecordingChatModel model = new SequentialRecordingChatModel(
+                """
+                {"overallPlan":{"mode":"DAG","detail":"先并行查询，再汇总。"}}
+                """,
+                """
+                {
+                  "analysis":"按顺序查询并汇总。",
+                  "items":[
+                    {"id":"todo_1","sequence":1,"description":"查询数据"},
+                    {"id":"todo_2","sequence":2,"description":"汇总结论"}
+                  ]
+                }
+                """);
+
+        LangchainTodoPlan plan = twoStagePlanner().plan(LangchainPlanningRequest.builder()
+                .runId("run-forced-linear")
+                .userGoal("分析数据")
+                .model(model)
+                .executionMode(PlanExecutionMode.LINEAR)
+                .maxTodos(5)
+                .build());
+
+        assertThat(plan.getExecutionMode()).isEqualTo(PlanExecutionMode.LINEAR);
+        assertThat(model.requests).hasSize(2);
+        assertThat(model.requests.get(0).toString())
+                .contains("执行模式由调度器强制为 LINEAR")
+                .contains("overallPlan.mode 必须返回 LINEAR");
+        assertThat(model.requests.get(1).toString())
+                .contains("\"mode\":\"LINEAR\"")
+                .doesNotContain("\"mode\":\"DAG\"");
+    }
+
+    @Test
+    void twoStagePlannerShouldFailClosedWhenForcedLinearTodosContainDagMetadata() {
+        SequentialRecordingChatModel model = new SequentialRecordingChatModel(
+                """
+                {"overallPlan":{"mode":"LINEAR","detail":"顺序执行。"}}
+                """,
+                """
+                {
+                  "analysis":"错误地生成依赖。",
+                  "items":[
+                    {"id":"todo_1","sequence":1,"description":"查询"},
+                    {"id":"todo_2","sequence":2,"description":"汇总","dependsOn":["todo_1"]}
+                  ]
+                }
+                """,
+                """
+                {"overallPlan":{"mode":"LINEAR","detail":"顺序执行。"}}
+                """,
+                """
+                {
+                  "analysis":"仍然错误地生成依赖。",
+                  "items":[
+                    {"id":"todo_1","sequence":1,"description":"查询"},
+                    {"id":"todo_2","sequence":2,"description":"汇总","dependsOn":["todo_1"]}
+                  ]
+                }
+                """);
+
+        assertThatThrownBy(() -> twoStagePlanner().plan(LangchainPlanningRequest.builder()
+                .runId("run-linear-dag-shape")
+                .userGoal("分析数据")
+                .model(model)
+                .executionMode(PlanExecutionMode.LINEAR)
+                .maxTodos(5)
+                .build()))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("linear_plan_contains_dag_metadata");
     }
 
     @Test
@@ -140,6 +217,36 @@ class LangchainAiPlannerTest {
                     .aiMessage(AiMessage.from(response))
                     .build();
         }
+    }
+
+    static class SequentialRecordingChatModel implements ChatModel {
+        private final List<String> responses;
+        private final java.util.ArrayList<ChatRequest> requests = new java.util.ArrayList<>();
+
+        SequentialRecordingChatModel(String... responses) {
+            this.responses = List.of(responses);
+        }
+
+        @Override
+        public ChatResponse doChat(ChatRequest request) {
+            requests.add(request);
+            String response = responses.get(requests.size() - 1);
+            return ChatResponse.builder()
+                    .aiMessage(AiMessage.from(response))
+                    .build();
+        }
+    }
+
+    private static LangchainAiPlanner twoStagePlanner() {
+        AgentLlmProperties properties = LangchainTestFixtures.llmProperties();
+        properties.getRuntime().getPlanning().getStructuredOutput()
+                .setStrategyStageEnabled(true);
+        ObjectMapper objectMapper = new ObjectMapper();
+        AgentLlmLocalConfigLoader loader = new AgentLlmLocalConfigLoader(objectMapper);
+        return new LangchainAiPlanner(
+                new AgentPromptService(properties, loader),
+                new LangchainPlanningStructuredOutputSettings(properties, loader),
+                objectMapper);
     }
 
     static class DemoTools {

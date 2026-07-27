@@ -461,6 +461,74 @@ class ToolJobFinalizerRetryableTest {
         verify(anchorService, never()).updateAnchorAndStatus(any(), any(), any(), any());
     }
 
+    @Test
+    void knownLegacyEstimateMismatchIsNormalizedAndCapacityReleased() throws Exception {
+        ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
+        when(anchorService.updateAnchor(eq("run-legacy"), any(ToolJobAnchor.class),
+                any(AgentRunStatus.class))).thenReturn(true);
+        when(anchorService.updateAnchorAndStatus(eq("run-legacy"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.WAITING_TOOL_JOB))).thenReturn(true);
+        DataAnalysisCapacityService capacityService = mock(DataAnalysisCapacityService.class);
+        when(capacityService.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(capacityService.releaseReservation(any())).thenReturn(DataAnalysisReleaseOutcome.RELEASED);
+        ToolJobUsageHook usageHook = mock(ToolJobUsageHook.class);
+        when(usageHook.upsertUsage(eq("run-legacy"), any())).thenReturn(true);
+        ToolJobEventHook eventHook = mock(ToolJobEventHook.class);
+        when(eventHook.emitTerminalEvent(eq("run-legacy"), any())).thenReturn(true);
+        ToolJobResumeService resumeService = mock(ToolJobResumeService.class);
+
+        ToolJobFinalizer finalizer = new ToolJobFinalizer(
+                anchorService, mock(ToolJobRedisCache.class),
+                capacityService, resumeService, new ToolJobConfig());
+        inject(finalizer, "usageHook", usageHook);
+        inject(finalizer, "eventHook", eventHook);
+
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId("run-legacy:tc-legacy:1");
+        anchor.setToolCallId("tc-legacy");
+        anchor.setAttempt(1);
+        anchor.setTaskId("task-legacy");
+        anchor.setAutoResume(true);
+        anchor.setEstimateJson("{\"estimatedRows\":6000,\"estimatedBytes\":500000,\"fileCount\":2,"
+                + "\"selectedColumnRatio\":1.0,\"manifestMemberCount\":0,"
+                + "\"heavyOperationHints\":[],\"resourceClass\":\"HEAVY\",\"capacityUnits\":3}");
+        anchor.setReservationJson(buildReservationJson(
+                "run-legacy", "tc-legacy", 1, "task-legacy",
+                DataAnalysisReservationState.PENDING_TRANSFERRED));
+
+        TaskResultResponse response = TaskResultResponse.newBuilder()
+                .setTaskId("task-legacy")
+                .setStatus("SUCCEEDED")
+                .setStdout("ok")
+                .setRetryable(false)
+                .setResourceUsage(SandboxResourceUsage.newBuilder()
+                        .setResourceClass("STANDARD")
+                        .setCpuMillis(1)
+                        .setMemoryPeakBytes(1)
+                        .setLogicalBytesScanned(1)
+                        .setQueueWaitMillis(1)
+                        .setPrepareMillis(1)
+                        .setExecutionWallMillis(1)
+                        .setCleanupMillis(1)
+                        .setDatasetOpenCount(1)
+                        .setExitReason("SUCCEEDED")
+                        .setAttributionComplete(true)
+                        .build())
+                .build();
+
+        finalizer.handleTerminal("run-legacy", anchor, "SUCCEEDED", response, true);
+
+        DataAnalysisEstimate corrected = new com.fasterxml.jackson.databind.ObjectMapper()
+                .findAndRegisterModules()
+                .readValue(anchor.getEstimateJson(), DataAnalysisEstimate.class);
+        assertThat(corrected.resourceClass()).isEqualTo(DataAnalysisResourceClass.STANDARD);
+        assertThat(corrected.capacityUnits()).isEqualTo(1);
+        verify(capacityService).releaseReservation(argThat(request ->
+                request.reservation().resourceClass() == DataAnalysisResourceClass.STANDARD
+                        && request.reservation().capacityUnits() == 1));
+        verify(resumeService).tryResume("run-legacy");
+    }
+
     // ===== helpers =====
 
     private static void inject(Object target, String name, Object value) throws Exception {
@@ -471,11 +539,18 @@ class ToolJobFinalizerRetryableTest {
 
     private static String buildReleasedJson(String runId, String toolCallId, int attempt,
                                              String taskId) throws Exception {
+        return buildReservationJson(runId, toolCallId, attempt, taskId,
+                DataAnalysisReservationState.RELEASED);
+    }
+
+    private static String buildReservationJson(
+            String runId, String toolCallId, int attempt, String taskId,
+            DataAnalysisReservationState state) throws Exception {
         var mapper = new com.fasterxml.jackson.databind.ObjectMapper().findAndRegisterModules();
         var identity = new DataAnalysisOperationIdentity(runId, toolCallId, attempt);
         var reservation = new DataAnalysisReservation(
                 identity.operationId(), identity, DataAnalysisResourceClass.STANDARD, 1,
-                DataAnalysisReservationState.RELEASED, taskId, java.time.Instant.now());
+                state, taskId, java.time.Instant.now());
         return mapper.writeValueAsString(reservation);
     }
 }

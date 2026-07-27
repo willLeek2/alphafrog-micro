@@ -7,12 +7,14 @@ import org.apache.dubbo.config.annotation.DubboService;
 import org.apache.dubbo.rpc.RpcContext;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.util.UriComponentsBuilder;
 import org.springframework.web.client.HttpClientErrorException;
 import org.springframework.web.client.RestTemplate;
 import world.willfrog.agent.platform.debug.DebugObservabilityJsonlAppender;
 import world.willfrog.agent.platform.debug.DebugObservabilityRpcKeys;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
 
+import java.net.URI;
 import java.nio.file.Path;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -62,6 +64,38 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
             // Python 端必须能区分 "未传" 和 "传了空字符串"，所以这里 setXxx 始终调用（默认值 "" 即可）。
             httpRequest.setPaths_dataset_csv(request.getPathsDatasetCsv());
             httpRequest.setPath_manifest_csv(request.getPathManifestCsv());
+            /*
+             * data-intense canonical create 字段必须作为一个整体透传。旧实现只传了代码、数据集、
+             * libraries 和 timeoutSeconds，导致 Python 侧退回默认 STANDARD 资源配置，同时完全
+             * 收不到 operationId/requestFingerprint，createTask 的幂等索引形同虚设。
+             *
+             * proto3 标量没有 presence；因此只有 operationId 非空时才把 canonical 数值零值也
+             * 写入 HTTP DTO。旧客户端没有 operationId 时继续沿用 Python 默认值，避免把空字符串
+             * resource_class 或 0 memory_limit_bytes 发送给 Pydantic 后被 422 拒绝。
+             */
+            boolean canonicalCreate = request.getOperationId() != null
+                    && !request.getOperationId().isBlank();
+            if (canonicalCreate) {
+                httpRequest.setResource_class(request.getResourceClass());
+                httpRequest.setEstimated_rows(request.getEstimatedRows());
+                httpRequest.setEstimated_bytes(request.getEstimatedBytes());
+                httpRequest.setFile_count(request.getFileCount());
+                httpRequest.setCapacity_units(request.getCapacityUnits());
+                httpRequest.setOperation_id(request.getOperationId());
+                httpRequest.setRequest_fingerprint(request.getRequestFingerprint());
+                httpRequest.setMemory_limit_bytes(request.getMemoryLimitBytes());
+                httpRequest.setTimeout_millis(request.getTimeoutMillis());
+                httpRequest.setRuntime_environment_version(request.getRuntimeEnvironmentVersion());
+                httpRequest.setCanonical_spec_schema_version(request.getCanonicalSpecSchemaVersion());
+                httpRequest.setCode_hash(request.getCodeHash());
+                httpRequest.setImmutable_dataset_snapshot_digest(
+                        request.getImmutableDatasetSnapshotDigest());
+                httpRequest.setLibraries_digest(request.getLibrariesDigest());
+                httpRequest.setSandbox_options_digest(request.getSandboxOptionsDigest());
+            } else if (request.getResourceClass() != null && !request.getResourceClass().isBlank()) {
+                // 兼容尚未启用 canonical identity、但已经声明资源档位的过渡客户端。
+                httpRequest.setResource_class(request.getResourceClass());
+            }
 
             String endpoint = sandboxUrl + "/tasks";
             long httpStart = System.currentTimeMillis();
@@ -76,10 +110,16 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
                 log.info("sandbox.createTask.result: taskId={}, status={}, totalDurationMs={}",
                         response.getBody().getTask_id(), response.getBody().getStatus(),
                         System.currentTimeMillis() - startMs);
-                return ExecuteResponse.newBuilder()
+                ExecuteResponse.Builder builder = ExecuteResponse.newBuilder()
                         .setTaskId(response.getBody().getTask_id())
-                        .setStatus(response.getBody().getStatus())
-                        .build();
+                        .setStatus(response.getBody().getStatus());
+                if (response.getBody().getExisting() != null) {
+                    builder.setExisting(response.getBody().getExisting());
+                }
+                if (response.getBody().getRequest_fingerprint() != null) {
+                    builder.setRequestFingerprint(response.getBody().getRequest_fingerprint());
+                }
+                return builder.build();
             } else {
                 log.warn("sandbox.createTask.emptyBody: totalDurationMs={}", System.currentTimeMillis() - startMs);
                 return ExecuteResponse.newBuilder().setError("Empty response from sandbox").build();
@@ -90,6 +130,64 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
             emitSandboxHttp("POST", sandboxUrl + "/tasks", -1,
                     System.currentTimeMillis() - startMs, "ERROR", "CREATE_TASK_FAILED");
             return ExecuteResponse.newBuilder().setError(e.getMessage()).build();
+        }
+    }
+
+    @Override
+    public GetTaskByOperationIdResponse getTaskByOperationId(GetTaskByOperationIdRequest request) {
+        long startMs = System.currentTimeMillis();
+        String operationId = request.getOperationId();
+        if (operationId == null || operationId.isBlank()) {
+            return GetTaskByOperationIdResponse.newBuilder()
+                    .setFound(false)
+                    .setError("operationId is required")
+                    .build();
+        }
+        try {
+            /*
+             * operationId 是 createTask 不确定结果恢复的唯一幂等索引。该查询必须桥接到
+             * Python `/operations/{operation_id}`；若 Gateway 省略本 RPC，Java 在 create
+             * 超时后既无法确认“已创建”也无法安全释放 PREPARING reservation。
+             */
+            // operationId 是单个 path segment；统一编码，避免斜杠、空格或 Unicode 改变路由含义。
+            URI endpointUri = UriComponentsBuilder.fromHttpUrl(sandboxUrl)
+                    .pathSegment("operations", operationId)
+                    .build()
+                    .encode()
+                    .toUri();
+            String endpoint = endpointUri.toASCIIString();
+            long httpStart = System.currentTimeMillis();
+            ResponseEntity<HttpOperationLookupResponse> response = restTemplate.getForEntity(
+                    endpointUri, HttpOperationLookupResponse.class);
+            emitSandboxHttp("GET", endpoint, response.getStatusCode().value(),
+                    System.currentTimeMillis() - httpStart, "OK", null);
+            HttpOperationLookupResponse body = response.getBody();
+            if (body == null) {
+                return GetTaskByOperationIdResponse.newBuilder()
+                        .setFound(false)
+                        .setError("Empty response from sandbox")
+                        .build();
+            }
+            GetTaskByOperationIdResponse.Builder builder = GetTaskByOperationIdResponse.newBuilder()
+                    .setFound(body.isFound());
+            if (body.getTask_id() != null) builder.setTaskId(body.getTask_id());
+            if (body.getStatus() != null) builder.setStatus(body.getStatus());
+            if (body.getRequest_fingerprint() != null) {
+                builder.setRequestFingerprint(body.getRequest_fingerprint());
+            }
+            if (body.getError() != null) builder.setError(body.getError());
+            log.info("sandbox.getTaskByOperationId.result: operationId={}, found={}, taskId={}, "
+                            + "totalDurationMs={}",
+                    operationId, body.isFound(), body.getTask_id(),
+                    System.currentTimeMillis() - startMs);
+            return builder.build();
+        } catch (Exception e) {
+            log.error("sandbox.getTaskByOperationId.failed: operationId={}, totalDurationMs={}, error={}",
+                    operationId, System.currentTimeMillis() - startMs, e.getMessage(), e);
+            return GetTaskByOperationIdResponse.newBuilder()
+                    .setFound(false)
+                    .setError(e.getMessage() == null ? "operation lookup failed" : e.getMessage())
+                    .build();
         }
     }
 
@@ -367,12 +465,39 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
         // Python 端在 _prepare_task_workspace 替换 placeholder 并把 CSVs 落到 workdir。
         private String paths_dataset_csv;
         private String path_manifest_csv;
+        // 以下字段共同组成 canonical create contract；必须成组透传，不能只传其中一部分。
+        private String resource_class;
+        private Long estimated_rows;
+        private Long estimated_bytes;
+        private Integer file_count;
+        private Integer capacity_units;
+        private String operation_id;
+        private String request_fingerprint;
+        private Long memory_limit_bytes;
+        private Long timeout_millis;
+        private String runtime_environment_version;
+        private String canonical_spec_schema_version;
+        private String code_hash;
+        private String immutable_dataset_snapshot_digest;
+        private String libraries_digest;
+        private String sandbox_options_digest;
     }
 
     @Data
     static class HttpCreateTaskResponse {
         private String task_id;
         private String status;
+        private Boolean existing;
+        private String request_fingerprint;
+    }
+
+    @Data
+    static class HttpOperationLookupResponse {
+        private boolean found;
+        private String task_id;
+        private String status;
+        private String request_fingerprint;
+        private String error;
     }
 
     @Data

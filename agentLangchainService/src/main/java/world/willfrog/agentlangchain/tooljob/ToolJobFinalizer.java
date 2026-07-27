@@ -376,6 +376,19 @@ public class ToolJobFinalizer {
             // estimate 缺失/损坏时 fail-closed，不能构造不完整 release proof。
             DataAnalysisEstimate estimate = parseEstimate(anchor.getEstimateJson());
             if (estimate == null) return null;
+            /*
+             * 兼容 2026-07-27 之前由 PythonSandboxTools 分类漂移写出的存量 anchor：
+             * 工具层曾把 libraries 当 heavy hints，先得到 HEAVY/3；构造 estimate 时却把
+             * hints 清空，容量层重算后 reservation 变成 STANDARD/1。严格 envelope 校验会
+             * 因二者不一致而永久阻断 RELEASE，Run 停在 WAITING_TOOL_JOB，usedUnits 也持续
+             * 被占用。
+             *
+             * 修复上线后新任务不会再产生这种组合。这里仅识别已知的窄签名
+             * HEAVY/3 + 空 hints + STANDARD/1，并用实际 reservation 修正 estimate；
+             * 其他任意 mismatch 仍然 fail-closed，不能把未知数据损坏伪装成兼容迁移。
+             */
+            estimate = normalizeKnownLegacyEstimateMismatch(estimate, reservation, anchor);
+            if (estimate == null) return null;
             // success 只接受明确 SUCCEEDED，其他终态都按失败 envelope 处理。
             String status = anchor.getTerminalStatus();
             boolean success = "SUCCEEDED".equals(status);
@@ -422,6 +435,58 @@ public class ToolJobFinalizer {
             log.error("Failed to parse estimateJson", e);
             return null;
         }
+    }
+
+    /**
+     * 只修复已知旧版本的资源分类漂移，并把修复后的 estimate 回写内存 anchor。
+     *
+     * <p>外层 RELEASE 步骤随后会通过同一次 anchor CAS 把 corrected estimate 与 RELEASED
+     * reservation 一起持久化，因此重启后不会反复执行兼容分支。</p>
+     */
+    private DataAnalysisEstimate normalizeKnownLegacyEstimateMismatch(
+            DataAnalysisEstimate estimate,
+            DataAnalysisReservation reservation,
+            ToolJobAnchor anchor) {
+        if (estimate.resourceClass() == reservation.resourceClass()
+                && estimate.capacityUnits() == reservation.capacityUnits()) {
+            return estimate;
+        }
+        boolean knownLegacySignature =
+                anchor.getSchemaVersion() <= 1
+                        && estimate.resourceClass() == DataAnalysisResourceClass.HEAVY
+                        && estimate.capacityUnits()
+                        == DataAnalysisResourceClass.HEAVY.defaultCapacityUnits()
+                        && estimate.heavyOperationHints().isEmpty()
+                        && reservation.resourceClass() == DataAnalysisResourceClass.STANDARD
+                        && reservation.capacityUnits()
+                        == DataAnalysisResourceClass.STANDARD.defaultCapacityUnits();
+        if (!knownLegacySignature) {
+            log.error("Unknown estimate/reservation mismatch blocks release: reservationId={}, "
+                            + "estimate={}/{}, reservation={}/{}",
+                    reservation.reservationId(),
+                    estimate.resourceClass(), estimate.capacityUnits(),
+                    reservation.resourceClass(), reservation.capacityUnits());
+            return null;
+        }
+        DataAnalysisEstimate corrected = new DataAnalysisEstimate(
+                estimate.estimatedRows(),
+                estimate.estimatedBytes(),
+                estimate.fileCount(),
+                estimate.selectedColumnRatio(),
+                estimate.manifestMemberCount(),
+                estimate.heavyOperationHints(),
+                reservation.resourceClass(),
+                reservation.capacityUnits());
+        try {
+            anchor.setEstimateJson(objectMapper.writeValueAsString(corrected));
+        } catch (Exception serializationFailure) {
+            log.error("Failed to persist normalized legacy estimate for reservationId={}",
+                    reservation.reservationId(), serializationFailure);
+            return null;
+        }
+        log.warn("Normalized legacy estimate mismatch for reservationId={} from HEAVY/{} to STANDARD/{}",
+                reservation.reservationId(), estimate.capacityUnits(), reservation.capacityUnits());
+        return corrected;
     }
 
     // ========== helpers ==========

@@ -2,11 +2,15 @@ package world.willfrog.sandbox.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.test.util.ReflectionTestUtils;
 import org.springframework.test.web.client.MockRestServiceServer;
 import org.springframework.web.client.RestTemplate;
 import world.willfrog.alphafrogmicro.sandbox.idl.ExecuteRequest;
+import world.willfrog.alphafrogmicro.sandbox.idl.ExecuteResponse;
+import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskByOperationIdRequest;
+import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskByOperationIdResponse;
 import world.willfrog.alphafrogmicro.sandbox.idl.TaskResultResponse;
 
 import java.util.Map;
@@ -15,10 +19,146 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.springframework.test.web.client.ExpectedCount.once;
+import static org.springframework.test.web.client.match.MockRestRequestMatchers.content;
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.requestTo;
 import static org.springframework.test.web.client.response.MockRestResponseCreators.withSuccess;
+import static org.springframework.test.web.client.response.MockRestResponseCreators.withStatus;
 
 class PythonSandboxGatewayServiceImplTest {
+
+    @Test
+    void createTaskShouldForwardCanonicalContractAndBridgeIdempotencyResponse() {
+        RestTemplate restTemplate = new RestTemplate();
+        MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
+        PythonSandboxGatewayServiceImpl gateway =
+                new PythonSandboxGatewayServiceImpl(restTemplate, new ObjectMapper());
+        ReflectionTestUtils.setField(gateway, "sandboxUrl", "http://sandbox");
+
+        server.expect(once(), requestTo("http://sandbox/tasks"))
+                .andExpect(content().json("""
+                        {
+                          "resource_class":"HEAVY",
+                          "estimated_rows":6000,
+                          "estimated_bytes":500000,
+                          "file_count":2,
+                          "capacity_units":3,
+                          "operation_id":"run-1:call-1:1",
+                          "request_fingerprint":"sha256:request",
+                          "memory_limit_bytes":1073741824,
+                          "timeout_millis":30000,
+                          "runtime_environment_version":"python-v1",
+                          "canonical_spec_schema_version":"sandbox_create_v1",
+                          "code_hash":"sha256:code",
+                          "immutable_dataset_snapshot_digest":"sha256:dataset",
+                          "libraries_digest":"sha256:libraries",
+                          "sandbox_options_digest":"sha256:options"
+                        }
+                        """, false))
+                .andRespond(withSuccess("""
+                        {
+                          "task_id":"task-existing",
+                          "status":"RUNNING",
+                          "existing":true,
+                          "request_fingerprint":"sha256:request"
+                        }
+                        """, MediaType.APPLICATION_JSON));
+
+        ExecuteResponse response = gateway.createTask(ExecuteRequest.newBuilder()
+                .setCode("print(1)")
+                .setResourceClass("HEAVY")
+                .setEstimatedRows(6000)
+                .setEstimatedBytes(500000)
+                .setFileCount(2)
+                .setCapacityUnits(3)
+                .setOperationId("run-1:call-1:1")
+                .setRequestFingerprint("sha256:request")
+                .setMemoryLimitBytes(1073741824L)
+                .setTimeoutMillis(30000)
+                .setRuntimeEnvironmentVersion("python-v1")
+                .setCanonicalSpecSchemaVersion("sandbox_create_v1")
+                .setCodeHash("sha256:code")
+                .setImmutableDatasetSnapshotDigest("sha256:dataset")
+                .setLibrariesDigest("sha256:libraries")
+                .setSandboxOptionsDigest("sha256:options")
+                .build());
+
+        server.verify();
+        assertEquals("task-existing", response.getTaskId());
+        assertTrue(response.getExisting());
+        assertEquals("sha256:request", response.getRequestFingerprint());
+    }
+
+    @Test
+    void getTaskByOperationIdShouldBridgeFoundTask() {
+        RestTemplate restTemplate = new RestTemplate();
+        MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
+        PythonSandboxGatewayServiceImpl gateway =
+                new PythonSandboxGatewayServiceImpl(restTemplate, new ObjectMapper());
+        ReflectionTestUtils.setField(gateway, "sandboxUrl", "http://sandbox");
+
+        server.expect(once(), requestTo("http://sandbox/operations/run-1:call-1:1"))
+                .andRespond(withSuccess("""
+                        {
+                          "found":true,
+                          "task_id":"task-1",
+                          "status":"SUCCEEDED",
+                          "request_fingerprint":"sha256:request"
+                        }
+                        """, MediaType.APPLICATION_JSON));
+
+        GetTaskByOperationIdResponse response = gateway.getTaskByOperationId(
+                GetTaskByOperationIdRequest.newBuilder()
+                        .setOperationId("run-1:call-1:1")
+                        .build());
+
+        server.verify();
+        assertTrue(response.getFound());
+        assertEquals("task-1", response.getTaskId());
+        assertEquals("SUCCEEDED", response.getStatus());
+        assertEquals("sha256:request", response.getRequestFingerprint());
+    }
+
+    @Test
+    void getTaskByOperationIdShouldEncodeSinglePathSegment() {
+        RestTemplate restTemplate = new RestTemplate();
+        MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
+        PythonSandboxGatewayServiceImpl gateway =
+                new PythonSandboxGatewayServiceImpl(restTemplate, new ObjectMapper());
+        ReflectionTestUtils.setField(gateway, "sandboxUrl", "http://sandbox");
+
+        server.expect(once(), requestTo("http://sandbox/operations/run%2F%E4%B8%AD%E6%96%87%20id"))
+                .andRespond(withSuccess("{\"found\":false}", MediaType.APPLICATION_JSON));
+
+        GetTaskByOperationIdResponse response = gateway.getTaskByOperationId(
+                GetTaskByOperationIdRequest.newBuilder()
+                        .setOperationId("run/中文 id")
+                        .build());
+
+        server.verify();
+        assertFalse(response.getFound());
+        assertTrue(response.getError().isBlank());
+    }
+
+    @Test
+    void getTaskByOperationIdShouldExposeTransportFailureAsErrorNotDefinitiveAbsence() {
+        RestTemplate restTemplate = new RestTemplate();
+        MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
+        PythonSandboxGatewayServiceImpl gateway =
+                new PythonSandboxGatewayServiceImpl(restTemplate, new ObjectMapper());
+        ReflectionTestUtils.setField(gateway, "sandboxUrl", "http://sandbox");
+
+        server.expect(once(), requestTo("http://sandbox/operations/run-1:call-1:1"))
+                .andRespond(withStatus(HttpStatus.SERVICE_UNAVAILABLE));
+
+        GetTaskByOperationIdResponse response = gateway.getTaskByOperationId(
+                GetTaskByOperationIdRequest.newBuilder()
+                        .setOperationId("run-1:call-1:1")
+                        .build());
+
+        server.verify();
+        assertFalse(response.getFound());
+        assertFalse(response.getError().isBlank());
+    }
 
     @Test
     void canonicalCreateComponentsShouldKeepFrozenProtoNumbers() {

@@ -16,6 +16,7 @@ import world.willfrog.agent.workflow.TodoItem;
 import world.willfrog.agentlangchain.failure.LangchainFailureMapper;
 import world.willfrog.agentlangchain.orchestration.dag.LangchainDagWorkflowExecutor;
 import world.willfrog.agentlangchain.planning.LangchainAiPlanner;
+import world.willfrog.agentlangchain.planning.LangchainPlanningRequest;
 import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
 
 import java.util.List;
@@ -107,7 +108,7 @@ class LangchainLinearRunPipelinePlanReadyTest {
 
     @Test
     @SuppressWarnings("unchecked")
-    void executeRun_shouldPersistPlanBeforeEmittingPlanReadyWithPlanPayload() throws Exception {
+    void executeRun_withCodeInterpreterShouldPersistAndExecuteEffectiveLinearPlan() throws Exception {
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
         AgentEventService eventService = mock(AgentEventService.class);
         AgentRunStateStore stateStore = mock(AgentRunStateStore.class);
@@ -132,22 +133,35 @@ class LangchainLinearRunPipelinePlanReadyTest {
                 null, null, null, "openrouter", "kimi", List.of()));
         when(executionGuard.stopReason(eq("run-plan-1"), eq("user-1"))).thenReturn(Optional.empty());
 
-        LangchainTodoPlan plan = LangchainTodoPlan.builder()
-                .executionMode(PlanExecutionMode.LINEAR)
-                .items(List.of(TodoItem.builder()
-                        .id("todo-1")
-                        .sequence(1)
-                        .description("查询指数行情")
-                        .dependsOn(List.of())
-                        .build()))
+        LangchainTodoPlan plannerDagPlan = LangchainTodoPlan.builder()
+                .executionMode(PlanExecutionMode.DAG)
+                .items(List.of(
+                        TodoItem.builder()
+                                .id("todo-1")
+                                .sequence(1)
+                                .description("查询指数行情")
+                                .parallelizable(true)
+                                .groupKey("market")
+                                .build(),
+                        TodoItem.builder()
+                                .id("todo-2")
+                                .sequence(2)
+                                .description("执行 Python 分析")
+                                .dependsOn(List.of("todo-1"))
+                                .parallelizable(true)
+                                .groupKey("market")
+                                .build()))
                 .build();
-        when(planner.plan(any())).thenReturn(plan);
-        when(linear.executePlanned(any(), eq(plan))).thenReturn(LangchainLinearWorkflowResult.builder()
-                .success(true)
-                .finalAnswer("ok")
-                .plan(plan)
-                .completedTodos(List.of())
-                .build());
+        when(planner.plan(any())).thenReturn(plannerDagPlan);
+        when(linear.executePlanned(any(), any())).thenAnswer(invocation -> {
+            LangchainTodoPlan effectivePlan = invocation.getArgument(1);
+            return LangchainLinearWorkflowResult.builder()
+                    .success(true)
+                    .finalAnswer("ok")
+                    .plan(effectivePlan)
+                    .completedTodos(List.of())
+                    .build();
+        });
 
         ObjectProvider<AgentRunStateStore> stateStoreProvider = mock(ObjectProvider.class);
         when(stateStoreProvider.getIfAvailable()).thenReturn(stateStore);
@@ -183,14 +197,32 @@ class LangchainLinearRunPipelinePlanReadyTest {
 
         pipeline.executeRun(run);
 
+        ArgumentCaptor<LangchainPlanningRequest> planningRequest =
+                ArgumentCaptor.forClass(LangchainPlanningRequest.class);
+        verify(planner).plan(planningRequest.capture());
+        assertThat(planningRequest.getValue().getExecutionMode())
+                .isEqualTo(PlanExecutionMode.LINEAR);
+
+        ArgumentCaptor<LangchainTodoPlan> effectivePlanCaptor =
+                ArgumentCaptor.forClass(LangchainTodoPlan.class);
+        verify(linear).executePlanned(any(), effectivePlanCaptor.capture());
+        LangchainTodoPlan effectivePlan = effectivePlanCaptor.getValue();
+        assertThat(effectivePlan).isNotSameAs(plannerDagPlan);
+        assertThat(effectivePlan.getExecutionMode()).isEqualTo(PlanExecutionMode.LINEAR);
+        assertThat(effectivePlan.getItems()).hasSize(2).allSatisfy(item -> {
+            assertThat(item.getDependsOn()).isEmpty();
+            assertThat(item.getGroupKey()).isNull();
+            assertThat(item.isParallelizable()).isFalse();
+        });
+
         ArgumentCaptor<Object> payloadCaptor = ArgumentCaptor.forClass(Object.class);
         verify(eventService).append(eq("run-plan-1"), eq("user-1"), eq("PLAN_READY"), payloadCaptor.capture());
         Map<String, Object> payload = (Map<String, Object>) payloadCaptor.getValue();
         assertThat(payload.get("workflow")).isEqualTo("linear");
-        assertThat(payload.get("todo_count")).isEqualTo(1);
-        assertThat(payload.get("plan")).isSameAs(plan);
+        assertThat(payload.get("todo_count")).isEqualTo(2);
+        assertThat(payload.get("plan")).isSameAs(effectivePlan);
 
-        String expectedPlanJson = objectMapper.writeValueAsString(plan);
+        String expectedPlanJson = objectMapper.writeValueAsString(effectivePlan);
         InOrder inOrder = inOrder(runMapper, stateStore, eventService);
         inOrder.verify(runMapper).updatePlanJson("run-plan-1", "user-1", expectedPlanJson);
         inOrder.verify(stateStore).recordPlan("run-plan-1", expectedPlanJson, true);

@@ -102,12 +102,50 @@ public class DataAnalysisCapacityServiceImpl implements DataAnalysisCapacityServ
                                 + " (limits rows=" + decision.rowsLimit()
                                 + " bytes=" + decision.bytesLimit() + ")");
             }
-            DataAnalysisResourceClass resourceClass = decision.resourceClass();
-            int units = decision.capacityUnits();
+            /*
+             * estimate 是工具层已经冻结并即将写入 durable anchor 的资源决策。容量账本仍然
+             * 用本地配置重算一次，只用于校验调用方没有把 HEAVY 伪装成 STANDARD；真正写入
+             * reservation 的 class/units 必须取 estimate，保证 estimate、reservation、
+             * Sandbox request 和 terminal envelope 使用同一份决策。
+             */
+            if (estimate.resourceClass() != decision.resourceClass()
+                    || estimate.capacityUnits() != decision.capacityUnits()) {
+                throw new IllegalArgumentException(
+                        "estimate resource decision is inconsistent with configured classifier: estimate="
+                                + estimate.resourceClass() + "/" + estimate.capacityUnits()
+                                + " configured=" + decision.resourceClass() + "/" + decision.capacityUnits());
+            }
+            DataAnalysisResourceClass resourceClass = estimate.resourceClass();
+            int units = estimate.capacityUnits();
             if (ledger.containsKey(identity.reservationId())) {
                 throw new CapacityAdmissionException(
                         CapacityAdmissionException.Reason.ALREADY_RESERVED,
                         "reservation already exists: " + identity.reservationId());
+            }
+            /*
+             * maxActive/maxHeavyActive 必须在 createTask 之前检查。PREPARING 虽然还没有 taskId，
+             * 但 reserve 返回后调用方下一步就是创建 Sandbox 任务；若此处不把 PREPARING 算作
+             * 已占用的准入名额，第三个请求会先产生真实 Sandbox 副作用，随后才在
+             * PREPARING→TASK_ATTACHED 被拒绝，留下 orphan task 和无法释放的 PREPARING unit。
+             *
+             * activeCount/heavyActiveCount 的历史观测语义保持不变：它们只统计已经附着 taskId
+             * 的 reservation。这里单独扫描所有非 RELEASED reservation，表达的是“已承诺的
+             * pre-create 名额”，不能与运行中 active 指标混为一谈。
+             */
+            int admittedReservations = admittedReservationCount();
+            if (admittedReservations + 1 > properties.getMaxActive()) {
+                throw new CapacityAdmissionException(
+                        CapacityAdmissionException.Reason.SERVER_BUSY,
+                        "no active slots left (admitted=" + admittedReservations
+                                + " requested=1 max=" + properties.getMaxActive() + ")");
+            }
+            int admittedHeavyReservations = admittedHeavyReservationCount();
+            if (resourceClass == DataAnalysisResourceClass.HEAVY
+                    && admittedHeavyReservations + 1 > properties.getMaxHeavyActive()) {
+                throw new CapacityAdmissionException(
+                        CapacityAdmissionException.Reason.SERVER_BUSY,
+                        "no heavy slots left (admittedHeavy=" + admittedHeavyReservations
+                                + " requested=1 max=" + properties.getMaxHeavyActive() + ")");
             }
             if (usedUnits.get() + units > properties.getMaxUnits()) {
                 throw new CapacityAdmissionException(
@@ -384,6 +422,31 @@ public class DataAnalysisCapacityServiceImpl implements DataAnalysisCapacityServ
         return state == DataAnalysisReservationState.TASK_ATTACHED
                 || state == DataAnalysisReservationState.PENDING_TRANSFERRED
                 || state == DataAnalysisReservationState.TERMINAL_CONFIRMED;
+    }
+
+    /**
+     * 返回已经获得 pre-create 准入承诺、尚未 RELEASE 的 reservation 数。
+     *
+     * <p>调用方必须持有 {@link #reserveLock}。账本保留 RELEASED 项用于幂等查询，所以不能用
+     * {@code ledger.size()}；PREPARING 又必须计入，否则 maxActive 仍会在 Sandbox create 之后
+     * 才生效。</p>
+     */
+    private int admittedReservationCount() {
+        return (int) ledger.values().stream()
+                .filter(reservation -> reservation.state() != DataAnalysisReservationState.RELEASED)
+                .count();
+    }
+
+    /**
+     * 返回已经获得 pre-create 准入承诺的 HEAVY reservation 数。
+     * 与 {@code heavyActiveCount} 不同，本值包含 PREPARING，用于阻止第二个 HEAVY 任务先创建
+     * Sandbox 再失败。
+     */
+    private int admittedHeavyReservationCount() {
+        return (int) ledger.values().stream()
+                .filter(reservation -> reservation.state() != DataAnalysisReservationState.RELEASED)
+                .filter(reservation -> reservation.resourceClass() == DataAnalysisResourceClass.HEAVY)
+                .count();
     }
 
     private void releaseCounters(DataAnalysisReservation reservation) {

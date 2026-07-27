@@ -4,49 +4,51 @@ import lombok.Data;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
 /**
- * Data analysis capacity ledger tuning. Bound to the {@code alphafrog.data-analysis.capacity}
- * configuration prefix so it stays independent from the multi-owner {@code AgentLlmProperties}.
+ * Java 侧数据分析容量账本的配置与确定性分类器。
+ *
+ * <p>它在调用 Python Sandbox 之前生效，与 Sandbox 内部的 worker/容器伸缩是两层独立控制：
+ * 本账本拒绝后，请求不会到达 Sandbox，也不会触发 Sandbox 扩容。配置前缀固定为
+ * {@code alphafrog.data-analysis.capacity}，避免与多 owner 的 {@code AgentLlmProperties}
+ * 混在一起。</p>
  */
 @Data
 @ConfigurationProperties(prefix = "alphafrog.data-analysis.capacity")
 public class DataAnalysisCapacityProperties {
 
-    /** Maximum total capacity units a single host will hold concurrently. */
+    /** 单个 Java 实例允许持有的总 capacity units；STANDARD=1，HEAVY=3。 */
     private int maxUnits = 4;
 
-    /** Maximum number of active reservations regardless of resource class. */
+    /** 所有资源档位合计的 pre-create 准入数上限，PREPARING 也必须计入。 */
     private int maxActive = 2;
 
-    /** Maximum number of active HEAVY reservations. */
+    /** HEAVY 的 pre-create 准入数上限，防止多个大任务先创建容器后才被拒绝。 */
     private int maxHeavyActive = 1;
 
-    /** Hard row ceiling per task; rows above this are rejected as DATA_ANALYSIS_TASK_TOO_LARGE. */
+    /** 单任务行数硬上限；超过后返回 DATA_ANALYSIS_TASK_TOO_LARGE，不进入排队。 */
     private long maxRowsPerTask = 600_000L;
 
-    /** Hard byte ceiling per task; bytes above this are rejected as DATA_ANALYSIS_TASK_TOO_LARGE. */
+    /** 单任务字节数硬上限；超过后返回 DATA_ANALYSIS_TASK_TOO_LARGE，不进入排队。 */
     private long maxBytesPerTask = 512L * 1024L * 1024L;
 
-    /** Row threshold that promotes a task from STANDARD to HEAVY when combined with bytes / hints. */
+    /** STANDARD 最大行数；行数、字节和重操作提示必须同时满足才属于 STANDARD。 */
     private long standardRowsMax = 200_000L;
 
-    /** Byte threshold that promotes a task from STANDARD to HEAVY when combined with rows / hints. */
+    /** STANDARD 最大字节数；任一标准阈值不满足但未越硬上限时归为 HEAVY。 */
     private long standardBytesMax = 32L * 1024L * 1024L;
 
-    /** Memory cap for STANDARD tasks, in bytes. */
+    /** STANDARD 任务传给 Sandbox 的内存上限（字节）。 */
     private long standardMemoryLimitBytes = 512L * 1024L * 1024L;
 
-    /** Memory cap for HEAVY tasks, in bytes. */
+    /** HEAVY 任务传给 Sandbox 的内存上限（字节）。 */
     private long heavyMemoryLimitBytes = 1536L * 1024L * 1024L;
 
     /**
-     * Classify a task by its estimated row count, byte budget, and heavy-operation hints.
+     * 根据冻结的行数、字节预算和重操作提示确定资源档位。
      *
-     * <p>The classification rules are deterministic per the §8.1 contract:
-     * rows &le; {@code standardRowsMax} <em>and</em> bytes &le; {@code standardBytesMax}
-     * <em>and</em> no heavy operation hints resolves to {@link world.willfrog.agent.platform.dataanalysis.DataAnalysisResourceClass#STANDARD}.
-     * Anything that still fits under the per-task hard ceilings ({@code maxRowsPerTask} / {@code maxBytesPerTask})
-     * but does not meet all three standard thresholds resolves to
-     * {@link world.willfrog.agent.platform.dataanalysis.DataAnalysisResourceClass#HEAVY}.
+     * <p>规则必须是确定性的：行数不超过 {@code standardRowsMax}、字节不超过
+     * {@code standardBytesMax} 且没有重操作提示时为 STANDARD；仍在单任务硬上限内但
+     * 任一 STANDARD 条件不满足时为 HEAVY；越过硬上限时直接 REJECTED。调用链只能分类
+     * 一次，后续 estimate、reservation、Sandbox request 与终态证明必须复用同一结果。</p>
      */
     public DataAnalysisResourceClassDecision classify(
             long estimatedRows, long estimatedBytes, java.util.List<String> heavyOperationHints) {
@@ -65,7 +67,7 @@ public class DataAnalysisCapacityProperties {
                 heavyMemoryLimitBytes, maxRowsPerTask, maxBytesPerTask);
     }
 
-    /** Decision returned by {@link #classify}. */
+    /** 分类结果；同时冻结档位、unit 数、内存上限和诊断用硬上限。 */
     public record DataAnalysisResourceClassDecision(
             Outcome outcome,
             world.willfrog.agent.platform.dataanalysis.DataAnalysisResourceClass resourceClass,
