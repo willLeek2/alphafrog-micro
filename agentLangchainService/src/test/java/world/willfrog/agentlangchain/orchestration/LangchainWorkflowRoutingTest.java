@@ -8,6 +8,7 @@ import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class LangchainWorkflowRoutingTest {
 
@@ -56,5 +57,61 @@ class LangchainWorkflowRoutingTest {
         });
         assertThat(LangchainWorkflowRouting.shouldUseDag(effective)).isFalse();
         assertThat(LangchainWorkflowRouting.effectivePlan(effective, true)).isSameAs(effective);
+    }
+
+    @Test
+    void durableToolTopologicallySortsAndRenumbersPlannerDag() {
+        LangchainTodoPlan plan = LangchainTodoPlan.builder()
+                .executionMode(PlanExecutionMode.LINEAR)
+                .items(List.of(
+                        TodoItem.builder().id("join").sequence(1).description("汇总")
+                                .dependsOn(List.of("left", "right")).build(),
+                        TodoItem.builder().id("right").sequence(3).description("右分支")
+                                .dependsOn(List.of("root")).build(),
+                        TodoItem.builder().id("root").sequence(4).description("入口").build(),
+                        TodoItem.builder().id("left").sequence(2).description("左分支")
+                                .dependsOn(List.of("root")).build()))
+                .build();
+
+        LangchainTodoPlan effective = LangchainWorkflowRouting.effectivePlan(plan, true);
+
+        assertThat(effective.getItems()).extracting(TodoItem::getId)
+                .containsExactly("root", "left", "right", "join");
+        assertThat(effective.getItems()).extracting(TodoItem::getSequence)
+                .containsExactly(1, 2, 3, 4);
+        assertThat(effective.getItems()).allSatisfy(item -> assertThat(item.getDependsOn()).isEmpty());
+    }
+
+    @Test
+    void durableToolFailsClosedForMissingDependency() {
+        LangchainTodoPlan plan = LangchainTodoPlan.builder()
+                .executionMode(PlanExecutionMode.LINEAR)
+                .items(List.of(TodoItem.builder()
+                        .id("todo-1")
+                        .sequence(1)
+                        .description("查询")
+                        .dependsOn(List.of("missing"))
+                        .build()))
+                .build();
+
+        assertThatThrownBy(() -> LangchainWorkflowRouting.effectivePlan(plan, true))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("linear_plan_not_linearizable:missing_dependency:todo-1->missing");
+    }
+
+    @Test
+    void durableToolFailsClosedForDependencyCycle() {
+        LangchainTodoPlan plan = LangchainTodoPlan.builder()
+                .executionMode(PlanExecutionMode.LINEAR)
+                .items(List.of(
+                        TodoItem.builder().id("todo-1").sequence(1).description("一")
+                                .dependsOn(List.of("todo-2")).build(),
+                        TodoItem.builder().id("todo-2").sequence(2).description("二")
+                                .dependsOn(List.of("todo-1")).build()))
+                .build();
+
+        assertThatThrownBy(() -> LangchainWorkflowRouting.effectivePlan(plan, true))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("linear_plan_not_linearizable:dependency_cycle");
     }
 }

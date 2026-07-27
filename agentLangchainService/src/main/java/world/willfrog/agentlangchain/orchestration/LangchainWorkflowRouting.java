@@ -5,7 +5,14 @@ import world.willfrog.agent.workflow.TodoItem;
 import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
 
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.PriorityQueue;
+import java.util.Set;
 
 /**
  * LINEAR vs DAG 路由决策器。~30 行薄判断层。
@@ -52,8 +59,13 @@ final class LangchainWorkflowRouting {
      * 返回首次执行、持久化和恢复共同使用的有效计划。
      *
      * <p>当 durable 工具只支持 LINEAR checkpoint 时，不能只切换 executor 而保留一份
-     * DAG plan。这里复制 Todo 并移除依赖/并行字段，同时把 executionMode 固定为 LINEAR，
-     * 使 PostgreSQL planJson、PLAN_READY、首次执行与 resume 读取到完全相同的语义。</p>
+     * DAG plan。这里先按依赖做稳定拓扑排序，再复制 Todo、重新编号并移除依赖/并行字段，
+     * 同时把 executionMode 固定为 LINEAR。这样 PostgreSQL planJson、PLAN_READY、首次执行
+     * 与 resume 读取到完全相同的语义，也不会因为 planner 恰好返回了合法的 DAG 元数据
+     * 就误杀本可线性化的计划。</p>
+     *
+     * <p>缺失依赖、重复 id 或环都无法安全猜测，必须 fail-closed。无依赖节点之间使用
+     * planner sequence、原数组位置、id 依次作为稳定 tie-break，保证同一输入得到同一计划。</p>
      */
     static LangchainTodoPlan effectivePlan(LangchainTodoPlan plan, boolean forceLinear) {
         if (plan == null || !forceLinear || isAlreadyCanonicalLinear(plan)) {
@@ -62,14 +74,13 @@ final class LangchainWorkflowRouting {
         List<TodoItem> source = plan.getItems();
         List<TodoItem> linearItems = new ArrayList<>();
         if (source != null) {
-            for (TodoItem item : source) {
-                if (item == null) {
-                    continue;
-                }
-                // sequence 保留 planner 的确定顺序；DAG 专属字段全部清空，避免恢复时重新解释依赖。
+            List<TodoItem> ordered = stableTopologicalOrder(source);
+            for (int index = 0; index < ordered.size(); index++) {
+                TodoItem item = ordered.get(index);
+                // sequence 与拓扑数组顺序重新对齐；DAG 专属字段全部清空，避免恢复时重新解释依赖。
                 linearItems.add(TodoItem.builder()
                         .id(item.getId())
-                        .sequence(item.getSequence())
+                        .sequence(index + 1)
                         .description(item.getDescription())
                         .status(item.getStatus())
                         .resultSummary(item.getResultSummary())
@@ -89,6 +100,84 @@ final class LangchainWorkflowRouting {
                         ? List.of() : new ArrayList<>(plan.getExtractedEntities()))
                 .executionMode(PlanExecutionMode.LINEAR)
                 .build();
+    }
+
+    private static List<TodoItem> stableTopologicalOrder(List<TodoItem> source) {
+        List<IndexedTodo> nodes = new ArrayList<>();
+        Map<String, IndexedTodo> byId = new LinkedHashMap<>();
+        for (int index = 0; index < source.size(); index++) {
+            TodoItem item = source.get(index);
+            if (item == null) {
+                continue;
+            }
+            String id = item.getId() == null ? "" : item.getId().trim();
+            if (id.isEmpty()) {
+                throw invalidLinearPlan("missing_todo_id");
+            }
+            IndexedTodo node = new IndexedTodo(item, index);
+            if (byId.putIfAbsent(id, node) != null) {
+                throw invalidLinearPlan("duplicate_todo_id:" + id);
+            }
+            nodes.add(node);
+        }
+
+        Map<String, Integer> indegree = new HashMap<>();
+        Map<String, List<IndexedTodo>> outgoing = new HashMap<>();
+        for (IndexedTodo node : nodes) {
+            indegree.put(node.item().getId().trim(), 0);
+        }
+        for (IndexedTodo node : nodes) {
+            String nodeId = node.item().getId().trim();
+            Set<String> uniqueDependencies = new LinkedHashSet<>();
+            List<String> dependencies = node.item().getDependsOn();
+            if (dependencies != null) {
+                for (String rawDependency : dependencies) {
+                    String dependency = rawDependency == null ? "" : rawDependency.trim();
+                    if (dependency.isEmpty() || !byId.containsKey(dependency)) {
+                        throw invalidLinearPlan("missing_dependency:" + nodeId + "->" + dependency);
+                    }
+                    uniqueDependencies.add(dependency);
+                }
+            }
+            indegree.put(nodeId, uniqueDependencies.size());
+            for (String dependency : uniqueDependencies) {
+                outgoing.computeIfAbsent(dependency, ignored -> new ArrayList<>()).add(node);
+            }
+        }
+
+        Comparator<IndexedTodo> stableOrder = Comparator
+                .comparingInt((IndexedTodo node) -> node.item().getSequence())
+                .thenComparingInt(IndexedTodo::originalIndex)
+                .thenComparing(node -> node.item().getId());
+        PriorityQueue<IndexedTodo> ready = new PriorityQueue<>(stableOrder);
+        nodes.stream()
+                .filter(node -> indegree.get(node.item().getId().trim()) == 0)
+                .forEach(ready::add);
+
+        List<TodoItem> ordered = new ArrayList<>(nodes.size());
+        while (!ready.isEmpty()) {
+            IndexedTodo current = ready.remove();
+            String currentId = current.item().getId().trim();
+            ordered.add(current.item());
+            for (IndexedTodo dependent : outgoing.getOrDefault(currentId, List.of())) {
+                String dependentId = dependent.item().getId().trim();
+                int remaining = indegree.computeIfPresent(dependentId, (ignored, value) -> value - 1);
+                if (remaining == 0) {
+                    ready.add(dependent);
+                }
+            }
+        }
+        if (ordered.size() != nodes.size()) {
+            throw invalidLinearPlan("dependency_cycle");
+        }
+        return ordered;
+    }
+
+    private static IllegalStateException invalidLinearPlan(String reason) {
+        return new IllegalStateException("linear_plan_not_linearizable:" + reason);
+    }
+
+    private record IndexedTodo(TodoItem item, int originalIndex) {
     }
 
     /**

@@ -243,7 +243,6 @@ public class LangchainAiPlanner {
                             todosValidation.category(), todosValidation.message());
                 }
                 LangchainTodoPlan plan = LangchainTodoPlanParser.fromJsonRoot(todosRoot, mode, maxTodos);
-                requireLinearShape(plan, mode);
                 if (overallPlan.detail() != null && !overallPlan.detail().isBlank()) {
                     plan = LangchainTodoPlan.builder()
                             .analysis(overallPlan.detail())
@@ -340,32 +339,9 @@ public class LangchainAiPlanner {
                         + "\n\n当前轮次用户需求：" + request.getUserGoal();
             }
             LangchainTodoPlanResponse response = service.plan(userMessage);
-            LangchainTodoPlan plan = normalizeResponse(response, maxTodos, mode);
-            requireLinearShape(plan, mode);
-            return plan;
+            return normalizeResponse(response, maxTodos, mode);
         } finally {
             AgentContext.clearStructuredOutputSpec();
-        }
-    }
-
-    /**
-     * 强制 LINEAR 时拒绝任何 DAG 元数据，不能靠删除 dependsOn 来猜测拓扑顺序。
-     *
-     * <p>planner 的 items 数组并不保证已经拓扑排序；若把 DAG 计划机械去边后顺序执行，
-     * join/branch 可能在依赖完成前运行。这里 fail-closed，让规划重试或直接失败。</p>
-     */
-    private static void requireLinearShape(LangchainTodoPlan plan, PlanExecutionMode mode) {
-        if (mode != PlanExecutionMode.LINEAR || plan == null || plan.getItems() == null) {
-            return;
-        }
-        boolean containsDagMetadata = plan.getItems().stream().anyMatch(item ->
-                item != null && ((item.getDependsOn() != null && !item.getDependsOn().isEmpty())
-                        || item.getGroupKey() != null && !item.getGroupKey().isBlank()
-                        || item.isParallelizable()));
-        if (containsDagMetadata) {
-            throw new StructuredPlanningSupport.StructuredPlanningException(
-                    StructuredPlanningSupport.CATEGORY_SCHEMA_VALIDATION_ERROR,
-                    "linear_plan_contains_dag_metadata");
         }
     }
 

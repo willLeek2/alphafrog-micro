@@ -323,9 +323,9 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
 
             /*
              * 即使 planner/mock 违反请求返回 DAG 字段，也要生成一份真正可恢复的 effective
-             * LINEAR plan：executionMode 固定为 LINEAR，并清空 dependsOn/groupKey/
-             * parallelizable。后续持久化、PLAN_READY、首次执行和 resume 全部只使用这份
-             * effective plan，确保数据库真相与 executor 语义一致。
+             * LINEAR plan：先稳定拓扑排序，再固定 executionMode、重新编号并清空
+             * dependsOn/groupKey/parallelizable。后续持久化、PLAN_READY、首次执行和
+             * resume 全部只使用这份 effective plan，确保数据库真相与 executor 语义一致。
              */
             LangchainTodoPlan planned = plan;
             plan = LangchainWorkflowRouting.effectivePlan(plan, forceLinearForDurableTool);

@@ -127,7 +127,7 @@ class LangchainAiPlannerTest {
     }
 
     @Test
-    void twoStagePlannerShouldFailClosedWhenForcedLinearTodosContainDagMetadata() {
+    void twoStagePlannerShouldAcceptLinearizableDagMetadataForExecutionCanonicalization() {
         SequentialRecordingChatModel model = new SequentialRecordingChatModel(
                 """
                 {"overallPlan":{"mode":"LINEAR","detail":"顺序执行。"}}
@@ -140,29 +140,21 @@ class LangchainAiPlannerTest {
                     {"id":"todo_2","sequence":2,"description":"汇总","dependsOn":["todo_1"]}
                   ]
                 }
-                """,
-                """
-                {"overallPlan":{"mode":"LINEAR","detail":"顺序执行。"}}
-                """,
-                """
-                {
-                  "analysis":"仍然错误地生成依赖。",
-                  "items":[
-                    {"id":"todo_1","sequence":1,"description":"查询"},
-                    {"id":"todo_2","sequence":2,"description":"汇总","dependsOn":["todo_1"]}
-                  ]
-                }
                 """);
 
-        assertThatThrownBy(() -> twoStagePlanner().plan(LangchainPlanningRequest.builder()
+        LangchainTodoPlan plan = twoStagePlanner().plan(LangchainPlanningRequest.builder()
                 .runId("run-linear-dag-shape")
                 .userGoal("分析数据")
                 .model(model)
                 .executionMode(PlanExecutionMode.LINEAR)
                 .maxTodos(5)
-                .build()))
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("linear_plan_contains_dag_metadata");
+                .build());
+
+        assertThat(plan.getExecutionMode()).isEqualTo(PlanExecutionMode.LINEAR);
+        assertThat(plan.getItems()).extracting(item -> item.getId())
+                .containsExactly("todo_1", "todo_2");
+        assertThat(plan.getItems().get(1).getDependsOn()).containsExactly("todo_1");
+        assertThat(model.requests).hasSize(2);
     }
 
     @Test

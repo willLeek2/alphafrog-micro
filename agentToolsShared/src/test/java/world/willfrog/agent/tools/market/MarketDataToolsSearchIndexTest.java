@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
+import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.tools.dataset.DatasetManifest;
 import world.willfrog.agent.tools.dataset.DatasetRegistry;
 import world.willfrog.agent.tools.dataset.DatasetWriter;
@@ -22,13 +23,22 @@ import world.willfrog.alphafrogmicro.domestic.idl.DomesticStockInfoByTsCodeReque
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticStockInfoByTsCodeResponse;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticStockInfoFullItem;
 import world.willfrog.alphafrogmicro.domestic.idl.DomesticStockService;
+import world.willfrog.alphafrogmicro.domestic.idl.DomesticListedAssetService;
+import world.willfrog.alphafrogmicro.domestic.idl.ListedAssetAdjFactorResponse;
+import world.willfrog.alphafrogmicro.domestic.idl.ListedAssetDailyItem;
+import world.willfrog.alphafrogmicro.domestic.idl.ListedAssetDailyResponse;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -240,6 +250,81 @@ class MarketDataToolsSearchIndexTest {
         assertEquals("20240131", member.getEndDate());
     }
 
+    @Test
+    void batchEtfDailyPropagatesRunContextIntoDatasetWriterThreads() throws Exception {
+        DatasetWriter datasetWriter = mock(DatasetWriter.class);
+        DatasetRegistry datasetRegistry = mock(DatasetRegistry.class);
+        DomesticListedAssetService listedAssetService = mock(DomesticListedAssetService.class);
+        List<String> observedRunIds = new CopyOnWriteArrayList<>();
+
+        when(datasetWriter.isEnabled()).thenReturn(true);
+        when(datasetRegistry.isEnabled()).thenReturn(true);
+        when(datasetRegistry.findReusable(
+                anyString(), anyString(), anyString(), anyString(), anyList()))
+                .thenReturn(Optional.empty());
+        when(datasetWriter.writeDataset(
+                anyString(), anyString(), anyString(), anyString(), anyString(),
+                anyList(), anyList(), any()))
+                .thenAnswer(invocation -> {
+                    observedRunIds.add(AgentContext.getRunId());
+                    String prefix = invocation.getArgument(1);
+                    String tsCode = invocation.getArgument(2);
+                    return prefix + "-" + tsCode + "-dataset";
+                });
+        when(listedAssetService.getListedAssetDaily(any()))
+                .thenAnswer(invocation -> {
+                    String tsCode = invocation.<world.willfrog.alphafrogmicro.domestic.idl.ListedAssetDailyRequest>
+                                    getArgument(0)
+                            .getTsCode();
+                    return ListedAssetDailyResponse.newBuilder()
+                            .addItems(ListedAssetDailyItem.newBuilder()
+                                    .setAssetType("etf")
+                                    .setTsCode(tsCode)
+                                    .setTradeDate(20260105L)
+                                    .setOpen(1.0)
+                                    .setHigh(1.1)
+                                    .setLow(0.9)
+                                    .setClose(1.05)
+                                    .build())
+                            .build();
+                });
+        when(listedAssetService.getListedAssetAdjFactors(any()))
+                .thenReturn(ListedAssetAdjFactorResponse.getDefaultInstance());
+
+        MarketDataTools tools = new MarketDataTools(
+                datasetWriter,
+                datasetRegistry,
+                null,
+                null,
+                new AgentLlmProperties(),
+                objectMapper
+        );
+        ReflectionTestUtils.setField(tools, "domesticListedAssetService", listedAssetService);
+
+        AgentContext.setRunId("run-batch-etf");
+        try {
+            Map<String, Object> response = objectMapper.readValue(
+                    tools.getExchangeAssetDaily(
+                            "159923.SZ|159970.SZ",
+                            "etf",
+                            "20260101",
+                            "20260131",
+                            "raw_ohlc",
+                            null,
+                            null),
+                    new TypeReference<>() {
+                    });
+
+            assertEquals(Boolean.TRUE, response.get("ok"));
+            assertEquals(List.of("run-batch-etf", "run-batch-etf"),
+                    observedRunIds.stream().sorted().toList());
+            List<String> datasetIds = castStringList(castMap(response.get("data")).get("dataset_ids"));
+            assertThatAllStartWith(datasetIds, "run-batch-etf-etf-");
+        } finally {
+            AgentContext.clear();
+        }
+    }
+
     private boolean queryIsHs300(DomesticIndexSearchRequest request) {
         return request != null && "沪深300".equals(request.getQuery());
     }
@@ -266,5 +351,16 @@ class MarketDataToolsSearchIndexTest {
     private static List<Map<String, Object>> castList(Object value) {
         assertTrue(value instanceof List<?>);
         return (List<Map<String, Object>>) value;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<String> castStringList(Object value) {
+        assertTrue(value instanceof List<?>);
+        return (List<String>) value;
+    }
+
+    private static void assertThatAllStartWith(List<String> values, String prefix) {
+        assertEquals(2, values.size());
+        assertTrue(values.stream().allMatch(value -> value.startsWith(prefix)));
     }
 }

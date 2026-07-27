@@ -75,6 +75,7 @@ public class LangchainLinearWorkflowExecutor {
                     .executionMode(PlanExecutionMode.LINEAR)
                     .maxTodos(request.getMaxTodos())
                     .build());
+            plan = LangchainWorkflowRouting.effectivePlan(plan, true);
             return executePlanned(request, plan, toolCalls, null, null);
         } catch (Exception e) {
             return LangchainLinearWorkflowResult.builder()
@@ -93,6 +94,7 @@ public class LangchainLinearWorkflowExecutor {
         AtomicInteger toolCalls = new AtomicInteger();
         try {
             applyRunContext(request);
+            plan = LangchainWorkflowRouting.effectivePlan(plan, true);
             return executePlanned(request, plan, toolCalls, null, null);
         } catch (Exception e) {
             return LangchainLinearWorkflowResult.builder()

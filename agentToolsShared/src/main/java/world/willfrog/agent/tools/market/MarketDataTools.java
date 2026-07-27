@@ -49,6 +49,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
+import java.util.function.Supplier;
 
 /**
  * 金融数据工具集，暴露给 agent 的底层金融数据查询能力。
@@ -1098,7 +1099,7 @@ public class MarketDataTools {
     private String batchIsTradingDay(List<String> dates, String exchange) {
         String normalizedExchange = normalizeExchange(exchange);
         List<CompletableFuture<Map<String, Object>>> futures = dates.stream()
-                .map(date -> CompletableFuture.supplyAsync(() -> {
+                .map(date -> supplyAsyncWithAgentContext(() -> {
                     String response = isTradingDaySingle(date, normalizedExchange);
                     Map<String, Object> payload = readJsonMap(response);
                     Map<String, Object> row = new LinkedHashMap<>();
@@ -1170,7 +1171,7 @@ public class MarketDataTools {
                                             String startDateStr,
                                             String endDateStr) {
         List<CompletableFuture<Map<String, Object>>> futures = tsCodes.stream()
-                .map(code -> CompletableFuture.supplyAsync(() -> {
+                .map(code -> supplyAsyncWithAgentContext(() -> {
                     String response = fetchListedAssetDailySingle(code, startDateStr, endDateStr, "etf", toolName);
                     Map<String, Object> payload = readJsonMap(response);
                     Map<String, Object> row = new LinkedHashMap<>();
@@ -1379,7 +1380,7 @@ public class MarketDataTools {
      */
     private String batchSearch(String toolName, List<String> queries, Function<String, String> singleCall) {
         List<CompletableFuture<Map<String, Object>>> futures = queries.stream()
-                .map(query -> CompletableFuture.supplyAsync(() -> {
+                .map(query -> supplyAsyncWithAgentContext(() -> {
                     String response = singleCall.apply(query);
                     Map<String, Object> payload = readJsonMap(response);
                     Map<String, Object> row = new LinkedHashMap<>();
@@ -1414,7 +1415,7 @@ public class MarketDataTools {
                                  String endDateStr,
                                  boolean stock) {
         List<CompletableFuture<Map<String, Object>>> futures = tsCodes.stream()
-                .map(code -> CompletableFuture.supplyAsync(() -> {
+                .map(code -> supplyAsyncWithAgentContext(() -> {
                     String response = stock
                             ? getStockDailySingle(code, startDateStr, endDateStr)
                             : getIndexDailySingle(code, startDateStr, endDateStr);
@@ -2734,7 +2735,7 @@ public class MarketDataTools {
         ExecutorService executor = Executors.newFixedThreadPool(maxConcurrency);
         try {
             List<CompletableFuture<AdvancedDailyFetchResult>> futures = stockCodes.stream()
-                    .map(code -> CompletableFuture.supplyAsync(() -> {
+                    .map(code -> supplyAsyncWithAgentContext(() -> {
                         List<String> errors = new ArrayList<>();
                         boolean acquired = false;
                         try {
@@ -2823,6 +2824,37 @@ public class MarketDataTools {
             datasetRegistry.registerDataset(datasetKind, stableTsCode, startDateStr, endDateStr, headers, datasetId, items.size());
         }
         return datasetId;
+    }
+
+    /**
+     * 把当前 run 级 {@link AgentContext} 传进批量查询工作线程。
+     *
+     * <p>Dataset 写入和 {@link DatasetRegistry} 事件发布都依赖 ThreadLocal 中的 runId。
+     * 直接使用 {@link CompletableFuture#supplyAsync(Supplier)} 时，公共线程池看不到调用线程
+     * 的上下文，于是新 dataset 会被错误命名为 {@code shared-*}，也不会发布
+     * {@code DatasetPersistedEvent}；随后 manifest 虽注册成功，却没有可挂载的成员 dataset。
+     * 所有批量查询统一通过本方法，避免搜索、日线和 advanced 路径再次出现同类漂移。</p>
+     */
+    private <T> CompletableFuture<T> supplyAsyncWithAgentContext(Supplier<T> supplier) {
+        AgentContext.ContextSnapshot snapshot = AgentContext.captureRunContext();
+        return CompletableFuture.supplyAsync(() -> callWithAgentContext(snapshot, supplier));
+    }
+
+    private <T> CompletableFuture<T> supplyAsyncWithAgentContext(Supplier<T> supplier,
+                                                                  ExecutorService executor) {
+        AgentContext.ContextSnapshot snapshot = AgentContext.captureRunContext();
+        return CompletableFuture.supplyAsync(() -> callWithAgentContext(snapshot, supplier), executor);
+    }
+
+    private <T> T callWithAgentContext(AgentContext.ContextSnapshot snapshot, Supplier<T> supplier) {
+        AgentContext.clear();
+        AgentContext.restoreRunContext(snapshot);
+        try {
+            return supplier.get();
+        } finally {
+            // 公共/复用线程池必须清理，避免把当前 run 泄漏给下一批任务。
+            AgentContext.clear();
+        }
     }
 
     /**
