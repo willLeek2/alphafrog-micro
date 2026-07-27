@@ -28,7 +28,8 @@
         (id, user_id, status, current_step, max_steps, plan_json, snapshot_json, last_error, ttl_expires_at, ext, tool_job_anchor_json)
         VALUES
         (#{id}, #{userId}, #{status}, #{currentStep}, #{maxSteps},
-         CAST(#{planJson} AS jsonb), CAST(#{snapshotJson} AS jsonb), #{lastError}, #{ttlExpiresAt}, CAST(#{ext} AS jsonb), CAST(#{toolJobAnchorJson} AS jsonb))
+         CAST(#{planJson} AS jsonb), CAST(#{snapshotJson} AS jsonb), #{lastError}, #{ttlExpiresAt}, CAST(#{ext} AS jsonb),
+         COALESCE(CAST(#{toolJobAnchorJson} AS jsonb), '{}'::jsonb))
     </insert>
 
     <select id="findById" resultMap="AgentRunResultMap">

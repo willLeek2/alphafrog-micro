@@ -223,6 +223,7 @@ class AgentEventServiceTest {
         ArgumentCaptor<AgentRun> runCaptor = ArgumentCaptor.forClass(AgentRun.class);
         verify(runMapper).insert(runCaptor.capture());
         AgentRun captured = runCaptor.getValue();
+        assertEquals("{}", captured.getToolJobAnchorJson());
         Map<?, ?> ext = objectMapper.readValue(captured.getExt(), Map.class);
         Map<?, ?> df = (Map<?, ?>) ext.get("data_freshness");
         assertEquals("2020-01-01", df.get("start_date"));

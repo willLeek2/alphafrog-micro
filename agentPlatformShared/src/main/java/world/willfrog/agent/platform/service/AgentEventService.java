@@ -215,6 +215,7 @@ public class AgentEventService {
         run.setLastError(null);
         run.setTtlExpiresAt(OffsetDateTime.now().plusMinutes(ttlMinutes));
         run.setExt(writeJson(ext));
+        run.setToolJobAnchorJson("{}");
 
         runMapper.insert(run);
         // 紧接着写入 RUN_RECEIVED 事件,保留 ext 全文作为事件 payload 便于审计
