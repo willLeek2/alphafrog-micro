@@ -6,6 +6,8 @@ import org.slf4j.LoggerFactory;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
+import world.willfrog.agent.platform.dataanalysis.DataAnalysisReservation;
+import world.willfrog.agent.platform.dataanalysis.DataAnalysisReservationState;
 import world.willfrog.agent.platform.dataanalysis.DagBlockingWorkerLease;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.dataanalysis.ToolJobRunDisposition;
@@ -117,7 +119,18 @@ public class ToolJobReconciler {
             }
             // taskId 是查询 Sandbox 的真实任务主键。
             String taskId = anchor.getTaskId();
-            if (taskId == null || taskId.isBlank()) return;
+            if (taskId == null || taskId.isBlank()) {
+                if (ToolJobRunDisposition.isDagCleanupOnly(anchor.getRunDisposition())) {
+                    if ("PREPARING".equals(anchor.getAnchorState())) {
+                        resolveCleanupPreparing(runId, anchor);
+                    } else {
+                        log.error("DAG cleanup anchor lacks taskId outside PREPARING for run={}; "
+                                + "removing hot-loop due", runId);
+                        redisCache.removeDue(runId);
+                    }
+                }
+                return;
+            }
 
             if (ToolJobRunDisposition.isDagCleanupOnly(anchor.getRunDisposition())) {
                 checkPausedTerminal(runId, anchor);
@@ -201,6 +214,68 @@ public class ToolJobReconciler {
             log.error("Failed to fetch result for taskId={}, run={}", taskId, runId, e);
             return null;
         }
+    }
+
+    private void resolveCleanupPreparing(String runId, ToolJobAnchor anchor) {
+        DataAnalysisReservation preparing;
+        try {
+            preparing = new com.fasterxml.jackson.databind.ObjectMapper()
+                    .findAndRegisterModules()
+                    .readValue(anchor.getReservationJson(), DataAnalysisReservation.class);
+        } catch (Exception invalidReservation) {
+            log.error("DAG cleanup PREPARING reservation is invalid for run={}; "
+                    + "refusing online replay", runId, invalidReservation);
+            redisCache.removeDue(runId);
+            return;
+        }
+        if (preparing == null
+                || preparing.state() != DataAnalysisReservationState.PREPARING) {
+            log.error("DAG cleanup anchor/reservation state mismatch for run={}; "
+                    + "refusing online replay", runId);
+            redisCache.removeDue(runId);
+            return;
+        }
+
+        /*
+         * ATTACHED CAS 一并保存下一次轮询时间。在线恢复只走 cleanup fence，
+         * 不得把 Run 转 WAITING_TOOL_JOB 或触发 resume launcher。
+         */
+        anchor.setNextPollAt(Instant.now().plusMillis(config.getReconcilerIntervalMs()));
+        ToolJobPreparingDispatchResolver.Resolution resolution =
+                ToolJobPreparingDispatchResolver.resolve(
+                        runId, anchor, preparing, sandboxService, anchorService);
+        if (resolution.outcome() == ToolJobPreparingDispatchResolver.Outcome.RESOLVED) {
+            redisCache.atomicWritePendingAndDue(runId, anchor);
+            return;
+        }
+        if (resolution.outcome()
+                == ToolJobPreparingDispatchResolver.Outcome.INVALID_EVIDENCE) {
+            log.error("DAG cleanup PREPARING evidence is invalid for run={}; "
+                    + "removing hot-loop due", runId);
+            redisCache.removeDue(runId);
+            return;
+        }
+        if (resolution.outcome()
+                == ToolJobPreparingDispatchResolver.Outcome.REMOTE_UNAVAILABLE) {
+            try {
+                if (anchorService.updateDagCleanup(
+                        runId,
+                        anchor,
+                        anchor.getOperationId(),
+                        anchor.getBlockingOwnerId())) {
+                    redisCache.atomicWritePendingAndDue(runId, anchor);
+                    return;
+                }
+            } catch (Exception persistenceFailure) {
+                log.warn("Failed to persist DAG PREPARING online retry for run={}",
+                        runId, persistenceFailure);
+            }
+        }
+        /*
+         * 远端/DB 暂不可用或 CAS 已由另一恢复者推进时，只补 runId due。
+         * 下一轮仍从 PG 读取最新 anchor，不信任当前对象。
+         */
+        redisCache.upsertDue(runId, anchor);
     }
 
     private void checkPausedTerminal(String runId, ToolJobAnchor anchor) {

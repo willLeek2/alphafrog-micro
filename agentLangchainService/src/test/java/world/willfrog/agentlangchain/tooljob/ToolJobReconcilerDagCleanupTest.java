@@ -1,10 +1,19 @@
 package world.willfrog.agentlangchain.tooljob;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.protobuf.util.JsonFormat;
 import org.junit.jupiter.api.Test;
+import world.willfrog.agent.platform.dataanalysis.DataAnalysisOperationIdentity;
+import world.willfrog.agent.platform.dataanalysis.DataAnalysisReservation;
+import world.willfrog.agent.platform.dataanalysis.DataAnalysisReservationState;
+import world.willfrog.agent.platform.dataanalysis.DataAnalysisResourceClass;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.dataanalysis.ToolJobRunDisposition;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.alphafrogmicro.sandbox.idl.ExecuteRequest;
+import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskByOperationIdRequest;
+import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskByOperationIdResponse;
 import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskResultRequest;
 import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskStatusRequest;
 import world.willfrog.alphafrogmicro.sandbox.idl.PythonSandboxService;
@@ -20,6 +29,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -137,6 +147,40 @@ class ToolJobReconcilerDagCleanupTest {
         verify(fixture.finalizer, never()).handleTerminal(any(), any(), any(), any(), any(Boolean.class));
     }
 
+    @Test
+    void repeatedPreparingLookupFailuresStayCleanupOnlyAndRemainScheduled() throws Exception {
+        Fixture fixture = fixture(workerLostPreparingAnchor());
+        when(fixture.anchorService.updateDagCleanup(
+                eq("run-dag"), any(), eq("run-dag:call-1:1"), eq("owner-old")))
+                .thenReturn(true);
+        when(fixture.sandbox.getTaskByOperationId(any())).thenReturn(
+                GetTaskByOperationIdResponse.newBuilder()
+                        .setFound(false)
+                        .setError("sandbox unavailable")
+                        .build());
+
+        fixture.reconciler.reconcileFromDue();
+        fixture.reconciler.reconcileFromDue();
+
+        verify(fixture.sandbox, times(2)).getTaskByOperationId(
+                any(GetTaskByOperationIdRequest.class));
+        verify(fixture.anchorService, times(2)).updateDagCleanup(
+                eq("run-dag"),
+                org.mockito.ArgumentMatchers.argThat(
+                        anchor -> "PREPARING".equals(anchor.getAnchorState())
+                                && anchor.getTaskId() == null),
+                eq("run-dag:call-1:1"),
+                eq("owner-old"));
+        verify(fixture.redisCache, times(2)).atomicWritePendingAndDue(
+                eq("run-dag"), any(ToolJobAnchor.class));
+        verify(fixture.sandbox, never()).createTask(any());
+        verify(fixture.anchorService, never()).updateActiveAndStatus(
+                any(), any(), eq(AgentRunStatus.WAITING_TOOL_JOB), any(), any());
+        verify(fixture.anchorService, never()).updateAnchor(
+                any(), any(), eq(AgentRunStatus.WAITING_TOOL_JOB));
+        verify(fixture.resumeService, never()).tryResume(any());
+    }
+
     private Fixture fixture(ToolJobAnchor anchor) throws Exception {
         ToolJobRedisCache redisCache = mock(ToolJobRedisCache.class);
         ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
@@ -171,6 +215,35 @@ class ToolJobReconcilerDagCleanupTest {
     private ToolJobAnchor workerLostAnchor() {
         ToolJobAnchor anchor = baseAnchor();
         anchor.setRunDisposition(ToolJobRunDisposition.DAG_BLOCKING_WORKER_LOST);
+        return anchor;
+    }
+
+    private ToolJobAnchor workerLostPreparingAnchor() throws Exception {
+        ObjectMapper mapper = new ObjectMapper().findAndRegisterModules();
+        DataAnalysisOperationIdentity identity =
+                new DataAnalysisOperationIdentity("run-dag", "call-1", 1);
+        DataAnalysisReservation reservation = new DataAnalysisReservation(
+                identity.reservationId(),
+                identity,
+                DataAnalysisResourceClass.STANDARD,
+                1,
+                DataAnalysisReservationState.PREPARING,
+                null,
+                Instant.now());
+        ExecuteRequest request = ExecuteRequest.newBuilder()
+                .setDatasetId("ds-dag")
+                .setCode("print(1)")
+                .setOperationId(identity.operationId())
+                .setRequestFingerprint("sha256:" + "a".repeat(64))
+                .build();
+        ToolJobAnchor anchor = baseAnchor();
+        anchor.setTaskId(null);
+        anchor.setAnchorState("PREPARING");
+        anchor.setRunDisposition(ToolJobRunDisposition.DAG_BLOCKING_WORKER_LOST);
+        anchor.setRequestFingerprint(request.getRequestFingerprint());
+        anchor.setCreateRequestJson(JsonFormat.printer().print(request));
+        anchor.setReservationJson(mapper.writeValueAsString(reservation));
+        anchor.setNextPollAt(Instant.now().minusSeconds(1));
         return anchor;
     }
 

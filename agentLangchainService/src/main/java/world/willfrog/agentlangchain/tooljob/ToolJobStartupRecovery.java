@@ -6,7 +6,6 @@ import org.slf4j.LoggerFactory;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Service;
-import com.google.protobuf.util.JsonFormat;
 import world.willfrog.agent.platform.dataanalysis.*;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.model.AgentRunStatus;
@@ -128,8 +127,43 @@ public class ToolJobStartupRecovery {
                             continue;
                         }
                     }
-                    reservation = resolvePreparingDispatch(run, anchor, reservation);
-                    if (reservation == null) {
+                    ToolJobPreparingDispatchResolver.Resolution resolution =
+                            resolvePreparingDispatch(run, anchor, reservation);
+                    if (resolution.outcome()
+                            == ToolJobPreparingDispatchResolver.Outcome.RESOLVED) {
+                        reservation = resolution.reservation();
+                    } else if (ToolJobRunDisposition.isDagCleanupOnly(
+                            anchor.getRunDisposition())
+                            && resolution.outcome()
+                            == ToolJobPreparingDispatchResolver.Outcome.REMOTE_UNAVAILABLE) {
+                        /*
+                         * takeover 已完成但远端状态暂不可决时，原 PREPARING 仍是容量真相。
+                         * 继续计账并重建在线重试 due，不能因一次 RPC 故障超卖。
+                         */
+                        durableReservations.add(reservation);
+                        scheduleDagPreparingRetry(run.getId(), anchor);
+                        continue;
+                    } else if (ToolJobRunDisposition.isDagCleanupOnly(
+                            anchor.getRunDisposition())
+                            && (resolution.outcome()
+                            == ToolJobPreparingDispatchResolver.Outcome.OWNERSHIP_LOST
+                            || resolution.outcome()
+                            == ToolJobPreparingDispatchResolver.Outcome.DURABLE_WRITE_UNCERTAIN)) {
+                        /*
+                         * 另一恢复者已经推进 durable anchor。当前快照只用于保守计账，
+                         * 不能再写回 PREPARING 覆盖 winner；runId due 会重新读取 PG。
+                         */
+                        durableReservations.add(reservation);
+                        anchor.setNextPollAt(
+                                Instant.now().plusMillis(config.getReconcilerIntervalMs()));
+                        try {
+                            redisCache.upsertDue(run.getId(), anchor);
+                        } catch (Exception redisFailure) {
+                            log.warn("Failed to rebuild winner-owned PREPARING due for run={}",
+                                    run.getId(), redisFailure);
+                        }
+                        continue;
+                    } else {
                         quarantinedRuns.add(run.getId());
                         continue;
                     }
@@ -368,7 +402,7 @@ public class ToolJobStartupRecovery {
         return anchorService.updateAnchor(runId, anchor, AgentRunStatus.WAITING_TOOL_JOB);
     }
 
-    private DataAnalysisReservation resolvePreparingDispatch(
+    private ToolJobPreparingDispatchResolver.Resolution resolvePreparingDispatch(
             AgentRun run,
             ToolJobAnchor anchor,
             DataAnalysisReservation preparing) {
@@ -382,80 +416,36 @@ public class ToolJobStartupRecovery {
         if ((run.getStatus() != AgentRunStatus.EXECUTING && !cleanupStatus)
                 || anchor.getOperationId() == null
                 || anchor.getOperationId().isBlank()) {
-            return null;
+            return ToolJobPreparingDispatchResolver.Resolution.invalidEvidence();
         }
+        return ToolJobPreparingDispatchResolver.resolve(
+                run.getId(), anchor, preparing, sandboxService, anchorService);
+    }
+
+    private void scheduleDagPreparingRetry(String runId, ToolJobAnchor anchor) {
+        anchor.setNextPollAt(Instant.now().plusMillis(config.getReconcilerIntervalMs()));
         try {
-            // 先按幂等 operationId 查询 Sandbox，覆盖 createTask 成功但本地未落 taskId 的崩溃窗口。
-            GetTaskByOperationIdResponse lookup = sandboxService.getTaskByOperationId(
-                    GetTaskByOperationIdRequest.newBuilder()
-                            .setOperationId(anchor.getOperationId()).build());
-            // taskId/fingerprint 必须成对验证，不能只凭 operationId 猜测任务。
-            String taskId = null;
-            String fingerprint = null;
-            if (lookup != null && lookup.getFound()) {
-                // 找到已创建任务时先取身份字段，后面的成对校验通过后才允许附着。
-                taskId = lookup.getTaskId();
-                fingerprint = lookup.getRequestFingerprint();
-            } else if (lookup != null && !lookup.getFound() && lookup.getError().isBlank()) {
-                /*
-                 * 只有“权威未找到且无查询错误”才允许重放。found=false + error 表示 Gateway/
-                 * Sandbox 暂时不可用，不代表服务端没有创建；此时保留 PREPARING 给下次恢复。
-                 */
-                if (anchor.getCreateRequestJson() == null || anchor.getCreateRequestJson().isBlank()) {
-                    return null;
-                }
-                // protobuf JSON 解析恢复原始创建请求。
-                ExecuteRequest.Builder request = ExecuteRequest.newBuilder();
-                JsonFormat.parser().merge(anchor.getCreateRequestJson(), request);
-                // Sandbox 以 operationId 保证重放不会创建两个逻辑任务。
-                ExecuteResponse created = sandboxService.createTask(request.build());
-                if (created == null || !created.getError().isBlank()) {
-                    return null;
-                }
-                taskId = created.getTaskId();
-                fingerprint = created.getRequestFingerprint();
-            } else {
-                // 查询不可用或响应损坏时没有否定证明，严禁重放 create。
-                return null;
+            if (persistRecoveredAnchor(runId, anchor)) {
+                redisCache.atomicWritePendingAndDue(runId, anchor);
+                return;
             }
-            // canonical operation 要求 taskId 与精确、非空 fingerprint 成对出现。
-            if (taskId == null || taskId.isBlank()
-                    || anchor.getRequestFingerprint() == null
-                    || anchor.getRequestFingerprint().isBlank()
-                    || fingerprint == null
-                    || fingerprint.isBlank()
-                    || !anchor.getRequestFingerprint().equals(fingerprint)) {
-                return null;
-            }
-            // 构造 TASK_ATTACHED reservation，保持原 reservationId/identity/units。
-            DataAnalysisReservation attached = new DataAnalysisReservation(
-                    preparing.reservationId(), preparing.identity(), preparing.resourceClass(),
-                    preparing.capacityUnits(), DataAnalysisReservationState.TASK_ATTACHED,
-                    taskId, preparing.acquiredAt());
-            // taskId、anchorState 和 reservationJson 必须在同一 CAS 中写入。
-            anchor.setTaskId(taskId);
-            anchor.setAnchorState("ATTACHED");
-            anchor.setReservationJson(new com.fasterxml.jackson.databind.ObjectMapper()
-                    .findAndRegisterModules().writeValueAsString(attached));
             /*
-             * A takeover owner must retain the worker-lost owner/disposition fence. The generic
-             * path remains unchanged for LINEAR and other non-DAG PREPARING recovery.
+             * CAS 失败通常表示另一恢复者已推进。只补 runId wake-up，让下一轮从 PG
+             * 重新读取；不能拿当前 stale anchor 再做 durable write。
              */
-            boolean persisted;
-            if (ToolJobRunDisposition.isDagCleanupOnly(anchor.getRunDisposition())) {
-                if (!hasDagBlockingIdentity(anchor)) {
-                    return null;
-                }
-                persisted = anchorService.updateDagCleanup(
-                        run.getId(), anchor, anchor.getOperationId(), anchor.getBlockingOwnerId());
-            } else {
-                persisted = anchorService.updateActive(
-                        run.getId(), anchor, AgentRunStatus.EXECUTING, anchor.getOperationId());
+            redisCache.upsertDue(runId, anchor);
+        } catch (Exception persistenceFailure) {
+            /*
+             * takeover CAS 已把 PREPARING 和 nextPollAt 写进 PG。DB/Redis 任一短暂故障
+             * 都不改变容量真相；尽力补 due，后续还有 PG rebuild。
+             */
+            log.error("Failed to persist PREPARING retry for run={}; rebuilding due only",
+                    runId, persistenceFailure);
+            try {
+                redisCache.atomicWritePendingAndDue(runId, anchor);
+            } catch (Exception redisFailure) {
+                log.error("Failed to rebuild PREPARING retry due for run={}", runId, redisFailure);
             }
-            return persisted ? attached : null;
-        } catch (Exception unresolved) {
-            log.error("Failed to resolve PREPARING dispatch for run={}", run.getId(), unresolved);
-            return null;
         }
     }
 
