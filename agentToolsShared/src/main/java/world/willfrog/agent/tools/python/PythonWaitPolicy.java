@@ -1,5 +1,7 @@
 package world.willfrog.agent.tools.python;
 
+import world.willfrog.agent.platform.dataanalysis.ToolJobRunDisposition;
+
 import java.util.Locale;
 import java.util.Optional;
 
@@ -12,7 +14,7 @@ import java.util.Optional;
 enum PythonWaitPolicy {
 
     DURABLE_SUSPEND("AUTO_RESUME", true),
-    BLOCKING_POLL("DAG_BLOCKING_NO_RESUME", false);
+    BLOCKING_POLL(ToolJobRunDisposition.DAG_BLOCKING_NO_RESUME, false);
 
     private final String runDisposition;
     private final boolean autoResume;
