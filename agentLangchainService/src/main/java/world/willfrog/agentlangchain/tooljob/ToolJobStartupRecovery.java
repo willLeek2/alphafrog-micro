@@ -91,6 +91,43 @@ public class ToolJobStartupRecovery {
                 // PREPARING 表示进程可能在 createTask 前后崩溃，需要按 operationId 查找/重放。
                 if (reservation != null
                         && reservation.state() == DataAnalysisReservationState.PREPARING) {
+                    if (ToolJobRunDisposition.isLiveDagBlocking(anchor.getRunDisposition())) {
+                        /*
+                         * DAG worker may still be inside createTask. A new process must first
+                         * respect its durable lease instead of treating PREPARING as abandoned.
+                         */
+                        if (!hasDagBlockingIdentity(anchor)) {
+                            quarantinedRuns.add(run.getId());
+                            continue;
+                        }
+                        Instant recoveryNow = Instant.now();
+                        boolean leaseExpired = DagBlockingWorkerLease.isExpired(
+                                anchor.getBlockingLeaseUntil(), recoveryNow);
+                        if (!leaseExpired) {
+                            // Future lease: restore capacity and only rebuild the expiry wake-up.
+                            try {
+                                recoverLiveDagBlocking(run.getId(), anchor, recoveryNow);
+                            } catch (Exception scheduleFailure) {
+                                /*
+                                 * Redis is only a wake-up index. Its outage must not turn a
+                                 * proven durable reservation into a capacity quarantine.
+                                 */
+                                log.error("Failed to schedule live DAG lease expiry for run={}; "
+                                                + "restoring durable PREPARING capacity",
+                                        run.getId(), scheduleFailure);
+                            }
+                            durableReservations.add(reservation);
+                            continue;
+                        }
+                        if (!recoverLiveDagBlocking(run.getId(), anchor, recoveryNow)) {
+                            /*
+                             * Another process won the takeover CAS. Keep the stale durable
+                             * reservation counted locally; the winner owns all further writes.
+                             */
+                            durableReservations.add(reservation);
+                            continue;
+                        }
+                    }
                     reservation = resolvePreparingDispatch(run, anchor, reservation);
                     if (reservation == null) {
                         quarantinedRuns.add(run.getId());
@@ -269,17 +306,22 @@ public class ToolJobStartupRecovery {
     }
 
     private boolean recoverLiveDagBlocking(String runId, ToolJobAnchor anchor) {
+        return recoverLiveDagBlocking(runId, anchor, Instant.now());
+    }
+
+    private boolean recoverLiveDagBlocking(
+            String runId,
+            ToolJobAnchor anchor,
+            Instant now) {
         if (!ToolJobRunDisposition.isLiveDagBlocking(anchor.getRunDisposition())) {
+            return false;
+        }
+        if (!hasDagBlockingIdentity(anchor)) {
+            log.error("DAG blocking anchor lacks fenced identity for run={}; refusing takeover", runId);
             return false;
         }
         String operationId = anchor.getOperationId();
         String ownerId = anchor.getBlockingOwnerId();
-        if (operationId == null || operationId.isBlank()
-                || ownerId == null || ownerId.isBlank()) {
-            log.error("DAG blocking anchor lacks fenced identity for run={}; refusing takeover", runId);
-            return false;
-        }
-        Instant now = Instant.now();
         if (!DagBlockingWorkerLease.isExpired(anchor.getBlockingLeaseUntil(), now)) {
             // Redis is only a wake-up index. Keep the durable lease untouched.
             anchor.setNextPollAt(anchor.getBlockingLeaseUntil());
@@ -305,6 +347,13 @@ public class ToolJobStartupRecovery {
         return marked;
     }
 
+    private boolean hasDagBlockingIdentity(ToolJobAnchor anchor) {
+        return anchor.getOperationId() != null
+                && !anchor.getOperationId().isBlank()
+                && anchor.getBlockingOwnerId() != null
+                && !anchor.getBlockingOwnerId().isBlank();
+    }
+
     private boolean persistRecoveredAnchor(String runId, ToolJobAnchor anchor) {
         if (ToolJobRunDisposition.isDagCleanupOnly(anchor.getRunDisposition())) {
             String operationId = anchor.getOperationId();
@@ -323,8 +372,14 @@ public class ToolJobStartupRecovery {
             AgentRun run,
             ToolJobAnchor anchor,
             DataAnalysisReservation preparing) {
-        // PREPARING 只允许附着到仍为 EXECUTING 且有 operationId 的原 Run。
-        if (run.getStatus() != AgentRunStatus.EXECUTING
+        /*
+         * Generic PREPARING recovery remains EXECUTING-only. A fenced cleanup owner may
+         * re-enter after the pipeline/control plane has already committed FAILED/CANCELED.
+         */
+        boolean cleanupStatus = ToolJobRunDisposition.isDagCleanupOnly(anchor.getRunDisposition())
+                && (run.getStatus() == AgentRunStatus.FAILED
+                || run.getStatus() == AgentRunStatus.CANCELED);
+        if ((run.getStatus() != AgentRunStatus.EXECUTING && !cleanupStatus)
                 || anchor.getOperationId() == null
                 || anchor.getOperationId().isBlank()) {
             return null;
@@ -382,10 +437,22 @@ public class ToolJobStartupRecovery {
             anchor.setAnchorState("ATTACHED");
             anchor.setReservationJson(new com.fasterxml.jackson.databind.ObjectMapper()
                     .findAndRegisterModules().writeValueAsString(attached));
-            // operationId 条件确保只推进仍属于本次 PREPARING 的 anchor。
-            return anchorService.updateActive(
-                    run.getId(), anchor, AgentRunStatus.EXECUTING, anchor.getOperationId())
-                    ? attached : null;
+            /*
+             * A takeover owner must retain the worker-lost owner/disposition fence. The generic
+             * path remains unchanged for LINEAR and other non-DAG PREPARING recovery.
+             */
+            boolean persisted;
+            if (ToolJobRunDisposition.isDagCleanupOnly(anchor.getRunDisposition())) {
+                if (!hasDagBlockingIdentity(anchor)) {
+                    return null;
+                }
+                persisted = anchorService.updateDagCleanup(
+                        run.getId(), anchor, anchor.getOperationId(), anchor.getBlockingOwnerId());
+            } else {
+                persisted = anchorService.updateActive(
+                        run.getId(), anchor, AgentRunStatus.EXECUTING, anchor.getOperationId());
+            }
+            return persisted ? attached : null;
         } catch (Exception unresolved) {
             log.error("Failed to resolve PREPARING dispatch for run={}", run.getId(), unresolved);
             return null;

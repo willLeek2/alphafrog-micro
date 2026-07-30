@@ -3,6 +3,7 @@ package world.willfrog.agentlangchain.tooljob;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisAdmissionState;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisCapacityRecoveryReport;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisCapacityService;
@@ -15,11 +16,7 @@ import world.willfrog.agent.platform.dataanalysis.ToolJobRunDisposition;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.tools.python.DataAnalysisCapacityProperties;
-import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskResultRequest;
-import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskStatusRequest;
-import world.willfrog.alphafrogmicro.sandbox.idl.PythonSandboxService;
-import world.willfrog.alphafrogmicro.sandbox.idl.TaskResultResponse;
-import world.willfrog.alphafrogmicro.sandbox.idl.TaskStatusResponse;
+import world.willfrog.alphafrogmicro.sandbox.idl.*;
 
 import java.lang.reflect.Field;
 import java.time.Instant;
@@ -30,6 +27,8 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -128,6 +127,144 @@ class ToolJobStartupDagCleanupRecoveryTest {
         verify(fixture.resumeService, never()).tryResume(any());
     }
 
+    @Test
+    void futureDagPreparingRestoresCapacityWithoutResolvingOrQuarantining() throws Exception {
+        Instant leaseUntil = Instant.now().plusSeconds(60);
+        Fixture fixture = fixture(
+                "RUNNING",
+                dagPreparingAnchor(ToolJobRunDisposition.DAG_BLOCKING_NO_RESUME, leaseUntil));
+
+        fixture.recovery.onReady();
+
+        ArgumentCaptor<List<DataAnalysisReservation>> recovered =
+                ArgumentCaptor.forClass(List.class);
+        verify(fixture.capacity).recover(recovered.capture(), anyInt(), anyInt());
+        assertThat(recovered.getValue()).singleElement().satisfies(reservation -> {
+            assertThat(reservation.state()).isEqualTo(DataAnalysisReservationState.PREPARING);
+            assertThat(reservation.taskId()).isNull();
+        });
+        verify(fixture.sandbox, never()).getTaskByOperationId(any());
+        verify(fixture.sandbox, never()).createTask(any());
+        verify(fixture.anchorService, never()).promoteExpiredDagBlockingWorkerLost(
+                any(), any(), any(), any());
+        verify(fixture.anchorService, never()).updateAnchor(any(), any(), any());
+        verify(fixture.anchorService, never()).updateAnchorAndStatus(any(), any(), any(), any());
+        verify(fixture.anchorService, never()).updateActive(any(), any(), any(), any());
+        verify(fixture.anchorService, never()).updateActiveAndStatus(
+                any(), any(), any(), any(), any());
+        verify(fixture.anchorService, never()).updateDagCleanup(any(), any(), any(), any());
+        verify(fixture.redisCache, org.mockito.Mockito.atLeastOnce())
+                .atomicWritePendingAndDue(
+                        eq("run-dag"),
+                        org.mockito.ArgumentMatchers.argThat(
+                                anchor -> leaseUntil.equals(anchor.getNextPollAt())));
+    }
+
+    @Test
+    void futureDagPreparingRedisFailureStillRestoresCapacityWithoutQuarantine() throws Exception {
+        Fixture fixture = fixture(
+                "RUNNING",
+                dagPreparingAnchor(
+                        ToolJobRunDisposition.DAG_BLOCKING_NO_RESUME,
+                        Instant.now().plusSeconds(60)));
+        doThrow(new IllegalStateException("redis unavailable"))
+                .when(fixture.redisCache)
+                .atomicWritePendingAndDue(eq("run-dag"), any(ToolJobAnchor.class));
+
+        fixture.recovery.onReady();
+
+        ArgumentCaptor<List<DataAnalysisReservation>> recovered =
+                ArgumentCaptor.forClass(List.class);
+        verify(fixture.capacity).recover(recovered.capture(), anyInt(), anyInt());
+        assertThat(recovered.getValue()).singleElement().satisfies(reservation ->
+                assertThat(reservation.state()).isEqualTo(DataAnalysisReservationState.PREPARING));
+        verify(fixture.sandbox, never()).getTaskByOperationId(any());
+        verify(fixture.sandbox, never()).createTask(any());
+        verify(fixture.anchorService, never()).promoteExpiredDagBlockingWorkerLost(
+                any(), any(), any(), any());
+        verify(fixture.anchorService, never()).updateActive(any(), any(), any(), any());
+        verify(fixture.anchorService, never()).updateDagCleanup(any(), any(), any(), any());
+    }
+
+    @Test
+    void expiredDagPreparingTakesOverBeforeResolvingAndUsesCleanupFence() throws Exception {
+        Fixture fixture = fixture(
+                "RUNNING",
+                dagPreparingAnchor(
+                        ToolJobRunDisposition.DAG_BLOCKING_NO_RESUME,
+                        Instant.now().minusSeconds(5)));
+        when(fixture.sandbox.getTaskByOperationId(any())).thenReturn(
+                GetTaskByOperationIdResponse.newBuilder()
+                        .setFound(true)
+                        .setTaskId("task-recovered")
+                        .setRequestFingerprint("sha256:" + "a".repeat(64))
+                        .build());
+
+        fixture.recovery.onReady();
+
+        InOrder takeoverOrder = inOrder(fixture.anchorService, fixture.sandbox);
+        takeoverOrder.verify(fixture.anchorService).promoteExpiredDagBlockingWorkerLost(
+                eq("run-dag"), any(ToolJobAnchor.class),
+                eq("run-dag:call-1:1"), eq("owner-old"));
+        takeoverOrder.verify(fixture.sandbox).getTaskByOperationId(
+                org.mockito.ArgumentMatchers.argThat(
+                        request -> "run-dag:call-1:1".equals(request.getOperationId())));
+        takeoverOrder.verify(fixture.anchorService).updateDagCleanup(
+                eq("run-dag"),
+                org.mockito.ArgumentMatchers.argThat(
+                        anchor -> "task-recovered".equals(anchor.getTaskId())
+                                && "ATTACHED".equals(anchor.getAnchorState())
+                                && ToolJobRunDisposition.DAG_BLOCKING_WORKER_LOST.equals(
+                                anchor.getRunDisposition())),
+                eq("run-dag:call-1:1"),
+                eq("owner-old"));
+
+        ArgumentCaptor<List<DataAnalysisReservation>> recovered =
+                ArgumentCaptor.forClass(List.class);
+        verify(fixture.capacity).recover(recovered.capture(), anyInt(), anyInt());
+        assertThat(recovered.getValue()).singleElement().satisfies(reservation -> {
+            assertThat(reservation.state()).isEqualTo(DataAnalysisReservationState.TASK_ATTACHED);
+            assertThat(reservation.taskId()).isEqualTo("task-recovered");
+        });
+        verify(fixture.anchorService, never()).updateActive(any(), any(), any(), any());
+        verify(fixture.anchorService, never()).updateActiveAndStatus(
+                any(), any(), eq(AgentRunStatus.WAITING_TOOL_JOB),
+                eq(AgentRunStatus.EXECUTING), any());
+    }
+
+    @Test
+    void failedDagCleanupPreparingReentersResolveUsingCleanupFence() throws Exception {
+        Fixture fixture = fixture(
+                "RUNNING",
+                dagPreparingAnchor(
+                        ToolJobRunDisposition.DAG_BLOCKING_WORKER_LOST,
+                        Instant.now().minusSeconds(5)),
+                AgentRunStatus.FAILED);
+        when(fixture.sandbox.getTaskByOperationId(any())).thenReturn(
+                GetTaskByOperationIdResponse.newBuilder()
+                        .setFound(true)
+                        .setTaskId("task-recovered")
+                        .setRequestFingerprint("sha256:" + "a".repeat(64))
+                        .build());
+
+        fixture.recovery.onReady();
+
+        verify(fixture.sandbox).getTaskByOperationId(
+                org.mockito.ArgumentMatchers.argThat(
+                        request -> "run-dag:call-1:1".equals(request.getOperationId())));
+        verify(fixture.anchorService, org.mockito.Mockito.atLeastOnce()).updateDagCleanup(
+                eq("run-dag"),
+                org.mockito.ArgumentMatchers.argThat(
+                        anchor -> "task-recovered".equals(anchor.getTaskId())
+                                && "ATTACHED".equals(anchor.getAnchorState())),
+                eq("run-dag:call-1:1"),
+                eq("owner-old"));
+        verify(fixture.anchorService, never()).updateActive(any(), any(), any(), any());
+        verify(fixture.anchorService, never()).updateActiveAndStatus(
+                any(), any(), eq(AgentRunStatus.WAITING_TOOL_JOB),
+                any(), any());
+    }
+
     private Fixture fixture(String sandboxStatus) throws Exception {
         return fixture(
                 sandboxStatus,
@@ -143,6 +280,21 @@ class ToolJobStartupDagCleanupRecoveryTest {
             String sandboxStatus,
             String runDisposition,
             Instant leaseUntil) throws Exception {
+        ToolJobAnchor anchor = dagAnchor(runDisposition);
+        anchor.setBlockingLeaseUntil(leaseUntil);
+        return fixture(sandboxStatus, anchor);
+    }
+
+    private Fixture fixture(
+            String sandboxStatus,
+            ToolJobAnchor anchor) throws Exception {
+        return fixture(sandboxStatus, anchor, AgentRunStatus.EXECUTING);
+    }
+
+    private Fixture fixture(
+            String sandboxStatus,
+            ToolJobAnchor anchor,
+            AgentRunStatus runStatus) throws Exception {
         ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
         ToolJobRedisCache redisCache = mock(ToolJobRedisCache.class);
         DataAnalysisCapacityService capacity = mock(DataAnalysisCapacityService.class);
@@ -157,9 +309,7 @@ class ToolJobStartupDagCleanupRecoveryTest {
 
         AgentRun run = new AgentRun();
         run.setId("run-dag");
-        run.setStatus(AgentRunStatus.EXECUTING);
-        ToolJobAnchor anchor = dagAnchor(runDisposition);
-        anchor.setBlockingLeaseUntil(leaseUntil);
+        run.setStatus(runStatus);
         when(anchorService.listActive(200)).thenReturn(List.of(run));
         when(anchorService.listResumeReady(200)).thenReturn(List.of());
         when(anchorService.loadAnchor("run-dag")).thenReturn(anchor);
@@ -176,7 +326,7 @@ class ToolJobStartupDagCleanupRecoveryTest {
         when(sandbox.getTaskStatus(any(GetTaskStatusRequest.class))).thenReturn(
                 TaskStatusResponse.newBuilder().setStatus(sandboxStatus).build());
         return new Fixture(
-                recovery, anchorService, redisCache, finalizer, resumeService, sandbox);
+                recovery, anchorService, redisCache, capacity, finalizer, resumeService, sandbox);
     }
 
     private ToolJobAnchor dagAnchor(String runDisposition) throws Exception {
@@ -206,6 +356,43 @@ class ToolJobStartupDagCleanupRecoveryTest {
         return anchor;
     }
 
+    private ToolJobAnchor dagPreparingAnchor(
+            String runDisposition,
+            Instant leaseUntil) throws Exception {
+        ObjectMapper mapper = new ObjectMapper().findAndRegisterModules();
+        DataAnalysisOperationIdentity identity =
+                new DataAnalysisOperationIdentity("run-dag", "call-1", 1);
+        DataAnalysisReservation reservation = new DataAnalysisReservation(
+                identity.reservationId(),
+                identity,
+                DataAnalysisResourceClass.STANDARD,
+                1,
+                DataAnalysisReservationState.PREPARING,
+                null,
+                Instant.now());
+        ExecuteRequest request = ExecuteRequest.newBuilder()
+                .setDatasetId("ds-dag")
+                .setCode("print(1)")
+                .setOperationId(identity.operationId())
+                .setRequestFingerprint("sha256:" + "a".repeat(64))
+                .build();
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId(identity.operationId());
+        anchor.setToolCallId(identity.toolCallId());
+        anchor.setAttempt(identity.attempt());
+        anchor.setBlockingOwnerId("owner-old");
+        anchor.setBlockingLeaseUntil(leaseUntil);
+        anchor.setRequestFingerprint(request.getRequestFingerprint());
+        anchor.setCreateRequestJson(com.google.protobuf.util.JsonFormat.printer().print(request));
+        anchor.setAnchorState("PREPARING");
+        anchor.setRunDisposition(runDisposition);
+        anchor.setAutoResume(false);
+        anchor.setReservationJson(mapper.writeValueAsString(reservation));
+        anchor.setNextPollAt(Instant.now().minusSeconds(1));
+        anchor.setTimeoutAt(Instant.now().plusSeconds(60));
+        return anchor;
+    }
+
     private static void inject(Object target, String fieldName, Object value) throws Exception {
         Field field = target.getClass().getDeclaredField(fieldName);
         field.setAccessible(true);
@@ -216,6 +403,7 @@ class ToolJobStartupDagCleanupRecoveryTest {
             ToolJobStartupRecovery recovery,
             ToolJobAnchorService anchorService,
             ToolJobRedisCache redisCache,
+            DataAnalysisCapacityService capacity,
             ToolJobFinalizer finalizer,
             ToolJobResumeService resumeService,
             PythonSandboxService sandbox) {
