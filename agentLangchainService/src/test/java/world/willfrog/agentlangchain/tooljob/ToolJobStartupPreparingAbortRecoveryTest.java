@@ -52,12 +52,28 @@ class ToolJobStartupPreparingAbortRecoveryTest {
         when(anchorService.loadAnchor("run-abort")).thenReturn(aborting);
         when(capacityService.releaseReservation(any()))
                 .thenReturn(DataAnalysisReleaseOutcome.NOT_FOUND);
+        when(anchorService.claimLiveDagBlockingPreparingAbortCleanup(
+                eq("run-abort"),
+                any(ToolJobAnchor.class),
+                eq("run-abort:call-1:1"),
+                eq("worker-old"),
+                eq(aborting.getBlockingLeaseUntil()))).thenReturn(true);
+        when(redisCache.claimPreparingAbortCleanupIndexes(
+                eq("run-abort"), eq(aborting), any(ToolJobAnchor.class)))
+                .thenReturn(ToolJobRedisCache.OwnedIndexClaimResult.CLAIMED);
+        when(redisCache.removePendingAndDueIfMatches(
+                eq("run-abort"),
+                eq("run-abort:call-1:1"),
+                eq(ToolJobRunDisposition.DAG_BLOCKING_PREPARING_ABORT),
+                contains("/abort-cleanup/"),
+                any(Instant.class)))
+                .thenReturn(ToolJobRedisCache.OwnedIndexDeleteResult.REMOVED);
         when(anchorService.completeLiveDagBlockingPreparingAbort(
                 eq("run-abort"),
                 eq(AgentRunStatus.EXECUTING),
                 eq("run-abort:call-1:1"),
-                eq("worker-old"),
-                eq(aborting.getBlockingLeaseUntil())))
+                contains("/abort-cleanup/"),
+                any(Instant.class)))
                 .thenReturn(true);
         when(capacityService.recover(any(), anyInt(), anyInt()))
                 .thenReturn(new DataAnalysisCapacityRecoveryReport(
@@ -89,8 +105,8 @@ class ToolJobStartupPreparingAbortRecoveryTest {
                 eq("run-abort"),
                 eq(AgentRunStatus.EXECUTING),
                 eq("run-abort:call-1:1"),
-                eq("worker-old"),
-                eq(aborting.getBlockingLeaseUntil()));
+                contains("/abort-cleanup/"),
+                any(Instant.class));
         verify(capacityService).recover(eq(List.of()), anyInt(), anyInt());
         verifyNoInteractions(sandbox);
         verify(anchorService, never()).updateActiveAndStatus(
@@ -128,9 +144,9 @@ class ToolJobStartupPreparingAbortRecoveryTest {
                 .thenReturn(staleAbort, winner);
         when(capacityService.releaseReservation(any()))
                 .thenReturn(DataAnalysisReleaseOutcome.RELEASED);
-        when(anchorService.completeLiveDagBlockingPreparingAbort(
+        when(anchorService.claimLiveDagBlockingPreparingAbortCleanup(
                 eq("run-abort"),
-                eq(AgentRunStatus.EXECUTING),
+                any(ToolJobAnchor.class),
                 eq("run-abort:call-1:1"),
                 eq("worker-old"),
                 eq(staleAbort.getBlockingLeaseUntil())))

@@ -96,20 +96,15 @@ public class ToolJobStartupRecovery {
                                     run.getId(),
                                     anchor,
                                     capacityService,
-                                    anchorService);
+                                    anchorService,
+                                    redisCache);
                     if (outcome
                             == ToolJobPreparingAbortRecoveryService.Outcome.COMPLETED) {
-                        removeRecoveredAbortIndexes(run.getId());
                         continue;
                     }
                     if (outcome
                             == ToolJobPreparingAbortRecoveryService.Outcome.CLEAR_PENDING) {
-                        schedulePreparingAbortRetry(run.getId(), anchor);
                         continue;
-                    }
-                    if (outcome
-                            == ToolJobPreparingAbortRecoveryService.Outcome.RETRYABLE) {
-                        schedulePreparingAbortRetry(run.getId(), anchor);
                     }
                     if (outcome
                             == ToolJobPreparingAbortRecoveryService.Outcome.OWNERSHIP_LOST) {
@@ -552,14 +547,13 @@ public class ToolJobStartupRecovery {
                         runId,
                         anchor,
                         capacityService,
-                        anchorService);
+                        anchorService,
+                        redisCache);
         if (outcome == ToolJobPreparingAbortRecoveryService.Outcome.COMPLETED) {
-            removeRecoveredAbortIndexes(runId);
             return;
         }
         if (outcome == ToolJobPreparingAbortRecoveryService.Outcome.CLEAR_PENDING
                 || outcome == ToolJobPreparingAbortRecoveryService.Outcome.RETRYABLE) {
-            schedulePreparingAbortRetry(runId, anchor);
             return;
         }
         if (outcome == ToolJobPreparingAbortRecoveryService.Outcome.OWNERSHIP_LOST) {
@@ -570,33 +564,6 @@ public class ToolJobStartupRecovery {
         log.error("Durable DAG PREPARING abort cannot be recovered for run={}, outcome={}; "
                         + "retaining PostgreSQL anchor without Sandbox/resume",
                 runId, outcome);
-        try {
-            redisCache.removeDue(runId);
-        } catch (Exception cacheFailure) {
-            log.warn("Failed to remove invalid PREPARING abort due for run={}",
-                    runId, cacheFailure);
-        }
-    }
-
-    private void schedulePreparingAbortRetry(String runId, ToolJobAnchor anchor) {
-        anchor.setNextPollAt(
-                Instant.now().plusMillis(config.getReconcilerIntervalMs()));
-        try {
-            redisCache.upsertDue(runId, anchor);
-        } catch (Exception cacheFailure) {
-            log.warn("Failed to schedule PREPARING abort retry for run={}",
-                    runId, cacheFailure);
-        }
-    }
-
-    private void removeRecoveredAbortIndexes(String runId) {
-        try {
-            redisCache.removeDue(runId);
-            redisCache.deletePendingCache(runId);
-        } catch (Exception cacheFailure) {
-            log.warn("Failed to clear recovered PREPARING abort Redis indexes for run={}",
-                    runId, cacheFailure);
-        }
     }
 
 }

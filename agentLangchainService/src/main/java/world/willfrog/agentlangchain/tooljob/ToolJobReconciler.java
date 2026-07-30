@@ -376,17 +376,13 @@ public class ToolJobReconciler {
                         runId,
                         anchor,
                         capacityService,
-                        anchorService);
+                        anchorService,
+                        redisCache);
         if (outcome == ToolJobPreparingAbortRecoveryService.Outcome.COMPLETED) {
-            redisCache.removeDue(runId);
-            redisCache.deletePendingCache(runId);
             return;
         }
         if (outcome == ToolJobPreparingAbortRecoveryService.Outcome.CLEAR_PENDING
                 || outcome == ToolJobPreparingAbortRecoveryService.Outcome.RETRYABLE) {
-            anchor.setNextPollAt(
-                    Instant.now().plusMillis(config.getReconcilerIntervalMs()));
-            redisCache.upsertDue(runId, anchor);
             return;
         }
         if (outcome == ToolJobPreparingAbortRecoveryService.Outcome.OWNERSHIP_LOST) {
@@ -397,6 +393,5 @@ public class ToolJobReconciler {
         log.error("DAG PREPARING abort retained for run={}, outcome={}; "
                         + "no Sandbox lookup or workflow resume is allowed",
                 runId, outcome);
-        redisCache.removeDue(runId);
     }
 }

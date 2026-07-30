@@ -377,8 +377,38 @@
     </update>
 
     <!--
-        容量释放后清理 durable abort intent。ABORTING 已经脱离 live lease 竞争，因此只要求
-        精确身份/lease 与 RELEASED 证明，不要求 lease 仍在未来；进程可在 begin 后崩溃重入。
+        容量释放后先取得 Redis 清理的 durable 独占权。ABORTING 可直接 claim；
+        CLEARING 只有租约已按 PostgreSQL 时间过期才可 takeover。新 owner/lease 写入
+        toolJobAnchorJson，claimPreparing 在 CLEARING 期间仍被 PG anchor 阻挡。
+    -->
+    <update id="claimLiveDagBlockingPreparingAbortCleanup">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = CAST(#{toolJobAnchorJson} AS jsonb),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status IN ('EXECUTING', 'FAILED', 'CANCELED')
+          AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{expectedOperationId}
+          AND tool_job_anchor_json -&gt;&gt; 'runDisposition' = 'DAG_BLOCKING_PREPARING_ABORT'
+          AND COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true) = false
+          AND tool_job_anchor_json -&gt;&gt; 'blockingOwnerId' = #{expectedOwnerId}
+          AND tool_job_anchor_json -&gt;&gt; 'blockingLeaseUntil' = #{expectedLeaseUntil}
+          AND (
+                (tool_job_anchor_json -&gt;&gt; 'reservationJson')::jsonb
+                    -&gt;&gt; 'state'
+              ) = 'RELEASED'
+          AND (
+                tool_job_anchor_json -&gt;&gt; 'anchorState' = 'ABORTING'
+                OR (
+                    tool_job_anchor_json -&gt;&gt; 'anchorState' = 'CLEARING'
+                    AND (
+                        tool_job_anchor_json -&gt;&gt; 'blockingLeaseUntil'
+                    )::timestamptz &lt;= CURRENT_TIMESTAMP
+                )
+              )
+    </update>
+
+    <!--
+        Redis 清理后再清 durable abort intent。只有当前 CLEARING token/lease 可以完成；
         pipeline/control 若先推进 FAILED/CANCELED，只清 anchor，不覆盖业务终态。
     -->
     <update id="completeLiveDagBlockingPreparingAbort">
@@ -388,7 +418,7 @@
         WHERE id = #{id}
           AND status IN ('EXECUTING', 'FAILED', 'CANCELED')
           AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{expectedOperationId}
-          AND tool_job_anchor_json -&gt;&gt; 'anchorState' = 'ABORTING'
+          AND tool_job_anchor_json -&gt;&gt; 'anchorState' = 'CLEARING'
           AND tool_job_anchor_json -&gt;&gt; 'runDisposition' = 'DAG_BLOCKING_PREPARING_ABORT'
           AND COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true) = false
           AND tool_job_anchor_json -&gt;&gt; 'blockingOwnerId' = #{expectedOwnerId}

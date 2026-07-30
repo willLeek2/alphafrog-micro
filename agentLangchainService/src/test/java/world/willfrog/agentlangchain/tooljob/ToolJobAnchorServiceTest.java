@@ -215,6 +215,33 @@ class ToolJobAnchorServiceTest {
     }
 
     @Test
+    void shouldBindOldOwnerAndLeaseWhenClaimingAbortCleanup() {
+        ToolJobAnchor cleanup = new ToolJobAnchor();
+        cleanup.setAnchorState("CLEARING");
+        Instant expectedLease = Instant.parse("2026-07-30T07:00:00Z");
+        when(agentRunMapper.claimLiveDagBlockingPreparingAbortCleanup(
+                eq("run-1"),
+                anyString(),
+                eq("run-1:tc-1:1"),
+                eq("worker-a"),
+                eq(expectedLease.toString()))).thenReturn(1);
+
+        assertThat(anchorService.claimLiveDagBlockingPreparingAbortCleanup(
+                "run-1",
+                cleanup,
+                "run-1:tc-1:1",
+                "worker-a",
+                expectedLease)).isTrue();
+
+        verify(agentRunMapper).claimLiveDagBlockingPreparingAbortCleanup(
+                eq("run-1"),
+                anyString(),
+                eq("run-1:tc-1:1"),
+                eq("worker-a"),
+                eq(expectedLease.toString()));
+    }
+
+    @Test
     void shouldRejectLiveDagPreparingAbortWithoutLease() {
         assertThat(anchorService.beginLiveDagBlockingPreparingAbort(
                 "run-1", new ToolJobAnchor(), AgentRunStatus.EXECUTING,
@@ -222,11 +249,16 @@ class ToolJobAnchorServiceTest {
         assertThat(anchorService.completeLiveDagBlockingPreparingAbort(
                 "run-1", AgentRunStatus.EXECUTING,
                 "run-1:tc-1:1", "worker-a", null)).isFalse();
+        assertThat(anchorService.claimLiveDagBlockingPreparingAbortCleanup(
+                "run-1", new ToolJobAnchor(),
+                "run-1:tc-1:1", "worker-a", null)).isFalse();
 
         verify(agentRunMapper, never()).beginLiveDagBlockingPreparingAbort(
                 anyString(), anyString(), any(), anyString(), anyString(), anyString());
         verify(agentRunMapper, never()).completeLiveDagBlockingPreparingAbort(
                 anyString(), any(), anyString(), anyString(), anyString());
+        verify(agentRunMapper, never()).claimLiveDagBlockingPreparingAbortCleanup(
+                anyString(), anyString(), anyString(), anyString(), anyString());
     }
 
     // ---- CAS predicate binding tests (verify SQL WHERE clause arguments) ----

@@ -162,21 +162,49 @@ class PythonSandboxDispatchStoreImplTest {
     }
 
     @Test
-    void dagPreparingAbortCompletionIsReentrantAfterLeaseExpiry() {
+    void dagPreparingAbortCompletionUsesDurableCleanupAndRedisFences() {
         ToolJobAnchor anchor = liveDagAnchor("ABORTING");
         Instant expectedLease = anchor.getBlockingLeaseUntil();
         anchor.setRunDisposition("DAG_BLOCKING_PREPARING_ABORT");
+        anchor.setReservationJson("""
+                {"reservationId":"run-1:call-1:1",
+                 "identity":{"runId":"run-1","toolCallId":"call-1","attempt":1},
+                 "resourceClass":"STANDARD","capacityUnits":1,"state":"RELEASED",
+                 "taskId":null,"acquiredAt":"2026-07-30T07:00:00Z"}
+                """);
+        when(anchorService.claimLiveDagBlockingPreparingAbortCleanup(
+                eq("run-1"),
+                any(ToolJobAnchor.class),
+                eq("run-1:call-1:1"),
+                eq("worker-a"),
+                eq(expectedLease))).thenReturn(true);
+        when(redisCache.claimPreparingAbortCleanupIndexes(
+                eq("run-1"), eq(anchor), any(ToolJobAnchor.class)))
+                .thenReturn(ToolJobRedisCache.OwnedIndexClaimResult.CLAIMED);
+        when(redisCache.removePendingAndDueIfMatches(
+                eq("run-1"),
+                eq("run-1:call-1:1"),
+                eq("DAG_BLOCKING_PREPARING_ABORT"),
+                contains("/abort-cleanup/"),
+                any(Instant.class)))
+                .thenReturn(ToolJobRedisCache.OwnedIndexDeleteResult.REMOVED);
         when(anchorService.completeLiveDagBlockingPreparingAbort(
-                "run-1", AgentRunStatus.EXECUTING,
-                "run-1:call-1:1", "worker-a", expectedLease))
+                eq("run-1"),
+                eq(AgentRunStatus.EXECUTING),
+                eq("run-1:call-1:1"),
+                contains("/abort-cleanup/"),
+                any(Instant.class)))
                 .thenReturn(true);
 
         assertThat(store.completeDagBlockingPreparingAbort(
                 "run-1", anchor, expectedLease)).isTrue();
 
         verify(anchorService).completeLiveDagBlockingPreparingAbort(
-                "run-1", AgentRunStatus.EXECUTING,
-                "run-1:call-1:1", "worker-a", expectedLease);
+                eq("run-1"),
+                eq(AgentRunStatus.EXECUTING),
+                eq("run-1:call-1:1"),
+                contains("/abort-cleanup/"),
+                any(Instant.class));
     }
 
     @Test

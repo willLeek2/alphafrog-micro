@@ -31,6 +31,7 @@ import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.contains;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -261,11 +262,29 @@ class ToolJobReconcilerDagCleanupTest {
         Fixture fixture = fixture(preparingAbortAnchor());
         when(fixture.capacityService.releaseReservation(any()))
                 .thenReturn(DataAnalysisReleaseOutcome.ALREADY_RELEASED);
+        when(fixture.anchorService.claimLiveDagBlockingPreparingAbortCleanup(
+                eq("run-dag"),
+                any(ToolJobAnchor.class),
+                eq("run-dag:call-1:1"),
+                eq("owner-old"),
+                any(Instant.class))).thenReturn(true);
+        when(fixture.redisCache.claimPreparingAbortCleanupIndexes(
+                eq("run-dag"),
+                any(ToolJobAnchor.class),
+                any(ToolJobAnchor.class)))
+                .thenReturn(ToolJobRedisCache.OwnedIndexClaimResult.CLAIMED);
+        when(fixture.redisCache.removePendingAndDueIfMatches(
+                eq("run-dag"),
+                eq("run-dag:call-1:1"),
+                eq(ToolJobRunDisposition.DAG_BLOCKING_PREPARING_ABORT),
+                contains("/abort-cleanup/"),
+                any(Instant.class)))
+                .thenReturn(ToolJobRedisCache.OwnedIndexDeleteResult.REMOVED);
         when(fixture.anchorService.completeLiveDagBlockingPreparingAbort(
                 eq("run-dag"),
                 eq(AgentRunStatus.EXECUTING),
                 eq("run-dag:call-1:1"),
-                eq("owner-old"),
+                contains("/abort-cleanup/"),
                 any(Instant.class))).thenReturn(true);
 
         fixture.reconciler.reconcileFromDue();
@@ -279,10 +298,18 @@ class ToolJobReconcilerDagCleanupTest {
                 eq("run-dag"),
                 eq(AgentRunStatus.EXECUTING),
                 eq("run-dag:call-1:1"),
-                eq("owner-old"),
+                contains("/abort-cleanup/"),
                 any(Instant.class));
-        verify(fixture.redisCache).removeDue("run-dag");
-        verify(fixture.redisCache).deletePendingCache("run-dag");
+        verify(fixture.redisCache).claimPreparingAbortCleanupIndexes(
+                eq("run-dag"),
+                any(ToolJobAnchor.class),
+                any(ToolJobAnchor.class));
+        verify(fixture.redisCache).removePendingAndDueIfMatches(
+                eq("run-dag"),
+                eq("run-dag:call-1:1"),
+                eq(ToolJobRunDisposition.DAG_BLOCKING_PREPARING_ABORT),
+                contains("/abort-cleanup/"),
+                any(Instant.class));
         verifyNoInteractions(fixture.sandbox);
         verify(fixture.finalizer, never()).handleTerminal(
                 any(), any(), any(), any(), any(Boolean.class));
@@ -302,9 +329,9 @@ class ToolJobReconcilerDagCleanupTest {
                 .thenReturn(staleAbort, winner);
         when(fixture.capacityService.releaseReservation(any()))
                 .thenReturn(DataAnalysisReleaseOutcome.RELEASED);
-        when(fixture.anchorService.completeLiveDagBlockingPreparingAbort(
+        when(fixture.anchorService.claimLiveDagBlockingPreparingAbortCleanup(
                 eq("run-dag"),
-                eq(AgentRunStatus.EXECUTING),
+                any(ToolJobAnchor.class),
                 eq("run-dag:call-1:1"),
                 eq("owner-old"),
                 any(Instant.class))).thenReturn(false);

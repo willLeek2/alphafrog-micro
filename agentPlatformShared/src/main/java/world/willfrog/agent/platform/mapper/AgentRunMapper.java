@@ -159,7 +159,18 @@ public interface AgentRunMapper {
             @Param("expectedLeaseUntil") String expectedLeaseUntil);
 
     /**
-     * 幂等容量释放后，按 operation/owner/lease/ABORTING disposition 清除 durable abort anchor。
+     * 幂等容量释放后，先把 ABORTING（或租约已过期的 CLEARING）推进到独占 CLEARING。
+     * 只有赢得该 CAS 的恢复者可以清理 Redis 派生索引。
+     */
+    int claimLiveDagBlockingPreparingAbortCleanup(
+            @Param("id") String id,
+            @Param("toolJobAnchorJson") String toolJobAnchorJson,
+            @Param("expectedOperationId") String expectedOperationId,
+            @Param("expectedOwnerId") String expectedOwnerId,
+            @Param("expectedLeaseUntil") String expectedLeaseUntil);
+
+    /**
+     * Redis 清理完成后，按 operation/owner/lease/CLEARING disposition 清除 durable abort anchor。
      */
     int completeLiveDagBlockingPreparingAbort(
             @Param("id") String id,

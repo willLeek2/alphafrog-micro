@@ -134,6 +134,23 @@ public class ToolJobAnchorService {
                 expectedLeaseUntil.toString()) == 1;
     }
 
+    public boolean claimLiveDagBlockingPreparingAbortCleanup(
+            String runId,
+            ToolJobAnchor cleanupAnchor,
+            String operationId,
+            String expectedOwnerId,
+            Instant expectedLeaseUntil) {
+        if (expectedLeaseUntil == null) {
+            return false;
+        }
+        return agentRunMapper.claimLiveDagBlockingPreparingAbortCleanup(
+                runId,
+                cleanupAnchor.toJson(),
+                operationId,
+                expectedOwnerId,
+                expectedLeaseUntil.toString()) == 1;
+    }
+
     public boolean updateActiveAndStatus(String runId, ToolJobAnchor anchor,
                                          AgentRunStatus newStatus,
                                          AgentRunStatus expectedStatus,

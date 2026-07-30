@@ -8,9 +8,13 @@ import world.willfrog.agent.platform.dataanalysis.DataAnalysisReleaseReason;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisReleaseRequest;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisReservation;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisReservationState;
+import world.willfrog.agent.platform.dataanalysis.DagBlockingWorkerLease;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.dataanalysis.ToolJobRunDisposition;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+
+import java.time.Instant;
+import java.util.UUID;
 
 /**
  * 在不查询 Sandbox 的前提下重入 durable DAG PREPARING abort。
@@ -39,10 +43,12 @@ public final class ToolJobPreparingAbortRecoveryService {
             String runId,
             ToolJobAnchor anchor,
             DataAnalysisCapacityService capacityService,
-            ToolJobAnchorService anchorService) {
+            ToolJobAnchorService anchorService,
+            ToolJobRedisCache redisCache) {
         if (!hasDurableAbortIdentity(runId, anchor)
                 || capacityService == null
-                || anchorService == null) {
+                || anchorService == null
+                || redisCache == null) {
             return Outcome.INVALID_EVIDENCE;
         }
 
@@ -85,15 +91,101 @@ public final class ToolJobPreparingAbortRecoveryService {
                 && releaseOutcome != DataAnalysisReleaseOutcome.NOT_FOUND) {
             return Outcome.RETRYABLE;
         }
+        return completeAcceptedRelease(runId, anchor, anchorService, redisCache);
+    }
+
+    public Outcome completeAcceptedRelease(
+            String runId,
+            ToolJobAnchor anchor,
+            ToolJobAnchorService anchorService,
+            ToolJobRedisCache redisCache) {
+        if (!hasDurableAbortIdentity(runId, anchor)
+                || anchorService == null
+                || redisCache == null) {
+            return Outcome.INVALID_EVIDENCE;
+        }
+        try {
+            DataAnalysisReservation released = OBJECT_MAPPER.readValue(
+                    anchor.getReservationJson(), DataAnalysisReservation.class);
+            if (!matchesDurableAbort(runId, anchor, released)) {
+                return Outcome.INVALID_EVIDENCE;
+            }
+        } catch (Exception invalidReservation) {
+            return Outcome.INVALID_EVIDENCE;
+        }
+        ToolJobAnchor cleanupAnchor = ToolJobAnchor.fromJson(anchor.toJson());
+        cleanupAnchor.setAnchorState("CLEARING");
+        cleanupAnchor.setBlockingOwnerId(
+                DagBlockingWorkerLease.processOwnerId()
+                        + "/abort-cleanup/"
+                        + UUID.randomUUID());
+        cleanupAnchor.setBlockingLeaseUntil(
+                DagBlockingWorkerLease.renewedUntil(Instant.now()));
+
+        boolean claimed;
+        try {
+            claimed = anchorService.claimLiveDagBlockingPreparingAbortCleanup(
+                    runId,
+                    cleanupAnchor,
+                    anchor.getOperationId(),
+                    anchor.getBlockingOwnerId(),
+                    anchor.getBlockingLeaseUntil());
+        } catch (Exception claimFailure) {
+            claimed = false;
+        }
+        if (!claimed) {
+            ToolJobAnchor current;
+            try {
+                current = anchorService.loadAnchor(runId);
+            } catch (Exception reloadFailure) {
+                return Outcome.RETRYABLE;
+            }
+            if (current == null) {
+                return Outcome.COMPLETED;
+            }
+            if (!sameCleanupIdentity(cleanupAnchor, current)) {
+                return sameAbortIdentity(anchor, current)
+                        ? Outcome.RETRYABLE
+                        : Outcome.OWNERSHIP_LOST;
+            }
+        }
+
+        ToolJobRedisCache.OwnedIndexClaimResult indexClaim;
+        try {
+            indexClaim = redisCache.claimPreparingAbortCleanupIndexes(
+                    runId, anchor, cleanupAnchor);
+        } catch (Exception redisFailure) {
+            return Outcome.CLEAR_PENDING;
+        }
+        if (indexClaim == ToolJobRedisCache.OwnedIndexClaimResult.MISMATCHED) {
+            return Outcome.CLEAR_PENDING;
+        }
+        if (indexClaim == ToolJobRedisCache.OwnedIndexClaimResult.CLAIMED) {
+            ToolJobRedisCache.OwnedIndexDeleteResult deleteResult;
+            try {
+                deleteResult = redisCache.removePendingAndDueIfMatches(
+                        runId,
+                        cleanupAnchor.getOperationId(),
+                        cleanupAnchor.getRunDisposition(),
+                        cleanupAnchor.getBlockingOwnerId(),
+                        cleanupAnchor.getBlockingLeaseUntil());
+            } catch (Exception redisFailure) {
+                return Outcome.CLEAR_PENDING;
+            }
+            if (deleteResult
+                    == ToolJobRedisCache.OwnedIndexDeleteResult.MISMATCHED) {
+                return Outcome.CLEAR_PENDING;
+            }
+        }
 
         boolean cleared;
         try {
             cleared = anchorService.completeLiveDagBlockingPreparingAbort(
                     runId,
                     AgentRunStatus.EXECUTING,
-                    anchor.getOperationId(),
-                    anchor.getBlockingOwnerId(),
-                    anchor.getBlockingLeaseUntil());
+                    cleanupAnchor.getOperationId(),
+                    cleanupAnchor.getBlockingOwnerId(),
+                    cleanupAnchor.getBlockingLeaseUntil());
         } catch (Exception clearFailure) {
             return Outcome.CLEAR_PENDING;
         }
@@ -106,7 +198,7 @@ public final class ToolJobPreparingAbortRecoveryService {
             if (current == null) {
                 return Outcome.COMPLETED;
             }
-            if (!sameAbortIdentity(anchor, current)) {
+            if (!sameCleanupIdentity(cleanupAnchor, current)) {
                 return Outcome.OWNERSHIP_LOST;
             }
         } catch (Exception reloadFailure) {
@@ -119,7 +211,8 @@ public final class ToolJobPreparingAbortRecoveryService {
         return runId != null
                 && !runId.isBlank()
                 && anchor != null
-                && "ABORTING".equals(anchor.getAnchorState())
+                && ("ABORTING".equals(anchor.getAnchorState())
+                    || "CLEARING".equals(anchor.getAnchorState()))
                 && ToolJobRunDisposition.isDagPreparingAbort(
                         anchor.getRunDisposition())
                 && !anchor.isAutoResume()
@@ -147,7 +240,20 @@ public final class ToolJobPreparingAbortRecoveryService {
     private static boolean sameAbortIdentity(
             ToolJobAnchor expected,
             ToolJobAnchor current) {
-        return "ABORTING".equals(current.getAnchorState())
+        return expected.getAnchorState().equals(current.getAnchorState())
+                && ToolJobRunDisposition.isDagPreparingAbort(
+                        current.getRunDisposition())
+                && expected.getOperationId().equals(current.getOperationId())
+                && expected.getBlockingOwnerId().equals(
+                        current.getBlockingOwnerId())
+                && expected.getBlockingLeaseUntil().equals(
+                        current.getBlockingLeaseUntil());
+    }
+
+    private static boolean sameCleanupIdentity(
+            ToolJobAnchor expected,
+            ToolJobAnchor current) {
+        return "CLEARING".equals(current.getAnchorState())
                 && ToolJobRunDisposition.isDagPreparingAbort(
                         current.getRunDisposition())
                 && expected.getOperationId().equals(current.getOperationId())

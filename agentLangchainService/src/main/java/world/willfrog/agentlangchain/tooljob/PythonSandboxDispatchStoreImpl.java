@@ -174,14 +174,18 @@ public class PythonSandboxDispatchStoreImpl implements PythonSandboxDispatchStor
             Instant expectedLeaseUntil) {
         if (!"ABORTING".equals(anchor.getAnchorState())
                 || !ToolJobRunDisposition.isDagPreparingAbort(
-                        anchor.getRunDisposition())) {
+                        anchor.getRunDisposition())
+                || expectedLeaseUntil == null
+                || !expectedLeaseUntil.equals(anchor.getBlockingLeaseUntil())) {
             return false;
         }
-        return anchorService.completeLiveDagBlockingPreparingAbort(
-                runId,
-                AgentRunStatus.EXECUTING,
-                anchor.getOperationId(),
-                anchor.getBlockingOwnerId(),
-                expectedLeaseUntil);
+        ToolJobPreparingAbortRecoveryService.Outcome outcome =
+                new ToolJobPreparingAbortRecoveryService()
+                        .completeAcceptedRelease(
+                                runId,
+                                anchor,
+                                anchorService,
+                                redisCache);
+        return outcome == ToolJobPreparingAbortRecoveryService.Outcome.COMPLETED;
     }
 }

@@ -32,6 +32,83 @@ public class ToolJobRedisCache {
     private static final String PENDING_CACHE_PREFIX = "agent:run:";
     private static final String PENDING_CACHE_SUFFIX = ":pending_tool_job";
     private static final String DUE_ZSET_KEY = "agent:tool-job:due";
+    static final String CLAIM_PREPARING_ABORT_CLEANUP_INDEXES_SCRIPT = """
+            local cached = redis.call('GET', KEYS[1])
+            local score = redis.call('ZSCORE', KEYS[2], ARGV[1])
+            if (not cached) and (not score) then
+                return 2
+            end
+            if (not cached) or (not score) then
+                return 0
+            end
+            local ok, anchor = pcall(cjson.decode, cached)
+            if not ok then
+                return 0
+            end
+            if anchor['operationId'] == ARGV[2]
+                and anchor['anchorState'] == 'CLEARING'
+                and anchor['blockingOwnerId'] == ARGV[9]
+                and anchor['blockingLeaseUntil'] == ARGV[10] then
+                return 1
+            end
+            if anchor['operationId'] ~= ARGV[2] then
+                return 0
+            end
+            if ARGV[3] == 'CLEARING' then
+                if anchor['anchorState'] ~= 'CLEARING'
+                    or anchor['blockingOwnerId'] ~= ARGV[4]
+                    or anchor['blockingLeaseUntil'] ~= ARGV[5] then
+                    return 0
+                end
+            else
+                if ARGV[3] ~= 'ABORTING'
+                    or (anchor['anchorState'] ~= 'PREPARING'
+                        and anchor['anchorState'] ~= 'ABORTING')
+                    or (anchor['runDisposition'] ~= 'DAG_BLOCKING_NO_RESUME'
+                        and anchor['runDisposition'] ~= 'DAG_BLOCKING_PREPARING_ABORT')
+                    or anchor['blockingOwnerId'] ~= ARGV[4]
+                    or anchor['blockingLeaseUntil'] ~= ARGV[5] then
+                    return 0
+                end
+            end
+            redis.call('SET', KEYS[1], ARGV[6], 'EX', ARGV[7])
+            redis.call('ZADD', KEYS[2], ARGV[8], ARGV[1])
+            return 1
+            """;
+    static final String REMOVE_OWNED_PENDING_AND_DUE_SCRIPT = """
+            local cached = redis.call('GET', KEYS[1])
+            local score = redis.call('ZSCORE', KEYS[2], ARGV[1])
+            if (not cached) and (not score) then
+                return 2
+            end
+            if (not cached) or (not score) then
+                return 0
+            end
+            local ok, anchor = pcall(cjson.decode, cached)
+            if (not ok)
+                or anchor['operationId'] ~= ARGV[2]
+                or anchor['anchorState'] ~= 'CLEARING'
+                or anchor['runDisposition'] ~= ARGV[3]
+                or anchor['blockingOwnerId'] ~= ARGV[4]
+                or anchor['blockingLeaseUntil'] ~= ARGV[5] then
+                return 0
+            end
+            redis.call('DEL', KEYS[1])
+            redis.call('ZREM', KEYS[2], ARGV[1])
+            return 1
+            """;
+
+    public enum OwnedIndexClaimResult {
+        CLAIMED,
+        ALREADY_CLEAN,
+        MISMATCHED
+    }
+
+    public enum OwnedIndexDeleteResult {
+        REMOVED,
+        ALREADY_CLEAN,
+        MISMATCHED
+    }
 
     private final StringRedisTemplate redisTemplate;
     private final ObjectMapper objectMapper;
@@ -54,11 +131,11 @@ public class ToolJobRedisCache {
         String key = pendingCacheKey(runId);
         try {
             // 缓存完整 anchor 便于诊断，但业务 CAS 仍要回 PostgreSQL。
-            String json = objectMapper.writeValueAsString(anchor);
+            String json = anchor.toJson();
             // TTL 覆盖任务 timeout 与终态保留窗口，且至少 60 秒。
             long ttlSeconds = calculateTtlSeconds(anchor);
             redisTemplate.opsForValue().set(key, json, Duration.ofSeconds(ttlSeconds));
-        } catch (JsonProcessingException e) {
+        } catch (RuntimeException e) {
             log.error("Failed to serialize pending cache for run={}", runId, e);
         }
     }
@@ -120,8 +197,8 @@ public class ToolJobRedisCache {
         String cacheKey = pendingCacheKey(runId);
         String cacheJson;
         try {
-            cacheJson = objectMapper.writeValueAsString(anchor);
-        } catch (JsonProcessingException e) {
+            cacheJson = anchor.toJson();
+        } catch (RuntimeException e) {
             log.error("Failed to serialize anchor for atomic write, run={}", runId, e);
             return false;
         }
@@ -144,6 +221,104 @@ public class ToolJobRedisCache {
                 cacheJson, String.valueOf(ttlSeconds),
                 String.valueOf(score), runId);
         return true;
+    }
+
+    /**
+     * 仅删除仍属于同一 operation/CLEARING token/lease 的 Redis 派生索引。
+     *
+     * <p>脚本把身份核对与两个删除放在同一个 Redis 原子步骤里。过期 cleanup
+     * owner 即使在暂停后恢复，也不能删除 takeover owner 或新 operation 的索引。</p>
+     */
+    public OwnedIndexDeleteResult removePendingAndDueIfMatches(
+            String runId,
+            String expectedOperationId,
+            String expectedDisposition,
+            String expectedOwnerId,
+            Instant expectedLeaseUntil) {
+        if (runId == null || runId.isBlank()
+                || expectedOperationId == null || expectedOperationId.isBlank()
+                || expectedDisposition == null || expectedDisposition.isBlank()
+                || expectedOwnerId == null || expectedOwnerId.isBlank()
+                || expectedLeaseUntil == null) {
+            return OwnedIndexDeleteResult.MISMATCHED;
+        }
+        DefaultRedisScript<Long> script = new DefaultRedisScript<>(
+                REMOVE_OWNED_PENDING_AND_DUE_SCRIPT,
+                Long.class);
+        Long result = redisTemplate.execute(
+                script,
+                java.util.List.of(pendingCacheKey(runId), DUE_ZSET_KEY),
+                runId,
+                expectedOperationId,
+                expectedDisposition,
+                expectedOwnerId,
+                expectedLeaseUntil.toString());
+        if (Long.valueOf(1L).equals(result)) {
+            return OwnedIndexDeleteResult.REMOVED;
+        }
+        if (Long.valueOf(2L).equals(result)) {
+            return OwnedIndexDeleteResult.ALREADY_CLEAN;
+        }
+        return OwnedIndexDeleteResult.MISMATCHED;
+    }
+
+    /**
+     * 把旧 abort 的 Redis 热副本原子推进到当前 CLEARING token。
+     *
+     * <p>初次 claim 只接受同一 operation、owner、lease 的 PREPARING/ABORTING 热副本；
+     * takeover 也只接受精确旧 token/lease。暂停后恢复的过期 owner 因此无法覆盖新 token，
+     * 即使 operationId 被错误复用也会 fail closed。</p>
+     */
+    public OwnedIndexClaimResult claimPreparingAbortCleanupIndexes(
+            String runId,
+            ToolJobAnchor expectedAnchor,
+            ToolJobAnchor cleanupAnchor) {
+        if (runId == null || runId.isBlank()
+                || expectedAnchor == null
+                || cleanupAnchor == null
+                || expectedAnchor.getOperationId() == null
+                || expectedAnchor.getBlockingOwnerId() == null
+                || expectedAnchor.getBlockingLeaseUntil() == null
+                || cleanupAnchor.getBlockingOwnerId() == null
+                || cleanupAnchor.getBlockingLeaseUntil() == null
+                || !"CLEARING".equals(cleanupAnchor.getAnchorState())) {
+            return OwnedIndexClaimResult.MISMATCHED;
+        }
+        String cleanupJson;
+        try {
+            cleanupJson = cleanupAnchor.toJson();
+        } catch (RuntimeException serializationFailure) {
+            log.error("Failed to serialize PREPARING abort cleanup cache for run={}",
+                    runId, serializationFailure);
+            return OwnedIndexClaimResult.MISMATCHED;
+        }
+        long ttlSeconds = calculateTtlSeconds(cleanupAnchor);
+        long score = cleanupAnchor.getNextPollAt() != null
+                ? cleanupAnchor.getNextPollAt().toEpochMilli()
+                : System.currentTimeMillis();
+        DefaultRedisScript<Long> script = new DefaultRedisScript<>(
+                CLAIM_PREPARING_ABORT_CLEANUP_INDEXES_SCRIPT,
+                Long.class);
+        Long result = redisTemplate.execute(
+                script,
+                java.util.List.of(pendingCacheKey(runId), DUE_ZSET_KEY),
+                runId,
+                expectedAnchor.getOperationId(),
+                expectedAnchor.getAnchorState(),
+                expectedAnchor.getBlockingOwnerId(),
+                expectedAnchor.getBlockingLeaseUntil().toString(),
+                cleanupJson,
+                String.valueOf(ttlSeconds),
+                String.valueOf(score),
+                cleanupAnchor.getBlockingOwnerId(),
+                cleanupAnchor.getBlockingLeaseUntil().toString());
+        if (Long.valueOf(1L).equals(result)) {
+            return OwnedIndexClaimResult.CLAIMED;
+        }
+        if (Long.valueOf(2L).equals(result)) {
+            return OwnedIndexClaimResult.ALREADY_CLEAN;
+        }
+        return OwnedIndexClaimResult.MISMATCHED;
     }
 
     // ---- helpers ----
