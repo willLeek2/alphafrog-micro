@@ -476,6 +476,47 @@
     </update>
 
     <!--
+        live DAG 的同步完成只能由当前进程持有的精确未过期 lease 清理。
+        除 anchor 内的终态、容量和 usage 证明外，还要求唯一 logical-terminal
+        TOOL_CALL_FINISHED 事件已经持久化，防止迟到 worker 清除 takeover winner。
+    -->
+    <update id="clearLiveDagBlockingSynchronouslyCompletedToolJobAnchor">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = CAST('{}' AS jsonb),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status = 'EXECUTING'
+          AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{expectedOperationId}
+          AND tool_job_anchor_json -&gt;&gt; 'blockingOwnerId' = #{expectedOwnerId}
+          AND tool_job_anchor_json -&gt;&gt; 'blockingLeaseUntil' = #{expectedLeaseUntil}
+          AND (tool_job_anchor_json -&gt;&gt; 'blockingLeaseUntil')::timestamptz
+              &gt; CURRENT_TIMESTAMP
+          AND tool_job_anchor_json -&gt;&gt; 'runDisposition' = 'DAG_BLOCKING_NO_RESUME'
+          AND COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true) = false
+          AND tool_job_anchor_json -&gt;&gt; 'anchorState' = 'TERMINAL'
+          AND NULLIF(tool_job_anchor_json -&gt;&gt; 'terminalStatus', '') IS NOT NULL
+          AND NULLIF(tool_job_anchor_json -&gt;&gt; 'terminalAt', '') IS NOT NULL
+          AND tool_job_anchor_json -&gt;&gt; 'finalizerStep' = 'USAGE'
+          AND COALESCE((tool_job_anchor_json -&gt;&gt; 'usagePersisted')::boolean, false) = true
+          AND (
+                (tool_job_anchor_json -&gt;&gt; 'reservationJson')::jsonb
+                    -&gt;&gt; 'state'
+              ) = 'RELEASED'
+          AND EXISTS (
+                SELECT 1
+                FROM alphafrog_agent_run_event e
+                WHERE e.run_id = alphafrog_agent_run.id
+                  AND e.event_type = 'TOOL_CALL_FINISHED'
+                  AND e.dedupe_key = CONCAT(
+                        alphafrog_agent_run.id,
+                        ':',
+                        tool_job_anchor_json -&gt;&gt; 'toolCallId',
+                        ':logical_terminal'
+                      )
+              )
+    </update>
+
+    <!--
         PREPARING lookup/replay 与 remote-unavailable retry 的专用状态 CAS。
         当前 durable anchor 必须仍是同一 fingerprint 的 PREPARING、没有 taskId，
         且 reservation 仍为 PREPARING；迟到恢复者不能覆盖已推进的 ATTACHED/TERMINAL。
@@ -595,7 +636,7 @@
 
     <!--
         补扫真相源中的 active anchor。除常规 active/canceled 状态外，只把
-        DAG_BLOCKING_WORKER_LOST 的 FAILED Run 纳入，覆盖 pipeline 先失败、cleanup 后收尾。
+        DAG cleanup/abort 的 FAILED Run 纳入，覆盖 pipeline 先失败、容量后收尾。
     -->
     <select id="listActiveToolJobAnchors" resultMap="AgentRunResultMap">
         SELECT id,
@@ -623,7 +664,7 @@
                 OR (
                     status = 'FAILED'
                     AND tool_job_anchor_json -&gt;&gt; 'runDisposition'
-                        = 'DAG_BLOCKING_WORKER_LOST'
+                        IN ('DAG_BLOCKING_WORKER_LOST', 'DAG_BLOCKING_PREPARING_ABORT')
                 )
               )
         ORDER BY updated_at ASC

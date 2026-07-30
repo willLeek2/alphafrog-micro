@@ -125,6 +125,20 @@ class ToolJobAnchorServiceTest {
     }
 
     @Test
+    void shouldBindOwnerAndExactLeaseToLiveDagSynchronousClear() {
+        Instant expectedLease = Instant.parse("2026-07-30T07:00:00Z");
+        when(agentRunMapper.clearLiveDagBlockingSynchronouslyCompletedToolJobAnchor(
+                "run-1", "run-1:tc-1:1", "worker-a", expectedLease.toString()))
+                .thenReturn(1);
+
+        assertThat(anchorService.clearLiveDagBlockingSynchronouslyCompleted(
+                "run-1", "run-1:tc-1:1", "worker-a", expectedLease)).isTrue();
+
+        verify(agentRunMapper).clearLiveDagBlockingSynchronouslyCompletedToolJobAnchor(
+                "run-1", "run-1:tc-1:1", "worker-a", expectedLease.toString());
+    }
+
+    @Test
     void shouldBindOwnerAndExactPreviousLeaseInLiveDagUpdate() {
         ToolJobAnchor anchor = new ToolJobAnchor();
         anchor.setOperationId("run-1:tc-1:1");

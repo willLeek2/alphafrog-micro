@@ -3,8 +3,10 @@ package world.willfrog.agentlangchain.tooljob;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import world.willfrog.agent.platform.dataanalysis.DagBlockingWorkerLease;
 import world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
+import world.willfrog.agent.platform.dataanalysis.ToolJobRunDisposition;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 
 import java.time.Instant;
@@ -17,11 +19,6 @@ import java.time.Instant;
 @RequiredArgsConstructor
 @Slf4j
 public class PythonSandboxDispatchStoreImpl implements PythonSandboxDispatchStore {
-
-    private static final String DAG_BLOCKING_NO_RESUME = "DAG_BLOCKING_NO_RESUME";
-    private static final String DAG_BLOCKING_WORKER_LOST = "DAG_BLOCKING_WORKER_LOST";
-    private static final String DAG_BLOCKING_PREPARING_ABORT =
-            "DAG_BLOCKING_PREPARING_ABORT";
 
     private final ToolJobAnchorService anchorService;
     private final ToolJobRedisCache redisCache;
@@ -40,7 +37,7 @@ public class PythonSandboxDispatchStoreImpl implements PythonSandboxDispatchStor
                 && !"TERMINAL".equals(anchor.getAnchorState())) {
             return false;
         }
-        if (DAG_BLOCKING_NO_RESUME.equals(anchor.getRunDisposition())) {
+        if (ToolJobRunDisposition.isLiveDagBlocking(anchor.getRunDisposition())) {
             return anchorService.updateLiveDagBlocking(
                     runId,
                     anchor,
@@ -84,8 +81,26 @@ public class PythonSandboxDispatchStoreImpl implements PythonSandboxDispatchStor
 
     @Override
     public boolean clearSynchronouslyCompleted(String runId, String operationId) {
-        return anchorService.clearSynchronouslyCompleted(
-                runId, AgentRunStatus.EXECUTING, operationId);
+        ToolJobAnchor current = anchorService.loadAnchor(runId);
+        if (current == null) {
+            return false;
+        }
+        if (!ToolJobRunDisposition.isDagBlocking(current.getRunDisposition())) {
+            return anchorService.clearSynchronouslyCompleted(
+                    runId, AgentRunStatus.EXECUTING, operationId);
+        }
+        if (!ToolJobRunDisposition.isLiveDagBlocking(current.getRunDisposition())
+                || !operationId.equals(current.getOperationId())
+                || !DagBlockingWorkerLease.processOwnerId()
+                        .equals(current.getBlockingOwnerId())
+                || current.getBlockingLeaseUntil() == null) {
+            return false;
+        }
+        return anchorService.clearLiveDagBlockingSynchronouslyCompleted(
+                runId,
+                operationId,
+                current.getBlockingOwnerId(),
+                current.getBlockingLeaseUntil());
     }
 
     @Override
@@ -93,7 +108,7 @@ public class PythonSandboxDispatchStoreImpl implements PythonSandboxDispatchStor
             String runId,
             ToolJobAnchor anchor,
             Instant expectedLeaseUntil) {
-        if (!DAG_BLOCKING_NO_RESUME.equals(anchor.getRunDisposition())) {
+        if (!ToolJobRunDisposition.isLiveDagBlocking(anchor.getRunDisposition())) {
             return false;
         }
         return anchorService.updateLiveDagBlocking(
@@ -110,7 +125,7 @@ public class PythonSandboxDispatchStoreImpl implements PythonSandboxDispatchStor
             String runId,
             ToolJobAnchor anchor,
             Instant expectedLeaseUntil) {
-        if (!DAG_BLOCKING_WORKER_LOST.equals(anchor.getRunDisposition())) {
+        if (!ToolJobRunDisposition.isDagCleanupOnly(anchor.getRunDisposition())) {
             return false;
         }
         boolean promoted = anchorService.updateLiveDagBlocking(
@@ -139,7 +154,8 @@ public class PythonSandboxDispatchStoreImpl implements PythonSandboxDispatchStor
             ToolJobAnchor anchor,
             Instant expectedLeaseUntil) {
         if (!"ABORTING".equals(anchor.getAnchorState())
-                || !DAG_BLOCKING_PREPARING_ABORT.equals(anchor.getRunDisposition())) {
+                || !ToolJobRunDisposition.isDagPreparingAbort(
+                        anchor.getRunDisposition())) {
             return false;
         }
         return anchorService.beginLiveDagBlockingPreparingAbort(
@@ -157,7 +173,8 @@ public class PythonSandboxDispatchStoreImpl implements PythonSandboxDispatchStor
             ToolJobAnchor anchor,
             Instant expectedLeaseUntil) {
         if (!"ABORTING".equals(anchor.getAnchorState())
-                || !DAG_BLOCKING_PREPARING_ABORT.equals(anchor.getRunDisposition())) {
+                || !ToolJobRunDisposition.isDagPreparingAbort(
+                        anchor.getRunDisposition())) {
             return false;
         }
         return anchorService.completeLiveDagBlockingPreparingAbort(

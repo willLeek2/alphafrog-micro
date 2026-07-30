@@ -1,6 +1,7 @@
 package world.willfrog.agentlangchain.tooljob;
 
 import org.junit.jupiter.api.Test;
+import world.willfrog.agent.platform.dataanalysis.DagBlockingWorkerLease;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 
@@ -195,6 +196,8 @@ class PythonSandboxDispatchStoreImplTest {
 
     @Test
     void synchronousCompletionUsesProofGatedExecutingCas() {
+        ToolJobAnchor linear = anchor("TERMINAL");
+        when(anchorService.loadAnchor("run-1")).thenReturn(linear);
         when(anchorService.clearSynchronouslyCompleted(
                 "run-1", AgentRunStatus.EXECUTING, "run-1:call-1:1"))
                 .thenReturn(true);
@@ -205,6 +208,50 @@ class PythonSandboxDispatchStoreImplTest {
         verify(anchorService).clearSynchronouslyCompleted(
                 "run-1", AgentRunStatus.EXECUTING, "run-1:call-1:1");
         verify(anchorService, never()).clearActive(any(), any(), any());
+    }
+
+    @Test
+    void liveDagSynchronousCompletionBindsProcessOwnerAndExactLease() {
+        ToolJobAnchor live = liveDagAnchor("TERMINAL");
+        live.setBlockingOwnerId(DagBlockingWorkerLease.processOwnerId());
+        when(anchorService.loadAnchor("run-1")).thenReturn(live);
+        when(anchorService.clearLiveDagBlockingSynchronouslyCompleted(
+                "run-1",
+                "run-1:call-1:1",
+                DagBlockingWorkerLease.processOwnerId(),
+                live.getBlockingLeaseUntil()))
+                .thenReturn(true);
+
+        assertThat(store.clearSynchronouslyCompleted(
+                "run-1", "run-1:call-1:1")).isTrue();
+
+        verify(anchorService).clearLiveDagBlockingSynchronouslyCompleted(
+                "run-1",
+                "run-1:call-1:1",
+                DagBlockingWorkerLease.processOwnerId(),
+                live.getBlockingLeaseUntil());
+        verify(anchorService, never()).clearSynchronouslyCompleted(
+                any(), any(), any());
+    }
+
+    @Test
+    void staleOrAbortDagSynchronousCompletionCannotClear() {
+        ToolJobAnchor staleOwner = liveDagAnchor("TERMINAL");
+        when(anchorService.loadAnchor("run-1")).thenReturn(staleOwner);
+        assertThat(store.clearSynchronouslyCompleted(
+                "run-1", "run-1:call-1:1")).isFalse();
+
+        ToolJobAnchor aborting = liveDagAnchor("ABORTING");
+        aborting.setRunDisposition("DAG_BLOCKING_PREPARING_ABORT");
+        aborting.setBlockingOwnerId(DagBlockingWorkerLease.processOwnerId());
+        when(anchorService.loadAnchor("run-1")).thenReturn(aborting);
+        assertThat(store.clearSynchronouslyCompleted(
+                "run-1", "run-1:call-1:1")).isFalse();
+
+        verify(anchorService, never()).clearLiveDagBlockingSynchronouslyCompleted(
+                any(), any(), any(), any());
+        verify(anchorService, never()).clearSynchronouslyCompleted(
+                any(), any(), any());
     }
 
     private ToolJobAnchor anchor(String state) {

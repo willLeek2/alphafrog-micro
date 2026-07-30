@@ -3,6 +3,7 @@ package world.willfrog.agent.platform.dataanalysis;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
 
 import java.time.Instant;
 
@@ -21,7 +22,8 @@ import java.time.Instant;
 public class ToolJobAnchor {
 
     private static final ObjectMapper MAPPER = new ObjectMapper()
-            .findAndRegisterModules();
+            .findAndRegisterModules()
+            .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
 
     // schemaVersion 允许未来升级 JSON 结构时保留兼容读取路径。
     private int schemaVersion = 1;

@@ -234,6 +234,16 @@ public interface AgentRunMapper {
             @Param("expectedOperationId") String expectedOperationId);
 
     /**
+     * DAG blocking 同步返回后的窄清理。除终态证明外，还绑定进程 owner、
+     * 精确未过期 lease 和 durable logical-terminal event。
+     */
+    int clearLiveDagBlockingSynchronouslyCompletedToolJobAnchor(
+            @Param("id") String id,
+            @Param("expectedOperationId") String expectedOperationId,
+            @Param("expectedOwnerId") String expectedOwnerId,
+            @Param("expectedLeaseUntil") String expectedLeaseUntil);
+
+    /**
      * 完整 checkpoint 写失败后的白名单补偿写入：只登记失败身份与错误，不覆盖 terminal/reservation。
      * startup recovery 可据此继续收口；调用方不能把失败误当成已经安全释放 worker。
      */

@@ -67,6 +67,17 @@ class AgentRunMapperPostgresIntegrationTest {
                         tool_job_anchor_json JSONB NOT NULL DEFAULT '{}'
                     )
                     """);
+            statement.execute("""
+                    CREATE TABLE alphafrog_agent_run_event (
+                        id BIGSERIAL PRIMARY KEY,
+                        run_id VARCHAR(64) NOT NULL,
+                        seq BIGINT NOT NULL DEFAULT 1,
+                        event_type VARCHAR(64) NOT NULL,
+                        payload_json JSONB NOT NULL DEFAULT '{}',
+                        dedupe_key VARCHAR(255),
+                        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+                    )
+                    """);
         }
 
         Configuration configuration = new Configuration(
@@ -150,6 +161,9 @@ class AgentRunMapperPostgresIntegrationTest {
         insertRun("dag-preparing-abort", AgentRunStatus.EXECUTING,
                 liveDagAnchor(
                         "dag-preparing-abort:call-1:1", "worker-a", liveLease, "PREPARING"));
+        insertRun("dag-direct-promote", AgentRunStatus.EXECUTING,
+                liveDagAnchor(
+                        "dag-direct-promote:call-1:1", "worker-a", liveLease));
         Instant expiredLease = Instant.now().minusSeconds(5);
         insertRun("dag-expired-fence", AgentRunStatus.EXECUTING,
                 liveDagAnchor("dag-expired-fence:call-1:1", "worker-a", expiredLease));
@@ -185,6 +199,18 @@ class AgentRunMapperPostgresIntegrationTest {
                     "dag-live-fence", renewedAnchor, AgentRunStatus.EXECUTING,
                     "dag-live-fence:call-1:1", "worker-a", liveLease.toString()))
                     .isEqualTo(1);
+
+            ToolJobAnchor directPromote = ToolJobAnchor.fromJson(
+                    liveDagAnchor(
+                            "dag-direct-promote:call-1:1", "worker-a", liveLease));
+            directPromote.setRunDisposition("DAG_BLOCKING_WORKER_LOST");
+            assertThat(mapper.updateLiveDagBlockingToolJobAnchor(
+                    "dag-direct-promote",
+                    directPromote.toJson(),
+                    AgentRunStatus.EXECUTING,
+                    "dag-direct-promote:call-1:1",
+                    "worker-a",
+                    liveLease.toString())).isEqualTo(1);
 
             ToolJobAnchor persisted = ToolJobAnchor.fromJson(
                     mapper.findById("dag-live-fence").getToolJobAnchorJson());
@@ -222,6 +248,9 @@ class AgentRunMapperPostgresIntegrationTest {
             assertThat(mapper.casUpdateStatus(
                     "dag-preparing-abort", AgentRunStatus.FAILED, AgentRunStatus.EXECUTING))
                     .isEqualTo(1);
+            assertThat(mapper.listActiveToolJobAnchors(20))
+                    .extracting(AgentRun::getId)
+                    .contains("dag-preparing-abort");
             assertThat(mapper.completeLiveDagBlockingPreparingAbort(
                     "dag-preparing-abort", AgentRunStatus.EXECUTING,
                     "dag-preparing-abort:call-1:1", "worker-b", liveLease.toString()))
@@ -238,6 +267,54 @@ class AgentRunMapperPostgresIntegrationTest {
                     .isEqualTo("{}");
             assertThat(mapper.findById("dag-preparing-abort").getStatus())
                     .isEqualTo(AgentRunStatus.FAILED);
+        }
+    }
+
+    @Test
+    void liveDagSynchronousClearRequiresExactLiveLeaseAndDurableEvent() throws Exception {
+        Instant liveLease = Instant.now().plusSeconds(300);
+        Instant expiredLease = Instant.now().minusSeconds(5);
+        insertRun("dag-sync-valid", AgentRunStatus.EXECUTING,
+                terminalLiveDagAnchor(
+                        "dag-sync-valid:call-1:1", "call-1", "worker-a", liveLease));
+        insertRun("dag-sync-no-event", AgentRunStatus.EXECUTING,
+                terminalLiveDagAnchor(
+                        "dag-sync-no-event:call-1:1", "call-1", "worker-a", liveLease));
+        insertRun("dag-sync-expired", AgentRunStatus.EXECUTING,
+                terminalLiveDagAnchor(
+                        "dag-sync-expired:call-1:1", "call-1", "worker-a", expiredLease));
+        insertEvent("dag-sync-valid", "call-1");
+        insertEvent("dag-sync-expired", "call-1");
+
+        try (SqlSession session = sqlSessionFactory.openSession(true)) {
+            AgentRunMapper mapper = session.getMapper(AgentRunMapper.class);
+            assertThat(mapper.clearLiveDagBlockingSynchronouslyCompletedToolJobAnchor(
+                    "dag-sync-valid",
+                    "dag-sync-valid:call-1:1",
+                    "worker-b",
+                    liveLease.toString())).isZero();
+            assertThat(mapper.clearLiveDagBlockingSynchronouslyCompletedToolJobAnchor(
+                    "dag-sync-valid",
+                    "dag-sync-valid:call-1:1",
+                    "worker-a",
+                    liveLease.plusSeconds(30).toString())).isZero();
+            assertThat(mapper.clearLiveDagBlockingSynchronouslyCompletedToolJobAnchor(
+                    "dag-sync-no-event",
+                    "dag-sync-no-event:call-1:1",
+                    "worker-a",
+                    liveLease.toString())).isZero();
+            assertThat(mapper.clearLiveDagBlockingSynchronouslyCompletedToolJobAnchor(
+                    "dag-sync-expired",
+                    "dag-sync-expired:call-1:1",
+                    "worker-a",
+                    expiredLease.toString())).isZero();
+            assertThat(mapper.clearLiveDagBlockingSynchronouslyCompletedToolJobAnchor(
+                    "dag-sync-valid",
+                    "dag-sync-valid:call-1:1",
+                    "worker-a",
+                    liveLease.toString())).isEqualTo(1);
+            assertThat(mapper.findById("dag-sync-valid").getToolJobAnchorJson())
+                    .isEqualTo("{}");
         }
     }
 
@@ -267,30 +344,66 @@ class AgentRunMapperPostgresIntegrationTest {
             String ownerId,
             Instant leaseUntil,
             String anchorState) throws Exception {
-        Map<String, Object> anchor = new LinkedHashMap<>();
-        anchor.put("operationId", operationId);
-        anchor.put("anchorState", anchorState);
-        anchor.put("runDisposition", "DAG_BLOCKING_NO_RESUME");
-        anchor.put("autoResume", false);
-        anchor.put("blockingOwnerId", ownerId);
-        anchor.put("blockingLeaseUntil", leaseUntil.toString());
-        return OBJECT_MAPPER.writeValueAsString(anchor);
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId(operationId);
+        anchor.setAnchorState(anchorState);
+        anchor.setRunDisposition("DAG_BLOCKING_NO_RESUME");
+        anchor.setAutoResume(false);
+        anchor.setBlockingOwnerId(ownerId);
+        anchor.setBlockingLeaseUntil(leaseUntil);
+        return anchor.toJson();
     }
 
     private static String abortingDagAnchor(
             String operationId,
             String ownerId,
             Instant leaseUntil) throws Exception {
-        Map<String, Object> anchor = new LinkedHashMap<>();
-        anchor.put("operationId", operationId);
-        anchor.put("anchorState", "ABORTING");
-        anchor.put("runDisposition", "DAG_BLOCKING_PREPARING_ABORT");
-        anchor.put("autoResume", false);
-        anchor.put("blockingOwnerId", ownerId);
-        anchor.put("blockingLeaseUntil", leaseUntil.toString());
-        anchor.put("reservationJson",
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId(operationId);
+        anchor.setAnchorState("ABORTING");
+        anchor.setRunDisposition("DAG_BLOCKING_PREPARING_ABORT");
+        anchor.setAutoResume(false);
+        anchor.setBlockingOwnerId(ownerId);
+        anchor.setBlockingLeaseUntil(leaseUntil);
+        anchor.setReservationJson(
                 OBJECT_MAPPER.writeValueAsString(Map.of("state", "RELEASED")));
-        return OBJECT_MAPPER.writeValueAsString(anchor);
+        return anchor.toJson();
+    }
+
+    private static String terminalLiveDagAnchor(
+            String operationId,
+            String toolCallId,
+            String ownerId,
+            Instant leaseUntil) throws Exception {
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId(operationId);
+        anchor.setToolCallId(toolCallId);
+        anchor.setAnchorState("TERMINAL");
+        anchor.setRunDisposition("DAG_BLOCKING_NO_RESUME");
+        anchor.setAutoResume(false);
+        anchor.setBlockingOwnerId(ownerId);
+        anchor.setBlockingLeaseUntil(leaseUntil);
+        anchor.setTerminalStatus("SUCCEEDED");
+        anchor.setTerminalAt(Instant.now());
+        anchor.setFinalizerStep("USAGE");
+        anchor.setUsagePersisted(true);
+        anchor.setReservationJson(
+                OBJECT_MAPPER.writeValueAsString(Map.of("state", "RELEASED")));
+        return anchor.toJson();
+    }
+
+    private static void insertEvent(String runId, String toolCallId) throws Exception {
+        try (var connection = dataSource().getConnection();
+             var statement = connection.prepareStatement("""
+                     INSERT INTO alphafrog_agent_run_event
+                         (run_id, event_type, dedupe_key)
+                     VALUES (?, 'TOOL_CALL_FINISHED', ?)
+                     """)) {
+            statement.setString(1, runId);
+            statement.setString(
+                    2, runId + ":" + toolCallId + ":logical_terminal");
+            statement.executeUpdate();
+        }
     }
 
     private static void insertRun(

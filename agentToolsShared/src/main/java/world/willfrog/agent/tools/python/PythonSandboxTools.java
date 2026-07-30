@@ -1011,7 +1011,7 @@ public class PythonSandboxTools {
         String releasedReservationJson = objectMapper.writeValueAsString(released);
         String previousReservationJson = anchor.getReservationJson();
         anchor.setAnchorState("ABORTING");
-        anchor.setRunDisposition("DAG_BLOCKING_PREPARING_ABORT");
+        anchor.setRunDisposition(ToolJobRunDisposition.DAG_BLOCKING_PREPARING_ABORT);
         anchor.setReservationJson(releasedReservationJson);
 
         boolean began;
@@ -1025,7 +1025,7 @@ public class PythonSandboxTools {
              * durable abort intent 仍安全保留。
              */
             anchor.setAnchorState("PREPARING");
-            anchor.setRunDisposition("DAG_BLOCKING_NO_RESUME");
+            anchor.setRunDisposition(ToolJobRunDisposition.DAG_BLOCKING_NO_RESUME);
             anchor.setReservationJson(previousReservationJson);
             throw beginFailure;
         }
@@ -1050,7 +1050,7 @@ public class PythonSandboxTools {
             long toolStartMs,
             Map<String, Object> details) {
         Instant expectedLeaseUntil = anchor.getBlockingLeaseUntil();
-        anchor.setRunDisposition("DAG_BLOCKING_WORKER_LOST");
+        anchor.setRunDisposition(ToolJobRunDisposition.DAG_BLOCKING_WORKER_LOST);
         anchor.setAutoResume(false);
         anchor.setFinalizerError(errorCode);
         anchor.setNextPollAt(Instant.now());

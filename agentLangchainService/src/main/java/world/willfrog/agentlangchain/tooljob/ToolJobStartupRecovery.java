@@ -34,6 +34,8 @@ public class ToolJobStartupRecovery {
     private final ToolJobFinalizer finalizer;
     private final ToolJobResumeService resumeService;
     private final ToolJobConfig config;
+    private final ToolJobPreparingAbortRecoveryService preparingAbortRecovery =
+            new ToolJobPreparingAbortRecoveryService();
 
     @DubboReference
     private PythonSandboxService sandboxService;
@@ -87,6 +89,40 @@ public class ToolJobStartupRecovery {
                         new com.fasterxml.jackson.databind.ObjectMapper().findAndRegisterModules();
                 DataAnalysisReservation reservation = mapper.readValue(
                         anchor.getReservationJson(), DataAnalysisReservation.class);
+                if (ToolJobRunDisposition.isDagPreparingAbort(
+                        anchor.getRunDisposition())) {
+                    ToolJobPreparingAbortRecoveryService.Outcome outcome =
+                            preparingAbortRecovery.recover(
+                                    run.getId(),
+                                    anchor,
+                                    capacityService,
+                                    anchorService);
+                    if (outcome
+                            == ToolJobPreparingAbortRecoveryService.Outcome.COMPLETED) {
+                        removeRecoveredAbortIndexes(run.getId());
+                        continue;
+                    }
+                    if (outcome
+                            == ToolJobPreparingAbortRecoveryService.Outcome.CLEAR_PENDING) {
+                        schedulePreparingAbortRetry(run.getId(), anchor);
+                        continue;
+                    }
+                    if (outcome
+                            == ToolJobPreparingAbortRecoveryService.Outcome.RETRYABLE) {
+                        schedulePreparingAbortRetry(run.getId(), anchor);
+                    }
+                    if (outcome
+                            == ToolJobPreparingAbortRecoveryService.Outcome.OWNERSHIP_LOST) {
+                        /*
+                         * 另一 operation 已经成为 PG winner。不能删除或用 stale abort
+                         * 重排它的 Redis 索引；容量恢复保持 fail-closed，等待下一轮新快照。
+                         */
+                        quarantinedRuns.add(run.getId());
+                        continue;
+                    }
+                    quarantinedRuns.add(run.getId());
+                    continue;
+                }
                 // PREPARING 表示进程可能在 createTask 前后崩溃，需要按 operationId 查找/重放。
                 if (reservation != null
                         && reservation.state() == DataAnalysisReservationState.PREPARING) {
@@ -209,6 +245,11 @@ public class ToolJobStartupRecovery {
             if (anchor == null) continue;
 
             try {
+                if (ToolJobRunDisposition.isDagPreparingAbort(
+                        anchor.getRunDisposition())) {
+                    recoverPreparingAbort(run.getId(), anchor);
+                    continue;
+                }
                 // cleanup-only 可跨 EXECUTING/FAILED/CANCELED 重入；业务终态不能阻断容量收尾。
                 if (ToolJobRunDisposition.isDagCleanupOnly(anchor.getRunDisposition())) {
                     resolveActiveAnchor(run, anchor);
@@ -502,6 +543,59 @@ public class ToolJobStartupRecovery {
         } catch (Exception failure) {
             log.error("Failed to transfer recovered dispatch for run={}", runId, failure);
             return false;
+        }
+    }
+
+    private void recoverPreparingAbort(String runId, ToolJobAnchor anchor) {
+        ToolJobPreparingAbortRecoveryService.Outcome outcome =
+                preparingAbortRecovery.recover(
+                        runId,
+                        anchor,
+                        capacityService,
+                        anchorService);
+        if (outcome == ToolJobPreparingAbortRecoveryService.Outcome.COMPLETED) {
+            removeRecoveredAbortIndexes(runId);
+            return;
+        }
+        if (outcome == ToolJobPreparingAbortRecoveryService.Outcome.CLEAR_PENDING
+                || outcome == ToolJobPreparingAbortRecoveryService.Outcome.RETRYABLE) {
+            schedulePreparingAbortRetry(runId, anchor);
+            return;
+        }
+        if (outcome == ToolJobPreparingAbortRecoveryService.Outcome.OWNERSHIP_LOST) {
+            log.info("DAG PREPARING abort lost ownership to a new anchor for run={}; "
+                    + "leaving winner Redis indexes untouched", runId);
+            return;
+        }
+        log.error("Durable DAG PREPARING abort cannot be recovered for run={}, outcome={}; "
+                        + "retaining PostgreSQL anchor without Sandbox/resume",
+                runId, outcome);
+        try {
+            redisCache.removeDue(runId);
+        } catch (Exception cacheFailure) {
+            log.warn("Failed to remove invalid PREPARING abort due for run={}",
+                    runId, cacheFailure);
+        }
+    }
+
+    private void schedulePreparingAbortRetry(String runId, ToolJobAnchor anchor) {
+        anchor.setNextPollAt(
+                Instant.now().plusMillis(config.getReconcilerIntervalMs()));
+        try {
+            redisCache.upsertDue(runId, anchor);
+        } catch (Exception cacheFailure) {
+            log.warn("Failed to schedule PREPARING abort retry for run={}",
+                    runId, cacheFailure);
+        }
+    }
+
+    private void removeRecoveredAbortIndexes(String runId) {
+        try {
+            redisCache.removeDue(runId);
+            redisCache.deletePendingCache(runId);
+        } catch (Exception cacheFailure) {
+            log.warn("Failed to clear recovered PREPARING abort Redis indexes for run={}",
+                    runId, cacheFailure);
         }
     }
 

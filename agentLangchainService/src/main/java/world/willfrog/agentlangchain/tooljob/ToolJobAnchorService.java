@@ -205,6 +205,21 @@ public class ToolJobAnchorService {
                 runId, expectedStatus, operationId) == 1;
     }
 
+    public boolean clearLiveDagBlockingSynchronouslyCompleted(
+            String runId,
+            String operationId,
+            String ownerId,
+            Instant expectedLeaseUntil) {
+        if (expectedLeaseUntil == null) {
+            return false;
+        }
+        return agentRunMapper.clearLiveDagBlockingSynchronouslyCompletedToolJobAnchor(
+                runId,
+                operationId,
+                ownerId,
+                expectedLeaseUntil.toString()) == 1;
+    }
+
     /**
      * Narrow PostgreSQL JSONB merge for checkpoint-failure ownership. It does
      * not replace reservation/terminal fields and binds the failed checkpoint

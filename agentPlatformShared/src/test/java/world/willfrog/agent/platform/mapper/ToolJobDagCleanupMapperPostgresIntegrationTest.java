@@ -14,11 +14,13 @@ import org.postgresql.ds.PGSimpleDataSource;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
+import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 
 import javax.sql.DataSource;
 import java.io.InputStream;
+import java.time.Instant;
 import java.time.OffsetDateTime;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -81,33 +83,20 @@ class ToolJobDagCleanupMapperPostgresIntegrationTest {
     void expiredLeaseTakeoverRequiresMatchingOperationOwnerAndDatabaseExpiry() {
         try (SqlSession session = sqlSessionFactory.openSession(true)) {
             AgentRunMapper mapper = session.getMapper(AgentRunMapper.class);
-            insertRun(mapper, "future-lease", AgentRunStatus.EXECUTING, null, """
-                    {
-                      "operationId":"future-lease:call-1:1",
-                      "blockingOwnerId":"owner-1",
-                      "blockingLeaseUntil":"2999-01-01T00:00:00Z",
-                      "runDisposition":"DAG_BLOCKING_NO_RESUME",
-                      "autoResume":false
-                    }
-                    """);
-            insertRun(mapper, "expired-lease", AgentRunStatus.EXECUTING, null, """
-                    {
-                      "operationId":"expired-lease:call-1:1",
-                      "blockingOwnerId":"owner-1",
-                      "blockingLeaseUntil":"2000-01-01T00:00:00Z",
-                      "runDisposition":"DAG_BLOCKING_NO_RESUME",
-                      "autoResume":false
-                    }
-                    """);
-            String promoted = """
-                    {
-                      "operationId":"expired-lease:call-1:1",
-                      "blockingOwnerId":"owner-1",
-                      "blockingLeaseUntil":"2000-01-01T00:00:00Z",
-                      "runDisposition":"DAG_BLOCKING_WORKER_LOST",
-                      "autoResume":false
-                    }
-                    """;
+            insertRun(mapper, "future-lease", AgentRunStatus.EXECUTING, null,
+                    liveDagAnchor(
+                            "future-lease:call-1:1",
+                            Instant.parse("2999-01-01T00:00:00Z")));
+            insertRun(mapper, "expired-lease", AgentRunStatus.EXECUTING, null,
+                    liveDagAnchor(
+                            "expired-lease:call-1:1",
+                            Instant.parse("2000-01-01T00:00:00Z")));
+            ToolJobAnchor promotedAnchor = ToolJobAnchor.fromJson(
+                    liveDagAnchor(
+                            "expired-lease:call-1:1",
+                            Instant.parse("2000-01-01T00:00:00Z")));
+            promotedAnchor.setRunDisposition("DAG_BLOCKING_WORKER_LOST");
+            String promoted = promotedAnchor.toJson();
 
             assertThat(mapper.promoteExpiredDagBlockingWorkerLost(
                     "future-lease", promoted, "future-lease:call-1:1", "owner-1")).isZero();
@@ -258,6 +247,18 @@ class ToolJobDagCleanupMapperPostgresIntegrationTest {
                   "reservationJson":"{\\"state\\":\\"RELEASED\\"}"
                 }
                 """.formatted(runId);
+    }
+
+    private static String liveDagAnchor(
+            String operationId,
+            Instant leaseUntil) {
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId(operationId);
+        anchor.setBlockingOwnerId("owner-1");
+        anchor.setBlockingLeaseUntil(leaseUntil);
+        anchor.setRunDisposition("DAG_BLOCKING_NO_RESUME");
+        anchor.setAutoResume(false);
+        return anchor.toJson();
     }
 
     private static String preparingAnchor(String runId) {

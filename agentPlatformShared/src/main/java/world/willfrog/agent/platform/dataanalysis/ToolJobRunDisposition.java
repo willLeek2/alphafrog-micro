@@ -12,6 +12,8 @@ public final class ToolJobRunDisposition {
 
     public static final String DAG_BLOCKING_NO_RESUME = "DAG_BLOCKING_NO_RESUME";
     public static final String DAG_BLOCKING_WORKER_LOST = "DAG_BLOCKING_WORKER_LOST";
+    public static final String DAG_BLOCKING_PREPARING_ABORT =
+            "DAG_BLOCKING_PREPARING_ABORT";
 
     private ToolJobRunDisposition() {
     }
@@ -24,7 +26,13 @@ public final class ToolJobRunDisposition {
         return DAG_BLOCKING_WORKER_LOST.equals(disposition);
     }
 
+    public static boolean isDagPreparingAbort(String disposition) {
+        return DAG_BLOCKING_PREPARING_ABORT.equals(disposition);
+    }
+
     public static boolean isDagBlocking(String disposition) {
-        return isLiveDagBlocking(disposition) || isDagCleanupOnly(disposition);
+        return isLiveDagBlocking(disposition)
+                || isDagCleanupOnly(disposition)
+                || isDagPreparingAbort(disposition);
     }
 }

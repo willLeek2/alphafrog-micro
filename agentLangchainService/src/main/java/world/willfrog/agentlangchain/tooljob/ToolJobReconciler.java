@@ -6,6 +6,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
+import world.willfrog.agent.platform.dataanalysis.DataAnalysisCapacityService;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisReservation;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisReservationState;
 import world.willfrog.agent.platform.dataanalysis.DagBlockingWorkerLease;
@@ -39,6 +40,9 @@ public class ToolJobReconciler {
     private final ToolJobFinalizer finalizer;
     private final ToolJobResumeService resumeService;
     private final ToolJobConfig config;
+    private final DataAnalysisCapacityService capacityService;
+    private final ToolJobPreparingAbortRecoveryService preparingAbortRecovery =
+            new ToolJobPreparingAbortRecoveryService();
 
     @Autowired(required = false)
     private ToolJobCheckpointFailureRecoveryService checkpointFailureRecoveryService;
@@ -49,11 +53,20 @@ public class ToolJobReconciler {
     public ToolJobReconciler(ToolJobRedisCache redisCache, ToolJobAnchorService anchorService,
                              ToolJobFinalizer finalizer, ToolJobResumeService resumeService,
                              ToolJobConfig config) {
+        this(redisCache, anchorService, finalizer, resumeService, config, null);
+    }
+
+    @Autowired
+    public ToolJobReconciler(ToolJobRedisCache redisCache, ToolJobAnchorService anchorService,
+                             ToolJobFinalizer finalizer, ToolJobResumeService resumeService,
+                             ToolJobConfig config,
+                             DataAnalysisCapacityService capacityService) {
         this.redisCache = redisCache;
         this.anchorService = anchorService;
         this.finalizer = finalizer;
         this.resumeService = resumeService;
         this.config = config;
+        this.capacityService = capacityService;
     }
 
     @Scheduled(fixedDelayString = "${agent.tool-job.reconciler-interval-ms:5000}")
@@ -76,6 +89,11 @@ public class ToolJobReconciler {
                 // 再按 id 读取最新 anchor，避免列表查询后的状态漂移。
                 ToolJobAnchor a = anchorService.loadAnchor(run.getId());
                 if (a == null) continue;
+                if (ToolJobRunDisposition.isDagPreparingAbort(
+                        a.getRunDisposition())) {
+                    processItem(run.getId());
+                    continue;
+                }
                 if (run.getStatus() == AgentRunStatus.EXECUTING
                         && ToolJobRunDisposition.isLiveDagBlocking(a.getRunDisposition())) {
                     // 未来租约只重建到期唤醒；过期租约通过 owner/opId CAS 接管。
@@ -113,6 +131,11 @@ public class ToolJobReconciler {
             ToolJobAnchor anchor = anchorService.loadAnchor(runId);
             // DB 已无 active anchor 时清理 Redis 残留，幂等结束。
             if (anchor == null) { redisCache.removeDue(runId); redisCache.deletePendingCache(runId); return; }
+            if (ToolJobRunDisposition.isDagPreparingAbort(
+                    anchor.getRunDisposition())) {
+                recoverPreparingAbort(runId, anchor);
+                return;
+            }
             if (ToolJobRunDisposition.isLiveDagBlocking(anchor.getRunDisposition())) {
                 // live worker 的 lease 未到期时只重排 expiry；过期后必须先赢 fenced CAS。
                 if (!recoverLiveDagBlocking(runId, anchor)) return;
@@ -345,5 +368,35 @@ public class ToolJobReconciler {
         log.warn("Reconciler claimed expired DAG blocking worker for run={}, operationId={}, owner={}",
                 runId, operationId, ownerId);
         return true;
+    }
+
+    private void recoverPreparingAbort(String runId, ToolJobAnchor anchor) {
+        ToolJobPreparingAbortRecoveryService.Outcome outcome =
+                preparingAbortRecovery.recover(
+                        runId,
+                        anchor,
+                        capacityService,
+                        anchorService);
+        if (outcome == ToolJobPreparingAbortRecoveryService.Outcome.COMPLETED) {
+            redisCache.removeDue(runId);
+            redisCache.deletePendingCache(runId);
+            return;
+        }
+        if (outcome == ToolJobPreparingAbortRecoveryService.Outcome.CLEAR_PENDING
+                || outcome == ToolJobPreparingAbortRecoveryService.Outcome.RETRYABLE) {
+            anchor.setNextPollAt(
+                    Instant.now().plusMillis(config.getReconcilerIntervalMs()));
+            redisCache.upsertDue(runId, anchor);
+            return;
+        }
+        if (outcome == ToolJobPreparingAbortRecoveryService.Outcome.OWNERSHIP_LOST) {
+            log.info("DAG PREPARING abort lost ownership to a new anchor for run={}; "
+                    + "leaving winner Redis indexes untouched", runId);
+            return;
+        }
+        log.error("DAG PREPARING abort retained for run={}, outcome={}; "
+                        + "no Sandbox lookup or workflow resume is allowed",
+                runId, outcome);
+        redisCache.removeDue(runId);
     }
 }
