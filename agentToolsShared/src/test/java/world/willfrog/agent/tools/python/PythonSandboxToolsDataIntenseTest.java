@@ -51,6 +51,14 @@ class PythonSandboxToolsDataIntenseTest {
         inject("pythonSandboxDispatchStore", dispatchStore);
         inject("dataAnalysisTerminalRecorder", recorder);
         inject("fastPathMs", 5L);
+        when(dispatchStore.renewDagBlockingLease(eq("run-test"), any(), any()))
+                .thenReturn(true);
+        when(dispatchStore.promoteDagBlockingWorkerLost(eq("run-test"), any(), any()))
+                .thenReturn(true);
+        when(dispatchStore.beginDagBlockingPreparingAbort(eq("run-test"), any(), any()))
+                .thenReturn(true);
+        when(dispatchStore.completeDagBlockingPreparingAbort(eq("run-test"), any(), any()))
+                .thenReturn(true);
         AgentContext.setRunId("run-test");
         AgentContext.setToolCallId("call-1");
         AgentContext.setTodoContext("todo-1", 1);
@@ -231,6 +239,8 @@ class PythonSandboxToolsDataIntenseTest {
         assertThat(observedAnchors.get(0).getRunDisposition())
                 .isEqualTo("DAG_BLOCKING_NO_RESUME");
         assertThat(observedAnchors.get(0).isAutoResume()).isFalse();
+        assertThat(observedAnchors.get(0).getBlockingOwnerId()).isNotBlank();
+        assertThat(observedAnchors.get(0).getBlockingLeaseUntil()).isAfter(Instant.now());
         assertThat(observedAnchors.get(observedAnchors.size() - 1).getAnchorState())
                 .isEqualTo("TERMINAL");
         assertThat(observedAnchors.get(observedAnchors.size() - 1).isUsagePersisted()).isTrue();
@@ -305,6 +315,14 @@ class PythonSandboxToolsDataIntenseTest {
         assertThat(output)
                 .contains("\"ok\":false")
                 .contains("\"code\":\"DAG_BLOCKING_TERMINAL_INCOMPLETE\"");
+        verify(dispatchStore).promoteDagBlockingWorkerLost(
+                eq("run-test"),
+                argThat(anchor -> "DAG_BLOCKING_WORKER_LOST".equals(anchor.getRunDisposition())
+                        && !anchor.isAutoResume()
+                        && "DAG_BLOCKING_TERMINAL_INCOMPLETE".equals(anchor.getFinalizerError())
+                        && anchor.getBlockingOwnerId() != null
+                        && anchor.getBlockingLeaseUntil() != null),
+                any(Instant.class));
         verify(dispatchStore, never()).transferToPending(anyString(), any());
         verify(capacity, never()).releaseReservation(any());
         verifyNoInteractions(recorder);
@@ -335,6 +353,11 @@ class PythonSandboxToolsDataIntenseTest {
                 .contains("\"code\":\"DAG_BLOCKING_TIMEOUT\"")
                 .contains("timeout_at");
         assertThat(System.currentTimeMillis() - startedAt).isBetween(850L, 2500L);
+        verify(dispatchStore).promoteDagBlockingWorkerLost(
+                eq("run-test"),
+                argThat(anchor -> "DAG_BLOCKING_WORKER_LOST".equals(anchor.getRunDisposition())
+                        && "DAG_BLOCKING_TIMEOUT".equals(anchor.getFinalizerError())),
+                any(Instant.class));
         verify(dispatchStore, never()).transferToPending(anyString(), any());
         verify(capacity, never()).releaseReservation(any());
         verifyNoInteractions(recorder);
@@ -367,9 +390,448 @@ class PythonSandboxToolsDataIntenseTest {
         } finally {
             Thread.interrupted();
         }
+        verify(dispatchStore).promoteDagBlockingWorkerLost(
+                eq("run-test"),
+                argThat(anchor -> "DAG_BLOCKING_WORKER_LOST".equals(anchor.getRunDisposition())
+                        && "DAG_BLOCKING_INTERRUPTED".equals(anchor.getFinalizerError())),
+                any(Instant.class));
         verify(dispatchStore, never()).transferToPending(anyString(), any());
         verify(capacity, never()).releaseReservation(any());
         verifyNoInteractions(recorder);
+    }
+
+    @Test
+    void dagFastPathStatusRpcFailureTransfersCleanupOwnership() throws Exception {
+        fixtureDataset();
+        AgentContext.setWorkflow("dag");
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
+        when(dispatchStore.persistAttached(eq("run-test"), any())).thenReturn(true);
+        when(sandbox.createTask(any())).thenAnswer(invocation -> {
+            ExecuteRequest request = invocation.getArgument(0);
+            return ExecuteResponse.newBuilder().setTaskId("task-dag-fast-rpc")
+                    .setRequestFingerprint(request.getRequestFingerprint()).build();
+        });
+        when(sandbox.getTaskStatus(any()))
+                .thenThrow(new IllegalStateException("status transport unavailable"));
+
+        String output = tools.executePython("print(1)", "1", null, null, 30);
+
+        assertThat(output)
+                .contains("\"ok\":false")
+                .contains("\"code\":\"DAG_BLOCKING_POLL_FAILED\"")
+                .contains("status transport unavailable");
+        verify(dispatchStore).promoteDagBlockingWorkerLost(
+                eq("run-test"),
+                argThat(anchor -> "DAG_BLOCKING_WORKER_LOST".equals(anchor.getRunDisposition())
+                        && "DAG_BLOCKING_POLL_FAILED".equals(anchor.getFinalizerError())),
+                any(Instant.class));
+        verify(dispatchStore, never()).transferToPending(anyString(), any());
+        verify(capacity, never()).releaseReservation(any());
+        verifyNoInteractions(recorder);
+    }
+
+    @Test
+    void dagFastPathStatusErrorResponseTransfersCleanupOwnership() throws Exception {
+        fixtureDataset();
+        AgentContext.setWorkflow("dag");
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
+        when(dispatchStore.persistAttached(eq("run-test"), any())).thenReturn(true);
+        when(sandbox.createTask(any())).thenAnswer(invocation -> {
+            ExecuteRequest request = invocation.getArgument(0);
+            return ExecuteResponse.newBuilder().setTaskId("task-dag-status-error")
+                    .setRequestFingerprint(request.getRequestFingerprint()).build();
+        });
+        when(sandbox.getTaskStatus(any())).thenReturn(
+                TaskStatusResponse.newBuilder()
+                        .setError("status gateway unavailable")
+                        .build());
+
+        String output = tools.executePython("print(1)", "1", null, null, 30);
+
+        assertThat(output)
+                .contains("\"ok\":false")
+                .contains("\"code\":\"DAG_BLOCKING_POLL_FAILED\"")
+                .contains("status gateway unavailable");
+        verify(dispatchStore).promoteDagBlockingWorkerLost(
+                eq("run-test"),
+                argThat(anchor -> "DAG_BLOCKING_WORKER_LOST".equals(anchor.getRunDisposition())
+                        && "DAG_BLOCKING_POLL_FAILED".equals(anchor.getFinalizerError())),
+                any(Instant.class));
+        verify(dispatchStore, never()).transferToPending(anyString(), any());
+        verify(capacity, never()).releaseReservation(any());
+        verifyNoInteractions(recorder);
+    }
+
+    @Test
+    void dagCleanupOwnershipTransferExceptionFailsClosedAsLeaseLost() throws Exception {
+        fixtureDataset();
+        AgentContext.setWorkflow("dag");
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
+        when(dispatchStore.persistAttached(eq("run-test"), any())).thenReturn(true);
+        when(dispatchStore.promoteDagBlockingWorkerLost(eq("run-test"), any(), any()))
+                .thenThrow(new IllegalStateException("postgres unavailable"));
+        when(sandbox.createTask(any())).thenAnswer(invocation -> {
+            ExecuteRequest request = invocation.getArgument(0);
+            return ExecuteResponse.newBuilder().setTaskId("task-dag-promote-error")
+                    .setRequestFingerprint(request.getRequestFingerprint()).build();
+        });
+        when(sandbox.getTaskStatus(any()))
+                .thenThrow(new IllegalStateException("status transport unavailable"));
+
+        String output = tools.executePython("print(1)", "1", null, null, 30);
+
+        assertThat(output)
+                .contains("\"ok\":false")
+                .contains("\"code\":\"DAG_BLOCKING_LEASE_LOST\"");
+        verify(dispatchStore).promoteDagBlockingWorkerLost(
+                eq("run-test"), any(), any(Instant.class));
+        verify(dispatchStore, never()).transferToPending(anyString(), any());
+        verify(capacity, never()).releaseReservation(any());
+        verifyNoInteractions(recorder);
+    }
+
+    @Test
+    void dagBlockingStatusRpcFailureTransfersCleanupOwnership() throws Exception {
+        fixtureDataset();
+        AgentContext.setWorkflow("dag");
+        inject("fastPathMs", 1L);
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
+        when(dispatchStore.persistAttached(eq("run-test"), any())).thenReturn(true);
+        when(sandbox.createTask(any())).thenAnswer(invocation -> {
+            ExecuteRequest request = invocation.getArgument(0);
+            return ExecuteResponse.newBuilder().setTaskId("task-dag-blocking-rpc")
+                    .setRequestFingerprint(request.getRequestFingerprint()).build();
+        });
+        when(sandbox.getTaskStatus(any()))
+                .thenReturn(TaskStatusResponse.newBuilder().setStatus("RUNNING").build())
+                .thenThrow(new IllegalStateException("blocking status transport unavailable"));
+
+        String output = tools.executePython("print(1)", "1", null, null, 30);
+
+        assertThat(output)
+                .contains("\"ok\":false")
+                .contains("\"code\":\"DAG_BLOCKING_POLL_FAILED\"")
+                .contains("blocking status transport unavailable");
+        verify(dispatchStore).promoteDagBlockingWorkerLost(
+                eq("run-test"),
+                argThat(anchor -> "DAG_BLOCKING_WORKER_LOST".equals(anchor.getRunDisposition())
+                        && "DAG_BLOCKING_POLL_FAILED".equals(anchor.getFinalizerError())),
+                any(Instant.class));
+        verify(dispatchStore, never()).transferToPending(anyString(), any());
+        verify(capacity, never()).releaseReservation(any());
+        verifyNoInteractions(recorder);
+    }
+
+    @Test
+    void dagTerminalResultRpcFailureTransfersCleanupOwnership() throws Exception {
+        fixtureDataset();
+        AgentContext.setWorkflow("dag");
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
+        when(dispatchStore.persistAttached(eq("run-test"), any())).thenReturn(true);
+        when(sandbox.createTask(any())).thenAnswer(invocation -> {
+            ExecuteRequest request = invocation.getArgument(0);
+            return ExecuteResponse.newBuilder().setTaskId("task-dag-result-rpc")
+                    .setRequestFingerprint(request.getRequestFingerprint()).build();
+        });
+        when(sandbox.getTaskStatus(any())).thenReturn(
+                TaskStatusResponse.newBuilder().setStatus("SUCCEEDED").build());
+        when(sandbox.getTaskResult(any()))
+                .thenThrow(new IllegalStateException("result transport unavailable"));
+
+        String output = tools.executePython("print(1)", "1", null, null, 30);
+
+        assertThat(output)
+                .contains("\"ok\":false")
+                .contains("\"code\":\"DAG_BLOCKING_RESULT_FETCH_FAILED\"")
+                .contains("result transport unavailable");
+        verify(dispatchStore).promoteDagBlockingWorkerLost(
+                eq("run-test"),
+                argThat(anchor -> "DAG_BLOCKING_WORKER_LOST".equals(anchor.getRunDisposition())
+                        && "DAG_BLOCKING_RESULT_FETCH_FAILED".equals(anchor.getFinalizerError())),
+                any(Instant.class));
+        verify(dispatchStore, never()).transferToPending(anyString(), any());
+        verify(capacity, never()).releaseReservation(any());
+        verifyNoInteractions(recorder);
+    }
+
+    @Test
+    void dagLeaseRenewalFailureStopsBeforeStatusAndDoesNotPromote() throws Exception {
+        fixtureDataset();
+        AgentContext.setWorkflow("dag");
+        Instant nearExpiry = Instant.now().plusSeconds(1);
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
+        when(dispatchStore.persistAttached(eq("run-test"), any())).thenAnswer(invocation -> {
+            ToolJobAnchor anchor = invocation.getArgument(1);
+            anchor.setBlockingLeaseUntil(nearExpiry);
+            return true;
+        });
+        when(dispatchStore.renewDagBlockingLease(eq("run-test"), any(), eq(nearExpiry)))
+                .thenReturn(false);
+        when(sandbox.createTask(any())).thenAnswer(invocation -> {
+            ExecuteRequest request = invocation.getArgument(0);
+            return ExecuteResponse.newBuilder().setTaskId("task-dag-lease-lost")
+                    .setRequestFingerprint(request.getRequestFingerprint()).build();
+        });
+
+        String output = tools.executePython("print(1)", "1", null, null, 30);
+
+        assertThat(output)
+                .contains("\"ok\":false")
+                .contains("\"code\":\"DAG_BLOCKING_LEASE_LOST\"");
+        verify(dispatchStore).renewDagBlockingLease(
+                eq("run-test"),
+                argThat(anchor -> nearExpiry.equals(anchor.getBlockingLeaseUntil())),
+                eq(nearExpiry));
+        verify(sandbox, never()).getTaskStatus(any());
+        verify(dispatchStore, never()).promoteDagBlockingWorkerLost(anyString(), any(), any());
+        verify(dispatchStore, never()).transferToPending(anyString(), any());
+        verify(capacity, never()).releaseReservation(any());
+        verifyNoInteractions(recorder);
+    }
+
+    @Test
+    void dagLeaseRenewalExceptionStopsBeforeStatusAndDoesNotPromote() throws Exception {
+        fixtureDataset();
+        AgentContext.setWorkflow("dag");
+        Instant nearExpiry = Instant.now().plusSeconds(1);
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
+        when(dispatchStore.persistAttached(eq("run-test"), any())).thenAnswer(invocation -> {
+            ToolJobAnchor anchor = invocation.getArgument(1);
+            anchor.setBlockingLeaseUntil(nearExpiry);
+            return true;
+        });
+        when(dispatchStore.renewDagBlockingLease(eq("run-test"), any(), eq(nearExpiry)))
+                .thenThrow(new IllegalStateException("postgres unavailable"));
+        when(sandbox.createTask(any())).thenAnswer(invocation -> {
+            ExecuteRequest request = invocation.getArgument(0);
+            return ExecuteResponse.newBuilder().setTaskId("task-dag-renew-error")
+                    .setRequestFingerprint(request.getRequestFingerprint()).build();
+        });
+
+        String output = tools.executePython("print(1)", "1", null, null, 30);
+
+        assertThat(output)
+                .contains("\"ok\":false")
+                .contains("\"code\":\"DAG_BLOCKING_LEASE_LOST\"");
+        verify(sandbox, never()).getTaskStatus(any());
+        verify(dispatchStore, never()).promoteDagBlockingWorkerLost(anyString(), any(), any());
+        verify(dispatchStore, never()).transferToPending(anyString(), any());
+        verify(capacity, never()).releaseReservation(any());
+        verifyNoInteractions(recorder);
+    }
+
+    @Test
+    void dagNearExpiryLeaseRenewsWithSameOwnerFence() throws Exception {
+        fixtureDataset();
+        AgentContext.setWorkflow("dag");
+        Instant nearExpiry = Instant.now().plusSeconds(1);
+        AtomicReference<String> owner = new AtomicReference<>();
+        AtomicReference<String> renewedOwner = new AtomicReference<>();
+        AtomicReference<Instant> firstExpectedLease = new AtomicReference<>();
+        AtomicReference<Instant> firstRenewedLease = new AtomicReference<>();
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(capacity.releaseReservation(any())).thenReturn(DataAnalysisReleaseOutcome.RELEASED);
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
+        when(dispatchStore.persistAttached(eq("run-test"), any())).thenAnswer(invocation -> {
+            ToolJobAnchor anchor = invocation.getArgument(1);
+            owner.set(anchor.getBlockingOwnerId());
+            anchor.setBlockingLeaseUntil(nearExpiry);
+            return true;
+        });
+        when(dispatchStore.renewDagBlockingLease(eq("run-test"), any(), any()))
+                .thenAnswer(invocation -> {
+                    ToolJobAnchor anchor = invocation.getArgument(1);
+                    if (firstExpectedLease.get() == null) {
+                        renewedOwner.set(anchor.getBlockingOwnerId());
+                        firstExpectedLease.set(invocation.getArgument(2));
+                        firstRenewedLease.set(anchor.getBlockingLeaseUntil());
+                    }
+                    return true;
+                });
+        when(recorder.upsert(any())).thenReturn(DataAnalysisUpsertOutcome.INSERTED);
+        when(sandbox.createTask(any())).thenAnswer(invocation -> {
+            ExecuteRequest request = invocation.getArgument(0);
+            return ExecuteResponse.newBuilder().setTaskId("task-dag-renew")
+                    .setRequestFingerprint(request.getRequestFingerprint()).build();
+        });
+        when(sandbox.getTaskStatus(any())).thenReturn(
+                TaskStatusResponse.newBuilder().setStatus("SUCCEEDED").build());
+        when(sandbox.getTaskResult(any())).thenReturn(TaskResultResponse.newBuilder()
+                .setTaskId("task-dag-renew").setStatus("SUCCEEDED").setExitCode(0)
+                .setStdout("renewed").setRetryable(false)
+                .setResourceUsage(completeUsage()).build());
+
+        String output = tools.executePython("print(1)", "1", null, null, 30);
+
+        assertThat(output).contains("\"ok\":true").contains("\"stdout\":\"renewed\"");
+        assertThat(owner.get()).isNotBlank();
+        assertThat(renewedOwner.get()).isEqualTo(owner.get());
+        assertThat(firstExpectedLease.get()).isEqualTo(nearExpiry);
+        assertThat(firstRenewedLease.get()).isAfter(nearExpiry);
+        verify(dispatchStore, atLeastOnce()).renewDagBlockingLease(
+                eq("run-test"), any(), any(Instant.class));
+        verify(dispatchStore, never()).promoteDagBlockingWorkerLost(anyString(), any(), any());
+        verify(dispatchStore, never()).transferToPending(anyString(), any());
+    }
+
+    @Test
+    void dagLateAuthoritativeNotFoundCannotClearAfterLeaseTakeover() throws Exception {
+        fixtureDataset();
+        AgentContext.setWorkflow("dag");
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
+        when(dispatchStore.renewDagBlockingLease(eq("run-test"), any(), any()))
+                .thenReturn(false);
+        when(sandbox.createTask(any()))
+                .thenThrow(new IllegalStateException("create response lost"));
+        when(sandbox.getTaskByOperationId(any())).thenReturn(
+                GetTaskByOperationIdResponse.newBuilder()
+                        .setFound(false)
+                        .build());
+
+        String output = tools.executePython("print(1)", "1", null, null, 30);
+
+        assertThat(output)
+                .contains("\"ok\":false")
+                .contains("\"code\":\"DAG_BLOCKING_LEASE_LOST\"");
+        verify(dispatchStore).renewDagBlockingLease(eq("run-test"), any(), any(Instant.class));
+        verify(capacity, never()).releaseReservation(any());
+        verify(dispatchStore, never()).beginDagBlockingPreparingAbort(anyString(), any(), any());
+        verify(dispatchStore, never()).completeDagBlockingPreparingAbort(anyString(), any(), any());
+        verify(dispatchStore, never()).clearActive(anyString(), anyString());
+        verifyNoInteractions(recorder);
+    }
+
+    @Test
+    void dagInvalidCreateResponseUsesDurableTwoPhasePreparingAbort() throws Exception {
+        fixtureDataset();
+        AgentContext.setWorkflow("dag");
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(capacity.releaseReservation(any())).thenReturn(DataAnalysisReleaseOutcome.RELEASED);
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
+        when(sandbox.createTask(any())).thenReturn(
+                ExecuteResponse.newBuilder().setError("create rejected").build());
+
+        String output = tools.executePython("print(1)", "1", null, null, 30);
+
+        assertThat(output)
+                .contains("\"ok\":false")
+                .contains("\"code\":\"CREATE_TASK_FAILED\"");
+        verify(dispatchStore).renewDagBlockingLease(eq("run-test"), any(), any(Instant.class));
+        verify(dispatchStore).beginDagBlockingPreparingAbort(
+                eq("run-test"),
+                argThat(anchor -> "ABORTING".equals(anchor.getAnchorState())
+                        && "DAG_BLOCKING_PREPARING_ABORT".equals(anchor.getRunDisposition())
+                        && anchor.getBlockingOwnerId() != null
+                        && anchor.getReservationJson().contains("\"state\":\"RELEASED\"")),
+                any(Instant.class));
+        verify(dispatchStore).completeDagBlockingPreparingAbort(
+                eq("run-test"),
+                argThat(anchor -> "ABORTING".equals(anchor.getAnchorState())
+                        && "DAG_BLOCKING_PREPARING_ABORT".equals(anchor.getRunDisposition())),
+                any(Instant.class));
+        var order = inOrder(dispatchStore, capacity);
+        order.verify(dispatchStore).beginDagBlockingPreparingAbort(
+                eq("run-test"), any(), any(Instant.class));
+        order.verify(capacity).releaseReservation(argThat(request ->
+                request.reason() == DataAnalysisReleaseReason.PREPARING_ABORTED));
+        order.verify(dispatchStore).completeDagBlockingPreparingAbort(
+                eq("run-test"), any(), any(Instant.class));
+        verify(dispatchStore, never()).clearActive(anyString(), anyString());
+        verifyNoInteractions(recorder);
+    }
+
+    @Test
+    void dagPreparingAbortFenceFailureDoesNotReleaseCapacity() throws Exception {
+        fixtureDataset();
+        AgentContext.setWorkflow("dag");
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
+        when(dispatchStore.beginDagBlockingPreparingAbort(eq("run-test"), any(), any()))
+                .thenReturn(false);
+        when(sandbox.createTask(any())).thenReturn(
+                ExecuteResponse.newBuilder().setError("create rejected").build());
+
+        String output = tools.executePython("print(1)", "1", null, null, 30);
+
+        assertThat(output)
+                .contains("\"ok\":false")
+                .contains("\"code\":\"DAG_BLOCKING_LEASE_LOST\"");
+        verify(dispatchStore).beginDagBlockingPreparingAbort(
+                eq("run-test"), any(), any(Instant.class));
+        verify(capacity, never()).releaseReservation(any());
+        verify(dispatchStore, never()).completeDagBlockingPreparingAbort(
+                anyString(), any(), any());
+    }
+
+    @Test
+    void dagPreparingAbortCompletionFailureLeavesReleasedIntentForReentry() throws Exception {
+        fixtureDataset();
+        AgentContext.setWorkflow("dag");
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(capacity.releaseReservation(any())).thenReturn(DataAnalysisReleaseOutcome.RELEASED);
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
+        when(dispatchStore.completeDagBlockingPreparingAbort(eq("run-test"), any(), any()))
+                .thenReturn(false);
+        when(sandbox.createTask(any())).thenReturn(
+                ExecuteResponse.newBuilder().setError("create rejected").build());
+
+        String output = tools.executePython("print(1)", "1", null, null, 30);
+
+        assertThat(output)
+                .contains("\"ok\":false")
+                .contains("\"code\":\"DAG_BLOCKING_LEASE_LOST\"");
+        verify(dispatchStore).beginDagBlockingPreparingAbort(
+                eq("run-test"),
+                argThat(anchor -> "ABORTING".equals(anchor.getAnchorState())
+                        && anchor.getReservationJson().contains("\"state\":\"RELEASED\"")),
+                any(Instant.class));
+        verify(capacity).releaseReservation(argThat(request ->
+                request.reason() == DataAnalysisReleaseReason.PREPARING_ABORTED));
+        verify(dispatchStore).completeDagBlockingPreparingAbort(
+                eq("run-test"), any(), any(Instant.class));
+    }
+
+    @Test
+    void dagPreparingAbortBeginExceptionFallsBackToWorkerLostWithoutRelease() throws Exception {
+        fixtureDataset();
+        AgentContext.setWorkflow("dag");
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
+        when(dispatchStore.beginDagBlockingPreparingAbort(eq("run-test"), any(), any()))
+                .thenThrow(new IllegalStateException("abort CAS outcome unknown"));
+        when(sandbox.createTask(any())).thenReturn(
+                ExecuteResponse.newBuilder().setError("create rejected").build());
+
+        String output = tools.executePython("print(1)", "1", null, null, 30);
+
+        assertThat(output)
+                .contains("\"ok\":false")
+                .contains("\"code\":\"DAG_BLOCKING_LIFECYCLE_FAILED\"");
+        verify(dispatchStore).promoteDagBlockingWorkerLost(
+                eq("run-test"),
+                argThat(anchor -> "PREPARING".equals(anchor.getAnchorState())
+                        && "DAG_BLOCKING_WORKER_LOST".equals(anchor.getRunDisposition())
+                        && anchor.getReservationJson().contains("\"state\":\"PREPARING\"")),
+                any(Instant.class));
+        verify(capacity, never()).releaseReservation(any());
+        verify(dispatchStore, never()).completeDagBlockingPreparingAbort(
+                anyString(), any(), any());
     }
 
     @Test
@@ -460,6 +922,102 @@ class PythonSandboxToolsDataIntenseTest {
         verify(capacity, never()).releaseReservation(any());
         verify(dispatchStore).transferToPending(eq("run-test"), argThat(anchor ->
                 "task-existing".equals(anchor.getTaskId())));
+    }
+
+    @Test
+    void dagPersistAttachedExceptionTransfersOuterFallbackOwnership() throws Exception {
+        fixtureDataset();
+        AgentContext.setWorkflow("dag");
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
+        when(dispatchStore.persistAttached(eq("run-test"), any()))
+                .thenThrow(new IllegalStateException("postgres write outcome unknown"));
+        when(sandbox.createTask(any())).thenAnswer(invocation -> {
+            ExecuteRequest request = invocation.getArgument(0);
+            return ExecuteResponse.newBuilder()
+                    .setTaskId("task-dag-attach-unknown")
+                    .setRequestFingerprint(request.getRequestFingerprint())
+                    .build();
+        });
+
+        String output = tools.executePython("print(1)", "1", null, null, 30);
+
+        assertThat(output)
+                .contains("\"ok\":false")
+                .contains("\"code\":\"DAG_BLOCKING_LIFECYCLE_FAILED\"")
+                .contains("postgres write outcome unknown");
+        verify(dispatchStore).promoteDagBlockingWorkerLost(
+                eq("run-test"),
+                argThat(anchor -> "ATTACHED".equals(anchor.getAnchorState())
+                        && "task-dag-attach-unknown".equals(anchor.getTaskId())
+                        && "DAG_BLOCKING_WORKER_LOST".equals(anchor.getRunDisposition())),
+                any(Instant.class));
+        verify(capacity, never()).releaseReservation(any());
+        verify(dispatchStore, never()).transferToPending(anyString(), any());
+    }
+
+    @Test
+    void dagCapacityRestoreConflictTransfersAttachedProofToOuterFallback() throws Exception {
+        fixtureDataset();
+        AgentContext.setWorkflow("dag");
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.CONFLICT);
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
+        when(sandbox.createTask(any())).thenAnswer(invocation -> {
+            ExecuteRequest request = invocation.getArgument(0);
+            return ExecuteResponse.newBuilder()
+                    .setTaskId("task-dag-capacity-conflict")
+                    .setRequestFingerprint(request.getRequestFingerprint())
+                    .build();
+        });
+
+        String output = tools.executePython("print(1)", "1", null, null, 30);
+
+        assertThat(output)
+                .contains("\"ok\":false")
+                .contains("\"code\":\"DAG_BLOCKING_LIFECYCLE_FAILED\"");
+        verify(dispatchStore).promoteDagBlockingWorkerLost(
+                eq("run-test"),
+                argThat(anchor -> "ATTACHED".equals(anchor.getAnchorState())
+                        && "task-dag-capacity-conflict".equals(anchor.getTaskId())
+                        && anchor.getReservationJson().contains("\"state\":\"TASK_ATTACHED\"")
+                        && "DAG_BLOCKING_WORKER_LOST".equals(anchor.getRunDisposition())),
+                any(Instant.class));
+        verify(dispatchStore, never()).persistAttached(anyString(), any());
+        verify(capacity, never()).releaseReservation(any());
+    }
+
+    @Test
+    void dagAmbiguousCreateExceptionTransfersOuterFallbackOwnership() throws Exception {
+        fixtureDataset();
+        AgentContext.setWorkflow("dag");
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
+        when(sandbox.createTask(any()))
+                .thenThrow(new IllegalStateException("create response lost"));
+        when(sandbox.getTaskByOperationId(any())).thenReturn(
+                GetTaskByOperationIdResponse.newBuilder()
+                        .setFound(false)
+                        .setError("lookup unavailable")
+                        .build());
+
+        String output = tools.executePython("print(1)", "1", null, null, 30);
+
+        assertThat(output)
+                .contains("\"ok\":false")
+                .contains("\"code\":\"DAG_BLOCKING_LIFECYCLE_FAILED\"")
+                .contains("create response lost");
+        verify(dispatchStore).promoteDagBlockingWorkerLost(
+                eq("run-test"),
+                argThat(anchor -> "PREPARING".equals(anchor.getAnchorState())
+                        && anchor.getTaskId() == null
+                        && "DAG_BLOCKING_WORKER_LOST".equals(anchor.getRunDisposition())),
+                any(Instant.class));
+        verify(capacity, never()).releaseReservation(any());
+        verify(dispatchStore, never()).beginDagBlockingPreparingAbort(
+                anyString(), any(), any());
+        verify(dispatchStore, never()).transferToPending(anyString(), any());
     }
 
     @Test

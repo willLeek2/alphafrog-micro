@@ -4,6 +4,8 @@ import org.junit.jupiter.api.Test;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 
+import java.time.Instant;
+
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
@@ -67,6 +69,131 @@ class PythonSandboxDispatchStoreImplTest {
     }
 
     @Test
+    void liveDagSnapshotsUseOwnerAndLeaseFence() {
+        ToolJobAnchor anchor = liveDagAnchor("ATTACHED");
+        Instant expectedLease = anchor.getBlockingLeaseUntil();
+        when(anchorService.updateLiveDagBlocking(
+                "run-1", anchor, AgentRunStatus.EXECUTING,
+                "run-1:call-1:1", "worker-a", expectedLease))
+                .thenReturn(true);
+
+        assertThat(store.persistAttached("run-1", anchor)).isTrue();
+
+        verify(anchorService).updateLiveDagBlocking(
+                "run-1", anchor, AgentRunStatus.EXECUTING,
+                "run-1:call-1:1", "worker-a", expectedLease);
+        verify(anchorService, never()).updateActive(any(), any(), any(), any());
+    }
+
+    @Test
+    void dagLeaseRenewalBindsExactPreviousLease() {
+        ToolJobAnchor anchor = liveDagAnchor("ATTACHED");
+        Instant previousLease = anchor.getBlockingLeaseUntil();
+        anchor.setBlockingLeaseUntil(previousLease.plusSeconds(30));
+        when(anchorService.updateLiveDagBlocking(
+                "run-1", anchor, AgentRunStatus.EXECUTING,
+                "run-1:call-1:1", "worker-a", previousLease))
+                .thenReturn(true);
+
+        assertThat(store.renewDagBlockingLease(
+                "run-1", anchor, previousLease)).isTrue();
+
+        verify(anchorService).updateLiveDagBlocking(
+                "run-1", anchor, AgentRunStatus.EXECUTING,
+                "run-1:call-1:1", "worker-a", previousLease);
+        verifyNoInteractions(redisCache);
+    }
+
+    @Test
+    void dagWorkerLostPromotionCommitsPostgresBeforeBestEffortRedis() {
+        ToolJobAnchor anchor = liveDagAnchor("ATTACHED");
+        Instant expectedLease = anchor.getBlockingLeaseUntil();
+        anchor.setRunDisposition("DAG_BLOCKING_WORKER_LOST");
+        when(anchorService.updateLiveDagBlocking(
+                "run-1", anchor, AgentRunStatus.EXECUTING,
+                "run-1:call-1:1", "worker-a", expectedLease))
+                .thenReturn(true);
+        doThrow(new IllegalStateException("redis unavailable"))
+                .when(redisCache).atomicWritePendingAndDue("run-1", anchor);
+
+        assertThat(store.promoteDagBlockingWorkerLost(
+                "run-1", anchor, expectedLease)).isTrue();
+
+        var order = inOrder(anchorService, redisCache);
+        order.verify(anchorService).updateLiveDagBlocking(
+                "run-1", anchor, AgentRunStatus.EXECUTING,
+                "run-1:call-1:1", "worker-a", expectedLease);
+        order.verify(redisCache).atomicWritePendingAndDue("run-1", anchor);
+    }
+
+    @Test
+    void dagWorkerLostPromotionDoesNotPublishRedisWhenFenceFails() {
+        ToolJobAnchor anchor = liveDagAnchor("ATTACHED");
+        Instant expectedLease = anchor.getBlockingLeaseUntil();
+        anchor.setRunDisposition("DAG_BLOCKING_WORKER_LOST");
+        when(anchorService.updateLiveDagBlocking(
+                "run-1", anchor, AgentRunStatus.EXECUTING,
+                "run-1:call-1:1", "worker-a", expectedLease))
+                .thenReturn(false);
+
+        assertThat(store.promoteDagBlockingWorkerLost(
+                "run-1", anchor, expectedLease)).isFalse();
+
+        verifyNoInteractions(redisCache);
+    }
+
+    @Test
+    void dagPreparingAbortBeginBindsOwnerAndExactLeaseFence() {
+        ToolJobAnchor anchor = liveDagAnchor("ABORTING");
+        Instant expectedLease = anchor.getBlockingLeaseUntil();
+        anchor.setRunDisposition("DAG_BLOCKING_PREPARING_ABORT");
+        when(anchorService.beginLiveDagBlockingPreparingAbort(
+                "run-1", anchor, AgentRunStatus.EXECUTING,
+                "run-1:call-1:1", "worker-a", expectedLease))
+                .thenReturn(true);
+
+        assertThat(store.beginDagBlockingPreparingAbort(
+                "run-1", anchor, expectedLease)).isTrue();
+
+        verify(anchorService).beginLiveDagBlockingPreparingAbort(
+                "run-1", anchor, AgentRunStatus.EXECUTING,
+                "run-1:call-1:1", "worker-a", expectedLease);
+    }
+
+    @Test
+    void dagPreparingAbortCompletionIsReentrantAfterLeaseExpiry() {
+        ToolJobAnchor anchor = liveDagAnchor("ABORTING");
+        Instant expectedLease = anchor.getBlockingLeaseUntil();
+        anchor.setRunDisposition("DAG_BLOCKING_PREPARING_ABORT");
+        when(anchorService.completeLiveDagBlockingPreparingAbort(
+                "run-1", AgentRunStatus.EXECUTING,
+                "run-1:call-1:1", "worker-a", expectedLease))
+                .thenReturn(true);
+
+        assertThat(store.completeDagBlockingPreparingAbort(
+                "run-1", anchor, expectedLease)).isTrue();
+
+        verify(anchorService).completeLiveDagBlockingPreparingAbort(
+                "run-1", AgentRunStatus.EXECUTING,
+                "run-1:call-1:1", "worker-a", expectedLease);
+    }
+
+    @Test
+    void dagPreparingAbortRejectsAttachedAnchorWithoutCallingDatabase() {
+        ToolJobAnchor anchor = liveDagAnchor("ATTACHED");
+
+        assertThat(store.beginDagBlockingPreparingAbort(
+                "run-1", anchor, anchor.getBlockingLeaseUntil())).isFalse();
+        assertThat(store.completeDagBlockingPreparingAbort(
+                "run-1", anchor, anchor.getBlockingLeaseUntil())).isFalse();
+
+        verify(anchorService, never()).beginLiveDagBlockingPreparingAbort(
+                any(), any(), any(), any(), any(), any());
+        verify(anchorService, never()).completeLiveDagBlockingPreparingAbort(
+                any(), any(), any(), any(), any());
+    }
+
+    @Test
     void synchronousCompletionUsesProofGatedExecutingCas() {
         when(anchorService.clearSynchronouslyCompleted(
                 "run-1", AgentRunStatus.EXECUTING, "run-1:call-1:1"))
@@ -84,6 +211,15 @@ class PythonSandboxDispatchStoreImplTest {
         ToolJobAnchor anchor = new ToolJobAnchor();
         anchor.setOperationId("run-1:call-1:1");
         anchor.setAnchorState(state);
+        return anchor;
+    }
+
+    private ToolJobAnchor liveDagAnchor(String state) {
+        ToolJobAnchor anchor = anchor(state);
+        anchor.setRunDisposition("DAG_BLOCKING_NO_RESUME");
+        anchor.setAutoResume(false);
+        anchor.setBlockingOwnerId("worker-a");
+        anchor.setBlockingLeaseUntil(Instant.parse("2099-01-01T00:00:00Z"));
         return anchor;
     }
 }

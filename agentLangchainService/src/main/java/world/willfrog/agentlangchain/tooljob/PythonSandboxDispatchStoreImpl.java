@@ -7,6 +7,8 @@ import world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 
+import java.time.Instant;
+
 /**
  * executePython 分发阶段的 PostgreSQL 真相源实现。
  * PREPARING、ATTACHED、PENDING 三次推进都先写 DB；只有 PENDING 成功后才派生 Redis 索引。
@@ -15,6 +17,11 @@ import world.willfrog.agent.platform.model.AgentRunStatus;
 @RequiredArgsConstructor
 @Slf4j
 public class PythonSandboxDispatchStoreImpl implements PythonSandboxDispatchStore {
+
+    private static final String DAG_BLOCKING_NO_RESUME = "DAG_BLOCKING_NO_RESUME";
+    private static final String DAG_BLOCKING_WORKER_LOST = "DAG_BLOCKING_WORKER_LOST";
+    private static final String DAG_BLOCKING_PREPARING_ABORT =
+            "DAG_BLOCKING_PREPARING_ABORT";
 
     private final ToolJobAnchorService anchorService;
     private final ToolJobRedisCache redisCache;
@@ -29,10 +36,21 @@ public class PythonSandboxDispatchStoreImpl implements PythonSandboxDispatchStor
     @Override
     public boolean persistAttached(String runId, ToolJobAnchor anchor) {
         // fast-path 可能直接推进 TERMINAL，因此 ATTACHED/TERMINAL 都按 operationId 更新 active anchor。
-        return ("ATTACHED".equals(anchor.getAnchorState())
-                || "TERMINAL".equals(anchor.getAnchorState()))
-                && anchorService.updateActive(
-                        runId, anchor, AgentRunStatus.EXECUTING, anchor.getOperationId());
+        if (!"ATTACHED".equals(anchor.getAnchorState())
+                && !"TERMINAL".equals(anchor.getAnchorState())) {
+            return false;
+        }
+        if (DAG_BLOCKING_NO_RESUME.equals(anchor.getRunDisposition())) {
+            return anchorService.updateLiveDagBlocking(
+                    runId,
+                    anchor,
+                    AgentRunStatus.EXECUTING,
+                    anchor.getOperationId(),
+                    anchor.getBlockingOwnerId(),
+                    anchor.getBlockingLeaseUntil());
+        }
+        return anchorService.updateActive(
+                runId, anchor, AgentRunStatus.EXECUTING, anchor.getOperationId());
     }
 
     @Override
@@ -68,5 +86,85 @@ public class PythonSandboxDispatchStoreImpl implements PythonSandboxDispatchStor
     public boolean clearSynchronouslyCompleted(String runId, String operationId) {
         return anchorService.clearSynchronouslyCompleted(
                 runId, AgentRunStatus.EXECUTING, operationId);
+    }
+
+    @Override
+    public boolean renewDagBlockingLease(
+            String runId,
+            ToolJobAnchor anchor,
+            Instant expectedLeaseUntil) {
+        if (!DAG_BLOCKING_NO_RESUME.equals(anchor.getRunDisposition())) {
+            return false;
+        }
+        return anchorService.updateLiveDagBlocking(
+                runId,
+                anchor,
+                AgentRunStatus.EXECUTING,
+                anchor.getOperationId(),
+                anchor.getBlockingOwnerId(),
+                expectedLeaseUntil);
+    }
+
+    @Override
+    public boolean promoteDagBlockingWorkerLost(
+            String runId,
+            ToolJobAnchor anchor,
+            Instant expectedLeaseUntil) {
+        if (!DAG_BLOCKING_WORKER_LOST.equals(anchor.getRunDisposition())) {
+            return false;
+        }
+        boolean promoted = anchorService.updateLiveDagBlocking(
+                runId,
+                anchor,
+                AgentRunStatus.EXECUTING,
+                anchor.getOperationId(),
+                anchor.getBlockingOwnerId(),
+                expectedLeaseUntil);
+        if (!promoted) {
+            return false;
+        }
+        // PostgreSQL 是 owner 真相；Redis 只加速 cleanup，失败后可由 fallback scan 重建。
+        try {
+            redisCache.atomicWritePendingAndDue(runId, anchor);
+        } catch (Exception cacheFailure) {
+            log.warn("DAG cleanup Redis derivative write failed for run={}, durable marker remains: {}",
+                    runId, cacheFailure.getMessage());
+        }
+        return true;
+    }
+
+    @Override
+    public boolean beginDagBlockingPreparingAbort(
+            String runId,
+            ToolJobAnchor anchor,
+            Instant expectedLeaseUntil) {
+        if (!"ABORTING".equals(anchor.getAnchorState())
+                || !DAG_BLOCKING_PREPARING_ABORT.equals(anchor.getRunDisposition())) {
+            return false;
+        }
+        return anchorService.beginLiveDagBlockingPreparingAbort(
+                runId,
+                anchor,
+                AgentRunStatus.EXECUTING,
+                anchor.getOperationId(),
+                anchor.getBlockingOwnerId(),
+                expectedLeaseUntil);
+    }
+
+    @Override
+    public boolean completeDagBlockingPreparingAbort(
+            String runId,
+            ToolJobAnchor anchor,
+            Instant expectedLeaseUntil) {
+        if (!"ABORTING".equals(anchor.getAnchorState())
+                || !DAG_BLOCKING_PREPARING_ABORT.equals(anchor.getRunDisposition())) {
+            return false;
+        }
+        return anchorService.completeLiveDagBlockingPreparingAbort(
+                runId,
+                AgentRunStatus.EXECUTING,
+                anchor.getOperationId(),
+                anchor.getBlockingOwnerId(),
+                expectedLeaseUntil);
     }
 }

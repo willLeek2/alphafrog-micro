@@ -47,6 +47,9 @@ public class PythonSandboxTools {
 
     /** 轮询沙箱任务状态的间隔（毫秒）。 */
     private static final int POLL_INTERVAL_MS = 1000;
+    /** lease 剩余一半时续租，避免每次 fast-path poll 都写 PostgreSQL。 */
+    private static final long DAG_LEASE_RENEW_AHEAD_MILLIS =
+            DagBlockingWorkerLease.LEASE_DURATION.toMillis() / 2L;
     /** schema 2 起保证 estimate 与 reservation 同源；旧错配兼容只能处理 schema 1。 */
     private static final int DATA_INTENSE_ANCHOR_SCHEMA_VERSION = 2;
 
@@ -574,6 +577,11 @@ public class PythonSandboxTools {
         // timeoutAt 和 nextPollAt 都是 durable 时间，重启后不重新计时。
         anchor.setTimeoutAt(Instant.now().plusMillis(timeoutMillis));
         anchor.setNextPollAt(Instant.now().plusMillis(POLL_INTERVAL_MS));
+        if (!waitPolicy.durableSuspend()) {
+            // ownerId 在 JVM 生命周期内稳定；lease 从首次 durable claim 前开始计时。
+            anchor.setBlockingOwnerId(DagBlockingWorkerLease.processOwnerId());
+            anchor.setBlockingLeaseUntil(DagBlockingWorkerLease.renewedUntil(Instant.now()));
+        }
 
         // 必须先 CAS 占有空 anchor，再调用有副作用的 createTask。
         if (!pythonSandboxDispatchStore.persistPreparing(runId, anchor)) {
@@ -583,133 +591,219 @@ public class PythonSandboxTools {
                     "Failed to persist PREPARING tool-job anchor", Map.of("operation_id", identity.operationId()));
         }
 
-        // createResp 可能来自首次 RPC，也可能来自 operationId 灾后查询。
-        ExecuteResponse createResp;
+        /*
+         * 从 durable PREPARING claim 成功开始，DAG worker 的任何异常退场都必须先移交
+         * owner。局部路径负责更精确的 abort/poll 分类；这里的 outer fallback 覆盖序列化、
+         * capacity restore、persistAttached 以及 create 身份不确定等未被局部 catch 的异常。
+         */
         try {
-            installDebugRpcAttachments();
-            // Sandbox 必须按 operationId/requestFingerprint 幂等创建。
-            createResp = pythonSandboxService.createTask(request);
-        } catch (Exception createFailure) {
+            // createResp 可能来自首次 RPC，也可能来自 operationId 灾后查询。
+            ExecuteResponse createResp;
             try {
-                // RPC 异常不代表服务端未创建；先按 operationId 查找，禁止立即重建第二任务。
-                GetTaskByOperationIdResponse lookup = pythonSandboxService.getTaskByOperationId(
-                        GetTaskByOperationIdRequest.newBuilder()
-                                .setOperationId(identity.operationId()).build());
-                if (lookup != null && lookup.getFound()
-                        && !lookup.getTaskId().isBlank()
-                        && !lookup.getRequestFingerprint().isBlank()
-                        && spec.requestFingerprint().equals(lookup.getRequestFingerprint())) {
-                    // canonical operation 必须返回完全相同且非空的 fingerprint，才能附着已有任务。
-                    createResp = ExecuteResponse.newBuilder()
-                            .setTaskId(lookup.getTaskId())
-                            .setRequestFingerprint(spec.requestFingerprint())
-                            .build();
-                } else if (lookup != null && !lookup.getFound()
-                        && lookup.getError().isBlank()) {
-                    /*
-                     * 只有权威响应“未找到且无查询错误”才能证明 create 未发生。Gateway transport/
-                     * 5xx/解析异常会返回 found=false + error；该状态不具备否定证明，必须保留
-                     * PREPARING，避免真实 Sandbox task 已创建却被 Java 释放容量并清 anchor。
-                     */
-                    if (releasePreDispatch(reservation)) {
-                        pythonSandboxDispatchStore.clearActive(runId, identity.operationId());
+                installDebugRpcAttachments();
+                // Sandbox 必须按 operationId/requestFingerprint 幂等创建。
+                createResp = pythonSandboxService.createTask(request);
+            } catch (Exception createFailure) {
+                try {
+                    // RPC 异常不代表服务端未创建；先按 operationId 查找，禁止立即重建第二任务。
+                    GetTaskByOperationIdResponse lookup = pythonSandboxService.getTaskByOperationId(
+                            GetTaskByOperationIdRequest.newBuilder()
+                                    .setOperationId(identity.operationId()).build());
+                    if (lookup != null && lookup.getFound()
+                            && !lookup.getTaskId().isBlank()
+                            && !lookup.getRequestFingerprint().isBlank()
+                            && spec.requestFingerprint().equals(lookup.getRequestFingerprint())) {
+                        // canonical operation 必须返回完全相同且非空的 fingerprint，才能附着已有任务。
+                        createResp = ExecuteResponse.newBuilder()
+                                .setTaskId(lookup.getTaskId())
+                                .setRequestFingerprint(spec.requestFingerprint())
+                                .build();
+                    } else if (lookup != null && !lookup.getFound()
+                            && lookup.getError().isBlank()) {
+                        /*
+                         * 只有权威响应“未找到且无查询错误”才能证明 create 未发生。Gateway transport/
+                         * 5xx/解析异常会返回 found=false + error；该状态不具备否定证明，必须保留
+                         * PREPARING，避免真实 Sandbox task 已创建却被 Java 释放容量并清 anchor。
+                         */
+                        if (!waitPolicy.durableSuspend()) {
+                            if (!abortDagBlockingPreparing(runId, anchor, reservation)) {
+                                return dagBlockingLeaseLost(
+                                        null, toolStartMs,
+                                        "durable PREPARING abort was rejected after authoritative create result");
+                            }
+                            return fail("executePython", "CREATE_TASK_FAILED",
+                                    "Sandbox create failed and the operation was authoritatively absent",
+                                    Map.of("operation_id", identity.operationId(),
+                                            "message", nvl(createFailure.getMessage())));
+                        }
+                        if (releasePreDispatch(reservation)) {
+                            pythonSandboxDispatchStore.clearActive(runId, identity.operationId());
+                        }
+                        throw createFailure;
+                    } else {
+                        // 查询也无法证明结果时保留 PREPARING，交给 startup recovery 决定，不能猜测释放。
+                        throw new IllegalStateException(
+                                "createTask outcome is ambiguous; PREPARING anchor retained", createFailure);
+                    }
+                } catch (Exception lookupFailure) {
+                    if (lookupFailure != createFailure) {
+                        createFailure.addSuppressed(lookupFailure);
                     }
                     throw createFailure;
-                } else {
-                    // 查询也无法证明结果时保留 PREPARING，交给 startup recovery 决定，不能猜测释放。
-                    throw new IllegalStateException(
-                            "createTask outcome is ambiguous; PREPARING anchor retained", createFailure);
                 }
-            } catch (Exception lookupFailure) {
-                if (lookupFailure != createFailure) {
-                    createFailure.addSuppressed(lookupFailure);
-                }
-                throw createFailure;
             }
-        }
-        // create 响应必须包含无错误的 taskId，否则在确认释放成功后清 active anchor。
-        if (createResp == null || createResp.getError() != null && !createResp.getError().isEmpty()
-                || createResp.getTaskId() == null || createResp.getTaskId().isBlank()) {
-            if (releasePreDispatch(reservation)) {
-                pythonSandboxDispatchStore.clearActive(runId, identity.operationId());
-            }
-            return fail("executePython", "CREATE_TASK_FAILED",
-                    "Failed to create python sandbox task",
-                    Map.of("message", createResp == null ? "empty response" : nvl(createResp.getError())));
-        }
-        String taskId = createResp.getTaskId();
-        /*
-         * create 响应里的 canonical fingerprint 是 taskId 的身份凭据，不是可选诊断字段。
-         * 直接响应若为空或漂移，必须先用 operationId 做一次权威回读；只有同 taskId、精确且
-         * 非空的 fingerprint 才允许 PREPARING→ATTACHED。查询错误、未找到、taskId 漂移
-         * 都保留 PREPARING，严禁转普通 PENDING 后让 reconciler 消费未验证任务。
-         */
-        if (createResp.getRequestFingerprint().isBlank()
-                || !spec.requestFingerprint().equals(createResp.getRequestFingerprint())) {
-            GetTaskByOperationIdResponse lookup = null;
-            try {
-                lookup = pythonSandboxService.getTaskByOperationId(
-                        GetTaskByOperationIdRequest.newBuilder()
-                                .setOperationId(identity.operationId()).build());
-            } catch (Exception lookupFailure) {
-                log.error("Sandbox create identity lookup failed for run={}, operationId={}, taskId={}",
-                        runId, identity.operationId(), taskId, lookupFailure);
-            }
-            boolean canonicalIdentityConfirmed = lookup != null
-                    && lookup.getFound()
-                    && taskId.equals(lookup.getTaskId())
-                    && !lookup.getRequestFingerprint().isBlank()
-                    && spec.requestFingerprint().equals(lookup.getRequestFingerprint());
-            if (!canonicalIdentityConfirmed) {
-                log.error("Sandbox create identity unverified for run={}, operationId={}, taskId={}; "
-                                + "PREPARING anchor retained for fail-closed recovery",
-                        runId, identity.operationId(), taskId);
-                throw new IllegalStateException(
-                        "createTask identity is unverified; PREPARING anchor retained");
-            }
-        }
-
-        // taskId 与 canonical fingerprint 同时确认后，才把 reservation 转为 TASK_ATTACHED。
-        reservation = transitionReservation(reservation, DataAnalysisReservationState.TASK_ATTACHED, taskId);
-        // 容量账本必须接受同一 reservation 的附着状态，冲突时停止推进。
-        if (dataAnalysisCapacityService.restoreReservation(reservation) == DataAnalysisRestoreOutcome.CONFLICT) {
-            throw new IllegalStateException("capacity reservation attachment conflicted for task=" + taskId);
-        }
-        // taskId、ATTACHED 和 reservation 状态一起落入 durable anchor。
-        anchor.setTaskId(taskId);
-        anchor.setAnchorState("ATTACHED");
-        anchor.setReservationJson(objectMapper.writeValueAsString(reservation));
-        pythonSandboxDispatchStore.persistAttached(runId, anchor);
-
-        // 两种策略先共享极短 fast-path；到期后 LINEAR 才让出 worker，DAG 改为阻塞轮询。
-        long fastDeadline = System.currentTimeMillis() + Math.max(1L, fastPathMs);
-        while (System.currentTimeMillis() < fastDeadline) {
-            // 状态查询短而轻量，终态时再拉取结果体。
-            TaskStatusResponse statusResp = getTaskStatus(taskId);
-            String status = statusResp == null ? "" : nvl(statusResp.getStatus());
-            if (isTerminal(status)) {
-                return finishTerminalByWaitPolicy(
-                        runId, identity, estimate, reservation, anchor, status,
-                        waitPolicy, toolStartMs);
-            }
-            // 每次最多睡 100ms，并且不越过 fastDeadline。
-            try {
-                TimeUnit.MILLISECONDS.sleep(
-                        Math.min(100L, Math.max(1L, fastDeadline - System.currentTimeMillis())));
-            } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
+            // create 响应必须包含无错误的 taskId，否则在确认释放成功后清 active anchor。
+            if (createResp == null || createResp.getError() != null && !createResp.getError().isEmpty()
+                    || createResp.getTaskId() == null || createResp.getTaskId().isBlank()) {
                 if (!waitPolicy.durableSuspend()) {
-                    return dagBlockingInterrupted(taskId, toolStartMs);
+                    if (!abortDagBlockingPreparing(runId, anchor, reservation)) {
+                        return dagBlockingLeaseLost(
+                                null, toolStartMs,
+                                "durable PREPARING abort was rejected after invalid create response");
+                    }
+                } else if (releasePreDispatch(reservation)) {
+                    pythonSandboxDispatchStore.clearActive(runId, identity.operationId());
                 }
-                throw interrupted;
+                return fail("executePython", "CREATE_TASK_FAILED",
+                        "Failed to create python sandbox task",
+                        Map.of("message", createResp == null ? "empty response" : nvl(createResp.getError())));
             }
+            String taskId = createResp.getTaskId();
+            /*
+             * create 响应里的 canonical fingerprint 是 taskId 的身份凭据，不是可选诊断字段。
+             * 直接响应若为空或漂移，必须先用 operationId 做一次权威回读；只有同 taskId、精确且
+             * 非空的 fingerprint 才允许 PREPARING→ATTACHED。查询错误、未找到、taskId 漂移
+             * 都保留 PREPARING，严禁转普通 PENDING 后让 reconciler 消费未验证任务。
+             */
+            if (createResp.getRequestFingerprint().isBlank()
+                    || !spec.requestFingerprint().equals(createResp.getRequestFingerprint())) {
+                GetTaskByOperationIdResponse lookup = null;
+                try {
+                    lookup = pythonSandboxService.getTaskByOperationId(
+                            GetTaskByOperationIdRequest.newBuilder()
+                                    .setOperationId(identity.operationId()).build());
+                } catch (Exception lookupFailure) {
+                    log.error("Sandbox create identity lookup failed for run={}, operationId={}, taskId={}",
+                            runId, identity.operationId(), taskId, lookupFailure);
+                }
+                boolean canonicalIdentityConfirmed = lookup != null
+                        && lookup.getFound()
+                        && taskId.equals(lookup.getTaskId())
+                        && !lookup.getRequestFingerprint().isBlank()
+                        && spec.requestFingerprint().equals(lookup.getRequestFingerprint());
+                if (!canonicalIdentityConfirmed) {
+                    log.error("Sandbox create identity unverified for run={}, operationId={}, taskId={}; "
+                                    + "PREPARING anchor retained for fail-closed recovery",
+                            runId, identity.operationId(), taskId);
+                    throw new IllegalStateException(
+                            "createTask identity is unverified; PREPARING anchor retained");
+                }
+            }
+
+            // taskId 与 canonical fingerprint 同时确认后，才把 reservation 转为 TASK_ATTACHED。
+            reservation = transitionReservation(reservation, DataAnalysisReservationState.TASK_ATTACHED, taskId);
+            /*
+             * 先生成完整 ATTACHED 快照，再改变本地 anchor；序列化失败时 outer fallback
+             * 仍以 PREPARING 做 operationId recovery，成功后则 capacity 异常也携带 task proof。
+             */
+            String attachedReservationJson = objectMapper.writeValueAsString(reservation);
+            anchor.setTaskId(taskId);
+            anchor.setAnchorState("ATTACHED");
+            anchor.setReservationJson(attachedReservationJson);
+            // 容量账本必须接受同一 reservation 的附着状态，冲突时停止推进。
+            if (dataAnalysisCapacityService.restoreReservation(reservation) == DataAnalysisRestoreOutcome.CONFLICT) {
+                throw new IllegalStateException("capacity reservation attachment conflicted for task=" + taskId);
+            }
+            // taskId、ATTACHED 和 reservation 状态一起落入 durable anchor。
+            if (!pythonSandboxDispatchStore.persistAttached(runId, anchor)) {
+                if (!waitPolicy.durableSuspend()) {
+                    return dagBlockingLeaseLost(
+                            taskId, toolStartMs, "attach CAS rejected the live DAG owner");
+                }
+                throw new IllegalStateException("failed to persist attached Sandbox task");
+            }
+
+            // 两种策略先共享极短 fast-path；到期后 LINEAR 才让出 worker，DAG 改为阻塞轮询。
+            long fastDeadline = System.currentTimeMillis() + Math.max(1L, fastPathMs);
+            while (System.currentTimeMillis() < fastDeadline) {
+                // 状态查询短而轻量，终态时再拉取结果体。
+                TaskStatusResponse statusResp;
+                try {
+                    if (!waitPolicy.durableSuspend()
+                            && !renewDagBlockingLease(runId, anchor, false)) {
+                        return dagBlockingLeaseLost(
+                                taskId, toolStartMs, "lease renewal was rejected before fast-path poll");
+                    }
+                    statusResp = getTaskStatus(taskId);
+                } catch (Exception pollFailure) {
+                    if (!waitPolicy.durableSuspend()) {
+                        return promoteDagBlockingFailure(
+                                runId,
+                                anchor,
+                                "DAG_BLOCKING_POLL_FAILED",
+                                "DAG Sandbox status polling failed",
+                                toolStartMs,
+                                Map.of("task_id", taskId,
+                                        "message", nvl(pollFailure.getMessage())));
+                    }
+                    throw pollFailure;
+                }
+                if (!waitPolicy.durableSuspend()) {
+                    if (statusResp != null && !nvl(statusResp.getError()).isBlank()) {
+                        return promoteDagBlockingFailure(
+                                runId,
+                                anchor,
+                                "DAG_BLOCKING_POLL_FAILED",
+                                "DAG Sandbox status polling failed",
+                                toolStartMs,
+                                Map.of("task_id", taskId,
+                                        "message", nvl(statusResp.getError())));
+                    }
+                }
+                String status = statusResp == null ? "" : nvl(statusResp.getStatus());
+                if (isTerminal(status)) {
+                    return finishTerminalByWaitPolicy(
+                            runId, identity, estimate, reservation, anchor, status,
+                            waitPolicy, toolStartMs);
+                }
+                // 每次最多睡 100ms，并且不越过 fastDeadline。
+                try {
+                    TimeUnit.MILLISECONDS.sleep(
+                            Math.min(100L, Math.max(1L, fastDeadline - System.currentTimeMillis())));
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    if (!waitPolicy.durableSuspend()) {
+                        return promoteDagBlockingFailure(
+                                runId,
+                                anchor,
+                                "DAG_BLOCKING_INTERRUPTED",
+                                "DAG Sandbox task polling was interrupted",
+                                toolStartMs,
+                                Map.of("task_id", taskId));
+                    }
+                    throw interrupted;
+                }
+            }
+            // LINEAR 在 fast-path 后转 durable pending；DAG 留在当前 worker，禁止生成 WAITING_TOOL_JOB。
+            if (waitPolicy.durableSuspend()) {
+                return suspend(runId, anchor, reservation, taskId);
+            }
+            return pollDagBlocking(
+                    runId, identity, estimate, reservation, anchor, toolStartMs);
+        } catch (Exception lifecycleFailure) {
+            if (!waitPolicy.durableSuspend()) {
+                return promoteDagBlockingFailure(
+                        runId,
+                        anchor,
+                        "DAG_BLOCKING_LIFECYCLE_FAILED",
+                        "DAG Sandbox lifecycle failed after durable ownership claim",
+                        toolStartMs,
+                        Map.of("operation_id", identity.operationId(),
+                                "task_id", nvl(anchor.getTaskId()),
+                                "message", nvl(lifecycleFailure.getMessage())));
+            }
+            throw lifecycleFailure;
         }
-        // LINEAR 在 fast-path 后转 durable pending；DAG 留在当前 worker，禁止生成 WAITING_TOOL_JOB。
-        if (waitPolicy.durableSuspend()) {
-            return suspend(runId, anchor, reservation, taskId);
-        }
-        return pollDagBlocking(
-                runId, identity, estimate, reservation, anchor, toolStartMs);
     }
 
     /**
@@ -727,7 +821,33 @@ public class PythonSandboxTools {
             long toolStartMs) throws Exception {
         String taskId = anchor.getTaskId();
         // 终态结果必须同时证明 taskId、status、payload 完整性与 retryable 字段存在。
-        TaskResultResponse result = fetchTerminalResult(runId, taskId, status);
+        if (!waitPolicy.durableSuspend()
+                && !renewDagBlockingLease(runId, anchor, true)) {
+            return dagBlockingLeaseLost(
+                    taskId, toolStartMs, "lease renewal was rejected before terminal result fetch");
+        }
+        TaskResultResponse result;
+        try {
+            result = fetchTerminalResult(runId, taskId, status);
+        } catch (Exception resultFailure) {
+            if (!waitPolicy.durableSuspend()) {
+                return promoteDagBlockingFailure(
+                        runId,
+                        anchor,
+                        "DAG_BLOCKING_RESULT_FETCH_FAILED",
+                        "DAG Sandbox terminal result fetch failed",
+                        toolStartMs,
+                        Map.of("task_id", taskId,
+                                "status", status,
+                                "message", nvl(resultFailure.getMessage())));
+            }
+            throw resultFailure;
+        }
+        if (!waitPolicy.durableSuspend()
+                && !renewDagBlockingLease(runId, anchor, true)) {
+            return dagBlockingLeaseLost(
+                    taskId, toolStartMs, "lease renewal was rejected after terminal result fetch");
+        }
         if (result != null && result.hasRetryable()) {
             try {
                 String completed = completeSynchronously(
@@ -745,10 +865,12 @@ public class PythonSandboxTools {
         if (waitPolicy.durableSuspend()) {
             return suspend(runId, anchor, reservation, taskId);
         }
-        emitSandboxToolTotal(
-                toolStartMs, "ERROR", "DAG_BLOCKING_TERMINAL_INCOMPLETE");
-        return fail("executePython", "DAG_BLOCKING_TERMINAL_INCOMPLETE",
+        return promoteDagBlockingFailure(
+                runId,
+                anchor,
+                "DAG_BLOCKING_TERMINAL_INCOMPLETE",
                 "DAG Sandbox task reached terminal state but durable finalization proof is incomplete",
+                toolStartMs,
                 Map.of("task_id", taskId, "status", status));
     }
 
@@ -770,14 +892,31 @@ public class PythonSandboxTools {
         while (true) {
             TaskStatusResponse statusResp;
             try {
+                if (!renewDagBlockingLease(runId, anchor, false)) {
+                    return dagBlockingLeaseLost(
+                            taskId, toolStartMs, "lease renewal was rejected before blocking poll");
+                }
                 statusResp = getTaskStatus(taskId);
             } catch (Exception pollFailure) {
                 log.warn("DAG blocking poll failed: run={}, taskId={}, error={}",
                         runId, taskId, pollFailure.getMessage());
-                emitSandboxToolTotal(toolStartMs, "ERROR", "DAG_BLOCKING_POLL_FAILED");
-                return fail("executePython", "DAG_BLOCKING_POLL_FAILED",
+                return promoteDagBlockingFailure(
+                        runId,
+                        anchor,
+                        "DAG_BLOCKING_POLL_FAILED",
                         "DAG Sandbox status polling failed",
+                        toolStartMs,
                         Map.of("task_id", taskId, "message", nvl(pollFailure.getMessage())));
+            }
+            if (statusResp != null && !nvl(statusResp.getError()).isBlank()) {
+                return promoteDagBlockingFailure(
+                        runId,
+                        anchor,
+                        "DAG_BLOCKING_POLL_FAILED",
+                        "DAG Sandbox status polling failed",
+                        toolStartMs,
+                        Map.of("task_id", taskId,
+                                "message", nvl(statusResp.getError())));
             }
             String status = statusResp == null ? "" : nvl(statusResp.getStatus());
             if (pollIndex == 0 || !status.equals(lastRemoteStatus) || pollIndex % 5 == 0) {
@@ -798,25 +937,153 @@ public class PythonSandboxTools {
 
             long remainingMillis = timeoutAt.toEpochMilli() - System.currentTimeMillis();
             if (remainingMillis <= 0L) {
-                emitSandboxToolTotal(toolStartMs, "TIMEOUT", "DAG_BLOCKING_TIMEOUT");
-                return fail("executePython", "DAG_BLOCKING_TIMEOUT",
+                return promoteDagBlockingFailure(
+                        runId,
+                        anchor,
+                        "DAG_BLOCKING_TIMEOUT",
                         "DAG Sandbox task did not reach terminal state before the frozen timeout",
+                        toolStartMs,
                         Map.of("task_id", taskId, "timeout_at", timeoutAt.toString()));
             }
             try {
                 TimeUnit.MILLISECONDS.sleep(Math.min(POLL_INTERVAL_MS, remainingMillis));
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
-                return dagBlockingInterrupted(taskId, toolStartMs);
+                return promoteDagBlockingFailure(
+                        runId,
+                        anchor,
+                        "DAG_BLOCKING_INTERRUPTED",
+                        "DAG Sandbox task polling was interrupted",
+                        toolStartMs,
+                        Map.of("task_id", taskId));
             }
         }
     }
 
-    private String dagBlockingInterrupted(String taskId, long toolStartMs) {
-        emitSandboxToolTotal(toolStartMs, "ERROR", "DAG_BLOCKING_INTERRUPTED");
-        return fail("executePython", "DAG_BLOCKING_INTERRUPTED",
-                "DAG Sandbox task polling was interrupted",
-                Map.of("task_id", taskId));
+    private boolean renewDagBlockingLease(
+            String runId,
+            ToolJobAnchor anchor,
+            boolean force) {
+        Instant expectedLeaseUntil = anchor.getBlockingLeaseUntil();
+        Instant now = Instant.now();
+        if (expectedLeaseUntil == null
+                || anchor.getBlockingOwnerId() == null
+                || anchor.getBlockingOwnerId().isBlank()) {
+            return false;
+        }
+        if (!force && expectedLeaseUntil.isAfter(
+                now.plusMillis(DAG_LEASE_RENEW_AHEAD_MILLIS))) {
+            return true;
+        }
+        Instant renewedUntil = DagBlockingWorkerLease.renewedUntil(now);
+        anchor.setBlockingLeaseUntil(renewedUntil);
+        boolean renewed;
+        try {
+            renewed = pythonSandboxDispatchStore.renewDagBlockingLease(
+                    runId, anchor, expectedLeaseUntil);
+        } catch (Exception renewalFailure) {
+            log.warn("DAG blocking lease renewal failed: run={}, taskId={}, owner={}, error={}",
+                    runId, anchor.getTaskId(), anchor.getBlockingOwnerId(),
+                    renewalFailure.getMessage());
+            renewed = false;
+        }
+        if (!renewed) {
+            // 续租失败后旧 worker 不能携带新 lease 继续任何 durable 写入。
+            anchor.setBlockingLeaseUntil(expectedLeaseUntil);
+        }
+        return renewed;
+    }
+
+    private boolean abortDagBlockingPreparing(
+            String runId,
+            ToolJobAnchor anchor,
+            DataAnalysisReservation preparingReservation) throws Exception {
+        Instant expectedLeaseUntil = anchor.getBlockingLeaseUntil();
+        if (!renewDagBlockingLease(runId, anchor, true)) {
+            return false;
+        }
+        expectedLeaseUntil = anchor.getBlockingLeaseUntil();
+        DataAnalysisReservation released = transitionReservation(
+                preparingReservation,
+                DataAnalysisReservationState.RELEASED,
+                null);
+        // 先生成 durable proof，再改变本地 anchor；序列化失败时 outer fallback 仍看见 PREPARING。
+        String releasedReservationJson = objectMapper.writeValueAsString(released);
+        String previousReservationJson = anchor.getReservationJson();
+        anchor.setAnchorState("ABORTING");
+        anchor.setRunDisposition("DAG_BLOCKING_PREPARING_ABORT");
+        anchor.setReservationJson(releasedReservationJson);
+
+        boolean began;
+        try {
+            began = pythonSandboxDispatchStore.beginDagBlockingPreparingAbort(
+                    runId, anchor, expectedLeaseUntil);
+        } catch (Exception beginFailure) {
+            /*
+             * DB outcome 不确定：若 begin 未提交，outer fallback 需要用原 PREPARING 快照
+             * 做 WORKER_LOST CAS；若已提交，DB 的 ABORTING disposition 会拒绝该 CAS，
+             * durable abort intent 仍安全保留。
+             */
+            anchor.setAnchorState("PREPARING");
+            anchor.setRunDisposition("DAG_BLOCKING_NO_RESUME");
+            anchor.setReservationJson(previousReservationJson);
+            throw beginFailure;
+        }
+        if (!began) {
+            // takeover/过期/operation 漂移时绝不能触碰容量账本。
+            return false;
+        }
+
+        if (!releasePreDispatch(preparingReservation, DataAnalysisReleaseReason.PREPARING_ABORTED)) {
+            // durable ABORTING/RELEASED intent 留给恢复者重入；不能猜测清 anchor。
+            return false;
+        }
+        return pythonSandboxDispatchStore.completeDagBlockingPreparingAbort(
+                runId, anchor, expectedLeaseUntil);
+    }
+
+    private String promoteDagBlockingFailure(
+            String runId,
+            ToolJobAnchor anchor,
+            String errorCode,
+            String message,
+            long toolStartMs,
+            Map<String, Object> details) {
+        Instant expectedLeaseUntil = anchor.getBlockingLeaseUntil();
+        anchor.setRunDisposition("DAG_BLOCKING_WORKER_LOST");
+        anchor.setAutoResume(false);
+        anchor.setFinalizerError(errorCode);
+        anchor.setNextPollAt(Instant.now());
+        boolean promoted;
+        try {
+            promoted = pythonSandboxDispatchStore.promoteDagBlockingWorkerLost(
+                    runId, anchor, expectedLeaseUntil);
+        } catch (Exception promotionFailure) {
+            log.warn("DAG blocking cleanup ownership transfer failed: run={}, taskId={}, "
+                            + "owner={}, error={}",
+                    runId, anchor.getTaskId(), anchor.getBlockingOwnerId(),
+                    promotionFailure.getMessage());
+            promoted = false;
+        }
+        if (!promoted) {
+            return dagBlockingLeaseLost(
+                    anchor.getTaskId(), toolStartMs,
+                    "live-to-cleanup ownership CAS was rejected");
+        }
+        emitSandboxToolTotal(toolStartMs,
+                "DAG_BLOCKING_TIMEOUT".equals(errorCode) ? "TIMEOUT" : "ERROR",
+                errorCode);
+        return fail("executePython", errorCode, message, details);
+    }
+
+    private String dagBlockingLeaseLost(
+            String taskId,
+            long toolStartMs,
+            String reason) {
+        emitSandboxToolTotal(toolStartMs, "ERROR", "DAG_BLOCKING_LEASE_LOST");
+        return fail("executePython", "DAG_BLOCKING_LEASE_LOST",
+                "DAG Sandbox worker lost its durable blocking lease",
+                Map.of("task_id", nvl(taskId), "reason", nvl(reason)));
     }
 
     private String completeSynchronously(
@@ -955,11 +1222,17 @@ public class PythonSandboxTools {
     }
 
     private boolean releasePreDispatch(DataAnalysisReservation reservation) {
+        return releasePreDispatch(reservation, DataAnalysisReleaseReason.CREATE_NOT_STARTED);
+    }
+
+    private boolean releasePreDispatch(
+            DataAnalysisReservation reservation,
+            DataAnalysisReleaseReason reason) {
         DataAnalysisReleaseOutcome outcome = dataAnalysisCapacityService.releaseReservation(
                 new DataAnalysisReleaseRequest(
                 reservation,
                 new DataAnalysisReleaseProof.PreDispatchAbort(reservation.identity()),
-                DataAnalysisReleaseReason.CREATE_NOT_STARTED));
+                reason));
         return outcome == DataAnalysisReleaseOutcome.RELEASED
                 || outcome == DataAnalysisReleaseOutcome.ALREADY_RELEASED;
     }

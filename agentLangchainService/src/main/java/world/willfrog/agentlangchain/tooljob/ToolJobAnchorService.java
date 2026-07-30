@@ -7,6 +7,7 @@ import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 
+import java.time.Instant;
 import java.util.Collections;
 import java.util.List;
 
@@ -75,6 +76,62 @@ public class ToolJobAnchorService {
         // operationId 绑定当前 active dispatch，旧 operation 无法替换新任务。
         return agentRunMapper.updateActiveToolJobAnchor(
                 runId, anchor.toJson(), expectedStatus, operationId) == 1;
+    }
+
+    public boolean updateLiveDagBlocking(
+            String runId,
+            ToolJobAnchor anchor,
+            AgentRunStatus expectedStatus,
+            String operationId,
+            String ownerId,
+            Instant expectedLeaseUntil) {
+        // 精确旧 lease 既是续租版本，也是旧 worker 在 takeover 后不能继续写的 fencing token。
+        if (expectedLeaseUntil == null) {
+            return false;
+        }
+        return agentRunMapper.updateLiveDagBlockingToolJobAnchor(
+                runId,
+                anchor.toJson(),
+                expectedStatus,
+                operationId,
+                ownerId,
+                expectedLeaseUntil.toString()) == 1;
+    }
+
+    public boolean beginLiveDagBlockingPreparingAbort(
+            String runId,
+            ToolJobAnchor anchor,
+            AgentRunStatus expectedStatus,
+            String operationId,
+            String ownerId,
+            Instant expectedLeaseUntil) {
+        if (expectedLeaseUntil == null) {
+            return false;
+        }
+        return agentRunMapper.beginLiveDagBlockingPreparingAbort(
+                runId,
+                anchor.toJson(),
+                expectedStatus,
+                operationId,
+                ownerId,
+                expectedLeaseUntil.toString()) == 1;
+    }
+
+    public boolean completeLiveDagBlockingPreparingAbort(
+            String runId,
+            AgentRunStatus expectedStatus,
+            String operationId,
+            String ownerId,
+            Instant expectedLeaseUntil) {
+        if (expectedLeaseUntil == null) {
+            return false;
+        }
+        return agentRunMapper.completeLiveDagBlockingPreparingAbort(
+                runId,
+                expectedStatus,
+                operationId,
+                ownerId,
+                expectedLeaseUntil.toString()) == 1;
     }
 
     public boolean updateActiveAndStatus(String runId, ToolJobAnchor anchor,

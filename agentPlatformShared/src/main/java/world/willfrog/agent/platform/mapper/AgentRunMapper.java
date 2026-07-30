@@ -136,6 +136,39 @@ public interface AgentRunMapper {
                                   @Param("expectedOperationId") String expectedOperationId);
 
     /**
+     * DAG blocking live worker 的 owner/lease fenced 写入口。
+     * 只接受当前 NO_RESUME、owner 与精确旧 lease 均匹配且旧 lease 尚未过期的写入。
+     */
+    int updateLiveDagBlockingToolJobAnchor(
+            @Param("id") String id,
+            @Param("toolJobAnchorJson") String toolJobAnchorJson,
+            @Param("expectedStatus") AgentRunStatus expectedStatus,
+            @Param("expectedOperationId") String expectedOperationId,
+            @Param("expectedOwnerId") String expectedOwnerId,
+            @Param("expectedLeaseUntil") String expectedLeaseUntil);
+
+    /**
+     * 仅当前未过期 DAG PREPARING owner 可把被权威证明未创建的任务推进到 durable ABORTING。
+     */
+    int beginLiveDagBlockingPreparingAbort(
+            @Param("id") String id,
+            @Param("toolJobAnchorJson") String toolJobAnchorJson,
+            @Param("expectedStatus") AgentRunStatus expectedStatus,
+            @Param("expectedOperationId") String expectedOperationId,
+            @Param("expectedOwnerId") String expectedOwnerId,
+            @Param("expectedLeaseUntil") String expectedLeaseUntil);
+
+    /**
+     * 幂等容量释放后，按 operation/owner/lease/ABORTING disposition 清除 durable abort anchor。
+     */
+    int completeLiveDagBlockingPreparingAbort(
+            @Param("id") String id,
+            @Param("expectedStatus") AgentRunStatus expectedStatus,
+            @Param("expectedOperationId") String expectedOperationId,
+            @Param("expectedOwnerId") String expectedOwnerId,
+            @Param("expectedLeaseUntil") String expectedLeaseUntil);
+
+    /**
      * 仅对当前 operation 原子写入下一版 anchor 并切换 Run 状态。
      * Python 工具完成 PENDING handoff 时用它把内存执行权转交给 WAITING_TOOL_JOB durable 状态。
      */

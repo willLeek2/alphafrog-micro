@@ -335,6 +335,70 @@
           AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{expectedOperationId}
     </update>
 
+    <!--
+        DAG blocking live worker 的唯一更新栅栏。旧 lease 必须精确匹配且仍在未来；
+        startup/另一实例一旦接管或 lease 过期，原 worker 后续续租、终态写入和
+        NO_RESUME→WORKER_LOST 移交都会返回 0，不能覆盖 cleanup owner。
+    -->
+    <update id="updateLiveDagBlockingToolJobAnchor">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = CAST(#{toolJobAnchorJson} AS jsonb),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status = #{expectedStatus}
+          AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{expectedOperationId}
+          AND tool_job_anchor_json -&gt;&gt; 'runDisposition' = 'DAG_BLOCKING_NO_RESUME'
+          AND COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true) = false
+          AND tool_job_anchor_json -&gt;&gt; 'blockingOwnerId' = #{expectedOwnerId}
+          AND tool_job_anchor_json -&gt;&gt; 'blockingLeaseUntil' = #{expectedLeaseUntil}
+          AND CAST(tool_job_anchor_json -&gt;&gt; 'blockingLeaseUntil' AS timestamptz)
+              &gt; CURRENT_TIMESTAMP
+    </update>
+
+    <!--
+        create 未生效的 DAG 退场先持久化 ABORTING/RELEASED intent，再允许释放进程内容量。
+        当前 live owner 必须同时匹配 PREPARING、operation、owner 与精确未过期 lease；
+        takeover 或迟到响应不能把别人的 reservation 标为已释放。
+    -->
+    <update id="beginLiveDagBlockingPreparingAbort">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = CAST(#{toolJobAnchorJson} AS jsonb),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status = #{expectedStatus}
+          AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{expectedOperationId}
+          AND tool_job_anchor_json -&gt;&gt; 'anchorState' = 'PREPARING'
+          AND tool_job_anchor_json -&gt;&gt; 'runDisposition' = 'DAG_BLOCKING_NO_RESUME'
+          AND COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true) = false
+          AND tool_job_anchor_json -&gt;&gt; 'blockingOwnerId' = #{expectedOwnerId}
+          AND tool_job_anchor_json -&gt;&gt; 'blockingLeaseUntil' = #{expectedLeaseUntil}
+          AND CAST(tool_job_anchor_json -&gt;&gt; 'blockingLeaseUntil' AS timestamptz)
+              &gt; CURRENT_TIMESTAMP
+    </update>
+
+    <!--
+        容量释放后清理 durable abort intent。ABORTING 已经脱离 live lease 竞争，因此只要求
+        精确身份/lease 与 RELEASED 证明，不要求 lease 仍在未来；进程可在 begin 后崩溃重入。
+        pipeline/control 若先推进 FAILED/CANCELED，只清 anchor，不覆盖业务终态。
+    -->
+    <update id="completeLiveDagBlockingPreparingAbort">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = CAST('{}' AS jsonb),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status IN ('EXECUTING', 'FAILED', 'CANCELED')
+          AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{expectedOperationId}
+          AND tool_job_anchor_json -&gt;&gt; 'anchorState' = 'ABORTING'
+          AND tool_job_anchor_json -&gt;&gt; 'runDisposition' = 'DAG_BLOCKING_PREPARING_ABORT'
+          AND COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true) = false
+          AND tool_job_anchor_json -&gt;&gt; 'blockingOwnerId' = #{expectedOwnerId}
+          AND tool_job_anchor_json -&gt;&gt; 'blockingLeaseUntil' = #{expectedLeaseUntil}
+          AND (
+                (tool_job_anchor_json -&gt;&gt; 'reservationJson')::jsonb
+                    -&gt;&gt; 'state'
+              ) = 'RELEASED'
+    </update>
+
     <update id="updateToolJobAnchorAndStatusByOperation">
         UPDATE alphafrog_agent_run
         SET tool_job_anchor_json = CAST(#{toolJobAnchorJson} AS jsonb),

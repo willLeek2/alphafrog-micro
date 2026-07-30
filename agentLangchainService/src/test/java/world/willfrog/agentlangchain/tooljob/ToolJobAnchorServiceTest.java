@@ -10,11 +10,14 @@ import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 
+import java.time.Instant;
+
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -119,6 +122,97 @@ class ToolJobAnchorServiceTest {
 
         verify(agentRunMapper).clearSynchronouslyCompletedToolJobAnchor(
                 "run-1", AgentRunStatus.EXECUTING, "run-1:tc-1:1");
+    }
+
+    @Test
+    void shouldBindOwnerAndExactPreviousLeaseInLiveDagUpdate() {
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId("run-1:tc-1:1");
+        anchor.setRunDisposition("DAG_BLOCKING_NO_RESUME");
+        anchor.setAutoResume(false);
+        anchor.setBlockingOwnerId("worker-a");
+        Instant expectedLease = Instant.parse("2026-07-30T07:00:00Z");
+        anchor.setBlockingLeaseUntil(expectedLease.plusSeconds(30));
+        when(agentRunMapper.updateLiveDagBlockingToolJobAnchor(
+                eq("run-1"), anyString(), eq(AgentRunStatus.EXECUTING),
+                eq("run-1:tc-1:1"), eq("worker-a"), eq(expectedLease.toString())))
+                .thenReturn(1);
+
+        assertThat(anchorService.updateLiveDagBlocking(
+                "run-1", anchor, AgentRunStatus.EXECUTING,
+                "run-1:tc-1:1", "worker-a", expectedLease)).isTrue();
+
+        ArgumentCaptor<String> json = ArgumentCaptor.forClass(String.class);
+        verify(agentRunMapper).updateLiveDagBlockingToolJobAnchor(
+                eq("run-1"), json.capture(), eq(AgentRunStatus.EXECUTING),
+                eq("run-1:tc-1:1"), eq("worker-a"), eq(expectedLease.toString()));
+        ToolJobAnchor persisted = ToolJobAnchor.fromJson(json.getValue());
+        assertThat(persisted.getBlockingOwnerId()).isEqualTo("worker-a");
+        assertThat(persisted.getBlockingLeaseUntil()).isEqualTo(expectedLease.plusSeconds(30));
+    }
+
+    @Test
+    void shouldRejectLiveDagUpdateWithoutPreviousLease() {
+        ToolJobAnchor anchor = new ToolJobAnchor();
+
+        assertThat(anchorService.updateLiveDagBlocking(
+                "run-1", anchor, AgentRunStatus.EXECUTING,
+                "run-1:tc-1:1", "worker-a", null)).isFalse();
+
+        verify(agentRunMapper, never()).updateLiveDagBlockingToolJobAnchor(
+                anyString(), anyString(), any(), anyString(), anyString(), anyString());
+    }
+
+    @Test
+    void shouldBindOwnerAndExactLeaseInLiveDagPreparingAbortBegin() {
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setAnchorState("ABORTING");
+        anchor.setRunDisposition("DAG_BLOCKING_PREPARING_ABORT");
+        Instant expectedLease = Instant.parse("2026-07-30T07:00:00Z");
+        when(agentRunMapper.beginLiveDagBlockingPreparingAbort(
+                eq("run-1"), anyString(), eq(AgentRunStatus.EXECUTING),
+                eq("run-1:tc-1:1"), eq("worker-a"), eq(expectedLease.toString())))
+                .thenReturn(1);
+
+        assertThat(anchorService.beginLiveDagBlockingPreparingAbort(
+                "run-1", anchor, AgentRunStatus.EXECUTING,
+                "run-1:tc-1:1", "worker-a", expectedLease)).isTrue();
+
+        verify(agentRunMapper).beginLiveDagBlockingPreparingAbort(
+                eq("run-1"), anyString(), eq(AgentRunStatus.EXECUTING),
+                eq("run-1:tc-1:1"), eq("worker-a"), eq(expectedLease.toString()));
+    }
+
+    @Test
+    void shouldBindOwnerAndExactLeaseInLiveDagPreparingAbortCompletion() {
+        Instant expectedLease = Instant.parse("2026-07-30T07:00:00Z");
+        when(agentRunMapper.completeLiveDagBlockingPreparingAbort(
+                "run-1", AgentRunStatus.EXECUTING,
+                "run-1:tc-1:1", "worker-a", expectedLease.toString()))
+                .thenReturn(1);
+
+        assertThat(anchorService.completeLiveDagBlockingPreparingAbort(
+                "run-1", AgentRunStatus.EXECUTING,
+                "run-1:tc-1:1", "worker-a", expectedLease)).isTrue();
+
+        verify(agentRunMapper).completeLiveDagBlockingPreparingAbort(
+                "run-1", AgentRunStatus.EXECUTING,
+                "run-1:tc-1:1", "worker-a", expectedLease.toString());
+    }
+
+    @Test
+    void shouldRejectLiveDagPreparingAbortWithoutLease() {
+        assertThat(anchorService.beginLiveDagBlockingPreparingAbort(
+                "run-1", new ToolJobAnchor(), AgentRunStatus.EXECUTING,
+                "run-1:tc-1:1", "worker-a", null)).isFalse();
+        assertThat(anchorService.completeLiveDagBlockingPreparingAbort(
+                "run-1", AgentRunStatus.EXECUTING,
+                "run-1:tc-1:1", "worker-a", null)).isFalse();
+
+        verify(agentRunMapper, never()).beginLiveDagBlockingPreparingAbort(
+                anyString(), anyString(), any(), anyString(), anyString(), anyString());
+        verify(agentRunMapper, never()).completeLiveDagBlockingPreparingAbort(
+                anyString(), any(), anyString(), anyString(), anyString());
     }
 
     // ---- CAS predicate binding tests (verify SQL WHERE clause arguments) ----
