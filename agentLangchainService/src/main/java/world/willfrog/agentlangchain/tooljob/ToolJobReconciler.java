@@ -7,6 +7,7 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
+import world.willfrog.agent.platform.dataanalysis.ToolJobRunDisposition;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
@@ -72,6 +73,13 @@ public class ToolJobReconciler {
                 // 再按 id 读取最新 anchor，避免列表查询后的状态漂移。
                 ToolJobAnchor a = anchorService.loadAnchor(run.getId());
                 if (a == null) continue;
+                if (run.getStatus() == AgentRunStatus.EXECUTING
+                        && ToolJobRunDisposition.isLiveDagBlocking(a.getRunDisposition())) {
+                    // 在线 DAG blocking 仍由当前节点线程持有；只有 startup 才能把它标成 worker-lost。
+                    // 删除可能的旧 due 成员，避免后台协调器与存活 worker 竞争终态。
+                    redisCache.removeDue(run.getId());
+                    continue;
+                }
                 // Redis 丢失或重启后可由完整 anchor 重建，不承担真相源职责。
                 redisCache.atomicWritePendingAndDue(run.getId(), a);
                 // 已到期任务立即处理，不等待下一轮 due 定时器。
@@ -101,10 +109,19 @@ public class ToolJobReconciler {
             ToolJobAnchor anchor = anchorService.loadAnchor(runId);
             // DB 已无 active anchor 时清理 Redis 残留，幂等结束。
             if (anchor == null) { redisCache.removeDue(runId); redisCache.deletePendingCache(runId); return; }
+            if (ToolJobRunDisposition.isLiveDagBlocking(anchor.getRunDisposition())) {
+                // 原 DAG worker 仍可能存活；在线 reconciler 不取得 cleanup 所有权。
+                redisCache.removeDue(runId);
+                return;
+            }
             // taskId 是查询 Sandbox 的真实任务主键。
             String taskId = anchor.getTaskId();
             if (taskId == null || taskId.isBlank()) return;
 
+            if (ToolJobRunDisposition.isDagCleanupOnly(anchor.getRunDisposition())) {
+                checkPausedTerminal(runId, anchor);
+                return;
+            }
             // 暂停/取消/checkpoint 失败仍需确认终态并释放容量，但禁止自动恢复。
             if (!anchor.isAutoResume()) { checkPausedTerminal(runId, anchor); return; }
 
@@ -201,8 +218,18 @@ public class ToolJobReconciler {
                 if (resultResp != null) {
                     // 只执行 envelope/release/usage/event，不 CAS RECEIVED、不生成 READY。
                     finalizer.handleTerminal(runId, anchor, status, resultResp, false);
+                } else {
+                    // 终态已确认但结果体不可用时也要有界重试，不能永久占用 DAG/暂停容量。
+                    finalizer.handleNotFound(runId, anchor);
                 }
-        }
+            } else if (ToolJobRunDisposition.isDagCleanupOnly(anchor.getRunDisposition())) {
+                // cleanup-only worker 已丢失，当前 Run 保持 EXECUTING，后台继续轮询至终态。
+                anchor.setNextPollAt(Instant.now().plusMillis(config.getPollIntervalMs()));
+                if (anchorService.updateAnchor(runId, anchor, AgentRunStatus.EXECUTING)) {
+                    redisCache.upsertDue(runId, anchor);
+                    redisCache.writePendingCache(runId, anchor);
+                }
+            }
         } catch (Exception e) {
             log.error("Paused-terminal check error run={}", runId, e);
         }

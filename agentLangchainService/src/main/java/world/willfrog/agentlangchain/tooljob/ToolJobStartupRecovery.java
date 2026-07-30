@@ -140,6 +140,16 @@ public class ToolJobStartupRecovery {
             try {
                 // EXECUTING + active anchor 表示进程可能在工具已附着但 Run 尚未转 WAITING 时崩溃。
                 if (run.getStatus() == AgentRunStatus.EXECUTING) {
+                    if (ToolJobRunDisposition.isDagBlocking(anchor.getRunDisposition())) {
+                        // DAG blocking 不支持 frontier 恢复。只有本 startup 才能证明旧 worker
+                        // 已随旧进程消失，并把在线处置升级成 cleanup-only。
+                        if (markDagBlockingWorkerLost(run.getId(), anchor)) {
+                            resolveActiveAnchor(run, anchor);
+                        } else {
+                            log.warn("DAG cleanup-only ownership remains unresolved for run={}", run.getId());
+                        }
+                        continue;
+                    }
                     if (!transferRecoveredAttached(run.getId(), anchor)) {
                         log.warn("Startup dispatch transfer remains unresolved for run={}", run.getId());
                     }
@@ -198,6 +208,10 @@ public class ToolJobStartupRecovery {
     }
 
     private void resolveActiveAnchor(AgentRun run, ToolJobAnchor anchor) {
+        AgentRunStatus expectedStatus =
+                ToolJobRunDisposition.isDagCleanupOnly(anchor.getRunDisposition())
+                        ? AgentRunStatus.EXECUTING
+                        : AgentRunStatus.WAITING_TOOL_JOB;
         // taskId 缺失无法查询 Sandbox，保留 anchor 并等待人工/后续 PREPARING 修复。
         String taskId = anchor.getTaskId();
         if (taskId == null || taskId.isBlank()) {
@@ -227,8 +241,9 @@ public class ToolJobStartupRecovery {
                             run.getId(), taskId);
                     // 将重试时间先写 DB，再重建 Redis。
                     anchor.setNextPollAt(Instant.now().plusMillis(config.getReconcilerIntervalMs()));
-                    anchorService.updateAnchor(run.getId(), anchor, AgentRunStatus.WAITING_TOOL_JOB);
-                    redisCache.atomicWritePendingAndDue(run.getId(), anchor);
+                    if (anchorService.updateAnchor(run.getId(), anchor, expectedStatus)) {
+                        redisCache.atomicWritePendingAndDue(run.getId(), anchor);
+                    }
                     return;
                 }
                 // 交给可重入 finalizer 释放容量并决定是否自动恢复。
@@ -237,18 +252,47 @@ public class ToolJobStartupRecovery {
             }
 
             // 非终态任务重新安排下一轮；暂停任务保留原 nextPollAt 语义。
-            if (anchor.isAutoResume()) {
+            if (anchor.isAutoResume()
+                    || ToolJobRunDisposition.isDagCleanupOnly(anchor.getRunDisposition())) {
                 anchor.setNextPollAt(Instant.now().plusMillis(config.getReconcilerIntervalMs()));
             }
-            anchorService.updateAnchor(run.getId(), anchor, AgentRunStatus.WAITING_TOOL_JOB);
-            redisCache.atomicWritePendingAndDue(run.getId(), anchor);
+            if (anchorService.updateAnchor(run.getId(), anchor, expectedStatus)) {
+                redisCache.atomicWritePendingAndDue(run.getId(), anchor);
+            }
 
         } catch (Exception e) {
             // 启动阶段暂时无法访问 Sandbox 时保留 anchor，并重建 due 供在线 reconciler 重试。
             log.error("Failed to resolve anchor for run={}, taskId={}", run.getId(), taskId, e);
             anchor.setNextPollAt(Instant.now().plusMillis(config.getReconcilerIntervalMs()));
-            redisCache.atomicWritePendingAndDue(run.getId(), anchor);
+            if (anchorService.updateAnchor(run.getId(), anchor, expectedStatus)) {
+                redisCache.atomicWritePendingAndDue(run.getId(), anchor);
+            }
         }
+    }
+
+    private boolean markDagBlockingWorkerLost(String runId, ToolJobAnchor anchor) {
+        if (ToolJobRunDisposition.isDagCleanupOnly(anchor.getRunDisposition())) {
+            // 前一次 startup 已经取得 cleanup-only 所有权，可直接继续轮询/finalizer。
+            return true;
+        }
+        if (!ToolJobRunDisposition.isLiveDagBlocking(anchor.getRunDisposition())) {
+            return false;
+        }
+        if (anchor.getOperationId() == null || anchor.getOperationId().isBlank()) {
+            return false;
+        }
+        anchor.setRunDisposition(ToolJobRunDisposition.DAG_BLOCKING_WORKER_LOST);
+        anchor.setAutoResume(false);
+        anchor.setFinalizerError(ToolJobRunDisposition.DAG_BLOCKING_WORKER_LOST);
+        anchor.setNextPollAt(Instant.now());
+        boolean marked = anchorService.updateActive(
+                runId, anchor, AgentRunStatus.EXECUTING, anchor.getOperationId());
+        if (marked) {
+            log.warn("Startup marked DAG blocking worker lost for run={}, operationId={}; "
+                            + "cleanup-only will not resume workflow",
+                    runId, anchor.getOperationId());
+        }
+        return marked;
     }
 
     private DataAnalysisReservation resolvePreparingDispatch(

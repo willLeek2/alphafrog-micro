@@ -91,6 +91,16 @@ public class ToolJobAnchorService {
         return agentRunMapper.clearActiveToolJobAnchor(runId, expectedStatus, operationId) == 1;
     }
 
+    public boolean failDagBlockingAndClear(
+            String runId,
+            AgentRunStatus expectedStatus,
+            String operationId,
+            String lastError) {
+        // SQL 还会约束 cleanup-only disposition 与 autoResume=false，防止误失败在线 DAG worker。
+        return agentRunMapper.failDagBlockingAndClearToolJobAnchor(
+                runId, expectedStatus, operationId, lastError) == 1;
+    }
+
     /**
      * Narrow PostgreSQL JSONB merge for checkpoint-failure ownership. It does
      * not replace reservation/terminal fields and binds the failed checkpoint

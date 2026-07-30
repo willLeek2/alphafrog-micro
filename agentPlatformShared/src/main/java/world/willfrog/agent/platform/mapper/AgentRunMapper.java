@@ -152,6 +152,17 @@ public interface AgentRunMapper {
                                  @Param("expectedOperationId") String expectedOperationId);
 
     /**
+     * DAG blocking worker 在进程重启后已经不可恢复。只有 cleanup-only disposition、
+     * {@code autoResume=false}、EXECUTING 状态和 operationId 全部匹配时，才原子地
+     * 把 Run 标为 FAILED、保存诊断并清空 active anchor。
+     */
+    int failDagBlockingAndClearToolJobAnchor(
+            @Param("id") String id,
+            @Param("expectedStatus") AgentRunStatus expectedStatus,
+            @Param("expectedOperationId") String expectedOperationId,
+            @Param("lastError") String lastError);
+
+    /**
      * 完整 checkpoint 写失败后的白名单补偿写入：只登记失败身份与错误，不覆盖 terminal/reservation。
      * startup recovery 可据此继续收口；调用方不能把失败误当成已经安全释放 worker。
      */

@@ -358,6 +358,25 @@
     </update>
 
     <!--
+        DAG blocking worker 只在 startup recovery 后进入 cleanup-only。终态 envelope、容量释放、
+        usage 和事件全部完成后，用一条 operationId-gated UPDATE 同时失败 Run 并清 anchor，
+        消除“Run 已 FAILED 但崩溃导致 anchor 永久残留”的窗口。
+    -->
+    <update id="failDagBlockingAndClearToolJobAnchor">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = CAST('{}' AS jsonb),
+            status = 'FAILED',
+            last_error = #{lastError},
+            completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status = #{expectedStatus}
+          AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{expectedOperationId}
+          AND tool_job_anchor_json -&gt;&gt; 'runDisposition' = 'DAG_BLOCKING_WORKER_LOST'
+          AND COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true) = false
+    </update>
+
+    <!--
         完整 checkpoint 写失败后的窄合并：只关闭 autoResume、冻结 disposition 和错误。
         WHERE 绑定 Run 状态、operation、tool call、attempt、task 与 checkpointVersion，
         因此失败 worker 不能污染另一轮工具任务，也不会覆盖 reservation/terminal 字段。
