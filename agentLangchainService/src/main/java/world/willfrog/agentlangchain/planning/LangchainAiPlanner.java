@@ -173,11 +173,11 @@ public class LangchainAiPlanner {
                 String strategyStage = promptService.planningStrategyStageInstruction(toolList, maxTodos, maxDetailLength);
                 if (mode == PlanExecutionMode.LINEAR) {
                     /*
-                     * durable ToolJob 的 checkpoint 只保存顺序完成前缀，因此强制 LINEAR 不能
-                     * 只存在于最终 plan 字段；strategy LLM 必须先按 LINEAR 思考，避免第二阶段
-                     * 根据一个 DAG strategy 生成分支/汇合依赖。
+                     * 本 Run 明确请求 LINEAR 时，约束不能只存在于最终 plan 字段；strategy
+                     * LLM 也必须先按 LINEAR 思考，避免第二阶段根据一个 DAG strategy 生成
+                     * 分支/汇合依赖。
                      */
-                    strategyStage += "\n\n本次执行模式由调度器强制为 LINEAR。"
+                    strategyStage += "\n\n本 Run 请求的执行模式为 LINEAR。"
                             + "overallPlan.mode 必须返回 LINEAR，策略必须描述可按顺序执行的步骤。";
                 }
                 String strategyContent = dialogueContext.isBlank()

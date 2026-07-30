@@ -56,6 +56,32 @@ final class LangchainWorkflowRouting {
     }
 
     /**
+     * 把 Run 创建时的 requested mode 与 planner 输出合并成唯一 effective plan。
+     *
+     * <ul>
+     *   <li>requested LINEAR：稳定拓扑排序并移除 DAG metadata，持久化为 LINEAR；</li>
+     *   <li>requested DAG：保留 planner 的节点/依赖，持久化为 DAG；</li>
+     *   <li>requested AUTO：按 planner mode / dependsOn 路由，随后冻结为 LINEAR 或 DAG。</li>
+     * </ul>
+     *
+     * <p>返回计划会同时用于 planJson、PLAN_READY 和 executor 选择，所以不会再出现
+     * “持久化 AUTO/DAG、实际却临时跑 LINEAR”的分裂语义。</p>
+     */
+    static LangchainTodoPlan effectivePlan(LangchainTodoPlan plan, PlanExecutionMode requestedMode) {
+        if (plan == null) {
+            return null;
+        }
+        PlanExecutionMode requested = requestedMode == null ? PlanExecutionMode.AUTO : requestedMode;
+        return switch (requested) {
+            case LINEAR -> effectivePlan(plan, true);
+            case DAG -> copyWithMode(plan, PlanExecutionMode.DAG);
+            case AUTO -> copyWithMode(
+                    plan,
+                    shouldUseDag(plan) ? PlanExecutionMode.DAG : PlanExecutionMode.LINEAR);
+        };
+    }
+
+    /**
      * 返回首次执行、持久化和恢复共同使用的有效计划。
      *
      * <p>当 durable 工具只支持 LINEAR checkpoint 时，不能只切换 executor 而保留一份
@@ -99,6 +125,19 @@ final class LangchainWorkflowRouting {
                 .extractedEntities(plan.getExtractedEntities() == null
                         ? List.of() : new ArrayList<>(plan.getExtractedEntities()))
                 .executionMode(PlanExecutionMode.LINEAR)
+                .build();
+    }
+
+    private static LangchainTodoPlan copyWithMode(LangchainTodoPlan plan, PlanExecutionMode mode) {
+        if (plan.getExecutionMode() == mode) {
+            return plan;
+        }
+        return LangchainTodoPlan.builder()
+                .analysis(plan.getAnalysis())
+                .items(plan.getItems() == null ? List.of() : new ArrayList<>(plan.getItems()))
+                .extractedEntities(plan.getExtractedEntities() == null
+                        ? List.of() : new ArrayList<>(plan.getExtractedEntities()))
+                .executionMode(mode)
                 .build();
     }
 

@@ -14,12 +14,14 @@ import world.willfrog.agent.platform.mapper.AgentRunEventMapper;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunEventEnvelope;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agent.workflow.PlanExecutionMode;
 
 import java.time.OffsetDateTime;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 @Service
@@ -46,7 +48,8 @@ import java.util.Map;
  *
  * <h3>ext 字段提取方法集</h3>
  * 大量 {@code extractXxx(String extJson)} 方法都遵循统一约定:解析 JSON,缺失/异常返回安全默认值,
- * 不抛出异常,避免单个字段问题阻塞 run 执行。多数方法还兼容 ext 顶层 / context_json 嵌套两种位置,
+ * 避免单个字段问题阻塞 run 执行。execution mode 是会改变 executor 与恢复语义的契约字段，
+ * 因此它例外地对未知值 fail-closed。多数方法还兼容 ext 顶层 / context_json 嵌套两种位置,
  * 同时兼容 camelCase / snake_case 两种命名。
  *
  * <h3>Payload 截断</h3>
@@ -180,11 +183,13 @@ public class AgentEventService {
             log.warn("[AgentEventService] stageConfigJson 为空，未存入 ext");
         }
 
-        // 从 contextJson 中提取 execution_mode
-        String executionMode = extractExecutionModeFromContext(contextJson);
-        if (executionMode != null && !executionMode.isBlank()) {
-            ext.put("execution_mode", executionMode);
-        }
+        /*
+         * execution mode 是 Run 创建契约，不是 pipeline 的本地猜测。
+         * 创建时立即做严格、统一的规范化，后续 planner / executor / 事件都只读取这份冻结值。
+         * 缺省写成 AUTO；非法值在插入 Run 前拒绝，避免留下一条无法可靠执行的半成品记录。
+         */
+        PlanExecutionMode executionMode = parseExecutionMode(extractExecutionModeFromContext(contextJson));
+        ext.put("execution_mode", executionMode.name());
 
         world.willfrog.agent.platform.debug.DebugObservabilityRequest debugObservability =
                 world.willfrog.agent.platform.debug.DebugObservabilityRequest.parseContextJson(contextJson, objectMapper);
@@ -559,7 +564,8 @@ public class AgentEventService {
      * 从 ext JSON 中提取执行模式。
      *
      * <p>兼容 snake_case ({@code execution_mode}) 和 camelCase ({@code executionMode}) 两种命名。
-     * 未配置时返回 {@code "AUTO"},由 Planner 根据 Plan 特征自动选择 LINEAR 或 DAG。</p>
+     * 未配置时返回 {@code "AUTO"},由 Planner 根据 Plan 特征自动选择 LINEAR 或 DAG。
+     * 非法值会明确抛出 {@link IllegalArgumentException}，不能静默回退。</p>
      *
      * @param extJson ext 字段 JSON
      * @return execution_mode 字段值，默认为 AUTO
@@ -569,7 +575,36 @@ public class AgentEventService {
         if (mode == null || mode.isBlank()) {
             mode = extractField(extJson, "executionMode");
         }
-        return mode == null || mode.isBlank() ? "AUTO" : mode;
+        return parseExecutionMode(mode).name();
+    }
+
+    /**
+     * 从 ext JSON 中提取强类型 requested execution mode。
+     *
+     * <p>这是 pipeline 的统一入口；与 {@link #extractExecutionMode(String)} 使用同一套
+     * trim / case-insensitive / fail-closed 规则。</p>
+     */
+    public PlanExecutionMode extractPlanExecutionMode(String extJson) {
+        return parseExecutionMode(extractExecutionMode(extJson));
+    }
+
+    /**
+     * 统一解析 execution mode。
+     *
+     * @param raw 原始模式；null/空白表示未指定
+     * @return LINEAR、DAG 或 AUTO
+     * @throws IllegalArgumentException 非法值
+     */
+    public static PlanExecutionMode parseExecutionMode(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return PlanExecutionMode.AUTO;
+        }
+        String normalized = raw.trim().toUpperCase(Locale.ROOT);
+        try {
+            return PlanExecutionMode.valueOf(normalized);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("unsupported_execution_mode:" + normalized, e);
+        }
     }
 
     /**
@@ -616,7 +651,7 @@ public class AgentEventService {
         try {
             Map<?, ?> map = objectMapper.readValue(contextJson, Map.class);
             Object mode = map.get("execution_mode");
-            if (mode == null) {
+            if (mode == null || mode.toString().isBlank()) {
                 mode = map.get("executionMode");
             }
             return mode != null ? mode.toString() : null;

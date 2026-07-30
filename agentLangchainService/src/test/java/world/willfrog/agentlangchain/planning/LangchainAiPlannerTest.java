@@ -119,7 +119,7 @@ class LangchainAiPlannerTest {
         assertThat(plan.getExecutionMode()).isEqualTo(PlanExecutionMode.LINEAR);
         assertThat(model.requests).hasSize(2);
         assertThat(model.requests.get(0).toString())
-                .contains("执行模式由调度器强制为 LINEAR")
+                .contains("本 Run 请求的执行模式为 LINEAR")
                 .contains("overallPlan.mode 必须返回 LINEAR");
         assertThat(model.requests.get(1).toString())
                 .contains("\"mode\":\"LINEAR\"")

@@ -296,17 +296,15 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                     .build();
 
             /*
-             * durable ToolJob 目前只保存 LINEAR 的完成前缀，尚不能保存 DAG frontier。只要
-             * 本 Run 暴露代码解释器，就必须在发起 planning 前请求 LINEAR；不能先让 planner
-             * 生成 DAG，再只把 executor 临时切成 LINEAR，否则持久化 plan 与恢复路由会分裂。
+             * execution mode 是 Run 创建时冻结的用户契约。代码解释器开关只决定是否暴露
+             * executePython，不能再覆盖 LINEAR / DAG / AUTO。非法值由统一解析器 fail-closed；
+             * 缺省值保持 AUTO。
              */
-            boolean forceLinearForDurableTool = runConfig.codeInterpreterEnabled();
-            PlanExecutionMode requestedExecutionMode = forceLinearForDurableTool
-                    ? PlanExecutionMode.LINEAR
-                    : PlanExecutionMode.AUTO;
+            PlanExecutionMode requestedExecutionMode = AgentEventService.parseExecutionMode(
+                    eventService.extractExecutionMode(run.getExt()));
 
             // planning（规划）阶段只负责把用户目标变成 todo plan（任务计划）。
-            // 不暴露代码解释器时，planner 仍可输出 AUTO/DAG，由 LangchainWorkflowRouting 统一裁决。
+            // 显式 LINEAR/DAG 会约束 planner；AUTO 则由计划特征交给 routing 裁决。
             AgentContext.setPhase("planning");
             LangchainTodoPlan plan = planner.plan(LangchainPlanningRequest.builder()
                     .runId(runId)
@@ -322,17 +320,19 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                     .build());
 
             /*
-             * 即使 planner/mock 违反请求返回 DAG 字段，也要生成一份真正可恢复的 effective
-             * LINEAR plan：先稳定拓扑排序，再固定 executionMode、重新编号并清空
-             * dependsOn/groupKey/parallelizable。后续持久化、PLAN_READY、首次执行和
-             * resume 全部只使用这份 effective plan，确保数据库真相与 executor 语义一致。
+             * requested mode 与 planner 输出在这里一次性冻结成 effective plan。显式
+             * LINEAR 保留稳定拓扑正规化；显式 DAG 保留 DAG；AUTO 按计划路由。后续持久化、
+             * PLAN_READY 和 executor 全部只使用这份 effective plan。
              */
             LangchainTodoPlan planned = plan;
-            plan = LangchainWorkflowRouting.effectivePlan(plan, forceLinearForDurableTool);
+            plan = LangchainWorkflowRouting.effectivePlan(plan, requestedExecutionMode);
             boolean useDag = LangchainWorkflowRouting.shouldUseDag(plan);
-            if (forceLinearForDurableTool && planned != plan) {
-                log.info("Normalized plan to durable LINEAR: runId={} requestedMode={}",
-                        runId, planned.getExecutionMode());
+            PlanExecutionMode effectiveExecutionMode = useDag
+                    ? PlanExecutionMode.DAG
+                    : PlanExecutionMode.LINEAR;
+            if (planned != plan) {
+                log.info("Resolved effective workflow plan: runId={} requestedMode={} plannerMode={} effectiveMode={}",
+                        runId, requestedExecutionMode, planned.getExecutionMode(), effectiveExecutionMode);
             }
             // PLAN_READY 既是实时 UI 的启动信号，也是断线重连后的恢复锚点。
             // 因此先把 plan 写入 DB/Redis，再发带完整 plan payload 的事件；这样前端收到事件后，
@@ -340,7 +340,10 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             // Redis 里的 plan 服务于执行中轮询，DB 里的 plan 服务于历史查询和 Redis 过期后的恢复。
             persistPlan(runId, userId, plan);
             eventService.append(runId, userId, "PLAN_READY", Map.of(
-                    "execution_mode", plan.getExecutionMode() == null ? "AUTO" : plan.getExecutionMode().name(),
+                    // execution_mode 保留给既有消费者，语义升级为 effective mode。
+                    "execution_mode", effectiveExecutionMode.name(),
+                    "requested_execution_mode", requestedExecutionMode.name(),
+                    "effective_execution_mode", effectiveExecutionMode.name(),
                     "workflow", useDag ? "dag" : "linear",
                     "todo_count", plan.getItems() == null ? 0 : plan.getItems().size(),
                     "plan", plan
@@ -358,6 +361,10 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
 
             // suspended 是“后台工具仍在运行”的正常控制结果，不按失败或完成落终态。
             if (result.isSuspended()) {
+                // DAG 本阶段使用节点内 blocking poll，不拥有可恢复 frontier；严禁误写 LINEAR checkpoint。
+                if (useDag) {
+                    throw new IllegalStateException("dag_workflow_suspended_without_frontier_checkpoint");
+                }
                 // 必须先持久化完整 checkpoint，之后才允许当前 Runnable 返回并释放 worker。
                 ToolJobCheckpointAttempt checkpoint = persistToolJobCheckpoint(runId, result);
                 // checkpoint CAS 失败时不能假装已经安全挂起，否则原 worker 一退出上下文就丢失。

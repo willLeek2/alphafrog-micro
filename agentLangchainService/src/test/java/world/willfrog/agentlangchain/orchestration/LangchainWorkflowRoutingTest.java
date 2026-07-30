@@ -36,7 +36,7 @@ class LangchainWorkflowRoutingTest {
     }
 
     @Test
-    void durableToolBuildsPersistableLinearPlanBeforeExecution() {
+    void requestedLinearBuildsPersistableLinearPlanBeforeExecution() {
         LangchainTodoPlan plan = LangchainTodoPlan.builder()
                 .executionMode(PlanExecutionMode.DAG)
                 .items(List.of(
@@ -46,7 +46,8 @@ class LangchainWorkflowRoutingTest {
                                 .dependsOn(List.of("t1")).parallelizable(true).groupKey("g1").build()))
                 .build();
 
-        LangchainTodoPlan effective = LangchainWorkflowRouting.effectivePlan(plan, true);
+        LangchainTodoPlan effective = LangchainWorkflowRouting.effectivePlan(
+                plan, PlanExecutionMode.LINEAR);
 
         assertThat(effective).isNotSameAs(plan);
         assertThat(effective.getExecutionMode()).isEqualTo(PlanExecutionMode.LINEAR);
@@ -56,11 +57,12 @@ class LangchainWorkflowRoutingTest {
             assertThat(item.isParallelizable()).isFalse();
         });
         assertThat(LangchainWorkflowRouting.shouldUseDag(effective)).isFalse();
-        assertThat(LangchainWorkflowRouting.effectivePlan(effective, true)).isSameAs(effective);
+        assertThat(LangchainWorkflowRouting.effectivePlan(
+                effective, PlanExecutionMode.LINEAR)).isSameAs(effective);
     }
 
     @Test
-    void durableToolTopologicallySortsAndRenumbersPlannerDag() {
+    void requestedLinearTopologicallySortsAndRenumbersPlannerDag() {
         LangchainTodoPlan plan = LangchainTodoPlan.builder()
                 .executionMode(PlanExecutionMode.LINEAR)
                 .items(List.of(
@@ -73,7 +75,8 @@ class LangchainWorkflowRoutingTest {
                                 .dependsOn(List.of("root")).build()))
                 .build();
 
-        LangchainTodoPlan effective = LangchainWorkflowRouting.effectivePlan(plan, true);
+        LangchainTodoPlan effective = LangchainWorkflowRouting.effectivePlan(
+                plan, PlanExecutionMode.LINEAR);
 
         assertThat(effective.getItems()).extracting(TodoItem::getId)
                 .containsExactly("root", "left", "right", "join");
@@ -83,7 +86,7 @@ class LangchainWorkflowRoutingTest {
     }
 
     @Test
-    void durableToolFailsClosedForMissingDependency() {
+    void requestedLinearFailsClosedForMissingDependency() {
         LangchainTodoPlan plan = LangchainTodoPlan.builder()
                 .executionMode(PlanExecutionMode.LINEAR)
                 .items(List.of(TodoItem.builder()
@@ -94,13 +97,14 @@ class LangchainWorkflowRoutingTest {
                         .build()))
                 .build();
 
-        assertThatThrownBy(() -> LangchainWorkflowRouting.effectivePlan(plan, true))
+        assertThatThrownBy(() -> LangchainWorkflowRouting.effectivePlan(
+                plan, PlanExecutionMode.LINEAR))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessage("linear_plan_not_linearizable:missing_dependency:todo-1->missing");
     }
 
     @Test
-    void durableToolFailsClosedForDependencyCycle() {
+    void requestedLinearFailsClosedForDependencyCycle() {
         LangchainTodoPlan plan = LangchainTodoPlan.builder()
                 .executionMode(PlanExecutionMode.LINEAR)
                 .items(List.of(
@@ -110,8 +114,51 @@ class LangchainWorkflowRoutingTest {
                                 .dependsOn(List.of("todo-1")).build()))
                 .build();
 
-        assertThatThrownBy(() -> LangchainWorkflowRouting.effectivePlan(plan, true))
+        assertThatThrownBy(() -> LangchainWorkflowRouting.effectivePlan(
+                plan, PlanExecutionMode.LINEAR))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessage("linear_plan_not_linearizable:dependency_cycle");
+    }
+
+    @Test
+    void requestedDagOverridesPlannerLinearModeWithoutDroppingNodes() {
+        LangchainTodoPlan plan = LangchainTodoPlan.builder()
+                .executionMode(PlanExecutionMode.LINEAR)
+                .items(List.of(
+                        TodoItem.builder().id("t1").sequence(1).description("a").build(),
+                        TodoItem.builder().id("t2").sequence(2).description("b").build()))
+                .build();
+
+        LangchainTodoPlan effective = LangchainWorkflowRouting.effectivePlan(
+                plan, PlanExecutionMode.DAG);
+
+        assertThat(effective.getExecutionMode()).isEqualTo(PlanExecutionMode.DAG);
+        assertThat(effective.getItems()).containsExactlyElementsOf(plan.getItems());
+        assertThat(LangchainWorkflowRouting.shouldUseDag(effective)).isTrue();
+    }
+
+    @Test
+    void requestedAutoFreezesPlannerShapeIntoConcreteEffectiveMode() {
+        LangchainTodoPlan linear = LangchainTodoPlan.builder()
+                .executionMode(PlanExecutionMode.AUTO)
+                .items(List.of(TodoItem.builder().id("t1").sequence(1).description("a").build()))
+                .build();
+        LangchainTodoPlan dag = LangchainTodoPlan.builder()
+                .executionMode(PlanExecutionMode.AUTO)
+                .items(List.of(
+                        TodoItem.builder().id("t1").sequence(1).description("a").build(),
+                        TodoItem.builder().id("t2").sequence(2).description("b")
+                                .dependsOn(List.of("t1")).build()))
+                .build();
+
+        LangchainTodoPlan effectiveLinear = LangchainWorkflowRouting.effectivePlan(
+                linear, PlanExecutionMode.AUTO);
+        LangchainTodoPlan effectiveDag = LangchainWorkflowRouting.effectivePlan(
+                dag, PlanExecutionMode.AUTO);
+
+        assertThat(effectiveLinear.getExecutionMode()).isEqualTo(PlanExecutionMode.LINEAR);
+        assertThat(LangchainWorkflowRouting.shouldUseDag(effectiveLinear)).isFalse();
+        assertThat(effectiveDag.getExecutionMode()).isEqualTo(PlanExecutionMode.DAG);
+        assertThat(LangchainWorkflowRouting.shouldUseDag(effectiveDag)).isTrue();
     }
 }

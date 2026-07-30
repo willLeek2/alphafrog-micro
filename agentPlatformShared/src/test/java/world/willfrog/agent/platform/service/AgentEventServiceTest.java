@@ -15,11 +15,13 @@ import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.entity.AgentRunEvent;
 import world.willfrog.agent.platform.mapper.AgentRunEventMapper;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
+import world.willfrog.agent.workflow.PlanExecutionMode;
 
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -204,6 +206,52 @@ class AgentEventServiceTest {
     }
 
     @Test
+    void extractExecutionMode_shouldNormalizeAliasesAndHonorSnakeCasePrecedence() throws Exception {
+        assertEquals("AUTO", service.extractExecutionMode("{}"));
+        assertEquals(PlanExecutionMode.AUTO, service.extractPlanExecutionMode("{}"));
+        assertEquals("LINEAR", service.extractExecutionMode(objectMapper.writeValueAsString(Map.of(
+                "execution_mode", "  linear  "))));
+        assertEquals("DAG", service.extractExecutionMode(objectMapper.writeValueAsString(Map.of(
+                "executionMode", "dAg"))));
+        assertEquals("LINEAR", service.extractExecutionMode(objectMapper.writeValueAsString(Map.of(
+                "execution_mode", "LINEAR",
+                "executionMode", "DAG"))));
+    }
+
+    @Test
+    void extractExecutionMode_shouldRejectUnsupportedValue() throws Exception {
+        String ext = objectMapper.writeValueAsString(Map.of("execution_mode", "parallel"));
+
+        IllegalArgumentException error = assertThrows(
+                IllegalArgumentException.class,
+                () -> service.extractPlanExecutionMode(ext));
+
+        assertEquals("unsupported_execution_mode:PARALLEL", error.getMessage());
+    }
+
+    @Test
+    void createRun_shouldRejectUnsupportedExecutionModeBeforeInsert() {
+        IllegalArgumentException error = assertThrows(
+                IllegalArgumentException.class,
+                () -> service.createRun(
+                        "u-invalid",
+                        "hello",
+                        "{\"execution_mode\":\"parallel\"}",
+                        "idem",
+                        "m",
+                        "e",
+                        false,
+                        "openrouter",
+                        2,
+                        false,
+                        "{}",
+                        false));
+
+        assertEquals("unsupported_execution_mode:PARALLEL", error.getMessage());
+        verify(runMapper, never()).insert(any());
+    }
+
+    @Test
     void createRun_shouldSnapshotDataFreshnessIntoExt() throws Exception {
         AgentLlmProperties.DataFreshness freshness = new AgentLlmProperties.DataFreshness();
         freshness.setStartDate("2020-01-01");
@@ -218,13 +266,15 @@ class AgentEventServiceTest {
         AgentRun run = run("r-test", "u-test");
         when(runMapper.findByIdAndUser(anyString(), anyString())).thenReturn(run);
 
-        service.createRun("u-test", "hello", "{}", "idem", "m", "e", false, "openrouter", 2, false, "{}", false);
+        service.createRun("u-test", "hello", "{\"executionMode\":\" dag \"}",
+                "idem", "m", "e", false, "openrouter", 2, false, "{}", false);
 
         ArgumentCaptor<AgentRun> runCaptor = ArgumentCaptor.forClass(AgentRun.class);
         verify(runMapper).insert(runCaptor.capture());
         AgentRun captured = runCaptor.getValue();
         assertEquals("{}", captured.getToolJobAnchorJson());
         Map<?, ?> ext = objectMapper.readValue(captured.getExt(), Map.class);
+        assertEquals("DAG", ext.get("execution_mode"));
         Map<?, ?> df = (Map<?, ?>) ext.get("data_freshness");
         assertEquals("2020-01-01", df.get("start_date"));
         assertEquals("2026-06-24", df.get("end_date"));
@@ -247,6 +297,7 @@ class AgentEventServiceTest {
         ArgumentCaptor<AgentRun> runCaptor = ArgumentCaptor.forClass(AgentRun.class);
         verify(runMapper).insert(runCaptor.capture());
         Map<?, ?> ext = objectMapper.readValue(runCaptor.getValue().getExt(), Map.class);
+        assertEquals("AUTO", ext.get("execution_mode"));
         assertFalse(ext.containsKey("data_freshness"));
     }
 
