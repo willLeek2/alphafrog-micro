@@ -22,6 +22,7 @@ import java.lang.reflect.Field;
 import java.time.Instant;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -211,7 +212,7 @@ class ToolJobStartupDagCleanupRecoveryTest {
         takeoverOrder.verify(fixture.sandbox).getTaskByOperationId(
                 org.mockito.ArgumentMatchers.argThat(
                         request -> "run-dag:call-1:1".equals(request.getOperationId())));
-        takeoverOrder.verify(fixture.anchorService).updateDagCleanup(
+        takeoverOrder.verify(fixture.anchorService).updateDagCleanupPreparing(
                 eq("run-dag"),
                 org.mockito.ArgumentMatchers.argThat(
                         anchor -> "task-recovered".equals(anchor.getTaskId())
@@ -219,7 +220,8 @@ class ToolJobStartupDagCleanupRecoveryTest {
                                 && ToolJobRunDisposition.DAG_BLOCKING_WORKER_LOST.equals(
                                 anchor.getRunDisposition())),
                 eq("run-dag:call-1:1"),
-                eq("owner-old"));
+                eq("owner-old"),
+                eq("sha256:" + "a".repeat(64)));
 
         ArgumentCaptor<List<DataAnalysisReservation>> recovered =
                 ArgumentCaptor.forClass(List.class);
@@ -254,13 +256,15 @@ class ToolJobStartupDagCleanupRecoveryTest {
         verify(fixture.sandbox).getTaskByOperationId(
                 org.mockito.ArgumentMatchers.argThat(
                         request -> "run-dag:call-1:1".equals(request.getOperationId())));
-        verify(fixture.anchorService, org.mockito.Mockito.atLeastOnce()).updateDagCleanup(
+        verify(fixture.anchorService, org.mockito.Mockito.atLeastOnce())
+                .updateDagCleanupPreparing(
                 eq("run-dag"),
                 org.mockito.ArgumentMatchers.argThat(
                         anchor -> "task-recovered".equals(anchor.getTaskId())
                                 && "ATTACHED".equals(anchor.getAnchorState())),
                 eq("run-dag:call-1:1"),
-                eq("owner-old"));
+                eq("owner-old"),
+                eq("sha256:" + "a".repeat(64)));
         verify(fixture.anchorService, never()).updateActive(any(), any(), any(), any());
         verify(fixture.anchorService, never()).updateActiveAndStatus(
                 any(), any(), eq(AgentRunStatus.WAITING_TOOL_JOB),
@@ -297,13 +301,14 @@ class ToolJobStartupDagCleanupRecoveryTest {
         });
         verify(fixture.sandbox).getTaskByOperationId(any());
         verify(fixture.sandbox, never()).createTask(any());
-        verify(fixture.anchorService).updateDagCleanup(
+        verify(fixture.anchorService).updateDagCleanupPreparing(
                 eq("run-dag"),
                 org.mockito.ArgumentMatchers.argThat(
                         anchor -> "PREPARING".equals(anchor.getAnchorState())
                                 && anchor.getNextPollAt() != null),
                 eq("run-dag:call-1:1"),
-                eq("owner-old"));
+                eq("owner-old"),
+                eq("sha256:" + "a".repeat(64)));
         verify(fixture.redisCache).atomicWritePendingAndDue(
                 eq("run-dag"), any(ToolJobAnchor.class));
 
@@ -312,13 +317,15 @@ class ToolJobStartupDagCleanupRecoveryTest {
         verify(fixture.sandbox, times(2)).getTaskByOperationId(
                 org.mockito.ArgumentMatchers.argThat(
                         request -> "run-dag:call-1:1".equals(request.getOperationId())));
-        verify(fixture.anchorService, org.mockito.Mockito.atLeastOnce()).updateDagCleanup(
+        verify(fixture.anchorService, org.mockito.Mockito.atLeastOnce())
+                .updateDagCleanupPreparing(
                 eq("run-dag"),
                 org.mockito.ArgumentMatchers.argThat(
                         anchor -> "task-recovered-online".equals(anchor.getTaskId())
                                 && "ATTACHED".equals(anchor.getAnchorState())),
                 eq("run-dag:call-1:1"),
-                eq("owner-old"));
+                eq("owner-old"),
+                eq("sha256:" + "a".repeat(64)));
         verify(fixture.anchorService, never()).updateActiveAndStatus(
                 any(), any(), eq(AgentRunStatus.WAITING_TOOL_JOB), any(), any());
         verify(fixture.resumeService, never()).tryResume(any());
@@ -348,6 +355,96 @@ class ToolJobStartupDagCleanupRecoveryTest {
                         anchor -> "ATTACHED".equals(anchor.getAnchorState())),
                 any(),
                 any());
+        verify(fixture.anchorService, never()).updateDagCleanupPreparing(
+                any(), any(), any(), any(), any());
+        verify(fixture.resumeService, never()).tryResume(any());
+    }
+
+    @Test
+    void expiredDagPreparingWithContradictoryReplayFingerprintRemainsQuarantined()
+            throws Exception {
+        Fixture fixture = fixture(
+                "RUNNING",
+                dagPreparingAnchor(
+                        ToolJobRunDisposition.DAG_BLOCKING_NO_RESUME,
+                        Instant.now().minusSeconds(5)));
+        when(fixture.sandbox.getTaskByOperationId(any())).thenReturn(
+                GetTaskByOperationIdResponse.newBuilder()
+                        .setFound(false)
+                        .build());
+        when(fixture.sandbox.createTask(any())).thenReturn(
+                ExecuteResponse.newBuilder()
+                        .setTaskId("task-replayed")
+                        .setRequestFingerprint("sha256:" + "b".repeat(64))
+                        .build());
+
+        fixture.recovery.onReady();
+
+        verify(fixture.sandbox).createTask(
+                org.mockito.ArgumentMatchers.argThat(
+                        request -> "run-dag:call-1:1".equals(request.getOperationId())
+                                && ("sha256:" + "a".repeat(64)).equals(
+                                request.getRequestFingerprint())));
+        verify(fixture.capacity, never()).recover(anyList(), anyInt(), anyInt());
+        verify(fixture.anchorService, never()).updateDagCleanup(
+                eq("run-dag"),
+                org.mockito.ArgumentMatchers.argThat(
+                        anchor -> "ATTACHED".equals(anchor.getAnchorState())),
+                any(),
+                any());
+        verify(fixture.anchorService, never()).updateDagCleanupPreparing(
+                any(), any(), any(), any(), any());
+        verify(fixture.anchorService, never()).updateActiveAndStatus(
+                any(), any(), eq(AgentRunStatus.WAITING_TOOL_JOB), any(), any());
+        verify(fixture.resumeService, never()).tryResume(any());
+    }
+
+    @Test
+    void startupResolvedPreparingCasLoserCannotOverwriteAttachedWinner()
+            throws Exception {
+        Fixture fixture = fixture(
+                "RUNNING",
+                dagPreparingAnchor(
+                        ToolJobRunDisposition.DAG_BLOCKING_NO_RESUME,
+                        Instant.now().minusSeconds(5)));
+        AtomicReference<ToolJobAnchor> attemptedWrite = new AtomicReference<>();
+        when(fixture.anchorService.updateDagCleanupPreparing(
+                eq("run-dag"), any(), eq("run-dag:call-1:1"), eq("owner-old"),
+                eq("sha256:" + "a".repeat(64))))
+                .thenAnswer(invocation -> {
+                    ToolJobAnchor candidate = invocation.getArgument(1);
+                    attemptedWrite.set(ToolJobAnchor.fromJson(candidate.toJson()));
+                    return false;
+                });
+        when(fixture.sandbox.getTaskByOperationId(any())).thenReturn(
+                GetTaskByOperationIdResponse.newBuilder()
+                        .setFound(true)
+                        .setTaskId("task-stale")
+                        .setRequestFingerprint("sha256:" + "a".repeat(64))
+                        .build());
+
+        fixture.recovery.onReady();
+
+        ArgumentCaptor<List<DataAnalysisReservation>> recovered =
+                ArgumentCaptor.forClass(List.class);
+        verify(fixture.capacity).recover(recovered.capture(), anyInt(), anyInt());
+        assertThat(recovered.getValue()).singleElement().satisfies(reservation -> {
+            assertThat(reservation.state()).isEqualTo(DataAnalysisReservationState.PREPARING);
+            assertThat(reservation.taskId()).isNull();
+        });
+        verify(fixture.anchorService).updateDagCleanupPreparing(
+                eq("run-dag"), any(ToolJobAnchor.class),
+                eq("run-dag:call-1:1"),
+                eq("owner-old"),
+                eq("sha256:" + "a".repeat(64)));
+        assertThat(attemptedWrite.get()).isNotNull();
+        assertThat(attemptedWrite.get().getAnchorState()).isEqualTo("ATTACHED");
+        assertThat(attemptedWrite.get().getTaskId()).isEqualTo("task-stale");
+        verify(fixture.anchorService, never()).updateDagCleanup(
+                any(), any(), any(), any());
+        verify(fixture.redisCache).upsertDue(eq("run-dag"), any(ToolJobAnchor.class));
+        verify(fixture.anchorService, never()).updateActiveAndStatus(
+                any(), any(), eq(AgentRunStatus.WAITING_TOOL_JOB), any(), any());
         verify(fixture.resumeService, never()).tryResume(any());
     }
 
@@ -366,8 +463,9 @@ class ToolJobStartupDagCleanupRecoveryTest {
                         .build());
         doThrow(new IllegalStateException("commit outcome unknown"))
                 .when(fixture.anchorService)
-                .updateDagCleanup(
-                        eq("run-dag"), any(), eq("run-dag:call-1:1"), eq("owner-old"));
+                .updateDagCleanupPreparing(
+                        eq("run-dag"), any(), eq("run-dag:call-1:1"), eq("owner-old"),
+                        eq("sha256:" + "a".repeat(64)));
 
         fixture.recovery.onReady();
 
@@ -376,8 +474,9 @@ class ToolJobStartupDagCleanupRecoveryTest {
         verify(fixture.capacity).recover(recovered.capture(), anyInt(), anyInt());
         assertThat(recovered.getValue()).singleElement().satisfies(reservation ->
                 assertThat(reservation.state()).isEqualTo(DataAnalysisReservationState.PREPARING));
-        verify(fixture.anchorService, times(1)).updateDagCleanup(
-                eq("run-dag"), any(), eq("run-dag:call-1:1"), eq("owner-old"));
+        verify(fixture.anchorService, times(1)).updateDagCleanupPreparing(
+                eq("run-dag"), any(), eq("run-dag:call-1:1"), eq("owner-old"),
+                eq("sha256:" + "a".repeat(64)));
         verify(fixture.redisCache).upsertDue(eq("run-dag"), any(ToolJobAnchor.class));
         verify(fixture.anchorService, never()).updateActive(any(), any(), any(), any());
         verify(fixture.resumeService, never()).tryResume(any());
@@ -436,6 +535,10 @@ class ToolJobStartupDagCleanupRecoveryTest {
                 .thenReturn(true);
         when(anchorService.updateDagCleanup(
                 eq("run-dag"), any(), eq("run-dag:call-1:1"), eq("owner-old")))
+                .thenReturn(true);
+        when(anchorService.updateDagCleanupPreparing(
+                eq("run-dag"), any(), eq("run-dag:call-1:1"), eq("owner-old"),
+                eq("sha256:" + "a".repeat(64))))
                 .thenReturn(true);
         when(capacity.recover(anyList(), anyInt(), anyInt()))
                 .thenReturn(new DataAnalysisCapacityRecoveryReport(

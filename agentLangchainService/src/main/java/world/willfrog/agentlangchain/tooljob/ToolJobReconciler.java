@@ -258,11 +258,12 @@ public class ToolJobReconciler {
         if (resolution.outcome()
                 == ToolJobPreparingDispatchResolver.Outcome.REMOTE_UNAVAILABLE) {
             try {
-                if (anchorService.updateDagCleanup(
+                if (anchorService.updateDagCleanupPreparing(
                         runId,
                         anchor,
                         anchor.getOperationId(),
-                        anchor.getBlockingOwnerId())) {
+                        anchor.getBlockingOwnerId(),
+                        anchor.getRequestFingerprint())) {
                     redisCache.atomicWritePendingAndDue(runId, anchor);
                     return;
                 }

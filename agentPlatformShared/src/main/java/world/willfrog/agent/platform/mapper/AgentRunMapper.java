@@ -205,6 +205,17 @@ public interface AgentRunMapper {
             @Param("expectedOwnerId") String expectedOwnerId);
 
     /**
+     * PREPARING cleanup 的专用状态 CAS。远端解析结果或 retry 时间只能在数据库当前
+     * 仍是同一 PREPARING dispatch 时写入，不能覆盖另一恢复者已推进的 ATTACHED/TERMINAL。
+     */
+    int updateDagCleanupPreparingToolJobAnchor(
+            @Param("id") String id,
+            @Param("toolJobAnchorJson") String toolJobAnchorJson,
+            @Param("expectedOperationId") String expectedOperationId,
+            @Param("expectedOwnerId") String expectedOwnerId,
+            @Param("expectedRequestFingerprint") String expectedRequestFingerprint);
+
+    /**
      * cleanup-only 的终态证明全部落地后清空 anchor。EXECUTING 转为 FAILED；
      * 已经 FAILED/CANCELED 的 Run 保留原 status、snapshot 和 last_error。
      */

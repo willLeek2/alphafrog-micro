@@ -425,7 +425,12 @@ public class ToolJobStartupRecovery {
     private void scheduleDagPreparingRetry(String runId, ToolJobAnchor anchor) {
         anchor.setNextPollAt(Instant.now().plusMillis(config.getReconcilerIntervalMs()));
         try {
-            if (persistRecoveredAnchor(runId, anchor)) {
+            if (anchorService.updateDagCleanupPreparing(
+                    runId,
+                    anchor,
+                    anchor.getOperationId(),
+                    anchor.getBlockingOwnerId(),
+                    anchor.getRequestFingerprint())) {
                 redisCache.atomicWritePendingAndDue(runId, anchor);
                 return;
             }

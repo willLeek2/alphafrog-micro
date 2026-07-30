@@ -24,6 +24,10 @@ class ToolJobDagCleanupAnchorServiceTest {
         when(mapper.updateDagCleanupToolJobAnchor(
                 eq("run-1"), anyString(),
                 eq("run-1:call-1:1"), eq("owner-1"))).thenReturn(1);
+        when(mapper.updateDagCleanupPreparingToolJobAnchor(
+                eq("run-1"), anyString(),
+                eq("run-1:call-1:1"), eq("owner-1"), eq("sha256:request")))
+                .thenReturn(1);
         when(mapper.completeDagCleanupAndClearToolJobAnchor(
                 "run-1", "run-1:call-1:1", "owner-1",
                 "DAG_BLOCKING_WORKER_LOST")).thenReturn(1);
@@ -31,11 +35,15 @@ class ToolJobDagCleanupAnchorServiceTest {
         ToolJobAnchor anchor = new ToolJobAnchor();
         anchor.setOperationId("run-1:call-1:1");
         anchor.setBlockingOwnerId("owner-1");
+        anchor.setRequestFingerprint("sha256:request");
 
         assertThat(service.promoteExpiredDagBlockingWorkerLost(
                 "run-1", anchor, "run-1:call-1:1", "owner-1")).isTrue();
         assertThat(service.updateDagCleanup(
                 "run-1", anchor, "run-1:call-1:1", "owner-1")).isTrue();
+        assertThat(service.updateDagCleanupPreparing(
+                "run-1", anchor, "run-1:call-1:1", "owner-1",
+                "sha256:request")).isTrue();
         assertThat(service.completeDagCleanupAndClear(
                 "run-1", "run-1:call-1:1", "owner-1",
                 "DAG_BLOCKING_WORKER_LOST")).isTrue();
@@ -44,6 +52,9 @@ class ToolJobDagCleanupAnchorServiceTest {
                 "run-1", anchor.toJson(), "run-1:call-1:1", "owner-1");
         verify(mapper).updateDagCleanupToolJobAnchor(
                 "run-1", anchor.toJson(), "run-1:call-1:1", "owner-1");
+        verify(mapper).updateDagCleanupPreparingToolJobAnchor(
+                "run-1", anchor.toJson(), "run-1:call-1:1", "owner-1",
+                "sha256:request");
         verify(mapper).completeDagCleanupAndClearToolJobAnchor(
                 "run-1",
                 "run-1:call-1:1",

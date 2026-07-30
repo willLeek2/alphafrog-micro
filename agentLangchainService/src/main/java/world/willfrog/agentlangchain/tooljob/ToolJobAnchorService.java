@@ -168,6 +168,24 @@ public class ToolJobAnchorService {
                 runId, anchor.toJson(), operationId, ownerId) == 1;
     }
 
+    public boolean updateDagCleanupPreparing(
+            String runId,
+            ToolJobAnchor anchor,
+            String operationId,
+            String ownerId,
+            String requestFingerprint) {
+        // PREPARING→ATTACHED 与 nextPoll retry 共用同一个精确旧状态 fence。
+        if (requestFingerprint == null || requestFingerprint.isBlank()) {
+            return false;
+        }
+        return agentRunMapper.updateDagCleanupPreparingToolJobAnchor(
+                runId,
+                anchor.toJson(),
+                operationId,
+                ownerId,
+                requestFingerprint) == 1;
+    }
+
     public boolean completeDagCleanupAndClear(
             String runId,
             String operationId,

@@ -12,6 +12,7 @@ import world.willfrog.agent.platform.dataanalysis.ToolJobRunDisposition;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.alphafrogmicro.sandbox.idl.ExecuteRequest;
+import world.willfrog.alphafrogmicro.sandbox.idl.ExecuteResponse;
 import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskByOperationIdRequest;
 import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskByOperationIdResponse;
 import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskResultRequest;
@@ -150,8 +151,9 @@ class ToolJobReconcilerDagCleanupTest {
     @Test
     void repeatedPreparingLookupFailuresStayCleanupOnlyAndRemainScheduled() throws Exception {
         Fixture fixture = fixture(workerLostPreparingAnchor());
-        when(fixture.anchorService.updateDagCleanup(
-                eq("run-dag"), any(), eq("run-dag:call-1:1"), eq("owner-old")))
+        when(fixture.anchorService.updateDagCleanupPreparing(
+                eq("run-dag"), any(), eq("run-dag:call-1:1"), eq("owner-old"),
+                eq("sha256:" + "a".repeat(64))))
                 .thenReturn(true);
         when(fixture.sandbox.getTaskByOperationId(any())).thenReturn(
                 GetTaskByOperationIdResponse.newBuilder()
@@ -164,13 +166,14 @@ class ToolJobReconcilerDagCleanupTest {
 
         verify(fixture.sandbox, times(2)).getTaskByOperationId(
                 any(GetTaskByOperationIdRequest.class));
-        verify(fixture.anchorService, times(2)).updateDagCleanup(
+        verify(fixture.anchorService, times(2)).updateDagCleanupPreparing(
                 eq("run-dag"),
                 org.mockito.ArgumentMatchers.argThat(
                         anchor -> "PREPARING".equals(anchor.getAnchorState())
                                 && anchor.getTaskId() == null),
                 eq("run-dag:call-1:1"),
-                eq("owner-old"));
+                eq("owner-old"),
+                eq("sha256:" + "a".repeat(64)));
         verify(fixture.redisCache, times(2)).atomicWritePendingAndDue(
                 eq("run-dag"), any(ToolJobAnchor.class));
         verify(fixture.sandbox, never()).createTask(any());
@@ -178,6 +181,72 @@ class ToolJobReconcilerDagCleanupTest {
                 any(), any(), eq(AgentRunStatus.WAITING_TOOL_JOB), any(), any());
         verify(fixture.anchorService, never()).updateAnchor(
                 any(), any(), eq(AgentRunStatus.WAITING_TOOL_JOB));
+        verify(fixture.resumeService, never()).tryResume(any());
+    }
+
+    @Test
+    void stalePreparingRetryCasLoserCannotOverwriteTerminalWinner()
+            throws Exception {
+        Fixture fixture = fixture(workerLostPreparingAnchor());
+        when(fixture.anchorService.updateDagCleanupPreparing(
+                eq("run-dag"), any(), eq("run-dag:call-1:1"), eq("owner-old"),
+                eq("sha256:" + "a".repeat(64))))
+                .thenReturn(false);
+        when(fixture.sandbox.getTaskByOperationId(any())).thenReturn(
+                GetTaskByOperationIdResponse.newBuilder()
+                        .setFound(false)
+                        .setError("sandbox unavailable")
+                        .build());
+
+        fixture.reconciler.reconcileFromDue();
+
+        verify(fixture.anchorService).updateDagCleanupPreparing(
+                eq("run-dag"),
+                org.mockito.ArgumentMatchers.argThat(
+                        anchor -> "PREPARING".equals(anchor.getAnchorState())
+                                && anchor.getTaskId() == null
+                                && anchor.getNextPollAt() != null),
+                eq("run-dag:call-1:1"),
+                eq("owner-old"),
+                eq("sha256:" + "a".repeat(64)));
+        verify(fixture.anchorService, never()).updateDagCleanup(
+                any(), any(), any(), any());
+        verify(fixture.redisCache).upsertDue(eq("run-dag"), any(ToolJobAnchor.class));
+        verify(fixture.redisCache, never()).atomicWritePendingAndDue(
+                eq("run-dag"), any(ToolJobAnchor.class));
+        verify(fixture.anchorService, never()).updateActiveAndStatus(
+                any(), any(), eq(AgentRunStatus.WAITING_TOOL_JOB), any(), any());
+        verify(fixture.resumeService, never()).tryResume(any());
+    }
+
+    @Test
+    void contradictoryReplayFingerprintRemovesDueWithoutAttachingOrResuming()
+            throws Exception {
+        Fixture fixture = fixture(workerLostPreparingAnchor());
+        when(fixture.sandbox.getTaskByOperationId(any())).thenReturn(
+                GetTaskByOperationIdResponse.newBuilder()
+                        .setFound(false)
+                        .build());
+        when(fixture.sandbox.createTask(any())).thenReturn(
+                ExecuteResponse.newBuilder()
+                        .setTaskId("task-replayed")
+                        .setRequestFingerprint("sha256:" + "b".repeat(64))
+                        .build());
+
+        fixture.reconciler.reconcileFromDue();
+
+        verify(fixture.sandbox).createTask(
+                org.mockito.ArgumentMatchers.argThat(
+                        request -> "run-dag:call-1:1".equals(request.getOperationId())
+                                && ("sha256:" + "a".repeat(64)).equals(
+                                request.getRequestFingerprint())));
+        verify(fixture.redisCache).removeDue("run-dag");
+        verify(fixture.anchorService, never()).updateDagCleanupPreparing(
+                any(), any(), any(), any(), any());
+        verify(fixture.anchorService, never()).updateDagCleanup(
+                any(), any(), any(), any());
+        verify(fixture.anchorService, never()).updateActiveAndStatus(
+                any(), any(), eq(AgentRunStatus.WAITING_TOOL_JOB), any(), any());
         verify(fixture.resumeService, never()).tryResume(any());
     }
 

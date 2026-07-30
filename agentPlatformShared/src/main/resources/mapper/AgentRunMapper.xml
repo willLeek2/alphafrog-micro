@@ -476,6 +476,31 @@
     </update>
 
     <!--
+        PREPARING lookup/replay 与 remote-unavailable retry 的专用状态 CAS。
+        当前 durable anchor 必须仍是同一 fingerprint 的 PREPARING、没有 taskId，
+        且 reservation 仍为 PREPARING；迟到恢复者不能覆盖已推进的 ATTACHED/TERMINAL。
+    -->
+    <update id="updateDagCleanupPreparingToolJobAnchor">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = CAST(#{toolJobAnchorJson} AS jsonb),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status IN ('EXECUTING', 'FAILED', 'CANCELED')
+          AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{expectedOperationId}
+          AND tool_job_anchor_json -&gt;&gt; 'blockingOwnerId' = #{expectedOwnerId}
+          AND tool_job_anchor_json -&gt;&gt; 'runDisposition' = 'DAG_BLOCKING_WORKER_LOST'
+          AND COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true) = false
+          AND tool_job_anchor_json -&gt;&gt; 'requestFingerprint'
+              = #{expectedRequestFingerprint}
+          AND tool_job_anchor_json -&gt;&gt; 'anchorState' = 'PREPARING'
+          AND NULLIF(tool_job_anchor_json -&gt;&gt; 'taskId', '') IS NULL
+          AND (
+                 (tool_job_anchor_json -&gt;&gt; 'reservationJson')::jsonb
+                     -&gt;&gt; 'state'
+               ) = 'PREPARING'
+    </update>
+
+    <!--
         清 anchor 前要求 TERMINAL + RELEASED + usage + event 四类 durable proof。
         EXECUTING 才改 FAILED/last_error；已有 FAILED/CANCELED 的业务终态原样保留。
     -->

@@ -124,6 +124,56 @@ class ToolJobDagCleanupMapperPostgresIntegrationTest {
     }
 
     @Test
+    void preparingCleanupCasCannotOverwriteAttachedOrTerminalWinner() {
+        try (SqlSession session = sqlSessionFactory.openSession(true)) {
+            AgentRunMapper mapper = session.getMapper(AgentRunMapper.class);
+            insertRun(mapper, "preparing-cas", AgentRunStatus.FAILED, "pipeline_failed",
+                    preparingAnchor("preparing-cas"));
+            insertRun(mapper, "winner-attached", AgentRunStatus.EXECUTING, null,
+                    attachedAnchor("winner-attached", "ATTACHED"));
+            insertRun(mapper, "winner-terminal", AgentRunStatus.CANCELED, "user_canceled",
+                    attachedAnchor("winner-terminal", "TERMINAL"));
+
+            assertThat(mapper.updateDagCleanupPreparingToolJobAnchor(
+                    "preparing-cas",
+                    attachedAnchor("preparing-cas", "ATTACHED"),
+                    "preparing-cas:call-1:1",
+                    "owner-1",
+                    "sha256:wrong")).isZero();
+            assertThat(mapper.updateDagCleanupPreparingToolJobAnchor(
+                    "preparing-cas",
+                    attachedAnchor("preparing-cas", "ATTACHED"),
+                    "preparing-cas:call-1:1",
+                    "owner-1",
+                    "sha256:request")).isEqualTo(1);
+            assertThat(mapper.findById("preparing-cas").getToolJobAnchorJson())
+                    .contains("\"anchorState\": \"ATTACHED\"")
+                    .contains("\"taskId\": \"task-1\"");
+
+            assertThat(mapper.updateDagCleanupPreparingToolJobAnchor(
+                    "winner-attached",
+                    preparingAnchor("winner-attached"),
+                    "winner-attached:call-1:1",
+                    "owner-1",
+                    "sha256:request")).isZero();
+            assertThat(mapper.updateDagCleanupPreparingToolJobAnchor(
+                    "winner-terminal",
+                    preparingAnchor("winner-terminal"),
+                    "winner-terminal:call-1:1",
+                    "owner-1",
+                    "sha256:request")).isZero();
+            assertThat(mapper.findById("winner-attached").getToolJobAnchorJson())
+                    .contains("\"anchorState\": \"ATTACHED\"");
+            assertThat(mapper.findById("winner-terminal").getToolJobAnchorJson())
+                    .contains("\"anchorState\": \"TERMINAL\"");
+            assertThat(mapper.findById("winner-terminal").getStatus())
+                    .isEqualTo(AgentRunStatus.CANCELED);
+            assertThat(mapper.findById("winner-terminal").getLastError())
+                    .isEqualTo("user_canceled");
+        }
+    }
+
+    @Test
     void cleanupCompletionRequiresAllDurableProofs() {
         try (SqlSession session = sqlSessionFactory.openSession(true)) {
             AgentRunMapper mapper = session.getMapper(AgentRunMapper.class);
@@ -208,6 +258,35 @@ class ToolJobDagCleanupMapperPostgresIntegrationTest {
                   "reservationJson":"{\\"state\\":\\"RELEASED\\"}"
                 }
                 """.formatted(runId);
+    }
+
+    private static String preparingAnchor(String runId) {
+        return """
+                {
+                  "operationId":"%s:call-1:1",
+                  "blockingOwnerId":"owner-1",
+                  "runDisposition":"DAG_BLOCKING_WORKER_LOST",
+                  "autoResume":false,
+                  "requestFingerprint":"sha256:request",
+                  "anchorState":"PREPARING",
+                  "reservationJson":"{\\"state\\":\\"PREPARING\\"}"
+                }
+                """.formatted(runId);
+    }
+
+    private static String attachedAnchor(String runId, String state) {
+        return """
+                {
+                  "operationId":"%s:call-1:1",
+                  "blockingOwnerId":"owner-1",
+                  "runDisposition":"DAG_BLOCKING_WORKER_LOST",
+                  "autoResume":false,
+                  "requestFingerprint":"sha256:request",
+                  "anchorState":"%s",
+                  "taskId":"task-1",
+                  "reservationJson":"{\\"state\\":\\"TASK_ATTACHED\\"}"
+                }
+                """.formatted(runId, state);
     }
 
     private static void insertRun(
