@@ -49,6 +49,10 @@ public class ToolJobAnchor {
     private int sequence;
     // runDisposition 冻结 RUNNING、PAUSED、CANCELED 或 CHECKPOINT_FAILED 等处置。
     private String runDisposition;
+    // blockingOwnerId 标识当前同步等待 DAG 工具结果的进程，防止其他实例抢占活 worker。
+    private String blockingOwnerId;
+    // blockingLeaseUntil 是同步等待 worker 的可续租期限；只有过期租约可被恢复扫描接管。
+    private Instant blockingLeaseUntil;
     // autoResume=false 时只做终态收尾和容量释放，不自动重新入队。
     private boolean autoResume = true;
     // resumeState 表示 READY、LAUNCHING、CONSUMED 三阶段交接状态。
@@ -181,6 +185,12 @@ public class ToolJobAnchor {
 
     public String getRunDisposition() { return runDisposition; }
     public void setRunDisposition(String runDisposition) { this.runDisposition = runDisposition; }
+
+    public String getBlockingOwnerId() { return blockingOwnerId; }
+    public void setBlockingOwnerId(String blockingOwnerId) { this.blockingOwnerId = blockingOwnerId; }
+
+    public Instant getBlockingLeaseUntil() { return blockingLeaseUntil; }
+    public void setBlockingLeaseUntil(Instant blockingLeaseUntil) { this.blockingLeaseUntil = blockingLeaseUntil; }
 
     public boolean isAutoResume() { return autoResume; }
     public void setAutoResume(boolean autoResume) { this.autoResume = autoResume; }
