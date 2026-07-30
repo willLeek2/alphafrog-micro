@@ -74,6 +74,22 @@ class LangchainLinearRunPipelinePlanReadyTest {
     }
 
     @Test
+    void executeRun_autoLinearShouldPersistAndExecuteTheSameEffectivePlan() throws Exception {
+        LangchainTodoPlan plannerLinearPlan = LangchainTodoPlan.builder()
+                .executionMode(PlanExecutionMode.LINEAR)
+                .items(List.of(
+                        TodoItem.builder().id("todo-1").sequence(1).description("查询").build(),
+                        TodoItem.builder().id("todo-2").sequence(2).description("Python").build()))
+                .build();
+
+        assertPipelineMode(
+                PlanExecutionMode.AUTO,
+                plannerLinearPlan,
+                PlanExecutionMode.LINEAR,
+                false);
+    }
+
+    @Test
     @SuppressWarnings("unchecked")
     void executeRun_shouldFailClosedWhenSuspensionCheckpointIsUnavailable() {
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
@@ -285,6 +301,7 @@ class LangchainLinearRunPipelinePlanReadyTest {
         LangchainLinearWorkflowExecutor linear = mock(LangchainLinearWorkflowExecutor.class);
         LangchainDagWorkflowExecutor dag = mock(LangchainDagWorkflowExecutor.class);
         LangchainRunExecutionGuard executionGuard = mock(LangchainRunExecutionGuard.class);
+        ObjectMapper objectMapper = new ObjectMapper();
         AgentRun run = new AgentRun();
         run.setId("run-mode-" + requestedMode.name().toLowerCase());
         run.setUserId("user-mode");
@@ -314,7 +331,7 @@ class LangchainLinearRunPipelinePlanReadyTest {
                 stageModelResolver,
                 runMapper,
                 eventService,
-                new ObjectMapper(),
+                objectMapper,
                 mock(ObjectProvider.class),
                 stateStoreProvider,
                 mock(ObjectProvider.class),
@@ -354,8 +371,13 @@ class LangchainLinearRunPipelinePlanReadyTest {
             });
         }
 
+        String expectedPlanJson = objectMapper.writeValueAsString(effectivePlan);
         ArgumentCaptor<Object> payloadCaptor = ArgumentCaptor.forClass(Object.class);
-        verify(eventService).append(eq(run.getId()), eq(run.getUserId()), eq("PLAN_READY"), payloadCaptor.capture());
+        InOrder inOrder = inOrder(runMapper, stateStore, eventService);
+        inOrder.verify(runMapper).updatePlanJson(run.getId(), run.getUserId(), expectedPlanJson);
+        inOrder.verify(stateStore).recordPlan(run.getId(), expectedPlanJson, true);
+        inOrder.verify(eventService).append(
+                eq(run.getId()), eq(run.getUserId()), eq("PLAN_READY"), payloadCaptor.capture());
         assertThat((Map<String, Object>) payloadCaptor.getValue())
                 .containsEntry("execution_mode", expectedMode.name())
                 .containsEntry("requested_execution_mode", requestedMode.name())
