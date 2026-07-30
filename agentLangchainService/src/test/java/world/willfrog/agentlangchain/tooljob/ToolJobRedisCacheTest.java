@@ -49,7 +49,8 @@ class ToolJobRedisCacheTest {
                 eq("cleanup-new"),
                 eq("2026-07-30T10:01:00Z"),
                 eq("worker-old"),
-                eq("2026-07-30T10:00:00Z")))
+                eq("2026-07-30T10:00:00Z"),
+                any(String.class)))
                 .thenReturn(0L);
 
         assertThat(cache.claimPreparingAbortCleanupIndexes(
@@ -72,11 +73,12 @@ class ToolJobRedisCacheTest {
                 eq("cleanup-new"),
                 eq("2026-07-30T10:01:00Z"),
                 eq("worker-old"),
-                eq("2026-07-30T10:00:00Z"));
+                eq("2026-07-30T10:00:00Z"),
+                any(String.class));
         String script = scriptCaptor.getValue().getScriptAsString();
         assertThat(script)
-                .contains("anchor['blockingOwnerId'] ~= ARGV[4]")
-                .contains("anchor['blockingLeaseUntil'] ~= ARGV[5]");
+                .contains("and anchor['blockingOwnerId'] == ARGV[4]")
+                .contains("and anchor['blockingLeaseUntil'] == ARGV[5]");
     }
 
     @Test
@@ -88,7 +90,7 @@ class ToolJobRedisCacheTest {
                 .contains("local matchesPreRedisCrash")
                 .contains("anchor['blockingOwnerId'] == ARGV[11]")
                 .contains("anchor['blockingLeaseUntil'] == ARGV[12]")
-                .contains("(not matchesPreviousCleanup) and (not matchesPreRedisCrash)");
+                .contains("return matchesPreviousCleanup or matchesPreRedisCrash");
         assertThat(script.indexOf("anchor['blockingOwnerId'] == ARGV[11]"))
                 .isLessThan(script.indexOf("redis.call('SET'"));
         assertThat(script.indexOf("anchor['blockingLeaseUntil'] == ARGV[12]"))
@@ -127,7 +129,8 @@ class ToolJobRedisCacheTest {
                 eq("cleanup-new"),
                 eq("2026-07-30T10:01:00Z"),
                 eq("worker-source"),
-                eq("2026-07-30T09:59:00Z")))
+                eq("2026-07-30T09:59:00Z"),
+                any(String.class)))
                 .thenReturn(1L);
 
         assertThat(cache.claimPreparingAbortCleanupIndexes(
@@ -136,17 +139,54 @@ class ToolJobRedisCacheTest {
     }
 
     @Test
+    void dueOnlyOldTaskCanBeRebuiltOnlyAfterItsIdentityMatches() {
+        String script =
+                ToolJobRedisCache.CLAIM_PREPARING_ABORT_CLEANUP_INDEXES_SCRIPT;
+
+        assertThat(script)
+                .contains("local dueIdentity = redis.call('HGET', KEYS[3], ARGV[1])")
+                .contains("if score and not matchesClaimable(decodeAnchor(dueIdentity)) then")
+                .contains("redis.call('HSET', KEYS[3], ARGV[1], ARGV[13])");
+        assertThat(script.indexOf(
+                "if score and not matchesClaimable(decodeAnchor(dueIdentity)) then"))
+                .isLessThan(script.indexOf("redis.call('SET'"));
+        assertThat(script.indexOf(
+                "if score and not matchesClaimable(decodeAnchor(dueIdentity)) then"))
+                .isLessThan(script.indexOf("redis.call('ZADD'"));
+    }
+
+    @Test
+    void dueOnlyNewTaskIdentityIsRejectedBeforeOldCleanupCanDeleteIt() {
+        String claimScript =
+                ToolJobRedisCache.CLAIM_PREPARING_ABORT_CLEANUP_INDEXES_SCRIPT;
+        String deleteScript =
+                ToolJobRedisCache.REMOVE_OWNED_PENDING_AND_DUE_SCRIPT;
+
+        assertThat(claimScript)
+                .contains("anchor['operationId'] ~= ARGV[2]")
+                .contains("anchor['blockingOwnerId'] == ARGV[11]")
+                .contains("anchor['blockingLeaseUntil'] == ARGV[12]");
+        assertThat(deleteScript)
+                .contains("if score and not matchesCleanup(dueIdentity) then")
+                .contains("redis.call('ZREM', KEYS[2], ARGV[1])")
+                .contains("redis.call('HDEL', KEYS[3], ARGV[1])");
+        assertThat(deleteScript.indexOf(
+                "if score and not matchesCleanup(dueIdentity) then"))
+                .isLessThan(deleteScript.indexOf("redis.call('ZREM'"));
+    }
+
+    @Test
     void sameOperationWithChangedOwnerOrLeaseIsRejectedWithoutAClaim() {
         String script = ToolJobRedisCache.CLAIM_PREPARING_ABORT_CLEANUP_INDEXES_SCRIPT;
 
         assertThat(script)
                 .contains("anchor['operationId'] ~= ARGV[2]")
-                .contains("anchor['blockingOwnerId'] ~= ARGV[4]")
-                .contains("anchor['blockingLeaseUntil'] ~= ARGV[5]")
+                .contains("anchor['blockingOwnerId'] == ARGV[4]")
+                .contains("anchor['blockingLeaseUntil'] == ARGV[5]")
                 .contains("return 0");
-        assertThat(script.indexOf("anchor['blockingOwnerId'] ~= ARGV[4]"))
+        assertThat(script.indexOf("anchor['blockingOwnerId'] == ARGV[4]"))
                 .isLessThan(script.indexOf("redis.call('SET'"));
-        assertThat(script.indexOf("anchor['blockingLeaseUntil'] ~= ARGV[5]"))
+        assertThat(script.indexOf("anchor['blockingLeaseUntil'] == ARGV[5]"))
                 .isLessThan(script.indexOf("redis.call('SET'"));
     }
 

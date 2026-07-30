@@ -20,6 +20,7 @@ import java.util.Set;
  * <ul>
  *   <li>{@code agent:run:{runId}:pending_tool_job} — JSON cache of pending job state</li>
  *   <li>{@code agent:tool-job:due} — ZSET scored by nextPollAt epoch millis</li>
+ *   <li>{@code agent:tool-job:due:identity} — runId 到 operation/owner/lease 的身份索引</li>
  * </ul>
  * <p>PostgreSQL {@code tool_job_anchor_json} 始终是真相源；本类写失败不会丢上下文，
  * startup recovery/reconciler 会从数据库重建。Redis 只避免全表扫描并降低轮询延迟。</p>
@@ -32,29 +33,48 @@ public class ToolJobRedisCache {
     private static final String PENDING_CACHE_PREFIX = "agent:run:";
     private static final String PENDING_CACHE_SUFFIX = ":pending_tool_job";
     private static final String DUE_ZSET_KEY = "agent:tool-job:due";
+    private static final String DUE_IDENTITY_HASH_KEY =
+            "agent:tool-job:due:identity";
     static final String CLAIM_PREPARING_ABORT_CLEANUP_INDEXES_SCRIPT = """
             local cached = redis.call('GET', KEYS[1])
             local score = redis.call('ZSCORE', KEYS[2], ARGV[1])
+            local dueIdentity = redis.call('HGET', KEYS[3], ARGV[1])
             if (not cached) and (not score) then
+                redis.call('HDEL', KEYS[3], ARGV[1])
                 return 2
             end
-            if (not cached) or (not score) then
-                return 0
+            local function decodeAnchor(value)
+                if not value then
+                    return nil
+                end
+                local ok, anchor = pcall(cjson.decode, value)
+                if not ok then
+                    return nil
+                end
+                return anchor
             end
-            local ok, anchor = pcall(cjson.decode, cached)
-            if not ok then
-                return 0
+            local function isAbortDisposition(anchor)
+                return anchor['runDisposition'] == 'DAG_BLOCKING_NO_RESUME'
+                    or anchor['runDisposition'] == 'DAG_BLOCKING_PREPARING_ABORT'
             end
-            if anchor['operationId'] == ARGV[2]
-                and anchor['anchorState'] == 'CLEARING'
-                and anchor['blockingOwnerId'] == ARGV[9]
-                and anchor['blockingLeaseUntil'] == ARGV[10] then
-                return 1
-            end
-            if anchor['operationId'] ~= ARGV[2] then
-                return 0
-            end
-            if ARGV[3] == 'CLEARING' then
+            local function matchesClaimable(anchor)
+                if not anchor
+                    or anchor['operationId'] ~= ARGV[2]
+                    or not isAbortDisposition(anchor) then
+                    return false
+                end
+                if anchor['anchorState'] == 'CLEARING'
+                    and anchor['blockingOwnerId'] == ARGV[9]
+                    and anchor['blockingLeaseUntil'] == ARGV[10] then
+                    return true
+                end
+                if ARGV[3] ~= 'CLEARING' then
+                    return ARGV[3] == 'ABORTING'
+                        and (anchor['anchorState'] == 'PREPARING'
+                            or anchor['anchorState'] == 'ABORTING')
+                        and anchor['blockingOwnerId'] == ARGV[4]
+                        and anchor['blockingLeaseUntil'] == ARGV[5]
+                end
                 local matchesPreviousCleanup =
                     anchor['anchorState'] == 'CLEARING'
                     and anchor['blockingOwnerId'] == ARGV[4]
@@ -66,44 +86,48 @@ public class ToolJobRedisCache {
                         or anchor['runDisposition'] == 'DAG_BLOCKING_PREPARING_ABORT')
                     and anchor['blockingOwnerId'] == ARGV[11]
                     and anchor['blockingLeaseUntil'] == ARGV[12]
-                if (not matchesPreviousCleanup) and (not matchesPreRedisCrash) then
-                    return 0
-                end
-            else
-                if ARGV[3] ~= 'ABORTING'
-                    or (anchor['anchorState'] ~= 'PREPARING'
-                        and anchor['anchorState'] ~= 'ABORTING')
-                    or (anchor['runDisposition'] ~= 'DAG_BLOCKING_NO_RESUME'
-                        and anchor['runDisposition'] ~= 'DAG_BLOCKING_PREPARING_ABORT')
-                    or anchor['blockingOwnerId'] ~= ARGV[4]
-                    or anchor['blockingLeaseUntil'] ~= ARGV[5] then
-                    return 0
-                end
+                return matchesPreviousCleanup or matchesPreRedisCrash
+            end
+            if cached and not matchesClaimable(decodeAnchor(cached)) then
+                return 0
+            end
+            if score and not matchesClaimable(decodeAnchor(dueIdentity)) then
+                return 0
             end
             redis.call('SET', KEYS[1], ARGV[6], 'EX', ARGV[7])
             redis.call('ZADD', KEYS[2], ARGV[8], ARGV[1])
+            redis.call('HSET', KEYS[3], ARGV[1], ARGV[13])
             return 1
             """;
     static final String REMOVE_OWNED_PENDING_AND_DUE_SCRIPT = """
             local cached = redis.call('GET', KEYS[1])
             local score = redis.call('ZSCORE', KEYS[2], ARGV[1])
+            local dueIdentity = redis.call('HGET', KEYS[3], ARGV[1])
             if (not cached) and (not score) then
+                redis.call('HDEL', KEYS[3], ARGV[1])
                 return 2
             end
-            if (not cached) or (not score) then
+            local function matchesCleanup(value)
+                if not value then
+                    return false
+                end
+                local ok, anchor = pcall(cjson.decode, value)
+                return ok
+                    and anchor['operationId'] == ARGV[2]
+                    and anchor['anchorState'] == 'CLEARING'
+                    and anchor['runDisposition'] == ARGV[3]
+                    and anchor['blockingOwnerId'] == ARGV[4]
+                    and anchor['blockingLeaseUntil'] == ARGV[5]
+            end
+            if cached and not matchesCleanup(cached) then
                 return 0
             end
-            local ok, anchor = pcall(cjson.decode, cached)
-            if (not ok)
-                or anchor['operationId'] ~= ARGV[2]
-                or anchor['anchorState'] ~= 'CLEARING'
-                or anchor['runDisposition'] ~= ARGV[3]
-                or anchor['blockingOwnerId'] ~= ARGV[4]
-                or anchor['blockingLeaseUntil'] ~= ARGV[5] then
+            if score and not matchesCleanup(dueIdentity) then
                 return 0
             end
             redis.call('DEL', KEYS[1])
             redis.call('ZREM', KEYS[2], ARGV[1])
+            redis.call('HDEL', KEYS[3], ARGV[1])
             return 1
             """;
 
@@ -169,7 +193,7 @@ public class ToolJobRedisCache {
     // ---- due ZSET ----
 
     /**
-     * Add or update a run in the due ZSET, scored by the anchor's nextPollAt.
+     * Add or update a run in the due ZSET and its ownership sidecar.
      */
     public void upsertDue(String runId, ToolJobAnchor anchor) {
         // ZSET score 使用 durable nextPollAt；缺失时立即到期以便补扫修复。
@@ -177,14 +201,40 @@ public class ToolJobRedisCache {
         if (nextPoll == null) {
             nextPoll = Instant.now();
         }
-        redisTemplate.opsForZSet().add(DUE_ZSET_KEY, runId, nextPoll.toEpochMilli());
+        String identityJson;
+        try {
+            identityJson = dueIdentityJson(anchor);
+        } catch (RuntimeException serializationFailure) {
+            log.error("Failed to serialize due identity for run={}",
+                    runId, serializationFailure);
+            return;
+        }
+        String lua = """
+                redis.call('ZADD', KEYS[1], ARGV[2], ARGV[1])
+                redis.call('HSET', KEYS[2], ARGV[1], ARGV[3])
+                return 1
+                """;
+        redisTemplate.execute(
+                new DefaultRedisScript<>(lua, Long.class),
+                java.util.List.of(DUE_ZSET_KEY, DUE_IDENTITY_HASH_KEY),
+                runId,
+                String.valueOf(nextPoll.toEpochMilli()),
+                identityJson);
     }
 
     /**
-     * Remove a run from the due ZSET (e.g. after terminal cleanup).
+     * Remove a run from the due ZSET and its ownership sidecar.
      */
     public void removeDue(String runId) {
-        redisTemplate.opsForZSet().remove(DUE_ZSET_KEY, runId);
+        String lua = """
+                redis.call('ZREM', KEYS[1], ARGV[1])
+                redis.call('HDEL', KEYS[2], ARGV[1])
+                return 1
+                """;
+        redisTemplate.execute(
+                new DefaultRedisScript<>(lua, Long.class),
+                java.util.List.of(DUE_ZSET_KEY, DUE_IDENTITY_HASH_KEY),
+                runId);
     }
 
     /**
@@ -198,15 +248,17 @@ public class ToolJobRedisCache {
     }
 
     /**
-     * Atomically write pending cache + due ZSET using a Lua script.
+     * Atomically write pending cache + due ZSET + due identity using a Lua script.
      * Returns true on success.
      */
     public boolean atomicWritePendingAndDue(String runId, ToolJobAnchor anchor) {
         // cache 与 ZSET 必须同成同败，避免有缓存无索引或有索引无缓存的短窗口。
         String cacheKey = pendingCacheKey(runId);
         String cacheJson;
+        String identityJson;
         try {
             cacheJson = anchor.toJson();
+            identityJson = dueIdentityJson(anchor);
         } catch (RuntimeException e) {
             log.error("Failed to serialize anchor for atomic write, run={}", runId, e);
             return false;
@@ -221,14 +273,16 @@ public class ToolJobRedisCache {
         String lua = """
                 redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
                 redis.call('ZADD', KEYS[2], ARGV[3], ARGV[4])
+                redis.call('HSET', KEYS[3], ARGV[4], ARGV[5])
                 return 1
                 """;
         DefaultRedisScript<Long> script = new DefaultRedisScript<>(lua, Long.class);
-        // KEYS 只包含当前 Run cache 与全局 due ZSET，ARGV 传序列化值和时间。
+        // due 身份与索引同成同败；即使 cache TTL 先到，也能安全判断剩余索引属于哪次任务。
         redisTemplate.execute(script,
-                java.util.List.of(cacheKey, DUE_ZSET_KEY),
+                java.util.List.of(
+                        cacheKey, DUE_ZSET_KEY, DUE_IDENTITY_HASH_KEY),
                 cacheJson, String.valueOf(ttlSeconds),
-                String.valueOf(score), runId);
+                String.valueOf(score), runId, identityJson);
         return true;
     }
 
@@ -256,7 +310,10 @@ public class ToolJobRedisCache {
                 Long.class);
         Long result = redisTemplate.execute(
                 script,
-                java.util.List.of(pendingCacheKey(runId), DUE_ZSET_KEY),
+                java.util.List.of(
+                        pendingCacheKey(runId),
+                        DUE_ZSET_KEY,
+                        DUE_IDENTITY_HASH_KEY),
                 runId,
                 expectedOperationId,
                 expectedDisposition,
@@ -297,8 +354,10 @@ public class ToolJobRedisCache {
             return OwnedIndexClaimResult.MISMATCHED;
         }
         String cleanupJson;
+        String cleanupIdentityJson;
         try {
             cleanupJson = cleanupAnchor.toJson();
+            cleanupIdentityJson = dueIdentityJson(cleanupAnchor);
         } catch (RuntimeException serializationFailure) {
             log.error("Failed to serialize PREPARING abort cleanup cache for run={}",
                     runId, serializationFailure);
@@ -313,7 +372,10 @@ public class ToolJobRedisCache {
                 Long.class);
         Long result = redisTemplate.execute(
                 script,
-                java.util.List.of(pendingCacheKey(runId), DUE_ZSET_KEY),
+                java.util.List.of(
+                        pendingCacheKey(runId),
+                        DUE_ZSET_KEY,
+                        DUE_IDENTITY_HASH_KEY),
                 runId,
                 expectedAnchor.getOperationId(),
                 expectedAnchor.getAnchorState(),
@@ -325,7 +387,8 @@ public class ToolJobRedisCache {
                 cleanupAnchor.getBlockingOwnerId(),
                 cleanupAnchor.getBlockingLeaseUntil().toString(),
                 cleanupAnchor.getCleanupSourceOwnerId(),
-                cleanupAnchor.getCleanupSourceLeaseUntil().toString());
+                cleanupAnchor.getCleanupSourceLeaseUntil().toString(),
+                cleanupIdentityJson);
         if (Long.valueOf(1L).equals(result)) {
             return OwnedIndexClaimResult.CLAIMED;
         }
@@ -347,5 +410,15 @@ public class ToolJobRedisCache {
         long ttl = Duration.between(Instant.now(), timeout).toSeconds()
                 + config.getTerminalRetentionSeconds();
         return Math.max(60, ttl);
+    }
+
+    private static String dueIdentityJson(ToolJobAnchor anchor) {
+        ToolJobAnchor identity = new ToolJobAnchor();
+        identity.setOperationId(anchor.getOperationId());
+        identity.setAnchorState(anchor.getAnchorState());
+        identity.setRunDisposition(anchor.getRunDisposition());
+        identity.setBlockingOwnerId(anchor.getBlockingOwnerId());
+        identity.setBlockingLeaseUntil(anchor.getBlockingLeaseUntil());
+        return identity.toJson();
     }
 }
