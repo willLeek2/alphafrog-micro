@@ -54,6 +54,7 @@ class PythonSandboxToolsDataIntenseTest {
         AgentContext.setRunId("run-test");
         AgentContext.setToolCallId("call-1");
         AgentContext.setTodoContext("todo-1", 1);
+        AgentContext.setWorkflow("linear");
     }
 
     @AfterEach
@@ -175,7 +176,200 @@ class PythonSandboxToolsDataIntenseTest {
                 !envelope.background() && !envelope.retryable()
                         && "SUCCEEDED".equals(envelope.terminalStatus())));
         verify(dispatchStore, never()).clearActive(anyString(), anyString());
+        verify(dispatchStore, never()).clearSynchronouslyCompleted(anyString(), anyString());
         verify(dispatchStore, never()).transferToPending(anyString(), any());
+    }
+
+    @Test
+    void unknownWorkflowFailsClosedBeforeCapacitySandboxOrDispatch() throws Exception {
+        fixtureDataset();
+        AgentContext.setWorkflow("experimental");
+
+        String output = tools.executePython("print(1)", "1", null, null, 30);
+
+        assertThat(output)
+                .contains("\"ok\":false")
+                .contains("\"code\":\"WORKFLOW_MODE_UNAVAILABLE\"")
+                .contains("\"workflow\":\"experimental\"");
+        verifyNoInteractions(capacity, sandbox, dispatchStore, recorder);
+    }
+
+    @Test
+    void dagSlowTaskBlocksToSuccessWithoutPendingTransfer() throws Exception {
+        fixtureDataset();
+        AgentContext.setWorkflow("dag");
+        inject("fastPathMs", 1L);
+        List<ToolJobAnchor> observedAnchors = new ArrayList<>();
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(capacity.releaseReservation(any())).thenReturn(DataAnalysisReleaseOutcome.RELEASED);
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenAnswer(invocation -> {
+            observedAnchors.add(snapshot(invocation.getArgument(1)));
+            return true;
+        });
+        when(dispatchStore.persistAttached(eq("run-test"), any())).thenAnswer(invocation -> {
+            observedAnchors.add(snapshot(invocation.getArgument(1)));
+            return true;
+        });
+        when(recorder.upsert(any())).thenReturn(DataAnalysisUpsertOutcome.INSERTED);
+        when(sandbox.createTask(any())).thenAnswer(invocation -> {
+            ExecuteRequest request = invocation.getArgument(0);
+            return ExecuteResponse.newBuilder().setTaskId("task-dag")
+                    .setRequestFingerprint(request.getRequestFingerprint()).build();
+        });
+        when(sandbox.getTaskStatus(any())).thenReturn(
+                TaskStatusResponse.newBuilder().setStatus("RUNNING").build(),
+                TaskStatusResponse.newBuilder().setStatus("SUCCEEDED").build());
+        when(sandbox.getTaskResult(any())).thenReturn(TaskResultResponse.newBuilder()
+                .setTaskId("task-dag").setStatus("SUCCEEDED").setExitCode(0)
+                .setStdout("dag-ok").setRetryable(false)
+                .setResourceUsage(completeUsage()).build());
+
+        String output = tools.executePython("print(1)", "1", null, null, 30);
+
+        assertThat(output).contains("\"ok\":true").contains("\"stdout\":\"dag-ok\"");
+        assertThat(observedAnchors.get(0).getRunDisposition())
+                .isEqualTo("DAG_BLOCKING_NO_RESUME");
+        assertThat(observedAnchors.get(0).isAutoResume()).isFalse();
+        assertThat(observedAnchors.get(observedAnchors.size() - 1).getAnchorState())
+                .isEqualTo("TERMINAL");
+        assertThat(observedAnchors.get(observedAnchors.size() - 1).isUsagePersisted()).isTrue();
+        verify(dispatchStore, never()).transferToPending(anyString(), any());
+        verify(capacity).releaseReservation(any());
+        verify(recorder).upsert(argThat(envelope ->
+                "SUCCEEDED".equals(envelope.terminalStatus()) && !envelope.background()));
+    }
+
+    @Test
+    void dagFailedTaskReturnsFailureWithoutPendingTransfer() throws Exception {
+        fixtureDataset();
+        AgentContext.setWorkflow("dag");
+        inject("fastPathMs", 1L);
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(capacity.releaseReservation(any())).thenReturn(DataAnalysisReleaseOutcome.RELEASED);
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
+        when(dispatchStore.persistAttached(eq("run-test"), any())).thenReturn(true);
+        when(recorder.upsert(any())).thenReturn(DataAnalysisUpsertOutcome.INSERTED);
+        when(sandbox.createTask(any())).thenAnswer(invocation -> {
+            ExecuteRequest request = invocation.getArgument(0);
+            return ExecuteResponse.newBuilder().setTaskId("task-dag-failed")
+                    .setRequestFingerprint(request.getRequestFingerprint()).build();
+        });
+        when(sandbox.getTaskStatus(any())).thenReturn(
+                TaskStatusResponse.newBuilder().setStatus("RUNNING").build(),
+                TaskStatusResponse.newBuilder().setStatus("FAILED").build());
+        when(sandbox.getTaskResult(any())).thenReturn(TaskResultResponse.newBuilder()
+                .setTaskId("task-dag-failed").setStatus("FAILED").setExitCode(1)
+                .setError("boom").setStderr("boom").setRetryable(true)
+                .setResourceUsage(completeUsage()).build());
+
+        String output = tools.executePython(
+                "raise RuntimeError()", "1", null, null, 30);
+
+        assertThat(output)
+                .contains("\"ok\":false")
+                .contains("\"code\":\"TASK_FAILED\"")
+                .contains("\"status\":\"FAILED\"");
+        verify(dispatchStore, never()).transferToPending(anyString(), any());
+        verify(capacity).releaseReservation(any());
+        verify(recorder).upsert(argThat(envelope ->
+                "FAILED".equals(envelope.terminalStatus()) && envelope.retryable()));
+    }
+
+    @Test
+    void dagTerminalWithoutCompleteProofReturnsNormallyAndRetainsAnchor() throws Exception {
+        fixtureDataset();
+        AgentContext.setWorkflow("dag");
+        inject("fastPathMs", 1L);
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
+        when(dispatchStore.persistAttached(eq("run-test"), any())).thenReturn(true);
+        when(sandbox.createTask(any())).thenAnswer(invocation -> {
+            ExecuteRequest request = invocation.getArgument(0);
+            return ExecuteResponse.newBuilder().setTaskId("task-dag-incomplete")
+                    .setRequestFingerprint(request.getRequestFingerprint()).build();
+        });
+        when(sandbox.getTaskStatus(any())).thenReturn(
+                TaskStatusResponse.newBuilder().setStatus("RUNNING").build(),
+                TaskStatusResponse.newBuilder().setStatus("FAILED").build());
+        when(sandbox.getTaskResult(any())).thenReturn(TaskResultResponse.newBuilder()
+                .setTaskId("task-dag-incomplete").setStatus("FAILED")
+                .setError("retryability missing")
+                .setResourceUsage(completeUsage()).build());
+
+        String output = tools.executePython(
+                "raise RuntimeError()", "1", null, null, 30);
+
+        assertThat(output)
+                .contains("\"ok\":false")
+                .contains("\"code\":\"DAG_BLOCKING_TERMINAL_INCOMPLETE\"");
+        verify(dispatchStore, never()).transferToPending(anyString(), any());
+        verify(capacity, never()).releaseReservation(any());
+        verifyNoInteractions(recorder);
+    }
+
+    @Test
+    void dagBlockingTimeoutUsesFrozenDeadlineWithoutPendingTransfer() throws Exception {
+        fixtureDataset();
+        AgentContext.setWorkflow("dag");
+        inject("fastPathMs", 1L);
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
+        when(dispatchStore.persistAttached(eq("run-test"), any())).thenReturn(true);
+        when(sandbox.createTask(any())).thenAnswer(invocation -> {
+            ExecuteRequest request = invocation.getArgument(0);
+            return ExecuteResponse.newBuilder().setTaskId("task-dag-timeout")
+                    .setRequestFingerprint(request.getRequestFingerprint()).build();
+        });
+        when(sandbox.getTaskStatus(any())).thenReturn(
+                TaskStatusResponse.newBuilder().setStatus("RUNNING").build());
+
+        long startedAt = System.currentTimeMillis();
+        String output = tools.executePython("print(1)", "1", null, null, 1);
+
+        assertThat(output)
+                .contains("\"ok\":false")
+                .contains("\"code\":\"DAG_BLOCKING_TIMEOUT\"")
+                .contains("timeout_at");
+        assertThat(System.currentTimeMillis() - startedAt).isBetween(850L, 2500L);
+        verify(dispatchStore, never()).transferToPending(anyString(), any());
+        verify(capacity, never()).releaseReservation(any());
+        verifyNoInteractions(recorder);
+    }
+
+    @Test
+    void dagBlockingInterruptionPreservesInterruptAndRetainsAnchor() throws Exception {
+        fixtureDataset();
+        AgentContext.setWorkflow("dag");
+        inject("fastPathMs", 1L);
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
+        when(dispatchStore.persistAttached(eq("run-test"), any())).thenReturn(true);
+        when(sandbox.createTask(any())).thenAnswer(invocation -> {
+            ExecuteRequest request = invocation.getArgument(0);
+            return ExecuteResponse.newBuilder().setTaskId("task-dag-interrupted")
+                    .setRequestFingerprint(request.getRequestFingerprint()).build();
+        });
+        when(sandbox.getTaskStatus(any())).thenReturn(
+                TaskStatusResponse.newBuilder().setStatus("RUNNING").build());
+
+        Thread.currentThread().interrupt();
+        try {
+            String output = tools.executePython("print(1)", "1", null, null, 30);
+            assertThat(output)
+                    .contains("\"ok\":false")
+                    .contains("\"code\":\"DAG_BLOCKING_INTERRUPTED\"");
+            assertThat(Thread.currentThread().isInterrupted()).isTrue();
+        } finally {
+            Thread.interrupted();
+        }
+        verify(dispatchStore, never()).transferToPending(anyString(), any());
+        verify(capacity, never()).releaseReservation(any());
+        verifyNoInteractions(recorder);
     }
 
     @Test

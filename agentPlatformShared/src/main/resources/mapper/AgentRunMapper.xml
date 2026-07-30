@@ -377,6 +377,23 @@
     </update>
 
     <!--
+        同步工具返回后的清理不能只凭返回字符串判断成功。只有 Run/operation 所有权仍在，
+        anchor 已写 TERMINAL，reservation JSON 证明 RELEASED，且 usage 已持久化时才允许清空。
+    -->
+    <update id="clearSynchronouslyCompletedToolJobAnchor">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = CAST('{}' AS jsonb),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status = #{expectedStatus}
+          AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{expectedOperationId}
+          AND tool_job_anchor_json -&gt;&gt; 'anchorState' = 'TERMINAL'
+          AND COALESCE((tool_job_anchor_json -&gt;&gt; 'usagePersisted')::boolean, false)
+          AND tool_job_anchor_json -&gt;&gt; 'reservationJson' IS NOT NULL
+          AND CAST(tool_job_anchor_json -&gt;&gt; 'reservationJson' AS jsonb) -&gt;&gt; 'state' = 'RELEASED'
+    </update>
+
+    <!--
         完整 checkpoint 写失败后的窄合并：只关闭 autoResume、冻结 disposition 和错误。
         WHERE 绑定 Run 状态、operation、tool call、attempt、task 与 checkpointVersion，
         因此失败 worker 不能污染另一轮工具任务，也不会覆盖 reservation/terminal 字段。

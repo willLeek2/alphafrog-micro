@@ -66,6 +66,20 @@ class PythonSandboxDispatchStoreImplTest {
                 eq("run-1"), any(), eq(AgentRunStatus.EXECUTING), eq("run-1:call-1:1"));
     }
 
+    @Test
+    void synchronousCompletionUsesProofGatedExecutingCas() {
+        when(anchorService.clearSynchronouslyCompleted(
+                "run-1", AgentRunStatus.EXECUTING, "run-1:call-1:1"))
+                .thenReturn(true);
+
+        assertThat(store.clearSynchronouslyCompleted(
+                "run-1", "run-1:call-1:1")).isTrue();
+
+        verify(anchorService).clearSynchronouslyCompleted(
+                "run-1", AgentRunStatus.EXECUTING, "run-1:call-1:1");
+        verify(anchorService, never()).clearActive(any(), any(), any());
+    }
+
     private ToolJobAnchor anchor(String state) {
         ToolJobAnchor anchor = new ToolJobAnchor();
         anchor.setOperationId("run-1:call-1:1");

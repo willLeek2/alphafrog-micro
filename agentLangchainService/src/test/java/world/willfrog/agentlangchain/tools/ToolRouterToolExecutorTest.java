@@ -202,7 +202,7 @@ class ToolRouterToolExecutorTest {
                 "executePython", Map.of("dataset_ids", "1", "code", "print(1)")))
                 .thenReturn(ToolRouter.ToolInvocationResult.builder()
                         .output("{\"ok\":true}").success(true).durationMs(1L).build());
-        when(pythonSandboxDispatchStore.clearActive(
+        when(pythonSandboxDispatchStore.clearSynchronouslyCompleted(
                 "run-123", "run-123:call-python-1:1")).thenReturn(true);
 
         executor.execute(request, null);
@@ -211,8 +211,9 @@ class ToolRouterToolExecutorTest {
         order.verify(eventService).appendOnce(
                 eq("run-123"), eq("user-456"), eq("TOOL_CALL_FINISHED"),
                 eq("run-123:call-python-1:logical_terminal"), any());
-        order.verify(pythonSandboxDispatchStore).clearActive(
+        order.verify(pythonSandboxDispatchStore).clearSynchronouslyCompleted(
                 "run-123", "run-123:call-python-1:1");
+        verify(pythonSandboxDispatchStore, never()).clearActive(anyString(), anyString());
     }
 
     @Test

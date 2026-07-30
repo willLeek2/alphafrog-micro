@@ -426,6 +426,16 @@ public class PythonSandboxTools {
             ExecuteRequest baseRequest,
             int timeoutSeconds,
             long toolStartMs) throws Exception {
+        // 等待策略必须来自 executor 已冻结的 effective workflow；未知值不能猜成 LINEAR。
+        Optional<PythonWaitPolicy> resolvedWaitPolicy =
+                PythonWaitPolicy.fromWorkflow(AgentContext.getWorkflow());
+        if (resolvedWaitPolicy.isEmpty()) {
+            return fail("executePython", "WORKFLOW_MODE_UNAVAILABLE",
+                    "executePython requires an effective workflow of linear or dag",
+                    Map.of("workflow", nvl(AgentContext.getWorkflow())));
+        }
+        PythonWaitPolicy waitPolicy = resolvedWaitPolicy.get();
+
         // toolCallId 来自当前 Todo 的 AgentContext，是跨 worker 恢复的稳定逻辑调用身份。
         String toolCallId = AgentContext.getToolCallId();
         if (toolCallId == null || toolCallId.isBlank()) {
@@ -554,8 +564,8 @@ public class PythonSandboxTools {
         // 保存当前 Todo 位置，后续 pipeline 完整 checkpoint 会补充已完成前缀。
         anchor.setTodoId(AgentContext.getTodoId());
         anchor.setSequence(AgentContext.getTodoSequence() == null ? 0 : AgentContext.getTodoSequence());
-        anchor.setRunDisposition("AUTO_RESUME");
-        anchor.setAutoResume(true);
+        anchor.setRunDisposition(waitPolicy.runDisposition());
+        anchor.setAutoResume(waitPolicy.autoResume());
         // reservation/estimate/dataset snapshot 都先写 anchor，确保旧 worker 退出前真相完整。
         anchor.setReservationJson(objectMapper.writeValueAsString(reservation));
         anchor.setEstimateJson(objectMapper.writeValueAsString(estimate));
@@ -671,38 +681,142 @@ public class PythonSandboxTools {
         anchor.setReservationJson(objectMapper.writeValueAsString(reservation));
         pythonSandboxDispatchStore.persistAttached(runId, anchor);
 
-        // 只在极短 fast-path 窗口内同步轮询；超过窗口就让出 Agent worker。
+        // 两种策略先共享极短 fast-path；到期后 LINEAR 才让出 worker，DAG 改为阻塞轮询。
         long fastDeadline = System.currentTimeMillis() + Math.max(1L, fastPathMs);
         while (System.currentTimeMillis() < fastDeadline) {
             // 状态查询短而轻量，终态时再拉取结果体。
             TaskStatusResponse statusResp = getTaskStatus(taskId);
             String status = statusResp == null ? "" : nvl(statusResp.getStatus());
             if (isTerminal(status)) {
-                // 快速完成也要校验终态结果的任务身份和状态。
-                TaskResultResponse result = fetchTerminalResult(runId, taskId, status);
-                if (result != null && result.hasRetryable()) {
-                    try {
-                        // 同步路径完成 envelope/release/usage 后才直接向模型返回 output。
-                        String completed = completeSynchronously(
-                                runId, identity, estimate, reservation, anchor, status, result);
-                        if (completed != null) {
-                            emitSandboxToolTotal(toolStartMs, "OK", "");
-                            return completed;
-                        }
-                    } catch (Exception terminalFailure) {
-                        log.warn("Synchronous terminal finalization deferred to durable reconciler: "
-                                        + "run={}, taskId={}, error={}",
-                                runId, taskId, terminalFailure.getMessage());
-                    }
-                }
-                // 任一步不能安全同步完成时转 durable pending，由共享 finalizer 重入。
-                return suspend(runId, anchor, reservation, taskId);
+                return finishTerminalByWaitPolicy(
+                        runId, identity, estimate, reservation, anchor, status,
+                        waitPolicy, toolStartMs);
             }
             // 每次最多睡 100ms，并且不越过 fastDeadline。
-            TimeUnit.MILLISECONDS.sleep(Math.min(100L, Math.max(1L, fastDeadline - System.currentTimeMillis())));
+            try {
+                TimeUnit.MILLISECONDS.sleep(
+                        Math.min(100L, Math.max(1L, fastDeadline - System.currentTimeMillis())));
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                if (!waitPolicy.durableSuspend()) {
+                    return dagBlockingInterrupted(taskId, toolStartMs);
+                }
+                throw interrupted;
+            }
         }
-        // fast-path 到期：后台任务继续，当前 Run 进入上下文切换。
-        return suspend(runId, anchor, reservation, taskId);
+        // LINEAR 在 fast-path 后转 durable pending；DAG 留在当前 worker，禁止生成 WAITING_TOOL_JOB。
+        if (waitPolicy.durableSuspend()) {
+            return suspend(runId, anchor, reservation, taskId);
+        }
+        return pollDagBlocking(
+                runId, identity, estimate, reservation, anchor, toolStartMs);
+    }
+
+    /**
+     * 处理已经观察到的 Sandbox 终态。LINEAR 若同步收口不完整则转 durable pending；
+     * DAG 只能正常返回显式失败并保留 active anchor，交给 worker-lost cleanup 恢复。
+     */
+    private String finishTerminalByWaitPolicy(
+            String runId,
+            DataAnalysisOperationIdentity identity,
+            DataAnalysisEstimate estimate,
+            DataAnalysisReservation reservation,
+            ToolJobAnchor anchor,
+            String status,
+            PythonWaitPolicy waitPolicy,
+            long toolStartMs) throws Exception {
+        String taskId = anchor.getTaskId();
+        // 终态结果必须同时证明 taskId、status、payload 完整性与 retryable 字段存在。
+        TaskResultResponse result = fetchTerminalResult(runId, taskId, status);
+        if (result != null && result.hasRetryable()) {
+            try {
+                String completed = completeSynchronously(
+                        runId, identity, estimate, reservation, anchor, status, result);
+                if (completed != null) {
+                    emitSandboxToolTotal(toolStartMs, "OK", "");
+                    return completed;
+                }
+            } catch (Exception terminalFailure) {
+                log.warn("Synchronous terminal finalization incomplete: run={}, taskId={}, "
+                                + "waitPolicy={}, error={}",
+                        runId, taskId, waitPolicy, terminalFailure.getMessage());
+            }
+        }
+        if (waitPolicy.durableSuspend()) {
+            return suspend(runId, anchor, reservation, taskId);
+        }
+        emitSandboxToolTotal(
+                toolStartMs, "ERROR", "DAG_BLOCKING_TERMINAL_INCOMPLETE");
+        return fail("executePython", "DAG_BLOCKING_TERMINAL_INCOMPLETE",
+                "DAG Sandbox task reached terminal state but durable finalization proof is incomplete",
+                Map.of("task_id", taskId, "status", status));
+    }
+
+    /**
+     * DAG 节点在同一 worker 内阻塞轮询到 anchor 已冻结的 timeoutAt。
+     * 本方法从不调用 transferToPending，也不抛 ExternalToolJobPendingException。
+     */
+    private String pollDagBlocking(
+            String runId,
+            DataAnalysisOperationIdentity identity,
+            DataAnalysisEstimate estimate,
+            DataAnalysisReservation reservation,
+            ToolJobAnchor anchor,
+            long toolStartMs) throws Exception {
+        String taskId = anchor.getTaskId();
+        Instant timeoutAt = anchor.getTimeoutAt();
+        int pollIndex = 0;
+        String lastRemoteStatus = "";
+        while (true) {
+            TaskStatusResponse statusResp;
+            try {
+                statusResp = getTaskStatus(taskId);
+            } catch (Exception pollFailure) {
+                log.warn("DAG blocking poll failed: run={}, taskId={}, error={}",
+                        runId, taskId, pollFailure.getMessage());
+                emitSandboxToolTotal(toolStartMs, "ERROR", "DAG_BLOCKING_POLL_FAILED");
+                return fail("executePython", "DAG_BLOCKING_POLL_FAILED",
+                        "DAG Sandbox status polling failed",
+                        Map.of("task_id", taskId, "message", nvl(pollFailure.getMessage())));
+            }
+            String status = statusResp == null ? "" : nvl(statusResp.getStatus());
+            if (pollIndex == 0 || !status.equals(lastRemoteStatus) || pollIndex % 5 == 0) {
+                emitSandboxEvent("sandbox_poll", Map.of(
+                        "status", "OK",
+                        "pollIndex", pollIndex,
+                        "remoteStatus", status,
+                        "taskId", taskId,
+                        "waitPolicy", PythonWaitPolicy.BLOCKING_POLL.name()));
+            }
+            lastRemoteStatus = status;
+            pollIndex++;
+            if (isTerminal(status)) {
+                return finishTerminalByWaitPolicy(
+                        runId, identity, estimate, reservation, anchor, status,
+                        PythonWaitPolicy.BLOCKING_POLL, toolStartMs);
+            }
+
+            long remainingMillis = timeoutAt.toEpochMilli() - System.currentTimeMillis();
+            if (remainingMillis <= 0L) {
+                emitSandboxToolTotal(toolStartMs, "TIMEOUT", "DAG_BLOCKING_TIMEOUT");
+                return fail("executePython", "DAG_BLOCKING_TIMEOUT",
+                        "DAG Sandbox task did not reach terminal state before the frozen timeout",
+                        Map.of("task_id", taskId, "timeout_at", timeoutAt.toString()));
+            }
+            try {
+                TimeUnit.MILLISECONDS.sleep(Math.min(POLL_INTERVAL_MS, remainingMillis));
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return dagBlockingInterrupted(taskId, toolStartMs);
+            }
+        }
+    }
+
+    private String dagBlockingInterrupted(String taskId, long toolStartMs) {
+        emitSandboxToolTotal(toolStartMs, "ERROR", "DAG_BLOCKING_INTERRUPTED");
+        return fail("executePython", "DAG_BLOCKING_INTERRUPTED",
+                "DAG Sandbox task polling was interrupted",
+                Map.of("task_id", taskId));
     }
 
     private String completeSynchronously(
@@ -1107,11 +1221,16 @@ public class PythonSandboxTools {
         data.put("stderr", nvl(result.getStderr()));
         data.put("dataset_dir", nvl(result.getDatasetDir()));
 
-        if (result.getExitCode() == 0) {
+        if ("SUCCEEDED".equals(status) && result.getExitCode() == 0) {
             return ok("executePython", data);
         }
 
-        return fail("executePython", "NON_ZERO_EXIT", "Python execution finished with non-zero exit code", Map.of(
+        String errorCode = switch (status) {
+            case "FAILED" -> "TASK_FAILED";
+            case "CANCELED" -> "TASK_CANCELED";
+            default -> "NON_ZERO_EXIT";
+        };
+        return fail("executePython", errorCode, "Python execution did not succeed", Map.of(
                 "task_id", taskId,
                 "status", status,
                 "exit_code", result.getExitCode(),

@@ -186,6 +186,7 @@ class PythonSandboxToolsP001FastPathTest {
         AgentContext.setRunId(RUN_ID);
         AgentContext.setToolCallId(TOOL_CALL_ID);
         AgentContext.setTodoContext("todo-1", 1);
+        AgentContext.setWorkflow("linear");
 
         fixtureDataset();
     }
@@ -235,8 +236,9 @@ class PythonSandboxToolsP001FastPathTest {
                 !env.background() && !env.retryable()
                         && "SUCCEEDED".equals(env.terminalStatus())));
 
-        // Oracle 4: no clearActive during executePython (done later by ToolRouter)
+        // Oracle 4: executePython 内不清 anchor；ToolRouter 后续按完整凭证清理。
         verify(dispatchStore, never()).clearActive(anyString(), anyString());
+        verify(dispatchStore, never()).clearSynchronouslyCompleted(anyString(), anyString());
 
         // Oracle 5: no transferToPending (fast path succeeds)
         verify(dispatchStore, never()).transferToPending(anyString(), any());
@@ -250,9 +252,9 @@ class PythonSandboxToolsP001FastPathTest {
         assertThat(dbAnchor.isUsagePersisted()).isTrue();
         assertThat(dbAnchor.getResumeState()).isNull();
 
-        // Oracle 7: clearActive (simulating ToolRouter acknowledgement)
+        // Oracle 7: proof-gated clear (模拟 ToolRouter acknowledgement)
         String operationId = RUN_ID + ":" + TOOL_CALL_ID + ":1";
-        boolean cleared = dispatchStore.clearActive(RUN_ID, operationId);
+        boolean cleared = dispatchStore.clearSynchronouslyCompleted(RUN_ID, operationId);
         assertThat(cleared).isTrue();
 
         // Oracle 8: after clearActive, anchor cleared to {} (operationId null)
@@ -375,7 +377,7 @@ class PythonSandboxToolsP001FastPathTest {
                 ToolRouter.ToolInvocationResult.builder()
                         .output("{\"ok\":true}").success(true).durationMs(1L).build());
 
-        // dispatchStore is a real spy — let clearActive hit PG (no stub)
+        // dispatchStore is a real spy — 让 proof-gated clear 真实命中 PG。
 
         // Instantiate real ToolRouterToolExecutor via reflection (package-private class)
         Class<?> executorClass = Class.forName(
@@ -402,21 +404,21 @@ class PythonSandboxToolsP001FastPathTest {
         String output = (String) executeMethod.invoke(executor, request, null);
         assertThat(output).isEqualTo("{\"ok\":true}");
 
-        // Oracle 1: appendOnce called BEFORE clearActive (InOrder on spies)
+        // Oracle 1: appendOnce 必须先于 proof-gated clear（InOrder on spies）。
         InOrder order = inOrder(eventService, dispatchStore);
         String dedupeKey = RUN_ID + ":" + TOOL_CALL_ID + ":logical_terminal";
         order.verify(eventService).appendOnce(
                 eq(RUN_ID), eq("user-test"), eq("TOOL_CALL_FINISHED"),
                 eq(dedupeKey), any());
         String operationId = RUN_ID + ":" + TOOL_CALL_ID + ":1";
-        order.verify(dispatchStore).clearActive(RUN_ID, operationId);
+        order.verify(dispatchStore).clearSynchronouslyCompleted(RUN_ID, operationId);
 
         // Oracle 2: event row persisted to PG
         AgentRunEvent persisted = newEventMapper().findByRunIdAndDedupeKey(RUN_ID, dedupeKey);
         assertThat(persisted).isNotNull();
         assertThat(persisted.getPayloadJson()).contains("executePython");
 
-        // Oracle 3: anchor cleared to {} in PG (real clearActive via real dispatchStore)
+        // Oracle 3: anchor 在 PG 中清为 {}（真实 proof-gated clear）。
         ToolJobAnchorService verifyAfter = new ToolJobAnchorService(newMapper());
         ToolJobAnchor afterClear = verifyAfter.loadAnchor(RUN_ID);
         assertThat(afterClear).isNotNull();

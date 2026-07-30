@@ -63,4 +63,10 @@ public class PythonSandboxDispatchStoreImpl implements PythonSandboxDispatchStor
     public boolean clearActive(String runId, String operationId) {
         return anchorService.clearActive(runId, AgentRunStatus.EXECUTING, operationId);
     }
+
+    @Override
+    public boolean clearSynchronouslyCompleted(String runId, String operationId) {
+        return anchorService.clearSynchronouslyCompleted(
+                runId, AgentRunStatus.EXECUTING, operationId);
+    }
 }

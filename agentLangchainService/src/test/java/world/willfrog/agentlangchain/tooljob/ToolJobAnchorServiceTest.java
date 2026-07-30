@@ -108,6 +108,19 @@ class ToolJobAnchorServiceTest {
         assertThat(result).isFalse();
     }
 
+    @Test
+    void shouldBindStatusAndOperationToProofGatedSynchronousClear() {
+        when(agentRunMapper.clearSynchronouslyCompletedToolJobAnchor(
+                "run-1", AgentRunStatus.EXECUTING, "run-1:tc-1:1"))
+                .thenReturn(1);
+
+        assertThat(anchorService.clearSynchronouslyCompleted(
+                "run-1", AgentRunStatus.EXECUTING, "run-1:tc-1:1")).isTrue();
+
+        verify(agentRunMapper).clearSynchronouslyCompletedToolJobAnchor(
+                "run-1", AgentRunStatus.EXECUTING, "run-1:tc-1:1");
+    }
+
     // ---- CAS predicate binding tests (verify SQL WHERE clause arguments) ----
 
     @Test

@@ -101,6 +101,15 @@ public class ToolJobAnchorService {
                 runId, expectedStatus, operationId, lastError) == 1;
     }
 
+    public boolean clearSynchronouslyCompleted(
+            String runId,
+            AgentRunStatus expectedStatus,
+            String operationId) {
+        // mapper 同时校验 terminal、released reservation 与 usage proof；缺一项均保留 anchor。
+        return agentRunMapper.clearSynchronouslyCompletedToolJobAnchor(
+                runId, expectedStatus, operationId) == 1;
+    }
+
     /**
      * Narrow PostgreSQL JSONB merge for checkpoint-failure ownership. It does
      * not replace reservation/terminal fields and binds the failed checkpoint

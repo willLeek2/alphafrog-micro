@@ -355,8 +355,8 @@ final class ToolRouterToolExecutor implements ToolExecutor {
             return;
         }
         String operationId = new DataAnalysisOperationIdentity(runId, toolCallId, 1).operationId();
-        if (!pythonSandboxDispatchStore.clearActive(runId, operationId)) {
-            log.debug("No synchronous Python anchor cleared for run={}, operationId={}",
+        if (!pythonSandboxDispatchStore.clearSynchronouslyCompleted(runId, operationId)) {
+            log.debug("No proof-complete synchronous Python anchor cleared for run={}, operationId={}",
                     runId, operationId);
         }
     }

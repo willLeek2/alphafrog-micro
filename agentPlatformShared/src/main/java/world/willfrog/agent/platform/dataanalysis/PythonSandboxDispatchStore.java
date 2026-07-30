@@ -17,4 +17,10 @@ public interface PythonSandboxDispatchStore {
 
     /** 仅在 operationId 仍属于调用方时清空失败的 active dispatch。 */
     boolean clearActive(String runId, String operationId);
+
+    /**
+     * 仅在同步终态的 envelope、容量释放和 usage 持久化凭证齐全时清 active anchor。
+     * 返回 false 表示凭证不完整或 operation/status 所有权已变化。
+     */
+    boolean clearSynchronouslyCompleted(String runId, String operationId);
 }

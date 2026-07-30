@@ -163,6 +163,14 @@ public interface AgentRunMapper {
             @Param("lastError") String lastError);
 
     /**
+     * 同步返回后的窄清理：除 status/operation 所有权外，还要求 terminal、released 和 usage proof。
+     */
+    int clearSynchronouslyCompletedToolJobAnchor(
+            @Param("id") String id,
+            @Param("expectedStatus") AgentRunStatus expectedStatus,
+            @Param("expectedOperationId") String expectedOperationId);
+
+    /**
      * 完整 checkpoint 写失败后的白名单补偿写入：只登记失败身份与错误，不覆盖 terminal/reservation。
      * startup recovery 可据此继续收口；调用方不能把失败误当成已经安全释放 worker。
      */
