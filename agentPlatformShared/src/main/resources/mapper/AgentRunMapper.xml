@@ -397,12 +397,24 @@
                     -&gt;&gt; 'state'
               ) = 'RELEASED'
           AND (
-                tool_job_anchor_json -&gt;&gt; 'anchorState' = 'ABORTING'
+                (
+                    tool_job_anchor_json -&gt;&gt; 'anchorState' = 'ABORTING'
+                    AND CAST(#{toolJobAnchorJson} AS jsonb)
+                        -&gt;&gt; 'cleanupSourceOwnerId' = #{expectedOwnerId}
+                    AND CAST(#{toolJobAnchorJson} AS jsonb)
+                        -&gt;&gt; 'cleanupSourceLeaseUntil' = #{expectedLeaseUntil}
+                )
                 OR (
                     tool_job_anchor_json -&gt;&gt; 'anchorState' = 'CLEARING'
                     AND (
                         tool_job_anchor_json -&gt;&gt; 'blockingLeaseUntil'
                     )::timestamptz &lt;= CURRENT_TIMESTAMP
+                    AND CAST(#{toolJobAnchorJson} AS jsonb)
+                        -&gt;&gt; 'cleanupSourceOwnerId'
+                        = tool_job_anchor_json -&gt;&gt; 'cleanupSourceOwnerId'
+                    AND CAST(#{toolJobAnchorJson} AS jsonb)
+                        -&gt;&gt; 'cleanupSourceLeaseUntil'
+                        = tool_job_anchor_json -&gt;&gt; 'cleanupSourceLeaseUntil'
                 )
               )
     </update>

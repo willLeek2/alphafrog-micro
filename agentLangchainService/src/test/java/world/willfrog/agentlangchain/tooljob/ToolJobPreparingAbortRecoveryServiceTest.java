@@ -271,6 +271,8 @@ class ToolJobPreparingAbortRecoveryServiceTest {
         expired.setBlockingOwnerId("worker-old/abort-cleanup/token-a");
         expired.setBlockingLeaseUntil(
                 Instant.parse("2026-07-30T06:00:00Z"));
+        expired.setCleanupSourceOwnerId("worker-a");
+        expired.setCleanupSourceLeaseUntil(LEASE);
         when(capacityService.releaseReservation(any()))
                 .thenReturn(DataAnalysisReleaseOutcome.NOT_FOUND);
         when(anchorService.claimLiveDagBlockingPreparingAbortCleanup(
@@ -300,6 +302,15 @@ class ToolJobPreparingAbortRecoveryServiceTest {
                 RUN_ID, expired, capacityService, anchorService, redisCache))
                 .isEqualTo(
                         ToolJobPreparingAbortRecoveryService.Outcome.COMPLETED);
+
+        var cleanupCaptor =
+                org.mockito.ArgumentCaptor.forClass(ToolJobAnchor.class);
+        verify(redisCache).claimPreparingAbortCleanupIndexes(
+                eq(RUN_ID), eq(expired), cleanupCaptor.capture());
+        assertThat(cleanupCaptor.getValue().getCleanupSourceOwnerId())
+                .isEqualTo("worker-a");
+        assertThat(cleanupCaptor.getValue().getCleanupSourceLeaseUntil())
+                .isEqualTo(LEASE);
     }
 
     @Test

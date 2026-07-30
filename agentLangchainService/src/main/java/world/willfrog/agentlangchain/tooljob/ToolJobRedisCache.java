@@ -55,9 +55,18 @@ public class ToolJobRedisCache {
                 return 0
             end
             if ARGV[3] == 'CLEARING' then
-                if anchor['anchorState'] ~= 'CLEARING'
-                    or anchor['blockingOwnerId'] ~= ARGV[4]
-                    or anchor['blockingLeaseUntil'] ~= ARGV[5] then
+                local matchesPreviousCleanup =
+                    anchor['anchorState'] == 'CLEARING'
+                    and anchor['blockingOwnerId'] == ARGV[4]
+                    and anchor['blockingLeaseUntil'] == ARGV[5]
+                local matchesPreRedisCrash =
+                    (anchor['anchorState'] == 'PREPARING'
+                        or anchor['anchorState'] == 'ABORTING')
+                    and (anchor['runDisposition'] == 'DAG_BLOCKING_NO_RESUME'
+                        or anchor['runDisposition'] == 'DAG_BLOCKING_PREPARING_ABORT')
+                    and anchor['blockingOwnerId'] == ARGV[11]
+                    and anchor['blockingLeaseUntil'] == ARGV[12]
+                if (not matchesPreviousCleanup) and (not matchesPreRedisCrash) then
                     return 0
                 end
             else
@@ -266,8 +275,9 @@ public class ToolJobRedisCache {
      * 把旧 abort 的 Redis 热副本原子推进到当前 CLEARING token。
      *
      * <p>初次 claim 只接受同一 operation、owner、lease 的 PREPARING/ABORTING 热副本；
-     * takeover 也只接受精确旧 token/lease。暂停后恢复的过期 owner 因此无法覆盖新 token，
-     * 即使 operationId 被错误复用也会 fail closed。</p>
+     * takeover 接受精确旧 token/lease，或数据库首次进入 CLEARING 后、Redis 尚未更新就崩溃
+     * 时冻结的原 worker 身份。暂停后恢复的过期 owner 因此无法覆盖新 token；新 operation
+     * 即使错误复用 operationId，只要 owner/lease 不同也会 fail closed。</p>
      */
     public OwnedIndexClaimResult claimPreparingAbortCleanupIndexes(
             String runId,
@@ -281,6 +291,8 @@ public class ToolJobRedisCache {
                 || expectedAnchor.getBlockingLeaseUntil() == null
                 || cleanupAnchor.getBlockingOwnerId() == null
                 || cleanupAnchor.getBlockingLeaseUntil() == null
+                || cleanupAnchor.getCleanupSourceOwnerId() == null
+                || cleanupAnchor.getCleanupSourceLeaseUntil() == null
                 || !"CLEARING".equals(cleanupAnchor.getAnchorState())) {
             return OwnedIndexClaimResult.MISMATCHED;
         }
@@ -311,7 +323,9 @@ public class ToolJobRedisCache {
                 String.valueOf(ttlSeconds),
                 String.valueOf(score),
                 cleanupAnchor.getBlockingOwnerId(),
-                cleanupAnchor.getBlockingLeaseUntil().toString());
+                cleanupAnchor.getBlockingLeaseUntil().toString(),
+                cleanupAnchor.getCleanupSourceOwnerId(),
+                cleanupAnchor.getCleanupSourceLeaseUntil().toString());
         if (Long.valueOf(1L).equals(result)) {
             return OwnedIndexClaimResult.CLAIMED;
         }

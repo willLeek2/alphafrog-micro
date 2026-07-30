@@ -34,4 +34,19 @@ class ToolJobAnchorSerializationTest {
         assertThat(textual.getBlockingLeaseUntil())
                 .isEqualTo(Instant.parse("2026-07-30T07:45:47.335223Z"));
     }
+
+    @Test
+    void roundTripsFrozenRedisCleanupSourceIdentity() {
+        Instant sourceLease =
+                Instant.parse("2026-07-30T07:40:00.123456Z");
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setCleanupSourceOwnerId("worker-a");
+        anchor.setCleanupSourceLeaseUntil(sourceLease);
+
+        ToolJobAnchor restored = ToolJobAnchor.fromJson(anchor.toJson());
+
+        assertThat(restored.getCleanupSourceOwnerId()).isEqualTo("worker-a");
+        assertThat(restored.getCleanupSourceLeaseUntil())
+                .isEqualTo(sourceLease);
+    }
 }

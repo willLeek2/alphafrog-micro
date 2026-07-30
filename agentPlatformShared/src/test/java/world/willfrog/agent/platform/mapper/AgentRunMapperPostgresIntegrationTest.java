@@ -253,6 +253,8 @@ class AgentRunMapperPostgresIntegrationTest {
                     .contains("dag-preparing-abort");
             ToolJobAnchor cleanup = ToolJobAnchor.fromJson(
                     mapper.findById("dag-preparing-abort").getToolJobAnchorJson());
+            cleanup.setCleanupSourceOwnerId(cleanup.getBlockingOwnerId());
+            cleanup.setCleanupSourceLeaseUntil(cleanup.getBlockingLeaseUntil());
             cleanup.setAnchorState("CLEARING");
             cleanup.setBlockingOwnerId("cleanup-token-a");
             cleanup.setBlockingLeaseUntil(renewedLease);
@@ -309,13 +311,22 @@ class AgentRunMapperPostgresIntegrationTest {
             ToolJobAnchor activeTakeover = ToolJobAnchor.fromJson(
                     clearingDagAnchor(
                             "dag-clearing-active:call-1:1",
-                            "cleanup-new",
-                            activeLease.plusSeconds(60)));
+                            "cleanup-old",
+                            activeLease));
+            activeTakeover.setBlockingOwnerId("cleanup-new");
+            activeTakeover.setBlockingLeaseUntil(
+                    activeLease.plusSeconds(60));
             ToolJobAnchor expiredTakeover = ToolJobAnchor.fromJson(
                     clearingDagAnchor(
                             "dag-clearing-expired:call-1:1",
-                            "cleanup-new",
-                            activeLease.plusSeconds(60)));
+                            "cleanup-old",
+                            expiredLease));
+            expiredTakeover.setBlockingOwnerId("cleanup-new");
+            expiredTakeover.setBlockingLeaseUntil(
+                    activeLease.plusSeconds(60));
+            ToolJobAnchor tamperedSource = ToolJobAnchor.fromJson(
+                    expiredTakeover.toJson());
+            tamperedSource.setCleanupSourceOwnerId("worker-wrong");
 
             assertThat(mapper.claimLiveDagBlockingPreparingAbortCleanup(
                     "dag-clearing-active",
@@ -335,6 +346,12 @@ class AgentRunMapperPostgresIntegrationTest {
                     "dag-clearing-expired:call-1:1",
                     "cleanup-old",
                     expiredLease.plusSeconds(1).toString())).isZero();
+            assertThat(mapper.claimLiveDagBlockingPreparingAbortCleanup(
+                    "dag-clearing-expired",
+                    tamperedSource.toJson(),
+                    "dag-clearing-expired:call-1:1",
+                    "cleanup-old",
+                    expiredLease.toString())).isZero();
             assertThat(mapper.claimLiveDagBlockingPreparingAbortCleanup(
                     "dag-clearing-expired",
                     expiredTakeover.toJson(),
@@ -456,6 +473,8 @@ class AgentRunMapperPostgresIntegrationTest {
             Instant leaseUntil) throws Exception {
         ToolJobAnchor anchor = ToolJobAnchor.fromJson(
                 abortingDagAnchor(operationId, ownerId, leaseUntil));
+        anchor.setCleanupSourceOwnerId(ownerId);
+        anchor.setCleanupSourceLeaseUntil(leaseUntil);
         anchor.setAnchorState("CLEARING");
         return anchor.toJson();
     }

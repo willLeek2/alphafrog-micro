@@ -114,6 +114,17 @@ public final class ToolJobPreparingAbortRecoveryService {
             return Outcome.INVALID_EVIDENCE;
         }
         ToolJobAnchor cleanupAnchor = ToolJobAnchor.fromJson(anchor.toJson());
+        if ("ABORTING".equals(anchor.getAnchorState())) {
+            cleanupAnchor.setCleanupSourceOwnerId(
+                    anchor.getBlockingOwnerId());
+            cleanupAnchor.setCleanupSourceLeaseUntil(
+                    anchor.getBlockingLeaseUntil());
+        } else if (anchor.getCleanupSourceOwnerId() == null
+                || anchor.getCleanupSourceOwnerId().isBlank()
+                || anchor.getCleanupSourceLeaseUntil() == null) {
+            // 没有冻结旧 Redis 身份的 CLEARING 不能安全接管，避免误改后来任务的索引。
+            return Outcome.INVALID_EVIDENCE;
+        }
         cleanupAnchor.setAnchorState("CLEARING");
         cleanupAnchor.setBlockingOwnerId(
                 DagBlockingWorkerLease.processOwnerId()

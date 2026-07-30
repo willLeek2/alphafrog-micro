@@ -55,6 +55,10 @@ public class ToolJobAnchor {
     private String blockingOwnerId;
     // blockingLeaseUntil 是同步等待 worker 的可续租期限；只有过期租约可被恢复扫描接管。
     private Instant blockingLeaseUntil;
+    // cleanupSourceOwnerId 冻结进入 CLEARING 前的 worker owner，供 Redis 崩溃恢复核对旧热副本。
+    private String cleanupSourceOwnerId;
+    // cleanupSourceLeaseUntil 与 cleanupSourceOwnerId 组成不可变的旧 Redis 身份。
+    private Instant cleanupSourceLeaseUntil;
     // autoResume=false 时只做终态收尾和容量释放，不自动重新入队。
     private boolean autoResume = true;
     // resumeState 表示 READY、LAUNCHING、CONSUMED 三阶段交接状态。
@@ -193,6 +197,12 @@ public class ToolJobAnchor {
 
     public Instant getBlockingLeaseUntil() { return blockingLeaseUntil; }
     public void setBlockingLeaseUntil(Instant blockingLeaseUntil) { this.blockingLeaseUntil = blockingLeaseUntil; }
+
+    public String getCleanupSourceOwnerId() { return cleanupSourceOwnerId; }
+    public void setCleanupSourceOwnerId(String cleanupSourceOwnerId) { this.cleanupSourceOwnerId = cleanupSourceOwnerId; }
+
+    public Instant getCleanupSourceLeaseUntil() { return cleanupSourceLeaseUntil; }
+    public void setCleanupSourceLeaseUntil(Instant cleanupSourceLeaseUntil) { this.cleanupSourceLeaseUntil = cleanupSourceLeaseUntil; }
 
     public boolean isAutoResume() { return autoResume; }
     public void setAutoResume(boolean autoResume) { this.autoResume = autoResume; }
