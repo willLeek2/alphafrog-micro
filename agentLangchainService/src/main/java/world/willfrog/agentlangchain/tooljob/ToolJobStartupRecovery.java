@@ -138,15 +138,17 @@ public class ToolJobStartupRecovery {
             if (anchor == null) continue;
 
             try {
+                // cleanup-only 可跨 EXECUTING/FAILED/CANCELED 重入；业务终态不能阻断容量收尾。
+                if (ToolJobRunDisposition.isDagCleanupOnly(anchor.getRunDisposition())) {
+                    resolveActiveAnchor(run, anchor);
+                    continue;
+                }
                 // EXECUTING + active anchor 表示进程可能在工具已附着但 Run 尚未转 WAITING 时崩溃。
                 if (run.getStatus() == AgentRunStatus.EXECUTING) {
-                    if (ToolJobRunDisposition.isDagBlocking(anchor.getRunDisposition())) {
-                        // DAG blocking 不支持 frontier 恢复。只有本 startup 才能证明旧 worker
-                        // 已随旧进程消失，并把在线处置升级成 cleanup-only。
-                        if (markDagBlockingWorkerLost(run.getId(), anchor)) {
+                    if (ToolJobRunDisposition.isLiveDagBlocking(anchor.getRunDisposition())) {
+                        // 未来租约只重建 expiry due；过期租约必须通过 owner/opId CAS 才能接管。
+                        if (recoverLiveDagBlocking(run.getId(), anchor)) {
                             resolveActiveAnchor(run, anchor);
-                        } else {
-                            log.warn("DAG cleanup-only ownership remains unresolved for run={}", run.getId());
                         }
                         continue;
                     }
@@ -208,10 +210,6 @@ public class ToolJobStartupRecovery {
     }
 
     private void resolveActiveAnchor(AgentRun run, ToolJobAnchor anchor) {
-        AgentRunStatus expectedStatus =
-                ToolJobRunDisposition.isDagCleanupOnly(anchor.getRunDisposition())
-                        ? AgentRunStatus.EXECUTING
-                        : AgentRunStatus.WAITING_TOOL_JOB;
         // taskId 缺失无法查询 Sandbox，保留 anchor 并等待人工/后续 PREPARING 修复。
         String taskId = anchor.getTaskId();
         if (taskId == null || taskId.isBlank()) {
@@ -241,7 +239,7 @@ public class ToolJobStartupRecovery {
                             run.getId(), taskId);
                     // 将重试时间先写 DB，再重建 Redis。
                     anchor.setNextPollAt(Instant.now().plusMillis(config.getReconcilerIntervalMs()));
-                    if (anchorService.updateAnchor(run.getId(), anchor, expectedStatus)) {
+                    if (persistRecoveredAnchor(run.getId(), anchor)) {
                         redisCache.atomicWritePendingAndDue(run.getId(), anchor);
                     }
                     return;
@@ -256,7 +254,7 @@ public class ToolJobStartupRecovery {
                     || ToolJobRunDisposition.isDagCleanupOnly(anchor.getRunDisposition())) {
                 anchor.setNextPollAt(Instant.now().plusMillis(config.getReconcilerIntervalMs()));
             }
-            if (anchorService.updateAnchor(run.getId(), anchor, expectedStatus)) {
+            if (persistRecoveredAnchor(run.getId(), anchor)) {
                 redisCache.atomicWritePendingAndDue(run.getId(), anchor);
             }
 
@@ -264,35 +262,61 @@ public class ToolJobStartupRecovery {
             // 启动阶段暂时无法访问 Sandbox 时保留 anchor，并重建 due 供在线 reconciler 重试。
             log.error("Failed to resolve anchor for run={}, taskId={}", run.getId(), taskId, e);
             anchor.setNextPollAt(Instant.now().plusMillis(config.getReconcilerIntervalMs()));
-            if (anchorService.updateAnchor(run.getId(), anchor, expectedStatus)) {
+            if (persistRecoveredAnchor(run.getId(), anchor)) {
                 redisCache.atomicWritePendingAndDue(run.getId(), anchor);
             }
         }
     }
 
-    private boolean markDagBlockingWorkerLost(String runId, ToolJobAnchor anchor) {
-        if (ToolJobRunDisposition.isDagCleanupOnly(anchor.getRunDisposition())) {
-            // 前一次 startup 已经取得 cleanup-only 所有权，可直接继续轮询/finalizer。
-            return true;
-        }
+    private boolean recoverLiveDagBlocking(String runId, ToolJobAnchor anchor) {
         if (!ToolJobRunDisposition.isLiveDagBlocking(anchor.getRunDisposition())) {
             return false;
         }
-        if (anchor.getOperationId() == null || anchor.getOperationId().isBlank()) {
+        String operationId = anchor.getOperationId();
+        String ownerId = anchor.getBlockingOwnerId();
+        if (operationId == null || operationId.isBlank()
+                || ownerId == null || ownerId.isBlank()) {
+            log.error("DAG blocking anchor lacks fenced identity for run={}; refusing takeover", runId);
+            return false;
+        }
+        Instant now = Instant.now();
+        if (!DagBlockingWorkerLease.isExpired(anchor.getBlockingLeaseUntil(), now)) {
+            // Redis is only a wake-up index. Keep the durable lease untouched.
+            anchor.setNextPollAt(anchor.getBlockingLeaseUntil());
+            redisCache.atomicWritePendingAndDue(runId, anchor);
+            log.info("DAG blocking lease still live for run={}, owner={}, due={}",
+                    runId, ownerId, anchor.getBlockingLeaseUntil());
             return false;
         }
         anchor.setRunDisposition(ToolJobRunDisposition.DAG_BLOCKING_WORKER_LOST);
         anchor.setAutoResume(false);
         anchor.setFinalizerError(ToolJobRunDisposition.DAG_BLOCKING_WORKER_LOST);
-        anchor.setNextPollAt(Instant.now());
-        boolean marked = anchorService.updateActive(
-                runId, anchor, AgentRunStatus.EXECUTING, anchor.getOperationId());
+        anchor.setNextPollAt(now);
+        boolean marked = anchorService.promoteExpiredDagBlockingWorkerLost(
+                runId, anchor, operationId, ownerId);
         if (marked) {
-            log.warn("Startup marked DAG blocking worker lost for run={}, operationId={}; "
+            log.warn("Startup claimed expired DAG blocking worker for run={}, operationId={}, owner={}; "
                             + "cleanup-only will not resume workflow",
-                    runId, anchor.getOperationId());
+                    runId, operationId, ownerId);
+        } else {
+            log.info("Expired DAG blocking takeover lost CAS for run={}, operationId={}, owner={}",
+                    runId, operationId, ownerId);
         }
         return marked;
+    }
+
+    private boolean persistRecoveredAnchor(String runId, ToolJobAnchor anchor) {
+        if (ToolJobRunDisposition.isDagCleanupOnly(anchor.getRunDisposition())) {
+            String operationId = anchor.getOperationId();
+            String ownerId = anchor.getBlockingOwnerId();
+            if (operationId == null || operationId.isBlank()
+                    || ownerId == null || ownerId.isBlank()) {
+                log.error("DAG cleanup anchor lacks fenced identity for run={}", runId);
+                return false;
+            }
+            return anchorService.updateDagCleanup(runId, anchor, operationId, ownerId);
+        }
+        return anchorService.updateAnchor(runId, anchor, AgentRunStatus.WAITING_TOOL_JOB);
     }
 
     private DataAnalysisReservation resolvePreparingDispatch(

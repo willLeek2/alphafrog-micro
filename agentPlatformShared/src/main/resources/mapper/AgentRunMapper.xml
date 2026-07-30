@@ -422,20 +422,38 @@
     </update>
 
     <!--
-        DAG blocking worker 只在 startup recovery 后进入 cleanup-only。终态 envelope、容量释放、
-        usage 和事件全部完成后，用一条 operationId-gated UPDATE 同时失败 Run 并清 anchor，
-        消除“Run 已 FAILED 但崩溃导致 anchor 永久残留”的窗口。
+        只有同一 operation/owner 的 DAG blocking 租约已到期时，恢复者才能取得
+        cleanup-only 所有权。数据库时间是跨实例统一的过期判据。
     -->
-    <update id="failDagBlockingAndClearToolJobAnchor">
+    <update id="promoteExpiredDagBlockingWorkerLost">
         UPDATE alphafrog_agent_run
-        SET tool_job_anchor_json = CAST('{}' AS jsonb),
-            status = 'FAILED',
-            last_error = #{lastError},
-            completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP),
+        SET tool_job_anchor_json = CAST(#{toolJobAnchorJson} AS jsonb),
             updated_at = CURRENT_TIMESTAMP
         WHERE id = #{id}
-          AND status = #{expectedStatus}
+          AND status = 'EXECUTING'
           AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{expectedOperationId}
+          AND tool_job_anchor_json -&gt;&gt; 'blockingOwnerId' = #{expectedOwnerId}
+          AND tool_job_anchor_json -&gt;&gt; 'runDisposition' = 'DAG_BLOCKING_NO_RESUME'
+          AND COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true) = false
+          AND (
+                NULLIF(tool_job_anchor_json -&gt;&gt; 'blockingLeaseUntil', '') IS NULL
+                OR (tool_job_anchor_json -&gt;&gt; 'blockingLeaseUntil')::timestamptz
+                    &lt;= CURRENT_TIMESTAMP
+              )
+    </update>
+
+    <!--
+        pipeline/control 可能先把 Run 推进到 FAILED/CANCELED。cleanup 中间状态因此按
+        operation+owner+disposition 做 CAS，而不把 Run status 当作唯一所有权。
+    -->
+    <update id="updateDagCleanupToolJobAnchor">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = CAST(#{toolJobAnchorJson} AS jsonb),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status IN ('EXECUTING', 'FAILED', 'CANCELED')
+          AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{expectedOperationId}
+          AND tool_job_anchor_json -&gt;&gt; 'blockingOwnerId' = #{expectedOwnerId}
           AND tool_job_anchor_json -&gt;&gt; 'runDisposition' = 'DAG_BLOCKING_WORKER_LOST'
           AND COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true) = false
     </update>
@@ -455,6 +473,38 @@
           AND COALESCE((tool_job_anchor_json -&gt;&gt; 'usagePersisted')::boolean, false)
           AND tool_job_anchor_json -&gt;&gt; 'reservationJson' IS NOT NULL
           AND CAST(tool_job_anchor_json -&gt;&gt; 'reservationJson' AS jsonb) -&gt;&gt; 'state' = 'RELEASED'
+    </update>
+
+    <!--
+        清 anchor 前要求 TERMINAL + RELEASED + usage + event 四类 durable proof。
+        EXECUTING 才改 FAILED/last_error；已有 FAILED/CANCELED 的业务终态原样保留。
+    -->
+    <update id="completeDagCleanupAndClearToolJobAnchor">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = CAST('{}' AS jsonb),
+            status = CASE WHEN status = 'EXECUTING' THEN 'FAILED' ELSE status END,
+            last_error = CASE WHEN status = 'EXECUTING' THEN #{lastError} ELSE last_error END,
+            completed_at = CASE
+                WHEN status = 'EXECUTING' THEN COALESCE(completed_at, CURRENT_TIMESTAMP)
+                ELSE completed_at
+            END,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status IN ('EXECUTING', 'FAILED', 'CANCELED')
+          AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{expectedOperationId}
+          AND tool_job_anchor_json -&gt;&gt; 'blockingOwnerId' = #{expectedOwnerId}
+          AND tool_job_anchor_json -&gt;&gt; 'runDisposition' = 'DAG_BLOCKING_WORKER_LOST'
+          AND COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true) = false
+          AND tool_job_anchor_json -&gt;&gt; 'anchorState' = 'TERMINAL'
+          AND NULLIF(tool_job_anchor_json -&gt;&gt; 'terminalStatus', '') IS NOT NULL
+          AND NULLIF(tool_job_anchor_json -&gt;&gt; 'terminalAt', '') IS NOT NULL
+          AND tool_job_anchor_json -&gt;&gt; 'finalizerStep' = 'EVENT'
+          AND COALESCE((tool_job_anchor_json -&gt;&gt; 'usagePersisted')::boolean, false) = true
+          AND COALESCE((tool_job_anchor_json -&gt;&gt; 'terminalEventEmitted')::boolean, false) = true
+          AND (
+                 (tool_job_anchor_json -&gt;&gt; 'reservationJson')::jsonb
+                     -&gt;&gt; 'state'
+               ) = 'RELEASED'
     </update>
 
     <!--
@@ -519,8 +569,8 @@
     </update>
 
     <!--
-        补扫真相源中的 active anchor。这里包含 EXECUTING/WAITING_TOOL_JOB/WAITING/CANCELED，
-        因为进程可能在状态推进或取消收尾的任意一步崩溃，不能只扫理想状态。
+        补扫真相源中的 active anchor。除常规 active/canceled 状态外，只把
+        DAG_BLOCKING_WORKER_LOST 的 FAILED Run 纳入，覆盖 pipeline 先失败、cleanup 后收尾。
     -->
     <select id="listActiveToolJobAnchors" resultMap="AgentRunResultMap">
         SELECT id,
@@ -543,7 +593,14 @@
         FROM alphafrog_agent_run
         WHERE tool_job_anchor_json IS NOT NULL
           AND tool_job_anchor_json &lt;&gt; '{}'::jsonb
-          AND status IN ('EXECUTING', 'WAITING_TOOL_JOB', 'WAITING', 'CANCELED')
+          AND (
+                status IN ('EXECUTING', 'WAITING_TOOL_JOB', 'WAITING', 'CANCELED')
+                OR (
+                    status = 'FAILED'
+                    AND tool_job_anchor_json -&gt;&gt; 'runDisposition'
+                        = 'DAG_BLOCKING_WORKER_LOST'
+                )
+              )
         ORDER BY updated_at ASC
         LIMIT #{limit}
     </select>

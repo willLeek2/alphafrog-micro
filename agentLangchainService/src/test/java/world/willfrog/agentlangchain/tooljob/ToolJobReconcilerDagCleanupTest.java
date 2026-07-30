@@ -12,6 +12,7 @@ import world.willfrog.alphafrogmicro.sandbox.idl.TaskResultResponse;
 import world.willfrog.alphafrogmicro.sandbox.idl.TaskStatusResponse;
 
 import java.lang.reflect.Field;
+import java.time.Instant;
 import java.util.List;
 import java.util.Set;
 
@@ -25,19 +26,22 @@ import static org.mockito.Mockito.when;
 class ToolJobReconcilerDagCleanupTest {
 
     @Test
-    void onlineReconcilerNeverStealsLiveDagBlockingWorker() throws Exception {
+    void onlineReconcilerPreservesFutureDagLeaseAndSchedulesExpiry() throws Exception {
         Fixture fixture = fixture(liveAnchor());
 
         fixture.reconciler.reconcileFromDue();
 
-        verify(fixture.redisCache).removeDue("run-dag");
+        verify(fixture.redisCache).atomicWritePendingAndDue(
+                eq("run-dag"), any(ToolJobAnchor.class));
+        verify(fixture.anchorService, never()).promoteExpiredDagBlockingWorkerLost(
+                any(), any(), any(), any());
         verify(fixture.sandbox, never()).getTaskStatus(any());
         verify(fixture.finalizer, never()).handleTerminal(any(), any(), any(), any(), any(Boolean.class));
         verify(fixture.resumeService, never()).tryResume(any());
     }
 
     @Test
-    void anchorRebuildDoesNotPublishLiveDagWorkerIntoBackgroundDueSet() throws Exception {
+    void anchorRebuildSchedulesLiveDagWorkerAtLeaseExpiryWithoutPollingSandbox() throws Exception {
         Fixture fixture = fixture(liveAnchor());
         AgentRun run = new AgentRun();
         run.setId("run-dag");
@@ -47,9 +51,33 @@ class ToolJobReconcilerDagCleanupTest {
 
         fixture.reconciler.rebuildFromAnchors();
 
-        verify(fixture.redisCache).removeDue("run-dag");
-        verify(fixture.redisCache, never()).atomicWritePendingAndDue(any(), any());
+        verify(fixture.redisCache).atomicWritePendingAndDue(
+                eq("run-dag"), any(ToolJobAnchor.class));
+        verify(fixture.anchorService, never()).promoteExpiredDagBlockingWorkerLost(
+                any(), any(), any(), any());
         verify(fixture.sandbox, never()).getTaskStatus(any());
+        verify(fixture.resumeService, never()).tryResume(any());
+    }
+
+    @Test
+    void expiredDagLeaseIsPromotedBeforeSandboxCleanupPolling() throws Exception {
+        Fixture fixture = fixture(expiredLiveAnchor());
+        when(fixture.anchorService.promoteExpiredDagBlockingWorkerLost(
+                eq("run-dag"), any(), eq("run-dag:call-1:1"), eq("owner-old")))
+                .thenReturn(true);
+        when(fixture.anchorService.updateDagCleanup(
+                eq("run-dag"), any(), eq("run-dag:call-1:1"), eq("owner-old")))
+                .thenReturn(true);
+        when(fixture.sandbox.getTaskStatus(any(GetTaskStatusRequest.class))).thenReturn(
+                TaskStatusResponse.newBuilder().setStatus("RUNNING").build());
+
+        fixture.reconciler.reconcileFromDue();
+
+        verify(fixture.anchorService).promoteExpiredDagBlockingWorkerLost(
+                eq("run-dag"), any(), eq("run-dag:call-1:1"), eq("owner-old"));
+        verify(fixture.anchorService).updateDagCleanup(
+                eq("run-dag"), any(), eq("run-dag:call-1:1"), eq("owner-old"));
+        verify(fixture.sandbox).getTaskStatus(any(GetTaskStatusRequest.class));
         verify(fixture.resumeService, never()).tryResume(any());
     }
 
@@ -58,14 +86,16 @@ class ToolJobReconcilerDagCleanupTest {
         Fixture fixture = fixture(workerLostAnchor());
         when(fixture.sandbox.getTaskStatus(any(GetTaskStatusRequest.class))).thenReturn(
                 TaskStatusResponse.newBuilder().setStatus("RUNNING").build());
-        when(fixture.anchorService.updateAnchor(
-                eq("run-dag"), any(ToolJobAnchor.class), eq(AgentRunStatus.EXECUTING)))
+        when(fixture.anchorService.updateDagCleanup(
+                eq("run-dag"), any(ToolJobAnchor.class),
+                eq("run-dag:call-1:1"), eq("owner-old")))
                 .thenReturn(true);
 
         fixture.reconciler.reconcileFromDue();
 
-        verify(fixture.anchorService).updateAnchor(
-                eq("run-dag"), any(ToolJobAnchor.class), eq(AgentRunStatus.EXECUTING));
+        verify(fixture.anchorService).updateDagCleanup(
+                eq("run-dag"), any(ToolJobAnchor.class),
+                eq("run-dag:call-1:1"), eq("owner-old"));
         verify(fixture.redisCache).upsertDue(eq("run-dag"), any(ToolJobAnchor.class));
         verify(fixture.finalizer, never()).handleTerminal(any(), any(), any(), any(), any(Boolean.class));
         verify(fixture.resumeService, never()).tryResume(any());
@@ -127,6 +157,14 @@ class ToolJobReconcilerDagCleanupTest {
     private ToolJobAnchor liveAnchor() {
         ToolJobAnchor anchor = baseAnchor();
         anchor.setRunDisposition(ToolJobRunDisposition.DAG_BLOCKING_NO_RESUME);
+        anchor.setBlockingLeaseUntil(Instant.now().plusSeconds(60));
+        return anchor;
+    }
+
+    private ToolJobAnchor expiredLiveAnchor() {
+        ToolJobAnchor anchor = baseAnchor();
+        anchor.setRunDisposition(ToolJobRunDisposition.DAG_BLOCKING_NO_RESUME);
+        anchor.setBlockingLeaseUntil(Instant.now().minusSeconds(1));
         return anchor;
     }
 
@@ -142,6 +180,7 @@ class ToolJobReconcilerDagCleanupTest {
         anchor.setToolCallId("call-1");
         anchor.setAttempt(1);
         anchor.setTaskId("task-dag");
+        anchor.setBlockingOwnerId("owner-old");
         anchor.setAutoResume(false);
         return anchor;
     }

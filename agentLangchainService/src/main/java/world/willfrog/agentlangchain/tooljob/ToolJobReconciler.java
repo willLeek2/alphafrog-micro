@@ -6,6 +6,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
+import world.willfrog.agent.platform.dataanalysis.DagBlockingWorkerLease;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.dataanalysis.ToolJobRunDisposition;
 import world.willfrog.agent.platform.entity.AgentRun;
@@ -75,9 +76,10 @@ public class ToolJobReconciler {
                 if (a == null) continue;
                 if (run.getStatus() == AgentRunStatus.EXECUTING
                         && ToolJobRunDisposition.isLiveDagBlocking(a.getRunDisposition())) {
-                    // 在线 DAG blocking 仍由当前节点线程持有；只有 startup 才能把它标成 worker-lost。
-                    // 删除可能的旧 due 成员，避免后台协调器与存活 worker 竞争终态。
-                    redisCache.removeDue(run.getId());
+                    // 未来租约只重建到期唤醒；过期租约通过 owner/opId CAS 接管。
+                    if (recoverLiveDagBlocking(run.getId(), a)) {
+                        processItem(run.getId());
+                    }
                     continue;
                 }
                 // Redis 丢失或重启后可由完整 anchor 重建，不承担真相源职责。
@@ -110,9 +112,8 @@ public class ToolJobReconciler {
             // DB 已无 active anchor 时清理 Redis 残留，幂等结束。
             if (anchor == null) { redisCache.removeDue(runId); redisCache.deletePendingCache(runId); return; }
             if (ToolJobRunDisposition.isLiveDagBlocking(anchor.getRunDisposition())) {
-                // 原 DAG worker 仍可能存活；在线 reconciler 不取得 cleanup 所有权。
-                redisCache.removeDue(runId);
-                return;
+                // live worker 的 lease 未到期时只重排 expiry；过期后必须先赢 fenced CAS。
+                if (!recoverLiveDagBlocking(runId, anchor)) return;
             }
             // taskId 是查询 Sandbox 的真实任务主键。
             String taskId = anchor.getTaskId();
@@ -223,9 +224,10 @@ public class ToolJobReconciler {
                     finalizer.handleNotFound(runId, anchor);
                 }
             } else if (ToolJobRunDisposition.isDagCleanupOnly(anchor.getRunDisposition())) {
-                // cleanup-only worker 已丢失，当前 Run 保持 EXECUTING，后台继续轮询至终态。
+                // cleanup-only 可跨 EXECUTING/FAILED/CANCELED 持续收尾。
                 anchor.setNextPollAt(Instant.now().plusMillis(config.getPollIntervalMs()));
-                if (anchorService.updateAnchor(runId, anchor, AgentRunStatus.EXECUTING)) {
+                if (anchorService.updateDagCleanup(
+                        runId, anchor, anchor.getOperationId(), anchor.getBlockingOwnerId())) {
                     redisCache.upsertDue(runId, anchor);
                     redisCache.writePendingCache(runId, anchor);
                 }
@@ -233,5 +235,39 @@ public class ToolJobReconciler {
         } catch (Exception e) {
             log.error("Paused-terminal check error run={}", runId, e);
         }
+    }
+
+    private boolean recoverLiveDagBlocking(String runId, ToolJobAnchor anchor) {
+        String operationId = anchor.getOperationId();
+        String ownerId = anchor.getBlockingOwnerId();
+        if (operationId == null || operationId.isBlank()
+                || ownerId == null || ownerId.isBlank()) {
+            log.error("DAG blocking anchor lacks fenced identity for run={}; refusing takeover", runId);
+            redisCache.removeDue(runId);
+            return false;
+        }
+        Instant now = Instant.now();
+        if (!DagBlockingWorkerLease.isExpired(anchor.getBlockingLeaseUntil(), now)) {
+            // 不写 PostgreSQL anchor；当前 live worker 仍拥有 durable lease。
+            anchor.setNextPollAt(anchor.getBlockingLeaseUntil());
+            redisCache.atomicWritePendingAndDue(runId, anchor);
+            return false;
+        }
+
+        anchor.setRunDisposition(ToolJobRunDisposition.DAG_BLOCKING_WORKER_LOST);
+        anchor.setAutoResume(false);
+        anchor.setFinalizerError(ToolJobRunDisposition.DAG_BLOCKING_WORKER_LOST);
+        anchor.setNextPollAt(now);
+        boolean promoted = anchorService.promoteExpiredDagBlockingWorkerLost(
+                runId, anchor, operationId, ownerId);
+        if (!promoted) {
+            // 其他 worker/恢复者已续租或接管；丢弃本轮旧 due，等待 PG 重建。
+            redisCache.removeDue(runId);
+            return false;
+        }
+        redisCache.atomicWritePendingAndDue(runId, anchor);
+        log.warn("Reconciler claimed expired DAG blocking worker for run={}, operationId={}, owner={}",
+                runId, operationId, ownerId);
+        return true;
     }
 }

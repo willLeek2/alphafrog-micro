@@ -24,13 +24,14 @@ class ToolJobFinalizerDagCleanupTest {
         ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
         ToolJobRedisCache redisCache = mock(ToolJobRedisCache.class);
         ToolJobResumeService resumeService = mock(ToolJobResumeService.class);
-        when(anchorService.updateAnchor(
-                eq("run-dag"), any(ToolJobAnchor.class), eq(AgentRunStatus.EXECUTING)))
+        when(anchorService.updateDagCleanup(
+                eq("run-dag"), any(ToolJobAnchor.class),
+                eq("run-dag:call-1:1"), eq("owner-old")))
                 .thenReturn(true);
-        when(anchorService.failDagBlockingAndClear(
+        when(anchorService.completeDagCleanupAndClear(
                 "run-dag",
-                AgentRunStatus.EXECUTING,
                 "run-dag:call-1:1",
+                "owner-old",
                 ToolJobRunDisposition.DAG_BLOCKING_WORKER_LOST)).thenReturn(true);
         ToolJobUsageHook usageHook = mock(ToolJobUsageHook.class);
         ToolJobEventHook eventHook = mock(ToolJobEventHook.class);
@@ -48,13 +49,14 @@ class ToolJobFinalizerDagCleanupTest {
 
         finalizer.handleTerminal("run-dag", anchor, "FAILED", null, false);
 
+        assertThat(anchor.getAnchorState()).isEqualTo("TERMINAL");
         assertThat(anchor.getFinalizerStep()).isEqualTo(ToolJobFinalizer.STEP_EVENT);
         assertThat(anchor.getFinalizerError())
                 .isEqualTo(ToolJobRunDisposition.DAG_BLOCKING_WORKER_LOST);
-        verify(anchorService).failDagBlockingAndClear(
+        verify(anchorService).completeDagCleanupAndClear(
                 "run-dag",
-                AgentRunStatus.EXECUTING,
                 "run-dag:call-1:1",
+                "owner-old",
                 ToolJobRunDisposition.DAG_BLOCKING_WORKER_LOST);
         verify(redisCache).removeDue("run-dag");
         verify(redisCache).deletePendingCache("run-dag");
@@ -64,12 +66,51 @@ class ToolJobFinalizerDagCleanupTest {
     }
 
     @Test
+    void reentryBackfillsTerminalProofBeforeClearingLegacyCleanupAnchor() throws Exception {
+        ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
+        ToolJobRedisCache redisCache = mock(ToolJobRedisCache.class);
+        ToolJobResumeService resumeService = mock(ToolJobResumeService.class);
+        when(anchorService.updateDagCleanup(
+                eq("run-dag"), any(ToolJobAnchor.class),
+                eq("run-dag:call-1:1"), eq("owner-old")))
+                .thenReturn(true);
+        when(anchorService.completeDagCleanupAndClear(
+                "run-dag", "run-dag:call-1:1", "owner-old",
+                ToolJobRunDisposition.DAG_BLOCKING_WORKER_LOST)).thenReturn(true);
+        ToolJobFinalizer finalizer = new ToolJobFinalizer(
+                anchorService,
+                redisCache,
+                mock(DataAnalysisCapacityService.class),
+                resumeService,
+                new ToolJobConfig());
+        ToolJobAnchor anchor = cleanupAnchor();
+        anchor.setAnchorState("ATTACHED");
+        anchor.setTerminalStatus("FAILED");
+        anchor.setTerminalAt(Instant.now());
+        anchor.setUsagePersisted(true);
+        anchor.setTerminalEventEmitted(true);
+        anchor.setFinalizerStep(ToolJobFinalizer.STEP_EVENT);
+
+        finalizer.handleTerminal("run-dag", anchor, "FAILED", null, false);
+
+        assertThat(anchor.getAnchorState()).isEqualTo("TERMINAL");
+        verify(anchorService).updateDagCleanup(
+                eq("run-dag"), any(ToolJobAnchor.class),
+                eq("run-dag:call-1:1"), eq("owner-old"));
+        verify(anchorService).completeDagCleanupAndClear(
+                "run-dag", "run-dag:call-1:1", "owner-old",
+                ToolJobRunDisposition.DAG_BLOCKING_WORKER_LOST);
+        verify(resumeService, never()).tryResume(any());
+    }
+
+    @Test
     void failAndClearCasLossKeepsRedisEvidenceForNextOwner() throws Exception {
         ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
         ToolJobRedisCache redisCache = mock(ToolJobRedisCache.class);
         ToolJobResumeService resumeService = mock(ToolJobResumeService.class);
-        when(anchorService.updateAnchor(
-                eq("run-dag"), any(ToolJobAnchor.class), eq(AgentRunStatus.EXECUTING)))
+        when(anchorService.updateDagCleanup(
+                eq("run-dag"), any(ToolJobAnchor.class),
+                eq("run-dag:call-1:1"), eq("owner-old")))
                 .thenReturn(true);
         ToolJobUsageHook usageHook = mock(ToolJobUsageHook.class);
         ToolJobEventHook eventHook = mock(ToolJobEventHook.class);
@@ -96,13 +137,14 @@ class ToolJobFinalizerDagCleanupTest {
         ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
         ToolJobRedisCache redisCache = mock(ToolJobRedisCache.class);
         ToolJobResumeService resumeService = mock(ToolJobResumeService.class);
-        when(anchorService.updateAnchor(
-                eq("run-dag"), any(ToolJobAnchor.class), eq(AgentRunStatus.EXECUTING)))
+        when(anchorService.updateDagCleanup(
+                eq("run-dag"), any(ToolJobAnchor.class),
+                eq("run-dag:call-1:1"), eq("owner-old")))
                 .thenReturn(true);
-        when(anchorService.failDagBlockingAndClear(
+        when(anchorService.completeDagCleanupAndClear(
                 "run-dag",
-                AgentRunStatus.EXECUTING,
                 "run-dag:call-1:1",
+                "owner-old",
                 ToolJobRunDisposition.DAG_BLOCKING_WORKER_LOST)).thenReturn(true);
         ToolJobUsageHook usageHook = mock(ToolJobUsageHook.class);
         ToolJobEventHook eventHook = mock(ToolJobEventHook.class);
@@ -125,10 +167,10 @@ class ToolJobFinalizerDagCleanupTest {
 
         assertThat(anchor.getTerminalStatus()).isEqualTo("RESULT_LOST");
         assertThat(anchor.getTerminalRetryable()).isFalse();
-        verify(anchorService).failDagBlockingAndClear(
+        verify(anchorService).completeDagCleanupAndClear(
                 "run-dag",
-                AgentRunStatus.EXECUTING,
                 "run-dag:call-1:1",
+                "owner-old",
                 ToolJobRunDisposition.DAG_BLOCKING_WORKER_LOST);
         verify(redisCache).removeDue("run-dag");
         verify(redisCache).deletePendingCache("run-dag");
@@ -141,6 +183,7 @@ class ToolJobFinalizerDagCleanupTest {
         anchor.setToolCallId("call-1");
         anchor.setAttempt(1);
         anchor.setTaskId("task-dag");
+        anchor.setBlockingOwnerId("owner-old");
         anchor.setRunDisposition(ToolJobRunDisposition.DAG_BLOCKING_WORKER_LOST);
         anchor.setAutoResume(false);
         anchor.setTerminalRetryable(false);

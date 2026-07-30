@@ -1,10 +1,12 @@
 package world.willfrog.agentlangchain.tooljob;
 
 import org.junit.jupiter.api.Test;
+import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
-import world.willfrog.agent.platform.model.AgentRunStatus;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -12,26 +14,40 @@ import static org.mockito.Mockito.when;
 class ToolJobDagCleanupAnchorServiceTest {
 
     @Test
-    void failAndClearBindsExecutingOperationAndDiagnostic() {
+    void cleanupOperationsBindOperationAndBlockingOwner() {
         AgentRunMapper mapper = mock(AgentRunMapper.class);
-        when(mapper.failDagBlockingAndClearToolJobAnchor(
-                "run-1",
-                AgentRunStatus.EXECUTING,
-                "run-1:call-1:1",
+        when(mapper.promoteExpiredDagBlockingWorkerLost(
+                eq("run-1"),
+                anyString(),
+                eq("run-1:call-1:1"),
+                eq("owner-1"))).thenReturn(1);
+        when(mapper.updateDagCleanupToolJobAnchor(
+                eq("run-1"), anyString(),
+                eq("run-1:call-1:1"), eq("owner-1"))).thenReturn(1);
+        when(mapper.completeDagCleanupAndClearToolJobAnchor(
+                "run-1", "run-1:call-1:1", "owner-1",
                 "DAG_BLOCKING_WORKER_LOST")).thenReturn(1);
         ToolJobAnchorService service = new ToolJobAnchorService(mapper);
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId("run-1:call-1:1");
+        anchor.setBlockingOwnerId("owner-1");
 
-        boolean updated = service.failDagBlockingAndClear(
-                "run-1",
-                AgentRunStatus.EXECUTING,
-                "run-1:call-1:1",
-                "DAG_BLOCKING_WORKER_LOST");
+        assertThat(service.promoteExpiredDagBlockingWorkerLost(
+                "run-1", anchor, "run-1:call-1:1", "owner-1")).isTrue();
+        assertThat(service.updateDagCleanup(
+                "run-1", anchor, "run-1:call-1:1", "owner-1")).isTrue();
+        assertThat(service.completeDagCleanupAndClear(
+                "run-1", "run-1:call-1:1", "owner-1",
+                "DAG_BLOCKING_WORKER_LOST")).isTrue();
 
-        assertThat(updated).isTrue();
-        verify(mapper).failDagBlockingAndClearToolJobAnchor(
+        verify(mapper).promoteExpiredDagBlockingWorkerLost(
+                "run-1", anchor.toJson(), "run-1:call-1:1", "owner-1");
+        verify(mapper).updateDagCleanupToolJobAnchor(
+                "run-1", anchor.toJson(), "run-1:call-1:1", "owner-1");
+        verify(mapper).completeDagCleanupAndClearToolJobAnchor(
                 "run-1",
-                AgentRunStatus.EXECUTING,
                 "run-1:call-1:1",
+                "owner-1",
                 "DAG_BLOCKING_WORKER_LOST");
     }
 }

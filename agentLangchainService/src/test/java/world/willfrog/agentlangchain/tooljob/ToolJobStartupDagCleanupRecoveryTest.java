@@ -38,25 +38,26 @@ import static org.mockito.Mockito.when;
 class ToolJobStartupDagCleanupRecoveryTest {
 
     @Test
-    void startupMarksLiveDagWorkerLostAndSchedulesCleanupWithoutWaitingTransition() throws Exception {
+    void startupTakesOverExpiredDagLeaseAndSchedulesCleanupWithoutWaitingTransition() throws Exception {
         Fixture fixture = fixture("RUNNING");
 
         fixture.recovery.onReady();
 
         ArgumentCaptor<ToolJobAnchor> marked = ArgumentCaptor.forClass(ToolJobAnchor.class);
-        verify(fixture.anchorService).updateActive(
-                eq("run-dag"), marked.capture(), eq(AgentRunStatus.EXECUTING),
-                eq("run-dag:call-1:1"));
+        verify(fixture.anchorService).promoteExpiredDagBlockingWorkerLost(
+                eq("run-dag"), marked.capture(),
+                eq("run-dag:call-1:1"), eq("owner-old"));
         assertThat(marked.getValue().getRunDisposition())
                 .isEqualTo(ToolJobRunDisposition.DAG_BLOCKING_WORKER_LOST);
         assertThat(marked.getValue().isAutoResume()).isFalse();
         assertThat(marked.getValue().getFinalizerError())
                 .isEqualTo(ToolJobRunDisposition.DAG_BLOCKING_WORKER_LOST);
 
-        verify(fixture.anchorService).updateAnchor(
+        verify(fixture.anchorService).updateDagCleanup(
                 eq("run-dag"),
                 any(ToolJobAnchor.class),
-                eq(AgentRunStatus.EXECUTING));
+                eq("run-dag:call-1:1"),
+                eq("owner-old"));
         verify(fixture.redisCache).atomicWritePendingAndDue(
                 eq("run-dag"), any(ToolJobAnchor.class));
         verify(fixture.anchorService, never()).updateActiveAndStatus(
@@ -64,6 +65,25 @@ class ToolJobStartupDagCleanupRecoveryTest {
                 eq(AgentRunStatus.EXECUTING), any());
         verify(fixture.finalizer, never()).handleTerminal(any(), any(), any(), any(), any(Boolean.class));
         verify(fixture.resumeService, never()).tryResume(any());
+    }
+
+    @Test
+    void startupPreservesFutureDagLeaseAndOnlySchedulesExpiryWakeup() throws Exception {
+        Instant leaseUntil = Instant.now().plusSeconds(60);
+        Fixture fixture = fixture(
+                "RUNNING", ToolJobRunDisposition.DAG_BLOCKING_NO_RESUME, leaseUntil);
+
+        fixture.recovery.onReady();
+
+        verify(fixture.anchorService, never()).promoteExpiredDagBlockingWorkerLost(
+                any(), any(), any(), any());
+        verify(fixture.anchorService, never()).updateDagCleanup(any(), any(), any(), any());
+        verify(fixture.redisCache).atomicWritePendingAndDue(
+                eq("run-dag"),
+                org.mockito.ArgumentMatchers.argThat(
+                        anchor -> leaseUntil.equals(anchor.getNextPollAt())));
+        verify(fixture.sandbox, never()).getTaskStatus(any());
+        verify(fixture.finalizer, never()).handleTerminal(any(), any(), any(), any(), any(Boolean.class));
     }
 
     @Test
@@ -98,19 +118,31 @@ class ToolJobStartupDagCleanupRecoveryTest {
 
         fixture.recovery.onReady();
 
-        verify(fixture.anchorService, never()).updateActive(any(), any(), any(), any());
-        verify(fixture.anchorService).updateAnchor(
-                eq("run-dag"), any(ToolJobAnchor.class), eq(AgentRunStatus.EXECUTING));
+        verify(fixture.anchorService, never()).promoteExpiredDagBlockingWorkerLost(
+                any(), any(), any(), any());
+        verify(fixture.anchorService).updateDagCleanup(
+                eq("run-dag"), any(ToolJobAnchor.class),
+                eq("run-dag:call-1:1"), eq("owner-old"));
         verify(fixture.redisCache).atomicWritePendingAndDue(
                 eq("run-dag"), any(ToolJobAnchor.class));
         verify(fixture.resumeService, never()).tryResume(any());
     }
 
     private Fixture fixture(String sandboxStatus) throws Exception {
-        return fixture(sandboxStatus, ToolJobRunDisposition.DAG_BLOCKING_NO_RESUME);
+        return fixture(
+                sandboxStatus,
+                ToolJobRunDisposition.DAG_BLOCKING_NO_RESUME,
+                Instant.now().minusSeconds(5));
     }
 
     private Fixture fixture(String sandboxStatus, String runDisposition) throws Exception {
+        return fixture(sandboxStatus, runDisposition, Instant.now().minusSeconds(5));
+    }
+
+    private Fixture fixture(
+            String sandboxStatus,
+            String runDisposition,
+            Instant leaseUntil) throws Exception {
         ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
         ToolJobRedisCache redisCache = mock(ToolJobRedisCache.class);
         DataAnalysisCapacityService capacity = mock(DataAnalysisCapacityService.class);
@@ -127,13 +159,16 @@ class ToolJobStartupDagCleanupRecoveryTest {
         run.setId("run-dag");
         run.setStatus(AgentRunStatus.EXECUTING);
         ToolJobAnchor anchor = dagAnchor(runDisposition);
+        anchor.setBlockingLeaseUntil(leaseUntil);
         when(anchorService.listActive(200)).thenReturn(List.of(run));
         when(anchorService.listResumeReady(200)).thenReturn(List.of());
         when(anchorService.loadAnchor("run-dag")).thenReturn(anchor);
-        when(anchorService.updateActive(
-                eq("run-dag"), any(), eq(AgentRunStatus.EXECUTING),
-                eq("run-dag:call-1:1"))).thenReturn(true);
-        when(anchorService.updateAnchor(eq("run-dag"), any(), any())).thenReturn(true);
+        when(anchorService.promoteExpiredDagBlockingWorkerLost(
+                eq("run-dag"), any(), eq("run-dag:call-1:1"), eq("owner-old")))
+                .thenReturn(true);
+        when(anchorService.updateDagCleanup(
+                eq("run-dag"), any(), eq("run-dag:call-1:1"), eq("owner-old")))
+                .thenReturn(true);
         when(capacity.recover(anyList(), anyInt(), anyInt()))
                 .thenReturn(new DataAnalysisCapacityRecoveryReport(
                         1, 1, 0, 1, properties.getMaxUnits(), properties.getMaxHeavyActive(),
@@ -161,6 +196,7 @@ class ToolJobStartupDagCleanupRecoveryTest {
         anchor.setToolCallId(identity.toolCallId());
         anchor.setAttempt(identity.attempt());
         anchor.setTaskId("task-dag");
+        anchor.setBlockingOwnerId("owner-old");
         anchor.setAnchorState("ATTACHED");
         anchor.setRunDisposition(runDisposition);
         anchor.setAutoResume(false);

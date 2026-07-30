@@ -74,12 +74,10 @@ public class ToolJobFinalizer {
                                 boolean autoResume) {
         // 同一轮收尾统一使用一个时间点，避免各字段在重入时产生互相矛盾的时间。
         Instant now = Instant.now();
-        // LINEAR pending 在 WAITING_TOOL_JOB 收尾；startup 标记过的 DAG cleanup-only
-        // 保持 EXECUTING，直到容量和观测全部落地后原子失败并清 anchor。
-        AgentRunStatus expectedActiveStatus = expectedActiveStatus(anchor);
-
         // 第一步：把 Sandbox 终态和有界结果摘要写入真相源。
         if (!isStepDone(anchor, STEP_ENVELOPE)) {
+            // TERMINAL 是后续 release/clear 的 durable 状态证明，不只依赖进程内调用栈。
+            anchor.setAnchorState("TERMINAL");
             // terminalStatus 是 reconciler 已确认的规范化终态。
             anchor.setTerminalStatus(terminalStatus);
             // 保留原始 Sandbox 状态用于事后契约核对。
@@ -110,9 +108,20 @@ public class ToolJobFinalizer {
             }
             // 先标记步骤，再连同 envelope 一起 CAS 写入，避免半步状态。
             anchor.setFinalizerStep(STEP_ENVELOPE);
-            if (!anchorService.updateAnchor(runId, anchor, expectedActiveStatus)) {
+            if (!persistFinalizerAnchor(runId, anchor)) {
                 // CAS 失败说明别的进程已推进，当前 finalizer 立即退场。
                 log.warn("ENVELOPE CAS failed for run={}", runId);
+                return;
+            }
+        }
+
+        // 兼容已完成 ENVELOPE 但旧版本尚未写 anchorState=TERMINAL 的可重入 anchor。
+        if (ToolJobRunDisposition.isDagCleanupOnly(anchor.getRunDisposition())
+                && isStepDone(anchor, STEP_ENVELOPE)
+                && !"TERMINAL".equals(anchor.getAnchorState())) {
+            anchor.setAnchorState("TERMINAL");
+            if (!persistFinalizerAnchor(runId, anchor)) {
+                log.warn("TERMINAL proof backfill CAS failed for run={}", runId);
                 return;
             }
         }
@@ -130,7 +139,7 @@ public class ToolJobFinalizer {
             if (backfilled) {
                 // 新分类已经补齐，清除先前的缺失诊断。
                 anchor.setFinalizerError(null); // clear missing diagnostic
-                if (!anchorService.updateAnchor(runId, anchor, expectedActiveStatus)) {
+                if (!persistFinalizerAnchor(runId, anchor)) {
                     log.warn("terminalRetryable backfill CAS failed for run={}", runId);
                     return;
                 }
@@ -141,7 +150,7 @@ public class ToolJobFinalizer {
         if (anchor.getTerminalRetryable() == null) {
             log.warn("terminalRetryable missing for run={}, fail-closed before RELEASE", runId);
             anchor.setFinalizerError("terminal_retryability_missing");
-            anchorService.updateAnchor(runId, anchor, expectedActiveStatus);
+            persistFinalizerAnchor(runId, anchor);
             return;
         }
 
@@ -154,7 +163,7 @@ public class ToolJobFinalizer {
             }
             // 只有容量账本确认释放后才推进 STEP_RELEASE。
             anchor.setFinalizerStep(STEP_RELEASE);
-            if (!anchorService.updateAnchor(runId, anchor, expectedActiveStatus)) return;
+            if (!persistFinalizerAnchor(runId, anchor)) return;
         }
 
         // 第三步：资源用量是终态真相的一部分，hook 缺失或失败都阻塞恢复。
@@ -171,7 +180,7 @@ public class ToolJobFinalizer {
             }
             anchor.setUsagePersisted(true);
             anchor.setFinalizerStep(STEP_USAGE);
-            if (!anchorService.updateAnchor(runId, anchor, expectedActiveStatus)) return;
+            if (!persistFinalizerAnchor(runId, anchor)) return;
         }
 
         // 第四步：发唯一逻辑终态事件；成功前不能把 Run 重新入队。
@@ -188,17 +197,17 @@ public class ToolJobFinalizer {
             }
             anchor.setTerminalEventEmitted(true);
             anchor.setFinalizerStep(STEP_EVENT);
-            if (!anchorService.updateAnchor(runId, anchor, expectedActiveStatus)) return;
+            if (!persistFinalizerAnchor(runId, anchor)) return;
         }
 
         if (!autoResume) {
             if (ToolJobRunDisposition.isDagCleanupOnly(anchor.getRunDisposition())) {
                 // 原 DAG worker 已随旧进程消失；工具终态只用于收尾，不能生成 READY 或重跑 DAG。
                 anchor.setFinalizerError(ToolJobRunDisposition.DAG_BLOCKING_WORKER_LOST);
-                boolean failedAndCleared = anchorService.failDagBlockingAndClear(
+                boolean failedAndCleared = anchorService.completeDagCleanupAndClear(
                         runId,
-                        AgentRunStatus.EXECUTING,
                         anchor.getOperationId(),
+                        anchor.getBlockingOwnerId(),
                         ToolJobRunDisposition.DAG_BLOCKING_WORKER_LOST);
                 if (!failedAndCleared) {
                     log.warn("DAG cleanup-only fail+clear CAS failed for run={}, operationId={}",
@@ -208,7 +217,8 @@ public class ToolJobFinalizer {
                 // PostgreSQL 已原子保存 FAILED/last_error 并清 anchor，随后清理可重建的 Redis 派生项。
                 redisCache.removeDue(runId);
                 redisCache.deletePendingCache(runId);
-                log.warn("DAG blocking worker lost; cleanup-only finalized run={} as FAILED", runId);
+                log.warn("DAG blocking worker lost; cleanup-only finalized run={} "
+                        + "(EXECUTING fails, existing FAILED/CANCELED is preserved)", runId);
                 return;
             }
             // checkpoint 失败由 finalizer 在完成 envelope/release/usage/event 后落 Run FAILED。
@@ -274,7 +284,6 @@ public class ToolJobFinalizer {
     public void handleNotFound(String runId, ToolJobAnchor anchor) {
         // getTaskResult 暂无结果体时，用有界次数与保留期限决定继续轮询或 RESULT_LOST。
         Instant now = Instant.now();
-        AgentRunStatus expectedActiveStatus = expectedActiveStatus(anchor);
         // 已确认 Sandbox 终态后仍取不到结果，才累计“终态结果丢失”窗口。
         if (anchor.getTerminalConfirmedAt() != null) {
             long elapsed = java.time.Duration.between(anchor.getTerminalConfirmedAt(), now).toSeconds();
@@ -298,9 +307,10 @@ public class ToolJobFinalizer {
         }
         // 未到丢失阈值时安排下一次 due；DB anchor 与 Redis 索引同时更新。
         anchor.setNextPollAt(now.plusMillis(config.getReconcilerIntervalMs()));
-        anchorService.updateAnchor(runId, anchor, expectedActiveStatus);
-        redisCache.upsertDue(runId, anchor);
-        redisCache.writePendingCache(runId, anchor);
+        if (persistFinalizerAnchor(runId, anchor)) {
+            redisCache.upsertDue(runId, anchor);
+            redisCache.writePendingCache(runId, anchor);
+        }
     }
 
     // ========== capacity release ==========
@@ -520,10 +530,18 @@ public class ToolJobFinalizer {
         return STEP_ORDER.getOrDefault(current, 0) >= STEP_ORDER.getOrDefault(step, 0);
     }
 
-    private static AgentRunStatus expectedActiveStatus(ToolJobAnchor anchor) {
-        return ToolJobRunDisposition.isDagCleanupOnly(anchor.getRunDisposition())
-                ? AgentRunStatus.EXECUTING
-                : AgentRunStatus.WAITING_TOOL_JOB;
+    private boolean persistFinalizerAnchor(String runId, ToolJobAnchor anchor) {
+        if (ToolJobRunDisposition.isDagCleanupOnly(anchor.getRunDisposition())) {
+            String operationId = anchor.getOperationId();
+            String ownerId = anchor.getBlockingOwnerId();
+            if (operationId == null || operationId.isBlank()
+                    || ownerId == null || ownerId.isBlank()) {
+                log.error("DAG cleanup anchor is missing fenced identity for run={}", runId);
+                return false;
+            }
+            return anchorService.updateDagCleanup(runId, anchor, operationId, ownerId);
+        }
+        return anchorService.updateAnchor(runId, anchor, AgentRunStatus.WAITING_TOOL_JOB);
     }
 
     private static String emptyToNull(String s) { return s == null || s.isBlank() ? null : s.trim(); }

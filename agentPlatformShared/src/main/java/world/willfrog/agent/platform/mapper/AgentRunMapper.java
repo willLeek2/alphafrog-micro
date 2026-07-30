@@ -185,14 +185,33 @@ public interface AgentRunMapper {
                                  @Param("expectedOperationId") String expectedOperationId);
 
     /**
-     * DAG blocking worker 在进程重启后已经不可恢复。只有 cleanup-only disposition、
-     * {@code autoResume=false}、EXECUTING 状态和 operationId 全部匹配时，才原子地
-     * 把 Run 标为 FAILED、保存诊断并清空 active anchor。
+     * 只有租约已经过期且 operation/owner/disposition 仍匹配时，才把在线 DAG worker
+     * 原子提升为 cleanup-only。状态必须仍为 EXECUTING，防止恢复者覆盖新的控制结果。
      */
-    int failDagBlockingAndClearToolJobAnchor(
+    int promoteExpiredDagBlockingWorkerLost(
             @Param("id") String id,
-            @Param("expectedStatus") AgentRunStatus expectedStatus,
+            @Param("toolJobAnchorJson") String toolJobAnchorJson,
             @Param("expectedOperationId") String expectedOperationId,
+            @Param("expectedOwnerId") String expectedOwnerId);
+
+    /**
+     * cleanup-only 中间步骤允许跨 EXECUTING/FAILED/CANCELED 重入，但始终绑定
+     * operation、原 blocking owner、worker-lost disposition 和 autoResume=false。
+     */
+    int updateDagCleanupToolJobAnchor(
+            @Param("id") String id,
+            @Param("toolJobAnchorJson") String toolJobAnchorJson,
+            @Param("expectedOperationId") String expectedOperationId,
+            @Param("expectedOwnerId") String expectedOwnerId);
+
+    /**
+     * cleanup-only 的终态证明全部落地后清空 anchor。EXECUTING 转为 FAILED；
+     * 已经 FAILED/CANCELED 的 Run 保留原 status、snapshot 和 last_error。
+     */
+    int completeDagCleanupAndClearToolJobAnchor(
+            @Param("id") String id,
+            @Param("expectedOperationId") String expectedOperationId,
+            @Param("expectedOwnerId") String expectedOwnerId,
             @Param("lastError") String lastError);
 
     /**

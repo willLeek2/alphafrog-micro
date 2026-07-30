@@ -24,7 +24,7 @@ import java.time.OffsetDateTime;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Verifies the DAG cleanup-only fail-and-clear CAS against PostgreSQL JSONB predicates.
+ * Verifies DAG lease takeover and multi-status cleanup CAS against PostgreSQL JSONB predicates.
  */
 @Testcontainers(disabledWithoutDocker = true)
 class ToolJobDagCleanupMapperPostgresIntegrationTest {
@@ -78,104 +78,153 @@ class ToolJobDagCleanupMapperPostgresIntegrationTest {
     }
 
     @Test
-    void workerLostDispositionFailsRunAndClearsAnchorAtomically() {
+    void expiredLeaseTakeoverRequiresMatchingOperationOwnerAndDatabaseExpiry() {
         try (SqlSession session = sqlSessionFactory.openSession(true)) {
             AgentRunMapper mapper = session.getMapper(AgentRunMapper.class);
-            insertRun(mapper, "cleanup-success", """
+            insertRun(mapper, "future-lease", AgentRunStatus.EXECUTING, null, """
                     {
-                      "operationId":"cleanup-success:call-1:1",
-                      "runDisposition":"DAG_BLOCKING_WORKER_LOST",
-                      "autoResume":false
-                    }
-                    """);
-
-            assertThat(mapper.failDagBlockingAndClearToolJobAnchor(
-                    "cleanup-success",
-                    AgentRunStatus.EXECUTING,
-                    "cleanup-success:call-1:1",
-                    "DAG_BLOCKING_WORKER_LOST"
-            )).isEqualTo(1);
-
-            AgentRun failed = mapper.findById("cleanup-success");
-            assertThat(failed.getStatus()).isEqualTo(AgentRunStatus.FAILED);
-            assertThat(failed.getToolJobAnchorJson()).isEqualTo("{}");
-            assertThat(failed.getLastError()).isEqualTo("DAG_BLOCKING_WORKER_LOST");
-            assertThat(failed.getCompletedAt()).isNotNull();
-        }
-    }
-
-    @Test
-    void liveOrAutoResumeDagAnchorCannotBeFailedByCleanupFinalizer() {
-        try (SqlSession session = sqlSessionFactory.openSession(true)) {
-            AgentRunMapper mapper = session.getMapper(AgentRunMapper.class);
-            insertRun(mapper, "cleanup-live", """
-                    {
-                      "operationId":"cleanup-live:call-1:1",
+                      "operationId":"future-lease:call-1:1",
+                      "blockingOwnerId":"owner-1",
+                      "blockingLeaseUntil":"2999-01-01T00:00:00Z",
                       "runDisposition":"DAG_BLOCKING_NO_RESUME",
                       "autoResume":false
                     }
                     """);
-            insertRun(mapper, "cleanup-auto-resume", """
+            insertRun(mapper, "expired-lease", AgentRunStatus.EXECUTING, null, """
                     {
-                      "operationId":"cleanup-auto-resume:call-1:1",
-                      "runDisposition":"DAG_BLOCKING_WORKER_LOST",
-                      "autoResume":true
+                      "operationId":"expired-lease:call-1:1",
+                      "blockingOwnerId":"owner-1",
+                      "blockingLeaseUntil":"2000-01-01T00:00:00Z",
+                      "runDisposition":"DAG_BLOCKING_NO_RESUME",
+                      "autoResume":false
                     }
                     """);
+            String promoted = """
+                    {
+                      "operationId":"expired-lease:call-1:1",
+                      "blockingOwnerId":"owner-1",
+                      "blockingLeaseUntil":"2000-01-01T00:00:00Z",
+                      "runDisposition":"DAG_BLOCKING_WORKER_LOST",
+                      "autoResume":false
+                    }
+                    """;
 
-            assertThat(mapper.failDagBlockingAndClearToolJobAnchor(
-                    "cleanup-live",
-                    AgentRunStatus.EXECUTING,
-                    "cleanup-live:call-1:1",
-                    "DAG_BLOCKING_WORKER_LOST"
-            )).isZero();
-            assertThat(mapper.failDagBlockingAndClearToolJobAnchor(
-                    "cleanup-auto-resume",
-                    AgentRunStatus.EXECUTING,
-                    "cleanup-auto-resume:call-1:1",
-                    "DAG_BLOCKING_WORKER_LOST"
-            )).isZero();
+            assertThat(mapper.promoteExpiredDagBlockingWorkerLost(
+                    "future-lease", promoted, "future-lease:call-1:1", "owner-1")).isZero();
+            assertThat(mapper.promoteExpiredDagBlockingWorkerLost(
+                    "expired-lease", promoted, "expired-lease:call-1:1", "owner-other")).isZero();
+            assertThat(mapper.promoteExpiredDagBlockingWorkerLost(
+                    "expired-lease", promoted, "expired-lease:call-1:1", "owner-1")).isEqualTo(1);
 
-            assertThat(mapper.findById("cleanup-live").getStatus()).isEqualTo(AgentRunStatus.EXECUTING);
-            assertThat(mapper.findById("cleanup-auto-resume").getStatus()).isEqualTo(AgentRunStatus.EXECUTING);
+            assertThat(mapper.findById("future-lease").getToolJobAnchorJson())
+                    .contains("DAG_BLOCKING_NO_RESUME");
+            assertThat(mapper.findById("expired-lease").getToolJobAnchorJson())
+                    .contains("DAG_BLOCKING_WORKER_LOST");
         }
     }
 
     @Test
-    void staleOperationCannotFailOrClearNewDagAnchor() {
+    void cleanupCompletionRequiresAllDurableProofs() {
         try (SqlSession session = sqlSessionFactory.openSession(true)) {
             AgentRunMapper mapper = session.getMapper(AgentRunMapper.class);
-            insertRun(mapper, "cleanup-stale", """
+            insertRun(mapper, "proof-missing", AgentRunStatus.EXECUTING, null, """
                     {
-                      "operationId":"cleanup-stale:call-2:1",
+                      "operationId":"proof-missing:call-1:1",
+                      "blockingOwnerId":"owner-1",
                       "runDisposition":"DAG_BLOCKING_WORKER_LOST",
-                      "autoResume":false
+                      "autoResume":false,
+                      "terminalStatus":"FAILED"
                     }
                     """);
+            insertRun(mapper, "proof-complete", AgentRunStatus.EXECUTING, null,
+                    proofAnchor("proof-complete"));
 
-            assertThat(mapper.failDagBlockingAndClearToolJobAnchor(
-                    "cleanup-stale",
-                    AgentRunStatus.EXECUTING,
-                    "cleanup-stale:call-1:1",
-                    "DAG_BLOCKING_WORKER_LOST"
-            )).isZero();
+            assertThat(mapper.completeDagCleanupAndClearToolJobAnchor(
+                    "proof-missing", "proof-missing:call-1:1", "owner-1",
+                    "DAG_BLOCKING_WORKER_LOST")).isZero();
+            assertThat(mapper.completeDagCleanupAndClearToolJobAnchor(
+                    "proof-complete", "proof-complete:call-1:1", "owner-1",
+                    "DAG_BLOCKING_WORKER_LOST")).isEqualTo(1);
 
-            AgentRun unchanged = mapper.findById("cleanup-stale");
-            assertThat(unchanged.getStatus()).isEqualTo(AgentRunStatus.EXECUTING);
-            assertThat(unchanged.getToolJobAnchorJson()).contains("cleanup-stale:call-2:1");
-            assertThat(unchanged.getCompletedAt()).isNull();
+            AgentRun failed = mapper.findById("proof-complete");
+            assertThat(failed.getStatus()).isEqualTo(AgentRunStatus.FAILED);
+            assertThat(failed.getToolJobAnchorJson()).isEqualTo("{}");
+            assertThat(failed.getLastError()).isEqualTo("DAG_BLOCKING_WORKER_LOST");
+            assertThat(failed.getCompletedAt()).isNotNull();
+            assertThat(mapper.findById("proof-missing").getToolJobAnchorJson())
+                    .contains("proof-missing");
         }
     }
 
-    private static void insertRun(AgentRunMapper mapper, String runId, String anchorJson) {
+    @Test
+    void failedAndCanceledCleanupPreserveOriginalBusinessOutcome() {
+        try (SqlSession session = sqlSessionFactory.openSession(true)) {
+            AgentRunMapper mapper = session.getMapper(AgentRunMapper.class);
+            insertRun(mapper, "already-failed", AgentRunStatus.FAILED,
+                    "pipeline_failed", proofAnchor("already-failed"));
+            insertRun(mapper, "already-canceled", AgentRunStatus.CANCELED,
+                    "user_canceled", proofAnchor("already-canceled"));
+
+            assertThat(mapper.listActiveToolJobAnchors(20))
+                    .extracting(AgentRun::getId)
+                    .contains("already-failed", "already-canceled");
+            assertThat(mapper.updateDagCleanupToolJobAnchor(
+                    "already-failed", proofAnchor("already-failed"),
+                    "already-failed:call-1:1", "owner-1")).isEqualTo(1);
+            assertThat(mapper.updateDagCleanupToolJobAnchor(
+                    "already-canceled", proofAnchor("already-canceled"),
+                    "already-canceled:call-1:1", "owner-1")).isEqualTo(1);
+            assertThat(mapper.completeDagCleanupAndClearToolJobAnchor(
+                    "already-failed", "already-failed:call-1:1", "owner-1",
+                    "DAG_BLOCKING_WORKER_LOST")).isEqualTo(1);
+            assertThat(mapper.completeDagCleanupAndClearToolJobAnchor(
+                    "already-canceled", "already-canceled:call-1:1", "owner-1",
+                    "DAG_BLOCKING_WORKER_LOST")).isEqualTo(1);
+
+            AgentRun failed = mapper.findById("already-failed");
+            assertThat(failed.getStatus()).isEqualTo(AgentRunStatus.FAILED);
+            assertThat(failed.getLastError()).isEqualTo("pipeline_failed");
+            assertThat(failed.getToolJobAnchorJson()).isEqualTo("{}");
+            AgentRun canceled = mapper.findById("already-canceled");
+            assertThat(canceled.getStatus()).isEqualTo(AgentRunStatus.CANCELED);
+            assertThat(canceled.getLastError()).isEqualTo("user_canceled");
+            assertThat(canceled.getToolJobAnchorJson()).isEqualTo("{}");
+        }
+    }
+
+    private static String proofAnchor(String runId) {
+        return """
+                {
+                  "operationId":"%s:call-1:1",
+                  "blockingOwnerId":"owner-1",
+                  "runDisposition":"DAG_BLOCKING_WORKER_LOST",
+                  "autoResume":false,
+                  "anchorState":"TERMINAL",
+                  "terminalStatus":"FAILED",
+                  "terminalAt":"2026-07-30T00:00:00Z",
+                  "finalizerStep":"EVENT",
+                  "usagePersisted":true,
+                  "terminalEventEmitted":true,
+                  "reservationJson":"{\\"state\\":\\"RELEASED\\"}"
+                }
+                """.formatted(runId);
+    }
+
+    private static void insertRun(
+            AgentRunMapper mapper,
+            String runId,
+            AgentRunStatus status,
+            String lastError,
+            String anchorJson) {
         AgentRun run = new AgentRun();
         run.setId(runId);
         run.setUserId("user-1");
-        run.setStatus(AgentRunStatus.EXECUTING);
+        run.setStatus(status);
         run.setCurrentStep(1);
         run.setMaxSteps(12);
         run.setPlanJson("{}");
         run.setSnapshotJson("{}");
+        run.setLastError(lastError);
         run.setTtlExpiresAt(OffsetDateTime.now().plusMinutes(30));
         run.setExt("{}");
         run.setToolJobAnchorJson(anchorJson);

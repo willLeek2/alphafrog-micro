@@ -148,14 +148,34 @@ public class ToolJobAnchorService {
         return agentRunMapper.clearActiveToolJobAnchor(runId, expectedStatus, operationId) == 1;
     }
 
-    public boolean failDagBlockingAndClear(
+    public boolean promoteExpiredDagBlockingWorkerLost(
             String runId,
-            AgentRunStatus expectedStatus,
+            ToolJobAnchor anchor,
             String operationId,
+            String ownerId) {
+        // SQL 复核数据库时间的租约过期条件；调用方本地时间只用于减少无效 CAS。
+        return agentRunMapper.promoteExpiredDagBlockingWorkerLost(
+                runId, anchor.toJson(), operationId, ownerId) == 1;
+    }
+
+    public boolean updateDagCleanup(
+            String runId,
+            ToolJobAnchor anchor,
+            String operationId,
+            String ownerId) {
+        // cleanup 可跨业务终态重入，但不能越过 operation/owner/disposition fencing。
+        return agentRunMapper.updateDagCleanupToolJobAnchor(
+                runId, anchor.toJson(), operationId, ownerId) == 1;
+    }
+
+    public boolean completeDagCleanupAndClear(
+            String runId,
+            String operationId,
+            String ownerId,
             String lastError) {
-        // SQL 还会约束 cleanup-only disposition 与 autoResume=false，防止误失败在线 DAG worker。
-        return agentRunMapper.failDagBlockingAndClearToolJobAnchor(
-                runId, expectedStatus, operationId, lastError) == 1;
+        // SQL 复核全部终态证明，并按当前 status 决定失败或保留原业务终态。
+        return agentRunMapper.completeDagCleanupAndClearToolJobAnchor(
+                runId, operationId, ownerId, lastError) == 1;
     }
 
     public boolean clearSynchronouslyCompleted(
