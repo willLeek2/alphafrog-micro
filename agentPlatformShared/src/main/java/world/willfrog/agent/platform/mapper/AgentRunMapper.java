@@ -129,6 +129,16 @@ public interface AgentRunMapper {
                                     @Param("toolJobAnchorJson") String toolJobAnchorJson,
                                     @Param("expectedStatus") AgentRunStatus expectedStatus);
 
+    /**
+     * 恢复 worker 的第二次 dispatch 只允许替换自己已经消费的 LAUNCHING handoff。
+     * token/version/resultConsumed 共同防止旧 launcher 覆盖新的工具任务。
+     */
+    int claimPreparingToolJobAnchorFromResume(
+            @Param("id") String id,
+            @Param("toolJobAnchorJson") String toolJobAnchorJson,
+            @Param("expectedResumeToken") String expectedResumeToken,
+            @Param("expectedLeaseVersion") long expectedLeaseVersion);
+
     /** 仅替换仍由 expectedOperationId 拥有的活跃 dispatch，拒绝旧 operation 的迟到写入。 */
     int updateActiveToolJobAnchor(@Param("id") String id,
                                   @Param("toolJobAnchorJson") String toolJobAnchorJson,
@@ -307,6 +317,16 @@ public interface AgentRunMapper {
                                    @Param("expectedResumeState") String expectedResumeState,
                                    @Param("expectedResumeToken") String expectedResumeToken,
                                    @Param("expectedLeaseVersion") long expectedLeaseVersion);
+
+    /** 同一条 CAS 同时推进恢复 anchor 与 Run 状态，避免已恢复 worker 长时间停在 RECEIVED。 */
+    int casUpdateAnchorResumeStateAndStatus(
+            @Param("id") String id,
+            @Param("toolJobAnchorJson") String toolJobAnchorJson,
+            @Param("newStatus") AgentRunStatus newStatus,
+            @Param("expectedStatus") AgentRunStatus expectedStatus,
+            @Param("expectedResumeState") String expectedResumeState,
+            @Param("expectedResumeToken") String expectedResumeToken,
+            @Param("expectedLeaseVersion") long expectedLeaseVersion);
 
     /**
      * 原子合并检查点白名单字段，并保留 reservation、terminal、finalizer 等并发子树。

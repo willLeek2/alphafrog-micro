@@ -120,6 +120,34 @@ class PythonSandboxToolsDataIntenseTest {
     }
 
     @Test
+    void resumedSlowTaskConsumesExactOldHandoffBeforeSandboxCreate() throws Exception {
+        fixtureDataset();
+        AgentContext.setToolJobResumeHandoff("resume-token", 9L);
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(dispatchStore.persistPreparingFromResume(
+                eq("run-test"), any(), eq("resume-token"), eq(9L))).thenReturn(true);
+        when(dispatchStore.persistAttached(eq("run-test"), any())).thenReturn(true);
+        when(dispatchStore.transferToPending(eq("run-test"), any())).thenReturn(true);
+        when(sandbox.createTask(any())).thenAnswer(invocation -> {
+            ExecuteRequest request = invocation.getArgument(0);
+            return ExecuteResponse.newBuilder().setTaskId("task-resumed")
+                    .setRequestFingerprint(request.getRequestFingerprint()).build();
+        });
+        when(sandbox.getTaskStatus(any())).thenReturn(
+                TaskStatusResponse.newBuilder().setStatus("RUNNING").build());
+
+        assertThrows(ExternalToolJobPendingException.class,
+                () -> tools.executePython("print(2)", "1", null, null, 30));
+
+        verify(dispatchStore).persistPreparingFromResume(
+                eq("run-test"), any(), eq("resume-token"), eq(9L));
+        verify(dispatchStore, never()).persistPreparing(eq("run-test"), any());
+        assertThat(AgentContext.getToolJobResumeToken()).isNull();
+        assertThat(AgentContext.getToolJobResumeLeaseVersion()).isNull();
+    }
+
+    @Test
     void commonLibrariesDoNotBecomeHeavyHintsAndEstimateStaysStandard() throws Exception {
         fixtureDataset();
         when(capacity.reserve(any(), any())).thenReturn(preparingReservation());

@@ -232,8 +232,9 @@ class ToolJobResumeServiceTest {
         ToolJobAnchor anchor = buildReadyAnchor();
         anchor.setResumeState("LAUNCHING");
         when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
-        when(anchorService.casResumeState(eq("run-1"), any(ToolJobAnchor.class),
-                eq(AgentRunStatus.RECEIVED), eq("LAUNCHING"), eq("token-v1"), eq(5L)))
+        when(anchorService.casResumeStateAndStatus(eq("run-1"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.EXECUTING), eq(AgentRunStatus.RECEIVED),
+                eq("LAUNCHING"), eq("token-v1"), eq(5L)))
                 .thenReturn(true);
         CompletedTodoRecord completed = new CompletedTodoRecord();
         completed.setTodoId("todo_3");
@@ -256,7 +257,8 @@ class ToolJobResumeServiceTest {
         assertThat(anchor.getSequence()).isEqualTo(4);
         assertThat(anchor.getCompletedTodosJson()).contains("todo_3", "terminal-result");
         verify(anchorService, never()).clearAnchorWithToken(any(), any(), any(), anyLong());
-        verify(redisCache, never()).deletePendingCache(any());
+        verify(redisCache).removeDue("run-1");
+        verify(redisCache).deletePendingCache("run-1");
     }
 
     @Test
@@ -384,6 +386,31 @@ class ToolJobResumeServiceTest {
         assertThat(anchor.getResumeState()).isEqualTo("READY");
         assertThat(anchor.getResumeLeaseVersion()).isEqualTo(9); // monotonic bump
         assertThat(anchor.getResumeToken()).isNotEqualTo("stale-token"); // new token generated
+    }
+
+    @Test
+    void shouldRollbackStaleAcceptedHandoffToReceivedReadyAtomically() {
+        ToolJobAnchor anchor = buildReadyAnchor();
+        anchor.setResumeState("LAUNCHING");
+        anchor.setResultConsumed(true);
+        anchor.setResumeClaimedAt(java.time.Instant.now().minusSeconds(300));
+        anchor.setResumeToken("accepted-token");
+        anchor.setResumeLeaseVersion(11);
+
+        when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
+        when(resumeLauncher.isActive("run-1", "accepted-token", 11L)).thenReturn(false);
+        when(anchorService.casResumeStateAndStatus(
+                eq("run-1"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.EXECUTING),
+                eq("LAUNCHING"), eq("accepted-token"), eq(11L))).thenReturn(true);
+
+        assertThat(resumeService.tryResume("run-1")).isFalse();
+        assertThat(anchor.getResumeState()).isEqualTo("READY");
+        assertThat(anchor.getResumeLeaseVersion()).isEqualTo(12L);
+        verify(anchorService).casResumeStateAndStatus(
+                eq("run-1"), eq(anchor),
+                eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.EXECUTING),
+                eq("LAUNCHING"), eq("accepted-token"), eq(11L));
     }
 
     @Test

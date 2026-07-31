@@ -323,6 +323,22 @@
     </update>
 
     <!--
+        恢复 worker 的第二次长工具接管：旧 handoff 已经消费且 Run 已回到 EXECUTING，
+        只有持有精确 LAUNCHING token/version 的 worker 能原子替换为新 PREPARING。
+    -->
+    <update id="claimPreparingToolJobAnchorFromResume">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = CAST(#{toolJobAnchorJson} AS jsonb),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status = 'EXECUTING'
+          AND tool_job_anchor_json #>> '{resumeState}' = 'LAUNCHING'
+          AND COALESCE((tool_job_anchor_json #>> '{resultConsumed}')::boolean, false)
+          AND tool_job_anchor_json #>> '{resumeToken}' = #{expectedResumeToken}
+          AND (tool_job_anchor_json #>> '{resumeLeaseVersion}')::bigint = #{expectedLeaseVersion}
+    </update>
+
+    <!--
         PREPARING 之后的每次推进都绑定 operationId。
         旧 operation 的迟到回调即使 Run 状态相同，也无法覆盖新 dispatch。
     -->
@@ -702,6 +718,11 @@
         FROM alphafrog_agent_run
         WHERE tool_job_anchor_json IS NOT NULL
           AND tool_job_anchor_json &lt;&gt; '{}'::jsonb
+          AND NOT (
+                status = 'EXECUTING'
+                AND tool_job_anchor_json #>> '{resumeState}' = 'LAUNCHING'
+                AND COALESCE((tool_job_anchor_json #>> '{resultConsumed}')::boolean, false)
+              )
           AND (
                 status IN ('EXECUTING', 'WAITING_TOOL_JOB', 'WAITING')
                 OR (
@@ -737,10 +758,19 @@
                0 AS total_tokens,
                0 AS tool_calls
         FROM alphafrog_agent_run
-        WHERE status = 'RECEIVED'
-          AND tool_job_anchor_json IS NOT NULL
+        WHERE tool_job_anchor_json IS NOT NULL
           AND tool_job_anchor_json &lt;&gt; '{}'::jsonb
-          AND tool_job_anchor_json #>> '{resumeState}' IN ('READY', 'LAUNCHING')
+          AND (
+                (
+                    status = 'RECEIVED'
+                    AND tool_job_anchor_json #>> '{resumeState}' IN ('READY', 'LAUNCHING')
+                )
+                OR (
+                    status = 'EXECUTING'
+                    AND tool_job_anchor_json #>> '{resumeState}' = 'LAUNCHING'
+                    AND COALESCE((tool_job_anchor_json #>> '{resultConsumed}')::boolean, false)
+                )
+              )
         ORDER BY updated_at ASC
         LIMIT #{limit}
     </select>
@@ -752,6 +782,18 @@
     <update id="casUpdateAnchorResumeState">
         UPDATE alphafrog_agent_run
         SET tool_job_anchor_json = CAST(#{toolJobAnchorJson} AS jsonb),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status = #{expectedStatus}
+          AND tool_job_anchor_json #>> '{resumeState}' = #{expectedResumeState}
+          AND tool_job_anchor_json #>> '{resumeToken}' = #{expectedResumeToken}
+          AND (tool_job_anchor_json #>> '{resumeLeaseVersion}')::bigint = #{expectedLeaseVersion}
+    </update>
+
+    <update id="casUpdateAnchorResumeStateAndStatus">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = CAST(#{toolJobAnchorJson} AS jsonb),
+            status = #{newStatus},
             updated_at = CURRENT_TIMESTAMP
         WHERE id = #{id}
           AND status = #{expectedStatus}

@@ -30,6 +30,20 @@ class PythonSandboxDispatchStoreImplTest {
     }
 
     @Test
+    void resumedPreparingReplacesOnlyExactAcceptedHandoff() {
+        ToolJobAnchor preparing = anchor("PREPARING");
+        when(anchorService.claimPreparingFromResume(
+                "run-1", preparing, "resume-token", 7L)).thenReturn(true);
+
+        assertThat(store.persistPreparingFromResume(
+                "run-1", preparing, "resume-token", 7L)).isTrue();
+
+        verify(anchorService).claimPreparingFromResume(
+                "run-1", preparing, "resume-token", 7L);
+        verify(anchorService, never()).claimPreparing(any(), any(), any());
+    }
+
+    @Test
     void pendingTransferCommitsPostgresBeforeBestEffortRedis() {
         ToolJobAnchor anchor = anchor("PENDING");
         when(anchorService.updateActiveAndStatus(

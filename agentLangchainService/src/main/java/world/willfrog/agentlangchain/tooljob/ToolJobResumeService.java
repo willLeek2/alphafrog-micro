@@ -91,8 +91,13 @@ public class ToolJobResumeService {
         anchor.setResumeClaimedAt(java.time.Instant.now());
 
         // 只有一个进程能命中 READY + expectedToken + expectedVersion。
-        if (!anchorService.casResumeState(runId, anchor, AgentRunStatus.RECEIVED, "READY",
-                expectedToken, expectedVersion)) {
+        boolean claimed = anchor.isResultConsumed()
+                ? anchorService.casResumeStateAndStatus(
+                runId, anchor, AgentRunStatus.EXECUTING, AgentRunStatus.RECEIVED,
+                "READY", expectedToken, expectedVersion)
+                : anchorService.casResumeState(
+                runId, anchor, AgentRunStatus.RECEIVED, "READY", expectedToken, expectedVersion);
+        if (!claimed) {
             log.info("Resume CAS READY→LAUNCHING failed for run={}", runId);
             return false;
         }
@@ -121,8 +126,14 @@ public class ToolJobResumeService {
         anchor.setResumeLeaseVersion(nextVersion);
         anchor.setResumeClaimedAt(null);
         // 只回滚自己持有的 LAUNCHING claim；若所有权已变则 rows=0 并退场。
-        anchorService.casResumeState(runId, anchor, AgentRunStatus.RECEIVED, "LAUNCHING",
-                claimedToken, claimedVersion);
+        if (anchor.isResultConsumed()) {
+            anchorService.casResumeStateAndStatus(
+                    runId, anchor, AgentRunStatus.RECEIVED, AgentRunStatus.EXECUTING,
+                    "LAUNCHING", claimedToken, claimedVersion);
+        } else {
+            anchorService.casResumeState(runId, anchor, AgentRunStatus.RECEIVED, "LAUNCHING",
+                    claimedToken, claimedVersion);
+        }
     }
 
     private boolean reenterLaunching(String runId, ToolJobAnchor anchor) {
@@ -149,8 +160,16 @@ public class ToolJobResumeService {
                 anchor.setResumeLeaseVersion(claimedVersion + 1);
                 anchor.setResumeToken(java.util.UUID.randomUUID().toString());
                 anchor.setResumeClaimedAt(null);
-                anchorService.casResumeState(runId, anchor, AgentRunStatus.RECEIVED, "LAUNCHING",
-                        claimedToken, claimedVersion);
+                if (anchor.isResultConsumed()) {
+                    // 已消费 handoff 的 resumed worker 运行在 EXECUTING；回滚 READY 时必须同时
+                    // 恢复 RECEIVED，否则 READY 会落在扫描器无法再次 claim 的状态中。
+                    anchorService.casResumeStateAndStatus(
+                            runId, anchor, AgentRunStatus.RECEIVED, AgentRunStatus.EXECUTING,
+                            "LAUNCHING", claimedToken, claimedVersion);
+                } else {
+                    anchorService.casResumeState(runId, anchor, AgentRunStatus.RECEIVED, "LAUNCHING",
+                            claimedToken, claimedVersion);
+                }
                 // 本轮不直接递归 launch；下一次扫描按新 READY 正常竞争。
                 return false;
             }
@@ -273,9 +292,22 @@ public class ToolJobResumeService {
         anchor.setSequence(context.getTodoSequence());
         anchor.setToolCallsUsed(context.getToolCallsUsed());
         anchor.setResultConsumed(true);
-        // CAS 不改变 LAUNCHING state，只在相同租约内持久化“结果已接受”的半交接。
-        return anchorService.casResumeState(runId, anchor, AgentRunStatus.RECEIVED, "LAUNCHING",
-                context.getResumeToken(), context.getResumeLeaseVersion());
+        // 同一条 CAS 持久化“结果已接受”并把 Run 从 RECEIVED 恢复为 EXECUTING。
+        // 旧 LAUNCHING anchor 继续保留，直到最终结果落稳或被下一次 PREPARING 精确替换。
+        boolean accepted = anchorService.casResumeStateAndStatus(
+                runId, anchor, AgentRunStatus.EXECUTING, AgentRunStatus.RECEIVED,
+                "LAUNCHING", context.getResumeToken(), context.getResumeLeaseVersion());
+        if (accepted) {
+            // 先有 PostgreSQL 真相再清旧 Redis 派生项；恢复扫描可直接从 PG 重建。
+            try {
+                redisCache.removeDue(runId);
+                redisCache.deletePendingCache(runId);
+            } catch (Exception cacheFailure) {
+                log.warn("Accepted handoff Redis cleanup failed for run={}, PG state remains recoverable: {}",
+                        runId, cacheFailure.getMessage());
+            }
+        }
+        return accepted;
     }
 
     /**

@@ -306,7 +306,7 @@ public class ToolJobStartupRecovery {
         }
 
         for (AgentRun run : resumeReadyRuns) {
-            // 单独扫描 RECEIVED + READY/LAUNCHING，覆盖 active 列表状态集合之外的恢复 Run。
+            // 单独扫描 RECEIVED 的 READY/LAUNCHING 以及 EXECUTING 的已接受 LAUNCHING handoff。
             ToolJobAnchor anchor = anchorService.loadAnchor(run.getId());
             if (anchor == null) continue;
             log.info("Recovery found resume-ready run={}, resumeState={}", run.getId(), anchor.getResumeState());

@@ -131,6 +131,13 @@ public class ToolJobReconciler {
             ToolJobAnchor anchor = anchorService.loadAnchor(runId);
             // DB 已无 active anchor 时清理 Redis 残留，幂等结束。
             if (anchor == null) { redisCache.removeDue(runId); redisCache.deletePendingCache(runId); return; }
+            if ("LAUNCHING".equals(anchor.getResumeState()) && anchor.isResultConsumed()) {
+                // 已接受 handoff 的 Run 处于 EXECUTING；旧 due 不能再次进入 Sandbox terminal finalizer。
+                redisCache.removeDue(runId);
+                redisCache.deletePendingCache(runId);
+                resumeService.tryResume(runId);
+                return;
+            }
             if (ToolJobRunDisposition.isDagPreparingAbort(
                     anchor.getRunDisposition())) {
                 recoverPreparingAbort(runId, anchor);

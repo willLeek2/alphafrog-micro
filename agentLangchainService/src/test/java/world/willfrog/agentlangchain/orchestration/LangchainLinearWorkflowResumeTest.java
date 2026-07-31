@@ -3,6 +3,7 @@ package world.willfrog.agentlangchain.orchestration;
 import dev.langchain4j.model.chat.ChatModel;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.dataanalysis.CompletedTodoRecord;
 import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agent.workflow.PlanExecutionMode;
@@ -14,6 +15,7 @@ import world.willfrog.agentlangchain.tooljob.ToolJobResumeContext;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -28,8 +30,14 @@ class LangchainLinearWorkflowResumeTest {
         LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
         AgentEventService events = mock(AgentEventService.class);
         when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
+        AtomicReference<String> resumeTokenSeenByNextTodo = new AtomicReference<>();
+        AtomicReference<Long> resumeVersionSeenByNextTodo = new AtomicReference<>();
         when(nodeExecutor.execute(any(), any(), any(), any(), any()))
-                .thenReturn(LangchainTodoNodeResult.success("todo-3-output", 6));
+                .thenAnswer(invocation -> {
+                    resumeTokenSeenByNextTodo.set(AgentContext.getToolJobResumeToken());
+                    resumeVersionSeenByNextTodo.set(AgentContext.getToolJobResumeLeaseVersion());
+                    return LangchainTodoNodeResult.success("todo-3-output", 6);
+                });
         when(nodeExecutor.writeFinalAnswer(any(), any())).thenReturn("final-answer");
 
         LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
@@ -69,6 +77,8 @@ class LangchainLinearWorkflowResumeTest {
         assertThat(result.getCompletedTodos().get(1).displayOutput())
                 .contains("terminal-preview", "artifact://result-1");
         assertThat(consumed.get()).isEqualTo(1);
+        assertThat(resumeTokenSeenByNextTodo.get()).isEqualTo("token-1");
+        assertThat(resumeVersionSeenByNextTodo.get()).isEqualTo(2L);
         verifyNoInteractions(planner);
 
         ArgumentCaptor<TodoItem> executed = ArgumentCaptor.forClass(TodoItem.class);

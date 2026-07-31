@@ -71,6 +71,18 @@ public class ToolJobAnchorService {
                 runId, anchor.toJson(), expectedStatus) == 1;
     }
 
+    public boolean claimPreparingFromResume(String runId,
+                                             ToolJobAnchor anchor,
+                                             String expectedResumeToken,
+                                             long expectedResumeLeaseVersion) {
+        if (expectedResumeToken == null || expectedResumeToken.isBlank()
+                || expectedResumeLeaseVersion <= 0) {
+            return false;
+        }
+        return agentRunMapper.claimPreparingToolJobAnchorFromResume(
+                runId, anchor.toJson(), expectedResumeToken, expectedResumeLeaseVersion) == 1;
+    }
+
     public boolean updateActive(String runId, ToolJobAnchor anchor,
                                 AgentRunStatus expectedStatus, String operationId) {
         // operationId 绑定当前 active dispatch，旧 operation 无法替换新任务。
@@ -269,9 +281,9 @@ public class ToolJobAnchorService {
     }
 
     /**
-     * Lists runs with status=RECEIVED and resumeState=READY/LAUNCHING,
-     * i.e. runs that were CAS-ed back to RECEIVED but may not have been
-     * picked up by the resume launcher (crash recovery).
+     * Lists RECEIVED READY/LAUNCHING runs and EXECUTING accepted LAUNCHING handoffs.
+     * 后者覆盖终态已消费、状态已回到执行中，但 resumed worker 在最终结果或下一工具 checkpoint
+     * 落稳前崩溃的窗口。
      */
     public List<AgentRun> listResumeReady(int limit) {
         // READY 与超时 LAUNCHING 都需要启动恢复扫描，具体租约判断在 ResumeService。
@@ -293,6 +305,18 @@ public class ToolJobAnchorService {
                 runId, anchor.toJson(), expectedStatus, expectedResumeState,
                 expectedResumeToken, expectedLeaseVersion);
         return rows == 1;
+    }
+
+    public boolean casResumeStateAndStatus(String runId,
+                                            ToolJobAnchor anchor,
+                                            AgentRunStatus newStatus,
+                                            AgentRunStatus expectedStatus,
+                                            String expectedResumeState,
+                                            String expectedResumeToken,
+                                            long expectedLeaseVersion) {
+        return agentRunMapper.casUpdateAnchorResumeStateAndStatus(
+                runId, anchor.toJson(), newStatus, expectedStatus,
+                expectedResumeState, expectedResumeToken, expectedLeaseVersion) == 1;
     }
 
     /**

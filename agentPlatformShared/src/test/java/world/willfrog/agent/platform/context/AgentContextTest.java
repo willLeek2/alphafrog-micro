@@ -177,6 +177,30 @@ class AgentContextTest {
         assertEquals("[last_mile_hint] 92% tokens", childHint.get());
     }
 
+    @Test
+    void captureRestoreAndClearShouldPreserveResumeHandoffIdentity() throws Exception {
+        AgentContext.setToolJobResumeHandoff("resume-token", 6L);
+        AgentContext.ContextSnapshot snapshot = AgentContext.captureRunContext();
+
+        CountDownLatch latch = new CountDownLatch(1);
+        AtomicReference<String> childToken = new AtomicReference<>();
+        AtomicReference<Long> childVersion = new AtomicReference<>();
+        new Thread(() -> {
+            AgentContext.restoreRunContext(snapshot);
+            childToken.set(AgentContext.getToolJobResumeToken());
+            childVersion.set(AgentContext.getToolJobResumeLeaseVersion());
+            AgentContext.clear();
+            latch.countDown();
+        }).start();
+
+        latch.await();
+        assertEquals("resume-token", childToken.get());
+        assertEquals(6L, childVersion.get());
+        AgentContext.clear();
+        assertNull(AgentContext.getToolJobResumeToken());
+        assertNull(AgentContext.getToolJobResumeLeaseVersion());
+    }
+
     // ── helper ──
 
     private static AgentLlmProperties.DataFreshness freshness(String start, String end, String asOf, String desc) {

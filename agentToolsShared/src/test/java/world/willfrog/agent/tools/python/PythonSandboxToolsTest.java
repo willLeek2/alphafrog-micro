@@ -437,9 +437,9 @@ class PythonSandboxToolsTest {
     }
 
     @Test
-    void manifestWithMissingRelatedNumberShouldSkipSilently() throws Exception {
+    void manifestWithNoResolvableRelatedNumberShouldFailBeforeSandboxDispatch() throws Exception {
         // mf1.related_dataset_ids 含 "99", 但 registry 里没有 number=99 的 dataset
-        // → 静默跳过（log warning），不 fail loud
+        // → 当前 run 无可挂载成员，必须在 Java 侧 fail loud
         AgentRunDatasetEntry ds1 = AgentRunDatasetEntry.forDataset(
                 1, "ds-a", "/p/ds-a", "000300.SH", "a.csv");
         AgentRunDatasetEntry mf1 = AgentRunDatasetEntry.forManifest(
@@ -454,35 +454,17 @@ class PythonSandboxToolsTest {
                 .thenReturn(new world.willfrog.agent.workflow.AgentRunDatasetSnapshot(
                         List.of(ds1), List.of(mf1)));
 
-        ExecuteResponse createResp = ExecuteResponse.newBuilder().setTaskId("task-miss").build();
-        when(sandboxService.createTask(any())).thenReturn(createResp);
-        TaskStatusResponse doneStatus = TaskStatusResponse.newBuilder().setStatus("SUCCEEDED").build();
-        TaskResultResponse resultResp = TaskResultResponse.newBuilder()
-                .setExitCode(0).setStdout("ok").setStderr("")
-                .setDatasetDir("/sandbox/runs/task-miss/input").build();
-        when(sandboxService.getTaskStatus(any(GetTaskStatusRequest.class))).thenReturn(doneStatus);
-        when(sandboxService.getTaskResult(any(GetTaskResultRequest.class))).thenReturn(resultResp);
-
         String result = tools.executePython("print('s')", null, "1", null, null);
-        assertNotNull(result);
-        // 不应 fail loud，仍然调用 sandbox
-        verify(sandboxService, times(1)).createTask(any());
-
-        ArgumentCaptor<ExecuteRequest> captor = ArgumentCaptor.forClass(ExecuteRequest.class);
-        verify(sandboxService, times(1)).createTask(captor.capture());
-        ExecuteRequest sent = captor.getValue();
-        // 只含 manifest 自己 + 它的 ownOriginalId mount
-        // ds-a 不应被隐式加进来 (number 99 解析失败)
-        String dsCsv = sent.getPathsDatasetCsv();
-        assertFalse(dsCsv.contains("ds-a"),
-                "missing related 不应引入 ds-a; got: " + dsCsv);
-        // m-x 应被 mount (manifest 自身)
-        assertTrue(sent.getDatasetIdsList().contains("m-x"));
+        JsonNode root = mapper.readTree(result);
+        assertFalse(root.path("ok").asBoolean());
+        assertEquals("MANIFEST_MEMBERS_UNAVAILABLE", root.path("error").path("code").asText());
+        assertEquals(1, root.path("error").path("details").path("manifest_numbers").get(0).asInt());
+        verify(sandboxService, never()).createTask(any());
     }
 
     @Test
-    void manifestWithEmptyRelatedIdsShouldNotAddRelatedDatasets() throws Exception {
-        // mf1.related_dataset_ids 为空 → 不展开隐式 dataset
+    void manifestWithEmptyRelatedIdsShouldFailBeforeSandboxDispatch() throws Exception {
+        // mf1.related_dataset_ids 为空表示 run-level 绑定损坏，不能提交 header-only CSV
         AgentRunDatasetEntry mf1 = AgentRunDatasetEntry.forManifest(
                 1, "m-x", "/p/m-x", "UNCERTAIN", "manifest.json", List.of());
 
@@ -493,27 +475,10 @@ class PythonSandboxToolsTest {
                 .thenReturn(new world.willfrog.agent.workflow.AgentRunDatasetSnapshot(
                         List.of(), List.of(mf1)));
 
-        ExecuteResponse createResp = ExecuteResponse.newBuilder().setTaskId("task-empty").build();
-        when(sandboxService.createTask(any())).thenReturn(createResp);
-        TaskStatusResponse doneStatus = TaskStatusResponse.newBuilder().setStatus("SUCCEEDED").build();
-        TaskResultResponse resultResp = TaskResultResponse.newBuilder()
-                .setExitCode(0).setStdout("ok").setStderr("")
-                .setDatasetDir("/sandbox/runs/task-empty/input").build();
-        when(sandboxService.getTaskStatus(any(GetTaskStatusRequest.class))).thenReturn(doneStatus);
-        when(sandboxService.getTaskResult(any(GetTaskResultRequest.class))).thenReturn(resultResp);
-
         String result = tools.executePython("print('e')", null, "1", null, null);
-        assertNotNull(result);
-
-        ArgumentCaptor<ExecuteRequest> captor = ArgumentCaptor.forClass(ExecuteRequest.class);
-        verify(sandboxService, times(1)).createTask(captor.capture());
-        ExecuteRequest sent = captor.getValue();
-        // pathsDatasetCsv 只有 header (empty related → 没有隐式 dataset 行)
-        String dsCsv = sent.getPathsDatasetCsv();
-        // 不应包含任何 data row (只有 header)
-        String[] lines = dsCsv.split("\n");
-        assertEquals(1, lines.length, "empty related → pathsDatasetCsv 仅有 header; got: " + dsCsv);
-        // datasetIds 只含 manifest
-        assertEquals(List.of("m-x"), sent.getDatasetIdsList());
+        JsonNode root = mapper.readTree(result);
+        assertFalse(root.path("ok").asBoolean());
+        assertEquals("MANIFEST_MEMBERS_UNAVAILABLE", root.path("error").path("code").asText());
+        verify(sandboxService, never()).createTask(any());
     }
 }

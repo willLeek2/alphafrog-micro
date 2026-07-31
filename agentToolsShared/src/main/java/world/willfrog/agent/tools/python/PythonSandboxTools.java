@@ -244,7 +244,9 @@ public class PythonSandboxTools {
                 explicitNumbers.add(ds.number());
             }
             List<AgentRunDatasetEntry> relatedDatasets = new ArrayList<>();
+            List<Integer> manifestsWithoutResolvableMembers = new ArrayList<>();
             for (AgentRunDatasetEntry mf : resolvedManifests) {
+                int resolvedMemberCount = 0;
                 for (String relatedNumberStr : mf.relatedDatasetIds()) {
                     int relatedNumber;
                     try {
@@ -255,9 +257,6 @@ public class PythonSandboxTools {
                                 runId, mf.originalId(), relatedNumberStr);
                         continue;
                     }
-                    if (explicitNumbers.contains(relatedNumber)) {
-                        continue;
-                    }
                     AgentRunDatasetEntry relatedDs = datasetByNumber.get(relatedNumber);
                     if (relatedDs == null) {
                         // manifest 引用了本 run 中不存在的 dataset 编号，同样跳过并打 warn。
@@ -265,9 +264,21 @@ public class PythonSandboxTools {
                                 runId, mf.originalId(), relatedNumber);
                         continue;
                     }
-                    explicitNumbers.add(relatedNumber);
-                    relatedDatasets.add(relatedDs);
+                    resolvedMemberCount++;
+                    if (explicitNumbers.add(relatedNumber)) {
+                        relatedDatasets.add(relatedDs);
+                    }
                 }
+                if (resolvedMemberCount == 0) {
+                    manifestsWithoutResolvableMembers.add(mf.number());
+                }
+            }
+            if (!manifestsWithoutResolvableMembers.isEmpty()) {
+                return fail("executePython", "MANIFEST_MEMBERS_UNAVAILABLE",
+                        "Selected manifest has no resolvable dataset members in the current run",
+                        Map.of(
+                                "manifest_numbers", manifestsWithoutResolvableMembers,
+                                "legal_dataset_numbers", legalDatasetNumbers));
             }
 
             // --- 第四阶段：汇总挂载列表并生成路径映射 CSV ---
@@ -583,8 +594,23 @@ public class PythonSandboxTools {
             anchor.setBlockingLeaseUntil(DagBlockingWorkerLease.renewedUntil(Instant.now()));
         }
 
-        // 必须先 CAS 占有空 anchor，再调用有副作用的 createTask。
-        if (!pythonSandboxDispatchStore.persistPreparing(runId, anchor)) {
+        // 必须先 CAS 占有 anchor，再调用有副作用的 createTask。恢复 worker 的第二次长工具
+        // 不能走“空 anchor”路径：它必须用旧 LAUNCHING token/version 原子替换已消费 handoff。
+        String resumeToken = AgentContext.getToolJobResumeToken();
+        Long resumeLeaseVersion = AgentContext.getToolJobResumeLeaseVersion();
+        boolean preparingPersisted;
+        if (resumeToken != null && !resumeToken.isBlank()
+                && resumeLeaseVersion != null && resumeLeaseVersion > 0) {
+            preparingPersisted = pythonSandboxDispatchStore.persistPreparingFromResume(
+                    runId, anchor, resumeToken, resumeLeaseVersion);
+            if (preparingPersisted) {
+                // 旧 handoff 已被这一版 PREPARING 消费；同一 worker 后续同步工具回到普通空-anchor CAS。
+                AgentContext.clearToolJobResumeHandoff();
+            }
+        } else {
+            preparingPersisted = pythonSandboxDispatchStore.persistPreparing(runId, anchor);
+        }
+        if (!preparingPersisted) {
             // 未取得 anchor owner 时释放尚未转交的容量。
             releasePreDispatch(reservation);
             return fail("executePython", "TOOL_JOB_ANCHOR_INVALID",

@@ -56,6 +56,12 @@ public class AgentContext {
     private static final ThreadLocal<Integer> PYTHON_REFINE_ATTEMPT_HOLDER = new ThreadLocal<>();
     /** 当前 LangChain tool call id（与 SSE {@code tool_call_id} 对齐，供 observability tool trace）。 */
     private static final ThreadLocal<String> TOOL_CALL_ID_HOLDER = new ThreadLocal<>();
+    /**
+     * 当前恢复 worker 正在消费的旧 tool-job handoff 身份。
+     * 第二次长工具必须携带该 token/version，才能原子替换旧 LAUNCHING anchor。
+     */
+    private static final ThreadLocal<String> TOOL_JOB_RESUME_TOKEN_HOLDER = new ThreadLocal<>();
+    private static final ThreadLocal<Long> TOOL_JOB_RESUME_LEASE_VERSION_HOLDER = new ThreadLocal<>();
     /** 决策 trace ID,关联到 PlanJudge 等组件产生的决策链 */
     private static final ThreadLocal<String> DECISION_TRACE_ID_HOLDER = new ThreadLocal<>();
     /** 决策所处阶段(配合 traceId 用) */
@@ -264,6 +270,32 @@ public class AgentContext {
 
     public static void clearToolCallId() {
         TOOL_CALL_ID_HOLDER.remove();
+    }
+
+    /** 设置当前恢复 worker 持有的旧 handoff 租约。 */
+    public static void setToolJobResumeHandoff(String token, long leaseVersion) {
+        if (token == null || token.isBlank() || leaseVersion <= 0) {
+            clearToolJobResumeHandoff();
+            return;
+        }
+        TOOL_JOB_RESUME_TOKEN_HOLDER.set(token);
+        TOOL_JOB_RESUME_LEASE_VERSION_HOLDER.set(leaseVersion);
+    }
+
+    /** 获取当前恢复 handoff token；普通首次执行返回 null。 */
+    public static String getToolJobResumeToken() {
+        return TOOL_JOB_RESUME_TOKEN_HOLDER.get();
+    }
+
+    /** 获取当前恢复 handoff lease version；普通首次执行返回 null。 */
+    public static Long getToolJobResumeLeaseVersion() {
+        return TOOL_JOB_RESUME_LEASE_VERSION_HOLDER.get();
+    }
+
+    /** 清除已经被下一次 PREPARING 原子接管的旧 handoff 身份。 */
+    public static void clearToolJobResumeHandoff() {
+        TOOL_JOB_RESUME_TOKEN_HOLDER.remove();
+        TOOL_JOB_RESUME_LEASE_VERSION_HOLDER.remove();
     }
 
     /**
@@ -682,7 +714,9 @@ public class AgentContext {
                 getWorkflow(),
                 getDataFreshness(),
                 getLastMileHint(),
-                getDebugObservabilitySessionId()
+                getDebugObservabilitySessionId(),
+                getToolJobResumeToken(),
+                getToolJobResumeLeaseVersion()
         );
     }
 
@@ -772,6 +806,12 @@ public class AgentContext {
         } else {
             setDebugObservabilitySessionId(snapshot.debugObservabilitySessionId());
         }
+        if (snapshot.toolJobResumeToken() == null || snapshot.toolJobResumeLeaseVersion() == null) {
+            clearToolJobResumeHandoff();
+        } else {
+            setToolJobResumeHandoff(
+                    snapshot.toolJobResumeToken(), snapshot.toolJobResumeLeaseVersion());
+        }
     }
 
     /**
@@ -791,6 +831,7 @@ public class AgentContext {
         clearSubAgentStepIndex();
         clearPythonRefineAttempt();
         clearToolCallId();
+        clearToolJobResumeHandoff();
         clearDecisionContext();
         PROVIDER_LLM_TRACE_ID_HOLDER.remove();
         LLM_CALL_REQUEST_META_HOLDER.remove();
@@ -848,6 +889,8 @@ public class AgentContext {
      * @param stageConfig         阶段级 LLM 配置
      * @param effectiveExecutionStageConfig execution 阶段生效配置
      * @param workflow            工作流形态（linear / dag）
+     * @param toolJobResumeToken  恢复 worker 当前持有的旧 handoff token
+     * @param toolJobResumeLeaseVersion 恢复 worker 当前持有的旧 handoff lease version
      */
     public record ContextSnapshot(
             String runId,
@@ -862,7 +905,9 @@ public class AgentContext {
             String workflow,
             AgentLlmProperties.DataFreshness dataFreshness,
             String lastMileHint,
-            String debugObservabilitySessionId
+            String debugObservabilitySessionId,
+            String toolJobResumeToken,
+            Long toolJobResumeLeaseVersion
     ) {
     }
 

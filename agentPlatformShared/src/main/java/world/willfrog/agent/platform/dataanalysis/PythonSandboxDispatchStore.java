@@ -11,6 +11,17 @@ public interface PythonSandboxDispatchStore {
     /** 在 createTask 前抢占空 anchor；成功后 PREPARING reservation 才有持久化 owner。 */
     boolean persistPreparing(String runId, ToolJobAnchor anchor);
 
+    /**
+     * 恢复 worker 的第二次长工具分发：只允许持有精确旧 LAUNCHING token/version 的 worker
+     * 原子替换已消费 handoff，并保持 Run 为 EXECUTING。
+     */
+    default boolean persistPreparingFromResume(String runId,
+                                               ToolJobAnchor anchor,
+                                               String expectedResumeToken,
+                                               long expectedResumeLeaseVersion) {
+        return false;
+    }
+
     /** 按 operationId 保存 Sandbox taskId 和 ATTACHED/TERMINAL 状态。 */
     boolean persistAttached(String runId, ToolJobAnchor anchor);
 

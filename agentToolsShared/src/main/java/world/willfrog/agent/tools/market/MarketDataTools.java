@@ -1481,8 +1481,13 @@ public class MarketDataTools {
                 .sum();
 
         try {
+            List<String> currentReadyDatasetIds = members.stream()
+                    .filter(member -> DatasetManifest.ManifestMember.STATUS_READY.equals(member.getStatus()))
+                    .map(DatasetManifest.ManifestMember::getDatasetId)
+                    .filter(id -> id != null && !id.isBlank())
+                    .toList();
             Optional<DatasetRegistry.ManifestMeta> existing = datasetRegistry.findReusableManifest(
-                    dataType, startDate, endDate, tsCodes, columns);
+                    dataType, startDate, endDate, tsCodes, columns, currentReadyDatasetIds);
             String manifestId = existing.map(DatasetRegistry.ManifestMeta::getManifestId).orElseGet(() -> {
                 String id = manifestWriter.writeManifest(dataType, startDate, endDate, members, totalRowCount, columns);
                 if (id != null) {

@@ -31,6 +31,16 @@ public class PythonSandboxDispatchStoreImpl implements PythonSandboxDispatchStor
     }
 
     @Override
+    public boolean persistPreparingFromResume(String runId,
+                                              ToolJobAnchor anchor,
+                                              String expectedResumeToken,
+                                              long expectedResumeLeaseVersion) {
+        return "PREPARING".equals(anchor.getAnchorState())
+                && anchorService.claimPreparingFromResume(
+                runId, anchor, expectedResumeToken, expectedResumeLeaseVersion);
+    }
+
+    @Override
     public boolean persistAttached(String runId, ToolJobAnchor anchor) {
         // fast-path 可能直接推进 TERMINAL，因此 ATTACHED/TERMINAL 都按 operationId 更新 active anchor。
         if (!"ATTACHED".equals(anchor.getAnchorState())

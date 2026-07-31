@@ -171,6 +171,11 @@ public class LangchainLinearWorkflowExecutor {
                 .collect(Collectors.toCollection(java.util.LinkedHashSet::new));
         // resultConsumed=true 表示上一次恢复已确认消费终态，当前应从下一节点继续。
         boolean handoffAccepted = resumeContext != null && resumeContext.isResultConsumed();
+        if (handoffAccepted) {
+            // 崩溃重入的 worker 继续持有同一 token/version；第二次长工具用它精确替换旧 anchor。
+            AgentContext.setToolJobResumeHandoff(
+                    resumeContext.getResumeToken(), resumeContext.getResumeLeaseVersion());
+        }
         // FINAL_TODO_ID 表示所有 Todo 已完成，本轮只需要生成最终答案。
         boolean resumeAtFinal = handoffAccepted
                 && ToolJobResumeContext.FINAL_TODO_ID.equals(resumeContext.getTodoId());
@@ -249,6 +254,10 @@ public class LangchainLinearWorkflowExecutor {
                     return failure(plan, completedTodos, "resume_result_consume_failed",
                             toolCalls.get(), null);
                 }
+                // markHandoffAccepted 已把 Run 推回 EXECUTING。后续长工具只能凭这份
+                // token/version 原子替换旧 LAUNCHING anchor。
+                AgentContext.setToolJobResumeHandoff(
+                        resumeContext.getResumeToken(), resumeContext.getResumeLeaseVersion());
                 // 当前节点已经通过注入完成，进入原 plan 的下一节点。
                 continue;
             }

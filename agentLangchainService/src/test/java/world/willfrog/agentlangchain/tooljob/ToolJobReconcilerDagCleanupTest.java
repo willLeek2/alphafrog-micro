@@ -43,6 +43,24 @@ import static org.mockito.Mockito.when;
 class ToolJobReconcilerDagCleanupTest {
 
     @Test
+    void acceptedLinearHandoffDoesNotReenterSandboxFinalizer() throws Exception {
+        ToolJobAnchor anchor = baseAnchor();
+        anchor.setAutoResume(true);
+        anchor.setResumeState("LAUNCHING");
+        anchor.setResultConsumed(true);
+        Fixture fixture = fixture(anchor);
+
+        fixture.reconciler.reconcileFromDue();
+
+        verify(fixture.redisCache).removeDue("run-dag");
+        verify(fixture.redisCache).deletePendingCache("run-dag");
+        verify(fixture.resumeService).tryResume("run-dag");
+        verifyNoInteractions(fixture.sandbox);
+        verify(fixture.finalizer, never()).handleTerminal(
+                any(), any(), any(), any(), any(Boolean.class));
+    }
+
+    @Test
     void onlineReconcilerPreservesFutureDagLeaseAndSchedulesExpiry() throws Exception {
         Fixture fixture = fixture(liveAnchor());
 

@@ -13,6 +13,7 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisEstimate;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisResourceClass;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
+import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.workflow.AgentRunDatasetSnapshot;
@@ -573,6 +574,53 @@ class ToolJobAnchorMapperIntegrationTest {
                 AgentRunStatus.EXECUTING, "run-dispatch-cas:call-1:1")).isEqualTo(1);
         assertThat(mapper.findById("run-dispatch-cas").getStatus())
                 .isEqualTo(AgentRunStatus.WAITING_TOOL_JOB);
+    }
+
+    @Test
+    void acceptedResumeHandoffReturnsToExecutingAndAllowsExactSecondPreparing() throws Exception {
+        insertRun("run-resume-dispatch", "RECEIVED", """
+            {"operationId":"run-resume-dispatch:call-1:1","anchorState":"TERMINAL",
+             "resumeState":"LAUNCHING","resumeToken":"resume-token","resumeLeaseVersion":4,
+             "resultConsumed":false}""");
+        AgentRunMapper mapper = newMapper();
+        String accepted = """
+            {"operationId":"run-resume-dispatch:call-1:1","anchorState":"TERMINAL",
+             "resumeState":"LAUNCHING","resumeToken":"resume-token","resumeLeaseVersion":4,
+             "resultConsumed":true}""";
+        assertThat(mapper.casUpdateAnchorResumeStateAndStatus(
+                "run-resume-dispatch", accepted,
+                AgentRunStatus.EXECUTING, AgentRunStatus.RECEIVED,
+                "LAUNCHING", "resume-token", 4L)).isEqualTo(1);
+        assertThat(mapper.findById("run-resume-dispatch").getStatus())
+                .isEqualTo(AgentRunStatus.EXECUTING);
+
+        String nextPreparing = """
+            {"operationId":"run-resume-dispatch:call-2:1","anchorState":"PREPARING"}""";
+        assertThat(mapper.claimPreparingToolJobAnchorFromResume(
+                "run-resume-dispatch", nextPreparing, "stale-token", 4L)).isEqualTo(0);
+        assertThat(mapper.claimPreparingToolJobAnchorFromResume(
+                "run-resume-dispatch", nextPreparing, "resume-token", 3L)).isEqualTo(0);
+        assertThat(mapper.claimPreparingToolJobAnchorFromResume(
+                "run-resume-dispatch", nextPreparing, "resume-token", 4L)).isEqualTo(1);
+        assertThat(mapper.findById("run-resume-dispatch").getToolJobAnchorJson())
+                .contains("run-resume-dispatch:call-2:1", "PREPARING")
+                .doesNotContain("resume-token");
+    }
+
+    @Test
+    void acceptedExecutingHandoffUsesResumeScanNotActiveDispatchScan() throws Exception {
+        insertRun("run-resume-scan", "EXECUTING", """
+            {"operationId":"run-resume-scan:call-1:1","anchorState":"TERMINAL",
+             "resumeState":"LAUNCHING","resumeToken":"scan-token","resumeLeaseVersion":8,
+             "resultConsumed":true}""");
+        AgentRunMapper mapper = newMapper();
+
+        assertThat(mapper.listResumeReadyAnchors(10))
+                .extracting(AgentRun::getId)
+                .contains("run-resume-scan");
+        assertThat(mapper.listActiveToolJobAnchors(10))
+                .extracting(AgentRun::getId)
+                .doesNotContain("run-resume-scan");
     }
 
     @Test

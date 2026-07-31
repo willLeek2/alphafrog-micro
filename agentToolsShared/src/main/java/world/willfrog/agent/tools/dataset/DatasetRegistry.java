@@ -215,6 +215,17 @@ public class DatasetRegistry {
      */
     public Optional<ManifestMeta> findReusableManifest(String dataType, String startDate, String endDate,
                                                        List<String> tsCodes, List<String> columns) {
+        return findReusableManifest(dataType, startDate, endDate, tsCodes, columns, null);
+    }
+
+    /**
+     * 按当前 batch 实际产生的 READY dataset ID 复用 manifest。
+     * manifest 文件名可跨 run 稳定复用，但 run-level 事件必须绑定本批次的 atomic ID，
+     * 不能继续发布 manifest.json 中上一批次的旧 ID。
+     */
+    public Optional<ManifestMeta> findReusableManifest(String dataType, String startDate, String endDate,
+                                                       List<String> tsCodes, List<String> columns,
+                                                       List<String> currentReadyDatasetIds) {
         if (!resolveEnabled()) {
             return Optional.empty();
         }
@@ -233,9 +244,24 @@ public class DatasetRegistry {
             cleanupManifestMeta(meta);
             return Optional.empty();
         }
+        List<String> reboundDatasetIds = currentReadyDatasetIds == null ? null
+                : currentReadyDatasetIds.stream()
+                .filter(id -> id != null && !id.isBlank())
+                .toList();
+        if (reboundDatasetIds != null && reboundDatasetIds.size() != meta.getReadyCount()) {
+            log.warn("Reusable manifest ready-member mismatch: manifestId={} expectedReady={} currentReady={}",
+                    meta.getManifestId(), meta.getReadyCount(), reboundDatasetIds.size());
+            return Optional.empty();
+        }
         touchManifestMeta(meta);
-        publishManifestMemberDatasetEvents(meta);
-        publishManifestPersistedEvent(meta);
+        if (reboundDatasetIds == null) {
+            // 兼容非 batch 调用方：按持久化 manifest 解析并补发成员事件。
+            publishManifestMemberDatasetEvents(meta);
+            publishManifestPersistedEvent(meta);
+        } else {
+            // batch 的 atomic dataset 已在同一 run 中分别发布；这里仅发布绑定后的 manifest 事件。
+            publishManifestPersistedEvent(meta, reboundDatasetIds);
+        }
         return Optional.of(meta);
     }
 
@@ -432,6 +458,10 @@ public class DatasetRegistry {
     }
 
     private void publishManifestPersistedEvent(ManifestMeta meta) {
+        publishManifestPersistedEvent(meta, null);
+    }
+
+    private void publishManifestPersistedEvent(ManifestMeta meta, List<String> reboundDatasetIds) {
         if (eventPublisher == null || meta == null || meta.getManifestId() == null || meta.getManifestId().isBlank()) {
             return;
         }
@@ -441,7 +471,9 @@ public class DatasetRegistry {
         }
         Path persistedJsonPath = Paths.get(meta.getPath()).resolve("manifest.json");
         String persistedPath = persistedJsonPath.toAbsolutePath().toString();
-        List<String> relatedDatasetIds = readManifestDatasetIds(persistedJsonPath);
+        List<String> relatedDatasetIds = reboundDatasetIds == null
+                ? readManifestDatasetIds(persistedJsonPath)
+                : List.copyOf(reboundDatasetIds);
         String fromTsCode = readManifestTsCodes(persistedJsonPath);
         String sortKey = "manifest-" + meta.getManifestId() + ".json";
         eventPublisher.publishEvent(new DatasetPersistedEvent(
