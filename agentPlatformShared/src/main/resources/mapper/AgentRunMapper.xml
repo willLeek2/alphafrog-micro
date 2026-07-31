@@ -677,8 +677,9 @@
     </update>
 
     <!--
-        补扫真相源中的 active anchor。除常规 active/canceled 状态外，只把
-        DAG cleanup/abort 的 FAILED Run 纳入，覆盖 pipeline 先失败、容量后收尾。
+        补扫真相源中的 active anchor。除常规 active 状态外，只把
+        DAG cleanup/abort 的 FAILED / CANCELED Run 纳入，覆盖 pipeline 先失败/取消、容量后收尾。
+        普通 CANCELED（非 cleanup disposition）不纳入，由其自身的 finalizer 完成收尾后不再重入。
     -->
     <select id="listActiveToolJobAnchors" resultMap="AgentRunResultMap">
         SELECT id,
@@ -702,9 +703,9 @@
         WHERE tool_job_anchor_json IS NOT NULL
           AND tool_job_anchor_json &lt;&gt; '{}'::jsonb
           AND (
-                status IN ('EXECUTING', 'WAITING_TOOL_JOB', 'WAITING', 'CANCELED')
+                status IN ('EXECUTING', 'WAITING_TOOL_JOB', 'WAITING')
                 OR (
-                    status = 'FAILED'
+                    status IN ('FAILED', 'CANCELED')
                     AND tool_job_anchor_json -&gt;&gt; 'runDisposition'
                         IN ('DAG_BLOCKING_WORKER_LOST', 'DAG_BLOCKING_PREPARING_ABORT')
                 )

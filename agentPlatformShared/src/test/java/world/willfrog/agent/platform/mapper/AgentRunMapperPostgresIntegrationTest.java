@@ -24,6 +24,7 @@ import java.io.InputStream;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -412,6 +413,38 @@ class AgentRunMapperPostgresIntegrationTest {
                     liveLease.toString())).isEqualTo(1);
             assertThat(mapper.findById("dag-sync-valid").getToolJobAnchorJson())
                     .isEqualTo("{}");
+        }
+    }
+
+    @Test
+    void listActiveToolJobAnchorsExcludesOrdinaryCanceledRun() {
+        // Seed an ordinary CANCELED run (non-cleanup disposition, already finalized)
+        ToolJobAnchor ordinaryCanceled = new ToolJobAnchor();
+        ordinaryCanceled.setOperationId("ordinary-canceled:call-1:1");
+        ordinaryCanceled.setRunDisposition("CANCELED");
+        ordinaryCanceled.setFinalizerStep("CANCELED");
+        ordinaryCanceled.setAutoResume(false);
+        insertRun("ordinary-canceled", AgentRunStatus.CANCELED, ordinaryCanceled.toJson());
+
+        // Seed a DAG cleanup CANCELED run (should still be in active)
+        ToolJobAnchor dagCleanupCanceled = new ToolJobAnchor();
+        dagCleanupCanceled.setOperationId("dag-cleanup-canceled:call-1:1");
+        dagCleanupCanceled.setRunDisposition("DAG_BLOCKING_PREPARING_ABORT");
+        dagCleanupCanceled.setFinalizerStep("EVENT");
+        dagCleanupCanceled.setAutoResume(false);
+        dagCleanupCanceled.setBlockingOwnerId("worker-a");
+        dagCleanupCanceled.setBlockingLeaseUntil(Instant.now().plusSeconds(300));
+        insertRun("dag-cleanup-canceled", AgentRunStatus.CANCELED, dagCleanupCanceled.toJson());
+
+        try (SqlSession session = sqlSessionFactory.openSession(true)) {
+            AgentRunMapper mapper = session.getMapper(AgentRunMapper.class);
+            List<String> activeIds = mapper.listActiveToolJobAnchors(20).stream()
+                    .map(AgentRun::getId)
+                    .toList();
+            // DAG cleanup CANCELED must still be included
+            assertThat(activeIds).contains("dag-cleanup-canceled");
+            // Ordinary CANCELED must NOT be in active list
+            assertThat(activeIds).doesNotContain("ordinary-canceled");
         }
     }
 

@@ -232,6 +232,11 @@ public class ToolJobFinalizer {
             }
             // canceled Run 同样必须先释放容量，再原子落 CANCELED。
             if ("CANCELED".equals(anchor.getRunDisposition())) {
+                if (isStepDone(anchor, STEP_CANCELED)) {
+                    redisCache.removeDue(runId);
+                    redisCache.deletePendingCache(runId);
+                    return;
+                }
                 anchor.setFinalizerStep(STEP_CANCELED);
                 if (!anchorService.updateAnchorAndStatus(runId, anchor,
                         AgentRunStatus.CANCELED, AgentRunStatus.WAITING_TOOL_JOB)) {
