@@ -40,6 +40,17 @@ class LangchainLinearRunPipelineResumeTest {
         LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
         LangchainFollowUpContextSupport followUp = mock(LangchainFollowUpContextSupport.class);
         AgentMessageService messageService = mock(AgentMessageService.class);
+        AgentObservabilityService observabilityService = mock(AgentObservabilityService.class);
+        ObjectProvider<AgentObservabilityService> observabilityProvider = mock(ObjectProvider.class);
+        when(observabilityProvider.getIfAvailable()).thenReturn(observabilityService);
+        when(observabilityService.prepareTerminalSnapshot(
+                eq("run-1"), anyString(), any(), any(), any()))
+                .thenAnswer(invocation -> {
+                    world.willfrog.agent.platform.model.AgentRunStatus status = invocation.getArgument(2);
+                    String snapshot = invocation.getArgument(1);
+                    return new AgentObservabilityService.TerminalSnapshotCandidate(
+                            "run-1", status, snapshot, "{\"status\":\"" + status.name() + "\"}", 1, 1);
+                });
         AgentRunCreditSettlementService settlementService =
                 mock(AgentRunCreditSettlementService.class);
         world.willfrog.agent.platform.event.AgentRunFinalizationService finalizationService =
@@ -76,7 +87,7 @@ class LangchainLinearRunPipelineResumeTest {
         LangchainLinearRunPipelineImpl pipeline = new LangchainLinearRunPipelineImpl(
                 planner, linear, mock(LangchainDagWorkflowExecutor.class), stageModels,
                 runMapper, events, objectMapper, mock(ObjectProvider.class), mock(ObjectProvider.class),
-                mock(ObjectProvider.class), new LangchainFailureMapper(), followUp,
+                observabilityProvider, new LangchainFailureMapper(), followUp,
                 messageService, guard,
                 LangchainRunSchedulerTestSupport.immediateScheduler(), mock(AgentCreditService.class),
                 settlementService,
@@ -92,6 +103,8 @@ class LangchainLinearRunPipelineResumeTest {
         context.setToolCallsUsed(4);
 
         assertThat(pipeline.executeResumedRun(run, context, () -> true)).isTrue();
+        verify(observabilityService, times(1)).commitTerminalSnapshot(argThat(candidate ->
+                candidate.status() == world.willfrog.agent.platform.model.AgentRunStatus.COMPLETED));
 
         verifyNoInteractions(planner);
         verify(linear).resumePlanned(any(), eq(plan), same(context), any());
@@ -135,7 +148,8 @@ class LangchainLinearRunPipelineResumeTest {
                 LangchainLinearWorkflowResult.builder()
                         .success(true).finalAnswer("not-durable").plan(plan)
                         .completedTodos(List.of()).build());
-        clearInvocations(messageService, settlementService, finalizationService, events);
+        clearInvocations(messageService, settlementService, finalizationService, events,
+                observabilityService);
         when(runMapper.updateResumedTerminal(eq("run-1"), eq("user-1"),
                 eq(world.willfrog.agent.platform.model.AgentRunStatus.COMPLETED),
                 any(), any(), eq(true), isNull(), eq("token-1"), eq(3L), eq("owner-1")))
@@ -146,6 +160,23 @@ class LangchainLinearRunPipelineResumeTest {
         verify(finalizationService, never()).publishFinalizedEvent(any(), any(), any());
         verify(events, never()).append(eq("run-1"), eq("user-1"),
                 eq("WORKFLOW_COMPLETED"), any());
+        verify(observabilityService, never()).commitTerminalSnapshot(any());
+
+        when(linear.resumePlanned(any(), any(), any(), any())).thenReturn(
+                LangchainLinearWorkflowResult.builder()
+                        .partial(true).failureReason("partial-result").finalAnswer("partial-answer")
+                        .plan(plan).completedTodos(List.of()).build());
+        when(runMapper.updateResumedTerminal(eq("run-1"), eq("user-1"),
+                eq(world.willfrog.agent.platform.model.AgentRunStatus.PARTIAL),
+                any(), any(), eq(true), eq("partial-result"),
+                eq("token-1"), eq(3L), eq("owner-1"))).thenReturn(0);
+        clearInvocations(messageService, settlementService, finalizationService, events,
+                observabilityService);
+        assertThat(pipeline.executeResumedRun(run, context, () -> true)).isFalse();
+        verify(observabilityService, never()).commitTerminalSnapshot(any());
+        verify(messageService, never()).createAssistantMessage(any(), any(), any());
+        verify(settlementService, never()).settleAsync(any(), any());
+        verify(finalizationService, never()).publishFinalizedEvent(any(), any(), any());
 
         when(linear.resumePlanned(any(), any(), any(), any())).thenReturn(
                 LangchainLinearWorkflowResult.builder()
@@ -155,13 +186,66 @@ class LangchainLinearRunPipelineResumeTest {
                 eq(world.willfrog.agent.platform.model.AgentRunStatus.FAILED),
                 any(), any(), eq(true), any(), eq("token-1"), eq(3L), eq("owner-1")))
                 .thenReturn(0);
-        clearInvocations(messageService, settlementService, finalizationService, events);
+        clearInvocations(messageService, settlementService, finalizationService, events,
+                observabilityService);
         assertThat(pipeline.executeResumedRun(run, context, () -> true)).isFalse();
         verify(messageService, never()).createAssistantMessage(any(), any(), any());
         verify(settlementService, never()).settleAsync(any(), any());
         verify(finalizationService, never()).publishFinalizedEvent(any(), any(), any());
         verify(events, never()).append(eq("run-1"), eq("user-1"),
                 eq("WORKFLOW_FAILED"), any());
+        verify(observabilityService, never()).commitTerminalSnapshot(any());
+
+        when(linear.resumePlanned(any(), any(), any(), any())).thenReturn(
+                LangchainLinearWorkflowResult.builder()
+                        .partial(true).failureReason("winner-partial").finalAnswer("partial-answer")
+                        .plan(plan).completedTodos(List.of()).build());
+        when(runMapper.updateResumedTerminal(eq("run-1"), eq("user-1"),
+                eq(world.willfrog.agent.platform.model.AgentRunStatus.PARTIAL),
+                any(), any(), eq(true), eq("winner-partial"),
+                eq("token-1"), eq(3L), eq("owner-1"))).thenReturn(1);
+        clearInvocations(observabilityService);
+        assertThat(pipeline.executeResumedRun(run, context, () -> true)).isTrue();
+        verify(observabilityService, times(1)).commitTerminalSnapshot(argThat(candidate ->
+                candidate.status() == world.willfrog.agent.platform.model.AgentRunStatus.PARTIAL));
+
+        when(linear.resumePlanned(any(), any(), any(), any())).thenReturn(
+                LangchainLinearWorkflowResult.builder()
+                        .success(false).failureReason("winner-failure").plan(plan)
+                        .completedTodos(List.of()).build());
+        when(runMapper.updateResumedTerminal(eq("run-1"), eq("user-1"),
+                eq(world.willfrog.agent.platform.model.AgentRunStatus.FAILED),
+                any(), any(), eq(true), any(), eq("token-1"), eq(3L), eq("owner-1")))
+                .thenReturn(1);
+        clearInvocations(observabilityService);
+        assertThat(pipeline.executeResumedRun(run, context, () -> true)).isTrue();
+        verify(observabilityService, times(1)).commitTerminalSnapshot(argThat(candidate ->
+                candidate.status() == world.willfrog.agent.platform.model.AgentRunStatus.FAILED));
+
+        when(linear.resumePlanned(any(), any(), any(), any())).thenReturn(
+                LangchainLinearWorkflowResult.builder()
+                        .partial(true).failureReason("throwing-partial-write")
+                        .plan(plan).completedTodos(List.of()).build());
+        when(runMapper.updateResumedTerminal(eq("run-1"), eq("user-1"),
+                eq(world.willfrog.agent.platform.model.AgentRunStatus.PARTIAL),
+                any(), any(), eq(true), eq("throwing-partial-write"),
+                eq("token-1"), eq(3L), eq("owner-1")))
+                .thenThrow(new IllegalStateException("db-partial-write-failed"));
+        when(runMapper.updateResumedTerminal(eq("run-1"), eq("user-1"),
+                eq(world.willfrog.agent.platform.model.AgentRunStatus.FAILED),
+                any(), any(), eq(true), any(), eq("token-1"), eq(3L), eq("owner-1")))
+                .thenThrow(new IllegalStateException("db-failure-write-failed"));
+        clearInvocations(observabilityService);
+        assertThat(pipeline.executeResumedRun(run, context, () -> true)).isFalse();
+        verify(observabilityService, never()).commitTerminalSnapshot(any());
+
+        when(linear.resumePlanned(any(), any(), any(), any())).thenReturn(
+                LangchainLinearWorkflowResult.builder()
+                        .success(false).failureReason("throwing-failure-write")
+                        .plan(plan).completedTodos(List.of()).build());
+        clearInvocations(observabilityService);
+        assertThat(pipeline.executeResumedRun(run, context, () -> true)).isFalse();
+        verify(observabilityService, never()).commitTerminalSnapshot(any());
 
         when(linear.resumePlanned(any(), any(), any(), any())).thenReturn(
                 LangchainLinearWorkflowResult.builder()
@@ -171,7 +255,9 @@ class LangchainLinearRunPipelineResumeTest {
                 eq(world.willfrog.agent.platform.model.AgentRunStatus.COMPLETED),
                 any(), any(), eq(true), isNull(), eq("token-1"), eq(3L), eq("owner-1")))
                 .thenThrow(new IllegalStateException("db-write-failed"));
+        clearInvocations(observabilityService);
         assertThat(pipeline.executeResumedRun(run, context, () -> true)).isFalse();
+        verify(observabilityService, never()).commitTerminalSnapshot(any());
         verify(runMapper, never()).updatePlanJson(any(), any(), any());
         verify(runMapper, never()).updateSnapshot(any(), any(), any(), any(), anyBoolean(), any());
     }

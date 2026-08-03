@@ -1003,11 +1003,7 @@ public class AgentObservabilityService {
      * 用于即使 run 出现未预期异常时也保留观测数据落盘。</p>
      */
     public void recordFailure(String runId, String errorType, String errorMessage) {
-        mutate(runId, state -> {
-            state.getSummary().setStatus(AgentRunStatus.FAILED.name());
-            state.getDiagnostics().setLastErrorType(nvl(errorType));
-            state.getDiagnostics().setLastErrorMessage(trim(errorMessage, 500));
-        });
+        mutate(runId, state -> applyFailure(state, errorType, errorMessage));
     }
 
     /**
@@ -1167,6 +1163,81 @@ public class AgentObservabilityService {
     }
 
     /**
+     * 两阶段终态观测候选项。snapshotJson 与 observabilityJson 由同一份只读候选状态
+     * 生成；只有数据库终态 CAS 胜者才能调用 {@link #commitTerminalSnapshot} 提交。
+     */
+    public record TerminalSnapshotCandidate(String runId,
+                                            AgentRunStatus status,
+                                            String snapshotJson,
+                                            String observabilityJson,
+                                            int llmTraceCount,
+                                            int toolTraceCount) {
+    }
+
+    /**
+     * 只读生成终态 snapshot 候选项。该方法不调用 mutate，不写 Redis，也不清理 run 锁。
+     * 恢复 worker 必须先用返回的 snapshotJson 竞争数据库 CAS，成功后再提交候选项。
+     */
+    public TerminalSnapshotCandidate prepareTerminalSnapshot(String runId,
+                                                              String snapshotJson,
+                                                              AgentRunStatus status,
+                                                              String failureType,
+                                                              String failureReason) {
+        ObservabilityState state = loadState(runId);
+        if (status != null) {
+            state.getSummary().setStatus(status.name());
+        }
+        if (status == AgentRunStatus.FAILED && failureReason != null && !failureReason.isBlank()) {
+            applyFailure(state, failureType, failureReason);
+        }
+        if (isTerminalStatus(status)) {
+            state.getSummary().setCompletedAtMillis(System.currentTimeMillis());
+        }
+        // mutate 平时在写回前调用 touch；preview 只更新当前内存副本。
+        touch(state);
+
+        Map<String, Object> snapshot = parseJsonObject(snapshotJson);
+        Map<String, Object> observabilityMap = objectMapper.convertValue(
+                state, new TypeReference<Map<String, Object>>() { });
+        attachRagObservability(runId, snapshot, state, observabilityMap);
+        AgentCallDetailPersistence.scrubObservabilityMap(observabilityMap);
+        snapshot.put("observability", observabilityMap);
+
+        String preparedSnapshot = safeWrite(snapshot);
+        String preparedObservability = safeWrite(observabilityMap);
+        int llmTraceCount = state.getDiagnostics().getLlmTraces().size();
+        int toolTraceCount = state.getDiagnostics().getToolTraces().size();
+        log.debug("Terminal observability prepared without persistence: runId={}, status={}, llmTraces={}, toolTraces={}",
+                runId, status, llmTraceCount, toolTraceCount);
+        return new TerminalSnapshotCandidate(
+                runId, status, preparedSnapshot, preparedObservability,
+                llmTraceCount, toolTraceCount);
+    }
+
+    /**
+     * 提交数据库终态 CAS 胜者的观测候选项。每次调用只写一次 Redis，然后清理 run 锁。
+     */
+    public void commitTerminalSnapshot(TerminalSnapshotCandidate candidate) {
+        if (candidate == null || candidate.runId() == null || candidate.runId().isBlank()
+                || !isTerminalStatus(candidate.status())
+                || candidate.observabilityJson() == null || candidate.observabilityJson().isBlank()) {
+            throw new IllegalArgumentException("Invalid terminal observability candidate");
+        }
+        Object lock = locks.computeIfAbsent(candidate.runId(), key -> new Object());
+        try {
+            synchronized (lock) {
+                stateStore.saveObservability(candidate.runId(), candidate.observabilityJson());
+            }
+            log.info("Terminal observability committed: runId={}, status={}, llmTraces={}, toolTraces={}, redisSize={} bytes",
+                    candidate.runId(), candidate.status(), candidate.llmTraceCount(),
+                    candidate.toolTraceCount(), candidate.observabilityJson().length());
+        } finally {
+            // 只有 CAS winner 会进入此方法；即使 Redis 暂时写失败也不保留终态锁。
+            locks.remove(candidate.runId(), lock);
+        }
+    }
+
+    /**
      * 将观测数据附加到 run 的 snapshot JSON 中，并同步保存到 Redis。
      *
      * <p>这是 run 终态（COMPLETED/FAILED/CANCELED）写回 DB 前的最后一步：</p>
@@ -1183,50 +1254,53 @@ public class AgentObservabilityService {
      * @return 附加完观测数据后的 snapshot JSON
      */
     public String attachObservabilityToSnapshot(String runId, String snapshotJson, AgentRunStatus status) {
-        int llmTracesBefore = 0;
-        int toolTracesBefore = 0;
-        try {
-            ObservabilityState currentState = loadState(runId);
-            llmTracesBefore = currentState.getDiagnostics().getLlmTraces().size();
-            toolTracesBefore = currentState.getDiagnostics().getToolTraces().size();
-        } catch (Exception e) {
-            log.debug("Could not load current state for metrics: runId={}", runId);
+        if (!isTerminalStatus(status)) {
+            return attachNonTerminalObservabilityToSnapshot(runId, snapshotJson, status);
         }
+        TerminalSnapshotCandidate candidate = prepareTerminalSnapshot(
+                runId, snapshotJson, status, null, null);
+        commitTerminalSnapshot(candidate);
+        return candidate.snapshotJson();
+    }
 
+    /**
+     * pause 等非终态调用仍沿用原有的即时写入语义；两阶段候选项只约束终态恢复 CAS。
+     */
+    private String attachNonTerminalObservabilityToSnapshot(String runId,
+                                                            String snapshotJson,
+                                                            AgentRunStatus status) {
         ObservabilityState state = mutate(runId, current -> {
             if (status != null) {
                 current.getSummary().setStatus(status.name());
             }
-            // 终态时锁定 completedAtMillis，后续 touch 不会再覆盖 totalDurationMs
-            if (status == AgentRunStatus.COMPLETED || status == AgentRunStatus.PARTIAL || status == AgentRunStatus.FAILED || status == AgentRunStatus.CANCELED) {
-                current.getSummary().setCompletedAtMillis(System.currentTimeMillis());
-            }
         });
         Map<String, Object> snapshot = parseJsonObject(snapshotJson);
-        Map<String, Object> observabilityMap = objectMapper.convertValue(state, new TypeReference<Map<String, Object>>() {
-        });
+        Map<String, Object> observabilityMap = objectMapper.convertValue(
+                state, new TypeReference<Map<String, Object>>() { });
         attachRagObservability(runId, snapshot, state, observabilityMap);
-        // DB snapshot 只保存可长期查看的安全索引。
-        // raw HTTP、reasoning、完整工具输出等大字段已在 finalize*TraceForPersistence 中拆到 Redis detail blob。
         AgentCallDetailPersistence.scrubObservabilityMap(observabilityMap);
         snapshot.put("observability", observabilityMap);
-        String output = safeWrite(snapshot);
 
-        // 强制同步保存可观测数据到 Redis，确保后续可以立即加载
+        String output = safeWrite(snapshot);
         String observabilityJson = safeWrite(observabilityMap);
         stateStore.saveObservability(runId, observabilityJson);
-
-        int llmTracesAfter = state.getDiagnostics().getLlmTraces().size();
-        int toolTracesAfter = state.getDiagnostics().getToolTraces().size();
-        log.info("Observability attached to snapshot: runId={}, status={}, llmTraces {}→{}, toolTraces {}→{}, snapshotSize={} bytes, redisSize={} bytes",
-                runId, status, llmTracesBefore, llmTracesAfter, toolTracesBefore, toolTracesAfter,
-                output.length(), observabilityJson.length());
-
-        // 终态后清理 per-runId 锁，避免长期占用内存
-        if (status == AgentRunStatus.COMPLETED || status == AgentRunStatus.PARTIAL || status == AgentRunStatus.FAILED || status == AgentRunStatus.CANCELED) {
-            locks.remove(runId);
-        }
+        log.info("Non-terminal observability attached to snapshot: runId={}, status={}, llmTraces={}, toolTraces={}, snapshotSize={} bytes, redisSize={} bytes",
+                runId, status, state.getDiagnostics().getLlmTraces().size(),
+                state.getDiagnostics().getToolTraces().size(), output.length(), observabilityJson.length());
         return output;
+    }
+
+    private void applyFailure(ObservabilityState state, String errorType, String errorMessage) {
+        state.getSummary().setStatus(AgentRunStatus.FAILED.name());
+        state.getDiagnostics().setLastErrorType(nvl(errorType));
+        state.getDiagnostics().setLastErrorMessage(trim(errorMessage, 500));
+    }
+
+    private boolean isTerminalStatus(AgentRunStatus status) {
+        return status == AgentRunStatus.COMPLETED
+                || status == AgentRunStatus.PARTIAL
+                || status == AgentRunStatus.FAILED
+                || status == AgentRunStatus.CANCELED;
     }
 
     private void attachRagObservability(String runId,

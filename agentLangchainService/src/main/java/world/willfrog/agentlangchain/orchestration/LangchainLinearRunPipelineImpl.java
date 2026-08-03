@@ -642,16 +642,17 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             return hasDurableStopState(runId);
         }
         if (result.isSuccess()) {
-            // 先持久化 COMPLETED 快照；事件、消息和结算属于可重试副作用。
-            String snapshot = attachObservability(runId,
+            // CAS 前只生成观测候选项；失去 lease 的 worker 不能写 Redis 或清理终态锁。
+            PreparedResumedTerminal prepared = prepareResumedTerminalObservability(runId,
                     buildSnapshot(userGoal, result, AgentRunStatus.COMPLETED),
                     AgentRunStatus.COMPLETED, null, null);
             if (persistResumedTerminal(runId, userId, AgentRunStatus.COMPLETED,
-                    result, snapshot, null, resumeContext) != 1) {
+                    result, prepared.snapshot(), null, resumeContext) != 1) {
                 // DB 没接受写入就返回 false，不能清理恢复 anchor。
                 log.warn("Resumed COMPLETED snapshot was not persisted for run={}", runId);
                 return false;
             }
+            commitResumedTerminalObservability(prepared);
             try {
                 // 以下副作用发生在 durable snapshot 之后，失败不会回滚已确定的工作流结果。
                 markRunStatus(runId, AgentRunStatus.COMPLETED);
@@ -673,13 +674,15 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             return true;
         }
         if (result.isPartial()) {
-            String snapshot = attachObservability(runId, buildPartialSnapshot(userGoal, result),
+            PreparedResumedTerminal prepared = prepareResumedTerminalObservability(
+                    runId, buildPartialSnapshot(userGoal, result),
                     AgentRunStatus.PARTIAL, null, result.getFailureReason());
             if (persistResumedTerminal(runId, userId, AgentRunStatus.PARTIAL,
-                    result, snapshot, result.getFailureReason(), resumeContext) != 1) {
+                    result, prepared.snapshot(), result.getFailureReason(), resumeContext) != 1) {
                 log.warn("Resumed PARTIAL snapshot was not persisted for run={}", runId);
                 return false;
             }
+            commitResumedTerminalObservability(prepared);
             try {
                 markRunStatus(runId, AgentRunStatus.PARTIAL);
                 eventService.append(runId, userId, "WORKFLOW_PARTIAL_COMPLETED", Map.of(
@@ -1100,12 +1103,22 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 null,
                 throwable,
                 result == null ? null : result.getToolCallsUsed());
-        String snapshot = attachObservability(
-                runId,
-                buildSnapshot(userGoal, result, AgentRunStatus.FAILED),
-                AgentRunStatus.FAILED,
-                decision.getObservabilityFailureType(),
-                requireDurableWrite ? null : decision.getReason());
+        PreparedResumedTerminal prepared = requireDurableWrite
+                ? prepareResumedTerminalObservability(
+                        runId,
+                        buildSnapshot(userGoal, result, AgentRunStatus.FAILED),
+                        AgentRunStatus.FAILED,
+                        decision.getObservabilityFailureType(),
+                        decision.getReason())
+                : null;
+        String snapshot = requireDurableWrite
+                ? prepared.snapshot()
+                : attachObservability(
+                        runId,
+                        buildSnapshot(userGoal, result, AgentRunStatus.FAILED),
+                        AgentRunStatus.FAILED,
+                        decision.getObservabilityFailureType(),
+                        decision.getReason());
         int updated = requireDurableWrite
                 ? persistResumedTerminal(runId, userId, AgentRunStatus.FAILED,
                 result, snapshot, decision.getReason(), resumeContext)
@@ -1115,11 +1128,10 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             log.warn("FAILED snapshot was not persisted for run={}", runId);
             return false;
         }
+        if (requireDurableWrite) {
+            commitResumedTerminalObservability(prepared);
+        }
         try {
-            if (requireDurableWrite) {
-                recordObservabilityFailure(runId,
-                        decision.getObservabilityFailureType(), decision.getReason());
-            }
             markRunStatus(runId, AgentRunStatus.FAILED);
             // 260618-workspace-v0: 触发终态事件
             finalizationService.publishFinalizedEvent(runId, userId, AgentRunStatus.FAILED.name());
@@ -1173,17 +1185,41 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 resumeContext.getResumeLauncherOwnerId());
     }
 
-    private void recordObservabilityFailure(String runId,
-                                            String failureType,
-                                            String failureReason) {
+    private PreparedResumedTerminal prepareResumedTerminalObservability(
+            String runId,
+            String snapshot,
+            AgentRunStatus status,
+            String failureType,
+            String failureReason) {
         AgentObservabilityService observabilityService = observabilityServiceProvider.getIfAvailable();
-        if (observabilityService == null || isBlank(failureReason)) {
+        if (observabilityService == null) {
+            return new PreparedResumedTerminal(snapshot, null, null);
+        }
+        AgentObservabilityService.TerminalSnapshotCandidate candidate =
+                observabilityService.prepareTerminalSnapshot(
+                        runId, snapshot, status,
+                        isBlank(failureType) ? "WorkflowFailed" : failureType,
+                        failureReason);
+        return new PreparedResumedTerminal(candidate.snapshotJson(), observabilityService, candidate);
+    }
+
+    private void commitResumedTerminalObservability(PreparedResumedTerminal prepared) {
+        if (prepared == null || prepared.service() == null || prepared.candidate() == null) {
             return;
         }
-        observabilityService.recordFailure(
-                runId,
-                isBlank(failureType) ? "WorkflowFailed" : failureType,
-                failureReason);
+        try {
+            prepared.service().commitTerminalSnapshot(prepared.candidate());
+        } catch (RuntimeException e) {
+            // 主数据库终态已落稳；观测 Redis 失败不得把 winner 伪装成可重试旧 worker。
+            log.warn("Terminal observability commit failed after durable resumed snapshot run={}: {}",
+                    prepared.candidate().runId(), e.getMessage());
+        }
+    }
+
+    private record PreparedResumedTerminal(
+            String snapshot,
+            AgentObservabilityService service,
+            AgentObservabilityService.TerminalSnapshotCandidate candidate) {
     }
 
     private void tryScheduleSettlement(String runId, String userId) {

@@ -23,6 +23,9 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.clearInvocations;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static world.willfrog.agent.platform.service.AgentCallDetailPersistence.OBSERVABILITY_PREVIEW_MAX_CHARS;
@@ -395,6 +398,68 @@ class AgentObservabilityServiceEnhancedTest {
 
         JsonNode root = objectMapper.readTree(output);
         assertTrue(root.path("observability").path("rag_observability").isMissingNode());
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void terminalPreviewIsPureAndCommitWritesOnceThenRemovesLock() throws Exception {
+        String runId = "test-terminal-preview";
+        setupStateStore(runId);
+        service.initializeRun(runId, "endpoint", "model");
+        Map<String, Object> locks = (Map<String, Object>) ReflectionTestUtils.getField(service, "locks");
+        assertNotNull(locks);
+        assertTrue(locks.containsKey(runId));
+        String persistedSnapshotBeforePreview = savedJson.get();
+        clearInvocations(stateStore);
+
+        AgentObservabilityService.TerminalSnapshotCandidate candidate =
+                service.prepareTerminalSnapshot(
+                        runId,
+                        "{\"answer_markdown\":\"failed\"}",
+                        AgentRunStatus.FAILED,
+                        "ExternalToolFailure",
+                        "stale worker failed");
+
+        verify(stateStore, never()).saveObservability(eq(runId), anyString());
+        assertTrue(locks.containsKey(runId), "preview must not clean the run lock");
+        assertEquals(persistedSnapshotBeforePreview, savedJson.get(),
+                "preview must leave persisted observability unchanged");
+        JsonNode persistedBeforeCas = objectMapper.readTree(savedJson.get());
+        assertEquals("EXECUTING", persistedBeforeCas.path("summary").path("status").asText());
+        JsonNode prepared = objectMapper.readTree(candidate.snapshotJson()).path("observability");
+        assertEquals("FAILED", prepared.path("summary").path("status").asText());
+        assertTrue(prepared.path("summary").path("completedAtMillis").asLong() > 0);
+        assertEquals("ExternalToolFailure",
+                prepared.path("diagnostics").path("lastErrorType").asText());
+        assertEquals("stale worker failed",
+                prepared.path("diagnostics").path("lastErrorMessage").asText());
+
+        service.commitTerminalSnapshot(candidate);
+
+        verify(stateStore, times(1)).saveObservability(runId, candidate.observabilityJson());
+        assertFalse(locks.containsKey(runId), "winner commit must clean the run lock");
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void nonTerminalSnapshotKeepsImmediatePersistenceAndRunLock() throws Exception {
+        String runId = "test-waiting-snapshot";
+        setupStateStore(runId);
+        service.initializeRun(runId, "endpoint", "model");
+        Map<String, Object> locks = (Map<String, Object>) ReflectionTestUtils.getField(service, "locks");
+        assertNotNull(locks);
+        assertTrue(locks.containsKey(runId));
+        clearInvocations(stateStore);
+
+        String output = service.attachObservabilityToSnapshot(
+                runId, "{\"answer_markdown\":\"paused\"}", AgentRunStatus.WAITING);
+
+        verify(stateStore, times(2)).saveObservability(eq(runId), anyString());
+        assertTrue(locks.containsKey(runId), "non-terminal snapshot must retain the run lock");
+        assertEquals("WAITING",
+                objectMapper.readTree(savedJson.get()).path("summary").path("status").asText());
+        assertEquals("WAITING",
+                objectMapper.readTree(output).path("observability").path("summary").path("status").asText());
     }
 
     // ==================== ToolTrace backward compat ====================
