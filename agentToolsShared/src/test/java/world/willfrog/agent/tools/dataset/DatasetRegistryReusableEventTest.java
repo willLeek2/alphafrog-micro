@@ -171,6 +171,24 @@ class DatasetRegistryReusableEventTest {
     }
 
     @Test
+    void reusableManifestReadyCountMismatchIsRejectedForWriterRewrite() throws Exception {
+        List<String> columns = List.of("trade_date", "close");
+        DatasetRegistry.ManifestMeta manifestMeta = reusableManifestMeta(
+                "stock_daily", "20240101", "20240131", List.of("000001.SZ"), columns,
+                "manifest-stale-one-ready", "ds-stale", "20240101", "20240131");
+        String queryKey = manifestQueryKey("stock_daily", "20240101", "20240131",
+                List.of("000001.SZ"), columns);
+        manifestMeta.setQueryKey(queryKey);
+        when(valueOps.get(manifestMetaKey(queryKey))).thenReturn(MAPPER.writeValueAsString(manifestMeta));
+
+        Optional<DatasetRegistry.ManifestMeta> found = registry.findReusableManifest(
+                "stock_daily", "20240101", "20240131", List.of("000001.SZ"), columns,
+                List.of("ds-current-1", "ds-current-2"));
+
+        assertTrue(found.isEmpty());
+    }
+
+    @Test
     void manifestMemberRangeMismatchFallsBackToDatasetIdIndex() throws Exception {
         List<String> columns = List.of("trade_date", "close");
         DatasetRegistry.DatasetMeta dsMeta = reusableMeta(

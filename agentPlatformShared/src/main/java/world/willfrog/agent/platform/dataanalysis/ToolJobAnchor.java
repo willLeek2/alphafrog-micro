@@ -69,6 +69,10 @@ public class ToolJobAnchor {
     private long resumeLeaseVersion;
     // resumeClaimedAt 用来识别 LAUNCHING 卡死并允许启动恢复重新接管。
     private Instant resumeClaimedAt;
+    // resumeLauncherOwnerId 是当前恢复 launcher 的进程级身份，不能用 JVM 本地 map 代替。
+    private String resumeLauncherOwnerId;
+    // resumeLauncherLeaseUntil 是 launcher 必须持续续租的数据库租约；过期后才允许跨实例接管。
+    private Instant resumeLauncherLeaseUntil;
 
     // 以下字段是在工具进入 pending 时冻结的工作流上下文。
     // completedTodosJson 保存完整的已完成 Todo 记录，而不只是 id 列表。
@@ -218,6 +222,12 @@ public class ToolJobAnchor {
 
     public Instant getResumeClaimedAt() { return resumeClaimedAt; }
     public void setResumeClaimedAt(Instant resumeClaimedAt) { this.resumeClaimedAt = resumeClaimedAt; }
+
+    public String getResumeLauncherOwnerId() { return resumeLauncherOwnerId; }
+    public void setResumeLauncherOwnerId(String resumeLauncherOwnerId) { this.resumeLauncherOwnerId = resumeLauncherOwnerId; }
+
+    public Instant getResumeLauncherLeaseUntil() { return resumeLauncherLeaseUntil; }
+    public void setResumeLauncherLeaseUntil(Instant resumeLauncherLeaseUntil) { this.resumeLauncherLeaseUntil = resumeLauncherLeaseUntil; }
 
     public String getEstimateJson() { return estimateJson; }
     public void setEstimateJson(String estimateJson) { this.estimateJson = estimateJson; }

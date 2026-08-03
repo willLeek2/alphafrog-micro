@@ -39,6 +39,11 @@ class LangchainLinearRunPipelineResumeTest {
         LangchainRunStageModelResolver stageModels = mock(LangchainRunStageModelResolver.class);
         LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
         LangchainFollowUpContextSupport followUp = mock(LangchainFollowUpContextSupport.class);
+        AgentMessageService messageService = mock(AgentMessageService.class);
+        AgentRunCreditSettlementService settlementService =
+                mock(AgentRunCreditSettlementService.class);
+        world.willfrog.agent.platform.event.AgentRunFinalizationService finalizationService =
+                mock(world.willfrog.agent.platform.event.AgentRunFinalizationService.class);
         LangchainTodoPlan plan = LangchainTodoPlan.builder()
                 .executionMode(PlanExecutionMode.LINEAR)
                 .items(List.of(TodoItem.builder().id("todo-2").sequence(2).description("resume").build()))
@@ -49,9 +54,10 @@ class LangchainLinearRunPipelineResumeTest {
         run.setExt("{}");
         run.setPlanJson(objectMapper.writeValueAsString(plan));
         when(runMapper.findById("run-1")).thenReturn(run);
-        when(runMapper.updateSnapshot(eq("run-1"), eq("user-1"),
+        when(runMapper.updateResumedTerminal(eq("run-1"), eq("user-1"),
                 eq(world.willfrog.agent.platform.model.AgentRunStatus.COMPLETED),
-                any(), eq(true), isNull())).thenReturn(1);
+                any(), any(), eq(true), isNull(), eq("token-1"), eq(3L), eq("owner-1")))
+                .thenReturn(1);
         when(events.isRunnable("run-1", "user-1")).thenReturn(true);
         when(events.extractRunConfig("{}")).thenReturn(AgentEventService.RunConfig.defaults());
         ChatModel model = mock(ChatModel.class);
@@ -71,16 +77,18 @@ class LangchainLinearRunPipelineResumeTest {
                 planner, linear, mock(LangchainDagWorkflowExecutor.class), stageModels,
                 runMapper, events, objectMapper, mock(ObjectProvider.class), mock(ObjectProvider.class),
                 mock(ObjectProvider.class), new LangchainFailureMapper(), followUp,
-                mock(AgentMessageService.class), guard,
+                messageService, guard,
                 LangchainRunSchedulerTestSupport.immediateScheduler(), mock(AgentCreditService.class),
-                mock(AgentRunCreditSettlementService.class),
-                mock(world.willfrog.agent.platform.event.AgentRunFinalizationService.class),
+                settlementService,
+                finalizationService,
                 mock(ObjectProvider.class), mock(ObjectProvider.class));
         ToolJobResumeContext context = new ToolJobResumeContext();
         context.setRunId("run-1");
         context.setTodoId("todo-2");
         context.setResumeToken("token-1");
         context.setResumeLeaseVersion(3);
+        context.setResumeLauncherOwnerId("owner-1");
+        context.setResultConsumed(true);
         context.setToolCallsUsed(4);
 
         assertThat(pipeline.executeResumedRun(run, context, () -> true)).isTrue();
@@ -127,14 +135,44 @@ class LangchainLinearRunPipelineResumeTest {
                 LangchainLinearWorkflowResult.builder()
                         .success(true).finalAnswer("not-durable").plan(plan)
                         .completedTodos(List.of()).build());
-        when(runMapper.updateSnapshot(eq("run-1"), eq("user-1"),
+        clearInvocations(messageService, settlementService, finalizationService, events);
+        when(runMapper.updateResumedTerminal(eq("run-1"), eq("user-1"),
                 eq(world.willfrog.agent.platform.model.AgentRunStatus.COMPLETED),
-                any(), eq(true), isNull())).thenReturn(0);
+                any(), any(), eq(true), isNull(), eq("token-1"), eq(3L), eq("owner-1")))
+                .thenReturn(0);
         assertThat(pipeline.executeResumedRun(run, context, () -> true)).isFalse();
+        verify(messageService, never()).createAssistantMessage(any(), any(), any());
+        verify(settlementService, never()).settleAsync(any(), any());
+        verify(finalizationService, never()).publishFinalizedEvent(any(), any(), any());
+        verify(events, never()).append(eq("run-1"), eq("user-1"),
+                eq("WORKFLOW_COMPLETED"), any());
 
-        when(runMapper.updateSnapshot(eq("run-1"), eq("user-1"),
-                eq(world.willfrog.agent.platform.model.AgentRunStatus.COMPLETED),
-                any(), eq(true), isNull())).thenThrow(new IllegalStateException("db-write-failed"));
+        when(linear.resumePlanned(any(), any(), any(), any())).thenReturn(
+                LangchainLinearWorkflowResult.builder()
+                        .success(false).failureReason("stale-worker-failure").plan(plan)
+                        .completedTodos(List.of()).build());
+        when(runMapper.updateResumedTerminal(eq("run-1"), eq("user-1"),
+                eq(world.willfrog.agent.platform.model.AgentRunStatus.FAILED),
+                any(), any(), eq(true), any(), eq("token-1"), eq(3L), eq("owner-1")))
+                .thenReturn(0);
+        clearInvocations(messageService, settlementService, finalizationService, events);
         assertThat(pipeline.executeResumedRun(run, context, () -> true)).isFalse();
+        verify(messageService, never()).createAssistantMessage(any(), any(), any());
+        verify(settlementService, never()).settleAsync(any(), any());
+        verify(finalizationService, never()).publishFinalizedEvent(any(), any(), any());
+        verify(events, never()).append(eq("run-1"), eq("user-1"),
+                eq("WORKFLOW_FAILED"), any());
+
+        when(linear.resumePlanned(any(), any(), any(), any())).thenReturn(
+                LangchainLinearWorkflowResult.builder()
+                        .success(true).finalAnswer("throwing-write").plan(plan)
+                        .completedTodos(List.of()).build());
+        when(runMapper.updateResumedTerminal(eq("run-1"), eq("user-1"),
+                eq(world.willfrog.agent.platform.model.AgentRunStatus.COMPLETED),
+                any(), any(), eq(true), isNull(), eq("token-1"), eq(3L), eq("owner-1")))
+                .thenThrow(new IllegalStateException("db-write-failed"));
+        assertThat(pipeline.executeResumedRun(run, context, () -> true)).isFalse();
+        verify(runMapper, never()).updatePlanJson(any(), any(), any());
+        verify(runMapper, never()).updateSnapshot(any(), any(), any(), any(), anyBoolean(), any());
     }
 }

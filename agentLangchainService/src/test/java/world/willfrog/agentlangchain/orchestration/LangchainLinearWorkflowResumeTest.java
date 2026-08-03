@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.dataanalysis.CompletedTodoRecord;
+import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingException;
 import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 import world.willfrog.agent.workflow.TodoItem;
@@ -164,6 +165,69 @@ class LangchainLinearWorkflowResumeTest {
         ArgumentCaptor<TodoItem> executed = ArgumentCaptor.forClass(TodoItem.class);
         verify(nodeExecutor, times(1)).execute(any(), executed.capture(), any(), any(), any());
         assertThat(executed.getValue().getId()).isEqualTo("todo-3");
+        verifyNoInteractions(planner);
+    }
+
+    @Test
+    void consecutiveTwoLongPythonTodosConsumeFirstThenSuspendAtSecondWithSameFence() {
+        LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
+        LangchainTodoNodeExecutor nodeExecutor = mock(LangchainTodoNodeExecutor.class);
+        LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
+        when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
+        AtomicReference<String> resumeTokenSeenBySecondTool = new AtomicReference<>();
+        AtomicReference<Long> resumeVersionSeenBySecondTool = new AtomicReference<>();
+        when(nodeExecutor.execute(any(), any(), any(), any(), any()))
+                .thenAnswer(invocation -> {
+                    TodoItem todo = invocation.getArgument(1);
+                    assertThat(todo.getId()).isEqualTo("todo-3");
+                    resumeTokenSeenBySecondTool.set(AgentContext.getToolJobResumeToken());
+                    resumeVersionSeenBySecondTool.set(AgentContext.getToolJobResumeLeaseVersion());
+                    return LangchainTodoNodeResult.suspended(
+                            new ExternalToolJobPendingException(
+                                    "run-1", "python-call-2", 1, "second long python pending"));
+                });
+        LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
+                planner, nodeExecutor, guard, mock(AgentEventService.class));
+        LangchainTodoPlan plan = LangchainTodoPlan.builder()
+                .executionMode(PlanExecutionMode.LINEAR)
+                .items(List.of(item("todo-1", 1), item("todo-2", 2), item("todo-3", 3)))
+                .build();
+        CompletedTodoRecord prior = new CompletedTodoRecord();
+        prior.setTodoId("todo-1");
+        prior.setSequence(1);
+        prior.setDescription("todo-1-description");
+        prior.setOutput("prior-output");
+        ToolJobResumeContext context = new ToolJobResumeContext();
+        context.setRunId("run-1");
+        context.setTodoId("todo-2");
+        context.setResumeToken("python-token-1");
+        context.setResumeLeaseVersion(11L);
+        context.setResumeLauncherOwnerId("owner-1");
+        context.setCompletedTodos(List.of(prior));
+        context.setToolCallsUsed(5);
+        context.setTerminalSuccess(true);
+        context.setTerminalResultPreview("first-python-result");
+        AtomicInteger accepted = new AtomicInteger();
+
+        LangchainLinearWorkflowResult result = executor.resumePlanned(
+                request(), plan, context, () -> {
+                    accepted.incrementAndGet();
+                    return true;
+                });
+
+        assertThat(result.isSuspended()).isTrue();
+        assertThat(result.getSuspendedTodoId()).isEqualTo("todo-3");
+        assertThat(result.getPendingToolCallId()).isEqualTo("python-call-2");
+        assertThat(result.getPendingAttempt()).isEqualTo(1);
+        assertThat(result.getCompletedTodos()).extracting(LangchainCompletedTodo::getTodoId)
+                .containsExactly("todo-1", "todo-2");
+        assertThat(result.getCompletedTodos().get(1).displayOutput()).contains("first-python-result");
+        assertThat(accepted.get()).isEqualTo(1);
+        assertThat(context.isResultConsumed()).isTrue();
+        assertThat(context.getTodoId()).isEqualTo("todo-3");
+        assertThat(resumeTokenSeenBySecondTool.get()).isEqualTo("python-token-1");
+        assertThat(resumeVersionSeenBySecondTool.get()).isEqualTo(11L);
+        verify(nodeExecutor, times(1)).execute(any(), any(), any(), any(), any());
         verifyNoInteractions(planner);
     }
 

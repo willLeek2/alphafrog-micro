@@ -46,7 +46,7 @@ class ToolJobResumeLauncherImplTest {
         assertThat(consumed.get().getAsBoolean()).isTrue();
         verify(resumeService).markHandoffAccepted("run-1", context);
         completion.get().accept(true);
-        verify(resumeService).completeHandoff("run-1", "token-1", 7);
+        verify(resumeService).completeHandoff("run-1", "token-1", 7, "owner-1");
         assertThat(launcher.isActive("run-1", "token-1", 7)).isFalse();
     }
 
@@ -71,8 +71,31 @@ class ToolJobResumeLauncherImplTest {
         assertThat(launcher.launch("run-1", context())).isTrue();
         completion.get().accept(false);
 
-        verify(resumeService, never()).completeHandoff(any(), any(), anyLong());
+        verify(resumeService, never()).completeHandoff(any(), any(), anyLong(), any());
         assertThat(launcher.isActive("run-1", "token-1", 7)).isFalse();
+    }
+
+    @Test
+    void heartbeatKeepsOnlyClaimsStillOwnedInDatabase() {
+        AgentRunMapper runMapper = mock(AgentRunMapper.class);
+        LangchainLinearRunPipelineImpl pipeline = mock(LangchainLinearRunPipelineImpl.class);
+        @SuppressWarnings("unchecked")
+        ObjectProvider<ToolJobResumeService> provider = mock(ObjectProvider.class);
+        ToolJobResumeService resumeService = mock(ToolJobResumeService.class);
+        when(provider.getIfAvailable()).thenReturn(resumeService);
+        AgentRun run = new AgentRun();
+        run.setId("run-1");
+        when(runMapper.findById("run-1")).thenReturn(run);
+        when(pipeline.launchResumedAsync(eq(run), any(), any(), any())).thenReturn(true);
+        when(resumeService.heartbeat("run-1", "token-1", 7L, "owner-1"))
+                .thenReturn(true, false);
+        ToolJobResumeLauncherImpl launcher = new ToolJobResumeLauncherImpl(runMapper, pipeline, provider);
+
+        assertThat(launcher.launch("run-1", context())).isTrue();
+        launcher.heartbeatActiveClaims();
+        assertThat(launcher.isActive("run-1", "token-1", 7L)).isTrue();
+        launcher.heartbeatActiveClaims();
+        assertThat(launcher.isActive("run-1", "token-1", 7L)).isFalse();
     }
 
     private static ToolJobResumeContext context() {
@@ -81,6 +104,7 @@ class ToolJobResumeLauncherImplTest {
         context.setTodoId("todo-2");
         context.setResumeToken("token-1");
         context.setResumeLeaseVersion(7);
+        context.setResumeLauncherOwnerId("owner-1");
         return context;
     }
 }

@@ -12,8 +12,10 @@ import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
 
+import java.time.Instant;
 import java.util.Collections;
 import java.util.List;
+import java.util.UUID;
 
 /**
  * durable anchor 到新 Agent worker 之间的恢复租约状态机。
@@ -31,6 +33,7 @@ public class ToolJobResumeService {
     private final ToolJobRedisCache redisCache;
     private final ToolJobConfig config;
     private final ObjectMapper objectMapper;
+    private final String launcherOwnerId;
 
     @Autowired(required = false)
     private AgentRunDatasetRegistry datasetRegistry;
@@ -41,10 +44,17 @@ public class ToolJobResumeService {
     public ToolJobResumeService(ToolJobAnchorService anchorService,
                                 ToolJobRedisCache redisCache, ToolJobConfig config,
                                 ObjectMapper objectMapper) {
+        this(anchorService, redisCache, config, objectMapper, "resume-launcher-" + UUID.randomUUID());
+    }
+
+    ToolJobResumeService(ToolJobAnchorService anchorService,
+                         ToolJobRedisCache redisCache, ToolJobConfig config,
+                         ObjectMapper objectMapper, String launcherOwnerId) {
         this.anchorService = anchorService;
         this.redisCache = redisCache;
         this.config = config;
         this.objectMapper = objectMapper;
+        this.launcherOwnerId = launcherOwnerId;
     }
 
     public boolean tryResume(String runId) {
@@ -81,6 +91,10 @@ public class ToolJobResumeService {
     }
 
     private boolean launchFromReady(String runId, ToolJobAnchor anchor) {
+        if (resumeLauncher == null) {
+            log.warn("No resumeLauncher wired — cannot claim READY run={}", runId);
+            return false;
+        }
         // 在修改内存 anchor 前冻结 READY 的 token/version，作为 optimistic CAS 条件。
         String expectedToken = anchor.getResumeToken();
         long expectedVersion = anchor.getResumeLeaseVersion();
@@ -88,15 +102,16 @@ public class ToolJobResumeService {
         // 准备 READY→LAUNCHING；claim 时单调递增 version，使所有旧重放失效。
         anchor.setResumeState("LAUNCHING");
         anchor.setResumeLeaseVersion(expectedVersion + 1);
-        anchor.setResumeClaimedAt(java.time.Instant.now());
+        anchor.setResumeClaimedAt(Instant.now());
+        anchor.setResumeLauncherOwnerId(launcherOwnerId);
+        anchor.setResumeLauncherLeaseUntil(Instant.now().plusSeconds(leaseSeconds()));
 
-        // 只有一个进程能命中 READY + expectedToken + expectedVersion。
-        boolean claimed = anchor.isResultConsumed()
-                ? anchorService.casResumeStateAndStatus(
-                runId, anchor, AgentRunStatus.EXECUTING, AgentRunStatus.RECEIVED,
-                "READY", expectedToken, expectedVersion)
-                : anchorService.casResumeState(
-                runId, anchor, AgentRunStatus.RECEIVED, "READY", expectedToken, expectedVersion);
+        // owner 与数据库时间 lease 和 token/version 在同一条 CAS 中落稳。
+        boolean claimed = anchorService.claimResumeLauncher(
+                runId, anchor,
+                anchor.isResultConsumed() ? AgentRunStatus.EXECUTING : AgentRunStatus.RECEIVED,
+                AgentRunStatus.RECEIVED, expectedToken, expectedVersion,
+                launcherOwnerId, leaseSeconds());
         if (!claimed) {
             log.info("Resume CAS READY→LAUNCHING failed for run={}", runId);
             return false;
@@ -125,6 +140,8 @@ public class ToolJobResumeService {
         anchor.setResumeState("READY");
         anchor.setResumeLeaseVersion(nextVersion);
         anchor.setResumeClaimedAt(null);
+        anchor.setResumeLauncherOwnerId(null);
+        anchor.setResumeLauncherLeaseUntil(null);
         // 只回滚自己持有的 LAUNCHING claim；若所有权已变则 rows=0 并退场。
         if (anchor.isResultConsumed()) {
             anchorService.casResumeStateAndStatus(
@@ -138,70 +155,44 @@ public class ToolJobResumeService {
 
     private boolean reenterLaunching(String runId, ToolJobAnchor anchor) {
         log.info("Re-entering LAUNCHING resume for run={}", runId);
-
-        // 只有 claim 超过 TTL 且本进程 launcher 也报告 inactive，才能判定为崩溃遗留。
-        if (anchor.getResumeClaimedAt() != null) {
-            // claimedAt 是 durable 时间，因此进程重启后仍能计算 staleDeadline。
-            long staleDeadline = anchor.getResumeClaimedAt().toEpochMilli()
-                    + config.getLaunchingStaleSeconds() * 1000;
-            if (System.currentTimeMillis() > staleDeadline) {
-                long claimedVersion = anchor.getResumeLeaseVersion();
-                String claimedToken = anchor.getResumeToken();
-                // TTL 只是诊断阈值；本地任务仍 active 时不能抢走其租约。
-                if (resumeLauncher != null && resumeLauncher.isActive(runId, claimedToken, claimedVersion)) {
-                    log.info("LAUNCHING claim past TTL but launcher still active for run={} token={} v{}",
-                            runId, claimedToken, claimedVersion);
-                    return false; // don't roll back — launcher is still running
-                }
-                log.warn("LAUNCHING claim stale for run={}, claimedAt={}, rolling back to READY",
-                        runId, anchor.getResumeClaimedAt());
-                // 确认 stale 后生成新 token 并递增 version，彻底 fence 旧 launcher。
-                anchor.setResumeState("READY");
-                anchor.setResumeLeaseVersion(claimedVersion + 1);
-                anchor.setResumeToken(java.util.UUID.randomUUID().toString());
-                anchor.setResumeClaimedAt(null);
-                if (anchor.isResultConsumed()) {
-                    // 已消费 handoff 的 resumed worker 运行在 EXECUTING；回滚 READY 时必须同时
-                    // 恢复 RECEIVED，否则 READY 会落在扫描器无法再次 claim 的状态中。
-                    anchorService.casResumeStateAndStatus(
-                            runId, anchor, AgentRunStatus.RECEIVED, AgentRunStatus.EXECUTING,
-                            "LAUNCHING", claimedToken, claimedVersion);
-                } else {
-                    anchorService.casResumeState(runId, anchor, AgentRunStatus.RECEIVED, "LAUNCHING",
-                            claimedToken, claimedVersion);
-                }
-                // 本轮不直接递归 launch；下一次扫描按新 READY 正常竞争。
-                return false;
-            }
-        }
-
-        // 未过期 LAUNCHING 允许重复调用 launcher；其 activeClaims 按 token/version 幂等。
-        if (!restoreDatasetRegistry(runId, anchor)) {
-            log.error("Dataset restore failed on LAUNCHING reentry for run={}, will retry", runId);
-            return false;
-        }
         if (resumeLauncher == null) {
             log.warn("No resumeLauncher wired — cannot recover LAUNCHING run={}", runId);
             return false;
         }
-        // 从同一 LAUNCHING anchor 重建完全相同的恢复上下文。
-        ToolJobResumeContext ctx = buildResumeContext(runId, anchor);
-        try {
-            return resumeLauncher.launch(runId, ctx);
-        } catch (Exception e) {
-            log.error("Re-launch threw for run={}, will retry", runId, e);
+        // 未过期的持久化 lease 无论属于本实例还是别的实例，都不能重复提交 pipeline。
+        if (!launcherLeaseExpired(anchor, Instant.now())) {
             return false;
         }
+
+        String expectedToken = anchor.getResumeToken();
+        long expectedVersion = anchor.getResumeLeaseVersion();
+        String expectedOwnerId = anchor.getResumeLauncherOwnerId();
+        anchor.setResumeToken(UUID.randomUUID().toString());
+        anchor.setResumeLeaseVersion(expectedVersion + 1);
+        anchor.setResumeClaimedAt(Instant.now());
+        anchor.setResumeLauncherOwnerId(launcherOwnerId);
+        anchor.setResumeLauncherLeaseUntil(Instant.now().plusSeconds(leaseSeconds()));
+        AgentRunStatus expectedStatus = anchor.isResultConsumed()
+                ? AgentRunStatus.EXECUTING : AgentRunStatus.RECEIVED;
+        if (!anchorService.takeoverExpiredResumeLauncher(
+                runId, anchor, expectedStatus, expectedToken, expectedVersion,
+                expectedOwnerId, launcherOwnerId, leaseSeconds(), legacyStaleSeconds())) {
+            // 数据库时间仍未过期，或另一个实例已经先赢得 takeover。
+            return false;
+        }
+
+        if (!restoreDatasetRegistry(runId, anchor)) {
+            log.error("Dataset restore failed after LAUNCHING takeover for run={}, rolling back", runId);
+            rollbackToReady(runId, anchor, expectedVersion,
+                    anchor.getResumeToken(), anchor.getResumeLeaseVersion());
+            return false;
+        }
+        return doLaunch(runId, anchor, expectedVersion,
+                anchor.getResumeToken(), anchor.getResumeLeaseVersion());
     }
 
     private boolean doLaunch(String runId, ToolJobAnchor anchor,
                               long originalVersion, String claimedToken, long claimedVersion) {
-        // launcher 未装配时不能丢弃 claim，回滚为新版本 READY 供后续恢复。
-        if (resumeLauncher == null) {
-            log.warn("No resumeLauncher wired — rolling back run={}", runId);
-            rollbackToReady(runId, anchor, originalVersion, claimedToken, claimedVersion);
-            return false;
-        }
         // 只从已 claim 的 durable anchor 构建 context，不读取旧 worker 内存。
         ToolJobResumeContext ctx = buildResumeContext(runId, anchor);
         try {
@@ -269,6 +260,8 @@ public class ToolJobResumeService {
         if (runId == null || runId.isBlank() || context == null || !runId.equals(context.getRunId())
                 || context.getResumeToken() == null || context.getResumeToken().isBlank()
                 || context.getResumeLeaseVersion() <= 0 || !context.isResultConsumed()
+                || context.getResumeLauncherOwnerId() == null
+                || !launcherOwnerId.equals(context.getResumeLauncherOwnerId())
                 || context.getTodoId() == null || context.getTodoId().isBlank()
                 || context.getCompletedTodos() == null) {
             return false;
@@ -277,7 +270,8 @@ public class ToolJobResumeService {
         ToolJobAnchor anchor = anchorService.loadAnchor(runId);
         if (anchor == null || !"LAUNCHING".equals(anchor.getResumeState())
                 || !context.getResumeToken().equals(anchor.getResumeToken())
-                || context.getResumeLeaseVersion() != anchor.getResumeLeaseVersion()) {
+                || context.getResumeLeaseVersion() != anchor.getResumeLeaseVersion()
+                || !context.getResumeLauncherOwnerId().equals(anchor.getResumeLauncherOwnerId())) {
             return false;
         }
         try {
@@ -292,11 +286,12 @@ public class ToolJobResumeService {
         anchor.setSequence(context.getTodoSequence());
         anchor.setToolCallsUsed(context.getToolCallsUsed());
         anchor.setResultConsumed(true);
+        anchor.setResumeLauncherLeaseUntil(Instant.now().plusSeconds(leaseSeconds()));
         // 同一条 CAS 持久化“结果已接受”并把 Run 从 RECEIVED 恢复为 EXECUTING。
         // 旧 LAUNCHING anchor 继续保留，直到最终结果落稳或被下一次 PREPARING 精确替换。
-        boolean accepted = anchorService.casResumeStateAndStatus(
-                runId, anchor, AgentRunStatus.EXECUTING, AgentRunStatus.RECEIVED,
-                "LAUNCHING", context.getResumeToken(), context.getResumeLeaseVersion());
+        boolean accepted = anchorService.acceptResumeHandoff(
+                runId, anchor, context.getResumeToken(), context.getResumeLeaseVersion(),
+                context.getResumeLauncherOwnerId(), leaseSeconds());
         if (accepted) {
             // 先有 PostgreSQL 真相再清旧 Redis 派生项；恢复扫描可直接从 PG 重建。
             try {
@@ -315,7 +310,7 @@ public class ToolJobResumeService {
      * returned from durable result/checkpoint persistence. A later suspension
      * has a different state/token/version and is therefore never cleared here.
      */
-    public boolean completeHandoff(String runId, String token, long version) {
+    public boolean completeHandoff(String runId, String token, long version, String ownerId) {
         // pipeline 回调只允许清理自己最初提交的旧 claim。
         ToolJobAnchor anchor = anchorService.loadAnchor(runId);
         if (anchor == null) {
@@ -325,11 +320,12 @@ public class ToolJobResumeService {
         // 若恢复执行再次挂起，anchor 已换 state/token/version；这里必须返回 false 且绝不清理。
         if (!"LAUNCHING".equals(anchor.getResumeState()) || !anchor.isResultConsumed()
                 || token == null || !token.equals(anchor.getResumeToken())
-                || version != anchor.getResumeLeaseVersion()) {
+                || version != anchor.getResumeLeaseVersion()
+                || ownerId == null || !ownerId.equals(anchor.getResumeLauncherOwnerId())) {
             return false;
         }
         // DB token-gated clear 是最终 durable gate。
-        if (!anchorService.clearAnchorWithToken(runId, "LAUNCHING", token, version)) {
+        if (!anchorService.clearAcceptedResumeHandoff(runId, token, version, ownerId)) {
             return false;
         }
         // DB 已清理后再删除 Redis 辅助状态。
@@ -370,6 +366,7 @@ public class ToolJobResumeService {
         // 当前 claim 的 token/version 会贯穿 launcher 去重、handoff CAS 和最终清理。
         ctx.setResumeToken(anchor.getResumeToken());
         ctx.setResumeLeaseVersion(anchor.getResumeLeaseVersion());
+        ctx.setResumeLauncherOwnerId(anchor.getResumeLauncherOwnerId());
         // 还原不再执行的 Todo 前缀和 dataset 快照。
         ctx.setCompletedTodos(parseCompletedTodos(anchor.getCompletedTodosJson()));
         ctx.setDatasetSnapshotJson(anchor.getDatasetSnapshotJson());
@@ -382,6 +379,36 @@ public class ToolJobResumeService {
         // crash reentry 时该标记决定从当前挂起节点还是下一节点继续。
         ctx.setResultConsumed(anchor.isResultConsumed());
         return ctx;
+    }
+
+    public boolean heartbeat(String runId, String token, long version, String ownerId) {
+        if (!launcherOwnerId.equals(ownerId)) {
+            return false;
+        }
+        return anchorService.heartbeatResumeLauncher(
+                runId, token, version, ownerId, leaseSeconds());
+    }
+
+    String launcherOwnerId() {
+        return launcherOwnerId;
+    }
+
+    private boolean launcherLeaseExpired(ToolJobAnchor anchor, Instant now) {
+        if (anchor.getResumeLauncherLeaseUntil() != null) {
+            return !anchor.getResumeLauncherLeaseUntil().isAfter(now);
+        }
+        // 旧 anchor 没有持久化 launcher lease 时，沿用 claimedAt stale 窗口再尝试数据库 takeover。
+        return anchor.getResumeClaimedAt() == null
+                || !anchor.getResumeClaimedAt().plusSeconds(legacyStaleSeconds()).isAfter(now);
+    }
+
+    private long leaseSeconds() {
+        long configured = config.getResumeLauncherLeaseSeconds();
+        return configured > 0 ? configured : Math.max(1L, config.getLaunchingStaleSeconds());
+    }
+
+    private long legacyStaleSeconds() {
+        return Math.max(1L, config.getLaunchingStaleSeconds());
     }
 
     List<CompletedTodoRecord> parseCompletedTodos(String json) {

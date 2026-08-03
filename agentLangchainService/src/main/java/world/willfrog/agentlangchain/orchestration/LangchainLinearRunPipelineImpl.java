@@ -575,7 +575,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             LangchainLinearWorkflowResult result = linearWorkflowExecutor.resumePlanned(
                     workflowRequest, plan, resumeContext, terminalConsumed);
             // 只有结果成功写入 DB，launcher 才能完成消费确认并清理 anchor。
-            return persistResumedResult(run, userGoal, stageModels, result);
+            return persistResumedResult(run, userGoal, stageModels, result, resumeContext);
         } catch (Exception e) {
             // 恢复异常也要尝试持久化为可见失败，不能只依赖当前进程日志。
             log.error("Resumed LangChain run failed: runId={}", runId, e);
@@ -585,7 +585,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                                 .success(false)
                                 .failureReason(e.getMessage())
                                 .toolCallsUsed(resumeContext.getToolCallsUsed())
-                                .build(), e);
+                                .build(), e, resumeContext);
             } catch (Exception persistEx) {
                 // 失败本身未持久化时返回 false，保留 LAUNCHING claim 供 reconciler 重入。
                 log.error("Resumed failure could not be persisted runId={}", runId, persistEx);
@@ -610,7 +610,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
     private boolean persistResumedResult(AgentRun run,
                                          String userGoal,
                                          LangchainRunStageModelResolver.StageModels stageModels,
-                                         LangchainLinearWorkflowResult result) {
+                                         LangchainLinearWorkflowResult result,
+                                         ToolJobResumeContext resumeContext) {
         String runId = run.getId();
         String userId = run.getUserId();
         // 恢复过程中还可能再次遇到另一个长工具，因此允许二次挂起。
@@ -640,15 +641,13 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         if (result.isInterrupted() || abortIfStopped(runId, userId, "resume_before_persist")) {
             return hasDurableStopState(runId);
         }
-        // plan 仍写回原值，确保恢复后的快照与首次执行路径结构一致。
-        runMapper.updatePlanJson(runId, userId, writeJson(result.getPlan()));
         if (result.isSuccess()) {
             // 先持久化 COMPLETED 快照；事件、消息和结算属于可重试副作用。
             String snapshot = attachObservability(runId,
                     buildSnapshot(userGoal, result, AgentRunStatus.COMPLETED),
                     AgentRunStatus.COMPLETED, null, null);
-            if (runMapper.updateSnapshot(runId, userId, AgentRunStatus.COMPLETED,
-                    snapshot, true, null) != 1) {
+            if (persistResumedTerminal(runId, userId, AgentRunStatus.COMPLETED,
+                    result, snapshot, null, resumeContext) != 1) {
                 // DB 没接受写入就返回 false，不能清理恢复 anchor。
                 log.warn("Resumed COMPLETED snapshot was not persisted for run={}", runId);
                 return false;
@@ -676,8 +675,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         if (result.isPartial()) {
             String snapshot = attachObservability(runId, buildPartialSnapshot(userGoal, result),
                     AgentRunStatus.PARTIAL, null, result.getFailureReason());
-            if (runMapper.updateSnapshot(runId, userId, AgentRunStatus.PARTIAL, snapshot, true,
-                    result.getFailureReason()) != 1) {
+            if (persistResumedTerminal(runId, userId, AgentRunStatus.PARTIAL,
+                    result, snapshot, result.getFailureReason(), resumeContext) != 1) {
                 log.warn("Resumed PARTIAL snapshot was not persisted for run={}", runId);
                 return false;
             }
@@ -708,7 +707,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             log.warn("Resume result consume failed for run={}, leaving claim for retry", runId);
             return false;
         }
-        boolean durable = publishResumedFailure(runId, userId, userGoal, result, null);
+        boolean durable = publishResumedFailure(
+                runId, userId, userGoal, result, null, resumeContext);
         if (durable) {
             tryScheduleSettlement(runId, userId);
         }
@@ -1066,15 +1066,16 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                                 String userGoal,
                                 LangchainLinearWorkflowResult result,
                                 Throwable throwable) {
-        publishFailureInternal(runId, userId, userGoal, result, throwable, false);
+        publishFailureInternal(runId, userId, userGoal, result, throwable, null);
     }
 
     private boolean publishResumedFailure(String runId,
                                           String userId,
                                           String userGoal,
                                           LangchainLinearWorkflowResult result,
-                                          Throwable throwable) {
-        return publishFailureInternal(runId, userId, userGoal, result, throwable, true);
+                                          Throwable throwable,
+                                          ToolJobResumeContext resumeContext) {
+        return publishFailureInternal(runId, userId, userGoal, result, throwable, resumeContext);
     }
 
     private boolean publishFailureInternal(String runId,
@@ -1082,7 +1083,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                                            String userGoal,
                                            LangchainLinearWorkflowResult result,
                                            Throwable throwable,
-                                           boolean requireDurableWrite) {
+                                           ToolJobResumeContext resumeContext) {
+        boolean requireDurableWrite = resumeContext != null;
         if (abortIfStopped(runId, userId, "before_failure_persist")) {
             return !requireDurableWrite || hasDurableStopState(runId);
         }
@@ -1103,14 +1105,21 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 buildSnapshot(userGoal, result, AgentRunStatus.FAILED),
                 AgentRunStatus.FAILED,
                 decision.getObservabilityFailureType(),
-                decision.getReason());
-        int updated = runMapper.updateSnapshot(runId, userId, AgentRunStatus.FAILED,
+                requireDurableWrite ? null : decision.getReason());
+        int updated = requireDurableWrite
+                ? persistResumedTerminal(runId, userId, AgentRunStatus.FAILED,
+                result, snapshot, decision.getReason(), resumeContext)
+                : runMapper.updateSnapshot(runId, userId, AgentRunStatus.FAILED,
                 snapshot, true, decision.getReason());
         if (requireDurableWrite && updated != 1) {
             log.warn("FAILED snapshot was not persisted for run={}", runId);
             return false;
         }
         try {
+            if (requireDurableWrite) {
+                recordObservabilityFailure(runId,
+                        decision.getObservabilityFailureType(), decision.getReason());
+            }
             markRunStatus(runId, AgentRunStatus.FAILED);
             // 260618-workspace-v0: 触发终态事件
             finalizationService.publishFinalizedEvent(runId, userId, AgentRunStatus.FAILED.name());
@@ -1140,6 +1149,41 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                     runId, sideEffect.getMessage());
         }
         return true;
+    }
+
+    private int persistResumedTerminal(String runId,
+                                       String userId,
+                                       AgentRunStatus status,
+                                       LangchainLinearWorkflowResult result,
+                                       String snapshot,
+                                       String lastError,
+                                       ToolJobResumeContext resumeContext) {
+        if (resumeContext == null || resumeContext.getResumeToken() == null
+                || resumeContext.getResumeToken().isBlank()
+                || resumeContext.getResumeLeaseVersion() <= 0
+                || resumeContext.getResumeLauncherOwnerId() == null
+                || resumeContext.getResumeLauncherOwnerId().isBlank()) {
+            return 0;
+        }
+        String planJson = result == null || result.getPlan() == null
+                ? null : writeJson(result.getPlan());
+        return runMapper.updateResumedTerminal(
+                runId, userId, status, planJson, snapshot, true, lastError,
+                resumeContext.getResumeToken(), resumeContext.getResumeLeaseVersion(),
+                resumeContext.getResumeLauncherOwnerId());
+    }
+
+    private void recordObservabilityFailure(String runId,
+                                            String failureType,
+                                            String failureReason) {
+        AgentObservabilityService observabilityService = observabilityServiceProvider.getIfAvailable();
+        if (observabilityService == null || isBlank(failureReason)) {
+            return;
+        }
+        observabilityService.recordFailure(
+                runId,
+                isBlank(failureType) ? "WorkflowFailed" : failureType,
+                failureReason);
     }
 
     private void tryScheduleSettlement(String runId, String userId) {

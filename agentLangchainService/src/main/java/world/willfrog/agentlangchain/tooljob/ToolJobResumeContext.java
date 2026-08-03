@@ -27,6 +27,8 @@ public class ToolJobResumeContext {
     private String resumeToken;
     // resumeLeaseVersion 每次重新 claim 都递增，与 token 共同构成 fencing 条件。
     private long resumeLeaseVersion;
+    // resumeLauncherOwnerId 绑定取得数据库租约的 launcher 实例，终态写入还会复核该 owner。
+    private String resumeLauncherOwnerId;
     // completedTodos 是挂起前已经落稳的工作流前缀，恢复后不会重复执行。
     private List<CompletedTodoRecord> completedTodos = Collections.emptyList();
     // datasetSnapshotJson 保存 run 级数据集编号到真实引用的映射。
@@ -60,6 +62,9 @@ public class ToolJobResumeContext {
 
     public long getResumeLeaseVersion() { return resumeLeaseVersion; }
     public void setResumeLeaseVersion(long resumeLeaseVersion) { this.resumeLeaseVersion = resumeLeaseVersion; }
+
+    public String getResumeLauncherOwnerId() { return resumeLauncherOwnerId; }
+    public void setResumeLauncherOwnerId(String resumeLauncherOwnerId) { this.resumeLauncherOwnerId = resumeLauncherOwnerId; }
 
     public List<CompletedTodoRecord> getCompletedTodos() { return completedTodos; }
     public void setCompletedTodos(List<CompletedTodoRecord> completedTodos) { this.completedTodos = completedTodos; }

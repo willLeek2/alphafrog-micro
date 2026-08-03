@@ -166,6 +166,17 @@ class ToolJobAnchorMapperIntegrationTest {
         }
     }
 
+    private static void updateUserId(String id, String userId) throws Exception {
+        DataSource ds = dataSource();
+        try (Connection conn = ds.getConnection();
+             var ps = conn.prepareStatement(
+                     "UPDATE alphafrog_agent_run SET user_id = ? WHERE id = ?")) {
+            ps.setString(1, userId);
+            ps.setString(2, id);
+            ps.executeUpdate();
+        }
+    }
+
     // ========== updateToolJobCheckpoint: atomic merge CAS ==========
 
     @Test
@@ -581,16 +592,17 @@ class ToolJobAnchorMapperIntegrationTest {
         insertRun("run-resume-dispatch", "RECEIVED", """
             {"operationId":"run-resume-dispatch:call-1:1","anchorState":"TERMINAL",
              "resumeState":"LAUNCHING","resumeToken":"resume-token","resumeLeaseVersion":4,
-             "resultConsumed":false}""");
+             "resumeLauncherOwnerId":"owner-1",
+             "resumeLauncherLeaseUntil":"2999-01-01T00:00:00Z","resultConsumed":false}""");
         AgentRunMapper mapper = newMapper();
         String accepted = """
             {"operationId":"run-resume-dispatch:call-1:1","anchorState":"TERMINAL",
              "resumeState":"LAUNCHING","resumeToken":"resume-token","resumeLeaseVersion":4,
-             "resultConsumed":true}""";
-        assertThat(mapper.casUpdateAnchorResumeStateAndStatus(
-                "run-resume-dispatch", accepted,
-                AgentRunStatus.EXECUTING, AgentRunStatus.RECEIVED,
-                "LAUNCHING", "resume-token", 4L)).isEqualTo(1);
+             "resumeLauncherOwnerId":"owner-1",
+             "resumeLauncherLeaseUntil":"2999-01-01T00:00:00Z","resultConsumed":true}""";
+        assertThat(mapper.acceptResumeHandoff(
+                "run-resume-dispatch", accepted, "resume-token", 4L, "owner-1", 30L))
+                .isEqualTo(1);
         assertThat(mapper.findById("run-resume-dispatch").getStatus())
                 .isEqualTo(AgentRunStatus.EXECUTING);
 
@@ -608,19 +620,99 @@ class ToolJobAnchorMapperIntegrationTest {
     }
 
     @Test
-    void acceptedExecutingHandoffUsesResumeScanNotActiveDispatchScan() throws Exception {
+    void acceptedExecutingHandoffWithLiveLeaseIsNotRequeuedOrTreatedAsDispatch() throws Exception {
         insertRun("run-resume-scan", "EXECUTING", """
             {"operationId":"run-resume-scan:call-1:1","anchorState":"TERMINAL",
              "resumeState":"LAUNCHING","resumeToken":"scan-token","resumeLeaseVersion":8,
+             "resumeLauncherOwnerId":"owner-live",
+             "resumeLauncherLeaseUntil":"2999-01-01T00:00:00Z",
              "resultConsumed":true}""");
         AgentRunMapper mapper = newMapper();
 
         assertThat(mapper.listResumeReadyAnchors(10))
                 .extracting(AgentRun::getId)
-                .contains("run-resume-scan");
+                .doesNotContain("run-resume-scan");
         assertThat(mapper.listActiveToolJobAnchors(10))
                 .extracting(AgentRun::getId)
                 .doesNotContain("run-resume-scan");
+    }
+
+    @Test
+    void twoIndependentLaunchersOnlyFirstReadyClaimWins() throws Exception {
+        insertRun("run-resume-claim", "RECEIVED", """
+            {"resumeState":"READY","resumeToken":"ready-token","resumeLeaseVersion":1,
+             "resultConsumed":false}""");
+        String launchingA = """
+            {"resumeState":"LAUNCHING","resumeToken":"ready-token","resumeLeaseVersion":2,
+             "resumeLauncherOwnerId":"owner-a","resultConsumed":false}""";
+        String launchingB = """
+            {"resumeState":"LAUNCHING","resumeToken":"ready-token","resumeLeaseVersion":2,
+             "resumeLauncherOwnerId":"owner-b","resultConsumed":false}""";
+
+        assertThat(newMapper().claimResumeLauncher(
+                "run-resume-claim", launchingA,
+                AgentRunStatus.RECEIVED, AgentRunStatus.RECEIVED,
+                "ready-token", 1L, "owner-a", 30L)).isEqualTo(1);
+        assertThat(newMapper().claimResumeLauncher(
+                "run-resume-claim", launchingB,
+                AgentRunStatus.RECEIVED, AgentRunStatus.RECEIVED,
+                "ready-token", 1L, "owner-b", 30L)).isZero();
+
+        ToolJobAnchor claimed = ToolJobAnchor.fromJson(
+                newMapper().findById("run-resume-claim").getToolJobAnchorJson());
+        assertThat(claimed.getResumeLauncherOwnerId()).isEqualTo("owner-a");
+        assertThat(claimed.getResumeLeaseVersion()).isEqualTo(2L);
+        assertThat(claimed.getResumeLauncherLeaseUntil()).isNotNull();
+        assertThat(newMapper().listResumeReadyAnchors(10))
+                .extracting(AgentRun::getId)
+                .doesNotContain("run-resume-claim");
+    }
+
+    @Test
+    void expiredTakeoverRotatesLeaseAndFencesOldTerminalWriterAndCleanup() throws Exception {
+        insertRun("run-resume-takeover", "EXECUTING", """
+            {"operationId":"run-resume-takeover:call-1:1","anchorState":"TERMINAL",
+             "resumeState":"LAUNCHING","resumeToken":"token-old","resumeLeaseVersion":6,
+             "resumeLauncherOwnerId":"owner-old",
+             "resumeLauncherLeaseUntil":"2000-01-01T00:00:00Z","resultConsumed":true}""");
+        updateUserId("run-resume-takeover", "user-1");
+
+        AgentRunMapper mapper = newMapper();
+        assertThat(mapper.listResumeReadyAnchors(10))
+                .extracting(AgentRun::getId)
+                .contains("run-resume-takeover");
+        assertThat(mapper.heartbeatResumeLauncher(
+                "run-resume-takeover", "token-old", 6L, "owner-old", 30L)).isZero();
+        assertThat(mapper.clearAcceptedResumeHandoff(
+                "run-resume-takeover", "token-old", 6L, "owner-old")).isZero();
+
+        String takeover = """
+            {"operationId":"run-resume-takeover:call-1:1","anchorState":"TERMINAL",
+             "resumeState":"LAUNCHING","resumeToken":"token-new","resumeLeaseVersion":7,
+             "resumeLauncherOwnerId":"owner-new","resultConsumed":true}""";
+        assertThat(mapper.takeoverExpiredResumeLauncher(
+                "run-resume-takeover", takeover, AgentRunStatus.EXECUTING,
+                "token-old", 6L, "owner-old", "owner-new", 30L, 120L)).isEqualTo(1);
+
+        assertThat(mapper.updateResumedTerminal(
+                "run-resume-takeover", "user-1", AgentRunStatus.COMPLETED,
+                "{\"winner\":\"old\"}", "{\"status\":\"old\"}", true, null,
+                "token-old", 6L, "owner-old")).isZero();
+        assertThat(mapper.clearAcceptedResumeHandoff(
+                "run-resume-takeover", "token-old", 6L, "owner-old")).isZero();
+
+        assertThat(mapper.updateResumedTerminal(
+                "run-resume-takeover", "user-1", AgentRunStatus.COMPLETED,
+                "{\"winner\":\"new\"}", "{\"status\":\"COMPLETED\"}", true, null,
+                "token-new", 7L, "owner-new")).isEqualTo(1);
+        assertThat(mapper.clearAcceptedResumeHandoff(
+                "run-resume-takeover", "token-new", 7L, "owner-new")).isEqualTo(1);
+
+        AgentRun completed = mapper.findById("run-resume-takeover");
+        assertThat(completed.getStatus()).isEqualTo(AgentRunStatus.COMPLETED);
+        assertThat(completed.getPlanJson()).contains("new").doesNotContain("old");
+        assertThat(completed.getSnapshotJson()).contains("COMPLETED").doesNotContain("old");
+        assertThat(completed.getToolJobAnchorJson()).isEqualTo("{}");
     }
 
     @Test

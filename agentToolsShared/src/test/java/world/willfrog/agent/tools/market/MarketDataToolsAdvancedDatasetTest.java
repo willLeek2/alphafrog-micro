@@ -3,8 +3,10 @@ package world.willfrog.agent.tools.market;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.tools.dataset.DatasetManifest;
 import world.willfrog.agent.tools.dataset.DatasetRegistry;
 import world.willfrog.agent.tools.dataset.DatasetWriter;
 import world.willfrog.agent.tools.dataset.ManifestWriter;
@@ -17,6 +19,7 @@ import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.function.Function;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -45,6 +48,59 @@ import static org.mockito.Mockito.when;
  * </ul>
  */
 class MarketDataToolsAdvancedDatasetTest {
+
+    @Test
+    void directReadyCountMismatchMissRewritesManifestFromCurrentBatch() {
+        DatasetWriter datasetWriter = mock(DatasetWriter.class);
+        DatasetRegistry registry = mock(DatasetRegistry.class);
+        ManifestWriter manifestWriter = mock(ManifestWriter.class);
+        when(registry.isEnabled()).thenReturn(true);
+        when(manifestWriter.isEnabled()).thenReturn(true);
+        when(registry.findReusableManifest(
+                eq("stock_daily"), eq("20240101"), eq("20240131"),
+                eq(List.of("000001.SZ", "600519.SH")), eq(List.of("trade_date", "close")),
+                eq(List.of("ds-current-1", "ds-current-2"))))
+                .thenReturn(Optional.empty());
+        when(manifestWriter.writeManifest(
+                eq("stock_daily"), eq("20240101"), eq("20240131"),
+                anyList(), eq(3), eq(List.of("trade_date", "close"))))
+                .thenReturn("manifest-rewritten");
+        MarketDataTools tools = new MarketDataTools(
+                datasetWriter, registry, manifestWriter,
+                null, new AgentLlmProperties(), new ObjectMapper(),
+                mock(IndexWeightDao.class), mock(SwIndustryMemberDao.class));
+        ReflectionTestUtils.setField(tools, "emitManifest", true);
+        List<Map<String, Object>> results = List.of(
+                Map.of("ts_code", "000001.SZ", "ok", true,
+                        "data", Map.of("dataset_id", "ds-current-1", "rows", 1),
+                        "error", Map.of()),
+                Map.of("ts_code", "600519.SH", "ok", true,
+                        "data", Map.of("dataset_id", "ds-current-2", "rows", 2),
+                        "error", Map.of()));
+        Map<String, Object> data = new LinkedHashMap<>();
+
+        ReflectionTestUtils.invokeMethod(tools, "attachManifestIfEnabled",
+                "stock_daily", "20240101", "20240131",
+                List.of("000001.SZ", "600519.SH"), List.of("trade_date", "close"),
+                results, data);
+
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<DatasetManifest.ManifestMember>> membersCaptor =
+                ArgumentCaptor.forClass(List.class);
+        verify(manifestWriter).writeManifest(
+                eq("stock_daily"), eq("20240101"), eq("20240131"),
+                membersCaptor.capture(), eq(3), eq(List.of("trade_date", "close")));
+        assertEquals(List.of("ds-current-1", "ds-current-2"),
+                membersCaptor.getValue().stream()
+                        .map(DatasetManifest.ManifestMember::getDatasetId)
+                        .toList());
+        verify(registry).registerManifest(
+                eq("stock_daily"), eq("20240101"), eq("20240131"),
+                eq(List.of("000001.SZ", "600519.SH")), eq(List.of("trade_date", "close")),
+                eq("manifest-rewritten"), eq(2), eq(2), eq(0), eq(3));
+        assertEquals(List.of("ds-current-1", "ds-current-2"), data.get("dataset_ids"));
+        assertEquals("manifest-rewritten", data.get("manifest_id"));
+    }
 
     @Test
     @SuppressWarnings("unchecked")

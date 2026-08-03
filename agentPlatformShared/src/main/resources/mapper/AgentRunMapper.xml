@@ -736,8 +736,8 @@
     </select>
 
     <!--
-        结果已经 finalizer 到 RECEIVED 后，READY 表示待 claim；LAUNCHING 表示可能在 launch 前崩溃。
-        启动恢复会再次检查 lease 时间和 token，不会直接执行查询结果。
+        结果已经 finalizer 到 RECEIVED 后，READY 表示待 claim；LAUNCHING 只在持久化 lease
+        已过期或旧 anchor 没有 lease 时进入扫描。accepted EXECUTING handoff 使用同一规则。
     -->
     <select id="listResumeReadyAnchors" resultMap="AgentRunResultMap">
         SELECT id,
@@ -763,12 +763,27 @@
           AND (
                 (
                     status = 'RECEIVED'
-                    AND tool_job_anchor_json #>> '{resumeState}' IN ('READY', 'LAUNCHING')
+                    AND (
+                        tool_job_anchor_json #>> '{resumeState}' = 'READY'
+                        OR (
+                            tool_job_anchor_json #>> '{resumeState}' = 'LAUNCHING'
+                            AND (
+                                tool_job_anchor_json #>> '{resumeLauncherLeaseUntil}' IS NULL
+                                OR (tool_job_anchor_json #>> '{resumeLauncherLeaseUntil}')::timestamptz
+                                    &lt;= CURRENT_TIMESTAMP
+                            )
+                        )
+                    )
                 )
                 OR (
                     status = 'EXECUTING'
                     AND tool_job_anchor_json #>> '{resumeState}' = 'LAUNCHING'
                     AND COALESCE((tool_job_anchor_json #>> '{resultConsumed}')::boolean, false)
+                    AND (
+                        tool_job_anchor_json #>> '{resumeLauncherLeaseUntil}' IS NULL
+                        OR (tool_job_anchor_json #>> '{resumeLauncherLeaseUntil}')::timestamptz
+                            &lt;= CURRENT_TIMESTAMP
+                    )
                 )
               )
         ORDER BY updated_at ASC
@@ -800,6 +815,146 @@
           AND tool_job_anchor_json #>> '{resumeState}' = #{expectedResumeState}
           AND tool_job_anchor_json #>> '{resumeToken}' = #{expectedResumeToken}
           AND (tool_job_anchor_json #>> '{resumeLeaseVersion}')::bigint = #{expectedLeaseVersion}
+    </update>
+
+    <!--
+        READY→LAUNCHING 的数据库 claim。owner、claimedAt 和 leaseUntil 与 token/version
+        在同一条 UPDATE 中写入，另一个实例不能只凭自己的 JVM 本地状态重复启动。
+    -->
+    <update id="claimResumeLauncher">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = CAST(#{toolJobAnchorJson} AS jsonb)
+                || jsonb_build_object(
+                    'resumeLauncherOwnerId', #{launcherOwnerId}::text,
+                    'resumeClaimedAt', CURRENT_TIMESTAMP,
+                    'resumeLauncherLeaseUntil',
+                        CURRENT_TIMESTAMP + make_interval(secs => #{leaseSeconds})
+                ),
+            status = #{newStatus},
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status = #{expectedStatus}
+          AND tool_job_anchor_json #>> '{resumeState}' = 'READY'
+          AND tool_job_anchor_json #>> '{resumeToken}' = #{expectedResumeToken}
+          AND (tool_job_anchor_json #>> '{resumeLeaseVersion}')::bigint = #{expectedLeaseVersion}
+    </update>
+
+    <!--
+        LAUNCHING takeover 由数据库时间判定。新 owner 直接旋转 token/version 并取得新 lease；
+        旧 owner 之后的 heartbeat、accepted handoff 和 terminal write 都会因身份不匹配返回 0。
+        旧版本 anchor 没有 launcher lease 时，仍要求 claimedAt 超过 legacy stale 窗口。
+    -->
+    <update id="takeoverExpiredResumeLauncher">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = CAST(#{toolJobAnchorJson} AS jsonb)
+                || jsonb_build_object(
+                    'resumeLauncherOwnerId', #{launcherOwnerId}::text,
+                    'resumeClaimedAt', CURRENT_TIMESTAMP,
+                    'resumeLauncherLeaseUntil',
+                        CURRENT_TIMESTAMP + make_interval(secs => #{leaseSeconds})
+                ),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status = #{expectedStatus}
+          AND tool_job_anchor_json #>> '{resumeState}' = 'LAUNCHING'
+          AND tool_job_anchor_json #>> '{resumeToken}' = #{expectedResumeToken}
+          AND (tool_job_anchor_json #>> '{resumeLeaseVersion}')::bigint = #{expectedLeaseVersion}
+          AND (tool_job_anchor_json #>> '{resumeLauncherOwnerId}')
+                IS NOT DISTINCT FROM #{expectedLauncherOwnerId,jdbcType=VARCHAR}
+          AND (
+                (
+                    tool_job_anchor_json #>> '{resumeLauncherLeaseUntil}' IS NOT NULL
+                    AND (tool_job_anchor_json #>> '{resumeLauncherLeaseUntil}')::timestamptz
+                        &lt;= CURRENT_TIMESTAMP
+                )
+                OR (
+                    tool_job_anchor_json #>> '{resumeLauncherLeaseUntil}' IS NULL
+                    AND (
+                        tool_job_anchor_json #>> '{resumeClaimedAt}' IS NULL
+                        OR (tool_job_anchor_json #>> '{resumeClaimedAt}')::timestamptz
+                            &lt;= CURRENT_TIMESTAMP - make_interval(secs => #{legacyStaleSeconds})
+                    )
+                )
+              )
+    </update>
+
+    <!-- 窄续租只更新 leaseUntil，避免覆盖 accepted handoff 或新 PREPARING checkpoint。 -->
+    <update id="heartbeatResumeLauncher">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = jsonb_set(
+                    tool_job_anchor_json,
+                    '{resumeLauncherLeaseUntil}',
+                    to_jsonb(CURRENT_TIMESTAMP + make_interval(secs => #{leaseSeconds})),
+                    true
+                ),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status IN ('RECEIVED', 'EXECUTING')
+          AND tool_job_anchor_json #>> '{resumeState}' = 'LAUNCHING'
+          AND tool_job_anchor_json #>> '{resumeToken}' = #{expectedResumeToken}
+          AND (tool_job_anchor_json #>> '{resumeLeaseVersion}')::bigint = #{expectedLeaseVersion}
+          AND tool_job_anchor_json #>> '{resumeLauncherOwnerId}' = #{expectedLauncherOwnerId}
+          AND (tool_job_anchor_json #>> '{resumeLauncherLeaseUntil}')::timestamptz
+                &gt; CURRENT_TIMESTAMP
+    </update>
+
+    <!-- 首次终态消费把 Run 与 accepted handoff 一次推进到 EXECUTING。 -->
+    <update id="acceptResumeHandoff">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = CAST(#{toolJobAnchorJson} AS jsonb)
+                || jsonb_build_object(
+                    'resumeLauncherOwnerId', #{expectedLauncherOwnerId}::text,
+                    'resumeLauncherLeaseUntil',
+                        CURRENT_TIMESTAMP + make_interval(secs => #{leaseSeconds})
+                ),
+            status = 'EXECUTING',
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status = 'RECEIVED'
+          AND tool_job_anchor_json #>> '{resumeState}' = 'LAUNCHING'
+          AND NOT COALESCE((tool_job_anchor_json #>> '{resultConsumed}')::boolean, false)
+          AND tool_job_anchor_json #>> '{resumeToken}' = #{expectedResumeToken}
+          AND (tool_job_anchor_json #>> '{resumeLeaseVersion}')::bigint = #{expectedLeaseVersion}
+          AND tool_job_anchor_json #>> '{resumeLauncherOwnerId}' = #{expectedLauncherOwnerId}
+          AND (tool_job_anchor_json #>> '{resumeLauncherLeaseUntil}')::timestamptz
+                &gt; CURRENT_TIMESTAMP
+    </update>
+
+    <!--
+        resumed 终态唯一写入口：accepted handoff 身份仍有效时，才原子写 plan/status/snapshot。
+        rows=0 表示 worker 已失去租约；调用方必须停止全部终态副作用。
+    -->
+    <update id="updateResumedTerminal">
+        UPDATE alphafrog_agent_run
+        SET plan_json = COALESCE(CAST(#{planJson} AS jsonb), plan_json),
+            status = #{status},
+            snapshot_json = CAST(#{snapshotJson} AS jsonb),
+            completed_at = CASE WHEN #{completed} THEN CURRENT_TIMESTAMP ELSE completed_at END,
+            last_error = #{lastError},
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND user_id = #{userId}
+          AND status = 'EXECUTING'
+          AND tool_job_anchor_json #>> '{resumeState}' = 'LAUNCHING'
+          AND COALESCE((tool_job_anchor_json #>> '{resultConsumed}')::boolean, false)
+          AND tool_job_anchor_json #>> '{resumeToken}' = #{expectedResumeToken}
+          AND (tool_job_anchor_json #>> '{resumeLeaseVersion}')::bigint = #{expectedLeaseVersion}
+          AND tool_job_anchor_json #>> '{resumeLauncherOwnerId}' = #{expectedLauncherOwnerId}
+          AND (tool_job_anchor_json #>> '{resumeLauncherLeaseUntil}')::timestamptz
+                &gt; CURRENT_TIMESTAMP
+    </update>
+
+    <update id="clearAcceptedResumeHandoff">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = CAST('{}' AS jsonb),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND tool_job_anchor_json #>> '{resumeState}' = 'LAUNCHING'
+          AND COALESCE((tool_job_anchor_json #>> '{resultConsumed}')::boolean, false)
+          AND tool_job_anchor_json #>> '{resumeToken}' = #{expectedResumeToken}
+          AND (tool_job_anchor_json #>> '{resumeLeaseVersion}')::bigint = #{expectedLeaseVersion}
+          AND tool_job_anchor_json #>> '{resumeLauncherOwnerId}' = #{expectedLauncherOwnerId}
+          AND status IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')
     </update>
 
     <!--

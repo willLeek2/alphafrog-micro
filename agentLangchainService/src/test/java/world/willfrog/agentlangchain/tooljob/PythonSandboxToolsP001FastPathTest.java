@@ -822,7 +822,20 @@ class PythonSandboxToolsP001FastPathTest {
         assertThat(afterHandoff.isResultConsumed()).isTrue();
         assertThat(afterHandoff.getResumeState()).isEqualTo("LAUNCHING");
 
-        // ── Invoke completion(true) → completeHandoff clears anchor ──
+        // Real pipeline persists the terminal state before invoking completion(true).
+        assertThat(runMapper2.updateResumedTerminal(
+                RUN_ID,
+                "user-test",
+                AgentRunStatus.COMPLETED,
+                null,
+                "{}",
+                true,
+                null,
+                afterHandoff.getResumeToken(),
+                afterHandoff.getResumeLeaseVersion(),
+                afterHandoff.getResumeLauncherOwnerId())).isEqualTo(1);
+
+        // ── Invoke completion(true) → completeHandoff clears terminal anchor ──
         assertThat(completionRef.get()).isNotNull();
         completionRef.get().accept(true);
 

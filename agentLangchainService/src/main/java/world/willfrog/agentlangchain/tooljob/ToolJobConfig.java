@@ -35,6 +35,9 @@ public class ToolJobConfig {
     /** READY→LAUNCHING 租约未被执行线程确认的最长时间；超时后允许回滚并重新抢占。 */
     private long launchingStaleSeconds = 120;
 
+    /** 恢复 launcher 的持久化租约时长；活跃 launcher 必须在过期前续租。 */
+    private long resumeLauncherLeaseSeconds = 30;
+
     public long getFastPathMs() { return fastPathMs; }
     public void setFastPathMs(long fastPathMs) { this.fastPathMs = fastPathMs; }
 
@@ -58,5 +61,10 @@ public class ToolJobConfig {
 
     public long getLaunchingStaleSeconds() { return launchingStaleSeconds; }
     public void setLaunchingStaleSeconds(long launchingStaleSeconds) { this.launchingStaleSeconds = launchingStaleSeconds; }
+
+    public long getResumeLauncherLeaseSeconds() { return resumeLauncherLeaseSeconds; }
+    public void setResumeLauncherLeaseSeconds(long resumeLauncherLeaseSeconds) {
+        this.resumeLauncherLeaseSeconds = resumeLauncherLeaseSeconds;
+    }
 
 }

@@ -17,7 +17,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.same;
 import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -43,11 +45,17 @@ class ToolJobResumeServiceTest {
     @BeforeEach
     void setUp() {
         lenient().when(config.getLaunchingStaleSeconds()).thenReturn(120L);
-        resumeService = new ToolJobResumeService(anchorService, redisCache, config, objectMapper);
+        lenient().when(config.getResumeLauncherLeaseSeconds()).thenReturn(30L);
+        resumeService = new ToolJobResumeService(
+                anchorService, redisCache, config, objectMapper, "owner-a");
+        setLauncher(resumeService, resumeLauncher);
+    }
+
+    private void setLauncher(ToolJobResumeService service, ToolJobResumeLauncher launcher) {
         try {
             var field = ToolJobResumeService.class.getDeclaredField("resumeLauncher");
             field.setAccessible(true);
-            field.set(resumeService, resumeLauncher);
+            field.set(service, launcher);
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
@@ -82,8 +90,9 @@ class ToolJobResumeServiceTest {
     void shouldCasReadToLaunchingAndLaunch() {
         ToolJobAnchor anchor = buildReadyAnchor();
         when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
-        when(anchorService.casResumeState(eq("run-1"), any(ToolJobAnchor.class),
-                eq(AgentRunStatus.RECEIVED), eq("READY"), eq("token-v1"), eq(5L))).thenReturn(true);
+        when(anchorService.claimResumeLauncher(eq("run-1"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.RECEIVED),
+                eq("token-v1"), eq(5L), eq("owner-a"), eq(30L))).thenReturn(true);
         when(resumeLauncher.launch(eq("run-1"), any(ToolJobResumeContext.class))).thenReturn(true);
 
         boolean result = resumeService.tryResume("run-1");
@@ -103,14 +112,16 @@ class ToolJobResumeServiceTest {
         assertThat(ctx.isTerminalSuccess()).isTrue();
         assertThat(ctx.getResumeToken()).isEqualTo("token-v1");
         assertThat(ctx.getResumeLeaseVersion()).isEqualTo(6L);
+        assertThat(ctx.getResumeLauncherOwnerId()).isEqualTo("owner-a");
     }
 
     @Test
     void shouldNotLaunchWhenCasFails() {
         ToolJobAnchor anchor = buildReadyAnchor();
         when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
-        when(anchorService.casResumeState(eq("run-1"), any(ToolJobAnchor.class),
-                eq(AgentRunStatus.RECEIVED), eq("READY"), eq("token-v1"), eq(5L))).thenReturn(false);
+        when(anchorService.claimResumeLauncher(eq("run-1"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.RECEIVED),
+                eq("token-v1"), eq(5L), eq("owner-a"), eq(30L))).thenReturn(false);
 
         boolean result = resumeService.tryResume("run-1");
         assertThat(result).isFalse();
@@ -121,8 +132,9 @@ class ToolJobResumeServiceTest {
     void shouldRollbackToReadWhenLaunchRejected() {
         ToolJobAnchor anchor = buildReadyAnchor();
         when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
-        when(anchorService.casResumeState(eq("run-1"), any(ToolJobAnchor.class),
-                eq(AgentRunStatus.RECEIVED), eq("READY"), eq("token-v1"), eq(5L))).thenReturn(true);
+        when(anchorService.claimResumeLauncher(eq("run-1"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.RECEIVED),
+                eq("token-v1"), eq(5L), eq("owner-a"), eq(30L))).thenReturn(true);
         when(resumeLauncher.launch(eq("run-1"), any(ToolJobResumeContext.class))).thenReturn(false);
         // Rollback: expected LAUNCHING + token-v1 + claimedVersion 6
         when(anchorService.casResumeState(eq("run-1"), any(ToolJobAnchor.class),
@@ -138,8 +150,9 @@ class ToolJobResumeServiceTest {
     void shouldRollbackToReadWhenLaunchThrows() {
         ToolJobAnchor anchor = buildReadyAnchor();
         when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
-        when(anchorService.casResumeState(eq("run-1"), any(ToolJobAnchor.class),
-                eq(AgentRunStatus.RECEIVED), eq("READY"), eq("token-v1"), eq(5L))).thenReturn(true);
+        when(anchorService.claimResumeLauncher(eq("run-1"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.RECEIVED),
+                eq("token-v1"), eq(5L), eq("owner-a"), eq(30L))).thenReturn(true);
         when(resumeLauncher.launch(eq("run-1"), any(ToolJobResumeContext.class)))
                 .thenThrow(new RuntimeException("pipeline error"));
         // Rollback: expected LAUNCHING + token-v1 + claimedVersion 6
@@ -155,15 +168,19 @@ class ToolJobResumeServiceTest {
     // ---- LAUNCHING reentry (crash recovery, §9.11) ----
 
     @Test
-    void shouldReenterLaunchingAndRelunch() {
+    void shouldNotRelaunchUnexpiredDurableLease() {
         ToolJobAnchor anchor = buildReadyAnchor();
         anchor.setResumeState("LAUNCHING");
-        anchor.setResumeClaimedAt(java.time.Instant.now()); // active, not stale
+        anchor.setResumeClaimedAt(java.time.Instant.now());
+        anchor.setResumeLauncherOwnerId("owner-a");
+        anchor.setResumeLauncherLeaseUntil(java.time.Instant.now().plusSeconds(30));
         when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
-        when(resumeLauncher.launch(eq("run-1"), any(ToolJobResumeContext.class))).thenReturn(true);
 
         boolean result = resumeService.tryResume("run-1");
-        assertThat(result).isTrue();
+        assertThat(result).isFalse();
+        verify(resumeLauncher, never()).launch(any(), any());
+        verify(anchorService, never()).takeoverExpiredResumeLauncher(
+                any(), any(), any(), any(), anyLong(), any(), any(), anyLong(), anyLong());
     }
 
     @Test
@@ -180,6 +197,8 @@ class ToolJobResumeServiceTest {
         ToolJobAnchor anchor = buildReadyAnchor();
         anchor.setResumeState("LAUNCHING");
         anchor.setResumeClaimedAt(java.time.Instant.now()); // active, not stale
+        anchor.setResumeLauncherOwnerId("owner-a");
+        anchor.setResumeLauncherLeaseUntil(java.time.Instant.now().plusSeconds(30));
         when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
 
         boolean result = resumeService.tryResume("run-1");
@@ -231,10 +250,11 @@ class ToolJobResumeServiceTest {
     void acceptedHandoffPersistsNextTodoAndKeepsOldAnchor() {
         ToolJobAnchor anchor = buildReadyAnchor();
         anchor.setResumeState("LAUNCHING");
+        anchor.setResumeLauncherOwnerId("owner-a");
+        anchor.setResumeLauncherLeaseUntil(java.time.Instant.now().plusSeconds(30));
         when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
-        when(anchorService.casResumeStateAndStatus(eq("run-1"), any(ToolJobAnchor.class),
-                eq(AgentRunStatus.EXECUTING), eq(AgentRunStatus.RECEIVED),
-                eq("LAUNCHING"), eq("token-v1"), eq(5L)))
+        when(anchorService.acceptResumeHandoff(eq("run-1"), any(ToolJobAnchor.class),
+                eq("token-v1"), eq(5L), eq("owner-a"), eq(30L)))
                 .thenReturn(true);
         CompletedTodoRecord completed = new CompletedTodoRecord();
         completed.setTodoId("todo_3");
@@ -244,6 +264,7 @@ class ToolJobResumeServiceTest {
         context.setRunId("run-1");
         context.setResumeToken("token-v1");
         context.setResumeLeaseVersion(5);
+        context.setResumeLauncherOwnerId("owner-a");
         context.setTodoId("todo_4");
         context.setTodoSequence(4);
         context.setCompletedTodos(List.of(completed));
@@ -266,11 +287,14 @@ class ToolJobResumeServiceTest {
         ToolJobAnchor anchor = buildReadyAnchor();
         anchor.setResumeState("LAUNCHING");
         anchor.setResultConsumed(true);
+        anchor.setResumeLauncherOwnerId("owner-a");
         when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
-        when(anchorService.clearAnchorWithToken("run-1", "LAUNCHING", "token-v1", 5L))
+        when(anchorService.clearAcceptedResumeHandoff(
+                "run-1", "token-v1", 5L, "owner-a"))
                 .thenReturn(true);
 
-        assertThat(resumeService.completeHandoff("run-1", "token-v1", 5L)).isTrue();
+        assertThat(resumeService.completeHandoff(
+                "run-1", "token-v1", 5L, "owner-a")).isTrue();
         verify(redisCache).removeDue("run-1");
         verify(redisCache).deletePendingCache("run-1");
     }
@@ -286,8 +310,9 @@ class ToolJobResumeServiceTest {
         ToolJobAnchor anchor2 = buildReadyAnchor(); // same token+version
 
         when(anchorService.loadAnchor("run-1")).thenReturn(anchor1, anchor2);
-        when(anchorService.casResumeState(eq("run-1"), any(ToolJobAnchor.class),
-                eq(AgentRunStatus.RECEIVED), eq("READY"), eq("token-v1"), eq(5L)))
+        when(anchorService.claimResumeLauncher(eq("run-1"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.RECEIVED),
+                eq("token-v1"), eq(5L), eq("owner-a"), eq(30L)))
                 .thenReturn(true)   // first process wins
                 .thenReturn(false); // second process loses (token+version+state mismatch)
         when(resumeLauncher.launch(eq("run-1"), any(ToolJobResumeContext.class))).thenReturn(true);
@@ -306,6 +331,32 @@ class ToolJobResumeServiceTest {
     }
 
     @Test
+    void twoIndependentServicesLaunchExpiredAcceptedClaimOnlyOnce() {
+        ToolJobResumeLauncher launcherA = mock(ToolJobResumeLauncher.class);
+        ToolJobResumeLauncher launcherB = mock(ToolJobResumeLauncher.class);
+        ToolJobResumeService serviceA = new ToolJobResumeService(
+                anchorService, redisCache, config, objectMapper, "owner-a");
+        ToolJobResumeService serviceB = new ToolJobResumeService(
+                anchorService, redisCache, config, objectMapper, "owner-b");
+        setLauncher(serviceA, launcherA);
+        setLauncher(serviceB, launcherB);
+
+        ToolJobAnchor loadedByA = expiredAcceptedAnchor("owner-old", "accepted-token", 11L);
+        ToolJobAnchor loadedByB = expiredAcceptedAnchor("owner-old", "accepted-token", 11L);
+        when(anchorService.loadAnchor("run-1")).thenReturn(loadedByA, loadedByB);
+        when(anchorService.takeoverExpiredResumeLauncher(
+                eq("run-1"), any(ToolJobAnchor.class), eq(AgentRunStatus.EXECUTING),
+                eq("accepted-token"), eq(11L), eq("owner-old"), any(),
+                eq(30L), eq(120L))).thenReturn(true, false);
+        when(launcherA.launch(eq("run-1"), any(ToolJobResumeContext.class))).thenReturn(true);
+
+        assertThat(serviceA.tryResume("run-1")).isTrue();
+        assertThat(serviceB.tryResume("run-1")).isFalse();
+        verify(launcherA).launch(eq("run-1"), any(ToolJobResumeContext.class));
+        verify(launcherB, never()).launch(any(), any());
+    }
+
+    @Test
     void shouldRejectStaleLeaseVersionInCas() {
         // Anchor was already claimed (version 5→6), then rolled back (6→5),
         // then re-marked READY with new token+version (token-v2/version 7).
@@ -317,8 +368,9 @@ class ToolJobResumeServiceTest {
 
         when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
         // CAS with token-v2/version 7 (matching what we loaded) succeeds
-        when(anchorService.casResumeState(eq("run-1"), any(ToolJobAnchor.class),
-                eq(AgentRunStatus.RECEIVED), eq("READY"), eq("token-v2"), eq(7L)))
+        when(anchorService.claimResumeLauncher(eq("run-1"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.RECEIVED),
+                eq("token-v2"), eq(7L), eq("owner-a"), eq(30L)))
                 .thenReturn(true);
         when(resumeLauncher.launch(eq("run-1"), any(ToolJobResumeContext.class))).thenReturn(true);
 
@@ -335,8 +387,9 @@ class ToolJobResumeServiceTest {
 
         when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
         // CAS with token-v1/version 5 fails because DB has different token
-        when(anchorService.casResumeState(eq("run-1"), any(ToolJobAnchor.class),
-                eq(AgentRunStatus.RECEIVED), eq("READY"), eq("token-v1"), eq(5L)))
+        when(anchorService.claimResumeLauncher(eq("run-1"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.RECEIVED),
+                eq("token-v1"), eq(5L), eq("owner-a"), eq(30L)))
                 .thenReturn(false);
 
         boolean result = resumeService.tryResume("run-1");
@@ -344,89 +397,83 @@ class ToolJobResumeServiceTest {
         verify(resumeLauncher, never()).launch(any(), any());
     }
 
-    // ---- active-token contract (§9.11 stale LAUNCHING) ----
+    // ---- durable launcher owner/lease and takeover ----
 
     @Test
-    void shouldNotRollbackStaleLaunchingWhenLauncherActive() {
-        // LAUNCHING past TTL, but launcher reports isActive=true → no rollback
+    void expiredLeaseIsTakenOverByCasAndLaunchedWithNewIdentity() {
         ToolJobAnchor anchor = buildReadyAnchor();
         anchor.setResumeState("LAUNCHING");
-        anchor.setResumeClaimedAt(java.time.Instant.now().minusSeconds(300)); // well past 120s TTL
-        anchor.setResumeToken("active-token");
-        anchor.setResumeLeaseVersion(10);
-
-        when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
-        when(resumeLauncher.isActive("run-1", "active-token", 10L)).thenReturn(true);
-
-        boolean result = resumeService.tryResume("run-1");
-        // Launcher still active → don't roll back, don't re-launch; launcher handles it
-        assertThat(result).isFalse();
-        verify(resumeLauncher).isActive("run-1", "active-token", 10L);
-        verify(resumeLauncher, never()).launch(any(), any());
-    }
-
-    @Test
-    void shouldRollbackStaleLaunchingWhenLauncherInactive() {
-        // LAUNCHING past TTL, launcher reports isActive=false → rollback to READY
-        ToolJobAnchor anchor = buildReadyAnchor();
-        anchor.setResumeState("LAUNCHING");
-        anchor.setResumeClaimedAt(java.time.Instant.now().minusSeconds(300)); // well past 120s TTL
+        anchor.setResumeClaimedAt(java.time.Instant.now().minusSeconds(60));
+        anchor.setResumeLauncherOwnerId("owner-old");
+        anchor.setResumeLauncherLeaseUntil(java.time.Instant.now().minusSeconds(1));
         anchor.setResumeToken("stale-token");
         anchor.setResumeLeaseVersion(8);
 
         when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
-        when(resumeLauncher.isActive("run-1", "stale-token", 8L)).thenReturn(false);
-        // Rollback CAS: LAUNCHING → READY with version 9
-        when(anchorService.casResumeState(eq("run-1"), any(ToolJobAnchor.class),
-                eq(AgentRunStatus.RECEIVED), eq("LAUNCHING"), eq("stale-token"), eq(8L)))
-                .thenReturn(true);
+        when(anchorService.takeoverExpiredResumeLauncher(
+                eq("run-1"), same(anchor), eq(AgentRunStatus.RECEIVED),
+                eq("stale-token"), eq(8L), eq("owner-old"), eq("owner-a"),
+                eq(30L), eq(120L))).thenReturn(true);
+        when(resumeLauncher.launch(eq("run-1"), any(ToolJobResumeContext.class))).thenReturn(true);
 
-        boolean result = resumeService.tryResume("run-1");
-        assertThat(result).isFalse(); // rollback, will retry as READY on next scan
-        assertThat(anchor.getResumeState()).isEqualTo("READY");
-        assertThat(anchor.getResumeLeaseVersion()).isEqualTo(9); // monotonic bump
-        assertThat(anchor.getResumeToken()).isNotEqualTo("stale-token"); // new token generated
+        assertThat(resumeService.tryResume("run-1")).isTrue();
+        assertThat(anchor.getResumeState()).isEqualTo("LAUNCHING");
+        assertThat(anchor.getResumeLeaseVersion()).isEqualTo(9L);
+        assertThat(anchor.getResumeToken()).isNotEqualTo("stale-token");
+        assertThat(anchor.getResumeLauncherOwnerId()).isEqualTo("owner-a");
+        verify(resumeLauncher, never()).isActive(any(), any(), anyLong());
     }
 
     @Test
-    void shouldRollbackStaleAcceptedHandoffToReceivedReadyAtomically() {
+    void expiredAcceptedHandoffIsTakenOverWithoutReturningToReady() {
         ToolJobAnchor anchor = buildReadyAnchor();
         anchor.setResumeState("LAUNCHING");
         anchor.setResultConsumed(true);
-        anchor.setResumeClaimedAt(java.time.Instant.now().minusSeconds(300));
+        anchor.setResumeClaimedAt(java.time.Instant.now().minusSeconds(60));
+        anchor.setResumeLauncherOwnerId("owner-old");
+        anchor.setResumeLauncherLeaseUntil(java.time.Instant.now().minusSeconds(1));
         anchor.setResumeToken("accepted-token");
         anchor.setResumeLeaseVersion(11);
 
         when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
-        when(resumeLauncher.isActive("run-1", "accepted-token", 11L)).thenReturn(false);
-        when(anchorService.casResumeStateAndStatus(
-                eq("run-1"), any(ToolJobAnchor.class),
-                eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.EXECUTING),
-                eq("LAUNCHING"), eq("accepted-token"), eq(11L))).thenReturn(true);
+        when(anchorService.takeoverExpiredResumeLauncher(
+                eq("run-1"), same(anchor), eq(AgentRunStatus.EXECUTING),
+                eq("accepted-token"), eq(11L), eq("owner-old"), eq("owner-a"),
+                eq(30L), eq(120L))).thenReturn(true);
+        when(resumeLauncher.launch(eq("run-1"), any(ToolJobResumeContext.class))).thenReturn(true);
 
-        assertThat(resumeService.tryResume("run-1")).isFalse();
-        assertThat(anchor.getResumeState()).isEqualTo("READY");
-        assertThat(anchor.getResumeLeaseVersion()).isEqualTo(12L);
-        verify(anchorService).casResumeStateAndStatus(
-                eq("run-1"), eq(anchor),
-                eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.EXECUTING),
-                eq("LAUNCHING"), eq("accepted-token"), eq(11L));
+        assertThat(resumeService.tryResume("run-1")).isTrue();
+        ArgumentCaptor<ToolJobResumeContext> contextCaptor =
+                ArgumentCaptor.forClass(ToolJobResumeContext.class);
+        verify(resumeLauncher).launch(eq("run-1"), contextCaptor.capture());
+        assertThat(contextCaptor.getValue().isResultConsumed()).isTrue();
+        assertThat(contextCaptor.getValue().getResumeLauncherOwnerId()).isEqualTo("owner-a");
+        assertThat(anchor.getResumeState()).isEqualTo("LAUNCHING");
     }
 
     @Test
-    void shouldConsiderActiveLaunchingWithoutClaimedAtAsStale() {
-        // LAUNCHING without claimedAt → don't rollback (claimedAt is null, skip stale check)
+    void legacyLaunchingWithoutLeaseWaitsForClaimedAtStaleWindow() {
         ToolJobAnchor anchor = buildReadyAnchor();
         anchor.setResumeState("LAUNCHING");
-        anchor.setResumeClaimedAt(null); // no claimedAt set
-        anchor.setResumeToken("no-claimed-at-token");
-        anchor.setResumeLeaseVersion(3);
-
+        anchor.setResumeClaimedAt(java.time.Instant.now());
+        anchor.setResumeLauncherLeaseUntil(null);
         when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
-        when(resumeLauncher.launch(eq("run-1"), any(ToolJobResumeContext.class))).thenReturn(true);
 
-        boolean result = resumeService.tryResume("run-1");
-        assertThat(result).isTrue();
+        assertThat(resumeService.tryResume("run-1")).isFalse();
+        verify(anchorService, never()).takeoverExpiredResumeLauncher(
+                any(), any(), any(), any(), anyLong(), any(), any(), anyLong(), anyLong());
+        verify(resumeLauncher, never()).launch(any(), any());
+    }
+
+    @Test
+    void heartbeatUsesExactLocalOwnerTokenAndVersion() {
+        when(anchorService.heartbeatResumeLauncher(
+                "run-1", "token-v1", 5L, "owner-a", 30L)).thenReturn(true);
+
+        assertThat(resumeService.heartbeat("run-1", "token-v1", 5L, "owner-a")).isTrue();
+        assertThat(resumeService.heartbeat("run-1", "token-v1", 5L, "owner-other")).isFalse();
+        verify(anchorService).heartbeatResumeLauncher(
+                "run-1", "token-v1", 5L, "owner-a", 30L);
     }
 
     // ---- helpers ----
@@ -448,6 +495,18 @@ class ToolJobResumeServiceTest {
         anchor.setResumeState("READY");
         anchor.setResumeToken("token-v1");
         anchor.setResumeLeaseVersion(5);
+        return anchor;
+    }
+
+    private ToolJobAnchor expiredAcceptedAnchor(String ownerId, String token, long version) {
+        ToolJobAnchor anchor = buildReadyAnchor();
+        anchor.setResumeState("LAUNCHING");
+        anchor.setResultConsumed(true);
+        anchor.setResumeClaimedAt(java.time.Instant.now().minusSeconds(60));
+        anchor.setResumeLauncherOwnerId(ownerId);
+        anchor.setResumeLauncherLeaseUntil(java.time.Instant.now().minusSeconds(1));
+        anchor.setResumeToken(token);
+        anchor.setResumeLeaseVersion(version);
         return anchor;
     }
 }

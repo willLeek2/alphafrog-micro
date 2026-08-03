@@ -302,8 +302,8 @@ public interface AgentRunMapper {
     List<AgentRun> listActiveToolJobAnchors(@Param("limit") int limit);
 
     /**
-     * 列出 status=RECEIVED 且 anchor 中 resumeState 为 READY 或 LAUNCHING 的 Run。
-     * 用于扫描“结果已接管但尚未 launch”以及“声明 LAUNCHING 后进程崩溃”的两个断点窗口。
+     * 列出 RECEIVED+READY，以及 launcher lease 已过期的 RECEIVED/EXECUTING+LAUNCHING Run。
+     * 活跃 lease 不进入扫描结果，避免多个实例反复提交同一恢复 worker。
      */
     List<AgentRun> listResumeReadyAnchors(@Param("limit") int limit);
 
@@ -327,6 +327,69 @@ public interface AgentRunMapper {
             @Param("expectedResumeState") String expectedResumeState,
             @Param("expectedResumeToken") String expectedResumeToken,
             @Param("expectedLeaseVersion") long expectedLeaseVersion);
+
+    /** READY→LAUNCHING 的持久化 launcher claim；owner 与 lease 使用同一条数据库 CAS 写入。 */
+    int claimResumeLauncher(
+            @Param("id") String id,
+            @Param("toolJobAnchorJson") String toolJobAnchorJson,
+            @Param("newStatus") AgentRunStatus newStatus,
+            @Param("expectedStatus") AgentRunStatus expectedStatus,
+            @Param("expectedResumeToken") String expectedResumeToken,
+            @Param("expectedLeaseVersion") long expectedLeaseVersion,
+            @Param("launcherOwnerId") String launcherOwnerId,
+            @Param("leaseSeconds") long leaseSeconds);
+
+    /** 只有数据库确认 launcher lease 已过期时，新的实例才能原子旋转 token/version/owner。 */
+    int takeoverExpiredResumeLauncher(
+            @Param("id") String id,
+            @Param("toolJobAnchorJson") String toolJobAnchorJson,
+            @Param("expectedStatus") AgentRunStatus expectedStatus,
+            @Param("expectedResumeToken") String expectedResumeToken,
+            @Param("expectedLeaseVersion") long expectedLeaseVersion,
+            @Param("expectedLauncherOwnerId") String expectedLauncherOwnerId,
+            @Param("launcherOwnerId") String launcherOwnerId,
+            @Param("leaseSeconds") long leaseSeconds,
+            @Param("legacyStaleSeconds") long legacyStaleSeconds);
+
+    /** 仅当前 owner/token/version 可以窄更新 launcher lease，不能覆盖 handoff/checkpoint 字段。 */
+    int heartbeatResumeLauncher(
+            @Param("id") String id,
+            @Param("expectedResumeToken") String expectedResumeToken,
+            @Param("expectedLeaseVersion") long expectedLeaseVersion,
+            @Param("expectedLauncherOwnerId") String expectedLauncherOwnerId,
+            @Param("leaseSeconds") long leaseSeconds);
+
+    /** 首次消费终态时，在未过期 launcher lease 下原子写 accepted handoff 并恢复 EXECUTING。 */
+    int acceptResumeHandoff(
+            @Param("id") String id,
+            @Param("toolJobAnchorJson") String toolJobAnchorJson,
+            @Param("expectedResumeToken") String expectedResumeToken,
+            @Param("expectedLeaseVersion") long expectedLeaseVersion,
+            @Param("expectedLauncherOwnerId") String expectedLauncherOwnerId,
+            @Param("leaseSeconds") long leaseSeconds);
+
+    /**
+     * resumed pipeline 的唯一终态写入口。plan/status/snapshot 在同一条 UPDATE 中写入，
+     * 并要求 accepted LAUNCHING handoff 的 token/version/owner/未过期 lease 仍匹配。
+     */
+    int updateResumedTerminal(
+            @Param("id") String id,
+            @Param("userId") String userId,
+            @Param("status") AgentRunStatus status,
+            @Param("planJson") String planJson,
+            @Param("snapshotJson") String snapshotJson,
+            @Param("completed") boolean completed,
+            @Param("lastError") String lastError,
+            @Param("expectedResumeToken") String expectedResumeToken,
+            @Param("expectedLeaseVersion") long expectedLeaseVersion,
+            @Param("expectedLauncherOwnerId") String expectedLauncherOwnerId);
+
+    /** 终态已落稳后，仅清理精确 accepted handoff。 */
+    int clearAcceptedResumeHandoff(
+            @Param("id") String id,
+            @Param("expectedResumeToken") String expectedResumeToken,
+            @Param("expectedLeaseVersion") long expectedLeaseVersion,
+            @Param("expectedLauncherOwnerId") String expectedLauncherOwnerId);
 
     /**
      * 原子合并检查点白名单字段，并保留 reservation、terminal、finalizer 等并发子树。

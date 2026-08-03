@@ -319,6 +319,80 @@ public class ToolJobAnchorService {
                 expectedResumeState, expectedResumeToken, expectedLeaseVersion) == 1;
     }
 
+    public boolean claimResumeLauncher(String runId,
+                                       ToolJobAnchor anchor,
+                                       AgentRunStatus newStatus,
+                                       AgentRunStatus expectedStatus,
+                                       String expectedResumeToken,
+                                       long expectedLeaseVersion,
+                                       String launcherOwnerId,
+                                       long leaseSeconds) {
+        if (launcherOwnerId == null || launcherOwnerId.isBlank() || leaseSeconds <= 0) {
+            return false;
+        }
+        return agentRunMapper.claimResumeLauncher(
+                runId, anchor.toJson(), newStatus, expectedStatus, expectedResumeToken,
+                expectedLeaseVersion, launcherOwnerId, leaseSeconds) == 1;
+    }
+
+    public boolean takeoverExpiredResumeLauncher(String runId,
+                                                  ToolJobAnchor anchor,
+                                                  AgentRunStatus expectedStatus,
+                                                  String expectedResumeToken,
+                                                  long expectedLeaseVersion,
+                                                  String expectedLauncherOwnerId,
+                                                  String launcherOwnerId,
+                                                  long leaseSeconds,
+                                                  long legacyStaleSeconds) {
+        if (launcherOwnerId == null || launcherOwnerId.isBlank()
+                || leaseSeconds <= 0 || legacyStaleSeconds <= 0) {
+            return false;
+        }
+        return agentRunMapper.takeoverExpiredResumeLauncher(
+                runId, anchor.toJson(), expectedStatus, expectedResumeToken,
+                expectedLeaseVersion, expectedLauncherOwnerId, launcherOwnerId,
+                leaseSeconds, legacyStaleSeconds) == 1;
+    }
+
+    public boolean heartbeatResumeLauncher(String runId,
+                                            String token,
+                                            long version,
+                                            String launcherOwnerId,
+                                            long leaseSeconds) {
+        if (token == null || token.isBlank() || version <= 0
+                || launcherOwnerId == null || launcherOwnerId.isBlank() || leaseSeconds <= 0) {
+            return false;
+        }
+        return agentRunMapper.heartbeatResumeLauncher(
+                runId, token, version, launcherOwnerId, leaseSeconds) == 1;
+    }
+
+    public boolean acceptResumeHandoff(String runId,
+                                       ToolJobAnchor anchor,
+                                       String token,
+                                       long version,
+                                       String launcherOwnerId,
+                                       long leaseSeconds) {
+        if (token == null || token.isBlank() || version <= 0
+                || launcherOwnerId == null || launcherOwnerId.isBlank() || leaseSeconds <= 0) {
+            return false;
+        }
+        return agentRunMapper.acceptResumeHandoff(
+                runId, anchor.toJson(), token, version, launcherOwnerId, leaseSeconds) == 1;
+    }
+
+    public boolean clearAcceptedResumeHandoff(String runId,
+                                              String token,
+                                              long version,
+                                              String launcherOwnerId) {
+        if (token == null || token.isBlank() || version <= 0
+                || launcherOwnerId == null || launcherOwnerId.isBlank()) {
+            return false;
+        }
+        return agentRunMapper.clearAcceptedResumeHandoff(
+                runId, token, version, launcherOwnerId) == 1;
+    }
+
     /**
      * Atomic checkpoint merge: merges only checkpoint fields into anchor via
      * jsonb || concat. WHERE binds identity + taskId + checkpointVersion.
