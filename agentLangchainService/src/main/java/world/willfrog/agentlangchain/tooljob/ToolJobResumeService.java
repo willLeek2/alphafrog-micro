@@ -41,6 +41,7 @@ public class ToolJobResumeService {
     @Autowired(required = false)
     private ToolJobResumeLauncher resumeLauncher;
 
+    @Autowired
     public ToolJobResumeService(ToolJobAnchorService anchorService,
                                 ToolJobRedisCache redisCache, ToolJobConfig config,
                                 ObjectMapper objectMapper) {
