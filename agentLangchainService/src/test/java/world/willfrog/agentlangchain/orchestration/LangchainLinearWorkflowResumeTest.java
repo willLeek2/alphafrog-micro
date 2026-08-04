@@ -3,10 +3,12 @@ package world.willfrog.agentlangchain.orchestration;
 import dev.langchain4j.model.chat.ChatModel;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import world.willfrog.agent.platform.config.CodeRefineProperties;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.dataanalysis.CompletedTodoRecord;
 import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingException;
 import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.CodeRefineLocalConfigLoader;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 import world.willfrog.agent.workflow.TodoItem;
 import world.willfrog.agentlangchain.planning.LangchainAiPlanner;
@@ -308,6 +310,22 @@ class LangchainLinearWorkflowResumeTest {
     }
 
     @Test
+    void pendingOomCrashReentryFailsClosedWithoutLlmOrTool() {
+        assertInvalidPendingRepairFailsClosed("OOM", false, "external_tool_terminal_failure");
+    }
+
+    @Test
+    void pendingExecutionErrorCrashReentryFailsClosedWithoutLlmOrTool() {
+        assertInvalidPendingRepairFailsClosed(
+                "EXECUTION_ERROR", false, "external_tool_terminal_failure");
+    }
+
+    @Test
+    void pendingAndExhaustedCrashReentryFailsClosedWithoutLlmOrTool() {
+        assertInvalidPendingRepairFailsClosed("NON_ZERO_EXIT", true, "python_repair_exhausted");
+    }
+
+    @Test
     void pythonRepairExhaustionConsumesTerminalAndFailsWithoutAnotherLlmCall() {
         LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
         LangchainTodoNodeExecutor nodeExecutor = mock(LangchainTodoNodeExecutor.class);
@@ -370,6 +388,66 @@ class LangchainLinearWorkflowResumeTest {
     }
 
     @Test
+    void hotReloadedMaxAttemptsChangesExhaustionGateWithoutRestart() {
+        LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
+        LangchainTodoNodeExecutor nodeExecutor = mock(LangchainTodoNodeExecutor.class);
+        LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
+        AgentEventService events = mock(AgentEventService.class);
+        CodeRefineLocalConfigLoader loader = mock(CodeRefineLocalConfigLoader.class);
+        CodeRefineProperties startup = attempts(5);
+        java.util.concurrent.atomic.AtomicReference<CodeRefineProperties> live =
+                new java.util.concurrent.atomic.AtomicReference<>(attempts(2));
+        when(loader.current()).thenAnswer(ignored -> Optional.ofNullable(live.get()));
+        when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
+        when(nodeExecutor.execute(any(), any(), any(), any(), any(),
+                any(ToolJobResumeContext.class)))
+                .thenReturn(LangchainTodoNodeResult.success("repaired-output", 1));
+        when(nodeExecutor.writeFinalAnswer(any(), any())).thenReturn("final-after-repair");
+        LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
+                planner, nodeExecutor, guard, events, loader, startup);
+        LangchainTodoPlan plan = LangchainTodoPlan.builder()
+                .executionMode(PlanExecutionMode.LINEAR)
+                .items(List.of(item("todo-2", 2)))
+                .build();
+
+        ToolJobResumeContext exhaustedAtTwo = failedPythonContext(false, 1);
+        LangchainLinearWorkflowResult exhausted = executor.resumePlanned(
+                request(), plan, exhaustedAtTwo, () -> true);
+        assertThat(exhausted.getFailureReason()).isEqualTo("python_repair_exhausted");
+        assertThat(exhausted.getFailureMetadata()).containsEntry("max_attempts", 2);
+        verifyNoInteractions(nodeExecutor);
+
+        live.set(attempts(4));
+        ToolJobResumeContext allowedAtFour = failedPythonContext(false, 1);
+        LangchainLinearWorkflowResult allowed = executor.resumePlanned(
+                request(), plan, allowedAtFour, () -> true);
+        assertThat(allowed.isSuccess()).isTrue();
+        verify(nodeExecutor).execute(any(), any(), any(), any(), any(), same(allowedAtFour));
+        verify(nodeExecutor).writeFinalAnswer(any(), any());
+        verifyNoInteractions(planner);
+    }
+
+    @Test
+    void invalidHotReloadedMaxAttemptsUsesSameDefaultAsLoaderSanitizer() {
+        LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
+        LangchainTodoNodeExecutor nodeExecutor = mock(LangchainTodoNodeExecutor.class);
+        LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
+        CodeRefineLocalConfigLoader loader = mock(CodeRefineLocalConfigLoader.class);
+        when(loader.current()).thenReturn(Optional.of(attempts(0)));
+        when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
+        LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
+                planner, nodeExecutor, guard, mock(AgentEventService.class), loader, attempts(5));
+        ToolJobResumeContext context = failedPythonContext(false, 2);
+
+        LangchainLinearWorkflowResult result = executor.resumePlanned(
+                request(), singleTodoPlan(), context, () -> true);
+
+        assertThat(result.getFailureReason()).isEqualTo("python_repair_exhausted");
+        assertThat(result.getFailureMetadata()).containsEntry("max_attempts", 3);
+        verifyNoInteractions(nodeExecutor, planner);
+    }
+
+    @Test
     void executionErrorRemainsFailFastInsteadOfEnteringCodeRepair() {
         LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
         LangchainTodoNodeExecutor nodeExecutor = mock(LangchainTodoNodeExecutor.class);
@@ -426,6 +504,39 @@ class LangchainLinearWorkflowResumeTest {
         context.setPythonFailedRequestFingerprints(List.of("sha256:failed-code"));
         context.setResultConsumed(consumed);
         return context;
+    }
+
+    private static void assertInvalidPendingRepairFailsClosed(
+            String exitReason, boolean exhausted, String expectedFailure) {
+        LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
+        LangchainTodoNodeExecutor nodeExecutor = mock(LangchainTodoNodeExecutor.class);
+        LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
+        when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
+        LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
+                planner, nodeExecutor, guard, mock(AgentEventService.class));
+        ToolJobResumeContext context = failedPythonContext(true, 1);
+        context.setTerminalExitReason(exitReason);
+        context.setPythonRepairExhausted(exhausted);
+
+        LangchainLinearWorkflowResult result = executor.resumePlanned(
+                request(), singleTodoPlan(), context,
+                () -> { throw new AssertionError("accepted handoff must not be consumed twice"); });
+
+        assertThat(result.getFailureReason()).isEqualTo(expectedFailure);
+        verifyNoInteractions(nodeExecutor, planner);
+    }
+
+    private static CodeRefineProperties attempts(int value) {
+        CodeRefineProperties properties = new CodeRefineProperties();
+        properties.setMaxAttempts(value);
+        return properties;
+    }
+
+    private static LangchainTodoPlan singleTodoPlan() {
+        return LangchainTodoPlan.builder()
+                .executionMode(PlanExecutionMode.LINEAR)
+                .items(List.of(item("todo-2", 2)))
+                .build();
     }
 
     private static TodoItem item(String id, int sequence) {

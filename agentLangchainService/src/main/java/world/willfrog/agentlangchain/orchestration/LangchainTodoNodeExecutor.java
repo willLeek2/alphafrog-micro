@@ -1,5 +1,7 @@
 package world.willfrog.agentlangchain.orchestration;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.model.chat.request.ChatRequest;
@@ -26,6 +28,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -75,6 +78,8 @@ public class LangchainTodoNodeExecutor {
      * 是两层独立限制。此前（commit ddf3dce 之前）这个值是 8，导致复杂回测 todo 内工具未执行完就被截断，后改为 30。
      */
     private static final int DEFAULT_MAX_TOOL_ROUND_TRIPS = 30;
+    private static final String EXECUTE_PYTHON_TOOL = "executePython";
+    private static final ObjectMapper TOOL_RESULT_MAPPER = new ObjectMapper();
 
     /**
      * 附加到 user message 末尾的安全 recovery 提示。仅在第一次返回空输出后追加一次。
@@ -243,6 +248,7 @@ public class LangchainTodoNodeExecutor {
                 item.getDescription(),
                 request.getToolSpecifications());
         boolean pythonRepair = isPythonRepair(repairContext);
+        AtomicBoolean acceptedPythonRepairExecution = new AtomicBoolean(false);
         if (pythonRepair) {
             userMessage += buildPythonRepairUserMessage(repairContext);
             AgentContext.setPythonRefineAttempt(repairContext.getPythonRepairAttempt());
@@ -280,7 +286,9 @@ public class LangchainTodoNodeExecutor {
         try {
             // 发 LLM 请求前先检查 run 是否已被取消
             ensureRunnable(request);
-            String output = buildTodoAiService(request, toolCalls, datasetRefs, pythonRepair).execute(userMessage);
+            String output = buildTodoAiService(
+                    request, toolCalls, datasetRefs, pythonRepair, acceptedPythonRepairExecution)
+                    .execute(userMessage);
             // 极端情况：LLM 返回了空字符串（例如被安全过滤或模型异常），视为失败
             if (isBlank(output)) {
                 return handleEmptyOutput(
@@ -290,6 +298,16 @@ public class LangchainTodoNodeExecutor {
                         previousTodoTotalLength, currentPromptBudget, lastNonEmptyTodoId);
             }
             String trimmed = output.trim();
+            // Prompt 只能表达意图，不能作为执行证明。修复轮次若没有真正完成一次新的
+            // executePython（旧语义请求会在工具层返回 ok=false），纯文本/JSON/解释均 fail-closed。
+            if (pythonRepair && !acceptedPythonRepairExecution.get()) {
+                return LangchainTodoNodeResult.failure(
+                        "python_repair_execute_required",
+                        Map.of(
+                                "python_repair_postcondition_failed", true,
+                                "required_tool", EXECUTE_PYTHON_TOOL,
+                                "repair_attempt", repairContext.getPythonRepairAttempt()));
+            }
             // 把 LLM 返回结果中的 dataset ref（JSON 片段）注册到引用表，后续节点可通过 datasetRefs 读取复用
             DatasetRefRegistry.registerFromJson(trimmed, datasetRefs);
             return LangchainTodoNodeResult.success(trimmed, Math.max(0, toolCalls.get() - callsBefore));
@@ -667,7 +685,8 @@ public class LangchainTodoNodeExecutor {
     private LangchainTodoExecutionAiService buildTodoAiService(LangchainLinearWorkflowRequest request,
                                                                AtomicInteger toolCalls,
                                                                Map<String, String> datasetRefs,
-                                                               boolean pythonRepair) {
+                                                               boolean pythonRepair,
+                                                               AtomicBoolean acceptedPythonRepairExecution) {
         AiServices<LangchainTodoExecutionAiService> builder = AiServices
                 .builder(LangchainTodoExecutionAiService.class)
                 .chatModel(request.executionModelOrDefault())
@@ -685,9 +704,30 @@ public class LangchainTodoNodeExecutor {
                     if (result != null && result.result() != null) {
                         DatasetRefRegistry.registerFromJson(result.result(), datasetRefs);
                     }
+                    if (pythonRepair && isAcceptedPythonRepairExecution(result)) {
+                        acceptedPythonRepairExecution.set(true);
+                    }
                 });
         toolProvider.ifAvailable(builder::toolProvider);
         return builder.build();
+    }
+
+    private boolean isAcceptedPythonRepairExecution(
+            dev.langchain4j.service.tool.ToolExecution execution) {
+        if (execution == null
+                || execution.request() == null
+                || !EXECUTE_PYTHON_TOOL.equals(execution.request().name())
+                || execution.hasFailed()
+                || isBlank(execution.result())) {
+            return false;
+        }
+        try {
+            JsonNode root = TOOL_RESULT_MAPPER.readTree(execution.result());
+            return root != null && root.path("ok").asBoolean(false);
+        } catch (Exception malformedToolResult) {
+            // executePython 的公开契约是 JSON；无法解析不能作为修复成功证明。
+            return false;
+        }
     }
 
     private String pythonRepairSystemPrompt() {

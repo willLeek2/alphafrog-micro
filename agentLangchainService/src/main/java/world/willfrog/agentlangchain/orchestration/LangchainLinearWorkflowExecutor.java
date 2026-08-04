@@ -1,10 +1,11 @@
 package world.willfrog.agentlangchain.orchestration;
 
-import lombok.RequiredArgsConstructor;
-import org.springframework.beans.factory.annotation.Value;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
+import world.willfrog.agent.platform.config.CodeRefineProperties;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.CodeRefineLocalConfigLoader;
 import world.willfrog.agent.workflow.DatasetRefRegistry;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 import world.willfrog.agent.workflow.TodoItem;
@@ -50,19 +51,46 @@ import java.util.stream.Collectors;
  * @see LangchainWorkflowRouting 决策 LINEAR vs DAG 的路由逻辑
  */
 @Service
-@RequiredArgsConstructor
 public class LangchainLinearWorkflowExecutor {
+
+    private static final int DEFAULT_MAX_PYTHON_ATTEMPTS = 3;
+    private static final int MAX_PYTHON_ATTEMPTS = 10;
 
     private final LangchainAiPlanner planner;
     private final LangchainTodoNodeExecutor todoNodeExecutor;
     private final LangchainRunExecutionGuard executionGuard;
     private final AgentEventService eventService;
-
-    /** 初次提交也占一次；默认 3 表示最多初次 + 两轮修复。 */
-    @Value("${agent.flow.code-refine.max-attempts:3}")
-    private int maxPythonAttempts = 3;
+    private final CodeRefineLocalConfigLoader codeRefineConfigLoader;
+    private final CodeRefineProperties startupCodeRefineProperties;
 
     private static final Set<String> REPAIRABLE_PYTHON_EXIT_REASONS = Set.of("NON_ZERO_EXIT");
+
+    /**
+     * 生产构造器显式选择六个依赖，避免存在测试便利构造器时 Spring 猜错构造器。
+     */
+    @Autowired
+    public LangchainLinearWorkflowExecutor(LangchainAiPlanner planner,
+                                           LangchainTodoNodeExecutor todoNodeExecutor,
+                                           LangchainRunExecutionGuard executionGuard,
+                                           AgentEventService eventService,
+                                           CodeRefineLocalConfigLoader codeRefineConfigLoader,
+                                           CodeRefineProperties startupCodeRefineProperties) {
+        this.planner = planner;
+        this.todoNodeExecutor = todoNodeExecutor;
+        this.executionGuard = executionGuard;
+        this.eventService = eventService;
+        this.codeRefineConfigLoader = codeRefineConfigLoader;
+        this.startupCodeRefineProperties = startupCodeRefineProperties;
+    }
+
+    /** 测试与历史直接构造调用的兼容入口；生产 Spring 必须使用上面的 @Autowired 构造器。 */
+    public LangchainLinearWorkflowExecutor(LangchainAiPlanner planner,
+                                           LangchainTodoNodeExecutor todoNodeExecutor,
+                                           LangchainRunExecutionGuard executionGuard,
+                                           AgentEventService eventService) {
+        this(planner, todoNodeExecutor, executionGuard, eventService,
+                null, new CodeRefineProperties());
+    }
 
     public LangchainLinearWorkflowResult execute(LangchainLinearWorkflowRequest request) {
         validate(request);
@@ -207,7 +235,8 @@ public class LangchainLinearWorkflowExecutor {
                     toolCalls.get(), null);
         }
         // 已消费的失败终态不允许继续后续 Todo，直接恢复为确定性失败。
-        if (handoffAccepted && !resumeContext.isTerminalSuccess() && !activePythonRepair) {
+        if (handoffAccepted && !activePythonRepair
+                && (!resumeContext.isTerminalSuccess() || resumeContext.isPythonRepairPending())) {
             if (resumeContext.isPythonRepairExhausted()) {
                 return failure(plan, completedTodos, "python_repair_exhausted",
                         toolCalls.get(), pythonRepairExhaustedMetadata(resumeContext));
@@ -252,8 +281,10 @@ public class LangchainLinearWorkflowExecutor {
                                 toolCalls.get(), null);
                     }
                     int nextRepairAttempt = resumeContext.getPythonRepairAttempt() + 1;
-                    if (nextRepairAttempt >= effectiveMaxPythonAttempts()) {
-                        Map<String, Object> metadata = pythonRepairExhaustedMetadata(resumeContext);
+                    int effectiveMaxAttempts = effectiveMaxPythonAttempts();
+                    if (nextRepairAttempt >= effectiveMaxAttempts) {
+                        Map<String, Object> metadata = pythonRepairExhaustedMetadata(
+                                resumeContext, effectiveMaxAttempts);
                         emitTodoNodeEvent(request.getRunId(), request.getUserId(),
                                 "TODO_NODE_FAILED", item, "python_repair_exhausted", 0,
                                 metadata, false, null);
@@ -466,15 +497,16 @@ public class LangchainLinearWorkflowExecutor {
 
     private boolean isActivePythonRepair(ToolJobResumeContext context) {
         return context != null
-                && !context.isTerminalSuccess()
+                && isRepairablePythonFailure(context)
                 && context.isPythonRepairPending()
+                && !context.isPythonRepairExhausted()
                 && context.getPythonRepairAttempt() > 0
-                && context.getPythonFailedRequestFingerprints() != null
-                && !context.getPythonFailedRequestFingerprints().isEmpty();
+                && context.isResultConsumed();
     }
 
     private boolean isRepairablePythonFailure(ToolJobResumeContext context) {
         return context != null
+                && !context.isTerminalSuccess()
                 && "FAILED".equals(context.getTerminalStatus())
                 && Boolean.FALSE.equals(context.getTerminalRetryable())
                 && REPAIRABLE_PYTHON_EXIT_REASONS.contains(
@@ -484,13 +516,29 @@ public class LangchainLinearWorkflowExecutor {
     }
 
     private int effectiveMaxPythonAttempts() {
-        return Math.max(1, Math.min(maxPythonAttempts, 10));
+        int startupValue = startupCodeRefineProperties == null
+                ? DEFAULT_MAX_PYTHON_ATTEMPTS
+                : startupCodeRefineProperties.getMaxAttempts();
+        int configuredValue = codeRefineConfigLoader == null
+                ? startupValue
+                : codeRefineConfigLoader.current()
+                        .map(CodeRefineProperties::getMaxAttempts)
+                        .orElse(startupValue);
+        if (configuredValue <= 0) {
+            configuredValue = DEFAULT_MAX_PYTHON_ATTEMPTS;
+        }
+        return Math.min(configuredValue, MAX_PYTHON_ATTEMPTS);
     }
 
     private Map<String, Object> pythonRepairExhaustedMetadata(ToolJobResumeContext context) {
+        return pythonRepairExhaustedMetadata(context, effectiveMaxPythonAttempts());
+    }
+
+    private Map<String, Object> pythonRepairExhaustedMetadata(
+            ToolJobResumeContext context, int effectiveMaxAttempts) {
         return Map.of(
                 "python_repair_exhausted", true,
-                "max_attempts", effectiveMaxPythonAttempts(),
+                "max_attempts", effectiveMaxAttempts,
                 "failed_request_count", context.getPythonFailedRequestFingerprints().size());
     }
 
