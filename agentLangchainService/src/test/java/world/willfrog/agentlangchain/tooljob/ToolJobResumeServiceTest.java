@@ -89,6 +89,15 @@ class ToolJobResumeServiceTest {
     @Test
     void shouldCasReadToLaunchingAndLaunch() {
         ToolJobAnchor anchor = buildReadyAnchor();
+        anchor.setTerminalStderrPreview("Traceback: bad date");
+        anchor.setTerminalErrorCode("execution_failed");
+        anchor.setTerminalExitReason("NON_ZERO_EXIT");
+        anchor.setTerminalRetryable(false);
+        anchor.setPythonRepairAttempt(1);
+        anchor.setPythonRepairPending(true);
+        anchor.setPythonRepairExhausted(true);
+        anchor.setPythonFailedRequestFingerprints(List.of("sha256:failed-1"));
+        anchor.setCreateRequestJson("{\"code\":\"print(1)\"}");
         when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
         when(anchorService.claimResumeLauncher(eq("run-1"), any(ToolJobAnchor.class),
                 eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.RECEIVED),
@@ -113,6 +122,15 @@ class ToolJobResumeServiceTest {
         assertThat(ctx.getResumeToken()).isEqualTo("token-v1");
         assertThat(ctx.getResumeLeaseVersion()).isEqualTo(6L);
         assertThat(ctx.getResumeLauncherOwnerId()).isEqualTo("owner-a");
+        assertThat(ctx.getTerminalStderrPreview()).isEqualTo("Traceback: bad date");
+        assertThat(ctx.getTerminalErrorCode()).isEqualTo("execution_failed");
+        assertThat(ctx.getTerminalExitReason()).isEqualTo("NON_ZERO_EXIT");
+        assertThat(ctx.getTerminalRetryable()).isFalse();
+        assertThat(ctx.getPythonRepairAttempt()).isEqualTo(1);
+        assertThat(ctx.isPythonRepairPending()).isTrue();
+        assertThat(ctx.isPythonRepairExhausted()).isTrue();
+        assertThat(ctx.getPythonFailedCodePreview()).isEqualTo("print(1)");
+        assertThat(ctx.getPythonFailedRequestFingerprints()).containsExactly("sha256:failed-1");
     }
 
     @Test
@@ -269,6 +287,10 @@ class ToolJobResumeServiceTest {
         context.setTodoSequence(4);
         context.setCompletedTodos(List.of(completed));
         context.setToolCallsUsed(3);
+        context.setPythonRepairAttempt(2);
+        context.setPythonRepairPending(true);
+        context.setPythonRepairExhausted(true);
+        context.setPythonFailedRequestFingerprints(List.of("sha256:failed-1", "sha256:failed-2"));
         context.setResultConsumed(true);
 
         assertThat(resumeService.markHandoffAccepted("run-1", context)).isTrue();
@@ -277,6 +299,11 @@ class ToolJobResumeServiceTest {
         assertThat(anchor.getTodoId()).isEqualTo("todo_4");
         assertThat(anchor.getSequence()).isEqualTo(4);
         assertThat(anchor.getCompletedTodosJson()).contains("todo_3", "terminal-result");
+        assertThat(anchor.getPythonRepairAttempt()).isEqualTo(2);
+        assertThat(anchor.isPythonRepairPending()).isTrue();
+        assertThat(anchor.isPythonRepairExhausted()).isTrue();
+        assertThat(anchor.getPythonFailedRequestFingerprints())
+                .containsExactly("sha256:failed-1", "sha256:failed-2");
         verify(anchorService, never()).clearAnchorWithToken(any(), any(), any(), anyLong());
         verify(redisCache).removeDue("run-1");
         verify(redisCache).deletePendingCache("run-1");

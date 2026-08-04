@@ -3,6 +3,7 @@ package world.willfrog.agentlangchain.tooljob;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.protobuf.util.JsonFormat;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -11,6 +12,7 @@ import world.willfrog.agent.platform.dataanalysis.CompletedTodoRecord;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
+import world.willfrog.alphafrogmicro.sandbox.idl.ExecuteRequest;
 
 import java.time.Instant;
 import java.util.Collections;
@@ -286,6 +288,10 @@ public class ToolJobResumeService {
         anchor.setTodoId(context.getTodoId());
         anchor.setSequence(context.getTodoSequence());
         anchor.setToolCallsUsed(context.getToolCallsUsed());
+        anchor.setPythonRepairAttempt(context.getPythonRepairAttempt());
+        anchor.setPythonRepairPending(context.isPythonRepairPending());
+        anchor.setPythonRepairExhausted(context.isPythonRepairExhausted());
+        anchor.setPythonFailedRequestFingerprints(context.getPythonFailedRequestFingerprints());
         anchor.setResultConsumed(true);
         anchor.setResumeLauncherLeaseUntil(Instant.now().plusSeconds(leaseSeconds()));
         // 同一条 CAS 持久化“结果已接受”并把 Run 从 RECEIVED 恢复为 EXECUTING。
@@ -375,11 +381,37 @@ public class ToolJobResumeService {
         // 延续工具预算与终态结果。
         ctx.setToolCallsUsed(anchor.getToolCallsUsed());
         ctx.setTerminalSuccess("SUCCEEDED".equals(anchor.getTerminalStatus()));
+        ctx.setTerminalStatus(anchor.getTerminalStatus());
         ctx.setTerminalResultPreview(anchor.getTerminalResultPreview());
         ctx.setTerminalRawRef(anchor.getTerminalRawRef());
+        ctx.setTerminalStderrPreview(anchor.getTerminalStderrPreview());
+        ctx.setTerminalErrorCode(anchor.getTerminalErrorCode());
+        ctx.setTerminalExitReason(anchor.getTerminalExitReason());
+        ctx.setTerminalRetryable(anchor.getTerminalRetryable());
+        ctx.setPythonFailedCodePreview(extractPythonCodePreview(anchor));
+        ctx.setPythonRepairAttempt(anchor.getPythonRepairAttempt());
+        ctx.setPythonRepairPending(anchor.isPythonRepairPending());
+        ctx.setPythonRepairExhausted(anchor.isPythonRepairExhausted());
+        ctx.setPythonFailedRequestFingerprints(anchor.getPythonFailedRequestFingerprints());
         // crash reentry 时该标记决定从当前挂起节点还是下一节点继续。
         ctx.setResultConsumed(anchor.isResultConsumed());
         return ctx;
+    }
+
+    private static String extractPythonCodePreview(ToolJobAnchor anchor) {
+        if (anchor == null || anchor.getCreateRequestJson() == null
+                || anchor.getCreateRequestJson().isBlank()) {
+            return null;
+        }
+        try {
+            ExecuteRequest.Builder builder = ExecuteRequest.newBuilder();
+            JsonFormat.parser().merge(anchor.getCreateRequestJson(), builder);
+            return ToolJobFinalizer.boundedPreview(builder.getCode());
+        } catch (Exception parseFailure) {
+            log.warn("Cannot recover failed Python code from durable create request operation={}",
+                    anchor.getOperationId(), parseFailure);
+            return null;
+        }
     }
 
     public boolean heartbeat(String runId, String token, long version, String ownerId) {

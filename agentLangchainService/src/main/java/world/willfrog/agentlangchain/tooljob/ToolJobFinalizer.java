@@ -88,8 +88,13 @@ public class ToolJobFinalizer {
                 // stdout 只保存 16KB UTF-8 安全 preview，完整结果由 rawRef 指向。
                 anchor.setTerminalResultPreview(boundedPreview(resultResp.getStdout()));
                 anchor.setTerminalRawRef(emptyToNull(resultResp.getDatasetDir()));
+                anchor.setTerminalStderrPreview(boundedPreview(resultResp.getStderr()));
                 // error 保存结构化失败码，不用异常 message 替代。
                 anchor.setTerminalErrorCode(emptyToNull(resultResp.getError()));
+                anchor.setTerminalExitReason(emptyToNull(resultResp.getResourceUsage().getExitReason()));
+                if (!"SUCCEEDED".equals(terminalStatus)) {
+                    appendFailedPythonFingerprint(anchor);
+                }
                 try {
                     // 实际用量先冻结到 anchor，后续 USAGE 步骤幂等落账。
                     anchor.setTerminalUsageJson(JsonFormat.printer()
@@ -550,6 +555,18 @@ public class ToolJobFinalizer {
     }
 
     private static String emptyToNull(String s) { return s == null || s.isBlank() ? null : s.trim(); }
+
+    private static void appendFailedPythonFingerprint(ToolJobAnchor anchor) {
+        String fingerprint = anchor.getPythonRequestFingerprint();
+        if (fingerprint == null || fingerprint.isBlank()) {
+            return;
+        }
+        LinkedHashSet<String> history = new LinkedHashSet<>(
+                anchor.getPythonFailedRequestFingerprints() == null
+                        ? List.of() : anchor.getPythonFailedRequestFingerprints());
+        history.add(fingerprint.trim());
+        anchor.setPythonFailedRequestFingerprints(List.copyOf(history));
+    }
 
     /** Truncate to 16KB UTF-8 respecting MAX_RESULT_PREVIEW_BYTES including suffix. */
     static String boundedPreview(String s) {

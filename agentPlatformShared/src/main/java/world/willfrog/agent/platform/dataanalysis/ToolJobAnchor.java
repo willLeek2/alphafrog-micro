@@ -6,6 +6,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 
 import java.time.Instant;
+import java.util.Collections;
+import java.util.LinkedHashSet;
+import java.util.List;
 
 /**
  * 外部工具上下文切换的持久化锚点，存放在
@@ -98,14 +101,29 @@ public class ToolJobAnchor {
     private String terminalResultPreview;
     // terminalRawRef 指向完整结果产物，避免大对象进入 anchor。
     private String terminalRawRef;
+    // terminalStderrPreview 保存可注入修复 prompt 的有界 stderr，完整结果仍由 Sandbox 保管。
+    private String terminalStderrPreview;
     // terminalErrorCode 保存失败分类，供工作流决定失败语义。
     private String terminalErrorCode;
+    // terminalExitReason 是 Sandbox resourceUsage 的结束分类，用于区分用户代码失败与基础设施故障。
+    private String terminalExitReason;
     // terminalUsageJson 保存实际资源用量，finalizer 会幂等落账。
     private String terminalUsageJson;
     // terminalAt 保存 Sandbox 终态发生时间，不使用轮询发现时间替代。
     private Instant terminalAt;
     // nullable 用于区分“明确不可重试”和“旧协议未返回分类”；缺失时 fail-closed。
     private Boolean terminalRetryable;
+
+    // pythonRequestFingerprint 排除 operationId，用于跨 worker 判断模型是否原样重放已失败代码。
+    private String pythonRequestFingerprint;
+    // pythonRepairAttempt 表示当前 todo 已启动的修复轮次，0 是初次执行。
+    private int pythonRepairAttempt;
+    // pythonRepairPending 表示终态结果已消费、同一 todo 的修复 LLM 尚未产生下一条 Sandbox anchor。
+    private boolean pythonRepairPending;
+    // pythonRepairExhausted 保留“已耗尽”终态，防止消费成功后崩溃重入丢失失败语义。
+    private boolean pythonRepairExhausted;
+    // pythonFailedRequestFingerprints 是 durable 失败历史，阻止新 toolCallId 绕过同参数判重。
+    private List<String> pythonFailedRequestFingerprints = Collections.emptyList();
 
     // resultFetchState 区分等待结果体与已经确认丢失。
     private String resultFetchState;
@@ -259,8 +277,14 @@ public class ToolJobAnchor {
     public String getTerminalRawRef() { return terminalRawRef; }
     public void setTerminalRawRef(String terminalRawRef) { this.terminalRawRef = terminalRawRef; }
 
+    public String getTerminalStderrPreview() { return terminalStderrPreview; }
+    public void setTerminalStderrPreview(String terminalStderrPreview) { this.terminalStderrPreview = terminalStderrPreview; }
+
     public String getTerminalErrorCode() { return terminalErrorCode; }
     public void setTerminalErrorCode(String terminalErrorCode) { this.terminalErrorCode = terminalErrorCode; }
+
+    public String getTerminalExitReason() { return terminalExitReason; }
+    public void setTerminalExitReason(String terminalExitReason) { this.terminalExitReason = terminalExitReason; }
 
     public String getTerminalUsageJson() { return terminalUsageJson; }
     public void setTerminalUsageJson(String terminalUsageJson) { this.terminalUsageJson = terminalUsageJson; }
@@ -270,6 +294,41 @@ public class ToolJobAnchor {
 
     public Boolean getTerminalRetryable() { return terminalRetryable; }
     public void setTerminalRetryable(Boolean terminalRetryable) { this.terminalRetryable = terminalRetryable; }
+
+    public String getPythonRequestFingerprint() { return pythonRequestFingerprint; }
+    public void setPythonRequestFingerprint(String pythonRequestFingerprint) {
+        this.pythonRequestFingerprint = pythonRequestFingerprint;
+    }
+
+    public int getPythonRepairAttempt() { return pythonRepairAttempt; }
+    public void setPythonRepairAttempt(int pythonRepairAttempt) {
+        this.pythonRepairAttempt = Math.max(0, pythonRepairAttempt);
+    }
+
+    public boolean isPythonRepairPending() { return pythonRepairPending; }
+    public void setPythonRepairPending(boolean pythonRepairPending) {
+        this.pythonRepairPending = pythonRepairPending;
+    }
+
+    public boolean isPythonRepairExhausted() { return pythonRepairExhausted; }
+    public void setPythonRepairExhausted(boolean pythonRepairExhausted) {
+        this.pythonRepairExhausted = pythonRepairExhausted;
+    }
+
+    public List<String> getPythonFailedRequestFingerprints() { return pythonFailedRequestFingerprints; }
+    public void setPythonFailedRequestFingerprints(List<String> fingerprints) {
+        if (fingerprints == null || fingerprints.isEmpty()) {
+            this.pythonFailedRequestFingerprints = Collections.emptyList();
+            return;
+        }
+        LinkedHashSet<String> normalized = new LinkedHashSet<>();
+        for (String fingerprint : fingerprints) {
+            if (fingerprint != null && !fingerprint.isBlank()) {
+                normalized.add(fingerprint.trim());
+            }
+        }
+        this.pythonFailedRequestFingerprints = List.copyOf(normalized);
+    }
 
     public String getResultFetchState() { return resultFetchState; }
     public void setResultFetchState(String resultFetchState) { this.resultFetchState = resultFetchState; }

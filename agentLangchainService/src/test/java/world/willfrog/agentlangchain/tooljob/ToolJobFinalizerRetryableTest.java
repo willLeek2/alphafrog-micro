@@ -47,6 +47,7 @@ class ToolJobFinalizerRetryableTest {
         TaskResultResponse resp = TaskResultResponse.newBuilder()
                 .setStatus("FAILED")
                 .setError("oom_killed")
+                .setStderr("Traceback before OOM")
                 .setRetryable(true) // proto3 optional presence
                 .setResourceUsage(SandboxResourceUsage.newBuilder()
                         .setExitReason("OOM_KILLED").build())
@@ -57,6 +58,7 @@ class ToolJobFinalizerRetryableTest {
         anchor.setToolCallId("tc-1");
         anchor.setAttempt(1);
         anchor.setTaskId("task-1");
+        anchor.setPythonRequestFingerprint("sha256:failed-python");
         anchor.setAutoResume(true);
         anchor.setEstimateJson("{\"estimatedRows\":1000,\"estimatedBytes\":10000,\"fileCount\":1,"
                 + "\"selectedColumnRatio\":0.5,\"manifestMemberCount\":1,"
@@ -68,6 +70,10 @@ class ToolJobFinalizerRetryableTest {
 
         // Gate passed: terminalRetryable was set from result
         assertThat(anchor.getTerminalRetryable()).isTrue();
+        assertThat(anchor.getTerminalStderrPreview()).isEqualTo("Traceback before OOM");
+        assertThat(anchor.getTerminalExitReason()).isEqualTo("OOM_KILLED");
+        assertThat(anchor.getPythonFailedRequestFingerprints())
+                .containsExactly("sha256:failed-python");
         // Pipeline completed
         verify(anchorService).updateAnchorAndStatus(eq("run-1"), any(ToolJobAnchor.class),
                 eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.WAITING_TOOL_JOB));

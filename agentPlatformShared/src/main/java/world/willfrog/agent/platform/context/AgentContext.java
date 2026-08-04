@@ -7,6 +7,7 @@ import java.util.Map;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.config.RunStageConfig;
 import world.willfrog.agent.platform.config.StageLlmConfig;
+import world.willfrog.agent.platform.dataanalysis.PythonRepairContext;
 
 /**
  * Agent 运行时上下文中枢 —— 跨组件共享的 {@link ThreadLocal} 容器。
@@ -54,6 +55,8 @@ public class AgentContext {
     private static final ThreadLocal<Integer> SUB_AGENT_STEP_INDEX_HOLDER = new ThreadLocal<>();
     /** Python 沙箱代码二次重写(refine)的尝试次数,用于观测和限流 */
     private static final ThreadLocal<Integer> PYTHON_REFINE_ATTEMPT_HOLDER = new ThreadLocal<>();
+    /** 当前 todo 的 durable Python 修复历史投影，供容量准入前判重。 */
+    private static final ThreadLocal<PythonRepairContext> PYTHON_REPAIR_CONTEXT_HOLDER = new ThreadLocal<>();
     /** 当前 LangChain tool call id（与 SSE {@code tool_call_id} 对齐，供 observability tool trace）。 */
     private static final ThreadLocal<String> TOOL_CALL_ID_HOLDER = new ThreadLocal<>();
     /**
@@ -252,6 +255,22 @@ public class AgentContext {
     /** 获取 Python 沙箱 refine 的尝试次数。 */
     public static Integer getPythonRefineAttempt() {
         return PYTHON_REFINE_ATTEMPT_HOLDER.get();
+    }
+
+    public static void setPythonRepairContext(PythonRepairContext context) {
+        if (context == null) {
+            clearPythonRepairContext();
+            return;
+        }
+        PYTHON_REPAIR_CONTEXT_HOLDER.set(context);
+    }
+
+    public static PythonRepairContext getPythonRepairContext() {
+        return PYTHON_REPAIR_CONTEXT_HOLDER.get();
+    }
+
+    public static void clearPythonRepairContext() {
+        PYTHON_REPAIR_CONTEXT_HOLDER.remove();
     }
 
     /** 设置当前 tool call id（LangChain {@code ToolExecutionRequest#id()}，与 SSE 对齐）。 */
@@ -830,6 +849,7 @@ public class AgentContext {
         clearWorkflow();
         clearSubAgentStepIndex();
         clearPythonRefineAttempt();
+        clearPythonRepairContext();
         clearToolCallId();
         clearToolJobResumeHandoff();
         clearDecisionContext();

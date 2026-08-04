@@ -120,6 +120,57 @@ class PythonSandboxToolsDataIntenseTest {
     }
 
     @Test
+    void repeatedFailedPythonRequestIsBlockedBeforeCapacityAndSandboxDispatch() throws Exception {
+        fixtureDataset();
+        AtomicReference<ToolJobAnchor> preparingAnchor = new AtomicReference<>();
+        when(capacity.reserve(any(), any())).thenAnswer(invocation -> {
+            DataAnalysisOperationIdentity identity = invocation.getArgument(0);
+            return new DataAnalysisReservation(identity.reservationId(), identity,
+                    DataAnalysisResourceClass.STANDARD, 1,
+                    DataAnalysisReservationState.PREPARING, null, Instant.now());
+        });
+        when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenAnswer(invocation -> {
+            preparingAnchor.set(snapshot(invocation.getArgument(1)));
+            return true;
+        });
+        when(dispatchStore.persistAttached(eq("run-test"), any())).thenReturn(true);
+        when(dispatchStore.transferToPending(eq("run-test"), any())).thenReturn(true);
+        when(sandbox.createTask(any())).thenAnswer(invocation -> {
+            ExecuteRequest request = invocation.getArgument(0);
+            return ExecuteResponse.newBuilder().setTaskId("task-1")
+                    .setRequestFingerprint(request.getRequestFingerprint()).build();
+        });
+        when(sandbox.getTaskStatus(any())).thenReturn(
+                TaskStatusResponse.newBuilder().setStatus("RUNNING").build());
+
+        assertThrows(ExternalToolJobPendingException.class,
+                () -> tools.executePython("print(1)", "1", null, null, 30));
+        String failedFingerprint = preparingAnchor.get().getPythonRequestFingerprint();
+        assertThat(failedFingerprint).startsWith("sha256:");
+
+        AgentContext.setToolCallId("call-2");
+        AgentContext.setPythonRepairContext(new PythonRepairContext(
+                1, List.of(failedFingerprint)));
+        String repeated = tools.executePython("print(1)", "1", null, null, 30);
+
+        assertThat(repeated)
+                .contains("\"ok\":false")
+                .contains("\"code\":\"REPEATED_FAILED_PYTHON_ATTEMPT\"")
+                .contains(failedFingerprint);
+        verify(capacity, times(1)).reserve(any(), any());
+        verify(sandbox, times(1)).createTask(any());
+        verify(dispatchStore, times(1)).persistPreparing(eq("run-test"), any());
+
+        assertThrows(ExternalToolJobPendingException.class,
+                () -> tools.executePython("print(2)", "1", null, null, 30));
+        assertThat(preparingAnchor.get().getPythonRequestFingerprint()).isNotEqualTo(failedFingerprint);
+        verify(capacity, times(2)).reserve(any(), any());
+        verify(sandbox, times(2)).createTask(any());
+        verify(dispatchStore, times(2)).persistPreparing(eq("run-test"), any());
+    }
+
+    @Test
     void resumedSlowTaskConsumesExactOldHandoffBeforeSandboxCreate() throws Exception {
         fixtureDataset();
         AgentContext.setToolJobResumeHandoff("resume-token", 9L);

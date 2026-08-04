@@ -43,6 +43,19 @@ public class ToolJobResumeContext {
     private String terminalResultPreview;
     // rawRef 指向完整结果，避免把大结果塞回 Run 上下文。
     private String terminalRawRef;
+    // stderr/error/exitReason/retryable 用来仅对用户代码失败开启有界修复。
+    private String terminalStatus;
+    private String terminalStderrPreview;
+    private String terminalErrorCode;
+    private String terminalExitReason;
+    private Boolean terminalRetryable;
+    // 从 durable createRequestJson 投影出的有界原代码，供无会话记忆的新 worker 修复。
+    private String pythonFailedCodePreview;
+    // durable Python 修复状态：已启动轮次与已失败请求内容指纹。
+    private int pythonRepairAttempt;
+    private boolean pythonRepairPending;
+    private boolean pythonRepairExhausted;
+    private List<String> pythonFailedRequestFingerprints = Collections.emptyList();
     // resultConsumed 表示终态结果已被当前工作流接受，后续恢复从下一节点继续。
     private boolean resultConsumed;
 
@@ -86,6 +99,47 @@ public class ToolJobResumeContext {
 
     public String getTerminalRawRef() { return terminalRawRef; }
     public void setTerminalRawRef(String terminalRawRef) { this.terminalRawRef = terminalRawRef; }
+
+    public String getTerminalStatus() { return terminalStatus; }
+    public void setTerminalStatus(String terminalStatus) { this.terminalStatus = terminalStatus; }
+
+    public String getTerminalStderrPreview() { return terminalStderrPreview; }
+    public void setTerminalStderrPreview(String terminalStderrPreview) { this.terminalStderrPreview = terminalStderrPreview; }
+
+    public String getTerminalErrorCode() { return terminalErrorCode; }
+    public void setTerminalErrorCode(String terminalErrorCode) { this.terminalErrorCode = terminalErrorCode; }
+
+    public String getTerminalExitReason() { return terminalExitReason; }
+    public void setTerminalExitReason(String terminalExitReason) { this.terminalExitReason = terminalExitReason; }
+
+    public Boolean getTerminalRetryable() { return terminalRetryable; }
+    public void setTerminalRetryable(Boolean terminalRetryable) { this.terminalRetryable = terminalRetryable; }
+
+    public String getPythonFailedCodePreview() { return pythonFailedCodePreview; }
+    public void setPythonFailedCodePreview(String pythonFailedCodePreview) {
+        this.pythonFailedCodePreview = pythonFailedCodePreview;
+    }
+
+    public int getPythonRepairAttempt() { return pythonRepairAttempt; }
+    public void setPythonRepairAttempt(int pythonRepairAttempt) {
+        this.pythonRepairAttempt = Math.max(0, pythonRepairAttempt);
+    }
+
+    public boolean isPythonRepairPending() { return pythonRepairPending; }
+    public void setPythonRepairPending(boolean pythonRepairPending) {
+        this.pythonRepairPending = pythonRepairPending;
+    }
+
+    public boolean isPythonRepairExhausted() { return pythonRepairExhausted; }
+    public void setPythonRepairExhausted(boolean pythonRepairExhausted) {
+        this.pythonRepairExhausted = pythonRepairExhausted;
+    }
+
+    public List<String> getPythonFailedRequestFingerprints() { return pythonFailedRequestFingerprints; }
+    public void setPythonFailedRequestFingerprints(List<String> fingerprints) {
+        this.pythonFailedRequestFingerprints = fingerprints == null
+                ? Collections.emptyList() : List.copyOf(fingerprints);
+    }
 
     public boolean isResultConsumed() { return resultConsumed; }
     public void setResultConsumed(boolean resultConsumed) { this.resultConsumed = resultConsumed; }

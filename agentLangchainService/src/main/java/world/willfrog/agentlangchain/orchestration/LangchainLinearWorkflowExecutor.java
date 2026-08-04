@@ -1,6 +1,7 @@
 package world.willfrog.agentlangchain.orchestration;
 
 import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.service.AgentEventService;
@@ -19,6 +20,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
 import java.util.stream.Collectors;
@@ -55,6 +57,12 @@ public class LangchainLinearWorkflowExecutor {
     private final LangchainTodoNodeExecutor todoNodeExecutor;
     private final LangchainRunExecutionGuard executionGuard;
     private final AgentEventService eventService;
+
+    /** 初次提交也占一次；默认 3 表示最多初次 + 两轮修复。 */
+    @Value("${agent.flow.code-refine.max-attempts:3}")
+    private int maxPythonAttempts = 3;
+
+    private static final Set<String> REPAIRABLE_PYTHON_EXIT_REASONS = Set.of("NON_ZERO_EXIT");
 
     public LangchainLinearWorkflowResult execute(LangchainLinearWorkflowRequest request) {
         validate(request);
@@ -171,6 +179,7 @@ public class LangchainLinearWorkflowExecutor {
                 .collect(Collectors.toCollection(java.util.LinkedHashSet::new));
         // resultConsumed=true 表示上一次恢复已确认消费终态，当前应从下一节点继续。
         boolean handoffAccepted = resumeContext != null && resumeContext.isResultConsumed();
+        boolean activePythonRepair = handoffAccepted && isActivePythonRepair(resumeContext);
         if (handoffAccepted) {
             // 崩溃重入的 worker 继续持有同一 token/version；第二次长工具用它精确替换旧 anchor。
             AgentContext.setToolJobResumeHandoff(
@@ -198,12 +207,20 @@ public class LangchainLinearWorkflowExecutor {
                     toolCalls.get(), null);
         }
         // 已消费的失败终态不允许继续后续 Todo，直接恢复为确定性失败。
-        if (handoffAccepted && !resumeContext.isTerminalSuccess()) {
+        if (handoffAccepted && !resumeContext.isTerminalSuccess() && !activePythonRepair) {
+            if (resumeContext.isPythonRepairExhausted()) {
+                return failure(plan, completedTodos, "python_repair_exhausted",
+                        toolCalls.get(), pythonRepairExhaustedMetadata(resumeContext));
+            }
             return failure(plan, completedTodos, "external_tool_terminal_failure",
                     toolCalls.get(), null);
         }
         // 从原 plan 开头遍历，依靠 completedIds/sequence 精确跳过持久化前缀。
         for (TodoItem item : plan.getItems()) {
+            // crash reentry 会从已接受的修复 handoff 重跑当前 Todo，不再次消费终态或增加轮次。
+            ToolJobResumeContext repairExecutionContext = activePythonRepair
+                    && java.util.Objects.equals(item.getId(), resumeContext.getTodoId())
+                    ? resumeContext : null;
             // 已完成节点已经在 completedTodos 中恢复，绝不重复执行。
             if (resumeContext != null && completedIds.contains(item.getId())) {
                 continue;
@@ -221,45 +238,80 @@ public class LangchainLinearWorkflowExecutor {
                 String injectedOutput = resumeTerminalOutput(resumeContext);
                 // 失败终态先发节点失败，再推进/持久化消费位置，保证重入幂等。
                 if (!resumeContext.isTerminalSuccess()) {
+                    if (!isRepairablePythonFailure(resumeContext)) {
+                        emitTodoNodeEvent(request.getRunId(), request.getUserId(),
+                                "TODO_NODE_FAILED", item, "external_tool_terminal_failure", 0,
+                                null, false, null);
+                        prepareAcceptedHandoff(resumeContext, plan, completedTodos, item, toolCalls.get(), false);
+                        // 消费确认是 durable gate；失败则保留 LAUNCHING anchor 供再次恢复。
+                        if (terminalConsumed == null || !terminalConsumed.getAsBoolean()) {
+                            return failure(plan, completedTodos, "resume_result_consume_failed",
+                                    toolCalls.get(), null);
+                        }
+                        return failure(plan, completedTodos, "external_tool_terminal_failure",
+                                toolCalls.get(), null);
+                    }
+                    int nextRepairAttempt = resumeContext.getPythonRepairAttempt() + 1;
+                    if (nextRepairAttempt >= effectiveMaxPythonAttempts()) {
+                        Map<String, Object> metadata = pythonRepairExhaustedMetadata(resumeContext);
+                        emitTodoNodeEvent(request.getRunId(), request.getUserId(),
+                                "TODO_NODE_FAILED", item, "python_repair_exhausted", 0,
+                                metadata, false, null);
+                        prepareAcceptedHandoff(resumeContext, plan, completedTodos, item, toolCalls.get(), false);
+                        resumeContext.setPythonRepairExhausted(true);
+                        if (terminalConsumed == null || !terminalConsumed.getAsBoolean()) {
+                            return failure(plan, completedTodos, "resume_result_consume_failed",
+                                    toolCalls.get(), null);
+                        }
+                        return failure(plan, completedTodos, "python_repair_exhausted",
+                                toolCalls.get(), metadata);
+                    }
+                    prepareRepairHandoff(
+                            resumeContext, completedTodos, item, toolCalls.get(), nextRepairAttempt);
+                    Map<String, Object> repairMetadata = Map.of(
+                            "python_repair_attempt", nextRepairAttempt,
+                            "failed_request_count", resumeContext.getPythonFailedRequestFingerprints().size(),
+                            "exit_reason", nvl(resumeContext.getTerminalExitReason(), "unknown"));
                     emitTodoNodeEvent(request.getRunId(), request.getUserId(),
-                            "TODO_NODE_FAILED", item, "external_tool_terminal_failure", 0,
-                            null, false, null);
-                    prepareAcceptedHandoff(resumeContext, plan, completedTodos, item, toolCalls.get(), false);
-                    // 消费确认是 durable gate；失败则保留 LAUNCHING anchor 供再次恢复。
+                            "TODO_NODE_REPAIRING", item, null, 0,
+                            repairMetadata, false, null);
                     if (terminalConsumed == null || !terminalConsumed.getAsBoolean()) {
                         return failure(plan, completedTodos, "resume_result_consume_failed",
                                 toolCalls.get(), null);
                     }
-                    return failure(plan, completedTodos, "external_tool_terminal_failure",
-                            toolCalls.get(), null);
+                    AgentContext.setToolJobResumeHandoff(
+                            resumeContext.getResumeToken(), resumeContext.getResumeLeaseVersion());
+                    repairExecutionContext = resumeContext;
                 }
-                // 成功输出可能包含 dataset ref，必须在后续 Todo 执行前重新注册。
-                DatasetRefRegistry.registerFromJson(injectedOutput, datasetRefs);
-                // 把挂起 Todo 追加为已完成，但不增加 toolCalls：那次调用在挂起前已经计数。
-                completedTodos.add(LangchainCompletedTodo.builder()
-                        .todoId(item.getId())
-                        .sequence(item.getSequence())
-                        .description(item.getDescription())
-                        .modelOutput(injectedOutput)
-                        .output(injectedOutput)
-                        .summary("external_tool_result")
-                        .build());
-                emitTodoNodeEvent(request.getRunId(), request.getUserId(),
-                        "TODO_NODE_COMPLETED", item, null,
-                        System.currentTimeMillis() - nodeStartMs, null, false, null);
-                // 在内存 context 中把恢复点推进到下一 Todo 或 FINAL 哨兵。
-                prepareAcceptedHandoff(resumeContext, plan, completedTodos, item, toolCalls.get(), true);
-                // 先持久化推进后的 checkpoint，成功后才允许继续执行后续 Todo。
-                if (terminalConsumed == null || !terminalConsumed.getAsBoolean()) {
-                    return failure(plan, completedTodos, "resume_result_consume_failed",
-                            toolCalls.get(), null);
+                if (resumeContext.isTerminalSuccess()) {
+                    // 成功输出可能包含 dataset ref，必须在后续 Todo 执行前重新注册。
+                    DatasetRefRegistry.registerFromJson(injectedOutput, datasetRefs);
+                    // 把挂起 Todo 追加为已完成，但不增加 toolCalls：那次调用在挂起前已经计数。
+                    completedTodos.add(LangchainCompletedTodo.builder()
+                            .todoId(item.getId())
+                            .sequence(item.getSequence())
+                            .description(item.getDescription())
+                            .modelOutput(injectedOutput)
+                            .output(injectedOutput)
+                            .summary("external_tool_result")
+                            .build());
+                    emitTodoNodeEvent(request.getRunId(), request.getUserId(),
+                            "TODO_NODE_COMPLETED", item, null,
+                            System.currentTimeMillis() - nodeStartMs, null, false, null);
+                    // 在内存 context 中把恢复点推进到下一 Todo 或 FINAL 哨兵。
+                    prepareAcceptedHandoff(resumeContext, plan, completedTodos, item, toolCalls.get(), true);
+                    // 先持久化推进后的 checkpoint，成功后才允许继续执行后续 Todo。
+                    if (terminalConsumed == null || !terminalConsumed.getAsBoolean()) {
+                        return failure(plan, completedTodos, "resume_result_consume_failed",
+                                toolCalls.get(), null);
+                    }
+                    // markHandoffAccepted 已把 Run 推回 EXECUTING。后续长工具只能凭这份
+                    // token/version 原子替换旧 LAUNCHING anchor。
+                    AgentContext.setToolJobResumeHandoff(
+                            resumeContext.getResumeToken(), resumeContext.getResumeLeaseVersion());
+                    // 当前节点已经通过注入完成，进入原 plan 的下一节点。
+                    continue;
                 }
-                // markHandoffAccepted 已把 Run 推回 EXECUTING。后续长工具只能凭这份
-                // token/version 原子替换旧 LAUNCHING anchor。
-                AgentContext.setToolJobResumeHandoff(
-                        resumeContext.getResumeToken(), resumeContext.getResumeLeaseVersion());
-                // 当前节点已经通过注入完成，进入原 plan 的下一节点。
-                continue;
             }
             Optional<String> stop = executionGuard.stopReason(request.getRunId(), request.getUserId());
             if (stop.isPresent()) {
@@ -278,8 +330,10 @@ public class LangchainLinearWorkflowExecutor {
             emitTodoNodeEvent(request.getRunId(), request.getUserId(),
                     "TODO_NODE_STARTED", item, null, 0, null, false, null);
             long nodeStartMs = System.currentTimeMillis();
-            LangchainTodoNodeResult nodeResult = todoNodeExecutor.execute(
-                    request, item, completedTodos, datasetRefs, toolCalls);
+            LangchainTodoNodeResult nodeResult = repairExecutionContext == null
+                    ? todoNodeExecutor.execute(request, item, completedTodos, datasetRefs, toolCalls)
+                    : todoNodeExecutor.execute(
+                            request, item, completedTodos, datasetRefs, toolCalls, repairExecutionContext);
             long nodeDurationMs = System.currentTimeMillis() - nodeStartMs;
             // 外部工具 pending 不属于节点失败：保存挂起身份并立刻返回到 pipeline。
             if (nodeResult.isSuspended()) {
@@ -380,8 +434,64 @@ public class LangchainLinearWorkflowExecutor {
         context.setTodoId(next == null ? ToolJobResumeContext.FINAL_TODO_ID : next.getId());
         // 哨兵沿用当前 sequence；有下一节点时保存其真实 sequence。
         context.setTodoSequence(next == null ? current.getSequence() : next.getSequence());
+        context.setPythonRepairPending(false);
         // 最后置 resultConsumed，表示以上上下文字段已经准备好交给 durable consume CAS。
         context.setResultConsumed(true);
+    }
+
+    private void prepareRepairHandoff(ToolJobResumeContext context,
+                                      List<LangchainCompletedTodo> completedTodos,
+                                      TodoItem current,
+                                      int toolCallsUsed,
+                                      int repairAttempt) {
+        List<CompletedTodoRecord> records = completedTodos.stream().map(todo -> {
+            CompletedTodoRecord record = new CompletedTodoRecord();
+            record.setTodoId(todo.getTodoId());
+            record.setSequence(todo.getSequence());
+            record.setDescription(todo.getDescription());
+            record.setModelOutput(todo.getModelOutput());
+            record.setOutput(todo.getOutput());
+            record.setSummary(todo.getSummary());
+            return record;
+        }).toList();
+        context.setCompletedTodos(records);
+        context.setToolCallsUsed(toolCallsUsed);
+        context.setTodoId(current.getId());
+        context.setTodoSequence(current.getSequence());
+        context.setPythonRepairAttempt(repairAttempt);
+        context.setPythonRepairPending(true);
+        context.setPythonRepairExhausted(false);
+        context.setResultConsumed(true);
+    }
+
+    private boolean isActivePythonRepair(ToolJobResumeContext context) {
+        return context != null
+                && !context.isTerminalSuccess()
+                && context.isPythonRepairPending()
+                && context.getPythonRepairAttempt() > 0
+                && context.getPythonFailedRequestFingerprints() != null
+                && !context.getPythonFailedRequestFingerprints().isEmpty();
+    }
+
+    private boolean isRepairablePythonFailure(ToolJobResumeContext context) {
+        return context != null
+                && "FAILED".equals(context.getTerminalStatus())
+                && Boolean.FALSE.equals(context.getTerminalRetryable())
+                && REPAIRABLE_PYTHON_EXIT_REASONS.contains(
+                        nvl(context.getTerminalExitReason(), "").toUpperCase(java.util.Locale.ROOT))
+                && context.getPythonFailedRequestFingerprints() != null
+                && !context.getPythonFailedRequestFingerprints().isEmpty();
+    }
+
+    private int effectiveMaxPythonAttempts() {
+        return Math.max(1, Math.min(maxPythonAttempts, 10));
+    }
+
+    private Map<String, Object> pythonRepairExhaustedMetadata(ToolJobResumeContext context) {
+        return Map.of(
+                "python_repair_exhausted", true,
+                "max_attempts", effectiveMaxPythonAttempts(),
+                "failed_request_count", context.getPythonFailedRequestFingerprints().size());
     }
 
     private List<LangchainCompletedTodo> restoreCompletedTodos(List<CompletedTodoRecord> records) {

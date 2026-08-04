@@ -53,9 +53,27 @@ public record CanonicalSandboxCreateSpec(
     }
 
     public byte[] canonicalBytes() {
+        return canonicalBytes(true);
+    }
+
+    /**
+     * 用于代码修复判重的请求内容指纹。
+     *
+     * <p>{@link #requestFingerprint()} 必须包含 operationId，才能保护同一次 Sandbox
+     * create 的 exactly-once 身份；模型修复会产生新的 toolCallId/operationId，因此
+     * 不能用它判断“代码和有效参数是否原样重放”。本指纹只排除 operationId，其余
+     * 代码、数据快照、资源、运行时、依赖和 options 全部保持相同编码契约。</p>
+     */
+    public String repairRequestFingerprint() {
+        return sha256(canonicalBytes(false));
+    }
+
+    private byte[] canonicalBytes(boolean includeOperationId) {
         ByteArrayOutputStream output = new ByteArrayOutputStream(512);
         append(output, "schemaVersion", schemaVersion);
-        append(output, "operationId", operationId);
+        if (includeOperationId) {
+            append(output, "operationId", operationId);
+        }
         append(output, "codeHash", codeHash);
         append(output, "immutableDatasetSnapshotDigest", immutableDatasetSnapshotDigest);
         append(output, "resourceClass", resourceClass.name());
@@ -68,8 +86,12 @@ public record CanonicalSandboxCreateSpec(
     }
 
     public String requestFingerprint() {
+        return sha256(canonicalBytes());
+    }
+
+    private static String sha256(byte[] canonicalBytes) {
         try {
-            byte[] digest = MessageDigest.getInstance("SHA-256").digest(canonicalBytes());
+            byte[] digest = MessageDigest.getInstance("SHA-256").digest(canonicalBytes);
             return SHA_256_PREFIX + HexFormat.of().formatHex(digest);
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException("JVM does not provide SHA-256", e);

@@ -35,6 +35,28 @@ class DataAnalysisContractsTest {
     }
 
     @Test
+    void repairFingerprintIgnoresOnlyOperationIdentity() {
+        CanonicalSandboxCreateSpec first = createSpec(60_000L);
+        CanonicalSandboxCreateSpec newToolCall = new CanonicalSandboxCreateSpec(
+                first.schemaVersion(),
+                "run-1:call-2:1",
+                first.codeHash(),
+                first.immutableDatasetSnapshotDigest(),
+                first.resourceClass(),
+                first.memoryLimitBytes(),
+                first.timeoutMillis(),
+                first.runtimeEnvironmentVersion(),
+                first.librariesDigest(),
+                first.sandboxOptionsDigest());
+
+        assertNotEquals(first.requestFingerprint(), newToolCall.requestFingerprint());
+        assertEquals(first.repairRequestFingerprint(), newToolCall.repairRequestFingerprint());
+        assertNotEquals(
+                first.repairRequestFingerprint(),
+                createSpec(90_000L).repairRequestFingerprint());
+    }
+
+    @Test
     void canonicalCreateSpecRejectsInvalidDigests() {
         assertThrows(
                 IllegalArgumentException.class,

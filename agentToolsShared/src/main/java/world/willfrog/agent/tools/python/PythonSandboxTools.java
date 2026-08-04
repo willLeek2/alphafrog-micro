@@ -514,6 +514,29 @@ public class PythonSandboxTools {
                     "Dataset estimate overflowed admission counters", Map.of());
         }
 
+        // 修复判重必须在容量 reserve 和 Sandbox create 之前完成，避免原样重放占用配额。
+        long timeoutMillis = timeoutSeconds * 1000L;
+        CanonicalSandboxCreateSpec spec = new CanonicalSandboxCreateSpec(
+                CanonicalSandboxCreateSpec.CURRENT_SCHEMA_VERSION,
+                identity.operationId(),
+                sha256(baseRequest.getCode()),
+                datasetSnapshot.immutableDigest(),
+                decision.resourceClass(),
+                decision.memoryLimitBytes(),
+                timeoutMillis,
+                runtimeEnvironmentVersion,
+                sha256(baseRequest.getLibrariesList().stream().sorted().collect(Collectors.joining("\n"))),
+                sha256(""));
+        String pythonRequestFingerprint = spec.repairRequestFingerprint();
+        PythonRepairContext repairContext = AgentContext.getPythonRepairContext();
+        if (repairContext != null && repairContext.hasFailed(pythonRequestFingerprint)) {
+            return fail("executePython", "REPEATED_FAILED_PYTHON_ATTEMPT",
+                    "The same Python code and effective parameters already failed in this Todo; "
+                            + "change the code or meaningful parameters before retrying",
+                    Map.of("python_repair_attempt", repairContext.repairAttempt(),
+                            "request_fingerprint", pythonRequestFingerprint));
+        }
+
         // reservation 是实际容量所有权；取得后任何退出路径都必须释放或转交 pending。
         DataAnalysisReservation reservation;
         try {
@@ -527,20 +550,6 @@ public class PythonSandboxTools {
                     admission.reason() != CapacityAdmissionException.Reason.TASK_TOO_LARGE));
         }
 
-        // timeout 同时用于 Sandbox 任务和 anchor 的最大等待期限。
-        long timeoutMillis = timeoutSeconds * 1000L;
-        // canonical spec 冻结代码、数据、依赖、资源和运行时版本，用于幂等 fingerprint。
-        CanonicalSandboxCreateSpec spec = new CanonicalSandboxCreateSpec(
-                CanonicalSandboxCreateSpec.CURRENT_SCHEMA_VERSION,
-                identity.operationId(),
-                sha256(baseRequest.getCode()),
-                datasetSnapshot.immutableDigest(),
-                reservation.resourceClass(),
-                decision.memoryLimitBytes(),
-                timeoutMillis,
-                runtimeEnvironmentVersion,
-                sha256(baseRequest.getLibrariesList().stream().sorted().collect(Collectors.joining("\n"))),
-                sha256(""));
         // 把准入结果与 canonical identity 写入真正发送给 Sandbox 的请求。
         ExecuteRequest request = baseRequest.toBuilder()
                 .setResourceClass(reservation.resourceClass().name())
@@ -567,6 +576,14 @@ public class PythonSandboxTools {
         // 幂等操作身份与请求指纹用于启动恢复查询/重放。
         anchor.setOperationId(identity.operationId());
         anchor.setRequestFingerprint(spec.requestFingerprint());
+        anchor.setPythonRequestFingerprint(pythonRequestFingerprint);
+        // 新请求已经形成自己的 durable anchor，旧终态后的“待启动修复”阶段结束。
+        anchor.setPythonRepairPending(false);
+        anchor.setPythonRepairExhausted(false);
+        if (repairContext != null) {
+            anchor.setPythonRepairAttempt(repairContext.repairAttempt());
+            anchor.setPythonFailedRequestFingerprints(repairContext.failedRequestFingerprints());
+        }
         anchor.setCanonicalCreateSpecJson(objectMapper.writeValueAsString(spec));
         // createRequestJson 允许进程在 RPC 前后崩溃后重放同一 canonical 请求。
         anchor.setCreateRequestJson(JsonFormat.printer()

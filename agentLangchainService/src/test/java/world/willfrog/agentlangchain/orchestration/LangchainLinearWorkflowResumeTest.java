@@ -231,6 +231,203 @@ class LangchainLinearWorkflowResumeTest {
         verifyNoInteractions(planner);
     }
 
+    @Test
+    void userCodeTerminalFailureReentersSameTodoWithDurableRepairContext() {
+        LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
+        LangchainTodoNodeExecutor nodeExecutor = mock(LangchainTodoNodeExecutor.class);
+        LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
+        when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
+        AtomicReference<ToolJobResumeContext> repairSeen = new AtomicReference<>();
+        when(nodeExecutor.execute(any(), any(), any(), any(), any(),
+                any(ToolJobResumeContext.class))).thenAnswer(invocation -> {
+            repairSeen.set(invocation.getArgument(5));
+            assertThat(AgentContext.getToolJobResumeToken()).isEqualTo("repair-token");
+            return LangchainTodoNodeResult.success("repaired-output", 1);
+        });
+        when(nodeExecutor.writeFinalAnswer(any(), any())).thenReturn("final-after-repair");
+        LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
+                planner, nodeExecutor, guard, mock(AgentEventService.class));
+        LangchainTodoPlan plan = LangchainTodoPlan.builder()
+                .executionMode(PlanExecutionMode.LINEAR)
+                .items(List.of(item("todo-2", 2)))
+                .build();
+        ToolJobResumeContext context = failedPythonContext(false, 0);
+        AtomicInteger consumed = new AtomicInteger();
+
+        LangchainLinearWorkflowResult result = executor.resumePlanned(
+                request(), plan, context, () -> {
+                    consumed.incrementAndGet();
+                    return true;
+                });
+
+        assertThat(result.isSuccess()).isTrue();
+        assertThat(result.getFinalAnswer()).isEqualTo("final-after-repair");
+        assertThat(consumed.get()).isEqualTo(1);
+        assertThat(context.isResultConsumed()).isTrue();
+        assertThat(context.getTodoId()).isEqualTo("todo-2");
+        assertThat(context.getPythonRepairAttempt()).isEqualTo(1);
+        assertThat(context.isPythonRepairPending()).isTrue();
+        assertThat(repairSeen.get()).isSameAs(context);
+        assertThat(result.getCompletedTodos()).extracting(LangchainCompletedTodo::getTodoId)
+                .containsExactly("todo-2");
+        verify(nodeExecutor).execute(any(), any(), any(), any(), any(), same(context));
+        verifyNoInteractions(planner);
+    }
+
+    @Test
+    void acceptedPythonRepairCrashReentryDoesNotConsumeOrIncrementAgain() {
+        LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
+        LangchainTodoNodeExecutor nodeExecutor = mock(LangchainTodoNodeExecutor.class);
+        LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
+        when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
+        when(nodeExecutor.execute(any(), any(), any(), any(), any(),
+                any(ToolJobResumeContext.class)))
+                .thenReturn(LangchainTodoNodeResult.success("repaired-output", 1));
+        when(nodeExecutor.writeFinalAnswer(any(), any())).thenReturn("final-after-restart");
+        LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
+                planner, nodeExecutor, guard, mock(AgentEventService.class));
+        LangchainTodoPlan plan = LangchainTodoPlan.builder()
+                .executionMode(PlanExecutionMode.LINEAR)
+                .items(List.of(item("todo-2", 2)))
+                .build();
+        ToolJobResumeContext context = failedPythonContext(true, 1);
+        AtomicInteger consumed = new AtomicInteger();
+
+        LangchainLinearWorkflowResult result = executor.resumePlanned(
+                request(), plan, context, () -> {
+                    consumed.incrementAndGet();
+                    return true;
+                });
+
+        assertThat(result.isSuccess()).isTrue();
+        assertThat(consumed.get()).isZero();
+        assertThat(context.getPythonRepairAttempt()).isEqualTo(1);
+        assertThat(context.isPythonRepairPending()).isTrue();
+        verify(nodeExecutor).execute(any(), any(), any(), any(), any(), same(context));
+        verifyNoInteractions(planner);
+    }
+
+    @Test
+    void pythonRepairExhaustionConsumesTerminalAndFailsWithoutAnotherLlmCall() {
+        LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
+        LangchainTodoNodeExecutor nodeExecutor = mock(LangchainTodoNodeExecutor.class);
+        LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
+        when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
+        LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
+                planner, nodeExecutor, guard, mock(AgentEventService.class));
+        LangchainTodoPlan plan = LangchainTodoPlan.builder()
+                .executionMode(PlanExecutionMode.LINEAR)
+                .items(List.of(item("todo-2", 2)))
+                .build();
+        ToolJobResumeContext context = failedPythonContext(false, 2);
+        AtomicInteger consumed = new AtomicInteger();
+
+        LangchainLinearWorkflowResult result = executor.resumePlanned(
+                request(), plan, context, () -> {
+                    consumed.incrementAndGet();
+                    return true;
+                });
+
+        assertThat(result.isSuccess()).isFalse();
+        assertThat(result.getFailureReason()).isEqualTo("python_repair_exhausted");
+        assertThat(result.getFailureMetadata())
+                .containsEntry("python_repair_exhausted", true)
+                .containsEntry("max_attempts", 3);
+        assertThat(consumed.get()).isEqualTo(1);
+        assertThat(context.isPythonRepairPending()).isFalse();
+        assertThat(context.isPythonRepairExhausted()).isTrue();
+        verify(nodeExecutor, never()).execute(any(), any(), any(), any(), any());
+        verify(nodeExecutor, never()).execute(any(), any(), any(), any(), any(), any());
+        verify(nodeExecutor, never()).writeFinalAnswer(any(), any());
+        verifyNoInteractions(planner);
+    }
+
+    @Test
+    void crashAfterPersistedRepairExhaustionFailsDeterministicallyWithoutAnotherLlmCall() {
+        LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
+        LangchainTodoNodeExecutor nodeExecutor = mock(LangchainTodoNodeExecutor.class);
+        LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
+        when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
+        LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
+                planner, nodeExecutor, guard, mock(AgentEventService.class));
+        LangchainTodoPlan plan = LangchainTodoPlan.builder()
+                .executionMode(PlanExecutionMode.LINEAR)
+                .items(List.of(item("todo-2", 2)))
+                .build();
+        ToolJobResumeContext context = failedPythonContext(true, 2);
+        context.setPythonRepairPending(false);
+        context.setPythonRepairExhausted(true);
+
+        LangchainLinearWorkflowResult result = executor.resumePlanned(
+                request(), plan, context, () -> {
+                    throw new AssertionError("terminal must not be consumed twice");
+                });
+
+        assertThat(result.isSuccess()).isFalse();
+        assertThat(result.getFailureReason()).isEqualTo("python_repair_exhausted");
+        assertThat(result.getFailureMetadata()).containsEntry("max_attempts", 3);
+        verifyNoInteractions(nodeExecutor, planner);
+    }
+
+    @Test
+    void executionErrorRemainsFailFastInsteadOfEnteringCodeRepair() {
+        LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
+        LangchainTodoNodeExecutor nodeExecutor = mock(LangchainTodoNodeExecutor.class);
+        LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
+        when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
+        LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
+                planner, nodeExecutor, guard, mock(AgentEventService.class));
+        LangchainTodoPlan plan = LangchainTodoPlan.builder()
+                .executionMode(PlanExecutionMode.LINEAR)
+                .items(List.of(item("todo-2", 2)))
+                .build();
+        ToolJobResumeContext context = failedPythonContext(false, 0);
+        context.setTerminalExitReason("EXECUTION_ERROR");
+
+        LangchainLinearWorkflowResult result = executor.resumePlanned(
+                request(), plan, context, () -> true);
+
+        assertThat(result.getFailureReason()).isEqualTo("external_tool_terminal_failure");
+        verifyNoInteractions(nodeExecutor, planner);
+    }
+
+    @Test
+    void repairPromptContainsBoundedTerminalDiagnosticsAndNoReplayInstruction() {
+        ToolJobResumeContext context = failedPythonContext(true, 1);
+
+        assertThat(LangchainTodoNodeExecutor.buildPythonRepairUserMessage(context))
+                .contains("PYTHON_REPAIR_CONTEXT")
+                .contains("repair_attempt: 1")
+                .contains("exit_reason: NON_ZERO_EXIT")
+                .contains("loaded five datasets")
+                .contains("Traceback: bad date")
+                .contains("print('broken date parser')")
+                .contains("禁止原样重放");
+    }
+
+    private static ToolJobResumeContext failedPythonContext(boolean consumed, int repairAttempt) {
+        ToolJobResumeContext context = new ToolJobResumeContext();
+        context.setRunId("run-1");
+        context.setTodoId("todo-2");
+        context.setTodoSequence(2);
+        context.setResumeToken("repair-token");
+        context.setResumeLeaseVersion(7L);
+        context.setResumeLauncherOwnerId("owner-1");
+        context.setTerminalSuccess(false);
+        context.setTerminalStatus("FAILED");
+        context.setTerminalRetryable(false);
+        context.setTerminalErrorCode("execution_failed");
+        context.setTerminalExitReason("NON_ZERO_EXIT");
+        context.setTerminalResultPreview("loaded five datasets");
+        context.setTerminalStderrPreview("Traceback: bad date");
+        context.setPythonFailedCodePreview("print('broken date parser')");
+        context.setPythonRepairAttempt(repairAttempt);
+        context.setPythonRepairPending(consumed);
+        context.setPythonFailedRequestFingerprints(List.of("sha256:failed-code"));
+        context.setResultConsumed(consumed);
+        return context;
+    }
+
     private static TodoItem item(String id, int sequence) {
         return TodoItem.builder().id(id).sequence(sequence).description(id + "-description").build();
     }
