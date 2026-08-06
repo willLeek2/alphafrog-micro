@@ -3,6 +3,7 @@ package world.willfrog.agentlangchain.facade;
 import org.junit.jupiter.api.Test;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.service.AgentArtifactService;
+import world.willfrog.agent.platform.service.SnapshotPartService;
 import world.willfrog.alphafrogmicro.agent.idl.AgentArtifactMessage;
 import world.willfrog.alphafrogmicro.agent.idl.DownloadAgentArtifactRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentArtifactsRequest;
@@ -16,8 +17,9 @@ class LangchainArtifactFacadeServiceTest {
 
     private final LangchainRunReadService readService = mock(LangchainRunReadService.class);
     private final AgentArtifactService artifactService = mock(AgentArtifactService.class);
+    private final SnapshotPartService snapshotPartService = mock(SnapshotPartService.class);
     private final LangchainArtifactFacadeService service =
-            new LangchainArtifactFacadeService(readService, artifactService);
+            new LangchainArtifactFacadeService(readService, artifactService, snapshotPartService);
 
     @Test
     void listArtifactsDelegatesToSharedService() {

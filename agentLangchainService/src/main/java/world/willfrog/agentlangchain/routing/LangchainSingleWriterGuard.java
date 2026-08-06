@@ -4,8 +4,8 @@ import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.entity.AgentRun;
 
 /**
- * Basic run access guard. With legacy agentService deprecated, langchain owns
- * the default AgentDubboService path and can read/write existing runs.
+ * Basic run access guard. Langchain owns the default AgentDubboService path and can
+ * read/write existing runs.
  */
 @Component
 public class LangchainSingleWriterGuard {

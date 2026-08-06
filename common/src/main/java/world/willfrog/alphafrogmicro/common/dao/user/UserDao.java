@@ -3,6 +3,7 @@ package world.willfrog.alphafrogmicro.common.dao.user;
 import org.apache.ibatis.annotations.*;
 import world.willfrog.alphafrogmicro.common.pojo.user.User;
 
+import java.math.BigDecimal;
 import java.util.List;
 
 @Mapper
@@ -43,6 +44,13 @@ public interface UserDao {
 
     @Select("SELECT * " +
             "FROM alphafrog_user " +
+            "WHERE user_id = #{userId} " +
+            "LIMIT 1 FOR UPDATE")
+    @ResultMap("userResultMap")
+    User getUserByIdForUpdate(@Param("userId") Long userId);
+
+    @Select("SELECT * " +
+            "FROM alphafrog_user " +
             "WHERE email = #{email} " +
             "LIMIT 1")
     @ResultMap("userResultMap")
@@ -54,9 +62,19 @@ public interface UserDao {
     int increaseCreditByUserId(@Param("userId") Long userId, @Param("delta") int delta);
 
     @Update("UPDATE alphafrog_user " +
+            "SET credit = COALESCE(credit, 0) + #{delta} " +
+            "WHERE user_id = #{userId}")
+    int increaseCreditByUserIdDecimal(@Param("userId") Long userId, @Param("delta") BigDecimal delta);
+
+    @Update("UPDATE alphafrog_user " +
             "SET credit = GREATEST(0, COALESCE(credit, 0) - #{delta}) " +
             "WHERE user_id = #{userId}")
     int decreaseCreditByUserId(@Param("userId") Long userId, @Param("delta") int delta);
+
+    @Update("UPDATE alphafrog_user " +
+            "SET credit = GREATEST(0, COALESCE(credit, 0) - #{delta}) " +
+            "WHERE user_id = #{userId}")
+    int decreaseCreditByUserIdDecimal(@Param("userId") Long userId, @Param("delta") BigDecimal delta);
 
     @Update("UPDATE alphafrog_user " +
             "SET password = #{encodedPassword} " +

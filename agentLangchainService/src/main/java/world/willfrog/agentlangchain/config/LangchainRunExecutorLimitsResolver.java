@@ -6,13 +6,20 @@ import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 
+/**
+ * 合并静态硬上限、本地热配置和自适应 core 覆盖，产出调度器每次准入使用的限制快照。
+ *
+ * <p>hardLimits 在启动时冻结，运行期配置只能在硬上限内缩放；adaptiveCoreOverride 只改
+ * core，不得扩大 max 或 queue。这样运维热调节和延迟自适应都不能突破实例启动时的安全边界。</p>
+ */
 @Component
 @Slf4j
 public class LangchainRunExecutorLimitsResolver {
 
     private final AgentLlmLocalConfigLoader configLoader;
     private final LangchainRunExecutorLimits hardLimits;
-    private volatile Integer adaptiveCoreOverride; // null → no override
+    /** null 表示不用自适应覆盖；volatile 保证调度线程立即看到控制器的新值。 */
+    private volatile Integer adaptiveCoreOverride;
 
     public LangchainRunExecutorLimitsResolver(
             @Value("${agent.langchain.run.executor.core-pool-size:4}") int defaultCorePoolSize,
@@ -38,6 +45,7 @@ public class LangchainRunExecutorLimitsResolver {
     }
 
     public LangchainRunExecutorLimits currentLimits() {
+        // 每次准入重新读本地配置，使 current.parallel.current 的缩放无需重启。
         AgentLlmProperties.ExecutorConfig executorConfig = configLoader.current()
                 .map(AgentLlmProperties::getExecutor)
                 .orElse(null);
@@ -57,11 +65,12 @@ public class LangchainRunExecutorLimitsResolver {
     private LangchainRunExecutorLimits applyOverrideIfSet(LangchainRunExecutorLimits base) {
         Integer override = adaptiveCoreOverride;
         if (override == null) return base;
+        // 自适应只能收缩/恢复 core，不能越过硬 core 或当前 max。
         int core = Math.max(1, Math.min(override, Math.min(hardLimits.getCorePoolSize(), base.getMaxPoolSize())));
         return new LangchainRunExecutorLimits(core, base.getMaxPoolSize(), base.getQueueCapacity(), base.getThreadNamePrefix());
     }
 
-    /** Set a runtime adaptive core override. Pass null to clear. */
+    /** 设置运行期 core 覆盖；传 null 清除覆盖并回到当前配置值。 */
     public void setAdaptiveCoreOverride(Integer core) {
         this.adaptiveCoreOverride = core;
     }
@@ -75,6 +84,7 @@ public class LangchainRunExecutorLimitsResolver {
                                                          int defaultMaxPoolSize,
                                                          int defaultQueueCapacity,
                                                          String defaultThreadNamePrefix) {
+        // parallel.hard 优先；旧配置没有分层时兼容直接使用 executor 根节点。
         AgentLlmProperties.ExecutorConfig hardConfig = null;
         if (executorConfig != null && executorConfig.getParallel() != null) {
             hardConfig = executorConfig.getParallel().getHard();
@@ -93,6 +103,7 @@ public class LangchainRunExecutorLimitsResolver {
     }
 
     private LangchainRunExecutorLimits clampCurrent(AgentLlmProperties.ExecutorConfig currentConfig) {
+        // current 可以缩小，但所有维度都必须夹在启动时 hardLimits 内。
         int requestedCore = valueOrDefault(currentConfig == null ? null : currentConfig.getCorePoolSize(),
                 hardLimits.getCorePoolSize());
         int requestedMax = valueOrDefault(currentConfig == null ? null : currentConfig.getMaxPoolSize(),

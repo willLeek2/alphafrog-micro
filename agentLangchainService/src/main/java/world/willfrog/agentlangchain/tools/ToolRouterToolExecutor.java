@@ -9,6 +9,9 @@ import dev.langchain4j.service.tool.ToolExecutor;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.dataanalysis.DataAnalysisOperationIdentity;
+import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingException;
+import world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore;
 import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agent.platform.service.AgentSsePayloadSupport;
 import world.willfrog.agent.workflow.DatasetRefRegistry;
@@ -75,10 +78,24 @@ final class ToolRouterToolExecutor implements ToolExecutor {
     private final ObjectMapper objectMapper;
     private final AgentEventService eventService;
     private final LangchainToolConcurrencyThrottle toolThrottle;
+    private final PythonSandboxDispatchStore pythonSandboxDispatchStore;
 
     /**
-     * LC4j 旧版回调：返回工具输出纯文本。{@link #executeWithContext} 是推荐路径，会先同步
-     * {@link InvocationContext} 里的 run 上下文。
+     * 执行一次 LC4j tool call 并把结果返回给模型。
+     *
+     * <p>处理顺序：</p>
+     * <ol>
+     *   <li>解析/生成 tool_call_id 并写入 {@link AgentContext}；</li>
+     *   <li>解析 arguments JSON；</li>
+     *   <li>{@link LangchainRepeatedToolCallGuard} 拦截重复调用；</li>
+     *   <li>发射 <b>TOOL_CALL_STARTED</b> SSE 事件；</li>
+     *   <li>经 {@link LangchainToolConcurrencyThrottle} 获取 permit 后调用 {@link ToolRouter}；</li>
+     *   <li>发射 <b>TOOL_CALL_FINISHED</b> SSE 事件；</li>
+     *   <li>注册 dataset ref 并追加 retry hint。</li>
+     * </ol>
+     *
+     * <p>{@link #executeWithContext} 是推荐入口，会先同步 {@link InvocationContext}
+     * 中的 run 上下文到 {@link AgentContext}。</p>
      */
     @Override
     public String execute(ToolExecutionRequest request, Object memoryId) {
@@ -111,9 +128,17 @@ final class ToolRouterToolExecutor implements ToolExecutor {
                 success = false;
             } else {
                 try {
+                    // invokeWithMeta 可能快速返回普通结果，也可能在超时阈值后抛出 pending 控制信号。
                     ToolRouter.ToolInvocationResult result = toolRouter.invokeWithMeta(request.name(), params);
+                    // 只有真正终态结果才进入普通 output/success 收尾链路。
                     output = result.getOutput();
                     success = result.isSuccess();
+                } catch (ExternalToolJobPendingException pending) {
+                    // pending 表示 Sandbox 后台任务仍在运行，不是工具失败。
+                    // 这里不能转成字符串 output，否则 LLM 会误以为工具已经完成。
+                    // 这里也不能写 TOOL_CALL_FINISHED；唯一终态事件归 reconciler/finalizer 所有。
+                    // 原样重抛可保留 runId/toolCallId/attempt，供上层生成可恢复挂起结果。
+                    throw pending;
                 } catch (Exception e) {
                     output = e.getMessage();
                     success = false;
@@ -128,6 +153,7 @@ final class ToolRouterToolExecutor implements ToolExecutor {
             long durationMs = Duration.between(start, Instant.now()).toMillis();
             toolThrottle.recordExecution(request.name(), durationMs);
             emitToolCallFinished(toolCallId, request.name(), params, success, output, durationMs);
+            acknowledgeSynchronousPythonCompletion(toolCallId, request.name());
 
             Map<String, String> datasetRefs = LangchainDatasetRefContext.snapshot();
             DatasetRefRegistry.registerFromJson(output, datasetRefs);
@@ -186,8 +212,8 @@ final class ToolRouterToolExecutor implements ToolExecutor {
     }
 
     /**
-     * executePython 等工具若因 dataset_ids 错误失败，把当前 run 已知的 ref 列表写进 hint，
-     * 减少模型编造 placeholder dataset_id。
+     * executePython 等工具若因 dataset_ids / manifest_ids 错误失败，把当前 run 已知的 ref 列表写进 hint，
+     * 引导模型先用 listMyData 解析 run-level 整数 ID，避免继续重试 raw id / path / placeholder。
      */
     private String appendDatasetRetryHintIfNeeded(String output, Map<String, String> datasetRefs) {
         if (output == null || output.isBlank()) {
@@ -197,19 +223,30 @@ final class ToolRouterToolExecutor implements ToolExecutor {
         boolean datasetError = lower.contains("missing_dataset_ids")
                 || lower.contains("missing dataset_ids")
                 || lower.contains("invalid dataset_ids")
+                || lower.contains("missing_manifest_ids")
+                || lower.contains("missing manifest_ids")
+                || lower.contains("invalid_manifest_ids")
+                || lower.contains("invalid manifest_ids")
+                || lower.contains("run_level_ids_unavailable")
                 || lower.contains("dataset_id directory not found")
-                || (lower.contains("dataset_ids") && containsFailureWord(lower));
+                || (lower.contains("dataset_ids") && containsFailureWord(lower))
+                || (lower.contains("manifest_ids") && containsFailureWord(lower));
         if (!datasetError) {
             return output;
         }
         StringBuilder hint = new StringBuilder(output);
-        hint.append("\n\n_retry_hint_: executePython failed because dataset_ids was missing or invalid. ");
+        hint.append("\n\n_retry_hint_: executePython failed because the run-level dataset_ids/manifest_ids are missing, invalid, or unavailable. ");
+        hint.append("executePython expects current run-level integer dataset_ids / manifest_ids, not raw dataset_id / manifest_id strings, paths, or scope hashes. ");
+        hint.append("Call listMyData first (query_type=dataset or query_type=manifest) to resolve the integer ids for this run before retrying. ");
+        if (lower.contains("run_level_ids_unavailable")) {
+            hint.append("RUN_LEVEL_IDS_UNAVAILABLE means the active run registry is not available; do not keep retrying the same raw ids. ");
+        }
         if (datasetRefs != null && !datasetRefs.isEmpty()) {
-            hint.append("Use only these existing dataset_ids exactly: ");
+            hint.append("Observed raw ids available for lookup: ");
             hint.append(String.join(",", datasetRefs.keySet()));
-            hint.append(". Do not use placeholders such as placeholder/data/test and do not hand-code market data.");
+            hint.append(". Resolve them through listMyData instead of passing them directly.");
         } else {
-            hint.append("Call a market data tool first and use the returned data.dataset_id or data.dataset_ids exactly.");
+            hint.append("If listMyData has no data, call a market data tool first, then listMyData, and do not use placeholders such as placeholder/data/test or hand-code market data.");
         }
         return hint.toString();
     }
@@ -301,7 +338,27 @@ final class ToolRouterToolExecutor implements ToolExecutor {
             payload.put("phase", phase);
         }
         AgentSsePayloadSupport.putExecutionAttribution(payload);
-        eventService.append(runId, userId, "TOOL_CALL_FINISHED", payload);
+        if ("executePython".equals(toolName)) {
+            String dedupeKey = runId + ":" + toolCallId + ":logical_terminal";
+            eventService.appendOnce(runId, userId, "TOOL_CALL_FINISHED", dedupeKey, payload);
+        } else {
+            eventService.append(runId, userId, "TOOL_CALL_FINISHED", payload);
+        }
+    }
+
+    private void acknowledgeSynchronousPythonCompletion(String toolCallId, String toolName) {
+        if (!"executePython".equals(toolName) || pythonSandboxDispatchStore == null) {
+            return;
+        }
+        String runId = AgentContext.getRunId();
+        if (runId == null || runId.isBlank()) {
+            return;
+        }
+        String operationId = new DataAnalysisOperationIdentity(runId, toolCallId, 1).operationId();
+        if (!pythonSandboxDispatchStore.clearSynchronouslyCompleted(runId, operationId)) {
+            log.debug("No proof-complete synchronous Python anchor cleared for run={}, operationId={}",
+                    runId, operationId);
+        }
     }
 
     /**

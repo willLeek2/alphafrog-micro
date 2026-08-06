@@ -73,6 +73,31 @@ class AgentPromptServiceCacheTest {
     }
 
     @Test
+    void composeSystemPrompt_shouldInjectHotLoadedDataFreshness() {
+        AgentLlmProperties local = new AgentLlmProperties();
+        AgentLlmProperties.DataFreshness freshness = new AgentLlmProperties.DataFreshness();
+        freshness.setStartDate("2020-01-01");
+        freshness.setEndDate("2026-05-25");
+        freshness.setAsOfDate("2026-05-25");
+        freshness.setDescription("覆盖股票、指数、ETF、基金等本地已爬取数据");
+        local.setDataFreshness(freshness);
+        when(localConfigLoader.current()).thenReturn(Optional.of(local));
+
+        String prompt = promptService.agentRunSystemPrompt();
+
+        assertTrue(prompt.contains("当前已爬取/可用市场数据时效范围"),
+                "system prompt 应注入部署者指定的数据时效范围");
+        assertTrue(prompt.contains("范围：2020-01-01 至 2026-05-25"),
+                "system prompt 应包含 YYYY-MM-DD 起止范围");
+        assertTrue(prompt.contains("as-of 日期：2026-05-25"),
+                "system prompt 应包含 as-of 日期");
+        assertTrue(prompt.contains("业务逻辑默认该日期正确"),
+                "system prompt 应表达部署者指定即权威的语义");
+        assertTrue(prompt.contains("不要自行推断或改写该范围"),
+                "system prompt 应禁止 LLM 自行改写数据范围");
+    }
+
+    @Test
     void todoPlannerPrompt_staticPrefixShouldBeStable() {
         String prompt1 = promptService.todoPlannerSystemPrompt("searchIndex, queryFund", 5);
         String prompt2 = promptService.todoPlannerSystemPrompt("searchIndex, queryFund", 5);

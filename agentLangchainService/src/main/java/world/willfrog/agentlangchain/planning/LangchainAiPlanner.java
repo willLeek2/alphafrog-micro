@@ -46,8 +46,8 @@ import java.util.stream.Collectors;
  * {@link #applyStructuredSpec} 设置 ThreadLocal，调用结束后在 finally 块中恢复/清理，
  * 避免污染后续执行阶段（execution）的 LLM 调用。
  *
- * <h2>与 legacy agentService 的关系</h2>
- * 本类的两阶段路径直接复用了 legacy 的 {@link StructuredPlanningSupport} 做 schema
+ * <h2>与共享规划组件的关系</h2>
+ * 本类的两阶段路径直接复用了 {@link StructuredPlanningSupport} 做 schema
  * 生成和 JSON 校验；provider 参数策略由 {@link LangchainPlanningStructuredOutputSettings}
  * 控制——其中 OpenRouter 的 {@code require_parameters} 默认设为 false，
  * 避免因 {@code stream_options} 等扩展字段导致 provider 路由错误。
@@ -171,6 +171,15 @@ public class LangchainAiPlanner {
             ctx.setSystemMessage(reactSystem);
             try {
                 String strategyStage = promptService.planningStrategyStageInstruction(toolList, maxTodos, maxDetailLength);
+                if (mode == PlanExecutionMode.LINEAR) {
+                    /*
+                     * 本 Run 明确请求 LINEAR 时，约束不能只存在于最终 plan 字段；strategy
+                     * LLM 也必须先按 LINEAR 思考，避免第二阶段根据一个 DAG strategy 生成
+                     * 分支/汇合依赖。
+                     */
+                    strategyStage += "\n\n本 Run 请求的执行模式为 LINEAR。"
+                            + "overallPlan.mode 必须返回 LINEAR，策略必须描述可按顺序执行的步骤。";
+                }
                 String strategyContent = dialogueContext.isBlank()
                         ? dynamicPrefix + "\n" + strategyStage + "\n\n用户需求：" + request.getUserGoal()
                         : dynamicPrefix + "\n" + strategyStage + "\n\n历史对话压缩内容：\n" + dialogueContext
@@ -195,10 +204,25 @@ public class LangchainAiPlanner {
                             strategyValidation.category(), strategyValidation.message());
                 }
                 StructuredPlanningSupport.OverallPlan overallPlan = strategyValidation.data();
-                ctx.addAssistantMessage(strategyRaw);
+                String effectiveStrategyMode = mode == PlanExecutionMode.LINEAR
+                        ? PlanExecutionMode.LINEAR.name()
+                        : overallPlan.mode();
+                if (mode == PlanExecutionMode.LINEAR) {
+                    /*
+                     * 即便 provider 忽略第一阶段指令返回 DAG，也不能把自相矛盾的 assistant
+                     * 消息带入 Todo 阶段；先把 strategy 正规化为 LINEAR，再生成真正的顺序计划。
+                     */
+                    var normalizedStrategy = objectMapper.createObjectNode();
+                    var normalizedOverallPlan = normalizedStrategy.putObject("overallPlan");
+                    normalizedOverallPlan.put("mode", PlanExecutionMode.LINEAR.name());
+                    normalizedOverallPlan.put("detail", nvl(overallPlan.detail()));
+                    ctx.addAssistantMessage(normalizedStrategy.toString());
+                } else {
+                    ctx.addAssistantMessage(strategyRaw);
+                }
 
                 String todosStage = promptService.planningTodosStageInstruction(
-                        overallPlan.mode(), overallPlan.detail(), toolList, maxTodos);
+                        effectiveStrategyMode, overallPlan.detail(), toolList, maxTodos);
                 ctx.addUserMessage(todosStage);
 
                 AgentContext.setStage("planning_todos");
@@ -425,10 +449,23 @@ public class LangchainAiPlanner {
         return Math.max(1, Math.min(requested, configured));
     }
 
+    /**
+     * 返回规划阶段的最大重试次数。
+     *
+     * <p>当前为硬编码的 {@value #DEFAULT_MAX_ATTEMPTS}，未来可扩展为 Nacos 配置。
+     * 两阶段规划的 JSON schema 校验失败时会重试，直到次数耗尽后抛出
+     * {@code IllegalStateException("planning_retry_exhausted")}。</p>
+     */
     private int resolvePlanningMaxAttempts() {
         return DEFAULT_MAX_ATTEMPTS;
     }
 
+    /**
+     * 校验规划请求的必要字段。
+     *
+     * <p>缺少 ChatModel 或用户目标时直接抛 {@link IllegalArgumentException}，
+     * 避免在后续 LLM 调用中出现难以定位的 NPE 或空输出。</p>
+     */
     private void validate(LangchainPlanningRequest request) {
         if (request == null) {
             throw new IllegalArgumentException("planning_request_required");
@@ -473,6 +510,12 @@ public class LangchainAiPlanner {
                 .collect(Collectors.toCollection(LinkedHashSet::new));
     }
 
+    /**
+     * 清理字符串列表：去重、去空、保留原始顺序。
+     *
+     * <p>用于规范化 LLM 输出的 dependsOn / extractedEntities 等列表字段，
+     * 防止空字符串或重复值进入后续的 Todo 执行流程。</p>
+     */
     private java.util.List<String> sanitizeList(java.util.List<String> values) {
         if (values == null || values.isEmpty()) {
             return java.util.List.of();
@@ -487,15 +530,23 @@ public class LangchainAiPlanner {
         return java.util.List.copyOf(unique);
     }
 
+    /**
+     * 将空白字符串转为 null，保留非空值。
+     *
+     * <p>用于处理 LLM 可能输出的空 groupKey / id 等字段，
+     * 避免空字符串污染 DAG 依赖解析。</p>
+     */
     private String blankToNull(String value) {
         String normalized = nvl(value).trim();
         return normalized.isBlank() ? null : normalized;
     }
 
+    /** 判断字符串是否为 null 或仅含空白字符。 */
     private boolean isBlank(String value) {
         return value == null || value.trim().isEmpty();
     }
 
+    /** null 转为空串，避免下游出现 NullPointerException。 */
     private String nvl(String value) {
         return value == null ? "" : value;
     }

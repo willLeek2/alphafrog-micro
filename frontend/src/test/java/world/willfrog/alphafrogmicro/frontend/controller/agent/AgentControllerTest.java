@@ -1,19 +1,20 @@
 package world.willfrog.alphafrogmicro.frontend.controller.agent;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import jakarta.servlet.http.HttpServletRequest;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.springframework.security.core.Authentication;
 import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.alphafrogmicro.agent.idl.AgentDubboService;
+import world.willfrog.alphafrogmicro.agent.idl.AgentArtifactMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunEventMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunResultMessage;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunResultRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentRunEventsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentRunEventsResponse;
+import world.willfrog.alphafrogmicro.agent.idl.ListAgentArtifactsResponse;
 import world.willfrog.alphafrogmicro.agent.idl.SendAgentMessageRequest;
 import world.willfrog.alphafrogmicro.agent.idl.SendAgentMessageResponse;
 import world.willfrog.alphafrogmicro.common.dto.ResponseCode;
@@ -21,12 +22,20 @@ import world.willfrog.alphafrogmicro.common.pojo.user.User;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentCallDetailResponse;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentMessageSendRequest;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentRunCreateRequest;
+import world.willfrog.alphafrogmicro.frontend.model.agent.TraceDetailResponse;
 import world.willfrog.alphafrogmicro.frontend.model.agent.TimelineResponse;
+import world.willfrog.alphafrogmicro.frontend.service.agent.AgentRawTraceDetailMapper;
 import world.willfrog.alphafrogmicro.frontend.service.AuthService;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentCallDetailBlobReader;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentRunResultCacheService;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
 import java.util.Optional;
+import java.util.Map;
+import java.util.zip.GZIPInputStream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -34,6 +43,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -56,12 +66,10 @@ class AgentControllerTest {
         callDetailBlobReader = mock(AgentCallDetailBlobReader.class);
         when(callDetailBlobReader.loadLlmCallDetail(any(), any())).thenReturn(Optional.empty());
         when(callDetailBlobReader.loadToolCallDetail(any(), any())).thenReturn(Optional.empty());
+        when(callDetailBlobReader.loadLlmCallRawContent(any(), any())).thenReturn(Optional.empty());
+        when(callDetailBlobReader.loadLlmCallRawMeta(any(), any())).thenReturn(Optional.empty());
         controller = new AgentController(authService, new ObjectMapper(), runResultCacheService, callDetailBlobReader);
         ReflectionTestUtils.setField(controller, "agentDubboServiceLangchain", agentDubboService);
-        ReflectionTestUtils.setField(controller, "agentDubboServiceLegacy", agentDubboService);
-        HttpServletRequest request = mock(HttpServletRequest.class);
-        when(request.getRequestURI()).thenReturn("/api/agent/runs/run-1");
-        ReflectionTestUtils.setField(controller, "request", request);
 
         authentication = mock(Authentication.class);
         when(authentication.isAuthenticated()).thenReturn(true);
@@ -132,6 +140,35 @@ class AgentControllerTest {
         var response = controller.observabilityFull(authentication, "run-1");
 
         assertEquals(ResponseCode.BUSINESS_ERROR.getCode(), response.getCode());
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void observabilityFull_shouldIncludeDatasetArtifactIndex() {
+        when(agentDubboService.getResult(any(GetAgentRunResultRequest.class))).thenReturn(
+                AgentRunResultMessage.newBuilder().setObservabilityJson("{\"diagnostics\":{}}").build()
+        );
+        when(agentDubboService.listArtifacts(any())).thenReturn(
+                ListAgentArtifactsResponse.newBuilder()
+                        .addItems(AgentArtifactMessage.newBuilder()
+                                .setArtifactId("artifact-1")
+                                .setType("dataset_json")
+                                .setName("ds1.json")
+                                .setContentType("application/json")
+                                .setUrl("/api/agent/runs/run-1/artifacts/artifact-1/download")
+                                .setMetaJson("{\"dataset_id\":\"ds1\",\"file_name\":\"ds1.json\"}")
+                                .build())
+                        .build()
+        );
+
+        var response = controller.observabilityFull(authentication, "run-1");
+
+        assertEquals(ResponseCode.SUCCESS.getCode(), response.getCode());
+        Map<String, Object> data = (Map<String, Object>) response.getData();
+        assertTrue(data.containsKey("artifacts"));
+        assertTrue(data.containsKey("dataset_artifacts"));
+        assertTrue(data.toString().contains("ds1.json"));
+        assertTrue(data.toString().contains("/api/agent/runs/run-1/artifacts/artifact-1/parts"));
     }
 
     @Test
@@ -260,6 +297,191 @@ class AgentControllerTest {
     }
 
     @Test
+    void traceDetail_fullTrue_shouldReturnSanitizedInlineLlmRawHttp() throws Exception {
+        String observability = """
+                {"summary":{},"diagnostics":{"llmTraces":[
+                  {"traceId":"llm-1","time":"2026-05-07T10:00:00Z","phase":"execution",
+                   "durationMs":42,"model":"qwen-plus","hasError":false,"detailBlobStored":true}
+                ],"toolTraces":[]}}
+                """;
+        String raw = """
+                {
+                  "type":"llm_raw_http",
+                  "runId":"run-1",
+                  "traceId":"llm-1",
+                  "httpRequest":{
+                    "url":"https://openrouter.ai/api/v1/chat/completions?api_key=sk-openrouter-secret",
+                    "method":"POST",
+                    "headers":{"Authorization":"Bearer sk-openrouter-secret","X-Api-Key":"sk-another-secret"},
+                    "body":"{\\"model\\":\\"qwen\\",\\"api_key\\":\\"sk-body-secret\\"}"
+                  },
+                  "httpResponse":{
+                    "statusCode":200,
+                    "headers":{"set-cookie":"sid=secret-session"},
+                    "body":"{\\"id\\":\\"ok\\",\\"token\\":\\"sk-response-secret\\"}"
+                  }
+                }
+                """;
+        when(agentDubboService.getResult(any(GetAgentRunResultRequest.class))).thenReturn(
+                AgentRunResultMessage.newBuilder().setId("run-1").setObservabilityJson(observability).build()
+        );
+        when(callDetailBlobReader.loadLlmCallRawContent("run-1", "llm-1")).thenReturn(Optional.of(raw));
+        when(callDetailBlobReader.loadLlmCallRawMeta("run-1", "llm-1"))
+                .thenReturn(Optional.of("{\"createdAtMillis\":1000,\"expiresAtMillis\":9999999999999}"));
+
+        var response = controller.traceDetail(authentication, "run-1", "llm-1", true, 0);
+
+        assertEquals(ResponseCode.SUCCESS.getCode(), response.getCode());
+        TraceDetailResponse detail = response.getData();
+        assertNotNull(detail.getFullDetail());
+        assertEquals(null, detail.getFullDetailParts());
+        String requestJson = new String(Base64.getDecoder().decode(
+                String.valueOf(detail.getFullDetail().get("httpRequestBase64"))), StandardCharsets.UTF_8);
+        String responseJson = new String(Base64.getDecoder().decode(
+                String.valueOf(detail.getFullDetail().get("httpResponseBase64"))), StandardCharsets.UTF_8);
+        assertFalse(requestJson.contains("sk-openrouter-secret"));
+        assertFalse(requestJson.contains("sk-body-secret"));
+        assertFalse(responseJson.contains("sk-response-secret"));
+        assertTrue(requestJson.contains(AgentRawTraceDetailMapper.REDACTION_TEXT));
+        assertTrue(responseJson.contains(AgentRawTraceDetailMapper.REDACTION_TEXT));
+    }
+
+    @Test
+    void traceDetail_fullFalse_shouldKeepSnapshotShapeAndSkipRawRedis() {
+        String observability = """
+                {"summary":{},"diagnostics":{"llmTraces":[
+                  {"traceId":"llm-1","time":"2026-05-07T10:00:00Z","phase":"execution",
+                   "durationMs":42,"model":"qwen-plus","hasError":false,"detailBlobStored":true}
+                ],"toolTraces":[]}}
+                """;
+        when(agentDubboService.getResult(any(GetAgentRunResultRequest.class))).thenReturn(
+                AgentRunResultMessage.newBuilder().setId("run-1").setObservabilityJson(observability).build()
+        );
+
+        var response = controller.traceDetail(authentication, "run-1", "llm-1", false, 0);
+
+        assertEquals(ResponseCode.SUCCESS.getCode(), response.getCode());
+        TraceDetailResponse detail = response.getData();
+        assertEquals("llm", detail.getType());
+        assertEquals("llm-1", detail.getTraceId());
+        assertEquals(null, detail.getFullDetail());
+        assertEquals(null, detail.getFullDetailParts());
+        verify(callDetailBlobReader, never()).loadLlmCallRawContent(any(), any());
+        verify(callDetailBlobReader, never()).loadLlmCallRawMeta(any(), any());
+    }
+
+    @Test
+    void traceDetail_fullTrue_shouldDistinguishRawMissingAndExpired() {
+        String observability = """
+                {"summary":{},"diagnostics":{"llmTraces":[
+                  {"traceId":"llm-missing","time":"2026-05-07T10:00:00Z","phase":"execution","detailBlobStored":true},
+                  {"traceId":"llm-expired","time":"2026-05-07T10:00:00Z","phase":"execution","detailBlobStored":true}
+                ],"toolTraces":[]}}
+                """;
+        when(agentDubboService.getResult(any(GetAgentRunResultRequest.class))).thenReturn(
+                AgentRunResultMessage.newBuilder().setId("run-1").setObservabilityJson(observability).build()
+        );
+        when(callDetailBlobReader.loadLlmCallRawMeta("run-1", "llm-expired"))
+                .thenReturn(Optional.of("{\"createdAtMillis\":1000,\"expiresAtMillis\":2000}"));
+
+        var missing = controller.traceDetail(authentication, "run-1", "llm-missing", true, 0);
+        var expired = controller.traceDetail(authentication, "run-1", "llm-expired", true, 0);
+
+        assertEquals(ResponseCode.DATA_NOT_FOUND.getCode(), missing.getCode());
+        assertEquals("RAW_TRACE_NOT_FOUND", missing.getMessage());
+        assertEquals(ResponseCode.DATA_EXPIRED.getCode(), expired.getCode());
+        assertEquals("RAW_TRACE_EXPIRED", expired.getMessage());
+    }
+
+    @Test
+    void traceDetail_fullTrue_shouldReturnSanitizedInlineToolDetail() throws Exception {
+        String observability = """
+                {"summary":{},"diagnostics":{"llmTraces":[],"toolTraces":[
+                  {"traceId":"tool-1","time":"2026-05-07T10:00:00Z","phase":"execution",
+                   "toolName":"searchAssetInfo","success":true,"detailBlobStored":true}
+                ]}}
+                """;
+        String detailJson = """
+                {
+                  "type":"tool",
+                  "traceId":"tool-1",
+                  "params":{"query":"AI ETF","api_key":"sk-tool-param-secret"},
+                  "output":"{\\"result\\":\\"ok\\",\\"token\\":\\"sk-tool-output-secret\\"}"
+                }
+                """;
+        when(agentDubboService.getResult(any(GetAgentRunResultRequest.class))).thenReturn(
+                AgentRunResultMessage.newBuilder().setId("run-1").setObservabilityJson(observability).build()
+        );
+        when(callDetailBlobReader.loadToolCallDetail("run-1", "tool-1")).thenReturn(Optional.of(detailJson));
+
+        var response = controller.traceDetail(authentication, "run-1", "tool-1", true, 0);
+
+        assertEquals(ResponseCode.SUCCESS.getCode(), response.getCode());
+        TraceDetailResponse trace = response.getData();
+        assertEquals("tool", trace.getType());
+        assertNotNull(trace.getFullDetail());
+        String paramsJson = new String(Base64.getDecoder().decode(
+                String.valueOf(trace.getFullDetail().get("paramsBase64"))), StandardCharsets.UTF_8);
+        String outputJson = new String(Base64.getDecoder().decode(
+                String.valueOf(trace.getFullDetail().get("outputBase64"))), StandardCharsets.UTF_8);
+        assertFalse(paramsJson.contains("sk-tool-param-secret"));
+        assertFalse(outputJson.contains("sk-tool-output-secret"));
+        assertTrue(paramsJson.contains(AgentRawTraceDetailMapper.REDACTION_TEXT));
+        assertTrue(outputJson.contains(AgentRawTraceDetailMapper.REDACTION_TEXT));
+    }
+
+    @Test
+    void traceDetail_fullTrue_shouldReturnGzipPartsForLargePayloadAndPartsReassemble() throws Exception {
+        String observability = """
+                {"summary":{},"diagnostics":{"llmTraces":[
+                  {"traceId":"llm-large","time":"2026-05-07T10:00:00Z","phase":"execution",
+                   "durationMs":42,"model":"qwen-plus","hasError":false,"detailBlobStored":true}
+                ],"toolTraces":[]}}
+                """;
+        String largeText = "x".repeat(257 * 1024);
+        String raw = """
+                {
+                  "type":"llm_raw_http",
+                  "runId":"run-1",
+                  "traceId":"llm-large",
+                  "httpRequest":{"url":"https://api.openai.com/v1/responses","headers":{"Authorization":"Bearer sk-large-secret"},"body":"%s"},
+                  "httpResponse":{"statusCode":200,"body":"ok"}
+                }
+                """.formatted(largeText);
+        String meta = "{\"createdAtMillis\":1000,\"expiresAtMillis\":9999999999999}";
+        when(agentDubboService.getResult(any(GetAgentRunResultRequest.class))).thenReturn(
+                AgentRunResultMessage.newBuilder().setId("run-1").setObservabilityJson(observability).build()
+        );
+        when(callDetailBlobReader.loadLlmCallRawContent("run-1", "llm-large")).thenReturn(Optional.of(raw));
+        when(callDetailBlobReader.loadLlmCallRawMeta("run-1", "llm-large")).thenReturn(Optional.of(meta));
+
+        var response = controller.traceDetail(authentication, "run-1", "llm-large", true, 65536);
+        assertEquals(ResponseCode.SUCCESS.getCode(), response.getCode());
+        assertEquals(null, response.getData().getFullDetail());
+        TraceDetailResponse.FullDetailParts parts = response.getData().getFullDetailParts();
+        assertNotNull(parts);
+        assertTrue(parts.totalParts() > 0);
+        assertTrue(parts.partsUrl().contains("maxPartSize=65536"));
+
+        ByteArrayOutputStream compressed = new ByteArrayOutputStream();
+        for (int i = 0; i < parts.totalParts(); i++) {
+            var partResponse = controller.traceFullPart(authentication, "run-1", "llm-large", i, 65536);
+            assertEquals(200, partResponse.getStatusCode().value());
+            compressed.write(partResponse.getBody());
+        }
+        byte[] actualFullDetailBytes = gunzip(compressed.toByteArray());
+        byte[] expectedFullDetailBytes = AgentRawTraceDetailMapper.buildLlmPayload(
+                new ObjectMapper(),
+                "run-1",
+                "llm-large",
+                raw,
+                AgentRawTraceDetailMapper.parseMeta(new ObjectMapper(), meta)).fullDetailBytes();
+        assertEquals(new String(expectedFullDetailBytes, StandardCharsets.UTF_8),
+                new String(actualFullDetailBytes, StandardCharsets.UTF_8));
+        assertFalse(new String(actualFullDetailBytes, StandardCharsets.UTF_8).contains("sk-large-secret"));
+    }
+
+    @Test
     void llmCallDetail_adminWithThinking_returnsReasoningContent() {
         // admin user, blob has reasoningText → includeThinking=true 应映射到 reasoningContent
         String observability = """
@@ -340,6 +562,14 @@ class AgentControllerTest {
         assertEquals(Boolean.TRUE, detail.getReasoningUnavailable());
         if (detail.getLlm() != null) {
             assertEquals(null, detail.getLlm().getReasoningContent());
+        }
+    }
+
+    private static byte[] gunzip(byte[] compressed) throws Exception {
+        try (GZIPInputStream gzip = new GZIPInputStream(new ByteArrayInputStream(compressed));
+             ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            gzip.transferTo(out);
+            return out.toByteArray();
         }
     }
 }

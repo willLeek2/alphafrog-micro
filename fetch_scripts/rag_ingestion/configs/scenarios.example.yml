@@ -1,0 +1,138 @@
+# RAG Ingestion 场景配置文件示例 (新式 scenarios: 列表 格式)
+# 用法: python run.py --task-config scenarios.yml
+#
+# 与旧式 tasks: 列表格式互斥, 不可混用。
+# 旧式 rag-ingestion-tasks.example.yml 继续可用 (向后兼容)。
+#
+# 字段说明:
+#   scenarios      - 顶层 list, 每项是 scenario 配置, 必含 'name' 字段
+#   name           - scenario 名称 (必填, 用于日志)
+#   ts_code        - 股票代码过滤来源, 支持:
+#                    1) 省略 / null     → 不过滤 (整库扫)
+#                    2) str            → 单值精确 (旧式兼容)
+#                    3) list           → 多值精确 (旧式兼容)
+#                    4) dict           → 显式指定, 必填 type: list | select
+#       type: list 的 fields:
+#         values   - ts_code 列表 (必填, 非空)
+#       type: select 的 fields:
+#         conditions:
+#           index_codes         - 指数代码列表 (必填, 非空, 如 000300.SH / 000905.SH)
+#           member_date_from    - 成分股记录日期起 (YYYYMMDD, 含), 对应
+#                                  alphafrog_index_weight.trade_date 范围
+#           member_date_to      - 成分股记录日期止 (YYYYMMDD, 含)
+#                                  注意: 这是"成分股记录日期" (即该股票在指数成分股名单中
+#                                  出现过的交易日期), 不是"股票首次纳入指数的日期"
+#   date_from      - 起始日期 (含), 格式 YYYYMMDD, 省略则不过滤
+#   date_to        - 截止日期 (含), 格式 YYYYMMDD, 省略则不过滤
+#   doc_type       - ann | research | all (默认 all)
+#   title_patterns - 旧式 title 子串过滤列表, OR 关系 (含任一即满足), 省略则不过滤
+#                    与 title_match 互斥
+#   title_match    - 新式 title 匹配配置, 与 title_patterns 互斥:
+#                    mode: contains          # 当前仅支持 contains
+#                    include_mode: any|all   # 可选, 默认 any
+#                    include: ["年度报告"]    # 命中条件
+#                    exclude: ["摘要"]        # 排除条件
+#   limit          - 最大处理条数 (默认 50); 语义取决于 ts_code.type:
+#                      list   → 作用于每个 ts_code (per-ts-code 分页)
+#                      select → 作用于全局 SQL 分页
+#                      null   → 作用于全局 SQL 分页
+#   offset         - DB 查询偏移 (默认 0); 语义同上
+#   enabled        - false 则跳过 (默认 true)
+#
+# auth 配置（全局，/rag/records/* 端点需要 JWT 登录鉴权）
+#   username     - 登录用户名
+#   password     - 登录密码
+# 注意：用户名密码写在 YAML 里，不要放环境变量；只有 API key 才放环境变量
+#
+# embedding 配置可放在两个层级, 优先级: scenario 级别 > 全局级别 > env 变量
+#
+#   1) 全局级别 (推荐, 同一文件内多 scenario 共享同一模型)
+#      放在 scenarios: 列表上方, 作为所有 scenario 的默认 embedding
+#
+#   2) scenario 级别 (特殊覆盖, 该 scenario 单独用不同模型)
+#      放在单个 scenario 项内, 显式声明时覆盖全局配置
+#
+#   字段说明:
+#     base_url     - embedding API 地址, 默认取 EMBEDDING_BASE_URL env
+#     api_key      - embedding API key, 默认取 EMBEDDING_API_KEY env
+#     model        - 模型名称, 默认取 EMBEDDING_MODEL env
+#     dim          - 向量维度, 默认取 EMBEDDING_DIM env
+#     provider     - (仅 OpenRouter 生效, Fireworks 等其他 endpoint 忽略) provider 优先级
+#       order      - provider 名称列表, 如 ["openai", "azure"]
+#
+# 失败模式 (fail closed): 任一 scenario 配置错误 (ts_code 缺值 / 未知 type / 缺 name)
+#   → 整个配置文件退出码 1, 不会跳过继续跑
+
+scenarios:
+
+  # 示例 1: ts_code.type=list (自选股 watchlist, 每只股票取 5 条年报)
+  - name: 自选股-2024年报
+    doc_type: ann
+    date_from: "20240101"
+    date_to: "20241231"
+    title_match:
+      mode: contains
+      include:
+        - "年度报告"
+      exclude:
+        - "摘要"
+        - "英文版"
+    ts_code:
+      type: list
+      values:
+        - "600519.SH"  # 贵州茅台
+        - "601318.SH"  # 中国平安
+        - "000858.SZ"  # 五粮液
+    limit: 5
+    offset: 0
+    enabled: false  # 默认禁用, 跑时改 true
+
+  # 示例 2: ts_code.type=select (沪深300成分股 + 2024 年年度报告)
+  - name: 沪深300-2024年报
+    doc_type: ann
+    date_from: "20240101"
+    date_to: "20241231"
+    title_match:
+      mode: contains
+      include:
+        - "年度报告"
+      exclude:
+        - "摘要"
+        - "英文版"
+    ts_code:
+      type: select
+      conditions:
+        index_codes:
+          - "000300.SH"  # 沪深300
+        # 限定该股票在 2020-2024 期间曾在沪深300中出现过
+        member_date_from: "20200101"
+        member_date_to: "20241231"
+    limit: 1000   # 一次性给大 limit, 让 SQL 自己分页
+    offset: 0
+    enabled: true
+    # embedding 配置示例：显式指定 OpenRouter provider 顺序
+    embedding:
+      base_url: "https://openrouter.ai/api/v1"
+      api_key: "${EMBEDDING_API_KEY}"
+      model: "openai/text-embedding-3-small"
+      dim: 1024
+      provider:
+        order:
+          - "openai"
+          - "azure"
+
+  # 示例 3: 不带 ts_code (整库扫 + title 过滤)
+  - name: 近期季报
+    doc_type: ann
+    date_from: "20260401"
+    date_to: "20260607"
+    title_match:
+      mode: contains
+      include_mode: any
+      include:
+        - "季度报告"
+        - "一季度报告"
+      exclude:
+        - "摘要"
+    limit: 200
+    enabled: false

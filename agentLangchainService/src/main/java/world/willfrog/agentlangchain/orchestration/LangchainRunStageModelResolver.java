@@ -311,6 +311,7 @@ public class LangchainRunStageModelResolver {
         return null;
     }
 
+    /** 判断字符串是否为 null 或仅含空白字符。 */
     private boolean isBlank(String value) {
         return value == null || value.trim().isEmpty();
     }

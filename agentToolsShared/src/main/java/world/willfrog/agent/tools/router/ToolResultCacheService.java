@@ -9,12 +9,15 @@ import lombok.Builder;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.artifact.RawPayloadLocator;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
+import world.willfrog.agent.tools.compaction.ToolOutputCompactionService;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -49,6 +52,7 @@ public class ToolResultCacheService {
     private final StringRedisTemplate redisTemplate;
     private final ObjectMapper objectMapper;
     private final AgentLlmLocalConfigLoader localConfigLoader;
+    private final ToolOutputCompactionService toolOutputCompactionService;
     private final MeterRegistry meterRegistry;
 
     private Counter cacheHitCounter;
@@ -112,8 +116,13 @@ public class ToolResultCacheService {
                             AgentContext.getRunId(), nvl(toolName), plan.getKey(), ttlRemainingMs, savedDurationMs);
                     cacheHitCounter.increment();
                     cacheLookupTimer.record(durationMs, TimeUnit.MILLISECONDS);
+                    String result = cached.getResult();
+                    if (cached.isCompactionApplied() && cached.getRawLocator() != null) {
+                        result = toolOutputCompactionService.rebindForCacheHit(result, cached.getRawLocator());
+                    }
                     return CachedToolCallResult.builder()
-                            .result(cached.getResult())
+                            .result(result)
+                            .observabilityResult(result)
                             .durationMs(durationMs)
                             .success(true)
                             .cacheMeta(meta)
@@ -135,6 +144,15 @@ public class ToolResultCacheService {
         }
 
         CacheMeta meta;
+        ToolOutputCompactionService.CompactionResult compaction = toolOutputCompactionService.compact(
+                toolName,
+                loaded.getResult(),
+                resolveTodoGoal());
+        String modelOutput = compaction.getModelOutput();
+        String cacheValue = compaction.isCompactionApplied() ? compaction.getCacheTemplate() : modelOutput;
+        RawPayloadLocator rawLocator = compaction.isCompactionApplied() ? compaction.getRawLocator() : null;
+        boolean compactionApplied = compaction.isCompactionApplied();
+
         if (plan.getMode() == CacheMode.NONE) {
             meta = CacheMeta.builder()
                     .eligible(false)
@@ -145,10 +163,10 @@ public class ToolResultCacheService {
                     .estimatedSavedDurationMs(0L)
                     .build();
         } else if (plan.getMode() == CacheMode.REDIS) {
-            if (loaded.isSuccess() && plan.getTtlSeconds() > 0 && isStructuredToolResult(loaded.getResult())) {
-                writeCache(plan.getKey(), loaded.getResult(), loaded.getDurationMs(), plan.getTtlSeconds());
-                debugLog("cache write: runId={}, tool={}, key={}, ttlSeconds={}, durationMs={}",
-                        AgentContext.getRunId(), nvl(toolName), plan.getKey(), plan.getTtlSeconds(), loaded.getDurationMs());
+            if (loaded.isSuccess() && plan.getTtlSeconds() > 0 && isStructuredToolResult(cacheValue)) {
+                writeCache(plan.getKey(), cacheValue, loaded.getDurationMs(), plan.getTtlSeconds(), rawLocator, compactionApplied);
+                debugLog("cache write: runId={}, tool={}, key={}, ttlSeconds={}, durationMs={}, compaction={}",
+                        AgentContext.getRunId(), nvl(toolName), plan.getKey(), plan.getTtlSeconds(), loaded.getDurationMs(), compactionApplied);
             }
             meta = CacheMeta.builder()
                     .eligible(true)
@@ -171,11 +189,17 @@ public class ToolResultCacheService {
         }
 
         return CachedToolCallResult.builder()
-                .result(loaded.getResult())
+                .result(modelOutput)
+                .observabilityResult(compaction.getObservabilityOutput())
                 .durationMs(Math.max(0L, loaded.getDurationMs()))
                 .success(loaded.isSuccess())
                 .cacheMeta(meta)
                 .build();
+    }
+
+    private String resolveTodoGoal() {
+        String excerpt = AgentContext.getDecisionExcerpt();
+        return excerpt == null ? "" : excerpt.trim();
     }
 
     public Map<String, Object> toPayload(CacheMeta meta) {
@@ -452,7 +476,8 @@ public class ToolResultCacheService {
         }
     }
 
-    private void writeCache(String key, String result, long originalDurationMs, int ttlSeconds) {
+    private void writeCache(String key, String result, long originalDurationMs, int ttlSeconds,
+                            RawPayloadLocator rawLocator, boolean compactionApplied) {
         if (blank(key) || blank(result) || ttlSeconds <= 0) {
             return;
         }
@@ -461,6 +486,8 @@ public class ToolResultCacheService {
             payload.setResult(result);
             payload.setOriginalDurationMs(Math.max(0L, originalDurationMs));
             payload.setCachedAtMillis(System.currentTimeMillis());
+            payload.setRawLocator(rawLocator);
+            payload.setCompactionApplied(compactionApplied);
             redisTemplate.opsForValue().set(key, objectMapper.writeValueAsString(payload), ttlSeconds, TimeUnit.SECONDS);
         } catch (Exception e) {
             log.warn("Write tool cache failed, key={}", key, e);
@@ -599,6 +626,8 @@ public class ToolResultCacheService {
         private String result;
         private long originalDurationMs;
         private long cachedAtMillis;
+        private RawPayloadLocator rawLocator;
+        private boolean compactionApplied;
     }
 
     @Data
@@ -624,6 +653,7 @@ public class ToolResultCacheService {
     @Builder
     public static class CachedToolCallResult {
         private String result;
+        private String observabilityResult;
         private long durationMs;
         private boolean success;
         private CacheMeta cacheMeta;

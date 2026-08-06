@@ -51,7 +51,7 @@ public class AgentObservabilityProperties {
         /**
          * 捕获 body 的最大字符数
          */
-        private int captureBodyMaxChars = 100000;
+        private int captureBodyMaxChars = 1572864;
         
         /**
          * 是否捕获请求/响应 headers

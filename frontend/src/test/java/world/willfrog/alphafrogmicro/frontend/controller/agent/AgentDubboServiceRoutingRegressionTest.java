@@ -17,7 +17,7 @@ import static org.junit.jupiter.api.Assertions.*;
 
 /**
  * 防回归测试：确认 AgentDubboService 的 Dubbo 路由没有 `group="*"` 混用，
- * 且 controller 按 URI 前缀正确分流到 langchain/legacy。
+ * 且 agent HTTP controller 只消费 langchain provider。
  */
 class AgentDubboServiceRoutingRegressionTest {
 
@@ -63,7 +63,7 @@ class AgentDubboServiceRoutingRegressionTest {
     }
 
     @Test
-    void agentControllersHaveResolveServiceMethodWithBothStubs() {
+    void agentControllersOnlyUseLangchainStub() {
         List<String> violations = new ArrayList<>();
 
         for (Class<?> clazz : List.of(
@@ -73,7 +73,6 @@ class AgentDubboServiceRoutingRegressionTest {
                 AgentCreditController.class
         )) {
             boolean hasLangchainStub = false;
-            boolean hasLegacyStub = false;
             boolean hasResolveService = false;
 
             for (Field field : clazz.getDeclaredFields()) {
@@ -83,7 +82,9 @@ class AgentDubboServiceRoutingRegressionTest {
 
                 String group = ref.group();
                 if ("langchain".equals(group)) hasLangchainStub = true;
-                if ("legacy".equals(group)) hasLegacyStub = true;
+                if ("legacy".equals(group)) {
+                    violations.add(clazz.getSimpleName() + "." + field.getName() + " still uses legacy group");
+                }
             }
 
             for (Method method : clazz.getDeclaredMethods()) {
@@ -97,15 +98,12 @@ class AgentDubboServiceRoutingRegressionTest {
             if (!hasLangchainStub) {
                 violations.add(clazz.getSimpleName() + " 缺少 langchain stub");
             }
-            if (!hasLegacyStub) {
-                violations.add(clazz.getSimpleName() + " 缺少 legacy stub");
-            }
             if (!hasResolveService) {
                 violations.add(clazz.getSimpleName() + " 缺少 resolveService() 方法");
             }
         }
 
         assertTrue(violations.isEmpty(),
-                "Controller Dubbo 路由配置不完整：" + violations);
+                "Controller Dubbo 路由配置不完整或仍引用 legacy：" + violations);
     }
 }

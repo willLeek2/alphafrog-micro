@@ -10,6 +10,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.entity.AgentRunEvent;
+import world.willfrog.agent.platform.mapper.AgentRunEventMapper;
 import world.willfrog.alphafrogmicro.agent.idl.AgentArtifactMessage;
 
 import java.nio.charset.StandardCharsets;
@@ -29,6 +30,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.regex.Pattern;
+import java.util.stream.Stream;
 
 @Service
 @RequiredArgsConstructor
@@ -39,6 +41,8 @@ public class AgentArtifactService {
     private static final DateTimeFormatter TIME_FORMATTER = DateTimeFormatter.ISO_OFFSET_DATE_TIME;
 
     private final AgentEventService eventService;
+    /** DB event mapper；workspace v0 走 DB，不依赖 Redis 事件流。 */
+    private final AgentRunEventMapper agentRunEventMapper;
     private final ObjectMapper objectMapper;
 
     @Value("${agent.tools.market-data.dataset.path:/data/agent_datasets}")
@@ -80,7 +84,52 @@ public class AgentArtifactService {
         return result;
     }
 
+    /**
+     * 公开入口：收集指定 run 的 parsed events（python scripts + dataset ids）。
+     *
+     * <p>给 workspace dump pipeline 用。内部走 {@link #parseEvents} 走完整事件解析，
+     * 然后映射成对外的 {@link ParsedEventsView}（避免把 internal record 暴露给跨模块 caller）。</p>
+     *
+     * <p>v0 走 {@link AgentRunEventMapper#listByRunId}（DB），不依赖 Redis 事件流
+     * （Redis ZSET TTL 7 天，旧 run 解析会丢事件，dump 稳定性不可接受）。</p>
+     *
+     * @param run 目标 run
+     * @return parsed events 公开视图
+     */
+    public ParsedEventsView collectParsedEvents(AgentRun run) {
+        if (run == null || run.getId() == null || run.getId().isBlank()) {
+            throw new IllegalArgumentException("run / runId 不能为空");
+        }
+        List<AgentRunEvent> events = agentRunEventMapper.listByRunId(run.getId());
+        ParsedEvents parsed = parseEvents(events);
+        List<PythonScript> scripts = new ArrayList<>();
+        if (parsed.invocations() != null) {
+            for (PythonInvocation invocation : parsed.invocations()) {
+                scripts.add(new PythonScript(
+                        invocation.ref(),
+                        invocation.seq(),
+                        invocation.createdAt(),
+                        invocation.code(),
+                        invocation.datasetIds() == null ? List.of() : new ArrayList<>(invocation.datasetIds()),
+                        invocation.success(),
+                        invocation.source()
+                ));
+            }
+        }
+        List<String> fallbackIds = parsed.fallbackDatasetIds() == null
+                ? List.of() : new ArrayList<>(parsed.fallbackDatasetIds());
+        return new ParsedEventsView(scripts, fallbackIds);
+    }
+
     public ArtifactContent loadArtifact(AgentRun run, boolean isAdmin, String artifactId) {
+        return loadArtifact(run, isAdmin, artifactId, true);
+    }
+
+    public ArtifactContent loadArtifactForParts(AgentRun run, boolean isAdmin, String artifactId) {
+        return loadArtifact(run, isAdmin, artifactId, false);
+    }
+
+    private ArtifactContent loadArtifact(AgentRun run, boolean isAdmin, String artifactId, boolean enforceDownloadMaxBytes) {
         List<ResolvedArtifact> artifacts = resolveArtifacts(run, isAdmin);
         ResolvedArtifact target = artifacts.stream()
                 .filter(item -> Objects.equals(item.getArtifactId(), artifactId))
@@ -93,7 +142,7 @@ public class AgentArtifactService {
 
         try {
             long size = Files.size(target.getFilePath());
-            if (downloadMaxBytes > 0 && size > downloadMaxBytes) {
+            if (enforceDownloadMaxBytes && downloadMaxBytes > 0 && size > downloadMaxBytes) {
                 throw new IllegalStateException("artifact too large to download");
             }
             byte[] bytes = Files.readAllBytes(target.getFilePath());
@@ -158,10 +207,7 @@ public class AgentArtifactService {
             if (!datasetDir.startsWith(baseDir)) {
                 continue;
             }
-            Path csvFile = datasetDir.resolve(datasetId + ".csv");
-            addDatasetFileArtifact(artifacts, run.getId(), datasetId, csvFile, "dataset_csv", "text/csv", isAdmin);
-            Path metaFile = datasetDir.resolve(datasetId + ".meta.json");
-            addDatasetFileArtifact(artifacts, run.getId(), datasetId, metaFile, "dataset_meta", "application/json", isAdmin);
+            addDatasetFileArtifacts(artifacts, run.getId(), datasetId, datasetDir, isAdmin);
         }
 
         artifacts.sort((a, b) -> Long.compare(
@@ -169,6 +215,29 @@ public class AgentArtifactService {
                 a.getCreatedAt() == null ? 0L : a.getCreatedAt().toInstant().toEpochMilli()
         ));
         return artifacts;
+    }
+
+    private void addDatasetFileArtifacts(List<ResolvedArtifact> artifacts,
+                                         String runId,
+                                         String datasetId,
+                                         Path datasetDir,
+                                         boolean isAdmin) {
+        try {
+            if (!Files.exists(datasetDir) || !Files.isDirectory(datasetDir)) {
+                return;
+            }
+            try (Stream<Path> stream = Files.list(datasetDir)) {
+                stream
+                        .filter(Files::isRegularFile)
+                        .sorted((a, b) -> a.getFileName().toString().compareTo(b.getFileName().toString()))
+                        .forEach(file -> {
+                            DatasetFileKind kind = resolveDatasetFileKind(datasetId, file.getFileName().toString());
+                            addDatasetFileArtifact(artifacts, runId, datasetId, file, kind.type(), kind.contentType(), isAdmin);
+                        });
+            }
+        } catch (Exception e) {
+            log.warn("Resolve dataset artifacts failed: runId={}, datasetId={}, dir={}", runId, datasetId, datasetDir, e);
+        }
     }
 
     private void addDatasetFileArtifact(List<ResolvedArtifact> artifacts,
@@ -191,10 +260,14 @@ public class AgentArtifactService {
             if (copiedFile == null) {
                 return;
             }
-            String artifactId = encodeArtifactId(type, runId, datasetId);
+            String fileName = copiedFile.getFileName().toString();
+            String artifactRef = canonicalDatasetArtifactRef(datasetId, fileName, type);
+            String artifactId = encodeArtifactId(type, runId, artifactRef);
             Map<String, Object> meta = new HashMap<>();
             meta.put("kind", type);
             meta.put("dataset_id", datasetId);
+            meta.put("file_name", fileName);
+            meta.put("format", datasetFormat(fileName, type));
             meta.put("scope", isAdmin ? "admin" : "normal");
             artifacts.add(ResolvedArtifact.builder()
                     .artifactId(artifactId)
@@ -209,6 +282,46 @@ public class AgentArtifactService {
         } catch (Exception e) {
             log.warn("Resolve dataset artifact failed: runId={}, datasetId={}, file={}", runId, datasetId, filePath, e);
         }
+    }
+
+    private DatasetFileKind resolveDatasetFileKind(String datasetId, String fileName) {
+        String safeFileName = fileName == null ? "" : fileName;
+        if (safeFileName.equals(datasetId + ".meta.json") || safeFileName.endsWith(".meta.json")) {
+            return new DatasetFileKind("dataset_meta", "application/json");
+        }
+        if (safeFileName.endsWith(".csv")) {
+            return new DatasetFileKind("dataset_csv", "text/csv");
+        }
+        if (safeFileName.endsWith(".json")) {
+            return new DatasetFileKind("dataset_json", "application/json");
+        }
+        return new DatasetFileKind("dataset_file", "application/octet-stream");
+    }
+
+    private String canonicalDatasetArtifactRef(String datasetId, String fileName, String type) {
+        if (fileName.equals(datasetId + ".csv") && "dataset_csv".equals(type)) {
+            return datasetId;
+        }
+        if (fileName.equals(datasetId + ".meta.json") && "dataset_meta".equals(type)) {
+            return datasetId;
+        }
+        if (fileName.equals(datasetId + ".json") && "dataset_json".equals(type)) {
+            return datasetId;
+        }
+        return datasetId + "/" + fileName;
+    }
+
+    private String datasetFormat(String fileName, String type) {
+        if ("dataset_meta".equals(type)) {
+            return "meta";
+        }
+        if (fileName.endsWith(".csv")) {
+            return "csv";
+        }
+        if (fileName.endsWith(".json")) {
+            return "json";
+        }
+        return "file";
     }
 
     private ParsedEvents parseEvents(List<AgentRunEvent> events) {
@@ -267,7 +380,7 @@ public class AgentArtifactService {
                 }
                 String preview = readAsString(payload.get("result_preview"));
                 JsonNode outputNode = parseToolOutput(preview);
-                // FIFO pairing of STARTED/FINISHED by event order (legacy agentService behavior).
+                // FIFO pairing of STARTED/FINISHED by event order.
                 // Parallel executePython may interleave; precise match would need tool_execution_id in events.
                 if (!pendingToolRefs.isEmpty()) {
                     String ref = pendingToolRefs.remove(0);
@@ -899,6 +1012,9 @@ public class AgentArtifactService {
     private record ArtifactRef(String type, String runId, String ref) {
     }
 
+    private record DatasetFileKind(String type, String contentType) {
+    }
+
     @Getter
     @Builder
     private static class ResolvedArtifact {
@@ -923,5 +1039,29 @@ public class AgentArtifactService {
     }
 
     public record ArtifactContent(String artifactId, String filename, String contentType, byte[] content) {
+    }
+
+    /**
+     * 给 workspace 用的 parsed events 投影（避免把 internal ParsedEvents 暴露给跨模块 caller）。
+     *
+     * @param pythonScripts       python invocation 列表
+     * @param fallbackDatasetIds  fallback 阶段抓到的 dataset id 列表
+     */
+    public record ParsedEventsView(
+            List<PythonScript> pythonScripts,
+            List<String> fallbackDatasetIds) {
+    }
+
+    /**
+     * python invocation 公开投影。
+     */
+    public record PythonScript(
+            String ref,
+            int seq,
+            OffsetDateTime createdAt,
+            String code,
+            List<String> datasetIds,
+            Boolean success,
+            String source) {
     }
 }

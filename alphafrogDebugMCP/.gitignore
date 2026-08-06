@@ -2,3 +2,7 @@ node_modules/
 dist/
 .venv/
 *.log
+
+
+# 拉取远程log的工具，本地默认落盘文件夹
+output/

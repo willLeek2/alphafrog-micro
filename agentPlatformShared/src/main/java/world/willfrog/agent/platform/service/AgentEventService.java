@@ -14,12 +14,14 @@ import world.willfrog.agent.platform.mapper.AgentRunEventMapper;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunEventEnvelope;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agent.workflow.PlanExecutionMode;
 
 import java.time.OffsetDateTime;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 @Service
@@ -46,7 +48,8 @@ import java.util.Map;
  *
  * <h3>ext 字段提取方法集</h3>
  * 大量 {@code extractXxx(String extJson)} 方法都遵循统一约定:解析 JSON,缺失/异常返回安全默认值,
- * 不抛出异常,避免单个字段问题阻塞 run 执行。多数方法还兼容 ext 顶层 / context_json 嵌套两种位置,
+ * 避免单个字段问题阻塞 run 执行。execution mode 是会改变 executor 与恢复语义的契约字段，
+ * 因此它例外地对未知值 fail-closed。多数方法还兼容 ext 顶层 / context_json 嵌套两种位置,
  * 同时兼容 camelCase / snake_case 两种命名。
  *
  * <h3>Payload 截断</h3>
@@ -79,6 +82,8 @@ public class AgentEventService {
     private final AgentLlmLocalConfigLoader llmLocalConfigLoader;
     /** 消息服务:用于在 run 创建时写入初始用户消息 */
     private final AgentMessageService messageService;
+    /** 提示词服务：用于在 run 创建时快照当前 dataFreshness */
+    private final AgentPromptService agentPromptService;
 
     /** Run 正常生命周期 TTL(分钟),默认 60 分钟,过期后视为 EXPIRED */
     @Value("${agent.run.ttl-minutes:60}")
@@ -124,7 +129,27 @@ public class AgentEventService {
                               int plannerCandidateCount,
                               boolean debugMode,
                               String stageConfigJson) {
-        log.info("[AgentEventService] 创建 Run: userId={}, stageConfigJson={}", userId, stageConfigJson);
+        return createRun(userId, message, contextJson, idempotencyKey, modelName, endpointName,
+                captureLlmRequests, provider, plannerCandidateCount, debugMode, stageConfigJson, false);
+    }
+
+    /**
+     * createRun 重载：接受 isAdmin 标志，落 ext.is_admin，
+     * 让 executor / pipeline 防御层有 admin 旁路信号。
+     */
+    public AgentRun createRun(String userId,
+                              String message,
+                              String contextJson,
+                              String idempotencyKey,
+                              String modelName,
+                              String endpointName,
+                              boolean captureLlmRequests,
+                              String provider,
+                              int plannerCandidateCount,
+                              boolean debugMode,
+                              String stageConfigJson,
+                              boolean isAdmin) {
+        log.info("[AgentEventService] 创建 Run: userId={}, stageConfigJson={}, isAdmin={}", userId, stageConfigJson, isAdmin);
         // 生成无连字符 UUID 作为 runId
         String runId = java.util.UUID.randomUUID().toString().replace("-", "");
 
@@ -142,6 +167,8 @@ public class AgentEventService {
             ext.put("planner_candidate_count", plannerCandidateCount);
         }
         ext.put("checkpoint_version", resolveCheckpointVersion());
+        // 260612-01-02: 落 admin 旁路信号，供 executor / pipeline 防御层使用
+        ext.put("is_admin", isAdmin);
         if (stageConfigJson != null && !stageConfigJson.isBlank()) {
             try {
                 // 存储为 JSON 对象而非字符串，便于后续解析
@@ -156,10 +183,29 @@ public class AgentEventService {
             log.warn("[AgentEventService] stageConfigJson 为空，未存入 ext");
         }
 
-        // 从 contextJson 中提取 execution_mode
-        String executionMode = extractExecutionModeFromContext(contextJson);
-        if (executionMode != null && !executionMode.isBlank()) {
-            ext.put("execution_mode", executionMode);
+        /*
+         * execution mode 是 Run 创建契约，不是 pipeline 的本地猜测。
+         * 创建时立即做严格、统一的规范化，后续 planner / executor / 事件都只读取这份冻结值。
+         * 缺省写成 AUTO；非法值在插入 Run 前拒绝，避免留下一条无法可靠执行的半成品记录。
+         */
+        PlanExecutionMode executionMode = parseExecutionMode(extractExecutionModeFromContext(contextJson));
+        ext.put("execution_mode", executionMode.name());
+
+        world.willfrog.agent.platform.debug.DebugObservabilityRequest debugObservability =
+                world.willfrog.agent.platform.debug.DebugObservabilityRequest.parseContextJson(contextJson, objectMapper);
+        if (debugObservability.enabled()) {
+            ext.put(world.willfrog.agent.platform.debug.DebugObservabilityRequest.EXT_KEY, debugObservability.toExtMap());
+        }
+
+        // 快照当前数据时效配置（run 启动时冻结，保证 run 内 dataFreshness 语义一致）
+        AgentLlmProperties.DataFreshness freshness = agentPromptService.snapshotDataFreshness();
+        if (freshness != null) {
+            Map<String, String> freshnessMap = new HashMap<>();
+            freshnessMap.put("start_date", freshness.getStartDate());
+            freshnessMap.put("end_date", freshness.getEndDate());
+            freshnessMap.put("as_of_date", freshness.getAsOfDate());
+            freshnessMap.put("description", freshness.getDescription());
+            ext.put("data_freshness", freshnessMap);
         }
 
         // ── 构建 run 实体并写入 DB ──
@@ -174,6 +220,7 @@ public class AgentEventService {
         run.setLastError(null);
         run.setTtlExpiresAt(OffsetDateTime.now().plusMinutes(ttlMinutes));
         run.setExt(writeJson(ext));
+        run.setToolJobAnchorJson("{}");
 
         runMapper.insert(run);
         // 紧接着写入 RUN_RECEIVED 事件,保留 ext 全文作为事件 payload 便于审计
@@ -223,6 +270,12 @@ public class AgentEventService {
         }
         if (run.getStatus() == AgentRunStatus.WAITING) {
             log.info("Run paused (waiting), stop: {}", runId);
+            return false;
+        }
+        if (run.getStatus() == AgentRunStatus.WAITING_TOOL_JOB) {
+            // 这是长工具主动让出 Agent worker 的持久状态。旧 pipeline 必须在所有后续入口停下；
+            // 工具完成后的继续执行由 token/version 保护的 resume launcher 重新排队，不能在此原地恢复。
+            log.info("Run suspended for external tool job, stop: {}", runId);
             return false;
         }
         if (run.getTtlExpiresAt() != null && OffsetDateTime.now().isAfter(run.getTtlExpiresAt())) {
@@ -279,6 +332,54 @@ public class AgentEventService {
             throw new IllegalStateException(msg, e);
         }
         publishLiveEvent(runId, nextSeq, eventType, normalizedPayloadJson, publishedAt);
+    }
+
+    /**
+     * Appends one logical event exactly once. PostgreSQL is the idempotency authority;
+     * a duplicate call heals the Redis event stream from the already persisted row
+     * without republishing the live event.
+     *
+     * @return {@code true} when this call inserted the logical event, {@code false}
+     *         when an earlier call already persisted the same dedupe key
+     */
+    public boolean appendOnce(String runId,
+                              String userId,
+                              String eventType,
+                              String dedupeKey,
+                              Object payload) {
+        if (dedupeKey == null || dedupeKey.isBlank()) {
+            throw new IllegalArgumentException("dedupeKey is required");
+        }
+        AgentRun run = runMapper.findByIdAndUser(runId, userId);
+        if (run == null) {
+            return false;
+        }
+        AgentRunEvent event = new AgentRunEvent();
+        event.setRunId(runId);
+        event.setSeq(nextSeq(runId));
+        event.setEventType(eventType);
+        event.setDedupeKey(dedupeKey.trim());
+        String payloadJson = payload instanceof String ? (String) payload : writeJson(payload);
+        event.setPayloadJson(normalizePayloadJson(eventType, payloadJson));
+        event.setCreatedAt(OffsetDateTime.now());
+
+        int inserted = eventMapper.insertOnce(event);
+        if (inserted == 0) {
+            AgentRunEvent existing = eventMapper.findByRunIdAndDedupeKey(runId, event.getDedupeKey());
+            if (existing == null) {
+                throw new IllegalStateException("Dedupe conflict without persisted event: runId=" + runId
+                        + ", dedupeKey=" + event.getDedupeKey());
+            }
+            eventRedisStore.append(existing);
+            return false;
+        }
+
+        eventRedisStore.append(event);
+        if (isTerminalEventType(eventType) || "TOOL_CALL_FINISHED".equals(eventType)) {
+            eventRedisStore.flush(runId);
+        }
+        publishLiveEvent(runId, event.getSeq(), eventType, event.getPayloadJson(), event.getCreatedAt());
+        return true;
     }
 
     /**
@@ -463,7 +564,8 @@ public class AgentEventService {
      * 从 ext JSON 中提取执行模式。
      *
      * <p>兼容 snake_case ({@code execution_mode}) 和 camelCase ({@code executionMode}) 两种命名。
-     * 未配置时返回 {@code "AUTO"},由 Planner 根据 Plan 特征自动选择 LINEAR 或 DAG。</p>
+     * 未配置时返回 {@code "AUTO"},由 Planner 根据 Plan 特征自动选择 LINEAR 或 DAG。
+     * 非法值会明确抛出 {@link IllegalArgumentException}，不能静默回退。</p>
      *
      * @param extJson ext 字段 JSON
      * @return execution_mode 字段值，默认为 AUTO
@@ -473,7 +575,36 @@ public class AgentEventService {
         if (mode == null || mode.isBlank()) {
             mode = extractField(extJson, "executionMode");
         }
-        return mode == null || mode.isBlank() ? "AUTO" : mode;
+        return parseExecutionMode(mode).name();
+    }
+
+    /**
+     * 从 ext JSON 中提取强类型 requested execution mode。
+     *
+     * <p>这是 pipeline 的统一入口；与 {@link #extractExecutionMode(String)} 使用同一套
+     * trim / case-insensitive / fail-closed 规则。</p>
+     */
+    public PlanExecutionMode extractPlanExecutionMode(String extJson) {
+        return parseExecutionMode(extractExecutionMode(extJson));
+    }
+
+    /**
+     * 统一解析 execution mode。
+     *
+     * @param raw 原始模式；null/空白表示未指定
+     * @return LINEAR、DAG 或 AUTO
+     * @throws IllegalArgumentException 非法值
+     */
+    public static PlanExecutionMode parseExecutionMode(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return PlanExecutionMode.AUTO;
+        }
+        String normalized = raw.trim().toUpperCase(Locale.ROOT);
+        try {
+            return PlanExecutionMode.valueOf(normalized);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("unsupported_execution_mode:" + normalized, e);
+        }
     }
 
     /**
@@ -520,7 +651,7 @@ public class AgentEventService {
         try {
             Map<?, ?> map = objectMapper.readValue(contextJson, Map.class);
             Object mode = map.get("execution_mode");
-            if (mode == null) {
+            if (mode == null || mode.toString().isBlank()) {
                 mode = map.get("executionMode");
             }
             return mode != null ? mode.toString() : null;

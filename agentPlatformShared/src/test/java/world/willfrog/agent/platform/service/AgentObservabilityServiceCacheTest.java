@@ -236,6 +236,72 @@ class AgentObservabilityServiceCacheTest {
     }
 
     @Test
+    void recordLlmCallWithRawHttp_shouldKeepBillingTraceWhenRawCaptureDisabled() {
+        ReflectionTestUtils.setField(service, "llmTraceEnabled", false);
+        String runId = "test-run-billing-trace-without-raw";
+        AtomicReference<String> savedJson = new AtomicReference<>();
+
+        when(stateStore.loadObservability(eq(runId))).thenAnswer(inv -> {
+            String json = savedJson.get();
+            return json == null ? Optional.empty() : Optional.of(json);
+        });
+        doAnswer(inv -> {
+            savedJson.set(inv.getArgument(1));
+            return null;
+        }).when(stateStore).saveObservability(eq(runId), anyString());
+
+        RawHttpLogger.HttpResponseRecord response = RawHttpLogger.HttpResponseRecord.builder()
+                .statusCode(200)
+                .body("""
+                        {
+                          "id": "gen-billing-1",
+                          "usage": {
+                            "prompt_tokens": 10,
+                            "completion_tokens": 5,
+                            "total_tokens": 15,
+                            "cost": 0.00015
+                          },
+                          "choices": [{"message": {"content": "raw output"}}]
+                        }
+                        """)
+                .durationMs(80)
+                .timestamp(123L)
+                .build();
+
+        String traceId = service.recordLlmCallWithRawHttp(
+                runId, "planning",
+                new TokenUsage(10, 5, 15), 0,
+                80L, 10L, 90L,
+                "openrouter", "moonshotai/kimi-k2.6", null,
+                null, response, null
+        );
+
+        assertNotNull(savedJson.get());
+        try {
+            AgentObservabilityService.ObservabilityState state =
+                    objectMapper.readValue(savedJson.get(), AgentObservabilityService.ObservabilityState.class);
+            AgentObservabilityService.LlmTrace trace = state.getDiagnostics().getLlmTraces().stream()
+                    .filter(t -> traceId.equals(t.getTraceId()))
+                    .findFirst()
+                    .orElseThrow();
+            assertEquals("openrouter", trace.getEndpoint());
+            assertEquals("moonshotai/kimi-k2.6", trace.getModel());
+            assertEquals("gen-billing-1", trace.getGenerationId());
+            assertEquals(0.00015, trace.getActualCost());
+            assertEquals(10L, trace.getInputTokens());
+            assertEquals(5L, trace.getOutputTokens());
+            assertEquals(15L, trace.getTotalTokens());
+            assertNull(trace.getHttpResponse(), "raw response must remain disabled");
+            assertNull(trace.getOutputText(), "raw output must remain disabled");
+            assertNull(trace.getResponsePreview(), "response preview belongs to raw diagnostics");
+            assertFalse(trace.isDetailBlobStored(), "minimal billing trace should not create a detail blob");
+            assertEquals(1, state.getSummary().getLlmCalls());
+        } catch (Exception e) {
+            fail("Failed to parse stored state: " + e.getMessage());
+        }
+    }
+
+    @Test
     void enrichLlmCallSpending_shouldHandleNullRunIdOrTraceId() {
         // Should not throw
         service.enrichLlmCallSpending(null, "trace-1", 0.001, 0.0008, 0.0001, false);

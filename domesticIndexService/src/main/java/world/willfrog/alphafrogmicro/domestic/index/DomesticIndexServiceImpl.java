@@ -24,10 +24,12 @@ import world.willfrog.alphafrogmicro.domestic.idl.DubboDomesticIndexServiceTripl
 import world.willfrog.alphafrogmicro.domestic.index.service.IndexDataCompletenessService;
 
 import jakarta.annotation.PostConstruct;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.function.Consumer;
 import java.util.function.Function;
 
 @DubboService
@@ -89,8 +91,8 @@ public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
                 client,
                 "indices",
                 new String[]{"name", "ts_code", "full_name", "market", "publisher"}, // 可搜索字段
-                new String[]{"market", "publisher"}, // 可过滤字段
-                new String[]{"name", "ts_code"} // 可排序字段
+                new String[]{"market", "publisher", "has_daily"}, // 可过滤字段
+                new String[]{"has_daily", "name", "ts_code"} // 可排序字段
             );
             
             // 初始化索引（创建 + 配置）
@@ -130,7 +132,7 @@ public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
         
         // 定义数据获取函数
         MeiliSearchDataSyncService.FetchFunction<IndexInfo> fetchFunction = 
-            (offset, limit) -> indexInfoDao.getAllIndexInfo(offset, limit);
+            (offset, limit) -> indexInfoDao.getAllIndexInfoWithDaily(offset, limit);
         
         // 定义文档转换函数
         Function<IndexInfo, Map<String, Object>> docConverter = this::convertToMeiliDocument;
@@ -173,6 +175,7 @@ public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
         doc.put("publisher", index.getPublisher());
         doc.put("index_type", index.getIndexType());
         doc.put("category", index.getCategory());
+        doc.put("has_daily", resolveHasDaily(index));
         return doc;
     }
 
@@ -247,7 +250,11 @@ public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
             try {
                 Index index = getMeiliClient().index("indices");
                 SearchResult searchResult = (SearchResult) index.search(
-                        SearchRequest.builder().q(normalizedQuery).limit(200).build());
+                        SearchRequest.builder()
+                                .q(normalizedQuery)
+                                .limit(200)
+                                .sort(new String[]{"has_daily:desc"})
+                                .build());
                 for (Object hitObj : searchResult.getHits()) {
                     if (!(hitObj instanceof Map<?, ?> hit)) {
                         continue;
@@ -259,7 +266,8 @@ public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
                             .setTsCode(originalTsCode)
                             .setName(stringValue(hit.get("name")))
                             .setFullname(stringValue(hit.get("full_name")))
-                            .setMarket(stringValue(hit.get("market")));
+                            .setMarket(stringValue(hit.get("market")))
+                            .setHasDaily(intValue(hit.get("has_daily")));
                     responseBuilder.addItems(itemBuilder.build());
                 }
                 if (responseBuilder.getItemsCount() > 0) {
@@ -272,7 +280,7 @@ public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
         List<IndexInfo> indexInfoList;
         try {
             // 单条 SQL + 相关性排序，避免高热度关键词下"随机截断"导致基础指数缺失
-            indexInfoList = indexInfoDao.searchIndexInfo(normalizedQuery, 200, 0);
+            indexInfoList = indexInfoDao.searchIndexInfoWithDaily(normalizedQuery, 200, 0);
         } catch (Exception e) {
             log.error("Error occurred while searching index info with query: {}", normalizedQuery, e);
             // 搜索异常时返回空响应
@@ -281,7 +289,8 @@ public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
         for (IndexInfo indexInfo : indexInfoList) {
             DomesticIndexInfoSimpleItem.Builder itemBuilder = DomesticIndexInfoSimpleItem.newBuilder()
                     .setTsCode(indexInfo.getTsCode()).setName(indexInfo.getName())
-                    .setFullname(indexInfo.getFullName()).setMarket(indexInfo.getMarket());
+                    .setFullname(indexInfo.getFullName()).setMarket(indexInfo.getMarket())
+                    .setHasDaily(resolveHasDaily(indexInfo));
             responseBuilder.addItems(itemBuilder.build());
         }
 
@@ -290,6 +299,39 @@ public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
 
     private String stringValue(Object value) {
         return value == null ? "" : String.valueOf(value);
+    }
+
+    private int intValue(Object value) {
+        if (value instanceof Number number) {
+            return number.intValue();
+        }
+        if (value instanceof Boolean bool) {
+            return bool ? 1 : 0;
+        }
+        if (value != null) {
+            try {
+                return Integer.parseInt(String.valueOf(value));
+            } catch (NumberFormatException ignored) {
+                return 0;
+            }
+        }
+        return 0;
+    }
+
+    private int resolveHasDaily(IndexInfo index) {
+        if (index == null) {
+            return 0;
+        }
+        Integer hasDaily = index.getHasDaily();
+        if (hasDaily != null) {
+            return hasDaily > 0 ? 1 : 0;
+        }
+        try {
+            return indexQuoteDao != null && indexQuoteDao.hasAnyIndexDaily(index.getTsCode()) ? 1 : 0;
+        } catch (Exception e) {
+            log.warn("Failed to resolve index has_daily for tsCode={}", index.getTsCode(), e);
+            return 0;
+        }
     }
 
     private boolean isMeiliEnabled() {
@@ -350,13 +392,20 @@ public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
                 DomesticIndexDailyByTsCodeAndDateRangeResponse.newBuilder();
 
         for (IndexDaily indexDaily : indexDailyList) {
+            List<String> missingFields = new ArrayList<>();
             DomesticIndexDailyItem.Builder itemBuilder = DomesticIndexDailyItem.newBuilder()
-                    .setTsCode(indexDaily.getTsCode()).setTradeDate(indexDaily.getTradeDate())
-                    .setClose(indexDaily.getClose()).setOpen(indexDaily.getOpen())
-                    .setHigh(indexDaily.getHigh()).setLow(indexDaily.getLow())
-                    .setPreClose(indexDaily.getPreClose()).setChange(indexDaily.getChange())
-                    .setPctChg(indexDaily.getPctChg()).setVol(indexDaily.getVol())
-                    .setAmount(indexDaily.getAmount());
+                    .setTsCode(Objects.toString(indexDaily.getTsCode(), ""));
+            setLongIfPresent(itemBuilder::setTradeDate, indexDaily.getTradeDate(), "trade_date", missingFields);
+            setDoubleIfPresent(itemBuilder::setClose, indexDaily.getClose(), "close", missingFields);
+            setDoubleIfPresent(itemBuilder::setOpen, indexDaily.getOpen(), "open", missingFields);
+            setDoubleIfPresent(itemBuilder::setHigh, indexDaily.getHigh(), "high", missingFields);
+            setDoubleIfPresent(itemBuilder::setLow, indexDaily.getLow(), "low", missingFields);
+            setDoubleIfPresent(itemBuilder::setPreClose, indexDaily.getPreClose(), "pre_close", missingFields);
+            setDoubleIfPresent(itemBuilder::setChange, indexDaily.getChange(), "change", missingFields);
+            setDoubleIfPresent(itemBuilder::setPctChg, indexDaily.getPctChg(), "pct_chg", missingFields);
+            setDoubleIfPresent(itemBuilder::setVol, indexDaily.getVol(), "vol", missingFields);
+            setDoubleIfPresent(itemBuilder::setAmount, indexDaily.getAmount(), "amount", missingFields);
+            itemBuilder.addAllMissingFields(missingFields);
 
             responseBuilder.addItems(itemBuilder.build());
         }
@@ -379,6 +428,28 @@ public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
         }
 
         return responseBuilder.build();
+    }
+
+    private static void setDoubleIfPresent(Consumer<Double> setter,
+                                           Double value,
+                                           String field,
+                                           List<String> missingFields) {
+        if (value == null) {
+            missingFields.add(field);
+            return;
+        }
+        setter.accept(value);
+    }
+
+    private static void setLongIfPresent(Consumer<Long> setter,
+                                         Long value,
+                                         String field,
+                                         List<String> missingFields) {
+        if (value == null) {
+            missingFields.add(field);
+            return;
+        }
+        setter.accept(value);
     }
 
     @Override
@@ -471,10 +542,9 @@ public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
                     request.getTsCode(), request.getStartDate(), request.getEndDate()
             );
         } catch (Exception e) {
-            log.error("Error occurred while getting index weight data for tsCode: {}, dateRange: {}-{}", 
+            log.error("Error occurred while getting index weight data for tsCode: {}, dateRange: {}-{}",
                      request.getTsCode(), request.getStartDate(), request.getEndDate(), e);
-            // 数据库异常时返回空响应
-            return DomesticIndexWeightByTsCodeAndDateRangeResponse.newBuilder().build();
+            throw new RuntimeException("Failed to get index weight data for tsCode: " + request.getTsCode(), e);
         }
 
         if (indexWeightList.isEmpty()) {
@@ -509,10 +579,9 @@ public class DomesticIndexServiceImpl extends DomesticIndexServiceImplBase {
                     request.getConCode(), request.getStartDate(), request.getEndDate()
             );
         } catch (Exception e) {
-            log.error("Error occurred while getting index weight data for conCode: {}, dateRange: {}-{}", 
+            log.error("Error occurred while getting index weight data for conCode: {}, dateRange: {}-{}",
                      request.getConCode(), request.getStartDate(), request.getEndDate(), e);
-            // 数据库异常时返回空响应
-            return DomesticIndexWeightByConCodeAndDateRangeResponse.newBuilder().build();
+            throw new RuntimeException("Failed to get index weight data for conCode: " + request.getConCode(), e);
         }
 
         if (indexWeightList.isEmpty()) {

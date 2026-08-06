@@ -119,6 +119,35 @@ class LangchainRunConcurrencySchedulerTest {
         assertThat(thirdStarted.await(1, TimeUnit.SECONDS)).isTrue();
     }
 
+    @Test
+    void maxExpansion_shouldUseEveryElasticSlotAboveCore() throws Exception {
+        currentLimits.set(new LangchainRunExecutorLimits(1, 3, 1, "scheduler-test-"));
+        CountDownLatch firstStarted = new CountDownLatch(1);
+        CountDownLatch secondStarted = new CountDownLatch(1);
+        CountDownLatch thirdStarted = new CountDownLatch(1);
+        CountDownLatch fourthStarted = new CountDownLatch(1);
+        CountDownLatch firstRelease = new CountDownLatch(1);
+        CountDownLatch secondRelease = new CountDownLatch(1);
+        CountDownLatch thirdRelease = new CountDownLatch(1);
+        CountDownLatch fourthRelease = new CountDownLatch(1);
+
+        submitBlocking("run-1", firstStarted, firstRelease);
+        submitBlocking("run-2", secondStarted, secondRelease);
+        submitBlocking("run-3", thirdStarted, thirdRelease);
+        submitBlocking("run-4", fourthStarted, fourthRelease);
+
+        assertThat(firstStarted.await(1, TimeUnit.SECONDS)).isTrue();
+        assertThat(secondStarted.await(1, TimeUnit.SECONDS)).isTrue();
+        assertThat(thirdStarted.await(1, TimeUnit.SECONDS)).isTrue();
+        assertThat(scheduler.runningCount()).isEqualTo(3);
+        assertThat(fourthStarted.await(150, TimeUnit.MILLISECONDS)).isFalse();
+
+        firstRelease.countDown();
+        secondRelease.countDown();
+        thirdRelease.countDown();
+        assertThat(fourthStarted.await(1, TimeUnit.SECONDS)).isTrue();
+    }
+
     private void submitBlocking(String runId, CountDownLatch started, CountDownLatch release) {
         releases.add(release);
         LangchainRunConcurrencyScheduler.Reservation reservation = scheduler.reserve();

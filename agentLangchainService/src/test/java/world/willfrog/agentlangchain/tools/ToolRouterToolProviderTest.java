@@ -16,11 +16,16 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
+import world.willfrog.agent.platform.artifact.ToolOutputRefService;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agent.platform.service.SearchEvidenceJudgeService;
+import world.willfrog.agent.tools.compaction.RereadToolHandler;
 import world.willfrog.agent.tools.dataset.DatasetRegistry;
 import world.willfrog.agent.tools.dataset.DatasetWriter;
+import world.willfrog.agent.tools.dataset.ListMyDataTool;
+import world.willfrog.agent.tools.dataset.ManifestWriter;
+import world.willfrog.agent.tools.docs.LoadToolGuideTool;
 import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
 import world.willfrog.agent.tools.rag.RagTools;
@@ -57,6 +62,7 @@ class ToolRouterToolProviderTest {
         MarketDataTools marketDataTools = new MarketDataTools(
                 mock(DatasetWriter.class),
                 mock(DatasetRegistry.class),
+                mock(ManifestWriter.class),
                 null,
                 new AgentLlmProperties(),
                 objectMapper
@@ -64,6 +70,9 @@ class ToolRouterToolProviderTest {
         RagTools ragTools = new RagTools(objectMapper);
         SearchTools searchTools = new SearchTools(objectMapper, mock(SearchEvidenceJudgeService.class));
         PythonSandboxTools pythonSandboxTools = new PythonSandboxTools(objectMapper);
+        ListMyDataTool listMyDataTool = new ListMyDataTool(objectMapper);
+        LoadToolGuideTool loadToolGuideTool = new LoadToolGuideTool(objectMapper);
+        RereadToolHandler rereadToolHandler = new RereadToolHandler(mock(ToolOutputRefService.class), objectMapper);
 
         provider = new ToolRouterToolProvider(
                 toolRouter,
@@ -71,9 +80,13 @@ class ToolRouterToolProviderTest {
                 ragTools,
                 searchTools,
                 pythonSandboxTools,
+                listMyDataTool,
+                loadToolGuideTool,
+                rereadToolHandler,
                 objectMapper,
                 eventService,
-                new LangchainToolConcurrencyThrottle(false, 20, 60)
+                new LangchainToolConcurrencyThrottle(false, 20, 60),
+                mock(world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore.class)
         );
     }
 
@@ -100,6 +113,29 @@ class ToolRouterToolProviderTest {
         assertTrue(toolNames.contains("getStockInfo"));
         assertTrue(toolNames.contains("checkParallelLimits"));
         assertTrue(toolNames.contains("ragSearch"));
+        assertTrue(toolNames.contains("listMyData"));
+        assertTrue(toolNames.contains("rereadToolResult"));
+    }
+
+    @Test
+    void provideTools_shouldExposeListMyDataEvenWhenSearchAndCodeInterpreterDisabled() {
+        ToolProviderResult result = provider.provideTools(request(Map.of(
+                LangchainToolInvocationKeys.WEB_SEARCH_ENABLED, false,
+                LangchainToolInvocationKeys.CODE_INTERPRETER_ENABLED, false
+        )));
+
+        Set<String> toolNames = result.tools().keySet().stream()
+                .map(ToolSpecification::name)
+                .collect(Collectors.toSet());
+
+        assertTrue(toolNames.contains("listMyData"),
+                "listMyData is a run metadata tool and must not depend on webSearch/codeInterpreter flags");
+        assertNotNull(result.toolExecutorByName("listMyData"),
+                "AiService must be able to execute a listMyData tool_call instead of treating it as hallucinated");
+        assertTrue(toolNames.contains("rereadToolResult"),
+                "rereadToolResult is a rawRef metadata tool and must not depend on webSearch/codeInterpreter flags");
+        assertNotNull(result.toolExecutorByName("rereadToolResult"),
+                "AiService must be able to execute a rereadToolResult tool_call instead of treating it as hallucinated");
     }
 
     @Test
@@ -116,6 +152,11 @@ class ToolRouterToolProviderTest {
         assertTrue(specsByName.get("isTradingDay").description().contains("calendar_record_found"));
         assertTrue(specsByName.get("isTradingDay").description().contains("calendar.maxItems"));
         assertTrue(specsByName.get("isTradingDay").description().contains("data.mode=batch"));
+        assertTrue(specsByName.containsKey("rereadToolResult"));
+        String rereadDescription = specsByName.get("rereadToolResult").description();
+        assertTrue(rereadDescription.contains("rawRef"));
+        assertTrue(rereadDescription.contains("keyword"));
+        assertTrue(rereadDescription.contains("offset"));
 
         String dailyDescription = specsByName.get("getExchangeAssetDaily").description();
         assertTrue(dailyDescription.contains("checkParallelLimits"));
@@ -197,11 +238,15 @@ class ToolRouterToolProviderTest {
         assertTrue(output.contains("_retry_hint_"));
         assertTrue(output.contains("dataset-hs300"));
         assertTrue(output.contains("dataset-zz500"));
-        assertTrue(output.contains("placeholder/data/test"));
+        assertTrue(output.contains("run-level"));
+        assertTrue(output.contains("listMyData"));
+        assertTrue(output.contains("dataset_ids"));
+        assertTrue(output.contains("manifest_ids"));
+        assertTrue(output.contains("Resolve them through listMyData instead of passing them directly."));
     }
 
     @Test
-    void toolExecutor_shouldWarnThenBlockRepeatedIdenticalToolCalls() {
+    void toolExecutor_shouldNotBlockRepeatedNonDatabaseToolCalls() {
         when(toolRouter.invokeWithMeta(eq("searchWeb"), anyMap()))
                 .thenReturn(ToolRouter.ToolInvocationResult.builder()
                         .output("{\"ok\":true}")
@@ -224,11 +269,42 @@ class ToolRouterToolProviderTest {
         String third = executor.execute(toolRequest, "memory-1");
 
         assertEquals("{\"ok\":true}", first);
+        assertEquals("{\"ok\":true}", second);
+        assertEquals("{\"ok\":true}", third);
+        verify(toolRouter, times(3)).invokeWithMeta(eq("searchWeb"), eq(Map.of("query", "512800", "limit", 3)));
+    }
+
+    @Test
+    void toolExecutor_shouldWarnThenBlockRepeatedIdenticalDatabaseToolCalls() {
+        when(toolRouter.invokeWithMeta(eq("getIndexDaily"), anyMap()))
+                .thenReturn(ToolRouter.ToolInvocationResult.builder()
+                        .output("{\"ok\":true}")
+                        .success(true)
+                        .durationMs(1)
+                        .build());
+
+        ToolProviderResult result = provider.provideTools(request(Map.of()));
+        ToolExecutor executor = result.toolExecutorByName("getIndexDaily");
+        assertNotNull(executor);
+        ToolExecutionRequest toolRequest = ToolExecutionRequest.builder()
+                .name("getIndexDaily")
+                .arguments("{\"tsCode\":\"000300.SH\",\"startDateStr\":\"20250101\",\"endDateStr\":\"20250630\"}")
+                .build();
+
+        String first = executor.execute(toolRequest, "memory-1");
+        String second = executor.execute(toolRequest, "memory-1");
+        String third = executor.execute(toolRequest, "memory-1");
+
+        assertEquals("{\"ok\":true}", first);
         assertTrue(second.contains("_retry_hint_"));
-        assertTrue(second.contains("Do not call searchWeb again with identical arguments"));
+        assertTrue(second.contains("Do not call getIndexDaily again with identical arguments"));
         assertTrue(third.contains("\"code\":\"REPEATED_TOOL_CALL\""));
         assertTrue(third.contains("_retry_hint_"));
-        verify(toolRouter, times(2)).invokeWithMeta(eq("searchWeb"), eq(Map.of("query", "512800", "limit", 3)));
+        verify(toolRouter, times(2)).invokeWithMeta(eq("getIndexDaily"), eq(Map.of(
+                "tsCode", "000300.SH",
+                "startDateStr", "20250101",
+                "endDateStr", "20250630"
+        )));
     }
 
     @Test

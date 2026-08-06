@@ -43,6 +43,15 @@ security:
     task-creation-window-minutes: 60
 
 alphafrog:
+  domestic-fetch:
+    debug-base-url: ${AF_DOMESTIC_FETCH_DEBUG_BASE_URL:http://domestic-fetch-service:18082}
+  debug:
+    observability:
+      output-root: ${AF_DEBUG_OBSERVABILITY_OUTPUT_ROOT:/app/logs/agent-debug-observability}
+      auth:
+        default-ttl-seconds: 1800
+        max-bytes-per-session: 209715200
+        max-file-size-bytes: 52428800
   config:
     nacos:
       enabled: ${AF_CONFIG_NACOS_ENABLED:true}
@@ -50,7 +59,6 @@ alphafrog:
       namespace: ${AF_CONFIG_NACOS_NAMESPACE:}
   rag:
     ingest:
-      admin-token: ${AF_RAG_INGEST_TOKEN:}
       external-info-service-url: ${AF_EXTERNAL_INFO_SERVICE_URL:http://alphafrog-external-info-service:18096}
 
 agent:

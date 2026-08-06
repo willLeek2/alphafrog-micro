@@ -5,6 +5,7 @@ import org.springframework.cache.annotation.Cacheable;
 import world.willfrog.alphafrogmicro.common.pojo.domestic.stock.StockInfo;
 
 import java.util.List;
+import java.util.Map;
 
 @Mapper
 public interface StockInfoDao {
@@ -75,5 +76,31 @@ public interface StockInfoDao {
             @Result(column = "act_ent_type", property = "actEntType")
     })
     List<StockInfo> getAllStockInfo(@Param("offset") int offset, @Param("limit") int limit);
+
+    @Select("WITH candidates AS (" +
+            "  SELECT stock.ts_code, BTRIM(stock.name) AS name " +
+            "  FROM alphafrog_stock_info stock " +
+            "  WHERE stock.list_status = 'L' " +
+            "    AND stock.ts_code IS NOT NULL " +
+            "    AND NULLIF(BTRIM(stock.name), '') IS NOT NULL " +
+            "  ORDER BY random() " +
+            "  LIMIT #{candidateLimit}" +
+            ") " +
+            "SELECT c.ts_code AS ts_code, c.name AS name, " +
+            "       COUNT(*) AS daily_count, AVG(d.amount) AS average_amount " +
+            "FROM candidates c " +
+            "JOIN alphafrog_stock_daily d ON d.ts_code = c.ts_code " +
+            "WHERE d.trade_date BETWEEN #{startDate} AND #{endDate} " +
+            "GROUP BY c.ts_code, c.name " +
+            "HAVING COUNT(*) >= #{requiredDailyCount} " +
+            "   AND (CAST(#{minAverageAmount} AS DOUBLE PRECISION) IS NULL " +
+            "        OR AVG(d.amount) >= CAST(#{minAverageAmount} AS DOUBLE PRECISION)) " +
+            "ORDER BY random()")
+    List<Map<String, Object>> getEligibleRandomStocks(
+            @Param("startDate") Long startDate,
+            @Param("endDate") Long endDate,
+            @Param("requiredDailyCount") int requiredDailyCount,
+            @Param("minAverageAmount") Double minAverageAmount,
+            @Param("candidateLimit") int candidateLimit);
 
 }

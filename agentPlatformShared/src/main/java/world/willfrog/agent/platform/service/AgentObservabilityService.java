@@ -12,6 +12,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agent.platform.rag.RagObservabilityBuilder;
 
 import java.util.ArrayList;
 import java.util.Collection;
@@ -1002,11 +1003,7 @@ public class AgentObservabilityService {
      * 用于即使 run 出现未预期异常时也保留观测数据落盘。</p>
      */
     public void recordFailure(String runId, String errorType, String errorMessage) {
-        mutate(runId, state -> {
-            state.getSummary().setStatus(AgentRunStatus.FAILED.name());
-            state.getDiagnostics().setLastErrorType(nvl(errorType));
-            state.getDiagnostics().setLastErrorMessage(trim(errorMessage, 500));
-        });
+        mutate(runId, state -> applyFailure(state, errorType, errorMessage));
     }
 
     /**
@@ -1092,6 +1089,8 @@ public class AgentObservabilityService {
     public String loadObservabilityJson(String runId, String snapshotJson) {
         Optional<String> cached = stateStore.loadObservability(runId);
         if (cached.isPresent()) {
+            // 执行中优先读 Redis，因为这里保存的是最新 trace 列表和 streaming progress。
+            // snapshot 只在终态写回，不能代表当前执行中的实时状态。
             int llmTraces = 0;
             int toolTraces = 0;
             try {
@@ -1112,6 +1111,8 @@ public class AgentObservabilityService {
         Map<String, Object> snapshot = parseJsonObject(snapshotJson);
         Object observability = snapshot.get("observability");
         if (observability != null) {
+            // 这里读到的通常是 scrub 后的终态摘要和 trace index，不一定包含可展开的大字段。
+            // 但它足以支撑历史详情页展示基本耗时、token、错误和工具调用列表。
             String json = safeWrite(observability);
             log.warn("Observability fallback to snapshot: runId={}, size={} bytes", runId, json.length());
             return json;
@@ -1137,6 +1138,8 @@ public class AgentObservabilityService {
         }
         try {
             ObservabilityState state = objectMapper.readValue(full, ObservabilityState.class);
+            // summary 视图会保留 trace 数量和最新诊断状态，但移除完整 traces 列表。
+            // 这是 status/list 高频接口能承受的体积边界。
             return safeWrite(buildSummaryMap(state));
         } catch (Exception e) {
             // 反序列化失败时（可能是历史 schema 字段不匹配），按通用 Map 解析做兜底裁剪
@@ -1160,6 +1163,81 @@ public class AgentObservabilityService {
     }
 
     /**
+     * 两阶段终态观测候选项。snapshotJson 与 observabilityJson 由同一份只读候选状态
+     * 生成；只有数据库终态 CAS 胜者才能调用 {@link #commitTerminalSnapshot} 提交。
+     */
+    public record TerminalSnapshotCandidate(String runId,
+                                            AgentRunStatus status,
+                                            String snapshotJson,
+                                            String observabilityJson,
+                                            int llmTraceCount,
+                                            int toolTraceCount) {
+    }
+
+    /**
+     * 只读生成终态 snapshot 候选项。该方法不调用 mutate，不写 Redis，也不清理 run 锁。
+     * 恢复 worker 必须先用返回的 snapshotJson 竞争数据库 CAS，成功后再提交候选项。
+     */
+    public TerminalSnapshotCandidate prepareTerminalSnapshot(String runId,
+                                                              String snapshotJson,
+                                                              AgentRunStatus status,
+                                                              String failureType,
+                                                              String failureReason) {
+        ObservabilityState state = loadState(runId);
+        if (status != null) {
+            state.getSummary().setStatus(status.name());
+        }
+        if (status == AgentRunStatus.FAILED && failureReason != null && !failureReason.isBlank()) {
+            applyFailure(state, failureType, failureReason);
+        }
+        if (isTerminalStatus(status)) {
+            state.getSummary().setCompletedAtMillis(System.currentTimeMillis());
+        }
+        // mutate 平时在写回前调用 touch；preview 只更新当前内存副本。
+        touch(state);
+
+        Map<String, Object> snapshot = parseJsonObject(snapshotJson);
+        Map<String, Object> observabilityMap = objectMapper.convertValue(
+                state, new TypeReference<Map<String, Object>>() { });
+        attachRagObservability(runId, snapshot, state, observabilityMap);
+        AgentCallDetailPersistence.scrubObservabilityMap(observabilityMap);
+        snapshot.put("observability", observabilityMap);
+
+        String preparedSnapshot = safeWrite(snapshot);
+        String preparedObservability = safeWrite(observabilityMap);
+        int llmTraceCount = state.getDiagnostics().getLlmTraces().size();
+        int toolTraceCount = state.getDiagnostics().getToolTraces().size();
+        log.debug("Terminal observability prepared without persistence: runId={}, status={}, llmTraces={}, toolTraces={}",
+                runId, status, llmTraceCount, toolTraceCount);
+        return new TerminalSnapshotCandidate(
+                runId, status, preparedSnapshot, preparedObservability,
+                llmTraceCount, toolTraceCount);
+    }
+
+    /**
+     * 提交数据库终态 CAS 胜者的观测候选项。每次调用只写一次 Redis，然后清理 run 锁。
+     */
+    public void commitTerminalSnapshot(TerminalSnapshotCandidate candidate) {
+        if (candidate == null || candidate.runId() == null || candidate.runId().isBlank()
+                || !isTerminalStatus(candidate.status())
+                || candidate.observabilityJson() == null || candidate.observabilityJson().isBlank()) {
+            throw new IllegalArgumentException("Invalid terminal observability candidate");
+        }
+        Object lock = locks.computeIfAbsent(candidate.runId(), key -> new Object());
+        try {
+            synchronized (lock) {
+                stateStore.saveObservability(candidate.runId(), candidate.observabilityJson());
+            }
+            log.info("Terminal observability committed: runId={}, status={}, llmTraces={}, toolTraces={}, redisSize={} bytes",
+                    candidate.runId(), candidate.status(), candidate.llmTraceCount(),
+                    candidate.toolTraceCount(), candidate.observabilityJson().length());
+        } finally {
+            // 只有 CAS winner 会进入此方法；即使 Redis 暂时写失败也不保留终态锁。
+            locks.remove(candidate.runId(), lock);
+        }
+    }
+
+    /**
      * 将观测数据附加到 run 的 snapshot JSON 中，并同步保存到 Redis。
      *
      * <p>这是 run 终态（COMPLETED/FAILED/CANCELED）写回 DB 前的最后一步：</p>
@@ -1176,47 +1254,89 @@ public class AgentObservabilityService {
      * @return 附加完观测数据后的 snapshot JSON
      */
     public String attachObservabilityToSnapshot(String runId, String snapshotJson, AgentRunStatus status) {
-        int llmTracesBefore = 0;
-        int toolTracesBefore = 0;
-        try {
-            ObservabilityState currentState = loadState(runId);
-            llmTracesBefore = currentState.getDiagnostics().getLlmTraces().size();
-            toolTracesBefore = currentState.getDiagnostics().getToolTraces().size();
-        } catch (Exception e) {
-            log.debug("Could not load current state for metrics: runId={}", runId);
+        if (!isTerminalStatus(status)) {
+            return attachNonTerminalObservabilityToSnapshot(runId, snapshotJson, status);
         }
+        TerminalSnapshotCandidate candidate = prepareTerminalSnapshot(
+                runId, snapshotJson, status, null, null);
+        commitTerminalSnapshot(candidate);
+        return candidate.snapshotJson();
+    }
 
+    /**
+     * pause 等非终态调用仍沿用原有的即时写入语义；两阶段候选项只约束终态恢复 CAS。
+     */
+    private String attachNonTerminalObservabilityToSnapshot(String runId,
+                                                            String snapshotJson,
+                                                            AgentRunStatus status) {
         ObservabilityState state = mutate(runId, current -> {
             if (status != null) {
                 current.getSummary().setStatus(status.name());
             }
-            // 终态时锁定 completedAtMillis，后续 touch 不会再覆盖 totalDurationMs
-            if (status == AgentRunStatus.COMPLETED || status == AgentRunStatus.PARTIAL || status == AgentRunStatus.FAILED || status == AgentRunStatus.CANCELED) {
-                current.getSummary().setCompletedAtMillis(System.currentTimeMillis());
-            }
         });
         Map<String, Object> snapshot = parseJsonObject(snapshotJson);
-        Map<String, Object> observabilityMap = objectMapper.convertValue(state, new TypeReference<Map<String, Object>>() {
-        });
+        Map<String, Object> observabilityMap = objectMapper.convertValue(
+                state, new TypeReference<Map<String, Object>>() { });
+        attachRagObservability(runId, snapshot, state, observabilityMap);
         AgentCallDetailPersistence.scrubObservabilityMap(observabilityMap);
         snapshot.put("observability", observabilityMap);
-        String output = safeWrite(snapshot);
 
-        // 强制同步保存可观测数据到 Redis，确保后续可以立即加载
+        String output = safeWrite(snapshot);
         String observabilityJson = safeWrite(observabilityMap);
         stateStore.saveObservability(runId, observabilityJson);
-
-        int llmTracesAfter = state.getDiagnostics().getLlmTraces().size();
-        int toolTracesAfter = state.getDiagnostics().getToolTraces().size();
-        log.info("Observability attached to snapshot: runId={}, status={}, llmTraces {}→{}, toolTraces {}→{}, snapshotSize={} bytes, redisSize={} bytes",
-                runId, status, llmTracesBefore, llmTracesAfter, toolTracesBefore, toolTracesAfter,
-                output.length(), observabilityJson.length());
-
-        // 终态后清理 per-runId 锁，避免长期占用内存
-        if (status == AgentRunStatus.COMPLETED || status == AgentRunStatus.PARTIAL || status == AgentRunStatus.FAILED || status == AgentRunStatus.CANCELED) {
-            locks.remove(runId);
-        }
+        log.info("Non-terminal observability attached to snapshot: runId={}, status={}, llmTraces={}, toolTraces={}, snapshotSize={} bytes, redisSize={} bytes",
+                runId, status, state.getDiagnostics().getLlmTraces().size(),
+                state.getDiagnostics().getToolTraces().size(), output.length(), observabilityJson.length());
         return output;
+    }
+
+    private void applyFailure(ObservabilityState state, String errorType, String errorMessage) {
+        state.getSummary().setStatus(AgentRunStatus.FAILED.name());
+        state.getDiagnostics().setLastErrorType(nvl(errorType));
+        state.getDiagnostics().setLastErrorMessage(trim(errorMessage, 500));
+    }
+
+    private boolean isTerminalStatus(AgentRunStatus status) {
+        return status == AgentRunStatus.COMPLETED
+                || status == AgentRunStatus.PARTIAL
+                || status == AgentRunStatus.FAILED
+                || status == AgentRunStatus.CANCELED;
+    }
+
+    private void attachRagObservability(String runId,
+                                        Map<String, Object> snapshot,
+                                        ObservabilityState state,
+                                        Map<String, Object> observabilityMap) {
+        try {
+            List<ToolTrace> toolTraces = state != null
+                    && state.getDiagnostics() != null
+                    && state.getDiagnostics().getToolTraces() != null
+                    ? state.getDiagnostics().getToolTraces()
+                    : List.of();
+            Map<String, Object> ragObservability = new RagObservabilityBuilder(objectMapper).build(
+                    runId,
+                    extractFinalAnswerText(snapshot),
+                    toolTraces,
+                    traceId -> stateStore.loadToolCallDetail(runId, traceId)
+            );
+            if (!ragObservability.isEmpty()) {
+                observabilityMap.put("rag_observability", ragObservability);
+            }
+        } catch (Exception e) {
+            log.debug("Failed to attach RAG observability: runId={}, error={}", runId, e.getMessage());
+        }
+    }
+
+    private String extractFinalAnswerText(Map<String, Object> snapshot) {
+        if (snapshot == null || snapshot.isEmpty()) {
+            return "";
+        }
+        Object answerMarkdown = snapshot.get("answer_markdown");
+        if (answerMarkdown instanceof String text && !text.isBlank()) {
+            return text;
+        }
+        Object answer = snapshot.get("answer");
+        return answer instanceof String text ? text : "";
     }
     
     /**
@@ -1289,6 +1409,7 @@ public class AgentObservabilityService {
 
             updater.accept(state);
             // touch：更新 startedAt（首次）、totalDurationMs、cacheHitRate、updatedAt
+            // 所有 record* 方法都走 mutate，因此 run 级 duration/cache 统计会随每次写入刷新。
             touch(state);
 
             String json = safeWrite(state);
@@ -1668,8 +1789,8 @@ public class AgentObservabilityService {
     /**
      * 向 diagnostics.llmTraces 追加一条不含原始 HTTP 的 LlmTrace。
      *
-     * <p>本方法不主动开启 trace 捕获：仅当 {@link #shouldCaptureLlmTrace} 判断当前 run
-     * 启用了 LLM trace 时才追加。同时检查并裁剪超过 {@link #llmTraceCallLimit()} 的最旧记录。</p>
+     * <p>本方法始终写入结算所需的 minimal trace；{@link #shouldCaptureLlmTrace} 只控制
+     * request/response/reasoning 等诊断详情是否保留到 detail blob。</p>
      */
     private void appendLlmTrace(Diagnostics diagnostics,
                                 String traceId,
@@ -1686,12 +1807,10 @@ public class AgentObservabilityService {
                                 Map<String, Object> requestSnapshot,
                                 String responsePreview,
                                 ReasoningExtraction reasoning) {
-        if (!shouldCaptureLlmTrace(diagnostics)) {
-            return;
-        }
         if (diagnostics.getLlmTraces() == null) {
             diagnostics.setLlmTraces(new ArrayList<>());
         }
+        boolean captureDetails = shouldCaptureLlmTrace(diagnostics);
         List<LlmTrace> traces = diagnostics.getLlmTraces();
         LlmTrace trace = new LlmTrace();
         trace.setTraceId(nvl(traceId));
@@ -1706,15 +1825,17 @@ public class AgentObservabilityService {
         trace.setModel(nvl(modelName));
         trace.setHasError(errorMessage != null && !errorMessage.isBlank());
         trace.setError(trim(errorMessage, 1000));
-        trace.setRequest(requestSnapshot);
-        trace.setResponsePreview(responsePreview);
-        trace.setInputMessages(requestSnapshot);
-        trace.setOutputText(responsePreview);
+        if (captureDetails) {
+            trace.setRequest(requestSnapshot);
+            trace.setResponsePreview(responsePreview);
+            trace.setInputMessages(requestSnapshot);
+            trace.setOutputText(responsePreview);
+            trace.setReasoningText(reasoning == null ? "" : reasoning.text());
+            trace.setReasoningDetails(reasoning == null ? null : reasoning.details());
+            trace.setReasoningTruncated(reasoning != null && reasoning.truncated());
+        }
         trace.setTodoId(nvl(AgentContext.getTodoId()));
         trace.setTodoSequence(AgentContext.getTodoSequence());
-        trace.setReasoningText(reasoning == null ? "" : reasoning.text());
-        trace.setReasoningDetails(reasoning == null ? null : reasoning.details());
-        trace.setReasoningTruncated(reasoning != null && reasoning.truncated());
         // 设置 Token 统计
         if (tokenUsage != null) {
             trace.setInputTokens(tokenUsage.inputTokenCount() != null ? tokenUsage.inputTokenCount().longValue() : null);
@@ -1732,7 +1853,7 @@ public class AgentObservabilityService {
     /**
      * 添加带有原始 HTTP 信息的 LLM Trace（ALP-25 内部方法）。
      * 
-     * <p>将完整的 HTTP 观测数据添加到 Diagnostics.llmTraces 列表中。</p>
+     * <p>始终添加结算所需的 minimal trace；完整 HTTP 观测数据仅在诊断采集开启时保留。</p>
      * 
      * <p><b>数据结构说明：</b></p>
      * <ul>
@@ -1779,14 +1900,11 @@ public class AgentObservabilityService {
             ReasoningExtraction reasoning,
             List<Map<String, Object>> attempts) {
 
-        if (!shouldCaptureLlmTrace(diagnostics)) {
-            return;
-        }
-
         if (diagnostics.getLlmTraces() == null) {
             diagnostics.setLlmTraces(new ArrayList<>());
         }
 
+        boolean captureDetails = shouldCaptureLlmTrace(diagnostics);
         List<LlmTrace> traces = diagnostics.getLlmTraces();
         LlmTrace trace = new LlmTrace();
         trace.setTraceId(nvl(traceId));
@@ -1801,10 +1919,12 @@ public class AgentObservabilityService {
         trace.setModel(nvl(modelName));
         trace.setHasError(errorMessage != null && !errorMessage.isBlank());
         trace.setError(trim(errorMessage, 1000));
-        trace.setReasoningText(thinkingContent != null ? thinkingContent : (reasoning == null ? "" : reasoning.text()));
-        trace.setReasoningDetails(reasoning == null ? null : reasoning.details());
-        trace.setReasoningTruncated(reasoning != null && reasoning.truncated());
-        if (streamingProgress != null) {
+        if (captureDetails) {
+            trace.setReasoningText(thinkingContent != null ? thinkingContent : (reasoning == null ? "" : reasoning.text()));
+            trace.setReasoningDetails(reasoning == null ? null : reasoning.details());
+            trace.setReasoningTruncated(reasoning != null && reasoning.truncated());
+        }
+        if (captureDetails && streamingProgress != null) {
             LlmTrace.StreamingProgress sp = new LlmTrace.StreamingProgress();
             sp.setContentCharCount(streamingProgress.contentCharCount());
             sp.setReasoningCharCount(streamingProgress.reasoningCharCount());
@@ -1831,7 +1951,7 @@ public class AgentObservabilityService {
         trace.setGenerationId(extractOpenRouterGenerationId(httpResponse == null ? null : httpResponse.getBody()));
         
         // 设置原始 HTTP 请求信息
-        if (httpRequest != null) {
+        if (captureDetails && httpRequest != null) {
             RawHttpTrace reqTrace = new RawHttpTrace();
             reqTrace.setUrl(httpRequest.getUrl());
             reqTrace.setMethod(httpRequest.getMethod());
@@ -1844,7 +1964,7 @@ public class AgentObservabilityService {
         }
         
         // 设置原始 HTTP 响应信息
-        if (httpResponse != null) {
+        if (captureDetails && httpResponse != null) {
             RawHttpTrace respTrace = new RawHttpTrace();
             respTrace.setUrl(null); // 响应没有 URL
             respTrace.setMethod(null); // 响应没有方法
@@ -1857,15 +1977,17 @@ public class AgentObservabilityService {
         }
         
         // 设置 curl 命令
-        trace.setCurlCommand(curlCommand);
-        trace.setAttempts(attempts == null ? List.of() : attempts);
+        if (captureDetails) {
+            trace.setCurlCommand(curlCommand);
+            trace.setAttempts(attempts == null ? List.of() : attempts);
+        }
         
         // 保留向后兼容的字段
         trace.setRequest(null);
-        trace.setResponsePreview(httpResponse != null ? preview(httpResponse.getBody(), llmTraceTextLimit()) : null);
+        trace.setResponsePreview(captureDetails && httpResponse != null ? preview(httpResponse.getBody(), llmTraceTextLimit()) : null);
         
         // 设置新的 inputMessages / outputText 字段
-        if (httpRequest != null && httpRequest.getBody() != null && !httpRequest.getBody().isBlank()) {
+        if (captureDetails && httpRequest != null && httpRequest.getBody() != null && !httpRequest.getBody().isBlank()) {
             try {
                 Map<String, Object> body = objectMapper.readValue(httpRequest.getBody(), new TypeReference<Map<String, Object>>() {});
                 trace.setInputMessages(sanitizeRequestSnapshot(body));
@@ -1876,7 +1998,7 @@ public class AgentObservabilityService {
                 trace.setInputMessages(fallback);
             }
         }
-        trace.setOutputText(httpResponse != null ? preview(httpResponse.getBody(), llmTraceTextLimit()) : null);
+        trace.setOutputText(captureDetails && httpResponse != null ? preview(httpResponse.getBody(), llmTraceTextLimit()) : null);
         trace.setTodoId(nvl(AgentContext.getTodoId()));
         trace.setTodoSequence(AgentContext.getTodoSequence());
 
@@ -1896,7 +2018,18 @@ public class AgentObservabilityService {
         // Step 2 存储治理：先尝试把可懒加载的大字段写入 Redis detail blob；
         // 只有写入成功才在 trace index 上标 detailBlobStored=true。否则保留 available summary，
         // 避免 Redis 写失败被前端误判为 expired。
+        // trace index 留在 observability 列表中，detail blob 用 traceId 单独读取；
+        // 这就是“列表可扫、详情按需展开”的容量保护边界。
         boolean detailBlobStored = false;
+        Map<String, Object> rawBlob = AgentCallDetailPersistence.toLlmRawContentBlob(runId, trace);
+        if (AgentCallDetailPersistence.hasPersistableLlmRawContentBlob(rawBlob)) {
+            try {
+                stateStore.saveLlmCallRawContent(runId, trace.getTraceId(), safeWrite(rawBlob));
+            } catch (Exception e) {
+                log.debug("Failed to persist LLM raw http detail blob: runId={}, traceId={}, error={}",
+                        runId, trace.getTraceId(), e.getMessage());
+            }
+        }
         Map<String, Object> blob = AgentCallDetailPersistence.toLlmDetailBlob(trace);
         if (AgentCallDetailPersistence.hasPersistableDetailBlob(blob)) {
             try {
@@ -1916,6 +2049,7 @@ public class AgentObservabilityService {
         }
         // 工具输出可能远大于 SSE preview。这里同样先写 Redis detail blob，再 scrub trace；
         // 普通用户 safe detail API 只会返回白名单摘要，不会把 raw params/output 直接吐给前端。
+        // 写失败时 detailBlobStored=false，前端应展示“详情不可用”，而不是把 Redis miss 误判为过期。
         boolean detailBlobStored = false;
         Map<String, Object> blob = AgentCallDetailPersistence.toToolDetailBlob(trace);
         if (AgentCallDetailPersistence.hasPersistableDetailBlob(blob)) {

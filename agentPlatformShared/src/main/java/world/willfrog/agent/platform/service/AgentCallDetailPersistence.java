@@ -22,6 +22,10 @@ public final class AgentCallDetailPersistence {
         return blob != null && blob.size() > 2;
     }
 
+    public static boolean hasPersistableLlmRawContentBlob(Map<String, Object> blob) {
+        return blob != null && (blob.get("httpRequest") != null || blob.get("httpResponse") != null);
+    }
+
     public static Map<String, Object> toLlmDetailBlob(AgentObservabilityService.LlmTrace trace) {
         Map<String, Object> blob = new LinkedHashMap<>();
         blob.put("type", "llm");
@@ -30,13 +34,17 @@ public final class AgentCallDetailPersistence {
         putIfPresent(blob, "outputText", trace.getOutputText());
         putIfPresent(blob, "reasoningText", trace.getReasoningText());
         putIfPresent(blob, "reasoningDetails", trace.getReasoningDetails());
+        putIfPresent(blob, "responsePreview", trace.getResponsePreview());
+        return blob;
+    }
+
+    public static Map<String, Object> toLlmRawContentBlob(String runId, AgentObservabilityService.LlmTrace trace) {
+        Map<String, Object> blob = new LinkedHashMap<>();
+        blob.put("type", "llm_raw_http");
+        blob.put("runId", runId);
+        blob.put("traceId", trace.getTraceId());
         putIfPresent(blob, "httpRequest", trace.getHttpRequest());
         putIfPresent(blob, "httpResponse", trace.getHttpResponse());
-        putIfPresent(blob, "curlCommand", trace.getCurlCommand());
-        putIfPresent(blob, "attempts", trace.getAttempts());
-        putIfPresent(blob, "request", trace.getRequest());
-        putIfPresent(blob, "responsePreview", trace.getResponsePreview());
-        putIfPresent(blob, "generationId", trace.getGenerationId());
         return blob;
     }
 
@@ -70,8 +78,6 @@ public final class AgentCallDetailPersistence {
         trace.setCurlCommand(null);
         trace.setAttempts(null);
         trace.setRequest(null);
-        trace.setGenerationId(null);
-        trace.setEndpoint(null);
         trace.setDetailBlobStored(detailBlobStored);
     }
 
@@ -139,8 +145,6 @@ public final class AgentCallDetailPersistence {
         trace.remove("curlCommand");
         trace.remove("attempts");
         trace.remove("request");
-        trace.remove("generationId");
-        trace.remove("endpoint");
         String truncated = truncatePreview(preview == null ? null : String.valueOf(preview));
         if (truncated != null) {
             trace.put("responsePreview", truncated);

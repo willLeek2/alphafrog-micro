@@ -6,7 +6,9 @@ import org.springframework.beans.factory.ObjectProvider;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agent.platform.service.AgentCreditService;
 import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
 import world.willfrog.agentlangchain.failure.LangchainFailureMapper;
 import world.willfrog.agentlangchain.orchestration.dag.LangchainDagWorkflowExecutor;
 import world.willfrog.agentlangchain.planning.LangchainAiPlanner;
@@ -75,7 +77,12 @@ class LangchainLinearRunPipelineInterruptTest {
                 followUpContextSupport,
                 mock(world.willfrog.agent.platform.service.AgentMessageService.class),
                 executionGuard,
-                immediateScheduler()
+                immediateScheduler(),
+                mock(AgentCreditService.class),
+                mock(AgentRunCreditSettlementService.class),
+                mock(world.willfrog.agent.platform.event.AgentRunFinalizationService.class),
+                mock(ObjectProvider.class),
+                mock(ObjectProvider.class)
         );
 
         pipeline.executeRun(run);

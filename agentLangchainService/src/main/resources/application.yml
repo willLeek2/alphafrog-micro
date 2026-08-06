@@ -53,7 +53,7 @@ langchain4j:
       exclude: ${AF_AGENT_REASONING_EXCLUDE:false}
       enabled: ${AF_AGENT_REASONING_ENABLED:#{null}}
 
-# Nacos 配置订阅（与 legacy agentService 一致：推送写本地文件 → LocalConfigLoader 热加载）
+# Nacos 配置订阅：推送写本地文件 → LocalConfigLoader 热加载
 alphafrog:
   config:
     nacos:

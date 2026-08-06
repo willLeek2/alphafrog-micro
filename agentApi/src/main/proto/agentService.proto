@@ -122,6 +122,7 @@ message ListAgentRunEventsResponse {
 message GetAgentRunResultRequest {
   string user_id = 1;
   string id = 2;
+  bool is_admin = 3;
 }
 
 message GetAgentRunCostRequest {
@@ -251,6 +252,44 @@ message DownloadAgentArtifactResponse {
   bytes content = 4;
 }
 
+message GetAgentArtifactPartsRequest {
+  string user_id = 1;
+  string artifact_id = 2;
+  int32 max_part_size = 3;
+  bool is_admin = 4;
+}
+
+message AgentArtifactPartsMetaMessage {
+  string artifact_id = 1;
+  string filename = 2;
+  string content_type = 3;
+  int32 part_size = 4;
+  int32 total_parts = 5;
+  int64 uncompressed_size = 6;
+  int64 compressed_size = 7;
+  string compression = 8;
+  string checksum = 9;
+}
+
+message GetAgentArtifactPartRequest {
+  string user_id = 1;
+  string artifact_id = 2;
+  int32 part_index = 3;
+  int32 max_part_size = 4;
+  bool is_admin = 5;
+}
+
+message AgentArtifactPartMessage {
+  string artifact_id = 1;
+  string filename = 2;
+  string content_type = 3;
+  int32 part_index = 4;
+  int32 part_size = 5;
+  int32 total_parts = 6;
+  bytes content = 7;
+  string compression = 8;
+}
+
 message GetAgentConfigRequest {
   string user_id = 1;
 }
@@ -299,6 +338,57 @@ message ApplyAgentCreditsResponse {
   int32 used_credits = 4;
   string status = 5;
   string applied_at = 6;
+}
+
+// ---- 260612-01-04: 单次 run 的 credit 消耗明细查询 ----
+
+message GetAgentRunCreditsRequest {
+  string user_id = 1;
+  string id = 2;
+  bool is_admin = 3;
+}
+
+message RefreshAgentRunCreditsRequest {
+  string user_id = 1;
+  string id = 2;
+  bool is_admin = 3;
+}
+
+message AgentRunCreditRecordMessage {
+  string call_id = 1;             // 对外标识 (llm_call_id)
+  string phase = 2;               // planning / execution / sub_agent；可空
+  string todo_id = 3;             // 关联 todo node；可空
+  string endpoint = 4;            // openrouter / fireworks / dashscope-cn / dashscope-sg
+  string model = 5;               // 实际调用模型
+  string cost_source = 6;         // OPENROUTER_ACTUAL / OPENROUTER_FALLBACK / PER_CALL
+  string currency = 7;            // 当前固定 USD
+  string cost_amount = 8;         // 原始 cost（string, USD; PER_CALL 端点可空）
+  string credit_delta = 9;        // 实际扣减的 credit
+  int32 settlement_attempt = 10;  // 1=immediate, 2=delayed retry
+  string settlement_status = 11;  // SETTLED / PENDING_RETRY / MISSING
+  string reason = 12;             // 关联 ledger 的 reason
+  string created_at = 13;
+}
+
+message AgentRunCreditSettlementSummaryMessage {
+  int32 immediate_count = 1;      // settlement_attempt == 1 && status == SETTLED
+  int32 delayed_count = 2;        // settlement_attempt == 2 && status == SETTLED
+  int32 pending_count = 3;        // status == PENDING_RETRY
+  int32 missing_count = 4;        // status == MISSING
+  int32 total_call_count = 5;
+  string currency = 6;
+  string total_credits = 7;       // 来自 summary 表的长期保存值
+  string last_settlement_at = 8;  // summary 表新增字段
+}
+
+message GetAgentRunCreditsResponse {
+  string run_id = 1;
+  string owner_user_id = 2;
+  string total_credits = 3;
+  string currency = 4;
+  repeated AgentRunCreditRecordMessage records = 5;  // 按 created_at 升序
+  AgentRunCreditSettlementSummaryMessage summary = 6;
+  string updated_at = 7;
 }
 
 message AgentRetentionConfigMessage {
@@ -432,10 +522,14 @@ service AgentDubboService {
   rpc ListTools(ListAgentToolsRequest) returns (ListAgentToolsResponse);
   rpc ListArtifacts(ListAgentArtifactsRequest) returns (ListAgentArtifactsResponse);
   rpc DownloadArtifact(DownloadAgentArtifactRequest) returns (DownloadAgentArtifactResponse);
+  rpc GetArtifactPartsMeta(GetAgentArtifactPartsRequest) returns (AgentArtifactPartsMetaMessage);
+  rpc GetArtifactPart(GetAgentArtifactPartRequest) returns (AgentArtifactPartMessage);
   rpc GetConfig(GetAgentConfigRequest) returns (GetAgentConfigResponse);
   rpc ListModels(ListAgentModelsRequest) returns (ListAgentModelsResponse);
   rpc GetCredits(GetAgentCreditsRequest) returns (GetAgentCreditsResponse);
   rpc ApplyCredits(ApplyAgentCreditsRequest) returns (ApplyAgentCreditsResponse);
+  rpc GetRunCredits(GetAgentRunCreditsRequest) returns (GetAgentRunCreditsResponse);
+  rpc RefreshRunCredits(RefreshAgentRunCreditsRequest) returns (GetAgentRunCreditsResponse);
   rpc SubmitFeedback(SubmitAgentFeedbackRequest) returns (AgentEmpty);
   rpc ExportRun(ExportAgentRunRequest) returns (ExportAgentRunResponse);
   rpc SendMessage(SendAgentMessageRequest) returns (SendAgentMessageResponse);

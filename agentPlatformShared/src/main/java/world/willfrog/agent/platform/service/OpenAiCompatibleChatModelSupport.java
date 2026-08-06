@@ -532,7 +532,7 @@ public final class OpenAiCompatibleChatModelSupport {
         return normalized + "/v1/chat/completions";
     }
 
-    static String shorten(String text) {
+    public static String shorten(String text) {
         if (text == null) {
             return "";
         }

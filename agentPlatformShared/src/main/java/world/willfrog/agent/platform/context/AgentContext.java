@@ -4,7 +4,10 @@ import java.util.List;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
+import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.config.RunStageConfig;
+import world.willfrog.agent.platform.config.StageLlmConfig;
+import world.willfrog.agent.platform.dataanalysis.PythonRepairContext;
 
 /**
  * Agent 运行时上下文中枢 —— 跨组件共享的 {@link ThreadLocal} 容器。
@@ -52,8 +55,16 @@ public class AgentContext {
     private static final ThreadLocal<Integer> SUB_AGENT_STEP_INDEX_HOLDER = new ThreadLocal<>();
     /** Python 沙箱代码二次重写(refine)的尝试次数,用于观测和限流 */
     private static final ThreadLocal<Integer> PYTHON_REFINE_ATTEMPT_HOLDER = new ThreadLocal<>();
+    /** 当前 todo 的 durable Python 修复历史投影，供容量准入前判重。 */
+    private static final ThreadLocal<PythonRepairContext> PYTHON_REPAIR_CONTEXT_HOLDER = new ThreadLocal<>();
     /** 当前 LangChain tool call id（与 SSE {@code tool_call_id} 对齐，供 observability tool trace）。 */
     private static final ThreadLocal<String> TOOL_CALL_ID_HOLDER = new ThreadLocal<>();
+    /**
+     * 当前恢复 worker 正在消费的旧 tool-job handoff 身份。
+     * 第二次长工具必须携带该 token/version，才能原子替换旧 LAUNCHING anchor。
+     */
+    private static final ThreadLocal<String> TOOL_JOB_RESUME_TOKEN_HOLDER = new ThreadLocal<>();
+    private static final ThreadLocal<Long> TOOL_JOB_RESUME_LEASE_VERSION_HOLDER = new ThreadLocal<>();
     /** 决策 trace ID,关联到 PlanJudge 等组件产生的决策链 */
     private static final ThreadLocal<String> DECISION_TRACE_ID_HOLDER = new ThreadLocal<>();
     /** 决策所处阶段(配合 traceId 用) */
@@ -85,6 +96,8 @@ public class AgentContext {
      * 每个 run 在执行线程(含并行子线程)里独立保存,避免跨 run 串扰。
      */
     private static final ThreadLocal<Boolean> DEBUG_MODE_HOLDER = new ThreadLocal<>();
+    /** task #62 A: run-scoped debug observability session id for JSONL writer. */
+    private static final ThreadLocal<String> DEBUG_OBSERVABILITY_SESSION_ID_HOLDER = new ThreadLocal<>();
     /**
      * 网页搜索能力开关。
      * 由 AgentRunExecutor 根据 run 请求中的 webSearchEnabled 字段设置。
@@ -115,6 +128,18 @@ public class AgentContext {
     private static final ThreadLocal<RunStageConfig> STAGE_CONFIG_HOLDER = new ThreadLocal<>();
 
     /**
+     * 当前 Run 的 execution 阶段生效配置（endpoint / model / providerOrder 已合并请求参数与本地 fallback）。
+     * 供 search_evidence_judge 等没有独立 stage 配置的环节退化使用，避免落到 deprecated runtime.judge.routes。
+     */
+    private static final ThreadLocal<StageLlmConfig> EFFECTIVE_EXECUTION_STAGE_CONFIG_HOLDER = new ThreadLocal<>();
+
+    /**
+     * 当前 Run 的数据时效快照，在 executeRun 入口从 ext.data_freshness 反序列化设置。
+     * 同一 run 内不变，确保 planning → execution → final 看到的 dataFreshness 语义一致。
+     */
+    private static final ThreadLocal<AgentLlmProperties.DataFreshness> DATA_FRESHNESS_HOLDER = new ThreadLocal<>();
+
+    /**
      * DashScope thinking 内容：从流式响应中提取的 reasoning_content。
      */
     private static final ThreadLocal<String> THINKING_CONTENT_HOLDER = new ThreadLocal<>();
@@ -123,6 +148,16 @@ public class AgentContext {
      * 流式响应实时进度快照。
      */
     private static final ThreadLocal<world.willfrog.agent.platform.service.StreamingProgressTracker.StreamingProgressSnapshot> STREAMING_PROGRESS_HOLDER = new ThreadLocal<>();
+
+    /**
+     * 90% last-mile hint：当本 run 的任意预算维度首次跨过 90% 时，
+     * {@code AgentRunBudgetService} 写入一段中文提示文本到本 ThreadLocal；
+     * 下一次 {@code LangchainTodoNodeExecutor} 的 {@code chatRequestTransformer} 读取并注入到 SystemMessage，
+     * 促使 LLM 在剩余预算内尽快给出最终结论。
+     * <p>字符串内容由 budget service 拼装（含维度名 / 实际值 / 上限 / 建议话术），
+     * transformer 只负责"读到就注入、读不到就透传"。</p>
+     */
+    private static final ThreadLocal<String> LAST_MILE_HINT_HOLDER = new ThreadLocal<>();
 
     /** 设置当前线程的 Run ID。 */
     public static void setRunId(String runId) {
@@ -222,14 +257,22 @@ public class AgentContext {
         return PYTHON_REFINE_ATTEMPT_HOLDER.get();
     }
 
-    /**
-     * 一次性写入决策上下文三元组(traceId / stage / excerpt),
-     * 通常由 PlanJudge 在做出决策后调用。
-     *
-     * @param traceId 决策链 trace ID
-     * @param stage   决策所处阶段
-     * @param excerpt 决策摘要片段
-     */
+    public static void setPythonRepairContext(PythonRepairContext context) {
+        if (context == null) {
+            clearPythonRepairContext();
+            return;
+        }
+        PYTHON_REPAIR_CONTEXT_HOLDER.set(context);
+    }
+
+    public static PythonRepairContext getPythonRepairContext() {
+        return PYTHON_REPAIR_CONTEXT_HOLDER.get();
+    }
+
+    public static void clearPythonRepairContext() {
+        PYTHON_REPAIR_CONTEXT_HOLDER.remove();
+    }
+
     /** 设置当前 tool call id（LangChain {@code ToolExecutionRequest#id()}，与 SSE 对齐）。 */
     public static void setToolCallId(String toolCallId) {
         if (toolCallId == null || toolCallId.isBlank()) {
@@ -248,6 +291,40 @@ public class AgentContext {
         TOOL_CALL_ID_HOLDER.remove();
     }
 
+    /** 设置当前恢复 worker 持有的旧 handoff 租约。 */
+    public static void setToolJobResumeHandoff(String token, long leaseVersion) {
+        if (token == null || token.isBlank() || leaseVersion <= 0) {
+            clearToolJobResumeHandoff();
+            return;
+        }
+        TOOL_JOB_RESUME_TOKEN_HOLDER.set(token);
+        TOOL_JOB_RESUME_LEASE_VERSION_HOLDER.set(leaseVersion);
+    }
+
+    /** 获取当前恢复 handoff token；普通首次执行返回 null。 */
+    public static String getToolJobResumeToken() {
+        return TOOL_JOB_RESUME_TOKEN_HOLDER.get();
+    }
+
+    /** 获取当前恢复 handoff lease version；普通首次执行返回 null。 */
+    public static Long getToolJobResumeLeaseVersion() {
+        return TOOL_JOB_RESUME_LEASE_VERSION_HOLDER.get();
+    }
+
+    /** 清除已经被下一次 PREPARING 原子接管的旧 handoff 身份。 */
+    public static void clearToolJobResumeHandoff() {
+        TOOL_JOB_RESUME_TOKEN_HOLDER.remove();
+        TOOL_JOB_RESUME_LEASE_VERSION_HOLDER.remove();
+    }
+
+    /**
+     * 一次性写入决策上下文三元组（traceId / stage / excerpt），
+     * 通常由 PlanJudge 在做出决策后调用。
+     *
+     * @param traceId 决策链 trace ID
+     * @param stage   决策所处阶段
+     * @param excerpt 决策摘要片段
+     */
     public static void setDecisionContext(String traceId, String stage, String excerpt) {
         DECISION_TRACE_ID_HOLDER.set(traceId);
         DECISION_STAGE_HOLDER.set(stage);
@@ -372,6 +449,22 @@ public class AgentContext {
         DEBUG_MODE_HOLDER.remove();
     }
 
+    public static void setDebugObservabilitySessionId(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) {
+            clearDebugObservabilitySessionId();
+            return;
+        }
+        DEBUG_OBSERVABILITY_SESSION_ID_HOLDER.set(sessionId);
+    }
+
+    public static String getDebugObservabilitySessionId() {
+        return DEBUG_OBSERVABILITY_SESSION_ID_HOLDER.get();
+    }
+
+    public static void clearDebugObservabilitySessionId() {
+        DEBUG_OBSERVABILITY_SESSION_ID_HOLDER.remove();
+    }
+
     /**
      * 设置 OpenRouter reasoning effort(如 "high"、"medium"、"low")。
      * LLM 包装器据此为 OpenRouter 端点注入 reasoning 参数。
@@ -408,6 +501,53 @@ public class AgentContext {
         STAGE_CONFIG_HOLDER.remove();
     }
 
+    /**
+     * 设置当前 Run 的 execution 阶段生效配置。
+     * 由 AgentRunExecutor 在解析合并完请求参数、本地 fallback 后写入，
+     * 供 search_evidence_judge 等无独立 stage 配置的环节退化使用。
+     */
+    public static void setEffectiveExecutionStageConfig(StageLlmConfig config) {
+        if (config == null) {
+            EFFECTIVE_EXECUTION_STAGE_CONFIG_HOLDER.remove();
+            return;
+        }
+        EFFECTIVE_EXECUTION_STAGE_CONFIG_HOLDER.set(config);
+    }
+
+    /** 获取 execution 阶段生效配置，可能为 null。 */
+    public static StageLlmConfig getEffectiveExecutionStageConfig() {
+        return EFFECTIVE_EXECUTION_STAGE_CONFIG_HOLDER.get();
+    }
+
+    /** 清理 execution 阶段生效配置。 */
+    public static void clearEffectiveExecutionStageConfig() {
+        EFFECTIVE_EXECUTION_STAGE_CONFIG_HOLDER.remove();
+    }
+
+    /** 获取当前线程的 Run 级数据时效快照（run 启动时冻结），可能为 null。 */
+    public static AgentLlmProperties.DataFreshness getDataFreshness() {
+        return DATA_FRESHNESS_HOLDER.get();
+    }
+
+    /** 设置当前线程的 Run 级数据时效快照（做字段级 defensive copy，避免外部修改影响冻结语义）。 */
+    public static void setDataFreshness(AgentLlmProperties.DataFreshness dataFreshness) {
+        if (dataFreshness == null) {
+            DATA_FRESHNESS_HOLDER.remove();
+            return;
+        }
+        AgentLlmProperties.DataFreshness copy = new AgentLlmProperties.DataFreshness();
+        copy.setStartDate(dataFreshness.getStartDate());
+        copy.setEndDate(dataFreshness.getEndDate());
+        copy.setAsOfDate(dataFreshness.getAsOfDate());
+        copy.setDescription(dataFreshness.getDescription());
+        DATA_FRESHNESS_HOLDER.set(copy);
+    }
+
+    /** 清理当前线程的数据时效快照。 */
+    public static void clearDataFreshness() {
+        DATA_FRESHNESS_HOLDER.remove();
+    }
+
     /** 设置流式响应中提取的 thinking 内容(DashScope reasoning_content 等)。 */
     public static void setThinkingContent(String content) {
         THINKING_CONTENT_HOLDER.set(content);
@@ -436,6 +576,32 @@ public class AgentContext {
     /** 清理流式进度快照。 */
     public static void clearStreamingProgress() {
         STREAMING_PROGRESS_HOLDER.remove();
+    }
+
+    /**
+     * 设置 90% last-mile hint 文本（由 {@code AgentRunBudgetService} 在首次跨过 90% 阈值时调用）。
+     * 空白值等价于清理,避免误把空字符串当成有效 hint 注入到 SystemMessage。
+     */
+    public static void setLastMileHint(String hint) {
+        if (hint == null || hint.isBlank()) {
+            LAST_MILE_HINT_HOLDER.remove();
+            return;
+        }
+        LAST_MILE_HINT_HOLDER.set(hint);
+    }
+
+    /**
+     * 获取 90% last-mile hint,可能为 null(未设置或已清理)。
+     * 由 {@code LangchainTodoNodeExecutor#chatRequestTransformer} 读取,
+     * 读到非空字符串时拼接到 SystemMessage 末尾促使 LLM 尽快给出最终结论。
+     */
+    public static String getLastMileHint() {
+        return LAST_MILE_HINT_HOLDER.get();
+    }
+
+    /** 清理 last-mile hint(在 chatRequestTransformer 注入完成后立即清,避免下次 LLM 调用误注入)。 */
+    public static void clearLastMileHint() {
+        LAST_MILE_HINT_HOLDER.remove();
     }
 
     /** 清理 phase。 */
@@ -551,7 +717,7 @@ public class AgentContext {
      * 用户没开搜索而拒绝执行。引入本方法后,子线程能正确继承父线程的所有能力配置。
      *
      * @return 包含 runId / userId / debugMode / webSearchEnabled / webSearchConfig /
-     *         extractedEntities / reasoningEffort / stageConfig 的不可变快照
+     *         extractedEntities / reasoningEffort / stageConfig / effectiveExecutionStageConfig 的不可变快照
      */
     public static ContextSnapshot captureRunContext() {
         return new ContextSnapshot(
@@ -563,7 +729,13 @@ public class AgentContext {
                 EXTRACTED_ENTITIES_HOLDER.get(),
                 getReasoningEffort(),
                 getStageConfig(),
-                getWorkflow()
+                getEffectiveExecutionStageConfig(),
+                getWorkflow(),
+                getDataFreshness(),
+                getLastMileHint(),
+                getDebugObservabilitySessionId(),
+                getToolJobResumeToken(),
+                getToolJobResumeLeaseVersion()
         );
     }
 
@@ -626,10 +798,38 @@ public class AgentContext {
         } else {
             setStageConfig(snapshot.stageConfig());
         }
+        // execution 阶段生效配置：子线程的 search_evidence_judge 等需要退化为 run 主模型
+        if (snapshot.effectiveExecutionStageConfig() == null) {
+            clearEffectiveExecutionStageConfig();
+        } else {
+            setEffectiveExecutionStageConfig(snapshot.effectiveExecutionStageConfig());
+        }
         if (snapshot.workflow() == null) {
             clearWorkflow();
         } else {
             setWorkflow(snapshot.workflow());
+        }
+        if (snapshot.dataFreshness() == null) {
+            clearDataFreshness();
+        } else {
+            setDataFreshness(snapshot.dataFreshness());
+        }
+        // last-mile hint:子线程的 LLM 调用也需要继承,否则在并行 DAG 子节点里 hint 看不到
+        if (snapshot.lastMileHint() == null) {
+            clearLastMileHint();
+        } else {
+            setLastMileHint(snapshot.lastMileHint());
+        }
+        if (snapshot.debugObservabilitySessionId() == null) {
+            clearDebugObservabilitySessionId();
+        } else {
+            setDebugObservabilitySessionId(snapshot.debugObservabilitySessionId());
+        }
+        if (snapshot.toolJobResumeToken() == null || snapshot.toolJobResumeLeaseVersion() == null) {
+            clearToolJobResumeHandoff();
+        } else {
+            setToolJobResumeHandoff(
+                    snapshot.toolJobResumeToken(), snapshot.toolJobResumeLeaseVersion());
         }
     }
 
@@ -649,7 +849,9 @@ public class AgentContext {
         clearWorkflow();
         clearSubAgentStepIndex();
         clearPythonRefineAttempt();
+        clearPythonRepairContext();
         clearToolCallId();
+        clearToolJobResumeHandoff();
         clearDecisionContext();
         PROVIDER_LLM_TRACE_ID_HOLDER.remove();
         LLM_CALL_REQUEST_META_HOLDER.remove();
@@ -661,8 +863,12 @@ public class AgentContext {
         clearExtractedEntities();
         clearReasoningEffort();
         clearStageConfig();
+        clearEffectiveExecutionStageConfig();
+        clearDataFreshness();
         clearThinkingContent();
         clearStreamingProgress();
+        clearLastMileHint();
+        clearDebugObservabilitySessionId();
     }
 
     /**
@@ -701,7 +907,10 @@ public class AgentContext {
      * @param extractedEntities   Planner 提取的实体列表
      * @param reasoningEffort     OpenRouter reasoning 强度
      * @param stageConfig         阶段级 LLM 配置
+     * @param effectiveExecutionStageConfig execution 阶段生效配置
      * @param workflow            工作流形态（linear / dag）
+     * @param toolJobResumeToken  恢复 worker 当前持有的旧 handoff token
+     * @param toolJobResumeLeaseVersion 恢复 worker 当前持有的旧 handoff lease version
      */
     public record ContextSnapshot(
             String runId,
@@ -712,7 +921,13 @@ public class AgentContext {
             List<String> extractedEntities,
             String reasoningEffort,
             RunStageConfig stageConfig,
-            String workflow
+            StageLlmConfig effectiveExecutionStageConfig,
+            String workflow,
+            AgentLlmProperties.DataFreshness dataFreshness,
+            String lastMileHint,
+            String debugObservabilitySessionId,
+            String toolJobResumeToken,
+            Long toolJobResumeLeaseVersion
     ) {
     }
 

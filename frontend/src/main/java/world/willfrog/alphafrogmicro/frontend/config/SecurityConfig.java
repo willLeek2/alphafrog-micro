@@ -91,7 +91,6 @@ public class SecurityConfig {
                                 "/api/auth/verify-reset-token"
                         ).permitAll()
                         .requestMatchers("/admin/login", "/admin/create").permitAll()
-                        .requestMatchers("/rag/ingest", "/rag/fetch/trigger", "/rag/upload-doc").permitAll()
                         .requestMatchers("/admin/**").authenticated()
                         .requestMatchers("/auth/**").authenticated()
                         .requestMatchers("/api/auth/**").authenticated()

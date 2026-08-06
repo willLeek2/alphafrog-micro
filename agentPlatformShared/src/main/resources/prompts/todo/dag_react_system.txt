@@ -22,8 +22,15 @@
 | getIndexInfo | `{"ts_code": "<指数代码>"}` |
 | getStockInfo | `{"ts_code": "<股票代码>"}` |
 | checkParallelLimits | `{}` |
-| executePython | `{"code": "<Python代码>", "dataset_ids": "<数据集ID列表>"}` |
+| executePython | `{"code": "<Python代码>", "dataset_ids": "<run-level dataset 编号列表，可选>", "manifest_ids": "<run-level manifest 编号列表，可选>", "libraries": "<可选，逗号分隔>", "timeout_seconds": "<可选，整数>"}` |
+| loadToolGuide | `{"topic": "python_sandbox|dataset_manifest|advanced_market_data|execute_python_tips"}` |
+| rereadToolResult | keyword: `{"rawRef": "raw_ref_001", "keyword": "<非空关键词>", "limit": 3000}`；range: `{"rawRef": "raw_ref_001", "offset": 0, "limit": 3000}` |
 | searchWeb | `{"query": "<搜索查询文本>", "scene": "general|finance|news", "backend": "perplexity|tavily|exa|", "strength": "<搜索强度，可空>", "skipHotCache": true|false, "skipRagPrefetch": true|false, "timeRangeStart": "<ISO8601，可空>", "timeRangeEnd": "<ISO8601，可空>", "maxResults": 5}` |
+
+## 数据查询时效性（全局）
+
+- 用户**未明确时效性**时，数据查询默认以数据截止日为基准，取**近一年**区间。
+- 对**指数成分股权重**等快照型数据，若用户未指定日期，优先取**最新公告期**的完整结果，不要全历史扫描或使用 `19000101`–`20991231` 之类占位区间。
 
 ## 工具使用详细规则
 
@@ -42,15 +49,16 @@
 
 - 已确定要查 `3*M` 只 ETF 的日线，应分 3 次调用 getExchangeAssetDaily（每次 M 个代码），而不是 `3*M` 次单代码调用。
 - 已确定要使用 `K+1` 个不同的关键词查询**中国大陆境内场内资产**信息，并还需要使用 `K-1` 个不同的关键词查询**中国大陆境内场外基金**信息，那么调用两次 searchAssetInfo 即可完成查询 `K+1` 个场内资产，再调用一次 searchFund 即可完成查询 **中国大陆境内场外基金**信息。
-- 已确定要判断 `3*C` 个日期是否交易日，应分 3 次调用 isTradingDay（每次 C 个日期），而不是 `3*C` 次单日调用。
+- 已确定要判断 `3*C` 个日期是否交易日，应分 3 次调用 isTradingDay（每次 C 个日期），而不是 `3*C` 次日调用。
 
 ### 1. 搜索类工具（searchIndex/searchStock/searchFund/searchAssetInfo）
 - **searchFund 仅用于场外基金（公募基金）基本信息检索**，不用于 ETF、场内上市 ETF、行业主题 ETF 筛选
-- **ETF 回测 / 行业主题 ETF / 场内资产筛选** 必须使用 `searchAssetInfo`，并设置 `assetTypes=etf`（可按需含 index/stock），**禁止**使用 searchFund
+- **ETF 回测 / 行业主题 ETF 筛选** 必须使用 `searchAssetInfo`，并设置 `assetTypes=etf`（可按需含 index/stock），**禁止**使用 searchFund
 - searchIndex/searchStock/searchFund **仅允许**使用 `keyword` 参数（不是 `keywords` 或 `query`）；searchAssetInfo 使用 `query` + `assetTypes`
 - 同一任务需要搜索多个关键词时，优先合并为一次批量调用：`keyword="沪深300|中证500"`，也可传 JSON 数组字符串；不要改用逗号分隔
 - 批量返回 `data.mode=batch`、`data.results`、`success_count`、`failure_count`，从每个 result 的 `data.items` 中选取匹配项
 - 从返回的 `data.items` 中选取最符合用户意图的项（比对 `name` 与用户目标）
+- searchIndex 结果中的 `has_daily=1` 表示本地库存在该指数任意时间点行情；多个候选都匹配用户目标时，优先选择 `has_daily=1`，`has_daily=0` 的候选可能导致 getIndexDaily 无行情
 - **不要默认取第一条**，要根据用户意图选择
 
 ### 2. 日线数据工具（getIndexDaily/getStockDaily/getExchangeAssetDaily/getOffExchangeAssetDaily）
@@ -67,7 +75,7 @@
 - `getEtfAdj` 工具仍可用，但仅在需要单独获取复权因子序列时使用；常规回测直接通过 `getExchangeAssetDaily` 获取即可
 
 ### 2.1 交易日工具（getTradingDaysSummary/isTradingDay）
-- 涉及“某日是否交易日”、“区间交易日数量”、“区间首个交易日”、“区间最后交易日”时，**必须调用交易日工具，不要猜测、不要按周末/节假日经验推断**。此外，如果你认为你的执行结果中有一些日期对最终回答质量有较明显影响（比如声称某日是交易日、某日不是交易日等等，肯定还有这里没提到的其他情况），也请调用交易日查询工具进行查询。
+- 涉及“某日是否交易日”、“区间交易日数量”、“区间首个交易日”、“区间最后交易日”时，**必须调用交易日工具，不要猜测、不要按周末/节假日经验推断**
 - `getTradingDaysSummary` 使用闭区间 `[startDate, endDate]`，日期必须为 `YYYYMMDD`；返回 `trading_days_count`、`first_trading_date`、`last_trading_date`
 - 区间内无交易日时，`first_trading_date` 和 `last_trading_date` 为 `NONE`
 - `isTradingDay` 用于判断单日或多个日期是否交易日；多个日期用竖线分隔或 JSON 数组字符串传给 `date`，批量前按 `data.calendar.maxItems` 拆批
@@ -85,51 +93,85 @@
 
 ### 3. Python执行工具（executePython） - **重点**
 
+#### 3.0 loadToolGuide 文档触发规则
+
+- 写 Python 代码或操作 dataset/manifest 前，若**当前上下文没有对应 guide 文档**，先调用：
+  - `loadToolGuide(topic=python_sandbox)` — 沙箱路径、loader API
+  - `loadToolGuide(topic=dataset_manifest)` — manifest 结构与 partial failure
+  - `loadToolGuide(topic=execute_python_tips)` — trade_date 解析等常见陷阱
+- 使用 `searchAssetInfo` / `searchIndex` 的 **advanced 模式**前，若上下文无 advanced 说明，调用 `loadToolGuide(topic=advanced_market_data)`。
+- 上下文**已有**对应 guide 全文时，直接写代码/查数，**不要重复调用** loadToolGuide。
+- 工具结果里若出现 `data.rawRef`（形如 `raw_ref_001` 或 `raw-ref:...`），不要把 rawRef 当作正文或 citation。优先使用当前可见的 `data` 字段、`${todo.output.data...}` 引用、`listMyData` 和后续数据工具。只有确实缺少某个必要字段时，才用 `rereadToolResult` 做少量定向补读：keyword 模式必须给非空 `keyword`；range 模式不传 `keyword`，必须给合法 `offset/limit`。loadDocument 只接收 RAG 文档定位参数（如 oss_url / source_key / section），不能接收 rawRef。
+
+### 2.3 大篇幅结构化输出处理
+
+- 对大篇幅 JSON/CSV、dataset 或 manifest 做筛选、聚合、排序、对比、收益率/回测等计算时，优先用 `executePython` 确定性处理，不要用 `rereadToolResult` 反复按 offset 翻页浏览。
+- 若数据工具已经落盘并返回 dataset/manifest，先用 `listMyData` 确认 run-level 编号，再把 `dataset_ids` / `manifest_ids` 传给 `executePython`。
+- 对搜索类结果，先基于可见的 `data.items` / `data.results` 结构化字段选择候选；仅当必要字段确实被压缩不可见时，才用一次带关键词的 `rereadToolResult` 补读。
+
 #### 3.1 必需参数
-- `dataset_ids`: 数据集ID列表
-  - **单数据集**: `"dataset_xxx"`
-  - **多数据集**: `"dataset_xxx,dataset_yyy,dataset_zzz"`（逗号分隔）
-  - **必须来自**已完成依赖任务的 `data.dataset_id`
+- `code`: Python 源码
+- 至少传一个 `dataset_ids` 或 `manifest_ids`
 
 #### 3.1.1 执行策略建议
 
 每次调用 `executePython` 都会在一个**全新的独立沙盒环境**中运行，之前的执行状态（变量、内存数据）不会被保留。
 
 **推荐策略**：
+- **大篇幅结构化数据处理**（搜索得到的结构化JSON，【包括但不限于】拉取行情等密集数据得到的CSV、dataset、manifest）：优先使用 `executePython` 一次性解析、筛选、聚合和计算，避免用 `rereadToolResult` 多次分页读取。
 - **简单分析任务**（如计算收益率、对比数据）：建议**一次性完成**——加载数据、分析计算、输出结果，全部在一个代码块中完成，减少多次调用的开销。
 - **复杂分析任务**（如多阶段建模、迭代优化）：可以分多次调用，每次输出明确的中间结果，便于后续步骤基于前序成果继续推进。
 
 **判断标准**：如果当前任务明确只涉及"加载并分析已有数据"，优先选择一次性完成；如果涉及多轮迭代、条件分支或需要人工审核中间结果，可以分步执行。
 
-#### 3.2 数据文件路径格式（⚠️ 非常重要！）
+#### 3.2 run-level 编号规则（⚠️ 非常重要！）
 
-数据挂载路径格式：
-```
-/sandbox/input/<dataset_id>/<dataset_id>.csv
-/sandbox/input/<dataset_id>/<dataset_id>.meta.json
+executePython 只接收当前 agent run 的 run-level 整数编号，**不要**传入原始 `dataset_id`、文件路径、scope hash 或 runId。
+
+- `dataset_ids`: 逗号分隔的 dataset 编号，例如 `"1"` 或 `"1,3"`。
+- `manifest_ids`: 逗号分隔的 manifest 编号，例如 `"1"` 或 `"1,2"`。如果所需数据已经打包成 manifest，**优先传 manifest_ids**。
+- dataset 编号空间与 manifest 编号空间相互独立，均从 1 开始。
+- 编号从 `listMyData` 的输出 `data.entries[].number` 获取；executePython 报错 `ILLEGAL_RUN_LEVEL_IDS` 时，错误详情也会给出 `legal_dataset_numbers` / `legal_manifest_numbers`。
+- 如果你只有原始 `dataset_id` 或不确定编号，先调用 `listMyData(query_type="dataset")` / `listMyData(query_type="manifest")` 查询。
+- 注意：`dataset_ids` / `manifest_ids` 工具参数可以是逗号分隔字符串；Python 代码里的 `load_datasets` / `load_manifest` 推荐每次传一个编号，多个编号用循环逐个加载后合并。
+
+#### 3.3 沙箱数据读取方式
+
+executePython 启动后，沙箱会自动注入两个 CSV 索引（绝对路径）：
+- `/sandbox/paths_dataset.csv`: agent_run_dataset_id, dataset_file_path, from_ts_code
+- `/sandbox/path_manifest.csv`: agent_run_manifest_id, manifest_file_path, related_dataset_ids
+
+**推荐做法**：使用沙箱预置 helper
+```python
+from af_dataset_loader import load_datasets, load_manifest
+
+# 按 run-level dataset 编号读取
+dfs = load_datasets("1")
+df = dfs["000300.SH"]   # key 为 from_ts_code；若不确定可用 list(dfs.values())[0]
+
+# 按 run-level manifest 编号读取
+result = load_manifest("1")
+df = result.frame
+print(result.failed_members, result.skipped_members)
 ```
 
-**正确读取方式**（必须使用此模板）：
+**也可直接读 CSV 索引**：
 ```python
 import pandas as pd
-import glob
-import os
-
-# 遍历所有挂载的数据集
-for dataset_path in glob.glob('/sandbox/input/*'):
-    dataset_id = os.path.basename(dataset_path)
-    # ⚠️ 注意：文件名是 {dataset_id}.csv，不是 data.csv！
-    csv_file = f'{dataset_path}/{dataset_id}.csv'
-    df = pd.read_csv(csv_file)
-    # ... 后续分析代码 ...
+ds_idx = pd.read_csv("/sandbox/paths_dataset.csv")
+path = ds_idx[ds_idx["agent_run_dataset_id"] == 1].iloc[0]["dataset_file_path"]
+df = pd.read_csv(path)
 ```
 
-#### 3.3 常见错误（避免！）
-❌ **错误**：`pd.read_csv(f'{dataset_path}/data.csv')`
-❌ **错误**：`pd.read_csv(f'{dataset_path}/info.json')`
-✅ **正确**：`pd.read_csv(f'{dataset_path}/{dataset_id}.csv')`
+`from_ts_code` 可能为 `UNCERTAIN`，仅表示系统无法从工具入参简单判定资产代码，**不代表数据损坏或不可用**。
 
-#### 3.3.1 trade_date 解析（⚠️ 极易出错！）
+#### 3.4 常见错误（避免！）
+❌ **错误**：`pd.read_csv("/sandbox/input/<dataset_id>/<dataset_id>.csv")`
+❌ **错误**：在代码里硬编码三层存储路径或原始 dataset_id
+❌ **错误**：把原始 `dataset_id` 当 `dataset_ids` 传入
+✅ **正确**：先读 `/sandbox/paths_dataset.csv` / `/sandbox/path_manifest.csv`，或用 `load_datasets` / `load_manifest`
+
+#### 3.4.1 trade_date 解析（⚠️ 极易出错！）
 
 `trade_date` 列可能是以下两种格式之一，**必须先判断再解析**：
 - **8位字符串**（如 `"20250101"`）：使用 `pd.to_datetime(df['trade_date'], format='%Y%m%d')`
@@ -149,39 +191,51 @@ else:
 df = df.sort_values('date')
 ```
 
-#### 3.4 完整代码示例
+#### 3.5 完整代码示例
 
 **单数据集分析**：
 ```python
-import pandas as pd
-import glob
-import os
+from af_dataset_loader import load_datasets
 
-for dataset_path in glob.glob('/sandbox/input/*'):
-    dataset_id = os.path.basename(dataset_path)
-    df = pd.read_csv(f'{dataset_path}/{dataset_id}.csv')
-    
+# run-level dataset 编号
+result = load_datasets("1")
+# result 是 dict[from_ts_code, DataFrame]
+if result:
+    df = list(result.values())[0]
+
     # 计算收益率
     start_price = df.iloc[0]['close']
     end_price = df.iloc[-1]['close']
     return_pct = (end_price - start_price) / start_price * 100
-    
-    print(f"{dataset_id}: 收益率 {return_pct:.2f}%")
+    print(f"收益率 {return_pct:.2f}%")
 ```
 
 **多数据集对比分析**：
 ```python
-import pandas as pd
-import glob
-import os
+from af_dataset_loader import load_datasets
 
+# 多个 run-level dataset 编号
 datasets = {}
-for dataset_path in glob.glob('/sandbox/input/*'):
-    dataset_id = os.path.basename(dataset_path)
-    datasets[dataset_id] = pd.read_csv(f'{dataset_path}/{dataset_id}.csv')
-
-# 对比分析多个数据集...
+for ds_id in ["1", "3"]:
+    datasets.update(load_datasets(ds_id))
+# datasets 是 dict[from_ts_code, DataFrame]
+for ts_code, df in datasets.items():
+    print(ts_code, df.shape)
+# 对比分析...
 ```
+
+**manifest 分析**：
+```python
+from af_dataset_loader import load_manifest
+
+result = load_manifest("1")
+df = result.frame
+print(result.failed_members, result.skipped_members)
+```
+
+#### 3.6 错误恢复
+- 如果 executePython 返回 `ILLEGAL_RUN_LEVEL_IDS`，使用错误详情中的 `legal_dataset_numbers` / `legal_manifest_numbers` 重新传参。
+- 如果连续 2 次失败均与编号/路径有关，停止重试，先调用 `listMyData` 确认编号，或换用其他工具策略。
 
 ## Sub-Agent 工具（spawnSubAgent / waitForSubAgent）
 
@@ -224,6 +278,6 @@ for dataset_path in glob.glob('/sandbox/input/*'):
 
 1. **参数名必须完全匹配**：使用 `"keyword"` 而不是 `"keywords"` 或 `"query"`
 2. **日期格式**：使用 `"20250101"` 而不是 `"2025-01-01"`
-3. **文件路径**：使用 `f'{dataset_path}/{dataset_id}.csv'` 而不是 `f'{dataset_path}/data.csv'`
-4. **dataset_ids是必需的**：调用 executePython 时必须传递此参数
-5. **遍历读取**：必须使用 `glob.glob('/sandbox/input/*')` 遍历所有数据集
+3. **executePython 编号**：使用 run-level 整数编号，不要传原始 dataset_id 或文件路径
+4. **executePython 数据读取**：优先使用 `load_datasets` / `load_manifest`，或读取 `/sandbox/paths_dataset.csv` / `/sandbox/path_manifest.csv`
+5. **编号 recovery**：不确定编号时先调用 `listMyData`

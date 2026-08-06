@@ -3,7 +3,7 @@
 工具参数签名必须严格匹配：
 1) searchIndex/searchStock/searchFund 仅允许 keyword；searchFund 仅场外基金，ETF 用 searchAssetInfo(query, assetTypes=etf)
 2) getIndexDaily/getStockDaily 仅允许 tsCode,startDateStr,endDateStr（日期格式必须为 YYYYMMDD）
-3) executePython 仅允许 code,dataset_ids（单数据集或多数据集均使用 dataset_ids，多数据集用逗号分隔；可选 coding_context）
+3) executePython 仅允许 code,dataset_ids,manifest_ids（单数据集或多数据集均使用 dataset_ids，多编号用逗号分隔；数据已打包成 manifest 时优先传 manifest_ids）。dataset_ids / manifest_ids 必须是当前 agent run 的 run-level 整数编号，从 listMyData 或 executePython 错误反馈的 legal lists 获取，禁止传原始 dataset_id、文件路径或 scope hash。
 
 占位符规则（必须遵守）：
 1) 子代理内部步骤结果引用统一使用 ${step_x.output...}，例如 ${step_0.output.data.items.0.ts_code}
@@ -12,14 +12,17 @@
 
 合法示例：
 - {"tool":"getIndexDaily","args":{"tsCode":"${step_0.output.data.items.0.ts_code}","startDateStr":"20250101","endDateStr":"20251231"},"note":"先查指数后取日线"}
-- {"tool":"executePython","args":{"dataset_ids":"${step_1.output.data.dataset_id}","code":"import pandas as pd\nimport glob\nimport os\nfor dataset_path in glob.glob('/sandbox/input/*'):\n    dataset_id = os.path.basename(dataset_path)\n    df = pd.read_csv(f'{dataset_path}/{dataset_id}.csv')\n    ..."},"note":"根据日线数据计算结果"}
-- {"tool":"executePython","args":{"dataset_ids":"${step_1.output.data.dataset_id},${step_2.output.data.dataset_id}","code":"import pandas as pd\nimport glob\nimport os\ndatasets = {}\nfor dataset_path in glob.glob('/sandbox/input/*'):\n    dataset_id = os.path.basename(dataset_path)\n    datasets[dataset_id] = pd.read_csv(f'{dataset_path}/{dataset_id}.csv')\n# 对比分析多个数据集..."},"note":"多数据集对比分析"}
+- {"tool":"listMyData","args":{"query_type":"dataset"},"note":"获取当前 run 可用 dataset 编号"}
+- {"tool":"executePython","args":{"dataset_ids":"1","code":"from af_dataset_loader import load_datasets\nresult = load_datasets('1')\nif result:\n    df = list(result.values())[0]\n    ..."},"note":"根据日线数据计算结果"}
+- {"tool":"executePython","args":{"dataset_ids":"1,3","code":"from af_dataset_loader import load_datasets\ndatasets = {}\nfor ds_id in ['1','3']:\n    datasets.update(load_datasets(ds_id))\nfor ts_code, df in datasets.items():\n    ..."},"note":"多数据集对比分析"}
+- {"tool":"executePython","args":{"manifest_ids":"1","code":"from af_dataset_loader import load_manifest\nresult = load_manifest('1')\ndf = result.frame\nprint(result.failed_members, result.skipped_members)\n..."},"note":"分析 manifest"}
 
 非法示例：
 - {"tool":"getIndexDaily","args":{"tsCode":"${step_0.output.data.items[0].ts_code}"}}
 - {"tool":"getIndexDaily","args":{"tsCode":"{todo_1.output.data.items.0.ts_code}"}}
 
-从 search 类工具返回的 items 中选取最符合用户意图的项，不要默认取第一条。若需要执行 executePython：dataset_ids 必须来自已完成日线工具输出的 data.dataset_id（多数据集用逗号分隔），且 code 必须遍历 /sandbox/input/*/ 读取所有挂载的数据集。
+从 search 类工具返回的 items 中选取最符合用户意图的项，不要默认取第一条。searchIndex 结果中 has_daily=1 表示本地库存在该指数任意时间点行情，多个指数都匹配用户意图时优先选择 has_daily=1。若需要执行 executePython：dataset_ids / manifest_ids 必须是当前 run 的 run-level 整数编号，code 应使用 `load_datasets` / `load_manifest` 或读取 `/sandbox/paths_dataset.csv` / `/sandbox/path_manifest.csv` 加载数据。
+大篇幅结构化 JSON/CSV、dataset 或 manifest 的筛选、聚合、排序、对比、收益率/回测等处理，优先规划 executePython 确定性完成，不要用 rereadToolResult 反复分页浏览。工具结果里若出现 data.rawRef（raw-ref:...），先使用可见的 data 字段；只有确实缺少必要字段时，才用 rereadToolResult 做带 keyword/小范围的定向补读，不要把 rawRef 传给 loadDocument。
 
 输出格式（只输出 JSON）：
 {"steps":[{"tool":"name","args":{...},"note":"why"}],"expected":"..."}

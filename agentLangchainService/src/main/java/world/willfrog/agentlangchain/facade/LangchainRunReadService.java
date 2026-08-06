@@ -2,6 +2,8 @@ package world.willfrog.agentlangchain.facade;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.entity.AgentRun;
@@ -10,12 +12,16 @@ import world.willfrog.agent.platform.entity.AgentRunMessage;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentArtifactService;
+import world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilityQuery;
+import world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilityReadMode;
 import world.willfrog.agent.platform.service.AgentCreditService;
 import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agent.platform.service.AgentMessageService;
 import world.willfrog.agent.platform.service.AgentModelCatalogService;
 import world.willfrog.agent.platform.service.AgentObservabilityService;
 import world.willfrog.agent.platform.service.AgentRunCostService;
+import world.willfrog.agent.platform.service.AgentRunCreditQueryService;
+import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agent.platform.service.SnapshotPartService;
 import world.willfrog.agent.platform.service.SnapshotPartsMeta;
@@ -42,6 +48,9 @@ import world.willfrog.alphafrogmicro.agent.idl.GetAgentCreditsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentCreditsResponse;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCostRequest;
+import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCreditsRequest;
+import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCreditsResponse;
+import world.willfrog.alphafrogmicro.agent.idl.RefreshAgentRunCreditsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunResultRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunStatusRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentSnapshotPartRequest;
@@ -86,7 +95,7 @@ import java.util.Map;
  * </ul>
  *
  * <h2>读写一致性</h2>
- * langchain 服务和 legacy agentService 共享同一套 PG/Redis 存储。事件流目前由
+ * langchain 服务和 agent runtime 共享同一套 PG/Redis 存储。事件流目前由
  * {@link AgentEventService} 优先从 Redis ZSET 读取，只有 Redis 没有该 run 的事件时才回退 DB；
  * 这是压测后为了避免大量 event 长期堆在数据库中的过渡设计。
  * 本类的读操作依赖 {@link LangchainSingleWriterGuard} 保证：
@@ -111,12 +120,16 @@ import java.util.Map;
 @RequiredArgsConstructor
 public class LangchainRunReadService {
 
+    private static final Logger log = LoggerFactory.getLogger(LangchainRunReadService.class);
+
     private final AgentRunMapper runMapper;
     private final AgentEventService eventService;
     private final AgentRunStateStore stateStore;
     private final AgentObservabilityService observabilityService;
     private final AgentCreditService creditService;
     private final AgentRunCostService runCostService;
+    private final AgentRunCreditQueryService runCreditQueryService;
+    private final AgentRunCreditSettlementService creditSettlementService;
     private final AgentModelCatalogService modelCatalogService;
     private final AgentMessageService messageService;
     private final SnapshotPartService snapshotPartService;
@@ -124,6 +137,8 @@ public class LangchainRunReadService {
     private final LangchainSingleWriterGuard singleWriterGuard;
     private final AgentArtifactService artifactService;
     private final ObjectMapper objectMapper;
+    private final DataAnalysisObservabilityQuery dataAnalysisObservabilityQuery;
+    private final DataAnalysisReadResponseSerializer dataAnalysisSerializer;
 
     @Value("${agent.run.list.default-days:30}")
     private int listDefaultDays;
@@ -216,9 +231,12 @@ public class LangchainRunReadService {
     }
 
     public AgentRunResultMessage getResult(GetAgentRunResultRequest request) {
-        AgentRun run = requireReadableRun(request.getId(), request.getUserId());
+        AgentRun run = request.getIsAdmin()
+                ? requireReadableRunForAdmin(request.getId())
+                : requireReadableRun(request.getId(), request.getUserId());
         String snapshotJson = nvl(run.getSnapshotJson());
         String observabilityJson = nvl(observabilityService.loadObservabilityJson(run.getId(), snapshotJson));
+        observabilityJson = mergeDataAnalysisResultView(run, observabilityJson);
         Map<String, Object> snapshot = readExtMap(snapshotJson);
         String answerMarkdown = firstNonBlank(stringValue(snapshot.get("answer_markdown")), stringValue(snapshot.get("answer")));
         String structuredAnswerJson = "";
@@ -242,6 +260,21 @@ public class LangchainRunReadService {
         AgentRun run = requireReadableRun(request.getId(), request.getUserId());
         String observabilityJson = nvl(observabilityService.loadObservabilityJson(run.getId(), run.getSnapshotJson()));
         return runCostService.buildAndPersist(run, observabilityJson);
+    }
+
+    public GetAgentRunCreditsResponse getRunCredits(GetAgentRunCreditsRequest request) {
+        AgentRun run = request.getIsAdmin()
+                ? requireReadableRunForAdmin(request.getId())
+                : requireReadableRun(request.getId(), request.getUserId());
+        return runCreditQueryService.build(run);
+    }
+
+    public GetAgentRunCreditsResponse refreshRunCredits(RefreshAgentRunCreditsRequest request) {
+        AgentRun run = request.getIsAdmin()
+                ? requireReadableRunForAdmin(request.getId())
+                : requireReadableRun(request.getId(), request.getUserId());
+        creditSettlementService.refreshCosts(run.getId(), run.getUserId());
+        return runCreditQueryService.build(run);
     }
 
     /**
@@ -268,10 +301,15 @@ public class LangchainRunReadService {
         String planJson = nvl(run.getPlanJson());
         var cachedPlan = stateStore.loadPlan(run.getId());
         if (cachedPlan.isPresent()) {
+            // 执行中 run 的 Redis plan 更新更及时；DB plan 用于历史和 Redis 过期后的读取。
+            // status 接口优先 Redis，是为了前端轮询时看到最新 HITL/plan override 状态。
             planJson = cachedPlan.get();
         }
         String progressJson = planJson.isBlank() ? "" : stateStore.buildProgressJson(run.getId(), planJson);
+        // status 是高频轮询接口，只返回 summary，不拉完整 observability。
+        // 完整 trace 可能很大，应该由详情页或 matrix 按需读取。
         String observabilitySummaryJson = observabilityService.loadObservabilitySummaryJson(run.getId(), run.getSnapshotJson());
+        observabilitySummaryJson = mergeDataAnalysisStatusView(run, observabilitySummaryJson);
         boolean observabilityFullAvailable = observabilityService.isFullObservabilityAvailable(run.getId(), run.getSnapshotJson());
         int totalCredits = creditService.calculateRunTotalCredits(run, eventService.listByRunId(run.getId()), observabilitySummaryJson);
         Integer maxSeq = eventService.findMaxSeq(run.getId());
@@ -411,6 +449,7 @@ public class LangchainRunReadService {
 
     public AgentSnapshotPartsMetaMessage getSnapshotPartsMeta(GetAgentSnapshotPartsRequest request) {
         AgentRun run = requireReadableRun(request.getId(), request.getUserId());
+        // 大 snapshot 不直接塞进单个响应。先生成 meta，让前端知道分片数量、压缩方式和校验信息。
         SnapshotPartsMeta meta = snapshotPartService.getOrBuildMeta(
                 run.getId(),
                 run.getSnapshotJson(),
@@ -428,6 +467,8 @@ public class LangchainRunReadService {
 
     public AgentSnapshotPartMessage getSnapshotPart(GetAgentSnapshotPartRequest request) {
         AgentRun run = requireReadableRun(request.getId(), request.getUserId());
+        // part 内容按 index 拉取，避免超大 run 详情超过网关/浏览器单次响应上限。
+        // meta 和 part 都通过同一个 SnapshotPartService 生成，保证分片参数一致。
         SnapshotPartsMeta meta = snapshotPartService.getOrBuildMeta(
                 run.getId(),
                 run.getSnapshotJson(),
@@ -451,6 +492,10 @@ public class LangchainRunReadService {
         return singleWriterGuard.requireReadable(requireRun(id, userId));
     }
 
+    AgentRun requireReadableRunForAdmin(String id) {
+        return singleWriterGuard.requireReadable(requireRunForAdmin(id));
+    }
+
     AgentRun requireWritableRun(String id, String userId) {
         return singleWriterGuard.requireWritable(requireRun(id, userId));
     }
@@ -465,10 +510,21 @@ public class LangchainRunReadService {
         return markExpiredIfNeeded(run);
     }
 
+    private AgentRun requireRunForAdmin(String id) {
+        String safeId = requireId(id, "id");
+        AgentRun run = runMapper.findById(safeId);
+        if (run == null) {
+            throw new IllegalArgumentException("run not found");
+        }
+        return markExpiredIfNeeded(run);
+    }
+
     private AgentRun markExpiredIfNeeded(AgentRun run) {
         if (run == null || !eventService.shouldMarkExpired(run)) {
             return run;
         }
+        // 过期是读时发现并补写的状态：旧 run 没有后台定时器一直扫描。
+        // 一旦某次读取发现超出保留窗口，就补 RUN_EXPIRED 事件并刷新 Redis 状态。
         runMapper.updateStatus(run.getId(), run.getUserId(), AgentRunStatus.EXPIRED);
         eventService.append(run.getId(), run.getUserId(), "RUN_EXPIRED", Map.of(
                 "run_id", run.getId(),
@@ -566,15 +622,24 @@ public class LangchainRunReadService {
         if (status == AgentRunStatus.WAITING) {
             return "PAUSED";
         }
+        if (status == AgentRunStatus.WAITING_TOOL_JOB) {
+            // 直接暴露持久阶段，避免把“已释放 worker、等待外部结果”误显示成普通 PAUSED 或 EXECUTING。
+            // 这里的 phase 只用于读取/UI，不参与 resume 决策；真正的重入资格仍来自 anchor 的
+            // READY/LAUNCHING、resumeToken 与 leaseVersion，客户端刷新不会触发任何执行副作用。
+            return "WAITING_TOOL_JOB";
+        }
         if ("PLAN_READY".equals(lastEventType)
                 || "PLANNING_STARTED".equals(lastEventType)
                 || "TODO_LIST_CREATED".equals(lastEventType)) {
+            // PLAN_READY 已经有计划，但还没有 TODO_NODE_STARTED/TOOL_CALL_STARTED，
+            // 对前端来说仍应展示为规划阶段结束、执行尚未正式展开。
             return "PLANNING";
         }
         if ("FINAL_ANSWER_GENERATING".equals(lastEventType) || "SUMMARIZING_STARTED".equals(lastEventType)) {
             return "SUMMARIZING";
         }
         if ("TOOL_CALL_STARTED".equals(lastEventType)) {
+            // 当前工具名从 payload 中解析，phase 只负责告诉前端这是工具执行中。
             return "EXECUTING_TOOL";
         }
         if ("EXECUTION_STARTED".equals(lastEventType) || "TODO_STARTED".equals(lastEventType)
@@ -666,5 +731,75 @@ public class LangchainRunReadService {
 
     private String nvl(String value) {
         return value == null ? "" : value;
+    }
+
+    private String mergeDataAnalysisStatusView(AgentRun run, String existingJson) {
+        String runId = run.getId();
+        try {
+            String dataAnalysisJson = dataAnalysisSerializer.serializeStatusFromSummary(
+                    runId,
+                    dataAnalysisObservabilityQuery.findSummaryByRunId(
+                            runId, dataAnalysisReadMode(run.getStatus())));
+            if (dataAnalysisJson.equals("{}")) {
+                return existingJson;
+            }
+            return mergeJsonObjects(runId, "status", existingJson, dataAnalysisJson);
+        } catch (Exception e) {
+            log.warn("合并 data-analysis status 视图失败 runId={} 异常={}/{}",
+                    runId, e.getClass().getSimpleName(), e.getMessage());
+            return existingJson;
+        }
+    }
+
+    private String mergeDataAnalysisResultView(AgentRun run, String existingJson) {
+        String runId = run.getId();
+        try {
+            String dataAnalysisJson = dataAnalysisSerializer.serializeResultView(
+                    dataAnalysisObservabilityQuery.findByRunId(
+                            runId, dataAnalysisReadMode(run.getStatus())));
+            if (dataAnalysisJson.equals("{}")) {
+                return existingJson;
+            }
+            return mergeJsonObjects(runId, "result", existingJson, dataAnalysisJson);
+        } catch (Exception e) {
+            log.warn("合并 data-analysis result 视图失败 runId={} 异常={}/{}",
+                    runId, e.getClass().getSimpleName(), e.getMessage());
+            return existingJson;
+        }
+    }
+
+    private DataAnalysisObservabilityReadMode dataAnalysisReadMode(AgentRunStatus status) {
+        if (status == AgentRunStatus.COMPLETED || status == AgentRunStatus.PARTIAL
+                || status == AgentRunStatus.FAILED || status == AgentRunStatus.CANCELED
+                || status == AgentRunStatus.EXPIRED) {
+            return DataAnalysisObservabilityReadMode.TERMINAL_DB_ONLY;
+        }
+        return DataAnalysisObservabilityReadMode.RUNNING_CACHE_FIRST;
+    }
+
+    private String mergeJsonObjects(String runId, String view, String baseJson, String overlayJson) {
+        if (baseJson == null || baseJson.isBlank()) {
+            return overlayJson;
+        }
+        try {
+            com.fasterxml.jackson.databind.JsonNode baseNode = objectMapper.readTree(baseJson);
+            if (!baseNode.isObject()) {
+                log.warn("base JSON 非对象 runId={} view={}，保留原始响应", runId, view);
+                return baseJson;
+            }
+            com.fasterxml.jackson.databind.JsonNode overlayNode = objectMapper.readTree(overlayJson);
+            if (!overlayNode.isObject()) {
+                log.warn("overlay JSON 非对象 runId={} view={}，保留原始响应", runId, view);
+                return baseJson;
+            }
+            Map<String, Object> base = objectMapper.convertValue(baseNode, Map.class);
+            Map<String, Object> overlay = objectMapper.convertValue(overlayNode, Map.class);
+            base.putAll(overlay);
+            return objectMapper.writeValueAsString(base);
+        } catch (Exception e) {
+            log.warn("JSON merge 失败 runId={} view={} 异常={}/{}，保留原始响应",
+                    runId, view, e.getClass().getSimpleName(), e.getMessage());
+            return baseJson;
+        }
     }
 }

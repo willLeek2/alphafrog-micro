@@ -4,6 +4,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
+import world.willfrog.agent.platform.context.AgentContext;
 
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
@@ -99,8 +100,8 @@ public class AgentPromptService {
 
     /**
      * 返回 Agent Run 入口的完整 System Prompt（含时间基准 + 全局指令）。
-     * 主要供旧版调用方（如 legacy agentService）使用；新代码（agentLangchainService）
-     * 倾向使用 {@link #reactSystemPrompt()} 配合 stage instruction 注入到 User Message。
+     * 主要供完整 Agent Run 入口使用；DAG 节点执行倾向使用 {@link #reactSystemPrompt()}
+     * 配合 stage instruction 注入到 User Message。
      *
      * @return 时间基准 + agent_run_system.txt 全局指令的拼接结果
      */
@@ -244,7 +245,12 @@ public class AgentPromptService {
         return composeSystemPrompt(specific);
     }
 
-    /** 并行执行结束后的最终汇总（final answer）System Prompt。 */
+    /**
+     * 并行执行结束后的最终汇总（final answer）System Prompt。
+     *
+     * <p>当一次 run 同时生成多个候选方案并执行完毕后，用此 prompt 引导 LLM
+     * 比较各方案结果并输出最终答案。</p>
+     */
     public String parallelFinalSystemPrompt() {
         return composeSystemPrompt(firstNonBlank(currentPrompts().getParallelFinalSystemPrompt(), ""));
     }
@@ -305,8 +311,12 @@ public class AgentPromptService {
         return composeSystemPrompt(firstNonBlank(currentPrompts().getSubAgentSummarySystemPrompt(), ""));
     }
 
-    /** Python 代码自动修正（refine）阶段的 System Prompt。
-     *  当 LLM 生成的 Python 代码执行出错时，用此 prompt 引导 LLM 修复代码。 */
+    /**
+     * Python 代码自动修正（refine）阶段的 System Prompt。
+     *
+     * <p>当 executePython 返回错误（如语法错误、依赖缺失、数据字段不对）时，
+     * 用此 prompt 引导 LLM 基于错误信息和原始代码生成修正版本。</p>
+     */
     public String pythonRefineSystemPrompt() {
         return composeSystemPrompt(firstNonBlank(currentPrompts().getPythonRefineSystemPrompt(), ""));
     }
@@ -915,6 +925,10 @@ public class AgentPromptService {
                 thisYear, thisYear,
                 lastYear, thisYear,
                 lastYear, yearBeforeLast));
+        String dataFreshnessPrompt = dataFreshnessPrompt();
+        if (!dataFreshnessPrompt.isBlank()) {
+            parts.add(dataFreshnessPrompt);
+        }
         // 第二段：全局 agent 角色定义（跨阶段共享，利于 KV 缓存）
         if (!global.isBlank()) {
             parts.add(global);
@@ -924,6 +938,45 @@ public class AgentPromptService {
             parts.add(specific);
         }
         return String.join("\n", parts).trim();
+    }
+
+    /**
+     * 数据时效 Prompt 注入。
+     *
+     * <p>优先级：AgentContext 快照（run 启动时从 ext.data_freshness 反序列化）> Nacos 热加载 > 静态配置。
+     * ext 快照由 {@code AgentEventService.createRun()} 写入、{@code LangchainLinearRunPipelineImpl.executeRun()}
+     * 入口从 ext 解析回 ThreadLocal。快照为 null 时 fallback 到 {@link #currentDataFreshness()}。</p>
+     */
+    private String dataFreshnessPrompt() {
+        // 优先使用 run 启动时冻结的快照（AgentContext），保证同一 run 内 dataFreshness 语义一致
+        AgentLlmProperties.DataFreshness freshness = AgentContext.getDataFreshness();
+        if (freshness == null) {
+            freshness = currentDataFreshness();
+        }
+        if (freshness == null) {
+            return "";
+        }
+        String startDate = firstNonBlank(freshness.getStartDate());
+        String endDate = firstNonBlank(freshness.getEndDate());
+        String asOfDate = firstNonBlank(freshness.getAsOfDate());
+        String description = firstNonBlank(freshness.getDescription());
+        if (startDate.isEmpty() && endDate.isEmpty() && asOfDate.isEmpty() && description.isEmpty()) {
+            return "";
+        }
+
+        List<String> clauses = new ArrayList<>();
+        if (!startDate.isEmpty() || !endDate.isEmpty()) {
+            clauses.add("范围：" + firstNonBlank(startDate, "未指定") + " 至 " + firstNonBlank(endDate, "未指定"));
+        }
+        if (!asOfDate.isEmpty()) {
+            clauses.add("as-of 日期：" + asOfDate);
+        }
+        if (!description.isEmpty()) {
+            clauses.add("说明：" + description);
+        }
+        return "当前已爬取/可用市场数据时效范围（部署者在 agent-llm 配置中指定，业务逻辑默认该日期正确）："
+                + String.join("；", clauses)
+                + "。涉及行情、基金、指数、ETF 等本地数据查询时，应将该范围视为当前数据覆盖边界，不要自行推断或改写该范围。";
     }
 
     /**
@@ -980,6 +1033,33 @@ public class AgentPromptService {
         merged.setDagRecoveryJudgeSystemPromptTemplate(firstNonBlank(local.getDagRecoveryJudgeSystemPromptTemplate(), base.getDagRecoveryJudgeSystemPromptTemplate()));
         merged.setDagRecoveryJudgeSystemPromptFile(firstNonBlank(local.getDagRecoveryJudgeSystemPromptFile(), base.getDagRecoveryJudgeSystemPromptFile()));
         return merged;
+    }
+
+    private AgentLlmProperties.DataFreshness currentDataFreshness() {
+        AgentLlmProperties.DataFreshness base = properties.getDataFreshness();
+        AgentLlmProperties.DataFreshness local = localConfigLoader.current()
+                .map(AgentLlmProperties::getDataFreshness)
+                .orElse(null);
+        if (local == null) {
+            return base;
+        }
+        AgentLlmProperties.DataFreshness merged = new AgentLlmProperties.DataFreshness();
+        merged.setStartDate(firstNonBlank(local.getStartDate(), base == null ? null : base.getStartDate()));
+        merged.setEndDate(firstNonBlank(local.getEndDate(), base == null ? null : base.getEndDate()));
+        merged.setAsOfDate(firstNonBlank(local.getAsOfDate(), base == null ? null : base.getAsOfDate()));
+        merged.setDescription(firstNonBlank(local.getDescription(), base == null ? null : base.getDescription()));
+        return merged;
+    }
+
+    /**
+     * 公开的快照方法：返回当前生效的合并后 DataFreshness 的防御性副本。
+     * 调用方（如 {@code AgentEventService.createRun()}）在 run 创建时调用一次，
+     * 写入 ext JSON 作为该 run 的不可变快照，保证 run 生命周期内数据时效语义稳定。
+     *
+     * @return 合并后的 DataFreshness 副本，不会随后续 Nacos 热加载变化
+     */
+    public AgentLlmProperties.DataFreshness snapshotDataFreshness() {
+        return currentDataFreshness();
     }
 
     /**

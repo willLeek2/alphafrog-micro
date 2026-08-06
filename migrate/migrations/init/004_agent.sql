@@ -47,15 +47,70 @@ CREATE TABLE IF NOT EXISTS alphafrog_agent_credit_ledger (
     ledger_id VARCHAR(64) NOT NULL UNIQUE,
     user_id VARCHAR(64) NOT NULL,
     biz_type VARCHAR(32) NOT NULL,
-    delta INTEGER NOT NULL,
-    balance_before INTEGER NOT NULL,
-    balance_after INTEGER NOT NULL,
+    delta NUMERIC(20, 6) NOT NULL,
+    balance_before NUMERIC(20, 6) NOT NULL,
+    balance_after NUMERIC(20, 6) NOT NULL,
     source_type VARCHAR(32) NOT NULL,
     source_id VARCHAR(64) NOT NULL,
     operator_id VARCHAR(64),
     idempotency_key VARCHAR(128),
+    reason TEXT NOT NULL DEFAULT '',
     ext JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS alphafrog_agent_credit_recharge (
+    id BIGSERIAL PRIMARY KEY,
+    recharge_id VARCHAR(64) NOT NULL UNIQUE,
+    ledger_id VARCHAR(64) NOT NULL,
+    user_id VARCHAR(64) NOT NULL,
+    username VARCHAR(128),
+    operator_id VARCHAR(64) NOT NULL,
+    currency VARCHAR(8) NOT NULL,
+    original_amount NUMERIC(20, 6) NOT NULL,
+    exchange_rate_to_usd NUMERIC(20, 8) NOT NULL,
+    credit_amount NUMERIC(20, 6) NOT NULL,
+    reason TEXT NOT NULL,
+    idempotency_key VARCHAR(128) NOT NULL,
+    ext JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS alphafrog_agent_run_credit_summary (
+    id BIGSERIAL PRIMARY KEY,
+    run_id VARCHAR(64) NOT NULL UNIQUE,
+    user_id VARCHAR(64) NOT NULL,
+    total_credit_consumed NUMERIC(20, 6) NOT NULL DEFAULT 0,
+    immediate_credit_consumed NUMERIC(20, 6) NOT NULL DEFAULT 0,
+    delayed_credit_consumed NUMERIC(20, 6) NOT NULL DEFAULT 0,
+    currency VARCHAR(8) NOT NULL DEFAULT 'USD',
+    settlement_status VARCHAR(32) NOT NULL,
+    idempotency_key VARCHAR(128),
+    ext JSONB NOT NULL DEFAULT '{}'::jsonb,
+    last_settlement_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS alphafrog_agent_run_llm_call_credit (
+    id BIGSERIAL PRIMARY KEY,
+    record_id VARCHAR(64) NOT NULL UNIQUE,
+    run_id VARCHAR(64) NOT NULL,
+    user_id VARCHAR(64) NOT NULL,
+    llm_call_id VARCHAR(128) NOT NULL,
+    endpoint_name VARCHAR(64),
+    model_name VARCHAR(255),
+    cost_source VARCHAR(32) NOT NULL,
+    currency VARCHAR(8) NOT NULL DEFAULT 'USD',
+    cost_amount NUMERIC(20, 8) NOT NULL DEFAULT 0,
+    credit_delta NUMERIC(20, 6) NOT NULL DEFAULT 0,
+    settlement_status VARCHAR(32) NOT NULL,
+    settlement_attempt INT NOT NULL DEFAULT 1,
+    reason TEXT NOT NULL DEFAULT '',
+    idempotency_key VARCHAR(128) NOT NULL,
+    ext JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    expires_at TIMESTAMPTZ NOT NULL DEFAULT (CURRENT_TIMESTAMP + INTERVAL '30 days')
 );
 
 CREATE TABLE IF NOT EXISTS alphafrog_admin_audit_log (
@@ -99,9 +154,16 @@ CREATE INDEX IF NOT EXISTS idx_agent_credit_apply_created ON alphafrog_agent_cre
 CREATE INDEX IF NOT EXISTS idx_credit_app_status_created ON alphafrog_agent_credit_application(status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_credit_app_user_status ON alphafrog_agent_credit_application(user_id, status);
 
-CREATE UNIQUE INDEX IF NOT EXISTS uniq_ledger_biz_source ON alphafrog_agent_credit_ledger(biz_type, source_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_ledger_biz_source_idem ON alphafrog_agent_credit_ledger(biz_type, source_id, idempotency_key);
 CREATE INDEX IF NOT EXISTS idx_credit_ledger_user_created ON alphafrog_agent_credit_ledger(user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_credit_ledger_biz_created ON alphafrog_agent_credit_ledger(biz_type, created_at DESC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_credit_recharge_operator_idem ON alphafrog_agent_credit_recharge(operator_id, idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_credit_recharge_user_created ON alphafrog_agent_credit_recharge(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_run_credit_summary_user_created ON alphafrog_agent_run_credit_summary(user_id, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_run_llm_call_credit_idem ON alphafrog_agent_run_llm_call_credit(idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_run_llm_call_credit_run_created ON alphafrog_agent_run_llm_call_credit(run_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_run_llm_call_credit_expires ON alphafrog_agent_run_llm_call_credit(expires_at);
 
 CREATE INDEX IF NOT EXISTS idx_audit_target ON alphafrog_admin_audit_log(target_type, target_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_operator_created ON alphafrog_admin_audit_log(operator_id, created_at DESC);

@@ -273,7 +273,7 @@ public class AuthController {
                 user.getEmail(),
                 user.getUserType(),
                 user.getUserLevel(),
-                user.getCredit(),
+                user.getCredit() == null ? 0 : user.getCredit().intValue(),
                 user.getRegisterTime()
         );
 

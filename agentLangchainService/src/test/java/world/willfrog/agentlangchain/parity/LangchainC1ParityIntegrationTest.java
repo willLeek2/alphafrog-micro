@@ -86,7 +86,7 @@ class LangchainC1ParityIntegrationTest {
         LangchainLinearWorkflowResult result = executor.execute(request(model, "查询"));
 
         assertLegacyAlignedFailure(result);
-        assertThat(result.getFailureReason()).isEqualTo("empty_todo_output:t1");
+        assertThat(result.getFailureReason()).isEqualTo("empty_todo_output_after_recovery:t1");
         assertThat(result.getFinalAnswer()).isBlank();
     }
 

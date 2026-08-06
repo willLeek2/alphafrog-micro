@@ -5,8 +5,12 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.ObjectProvider;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
+import world.willfrog.agent.platform.service.AgentCreditService;
 import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agent.platform.service.AgentObservabilityService;
+import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
+import world.willfrog.agent.platform.debug.DebugObservabilityService;
+import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 import world.willfrog.agent.workflow.TodoItem;
 import world.willfrog.agentlangchain.planning.LangchainAiPlanner;
@@ -19,6 +23,7 @@ import java.util.List;
 import static org.mockito.ArgumentMatchers.any;
 import static world.willfrog.agentlangchain.orchestration.LangchainRunSchedulerTestSupport.immediateScheduler;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -50,6 +55,11 @@ class LangchainLinearRunPipelineObservabilityTest {
         ObjectProvider<AgentObservabilityService> observabilityProvider = mock(ObjectProvider.class);
         when(observabilityProvider.getIfAvailable()).thenReturn(observabilityService);
 
+        @SuppressWarnings("unchecked")
+        ObjectProvider<AgentRunDatasetRegistry> datasetRegistryProvider = mock(ObjectProvider.class);
+        @SuppressWarnings("unchecked")
+        ObjectProvider<DebugObservabilityService> debugObservabilityProvider = mock(ObjectProvider.class);
+
         LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
         when(planner.plan(any())).thenReturn(LangchainTodoPlan.builder()
                 .executionMode(PlanExecutionMode.LINEAR)
@@ -62,6 +72,9 @@ class LangchainLinearRunPipelineObservabilityTest {
         LangchainFollowUpContextSupport followUpContextSupport = mock(LangchainFollowUpContextSupport.class);
         when(followUpContextSupport.resolve(run)).thenReturn(
                 new LangchainFollowUpContextSupport.ExecutionContext("goal", ""));
+
+        AgentCreditService creditService = mock(AgentCreditService.class);
+        lenient().when(creditService.hasPositiveCredit("user-1")).thenReturn(true);
 
         LangchainLinearRunPipelineImpl pipeline = new LangchainLinearRunPipelineImpl(
                 planner,
@@ -78,7 +91,12 @@ class LangchainLinearRunPipelineObservabilityTest {
                 followUpContextSupport,
                 mock(world.willfrog.agent.platform.service.AgentMessageService.class),
                 mock(LangchainRunExecutionGuard.class),
-                immediateScheduler()
+                immediateScheduler(),
+                creditService,
+                mock(AgentRunCreditSettlementService.class),
+                mock(world.willfrog.agent.platform.event.AgentRunFinalizationService.class),
+                datasetRegistryProvider,
+                debugObservabilityProvider
         );
 
         pipeline.executeRun(run);

@@ -9,6 +9,8 @@ import world.willfrog.alphafrogmicro.agent.idl.AgentRunCostMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunResultMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunStatusMessage;
+import world.willfrog.alphafrogmicro.agent.idl.AgentArtifactPartMessage;
+import world.willfrog.alphafrogmicro.agent.idl.AgentArtifactPartsMetaMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentSnapshotPartMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentSnapshotPartsMetaMessage;
 import world.willfrog.alphafrogmicro.agent.idl.ApplyAgentCreditsRequest;
@@ -27,8 +29,13 @@ import world.willfrog.alphafrogmicro.agent.idl.GetAgentCreditsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentCreditsResponse;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCostRequest;
+import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCreditsRequest;
+import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCreditsResponse;
+import world.willfrog.alphafrogmicro.agent.idl.RefreshAgentRunCreditsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunResultRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunStatusRequest;
+import world.willfrog.alphafrogmicro.agent.idl.GetAgentArtifactPartRequest;
+import world.willfrog.alphafrogmicro.agent.idl.GetAgentArtifactPartsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentSnapshotPartRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentSnapshotPartsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentArtifactsRequest;
@@ -51,7 +58,7 @@ import world.willfrog.alphafrogmicro.agent.idl.SubmitAgentFeedbackRequest;
 import world.willfrog.alphafrogmicro.agent.idl.UpdateAgentRunRequest;
 
 /**
- * agentLangchainService 的 Dubbo RPC 入口 —— 实现与 legacy agentService 相同的
+ * agentLangchainService 的 Dubbo RPC 入口 —— 实现共享的
  * {@code DubboAgentDubboService} 接口，但注册在独立的 {@code group=langchain}。
  *
  * <h2>设计意图</h2>
@@ -64,9 +71,7 @@ import world.willfrog.alphafrogmicro.agent.idl.UpdateAgentRunRequest;
  * 不包含任何业务逻辑，只是 RPC 协议到内部 service 的路由。
  *
  * <h2>group=langchain 隔离</h2>
- * 注册在 {@code group=langchain}，与 legacy agentService（默认 group）隔离。
- * frontend 通过路径分流（POST /api/agent/runs → langchain，其余 → legacy）
- * 决定调用哪个 provider。
+ * 注册在 {@code group=langchain}，frontend 的 {@code /api/agent/**} 入口固定调用该 provider。
  *
  * <h2>条件装配</h2>
  * 仅在 {@code agent.langchain.provider.enabled=true} 时激活。
@@ -145,6 +150,16 @@ public class AgentLangchainDubboServiceImpl extends DubboAgentDubboServiceTriple
     }
 
     @Override
+    public GetAgentRunCreditsResponse getRunCredits(GetAgentRunCreditsRequest request) {
+        return readService.getRunCredits(request);
+    }
+
+    @Override
+    public GetAgentRunCreditsResponse refreshRunCredits(RefreshAgentRunCreditsRequest request) {
+        return readService.refreshRunCredits(request);
+    }
+
+    @Override
     public AgentRunStatusMessage getStatus(GetAgentRunStatusRequest request) {
         return readService.getStatus(request);
     }
@@ -162,6 +177,16 @@ public class AgentLangchainDubboServiceImpl extends DubboAgentDubboServiceTriple
     @Override
     public DownloadAgentArtifactResponse downloadArtifact(DownloadAgentArtifactRequest request) {
         return artifactFacadeService.downloadArtifact(request);
+    }
+
+    @Override
+    public AgentArtifactPartsMetaMessage getArtifactPartsMeta(GetAgentArtifactPartsRequest request) {
+        return artifactFacadeService.getArtifactPartsMeta(request);
+    }
+
+    @Override
+    public AgentArtifactPartMessage getArtifactPart(GetAgentArtifactPartRequest request) {
+        return artifactFacadeService.getArtifactPart(request);
     }
 
     @Override

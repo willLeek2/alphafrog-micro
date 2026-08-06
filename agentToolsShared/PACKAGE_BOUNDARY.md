@@ -17,7 +17,11 @@
 - Dubbo API modules for market/rag/search/python tools
 - Must not depend on `agentService` or `workflow/*` executors
 
-## Out of scope (stay in agentService until P1)
+## Out of scope (not active in agentLangchainService)
 
 - `spawnSubAgent` / `waitForSubAgent` tool specs (ReactTodoExecutor)
 - `AgentToolCatalogService`, simple tool fast path
+
+These legacy-only surfaces are not part of the current langchain runtime contract.
+If revived, migrate them explicitly instead of depending on the legacy `agentService`
+module.

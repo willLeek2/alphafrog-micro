@@ -6,18 +6,24 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.tools.compaction.RereadToolHandler;
+import world.willfrog.agent.tools.dataset.ListMyDataTool;
+import world.willfrog.agent.tools.docs.LoadToolGuideTool;
 import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
 import world.willfrog.agent.tools.rag.RagTools;
 import world.willfrog.agent.tools.router.ToolRouter;
 import world.willfrog.agent.tools.search.SearchTools;
 import world.willfrog.agentlangchain.tools.ToolRouterToolProvider;
+import world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore;
 
 /**
  * Registers the ToolRouter-backed {@link ToolProvider} for AiServices (P1 A2).
  */
 @Configuration
-@ConditionalOnBean({ToolRouter.class, MarketDataTools.class, RagTools.class, SearchTools.class, PythonSandboxTools.class, AgentEventService.class})
+@ConditionalOnBean({ToolRouter.class, MarketDataTools.class, RagTools.class, SearchTools.class,
+        PythonSandboxTools.class, ListMyDataTool.class, LoadToolGuideTool.class,
+        RereadToolHandler.class, AgentEventService.class, PythonSandboxDispatchStore.class})
 public class LangchainToolsConfiguration {
 
     @Bean
@@ -26,18 +32,26 @@ public class LangchainToolsConfiguration {
                                        RagTools ragTools,
                                        SearchTools searchTools,
                                        PythonSandboxTools pythonSandboxTools,
+                                       ListMyDataTool listMyDataTool,
+                                       LoadToolGuideTool loadToolGuideTool,
+                                       RereadToolHandler rereadToolHandler,
                                        ObjectMapper objectMapper,
                                        AgentEventService eventService,
-                                       LangchainToolConcurrencyThrottle toolThrottle) {
+                                       LangchainToolConcurrencyThrottle toolThrottle,
+                                       PythonSandboxDispatchStore pythonSandboxDispatchStore) {
         return new ToolRouterToolProvider(
                 toolRouter,
                 marketDataTools,
                 ragTools,
                 searchTools,
                 pythonSandboxTools,
+                listMyDataTool,
+                loadToolGuideTool,
+                rereadToolHandler,
                 objectMapper,
                 eventService,
-                toolThrottle
+                toolThrottle,
+                pythonSandboxDispatchStore
         );
     }
 }

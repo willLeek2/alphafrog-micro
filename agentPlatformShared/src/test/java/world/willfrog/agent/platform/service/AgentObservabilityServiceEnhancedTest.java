@@ -1,6 +1,7 @@
 package world.willfrog.agent.platform.service;
 
 import world.willfrog.agent.platform.service.*;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.langchain4j.model.output.TokenUsage;
 import org.junit.jupiter.api.BeforeEach;
@@ -10,16 +11,21 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.model.AgentRunStatus;
 
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.clearInvocations;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static world.willfrog.agent.platform.service.AgentCallDetailPersistence.OBSERVABILITY_PREVIEW_MAX_CHARS;
@@ -205,10 +211,18 @@ class AgentObservabilityServiceEnhancedTest {
         Map<String, Object> blob = objectMapper.readValue(blobCaptor.getValue(), Map.class);
         @SuppressWarnings("unchecked")
         Map<String, Object> inputMessages = (Map<String, Object>) blob.get("inputMessages");
-        assertNotNull(inputMessages, "HTTP body should be parsed into detail blob");
+        assertNotNull(inputMessages, "HTTP body should be parsed into safe detail blob");
         assertTrue(inputMessages.containsKey("messages"));
         assertNotNull(blob.get("outputText"));
-        assertNotNull(blob.get("httpRequest"));
+        assertNull(blob.get("httpRequest"), "raw httpRequest must live in raw content blob, not safe detail blob");
+        assertNull(blob.get("httpResponse"), "raw httpResponse must live in raw content blob, not safe detail blob");
+
+        ArgumentCaptor<String> rawCaptor = ArgumentCaptor.forClass(String.class);
+        verify(stateStore).saveLlmCallRawContent(eq(runId), eq(trace.getTraceId()), rawCaptor.capture());
+        @SuppressWarnings("unchecked")
+        Map<String, Object> rawBlob = objectMapper.readValue(rawCaptor.getValue(), Map.class);
+        assertNotNull(rawBlob.get("httpRequest"), "raw httpRequest should be persisted to raw content blob");
+        assertNotNull(rawBlob.get("httpResponse"), "raw httpResponse should be persisted to raw content blob");
     }
 
     // ==================== 5.3 DAG 节点 ID 写入 LlmTrace ====================
@@ -334,6 +348,118 @@ class AgentObservabilityServiceEnhancedTest {
         @SuppressWarnings("unchecked")
         Map<String, Object> blob = objectMapper.readValue(blobCaptor.getValue(), Map.class);
         assertEquals(shortOutput, blob.get("output"));
+    }
+
+    @Test
+    void attachObservabilityToSnapshot_shouldAttachRagObservabilityFromToolDetailBlob() throws Exception {
+        String runId = "test-rag-observability-1";
+        setupStateStore(runId);
+        Map<String, String> toolDetails = new ConcurrentHashMap<>();
+        doAnswer(inv -> {
+            toolDetails.put(inv.getArgument(1), inv.getArgument(2));
+            return null;
+        }).when(stateStore).saveToolCallDetail(eq(runId), anyString(), anyString());
+        when(stateStore.loadToolCallDetail(eq(runId), anyString()))
+                .thenAnswer(inv -> Optional.ofNullable(toolDetails.get(inv.getArgument(1))));
+
+        AgentContext.setToolCallId("rag-call-1");
+        service.recordToolCall(runId, "tool_execution", "ragSearch",
+                Map.of("query", "Alpha"),
+                """
+                {"ok":true,"data":{"summary":{"hit_count":1,"omitted_count":0,"visible_chars":120},"rawRef":"raw_ref_001","top_refs":[{"ref_id":"rag_ref_001","source_key":"oss://a#chunk=0"}]}}
+                """,
+                100L, true, false, false, null, null, 0, 0, null);
+        AgentContext.clearToolCallId();
+
+        String output = service.attachObservabilityToSnapshot(
+                runId,
+                "{\"answer_markdown\":\"答案 <rag-cite ref=\\\"rag_ref_001\\\" />\"}",
+                AgentRunStatus.COMPLETED
+        );
+
+        JsonNode root = objectMapper.readTree(output);
+        JsonNode rag = root.path("observability").path("rag_observability");
+        assertFalse(rag.isMissingNode(), "RAG observability should be attached when RAG signal exists");
+        assertEquals("rag_ref_001", rag.path("aggregate").path("final_answer_cited_refs").get(0).asText());
+        assertEquals(1, rag.path("aggregate").path("visible_count").asInt());
+    }
+
+    @Test
+    void attachObservabilityToSnapshot_withoutRagSignalShouldKeepNoRagField() throws Exception {
+        String runId = "test-rag-observability-empty";
+        setupStateStore(runId);
+
+        service.initializeRun(runId, "endpoint", "model");
+        String output = service.attachObservabilityToSnapshot(
+                runId,
+                "{\"answer_markdown\":\"普通答案 [1]\"}",
+                AgentRunStatus.COMPLETED
+        );
+
+        JsonNode root = objectMapper.readTree(output);
+        assertTrue(root.path("observability").path("rag_observability").isMissingNode());
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void terminalPreviewIsPureAndCommitWritesOnceThenRemovesLock() throws Exception {
+        String runId = "test-terminal-preview";
+        setupStateStore(runId);
+        service.initializeRun(runId, "endpoint", "model");
+        Map<String, Object> locks = (Map<String, Object>) ReflectionTestUtils.getField(service, "locks");
+        assertNotNull(locks);
+        assertTrue(locks.containsKey(runId));
+        String persistedSnapshotBeforePreview = savedJson.get();
+        clearInvocations(stateStore);
+
+        AgentObservabilityService.TerminalSnapshotCandidate candidate =
+                service.prepareTerminalSnapshot(
+                        runId,
+                        "{\"answer_markdown\":\"failed\"}",
+                        AgentRunStatus.FAILED,
+                        "ExternalToolFailure",
+                        "stale worker failed");
+
+        verify(stateStore, never()).saveObservability(eq(runId), anyString());
+        assertTrue(locks.containsKey(runId), "preview must not clean the run lock");
+        assertEquals(persistedSnapshotBeforePreview, savedJson.get(),
+                "preview must leave persisted observability unchanged");
+        JsonNode persistedBeforeCas = objectMapper.readTree(savedJson.get());
+        assertEquals("EXECUTING", persistedBeforeCas.path("summary").path("status").asText());
+        JsonNode prepared = objectMapper.readTree(candidate.snapshotJson()).path("observability");
+        assertEquals("FAILED", prepared.path("summary").path("status").asText());
+        assertTrue(prepared.path("summary").path("completedAtMillis").asLong() > 0);
+        assertEquals("ExternalToolFailure",
+                prepared.path("diagnostics").path("lastErrorType").asText());
+        assertEquals("stale worker failed",
+                prepared.path("diagnostics").path("lastErrorMessage").asText());
+
+        service.commitTerminalSnapshot(candidate);
+
+        verify(stateStore, times(1)).saveObservability(runId, candidate.observabilityJson());
+        assertFalse(locks.containsKey(runId), "winner commit must clean the run lock");
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void nonTerminalSnapshotKeepsImmediatePersistenceAndRunLock() throws Exception {
+        String runId = "test-waiting-snapshot";
+        setupStateStore(runId);
+        service.initializeRun(runId, "endpoint", "model");
+        Map<String, Object> locks = (Map<String, Object>) ReflectionTestUtils.getField(service, "locks");
+        assertNotNull(locks);
+        assertTrue(locks.containsKey(runId));
+        clearInvocations(stateStore);
+
+        String output = service.attachObservabilityToSnapshot(
+                runId, "{\"answer_markdown\":\"paused\"}", AgentRunStatus.WAITING);
+
+        verify(stateStore, times(2)).saveObservability(eq(runId), anyString());
+        assertTrue(locks.containsKey(runId), "non-terminal snapshot must retain the run lock");
+        assertEquals("WAITING",
+                objectMapper.readTree(savedJson.get()).path("summary").path("status").asText());
+        assertEquals("WAITING",
+                objectMapper.readTree(output).path("observability").path("summary").path("status").asText());
     }
 
     // ==================== ToolTrace backward compat ====================

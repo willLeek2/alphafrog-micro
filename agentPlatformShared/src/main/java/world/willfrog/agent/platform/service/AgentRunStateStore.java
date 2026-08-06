@@ -10,6 +10,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
+import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.workflow.TodoStatus;
 import world.willfrog.agent.workflow.WorkflowState;
 
@@ -33,12 +34,28 @@ public class AgentRunStateStore {
     private static final String PLAN_OVERRIDE_KEY = ":plan_override";
     private static final String STATUS_KEY = ":status";
     private static final String OBSERVABILITY_KEY = ":observability";
+    private static final String DATA_ANALYSIS_OBSERVABILITY_KEY = ":data_analysis_observability";
+    private static final String DATA_ANALYSIS_SUMMARY_KEY = ":data_analysis_observability:summary";
     private static final String DETAIL_LLM_KEY = ":detail:llm:";
     private static final String DETAIL_TOOL_KEY = ":detail:tool:";
+    private static final String RAW_DETAIL_SUFFIX = ":raw";
+    private static final String RAW_DETAIL_META_SUFFIX = ":raw:meta";
 
     private static final String WORKFLOW_STATE_KEY = ":workflow_state";
     private static final String TOOL_CALL_COUNT_KEY = ":tool_call_count";
     private static final String PATCHED_PLAN_KEY = ":patched_plan";
+
+    /**
+     * 预算进度告警去重 key（Set 结构，元素为已发过 80% 告警的 dimension 名）。
+     * 用于保证 {@code BUDGET_PROGRESS} 事件在单个 run 内对每个 dimension 只发一次（首次跨过 80% 阈值时触发）。
+     */
+    private static final String BUDGET_PROGRESS_WARNED_KEY = ":budget_progress_warned";
+
+    /**
+     * 90% last-mile 提示去重 key（Set 结构，元素为已发过 90% 提示的 dimension 名）。
+     * 用于保证 {@code BUDGET_LAST_MILE} 事件 + {@code AgentContext.lastMileHint} 注入在单个 run 内对每个 dimension 只触发一次（首次跨过 90% 阈值时触发）。
+     */
+    private static final String BUDGET_LAST_MILE_WARNED_KEY = ":budget_last_mile_warned";
 
     // legacy keys for read compatibility
     private static final String TASK_INDEX_KEY = ":tasks";
@@ -46,6 +63,9 @@ public class AgentRunStateStore {
 
     private final StringRedisTemplate redisTemplate;
     private final ObjectMapper objectMapper;
+
+    @Autowired(required = false)
+    private AgentLlmLocalConfigLoader localConfigLoader;
 
     /** Micrometer 指标注册中心（可选，若服务未引入 actuator 则为 null） */
     @Autowired(required = false)
@@ -61,6 +81,10 @@ public class AgentRunStateStore {
      *  Default 6h to keep thinking/reasoning content short-lived while still useful for debugging. */
     @Value("${agent.call-detail.ttl-seconds:21600}")
     private long callDetailTtlSeconds;
+
+    /** Hot-reloadable via agent-llm.json agent.call-raw-content.ttl-seconds; this is only fallback. */
+    @Value("${agent.call-raw-content.ttl-seconds:7200}")
+    private long callRawContentTtlSeconds;
 
     public void recordPlan(String runId, String planJson, boolean valid) {
         if (blank(runId)) {
@@ -188,12 +212,74 @@ public class AgentRunStateStore {
         }
     }
 
+    public void saveDataAnalysisObservability(String runId, String snapshotJson, String summaryJson) {
+        if (blank(runId)) {
+            return;
+        }
+        String fullKey = dataAnalysisObservabilityKey(runId);
+        String summaryKey = dataAnalysisSummaryKey(runId);
+        redisTemplate.opsForValue().set(fullKey, nvl(snapshotJson));
+        redisTemplate.opsForValue().set(summaryKey, nvl(summaryJson));
+        touch(fullKey);
+        touch(summaryKey);
+    }
+
+    public void saveDataAnalysisObservabilitySummary(String runId, String summaryJson) {
+        if (blank(runId)) {
+            return;
+        }
+        String key = dataAnalysisSummaryKey(runId);
+        redisTemplate.opsForValue().set(key, nvl(summaryJson));
+        touch(key);
+    }
+
+    public Optional<String> loadDataAnalysisObservability(String runId) {
+        return loadNonBlankValue(dataAnalysisObservabilityKey(runId));
+    }
+
+    public Optional<String> loadDataAnalysisObservabilitySummary(String runId) {
+        return loadNonBlankValue(dataAnalysisSummaryKey(runId));
+    }
+
+    private Optional<String> loadNonBlankValue(String key) {
+        if (blank(key)) {
+            return Optional.empty();
+        }
+        try {
+            String json = redisTemplate.opsForValue().get(key);
+            return json == null || json.isBlank() ? Optional.empty() : Optional.of(json);
+        } catch (Exception e) {
+            log.warn("load data-analysis observability failed: key={}, error={}", key, e.getMessage());
+            return Optional.empty();
+        }
+    }
+
     public void saveLlmCallDetail(String runId, String llmCallId, String detailJson) {
         saveCallDetail(runId, llmCallId, detailJson, true);
     }
 
     public void saveToolCallDetail(String runId, String toolCallId, String detailJson) {
         saveCallDetail(runId, toolCallId, detailJson, false);
+    }
+
+    public void saveLlmCallRawContent(String runId, String llmCallId, String rawJson) {
+        if (blank(runId) || blank(llmCallId) || blank(rawJson)) {
+            return;
+        }
+        long ttl = resolveCallRawContentTtlSeconds();
+        long createdAtMillis = System.currentTimeMillis();
+        long expiresAtMillis = createdAtMillis + ttl * 1000L;
+        String rawKey = llmCallRawContentKey(runId, llmCallId);
+        String metaKey = llmCallRawMetaKey(runId, llmCallId);
+        redisTemplate.opsForValue().set(rawKey, nvl(rawJson), Duration.ofSeconds(ttl));
+        Map<String, Object> meta = new LinkedHashMap<>();
+        meta.put("type", "llm_raw_meta");
+        meta.put("runId", runId);
+        meta.put("traceId", llmCallId);
+        meta.put("createdAtMillis", createdAtMillis);
+        meta.put("expiresAtMillis", expiresAtMillis);
+        meta.put("ttlSeconds", ttl);
+        redisTemplate.opsForValue().set(metaKey, safeWrite(meta), Duration.ofSeconds(rawMetaTtlSeconds(ttl)));
     }
 
     public Optional<String> loadLlmCallDetail(String runId, String llmCallId) {
@@ -204,14 +290,40 @@ public class AgentRunStateStore {
         return loadCallDetail(runId, toolCallId, false);
     }
 
+    public Optional<String> loadLlmCallRawContent(String runId, String llmCallId) {
+        return loadRaw(rawContentKeyOrBlank(runId, llmCallId));
+    }
+
+    public Optional<String> loadLlmCallRawMeta(String runId, String llmCallId) {
+        return loadRaw(rawMetaKeyOrBlank(runId, llmCallId));
+    }
+
     /** Public for frontend Redis reader — keep in sync with detail key layout. */
     public String llmCallDetailKey(String runId, String llmCallId) {
         return PREFIX + runId + DETAIL_LLM_KEY + nvl(llmCallId);
     }
 
+    /** Public for frontend Redis reader — keep in sync with raw detail key layout. */
+    public String llmCallRawContentKey(String runId, String llmCallId) {
+        return llmCallDetailKey(runId, llmCallId) + RAW_DETAIL_SUFFIX;
+    }
+
+    /** Public for frontend Redis reader — keep in sync with raw detail key layout. */
+    public String llmCallRawMetaKey(String runId, String llmCallId) {
+        return llmCallDetailKey(runId, llmCallId) + RAW_DETAIL_META_SUFFIX;
+    }
+
     /** Public for frontend Redis reader — keep in sync with detail key layout. */
     public String toolCallDetailKey(String runId, String toolCallId) {
         return PREFIX + runId + DETAIL_TOOL_KEY + nvl(toolCallId);
+    }
+
+    public String dataAnalysisObservabilityKey(String runId) {
+        return blank(runId) ? "" : PREFIX + runId + DATA_ANALYSIS_OBSERVABILITY_KEY;
+    }
+
+    public String dataAnalysisSummaryKey(String runId) {
+        return blank(runId) ? "" : PREFIX + runId + DATA_ANALYSIS_SUMMARY_KEY;
     }
 
     private void saveCallDetail(String runId, String callId, String detailJson, boolean llm) {
@@ -228,11 +340,44 @@ public class AgentRunStateStore {
             return Optional.empty();
         }
         String key = llm ? llmCallDetailKey(runId, callId) : toolCallDetailKey(runId, callId);
+        return loadRaw(key);
+    }
+
+    private Optional<String> loadRaw(String key) {
+        if (blank(key)) {
+            return Optional.empty();
+        }
         String json = redisTemplate.opsForValue().get(key);
         if (json == null || json.isBlank()) {
             return Optional.empty();
         }
         return Optional.of(json);
+    }
+
+    private String rawContentKeyOrBlank(String runId, String llmCallId) {
+        return blank(runId) || blank(llmCallId) ? "" : llmCallRawContentKey(runId, llmCallId);
+    }
+
+    private String rawMetaKeyOrBlank(String runId, String llmCallId) {
+        return blank(runId) || blank(llmCallId) ? "" : llmCallRawMetaKey(runId, llmCallId);
+    }
+
+    private long resolveCallRawContentTtlSeconds() {
+        Long hotValue = localConfigLoader == null ? null : localConfigLoader.current()
+                .map(AgentLlmProperties::getAgent)
+                .map(AgentLlmProperties.Agent::getCallRawContent)
+                .map(AgentLlmProperties.CallRawContent::getTtlSeconds)
+                .filter(value -> value != null && value > 0)
+                .orElse(null);
+        if (hotValue != null) {
+            return hotValue;
+        }
+        return callRawContentTtlSeconds > 0 ? callRawContentTtlSeconds : 7200L;
+    }
+
+    private long rawMetaTtlSeconds(long rawTtlSeconds) {
+        long detailTtl = callDetailTtlSeconds > 0 ? callDetailTtlSeconds : 86400L;
+        return Math.max(rawTtlSeconds, detailTtl);
     }
 
     public void saveWorkflowState(String runId, WorkflowState state) {
@@ -334,6 +479,89 @@ public class AgentRunStateStore {
         touch(toolCallCountKey(runId));
     }
 
+    /**
+     * 原子地尝试标记某个 dimension 在本 run 已发过 80% 预算进度告警。
+     * 利用 Redis {@code SADD} 的原子语义（元素不存在时返回 1，已存在时返回 0），
+     * 保证同 {@code (runId, dimension)} 组合在并发场景（并行 DAG 节点、并发 LLM/tool 入口）下也只发一次 {@code BUDGET_PROGRESS} 事件。
+     * <p>调用方应只在返回 {@code true} 时发出事件；返回 {@code false} 表示已被其它线程抢先标记，应跳过。</p>
+     *
+     * @return true 表示本次新加入（应当前调用方发事件）；false 表示已存在（应跳过）
+     */
+    public boolean tryMarkBudgetProgressWarned(String runId, String dimension) {
+        if (blank(runId) || blank(dimension)) {
+            return false;
+        }
+        Long added = redisTemplate.opsForSet().add(budgetProgressWarnedKey(runId), dimension);
+        touch(budgetProgressWarnedKey(runId));
+        return added != null && added > 0;
+    }
+
+    /**
+     * 非破坏性查询某 dimension 是否已发过 80% 预算进度告警。
+     * 不修改 Redis 状态，用于监控/测试的只读场景。
+     * <p>注意：发事件路径请使用 {@link #tryMarkBudgetProgressWarned} 原子 gate，
+     * 不要先 {@code has} 再 {@code mark} 两步走——并发下两步之间会被其他线程插队导致重复事件。</p>
+     *
+     * @return true 表示已发过，false 表示尚未发过
+     */
+    public boolean hasBudgetProgressWarned(String runId, String dimension) {
+        if (blank(runId) || blank(dimension)) {
+            return false;
+        }
+        Boolean member = redisTemplate.opsForSet().isMember(budgetProgressWarnedKey(runId), dimension);
+        return Boolean.TRUE.equals(member);
+    }
+
+    /**
+     * 清空本 run 的 80% 预算进度告警去重 Set。
+     * 由 {@link #clear} 在 run 结束时统一调用；单独暴露用于测试和运维手工清理。
+     */
+    public void clearBudgetProgressWarned(String runId) {
+        if (blank(runId)) {
+            return;
+        }
+        redisTemplate.delete(budgetProgressWarnedKey(runId));
+    }
+
+    /**
+     * 原子地尝试标记某个 dimension 在本 run 已发过 90% last-mile 提示。
+     * 与 {@link #tryMarkBudgetProgressWarned} 同语义（Redis SADD 返回值做 check-and-set），
+     * 保证同 {@code (runId, dimension)} 在并发场景下只触发一次 {@code BUDGET_LAST_MILE} 事件 + {@code AgentContext.lastMileHint} 写入。
+     *
+     * @return true 表示本次新加入（应当前调用方发事件 + 写 hint）；false 表示已存在（应跳过）
+     */
+    public boolean tryMarkBudgetLastMileWarned(String runId, String dimension) {
+        if (blank(runId) || blank(dimension)) {
+            return false;
+        }
+        Long added = redisTemplate.opsForSet().add(budgetLastMileWarnedKey(runId), dimension);
+        touch(budgetLastMileWarnedKey(runId));
+        return added != null && added > 0;
+    }
+
+    /**
+     * 非破坏性查询某 dimension 是否已发过 90% last-mile 提示。
+     * 不修改 Redis 状态，用于监控/测试的只读场景。
+     */
+    public boolean hasBudgetLastMileWarned(String runId, String dimension) {
+        if (blank(runId) || blank(dimension)) {
+            return false;
+        }
+        Boolean member = redisTemplate.opsForSet().isMember(budgetLastMileWarnedKey(runId), dimension);
+        return Boolean.TRUE.equals(member);
+    }
+
+    /**
+     * 清空本 run 的 90% last-mile 提示去重 Set。
+     * 由 {@link #clear} 在 run 结束时统一调用；单独暴露用于测试和运维手工清理。
+     */
+    public void clearBudgetLastMileWarned(String runId) {
+        if (blank(runId)) {
+            return;
+        }
+        redisTemplate.delete(budgetLastMileWarnedKey(runId));
+    }
+
     public String buildProgressJson(String runId, String planJson) {
         JsonNode root = parseJson(planJson);
         if (root != null && root.path("items").isArray()) {
@@ -358,6 +586,8 @@ public class AgentRunStateStore {
         redisTemplate.delete(workflowStateKey(runId));
         redisTemplate.delete(toolCallCountKey(runId));
         redisTemplate.delete(patchedPlanKey(runId));
+        redisTemplate.delete(budgetProgressWarnedKey(runId));
+        redisTemplate.delete(budgetLastMileWarnedKey(runId));
     }
 
     public void clearTasks(String runId) {
@@ -588,6 +818,14 @@ public class AgentRunStateStore {
 
     private String patchedPlanKey(String runId) {
         return PREFIX + runId + PATCHED_PLAN_KEY;
+    }
+
+    private String budgetProgressWarnedKey(String runId) {
+        return PREFIX + runId + BUDGET_PROGRESS_WARNED_KEY;
+    }
+
+    private String budgetLastMileWarnedKey(String runId) {
+        return PREFIX + runId + BUDGET_LAST_MILE_WARNED_KEY;
     }
 
     private String taskIndexKey(String runId) {

@@ -9,12 +9,14 @@ import org.springframework.beans.factory.ObjectProvider;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agent.platform.service.AgentCreditService;
 import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agentlangchain.orchestration.LangchainLinearRunPipeline;
 import world.willfrog.agentlangchain.orchestration.LangchainRunConcurrencyScheduler;
 import world.willfrog.agentlangchain.orchestration.LangchainRunRejectedException;
 import world.willfrog.agentlangchain.routing.LangchainSingleWriterGuard;
 import world.willfrog.alphafrogmicro.agent.idl.CreateAgentRunRequest;
+import world.willfrog.alphafrogmicro.common.dao.user.UserDao;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
@@ -37,13 +39,18 @@ class AgentLangchainRunServiceTest {
     private AgentRunMapper runMapper;
     @Mock
     private LangchainSingleWriterGuard singleWriterGuard;
+    @Mock
+    private AgentCreditService creditService;
+    @Mock
+    private UserDao userDao;
 
     private AgentLangchainRunService runService;
 
     @BeforeEach
     void setUp() {
         runService = new AgentLangchainRunService(eventServiceProvider, pipelineProvider, scheduler, runMapper,
-                singleWriterGuard);
+                singleWriterGuard, creditService, userDao);
+        lenient().when(creditService.hasPositiveCredit(anyString())).thenReturn(true);
     }
 
     @Test
@@ -59,7 +66,7 @@ class AgentLangchainRunServiceTest {
         run.setUserId("u1");
         run.setStatus(AgentRunStatus.RECEIVED);
         when(eventService.createRun(anyString(), anyString(), any(), any(), any(), any(),
-                anyBoolean(), any(), anyInt(), anyBoolean(), any())).thenReturn(run);
+                anyBoolean(), any(), anyInt(), anyBoolean(), any(), anyBoolean())).thenReturn(run);
         when(singleWriterGuard.markLangchainOwner(run)).thenReturn(run);
 
         CreateAgentRunRequest request = CreateAgentRunRequest.newBuilder()
@@ -86,7 +93,7 @@ class AgentLangchainRunServiceTest {
 
         assertThrows(LangchainRunRejectedException.class, () -> runService.createRun(request));
         verify(eventService, never()).createRun(anyString(), anyString(), any(), any(), any(), any(),
-                anyBoolean(), any(), anyInt(), anyBoolean(), any());
+                anyBoolean(), any(), anyInt(), anyBoolean(), any(), anyBoolean());
         verify(pipeline, never()).launchAsync(any(), any());
     }
 

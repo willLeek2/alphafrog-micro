@@ -1,7 +1,7 @@
 {
   "name": "alphafrogdebugmcp",
   "version": "1.0.0",
-  "description": "Minimal MCP server for remote debugging over SSH (docker ps/logs, git log) and read-only PostgreSQL queries.",
+  "description": "Minimal MCP server for remote debugging over SSH (docker ps/logs, git log, agent data browse, read-only Redis) and read-only PostgreSQL queries.",
   "type": "module",
   "bin": {
     "alphafrog-debug-mcp": "./bin/alphafrog-debug-mcp.mjs"
@@ -9,6 +9,7 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/server.js",
+    "test": "npm run build && node --test dist/**/*.test.js",
     "prepare": "npm run build"
   },
   "engines": {

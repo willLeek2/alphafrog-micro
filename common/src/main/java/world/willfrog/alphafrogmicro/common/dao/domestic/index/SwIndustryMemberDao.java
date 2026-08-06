@@ -51,6 +51,52 @@ public interface SwIndustryMemberDao {
     })
     List<SwIndustryMember> getByL1Code(@Param("l1Code") String l1Code);
 
+    @Select("SELECT * FROM alphafrog_index_sw_member WHERE l2_code = #{l2Code} AND is_new = 'Y'")
+    @Results({
+            @Result(property = "id", column = "id"),
+            @Result(property = "l1Code", column = "l1_code"),
+            @Result(property = "l1Name", column = "l1_name"),
+            @Result(property = "l2Code", column = "l2_code"),
+            @Result(property = "l2Name", column = "l2_name"),
+            @Result(property = "l3Code", column = "l3_code"),
+            @Result(property = "l3Name", column = "l3_name"),
+            @Result(property = "tsCode", column = "ts_code"),
+            @Result(property = "name", column = "name"),
+            @Result(property = "inDate", column = "in_date"),
+            @Result(property = "outDate", column = "out_date"),
+            @Result(property = "isNew", column = "is_new"),
+            @Result(property = "extended", column = "extended")
+    })
+    List<SwIndustryMember> getByL2Code(@Param("l2Code") String l2Code);
+
+    @Select("SELECT * FROM alphafrog_index_sw_member WHERE l3_code = #{l3Code} AND is_new = 'Y'")
+    @Results({
+            @Result(property = "id", column = "id"),
+            @Result(property = "l1Code", column = "l1_code"),
+            @Result(property = "l1Name", column = "l1_name"),
+            @Result(property = "l2Code", column = "l2_code"),
+            @Result(property = "l2Name", column = "l2_name"),
+            @Result(property = "l3Code", column = "l3_code"),
+            @Result(property = "l3Name", column = "l3_name"),
+            @Result(property = "tsCode", column = "ts_code"),
+            @Result(property = "name", column = "name"),
+            @Result(property = "inDate", column = "in_date"),
+            @Result(property = "outDate", column = "out_date"),
+            @Result(property = "isNew", column = "is_new"),
+            @Result(property = "extended", column = "extended")
+    })
+    List<SwIndustryMember> getByL3Code(@Param("l3Code") String l3Code);
+
+    @Select("SELECT l3_name FROM (" +
+            "  SELECT DISTINCT l3_name " +
+            "  FROM alphafrog_index_sw_member " +
+            "  WHERE l3_name IS NOT NULL " +
+            "    AND l3_name <> ''" +
+            ") names " +
+            "ORDER BY random() " +
+            "LIMIT #{limit}")
+    List<String> getRandomL3IndustryNames(@Param("limit") int limit);
+
     @Delete("DELETE FROM alphafrog_index_sw_member")
     int deleteAll();
 

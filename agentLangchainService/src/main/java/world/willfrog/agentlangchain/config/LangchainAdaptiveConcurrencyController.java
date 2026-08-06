@@ -9,16 +9,11 @@ import world.willfrog.agent.platform.service.LangchainLlmLatencyWindow;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Conservative adaptive concurrency: adjusts current corePoolSize based on p90 LLM latency.
+ * 基于 LLM p90 延迟保守调节 Run core 并发。
  *
- * <p>Design principles (per frog):
- * <ul>
- *   <li>Don't reduce too aggressively — floor prevents collapse under transient spikes.</li>
- *   <li>Cooldown between adjustments prevents oscillation.</li>
- *   <li>Recovery is gradual: one step at a time after sustained low latency.</li>
- *   <li>Every automatic change emits WARN log with before/after, p90, window size.</li>
- *   <li>Feature-gated via config, defaults off.</li>
- * </ul>
+ * <p>高延迟时每轮最多减 1 且不低于 floor；低延迟时每轮最多恢复 1，直到启动时 core。
+ * 两次调整之间必须经过 cooldown，样本不足时不决策，避免短时尖峰造成并发振荡。功能默认
+ * 关闭，每次自动变化都用 WARN 记录前后值、p90、均值和窗口大小。</p>
  */
 @Component
 @Slf4j
@@ -64,7 +59,7 @@ public class LangchainAdaptiveConcurrencyController {
         int windowSize = latencyWindow.size();
 
         if (p90 <= 0 || windowSize < 3) {
-            return; // insufficient data, skip this cycle
+            return; // 少于三个有效样本不能代表稳定延迟，跳过本轮。
         }
 
         int currentCore = limitsResolver.currentLimits().getCorePoolSize();
@@ -72,9 +67,9 @@ public class LangchainAdaptiveConcurrencyController {
         int floor = Math.max(1, hardCore * floorPercent / 100);
 
         if (p90 > startReductionP90Ms) {
-            // Reduce concurrency
+            // 高延迟时逐级收缩，floor 防止瞬时抖动把服务压到不可用。
             long elapsed = now - lastAdjustmentAt;
-            if (elapsed < cooldownMs) return; // cooldown active
+            if (elapsed < cooldownMs) return; // 冷却期内保持当前并发，防止来回震荡。
 
             int newCore = Math.max(floor, currentCore - 1);
             if (newCore < currentCore) {
@@ -82,7 +77,7 @@ public class LangchainAdaptiveConcurrencyController {
                         + " floor=" + floor + " hardCore=" + hardCore);
             }
         } else if (p90 < recoveryP90Ms && currentCore < originalCore) {
-            // Gradual recovery: one step at a time back to originalCore
+            // 延迟恢复后也逐级加 1，不直接跳回原始 core。
             long elapsed = now - lastAdjustmentAt;
             if (elapsed < cooldownMs) return;
 
@@ -102,7 +97,7 @@ public class LangchainAdaptiveConcurrencyController {
         lastAdjustmentAt = System.currentTimeMillis();
     }
 
-    // ── operator knobs ──
+    // ── 运维开关：只启停控制器，不直接修改 hard/max/queue ──
 
     public void setEnabled(boolean enabled) {
         this.enabled.set(enabled);

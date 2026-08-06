@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -18,6 +22,11 @@ class SandboxConfig:
     sandbox_image: str
     skip_environment_setup: bool
     preinstalled_libraries: frozenset[str]
+    # Per-container concurrency: how many Python tasks may execute concurrently
+    # inside a single warm container. Default 5; set to 1 for the legacy serial
+    # behavior. Values >1 require compat_input_path_enabled=False (global symlink
+    # would otherwise collide across concurrent tasks).
+    container_max_concurrency: int
     # Pool config
     pool_enabled: bool
     pool_min_size: int
@@ -27,6 +36,11 @@ class SandboxConfig:
     pool_max_container_uses: int | None
     workspace_root: str
     compat_input_path_enabled: bool
+    standard_memory_limit_bytes: int = 512 * 1024 * 1024
+    heavy_memory_limit_bytes: int = 1536 * 1024 * 1024
+    queue_wait_timeout_seconds: float = 30.0
+    usage_sampling_interval_millis: int = 200
+    task_store_path: Path = Path("/data/sandbox_tasks/state.json")
 
 
 def load_config() -> SandboxConfig:
@@ -48,6 +62,11 @@ def load_config() -> SandboxConfig:
         ).split(",")
         if item.strip()
     )
+    container_max_concurrency = int(os.getenv("AF_SANDBOX_CONTAINER_MAX_CONCURRENCY", "1"))
+    if container_max_concurrency < 1:
+        raise ValueError(
+            f"Invalid container_max_concurrency ({container_max_concurrency}): must be >= 1."
+        )
     # Pool config (default disabled for safe rollout)
     pool_enabled = _parse_bool(os.getenv("AF_SANDBOX_POOL_ENABLED"), default=False)
     pool_min_size = int(os.getenv("AF_SANDBOX_POOL_MIN_SIZE", "2"))
@@ -57,6 +76,11 @@ def load_config() -> SandboxConfig:
     pool_max_container_uses = _parse_int_or_none(os.getenv("AF_SANDBOX_POOL_MAX_CONTAINER_USES"))
     workspace_root = os.getenv("AF_SANDBOX_WORKSPACE_ROOT", "/sandbox/runs")
     compat_input_path_enabled = _parse_bool(os.getenv("AF_SANDBOX_COMPAT_INPUT_PATH"), default=True)
+    standard_memory_limit_bytes = int(os.getenv("AF_SANDBOX_STANDARD_MEMORY_BYTES", str(512 * 1024 * 1024)))
+    heavy_memory_limit_bytes = int(os.getenv("AF_SANDBOX_HEAVY_MEMORY_BYTES", str(1536 * 1024 * 1024)))
+    queue_wait_timeout_seconds = float(os.getenv("AF_SANDBOX_QUEUE_WAIT_TIMEOUT", "30"))
+    usage_sampling_interval_millis = int(os.getenv("AF_SANDBOX_USAGE_SAMPLE_MILLIS", "200"))
+    task_store_path = Path(os.getenv("AF_SANDBOX_TASK_STORE_PATH", "/data/sandbox_tasks/state.json"))
 
     # Config validation
     if pool_enabled and pool_min_size > pool_max_size:
@@ -64,6 +88,20 @@ def load_config() -> SandboxConfig:
             f"Invalid pool config: pool_min_size ({pool_min_size}) > pool_max_size ({pool_max_size}). "
             f"Ensure AF_SANDBOX_POOL_MIN_SIZE <= AF_SANDBOX_POOL_MAX_SIZE."
         )
+    if standard_memory_limit_bytes <= 0 or heavy_memory_limit_bytes <= standard_memory_limit_bytes:
+        raise ValueError("Sandbox memory limits must be positive and HEAVY must exceed STANDARD")
+    if queue_wait_timeout_seconds <= 0:
+        raise ValueError("AF_SANDBOX_QUEUE_WAIT_TIMEOUT must be positive")
+    if usage_sampling_interval_millis <= 0:
+        raise ValueError("AF_SANDBOX_USAGE_SAMPLE_MILLIS must be positive")
+    if container_max_concurrency > 1 and compat_input_path_enabled:
+        # The global /sandbox/input symlink would be overwritten by concurrent tasks.
+        logger.warning(
+            "container_max_concurrency=%s > 1 is incompatible with compat_input_path_enabled=True; "
+            "disabling compat_input_path_enabled automatically.",
+            container_max_concurrency,
+        )
+        compat_input_path_enabled = False
     return SandboxConfig(
         data_dir=data_dir,
         max_concurrency=max_concurrency,
@@ -76,6 +114,7 @@ def load_config() -> SandboxConfig:
         sandbox_image=sandbox_image,
         skip_environment_setup=skip_environment_setup,
         preinstalled_libraries=preinstalled_libraries,
+        container_max_concurrency=container_max_concurrency,
         pool_enabled=pool_enabled,
         pool_min_size=pool_min_size,
         pool_max_size=pool_max_size,
@@ -84,6 +123,11 @@ def load_config() -> SandboxConfig:
         pool_max_container_uses=pool_max_container_uses,
         workspace_root=workspace_root,
         compat_input_path_enabled=compat_input_path_enabled,
+        standard_memory_limit_bytes=standard_memory_limit_bytes,
+        heavy_memory_limit_bytes=heavy_memory_limit_bytes,
+        queue_wait_timeout_seconds=queue_wait_timeout_seconds,
+        usage_sampling_interval_millis=usage_sampling_interval_millis,
+        task_store_path=task_store_path,
     )
 
 

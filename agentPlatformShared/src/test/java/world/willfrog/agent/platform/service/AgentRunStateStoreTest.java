@@ -42,6 +42,7 @@ class AgentRunStateStoreTest {
         // @Value 字段在直接 new 时不会注入，需手动设 TTL，否则 touch() 会因 ttl<=0 直接返回
         org.springframework.test.util.ReflectionTestUtils.setField(store, "ttlSeconds", 7200L);
         org.springframework.test.util.ReflectionTestUtils.setField(store, "callDetailTtlSeconds", 21600L);
+        org.springframework.test.util.ReflectionTestUtils.setField(store, "callRawContentTtlSeconds", 7200L);
     }
 
     @Test
@@ -71,6 +72,16 @@ class AgentRunStateStoreTest {
 
         verify(valueOperations).set(anyString(), eq(json));
         verify(redisTemplate).expire(anyString(), any(Duration.class));
+    }
+
+    @Test
+    void saveLlmCallRawContent_shouldUseRawTtlAndLongerMarkerTtl() {
+        store.saveLlmCallRawContent("run-1", "llm-1", "{\"httpRequest\":{}}");
+
+        verify(valueOperations).set(eq("agent:run:run-1:detail:llm:llm-1:raw"),
+                eq("{\"httpRequest\":{}}"), eq(Duration.ofSeconds(7200)));
+        verify(valueOperations).set(eq("agent:run:run-1:detail:llm:llm-1:raw:meta"),
+                anyString(), eq(Duration.ofSeconds(21600)));
     }
 
     @Test

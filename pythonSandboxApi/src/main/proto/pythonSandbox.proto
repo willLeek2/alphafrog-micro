@@ -13,12 +13,37 @@ message ExecuteRequest {
   repeated string libraries = 4;
   double timeoutSeconds = 5;
   repeated string datasetIds = 6;
+  // 260623-harness-optimization-02: paths_dataset.csv 内容（run 级编号 → sandbox 路径映射）
+  string pathsDatasetCsv = 7;
+  // 260623-harness-optimization-02: path_manifest.csv 内容（manifest 元信息）
+  string pathManifestCsv = 8;
+  // data-intense P0：资源分类与容量估算，仅增加字段，旧客户端可以不传。
+  string resourceClass = 9;
+  int64 estimatedRows = 10;
+  int64 estimatedBytes = 11;
+  int32 fileCount = 12;
+  int32 capacityUnits = 13;
+  // 幂等身份与由共享 canonical contract 计算的请求指纹。
+  string operationId = 14;
+  string requestFingerprint = 15;
+  int64 memoryLimitBytes = 16;
+  int64 timeoutMillis = 17;
+  string runtimeEnvironmentVersion = 18;
+  // CanonicalSandboxCreateSpec 剩余组件。Sandbox 必须结合 14/9/16/17/18
+  // 按共享 UTF-8 length-prefix 契约重算 requestFingerprint，不得直接信任字段 15。
+  string canonicalSpecSchemaVersion = 19;
+  string codeHash = 20;
+  string immutableDatasetSnapshotDigest = 21;
+  string librariesDigest = 22;
+  string sandboxOptionsDigest = 23;
 }
 
 message ExecuteResponse {
   string taskId = 1;
   string status = 2;
   string error = 3;
+  bool existing = 4;
+  string requestFingerprint = 5;
 }
 
 message GetTaskStatusRequest {
@@ -45,10 +70,48 @@ message TaskResultResponse {
   string stderr = 5;
   string datasetDir = 6;
   string error = 7;
+  SandboxResourceUsage resourceUsage = 8;
+  // Harness-owned terminal classification. Presence is required: missing must
+  // never be interpreted as the proto3 default false by downstream finalizers.
+  optional bool retryable = 9;
+}
+
+message SandboxResourceUsage {
+  string resourceClass = 1;
+  optional int64 cpuMillis = 2;
+  optional int64 memoryPeakBytes = 3;
+  optional int64 memoryByteMillis = 4;
+  optional int64 logicalBytesScanned = 5;
+  optional int64 artifactBytesWritten = 6;
+  optional int64 temporaryBytesWritten = 7;
+  optional int64 queueWaitMillis = 8;
+  optional int64 prepareMillis = 9;
+  optional int64 executionWallMillis = 10;
+  optional int64 cleanupMillis = 11;
+  optional int32 datasetOpenCount = 12;
+  string exitReason = 13;
+  bool oomKilled = 14;
+  bool timedOut = 15;
+  bool attributionComplete = 16;
+  optional int64 samplingIntervalMillis = 17;
+  repeated string missingFields = 18;
+}
+
+message GetTaskByOperationIdRequest {
+  string operationId = 1;
+}
+
+message GetTaskByOperationIdResponse {
+  bool found = 1;
+  string taskId = 2;
+  string status = 3;
+  string requestFingerprint = 4;
+  string error = 5;
 }
 
 service PythonSandboxService {
   rpc createTask(ExecuteRequest) returns (ExecuteResponse);
   rpc getTaskStatus(GetTaskStatusRequest) returns (TaskStatusResponse);
   rpc getTaskResult(GetTaskResultRequest) returns (TaskResultResponse);
+  rpc getTaskByOperationId(GetTaskByOperationIdRequest) returns (GetTaskByOperationIdResponse);
 }

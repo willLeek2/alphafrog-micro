@@ -73,6 +73,19 @@ class SearchEvidenceJudgeModelResolverTest {
         assertTrue(resolved.isEmpty());
     }
 
+    @Test
+    void resolve_shouldFallbackToRunExecutionWhenNoStageConfigAvailable() {
+        AgentContext.setStageConfig(new RunStageConfig());
+        AgentContext.setEffectiveExecutionStageConfig(stage("openrouter", "moonshotai/kimi-k2.6"));
+        AgentContext.setPhase("linear_execution");
+
+        Optional<SearchEvidenceJudgeModelResolver.ResolvedStageModel> resolved = resolver.resolve();
+
+        assertTrue(resolved.isPresent());
+        assertEquals(SearchEvidenceJudgeModelResolver.ModelSource.RUN_EXECUTION, resolved.get().source());
+        assertEquals("moonshotai/kimi-k2.6", resolved.get().config().getModelName());
+    }
+
     private StageLlmConfig stage(String endpoint, String model) {
         StageLlmConfig cfg = new StageLlmConfig();
         cfg.setEndpointName(endpoint);
