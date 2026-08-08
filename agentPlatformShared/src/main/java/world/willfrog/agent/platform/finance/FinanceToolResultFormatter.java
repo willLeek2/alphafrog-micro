@@ -251,6 +251,7 @@ public class FinanceToolResultFormatter {
         if (value == null || value.isBlank()) {
             throw new IllegalArgumentException(label + " is required");
         }
+        rejectMarkerFamily(value, label);
         return value;
     }
 

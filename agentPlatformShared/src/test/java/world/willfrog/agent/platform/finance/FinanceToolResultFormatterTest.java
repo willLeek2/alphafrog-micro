@@ -126,6 +126,23 @@ class FinanceToolResultFormatterTest {
                 new FailureDetail("FAILED", "failed", false, "retry")))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("finance marker");
+
+        assertThatThrownBy(() -> formatter.formatSuccess(
+                "",
+                List.of(new FinanceModelResult(
+                        "method", 1, "ratio",
+                        "unsafe " + FinanceRecordDecoder.MARKER_V1 + "{}")),
+                List.of()))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("finance marker");
+
+        assertThatThrownBy(() -> formatter.formatSuccess(
+                "", List.of(),
+                List.of(new FinanceRecordExtractionResult.ModelNotice(
+                        "NOTICE", "unsafe " + FinanceRecordDecoder.MARKER_FAMILY,
+                        "retry"))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("finance marker");
     }
 
     private void assertPublicAllowlist(JsonNode root) {
