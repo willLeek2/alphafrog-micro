@@ -735,6 +735,85 @@ class PostInstallFailClosedTest(unittest.TestCase):
             cm.exception.execution_environment["environment_id"],
         )
 
+    def _post_install_env(self) -> ExecutionEnvironment:
+        return ExecutionEnvironment(
+            environment_id="sha256:post-install",
+            image_digest="sha256:img-baked",
+            library_set_digest="sha256:libs-post-install",
+            package_apis=[],
+            inventory_complete=True,
+        )
+
+    def _frozen_limits(self) -> dict:
+        return {
+            "recordChannelMaxRecords": 10,
+            "recordChannelMaxBytes": 4096,
+            "stdoutMaxBytes": 4096,
+            "stderrMaxBytes": 4096,
+            "sourceRevision": "test-rev",
+        }
+
+    def _run_wrapper_failure_case(self, wrapper_exc):
+        """install+recollect+push succeed, then the bounded wrapper fails.
+
+        codex 88ff8a41/d48a2275 (#97 owner merge additive): the propagated
+        exception MUST carry the POST-INSTALL execution_environment (the
+        actual container state), not the caller-supplied baked env.
+        Returns the caught exception.
+        """
+        session = self._build_session()
+        config = self._test_config()
+        baked_env = self._baked_env()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir)
+            dataset_dir = data_dir / "ds1"
+            dataset_dir.mkdir()
+            (dataset_dir / "ds1.csv").write_text("x\n1\n", encoding="utf-8")
+            (dataset_dir / "ds1.meta.json").write_text("{}", encoding="utf-8")
+            config = replace(config, data_dir=data_dir)
+
+            with patch(
+                "app.sandbox_runner.collect_runtime_environment",
+                return_value=self._post_install_env(),
+            ), patch(
+                "app.sandbox_runner._run_bounded_wrapper_path",
+                side_effect=wrapper_exc,
+            ):
+                with self.assertRaises(Exception) as cm:
+                    run_in_open_session(
+                        config,
+                        session,
+                        "task-wrapper-post-install-env",
+                        "ds1",
+                        None,
+                        "print('x')",
+                        None,
+                        ["requests"],  # not preinstalled -> install path
+                        5,
+                        effective_output_limits=self._frozen_limits(),
+                        execution_environment=baked_env,
+                    )
+        return cm.exception
+
+    def test_wrapper_raise_after_successful_recollect_prefers_post_install_env(self) -> None:
+        exc = self._run_wrapper_failure_case(RuntimeError("wrapper boom"))
+        self.assertIn("wrapper boom", str(exc))
+        self.assertIsNotNone(getattr(exc, "execution_environment", None))
+        self.assertEqual(
+            "sha256:post-install",
+            exc.execution_environment["environment_id"],
+        )
+
+    def test_wrapper_timeout_after_successful_recollect_prefers_post_install_env(self) -> None:
+        # llm_sandbox is stubbed in this module: SandboxTimeoutError = TimeoutError.
+        exc = self._run_wrapper_failure_case(TimeoutError("wrapper timeout"))
+        self.assertIsNotNone(getattr(exc, "execution_environment", None))
+        self.assertEqual(
+            "sha256:post-install",
+            exc.execution_environment["environment_id"],
+        )
+
     def test_post_install_collect_raises_blocks_run_and_recycles_container(self) -> None:
         """collect_runtime_environment raises → session.run() MUST NOT be called."""
         session = self._build_session()

@@ -161,6 +161,41 @@ class MainIdempotencyTest(unittest.IsolatedAsyncioTestCase):
         self.assertIs(task.retryable, False)
         self.assertIs(task.result.retryable, False)
 
+    async def test_runner_exception_environment_reaches_final_task_result(self) -> None:
+        """codex 529a823f (#97 owner additive): when the runner raises, the
+        typed execution_environment rides the exception attribute (result_dict
+        is empty); the FAILED task.result must surface it presence-aware."""
+        from app.models import ExecutionEnvironment
+
+        task = Task(
+            task_id="task-exception-env",
+            status=TaskStatus.QUEUED,
+            request=ExecuteRequest(dataset_id="dataset-1", code="print(1)"),
+        )
+        runner_exc = RuntimeError("wrapper boom after successful recollect")
+        runner_exc.execution_environment = ExecutionEnvironment(
+            environment_id="sha256:post-install",
+            image_digest="sha256:img-baked",
+            library_set_digest="sha256:libs-post-install",
+            package_apis=[],
+            inventory_complete=True,
+        ).model_dump(mode="json")
+
+        with patch.object(main, "pool", None), patch.object(
+            main, "run_in_sandbox", side_effect=runner_exc
+        ):
+            await main.process_task(task, 1)
+
+        self.assertEqual(task.status, TaskStatus.FAILED)
+        self.assertIsNotNone(task.result.execution_environment)
+        self.assertIsInstance(
+            task.result.execution_environment, ExecutionEnvironment
+        )
+        self.assertEqual(
+            "sha256:post-install",
+            task.result.execution_environment.environment_id,
+        )
+
     async def test_canceled_task_returns_durable_non_retryable_result(self) -> None:
         task = Task(
             task_id="task-canceled",

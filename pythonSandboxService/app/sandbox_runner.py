@@ -1820,15 +1820,19 @@ def run_in_open_session(
             # next task gets a fresh baked container.
             try:
                 t_post_install_start = time.monotonic()
-                post_install_environment = collect_runtime_environment(
+                recollected_environment = collect_runtime_environment(
                     container_id=actual_container_id, session=session,
                 )
                 container_env_path = os.path.join(
                     config.workdir.rstrip("/"), "runtime-environment.json",
                 )
                 write_runtime_environment_to_container(
-                    session, post_install_environment, container_env_path,
+                    session, recollected_environment, container_env_path,
                 )
+                # Only publish AFTER the push succeeded: the exception/HTTP
+                # surface may report the post-install env iff the container
+                # file user code reads actually carries it (codex 88ff8a41).
+                post_install_environment = recollected_environment
                 timings["post_install_recollect_ms"] = int(
                     (time.monotonic() - t_post_install_start) * 1000,
                 )
@@ -1837,7 +1841,7 @@ def run_in_open_session(
                     "installed=%s environment_id=%s baked_environment_id=%s "
                     "container_path=%s elapsed_ms=%s",
                     task_id, install_libraries,
-                    post_install_environment.environment_id,
+                    recollected_environment.environment_id,
                     execution_environment.environment_id
                     if execution_environment is not None else "-",
                     container_env_path,
@@ -1982,13 +1986,21 @@ def run_in_open_session(
     if execution_error is not None:
         setattr(execution_error, "resource_usage", resource_usage.model_dump(mode="json"))
         setattr(execution_error, "timings", timings)
-        # Spec §8 L1019: on the exception path, fall back to the caller-
-        # supplied baked env (post-install collection did not run or failed).
-        if execution_environment is not None:
+        # Spec §8 L1019: on the exception path, prefer the successfully
+        # re-collected post-install env (install+recollect+push succeeded but
+        # the run/wrapper afterwards failed or timed out) so the HTTP failure
+        # still reports the ACTUAL container environmentId; fall back to the
+        # caller-supplied baked env when re-collection did not run or failed.
+        error_environment = (
+            post_install_environment
+            if post_install_environment is not None
+            else execution_environment
+        )
+        if error_environment is not None:
             setattr(
                 execution_error,
                 "execution_environment",
-                execution_environment.model_dump(mode="json"),
+                error_environment.model_dump(mode="json"),
             )
         raise execution_error
 

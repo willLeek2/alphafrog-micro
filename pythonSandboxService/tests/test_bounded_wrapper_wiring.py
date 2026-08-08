@@ -1796,14 +1796,35 @@ class AttachChannelHelperTest(unittest.TestCase):
 
     def test_real_execute_result_attaches_channel_post_merge(self):
         import app.main as main_module
+        from app.models import FinanceRecordChannel
 
         # Owner merge 2026-08-09: D's frozen §5.1 field now exists on the real
         # ExecuteResult, so the validated channel attaches with no model_cls.
         self.assertIn("finance_record_channel", main_module.ExecuteResult.model_fields)
-        channel = {"emitted_record_count": 0}
         result = self._result()
-        updated = main_module._attach_finance_record_channel(result, channel)
-        self.assertEqual(updated.finance_record_channel, channel)
+        updated = main_module._attach_finance_record_channel(
+            result, {"emitted_record_count": 0}
+        )
+        # codex 40f2f2f2: model_copy(update=...) does not validate/coerce, so
+        # the attach helper must validate explicitly — the stored value is a
+        # TYPED FinanceRecordChannel, never a raw dict.
+        self.assertIsInstance(updated.finance_record_channel, FinanceRecordChannel)
+        self.assertEqual(updated.finance_record_channel.emitted_record_count, 0)
+        self.assertTrue(updated.finance_record_channel.record_set_complete)
+
+    def test_real_execute_result_malformed_channel_fail_closed(self):
+        import app.main as main_module
+
+        # codex 40f2f2f2: malformed channel payloads MUST raise against D's
+        # frozen DTO instead of bypassing it as an unvalidated raw dict.
+        result = self._result()
+        with self.assertRaises(Exception) as cm:
+            main_module._attach_finance_record_channel(
+                result, {"emitted_record_count": "not-an-int"}
+            )
+        self.assertIn("emitted_record_count", str(cm.exception))
+        # Original result untouched.
+        self.assertIsNone(result.finance_record_channel)
 
     def test_present_field_attaches_channel(self):
         import app.main as main_module

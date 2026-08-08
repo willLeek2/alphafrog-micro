@@ -21,6 +21,7 @@ from .models import (
     ExecuteRequest,
     ExecuteResult,
     ExecutionEnvironment,
+    FinanceRecordChannel,
     OperationLookupResponse,
     SandboxResourceUsage,
     Task,
@@ -122,13 +123,22 @@ def _attach_finance_record_channel(result: ExecuteResult, channel, model_cls=Non
     VALIDATED channel is simply not attached, keeping the C write path
     tolerant of the field's absence.  Once D's field exists on ExecuteResult
     this attaches without any further change here.
+
+    Real-DTO branch (model_cls=None): ``model_copy(update=...)`` does NOT
+    validate/coerce, so the channel is explicitly validated against D's frozen
+    ``FinanceRecordChannel`` first — a malformed payload raises (fail-closed)
+    instead of bypassing the DTO as a raw dict.
     """
     if channel is None:
         return result
     cls = model_cls if model_cls is not None else ExecuteResult
     if "finance_record_channel" not in getattr(cls, "model_fields", {}):
         return result
+    if model_cls is None:
+        channel = FinanceRecordChannel.model_validate(channel)
     return result.model_copy(update={"finance_record_channel": channel})
+
+
 def _safe_parse_execution_environment(payload):
     """260808-finance-methodspec-v5 work package D: best-effort parse.
 
@@ -320,8 +330,14 @@ async def process_task(task: Task, worker_id: int):
             # may be missing or partially populated if the exception happened
             # before/around runtime_environment collection. _safe_parse handles
             # both cases; None propagates as proto parent absence.
+            # codex 529a823f (#97 owner additive): when the runner raised, the
+            # environment rides the EXCEPTION attribute (baked, or post-install
+            # once install+recollect+push all succeeded) while result_dict is
+            # still empty — the attribute wins; result_dict is only a fallback.
             execution_environment=_safe_parse_execution_environment(
-                result_dict.get("execution_environment"),
+                getattr(e, "execution_environment", None)
+                if getattr(e, "execution_environment", None) is not None
+                else result_dict.get("execution_environment"),
             ),
         )
     finally:
