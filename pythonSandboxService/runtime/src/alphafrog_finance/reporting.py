@@ -58,12 +58,15 @@ def _runtime_environment_path() -> str:
 
 
 def _environment_id() -> str:
-    """Read ``environmentId`` from the read-only task environment file.
+    """Read the environment id from the read-only task environment file.
 
-    Raises RuntimeError when the file is missing/unreadable or lacks the
-    field: the sandbox must always provide it (single source of truth,
-    work package D), and emitting a record without environmentId would only
-    produce a schema-invalid record downstream.
+    The file key is snake_case ``environment_id`` (work package D's
+    ExecutionEnvironment schema); it is emitted as the camelCase record
+    field ``environmentId``. Raises RuntimeError when the file is
+    missing/unreadable or lacks the field: the sandbox must always provide
+    it (single source of truth, work package D), and emitting a record
+    without environmentId would only produce a schema-invalid record
+    downstream.
     """
     path = _runtime_environment_path()
     try:
@@ -73,10 +76,13 @@ def _environment_id() -> str:
         raise RuntimeError(
             f"cannot read runtime environment file {path!r}: {exc}"
         ) from None
-    environment_id = data.get("environmentId") if isinstance(data, dict) else None
+    # The file is written by work package D's runtime_environment.py
+    # (single-source ExecutionEnvironment.model_dump()), which uses
+    # snake_case keys; the emitted record field is camelCase environmentId.
+    environment_id = data.get("environment_id") if isinstance(data, dict) else None
     if not isinstance(environment_id, str) or not environment_id:
         raise RuntimeError(
-            f"runtime environment file {path!r} lacks a usable environmentId"
+            f"runtime environment file {path!r} lacks a usable environment_id"
         )
     return environment_id
 

@@ -51,8 +51,10 @@ class ReportingTestBase(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.mkdtemp(prefix="af-reporting-test-")
         self._env_file = os.path.join(self._tmp, "runtime-environment.json")
+        # D's runtime_environment.py writes ExecutionEnvironment.model_dump():
+        # snake_case keys (environment_id), camelCase only in emitted records.
         with open(self._env_file, "w", encoding="utf-8") as fh:
-            json.dump({"environmentId": _ENV_ID}, fh)
+            json.dump({"environment_id": _ENV_ID}, fh)
         self._old_env = os.environ.get(reporting._RUNTIME_ENV_VAR)
         os.environ[reporting._RUNTIME_ENV_VAR] = self._env_file
         self._old_specs = reporting._METHOD_SPECS_CACHE
@@ -303,7 +305,7 @@ class TestEnvironmentIdSource(ReportingTestBase):
     def test_env_file_without_environment_id_raises_runtime_error(self):
         with open(self._env_file, "w", encoding="utf-8") as fh:
             json.dump({"other": 1}, fh)
-        with self.assertRaisesRegex(RuntimeError, "environmentId"):
+        with self.assertRaisesRegex(RuntimeError, "environment_id"):
             report(self.cagr_result())
 
 
