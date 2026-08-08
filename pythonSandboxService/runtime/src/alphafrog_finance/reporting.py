@@ -26,8 +26,10 @@ Field rules (contract §4.3, frozen at CONTRACT_BASE_SHA 7c695371):
   * ``environmentId`` comes from the read-only task environment file written
     by the single source of truth ``runtime_environment.py`` (work package D);
   * no legacy field names (adviceId/adviceDurable etc., contract §4.1);
-  * serialization is UTF-8 with compact separators (ensure_ascii=False), which
-    keeps payload bytes — and therefore rawDigest/recordDigest — deterministic.
+  * serialization is UTF-8 with compact separators (ensure_ascii=False) and
+    allow_nan=False, which keeps payload bytes — and therefore rawDigest/
+    recordDigest — deterministic and fails CLOSED (ValueError, nothing
+    emitted) on any NaN/±Infinity smuggled into an open payload;
 """
 from __future__ import annotations
 
@@ -177,8 +179,24 @@ def _method_specs() -> Mapping[str, Mapping[str, Any]]:
 
 
 def _encode_record(fields: Sequence[Tuple[str, Any]]) -> str:
-    """MARKER + compact single-line JSON preserving the given field order."""
-    payload = json.dumps(dict(fields), ensure_ascii=False, separators=(",", ":"))
+    """MARKER + compact single-line JSON preserving the given field order.
+
+    The encoder runs with ``allow_nan=False`` (codex must-fix bfcfebec):
+    ``parameters`` is an OPEN object, so a caller-supplied ``NaN``/``±Infinity``
+    would otherwise be printed as the bare tokens ``NaN``/``Infinity`` — not
+    valid JSON, and one such record makes the Java consumer reject the WHOLE
+    batch (contract §7 step 6, §9 failure matrix). With ``allow_nan=False``,
+    ``json.dumps`` raises ValueError BEFORE any bytes are produced, and since
+    ``_emit`` prints only the fully-encoded line, the ValueError propagates
+    with stdout completely empty (no partial marker). This is the pre-emit
+    guarantee: the library never emits a record E/Java would reject.
+    """
+    payload = json.dumps(
+        dict(fields),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
     return MARKER + payload
 
 

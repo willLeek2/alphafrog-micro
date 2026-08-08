@@ -923,5 +923,118 @@ class TestGeneratedBindingDriftGuard(ReportingTestBase):
                 self.assert_rejects(lambda: report(self.cagr_result()))
 
 
+class TestNonFinitePayloadFailClosed(ReportingTestBase):
+    """B must-fix 3 (codex bfcfebec): ``parameters`` is an OPEN object, so a
+    caller-supplied NaN/±Infinity used to be emitted as the bare tokens
+    ``NaN``/``Infinity`` — not valid JSON, and the Java consumer rejects the
+    whole batch (contract §7 step 6, §9 failure matrix). The marker encoder
+    now runs with ``allow_nan=False``: ``json.dumps`` raises ValueError
+    BEFORE any bytes are produced and ``_emit`` prints only the fully-encoded
+    line, so the ValueError propagates with stdout COMPLETELY empty (no
+    partial marker) — the pre-emit invariant that the library never emits a
+    record E/Java would reject."""
+
+    def assert_emits(self, fn):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            fn()
+        self.assertNotEqual(buf.getvalue(), "")
+
+    def assert_rejects(self, fn):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with self.assertRaises(ValueError):
+                fn()
+        # Fail closed = stdout stays COMPLETELY empty, not even a partial
+        # marker prefix.
+        self.assertEqual(buf.getvalue(), "")
+
+    def _custom(self, **overrides):
+        kwargs = {
+            "formula_description": "f(x)",
+            "input_refs": [],
+            "output_unit": "ratio",
+        }
+        kwargs.update(overrides)
+        return lambda: report_custom(1.0, **kwargs)
+
+    def test_custom_nan_and_infinities_in_parameters_rejected(self):
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=bad):
+                self.assert_rejects(self._custom(parameters={"x": bad}))
+
+    def test_custom_encoder_error_message_pins_allow_nan_false(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with self.assertRaisesRegex(ValueError, "not JSON compliant"):
+                report_custom(
+                    1.0,
+                    formula_description="f(x)",
+                    input_refs=[],
+                    output_unit="ratio",
+                    parameters={"x": float("nan")},
+                )
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_custom_nested_non_finite_payloads_rejected(self):
+        nested_cases = (
+            {"outer": {"inner": float("nan")}},
+            {"outer": {"inner": float("inf")}},
+            {"outer": {"inner": float("-inf")}},
+            {"series": [1.0, float("nan"), 2.0]},
+            {"deep": {"list": [{"k": float("-inf")}]}},
+        )
+        for params in nested_cases:
+            with self.subTest(parameters=repr(params)):
+                self.assert_rejects(self._custom(parameters=params))
+
+    def test_report_path_non_finite_parameters_rejected(self):
+        # report() accepts the OPEN parameters mapping through the
+        # FinanceMetricResult, so the same fail-closed guard must hold there.
+        result = self.cagr_result()
+        cls = type(result)
+        bad_params = (
+            {"x": float("nan")},
+            {"x": float("inf")},
+            {"x": float("-inf")},
+            {"outer": {"inner": float("nan")}},
+            {"series": [0.1, float("nan")]},
+        )
+        for params in bad_params:
+            with self.subTest(parameters=repr(params)):
+                bad = cls(
+                    method_id=result.method_id,
+                    value=result.value,
+                    unit=result.unit,
+                    parameters=params,
+                )
+                self.assert_rejects(lambda r=bad: report(r))
+
+    def test_normal_open_json_parameters_still_emit(self):
+        # Positive pin: every ordinary JSON type (str, int, float, bool, None,
+        # nested dicts/lists, non-ASCII) keeps emitting normally.
+        params = {
+            "label": "回撤窗口",
+            "count": 37,
+            "threshold": 0.8,
+            "negative": -1.25,
+            "flagOn": True,
+            "flagOff": False,
+            "missing": None,
+            "nested": {"inner": 1.5, "list": [1, 2.5, "x", None, True]},
+        }
+        line, stdout = self.capture_report_custom(
+            1.0,
+            formula_description="f(x)",
+            input_refs=[],
+            output_unit="ratio",
+            parameters=params,
+        )
+        self.assertEqual(stdout, line + "\n")
+        self.assertEqual(json.loads(_payload_of(line))["parameters"], params)
+        # Library path: the canonical finite metric parameters keep emitting.
+        self.assert_emits(lambda: report(self.cagr_result()))
+
+
 if __name__ == "__main__":
     unittest.main()
