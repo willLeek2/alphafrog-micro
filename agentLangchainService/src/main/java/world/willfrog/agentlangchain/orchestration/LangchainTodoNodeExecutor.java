@@ -182,6 +182,13 @@ public class LangchainTodoNodeExecutor {
      */
     private final world.willfrog.agent.platform.service.AgentRunStateStore stateStore;
 
+    /**
+     * 金融结果块组合器（Spec §11）。{@link #writeFinalAnswer} 在模型生成块外说明后调用它：
+     * 按 runId 查询 renderable 金融记录，追加服务端渲染的确定性三列 Markdown 结果块并写耐久事件；
+     * 无记录或失败时原样返回模型文本。
+     */
+    private final world.willfrog.agentlangchain.finance.FinanceResultComposer financeResultComposer;
+
 
     /**
      * 执行单个 DAG todo 节点：构建 user message → 启动 LC4j tool loop → 收集结果。
@@ -647,11 +654,15 @@ public class LangchainTodoNodeExecutor {
         // 生成最终答案前也要检查 run 是否已被取消——避免用户在最后一步点了 cancel 但请求仍发出
         ensureRunnable(request);
         // buildFinalAnswerAiService 不注入 toolProvider → 纯文本生成，不会触发工具调用
-        return buildFinalAnswerAiService(request)
+        String modelText = buildFinalAnswerAiService(request)
                 .answer(LangchainTodoUserMessageBuilder.buildFinalUserMessage(
                         promptService,
                         request.getUserGoal(),
                         completedTodos));
+        // Spec §11：模型块外说明之后，服务端按 runId 查询可投影金融记录并追加确定性三列结果块；
+        // 无记录或组合失败时 composer 原样返回模型文本，普通任务仍成功。
+        return financeResultComposer.appendFinanceResultBlock(
+                request.getRunId(), request.getUserId(), modelText);
     }
 
     /**

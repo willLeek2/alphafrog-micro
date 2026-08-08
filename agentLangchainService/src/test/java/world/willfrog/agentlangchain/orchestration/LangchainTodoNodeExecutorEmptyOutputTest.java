@@ -150,7 +150,8 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
                 "{\"summary\":{\"llmCalls\":8,\"toolCalls\":0,\"totalTokens\":100,\"startedAtMillis\":0}}"));
         ObjectProvider<dev.langchain4j.service.tool.ToolProvider> provider = emptyToolProvider();
         LangchainTodoNodeExecutor executor = new LangchainTodoNodeExecutor(
-                LangchainTestFixtures.promptService(), provider, noopExecutionGuard(), budget, stateStore);
+                LangchainTestFixtures.promptService(), provider, noopExecutionGuard(), budget, stateStore,
+                LangchainTestFixtures.noopFinanceResultComposer());
 
         QueueChatModel model = new QueueChatModel("   ");
         LangchainLinearWorkflowRequest request = baseRequest(model);
@@ -178,7 +179,8 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
                 "{\"summary\":{\"llmCalls\":2,\"toolCalls\":0,\"totalTokens\":100,\"startedAtMillis\":0}}"));
         ObjectProvider<dev.langchain4j.service.tool.ToolProvider> provider = emptyToolProvider();
         LangchainTodoNodeExecutor executor = new LangchainTodoNodeExecutor(
-                LangchainTestFixtures.promptService(), provider, noopExecutionGuard(), budget, stateStore);
+                LangchainTestFixtures.promptService(), provider, noopExecutionGuard(), budget, stateStore,
+                LangchainTestFixtures.noopFinanceResultComposer());
 
         QueueChatModel model = new QueueChatModel("   ", "RECOVERED");
         LangchainLinearWorkflowRequest request = baseRequest(model);
@@ -207,7 +209,8 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
                 "{\"summary\":{\"llmCalls\":40,\"toolCalls\":0,\"totalTokens\":240000,\"startedAtMillis\":0}}"));
         ObjectProvider<dev.langchain4j.service.tool.ToolProvider> provider = emptyToolProvider();
         LangchainTodoNodeExecutor executor = new LangchainTodoNodeExecutor(
-                LangchainTestFixtures.promptService(), provider, noopExecutionGuard(), budget, stateStore);
+                LangchainTestFixtures.promptService(), provider, noopExecutionGuard(), budget, stateStore,
+                LangchainTestFixtures.noopFinanceResultComposer());
 
         QueueChatModel model = new QueueChatModel("   ");
         LangchainLinearWorkflowRequest request = baseRequest(model);
@@ -237,7 +240,8 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
                 "{\"summary\":{\"llmCalls\":0,\"toolCalls\":30,\"totalTokens\":0,\"startedAtMillis\":0}}"));
         ObjectProvider<dev.langchain4j.service.tool.ToolProvider> provider = emptyToolProvider();
         LangchainTodoNodeExecutor executor = new LangchainTodoNodeExecutor(
-                LangchainTestFixtures.promptService(), provider, noopExecutionGuard(), budget, stateStore);
+                LangchainTestFixtures.promptService(), provider, noopExecutionGuard(), budget, stateStore,
+                LangchainTestFixtures.noopFinanceResultComposer());
 
         QueueChatModel model = new QueueChatModel("   ");
         LangchainLinearWorkflowRequest request = baseRequest(model);

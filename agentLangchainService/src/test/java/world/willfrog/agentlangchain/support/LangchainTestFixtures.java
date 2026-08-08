@@ -76,7 +76,7 @@ public final class LangchainTestFixtures {
                 return null;
             }
         };
-        return new LangchainTodoNodeExecutor(promptService(), provider, noopExecutionGuard(), noopBudgetService(), noopStateStore());
+        return new LangchainTodoNodeExecutor(promptService(), provider, noopExecutionGuard(), noopBudgetService(), noopStateStore(), noopFinanceResultComposer());
     }
 
     public static LangchainTodoNodeExecutor todoNodeExecutor(Optional<dev.langchain4j.service.tool.ToolProvider> toolProvider) {
@@ -101,7 +101,7 @@ public final class LangchainTestFixtures {
                 return toolProvider.orElse(null);
             }
         };
-        return new LangchainTodoNodeExecutor(promptService(), provider, noopExecutionGuard(), noopBudgetService(), noopStateStore());
+        return new LangchainTodoNodeExecutor(promptService(), provider, noopExecutionGuard(), noopBudgetService(), noopStateStore(), noopFinanceResultComposer());
     }
 
     /**
@@ -112,6 +112,17 @@ public final class LangchainTestFixtures {
         world.willfrog.agent.platform.service.AgentRunBudgetService.EffectiveRunBudget empty = new world.willfrog.agent.platform.service.AgentRunBudgetService.EffectiveRunBudget(0L, 0, 0, 0, 0);
         when(budget.effectiveConfig()).thenReturn(empty);
         return budget;
+    }
+
+    /**
+     * 默认 no-op 金融结果块组合器：原样返回模型文本（不写事件、不查记录）。
+     * 需要真实块行为的测试应自行构造 composer 并直接 new executor。
+     */
+    public static world.willfrog.agentlangchain.finance.FinanceResultComposer noopFinanceResultComposer() {
+        world.willfrog.agentlangchain.finance.FinanceResultComposer composer =
+                mock(world.willfrog.agentlangchain.finance.FinanceResultComposer.class);
+        when(composer.appendFinanceResultBlock(any(), any(), any())).thenAnswer(invocation -> invocation.getArgument(2));
+        return composer;
     }
 
     /**
