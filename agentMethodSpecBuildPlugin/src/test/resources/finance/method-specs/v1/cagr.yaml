@@ -1,0 +1,39 @@
+schemaVersion: "1"
+methodId: finance.growth.cagr
+version: 1.0.0
+displayName: 复合年均增长率
+definition: 从起始值到结束值、按给定期数换算的平滑年均增长率
+resolverHints:
+  aliases: [复合增长率, CAGR, 年复合增长率]
+  commonPhrases: [这段时间平均每期涨多少, 换成可比较的复合增长速度]
+  clarificationDimensions:
+    - id: rangeBoundary
+      question: 希望从哪个日期或交易日算到哪个日期或交易日
+    - id: intervalConvention
+      question: 区间长度按自然年、月、交易日还是其他频率换算
+parameters:
+  beginningValue:
+    type: number
+    required: true
+    meaning: 明确起点对应的数值
+  endingValue:
+    type: number
+    required: true
+    meaning: 明确终点对应的数值
+  periods:
+    type: integer
+    required: true
+    minimum: 1
+    meaning: 按方法约定换算的实际区间长度
+conventions:
+  finance.growth:
+    periodMeaning: 起止时点之间的期间数
+    calculationExpression: (endingValue / beginningValue) ** (1 / periods) - 1
+outputs:
+  - {name: cagr, unit: ratio, description: 复合年均增长率}
+libraryBinding:
+  package: alphafrog_finance
+  function: cagr
+  apiCompatRange: ">=1.0.0,<2.0.0"
+sourceRefs:
+  - method-knowledge:finance.growth.cagr@1.0.0

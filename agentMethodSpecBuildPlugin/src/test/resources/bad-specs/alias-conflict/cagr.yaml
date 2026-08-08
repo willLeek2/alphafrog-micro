@@ -1,0 +1,11 @@
+schemaVersion: "1"
+methodId: finance.growth.cagr
+version: 1.0.0
+displayName: 复合年均增长率
+definition: 从起始值到结束值、按给定期数换算的平滑年均增长率
+resolverHints:
+  aliases: [共享别名]
+parameters:
+  beginningValue: {type: number, required: true}
+outputs:
+  - {name: cagr, unit: ratio, description: 复合年均增长率}
