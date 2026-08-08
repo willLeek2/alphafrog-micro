@@ -61,6 +61,19 @@ class FinanceRecordDecoderFixtureTest {
     }
 
     @Test
+    void embeddedOrIndentedMarkerFamilyIsAuditedAndNeverLeaksAsOrdinaryStdout() {
+        FinanceRecordDecoder.DecodedBatch decoded = decoder.decode(
+                "before\n  __AF_FINANCE_RESULT_v1__{\"value\":1}\n"
+                        + "prefix __AF_FINANCE_RESULT_v2__{\"value\":2}\nafter\n");
+
+        assertThat(decoded.ordinaryStdout()).isEqualTo("before\nafter\n");
+        assertThat(decoded.records()).hasSize(2).allSatisfy(record -> {
+            assertThat(record.knownVersion()).isFalse();
+            assertThat(record.decodeError()).isEqualTo("MARKER_NOT_AT_LINE_START");
+        });
+    }
+
+    @Test
     void emptyBatchUsesSha256OfEmptyBytes() {
         FinanceRecordDecoder.DecodedBatch decoded = decoder.decode("ordinary");
 

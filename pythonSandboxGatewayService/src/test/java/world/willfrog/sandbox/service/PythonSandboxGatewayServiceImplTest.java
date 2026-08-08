@@ -9,8 +9,11 @@ import org.springframework.test.web.client.MockRestServiceServer;
 import org.springframework.web.client.RestTemplate;
 import world.willfrog.alphafrogmicro.sandbox.idl.ExecuteRequest;
 import world.willfrog.alphafrogmicro.sandbox.idl.ExecuteResponse;
+import world.willfrog.alphafrogmicro.sandbox.idl.FinanceRecordChannelMetadata;
 import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskByOperationIdRequest;
 import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskByOperationIdResponse;
+import world.willfrog.alphafrogmicro.sandbox.idl.SandboxEnvironmentIdentity;
+import world.willfrog.alphafrogmicro.sandbox.idl.SandboxPackageApi;
 import world.willfrog.alphafrogmicro.sandbox.idl.TaskResultResponse;
 
 import java.util.Map;
@@ -408,5 +411,180 @@ class PythonSandboxGatewayServiceImplTest {
         assertEquals(10L, fields.get("env_load_ms"));
         assertEquals(20L, fields.get("code_exec_ms"));
         assertEquals(4L, fields.get("artifact_collect_ms"));
+    }
+
+    // 260808-finance-methodspec-v5 work package D: parent absence on HTTP must
+    // translate to no parent set on proto. Downstream consumers then see
+    // hasFinanceRecordChannel() == false and hasExecutionEnvironment() == false,
+    // which is the v5 signal for "old producer, do not interpret defaults".
+    @Test
+    void getTaskResultShouldDistinguishOldProducerByParentAbsence() {
+        RestTemplate restTemplate = new RestTemplate();
+        MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
+        PythonSandboxGatewayServiceImpl gateway =
+                new PythonSandboxGatewayServiceImpl(restTemplate, new ObjectMapper());
+        ReflectionTestUtils.setField(gateway, "sandboxUrl", "http://sandbox");
+
+        server.expect(once(), requestTo("http://sandbox/tasks/task-old"))
+                .andRespond(withSuccess(
+                        "{\"task_id\":\"task-old\",\"status\":\"SUCCEEDED\"}",
+                        MediaType.APPLICATION_JSON));
+        // HTTP body without finance_record_channel and execution_environment keys.
+        server.expect(once(), requestTo("http://sandbox/tasks/task-old/result"))
+                .andRespond(withSuccess("""
+                        {
+                          "exit_code": 0,
+                          "stdout": "ok",
+                          "stderr": "",
+                          "dataset_dir": "/tmp/ds",
+                          "retryable": false,
+                          "resource_usage": {
+                            "resource_class": "STANDARD",
+                            "attribution_complete": true
+                          }
+                        }
+                        """, MediaType.APPLICATION_JSON));
+
+        TaskResultResponse response = gateway.getTaskResult(
+                world.willfrog.alphafrogmicro.sandbox.idl.GetTaskResultRequest.newBuilder()
+                        .setTaskId("task-old").build());
+
+        server.verify();
+        assertFalse(response.hasFinanceRecordChannel(),
+                "parent absence on HTTP must NOT set FinanceRecordChannel on proto");
+        assertFalse(response.hasExecutionEnvironment(),
+                "parent absence on HTTP must NOT set ExecutionEnvironment on proto");
+    }
+
+    // 260808-finance-methodspec-v5 work package D: both parents present on HTTP
+    // must surface on proto with all mapped fields. packageApis list must be
+    // carried through as a repeated SandboxPackageApi snapshot, with no
+    // runtimeImageRef leaking from the Python-internal layer.
+    @Test
+    void getTaskResultShouldBridgeFinanceRecordChannelAndExecutionEnvironment() {
+        RestTemplate restTemplate = new RestTemplate();
+        MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
+        PythonSandboxGatewayServiceImpl gateway =
+                new PythonSandboxGatewayServiceImpl(restTemplate, new ObjectMapper());
+        ReflectionTestUtils.setField(gateway, "sandboxUrl", "http://sandbox");
+
+        server.expect(once(), requestTo("http://sandbox/tasks/task-v5"))
+                .andRespond(withSuccess(
+                        "{\"task_id\":\"task-v5\",\"status\":\"SUCCEEDED\"}",
+                        MediaType.APPLICATION_JSON));
+        server.expect(once(), requestTo("http://sandbox/tasks/task-v5/result"))
+                .andRespond(withSuccess("""
+                        {
+                          "exit_code": 0,
+                          "stdout": "ok",
+                          "stderr": "",
+                          "dataset_dir": "/tmp/ds",
+                          "retryable": false,
+                          "resource_usage": {"resource_class":"STANDARD","attribution_complete":true},
+                          "finance_record_channel": {
+                            "emitted_record_count": 1,
+                            "emitted_record_bytes": 401,
+                            "record_set_complete": true,
+                            "drop_reason": "",
+                            "record_digest": "eb4382d97e74ff45f9b2a28d967f44af2f083404ac535287e70bc1d9e36a8a20",
+                            "stdout_truncated": false,
+                            "stderr_truncated": false
+                          },
+                          "execution_environment": {
+                            "environment_id": "sha256:actual-runtime-example",
+                            "image_digest": "sha256:image-example",
+                            "library_set_digest": "sha256:library-set-example",
+                            "inventory_complete": true,
+                            "package_apis": [
+                              {
+                                "name": "alphafrog_finance",
+                                "version": "1.0.3",
+                                "api_version": "1.0"
+                              }
+                            ]
+                          }
+                        }
+                        """, MediaType.APPLICATION_JSON));
+
+        TaskResultResponse response = gateway.getTaskResult(
+                world.willfrog.alphafrogmicro.sandbox.idl.GetTaskResultRequest.newBuilder()
+                        .setTaskId("task-v5").build());
+
+        server.verify();
+        assertTrue(response.hasFinanceRecordChannel());
+        FinanceRecordChannelMetadata finance = response.getFinanceRecordChannel();
+        assertEquals(1, finance.getEmittedRecordCount());
+        assertEquals(401L, finance.getEmittedRecordBytes());
+        assertTrue(finance.getRecordSetComplete());
+        assertEquals("", finance.getDropReason());
+        assertEquals("eb4382d97e74ff45f9b2a28d967f44af2f083404ac535287e70bc1d9e36a8a20",
+                finance.getRecordDigest());
+        assertFalse(finance.getStdoutTruncated());
+        assertFalse(finance.getStderrTruncated());
+
+        assertTrue(response.hasExecutionEnvironment());
+        SandboxEnvironmentIdentity env = response.getExecutionEnvironment();
+        assertEquals("sha256:actual-runtime-example", env.getEnvironmentId());
+        assertEquals("sha256:image-example", env.getImageDigest());
+        assertEquals("sha256:library-set-example", env.getLibrarySetDigest());
+        assertTrue(env.getInventoryComplete());
+        assertEquals(1, env.getPackageApisCount());
+        SandboxPackageApi pkg = env.getPackageApis(0);
+        assertEquals("alphafrog_finance", pkg.getName());
+        assertEquals("1.0.3", pkg.getVersion());
+        assertEquals("1.0", pkg.getApiVersion());
+    }
+
+    // 260808-finance-methodspec-v5 work package D: parent present with all
+    // default-valued fields is "v5 enabled, empty batch". This is the contract
+    // for sandbox runs that emit no __AF_FINANCE_RESULT_v1__ markers. Parent
+    // must still be set so downstream sees hasFinanceRecordChannel() == true;
+    // internal field defaults use proto3 zero values.
+    @Test
+    void getTaskResultShouldBridgeEmptyFinanceRecordChannelBatch() {
+        RestTemplate restTemplate = new RestTemplate();
+        MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
+        PythonSandboxGatewayServiceImpl gateway =
+                new PythonSandboxGatewayServiceImpl(restTemplate, new ObjectMapper());
+        ReflectionTestUtils.setField(gateway, "sandboxUrl", "http://sandbox");
+
+        server.expect(once(), requestTo("http://sandbox/tasks/task-empty"))
+                .andRespond(withSuccess(
+                        "{\"task_id\":\"task-empty\",\"status\":\"SUCCEEDED\"}",
+                        MediaType.APPLICATION_JSON));
+        server.expect(once(), requestTo("http://sandbox/tasks/task-empty/result"))
+                .andRespond(withSuccess("""
+                        {
+                          "exit_code": 0,
+                          "stdout": "no markers here",
+                          "stderr": "",
+                          "dataset_dir": "/tmp/ds",
+                          "retryable": false,
+                          "finance_record_channel": {
+                            "emitted_record_count": 0,
+                            "emitted_record_bytes": 0,
+                            "record_set_complete": true,
+                            "drop_reason": "",
+                            "record_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                            "stdout_truncated": false,
+                            "stderr_truncated": false
+                          }
+                        }
+                        """, MediaType.APPLICATION_JSON));
+
+        TaskResultResponse response = gateway.getTaskResult(
+                world.willfrog.alphafrogmicro.sandbox.idl.GetTaskResultRequest.newBuilder()
+                        .setTaskId("task-empty").build());
+
+        server.verify();
+        assertTrue(response.hasFinanceRecordChannel(),
+                "parent present with empty batch must still be set on proto");
+        FinanceRecordChannelMetadata finance = response.getFinanceRecordChannel();
+        assertEquals(0, finance.getEmittedRecordCount());
+        assertEquals(0L, finance.getEmittedRecordBytes());
+        assertTrue(finance.getRecordSetComplete());
+        assertEquals("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                finance.getRecordDigest());
+        assertFalse(response.hasExecutionEnvironment());
     }
 }

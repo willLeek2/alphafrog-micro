@@ -41,16 +41,18 @@ public class FinanceRecordDecoder {
             if (line.endsWith("\r")) {
                 line = line.substring(0, line.length() - 1);
             }
-            if (!line.startsWith(MARKER_FAMILY)) {
+            int markerIndex = line.indexOf(MARKER_FAMILY);
+            if (markerIndex < 0) {
                 ordinaryLines.add(line);
                 continue;
             }
 
             int recordIndex = records.size();
-            boolean knownVersion = line.startsWith(MARKER_V1);
+            boolean framedAtLineStart = markerIndex == 0;
+            boolean knownVersion = framedAtLineStart && line.startsWith(MARKER_V1);
             String rawPayload = knownVersion
                     ? line.substring(MARKER_V1.length())
-                    : line.substring(MARKER_FAMILY.length());
+                    : line.substring(markerIndex + MARKER_FAMILY.length());
             byte[] rawBytes = rawPayload.getBytes(StandardCharsets.UTF_8);
             totalBytes = Math.addExact(totalBytes, rawBytes.length);
             digestInput.writeBytes(ByteBuffer.allocate(Integer.BYTES).putInt(rawBytes.length).array());
@@ -58,7 +60,9 @@ public class FinanceRecordDecoder {
 
             JsonNode node = null;
             String decodeError = null;
-            if (!knownVersion) {
+            if (!framedAtLineStart) {
+                decodeError = "MARKER_NOT_AT_LINE_START";
+            } else if (!knownVersion) {
                 decodeError = "UNSUPPORTED_MARKER_VERSION";
             } else {
                 try {

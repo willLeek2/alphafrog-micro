@@ -19,6 +19,7 @@ class FinanceMethodResolutionPersisterTest {
     @Test
     void computesContentDigestAndAcceptsExactReplay() {
         FinanceMethodResolution row = resolution("reason-a");
+        row.setResolutionContentDigest("caller-controlled-digest");
         when(mapper.insertIgnore(row)).thenReturn(1, 0);
         when(mapper.findExact("run-1", "resolver-1", "finance.growth.cagr", "1.0.0", "sha256:spec"))
                 .thenReturn(row);
@@ -27,9 +28,42 @@ class FinanceMethodResolutionPersisterTest {
         String digest = row.getResolutionContentDigest();
         persister.persistBatch(List.of(row));
 
-        assertThat(digest).hasSize(64);
+        assertThat(digest).hasSize(64).isNotEqualTo("caller-controlled-digest");
         assertThat(row.getResolutionContentDigest()).isEqualTo(digest);
         verify(mapper, times(2)).insertIgnore(row);
+    }
+
+    @Test
+    void canonicalJsonOrderingDoesNotCreateAReplayConflict() {
+        FinanceMethodResolution first = resolution("reason-a");
+        FinanceMethodResolution replay = resolution("reason-a");
+        first.setModelRouteJson("{\"provider\":\"openrouter\",\"model\":\"light\"}");
+        replay.setModelRouteJson("{\"model\":\"light\",\"provider\":\"openrouter\"}");
+        when(mapper.insertIgnore(first)).thenReturn(1);
+        when(mapper.insertIgnore(replay)).thenReturn(0);
+        when(mapper.findExact(
+                "run-1", "resolver-1", "finance.growth.cagr", "1.0.0", "sha256:spec"))
+                .thenReturn(first);
+
+        persister.persistBatch(List.of(first));
+        persister.persistBatch(List.of(replay));
+
+        assertThat(replay.getResolutionContentDigest())
+                .isEqualTo(first.getResolutionContentDigest());
+    }
+
+    @Test
+    void identityFieldsAreTrimmedBeforeInsertAndDigest() {
+        FinanceMethodResolution row = resolution(" reason-a ");
+        row.setRunId(" run-1 ");
+        row.setResolverToolCallId(" resolver-1 ");
+        when(mapper.insertIgnore(row)).thenReturn(1);
+
+        persister.persistBatch(List.of(row));
+
+        assertThat(row.getRunId()).isEqualTo("run-1");
+        assertThat(row.getResolverToolCallId()).isEqualTo("resolver-1");
+        assertThat(row.getMatchReason()).isEqualTo("reason-a");
     }
 
     @Test

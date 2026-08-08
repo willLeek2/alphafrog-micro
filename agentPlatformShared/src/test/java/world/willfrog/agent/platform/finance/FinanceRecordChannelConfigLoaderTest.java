@@ -9,6 +9,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class FinanceRecordChannelConfigLoaderTest {
     private final ObjectMapper objectMapper = new ObjectMapper();
@@ -64,8 +65,34 @@ class FinanceRecordChannelConfigLoaderTest {
         JsonNode root = objectMapper.readTree(frozen);
         assertThat(root.path("effectiveFinanceRecordConfig").path("targetEnvironmentId").asText())
                 .isEqualTo("sha256:target");
-        assertThat(root.toString()).doesNotContain("imageDigest", "packageApis", "librarySetDigest");
+        assertThat(root.path("targetEnvironment").path("imageDigest").asText())
+                .isEqualTo("sha256:image");
+        assertThat(root.path("targetEnvironment").path("librarySetDigest").asText())
+                .isEqualTo("sha256:library");
+        assertThat(root.path("targetEnvironment").path("packageApis").get(0).path("apiVersion").asText())
+                .isEqualTo("1.0");
         assertThat(loader.parseFrozenLimits(frozen)).isEqualTo(loader.current().limits());
+
+        Files.writeString(config, """
+                {
+                  "enabled": true,
+                  "targetEnvironment": {
+                    "environmentId": "sha256:target-new",
+                    "imageDigest": "sha256:image-new",
+                    "librarySetDigest": "sha256:library-new",
+                    "packageApis": [{"name":"alphafrog_finance","version":"2.0.0","apiVersion":"2.0"}]
+                  }
+                }
+                """);
+        loader.reloadIfNeeded(true);
+
+        FinanceRecordChannelConfigLoader.Snapshot restored = loader.parseFrozenSnapshot(frozen);
+        assertThat(loader.current().targetEnvironment().environmentId()).isEqualTo("sha256:target-new");
+        assertThat(restored.targetEnvironment().environmentId()).isEqualTo("sha256:target");
+        assertThat(restored.targetEnvironment().imageDigest()).isEqualTo("sha256:image");
+        assertThat(restored.targetEnvironment().packageApis()).containsExactly(
+                new FinanceEnvironmentFact.PackageApi(
+                        "alphafrog_finance", "1.0.3", "1.0"));
     }
 
     @Test
@@ -82,5 +109,166 @@ class FinanceRecordChannelConfigLoaderTest {
         loader.reloadIfNeeded(true);
 
         assertThat(loader.current()).isSameAs(valid);
+    }
+
+    @Test
+    void invalidOrMissingDynamicRevisionKeepsTheWholeLastKnownGoodSnapshot(
+            @TempDir Path tempDir) throws Exception {
+        Path config = tempDir.resolve("finance-record-channel.json");
+        Files.writeString(config, """
+                {
+                  "enabled": true,
+                  "recordCountMax": 12,
+                  "targetEnvironment": {
+                    "environmentId": "sha256:target",
+                    "imageDigest": "sha256:image",
+                    "librarySetDigest": "sha256:library",
+                    "packageApis": [
+                      {"name":"alphafrog_finance","version":"1.0.3","apiVersion":"1.0"}
+                    ]
+                  }
+                }
+                """);
+        FinanceRecordChannelProperties defaults = new FinanceRecordChannelProperties();
+        defaults.setEnabled(false);
+        defaults.setRecordCountMax(128);
+        defaults.setConfigFile(config.toString());
+        FinanceRecordChannelConfigLoader loader = new FinanceRecordChannelConfigLoader(objectMapper, defaults);
+        loader.load();
+        FinanceRecordChannelConfigLoader.Snapshot valid = loader.current();
+
+        Files.writeString(config, "{\"enabled\":false,\"recordCountMax\":0}");
+        loader.reloadIfNeeded(true);
+        assertThat(loader.current()).isSameAs(valid);
+        assertThat(loader.current().limits().enabled()).isTrue();
+        assertThat(loader.current().limits().recordCountMax()).isEqualTo(12);
+
+        Files.writeString(config, """
+                {
+                  "enabled": false,
+                  "recordCountMax": 9,
+                  "targetEnvironment": {
+                    "environmentId": "sha256:partial",
+                    "imageDigest": "",
+                    "librarySetDigest": "sha256:library",
+                    "packageApis": []
+                  }
+                }
+                """);
+        loader.reloadIfNeeded(true);
+        assertThat(loader.current()).isSameAs(valid);
+
+        Files.delete(config);
+        loader.reloadIfNeeded(true);
+        assertThat(loader.current()).isSameAs(valid);
+    }
+
+    @Test
+    void frozenTargetIdentityRequiresTheCompleteTargetSnapshot() throws Exception {
+        FinanceRecordChannelProperties defaults = new FinanceRecordChannelProperties();
+        FinanceRecordChannelConfigLoader loader = new FinanceRecordChannelConfigLoader(objectMapper, defaults);
+        String missingTarget = """
+                {
+                  "effectiveFinanceRecordConfig": {
+                    "enabled": true,
+                    "recordCountMax": 12,
+                    "recordMaxBytes": 1024,
+                    "recordChannelMaxBytes": 2048,
+                    "stdoutMaxBytes": 4096,
+                    "stderrMaxBytes": 1024,
+                    "targetEnvironmentId": "sha256:target"
+                  },
+                  "sourceRevision": "sha256:config",
+                  "limitsClamped": false
+                }
+                """;
+
+        assertThatThrownBy(() -> loader.parseFrozenSnapshot(missingTarget))
+                .isInstanceOf(FinanceRecordProcessingException.class)
+                .extracting("code")
+                .isEqualTo("FINANCE_RECORD_CONFIG_SNAPSHOT_INVALID");
+    }
+
+    @Test
+    void frozenTargetSnapshotRejectsPartialOrUntrustedEnvironmentFacts() {
+        FinanceRecordChannelProperties defaults = new FinanceRecordChannelProperties();
+        FinanceRecordChannelConfigLoader loader = new FinanceRecordChannelConfigLoader(objectMapper, defaults);
+        String partialTarget = """
+                {
+                  "effectiveFinanceRecordConfig": {
+                    "enabled": true,
+                    "recordCountMax": 12,
+                    "recordMaxBytes": 1024,
+                    "recordChannelMaxBytes": 2048,
+                    "stdoutMaxBytes": 4096,
+                    "stderrMaxBytes": 1024,
+                    "targetEnvironmentId": "sha256:target"
+                  },
+                  "targetEnvironment": {
+                    "environmentId": "sha256:target",
+                    "imageDigest": "",
+                    "librarySetDigest": "sha256:library",
+                    "packageApis": [],
+                    "inventoryComplete": false
+                  }
+                }
+                """;
+
+        assertThatThrownBy(() -> loader.parseFrozenSnapshot(partialTarget))
+                .isInstanceOf(FinanceRecordProcessingException.class)
+                .extracting("code")
+                .isEqualTo("FINANCE_RECORD_CONFIG_SNAPSHOT_INVALID");
+    }
+
+    @Test
+    void partialApplicationDefaultTargetFailsFast() {
+        FinanceRecordChannelProperties defaults = new FinanceRecordChannelProperties();
+        FinanceRecordChannelProperties.TargetEnvironment target =
+                new FinanceRecordChannelProperties.TargetEnvironment();
+        target.setEnvironmentId("sha256:target");
+        target.setImageDigest("");
+        target.setLibrarySetDigest("sha256:library");
+        defaults.setTargetEnvironment(target);
+
+        assertThatThrownBy(() -> new FinanceRecordChannelConfigLoader(objectMapper, defaults))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("targetEnvironment.imageDigest");
+    }
+
+    @Test
+    void applicationDefaultTargetWithoutEnvironmentIdFailsFast() {
+        FinanceRecordChannelProperties defaults = new FinanceRecordChannelProperties();
+        FinanceRecordChannelProperties.TargetEnvironment target =
+                new FinanceRecordChannelProperties.TargetEnvironment();
+        target.setImageDigest("sha256:image");
+        defaults.setTargetEnvironment(target);
+
+        assertThatThrownBy(() -> new FinanceRecordChannelConfigLoader(objectMapper, defaults))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("targetEnvironment.environmentId");
+    }
+
+    @Test
+    void frozenSnapshotCannotExpandCodeHardLimits() {
+        FinanceRecordChannelConfigLoader loader = new FinanceRecordChannelConfigLoader(
+                objectMapper, new FinanceRecordChannelProperties());
+        String oversized = """
+                {
+                  "effectiveFinanceRecordConfig": {
+                    "enabled": true,
+                    "recordCountMax": 128,
+                    "recordMaxBytes": 16384,
+                    "recordChannelMaxBytes": 262144,
+                    "stdoutMaxBytes": 4194305,
+                    "stderrMaxBytes": 262144,
+                    "targetEnvironmentId": ""
+                  }
+                }
+                """;
+
+        assertThatThrownBy(() -> loader.parseFrozenSnapshot(oversized))
+                .isInstanceOf(FinanceRecordProcessingException.class)
+                .extracting("code")
+                .isEqualTo("FINANCE_RECORD_CONFIG_SNAPSHOT_INVALID");
     }
 }

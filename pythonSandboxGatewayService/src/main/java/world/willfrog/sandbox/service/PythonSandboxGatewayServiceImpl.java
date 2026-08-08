@@ -280,6 +280,22 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
                     if (usage != null) {
                         builder.setResourceUsage(usage);
                     }
+                    // 260808-finance-methodspec-v5 work package D: presence-aware mapping
+                    // for v5 finance record channel + execution environment. Parent absence
+                    // means old producer (no v5 protocol); parent presence means v5 enabled
+                    // (including empty but complete batch). The mapping is one-directional:
+                    // HTTP null parent -> proto no setFinanceRecordChannel/setExecutionEnvironment;
+                    // HTTP present parent -> proto parent set with mapped fields.
+                    FinanceRecordChannelMetadata financeChannel = toProtoFinanceRecordChannel(
+                            res.getFinance_record_channel());
+                    if (financeChannel != null) {
+                        builder.setFinanceRecordChannel(financeChannel);
+                    }
+                    SandboxEnvironmentIdentity executionEnvironment = toProtoExecutionEnvironment(
+                            res.getExecution_environment());
+                    if (executionEnvironment != null) {
+                        builder.setExecutionEnvironment(executionEnvironment);
+                    }
                     return builder.build();
                 }
             }
@@ -331,6 +347,82 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
         }
         if (usage.getMissing_fields() != null) {
             builder.addAllMissingFields(usage.getMissing_fields());
+        }
+        return builder.build();
+    }
+
+    // 260808-finance-methodspec-v5 work package D: presence-aware mapping for
+    // financeRecordChannel (proto field 10). Returns null when the HTTP parent
+    // is absent, so the caller skips setFinanceRecordChannel and downstream
+    // consumers see hasFinanceRecordChannel() == false (old producer).
+    static FinanceRecordChannelMetadata toProtoFinanceRecordChannel(HttpFinanceRecordChannel channel) {
+        if (channel == null) {
+            return null;
+        }
+        FinanceRecordChannelMetadata.Builder builder = FinanceRecordChannelMetadata.newBuilder();
+        if (channel.getEmitted_record_count() != null) {
+            builder.setEmittedRecordCount(channel.getEmitted_record_count());
+        }
+        if (channel.getEmitted_record_bytes() != null) {
+            builder.setEmittedRecordBytes(channel.getEmitted_record_bytes());
+        }
+        if (channel.getRecord_set_complete() != null) {
+            builder.setRecordSetComplete(channel.getRecord_set_complete());
+        }
+        if (channel.getDrop_reason() != null) {
+            builder.setDropReason(channel.getDrop_reason());
+        }
+        if (channel.getRecord_digest() != null) {
+            builder.setRecordDigest(channel.getRecord_digest());
+        }
+        if (channel.getStdout_truncated() != null) {
+            builder.setStdoutTruncated(channel.getStdout_truncated());
+        }
+        if (channel.getStderr_truncated() != null) {
+            builder.setStderrTruncated(channel.getStderr_truncated());
+        }
+        return builder.build();
+    }
+
+    // 260808-finance-methodspec-v5 work package D: presence-aware mapping for
+    // executionEnvironment (proto field 11). Returns null when the HTTP parent
+    // is absent, so the caller skips setExecutionEnvironment and downstream
+    // consumers see hasExecutionEnvironment() == false (old producer). The
+    // packageApis repeated field uses no runtimeImageRef per FROZEN contract.
+    static SandboxEnvironmentIdentity toProtoExecutionEnvironment(HttpExecutionEnvironment environment) {
+        if (environment == null) {
+            return null;
+        }
+        SandboxEnvironmentIdentity.Builder builder = SandboxEnvironmentIdentity.newBuilder();
+        if (environment.getEnvironment_id() != null) {
+            builder.setEnvironmentId(environment.getEnvironment_id());
+        }
+        if (environment.getImage_digest() != null) {
+            builder.setImageDigest(environment.getImage_digest());
+        }
+        if (environment.getLibrary_set_digest() != null) {
+            builder.setLibrarySetDigest(environment.getLibrary_set_digest());
+        }
+        if (environment.getPackage_apis() != null) {
+            for (HttpSandboxPackageApi pkg : environment.getPackage_apis()) {
+                if (pkg == null) {
+                    continue;
+                }
+                SandboxPackageApi.Builder pkgBuilder = SandboxPackageApi.newBuilder();
+                if (pkg.getName() != null) {
+                    pkgBuilder.setName(pkg.getName());
+                }
+                if (pkg.getVersion() != null) {
+                    pkgBuilder.setVersion(pkg.getVersion());
+                }
+                if (pkg.getApi_version() != null) {
+                    pkgBuilder.setApiVersion(pkg.getApi_version());
+                }
+                builder.addPackageApis(pkgBuilder.build());
+            }
+        }
+        if (environment.getInventory_complete() != null) {
+            builder.setInventoryComplete(environment.getInventory_complete());
         }
         return builder.build();
     }
@@ -518,6 +610,13 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
         private Map<String, Object> artifacts;
         private HttpSandboxResourceUsage resource_usage;
         private Boolean retryable;
+        // 260808-finance-methodspec-v5 work package D: v5 finance record channel +
+        // execution environment parents. Null parent = old producer (no v5 protocol);
+        // present parent (even with default-valued fields) = v5 enabled. The presence
+        // check at consumer side is via hasFinanceRecordChannel()/hasExecutionEnvironment()
+        // on the proto side, not on these fields.
+        private HttpFinanceRecordChannel finance_record_channel;
+        private HttpExecutionEnvironment execution_environment;
     }
 
     @Data
@@ -540,5 +639,39 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
         private Boolean attribution_complete;
         private Long sampling_interval_millis;
         private List<String> missing_fields;
+    }
+
+    // 260808-finance-methodspec-v5 work package D: HTTP-side mirror of
+    // FinanceRecordChannelMetadata (proto field 10). Jackson binds snake_case JSON
+    // from the sandbox Python side. Field order matches the proto schema.
+    @Data
+    static class HttpFinanceRecordChannel {
+        private Integer emitted_record_count;
+        private Long emitted_record_bytes;
+        private Boolean record_set_complete;
+        private String drop_reason;
+        private String record_digest;
+        private Boolean stdout_truncated;
+        private Boolean stderr_truncated;
+    }
+
+    // 260808-finance-methodspec-v5 work package D: HTTP-side mirror of
+    // SandboxEnvironmentIdentity (proto field 11). Jackson binds snake_case JSON
+    // from the sandbox Python side. No runtimeImageRef per FROZEN contract;
+    // that value is a Python-internal C/H task fact and stays off the wire.
+    @Data
+    static class HttpExecutionEnvironment {
+        private String environment_id;
+        private String image_digest;
+        private String library_set_digest;
+        private List<HttpSandboxPackageApi> package_apis;
+        private Boolean inventory_complete;
+    }
+
+    @Data
+    static class HttpSandboxPackageApi {
+        private String name;
+        private String version;
+        private String api_version;
     }
 }

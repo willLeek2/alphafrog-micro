@@ -19,6 +19,7 @@ from .models import (
     CreateTaskResponse,
     ExecuteRequest,
     ExecuteResult,
+    ExecutionEnvironment,
     OperationLookupResponse,
     SandboxResourceUsage,
     Task,
@@ -112,6 +113,27 @@ async def worker(worker_id: int):
             logger.error("Worker %s error: %s", worker_id, e)
 
 
+def _safe_parse_execution_environment(payload):
+    """260808-finance-methodspec-v5 work package D: best-effort parse.
+
+    Returns a validated ExecutionEnvironment when the sandbox runner supplied
+    a payload, None when the payload is absent (queue timeout, exception
+    before collection) or malformed (validation failure logged at WARNING).
+    Presence-aware consumers translate None into proto parent absence, which
+    is the v5 signal for "old producer / environment facts unknown".
+    """
+    if not payload:
+        return None
+    try:
+        return ExecutionEnvironment.model_validate(payload)
+    except Exception as exc:
+        logger.warning(
+            "EXECUTION_ENVIRONMENT_VALIDATION_FAILED error=%s payload=%s",
+            exc, payload,
+        )
+        return None
+
+
 async def process_task(task: Task, worker_id: int):
     started_at = datetime.utcnow()
     queued_ms = int((started_at - task.created_at).total_seconds() * 1000)
@@ -146,6 +168,10 @@ async def process_task(task: Task, worker_id: int):
             dataset_dir=f"{config.workdir}/input/{task.request.dataset_id}",
             resource_usage=task.resource_usage,
             retryable=task.retryable,
+            # 260808-finance-methodspec-v5 work package D: queue timeout runs
+            # before sandbox opens, so no execution_environment is available;
+            # presence-aware consumers see hasExecutionEnvironment() == false.
+            execution_environment=None,
         )
         task_store.save(task)
         return
@@ -214,6 +240,13 @@ async def process_task(task: Task, worker_id: int):
             },
             resource_usage=task.resource_usage,
             retryable=task.retryable,
+            # 260808-finance-methodspec-v5 work package D: same ExecutionEnvironment
+            # instance that drove the workdir file is surfaced here on the HTTP
+            # ExecuteResult; gateway presence-aware mapping then sets the proto
+            # executionEnvironment parent when this is non-None.
+            execution_environment=_safe_parse_execution_environment(
+                result_dict.get("execution_environment"),
+            ),
         )
         if task.status == TaskStatus.FAILED:
             task.error = f"sandbox exited with code {result_dict['exit_code']}"
@@ -253,6 +286,13 @@ async def process_task(task: Task, worker_id: int):
             artifacts={"timings": getattr(e, "timings", {})},
             resource_usage=task.resource_usage,
             retryable=task.retryable,
+            # 260808-finance-methodspec-v5 work package D: execution_environment
+            # may be missing or partially populated if the exception happened
+            # before/around runtime_environment collection. _safe_parse handles
+            # both cases; None propagates as proto parent absence.
+            execution_environment=_safe_parse_execution_environment(
+                result_dict.get("execution_environment"),
+            ),
         )
     finally:
         task.finished_at = datetime.utcnow()

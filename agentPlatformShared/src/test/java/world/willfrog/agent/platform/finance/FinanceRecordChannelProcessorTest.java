@@ -142,6 +142,23 @@ class FinanceRecordChannelProcessorTest {
     }
 
     @Test
+    void syncToAsyncReplayKeepsTheSameBatchContentDigest() throws Exception {
+        FixtureCase fixture = fixture("one-valid-custom-non-annual-result");
+        FinanceRecordExtractionRequest sync = request(
+                fixture, actualEnvironment(), true, fixture.metadata, "sync");
+        FinanceRecordExtractionRequest async = request(
+                fixture, actualEnvironment(), true, fixture.metadata, "async");
+
+        FinanceRecordExtractionResult syncResult = processor.process(sync);
+        FinanceRecordExtractionResult asyncResult = processor.process(async);
+
+        assertThat(syncResult.batch().getEntryPoint()).isEqualTo("sync");
+        assertThat(asyncResult.batch().getEntryPoint()).isEqualTo("async");
+        assertThat(asyncResult.batch().getBatchContentDigest())
+                .isEqualTo(syncResult.batch().getBatchContentDigest());
+    }
+
+    @Test
     void missingTrustedIdentityIsRejectedBeforePersistence() throws Exception {
         FixtureCase fixture = fixture("one-valid-cagr-result");
         FinanceRecordExtractionRequest request = new FinanceRecordExtractionRequest(
@@ -180,8 +197,17 @@ class FinanceRecordChannelProcessorTest {
             FinanceEnvironmentFact actual,
             boolean enabled,
             FinanceRecordChannelMetadata metadata) {
+        return request(fixture, actual, enabled, metadata, "sync");
+    }
+
+    private FinanceRecordExtractionRequest request(
+            FixtureCase fixture,
+            FinanceEnvironmentFact actual,
+            boolean enabled,
+            FinanceRecordChannelMetadata metadata,
+            String entryPoint) {
         return new FinanceRecordExtractionRequest(
-                "run-1", "user-1", "todo-1", "execute-1", "sync", "task-1",
+                "run-1", "user-1", "todo-1", "execute-1", entryPoint, "task-1",
                 "SUCCEEDED", 0, fixture.stdout, "", metadata,
                 actual, actualEnvironment(), limits(enabled));
     }

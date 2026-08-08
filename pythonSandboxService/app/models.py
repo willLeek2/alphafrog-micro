@@ -100,6 +100,67 @@ class SandboxResourceUsage(BaseModel):
     missing_fields: List[str] = Field(default_factory=list)
 
 
+# 260808-finance-methodspec-v5 work package D-owned Pydantic classes.
+# 边界：ccmax D 拥有 class 定义；ccqwen C 只承载 ExecuteResult.finance_record_channel /
+# execution_environment 写入路径，不重定义（按 sub-task 01 thread f4341b21 + 3cbdbaac
+# 双向确认）。gateway presence-aware 映射负责 snake_case -> camelCase proto 转换，
+# runtime_environment.py 单源生成 environmentId / runtime-environment.json。
+# model_config: 调用方传 snake_case 字段（与现有 ExecuteRequest/ExecuteResult 风格一致），
+# 不引入 alias，保持 Pydantic 内部表示 + JSON 序列化两端 snake_case 一致。
+class SandboxPackageApi(BaseModel):
+    name: str = Field(..., description="Package name (e.g. alphafrog_finance)")
+    version: str = Field(..., description="Package version (e.g. 1.0.3)")
+    api_version: str = Field(..., description="Package API version (e.g. 1.0)")
+
+
+class FinanceRecordChannel(BaseModel):
+    emitted_record_count: int = Field(
+        default=0,
+        description="Marker line count after bounded capture; 0 means no markers in this batch",
+    )
+    emitted_record_bytes: int = Field(
+        default=0,
+        description="Sum of rawPayload UTF-8 byte lengths for this batch",
+    )
+    record_set_complete: bool = Field(
+        default=True,
+        description="True iff the channel finished without dropping records; drops set record_set_complete=False",
+    )
+    drop_reason: str = Field(
+        default="",
+        description="Stable reason when record_set_complete=False; empty when complete",
+    )
+    record_digest: str = Field(
+        default="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        description="SHA-256 of length-prefix concatenation; empty batch -> SHA-256 of empty bytes",
+    )
+    stdout_truncated: bool = Field(
+        default=False,
+        description="True iff ordinary stdout was clipped before the bounded file",
+    )
+    stderr_truncated: bool = Field(
+        default=False,
+        description="True iff stderr was clipped before the bounded file",
+    )
+
+
+class ExecutionEnvironment(BaseModel):
+    environment_id: str = Field(..., description="SHA-256 of the runtime environment snapshot")
+    image_digest: str = Field(..., description="SHA-256 of the immutable container image")
+    library_set_digest: str = Field(
+        ...,
+        description="SHA-256 of canonical-encoded library-set.json (sorted packages)",
+    )
+    package_apis: List[SandboxPackageApi] = Field(
+        default_factory=list,
+        description="Snapshot of installed package APIs visible to user code",
+    )
+    inventory_complete: bool = Field(
+        default=False,
+        description="True iff the inventory is comprehensive; false means unknown hidden packages",
+    )
+
+
 class ExecuteResult(BaseModel):
     exit_code: int
     stdout: str
@@ -108,6 +169,11 @@ class ExecuteResult(BaseModel):
     artifacts: Optional[dict] = None
     resource_usage: Optional[SandboxResourceUsage] = None
     retryable: Optional[bool] = None
+    # 260808-finance-methodspec-v5 work package D. Presence-aware:
+    # None = channel not active / pre-v5; non-None = v5 enabled (including empty
+    # but complete batch). Same convention applies to execution_environment.
+    finance_record_channel: Optional[FinanceRecordChannel] = None
+    execution_environment: Optional[ExecutionEnvironment] = None
 
 
 class Task(BaseModel):

@@ -139,6 +139,7 @@
         <module>portfolioService</module>
         <module>frontend</module>
         <module>agentPlatformShared</module>
+        <module>agentMethodSpecBuildPlugin</module>
         <module>agentToolsShared</module>
         <module>agentLangchainService</module>
         <module>externalInfoService</module>

@@ -1,6 +1,7 @@
 package world.willfrog.agent.platform.finance;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 import world.willfrog.agent.platform.mapper.FinanceMethodResolutionMapper;
@@ -21,7 +22,8 @@ public class FinanceMethodResolutionPersister {
             FinanceMethodResolutionMapper mapper,
             ObjectMapper objectMapper) {
         this.mapper = mapper;
-        this.objectMapper = objectMapper;
+        this.objectMapper = objectMapper.copy()
+                .configure(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS, true);
     }
 
     @Transactional
@@ -39,9 +41,8 @@ public class FinanceMethodResolutionPersister {
                         "All resolver suggestions in one transaction must share runId and resolverToolCallId");
             }
             normalizeJson(resolution);
-            if (blank(resolution.getResolutionContentDigest())) {
-                resolution.setResolutionContentDigest(contentDigest(resolution));
-            }
+            // The digest is a trusted persistence fact, never caller-supplied input.
+            resolution.setResolutionContentDigest(contentDigest(resolution));
         }
         for (FinanceMethodResolution resolution : resolutions) {
             int inserted = mapper.insertIgnore(resolution);
@@ -88,22 +89,27 @@ public class FinanceMethodResolutionPersister {
     }
 
     private Object parseJson(String json) throws Exception {
-        return objectMapper.readTree(json);
+        return objectMapper.readValue(json, Object.class);
     }
 
     private static void normalizeJson(FinanceMethodResolution row) {
+        row.setRunId(required(row.getRunId(), "runId"));
+        row.setResolverToolCallId(required(row.getResolverToolCallId(), "resolverToolCallId"));
+        row.setTodoId(required(row.getTodoId(), "todoId"));
+        row.setMethodId(required(row.getMethodId(), "methodId"));
+        row.setMethodVersion(required(row.getMethodVersion(), "methodVersion"));
+        row.setSpecDigest(required(row.getSpecDigest(), "specDigest"));
+        row.setCatalogDigest(required(row.getCatalogDigest(), "catalogDigest"));
+        row.setResolverSchemaVersion(required(
+                row.getResolverSchemaVersion(), "resolverSchemaVersion"));
+        row.setResolverPromptVersion(required(
+                row.getResolverPromptVersion(), "resolverPromptVersion"));
+        row.setMatchReason(required(row.getMatchReason(), "matchReason"));
+        row.setTargetEnvironmentId(trimToNull(row.getTargetEnvironmentId()));
         row.setModelRouteJson(jsonObject(row.getModelRouteJson()));
         row.setClarificationJson(jsonArray(row.getClarificationJson()));
         row.setTargetPackageApiJson(jsonArray(row.getTargetPackageApiJson()));
         row.setResolutionPayloadJson(jsonObject(row.getResolutionPayloadJson()));
-        required(row.getTodoId(), "todoId");
-        required(row.getMethodId(), "methodId");
-        required(row.getMethodVersion(), "methodVersion");
-        required(row.getSpecDigest(), "specDigest");
-        required(row.getCatalogDigest(), "catalogDigest");
-        required(row.getResolverSchemaVersion(), "resolverSchemaVersion");
-        required(row.getResolverPromptVersion(), "resolverPromptVersion");
-        required(row.getMatchReason(), "matchReason");
     }
 
     private static String jsonObject(String value) { return blank(value) ? "{}" : value; }
@@ -115,6 +121,10 @@ public class FinanceMethodResolutionPersister {
                     "FINANCE_RESOLUTION_IDENTITY_INVALID", field + " is required");
         }
         return value.trim();
+    }
+
+    private static String trimToNull(String value) {
+        return blank(value) ? null : value.trim();
     }
 
     private static boolean blank(String value) { return value == null || value.isBlank(); }

@@ -10,7 +10,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 /** Loads Nacos-written JSON over application defaults, then clamps every value to code ceilings. */
 @Component
@@ -50,6 +52,7 @@ public class FinanceRecordChannelConfigLoader {
             Snapshot snapshot = current;
             MapPayload payload = new MapPayload();
             payload.effectiveFinanceRecordConfig = new EffectiveConfig(snapshot.limits());
+            payload.targetEnvironment = snapshot.targetEnvironment();
             payload.sourceRevision = snapshot.sourceRevision();
             payload.limitsClamped = snapshot.limitsClamped();
             return objectMapper.writeValueAsString(payload);
@@ -61,12 +64,38 @@ public class FinanceRecordChannelConfigLoader {
     }
 
     public FinanceRecordChannelLimits parseFrozenLimits(String json) {
+        return parseFrozenSnapshot(json).limits();
+    }
+
+    /**
+     * Restores the complete immutable snapshot stored on a run/tool-job anchor.
+     * Terminal processing must not combine frozen limits with a later live target-environment config.
+     */
+    public Snapshot parseFrozenSnapshot(String json) {
         try {
             MapPayload payload = objectMapper.readValue(json, MapPayload.class);
             if (payload.effectiveFinanceRecordConfig == null) {
                 throw new IllegalArgumentException("effectiveFinanceRecordConfig is required");
             }
-            return payload.effectiveFinanceRecordConfig.toLimits();
+            FinanceRecordChannelLimits limits = payload.effectiveFinanceRecordConfig.toLimits();
+            FinanceEnvironmentFact targetEnvironment = payload.targetEnvironment;
+            if (!limits.targetEnvironmentId().isBlank() && targetEnvironment == null) {
+                throw new IllegalArgumentException(
+                        "targetEnvironment is required when targetEnvironmentId is configured");
+            }
+            if (targetEnvironment != null
+                    && !limits.targetEnvironmentId().equals(targetEnvironment.environmentId())) {
+                throw new IllegalArgumentException(
+                        "targetEnvironment.environmentId must match targetEnvironmentId");
+            }
+            if (targetEnvironment != null) {
+                validateTargetEnvironmentFact(targetEnvironment);
+            }
+            return new Snapshot(
+                    limits,
+                    targetEnvironment,
+                    trim(payload.sourceRevision),
+                    Boolean.TRUE.equals(payload.limitsClamped));
         } catch (Exception exception) {
             throw new FinanceRecordProcessingException(
                     "FINANCE_RECORD_CONFIG_SNAPSHOT_INVALID",
@@ -82,10 +111,7 @@ public class FinanceRecordChannelConfigLoader {
         }
         Path path = Paths.get(configured).toAbsolutePath().normalize();
         if (!Files.exists(path)) {
-            if (force) {
-                log.info("Finance record config file not found; using application defaults: {}", path);
-            }
-            current = sanitize(null, "application-defaults");
+            log.warn("Finance record config file not found; keeping last valid snapshot: {}", path);
             return;
         }
         try {
@@ -95,6 +121,7 @@ public class FinanceRecordChannelConfigLoader {
             }
             byte[] bytes = Files.readAllBytes(path);
             DynamicConfig dynamic = objectMapper.readValue(bytes, DynamicConfig.class);
+            validateDynamic(dynamic);
             current = sanitize(dynamic, "sha256:" + FinanceRecordDecoder.sha256Hex(bytes));
             loadedPath = path.toString();
             loadedLastModified = modified;
@@ -131,9 +158,65 @@ public class FinanceRecordChannelConfigLoader {
         return new Snapshot(limits, environment, sourceRevision, clamped);
     }
 
+    /**
+     * Dynamic configuration is an atomic last-known-good document. Supplying one invalid
+     * limit or a partial target environment must reject the whole revision instead of mixing
+     * that revision with application defaults and presenting the hybrid as a valid snapshot.
+     */
+    private static void validateDynamic(DynamicConfig dynamic) {
+        if (dynamic == null) {
+            throw new IllegalArgumentException("dynamic finance record config is required");
+        }
+        requirePositiveWhenPresent(dynamic.recordCountMax, "recordCountMax");
+        requirePositiveWhenPresent(dynamic.recordMaxBytes, "recordMaxBytes");
+        requirePositiveWhenPresent(dynamic.recordChannelMaxBytes, "recordChannelMaxBytes");
+        requirePositiveWhenPresent(dynamic.stdoutMaxBytes, "stdoutMaxBytes");
+        requirePositiveWhenPresent(dynamic.stderrMaxBytes, "stderrMaxBytes");
+
+        FinanceRecordChannelProperties.TargetEnvironment environment = dynamic.targetEnvironment;
+        if (environment == null) {
+            return;
+        }
+        requireNonBlank(environment.getEnvironmentId(), "targetEnvironment.environmentId");
+        requireNonBlank(environment.getImageDigest(), "targetEnvironment.imageDigest");
+        requireNonBlank(environment.getLibrarySetDigest(), "targetEnvironment.librarySetDigest");
+        List<FinanceRecordChannelProperties.PackageApi> packages = environment.getPackageApis();
+        if (packages == null || packages.isEmpty()) {
+            throw new IllegalArgumentException("targetEnvironment.packageApis is required");
+        }
+        boolean financePackageFound = false;
+        for (FinanceRecordChannelProperties.PackageApi item : packages) {
+            if (item == null) {
+                throw new IllegalArgumentException("targetEnvironment.packageApis contains null");
+            }
+            requireNonBlank(item.getName(), "targetEnvironment.packageApis.name");
+            requireNonBlank(item.getVersion(), "targetEnvironment.packageApis.version");
+            requireNonBlank(item.getApiVersion(), "targetEnvironment.packageApis.apiVersion");
+            if ("alphafrog_finance".equals(trim(item.getName()))) {
+                financePackageFound = true;
+            }
+        }
+        if (!financePackageFound) {
+            throw new IllegalArgumentException(
+                    "targetEnvironment.packageApis must contain alphafrog_finance");
+        }
+    }
+
+    private static void requirePositiveWhenPresent(Integer value, String name) {
+        if (value != null && value <= 0) {
+            throw new IllegalArgumentException(name + " must be positive");
+        }
+    }
+
+    private static void requireNonBlank(String value, String name) {
+        if (trim(value).isEmpty()) {
+            throw new IllegalArgumentException(name + " must be non-blank");
+        }
+    }
+
     private static FinanceEnvironmentFact toFact(
             FinanceRecordChannelProperties.TargetEnvironment source) {
-        if (source == null || trim(source.getEnvironmentId()).isEmpty()) {
+        if (source == null || isEmptyTargetEnvironment(source)) {
             return null;
         }
         List<FinanceEnvironmentFact.PackageApi> packageApis = new ArrayList<>();
@@ -145,9 +228,57 @@ public class FinanceRecordChannelConfigLoader {
                 }
             }
         }
-        return new FinanceEnvironmentFact(
+        FinanceEnvironmentFact fact = new FinanceEnvironmentFact(
                 source.getEnvironmentId(), source.getImageDigest(), source.getLibrarySetDigest(),
                 packageApis, true);
+        validateTargetEnvironmentFact(fact);
+        return fact;
+    }
+
+    private static boolean isEmptyTargetEnvironment(
+            FinanceRecordChannelProperties.TargetEnvironment source) {
+        return trim(source.getEnvironmentId()).isEmpty()
+                && trim(source.getImageDigest()).isEmpty()
+                && trim(source.getLibrarySetDigest()).isEmpty()
+                && (source.getPackageApis() == null || source.getPackageApis().isEmpty());
+    }
+
+    /**
+     * A target environment is an atomic trusted fact, both when it comes from application
+     * defaults and when it is restored from a durable frozen snapshot. Dynamic-file validation
+     * alone is insufficient because neither of those two paths is guaranteed to pass through it.
+     */
+    private static void validateTargetEnvironmentFact(FinanceEnvironmentFact environment) {
+        requireNonBlank(environment.environmentId(), "targetEnvironment.environmentId");
+        requireNonBlank(environment.imageDigest(), "targetEnvironment.imageDigest");
+        requireNonBlank(environment.librarySetDigest(), "targetEnvironment.librarySetDigest");
+        if (!environment.inventoryComplete()) {
+            throw new IllegalArgumentException("targetEnvironment.inventoryComplete must be true");
+        }
+        if (environment.packageApis().isEmpty()) {
+            throw new IllegalArgumentException("targetEnvironment.packageApis is required");
+        }
+        Set<String> packageNames = new HashSet<>();
+        boolean financePackageFound = false;
+        for (FinanceEnvironmentFact.PackageApi item : environment.packageApis()) {
+            if (item == null) {
+                throw new IllegalArgumentException("targetEnvironment.packageApis contains null");
+            }
+            requireNonBlank(item.name(), "targetEnvironment.packageApis.name");
+            requireNonBlank(item.version(), "targetEnvironment.packageApis.version");
+            requireNonBlank(item.apiVersion(), "targetEnvironment.packageApis.apiVersion");
+            if (!packageNames.add(item.name())) {
+                throw new IllegalArgumentException(
+                        "targetEnvironment.packageApis contains duplicate package: " + item.name());
+            }
+            if ("alphafrog_finance".equals(item.name())) {
+                financePackageFound = true;
+            }
+        }
+        if (!financePackageFound) {
+            throw new IllegalArgumentException(
+                    "targetEnvironment.packageApis must contain alphafrog_finance");
+        }
     }
 
     private static int firstPositive(Integer override, int fallback) {
@@ -183,6 +314,7 @@ public class FinanceRecordChannelConfigLoader {
 
     static class MapPayload {
         public EffectiveConfig effectiveFinanceRecordConfig;
+        public FinanceEnvironmentFact targetEnvironment;
         public String sourceRevision;
         public Boolean limitsClamped;
     }
@@ -210,16 +342,26 @@ public class FinanceRecordChannelConfigLoader {
 
         FinanceRecordChannelLimits toLimits() {
             return new FinanceRecordChannelLimits(
-                    Boolean.TRUE.equals(enabled), required(recordCountMax, "recordCountMax"),
-                    required(recordMaxBytes, "recordMaxBytes"),
-                    required(recordChannelMaxBytes, "recordChannelMaxBytes"),
-                    required(stdoutMaxBytes, "stdoutMaxBytes"),
-                    required(stderrMaxBytes, "stderrMaxBytes"), targetEnvironmentId);
+                    Boolean.TRUE.equals(enabled),
+                    requiredAtMost(recordCountMax, "recordCountMax",
+                            FinanceRecordChannelProperties.HARD_RECORD_COUNT_MAX),
+                    requiredAtMost(recordMaxBytes, "recordMaxBytes",
+                            FinanceRecordChannelProperties.HARD_RECORD_MAX_BYTES),
+                    requiredAtMost(recordChannelMaxBytes, "recordChannelMaxBytes",
+                            FinanceRecordChannelProperties.HARD_RECORD_CHANNEL_MAX_BYTES),
+                    requiredAtMost(stdoutMaxBytes, "stdoutMaxBytes",
+                            FinanceRecordChannelProperties.HARD_STDOUT_MAX_BYTES),
+                    requiredAtMost(stderrMaxBytes, "stderrMaxBytes",
+                            FinanceRecordChannelProperties.HARD_STDERR_MAX_BYTES),
+                    targetEnvironmentId);
         }
 
-        private static int required(Integer value, String name) {
+        private static int requiredAtMost(Integer value, String name, int hardMaximum) {
             if (value == null || value <= 0) {
                 throw new IllegalArgumentException(name + " must be positive");
+            }
+            if (value > hardMaximum) {
+                throw new IllegalArgumentException(name + " exceeds the code hard maximum");
             }
             return value;
         }

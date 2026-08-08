@@ -8,6 +8,8 @@ import org.junit.jupiter.api.io.TempDir;
 import org.mockito.ArgumentCaptor;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.dataanalysis.*;
+import world.willfrog.agent.platform.finance.*;
+import world.willfrog.agent.tools.finance.FinanceResultModelAdapter;
 import world.willfrog.agent.workflow.AgentRunDatasetEntry;
 import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
 import world.willfrog.agent.workflow.AgentRunDatasetSnapshot;
@@ -38,7 +40,8 @@ class PythonSandboxToolsDataIntenseTest {
 
     @BeforeEach
     void setUp() throws Exception {
-        tools = new PythonSandboxTools(new ObjectMapper().findAndRegisterModules());
+        ObjectMapper objectMapper = new ObjectMapper().findAndRegisterModules();
+        tools = new PythonSandboxTools(objectMapper);
         sandbox = mock(PythonSandboxService.class);
         capacity = mock(DataAnalysisCapacityService.class);
         dispatchStore = mock(PythonSandboxDispatchStore.class);
@@ -256,15 +259,208 @@ class PythonSandboxToolsDataIntenseTest {
 
         String output = tools.executePython("print(1)", "1", null, null, 30);
 
-        assertThat(output).contains("\"ok\":true").contains("\"stdout\":\"ok\"");
+        assertThat(output)
+                .isEqualTo("{\"ok\":true,\"tool\":\"executePython\","
+                        + "\"data\":{\"stdout\":\"ok\"},\"error\":null}")
+                .doesNotContain("task-1", "task_id", "dataset_dir", "rawRef");
         verify(capacity).releaseReservation(argThat(request ->
                 request.proof() instanceof DataAnalysisReleaseProof.Terminal));
         verify(recorder).upsert(argThat(envelope ->
                 !envelope.background() && !envelope.retryable()
-                        && "SUCCEEDED".equals(envelope.terminalStatus())));
+                        && "SUCCEEDED".equals(envelope.terminalStatus())
+                        && output.equals(envelope.resultPreview())));
         verify(dispatchStore, never()).clearActive(anyString(), anyString());
         verify(dispatchStore, never()).clearSynchronouslyCompleted(anyString(), anyString());
         verify(dispatchStore, never()).transferToPending(anyString(), any());
+    }
+
+    @Test
+    void financeSuccessProcessesBeforeEnvelopeAndReturnsOnlyModelAllowlist() throws Exception {
+        fixtureDataset();
+        List<String> seamOrder = new ArrayList<>();
+        FinanceRecordChannelConfigLoader configLoader = mock(FinanceRecordChannelConfigLoader.class);
+        FinanceRecordChannelProcessor processor = mock(FinanceRecordChannelProcessor.class);
+        FinanceResultModelAdapter adapter = mock(FinanceResultModelAdapter.class);
+        inject("financeRecordChannelConfigLoader", configLoader);
+        inject("financeRecordChannelProcessor", processor);
+        inject("financeResultModelAdapter", adapter);
+        when(configLoader.frozenSnapshotJson()).thenReturn("{\"snapshot\":1}");
+        when(configLoader.parseFrozenSnapshot("{\"snapshot\":1}"))
+                .thenReturn(financeSnapshot());
+
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(capacity.releaseReservation(any())).thenReturn(DataAnalysisReleaseOutcome.RELEASED);
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
+        when(dispatchStore.persistAttached(eq("run-test"), any())).thenAnswer(invocation -> {
+            ToolJobAnchor anchor = invocation.getArgument(1);
+            if ("ENVELOPE".equals(anchor.getFinalizerStep())) {
+                seamOrder.add("envelope:" + anchor.getTerminalResultPreview());
+            }
+            return true;
+        });
+        when(recorder.upsert(any())).thenReturn(DataAnalysisUpsertOutcome.INSERTED);
+        when(sandbox.createTask(any())).thenAnswer(invocation -> {
+            ExecuteRequest request = invocation.getArgument(0);
+            return ExecuteResponse.newBuilder().setTaskId("task-finance")
+                    .setRequestFingerprint(request.getRequestFingerprint()).build();
+        });
+        when(sandbox.getTaskStatus(any())).thenReturn(
+                TaskStatusResponse.newBuilder().setStatus("SUCCEEDED").build());
+        when(sandbox.getTaskResult(any())).thenReturn(financeTerminalResult());
+        when(processor.process(any())).thenAnswer(invocation -> {
+            seamOrder.add("processor");
+            return financeExtractionResult();
+        });
+        when(adapter.project(any())).thenReturn(new FinanceResultModelAdapter.ProjectionBatch(
+                List.of(new FinanceToolResultFormatter.FinanceModelResult(
+                        "复合增长率", 0.12468265, "ratio", "按规范参数计算")),
+                List.of()));
+
+        String output = tools.executePython("print(1)", "1", null, null, 30);
+
+        assertThat(output)
+                .contains("\"ok\":true", "\"stdout\":\"rows=5\"", "\"results\"")
+                .contains("\"method\":\"复合增长率\"", "\"value\":0.12468265")
+                .doesNotContain(
+                        "__AF_FINANCE_RESULT_", "task-finance", "dataset_dir", "datasetDir",
+                        "toolCall", "recordDigest", "executionEnvironment", "sha256:actual");
+
+        ArgumentCaptor<FinanceRecordExtractionRequest> request =
+                ArgumentCaptor.forClass(FinanceRecordExtractionRequest.class);
+        verify(processor).process(request.capture());
+        assertThat(request.getValue().todoId()).isEqualTo("todo-1");
+        assertThat(request.getValue().executePythonToolCallId()).isEqualTo("call-1");
+        assertThat(request.getValue().channelMetadata()).isEqualTo(
+                new world.willfrog.agent.platform.finance.FinanceRecordChannelMetadata(
+                        1, 401, true, "", "sha256:batch", false, false));
+        assertThat(request.getValue().executionEnvironment().inventoryComplete()).isTrue();
+        assertThat(request.getValue().targetEnvironment().environmentId())
+                .isEqualTo("sha256:target");
+
+        assertThat(seamOrder.get(0)).isEqualTo("processor");
+        assertThat(seamOrder.get(1))
+                .startsWith("envelope:{\"ok\":true,\"tool\":\"executePython\"")
+                .contains("\"results\"")
+                .doesNotContain("__AF_FINANCE_RESULT_", "task-finance");
+        assertThat(seamOrder.get(1)).isEqualTo("envelope:" + output);
+        verify(adapter).project(any());
+    }
+
+    @Test
+    void financeFailureDemarkersWithoutProjectionAndPersistsExactFailurePreview() throws Exception {
+        fixtureDataset();
+        FinanceRecordChannelConfigLoader configLoader = mock(FinanceRecordChannelConfigLoader.class);
+        FinanceRecordChannelProcessor processor = mock(FinanceRecordChannelProcessor.class);
+        FinanceResultModelAdapter adapter = mock(FinanceResultModelAdapter.class);
+        inject("financeRecordChannelConfigLoader", configLoader);
+        inject("financeRecordChannelProcessor", processor);
+        inject("financeResultModelAdapter", adapter);
+        when(configLoader.frozenSnapshotJson()).thenReturn("{\"snapshot\":1}");
+        when(configLoader.parseFrozenSnapshot("{\"snapshot\":1}"))
+                .thenReturn(financeSnapshot());
+
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(capacity.releaseReservation(any())).thenReturn(DataAnalysisReleaseOutcome.RELEASED);
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
+        when(dispatchStore.persistAttached(eq("run-test"), any())).thenReturn(true);
+        when(recorder.upsert(any())).thenReturn(DataAnalysisUpsertOutcome.INSERTED);
+        when(sandbox.createTask(any())).thenAnswer(invocation -> {
+            ExecuteRequest request = invocation.getArgument(0);
+            return ExecuteResponse.newBuilder().setTaskId("task-finance-failed")
+                    .setRequestFingerprint(request.getRequestFingerprint()).build();
+        });
+        when(sandbox.getTaskStatus(any())).thenReturn(
+                TaskStatusResponse.newBuilder().setStatus("FAILED").build());
+        when(sandbox.getTaskResult(any())).thenReturn(financeFailedTerminalResult());
+        when(processor.process(any())).thenReturn(new FinanceRecordExtractionResult(
+                null, List.of(), "rows-before-failure", List.of(), false));
+
+        String output = tools.executePython(
+                "raise RuntimeError()", "1", null, null, 30);
+
+        assertThat(output)
+                .contains("\"ok\":false", "\"code\":\"PYTHON_EXECUTION_FAILED\"")
+                .contains("\"stdout\":\"rows-before-failure\"", "\"stderr\":\"boom\"")
+                .doesNotContain("__AF_FINANCE_RESULT_", "task-finance-failed", "results");
+        verify(processor).process(argThat(request ->
+                "FAILED".equals(request.terminalStatus()) && request.exitCode() == 1));
+        verify(adapter, never()).project(any());
+        verify(recorder).upsert(argThat(envelope ->
+                output.equals(envelope.resultPreview())
+                        && "FAILED".equals(envelope.terminalStatus())));
+    }
+
+    @Test
+    void financePersistenceFailureDoesNotWriteEnvelopeOrReturnSuccess() throws Exception {
+        fixtureDataset();
+        FinanceRecordChannelConfigLoader configLoader = mock(FinanceRecordChannelConfigLoader.class);
+        FinanceRecordChannelProcessor processor = mock(FinanceRecordChannelProcessor.class);
+        inject("financeRecordChannelConfigLoader", configLoader);
+        inject("financeRecordChannelProcessor", processor);
+        when(configLoader.frozenSnapshotJson()).thenReturn("{\"snapshot\":1}");
+        when(configLoader.parseFrozenSnapshot("{\"snapshot\":1}"))
+                .thenReturn(financeSnapshot());
+
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
+        when(dispatchStore.persistAttached(eq("run-test"), any())).thenReturn(true);
+        when(dispatchStore.transferToPending(eq("run-test"), any())).thenReturn(true);
+        when(sandbox.createTask(any())).thenAnswer(invocation -> {
+            ExecuteRequest request = invocation.getArgument(0);
+            return ExecuteResponse.newBuilder().setTaskId("task-finance")
+                    .setRequestFingerprint(request.getRequestFingerprint()).build();
+        });
+        when(sandbox.getTaskStatus(any())).thenReturn(
+                TaskStatusResponse.newBuilder().setStatus("SUCCEEDED").build());
+        when(sandbox.getTaskResult(any())).thenReturn(financeTerminalResult());
+        when(processor.process(any())).thenThrow(new FinanceRecordProcessingException(
+                "FINANCE_RECORD_PERSISTENCE_UNAVAILABLE", "database down"));
+
+        assertThrows(ExternalToolJobPendingException.class,
+                () -> tools.executePython("print(1)", "1", null, null, 30));
+
+        verify(dispatchStore, never()).persistAttached(eq("run-test"), argThat(anchor ->
+                "ENVELOPE".equals(anchor.getFinalizerStep())));
+        verify(dispatchStore).transferToPending(eq("run-test"), any());
+        verify(capacity, never()).releaseReservation(any());
+        verifyNoInteractions(recorder);
+    }
+
+    @Test
+    void financePayloadWithoutFrozenSnapshotDoesNotWriteEnvelopeOrReturnSuccess() throws Exception {
+        fixtureDataset();
+        FinanceRecordChannelConfigLoader configLoader = mock(FinanceRecordChannelConfigLoader.class);
+        FinanceRecordChannelProcessor processor = mock(FinanceRecordChannelProcessor.class);
+        inject("financeRecordChannelConfigLoader", configLoader);
+        inject("financeRecordChannelProcessor", processor);
+        when(configLoader.frozenSnapshotJson()).thenReturn(null);
+
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(capacity.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(true);
+        when(dispatchStore.persistAttached(eq("run-test"), any())).thenReturn(true);
+        when(dispatchStore.transferToPending(eq("run-test"), any())).thenReturn(true);
+        when(sandbox.createTask(any())).thenAnswer(invocation -> {
+            ExecuteRequest request = invocation.getArgument(0);
+            return ExecuteResponse.newBuilder().setTaskId("task-finance")
+                    .setRequestFingerprint(request.getRequestFingerprint()).build();
+        });
+        when(sandbox.getTaskStatus(any())).thenReturn(
+                TaskStatusResponse.newBuilder().setStatus("SUCCEEDED").build());
+        when(sandbox.getTaskResult(any())).thenReturn(financeTerminalResult());
+
+        assertThrows(ExternalToolJobPendingException.class,
+                () -> tools.executePython("print(1)", "1", null, null, 30));
+
+        verify(processor, never()).process(any());
+        verify(dispatchStore, never()).persistAttached(eq("run-test"), argThat(anchor ->
+                "ENVELOPE".equals(anchor.getFinalizerStep())));
+        verify(dispatchStore).transferToPending(eq("run-test"), any());
+        verify(capacity, never()).releaseReservation(any());
+        verifyNoInteractions(recorder);
     }
 
     @Test
@@ -358,12 +554,77 @@ class PythonSandboxToolsDataIntenseTest {
 
         assertThat(output)
                 .contains("\"ok\":false")
-                .contains("\"code\":\"TASK_FAILED\"")
-                .contains("\"status\":\"FAILED\"");
+                .contains("\"code\":\"PYTHON_EXECUTION_FAILED\"")
+                .contains("\"retryable\":true", "\"action\":")
+                .doesNotContain("\"status\":", "task-dag-failed");
         verify(dispatchStore, never()).transferToPending(anyString(), any());
         verify(capacity).releaseReservation(any());
         verify(recorder).upsert(argThat(envelope ->
                 "FAILED".equals(envelope.terminalStatus()) && envelope.retryable()));
+    }
+
+    @Test
+    void legacyFailedTaskPreservesBoundedDiagnosticsInSharedFailureFormatter() throws Exception {
+        fixtureDataset();
+        // Force the legacy polling path while keeping the same sandbox/registry fixture.
+        inject("dataAnalysisCapacityService", null);
+        when(sandbox.createTask(any())).thenReturn(
+                ExecuteResponse.newBuilder().setTaskId("task-legacy-failed").build());
+        when(sandbox.getTaskStatus(any())).thenReturn(
+                TaskStatusResponse.newBuilder()
+                        .setStatus("FAILED")
+                        .setError("status-only fallback")
+                        .build());
+        when(sandbox.getTaskResult(any())).thenReturn(TaskResultResponse.newBuilder()
+                .setTaskId("task-legacy-failed")
+                .setStatus("FAILED")
+                .setExitCode(1)
+                .setStdout("rows-before-failure")
+                .setStderr("NameError: missing_value")
+                .setRetryable(true)
+                .build());
+
+        String output = tools.executePython(
+                "raise NameError('missing_value')", "1", null, null, 30);
+
+        assertThat(output)
+                .contains("\"ok\":false", "\"code\":\"PYTHON_EXECUTION_FAILED\"")
+                .contains("\"stdout\":\"rows-before-failure\"")
+                .contains("\"stderr\":\"NameError: missing_value\"")
+                .contains("\"retryable\":true", "\"action\":")
+                .doesNotContain("task-legacy-failed", "dataset_dir", "rawRef");
+        verify(sandbox).getTaskResult(any());
+    }
+
+    @Test
+    void legacyFinanceFailureWithoutDurableWiringNeverLeaksMarkerOrRawDiagnostics()
+            throws Exception {
+        fixtureDataset();
+        inject("dataAnalysisCapacityService", null);
+        when(sandbox.createTask(any())).thenReturn(
+                ExecuteResponse.newBuilder().setTaskId("task-legacy-finance").build());
+        when(sandbox.getTaskStatus(any())).thenReturn(
+                TaskStatusResponse.newBuilder().setStatus("FAILED").build());
+        when(sandbox.getTaskResult(any())).thenReturn(TaskResultResponse.newBuilder()
+                .setTaskId("task-legacy-finance")
+                .setStatus("FAILED")
+                .setExitCode(1)
+                .setStdout("__AF_FINANCE_RESULT_v1__{\"value\":0.1}\n")
+                .setStderr("backend path /sandbox/input")
+                .setFinanceRecordChannel(
+                        world.willfrog.alphafrogmicro.sandbox.idl.FinanceRecordChannelMetadata
+                                .newBuilder().setEmittedRecordCount(1).build())
+                .build());
+
+        String output = tools.executePython(
+                "raise RuntimeError()", "1", null, null, 30);
+
+        assertThat(output)
+                .contains("\"ok\":false")
+                .contains("\"code\":\"FINANCE_RECORD_DURABLE_WIRING_UNAVAILABLE\"")
+                .doesNotContain(
+                        "__AF_FINANCE_RESULT_", "/sandbox/input", "task-legacy-finance",
+                        "executionEnvironment", "financeRecordChannel");
     }
 
     @Test
@@ -1240,6 +1501,83 @@ class PythonSandboxToolsDataIntenseTest {
         verify(dispatchStore).transferToPending(eq("run-test"), any());
         verify(capacity, never()).releaseReservation(any());
         verifyNoInteractions(recorder);
+    }
+
+    private FinanceRecordChannelConfigLoader.Snapshot financeSnapshot() {
+        FinanceEnvironmentFact target = new FinanceEnvironmentFact(
+                "sha256:target",
+                "sha256:image-target",
+                "sha256:library-target",
+                List.of(new FinanceEnvironmentFact.PackageApi(
+                        "alphafrog_finance", "1.0.3", "1.0")),
+                true);
+        return new FinanceRecordChannelConfigLoader.Snapshot(
+                new FinanceRecordChannelLimits(
+                        true, 128, 16_384, 262_144, 1_048_576, 262_144,
+                        "sha256:target"),
+                target,
+                "sha256:config",
+                false);
+    }
+
+    private TaskResultResponse financeTerminalResult() {
+        return TaskResultResponse.newBuilder()
+                .setTaskId("task-finance")
+                .setStatus("SUCCEEDED")
+                .setExitCode(0)
+                .setStdout("rows=5\n__AF_FINANCE_RESULT_v1__{\"value\":0.12468265}")
+                .setDatasetDir("/sandbox/input")
+                .setRetryable(false)
+                .setResourceUsage(completeUsage())
+                .setFinanceRecordChannel(
+                        world.willfrog.alphafrogmicro.sandbox.idl.FinanceRecordChannelMetadata
+                                .newBuilder()
+                                .setEmittedRecordCount(1)
+                                .setEmittedRecordBytes(401)
+                                .setRecordSetComplete(true)
+                                .setRecordDigest("sha256:batch")
+                                .build())
+                .setExecutionEnvironment(SandboxEnvironmentIdentity.newBuilder()
+                        .setEnvironmentId("sha256:actual")
+                        .setImageDigest("sha256:image-actual")
+                        .setLibrarySetDigest("sha256:library-actual")
+                        .addPackageApis(SandboxPackageApi.newBuilder()
+                                .setName("alphafrog_finance")
+                                .setVersion("1.0.3")
+                                .setApiVersion("1.0")
+                                .build())
+                        .setInventoryComplete(true)
+                        .build())
+                .build();
+    }
+
+    private TaskResultResponse financeFailedTerminalResult() {
+        return financeTerminalResult().toBuilder()
+                .setTaskId("task-finance-failed")
+                .setStatus("FAILED")
+                .setExitCode(1)
+                .setError("boom")
+                .setStderr("boom")
+                .setStdout("rows-before-failure\n__AF_FINANCE_RESULT_v1__{\"value\":0.1}")
+                .setRetryable(true)
+                .build();
+    }
+
+    private FinanceRecordExtractionResult financeExtractionResult() {
+        FinanceRecordBatch batch = FinanceRecordBatch.builder()
+                .runId("run-test")
+                .todoId("todo-1")
+                .executePythonToolCallId("call-1")
+                .renderable(true)
+                .build();
+        FinanceMetricRecord record = FinanceMetricRecord.builder()
+                .methodId("finance.growth.cagr")
+                .valueJson("0.12468265")
+                .unit("ratio")
+                .renderable(true)
+                .build();
+        return new FinanceRecordExtractionResult(
+                batch, List.of(record), "rows=5", List.of(), true);
     }
 
     private void fixtureDataset() throws Exception {

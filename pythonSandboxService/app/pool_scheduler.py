@@ -14,6 +14,7 @@ from .sandbox_runner import (
     SANDBOX_WORKER_LABELS,
     create_sandbox_session,
     get_session_container_id,
+    initialize_runtime_environment,
     prepare_container_loader_modules,
     run_in_open_session,
     smoke_check_session,
@@ -127,6 +128,16 @@ class ContainerWorker:
         self.started_at = time.monotonic()
         self.last_used_at = self.started_at
         self._set_state("idle")
+        # 260808-finance-methodspec-v5 work package D: collect runtime
+        # environment once per warm container. The same ExecutionEnvironment
+        # instance drives the workdir file (written by initialize_runtime_environment),
+        # the AF_RUNTIME_ENVIRONMENT_FILE env var (set at container creation),
+        # and the HTTP execution_environment field for every task in this
+        # container. All tasks in the same pool container share this env by
+        # construction (same image, same baked packages).
+        self.execution_environment = initialize_runtime_environment(
+            self.config, session,
+        )
         logger.info(
             "POOL_WORKER_READY worker=%s container=%s slots=%s create_ms=%s",
             self.worker_id,
@@ -231,6 +242,7 @@ class ContainerWorker:
             prepare_loader_modules=False,
             resource_class=job.resource_class,
             usage_sampling_interval_millis=self.config.usage_sampling_interval_millis,
+            execution_environment=self.execution_environment,
         )
 
     def _on_job_done(self, job: SandboxJob, future: Future) -> None:

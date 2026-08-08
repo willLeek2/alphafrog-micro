@@ -4,6 +4,7 @@ import csv
 import io
 import json
 import logging
+import os
 import re
 import shlex
 import tempfile
@@ -17,6 +18,11 @@ from llm_sandbox.exceptions import SandboxTimeoutError
 from .config import SandboxConfig
 from .dataset_manifest import expand_dataset_ids
 from .resource_usage import SandboxResourceUsageCollector
+from .runtime_environment import (
+    ExecutionEnvironment,
+    collect_runtime_environment,
+    write_runtime_environment_json,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -882,6 +888,15 @@ def create_sandbox_session(
         "mem_limit": effective_memory_limit,
         "memswap_limit": effective_memory_limit if memory_limit_bytes else config.memswap_limit,
         "labels": SANDBOX_WORKER_LABELS,
+        # 260808-finance-methodspec-v5 work package D: contract with package
+        # B/C (ccqwen). The Python finance library reads environmentId from
+        # the read-only task environment file; the file path is communicated
+        # to user code via this env var, set at container creation so all
+        # child processes (including session.run()) inherit it. The file
+        # itself is written below in this function after session.open().
+        "environment": [
+            f"AF_RUNTIME_ENVIRONMENT_FILE={config.workdir.rstrip('/')}/runtime-environment.json",
+        ],
     }
     session = SandboxSession(
         lang="python",
@@ -894,6 +909,53 @@ def create_sandbox_session(
     )
     session.open()
     return session
+
+
+def initialize_runtime_environment(
+    config: SandboxConfig,
+    session: SandboxSession,
+    *,
+    task_id: str | None = None,
+) -> ExecutionEnvironment:
+    """Collect runtime environment single-source and persist it to the workdir.
+
+    Called once per container after create_sandbox_session(). The
+    AF_RUNTIME_ENVIRONMENT_FILE env var was set at container creation; this
+    function writes the file at that path so user code can read it via
+    os.environ[AF_RUNTIME_ENVIRONMENT_FILE] and follow the contract with
+    package B/C (ccqwen reporting library).
+
+    Returns the ExecutionEnvironment instance so the caller can surface it on
+    the HTTP execution_environment field; one ExecutionEnvironment drives
+    both the workdir file and the wire field (single-source invariant).
+
+    For non-pool mode, task_id is logged to aid ops correlation. For pool
+    mode, task_id may be None because the same container serves many tasks;
+    the environment is constant per container so the file is logically
+    valid for any task in that container.
+    """
+    container_id = get_session_container_id(session)
+    env = collect_runtime_environment(container_id=container_id, session=session)
+    env_file_path = os.path.join(
+        config.workdir.rstrip("/"), "runtime-environment.json",
+    )
+    try:
+        write_runtime_environment_json(config.workdir, env)
+    except Exception as exc:
+        logger.warning(
+            "RUNTIME_ENVIRONMENT_FILE_WRITE_FAILED container=%s task=%s error=%s",
+            container_id, task_id, exc,
+        )
+    else:
+        logger.info(
+            "RUNTIME_ENVIRONMENT_READY container=%s task=%s environment_id=%s "
+            "image_digest=%s library_set_digest=%s package_count=%s "
+            "inventory_complete=%s file=%s",
+            container_id, task_id or "-", env.environment_id, env.image_digest,
+            env.library_set_digest, len(env.package_apis),
+            env.inventory_complete, env_file_path,
+        )
+    return env
 
 
 def get_session_container_id(session: SandboxSession) -> str:
@@ -1008,6 +1070,7 @@ def run_in_open_session(
     prepare_loader_modules: bool = True,
     resource_class: str = "STANDARD",
     usage_sampling_interval_millis: int | None = None,
+    execution_environment: ExecutionEnvironment | None = None,
 ) -> dict:
     """Run one task inside an already-open session.
 
@@ -1060,6 +1123,14 @@ def run_in_open_session(
             copy_loader_modules=prepare_loader_modules,
         )
         timings["workspace_prepare_ms"] = int((time.monotonic() - t_workspace_start) * 1000)
+
+        # 260808-finance-methodspec-v5 work package D: ExecutionEnvironment was
+        # collected by initialize_runtime_environment() once per container; the
+        # caller passes it in here so we can surface the same instance on the
+        # HTTP execution_environment field (single-source invariant).
+        # initialize_runtime_environment() already wrote the workdir file and
+        # set the AF_RUNTIME_ENVIRONMENT_FILE env var at container creation,
+        # so we do NOT re-collect per task.
 
         _log_in_container(session, task_id, config, "script_start")
         t_run_start = time.monotonic()
@@ -1154,6 +1225,15 @@ def run_in_open_session(
         "recycle_reason": recycle_reason,
         "container_id": actual_container_id,
         "resource_usage": resource_usage.model_dump(mode="json"),
+        # 260808-finance-methodspec-v5 work package D: caller-supplied
+        # ExecutionEnvironment instance is surfaced here on the HTTP
+        # ExecuteResult; gateway presence-aware mapping then sets the proto
+        # executionEnvironment parent when this is non-None. The same
+        # instance is the workdir file's contents (single-source invariant).
+        "execution_environment": (
+            execution_environment.model_dump(mode="json")
+            if execution_environment is not None else None
+        ),
     }
 
 
@@ -1183,6 +1263,14 @@ def run_in_sandbox(
     )
     container_create_ms = int((time.monotonic() - t_create_start) * 1000)
     container_id = get_session_container_id(session)
+    # 260808-finance-methodspec-v5 work package D: single-source env collection.
+    # The same ExecutionEnvironment instance drives the workdir file (written
+    # here), the AF_RUNTIME_ENVIRONMENT_FILE env var (set at container
+    # creation), and the HTTP execution_environment field (passed to
+    # run_in_open_session).
+    execution_environment = initialize_runtime_environment(
+        config, session, task_id=task_id,
+    )
     try:
         result = run_in_open_session(
             config,
@@ -1200,6 +1288,7 @@ def run_in_sandbox(
             container_id=container_id,
             pool_enabled=False,
             resource_class=resource_class,
+            execution_environment=execution_environment,
         )
         timings = result.setdefault("timings", {})
         timings["container_create_ms"] = container_create_ms
