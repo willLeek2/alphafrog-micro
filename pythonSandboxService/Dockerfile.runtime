@@ -1,4 +1,42 @@
-FROM python:3.13-slim
+# AlphaFrog pythonSandboxService sandbox runtime image (MethodSpec V5, Spec §12).
+#
+# Spec §12 实施要求 implemented here:
+#   - 基础镜像固定到已验证摘要，不使用裸 python:3.13-slim 标签；
+#   - 四个现有 Python 包版本从 Dockerfile 内联文字移到锁文件 requirements-image.lock；
+#   - library-set.json 在镜像外由 docker_build.sh 从镜像内【真实解释器】查询并
+#     校验后的实际清单生成（round-2 R2-2），再烘焙进最终镜像；librarySetDigest
+#     写入 OCI 镜像标签；
+#   - 最终 imageDigest → digests 对照文件在镜像外、image ID 确定后生成
+#     （见 docker_build.sh），绝不写回镜像标签（禁止自引用）。
+#
+# Round-2 (R2-1/R2-2) TWO-PHASE build orchestrated by docker_build.sh:
+#   phase 1 (stage runtime-install): install the locked library set, then pip
+#     install the REAL alphafrog_finance distribution from runtime/ -- its
+#     _generated/method_specs.json is a BUILD PRODUCT written host-side by
+#     docker_build.sh (runtime/scripts/generate_method_bindings.py against
+#     work package A's canonical JSON) BEFORE the build; hand-copied method
+#     triples are forbidden (Spec §6). A generator failure aborts the build;
+#   BETWEEN the phases docker_build.sh runs, via `docker run` against the
+#     phase-1 image: the smoke gate (scripts/smoke_runtime_image.py under the
+#     SYSTEM python AND the compat venv) and the inventory query
+#     (scripts/runtime_image_inventory.py), verified fail-closed against
+#     requirements-image.lock;
+#   phase 2 (final stage): FROM the phase-1 image by IMMUTABLE ID, bakes the
+#     inventory-VERIFIED library-set.json and sets the OCI labels. Labels are
+#     static metadata, so librarySetDigest can only be written here, after the
+#     actual inventory was queried and verified.
+#
+# PLACEHOLDER WARNING: RUNTIME_BASE_IMAGE_REF below is a documented
+# placeholder token, not a real image reference. frog (the human release
+# owner) pins the verified base image (python:<tag>@sha256:<64 lowercase
+# hex>) at release time (Spec §12: agents never invent production values).
+# Until it is replaced, any real `docker build` will fail at the FROM step --
+# that failure is intentional and loud. docker_build.sh normally supplies the
+# verified reference; ONLY a dev structural build behind the explicit switch
+# AF_SANDBOX_ALLOW_INCOMPLETE_DEV_BUILD may pass the bare base tag instead
+# (such a build is marked releasable=false and refused by deploy_latest.sh).
+ARG RUNTIME_BASE_IMAGE_REF=REPLACE_WITH_VERIFIED_BASE_IMAGE_REF
+FROM ${RUNTIME_BASE_IMAGE_REF} AS runtime-install
 
 ARG PIP_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL
@@ -8,30 +46,55 @@ ARG https_proxy
 # Create sandbox working directory
 RUN mkdir -p /sandbox && chmod 777 /sandbox
 
-# Pre-create venv and pip cache directories that llm-sandbox expects. The
-# custom scheduler opens new SandboxSession containers with
-# skip_environment_setup=True, so llm-sandbox executes code with system
-# `python`. Install packages into system Python first; the venv uses
-# --system-site-packages as compatibility for paths that explicitly use
-# /sandbox/.sandbox-venv/bin/python.
+# Lockfile (source of truth for the EXPECTED runtime library set; the baked
+# manifest itself comes from the verified ACTUAL in-image inventory, R2-2).
+COPY requirements-image.lock /opt/alphafrog/build/requirements-image.lock
+
+# Install the locked runtime library set. Pre-create venv and pip cache
+# directories that llm-sandbox expects. The custom scheduler opens new
+# SandboxSession containers with skip_environment_setup=True, so llm-sandbox
+# executes code with system `python`. Install packages into system Python
+# first; the venv uses --system-site-packages as compatibility for paths that
+# explicitly use /sandbox/.sandbox-venv/bin/python.
+# (Proxy/index branching preserved from the pre-Spec-§12 Dockerfile; the only
+#  change is that package pins now come from requirements-image.lock.)
 RUN set -eux; \
-    PKGS="numpy==2.4.1 pandas==2.3.3 matplotlib==3.10.8 scipy==1.17.0"; \
+    LOCK=/opt/alphafrog/build/requirements-image.lock; \
     if [ -n "${PIP_INDEX_URL:-}" ]; then \
       unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY; \
       if [ -n "${PIP_EXTRA_INDEX_URL:-}" ]; then \
-        python -m pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" --extra-index-url "${PIP_EXTRA_INDEX_URL}" ${PKGS}; \
+        python -m pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" --extra-index-url "${PIP_EXTRA_INDEX_URL}" -r ${LOCK}; \
       else \
-        python -m pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" ${PKGS}; \
+        python -m pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" -r ${LOCK}; \
       fi; \
     else \
       export http_proxy="${http_proxy:-}" https_proxy="${https_proxy:-}"; \
-      python -m pip install --no-cache-dir ${PKGS}; \
+      python -m pip install --no-cache-dir -r ${LOCK}; \
     fi; \
     python -m venv --system-site-packages /sandbox/.sandbox-venv; \
     mkdir -p /sandbox/.sandbox-pip-cache
 
-# Build-time smoke: verify both the actual runtime Python and compatibility venv
-# can import the pre-installed packages.
+# The alphafrog_finance distribution source (work package B, byte-exact).
+# runtime/src/alphafrog_finance/_generated/method_specs.json is generated
+# host-side by docker_build.sh BEFORE this build (generate_method_bindings.py
+# against A's canonical method-spec JSON); it is gitignored, never committed,
+# and a generator failure aborts the build before `docker build` ever runs.
+COPY runtime/ /opt/alphafrog/build/runtime/
+
+# REAL pip install of the alphafrog_finance distribution: metadata name
+# alphafrog_finance, dynamic version == alphafrog_finance.__version__, wheel
+# package data carries the generated method_specs.json (Spec §6). Non-zero
+# exit aborts the build.
+RUN python -m pip install --no-cache-dir /opt/alphafrog/build/runtime
+
+# Post-build gate helpers. docker_build.sh invokes them via `docker run`
+# against this stage: smoke gate under BOTH interpreters (system python and
+# the compat venv), then the actual-inventory query (R2-1/R2-2).
+COPY scripts/smoke_runtime_image.py /opt/alphafrog/build/smoke_runtime_image.py
+COPY scripts/runtime_image_inventory.py /opt/alphafrog/build/runtime_image_inventory.py
+
+# Build-time smoke: verify both the actual runtime Python and compatibility
+# venv can import the pre-installed packages.
 RUN python - <<'PY'
 import sys, os
 print("sandbox-smoke: python", sys.version)
@@ -55,3 +118,55 @@ RUN /sandbox/.sandbox-venv/bin/python - <<'PY'
 import numpy, pandas, matplotlib, scipy
 print("sandbox-smoke: venv imports passed")
 PY
+
+# --- phase 2: finalize with the inventory-VERIFIED manifest (R2-2) ---------
+# FROM the phase-1 image by IMMUTABLE ID: docker_build.sh supplies it only
+# after the smoke gate and the inventory verification passed against exactly
+# that image. Never a mutable tag -- the two phases must refer to the SAME
+# verified install. Direct `docker build` without docker_build.sh fails
+# loudly at FROM (placeholder token).
+ARG AF_RUNTIME_INSTALL_IMAGE=REPLACE_WITH_RUNTIME_INSTALL_STAGE_IMAGE_ID
+FROM ${AF_RUNTIME_INSTALL_IMAGE}
+
+# Build attestation inputs, supplied by docker_build.sh (Spec §12).
+#   AF_LOCK_DIGEST              = sha256 of requirements-image.lock
+#   AF_METHOD_SPEC_INDEX_DIGEST = digest of the MethodSpec index (built by the
+#                                 MethodSpec work package; never fabricated)
+#   AF_LIBRARY_SET_DIGEST       = librarySetDigest computed on the host by
+#                                 scripts/build_runtime_manifest.py over the
+#                                 VERIFIED ACTUAL in-image inventory (R2-2),
+#                                 written into an OCI label (labels are static
+#                                 metadata and cannot be set from a RUN step)
+#   AF_BASE_IMAGE_DIGEST        = the verified base-image digest pinned above
+ARG AF_LOCK_DIGEST
+ARG AF_METHOD_SPEC_INDEX_DIGEST
+ARG AF_LIBRARY_SET_DIGEST
+ARG AF_BASE_IMAGE_DIGEST
+
+# OCI image labels carry the build-time digests (Spec §12).
+# com.alphafrog.runtime=true marks this image as a managed runtime image:
+# scripts/prune_runtime_images.sh only ever touches images with this label.
+# sbomDigest is intentionally NOT a label: the SBOM is generated from the
+# finished image, so its digest can only live in the external mapping file --
+# writing it back here would require rebuilding the image (self-reference).
+LABEL com.alphafrog.runtime="true" \
+      com.alphafrog.schemaVersion="1" \
+      com.alphafrog.lockDigest="${AF_LOCK_DIGEST}" \
+      com.alphafrog.librarySetDigest="${AF_LIBRARY_SET_DIGEST}" \
+      com.alphafrog.methodSpecIndexDigest="${AF_METHOD_SPEC_INDEX_DIGEST}" \
+      com.alphafrog.baseImageDigest="${AF_BASE_IMAGE_DIGEST}"
+
+# Bake the inventory-VERIFIED library-set.json (Spec §12 + R2-2): the SAME
+# document docker_build.sh verified against the image's actual executing
+# interpreter and used for the OCI librarySetDigest label and the external
+# mapping. Fail loudly if the attestation build args are missing: an image
+# without a verified manifest must never be produced silently. Build via
+# docker_build.sh, which computes these values on the host.
+RUN if [ -z "${AF_LOCK_DIGEST}" ] || [ -z "${AF_METHOD_SPEC_INDEX_DIGEST}" ] || [ -z "${AF_LIBRARY_SET_DIGEST}" ]; then \
+      echo "ERROR: AF_LOCK_DIGEST, AF_METHOD_SPEC_INDEX_DIGEST and AF_LIBRARY_SET_DIGEST build args are required (Spec §12)." >&2; \
+      echo "       Build the runtime image via pythonSandboxService/docker_build.sh runtime." >&2; \
+      exit 1; \
+    fi
+COPY .runtime-build/library-set.json /opt/alphafrog/runtime/library-set.json
+RUN echo "--- /opt/alphafrog/runtime/library-set.json ---" && \
+    cat /opt/alphafrog/runtime/library-set.json
