@@ -1,6 +1,6 @@
 # 金融 MethodSpec V5 共同协议
 
-状态：`DRAFT_FOR_CROSS_REVIEW`
+状态：`FROZEN`
 
 适用父任务：`#af-v1p1 task #96`
 
