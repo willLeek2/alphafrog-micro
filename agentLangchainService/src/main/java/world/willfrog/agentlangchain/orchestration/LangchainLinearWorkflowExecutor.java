@@ -561,20 +561,11 @@ public class LangchainLinearWorkflowExecutor {
     }
 
     private String resumeTerminalOutput(ToolJobResumeContext context) {
-        // preview 是有界可读内容，rawRef 是完整产物位置；优先同时保留。
+        // preview 是有界可读内容；rawRef 是完整产物位置，仅用于内部数据集引用，
+        // 不泄露给模型上下文。
         String preview = context.getTerminalResultPreview();
-        String rawRef = context.getTerminalRawRef();
-        // 与普通工具结果格式保持一致，后续节点可以继续识别 rawRef。
-        if (!isBlank(preview) && !isBlank(rawRef)) {
-            return preview.trim() + "\nrawRef: " + rawRef.trim();
-        }
-        // 只有 preview 时直接注入文本，不制造空 rawRef。
         if (!isBlank(preview)) {
             return preview.trim();
-        }
-        // 大结果可能只有 rawRef，仍提供可被 DatasetRefRegistry 识别的标记。
-        if (!isBlank(rawRef)) {
-            return "rawRef: " + rawRef.trim();
         }
         // 终态缺少可见正文时给确定性占位，避免 null 破坏后续 prompt 构建。
         return context.isTerminalSuccess() ? "external tool completed" : "external tool failed";

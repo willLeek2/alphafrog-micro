@@ -78,7 +78,8 @@ class LangchainLinearWorkflowResumeTest {
         assertThat(result.getCompletedTodos()).extracting(LangchainCompletedTodo::getTodoId)
                 .containsExactly("todo-1", "todo-2", "todo-3");
         assertThat(result.getCompletedTodos().get(1).displayOutput())
-                .contains("terminal-preview", "artifact://result-1");
+                .contains("terminal-preview")
+                .doesNotContain("artifact://result-1");
         assertThat(consumed.get()).isEqualTo(1);
         assertThat(resumeTokenSeenByNextTodo.get()).isEqualTo("token-1");
         assertThat(resumeVersionSeenByNextTodo.get()).isEqualTo(2L);
