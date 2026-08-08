@@ -69,6 +69,9 @@ alphafrog:
         - data-id: ${AF_CONFIG_NACOS_AGENT_LLM_DATA_ID:agent-llm.json}
           group: ${AF_CONFIG_NACOS_GROUP:alphafrog-config}
           target-file: ${AF_AGENT_LLM_CONFIG_FILE:}
+        - data-id: ${AF_CONFIG_NACOS_FINANCE_RECORD_DATA_ID:finance-record-channel.json}
+          group: ${AF_CONFIG_NACOS_GROUP:alphafrog-config}
+          target-file: ${AF_FINANCE_RECORD_CHANNEL_CONFIG_FILE:}
 
 stress:
   test:

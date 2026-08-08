@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="world.willfrog.agent.platform.mapper.FinanceMethodResolutionMapper">
+    <resultMap id="ResolutionMap" type="world.willfrog.agent.platform.finance.FinanceMethodResolution">
+        <id property="id" column="id"/>
+        <result property="runId" column="run_id"/>
+        <result property="resolverToolCallId" column="resolver_tool_call_id"/>
+        <result property="todoId" column="todo_id"/>
+        <result property="methodId" column="method_id"/>
+        <result property="methodVersion" column="method_version"/>
+        <result property="specDigest" column="spec_digest"/>
+        <result property="catalogDigest" column="catalog_digest"/>
+        <result property="resolverSchemaVersion" column="resolver_schema_version"/>
+        <result property="resolverPromptVersion" column="resolver_prompt_version"/>
+        <result property="modelRouteJson" column="model_route_json"/>
+        <result property="matchReason" column="match_reason"/>
+        <result property="clarificationJson" column="clarification_json"/>
+        <result property="targetEnvironmentId" column="target_environment_id"/>
+        <result property="targetPackageApiJson" column="target_package_api_json"/>
+        <result property="resolutionPayloadJson" column="resolution_payload_json"/>
+        <result property="resolutionContentDigest" column="resolution_content_digest"/>
+        <result property="createdAt" column="created_at"/>
+    </resultMap>
+
+    <sql id="Columns">
+        id, run_id, resolver_tool_call_id, todo_id, method_id, method_version, spec_digest,
+        catalog_digest, resolver_schema_version, resolver_prompt_version,
+        model_route_json::text AS model_route_json, match_reason,
+        clarification_json::text AS clarification_json, target_environment_id,
+        target_package_api_json::text AS target_package_api_json,
+        resolution_payload_json::text AS resolution_payload_json,
+        resolution_content_digest, created_at
+    </sql>
+
+    <insert id="insertIgnore" parameterType="world.willfrog.agent.platform.finance.FinanceMethodResolution">
+        INSERT INTO alphafrog_agent_finance_method_resolution
+        (run_id, resolver_tool_call_id, todo_id, method_id, method_version, spec_digest,
+         catalog_digest, resolver_schema_version, resolver_prompt_version, model_route_json,
+         match_reason, clarification_json, target_environment_id, target_package_api_json,
+         resolution_payload_json, resolution_content_digest)
+        VALUES
+        (#{runId}, #{resolverToolCallId}, #{todoId}, #{methodId}, #{methodVersion}, #{specDigest},
+         #{catalogDigest}, #{resolverSchemaVersion}, #{resolverPromptVersion},
+         CAST(#{modelRouteJson} AS jsonb), #{matchReason}, CAST(#{clarificationJson} AS jsonb),
+         #{targetEnvironmentId}, CAST(#{targetPackageApiJson} AS jsonb),
+         CAST(#{resolutionPayloadJson} AS jsonb), #{resolutionContentDigest})
+        ON CONFLICT (run_id, resolver_tool_call_id, method_id, method_version, spec_digest)
+        DO NOTHING
+    </insert>
+
+    <select id="findExact" resultMap="ResolutionMap">
+        SELECT <include refid="Columns"/>
+        FROM alphafrog_agent_finance_method_resolution
+        WHERE run_id = #{runId}
+          AND resolver_tool_call_id = #{resolverToolCallId}
+          AND method_id = #{methodId}
+          AND method_version = #{methodVersion}
+          AND spec_digest = #{specDigest}
+        LIMIT 1
+    </select>
+
+    <select id="listByRun" resultMap="ResolutionMap">
+        SELECT <include refid="Columns"/>
+        FROM alphafrog_agent_finance_method_resolution
+        WHERE run_id = #{runId}
+        ORDER BY created_at, id
+    </select>
+</mapper>

@@ -43,15 +43,20 @@ class NacosConfigBridgeTest {
         environment.setProperty("alphafrog.config.nacos.subscriptions[1].data-id", "agent-llm.json");
         environment.setProperty("alphafrog.config.nacos.subscriptions[1].group", "alphafrog-config");
         environment.setProperty("alphafrog.config.nacos.subscriptions[1].target-file", "/app/config-dynamic/agent-llm.json");
+        environment.setProperty("alphafrog.config.nacos.subscriptions[2].data-id", "finance-record-channel.json");
+        environment.setProperty("alphafrog.config.nacos.subscriptions[2].group", "alphafrog-config");
+        environment.setProperty("alphafrog.config.nacos.subscriptions[2].target-file", "/app/config-dynamic/finance-record-channel.local.json");
 
         NacosConfigBridge bridge = new NacosConfigBridge(objectMapper, environment);
         List<NacosConfigBridge.Subscription> subscriptions = invokeResolveSubscriptions(bridge);
 
-        assertEquals(2, subscriptions.size());
+        assertEquals(3, subscriptions.size());
         assertEquals("code-refine.json", subscriptions.get(0).getDataId());
         assertEquals("/app/config-dynamic/code-refine.json", subscriptions.get(0).getTargetFile());
         assertEquals("agent-llm.json", subscriptions.get(1).getDataId());
         assertEquals("/app/config-dynamic/agent-llm.json", subscriptions.get(1).getTargetFile());
+        assertEquals("finance-record-channel.json", subscriptions.get(2).getDataId());
+        assertEquals("/app/config-dynamic/finance-record-channel.local.json", subscriptions.get(2).getTargetFile());
     }
 
     @Test
