@@ -1,0 +1,13 @@
+schemaVersion: "1"
+methodId: finance.growth.cagr
+version: 1.0.0
+displayName: 复合增长率（增长）
+definition: 增长空间下的复合年均增长率
+resolverHints:
+  aliases: [增长CAGR]
+parameters:
+  beginningValue: {type: number, required: true}
+  endingValue: {type: number, required: true}
+  periods: {type: integer, required: true, minimum: 1}
+outputs:
+  - {name: cagr, unit: ratio, description: 复合增长率}

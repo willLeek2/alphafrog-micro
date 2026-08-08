@@ -108,4 +108,46 @@ class AgentPromptServiceTest {
         f.setDescription(desc);
         return f;
     }
+
+    @Test
+    void financeMethodResolverTemplate_shouldPreferDirectConfigText() {
+        AgentLlmProperties.Prompts prompts = properties.getPrompts();
+        prompts.setFinanceMethodResolverSystemPrompt("direct resolver template {{RESOLVER_CATALOG}}");
+        prompts.setFinanceMethodResolverSystemPromptFile("local file content that must lose");
+
+        String template = service.financeMethodResolverSystemPromptTemplate();
+
+        assertEquals("direct resolver template {{RESOLVER_CATALOG}}", template);
+    }
+
+    @Test
+    void financeMethodResolverTemplate_shouldUseResolvedLocalFileContentOverClasspath() {
+        // loader 已把 file: 引用解析成正文（多行，不可能是 classpath 资源名）；必须优先于 classpath 默认文件
+        AgentLlmProperties.Prompts prompts = properties.getPrompts();
+        prompts.setFinanceMethodResolverSystemPromptFile("local resolver template line1\nline2 {{RESOLVER_CATALOG}}");
+
+        String template = service.financeMethodResolverSystemPromptTemplate();
+
+        assertEquals("local resolver template line1\nline2 {{RESOLVER_CATALOG}}", template);
+    }
+
+    @Test
+    void financeMethodResolverTemplate_shouldLoadClasspathPathValue() {
+        // 历史取值语义：裸 classpath 路径（application-agent-llm-prompts.yml 的默认配置形态）
+        AgentLlmProperties.Prompts prompts = properties.getPrompts();
+        prompts.setFinanceMethodResolverSystemPromptFile("prompts/finance/finance_method_resolver_system.txt");
+
+        String template = service.financeMethodResolverSystemPromptTemplate();
+
+        assertFalse(template.isBlank());
+        assertTrue(template.contains("{{RESOLVER_CATALOG}}"));
+    }
+
+    @Test
+    void financeMethodResolverTemplate_shouldFallBackToClasspathDefaultWhenUnset() {
+        String template = service.financeMethodResolverSystemPromptTemplate();
+
+        assertFalse(template.isBlank());
+        assertTrue(template.contains("{{RESOLVER_CATALOG}}"));
+    }
 }

@@ -22,6 +22,7 @@ import world.willfrog.agent.tools.docs.LoadToolGuideTool;
 import world.willfrog.agent.tools.dataset.ListMyDataTool;
 import world.willfrog.agent.tools.compaction.RereadToolHandler;
 import world.willfrog.agent.tools.compaction.ToolOutputCompactionService;
+import world.willfrog.agent.tools.finance.FinanceMethodTools;
 import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.agent.tools.market.advanced.AdvancedSearchRequest;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
@@ -107,6 +108,8 @@ public class ToolRouter {
     private final SearchTools searchTools;
     /** Python 沙箱执行工具集（executePython） */
     private final PythonSandboxTools pythonSandboxTools;
+    /** 金融方法建议工具（resolveFinanceMethods），只读建议工具。 */
+    private final FinanceMethodTools financeMethodTools;
     /** 平台工具指南加载工具（loadToolGuide） */
     private final LoadToolGuideTool loadToolGuideTool;
     /** 260623-harness-optimization-02: 列出当前 agent run 已落盘 dataset / manifest（listMyData） */
@@ -343,6 +346,7 @@ public class ToolRouter {
                 "loadDocument",
                 "searchWeb",
                 "executePython",
+                "resolveFinanceMethods",
                 "loadToolGuide",
                 "rereadToolResult",
                 "spawnSubAgent",
@@ -630,6 +634,10 @@ public class ToolRouter {
                         str(params.get("timeRangeStart"), params.get("time_range_start"), params.get("arg6")),
                         str(params.get("timeRangeEnd"), params.get("time_range_end"), params.get("arg7")),
                         toIntWithDefault(5, params.get("maxResults"), params.get("max_results"), params.get("arg8"))
+                );
+                case "resolveFinanceMethods" -> financeMethodTools.resolveFinanceMethods(
+                        str(params.get("query"), params.get("arg0")),
+                        str(params.get("context"), params.get("arg1"))
                 );
                 case "executePython" -> invokeExecutePython(params);
                 case "loadToolGuide" -> loadToolGuideTool.loadToolGuide(

@@ -663,6 +663,26 @@ public class AgentContext {
         return traceId;
     }
 
+    /**
+     * 非破坏读取 provider trace ID（不消费）。
+     *
+     * <p>供内嵌轻量模型调用（如 finance_method_resolver）在外层值作用域内做快照/恢复；
+     * 正常记录链路仍应使用 {@link #consumeProviderLlmTraceId()}。</p>
+     */
+    public static String peekProviderLlmTraceId() {
+        return PROVIDER_LLM_TRACE_ID_HOLDER.get();
+    }
+
+    /** 非破坏读取 LLM request meta（不消费），用途同 {@link #peekProviderLlmTraceId()}。 */
+    public static Map<String, Object> peekLlmCallRequestMeta() {
+        return LLM_CALL_REQUEST_META_HOLDER.get();
+    }
+
+    /** 非破坏读取最近一次 observability 记录的 traceId（不清理），用途同上。 */
+    public static String peekLastRecordedLlmTraceId() {
+        return LAST_RECORDED_LLM_TRACE_ID_HOLDER.get();
+    }
+
     /** 为下一次 LLM observability 记录附带 request meta。 */
     public static void setLlmCallRequestMeta(Map<String, Object> requestMeta) {
         if (requestMeta == null || requestMeta.isEmpty()) {

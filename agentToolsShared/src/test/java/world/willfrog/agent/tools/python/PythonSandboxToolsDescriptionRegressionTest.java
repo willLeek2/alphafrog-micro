@@ -21,10 +21,21 @@ class PythonSandboxToolsDescriptionRegressionTest {
                 "tool description 必须包含 paths_dataset.csv");
         assertTrue(desc.contains("path_manifest.csv"),
                 "tool description 必须包含 path_manifest.csv");
-        assertTrue(desc.contains("listMyData"),
-                "tool description 必须包含 listMyData 恢复路径");
-        assertTrue(desc.contains("ILLEGAL_RUN_LEVEL_IDS"),
-                "tool description 必须包含非法编号错误码");
+        assertTrue(desc.contains("resolveFinanceMethods"),
+                "tool description 必须提示可把金融问题原始表达交给 resolveFinanceMethods");
+        assertTrue(desc.contains("unresolved boundaries") || desc.contains("未解决边界") || desc.contains("do not invent"),
+                "tool description 必须提示候选有未解决边界时不能擅自补造");
+        assertTrue(desc.contains("source_resolver_tool_call_id") || desc.contains("resolverToolCallId"),
+                "tool description 必须提示显式传递 source_resolver_tool_call_id");
+    }
+
+    @Test
+    void loadToolDescription_shouldMentionCompatibleLibraryPreference() {
+        String desc = PythonSandboxTools.loadToolDescription();
+        assertTrue(desc.contains("compatible public libraries") || desc.contains("兼容公共库"),
+                "tool description 必须提示优先使用兼容公共库但不强制");
+        assertTrue(desc.contains("custom calculations") || desc.contains("自定义计算"),
+                "tool description 必须提示自定义计算按通用字段声明");
     }
 
     @Test
