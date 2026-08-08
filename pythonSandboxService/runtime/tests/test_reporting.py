@@ -23,7 +23,15 @@ _SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-from alphafrog_finance import cagr, report, report_custom, MARKER
+from alphafrog_finance import (
+    FinanceMetricResult,
+    annualized_volatility,
+    cagr,
+    report,
+    report_custom,
+    sharpe,
+    MARKER,
+)
 from alphafrog_finance import reporting
 
 _SERVICE_ROOT = os.path.dirname(
@@ -38,7 +46,17 @@ _SPECS = {
     "finance.growth.cagr": {
         "methodVersion": "1.0.0",
         "specDigest": "sha256:spec-example",
-    }
+    },
+    # Stand-in canonical entries so report() can emit the other two public
+    # methods in tests; the real triples come from A's canonical JSON.
+    "finance.risk.annualized_volatility": {
+        "methodVersion": "1.0.0",
+        "specDigest": "sha256:spec-volatility-example",
+    },
+    "finance.risk.sharpe_ratio": {
+        "methodVersion": "1.0.0",
+        "specDigest": "sha256:spec-sharpe-example",
+    },
 }
 
 
@@ -330,6 +348,352 @@ class TestDigestRoundTrip(ReportingTestBase):
         self.assertEqual(hashlib.sha256(_payload_of(line2).encode("utf-8")).hexdigest(), raw_digest)
         self.assertEqual(len(raw_digest), 64)
         self.assertEqual(len(record_digest), 64)
+
+
+class TestReportParametersEchoIncludingReturns(ReportingTestBase):
+    """ITEM 1 (codex must-fix 0c147646): the emitted record must echo
+    ``parameters`` EXACTLY as computed, including the canonical required
+    ``returns`` sequence (contract §3.5 parameter table)."""
+
+    def test_volatility_record_echoes_returns_and_window_exactly(self):
+        returns = [0.01, -0.02, 0.015, 0.005, -0.01, 0.02]
+        result = annualized_volatility(returns, periods_per_year=12, window=4)
+        line, _ = self.capture_report(result)
+        record = json.loads(_payload_of(line))
+        self.assertEqual(
+            record["parameters"],
+            {"returns": returns, "periodsPerYear": 12, "window": 4},
+        )
+        self.assertEqual(record["methodId"], "finance.risk.annualized_volatility")
+
+    def test_sharpe_record_echoes_returns_exactly(self):
+        returns = [0.012, -0.008, 0.021, 0.004, 0.011]
+        result = sharpe(returns, risk_free_rate=0.02, periods_per_year=252)
+        line, _ = self.capture_report(result)
+        record = json.loads(_payload_of(line))
+        self.assertEqual(
+            record["parameters"],
+            {
+                "returns": returns,
+                "riskFreeRate": 0.02,
+                "riskFreeRateConvention": "annual",
+                "ddof": 1,
+                "periodsPerYear": 252,
+                "returnConvention": "arithmetic",
+            },
+        )
+        self.assertEqual(record["methodId"], "finance.risk.sharpe_ratio")
+
+
+class TestReportCustomMethodTriple(ReportingTestBase):
+    """ITEM 2 (codex must-fix 0c147646): the frozen contract (§4.3) allows a
+    custom record with source only, OR source + the COMPLETE method triple —
+    report_custom() takes three optional triple parameters and enforces
+    ALL-OR-NONE: exactly 0 or exactly 3 present."""
+
+    _TRIPLE = {
+        "method_id": "finance.growth.cagr",
+        "method_version": "1.0.0",
+        "spec_digest": "sha256:spec-example",
+    }
+
+    def _base_kwargs(self):
+        return {
+            "formula_description": "f(x)",
+            "input_refs": ["dataset:1"],
+            "output_unit": "ratio",
+        }
+
+    def test_no_triple_emits_no_triple_fields(self):
+        line, _ = self.capture_report_custom(1.0, **self._base_kwargs())
+        record = json.loads(_payload_of(line))
+        for key in ("methodId", "methodVersion", "specDigest"):
+            self.assertNotIn(key, record)
+
+    def test_all_three_emit_complete_triple_and_field_order(self):
+        kwargs = {**self._base_kwargs(), **self._TRIPLE}
+        line, _ = self.capture_report_custom(
+            1.0, source_resolver_tool_call_id="tool-call-resolver-3", **kwargs
+        )
+        record = json.loads(_payload_of(line))
+        # Field order mirrors the library record (§4.3 example): the triple
+        # comes right after schemaVersion, before the source association.
+        self.assertEqual(
+            list(record.keys()),
+            [
+                "schemaVersion",
+                "methodId",
+                "methodVersion",
+                "specDigest",
+                "sourceResolverToolCallId",
+                "environmentId",
+                "value",
+                "unit",
+                "parameters",
+                "inputRefs",
+                "checks",
+                "formulaDescription",
+                "evidence",
+            ],
+        )
+        self.assertEqual(record["methodId"], self._TRIPLE["method_id"])
+        self.assertEqual(record["methodVersion"], self._TRIPLE["method_version"])
+        self.assertEqual(record["specDigest"], self._TRIPLE["spec_digest"])
+
+    def test_partial_triples_raise_and_emit_nothing(self):
+        partials = [
+            {"method_id": "m"},
+            {"method_version": "1.0.0"},
+            {"spec_digest": "sha256:x"},
+            {"method_id": "m", "method_version": "1.0.0"},
+            {"method_id": "m", "spec_digest": "sha256:x"},
+            {"method_version": "1.0.0", "spec_digest": "sha256:x"},
+        ]
+        for partial in partials:
+            with self.subTest(provided=sorted(partial)):
+                kwargs = {**self._base_kwargs(), **partial}
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    with self.assertRaisesRegex(ValueError, "together"):
+                        report_custom(1.0, **kwargs)
+                self.assertEqual(buf.getvalue(), "")
+
+    def test_empty_triple_component_raises_and_emits_nothing(self):
+        empties = [
+            {"method_id": ""},
+            {"method_version": "   "},
+            {"spec_digest": ""},
+        ]
+        for empty in empties:
+            with self.subTest(overridden=sorted(empty)):
+                kwargs = {**self._base_kwargs(), **self._TRIPLE, **empty}
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    with self.assertRaises(ValueError):
+                        report_custom(1.0, **kwargs)
+                self.assertEqual(buf.getvalue(), "")
+
+    def test_triple_presence_does_not_change_custom_evidence(self):
+        for checks, expected in (
+            (None, "CUSTOM_UNVERIFIED"),
+            ({"finite": True}, "CUSTOM_WITH_CHECKS"),
+        ):
+            with self.subTest(checks=checks):
+                line_plain, _ = self.capture_report_custom(
+                    1.0,
+                    checks=checks,
+                    source_resolver_tool_call_id="tool-call-resolver-3",
+                    **self._base_kwargs(),
+                )
+                line_triple, _ = self.capture_report_custom(
+                    1.0,
+                    checks=checks,
+                    source_resolver_tool_call_id="tool-call-resolver-3",
+                    **{**self._base_kwargs(), **self._TRIPLE},
+                )
+                plain = json.loads(_payload_of(line_plain))
+                with_triple = json.loads(_payload_of(line_triple))
+                self.assertEqual(plain["evidence"], expected)
+                self.assertEqual(with_triple["evidence"], expected)
+                # The triple is the ONLY difference between the two records.
+                stripped = {
+                    k: v
+                    for k, v in with_triple.items()
+                    if k not in ("methodId", "methodVersion", "specDigest")
+                }
+                self.assertEqual(stripped, plain)
+
+
+class TestPreEmitSchemaValidation(ReportingTestBase):
+    """ITEM 3 (codex must-fix 0c147646): report functions enforce the v1
+    schema bounds BEFORE emit (contract §4.3 field rules; §7 step 6 rejects
+    non-conforming records; §9 failure matrix: one schema-invalid record
+    makes the whole batch unpresentable). Same-table boundary checks: exactly
+    at the limit emits fine, over the limit raises ValueError and emits
+    nothing. Limits: inputRefs <= 128 entries / 512 UTF-8 bytes per entry,
+    formulaDescription <= 4096 bytes, parameters <= 128 entries, checks <=
+    128 entries, unit <= 128 bytes, environmentId <= 512 bytes, source
+    association non-empty (see reporting.py constants for citations)."""
+
+    def assert_emits(self, fn):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            fn()
+        self.assertNotEqual(buf.getvalue(), "")
+
+    def assert_rejects(self, fn):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with self.assertRaises(ValueError):
+                fn()
+        self.assertEqual(buf.getvalue(), "")
+
+    def _custom(self, **overrides):
+        kwargs = {
+            "formula_description": "f(x)",
+            "input_refs": [],
+            "output_unit": "ratio",
+        }
+        kwargs.update(overrides)
+        return lambda: report_custom(1.0, **kwargs)
+
+    def test_input_refs_count_boundary(self):
+        self.assert_emits(self._custom(input_refs=["r"] * 128))
+        self.assert_rejects(self._custom(input_refs=["r"] * 129))
+
+    def test_input_ref_entry_bytes_boundary(self):
+        self.assert_emits(self._custom(input_refs=["x" * 512]))
+        self.assert_rejects(self._custom(input_refs=["x" * 513]))
+
+    def test_formula_description_bytes_boundary(self):
+        self.assert_emits(self._custom(formula_description="f" * 4096))
+        self.assert_rejects(self._custom(formula_description="f" * 4097))
+        # Limits are UTF-8 BYTES (contract §4.2 byte accounting): 1366 CJK
+        # characters are only 1366 code points but 4098 bytes.
+        self.assert_rejects(self._custom(formula_description="中" * 1366))
+
+    def test_parameters_count_boundary(self):
+        at_limit = {f"p{i:03d}": i for i in range(128)}
+        over_limit = {f"p{i:03d}": i for i in range(129)}
+        self.assert_emits(self._custom(parameters=at_limit))
+        self.assert_rejects(self._custom(parameters=over_limit))
+
+    def test_checks_count_boundary(self):
+        at_limit = {f"c{i:03d}": True for i in range(128)}
+        over_limit = {f"c{i:03d}": True for i in range(129)}
+        self.assert_emits(self._custom(checks=at_limit))
+        self.assert_rejects(self._custom(checks=over_limit))
+
+    def test_unit_bytes_boundary(self):
+        self.assert_emits(self._custom(output_unit="u" * 128))
+        self.assert_rejects(self._custom(output_unit="u" * 129))
+
+    def test_environment_id_bytes_boundary(self):
+        for size, expect_emit in ((512, True), (513, False)):
+            with self.subTest(size=size):
+                with open(self._env_file, "w", encoding="utf-8") as fh:
+                    json.dump({"environment_id": "e" * size}, fh)
+                if expect_emit:
+                    self.assert_emits(self._custom())
+                else:
+                    self.assert_rejects(self._custom())
+
+    def test_source_association_must_be_non_empty(self):
+        for bad_source in ("", "   "):
+            with self.subTest(source=repr(bad_source)):
+                self.assert_rejects(
+                    self._custom(source_resolver_tool_call_id=bad_source)
+                )
+        self.assert_emits(
+            self._custom(source_resolver_tool_call_id="tool-call-resolver-1")
+        )
+
+    def test_report_path_enforces_the_same_bounds(self):
+        result = self.cagr_result()
+        self.assert_emits(lambda: report(result, input_refs=["r"] * 128))
+        self.assert_rejects(lambda: report(result, input_refs=["r"] * 129))
+        self.assert_rejects(lambda: report(result, input_refs=["x" * 513]))
+        self.assert_rejects(
+            lambda: report(result, source_resolver_tool_call_id="")
+        )
+        cls = type(result)
+        long_unit = cls(
+            method_id=result.method_id,
+            value=result.value,
+            unit="u" * 129,
+            parameters=result.parameters,
+        )
+        self.assert_rejects(lambda: report(long_unit))
+        many_parameters = cls(
+            method_id=result.method_id,
+            value=result.value,
+            unit=result.unit,
+            parameters={f"p{i:03d}": i for i in range(129)},
+        )
+        self.assert_rejects(lambda: report(many_parameters))
+        many_checks = cls(
+            method_id=result.method_id,
+            value=result.value,
+            unit=result.unit,
+            parameters={},
+            checks={f"c{i:03d}": True for i in range(129)},
+        )
+        self.assert_rejects(lambda: report(many_checks))
+
+
+class TestMethodIdentityNotOverridableAtEmit(ReportingTestBase):
+    """ITEM 4 (codex must-fix 0c147646): a hand-crafted or wrongly-bound
+    method_id cannot masquerade as a public-library method — the emitted
+    triple comes exclusively from the canonical specs, and no emit function
+    exposes a kwarg to override it."""
+
+    def test_forged_unknown_method_id_emits_nothing(self):
+        forged = FinanceMetricResult(
+            method_id="finance.growth.cagr.forged",
+            value=1.0,
+            unit="ratio",
+            parameters={},
+        )
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with self.assertRaisesRegex(RuntimeError, "canonical"):
+                report(forged)
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_report_exposes_no_triple_kwargs(self):
+        import inspect
+
+        params = set(inspect.signature(report).parameters)
+        for triple_kwarg in ("method_id", "method_version", "spec_digest"):
+            self.assertNotIn(triple_kwarg, params)
+        result = self.cagr_result()
+        with self.assertRaises(TypeError):
+            report(result, method_version="9.9.9")
+        with self.assertRaises(TypeError):
+            report(result, spec_digest="sha256:forged")
+
+    def test_result_model_has_no_caller_fillable_triple(self):
+        import dataclasses as dc
+
+        names = {f.name for f in dc.fields(FinanceMetricResult)}
+        self.assertNotIn("method_version", names)
+        self.assertNotIn("spec_digest", names)
+
+    def test_custom_triple_never_grants_library_evidence(self):
+        # Declaring a real library triple on a CUSTOM record is contract-
+        # allowed linkage (§4.3), but it can never produce library evidence.
+        line, _ = self.capture_report_custom(
+            1.0,
+            formula_description="f(x)",
+            input_refs=[],
+            output_unit="ratio",
+            method_id="finance.growth.cagr",
+            method_version="1.0.0",
+            spec_digest="sha256:spec-example",
+        )
+        record = json.loads(_payload_of(line))
+        self.assertEqual(record["methodId"], "finance.growth.cagr")
+        self.assertEqual(record["evidence"], "CUSTOM_UNVERIFIED")
+        self.assertNotEqual(record["evidence"], "LIBRARY_CALL_DECLARED")
+
+    def test_emitted_triple_comes_from_canonical_specs_not_result(self):
+        # Even a hand-crafted instance of a REAL method id gets its triple
+        # exclusively from the installed canonical specs.
+        hand = FinanceMetricResult(
+            method_id="finance.growth.cagr",
+            value=0.5,
+            unit="ratio",
+            parameters={"beginningValue": 100.0, "endingValue": 150.0, "periods": 1},
+        )
+        line, _ = self.capture_report(hand)
+        record = json.loads(_payload_of(line))
+        self.assertEqual(
+            record["methodVersion"],
+            _SPECS["finance.growth.cagr"]["methodVersion"],
+        )
+        self.assertEqual(
+            record["specDigest"], _SPECS["finance.growth.cagr"]["specDigest"]
+        )
 
 
 if __name__ == "__main__":

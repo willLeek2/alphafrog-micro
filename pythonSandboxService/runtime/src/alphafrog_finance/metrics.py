@@ -4,12 +4,15 @@
 Spec basis: §6 (metrics.py 三个指标函数：纯函数、显式参数、不取数、不做金融正确性判断)
 and §5.2 YAML/canonical shapes. YAML camelCase parameter names map 1:1 to
 snake_case kwargs (word-wise lowercase); the ``parameters`` echo in each result
-uses the camelCase YAML names as open, method-specific keys.
+uses the camelCase YAML names as open, method-specific keys, including each
+method's canonical required inputs (contract §3.5 parameter table: volatility
+and sharpe both require ``returns``), so a consumer can reproduce the exact
+computed value from ``parameters`` alone.
 
-Method IDs are proposed strings; the final values are owned by work package A's
-YAML/canonical JSON (see models.py note). Constraint violations raise
-``ValueError`` naming the offending parameter; nothing is printed and no marker
-line is produced on failure.
+Method identity flows through the module-private registry/factory below; no
+public kwarg can override it (Spec §6, codex must-fix 0c147646 ITEM 4).
+Constraint violations raise ``ValueError`` naming the offending parameter;
+nothing is printed and no marker line is produced on failure.
 """
 from __future__ import annotations
 
@@ -19,10 +22,55 @@ from typing import Any, Dict, List, Sequence
 from .checks import check_cagr, check_sharpe, check_volatility
 from .models import FinanceMetricResult
 
-# Proposed method identities (final strings owned by package A YAML).
-_METHOD_ID_CAGR = "finance.growth.cagr"
-_METHOD_ID_VOLATILITY = "finance.risk.annualized_volatility"
-_METHOD_ID_SHARPE = "finance.risk.sharpe_ratio"
+# Module-private method identity registry (Spec §6). The definitive linkage is
+# work package A's canonical generated bindings (runtime/scripts/
+# generate_method_bindings.py -> alphafrog_finance/bindings.py), which are NOT
+# delivered yet; until then this private registry is the single internal source
+# of method ids for the public metric functions. It is deliberately private:
+# no public kwarg of cagr()/annualized_volatility()/sharpe() can replace the
+# identity, and report() cross-checks the id against the canonical method
+# specs installed with the package before emitting any triple.
+# TODO(Spec §6): replace this interim registry with the A-canonical generated
+# bindings once the A canonical SHA is delivered (generate_method_bindings.py
+# / bindings.py are still pending in the B gate); do not hand-maintain a
+# second source of truth alongside the generated bindings.
+_METHOD_IDENTITY_REGISTRY: Dict[str, str] = {
+    "cagr": "finance.growth.cagr",
+    "annualized_volatility": "finance.risk.annualized_volatility",
+    "sharpe": "finance.risk.sharpe_ratio",
+}
+
+
+def _method_id_for(metric_key: str) -> str:
+    """Module-private identity lookup — the only path from a public metric
+    function to a method id. Unknown keys are internal programming errors."""
+    try:
+        return _METHOD_IDENTITY_REGISTRY[metric_key]
+    except KeyError:
+        raise RuntimeError(
+            f"no method identity registered for {metric_key!r}; method "
+            "identity must come from the module-private registry (Spec §6), "
+            "never from caller-supplied values"
+        ) from None
+
+
+def _metric_result(
+    metric_key: str,
+    *,
+    value: float,
+    unit: str,
+    parameters: Dict[str, Any],
+    checks: Dict[str, bool],
+) -> FinanceMetricResult:
+    """Module-private result factory: resolves the method id from the private
+    registry so the public metric functions never expose an identity kwarg."""
+    return FinanceMetricResult(
+        method_id=_method_id_for(metric_key),
+        value=value,
+        unit=unit,
+        parameters=parameters,
+        checks=checks,
+    )
 
 _UNIT_RATIO = "ratio"
 _UNIT_RATIO_PER_ANNUM = "ratio_per_annum"
@@ -109,8 +157,8 @@ def cagr(*, beginning_value: float, ending_value: float, periods: int) -> Financ
     if ending_value <= 0:
         raise ValueError(f"ending_value must be > 0, got {ending_value}")
     value = (ending_value / beginning_value) ** (1.0 / periods) - 1.0
-    return FinanceMetricResult(
-        method_id=_METHOD_ID_CAGR,
+    return _metric_result(
+        "cagr",
         value=value,
         unit=_UNIT_RATIO,
         parameters={
@@ -132,9 +180,13 @@ def annualized_volatility(
 
     Semantics: sample standard deviation (ddof=1, fixed) of the series — or of
     the trailing ``window`` observations when ``window`` is given — multiplied
-    by ``sqrt(periods_per_year)``. The returns series itself is an input, not a
-    ``parameters`` key; only ``periodsPerYear`` (and ``window`` when used) are
-    echoed.
+    by ``sqrt(periods_per_year)``.
+
+    The ``parameters`` echo follows the canonical ``returns + window`` shape
+    (contract §3.5 parameter table: ``returns/periodsPerYear`` required,
+    ``window`` optional): ``returns`` echoes the ORIGINAL full series as
+    passed, and when ``window`` is used it is echoed alongside, so a consumer
+    can reproduce the exact value via ``returns[-window:]``.
 
     Args:
         returns: at least 2 finite periodic returns.
@@ -159,11 +211,14 @@ def annualized_volatility(
     else:
         series = values
     value = _sample_std(series, 1) * math.sqrt(periods_per_year)
-    parameters: Dict[str, Any] = {"periodsPerYear": periods_per_year}
+    parameters: Dict[str, Any] = {
+        "returns": list(values),
+        "periodsPerYear": periods_per_year,
+    }
     if window is not None:
         parameters["window"] = window
-    return FinanceMetricResult(
-        method_id=_METHOD_ID_VOLATILITY,
+    return _metric_result(
+        "annualized_volatility",
         value=value,
         unit=_UNIT_RATIO_PER_ANNUM,
         parameters=parameters,
@@ -245,11 +300,16 @@ def sharpe(
             "returns imply zero standard deviation of excess returns; sharpe is undefined"
         )
     value = (sum(excess) / len(excess)) / std * math.sqrt(periods_per_year)
-    return FinanceMetricResult(
-        method_id=_METHOD_ID_SHARPE,
+    # Canonical parameter order (contract §3.5 table: Sharpe requires
+    # ``returns``; the rest are optional execution parameters). The returns
+    # sequence actually used is echoed so a consumer can reproduce the exact
+    # computed value from parameters alone (codex must-fix 0c147646 ITEM 1).
+    return _metric_result(
+        "sharpe",
         value=value,
         unit=_UNIT_RATIO_PER_ANNUM,
         parameters={
+            "returns": list(values),
             "riskFreeRate": risk_free_rate,
             "riskFreeRateConvention": risk_free_rate_convention,
             "ddof": ddof,
