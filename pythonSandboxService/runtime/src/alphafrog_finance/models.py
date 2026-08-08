@@ -18,6 +18,12 @@ class FinanceMetricResult:
     Attributes:
         method_id: method identity echoed from the computation
             (e.g. ``finance.growth.cagr``; final strings owned by work package A YAML).
+            The public metric functions obtain it exclusively through the
+            module-private identity factory in ``metrics.py`` (Spec §6);
+            ``report()`` only emits a method triple looked up from the
+            canonical specs installed with the package, so a hand-crafted
+            instance can never supply or override the emitted triple
+            (codex must-fix 0c147646 ITEM 4).
         value: the computed metric value.
         unit: result unit string (e.g. ``ratio``, ``ratio_per_annum``).
         parameters: echo of the execution parameters actually used (open keys).

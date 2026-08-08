@@ -171,6 +171,127 @@ class TestChecks(unittest.TestCase):
                     self.assertIs(result.checks[key], True)
 
 
+class TestCanonicalParametersEcho(unittest.TestCase):
+    """ITEM 1 (codex must-fix 0c147646): the canonical required parameter
+    ``returns`` (contract §3.5 parameter table; the A-side narrative template
+    references {returns}) must be part of ``parameters`` so the projector and
+    any consumer can reproduce the exact computed value from parameters alone.
+    """
+
+    _RETURNS6 = [0.01, -0.02, 0.015, 0.005, -0.01, 0.02]
+
+    def test_volatility_full_sample_echoes_returns(self):
+        result = annualized_volatility(self._RETURNS6, periods_per_year=12)
+        self.assertEqual(
+            dict(result.parameters),
+            {"returns": self._RETURNS6, "periodsPerYear": 12},
+        )
+
+    def test_volatility_window_echoes_original_series_and_window(self):
+        result = annualized_volatility(self._RETURNS6, periods_per_year=12, window=4)
+        self.assertEqual(
+            dict(result.parameters),
+            {"returns": self._RETURNS6, "periodsPerYear": 12, "window": 4},
+        )
+        # The echo is the ORIGINAL full series, not the truncated tail; the
+        # stored combination stays consistent with canonical returns+window.
+        self.assertEqual(len(result.parameters["returns"]), len(self._RETURNS6))
+
+    def test_volatility_parameters_reproduce_exact_value(self):
+        result = annualized_volatility(self._RETURNS6, periods_per_year=12, window=4)
+        p = result.parameters
+        series = p["returns"][-p["window"]:]
+        recon = statistics.stdev(series) * math.sqrt(p["periodsPerYear"])
+        self.assertTrue(
+            math.isclose(recon, result.value, rel_tol=_REL_TOL, abs_tol=_ABS_TOL),
+            f"reproduced {recon!r} != computed {result.value!r}",
+        )
+
+    def test_sharpe_echoes_returns_in_canonical_order(self):
+        returns = [0.012, -0.008, 0.021, 0.004, 0.011]
+        result = sharpe(returns, risk_free_rate=0.02, periods_per_year=252)
+        self.assertEqual(
+            dict(result.parameters),
+            {
+                "returns": returns,
+                "riskFreeRate": 0.02,
+                "riskFreeRateConvention": "annual",
+                "ddof": 1,
+                "periodsPerYear": 252,
+                "returnConvention": "arithmetic",
+            },
+        )
+        self.assertEqual(list(result.parameters.keys())[0], "returns")
+
+    def test_sharpe_parameters_reproduce_exact_value(self):
+        returns = [0.012, -0.008, 0.021, 0.004, 0.011]
+        result = sharpe(returns, risk_free_rate=0.02, periods_per_year=252)
+        p = result.parameters
+        rf_period = p["riskFreeRate"] / p["periodsPerYear"]
+        excess = [r - rf_period for r in p["returns"]]
+        recon = (
+            statistics.fmean(excess)
+            / statistics.stdev(excess)
+            * math.sqrt(p["periodsPerYear"])
+        )
+        self.assertTrue(
+            math.isclose(recon, result.value, rel_tol=_REL_TOL, abs_tol=_ABS_TOL),
+            f"reproduced {recon!r} != computed {result.value!r}",
+        )
+
+
+class TestMethodIdentityFactory(unittest.TestCase):
+    """ITEM 4 (codex must-fix 0c147646): method identity flows through a
+    module-private registry/factory (Spec §6); no public kwarg can override
+    the identity a public metric function produces. The definitive linkage is
+    A-canonical generated bindings, still pending (see metrics.py TODO).
+    """
+
+    def test_public_functions_reject_identity_kwargs(self):
+        with self.assertRaises(TypeError):
+            cagr(beginning_value=100.0, ending_value=160.0, periods=4, method_id="x")
+        with self.assertRaises(TypeError):
+            annualized_volatility(
+                [0.01, 0.02], periods_per_year=12, spec_digest="sha256:forged"
+            )
+        with self.assertRaises(TypeError):
+            sharpe([0.01, 0.02], method_version="9.9.9")
+
+    def test_identity_registry_is_private_and_not_exported(self):
+        import alphafrog_finance
+        from alphafrog_finance import metrics as metrics_mod
+
+        self.assertTrue(hasattr(metrics_mod, "_METHOD_IDENTITY_REGISTRY"))
+        self.assertTrue(callable(metrics_mod._method_id_for))
+        self.assertTrue(callable(metrics_mod._metric_result))
+        for name in ("_METHOD_IDENTITY_REGISTRY", "_method_id_for", "_metric_result"):
+            self.assertNotIn(name, alphafrog_finance.__all__)
+            self.assertFalse(hasattr(alphafrog_finance, name))
+
+    def test_public_functions_produce_registry_method_ids(self):
+        from alphafrog_finance.metrics import _METHOD_IDENTITY_REGISTRY
+
+        self.assertEqual(
+            cagr(beginning_value=100.0, ending_value=160.0, periods=4).method_id,
+            _METHOD_IDENTITY_REGISTRY["cagr"],
+        )
+        self.assertEqual(
+            annualized_volatility([0.01, 0.02], periods_per_year=12).method_id,
+            _METHOD_IDENTITY_REGISTRY["annualized_volatility"],
+        )
+        self.assertEqual(
+            sharpe([0.01, 0.02]).method_id, _METHOD_IDENTITY_REGISTRY["sharpe"]
+        )
+
+    def test_result_model_exposes_no_caller_fillable_triple(self):
+        # FinanceMetricResult carries method_id only; there are no public
+        # method_version/spec_digest fields a caller could forge.
+        names = {f.name for f in dataclasses.fields(FinanceMetricResult)}
+        self.assertIn("method_id", names)
+        self.assertNotIn("method_version", names)
+        self.assertNotIn("spec_digest", names)
+
+
 class TestValueErrors(unittest.TestCase):
     def test_cagr_value_errors(self):
         base = {"beginning_value": 100.0, "ending_value": 160.0, "periods": 4}
