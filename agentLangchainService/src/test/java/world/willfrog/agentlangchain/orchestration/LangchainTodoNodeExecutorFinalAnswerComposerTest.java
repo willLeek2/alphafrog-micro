@@ -76,6 +76,47 @@ class LangchainTodoNodeExecutorFinalAnswerComposerTest {
         verify(composer).appendFinanceResultBlock("run-no-records", "user-z", "纯文本答案");
     }
 
+    @Test
+    void writeFinalAnswer_shouldSendFinalPromptWithFinanceBlockIsolationInstruction() {
+        // codex e740f454 ①/③：final-stage prompt 必须带 §11 块外隔离约束——
+        // 服务端追加数值表 + 禁止模型复述后台身份/摘要；捕获实际 ChatRequest 钉死。
+        FinanceResultComposer composer = mock(FinanceResultComposer.class);
+        when(composer.appendFinanceResultBlock(any(), any(), any()))
+                .thenAnswer(invocation -> invocation.getArgument(2));
+        LangchainTodoNodeExecutor executor = newExecutor(composer);
+        FixedChatModel model = new FixedChatModel("最终答案");
+
+        LangchainLinearWorkflowRequest request = LangchainLinearWorkflowRequest.builder()
+                .runId("run-prompt")
+                .userId("user-p")
+                .userGoal("分析指数")
+                .model(model)
+                .build();
+
+        executor.writeFinalAnswer(request, List.of());
+
+        assertThat(model.requests()).isNotEmpty();
+        ChatRequest captured = model.requests().get(model.requests().size() - 1);
+        StringBuilder userText = new StringBuilder();
+        for (dev.langchain4j.data.message.ChatMessage message : captured.messages()) {
+            if (message instanceof dev.langchain4j.data.message.UserMessage userMessage) {
+                userText.append(userMessage.singleText()).append('\n');
+            }
+        }
+        String prompt = userText.toString();
+        // 服务端追加契约
+        assertThat(prompt).contains("由服务端在你的回答之后自动追加");
+        // 块外禁止复述：digest/版本/环境/镜像/包/证据/resolver/内部警告/各类 ID
+        assertThat(prompt).contains("禁止在回答中复述或拼接任何内部身份与后台信息");
+        assertThat(prompt).contains("sha256:");
+        assertThat(prompt).contains("执行环境或镜像身份");
+        assertThat(prompt).contains("证据类型或等级");
+        assertThat(prompt).contains("resolver");
+        assertThat(prompt).contains("内部警告");
+        // prompt 自身不携带任何真实后台身份值（静态指令文本）
+        assertThat(prompt).doesNotContain("run-prompt");
+    }
+
     private static LangchainTodoNodeExecutor newExecutor(FinanceResultComposer composer) {
         ObjectProvider<dev.langchain4j.service.tool.ToolProvider> provider = new ObjectProvider<>() {
             @Override
@@ -95,9 +136,10 @@ class LangchainTodoNodeExecutorFinalAnswerComposerTest {
                 LangchainTestFixtures.promptService(), provider, guard, budget, stateStore, composer);
     }
 
-    /** 固定文本 ChatModel：无论请求内容都返回同一最终答案。 */
+    /** 固定文本 ChatModel：无论请求内容都返回同一最终答案；记录全部请求供 prompt 断言。 */
     static class FixedChatModel implements ChatModel {
         private final String answer;
+        private final List<ChatRequest> requests = new java.util.ArrayList<>();
 
         FixedChatModel(String answer) {
             this.answer = answer;
@@ -105,7 +147,12 @@ class LangchainTodoNodeExecutorFinalAnswerComposerTest {
 
         @Override
         public ChatResponse doChat(ChatRequest request) {
+            requests.add(request);
             return ChatResponse.builder().aiMessage(AiMessage.from(answer)).build();
+        }
+
+        List<ChatRequest> requests() {
+            return requests;
         }
     }
 }

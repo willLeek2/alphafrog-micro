@@ -40,6 +40,31 @@ public class FinanceResultComposer {
     public static final String EVENT_RESULT_BLOCK_RENDERED = "FINANCE_RESULT_BLOCK_RENDERED";
     public static final String EVENT_CROSS_ENVIRONMENT = "FINANCE_CROSS_ENVIRONMENT";
 
+    /**
+     * 三列 cell 的后台身份 denylist。命中任一 token 的投影记录 fail-closed 跳过
+     * （Spec §11/§17 停止条件，codex 935bef41/b4a4d737）：CUSTOM 记录的 formulaDescription
+     * 会逐字成为 howCalculated，schema 只限长度，公开渲染边界必须拦截内部身份 token。
+     * 匹配口径：{@code sha256:} 原始前缀硬拦；其余 token 对 cell 做 separator-insensitive
+     * compact（去非字母数字 + 小写）后 contains——camelCase/snake_case/kebab/分词形式同键
+     * 一并拦截。token 均为具体身份形状，合法自然语言说明（尤其中文）不受影响。
+     */
+    static final List<String> CELL_DENYLIST = List.of(
+            "methodid", "methodversion", "specdigest",
+            "recordid", "recordindex", "recorddigest", "rawdigest", "inputrefs",
+            "runid", "todoid", "taskid", "batchid", "blockid", "datasetid",
+            "environmentid", "actualenvironmentid", "targetenvironmentid",
+            "imagedigest", "imageref", "imageid", "runtimeimage",
+            "librarysetdigest", "catalogdigest", "resolutioncontentdigest",
+            "packageapis", "packagename", "packageversion", "apicompatrange", "apiversion",
+            "rendererversion", "resolverpromptversion", "resolverschemaversion", "schemaversion",
+            "declaredevidence", "effectiveinternalevidence",
+            "executepythontoolcallid", "toolcallid",
+            "sourceresolvertoolcallid", "resolvertoolcallid", "sourceresolver",
+            "librarycalldeclared", "customwithchecks", "customunverified",
+            "financeresultblockrendered", "financecrossenvironment",
+            "financeblock", "financerecord", "financeenvironment", "financerun", "financerenderer"
+    );
+
     private final FinanceRecordQuery recordQuery;
     private final FinanceMethodResolutionQuery resolutionQuery;
     private final FinanceResultModelProjector projector;
@@ -111,10 +136,11 @@ public class FinanceResultComposer {
                 continue; // 记录级 fail-closed：不可投影即跳过，不在块中残留任何痕迹
             }
             FinanceResultModelProjector.FinanceResultProjection p = projection.get();
-            rows.add(new FinanceResultBlockRenderer.Row(
-                    p.method(),
-                    renderer.formatValue(p.value(), displayFormatOf(record)),
-                    p.howCalculated()));
+            String formattedValue = renderer.formatValue(p.value(), displayFormatOf(record));
+            if (containsDenylistedToken(p.method(), formattedValue, p.howCalculated())) {
+                continue; // cell denylist 命中（codex 935bef41）：该记录 fail-closed 跳过
+            }
+            rows.add(new FinanceResultBlockRenderer.Row(p.method(), formattedValue, p.howCalculated()));
             renderedRecordIds.add(record.getRecordId());
             if (record.getActualEnvironmentId() != null && !record.getActualEnvironmentId().isBlank()) {
                 environmentIds.add(record.getActualEnvironmentId().trim());
@@ -234,6 +260,7 @@ public class FinanceResultComposer {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("finance.block.id", block.blockId());
         payload.put("finance.record.count", block.recordIds().size());
+        payload.put("finance.record.ids", List.copyOf(block.recordIds()));
         payload.put("finance.environment.id", block.environmentId() == null ? "" : block.environmentId());
         payload.put("finance.renderer.version", block.rendererVersion());
         safeAppendOnce(runId, userId, EVENT_RESULT_BLOCK_RENDERED,
@@ -251,6 +278,37 @@ public class FinanceResultComposer {
 
     private boolean isBlank(String value) {
         return value == null || value.isBlank();
+    }
+
+    /** 三列 cell 任一命中后台身份 token 即不可公开（sha256: 原始硬拦 + compact contains）。 */
+    static boolean containsDenylistedToken(String... cells) {
+        for (String cell : cells) {
+            if (cell == null || cell.isEmpty()) {
+                continue;
+            }
+            if (cell.toLowerCase(java.util.Locale.ROOT).contains("sha256:")) {
+                return true;
+            }
+            String compact = compactCell(cell);
+            for (String token : CELL_DENYLIST) {
+                if (compact.contains(token)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /** separator-insensitive 归一：去非字母数字并小写（CJK 字符保留）。 */
+    private static String compactCell(String cell) {
+        StringBuilder sb = new StringBuilder(cell.length());
+        for (int i = 0; i < cell.length(); i++) {
+            char c = cell.charAt(i);
+            if (Character.isLetterOrDigit(c)) {
+                sb.append(Character.toLowerCase(c));
+            }
+        }
+        return sb.toString();
     }
 
     private record CrossEnvironmentFact(String recordId, String targetEnvironmentId, String actualEnvironmentId) {

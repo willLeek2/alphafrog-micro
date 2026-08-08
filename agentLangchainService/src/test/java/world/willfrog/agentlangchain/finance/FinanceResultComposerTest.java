@@ -319,9 +319,33 @@ class FinanceResultComposerTest {
         Map<String, Object> payload = (Map<String, Object>) payloadCaptor.getValue();
         assertThat(payload.get("finance.block.id").toString()).startsWith("sha256:");
         assertThat(payload.get("finance.record.count")).isEqualTo(1);
+        assertThat(payload.get("finance.record.ids")).isEqualTo(List.of("rec-1"));
         assertThat(payload.get("finance.environment.id")).isEqualTo("env-a");
         assertThat(payload.get("finance.renderer.version"))
                 .isEqualTo(FinanceResultBlockRenderer.RENDERER_VERSION);
+    }
+
+    @Test
+    void append_shouldWriteRenderedEventWithOrderedRecordIdsAndSkipUnprojectableRecord() {
+        FinanceMetricRecord recA = renderableRecord("rec-a", 0);
+        FinanceMetricRecord recSkipped = renderableRecord("rec-skipped", 1).toBuilder()
+                .methodId("unprojectable_method").build();
+        FinanceMetricRecord recB = renderableRecord("rec-b", 2);
+        when(recordQuery.listRenderableByRun(RUN_ID)).thenReturn(List.of(recA, recSkipped, recB));
+        stubProjectorEcho();
+        when(projector.project(argThat(in -> in != null && "unprojectable_method".equals(in.methodId()))))
+                .thenReturn(Optional.empty());
+
+        String result = composer.appendFinanceResultBlock(RUN_ID, USER_ID, "说明");
+
+        ArgumentCaptor<Object> payloadCaptor = ArgumentCaptor.forClass(Object.class);
+        verify(eventService).appendOnce(eq(RUN_ID), eq(USER_ID),
+                eq(FinanceResultComposer.EVENT_RESULT_BLOCK_RENDERED), anyString(), payloadCaptor.capture());
+        @SuppressWarnings("unchecked")
+        Map<String, Object> payload = (Map<String, Object>) payloadCaptor.getValue();
+        assertThat(payload.get("finance.record.count")).isEqualTo(2);
+        assertThat(payload.get("finance.record.ids")).isEqualTo(List.of("rec-a", "rec-b"));
+        assertThat(result).doesNotContain("[rec-a, rec-b]");
     }
 
     @Test
@@ -374,6 +398,152 @@ class FinanceResultComposerTest {
         assertThat(markdown).doesNotContain("PARAM-MARKER");
         assertThat(markdown).doesNotContain(FinanceResultBlockRenderer.RENDERER_VERSION);
         assertThat(markdown).doesNotContain("CROSS_ENVIRONMENT");
+        // codex e740f454 ③ 验收硬词：最终用户字符串/三列表格不得出现以下身份形状
+        assertHardWordsAbsent(result);
+    }
+
+    // ========== cell denylist（codex 935bef41 P0）：投影 cell 命中后台身份 token 即跳过 ==========
+
+    @Test
+    void append_shouldSkipRecordWhenCustomFormulaContainsIdentityTokens_customWithChecks() {
+        FinanceMetricRecord injection = renderableRecord("rec-inject-1", 0).toBuilder()
+                .declaredEvidence("CUSTOM_WITH_CHECKS")
+                .formulaDescription("sha256:abc123 environmentId=env-x sourceResolverToolCallId=call-9")
+                .build();
+        when(recordQuery.listRenderableByRun(RUN_ID)).thenReturn(List.of(injection));
+        stubProjectorEcho();
+
+        String result = composer.appendFinanceResultBlock(RUN_ID, USER_ID, "原文");
+
+        assertThat(result).isEqualTo("原文");
+        assertThat(result).doesNotContain("sha256:abc123");
+        assertThat(result).doesNotContain("environmentId");
+        assertThat(result).doesNotContain("sourceResolverToolCallId");
+        verifyNoInteractions(eventService);
+    }
+
+    @Test
+    void append_shouldSkipRecordWhenCustomFormulaContainsIdentityTokens_customUnverified() {
+        FinanceMetricRecord injection = renderableRecord("rec-inject-2", 0).toBuilder()
+                .declaredEvidence("CUSTOM_UNVERIFIED")
+                .formulaDescription("methodVersion=9.9 specDigest=deadbeef imageDigest=img packageApis=[x]")
+                .build();
+        when(recordQuery.listRenderableByRun(RUN_ID)).thenReturn(List.of(injection));
+        stubProjectorEcho();
+
+        String result = composer.appendFinanceResultBlock(RUN_ID, USER_ID, "原文");
+
+        assertThat(result).isEqualTo("原文");
+        verifyNoInteractions(eventService);
+    }
+
+    @Test
+    void append_shouldSkipOnlyInjectedRecordAndStillRenderCleanOnes() {
+        FinanceMetricRecord injected = renderableRecord("rec-inject-3", 0).toBuilder()
+                .declaredEvidence("CUSTOM_WITH_CHECKS")
+                .formulaDescription("batchId=b-1 blockId=bl-2 inputRefs=[r] executePythonToolCallId=tc-1")
+                .build();
+        FinanceMetricRecord clean = renderableRecord("rec-clean", 1);
+        when(recordQuery.listRenderableByRun(RUN_ID)).thenReturn(List.of(injected, clean));
+        stubProjectorEcho();
+
+        String result = composer.appendFinanceResultBlock(RUN_ID, USER_ID, "说明");
+
+        assertThat(result).contains("M:tushare_index_daily");
+        assertThat(result).doesNotContain("batchId");
+        assertThat(result).doesNotContain("blockId");
+        assertThat(result).doesNotContain("inputRefs");
+        assertThat(result).doesNotContain("executePythonToolCallId");
+        // 干净记录仍渲染：事件 record.ids 只含 rec-clean
+        ArgumentCaptor<Object> payloadCaptor = ArgumentCaptor.forClass(Object.class);
+        verify(eventService).appendOnce(eq(RUN_ID), eq(USER_ID),
+                eq(FinanceResultComposer.EVENT_RESULT_BLOCK_RENDERED), anyString(), payloadCaptor.capture());
+        @SuppressWarnings("unchecked")
+        Map<String, Object> payload = (Map<String, Object>) payloadCaptor.getValue();
+        assertThat(payload.get("finance.record.ids")).isEqualTo(List.of("rec-clean"));
+    }
+
+    @Test
+    void append_shouldRenderLegitimateNaturalLanguageCustomDescription() {
+        FinanceMetricRecord legit = renderableRecord("rec-legit", 0).toBuilder()
+                .declaredEvidence("CUSTOM_UNVERIFIED")
+                .formulaDescription("按 (结束值 / 起始值)^(1 / 区间长度) - 1 计算复合增长，再按年化口径折算")
+                .build();
+        when(recordQuery.listRenderableByRun(RUN_ID)).thenReturn(List.of(legit));
+        stubProjectorEcho();
+
+        String result = composer.appendFinanceResultBlock(RUN_ID, USER_ID, "");
+
+        assertThat(result).contains("H:按 (结束值 / 起始值)^(1 / 区间长度) - 1 计算复合增长，再按年化口径折算");
+    }
+
+    @Test
+    void cellDenylist_shouldPinEveryIdentityCategory() {
+        // codex 935bef41 类别钉死：digest/environment/image/package/version/evidence/
+        // record/batch/block/task/dataset/toolCall/sourceResolver/run 等身份形状全部命中
+        List<String> injections = List.of(
+                "sha256:0123abcd",
+                "methodId=x", "methodVersion=1", "specDigest=d", "rawDigest=r", "recordDigest=rd",
+                "recordId=r", "recordIndex=1", "inputRefs=[]",
+                "runId=r", "todoId=t", "taskId=t", "batchId=b", "blockId=b", "datasetId=d",
+                "environmentId=e", "actualEnvironmentId=e", "targetEnvironmentId=e",
+                "imageDigest=i", "imageRef=i", "imageId=i", "runtimeImage=r",
+                "librarySetDigest=l", "catalogDigest=c",
+                "packageApis=[]", "packageName=p", "packageVersion=1", "apiCompatRange=a", "apiVersion=1",
+                "rendererVersion=1", "resolverPromptVersion=1", "resolverSchemaVersion=1",
+                "declaredEvidence=x", "effectiveInternalEvidence=x",
+                "executePythonToolCallId=t", "toolCallId=t",
+                "sourceResolverToolCallId=s", "resolverToolCallId=s", "sourceResolver=s",
+                "LIBRARY_CALL_DECLARED", "CUSTOM_WITH_CHECKS", "CUSTOM_UNVERIFIED",
+                "FINANCE_RESULT_BLOCK_RENDERED", "FINANCE_CROSS_ENVIRONMENT",
+                "finance.block.id", "finance.record.id", "finance.environment.id"
+        );
+        for (String injection : injections) {
+            assertThat(FinanceResultComposer.containsDenylistedToken("正常说明", "1.0", injection))
+                    .as("injection should be denylisted: %s", injection)
+                    .isTrue();
+        }
+    }
+
+    @Test
+    void cellDenylist_shouldCatchSnakeKebabAndSpacedSynonymForms() {
+        // codex b4a4d737：camel/snake/kebab/分词同义键不得绕过 compact 口径
+        List<String> synonyms = List.of(
+                "sourceResolverToolCallId=1", "source_resolver_tool_call_id=1",
+                "source-resolver-tool-call-id=1", "source resolver tool call id: 1",
+                "environmentId=e", "environment_id=e", "environment-id=e",
+                "record_id=r", "record-id=r",
+                "package_version=1", "package-version=1",
+                "apiVersion=2", "api_version=2",
+                "imageId=i", "image_id=i", "runtime_image=r", "runtime-image=r",
+                "SHA256:ABCD", "前缀 sha256: 值"
+        );
+        for (String synonym : synonyms) {
+            assertThat(FinanceResultComposer.containsDenylistedToken(synonym))
+                    .as("synonym form should be denylisted: %s", synonym)
+                    .isTrue();
+        }
+        // 合法自然语言正对照（codex b4a4d737 要求保留）
+        assertThat(FinanceResultComposer.containsDenylistedToken(
+                "复合年均增长率", "12.34%", "按 canonical 公式计算年化收益")).isFalse();
+        assertThat(FinanceResultComposer.containsDenylistedToken(
+                "按收盘价序列的一阶差分计算日收益，再年化")).isFalse();
+        assertThat(FinanceResultComposer.containsDenylistedToken(null, "", "  ")).isFalse();
+    }
+
+    private static void assertHardWordsAbsent(String finalText) {
+        List<String> hardWords = List.of(
+                "sha256:",
+                "LIBRARY_CALL_DECLARED", "CUSTOM_WITH_CHECKS", "CUSTOM_UNVERIFIED",
+                "inputRefs", "executePythonToolCallId", "sourceResolverToolCallId",
+                "batchId", "blockId", "environmentId", "methodVersion", "specDigest",
+                "packageApis", "recordId", "runId", "taskId", "datasetId",
+                "rendererVersion", "FINANCE_RESULT_BLOCK_RENDERED", "FINANCE_CROSS_ENVIRONMENT"
+        );
+        for (String word : hardWords) {
+            assertThat(finalText).as("final text must not contain hard word: %s", word)
+                    .doesNotContain(word);
+        }
     }
 
     // ========== 显示格式 ==========
