@@ -22,12 +22,6 @@ logger = logging.getLogger(__name__)
 # authoritative source for environmentId / imageDigest / librarySetDigest /
 # packageApis; downstream consumers must NOT recompute these values.
 
-# Spec §8 L1019: packages without an explicit __api_version__ attribute fall
-# back to this documented wire default. Tests pin this value so a change here
-# requires an explicit contract update.
-DEFAULT_PACKAGE_API_VERSION = "1.0"
-
-
 def _canonical_bytes(data: Any) -> bytes:
     """Stable JSON encoding: sorted keys, no whitespace, UTF-8."""
     return json.dumps(
@@ -37,6 +31,9 @@ def _canonical_bytes(data: Any) -> bytes:
 
 def _sha256_hex_digest(data: bytes) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+SUPPORTED_PACKAGE_API_NAMES = frozenset({"alphafrog_finance"})
 
 
 def _resolve_target_interpreter(session: Any) -> str:
@@ -145,7 +142,7 @@ def _probe_package_api_versions(
 ) -> Tuple[dict[str, str], bool]:
     """Read package API versions inside the task runtime interpreter."""
     if session is None or not package_names:
-        return {}, True
+        return {}, False
     interpreter = shlex.quote(_resolve_target_interpreter(session))
     names_json = json.dumps(sorted(set(package_names)), separators=(",", ":"))
     script = (
@@ -170,12 +167,12 @@ def _probe_package_api_versions(
         payload = json.loads(text)
         if not isinstance(payload, dict):
             return {}, False
-        versions = {
-            str(name): value
-            for name, value in payload.items()
-            if isinstance(name, str) and isinstance(value, str) and value
-        }
-        return versions, True
+        versions: dict[str, str] = {}
+        for name in package_names:
+            raw = payload.get(name)
+            if isinstance(raw, str) and raw:
+                versions[name] = raw
+        return versions, bool(versions) and len(versions) == len(set(package_names))
     except Exception as exc:
         logger.warning(
             "RUNTIME_ENVIRONMENT_PACKAGE_API_PROBE_FAILED error=%s", exc
@@ -204,28 +201,33 @@ def collect_runtime_environment(
       - image_digest: Docker-inspected container image (sha256:...) or ""
       - library_set_digest: SHA-256 of canonical-encoded sorted package list
       - package_apis: SandboxPackageApi list sorted by package name
-      - inventory_complete: True iff pip list succeeded non-empty
+      - inventory_complete: True iff package inventory and supported API probes succeed
     """
     image_digest = _inspect_container_image_digest(container_id)
     packages, inventory_complete = _read_installed_packages(session)
     packages_sorted = sorted(packages, key=lambda p: p["name"])
     api_versions, api_probe_complete = _probe_package_api_versions(
-        session, [p["name"] for p in packages_sorted]
+        session, sorted(SUPPORTED_PACKAGE_API_NAMES)
     )
     inventory_complete = inventory_complete and api_probe_complete
 
-    library_set_payload = [
-        {"name": p["name"], "version": p["version"]} for p in packages_sorted
-    ]
-    library_set_digest = _sha256_hex_digest(_canonical_bytes(library_set_payload))
+    canonical_packages = []
+    for package in packages_sorted:
+        item = {"name": package["name"], "version": package["version"]}
+        api_version = api_versions.get(package["name"])
+        if api_version:
+            item["apiVersion"] = api_version
+        canonical_packages.append(item)
+    library_set_digest = _sha256_hex_digest(_canonical_bytes(canonical_packages))
 
     package_apis = [
         SandboxPackageApi(
-            name=p["name"],
-            version=p["version"],
-            api_version=api_versions.get(p["name"], ""),
+            name=package["name"],
+            version=package["version"],
+            api_version=api_versions[package["name"]],
         )
-        for p in packages_sorted
+        for package in packages_sorted
+        if package["name"] in api_versions
     ]
 
     snapshot = {

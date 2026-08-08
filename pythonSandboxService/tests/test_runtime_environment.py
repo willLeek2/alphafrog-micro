@@ -181,10 +181,6 @@ class RuntimeEnvironmentTest(unittest.TestCase):
         from app.runtime_environment import collect_runtime_environment
 
         fake_client = _FakeDockerClient(_FakeContainer("sha256:image-digest-1"))
-        pip_output = json.dumps([
-            {"name": "numpy", "version": "1.26.0"},
-            {"name": "alphafrog_finance", "version": "1.0.3"},
-        ])
 
         session = _runtime_session(
             [
@@ -207,17 +203,14 @@ class RuntimeEnvironmentTest(unittest.TestCase):
         self.assertEqual(env_a.package_apis, env_b.package_apis)
         self.assertTrue(env_a.inventory_complete)
 
-    def test_collect_runtime_environment_changing_image_or_packages_changes_environment_id(self) -> None:
+    def test_collect_runtime_environment_changing_image_changes_environment_id(self) -> None:
         from app.runtime_environment import collect_runtime_environment
 
         fake_client_a = _FakeDockerClient(_FakeContainer("sha256:image-A"))
         fake_client_b = _FakeDockerClient(_FakeContainer("sha256:image-B"))
-        pip_output = json.dumps([{"name": "numpy", "version": "1.26.0"}])
         session = _runtime_session(
-            [{"name": "numpy", "version": "1.26.0"}],
-            {},
+            [{"name": "numpy", "version": "1.26.0"}], {}
         )
-        session.execute_command.side_effect = session.execute_command.side_effect
         with patch.dict(
             "sys.modules",
             {"docker": types.SimpleNamespace(from_env=lambda: fake_client_a)},
@@ -254,45 +247,13 @@ class RuntimeEnvironmentTest(unittest.TestCase):
 
         self.assertNotEqual(env_before.library_set_digest, env_after.library_set_digest)
         self.assertNotEqual(env_before.environment_id, env_after.environment_id)
-        self.assertIn(".sandbox-venv/bin/python -m pip list", before.execute_command.call_args_list[0].args[0])
-        self.assertIn(".sandbox-venv/bin/python -m pip list", after.execute_command.call_args_list[0].args[0])
-
-        from app.runtime_environment import collect_runtime_environment
-
-        class _BoomClient:
-            @property
-            def containers(self):
-                boom_self = self
-
-                class _BoomContainers:
-                    def get(self, cid):
-                        raise RuntimeError("docker daemon unreachable")
-
-                return _BoomContainers()
-
-            def close(self) -> None:
-                return None
-
-        session = MagicMock()
-        session.execute_command.return_value = _FakeCommandResult(
-            stdout="", exit_code=1,
+        self.assertIn(
+            ".sandbox-venv/bin/python -m pip list",
+            before.execute_command.call_args_list[0].args[0],
         )
-        with patch.dict(
-            "sys.modules",
-            {"docker": types.SimpleNamespace(from_env=lambda: _BoomClient())},
-        ):
-            env = collect_runtime_environment(
-                container_id="c-broken", session=session,
-            )
-
-        self.assertEqual("", env.image_digest)
-        self.assertEqual([], env.package_apis)
-        self.assertFalse(env.inventory_complete)
-        # environment_id is still a stable SHA-256 of the empty snapshot,
-        # which is the expected "unknown environment" signal.
-        self.assertTrue(env.environment_id.startswith("sha256:"))
-        self.assertEqual(
-            64, len(env.environment_id.split(":", 1)[1]),
+        self.assertIn(
+            ".sandbox-venv/bin/python -m pip list",
+            after.execute_command.call_args_list[0].args[0],
         )
 
     def test_collect_runtime_environment_handles_full_failure_gracefully(self) -> None:
@@ -305,53 +266,47 @@ class RuntimeEnvironmentTest(unittest.TestCase):
             stdout="", exit_code=1
         )
         env = collect_runtime_environment(container_id="c-broken", session=session)
+
         self.assertEqual("", env.image_digest)
         self.assertEqual([], env.package_apis)
         self.assertFalse(env.inventory_complete)
         self.assertTrue(env.environment_id.startswith("sha256:"))
+        self.assertEqual(64, len(env.environment_id.split(":", 1)[1]))
 
+    def test_collect_runtime_environment_single_source_consistency_with_file_write(self) -> None:
         from app.runtime_environment import (
             collect_runtime_environment,
             write_runtime_environment_json,
         )
 
         fake_client = _FakeDockerClient(_FakeContainer("sha256:image-X"))
-        session = MagicMock()
-        session.execute_command.return_value = _FakeCommandResult(
-            stdout=json.dumps([{"name": "numpy", "version": "1.26.0"}]),
-            exit_code=0,
+        session = _runtime_session(
+            [{"name": "alphafrog_finance", "version": "1.7.0"}],
+            {"alphafrog_finance": "1.7"},
         )
-
         with patch.dict(
             "sys.modules",
             {"docker": types.SimpleNamespace(from_env=lambda: fake_client)},
         ):
-            env = collect_runtime_environment(
-                container_id="c-X", session=session,
-            )
+            env = collect_runtime_environment(container_id="c-X", session=session)
 
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
             path = write_runtime_environment_json(str(workspace), env)
-            self.assertEqual(
-                str(workspace / "runtime-environment.json"), path,
-            )
+            self.assertEqual(str(workspace / "runtime-environment.json"), path)
             persisted = json.loads(Path(path).read_text(encoding="utf-8"))
 
         self.assertEqual(persisted["environment_id"], env.environment_id)
         self.assertEqual(persisted["image_digest"], env.image_digest)
         self.assertEqual(
-            persisted["library_set_digest"], env.library_set_digest,
+            persisted["library_set_digest"], env.library_set_digest
         )
-        # persisted["package_apis"] is a JSON-deserialized list of dicts;
-        # env.package_apis is a list of SandboxPackageApi models. Compare
-        # dict-by-dict to assert semantic equality regardless of type.
         self.assertEqual(
             [pkg.model_dump() for pkg in env.package_apis],
             persisted["package_apis"],
         )
         self.assertEqual(
-            persisted["inventory_complete"], env.inventory_complete,
+            persisted["inventory_complete"], env.inventory_complete
         )
 
     def test_write_runtime_environment_json_creates_missing_workspace(self) -> None:
@@ -390,9 +345,9 @@ class RuntimeEnvironmentTest(unittest.TestCase):
         session = _runtime_session(
             [
                 {"name": "z-pkg", "version": "0.1"},
-                {"name": "a-pkg", "version": "1.0"},
+                {"name": "alphafrog_finance", "version": "1.0"},
             ],
-            {"a-pkg": "1.0", "z-pkg": "1.0"},
+            {"alphafrog_finance": "1.0"},
         )
 
         with patch.dict(
@@ -403,9 +358,10 @@ class RuntimeEnvironmentTest(unittest.TestCase):
                 container_id="c-fixed", session=session,
             )
 
-        # library_set_digest uses sorted name order, so a-pkg first, z-pkg second.
+        # library_set_digest merges alphafrog_finance's API version into the
+        # same canonical payload; z-pkg stays pure name/version.
         library_set_payload = [
-            {"name": "a-pkg", "version": "1.0"},
+            {"name": "alphafrog_finance", "version": "1.0", "apiVersion": "1.0"},
             {"name": "z-pkg", "version": "0.1"},
         ]
         library_set_bytes = json.dumps(
@@ -417,10 +373,9 @@ class RuntimeEnvironmentTest(unittest.TestCase):
 
         package_apis_payload = [
             {
-                "name": "a-pkg", "version": "1.0", "api_version": "1.0",
-            },
-            {
-                "name": "z-pkg", "version": "0.1", "api_version": "1.0",
+                "name": "alphafrog_finance",
+                "version": "1.0",
+                "api_version": "1.0",
             },
         ]
         snapshot_payload = {
@@ -434,18 +389,23 @@ class RuntimeEnvironmentTest(unittest.TestCase):
         ).encode("utf-8")
         expected_environment_id = "sha256:" + hashlib.sha256(snapshot_bytes).hexdigest()
         self.assertEqual(expected_environment_id, env.environment_id)
+        snapshot_bytes = json.dumps(
+            snapshot_payload, sort_keys=True,
+            separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")
+        expected_environment_id = "sha256:" + hashlib.sha256(snapshot_bytes).hexdigest()
+        self.assertEqual(expected_environment_id, env.environment_id)
 
-    def test_default_package_api_version_is_pinned_for_wire_compatibility(self) -> None:
-        """Pin the documented wire default for packages without __api_version__.
+    def test_no_fabricated_default_for_packages_without_api_version(self) -> None:
+        """Spec §8: probe failures MUST NOT fabricate a default apiVersion.
 
-        Spec §8 L1019: when a package does not expose __api_version__, the
-        runtime_environment.py generator MUST fall back to a documented
-        default so E's target/actual API compatibility check has a stable
-        value to compare against. Changing this default is a contract break.
+        The wire default "1.0" used to be applied by an importlib fallback;
+        that fallback was removed because it imported target packages in the
+        service host and silently masked missing __api_version__ attributes.
         """
-        from app.runtime_environment import DEFAULT_PACKAGE_API_VERSION
+        from app import runtime_environment
 
-        self.assertEqual("1.0", DEFAULT_PACKAGE_API_VERSION)
+        self.assertFalse(hasattr(runtime_environment, "DEFAULT_PACKAGE_API_VERSION"))
 
     def test_resolve_target_interpreter_uses_sandbox_venv_for_user_code(self) -> None:
         from app.runtime_environment import _resolve_target_interpreter
@@ -491,6 +451,52 @@ class RuntimeEnvironmentTest(unittest.TestCase):
         from app.runtime_environment import _probe_package_api_versions
 
         session = MagicMock()
+        session.config = types.SimpleNamespace(skip_environment_setup=False)
+        session.python_executable_path = "/sandbox/.sandbox-venv/bin/python"
+        session.execute_command.return_value = _FakeCommandResult(
+            stdout=json.dumps({"alphafrog_finance": "1.7"}), exit_code=0
+        )
+        _probe_package_api_versions(
+            session, ["alphafrog_finance", "numpy", "beautifulsoup4"]
+        )
+        command = session.execute_command.call_args.args[0]
+        self.assertIn("alphafrog_finance", command)
+        self.assertNotIn("numpy", command)
+        self.assertNotIn("beautifulsoup4", command)
+
+    def test_library_set_digest_matches_golden_reference(self) -> None:
+        """Pin the canonical librarySetDigest for a fixed inventory.
+
+        This matches the H canonical JSON digest for the same packages and
+        apiVersion; a divergence here signals a schema drift that would
+        invalidate downstream compatibility checks.
+        """
+        from app.runtime_environment import collect_runtime_environment
+
+        fake_client = _FakeDockerClient(_FakeContainer("sha256:golden-image"))
+        session = _runtime_session(
+            [
+                {"name": "numpy", "version": "1.26.0"},
+                {"name": "alphafrog_finance", "version": "1.0.3"},
+            ],
+            {"alphafrog_finance": "1.7"},
+        )
+        with patch.dict(
+            "sys.modules",
+            {"docker": types.SimpleNamespace(from_env=lambda: fake_client)},
+        ):
+            env = collect_runtime_environment(
+                container_id="c-golden", session=session
+            )
+        self.assertEqual(
+            "sha256:d36c2ee55acb03458cd694a28477f911e8c0ffa71e978bf280eabbea1ecb2ee1",
+            env.library_set_digest,
+        )
+
+    def test_probe_package_api_versions_failure_is_incomplete(self) -> None:
+        from app.runtime_environment import _probe_package_api_versions
+
+        session = MagicMock()
         session.config.skip_environment_setup = False
         session.python_executable_path = "/sandbox/.sandbox-venv/bin/python"
         session.execute_command.return_value = _FakeCommandResult(
@@ -501,6 +507,41 @@ class RuntimeEnvironmentTest(unittest.TestCase):
         )
         self.assertFalse(complete)
         self.assertEqual({}, versions)
+
+    def test_probe_package_api_versions_missing_attribute_is_incomplete(self) -> None:
+        from app.runtime_environment import _probe_package_api_versions
+
+        session = MagicMock()
+        session.config = types.SimpleNamespace(skip_environment_setup=False)
+        session.python_executable_path = "/sandbox/.sandbox-venv/bin/python"
+        session.execute_command.return_value = _FakeCommandResult(
+            stdout=json.dumps({"alphafrog_finance": None}), exit_code=0
+        )
+        versions, complete = _probe_package_api_versions(
+            session, ["alphafrog_finance"]
+        )
+        self.assertFalse(complete)
+        self.assertEqual({}, versions)
+
+    def test_probe_does_not_import_unsupported_packages(self) -> None:
+        from app.runtime_environment import (
+            SUPPORTED_PACKAGE_API_NAMES,
+            _probe_package_api_versions,
+        )
+
+        session = MagicMock()
+        session.config = types.SimpleNamespace(skip_environment_setup=False)
+        session.python_executable_path = "/sandbox/.sandbox-venv/bin/python"
+        session.execute_command.return_value = _FakeCommandResult(
+            stdout=json.dumps({"alphafrog_finance": "1.7"}), exit_code=0
+        )
+        _probe_package_api_versions(
+            session, list(SUPPORTED_PACKAGE_API_NAMES)
+        )
+        command = session.execute_command.call_args.args[0]
+        self.assertIn("alphafrog_finance", command)
+        for unsupported in ("numpy", "beautifulsoup4", "scikit-learn"):
+            self.assertNotIn(unsupported, command)
 
     def test_collect_runtime_environment_uses_container_api_version(self) -> None:
         from app import runtime_environment
@@ -523,7 +564,10 @@ class RuntimeEnvironmentTest(unittest.TestCase):
             )
         by_name = {pkg.name: pkg for pkg in env.package_apis}
         self.assertEqual("1.7", by_name["alphafrog_finance"].api_version)
-        self.assertEqual("", by_name["numpy"].api_version)
+        self.assertNotIn("numpy", by_name)
+        probe_command = session.execute_command.call_args_list[1].args[0]
+        self.assertIn("alphafrog_finance", probe_command)
+        self.assertNotIn("numpy", probe_command)
         self.assertTrue(env.inventory_complete)
         self.assertNotEqual(env.environment_id, env.library_set_digest)
 
@@ -542,4 +586,4 @@ class RuntimeEnvironmentTest(unittest.TestCase):
         ]
         env = collect_runtime_environment(container_id="c-probe-fail", session=session)
         self.assertFalse(env.inventory_complete)
-        self.assertEqual("", env.package_apis[0].api_version)
+        self.assertEqual([], env.package_apis)
