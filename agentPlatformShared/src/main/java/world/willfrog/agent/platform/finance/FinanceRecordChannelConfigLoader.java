@@ -10,7 +10,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 /** Loads Nacos-written JSON over application defaults, then clamps every value to code ceilings. */
 @Component
@@ -85,6 +87,9 @@ public class FinanceRecordChannelConfigLoader {
                     && !limits.targetEnvironmentId().equals(targetEnvironment.environmentId())) {
                 throw new IllegalArgumentException(
                         "targetEnvironment.environmentId must match targetEnvironmentId");
+            }
+            if (targetEnvironment != null) {
+                validateTargetEnvironmentFact(targetEnvironment);
             }
             return new Snapshot(
                     limits,
@@ -211,7 +216,7 @@ public class FinanceRecordChannelConfigLoader {
 
     private static FinanceEnvironmentFact toFact(
             FinanceRecordChannelProperties.TargetEnvironment source) {
-        if (source == null || trim(source.getEnvironmentId()).isEmpty()) {
+        if (source == null || isEmptyTargetEnvironment(source)) {
             return null;
         }
         List<FinanceEnvironmentFact.PackageApi> packageApis = new ArrayList<>();
@@ -223,9 +228,57 @@ public class FinanceRecordChannelConfigLoader {
                 }
             }
         }
-        return new FinanceEnvironmentFact(
+        FinanceEnvironmentFact fact = new FinanceEnvironmentFact(
                 source.getEnvironmentId(), source.getImageDigest(), source.getLibrarySetDigest(),
                 packageApis, true);
+        validateTargetEnvironmentFact(fact);
+        return fact;
+    }
+
+    private static boolean isEmptyTargetEnvironment(
+            FinanceRecordChannelProperties.TargetEnvironment source) {
+        return trim(source.getEnvironmentId()).isEmpty()
+                && trim(source.getImageDigest()).isEmpty()
+                && trim(source.getLibrarySetDigest()).isEmpty()
+                && (source.getPackageApis() == null || source.getPackageApis().isEmpty());
+    }
+
+    /**
+     * A target environment is an atomic trusted fact, both when it comes from application
+     * defaults and when it is restored from a durable frozen snapshot. Dynamic-file validation
+     * alone is insufficient because neither of those two paths is guaranteed to pass through it.
+     */
+    private static void validateTargetEnvironmentFact(FinanceEnvironmentFact environment) {
+        requireNonBlank(environment.environmentId(), "targetEnvironment.environmentId");
+        requireNonBlank(environment.imageDigest(), "targetEnvironment.imageDigest");
+        requireNonBlank(environment.librarySetDigest(), "targetEnvironment.librarySetDigest");
+        if (!environment.inventoryComplete()) {
+            throw new IllegalArgumentException("targetEnvironment.inventoryComplete must be true");
+        }
+        if (environment.packageApis().isEmpty()) {
+            throw new IllegalArgumentException("targetEnvironment.packageApis is required");
+        }
+        Set<String> packageNames = new HashSet<>();
+        boolean financePackageFound = false;
+        for (FinanceEnvironmentFact.PackageApi item : environment.packageApis()) {
+            if (item == null) {
+                throw new IllegalArgumentException("targetEnvironment.packageApis contains null");
+            }
+            requireNonBlank(item.name(), "targetEnvironment.packageApis.name");
+            requireNonBlank(item.version(), "targetEnvironment.packageApis.version");
+            requireNonBlank(item.apiVersion(), "targetEnvironment.packageApis.apiVersion");
+            if (!packageNames.add(item.name())) {
+                throw new IllegalArgumentException(
+                        "targetEnvironment.packageApis contains duplicate package: " + item.name());
+            }
+            if ("alphafrog_finance".equals(item.name())) {
+                financePackageFound = true;
+            }
+        }
+        if (!financePackageFound) {
+            throw new IllegalArgumentException(
+                    "targetEnvironment.packageApis must contain alphafrog_finance");
+        }
     }
 
     private static int firstPositive(Integer override, int fallback) {

@@ -188,4 +188,63 @@ class FinanceRecordChannelConfigLoaderTest {
                 .extracting("code")
                 .isEqualTo("FINANCE_RECORD_CONFIG_SNAPSHOT_INVALID");
     }
+
+    @Test
+    void frozenTargetSnapshotRejectsPartialOrUntrustedEnvironmentFacts() {
+        FinanceRecordChannelProperties defaults = new FinanceRecordChannelProperties();
+        FinanceRecordChannelConfigLoader loader = new FinanceRecordChannelConfigLoader(objectMapper, defaults);
+        String partialTarget = """
+                {
+                  "effectiveFinanceRecordConfig": {
+                    "enabled": true,
+                    "recordCountMax": 12,
+                    "recordMaxBytes": 1024,
+                    "recordChannelMaxBytes": 2048,
+                    "stdoutMaxBytes": 4096,
+                    "stderrMaxBytes": 1024,
+                    "targetEnvironmentId": "sha256:target"
+                  },
+                  "targetEnvironment": {
+                    "environmentId": "sha256:target",
+                    "imageDigest": "",
+                    "librarySetDigest": "sha256:library",
+                    "packageApis": [],
+                    "inventoryComplete": false
+                  }
+                }
+                """;
+
+        assertThatThrownBy(() -> loader.parseFrozenSnapshot(partialTarget))
+                .isInstanceOf(FinanceRecordProcessingException.class)
+                .extracting("code")
+                .isEqualTo("FINANCE_RECORD_CONFIG_SNAPSHOT_INVALID");
+    }
+
+    @Test
+    void partialApplicationDefaultTargetFailsFast() {
+        FinanceRecordChannelProperties defaults = new FinanceRecordChannelProperties();
+        FinanceRecordChannelProperties.TargetEnvironment target =
+                new FinanceRecordChannelProperties.TargetEnvironment();
+        target.setEnvironmentId("sha256:target");
+        target.setImageDigest("");
+        target.setLibrarySetDigest("sha256:library");
+        defaults.setTargetEnvironment(target);
+
+        assertThatThrownBy(() -> new FinanceRecordChannelConfigLoader(objectMapper, defaults))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("targetEnvironment.imageDigest");
+    }
+
+    @Test
+    void applicationDefaultTargetWithoutEnvironmentIdFailsFast() {
+        FinanceRecordChannelProperties defaults = new FinanceRecordChannelProperties();
+        FinanceRecordChannelProperties.TargetEnvironment target =
+                new FinanceRecordChannelProperties.TargetEnvironment();
+        target.setImageDigest("sha256:image");
+        defaults.setTargetEnvironment(target);
+
+        assertThatThrownBy(() -> new FinanceRecordChannelConfigLoader(objectMapper, defaults))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("targetEnvironment.environmentId");
+    }
 }
