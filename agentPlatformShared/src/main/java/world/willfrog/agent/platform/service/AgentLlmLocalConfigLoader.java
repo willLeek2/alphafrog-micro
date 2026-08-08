@@ -237,6 +237,14 @@ public class AgentLlmLocalConfigLoader {
     }
 
     /**
+     * 当前本地配置的原子快照（config 与显式顶层节同源、单次 volatile 读取）。
+     * 需要同时判断节存在性与读取配置的调用方必须用它，而不是拼接多个 accessor。
+     */
+    public LocalConfigSnapshot currentSnapshot() {
+        return localSnapshot;
+    }
+
+    /**
      * 当前本地配置 JSON 是否显式包含指定顶层节（别名预处理后）。
      *
      * <p>用于区分"本地文件没有配置该节"与"该节字段恰好等于默认值"：只有前者才应回退到
