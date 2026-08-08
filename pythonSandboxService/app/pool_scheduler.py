@@ -120,6 +120,24 @@ class ContainerWorker:
             # Copy static loader modules once per warm container so concurrent
             # tasks do not race copying the same files into /sandbox.
             prepare_container_loader_modules(session, self.config)
+            # 260808-finance-methodspec-v5 work package D: collect runtime
+            # environment once per warm container. The same ExecutionEnvironment
+            # instance drives the workdir file (written by initialize_runtime_environment),
+            # the AF_RUNTIME_ENVIRONMENT_FILE env var (set at container creation),
+            # and the HTTP execution_environment field for every task in this
+            # container. All tasks in the same pool container share this env by
+            # construction (same image, same baked packages).
+            #
+            # codex 2026-08-08 23:44 (msg 044974a1) pool init lifecycle: smoke
+            # + loader + initialize MUST share the same close-on-error try;
+            # ``self.session/container_id/execution_environment`` and the
+            # idle/ready state MUST only be assigned AFTER initialize succeeds.
+            # Otherwise an init collect/copy failure would orphan an active
+            # Docker container (the manager never sees an idle worker, but
+            # Docker still holds the container until process exit).
+            self.execution_environment = initialize_runtime_environment(
+                self.config, session,
+            )
         except Exception:
             session.close()
             raise
@@ -128,16 +146,6 @@ class ContainerWorker:
         self.started_at = time.monotonic()
         self.last_used_at = self.started_at
         self._set_state("idle")
-        # 260808-finance-methodspec-v5 work package D: collect runtime
-        # environment once per warm container. The same ExecutionEnvironment
-        # instance drives the workdir file (written by initialize_runtime_environment),
-        # the AF_RUNTIME_ENVIRONMENT_FILE env var (set at container creation),
-        # and the HTTP execution_environment field for every task in this
-        # container. All tasks in the same pool container share this env by
-        # construction (same image, same baked packages).
-        self.execution_environment = initialize_runtime_environment(
-            self.config, session,
-        )
         logger.info(
             "POOL_WORKER_READY worker=%s container=%s slots=%s create_ms=%s",
             self.worker_id,
