@@ -205,6 +205,41 @@ class FinanceMethodToolsTest {
     }
 
     @Test
+    void requestTooLargeReturnsDedicatedError() throws Exception {
+        FinanceMethodResolverClient client = mock(FinanceMethodResolverClient.class);
+        when(client.resolve(any(), any(), any()))
+                .thenReturn(new FinanceMethodResolverClient.TechnicalError(
+                        FinanceMethodResolverClient.ErrorKind.REQUEST_TOO_LARGE, "request too large"));
+
+        FinanceMethodTools tools = new FinanceMethodTools(
+                specCatalog, resolverCatalog, validator, renderer, knowledgeCatalog, objectMapper);
+        tools.setResolverClient(client);
+
+        String result = tools.resolveFinanceMethods("完全无关的问题", null);
+        JsonNode node = objectMapper.readTree(result);
+        assertFalse(node.get("ok").asBoolean());
+        assertEquals("RESOLVER_REQUEST_TOO_LARGE", node.get("error").get("code").asText());
+    }
+
+    @Test
+    void callFailedMapsToUnavailable() throws Exception {
+        FinanceMethodResolverClient client = mock(FinanceMethodResolverClient.class);
+        when(client.resolve(any(), any(), any()))
+                .thenReturn(new FinanceMethodResolverClient.TechnicalError(
+                        FinanceMethodResolverClient.ErrorKind.CALL_FAILED, "connection refused"));
+
+        FinanceMethodTools tools = new FinanceMethodTools(
+                specCatalog, resolverCatalog, validator, renderer, knowledgeCatalog, objectMapper);
+        tools.setResolverClient(client);
+
+        String result = tools.resolveFinanceMethods("完全无关的问题", null);
+        JsonNode node = objectMapper.readTree(result);
+        assertFalse(node.get("ok").asBoolean());
+        assertEquals("RESOLVER_UNAVAILABLE", node.get("error").get("code").asText());
+        assertEquals("Finance method resolver call failed", node.get("error").get("message").asText());
+    }
+
+    @Test
     void badModelOutputReturnsError() throws Exception {
         FinanceMethodResolverClient client = mock(FinanceMethodResolverClient.class);
         when(client.resolve(any(), any(), any())).thenReturn(new FinanceMethodResolverClient.Ok("not json", ROUTE, PROMPT_VERSION));

@@ -85,4 +85,26 @@ class LangchainToolCatalogServiceTest {
         assertTrue(props.has("grep"));
         assertTrue(props.has("related_dataset_ids"));
     }
+
+    @Test
+    void listToolMessages_shouldExposeResolveFinanceMethodsAlways() throws Exception {
+        LangchainToolCatalogService service = new LangchainToolCatalogService(
+                null,
+                null,
+                null,
+                null,
+                new ListMyDataTool(objectMapper),
+                objectMapper
+        );
+
+        AgentToolMessage resolve = service.listToolMessages().stream()
+                .filter(tool -> "resolveFinanceMethods".equals(tool.getName()))
+                .findFirst()
+                .orElseThrow();
+
+        JsonNode props = objectMapper.readTree(resolve.getParametersJson()).path("properties");
+        assertTrue(props.has("query"));
+        assertTrue(props.has("context"));
+        assertTrue(resolve.getDescription().contains("raw natural-language"));
+    }
 }

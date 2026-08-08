@@ -2,6 +2,8 @@ package world.willfrog.agentlangchain.tools;
 
 import dev.langchain4j.agent.tool.ToolSpecification;
 import dev.langchain4j.agent.tool.ToolSpecifications;
+import dev.langchain4j.model.chat.request.json.JsonObjectSchema;
+import dev.langchain4j.model.chat.request.json.JsonStringSchema;
 import world.willfrog.agent.tools.compaction.RereadToolHandler;
 import world.willfrog.agent.tools.catalog.MarketDataAdvancedToolCatalog;
 import world.willfrog.agent.tools.catalog.ParallelLimitsToolCatalog;
@@ -44,6 +46,41 @@ final class ToolCatalogBuilder {
         specifications.addAll(ToolSpecifications.toolSpecificationsFrom(listMyDataTool));
         specifications.addAll(ToolSpecifications.toolSpecificationsFrom(loadToolGuideTool));
         specifications.addAll(ToolSpecifications.toolSpecificationsFrom(rereadToolHandler));
-        return MarketDataAdvancedToolCatalog.mergeCanonical(ParallelLimitsToolCatalog.mergeCanonical(specifications));
+
+        List<ToolSpecification> merged = MarketDataAdvancedToolCatalog.mergeCanonical(
+                ParallelLimitsToolCatalog.mergeCanonical(specifications));
+        return addResolveFinanceMethodsIfAbsent(merged);
+    }
+
+    static ToolSpecification resolveFinanceMethodsSpecification() {
+        return ToolSpecification.builder()
+                .name("resolveFinanceMethods")
+                .description("Read-only advisor for financial indicators or calculation methods. "
+                        + "When a question involves a financial metric or computation, pass the user's raw natural-language "
+                        + "expression directly to this tool; do not first rewrite it into fixed fields such as method name, "
+                        + "year, or period count. If the result contains unresolvedTerms, clarify the boundary before computing. "
+                        + "Compatible public-library samples should be preferred but are not mandatory. "
+                        + "When later calling report() or report_custom(), pass the resolverToolCallId from this tool's result "
+                        + "as source_resolver_tool_call_id.")
+                .parameters(JsonObjectSchema.builder()
+                        .addProperty("query", JsonStringSchema.builder()
+                                .description("The user's raw natural-language financial question (required).")
+                                .build())
+                        .addProperty("context", JsonStringSchema.builder()
+                                .description("Optional natural-language context, e.g. already-fetched data or missing boundary hints.")
+                                .build())
+                        .required(List.of("query"))
+                        .build())
+                .build();
+    }
+
+    public static List<ToolSpecification> addResolveFinanceMethodsIfAbsent(List<ToolSpecification> specifications) {
+        boolean exists = specifications.stream().anyMatch(spec -> "resolveFinanceMethods".equals(spec.name()));
+        if (exists) {
+            return specifications;
+        }
+        List<ToolSpecification> result = new ArrayList<>(specifications);
+        result.add(resolveFinanceMethodsSpecification());
+        return result;
     }
 }
