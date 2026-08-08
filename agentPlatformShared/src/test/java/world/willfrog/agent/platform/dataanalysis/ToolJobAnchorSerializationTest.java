@@ -78,4 +78,15 @@ class ToolJobAnchorSerializationTest {
         assertThat(restored.getTerminalStderrPreview()).isEqualTo("Traceback: bad date");
         assertThat(restored.getTerminalExitReason()).isEqualTo("NON_ZERO_EXIT");
     }
+
+    @Test
+    void roundTripsFrozenFinanceRecordLimits() {
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setFinanceRecordLimitsJson("{\"enabled\":false,\"recordCountMax\":128}");
+
+        ToolJobAnchor restored = ToolJobAnchor.fromJson(anchor.toJson());
+
+        assertThat(restored.getFinanceRecordLimitsJson())
+                .isEqualTo("{\"enabled\":false,\"recordCountMax\":128}");
+    }
 }

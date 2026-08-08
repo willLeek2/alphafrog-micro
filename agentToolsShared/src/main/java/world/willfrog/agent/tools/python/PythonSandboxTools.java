@@ -10,6 +10,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.dataanalysis.*;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.finance.FinanceRecordChannelConfigLoader;
 import world.willfrog.agent.platform.debug.DebugObservabilityRpcKeys;
 import world.willfrog.agent.platform.debug.DebugObservabilityService;
 import world.willfrog.agent.platform.util.PromptFileLoader;
@@ -123,6 +124,9 @@ public class PythonSandboxTools {
 
     @Autowired(required = false)
     private DataAnalysisTerminalRecorder dataAnalysisTerminalRecorder;
+
+    @Autowired(required = false)
+    private FinanceRecordChannelConfigLoader financeRecordChannelConfigLoader;
 
     @Value("${agent.tool-job.fast-path-ms:1500}")
     private long fastPathMs = 1500L;
@@ -600,6 +604,9 @@ public class PythonSandboxTools {
         // reservation/estimate/dataset snapshot 都先写 anchor，确保旧 worker 退出前真相完整。
         anchor.setReservationJson(objectMapper.writeValueAsString(reservation));
         anchor.setEstimateJson(objectMapper.writeValueAsString(estimate));
+        if (financeRecordChannelConfigLoader != null) {
+            anchor.setFinanceRecordLimitsJson(financeRecordChannelConfigLoader.frozenSnapshotJson());
+        }
         anchor.setDatasetSnapshotJson(objectMapper.writeValueAsString(datasetSnapshot));
         anchor.setDatasetSnapshotDigest(datasetSnapshot.immutableDigest());
         // timeoutAt 和 nextPollAt 都是 durable 时间，重启后不重新计时。

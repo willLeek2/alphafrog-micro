@@ -1,5 +1,15 @@
 # Shared agent platform config for active agent runtimes.
 agent:
+  finance-record-channel:
+    # 四段上限实测完成前保持关闭；动态配置只能在以下应用默认值和代码硬上限内缩小。
+    enabled: ${AF_FINANCE_RECORD_CHANNEL_ENABLED:false}
+    config-file: ${AF_FINANCE_RECORD_CHANNEL_CONFIG_FILE:}
+    config-refresh-interval-ms: ${AF_FINANCE_RECORD_CHANNEL_CONFIG_REFRESH_INTERVAL_MS:10000}
+    record-count-max: ${AF_FINANCE_RECORD_COUNT_MAX:128}
+    record-max-bytes: ${AF_FINANCE_RECORD_MAX_BYTES:16384}
+    record-channel-max-bytes: ${AF_FINANCE_RECORD_CHANNEL_MAX_BYTES:262144}
+    stdout-max-bytes: ${AF_FINANCE_STDOUT_MAX_BYTES:1048576}
+    stderr-max-bytes: ${AF_FINANCE_STDERR_MAX_BYTES:262144}
   tool-job:
     # durable 工具的同步快路径；超过该阈值后 Run 先落 checkpoint，再转 WAITING_TOOL_JOB。
     fast-path-ms: ${AF_AGENT_TOOL_JOB_FAST_PATH_MS:1500}
