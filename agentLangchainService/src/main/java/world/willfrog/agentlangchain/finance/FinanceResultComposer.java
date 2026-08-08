@@ -49,6 +49,10 @@ public class FinanceResultComposer {
      * 一并拦截。token 均为具体身份形状，合法自然语言说明（尤其中文）不受影响。
      */
     static final List<String> CELL_DENYLIST = List.of(
+            // 通用类别词（codex 52799ba0）：§11/§16.3 版本/环境/后台身份类别本身
+            // 不得进最终 Markdown，无论是否带 Id/Version/Digest 复合形状
+            "digest", "environment", "image", "package", "version", "evidence",
+            "record", "batch", "block", "task", "dataset", "toolcall",
             "methodid", "methodversion", "specdigest",
             "recordid", "recordindex", "recorddigest", "rawdigest", "inputrefs",
             "runid", "todoid", "taskid", "batchid", "blockid", "datasetid",

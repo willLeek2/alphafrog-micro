@@ -503,6 +503,17 @@ class FinanceResultComposerTest {
                     .as("injection should be denylisted: %s", injection)
                     .isTrue();
         }
+        // codex 52799ba0：通用类别词裸形 exact bypass 钉死（不带 Id/Version/Digest 复合形状也拦）
+        List<String> bareCategoryBypasses = List.of(
+                "digest=deadbeef", "environment=prod", "image=runtime", "package=numpy",
+                "version=9", "evidence=custom", "record=x", "batch=x", "block=x",
+                "task=x", "dataset=x", "toolCall=x"
+        );
+        for (String bypass : bareCategoryBypasses) {
+            assertThat(FinanceResultComposer.containsDenylistedToken(bypass))
+                    .as("bare category bypass should be denylisted: %s", bypass)
+                    .isTrue();
+        }
     }
 
     @Test
