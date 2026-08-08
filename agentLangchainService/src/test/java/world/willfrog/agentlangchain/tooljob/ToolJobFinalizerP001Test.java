@@ -17,6 +17,10 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 import world.willfrog.agent.platform.dataanalysis.*;
+import world.willfrog.agent.platform.finance.FinanceRecordChannelConfigLoader;
+import world.willfrog.agent.platform.finance.FinanceRecordChannelProcessor;
+import world.willfrog.agent.platform.finance.FinanceToolResultFormatter;
+import world.willfrog.agent.tools.finance.FinanceResultModelAdapter;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.entity.AgentRunEvent;
 import world.willfrog.agent.platform.mapper.AgentRunEventMapper;
@@ -255,7 +259,7 @@ class ToolJobFinalizerP001Test {
         PgBackedEventHook eventHook = new PgBackedEventHook(eventMapper);
 
         ToolJobFinalizer finalizer = new ToolJobFinalizer(
-                anchorService, redisCache, capacityFake, resumeService, config);
+                anchorService, redisCache, capacityFake, resumeService, config, mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
         inject(finalizer, "usageHook", (ToolJobUsageHook) usageFake);
         inject(finalizer, "eventHook", (ToolJobEventHook) eventHook);
 

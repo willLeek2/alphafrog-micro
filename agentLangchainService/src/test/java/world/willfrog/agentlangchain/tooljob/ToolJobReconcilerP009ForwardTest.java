@@ -16,6 +16,10 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 import world.willfrog.agent.platform.dataanalysis.*;
+import world.willfrog.agent.platform.finance.FinanceRecordChannelConfigLoader;
+import world.willfrog.agent.platform.finance.FinanceRecordChannelProcessor;
+import world.willfrog.agent.platform.finance.FinanceToolResultFormatter;
+import world.willfrog.agent.tools.finance.FinanceResultModelAdapter;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
@@ -158,7 +162,7 @@ class ToolJobReconcilerP009ForwardTest {
                 anchorService, redisCache, config, om);
 
         ToolJobFinalizer finalizer = new ToolJobFinalizer(
-                anchorService, redisCache, capacityFake, resumeService, config);
+                anchorService, redisCache, capacityFake, resumeService, config, mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
         injectHook(finalizer, "usageHook", (ToolJobUsageHook) (rid, a) -> true);
         injectHook(finalizer, "eventHook", (ToolJobEventHook) (rid, a) -> true);
 
@@ -235,7 +239,7 @@ class ToolJobReconcilerP009ForwardTest {
         ToolJobResumeService resumeService2 = new ToolJobResumeService(
                 anchorService2, redisCache2, config, om);
         ToolJobFinalizer finalizer2 = new ToolJobFinalizer(
-                anchorService2, redisCache2, capacityFake2, resumeService2, config);
+                anchorService2, redisCache2, capacityFake2, resumeService2, config, mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
         injectHook(finalizer2, "usageHook", (ToolJobUsageHook) (rid, a) -> true);
         injectHook(finalizer2, "eventHook", (ToolJobEventHook) (rid, a) -> true);
 
@@ -296,7 +300,7 @@ class ToolJobReconcilerP009ForwardTest {
                 anchorService1, redisCache1, config, om);
 
         ToolJobFinalizer finalizer1 = new ToolJobFinalizer(
-                anchorService1, redisCache1, capacity1, resumeService1, config);
+                anchorService1, redisCache1, capacity1, resumeService1, config, mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
         // USAGE hook FAILS — simulates crash after RELEASE, before USAGE durable write
         injectHook(finalizer1, "usageHook", (ToolJobUsageHook) (rid, a) -> false);
         injectHook(finalizer1, "eventHook", (ToolJobEventHook) (rid, a) -> true);
@@ -329,7 +333,7 @@ class ToolJobReconcilerP009ForwardTest {
         AtomicInteger usageCount2 = new AtomicInteger(0);
         AtomicInteger eventCount2 = new AtomicInteger(0);
         ToolJobFinalizer finalizer2 = new ToolJobFinalizer(
-                anchorService2, redisCache2, capacity2, resumeService2, config);
+                anchorService2, redisCache2, capacity2, resumeService2, config, mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
         injectHook(finalizer2, "usageHook", (ToolJobUsageHook) (rid, a) -> {
             usageCount2.incrementAndGet();
             return true;
@@ -366,7 +370,7 @@ class ToolJobReconcilerP009ForwardTest {
         AtomicInteger usageCount3 = new AtomicInteger(0);
         AtomicInteger eventCount3 = new AtomicInteger(0);
         ToolJobFinalizer finalizer3 = new ToolJobFinalizer(
-                anchorService3, redisCache3, capacity3, resumeService3, config);
+                anchorService3, redisCache3, capacity3, resumeService3, config, mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
         injectHook(finalizer3, "usageHook", (ToolJobUsageHook) (rid, a) -> {
             usageCount3.incrementAndGet();
             return true;
@@ -442,7 +446,7 @@ class ToolJobReconcilerP009ForwardTest {
                 failOnceService, redisCache1, config, om);
         CapacityCountingFake capacity1 = new CapacityCountingFake();
         ToolJobFinalizer finalizer1 = new ToolJobFinalizer(
-                failOnceService, redisCache1, capacity1, resumeService1, config);
+                failOnceService, redisCache1, capacity1, resumeService1, config, mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
         injectHook(finalizer1, "usageHook", (ToolJobUsageHook) (rid, a) -> true);
         injectHook(finalizer1, "eventHook", (ToolJobEventHook) (rid, a) -> true);
 
@@ -476,7 +480,7 @@ class ToolJobReconcilerP009ForwardTest {
                 anchorService2, redisCache2, config, om);
         CapacityCountingFake capacity2 = new CapacityCountingFake();
         ToolJobFinalizer finalizer2 = new ToolJobFinalizer(
-                anchorService2, redisCache2, capacity2, resumeService2, config);
+                anchorService2, redisCache2, capacity2, resumeService2, config, mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
         injectHook(finalizer2, "usageHook", (ToolJobUsageHook) (rid, a) -> true);
         injectHook(finalizer2, "eventHook", (ToolJobEventHook) (rid, a) -> true);
 

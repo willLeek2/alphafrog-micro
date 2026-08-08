@@ -21,6 +21,10 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.dataanalysis.*;
+import world.willfrog.agent.platform.finance.FinanceRecordChannelConfigLoader;
+import world.willfrog.agent.platform.finance.FinanceRecordChannelProcessor;
+import world.willfrog.agent.platform.finance.FinanceToolResultFormatter;
+import world.willfrog.agent.tools.finance.FinanceResultModelAdapter;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisCapacityRecoveryReport;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.entity.AgentRunEvent;
@@ -487,7 +491,7 @@ class PythonSandboxToolsP001FastPathTest {
 
         ToolJobFinalizer finalizer = new ToolJobFinalizer(
                 anchorDelegate, mock(ToolJobRedisCache.class),
-                capacity, mock(ToolJobResumeService.class), new ToolJobConfig());
+                capacity, mock(ToolJobResumeService.class), new ToolJobConfig(), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
         java.lang.reflect.Field usageField = ToolJobFinalizer.class.getDeclaredField("usageHook");
         usageField.setAccessible(true);
         ToolJobUsageHook usageHook = mock(ToolJobUsageHook.class);
@@ -706,7 +710,7 @@ class PythonSandboxToolsP001FastPathTest {
         ToolJobEventHookImpl eventHook1 = new ToolJobEventHookImpl(newMapper(), eventSvc1);
 
         ToolJobFinalizer finalizer1 = new ToolJobFinalizer(
-                anchorService1, redisCache1, capacity1, crashResumeService, new ToolJobConfig());
+                anchorService1, redisCache1, capacity1, crashResumeService, new ToolJobConfig(), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
         java.lang.reflect.Field usageF1 = ToolJobFinalizer.class.getDeclaredField("usageHook");
         usageF1.setAccessible(true);
         ToolJobUsageHook usageHook1 = mock(ToolJobUsageHook.class);
@@ -783,7 +787,7 @@ class PythonSandboxToolsP001FastPathTest {
 
         // Fresh finalizer for startup recovery
         ToolJobFinalizer finalizer2 = new ToolJobFinalizer(
-                anchorService2, redisCache2, capacity2, resumeService2, new ToolJobConfig());
+                anchorService2, redisCache2, capacity2, resumeService2, new ToolJobConfig(), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
 
         // ToolJobStartupRecovery — simulates onReady()
         ToolJobStartupRecovery recovery = new ToolJobStartupRecovery(
@@ -919,7 +923,7 @@ class PythonSandboxToolsP001FastPathTest {
         // Production finalizer with real hooks
         ToolJobFinalizer finalizer = new ToolJobFinalizer(
                 anchorService, redisCache, capacity, mock(ToolJobResumeService.class),
-                new ToolJobConfig());
+                new ToolJobConfig(), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
         java.lang.reflect.Field usageField = ToolJobFinalizer.class.getDeclaredField("usageHook");
         usageField.setAccessible(true);
         usageField.set(finalizer, realUsageHook);

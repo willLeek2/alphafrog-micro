@@ -16,6 +16,10 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 import world.willfrog.agent.platform.dataanalysis.*;
+import world.willfrog.agent.platform.finance.FinanceRecordChannelConfigLoader;
+import world.willfrog.agent.platform.finance.FinanceRecordChannelProcessor;
+import world.willfrog.agent.platform.finance.FinanceToolResultFormatter;
+import world.willfrog.agent.tools.finance.FinanceResultModelAdapter;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
@@ -258,7 +262,7 @@ class ToolJobReconcilerP005ReverseTest {
         // Real ToolJobFinalizer wrapped in a spy so we can verify handleTerminal
         // was called (proving the reconciler tried)
         ToolJobFinalizer realFinalizer = new ToolJobFinalizer(
-                anchorService, redisCache, capacityFake, resumeService, config);
+                anchorService, redisCache, capacityFake, resumeService, config, mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
         // Wire usage/event hooks (mocked — return success)
         ToolJobUsageHook usageHook = mock(ToolJobUsageHook.class);
         when(usageHook.upsertUsage(anyString(), any())).thenReturn(true);
