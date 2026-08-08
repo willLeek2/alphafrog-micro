@@ -14,32 +14,44 @@ import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.config.StageLlmConfig;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.finance.FinanceMethodResolverClient;
 
-import java.util.ArrayList;
+import java.net.SocketTimeoutException;
+import java.net.http.HttpTimeoutException;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
-import java.util.UUID;
+import java.util.concurrent.TimeoutException;
 
 /**
- * Lightweight LLM service for the financial MethodSpec resolver.
+ * Lightweight LLM service for the financial MethodSpec resolver; the platform-side
+ * implementation of {@link FinanceMethodResolverClient}.
  *
- * <p>Mirrors the boundary of {@link SearchEvidenceJudgeService}: builds a dedicated
- * ChatModel via {@link AgentAiServiceFactory}, sets {@code phase/stage=finance_method_resolver},
- * injects a structured output schema, records observability, and restores the outer
- * execution context afterwards.</p>
+ * <p>Builds a dedicated ChatModel via {@link AgentAiServiceFactory} with
+ * {@code phase/stage=finance_method_resolver} and temperature 0, assembles the final
+ * system prompt from the actual AgentPromptService template (local file takes precedence
+ * over classpath) plus the caller-supplied compact catalog fragment, and returns the raw
+ * model JSON untouched. It performs only fail-closed technical pre-checks (request/response
+ * byte bounds, candidate-count bound, strict single-JSON shape) and never silently truncates;
+ * per-item semantic validation is the canonical tools-side validator's job.</p>
  *
- * <p>The catalog text (compact method list) is supplied by the caller; this service never
- * silently truncates a catalog that exceeds the configured budget.</p>
+ * <p>The outer execution context (phase, stage, structuredOutputSpec, reasoningEffort,
+ * providerLlmTraceId, llmCallRequestMeta, lastRecordedLlmTraceId) is snapshotted on entry and
+ * restored verbatim in {@code finally}; reasoningEffort is additionally cleared explicitly
+ * before the resolver call because provider-routed chat models read it directly from
+ * AgentContext. No synthetic resolver identity is generated: when the outer toolCallId is
+ * absent the tools layer fails with TOOL_CALL_ID_MISSING before this service runs.</p>
  */
 @Service
 @RequiredArgsConstructor
 @Slf4j
-public class FinanceMethodResolverModelService {
+public class FinanceMethodResolverModelService implements FinanceMethodResolverClient {
 
     public static final String STAGE = "finance_method_resolver";
     static final int DEFAULT_MAX_TOKENS = 2048;
+    private static final String CATALOG_PLACEHOLDER = "{{RESOLVER_CATALOG}}";
 
     private final ObjectMapper objectMapper;
     private final AgentAiServiceFactory aiServiceFactory;
@@ -48,100 +60,182 @@ public class FinanceMethodResolverModelService {
     private final AgentObservabilityService observabilityService;
     private final AgentLlmProperties llmProperties;
 
-    /**
-     * Resolve candidate financial methods for a raw natural-language query.
-     *
-     * @param query           the user's financial question (required)
-     * @param context         optional natural-language context
-     * @param resolverCatalog compact catalog text built from the canonical MethodSpec directory
-     * @return a resolution result carrying status, candidates and the resolver tool-call id
-     */
-    public ResolutionResult resolve(String query, String context, String resolverCatalog) {
+    @Override
+    public ResolverResult resolve(String query, String context, String catalogFragment) {
         String safeQuery = nvl(query);
         if (safeQuery.isBlank()) {
-            return unavailable("EMPTY_QUERY", null);
+            return new TechnicalError(ErrorKind.CALL_FAILED, "query must not be blank");
         }
-        String safeCatalog = nvl(resolverCatalog);
+        String safeContext = nvl(context);
+        String safeCatalog = nvl(catalogFragment);
 
-        String budgetError = checkCatalogBudget(safeCatalog);
+        AgentLlmProperties.FinanceMethodResolver bounds = boundsConfig();
+        int requestMaxBytes = positiveOr(bounds == null ? null : bounds.getRequestMaxBytes(), 8192);
+        int responseMaxBytes = positiveOr(bounds == null ? null : bounds.getResponseMaxBytes(), 16384);
+        int maxCandidates = positiveOr(bounds == null ? null : bounds.getMaxCandidates(), 8);
+
+        String budgetError = checkCatalogBudget(safeCatalog, bounds);
         if (budgetError != null) {
-            return unavailable(budgetError, null);
+            return new TechnicalError(ErrorKind.CATALOG_BUDGET_EXCEEDED, budgetError);
+        }
+
+        // 请求序列化失败必须技术失败，不能静默丢 query/context 继续。
+        String userPayload;
+        try {
+            Map<String, Object> payload = new LinkedHashMap<>();
+            payload.put("query", safeQuery);
+            payload.put("context", safeContext);
+            userPayload = objectMapper.writeValueAsString(payload);
+        } catch (Exception e) {
+            return new TechnicalError(ErrorKind.CALL_FAILED,
+                    "failed to serialize resolver request payload: " + nvl(e.getMessage()));
         }
 
         SelectionAndModel selected = selectModel();
         if (selected == null) {
-            return unavailable("NO_RESOLVER_ROUTE", null);
+            return new TechnicalError(ErrorKind.NO_ROUTE,
+                    "no finance_method_resolver stage config and no enabled default route");
         }
 
-        String resolverToolCallId = nvl(AgentContext.getToolCallId());
-        if (resolverToolCallId.isBlank()) {
-            resolverToolCallId = "resolver-" + UUID.randomUUID();
+        // 实际模板只解析一次：同一文本既用于摘要也用于最终 prompt，避免热加载竞态导致两者不一致。
+        // 模板必须 fail-closed 地恰含 1 个 {{RESOLVER_CATALOG}}：0 个会静默不注入目录，多个会重复注入。
+        String template = nvl(promptService.financeMethodResolverSystemPromptTemplate());
+        if (template.isBlank()) {
+            return new TechnicalError(ErrorKind.CALL_FAILED, "resolver system prompt template is blank");
+        }
+        int placeholderCount = countOccurrences(template, CATALOG_PLACEHOLDER);
+        if (placeholderCount != 1) {
+            return new TechnicalError(ErrorKind.CALL_FAILED,
+                    "resolver system prompt template must contain exactly one " + CATALOG_PLACEHOLDER
+                            + " placeholder, found " + placeholderCount);
+        }
+        String resolverPromptVersion = "sha256:" + sha256Hex(template.getBytes(StandardCharsets.UTF_8));
+        String systemPrompt = template.replace(CATALOG_PLACEHOLDER, safeCatalog);
+
+        // 请求字节上限钉实际送给 ChatModel 的两个 message content（render 后 systemPrompt + 序列化 user JSON）
+        // 的 UTF-8 bytes 总和：catalog 有独立预算，但 local template 本身也可能异常巨大。只报 size/cap，不回显内容。
+        int requestBytes = systemPrompt.getBytes(StandardCharsets.UTF_8).length
+                + userPayload.getBytes(StandardCharsets.UTF_8).length;
+        if (requestBytes > requestMaxBytes) {
+            return new TechnicalError(ErrorKind.REQUEST_TOO_LARGE,
+                    "resolver request message bytes " + requestBytes + " exceed configured limit " + requestMaxBytes);
         }
 
         String previousPhase = AgentContext.getPhase();
         String previousStage = AgentContext.getStage();
         AgentContext.StructuredOutputSpec previousSpec = AgentContext.getStructuredOutputSpec();
         String previousReasoning = AgentContext.getReasoningEffort();
+        String previousProviderTraceId = AgentContext.peekProviderLlmTraceId();
+        Map<String, Object> previousRequestMeta = copyMeta(AgentContext.peekLlmCallRequestMeta());
+        String previousLastRecordedTraceId = AgentContext.peekLastRecordedLlmTraceId();
 
         long startedAtMillis = System.currentTimeMillis();
         ChatResponse lastResponse = null;
-        Exception lastError = null;
+        ErrorKind lastKind = ErrorKind.CALL_FAILED;
+        String lastError = "";
 
         try {
-            AgentContext.clearLastRecordedLlmTraceId();
-            AgentContext.setLlmCallRequestMeta(buildRequestMeta(selected, safeQuery));
-            AgentContext.setPhase(AgentObservabilityService.PHASE_SUMMARIZING);
+            AgentContext.setPhase(STAGE);
             AgentContext.setStage(STAGE);
             AgentContext.setStructuredOutputSpec(buildOutputSchema());
+            // provider-routed ChatModel 直接读 AgentContext.reasoningEffort 写 reasoning 配置；
+            // 轻量 resolver 必须显式清除，不能沿用外层执行模型的推理模式。
+            AgentContext.clearReasoningEffort();
+            AgentContext.clearLastRecordedLlmTraceId();
+            // observability 记录会 consumeProviderLlmTraceId()；进入时清空外层值，
+            // 避免 resolver 未写新 trace 时错记/重复归属外层 trace（finally 会逐字恢复）。
+            AgentContext.setProviderLlmTraceId(null);
+            AgentContext.setLlmCallRequestMeta(buildRequestMeta(selected, safeQuery));
 
-            List<ChatMessage> messages = buildMessages(safeQuery, context, safeCatalog);
-            int maxAttempts = resolveMaxAttempts(selected.config());
+            List<ChatMessage> messages = List.of(
+                    new SystemMessage(systemPrompt),
+                    new UserMessage(userPayload)
+            );
+            int maxAttempts = resolveMaxAttempts();
 
             for (int attempt = 1; attempt <= maxAttempts; attempt++) {
                 try {
                     lastResponse = selected.model().chat(messages);
                     String text = lastResponse.aiMessage() == null ? "" : nvl(lastResponse.aiMessage().text());
-                    JsonNode root = parseJson(text);
-                    Validation validation = validate(root);
-                    if (validation.valid()) {
+                    String rejection = checkResponse(text, responseMaxBytes, maxCandidates);
+                    if (rejection == null) {
                         long durationMs = System.currentTimeMillis() - startedAtMillis;
                         recordObservability(selected, durationMs, startedAtMillis, safeQuery,
                                 null, lastResponse.tokenUsage(), text);
-                        return new ResolutionResult(
-                                root.path("status").asText("NO_ADVICE"),
-                                parseCandidates(root.path("candidates")),
-                                resolverToolCallId,
-                                ""
-                        );
+                        return new Ok(text, selected.route(), resolverPromptVersion);
                     }
-                    lastError = new RuntimeException(validation.error());
+                    lastKind = ErrorKind.BAD_JSON;
+                    lastError = rejection;
+                    log.warn("Finance method resolver attempt {}/{} rejected response: {}", attempt, maxAttempts, rejection);
                 } catch (Exception e) {
-                    lastError = e;
+                    lastKind = isTimeout(e) ? ErrorKind.TIMEOUT : ErrorKind.CALL_FAILED;
+                    lastError = nvl(e.getMessage());
                     log.warn("Finance method resolver attempt {}/{} failed: {}", attempt, maxAttempts, e.getMessage());
                 }
             }
 
             long durationMs = System.currentTimeMillis() - startedAtMillis;
             recordObservability(selected, durationMs, startedAtMillis, safeQuery,
-                    lastError != null ? lastError.getMessage() : "VALIDATION_FAILED",
+                    lastError.isBlank() ? "RESOLVER_ATTEMPTS_EXHAUSTED" : lastError,
                     lastResponse == null ? null : lastResponse.tokenUsage(),
-                    lastResponse == null ? null : (lastResponse.aiMessage() == null ? null : lastResponse.aiMessage().text()));
-            return unavailable("RESOLVER_CALL_FAILED: " + (lastError != null ? lastError.getMessage() : "validation failed"),
-                    resolverToolCallId);
+                    lastResponse == null ? null
+                            : (lastResponse.aiMessage() == null ? null : lastResponse.aiMessage().text()));
+            return new TechnicalError(lastKind, lastError);
         } catch (Exception e) {
             long durationMs = System.currentTimeMillis() - startedAtMillis;
             log.warn("Finance method resolver failed: {}", e.getMessage());
             recordObservability(selected, durationMs, startedAtMillis, safeQuery, nvl(e.getMessage()), null, null);
-            return unavailable("RESOLVER_CALL_FAILED: " + nvl(e.getMessage()), resolverToolCallId);
+            return new TechnicalError(isTimeout(e) ? ErrorKind.TIMEOUT : ErrorKind.CALL_FAILED, nvl(e.getMessage()));
         } finally {
-            restoreContext(previousPhase, previousStage, previousSpec, previousReasoning);
+            restoreContext(previousPhase, previousStage, previousSpec, previousReasoning,
+                    previousProviderTraceId, previousRequestMeta, previousLastRecordedTraceId);
         }
     }
 
+    /**
+     * 响应侧 fail-closed 预检：字节上限、严格单一 JSON、候选数上限。
+     * 通过返回 null；否则返回拒绝原因（不静默截断、不做逐项语义校验）。
+     */
+    private String checkResponse(String text, int responseMaxBytes, int maxCandidates) {
+        if (text.isBlank()) {
+            return "resolver response is blank";
+        }
+        int responseBytes = text.getBytes(StandardCharsets.UTF_8).length;
+        if (responseBytes > responseMaxBytes) {
+            return "resolver response UTF-8 bytes " + responseBytes + " exceed configured limit " + responseMaxBytes;
+        }
+        JsonNode root = parseStrictJson(text);
+        if (root == null || !root.isObject()) {
+            return "resolver response is not a strict single JSON object";
+        }
+        JsonNode candidates = root.get("candidates");
+        if (candidates != null && candidates.isArray() && candidates.size() > maxCandidates) {
+            return "resolver candidate count " + candidates.size() + " exceeds configured limit " + maxCandidates;
+        }
+        return null;
+    }
+
+    /**
+     * 严格单一 JSON：拒绝 fence、前后缀说明文字与 trailing garbage
+     * （FAIL_ON_TRAILING_TOKENS 等价严格预检）。解析失败返回 null。
+     */
+    private JsonNode parseStrictJson(String text) {
+        try {
+            return objectMapper.reader()
+                    .with(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
+                    .readTree(text);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * 按 frozen 顺序尝试候选路由：dedicated stage 优先，其次 server default route；
+     * 前一个候选构建失败继续尝试下一个，全部不可用才返回 null（NO_ROUTE）。严禁继承 execution 大模型。
+     */
     private SelectionAndModel selectModel() {
-        Optional<FinanceMethodResolverModelResolver.ResolvedStageModel> resolvedStage = resolverModelResolver.resolve();
-        if (resolvedStage.isPresent()) {
-            StageLlmConfig cfg = resolvedStage.get().config();
+        for (FinanceMethodResolverModelResolver.ResolvedStageModel candidate : resolverModelResolver.resolveCandidates()) {
+            StageLlmConfig cfg = candidate.config();
             try {
                 AgentLlmResolver.ResolvedLlm resolved = aiServiceFactory.resolveLlm(
                         cfg.getEndpointName(), cfg.getModelName());
@@ -151,56 +245,84 @@ public class FinanceMethodResolverModelService {
                         : DEFAULT_MAX_TOKENS;
                 ChatModel model = aiServiceFactory.buildChatModelWithProviderOrderAndTemperature(
                         resolved, providerOrder, 0.0D, maxTokens);
-                return new SelectionAndModel(
-                        cfg,
-                        cfg.getEndpointName(),
-                        cfg.getModelName(),
-                        resolvedStage.get().source(),
-                        model);
+                RouteInfo route = new RouteInfo(
+                        resolveProviderType(resolved),
+                        resolveEffectiveEndpoint(resolved),
+                        resolved.modelName());
+                return new SelectionAndModel(cfg, candidate.source(), model, route);
             } catch (Exception e) {
-                log.warn("Init finance method resolver from stage config failed: endpoint={}, model={}, err={}",
-                        cfg.getEndpointName(), cfg.getModelName(), e.getMessage());
+                log.warn("Init finance method resolver from {} failed: endpoint={}, model={}, err={}",
+                        candidate.source(), cfg.getEndpointName(), cfg.getModelName(), e.getMessage());
             }
         }
         return null;
     }
 
-    private String checkCatalogBudget(String catalog) {
-        AgentLlmProperties.FinanceMethodResolver config = llmProperties == null ? null : llmProperties.getFinanceMethodResolver();
-        int maxBytes = config != null && config.getCatalogPromptMaxBytes() != null
-                ? config.getCatalogPromptMaxBytes()
-                : 8192;
-        int maxTokens = config != null && config.getCatalogPromptMaxTokens() != null
-                ? config.getCatalogPromptMaxTokens()
-                : 2048;
-        byte[] bytes = catalog.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    /**
+     * RouteInfo.provider 语义钉死为 HTTP 平台类型（不猜 providerOrder[0]，不回填 stage 别名，
+     * 也不是 OpenRouter retry 后的实际 winning provider）。
+     */
+    private String resolveProviderType(AgentLlmResolver.ResolvedLlm resolved) {
+        String baseUrl = resolved.baseUrl() == null ? "" : resolved.baseUrl().toLowerCase();
+        if (isDashScope(resolved) || baseUrl.contains("dashscope")) {
+            return "dashscope";
+        }
+        if (baseUrl.contains("openrouter.ai")) {
+            return "openrouter";
+        }
+        return "openai-compatible";
+    }
+
+    /**
+     * RouteInfo.endpoint = 解析后的真实 baseUrl；仅 DashScope 允许按 region 推导缺省端点，
+     * 其他端点 blank baseUrl 一律 fail closed（抛错由候选循环捕获后继续/降级），不得回填假地址。
+     */
+    private String resolveEffectiveEndpoint(AgentLlmResolver.ResolvedLlm resolved) {
+        if (resolved.baseUrl() != null && !resolved.baseUrl().isBlank()) {
+            return resolved.baseUrl();
+        }
+        if (!isDashScope(resolved)) {
+            throw new IllegalStateException(
+                    "resolved endpoint has blank baseUrl and is not dashscope: " + resolved.endpointName());
+        }
+        String region = resolved.region() == null ? "" : resolved.region().trim().toLowerCase();
+        return switch (region) {
+            case "us" -> "https://dashscope-us.aliyuncs.com/compatible-mode/v1";
+            case "cn" -> "https://dashscope.aliyuncs.com/compatible-mode/v1";
+            case "singapore" -> "https://dashscope-intl.aliyuncs.com/compatible-mode/v1";
+            default -> "https://dashscope-intl.aliyuncs.com/compatible-mode/v1";
+        };
+    }
+
+    private boolean isDashScope(AgentLlmResolver.ResolvedLlm resolved) {
+        String endpointName = resolved.endpointName() == null ? "" : resolved.endpointName().trim();
+        return endpointName.equalsIgnoreCase("dashscope");
+    }
+
+    private AgentLlmProperties.FinanceMethodResolver boundsConfig() {
+        return llmProperties == null ? null : llmProperties.getFinanceMethodResolver();
+    }
+
+    private String checkCatalogBudget(String catalog, AgentLlmProperties.FinanceMethodResolver config) {
+        int maxBytes = positiveOr(config == null ? null : config.getCatalogPromptMaxBytes(), 8192);
+        int maxTokens = positiveOr(config == null ? null : config.getCatalogPromptMaxTokens(), 2048);
+        byte[] bytes = catalog.getBytes(StandardCharsets.UTF_8);
         if (bytes.length > maxBytes) {
-            return "CATALOG_EXCEEDS_BYTES";
+            return "catalog UTF-8 bytes " + bytes.length + " exceed configured limit " + maxBytes;
         }
         // conservative byte-per-token estimate: do not assume all languages are 4 bytes/token
         if (bytes.length > maxTokens * 2L) {
-            return "CATALOG_EXCEEDS_TOKENS";
+            return "catalog UTF-8 bytes " + bytes.length + " exceed conservative token estimate for limit " + maxTokens;
         }
         return null;
     }
 
-    private int resolveMaxAttempts(StageLlmConfig cfg) {
-        AgentLlmProperties.FinanceMethodResolver config = llmProperties == null ? null : llmProperties.getFinanceMethodResolver();
+    private int resolveMaxAttempts() {
+        AgentLlmProperties.FinanceMethodResolver config = boundsConfig();
         if (config != null && config.getDefaultRoute() != null && config.getDefaultRoute().getMaxAttempts() != null) {
             return Math.max(1, config.getDefaultRoute().getMaxAttempts());
         }
         return 2;
-    }
-
-    private List<ChatMessage> buildMessages(String query, String context, String resolverCatalog) {
-        String systemPrompt = promptService.financeMethodResolverSystemPrompt(resolverCatalog);
-        Map<String, Object> payload = new LinkedHashMap<>();
-        payload.put("query", query);
-        payload.put("context", nvl(context));
-        return List.of(
-                new SystemMessage(systemPrompt),
-                new UserMessage(writeJson(payload))
-        );
     }
 
     private AgentContext.StructuredOutputSpec buildOutputSchema() {
@@ -231,68 +353,6 @@ public class FinanceMethodResolverModelService {
                 "finance_method_resolver_output", false, schema, false, true);
     }
 
-    private Validation validate(JsonNode root) {
-        if (root == null || !root.isObject()) {
-            return Validation.invalid("RESOLVER_BAD_JSON");
-        }
-        JsonNode status = root.path("status");
-        if (!status.isTextual()) {
-            return Validation.invalid("RESOLVER_MISSING_STATUS");
-        }
-        String statusText = status.asText("");
-        if (!List.of("MATCHED", "AMBIGUOUS", "NEEDS_CLARIFICATION", "NO_ADVICE").contains(statusText)) {
-            return Validation.invalid("RESOLVER_INVALID_STATUS");
-        }
-        JsonNode candidates = root.path("candidates");
-        if (!candidates.isArray()) {
-            return Validation.invalid("RESOLVER_MISSING_CANDIDATES");
-        }
-        for (JsonNode candidate : candidates) {
-            if (!candidate.isObject()) {
-                return Validation.invalid("RESOLVER_CANDIDATE_NOT_OBJECT");
-            }
-            if (isBlank(candidate.path("methodId"))
-                    || isBlank(candidate.path("version"))
-                    || isBlank(candidate.path("specDigest"))
-                    || isBlank(candidate.path("matchReason"))) {
-                return Validation.invalid("RESOLVER_CANDIDATE_MISSING_FIELDS");
-            }
-        }
-        return Validation.ok();
-    }
-
-    private List<MethodCandidate> parseCandidates(JsonNode candidates) {
-        List<MethodCandidate> out = new ArrayList<>();
-        if (!candidates.isArray()) {
-            return out;
-        }
-        for (JsonNode candidate : candidates) {
-            out.add(new MethodCandidate(
-                    textOrEmpty(candidate.path("methodId")),
-                    textOrEmpty(candidate.path("version")),
-                    textOrEmpty(candidate.path("specDigest")),
-                    textOrEmpty(candidate.path("matchReason")),
-                    stringList(candidate.path("unresolvedTerms")),
-                    stringList(candidate.path("clarificationQuestions"))
-            ));
-        }
-        return out;
-    }
-
-    private List<String> stringList(JsonNode node) {
-        List<String> out = new ArrayList<>();
-        if (!node.isArray()) {
-            return out;
-        }
-        for (JsonNode item : node) {
-            String text = item.asText("").trim();
-            if (!text.isEmpty()) {
-                out.add(text);
-            }
-        }
-        return out;
-    }
-
     private void recordObservability(SelectionAndModel selected,
                                      long durationMs,
                                      long startedAtMillis,
@@ -316,13 +376,13 @@ public class FinanceMethodResolverModelService {
             requestSnapshot.put("stage", STAGE);
             observabilityService.recordLlmCall(
                     runId,
-                    AgentObservabilityService.PHASE_SUMMARIZING,
+                    STAGE,
                     tokenUsage,
                     durationMs,
                     startedAtMillis,
                     startedAtMillis + durationMs,
-                    selected.endpointName(),
-                    selected.modelName(),
+                    selected.route().endpoint(),
+                    selected.route().model(),
                     errorMessage,
                     requestSnapshot,
                     responseText);
@@ -335,14 +395,17 @@ public class FinanceMethodResolverModelService {
         Map<String, Object> meta = new LinkedHashMap<>();
         meta.put("stage", STAGE);
         meta.put("resolver_model_source", selected.source().name().toLowerCase());
-        meta.put("resolver_model", selected.modelName());
-        meta.put("resolver_endpoint", selected.endpointName());
+        meta.put("resolver_model", selected.route().model());
+        meta.put("resolver_endpoint", selected.route().endpoint());
+        meta.put("resolver_provider", selected.route().provider());
         meta.put("query_preview", truncate(query, 200));
         return meta;
     }
 
     private void restoreContext(String previousPhase, String previousStage,
-                                AgentContext.StructuredOutputSpec previousSpec, String previousReasoning) {
+                                AgentContext.StructuredOutputSpec previousSpec, String previousReasoning,
+                                String previousProviderTraceId, Map<String, Object> previousRequestMeta,
+                                String previousLastRecordedTraceId) {
         if (previousPhase == null || previousPhase.isBlank()) {
             AgentContext.clearPhase();
         } else {
@@ -363,46 +426,50 @@ public class FinanceMethodResolverModelService {
         } else {
             AgentContext.setReasoningEffort(previousReasoning);
         }
+        // setters 对 null/空白执行 remove，天然恢复"外层未设置"状态
+        AgentContext.setProviderLlmTraceId(previousProviderTraceId);
+        AgentContext.setLlmCallRequestMeta(previousRequestMeta);
+        AgentContext.setLastRecordedLlmTraceId(previousLastRecordedTraceId);
     }
 
-    private JsonNode parseJson(String text) {
-        if (text == null || text.isBlank()) {
-            return null;
-        }
-        String trimmed = text.trim();
-        int fenceStart = trimmed.indexOf("```");
-        if (fenceStart >= 0) {
-            int firstLineEnd = trimmed.indexOf('\n', fenceStart);
-            int contentStart = firstLineEnd < 0 ? fenceStart + 3 : firstLineEnd + 1;
-            int fenceEnd = trimmed.indexOf("```", contentStart);
-            if (fenceEnd > contentStart) {
-                trimmed = trimmed.substring(contentStart, fenceEnd).trim();
-                if (trimmed.regionMatches(true, 0, "json", 0, 4)) {
-                    trimmed = trimmed.substring(4).trim();
-                }
+    private boolean isTimeout(Throwable error) {
+        Throwable current = error;
+        while (current != null) {
+            if (current instanceof SocketTimeoutException
+                    || current instanceof TimeoutException
+                    || current instanceof HttpTimeoutException) {
+                return true;
             }
+            current = current.getCause();
         }
-        int start = trimmed.indexOf('{');
-        int end = trimmed.lastIndexOf('}');
-        String json = (start >= 0 && end > start) ? trimmed.substring(start, end + 1) : trimmed;
-        try {
-            return objectMapper.readTree(json);
-        } catch (Exception e) {
-            return null;
-        }
+        return false;
     }
 
-    private String writeJson(Object value) {
-        try {
-            return objectMapper.writeValueAsString(value);
-        } catch (Exception e) {
-            return "{}";
-        }
+    private Map<String, Object> copyMeta(Map<String, Object> meta) {
+        return meta == null ? null : new LinkedHashMap<>(meta);
     }
 
-    private ResolutionResult unavailable(String reason, String resolverToolCallId) {
-        return new ResolutionResult("RESOLVER_UNAVAILABLE", List.of(),
-                resolverToolCallId == null ? "" : resolverToolCallId, reason);
+    private int countOccurrences(String text, String token) {
+        int count = 0;
+        int index = 0;
+        while ((index = text.indexOf(token, index)) >= 0) {
+            count++;
+            index += token.length();
+        }
+        return count;
+    }
+
+    private int positiveOr(Integer value, int fallback) {
+        return value != null && value > 0 ? value : fallback;
+    }
+
+    private String sha256Hex(byte[] bytes) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            return java.util.HexFormat.of().formatHex(digest.digest(bytes));
+        } catch (Exception e) {
+            throw new IllegalStateException("SHA-256 unavailable", e);
+        }
     }
 
     private String nvl(String value) {
@@ -417,45 +484,10 @@ public class FinanceMethodResolverModelService {
         return text.substring(0, maxChars);
     }
 
-    private static boolean isBlank(JsonNode node) {
-        return node == null || !node.isTextual() || node.asText("").isBlank();
-    }
-
-    private static String textOrEmpty(JsonNode node) {
-        return node == null ? "" : node.asText("");
-    }
-
     private record SelectionAndModel(
             StageLlmConfig config,
-            String endpointName,
-            String modelName,
             FinanceMethodResolverModelResolver.ModelSource source,
-            ChatModel model) {
-    }
-
-    private record Validation(boolean valid, String error) {
-        static Validation ok() {
-            return new Validation(true, "");
-        }
-
-        static Validation invalid(String error) {
-            return new Validation(false, error == null ? "" : error);
-        }
-    }
-
-    public record ResolutionResult(
-            String status,
-            List<MethodCandidate> candidates,
-            String resolverToolCallId,
-            String unavailableReason) {
-    }
-
-    public record MethodCandidate(
-            String methodId,
-            String version,
-            String specDigest,
-            String matchReason,
-            List<String> unresolvedTerms,
-            List<String> clarificationQuestions) {
+            ChatModel model,
+            RouteInfo route) {
     }
 }

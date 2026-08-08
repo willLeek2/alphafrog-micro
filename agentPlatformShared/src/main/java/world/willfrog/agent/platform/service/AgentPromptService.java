@@ -357,14 +357,34 @@ public class AgentPromptService {
      * @return 替换占位符后的完整 system prompt
      */
     public String financeMethodResolverSystemPrompt(String resolverCatalog) {
-        String template = firstNonBlank(
-                currentPrompts().getFinanceMethodResolverSystemPrompt(),
-                loadPromptFileFromClasspath(firstNonBlank(
-                        currentPrompts().getFinanceMethodResolverSystemPromptFile(),
-                        "prompts/finance/finance_method_resolver_system.txt")),
+        return render(financeMethodResolverSystemPromptTemplate(), Map.of("RESOLVER_CATALOG", safe(resolverCatalog)));
+    }
+
+    /**
+     * 返回占位符替换前的 resolver system prompt 原始模板（含 local 配置正文/文件优先链）。
+     *
+     * <p>调用方（如 resolver 轻量模型服务）据此计算实际模板的版本摘要，
+     * 保证持久化的 promptVersion 是真实使用模板的事实而非 classpath 默认。</p>
+     *
+     * <p>优先链：直接配置正文 ＞ local file 引用（loader 已把 {@code file:} 引用解析为正文）
+     * ＞ 配置的 classpath 路径 ＞ 内置 classpath 默认文件。{@code financeMethodResolverSystemPromptFile}
+     * 的历史取值是 classpath 路径（见 application-agent-llm-prompts.yml），因此裸路径值仍按
+     * classpath 资源解析；只有加载不到资源时才把该值当作 literal 正文。</p>
+     */
+    public String financeMethodResolverSystemPromptTemplate() {
+        String direct = currentPrompts().getFinanceMethodResolverSystemPrompt();
+        if (!safe(direct).isBlank()) {
+            return direct;
+        }
+        String fileValue = currentPrompts().getFinanceMethodResolverSystemPromptFile();
+        if (!safe(fileValue).isBlank()) {
+            String loaded = loadPromptFileFromClasspath(fileValue.trim());
+            return !safe(loaded).isBlank() ? loaded : fileValue;
+        }
+        return firstNonBlank(
+                loadPromptFileFromClasspath("prompts/finance/finance_method_resolver_system.txt"),
                 ""
         );
-        return render(template, Map.of("RESOLVER_CATALOG", safe(resolverCatalog)));
     }
 
     /**

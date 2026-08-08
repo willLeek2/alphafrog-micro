@@ -49,6 +49,11 @@ public interface FinanceMethodResolverClient {
 
     /**
      * 模型路由信息。compact constructor 会 trim 并拒绝空值。
+     *
+     * <p>{@code provider} 语义钉死为 <b>HTTP 平台类型</b>（如 openrouter / dashscope / openai-compatible），
+     * 由 platform 实现侧从解析后的真实端点推导；它<i>不是</i> OpenRouter retry 后的实际 winning provider，
+     * 也不是 stage 配置别名或模型输出字段。{@code endpoint} 为解析后的真实 baseUrl（仅 DashScope 允许
+     * 按 region 推导缺省端点）；{@code model} 为解析后的真实模型名。</p>
      */
     record RouteInfo(String provider, String endpoint, String model) {
         public RouteInfo {
@@ -74,6 +79,10 @@ public interface FinanceMethodResolverClient {
         NO_ROUTE,
         TIMEOUT,
         BAD_JSON,
-        CATALOG_BUDGET_EXCEEDED
+        CATALOG_BUDGET_EXCEEDED,
+        /** query/context 合并请求字节超过 platform 侧配置上限（不静默截断）。 */
+        REQUEST_TOO_LARGE,
+        /** ChatModel 调用抛出的非超时异常（认证失败、连接拒绝、5xx 重试耗尽等）。 */
+        CALL_FAILED
     }
 }

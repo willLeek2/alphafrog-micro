@@ -294,6 +294,7 @@ public class AgentLlmLocalConfigLoader {
         prompts.setDagReactSystemPromptFile(resolvePromptText(prompts.getDagReactSystemPromptFile(), baseDir, fileTimes));
         prompts.setDagRecoveryJudgeSystemPromptTemplate(resolvePromptText(prompts.getDagRecoveryJudgeSystemPromptTemplate(), baseDir, fileTimes));
         prompts.setDagRecoveryJudgeSystemPromptFile(resolvePromptText(prompts.getDagRecoveryJudgeSystemPromptFile(), baseDir, fileTimes));
+        prompts.setFinanceMethodResolverSystemPromptFile(resolvePromptText(prompts.getFinanceMethodResolverSystemPromptFile(), baseDir, fileTimes));
 
         // 加载两阶段 planning 的 prompt 文件（复用 resolvePromptText 处理 file: 前缀）
         prompts.setPlanningStrategyStage(resolvePromptText(prompts.getPlanningStrategyStageFile(), baseDir, fileTimes));

@@ -2419,6 +2419,12 @@ public class AgentLlmProperties {
         private Integer catalogPromptMaxBytes = 8192;
         @JsonAlias({"catalog_prompt_max_tokens", "catalogPromptMaxTokens"})
         private Integer catalogPromptMaxTokens = 2048;
+        @JsonAlias({"request_max_bytes", "requestMaxBytes"})
+        private Integer requestMaxBytes = 8192;
+        @JsonAlias({"response_max_bytes", "responseMaxBytes"})
+        private Integer responseMaxBytes = 16384;
+        @JsonAlias({"max_candidates", "maxCandidates"})
+        private Integer maxCandidates = 8;
 
         public DefaultRoute getDefaultRoute() {
             return defaultRoute;
@@ -2442,6 +2448,30 @@ public class AgentLlmProperties {
 
         public void setCatalogPromptMaxTokens(Integer catalogPromptMaxTokens) {
             this.catalogPromptMaxTokens = catalogPromptMaxTokens;
+        }
+
+        public Integer getRequestMaxBytes() {
+            return requestMaxBytes;
+        }
+
+        public void setRequestMaxBytes(Integer requestMaxBytes) {
+            this.requestMaxBytes = requestMaxBytes;
+        }
+
+        public Integer getResponseMaxBytes() {
+            return responseMaxBytes;
+        }
+
+        public void setResponseMaxBytes(Integer responseMaxBytes) {
+            this.responseMaxBytes = responseMaxBytes;
+        }
+
+        public Integer getMaxCandidates() {
+            return maxCandidates;
+        }
+
+        public void setMaxCandidates(Integer maxCandidates) {
+            this.maxCandidates = maxCandidates;
         }
 
         public static class DefaultRoute {

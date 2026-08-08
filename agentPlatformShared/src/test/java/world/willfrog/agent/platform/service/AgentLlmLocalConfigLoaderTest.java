@@ -127,6 +127,232 @@ class AgentLlmLocalConfigLoaderTest {
     }
 
     @Test
+    void load_shouldParseFinanceMethodResolverBoundsFromTopLevel() throws Exception {
+        Path configFile = tempDir.resolve("agent-llm.local.json");
+        Files.writeString(configFile, """
+                {
+                  "financeMethodResolver": {
+                    "defaultRoute": {
+                      "enabled": true,
+                      "endpointName": "openrouter",
+                      "modelName": "openai/gpt-5.2",
+                      "maxAttempts": 3
+                    },
+                    "catalogPromptMaxBytes": 4096,
+                    "catalogPromptMaxTokens": 1024,
+                    "requestMaxBytes": 6000,
+                    "responseMaxBytes": 12000,
+                    "maxCandidates": 5
+                  }
+                }
+                """, StandardCharsets.UTF_8);
+
+        AgentLlmLocalConfigLoader loader = new AgentLlmLocalConfigLoader(new ObjectMapper());
+        ReflectionTestUtils.setField(loader, "configFile", configFile.toString());
+        loader.load();
+
+        var resolver = loader.current().orElseThrow().getFinanceMethodResolver();
+        assertEquals(4096, resolver.getCatalogPromptMaxBytes());
+        assertEquals(1024, resolver.getCatalogPromptMaxTokens());
+        assertEquals(6000, resolver.getRequestMaxBytes());
+        assertEquals(12000, resolver.getResponseMaxBytes());
+        assertEquals(5, resolver.getMaxCandidates());
+        assertTrue(Boolean.TRUE.equals(resolver.getDefaultRoute().getEnabled()));
+        assertEquals(3, resolver.getDefaultRoute().getMaxAttempts());
+    }
+
+    @Test
+    void load_shouldApplyFinanceMethodResolverBoundsDefaultsWhenOmitted() throws Exception {
+        Path configFile = tempDir.resolve("agent-llm.local.json");
+        Files.writeString(configFile, """
+                {
+                  "financeMethodResolver": {
+                    "defaultRoute": { "enabled": false }
+                  }
+                }
+                """, StandardCharsets.UTF_8);
+
+        AgentLlmLocalConfigLoader loader = new AgentLlmLocalConfigLoader(new ObjectMapper());
+        ReflectionTestUtils.setField(loader, "configFile", configFile.toString());
+        loader.load();
+
+        var resolver = loader.current().orElseThrow().getFinanceMethodResolver();
+        assertEquals(8192, resolver.getCatalogPromptMaxBytes());
+        assertEquals(2048, resolver.getCatalogPromptMaxTokens());
+        assertEquals(8192, resolver.getRequestMaxBytes());
+        assertEquals(16384, resolver.getResponseMaxBytes());
+        assertEquals(8, resolver.getMaxCandidates());
+    }
+
+    @Test
+    void load_shouldResolveFinanceMethodResolverSystemPromptFile() throws Exception {
+        Path promptsDir = tempDir.resolve("prompts").resolve("finance");
+        Files.createDirectories(promptsDir);
+        Path resolverPromptFile = promptsDir.resolve("finance_method_resolver_system.txt");
+        Files.writeString(resolverPromptFile, "resolver prompt local {{RESOLVER_CATALOG}}", StandardCharsets.UTF_8);
+
+        Path configFile = tempDir.resolve("agent-llm.local.json");
+        Files.writeString(configFile, """
+                {
+                  "prompts": {
+                    "financeMethodResolverSystemPromptFile": "file:prompts/finance/finance_method_resolver_system.txt"
+                  }
+                }
+                """, StandardCharsets.UTF_8);
+
+        AgentLlmLocalConfigLoader loader = new AgentLlmLocalConfigLoader(new ObjectMapper());
+        ReflectionTestUtils.setField(loader, "configFile", configFile.toString());
+        loader.load();
+
+        assertEquals("resolver prompt local {{RESOLVER_CATALOG}}",
+                loader.current().orElseThrow().getPrompts().getFinanceMethodResolverSystemPromptFile());
+    }
+
+    @Test
+    void refresh_shouldReloadWhenFinanceMethodResolverPromptFileChanges() throws Exception {
+        Path promptsDir = tempDir.resolve("prompts").resolve("finance");
+        Files.createDirectories(promptsDir);
+        Path resolverPromptFile = promptsDir.resolve("finance_method_resolver_system.txt");
+        Files.writeString(resolverPromptFile, "resolver prompt v1", StandardCharsets.UTF_8);
+
+        Path configFile = tempDir.resolve("agent-llm.local.json");
+        Files.writeString(configFile, """
+                {
+                  "prompts": {
+                    "financeMethodResolverSystemPromptFile": "file:prompts/finance/finance_method_resolver_system.txt"
+                  }
+                }
+                """, StandardCharsets.UTF_8);
+
+        AgentLlmLocalConfigLoader loader = new AgentLlmLocalConfigLoader(new ObjectMapper());
+        ReflectionTestUtils.setField(loader, "configFile", configFile.toString());
+        loader.load();
+        assertEquals("resolver prompt v1",
+                loader.current().orElseThrow().getPrompts().getFinanceMethodResolverSystemPromptFile());
+
+        Thread.sleep(5L);
+        Files.writeString(resolverPromptFile, "resolver prompt v2", StandardCharsets.UTF_8);
+        loader.refresh();
+
+        assertEquals("resolver prompt v2",
+                loader.current().orElseThrow().getPrompts().getFinanceMethodResolverSystemPromptFile());
+    }
+
+    @Test
+    void localFileOverride_shouldDriveActualSystemPromptAndPromptVersionEndToEnd() throws Exception {
+        // codex 80166252 item 6 端到端：临时 local file 内容 → loader resolvePromptText →
+        // AgentPromptService 实际模板（local 优先于 classpath）→ 渲染后 system prompt 与模板摘要一致。
+        Path promptsDir = tempDir.resolve("prompts").resolve("finance");
+        Files.createDirectories(promptsDir);
+        Path resolverPromptFile = promptsDir.resolve("finance_method_resolver_system.txt");
+        String localTemplate = "LOCAL resolver template body\n目录如下：{{RESOLVER_CATALOG}}\n结束";
+        Files.writeString(resolverPromptFile, localTemplate, StandardCharsets.UTF_8);
+
+        Path configFile = tempDir.resolve("agent-llm.local.json");
+        Files.writeString(configFile, """
+                {
+                  "prompts": {
+                    "financeMethodResolverSystemPromptFile": "file:prompts/finance/finance_method_resolver_system.txt"
+                  }
+                }
+                """, StandardCharsets.UTF_8);
+
+        AgentLlmLocalConfigLoader loader = new AgentLlmLocalConfigLoader(new ObjectMapper());
+        ReflectionTestUtils.setField(loader, "configFile", configFile.toString());
+        loader.load();
+
+        AgentPromptService promptService = new AgentPromptService(new AgentLlmProperties(), loader);
+        String template = promptService.financeMethodResolverSystemPromptTemplate();
+        assertEquals(localTemplate, template);
+
+        String rendered = promptService.financeMethodResolverSystemPrompt("COMPACT-CATALOG");
+        assertTrue(rendered.contains("LOCAL resolver template body"));
+        assertTrue(rendered.contains("COMPACT-CATALOG"));
+        assertFalse(rendered.contains("{{RESOLVER_CATALOG}}"));
+        // promptVersion 摘要输入就是上面的 template（ModelService 侧测试已断言 sha256 计算），
+        // 这里钉死"local file 内容 == 实际模板"这一端到端事实即可。
+    }
+
+    @Test
+    void localFileOverride_shouldDriveResolverModelServiceSystemMessageAndPromptVersion() throws Exception {
+        // 真实链：loader → AgentPromptService → FinanceMethodResolverModelService（仅 mock route/ChatModel）。
+        // 断言实际 SystemMessage 精确等于 local template 单次插入 catalog，且 Ok.resolverPromptVersion
+        // 是 local template 逐字节的 sha256，而不是 classpath 默认模板摘要。
+        Path promptsDir = tempDir.resolve("prompts").resolve("finance");
+        Files.createDirectories(promptsDir);
+        Path resolverPromptFile = promptsDir.resolve("finance_method_resolver_system.txt");
+        String localTemplate = "E2E local resolver template body\n目录：{{RESOLVER_CATALOG}}\n末尾";
+        Files.writeString(resolverPromptFile, localTemplate, StandardCharsets.UTF_8);
+
+        Path configFile = tempDir.resolve("agent-llm.local.json");
+        Files.writeString(configFile, """
+                {
+                  "prompts": {
+                    "financeMethodResolverSystemPromptFile": "file:prompts/finance/finance_method_resolver_system.txt"
+                  }
+                }
+                """, StandardCharsets.UTF_8);
+
+        AgentLlmLocalConfigLoader loader = new AgentLlmLocalConfigLoader(new ObjectMapper());
+        ReflectionTestUtils.setField(loader, "configFile", configFile.toString());
+        loader.load();
+
+        AgentPromptService promptService = new AgentPromptService(new AgentLlmProperties(), loader);
+
+        AgentAiServiceFactory aiServiceFactory = org.mockito.Mockito.mock(AgentAiServiceFactory.class);
+        FinanceMethodResolverModelResolver modelResolver = org.mockito.Mockito.mock(FinanceMethodResolverModelResolver.class);
+        AgentObservabilityService observability = org.mockito.Mockito.mock(AgentObservabilityService.class);
+        dev.langchain4j.model.chat.ChatModel chatModel = org.mockito.Mockito.mock(dev.langchain4j.model.chat.ChatModel.class);
+
+        world.willfrog.agent.platform.config.StageLlmConfig stage = new world.willfrog.agent.platform.config.StageLlmConfig();
+        stage.setEndpointName("e2e-endpoint");
+        stage.setModelName("e2e-model");
+        org.mockito.Mockito.when(modelResolver.resolveCandidates()).thenReturn(java.util.List.of(
+                new FinanceMethodResolverModelResolver.ResolvedStageModel(
+                        stage, FinanceMethodResolverModelResolver.ModelSource.STAGE_CONFIG)));
+        AgentLlmResolver.ResolvedLlm resolved = new AgentLlmResolver.ResolvedLlm(
+                "e2e-endpoint", "https://e2e.example.com/v1", "e2e-model", "key", "", java.util.List.of(), null);
+        org.mockito.Mockito.when(aiServiceFactory.resolveLlm("e2e-endpoint", "e2e-model")).thenReturn(resolved);
+        org.mockito.Mockito.when(aiServiceFactory.buildChatModelWithProviderOrderAndTemperature(
+                org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.anyList(),
+                org.mockito.ArgumentMatchers.anyDouble(), org.mockito.ArgumentMatchers.anyInt()))
+                .thenReturn(chatModel);
+        org.mockito.Mockito.when(chatModel.chat(org.mockito.ArgumentMatchers.anyList())).thenReturn(
+                dev.langchain4j.model.chat.response.ChatResponse.builder()
+                        .aiMessage(new dev.langchain4j.data.message.AiMessage("{\"status\":\"NO_ADVICE\",\"candidates\":[]}"))
+                        .build());
+
+        FinanceMethodResolverModelService service = new FinanceMethodResolverModelService(
+                new ObjectMapper(), aiServiceFactory, modelResolver, promptService, observability,
+                new AgentLlmProperties());
+
+        var result = service.resolve("query", null, "E2E-CATALOG");
+
+        var ok = org.junit.jupiter.api.Assertions.assertInstanceOf(
+                world.willfrog.agent.platform.finance.FinanceMethodResolverClient.Ok.class, result);
+        String expectedDigest = "sha256:" + java.util.HexFormat.of().formatHex(
+                java.security.MessageDigest.getInstance("SHA-256")
+                        .digest(localTemplate.getBytes(StandardCharsets.UTF_8)));
+        assertEquals(expectedDigest, ok.resolverPromptVersion());
+
+        byte[] classpathBytes;
+        try (java.io.InputStream is = getClass().getResourceAsStream(
+                "/prompts/finance/finance_method_resolver_system.txt")) {
+            classpathBytes = is == null ? new byte[0] : is.readAllBytes();
+        }
+        String classpathDigest = "sha256:" + java.util.HexFormat.of().formatHex(
+                java.security.MessageDigest.getInstance("SHA-256").digest(classpathBytes));
+        org.junit.jupiter.api.Assertions.assertNotEquals(classpathDigest, ok.resolverPromptVersion(),
+                "local override 必须驱动 promptVersion，不能落回 classpath 默认模板摘要");
+
+        org.mockito.ArgumentCaptor<java.util.List<dev.langchain4j.data.message.ChatMessage>> captor =
+                org.mockito.ArgumentCaptor.forClass(java.util.List.class);
+        org.mockito.Mockito.verify(chatModel).chat(captor.capture());
+        var systemMessage = (dev.langchain4j.data.message.SystemMessage) captor.getValue().get(0);
+        assertEquals(localTemplate.replace("{{RESOLVER_CATALOG}}", "E2E-CATALOG"), systemMessage.text());
+    }
+
+    @Test
     void load_shouldDefaultRequiresAdjFactorEnabledToFalseWhenOmitted() throws Exception {
         Path configFile = tempDir.resolve("agent-llm.local.json");
         Files.writeString(configFile, """

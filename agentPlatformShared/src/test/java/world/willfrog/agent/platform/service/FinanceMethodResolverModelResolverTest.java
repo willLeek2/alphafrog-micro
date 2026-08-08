@@ -96,6 +96,41 @@ class FinanceMethodResolverModelResolverTest {
         assertFalse(result.isPresent(), "resolver 不能静默继承 execution 模型");
     }
 
+    @Test
+    void resolveCandidates_shouldReturnStageThenDefaultInFrozenOrder() {
+        StageLlmConfig dedicated = stageConfig("dedicated-endpoint", "dedicated-model");
+        RunStageConfig runStageConfig = new RunStageConfig();
+        runStageConfig.setFinanceMethodResolver(dedicated);
+        AgentContext.setStageConfig(runStageConfig);
+
+        AgentLlmProperties properties = propertiesWithDefaultRoute("default-endpoint", "default-model");
+        FinanceMethodResolverModelResolver resolver = new FinanceMethodResolverModelResolver(properties);
+
+        List<FinanceMethodResolverModelResolver.ResolvedStageModel> candidates = resolver.resolveCandidates();
+
+        assertEquals(2, candidates.size());
+        assertEquals(FinanceMethodResolverModelResolver.ModelSource.STAGE_CONFIG, candidates.get(0).source());
+        assertEquals("dedicated-endpoint", candidates.get(0).config().getEndpointName());
+        assertEquals(FinanceMethodResolverModelResolver.ModelSource.DEFAULT_ROUTE, candidates.get(1).source());
+        assertEquals("default-endpoint", candidates.get(1).config().getEndpointName());
+    }
+
+    @Test
+    void resolveCandidates_shouldSkipInvalidStageButKeepDefault() {
+        StageLlmConfig invalidStage = stageConfig("", "model-only");
+        RunStageConfig runStageConfig = new RunStageConfig();
+        runStageConfig.setFinanceMethodResolver(invalidStage);
+        AgentContext.setStageConfig(runStageConfig);
+
+        AgentLlmProperties properties = propertiesWithDefaultRoute("default-endpoint", "default-model");
+        FinanceMethodResolverModelResolver resolver = new FinanceMethodResolverModelResolver(properties);
+
+        List<FinanceMethodResolverModelResolver.ResolvedStageModel> candidates = resolver.resolveCandidates();
+
+        assertEquals(1, candidates.size());
+        assertEquals(FinanceMethodResolverModelResolver.ModelSource.DEFAULT_ROUTE, candidates.get(0).source());
+    }
+
     private static StageLlmConfig stageConfig(String endpoint, String model) {
         StageLlmConfig config = new StageLlmConfig();
         config.setEndpointName(endpoint);
