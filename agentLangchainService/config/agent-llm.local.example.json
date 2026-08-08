@@ -204,6 +204,20 @@
     "finalAnswer": {
       "maxTokens": 20000
     },
+    "financeMethodResolver": {
+      "defaultRoute": {
+        "enabled": false,
+        "endpointName": "openrouter",
+        "modelName": "openai/gpt-5.2",
+        "providerOrder": ["moonshotai/int4", "fireworks"],
+        "temperature": 0.0,
+        "maxTokens": 2048,
+        "maxAttempts": 2,
+        "structuredOutput": true
+      },
+      "catalogPromptMaxBytes": 8192,
+      "catalogPromptMaxTokens": 2048
+    },
     "runBudget": {
       "maxWallClockMs": 1200000,
       "maxLlmCalls": 80,
@@ -413,6 +427,7 @@
     "pythonRefineRequirementsFile": "prompts/python/python_refine_requirements.txt",
     "pythonRefineOutputInstruction": "file:prompts/python/python_refine_output_instruction.txt",
     "datasetFieldSpecsFile": "prompts/python/dataset_field_specs.json",
+    "financeMethodResolverSystemPromptFile": "prompts/finance/finance_method_resolver_system.txt",
     "orchestratorPlanningSystemPrompt": "file:prompts/orchestrator/orchestrator_planning_system.txt",
     "orchestratorSummarySystemPrompt": "file:prompts/orchestrator/orchestrator_summary_system.txt",
     "dagReactSystemPromptFile": "file:prompts/todo/dag_react_system.txt",
