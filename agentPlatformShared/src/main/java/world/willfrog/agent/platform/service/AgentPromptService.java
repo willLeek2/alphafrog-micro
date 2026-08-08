@@ -347,9 +347,48 @@ public class AgentPromptService {
     }
 
     /**
-     * 数据集字段说明文档（供 LLM 理解每个数据列的字段名、含义、类型和格式）。
+     * Finance MethodSpec resolver 的专用 system prompt 组装。
      *
-     * <p>从配置的 {@code datasetFieldSpecs} 列表渲染为如下格式：</p>
+     * <p>由稳定模板 + 构建期生成的紧凑目录组成。模板中保留 {@code {{RESOLVER_CATALOG}}}
+     * 占位符，由调用方传入当前目录文本后替换。如果热加载或 application.yml 已配置正文，
+     * 优先使用配置内容；否则从 classpath 加载默认文件。</p>
+     *
+     * @param resolverCatalog 运行时紧凑目录文本（含 methodId/version/specDigest/aliases 等）
+     * @return 替换占位符后的完整 system prompt
+     */
+    public String financeMethodResolverSystemPrompt(String resolverCatalog) {
+        return render(financeMethodResolverSystemPromptTemplate(), Map.of("RESOLVER_CATALOG", safe(resolverCatalog)));
+    }
+
+    /**
+     * 返回占位符替换前的 resolver system prompt 原始模板（含 local 配置正文/文件优先链）。
+     *
+     * <p>调用方（如 resolver 轻量模型服务）据此计算实际模板的版本摘要，
+     * 保证持久化的 promptVersion 是真实使用模板的事实而非 classpath 默认。</p>
+     *
+     * <p>优先链：直接配置正文 ＞ local file 引用（loader 已把 {@code file:} 引用解析为正文）
+     * ＞ 配置的 classpath 路径 ＞ 内置 classpath 默认文件。{@code financeMethodResolverSystemPromptFile}
+     * 的历史取值是 classpath 路径（见 application-agent-llm-prompts.yml），因此裸路径值仍按
+     * classpath 资源解析；只有加载不到资源时才把该值当作 literal 正文。</p>
+     */
+    public String financeMethodResolverSystemPromptTemplate() {
+        String direct = currentPrompts().getFinanceMethodResolverSystemPrompt();
+        if (!safe(direct).isBlank()) {
+            return direct;
+        }
+        String fileValue = currentPrompts().getFinanceMethodResolverSystemPromptFile();
+        if (!safe(fileValue).isBlank()) {
+            String loaded = loadPromptFileFromClasspath(fileValue.trim());
+            return !safe(loaded).isBlank() ? loaded : fileValue;
+        }
+        return firstNonBlank(
+                loadPromptFileFromClasspath("prompts/finance/finance_method_resolver_system.txt"),
+                ""
+        );
+    }
+
+    /**
+     * 从配置的 {@code datasetFieldSpecs} 列表渲染为如下格式：
      * <pre>
      * - trade_date | 含义: 交易日期 | 类型: string | 格式: YYYYMMDD
      * - close      | 含义: 收盘价   | 类型: double | 格式: 保留两位小数
@@ -701,6 +740,8 @@ public class AgentPromptService {
                     "- searchFund: 仅搜索场外基金（公募基金）基本信息，不用于 ETF 场内资产筛选。keyword 支持 | 分隔或 JSON 数组批量；具体上限先调用 checkParallelLimits 查询，如 keyword=\"易方达蓝筹精选|招商中证白酒\"；批量返回 data.mode=batch 和 data.results。");
                 case "executePython" -> capabilities.add(
                     "- executePython: 执行 Python 代码进行数据分析。支持批量处理多个数据集（dataset_ids 用逗号分隔）。");
+                case "resolveFinanceMethods" -> capabilities.add(
+                    "- resolveFinanceMethods: 金融指标或计算方法建议工具。遇到金融计算类问题时，把用户的原始自然语言问题直接交给它，不要先把问题改写成固定的方法名、年份或期间字段。建议结果带有未解决表达（unresolvedTerms）时，先处理澄清或明确边界，再执行 Python。");
                 case "getIndexInfo" -> capabilities.add(
                     "- getIndexInfo: 查询指数基本信息。tsCode 支持 | 分隔或 JSON 数组批量；具体上限先调用 checkParallelLimits 查询，如 tsCode=\"000300.SH|000905.SH\"。");
                 case "getStockInfo" -> capabilities.add(
@@ -1032,6 +1073,8 @@ public class AgentPromptService {
         merged.setPlanningTodosStage(firstNonBlank(local.getPlanningTodosStage(), base.getPlanningTodosStage()));
         merged.setDagRecoveryJudgeSystemPromptTemplate(firstNonBlank(local.getDagRecoveryJudgeSystemPromptTemplate(), base.getDagRecoveryJudgeSystemPromptTemplate()));
         merged.setDagRecoveryJudgeSystemPromptFile(firstNonBlank(local.getDagRecoveryJudgeSystemPromptFile(), base.getDagRecoveryJudgeSystemPromptFile()));
+        merged.setFinanceMethodResolverSystemPrompt(firstNonBlank(local.getFinanceMethodResolverSystemPrompt(), base.getFinanceMethodResolverSystemPrompt()));
+        merged.setFinanceMethodResolverSystemPromptFile(firstNonBlank(local.getFinanceMethodResolverSystemPromptFile(), base.getFinanceMethodResolverSystemPromptFile()));
         return merged;
     }
 

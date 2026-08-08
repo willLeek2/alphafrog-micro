@@ -53,3 +53,9 @@ ERROR FEEDBACK AND RECOVERY:
 - TASK_FAILED / NON_ZERO_EXIT: code raised → fix and retry. If you hit this twice due to IDs or paths, stop and call listMyData or switch strategy.
 
 from_ts_code may be UNCERTAIN in paths_dataset.csv; this only means the asset code could not be inferred from the tool arguments, NOT that the data is corrupted.
+
+FINANCE METHOD INTEGRATION:
+- For finance questions, pass the raw natural-language expression to resolveFinanceMethods first.
+- If a candidate has unresolved boundaries, do not invent values; use compatible public libraries when available but not mandatory.
+- For custom calculations, declare generic fields explicitly （自定义计算按通用字段声明）.
+- Pass the resolver root resolverToolCallId to report() or report_custom() via the source_resolver_tool_call_id parameter.

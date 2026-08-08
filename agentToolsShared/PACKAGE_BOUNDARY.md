@@ -5,6 +5,7 @@
 | Package | Classes |
 |---------|---------|
 | `world.willfrog.agent.tools.dataset` | DatasetRegistry, DatasetWriter |
+| `world.willfrog.agent.tools.finance` | FinanceMethodSpec, FinanceMethodSpecCatalog, FinanceMethodResolverCatalog, FinanceMethodResolutionValidator, FinanceMethodSuggestionRenderer, FinanceMethodKnowledgeCatalog, FinanceMethodTools, FinanceResultModelProjector, FinanceTargetEnvironmentProvider（resolver client/sink/snapshot SPI 位于下层 agentPlatformShared 的 world.willfrog.agent.platform.finance，避免依赖环） |
 | `world.willfrog.agent.tools.market` | MarketDataTools |
 | `world.willfrog.agent.tools.python` | PythonSandboxTools |
 | `world.willfrog.agent.tools.rag` | RagTools |

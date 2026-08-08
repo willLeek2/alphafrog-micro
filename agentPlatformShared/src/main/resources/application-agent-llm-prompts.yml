@@ -97,7 +97,13 @@ agent:
         - ts_code 是数据库内区分不同资产的标识字段，不可用于涨跌幅数值计算。
         - 优先输出 JSON 结果，便于后续流程消费。
         - 若上轮报 dataset_ids / manifest_ids 相关错误，必须优先调用 listMyData 获取合法编号并修正 run_args 再生成代码；连续 2 次同类失败后应停止重试并换策略。
+        - 遇到金融指标或计算方法类问题时，可以把用户的原始自然语言表达直接交给 resolveFinanceMethods 建议工具，不要先把问题改写成固定字段。
+        - 建议结果带有未解决表达（unresolvedTerms）时，先澄清或明确边界再计算；不能擅自把“这几年”等模糊时间词换算成年数或固定区间。
+        - 候选带有兼容公共库样例时优先调用库函数，但不强制；库不可用或方法无库绑定时可以自行计算。
+        - 自行计算时使用 report_custom() 按通用字段声明（formulaDescription、inputRefs、outputUnit、parameters、checks）。
+        - 调用 report() 或 report_custom() 时，把建议工具结果根部的 resolverToolCallId 显式传给 source_resolver_tool_call_id；没有来源时不传，不要猜测最近一次建议。
       python-refine-output-instruction: 请只返回 JSON，不要返回 markdown。
+      finance-method-resolver-system-prompt-file: prompts/finance/finance_method_resolver_system.txt
       dataset-field-specs:
         - name: ts_code
           meaning: 资产代码（股票/指数唯一标识）
