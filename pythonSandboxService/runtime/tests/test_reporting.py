@@ -513,7 +513,9 @@ class TestPreEmitSchemaValidation(ReportingTestBase):
     nothing. Limits: inputRefs <= 128 entries / 512 UTF-8 bytes per entry,
     formulaDescription <= 4096 bytes, parameters <= 128 entries, checks <=
     128 entries, unit <= 128 bytes, environmentId <= 512 bytes, source
-    association non-empty (see reporting.py constants for citations)."""
+    association non-empty (see reporting.py constants for citations). The
+    additional E-schema code-point layer (unit 96, environmentId 256, …) is
+    covered by TestESchemaCodePointValidation below."""
 
     def assert_emits(self, fn):
         buf = io.StringIO()
@@ -565,14 +567,22 @@ class TestPreEmitSchemaValidation(ReportingTestBase):
         self.assert_rejects(self._custom(checks=over_limit))
 
     def test_unit_bytes_boundary(self):
-        self.assert_emits(self._custom(output_unit="u" * 128))
-        self.assert_rejects(self._custom(output_unit="u" * 129))
+        # The E-schema code-point cap for unit (96) is asserted in
+        # TestESchemaCodePointValidation; with CJK units the retained UTF-8
+        # byte layer (128) is the deciding guard: 42/43 CJK chars are only
+        # 42/43 code points but 126/129 bytes.
+        self.assert_emits(self._custom(output_unit="中" * 42))
+        self.assert_rejects(self._custom(output_unit="中" * 43))
 
     def test_environment_id_bytes_boundary(self):
-        for size, expect_emit in ((512, True), (513, False)):
+        # The E-schema code-point cap for environmentId (256) is asserted in
+        # TestESchemaCodePointValidation; with CJK ids the retained UTF-8
+        # byte layer (512) is the deciding guard: 170/171 code points are
+        # 510/513 bytes.
+        for size, expect_emit in ((170, True), (171, False)):
             with self.subTest(size=size):
                 with open(self._env_file, "w", encoding="utf-8") as fh:
-                    json.dump({"environment_id": "e" * size}, fh)
+                    json.dump({"environment_id": "中" * size}, fh)
                 if expect_emit:
                     self.assert_emits(self._custom())
                 else:
@@ -694,6 +704,223 @@ class TestMethodIdentityNotOverridableAtEmit(ReportingTestBase):
         self.assertEqual(
             record["specDigest"], _SPECS["finance.growth.cagr"]["specDigest"]
         )
+
+
+class TestESchemaCodePointValidation(ReportingTestBase):
+    """B must-fix 2 (codex b4b48852): the Java consumer validates records
+    against E's FROZEN metric-record-v1.schema.json, whose JSON Schema
+    maxLength counts Unicode CODE POINTS (Python len(str)), not UTF-8 bytes.
+    The emit-side validators now mirror that field table VERBATIM — unit 96,
+    environmentId 256, sourceResolverToolCallId 160, inputRefs items
+    minLength 1 / maxLength 512, methodId 160, methodVersion 64, specDigest
+    160 + ^sha256:[0-9A-Za-z._:-]+$ — in addition to the retained UTF-8
+    byte layer. At the code-point limit emits; one over raises ValueError
+    and emits NOTHING (contract §7 step 6, §9 failure matrix)."""
+
+    def assert_emits(self, fn):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            fn()
+        self.assertNotEqual(buf.getvalue(), "")
+
+    def assert_rejects(self, fn):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with self.assertRaises(ValueError):
+                fn()
+        self.assertEqual(buf.getvalue(), "")
+
+    def _custom(self, **overrides):
+        kwargs = {
+            "formula_description": "f(x)",
+            "input_refs": [],
+            "output_unit": "ratio",
+        }
+        kwargs.update(overrides)
+        return lambda: report_custom(1.0, **kwargs)
+
+    def _custom_with_triple(self, **overrides):
+        kwargs = {
+            "formula_description": "f(x)",
+            "input_refs": [],
+            "output_unit": "ratio",
+            "method_id": "finance.growth.cagr",
+            "method_version": "1.0.0",
+            "spec_digest": "sha256:spec-example",
+        }
+        kwargs.update(overrides)
+        return lambda: report_custom(1.0, **kwargs)
+
+    def test_unit_code_point_boundary(self):
+        self.assert_emits(self._custom(output_unit="u" * 96))
+        self.assert_rejects(self._custom(output_unit="u" * 97))
+        # Code-point semantics differ from the byte layer: 43 CJK chars are
+        # only 43 code points, so the code-point cap passes and the retained
+        # 128-byte layer is the deciding guard (129 bytes).
+        self.assert_emits(self._custom(output_unit="中" * 42))
+        self.assert_rejects(self._custom(output_unit="中" * 43))
+
+    def test_environment_id_code_point_boundary(self):
+        for size, expect_emit in ((256, True), (257, False)):
+            with self.subTest(size=size):
+                with open(self._env_file, "w", encoding="utf-8") as fh:
+                    json.dump({"environment_id": "e" * size}, fh)
+                if expect_emit:
+                    self.assert_emits(self._custom())
+                else:
+                    self.assert_rejects(self._custom())
+
+    def test_source_resolver_code_point_boundary(self):
+        self.assert_emits(self._custom(source_resolver_tool_call_id="s" * 160))
+        self.assert_rejects(self._custom(source_resolver_tool_call_id="s" * 161))
+
+    def test_input_ref_entry_code_point_boundary(self):
+        self.assert_emits(self._custom(input_refs=["x" * 512]))
+        self.assert_rejects(self._custom(input_refs=["x" * 513]))
+        # The retained byte layer stays stricter for multi-byte entries: 512
+        # CJK chars are exactly 512 code points but 1536 UTF-8 bytes.
+        self.assert_rejects(self._custom(input_refs=["中" * 512]))
+
+    def test_empty_input_ref_rejected_and_emits_nothing(self):
+        # Frozen schema items minLength is 1: an empty string must be
+        # rejected even though it satisfies every byte/code-point cap.
+        self.assert_rejects(self._custom(input_refs=[""]))
+        self.assert_rejects(self._custom(input_refs=["ok", ""]))
+
+    def test_custom_method_id_code_point_boundary(self):
+        self.assert_emits(self._custom_with_triple(method_id="m" * 160))
+        self.assert_rejects(self._custom_with_triple(method_id="m" * 161))
+
+    def test_custom_method_version_code_point_boundary(self):
+        self.assert_emits(self._custom_with_triple(method_version="v" * 64))
+        self.assert_rejects(self._custom_with_triple(method_version="v" * 65))
+
+    def test_custom_spec_digest_code_point_boundary(self):
+        at_limit = "sha256:" + "a" * 153  # 160 code points
+        over_limit = "sha256:" + "a" * 154  # 161 code points
+        self.assertEqual(len(at_limit), 160)
+        self.assert_emits(self._custom_with_triple(spec_digest=at_limit))
+        self.assert_rejects(self._custom_with_triple(spec_digest=over_limit))
+
+    def test_custom_spec_digest_pattern_violation_emits_nothing(self):
+        violations = (
+            "md5:abc",         # wrong prefix
+            "sha256:",         # empty payload (+ requires at least one char)
+            "sha256:ab c",     # space outside the char class
+            "sha256:abc!",     # char outside the char class
+            "sha256:abc\n",    # trailing newline must not sneak past `$`
+        )
+        for bad_digest in violations:
+            with self.subTest(spec_digest=repr(bad_digest)):
+                self.assert_rejects(
+                    self._custom_with_triple(spec_digest=bad_digest)
+                )
+
+    def test_report_path_code_point_bounds(self):
+        result = self.cagr_result()
+        self.assert_emits(
+            lambda: report(result, source_resolver_tool_call_id="s" * 160)
+        )
+        self.assert_rejects(
+            lambda: report(result, source_resolver_tool_call_id="s" * 161)
+        )
+        self.assert_rejects(lambda: report(result, input_refs=[""]))
+        cls = type(result)
+        long_unit = cls(
+            method_id=result.method_id,
+            value=result.value,
+            unit="u" * 97,
+            parameters=result.parameters,
+        )
+        self.assert_rejects(lambda: report(long_unit))
+
+
+class TestStrictBooleanChecks(ReportingTestBase):
+    """B must-fix 2 (codex b4b48852): ``_validated_checks`` previously
+    coerced any truthy value with bool() — the string "false" became True.
+    Only real booleans are accepted now; anything else raises ValueError
+    before emit and nothing reaches stdout."""
+
+    def assert_emits(self, fn):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            fn()
+        self.assertNotEqual(buf.getvalue(), "")
+
+    def assert_rejects(self, fn):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with self.assertRaises(ValueError):
+                fn()
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_checks_string_false_rejected_and_emits_nothing(self):
+        for bad_value in ("false", "true", "False", 1, 0, None, [True]):
+            with self.subTest(value=repr(bad_value)):
+                self.assert_rejects(
+                    lambda v=bad_value: report_custom(
+                        1.0,
+                        formula_description="f(x)",
+                        input_refs=[],
+                        output_unit="ratio",
+                        checks={"finite": v},
+                    )
+                )
+
+    def test_report_path_checks_string_false_rejected(self):
+        result = self.cagr_result()
+        bad = type(result)(
+            method_id=result.method_id,
+            value=result.value,
+            unit=result.unit,
+            parameters=result.parameters,
+            checks={"finite": "false"},
+        )
+        self.assert_rejects(lambda: report(bad))
+
+    def test_checks_real_booleans_still_emit(self):
+        line, _ = self.capture_report_custom(
+            1.0,
+            formula_description="f(x)",
+            input_refs=[],
+            output_unit="ratio",
+            checks={"passed": True, "skipped": False},
+        )
+        record = json.loads(_payload_of(line))
+        self.assertEqual(record["checks"], {"passed": True, "skipped": False})
+        self.assertEqual(record["evidence"], "CUSTOM_WITH_CHECKS")
+        # The library path emits real booleans unchanged.
+        self.assert_emits(lambda: report(self.cagr_result()))
+
+
+class TestGeneratedBindingDriftGuard(ReportingTestBase):
+    """B must-fix 2 (codex b4b48852): the library/generated-binding triple
+    must pass the SAME E-schema field-table validator as a caller-provided
+    custom triple before emit, so build-artifact drift in the installed
+    canonical specs can never produce a record the Java schema check would
+    reject."""
+
+    def assert_rejects(self, fn):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with self.assertRaisesRegex(ValueError, "drift"):
+                fn()
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_library_binding_drift_rejected_before_emit(self):
+        drift_cases = [
+            {"methodVersion": "1.0.0", "specDigest": "md5:abc"},
+            {"methodVersion": "1.0.0", "specDigest": "sha256:"},
+            {"methodVersion": "v" * 65, "specDigest": "sha256:spec-example"},
+            {"methodVersion": "1.0.0", "specDigest": "sha256:" + "a" * 154},
+            {"methodVersion": "", "specDigest": "sha256:spec-example"},
+        ]
+        for entry in drift_cases:
+            with self.subTest(entry=entry):
+                reporting._METHOD_SPECS_CACHE = {
+                    "finance.growth.cagr": entry,
+                }
+                self.assert_rejects(lambda: report(self.cagr_result()))
 
 
 if __name__ == "__main__":
