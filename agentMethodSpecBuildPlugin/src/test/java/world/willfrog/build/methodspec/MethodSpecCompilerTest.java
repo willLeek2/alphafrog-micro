@@ -62,7 +62,17 @@ class MethodSpecCompilerTest {
         assertTrue(catalogEntries.get(0).has("aliases"));
         assertTrue(catalogEntries.get(0).has("commonPhrases"));
         assertTrue(catalogEntries.get(0).has("clarificationDimensions"));
+        assertTrue(catalogEntries.get(0).has("specDigest"));
+        assertTrue(!catalogEntries.get(0).has("definition"));
         assertTrue(!catalogEntries.get(0).has("parameters"));
+        assertTrue(!catalogEntries.get(0).has("sources"));
+        assertTrue(!catalogEntries.get(0).has("library"));
+
+        for (int i = 0; i < indexEntries.size(); i++) {
+            assertEquals(indexEntries.get(i).get("methodId").asText(), catalogEntries.get(i).get("methodId").asText());
+            assertEquals(indexEntries.get(i).get("version").asText(), catalogEntries.get(i).get("version").asText());
+            assertEquals(indexEntries.get(i).get("specDigest").asText(), catalogEntries.get(i).get("specDigest").asText());
+        }
     }
 
     @Test
@@ -126,5 +136,18 @@ class MethodSpecCompilerTest {
         MethodSpecBuildException ex = assertThrows(MethodSpecBuildException.class,
                 () -> MethodSpecCompiler.compile(schema, specsDir, knowledgeDir, tempDir.resolve("out")));
         assertTrue(ex.getMessage().contains("digest mismatch"));
+    }
+
+    @Test
+    void duplicateBaseNameAcrossMethodsFails() {
+        Path schema = resource("finance/method-specs/schema/method-spec-v1.schema.json");
+        Path specsDir = resource("bad-specs/basename-collision");
+
+        MethodSpecBuildException ex = assertThrows(MethodSpecBuildException.class,
+                () -> MethodSpecCompiler.compile(schema, specsDir, null, tempDir));
+        assertTrue(ex.getMessage().contains("resourcePath collision"));
+        assertTrue(ex.getMessage().contains("finance.growth.cagr"));
+        assertTrue(ex.getMessage().contains("finance.risk.cagr"));
+        assertTrue(ex.getMessage().contains("finance/method-specs/v1/cagr.json"));
     }
 }

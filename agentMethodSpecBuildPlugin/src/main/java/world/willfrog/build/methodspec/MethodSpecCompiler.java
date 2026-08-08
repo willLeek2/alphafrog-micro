@@ -72,7 +72,8 @@ public final class MethodSpecCompiler {
         for (Map<String, Object> spec : specs) {
             String canonical = MethodSpecCanonicalizer.canonicalJsonWithDigest(spec);
             String methodId = String.valueOf(spec.get("methodId"));
-            String digest = extractDigest(canonical);
+            String digest = MethodSpecCanonicalizer.digestForCanonicalBytes(
+                    MethodSpecCanonicalizer.canonicalBytes(spec));
             spec.put("specDigest", digest);
             canonicalJsons.put(methodId, canonical);
         }
@@ -255,6 +256,7 @@ public final class MethodSpecCompiler {
             String version = String.valueOf(spec.get("version"));
             String resourcePath = "finance/method-specs/v1/" + baseName(methodId) + ".json";
             String canonical = canonicalJsons.get(methodId);
+            String digest = String.valueOf(spec.get("specDigest"));
 
             Path jsonFile = specsV1Dir.resolve(baseName(methodId) + ".json");
             Files.writeString(jsonFile, canonical, StandardCharsets.UTF_8);
@@ -262,7 +264,6 @@ public final class MethodSpecCompiler {
             Map<String, Object> entry = new TreeMap<>();
             entry.put("methodId", methodId);
             entry.put("version", version);
-            String digest = extractDigest(canonical);
             entry.put("specDigest", digest);
             entry.put("resourcePath", resourcePath);
             indexEntries.add(entry);
@@ -270,6 +271,7 @@ public final class MethodSpecCompiler {
             Map<String, Object> resolverEntry = new TreeMap<>();
             resolverEntry.put("methodId", methodId);
             resolverEntry.put("version", version);
+            resolverEntry.put("specDigest", digest);
             resolverEntry.put("displayName", spec.get("displayName"));
             Map<String, Object> hints = (Map<String, Object>) spec.get("resolverHints");
             if (hints != null) {
@@ -305,16 +307,6 @@ public final class MethodSpecCompiler {
             Files.writeString(guidesDir.resolve("finance_method_knowledge.md"),
                     combinedKnowledge, StandardCharsets.UTF_8);
         }
-    }
-
-    private static String extractDigest(String canonicalJson) {
-        int idx = canonicalJson.indexOf("\"specDigest\":\"");
-        if (idx < 0) {
-            throw new IllegalStateException("Canonical JSON missing specDigest");
-        }
-        int start = idx + "\"specDigest\":\"".length();
-        int end = canonicalJson.indexOf('"', start);
-        return canonicalJson.substring(start, end);
     }
 
     private static String baseName(String methodId) {

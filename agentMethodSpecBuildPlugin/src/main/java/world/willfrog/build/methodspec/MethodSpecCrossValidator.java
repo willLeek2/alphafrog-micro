@@ -18,6 +18,7 @@ public final class MethodSpecCrossValidator {
     public static void validate(List<Map<String, Object>> specs, Map<String, String> availableKnowledge) throws MethodSpecBuildException {
         Set<String> aliases = new HashSet<>();
         Set<String> seenIdentity = new HashSet<>();
+        Map<String, String> seenResourcePath = new HashMap<>();
         boolean enforceKnowledgeRefs = availableKnowledge != null;
 
         for (Map<String, Object> spec : specs) {
@@ -30,6 +31,13 @@ public final class MethodSpecCrossValidator {
             String identity = methodId + "@" + version;
             if (!seenIdentity.add(identity)) {
                 throw new MethodSpecBuildException("Duplicate methodId+version: " + identity);
+            }
+
+            String resourcePath = resourcePathForMethodId(methodId);
+            String existingMethodId = seenResourcePath.put(resourcePath, methodId);
+            if (existingMethodId != null) {
+                throw new MethodSpecBuildException("MethodSpec resourcePath collision: " + existingMethodId
+                        + " and " + methodId + " both map to " + resourcePath);
             }
 
             Map<String, Object> resolverHints = (Map<String, Object>) spec.get("resolverHints");
@@ -89,5 +97,11 @@ public final class MethodSpecCrossValidator {
     private static String getString(Map<String, Object> map, String key) {
         Object value = map.get(key);
         return value == null ? null : String.valueOf(value);
+    }
+
+    private static String resourcePathForMethodId(String methodId) {
+        int lastDot = methodId.lastIndexOf('.');
+        String baseName = lastDot < 0 ? methodId : methodId.substring(lastDot + 1);
+        return "finance/method-specs/v1/" + baseName + ".json";
     }
 }
