@@ -146,6 +146,14 @@ public class ToolJobFinalizer {
                         } catch (FinanceRecordProcessingException e) {
                             log.warn("Finance processor failed for run={}: {} — "
                                     + "ENVELOPE blocked, will retry", runId, e.getCode());
+                            anchor.setFinalizerError("finance_processing_failed");
+                            persistFinalizerAnchor(runId, anchor);
+                            return;
+                        } catch (RuntimeException e) {
+                            log.warn("Finance pipeline unexpected error for run={} — "
+                                    + "ENVELOPE blocked, will retry", runId, e.getMessage());
+                            anchor.setFinalizerError("finance_processing_failed");
+                            persistFinalizerAnchor(runId, anchor);
                             return;
                         }
                     } else {
