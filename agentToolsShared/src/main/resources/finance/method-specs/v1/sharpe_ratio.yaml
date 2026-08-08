@@ -1,0 +1,63 @@
+schemaVersion: "1"
+methodId: finance.risk.sharpe_ratio
+version: 1.0.0
+displayName: 夏普比率
+definition: 周期超额收益率的算术平均值除以周期收益率样本标准差，再按每年期数平方根换算的年化夏普比率
+resolverHints:
+  aliases: [夏普比率, 夏普, Sharpe, Sharpe ratio]
+  commonPhrases: [每承担一份波动换来多少收益, 风险调整后的收益水平]
+  clarificationDimensions:
+    - id: rangeBoundary
+      question: 希望用哪个日期或交易日区间的收益率序列
+    - id: returnFrequency
+      question: 收益率序列按日、周、月还是其他频率
+    - id: riskFreeChoice
+      question: 无风险利率取哪个值，以及它是年化值还是每周期值
+parameters:
+  returns:
+    type: array
+    required: true
+    items: {type: number}
+    meaning: 周期收益率序列，按时间先后排列，长度至少为 2
+  riskFreeRate:
+    type: number
+    required: false
+    default: 0
+    meaning: 无风险利率数值
+  riskFreeRateConvention:
+    type: string
+    required: false
+    default: annual
+    enum: [annual, period]
+    meaning: annual 表示年化值，按 periodsPerYear 折算到每期；period 表示每周期值直接使用
+  periodsPerYear:
+    type: integer
+    required: false
+    default: 252
+    minimum: 1
+    meaning: 每年包含的期数
+  ddof:
+    type: integer
+    required: false
+    default: 1
+    minimum: 0
+    meaning: 样本标准差的自由度修正
+  returnConvention:
+    type: string
+    required: false
+    default: arithmetic
+    enum: [arithmetic, geometric]
+    meaning: 超额收益聚合方式；v1.0.0 规范路径为 arithmetic
+conventions:
+  period_arithmetic_excess_mean_over_stdev_annualized:
+    riskFreeHandling: annual_to_period_subtract
+    returnType: simple_period_returns
+    stdevDdof: 1
+outputs:
+  - {name: sharpe, unit: ratio_per_annum, description: 年化夏普比率}
+libraryBinding:
+  package: alphafrog_finance
+  function: sharpe
+  apiCompatRange: ">=1.0.0,<2.0.0"
+sourceRefs:
+  - method-knowledge:finance.risk.sharpe_ratio@1.0.0
