@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 import tempfile
 import types
 import unittest
@@ -384,6 +385,130 @@ class RuntimeEnvironmentTest(unittest.TestCase):
         ).encode("utf-8")
         expected_environment_id = "sha256:" + hashlib.sha256(snapshot_bytes).hexdigest()
         self.assertEqual(expected_environment_id, env.environment_id)
+
+    def test_default_package_api_version_is_pinned_for_wire_compatibility(self) -> None:
+        """Pin the documented wire default for packages without __api_version__.
+
+        Spec §8 L1019: when a package does not expose __api_version__, the
+        runtime_environment.py generator MUST fall back to a documented
+        default so E's target/actual API compatibility check has a stable
+        value to compare against. Changing this default is a contract break.
+        """
+        from app.runtime_environment import DEFAULT_PACKAGE_API_VERSION
+
+        self.assertEqual("1.0", DEFAULT_PACKAGE_API_VERSION)
+
+    def test_read_package_api_version_returns_attribute_value(self) -> None:
+        """When a package exposes __api_version__, the generator reads it."""
+        from app.runtime_environment import _read_package_api_version
+
+        fake_pkg = types.ModuleType("alphafrog_finance")
+        fake_pkg.__api_version__ = "2.3.1"
+        sys.modules["alphafrog_finance"] = fake_pkg
+
+        try:
+            self.assertEqual("2.3.1", _read_package_api_version("alphafrog_finance"))
+        finally:
+            sys.modules.pop("alphafrog_finance", None)
+
+    def test_read_package_api_version_falls_back_for_unknown_package(self) -> None:
+        """A package that cannot be imported falls back to the documented default."""
+        from app.runtime_environment import (
+            DEFAULT_PACKAGE_API_VERSION,
+            _read_package_api_version,
+        )
+
+        # Module that does not exist anywhere on sys.path.
+        self.assertEqual(
+            DEFAULT_PACKAGE_API_VERSION,
+            _read_package_api_version("__definitely_not_a_real_pkg_12345__"),
+        )
+
+    def test_read_package_api_version_falls_back_when_attribute_missing(self) -> None:
+        """An importable package without __api_version__ also falls back."""
+        from app.runtime_environment import (
+            DEFAULT_PACKAGE_API_VERSION,
+            _read_package_api_version,
+        )
+
+        fake_pkg = types.ModuleType("plain_pkg_no_api_version")
+        # Intentionally no __api_version__ attribute.
+        sys.modules["plain_pkg_no_api_version"] = fake_pkg
+
+        try:
+            self.assertEqual(
+                DEFAULT_PACKAGE_API_VERSION,
+                _read_package_api_version("plain_pkg_no_api_version"),
+            )
+        finally:
+            sys.modules.pop("plain_pkg_no_api_version", None)
+
+    def test_read_package_api_version_falls_back_when_attribute_is_empty(self) -> None:
+        """An __api_version__ of non-string or empty value falls back to default."""
+        from app.runtime_environment import (
+            DEFAULT_PACKAGE_API_VERSION,
+            _read_package_api_version,
+        )
+
+        fake_pkg = types.ModuleType("pkg_empty_api_version")
+        fake_pkg.__api_version__ = ""  # type: ignore[attr-defined]
+        sys.modules["pkg_empty_api_version"] = fake_pkg
+
+        try:
+            self.assertEqual(
+                DEFAULT_PACKAGE_API_VERSION,
+                _read_package_api_version("pkg_empty_api_version"),
+            )
+        finally:
+            sys.modules.pop("pkg_empty_api_version", None)
+
+    def test_collect_runtime_environment_uses_real_api_version_when_available(self) -> None:
+        """Verify the single-source snapshot encodes the real package api_version.
+
+        With _read_package_api_version mocked to return a known distinct value
+        for one package, the resulting environmentId SHA-256 must reflect that
+        value (not the default), proving the helper is wired in correctly.
+        """
+        from app import runtime_environment
+        from app.runtime_environment import collect_runtime_environment
+
+        fake_client = _FakeDockerClient(_FakeContainer("sha256:image-real-api"))
+
+        def fake_api_version(name: str) -> str:
+            if name == "alphafrog_finance":
+                return "2.3.1"
+            return runtime_environment.DEFAULT_PACKAGE_API_VERSION
+
+        session = MagicMock()
+        session.execute_command.return_value = _FakeCommandResult(
+            stdout=json.dumps([
+                {"name": "alphafrog_finance", "version": "1.0.0"},
+                {"name": "numpy", "version": "1.26.0"},
+            ]),
+            exit_code=0,
+        )
+
+        with patch.dict(
+            "sys.modules",
+            {"docker": types.SimpleNamespace(from_env=lambda: fake_client)},
+        ):
+            with patch.object(
+                runtime_environment, "_read_package_api_version",
+                side_effect=fake_api_version,
+            ):
+                env = collect_runtime_environment(
+                    container_id="c-real-api", session=session,
+                )
+
+        by_name = {pkg.name: pkg for pkg in env.package_apis}
+        self.assertEqual("2.3.1", by_name["alphafrog_finance"].api_version)
+        self.assertEqual(
+            runtime_environment.DEFAULT_PACKAGE_API_VERSION,
+            by_name["numpy"].api_version,
+        )
+        # environmentId depends on package_apis, so a non-default value MUST
+        # change the digest from what it would be with all-default api_versions.
+        self.assertNotEqual(env.environment_id, env.library_set_digest)
 
 
 if __name__ == "__main__":

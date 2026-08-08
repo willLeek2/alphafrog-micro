@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import logging
 import os
@@ -19,6 +20,11 @@ logger = logging.getLogger(__name__)
 # authoritative source for environmentId / imageDigest / librarySetDigest /
 # packageApis; downstream consumers must NOT recompute these values.
 
+# Spec §8 L1019: packages without an explicit __api_version__ attribute fall
+# back to this documented wire default. Tests pin this value so a change here
+# requires an explicit contract update.
+DEFAULT_PACKAGE_API_VERSION = "1.0"
+
 
 def _canonical_bytes(data: Any) -> bytes:
     """Stable JSON encoding: sorted keys, no whitespace, UTF-8."""
@@ -29,6 +35,37 @@ def _canonical_bytes(data: Any) -> bytes:
 
 def _sha256_hex_digest(data: bytes) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def _read_package_api_version(package_name: str) -> str:
+    """Read api_version from a package's module-level __api_version__ attribute.
+
+    Spec §8 L1019: hardcoding "1.0" for every package broke E's target/actual
+    API compatibility check (completion criteria #9), which depends on real
+    values. Try to import the package and read its ``__api_version__``; on any
+    failure (ImportError, AttributeError, syntax error inside the package),
+    fall back to the documented wire default so a broken package cannot crash
+    environment collection.
+
+    This is called from the warm container at sandbox_runner startup, so
+    import cost is paid once per container per package.
+    """
+    try:
+        module = importlib.import_module(package_name)
+    except Exception as exc:
+        logger.info(
+            "RUNTIME_ENVIRONMENT_API_VERSION_FALLBACK_IMPORT name=%s reason=%s",
+            package_name, exc,
+        )
+        return DEFAULT_PACKAGE_API_VERSION
+    value = getattr(module, "__api_version__", None)
+    if not isinstance(value, str) or not value:
+        logger.info(
+            "RUNTIME_ENVIRONMENT_API_VERSION_FALLBACK_MISSING name=%s default=%s",
+            package_name, DEFAULT_PACKAGE_API_VERSION,
+        )
+        return DEFAULT_PACKAGE_API_VERSION
+    return value
 
 
 def _inspect_container_image_digest(container_id: str) -> str:
@@ -146,14 +183,16 @@ def collect_runtime_environment(
     ]
     library_set_digest = _sha256_hex_digest(_canonical_bytes(library_set_payload))
 
+    # Spec §8 L1019: api_version must come from each package's own metadata
+    # (__api_version__ attribute), not a hardcoded constant — E's target/actual
+    # API compatibility check (completion criteria #9) depends on real values.
+    # Packages without __api_version__ fall back to DEFAULT_PACKAGE_API_VERSION
+    # via _read_package_api_version; the default is pinned in tests.
     package_apis = [
         SandboxPackageApi(
             name=p["name"],
             version=p["version"],
-            # canonical placeholder; non-sandbox packages lack distinct
-            # API surface metadata; sandbox-specific packages (e.g.,
-            # alphafrog_finance) override this in their canonical registry.
-            api_version="1.0",
+            api_version=_read_package_api_version(p["name"]),
         )
         for p in packages_sorted
     ]

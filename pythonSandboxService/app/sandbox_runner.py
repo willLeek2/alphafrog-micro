@@ -1108,6 +1108,14 @@ def run_in_open_session(
     oom_killed = False
     exit_reason = "UNKNOWN"
     resource_usage = None
+    # Spec §8 L1019 + Kimi rework 2026-08-08: when this task actually installs
+    # non-preinstalled packages, re-collect the runtime environment after the
+    # install so the task's HTTP execution_environment field reflects the
+    # post-install state. Pool container reuse across tasks otherwise leaves
+    # residual installs polluting the next task's environment identity if we
+    # only sample at container warm-up time. Effective env falls back to the
+    # caller-supplied baked env if re-collection fails or no install happened.
+    post_install_environment: ExecutionEnvironment | None = None
 
     try:
         t_workspace_start = time.monotonic()
@@ -1131,6 +1139,10 @@ def run_in_open_session(
         # initialize_runtime_environment() already wrote the workdir file and
         # set the AF_RUNTIME_ENVIRONMENT_FILE env var at container creation,
         # so we do NOT re-collect per task.
+        #
+        # Spec §8 L1019 (Kimi rework 2026-08-08): exception below — when this
+        # task installs non-preinstalled packages, we MUST re-collect after
+        # the install so the HTTP field reflects post-install state.
 
         _log_in_container(session, task_id, config, "script_start")
         t_run_start = time.monotonic()
@@ -1139,6 +1151,48 @@ def run_in_open_session(
         timings["script_run_ms"] = int((time.monotonic() - t_run_start) * 1000)
         timings["env_load_ms"] = timings["workspace_prepare_ms"]
         timings["code_exec_ms"] = timings["script_run_ms"]
+        # Post-install environment re-collection: only when install_libraries
+        # was non-empty (i.e., the task actually triggered dynamic install).
+        # If install attempted and failed (network error, package not found),
+        # the post-install pip list will still reflect the actual installed
+        # set, which is the honest state to surface.
+        if install_libraries:
+            t_post_install_start = time.monotonic()
+            try:
+                post_install_environment = collect_runtime_environment(
+                    container_id=actual_container_id, session=session,
+                )
+                try:
+                    write_runtime_environment_json(
+                        config.workdir, post_install_environment,
+                    )
+                except Exception as write_exc:
+                    logger.warning(
+                        "RUNTIME_ENVIRONMENT_POST_INSTALL_FILE_WRITE_FAILED "
+                        "task=%s error=%s",
+                        task_id, write_exc,
+                    )
+                timings["post_install_recollect_ms"] = int(
+                    (time.monotonic() - t_post_install_start) * 1000,
+                )
+                logger.info(
+                    "RUNTIME_ENVIRONMENT_POST_INSTALL_RECOLLECT task=%s "
+                    "installed=%s environment_id=%s baked_environment_id=%s "
+                    "elapsed_ms=%s",
+                    task_id, install_libraries,
+                    post_install_environment.environment_id,
+                    execution_environment.environment_id
+                    if execution_environment is not None else "-",
+                    timings["post_install_recollect_ms"],
+                )
+            except Exception as collect_exc:
+                logger.warning(
+                    "RUNTIME_ENVIRONMENT_POST_INSTALL_COLLECT_FAILED "
+                    "task=%s error=%s",
+                    task_id, collect_exc,
+                )
+                # post_install_environment remains None; we fall back to the
+                # baked environment below when computing the effective env.
         _log_in_container(
             session,
             task_id,
@@ -1202,7 +1256,23 @@ def run_in_open_session(
     if execution_error is not None:
         setattr(execution_error, "resource_usage", resource_usage.model_dump(mode="json"))
         setattr(execution_error, "timings", timings)
+        # Spec §8 L1019: on the exception path, fall back to the caller-
+        # supplied baked env (post-install collection did not run or failed).
+        if execution_environment is not None:
+            setattr(
+                execution_error,
+                "execution_environment",
+                execution_environment.model_dump(mode="json"),
+            )
         raise execution_error
+
+    # Spec §8 L1019: post-install re-collection overrides the baked env when
+    # available, so the HTTP field reflects what the container actually has
+    # after this task's dynamic installs.
+    effective_execution_environment: ExecutionEnvironment | None = (
+        post_install_environment if post_install_environment is not None
+        else execution_environment
+    )
 
     primary_mount = f"{config.workdir}/input/{dataset_id}"
     logger.info(
@@ -1230,9 +1300,15 @@ def run_in_open_session(
         # ExecuteResult; gateway presence-aware mapping then sets the proto
         # executionEnvironment parent when this is non-None. The same
         # instance is the workdir file's contents (single-source invariant).
+        #
+        # Spec §8 L1019 (Kimi rework 2026-08-08): when this task actually
+        # installed non-preinstalled packages, post_install_environment was
+        # re-collected after the install and overrides the caller-supplied
+        # baked env so the HTTP field reflects post-install state. Otherwise
+        # we keep the baked env (no install happened, no re-collection needed).
         "execution_environment": (
-            execution_environment.model_dump(mode="json")
-            if execution_environment is not None else None
+            effective_execution_environment.model_dump(mode="json")
+            if effective_execution_environment is not None else None
         ),
     }
 
