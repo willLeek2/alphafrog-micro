@@ -37,22 +37,49 @@ Bounded outputs land under ``<wrapper-input dir>/capture/``::
     finance-records.jsonl                 v1 rawPayloads, one per line (§4.1),
                                           marker and trailing newline stripped;
                                           DELETED when the record channel
-                                          exceeds its count or byte limit
+                                          exceeds its count limit or the JOINT
+                                          recordChannelMaxBytes budget
     finance-records-unknown-marker.jsonl  marker-family lines with an unknown
-                                          version, kept for the backend format
-                                          audit (§4.1), never mixed into
-                                          stdout.bin
-    capture-result.json                   the §7.1 summary (exact field shape
-                                          asserted by the skeleton tests; its
-                                          values feed the §5.1 snake_case
-                                          ExecuteResult.finance_record_channel)
+                                          version (plus malformed/unterminated
+                                          v1 lines), kept verbatim for the
+                                          backend format audit (§4.1/§4.2:
+                                          Java audits UNSUPPORTED_MARKER_VERSION
+                                          from these), never mixed into
+                                          stdout.bin; created lazily on the
+                                          first stored line, so it exists iff
+                                          at least one line was stored.  Shares
+                                          the SAME single recordChannelMaxBytes
+                                          budget as finance-records.jsonl —
+                                          the combined stored bytes of both
+                                          files never exceed it.
+    capture-result.json                   the §7.1 summary: the ten frozen
+                                          fields plus three internal
+                                          unknown-marker counters
+                                          (unknownMarkerLines /
+                                          unknownMarkerBytes /
+                                          unknownMarkerTruncated) that stay
+                                          out of the §5.1 channel mapping; the
+                                          summary's values feed the §5.1
+                                          snake_case
+                                          ExecuteResult.finance_record_channel
 
-Over-limit semantics (§7.1 实施方式 4-5): when a limit is hit the wrapper keeps
-draining (the child must never see a full pipe) but stops storing; a record
-channel over-limit drops the WHOLE batch (delete the batch file,
+Over-limit semantics (§7.1 实施方式 4-5, contract §4.1/§4.2): when a limit is
+hit the wrapper keeps draining (the child must never see a full pipe) but
+stops storing.  Known v1 records and unknown-marker audit lines share ONE
+recordChannelMaxBytes budget (counted as written: payload+newline per known
+record line, line+newline per audit line); recordChannelMaxRecords counts v1
+records ONLY.  A v1 record that would exceed the count limit or the joint
+byte budget drops the WHOLE v1 batch (delete finance-records.jsonl,
 ``recordSetComplete=false``, non-empty ``dropReason``) without failing the
-task itself.  Timeout (§7.1 实施方式 6): SIGKILL the entire process group so no
-orphan grandchild survives in the reused container, then still write
+task itself — but the audit file is KEPT, because format-audit transport is
+independent of the record batch.  After a byte-budget drop the budget is
+exhausted and BOTH classes stop storing (``unknownMarkerTruncated=true``);
+after a count-only drop, unknown lines keep storing while the joint budget
+allows.  The reported metrics keep their frozen meanings: emittedRecordCount/
+emittedRecordBytes count v1 records only (raw payload bytes, no newline, no
+marker) and recordDigest stays the §4.2 batch digest over v1 raw payloads
+only.  Timeout (§7.1 实施方式 6): SIGKILL the entire process group so no orphan
+grandchild survives in the reused container, then still write
 ``capture-result.json`` — the timeout fact is carried by the non-zero
 ``exitCode`` (negative signal translation, e.g. -9 for SIGKILL).
 
@@ -153,24 +180,62 @@ class _BoundedByteSink:
         self.stored_bytes += len(data)
 
 
+class _JointByteBudget:
+    """The SINGLE ``recordChannelMaxBytes`` budget shared by both record-channel
+    files (contract §4.1/§4.2).
+
+    Known v1 record lines (``finance-records.jsonl``) and unknown-marker audit
+    lines (``finance-records-unknown-marker.jsonl``) draw from the SAME budget;
+    the combined bytes stored across both files never exceed ``max_bytes``.
+    Bytes are counted exactly as written to the files: ``len(payload) + 1``
+    (payload + newline) per known record line, ``len(line) + 1`` (line +
+    newline) per audit line.
+
+    ``exhausted`` is set when the v1 batch is dropped ON THE BYTE BUDGET: the
+    budget is then frozen for BOTH classes (the audit truncation flag is set
+    and no further audit line is stored).  A count-only drop leaves the budget
+    open for audit lines.
+    """
+
+    __slots__ = ("max_bytes", "used", "exhausted")
+
+    def __init__(self, max_bytes: int) -> None:
+        self.max_bytes = max_bytes
+        self.used = 0
+        self.exhausted = False
+
+    def fits(self, size: int) -> bool:
+        return not self.exhausted and self.used + size <= self.max_bytes
+
+    def consume(self, size: int) -> None:
+        self.used += size
+
+
 class _RecordChannel:
     """The v1 finance record batch channel (§4.1/§4.2).
 
     Stores rawPayloads one line each in ``finance-records.jsonl`` while
     maintaining the §4.2 counters (``emittedRecordCount`` /
     ``emittedRecordBytes`` — rawPayload bytes only, no markers, no newlines)
-    and the incremental batch digest.  Exceeding the count OR byte limit drops
-    the WHOLE batch (§7.1 实施方式 5, §17 整批放弃): the batch file is deleted,
-    ``recordSetComplete`` becomes false with a non-empty ``dropReason``;
-    draining continues and later records are discarded without touching the
-    filesystem.  Ordinary stdout/stderr are unaffected and the task itself
+    and the incremental batch digest.  Each stored line consumes
+    ``len(payload) + 1`` bytes of the JOINT ``recordChannelMaxBytes`` budget
+    it shares with the unknown-marker audit file.  Exceeding the count limit
+    OR the joint byte budget drops the WHOLE batch (§7.1 实施方式 5, §17
+    整批放弃): the batch file is deleted, ``recordSetComplete`` becomes false
+    with a non-empty ``dropReason``; draining continues and later records are
+    discarded without touching the filesystem.  The audit file is KEPT across
+    a drop (format-audit transport is independent of the record batch); a
+    byte-budget drop additionally exhausts the joint budget so BOTH classes
+    stop storing.  Ordinary stdout/stderr are unaffected and the task itself
     does not fail because of this.
     """
 
-    def __init__(self, path: Path, max_records: int, max_bytes: int) -> None:
+    def __init__(
+        self, path: Path, max_records: int, budget: _JointByteBudget
+    ) -> None:
         self._path = Path(path)
         self._max_records = max_records
-        self._max_bytes = max_bytes
+        self._budget = budget
         self._file = open(self._path, "wb")
         self._hasher = hashlib.sha256()
         self._dropped = False
@@ -195,12 +260,16 @@ class _RecordChannel:
                 f"recordChannelMaxRecords exceeded: limit={self._max_records}"
             )
             return
-        if self.emitted_bytes + len(payload) > self._max_bytes:
+        size = len(payload) + 1  # stored line: payload + newline
+        if not self._budget.fits(size):
             self._drop(
-                f"recordChannelMaxBytes exceeded: limit={self._max_bytes}"
+                f"recordChannelMaxBytes exceeded: limit={self._budget.max_bytes}"
             )
+            # Budget exhausted by the drop: freeze BOTH classes (§4.1/§4.2).
+            self._budget.exhausted = True
             return
         self._file.write(payload + b"\n")
+        self._budget.consume(size)
         self.emitted_count += 1
         self.emitted_bytes += len(payload)
         self._hasher.update(struct.pack(">I", len(payload)))
@@ -219,6 +288,56 @@ class _RecordChannel:
 
     def finalize(self) -> None:
         if not self._file.closed:
+            self._file.flush()
+            self._file.close()
+
+
+class _UnknownMarkerAudit:
+    """Unknown-version marker-line audit store (contract §4.1/§4.2).
+
+    Stores marker-FAMILY lines that are not well-formed v1 records (unknown
+    version prefix, or a v1 line missing its terminating newline) VERBATIM —
+    original marker prefix kept, one newline-terminated line each — in
+    ``finance-records-unknown-marker.jsonl``, so the Java side can audit
+    UNSUPPORTED_MARKER_VERSION.  Shares the JOINT ``recordChannelMaxBytes``
+    budget with the v1 record batch: a line is stored only while
+    ``len(line) + 1`` fits the remaining budget; otherwise the line is
+    discarded whole and ``truncated`` is set (a partial line would break the
+    line-oriented audit format).  After a v1 byte-budget drop the budget is
+    exhausted and ``truncated`` is set IMMEDIATELY — the audit channel is
+    frozen from that moment even if no further audit line arrives; after a
+    count-only drop, audit lines keep storing while the joint budget allows.
+
+    The file is created lazily on the first STORED line, so a run with no
+    stored audit lines leaves no file behind — the reader relies on the
+    invariant: audit file exists iff ``unknownMarkerLines > 0``.
+    """
+
+    __slots__ = ("_path", "_budget", "_file", "stored_lines", "stored_bytes",
+                 "truncated")
+
+    def __init__(self, path: Path, budget: _JointByteBudget) -> None:
+        self._path = Path(path)
+        self._budget = budget
+        self._file = None
+        self.stored_lines = 0
+        self.stored_bytes = 0
+        self.truncated = False
+
+    def add(self, line: bytes) -> None:
+        size = len(line) + 1  # stored line: marker line + newline
+        if not self._budget.fits(size):
+            self.truncated = True
+            return
+        if self._file is None:
+            self._file = open(self._path, "wb")
+        self._file.write(line + b"\n")
+        self._budget.consume(size)
+        self.stored_lines += 1
+        self.stored_bytes += size
+
+    def finalize(self) -> None:
+        if self._file is not None and not self._file.closed:
             self._file.flush()
             self._file.close()
 
@@ -317,11 +436,18 @@ def run_bounded_capture(
         "recordSetComplete": True,
         "dropReason": "",
         "recordDigest": _EMPTY_BATCH_DIGEST,
+        # Internal unknown-marker audit counters (§4.1/§4.2).  These stay out
+        # of the §5.1 channel mapping (exactly its 7 fields) and are consumed
+        # by the fail-closed artifact reader only.
+        "unknownMarkerLines": 0,
+        "unknownMarkerBytes": 0,
+        "unknownMarkerTruncated": False,
     }
 
-    stdout_file = stderr_file = audit_file = None
-    stdout_sink = stderr_sink = audit_sink = None
+    stdout_file = stderr_file = None
+    stdout_sink = stderr_sink = None
     records: _RecordChannel | None = None
+    audit: _UnknownMarkerAudit | None = None
     stdout_pending = b""  # bytes of the not-yet-terminated final stdout line
     lock = threading.Lock()
     proc: subprocess.Popen | None = None
@@ -334,21 +460,14 @@ def run_bounded_capture(
         §16.2): report() and report_custom() both use the identical v1 marker,
         and a marker merely contained mid-line stays ordinary.  A marker line
         missing its trailing newline is malformed (§4.1 requires newline
-        termination) and goes to the audit bucket as well.
+        termination) and goes to the audit bucket as well.  Both classes draw
+        from the SINGLE joint recordChannelMaxBytes budget (§4.1/§4.2).
         """
-        nonlocal audit_file, audit_sink
         if line.startswith(MARKER_FAMILY_PREFIX_BYTES):
             if terminated and line.startswith(MARKER_V1_PREFIX_BYTES):
                 records.add(line[len(MARKER_V1_PREFIX_BYTES):])
             else:
-                if audit_sink is None:
-                    audit_file = open(
-                        capture_dir / UNKNOWN_MARKER_AUDIT_FILE_NAME, "wb"
-                    )
-                    audit_sink = _BoundedByteSink(
-                        audit_file, limits["recordChannelMaxBytes"]
-                    )
-                audit_sink.write(line + b"\n")
+                audit.add(line)
         else:
             stdout_sink.write(line + (b"\n" if terminated else b""))
 
@@ -383,10 +502,16 @@ def run_bounded_capture(
         stderr_file = open(capture_dir / STDERR_FILE_NAME, "wb")
         stdout_sink = _BoundedByteSink(stdout_file, limits["stdoutMaxBytes"])
         stderr_sink = _BoundedByteSink(stderr_file, limits["stderrMaxBytes"])
+        # ONE joint recordChannelMaxBytes budget for the two record-channel
+        # files: known v1 records and unknown-marker audit lines (§4.1/§4.2).
+        joint_budget = _JointByteBudget(limits["recordChannelMaxBytes"])
         records = _RecordChannel(
             capture_dir / RECORDS_FILE_NAME,
             limits["recordChannelMaxRecords"],
-            limits["recordChannelMaxBytes"],
+            joint_budget,
+        )
+        audit = _UnknownMarkerAudit(
+            capture_dir / UNKNOWN_MARKER_AUDIT_FILE_NAME, joint_budget
         )
 
         try:
@@ -449,6 +574,12 @@ def run_bounded_capture(
                 classify_line(stdout_pending, False)
                 stdout_pending = b""
 
+        # A byte-budget drop exhausts the joint budget and freezes the audit
+        # class: ``unknownMarkerTruncated`` becomes true at the drop itself,
+        # even when no further audit line arrives afterwards (§4.1/§4.2).
+        if joint_budget.exhausted:
+            audit.truncated = True
+
         summary.update(
             {
                 "ordinaryStdoutBytes": stdout_sink.stored_bytes,
@@ -460,6 +591,11 @@ def run_bounded_capture(
                 "recordSetComplete": records.complete,
                 "dropReason": records.drop_reason,
                 "recordDigest": records.record_digest,
+                "unknownMarkerLines": audit.stored_lines,
+                # Stored audit-file bytes INCLUDING newlines, exactly as
+                # written (== joint-budget bytes used by the audit class).
+                "unknownMarkerBytes": audit.stored_bytes,
+                "unknownMarkerTruncated": audit.truncated,
             }
         )
 
@@ -473,9 +609,10 @@ def run_bounded_capture(
     finally:
         _close_quietly(stdout_file)
         _close_quietly(stderr_file)
-        _close_quietly(audit_file)
         if records is not None:
             records.finalize()
+        if audit is not None:
+            audit.finalize()
         _write_capture_result(capture_dir, summary)
 
 

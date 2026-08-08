@@ -31,6 +31,7 @@ import hashlib
 import importlib
 import json
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -172,13 +173,23 @@ class BoundedExecWrapperTest(unittest.TestCase):
         self.assertTrue(result["recordSetComplete"])
         self.assertEqual(result["dropReason"], "")
         self.assertEqual(result["recordDigest"], EMPTY_BATCH_DIGEST)
+        # Internal unknown-marker counters: nothing to audit in a plain run.
+        self.assertEqual(result["unknownMarkerLines"], 0)
+        self.assertEqual(result["unknownMarkerBytes"], 0)
+        self.assertFalse(result["unknownMarkerTruncated"])
 
         records_path = self._capture_dir() / "finance-records.jsonl"
         if records_path.exists():
             self.assertEqual(records_path.read_bytes(), b"")
+        # The audit file is created lazily: no stored unknown lines, no file.
+        self.assertFalse(
+            (self._capture_dir() / "finance-records-unknown-marker.jsonl").exists()
+        )
 
     def test_capture_result_json_matches_spec_field_shape(self) -> None:
-        """§7.1 capture-result.json shape: exactly the documented keys."""
+        """§7.1 capture-result.json shape: exactly the ten frozen keys plus
+        the three internal unknown-marker audit counters (§4.1/§4.2); nothing
+        else may appear (the reader rejects unknown keys fail-closed)."""
         script = self._write_script("print('shape-probe')\n")
         self._run_wrapper(script)
 
@@ -196,6 +207,10 @@ class BoundedExecWrapperTest(unittest.TestCase):
             "recordSetComplete",
             "dropReason",
             "recordDigest",
+            # Internal unknown-marker counters — NOT part of the §5.1 channel.
+            "unknownMarkerLines",
+            "unknownMarkerBytes",
+            "unknownMarkerTruncated",
         }
         self.assertEqual(set(result.keys()), expected_fields)
 
@@ -309,6 +324,249 @@ class BoundedExecWrapperTest(unittest.TestCase):
         )
         self.assertFalse(result["recordSetComplete"])
         self.assertNotEqual(result["dropReason"], "")
+
+    # ------------------------------------------------------------------
+    # unknown-marker audit + the single joint recordChannelMaxBytes budget
+    # (contract §4.1/§4.2)
+    # ------------------------------------------------------------------
+
+    def test_unknown_marker_lines_are_stored_verbatim_in_the_audit_file(self) -> None:
+        """§4.1/§4.2: marker-family lines with an unknown version never enter
+        stdout.bin or finance-records.jsonl; they are stored VERBATIM in the
+        audit file so the Java side can audit UNSUPPORTED_MARKER_VERSION, and
+        the internal summary counters track them."""
+        unknown_v2 = MARKER_FAMILY_PREFIX + 'v2__{"value":9}'
+        unknown_v9 = MARKER_FAMILY_PREFIX + 'v9__{"other":true}'
+        script = self._write_script(
+            "import sys\n"
+            "sys.stdout.write('plain\\n')\n"
+            f"sys.stdout.write('{unknown_v2}\\n')\n"
+            f"sys.stdout.write('{unknown_v9}\\n')\n"
+            "sys.stdout.flush()\n"
+        )
+        self._run_wrapper(script)
+
+        result = self._read_capture_result()
+        audit_bin = self._read_capture_bytes("finance-records-unknown-marker.jsonl")
+        self.assertEqual(
+            audit_bin, unknown_v2.encode() + b"\n" + unknown_v9.encode() + b"\n"
+        )
+        self.assertEqual(result["unknownMarkerLines"], 2)
+        self.assertEqual(result["unknownMarkerBytes"], len(audit_bin))
+        self.assertFalse(result["unknownMarkerTruncated"])
+        # The v1 batch is untouched: empty-but-complete with frozen metrics.
+        self.assertEqual(result["emittedRecordCount"], 0)
+        self.assertEqual(result["emittedRecordBytes"], 0)
+        self.assertTrue(result["recordSetComplete"])
+        self.assertEqual(result["dropReason"], "")
+        self.assertEqual(result["recordDigest"], EMPTY_BATCH_DIGEST)
+        # Unknown lines never go into ordinary stdout or the records file.
+        self.assertEqual(self._read_capture_bytes("stdout.bin"), b"plain\n")
+        self.assertEqual(self._read_capture_bytes("finance-records.jsonl"), b"")
+
+    def test_unterminated_v1_marker_line_goes_to_audit_verbatim(self) -> None:
+        """§4.1: a v1 marker line missing its terminating newline is malformed
+        and joins the unknown-marker audit bucket (with its marker prefix
+        kept), while a well-formed v1 line stays a known record."""
+        payload = '{"sourceResolverToolCallId":"call-1"}'
+        unterminated = MARKER_V1_PREFIX + '{"unterminated":true}'
+        script = self._write_script(
+            "import sys\n"
+            f"sys.stdout.write('{MARKER_V1_PREFIX}' + '{payload}' + '\\n')\n"
+            f"sys.stdout.write('{unterminated}')\n"  # EOF without newline
+            "sys.stdout.flush()\n"
+        )
+        self._run_wrapper(script)
+
+        result = self._read_capture_result()
+        self.assertEqual(
+            self._read_capture_bytes("finance-records.jsonl"),
+            payload.encode() + b"\n",
+        )
+        self.assertEqual(
+            self._read_capture_bytes("finance-records-unknown-marker.jsonl"),
+            unterminated.encode() + b"\n",
+        )
+        self.assertEqual(result["emittedRecordCount"], 1)
+        self.assertEqual(result["unknownMarkerLines"], 1)
+        self.assertEqual(
+            result["unknownMarkerBytes"], len(unterminated.encode()) + 1
+        )
+        self.assertFalse(result["unknownMarkerTruncated"])
+
+    def test_known_and_unknown_lines_share_one_joint_byte_budget(self) -> None:
+        """§4.1/§4.2: there is ONE recordChannelMaxBytes budget for BOTH
+        record-channel files; the combined stored bytes never exceed it and
+        the counters account for each file as written (line + newline)."""
+        unknown_line = MARKER_FAMILY_PREFIX + 'v2__{"value":9}'
+        payload = '{"sourceResolverToolCallId":"call-1"}'
+        cap = 200
+        script = self._write_script(
+            "import sys\n"
+            f"sys.stdout.write('{unknown_line}\\n')\n"
+            f"sys.stdout.write('{MARKER_V1_PREFIX}' + '{payload}' + '\\n')\n"
+            "sys.stdout.flush()\n"
+        )
+        self._run_wrapper(script, limits={"recordChannelMaxBytes": cap})
+
+        result = self._read_capture_result()
+        records_bin = self._read_capture_bytes("finance-records.jsonl")
+        audit_bin = self._read_capture_bytes("finance-records-unknown-marker.jsonl")
+        self.assertEqual(records_bin, payload.encode() + b"\n")
+        self.assertEqual(audit_bin, unknown_line.encode() + b"\n")
+        # Joint accounting: stored bytes of both files together, within cap.
+        self.assertEqual(result["unknownMarkerBytes"], len(audit_bin))
+        self.assertEqual(result["emittedRecordBytes"], len(payload.encode()))
+        self.assertLessEqual(len(records_bin) + len(audit_bin), cap)
+        self.assertTrue(result["recordSetComplete"])
+        self.assertFalse(result["unknownMarkerTruncated"])
+
+    def test_unknown_lines_exhaust_joint_budget_and_drop_the_known_batch(self) -> None:
+        """§4.1/§4.2: unknown audit lines consume the SAME budget.  When they
+        exhaust it, the NEXT v1 record triggers the whole-batch drop — but
+        the audit file is KEPT (format-audit transport is independent of the
+        record batch) and the budget is frozen for both classes."""
+        unknown_big = MARKER_FAMILY_PREFIX + 'v2__{"blob":"' + "u" * 100 + '"}'
+        cap = len(unknown_big) + 1  # the unknown line alone fills the budget
+        payload = '{"sourceResolverToolCallId":"call-1"}'
+        unknown_small = MARKER_FAMILY_PREFIX + 'v3__{"late":true}'
+        script = self._write_script(
+            "import sys\n"
+            f"sys.stdout.write('{unknown_big}\\n')\n"      # fits, fills budget
+            f"sys.stdout.write('{MARKER_V1_PREFIX}' + '{payload}' + '\\n')\n"  # drop
+            f"sys.stdout.write('{unknown_small}\\n')\n"    # frozen budget
+            "sys.stdout.flush()\n"
+        )
+        self._run_wrapper(script, limits={"recordChannelMaxBytes": cap})
+
+        result = self._read_capture_result()
+        self.assertFalse(
+            (self._capture_dir() / "finance-records.jsonl").exists(),
+            "byte-budget drop must delete the batch file (§7.1 实施方式 5)",
+        )
+        self.assertFalse(result["recordSetComplete"])
+        self.assertEqual(
+            result["dropReason"], f"recordChannelMaxBytes exceeded: limit={cap}"
+        )
+        # Audit retained with only the first line; the post-drop line is out.
+        self.assertEqual(
+            self._read_capture_bytes("finance-records-unknown-marker.jsonl"),
+            unknown_big.encode() + b"\n",
+        )
+        self.assertEqual(result["unknownMarkerLines"], 1)
+        self.assertEqual(result["unknownMarkerBytes"], len(unknown_big.encode()) + 1)
+        self.assertTrue(result["unknownMarkerTruncated"])
+        # Frozen metrics: no v1 record was ever stored.
+        self.assertEqual(result["emittedRecordCount"], 0)
+        self.assertEqual(result["emittedRecordBytes"], 0)
+        self.assertEqual(result["recordDigest"], EMPTY_BATCH_DIGEST)
+
+    def test_count_limit_drop_keeps_unknown_lines_storing(self) -> None:
+        """§7.1/§4.2: after a COUNT-only drop the joint byte budget is still
+        open, so unknown audit lines keep storing while the budget allows."""
+        payload = '{"sourceResolverToolCallId":"call-%d"}'
+        unknown_line = MARKER_FAMILY_PREFIX + 'v2__{"value":9}'
+        script = self._write_script(
+            "import sys\n"
+            f"sys.stdout.write('{MARKER_V1_PREFIX}' + ('{payload}' % 1) + '\\n')\n"
+            f"sys.stdout.write('{MARKER_V1_PREFIX}' + ('{payload}' % 2) + '\\n')\n"  # drop
+            f"sys.stdout.write('{unknown_line}\\n')\n"  # still stored
+            "sys.stdout.flush()\n"
+        )
+        self._run_wrapper(script, limits={"recordChannelMaxRecords": 1})
+
+        result = self._read_capture_result()
+        self.assertFalse(
+            (self._capture_dir() / "finance-records.jsonl").exists(),
+            "count-limit drop must delete the batch file (§7.1 实施方式 5)",
+        )
+        self.assertFalse(result["recordSetComplete"])
+        self.assertEqual(
+            result["dropReason"], "recordChannelMaxRecords exceeded: limit=1"
+        )
+        self.assertEqual(
+            self._read_capture_bytes("finance-records-unknown-marker.jsonl"),
+            unknown_line.encode() + b"\n",
+        )
+        self.assertEqual(result["unknownMarkerLines"], 1)
+        self.assertFalse(result["unknownMarkerTruncated"])
+
+    def test_exact_boundary_joint_budget_stores_and_cap_plus_one_drops(self) -> None:
+        """§4.1/§4.2 boundary semantics: combined stored bytes == cap stores
+        everything; one byte over the cap (cap+1 needed) drops the batch."""
+        unknown_line = MARKER_FAMILY_PREFIX + 'v2__{"value":9}'
+        payload = '{"sourceResolverToolCallId":"call-1"}'
+        size_unknown = len(unknown_line.encode()) + 1
+        size_record = len(payload.encode()) + 1
+
+        # Run A: cap == size_unknown + size_record (exact boundary) -> stored.
+        cap = size_unknown + size_record
+        script_a = self._write_script(
+            "import sys\n"
+            f"sys.stdout.write('{unknown_line}\\n')\n"
+            f"sys.stdout.write('{MARKER_V1_PREFIX}' + '{payload}' + '\\n')\n"
+            "sys.stdout.flush()\n",
+            name="boundary_exact.py",
+        )
+        self._run_wrapper(script_a, limits={"recordChannelMaxBytes": cap})
+        result = self._read_capture_result()
+        self.assertTrue(result["recordSetComplete"])
+        self.assertEqual(result["emittedRecordCount"], 1)
+        self.assertEqual(result["unknownMarkerLines"], 1)
+        self.assertFalse(result["unknownMarkerTruncated"])
+        self.assertEqual(
+            len(self._read_capture_bytes("finance-records.jsonl"))
+            + len(self._read_capture_bytes("finance-records-unknown-marker.jsonl")),
+            cap,
+        )
+
+        # Run B: same cap with one more record needing size_record bytes
+        # (joint total would be cap + size_record > cap) -> whole-batch drop.
+        shutil.rmtree(self._capture_dir(), ignore_errors=True)  # fresh capture
+        script_b = self._write_script(
+            "import sys\n"
+            f"sys.stdout.write('{unknown_line}\\n')\n"
+            f"sys.stdout.write('{MARKER_V1_PREFIX}' + '{payload}' + '\\n')\n"
+            f"sys.stdout.write('{MARKER_V1_PREFIX}' + '{payload}' + '\\n')\n"
+            "sys.stdout.flush()\n",
+            name="boundary_over.py",
+        )
+        self._run_wrapper(script_b, limits={"recordChannelMaxBytes": cap})
+        result = self._read_capture_result()
+        self.assertFalse(result["recordSetComplete"])
+        self.assertEqual(
+            result["dropReason"], f"recordChannelMaxBytes exceeded: limit={cap}"
+        )
+        # The audit file survives the record-batch drop.  The byte-budget
+        # drop exhausts the joint budget, so the audit truncation flag is
+        # set at the drop itself — even though no further audit line
+        # arrived afterwards (§4.1/§4.2).
+        self.assertEqual(result["unknownMarkerLines"], 1)
+        self.assertTrue(result["unknownMarkerTruncated"])
+        self.assertEqual(
+            self._read_capture_bytes("finance-records-unknown-marker.jsonl"),
+            unknown_line.encode() + b"\n",
+        )
+        self.assertFalse(
+            (self._capture_dir() / "finance-records.jsonl").exists()
+        )
+
+        # Run C: a lone record one byte over a tight cap -> dropped as well.
+        shutil.rmtree(self._capture_dir(), ignore_errors=True)  # fresh capture
+        cap_c = size_record - 1
+        script_c = self._write_script(
+            "import sys\n"
+            f"sys.stdout.write('{MARKER_V1_PREFIX}' + '{payload}' + '\\n')\n"
+            "sys.stdout.flush()\n",
+            name="boundary_plus_one.py",
+        )
+        self._run_wrapper(script_c, limits={"recordChannelMaxBytes": cap_c})
+        result = self._read_capture_result()
+        self.assertFalse(result["recordSetComplete"])
+        self.assertEqual(
+            result["dropReason"], f"recordChannelMaxBytes exceeded: limit={cap_c}"
+        )
+        self.assertEqual(result["emittedRecordCount"], 0)
 
     def test_timeout_kills_entire_process_group_and_writes_capture_result(self) -> None:
         """§7.1 实施方式 6 + §7.1 风险清单 (line 864): on timeout the wrapper
