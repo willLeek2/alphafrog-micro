@@ -108,6 +108,80 @@ class ExecuteResult(BaseModel):
     artifacts: Optional[dict] = None
     resource_usage: Optional[SandboxResourceUsage] = None
     retryable: Optional[bool] = None
+    # NOTE: the §5.1 `finance_record_channel` / `execution_environment` fields
+    # are declared by work package D (frozen DTO classes FinanceRecordChannel /
+    # ExecutionEnvironment, contract §5.1 snake_case). Work package C only
+    # WRITES finance_record_channel (app.finance_record_channel write path) and
+    # never redefines the classes (owner split, msg f4341b21). They land here
+    # at owner merge; the C write path tolerates their absence until then.
+
+
+# === work-package-C (ccqwen) ===
+# Spec §7.2 / frozen contract §13: output-limit snapshot models.
+# Contract §13 spells the four Python task snapshot keys VERBATIM in camelCase
+# (recordChannelMaxRecords/recordChannelMaxBytes/stdoutMaxBytes/stderrMaxBytes)
+# plus a source revision; the snapshot is frozen at create_task (idempotent
+# create returns the original snapshot) and is the ONLY limit source execution
+# may read — hot config is never re-read mid-run.
+class EffectiveOutputLimits(BaseModel):
+    """Frozen per-task output limit snapshot (§7.2, contract §13)."""
+
+    stdoutMaxBytes: int = Field(..., ge=0)
+    stderrMaxBytes: int = Field(..., ge=0)
+    recordChannelMaxBytes: int = Field(..., ge=0)
+    recordChannelMaxRecords: int = Field(..., ge=0)
+    sourceRevision: str = Field(
+        default="",
+        description="Config generation this snapshot was frozen from",
+    )
+
+
+class BoundedExecRequest(BaseModel):
+    """§7.1 wrapper input (wrapper-input.json) shape, camelCase keys."""
+
+    scriptPath: str = Field(..., min_length=1)
+    timeoutSeconds: float = Field(..., ge=0)
+    effectiveOutputLimits: EffectiveOutputLimits
+    runtimeEnvironmentPath: Optional[str] = None
+
+    def wrapper_input_payload(self) -> dict:
+        """Serialize to the exact §7.1 input shape.
+
+        The wrapper (bounded_exec_wrapper.parse_wrapper_input) requires the
+        four §13 limit keys verbatim; the snapshot's sourceRevision is Task
+        metadata and is NOT part of the wrapper input.
+        """
+        limits = self.effectiveOutputLimits.model_dump()
+        limits.pop("sourceRevision", None)
+        payload: dict = {
+            "scriptPath": self.scriptPath,
+            "timeoutSeconds": self.timeoutSeconds,
+            "effectiveOutputLimits": limits,
+        }
+        if self.runtimeEnvironmentPath is not None:
+            payload["runtimeEnvironmentPath"] = self.runtimeEnvironmentPath
+        return payload
+
+
+class BoundedExecResult(BaseModel):
+    """§7.1 capture-result.json summary shape (wrapper layer, camelCase).
+
+    These are the wrapper's own reporting fields; the frozen consumer surface
+    is the §5.1 snake_case finance_record_channel built from them by
+    app.finance_record_channel.finance_channel_from_capture.
+    """
+
+    exitCode: int
+    ordinaryStdoutBytes: int = Field(..., ge=0)
+    stderrBytes: int = Field(..., ge=0)
+    stdoutTruncated: bool
+    stderrTruncated: bool
+    emittedRecordCount: int = Field(..., ge=0)
+    emittedRecordBytes: int = Field(..., ge=0)
+    recordSetComplete: bool
+    dropReason: str
+    recordDigest: str
+# === end work-package-C (ccqwen) ===
 
 
 class Task(BaseModel):
@@ -123,6 +197,15 @@ class Task(BaseModel):
     payload_digest: Optional[str] = None
     resource_usage: Optional[SandboxResourceUsage] = None
     retryable: Optional[bool] = None
+    # === work-package-C (ccqwen) ===
+    # §7.2/§13: the frozen output-limit snapshot, set once in create_task and
+    # read-only for the whole execution (idempotent create returns the
+    # original Task and snapshot). runtime_image_ref stores the digest
+    # reference of the image the task runs on (H owns resolution rules; C
+    # only stores). Both are backend facts, never model/user-visible.
+    effective_output_limits: Optional[EffectiveOutputLimits] = None
+    runtime_image_ref: Optional[str] = None
+    # === end work-package-C (ccqwen) ===
 
 
 class CreateTaskResponse(BaseModel):

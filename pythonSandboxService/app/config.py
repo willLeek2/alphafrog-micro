@@ -9,6 +9,44 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+# --- MethodSpec V5 output limits (Spec §7.1/§7.2, frozen contract §13) -----
+# Verbatim camelCase keys used in python-sandbox.json / Nacos payloads and in
+# the per-task snapshot. Contract §13 fixes the exact spelling:
+# recordChannelMaxRecords/recordChannelMaxBytes/stdoutMaxBytes/stderrMaxBytes.
+OUTPUT_LIMIT_KEYS: tuple[str, ...] = (
+    "stdoutMaxBytes",
+    "stderrMaxBytes",
+    "recordChannelMaxBytes",
+    "recordChannelMaxRecords",
+)
+
+# Application defaults. These mirror the *shape* of the Spec §7.1 wrapper
+# input example (numbers only denote shape, 数字只表示形状). The production
+# numbers must be confirmed by the four-stage tests (subprocess / Python HTTP
+# / Java gateway-Dubbo / Java parse-save, Spec §7.1 & contract §13: 生产默认
+# 取四段最小已验证值并留余量；正式数字必须由工作包 C/D 的四段测试确认，本协议
+# 不编造生产值). Do not raise them until those tests exist.
+DEFAULT_OUTPUT_LIMITS: dict[str, int] = {
+    "stdoutMaxBytes": 1048576,
+    "stderrMaxBytes": 262144,
+    "recordChannelMaxBytes": 262144,
+    "recordChannelMaxRecords": 128,
+}
+
+# Static hard ceilings, written in code (Spec §7.1: 静态硬上限写在代码或启动
+# 配置里，Nacos 只能调低或调到硬上限，不能提高硬上限; contract §13: 静态硬上限
+# 只能被 Nacos 调低，不能被动态配置提高). Until the four-stage tests confirm
+# real numbers, the ceilings are pinned AT the application defaults so no
+# dynamic config can raise any limit above what the code ships with. Raising a
+# ceiling requires a code change backed by four-stage test evidence.
+HARD_OUTPUT_LIMIT_CEILINGS: dict[str, int] = {
+    "stdoutMaxBytes": 1048576,
+    "stderrMaxBytes": 262144,
+    "recordChannelMaxBytes": 262144,
+    "recordChannelMaxRecords": 128,
+}
+
+
 @dataclass(frozen=True)
 class SandboxConfig:
     data_dir: Path
@@ -41,6 +79,13 @@ class SandboxConfig:
     queue_wait_timeout_seconds: float = 30.0
     usage_sampling_interval_millis: int = 200
     task_store_path: Path = Path("/data/sandbox_tasks/state.json")
+    # MethodSpec V5 sandbox output limits (Spec §7.2 / contract §13).
+    # Application defaults; the dynamic (Nacos) layer may only lower these or
+    # clamp them down to HARD_OUTPUT_LIMIT_CEILINGS, never raise them.
+    stdout_max_bytes: int = DEFAULT_OUTPUT_LIMITS["stdoutMaxBytes"]
+    stderr_max_bytes: int = DEFAULT_OUTPUT_LIMITS["stderrMaxBytes"]
+    record_channel_max_bytes: int = DEFAULT_OUTPUT_LIMITS["recordChannelMaxBytes"]
+    record_channel_max_records: int = DEFAULT_OUTPUT_LIMITS["recordChannelMaxRecords"]
 
 
 def load_config() -> SandboxConfig:
