@@ -8,7 +8,11 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.context.AgentContext;
-import world.willfrog.agent.tools.finance.FinanceMethodResolverClient.ResolverResult;
+import world.willfrog.agent.platform.finance.FinanceMethodResolutionSink;
+import world.willfrog.agent.platform.finance.FinanceMethodResolutionSinkException;
+import world.willfrog.agent.platform.finance.FinanceMethodResolutionSnapshot;
+import world.willfrog.agent.platform.finance.FinanceMethodResolverClient;
+import world.willfrog.agent.platform.finance.FinanceMethodResolverClient.ResolverResult;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
