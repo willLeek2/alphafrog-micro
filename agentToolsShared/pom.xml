@@ -85,4 +85,42 @@
             <scope>test</scope>
         </dependency>
     </dependencies>
+    <build>
+        <resources>
+            <resource>
+                <directory>src/main/resources</directory>
+                <excludes>
+                    <exclude>finance/method-specs/**/*.yaml</exclude>
+                    <exclude>finance/method-specs/schema/**</exclude>
+                </excludes>
+            </resource>
+            <resource>
+                <directory>${project.build.directory}/generated-resources</directory>
+            </resource>
+        </resources>
+        <plugins>
+            <plugin>
+                <groupId>world.willfrog</groupId>
+                <artifactId>agentMethodSpecBuildPlugin</artifactId>
+                <version>${project.version}</version>
+                <executions>
+                    <execution>
+                        <id>compile-method-specs</id>
+                        <goals>
+                            <goal>compile</goal>
+                        </goals>
+                        <phase>generate-resources</phase>
+                    </execution>
+                    <execution>
+                        <id>verify-method-spec-artifact</id>
+                        <goals>
+                            <goal>verify-artifact</goal>
+                        </goals>
+                        <phase>verify</phase>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+
 </project>
