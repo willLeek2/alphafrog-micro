@@ -24,7 +24,11 @@ Covered behavior:
   - ``sourceRevision`` is ``static-default`` initially and changes with the
     applied payload (deterministically).
   - ``containerMaxConcurrency`` hot-reload regression (direct update method
-    and whole-payload path, invalid values ignored).
+    and whole-payload path, invalid values ignored) under the UNCONDITIONAL
+    cmc==1 safety invariant (codex c72db8f6 item 4 / 56d28076): cmc>1 is
+    fail-fast rejected at construction, in single-field hot updates and in
+    whole payloads, for EVERY configuration until the task-specific global
+    sitecustomize.py bootstrap becomes task-local.
 
 Constructed directly from a ``SandboxConfig`` instance; stdlib unittest only,
 no nacos SDK or network required.
@@ -138,8 +142,10 @@ class SnapshotDefaultsTest(NacosConfigTest):
 class WholeObjectValidationTest(NacosConfigTest):
     def test_valid_whole_object_payload_replaces_all_four_limits(self) -> None:
         dyn = self._make_dynamic()
+        # cmc must stay 1 under the unconditional invariant; the four limits
+        # are the mutable part of the payload.
         payload = {
-            "containerMaxConcurrency": 3,
+            "containerMaxConcurrency": 1,
             "stdoutMaxBytes": 1000,
             "stderrMaxBytes": 2000,
             "recordChannelMaxBytes": 3000,
@@ -151,7 +157,7 @@ class WholeObjectValidationTest(NacosConfigTest):
         self.assertEqual(snapshot["stderrMaxBytes"], 2000)
         self.assertEqual(snapshot["recordChannelMaxBytes"], 3000)
         self.assertEqual(snapshot["recordChannelMaxRecords"], 10)
-        self.assertEqual(dyn.container_max_concurrency, 3)
+        self.assertEqual(dyn.container_max_concurrency, 1)
         self.assertNotEqual(snapshot["sourceRevision"], "static-default")
 
     def test_invalid_json_keeps_last_known_good(self) -> None:
@@ -187,6 +193,9 @@ class WholeObjectValidationTest(NacosConfigTest):
             {"stdoutMaxBytes": True},
             # containerMaxConcurrency below its minimum poisons the payload.
             {"containerMaxConcurrency": 0, "stdoutMaxBytes": 4096},
+            # containerMaxConcurrency above the unconditional cmc==1 ceiling
+            # poisons the payload for ALL configs (codex c72db8f6 item 4).
+            {"containerMaxConcurrency": 2, "stdoutMaxBytes": 4096},
         ]
         for payload in bad_payloads:
             with self.subTest(payload=payload):
@@ -309,114 +318,153 @@ class ContainerMaxConcurrencyRegressionTest(NacosConfigTest):
     def test_direct_update_method_semantics(self) -> None:
         dyn = self._make_dynamic()
         self.assertEqual(dyn.container_max_concurrency, 1)
-        dyn.update_container_max_concurrency(5)
-        self.assertEqual(dyn.container_max_concurrency, 5)
+        # cmc>1 is rejected for ALL configs under the unconditional invariant
+        # (codex c72db8f6 item 4 / 56d28076); the current value is retained.
+        with self.assertLogs("app.nacos_config", level="WARNING") as captured:
+            dyn.update_container_max_concurrency(5)
+        self.assertEqual(dyn.container_max_concurrency, 1)
+        self.assertTrue(any("DYNAMIC_CONFIG_REJECTED" in m for m in captured.output))
         with self.assertLogs("app.nacos_config", level="WARNING") as captured:
             dyn.update_container_max_concurrency(0)
-        self.assertEqual(dyn.container_max_concurrency, 5)
+        self.assertEqual(dyn.container_max_concurrency, 1)
         self.assertTrue(any("Ignoring invalid container_max_concurrency" in m
                             for m in captured.output))
         dyn.update_container_max_concurrency(-3)
-        self.assertEqual(dyn.container_max_concurrency, 5)
+        self.assertEqual(dyn.container_max_concurrency, 1)
+        # The only applicable value is 1 itself (idempotent apply).
+        dyn.update_container_max_concurrency(1)
+        self.assertEqual(dyn.container_max_concurrency, 1)
 
     def test_hot_reload_via_payload_content(self) -> None:
         dyn = self._make_dynamic()
-        self.assertTrue(dyn.apply_dynamic_content('{"containerMaxConcurrency": 7}'))
-        self.assertEqual(dyn.container_max_concurrency, 7)
+        # cmc>1 now rejects the WHOLE payload for ALL configs; value retained.
+        with self.assertLogs("app.nacos_config", level="WARNING") as captured:
+            self.assertFalse(dyn.apply_dynamic_content('{"containerMaxConcurrency": 7}'))
+        self.assertTrue(any("DYNAMIC_CONFIG_REJECTED" in m for m in captured.output))
+        self.assertEqual(dyn.container_max_concurrency, 1)
         # Invalid value rejects the whole payload; previous value retained.
         self.assertFalse(dyn.apply_dynamic_content('{"containerMaxConcurrency": 0}'))
-        self.assertEqual(dyn.container_max_concurrency, 7)
+        self.assertEqual(dyn.container_max_concurrency, 1)
+        # cmc=1 is the only applicable value and applies cleanly.
+        self.assertTrue(dyn.apply_dynamic_content('{"containerMaxConcurrency": 1}'))
+        self.assertEqual(dyn.container_max_concurrency, 1)
 
     def test_apply_to_mirrors_dynamic_values(self) -> None:
         dyn = self._make_dynamic()
+        # cmc=1 is the only dynamic concurrency that can ever be applied under
+        # the unconditional invariant; mirror it alongside a lowered limit.
         self.assertTrue(
             dyn.apply_dynamic_content(
-                json.dumps({"containerMaxConcurrency": 2, "stdoutMaxBytes": 4096})
+                json.dumps({"containerMaxConcurrency": 1, "stdoutMaxBytes": 4096})
             )
         )
         effective = dyn.apply_to(self._make_base_config())
-        self.assertEqual(effective.container_max_concurrency, 2)
+        self.assertEqual(effective.container_max_concurrency, 1)
         self.assertEqual(effective.stdout_max_bytes, 4096)
-        # cmc > 1 disables the global compat input symlink.
-        self.assertFalse(effective.compat_input_path_enabled)
+        # cmc==1 keeps the global compat input symlink enabled.
+        self.assertTrue(effective.compat_input_path_enabled)
         # No-change path returns the same object.
         unchanged_dyn = self._make_dynamic()
         base = self._make_base_config()
         self.assertIs(unchanged_dyn.apply_to(base), base)
 
 
-class DynamicInstallConcurrencyInvariantTest(NacosConfigTest):
-    """Dynamic-install safety invariant (codex 7fb75440 / bc11e841 point 3).
+class UnconditionalConcurrencyInvariantTest(NacosConfigTest):
+    """Unconditional cmc==1 safety invariant (codex c72db8f6 item 4 / 56d28076).
 
-    While dynamic install is enabled (``skip_environment_setup=False``),
-    ``session.install()`` mutates the shared container venv, so container
-    concurrency must stay exactly 1.  The base config fails fast at
-    construction; a violating single-field hot update and a violating whole
-    payload are both rejected, keeping the last-known-good value (invalid
-    hot update never changes the current value).
+    The sandbox runner's task bootstrap still writes/deletes a task-specific
+    GLOBAL /sandbox/sitecustomize.py shared across concurrent tasks in the
+    same container, for ALL configurations (not only dynamic install). Until
+    that bootstrap becomes task-local, every configuration is fail-fast
+    restricted to container concurrency exactly 1: if this layer accepted a
+    hot update to >1 in preinstalled mode, new worker creation would fail
+    afterwards, breaking last-known-good semantics.
+
+    The base config fails fast at construction; a violating single-field hot
+    update and a violating whole payload are both rejected, keeping the
+    last-known-good snapshot wholesale (an invalid hot update never changes
+    the current value or the source revision). All cases hold regardless of
+    ``skip_environment_setup``.
     """
 
-    def test_base_config_above_one_fails_fast_at_construction(self) -> None:
-        with self.assertRaisesRegex(ValueError, "container_max_concurrency must be 1"):
-            self._make_dynamic(
-                skip_environment_setup=False, container_max_concurrency=2
-            )
+    def test_base_config_above_one_fails_fast_for_all_configs(self) -> None:
+        for skip in (True, False):
+            with self.subTest(skip_environment_setup=skip):
+                with self.assertRaisesRegex(
+                    ValueError, "container_max_concurrency must be 1"
+                ):
+                    self._make_dynamic(
+                        skip_environment_setup=skip, container_max_concurrency=2
+                    )
 
-    def test_base_config_one_is_accepted_when_enabled(self) -> None:
-        dyn = self._make_dynamic(
-            skip_environment_setup=False, container_max_concurrency=1
-        )
-        self.assertEqual(dyn.container_max_concurrency, 1)
-
-    def test_single_field_hot_update_above_one_rejected_keeps_lkg(self) -> None:
-        dyn = self._make_dynamic(skip_environment_setup=False)
-        self.assertEqual(dyn.container_max_concurrency, 1)
-        with self.assertLogs("app.nacos_config", level="WARNING") as captured:
-            dyn.update_container_max_concurrency(4)
-        # The invalid hot update must not change the current value.
-        self.assertEqual(dyn.container_max_concurrency, 1)
-        self.assertTrue(
-            any("DYNAMIC_CONFIG_REJECTED" in m for m in captured.output)
-        )
-
-    def test_whole_payload_above_one_rejected_keeps_lkg(self) -> None:
-        dyn = self._make_dynamic(skip_environment_setup=False)
-        # Establish a known-good snapshot (a lowered limit).
-        self.assertTrue(
-            dyn.apply_dynamic_content(json.dumps({"stdoutMaxBytes": 2048}))
-        )
-        revision_before = dyn.source_revision
-        snapshot_before = dyn.output_limits_snapshot()
-        # The violating cmc rejects the WHOLE payload, including the valid
-        # stdoutMaxBytes carried alongside it.
-        with self.assertLogs("app.nacos_config", level="WARNING"):
-            self.assertFalse(
-                dyn.apply_dynamic_payload(
-                    {"containerMaxConcurrency": 3, "stdoutMaxBytes": 4096}
+    def test_base_config_one_is_accepted_for_all_configs(self) -> None:
+        for skip in (True, False):
+            with self.subTest(skip_environment_setup=skip):
+                dyn = self._make_dynamic(
+                    skip_environment_setup=skip, container_max_concurrency=1
                 )
-            )
-        self.assertEqual(dyn.container_max_concurrency, 1)
-        self._assert_last_known_good(
-            dyn, {"stdoutMaxBytes": 2048}, revision_before
-        )
-        self.assertEqual(dyn.output_limits_snapshot(), snapshot_before)
+                self.assertEqual(dyn.container_max_concurrency, 1)
 
-    def test_payload_cmc_one_applies_when_enabled(self) -> None:
-        dyn = self._make_dynamic(skip_environment_setup=False)
-        self.assertTrue(
-            dyn.apply_dynamic_payload(
-                {"containerMaxConcurrency": 1, "stdoutMaxBytes": 4096}
-            )
-        )
-        self.assertEqual(dyn.container_max_concurrency, 1)
-        self.assertEqual(dyn.output_limits_snapshot()["stdoutMaxBytes"], 4096)
+    def test_single_field_hot_update_above_one_rejected_for_all_configs(self) -> None:
+        for skip in (True, False):
+            with self.subTest(skip_environment_setup=skip):
+                dyn = self._make_dynamic(skip_environment_setup=skip)
+                self.assertEqual(dyn.container_max_concurrency, 1)
+                with self.assertLogs("app.nacos_config", level="WARNING") as captured:
+                    dyn.update_container_max_concurrency(2)
+                # The invalid hot update must not change the current value.
+                self.assertEqual(dyn.container_max_concurrency, 1)
+                self.assertTrue(
+                    any("DYNAMIC_CONFIG_REJECTED" in m for m in captured.output)
+                )
 
-    def test_disabled_dynamic_install_still_allows_hot_cmc_above_one(self) -> None:
-        # skip_environment_setup=True (the default): legacy behavior is
-        # unchanged; hot updates raising concurrency still apply.
-        dyn = self._make_dynamic(skip_environment_setup=True)
-        dyn.update_container_max_concurrency(5)
-        self.assertEqual(dyn.container_max_concurrency, 5)
+    def test_single_field_hot_update_to_one_applies_for_all_configs(self) -> None:
+        for skip in (True, False):
+            with self.subTest(skip_environment_setup=skip):
+                dyn = self._make_dynamic(skip_environment_setup=skip)
+                dyn.update_container_max_concurrency(1)
+                self.assertEqual(dyn.container_max_concurrency, 1)
+
+    def test_whole_payload_above_one_rejected_snapshot_unchanged(self) -> None:
+        for skip in (True, False):
+            with self.subTest(skip_environment_setup=skip):
+                dyn = self._make_dynamic(skip_environment_setup=skip)
+                # Establish a known-good snapshot (a lowered limit) so the
+                # rejection must preserve a non-default revision too.
+                self.assertTrue(
+                    dyn.apply_dynamic_content(json.dumps({"stdoutMaxBytes": 2048}))
+                )
+                snapshot_before = dyn.output_limits_snapshot()
+                # The violating cmc rejects the WHOLE payload, including the
+                # valid stdoutMaxBytes carried alongside it; the ENTIRE
+                # snapshot stays unchanged, including sourceRevision.
+                with self.assertLogs("app.nacos_config", level="WARNING") as captured:
+                    self.assertFalse(
+                        dyn.apply_dynamic_payload(
+                            {"containerMaxConcurrency": 2, "stdoutMaxBytes": 100}
+                        )
+                    )
+                self.assertTrue(
+                    any("DYNAMIC_CONFIG_REJECTED" in m for m in captured.output)
+                )
+                self.assertEqual(dyn.container_max_concurrency, 1)
+                self.assertEqual(dyn.output_limits_snapshot(), snapshot_before)
+                self.assertEqual(dyn.source_revision, snapshot_before["sourceRevision"])
+
+    def test_whole_payload_cmc_one_applies_and_updates_revision(self) -> None:
+        for skip in (True, False):
+            with self.subTest(skip_environment_setup=skip):
+                dyn = self._make_dynamic(skip_environment_setup=skip)
+                self.assertEqual(dyn.source_revision, "static-default")
+                self.assertTrue(
+                    dyn.apply_dynamic_payload(
+                        {"containerMaxConcurrency": 1, "stdoutMaxBytes": 100}
+                    )
+                )
+                self.assertEqual(dyn.container_max_concurrency, 1)
+                self.assertEqual(dyn.output_limits_snapshot()["stdoutMaxBytes"], 100)
+                self.assertNotEqual(dyn.source_revision, "static-default")
+                self.assertTrue(dyn.source_revision.startswith("nacos-sha256:"))
 
 
 class AtomicReplacementTest(NacosConfigTest):

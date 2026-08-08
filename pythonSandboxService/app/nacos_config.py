@@ -87,29 +87,42 @@ class DynamicSandboxConfig:
         -> shrink to code hard ceilings.
       - Tasks freeze ``output_limits_snapshot()`` at creation time and must
         not re-read this hot config during execution.
-      - Dynamic-install safety invariant: while dynamic install is enabled
-        (``skip_environment_setup=false``) ``containerMaxConcurrency`` must be
-        1, because ``session.install()`` mutates the shared container venv.
-        A violating base config fails startup (constructor raises); a
-        violating hot update is rejected keeping the last-known-good value.
+      - Concurrency safety invariant (UNCONDITIONAL, codex c72db8f6 item 4 /
+        56d28076): ``containerMaxConcurrency`` must be 1 for EVERY
+        configuration (dynamic-install and preinstalled alike), because the
+        runner's task bootstrap still writes/deletes a task-specific GLOBAL
+        /sandbox/sitecustomize.py shared across concurrent tasks in the same
+        container, which is not yet task-local. A violating base config fails
+        startup (constructor raises); a violating hot update is rejected
+        keeping the last-known-good value.
     """
 
     def __init__(self, config: SandboxConfig) -> None:
         self._lock = threading.Lock()
-        # Dynamic-install safety invariant (plan-A decision, codex 7fb75440 /
-        # bc11e841): ``session.install()`` mutates the SHARED container venv,
-        # so while dynamic install is enabled (skip_environment_setup=false)
-        # container concurrency must stay exactly 1.  The base config is
+        # Unconditional concurrency invariant (codex c72db8f6 item 4 /
+        # 56d28076): the sandbox runner's task bootstrap still writes/deletes
+        # a task-specific GLOBAL /sandbox/sitecustomize.py shared across
+        # concurrent tasks in the same container, for ALL configurations (not
+        # only dynamic install). codex 56d28076 wording: 现有 task-specific
+        # 全局 sitecustomize.py 写/删尚未 task-local 化，因此选择全配置
+        # fail-fast 的安全限制. Container concurrency must therefore stay
+        # exactly 1 for EVERY configuration: if this layer accepted a hot
+        # update to >1 in preinstalled mode, new worker creation would fail
+        # afterwards, breaking last-known-good semantics. The base config is
         # fail-fast rejected here at construction; hot updates are rejected
         # by update_container_max_concurrency/apply_dynamic_payload below,
         # keeping the last-known-good value instead of breaking later at
-        # session creation.
-        self._dynamic_install_enabled = not config.skip_environment_setup
-        if self._dynamic_install_enabled and config.container_max_concurrency > 1:
+        # worker creation.
+        #
+        # Restoration path: once the wrapper AF_TASK_* bootstrap becomes
+        # subprocess task-local env with no shared sitecustomize writes,
+        # preinstalled-mode (skip_environment_setup=true) cmc>1 may be
+        # restored behind concurrency-isolation tests.
+        if config.container_max_concurrency > 1:
             raise ValueError(
-                "container_max_concurrency must be 1 when dynamic install is "
-                "enabled (skip_environment_setup=false): session.install() "
-                "mutates the shared container venv"
+                "container_max_concurrency must be 1 for ALL configurations: "
+                "the task-specific global /sandbox/sitecustomize.py "
+                "write/delete is not yet task-local (codex 56d28076)"
             )
         self._snapshot = self._initial_snapshot(config)
 
@@ -187,14 +200,19 @@ class DynamicSandboxConfig:
             return
         with self._lock:
             old = self._snapshot.container_max_concurrency
-            if self._dynamic_install_enabled and value > 1:
-                # Fail-fast reject the hot update and KEEP the safe value:
-                # a later session creation error would break new workers,
-                # whereas rejecting here leaves the running config intact.
+            if value > 1:
+                # Unconditional safety invariant (codex c72db8f6 item 4 /
+                # 56d28076): the task-specific global /sandbox/sitecustomize.py
+                # write/delete is not yet task-local, so cmc>1 is rejected for
+                # ALL configs. Fail-fast reject the hot update and KEEP the
+                # safe value: a later worker creation error would break new
+                # workers, whereas rejecting here leaves the running config
+                # intact (last-known-good).
                 logger.warning(
-                    "DYNAMIC_CONFIG_REJECTED container_max_concurrency=%s: dynamic "
-                    "install enabled (skip_environment_setup=false) requires "
-                    "concurrency 1; keeping %s",
+                    "DYNAMIC_CONFIG_REJECTED container_max_concurrency=%s: the "
+                    "task-specific global sitecustomize.py bootstrap is not yet "
+                    "task-local, so every config is restricted to concurrency 1; "
+                    "keeping %s",
                     value,
                     old,
                 )
@@ -256,13 +274,16 @@ class DynamicSandboxConfig:
             raw = payload[KEY_CONTAINER_MAX_CONCURRENCY]
             if not _is_plain_int(raw) or raw < 1:
                 errors.append(f"containerMaxConcurrency={raw!r} must be an int >= 1")
-            elif self._dynamic_install_enabled and raw > 1:
-                # Dynamic-install safety invariant: whole-object rejection
-                # keeps the last-known-good concurrency rather than letting a
-                # hot payload raise it above the only safe value (1).
+            elif raw > 1:
+                # Unconditional safety invariant (codex c72db8f6 item 4 /
+                # 56d28076): whole-object rejection keeps the last-known-good
+                # concurrency rather than letting a hot payload raise it above
+                # the only safe value (1) for ANY configuration, until the
+                # task-specific global sitecustomize.py bootstrap is task-local.
                 errors.append(
-                    f"containerMaxConcurrency={raw!r} must be 1 while dynamic "
-                    "install is enabled (skip_environment_setup=false)"
+                    f"containerMaxConcurrency={raw!r} must be 1 for all "
+                    "configurations until the task-specific global "
+                    "sitecustomize.py bootstrap is task-local"
                 )
         for key in OUTPUT_LIMIT_KEYS:
             if key in payload:
@@ -381,7 +402,7 @@ def start_nacos_listener(
       - AF_CONFIG_NACOS_DATA_ID: data id (default "python-sandbox.json")
 
     Expected config content is a single JSON object, e.g.
-    {"containerMaxConcurrency": 5, "stdoutMaxBytes": 1048576,
+    {"containerMaxConcurrency": 1, "stdoutMaxBytes": 1048576,
      "stderrMaxBytes": 262144, "recordChannelMaxBytes": 262144,
      "recordChannelMaxRecords": 128}. The whole object must validate before
     any of it is applied (contract §13 whole-object semantics).
