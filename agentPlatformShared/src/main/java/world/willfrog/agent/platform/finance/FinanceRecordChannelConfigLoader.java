@@ -342,16 +342,26 @@ public class FinanceRecordChannelConfigLoader {
 
         FinanceRecordChannelLimits toLimits() {
             return new FinanceRecordChannelLimits(
-                    Boolean.TRUE.equals(enabled), required(recordCountMax, "recordCountMax"),
-                    required(recordMaxBytes, "recordMaxBytes"),
-                    required(recordChannelMaxBytes, "recordChannelMaxBytes"),
-                    required(stdoutMaxBytes, "stdoutMaxBytes"),
-                    required(stderrMaxBytes, "stderrMaxBytes"), targetEnvironmentId);
+                    Boolean.TRUE.equals(enabled),
+                    requiredAtMost(recordCountMax, "recordCountMax",
+                            FinanceRecordChannelProperties.HARD_RECORD_COUNT_MAX),
+                    requiredAtMost(recordMaxBytes, "recordMaxBytes",
+                            FinanceRecordChannelProperties.HARD_RECORD_MAX_BYTES),
+                    requiredAtMost(recordChannelMaxBytes, "recordChannelMaxBytes",
+                            FinanceRecordChannelProperties.HARD_RECORD_CHANNEL_MAX_BYTES),
+                    requiredAtMost(stdoutMaxBytes, "stdoutMaxBytes",
+                            FinanceRecordChannelProperties.HARD_STDOUT_MAX_BYTES),
+                    requiredAtMost(stderrMaxBytes, "stderrMaxBytes",
+                            FinanceRecordChannelProperties.HARD_STDERR_MAX_BYTES),
+                    targetEnvironmentId);
         }
 
-        private static int required(Integer value, String name) {
+        private static int requiredAtMost(Integer value, String name, int hardMaximum) {
             if (value == null || value <= 0) {
                 throw new IllegalArgumentException(name + " must be positive");
+            }
+            if (value > hardMaximum) {
+                throw new IllegalArgumentException(name + " exceeds the code hard maximum");
             }
             return value;
         }

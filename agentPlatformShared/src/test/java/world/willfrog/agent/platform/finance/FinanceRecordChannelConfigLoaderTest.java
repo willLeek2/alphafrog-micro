@@ -247,4 +247,28 @@ class FinanceRecordChannelConfigLoaderTest {
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("targetEnvironment.environmentId");
     }
+
+    @Test
+    void frozenSnapshotCannotExpandCodeHardLimits() {
+        FinanceRecordChannelConfigLoader loader = new FinanceRecordChannelConfigLoader(
+                objectMapper, new FinanceRecordChannelProperties());
+        String oversized = """
+                {
+                  "effectiveFinanceRecordConfig": {
+                    "enabled": true,
+                    "recordCountMax": 128,
+                    "recordMaxBytes": 16384,
+                    "recordChannelMaxBytes": 262144,
+                    "stdoutMaxBytes": 4194305,
+                    "stderrMaxBytes": 262144,
+                    "targetEnvironmentId": ""
+                  }
+                }
+                """;
+
+        assertThatThrownBy(() -> loader.parseFrozenSnapshot(oversized))
+                .isInstanceOf(FinanceRecordProcessingException.class)
+                .extracting("code")
+                .isEqualTo("FINANCE_RECORD_CONFIG_SNAPSHOT_INVALID");
+    }
 }
