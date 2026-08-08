@@ -3,13 +3,11 @@
 
 Public surface (frozen for 1.x, apiCompatRange >=1.0.0,<2.0.0; see the package
 API inventory): ``cagr``, ``annualized_volatility``, ``sharpe``,
-``FinanceMetricResult``, plus check helpers. ``report``/``report_custom`` will
-be re-exported here once ``reporting.py`` lands (post CONTRACT_BASE_SHA, since
-the marker record schema and environmentId source are task-0 contract items).
+``FinanceMetricResult``, ``report``, ``report_custom``, plus check helpers.
 
 Import forms that must keep working (Spec §2.3):
     from alphafrog_finance import cagr
-    from alphafrog_finance.reporting import report   # once reporting.py lands
+    from alphafrog_finance.reporting import report
 """
 from .checks import (
     check_cagr,
@@ -21,6 +19,7 @@ from .checks import (
 )
 from .metrics import annualized_volatility, cagr, sharpe
 from .models import FinanceMetricResult
+from .reporting import MARKER, report, report_custom
 
 __version__ = "1.0.0"
 __api_version__ = "1.0"
@@ -30,6 +29,9 @@ __all__ = [
     "annualized_volatility",
     "sharpe",
     "FinanceMetricResult",
+    "report",
+    "report_custom",
+    "MARKER",
     "check_cagr",
     "check_finite",
     "check_sharpe",
