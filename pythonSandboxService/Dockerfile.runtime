@@ -12,10 +12,12 @@
 # Round-2 (R2-1/R2-2) TWO-PHASE build orchestrated by docker_build.sh:
 #   phase 1 (stage runtime-install): install the locked library set, then pip
 #     install the REAL alphafrog_finance distribution from runtime/ -- its
-#     _generated/method_specs.json is a BUILD PRODUCT written host-side by
-#     docker_build.sh (runtime/scripts/generate_method_bindings.py against
-#     work package A's canonical JSON) BEFORE the build; hand-copied method
-#     triples are forbidden (Spec §6). A generator failure aborts the build;
+#     _generated/ method_specs.json + docstrings.py + call_samples.py are
+#     BUILD PRODUCTS written host-side by docker_build.sh
+#     (runtime/scripts/generate_method_bindings.py against work package A's
+#     canonical JSON, with --package-version) BEFORE the build; hand-copied
+#     method triples are forbidden (Spec §6). A generator failure aborts the
+#     build;
 #   BETWEEN the phases docker_build.sh runs, via `docker run` against the
 #     phase-1 image: the smoke gate (scripts/smoke_runtime_image.py under the
 #     SYSTEM python AND the compat venv) and the inventory query
@@ -36,6 +38,13 @@
 # AF_SANDBOX_ALLOW_INCOMPLETE_DEV_BUILD may pass the bare base tag instead
 # (such a build is marked releasable=false and refused by deploy_latest.sh).
 ARG RUNTIME_BASE_IMAGE_REF=REPLACE_WITH_VERIFIED_BASE_IMAGE_REF
+# AF_RUNTIME_INSTALL_IMAGE MUST be declared in GLOBAL scope (before the first
+# FROM): a Dockerfile FROM instruction can only expand ARGs declared before
+# the first FROM -- a stage-scoped declaration expands to EMPTY here and the
+# phase-2 FROM silently breaks (Spec §12 two-phase build). docker_build.sh
+# phase 2 supplies the immutable phase-1 image ID; the placeholder token
+# makes any direct `docker build` fail loudly at the second FROM.
+ARG AF_RUNTIME_INSTALL_IMAGE=REPLACE_WITH_RUNTIME_INSTALL_STAGE_IMAGE_ID
 FROM ${RUNTIME_BASE_IMAGE_REF} AS runtime-install
 
 ARG PIP_INDEX_URL
@@ -75,10 +84,13 @@ RUN set -eux; \
     mkdir -p /sandbox/.sandbox-pip-cache
 
 # The alphafrog_finance distribution source (work package B, byte-exact).
-# runtime/src/alphafrog_finance/_generated/method_specs.json is generated
-# host-side by docker_build.sh BEFORE this build (generate_method_bindings.py
-# against A's canonical method-spec JSON); it is gitignored, never committed,
-# and a generator failure aborts the build before `docker build` ever runs.
+# runtime/src/alphafrog_finance/_generated/{method_specs.json,docstrings.py,
+# call_samples.py} are generated host-side by docker_build.sh BEFORE this
+# build (generate_method_bindings.py against A's canonical method-spec JSON,
+# with --package-version from alphafrog_finance.__version__); they are
+# gitignored, never committed, and a generator failure aborts the build
+# before `docker build` ever runs. The registry swap (Spec §6) makes the
+# installed package resolve ALL method identity from these build products.
 COPY runtime/ /opt/alphafrog/build/runtime/
 
 # REAL pip install of the alphafrog_finance distribution: metadata name
@@ -123,15 +135,18 @@ PY
 # FROM the phase-1 image by IMMUTABLE ID: docker_build.sh supplies it only
 # after the smoke gate and the inventory verification passed against exactly
 # that image. Never a mutable tag -- the two phases must refer to the SAME
-# verified install. Direct `docker build` without docker_build.sh fails
-# loudly at FROM (placeholder token).
-ARG AF_RUNTIME_INSTALL_IMAGE=REPLACE_WITH_RUNTIME_INSTALL_STAGE_IMAGE_ID
+# verified install. The ARG itself is declared in GLOBAL scope above (a FROM
+# can only expand pre-FROM ARGs). Direct `docker build` without
+# docker_build.sh fails loudly at this FROM (placeholder token).
 FROM ${AF_RUNTIME_INSTALL_IMAGE}
 
 # Build attestation inputs, supplied by docker_build.sh (Spec §12).
 #   AF_LOCK_DIGEST              = sha256 of requirements-image.lock
-#   AF_METHOD_SPEC_INDEX_DIGEST = digest of the MethodSpec index (built by the
-#                                 MethodSpec work package; never fabricated)
+#   AF_METHOD_SPEC_INDEX_DIGEST = sha256 COMPUTED by docker_build.sh from the
+#                                 bytes of the canonical index.json it gated
+#                                 on (never taken on trust, never fabricated);
+#                                 re-verified in-image below over the baked
+#                                 index.json bytes
 #   AF_LIBRARY_SET_DIGEST       = librarySetDigest computed on the host by
 #                                 scripts/build_runtime_manifest.py over the
 #                                 VERIFIED ACTUAL in-image inventory (R2-2),
@@ -156,6 +171,19 @@ LABEL com.alphafrog.runtime="true" \
       com.alphafrog.methodSpecIndexDigest="${AF_METHOD_SPEC_INDEX_DIGEST}" \
       com.alphafrog.baseImageDigest="${AF_BASE_IMAGE_DIGEST}"
 
+# Dedicated UNPRIVILEGED sandbox identity (Spec §12): the CONTRACT identity
+# the work package C wrapper drops sandbox child processes to, selected via
+# AF_SANDBOX_CHILD_USER (accepts a username OR a uid:gid pair). FIXED numeric
+# IDs, both NON-zero, so the wrapper can drop privileges deterministically:
+#   user  alphafrog-sandbox  uid 10000
+#   group alphafrog-sandbox  gid 10001
+# The image's default USER deliberately stays root: sandbox session setup
+# needs it, and privilege dropping is the wrapper's job, never the image's.
+RUN set -eux; \
+    groupadd --gid 10001 alphafrog-sandbox; \
+    useradd --uid 10000 --gid 10001 --home-dir /sandbox --no-create-home \
+        --shell /usr/sbin/nologin alphafrog-sandbox
+
 # Bake the inventory-VERIFIED library-set.json (Spec §12 + R2-2): the SAME
 # document docker_build.sh verified against the image's actual executing
 # interpreter and used for the OCI librarySetDigest label and the external
@@ -167,6 +195,19 @@ RUN if [ -z "${AF_LOCK_DIGEST}" ] || [ -z "${AF_METHOD_SPEC_INDEX_DIGEST}" ] || 
       echo "       Build the runtime image via pythonSandboxService/docker_build.sh runtime." >&2; \
       exit 1; \
     fi
+# Bake the A-canonical MethodSpec index.json and RE-HASH it inside the image
+# BEFORE the verified manifest is baked (Spec §12): the baked bytes must
+# digest to EXACTLY AF_METHOD_SPEC_INDEX_DIGEST, which docker_build.sh
+# computed from the same canonical index.json bytes it gated on. A mismatch
+# (tampered or drifted index on the way into the image) fails closed here.
+COPY .runtime-build/index.json /opt/alphafrog/runtime/index.json
+RUN set -eux; \
+    actual_index_digest="sha256:$(sha256sum /opt/alphafrog/runtime/index.json | awk '{print $1}')"; \
+    if [ "${actual_index_digest}" != "${AF_METHOD_SPEC_INDEX_DIGEST}" ]; then \
+      echo "ERROR: baked index.json digest ${actual_index_digest} != AF_METHOD_SPEC_INDEX_DIGEST ${AF_METHOD_SPEC_INDEX_DIGEST} (Spec §12 fail-closed)." >&2; \
+      exit 1; \
+    fi; \
+    echo "index.json digest verified in-image: ${actual_index_digest}"
 COPY .runtime-build/library-set.json /opt/alphafrog/runtime/library-set.json
 RUN echo "--- /opt/alphafrog/runtime/library-set.json ---" && \
     cat /opt/alphafrog/runtime/library-set.json

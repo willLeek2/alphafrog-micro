@@ -1,7 +1,10 @@
-# Spec §6 / codex f1ed6ea9: method_specs.json here is a BUILD PRODUCT of
+# Spec §6 / codex f1ed6ea9 (+ registry swap, codex 0c147646/97ea103a):
+# everything in this directory except __init__.py is a BUILD PRODUCT of
 # runtime/scripts/generate_method_bindings.py (fed by work package A's
 # canonical generated JSON). It must never be committed — hand-copied method
-# triples are forbidden. This file only keeps the _generated/ directory in
-# git so setuptools package-data (pyproject.toml) has a stable location once
-# the image build runs the generator.
+# identity is forbidden. __init__.py (and this .gitignore) keep the
+# _generated/ package in git so setuptools package-data (pyproject.toml) has a
+# stable location once the image build runs the generator.
 *.json
+*.py
+!__init__.py

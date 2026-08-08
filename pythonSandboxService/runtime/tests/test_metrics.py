@@ -21,6 +21,15 @@ import unittest
 _SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
+_TESTS = os.path.dirname(os.path.abspath(__file__))
+if _TESTS not in sys.path:
+    sys.path.insert(0, _TESTS)
+
+# Registry swap: metric calls resolve identity through the generated bindings,
+# so materialize the build products (real generator) before any metric runs.
+from bindings_build_setup import ensure_generated_bindings  # noqa: E402
+
+ensure_generated_bindings()
 
 from alphafrog_finance import cagr, annualized_volatility, sharpe, FinanceMetricResult
 
@@ -241,10 +250,11 @@ class TestCanonicalParametersEcho(unittest.TestCase):
 
 
 class TestMethodIdentityFactory(unittest.TestCase):
-    """ITEM 4 (codex must-fix 0c147646): method identity flows through a
-    module-private registry/factory (Spec §6); no public kwarg can override
-    the identity a public metric function produces. The definitive linkage is
-    A-canonical generated bindings, still pending (see metrics.py TODO).
+    """ITEM 4 (codex must-fix 0c147646; registry swap, codex 0c147646/97ea103a):
+    method identity flows from the A-canonical GENERATED bindings
+    (``alphafrog_finance.bindings``); no public kwarg can override the identity
+    a public metric function produces, and the interim hard-coded registry is
+    gone (hand-maintained identity is forbidden, Spec §6).
     """
 
     def test_public_functions_reject_identity_kwargs(self):
@@ -257,30 +267,50 @@ class TestMethodIdentityFactory(unittest.TestCase):
         with self.assertRaises(TypeError):
             sharpe([0.01, 0.02], method_version="9.9.9")
 
-    def test_identity_registry_is_private_and_not_exported(self):
+    def test_bindings_seam_is_private_and_not_exported(self):
         import alphafrog_finance
         from alphafrog_finance import metrics as metrics_mod
 
-        self.assertTrue(hasattr(metrics_mod, "_METHOD_IDENTITY_REGISTRY"))
+        # The interim hard-coded identity registry has been removed.
+        self.assertFalse(hasattr(metrics_mod, "_METHOD_IDENTITY_REGISTRY"))
         self.assertTrue(callable(metrics_mod._method_id_for))
         self.assertTrue(callable(metrics_mod._metric_result))
-        for name in ("_METHOD_IDENTITY_REGISTRY", "_method_id_for", "_metric_result"):
+        # No identity seam is part of the public package surface: nothing
+        # identity-related appears in __all__, and no identity callable is an
+        # attribute of the top-level package.
+        for name in (
+            "bindings",
+            "_method_id_for",
+            "_metric_result",
+            "MethodBinding",
+            "get_binding",
+            "list_bindings",
+            "method_id_for_function",
+        ):
             self.assertNotIn(name, alphafrog_finance.__all__)
+        for name in (
+            "_method_id_for",
+            "_metric_result",
+            "MethodBinding",
+            "get_binding",
+            "list_bindings",
+            "method_id_for_function",
+        ):
             self.assertFalse(hasattr(alphafrog_finance, name))
 
-    def test_public_functions_produce_registry_method_ids(self):
-        from alphafrog_finance.metrics import _METHOD_IDENTITY_REGISTRY
-
+    def test_public_functions_produce_frozen_method_ids(self):
+        # Spec §6 frozen identities, pinned VERBATIM (version 1.0.0).
         self.assertEqual(
             cagr(beginning_value=100.0, ending_value=160.0, periods=4).method_id,
-            _METHOD_IDENTITY_REGISTRY["cagr"],
+            "finance.growth.cagr",
         )
         self.assertEqual(
             annualized_volatility([0.01, 0.02], periods_per_year=12).method_id,
-            _METHOD_IDENTITY_REGISTRY["annualized_volatility"],
+            "finance.risk.annualized_volatility",
         )
         self.assertEqual(
-            sharpe([0.01, 0.02]).method_id, _METHOD_IDENTITY_REGISTRY["sharpe"]
+            sharpe([0.01, 0.02]).method_id,
+            "finance.risk.sharpe_ratio",
         )
 
     def test_result_model_exposes_no_caller_fillable_triple(self):

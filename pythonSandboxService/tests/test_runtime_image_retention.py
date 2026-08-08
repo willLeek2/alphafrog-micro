@@ -68,6 +68,7 @@ subprocess.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -124,11 +125,20 @@ FAKE_BUILD_IMAGE_ID = "sha256:" + "de" * 32
 OTHER_IMAGE_ID = "sha256:" + "d3" * 32
 
 # Work package A canonical generated-resources fixture shipped with the
-# work-package-B runtime suite (resolver-catalog.json + the three frozen
-# method specs): the build-wiring tests point METHOD_SPEC_CANONICAL_DIR here.
+# work-package-B runtime suite: the FIVE canonical files (index.json +
+# resolver-catalog.json + the three frozen method specs). The build-wiring
+# tests point METHOD_SPEC_CANONICAL_DIR here.
 CANONICAL_FIXTURES_DIR = (
-    SANDBOX_SERVICE_ROOT / "runtime" / "tests" / "fixtures" / "a-canonical-method-specs"
+    SANDBOX_SERVICE_ROOT / "runtime" / "tests" / "fixtures" / "a-generated-resources-v1"
 )
+
+
+def canonical_index_digest() -> str:
+    """The sha256 computed from the canonical index.json BYTES — exactly the
+    value docker_build.sh computes host-side (Spec §12; never taken on
+    trust)."""
+    payload = (CANONICAL_FIXTURES_DIR / "index.json").read_bytes()
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
 
 # Default fabricated ACTUAL image inventory served by the fake `docker run`
 # inventory query (round-2 R2-2): the four lock pins VERBATIM + the real
@@ -1385,6 +1395,9 @@ class DockerBuildReleaseGateTest(RuntimeImageRetentionTestBase):
     digests (anchored lowercase-only), and mark dev-switch builds
     releasable=false in the external mapping."""
 
+    # Deliberately NOT the digest of the canonical index.json bytes: since
+    # the digest is now COMPUTED host-side, this value serves only as a
+    # well-formed-but-disagreeing cross-check vector.
     METHOD_DIGEST = "sha256:" + "11" * 32
     BASE_DIGEST = "sha256:" + "22" * 32
 
@@ -1448,8 +1461,12 @@ class DockerBuildReleaseGateTest(RuntimeImageRetentionTestBase):
             f"stdout={result.stdout}\nstderr={result.stderr}",
         )
         # Diagnostics name the failed inputs (no secrets involved).
-        for name in ("BASE_IMAGE_DIGEST", "METHOD_SPEC_INDEX_DIGEST", "SBOM_DIGEST"):
+        # methodSpecIndexDigest is NOT among them: it is COMPUTED from the
+        # canonical index.json bytes once the five-file gate passes, so it
+        # can never be missing or a placeholder (Spec §12).
+        for name in ("BASE_IMAGE_DIGEST", "SBOM_DIGEST"):
             self.assertIn(name, result.stderr)
+        self.assertNotIn("METHOD_SPEC_INDEX_DIGEST", result.stderr)
         self.assertIn("AF_SANDBOX_ALLOW_INCOMPLETE_DEV_BUILD", result.stderr)
         # Fail-closed BEFORE any docker build invocation.
         self.assertEqual(self.calls_for("build"), [])
@@ -1461,7 +1478,7 @@ class DockerBuildReleaseGateTest(RuntimeImageRetentionTestBase):
                 continue  # empty == missing -> placeholder path, covered above
             env = self.build_env(
                 BASE_IMAGE_DIGEST=value,
-                METHOD_SPEC_INDEX_DIGEST=self.METHOD_DIGEST,
+                METHOD_SPEC_INDEX_DIGEST=canonical_index_digest(),
                 AF_SANDBOX_ALLOW_INCOMPLETE_DEV_BUILD="true",
             )
             self.write_fake_syft(0)
@@ -1488,7 +1505,13 @@ class DockerBuildReleaseGateTest(RuntimeImageRetentionTestBase):
         self.assertFalse(entry["releasable"])
         self.assertEqual(
             entry["incompleteInputs"],
-            ["BASE_IMAGE_DIGEST", "METHOD_SPEC_INDEX_DIGEST", "SBOM_DIGEST"],
+            ["BASE_IMAGE_DIGEST", "SBOM_DIGEST"],
+        )
+        # methodSpecIndexDigest is computed from the canonical index.json
+        # bytes and carried into the phase-2 build args.
+        self.assertEqual(
+            entry["methodSpecIndexDigest"],
+            canonical_index_digest(),
         )
         self.assertIn("NOT RELEASABLE", result.stdout)
 
@@ -1496,7 +1519,7 @@ class DockerBuildReleaseGateTest(RuntimeImageRetentionTestBase):
         self.write_fake_syft(0)
         env = self.build_env(
             BASE_IMAGE_DIGEST=self.BASE_DIGEST,
-            METHOD_SPEC_INDEX_DIGEST=self.METHOD_DIGEST,
+            METHOD_SPEC_INDEX_DIGEST=canonical_index_digest(),
         )
         result = self.run_build(env)
         self.assertEqual(
@@ -1513,7 +1536,7 @@ class DockerBuildReleaseGateTest(RuntimeImageRetentionTestBase):
         self.write_fake_syft(1)
         env = self.build_env(
             BASE_IMAGE_DIGEST=self.BASE_DIGEST,
-            METHOD_SPEC_INDEX_DIGEST=self.METHOD_DIGEST,
+            METHOD_SPEC_INDEX_DIGEST=canonical_index_digest(),
         )
         result = self.run_build(env)
         self.assertEqual(
@@ -1532,7 +1555,7 @@ class DockerBuildReleaseGateTest(RuntimeImageRetentionTestBase):
         self.write_fake_syft(1)
         env = self.build_env(
             BASE_IMAGE_DIGEST=self.BASE_DIGEST,
-            METHOD_SPEC_INDEX_DIGEST=self.METHOD_DIGEST,
+            METHOD_SPEC_INDEX_DIGEST=canonical_index_digest(),
             AF_SANDBOX_ALLOW_INCOMPLETE_DEV_BUILD="1",
         )
         result = self.run_build(env)
@@ -1569,7 +1592,12 @@ class DockerBuildReleaseGateTest(RuntimeImageRetentionTestBase):
     def test_build_fails_closed_when_a_canonical_file_is_missing(self) -> None:
         canonical = Path(self._tmp.name) / "canonical-incomplete"
         canonical.mkdir()
-        for name in ("resolver-catalog.json", "cagr.json", "annualized_volatility.json"):
+        for name in (
+            "index.json",
+            "resolver-catalog.json",
+            "cagr.json",
+            "annualized_volatility.json",
+        ):
             shutil.copy(CANONICAL_FIXTURES_DIR / name, canonical / name)
         # sharpe_ratio.json deliberately missing.
         env = self.build_env(
@@ -1590,6 +1618,7 @@ class DockerBuildReleaseGateTest(RuntimeImageRetentionTestBase):
         canonical = Path(self._tmp.name) / "canonical-broken"
         canonical.mkdir()
         for name in (
+            "index.json",
             "resolver-catalog.json",
             "cagr.json",
             "annualized_volatility.json",
@@ -1738,6 +1767,21 @@ class DockerBuildReleaseGateTest(RuntimeImageRetentionTestBase):
         self.assertTrue(
             any(token.startswith("AF_LIBRARY_SET_DIGEST=sha256:") for token in build_calls[1]),
             f"phase 2 missing the verified librarySetDigest label arg: {build_calls[1]}",
+        )
+        # The phase-2 index digest build arg is COMPUTED from the canonical
+        # index.json bytes, and the SAME bytes are staged into
+        # .runtime-build/index.json for the in-image re-hash gate
+        # (Dockerfile COPY .runtime-build/index.json).
+        expected_index_digest = canonical_index_digest()
+        self.assertIn(
+            f"AF_METHOD_SPEC_INDEX_DIGEST={expected_index_digest}",
+            build_calls[1],
+            f"phase 2 must carry the computed index digest: {build_calls[1]}",
+        )
+        self.assertEqual(
+            (RUNTIME_BUILD_DIR / "index.json").read_bytes(),
+            (CANONICAL_FIXTURES_DIR / "index.json").read_bytes(),
+            "the staged index.json must be the SAME bytes the digest was computed from",
         )
 
         run_calls = self.calls_for("run")

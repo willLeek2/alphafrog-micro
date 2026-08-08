@@ -22,6 +22,15 @@ import unittest
 _SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
+_TESTS = os.path.dirname(os.path.abspath(__file__))
+if _TESTS not in sys.path:
+    sys.path.insert(0, _TESTS)
+
+# Registry swap: metric calls resolve identity through the generated bindings,
+# so materialize the build products (real generator) before any metric runs.
+from bindings_build_setup import ensure_generated_bindings  # noqa: E402
+
+ensure_generated_bindings()
 
 from alphafrog_finance import (
     FinanceMetricResult,

@@ -6,13 +6,18 @@
 #   1. lockDigest = sha256 of requirements-image.lock (the four runtime
 #      packages moved verbatim out of the old Dockerfile inline literal);
 #   2. canonical method-spec inputs gate: work package A's canonical
-#      generated JSON (resolver-catalog.json + the three method specs) must
-#      exist at METHOD_SPEC_CANONICAL_DIR -- a hard build material, missing
-#      inputs fail CLOSED with no dev-switch escape; then
+#      generated JSON (index.json + resolver-catalog.json + the three method
+#      specs -- FIVE files) must exist at METHOD_SPEC_CANONICAL_DIR -- a hard
+#      build material, missing inputs fail CLOSED with no dev-switch escape;
+#      methodSpecIndexDigest is COMPUTED here from the canonical index.json
+#      BYTES (never taken on trust); an optionally supplied
+#      METHOD_SPEC_INDEX_DIGEST env value is a cross-check only and must
+#      equal the computed digest or the build fails closed; then
 #      runtime/scripts/generate_method_bindings.py runs BEFORE the build and
-#      writes runtime/src/alphafrog_finance/_generated/method_specs.json
-#      (hand-copied method triples are forbidden, Spec §6); a generator
-#      failure aborts the build;
+#      writes runtime/src/alphafrog_finance/_generated/{method_specs.json,
+#      docstrings.py,call_samples.py} with --package-version extracted from
+#      alphafrog_finance.__version__ (hand-copied method triples are
+#      forbidden, Spec §6); a generator failure aborts the build;
 #   3. PHASE 1 `docker build --target runtime-install --iidfile`: installs
 #      the locked library set, then pip-installs the REAL alphafrog_finance
 #      distribution from runtime/ (with the generated bindings);
@@ -30,7 +35,9 @@
 #      library-set.json from the VERIFIED ACTUAL inventory and yields
 #      librarySetDigest;
 #   7. PHASE 2 `docker build --iidfile` FROM the phase-1 image ID bakes the
-#      verified library-set.json and sets the OCI labels (labels are static
+#      canonical index.json (re-hashed INSIDE the image against the
+#      host-computed methodSpecIndexDigest -- mismatch fails closed) plus the
+#      verified library-set.json, and sets the OCI labels (labels are static
 #      metadata, so librarySetDigest can only be set after verification);
 #   8. AFTER the final image ID is known, a second invocation writes the
 #      external imageDigest -> digests mapping OUTSIDE the image (never
@@ -44,24 +51,31 @@
 # RELEASE GATE (Spec §12 hardening, fail-closed):
 #   The runtime build DEFAULT-FAILS when any release input is missing or a
 #   REPLACE_WITH_... placeholder: BASE_IMAGE_DIGEST (verified base-image
-#   digest pinned by frog), METHOD_SPEC_INDEX_DIGEST (sha256:<64hex> digest
-#   of the MethodSpec index) or the SBOM input (syft available). The ONLY
+#   digest pinned by frog) or the SBOM input (syft available). The ONLY
 #   escape hatch is the explicit, independent dev switch
 #   AF_SANDBOX_ALLOW_INCOMPLETE_DEV_BUILD=true/1 (never implicit): it lets a
 #   structural dev build proceed, but the external digest mapping is then
 #   marked releasable=false and deploy_latest.sh refuses to deploy it unless
 #   the same explicit switch is set there too.
+#   methodSpecIndexDigest is NOT a release input: it is computed from the
+#   canonical index.json bytes (a HARD build material below), so it can never
+#   be missing once the canonical gate passes.
 #
 # Runtime target inputs (never invented here):
 #   BASE_IMAGE_DIGEST        verified base-image digest, sha256:<64 lowercase
 #                            hex>, pinned by frog; defaults to the explicit
 #                            REPLACE_WITH_... placeholder token, which fails
 #                            the release gate until frog pins the real value.
-#   METHOD_SPEC_INDEX_DIGEST sha256:<64hex> digest of the MethodSpec index.
+#   METHOD_SPEC_INDEX_DIGEST OPTIONAL cross-check only: when set (non-empty,
+#                            not a REPLACE_WITH_... placeholder) it must be
+#                            EXACTLY the sha256 computed from the canonical
+#                            index.json bytes or the build fails closed. When
+#                            unset, the computed digest is used directly.
 #   METHOD_SPEC_CANONICAL_DIR
 #                            directory holding work package A's canonical
-#                            generated method-spec JSON (resolver-catalog.json
-#                            + one spec file per frozen method). Defaults to
+#                            generated method-spec JSON: FIVE files --
+#                            index.json, resolver-catalog.json and one spec
+#                            file per frozen method. Defaults to
 #                            agentToolsShared/target/generated-resources/
 #                            finance/method-specs/v1 (A's build output).
 #                            Missing inputs fail CLOSED: this is a hard build
@@ -94,10 +108,15 @@ Runtime target (Spec §12) environment inputs:
                              hex>, pinned by frog (defaults to the
                              REPLACE_WITH_... placeholder; the release gate
                              fails until frog pins the verified value)
-  METHOD_SPEC_INDEX_DIGEST   sha256:<64hex> digest of the MethodSpec index
+  METHOD_SPEC_INDEX_DIGEST   OPTIONAL cross-check: when set, must equal the
+                             sha256 computed from the canonical index.json
+                             bytes or the build fails closed (unset => the
+                             computed digest is used directly)
   METHOD_SPEC_CANONICAL_DIR  work package A's canonical generated method-spec
                              JSON directory (default: agentToolsShared/target/
-                             generated-resources/finance/method-specs/v1).
+                             generated-resources/finance/method-specs/v1);
+                             FIVE files required: index.json,
+                             resolver-catalog.json + the three method specs.
                              Missing inputs fail CLOSED (hard build material;
                              the dev switch does not admit it)
 
@@ -108,10 +127,12 @@ which allows a structural dev build but marks it releasable=false
 (deploy_latest.sh refuses non-releasable builds unless the same switch is
 set). The switch is never implicit.
 
-Build order: canonical inputs -> bindings generator -> pip install (phase 1)
+Build order: canonical inputs (five-file gate + index digest computed from
+bytes) -> bindings generator (three build products) -> pip install (phase 1)
 -> smoke gate (system python + compat venv) -> actual-inventory query +
-fail-closed compare -> bake library-set.json + labels (phase 2) -> SBOM ->
-external mapping -> final release gate.
+fail-closed compare -> bake index.json (in-image re-hash gate) +
+library-set.json + labels (phase 2) -> SBOM -> external mapping -> final
+release gate.
 
 Runtime artifacts (outside the image):
   .runtime-build/library-set.json      (verified ACTUAL inventory)
@@ -304,17 +325,12 @@ build_runtime_image() {
     require_sha256_value "BASE_IMAGE_DIGEST" "$base_image_digest"
   fi
 
-  # 3) methodSpecIndexDigest: digest of the MethodSpec index (Spec §12 input
-  #    sample). Produced by the MethodSpec build tooling; never invented here.
-  local method_spec_index_digest="${METHOD_SPEC_INDEX_DIGEST:-}"
-  if is_missing_or_placeholder "$method_spec_index_digest"; then
-    incomplete_inputs+=("METHOD_SPEC_INDEX_DIGEST")
-    echo "[pythonSandbox] WARNING: METHOD_SPEC_INDEX_DIGEST is missing or a REPLACE_WITH_... placeholder." >&2
-    echo "[pythonSandbox]   Provide the sha256:<64hex> digest of the MethodSpec index (built by the" >&2
-    echo "[pythonSandbox]   MethodSpec work package); until then the build is NOT releasable." >&2
-  else
-    require_sha256_value "METHOD_SPEC_INDEX_DIGEST" "$method_spec_index_digest"
-  fi
+  # 3) methodSpecIndexDigest: NOT a release input (round FINAL): it is
+  #    COMPUTED from the canonical index.json bytes after the five-file
+  #    canonical gate below (step 4b), so it can never be missing or a
+  #    placeholder once the gate passes. An optionally supplied
+  #    METHOD_SPEC_INDEX_DIGEST env value is a cross-check only and must
+  #    equal the computed digest or the build fails closed there.
 
   # SBOM input: syft availability is known before the build. Without syft the
   # SBOM digest stays a placeholder -> incomplete input (fail-closed gate).
@@ -354,33 +370,84 @@ build_runtime_image() {
   #    distribution cannot install without generated bindings (hand-copied
   #    triples are forbidden, Spec §6). Missing inputs fail CLOSED here; the
   #    dev switch does NOT admit this (it is not a release-time placeholder).
+  #    The gate covers ALL FIVE canonical files: index.json (the authoritative
+  #    manifest), resolver-catalog.json and the three frozen method specs.
   local canonical_dir="${METHOD_SPEC_CANONICAL_DIR:-$REPO_ROOT/agentToolsShared/target/generated-resources/finance/method-specs/v1}"
   local canonical_file
   if [ ! -d "$canonical_dir" ]; then
     echo "[pythonSandbox] ERROR: METHOD_SPEC_CANONICAL_DIR is not a directory: $canonical_dir" >&2
     echo "[pythonSandbox]   The runtime build requires work package A's canonical generated" >&2
-    echo "[pythonSandbox]   method-spec JSON (resolver-catalog.json + the three frozen method" >&2
-    echo "[pythonSandbox]   specs). Build A's generated resources first or point" >&2
+    echo "[pythonSandbox]   method-spec JSON (index.json + resolver-catalog.json + the three" >&2
+    echo "[pythonSandbox]   frozen method specs). Build A's generated resources first or point" >&2
     echo "[pythonSandbox]   METHOD_SPEC_CANONICAL_DIR at them (fail-closed, Spec §12 R2-1)." >&2
     exit 1
   fi
-  for canonical_file in resolver-catalog.json cagr.json annualized_volatility.json sharpe_ratio.json; do
+  for canonical_file in index.json resolver-catalog.json cagr.json annualized_volatility.json sharpe_ratio.json; do
     if [ ! -f "$canonical_dir/$canonical_file" ]; then
       echo "[pythonSandbox] ERROR: canonical method-spec input missing: $canonical_dir/$canonical_file" >&2
-      echo "[pythonSandbox]   All four A-canonical JSON files are required (fail-closed, Spec §12 R2-1)." >&2
+      echo "[pythonSandbox]   All FIVE A-canonical JSON files are required (fail-closed, Spec §12 R2-1)." >&2
       exit 1
     fi
   done
   echo "[pythonSandbox] canonical method specs: $canonical_dir"
 
-  # 5) Build-time bindings generator (R2-1): BEFORE pip-installing the
-  #    distribution, generate runtime/src/alphafrog_finance/_generated/
-  #    method_specs.json from the A-canonical inputs. The generator is
-  #    fail-closed (non-zero exit, no partial output on ANY problem) and its
-  #    failure aborts the build before `docker build` ever runs.
+  # 4b) methodSpecIndexDigest is COMPUTED from the canonical index.json BYTES
+  #     (never taken on trust, never fabricated; the gate above guarantees the
+  #     file). An optionally supplied METHOD_SPEC_INDEX_DIGEST env value is a
+  #     cross-check ONLY: it must equal the computed digest or the build fails
+  #     closed (a disagreement means the caller pinned a different index than
+  #     the one actually being baked -- Spec §12 fail-closed).
+  local method_spec_index_digest
+  method_spec_index_digest="$(file_sha256 "$canonical_dir/index.json")"
+  echo "[pythonSandbox] methodSpecIndexDigest=${method_spec_index_digest} (computed from ${canonical_dir}/index.json)"
+  if ! is_missing_or_placeholder "${METHOD_SPEC_INDEX_DIGEST:-}"; then
+    require_sha256_value "METHOD_SPEC_INDEX_DIGEST" "${METHOD_SPEC_INDEX_DIGEST}"
+    if [ "${METHOD_SPEC_INDEX_DIGEST}" != "$method_spec_index_digest" ]; then
+      echo "[pythonSandbox] ERROR: METHOD_SPEC_INDEX_DIGEST=${METHOD_SPEC_INDEX_DIGEST} does NOT match" >&2
+      echo "[pythonSandbox]   the digest computed from the canonical index.json bytes" >&2
+      echo "[pythonSandbox]   (${method_spec_index_digest}). The build bakes ONLY the canonical" >&2
+      echo "[pythonSandbox]   index it gated on; refusing the mismatch (Spec §12 fail-closed)." >&2
+      exit 1
+    fi
+    echo "[pythonSandbox] METHOD_SPEC_INDEX_DIGEST cross-check OK (matches the computed digest)"
+  fi
+
+  # 5) Build-time bindings generator (R2-1 + registry swap): BEFORE
+  #    pip-installing the distribution, generate ALL THREE build products
+  #    into runtime/src/alphafrog_finance/_generated/ (method_specs.json,
+  #    docstrings.py, call_samples.py) from the A-canonical inputs. The
+  #    installed package resolves ALL method identity from these products
+  #    (Spec §6 registry swap; hand-maintained identity is forbidden).
+  #    --package-version is extracted fail-closed from
+  #    alphafrog_finance.__version__ so the generator can verify every
+  #    libraryBinding apiCompatRange against the actual package version. The
+  #    generator is fail-closed (non-zero exit, no partial output on ANY
+  #    problem) and its failure aborts the build before `docker build` runs.
   local generator_script="$SCRIPT_DIR/runtime/scripts/generate_method_bindings.py"
-  local generated_bindings="$SCRIPT_DIR/runtime/src/alphafrog_finance/_generated/method_specs.json"
-  if ! python3 "$generator_script" --canonical-dir "$canonical_dir" --out "$generated_bindings"; then
+  local generated_dir="$SCRIPT_DIR/runtime/src/alphafrog_finance/_generated"
+  local package_init="$SCRIPT_DIR/runtime/src/alphafrog_finance/__init__.py"
+  local package_version
+  if ! package_version="$(python3 -c '
+import re, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        source = fh.read()
+except OSError:
+    sys.exit(1)
+match = re.search(r"^__version__\s*=\s*\"([^\"]+)\"", source, re.MULTILINE)
+if match is None:
+    sys.exit(1)
+print(match.group(1))
+' "$package_init")" || [ -z "$package_version" ]; then
+    echo "[pythonSandbox] ERROR: cannot extract __version__ from $package_init (fail-closed, Spec §6)." >&2
+    exit 1
+  fi
+  if ! python3 "$generator_script" \
+      --canonical-dir "$canonical_dir" \
+      --out "$generated_dir/method_specs.json" \
+      --docstrings-out "$generated_dir/docstrings.py" \
+      --call-samples-out "$generated_dir/call_samples.py" \
+      --package-version "$package_version"; then
     echo "[pythonSandbox] ERROR: method-bindings generator FAILED (fail-closed, Spec §12 R2-1)." >&2
     echo "[pythonSandbox]   No build product was written; the build aborts before docker build." >&2
     exit 1
@@ -467,8 +534,12 @@ build_runtime_image() {
   echo "[pythonSandbox] librarySetDigest=${library_set_digest} (verified actual inventory)"
 
   # 12) PHASE 2 build: FROM the phase-1 image by immutable ID; bakes the
-  #     verified library-set.json and sets the OCI labels. --iidfile captures
-  #     the FINAL immutable image ID.
+  #     canonical index.json (re-hashed in-image against the computed
+  #     methodSpecIndexDigest) plus the verified library-set.json and sets
+  #     the OCI labels. --iidfile captures the FINAL immutable image ID.
+  #     The Dockerfile COPYs .runtime-build/index.json, so stage the SAME
+  #     bytes the digest was computed from (never a re-serialization).
+  cp "$canonical_dir/index.json" "$out_dir/index.json"
   local iid_file="$out_dir/image-id"
   rm -f "$iid_file"
   run_docker_build \
