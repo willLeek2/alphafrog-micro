@@ -18,9 +18,10 @@ Field rules (contract §4.3, frozen at CONTRACT_BASE_SHA 7c695371):
     (method_id + method_version + spec_digest), all-or-none: any partial
     combination raises ValueError and emits nothing; the triple never changes
     the CUSTOM_* evidence levels (contract §4.3);
-  * all v1 field bounds (non-empty source, entry counts, UTF-8 byte lengths)
-    are enforced BEFORE emit so the library never emits a record that the
-    Java v1 schema check would reject as a whole batch (contract §7, §9);
+  * all v1 field bounds (non-empty source, entry counts, E-schema code-point
+    caps, UTF-8 byte lengths) are enforced BEFORE emit so the library never
+    emits a record that the Java v1 schema check would reject as a whole
+    batch (contract §7, §9);
   * ``sourceResolverToolCallId`` is emitted only when provided (camelCase);
   * ``environmentId`` comes from the read-only task environment file written
     by the single source of truth ``runtime_environment.py`` (work package D);
@@ -33,6 +34,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 from typing import Any, List, Mapping, Optional, Sequence, Tuple
 
 from .checks import check_finite, check_unit
@@ -57,9 +59,11 @@ EVIDENCE_CUSTOM_UNVERIFIED = "CUSTOM_UNVERIFIED"
 # module review: 128 mirrors the frozen batch record cap (recordChannelMaxRecords,
 # contract §13 / python-sandbox config); string lengths are measured in UTF-8
 # bytes because the channel accounts rawPayload bytes (contract §4.2). These
-# guards must be reconciled with work package E's record schema validator
-# (agentPlatformShared .../finance/records/metric-record-v1.schema.json, Spec
-# §9.2) once it is delivered.
+# byte guards are supplemented (never replaced) by the E-schema code-point
+# layer below (codex must-fix b4b48852; agentPlatformShared .../finance/
+# records/metric-record-v1.schema.json, Spec §9.2). Note the byte limits do
+# NOT imply the schema caps for ASCII-heavy values: a 100-code-point ASCII
+# unit is only 100 bytes yet violates the schema maxLength 96.
 _MAX_INPUT_REFS = 128
 _MAX_INPUT_REF_BYTES = 512
 _MAX_FORMULA_DESCRIPTION_BYTES = 4096
@@ -67,6 +71,30 @@ _MAX_PARAMETER_ENTRIES = 128
 _MAX_CHECK_ENTRIES = 128
 _MAX_UNIT_BYTES = 128
 _MAX_ENVIRONMENT_ID_BYTES = 512
+
+# E-schema code-point limits (codex must-fix b4b48852). The Java consumer
+# validates records against E's FROZEN metric-record-v1.schema.json, whose
+# JSON Schema ``maxLength`` counts Unicode CODE POINTS — exactly Python
+# ``len(str)`` — not UTF-8 bytes. Every limit below was verified VERBATIM
+# against the frozen schema field table: unit 96, environmentId 256,
+# sourceResolverToolCallId 160, inputRefs items minLength 1 / maxLength 512,
+# methodId 160, methodVersion 64, specDigest 160 + pattern
+# ^sha256:[0-9A-Za-z._:-]+$. The pre-existing UTF-8 byte checks above remain
+# an ADDITIONAL stricter layer where they exist (contract §4.2 byte
+# accounting); a record must pass BOTH layers before emit. (formulaDescription
+# and the inputRef/unit byte limits already imply their schema code-point caps
+# only insofar as bytes >= code points; where the schema cap is SMALLER than
+# the byte limit — unit 96 < 128, environmentId 256 < 512 — the code-point
+# check below is the deciding guard.)
+_MAX_UNIT_CODE_POINTS = 96
+_MAX_ENVIRONMENT_ID_CODE_POINTS = 256
+_MAX_SOURCE_RESOLVER_CODE_POINTS = 160
+_MAX_INPUT_REF_CODE_POINTS = 512
+_MAX_METHOD_ID_CODE_POINTS = 160
+_MAX_METHOD_VERSION_CODE_POINTS = 64
+_MAX_SPEC_DIGEST_CODE_POINTS = 160
+# Frozen schema pattern for specDigest (verbatim from the schema).
+_SPEC_DIGEST_PATTERN = re.compile(r"^sha256:[0-9A-Za-z._:-]+$")
 
 # The wrapper (work package C) sets AF_RUNTIME_ENVIRONMENT_FILE to the task's
 # read-only environment file before executing user code. The fallback path is
@@ -114,6 +142,11 @@ def _environment_id() -> str:
         raise RuntimeError(
             f"runtime environment file {path!r} lacks a usable environment_id"
         )
+    # Code-point cap first (frozen schema maxLength 256), then the retained
+    # stricter B-gate UTF-8 byte layer.
+    _validate_code_point_length(
+        "environmentId", environment_id, _MAX_ENVIRONMENT_ID_CODE_POINTS
+    )
     _validate_byte_length(
         "environmentId", environment_id, _MAX_ENVIRONMENT_ID_BYTES
     )
@@ -168,9 +201,61 @@ def _validate_byte_length(name: str, value: str, limit: int) -> None:
         )
 
 
+def _validate_code_point_length(name: str, value: str, limit: int) -> None:
+    """Raise ValueError when the code-point length of value exceeds limit.
+
+    E's frozen metric-record-v1.schema.json enforces JSON Schema
+    ``maxLength``, which counts Unicode CODE POINTS — Python ``len(str)`` —
+    not UTF-8 bytes (codex must-fix b4b48852). This layer mirrors the frozen
+    schema field table verbatim; the UTF-8 byte checks remain an additional
+    stricter layer where they exist.
+    """
+    size = len(value)
+    if size > limit:
+        raise ValueError(
+            f"{name} must not exceed {limit} code points, got {size}"
+        )
+
+
+def _validate_method_triple(
+    method_id: Any, method_version: Any, spec_digest: Any
+) -> None:
+    """E-schema field-table validation for a method triple.
+
+    Frozen schema: ``methodId`` minLength 1 / maxLength 160, ``methodVersion``
+    minLength 1 / maxLength 64, ``specDigest`` maxLength 160 and pattern
+    ^sha256:[0-9A-Za-z._:-]+$ (maxLength counts code points). Applied to BOTH
+    the caller-provided custom triple and the generated library binding before
+    emit, so build-artifact drift can never produce a record the Java schema
+    check would reject.
+    """
+    for name, value in (("methodId", method_id), ("methodVersion", method_version)):
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{name} must be a non-empty string, got {value!r}")
+    _validate_code_point_length("methodId", method_id, _MAX_METHOD_ID_CODE_POINTS)
+    _validate_code_point_length(
+        "methodVersion", method_version, _MAX_METHOD_VERSION_CODE_POINTS
+    )
+    if not isinstance(spec_digest, str):
+        raise ValueError(
+            f"specDigest must be a string, got {type(spec_digest).__name__}"
+        )
+    _validate_code_point_length(
+        "specDigest", spec_digest, _MAX_SPEC_DIGEST_CODE_POINTS
+    )
+    # fullmatch: a trailing newline would sneak past ``$`` in a plain match
+    # but must be rejected (the Java pattern does not accept it either).
+    if _SPEC_DIGEST_PATTERN.fullmatch(spec_digest) is None:
+        raise ValueError(
+            "specDigest must match ^sha256:[0-9A-Za-z._:-]+$, got "
+            f"{spec_digest!r}"
+        )
+
+
 def _validated_source(source_resolver_tool_call_id: Optional[str]) -> None:
-    """A provided source association must be a non-empty string: an empty
-    ``sourceResolverToolCallId`` would be schema-invalid (contract §4.3)."""
+    """A provided source association must be a non-empty string (an empty
+    ``sourceResolverToolCallId`` would be schema-invalid, contract §4.3) and
+    must respect the frozen schema maxLength of 160 code points."""
     if source_resolver_tool_call_id is None:
         return
     if not isinstance(source_resolver_tool_call_id, str) or not source_resolver_tool_call_id.strip():
@@ -178,6 +263,11 @@ def _validated_source(source_resolver_tool_call_id: Optional[str]) -> None:
             "source_resolver_tool_call_id must be a non-empty string when "
             f"provided, got {source_resolver_tool_call_id!r}"
         )
+    _validate_code_point_length(
+        "sourceResolverToolCallId",
+        source_resolver_tool_call_id,
+        _MAX_SOURCE_RESOLVER_CODE_POINTS,
+    )
 
 
 def _validated_input_refs(input_refs: Sequence[str]) -> List[str]:
@@ -189,6 +279,14 @@ def _validated_input_refs(input_refs: Sequence[str]) -> List[str]:
     for i, ref in enumerate(refs):
         if not isinstance(ref, str):
             raise ValueError(f"input_refs[{i}] must be a string, got {type(ref).__name__}")
+        if not ref:
+            raise ValueError(
+                f"input_refs[{i}] must be a non-empty string (frozen schema "
+                "minLength 1)"
+            )
+        _validate_code_point_length(
+            f"input_refs[{i}]", ref, _MAX_INPUT_REF_CODE_POINTS
+        )
         _validate_byte_length(f"input_refs[{i}]", ref, _MAX_INPUT_REF_BYTES)
     return refs
 
@@ -204,7 +302,17 @@ def _validated_parameters(parameters: Optional[Mapping[str, Any]]) -> dict:
 
 
 def _validated_checks(checks: Mapping[str, Any]) -> dict:
-    result = {str(k): bool(v) for k, v in dict(checks).items()}
+    # Strict-bool (codex must-fix b4b48852): the previous ``bool(v)``
+    # coercion turned any truthy value — e.g. the string "false" — into True.
+    # Only real booleans are accepted; anything else fails closed before emit.
+    result = {}
+    for k, v in dict(checks).items():
+        if not isinstance(v, bool):
+            raise ValueError(
+                f"checks[{k!r}] must be a real boolean (True/False), got "
+                f"{type(v).__name__}"
+            )
+        result[str(k)] = v
     if len(result) > _MAX_CHECK_ENTRIES:
         raise ValueError(
             f"checks must have at most {_MAX_CHECK_ENTRIES} entries, "
@@ -242,7 +350,10 @@ def report(
         raise ValueError(f"unit must be a non-empty string, got {result.unit!r}")
     # All v1 schema bounds are enforced BEFORE anything is emitted: a single
     # schema-invalid record would make the whole batch unpresentable on the
-    # Java side (contract §7 step 6, §9 failure matrix).
+    # Java side (contract §7 step 6, §9 failure matrix). The code-point cap
+    # mirrors the frozen schema maxLength; the byte limit stays as the
+    # additional stricter B-gate layer.
+    _validate_code_point_length("unit", result.unit, _MAX_UNIT_CODE_POINTS)
     _validate_byte_length("unit", result.unit, _MAX_UNIT_BYTES)
     _validated_source(source_resolver_tool_call_id)
     parameters = _validated_parameters(result.parameters)
@@ -256,6 +367,18 @@ def report(
             f"method {result.method_id!r} is not present in the canonical "
             "method specs; report() never hand-fills the triple"
         )
+    # Build-artifact drift guard (codex must-fix b4b48852): the generated
+    # binding itself must pass the SAME E-schema field-table validator as a
+    # caller-provided triple before anything is emitted.
+    try:
+        _validate_method_triple(
+            result.method_id, spec["methodVersion"], spec["specDigest"]
+        )
+    except ValueError as exc:
+        raise ValueError(
+            f"canonical method spec for {result.method_id!r} violates the "
+            f"v1 schema field table (build-artifact drift): {exc}"
+        ) from None
 
     fields: List[Tuple[str, Any]] = [
         ("schemaVersion", SCHEMA_VERSION),
@@ -326,6 +449,7 @@ def report_custom(
     )
     if not check_unit(output_unit):
         raise ValueError(f"output_unit must be a non-empty string, got {output_unit!r}")
+    _validate_code_point_length("output_unit", output_unit, _MAX_UNIT_CODE_POINTS)
     _validate_byte_length("output_unit", output_unit, _MAX_UNIT_BYTES)
 
     # ALL-OR-NONE method triple (contract §4.3): a partial tuple cannot be
@@ -349,6 +473,10 @@ def report_custom(
                     f"{name} must be a non-empty string when the method "
                     f"triple is provided, got {item!r}"
                 )
+        # The same E-schema field-table validator that guards the generated
+        # library binding (code-point caps + digest pattern) also guards the
+        # caller-provided triple before emit.
+        _validate_method_triple(method_id, method_version, spec_digest)
 
     # Pre-emit v1 schema bounds (contract §7 step 6, §9 failure matrix).
     _validated_source(source_resolver_tool_call_id)
