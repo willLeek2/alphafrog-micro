@@ -5,6 +5,7 @@ import csv
 import io
 import json
 import logging
+import os
 import re
 import shlex
 import tempfile
@@ -23,6 +24,11 @@ from .bounded_exec_wrapper import (
     UNKNOWN_MARKER_AUDIT_FILE_NAME,
 )
 from .capture_reader import CAPTURE_FILE_NAMES
+from .child_identity import (
+    CHILD_USER_ENV_NAME,
+    ChildIdentityError,
+    validate_child_spec_host,
+)
 from .config import SandboxConfig
 from .dataset_manifest import expand_dataset_ids
 from .finance_record_channel import decode_capture_text, read_capture_artifacts
@@ -55,16 +61,26 @@ TEMP_MANIFEST_DIR_PREFIX = "_agent_run_manifest_"
 # per-container concurrency; codex 56d28076 — the global sitecustomize.py
 # write/delete is what is NOT task-local yet, not this package).
 # capture_reader.py is staged because the wrapper IMPORTS it pre-spawn
-# (PIN 1) for the in-memory wrapper-tail readback; it is never executed as a
-# process in-container — after user code exits nothing in the task workspace
-# runs again.
+# (PIN 1) for the in-memory wrapper-tail readback; child_identity.py is
+# staged because the wrapper imports it pre-spawn for the P0-4 privilege
+# drop.  Neither is ever executed as a process in-container — after user
+# code exits nothing in the task workspace runs again.
 WRAPPER_MODULE_FILES = (
     "__init__.py",
     "output_capture.py",
     "bounded_exec_wrapper.py",
     "capture_reader.py",
+    "child_identity.py",
 )
 WRAPPER_DIR_NAME = "bounded-wrapper"
+
+# P0-5 (codex 5777cda8): one-task-per-container security floor.  Any task
+# that went through the bounded wrapper path is ALWAYS recycled, regardless
+# of success/failure/dynamic-install — user code leaves residual state
+# (installed packages, filesystem writes, kernel object caches) that no
+# cleanup step can fully undo, so the container is single-use by policy.
+# Supersedes work package D's conditional recycle.
+RECYCLE_REASON_SECURITY_FLOOR = "one_task_per_container_security_floor"
 WRAPPER_BOOTSTRAP_NAME = "run_wrapper.py"
 WRAPPER_INPUT_FILE_NAME = "wrapper-input.json"
 USER_SCRIPT_FILE_NAME = "user_script.py"
@@ -1151,6 +1167,112 @@ def _resolve_wrapper_interpreter(
     return candidate
 
 
+# === P0-4 (codex 03b4d034 / 087da672): runner-side child identity gate =====
+def _validate_runner_child_identity(child_spec: str | None, euid: int) -> None:
+    """Host-side gate for the wrapper child's identity (P0-4).
+
+    Pure apart from the explicit ``euid`` argument (unit-testable without
+    root).  Returns None; the ORIGINAL spec string travels verbatim into
+    the container (exec export), where it is resolved AUTHORITATIVELY twice
+    against the target's passwd database (chown snippet + wrapper pre-spawn
+    gate).  The host gate validates SYNTAX ONLY — ``validate_child_spec_host``
+    performs no OS lookups, because the service runs in a different
+    uid/username namespace than the target image (codex 087da672): a
+    host-side ``pwd.getpwnam`` would reject identities that exist only in
+    the container.  Raises ``RuntimeError`` — the task must FAIL CLOSED
+    before any staging/workspace preparation — when:
+
+    * the runner is root and ``child_spec`` is UNSET (refuse to run user
+      code as root);
+    * any euid and ``child_spec`` is set but malformed (garbage in = fail;
+      numeric forms with uid OR gid zero included — codex 691341d2).
+
+    Non-root with an UNSET spec keeps the historical same-UID dev behavior;
+    NO security boundary is claimed in dev mode — the isolation guarantee
+    exists only in the container where the wrapper runs as root and drops
+    the child into a non-root identity (uid AND gid both nonzero).
+    """
+    if child_spec is None:
+        if euid == 0:
+            raise RuntimeError(
+                f"{CHILD_USER_ENV_NAME} must be set when the runner is "
+                "root: refusing to run user code as root"
+            )
+        return None
+    try:
+        validate_child_spec_host(child_spec)
+    except ChildIdentityError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+
+# The chown step runs INSIDE the container because the container's passwd
+# database is authoritative for the child identity (host-side uid spaces
+# differ: macOS nobody=4294967294 vs Debian nobody=65534).  The snippet
+# mirrors app.child_identity.parse_child_spec verbatim — that module is not
+# staged yet at chown time (staging happens later); the wrapper re-resolves
+# the SAME spec against the SAME database before the spawn.
+_CHOWN_SNIPPET_TEMPLATE = (
+    "import os, pwd, sys\n"
+    "spec = {spec!r}\n"
+    "def fail(reason):\n"
+    "    sys.stderr.write('child identity chown failed: ' + reason + '\\n')\n"
+    "    sys.exit(1)\n"
+    "if spec != spec.strip() or not spec:\n"
+    "    fail('spec is empty or has surrounding whitespace')\n"
+    "if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in spec):\n"
+    "    fail('spec contains control characters')\n"
+    "if ':' in spec:\n"
+    "    parts = spec.split(':')\n"
+    "    if len(parts) != 2 or not parts[0] or not parts[1]:\n"
+    "        fail('numeric spec must be exactly uid:gid')\n"
+    "    if not all('0' <= c <= '9' for c in parts[0] + parts[1]):\n"
+    "        fail('numeric spec has a non-digit field')\n"
+    "    uid, gid = int(parts[0], 10), int(parts[1], 10)\n"
+    "else:\n"
+    "    try:\n"
+    "        entry = pwd.getpwnam(spec)\n"
+    "    except KeyError:\n"
+    "        fail('username does not exist in this container')\n"
+    "    uid, gid = entry.pw_uid, entry.pw_gid\n"
+    "if uid == 0 or gid == 0:\n"
+    "    fail('child uid and gid must both be nonzero')\n"
+    "for path in {paths!r}:\n"
+    "    os.makedirs(path, exist_ok=True)\n"
+    "    os.chown(path, uid, gid)\n"
+)
+
+
+def _chown_workspace_for_child(
+    session: SandboxSession,
+    config: SandboxConfig,
+    task_id: str,
+    task_workspace: str,
+    child_spec: str,
+) -> None:
+    """P0-4 workspace permissions when a child identity is active.
+
+    Chowns the task workspace root and the child-writable subdirs (tmp,
+    artifacts, metrics) to the child's uid:gid BEFORE the wrapper runs (the
+    wrapper's sitecustomize import would otherwise create them root-owned).
+    STAY ROOT-OWNED: the ``input/`` dataset subtree (read-only inputs,
+    world-readable) and the bounded-wrapper staging dir + capture dir
+    (written later by the root wrapper; the capture dir is created mode
+    0700 so the child cannot enter it at all).
+    """
+    paths = [
+        task_workspace,
+        f"{task_workspace}/tmp",
+        f"{task_workspace}/artifacts",
+        f"{task_workspace}/metrics",
+    ]
+    snippet = _CHOWN_SNIPPET_TEMPLATE.format(spec=child_spec, paths=paths)
+    command = f"python3 -c {shlex.quote(snippet)}"
+    _exec_checked(session, command, f"chown_workspace_for_child task={task_id}")
+
+
+# === end P0-4 ================================================================
+
+
 def _stage_bounded_wrapper(
     session: SandboxSession,
     config: SandboxConfig,
@@ -1207,6 +1329,7 @@ def _wrapper_run_command(
     config: SandboxConfig,
     task_workspace: str,
     interpreter: str,
+    child_spec: str | None = None,
 ) -> str:
     """Build the in-container wrapper invocation.
 
@@ -1215,15 +1338,25 @@ def _wrapper_run_command(
     processes: AF_TASK_* env vars, the workdir sys.path entry (loader
     modules) and the chdir into the task workspace — exact equivalence with
     the legacy ``session.run`` path without rewriting any user code.
+
+    P0-4: when ``child_spec`` is given it is exported verbatim as
+    ``AF_SANDBOX_CHILD_USER`` for the wrapper's identity gate (the wrapper
+    resolves it against the CONTAINER's passwd database before the spawn).
     """
     workdir = config.workdir.rstrip("/")
     wrapper_dir = f"{task_workspace}/{WRAPPER_DIR_NAME}"
     bootstrap = f"{wrapper_dir}/{WRAPPER_BOOTSTRAP_NAME}"
     wrapper_input_path = f"{task_workspace}/{WRAPPER_INPUT_FILE_NAME}"
     pythonpath = f"{workdir}:{wrapper_dir}"
+    export_lines = ""
+    if child_spec is not None:
+        export_lines = (
+            f"export {CHILD_USER_ENV_NAME}={shlex.quote(child_spec)}\n"
+        )
     script = (
         "set -e\n"
         f"cd {shlex.quote(task_workspace)}\n"
+        f"{export_lines}"
         f"PYTHONPATH={shlex.quote(pythonpath)} {shlex.quote(interpreter)} "
         f"{shlex.quote(bootstrap)} {shlex.quote(wrapper_input_path)}\n"
     )
@@ -1307,6 +1440,7 @@ def _run_bounded_wrapper_path(
     install_libraries: List[str],
     timeout_seconds: float,
     limits: Dict[str, Any],
+    child_spec: str | None = None,
 ) -> Tuple[_WrappedScriptResult, Dict[str, Any], Dict[str, int]]:
     """§7.1 steps 1-2/7-8 production path: install -> stage -> wrapper -> readback.
 
@@ -1338,7 +1472,7 @@ def _run_bounded_wrapper_path(
 
     t_exec = time.monotonic()
     output = session.execute_command(
-        _wrapper_run_command(config, task_workspace, interpreter)
+        _wrapper_run_command(config, task_workspace, interpreter, child_spec)
     )
     phase_timings["wrapper_exec_ms"] = int((time.monotonic() - t_exec) * 1000)
     if output.exit_code != 0:
@@ -1394,7 +1528,23 @@ def run_in_open_session(
 
     The caller owns the container lifecycle. This function returns
     container_recycled=True when the caller should destroy and replace it.
+
+    P0-5 (codex 5777cda8): whenever the task went through the bounded
+    wrapper path (``effective_output_limits`` frozen), the container is
+    ALWAYS recycled — ``container_recycled=True`` with
+    ``recycle_reason=RECYCLE_REASON_SECURITY_FLOOR`` — regardless of
+    success, failure or dynamic install (one-task-per-container security
+    floor; supersedes the earlier conditional recycle).
     """
+    # P0-4 (codex 03b4d034 / 087da672): gate the child identity BEFORE any
+    # staging or workspace preparation — a root runner without a usable
+    # identity fails the task closed before anything runs.  The host gate is
+    # syntax-only (no OS lookups); the container resolves the SAME spec
+    # against its OWN passwd database twice (chown snippet + wrapper
+    # pre-spawn gate).  The raw spec travels verbatim via the exec export.
+    child_spec = os.environ.get(CHILD_USER_ENV_NAME)
+    _validate_runner_child_identity(child_spec, os.geteuid())
+
     dataset_id_list = _normalize_dataset_ids(dataset_id, dataset_ids)
     timeout = timeout_seconds or config.execution_timeout_seconds
     requested_libraries = [lib.strip() for lib in (libraries or []) if lib and lib.strip()]
@@ -1429,6 +1579,10 @@ def run_in_open_session(
 
     finance_record_channel: Dict[str, Any] | None = None
     task_workspace = f"{config.workspace_root}/{task_id}"
+    # P0-5: the floor keys off the SELECTED path (frozen limits present), so
+    # a task that fails mid-preparation is recycled exactly like a task that
+    # ran to completion — the bounded path is single-use, period.
+    bounded_path_selected = effective_output_limits is not None
     try:
         t_workspace_start = time.monotonic()
         workspace_created = True
@@ -1442,6 +1596,13 @@ def run_in_open_session(
             path_manifest_csv=path_manifest_csv,
             copy_loader_modules=prepare_loader_modules,
         )
+        if child_spec is not None:
+            # P0-4: hand the child-writable subtree to the child identity
+            # BEFORE the wrapper runs (input datasets and the wrapper
+            # staging dir stay root-owned).
+            _chown_workspace_for_child(
+                session, config, task_id, task_workspace, child_spec
+            )
         timings["workspace_prepare_ms"] = int((time.monotonic() - t_workspace_start) * 1000)
 
         _log_in_container(session, task_id, config, "script_start")
@@ -1464,6 +1625,7 @@ def run_in_open_session(
                     install_libraries,
                     timeout,
                     effective_output_limits,
+                    child_spec,
                 )
             )
             timings.update(wrapper_phase_timings)
@@ -1515,6 +1677,12 @@ def run_in_open_session(
         if not cleanup_ok:
             container_recycled = True
             recycle_reason = "cleanup_failed"
+        if bounded_path_selected:
+            # P0-5 security floor (codex 5777cda8): ALWAYS recycle after a
+            # bounded-path task.  This reason supersedes cleanup_failed —
+            # both demand recycling; the floor names the policy.
+            container_recycled = True
+            recycle_reason = RECYCLE_REASON_SECURITY_FLOOR
         resource_usage = collector.finish(
             container_id=actual_container_id,
             queue_wait_millis=int(timings.get("queue_wait_ms", 0)),

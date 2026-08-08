@@ -45,6 +45,17 @@ The file-name whitelist is the §7.1 fixed capture layout; it is pinned to
 ``app.bounded_exec_wrapper``'s constants by
 ``tests/test_bounded_wrapper_wiring.py`` so the two sides cannot drift.
 
+P0-4 (codex 03b4d034): FD-PINNED readback.  ``read_capture_files_from_fds``
+is the production entry point used by the wrapper: the wrapper pre-opens the
+capture files BEFORE the child is spawned and keeps the fds open; after the
+child exits the readback re-reads EXACTLY those fds (fstat on the fd, cap
+checks BEFORE the first read byte, lseek to 0, size-bounded read) — there is
+ZERO path resolution after spawn, so a malicious child that renames,
+unlinks, replaces or symlinks anything under the capture directory while it
+runs cannot influence the readback at all.  The fds are caller-owned and are
+never closed here.  The path-based ``read_capture_files`` remains as the
+equally fail-closed unit/host surface.
+
 Stdlib only; the module itself writes nothing anywhere — the WRAPPER emits
 the envelope (exactly one JSON document on its stdout, zero other bytes)
 and, on failure, a SHORT diagnostic (type/message only, never artifact
@@ -175,6 +186,71 @@ def _open_regular_file(capture_path: Path, name: str):
     return fd, info.st_size
 
 
+def _finalize_capture_envelope(
+    contents: dict,
+    *,
+    stdout_max_bytes: int,
+    stderr_max_bytes: int,
+    record_channel_max_bytes: int,
+    record_channel_max_records: int,
+) -> dict:
+    """Shared fail-closed tail used by BOTH readback entry points.
+
+    Runs AFTER the size-bounded reads only (every entry point has already
+    bounded each file against its cap, and the joint pair against the joint
+    budget, BEFORE the first read byte).  Re-validates the joint budget on
+    the real content lengths, bounds the record line count, base64-encodes,
+    and re-checks the serialized envelope against the ceiling — belt and
+    braces on top of the pre-read projections.  Raises ``ValueError`` on any
+    violation; messages carry names/sizes/caps only, never content (§18).
+    """
+    ceiling = _envelope_ceiling(
+        stdout_max_bytes, stderr_max_bytes, record_channel_max_bytes
+    )
+    joint_size = sum(
+        len(contents[name])
+        for name in _RECORD_CHANNEL_FILE_NAMES
+        if name in contents
+    )
+    if joint_size > record_channel_max_bytes:
+        raise ValueError(
+            f"record channel files are {joint_size} bytes jointly, "
+            f"over record_channel_max_bytes {record_channel_max_bytes}"
+        )
+    records_content = contents.get("finance-records.jsonl")
+    if records_content is not None:
+        line_count = records_content.count(b"\n")
+        if records_content and not records_content.endswith(b"\n"):
+            line_count += 1  # trailing non-newline-terminated fragment
+        if line_count > record_channel_max_records:
+            raise ValueError(
+                "capture file finance-records.jsonl holds "
+                f"{line_count} line(s), over "
+                f"record_channel_max_records {record_channel_max_records}"
+            )
+    projected = _ENVELOPE_OVERHEAD + sum(
+        _base64_length(len(content)) for content in contents.values()
+    )
+    if projected > ceiling:
+        raise ValueError(
+            f"capture envelope is {projected} bytes, over ceiling {ceiling}"
+        )
+    document = {
+        "files": {
+            name: base64.b64encode(contents[name]).decode("ascii")
+            for name in CAPTURE_FILE_NAMES
+            if name in contents
+        }
+    }
+    serialized_length = len(json.dumps(document))
+    if serialized_length > ceiling:
+        raise ValueError(
+            f"capture envelope is {serialized_length} bytes, over "
+            f"ceiling {ceiling}"
+        )
+    return document
+
+
 def read_capture_files(
     capture_dir,
     *,
@@ -281,39 +357,154 @@ def read_capture_files(
                 # separate stat — the fd IS the validation).
                 contents[name] = handle.read(size)
 
-        # --- records count bound (after the size-bounded read) ------------
-        records_content = contents.get("finance-records.jsonl")
-        if records_content is not None:
-            line_count = records_content.count(b"\n")
-            if records_content and not records_content.endswith(b"\n"):
-                line_count += 1  # trailing non-newline-terminated fragment
-            if line_count > record_channel_max_records:
-                raise ValueError(
-                    "capture file finance-records.jsonl holds "
-                    f"{line_count} line(s), over "
-                    f"record_channel_max_records {record_channel_max_records}"
-                )
-
-        document = {
-            "files": {
-                name: base64.b64encode(contents[name]).decode("ascii")
-                for name in CAPTURE_FILE_NAMES
-                if name in contents
-            }
-        }
-        # Belt and braces: the REAL serialized document must also fit the
-        # ceiling (the projected check above already guarantees it for
-        # well-behaved files; this catches any accounting drift).
-        serialized_length = len(json.dumps(document))
-        if serialized_length > ceiling:
-            raise ValueError(
-                f"capture envelope is {serialized_length} bytes, over "
-                f"ceiling {ceiling}"
-            )
-        return document
+        return _finalize_capture_envelope(
+            contents,
+            stdout_max_bytes=stdout_max_bytes,
+            stderr_max_bytes=stderr_max_bytes,
+            record_channel_max_bytes=record_channel_max_bytes,
+            record_channel_max_records=record_channel_max_records,
+        )
     finally:
         for fd, _ in opened.values():
             try:
                 os.close(fd)
             except OSError:
                 pass
+
+
+def _bounded_fd_read(fd: int, size: int) -> bytes:
+    """Read AT MOST ``size`` bytes from ``fd`` (already seeked to 0).
+
+    Never reads past the validated size, so a racing writer can never grow
+    the readback past a cap; returns fewer bytes only when the file hits EOF
+    early.
+    """
+    chunks = []
+    remaining = size
+    while remaining > 0:
+        chunk = os.read(fd, min(remaining, 1 << 20))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def read_capture_files_from_fds(
+    fds,
+    *,
+    stdout_max_bytes,
+    stderr_max_bytes,
+    record_channel_max_bytes,
+    record_channel_max_records,
+) -> dict:
+    """FD-pinned readback: ``{"files": {name: base64}}`` over PRE-OPENED fds.
+
+    ``fds`` maps capture file name -> already-open fd (int).  P0-4 (codex
+    03b4d034): the wrapper pre-opens the capture files before the child is
+    spawned and passes the still-open fds here after the child exits, so the
+    readback performs ZERO path resolution — rename/unlink/replace/symlink
+    attacks on the capture directory are structurally impossible to notice
+    because the paths are never consulted again.
+
+    Same fail-closed discipline as ``read_capture_files``: every held fd is
+    fstat-checked to be a regular file, bounded against its cap and the joint
+    record-channel budget BEFORE the first read byte, then seeked to 0 and
+    read through exactly that fd for at most the validated size; the envelope
+    ceiling is projected from the fstat sizes, then re-checked on the real
+    document.  The fds are CALLER-OWNED: this function never closes them
+    (closing here could let an error path double-close a fd the caller has
+    already reassigned).  Presence in the envelope means exactly "the caller
+    held that fd".
+
+    Unexpectedly invalid input (unknown name, non-int fd, dead fd, non-
+    regular file, unseekable fd) fails closed with ``ValueError``; messages
+    carry names/sizes/caps only, never artifact content (§18).
+    """
+    stdout_max_bytes = _validate_limit("stdout_max_bytes", stdout_max_bytes)
+    stderr_max_bytes = _validate_limit("stderr_max_bytes", stderr_max_bytes)
+    record_channel_max_bytes = _validate_limit(
+        "record_channel_max_bytes", record_channel_max_bytes
+    )
+    record_channel_max_records = _validate_limit(
+        "record_channel_max_records", record_channel_max_records
+    )
+    if not isinstance(fds, dict):
+        raise ValueError("fd map must be a dict of capture name -> fd")
+
+    caps = {
+        "capture-result.json": CAPTURE_SUMMARY_MAX_BYTES,
+        "stdout.bin": stdout_max_bytes,
+        "stderr.bin": stderr_max_bytes,
+    }
+    sizes: dict = {}
+    for name, fd in fds.items():
+        if name not in CAPTURE_FILE_NAMES:
+            # §18: an unknown name is untrusted input — never echo it.
+            raise ValueError("fd map holds an unknown capture file name")
+        if isinstance(fd, bool) or not isinstance(fd, int):
+            raise ValueError(
+                f"capture file {name} fd is not an integer file descriptor"
+            )
+        try:
+            info = os.fstat(fd)
+        except OSError as exc:
+            raise ValueError(
+                f"capture file {name} fd is not stat-able"
+            ) from exc
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(
+                f"capture file {name} fd is not a regular file"
+            )
+        sizes[name] = info.st_size
+
+    # --- cap checks on the fstat sizes, BEFORE any content is read --------
+    for name, cap in caps.items():
+        if name in sizes and sizes[name] > cap:
+            raise ValueError(
+                f"capture file {name} is {sizes[name]} bytes, "
+                f"over cap {cap}"
+            )
+    joint_size = sum(
+        sizes[name] for name in _RECORD_CHANNEL_FILE_NAMES if name in sizes
+    )
+    if joint_size > record_channel_max_bytes:
+        raise ValueError(
+            f"record channel files are {joint_size} bytes jointly, "
+            f"over record_channel_max_bytes {record_channel_max_bytes}"
+        )
+
+    # --- envelope bound projected from the fstat sizes (pre-read) ---------
+    ceiling = _envelope_ceiling(
+        stdout_max_bytes, stderr_max_bytes, record_channel_max_bytes
+    )
+    projected = _ENVELOPE_OVERHEAD + sum(
+        _base64_length(size) for size in sizes.values()
+    )
+    if projected > ceiling:
+        raise ValueError(
+            f"projected capture envelope is {projected} bytes, over "
+            f"ceiling {ceiling}"
+        )
+
+    # --- size-bounded reads through the ALREADY-VALIDATED fds -------------
+    contents: dict = {}
+    for name in CAPTURE_FILE_NAMES:
+        if name not in fds:
+            continue
+        fd = fds[name]
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+        except OSError as exc:
+            raise ValueError(
+                f"capture file {name} fd is not seekable"
+            ) from exc
+        contents[name] = _bounded_fd_read(fd, sizes[name])
+
+    return _finalize_capture_envelope(
+        contents,
+        stdout_max_bytes=stdout_max_bytes,
+        stderr_max_bytes=stderr_max_bytes,
+        record_channel_max_bytes=record_channel_max_bytes,
+        record_channel_max_records=record_channel_max_records,
+    )

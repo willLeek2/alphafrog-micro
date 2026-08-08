@@ -36,6 +36,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -44,6 +45,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 # Host-runnable llm_sandbox stub (tests never touch Docker here).
 llm_sandbox = types.ModuleType("llm_sandbox")
@@ -571,9 +573,191 @@ class CaptureReaderModuleTest(unittest.TestCase):
         # pins the import to module-load time (no lazy post-exit import).
         import app.bounded_exec_wrapper as wrapper_module
         import app.capture_reader as reader_module
+        import app.child_identity as child_identity_module
 
         self.assertIs(wrapper_module.capture_reader, reader_module)
         self.assertTrue(callable(wrapper_module.capture_reader.read_capture_files))
+        # The production fd-pinned entry point AND the child-identity parser
+        # (P0-4) are top-level bindings too — held as function objects from
+        # module-load time, never re-imported after the child exits.
+        self.assertTrue(
+            callable(wrapper_module.capture_reader.read_capture_files_from_fds)
+        )
+        self.assertIs(
+            wrapper_module.parse_child_spec, child_identity_module.parse_child_spec
+        )
+
+
+# --- spawn-time wiring facts (b3b28d1f item 2) ----------------------------
+# The capture files are pre-opened BEFORE the spawn (fd-pinned readback) and
+# must stay root-only: dir 0700 / files 0600.  The child may inherit ONLY
+# the capture pipes (stdin/stdout/stderr) — never the capture file fds
+# (no pass_fds leak).
+
+
+class CaptureSpawnWiringTest(unittest.TestCase):
+    """Capture permission modes + child fd inheritance wiring."""
+
+    def setUp(self):
+        import app.bounded_exec_wrapper as wrapper_module
+
+        self.wrapper = wrapper_module
+        self._tmp = tempfile.TemporaryDirectory(prefix="af-spawn-wiring-")
+        self.task_dir = Path(self._tmp.name)
+        self.script = self.task_dir / "user_code.py"
+        self.script.write_text("print('wiring-probe')\n", encoding="utf-8")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _limits(self):
+        return {key: _LIMITS[key] for key in _LIMIT_KEYS}
+
+    def test_capture_dir_is_0700_and_files_are_0600(self):
+        capture_dir = self.task_dir / "capture"
+        _summary, capture_files, sweep_ok = self.wrapper.run_bounded_capture(
+            script_path=str(self.script),
+            timeout_seconds=30,
+            limits=self._limits(),
+            capture_dir=capture_dir,
+            child_identity=None,
+        )
+        try:
+            self.assertTrue(sweep_ok)
+            self.assertEqual(
+                stat.S_IMODE(capture_dir.stat().st_mode),
+                0o700,
+                "capture dir must be owner-only so the child cannot enter",
+            )
+            for name, handle in capture_files.items():
+                mode = stat.S_IMODE(os.fstat(handle.fileno()).st_mode)
+                self.assertEqual(mode, 0o600, f"{name} must be 0600")
+        finally:
+            for handle in capture_files.values():
+                handle.close()
+
+    def test_child_inherits_only_capture_pipes_no_pass_fds(self):
+        captured_kwargs = {}
+        real_popen = subprocess.Popen
+
+        class RecordingPopen:
+            def __init__(self, *args, **kwargs):
+                # Record ONLY the user-child spawn — it is the only Popen
+                # that carries preexec_fn (the sweep's lsof utility helper
+                # also calls Popen and must not overwrite the evidence).
+                if "preexec_fn" in kwargs:
+                    captured_kwargs.update(kwargs)
+                self._proc = real_popen(*args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(self._proc, name)
+
+        capture_dir = self.task_dir / "capture"
+        with mock.patch.object(subprocess, "Popen", RecordingPopen):
+            _summary, capture_files, sweep_ok = self.wrapper.run_bounded_capture(
+                script_path=str(self.script),
+                timeout_seconds=30,
+                limits=self._limits(),
+                capture_dir=capture_dir,
+                child_identity=None,
+            )
+        try:
+            self.assertTrue(sweep_ok)
+            # The child gets ONLY the capture pipes: stdin null, stdout/
+            # stderr the capture pipes.  No pass_fds leak of the pre-opened
+            # capture file fds (close_fds default stays untouched).
+            self.assertFalse(
+                captured_kwargs.get("pass_fds"),
+                "capture file fds must never be inherited via pass_fds",
+            )
+            self.assertEqual(captured_kwargs.get("stdin"), subprocess.DEVNULL)
+            self.assertEqual(captured_kwargs.get("stdout"), subprocess.PIPE)
+            self.assertEqual(captured_kwargs.get("stderr"), subprocess.PIPE)
+            self.assertTrue(captured_kwargs.get("start_new_session"))
+        finally:
+            for handle in capture_files.values():
+                handle.close()
+
+
+class SubreaperHardGateTest(unittest.TestCase):
+    """codex 02953ca7: ``PR_SET_CHILD_SUBREAPER`` is a HARD spawn gate.
+
+    Without subreaper, a setsid grandchild that also closes the inherited
+    capture pipes is invisible to BOTH sweep signals (descendant ppid
+    enumeration AND pipe EOF), so the Linux/container path refuses to run
+    at all when the prctl fails: no child, no summary, no envelope.
+    """
+
+    def setUp(self):
+        import app.bounded_exec_wrapper as wrapper_module
+
+        self.wrapper = wrapper_module
+        self._tmp = tempfile.TemporaryDirectory(prefix="af-subreaper-gate-")
+        self.task_dir = Path(self._tmp.name)
+        self.marker = self.task_dir / "child_ran.flag"
+        self.script = self.task_dir / "user_code.py"
+        self.script.write_text(
+            "from pathlib import Path\n"
+            f"Path({str(self.marker)!r}).write_text('ran')\n",
+            encoding="utf-8",
+        )
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _limits(self):
+        return {key: _LIMITS[key] for key in _LIMIT_KEYS}
+
+    def _assert_gate_closed(self, capture_dir):
+        # The child never ran, and with an active identity a failed spawn
+        # leaves NO summary: the pre-opened summary file stays empty.
+        self.assertFalse(
+            self.marker.exists(), "the child must never be spawned"
+        )
+        result_path = capture_dir / CAPTURE_RESULT_FILE_NAME
+        self.assertTrue(result_path.exists())
+        self.assertEqual(
+            result_path.stat().st_size,
+            0,
+            "a subreaper-gate failure must leave no summary",
+        )
+
+    def test_prctl_failure_aborts_before_any_spawn(self):
+        class FailingPrctlLibc:
+            def prctl(self, *_args):
+                return -1
+
+            def capset(self, *_args):
+                return -1
+
+        capture_dir = self.task_dir / "capture"
+        with mock.patch.object(self.wrapper.sys, "platform", "linux"), \
+                mock.patch.object(
+                    self.wrapper, "_libc", return_value=FailingPrctlLibc()
+                ):
+            with self.assertRaises(OSError):
+                self.wrapper.run_bounded_capture(
+                    script_path=str(self.script),
+                    timeout_seconds=30,
+                    limits=self._limits(),
+                    capture_dir=capture_dir,
+                    child_identity=(1000, 10001),
+                )
+        self._assert_gate_closed(capture_dir)
+
+    def test_libc_unavailable_aborts_before_any_spawn(self):
+        capture_dir = self.task_dir / "capture"
+        with mock.patch.object(self.wrapper.sys, "platform", "linux"), \
+                mock.patch.object(self.wrapper, "_libc", return_value=None):
+            with self.assertRaises(OSError):
+                self.wrapper.run_bounded_capture(
+                    script_path=str(self.script),
+                    timeout_seconds=30,
+                    limits=self._limits(),
+                    capture_dir=capture_dir,
+                    child_identity=(1000, 10001),
+                )
+        self._assert_gate_closed(capture_dir)
 
 
 # --- reader hardening: malicious capture entries must fail closed ---------
@@ -783,18 +967,25 @@ class EffectiveOutputLimitsValidatorTest(unittest.TestCase):
 
 class CaptureTamperingWiringTest(unittest.TestCase):
     """Production wiring tier: MALICIOUS user code tampering with the
-    capture files must fail the task at readback (§7.1 stop condition, codex
-    f86c66f5 / e083e181).  Same harness as WrapperPathFunctionalTest: the
-    REAL staged wrapper runs as a host subprocess (its wrapper-tail readback
-    imports capture_reader pre-spawn and never executes anything from the
-    task workspace after the user child exits), the user script with cwd =
-    task workspace and the capture dir at capture/.
+    capture files must NOT influence the readback (P0-4 fd-pinning, codex
+    03b4d034 / d384119d; the §7.1 stop condition of codex f86c66f5 /
+    e083e181 is now met STRUCTURALLY instead of detectably).
 
-    The tamper is deterministic: the wrapper opens stdout.bin and
-    finance-records.jsonl BEFORE spawning the child and never reopens them,
-    so a user-script ``os.replace`` of the directory entry leaves the
-    wrapper writing to an orphaned inode while the tampered entry survives
-    until the readback.
+    BEHAVIOR CHANGE (forced by the fd-pinning fix, documented per the
+    work-package rules): under the path-based readback these tampers were
+    DETECTED — the readback failed closed and the task failed.  The wrapper
+    now opens every capture file BEFORE the spawn and the wrapper-tail
+    readback re-reads EXACTLY those fds (zero path resolution after spawn),
+    so the same tampers are INEFFECTUAL: the task succeeds with the GENUINE
+    capture content and the injected payload appears nowhere host-side.
+    Failing these reads closed was never the goal — bounded, genuine output
+    is; fd-pinning achieves it without relying on detection.
+
+    Same harness as WrapperPathFunctionalTest: the REAL staged wrapper runs
+    as a host subprocess (its wrapper-tail readback imports capture_reader
+    pre-spawn and never executes anything from the task workspace after the
+    user child exits), the user script with cwd = task workspace and the
+    capture dir at capture/.
     """
 
     _TAMPER_LIMITS = {
@@ -832,7 +1023,11 @@ class CaptureTamperingWiringTest(unittest.TestCase):
         )
         return config, session, result
 
-    def test_oversized_stdout_rewrite_fails_readback_without_leak(self):
+    def test_oversized_stdout_rewrite_is_ineffectual_fd_pinned(self):
+        """fd-pinning immunity: the child replaces the stdout.bin directory
+        entry with an oversized evil file; the readback re-reads the
+        wrapper's PRE-OPENED fd, so the task succeeds with the genuine
+        bounded output and the injected payload appears nowhere."""
         code = (
             "import os\n"
             "with open(os.path.join('capture', 'stdout.bin.evil'), 'wb') as fh:\n"
@@ -843,13 +1038,25 @@ class CaptureTamperingWiringTest(unittest.TestCase):
             ")\n"
             "print('ordinary-line')\n"
         )
-        with self.assertRaises(RuntimeError) as ctx:
-            self._run(code)
-        self.assertIn("capture readback failed", str(ctx.exception))
-        # §18: the injected payload never reaches the error text.
-        self.assertNotIn("EVIL-INJECTED-PAYLOAD", str(ctx.exception))
+        config, session, result = self._run(
+            code, session_cls=RecordingFakeContainerSession
+        )
+        self.assertEqual(result["exit_code"], 0)
+        self.assertEqual(result["stdout"], "ordinary-line\n")
+        self.assertNotIn("EVIL-INJECTED-PAYLOAD", result["stdout"])
+        self.assertNotIn("EVIL-INJECTED-PAYLOAD", result["stderr"])
+        (wrapper_output,) = session.wrapper_outputs
+        document = json.loads(wrapper_output.stdout)
+        self.assertEqual(
+            base64.b64decode(document["files"]["stdout.bin"]),
+            b"ordinary-line\n",
+        )
+        self.assertNotIn("EVIL-INJECTED-PAYLOAD", wrapper_output.stdout)
 
-    def test_symlinked_stdout_bin_fails_readback(self):
+    def test_symlinked_stdout_bin_is_ineffectual_fd_pinned(self):
+        """fd-pinning immunity: the child deletes stdout.bin and plants a
+        symlink to a 100 KB target; the pre-opened fd is untouched, so the
+        readback stays genuine and bounded."""
         code = (
             "import os\n"
             "with open('big-target.dat', 'wb') as fh:\n"
@@ -861,14 +1068,24 @@ class CaptureTamperingWiringTest(unittest.TestCase):
             "os.symlink(os.path.abspath('big-target.dat'), link)\n"
             "print('ordinary-line')\n"
         )
-        with self.assertRaises(RuntimeError) as ctx:
-            self._run(code)
-        self.assertNotIn("Z" * 64, str(ctx.exception))
+        config, session, result = self._run(
+            code, session_cls=RecordingFakeContainerSession
+        )
+        self.assertEqual(result["exit_code"], 0)
+        self.assertEqual(result["stdout"], "ordinary-line\n")
+        (wrapper_output,) = session.wrapper_outputs
+        document = json.loads(wrapper_output.stdout)
+        self.assertEqual(
+            base64.b64decode(document["files"]["stdout.bin"]),
+            b"ordinary-line\n",
+        )
+        self.assertNotIn("Z" * 64, wrapper_output.stdout)
 
-    def test_record_channel_joint_bytes_fails_readback(self):
-        # Each file individually small; JOINTLY over recordChannelMaxBytes.
-        # os.replace swaps the directory entry, so the wrapper's pre-opened
-        # fd keeps writing to the orphaned original inode.
+    def test_record_channel_joint_bytes_rewrite_is_ineffectual_fd_pinned(self):
+        """fd-pinning immunity: the child swaps BOTH record-channel
+        directory entries for files that are jointly over
+        recordChannelMaxBytes; the wrapper's pre-opened fds keep the
+        genuine (empty) record channel, so the task succeeds."""
         code = (
             "import os\n"
             "with open(os.path.join('capture', 'records.evil'), 'wb') as fh:\n"
@@ -885,9 +1102,44 @@ class CaptureTamperingWiringTest(unittest.TestCase):
             ")\n"
             "print('ordinary-line')\n"
         )
-        with self.assertRaises(RuntimeError) as ctx:
-            self._run(code)
-        self.assertIn("capture readback failed", str(ctx.exception))
+        config, session, result = self._run(
+            code, session_cls=RecordingFakeContainerSession
+        )
+        self.assertEqual(result["exit_code"], 0)
+        self.assertEqual(result["stdout"], "ordinary-line\n")
+        channel = result["finance_record_channel"]
+        self.assertIsNotNone(channel)
+        self.assertTrue(channel["record_set_complete"])
+        self.assertEqual(channel["emitted_record_count"], 0)
+        (wrapper_output,) = session.wrapper_outputs
+        document = json.loads(wrapper_output.stdout)
+        self.assertNotIn("y" * 64, wrapper_output.stdout)
+        # The planted audit file never enters the envelope: the wrapper
+        # stored zero audit lines, so it held no audit fd.
+        self.assertNotIn(
+            "finance-records-unknown-marker.jsonl", document["files"]
+        )
+
+    def test_renamed_capture_dir_leaves_fd_pinned_readback_unaffected(self):
+        """fd-pinning immunity: the child renames the ENTIRE capture
+        directory while it runs; the wrapper's open fds travel with the
+        inode, so the readback and the summary stay genuine."""
+        code = (
+            "import os\n"
+            "os.rename('capture', 'capture.evil')\n"
+            "print('ordinary-line')\n"
+        )
+        config, session, result = self._run(
+            code, session_cls=RecordingFakeContainerSession
+        )
+        self.assertEqual(result["exit_code"], 0)
+        self.assertEqual(result["stdout"], "ordinary-line\n")
+        (wrapper_output,) = session.wrapper_outputs
+        document = json.loads(wrapper_output.stdout)
+        self.assertEqual(
+            base64.b64decode(document["files"]["stdout.bin"]),
+            b"ordinary-line\n",
+        )
 
     # --- wrapper-tail P0 regression + stdout discipline (PIN 1 / PIN 2) ---
 
@@ -972,42 +1224,55 @@ class CaptureTamperingWiringTest(unittest.TestCase):
         )
 
     def test_failure_path_wrapper_stdout_stays_empty_with_short_stderr(self):
-        """PIN 2 failure path: a tampered capture file makes the wrapper-tail
-        readback fail closed — nonzero exit, EMPTY stdout, and a short stderr
-        diagnostic that never carries capture content (§18)."""
-        code = (
-            "import os\n"
-            "with open(os.path.join('capture', 'stdout.bin.evil'), 'wb') as fh:\n"
-            "    fh.write(b'SECRET-CAPTURE-CONTENT' * 200)\n"
-            "os.replace(\n"
-            "    os.path.join('capture', 'stdout.bin.evil'),\n"
-            "    os.path.join('capture', 'stdout.bin'),\n"
-            ")\n"
+        """PIN 2 failure path: a wrapper-internal failure exits nonzero with
+        EMPTY stdout and a SHORT stderr diagnostic that never carries
+        capture content (§18).
+
+        BEHAVIOR CHANGE (documented): the old trigger — a tampered capture
+        file failing the path-based readback — is structurally unreachable
+        under fd-pinning (codex d384119d): the readback re-reads pre-opened
+        fds, so no user-reachable tamper can corrupt it.  The failure
+        discipline is therefore pinned against a genuine internal failure:
+        a planted symlink at a capture path makes the wrapper's O_NOFOLLOW
+        pre-open fail closed BEFORE any spawn (exit 1, no envelope)."""
+        input_dir = self.root / "broken-wrapper"
+        (input_dir / "capture").mkdir(parents=True, exist_ok=True)
+        # Planted symlink: the wrapper must refuse to open capture files
+        # through it (O_NOFOLLOW -> ELOOP) and fail closed.
+        (input_dir / "capture" / "stdout.bin").symlink_to(
+            self.root / "some-target.dat"
         )
-        config = _test_config(self.root, skip_environment_setup=False)
-        session = RecordingFakeContainerSession(
-            self.root, skip_environment_setup=False
+        wrapper_input = input_dir / "wrapper-input.json"
+        wrapper_input.write_text(
+            json.dumps(
+                {
+                    "scriptPath": str(input_dir / "script.py"),
+                    "timeoutSeconds": 30,
+                    "effectiveOutputLimits": {
+                        key: self._TAMPER_LIMITS[key] for key in _LIMIT_KEYS
+                    },
+                }
+            ),
+            encoding="utf-8",
         )
-        with self.assertRaises(RuntimeError):
-            run_in_open_session(
-                config,
-                session,
-                "task-tamper",
-                "ds1",
-                None,
-                code,
-                None,
-                None,
-                30,
-                effective_output_limits=dict(self._TAMPER_LIMITS),
-            )
-        (wrapper_output,) = session.wrapper_outputs
-        self.assertNotEqual(wrapper_output.exit_code, 0)
-        self.assertEqual(wrapper_output.stdout, "")  # no envelope on failure
-        self.assertIn("capture readback failed", wrapper_output.stderr)
-        # §18: names/sizes/caps only — never capture content.
-        self.assertNotIn("SECRET-CAPTURE-CONTENT", wrapper_output.stderr)
-        self.assertLess(len(wrapper_output.stderr), 4096)
+        (input_dir / "script.py").write_text("print('never-runs')\n")
+        completed = subprocess.run(
+            [sys.executable, "-m", "app.bounded_exec_wrapper", str(wrapper_input)],
+            cwd=_SERVICE_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        # Fail closed BEFORE the spawn: the planted symlink survives (the
+        # wrapper never opened stdout.bin), proving the child never ran.
+        self.assertTrue((input_dir / "capture" / "stdout.bin").is_symlink())
+        self.assertIn("internal error", completed.stderr)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(completed.stdout, "")  # no envelope on failure
+        self.assertIn("bounded_exec_wrapper", completed.stderr)
+        # §18: type/message only — never capture content; stays bounded.
+        self.assertNotIn("SECRET-CAPTURE-CONTENT", completed.stderr)
+        self.assertLess(len(completed.stderr), 4096)
 
     def test_overwritten_wrapper_module_itself_is_harmless(self):
         """Overwriting bounded_exec_wrapper.py itself while the child runs
@@ -1538,6 +1803,237 @@ class AttachChannelHelperTest(unittest.TestCase):
             result, channel, model_cls=StubResult
         )
         self.assertEqual(updated.finance_record_channel, channel)
+
+
+class SecurityFloorWiringTest(unittest.TestCase):
+    """P0-5 (codex 5777cda8): one-task-per-container security floor.
+
+    Any task that selected the bounded wrapper path is ALWAYS recycled —
+    ``container_recycled=True`` with the floor reason — regardless of
+    success, failure or install state.  This SUPERSEDES work package D's
+    conditional recycle (which keyed recycling off cleanup failure only):
+    user code leaves residual state no cleanup can fully undo, so the
+    bounded path is single-use by policy.  The legacy (no-limits) path is
+    deliberately NOT subject to the floor.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="af-wiring-floor-")
+        self.root = Path(self._tmp.name).resolve()
+        _make_dataset(self.root)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _run_bounded(self, session, task_id, code, root=None):
+        config = _test_config(
+            root if root is not None else self.root,
+            skip_environment_setup=False,
+        )
+        return config, run_in_open_session(
+            config,
+            session,
+            task_id,
+            "ds1",
+            None,
+            code,
+            None,
+            None,
+            30,
+            effective_output_limits=dict(_LIMITS),
+        )
+
+    def test_successful_bounded_task_is_always_recycled(self):
+        session = FakeContainerSession(
+            self.root, skip_environment_setup=False
+        )
+        _, result = self._run_bounded(
+            session, "task-floor-ok", "print('floor-ok')\n"
+        )
+        self.assertEqual(result["exit_code"], 0)
+        self.assertTrue(
+            result["container_recycled"],
+            "a SUCCESSFUL bounded task must still recycle the container",
+        )
+        self.assertEqual(
+            result["recycle_reason"],
+            sandbox_runner.RECYCLE_REASON_SECURITY_FLOOR,
+        )
+
+    def test_failing_bounded_task_is_always_recycled(self):
+        session = FakeContainerSession(
+            self.root, skip_environment_setup=False
+        )
+        _, result = self._run_bounded(
+            session, "task-floor-fail", "import sys\nsys.exit(3)\n"
+        )
+        self.assertEqual(result["exit_code"], 3)
+        self.assertTrue(result["container_recycled"])
+        self.assertEqual(
+            result["recycle_reason"],
+            sandbox_runner.RECYCLE_REASON_SECURITY_FLOOR,
+        )
+
+    def test_legacy_path_is_not_subject_to_the_floor(self):
+        config = _test_config(self.root, skip_environment_setup=False)
+
+        class LegacySession(FakeContainerSession):
+            def run(self, code, libraries=None, timeout=None):
+                return SimpleNamespace(exit_code=0, stdout="legacy\n", stderr="")
+
+        session = LegacySession(self.root, skip_environment_setup=False)
+        result = run_in_open_session(
+            config, session, "task-legacy-floor", "ds1", None,
+            "print('legacy')", None, None, 30,
+        )
+        self.assertEqual(result["exit_code"], 0)
+        self.assertFalse(
+            result["container_recycled"],
+            "the floor applies to the BOUNDED path only; the legacy path "
+            "keeps its historical conditional recycle",
+        )
+
+    def test_two_bounded_tasks_never_share_a_container(self):
+        """Two-task regression: task one succeeds and the floor recycles;
+        the caller destroys that session; task two therefore runs on a
+        DIFFERENT session/container and sees none of task one's state."""
+        root1 = self.root / "container-1"
+        root1.mkdir(parents=True, exist_ok=True)
+        _make_dataset(root1)
+        session1 = FakeContainerSession(root1, skip_environment_setup=False)
+        session1.container_id = "fake-container-floor-1"
+        config1, result1 = self._run_bounded(
+            session1,
+            "task-floor-1",
+            # Container-wide pollution OUTSIDE the task workspace: survives
+            # workspace cleanup, dies only with the container.
+            "import os\n"
+            "with open(os.path.join(os.getcwd(), '..', '..', "
+            "'pollution-marker.txt'), 'w') as handle:\n"
+            "    handle.write('polluted-by-task-one')\n"
+            "print('task-one-ran')\n",
+            root=root1,
+        )
+        self.assertEqual(result1["exit_code"], 0)
+        self.assertTrue(result1["container_recycled"])
+        self.assertEqual(
+            result1["recycle_reason"],
+            sandbox_runner.RECYCLE_REASON_SECURITY_FLOOR,
+        )
+        self.assertEqual(result1["container_id"], "fake-container-floor-1")
+        self.assertTrue((root1 / "sandbox" / "pollution-marker.txt").exists())
+        session1.close()  # the caller destroys a recycled container
+
+        root2 = self.root / "container-2"
+        root2.mkdir(parents=True, exist_ok=True)
+        _make_dataset(root2)
+        session2 = FakeContainerSession(root2, skip_environment_setup=False)
+        session2.container_id = "fake-container-floor-2"
+        config2, result2 = self._run_bounded(
+            session2,
+            "task-floor-2",
+            "import os\n"
+            "print('POLLUTION_PRESENT=%s' % os.path.exists(\n"
+            "    os.path.join(os.getcwd(), '..', '..', "
+            "'pollution-marker.txt')))\n",
+            root=root2,
+        )
+        self.assertEqual(result2["exit_code"], 0)
+        self.assertNotEqual(
+            result1["container_id"],
+            result2["container_id"],
+            "the floor demands a fresh container for the next task",
+        )
+        self.assertIn("POLLUTION_PRESENT=False", result2["stdout"])
+
+    def test_pool_drains_a_recycled_container_and_serves_the_next_task(
+        self,
+    ):
+        """Pool-level wiring: a real ``ContainerPoolScheduler`` whose
+        sessions are FakeContainerSession instances — the recycled flag
+        from the bounded run drains the worker, and the NEXT task runs on a
+        freshly created session (different container id)."""
+        from unittest.mock import patch
+
+        from app.pool_scheduler import ContainerPoolScheduler
+
+        created_sessions: list = []
+
+        def fake_create(config, **kwargs):
+            root = self.root / "containers" / f"container-{len(created_sessions) + 1}"
+            root.mkdir(parents=True, exist_ok=True)
+            session = FakeContainerSession(
+                root, skip_environment_setup=False
+            )
+            session.container_id = f"fake-pool-container-{len(created_sessions) + 1}"
+            created_sessions.append(session)
+            return session
+
+        def fake_container_id(session):
+            return session.container_id
+
+        config = replace(
+            _test_config(self.root, skip_environment_setup=False),
+            pool_enabled=True,
+            pool_min_size=1,
+            pool_max_size=2,
+        )
+        with patch(
+            "app.pool_scheduler.create_sandbox_session",
+            side_effect=fake_create,
+        ), patch(
+            "app.pool_scheduler.get_session_container_id",
+            side_effect=fake_container_id,
+        ), patch(
+            "app.pool_scheduler.smoke_check_session"
+        ), patch(
+            "app.pool_scheduler.prepare_container_loader_modules",
+            sandbox_runner.prepare_container_loader_modules,
+        ):
+            scheduler = ContainerPoolScheduler(config)
+            scheduler.start()
+            try:
+                result1 = scheduler.run_task(
+                    "task-pool-floor-1",
+                    "ds1",
+                    None,
+                    "print('pool-floor-one')\n",
+                    None,
+                    None,
+                    30,
+                    effective_output_limits=dict(_LIMITS),
+                )
+                result2 = scheduler.run_task(
+                    "task-pool-floor-2",
+                    "ds1",
+                    None,
+                    "print('pool-floor-two')\n",
+                    None,
+                    None,
+                    30,
+                    effective_output_limits=dict(_LIMITS),
+                )
+            finally:
+                scheduler.close()
+
+        self.assertEqual(result1["exit_code"], 0)
+        self.assertTrue(result1["container_recycled"])
+        self.assertEqual(
+            result1["recycle_reason"],
+            sandbox_runner.RECYCLE_REASON_SECURITY_FLOOR,
+        )
+        self.assertEqual(result2["exit_code"], 0)
+        self.assertNotEqual(
+            result1["container_id"],
+            result2["container_id"],
+            "the drained worker must be replaced by a fresh container",
+        )
+        self.assertGreaterEqual(
+            len(created_sessions),
+            2,
+            "the pool must create a replacement session after the floor "
+            "recycle",
+        )
 
 
 if __name__ == "__main__":

@@ -709,5 +709,396 @@ class RecordDigestReferenceTest(unittest.TestCase):
         self.assertEqual(digest_fn([]), EMPTY_BATCH_DIGEST)
 
 
+class ProcessTreeSweepTest(unittest.TestCase):
+    """P0-2 (codex b39f5e6b / 1d81ca85): bounded post-exit process-tree
+    cleanup.  A child that exits promptly may leave grandchildren that
+    inherited the capture pipes; the drain threads only reach EOF when the
+    LAST pipe holder dies, so the wrapper must actively sweep the tree —
+    promptly, and with no survivor — instead of blocking to its own timeout
+    and still reporting success (the live red baseline f319ad54: main
+    exit(0) + sleep-120 grandchild produced wrapperExitCode 0 after ~30s
+    with the grandchild still alive).
+
+    Non-docker: these run on the macOS host (no /proc, no prctl) and pin
+    the ppid-chain + lsof pipe-holder fallback; the Linux subreaper + /proc
+    path is exercised by the docker-gated codex repro in
+    tests/test_wrapper_uid_isolation.py.
+    """
+
+    def setUp(self) -> None:
+        self.wrapper = importlib.import_module("app.bounded_exec_wrapper")
+        self._tmp = tempfile.TemporaryDirectory(prefix="af-sweep-test-")
+        self.task_dir = Path(self._tmp.name).resolve()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _write_script(self, source: str) -> Path:
+        script = self.task_dir / "user_code.py"
+        script.write_text(source, encoding="utf-8")
+        return script
+
+    def _run_wrapper(self, script: Path, timeout_seconds: int = 30):
+        payload = {
+            "scriptPath": str(script),
+            "timeoutSeconds": timeout_seconds,
+            "effectiveOutputLimits": dict(DEFAULT_LIMITS),
+            "runtimeEnvironmentPath": str(self.task_dir / "runtime-environment.json"),
+        }
+        (self.task_dir / "runtime-environment.json").write_text("{}", encoding="utf-8")
+        input_path = self.task_dir / "wrapper-input.json"
+        input_path.write_text(json.dumps(payload), encoding="utf-8")
+        started = time.monotonic()
+        completed = subprocess.run(
+            [sys.executable, "-m", "app.bounded_exec_wrapper", str(input_path)],
+            cwd=SERVICE_ROOT,
+            capture_output=True,
+            timeout=90,
+        )
+        return completed, time.monotonic() - started
+
+    def _read_capture_result(self) -> dict:
+        return json.loads(
+            (self.task_dir / "capture" / "capture-result.json").read_text(
+                encoding="utf-8"
+            )
+        )
+
+    def _assert_grandchild_dead(self, wall_seconds: float) -> None:
+        pid_path = self.task_dir / "grandchild.pid"
+        self.assertTrue(pid_path.exists(), "user script did not record the grandchild pid")
+        grandchild_pid = int(pid_path.read_text(encoding="utf-8").strip())
+        deadline = time.monotonic() + 10.0
+        while True:
+            try:
+                os.kill(grandchild_pid, 0)
+            except ProcessLookupError:
+                return  # gone: the sweep killed it
+            self.assertLess(
+                time.monotonic(),
+                deadline,
+                f"grandchild pid {grandchild_pid} survived the wrapper "
+                f"(wall {wall_seconds:.1f}s) — the process-tree sweep missed it",
+            )
+            time.sleep(0.2)
+
+    def test_exit0_with_slow_writing_grandchild_returns_promptly_and_kills_it(self) -> None:
+        """(i) main exit(0) + long-lived grandchild inheriting stdout and
+        writing slowly: prompt return (no 30s drain block), grandchild dead
+        after the wrapper, its pre-kill output captured bounded, and
+        wrapperExitCode still reflects the child's own 0."""
+        grandchild_src = (
+            "import sys, time\n"
+            "sys.stdout.write('gc-slow-line\\n')\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(120)\n"
+        )
+        script = self._write_script(
+            "import os, subprocess, sys\n"
+            "pid_file = os.path.join(\n"
+            "    os.path.dirname(os.path.abspath(__file__)), 'grandchild.pid')\n"
+            "grandchild = subprocess.Popen(\n"
+            f"    [sys.executable, '-c', {grandchild_src!r}])\n"
+            "with open(pid_file, 'w') as handle:\n"
+            "    handle.write(str(grandchild.pid))\n"
+            "sys.stdout.write('main-line\\n')\n"
+            "sys.exit(0)\n"
+        )
+        completed, wall = self._run_wrapper(script)
+        self.assertEqual(
+            completed.returncode, 0,
+            f"wrapper must exit 0 with an envelope; stderr={completed.stderr!r}",
+        )
+        # Prompt: bounded sweep (~3s budget) + enumeration overhead, never
+        # the old ~30s drain join.
+        self.assertLess(wall, 15.0, f"wrapper blocked {wall:.1f}s on the grandchild")
+        summary = self._read_capture_result()
+        self.assertEqual(summary["exitCode"], 0)  # the child's OWN exit code
+        envelope = json.loads(completed.stdout.decode("utf-8"))
+        import base64 as _base64
+
+        stdout_bytes = _base64.b64decode(envelope["files"]["stdout.bin"])
+        self.assertIn(b"main-line\n", stdout_bytes)
+        self.assertIn(b"gc-slow-line\n", stdout_bytes)  # pre-kill output kept
+        self._assert_grandchild_dead(wall)
+
+    def test_silent_grandchild_holding_stdout_is_killed_so_eof_is_reached(self) -> None:
+        """(ii) a grandchild that holds the stdout fd but writes NOTHING
+        still blocks EOF; the sweep must kill it so the wrapper returns."""
+        grandchild_src = "import time\ntime.sleep(120)\n"
+        script = self._write_script(
+            "import os, subprocess, sys\n"
+            "pid_file = os.path.join(\n"
+            "    os.path.dirname(os.path.abspath(__file__)), 'grandchild.pid')\n"
+            "grandchild = subprocess.Popen(\n"
+            f"    [sys.executable, '-c', {grandchild_src!r}])\n"
+            "with open(pid_file, 'w') as handle:\n"
+            "    handle.write(str(grandchild.pid))\n"
+            "sys.exit(0)\n"
+        )
+        completed, wall = self._run_wrapper(script)
+        self.assertEqual(completed.returncode, 0, repr(completed.stderr))
+        self.assertLess(wall, 15.0, f"wrapper blocked {wall:.1f}s on a silent pipe holder")
+        self.assertEqual(self._read_capture_result()["exitCode"], 0)
+        self._assert_grandchild_dead(wall)
+
+    def test_escaped_session_grandchild_is_killed_too(self) -> None:
+        """(iii) a grandchild in its OWN session (start_new_session=True)
+        escapes the process-group kill and — on macOS — is reparented to
+        launchd, breaking ppid chains; the pipe-holder correlation must
+        still find and kill it (on Linux the subreaper reparents it to the
+        wrapper instead)."""
+        grandchild_src = (
+            "import sys, time\n"
+            "sys.stdout.write('escaped-gc\\n')\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(120)\n"
+        )
+        script = self._write_script(
+            "import os, subprocess, sys\n"
+            "pid_file = os.path.join(\n"
+            "    os.path.dirname(os.path.abspath(__file__)), 'grandchild.pid')\n"
+            "grandchild = subprocess.Popen(\n"
+            f"    [sys.executable, '-c', {grandchild_src!r}],\n"
+            "    start_new_session=True)\n"
+            "with open(pid_file, 'w') as handle:\n"
+            "    handle.write(str(grandchild.pid))\n"
+            "sys.exit(0)\n"
+        )
+        completed, wall = self._run_wrapper(script)
+        self.assertEqual(completed.returncode, 0, repr(completed.stderr))
+        self.assertLess(wall, 15.0, f"wrapper blocked {wall:.1f}s on an escaped grandchild")
+        self.assertEqual(self._read_capture_result()["exitCode"], 0)
+        envelope = json.loads(completed.stdout.decode("utf-8"))
+        import base64 as _base64
+
+        stdout_bytes = _base64.b64decode(envelope["files"]["stdout.bin"])
+        self.assertIn(b"escaped-gc\n", stdout_bytes)
+        self._assert_grandchild_dead(wall)
+
+
+class StreamingClassifierTest(unittest.TestCase):
+    """P0-3 (codex 21aaf3b8): the bounded streaming line state machine.
+
+    Unit tier over ``_StreamingStdoutClassifier``: the old
+    ``pending + chunk`` accumulation is gone, so a no-newline stdout can
+    never grow pending unbounded (quadratic concat -> OOM), while marker
+    classification semantics stay EXACTLY the frozen classify_line rules.
+    """
+
+    def setUp(self) -> None:
+        self.wrapper = importlib.import_module("app.bounded_exec_wrapper")
+        self._tmp = tempfile.TemporaryDirectory(prefix="af-classifier-test-")
+        self.dir = Path(self._tmp.name)
+        self._closeables = []
+
+    def tearDown(self) -> None:
+        for closeable in self._closeables:
+            try:
+                closeable()
+            except Exception:
+                pass
+        self._tmp.cleanup()
+
+    def _make(
+        self,
+        *,
+        stdout_cap: int = 1024 * 1024,
+        record_budget: int = 256 * 1024,
+        max_records: int = 128,
+    ):
+        import io as _io
+
+        sink = self.wrapper._BoundedByteSink(_io.BytesIO(), stdout_cap)
+        budget = self.wrapper._JointByteBudget(record_budget)
+        records = self.wrapper._RecordChannel(
+            self.dir / "finance-records.jsonl", max_records, budget
+        )
+        audit = self.wrapper._UnknownMarkerAudit(
+            self.dir / "finance-records-unknown-marker.jsonl", budget
+        )
+        classifier = self.wrapper._StreamingStdoutClassifier(
+            sink, records, audit, budget
+        )
+        self._closeables.append(records.finalize)
+        self._closeables.append(audit.finalize)
+        return classifier, sink, records, audit, budget
+
+    def test_64mb_single_nonewline_ordinary_stays_bounded_and_linear(self) -> None:
+        """(i) 64 MB of no-newline ordinary bytes through a 1 MB cap:
+        pending stays bounded (instrumented), the sink stores exactly the
+        cap, truncated flips, and wall time stays linear."""
+        cap = 1024 * 1024
+        classifier, sink, records, audit, budget = self._make(stdout_cap=cap)
+        payload = b"o" * (64 * 1024 * 1024)
+        started = time.monotonic()
+        classifier.feed(payload)
+        classifier.finalize()
+        wall = time.monotonic() - started
+        self.assertEqual(sink.stored_bytes, cap)
+        self.assertTrue(sink.truncated)
+        # Ordinary data never accumulates: pending is bounded by the marker
+        # family prefix probe regardless of the unterminated line's length.
+        marker_family = len(MARKER_FAMILY_PREFIX)
+        self.assertLessEqual(classifier.max_pending_bytes, marker_family)
+        self.assertLess(wall, 10.0, f"64MB feed took {wall:.1f}s (not linear?)")
+        self.assertEqual(records.emitted_count, 0)
+        self.assertTrue(records.complete)
+
+    def test_marker_prefix_split_across_chunks_still_classifies(self) -> None:
+        """(iii) the v1 marker prefix arriving split across chunk boundaries
+        ('__AF_FIN' + 'ANCE_RESULT_v1__' + rest) is still one record."""
+        classifier, sink, records, audit, budget = self._make()
+        classifier.feed(b"__AF_FIN")
+        classifier.feed(b"ANCE_RESULT_v1__")
+        classifier.feed(b'{"a":1}\n')
+        classifier.finalize()
+        self.assertEqual(records.emitted_count, 1)
+        self.assertEqual(records.emitted_bytes, len('{"a":1}'))
+        self.assertTrue(records.complete)
+        self.assertEqual(sink.stored_bytes, 0)
+        self.assertEqual(audit.stored_lines, 0)
+
+    def test_overlong_unterminated_v1_line_drops_the_batch(self) -> None:
+        """(iv) a v1 marker line that never terminates and outruns the joint
+        budget + slack applies the SAME whole-batch-drop as a completed
+        over-limit line: byte-budget drop exhausts the budget."""
+        classifier, sink, records, audit, budget = self._make(record_budget=100)
+        classifier.feed(MARKER_V1_PREFIX.encode("ascii") + b"y" * 500)
+        classifier.feed(b"\n")
+        classifier.finalize()
+        self.assertFalse(records.complete)
+        self.assertEqual(
+            records.drop_reason,
+            "recordChannelMaxBytes exceeded: limit=100",
+        )
+        self.assertTrue(budget.exhausted)
+        self.assertTrue(audit.truncated)  # frozen post-byte-drop rule
+        self.assertGreater(classifier.discarded_marker_bytes, 0)
+        self.assertEqual(sink.stored_bytes, 0)  # never ordinary stdout
+
+    def test_overlong_unterminated_v1_line_count_limit_drops_first(self) -> None:
+        """(iv) count-limit branch order preserved on overflow: with the
+        record count already exhausted the drop reason is the COUNT reason
+        and the joint budget stays open for audit lines."""
+        classifier, sink, records, audit, budget = self._make(
+            record_budget=100000, max_records=0
+        )
+        classifier.feed(MARKER_V1_PREFIX.encode("ascii") + b"y" * 500)
+        classifier.feed(b"\n")
+        classifier.finalize()
+        self.assertFalse(records.complete)
+        self.assertEqual(
+            records.drop_reason,
+            "recordChannelMaxRecords exceeded: limit=0",
+        )
+        self.assertFalse(budget.exhausted)
+
+    def test_overlong_unterminated_unknown_marker_truncates_audit_only(self) -> None:
+        """(iv) an unknown-version marker line that never terminates and
+        outruns the budget sets the audit truncation flag WITHOUT dropping
+        the v1 batch (unknown-truncated semantics)."""
+        classifier, sink, records, audit, budget = self._make(record_budget=100)
+        classifier.feed(MARKER_FAMILY_PREFIX.encode("ascii") + b"v9_" + b"z" * 500)
+        classifier.feed(b"\n")
+        classifier.finalize()
+        self.assertTrue(records.complete)
+        self.assertEqual(records.drop_reason, "")
+        self.assertTrue(audit.truncated)
+        self.assertEqual(audit.stored_lines, 0)
+        self.assertGreater(classifier.discarded_marker_bytes, 0)
+
+    def test_ordinary_long_line_then_marker_keeps_order_and_classes(self) -> None:
+        """(v) an ordinary long line followed by a marker line: order and
+        classification preserved, ordinary bounded by its own cap, record
+        stored, whole-batch-drop invariant intact."""
+        classifier, sink, records, audit, budget = self._make(stdout_cap=1000)
+        classifier.feed(b"o" * 100000 + b"\n")
+        classifier.feed(MARKER_V1_PREFIX.encode("ascii") + b'{"a":1}\n')
+        classifier.finalize()
+        self.assertEqual(sink.stored_bytes, 1000)
+        self.assertTrue(sink.truncated)
+        self.assertEqual(records.emitted_count, 1)
+        self.assertTrue(records.complete)
+        self.assertEqual(audit.stored_lines, 0)
+
+    def test_unterminated_marker_prefix_at_eof_routes_like_legacy(self) -> None:
+        """EOF with a pending COMPLETE family prefix audits it verbatim
+        (legacy classify_line(line, False)); a PARTIAL prefix flushes to the
+        ordinary sink."""
+        classifier, sink, records, audit, budget = self._make()
+        classifier.feed(MARKER_FAMILY_PREFIX.encode("ascii"))
+        classifier.finalize()
+        self.assertEqual(audit.stored_lines, 1)
+        self.assertEqual(sink.stored_bytes, 0)
+
+        classifier2, sink2, records2, audit2, _ = self._make()
+        classifier2.feed(b"__AF_FIN")
+        classifier2.finalize()
+        self.assertEqual(audit2.stored_lines, 0)
+        self.assertEqual(sink2.stored_bytes, len(b"__AF_FIN"))
+
+
+class StreamingStdoutEndToEndTest(unittest.TestCase):
+    """P0-3 (codex 21aaf3b8) end-to-end tier: the REAL wrapper subprocess
+    bounds a multi-MB no-newline stdout at the frozen cap and the child
+    still exits normally."""
+
+    def setUp(self) -> None:
+        importlib.import_module("app.bounded_exec_wrapper")
+        self._tmp = tempfile.TemporaryDirectory(prefix="af-stdout-e2e-")
+        self.task_dir = Path(self._tmp.name).resolve()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_multimegabyte_nonewline_stdout_is_bounded_and_child_succeeds(self) -> None:
+        """(ii) the child writes 8 MB with NO newline under a 64 KB stdout
+        cap: it exits normally, the saved stdout is EXACTLY the cap,
+        truncated=true, and the wrapper emits one envelope promptly."""
+        cap = 64 * 1024
+        script = self.task_dir / "user_code.py"
+        script.write_text(
+            "import sys\n"
+            "sys.stdout.write('A' * (8 * 1024 * 1024))\n"
+            "sys.stdout.flush()\n"
+            "sys.exit(0)\n",
+            encoding="utf-8",
+        )
+        payload = {
+            "scriptPath": str(script),
+            "timeoutSeconds": 30,
+            "effectiveOutputLimits": {
+                **DEFAULT_LIMITS,
+                "stdoutMaxBytes": cap,
+            },
+            "runtimeEnvironmentPath": str(self.task_dir / "runtime-environment.json"),
+        }
+        (self.task_dir / "runtime-environment.json").write_text("{}", encoding="utf-8")
+        input_path = self.task_dir / "wrapper-input.json"
+        input_path.write_text(json.dumps(payload), encoding="utf-8")
+        started = time.monotonic()
+        completed = subprocess.run(
+            [sys.executable, "-m", "app.bounded_exec_wrapper", str(input_path)],
+            cwd=SERVICE_ROOT,
+            capture_output=True,
+            timeout=90,
+        )
+        wall = time.monotonic() - started
+        self.assertEqual(completed.returncode, 0, repr(completed.stderr[:512]))
+        self.assertLess(wall, 30.0)
+        summary = json.loads(
+            (self.task_dir / "capture" / "capture-result.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(summary["exitCode"], 0)
+        self.assertEqual(summary["ordinaryStdoutBytes"], cap)
+        self.assertTrue(summary["stdoutTruncated"])
+        stored = (self.task_dir / "capture" / "stdout.bin").read_bytes()
+        self.assertEqual(len(stored), cap)
+        self.assertEqual(stored, b"A" * cap)
+
+
 if __name__ == "__main__":
     unittest.main()
