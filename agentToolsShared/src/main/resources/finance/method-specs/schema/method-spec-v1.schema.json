@@ -86,7 +86,8 @@
         "properties": {
           "name": {"type": "string", "pattern": "^[a-z][a-zA-Z0-9_]*$", "maxLength": 64},
           "unit": {"type": "string", "minLength": 1, "maxLength": 64},
-          "description": {"type": "string", "minLength": 1, "maxLength": 512}
+          "description": {"type": "string", "minLength": 1, "maxLength": 512},
+          "displayFormat": {"enum": ["percent", "number"]}
         }
       }
     },

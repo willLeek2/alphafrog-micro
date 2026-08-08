@@ -53,8 +53,9 @@ conventions:
     riskFreeHandling: annual_to_period_subtract
     returnType: simple_period_returns
     stdevDdof: 1
+    narrativeTemplate: 使用输入的{returns}，无风险利率 {riskFreeRate}（{riskFreeRateConvention} 口径），按 {returnConvention} 平均的周期超额收益除以样本标准差（ddof={ddof}），再乘以每年 {periodsPerYear} 期的平方根换算为年化夏普比率
 outputs:
-  - {name: sharpe, unit: ratio_per_annum, description: 年化夏普比率}
+  - {name: sharpe, unit: ratio_per_annum, description: 年化夏普比率, displayFormat: number}
 libraryBinding:
   package: alphafrog_finance
   function: sharpe
