@@ -89,6 +89,8 @@ public class ToolJobAnchor {
     private String reservationJson;
     // estimateJson 保存准入估算，构造终态 envelope 时复用并校验资源类别。
     private String estimateJson;
+    // financeRecordLimitsJson 冻结本次 executePython 的 Java 通道开关、上限和目标环境身份。
+    private String financeRecordLimitsJson;
 
     // datasetSnapshotJson 保存可恢复的数据集注册表快照。
     private String datasetSnapshotJson;
@@ -249,6 +251,11 @@ public class ToolJobAnchor {
 
     public String getEstimateJson() { return estimateJson; }
     public void setEstimateJson(String estimateJson) { this.estimateJson = estimateJson; }
+
+    public String getFinanceRecordLimitsJson() { return financeRecordLimitsJson; }
+    public void setFinanceRecordLimitsJson(String financeRecordLimitsJson) {
+        this.financeRecordLimitsJson = financeRecordLimitsJson;
+    }
 
     public String getCompletedTodosJson() { return completedTodosJson; }
     public void setCompletedTodosJson(String completedTodosJson) { this.completedTodosJson = completedTodosJson; }
