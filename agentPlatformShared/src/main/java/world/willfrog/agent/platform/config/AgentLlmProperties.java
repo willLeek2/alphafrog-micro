@@ -25,6 +25,7 @@ public class AgentLlmProperties {
     private DataFreshness dataFreshness = new DataFreshness();
     private Tools tools = new Tools();
     private Agent agent = new Agent();
+    private FinanceMethodResolver financeMethodResolver = new FinanceMethodResolver();
 
     public String getDefaultEndpoint() {
         return defaultEndpoint;
@@ -136,6 +137,14 @@ public class AgentLlmProperties {
 
     public void setAgent(Agent agent) {
         this.agent = agent == null ? new Agent() : agent;
+    }
+
+    public FinanceMethodResolver getFinanceMethodResolver() {
+        return financeMethodResolver;
+    }
+
+    public void setFinanceMethodResolver(FinanceMethodResolver financeMethodResolver) {
+        this.financeMethodResolver = financeMethodResolver == null ? new FinanceMethodResolver() : financeMethodResolver;
     }
 
     /**
@@ -1984,6 +1993,8 @@ public class AgentLlmProperties {
         private String pythonRefineOutputInstruction;
         private List<DatasetFieldSpec> datasetFieldSpecs = new ArrayList<>();
         private String datasetFieldSpecsFile;
+        private String financeMethodResolverSystemPrompt;
+        private String financeMethodResolverSystemPromptFile;
         private String orchestratorPlanningSystemPrompt;
         private String orchestratorSummarySystemPrompt;
         private String dagReactSystemPrompt;
@@ -2145,6 +2156,22 @@ public class AgentLlmProperties {
 
         public void setDatasetFieldSpecsFile(String datasetFieldSpecsFile) {
             this.datasetFieldSpecsFile = datasetFieldSpecsFile;
+        }
+
+        public String getFinanceMethodResolverSystemPrompt() {
+            return financeMethodResolverSystemPrompt;
+        }
+
+        public void setFinanceMethodResolverSystemPrompt(String financeMethodResolverSystemPrompt) {
+            this.financeMethodResolverSystemPrompt = financeMethodResolverSystemPrompt;
+        }
+
+        public String getFinanceMethodResolverSystemPromptFile() {
+            return financeMethodResolverSystemPromptFile;
+        }
+
+        public void setFinanceMethodResolverSystemPromptFile(String financeMethodResolverSystemPromptFile) {
+            this.financeMethodResolverSystemPromptFile = financeMethodResolverSystemPromptFile;
         }
 
         public String getOrchestratorPlanningSystemPrompt() {
@@ -2378,6 +2405,120 @@ public class AgentLlmProperties {
 
         public void setCurrent(ExecutorConfig current) {
             this.current = current;
+        }
+    }
+
+    /**
+     * Finance MethodSpec resolver configuration: dedicated lightweight default route
+     * and catalog budget limits. Never silently inherit the execution model.
+     */
+    public static class FinanceMethodResolver {
+        @JsonAlias({"default_route", "defaultRoute"})
+        private DefaultRoute defaultRoute = new DefaultRoute();
+        @JsonAlias({"catalog_prompt_max_bytes", "catalogPromptMaxBytes"})
+        private Integer catalogPromptMaxBytes = 8192;
+        @JsonAlias({"catalog_prompt_max_tokens", "catalogPromptMaxTokens"})
+        private Integer catalogPromptMaxTokens = 2048;
+
+        public DefaultRoute getDefaultRoute() {
+            return defaultRoute;
+        }
+
+        public void setDefaultRoute(DefaultRoute defaultRoute) {
+            this.defaultRoute = defaultRoute == null ? new DefaultRoute() : defaultRoute;
+        }
+
+        public Integer getCatalogPromptMaxBytes() {
+            return catalogPromptMaxBytes;
+        }
+
+        public void setCatalogPromptMaxBytes(Integer catalogPromptMaxBytes) {
+            this.catalogPromptMaxBytes = catalogPromptMaxBytes;
+        }
+
+        public Integer getCatalogPromptMaxTokens() {
+            return catalogPromptMaxTokens;
+        }
+
+        public void setCatalogPromptMaxTokens(Integer catalogPromptMaxTokens) {
+            this.catalogPromptMaxTokens = catalogPromptMaxTokens;
+        }
+
+        public static class DefaultRoute {
+            private Boolean enabled = false;
+            private String endpointName;
+            private String modelName;
+            @JsonAlias({"provider_order", "providers"})
+            private List<String> providerOrder;
+            private Double temperature = 0.0D;
+            private Integer maxTokens = 2048;
+            private Integer maxAttempts = 2;
+            @JsonAlias({"structured_output", "structuredOutput"})
+            private Boolean structuredOutput = true;
+
+            public Boolean getEnabled() {
+                return enabled;
+            }
+
+            public void setEnabled(Boolean enabled) {
+                this.enabled = enabled;
+            }
+
+            public String getEndpointName() {
+                return endpointName;
+            }
+
+            public void setEndpointName(String endpointName) {
+                this.endpointName = endpointName;
+            }
+
+            public String getModelName() {
+                return modelName;
+            }
+
+            public void setModelName(String modelName) {
+                this.modelName = modelName;
+            }
+
+            public List<String> getProviderOrder() {
+                return providerOrder;
+            }
+
+            public void setProviderOrder(List<String> providerOrder) {
+                this.providerOrder = providerOrder;
+            }
+
+            public Double getTemperature() {
+                return temperature;
+            }
+
+            public void setTemperature(Double temperature) {
+                this.temperature = temperature;
+            }
+
+            public Integer getMaxTokens() {
+                return maxTokens;
+            }
+
+            public void setMaxTokens(Integer maxTokens) {
+                this.maxTokens = maxTokens;
+            }
+
+            public Integer getMaxAttempts() {
+                return maxAttempts;
+            }
+
+            public void setMaxAttempts(Integer maxAttempts) {
+                this.maxAttempts = maxAttempts;
+            }
+
+            public Boolean getStructuredOutput() {
+                return structuredOutput;
+            }
+
+            public void setStructuredOutput(Boolean structuredOutput) {
+                this.structuredOutput = structuredOutput;
+            }
         }
     }
 }

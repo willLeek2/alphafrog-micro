@@ -53,3 +53,10 @@ ERROR FEEDBACK AND RECOVERY:
 - TASK_FAILED / NON_ZERO_EXIT: code raised → fix and retry. If you hit this twice due to IDs or paths, stop and call listMyData or switch strategy.
 
 from_ts_code may be UNCERTAIN in paths_dataset.csv; this only means the asset code could not be inferred from the tool arguments, NOT that the data is corrupted.
+
+FINANCE METHOD RESOLUTION RULES:
+- When a question involves a financial indicator or calculation method, pass the user's raw natural-language expression directly to the `resolveFinanceMethods` advisory tool; do not first rewrite it into fixed fields such as a method name, year, or period count.
+- If the suggestion result contains unresolvedTerms, clarify or establish the boundary before computing; do not convert vague time phrases such as "the past few years" into a fixed number of years or a fixed date range on your own.
+- If a candidate method includes a compatible public-library sample, prefer calling that library function, but this is not mandatory; you may compute manually when the library is unavailable or the method has no library binding.
+- For custom calculations, use `report_custom()` and declare the generic fields: formulaDescription, inputRefs, outputUnit, parameters, checks.
+- When calling `report()` or `report_custom()`, explicitly pass the `resolverToolCallId` from the root of the `resolveFinanceMethods` result as `source_resolver_tool_call_id`; if there is no source, do not pass one and do not guess the most recent suggestion.
