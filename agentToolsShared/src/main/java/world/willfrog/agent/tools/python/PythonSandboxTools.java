@@ -69,6 +69,10 @@ public class PythonSandboxTools {
             + "Sandbox input: paths_dataset.csv + path_manifest.csv; use "
             + "`from af_dataset_loader import load_manifest, load_datasets`. "
             + "Runtime preinstalled: numpy==2.4.1, pandas==2.3.3, matplotlib==3.10.8, scipy==1.17.0. "
+            + "Finance questions can pass the raw natural-language expression to resolveFinanceMethods first. "
+            + "If a candidate has unresolved boundaries, do not invent values; use compatible public libraries when available but not mandatory; "
+            + "custom calculations must declare generic fields; pass the resolver root resolverToolCallId to report() or report_custom() "
+            + "via the source_resolver_tool_call_id parameter. "
             + "See loadToolDescription() for full docs (load failure falls back to a hardcoded equivalent).";
 
     private static final String FALLBACK_TOOL_DESCRIPTION = "Execute Python code in a secure sandbox. REQUIRED: code and at least one of "
@@ -79,6 +83,10 @@ public class PythonSandboxTools {
             + "DatasetLoadResult with frame / failed_members / skipped_members; load_datasets('1') returns dict[from_ts_code, DataFrame]. "
             + "For multiple datasets/manifests, load one run-level number at a time in helper code and merge results. "
             + "Do not construct /sandbox/input/<dataset_id>/ or /sandbox/runs/<oldTaskId>/ paths. "
+            + "Finance questions can pass the raw natural-language expression to resolveFinanceMethods first. "
+            + "If a candidate has unresolved boundaries, do not invent values; use compatible public libraries when available but not mandatory; "
+            + "custom calculations must declare generic fields; pass the resolver root resolverToolCallId to report() or report_custom() "
+            + "via the source_resolver_tool_call_id parameter. "
             + "OPTIONAL: libraries (comma-separated, e.g. 'numpy,pandas'), timeout_seconds. "
             + "Runtime preinstalled: numpy==2.4.1, pandas==2.3.3, matplotlib==3.10.8, scipy==1.17.0. "
             + "Service stack: fastapi==0.128.0, uvicorn[standard]==0.40.0, pydantic==2.12.5, llm-sandbox[docker]==0.3.33. "

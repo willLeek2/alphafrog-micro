@@ -5,10 +5,11 @@ import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.Test;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.config.StressTestProperties;
+import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.service.AgentObservabilityService;
 import world.willfrog.agent.tools.compaction.RereadToolHandler;
-import world.willfrog.agent.tools.docs.LoadToolGuideTool;
 import world.willfrog.agent.tools.dataset.ListMyDataTool;
+import world.willfrog.agent.tools.docs.LoadToolGuideTool;
 import world.willfrog.agent.tools.finance.FinanceMethodTools;
 import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
@@ -24,21 +25,20 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.when;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 /**
- * Task #70 review fix: ToolRouter must route getStockSwIndustryInfo to MarketDataTools
- * with proper parameter alias resolution (tsCode / ts_code / code / stock_code / arg0).
+ * ToolRouter 对 resolveFinanceMethods 的路由测试。
  */
-class ToolRouterGetStockSwIndustryInfoRouteTest {
+class ToolRouterFinanceMethodRouteTest {
 
     @SuppressWarnings("unchecked")
     @Test
-    void invoke_shouldRouteGetStockSwIndustryInfoWithAliasParams() throws Exception {
-        MarketDataTools marketDataTools = mock(MarketDataTools.class);
-        when(marketDataTools.getStockSwIndustryInfo(eq("000001.SZ")))
-                .thenReturn("{\"ok\":true,\"tool\":\"getStockSwIndustryInfo\",\"data\":{\"ts_code\":\"000001.SZ\",\"count\":1,\"items\":[]},\"error\":null}");
+    void invoke_shouldRouteResolveFinanceMethods() throws Exception {
+        FinanceMethodTools financeMethodTools = mock(FinanceMethodTools.class);
+        when(financeMethodTools.resolveFinanceMethods(eq("这几年涨了多少"), eq("已有收盘价")))
+                .thenReturn("{\"ok\":true,\"tool\":\"resolveFinanceMethods\",\"data\":{},\"error\":null}");
 
         ToolResultCacheService cacheService = mock(ToolResultCacheService.class);
         when(cacheService.executeWithCache(anyString(), any(), anyString(), any())).thenAnswer(inv -> {
@@ -52,11 +52,11 @@ class ToolRouterGetStockSwIndustryInfoRouteTest {
         });
 
         ToolRouter router = new ToolRouter(
-                marketDataTools,
+                mock(MarketDataTools.class),
                 mock(RagTools.class),
                 mock(SearchTools.class),
                 mock(PythonSandboxTools.class),
-                mock(FinanceMethodTools.class),
+                financeMethodTools,
                 mock(LoadToolGuideTool.class),
                 mock(ListMyDataTool.class),
                 new PythonStaticPrecheckService(),
@@ -69,65 +69,17 @@ class ToolRouterGetStockSwIndustryInfoRouteTest {
                 new StressTestProperties()
         );
 
-        // Test with ts_code alias (most common LLM output)
         ToolRouter.ToolInvocationResult result = router.invokeWithMeta(
-                "getStockSwIndustryInfo",
-                Map.of("ts_code", "000001.SZ")
+                "resolveFinanceMethods",
+                Map.of("query", "这几年涨了多少", "context", "已有收盘价")
         );
 
         assertTrue(result.isSuccess());
-        verify(marketDataTools).getStockSwIndustryInfo(eq("000001.SZ"));
+        verify(financeMethodTools).resolveFinanceMethods(eq("这几年涨了多少"), eq("已有收盘价"));
     }
 
-    @SuppressWarnings("unchecked")
     @Test
-    void invoke_shouldRouteGetStockSwIndustryInfoWithPositionalArg0() throws Exception {
-        MarketDataTools marketDataTools = mock(MarketDataTools.class);
-        when(marketDataTools.getStockSwIndustryInfo(eq("600519.SH")))
-                .thenReturn("{\"ok\":true,\"tool\":\"getStockSwIndustryInfo\",\"data\":{\"ts_code\":\"600519.SH\",\"count\":2,\"items\":[]},\"error\":null}");
-
-        ToolResultCacheService cacheService = mock(ToolResultCacheService.class);
-        when(cacheService.executeWithCache(anyString(), any(), anyString(), any())).thenAnswer(inv -> {
-            Supplier<ToolResultCacheService.ToolExecutionOutcome> supplier = inv.getArgument(3);
-            ToolResultCacheService.ToolExecutionOutcome outcome = supplier.get();
-            return ToolResultCacheService.CachedToolCallResult.builder()
-                    .result(outcome.getResult())
-                    .durationMs(outcome.getDurationMs())
-                    .success(outcome.isSuccess())
-                    .build();
-        });
-
-        ToolRouter router = new ToolRouter(
-                marketDataTools,
-                mock(RagTools.class),
-                mock(SearchTools.class),
-                mock(PythonSandboxTools.class),
-                mock(FinanceMethodTools.class),
-                mock(LoadToolGuideTool.class),
-                mock(ListMyDataTool.class),
-                new PythonStaticPrecheckService(),
-                llmPropertiesWithStaticPrecheck(true),
-                cacheService,
-                mock(RereadToolHandler.class),
-                mock(AgentObservabilityService.class),
-                new ObjectMapper(),
-                new SimpleMeterRegistry(),
-                new StressTestProperties()
-        );
-
-        // Test with arg0 positional parameter (legacy prompt style)
-        ToolRouter.ToolInvocationResult result = router.invokeWithMeta(
-                "getStockSwIndustryInfo",
-                Map.of("arg0", "600519.SH")
-        );
-
-        assertTrue(result.isSuccess());
-        verify(marketDataTools).getStockSwIndustryInfo(eq("600519.SH"));
-    }
-
-    @SuppressWarnings("unchecked")
-    @Test
-    void supportedTools_shouldIncludeGetStockSwIndustryInfo() {
+    void supportedTools_shouldIncludeResolveFinanceMethods() {
         ToolRouter router = new ToolRouter(
                 mock(MarketDataTools.class),
                 mock(RagTools.class),
@@ -145,10 +97,8 @@ class ToolRouterGetStockSwIndustryInfoRouteTest {
                 new SimpleMeterRegistry(),
                 new StressTestProperties()
         );
-        assertTrue(router.supportedTools().contains("getStockSwIndustryInfo"),
-                "supportedTools must include getStockSwIndustryInfo");
-        assertEquals(1, router.supportedTools().stream().filter("getStockSwIndustryInfo"::equals).count(),
-                "getStockSwIndustryInfo should appear exactly once (no duplication)");
+        assertTrue(router.supportedTools().contains("resolveFinanceMethods"));
+        assertEquals(1, router.supportedTools().stream().filter("resolveFinanceMethods"::equals).count());
     }
 
     private AgentLlmProperties llmPropertiesWithStaticPrecheck(boolean enabled) {

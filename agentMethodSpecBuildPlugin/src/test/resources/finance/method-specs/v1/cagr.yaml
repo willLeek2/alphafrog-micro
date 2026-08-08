@@ -29,9 +29,8 @@ conventions:
   finance.growth:
     periodMeaning: 起止时点之间的期间数
     calculationExpression: (endingValue / beginningValue) ** (1 / periods) - 1
-    narrativeTemplate: 使用已明确的起始值 {beginningValue}、结束值 {endingValue} 和实际区间长度 {periods}，按 `(结束值 / 起始值)^(1 / 区间长度) - 1` 计算
 outputs:
-  - {name: cagr, unit: ratio, description: 复合年均增长率, displayFormat: percent}
+  - {name: cagr, unit: ratio, description: 复合年均增长率}
 libraryBinding:
   package: alphafrog_finance
   function: cagr

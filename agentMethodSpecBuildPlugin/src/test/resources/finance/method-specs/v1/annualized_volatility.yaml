@@ -32,9 +32,8 @@ conventions:
     returnType: simple_period_returns
     stdevDdof: 1
     annualization: multiply_stdev_by_sqrt_periods_per_year
-    narrativeTemplate: 使用输入的{returns}（窗口语义：缺省为全样本，否则取序列末尾 window 期），按样本标准差（ddof=1）乘以每年 {periodsPerYear} 期的平方根换算为年化波动率
 outputs:
-  - {name: annualized_volatility, unit: ratio_per_annum, description: 年化波动率, displayFormat: percent}
+  - {name: annualized_volatility, unit: ratio_per_annum, description: 年化波动率}
 libraryBinding:
   package: alphafrog_finance
   function: annualized_volatility
