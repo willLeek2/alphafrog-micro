@@ -16,7 +16,6 @@ from llm_sandbox import SandboxSession
 from llm_sandbox.exceptions import SandboxTimeoutError
 
 from .bounded_exec_wrapper import (
-    CAPTURE_DIR_NAME,
     CAPTURE_RESULT_FILE_NAME,
     RECORDS_FILE_NAME,
     STDERR_FILE_NAME,
@@ -55,6 +54,10 @@ TEMP_MANIFEST_DIR_PREFIX = "_agent_run_manifest_"
 # task workspace (zero global-path writes, so it stays safe under future
 # per-container concurrency; codex 56d28076 — the global sitecustomize.py
 # write/delete is what is NOT task-local yet, not this package).
+# capture_reader.py is staged because the wrapper IMPORTS it pre-spawn
+# (PIN 1) for the in-memory wrapper-tail readback; it is never executed as a
+# process in-container — after user code exits nothing in the task workspace
+# runs again.
 WRAPPER_MODULE_FILES = (
     "__init__.py",
     "output_capture.py",
@@ -1228,41 +1231,36 @@ def _wrapper_run_command(
 
 
 def _read_capture_from_container(
-    session: SandboxSession,
-    config: SandboxConfig,
+    wrapper_output,
     task_id: str,
-    task_workspace: str,
-    interpreter: str,
     limits: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Read the wrapper's bounded artifacts back BEFORE cleanup (§7.1 step 7).
 
-    Runs the stdlib ``capture_reader`` inside the container WITH the four
-    frozen §13 limits (codex f86c66f5 / e083e181: the reader bounds every
-    artifact against them BEFORE readback, never trusting artifact
-    self-reported summaries), decodes the emitted JSON into a temporary
-    directory, and hands the files to the fail-closed host-side reader
-    (``read_capture_artifacts``, codex c72db8f6 item 3: presence/byte-
-    length/record-channel consistency/cap re-validation all performed).
-    ANY inconsistency raises -> the task fails instead of reporting a
-    half-formed finance_record_channel.
+    Wrapper-tail model (P0 fix): the trusted wrapper imported
+    ``capture_reader`` BEFORE spawning the user child, performed the bounded
+    readback IN MEMORY with the four frozen §13 limits after the child
+    exited (codex f86c66f5 / e083e181: every artifact bounded against them
+    BEFORE readback, never trusting artifact self-reported summaries), and
+    emitted the envelope on the wrapper run's OWN stdout.  This function
+    parses the envelope out of that SAME wrapper-run output — there is NO
+    second in-container execution, so after user code exits NOTHING located
+    in the user-writable task workspace is ever executed again.
+
+    Decodes the envelope into a temporary directory, and hands the files to
+    the fail-closed host-side reader (``read_capture_artifacts``, codex
+    c72db8f6 item 3: presence/byte-length/record-channel consistency/cap
+    re-validation all performed).  ANY inconsistency raises -> the task
+    fails instead of reporting a half-formed finance_record_channel.
     """
-    reader_path = (
-        f"{task_workspace}/{WRAPPER_DIR_NAME}/app/capture_reader.py"
-    )
-    capture_dir = f"{task_workspace}/{CAPTURE_DIR_NAME}"
-    limit_args = " ".join(
-        shlex.quote(str(int(limits[key]))) for key in WRAPPER_LIMIT_KEYS
-    )
-    command = f"sh -lc {shlex.quote(f'{shlex.quote(interpreter)} {shlex.quote(reader_path)} {shlex.quote(capture_dir)} {limit_args}')}"
-    output = session.execute_command(command)
-    if output.exit_code != 0:
+    if wrapper_output.exit_code != 0:
         raise RuntimeError(
             f"capture readback failed task={task_id}: "
-            f"exit_code={output.exit_code} stderr={(output.stderr or '')[:512]!r}"
+            f"exit_code={wrapper_output.exit_code} "
+            f"stderr={(wrapper_output.stderr or '')[:512]!r}"
         )
     try:
-        document = json.loads(output.stdout or "")
+        document = json.loads(wrapper_output.stdout or "")
     except ValueError as exc:
         raise RuntimeError(
             f"capture readback returned invalid JSON task={task_id}: {exc}"
@@ -1345,17 +1343,19 @@ def _run_bounded_wrapper_path(
     phase_timings["wrapper_exec_ms"] = int((time.monotonic() - t_exec) * 1000)
     if output.exit_code != 0:
         # The WRAPPER failed (not the child): capture-result.json was never
-        # written or the wrapper itself crashed.  Diagnostics only — the
-        # wrapper never echoes user content to its own stderr (§18).
+        # written, the wrapper itself crashed, or its trusted wrapper-tail
+        # readback rejected the capture (tamper).  Diagnostics only — the
+        # wrapper never echoes user content to its own stderr (§18).  The
+        # host fails closed on this nonzero terminal.
         raise RuntimeError(
             f"bounded wrapper failed task={task_id}: "
             f"exit_code={output.exit_code} stderr={(output.stderr or '')[:512]!r}"
         )
 
     t_read = time.monotonic()
-    artifacts = _read_capture_from_container(
-        session, config, task_id, task_workspace, interpreter, limits
-    )
+    # Wrapper-tail model: the envelope rides the wrapper run's OWN stdout —
+    # there is NO second in-container execution after user code exits.
+    artifacts = _read_capture_from_container(output, task_id, limits)
     phase_timings["capture_read_ms"] = int((time.monotonic() - t_read) * 1000)
 
     result = _WrappedScriptResult(

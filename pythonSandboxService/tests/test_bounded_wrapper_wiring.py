@@ -3,13 +3,24 @@
 c72db8f6 item 1): create_task snapshot freeze -> runner wrapper path ->
 container-side capture -> readback -> §5.1 channel.
 
+Wrapper-tail model (P0 fix): the trusted wrapper imports ``capture_reader``
+BEFORE spawning the user child and, after the child exits, performs the
+bounded readback IN MEMORY and emits EXACTLY ONE envelope JSON document on
+its own stdout; the host parses the envelope out of that SAME wrapper run
+and NEVER executes anything from the user-writable task workspace after
+user code exits.  The retired reader CLI (wrong-arg-count / non-integer
+exit-2 contracts) is therefore no longer tested here; the read discipline
+(symlink/FIFO/oversize/joint/line-count/envelope-ceiling) is pinned against
+the module API directly, plus wrapper-level stdout-discipline and
+reader-overwrite regression tests.
+
 The functional tier drives ``run_in_open_session`` END TO END with the REAL
-staged wrapper and capture reader running as host subprocesses behind a
-host-backed FakeSession: container paths are literal host paths under a
-per-test root, ``copy_to_runtime`` copies bytes, and ``execute_command``
-runs the exact ``sh -lc`` scripts production builds.  A PATH shim makes
-``python`` resolve to ``sys.executable`` (production containers have it on
-PATH; hosts may not).  No Docker required.
+staged wrapper running as a host subprocess behind a host-backed
+FakeSession: container paths are literal host paths under a per-test root,
+``copy_to_runtime`` copies bytes, and ``execute_command`` runs the exact
+``sh -lc`` scripts production builds.  A PATH shim makes ``python`` resolve
+to ``sys.executable`` (production containers have it on PATH; hosts may
+not).  No Docker required.
 
 Run from pythonSandboxService/:
 
@@ -21,9 +32,7 @@ suite needs the service requirements like the other runner/main suites.)
 from __future__ import annotations
 
 import base64
-import contextlib
 import hashlib
-import io
 import json
 import os
 import shutil
@@ -60,7 +69,6 @@ from app.capture_reader import (  # noqa: E402
     CAPTURE_FILE_NAMES,
     CAPTURE_SUMMARY_MAX_BYTES,
     _envelope_ceiling,
-    main as capture_reader_main,
     read_capture_files,
 )
 from app.config import SandboxConfig  # noqa: E402
@@ -191,6 +199,25 @@ class FakeContainerSession:
 
     def close(self) -> None:
         pass
+
+
+class RecordingFakeContainerSession(FakeContainerSession):
+    """FakeContainerSession that also records the wrapper-run outputs.
+
+    The wrapper-tail envelope rides the wrapper run's OWN stdout; tests that
+    pin the stdout discipline (PIN 2) or the no-flood regression need the raw
+    wrapper-run output, so every ``run_wrapper.py`` execution is captured.
+    """
+
+    def __init__(self, root: Path, *, skip_environment_setup: bool) -> None:
+        super().__init__(root, skip_environment_setup=skip_environment_setup)
+        self.wrapper_outputs: list = []
+
+    def execute_command(self, command: str, workdir=None):
+        output = super().execute_command(command, workdir)
+        if sandbox_runner.WRAPPER_BOOTSTRAP_NAME in command:
+            self.wrapper_outputs.append(output)
+        return output
 
 
 def _make_dataset(root: Path) -> None:
@@ -416,29 +443,17 @@ class WrapperStagingTest(unittest.TestCase):
 
 
 class CaptureReadbackTest(unittest.TestCase):
-    """Host-side guards around the container readback (fail-closed)."""
+    """Host-side guards around the wrapper-run readback (fail-closed).
 
-    class ScriptedSession:
-        def __init__(self, output):
-            self.output = output
-
-        def execute_command(self, command, workdir=None):
-            return self.output
-
-    def setUp(self):
-        self.config = _test_config(Path(tempfile.gettempdir()), skip_environment_setup=True)
+    The envelope rides the wrapper run's OWN stdout (wrapper-tail model);
+    these tests script that run output directly — no second in-container
+    execution exists anymore.
+    """
 
     def _read(self, output):
-        return _read_capture_from_container(
-            self.ScriptedSession(output),
-            self.config,
-            "task-rb",
-            "/tmp/task-rb",
-            "python",
-            dict(_LIMITS),
-        )
+        return _read_capture_from_container(output, "task-rb", dict(_LIMITS))
 
-    def test_nonzero_reader_exit_raises(self):
+    def test_nonzero_wrapper_exit_raises(self):
         with self.assertRaisesRegex(RuntimeError, "capture readback failed"):
             self._read(SimpleNamespace(exit_code=1, stdout="", stderr="boom"))
 
@@ -477,6 +492,9 @@ class CaptureReadbackTest(unittest.TestCase):
             "recordDigest": (
                 "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
             ),
+            "unknownMarkerLines": 0,
+            "unknownMarkerBytes": 0,
+            "unknownMarkerTruncated": False,
         }
         document = json.dumps(
             {
@@ -507,7 +525,9 @@ class CaptureReaderModuleTest(unittest.TestCase):
             },
         )
 
-    def test_presence_semantics_and_subprocess_round_trip(self):
+    def test_presence_semantics_via_module_api(self):
+        # The reader CLI is retired (wrapper-tail model): the read discipline
+        # is pinned against the module API the wrapper calls in memory.
         with tempfile.TemporaryDirectory(prefix="af-reader-test-") as tmp:
             capture = Path(tmp) / "capture"
             capture.mkdir()
@@ -526,38 +546,42 @@ class CaptureReaderModuleTest(unittest.TestCase):
             self.assertEqual(
                 base64.b64decode(document["files"]["stdout.bin"]), b"abc"
             )
-            # Container invocation shape: interpreter + capture dir + the four
-            # frozen §13 limit arguments (codex f86c66f5).
-            reader_path = Path(sandbox_runner.APP_DIR / "capture_reader.py")
-            limit_args = ["1048576", "262144", "262144", "128"]
-            completed = subprocess.run(
-                [sys.executable, str(reader_path), str(capture), *limit_args],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            self.assertEqual(completed.returncode, 0)
-            emitted = json.loads(completed.stdout)
-            self.assertEqual(emitted, document)
-            # Missing capture dir -> non-zero exit (host fails the task).
-            missing = subprocess.run(
-                [
-                    sys.executable, str(reader_path), str(capture / "nope"),
-                    *limit_args,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            self.assertEqual(missing.returncode, 1)
+            # Missing capture dir -> ValueError; the wrapper exits non-zero
+            # and the host fails the task.
+            with self.assertRaisesRegex(ValueError, "capture directory missing"):
+                read_capture_files(
+                    capture / "nope",
+                    stdout_max_bytes=1048576,
+                    stderr_max_bytes=262144,
+                    record_channel_max_bytes=262144,
+                    record_channel_max_records=128,
+                )
+
+    def test_cli_is_retired_no_main_no_dunder_main(self):
+        # Nothing in-container ever executes capture_reader.py as a process
+        # again: the module exposes no main() entry point.
+        import app.capture_reader as reader_module
+
+        self.assertFalse(hasattr(reader_module, "main"))
+
+    def test_wrapper_binds_reader_module_at_import_time_pin1(self):
+        # PIN 1: bounded_exec_wrapper binds capture_reader at module import
+        # time — in the container that happens at wrapper process start,
+        # BEFORE the user child is spawned.  A top-level module attribute
+        # pins the import to module-load time (no lazy post-exit import).
+        import app.bounded_exec_wrapper as wrapper_module
+        import app.capture_reader as reader_module
+
+        self.assertIs(wrapper_module.capture_reader, reader_module)
+        self.assertTrue(callable(wrapper_module.capture_reader.read_capture_files))
 
 
 # --- reader hardening: malicious capture entries must fail closed ---------
 # §7.1 stop condition (codex f86c66f5 / e083e181): the user script runs with
 # cwd = the task workspace, so MALICIOUS user code can rewrite, replace or
-# symlink the capture files before the readback.  Every attack below must be
-# rejected BEFORE any content is forwarded, and diagnostics must never carry
-# artifact content (§18).
+# symlink the capture files while it runs; the wrapper-tail readback happens
+# after it exits.  Every attack below must be rejected BEFORE any content is
+# forwarded, and diagnostics must never carry artifact content (§18).
 
 _READER_CAPS = {
     "stdout_max_bytes": 1024,
@@ -571,14 +595,6 @@ def _read_capture(capture, **overrides):
     caps = dict(_READER_CAPS)
     caps.update(overrides)
     return read_capture_files(capture, **caps)
-
-
-def _run_reader_cli(argv):
-    """Run capture_reader.main() in-process; return (exit_code, stderr)."""
-    stderr_buffer = io.StringIO()
-    with contextlib.redirect_stderr(stderr_buffer):
-        code = capture_reader_main(argv)
-    return code, stderr_buffer.getvalue()
 
 
 class CaptureReaderHardeningTest(unittest.TestCase):
@@ -597,31 +613,26 @@ class CaptureReaderHardeningTest(unittest.TestCase):
         (self.capture / name).write_bytes(data)
         return self.capture / name
 
-    def _cli_args(self):
-        return [str(self.capture), "1024", "1024", "1024", "8"]
-
     def test_symlinked_stdout_bin_rejected(self):
         outside = self.root / "outside.bin"
         outside.write_bytes(b"outside-file-bytes")
         self._write("capture-result.json", b"{}")
         os.symlink(str(outside), str(self.capture / "stdout.bin"))
-        with self.assertRaisesRegex(ValueError, "symlink"):
+        with self.assertRaises(ValueError) as ctx:
             _read_capture(self.capture)
-        # main() surfaces the same failure as a non-zero exit.
-        code, stderr_text = _run_reader_cli(self._cli_args())
-        self.assertEqual(code, 1)
-        self.assertNotIn("outside-file-bytes", stderr_text)
+        self.assertIn("symlink", str(ctx.exception))
+        # §18: the diagnostic carries names/modes only, never artifact bytes.
+        self.assertNotIn("outside-file-bytes", str(ctx.exception))
 
     def test_oversized_stdout_bin_rejected_without_content_leak(self):
         payload = b"EVIL-STDOUT-PAYLOAD" * 200  # 3800 bytes > cap 1024
         self._write("capture-result.json", b"{}")
         self._write("stdout.bin", payload)
-        with self.assertRaisesRegex(ValueError, "stdout.bin"):
+        with self.assertRaises(ValueError) as ctx:
             _read_capture(self.capture)
-        code, stderr_text = _run_reader_cli(self._cli_args())
-        self.assertEqual(code, 1)
+        self.assertIn("stdout.bin", str(ctx.exception))
         # §18: the diagnostic carries type/message only, never artifact bytes.
-        self.assertNotIn("EVIL-STDOUT-PAYLOAD", stderr_text)
+        self.assertNotIn("EVIL-STDOUT-PAYLOAD", str(ctx.exception))
 
     def test_record_channel_joint_bytes_rejected(self):
         self._write("capture-result.json", b"{}")
@@ -658,25 +669,21 @@ class CaptureReaderHardeningTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "regular file"):
             _read_capture(self.capture)
 
-    def test_wrong_arg_count_exits_2(self):
-        for argv in (
-            [],
-            [str(self.capture)],
-            [str(self.capture), "1024", "1024", "1024"],
-            [str(self.capture), "1024", "1024", "1024", "8", "extra"],
+    def test_non_integer_or_negative_limits_rejected_at_api(self):
+        # CLI limit parsing is retired; the module API itself rejects
+        # malformed limits fail-closed (the wrapper passes the frozen §13
+        # ints validated at the runner boundary).
+        self._write("capture-result.json", b"{}")
+        for bad_kwargs in (
+            {"stdout_max_bytes": "1024"},
+            {"stdout_max_bytes": True},
+            {"stderr_max_bytes": -1},
+            {"record_channel_max_bytes": 1.5},
+            {"record_channel_max_records": None},
         ):
-            with self.subTest(argv=argv):
-                code, stderr_text = _run_reader_cli(argv)
-                self.assertEqual(code, 2)
-                self.assertIn("usage", stderr_text)
-
-    def test_non_integer_limits_exit_2(self):
-        for bad in ("abc", "1.5", "", "0x10"):
-            with self.subTest(bad=bad):
-                argv = [str(self.capture), bad, "1024", "1024", "8"]
-                code, stderr_text = _run_reader_cli(argv)
-                self.assertEqual(code, 2)
-                self.assertIn("integer", stderr_text)
+            with self.subTest(bad_kwargs=bad_kwargs):
+                with self.assertRaises(ValueError):
+                    _read_capture(self.capture, **bad_kwargs)
 
     def test_envelope_ceiling_monotonic_and_bounds_documents(self):
         base = _envelope_ceiling(1024, 512, 256)
@@ -778,8 +785,10 @@ class CaptureTamperingWiringTest(unittest.TestCase):
     """Production wiring tier: MALICIOUS user code tampering with the
     capture files must fail the task at readback (§7.1 stop condition, codex
     f86c66f5 / e083e181).  Same harness as WrapperPathFunctionalTest: the
-    REAL staged wrapper and capture reader run as host subprocesses, the
-    user script with cwd = task workspace and the capture dir at capture/.
+    REAL staged wrapper runs as a host subprocess (its wrapper-tail readback
+    imports capture_reader pre-spawn and never executes anything from the
+    task workspace after the user child exits), the user script with cwd =
+    task workspace and the capture dir at capture/.
 
     The tamper is deterministic: the wrapper opens stdout.bin and
     finance-records.jsonl BEFORE spawning the child and never reopens them,
@@ -804,12 +813,12 @@ class CaptureTamperingWiringTest(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def _run(self, code, *, task_id="task-tamper"):
+    def _run(self, code, *, task_id="task-tamper", session_cls=None):
         config = _test_config(self.root, skip_environment_setup=False)
-        session = FakeContainerSession(
-            self.root, skip_environment_setup=False
-        )
-        return run_in_open_session(
+        if session_cls is None:
+            session_cls = FakeContainerSession
+        session = session_cls(self.root, skip_environment_setup=False)
+        result = run_in_open_session(
             config,
             session,
             task_id,
@@ -821,6 +830,7 @@ class CaptureTamperingWiringTest(unittest.TestCase):
             30,
             effective_output_limits=dict(self._TAMPER_LIMITS),
         )
+        return config, session, result
 
     def test_oversized_stdout_rewrite_fails_readback_without_leak(self):
         code = (
@@ -878,6 +888,152 @@ class CaptureTamperingWiringTest(unittest.TestCase):
         with self.assertRaises(RuntimeError) as ctx:
             self._run(code)
         self.assertIn("capture readback failed", str(ctx.exception))
+
+    # --- wrapper-tail P0 regression + stdout discipline (PIN 1 / PIN 2) ---
+
+    def test_overwritten_capture_reader_is_never_executed_regression(self):
+        """P0 regression repro: user code overwrites the staged
+        bounded-wrapper/app/capture_reader.py with an unbounded-flood script
+        and exits 0.  Under the OLD design the runner executed that
+        attacker-controlled file after user code exited, letting it flood
+        the exec stdout and forge the envelope.  Wrapper-tail model: the
+        reader was imported pre-spawn (PIN 1) and is NEVER executed as a
+        process after user code ran — the readback stays bounded and
+        genuine, and the flood payload appears nowhere host-side.
+        """
+        flood_size = 200000
+        code = (
+            "import os\n"
+            "evil_path = os.path.join('bounded-wrapper', 'app', 'capture_reader.py')\n"
+            "evil_src = 'import sys\\n"
+            f"sys.stdout.write(\"X\" * {flood_size})\\n"
+            "sys.exit(0)\\n'\n"
+            "with open(evil_path, 'w', encoding='utf-8') as fh:\n"
+            "    fh.write(evil_src)\n"
+            "with open(evil_path, 'r', encoding='utf-8') as fh:\n"
+            "    assert fh.read() == evil_src, 'overwrite did not land'\n"
+            "print('reader-overwrite-confirmed')\n"
+            "print('ordinary-line')\n"
+        )
+        config, session, result = self._run(
+            code, session_cls=RecordingFakeContainerSession
+        )
+
+        # The attack landed (verified by the attacker itself) and the task
+        # still succeeds with the GENUINE capture content.
+        self.assertEqual(result["exit_code"], 0)
+        self.assertEqual(
+            result["stdout"], "reader-overwrite-confirmed\nordinary-line\n"
+        )
+        self.assertIsNotNone(result["finance_record_channel"])
+        # The flood payload appears NOWHERE in host-side readback.
+        flood = "X" * flood_size
+        self.assertNotIn(flood, result["stdout"])
+        self.assertNotIn(flood, result["stderr"])
+        self.assertNotIn("X" * 64, result["stdout"])
+        self.assertNotIn("X" * 64, result["stderr"])
+
+        # The wrapper-run stdout stayed bounded by the envelope ceiling —
+        # no flood (the old bypass accumulated N unbounded bytes here).
+        (wrapper_output,) = session.wrapper_outputs
+        self.assertEqual(wrapper_output.exit_code, 0)
+        ceiling = _envelope_ceiling(
+            self._TAMPER_LIMITS["stdoutMaxBytes"],
+            self._TAMPER_LIMITS["stderrMaxBytes"],
+            self._TAMPER_LIMITS["recordChannelMaxBytes"],
+        )
+        self.assertLessEqual(len(wrapper_output.stdout), ceiling)
+        self.assertNotIn("X" * 64, wrapper_output.stdout)
+        # The single envelope parses and carries the genuine capture.
+        document = json.loads(wrapper_output.stdout)
+        self.assertEqual(
+            base64.b64decode(document["files"]["stdout.bin"]),
+            b"reader-overwrite-confirmed\nordinary-line\n",
+        )
+
+    def test_success_path_wrapper_stdout_is_exactly_one_json_document(self):
+        """PIN 2 success path: the wrapper's stdout is EXACTLY ONE envelope
+        JSON document — zero other bytes before or after it."""
+        config, session, result = self._run(
+            "print('discipline-probe')\n",
+            session_cls=RecordingFakeContainerSession,
+        )
+        self.assertEqual(result["exit_code"], 0)
+        (wrapper_output,) = session.wrapper_outputs
+        self.assertEqual(wrapper_output.exit_code, 0)
+        # The WHOLE stdout parses as one JSON document, and re-serializing
+        # it reproduces the stdout byte-for-byte (no leading/trailing bytes).
+        document = json.loads(wrapper_output.stdout)
+        self.assertEqual(wrapper_output.stdout, json.dumps(document))
+        self.assertIsInstance(document.get("files"), dict)
+        self.assertEqual(
+            base64.b64decode(document["files"]["stdout.bin"]),
+            b"discipline-probe\n",
+        )
+
+    def test_failure_path_wrapper_stdout_stays_empty_with_short_stderr(self):
+        """PIN 2 failure path: a tampered capture file makes the wrapper-tail
+        readback fail closed — nonzero exit, EMPTY stdout, and a short stderr
+        diagnostic that never carries capture content (§18)."""
+        code = (
+            "import os\n"
+            "with open(os.path.join('capture', 'stdout.bin.evil'), 'wb') as fh:\n"
+            "    fh.write(b'SECRET-CAPTURE-CONTENT' * 200)\n"
+            "os.replace(\n"
+            "    os.path.join('capture', 'stdout.bin.evil'),\n"
+            "    os.path.join('capture', 'stdout.bin'),\n"
+            ")\n"
+        )
+        config = _test_config(self.root, skip_environment_setup=False)
+        session = RecordingFakeContainerSession(
+            self.root, skip_environment_setup=False
+        )
+        with self.assertRaises(RuntimeError):
+            run_in_open_session(
+                config,
+                session,
+                "task-tamper",
+                "ds1",
+                None,
+                code,
+                None,
+                None,
+                30,
+                effective_output_limits=dict(self._TAMPER_LIMITS),
+            )
+        (wrapper_output,) = session.wrapper_outputs
+        self.assertNotEqual(wrapper_output.exit_code, 0)
+        self.assertEqual(wrapper_output.stdout, "")  # no envelope on failure
+        self.assertIn("capture readback failed", wrapper_output.stderr)
+        # §18: names/sizes/caps only — never capture content.
+        self.assertNotIn("SECRET-CAPTURE-CONTENT", wrapper_output.stderr)
+        self.assertLess(len(wrapper_output.stderr), 4096)
+
+    def test_overwritten_wrapper_module_itself_is_harmless(self):
+        """Overwriting bounded_exec_wrapper.py itself while the child runs
+        is harmless: the wrapper code is already in memory, and nothing from
+        the task workspace is executed again after the child exits."""
+        code = (
+            "import os\n"
+            "evil_path = os.path.join(\n"
+            "    'bounded-wrapper', 'app', 'bounded_exec_wrapper.py')\n"
+            "with open(evil_path, 'w', encoding='utf-8') as fh:\n"
+            "    fh.write('import sys\\nsys.stdout.write(\"Y\" * 200000)\\n')\n"
+            "print('still-alive')\n"
+        )
+        config, session, result = self._run(
+            code, session_cls=RecordingFakeContainerSession
+        )
+        self.assertEqual(result["exit_code"], 0)
+        self.assertEqual(result["stdout"], "still-alive\n")
+        (wrapper_output,) = session.wrapper_outputs
+        self.assertEqual(wrapper_output.exit_code, 0)
+        document = json.loads(wrapper_output.stdout)
+        self.assertEqual(
+            base64.b64decode(document["files"]["stdout.bin"]),
+            b"still-alive\n",
+        )
+        self.assertNotIn("Y" * 64, wrapper_output.stdout)
 
 
 class CreateTaskSnapshotTest(unittest.IsolatedAsyncioTestCase):
@@ -1250,6 +1406,9 @@ class ProcessTaskPersistenceTest(unittest.IsolatedAsyncioTestCase):
             "recordDigest": (
                 "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
             ),
+            "unknownMarkerLines": 0,
+            "unknownMarkerBytes": 0,
+            "unknownMarkerTruncated": False,
         }
         tampered_document = json.dumps(
             {
@@ -1265,8 +1424,10 @@ class ProcessTaskPersistenceTest(unittest.IsolatedAsyncioTestCase):
         )
 
         class TamperedReadbackSession(FakeContainerSession):
+            # Wrapper-tail model: the envelope rides the wrapper run's OWN
+            # stdout, so a forged readback means a forged wrapper-run output.
             def execute_command(self, command, workdir=None):
-                if "capture_reader.py" in command:
+                if sandbox_runner.WRAPPER_BOOTSTRAP_NAME in command:
                     return SimpleNamespace(
                         exit_code=0, stdout=tampered_document, stderr=""
                     )

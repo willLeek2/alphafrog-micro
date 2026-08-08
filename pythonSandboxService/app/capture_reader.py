@@ -1,13 +1,16 @@
 # === work-package-C (ccqwen) ===
-"""§7.1 step 7 capture readback: container-side artifact dump.
+"""§7.1 step 7 capture readback: trusted in-memory artifact dump.
 
-Runs INSIDE the execution container after the bounded wrapper finishes and
-BEFORE task-workspace cleanup (``app.sandbox_runner`` invokes it via
-``execute_command``)::
-
-    <interpreter> .../bounded-wrapper/app/capture_reader.py <capture-dir> \
-        <stdoutMaxBytes> <stderrMaxBytes> \
-        <recordChannelMaxBytes> <recordChannelMaxRecords>
+Wrapper-tail model (P0 fix: the reader is NEVER executed as a process
+inside the container).  ``app.bounded_exec_wrapper`` imports this module at
+wrapper process start, BEFORE the user child is spawned; after the child
+exits and the capture files are finalized the wrapper calls
+``read_capture_files(...)`` IN MEMORY with the four frozen §13 limits and
+emits the returned envelope on its OWN stdout.  After user code exits,
+NOTHING located in the user-writable task workspace is ever executed again,
+so user code cannot hijack the readback (the old CLI entry point is
+retired: no ``main()``, no ``__main__`` — the wrapper's nonzero-exit
+contract supersedes the old CLI exit-2/exit-1 contract).
 
 The four limit arguments are the FROZEN §13 snapshot the runner already
 validated (codex f86c66f5 / e083e181): the reader never trusts artifact
@@ -15,11 +18,11 @@ self-reported summaries for limits — every present file is bounded against
 those caps BEFORE any content is read or encoded (§7.1 stop condition:
 outputs are bounded before anything else happens).
 
-It emits ONE JSON document on stdout::
+``read_capture_files`` returns ONE JSON-able document::
 
     {"files": {"capture-result.json": "<base64>", "stdout.bin": "<base64>", ...}}
 
-containing exactly the capture files that exist under ``<capture-dir>``,
+containing exactly the capture files that exist under the capture dir,
 base64-encoded (pure ASCII, safe to transport through the container exec
 stdout channel).  File PRESENCE is significant: the host-side fail-closed
 reader (``app.finance_record_channel.read_capture_artifacts``) validates
@@ -28,22 +31,24 @@ deliberately dumb byte mover — it never interprets, truncates, filters or
 fabricates artifacts, and an absent file is simply absent from the JSON.
 
 The user script runs with cwd = the task workspace, so MALICIOUS user code
-can rewrite, replace or symlink the capture files before this reader runs.
-Every present file is therefore lstat'd WITHOUT following symlinks, opened
-with ``O_NOFOLLOW``, fstat-checked to be a regular file (never a symlink,
-directory, FIFO or device), and its fstat size is checked against the caps
-BEFORE any read — through the SAME fd that is read, so there is no
-stat/read TOCTOU window.  The whole envelope is additionally bounded by the
-worst-case serialized JSON size (``_envelope_ceiling``) both projected from
-the fstat sizes and re-checked on the real document (belt and braces).
+can rewrite, replace or symlink the capture files while it runs; the
+readback happens only after it exits.  Every present file is therefore
+lstat'd WITHOUT following symlinks, opened with ``O_NOFOLLOW``, fstat-
+checked to be a regular file (never a symlink, directory, FIFO or device),
+and its fstat size is checked against the caps BEFORE any read — through
+the SAME fd that is read, so there is no stat/read TOCTOU window.  The
+whole envelope is additionally bounded by the worst-case serialized JSON
+size (``_envelope_ceiling``) both projected from the fstat sizes and
+re-checked on the real document (belt and braces).
 
 The file-name whitelist is the §7.1 fixed capture layout; it is pinned to
 ``app.bounded_exec_wrapper``'s constants by
 ``tests/test_bounded_wrapper_wiring.py`` so the two sides cannot drift.
 
-Stdlib only; never writes anything but the JSON document to stdout and, on
-failure, a SHORT diagnostic (type/message only, never artifact CONTENT —
-§18) to stderr with a non-zero exit code (usage errors exit 2).
+Stdlib only; the module itself writes nothing anywhere — the WRAPPER emits
+the envelope (exactly one JSON document on its stdout, zero other bytes)
+and, on failure, a SHORT diagnostic (type/message only, never artifact
+CONTENT — §18) to stderr plus a non-zero exit.
 """
 
 from __future__ import annotations
@@ -53,7 +58,6 @@ import errno
 import json
 import os
 import stat
-import sys
 from pathlib import Path
 
 # §7.1 fixed capture layout (verbatim file names; keep in sync with
@@ -313,43 +317,3 @@ def read_capture_files(
                 os.close(fd)
             except OSError:
                 pass
-
-
-def main(argv: list[str] | None = None) -> int:
-    args = list(sys.argv[1:] if argv is None else argv)
-    if len(args) != 5:
-        sys.stderr.write(
-            "usage: capture_reader.py <capture-dir> <stdoutMaxBytes> "
-            "<stderrMaxBytes> <recordChannelMaxBytes> "
-            "<recordChannelMaxRecords>\n"
-        )
-        return 2
-    try:
-        stdout_max_bytes = int(args[1])
-        stderr_max_bytes = int(args[2])
-        record_channel_max_bytes = int(args[3])
-        record_channel_max_records = int(args[4])
-    except ValueError:
-        sys.stderr.write(
-            "capture_reader: limit arguments must be integers\n"
-        )
-        return 2
-    try:
-        document = read_capture_files(
-            Path(args[0]),
-            stdout_max_bytes=stdout_max_bytes,
-            stderr_max_bytes=stderr_max_bytes,
-            record_channel_max_bytes=record_channel_max_bytes,
-            record_channel_max_records=record_channel_max_records,
-        )
-    except (OSError, ValueError) as exc:
-        # SHORT diagnostic only — type/message, never artifact content (§18).
-        sys.stderr.write(f"capture_reader: {exc}\n")
-        return 1
-    json.dump(document, sys.stdout)
-    sys.stdout.write("\n")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

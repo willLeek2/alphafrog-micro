@@ -83,9 +83,24 @@ grandchild survives in the reused container, then still write
 ``capture-result.json`` — the timeout fact is carried by the non-zero
 ``exitCode`` (negative signal translation, e.g. -9 for SIGKILL).
 
-The wrapper NEVER writes user output, record lines or payloads to its own
-stdout/stderr (§18 stop condition): its exit code reports wrapper success
-(capture-result.json written); the child's fate lives in capture-result.json.
+Wrapper-tail envelope (work-package-C rework, P0 fix): after the user child
+exits and the capture files are finalized, the wrapper performs the bounded
+readback IN MEMORY through ``capture_reader`` and emits the returned
+envelope on its OWN stdout.  ``capture_reader`` is imported at wrapper
+process start, BEFORE the spawn (PIN 1): the staged copy lives in the
+user-writable task workspace, and binding it pre-spawn — while no adversary
+is alive — is what makes it trusted; after user code exits, NOTHING located
+in the task workspace is ever executed or re-imported again, so overwriting
+the staged files post-spawn is harmless.  The wrapper's stdout carries
+EXACTLY ONE bounded envelope JSON document and zero other bytes (PIN 2);
+the wrapper still NEVER writes user output, record lines or payloads to its
+own streams in readable form — the envelope is base64 and bounded by
+``capture_reader._envelope_ceiling`` (§18 stop condition).  On readback
+failure the wrapper writes a SHORT diagnostic (names/sizes/caps only, never
+capture content, §18) to stderr and exits non-zero; the host fails closed
+on the nonzero terminal.  The wrapper exit code reports wrapper success
+(capture-result.json written AND envelope emitted); the child's fate lives
+in capture-result.json.
 
 Stdlib only; importable without pydantic (``app/__init__.py`` stays empty).
 """
@@ -108,6 +123,18 @@ from app.output_capture import (
     MARKER_V1_PREFIX_BYTES,
     record_batch_digest,  # noqa: F401  re-exported: §4.1 cross-check binds it here
 )
+
+# === work-package-C: PIN 1 — pre-spawn capture_reader binding ==============
+# The readback module is imported HERE, at wrapper process start, BEFORE the
+# user child is spawned.  The staged capture_reader.py lives in the
+# user-writable task workspace, so user code may overwrite it while it runs;
+# this top-level import binds the trusted copy into memory while no
+# adversary is alive.  After the child exits the wrapper calls the IN-MEMORY
+# module only — it must NEVER lazily (re-)import it and NEVER execute
+# anything from the task workspace again; overwriting the staged file
+# post-spawn is harmless.
+from app import capture_reader
+# === end work-package-C =====================================================
 
 __all__ = [
     "CAPTURE_DIR_NAME",
@@ -515,6 +542,9 @@ def run_bounded_capture(
         )
 
         try:
+            # The child's stdout/stderr are the capture pipes ONLY: the child
+            # never inherits or shares the wrapper's own stdout fd, which
+            # later carries the single bounded envelope (PIN 2).
             proc = subprocess.Popen(
                 [sys.executable, str(script_path)],
                 stdin=subprocess.DEVNULL,
@@ -654,6 +684,35 @@ def main(argv: list[str] | None = None) -> int:
             f"bounded_exec_wrapper: internal error: {type(exc).__name__}\n"
         )
         return 1
+
+    # === work-package-C: wrapper-tail readback (PIN 1 + PIN 2) =============
+    # The user child has exited and the capture files are finalized.  The
+    # trusted reader — bound into memory BEFORE the spawn (PIN 1, top-level
+    # import) — performs the bounded readback IN MEMORY with the four frozen
+    # §13 limits.  Nothing located in the user-writable task workspace is
+    # executed or re-imported after user code ran: a user overwrite of the
+    # staged capture_reader.py (or of this wrapper file) is harmless.
+    try:
+        envelope = capture_reader.read_capture_files(
+            capture_dir,
+            stdout_max_bytes=parsed["limits"]["stdoutMaxBytes"],
+            stderr_max_bytes=parsed["limits"]["stderrMaxBytes"],
+            record_channel_max_bytes=parsed["limits"]["recordChannelMaxBytes"],
+            record_channel_max_records=parsed["limits"]["recordChannelMaxRecords"],
+        )
+    except (OSError, ValueError) as exc:
+        # Fail closed: SHORT diagnostic only — file names/sizes/caps, never
+        # capture CONTENT (§18).  The host fails the task on this nonzero
+        # terminal exit; stdout stays EMPTY on the failure path.
+        sys.stderr.write(
+            f"bounded_exec_wrapper: capture readback failed: {exc}\n"
+        )
+        return 1
+    # PIN 2: stdout carries EXACTLY ONE bounded envelope JSON document and
+    # zero other bytes before or after it (no trailing newline).
+    sys.stdout.write(json.dumps(envelope))
+    sys.stdout.flush()
+    # === end work-package-C =================================================
     return 0
 
 
