@@ -87,10 +87,30 @@ class DynamicSandboxConfig:
         -> shrink to code hard ceilings.
       - Tasks freeze ``output_limits_snapshot()`` at creation time and must
         not re-read this hot config during execution.
+      - Dynamic-install safety invariant: while dynamic install is enabled
+        (``skip_environment_setup=false``) ``containerMaxConcurrency`` must be
+        1, because ``session.install()`` mutates the shared container venv.
+        A violating base config fails startup (constructor raises); a
+        violating hot update is rejected keeping the last-known-good value.
     """
 
     def __init__(self, config: SandboxConfig) -> None:
         self._lock = threading.Lock()
+        # Dynamic-install safety invariant (plan-A decision, codex 7fb75440 /
+        # bc11e841): ``session.install()`` mutates the SHARED container venv,
+        # so while dynamic install is enabled (skip_environment_setup=false)
+        # container concurrency must stay exactly 1.  The base config is
+        # fail-fast rejected here at construction; hot updates are rejected
+        # by update_container_max_concurrency/apply_dynamic_payload below,
+        # keeping the last-known-good value instead of breaking later at
+        # session creation.
+        self._dynamic_install_enabled = not config.skip_environment_setup
+        if self._dynamic_install_enabled and config.container_max_concurrency > 1:
+            raise ValueError(
+                "container_max_concurrency must be 1 when dynamic install is "
+                "enabled (skip_environment_setup=false): session.install() "
+                "mutates the shared container venv"
+            )
         self._snapshot = self._initial_snapshot(config)
 
     # ------------------------------------------------------------------
@@ -167,6 +187,18 @@ class DynamicSandboxConfig:
             return
         with self._lock:
             old = self._snapshot.container_max_concurrency
+            if self._dynamic_install_enabled and value > 1:
+                # Fail-fast reject the hot update and KEEP the safe value:
+                # a later session creation error would break new workers,
+                # whereas rejecting here leaves the running config intact.
+                logger.warning(
+                    "DYNAMIC_CONFIG_REJECTED container_max_concurrency=%s: dynamic "
+                    "install enabled (skip_environment_setup=false) requires "
+                    "concurrency 1; keeping %s",
+                    value,
+                    old,
+                )
+                return
             self._snapshot = replace(self._snapshot, container_max_concurrency=value)
         logger.info("DYNAMIC_CONFIG container_max_concurrency %s -> %s", old, value)
 
@@ -224,6 +256,14 @@ class DynamicSandboxConfig:
             raw = payload[KEY_CONTAINER_MAX_CONCURRENCY]
             if not _is_plain_int(raw) or raw < 1:
                 errors.append(f"containerMaxConcurrency={raw!r} must be an int >= 1")
+            elif self._dynamic_install_enabled and raw > 1:
+                # Dynamic-install safety invariant: whole-object rejection
+                # keeps the last-known-good concurrency rather than letting a
+                # hot payload raise it above the only safe value (1).
+                errors.append(
+                    f"containerMaxConcurrency={raw!r} must be 1 while dynamic "
+                    "install is enabled (skip_environment_setup=false)"
+                )
         for key in OUTPUT_LIMIT_KEYS:
             if key in payload:
                 raw = payload[key]
