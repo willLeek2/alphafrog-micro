@@ -130,7 +130,7 @@ Java 必须验证：
         "requiredExecutionInputs": [
           {"name": "beginningValue", "meaning": "明确起点对应的数值"},
           {"name": "endingValue", "meaning": "明确终点对应的数值"},
-          {"name": "intervalCount", "meaning": "按方法约定换算的实际区间长度"}
+          {"name": "periods", "meaning": "按方法约定换算的实际区间长度"}
         ],
         "unresolvedTerms": ["这几年"],
         "clarificationQuestions": ["希望从哪个交易日算到哪个交易日？"]
@@ -141,7 +141,7 @@ Java 必须验证：
 }
 ```
 
-`resolverToolCallId` 在 `data` 根部只出现一次，由 Java 注入。definition、执行输入、来源和库样例由 Java 从 canonical MethodSpec 补齐。解析快照必须在工具成功返回前整批原子保存；保存失败时工具失败，不返回 `adviceDurable`、`persisted` 或半数建议。
+`resolverToolCallId` 在 `data` 根部只出现一次，由 Java 注入。definition、执行输入、来源和库样例由 Java 从 canonical MethodSpec 补齐；每个执行输入的 `name` 必须逐字等于 canonical `parameters` 的键，`meaning` 只投影 YAML 参数中经过校验的可选说明，renderer 不得改写参数名。解析快照必须在工具成功返回前整批原子保存；保存失败时工具失败，不返回 `adviceDurable`、`persisted` 或半数建议。
 
 ### 3.5 MethodSpec 公共字段和首批 YAML 草案
 
