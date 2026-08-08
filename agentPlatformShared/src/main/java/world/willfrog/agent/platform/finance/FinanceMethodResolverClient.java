@@ -1,4 +1,4 @@
-package world.willfrog.agent.tools.finance;
+package world.willfrog.agent.platform.finance;
 
 /**
  * 轻量模型解析客户端接口。实现由 agentPlatformShared 的 {@code FinanceMethodResolverModelService} 提供。

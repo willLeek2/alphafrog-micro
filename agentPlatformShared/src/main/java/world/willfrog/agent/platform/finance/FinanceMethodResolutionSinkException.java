@@ -1,4 +1,4 @@
-package world.willfrog.agent.tools.finance;
+package world.willfrog.agent.platform.finance;
 
 /**
  * 解析快照批量保存失败时抛出的专用异常。

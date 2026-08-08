@@ -7,6 +7,10 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.finance.FinanceMethodResolutionSink;
+import world.willfrog.agent.platform.finance.FinanceMethodResolutionSinkException;
+import world.willfrog.agent.platform.finance.FinanceMethodResolutionSnapshot;
+import world.willfrog.agent.platform.finance.FinanceMethodResolverClient;
 
 import java.util.Collections;
 import java.util.List;
