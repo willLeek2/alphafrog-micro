@@ -17,6 +17,11 @@ from llm_sandbox.exceptions import SandboxTimeoutError
 from .config import SandboxConfig
 from .dataset_manifest import expand_dataset_ids
 from .resource_usage import SandboxResourceUsageCollector
+from .runtime_environment import (
+    ExecutionEnvironment,
+    collect_runtime_environment,
+    write_runtime_environment_json,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1061,6 +1066,26 @@ def run_in_open_session(
         )
         timings["workspace_prepare_ms"] = int((time.monotonic() - t_workspace_start) * 1000)
 
+        # 260808-finance-methodspec-v5 work package D: collect runtime environment
+        # from the live container (Docker inspect + pip list). Same ExecutionEnvironment
+        # instance drives both the workdir file and the HTTP execution_environment
+        # field; downstream consumers see hasExecutionEnvironment() == true.
+        # We collect even if pip list fails: ExecutionEnvironment with
+        # inventory_complete=False is a valid "unknown packages" signal.
+        task_workspace = f"{config.workspace_root}/{task_id}"
+        task_execution_environment = collect_runtime_environment(
+            container_id=actual_container_id, session=session,
+        )
+        try:
+            write_runtime_environment_json(
+                task_workspace, task_execution_environment,
+            )
+        except Exception as exc:
+            logger.warning(
+                "RUNTIME_ENVIRONMENT_FILE_WRITE_FAILED task=%s error=%s",
+                task_id, exc,
+            )
+
         _log_in_container(session, task_id, config, "script_start")
         t_run_start = time.monotonic()
         _smoke_check_loader_modules(session, config, task_id)
@@ -1154,6 +1179,10 @@ def run_in_open_session(
         "recycle_reason": recycle_reason,
         "container_id": actual_container_id,
         "resource_usage": resource_usage.model_dump(mode="json"),
+        # 260808-finance-methodspec-v5 work package D: same ExecutionEnvironment
+        # instance drives both the workdir file and the HTTP execution_environment
+        # field; main.py copies this onto task.result.execution_environment.
+        "execution_environment": task_execution_environment.model_dump(mode="json"),
     }
 
 
