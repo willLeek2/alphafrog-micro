@@ -62,6 +62,15 @@ end-to-end gate tests, a ``docker build`` that writes the iidfile, and a
 ``docker run`` that serves the round-2 smoke/inventory gates (R2-1/R2-2):
 ``FAKE_DOCKER_FAIL=run`` makes every ``docker run`` fail.
 
+Fake syft CLI contract (SBOM immutable-ID regressions, Spec §12 immutable
+same-origin): the stub written by ``write_fake_syft`` /
+``write_fake_syft_recording_target`` logs the FULL argv of every invocation
+(one call per line, space-joined) to ``$SYFT_CALL_LOG`` so tests can assert
+the EXACT scan target. docker_build.sh must scan the immutable iidfile ID
+(``syft "docker:<iidfile-ID>"``), never the mutable :latest tag -- even when
+the tag is retargeted at a different image between phase 2 and the SBOM
+read (drift simulated via the alias file).
+
 Tests run via ``python3 -m unittest`` using only the standard library +
 subprocess.
 """
@@ -123,6 +132,10 @@ IMAGE_TASK_TERMINAL_ONLY = "sha256:" + "a7" * 32
 FAKE_BUILD_IMAGE_ID = "sha256:" + "de" * 32
 # A DIFFERENT immutable image ID for target-binding mismatch regressions.
 OTHER_IMAGE_ID = "sha256:" + "d3" * 32
+# Where the mutable :latest tag is retargeted in the SBOM drift regressions:
+# between phase-2 completion and the syft read a concurrent/manual build can
+# re-tag latest at a DIFFERENT image (Spec §12 immutable same-origin).
+DRIFTED_IMAGE_ID = "sha256:" + "ee" * 32
 
 # Work package A canonical generated-resources fixture shipped with the
 # work-package-B runtime suite: the FIVE canonical files (index.json +
@@ -1404,6 +1417,9 @@ class DockerBuildReleaseGateTest(RuntimeImageRetentionTestBase):
     def setUp(self) -> None:
         super().setUp()
         self.addCleanup(shutil.rmtree, str(RUNTIME_BUILD_DIR), True)
+        # Full argv log of every fake-syft invocation (one call per line).
+        self.syft_call_log = self.stub_dir / "syft-calls.log"
+        self.syft_call_log.write_text("", encoding="utf-8")
 
     def build_env(self, **overrides: str) -> dict:
         env = dict(self.env)
@@ -1418,6 +1434,7 @@ class DockerBuildReleaseGateTest(RuntimeImageRetentionTestBase):
         # presence/absence of syft deterministic across machines.
         env["PATH"] = str(self.stub_dir) + os.pathsep + "/usr/bin" + os.pathsep + "/bin"
         env["FAKE_DOCKER_BUILD_IMAGE_ID"] = FAKE_BUILD_IMAGE_ID
+        env["SYFT_CALL_LOG"] = str(self.syft_call_log)
         # Round-2 R2-1: the A-canonical method-spec inputs are a hard build
         # material. Point the gate at the fixture directory shipped with the
         # work-package-B runtime suite (resolver-catalog.json + the three
@@ -1431,11 +1448,35 @@ class DockerBuildReleaseGateTest(RuntimeImageRetentionTestBase):
         syft_path = self.stub_dir / "syft"
         syft_path.write_text(
             "#!/usr/bin/env bash\n"
+            'printf \'%s\\n\' "$*" >> "${SYFT_CALL_LOG:?SYFT_CALL_LOG not set}"\n'
             f"printf '%s' {output!r}\n"
             f"exit {exit_code}\n",
             encoding="utf-8",
         )
         syft_path.chmod(syft_path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP)
+
+    def write_fake_syft_recording_target(self, exit_code: int = 0) -> None:
+        """Fake syft that (like the real docker provider) records the image
+        reference it was asked to scan into the SBOM source metadata, so the
+        tests can assert WHICH image identity the sbomDigest evidence binds.
+        Full argv is logged to $SYFT_CALL_LOG."""
+        syft_path = self.stub_dir / "syft"
+        syft_path.write_text(
+            "#!/usr/bin/env bash\n"
+            'printf \'%s\\n\' "$*" >> "${SYFT_CALL_LOG:?SYFT_CALL_LOG not set}"\n'
+            'printf \'{"source": {"target": "%s"}, "artifacts": []}\' "${1:-}"\n'
+            f"exit {exit_code}\n",
+            encoding="utf-8",
+        )
+        syft_path.chmod(syft_path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP)
+
+    def syft_calls(self) -> list[list[str]]:
+        """Full argv of every fake-syft invocation, one list per call."""
+        return [
+            line.split()
+            for line in self.syft_call_log.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
 
     def run_build(self, env: dict) -> subprocess.CompletedProcess:
         self.assertTrue(DOCKER_BUILD_SCRIPT.is_file(), f"missing: {DOCKER_BUILD_SCRIPT}")
@@ -1735,8 +1776,11 @@ class DockerBuildReleaseGateTest(RuntimeImageRetentionTestBase):
             library_set["librarySetDigest"],
             "mapping must carry the SAME verified librarySetDigest",
         )
-        # R2-3 binding aid: the entry records the build-time imageRef.
-        self.assertEqual(entry["imageRef"], "alphafrog-sandbox-runtime:latest")
+        # R2-3 binding aid: the entry's imageRef alias is the SAME immutable
+        # iidfile ID the entry binds. The mutable :latest tag is NEVER
+        # recorded as evidence in the mapping (Spec §12 immutable
+        # same-origin: the tag can drift to another image at any time).
+        self.assertEqual(entry["imageRef"], FAKE_BUILD_IMAGE_ID)
 
     def test_build_wiring_two_phase_order_smoke_inventory_then_bake(self) -> None:
         # R2-1/R2-2 wiring order: phase-1 build (runtime-install) -> smoke
@@ -1832,6 +1876,162 @@ class DockerBuildReleaseGateTest(RuntimeImageRetentionTestBase):
         self.assertLess(smoke_system, inventory, "inventory gate must follow the smoke gate")
         self.assertLess(smoke_venv, inventory, "inventory gate must follow the smoke gate")
         self.assertLess(inventory, phase2, "the bake must follow the inventory gate")
+
+
+class SyftImmutableIdRegressionTest(DockerBuildReleaseGateTest):
+    """Spec §12 immutable same-origin at the SBOM step (reviewer codex
+    653674d9): after phase 2 obtains the iidfile's exact immutable image ID,
+    syft must scan EXACTLY that ID -- never the mutable :latest tag, which a
+    concurrent/manual build can retarget between phase-2 completion and the
+    syft read. The SBOM/mapping evidence and the deploy gate bind ONLY the
+    immutable ID; the local convenience tag stays a NON-evidence alias and
+    never enters the SBOM/mapping/deploy chain -- even under tag drift."""
+
+    LATEST_TAG = "alphafrog-sandbox-runtime:latest"
+
+    def run_verified_build_with_drifting_latest(self) -> subprocess.CompletedProcess:
+        """Full verified runtime build (releasable inputs + working syft)
+        while the mutable :latest tag is retargeted at a DIFFERENT image
+        between phase 2 and the SBOM read (alias-file drift)."""
+        self.add_alias(self.LATEST_TAG, DRIFTED_IMAGE_ID)
+        self.write_fake_syft_recording_target(0)
+        env = self.build_env(
+            BASE_IMAGE_DIGEST=self.BASE_DIGEST,
+            METHOD_SPEC_INDEX_DIGEST=canonical_index_digest(),
+        )
+        result = self.run_build(env)
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"stdout={result.stdout}\nstderr={result.stderr}",
+        )
+        return result
+
+    def run_deploy_gate(self, image: str, **extra_env: str) -> subprocess.CompletedProcess:
+        env = dict(self.env)
+        for key in (
+            "AF_SANDBOX_IMAGE",
+            "AF_SANDBOX_IMAGE_ALLOW_DEV_TAG",
+            "AF_SANDBOX_ALLOW_INCOMPLETE_DEV_BUILD",
+        ):
+            env.pop(key, None)
+        env["AF_SANDBOX_IMAGE"] = image
+        env.update(extra_env)
+        self.assertTrue(DEPLOY_SCRIPT.is_file(), f"missing: {DEPLOY_SCRIPT}")
+        return subprocess.run(
+            ["bash", str(DEPLOY_SCRIPT), "--deploy-only", "python-sandbox-service"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+
+    def test_syft_argv_is_exactly_the_iidfile_id_even_if_latest_drifts(self) -> None:
+        self.run_verified_build_with_drifting_latest()
+        calls = self.syft_calls()
+        self.assertEqual(len(calls), 1, f"expected exactly one syft invocation: {calls}")
+        # The scan target is EXACTLY the phase-2 iidfile immutable ID -- not
+        # the mutable tag, and not whatever the tag currently resolves to.
+        self.assertEqual(
+            calls[0],
+            ["docker:" + FAKE_BUILD_IMAGE_ID, "-o", "json"],
+            f"syft must scan the iidfile immutable ID exclusively: {calls}",
+        )
+
+    def test_sbom_and_mapping_evidence_bind_only_the_iidfile_id(self) -> None:
+        self.run_verified_build_with_drifting_latest()
+        # The convenience tag is RETAINED on the phase-2 build call ...
+        build_calls = self.calls_for("build")
+        self.assertEqual(len(build_calls), 2, f"expected two build phases: {build_calls}")
+        self.assertIn(self.LATEST_TAG, build_calls[1])
+        # ... yet it NEVER enters the SBOM or the mapping evidence.
+        sbom_path = RUNTIME_BUILD_DIR / "sbom.json"
+        sbom_text = sbom_path.read_text(encoding="utf-8")
+        self.assertIn(FAKE_BUILD_IMAGE_ID, sbom_text)
+        self.assertNotIn(DRIFTED_IMAGE_ID, sbom_text)
+        self.assertNotIn(self.LATEST_TAG, sbom_text)
+        mapping_text = MAPPING_FILE.read_text(encoding="utf-8")
+        self.assertNotIn(DRIFTED_IMAGE_ID, mapping_text)
+        self.assertNotIn(self.LATEST_TAG, mapping_text)
+        mapping = json.loads(mapping_text)
+        self.assertEqual(list(mapping["images"]), [FAKE_BUILD_IMAGE_ID])
+        entry = mapping["images"][FAKE_BUILD_IMAGE_ID]
+        self.assertEqual(entry["imageRef"], FAKE_BUILD_IMAGE_ID)
+        # sbomDigest is the sha256 of EXACTLY these SBOM bytes, and those
+        # bytes bind the iidfile ID (never the drifted/tag identity).
+        expected_sbom_digest = (
+            "sha256:" + hashlib.sha256(sbom_path.read_bytes()).hexdigest()
+        )
+        self.assertEqual(entry["sbomDigest"], expected_sbom_digest)
+        self.assertTrue(entry["releasable"])
+        self.assertEqual(entry["incompleteInputs"], [])
+
+    def test_deploy_rejects_drifted_latest_against_this_builds_mapping(self) -> None:
+        # The build's mapping binds ONLY the iidfile ID. After the tag
+        # drifts, deploying :latest targets the drifted image, which the
+        # mapping does NOT bind -> fail closed (no evidence for that image).
+        self.run_verified_build_with_drifting_latest()
+        result = self.run_deploy_gate(
+            self.LATEST_TAG, AF_SANDBOX_IMAGE_ALLOW_DEV_TAG="true"
+        )
+        self.assertEqual(
+            result.returncode,
+            1,
+            f"drifted :latest was deployed against this build's mapping\n"
+            f"stdout={result.stdout}\nstderr={result.stderr}",
+        )
+        self.assertNotIn("Deployment completed", result.stdout)
+
+    def test_deploy_rejects_tag_derived_evidence_for_another_image(self) -> None:
+        # Evidence derived ONLY from the mutable tag (an entry keyed by the
+        # drifted ID and recorded under the tag) cannot authorize deploying
+        # THIS build's image.
+        self.add_alias(self.LATEST_TAG, DRIFTED_IMAGE_ID)
+        self.add_alias(ACCEPT_REFS[0], FAKE_BUILD_IMAGE_ID)
+        self.write_mapping_file(
+            self.bound_mapping(image_id=DRIFTED_IMAGE_ID, imageRef=self.LATEST_TAG)
+        )
+        result = self.run_deploy_gate(ACCEPT_REFS[0])
+        self.assertEqual(
+            result.returncode,
+            1,
+            f"tag-derived evidence authorized an unrelated image\n"
+            f"stdout={result.stdout}\nstderr={result.stderr}",
+        )
+        self.assertNotIn("Deployment completed", result.stdout)
+
+    def test_deploy_still_accepts_this_build_via_digest_reference(self) -> None:
+        # Positive control for the drift scenario: a digest reference that
+        # resolves to the SAME immutable iidfile ID remains deployable --
+        # the binding is the ID, never the tag.
+        self.run_verified_build_with_drifting_latest()
+        self.add_alias(ACCEPT_REFS[0], FAKE_BUILD_IMAGE_ID)
+        result = self.run_deploy_gate(ACCEPT_REFS[0])
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"stdout={result.stdout}\nstderr={result.stderr}",
+        )
+        self.assertIn("Deployment completed", result.stdout)
+
+    def test_malformed_phase2_iidfile_fails_closed_before_syft_and_mapping(self) -> None:
+        self.write_fake_syft(0)
+        env = self.build_env(
+            BASE_IMAGE_DIGEST=self.BASE_DIGEST,
+            METHOD_SPEC_INDEX_DIGEST=canonical_index_digest(),
+            FAKE_DOCKER_BUILD_IMAGE_ID="sha256:not-a-64-hex-id",
+        )
+        result = self.run_build(env)
+        self.assertEqual(
+            result.returncode,
+            1,
+            f"malformed iidfile ID entered the evidence chain\n"
+            f"stdout={result.stdout}\nstderr={result.stderr}",
+        )
+        self.assertIn("phase-2 --iidfile image ID", result.stderr)
+        self.assertEqual(self.syft_calls(), [])
+        self.assertFalse(MAPPING_FILE.exists())
 
 
 if __name__ == "__main__":

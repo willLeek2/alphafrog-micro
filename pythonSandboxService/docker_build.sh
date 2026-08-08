@@ -46,7 +46,15 @@
 #      R2-3);
 #   9. SBOM generation is a documented OPTIONAL hook: syft is not required to
 #      install, but a build without a verified SBOM is NOT releasable (see
-#      the release gate below); agents never fabricate digests.
+#      the release gate below); agents never fabricate digests. When syft
+#      runs, it scans EXACTLY THIS build's immutable iidfile image ID
+#      (`syft "docker:${image_digest}"`) -- NEVER the mutable :latest tag:
+#      between phase 2 and the SBOM read the tag can be retargeted by
+#      another build, so a latest-based scan could attribute a DIFFERENT
+#      image's SBOM to this build's exact imageDigest (Spec §12 immutable
+#      same-origin proof). The `-t ...:latest` tag on phase 2 is a
+#      NON-evidence alias for local convenience ONLY: it never enters the
+#      SBOM, the external mapping, or the deploy chain.
 #
 # RELEASE GATE (Spec §12 hardening, fail-closed):
 #   The runtime build DEFAULT-FAILS when any release input is missing or a
@@ -100,8 +108,13 @@ usage() {
 Usage:
   bash docker_build.sh            # build runtime and service images
   bash docker_build.sh all
-  bash docker_build.sh runtime    # build alphafrog-sandbox-runtime:latest only
+  bash docker_build.sh runtime    # build the runtime image only
   bash docker_build.sh service    # build alphafrog-python-sandbox:latest only
+
+The runtime image carries the local convenience tag
+alphafrog-sandbox-runtime:latest, but that tag is a NON-evidence alias:
+SBOM, external mapping and deploy gates bind ONLY the immutable --iidfile
+image ID (Spec §12 immutable same-origin).
 
 Runtime target (Spec §12) environment inputs:
   BASE_IMAGE_DIGEST          verified base-image digest, sha256:<64 lowercase
@@ -542,6 +555,12 @@ print(match.group(1))
   cp "$canonical_dir/index.json" "$out_dir/index.json"
   local iid_file="$out_dir/image-id"
   rm -f "$iid_file"
+  # NOTE: the `-t alphafrog-sandbox-runtime:latest` tag is a NON-evidence
+  # alias kept ONLY for local convenience (docker run by tag during dev). It
+  # NEVER enters the SBOM, the external mapping, or the deploy chain: all
+  # evidence below binds the immutable --iidfile image ID exclusively
+  # (Spec §12 immutable same-origin; the tag can be retargeted by any
+  # concurrent/manual build at any time).
   run_docker_build \
     -t alphafrog-sandbox-runtime:latest \
     -f "$SCRIPT_DIR/Dockerfile.runtime" \
@@ -556,14 +575,29 @@ print(match.group(1))
   local image_digest
   image_digest="$(cat "$iid_file")"
   echo "[pythonSandbox] imageDigest=${image_digest} (immutable image ID via --iidfile)"
+  # Fail-closed: the phase-2 iidfile must carry EXACTLY sha256:<64 lowercase
+  # hex>. Every downstream binding -- the syft SBOM scan target, the external
+  # mapping key, the deploy gate -- derives from this value ALONE; a
+  # malformed ID must never enter evidence (Spec §12 immutable same-origin).
+  require_sha256_value "phase-2 --iidfile image ID" "$image_digest"
 
   # 13) SBOM: documented optional hook. syft need not be installed, but a
   #     build without a verified SBOM is NOT releasable (release gate). Never
   #     a fabricated digest: frog generates the verified SBOM at release time.
+  #
+  #     syft scans EXACTLY THIS build's immutable image ID read from the
+  #     phase-2 --iidfile (docker:${image_digest}) -- NEVER the mutable
+  #     :latest tag. Between phase-2 completion and this syft read the tag
+  #     can be retargeted by another concurrent/manual build; scanning the
+  #     tag could therefore write the sbomDigest of a DIFFERENT image into
+  #     THIS build's exact-imageDigest mapping, breaking the Spec §12
+  #     immutable same-origin proof. `docker build -t ...:latest` above is
+  #     not a basis for SBOM binding either: the tag is a non-evidence
+  #     local alias only.
   local sbom_digest="REPLACE_WITH_VERIFIED_SBOM_DIGEST"
   if [ "$syft_available" -eq 1 ]; then
-    echo "[pythonSandbox] syft detected: generating SBOM for the built image..."
-    if syft "docker:alphafrog-sandbox-runtime:latest" -o json > "$out_dir/sbom.json"; then
+    echo "[pythonSandbox] syft detected: generating SBOM for the immutable image ${image_digest}..."
+    if syft "docker:${image_digest}" -o json > "$out_dir/sbom.json"; then
       sbom_digest="$(file_sha256 "$out_dir/sbom.json")"
       echo "[pythonSandbox] sbomDigest=${sbom_digest} ($out_dir/sbom.json)"
     else
@@ -584,10 +618,15 @@ print(match.group(1))
   #     is consumed by deploy config and audit queries. Incomplete release
   #     inputs are recorded so the entry carries releasable=false (release
   #     gate). The entry BINDS the immutable image ID (its key) and records
-  #     the build-time imageRef, so deploy_latest.sh can prove the deploy
-  #     target identical to EXACTLY ONE mapping entry (R2-3 target binding).
-  #     The mapping carries the SAME verified librarySetDigest as the baked
-  #     library-set.json and the OCI label (R2-2).
+  #     the SAME immutable ID as its imageRef alias, so deploy_latest.sh can
+  #     prove the deploy target identical to EXACTLY ONE mapping entry (R2-3
+  #     target binding). The MUTABLE :latest tag is deliberately NOT
+  #     recorded: a mutable tag can drift to another image between build and
+  #     deploy, so it is never digest evidence (Spec §12 immutable
+  #     same-origin; build_runtime_manifest.py rejects non-immutable
+  #     imageRef values fail-closed). The mapping carries the SAME verified
+  #     librarySetDigest as the baked library-set.json and the OCI label
+  #     (R2-2).
   local incomplete_args=()
   local incomplete_name
   for incomplete_name in ${incomplete_inputs[@]+"${incomplete_inputs[@]}"}; do
@@ -600,7 +639,7 @@ print(match.group(1))
     --output "$out_dir/library-set.json" \
     --mapping-output "$out_dir/image-digest-mapping.json" \
     --image-digest "$image_digest" \
-    --image-ref "alphafrog-sandbox-runtime:latest" \
+    --image-ref "${image_digest}" \
     --base-image-digest "$base_image_digest" \
     --sbom-digest "$sbom_digest" \
     --build-revision "$build_revision" \
@@ -635,7 +674,8 @@ print(match.group(1))
 }
 
 if [ "$BUILD_TARGET" = "all" ] || [ "$BUILD_TARGET" = "runtime" ]; then
-  echo "[pythonSandbox] Building runtime image: alphafrog-sandbox-runtime:latest"
+  echo "[pythonSandbox] Building runtime image (local alias alphafrog-sandbox-runtime:latest;"
+  echo "[pythonSandbox]   SBOM/mapping/deploy evidence binds ONLY the immutable iidfile ID)"
   build_runtime_image
 fi
 

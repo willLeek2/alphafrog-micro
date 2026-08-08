@@ -251,6 +251,99 @@ class ExternalDigestMappingTest(unittest.TestCase):
         self.assertEqual(image_labels, labels_before)
 
 
+class ExternalMappingImmutableEvidenceTest(unittest.TestCase):
+    """Spec §12 immutable same-origin (reviewer codex 653674d9): the
+    external mapping is DIGEST EVIDENCE. Its key must be the immutable
+    iidfile image ID, and any recorded imageRef may only be the immutable
+    ID or an anchored digest reference. A MUTABLE tag (repo:latest) is
+    never evidence: between the build and any SBOM/deploy read the tag can
+    be retargeted at a different image."""
+
+    IMAGE_DIGEST = "sha256:" + "ab" * 32
+
+    def build_mapping(self, module, **overrides) -> dict:
+        kwargs = dict(
+            image_digest=self.IMAGE_DIGEST,
+            base_image_digest=SAMPLE_BUILD_INPUT["baseImageDigest"],
+            lock_digest=SAMPLE_BUILD_INPUT["lockDigest"],
+            library_set_digest=GOLDEN_LIBRARY_SET_DIGEST,
+            sbom_digest="sha256:sbom-example",
+            method_spec_index_digest=SAMPLE_BUILD_INPUT["methodSpecIndexDigest"],
+            build_revision=SAMPLE_BUILD_INPUT["buildRevision"],
+        )
+        kwargs.update(overrides)
+        return module.build_external_digest_mapping(**kwargs)
+
+    def test_immutable_id_and_digest_reference_image_ref_accepted(self) -> None:
+        module = require_build_runtime_manifest()
+        entry = self.build_mapping(module, image_ref=self.IMAGE_DIGEST)["images"][
+            self.IMAGE_DIGEST
+        ]
+        self.assertEqual(entry["imageRef"], self.IMAGE_DIGEST)
+        entry = self.build_mapping(module, image_ref=ACCEPT_REFS[0])["images"][
+            self.IMAGE_DIGEST
+        ]
+        self.assertEqual(entry["imageRef"], ACCEPT_REFS[0])
+
+    def test_mutable_or_malformed_image_ref_rejected_fail_closed(self) -> None:
+        module = require_build_runtime_manifest()
+        for ref in (
+            "alphafrog-sandbox-runtime:latest",
+            "repo/name:v1.2.3",
+            "repo/name",  # bare ref (implicit :latest) is mutable too
+            "repo/name:latest ",  # trailing content
+            "sha256:" + "AB" * 32,  # uppercase hex
+            "sha256:" + "ab" * 31,  # 62 hex chars
+        ):
+            with self.assertRaises(
+                ValueError, msg=f"mutable/malformed imageRef admitted: {ref!r}"
+            ):
+                self.build_mapping(module, image_ref=ref)
+
+    def test_non_immutable_mapping_key_rejected_fail_closed(self) -> None:
+        module = require_build_runtime_manifest()
+        for key in (
+            "alphafrog-sandbox-runtime:latest",
+            ACCEPT_REFS[0],  # repo@sha256:..., not a bare immutable image ID
+            "sha256:" + "AB" * 32,
+            "sha256:" + "ab" * 31,
+            "",
+        ):
+            with self.assertRaises(
+                ValueError, msg=f"non-immutable mapping key admitted: {key!r}"
+            ):
+                self.build_mapping(module, image_digest=key)
+
+    def test_cli_rejects_mutable_tag_image_ref(self) -> None:
+        module = require_build_runtime_manifest()
+        with tempfile.TemporaryDirectory(prefix="af-manifest-immutable-") as tmp:
+            out_path = Path(tmp) / "library-set.json"
+            mapping_path = Path(tmp) / "image-digest-mapping.json"
+            with self.assertRaises(SystemExit):
+                module.main(
+                    [
+                        "--lock-digest",
+                        SAMPLE_BUILD_INPUT["lockDigest"],
+                        "--method-spec-index-digest",
+                        SAMPLE_BUILD_INPUT["methodSpecIndexDigest"],
+                        "--packages-json",
+                        json.dumps(SAMPLE_PACKAGES_UNORDERED),
+                        "--output",
+                        str(out_path),
+                        "--mapping-output",
+                        str(mapping_path),
+                        "--image-digest",
+                        self.IMAGE_DIGEST,
+                        "--image-ref",
+                        "alphafrog-sandbox-runtime:latest",
+                    ]
+                )
+            self.assertFalse(
+                mapping_path.exists(),
+                "a mutable-tag imageRef must never be written into the mapping",
+            )
+
+
 class AfSandboxImageReferenceValidationTest(unittest.TestCase):
     """Production AF_SANDBOX_IMAGE must be a sha256 digest reference."""
 

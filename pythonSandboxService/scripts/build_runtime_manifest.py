@@ -75,6 +75,12 @@ _DEV_TAG_REFERENCE_RE = re.compile(
     + r"(?::%s)?" % _BARE_TAG
 )
 
+# A bare IMMUTABLE image ID value: exactly ``sha256:<64 lowercase hex>``
+# (the shape docker writes into ``--iidfile``). The external mapping is keyed
+# by this value and SBOM/deploy evidence binds ONLY it (Spec §12 immutable
+# same-origin proof).
+_SHA256_VALUE_RE = re.compile(r"sha256:[0-9a-f]{64}")
+
 
 def _canonical_json(value: Any) -> str:
     """Canonical JSON: sorted keys, compact separators, UTF-8 friendly."""
@@ -177,6 +183,16 @@ def build_library_set_manifest(
     }
 
 
+def is_immutable_image_id(value: Any) -> bool:
+    """Return True iff ``value`` is EXACTLY ``sha256:<64 lowercase hex>`` --
+    the immutable image ID shape docker writes into ``--iidfile`` (anchored
+    full match; used with the external mapping key and any image reference
+    admitted into the evidence chain, Spec §12 immutable same-origin)."""
+    if not isinstance(value, str):
+        return False
+    return _SHA256_VALUE_RE.fullmatch(value) is not None
+
+
 def build_external_digest_mapping(
     *,
     image_digest: str,
@@ -200,8 +216,19 @@ def build_external_digest_mapping(
     mapping lives outside the image. ``image_labels`` is accepted purely as
     informational input and is left untouched.
 
-    ``image_ref``, when given, records the build-time image reference in the
-    entry (informational binding aid; the immutable ID remains authoritative).
+    Spec §12 immutable same-origin (fail-closed evidence rules):
+
+    * ``image_digest`` (the entry KEY) must be EXACTLY
+      ``sha256:<64 lowercase hex>`` -- the immutable image ID straight from
+      the build's ``--iidfile``. Every binding (SBOM scan target, mapping
+      key, deploy gate) derives from this value alone; anything else raises
+      ``ValueError``.
+    * ``image_ref``, when given, is a NON-EVIDENCE alias and may only be the
+      immutable image ID itself or an anchored ``repo@sha256:<64hex>`` digest
+      reference. A MUTABLE tag (e.g. ``repo:latest``) is never admitted into
+      the mapping: between the build and any SBOM/deploy read the tag can be
+      retargeted at a DIFFERENT image, so it can never serve as digest
+      evidence. Violations raise ``ValueError``.
 
     Release gate (Spec §12 hardening): every entry carries ``releasable``.
     ``incomplete_inputs`` names the release inputs (e.g. ``BASE_IMAGE_DIGEST``,
@@ -212,6 +239,13 @@ def build_external_digest_mapping(
     """
     # NOTE: image_labels is intentionally NOT mutated. The final image digest
     # cannot be baked back into the image without creating a self-reference.
+    if not is_immutable_image_id(image_digest):
+        raise ValueError(
+            "image_digest must be EXACTLY the immutable image ID "
+            "sha256:<64 lowercase hex> from the build's --iidfile (Spec §12 "
+            "immutable same-origin); got %r. The mapping key is the ONLY "
+            "image identity the SBOM/deploy chain may bind." % (image_digest,)
+        )
     incomplete = sorted(dict.fromkeys(incomplete_inputs))
     entry = {
         "baseImageDigest": base_image_digest,
@@ -224,6 +258,17 @@ def build_external_digest_mapping(
         "incompleteInputs": incomplete,
     }
     if image_ref:
+        # Non-evidence alias rule (Spec §12): only the immutable ID or an
+        # anchored digest reference may enter the mapping; a mutable tag is
+        # NEVER digest evidence (it can drift to another image at any time).
+        if not (is_immutable_image_id(image_ref) or is_digest_reference(image_ref)):
+            raise ValueError(
+                "image_ref must be the immutable image ID (sha256:<64 "
+                "lowercase hex>) or an anchored repo@sha256:<64hex> digest "
+                "reference; got %r. A mutable tag (e.g. repo:latest) is "
+                "never digest evidence and must not enter the external "
+                "mapping (Spec §12 immutable same-origin)." % (image_ref,)
+            )
         entry["imageRef"] = image_ref
     return {
         "schemaVersion": "1",
@@ -342,7 +387,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image-digest", help="Immutable image digest (for the external mapping).")
     parser.add_argument(
         "--image-ref",
-        help="Build-time image reference recorded in the mapping entry (R2-3 target binding aid).",
+        help=(
+            "Build-time image reference recorded in the mapping entry as a "
+            "NON-evidence alias (R2-3 target binding aid). Must be the "
+            "immutable image ID (sha256:<64 lowercase hex>) or an anchored "
+            "repo@sha256:<64hex> digest reference; a mutable tag is never "
+            "admitted (Spec §12 immutable same-origin)."
+        ),
     )
     parser.add_argument(
         "--incomplete-input",
@@ -390,17 +441,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.mapping_output:
         if not args.image_digest:
             raise SystemExit("error: --mapping-output requires --image-digest")
-        mapping = build_external_digest_mapping(
-            image_digest=args.image_digest,
-            base_image_digest=args.base_image_digest or "",
-            lock_digest=args.lock_digest,
-            library_set_digest=manifest["librarySetDigest"],
-            sbom_digest=args.sbom_digest or "",
-            method_spec_index_digest=args.method_spec_index_digest,
-            build_revision=args.build_revision or "",
-            incomplete_inputs=args.incomplete_input,
-            image_ref=args.image_ref,
-        )
+        try:
+            mapping = build_external_digest_mapping(
+                image_digest=args.image_digest,
+                base_image_digest=args.base_image_digest or "",
+                lock_digest=args.lock_digest,
+                library_set_digest=manifest["librarySetDigest"],
+                sbom_digest=args.sbom_digest or "",
+                method_spec_index_digest=args.method_spec_index_digest,
+                build_revision=args.build_revision or "",
+                incomplete_inputs=args.incomplete_input,
+                image_ref=args.image_ref,
+            )
+        except ValueError as exc:
+            # Fail-closed evidence rule (Spec §12): a malformed immutable ID
+            # or a mutable-tag image_ref must never enter the mapping.
+            raise SystemExit("error: invalid external mapping input: %s" % exc)
         with open(args.mapping_output, "w", encoding="utf-8") as handle:
             json.dump(mapping, handle, indent=2, ensure_ascii=False)
             handle.write("\n")

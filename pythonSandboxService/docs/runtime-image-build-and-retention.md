@@ -143,6 +143,15 @@ releasable, incompleteInputs}}}`.
 tests); the mapping lives outside the image and is consumed by deploy config
 and audit queries.
 
+Immutable same-origin evidence rule: the mapping KEY must be EXACTLY the
+`sha256:<64 lowercase hex>` image ID from the phase-2 `--iidfile`, and the
+recorded `imageRef` (a NON-evidence alias) may only be that same immutable
+ID or an anchored `repo@sha256:<64hex>` digest reference. A MUTABLE tag
+(e.g. `alphafrog-sandbox-runtime:latest`) is never digest evidence —
+`build_external_digest_mapping()` rejects such values fail-closed. The local
+convenience tag on the phase-2 `docker build -t` stays an alias only: it
+never enters the SBOM, the mapping, or the deploy chain.
+
 Release gate: every entry carries `releasable`. `docker_build.sh` passes
 `--incomplete-input NAME` for each release input that was missing or a
 `REPLACE_WITH_...` placeholder (`BASE_IMAGE_DIGEST`,
@@ -155,22 +164,28 @@ unless the explicit `AF_SANDBOX_ALLOW_INCOMPLETE_DEV_BUILD` switch is set.
 
 ### SBOM (optional hook)
 
-If `syft` is on PATH, `docker_build.sh` scans the built image
-(`syft docker:alphafrog-sandbox-runtime:latest -o json`) and records the
-sha256 of the SBOM document as `sbomDigest`. If `syft` is absent or fails,
+If `syft` is on PATH, `docker_build.sh` scans EXACTLY THIS build's immutable
+image ID read from the phase-2 `--iidfile` (`syft "docker:<iidfile-ID>" -o
+json`) and records the sha256 of the SBOM document as `sbomDigest`. The
+mutable `:latest` tag is NEVER the scan target: between phase-2 completion
+and the syft read the tag can be retargeted by another concurrent/manual
+build, so a tag-based scan could attribute a DIFFERENT image's SBOM to this
+build's exact imageDigest (Spec §12 immutable same-origin; pinned by the
+fake-docker/fake-syft drift regressions in
+`tests/test_runtime_image_retention.py`). If `syft` is absent or fails,
 `sbomDigest` stays the explicit placeholder
 `REPLACE_WITH_VERIFIED_SBOM_DIGEST` — never a fabricated digest — and the
 SBOM input counts as incomplete for the release gate: the build fails closed
 unless the explicit dev switch is set, and then the mapping is marked
 `releasable=false`. frog produces the verified SBOM at release time.
 
-`methodSpecIndexDigest` must be supplied to `docker_build.sh` via
-`METHOD_SPEC_INDEX_DIGEST` (sha256 of the MethodSpec index built by the
-MethodSpec work package). Unset/placeholder → the SBOM/base inputs alike
-count as incomplete: the release gate fails closed by default; with the
-explicit dev switch the structural build proceeds but is marked
-`releasable=false`. Malformed (non-`sha256:<64 lowercase hex>`) values are
-hard errors in every case.
+`methodSpecIndexDigest` is NOT a release input: `docker_build.sh` COMPUTES
+it from the canonical `index.json` bytes (a hard build material) after the
+five-file canonical gate, so it can never be missing once the gate passes.
+An optionally supplied `METHOD_SPEC_INDEX_DIGEST` env value is a
+cross-check only and must equal the computed digest or the build fails
+closed. Malformed (non-`sha256:<64 lowercase hex>`) values are hard errors
+in every case.
 
 ## 5. AF_SANDBOX_IMAGE: digest reference required in production
 
