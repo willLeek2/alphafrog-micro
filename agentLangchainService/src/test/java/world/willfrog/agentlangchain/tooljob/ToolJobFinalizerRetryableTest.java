@@ -2,6 +2,10 @@ package world.willfrog.agentlangchain.tooljob;
 
 import org.junit.jupiter.api.Test;
 import world.willfrog.agent.platform.dataanalysis.*;
+import world.willfrog.agent.platform.finance.FinanceRecordChannelConfigLoader;
+import world.willfrog.agent.platform.finance.FinanceRecordChannelProcessor;
+import world.willfrog.agent.platform.finance.FinanceToolResultFormatter;
+import world.willfrog.agent.tools.finance.FinanceResultModelAdapter;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.alphafrogmicro.sandbox.idl.SandboxResourceUsage;
 import world.willfrog.alphafrogmicro.sandbox.idl.TaskResultResponse;
@@ -39,7 +43,7 @@ class ToolJobFinalizerRetryableTest {
         when(eventHook.emitTerminalEvent(eq("run-1"), any())).thenReturn(true);
 
         ToolJobFinalizer finalizer = new ToolJobFinalizer(anchorService, mock(ToolJobRedisCache.class),
-                capacityService, mock(ToolJobResumeService.class), mock(ToolJobConfig.class));
+                capacityService, mock(ToolJobResumeService.class), mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
         inject(finalizer, "usageHook", usageHook);
         inject(finalizer, "eventHook", eventHook);
 
@@ -97,7 +101,7 @@ class ToolJobFinalizerRetryableTest {
         when(eventHook.emitTerminalEvent(eq("run-2"), any())).thenReturn(true);
 
         ToolJobFinalizer finalizer = new ToolJobFinalizer(anchorService, mock(ToolJobRedisCache.class),
-                capacityService, mock(ToolJobResumeService.class), mock(ToolJobConfig.class));
+                capacityService, mock(ToolJobResumeService.class), mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
         inject(finalizer, "usageHook", usageHook);
         inject(finalizer, "eventHook", eventHook);
 
@@ -143,7 +147,7 @@ class ToolJobFinalizerRetryableTest {
         when(eventHook.emitTerminalEvent(eq("run-c"), any())).thenReturn(true);
 
         ToolJobFinalizer finalizer = new ToolJobFinalizer(anchorService, mock(ToolJobRedisCache.class),
-                capacityService, mock(ToolJobResumeService.class), mock(ToolJobConfig.class));
+                capacityService, mock(ToolJobResumeService.class), mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
         inject(finalizer, "usageHook", usageHook);
         inject(finalizer, "eventHook", eventHook);
 
@@ -185,7 +189,7 @@ class ToolJobFinalizerRetryableTest {
         ToolJobEventHook eventHook = mock(ToolJobEventHook.class);
 
         ToolJobFinalizer finalizer = new ToolJobFinalizer(anchorService, mock(ToolJobRedisCache.class),
-                capacityService, mock(ToolJobResumeService.class), mock(ToolJobConfig.class));
+                capacityService, mock(ToolJobResumeService.class), mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
         inject(finalizer, "usageHook", usageHook);
         inject(finalizer, "eventHook", eventHook);
 
@@ -255,7 +259,7 @@ class ToolJobFinalizerRetryableTest {
         when(eventHook.emitTerminalEvent(eq("run-bf"), any())).thenReturn(true);
 
         ToolJobFinalizer finalizer = new ToolJobFinalizer(anchorService, redisCache,
-                capacityService, resumeService, mock(ToolJobConfig.class));
+                capacityService, resumeService, mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
         inject(finalizer, "usageHook", usageHook);
         inject(finalizer, "eventHook", eventHook);
 
@@ -338,7 +342,7 @@ class ToolJobFinalizerRetryableTest {
         when(eventHook.emitTerminalEvent(eq("run-rl"), any())).thenReturn(true);
 
         ToolJobFinalizer finalizer = new ToolJobFinalizer(anchorService, mock(ToolJobRedisCache.class),
-                capacityService, mock(ToolJobResumeService.class), mock(ToolJobConfig.class));
+                capacityService, mock(ToolJobResumeService.class), mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
         inject(finalizer, "usageHook", usageHook);
         inject(finalizer, "eventHook", eventHook);
 
@@ -392,7 +396,7 @@ class ToolJobFinalizerRetryableTest {
                 .thenReturn(true);
 
         ToolJobFinalizer finalizer = new ToolJobFinalizer(anchorService, mock(ToolJobRedisCache.class),
-                capacityService, resumeService, mock(ToolJobConfig.class));
+                capacityService, resumeService, mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
         inject(finalizer, "usageHook", usageHook);
         inject(finalizer, "eventHook", eventHook);
 
@@ -434,7 +438,7 @@ class ToolJobFinalizerRetryableTest {
                 .thenReturn(false); // backfill write fails
 
         ToolJobFinalizer finalizer = new ToolJobFinalizer(anchorService, mock(ToolJobRedisCache.class),
-                capacityService, resumeService, mock(ToolJobConfig.class));
+                capacityService, resumeService, mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
         inject(finalizer, "usageHook", usageHook);
         inject(finalizer, "eventHook", eventHook);
 
@@ -485,7 +489,7 @@ class ToolJobFinalizerRetryableTest {
 
         ToolJobFinalizer finalizer = new ToolJobFinalizer(
                 anchorService, mock(ToolJobRedisCache.class),
-                capacityService, resumeService, new ToolJobConfig());
+                capacityService, resumeService, new ToolJobConfig(), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
         inject(finalizer, "usageHook", usageHook);
         inject(finalizer, "eventHook", eventHook);
 

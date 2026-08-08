@@ -561,11 +561,11 @@ public class LangchainLinearWorkflowExecutor {
     }
 
     private String resumeTerminalOutput(ToolJobResumeContext context) {
-        // preview 是有界可读内容；rawRef 是完整产物位置，仅用于内部数据集引用，
-        // 不泄露给模型上下文。
+        // preview 是 formatter 产出的完整有界 JSON；rawRef 仅用于内部引用，
+        // 不泄露给模型上下文。返回 exact bytes，不 trim/重写。
         String preview = context.getTerminalResultPreview();
         if (!isBlank(preview)) {
-            return preview.trim();
+            return preview;
         }
         // 终态缺少可见正文时给确定性占位，避免 null 破坏后续 prompt 构建。
         return context.isTerminalSuccess() ? "external tool completed" : "external tool failed";

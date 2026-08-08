@@ -5,6 +5,10 @@ import com.google.protobuf.util.JsonFormat;
 import org.junit.jupiter.api.Test;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisResourceClass;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisResourceUsage;
+import world.willfrog.agent.platform.finance.FinanceRecordChannelConfigLoader;
+import world.willfrog.agent.platform.finance.FinanceRecordChannelProcessor;
+import world.willfrog.agent.platform.finance.FinanceToolResultFormatter;
+import world.willfrog.agent.tools.finance.FinanceResultModelAdapter;
 import world.willfrog.alphafrogmicro.sandbox.idl.SandboxResourceUsage;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -25,7 +29,7 @@ class ToolJobResourceUsageParserTest {
         ToolJobFinalizer finalizer = new ToolJobFinalizer(
                 mock(ToolJobAnchorService.class), mock(ToolJobRedisCache.class),
                 mock(world.willfrog.agent.platform.dataanalysis.DataAnalysisCapacityService.class),
-                mock(ToolJobResumeService.class), mock(ToolJobConfig.class));
+                mock(ToolJobResumeService.class), mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
 
         assertThat(parsed.cpuMillis()).isZero();
         assertThat(parsed.datasetOpenCount()).isZero();

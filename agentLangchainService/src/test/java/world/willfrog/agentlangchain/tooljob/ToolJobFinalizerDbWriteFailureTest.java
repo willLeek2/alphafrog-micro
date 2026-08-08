@@ -3,6 +3,10 @@ package world.willfrog.agentlangchain.tooljob;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 import world.willfrog.agent.platform.dataanalysis.*;
+import world.willfrog.agent.platform.finance.FinanceRecordChannelConfigLoader;
+import world.willfrog.agent.platform.finance.FinanceRecordChannelProcessor;
+import world.willfrog.agent.platform.finance.FinanceToolResultFormatter;
+import world.willfrog.agent.tools.finance.FinanceResultModelAdapter;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 
 import java.lang.reflect.Field;
@@ -61,7 +65,7 @@ class ToolJobFinalizerDbWriteFailureTest {
 
         ToolJobFinalizer finalizer = new ToolJobFinalizer(
                 anchorService, redisCache, capacityFake, resumeService,
-                mock(ToolJobConfig.class));
+                mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
         inject(finalizer, "usageHook", usageHook);
         inject(finalizer, "eventHook", eventHook);
 
@@ -119,7 +123,7 @@ class ToolJobFinalizerDbWriteFailureTest {
 
         ToolJobFinalizer finalizer = new ToolJobFinalizer(
                 anchorService, redisCache, capacityFake, resumeService,
-                mock(ToolJobConfig.class));
+                mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
         inject(finalizer, "usageHook", usageHook);
         inject(finalizer, "eventHook", eventHook);
 
@@ -179,7 +183,7 @@ class ToolJobFinalizerDbWriteFailureTest {
 
         ToolJobFinalizer finalizer = new ToolJobFinalizer(
                 anchorService, redisCache, capacityService, resumeService,
-                mock(ToolJobConfig.class));
+                mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
         inject(finalizer, "usageHook", (ToolJobUsageHook) usageFake);
         inject(finalizer, "eventHook", (ToolJobEventHook) eventFake);
 
@@ -234,7 +238,7 @@ class ToolJobFinalizerDbWriteFailureTest {
 
         ToolJobFinalizer finalizer = new ToolJobFinalizer(
                 anchorService, redisCache, capacityService, resumeService,
-                mock(ToolJobConfig.class));
+                mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
         inject(finalizer, "usageHook", (ToolJobUsageHook) usageFake);
         inject(finalizer, "eventHook", (ToolJobEventHook) eventFake);
 
