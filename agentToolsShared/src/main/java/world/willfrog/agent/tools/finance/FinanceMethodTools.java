@@ -32,6 +32,7 @@ public class FinanceMethodTools {
 
     private static final String RESOLVER_SCHEMA_VERSION = "1";
     private static final String EXACT_ALIAS_FALLBACK_ROUTE = "{\"route\":\"exact_alias_fallback\"}";
+    private static final String EXACT_ALIAS_FALLBACK_PROMPT_VERSION = "exact_alias_fallback";
     private static final int MAX_QUERY_BYTES = 4096;
     private static final int MAX_CONTEXT_BYTES = 4096;
 
@@ -114,18 +115,20 @@ public class FinanceMethodTools {
             return fail("TOOL_CALL_ID_MISSING", "resolverToolCallId is not available in AgentContext");
         }
 
-        String systemPrompt = resolverCatalog.renderSystemPrompt();
+        String catalogFragment = resolverCatalog.getCompactCatalogText();
         JsonNode modelOutput;
         String modelRouteJson;
+        String resolverPromptVersion;
         boolean usedExactAliasFallback;
 
         ResolverResult resolverResult = resolverClient == null
                 ? new FinanceMethodResolverClient.TechnicalError(FinanceMethodResolverClient.ErrorKind.NO_ROUTE, "Resolver client not configured")
-                : resolverClient.resolve(query, context, systemPrompt);
+                : resolverClient.resolve(query, context, catalogFragment);
 
         if (resolverResult instanceof FinanceMethodResolverClient.Ok ok) {
             modelOutput = parseModelJson(ok.rawJson());
             modelRouteJson = serializeRouteInfo(ok.route());
+            resolverPromptVersion = ok.resolverPromptVersion();
             usedExactAliasFallback = false;
         } else if (resolverResult instanceof FinanceMethodResolverClient.TechnicalError err) {
             // 技术失败先走精确别名兜底
@@ -133,6 +136,7 @@ public class FinanceMethodTools {
             if (fallback.isPresent()) {
                 modelOutput = fallback.get();
                 modelRouteJson = EXACT_ALIAS_FALLBACK_ROUTE;
+                resolverPromptVersion = EXACT_ALIAS_FALLBACK_PROMPT_VERSION;
                 usedExactAliasFallback = true;
             } else {
                 return technicalError(err.kind());
@@ -150,6 +154,7 @@ public class FinanceMethodTools {
                 if (validation.isValid()) {
                     modelOutput = fallback.get();
                     modelRouteJson = EXACT_ALIAS_FALLBACK_ROUTE;
+                    resolverPromptVersion = EXACT_ALIAS_FALLBACK_PROMPT_VERSION;
                     usedExactAliasFallback = true;
                 }
             }
@@ -175,7 +180,7 @@ public class FinanceMethodTools {
             }
             String todoId = nvl(AgentContext.getTodoId());
             List<FinanceMethodResolutionSnapshot> snapshots = buildSnapshots(
-                    runId, resolverToolCallId, todoId, status, suggestions, modelRouteJson, targetEnv);
+                    runId, resolverToolCallId, todoId, status, suggestions, modelRouteJson, resolverPromptVersion, targetEnv);
             try {
                 resolutionSink.saveAll(snapshots);
             } catch (FinanceMethodResolutionSinkException sinkEx) {
@@ -307,13 +312,13 @@ public class FinanceMethodTools {
             String status,
             List<Map<String, Object>> suggestions,
             String modelRouteJson,
+            String resolverPromptVersion,
             FinanceMethodSuggestionRenderer.TargetEnvironment targetEnv) {
         if (runId.isBlank()) {
             return Collections.emptyList();
         }
         List<FinanceMethodResolutionSnapshot> snapshots = new ArrayList<>();
         String catalogDigest = resolverCatalog.getCatalogDigest();
-        String resolverPromptVersion = resolverCatalog.getPromptVersion();
         String resolutionPayloadJson = serializeSafe(suggestions);
         String resolutionContentDigest = sha256(resolutionPayloadJson.getBytes(StandardCharsets.UTF_8));
         String targetEnvironmentId = targetEnv == null ? null : targetEnv.environmentId();

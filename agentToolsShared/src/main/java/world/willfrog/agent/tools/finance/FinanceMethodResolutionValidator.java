@@ -77,6 +77,9 @@ public class FinanceMethodResolutionValidator {
         if ("AMBIGUOUS".equals(status) && candidateCount < 2) {
             return invalid("STATUS_CANDIDATE_MISMATCH", "AMBIGUOUS requires at least 2 candidates");
         }
+        if ("NEEDS_CLARIFICATION".equals(status) && candidateCount < 1) {
+            return invalid("STATUS_CANDIDATE_MISMATCH", "NEEDS_CLARIFICATION requires at least 1 candidate");
+        }
         if ("NO_ADVICE".equals(status) && candidateCount != 0) {
             return invalid("STATUS_CANDIDATE_MISMATCH", "NO_ADVICE requires 0 candidates");
         }
@@ -153,10 +156,16 @@ public class FinanceMethodResolutionValidator {
         String specDigest = specDigestNode.asText();
 
         JsonNode matchReasonNode = cand.get("matchReason");
-        if (matchReasonNode != null && !matchReasonNode.isNull() && !matchReasonNode.isTextual()) {
+        if (matchReasonNode == null || matchReasonNode.isNull()) {
+            return invalid("MISSING_MATCH_REASON", "Candidate " + index + " missing matchReason");
+        }
+        if (!matchReasonNode.isTextual()) {
             return invalid("MATCH_REASON_NOT_TEXTUAL", "Candidate " + index + " matchReason must be a string");
         }
-        String matchReason = matchReasonNode == null || matchReasonNode.isNull() ? "" : matchReasonNode.asText();
+        String matchReason = matchReasonNode.asText();
+        if (matchReason.isBlank()) {
+            return invalid("BLANK_MATCH_REASON", "Candidate " + index + " matchReason must not be blank");
+        }
         if (matchReason.length() > MAX_REASON_LENGTH) {
             return invalid("MATCH_REASON_TOO_LONG",
                     "Candidate " + index + " matchReason exceeds " + MAX_REASON_LENGTH + " chars");

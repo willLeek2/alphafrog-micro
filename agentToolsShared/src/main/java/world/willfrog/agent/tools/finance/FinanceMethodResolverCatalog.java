@@ -3,7 +3,6 @@ package world.willfrog.agent.tools.finance;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
-import world.willfrog.agent.platform.util.PromptFileLoader;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -17,20 +16,20 @@ import java.util.Map;
 import java.util.stream.Collectors;
 
 /**
- * 读取构建生成的 resolver-catalog.json，按稳定顺序构造 system prompt 目录片段，
- * 并暴露目录字节摘要与解析器系统提示模板版本。
+ * 读取构建生成的 resolver-catalog.json，按稳定顺序构造紧凑目录片段，并暴露目录字节摘要。
+ *
+ * <p>本类刻意不持有 system prompt 模板：最终 prompt 由 platform 经 AgentPromptService
+ * 解析实际模板（含 local override）后把 {@link #getCompactCatalogText()} 片段填入，
+ * 避免二次嵌套并保证 snapshot 的 promptVersion 是实际模板的事实。</p>
  */
 @Component
 @Slf4j
 public class FinanceMethodResolverCatalog {
 
     private static final String CATALOG_PATH = "finance/method-specs/v1/resolver-catalog.json";
-    private static final String SYSTEM_PROMPT_TEMPLATE_PATH = "prompts/finance/finance_method_resolver_system.txt";
-    private static final String FALLBACK_TEMPLATE_PATH = "prompts/finance/finance_method_resolver_system_fallback.txt";
 
     private final ObjectMapper objectMapper;
     private final String catalogDigest;
-    private final String promptVersion;
     private final String compactCatalogText;
     private final List<ResolverCatalogEntry> entries;
 
@@ -43,9 +42,6 @@ public class FinanceMethodResolverCatalog {
         this.catalogDigest = sha256(rawCatalog.getBytes(StandardCharsets.UTF_8));
         this.entries = parseCatalog(rawCatalog);
         this.compactCatalogText = renderCompactText(entries);
-
-        String template = loadSystemPromptTemplate();
-        this.promptVersion = sha256(template.getBytes(StandardCharsets.UTF_8));
     }
 
     /**
@@ -56,14 +52,7 @@ public class FinanceMethodResolverCatalog {
     }
 
     /**
-     * 返回 resolver system prompt 模板资源的 sha256 摘要。
-     */
-    public String getPromptVersion() {
-        return promptVersion;
-    }
-
-    /**
-     * 返回按稳定顺序渲染的紧凑目录文本，用于拼入轻量模型 system prompt。
+     * 返回按稳定顺序渲染的紧凑目录文本（仅目录片段，供 platform 拼入实际 system prompt 模板）。
      */
     public String getCompactCatalogText() {
         return compactCatalogText;
@@ -74,28 +63,6 @@ public class FinanceMethodResolverCatalog {
      */
     public List<ResolverCatalogEntry> getEntries() {
         return Collections.unmodifiableList(entries);
-    }
-
-    /**
-     * 将 system prompt 模板中的 {@code {{catalog}}} 占位符替换为紧凑目录文本。
-     */
-    public String renderSystemPrompt() {
-        String template = loadSystemPromptTemplate();
-        return template.replace("{{catalog}}", compactCatalogText);
-    }
-
-    private String loadSystemPromptTemplate() {
-        String template = PromptFileLoader.load(SYSTEM_PROMPT_TEMPLATE_PATH);
-        if (!template.isBlank()) {
-            return template;
-        }
-        template = PromptFileLoader.load(FALLBACK_TEMPLATE_PATH);
-        if (!template.isBlank()) {
-            log.warn("Using fallback finance resolver system prompt template from classpath");
-            return template;
-        }
-        throw new IllegalStateException("Finance resolver system prompt template not found on classpath: "
-                + SYSTEM_PROMPT_TEMPLATE_PATH);
     }
 
     @SuppressWarnings("unchecked")

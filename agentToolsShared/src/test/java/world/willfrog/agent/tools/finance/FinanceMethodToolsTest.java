@@ -39,6 +39,10 @@ class FinanceMethodToolsTest {
     private final FinanceMethodSuggestionRenderer renderer = new FinanceMethodSuggestionRenderer(
             specCatalog, knowledgeCatalog, objectMapper);
 
+    private static final FinanceMethodResolverClient.RouteInfo ROUTE =
+            new FinanceMethodResolverClient.RouteInfo("openrouter", "https://api.openrouter.ai", "gpt-4o-mini");
+    private static final String PROMPT_VERSION = "sha256:prompt-under-test";
+
     @BeforeEach
     void setUp() {
         AgentContext.setRunId("run-1");
@@ -71,8 +75,7 @@ class FinanceMethodToolsTest {
 
         FinanceMethodResolverClient client = mock(FinanceMethodResolverClient.class);
         when(client.resolve(any(), any(), any())).thenReturn(
-                new FinanceMethodResolverClient.Ok(modelJson,
-                        new FinanceMethodResolverClient.RouteInfo("openrouter", "https://api.openrouter.ai", "gpt-4o-mini")));
+                new FinanceMethodResolverClient.Ok(modelJson, ROUTE, PROMPT_VERSION));
         FinanceMethodResolutionSink sink = mock(FinanceMethodResolutionSink.class);
 
         FinanceMethodTools tools = new FinanceMethodTools(
@@ -200,7 +203,7 @@ class FinanceMethodToolsTest {
     @Test
     void badModelOutputReturnsError() throws Exception {
         FinanceMethodResolverClient client = mock(FinanceMethodResolverClient.class);
-        when(client.resolve(any(), any(), any())).thenReturn(new FinanceMethodResolverClient.Ok("not json", null));
+        when(client.resolve(any(), any(), any())).thenReturn(new FinanceMethodResolverClient.Ok("not json", ROUTE, PROMPT_VERSION));
 
         FinanceMethodTools tools = new FinanceMethodTools(
                 specCatalog, resolverCatalog, validator, renderer, knowledgeCatalog, objectMapper);
@@ -231,7 +234,7 @@ class FinanceMethodToolsTest {
                 + "}";
 
         FinanceMethodResolverClient client = mock(FinanceMethodResolverClient.class);
-        when(client.resolve(any(), any(), any())).thenReturn(new FinanceMethodResolverClient.Ok(modelJson, null));
+        when(client.resolve(any(), any(), any())).thenReturn(new FinanceMethodResolverClient.Ok(modelJson, ROUTE, PROMPT_VERSION));
         FinanceMethodResolutionSink sink = mock(FinanceMethodResolutionSink.class);
         doThrow(new FinanceMethodResolutionSinkException("db down")).when(sink).saveAll(any());
 
@@ -268,7 +271,7 @@ class FinanceMethodToolsTest {
                 + "}";
 
         FinanceMethodResolverClient client = mock(FinanceMethodResolverClient.class);
-        when(client.resolve(any(), any(), any())).thenReturn(new FinanceMethodResolverClient.Ok(modelJson, null));
+        when(client.resolve(any(), any(), any())).thenReturn(new FinanceMethodResolverClient.Ok(modelJson, ROUTE, PROMPT_VERSION));
         FinanceMethodResolutionSink sink = mock(FinanceMethodResolutionSink.class);
 
         FinanceMethodTools tools = new FinanceMethodTools(
@@ -302,7 +305,7 @@ class FinanceMethodToolsTest {
                 + "}";
 
         FinanceMethodResolverClient client = mock(FinanceMethodResolverClient.class);
-        when(client.resolve(any(), any(), any())).thenReturn(new FinanceMethodResolverClient.Ok(modelJson, null));
+        when(client.resolve(any(), any(), any())).thenReturn(new FinanceMethodResolverClient.Ok(modelJson, ROUTE, PROMPT_VERSION));
 
         FinanceMethodTools tools = new FinanceMethodTools(
                 specCatalog, resolverCatalog, validator, renderer, knowledgeCatalog, objectMapper);
@@ -348,7 +351,7 @@ class FinanceMethodToolsTest {
         String expectedRouteJson = "{\"endpoint\":\"https://api.openrouter.ai\",\"model\":\"gpt-4o-mini\",\"provider\":\"openrouter\"}";
 
         FinanceMethodResolverClient client = mock(FinanceMethodResolverClient.class);
-        when(client.resolve(any(), any(), any())).thenReturn(new FinanceMethodResolverClient.Ok(modelJson, route));
+        when(client.resolve(any(), any(), any())).thenReturn(new FinanceMethodResolverClient.Ok(modelJson, route, PROMPT_VERSION));
         FinanceMethodResolutionSink sink = mock(FinanceMethodResolutionSink.class);
 
         FinanceMethodTools tools = new FinanceMethodTools(
@@ -413,7 +416,7 @@ class FinanceMethodToolsTest {
         String expectedRouteJson = "{\"endpoint\":\"https://api.openrouter.ai\",\"model\":\"gpt-4o-mini\",\"provider\":\"openrouter\"}";
 
         FinanceMethodResolverClient client = mock(FinanceMethodResolverClient.class);
-        when(client.resolve(any(), any(), any())).thenReturn(new FinanceMethodResolverClient.Ok(modelJson, route));
+        when(client.resolve(any(), any(), any())).thenReturn(new FinanceMethodResolverClient.Ok(modelJson, route, PROMPT_VERSION));
         FinanceMethodResolutionSink sink = mock(FinanceMethodResolutionSink.class);
 
         FinanceMethodTools tools = new FinanceMethodTools(
@@ -483,7 +486,7 @@ class FinanceMethodToolsTest {
         when(provider.currentTargetEnvironment()).thenReturn(Optional.of(env));
 
         FinanceMethodResolverClient client = mock(FinanceMethodResolverClient.class);
-        when(client.resolve(any(), any(), any())).thenReturn(new FinanceMethodResolverClient.Ok(modelJson, null));
+        when(client.resolve(any(), any(), any())).thenReturn(new FinanceMethodResolverClient.Ok(modelJson, ROUTE, PROMPT_VERSION));
         FinanceMethodResolutionSink sink = mock(FinanceMethodResolutionSink.class);
 
         FinanceMethodTools tools = new FinanceMethodTools(
@@ -536,7 +539,7 @@ class FinanceMethodToolsTest {
         when(provider.currentTargetEnvironment()).thenReturn(Optional.empty());
 
         FinanceMethodResolverClient client = mock(FinanceMethodResolverClient.class);
-        when(client.resolve(any(), any(), any())).thenReturn(new FinanceMethodResolverClient.Ok(modelJson, null));
+        when(client.resolve(any(), any(), any())).thenReturn(new FinanceMethodResolverClient.Ok(modelJson, ROUTE, PROMPT_VERSION));
         FinanceMethodResolutionSink sink = mock(FinanceMethodResolutionSink.class);
 
         FinanceMethodTools tools = new FinanceMethodTools(
@@ -557,5 +560,95 @@ class FinanceMethodToolsTest {
         FinanceMethodResolutionSnapshot snapshot = captor.getValue().get(0);
         assertNull(snapshot.targetEnvironmentId());
         assertNull(snapshot.targetPackageApiJson());
+    }
+
+    @Test
+    void okRejectsNullRoute() {
+        assertThrows(IllegalArgumentException.class,
+                () -> new FinanceMethodResolverClient.Ok("{}", null, PROMPT_VERSION));
+    }
+
+    @Test
+    void okRejectsBlankPromptVersion() {
+        assertThrows(IllegalArgumentException.class,
+                () -> new FinanceMethodResolverClient.Ok("{}", ROUTE, null));
+        assertThrows(IllegalArgumentException.class,
+                () -> new FinanceMethodResolverClient.Ok("{}", ROUTE, "  "));
+    }
+
+    @Test
+    void promptVersionFlowsFromOkToSnapshot() throws Exception {
+        FinanceMethodSpec cagr = specCatalog.findByMethodId("finance.growth.cagr").orElseThrow();
+        String modelJson = "{"
+                + "\"status\":\"MATCHED\","
+                + "\"candidates\":[{"
+                + "  \"methodId\":\"" + cagr.getMethodId() + "\","
+                + "  \"version\":\"" + cagr.getVersion() + "\","
+                + "  \"specDigest\":\"" + cagr.getSpecDigest() + "\","
+                + "  \"matchReason\":\"ok\","
+                + "  \"unresolvedTerms\":[],"
+                + "  \"clarificationQuestions\":[]"
+                + "}],"
+                + "\"matchReason\":\"\","
+                + "\"unresolvedTerms\":[],"
+                + "\"clarificationQuestions\":[]"
+                + "}";
+        FinanceMethodResolverClient client = mock(FinanceMethodResolverClient.class);
+        when(client.resolve(any(), any(), any()))
+                .thenReturn(new FinanceMethodResolverClient.Ok(modelJson, ROUTE, "sha256:local-override-template-A"));
+        FinanceMethodResolutionSink sink = mock(FinanceMethodResolutionSink.class);
+
+        FinanceMethodTools tools = new FinanceMethodTools(
+                specCatalog, resolverCatalog, validator, renderer, knowledgeCatalog, objectMapper);
+        tools.setResolverClient(client);
+        tools.setResolutionSink(sink);
+
+        tools.resolveFinanceMethods("CAGR", null);
+
+        ArgumentCaptor<List<FinanceMethodResolutionSnapshot>> captor = ArgumentCaptor.forClass(List.class);
+        verify(sink).saveAll(captor.capture());
+        // snapshot 的 promptVersion 只取 Ok 回传的实际模板版本（local override 变化即变）
+        assertEquals("sha256:local-override-template-A", captor.getValue().get(0).resolverPromptVersion());
+    }
+
+    @Test
+    void exactAliasFallbackSnapshotPromptVersionIsConstant() throws Exception {
+        FinanceMethodResolverClient client = mock(FinanceMethodResolverClient.class);
+        when(client.resolve(any(), any(), any()))
+                .thenReturn(new FinanceMethodResolverClient.TechnicalError(
+                        FinanceMethodResolverClient.ErrorKind.NO_ROUTE, "no route"));
+        FinanceMethodResolutionSink sink = mock(FinanceMethodResolutionSink.class);
+
+        FinanceMethodTools tools = new FinanceMethodTools(
+                specCatalog, resolverCatalog, validator, renderer, knowledgeCatalog, objectMapper);
+        tools.setResolverClient(client);
+        tools.setResolutionSink(sink);
+
+        tools.resolveFinanceMethods("CAGR", null);
+
+        ArgumentCaptor<List<FinanceMethodResolutionSnapshot>> captor = ArgumentCaptor.forClass(List.class);
+        verify(sink).saveAll(captor.capture());
+        assertEquals("exact_alias_fallback", captor.getValue().get(0).resolverPromptVersion());
+    }
+
+    @Test
+    void clientReceivesCompactCatalogFragmentOnly() throws Exception {
+        FinanceMethodResolverClient client = mock(FinanceMethodResolverClient.class);
+        when(client.resolve(any(), any(), any()))
+                .thenReturn(new FinanceMethodResolverClient.TechnicalError(
+                        FinanceMethodResolverClient.ErrorKind.NO_ROUTE, "no route"));
+
+        FinanceMethodTools tools = new FinanceMethodTools(
+                specCatalog, resolverCatalog, validator, renderer, knowledgeCatalog, objectMapper);
+        tools.setResolverClient(client);
+
+        tools.resolveFinanceMethods("完全不相关的问法", null);
+
+        ArgumentCaptor<String> fragmentCaptor = ArgumentCaptor.forClass(String.class);
+        verify(client).resolve(any(), any(), fragmentCaptor.capture());
+        String fragment = fragmentCaptor.getValue();
+        // 第三参只应是紧凑目录片段：与 catalog 输出逐字一致，且不含模板占位符（不二次嵌套）
+        assertEquals(resolverCatalog.getCompactCatalogText(), fragment);
+        assertFalse(fragment.contains("{{catalog}}"));
     }
 }

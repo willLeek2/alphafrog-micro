@@ -32,13 +32,6 @@ class FinanceMethodResolverCatalogTest {
     }
 
     @Test
-    void shouldExposePromptVersion() {
-        FinanceMethodResolverCatalog catalog = new FinanceMethodResolverCatalog(objectMapper);
-        assertNotNull(catalog.getPromptVersion());
-        assertTrue(catalog.getPromptVersion().startsWith("sha256:"));
-    }
-
-    @Test
     void compactCatalogTextShouldBeStableAndContainMethods() {
         FinanceMethodResolverCatalog catalog = new FinanceMethodResolverCatalog(objectMapper);
         String text = catalog.getCompactCatalogText();
@@ -50,11 +43,10 @@ class FinanceMethodResolverCatalogTest {
     }
 
     @Test
-    void renderSystemPromptShouldSubstituteCatalog() {
+    void compactCatalogTextContainsNoTemplateMarkers() {
         FinanceMethodResolverCatalog catalog = new FinanceMethodResolverCatalog(objectMapper);
-        String prompt = catalog.renderSystemPrompt();
-        assertFalse(prompt.contains("{{catalog}}"));
-        assertTrue(prompt.contains("finance.growth.cagr"));
+        // 目录片段不得自带模板占位符，防止 platform 拼装时二次嵌套
+        assertFalse(catalog.getCompactCatalogText().contains("{{catalog}}"));
     }
 
     @Test

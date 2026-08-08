@@ -323,4 +323,59 @@ class FinanceMethodResolutionValidatorTest {
         assertFalse(result.isValid());
         assertEquals("MISSING_METHOD_ID", result.getErrorCode());
     }
+
+    @Test
+    void candidateMissingMatchReasonRejected() throws Exception {
+        String json = "{"
+                + "\"status\":\"MATCHED\","
+                + "\"candidates\":[{"
+                + "  \"methodId\":\"finance.growth.cagr\","
+                + "  \"version\":\"1.0.0\","
+                + "  \"specDigest\":\"sha256:deadbeef\","
+                + "  \"unresolvedTerms\":[],"
+                + "  \"clarificationQuestions\":[]"
+                + "}],"
+                + "\"unresolvedTerms\":[],"
+                + "\"clarificationQuestions\":[]"
+                + "}";
+        JsonNode node = objectMapper.readTree(json);
+        FinanceMethodResolutionValidator.ValidationResult result = validator.validate(node);
+        assertFalse(result.isValid());
+        assertEquals("MISSING_MATCH_REASON", result.getErrorCode());
+    }
+
+    @Test
+    void candidateBlankMatchReasonRejected() throws Exception {
+        String json = "{"
+                + "\"status\":\"MATCHED\","
+                + "\"candidates\":[{"
+                + "  \"methodId\":\"finance.growth.cagr\","
+                + "  \"version\":\"1.0.0\","
+                + "  \"specDigest\":\"sha256:deadbeef\","
+                + "  \"matchReason\":\"   \","
+                + "  \"unresolvedTerms\":[],"
+                + "  \"clarificationQuestions\":[]"
+                + "}],"
+                + "\"unresolvedTerms\":[],"
+                + "\"clarificationQuestions\":[]"
+                + "}";
+        JsonNode node = objectMapper.readTree(json);
+        FinanceMethodResolutionValidator.ValidationResult result = validator.validate(node);
+        assertFalse(result.isValid());
+        assertEquals("BLANK_MATCH_REASON", result.getErrorCode());
+    }
+
+    @Test
+    void needsClarificationWithEmptyCandidatesRejected() throws Exception {
+        String json = "{"
+                + "\"status\":\"NEEDS_CLARIFICATION\","
+                + "\"candidates\":[],"
+                + "\"unresolvedTerms\":[\"这几年\"],"
+                + "\"clarificationQuestions\":[\"希望从哪天算到哪天？\"]"
+                + "}";
+        JsonNode node = objectMapper.readTree(json);
+        FinanceMethodResolutionValidator.ValidationResult result = validator.validate(node);
+        assertFalse(result.isValid());
+        assertEquals("STATUS_CANDIDATE_MISMATCH", result.getErrorCode());
+    }
 }
