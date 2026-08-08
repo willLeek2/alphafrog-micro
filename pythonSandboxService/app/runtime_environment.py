@@ -5,6 +5,8 @@ import importlib
 import json
 import logging
 import os
+import tempfile
+from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
 from .models import ExecutionEnvironment, SandboxPackageApi
@@ -223,12 +225,19 @@ def collect_runtime_environment(
 def write_runtime_environment_json(
     task_workspace: str, env: ExecutionEnvironment
 ) -> str:
-    """Persist the ExecutionEnvironment snapshot for in-sandbox code to read.
+    """Persist the ExecutionEnvironment snapshot on the **service** filesystem.
 
-    The file at <task_workspace>/runtime-environment.json is the canonical
-    source user code (e.g., report()) consults to look up environmentId;
-    the same ExecutionEnvironment is also surfaced on the HTTP
-    execution_environment field for gateway presence-aware mapping.
+    The service host's <task_workspace>/runtime-environment.json is an ops
+    audit copy only — user code inside the execution container reads from a
+    SEPARATE file written via write_runtime_environment_to_container (the
+    service host's filesystem is not visible inside the running sandbox
+    container; only volumes explicitly mounted are shared, and the python-
+    sandbox-service compose does not mount the sandbox workdir into the
+    execution container).
+
+    Use write_runtime_environment_to_container for the runtime-visible
+    file that user code actually consults. This helper is kept for ops
+    audit / debugging on the service host.
     """
     os.makedirs(task_workspace, exist_ok=True)
     path = os.path.join(task_workspace, "runtime-environment.json")
@@ -240,7 +249,44 @@ def write_runtime_environment_json(
     return path
 
 
+def write_runtime_environment_to_container(
+    session: Any,
+    env: ExecutionEnvironment,
+    dest_path: str,
+) -> str:
+    """Serialize env and push it into the execution container via copy_to_runtime.
+
+    Spec §8 L1019 (codex rework 2026-08-08 22:49): the runtime-environment.json
+    that user code (e.g., report()) reads MUST live inside the execution
+    container, not on the service host's filesystem. The two have independent
+    /sandbox roots — the service's local /sandbox/runtime-environment.json
+    is invisible to a Python subprocess inside the container. This helper
+    serializes the ExecutionEnvironment to JSON, drops it onto a local
+    tempfile, and asks the llm-sandbox session to copy that file into the
+    container at dest_path. The tempfile is cleaned up regardless of outcome.
+
+    Returns dest_path so callers can chain it (e.g., echo into log lines).
+    Raises whatever session.copy_to_runtime raises; callers may catch and
+    downgrade to a warning if best-effort, but Spec §8 treats the container
+    file as the runtime-visible single source of truth for environmentId.
+    """
+    payload = env.model_dump(mode="json")
+    temp_path: Optional[str] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", delete=False, suffix=".json",
+        ) as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True, ensure_ascii=False)
+            temp_path = handle.name
+        session.copy_to_runtime(temp_path, dest_path)
+        return dest_path
+    finally:
+        if temp_path is not None:
+            Path(temp_path).unlink(missing_ok=True)
+
+
 __all__ = [
     "collect_runtime_environment",
     "write_runtime_environment_json",
+    "write_runtime_environment_to_container",
 ]

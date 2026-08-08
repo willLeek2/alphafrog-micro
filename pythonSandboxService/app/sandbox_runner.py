@@ -22,6 +22,7 @@ from .runtime_environment import (
     ExecutionEnvironment,
     collect_runtime_environment,
     write_runtime_environment_json,
+    write_runtime_environment_to_container,
 )
 
 logger = logging.getLogger(__name__)
@@ -332,8 +333,18 @@ def _prepare_task_workspace(
     path_manifest_csv: str | None = None,
     *,
     copy_loader_modules: bool = True,
+    execution_environment: ExecutionEnvironment | None = None,
 ) -> str:
-    """Create task-scoped workspace and copy datasets. Returns the task workspace path."""
+    """Create task-scoped workspace and copy datasets. Returns the task workspace path.
+
+    260808-finance-methodspec-v5 work package D (codex rework 2026-08-08 22:49):
+    when execution_environment is provided, the same ExecutionEnvironment instance
+    is serialized and pushed into the execution container at
+    <task_workspace>/runtime-environment.json. The per-task sitecustomize.py
+    overrides AF_RUNTIME_ENVIRONMENT_FILE to point at this file so concurrent
+    pool tasks never read each other's environment snapshot — the global
+    /sandbox/runtime-environment.json path was racy under pool reuse.
+    """
     task_workspace = f"{config.workspace_root}/{task_id}"
     task_input = f"{task_workspace}/input"
 
@@ -454,12 +465,37 @@ def _prepare_task_workspace(
         f"os.environ['AF_TASK_WORKSPACE'] = {task_workspace!r}\n"
         f"os.environ['AF_TASK_ARTIFACT_DIR'] = {artifact_dir!r}\n"
         f"os.environ['AF_TASK_TMP_DIR'] = {temporary_dir!r}\n"
+        # 260808-finance-methodspec-v5 work package D (codex rework 22:49):
+        # override the container-creation AF_RUNTIME_ENVIRONMENT_FILE to point
+        # at this task's per-task file, not the global /sandbox path. Each task
+        # has its own snapshot under <task_workspace>/ so concurrent pool tasks
+        # do not read each other's environmentId.
+        f"os.environ['AF_RUNTIME_ENVIRONMENT_FILE'] = {os.path.join(task_workspace, 'runtime-environment.json')!r}\n"
         f"os.makedirs({artifact_dir!r}, exist_ok=True)\n"
         f"os.makedirs({temporary_dir!r}, exist_ok=True)\n"
         f"sys.path.insert(0, {config.workdir.rstrip('/')!r})\n"
         f"os.chdir({task_workspace!r})\n"
     )
     _copy_text_to_runtime(session, sitecustomize, f"{config.workdir.rstrip('/')}/sitecustomize.py")
+
+    # 260808-finance-methodspec-v5 work package D (codex rework 22:49): push the
+    # runtime-environment.json into the execution container at the per-task path.
+    # The service host's local filesystem is NOT shared with the container, so
+    # write_runtime_environment_json (local fs) is ops-audit only; user code in
+    # the sandbox reads the file we copy_to_runtime here.
+    if execution_environment is not None:
+        try:
+            container_env_path = os.path.join(
+                task_workspace, "runtime-environment.json",
+            )
+            write_runtime_environment_to_container(
+                session, execution_environment, container_env_path,
+            )
+        except Exception as exc:
+            logger.warning(
+                "RUNTIME_ENVIRONMENT_CONTAINER_WRITE_FAILED task=%s error=%s",
+                task_id, exc,
+            )
 
     return task_workspace
 
@@ -1120,7 +1156,7 @@ def run_in_open_session(
     try:
         t_workspace_start = time.monotonic()
         workspace_created = True
-        _prepare_task_workspace(
+        task_workspace = _prepare_task_workspace(
             session,
             task_id,
             config,
@@ -1129,6 +1165,7 @@ def run_in_open_session(
             paths_dataset_csv=paths_dataset_csv,
             path_manifest_csv=path_manifest_csv,
             copy_loader_modules=prepare_loader_modules,
+            execution_environment=execution_environment,
         )
         timings["workspace_prepare_ms"] = int((time.monotonic() - t_workspace_start) * 1000)
 
@@ -1136,53 +1173,68 @@ def run_in_open_session(
         # collected by initialize_runtime_environment() once per container; the
         # caller passes it in here so we can surface the same instance on the
         # HTTP execution_environment field (single-source invariant).
-        # initialize_runtime_environment() already wrote the workdir file and
-        # set the AF_RUNTIME_ENVIRONMENT_FILE env var at container creation,
-        # so we do NOT re-collect per task.
+        # _prepare_task_workspace already pushed it into the execution container
+        # at <task_workspace>/runtime-environment.json (per-task path, set via
+        # sitecustomize AF_RUNTIME_ENVIRONMENT_FILE override), so we do NOT
+        # re-collect per task.
         #
-        # Spec §8 L1019 (Kimi rework 2026-08-08): exception below — when this
-        # task installs non-preinstalled packages, we MUST re-collect after
-        # the install so the HTTP field reflects post-install state.
+        # Spec §8 L1019 (Kimi rework 2026-08-08 + codex rework 2026-08-08 22:49):
+        # when this task installs non-preinstalled packages, the dynamic install
+        # path MUST be split into install() → re-collect → push updated file
+        # into container → run(code, libraries=None). Re-collecting AFTER run()
+        # is too late because report()/report_custom() already executed inside
+        # the run and read the baked file; the recorded environmentId would
+        # then disagree with the HTTP post-install field.
 
         _log_in_container(session, task_id, config, "script_start")
         t_run_start = time.monotonic()
         _smoke_check_loader_modules(session, config, task_id)
-        result = session.run(code, libraries=install_libraries, timeout=timeout)
-        timings["script_run_ms"] = int((time.monotonic() - t_run_start) * 1000)
-        timings["env_load_ms"] = timings["workspace_prepare_ms"]
-        timings["code_exec_ms"] = timings["script_run_ms"]
-        # Post-install environment re-collection: only when install_libraries
-        # was non-empty (i.e., the task actually triggered dynamic install).
-        # If install attempted and failed (network error, package not found),
-        # the post-install pip list will still reflect the actual installed
-        # set, which is the honest state to surface.
         if install_libraries:
-            t_post_install_start = time.monotonic()
+            # Phase 1: dynamic install via llm-sandbox's install() so we can
+            # re-collect + push the updated environment file BEFORE user code
+            # runs. session.install() raises LibraryInstallationNotSupported
+            # when skip_environment_setup=True or when the language handler
+            # refuses; that failure is the caller's contract to remove this
+            # branch (not a soft warning).
             try:
+                t_install_start = time.monotonic()
+                session.install(install_libraries)
+                timings["install_ms"] = int(
+                    (time.monotonic() - t_install_start) * 1000,
+                )
+            except Exception as install_exc:
+                logger.error(
+                    "RUNTIME_ENVIRONMENT_POST_INSTALL_FAILED task=%s "
+                    "libraries=%s error=%s",
+                    task_id, install_libraries, install_exc,
+                )
+                raise
+            # Phase 2: re-collect the actual post-install package set inside the
+            # container, then push it to the per-task runtime-environment.json
+            # path so user code that runs immediately below reads the new file.
+            try:
+                t_post_install_start = time.monotonic()
                 post_install_environment = collect_runtime_environment(
                     container_id=actual_container_id, session=session,
                 )
-                try:
-                    write_runtime_environment_json(
-                        config.workdir, post_install_environment,
-                    )
-                except Exception as write_exc:
-                    logger.warning(
-                        "RUNTIME_ENVIRONMENT_POST_INSTALL_FILE_WRITE_FAILED "
-                        "task=%s error=%s",
-                        task_id, write_exc,
-                    )
+                container_env_path = os.path.join(
+                    task_workspace, "runtime-environment.json",
+                )
+                write_runtime_environment_to_container(
+                    session, post_install_environment, container_env_path,
+                )
                 timings["post_install_recollect_ms"] = int(
                     (time.monotonic() - t_post_install_start) * 1000,
                 )
                 logger.info(
                     "RUNTIME_ENVIRONMENT_POST_INSTALL_RECOLLECT task=%s "
                     "installed=%s environment_id=%s baked_environment_id=%s "
-                    "elapsed_ms=%s",
+                    "container_path=%s elapsed_ms=%s",
                     task_id, install_libraries,
                     post_install_environment.environment_id,
                     execution_environment.environment_id
                     if execution_environment is not None else "-",
+                    container_env_path,
                     timings["post_install_recollect_ms"],
                 )
             except Exception as collect_exc:
@@ -1193,6 +1245,16 @@ def run_in_open_session(
                 )
                 # post_install_environment remains None; we fall back to the
                 # baked environment below when computing the effective env.
+            # Phase 3: run user code WITHOUT reinstalling — libraries are
+            # already present from session.install() above.
+            result = session.run(code, libraries=None, timeout=timeout)
+        else:
+            # No dynamic install: just run user code; libraries=[] is a no-op
+            # in llm-sandbox and keeps the contract explicit.
+            result = session.run(code, libraries=[], timeout=timeout)
+        timings["script_run_ms"] = int((time.monotonic() - t_run_start) * 1000)
+        timings["env_load_ms"] = timings["workspace_prepare_ms"]
+        timings["code_exec_ms"] = timings["script_run_ms"]
         _log_in_container(
             session,
             task_id,
