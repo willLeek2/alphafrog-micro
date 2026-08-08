@@ -74,6 +74,12 @@ final class LangchainTodoUserMessageBuilder {
         }
         context.append("\n请根据以上所有任务结果，生成对用户问题可直接展示的最终回答。");
         context.append("\n请直接输出 Markdown，不要把回答包在 JSON 或代码块里。");
+        // Spec §11 块外隔离（codex e740f454）：金融数值表由服务端在模型文本之后确定性追加，
+        // 模型只写块外说明，且块外文字同样不得复述环境、证据或任何内部身份。
+        context.append("\n金融计算的数值结果表由服务端在你的回答之后自动追加，你只需撰写必要的文字解释，不要自己拼表。");
+        context.append("\n禁止在回答中复述或拼接任何内部身份与后台信息：方法版本、规范或内容 digest（含 sha256: 前缀值）、"
+                + "运行/记录/批次/结果块/任务/数据集/工具调用等 ID、执行环境或镜像身份、包/API 版本、"
+                + "证据类型或等级、来源 resolver 信息，以及任何内部警告。");
         return context.toString();
     }
 
