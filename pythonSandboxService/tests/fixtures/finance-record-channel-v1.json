@@ -52,6 +52,25 @@
         ],
         "recordDigest": "d3d4cfc5e51e4ade73d71910e0e9195baf9422c68102b03f2bbc58e821bffd6a"
       }
+    },
+    {
+      "case": "two-valid-results-preserve-order",
+      "stdoutLines": [
+        "batch=2",
+        "__AF_FINANCE_RESULT_v1__{\"schemaVersion\":\"1\",\"methodId\":\"finance.growth.cagr\",\"methodVersion\":\"1.0.0\",\"specDigest\":\"sha256:spec-example\",\"sourceResolverToolCallId\":\"tool-call-resolver-1\",\"environmentId\":\"sha256:actual-runtime-example\",\"value\":0.12468265,\"unit\":\"ratio\",\"parameters\":{\"beginningValue\":100.0,\"endingValue\":160.0,\"periods\":4},\"inputRefs\":[\"dataset:1\"],\"checks\":{\"finite\":true},\"evidence\":\"LIBRARY_CALL_DECLARED\"}",
+        "__AF_FINANCE_RESULT_v1__{\"schemaVersion\":\"1\",\"sourceResolverToolCallId\":\"tool-call-resolver-2\",\"environmentId\":\"sha256:actual-runtime-example\",\"value\":2.75,\"unit\":\"score\",\"parameters\":{\"lookbackTradingDays\":37,\"threshold\":0.8},\"inputRefs\":[\"dataset:2\"],\"checks\":{\"finite\":true},\"formulaDescription\":\"37 个交易日内满足条件的自定义评分\",\"evidence\":\"CUSTOM_WITH_CHECKS\"}"
+      ],
+      "expected": {
+        "ordinaryStdout": "batch=2",
+        "resultRecordCount": 2,
+        "recordSetComplete": true,
+        "emittedRecordBytes": 759,
+        "rawDigests": [
+          "eb4382d97e74ff45f9b2a28d967f44af2f083404ac535287e70bc1d9e36a8a20",
+          "e280824002a4484ba012f2dbb6f9878dadb9c49097f3b2a7e1c3a492865c2e92"
+        ],
+        "recordDigest": "eda820b1ccf54b2d58d9d41d97298eb2af5e1c291e21c94855571ccde2f804f1"
+      }
     }
   ]
 }

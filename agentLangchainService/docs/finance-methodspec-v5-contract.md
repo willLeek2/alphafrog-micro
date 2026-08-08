@@ -199,8 +199,8 @@ schema 规则：
 | 方法 | 必填参数草案 | 方法特有约定 |
 |---|---|---|
 | CAGR | `beginningValue/endingValue/periods` | 期间含义与增长表达式 |
-| 年化波动率 | `returns/periodsPerYear/ddof` | 收益序列、年化因子和样本自由度 |
-| Sharpe | `returns/riskFreeRate/periodsPerYear/returnConvention/ddof` | 算术/几何收益、无风险利率频率和样本自由度 |
+| 年化波动率 | `returns/periodsPerYear`，可选 `window` | 收益序列、年化因子和可选观察窗口；样本标准差固定 `ddof=1` |
+| Sharpe | `returns`，可选 `riskFreeRate/riskFreeRateConvention/ddof/periodsPerYear/returnConvention` | 算术/几何收益、无风险利率频率和样本自由度 |
 
 三份草案都不得新增全局 `window`，也不得把自然年、月、交易日或任意日期范围写成 resolver 工具的固定输入字段。构建产物进入 jar，人工 YAML 和 schema 不进入运行时 jar。
 
@@ -394,6 +394,8 @@ ToolJobFinalizer 取得完整终态结果
 
 resume 不重新解析 16KB preview。同步和异步保存同一执行批次时依赖执行记录五元组幂等；同键内容不同是身份冲突，禁止覆盖。
 
+ENVELOPE 写入失败后再次进入该步骤时，Processor 必须对同一批次幂等；已经保存的同键同内容记录是无操作，同键不同内容仍按身份冲突失败。
+
 缺少可信 `runId`、`todoId` 或 `executePythonToolCallId` 时整批拒绝，不能生成临时身份。数据库使用五列复合唯一约束，不依赖字符串拼接；冲突后必须读回比较内容，不能只用 `ON CONFLICT DO NOTHING` 静默吞掉差异。
 
 保存失败时不得写 ENVELOPE，也不得返回 `ok=true`。FAILED、CANCELED、RESULT_LOST 即使 stdout 中含 marker，也不得保存业务记录。
@@ -410,6 +412,12 @@ resume 不重新解析 16KB preview。同步和异步保存同一执行批次时
 8. 来源 ID 和方法三元组完整时，使用可信 runId 精确查询解析快照；
 9. 目标/实际包 API 兼容性检查；
 10. 幂等保存，再写后台审计事件。
+
+环境与包接口检查区分三种事实：
+
+- 记录声明的 `environmentId` 与 proto 实际环境不一致、实际环境父消息缺失、实际包 API 不兼容时，记录保留后台审计，内部证据降为 `CUSTOM_UNVERIFIED`；普通任务仍可成功，呈现资格按后台规则决定，不能一律改成 `renderable=false`；记录本身缺少必填 `environmentId` 时仍按 schema-invalid 处理；
+- 已保存 resolver 目标环境与 proto 实际环境不一致时，写 `FINANCE_CROSS_ENVIRONMENT`，并降级内部证据；
+- 上述差异、证据降级、环境身份和包版本都不得进入模型投影或用户结果；若记录仍符合后台呈现规则，公开内容继续只有三列。
 
 解析输出要区分：
 
@@ -633,7 +641,7 @@ FINANCE_RESULT_BLOCK_RENDERED
 5. 模型成功 stdout 和失败 stdout/stderr 再设独立上下文上限。
 6. 目录 prompt 字节/令牌超预算时不得静默截断或遗漏方法。
 
-Python task 快照至少固定 `recordCountMax/recordMaxBytes/recordChannelMaxBytes/stdoutMaxBytes/stderrMaxBytes` 和 source revision；Java run/anchor 快照固定同一组生效上限及 `targetEnvironmentId`。配置加载顺序是应用默认值 → 整份合法动态值 → 代码硬上限缩小；非法动态值保留 last-known-good，幂等 create 返回原快照，执行中不得读取更新后的配置。
+Python task 快照固定 `recordChannelMaxRecords/recordChannelMaxBytes/stdoutMaxBytes/stderrMaxBytes` 和 source revision；Java run/anchor 快照固定 `recordCountMax/recordMaxBytes/recordChannelMaxBytes/stdoutMaxBytes/stderrMaxBytes` 及 `targetEnvironmentId`。配置加载顺序是应用默认值 → 整份合法动态值 → 代码硬上限缩小；非法动态值保留 last-known-good，幂等 create 返回原快照，执行中不得读取更新后的配置。
 
 正式数字必须由工作包 C/D 的四段测试确认，本协议不编造生产值。
 
