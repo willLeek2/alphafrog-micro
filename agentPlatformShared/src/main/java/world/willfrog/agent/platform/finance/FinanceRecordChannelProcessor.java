@@ -302,7 +302,10 @@ public class FinanceRecordChannelProcessor {
         content.put("runId", batch.getRunId());
         content.put("todoId", batch.getTodoId());
         content.put("executePythonToolCallId", batch.getExecutePythonToolCallId());
-        content.put("entryPoint", batch.getEntryPoint());
+        // entryPoint records which terminal path won the first durable write, but it is not
+        // business content. A sync write followed by async ENVELOPE recovery must replay as the
+        // same executePython batch instead of becoming an identity conflict solely because the
+        // processing path changed.
         content.put("terminalStatus", batch.getTerminalStatus());
         content.put("exitCode", batch.getExitCode());
         content.put("recordCount", batch.getRecordCount());
