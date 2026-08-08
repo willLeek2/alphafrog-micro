@@ -186,6 +186,54 @@ class FinanceMethodResolutionValidatorTest {
     }
 
     @Test
+    void unknownRootFieldIsRejected() throws Exception {
+        FinanceMethodSpec cagr = catalog.findByMethodId("finance.growth.cagr").orElseThrow();
+        String json = "{"
+                + "\"status\":\"MATCHED\","
+                + "\"candidates\":[{"
+                + "  \"methodId\":\"" + cagr.getMethodId() + "\","
+                + "  \"version\":\"" + cagr.getVersion() + "\","
+                + "  \"specDigest\":\"" + cagr.getSpecDigest() + "\","
+                + "  \"matchReason\":\"ok\","
+                + "  \"unresolvedTerms\":[],"
+                + "  \"clarificationQuestions\":[]"
+                + "}],"
+                + "\"foo\":\"bar\","
+                + "\"matchReason\":\"\","
+                + "\"unresolvedTerms\":[],"
+                + "\"clarificationQuestions\":[]"
+                + "}";
+        JsonNode node = objectMapper.readTree(json);
+        FinanceMethodResolutionValidator.ValidationResult result = validator.validate(node);
+        assertFalse(result.isValid());
+        assertEquals("FORBIDDEN_MODEL_FIELD", result.getErrorCode());
+    }
+
+    @Test
+    void unknownCandidateFieldIsRejected() throws Exception {
+        FinanceMethodSpec cagr = catalog.findByMethodId("finance.growth.cagr").orElseThrow();
+        String json = "{"
+                + "\"status\":\"MATCHED\","
+                + "\"candidates\":[{"
+                + "  \"methodId\":\"" + cagr.getMethodId() + "\","
+                + "  \"version\":\"" + cagr.getVersion() + "\","
+                + "  \"specDigest\":\"" + cagr.getSpecDigest() + "\","
+                + "  \"matchReason\":\"ok\","
+                + "  \"foo\":\"bar\","
+                + "  \"unresolvedTerms\":[],"
+                + "  \"clarificationQuestions\":[]"
+                + "}],"
+                + "\"matchReason\":\"\","
+                + "\"unresolvedTerms\":[],"
+                + "\"clarificationQuestions\":[]"
+                + "}";
+        JsonNode node = objectMapper.readTree(json);
+        FinanceMethodResolutionValidator.ValidationResult result = validator.validate(node);
+        assertFalse(result.isValid());
+        assertEquals("FORBIDDEN_MODEL_FIELD", result.getErrorCode());
+    }
+
+    @Test
     void vagueTimeTermsProduceClarificationOnly() throws Exception {
         FinanceMethodSpec cagr = catalog.findByMethodId("finance.growth.cagr").orElseThrow();
         String json = "{"

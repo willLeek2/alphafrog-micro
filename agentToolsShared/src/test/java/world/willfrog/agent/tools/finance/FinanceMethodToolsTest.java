@@ -5,8 +5,10 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import world.willfrog.agent.platform.context.AgentContext;
 
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
@@ -65,7 +67,8 @@ class FinanceMethodToolsTest {
                 + "}";
 
         FinanceMethodResolverClient client = mock(FinanceMethodResolverClient.class);
-        when(client.resolve(any(), any(), any())).thenReturn(new FinanceMethodResolverClient.Ok(modelJson));
+        when(client.resolve(any(), any(), any())).thenReturn(
+                new FinanceMethodResolverClient.Ok(modelJson, "{\"provider\":\"openrouter\",\"model\":\"gpt-4o-mini\"}"));
         FinanceMethodResolutionSink sink = mock(FinanceMethodResolutionSink.class);
 
         FinanceMethodTools tools = new FinanceMethodTools(
@@ -108,6 +111,72 @@ class FinanceMethodToolsTest {
     }
 
     @Test
+    void longSentenceContainingAliasSubstringDoesNotFallback() throws Exception {
+        FinanceMethodResolverClient client = mock(FinanceMethodResolverClient.class);
+        when(client.resolve(any(), any(), any()))
+                .thenReturn(new FinanceMethodResolverClient.TechnicalError(
+                        FinanceMethodResolverClient.ErrorKind.TIMEOUT, "timeout"));
+
+        FinanceMethodTools tools = new FinanceMethodTools(
+                specCatalog, resolverCatalog, validator, renderer, knowledgeCatalog, objectMapper);
+        tools.setResolverClient(client);
+
+        String result = tools.resolveFinanceMethods("请帮我计算一下CAGR大概是多少", null);
+        JsonNode node = objectMapper.readTree(result);
+        assertFalse(node.get("ok").asBoolean());
+        assertEquals("RESOLVER_UNAVAILABLE", node.get("error").get("code").asText());
+    }
+
+    @Test
+    void exactAliasMultiMethodHitReturnsEmpty() throws Exception {
+        FinanceMethodSpecCatalog mockCatalog = mock(FinanceMethodSpecCatalog.class);
+        FinanceMethodResolutionValidator mockValidator = new FinanceMethodResolutionValidator(mockCatalog);
+        FinanceMethodSuggestionRenderer mockRenderer = new FinanceMethodSuggestionRenderer(
+                mockCatalog, knowledgeCatalog, objectMapper);
+
+        FinanceMethodSpec specA = FinanceMethodSpec.builder()
+                .methodId("finance.x.a")
+                .version("1.0.0")
+                .specDigest("sha256:a")
+                .displayName("A")
+                .resolverHints(FinanceMethodSpec.FinanceResolverHints.builder()
+                        .aliases(List.of("overlap"))
+                        .build())
+                .outputs(List.of(FinanceMethodSpec.FinanceOutput.builder()
+                        .name("out").unit("u").description("d").build()))
+                .build();
+        FinanceMethodSpec specB = FinanceMethodSpec.builder()
+                .methodId("finance.x.b")
+                .version("1.0.0")
+                .specDigest("sha256:b")
+                .displayName("B")
+                .resolverHints(FinanceMethodSpec.FinanceResolverHints.builder()
+                        .aliases(List.of("overlap"))
+                        .build())
+                .outputs(List.of(FinanceMethodSpec.FinanceOutput.builder()
+                        .name("out").unit("u").description("d").build()))
+                .build();
+
+        when(mockCatalog.listAll()).thenReturn(List.of(specA, specB));
+        when(mockCatalog.find("finance.x.a", "1.0.0", "sha256:a")).thenReturn(java.util.Optional.of(specA));
+        when(mockCatalog.find("finance.x.b", "1.0.0", "sha256:b")).thenReturn(java.util.Optional.of(specB));
+
+        FinanceMethodResolverClient client = mock(FinanceMethodResolverClient.class);
+        when(client.resolve(any(), any(), any()))
+                .thenReturn(new FinanceMethodResolverClient.TechnicalError(
+                        FinanceMethodResolverClient.ErrorKind.TIMEOUT, "timeout"));
+
+        FinanceMethodTools tools = new FinanceMethodTools(
+                mockCatalog, resolverCatalog, mockValidator, mockRenderer, knowledgeCatalog, objectMapper);
+        tools.setResolverClient(client);
+
+        String result = tools.resolveFinanceMethods("overlap", null);
+        JsonNode node = objectMapper.readTree(result);
+        assertFalse(node.get("ok").asBoolean());
+        assertEquals("RESOLVER_UNAVAILABLE", node.get("error").get("code").asText());
+    }
+
+    @Test
     void technicalFailureWithoutAliasReturnsError() throws Exception {
         FinanceMethodResolverClient client = mock(FinanceMethodResolverClient.class);
         when(client.resolve(any(), any(), any()))
@@ -127,7 +196,7 @@ class FinanceMethodToolsTest {
     @Test
     void badModelOutputReturnsError() throws Exception {
         FinanceMethodResolverClient client = mock(FinanceMethodResolverClient.class);
-        when(client.resolve(any(), any(), any())).thenReturn(new FinanceMethodResolverClient.Ok("not json"));
+        when(client.resolve(any(), any(), any())).thenReturn(new FinanceMethodResolverClient.Ok("not json", null));
 
         FinanceMethodTools tools = new FinanceMethodTools(
                 specCatalog, resolverCatalog, validator, renderer, knowledgeCatalog, objectMapper);
@@ -158,7 +227,7 @@ class FinanceMethodToolsTest {
                 + "}";
 
         FinanceMethodResolverClient client = mock(FinanceMethodResolverClient.class);
-        when(client.resolve(any(), any(), any())).thenReturn(new FinanceMethodResolverClient.Ok(modelJson));
+        when(client.resolve(any(), any(), any())).thenReturn(new FinanceMethodResolverClient.Ok(modelJson, null));
         FinanceMethodResolutionSink sink = mock(FinanceMethodResolutionSink.class);
         doThrow(new FinanceMethodResolutionSinkException("db down")).when(sink).saveAll(any());
 
@@ -174,6 +243,75 @@ class FinanceMethodToolsTest {
     }
 
     @Test
+    void blankRunIdWithSuggestionsReturnsError() throws Exception {
+        AgentContext.clear();
+        AgentContext.setToolCallId("resolver-call-1");
+
+        FinanceMethodSpec cagr = specCatalog.findByMethodId("finance.growth.cagr").orElseThrow();
+        String modelJson = "{"
+                + "\"status\":\"MATCHED\","
+                + "\"candidates\":[{"
+                + "  \"methodId\":\"" + cagr.getMethodId() + "\","
+                + "  \"version\":\"" + cagr.getVersion() + "\","
+                + "  \"specDigest\":\"" + cagr.getSpecDigest() + "\","
+                + "  \"matchReason\":\"ok\","
+                + "  \"unresolvedTerms\":[],"
+                + "  \"clarificationQuestions\":[]"
+                + "}],"
+                + "\"matchReason\":\"\","
+                + "\"unresolvedTerms\":[],"
+                + "\"clarificationQuestions\":[]"
+                + "}";
+
+        FinanceMethodResolverClient client = mock(FinanceMethodResolverClient.class);
+        when(client.resolve(any(), any(), any())).thenReturn(new FinanceMethodResolverClient.Ok(modelJson, null));
+        FinanceMethodResolutionSink sink = mock(FinanceMethodResolutionSink.class);
+
+        FinanceMethodTools tools = new FinanceMethodTools(
+                specCatalog, resolverCatalog, validator, renderer, knowledgeCatalog, objectMapper);
+        tools.setResolverClient(client);
+        tools.setResolutionSink(sink);
+
+        String result = tools.resolveFinanceMethods("CAGR", null);
+        JsonNode node = objectMapper.readTree(result);
+        assertFalse(node.get("ok").asBoolean());
+        assertEquals("RESOLVER_RUN_ID_MISSING", node.get("error").get("code").asText());
+        verify(sink, never()).saveAll(any());
+    }
+
+    @Test
+    void sinkMissingWithSuggestionsReturnsError() throws Exception {
+        FinanceMethodSpec cagr = specCatalog.findByMethodId("finance.growth.cagr").orElseThrow();
+        String modelJson = "{"
+                + "\"status\":\"MATCHED\","
+                + "\"candidates\":[{"
+                + "  \"methodId\":\"" + cagr.getMethodId() + "\","
+                + "  \"version\":\"" + cagr.getVersion() + "\","
+                + "  \"specDigest\":\"" + cagr.getSpecDigest() + "\","
+                + "  \"matchReason\":\"ok\","
+                + "  \"unresolvedTerms\":[],"
+                + "  \"clarificationQuestions\":[]"
+                + "}],"
+                + "\"matchReason\":\"\","
+                + "\"unresolvedTerms\":[],"
+                + "\"clarificationQuestions\":[]"
+                + "}";
+
+        FinanceMethodResolverClient client = mock(FinanceMethodResolverClient.class);
+        when(client.resolve(any(), any(), any())).thenReturn(new FinanceMethodResolverClient.Ok(modelJson, null));
+
+        FinanceMethodTools tools = new FinanceMethodTools(
+                specCatalog, resolverCatalog, validator, renderer, knowledgeCatalog, objectMapper);
+        tools.setResolverClient(client);
+        // resolutionSink is null
+
+        String result = tools.resolveFinanceMethods("CAGR", null);
+        JsonNode node = objectMapper.readTree(result);
+        assertFalse(node.get("ok").asBoolean());
+        assertEquals("RESOLVER_SINK_NOT_CONFIGURED", node.get("error").get("code").asText());
+    }
+
+    @Test
     void noResolverClientReturnsUnavailable() throws Exception {
         FinanceMethodTools tools = new FinanceMethodTools(
                 specCatalog, resolverCatalog, validator, renderer, knowledgeCatalog, objectMapper);
@@ -182,5 +320,44 @@ class FinanceMethodToolsTest {
         JsonNode node = objectMapper.readTree(result);
         assertFalse(node.get("ok").asBoolean());
         assertEquals("RESOLVER_UNAVAILABLE", node.get("error").get("code").asText());
+    }
+
+    @Test
+    void modelRouteJsonComesFromOkRouteField() throws Exception {
+        FinanceMethodSpec cagr = specCatalog.findByMethodId("finance.growth.cagr").orElseThrow();
+        String modelJson = "{"
+                + "\"status\":\"MATCHED\","
+                + "\"candidates\":[{"
+                + "  \"methodId\":\"" + cagr.getMethodId() + "\","
+                + "  \"version\":\"" + cagr.getVersion() + "\","
+                + "  \"specDigest\":\"" + cagr.getSpecDigest() + "\","
+                + "  \"matchReason\":\"ok\","
+                + "  \"unresolvedTerms\":[],"
+                + "  \"clarificationQuestions\":[]"
+                + "}],"
+                + "\"matchReason\":\"\","
+                + "\"unresolvedTerms\":[],"
+                + "\"clarificationQuestions\":[]"
+                + "}";
+        String routeJson = "{\"provider\":\"openrouter\",\"model\":\"gpt-4o-mini\"}";
+
+        FinanceMethodResolverClient client = mock(FinanceMethodResolverClient.class);
+        when(client.resolve(any(), any(), any())).thenReturn(new FinanceMethodResolverClient.Ok(modelJson, routeJson));
+        FinanceMethodResolutionSink sink = mock(FinanceMethodResolutionSink.class);
+
+        FinanceMethodTools tools = new FinanceMethodTools(
+                specCatalog, resolverCatalog, validator, renderer, knowledgeCatalog, objectMapper);
+        tools.setResolverClient(client);
+        tools.setResolutionSink(sink);
+
+        String result = tools.resolveFinanceMethods("CAGR", null);
+        JsonNode node = objectMapper.readTree(result);
+        assertTrue(node.get("ok").asBoolean());
+
+        ArgumentCaptor<List<FinanceMethodResolutionSnapshot>> captor = ArgumentCaptor.forClass(List.class);
+        verify(sink).saveAll(captor.capture());
+        List<FinanceMethodResolutionSnapshot> snapshots = captor.getValue();
+        assertEquals(1, snapshots.size());
+        assertEquals(routeJson, snapshots.get(0).modelRouteJson());
     }
 }

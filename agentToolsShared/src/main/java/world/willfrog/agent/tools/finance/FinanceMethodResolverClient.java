@@ -19,12 +19,19 @@ public interface FinanceMethodResolverClient {
     ResolverResult resolve(String query, String context, String catalogText);
 
     /**
-     * 解析结果：要么成功返回原始 JSON 字符串，要么返回明确的技术错误分类。
+     * 解析结果：要么成功返回原始 JSON 字符串与真实模型路由信息，要么返回明确的技术错误分类。
      */
     sealed interface ResolverResult permits Ok, TechnicalError {
     }
 
-    record Ok(String rawJson) implements ResolverResult {
+    /**
+     * 成功结果。
+     *
+     * @param rawJson        模型原始输出 JSON 字符串
+     * @param modelRouteJson 真实 provider/endpoint/model 路由信息，由 platform 实现侧填入；
+     *                       仅用于可观测快照，不得把模型输出内容当作路由
+     */
+    record Ok(String rawJson, String modelRouteJson) implements ResolverResult {
     }
 
     record TechnicalError(ErrorKind kind, String message) implements ResolverResult {

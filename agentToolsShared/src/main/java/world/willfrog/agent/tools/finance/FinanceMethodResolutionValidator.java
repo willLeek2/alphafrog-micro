@@ -26,6 +26,12 @@ public class FinanceMethodResolutionValidator {
     private static final int MAX_TERMS = 64;
     private static final int MAX_QUESTIONS = 64;
 
+    private static final Set<String> ALLOWED_ROOT_FIELDS = Set.of(
+            "status", "candidates", "matchReason", "unresolvedTerms", "clarificationQuestions");
+
+    private static final Set<String> ALLOWED_CANDIDATE_FIELDS = Set.of(
+            "methodId", "version", "specDigest", "matchReason", "unresolvedTerms", "clarificationQuestions");
+
     private static final Set<String> ALLOWED_STATUSES = Set.of(
             "MATCHED", "AMBIGUOUS", "NEEDS_CLARIFICATION", "NO_ADVICE");
 
@@ -94,10 +100,10 @@ public class FinanceMethodResolutionValidator {
             }
         }
 
-        // 根级字段限制：模型不得提供 definition、parameters、sources、library、sample 或环境事实。
-        if (containsForbiddenRootField(output)) {
-            return invalid("FORBIDDEN_MODEL_FIELD",
-                    "Model output must not include definition/parameters/sources/library/sample/environment facts");
+        // 根级字段严格 allowlist
+        ValidationResult rootFieldResult = validateRootFields(output);
+        if (!rootFieldResult.isValid()) {
+            return rootFieldResult;
         }
 
         String matchReason = textOrNull(output, "matchReason");
@@ -146,16 +152,35 @@ public class FinanceMethodResolutionValidator {
             return questionsResult.withPrefix("Candidate " + index + " ");
         }
 
-        // 候选级禁止字段
-        Iterator<String> fieldNames = cand.fieldNames();
-        while (fieldNames.hasNext()) {
-            String name = fieldNames.next();
-            if (isForbiddenField(name)) {
-                return invalid("FORBIDDEN_MODEL_FIELD",
-                        "Candidate " + index + " must not include field: " + name);
-            }
+        // 候选级字段严格 allowlist
+        ValidationResult candFieldResult = validateCandidateFields(cand, index);
+        if (!candFieldResult.isValid()) {
+            return candFieldResult;
         }
 
+        return valid(null, null);
+    }
+
+    private ValidationResult validateRootFields(JsonNode output) {
+        Iterator<String> it = output.fieldNames();
+        while (it.hasNext()) {
+            String name = it.next();
+            if (!ALLOWED_ROOT_FIELDS.contains(name)) {
+                return invalid("FORBIDDEN_MODEL_FIELD", "Root field not allowed: " + name);
+            }
+        }
+        return valid(null, null);
+    }
+
+    private ValidationResult validateCandidateFields(JsonNode cand, int index) {
+        Iterator<String> it = cand.fieldNames();
+        while (it.hasNext()) {
+            String name = it.next();
+            if (!ALLOWED_CANDIDATE_FIELDS.contains(name)) {
+                return invalid("FORBIDDEN_MODEL_FIELD",
+                        "Candidate " + index + " field not allowed: " + name);
+            }
+        }
         return valid(null, null);
     }
 
@@ -183,27 +208,6 @@ public class FinanceMethodResolutionValidator {
             }
         }
         return valid(null, null);
-    }
-
-    private boolean containsForbiddenRootField(JsonNode output) {
-        Iterator<String> it = output.fieldNames();
-        while (it.hasNext()) {
-            if (isForbiddenField(it.next())) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private boolean isForbiddenField(String name) {
-        return "definition".equals(name)
-                || "parameters".equals(name)
-                || "sources".equals(name)
-                || "library".equals(name)
-                || "sample".equals(name)
-                || "environment".equals(name)
-                || name.toLowerCase().startsWith("library")
-                || name.toLowerCase().startsWith("environment");
     }
 
     private String text(JsonNode node, String field) {

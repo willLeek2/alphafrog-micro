@@ -116,7 +116,7 @@ public class FinanceMethodSuggestionRenderer {
         lib.put("package", binding.getPackageName());
         lib.put("function", binding.getFunction());
         lib.put("apiCompatRange", binding.getApiCompatRange());
-        if (isCompatible(binding.getApiCompatRange(), env)) {
+        if (isCompatible(binding.getApiCompatRange(), env, binding.getPackageName())) {
             lib.put("available", true);
         }
         return lib;
@@ -126,11 +126,11 @@ public class FinanceMethodSuggestionRenderer {
         if (spec.getLibraryBinding() == null) {
             return null;
         }
-        if (env == null || env.environmentId() == null) {
+        if (env == null || env.environmentId() == null || env.environmentId().isBlank()) {
             return null;
         }
         FinanceMethodSpec.FinanceLibraryBinding binding = spec.getLibraryBinding();
-        if (!isCompatible(binding.getApiCompatRange(), env)) {
+        if (!isCompatible(binding.getApiCompatRange(), env, binding.getPackageName())) {
             return null;
         }
         StringBuilder sb = new StringBuilder();
@@ -146,12 +146,12 @@ public class FinanceMethodSuggestionRenderer {
         return sb.toString();
     }
 
-    private boolean isCompatible(String apiCompatRange, TargetEnvironment env) {
-        if (apiCompatRange == null || apiCompatRange.isBlank()) {
+    private boolean isCompatible(String apiCompatRange, TargetEnvironment env, String packageName) {
+        if (apiCompatRange == null || apiCompatRange.isBlank() || packageName == null || packageName.isBlank()) {
             return false;
         }
         Optional<String> targetApi = env.packageApis().stream()
-                .filter(p -> "alphafrog_finance".equals(p.name()))
+                .filter(p -> packageName.equals(p.name()))
                 .map(TargetEnvironment.PackageApi::apiVersion)
                 .findFirst();
         if (targetApi.isEmpty()) {

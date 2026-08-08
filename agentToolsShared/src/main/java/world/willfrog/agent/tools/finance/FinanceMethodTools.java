@@ -2,7 +2,6 @@ package world.willfrog.agent.tools.finance;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ArrayNode;
 import dev.langchain4j.agent.tool.P;
 import dev.langchain4j.agent.tool.Tool;
 import lombok.extern.slf4j.Slf4j;
@@ -32,6 +31,7 @@ import java.util.stream.Collectors;
 public class FinanceMethodTools {
 
     private static final String RESOLVER_SCHEMA_VERSION = "1";
+    private static final String EXACT_ALIAS_FALLBACK_ROUTE = "{\"route\":\"exact_alias_fallback\"}";
     private static final int MAX_QUERY_BYTES = 4096;
     private static final int MAX_CONTEXT_BYTES = 4096;
 
@@ -109,6 +109,7 @@ public class FinanceMethodTools {
 
         String systemPrompt = resolverCatalog.renderSystemPrompt();
         JsonNode modelOutput;
+        String modelRouteJson;
         boolean usedExactAliasFallback;
 
         ResolverResult resolverResult = resolverClient == null
@@ -117,12 +118,14 @@ public class FinanceMethodTools {
 
         if (resolverResult instanceof FinanceMethodResolverClient.Ok ok) {
             modelOutput = parseModelJson(ok.rawJson());
+            modelRouteJson = ok.modelRouteJson();
             usedExactAliasFallback = false;
         } else if (resolverResult instanceof FinanceMethodResolverClient.TechnicalError err) {
             // 技术失败先走精确别名兜底
             Optional<JsonNode> fallback = exactAliasFallback(query, context);
             if (fallback.isPresent()) {
                 modelOutput = fallback.get();
+                modelRouteJson = EXACT_ALIAS_FALLBACK_ROUTE;
                 usedExactAliasFallback = true;
             } else {
                 return technicalError(err.kind());
@@ -139,6 +142,7 @@ public class FinanceMethodTools {
                 validation = validator.validate(fallback.get());
                 if (validation.isValid()) {
                     modelOutput = fallback.get();
+                    modelRouteJson = EXACT_ALIAS_FALLBACK_ROUTE;
                     usedExactAliasFallback = true;
                 }
             }
@@ -152,12 +156,18 @@ public class FinanceMethodTools {
         List<Map<String, Object>> suggestions = renderSuggestions(
                 validation.getCandidates(), status, modelOutput);
 
-        String runId = nvl(AgentContext.getRunId());
-        String todoId = nvl(AgentContext.getTodoId());
-        List<FinanceMethodResolutionSnapshot> snapshots = buildSnapshots(
-                runId, resolverToolCallId, todoId, status, suggestions, modelOutput);
-
-        if (resolutionSink != null && !snapshots.isEmpty()) {
+        // 有候选建议时才强制 runId 与 sink；NO_ADVICE 等空建议时允许不保存
+        if (!suggestions.isEmpty()) {
+            String runId = nvl(AgentContext.getRunId());
+            if (runId.isBlank()) {
+                return fail("RESOLVER_RUN_ID_MISSING", "Run ID is required to persist resolution snapshots");
+            }
+            if (resolutionSink == null) {
+                return fail("RESOLVER_SINK_NOT_CONFIGURED", "Resolution sink is required to persist snapshots");
+            }
+            String todoId = nvl(AgentContext.getTodoId());
+            List<FinanceMethodResolutionSnapshot> snapshots = buildSnapshots(
+                    runId, resolverToolCallId, todoId, status, suggestions, modelRouteJson);
             try {
                 resolutionSink.saveAll(snapshots);
             } catch (FinanceMethodResolutionSinkException sinkEx) {
@@ -191,8 +201,7 @@ public class FinanceMethodTools {
         if (query == null) {
             return Optional.empty();
         }
-        String normalized = query.toLowerCase();
-        List<FinanceMethodSpec.FinanceResolverHints> matched = new ArrayList<>();
+        String normalized = normalizeForExactAlias(query);
         FinanceMethodSpec matchedSpec = null;
         for (FinanceMethodSpec spec : specCatalog.listAll()) {
             FinanceMethodSpec.FinanceResolverHints hints = spec.getResolverHints();
@@ -200,17 +209,12 @@ public class FinanceMethodTools {
                 continue;
             }
             for (String alias : hints.getAliases()) {
-                if (!alias.isBlank() && normalized.contains(alias.toLowerCase())) {
-                    if (matchedSpec != null && !matchedSpec.getMethodId().equals(spec.getMethodId())) {
-                        return Optional.empty(); // 多个匹配 → 不兜底
-                    }
-                    matchedSpec = spec;
+                if (alias.isBlank()) {
+                    continue;
                 }
-            }
-            for (String phrase : hints.getCommonPhrases()) {
-                if (!phrase.isBlank() && normalized.contains(phrase.toLowerCase())) {
+                if (normalized.equals(normalizeForExactAlias(alias))) {
                     if (matchedSpec != null && !matchedSpec.getMethodId().equals(spec.getMethodId())) {
-                        return Optional.empty();
+                        return Optional.empty(); // 跨方法多命中 → 不兜底
                     }
                     matchedSpec = spec;
                 }
@@ -225,11 +229,11 @@ public class FinanceMethodTools {
         candidate.put("methodId", matchedSpec.getMethodId());
         candidate.put("version", matchedSpec.getVersion());
         candidate.put("specDigest", matchedSpec.getSpecDigest());
-        candidate.put("matchReason", "精确别名/常见说法匹配：" + query);
+        candidate.put("matchReason", "精确别名匹配：" + query);
         candidate.put("unresolvedTerms", Collections.emptyList());
         candidate.put("clarificationQuestions", Collections.emptyList());
         fallback.put("candidates", List.of(candidate));
-        fallback.put("matchReason", "基于目录别名或常见说法精确匹配");
+        fallback.put("matchReason", "基于目录别名精确匹配");
         fallback.put("unresolvedTerms", Collections.emptyList());
         fallback.put("clarificationQuestions", Collections.emptyList());
         try {
@@ -237,6 +241,13 @@ public class FinanceMethodTools {
         } catch (Exception e) {
             return Optional.empty();
         }
+    }
+
+    private String normalizeForExactAlias(String text) {
+        if (text == null) {
+            return "";
+        }
+        return text.trim().toLowerCase().replace('　', ' ');
     }
 
     private String technicalError(FinanceMethodResolverClient.ErrorKind kind) {
@@ -286,14 +297,13 @@ public class FinanceMethodTools {
             String todoId,
             String status,
             List<Map<String, Object>> suggestions,
-            JsonNode modelOutput) {
+            String modelRouteJson) {
         if (runId.isBlank()) {
             return Collections.emptyList();
         }
         List<FinanceMethodResolutionSnapshot> snapshots = new ArrayList<>();
         String catalogDigest = resolverCatalog.getCatalogDigest();
         String resolverPromptVersion = resolverCatalog.getPromptVersion();
-        String modelRouteJson = serializeSafe(modelOutput);
         String resolutionPayloadJson = serializeSafe(suggestions);
         String resolutionContentDigest = sha256(resolutionPayloadJson.getBytes(StandardCharsets.UTF_8));
         for (Map<String, Object> suggestion : suggestions) {

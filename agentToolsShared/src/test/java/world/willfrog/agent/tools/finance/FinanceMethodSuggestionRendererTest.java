@@ -108,4 +108,38 @@ class FinanceMethodSuggestionRendererTest {
         assertNull(library.get("available"));
         assertNull(suggestion.get("sample"));
     }
+
+    @Test
+    void packageNameMismatchIsNotCompatible() {
+        FinanceMethodSpec cagr = specCatalog.findByMethodId("finance.growth.cagr").orElseThrow();
+        FinanceMethodSuggestionRenderer.TargetEnvironment env =
+                new FinanceMethodSuggestionRenderer.TargetEnvironment(
+                        "env-1",
+                        List.of(new FinanceMethodSuggestionRenderer.TargetEnvironment.PackageApi(
+                                "other_package", "1.0.3", "1.0")));
+        Map<String, Object> suggestion = renderer.render(
+                cagr.getMethodId(), cagr.getVersion(), cagr.getSpecDigest(),
+                "匹配", List.of(), List.of(), env);
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> library = (Map<String, Object>) suggestion.get("library");
+        assertNotNull(library);
+        assertNull(library.get("available"));
+        assertNull(suggestion.get("sample"));
+    }
+
+    @Test
+    void blankEnvironmentIdDoesNotRenderSample() {
+        FinanceMethodSpec cagr = specCatalog.findByMethodId("finance.growth.cagr").orElseThrow();
+        FinanceMethodSuggestionRenderer.TargetEnvironment env =
+                new FinanceMethodSuggestionRenderer.TargetEnvironment(
+                        "   ",
+                        List.of(new FinanceMethodSuggestionRenderer.TargetEnvironment.PackageApi(
+                                "alphafrog_finance", "1.0.3", "1.0")));
+        Map<String, Object> suggestion = renderer.render(
+                cagr.getMethodId(), cagr.getVersion(), cagr.getSpecDigest(),
+                "匹配", List.of(), List.of(), env);
+        assertNull(suggestion.get("sample"));
+        assertNull(suggestion.get("library"));
+    }
 }

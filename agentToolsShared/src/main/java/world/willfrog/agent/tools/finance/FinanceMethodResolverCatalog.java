@@ -116,6 +116,7 @@ public class FinanceMethodResolverCatalog {
         return new ResolverCatalogEntry(
                 str(map.get("methodId")),
                 str(map.get("version")),
+                str(map.get("specDigest")),
                 str(map.get("displayName")),
                 listOfString(map.get("aliases")),
                 listOfString(map.get("commonPhrases")),
@@ -128,7 +129,7 @@ public class FinanceMethodResolverCatalog {
         sb.append("当前可用金融方法目录（按 methodId 排序）：\n");
         for (ResolverCatalogEntry e : entries) {
             sb.append("- ").append(e.methodId()).append(" v").append(e.version());
-            sb.append(" / ").append(e.displayName()).append("\n");
+            sb.append(" / ").append(e.displayName()).append("  ").append(e.specDigest()).append("\n");
             if (!e.aliases().isEmpty()) {
                 sb.append("  别名：").append(String.join("、", e.aliases())).append("\n");
             }
@@ -197,6 +198,7 @@ public class FinanceMethodResolverCatalog {
     public record ResolverCatalogEntry(
             String methodId,
             String version,
+            String specDigest,
             String displayName,
             List<String> aliases,
             List<String> commonPhrases,

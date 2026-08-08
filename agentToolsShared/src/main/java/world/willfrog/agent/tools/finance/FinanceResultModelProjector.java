@@ -2,6 +2,8 @@ package world.willfrog.agent.tools.finance;
 
 import lombok.extern.slf4j.Slf4j;
 
+import org.springframework.stereotype.Component;
+
 import java.util.Collection;
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -23,6 +25,7 @@ import java.util.regex.Pattern;
  *   <li>输出中永远不包含 digest / environment / evidence / identity / version 等后台字段。</li>
  * </ul>
  */
+@Component
 @Slf4j
 public class FinanceResultModelProjector {
 
@@ -49,10 +52,18 @@ public class FinanceResultModelProjector {
             return Optional.empty();
         }
 
-        // 自定义计算：没有完整方法三元组
-        boolean hasTriple = notBlank(in.methodId()) && notBlank(in.methodVersion()) && notBlank(in.specDigest());
-        if (!hasTriple) {
+        boolean methodIdBlank = isBlank(in.methodId());
+        boolean versionBlank = isBlank(in.methodVersion());
+        boolean specDigestBlank = isBlank(in.specDigest());
+
+        // 三者全空：自定义计算
+        if (methodIdBlank && versionBlank && specDigestBlank) {
             return projectCustom(in);
+        }
+
+        // partial triple：缺一或二 → 不可投影
+        if (methodIdBlank || versionBlank || specDigestBlank) {
+            return Optional.empty();
         }
 
         // 完整三元组但目录未命中：不可投影
@@ -67,13 +78,26 @@ public class FinanceResultModelProjector {
             return Optional.empty();
         }
 
+        // canonical unit 精确校验
+        String canonicalUnit = canonicalUnit(spec);
+        String inputUnit = in.unit() == null ? "" : in.unit().trim();
+        if (canonicalUnit == null || !inputUnit.equals(canonicalUnit)) {
+            return Optional.empty();
+        }
+
         Map<String, Object> effectiveParams = effectiveParameters(spec, in.parameters());
+        if (!requiredParametersSatisfied(spec, effectiveParams)) {
+            return Optional.empty();
+        }
+
         String howCalculated = fillTemplate(narrativeTemplate, effectiveParams, spec);
         if (howCalculated == null) {
             return Optional.empty();
         }
-        howCalculated = truncate(howCalculated, MAX_HOW_CALCULATED_LENGTH);
-        return Optional.of(new FinanceResultProjection(spec.getDisplayName(), in.value(), in.unit(), howCalculated));
+        if (howCalculated.length() > MAX_HOW_CALCULATED_LENGTH) {
+            return Optional.empty();
+        }
+        return Optional.of(new FinanceResultProjection(spec.getDisplayName(), in.value(), canonicalUnit, howCalculated));
     }
 
     private Optional<FinanceResultProjection> projectCustom(FinanceResultProjectionInput in) {
@@ -114,7 +138,8 @@ public class FinanceResultModelProjector {
                 // 缺少且无默认值：不可投影
                 return null;
             }
-            String replacement = renderValue(value);
+            FinanceMethodSpec.FinanceParameter param = spec.getParameters().get(key);
+            String replacement = renderValue(value, param == null ? null : param.getType());
             if (replacement == null) {
                 return null; // 类型不匹配或数组/对象直接输出
             }
@@ -124,7 +149,38 @@ public class FinanceResultModelProjector {
         return sb.toString();
     }
 
-    private String renderValue(Object value) {
+    private String renderValue(Object value, String declaredType) {
+        if (value == null) {
+            return null;
+        }
+        String type = declaredType == null ? "" : declaredType.toLowerCase();
+        if ("array".equals(type)) {
+            if (value instanceof Collection<?> c) {
+                return c.size() + " 个周期收益率样本";
+            }
+            if (value.getClass().isArray()) {
+                int length = java.lang.reflect.Array.getLength(value);
+                return length + " 个周期收益率样本";
+            }
+            return null; // array 参数收到标量 → 不可投影
+        }
+        if ("object".equals(type)) {
+            return null; // v1 无对象参数
+        }
+        // 标量类型：拒绝 Collection/数组
+        if (value instanceof Collection<?> || value.getClass().isArray()) {
+            return null;
+        }
+        if ("string".equals(type)) {
+            return value instanceof String ? (String) value : null;
+        }
+        if ("boolean".equals(type)) {
+            return value instanceof Boolean ? String.valueOf(value) : null;
+        }
+        if ("number".equals(type) || "integer".equals(type)) {
+            return value instanceof Number ? String.valueOf(value) : null;
+        }
+        // 未知类型：仅接受标量兜底
         if (value instanceof Number || value instanceof String || value instanceof Boolean) {
             if (value instanceof String s) {
                 if (s.length() > 256) {
@@ -134,14 +190,6 @@ public class FinanceResultModelProjector {
             }
             return String.valueOf(value);
         }
-        if (value instanceof Collection<?> c) {
-            return c.size() + " 个周期收益率样本";
-        }
-        if (value.getClass().isArray()) {
-            int length = java.lang.reflect.Array.getLength(value);
-            return length + " 个周期收益率样本";
-        }
-        // 对象或其他类型直接输出不可投影
         return null;
     }
 
@@ -155,15 +203,31 @@ public class FinanceResultModelProjector {
         return null;
     }
 
-    private String truncate(String text, int maxLength) {
-        if (text.length() <= maxLength) {
-            return text;
+    private String canonicalUnit(FinanceMethodSpec spec) {
+        List<FinanceMethodSpec.FinanceOutput> outputs = spec.getOutputs();
+        if (outputs == null || outputs.size() != 1) {
+            return null;
         }
-        return text.substring(0, maxLength);
+        String unit = outputs.get(0).getUnit();
+        if (unit == null || unit.isBlank()) {
+            return null;
+        }
+        return unit.trim();
     }
 
-    private boolean notBlank(String value) {
-        return value != null && !value.isBlank();
+    private boolean requiredParametersSatisfied(FinanceMethodSpec spec, Map<String, Object> params) {
+        for (Map.Entry<String, FinanceMethodSpec.FinanceParameter> e : spec.getParameters().entrySet()) {
+            FinanceMethodSpec.FinanceParameter param = e.getValue();
+            Boolean required = param.getRequired();
+            if (required != null && required && params.get(e.getKey()) == null) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean isBlank(String value) {
+        return value == null || value.isBlank();
     }
 
     /**
