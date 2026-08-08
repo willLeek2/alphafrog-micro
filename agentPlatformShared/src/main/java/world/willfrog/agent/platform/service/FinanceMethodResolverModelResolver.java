@@ -65,10 +65,15 @@ public class FinanceMethodResolverModelResolver {
     /**
      * resolver 配置的唯一读取口径：本地文件显式包含 {@code financeMethodResolver} 顶层节时取本地节，
      * 否则回退 Spring/Nacos 静态配置。调用方（路由与边界）必须使用同一返回值。
+     *
+     * <p>单次 {@link AgentLlmLocalConfigLoader#currentSnapshot()} 读取同时取得 config 与显式节集合，
+     * 不组合两个 accessor，refresh 窗口内也不会出现旧 config 配新 sections 的错配快照。</p>
      */
     public AgentLlmProperties.FinanceMethodResolver effectiveResolverConfig() {
-        AgentLlmProperties local = localConfigLoader == null ? null : localConfigLoader.current().orElse(null);
-        if (local != null && localConfigLoader.currentHasTopLevelSection(LOCAL_SECTION)
+        AgentLlmLocalConfigLoader.LocalConfigSnapshot snapshot =
+                localConfigLoader == null ? null : localConfigLoader.currentSnapshot();
+        AgentLlmProperties local = snapshot == null ? null : snapshot.config();
+        if (local != null && snapshot.topLevelSections().contains(LOCAL_SECTION)
                 && local.getFinanceMethodResolver() != null) {
             return local.getFinanceMethodResolver();
         }
