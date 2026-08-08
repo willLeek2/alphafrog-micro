@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import base64
 import csv
 import io
 import json
 import logging
+import os
 import re
 import shlex
 import tempfile
@@ -14,9 +16,29 @@ from typing import Any, Dict, List, Tuple
 from llm_sandbox import SandboxSession
 from llm_sandbox.exceptions import SandboxTimeoutError
 
+from .bounded_exec_wrapper import (
+    CAPTURE_RESULT_FILE_NAME,
+    RECORDS_FILE_NAME,
+    STDERR_FILE_NAME,
+    STDOUT_FILE_NAME,
+    UNKNOWN_MARKER_AUDIT_FILE_NAME,
+)
+from .capture_reader import CAPTURE_FILE_NAMES
+from .child_identity import (
+    CHILD_USER_ENV_NAME,
+    ChildIdentityError,
+    validate_child_spec_host,
+)
 from .config import SandboxConfig
 from .dataset_manifest import expand_dataset_ids
+from .finance_record_channel import decode_capture_text, read_capture_artifacts
 from .resource_usage import SandboxResourceUsageCollector
+from .runtime_environment import (
+    ExecutionEnvironment,
+    collect_runtime_environment,
+    write_runtime_environment_json,
+    write_runtime_environment_to_container,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +60,74 @@ SANDBOX_INPUT_PLACEHOLDER = "/__AF_INPUT__/"
 MANIFEST_NONE_MARKER = "NONE"
 # MF6: NONE 行物化产物子目录前缀（与 run_id / agent_run_manifest_id 拼接成 sandbox 内绝对路径）。
 TEMP_MANIFEST_DIR_PREFIX = "_agent_run_manifest_"
+
+# === work-package-C: §7.1 bounded wrapper production wiring ================
+# The wrapper runs from a TASK-LOCAL copy of the app package staged under the
+# task workspace (zero global-path writes, so it stays safe under future
+# per-container concurrency; codex 56d28076 — the global sitecustomize.py
+# write/delete is what is NOT task-local yet, not this package).
+# capture_reader.py is staged because the wrapper IMPORTS it pre-spawn
+# (PIN 1) for the in-memory wrapper-tail readback; child_identity.py is
+# staged because the wrapper imports it pre-spawn for the P0-4 privilege
+# drop.  Neither is ever executed as a process in-container — after user
+# code exits nothing in the task workspace runs again.
+WRAPPER_MODULE_FILES = (
+    "__init__.py",
+    "output_capture.py",
+    "bounded_exec_wrapper.py",
+    "capture_reader.py",
+    "child_identity.py",
+)
+WRAPPER_DIR_NAME = "bounded-wrapper"
+
+# P0-5 (codex 5777cda8): one-task-per-container security floor.  Any task
+# that went through the bounded wrapper path is ALWAYS recycled, regardless
+# of success/failure/dynamic-install — user code leaves residual state
+# (installed packages, filesystem writes, kernel object caches) that no
+# cleanup step can fully undo, so the container is single-use by policy.
+# Supersedes work package D's conditional recycle.
+RECYCLE_REASON_SECURITY_FLOOR = "one_task_per_container_security_floor"
+WRAPPER_BOOTSTRAP_NAME = "run_wrapper.py"
+WRAPPER_INPUT_FILE_NAME = "wrapper-input.json"
+USER_SCRIPT_FILE_NAME = "user_script.py"
+RUNTIME_ENVIRONMENT_FILE_NAME = "runtime-environment.json"
+
+# Contract §13 line 644: the four frozen limit keys, verbatim.
+WRAPPER_LIMIT_KEYS = (
+    "stdoutMaxBytes",
+    "stderrMaxBytes",
+    "recordChannelMaxBytes",
+    "recordChannelMaxRecords",
+)
+
+# Fail-fast whitelist drift guard: the container-side reader and the wrapper
+# must agree on the §7.1 fixed capture file layout.
+if set(CAPTURE_FILE_NAMES) != {
+    CAPTURE_RESULT_FILE_NAME,
+    STDOUT_FILE_NAME,
+    STDERR_FILE_NAME,
+    RECORDS_FILE_NAME,
+    UNKNOWN_MARKER_AUDIT_FILE_NAME,
+}:
+    raise RuntimeError(
+        "capture_reader.CAPTURE_FILE_NAMES drifted from bounded_exec_wrapper constants"
+    )
+
+# Task-local bootstrap: put THIS wrapper package first on sys.path at run time
+# (after site init) so nothing baked into the image can shadow it, then hand
+# argv to the wrapper's main().
+WRAPPER_BOOTSTRAP_SOURCE = (
+    "import os\n"
+    "import sys\n"
+    "\n"
+    "sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))\n"
+    "\n"
+    "from app.bounded_exec_wrapper import main\n"
+    "\n"
+    "if __name__ == '__main__':\n"
+    "    sys.exit(main(sys.argv[1:]))\n"
+)
+# === end work-package-C =====================================================
 
 
 def _read_json_file(path: Path) -> Dict[str, Any]:
@@ -327,7 +417,18 @@ def _prepare_task_workspace(
     *,
     copy_loader_modules: bool = True,
 ) -> str:
-    """Create task-scoped workspace and copy datasets. Returns the task workspace path."""
+    """Create task-scoped workspace and copy datasets. Returns the task workspace path.
+
+    260808-finance-methodspec-v5 work package D (codex (A) plan 2026-08-08 23:06):
+    the container-global ``<workdir>/runtime-environment.json`` is written once
+    per container by ``initialize_runtime_environment()`` and shared by every
+    task in that container. Sitecustomize.py no longer overrides
+    ``AF_RUNTIME_ENVIRONMENT_FILE`` per task because concurrent tasks would
+    race on the same global sitecustomize.py (and the cleanup path deleted
+    it under their feet). Dynamic-install safety is enforced at config
+    validation time (container_max_concurrency == 1), so concurrent tasks
+    cannot mutate the shared venv out from under each other.
+    """
     task_workspace = f"{config.workspace_root}/{task_id}"
     task_input = f"{task_workspace}/input"
 
@@ -448,6 +549,13 @@ def _prepare_task_workspace(
         f"os.environ['AF_TASK_WORKSPACE'] = {task_workspace!r}\n"
         f"os.environ['AF_TASK_ARTIFACT_DIR'] = {artifact_dir!r}\n"
         f"os.environ['AF_TASK_TMP_DIR'] = {temporary_dir!r}\n"
+        # 260808-finance-methodspec-v5 work package D (codex (A) plan 2026-08-08
+        # 23:06): do NOT override AF_RUNTIME_ENVIRONMENT_FILE here. The
+        # container-creation env var (set by create_sandbox_session) points at
+        # the global <workdir>/runtime-environment.json that
+        # initialize_runtime_environment() wrote once per container. Each task
+        # in the same container reads the SAME file; concurrency=1 is enforced
+        # via validate_dynamic_install_safety so the venv state cannot drift.
         f"os.makedirs({artifact_dir!r}, exist_ok=True)\n"
         f"os.makedirs({temporary_dir!r}, exist_ok=True)\n"
         f"sys.path.insert(0, {config.workdir.rstrip('/')!r})\n"
@@ -867,6 +975,57 @@ def _cleanup_task_workspace(
         return False
 
 
+def validate_dynamic_install_safety(config: SandboxConfig) -> None:
+    """Spec §8 L1019 + codex (A) plan 2026-08-08 23:06 safety invariant.
+
+    finance-methodspec-v5 enforces ``container_max_concurrency == 1`` for
+    every config (regardless of skip_environment_setup) because every
+    SandboxConfig writes a per-task bootstrap into the SHARED global file
+    ``/sandbox/sitecustomize.py`` (AF_TASK_WORKSPACE / AF_TASK_ARTIFACT_DIR /
+    AF_TASK_TMP_DIR / AF_TASK_METRICS_PATH) and deletes that same file on
+    cleanup. Concurrent tasks would race on that file even without dynamic
+    install — the bootstrap file is shared mutable state by construction.
+
+    Dynamic install (skip_environment_setup=False) additionally mutates the
+    shared venv via ``session.install()``, which compounds the race:
+    ``PoolWorker.execution_environment`` is captured once at warm-up and
+    never refreshed, so a second task in the same worker would read the
+    baked environmentId while the container's actual venv had already been
+    mutated by ``session.install()`` from the previous task.
+
+    Both invariants collapse to the same rule: exactly one task per
+    worker container at a time. Raise ``ConfigurationError`` (with a stable
+    code) if the invariant is violated. Callers that mutate config
+    dynamically (Nacos hot-reload, pool_min_size adjustment, etc.) MUST
+    re-run this check before accepting the new config; failing closed
+    prevents silent throughput drift that would corrupt environment
+    identity under the surface.
+
+    codex 2026-08-08 23:16 (bc11e841 item 2): the original plan only
+    enforced this for skip_environment_setup=False; sitecustomize.py races
+    even for preinstalled-only configs because the per-task AF_TASK_* env
+    vars are still written into the same global file. This invariant now
+    applies to ALL SandboxConfig instances.
+    """
+    if config.container_max_concurrency != 1:
+        raise ConfigurationError(
+            "CONTAINER_MAX_CONCURRENCY_REQUIRES_ONE: "
+            f"container_max_concurrency={config.container_max_concurrency} "
+            "is not allowed. SandboxConfig writes per-task bootstrap "
+            "(AF_TASK_WORKSPACE / AF_TASK_ARTIFACT_DIR / AF_TASK_TMP_DIR / "
+            "AF_TASK_METRICS_PATH) into the shared global file "
+            "/sandbox/sitecustomize.py and deletes that same file on cleanup; "
+            "concurrent tasks would race on the bootstrap. Dynamic install "
+            "(skip_environment_setup=False) additionally mutates the shared "
+            "venv via session.install(), which compounds the race. Both "
+            "invariants collapse to: one task per worker container at a time."
+        )
+
+
+class ConfigurationError(RuntimeError):
+    """Raised when SandboxConfig violates a finance-methodspec-v5 invariant."""
+
+
 def create_sandbox_session(
     config: SandboxConfig,
     *,
@@ -877,11 +1036,21 @@ def create_sandbox_session(
 
     The caller owns the returned session and must close it.
     """
+    validate_dynamic_install_safety(config)
     effective_memory_limit: int | str = memory_limit_bytes or config.memory_limit
     runtime_configs = {
         "mem_limit": effective_memory_limit,
         "memswap_limit": effective_memory_limit if memory_limit_bytes else config.memswap_limit,
         "labels": SANDBOX_WORKER_LABELS,
+        # 260808-finance-methodspec-v5 work package D: contract with package
+        # B/C (ccqwen). The Python finance library reads environmentId from
+        # the read-only task environment file; the file path is communicated
+        # to user code via this env var, set at container creation so all
+        # child processes (including session.run()) inherit it. The file
+        # itself is written below in this function after session.open().
+        "environment": [
+            f"AF_RUNTIME_ENVIRONMENT_FILE={config.workdir.rstrip('/')}/runtime-environment.json",
+        ],
     }
     session = SandboxSession(
         lang="python",
@@ -894,6 +1063,69 @@ def create_sandbox_session(
     )
     session.open()
     return session
+
+
+def initialize_runtime_environment(
+    config: SandboxConfig,
+    session: SandboxSession,
+    *,
+    task_id: str | None = None,
+) -> ExecutionEnvironment:
+    """Collect runtime environment single-source and push the file INTO the container.
+
+    Called once per container after create_sandbox_session(). The
+    AF_RUNTIME_ENVIRONMENT_FILE env var was set at container creation to
+    ``<workdir>/runtime-environment.json``; this function writes the file
+    at that path via ``copy_to_runtime`` so user code (e.g. ccqwen's
+    reporting library) reads it from inside the container. Failure to push
+    the file into the container raises — the worker cannot become ready
+    without an honest runtime environment file for user code to consult.
+
+    Returns the ExecutionEnvironment instance so the caller can surface it
+    on the HTTP execution_environment field; one ExecutionEnvironment
+    drives both the container file and the wire field (single-source
+    invariant).
+
+    For non-pool mode, task_id is logged to aid ops correlation. For pool
+    mode, task_id may be None because the same container serves many tasks;
+    the environment is constant per container so the file is logically
+    valid for any task in that container.
+
+    Spec §8 L1019 + codex 2026-08-08 23:06 (A plan): the file path is the
+    container-global ``<workdir>/runtime-environment.json`` set by
+    ``create_sandbox_session``. Per-task sitecustomize overrides were
+    removed because they were racy under pool reuse (concurrent tasks
+    clobbered each other's bootstrap files).
+    """
+    container_id = get_session_container_id(session)
+    env = collect_runtime_environment(container_id=container_id, session=session)
+    container_env_path = os.path.join(
+        config.workdir.rstrip("/"), "runtime-environment.json",
+    )
+    # Push into the execution container — this is the runtime-visible
+    # source user code actually consults. Failure here MUST raise so the
+    # worker is not considered ready; failing closed prevents report()
+    # from reading a stale or missing environment file.
+    write_runtime_environment_to_container(session, env, container_env_path)
+    logger.info(
+        "RUNTIME_ENVIRONMENT_READY container=%s task=%s environment_id=%s "
+        "image_digest=%s library_set_digest=%s package_count=%s "
+        "inventory_complete=%s container_path=%s",
+        container_id, task_id or "-", env.environment_id, env.image_digest,
+        env.library_set_digest, len(env.package_apis),
+        env.inventory_complete, container_env_path,
+    )
+    # Ops-audit copy on the service host filesystem (best-effort: the
+    # service host's <workdir>/ is not shared with the container, so this
+    # is purely a debugging convenience and MUST NOT fail the init path).
+    try:
+        write_runtime_environment_json(config.workdir, env)
+    except Exception as exc:
+        logger.info(
+            "RUNTIME_ENVIRONMENT_AUDIT_WRITE_FAILED container=%s error=%s",
+            container_id, exc,
+        )
+    return env
 
 
 def get_session_container_id(session: SandboxSession) -> str:
@@ -989,6 +1221,436 @@ def _container_oom_killed(container_id: str) -> bool:
                 pass
 
 
+# === work-package-C: §7.1 bounded wrapper production wiring ================
+
+
+def validate_effective_output_limits(payload: Dict[str, Any]) -> Dict[str, int]:
+    """Validate the frozen §13 limit snapshot at the runner boundary.
+
+    ``effective_output_limits`` crosses into the runner as a plain dict
+    (``Task.model_dump`` in main.py); the runner must NEVER index an
+    unvalidated external dict (§13, codex f86c66f5).  Allowed keys are
+    EXACTLY the four ``WRAPPER_LIMIT_KEYS`` plus optionally
+    ``sourceRevision`` (str): a missing limit key, an unknown extra key or a
+    non-dict payload raises ``ValueError`` naming the offending key, as does
+    any limit value that is not an int (bool is rejected — it is an int
+    subclass in Python) or is negative.  Returns a FRESH dict containing
+    exactly the four limit keys.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError(
+            "effective_output_limits must be a dict, got "
+            f"{type(payload).__name__}"
+        )
+    extra = sorted(set(payload) - set(WRAPPER_LIMIT_KEYS) - {"sourceRevision"})
+    if extra:
+        raise ValueError(
+            "effective_output_limits has unknown key(s): "
+            f"{', '.join(repr(key) for key in extra)}"
+        )
+    limits: Dict[str, int] = {}
+    for key in WRAPPER_LIMIT_KEYS:
+        if key not in payload:
+            raise ValueError(
+                f"effective_output_limits lacks limit key {key!r}"
+            )
+        value = payload[key]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(
+                f"effective_output_limits[{key!r}] must be an integer, got "
+                f"{type(value).__name__}"
+            )
+        if value < 0:
+            raise ValueError(
+                f"effective_output_limits[{key!r}] must be >= 0, got {value}"
+            )
+        limits[key] = value
+    source_revision = payload.get("sourceRevision", "")
+    if not isinstance(source_revision, str):
+        raise ValueError(
+            "effective_output_limits['sourceRevision'] must be a string, got "
+            f"{type(source_revision).__name__}"
+        )
+    return limits
+
+
+class _WrappedScriptResult:
+    """ConsoleOutput stand-in for the wrapper path (exit_code/stdout/stderr)."""
+
+    __slots__ = ("exit_code", "stdout", "stderr")
+
+    def __init__(self, exit_code: int, stdout: str, stderr: str) -> None:
+        self.exit_code = exit_code
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def _resolve_wrapper_interpreter(
+    session: SandboxSession,
+    config: SandboxConfig,
+    task_id: str,
+) -> str:
+    """Pick the exact interpreter llm-sandbox ``session.run`` would use.
+
+    llm-sandbox 0.3.33 (``BaseSession.run``) executes code with the venv
+    interpreter when environment setup runs (or an existing container is
+    attached) and with plain ``python`` otherwise.  The wrapper's child must
+    run on the SAME interpreter (codex 3c5a2858: container interpreter, never
+    the host's), so mirror that choice and fail closed: an absolute venv path
+    is probed with ``test -x`` before use.
+    """
+    use_venv = (not config.skip_environment_setup) or bool(
+        getattr(session, "using_existing_container", False)
+    )
+    if not use_venv:
+        return "python"
+    candidate = getattr(session, "python_executable_path", None) or (
+        f"{config.workdir.rstrip('/')}/.sandbox-venv/bin/python"
+    )
+    _exec_checked(
+        session,
+        f"test -x {shlex.quote(candidate)}",
+        f"wrapper_interpreter_check task={task_id}",
+    )
+    return candidate
+
+
+# === P0-4 (codex 03b4d034 / 087da672): runner-side child identity gate =====
+def _validate_runner_child_identity(child_spec: str | None, euid: int) -> None:
+    """Host-side gate for the wrapper child's identity (P0-4).
+
+    Pure apart from the explicit ``euid`` argument (unit-testable without
+    root).  Returns None; the ORIGINAL spec string travels verbatim into
+    the container (exec export), where it is resolved AUTHORITATIVELY twice
+    against the target's passwd database (chown snippet + wrapper pre-spawn
+    gate).  The host gate validates SYNTAX ONLY — ``validate_child_spec_host``
+    performs no OS lookups, because the service runs in a different
+    uid/username namespace than the target image (codex 087da672): a
+    host-side ``pwd.getpwnam`` would reject identities that exist only in
+    the container.  Raises ``RuntimeError`` — the task must FAIL CLOSED
+    before any staging/workspace preparation — when:
+
+    * the runner is root and ``child_spec`` is UNSET (refuse to run user
+      code as root);
+    * any euid and ``child_spec`` is set but malformed (garbage in = fail;
+      numeric forms with uid OR gid zero included — codex 691341d2).
+
+    Non-root with an UNSET spec keeps the historical same-UID dev behavior;
+    NO security boundary is claimed in dev mode — the isolation guarantee
+    exists only in the container where the wrapper runs as root and drops
+    the child into a non-root identity (uid AND gid both nonzero).
+    """
+    if child_spec is None:
+        if euid == 0:
+            raise RuntimeError(
+                f"{CHILD_USER_ENV_NAME} must be set when the runner is "
+                "root: refusing to run user code as root"
+            )
+        return None
+    try:
+        validate_child_spec_host(child_spec)
+    except ChildIdentityError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+
+# The chown step runs INSIDE the container because the container's passwd
+# database is authoritative for the child identity (host-side uid spaces
+# differ: macOS nobody=4294967294 vs Debian nobody=65534).  The snippet
+# mirrors app.child_identity.parse_child_spec verbatim — that module is not
+# staged yet at chown time (staging happens later); the wrapper re-resolves
+# the SAME spec against the SAME database before the spawn.
+_CHOWN_SNIPPET_TEMPLATE = (
+    "import os, pwd, sys\n"
+    "spec = {spec!r}\n"
+    "def fail(reason):\n"
+    "    sys.stderr.write('child identity chown failed: ' + reason + '\\n')\n"
+    "    sys.exit(1)\n"
+    "if spec != spec.strip() or not spec:\n"
+    "    fail('spec is empty or has surrounding whitespace')\n"
+    "if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in spec):\n"
+    "    fail('spec contains control characters')\n"
+    "if ':' in spec:\n"
+    "    parts = spec.split(':')\n"
+    "    if len(parts) != 2 or not parts[0] or not parts[1]:\n"
+    "        fail('numeric spec must be exactly uid:gid')\n"
+    "    if not all('0' <= c <= '9' for c in parts[0] + parts[1]):\n"
+    "        fail('numeric spec has a non-digit field')\n"
+    "    uid, gid = int(parts[0], 10), int(parts[1], 10)\n"
+    "else:\n"
+    "    try:\n"
+    "        entry = pwd.getpwnam(spec)\n"
+    "    except KeyError:\n"
+    "        fail('username does not exist in this container')\n"
+    "    uid, gid = entry.pw_uid, entry.pw_gid\n"
+    "if uid == 0 or gid == 0:\n"
+    "    fail('child uid and gid must both be nonzero')\n"
+    "for path in {paths!r}:\n"
+    "    os.makedirs(path, exist_ok=True)\n"
+    "    os.chown(path, uid, gid)\n"
+)
+
+
+def _chown_workspace_for_child(
+    session: SandboxSession,
+    config: SandboxConfig,
+    task_id: str,
+    task_workspace: str,
+    child_spec: str,
+) -> None:
+    """P0-4 workspace permissions when a child identity is active.
+
+    Chowns the task workspace root and the child-writable subdirs (tmp,
+    artifacts, metrics) to the child's uid:gid BEFORE the wrapper runs (the
+    wrapper's sitecustomize import would otherwise create them root-owned).
+    STAY ROOT-OWNED: the ``input/`` dataset subtree (read-only inputs,
+    world-readable) and the bounded-wrapper staging dir + capture dir
+    (written later by the root wrapper; the capture dir is created mode
+    0700 so the child cannot enter it at all).
+    """
+    paths = [
+        task_workspace,
+        f"{task_workspace}/tmp",
+        f"{task_workspace}/artifacts",
+        f"{task_workspace}/metrics",
+    ]
+    snippet = _CHOWN_SNIPPET_TEMPLATE.format(spec=child_spec, paths=paths)
+    command = f"python3 -c {shlex.quote(snippet)}"
+    _exec_checked(session, command, f"chown_workspace_for_child task={task_id}")
+
+
+# === end P0-4 ================================================================
+
+
+def _stage_bounded_wrapper(
+    session: SandboxSession,
+    config: SandboxConfig,
+    task_id: str,
+    task_workspace: str,
+    code: str,
+    timeout_seconds: float,
+    limits: Dict[str, Any],
+) -> str:
+    """Stage the task-local wrapper package, user script and wrapper-input.json.
+
+    Everything lands under ``{task_workspace}`` — no global paths are written,
+    so concurrent tasks in one container can never race on wrapper code.
+    Returns the wrapper-input.json path.
+    """
+    workdir = config.workdir.rstrip("/")
+    wrapper_dir = f"{task_workspace}/{WRAPPER_DIR_NAME}"
+    wrapper_pkg_dir = f"{wrapper_dir}/app"
+    _exec_checked(
+        session,
+        f"mkdir -p {shlex.quote(wrapper_pkg_dir)}",
+        f"create_wrapper_dir task={task_id}",
+    )
+    for filename in WRAPPER_MODULE_FILES:
+        source = APP_DIR / filename
+        if not source.is_file():
+            raise FileNotFoundError(f"bounded wrapper module not found: {source}")
+        _copy_dataset_file(session, source, f"{wrapper_pkg_dir}/{filename}")
+    _copy_text_to_runtime(
+        session, WRAPPER_BOOTSTRAP_SOURCE, f"{wrapper_dir}/{WRAPPER_BOOTSTRAP_NAME}"
+    )
+
+    script_path = f"{task_workspace}/{USER_SCRIPT_FILE_NAME}"
+    _copy_text_to_runtime(session, code, script_path)
+
+    # §7.1 wrapper input; the four §13 limit keys verbatim.  sourceRevision is
+    # Task metadata, not part of the wrapper input (models.BoundedExecRequest).
+    wrapper_input = {
+        "scriptPath": script_path,
+        "timeoutSeconds": timeout_seconds,
+        "effectiveOutputLimits": {key: limits[key] for key in WRAPPER_LIMIT_KEYS},
+        "runtimeEnvironmentPath": f"{workdir}/{RUNTIME_ENVIRONMENT_FILE_NAME}",
+    }
+    wrapper_input_path = f"{task_workspace}/{WRAPPER_INPUT_FILE_NAME}"
+    _copy_text_to_runtime(
+        session,
+        json.dumps(wrapper_input, ensure_ascii=False),
+        wrapper_input_path,
+    )
+    return wrapper_input_path
+
+
+def _wrapper_run_command(
+    config: SandboxConfig,
+    task_workspace: str,
+    interpreter: str,
+    child_spec: str | None = None,
+) -> str:
+    """Build the in-container wrapper invocation.
+
+    ``PYTHONPATH={workdir}`` makes the sitecustomize.py written by
+    ``_prepare_task_workspace`` auto-import in the wrapper AND child
+    processes: AF_TASK_* env vars, the workdir sys.path entry (loader
+    modules) and the chdir into the task workspace — exact equivalence with
+    the legacy ``session.run`` path without rewriting any user code.
+
+    P0-4: when ``child_spec`` is given it is exported verbatim as
+    ``AF_SANDBOX_CHILD_USER`` for the wrapper's identity gate (the wrapper
+    resolves it against the CONTAINER's passwd database before the spawn).
+    """
+    workdir = config.workdir.rstrip("/")
+    wrapper_dir = f"{task_workspace}/{WRAPPER_DIR_NAME}"
+    bootstrap = f"{wrapper_dir}/{WRAPPER_BOOTSTRAP_NAME}"
+    wrapper_input_path = f"{task_workspace}/{WRAPPER_INPUT_FILE_NAME}"
+    pythonpath = f"{workdir}:{wrapper_dir}"
+    export_lines = ""
+    if child_spec is not None:
+        export_lines = (
+            f"export {CHILD_USER_ENV_NAME}={shlex.quote(child_spec)}\n"
+        )
+    script = (
+        "set -e\n"
+        f"cd {shlex.quote(task_workspace)}\n"
+        f"{export_lines}"
+        f"PYTHONPATH={shlex.quote(pythonpath)} {shlex.quote(interpreter)} "
+        f"{shlex.quote(bootstrap)} {shlex.quote(wrapper_input_path)}\n"
+    )
+    return f"sh -lc {shlex.quote(script)}"
+
+
+def _read_capture_from_container(
+    wrapper_output,
+    task_id: str,
+    limits: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Read the wrapper's bounded artifacts back BEFORE cleanup (§7.1 step 7).
+
+    Wrapper-tail model (P0 fix): the trusted wrapper imported
+    ``capture_reader`` BEFORE spawning the user child, performed the bounded
+    readback IN MEMORY with the four frozen §13 limits after the child
+    exited (codex f86c66f5 / e083e181: every artifact bounded against them
+    BEFORE readback, never trusting artifact self-reported summaries), and
+    emitted the envelope on the wrapper run's OWN stdout.  This function
+    parses the envelope out of that SAME wrapper-run output — there is NO
+    second in-container execution, so after user code exits NOTHING located
+    in the user-writable task workspace is ever executed again.
+
+    Decodes the envelope into a temporary directory, and hands the files to
+    the fail-closed host-side reader (``read_capture_artifacts``, codex
+    c72db8f6 item 3: presence/byte-length/record-channel consistency/cap
+    re-validation all performed).  ANY inconsistency raises -> the task
+    fails instead of reporting a half-formed finance_record_channel.
+    """
+    if wrapper_output.exit_code != 0:
+        raise RuntimeError(
+            f"capture readback failed task={task_id}: "
+            f"exit_code={wrapper_output.exit_code} "
+            f"stderr={(wrapper_output.stderr or '')[:512]!r}"
+        )
+    try:
+        document = json.loads(wrapper_output.stdout or "")
+    except ValueError as exc:
+        raise RuntimeError(
+            f"capture readback returned invalid JSON task={task_id}: {exc}"
+        ) from exc
+    files = document.get("files") if isinstance(document, dict) else None
+    if not isinstance(files, dict):
+        raise RuntimeError(
+            f"capture readback JSON lacks a files object task={task_id}"
+        )
+
+    with tempfile.TemporaryDirectory(prefix=f"af-capture-{task_id}-") as temp_dir:
+        for name, encoded in files.items():
+            if name not in CAPTURE_FILE_NAMES:
+                raise RuntimeError(
+                    f"capture readback returned unknown artifact {name!r} "
+                    f"task={task_id}"
+                )
+            if not isinstance(encoded, str):
+                raise RuntimeError(
+                    f"capture artifact {name!r} is not base64 text task={task_id}"
+                )
+            try:
+                payload = base64.b64decode(encoded.encode("ascii"), validate=True)
+            except (ValueError, UnicodeEncodeError) as exc:
+                raise RuntimeError(
+                    f"capture artifact {name!r} is not valid base64 task={task_id}: {exc}"
+                ) from exc
+            (Path(temp_dir) / name).write_bytes(payload)
+        return read_capture_artifacts(
+            temp_dir,
+            stdout_max_bytes=limits["stdoutMaxBytes"],
+            stderr_max_bytes=limits["stderrMaxBytes"],
+            record_channel_max_bytes=limits["recordChannelMaxBytes"],
+            record_channel_max_records=limits["recordChannelMaxRecords"],
+        )
+
+
+def _run_bounded_wrapper_path(
+    session: SandboxSession,
+    config: SandboxConfig,
+    task_id: str,
+    task_workspace: str,
+    code: str,
+    install_libraries: List[str],
+    timeout_seconds: float,
+    limits: Dict[str, Any],
+    child_spec: str | None = None,
+) -> Tuple[_WrappedScriptResult, Dict[str, Any], Dict[str, int]]:
+    """§7.1 steps 1-2/7-8 production path: install -> stage -> wrapper -> readback.
+
+    Returns ``(result, finance_record_channel, phase_timings)`` where
+    ``result`` carries the child's exit code and the reassembled §4.2 bounded
+    stdout (ordinary bytes first, then the COMPLETE record lines)/stderr, and
+    the channel is the §5.1 snake_case dict built from the capture summary.
+    """
+    # §13/codex f86c66f5: validate the frozen snapshot FIRST — before
+    # interpreter resolution or any session interaction — so the runner never
+    # indexes an unvalidated external dict.
+    limits = validate_effective_output_limits(limits)
+    phase_timings: Dict[str, int] = {}
+    if install_libraries:
+        # llm-sandbox installs into the SHARED container venv — exactly why
+        # container concurrency must stay 1 while dynamic install is enabled
+        # (plan A; nacos_config invariant).
+        t_install = time.monotonic()
+        session.install(list(install_libraries))
+        phase_timings["library_install_ms"] = int((time.monotonic() - t_install) * 1000)
+
+    interpreter = _resolve_wrapper_interpreter(session, config, task_id)
+
+    t_stage = time.monotonic()
+    _stage_bounded_wrapper(
+        session, config, task_id, task_workspace, code, timeout_seconds, limits
+    )
+    phase_timings["wrapper_stage_ms"] = int((time.monotonic() - t_stage) * 1000)
+
+    t_exec = time.monotonic()
+    output = session.execute_command(
+        _wrapper_run_command(config, task_workspace, interpreter, child_spec)
+    )
+    phase_timings["wrapper_exec_ms"] = int((time.monotonic() - t_exec) * 1000)
+    if output.exit_code != 0:
+        # The WRAPPER failed (not the child): capture-result.json was never
+        # written, the wrapper itself crashed, or its trusted wrapper-tail
+        # readback rejected the capture (tamper).  Diagnostics only — the
+        # wrapper never echoes user content to its own stderr (§18).  The
+        # host fails closed on this nonzero terminal.
+        raise RuntimeError(
+            f"bounded wrapper failed task={task_id}: "
+            f"exit_code={output.exit_code} stderr={(output.stderr or '')[:512]!r}"
+        )
+
+    t_read = time.monotonic()
+    # Wrapper-tail model: the envelope rides the wrapper run's OWN stdout —
+    # there is NO second in-container execution after user code exits.
+    artifacts = _read_capture_from_container(output, task_id, limits)
+    phase_timings["capture_read_ms"] = int((time.monotonic() - t_read) * 1000)
+
+    result = _WrappedScriptResult(
+        exit_code=artifacts["exit_code"],
+        stdout=decode_capture_text(artifacts["stdout_bytes"]),
+        stderr=decode_capture_text(artifacts["stderr_bytes"]),
+    )
+    return result, artifacts["channel"], phase_timings
+
+
+# === end work-package-C =====================================================
+
+
 def run_in_open_session(
     config: SandboxConfig,
     session: SandboxSession,
@@ -1008,12 +1670,30 @@ def run_in_open_session(
     prepare_loader_modules: bool = True,
     resource_class: str = "STANDARD",
     usage_sampling_interval_millis: int | None = None,
+    effective_output_limits: Dict[str, Any] | None = None,
+    execution_environment: ExecutionEnvironment | None = None,
 ) -> dict:
     """Run one task inside an already-open session.
 
     The caller owns the container lifecycle. This function returns
     container_recycled=True when the caller should destroy and replace it.
+
+    P0-5 (codex 5777cda8): whenever the task went through the bounded
+    wrapper path (``effective_output_limits`` frozen), the container is
+    ALWAYS recycled — ``container_recycled=True`` with
+    ``recycle_reason=RECYCLE_REASON_SECURITY_FLOOR`` — regardless of
+    success, failure or dynamic install (one-task-per-container security
+    floor; supersedes the earlier conditional recycle).
     """
+    # P0-4 (codex 03b4d034 / 087da672): gate the child identity BEFORE any
+    # staging or workspace preparation — a root runner without a usable
+    # identity fails the task closed before anything runs.  The host gate is
+    # syntax-only (no OS lookups); the container resolves the SAME spec
+    # against its OWN passwd database twice (chown snippet + wrapper
+    # pre-spawn gate).  The raw spec travels verbatim via the exec export.
+    child_spec = os.environ.get(CHILD_USER_ENV_NAME)
+    _validate_runner_child_identity(child_spec, os.geteuid())
+
     dataset_id_list = _normalize_dataset_ids(dataset_id, dataset_ids)
     timeout = timeout_seconds or config.execution_timeout_seconds
     requested_libraries = [lib.strip() for lib in (libraries or []) if lib and lib.strip()]
@@ -1045,11 +1725,25 @@ def run_in_open_session(
     oom_killed = False
     exit_reason = "UNKNOWN"
     resource_usage = None
+    # Spec §8 L1019 + Kimi rework 2026-08-08: when this task actually installs
+    # non-preinstalled packages, re-collect the runtime environment after the
+    # install so the task's HTTP execution_environment field reflects the
+    # post-install state. Pool container reuse across tasks otherwise leaves
+    # residual installs polluting the next task's environment identity if we
+    # only sample at container warm-up time. Effective env falls back to the
+    # caller-supplied baked env if re-collection fails or no install happened.
+    post_install_environment: ExecutionEnvironment | None = None
 
+    finance_record_channel: Dict[str, Any] | None = None
+    task_workspace = f"{config.workspace_root}/{task_id}"
+    # P0-5: the floor keys off the SELECTED path (frozen limits present), so
+    # a task that fails mid-preparation is recycled exactly like a task that
+    # ran to completion — the bounded path is single-use, period.
+    bounded_path_selected = effective_output_limits is not None
     try:
         t_workspace_start = time.monotonic()
         workspace_created = True
-        _prepare_task_workspace(
+        task_workspace = _prepare_task_workspace(
             session,
             task_id,
             config,
@@ -1059,12 +1753,163 @@ def run_in_open_session(
             path_manifest_csv=path_manifest_csv,
             copy_loader_modules=prepare_loader_modules,
         )
+        if child_spec is not None:
+            # P0-4: hand the child-writable subtree to the child identity
+            # BEFORE the wrapper runs (input datasets and the wrapper
+            # staging dir stay root-owned).
+            _chown_workspace_for_child(
+                session, config, task_id, task_workspace, child_spec
+            )
         timings["workspace_prepare_ms"] = int((time.monotonic() - t_workspace_start) * 1000)
+
+        # 260808-finance-methodspec-v5 work package D: ExecutionEnvironment was
+        # collected by initialize_runtime_environment() once per container and
+        # pushed into the container-global <workdir>/runtime-environment.json.
+        # All tasks in the same container read the same file (concurrent
+        # tasks are forbidden via validate_dynamic_install_safety), so we do
+        # NOT re-collect or re-write the file per task.
+        #
+        # Spec §8 L1019 (Kimi rework + codex (A) plan 2026-08-08 23:06):
+        # when this task installs non-preinstalled packages, the dynamic install
+        # path MUST be split into install() → re-collect → push updated file
+        # into container → run(code, libraries=None). Re-collecting AFTER run()
+        # is too late because report()/report_custom() already executed inside
+        # the run and read the baked file; the recorded environmentId would
+        # then disagree with the HTTP post-install field.
+        #
+        # codex 2026-08-08 23:06 (A plan): install/collect/copy 任一失败 MUST
+        # raise before session.run (not silently fall back to baked env).
+        # session.install() mutated the shared venv; the recorded envId must
+        # reflect the actual container state or the task MUST NOT run.
 
         _log_in_container(session, task_id, config, "script_start")
         t_run_start = time.monotonic()
         _smoke_check_loader_modules(session, config, task_id)
-        result = session.run(code, libraries=install_libraries, timeout=timeout)
+        if install_libraries:
+            # Phase 1: dynamic install via llm-sandbox's install(). Failure
+            # raises; pool worker must close session and not reuse the
+            # partially-mutated venv for the next task.
+            try:
+                t_install_start = time.monotonic()
+                session.install(install_libraries)
+                timings["install_ms"] = int(
+                    (time.monotonic() - t_install_start) * 1000,
+                )
+            except Exception as install_exc:
+                # Spec §8 L1019 + codex 2026-08-08 23:06 (A plan): session.install
+                # already mutated the container's shared venv. If we silently
+                # fall back, the next task in this worker inherits a partial
+                # install set whose environmentId disagrees with what HTTP
+                # records. Mark the container for recycling so the pool
+                # scheduler retires this worker and the next task gets a
+                # fresh baked container.
+                container_recycled = True
+                recycle_reason = "post_install_install_failed"
+                logger.error(
+                    "RUNTIME_ENVIRONMENT_POST_INSTALL_INSTALL_FAILED "
+                    "task=%s libraries=%s error=%s",
+                    task_id, install_libraries, install_exc,
+                )
+                raise
+            # Phase 2: re-collect the actual post-install package set inside
+            # the container and push it to the SAME container-global path
+            # initialize_runtime_environment wrote (so user code reads the new
+            # file via the AF_RUNTIME_ENVIRONMENT_FILE env var set at container
+            # creation). Any failure (collect OR copy) raises; the pool worker
+            # observes container_recycled=True and retires the worker so the
+            # next task gets a fresh baked container.
+            try:
+                t_post_install_start = time.monotonic()
+                recollected_environment = collect_runtime_environment(
+                    container_id=actual_container_id, session=session,
+                )
+                container_env_path = os.path.join(
+                    config.workdir.rstrip("/"), "runtime-environment.json",
+                )
+                write_runtime_environment_to_container(
+                    session, recollected_environment, container_env_path,
+                )
+                # Only publish AFTER the push succeeded: the exception/HTTP
+                # surface may report the post-install env iff the container
+                # file user code reads actually carries it (codex 88ff8a41).
+                post_install_environment = recollected_environment
+                timings["post_install_recollect_ms"] = int(
+                    (time.monotonic() - t_post_install_start) * 1000,
+                )
+                logger.info(
+                    "RUNTIME_ENVIRONMENT_POST_INSTALL_RECOLLECT task=%s "
+                    "installed=%s environment_id=%s baked_environment_id=%s "
+                    "container_path=%s elapsed_ms=%s",
+                    task_id, install_libraries,
+                    recollected_environment.environment_id,
+                    execution_environment.environment_id
+                    if execution_environment is not None else "-",
+                    container_env_path,
+                    timings["post_install_recollect_ms"],
+                )
+            except Exception as post_install_exc:
+                # Spec §8 L1019 + codex 2026-08-08 23:06 (A plan): the install
+                # above already changed the venv. If collect OR copy fails,
+                # the recorded environmentId would not match the actual
+                # container state; recycling is mandatory, not optional.
+                container_recycled = True
+                recycle_reason = "post_install_collect_or_write_failed"
+                logger.error(
+                    "RUNTIME_ENVIRONMENT_POST_INSTALL_COLLECT_OR_WRITE_FAILED "
+                    "task=%s libraries=%s error=%s",
+                    task_id, install_libraries, post_install_exc,
+                )
+                raise
+        if effective_output_limits is None:
+            if install_libraries:
+                # Phase 3: run user code WITHOUT reinstalling — libraries are
+                # already present from session.install() above. Reached only if
+                # install + collect + write all succeeded; otherwise the exception
+                # above propagates and session.run() is NOT called.
+                result = session.run(code, libraries=None, timeout=timeout)
+                # Spec §8 L1019 + codex (A) plan 2026-08-08 23:06: session.install()
+                # mutated the shared venv in this container. Even on a successful
+                # run the worker must NOT serve another task because that next task
+                # would inherit the polluted venv while PoolWorker.execution_environment
+                # still holds the baked snapshot — the recorded environmentId
+                # would then disagree with the actual container state.
+                # Mark the container for recycling unconditionally; the pool worker's
+                # _on_job_done observes container_recycled=True and drains the worker
+                # so the next task gets a fresh baked container.
+                container_recycled = True
+                recycle_reason = "post_install_pollution"
+                logger.info(
+                    "RUNTIME_ENVIRONMENT_POST_INSTALL_POLLUTION task=%s "
+                    "installed=%s recycle_reason=%s",
+                    task_id, install_libraries, recycle_reason,
+                )
+            else:
+                # No dynamic install: just run user code; libraries=[] is a no-op
+                # in llm-sandbox and keeps the contract explicit.
+                result = session.run(code, libraries=[], timeout=timeout)
+        else:
+            # §7.1 production path: bounded wrapper + capture readback.  The
+            # task's FROZEN snapshot (never the hot config) is the only limit
+            # source; the wrapper enforces it while continuously draining.
+            # Dynamic install (when requested) already ran above exactly once
+            # (install -> re-collect -> push, fail-closed); the wrapper receives
+            # an EMPTY list so llm-sandbox never installs twice (one-install) and
+            # user code inside the wrapper reads the post-install env file
+            # (same-environmentId).
+            result, finance_record_channel, wrapper_phase_timings = (
+                _run_bounded_wrapper_path(
+                    session,
+                    config,
+                    task_id,
+                    task_workspace,
+                    code,
+                    [],
+                    timeout,
+                    effective_output_limits,
+                    child_spec,
+                )
+            )
+            timings.update(wrapper_phase_timings)
         timings["script_run_ms"] = int((time.monotonic() - t_run_start) * 1000)
         timings["env_load_ms"] = timings["workspace_prepare_ms"]
         timings["code_exec_ms"] = timings["script_run_ms"]
@@ -1072,7 +1917,8 @@ def run_in_open_session(
             session,
             task_id,
             config,
-            f"script_end exit_code={result.exit_code} stdout_len={len(result.stdout or '')} stderr_len={len(result.stderr or '')}",
+            f"script_end exit_code={result.exit_code} stdout_len={len(result.stdout or '')} stderr_len={len(result.stderr or '')} "
+            f"wrapper={'on' if finance_record_channel is not None else 'off'}",
         )
         exit_reason = "SUCCEEDED" if result.exit_code == 0 else "NON_ZERO_EXIT"
 
@@ -1095,7 +1941,6 @@ def run_in_open_session(
         _flush_container_log(session, task_id, config)
         _log_in_container(session, task_id, config, f"script_error error={type(e).__name__}")
     finally:
-        task_workspace = f"{config.workspace_root}/{task_id}"
         loader_metrics_jsonl = _read_runtime_text(
             session,
             f"cat {shlex.quote(task_workspace + '/metrics/loader_metrics.jsonl')} 2>/dev/null || true",
@@ -1112,7 +1957,17 @@ def run_in_open_session(
         timings["workspace_cleanup_ms"] = int((time.monotonic() - t_cleanup_start) * 1000)
         if not cleanup_ok:
             container_recycled = True
-            recycle_reason = "cleanup_failed"
+            # Preserve a more specific reason (post-install install/collect/write
+            # failure) over the generic cleanup_failed; both still recycle, but
+            # the operator can act on the root cause.
+            if recycle_reason is None:
+                recycle_reason = "cleanup_failed"
+        if bounded_path_selected:
+            # P0-5 security floor (codex 5777cda8): ALWAYS recycle after a
+            # bounded-path task.  This reason supersedes cleanup_failed —
+            # both demand recycling; the floor names the policy.
+            container_recycled = True
+            recycle_reason = RECYCLE_REASON_SECURITY_FLOOR
         resource_usage = collector.finish(
             container_id=actual_container_id,
             queue_wait_millis=int(timings.get("queue_wait_ms", 0)),
@@ -1131,7 +1986,31 @@ def run_in_open_session(
     if execution_error is not None:
         setattr(execution_error, "resource_usage", resource_usage.model_dump(mode="json"))
         setattr(execution_error, "timings", timings)
+        # Spec §8 L1019: on the exception path, prefer the successfully
+        # re-collected post-install env (install+recollect+push succeeded but
+        # the run/wrapper afterwards failed or timed out) so the HTTP failure
+        # still reports the ACTUAL container environmentId; fall back to the
+        # caller-supplied baked env when re-collection did not run or failed.
+        error_environment = (
+            post_install_environment
+            if post_install_environment is not None
+            else execution_environment
+        )
+        if error_environment is not None:
+            setattr(
+                execution_error,
+                "execution_environment",
+                error_environment.model_dump(mode="json"),
+            )
         raise execution_error
+
+    # Spec §8 L1019: post-install re-collection overrides the baked env when
+    # available, so the HTTP field reflects what the container actually has
+    # after this task's dynamic installs.
+    effective_execution_environment: ExecutionEnvironment | None = (
+        post_install_environment if post_install_environment is not None
+        else execution_environment
+    )
 
     primary_mount = f"{config.workdir}/input/{dataset_id}"
     logger.info(
@@ -1154,6 +2033,24 @@ def run_in_open_session(
         "recycle_reason": recycle_reason,
         "container_id": actual_container_id,
         "resource_usage": resource_usage.model_dump(mode="json"),
+        # §5.1 write path: the snake_case channel built from the capture
+        # summary, or None when the run did not go through the wrapper.
+        "finance_record_channel": finance_record_channel,
+        # 260808-finance-methodspec-v5 work package D: caller-supplied
+        # ExecutionEnvironment instance is surfaced here on the HTTP
+        # ExecuteResult; gateway presence-aware mapping then sets the proto
+        # executionEnvironment parent when this is non-None. The same
+        # instance is the workdir file's contents (single-source invariant).
+        #
+        # Spec §8 L1019 (Kimi rework 2026-08-08): when this task actually
+        # installed non-preinstalled packages, post_install_environment was
+        # re-collected after the install and overrides the caller-supplied
+        # baked env so the HTTP field reflects post-install state. Otherwise
+        # we keep the baked env (no install happened, no re-collection needed).
+        "execution_environment": (
+            effective_execution_environment.model_dump(mode="json")
+            if effective_execution_environment is not None else None
+        ),
     }
 
 
@@ -1172,6 +2069,7 @@ def run_in_sandbox(
     queue_wait_ms: int = 0,
     resource_class: str = "STANDARD",
     memory_limit_bytes: int | None = None,
+    effective_output_limits: Dict[str, Any] | None = None,
 ) -> dict:
     timeout = timeout_seconds or config.execution_timeout_seconds
     t0 = time.monotonic()
@@ -1183,7 +2081,20 @@ def run_in_sandbox(
     )
     container_create_ms = int((time.monotonic() - t_create_start) * 1000)
     container_id = get_session_container_id(session)
+    # 260808-finance-methodspec-v5 work package D: single-source env collection.
+    # The same ExecutionEnvironment instance drives the workdir file (written
+    # here), the AF_RUNTIME_ENVIRONMENT_FILE env var (set at container
+    # creation), and the HTTP execution_environment field (passed to
+    # run_in_open_session).
+    #
+    # codex 2026-08-08 23:28 (msg 0d67cf11) init fail-closed lifecycle:
+    # ``initialize_runtime_environment`` MUST run inside the same
+    # ``try/finally session.close()`` as run_in_open_session, otherwise an init
+    # collect/copy failure raises and the just-created session/container leaks.
     try:
+        execution_environment = initialize_runtime_environment(
+            config, session, task_id=task_id,
+        )
         result = run_in_open_session(
             config,
             session,
@@ -1200,6 +2111,8 @@ def run_in_sandbox(
             container_id=container_id,
             pool_enabled=False,
             resource_class=resource_class,
+            effective_output_limits=effective_output_limits,
+            execution_environment=execution_environment,
         )
         timings = result.setdefault("timings", {})
         timings["container_create_ms"] = container_create_ms

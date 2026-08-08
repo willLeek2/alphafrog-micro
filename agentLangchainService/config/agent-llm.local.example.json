@@ -21,6 +21,23 @@
     "asOfDate": "2026-05-25",
     "description": "部署者指定的当前本地已爬取市场数据覆盖范围；业务逻辑默认这些日期正确"
   },
+  "financeMethodResolver": {
+    "defaultRoute": {
+      "enabled": false,
+      "endpointName": "openrouter",
+      "modelName": "openai/gpt-5.2",
+      "providerOrder": ["moonshotai/int4", "fireworks"],
+      "temperature": 0.0,
+      "maxTokens": 2048,
+      "maxAttempts": 2,
+      "structuredOutput": true
+    },
+    "catalogPromptMaxBytes": 8192,
+    "catalogPromptMaxTokens": 2048,
+    "requestMaxBytes": 8192,
+    "responseMaxBytes": 16384,
+    "maxCandidates": 8
+  },
   "endpoints": {
     "openrouter": {
       "baseUrl": "https://openrouter.ai/api/v1",
@@ -413,6 +430,7 @@
     "pythonRefineRequirementsFile": "prompts/python/python_refine_requirements.txt",
     "pythonRefineOutputInstruction": "file:prompts/python/python_refine_output_instruction.txt",
     "datasetFieldSpecsFile": "prompts/python/dataset_field_specs.json",
+    "financeMethodResolverSystemPromptFile": "file:prompts/finance/finance_method_resolver_system.txt",
     "orchestratorPlanningSystemPrompt": "file:prompts/orchestrator/orchestrator_planning_system.txt",
     "orchestratorSummarySystemPrompt": "file:prompts/orchestrator/orchestrator_summary_system.txt",
     "dagReactSystemPromptFile": "file:prompts/todo/dag_react_system.txt",

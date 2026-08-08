@@ -17,8 +17,11 @@ from .canonical_fingerprint import (
 from .config import load_config
 from .models import (
     CreateTaskResponse,
+    EffectiveOutputLimits,
     ExecuteRequest,
     ExecuteResult,
+    ExecutionEnvironment,
+    FinanceRecordChannel,
     OperationLookupResponse,
     SandboxResourceUsage,
     Task,
@@ -112,6 +115,51 @@ async def worker(worker_id: int):
             logger.error("Worker %s error: %s", worker_id, e)
 
 
+def _attach_finance_record_channel(result: ExecuteResult, channel, model_cls=None) -> ExecuteResult:
+    """Merge-safe §5.1 attach of the captured finance_record_channel.
+
+    The frozen consumer DTO field is declared by work package D (models.py
+    NOTE, owner split msg f4341b21); until it lands at owner merge the fully
+    VALIDATED channel is simply not attached, keeping the C write path
+    tolerant of the field's absence.  Once D's field exists on ExecuteResult
+    this attaches without any further change here.
+
+    Real-DTO branch (model_cls=None): ``model_copy(update=...)`` does NOT
+    validate/coerce, so the channel is explicitly validated against D's frozen
+    ``FinanceRecordChannel`` first — a malformed payload raises (fail-closed)
+    instead of bypassing the DTO as a raw dict.
+    """
+    if channel is None:
+        return result
+    cls = model_cls if model_cls is not None else ExecuteResult
+    if "finance_record_channel" not in getattr(cls, "model_fields", {}):
+        return result
+    if model_cls is None:
+        channel = FinanceRecordChannel.model_validate(channel)
+    return result.model_copy(update={"finance_record_channel": channel})
+
+
+def _safe_parse_execution_environment(payload):
+    """260808-finance-methodspec-v5 work package D: best-effort parse.
+
+    Returns a validated ExecutionEnvironment when the sandbox runner supplied
+    a payload, None when the payload is absent (queue timeout, exception
+    before collection) or malformed (validation failure logged at WARNING).
+    Presence-aware consumers translate None into proto parent absence, which
+    is the v5 signal for "old producer / environment facts unknown".
+    """
+    if not payload:
+        return None
+    try:
+        return ExecutionEnvironment.model_validate(payload)
+    except Exception as exc:
+        logger.warning(
+            "EXECUTION_ENVIRONMENT_VALIDATION_FAILED error=%s payload=%s",
+            exc, payload,
+        )
+        return None
+
+
 async def process_task(task: Task, worker_id: int):
     started_at = datetime.utcnow()
     queued_ms = int((started_at - task.created_at).total_seconds() * 1000)
@@ -146,6 +194,10 @@ async def process_task(task: Task, worker_id: int):
             dataset_dir=f"{config.workdir}/input/{task.request.dataset_id}",
             resource_usage=task.resource_usage,
             retryable=task.retryable,
+            # 260808-finance-methodspec-v5 work package D: queue timeout runs
+            # before sandbox opens, so no execution_environment is available;
+            # presence-aware consumers see hasExecutionEnvironment() == false.
+            execution_environment=None,
         )
         task_store.save(task)
         return
@@ -159,6 +211,13 @@ async def process_task(task: Task, worker_id: int):
     )
 
     result_dict: dict = {}
+    # §7.2/§13: execution reads ONLY the snapshot frozen at create_task; the
+    # hot dynamic config is never re-read mid-run.
+    frozen_limits = (
+        task.effective_output_limits.model_dump()
+        if task.effective_output_limits is not None
+        else None
+    )
     try:
         # Run synchronous sandbox runner in thread pool
         if pool is not None and config.pool_enabled:
@@ -174,6 +233,7 @@ async def process_task(task: Task, worker_id: int):
                 task.request.paths_dataset_csv,
                 task.request.path_manifest_csv,
                 task.request.resource_class,
+                effective_output_limits=frozen_limits,
             )
         else:
             result_dict = await asyncio.to_thread(
@@ -191,6 +251,7 @@ async def process_task(task: Task, worker_id: int):
                 queue_wait_ms=queued_ms,
                 resource_class=task.request.resource_class,
                 memory_limit_bytes=task.request.memory_limit_bytes,
+                effective_output_limits=frozen_limits,
             )
         usage_payload = result_dict.get("resource_usage")
         if usage_payload:
@@ -214,6 +275,18 @@ async def process_task(task: Task, worker_id: int):
             },
             resource_usage=task.resource_usage,
             retryable=task.retryable,
+            # 260808-finance-methodspec-v5 work package D: same ExecutionEnvironment
+            # instance that drove the workdir file is surfaced here on the HTTP
+            # ExecuteResult; gateway presence-aware mapping then sets the proto
+            # executionEnvironment parent when this is non-None.
+            execution_environment=_safe_parse_execution_environment(
+                result_dict.get("execution_environment"),
+            ),
+        )
+        # §5.1: attach the validated channel from the §7.1 write path (the
+        # attach is merge-safe: it no-ops until D's frozen DTO field lands).
+        task.result = _attach_finance_record_channel(
+            task.result, result_dict.get("finance_record_channel")
         )
         if task.status == TaskStatus.FAILED:
             task.error = f"sandbox exited with code {result_dict['exit_code']}"
@@ -253,6 +326,19 @@ async def process_task(task: Task, worker_id: int):
             artifacts={"timings": getattr(e, "timings", {})},
             resource_usage=task.resource_usage,
             retryable=task.retryable,
+            # 260808-finance-methodspec-v5 work package D: execution_environment
+            # may be missing or partially populated if the exception happened
+            # before/around runtime_environment collection. _safe_parse handles
+            # both cases; None propagates as proto parent absence.
+            # codex 529a823f (#97 owner additive): when the runner raised, the
+            # environment rides the EXCEPTION attribute (baked, or post-install
+            # once install+recollect+push all succeeded) while result_dict is
+            # still empty — the attribute wins; result_dict is only a fallback.
+            execution_environment=_safe_parse_execution_environment(
+                getattr(e, "execution_environment", None)
+                if getattr(e, "execution_environment", None) is not None
+                else result_dict.get("execution_environment"),
+            ),
         )
     finally:
         task.finished_at = datetime.utcnow()
@@ -380,6 +466,17 @@ async def create_task(request: ExecuteRequest):
         raise HTTPException(status_code=400, detail=str(error)) from error
     task_id = str(uuid.uuid4())
     task = Task(task_id=task_id, status=TaskStatus.QUEUED, request=request)
+    # §7.2/§13: freeze the output-limit snapshot at creation time.  An
+    # idempotent re-create returns the ORIGINAL task from the store, so the
+    # original snapshot is kept untouched by any later Nacos update.
+    task.effective_output_limits = EffectiveOutputLimits(
+        **dynamic_config.output_limits_snapshot()
+    )
+    # §7.1 (codex b5a92810, C/H seam): freeze the validated image reference
+    # the task will run on.  Set ONCE here: an idempotent re-create returns
+    # the ORIGINAL task (original ref kept), execution never re-reads hot
+    # config, and a later image change only affects NEW tasks.
+    task.runtime_image_ref = config.sandbox_image
     try:
         decision = task_store.create(task)
     except OperationConflictError as error:

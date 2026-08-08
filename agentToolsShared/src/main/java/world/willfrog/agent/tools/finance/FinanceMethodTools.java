@@ -8,7 +8,11 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.context.AgentContext;
-import world.willfrog.agent.tools.finance.FinanceMethodResolverClient.ResolverResult;
+import world.willfrog.agent.platform.finance.FinanceMethodResolutionSink;
+import world.willfrog.agent.platform.finance.FinanceMethodResolutionSinkException;
+import world.willfrog.agent.platform.finance.FinanceMethodResolutionSnapshot;
+import world.willfrog.agent.platform.finance.FinanceMethodResolverClient;
+import world.willfrog.agent.platform.finance.FinanceMethodResolverClient.ResolverResult;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -267,14 +271,18 @@ public class FinanceMethodTools {
         String code = switch (kind) {
             case NO_ROUTE -> "RESOLVER_UNAVAILABLE";
             case TIMEOUT -> "RESOLVER_UNAVAILABLE";
+            case CALL_FAILED -> "RESOLVER_UNAVAILABLE";
             case BAD_JSON -> "RESOLVER_BAD_MODEL_OUTPUT";
             case CATALOG_BUDGET_EXCEEDED -> "RESOLVER_CATALOG_BUDGET_EXCEEDED";
+            case REQUEST_TOO_LARGE -> "RESOLVER_REQUEST_TOO_LARGE";
         };
         String message = switch (kind) {
             case NO_ROUTE -> "Finance method resolver route is not available";
             case TIMEOUT -> "Finance method resolver timed out";
+            case CALL_FAILED -> "Finance method resolver call failed";
             case BAD_JSON -> "Finance method resolver returned invalid JSON";
             case CATALOG_BUDGET_EXCEEDED -> "Finance method catalog exceeds prompt budget";
+            case REQUEST_TOO_LARGE -> "Finance method resolver request exceeds configured byte limit";
         };
         return fail(code, message);
     }

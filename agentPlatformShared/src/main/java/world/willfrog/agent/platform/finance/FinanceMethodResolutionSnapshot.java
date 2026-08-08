@@ -1,4 +1,4 @@
-package world.willfrog.agent.tools.finance;
+package world.willfrog.agent.platform.finance;
 
 import java.time.Instant;
 
