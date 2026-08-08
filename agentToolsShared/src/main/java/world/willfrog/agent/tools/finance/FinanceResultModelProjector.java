@@ -59,19 +59,26 @@ public class FinanceResultModelProjector {
         boolean versionBlank = isBlank(in.methodVersion());
         boolean specDigestBlank = isBlank(in.specDigest());
 
-        // 判型只信可信的 declaredEvidence（由持久化侧按记录声明写入）：仅 LIBRARY_CALL_DECLARED
-        // 走 canonical narrative；两种 CUSTOM 一律走 formulaDescription——自定义记录允许携带
-        // 完整三元组，但 evidence 仍是 CUSTOM，不得因此冒用 canonical 说明。null/未知 → fail-closed。
-        if (in.declaredEvidence() != FinanceDeclaredEvidence.LIBRARY_CALL_DECLARED) {
-            if (in.declaredEvidence() == FinanceDeclaredEvidence.CUSTOM_WITH_CHECKS
-                    || in.declaredEvidence() == FinanceDeclaredEvidence.CUSTOM_UNVERIFIED) {
-                return projectCustom(in);
-            }
+        // 方法身份 all-or-none，与 evidence 无关：partial triple 一律 fail-closed。
+        boolean anyIdentity = !methodIdBlank || !versionBlank || !specDigestBlank;
+        boolean completeIdentity = !methodIdBlank && !versionBlank && !specDigestBlank;
+        if (anyIdentity && !completeIdentity) {
             return Optional.empty();
         }
 
-        // LIBRARY_CALL_DECLARED 必须携带完整三元组：全空或缺一/二 → 不可投影
-        if (methodIdBlank || versionBlank || specDigestBlank) {
+        // 判型只信可信的 declaredEvidence（由持久化侧按记录声明写入）：仅 LIBRARY_CALL_DECLARED
+        // 走 canonical narrative；两种 CUSTOM 一律走 formulaDescription——自定义记录允许携带
+        // 完整三元组，但 evidence 仍是 CUSTOM，不得因此冒用 canonical 说明。null/未知 → fail-closed。
+        if (in.declaredEvidence() == FinanceDeclaredEvidence.CUSTOM_WITH_CHECKS
+                || in.declaredEvidence() == FinanceDeclaredEvidence.CUSTOM_UNVERIFIED) {
+            return projectCustom(in);
+        }
+        if (in.declaredEvidence() != FinanceDeclaredEvidence.LIBRARY_CALL_DECLARED) {
+            return Optional.empty();
+        }
+
+        // LIBRARY_CALL_DECLARED 必须携带完整三元组（此处即全空）→ 不可投影
+        if (!completeIdentity) {
             return Optional.empty();
         }
 

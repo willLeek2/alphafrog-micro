@@ -431,4 +431,37 @@ class FinanceResultModelProjectorTest {
                         null, true, null);
         assertFalse(projector.project(input).isPresent());
     }
+
+    @Test
+    void customPartialTripleOnlyMethodIdReturnsEmpty() {
+        FinanceMethodSpec cagr = catalog.findByMethodId("finance.growth.cagr").orElseThrow();
+        FinanceResultModelProjector.FinanceResultProjectionInput input =
+                new FinanceResultModelProjector.FinanceResultProjectionInput(
+                        cagr.getMethodId(), null, null,
+                        0.12, "ratio",
+                        Map.of(), "公式", true, FinanceDeclaredEvidence.CUSTOM_WITH_CHECKS);
+        assertFalse(projector.project(input).isPresent());
+    }
+
+    @Test
+    void customPartialTripleMethodIdAndVersionReturnsEmpty() {
+        FinanceMethodSpec cagr = catalog.findByMethodId("finance.growth.cagr").orElseThrow();
+        FinanceResultModelProjector.FinanceResultProjectionInput input =
+                new FinanceResultModelProjector.FinanceResultProjectionInput(
+                        cagr.getMethodId(), cagr.getVersion(), null,
+                        0.12, "ratio",
+                        Map.of(), "公式", true, FinanceDeclaredEvidence.CUSTOM_UNVERIFIED);
+        assertFalse(projector.project(input).isPresent());
+    }
+
+    @Test
+    void customPartialTripleOnlySpecDigestReturnsEmpty() {
+        FinanceMethodSpec cagr = catalog.findByMethodId("finance.growth.cagr").orElseThrow();
+        FinanceResultModelProjector.FinanceResultProjectionInput input =
+                new FinanceResultModelProjector.FinanceResultProjectionInput(
+                        null, null, cagr.getSpecDigest(),
+                        0.12, "ratio",
+                        Map.of(), "公式", true, FinanceDeclaredEvidence.CUSTOM_WITH_CHECKS);
+        assertFalse(projector.project(input).isPresent());
+    }
 }
