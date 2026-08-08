@@ -1,7 +1,7 @@
 ---
 methodId: finance.risk.sharpe_ratio
 version: 1.0.0
-specDigest: sha256:a4cceb26858ff519cbe20eacf836e57b3be0e5a09c625af02c345b479c711aef
+specDigest: sha256:4abdbff9f54b8bfcb41a7e0fe194075613cb0a0633947fc8faac46859784d923
 ---
 
 # 夏普比率
