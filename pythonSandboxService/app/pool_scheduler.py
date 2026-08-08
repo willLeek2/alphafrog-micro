@@ -41,6 +41,12 @@ class SandboxJob:
     paths_dataset_csv: str | None = None
     path_manifest_csv: str | None = None
     resource_class: str = "STANDARD"
+    # === work-package-C (ccqwen) ===
+    # §7.2/§13: the task's FROZEN output-limit snapshot (plain dict, four
+    # camelCase limit keys), carried untouched from create_task to the runner.
+    # None = legacy non-wrapper path.
+    effective_output_limits: dict | None = None
+    # === end work-package-C ===
 
 
 class ContainerWorker:
@@ -231,6 +237,7 @@ class ContainerWorker:
             prepare_loader_modules=False,
             resource_class=job.resource_class,
             usage_sampling_interval_millis=self.config.usage_sampling_interval_millis,
+            effective_output_limits=job.effective_output_limits,
         )
 
     def _on_job_done(self, job: SandboxJob, future: Future) -> None:
@@ -320,6 +327,7 @@ class ContainerPoolScheduler:
         paths_dataset_csv: str | None = None,
         path_manifest_csv: str | None = None,
         resource_class: str = "STANDARD",
+        effective_output_limits: dict | None = None,
     ) -> dict:
         if self._closing:
             raise RuntimeError("sandbox pool is closing")
@@ -341,6 +349,7 @@ class ContainerPoolScheduler:
                 paths_dataset_csv=paths_dataset_csv,
                 path_manifest_csv=path_manifest_csv,
                 resource_class=resource_class,
+                effective_output_limits=effective_output_limits,
             )
         )
         self._maybe_scale_up()

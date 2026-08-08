@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import csv
 import io
 import json
@@ -14,8 +15,18 @@ from typing import Any, Dict, List, Tuple
 from llm_sandbox import SandboxSession
 from llm_sandbox.exceptions import SandboxTimeoutError
 
+from .bounded_exec_wrapper import (
+    CAPTURE_DIR_NAME,
+    CAPTURE_RESULT_FILE_NAME,
+    RECORDS_FILE_NAME,
+    STDERR_FILE_NAME,
+    STDOUT_FILE_NAME,
+    UNKNOWN_MARKER_AUDIT_FILE_NAME,
+)
+from .capture_reader import CAPTURE_FILE_NAMES
 from .config import SandboxConfig
 from .dataset_manifest import expand_dataset_ids
+from .finance_record_channel import decode_capture_text, read_capture_artifacts
 from .resource_usage import SandboxResourceUsageCollector
 
 logger = logging.getLogger(__name__)
@@ -38,6 +49,60 @@ SANDBOX_INPUT_PLACEHOLDER = "/__AF_INPUT__/"
 MANIFEST_NONE_MARKER = "NONE"
 # MF6: NONE 行物化产物子目录前缀（与 run_id / agent_run_manifest_id 拼接成 sandbox 内绝对路径）。
 TEMP_MANIFEST_DIR_PREFIX = "_agent_run_manifest_"
+
+# === work-package-C: §7.1 bounded wrapper production wiring ================
+# The wrapper runs from a TASK-LOCAL copy of the app package staged under the
+# task workspace (zero global-path writes, so it stays safe under future
+# per-container concurrency; codex 56d28076 — the global sitecustomize.py
+# write/delete is what is NOT task-local yet, not this package).
+WRAPPER_MODULE_FILES = (
+    "__init__.py",
+    "output_capture.py",
+    "bounded_exec_wrapper.py",
+    "capture_reader.py",
+)
+WRAPPER_DIR_NAME = "bounded-wrapper"
+WRAPPER_BOOTSTRAP_NAME = "run_wrapper.py"
+WRAPPER_INPUT_FILE_NAME = "wrapper-input.json"
+USER_SCRIPT_FILE_NAME = "user_script.py"
+RUNTIME_ENVIRONMENT_FILE_NAME = "runtime-environment.json"
+
+# Contract §13 line 644: the four frozen limit keys, verbatim.
+WRAPPER_LIMIT_KEYS = (
+    "stdoutMaxBytes",
+    "stderrMaxBytes",
+    "recordChannelMaxBytes",
+    "recordChannelMaxRecords",
+)
+
+# Fail-fast whitelist drift guard: the container-side reader and the wrapper
+# must agree on the §7.1 fixed capture file layout.
+if set(CAPTURE_FILE_NAMES) != {
+    CAPTURE_RESULT_FILE_NAME,
+    STDOUT_FILE_NAME,
+    STDERR_FILE_NAME,
+    RECORDS_FILE_NAME,
+    UNKNOWN_MARKER_AUDIT_FILE_NAME,
+}:
+    raise RuntimeError(
+        "capture_reader.CAPTURE_FILE_NAMES drifted from bounded_exec_wrapper constants"
+    )
+
+# Task-local bootstrap: put THIS wrapper package first on sys.path at run time
+# (after site init) so nothing baked into the image can shadow it, then hand
+# argv to the wrapper's main().
+WRAPPER_BOOTSTRAP_SOURCE = (
+    "import os\n"
+    "import sys\n"
+    "\n"
+    "sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))\n"
+    "\n"
+    "from app.bounded_exec_wrapper import main\n"
+    "\n"
+    "if __name__ == '__main__':\n"
+    "    sys.exit(main(sys.argv[1:]))\n"
+)
+# === end work-package-C =====================================================
 
 
 def _read_json_file(path: Path) -> Dict[str, Any]:
@@ -989,6 +1054,259 @@ def _container_oom_killed(container_id: str) -> bool:
                 pass
 
 
+# === work-package-C: §7.1 bounded wrapper production wiring ================
+
+
+class _WrappedScriptResult:
+    """ConsoleOutput stand-in for the wrapper path (exit_code/stdout/stderr)."""
+
+    __slots__ = ("exit_code", "stdout", "stderr")
+
+    def __init__(self, exit_code: int, stdout: str, stderr: str) -> None:
+        self.exit_code = exit_code
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def _resolve_wrapper_interpreter(
+    session: SandboxSession,
+    config: SandboxConfig,
+    task_id: str,
+) -> str:
+    """Pick the exact interpreter llm-sandbox ``session.run`` would use.
+
+    llm-sandbox 0.3.33 (``BaseSession.run``) executes code with the venv
+    interpreter when environment setup runs (or an existing container is
+    attached) and with plain ``python`` otherwise.  The wrapper's child must
+    run on the SAME interpreter (codex 3c5a2858: container interpreter, never
+    the host's), so mirror that choice and fail closed: an absolute venv path
+    is probed with ``test -x`` before use.
+    """
+    use_venv = (not config.skip_environment_setup) or bool(
+        getattr(session, "using_existing_container", False)
+    )
+    if not use_venv:
+        return "python"
+    candidate = getattr(session, "python_executable_path", None) or (
+        f"{config.workdir.rstrip('/')}/.sandbox-venv/bin/python"
+    )
+    _exec_checked(
+        session,
+        f"test -x {shlex.quote(candidate)}",
+        f"wrapper_interpreter_check task={task_id}",
+    )
+    return candidate
+
+
+def _stage_bounded_wrapper(
+    session: SandboxSession,
+    config: SandboxConfig,
+    task_id: str,
+    task_workspace: str,
+    code: str,
+    timeout_seconds: float,
+    limits: Dict[str, Any],
+) -> str:
+    """Stage the task-local wrapper package, user script and wrapper-input.json.
+
+    Everything lands under ``{task_workspace}`` — no global paths are written,
+    so concurrent tasks in one container can never race on wrapper code.
+    Returns the wrapper-input.json path.
+    """
+    workdir = config.workdir.rstrip("/")
+    wrapper_dir = f"{task_workspace}/{WRAPPER_DIR_NAME}"
+    wrapper_pkg_dir = f"{wrapper_dir}/app"
+    _exec_checked(
+        session,
+        f"mkdir -p {shlex.quote(wrapper_pkg_dir)}",
+        f"create_wrapper_dir task={task_id}",
+    )
+    for filename in WRAPPER_MODULE_FILES:
+        source = APP_DIR / filename
+        if not source.is_file():
+            raise FileNotFoundError(f"bounded wrapper module not found: {source}")
+        _copy_dataset_file(session, source, f"{wrapper_pkg_dir}/{filename}")
+    _copy_text_to_runtime(
+        session, WRAPPER_BOOTSTRAP_SOURCE, f"{wrapper_dir}/{WRAPPER_BOOTSTRAP_NAME}"
+    )
+
+    script_path = f"{task_workspace}/{USER_SCRIPT_FILE_NAME}"
+    _copy_text_to_runtime(session, code, script_path)
+
+    # §7.1 wrapper input; the four §13 limit keys verbatim.  sourceRevision is
+    # Task metadata, not part of the wrapper input (models.BoundedExecRequest).
+    wrapper_input = {
+        "scriptPath": script_path,
+        "timeoutSeconds": timeout_seconds,
+        "effectiveOutputLimits": {key: limits[key] for key in WRAPPER_LIMIT_KEYS},
+        "runtimeEnvironmentPath": f"{workdir}/{RUNTIME_ENVIRONMENT_FILE_NAME}",
+    }
+    wrapper_input_path = f"{task_workspace}/{WRAPPER_INPUT_FILE_NAME}"
+    _copy_text_to_runtime(
+        session,
+        json.dumps(wrapper_input, ensure_ascii=False),
+        wrapper_input_path,
+    )
+    return wrapper_input_path
+
+
+def _wrapper_run_command(
+    config: SandboxConfig,
+    task_workspace: str,
+    interpreter: str,
+) -> str:
+    """Build the in-container wrapper invocation.
+
+    ``PYTHONPATH={workdir}`` makes the sitecustomize.py written by
+    ``_prepare_task_workspace`` auto-import in the wrapper AND child
+    processes: AF_TASK_* env vars, the workdir sys.path entry (loader
+    modules) and the chdir into the task workspace — exact equivalence with
+    the legacy ``session.run`` path without rewriting any user code.
+    """
+    workdir = config.workdir.rstrip("/")
+    wrapper_dir = f"{task_workspace}/{WRAPPER_DIR_NAME}"
+    bootstrap = f"{wrapper_dir}/{WRAPPER_BOOTSTRAP_NAME}"
+    wrapper_input_path = f"{task_workspace}/{WRAPPER_INPUT_FILE_NAME}"
+    pythonpath = f"{workdir}:{wrapper_dir}"
+    script = (
+        "set -e\n"
+        f"cd {shlex.quote(task_workspace)}\n"
+        f"PYTHONPATH={shlex.quote(pythonpath)} {shlex.quote(interpreter)} "
+        f"{shlex.quote(bootstrap)} {shlex.quote(wrapper_input_path)}\n"
+    )
+    return f"sh -lc {shlex.quote(script)}"
+
+
+def _read_capture_from_container(
+    session: SandboxSession,
+    config: SandboxConfig,
+    task_id: str,
+    task_workspace: str,
+    interpreter: str,
+    limits: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Read the wrapper's bounded artifacts back BEFORE cleanup (§7.1 step 7).
+
+    Runs the stdlib ``capture_reader`` inside the container, decodes the
+    emitted JSON into a temporary directory, and hands the files to the
+    fail-closed host-side reader (``read_capture_artifacts``, codex c72db8f6
+    item 3: presence/byte-length/record-channel consistency all validated).
+    ANY inconsistency raises -> the task fails instead of reporting a
+    half-formed finance_record_channel.
+    """
+    reader_path = (
+        f"{task_workspace}/{WRAPPER_DIR_NAME}/app/capture_reader.py"
+    )
+    capture_dir = f"{task_workspace}/{CAPTURE_DIR_NAME}"
+    command = f"sh -lc {shlex.quote(f'{shlex.quote(interpreter)} {shlex.quote(reader_path)} {shlex.quote(capture_dir)}')}"
+    output = session.execute_command(command)
+    if output.exit_code != 0:
+        raise RuntimeError(
+            f"capture readback failed task={task_id}: "
+            f"exit_code={output.exit_code} stderr={(output.stderr or '')[:512]!r}"
+        )
+    try:
+        document = json.loads(output.stdout or "")
+    except ValueError as exc:
+        raise RuntimeError(
+            f"capture readback returned invalid JSON task={task_id}: {exc}"
+        ) from exc
+    files = document.get("files") if isinstance(document, dict) else None
+    if not isinstance(files, dict):
+        raise RuntimeError(
+            f"capture readback JSON lacks a files object task={task_id}"
+        )
+
+    with tempfile.TemporaryDirectory(prefix=f"af-capture-{task_id}-") as temp_dir:
+        for name, encoded in files.items():
+            if name not in CAPTURE_FILE_NAMES:
+                raise RuntimeError(
+                    f"capture readback returned unknown artifact {name!r} "
+                    f"task={task_id}"
+                )
+            if not isinstance(encoded, str):
+                raise RuntimeError(
+                    f"capture artifact {name!r} is not base64 text task={task_id}"
+                )
+            try:
+                payload = base64.b64decode(encoded.encode("ascii"), validate=True)
+            except (ValueError, UnicodeEncodeError) as exc:
+                raise RuntimeError(
+                    f"capture artifact {name!r} is not valid base64 task={task_id}: {exc}"
+                ) from exc
+            (Path(temp_dir) / name).write_bytes(payload)
+        return read_capture_artifacts(
+            temp_dir,
+            stdout_max_bytes=limits["stdoutMaxBytes"],
+            stderr_max_bytes=limits["stderrMaxBytes"],
+        )
+
+
+def _run_bounded_wrapper_path(
+    session: SandboxSession,
+    config: SandboxConfig,
+    task_id: str,
+    task_workspace: str,
+    code: str,
+    install_libraries: List[str],
+    timeout_seconds: float,
+    limits: Dict[str, Any],
+) -> Tuple[_WrappedScriptResult, Dict[str, Any], Dict[str, int]]:
+    """§7.1 steps 1-2/7-8 production path: install -> stage -> wrapper -> readback.
+
+    Returns ``(result, finance_record_channel, phase_timings)`` where
+    ``result`` carries the child's exit code and the reassembled §4.2 bounded
+    stdout (ordinary bytes first, then the COMPLETE record lines)/stderr, and
+    the channel is the §5.1 snake_case dict built from the capture summary.
+    """
+    phase_timings: Dict[str, int] = {}
+    if install_libraries:
+        # llm-sandbox installs into the SHARED container venv — exactly why
+        # container concurrency must stay 1 while dynamic install is enabled
+        # (plan A; nacos_config invariant).
+        t_install = time.monotonic()
+        session.install(list(install_libraries))
+        phase_timings["library_install_ms"] = int((time.monotonic() - t_install) * 1000)
+
+    interpreter = _resolve_wrapper_interpreter(session, config, task_id)
+
+    t_stage = time.monotonic()
+    _stage_bounded_wrapper(
+        session, config, task_id, task_workspace, code, timeout_seconds, limits
+    )
+    phase_timings["wrapper_stage_ms"] = int((time.monotonic() - t_stage) * 1000)
+
+    t_exec = time.monotonic()
+    output = session.execute_command(
+        _wrapper_run_command(config, task_workspace, interpreter)
+    )
+    phase_timings["wrapper_exec_ms"] = int((time.monotonic() - t_exec) * 1000)
+    if output.exit_code != 0:
+        # The WRAPPER failed (not the child): capture-result.json was never
+        # written or the wrapper itself crashed.  Diagnostics only — the
+        # wrapper never echoes user content to its own stderr (§18).
+        raise RuntimeError(
+            f"bounded wrapper failed task={task_id}: "
+            f"exit_code={output.exit_code} stderr={(output.stderr or '')[:512]!r}"
+        )
+
+    t_read = time.monotonic()
+    artifacts = _read_capture_from_container(
+        session, config, task_id, task_workspace, interpreter, limits
+    )
+    phase_timings["capture_read_ms"] = int((time.monotonic() - t_read) * 1000)
+
+    result = _WrappedScriptResult(
+        exit_code=artifacts["exit_code"],
+        stdout=decode_capture_text(artifacts["stdout_bytes"]),
+        stderr=decode_capture_text(artifacts["stderr_bytes"]),
+    )
+    return result, artifacts["channel"], phase_timings
+
+
+# === end work-package-C =====================================================
+
+
 def run_in_open_session(
     config: SandboxConfig,
     session: SandboxSession,
@@ -1008,6 +1326,7 @@ def run_in_open_session(
     prepare_loader_modules: bool = True,
     resource_class: str = "STANDARD",
     usage_sampling_interval_millis: int | None = None,
+    effective_output_limits: Dict[str, Any] | None = None,
 ) -> dict:
     """Run one task inside an already-open session.
 
@@ -1046,10 +1365,12 @@ def run_in_open_session(
     exit_reason = "UNKNOWN"
     resource_usage = None
 
+    finance_record_channel: Dict[str, Any] | None = None
+    task_workspace = f"{config.workspace_root}/{task_id}"
     try:
         t_workspace_start = time.monotonic()
         workspace_created = True
-        _prepare_task_workspace(
+        task_workspace = _prepare_task_workspace(
             session,
             task_id,
             config,
@@ -1064,7 +1385,26 @@ def run_in_open_session(
         _log_in_container(session, task_id, config, "script_start")
         t_run_start = time.monotonic()
         _smoke_check_loader_modules(session, config, task_id)
-        result = session.run(code, libraries=install_libraries, timeout=timeout)
+        if effective_output_limits is None:
+            # Legacy path: no frozen §13 snapshot (pre-§7.2 tasks/tests).
+            result = session.run(code, libraries=install_libraries, timeout=timeout)
+        else:
+            # §7.1 production path: bounded wrapper + capture readback.  The
+            # task's FROZEN snapshot (never the hot config) is the only limit
+            # source; the wrapper enforces it while continuously draining.
+            result, finance_record_channel, wrapper_phase_timings = (
+                _run_bounded_wrapper_path(
+                    session,
+                    config,
+                    task_id,
+                    task_workspace,
+                    code,
+                    install_libraries,
+                    timeout,
+                    effective_output_limits,
+                )
+            )
+            timings.update(wrapper_phase_timings)
         timings["script_run_ms"] = int((time.monotonic() - t_run_start) * 1000)
         timings["env_load_ms"] = timings["workspace_prepare_ms"]
         timings["code_exec_ms"] = timings["script_run_ms"]
@@ -1072,7 +1412,8 @@ def run_in_open_session(
             session,
             task_id,
             config,
-            f"script_end exit_code={result.exit_code} stdout_len={len(result.stdout or '')} stderr_len={len(result.stderr or '')}",
+            f"script_end exit_code={result.exit_code} stdout_len={len(result.stdout or '')} stderr_len={len(result.stderr or '')} "
+            f"wrapper={'on' if finance_record_channel is not None else 'off'}",
         )
         exit_reason = "SUCCEEDED" if result.exit_code == 0 else "NON_ZERO_EXIT"
 
@@ -1095,7 +1436,6 @@ def run_in_open_session(
         _flush_container_log(session, task_id, config)
         _log_in_container(session, task_id, config, f"script_error error={type(e).__name__}")
     finally:
-        task_workspace = f"{config.workspace_root}/{task_id}"
         loader_metrics_jsonl = _read_runtime_text(
             session,
             f"cat {shlex.quote(task_workspace + '/metrics/loader_metrics.jsonl')} 2>/dev/null || true",
@@ -1154,6 +1494,9 @@ def run_in_open_session(
         "recycle_reason": recycle_reason,
         "container_id": actual_container_id,
         "resource_usage": resource_usage.model_dump(mode="json"),
+        # §5.1 write path: the snake_case channel built from the capture
+        # summary, or None when the run did not go through the wrapper.
+        "finance_record_channel": finance_record_channel,
     }
 
 
@@ -1172,6 +1515,7 @@ def run_in_sandbox(
     queue_wait_ms: int = 0,
     resource_class: str = "STANDARD",
     memory_limit_bytes: int | None = None,
+    effective_output_limits: Dict[str, Any] | None = None,
 ) -> dict:
     timeout = timeout_seconds or config.execution_timeout_seconds
     t0 = time.monotonic()
@@ -1200,6 +1544,7 @@ def run_in_sandbox(
             container_id=container_id,
             pool_enabled=False,
             resource_class=resource_class,
+            effective_output_limits=effective_output_limits,
         )
         timings = result.setdefault("timings", {})
         timings["container_create_ms"] = container_create_ms

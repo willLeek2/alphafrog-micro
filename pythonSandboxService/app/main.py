@@ -17,6 +17,7 @@ from .canonical_fingerprint import (
 from .config import load_config
 from .models import (
     CreateTaskResponse,
+    EffectiveOutputLimits,
     ExecuteRequest,
     ExecuteResult,
     OperationLookupResponse,
@@ -112,6 +113,23 @@ async def worker(worker_id: int):
             logger.error("Worker %s error: %s", worker_id, e)
 
 
+def _attach_finance_record_channel(result: ExecuteResult, channel, model_cls=None) -> ExecuteResult:
+    """Merge-safe §5.1 attach of the captured finance_record_channel.
+
+    The frozen consumer DTO field is declared by work package D (models.py
+    NOTE, owner split msg f4341b21); until it lands at owner merge the fully
+    VALIDATED channel is simply not attached, keeping the C write path
+    tolerant of the field's absence.  Once D's field exists on ExecuteResult
+    this attaches without any further change here.
+    """
+    if channel is None:
+        return result
+    cls = model_cls if model_cls is not None else ExecuteResult
+    if "finance_record_channel" not in getattr(cls, "model_fields", {}):
+        return result
+    return result.model_copy(update={"finance_record_channel": channel})
+
+
 async def process_task(task: Task, worker_id: int):
     started_at = datetime.utcnow()
     queued_ms = int((started_at - task.created_at).total_seconds() * 1000)
@@ -159,6 +177,13 @@ async def process_task(task: Task, worker_id: int):
     )
 
     result_dict: dict = {}
+    # §7.2/§13: execution reads ONLY the snapshot frozen at create_task; the
+    # hot dynamic config is never re-read mid-run.
+    frozen_limits = (
+        task.effective_output_limits.model_dump()
+        if task.effective_output_limits is not None
+        else None
+    )
     try:
         # Run synchronous sandbox runner in thread pool
         if pool is not None and config.pool_enabled:
@@ -174,6 +199,7 @@ async def process_task(task: Task, worker_id: int):
                 task.request.paths_dataset_csv,
                 task.request.path_manifest_csv,
                 task.request.resource_class,
+                effective_output_limits=frozen_limits,
             )
         else:
             result_dict = await asyncio.to_thread(
@@ -191,6 +217,7 @@ async def process_task(task: Task, worker_id: int):
                 queue_wait_ms=queued_ms,
                 resource_class=task.request.resource_class,
                 memory_limit_bytes=task.request.memory_limit_bytes,
+                effective_output_limits=frozen_limits,
             )
         usage_payload = result_dict.get("resource_usage")
         if usage_payload:
@@ -214,6 +241,11 @@ async def process_task(task: Task, worker_id: int):
             },
             resource_usage=task.resource_usage,
             retryable=task.retryable,
+        )
+        # §5.1: attach the validated channel from the §7.1 write path (the
+        # attach is merge-safe: it no-ops until D's frozen DTO field lands).
+        task.result = _attach_finance_record_channel(
+            task.result, result_dict.get("finance_record_channel")
         )
         if task.status == TaskStatus.FAILED:
             task.error = f"sandbox exited with code {result_dict['exit_code']}"
@@ -380,6 +412,17 @@ async def create_task(request: ExecuteRequest):
         raise HTTPException(status_code=400, detail=str(error)) from error
     task_id = str(uuid.uuid4())
     task = Task(task_id=task_id, status=TaskStatus.QUEUED, request=request)
+    # §7.2/§13: freeze the output-limit snapshot at creation time.  An
+    # idempotent re-create returns the ORIGINAL task from the store, so the
+    # original snapshot is kept untouched by any later Nacos update.
+    task.effective_output_limits = EffectiveOutputLimits(
+        **dynamic_config.output_limits_snapshot()
+    )
+    # §7.1 (codex b5a92810, C/H seam): freeze the validated image reference
+    # the task will run on.  Set ONCE here: an idempotent re-create returns
+    # the ORIGINAL task (original ref kept), execution never re-reads hot
+    # config, and a later image change only affects NEW tasks.
+    task.runtime_image_ref = config.sandbox_image
     try:
         decision = task_store.create(task)
     except OperationConflictError as error:
