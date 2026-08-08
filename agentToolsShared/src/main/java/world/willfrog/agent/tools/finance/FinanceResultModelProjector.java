@@ -20,6 +20,7 @@ import java.util.regex.Pattern;
  *
  * <p>投影规则（已与技术负责人对齐）：</p>
  * <ul>
+ *   <li>判型只信可信 {@code declaredEvidence}：仅 {@code LIBRARY_CALL_DECLARED} 走 canonical narrative；两种 CUSTOM 一律走 {@code formulaDescription}（自定义记录携带完整三元组也不例外）；</li>
  *   <li>数组参数占位符只渲染为“N 个周期收益率样本”（长度摘要），永不暴露内容；</li>
  *   <li>标量参数渲染实际值；</li>
  *   <li>未解析占位符 / 类型不匹配 / 数组或对象直接输出 → 该记录不可投影（返回空）；</li>
@@ -58,12 +59,18 @@ public class FinanceResultModelProjector {
         boolean versionBlank = isBlank(in.methodVersion());
         boolean specDigestBlank = isBlank(in.specDigest());
 
-        // 三者全空：自定义计算
-        if (methodIdBlank && versionBlank && specDigestBlank) {
-            return projectCustom(in);
+        // 判型只信可信的 declaredEvidence（由持久化侧按记录声明写入）：仅 LIBRARY_CALL_DECLARED
+        // 走 canonical narrative；两种 CUSTOM 一律走 formulaDescription——自定义记录允许携带
+        // 完整三元组，但 evidence 仍是 CUSTOM，不得因此冒用 canonical 说明。null/未知 → fail-closed。
+        if (in.declaredEvidence() != FinanceDeclaredEvidence.LIBRARY_CALL_DECLARED) {
+            if (in.declaredEvidence() == FinanceDeclaredEvidence.CUSTOM_WITH_CHECKS
+                    || in.declaredEvidence() == FinanceDeclaredEvidence.CUSTOM_UNVERIFIED) {
+                return projectCustom(in);
+            }
+            return Optional.empty();
         }
 
-        // partial triple：缺一或二 → 不可投影
+        // LIBRARY_CALL_DECLARED 必须携带完整三元组：全空或缺一/二 → 不可投影
         if (methodIdBlank || versionBlank || specDigestBlank) {
             return Optional.empty();
         }
@@ -289,8 +296,20 @@ public class FinanceResultModelProjector {
             String unit,
             Map<String, Object> parameters,
             String formulaDescription,
-            boolean renderable
+            boolean renderable,
+            FinanceDeclaredEvidence declaredEvidence
     ) {
+    }
+
+    /**
+     * 可信的记录声明证据类型（仅作投影判型输入，永不进入输出）。
+     * 与持久化记录的 declaredEvidence 字段一一对应；判型不得改用内部生效证据，
+     * 公共库记录即使被后台核对降级，也仍须 canonical narrative。
+     */
+    public enum FinanceDeclaredEvidence {
+        LIBRARY_CALL_DECLARED,
+        CUSTOM_WITH_CHECKS,
+        CUSTOM_UNVERIFIED
     }
 
     /**

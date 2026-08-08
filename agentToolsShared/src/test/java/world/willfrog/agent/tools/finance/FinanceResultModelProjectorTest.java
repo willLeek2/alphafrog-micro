@@ -2,6 +2,7 @@ package world.willfrog.agent.tools.finance;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
+import world.willfrog.agent.tools.finance.FinanceResultModelProjector.FinanceDeclaredEvidence;
 
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -34,7 +35,7 @@ class FinanceResultModelProjectorTest {
                         cagr.getMethodId(), cagr.getVersion(), cagr.getSpecDigest(),
                         0.1246, "ratio",
                         Map.of("beginningValue", 100.0, "endingValue", 160.0, "periods", 4),
-                        null, true);
+                        null, true, FinanceDeclaredEvidence.LIBRARY_CALL_DECLARED);
 
         Optional<FinanceResultModelProjector.FinanceResultProjection> result = projector.project(input);
         assertTrue(result.isPresent());
@@ -54,7 +55,7 @@ class FinanceResultModelProjectorTest {
                         vol.getMethodId(), vol.getVersion(), vol.getSpecDigest(),
                         0.15, "ratio_per_annum",
                         Map.of("returns", List.of(0.01, -0.02, 0.015), "periodsPerYear", 252),
-                        null, true);
+                        null, true, FinanceDeclaredEvidence.LIBRARY_CALL_DECLARED);
 
         Optional<FinanceResultModelProjector.FinanceResultProjection> result = projector.project(input);
         assertTrue(result.isPresent());
@@ -72,7 +73,7 @@ class FinanceResultModelProjectorTest {
                         vol.getMethodId(), vol.getVersion(), vol.getSpecDigest(),
                         0.15, "ratio_per_annum",
                         Map.of("returns", 0.01, "periodsPerYear", 252),
-                        null, true);
+                        null, true, FinanceDeclaredEvidence.LIBRARY_CALL_DECLARED);
         assertFalse(projector.project(input).isPresent());
     }
 
@@ -84,7 +85,7 @@ class FinanceResultModelProjectorTest {
                         cagr.getMethodId(), cagr.getVersion(), cagr.getSpecDigest(),
                         0.1, "ratio",
                         Map.of("beginningValue", 100.0, "endingValue", 160.0, "periods", List.of(1, 2, 3)),
-                        null, true);
+                        null, true, FinanceDeclaredEvidence.LIBRARY_CALL_DECLARED);
         assertFalse(projector.project(input).isPresent());
     }
 
@@ -97,7 +98,7 @@ class FinanceResultModelProjectorTest {
                         sharpe.getMethodId(), sharpe.getVersion(), sharpe.getSpecDigest(),
                         1.2, "ratio_per_annum",
                         Map.of("returns", List.of(0.01, -0.02, 0.015)),
-                        null, true);
+                        null, true, FinanceDeclaredEvidence.LIBRARY_CALL_DECLARED);
 
         Optional<FinanceResultModelProjector.FinanceResultProjection> result = projector.project(input);
         assertTrue(result.isPresent());
@@ -113,7 +114,7 @@ class FinanceResultModelProjectorTest {
                         cagr.getMethodId(), cagr.getVersion(), cagr.getSpecDigest(),
                         0.1, "ratio",
                         Map.of("beginningValue", 100.0, "endingValue", 160.0),
-                        null, true);
+                        null, true, FinanceDeclaredEvidence.LIBRARY_CALL_DECLARED);
         assertFalse(projector.project(input).isPresent());
     }
 
@@ -146,7 +147,7 @@ class FinanceResultModelProjectorTest {
                         spec.getMethodId(), spec.getVersion(), spec.getSpecDigest(),
                         1.0, "unit",
                         Map.of("visible", 1.0),
-                        null, true);
+                        null, true, FinanceDeclaredEvidence.LIBRARY_CALL_DECLARED);
         assertFalse(localProjector.project(input).isPresent(),
                 "Required param missing even if not referenced must fail closed");
     }
@@ -179,7 +180,7 @@ class FinanceResultModelProjectorTest {
                         spec.getMethodId(), spec.getVersion(), spec.getSpecDigest(),
                         1.0, "unit",
                         Map.of("visible", 1.0, "hidden", "not-an-integer"),
-                        null, true);
+                        null, true, FinanceDeclaredEvidence.LIBRARY_CALL_DECLARED);
         assertFalse(localProjector.project(input).isPresent(),
                 "Required param with wrong type must fail closed even if not in narrative");
     }
@@ -210,7 +211,7 @@ class FinanceResultModelProjectorTest {
                         spec.getMethodId(), spec.getVersion(), spec.getSpecDigest(),
                         1.0, "unit",
                         Map.of("count", 1.5),
-                        null, true);
+                        null, true, FinanceDeclaredEvidence.LIBRARY_CALL_DECLARED);
         assertFalse(localProjector.project(fractional).isPresent(),
                 "Fractional value for integer parameter must be rejected");
 
@@ -219,7 +220,7 @@ class FinanceResultModelProjectorTest {
                         spec.getMethodId(), spec.getVersion(), spec.getSpecDigest(),
                         1.0, "unit",
                         Map.of("count", 2.0),
-                        null, true);
+                        null, true, FinanceDeclaredEvidence.LIBRARY_CALL_DECLARED);
         assertTrue(localProjector.project(doubleIntegral).isPresent(),
                 "Mathematical integer as double must be accepted");
 
@@ -228,7 +229,7 @@ class FinanceResultModelProjectorTest {
                         spec.getMethodId(), spec.getVersion(), spec.getSpecDigest(),
                         1.0, "unit",
                         Map.of("count", 2),
-                        null, true);
+                        null, true, FinanceDeclaredEvidence.LIBRARY_CALL_DECLARED);
         assertTrue(localProjector.project(whole).isPresent(),
                 "Integral value must be accepted");
     }
@@ -248,7 +249,7 @@ class FinanceResultModelProjectorTest {
                             v[0], v[1], v[2],
                             0.1, "ratio",
                             Map.of("beginningValue", 100.0, "endingValue", 160.0, "periods", 4),
-                            null, true);
+                            null, true, FinanceDeclaredEvidence.LIBRARY_CALL_DECLARED);
             assertFalse(projector.project(input).isPresent(),
                     "Partial triple should not project: " + v[0] + "/" + v[1] + "/" + v[2]);
         }
@@ -281,7 +282,7 @@ class FinanceResultModelProjectorTest {
                         spec.getMethodId(), spec.getVersion(), spec.getSpecDigest(),
                         1.0, "unit",
                         Map.of("big", big),
-                        null, true);
+                        null, true, FinanceDeclaredEvidence.LIBRARY_CALL_DECLARED);
         assertFalse(localProjector.project(input).isPresent());
     }
 
@@ -293,7 +294,7 @@ class FinanceResultModelProjectorTest {
                         cagr.getMethodId(), cagr.getVersion(), cagr.getSpecDigest(),
                         0.1, "wrong_unit",
                         Map.of("beginningValue", 100.0, "endingValue", 160.0, "periods", 4),
-                        null, true);
+                        null, true, FinanceDeclaredEvidence.LIBRARY_CALL_DECLARED);
         assertFalse(projector.project(input).isPresent());
     }
 
@@ -305,7 +306,7 @@ class FinanceResultModelProjectorTest {
                         cagr.getMethodId(), cagr.getVersion(), cagr.getSpecDigest(),
                         0.1, "ratio",
                         Map.of("beginningValue", 100.0, "endingValue", 160.0, "periods", 4),
-                        null, true);
+                        null, true, FinanceDeclaredEvidence.LIBRARY_CALL_DECLARED);
         Optional<FinanceResultModelProjector.FinanceResultProjection> result = projector.project(input);
         assertTrue(result.isPresent());
         assertEquals("ratio", result.get().unit());
@@ -317,7 +318,7 @@ class FinanceResultModelProjectorTest {
                 new FinanceResultModelProjector.FinanceResultProjectionInput(
                         null, null, null,
                         0.12, "custom_unit",
-                        Map.of(), "formula", true);
+                        Map.of(), "formula", true, FinanceDeclaredEvidence.CUSTOM_WITH_CHECKS);
         Optional<FinanceResultModelProjector.FinanceResultProjection> result = projector.project(input);
         assertTrue(result.isPresent());
         assertEquals("custom_unit", result.get().unit());
@@ -330,7 +331,7 @@ class FinanceResultModelProjectorTest {
                         null, null, null,
                         0.12, "ratio",
                         Map.of("periods", 4),
-                        "(ending / beginning)^(1/periods) - 1", true);
+                        "(ending / beginning)^(1/periods) - 1", true, FinanceDeclaredEvidence.CUSTOM_WITH_CHECKS);
 
         Optional<FinanceResultModelProjector.FinanceResultProjection> result = projector.project(input);
         assertTrue(result.isPresent());
@@ -344,7 +345,7 @@ class FinanceResultModelProjectorTest {
                 new FinanceResultModelProjector.FinanceResultProjectionInput(
                         null, null, null,
                         0.12, "ratio",
-                        Map.of(), "", true);
+                        Map.of(), "", true, FinanceDeclaredEvidence.CUSTOM_WITH_CHECKS);
         assertFalse(projector.project(input).isPresent());
     }
 
@@ -356,7 +357,7 @@ class FinanceResultModelProjectorTest {
                         cagr.getMethodId(), cagr.getVersion(), cagr.getSpecDigest(),
                         0.1, "ratio",
                         Map.of("beginningValue", 100.0, "endingValue", 160.0, "periods", 4),
-                        null, false);
+                        null, false, FinanceDeclaredEvidence.LIBRARY_CALL_DECLARED);
         assertFalse(projector.project(input).isPresent());
     }
 
@@ -368,12 +369,66 @@ class FinanceResultModelProjectorTest {
                         cagr.getMethodId(), cagr.getVersion(), cagr.getSpecDigest(),
                         0.1, "ratio",
                         Map.of("beginningValue", 100.0, "endingValue", 160.0, "periods", 4),
-                        null, true);
+                        null, true, FinanceDeclaredEvidence.LIBRARY_CALL_DECLARED);
         FinanceResultModelProjector.FinanceResultProjection projection = projector.project(input).orElseThrow();
         String json = projection.toString();
         assertFalse(json.contains("specDigest"));
         assertFalse(json.contains("environment"));
         assertFalse(json.contains("evidence"));
         assertFalse(json.contains("version"));
+    }
+
+    @Test
+    void customWithCompleteTripleUsesFormulaDescription() {
+        FinanceMethodSpec cagr = catalog.findByMethodId("finance.growth.cagr").orElseThrow();
+        // report_custom 允许携带完整三元组，但 declaredEvidence=CUSTOM 时必须走 formulaDescription
+        FinanceResultModelProjector.FinanceResultProjectionInput input =
+                new FinanceResultModelProjector.FinanceResultProjectionInput(
+                        cagr.getMethodId(), cagr.getVersion(), cagr.getSpecDigest(),
+                        0.12, "ratio",
+                        Map.of("beginningValue", 100.0, "endingValue", 160.0, "periods", 4),
+                        "人工公式：(160/100)^(1/4)-1", true, FinanceDeclaredEvidence.CUSTOM_WITH_CHECKS);
+        Optional<FinanceResultModelProjector.FinanceResultProjection> result = projector.project(input);
+        assertTrue(result.isPresent());
+        assertEquals("自定义计算", result.get().method());
+        assertEquals("人工公式：(160/100)^(1/4)-1", result.get().howCalculated());
+    }
+
+    @Test
+    void customUnverifiedWithCompleteTripleUsesFormulaDescription() {
+        FinanceMethodSpec cagr = catalog.findByMethodId("finance.growth.cagr").orElseThrow();
+        FinanceResultModelProjector.FinanceResultProjectionInput input =
+                new FinanceResultModelProjector.FinanceResultProjectionInput(
+                        cagr.getMethodId(), cagr.getVersion(), cagr.getSpecDigest(),
+                        0.12, "ratio",
+                        Map.of("beginningValue", 100.0, "endingValue", 160.0, "periods", 4),
+                        "自定义口径，未经库核验", true, FinanceDeclaredEvidence.CUSTOM_UNVERIFIED);
+        Optional<FinanceResultModelProjector.FinanceResultProjection> result = projector.project(input);
+        assertTrue(result.isPresent());
+        assertEquals("自定义计算", result.get().method());
+        assertEquals("自定义口径，未经库核验", result.get().howCalculated());
+    }
+
+    @Test
+    void libraryDeclaredWithoutTripleReturnsEmpty() {
+        // LIBRARY_CALL_DECLARED 缺失三元组 = 身份不完整，fail-closed，不得落入自定义路径
+        FinanceResultModelProjector.FinanceResultProjectionInput input =
+                new FinanceResultModelProjector.FinanceResultProjectionInput(
+                        null, null, null,
+                        0.12, "ratio",
+                        Map.of(), "有公式也不能按自定义投影", true, FinanceDeclaredEvidence.LIBRARY_CALL_DECLARED);
+        assertFalse(projector.project(input).isPresent());
+    }
+
+    @Test
+    void nullDeclaredEvidenceReturnsEmpty() {
+        FinanceMethodSpec cagr = catalog.findByMethodId("finance.growth.cagr").orElseThrow();
+        FinanceResultModelProjector.FinanceResultProjectionInput input =
+                new FinanceResultModelProjector.FinanceResultProjectionInput(
+                        cagr.getMethodId(), cagr.getVersion(), cagr.getSpecDigest(),
+                        0.1, "ratio",
+                        Map.of("beginningValue", 100.0, "endingValue", 160.0, "periods", 4),
+                        null, true, null);
+        assertFalse(projector.project(input).isPresent());
     }
 }
