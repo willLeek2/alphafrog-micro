@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import hashlib
-import importlib
 import json
 import logging
 import os
+import shlex
 import tempfile
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
@@ -39,35 +39,21 @@ def _sha256_hex_digest(data: bytes) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
 
 
-def _read_package_api_version(package_name: str) -> str:
-    """Read api_version from a package's module-level __api_version__ attribute.
-
-    Spec §8 L1019: hardcoding "1.0" for every package broke E's target/actual
-    API compatibility check (completion criteria #9), which depends on real
-    values. Try to import the package and read its ``__api_version__``; on any
-    failure (ImportError, AttributeError, syntax error inside the package),
-    fall back to the documented wire default so a broken package cannot crash
-    environment collection.
-
-    This is called from the warm container at sandbox_runner startup, so
-    import cost is paid once per container per package.
-    """
-    try:
-        module = importlib.import_module(package_name)
-    except Exception as exc:
-        logger.info(
-            "RUNTIME_ENVIRONMENT_API_VERSION_FALLBACK_IMPORT name=%s reason=%s",
-            package_name, exc,
-        )
-        return DEFAULT_PACKAGE_API_VERSION
-    value = getattr(module, "__api_version__", None)
-    if not isinstance(value, str) or not value:
-        logger.info(
-            "RUNTIME_ENVIRONMENT_API_VERSION_FALLBACK_MISSING name=%s default=%s",
-            package_name, DEFAULT_PACKAGE_API_VERSION,
-        )
-        return DEFAULT_PACKAGE_API_VERSION
-    return value
+def _resolve_target_interpreter(session: Any) -> str:
+    """Resolve the interpreter used by user code and dynamic installs."""
+    if session is None:
+        return "python"
+    config = getattr(session, "config", None)
+    skip_environment_setup = bool(getattr(config, "skip_environment_setup", False))
+    using_existing_container = bool(getattr(session, "using_existing_container", False))
+    python_executable = getattr(session, "python_executable_path", None)
+    if (
+        (not skip_environment_setup or using_existing_container)
+        and isinstance(python_executable, str)
+        and python_executable
+    ):
+        return python_executable
+    return "python"
 
 
 def _inspect_container_image_digest(container_id: str) -> str:
@@ -121,9 +107,10 @@ def _read_installed_packages(session: Any) -> Tuple[List[dict], bool]:
     if session is None:
         return [], False
     try:
+        interpreter = shlex.quote(_resolve_target_interpreter(session))
         command = (
-            "python -m pip list --format=json --disable-pip-version-check "
-            "2>/dev/null"
+            f"{interpreter} -m pip list --format=json "
+            "--disable-pip-version-check 2>/dev/null"
         )
         output = session.execute_command(command)
         if getattr(output, "exit_code", 0) != 0:
@@ -153,6 +140,49 @@ def _read_installed_packages(session: Any) -> Tuple[List[dict], bool]:
         return [], False
 
 
+def _probe_package_api_versions(
+    session: Any, package_names: List[str]
+) -> Tuple[dict[str, str], bool]:
+    """Read package API versions inside the task runtime interpreter."""
+    if session is None or not package_names:
+        return {}, True
+    interpreter = shlex.quote(_resolve_target_interpreter(session))
+    names_json = json.dumps(sorted(set(package_names)), separators=(",", ":"))
+    script = (
+        "import importlib, json, sys\n"
+        f"names = {names_json}\n"
+        "result = {}\n"
+        "for name in names:\n"
+        "    try:\n"
+        "        module = importlib.import_module(name)\n"
+        "        value = getattr(module, '__api_version__', None)\n"
+        "        result[name] = value if isinstance(value, str) and value else None\n"
+        "    except Exception:\n"
+        "        result[name] = None\n"
+        "sys.stdout.write(json.dumps(result, sort_keys=True))\n"
+    )
+    command = f"{interpreter} -c {shlex.quote(script)}"
+    try:
+        output = session.execute_command(command)
+        if getattr(output, "exit_code", 0) != 0:
+            return {}, False
+        text = (getattr(output, "stdout", "") or "").strip()
+        payload = json.loads(text)
+        if not isinstance(payload, dict):
+            return {}, False
+        versions = {
+            str(name): value
+            for name, value in payload.items()
+            if isinstance(name, str) and isinstance(value, str) and value
+        }
+        return versions, True
+    except Exception as exc:
+        logger.warning(
+            "RUNTIME_ENVIRONMENT_PACKAGE_API_PROBE_FAILED error=%s", exc
+        )
+        return {}, False
+
+
 def collect_runtime_environment(
     *,
     container_id: str,
@@ -179,22 +209,21 @@ def collect_runtime_environment(
     image_digest = _inspect_container_image_digest(container_id)
     packages, inventory_complete = _read_installed_packages(session)
     packages_sorted = sorted(packages, key=lambda p: p["name"])
+    api_versions, api_probe_complete = _probe_package_api_versions(
+        session, [p["name"] for p in packages_sorted]
+    )
+    inventory_complete = inventory_complete and api_probe_complete
 
     library_set_payload = [
         {"name": p["name"], "version": p["version"]} for p in packages_sorted
     ]
     library_set_digest = _sha256_hex_digest(_canonical_bytes(library_set_payload))
 
-    # Spec §8 L1019: api_version must come from each package's own metadata
-    # (__api_version__ attribute), not a hardcoded constant — E's target/actual
-    # API compatibility check (completion criteria #9) depends on real values.
-    # Packages without __api_version__ fall back to DEFAULT_PACKAGE_API_VERSION
-    # via _read_package_api_version; the default is pinned in tests.
     package_apis = [
         SandboxPackageApi(
             name=p["name"],
             version=p["version"],
-            api_version=_read_package_api_version(p["name"]),
+            api_version=api_versions.get(p["name"], ""),
         )
         for p in packages_sorted
     ]
