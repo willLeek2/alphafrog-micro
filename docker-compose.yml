@@ -480,6 +480,8 @@ services:
       AGENT_LANGCHAIN_SERVER_PORT: 50158
       # Agent LLM 配置（使用 agentLangchainService/config 作为共享静态 prompt/config 目录）
       AF_AGENT_LLM_CONFIG_FILE: ${AF_AGENT_LLM_CONFIG_FILE:-/app/config-dynamic/agent-llm.local.json}
+      AF_FINANCE_RECORD_CHANNEL_CONFIG_FILE: ${AF_FINANCE_RECORD_CHANNEL_CONFIG_FILE:-/app/config-dynamic/finance-record-channel.local.json}
+      AF_FINANCE_RECORD_CHANNEL_ENABLED: "false"
       AF_AGENT_LLM_PROMPT_BASE_DIR: ${AF_AGENT_LLM_PROMPT_BASE_DIR:-/app/config}
       AF_AGENT_API_KEY: ${AF_AGENT_API_KEY:-demo}
       AF_AGENT_DEFAULT_ENDPOINT: ${AF_AGENT_DEFAULT_ENDPOINT:-openrouter}
