@@ -9,10 +9,13 @@ method's canonical required inputs (contract §3.5 parameter table: volatility
 and sharpe both require ``returns``), so a consumer can reproduce the exact
 computed value from ``parameters`` alone.
 
-Method identity flows through the module-private registry/factory below; no
-public kwarg can override it (Spec §6, codex must-fix 0c147646 ITEM 4).
-Constraint violations raise ``ValueError`` naming the offending parameter;
-nothing is printed and no marker line is produced on failure.
+Method identity flows from the A-canonical GENERATED bindings
+(``alphafrog_finance.bindings``); no public kwarg can override it (Spec §6,
+codex must-fix 0c147646 ITEM 4; registry swap, codex 0c147646/97ea103a). The
+former interim hard-coded registry was REMOVED — hand-maintained method
+identity is forbidden. Constraint violations raise ``ValueError`` naming the
+offending parameter; nothing is printed and no marker line is produced on
+failure.
 """
 from __future__ import annotations
 
@@ -22,36 +25,17 @@ from typing import Any, Dict, List, Sequence
 from .checks import check_cagr, check_sharpe, check_volatility
 from .models import FinanceMetricResult
 
-# Module-private method identity registry (Spec §6). The definitive linkage is
-# work package A's canonical generated bindings (runtime/scripts/
-# generate_method_bindings.py -> alphafrog_finance/bindings.py), which are NOT
-# delivered yet; until then this private registry is the single internal source
-# of method ids for the public metric functions. It is deliberately private:
-# no public kwarg of cagr()/annualized_volatility()/sharpe() can replace the
-# identity, and report() cross-checks the id against the canonical method
-# specs installed with the package before emitting any triple.
-# TODO(Spec §6): replace this interim registry with the A-canonical generated
-# bindings once the A canonical SHA is delivered (generate_method_bindings.py
-# / bindings.py are still pending in the B gate); do not hand-maintain a
-# second source of truth alongside the generated bindings.
-_METHOD_IDENTITY_REGISTRY: Dict[str, str] = {
-    "cagr": "finance.growth.cagr",
-    "annualized_volatility": "finance.risk.annualized_volatility",
-    "sharpe": "finance.risk.sharpe_ratio",
-}
-
 
 def _method_id_for(metric_key: str) -> str:
     """Module-private identity lookup — the only path from a public metric
-    function to a method id. Unknown keys are internal programming errors."""
-    try:
-        return _METHOD_IDENTITY_REGISTRY[metric_key]
-    except KeyError:
-        raise RuntimeError(
-            f"no method identity registered for {metric_key!r}; method "
-            "identity must come from the module-private registry (Spec §6), "
-            "never from caller-supplied values"
-        ) from None
+    function to a method id. Identity comes from the A-canonical generated
+    bindings (``alphafrog_finance.bindings``); unknown keys are internal
+    programming errors and fail closed. The ``bindings`` import is lazy
+    (inside the function) to avoid any import cycle: ``bindings`` imports
+    ``metrics`` lazily inside its own assembly."""
+    from . import bindings
+
+    return bindings.method_id_for_function(metric_key)
 
 
 def _metric_result(
@@ -62,8 +46,9 @@ def _metric_result(
     parameters: Dict[str, Any],
     checks: Dict[str, bool],
 ) -> FinanceMetricResult:
-    """Module-private result factory: resolves the method id from the private
-    registry so the public metric functions never expose an identity kwarg."""
+    """Module-private result factory: resolves the method id via the
+    A-canonical generated bindings so the public metric functions never expose
+    an identity kwarg."""
     return FinanceMetricResult(
         method_id=_method_id_for(metric_key),
         value=value,

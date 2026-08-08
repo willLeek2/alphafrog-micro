@@ -15,17 +15,40 @@ llm_sandbox_exceptions.SandboxTimeoutError = TimeoutError
 sys.modules.setdefault("llm_sandbox", llm_sandbox)
 sys.modules.setdefault("llm_sandbox.exceptions", llm_sandbox_exceptions)
 
-from app.config import load_config  # noqa: E402
+from app.config import (  # noqa: E402
+    is_digest_reference,
+    is_valid_dev_reference,
+    load_config,
+    validate_sandbox_image,
+)
 from app.sandbox_runner import (  # noqa: E402
     _atomic_copy_text_to_runtime,
     _build_agent_run_metadata_documents,
     create_sandbox_session,
 )
 
+# Shared accept/reject vectors (single source of truth pinning identical
+# semantics at every digest-validation entry point, Spec §12 hardening).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from digest_reference_vectors import (  # noqa: E402
+    ACCEPT_REFS,
+    HEX64,
+    MALFORMED_UNDER_DEV_REFS,
+    REPO,
+    REJECT_REFS,
+    VALID_DEV_REFERENCES,
+)
+
 
 class DataIntenseRuntimeTest(unittest.TestCase):
     def test_default_runtime_is_one_task_per_container_with_two_memory_classes(self) -> None:
-        with patch.dict("os.environ", {}, clear=True):
+        # Spec §12: AF_SANDBOX_IMAGE has no implicit default; a digest
+        # reference is always accepted (no dev-allow switch needed).
+        with patch.dict(
+            "os.environ",
+            {"AF_SANDBOX_IMAGE": "registry.local/alphafrog/runtime@sha256:" + "ab" * 32},
+            clear=True,
+        ):
             config = load_config()
 
         self.assertFalse(config.pool_enabled)
@@ -76,7 +99,13 @@ class DataIntenseRuntimeTest(unittest.TestCase):
             def open(self):
                 return None
 
-        with patch.dict("os.environ", {}, clear=True):
+        # Spec §12: AF_SANDBOX_IMAGE has no implicit default; a digest
+        # reference is always accepted (no dev-allow switch needed).
+        with patch.dict(
+            "os.environ",
+            {"AF_SANDBOX_IMAGE": "registry.local/alphafrog/runtime@sha256:" + "ab" * 32},
+            clear=True,
+        ):
             config = load_config()
         with patch("app.sandbox_runner.SandboxSession", FakeSession):
             create_sandbox_session(
@@ -118,6 +147,173 @@ class DataIntenseRuntimeTest(unittest.TestCase):
             "mv /sandbox/paths_dataset_meta.json.tmp /sandbox/paths_dataset_meta.json",
             session.commands,
         )
+
+
+class ConfigDigestReferenceSharedVectorsTest(unittest.TestCase):
+    """app/config.py must implement the SAME anchored, lowercase-only digest
+    semantics as scripts/build_runtime_manifest.py and the shell entry points
+    (deploy_latest.sh / docker_build.sh), pinned by the shared vectors in
+    tests/digest_reference_vectors.py (Spec §12 hardening)."""
+
+    def test_shared_accept_vectors_fullmatch(self) -> None:
+        for ref in ACCEPT_REFS:
+            self.assertTrue(is_digest_reference(ref), f"accept vector rejected: {ref!r}")
+            validate_sandbox_image(ref, allow_dev_tag=False)
+
+    def test_shared_reject_vectors_fullmatch(self) -> None:
+        for value, reason in REJECT_REFS:
+            self.assertFalse(
+                is_digest_reference(value),
+                f"reject vector accepted ({reason}): {value!r}",
+            )
+
+    def test_shared_reject_vectors_fail_validation_without_dev_switch(self) -> None:
+        for value, reason in REJECT_REFS:
+            with self.assertRaises(ValueError, msg=f"not rejected ({reason}): {value!r}"):
+                validate_sandbox_image(value, allow_dev_tag=False)
+
+
+class ConfigImagePolicyTest(unittest.TestCase):
+    """load_config() env behavior: no implicit default, explicit dev switch."""
+
+    def test_load_config_rejects_uppercase_digest_reference(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {"AF_SANDBOX_IMAGE": f"{REPO}@sha256:{HEX64.upper()}"},
+            clear=True,
+        ):
+            with self.assertRaises(ValueError):
+                load_config()
+
+    def test_load_config_rejects_trailing_hex_after_digest(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {"AF_SANDBOX_IMAGE": f"{REPO}@sha256:{HEX64}a"},
+            clear=True,
+        ):
+            with self.assertRaises(ValueError):
+                load_config()
+
+    def test_load_config_rejects_undigested_ref_without_dev_switch(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {"AF_SANDBOX_IMAGE": "alphafrog-sandbox-runtime:latest"},
+            clear=True,
+        ):
+            with self.assertRaises(ValueError):
+                load_config()
+
+    def test_load_config_accepts_undigested_ref_only_with_explicit_dev_switch(self) -> None:
+        for switch_value in ("true", "1"):
+            with patch.dict(
+                "os.environ",
+                {
+                    "AF_SANDBOX_IMAGE": "alphafrog-sandbox-runtime:latest",
+                    "AF_SANDBOX_IMAGE_ALLOW_DEV_TAG": switch_value,
+                },
+                clear=True,
+            ):
+                config = load_config()
+            self.assertEqual(config.sandbox_image, "alphafrog-sandbox-runtime:latest")
+
+    def test_load_config_rejects_implicit_dev_switch_values(self) -> None:
+        # Only exact true/1 count; anything else stays fail-closed.
+        for switch_value in ("yes", "on", "TRUEISH", "0", ""):
+            with patch.dict(
+                "os.environ",
+                {
+                    "AF_SANDBOX_IMAGE": "alphafrog-sandbox-runtime:latest",
+                    "AF_SANDBOX_IMAGE_ALLOW_DEV_TAG": switch_value,
+                },
+                clear=True,
+            ):
+                with self.assertRaises(ValueError, msg=f"switch {switch_value!r} must not allow a bare tag"):
+                    load_config()
+
+    def test_load_config_missing_image_fails_without_implicit_default(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            with self.assertRaises(ValueError):
+                load_config()
+
+
+class ConfigDevReferenceSharedVectorsTest(unittest.TestCase):
+    """R2-4 at the config surface: the explicit dev-allow switch admits ONLY
+    syntactically VALID bare tag/references (shared vector set); the malformed
+    classes (whitespace/control chars, wrong digest lengths, uppercase
+    digests, digest-shaped-but-invalid, garbage) are rejected with the switch
+    ON as well as OFF -- the switch is NOT a blanket bypass."""
+
+    def test_valid_dev_references_accepted_only_with_switch(self) -> None:
+        for ref in VALID_DEV_REFERENCES:
+            self.assertTrue(
+                is_valid_dev_reference(ref), f"valid dev reference rejected: {ref!r}"
+            )
+            validate_sandbox_image(ref, allow_dev_tag=True)
+            with self.assertRaises(
+                ValueError, msg=f"bare reference admitted WITHOUT the switch: {ref!r}"
+            ):
+                validate_sandbox_image(ref, allow_dev_tag=False)
+
+    def test_malformed_under_dev_rejected_with_switch_on_and_off(self) -> None:
+        for value, reason in MALFORMED_UNDER_DEV_REFS:
+            self.assertFalse(
+                is_valid_dev_reference(value),
+                f"malformed dev reference passed the grammar ({reason}): {value!r}",
+            )
+            for switch in (True, False):
+                with self.assertRaises(
+                    ValueError,
+                    msg=f"not rejected ({reason}), allow_dev_tag={switch}: {value!r}",
+                ):
+                    validate_sandbox_image(value, allow_dev_tag=switch)
+
+    def test_digest_shaped_reject_refs_rejected_even_under_dev_switch(self) -> None:
+        # Anything '@'-bearing must satisfy the anchored lowercase digest
+        # grammar; malformed digest-shaped values never ride the dev switch.
+        for value, reason in REJECT_REFS:
+            if "@" not in value:
+                continue
+            with self.assertRaises(
+                ValueError,
+                msg=f"digest-shaped value admitted under dev switch ({reason}): {value!r}",
+            ):
+                validate_sandbox_image(value, allow_dev_tag=True)
+
+    def test_load_config_accepts_valid_dev_reference_with_switch(self) -> None:
+        for ref in VALID_DEV_REFERENCES:
+            with patch.dict(
+                "os.environ",
+                {"AF_SANDBOX_IMAGE": ref, "AF_SANDBOX_IMAGE_ALLOW_DEV_TAG": "true"},
+                clear=True,
+            ):
+                config = load_config()
+            self.assertEqual(config.sandbox_image, ref)
+
+    def test_load_config_rejects_malformed_ref_even_with_dev_switch(self) -> None:
+        for value, reason in MALFORMED_UNDER_DEV_REFS:
+            if "\x00" in value:
+                continue  # env-var surface cannot carry NUL bytes
+            with patch.dict(
+                "os.environ",
+                {
+                    "AF_SANDBOX_IMAGE": value,
+                    "AF_SANDBOX_IMAGE_ALLOW_DEV_TAG": "true",
+                },
+                clear=True,
+            ):
+                with self.assertRaises(
+                    ValueError, msg=f"malformed ref admitted by load_config ({reason}): {value!r}"
+                ):
+                    load_config()
+
+    def test_load_config_rejects_empty_ref_even_with_dev_switch(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {"AF_SANDBOX_IMAGE": "", "AF_SANDBOX_IMAGE_ALLOW_DEV_TAG": "true"},
+            clear=True,
+        ):
+            with self.assertRaises(ValueError):
+                load_config()
 
 
 if __name__ == "__main__":

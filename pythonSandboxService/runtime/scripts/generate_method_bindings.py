@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 # === work-package-B (ccqwen) ===
-"""Build-time generator: canonical method bindings -> _generated/method_specs.json.
+"""Build-time generator: canonical method bindings -> _generated/ build products.
 
-Spec §6 / codex f1ed6ea9 (+ index.json consumption, codex 97ea103a): the
-alphafrog_finance distribution must ship its method identity triples
-(methodId -> {methodVersion, specDigest}) as a build product derived from
-work package A's canonical generated JSON. Hand-copied method triples are
-forbidden; this tool is the ONLY sanctioned path from A's generated
-resources into the runtime package.
+Spec §6 / codex f1ed6ea9 (+ index.json consumption, codex 97ea103a; registry
+swap, codex 0c147646/97ea103a): the alphafrog_finance distribution must ship
+its method identity triples (methodId -> {methodVersion, specDigest}) and its
+docstring/call-sample documents as build products derived from work package
+A's canonical generated JSON. Hand-copied method triples are forbidden; this
+tool is the ONLY sanctioned path from A's generated resources into the runtime
+package.
 
 This is a build tool. It is stdlib-only, runs before pip-install of the
 runtime distribution (the image build invokes it first), and is never
@@ -15,6 +16,9 @@ imported by the alphafrog_finance runtime package.
 
 CLI:
     generate_method_bindings.py --canonical-dir <dir> --out <method_specs.json>
+        [--docstrings-out <docstrings.py>]
+        [--call-samples-out <call_samples.py>]
+        [--package-version <version>]
 
 Inputs (<dir> = A's method-specs directory, e.g.
 agentToolsShared/target/generated-resources/finance/method-specs/v1):
@@ -35,8 +39,24 @@ agentToolsShared/target/generated-resources/finance/method-specs/v1):
                                parameters, outputs, libraryBinding,
                                resolverHints, sourceRefs).
 
+Outputs:
+  * --out method_specs.json -- {"methods": {<methodId>: {"methodVersion",
+                               "specDigest"}}}; the shape loaded by
+                               alphafrog_finance.reporting._method_specs().
+  * --docstrings-out        -- importable module embedding ONE JSON document
+                               {"methods": {<methodId>: {"displayName",
+                               "definition", "calculationExpression",
+                               "parameterTable", "binding"}}} via json.loads.
+  * --call-samples-out      -- importable module embedding ONE JSON document
+                               {"methods": {<methodId>: {"function",
+                               "callSample", "narrativeTemplate"}}} via
+                               json.loads.
+  The two module outputs are OPTIONAL; when omitted the run is byte-identical
+  to the historical method_specs.json-only behaviour. When given, all three
+  outputs are written all-or-nothing after ALL validation passes.
+
 Gates (any violation fails CLOSED: non-zero exit, diagnostic on stderr, and
-no output file is ever written -- the document is built fully in memory and
+no output file is ever written -- every document is built fully in memory and
 written exactly once at the end):
   * index.json must exist and parse to a JSON array; every entry must be a
     JSON object with EXACTLY the four keys above (missing or extra keys
@@ -62,13 +82,23 @@ written exactly once at the end):
     from the catalog, catalog entry with no spec file, or any mismatch
     fails);
   * duplicate methodId across spec files or catalog entries fails;
-  * unknown/extra top-level shape surprises fail.
+  * unknown/extra top-level shape surprises fail;
+  * ALWAYS: every spec file's libraryBinding must be a JSON object with
+    EXACTLY the keys {apiCompatRange, function, package}; package must equal
+    "alphafrog_finance" verbatim; function must match ^[a-z_][a-z0-9_]*$;
+    apiCompatRange must parse as ">=<lower>,<<upper>" numeric-tuple version
+    bounds (any other grammar fails); duplicate function across specs fails.
+    When --package-version is supplied it must lie inside every binding's
+    apiCompatRange (None => the range-vs-version check is skipped, shape
+    checks still run);
+  * when the docstring/call-sample outputs are requested, every spec must
+    carry a displayName/definition string and a single-entry conventions
+    object whose entry is a JSON object (the single convention entry supplies
+    calculationExpression/narrativeTemplate, empty string when absent).
 
-Output (--out): {"methods": {<methodId>: {"methodVersion": <version>,
-"specDigest": <specDigest>}}} -- exactly the shape loaded by
-alphafrog_finance.reporting._method_specs() -- serialized deterministically
-as json.dumps(payload, ensure_ascii=False, sort_keys=True,
-separators=(",", ":")) plus a single trailing newline.
+Byte contract for every output (build reproducibility): UTF-8,
+ensure_ascii=False, sort_keys=True, compact separators (",", ":") for the
+embedded JSON, plus a single trailing newline.
 """
 import argparse
 import json
@@ -86,6 +116,10 @@ _REQUIRED_METHOD_IDS = (
     "finance.risk.annualized_volatility",
     "finance.risk.sharpe_ratio",
 )
+
+# The only package the generated bindings may target (Spec §6). This is the
+# libraryBinding.package value that must appear VERBATIM in every spec.
+_PACKAGE_NAME = "alphafrog_finance"
 
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
@@ -111,6 +145,20 @@ _SPEC_TOP_LEVEL_KEYS = frozenset(
 # index.json entry shape (codex 97ea103a): EXACTLY these four keys. Any
 # missing or extra key is a shape surprise and fails closed.
 _INDEX_ENTRY_KEYS = frozenset({"methodId", "resourcePath", "specDigest", "version"})
+
+# libraryBinding shape (Spec §6 registry swap): EXACTLY these three keys. Any
+# missing or extra key is a shape surprise and fails closed.
+_BINDING_KEYS = frozenset({"apiCompatRange", "function", "package"})
+
+# libraryBinding.function must be a valid snake_case public attribute name.
+_FUNCTION_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
+
+# apiCompatRange grammar: ">=<lower>,<<upper>" (e.g. ">=1.0.0,<2.0.0").
+_API_RANGE_RE = re.compile(r"^>=([^,]+),<(.+)$")
+
+# Parameter-table base keys are always present; these optional keys are copied
+# VERBATIM only when present in the canonical spec.
+_PARAMETER_OPTIONAL_KEYS = ("minimum", "default", "enum", "items")
 
 # resourcePath must stay inside the canonical dir: split on both separator
 # styles so backslash-based traversal cannot sneak past on POSIX hosts.
@@ -250,11 +298,13 @@ def _load_index(canonical_dir):
 
 
 def _load_specs(canonical_dir, index):
-    """methodId -> {"version", "specDigest", "file"} resolved via index.json.
+    """methodId -> {"version", "specDigest", "file", "payload"}.
 
     Every index entry must resolve to an existing spec file inside the
     canonical directory whose identity triple equals the entry's values
-    VERBATIM. Returns the spec map plus the set of referenced file names.
+    VERBATIM. The FULL spec payload is retained so the libraryBinding and
+    docstring/call-sample documents can be derived from it. Returns the spec
+    map plus the set of referenced file names.
     """
     specs = {}
     referenced = set()
@@ -304,6 +354,7 @@ def _load_specs(canonical_dir, index):
             "version": spec_version,
             "specDigest": spec_digest,
             "file": name,
+            "payload": payload,
         }
     return specs, referenced
 
@@ -384,7 +435,280 @@ def _cross_check_index(index, catalog):
             )
 
 
-def generate(canonical_dir, out_path):
+# --- libraryBinding validation (Spec §6 registry swap) ---------------------
+
+
+def _parse_version_tuple(where, text, label):
+    """Parse a dot-separated numeric version into an int tuple (fail closed)."""
+    if not isinstance(text, str) or not text:
+        _fail(f"{where}: {label} must be a non-empty string, got {text!r}")
+    parts = text.split(".")
+    numbers = []
+    for part in parts:
+        if not part.isdigit():
+            _fail(
+                f"{where}: {label} {text!r} is not a dot-separated numeric "
+                "version"
+            )
+        numbers.append(int(part))
+    return tuple(numbers)
+
+
+def _parse_api_compat_range(where, api_compat_range):
+    """Parse ">=<lower>,<<upper>" into (lower_tuple, upper_tuple)."""
+    if not isinstance(api_compat_range, str) or not api_compat_range:
+        _fail(
+            f"{where}: apiCompatRange must be a non-empty string, got "
+            f"{api_compat_range!r}"
+        )
+    match = _API_RANGE_RE.match(api_compat_range)
+    if match is None:
+        _fail(
+            f"{where}: apiCompatRange {api_compat_range!r} must match the "
+            "grammar '>=<lower>,<<upper>' (e.g. '>=1.0.0,<2.0.0')"
+        )
+    lower = _parse_version_tuple(
+        where, match.group(1), "apiCompatRange lower bound"
+    )
+    upper = _parse_version_tuple(
+        where, match.group(2), "apiCompatRange upper bound"
+    )
+    return lower, upper
+
+
+def _validate_library_binding(where, payload):
+    """Validate one spec's libraryBinding; return the binding object."""
+    binding = payload.get("libraryBinding")
+    if not isinstance(binding, dict):
+        _fail(f"{where}: libraryBinding must be a JSON object")
+    missing = sorted(_BINDING_KEYS.difference(binding))
+    if missing:
+        _fail(f"{where}: libraryBinding is missing key(s) {missing!r}")
+    unknown = sorted(set(binding).difference(_BINDING_KEYS))
+    if unknown:
+        _fail(f"{where}: libraryBinding has unknown key(s) {unknown!r}")
+    package = binding.get("package")
+    if package != _PACKAGE_NAME:
+        _fail(
+            f"{where}: libraryBinding.package must be {_PACKAGE_NAME!r}, got "
+            f"{package!r}"
+        )
+    function = binding.get("function")
+    if not isinstance(function, str) or _FUNCTION_RE.match(function) is None:
+        _fail(
+            f"{where}: libraryBinding.function must match "
+            f"^[a-z_][a-z0-9_]*$, got {function!r}"
+        )
+    _parse_api_compat_range(where, binding.get("apiCompatRange"))
+    return binding
+
+
+def _validate_library_bindings(specs):
+    """Validate every spec's libraryBinding and reject duplicate functions."""
+    functions = {}
+    for method_id in sorted(specs):
+        where = specs[method_id]["file"]
+        binding = _validate_library_binding(where, specs[method_id]["payload"])
+        function = binding["function"]
+        if function in functions:
+            _fail(
+                f"duplicate libraryBinding.function {function!r} across "
+                f"{functions[function]!r} and {method_id!r}"
+            )
+        functions[function] = method_id
+
+
+def _check_package_version(specs, package_version):
+    """Every binding's apiCompatRange must include the package version."""
+    for method_id in sorted(specs):
+        where = specs[method_id]["file"]
+        binding = specs[method_id]["payload"]["libraryBinding"]
+        api_compat_range = binding["apiCompatRange"]
+        lower, upper = _parse_api_compat_range(where, api_compat_range)
+        version = _parse_version_tuple(where, package_version, "package version")
+        if not (lower <= version < upper):
+            _fail(
+                f"{where}: package version {package_version!r} is outside "
+                f"libraryBinding.apiCompatRange {api_compat_range!r}"
+            )
+
+
+# --- docstring / call-sample documents (optional outputs) ------------------
+
+
+def _require_string(where, payload, key):
+    value = payload.get(key)
+    if not isinstance(value, str):
+        _fail(f"{where}: {key} must be a string, got {value!r}")
+    return value
+
+
+def _single_convention_entry(where, payload):
+    """Return the single conventions entry ({} when conventions is absent).
+
+    When present, conventions must be a JSON object with EXACTLY one entry
+    whose value is a JSON object: the docstring/call-sample documents are
+    defined against that single convention entry, so any other shape is a
+    fail-closed inconsistency.
+    """
+    conventions = payload.get("conventions")
+    if conventions is None:
+        return {}
+    if not isinstance(conventions, dict):
+        _fail(f"{where}: conventions must be a JSON object")
+    if len(conventions) != 1:
+        _fail(
+            f"{where}: conventions must contain exactly one entry, got "
+            f"{len(conventions)}"
+        )
+    (entry,) = conventions.values()
+    if not isinstance(entry, dict):
+        _fail(f"{where}: the single conventions entry must be a JSON object")
+    return entry
+
+
+def _build_parameter_table(where, payload):
+    """parameterTable array preserving the spec's declaration order."""
+    parameters = payload.get("parameters")
+    if parameters is None:
+        return []
+    if not isinstance(parameters, dict):
+        _fail(f"{where}: parameters must be a JSON object")
+    table = []
+    for name, spec in parameters.items():
+        if not isinstance(spec, dict):
+            _fail(f"{where}: parameter {name!r} must be a JSON object")
+        required = spec.get("required")
+        if not isinstance(required, bool):
+            _fail(
+                f"{where}: parameter {name!r} 'required' must be a boolean, "
+                f"got {required!r}"
+            )
+        param_type = spec.get("type")
+        if not isinstance(param_type, str) or not param_type:
+            _fail(
+                f"{where}: parameter {name!r} 'type' must be a non-empty "
+                f"string, got {param_type!r}"
+            )
+        meaning = spec.get("meaning")
+        if not isinstance(meaning, str) or not meaning:
+            _fail(
+                f"{where}: parameter {name!r} 'meaning' must be a non-empty "
+                f"string, got {meaning!r}"
+            )
+        entry = {
+            "name": name,
+            "required": required,
+            "type": param_type,
+            "meaning": meaning,
+        }
+        for optional_key in _PARAMETER_OPTIONAL_KEYS:
+            if optional_key in spec:
+                entry[optional_key] = spec[optional_key]
+        table.append(entry)
+    return table
+
+
+def _build_docstrings_payload(specs):
+    """{"methods": {methodId: {displayName, definition, calculationExpression,
+    parameterTable, binding}}}."""
+    methods = {}
+    for method_id in sorted(specs):
+        where = specs[method_id]["file"]
+        payload = specs[method_id]["payload"]
+        convention = _single_convention_entry(where, payload)
+        calculation_expression = convention.get("calculationExpression", "")
+        if not isinstance(calculation_expression, str):
+            _fail(
+                f"{where}: conventions calculationExpression must be a "
+                f"string, got {calculation_expression!r}"
+            )
+        methods[method_id] = {
+            "displayName": _require_string(where, payload, "displayName"),
+            "definition": _require_string(where, payload, "definition"),
+            "calculationExpression": calculation_expression,
+            "parameterTable": _build_parameter_table(where, payload),
+            "binding": payload["libraryBinding"],
+        }
+    return {"methods": methods}
+
+
+def _build_call_samples_payload(specs):
+    """{"methods": {methodId: {function, callSample, narrativeTemplate}}}."""
+    methods = {}
+    for method_id in sorted(specs):
+        where = specs[method_id]["file"]
+        payload = specs[method_id]["payload"]
+        convention = _single_convention_entry(where, payload)
+        narrative_template = convention.get("narrativeTemplate", "")
+        if not isinstance(narrative_template, str):
+            _fail(
+                f"{where}: conventions narrativeTemplate must be a string, "
+                f"got {narrative_template!r}"
+            )
+        function = payload["libraryBinding"]["function"]
+        parameters = payload.get("parameters") or {}
+        # Canonical JSON carries NO example values: every placeholder is the
+        # literal ``...`` and no value is invented.
+        arguments = ", ".join(f"{name}=..." for name in parameters)
+        methods[method_id] = {
+            "function": function,
+            "callSample": f"{function}({arguments})",
+            "narrativeTemplate": narrative_template,
+        }
+    return {"methods": methods}
+
+
+def _canonical_json(payload):
+    # Byte contract (build reproducibility): UTF-8, ensure_ascii=False,
+    # sort_keys=True, compact separators.
+    return json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+
+
+def _render_generated_module(purpose, payload):
+    """Render an importable module embedding ONE JSON document via json.loads.
+
+    The JSON text is embedded as a Python string literal built with repr(),
+    which is a total, deterministic escaping for any embedded Chinese text or
+    quoting, so the module is always valid Python.
+    """
+    json_text = _canonical_json(payload)
+    literal = repr(json_text)
+    lines = [
+        "# === work-package-B (ccqwen) ===",
+        '"""GENERATED by runtime/scripts/generate_method_bindings.py — DO NOT EDIT.',
+        "",
+        f"Build product: alphafrog_finance/_generated {purpose}. The single",
+        "DOCUMENT below is the compact canonical JSON (ensure_ascii=False,",
+        'sort_keys=True, separators=(",", ":")) embedded via json.loads. The',
+        "module is byte-deterministic for a given canonical input set; any",
+        "hand edit is forbidden (Spec §6).",
+        '"""',
+        "import json",
+        "",
+        f"DOCUMENT = json.loads({literal})",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _write_text(path, text):
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+
+
+def generate(
+    canonical_dir,
+    out_path,
+    docstrings_out=None,
+    call_samples_out=None,
+    package_version=None,
+):
     if not os.path.isdir(canonical_dir):
         _fail(f"canonical dir does not exist or is not a directory: {canonical_dir}")
     catalog = _load_catalog(canonical_dir)
@@ -399,6 +723,11 @@ def generate(canonical_dir, out_path):
             "frozen method ids missing from canonical dir (Spec §6 requires "
             f">=3 identities): {missing!r}"
         )
+    # Spec §6 registry swap: ALWAYS validate every libraryBinding, even when
+    # only method_specs.json is requested.
+    _validate_library_bindings(specs)
+    if package_version is not None:
+        _check_package_version(specs, package_version)
     payload = {
         "methods": {
             method_id: {
@@ -408,17 +737,22 @@ def generate(canonical_dir, out_path):
             for method_id in sorted(specs)
         }
     }
-    # Byte contract (build reproducibility): UTF-8, ensure_ascii=False,
-    # sort_keys=True, compact separators, single trailing newline.
-    document = (
-        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        + "\n"
-    )
-    out_parent = os.path.dirname(os.path.abspath(out_path))
-    if out_parent:
-        os.makedirs(out_parent, exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as fh:
-        fh.write(document)
+    # Build EVERY requested document fully in memory before writing anything
+    # (all-or-nothing; no partial artifact on any failure).
+    documents = [(out_path, _canonical_json(payload) + "\n")]
+    if docstrings_out is not None:
+        documents.append(
+            (docstrings_out, _render_generated_module("docstrings", _build_docstrings_payload(specs)))
+        )
+    if call_samples_out is not None:
+        documents.append(
+            (
+                call_samples_out,
+                _render_generated_module("call samples", _build_call_samples_payload(specs)),
+            )
+        )
+    for path, text in documents:
+        _write_text(path, text)
     return payload
 
 
@@ -426,12 +760,13 @@ def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="generate_method_bindings.py",
         description=(
-            "Generate alphafrog_finance/_generated/method_specs.json from work "
+            "Generate alphafrog_finance/_generated build products from work "
             "package A's canonical method-spec JSON (Spec §6; hand-copied "
             "method triples are forbidden). Consumes index.json, "
             "resolver-catalog.json, and the per-method spec files with exact "
-            "bidirectional coverage. Fails closed on any missing, "
-            "mismatched, duplicated, or malformed input, writing nothing."
+            "bidirectional coverage, and validates every libraryBinding. "
+            "Fails closed on any missing, mismatched, duplicated, or "
+            "malformed input, writing nothing."
         ),
     )
     parser.add_argument(
@@ -448,9 +783,40 @@ def main(argv=None):
         required=True,
         help="Path of the method_specs.json to write (built in memory first).",
     )
+    parser.add_argument(
+        "--docstrings-out",
+        default=None,
+        help=(
+            "Optional path of the docstrings.py module to write (embedded "
+            "canonical JSON). Omitted => not produced."
+        ),
+    )
+    parser.add_argument(
+        "--call-samples-out",
+        default=None,
+        help=(
+            "Optional path of the call_samples.py module to write (embedded "
+            "canonical JSON). Omitted => not produced."
+        ),
+    )
+    parser.add_argument(
+        "--package-version",
+        default=None,
+        help=(
+            "Optional package version to check against every binding's "
+            "apiCompatRange (e.g. 1.0.0). Omitted => the range-vs-version "
+            "check is skipped; libraryBinding shape checks still run."
+        ),
+    )
     args = parser.parse_args(argv)
     try:
-        payload = generate(args.canonical_dir, args.out)
+        payload = generate(
+            args.canonical_dir,
+            args.out,
+            docstrings_out=args.docstrings_out,
+            call_samples_out=args.call_samples_out,
+            package_version=args.package_version,
+        )
     except SpecError as exc:
         print(f"generate_method_bindings: error: {exc}", file=sys.stderr)
         return 2

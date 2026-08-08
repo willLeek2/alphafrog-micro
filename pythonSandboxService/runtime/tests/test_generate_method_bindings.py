@@ -15,6 +15,7 @@ Run from pythonSandboxService/:
 """
 import hashlib
 import importlib
+import importlib.util
 import json
 import os
 import shutil
@@ -62,6 +63,13 @@ _FROZEN_SPEC_DIGESTS = {
     ),
 }
 
+# Generator output byte pin (build reproducibility): running the current
+# generator over the committed fixture dir must produce a method_specs.json
+# with EXACTLY this sha256. Any drift is a regression.
+_FROZEN_METHOD_SPECS_SHA256 = (
+    "1d3ef8ad56b42ec9fd15715389e5b3097e4469f7c8d1571ecd2bbb2d9f80ec6d"
+)
+
 # Env gate for the live e2e run against A's final generated directory.
 _LIVE_DIR_ENV = "AF_A_FINAL_GENERATED_DIR"
 
@@ -92,6 +100,26 @@ def _expected_methods_from_fixtures():
             "specDigest": spec["specDigest"],
         }
     return methods
+
+
+def _load_module(path, name):
+    """Load a generated .py module by path (it has no package context)."""
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _fixture_spec_payloads():
+    """methodId -> full canonical spec payload, from the committed fixtures."""
+    payloads = {}
+    for name in sorted(os.listdir(_FIXTURE_DIR)):
+        if not name.endswith(".json") or name in _RESERVED_NAMES:
+            continue
+        with open(os.path.join(_FIXTURE_DIR, name), encoding="utf-8") as fh:
+            spec = json.load(fh)
+        payloads[spec["methodId"]] = spec
+    return payloads
 
 
 class GenerateMethodBindingsTests(unittest.TestCase):
@@ -147,6 +175,13 @@ class GenerateMethodBindingsTests(unittest.TestCase):
             self.assertIn(method_id, payload["methods"])
             self.assertEqual(payload["methods"][method_id]["specDigest"], digest)
             self.assertEqual(payload["methods"][method_id]["methodVersion"], "1.0.0")
+
+    def test_method_specs_json_byte_pin(self):
+        # The committed fixture must reproduce method_specs.json EXACTLY, byte
+        # for byte. This pins the generator output against silent drift.
+        result, out = self._generate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(_sha256_file(out), _FROZEN_METHOD_SPECS_SHA256)
 
     def test_two_consecutive_runs_are_sha256_identical(self):
         first, out1 = self._generate(out_name="run1.json")
@@ -488,6 +523,252 @@ class GenerateMethodBindingsFailureTests(unittest.TestCase):
         self.assertIn("has no corresponding index.json entry", result.stderr)
 
 
+class GenerateLibraryBindingGateTests(unittest.TestCase):
+    """Spec §6 registry swap: every spec's libraryBinding is ALWAYS validated.
+
+    Each mutation exits non-zero and writes NO output (all-or-nothing), with
+    the three requested outputs asserted absent.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="gen-lib-binding-gate-")
+        self.addCleanup(self._tmp.cleanup)
+        self.tmpdir = self._tmp.name
+        self.out = os.path.join(self.tmpdir, "method_specs.json")
+        self.doc = os.path.join(self.tmpdir, "docstrings.py")
+        self.cs = os.path.join(self.tmpdir, "call_samples.py")
+
+    def _mutated_copy(self, mutate):
+        dst = os.path.join(self.tmpdir, "canonical")
+        shutil.copytree(_FIXTURE_DIR, dst)
+        mutate(dst)
+        return dst
+
+    @staticmethod
+    def _mutate_binding(directory, name, mutate):
+        path = os.path.join(directory, name)
+        with open(path, encoding="utf-8") as fh:
+            spec = json.load(fh)
+        mutate(spec["libraryBinding"])
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(spec, fh, ensure_ascii=False, indent=2)
+
+    def _assert_fails_closed(self, canonical_dir, extra_args=()):
+        result = _run_generator(
+            [
+                "--canonical-dir",
+                canonical_dir,
+                "--out",
+                self.out,
+                "--docstrings-out",
+                self.doc,
+                "--call-samples-out",
+                self.cs,
+            ]
+            + list(extra_args)
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("error", result.stderr)
+        for path in (self.out, self.doc, self.cs):
+            self.assertFalse(
+                os.path.exists(path),
+                f"generator must not leave {os.path.basename(path)} behind",
+            )
+        return result
+
+    def test_binding_missing_key_fails(self):
+        def mutate(dst):
+            def drop(binding):
+                del binding["package"]
+
+            self._mutate_binding(dst, "cagr.json", drop)
+
+        result = self._assert_fails_closed(self._mutated_copy(mutate))
+        self.assertIn("missing key(s)", result.stderr)
+
+    def test_binding_extra_key_fails(self):
+        def mutate(dst):
+            def add(binding):
+                binding["extra"] = True
+
+            self._mutate_binding(dst, "cagr.json", add)
+
+        result = self._assert_fails_closed(self._mutated_copy(mutate))
+        self.assertIn("unknown key(s)", result.stderr)
+
+    def test_binding_wrong_package_fails(self):
+        def mutate(dst):
+            def wrong(binding):
+                binding["package"] = "some_other_package"
+
+            self._mutate_binding(dst, "cagr.json", wrong)
+
+        result = self._assert_fails_closed(self._mutated_copy(mutate))
+        self.assertIn("package", result.stderr)
+
+    def test_binding_malformed_function_fails(self):
+        def mutate(dst):
+            def bad(binding):
+                binding["function"] = "BadName"
+
+            self._mutate_binding(dst, "cagr.json", bad)
+
+        result = self._assert_fails_closed(self._mutated_copy(mutate))
+        self.assertIn("function", result.stderr)
+
+    def test_binding_unparseable_api_compat_range_fails(self):
+        def mutate(dst):
+            def bad(binding):
+                binding["apiCompatRange"] = "~1.0.0"
+
+            self._mutate_binding(dst, "cagr.json", bad)
+
+        result = self._assert_fails_closed(self._mutated_copy(mutate))
+        self.assertIn("apiCompatRange", result.stderr)
+
+    def test_binding_range_excluding_package_version_fails(self):
+        def mutate(dst):
+            def narrow(binding):
+                binding["apiCompatRange"] = ">=2.0.0,<3.0.0"
+
+            self._mutate_binding(dst, "cagr.json", narrow)
+
+        result = self._assert_fails_closed(
+            self._mutated_copy(mutate), extra_args=["--package-version", "1.0.0"]
+        )
+        self.assertIn("outside", result.stderr)
+
+    def test_binding_range_check_skipped_without_package_version(self):
+        # No --package-version => the range-vs-version check is skipped (the
+        # range shape is still valid), so method_specs.json is written.
+        def mutate(dst):
+            def narrow(binding):
+                binding["apiCompatRange"] = ">=2.0.0,<3.0.0"
+
+            self._mutate_binding(dst, "cagr.json", narrow)
+
+        canonical = self._mutated_copy(mutate)
+        result = _run_generator(["--canonical-dir", canonical, "--out", self.out])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(os.path.exists(self.out))
+
+    def test_binding_duplicate_function_across_specs_fails(self):
+        def mutate(dst):
+            def dup(binding):
+                binding["function"] = "cagr"  # already bound by cagr.json
+
+            self._mutate_binding(dst, "annualized_volatility.json", dup)
+
+        result = self._assert_fails_closed(self._mutated_copy(mutate))
+        self.assertIn("duplicate", result.stderr)
+
+
+class GenerateDocstringsCallSamplesTests(unittest.TestCase):
+    """Determinism and payload-correctness of the optional docstrings.py and
+    call_samples.py outputs (Spec §6 registry swap)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="gen-doc-call-samples-")
+        self.addCleanup(self._tmp.cleanup)
+        self.tmpdir = self._tmp.name
+
+    def _generate_all(self, suffix=""):
+        out = os.path.join(self.tmpdir, f"method_specs{suffix}.json")
+        doc = os.path.join(self.tmpdir, f"docstrings{suffix}.py")
+        cs = os.path.join(self.tmpdir, f"call_samples{suffix}.py")
+        result = _run_generator(
+            [
+                "--canonical-dir",
+                _FIXTURE_DIR,
+                "--out",
+                out,
+                "--docstrings-out",
+                doc,
+                "--call-samples-out",
+                cs,
+            ]
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return out, doc, cs
+
+    def test_new_outputs_two_runs_byte_identical(self):
+        _, doc1, cs1 = self._generate_all("_run1")
+        _, doc2, cs2 = self._generate_all("_run2")
+        self.assertEqual(_sha256_file(doc1), _sha256_file(doc2))
+        self.assertEqual(_sha256_file(cs1), _sha256_file(cs2))
+
+    def test_docstrings_importable_and_payload_correct(self):
+        _, doc, _ = self._generate_all()
+        module = _load_module(doc, "gen_docstrings_under_test")
+        payload = module.DOCUMENT
+        fixtures = _fixture_spec_payloads()
+        self.assertEqual(set(payload["methods"]), _FROZEN_IDS)
+        for method_id, spec in fixtures.items():
+            with self.subTest(method_id=method_id):
+                entry = payload["methods"][method_id]
+                self.assertEqual(entry["displayName"], spec["displayName"])
+                self.assertEqual(entry["definition"], spec["definition"])
+                self.assertEqual(entry["binding"], spec["libraryBinding"])
+                # parameterTable preserves the spec's declaration order.
+                names = [e["name"] for e in entry["parameterTable"]]
+                self.assertEqual(names, list(spec["parameters"].keys()))
+                for entry_param in entry["parameterTable"]:
+                    spec_param = spec["parameters"][entry_param["name"]]
+                    expected_keys = {"name", "required", "type", "meaning"}
+                    for optional in ("minimum", "default", "enum", "items"):
+                        if optional in spec_param:
+                            expected_keys.add(optional)
+                    self.assertEqual(set(entry_param), expected_keys)
+                    self.assertEqual(entry_param["required"], spec_param["required"])
+                    self.assertEqual(entry_param["type"], spec_param["type"])
+                    self.assertEqual(entry_param["meaning"], spec_param["meaning"])
+                # calculationExpression: only cagr's convention carries one.
+                (convention,) = spec["conventions"].values()
+                self.assertEqual(
+                    entry["calculationExpression"],
+                    convention.get("calculationExpression", ""),
+                )
+
+    def test_call_samples_importable_and_payload_correct(self):
+        _, _, cs = self._generate_all()
+        module = _load_module(cs, "gen_call_samples_under_test")
+        payload = module.DOCUMENT
+        fixtures = _fixture_spec_payloads()
+        self.assertEqual(set(payload["methods"]), _FROZEN_IDS)
+        for method_id, spec in fixtures.items():
+            with self.subTest(method_id=method_id):
+                entry = payload["methods"][method_id]
+                function = spec["libraryBinding"]["function"]
+                self.assertEqual(entry["function"], function)
+                expected_args = ", ".join(
+                    f"{name}=..." for name in spec["parameters"]
+                )
+                self.assertEqual(entry["callSample"], f"{function}({expected_args})")
+                (convention,) = spec["conventions"].values()
+                self.assertEqual(
+                    entry["narrativeTemplate"],
+                    convention.get("narrativeTemplate", ""),
+                )
+
+    def test_method_specs_bytes_unaffected_by_new_outputs(self):
+        # Requesting the new outputs must not change method_specs.json bytes.
+        out_plain = os.path.join(self.tmpdir, "plain.json")
+        result = _run_generator(
+            ["--canonical-dir", _FIXTURE_DIR, "--out", out_plain]
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out_with, _, _ = self._generate_all("_with")
+        self.assertEqual(_sha256_file(out_plain), _sha256_file(out_with))
+        self.assertEqual(_sha256_file(out_with), _FROZEN_METHOD_SPECS_SHA256)
+
+    def test_help_lists_new_options(self):
+        result = _run_generator(["--help"])
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("--docstrings-out", result.stdout)
+        self.assertIn("--call-samples-out", result.stdout)
+        self.assertIn("--package-version", result.stdout)
+
+
 class TestPackagingMetadata(unittest.TestCase):
     """pyproject.toml exists and pins the real distribution identity."""
 
@@ -532,13 +813,35 @@ class LiveAFinalGeneratedDirTests(unittest.TestCase):
     def test_live_directory_matches_fixture_byte_for_byte(self):
         live_dir = os.environ[_LIVE_DIR_ENV]
         live_out = os.path.join(self.tmpdir, "live_method_specs.json")
+        live_doc = os.path.join(self.tmpdir, "live_docstrings.py")
+        live_cs = os.path.join(self.tmpdir, "live_call_samples.py")
         fixture_out = os.path.join(self.tmpdir, "fixture_method_specs.json")
+        fixture_doc = os.path.join(self.tmpdir, "fixture_docstrings.py")
+        fixture_cs = os.path.join(self.tmpdir, "fixture_call_samples.py")
         live_result = _run_generator(
-            ["--canonical-dir", live_dir, "--out", live_out]
+            [
+                "--canonical-dir",
+                live_dir,
+                "--out",
+                live_out,
+                "--docstrings-out",
+                live_doc,
+                "--call-samples-out",
+                live_cs,
+            ]
         )
         self.assertEqual(live_result.returncode, 0, live_result.stderr)
         fixture_result = _run_generator(
-            ["--canonical-dir", _FIXTURE_DIR, "--out", fixture_out]
+            [
+                "--canonical-dir",
+                _FIXTURE_DIR,
+                "--out",
+                fixture_out,
+                "--docstrings-out",
+                fixture_doc,
+                "--call-samples-out",
+                fixture_cs,
+            ]
         )
         self.assertEqual(fixture_result.returncode, 0, fixture_result.stderr)
         with open(live_out, encoding="utf-8") as fh:
@@ -546,6 +849,9 @@ class LiveAFinalGeneratedDirTests(unittest.TestCase):
         self.assertEqual(set(payload["methods"]), _FROZEN_IDS)
         self.assertEqual(len(payload["methods"]), 3)
         self.assertEqual(_sha256_file(live_out), _sha256_file(fixture_out))
+        # The two new outputs must ALSO be byte-identical live vs fixture.
+        self.assertEqual(_sha256_file(live_doc), _sha256_file(fixture_doc))
+        self.assertEqual(_sha256_file(live_cs), _sha256_file(fixture_cs))
 
 
 if __name__ == "__main__":

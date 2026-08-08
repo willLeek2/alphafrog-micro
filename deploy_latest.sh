@@ -253,6 +253,199 @@ fi
 
 echo "=== Selected services: ${SELECTED[*]} ==="
 
+# MethodSpec V5 §12: 部署目标运行时镜像引用必须是 sha256 摘要引用（生产）。
+# 裸标签仅在显式 AF_SANDBOX_IMAGE_ALLOW_DEV_TAG=true/1 时允许，且开发开关只放行
+# 【语法合法】的裸标签/引用（round-2 R2-4）：空值、空白/控制字符、大写仓库名、
+# 非法 digest 形状一律拒绝；绝不静默退回 latest。
+# 摘要引用语义为「全锚定、仅小写」：必须恰好是 repo/name@sha256:<64位小写hex>，
+# 不允许任何大写 hex、长度偏差或前后多余内容。校验函数来自共享脚本
+# pythonSandboxService/scripts/af_digest_reference.sh（与 app/config.py、
+# scripts/build_runtime_manifest.py 语义完全一致，tests/digest_reference_vectors.py
+# 用同一组 accept/reject 向量固定）。
+# 发布门禁（fail-closed）目标绑定（round-2 R2-3）：
+#   1) 构建产物 .runtime-build/image-digest-mapping.json 必须存在且可解析；
+#   2) 所选 AF_SANDBOX_IMAGE 经 docker inspect 解析出不可变 image ID；
+#   3) 恰好一个映射条目与所选目标对应（条目键 == 不可变 ID，或条目记录的
+#      imageRef == 所选引用）；
+#   4) 该条目必须绑定同一目标：其记录的不可变 image ID（条目键）== inspect
+#      解析出的 ID（无法证明同一性即拒绝）；
+#   5) 条目的 base/lock/library/SBOM/MethodSpec 摘要必须全部为合法
+#      非占位符 sha256 值且 releasable=true。
+#   唯一豁免：显式开关 AF_SANDBOX_ALLOW_INCOMPLETE_DEV_BUILD=true/1 放宽 (5)
+#   （releasable/占位符），(1)-(4) 的目标绑定永不放宽（从不隐式开启）。
+if is_in_list "python-sandbox-service" "${SELECTED[@]}" || is_in_list "python-sandbox-runtime" "${SELECTED[@]}"; then
+  source "$ROOT_DIR/pythonSandboxService/scripts/af_digest_reference.sh"
+
+  DEPLOY_SANDBOX_IMAGE="${AF_SANDBOX_IMAGE:-}"
+  DEPLOY_DEV_ALLOW="${AF_SANDBOX_IMAGE_ALLOW_DEV_TAG:-}"
+  DEPLOY_INCOMPLETE_DEV_ALLOW="${AF_SANDBOX_ALLOW_INCOMPLETE_DEV_BUILD:-}"
+  # compose 自动读取 .env；进程环境未设置时回退解析 .env（与 compose 取值保持一致）
+  if [[ -f "$ROOT_DIR/.env" ]]; then
+    if [[ -z "$DEPLOY_SANDBOX_IMAGE" ]]; then
+      DEPLOY_SANDBOX_IMAGE="$(grep -E '^AF_SANDBOX_IMAGE=' "$ROOT_DIR/.env" | tail -n 1 | cut -d= -f2- || true)"
+    fi
+    if [[ -z "$DEPLOY_DEV_ALLOW" ]]; then
+      DEPLOY_DEV_ALLOW="$(grep -E '^AF_SANDBOX_IMAGE_ALLOW_DEV_TAG=' "$ROOT_DIR/.env" | tail -n 1 | cut -d= -f2- || true)"
+    fi
+    if [[ -z "$DEPLOY_INCOMPLETE_DEV_ALLOW" ]]; then
+      DEPLOY_INCOMPLETE_DEV_ALLOW="$(grep -E '^AF_SANDBOX_ALLOW_INCOMPLETE_DEV_BUILD=' "$ROOT_DIR/.env" | tail -n 1 | cut -d= -f2- || true)"
+    fi
+  fi
+  case "$DEPLOY_DEV_ALLOW" in
+    true|TRUE|True|1) DEPLOY_DEV_ALLOW=1 ;;
+    *) DEPLOY_DEV_ALLOW=0 ;;
+  esac
+  case "$DEPLOY_INCOMPLETE_DEV_ALLOW" in
+    true|TRUE|True|1) DEPLOY_INCOMPLETE_DEV_ALLOW=1 ;;
+    *) DEPLOY_INCOMPLETE_DEV_ALLOW=0 ;;
+  esac
+  # 引用语法门禁（round-2 R2-4）：空值总是被拒绝（即使开了开发开关）；
+  # digest 引用按全锚定/仅小写语义校验；开发开关只放行语法合法的裸引用，
+  # 不是无条件豁免。
+  if [[ -z "$DEPLOY_SANDBOX_IMAGE" ]]; then
+    echo "[deploy] ERROR: AF_SANDBOX_IMAGE 未设置或为空 (MethodSpec V5 §12)。" >&2
+    echo "  生产部署目标镜像必须是 repo/name@sha256:<64hex> 摘要引用（frog 发布时固定）。" >&2
+    echo "  开发环境可显式设置 AF_SANDBOX_IMAGE_ALLOW_DEV_TAG=true 使用语法合法的裸标签。" >&2
+    exit 1
+  fi
+  if af_is_digest_reference "$DEPLOY_SANDBOX_IMAGE"; then
+    : # 生产 digest 引用，合法。
+  elif [[ "$DEPLOY_DEV_ALLOW" == "1" ]] && af_is_valid_dev_reference "$DEPLOY_SANDBOX_IMAGE"; then
+    echo "[deploy] WARNING: AF_SANDBOX_IMAGE 是裸引用，仅因显式开关 AF_SANDBOX_IMAGE_ALLOW_DEV_TAG 而放行（开发用途，勿用于生产）。" >&2
+  elif [[ "$DEPLOY_DEV_ALLOW" == "1" ]]; then
+    echo "[deploy] ERROR: AF_SANDBOX_IMAGE 既不是合法的 sha256 摘要引用，也不是语法合法的裸引用 (MethodSpec V5 §12 R2-4)。" >&2
+    echo "  开发开关 AF_SANDBOX_IMAGE_ALLOW_DEV_TAG 只放行语法合法的裸标签/引用；" >&2
+    echo "  空值、空白/控制字符、大写仓库名或 digest 形状非法的值一律拒绝（fail-closed）。" >&2
+    exit 1
+  else
+    echo "[deploy] ERROR: AF_SANDBOX_IMAGE 不是合法的 sha256 摘要引用 (MethodSpec V5 §12)。" >&2
+    echo "  生产部署目标镜像必须恰好是 repo/name@sha256:<64位小写hex>（frog 发布时固定）；" >&2
+    echo "  大写 hex、63/65 位 hex、缺失 @sha256: 或 digest 后带任何多余字符都会被拒绝。" >&2
+    echo "  开发环境可显式设置 AF_SANDBOX_IMAGE_ALLOW_DEV_TAG=true 允许语法合法的裸标签。" >&2
+    exit 1
+  fi
+
+  # 发布门禁：目标绑定（round-2 R2-3，fail-closed）。映射文件必须存在且可解析；
+  # 所选引用经 docker inspect 解析为不可变 image ID；恰好一个映射条目与所选
+  # 目标对应，且该条目绑定的不可变 ID 与 inspect 结果相同；条目的五个摘要
+  # （base/lock/library/SBOM/MethodSpec）全部合法非占位符且 releasable=true。
+  DEPLOY_MAPPING_FILE="$ROOT_DIR/pythonSandboxService/.runtime-build/image-digest-mapping.json"
+  if [[ ! -f "$DEPLOY_MAPPING_FILE" ]]; then
+    echo "[deploy] ERROR: 构建产物映射文件缺失: ${DEPLOY_MAPPING_FILE} (MethodSpec V5 §12 R2-3)。" >&2
+    echo "  部署必须能证明目标镜像与一次经过验证的构建完全同一；先运行" >&2
+    echo "  pythonSandboxService/docker_build.sh runtime 生成映射（fail-closed）。" >&2
+    exit 1
+  fi
+  DEPLOY_INSPECTED_ID="$(docker inspect --type=image --format '{{.Id}}' "$DEPLOY_SANDBOX_IMAGE" 2>/dev/null || true)"
+  if [[ -z "$DEPLOY_INSPECTED_ID" ]]; then
+    echo "[deploy] ERROR: 无法通过 docker inspect 解析 ${DEPLOY_SANDBOX_IMAGE} 的不可变 image ID (MethodSpec V5 §12 R2-3)。" >&2
+    echo "  部署目标无法与映射条目证明同一性（fail-closed）。" >&2
+    exit 1
+  fi
+  if ! DEPLOY_GATE_VERDICT="$(python3 - "$DEPLOY_MAPPING_FILE" "$DEPLOY_SANDBOX_IMAGE" "$DEPLOY_INSPECTED_ID" <<'PY'
+import json, re, sys
+
+mapping_path, chosen_ref, inspected_id = sys.argv[1], sys.argv[2], sys.argv[3]
+_SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+try:
+    with open(mapping_path, "r", encoding="utf-8") as fh:
+        mapping = json.load(fh)
+except Exception:
+    print("unparseable")
+    sys.exit(0)
+images = mapping.get("images") if isinstance(mapping, dict) else None
+if not isinstance(images, dict) or not images:
+    print("no-images")
+    sys.exit(0)
+
+# An entry CORRESPONDS to the chosen target when its key is the inspected
+# immutable image ID, or it records the chosen ref as imageRef.
+matches = []
+for key, entry in images.items():
+    if not isinstance(entry, dict):
+        continue
+    image_ref = entry.get("imageRef")
+    if key == inspected_id or (
+        isinstance(image_ref, str) and image_ref == chosen_ref
+    ):
+        matches.append((key, entry))
+if len(matches) == 0:
+    print("no-match")
+    sys.exit(0)
+if len(matches) > 1:
+    print("multiple-match")
+    sys.exit(0)
+key, entry = matches[0]
+if key != inspected_id:
+    # The entry exists (via its recorded imageRef) but binds a DIFFERENT
+    # immutable image ID than the inspected deploy target: identity NOT proven.
+    print("target-mismatch")
+    sys.exit(0)
+digest_fields = (
+    "baseImageDigest",
+    "lockDigest",
+    "librarySetDigest",
+    "sbomDigest",
+    "methodSpecIndexDigest",
+)
+bad = [
+    name
+    for name in digest_fields
+    if not (isinstance(entry.get(name), str) and _SHA256_RE.match(entry.get(name)))
+]
+if bad or entry.get("releasable") is not True:
+    print("not-releasable")
+    sys.exit(0)
+print("ok")
+PY
+)"; then
+    echo "[deploy] ERROR: 无法读取构建产物的发布状态: ${DEPLOY_MAPPING_FILE} (MethodSpec V5 §12)。" >&2
+    exit 1
+  fi
+  case "$DEPLOY_GATE_VERDICT" in
+    ok)
+      ;;
+    unparseable)
+      echo "[deploy] ERROR: 构建产物映射文件无法解析: ${DEPLOY_MAPPING_FILE} (MethodSpec V5 §12 R2-3, fail-closed)。" >&2
+      exit 1
+      ;;
+    no-images|no-match)
+      echo "[deploy] ERROR: ${DEPLOY_MAPPING_FILE} 没有任何条目绑定所选目标 ${DEPLOY_SANDBOX_IMAGE} (MethodSpec V5 §12 R2-3)。" >&2
+      echo "  映射中不存在与该引用/其不可变 image ID (${DEPLOY_INSPECTED_ID}) 对应的条目；" >&2
+      echo "  部署目标无法与经过验证的构建证明同一性（fail-closed）。" >&2
+      exit 1
+      ;;
+    multiple-match)
+      echo "[deploy] ERROR: ${DEPLOY_MAPPING_FILE} 有多个条目对应所选目标 ${DEPLOY_SANDBOX_IMAGE} (MethodSpec V5 §12 R2-3)。" >&2
+      echo "  目标绑定必须唯一（恰好一个条目）；无法确定部署的是哪一次构建（fail-closed）。" >&2
+      exit 1
+      ;;
+    target-mismatch)
+      echo "[deploy] ERROR: 映射条目记录的不可变 image ID 与 docker inspect 解析的 ${DEPLOY_INSPECTED_ID} 不一致 (MethodSpec V5 §12 R2-3)。" >&2
+      echo "  所选目标 ${DEPLOY_SANDBOX_IMAGE} 与映射条目绑定的不是同一个镜像；" >&2
+      echo "  部署目标同一性无法证明（fail-closed）。" >&2
+      exit 1
+      ;;
+    not-releasable)
+      if [[ "$DEPLOY_INCOMPLETE_DEV_ALLOW" == "1" ]]; then
+        echo "[deploy] WARNING: 构建产物 ${DEPLOY_MAPPING_FILE} 中该条目非 releasable（releasable=false 或含占位符/非法摘要）。" >&2
+        echo "  仅因显式开关 AF_SANDBOX_ALLOW_INCOMPLETE_DEV_BUILD=true/1 而继续部署（开发用途，勿用于生产）。" >&2
+      else
+        echo "[deploy] ERROR: 构建产物 ${DEPLOY_MAPPING_FILE} 中该条目非 releasable（releasable=false 或含占位符/非法摘要）(MethodSpec V5 §12)。" >&2
+        echo "  含 REPLACE_WITH_... 占位符或缺失发布输入的构建不得部署。" >&2
+        echo "  frog 补齐发布输入（基础镜像摘要/MethodSpec 索引摘要/SBOM）后重新构建；" >&2
+        echo "  开发环境可显式设置 AF_SANDBOX_ALLOW_INCOMPLETE_DEV_BUILD=true 豁免。" >&2
+        exit 1
+      fi
+      ;;
+    *)
+      echo "[deploy] ERROR: 发布门禁返回未知判定 '${DEPLOY_GATE_VERDICT}' (${DEPLOY_MAPPING_FILE}, fail-closed)。" >&2
+      exit 1
+      ;;
+  esac
+fi
+
 if [[ "$DEPLOY_ONLY" == true && "$SKIP_MAVEN" == true ]]; then
   echo "Note: --deploy-only 已包含跳过 Maven 与 Docker 构建，忽略 --skip-maven" >&2
 fi
@@ -367,6 +560,16 @@ if [[ ${#BUSINESS_TO_RECREATE[@]} -gt 0 ]]; then
 fi
 
 echo "=== Deployment completed ==="
+
+# MethodSpec V5 §12: 运行时镜像保留。默认 PLAN 模式（只打印计划，绝不删除）。
+# 实际删除由 frog 显式执行：bash pythonSandboxService/scripts/prune_runtime_images.sh --apply
+if is_in_list "python-sandbox-service" "${SELECTED[@]}" || is_in_list "python-sandbox-runtime" "${SELECTED[@]}"; then
+  echo "=== Runtime image retention plan (MethodSpec V5 §12, PLAN mode; deletion requires explicit --apply by frog) ==="
+  AF_CURRENT_RUNTIME_IMAGE="${AF_CURRENT_RUNTIME_IMAGE:-}" \
+  AF_PREVIOUS_RUNTIME_IMAGE="${AF_PREVIOUS_RUNTIME_IMAGE:-}" \
+  AF_STATE_FILE="${AF_STATE_FILE:-$ROOT_DIR/data/sandbox_tasks/state.json}" \
+    bash "$ROOT_DIR/pythonSandboxService/scripts/prune_runtime_images.sh"
+fi
 
 # 显示状态
 $DOCKER_COMPOSE ps --format "table {{.Name}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null || true
