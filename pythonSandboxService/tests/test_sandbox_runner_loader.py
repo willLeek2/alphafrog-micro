@@ -21,8 +21,10 @@ from app.config import SandboxConfig  # noqa: E402
 from app.models import ExecutionEnvironment  # noqa: E402
 from app.sandbox_runner import (  # noqa: E402
     SANDBOX_LOADER_FILES,
+    ConfigurationError,
     _loader_smoke_check_command,
     run_in_open_session,
+    validate_dynamic_install_safety,
 )
 
 
@@ -265,19 +267,30 @@ class SandboxRunnerPostInstallReCollectionTest(unittest.TestCase):
         self.assertIsNone(run_call[1])
         # install_ms timing must be reported.
         self.assertIn("install_ms", result["timings"])
-        # copy_to_runtime must have been called at least twice: once by
-        # _prepare_task_workspace (baked env into task_workspace file) and
-        # once by the post-install phase (post-install env overwriting it).
+        # codex (A) plan 2026-08-08 23:06: per-task baked-env writes were
+        # removed. The single runtime-environment.json file is the
+        # container-global one written once by initialize_runtime_environment
+        # at container startup; the post-install phase overwrites it with
+        # the post-install env. Only the post-install write happens inside
+        # run_in_open_session, so we expect exactly ONE copy_to_runtime call
+        # targeting runtime-environment.json here.
         copy_destinations = [
             dest for _src, dest in session.copy_to_runtime_calls
         ]
         runtime_env_destinations = [
             d for d in copy_destinations if d.endswith("runtime-environment.json")
         ]
-        self.assertGreaterEqual(
-            len(runtime_env_destinations), 2,
-            f"expected at least 2 copy_to_runtime calls writing runtime-environment.json "
-            f"(baked + post-install), got: {copy_destinations}",
+        self.assertEqual(
+            1, len(runtime_env_destinations),
+            f"expected exactly 1 copy_to_runtime call writing "
+            f"runtime-environment.json (post-install overwrite), got: "
+            f"{copy_destinations}",
+        )
+        self.assertTrue(
+            runtime_env_destinations[0].endswith("/sandbox/runtime-environment.json"),
+            f"post-install write MUST target the container-global "
+            f"<workdir>/runtime-environment.json path, got: "
+            f"{runtime_env_destinations[0]}",
         )
 
     def test_baked_environment_kept_when_no_install_happens(self) -> None:
@@ -401,12 +414,14 @@ class SandboxRunnerContainerWriteTest(unittest.TestCase):
 
         return _FakeSession()
 
-    def test_run_in_open_session_writes_runtime_environment_json_into_task_workspace_in_container(self) -> None:
-        """Verify the per-task runtime-environment.json is copy_to_runtime'd
-        into the container at <task_workspace>/runtime-environment.json (NOT
-        the global /sandbox path that the service host's local fs would map
-        to). Without this, report() running inside the container could not
-        read environmentId.
+    def test_run_in_open_session_writes_runtime_environment_json_into_container_global_path(self) -> None:
+        """Verify the container-global runtime-environment.json is
+        copy_to_runtime'd into the container at <workdir>/runtime-environment.json.
+        codex (A) plan 2026-08-08 23:06: the file path is the container-global
+        <workdir>/runtime-environment.json set by create_sandbox_session. Per-
+        task sitecustomize overrides were removed because they were racy under
+        pool reuse. Without this, report() running inside the container could
+        not read environmentId.
         """
         baked_env = ExecutionEnvironment(
             environment_id="sha256:baked_for_container_write",
@@ -457,42 +472,485 @@ class SandboxRunnerContainerWriteTest(unittest.TestCase):
             )
 
         # _prepare_task_workspace must call copy_to_runtime for the
-        # runtime-environment.json file under the task workspace.
+        # runtime-environment.json file at the container-global path
+        # (workdir). Per-task writes were removed by the (A) plan.
         runtime_env_writes = [
             (src, dest) for src, dest in session.copy_to_runtime_calls
             if dest.endswith("runtime-environment.json")
         ]
-        self.assertEqual(1, len(runtime_env_writes))
-        _src_path, dest_path = runtime_env_writes[0]
-        self.assertTrue(
-            dest_path.endswith("/sandbox/runs/task-container-write/runtime-environment.json"),
-            f"runtime-environment.json must live in the task workspace, "
-            f"got: {dest_path}",
-        )
-        # Verify the payload written was the baked env, byte-for-byte.
-        self.assertEqual(1, len(captured_runtime_env_payloads))
-        payload = captured_runtime_env_payloads[0]
-        self.assertEqual(
-            "sha256:baked_for_container_write",
-            payload["environment_id"],
-        )
+        # run_in_open_session reuses the container-level environment file written
+        # during initialization; it must not rewrite that global file per task.
+        self.assertEqual([], runtime_env_writes)
+        self.assertEqual([], captured_runtime_env_payloads)
 
-        # sitecustomize.py write must also be present — it carries the
-        # AF_RUNTIME_ENVIRONMENT_FILE override that points at the per-task
-        # file above.
+        # sitecustomize.py write must also be present, but it MUST NOT
+        # override AF_RUNTIME_ENVIRONMENT_FILE per task. The container-
+        # creation env var (set by create_sandbox_session) already points
+        # at the container-global /sandbox/runtime-environment.json; an
+        # override per task would race on the same global sitecustomize.py
+        # under pool reuse.
         self.assertGreaterEqual(
             len(captured_sitecustomize_text), 1,
-            "sitecustomize.py must be copied into the container so the "
-            "per-task AF_RUNTIME_ENVIRONMENT_FILE override takes effect",
+            "sitecustomize.py must be copied into the container so "
+            "AF_TASK_* env vars propagate",
         )
         sitecustomize_text = captured_sitecustomize_text[0]
-        self.assertIn(
+        self.assertNotIn(
             "AF_RUNTIME_ENVIRONMENT_FILE", sitecustomize_text,
+            "sitecustomize.py MUST NOT override AF_RUNTIME_ENVIRONMENT_FILE; "
+            "the container-creation env var handles that. Per-task overrides "
+            "race under pool reuse.",
         )
-        self.assertIn(
-            "/sandbox/runs/task-container-write/runtime-environment.json",
-            sitecustomize_text,
+
+
+class ValidateDynamicInstallSafetyTest(unittest.TestCase):
+    """260808-finance-methodspec-v5 codex (A) plan 2026-08-08 23:06 +
+    codex 2026-08-08 23:16 (bc11e841 item 2):
+
+    The v5 safety invariant is ``container_max_concurrency == 1`` for every
+    SandboxConfig — both because dynamic install mutates the shared venv,
+    AND because the per-task bootstrap (AF_TASK_* env vars) is written into
+    the SHARED global file ``/sandbox/sitecustomize.py``. Concurrent tasks
+    would race on that file regardless of skip_environment_setup.
+
+    codex 2026-08-08 23:16 explicitly required extending the check from
+    "skip_environment_setup=False only" to "all configs".
+    """
+
+    def _test_config(self, **overrides) -> SandboxConfig:
+        base = SandboxConfig(
+            data_dir=__import__("pathlib").Path("data/agent_datasets"),
+            max_concurrency=1,
+            execution_timeout_seconds=5.0,
+            memory_limit="512m",
+            memswap_limit="512m",
+            docker_backend="docker",
+            workdir="/sandbox",
+            log_level="INFO",
+            sandbox_image="alphafrog-sandbox-runtime:latest",
+            skip_environment_setup=False,
+            preinstalled_libraries=frozenset(),
+            container_max_concurrency=1,
+            pool_enabled=False,
+            pool_min_size=0,
+            pool_max_size=1,
+            pool_acquire_timeout_seconds=30.0,
+            pool_idle_timeout_seconds=None,
+            pool_max_container_uses=None,
+            workspace_root="/sandbox/runs",
+            compat_input_path_enabled=True,
         )
+        return replace(base, **overrides)
+
+    def test_validate_dynamic_install_safety_rejects_concurrency_gt_1_dynamic(self) -> None:
+        """skip_environment_setup=False + cmc>=2 must raise."""
+        for bad_concurrency in (2, 3, 4, 8):
+            config = self._test_config(container_max_concurrency=bad_concurrency)
+            with self.assertRaises(
+                ConfigurationError,
+                msg=f"cmc={bad_concurrency} with dynamic install must raise",
+            ) as cm:
+                validate_dynamic_install_safety(config)
+            self.assertIn(
+                "CONTAINER_MAX_CONCURRENCY_REQUIRES_ONE", str(cm.exception),
+            )
+            self.assertIn(str(bad_concurrency), str(cm.exception))
+
+    def test_validate_dynamic_install_safety_rejects_concurrency_gt_1_preinstalled(self) -> None:
+        """codex 2026-08-08 23:16 (bc11e841 item 2): sitecustomize.py races
+        even for preinstalled-only configs. cmc>=2 must raise even when
+        skip_environment_setup=True."""
+        for bad_concurrency in (2, 3, 4, 8, 16):
+            config = self._test_config(
+                skip_environment_setup=True,
+                container_max_concurrency=bad_concurrency,
+            )
+            with self.assertRaises(
+                ConfigurationError,
+                msg=f"cmc={bad_concurrency} with skip_environment_setup=True "
+                    f"must STILL raise (sitecustomize.py race)",
+            ) as cm:
+                validate_dynamic_install_safety(config)
+            self.assertIn(
+                "CONTAINER_MAX_CONCURRENCY_REQUIRES_ONE", str(cm.exception),
+            )
+            self.assertIn(str(bad_concurrency), str(cm.exception))
+
+    def test_validate_dynamic_install_safety_allows_concurrency_eq_1_dynamic(self) -> None:
+        """skip_environment_setup=False + cmc=1 must pass."""
+        config = self._test_config(container_max_concurrency=1)
+        # MUST NOT raise.
+        validate_dynamic_install_safety(config)
+
+    def test_validate_dynamic_install_safety_allows_concurrency_eq_1_preinstalled(self) -> None:
+        """skip_environment_setup=True + cmc=1 must pass."""
+        config = self._test_config(
+            skip_environment_setup=True, container_max_concurrency=1,
+        )
+        # MUST NOT raise.
+        validate_dynamic_install_safety(config)
+
+
+class PostInstallFailClosedTest(unittest.TestCase):
+    """260808-finance-methodspec-v5 codex (A) plan 2026-08-08 23:06:
+
+    install/collect/copy 任一失败 MUST raise before session.run; the
+    container is marked recycled so the pool scheduler retires the worker
+    and the next task gets a fresh baked container. session.run() MUST
+    NOT be called when any post-install step fails.
+    """
+
+    def _test_config(self, **overrides) -> SandboxConfig:
+        base = SandboxConfig(
+            data_dir=__import__("pathlib").Path("data/agent_datasets"),
+            max_concurrency=1,
+            execution_timeout_seconds=5.0,
+            memory_limit="512m",
+            memswap_limit="512m",
+            docker_backend="docker",
+            workdir="/sandbox",
+            log_level="INFO",
+            sandbox_image="alphafrog-sandbox-runtime:latest",
+            skip_environment_setup=False,
+            preinstalled_libraries=frozenset(),
+            container_max_concurrency=1,
+            pool_enabled=False,
+            pool_min_size=0,
+            pool_max_size=1,
+            pool_acquire_timeout_seconds=30.0,
+            pool_idle_timeout_seconds=None,
+            pool_max_container_uses=None,
+            workspace_root="/sandbox/runs",
+            compat_input_path_enabled=True,
+        )
+        return replace(base, **overrides)
+
+    def _build_session(self, *, install_exc=None, copy_exc=None, copy_runtime_env_only: bool = False):
+        """Build a fake session whose install/copy_to_runtime may raise.
+
+        copy_runtime_env_only: when True, copy_to_runtime only raises for
+        dest_path ending in runtime-environment.json. This matches the
+        production behavior where sitecustomize.py copy_to_runtime succeeds
+        but the post-install runtime-environment.json write fails. Used to
+        isolate the post-install failure path from _prepare_task_workspace
+        sitecustomize.py copy.
+        """
+
+        class _FakeRunResult:
+            exit_code = 0
+            stdout = "should-not-run"
+            stderr = ""
+
+        class _FakeOutput:
+            exit_code = 0
+            stdout = ""
+            stderr = ""
+
+        class _FakeSession:
+            container_id = "container-fail-closed"
+
+            def __init__(self) -> None:
+                self.install_calls: list[list[str]] = []
+                self.copy_to_runtime_calls: list[tuple[str, str]] = []
+                self.run_calls: list[tuple[str, list | None, float]] = []
+
+            def execute_command(self, command: str) -> _FakeOutput:
+                return _FakeOutput()
+
+            def copy_to_runtime(self, source: str, dest_path: str) -> None:
+                self.copy_to_runtime_calls.append((source, dest_path))
+                if copy_exc is None:
+                    return
+                if copy_runtime_env_only and not dest_path.endswith(
+                    "runtime-environment.json"
+                ):
+                    return
+                raise copy_exc
+
+            def install(self, libraries) -> None:
+                self.install_calls.append(list(libraries))
+                if install_exc is not None:
+                    raise install_exc
+
+            def run(self, code: str, libraries, timeout: float) -> _FakeRunResult:
+                self.run_calls.append((code, libraries, timeout))
+                return _FakeRunResult()
+
+        return _FakeSession()
+
+    def _baked_env(self) -> ExecutionEnvironment:
+        return ExecutionEnvironment(
+            environment_id="sha256:baked",
+            image_digest="sha256:img-baked",
+            library_set_digest="sha256:libs-baked",
+            package_apis=[],
+            inventory_complete=True,
+        )
+
+    def test_post_install_install_raises_blocks_run_and_recycles_container(self) -> None:
+        """session.install() raises → session.run() MUST NOT be called +
+        exception propagates with execution_environment falling back to baked."""
+        session = self._build_session(
+            install_exc=RuntimeError("pip index unreachable"),
+        )
+        config = self._test_config()
+        baked_env = self._baked_env()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir)
+            dataset_dir = data_dir / "ds1"
+            dataset_dir.mkdir()
+            (dataset_dir / "ds1.csv").write_text("x\n1\n", encoding="utf-8")
+            (dataset_dir / "ds1.meta.json").write_text("{}", encoding="utf-8")
+            config = replace(config, data_dir=data_dir)
+
+            with self.assertRaises(RuntimeError) as cm:
+                run_in_open_session(
+                    config,
+                    session,
+                    "task-install-raises",
+                    "ds1",
+                    None,
+                    "print('should not run')",
+                    None,
+                    ["requests"],  # not preinstalled → triggers install path
+                    5,
+                    execution_environment=baked_env,
+                )
+            self.assertIn("pip index unreachable", str(cm.exception))
+
+        # session.run() MUST NOT have been called.
+        self.assertEqual(
+            0, len(session.run_calls),
+            f"session.run() MUST NOT be called when session.install() "
+            f"raises; got run_calls={session.run_calls}",
+        )
+        # session.install() WAS called and raised.
+        self.assertEqual([["requests"]], session.install_calls)
+        # The exception carries the baked execution_environment fallback
+        # so downstream observers see a stable envId even on failure.
+        self.assertIsNotNone(getattr(cm.exception, "execution_environment", None))
+        self.assertEqual(
+            "sha256:baked",
+            cm.exception.execution_environment["environment_id"],
+        )
+
+    def test_post_install_collect_raises_blocks_run_and_recycles_container(self) -> None:
+        """collect_runtime_environment raises → session.run() MUST NOT be called."""
+        session = self._build_session()
+        config = self._test_config()
+        baked_env = self._baked_env()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir)
+            dataset_dir = data_dir / "ds1"
+            dataset_dir.mkdir()
+            (dataset_dir / "ds1.csv").write_text("x\n1\n", encoding="utf-8")
+            (dataset_dir / "ds1.meta.json").write_text("{}", encoding="utf-8")
+            config = replace(config, data_dir=data_dir)
+
+            with patch(
+                "app.sandbox_runner.collect_runtime_environment",
+                side_effect=RuntimeError("pip list crash"),
+            ):
+                with self.assertRaises(RuntimeError) as cm:
+                    run_in_open_session(
+                        config,
+                        session,
+                        "task-collect-raises",
+                        "ds1",
+                        None,
+                        "print('should not run')",
+                        None,
+                        ["requests"],
+                        5,
+                        execution_environment=baked_env,
+                    )
+                self.assertIn("pip list crash", str(cm.exception))
+
+        # session.install() succeeded but collect failed → run still not called.
+        self.assertEqual([["requests"]], session.install_calls)
+        self.assertEqual(
+            0, len(session.run_calls),
+            f"session.run() MUST NOT be called when post-install collect "
+            f"raises; got run_calls={session.run_calls}",
+        )
+        # Baked env fallback on the exception.
+        self.assertIsNotNone(getattr(cm.exception, "execution_environment", None))
+        self.assertEqual(
+            "sha256:baked",
+            cm.exception.execution_environment["environment_id"],
+        )
+
+    def test_post_install_copy_raises_blocks_run_and_recycles_container(self) -> None:
+        """write_runtime_environment_to_container raises → session.run() MUST
+        NOT be called."""
+        session = self._build_session(
+            copy_exc=RuntimeError("container copy unreachable"),
+            copy_runtime_env_only=True,
+        )
+        config = self._test_config()
+        baked_env = self._baked_env()
+
+        post_install_env = ExecutionEnvironment(
+            environment_id="sha256:post_install",
+            image_digest="sha256:img-post",
+            library_set_digest="sha256:libs-post",
+            package_apis=[],
+            inventory_complete=True,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir)
+            dataset_dir = data_dir / "ds1"
+            dataset_dir.mkdir()
+            (dataset_dir / "ds1.csv").write_text("x\n1\n", encoding="utf-8")
+            (dataset_dir / "ds1.meta.json").write_text("{}", encoding="utf-8")
+            config = replace(config, data_dir=data_dir)
+
+            with patch(
+                "app.sandbox_runner.collect_runtime_environment",
+                return_value=post_install_env,
+            ):
+                with self.assertRaises(RuntimeError) as cm:
+                    run_in_open_session(
+                        config,
+                        session,
+                        "task-copy-raises",
+                        "ds1",
+                        None,
+                        "print('should not run')",
+                        None,
+                        ["requests"],
+                        5,
+                        execution_environment=baked_env,
+                    )
+                self.assertIn("container copy unreachable", str(cm.exception))
+
+        # session.install() and collect succeeded but copy_to_runtime raised.
+        self.assertEqual([["requests"]], session.install_calls)
+        # copy_to_runtime WAS called (the failed one was the post-install
+        # write) so the first copy attempt (if any) is recorded.
+        self.assertGreaterEqual(len(session.copy_to_runtime_calls), 1)
+        # session.run() MUST NOT be called.
+        self.assertEqual(
+            0, len(session.run_calls),
+            f"session.run() MUST NOT be called when post-install copy "
+            f"raises; got run_calls={session.run_calls}",
+        )
+        # Baked env fallback on the exception.
+        self.assertIsNotNone(getattr(cm.exception, "execution_environment", None))
+        self.assertEqual(
+            "sha256:baked",
+            cm.exception.execution_environment["environment_id"],
+        )
+
+    def test_post_install_pollution_recycles_after_successful_install(self) -> None:
+        """codex 2026-08-08 23:16 (bc11e841 item 1): every successful
+        dynamic install MUST set container_recycled=True with reason
+        "post_install_pollution" — even when user code itself succeeded.
+        The next task in this worker would otherwise inherit the mutated
+        venv while PoolWorker.execution_environment still holds the baked
+        snapshot, causing environmentId to disagree with actual state.
+        """
+        session = self._build_session()
+        config = self._test_config()
+        baked_env = self._baked_env()
+
+        post_install_env = ExecutionEnvironment(
+            environment_id="sha256:post_install",
+            image_digest="sha256:img-post",
+            library_set_digest="sha256:libs-post",
+            package_apis=[],
+            inventory_complete=True,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir)
+            dataset_dir = data_dir / "ds1"
+            dataset_dir.mkdir()
+            (dataset_dir / "ds1.csv").write_text("x\n1\n", encoding="utf-8")
+            (dataset_dir / "ds1.meta.json").write_text("{}", encoding="utf-8")
+            config = replace(config, data_dir=data_dir)
+
+            with patch(
+                "app.sandbox_runner.collect_runtime_environment",
+                return_value=post_install_env,
+            ):
+                result = run_in_open_session(
+                    config,
+                    session,
+                    "task-pollution-recycle",
+                    "ds1",
+                    None,
+                    "import requests; print('ok')",
+                    None,
+                    ["requests"],
+                    5,
+                    execution_environment=baked_env,
+                )
+
+        # session.install + collect + copy + run all succeeded.
+        self.assertEqual([["requests"]], session.install_calls)
+        self.assertEqual(1, len(session.run_calls))
+        # Result MUST signal the pool worker to drain and recycle.
+        self.assertTrue(
+            result["container_recycled"],
+            f"after a successful dynamic install the worker MUST be marked "
+            f"for recycling (container_recycled=True); got: {result['container_recycled']}",
+        )
+        self.assertEqual(
+            "post_install_pollution", result["recycle_reason"],
+            f"recycle_reason MUST be 'post_install_pollution' on successful "
+            f"install; got: {result['recycle_reason']!r}",
+        )
+        # post_install env still drives the HTTP execution_environment
+        # field; the recycle signal is orthogonal to the recorded envId.
+        result_env = result["execution_environment"]
+        self.assertIsNotNone(result_env)
+        self.assertEqual("sha256:post_install", result_env["environment_id"])
+
+    def test_no_install_path_does_not_recycle(self) -> None:
+        """skip_environment_setup=True OR empty install_libraries MUST NOT
+        set container_recycled — the no-install path leaves the venv
+        pristine, the next task can safely reuse the worker."""
+        session = self._build_session()
+        config = self._test_config(skip_environment_setup=True)
+        baked_env = self._baked_env()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir)
+            dataset_dir = data_dir / "ds1"
+            dataset_dir.mkdir()
+            (dataset_dir / "ds1.csv").write_text("x\n1\n", encoding="utf-8")
+            (dataset_dir / "ds1.meta.json").write_text("{}", encoding="utf-8")
+            config = replace(config, data_dir=data_dir)
+
+            with patch(
+                "app.sandbox_runner.collect_runtime_environment",
+            ) as collect_mock:
+                result = run_in_open_session(
+                    config,
+                    session,
+                    "task-no-recycle",
+                    "ds1",
+                    None,
+                    "print('ok')",
+                    None,
+                    [],  # empty install list
+                    5,
+                    execution_environment=baked_env,
+                )
+
+        self.assertEqual([], session.install_calls)
+        self.assertEqual(1, len(session.run_calls))
+        self.assertFalse(
+            result["container_recycled"],
+            f"no-install path MUST NOT recycle; got: {result['container_recycled']}",
+        )
+        self.assertIsNone(result["recycle_reason"])
+        # Re-collection MUST NOT have been triggered.
+        self.assertEqual(0, collect_mock.call_count)
 
 
 class WriteRuntimeEnvironmentToContainerTest(unittest.TestCase):

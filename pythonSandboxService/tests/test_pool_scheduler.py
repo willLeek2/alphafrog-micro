@@ -21,6 +21,9 @@ from app.pool_scheduler import ContainerPoolScheduler, SandboxQueueTimeoutError
 
 
 class FakeSession:
+    def copy_to_runtime(self, source: str, dest_path: str) -> None:
+        pass
+
     def close(self) -> None:
         pass
 

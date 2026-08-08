@@ -333,17 +333,18 @@ def _prepare_task_workspace(
     path_manifest_csv: str | None = None,
     *,
     copy_loader_modules: bool = True,
-    execution_environment: ExecutionEnvironment | None = None,
 ) -> str:
     """Create task-scoped workspace and copy datasets. Returns the task workspace path.
 
-    260808-finance-methodspec-v5 work package D (codex rework 2026-08-08 22:49):
-    when execution_environment is provided, the same ExecutionEnvironment instance
-    is serialized and pushed into the execution container at
-    <task_workspace>/runtime-environment.json. The per-task sitecustomize.py
-    overrides AF_RUNTIME_ENVIRONMENT_FILE to point at this file so concurrent
-    pool tasks never read each other's environment snapshot — the global
-    /sandbox/runtime-environment.json path was racy under pool reuse.
+    260808-finance-methodspec-v5 work package D (codex (A) plan 2026-08-08 23:06):
+    the container-global ``<workdir>/runtime-environment.json`` is written once
+    per container by ``initialize_runtime_environment()`` and shared by every
+    task in that container. Sitecustomize.py no longer overrides
+    ``AF_RUNTIME_ENVIRONMENT_FILE`` per task because concurrent tasks would
+    race on the same global sitecustomize.py (and the cleanup path deleted
+    it under their feet). Dynamic-install safety is enforced at config
+    validation time (container_max_concurrency == 1), so concurrent tasks
+    cannot mutate the shared venv out from under each other.
     """
     task_workspace = f"{config.workspace_root}/{task_id}"
     task_input = f"{task_workspace}/input"
@@ -465,37 +466,19 @@ def _prepare_task_workspace(
         f"os.environ['AF_TASK_WORKSPACE'] = {task_workspace!r}\n"
         f"os.environ['AF_TASK_ARTIFACT_DIR'] = {artifact_dir!r}\n"
         f"os.environ['AF_TASK_TMP_DIR'] = {temporary_dir!r}\n"
-        # 260808-finance-methodspec-v5 work package D (codex rework 22:49):
-        # override the container-creation AF_RUNTIME_ENVIRONMENT_FILE to point
-        # at this task's per-task file, not the global /sandbox path. Each task
-        # has its own snapshot under <task_workspace>/ so concurrent pool tasks
-        # do not read each other's environmentId.
-        f"os.environ['AF_RUNTIME_ENVIRONMENT_FILE'] = {os.path.join(task_workspace, 'runtime-environment.json')!r}\n"
+        # 260808-finance-methodspec-v5 work package D (codex (A) plan 2026-08-08
+        # 23:06): do NOT override AF_RUNTIME_ENVIRONMENT_FILE here. The
+        # container-creation env var (set by create_sandbox_session) points at
+        # the global <workdir>/runtime-environment.json that
+        # initialize_runtime_environment() wrote once per container. Each task
+        # in the same container reads the SAME file; concurrency=1 is enforced
+        # via validate_dynamic_install_safety so the venv state cannot drift.
         f"os.makedirs({artifact_dir!r}, exist_ok=True)\n"
         f"os.makedirs({temporary_dir!r}, exist_ok=True)\n"
         f"sys.path.insert(0, {config.workdir.rstrip('/')!r})\n"
         f"os.chdir({task_workspace!r})\n"
     )
     _copy_text_to_runtime(session, sitecustomize, f"{config.workdir.rstrip('/')}/sitecustomize.py")
-
-    # 260808-finance-methodspec-v5 work package D (codex rework 22:49): push the
-    # runtime-environment.json into the execution container at the per-task path.
-    # The service host's local filesystem is NOT shared with the container, so
-    # write_runtime_environment_json (local fs) is ops-audit only; user code in
-    # the sandbox reads the file we copy_to_runtime here.
-    if execution_environment is not None:
-        try:
-            container_env_path = os.path.join(
-                task_workspace, "runtime-environment.json",
-            )
-            write_runtime_environment_to_container(
-                session, execution_environment, container_env_path,
-            )
-        except Exception as exc:
-            logger.warning(
-                "RUNTIME_ENVIRONMENT_CONTAINER_WRITE_FAILED task=%s error=%s",
-                task_id, exc,
-            )
 
     return task_workspace
 
@@ -909,6 +892,57 @@ def _cleanup_task_workspace(
         return False
 
 
+def validate_dynamic_install_safety(config: SandboxConfig) -> None:
+    """Spec §8 L1019 + codex (A) plan 2026-08-08 23:06 safety invariant.
+
+    finance-methodspec-v5 enforces ``container_max_concurrency == 1`` for
+    every config (regardless of skip_environment_setup) because every
+    SandboxConfig writes a per-task bootstrap into the SHARED global file
+    ``/sandbox/sitecustomize.py`` (AF_TASK_WORKSPACE / AF_TASK_ARTIFACT_DIR /
+    AF_TASK_TMP_DIR / AF_TASK_METRICS_PATH) and deletes that same file on
+    cleanup. Concurrent tasks would race on that file even without dynamic
+    install — the bootstrap file is shared mutable state by construction.
+
+    Dynamic install (skip_environment_setup=False) additionally mutates the
+    shared venv via ``session.install()``, which compounds the race:
+    ``PoolWorker.execution_environment`` is captured once at warm-up and
+    never refreshed, so a second task in the same worker would read the
+    baked environmentId while the container's actual venv had already been
+    mutated by ``session.install()`` from the previous task.
+
+    Both invariants collapse to the same rule: exactly one task per
+    worker container at a time. Raise ``ConfigurationError`` (with a stable
+    code) if the invariant is violated. Callers that mutate config
+    dynamically (Nacos hot-reload, pool_min_size adjustment, etc.) MUST
+    re-run this check before accepting the new config; failing closed
+    prevents silent throughput drift that would corrupt environment
+    identity under the surface.
+
+    codex 2026-08-08 23:16 (bc11e841 item 2): the original plan only
+    enforced this for skip_environment_setup=False; sitecustomize.py races
+    even for preinstalled-only configs because the per-task AF_TASK_* env
+    vars are still written into the same global file. This invariant now
+    applies to ALL SandboxConfig instances.
+    """
+    if config.container_max_concurrency != 1:
+        raise ConfigurationError(
+            "CONTAINER_MAX_CONCURRENCY_REQUIRES_ONE: "
+            f"container_max_concurrency={config.container_max_concurrency} "
+            "is not allowed. SandboxConfig writes per-task bootstrap "
+            "(AF_TASK_WORKSPACE / AF_TASK_ARTIFACT_DIR / AF_TASK_TMP_DIR / "
+            "AF_TASK_METRICS_PATH) into the shared global file "
+            "/sandbox/sitecustomize.py and deletes that same file on cleanup; "
+            "concurrent tasks would race on the bootstrap. Dynamic install "
+            "(skip_environment_setup=False) additionally mutates the shared "
+            "venv via session.install(), which compounds the race. Both "
+            "invariants collapse to: one task per worker container at a time."
+        )
+
+
+class ConfigurationError(RuntimeError):
+    """Raised when SandboxConfig violates a finance-methodspec-v5 invariant."""
+
+
 def create_sandbox_session(
     config: SandboxConfig,
     *,
@@ -919,6 +953,7 @@ def create_sandbox_session(
 
     The caller owns the returned session and must close it.
     """
+    validate_dynamic_install_safety(config)
     effective_memory_limit: int | str = memory_limit_bytes or config.memory_limit
     runtime_configs = {
         "mem_limit": effective_memory_limit,
@@ -953,43 +988,59 @@ def initialize_runtime_environment(
     *,
     task_id: str | None = None,
 ) -> ExecutionEnvironment:
-    """Collect runtime environment single-source and persist it to the workdir.
+    """Collect runtime environment single-source and push the file INTO the container.
 
     Called once per container after create_sandbox_session(). The
-    AF_RUNTIME_ENVIRONMENT_FILE env var was set at container creation; this
-    function writes the file at that path so user code can read it via
-    os.environ[AF_RUNTIME_ENVIRONMENT_FILE] and follow the contract with
-    package B/C (ccqwen reporting library).
+    AF_RUNTIME_ENVIRONMENT_FILE env var was set at container creation to
+    ``<workdir>/runtime-environment.json``; this function writes the file
+    at that path via ``copy_to_runtime`` so user code (e.g. ccqwen's
+    reporting library) reads it from inside the container. Failure to push
+    the file into the container raises — the worker cannot become ready
+    without an honest runtime environment file for user code to consult.
 
-    Returns the ExecutionEnvironment instance so the caller can surface it on
-    the HTTP execution_environment field; one ExecutionEnvironment drives
-    both the workdir file and the wire field (single-source invariant).
+    Returns the ExecutionEnvironment instance so the caller can surface it
+    on the HTTP execution_environment field; one ExecutionEnvironment
+    drives both the container file and the wire field (single-source
+    invariant).
 
     For non-pool mode, task_id is logged to aid ops correlation. For pool
     mode, task_id may be None because the same container serves many tasks;
     the environment is constant per container so the file is logically
     valid for any task in that container.
+
+    Spec §8 L1019 + codex 2026-08-08 23:06 (A plan): the file path is the
+    container-global ``<workdir>/runtime-environment.json`` set by
+    ``create_sandbox_session``. Per-task sitecustomize overrides were
+    removed because they were racy under pool reuse (concurrent tasks
+    clobbered each other's bootstrap files).
     """
     container_id = get_session_container_id(session)
     env = collect_runtime_environment(container_id=container_id, session=session)
-    env_file_path = os.path.join(
+    container_env_path = os.path.join(
         config.workdir.rstrip("/"), "runtime-environment.json",
     )
+    # Push into the execution container — this is the runtime-visible
+    # source user code actually consults. Failure here MUST raise so the
+    # worker is not considered ready; failing closed prevents report()
+    # from reading a stale or missing environment file.
+    write_runtime_environment_to_container(session, env, container_env_path)
+    logger.info(
+        "RUNTIME_ENVIRONMENT_READY container=%s task=%s environment_id=%s "
+        "image_digest=%s library_set_digest=%s package_count=%s "
+        "inventory_complete=%s container_path=%s",
+        container_id, task_id or "-", env.environment_id, env.image_digest,
+        env.library_set_digest, len(env.package_apis),
+        env.inventory_complete, container_env_path,
+    )
+    # Ops-audit copy on the service host filesystem (best-effort: the
+    # service host's <workdir>/ is not shared with the container, so this
+    # is purely a debugging convenience and MUST NOT fail the init path).
     try:
         write_runtime_environment_json(config.workdir, env)
     except Exception as exc:
-        logger.warning(
-            "RUNTIME_ENVIRONMENT_FILE_WRITE_FAILED container=%s task=%s error=%s",
-            container_id, task_id, exc,
-        )
-    else:
         logger.info(
-            "RUNTIME_ENVIRONMENT_READY container=%s task=%s environment_id=%s "
-            "image_digest=%s library_set_digest=%s package_count=%s "
-            "inventory_complete=%s file=%s",
-            container_id, task_id or "-", env.environment_id, env.image_digest,
-            env.library_set_digest, len(env.package_apis),
-            env.inventory_complete, env_file_path,
+            "RUNTIME_ENVIRONMENT_AUDIT_WRITE_FAILED container=%s error=%s",
+            container_id, exc,
         )
     return env
 
@@ -1165,37 +1216,36 @@ def run_in_open_session(
             paths_dataset_csv=paths_dataset_csv,
             path_manifest_csv=path_manifest_csv,
             copy_loader_modules=prepare_loader_modules,
-            execution_environment=execution_environment,
         )
         timings["workspace_prepare_ms"] = int((time.monotonic() - t_workspace_start) * 1000)
 
         # 260808-finance-methodspec-v5 work package D: ExecutionEnvironment was
-        # collected by initialize_runtime_environment() once per container; the
-        # caller passes it in here so we can surface the same instance on the
-        # HTTP execution_environment field (single-source invariant).
-        # _prepare_task_workspace already pushed it into the execution container
-        # at <task_workspace>/runtime-environment.json (per-task path, set via
-        # sitecustomize AF_RUNTIME_ENVIRONMENT_FILE override), so we do NOT
-        # re-collect per task.
+        # collected by initialize_runtime_environment() once per container and
+        # pushed into the container-global <workdir>/runtime-environment.json.
+        # All tasks in the same container read the same file (concurrent
+        # tasks are forbidden via validate_dynamic_install_safety), so we do
+        # NOT re-collect or re-write the file per task.
         #
-        # Spec §8 L1019 (Kimi rework 2026-08-08 + codex rework 2026-08-08 22:49):
+        # Spec §8 L1019 (Kimi rework + codex (A) plan 2026-08-08 23:06):
         # when this task installs non-preinstalled packages, the dynamic install
         # path MUST be split into install() → re-collect → push updated file
         # into container → run(code, libraries=None). Re-collecting AFTER run()
         # is too late because report()/report_custom() already executed inside
         # the run and read the baked file; the recorded environmentId would
         # then disagree with the HTTP post-install field.
+        #
+        # codex 2026-08-08 23:06 (A plan): install/collect/copy 任一失败 MUST
+        # raise before session.run (not silently fall back to baked env).
+        # session.install() mutated the shared venv; the recorded envId must
+        # reflect the actual container state or the task MUST NOT run.
 
         _log_in_container(session, task_id, config, "script_start")
         t_run_start = time.monotonic()
         _smoke_check_loader_modules(session, config, task_id)
         if install_libraries:
-            # Phase 1: dynamic install via llm-sandbox's install() so we can
-            # re-collect + push the updated environment file BEFORE user code
-            # runs. session.install() raises LibraryInstallationNotSupported
-            # when skip_environment_setup=True or when the language handler
-            # refuses; that failure is the caller's contract to remove this
-            # branch (not a soft warning).
+            # Phase 1: dynamic install via llm-sandbox's install(). Failure
+            # raises; pool worker must close session and not reuse the
+            # partially-mutated venv for the next task.
             try:
                 t_install_start = time.monotonic()
                 session.install(install_libraries)
@@ -1203,22 +1253,35 @@ def run_in_open_session(
                     (time.monotonic() - t_install_start) * 1000,
                 )
             except Exception as install_exc:
+                # Spec §8 L1019 + codex 2026-08-08 23:06 (A plan): session.install
+                # already mutated the container's shared venv. If we silently
+                # fall back, the next task in this worker inherits a partial
+                # install set whose environmentId disagrees with what HTTP
+                # records. Mark the container for recycling so the pool
+                # scheduler retires this worker and the next task gets a
+                # fresh baked container.
+                container_recycled = True
+                recycle_reason = "post_install_install_failed"
                 logger.error(
-                    "RUNTIME_ENVIRONMENT_POST_INSTALL_FAILED task=%s "
-                    "libraries=%s error=%s",
+                    "RUNTIME_ENVIRONMENT_POST_INSTALL_INSTALL_FAILED "
+                    "task=%s libraries=%s error=%s",
                     task_id, install_libraries, install_exc,
                 )
                 raise
-            # Phase 2: re-collect the actual post-install package set inside the
-            # container, then push it to the per-task runtime-environment.json
-            # path so user code that runs immediately below reads the new file.
+            # Phase 2: re-collect the actual post-install package set inside
+            # the container and push it to the SAME container-global path
+            # initialize_runtime_environment wrote (so user code reads the new
+            # file via the AF_RUNTIME_ENVIRONMENT_FILE env var set at container
+            # creation). Any failure (collect OR copy) raises; the pool worker
+            # observes container_recycled=True and retires the worker so the
+            # next task gets a fresh baked container.
             try:
                 t_post_install_start = time.monotonic()
                 post_install_environment = collect_runtime_environment(
                     container_id=actual_container_id, session=session,
                 )
                 container_env_path = os.path.join(
-                    task_workspace, "runtime-environment.json",
+                    config.workdir.rstrip("/"), "runtime-environment.json",
                 )
                 write_runtime_environment_to_container(
                     session, post_install_environment, container_env_path,
@@ -1237,17 +1300,40 @@ def run_in_open_session(
                     container_env_path,
                     timings["post_install_recollect_ms"],
                 )
-            except Exception as collect_exc:
-                logger.warning(
-                    "RUNTIME_ENVIRONMENT_POST_INSTALL_COLLECT_FAILED "
-                    "task=%s error=%s",
-                    task_id, collect_exc,
+            except Exception as post_install_exc:
+                # Spec §8 L1019 + codex 2026-08-08 23:06 (A plan): the install
+                # above already changed the venv. If collect OR copy fails,
+                # the recorded environmentId would not match the actual
+                # container state; recycling is mandatory, not optional.
+                container_recycled = True
+                recycle_reason = "post_install_collect_or_write_failed"
+                logger.error(
+                    "RUNTIME_ENVIRONMENT_POST_INSTALL_COLLECT_OR_WRITE_FAILED "
+                    "task=%s libraries=%s error=%s",
+                    task_id, install_libraries, post_install_exc,
                 )
-                # post_install_environment remains None; we fall back to the
-                # baked environment below when computing the effective env.
+                raise
             # Phase 3: run user code WITHOUT reinstalling — libraries are
-            # already present from session.install() above.
+            # already present from session.install() above. Reached only if
+            # install + collect + write all succeeded; otherwise the exception
+            # above propagates and session.run() is NOT called.
             result = session.run(code, libraries=None, timeout=timeout)
+            # Spec §8 L1019 + codex (A) plan 2026-08-08 23:06: session.install()
+            # mutated the shared venv in this container. Even on a successful
+            # run the worker must NOT serve another task because that next task
+            # would inherit the polluted venv while PoolWorker.execution_environment
+            # still holds the baked snapshot — the recorded environmentId
+            # would then disagree with the actual container state.
+            # Mark the container for recycling unconditionally; the pool worker's
+            # _on_job_done observes container_recycled=True and drains the worker
+            # so the next task gets a fresh baked container.
+            container_recycled = True
+            recycle_reason = "post_install_pollution"
+            logger.info(
+                "RUNTIME_ENVIRONMENT_POST_INSTALL_POLLUTION task=%s "
+                "installed=%s recycle_reason=%s",
+                task_id, install_libraries, recycle_reason,
+            )
         else:
             # No dynamic install: just run user code; libraries=[] is a no-op
             # in llm-sandbox and keeps the contract explicit.
@@ -1299,7 +1385,11 @@ def run_in_open_session(
         timings["workspace_cleanup_ms"] = int((time.monotonic() - t_cleanup_start) * 1000)
         if not cleanup_ok:
             container_recycled = True
-            recycle_reason = "cleanup_failed"
+            # Preserve a more specific reason (post-install install/collect/write
+            # failure) over the generic cleanup_failed; both still recycle, but
+            # the operator can act on the root cause.
+            if recycle_reason is None:
+                recycle_reason = "cleanup_failed"
         resource_usage = collector.finish(
             container_id=actual_container_id,
             queue_wait_millis=int(timings.get("queue_wait_ms", 0)),
