@@ -21,7 +21,9 @@ suite needs the service requirements like the other runner/main suites.)
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -54,15 +56,23 @@ from app.bounded_exec_wrapper import (  # noqa: E402
     STDOUT_FILE_NAME,
     UNKNOWN_MARKER_AUDIT_FILE_NAME,
 )
-from app.capture_reader import CAPTURE_FILE_NAMES, read_capture_files  # noqa: E402
+from app.capture_reader import (  # noqa: E402
+    CAPTURE_FILE_NAMES,
+    CAPTURE_SUMMARY_MAX_BYTES,
+    _envelope_ceiling,
+    main as capture_reader_main,
+    read_capture_files,
+)
 from app.config import SandboxConfig  # noqa: E402
 from app.models import BoundedExecRequest, EffectiveOutputLimits  # noqa: E402
 from app.output_capture import MARKER_V1_PREFIX, record_batch_digest  # noqa: E402
 from app.sandbox_runner import (  # noqa: E402
     _read_capture_from_container,
     _resolve_wrapper_interpreter,
+    _run_bounded_wrapper_path,
     _stage_bounded_wrapper,
     run_in_open_session,
+    validate_effective_output_limits,
 )
 
 _LIMIT_KEYS = (
@@ -503,17 +513,25 @@ class CaptureReaderModuleTest(unittest.TestCase):
             capture.mkdir()
             (capture / "capture-result.json").write_text("{}", encoding="utf-8")
             (capture / "stdout.bin").write_bytes(b"abc")
-            document = read_capture_files(capture)
+            document = read_capture_files(
+                capture,
+                stdout_max_bytes=1048576,
+                stderr_max_bytes=262144,
+                record_channel_max_bytes=262144,
+                record_channel_max_records=128,
+            )
             self.assertEqual(
                 set(document["files"]), {"capture-result.json", "stdout.bin"}
             )
             self.assertEqual(
                 base64.b64decode(document["files"]["stdout.bin"]), b"abc"
             )
-            # Container invocation shape: interpreter + capture dir argument.
+            # Container invocation shape: interpreter + capture dir + the four
+            # frozen §13 limit arguments (codex f86c66f5).
             reader_path = Path(sandbox_runner.APP_DIR / "capture_reader.py")
+            limit_args = ["1048576", "262144", "262144", "128"]
             completed = subprocess.run(
-                [sys.executable, str(reader_path), str(capture)],
+                [sys.executable, str(reader_path), str(capture), *limit_args],
                 capture_output=True,
                 text=True,
                 timeout=30,
@@ -523,12 +541,343 @@ class CaptureReaderModuleTest(unittest.TestCase):
             self.assertEqual(emitted, document)
             # Missing capture dir -> non-zero exit (host fails the task).
             missing = subprocess.run(
-                [sys.executable, str(reader_path), str(capture / "nope")],
+                [
+                    sys.executable, str(reader_path), str(capture / "nope"),
+                    *limit_args,
+                ],
                 capture_output=True,
                 text=True,
                 timeout=30,
             )
             self.assertEqual(missing.returncode, 1)
+
+
+# --- reader hardening: malicious capture entries must fail closed ---------
+# §7.1 stop condition (codex f86c66f5 / e083e181): the user script runs with
+# cwd = the task workspace, so MALICIOUS user code can rewrite, replace or
+# symlink the capture files before the readback.  Every attack below must be
+# rejected BEFORE any content is forwarded, and diagnostics must never carry
+# artifact content (§18).
+
+_READER_CAPS = {
+    "stdout_max_bytes": 1024,
+    "stderr_max_bytes": 1024,
+    "record_channel_max_bytes": 1024,
+    "record_channel_max_records": 8,
+}
+
+
+def _read_capture(capture, **overrides):
+    caps = dict(_READER_CAPS)
+    caps.update(overrides)
+    return read_capture_files(capture, **caps)
+
+
+def _run_reader_cli(argv):
+    """Run capture_reader.main() in-process; return (exit_code, stderr)."""
+    stderr_buffer = io.StringIO()
+    with contextlib.redirect_stderr(stderr_buffer):
+        code = capture_reader_main(argv)
+    return code, stderr_buffer.getvalue()
+
+
+class CaptureReaderHardeningTest(unittest.TestCase):
+    """Direct reader tier: tampered capture entries fail closed."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="af-reader-hard-")
+        self.root = Path(self._tmp.name).resolve()
+        self.capture = self.root / "capture"
+        self.capture.mkdir()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _write(self, name, data):
+        (self.capture / name).write_bytes(data)
+        return self.capture / name
+
+    def _cli_args(self):
+        return [str(self.capture), "1024", "1024", "1024", "8"]
+
+    def test_symlinked_stdout_bin_rejected(self):
+        outside = self.root / "outside.bin"
+        outside.write_bytes(b"outside-file-bytes")
+        self._write("capture-result.json", b"{}")
+        os.symlink(str(outside), str(self.capture / "stdout.bin"))
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            _read_capture(self.capture)
+        # main() surfaces the same failure as a non-zero exit.
+        code, stderr_text = _run_reader_cli(self._cli_args())
+        self.assertEqual(code, 1)
+        self.assertNotIn("outside-file-bytes", stderr_text)
+
+    def test_oversized_stdout_bin_rejected_without_content_leak(self):
+        payload = b"EVIL-STDOUT-PAYLOAD" * 200  # 3800 bytes > cap 1024
+        self._write("capture-result.json", b"{}")
+        self._write("stdout.bin", payload)
+        with self.assertRaisesRegex(ValueError, "stdout.bin"):
+            _read_capture(self.capture)
+        code, stderr_text = _run_reader_cli(self._cli_args())
+        self.assertEqual(code, 1)
+        # §18: the diagnostic carries type/message only, never artifact bytes.
+        self.assertNotIn("EVIL-STDOUT-PAYLOAD", stderr_text)
+
+    def test_record_channel_joint_bytes_rejected(self):
+        self._write("capture-result.json", b"{}")
+        # Each file individually small; JOINTLY over the budget.
+        self._write("finance-records.jsonl", b'{"v":1}\n')  # 8 bytes
+        self._write(
+            "finance-records-unknown-marker.jsonl", b"x" * 1020 + b"\n"
+        )  # 1021 bytes
+        with self.assertRaisesRegex(ValueError, "jointly"):
+            _read_capture(self.capture, record_channel_max_bytes=1024)
+
+    def test_record_line_count_rejected(self):
+        self._write("capture-result.json", b"{}")
+        lines = b"".join(b'{"v":%d}\n' % index for index in range(20))
+        self._write("finance-records.jsonl", lines)
+        with self.assertRaisesRegex(ValueError, "record_channel_max_records"):
+            _read_capture(self.capture)
+
+    def test_oversized_capture_summary_rejected(self):
+        big_summary = b"{" + b" " * CAPTURE_SUMMARY_MAX_BYTES + b"}"
+        self._write("capture-result.json", big_summary)
+        with self.assertRaisesRegex(ValueError, "capture-result.json"):
+            _read_capture(self.capture)
+
+    def test_directory_in_place_of_stdout_bin_rejected(self):
+        self._write("capture-result.json", b"{}")
+        (self.capture / "stdout.bin").mkdir()
+        with self.assertRaisesRegex(ValueError, "regular file"):
+            _read_capture(self.capture)
+
+    def test_fifo_in_place_of_stdout_bin_rejected(self):
+        self._write("capture-result.json", b"{}")
+        os.mkfifo(str(self.capture / "stdout.bin"))
+        with self.assertRaisesRegex(ValueError, "regular file"):
+            _read_capture(self.capture)
+
+    def test_wrong_arg_count_exits_2(self):
+        for argv in (
+            [],
+            [str(self.capture)],
+            [str(self.capture), "1024", "1024", "1024"],
+            [str(self.capture), "1024", "1024", "1024", "8", "extra"],
+        ):
+            with self.subTest(argv=argv):
+                code, stderr_text = _run_reader_cli(argv)
+                self.assertEqual(code, 2)
+                self.assertIn("usage", stderr_text)
+
+    def test_non_integer_limits_exit_2(self):
+        for bad in ("abc", "1.5", "", "0x10"):
+            with self.subTest(bad=bad):
+                argv = [str(self.capture), bad, "1024", "1024", "8"]
+                code, stderr_text = _run_reader_cli(argv)
+                self.assertEqual(code, 2)
+                self.assertIn("integer", stderr_text)
+
+    def test_envelope_ceiling_monotonic_and_bounds_documents(self):
+        base = _envelope_ceiling(1024, 512, 256)
+        self.assertLessEqual(base, _envelope_ceiling(2048, 512, 256))
+        self.assertLessEqual(base, _envelope_ceiling(1024, 1024, 256))
+        self.assertLessEqual(base, _envelope_ceiling(1024, 512, 512))
+        # The happy-path document fits under the ceiling.
+        self._write("capture-result.json", b'{"exitCode": 0}')
+        self._write("stdout.bin", b"ordinary-line\n")
+        self._write("stderr.bin", b"")
+        document = _read_capture(self.capture)
+        self.assertLessEqual(
+            len(json.dumps(document)),
+            _envelope_ceiling(
+                _READER_CAPS["stdout_max_bytes"],
+                _READER_CAPS["stderr_max_bytes"],
+                _READER_CAPS["record_channel_max_bytes"],
+            ),
+        )
+
+
+class EffectiveOutputLimitsValidatorTest(unittest.TestCase):
+    """§13/codex f86c66f5: the runner never indexes an unvalidated dict."""
+
+    def test_valid_payload_with_source_revision(self):
+        result = validate_effective_output_limits(dict(_LIMITS))
+        self.assertEqual(set(result), set(_LIMIT_KEYS))
+        for key in _LIMIT_KEYS:
+            self.assertEqual(result[key], _LIMITS[key])
+        self.assertNotIn("sourceRevision", result)
+
+    def test_valid_payload_without_source_revision(self):
+        payload = {key: _LIMITS[key] for key in _LIMIT_KEYS}
+        result = validate_effective_output_limits(payload)
+        self.assertEqual(result, payload)
+        self.assertIsNot(result, payload)  # a FRESH dict
+
+    def test_missing_limit_key_raises(self):
+        payload = {key: _LIMITS[key] for key in _LIMIT_KEYS}
+        del payload["recordChannelMaxRecords"]
+        with self.assertRaisesRegex(ValueError, "recordChannelMaxRecords"):
+            validate_effective_output_limits(payload)
+
+    def test_unknown_extra_key_raises(self):
+        payload = dict(_LIMITS)
+        payload["surprise"] = 1
+        with self.assertRaisesRegex(ValueError, "surprise"):
+            validate_effective_output_limits(payload)
+
+    def test_non_dict_payload_raises(self):
+        for payload in (None, [1, 2], "limits", 42):
+            with self.subTest(payload=payload):
+                with self.assertRaises(ValueError):
+                    validate_effective_output_limits(payload)
+
+    def test_invalid_limit_values_raise(self):
+        cases = {
+            "bool": True,
+            "negative": -1,
+            "float": 1.5,
+            "string": "1024",
+            "none": None,
+        }
+        for name, value in cases.items():
+            with self.subTest(case=name):
+                payload = {key: _LIMITS[key] for key in _LIMIT_KEYS}
+                payload["stdoutMaxBytes"] = value
+                with self.assertRaisesRegex(ValueError, "stdoutMaxBytes"):
+                    validate_effective_output_limits(payload)
+
+    def test_non_string_source_revision_raises(self):
+        payload = dict(_LIMITS)
+        payload["sourceRevision"] = 42
+        with self.assertRaisesRegex(ValueError, "sourceRevision"):
+            validate_effective_output_limits(payload)
+
+    def test_wrapper_path_validates_before_any_session_use(self):
+        config = _test_config(
+            Path(tempfile.gettempdir()), skip_environment_setup=True
+        )
+        malformed = dict(_LIMITS)
+        malformed["stdoutMaxBytes"] = -5
+        # session=None + a non-empty install list: validation must raise
+        # BEFORE any session interaction (install/interpreter/exec).
+        with self.assertRaisesRegex(ValueError, "stdoutMaxBytes"):
+            _run_bounded_wrapper_path(
+                None,
+                config,
+                "task-validate",
+                f"{config.workspace_root}/task-validate",
+                "print(1)",
+                ["pandas"],
+                30.0,
+                malformed,
+            )
+
+
+class CaptureTamperingWiringTest(unittest.TestCase):
+    """Production wiring tier: MALICIOUS user code tampering with the
+    capture files must fail the task at readback (§7.1 stop condition, codex
+    f86c66f5 / e083e181).  Same harness as WrapperPathFunctionalTest: the
+    REAL staged wrapper and capture reader run as host subprocesses, the
+    user script with cwd = task workspace and the capture dir at capture/.
+
+    The tamper is deterministic: the wrapper opens stdout.bin and
+    finance-records.jsonl BEFORE spawning the child and never reopens them,
+    so a user-script ``os.replace`` of the directory entry leaves the
+    wrapper writing to an orphaned inode while the tampered entry survives
+    until the readback.
+    """
+
+    _TAMPER_LIMITS = {
+        "stdoutMaxBytes": 1024,
+        "stderrMaxBytes": 1024,
+        "recordChannelMaxBytes": 512,
+        "recordChannelMaxRecords": 8,
+        "sourceRevision": "static-default",
+    }
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="af-tamper-test-")
+        self.root = Path(self._tmp.name).resolve()
+        _make_dataset(self.root)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _run(self, code, *, task_id="task-tamper"):
+        config = _test_config(self.root, skip_environment_setup=False)
+        session = FakeContainerSession(
+            self.root, skip_environment_setup=False
+        )
+        return run_in_open_session(
+            config,
+            session,
+            task_id,
+            "ds1",
+            None,
+            code,
+            None,
+            None,
+            30,
+            effective_output_limits=dict(self._TAMPER_LIMITS),
+        )
+
+    def test_oversized_stdout_rewrite_fails_readback_without_leak(self):
+        code = (
+            "import os\n"
+            "with open(os.path.join('capture', 'stdout.bin.evil'), 'wb') as fh:\n"
+            "    fh.write(b'EVIL-INJECTED-PAYLOAD' * 200)\n"
+            "os.replace(\n"
+            "    os.path.join('capture', 'stdout.bin.evil'),\n"
+            "    os.path.join('capture', 'stdout.bin'),\n"
+            ")\n"
+            "print('ordinary-line')\n"
+        )
+        with self.assertRaises(RuntimeError) as ctx:
+            self._run(code)
+        self.assertIn("capture readback failed", str(ctx.exception))
+        # §18: the injected payload never reaches the error text.
+        self.assertNotIn("EVIL-INJECTED-PAYLOAD", str(ctx.exception))
+
+    def test_symlinked_stdout_bin_fails_readback(self):
+        code = (
+            "import os\n"
+            "with open('big-target.dat', 'wb') as fh:\n"
+            "    fh.write(b'Z' * 100000)\n"
+            "os.makedirs('capture', exist_ok=True)\n"
+            "link = os.path.join('capture', 'stdout.bin')\n"
+            "if os.path.lexists(link):\n"
+            "    os.remove(link)\n"
+            "os.symlink(os.path.abspath('big-target.dat'), link)\n"
+            "print('ordinary-line')\n"
+        )
+        with self.assertRaises(RuntimeError) as ctx:
+            self._run(code)
+        self.assertNotIn("Z" * 64, str(ctx.exception))
+
+    def test_record_channel_joint_bytes_fails_readback(self):
+        # Each file individually small; JOINTLY over recordChannelMaxBytes.
+        # os.replace swaps the directory entry, so the wrapper's pre-opened
+        # fd keeps writing to the orphaned original inode.
+        code = (
+            "import os\n"
+            "with open(os.path.join('capture', 'records.evil'), 'wb') as fh:\n"
+            "    fh.write(b'{\"v\":1}\\n' * 30)\n"
+            "os.replace(\n"
+            "    os.path.join('capture', 'records.evil'),\n"
+            "    os.path.join('capture', 'finance-records.jsonl'),\n"
+            ")\n"
+            "with open(os.path.join('capture', 'audit.evil'), 'wb') as fh:\n"
+            "    fh.write(b'y' * 300)\n"
+            "os.replace(\n"
+            "    os.path.join('capture', 'audit.evil'),\n"
+            "    os.path.join('capture', 'finance-records-unknown-marker.jsonl'),\n"
+            ")\n"
+            "print('ordinary-line')\n"
+        )
+        with self.assertRaises(RuntimeError) as ctx:
+            self._run(code)
+        self.assertIn("capture readback failed", str(ctx.exception))
 
 
 class CreateTaskSnapshotTest(unittest.IsolatedAsyncioTestCase):

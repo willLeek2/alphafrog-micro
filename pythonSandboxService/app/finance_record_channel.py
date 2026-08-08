@@ -47,8 +47,10 @@ requires:
   the Task (§7.1 step 8).  It is FAIL-CLOSED about artifact consistency: the
   wrapper is the sole producer of these files, so any missing/extra/tampered
   artifact (strictly typed whole-summary validation, byte-length agreement
-  with the declared counters, marker-prefix checks) raises ``ValueError`` and
-  fails the task instead of silently forwarding a half-formed channel.
+  with the declared counters, marker-prefix checks, host-side re-validation
+  of the frozen §13 record-channel caps — codex f86c66f5 / e083e181) raises
+  ``ValueError`` and fails the task instead of silently forwarding a
+  half-formed channel.
 
 Stdlib only (no pydantic) so the mapping/reassembly semantics stay testable
 in every environment; the Pydantic DTO assignment lives in the caller
@@ -369,7 +371,12 @@ def _validate_summary_shape(summary: Dict) -> None:
 
 
 def read_capture_artifacts(
-    capture_dir, *, stdout_max_bytes: int, stderr_max_bytes: int
+    capture_dir,
+    *,
+    stdout_max_bytes: int,
+    stderr_max_bytes: int,
+    record_channel_max_bytes: int,
+    record_channel_max_records: int,
 ) -> Dict:
     """Read the wrapper's bounded outputs (§7.1 step 7, BEFORE cleanup).
 
@@ -407,11 +414,20 @@ def read_capture_artifacts(
       newline-terminated lines, and every line starts with the §4.1 marker
       family prefix.  An absent audit file requires zero declared
       lines/bytes.
+    * Host-side RE-validation of the frozen §13 record-channel caps (codex
+      f86c66f5 / e083e181 — the container reader alone is never trusted):
+      ``summary["emittedRecordCount"]`` <= ``record_channel_max_records``,
+      and the records file + unknown-marker audit file raw bytes JOINTLY <=
+      ``record_channel_max_bytes`` (the §4.1/§4.2 single joint budget).
     """
     if stdout_max_bytes < 0:
         raise ValueError("stdout_max_bytes must be >= 0")
     if stderr_max_bytes < 0:
         raise ValueError("stderr_max_bytes must be >= 0")
+    if record_channel_max_bytes < 0:
+        raise ValueError("record_channel_max_bytes must be >= 0")
+    if record_channel_max_records < 0:
+        raise ValueError("record_channel_max_records must be >= 0")
 
     capture_path = Path(capture_dir)
     summary_file = capture_path / CAPTURE_RESULT_FILE_NAME
@@ -432,6 +448,17 @@ def read_capture_artifacts(
     # §5.1 channel fields: strict presence + type validation (raises on any
     # malformed channel field).
     channel = finance_channel_from_capture(summary)
+
+    # Host-side RE-validation of the frozen §13 count cap (codex f86c66f5 /
+    # e083e181): never trust the container reader alone.  The wrapper keeps
+    # emittedRecordCount within the count limit (an over-limit record drops
+    # the whole batch), so any excess here is a tampered summary.
+    if summary["emittedRecordCount"] > record_channel_max_records:
+        raise ValueError(
+            "capture inconsistent: summary declares emittedRecordCount="
+            f"{summary['emittedRecordCount']}, over "
+            f"record_channel_max_records={record_channel_max_records}"
+        )
 
     def _read_capture_file(name: str, *, required: bool):
         path = capture_path / name
@@ -549,6 +576,18 @@ def read_capture_artifacts(
                 "capture inconsistent: unknownMarkerLines=0 but "
                 f"unknownMarkerBytes={declared_audit_bytes}"
             )
+
+    # JOINT record-channel budget re-validation (§4.1/§4.2, codex f86c66f5 /
+    # e083e181): the records file and the unknown-marker audit file together
+    # must stay within recordChannelMaxBytes — measured on the raw payloads
+    # actually on disk, never on self-reported counters.
+    joint_bytes = len(records_raw or b"") + len(audit_raw or b"")
+    if joint_bytes > record_channel_max_bytes:
+        raise ValueError(
+            "capture inconsistent: record-channel files hold "
+            f"{joint_bytes} bytes jointly, over "
+            f"record_channel_max_bytes={record_channel_max_bytes}"
+        )
 
     _verify_capture_consistency(summary, record_payloads)
     stdout_view = reassemble_bounded_stdout(

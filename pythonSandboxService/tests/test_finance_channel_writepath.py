@@ -361,7 +361,11 @@ class TestReadCaptureArtifacts(unittest.TestCase):
             records=[payload],
         )
         artifacts = read_capture_artifacts(
-            self._tmp, stdout_max_bytes=1048576, stderr_max_bytes=1048576
+            self._tmp,
+            stdout_max_bytes=1048576,
+            stderr_max_bytes=1048576,
+            record_channel_max_bytes=1048576,
+            record_channel_max_records=1024,
         )
         self.assertEqual(artifacts["exit_code"], 0)
         self.assertEqual(
@@ -388,7 +392,11 @@ class TestReadCaptureArtifacts(unittest.TestCase):
             records=[],
         )
         artifacts = read_capture_artifacts(
-            self._tmp, stdout_max_bytes=1048576, stderr_max_bytes=1048576
+            self._tmp,
+            stdout_max_bytes=1048576,
+            stderr_max_bytes=1048576,
+            record_channel_max_bytes=1048576,
+            record_channel_max_records=1024,
         )
         self.assertEqual(artifacts["stdout_bytes"], b"only-ordinary\n")
         self.assertEqual(artifacts["channel"]["emitted_record_count"], 0)
@@ -409,18 +417,34 @@ class TestReadCaptureArtifacts(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "records file"):
             read_capture_artifacts(
-                self._tmp, stdout_max_bytes=1048576, stderr_max_bytes=1048576
+                self._tmp,
+                stdout_max_bytes=1048576,
+                stderr_max_bytes=1048576,
+                record_channel_max_bytes=1048576,
+                record_channel_max_records=1024,
             )
 
     def test_missing_summary_raises(self):
         with self.assertRaisesRegex(ValueError, "capture summary"):
-            read_capture_artifacts(self._tmp, stdout_max_bytes=1024, stderr_max_bytes=1024)
+            read_capture_artifacts(
+                self._tmp,
+                stdout_max_bytes=1024,
+                stderr_max_bytes=1024,
+                record_channel_max_bytes=1048576,
+                record_channel_max_records=1024,
+            )
 
     def test_malformed_summary_raises(self):
         with open(os.path.join(self._tmp, "capture-result.json"), "w") as fh:
             fh.write("{not json")
         with self.assertRaisesRegex(ValueError, "not valid JSON"):
-            read_capture_artifacts(self._tmp, stdout_max_bytes=1024, stderr_max_bytes=1024)
+            read_capture_artifacts(
+                self._tmp,
+                stdout_max_bytes=1024,
+                stderr_max_bytes=1024,
+                record_channel_max_bytes=1048576,
+                record_channel_max_records=1024,
+            )
 
     def test_summary_without_exit_code_raises(self):
         summary = _summary()
@@ -428,7 +452,13 @@ class TestReadCaptureArtifacts(unittest.TestCase):
         with open(os.path.join(self._tmp, "capture-result.json"), "w") as fh:
             json.dump(summary, fh)
         with self.assertRaisesRegex(ValueError, "exitCode"):
-            read_capture_artifacts(self._tmp, stdout_max_bytes=1024, stderr_max_bytes=1024)
+            read_capture_artifacts(
+                self._tmp,
+                stdout_max_bytes=1024,
+                stderr_max_bytes=1024,
+                record_channel_max_bytes=1048576,
+                record_channel_max_records=1024,
+            )
 
     # --- record-channel consistency (records never silently lost) ---------
 
@@ -444,7 +474,13 @@ class TestReadCaptureArtifacts(unittest.TestCase):
             records=None,  # no finance-records.jsonl on disk
         )
         with self.assertRaisesRegex(ValueError, "records file"):
-            read_capture_artifacts(self._tmp, stdout_max_bytes=1024, stderr_max_bytes=1024)
+            read_capture_artifacts(
+                self._tmp,
+                stdout_max_bytes=1024,
+                stderr_max_bytes=1024,
+                record_channel_max_bytes=1048576,
+                record_channel_max_records=1024,
+            )
 
     def test_complete_summary_with_wrong_record_count_raises(self):
         payload = b'{"v":1}'
@@ -458,7 +494,13 @@ class TestReadCaptureArtifacts(unittest.TestCase):
             records=[payload],
         )
         with self.assertRaisesRegex(ValueError, "emittedRecordCount"):
-            read_capture_artifacts(self._tmp, stdout_max_bytes=1024, stderr_max_bytes=1024)
+            read_capture_artifacts(
+                self._tmp,
+                stdout_max_bytes=1024,
+                stderr_max_bytes=1024,
+                record_channel_max_bytes=1048576,
+                record_channel_max_records=1024,
+            )
 
     def test_complete_summary_with_wrong_record_bytes_raises(self):
         payload = b'{"v":1}'
@@ -471,7 +513,13 @@ class TestReadCaptureArtifacts(unittest.TestCase):
             records=[payload],
         )
         with self.assertRaisesRegex(ValueError, "emittedRecordBytes"):
-            read_capture_artifacts(self._tmp, stdout_max_bytes=1024, stderr_max_bytes=1024)
+            read_capture_artifacts(
+                self._tmp,
+                stdout_max_bytes=1024,
+                stderr_max_bytes=1024,
+                record_channel_max_bytes=1048576,
+                record_channel_max_records=1024,
+            )
 
     def test_complete_summary_with_digest_mismatch_raises(self):
         payload = b'{"v":1}'
@@ -485,7 +533,13 @@ class TestReadCaptureArtifacts(unittest.TestCase):
             records=[payload],
         )
         with self.assertRaisesRegex(ValueError, "recordDigest mismatch"):
-            read_capture_artifacts(self._tmp, stdout_max_bytes=1024, stderr_max_bytes=1024)
+            read_capture_artifacts(
+                self._tmp,
+                stdout_max_bytes=1024,
+                stderr_max_bytes=1024,
+                record_channel_max_bytes=1048576,
+                record_channel_max_records=1024,
+            )
 
     def test_incomplete_batch_with_leftover_records_file_raises(self):
         # recordSetComplete=false means the wrapper deleted the batch file;
@@ -503,7 +557,13 @@ class TestReadCaptureArtifacts(unittest.TestCase):
             records=[payload],
         )
         with self.assertRaisesRegex(ValueError, "deleted the batch file"):
-            read_capture_artifacts(self._tmp, stdout_max_bytes=1024, stderr_max_bytes=1024)
+            read_capture_artifacts(
+                self._tmp,
+                stdout_max_bytes=1024,
+                stderr_max_bytes=1024,
+                record_channel_max_bytes=1048576,
+                record_channel_max_records=1024,
+            )
 
     def test_incomplete_batch_without_drop_reason_raises(self):
         self._write_capture(
@@ -517,7 +577,13 @@ class TestReadCaptureArtifacts(unittest.TestCase):
             stdout=b"ok\n",
         )
         with self.assertRaisesRegex(ValueError, "dropReason"):
-            read_capture_artifacts(self._tmp, stdout_max_bytes=1024, stderr_max_bytes=1024)
+            read_capture_artifacts(
+                self._tmp,
+                stdout_max_bytes=1024,
+                stderr_max_bytes=1024,
+                record_channel_max_bytes=1048576,
+                record_channel_max_records=1024,
+            )
 
     def test_complete_summary_with_nonempty_drop_reason_raises(self):
         self._write_capture(
@@ -532,7 +598,13 @@ class TestReadCaptureArtifacts(unittest.TestCase):
             records=[],
         )
         with self.assertRaisesRegex(ValueError, "dropReason"):
-            read_capture_artifacts(self._tmp, stdout_max_bytes=1024, stderr_max_bytes=1024)
+            read_capture_artifacts(
+                self._tmp,
+                stdout_max_bytes=1024,
+                stderr_max_bytes=1024,
+                record_channel_max_bytes=1048576,
+                record_channel_max_records=1024,
+            )
 
     def test_incomplete_batch_with_no_records_is_readable(self):
         # A legitimately dropped batch: complete=false, dropReason set, and
@@ -548,7 +620,13 @@ class TestReadCaptureArtifacts(unittest.TestCase):
             ),
             stdout=b"ordinary only\n",
         )
-        artifacts = read_capture_artifacts(self._tmp, stdout_max_bytes=1024, stderr_max_bytes=1024)
+        artifacts = read_capture_artifacts(
+            self._tmp,
+            stdout_max_bytes=1024,
+            stderr_max_bytes=1024,
+            record_channel_max_bytes=1048576,
+            record_channel_max_records=1024,
+        )
         self.assertEqual(artifacts["stdout_bytes"], b"ordinary only\n")
         self.assertFalse(artifacts["channel"]["record_set_complete"])
         self.assertTrue(artifacts["channel"]["drop_reason"])
@@ -577,7 +655,13 @@ class TestReadCaptureArtifacts(unittest.TestCase):
             records=[],
             audit=unknown,
         )
-        artifacts = read_capture_artifacts(self._tmp, stdout_max_bytes=1024, stderr_max_bytes=1024)
+        artifacts = read_capture_artifacts(
+            self._tmp,
+            stdout_max_bytes=1024,
+            stderr_max_bytes=1024,
+            record_channel_max_bytes=1048576,
+            record_channel_max_records=1024,
+        )
         self.assertEqual(
             artifacts["stdout_bytes"],
             b"rows=2\n" + unknown[0] + b"\n" + unknown[1] + b"\n",
@@ -607,7 +691,13 @@ class TestReadCaptureArtifacts(unittest.TestCase):
             records=[payload],
             audit=unknown,
         )
-        artifacts = read_capture_artifacts(self._tmp, stdout_max_bytes=1024, stderr_max_bytes=1024)
+        artifacts = read_capture_artifacts(
+            self._tmp,
+            stdout_max_bytes=1024,
+            stderr_max_bytes=1024,
+            record_channel_max_bytes=1048576,
+            record_channel_max_records=1024,
+        )
         self.assertEqual(
             artifacts["stdout_bytes"],
             b"rows=5\n"
@@ -633,7 +723,13 @@ class TestReadCaptureArtifacts(unittest.TestCase):
             records=[],
             audit=unknown,
         )
-        artifacts = read_capture_artifacts(self._tmp, stdout_max_bytes=1024, stderr_max_bytes=1024)
+        artifacts = read_capture_artifacts(
+            self._tmp,
+            stdout_max_bytes=1024,
+            stderr_max_bytes=1024,
+            record_channel_max_bytes=1048576,
+            record_channel_max_records=1024,
+        )
         self.assertEqual(
             artifacts["stdout_bytes"], b"done\n" + unknown[0] + b"\n"
         )
@@ -656,7 +752,13 @@ class TestReadCaptureArtifacts(unittest.TestCase):
             records=[payload],
             audit=unknown,
         )
-        artifacts = read_capture_artifacts(self._tmp, stdout_max_bytes=1024, stderr_max_bytes=1024)
+        artifacts = read_capture_artifacts(
+            self._tmp,
+            stdout_max_bytes=1024,
+            stderr_max_bytes=1024,
+            record_channel_max_bytes=1048576,
+            record_channel_max_records=1024,
+        )
         self.assertEqual(
             artifacts["stdout_bytes"],
             ordinary
@@ -677,7 +779,13 @@ class TestReadCaptureArtifacts(unittest.TestCase):
             align_byte_counters=False,  # declares ordinaryStdoutBytes=7
         )
         with self.assertRaisesRegex(ValueError, "ordinaryStdoutBytes"):
-            read_capture_artifacts(self._tmp, stdout_max_bytes=1024, stderr_max_bytes=1024)
+            read_capture_artifacts(
+                self._tmp,
+                stdout_max_bytes=1024,
+                stderr_max_bytes=1024,
+                record_channel_max_bytes=1048576,
+                record_channel_max_records=1024,
+            )
 
     def test_stdout_bin_longer_than_declared_raises(self):
         summary = _summary(ordinaryStdoutBytes=2)
@@ -685,7 +793,13 @@ class TestReadCaptureArtifacts(unittest.TestCase):
             summary, stdout=b"ok\n", records=[b'{"v":1}'], align_byte_counters=False
         )
         with self.assertRaisesRegex(ValueError, "ordinaryStdoutBytes"):
-            read_capture_artifacts(self._tmp, stdout_max_bytes=1024, stderr_max_bytes=1024)
+            read_capture_artifacts(
+                self._tmp,
+                stdout_max_bytes=1024,
+                stderr_max_bytes=1024,
+                record_channel_max_bytes=1048576,
+                record_channel_max_records=1024,
+            )
 
     def test_missing_stdout_bin_raises(self):
         summary = _summary(ordinaryStdoutBytes=0)
@@ -696,7 +810,13 @@ class TestReadCaptureArtifacts(unittest.TestCase):
             fh.write(b"")
         # stdout.bin deliberately NOT written
         with self.assertRaisesRegex(ValueError, "stdout.bin"):
-            read_capture_artifacts(self._tmp, stdout_max_bytes=1024, stderr_max_bytes=1024)
+            read_capture_artifacts(
+                self._tmp,
+                stdout_max_bytes=1024,
+                stderr_max_bytes=1024,
+                record_channel_max_bytes=1048576,
+                record_channel_max_records=1024,
+            )
 
     def test_missing_stderr_bin_raises(self):
         summary = _summary(ordinaryStdoutBytes=0)
@@ -707,19 +827,37 @@ class TestReadCaptureArtifacts(unittest.TestCase):
             fh.write(b"")
         # stderr.bin deliberately NOT written
         with self.assertRaisesRegex(ValueError, "stderr.bin"):
-            read_capture_artifacts(self._tmp, stdout_max_bytes=1024, stderr_max_bytes=1024)
+            read_capture_artifacts(
+                self._tmp,
+                stdout_max_bytes=1024,
+                stderr_max_bytes=1024,
+                record_channel_max_bytes=1048576,
+                record_channel_max_records=1024,
+            )
 
     def test_stderr_over_stderr_max_bytes_raises(self):
         stderr = b"e" * 2048
         self._write_capture(_summary(), stdout=b"ok\n", stderr=stderr, records=[])
         with self.assertRaisesRegex(ValueError, "stderr_max_bytes"):
-            read_capture_artifacts(self._tmp, stdout_max_bytes=1024, stderr_max_bytes=1024)
+            read_capture_artifacts(
+                self._tmp,
+                stdout_max_bytes=1024,
+                stderr_max_bytes=1024,
+                record_channel_max_bytes=1048576,
+                record_channel_max_records=1024,
+            )
 
     def test_stdout_over_stdout_max_bytes_raises(self):
         stdout = b"o" * 2048
         self._write_capture(_summary(), stdout=stdout, records=[])
         with self.assertRaisesRegex(ValueError, "stdout_max_bytes"):
-            read_capture_artifacts(self._tmp, stdout_max_bytes=1024, stderr_max_bytes=1024)
+            read_capture_artifacts(
+                self._tmp,
+                stdout_max_bytes=1024,
+                stderr_max_bytes=1024,
+                record_channel_max_bytes=1048576,
+                record_channel_max_records=1024,
+            )
 
     def test_audit_bytes_mismatch_raises(self):
         unknown = [b"__AF_FINANCE_RESULT_v2__" + b'{"value":9}']
@@ -736,7 +874,13 @@ class TestReadCaptureArtifacts(unittest.TestCase):
             audit=unknown,
         )
         with self.assertRaisesRegex(ValueError, "unknownMarkerBytes"):
-            read_capture_artifacts(self._tmp, stdout_max_bytes=1024, stderr_max_bytes=1024)
+            read_capture_artifacts(
+                self._tmp,
+                stdout_max_bytes=1024,
+                stderr_max_bytes=1024,
+                record_channel_max_bytes=1048576,
+                record_channel_max_records=1024,
+            )
 
     def test_audit_line_count_mismatch_raises(self):
         unknown = [
@@ -757,7 +901,13 @@ class TestReadCaptureArtifacts(unittest.TestCase):
             audit=unknown,
         )
         with self.assertRaisesRegex(ValueError, "unknownMarkerLines"):
-            read_capture_artifacts(self._tmp, stdout_max_bytes=1024, stderr_max_bytes=1024)
+            read_capture_artifacts(
+                self._tmp,
+                stdout_max_bytes=1024,
+                stderr_max_bytes=1024,
+                record_channel_max_bytes=1048576,
+                record_channel_max_records=1024,
+            )
 
     def test_audit_line_lacking_marker_prefix_raises(self):
         unknown = [b"not-a-marker-line-at-all"]
@@ -774,7 +924,13 @@ class TestReadCaptureArtifacts(unittest.TestCase):
             audit=unknown,
         )
         with self.assertRaisesRegex(ValueError, "marker family prefix"):
-            read_capture_artifacts(self._tmp, stdout_max_bytes=1024, stderr_max_bytes=1024)
+            read_capture_artifacts(
+                self._tmp,
+                stdout_max_bytes=1024,
+                stderr_max_bytes=1024,
+                record_channel_max_bytes=1048576,
+                record_channel_max_records=1024,
+            )
 
     def test_audit_file_present_but_zero_declared_lines_raises(self):
         unknown = [b"__AF_FINANCE_RESULT_v2__" + b'{"value":9}']
@@ -791,7 +947,13 @@ class TestReadCaptureArtifacts(unittest.TestCase):
             audit=unknown,  # exists iff lines > 0 — violation
         )
         with self.assertRaisesRegex(ValueError, "unknownMarkerLines=0"):
-            read_capture_artifacts(self._tmp, stdout_max_bytes=1024, stderr_max_bytes=1024)
+            read_capture_artifacts(
+                self._tmp,
+                stdout_max_bytes=1024,
+                stderr_max_bytes=1024,
+                record_channel_max_bytes=1048576,
+                record_channel_max_records=1024,
+            )
 
     def test_declared_audit_lines_but_missing_file_raises(self):
         self._write_capture(
@@ -807,7 +969,13 @@ class TestReadCaptureArtifacts(unittest.TestCase):
             audit=None,  # file absent despite declared lines
         )
         with self.assertRaisesRegex(ValueError, "unknown-marker"):
-            read_capture_artifacts(self._tmp, stdout_max_bytes=1024, stderr_max_bytes=1024)
+            read_capture_artifacts(
+                self._tmp,
+                stdout_max_bytes=1024,
+                stderr_max_bytes=1024,
+                record_channel_max_bytes=1048576,
+                record_channel_max_records=1024,
+            )
 
     def test_zero_audit_lines_but_nonzero_audit_bytes_raises(self):
         self._write_capture(
@@ -822,7 +990,13 @@ class TestReadCaptureArtifacts(unittest.TestCase):
             records=[],
         )
         with self.assertRaisesRegex(ValueError, "unknownMarkerBytes"):
-            read_capture_artifacts(self._tmp, stdout_max_bytes=1024, stderr_max_bytes=1024)
+            read_capture_artifacts(
+                self._tmp,
+                stdout_max_bytes=1024,
+                stderr_max_bytes=1024,
+                record_channel_max_bytes=1048576,
+                record_channel_max_records=1024,
+            )
 
     def test_incomplete_batch_with_leftover_empty_records_file_raises(self):
         # recordSetComplete=false means the wrapper DELETED the batch file;
@@ -839,7 +1013,13 @@ class TestReadCaptureArtifacts(unittest.TestCase):
             records=[],  # empty leftover file
         )
         with self.assertRaisesRegex(ValueError, "deleted the batch file"):
-            read_capture_artifacts(self._tmp, stdout_max_bytes=1024, stderr_max_bytes=1024)
+            read_capture_artifacts(
+                self._tmp,
+                stdout_max_bytes=1024,
+                stderr_max_bytes=1024,
+                record_channel_max_bytes=1048576,
+                record_channel_max_records=1024,
+            )
 
     # --- fail-closed whole-summary validation ----------------------------
 
@@ -848,14 +1028,26 @@ class TestReadCaptureArtifacts(unittest.TestCase):
             _summary(exitCode=True), stdout=b"ok\n", records=[]
         )
         with self.assertRaisesRegex(ValueError, "exitCode"):
-            read_capture_artifacts(self._tmp, stdout_max_bytes=1024, stderr_max_bytes=1024)
+            read_capture_artifacts(
+                self._tmp,
+                stdout_max_bytes=1024,
+                stderr_max_bytes=1024,
+                record_channel_max_bytes=1048576,
+                record_channel_max_records=1024,
+            )
 
     def test_counter_as_bool_rejected(self):
         self._write_capture(
             _summary(unknownMarkerLines=True), stdout=b"ok\n", records=[]
         )
         with self.assertRaisesRegex(ValueError, "unknownMarkerLines"):
-            read_capture_artifacts(self._tmp, stdout_max_bytes=1024, stderr_max_bytes=1024)
+            read_capture_artifacts(
+                self._tmp,
+                stdout_max_bytes=1024,
+                stderr_max_bytes=1024,
+                record_channel_max_bytes=1048576,
+                record_channel_max_records=1024,
+            )
 
     def test_negative_counter_rejected(self):
         self._write_capture(
@@ -863,35 +1055,120 @@ class TestReadCaptureArtifacts(unittest.TestCase):
             align_byte_counters=False,
         )
         with self.assertRaisesRegex(ValueError, "stderrBytes"):
-            read_capture_artifacts(self._tmp, stdout_max_bytes=1024, stderr_max_bytes=1024)
+            read_capture_artifacts(
+                self._tmp,
+                stdout_max_bytes=1024,
+                stderr_max_bytes=1024,
+                record_channel_max_bytes=1048576,
+                record_channel_max_records=1024,
+            )
 
     def test_non_bool_truncation_flag_rejected(self):
         self._write_capture(
             _summary(unknownMarkerTruncated="yes"), stdout=b"ok\n", records=[]
         )
         with self.assertRaisesRegex(ValueError, "unknownMarkerTruncated"):
-            read_capture_artifacts(self._tmp, stdout_max_bytes=1024, stderr_max_bytes=1024)
+            read_capture_artifacts(
+                self._tmp,
+                stdout_max_bytes=1024,
+                stderr_max_bytes=1024,
+                record_channel_max_bytes=1048576,
+                record_channel_max_records=1024,
+            )
 
     def test_unknown_extra_summary_key_rejected(self):
         self._write_capture(
             _summary(surpriseKey=1), stdout=b"ok\n", records=[]
         )
         with self.assertRaisesRegex(ValueError, "unknown key"):
-            read_capture_artifacts(self._tmp, stdout_max_bytes=1024, stderr_max_bytes=1024)
+            read_capture_artifacts(
+                self._tmp,
+                stdout_max_bytes=1024,
+                stderr_max_bytes=1024,
+                record_channel_max_bytes=1048576,
+                record_channel_max_records=1024,
+            )
 
     def test_missing_summary_key_rejected(self):
         summary = _summary()
         del summary["unknownMarkerLines"]
         self._write_capture(summary, stdout=b"ok\n", records=[])
         with self.assertRaisesRegex(ValueError, "unknownMarkerLines"):
-            read_capture_artifacts(self._tmp, stdout_max_bytes=1024, stderr_max_bytes=1024)
+            read_capture_artifacts(
+                self._tmp,
+                stdout_max_bytes=1024,
+                stderr_max_bytes=1024,
+                record_channel_max_bytes=1048576,
+                record_channel_max_records=1024,
+            )
+
+    # --- host-side record-channel cap re-validation (§13, codex f86c66f5 /
+    # e083e181: never trust the container reader alone) --------------------
+
+    def test_emitted_record_count_over_record_cap_raises(self):
+        # The capture is INTERNALLY CONSISTENT (count/bytes/digest all agree
+        # with the records file); only the frozen §13 count cap is violated —
+        # the host re-validates it instead of trusting the container reader.
+        payloads = [b'{"v":%d}' % index for index in range(3)]
+        self._write_capture(
+            _summary(
+                emittedRecordCount=len(payloads),
+                emittedRecordBytes=sum(len(p) for p in payloads),
+                recordDigest=record_batch_digest(payloads),
+            ),
+            stdout=b"ok\n",
+            records=payloads,
+        )
+        with self.assertRaisesRegex(ValueError, "record_channel_max_records"):
+            read_capture_artifacts(
+                self._tmp,
+                stdout_max_bytes=1024,
+                stderr_max_bytes=1024,
+                record_channel_max_bytes=1048576,
+                record_channel_max_records=2,
+            )
+
+    def test_record_channel_joint_bytes_over_cap_raises(self):
+        # The summary stays internally consistent (declared record/audit
+        # counters match the files); the JOINT records + unknown-marker audit
+        # bytes exceed the frozen recordChannelMaxBytes budget.  Each file is
+        # individually under the budget.
+        payload = b'{"v":1}' + b"x" * 593  # 600-byte record payload
+        audit_line = b"__AF_FINANCE_RESULT_v2__" + b"y" * 576  # 600 bytes
+        self._write_capture(
+            _summary(
+                emittedRecordBytes=len(payload),
+                recordDigest=record_batch_digest([payload]),
+                unknownMarkerLines=1,
+                unknownMarkerBytes=len(audit_line) + 1,
+            ),
+            stdout=b"ok\n",
+            records=[payload],
+            audit=[audit_line],
+        )
+        with self.assertRaisesRegex(ValueError, "record_channel_max_bytes"):
+            read_capture_artifacts(
+                self._tmp,
+                stdout_max_bytes=1024,
+                stderr_max_bytes=1024,
+                record_channel_max_bytes=1024,
+                record_channel_max_records=1024,
+            )
 
     def test_negative_caps_rejected(self):
         self._write_capture(_summary(), stdout=b"ok\n", records=[])
-        with self.assertRaises(ValueError):
-            read_capture_artifacts(self._tmp, stdout_max_bytes=-1, stderr_max_bytes=1024)
-        with self.assertRaises(ValueError):
-            read_capture_artifacts(self._tmp, stdout_max_bytes=1024, stderr_max_bytes=-1)
+        good = {
+            "stdout_max_bytes": 1024,
+            "stderr_max_bytes": 1024,
+            "record_channel_max_bytes": 1048576,
+            "record_channel_max_records": 1024,
+        }
+        for key in good:
+            with self.subTest(cap=key):
+                caps = dict(good)
+                caps[key] = -1
+                with self.assertRaisesRegex(ValueError, key):
+                    read_capture_artifacts(self._tmp, **caps)
 
 
 class TestDecode(unittest.TestCase):

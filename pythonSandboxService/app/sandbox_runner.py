@@ -1057,6 +1057,56 @@ def _container_oom_killed(container_id: str) -> bool:
 # === work-package-C: §7.1 bounded wrapper production wiring ================
 
 
+def validate_effective_output_limits(payload: Dict[str, Any]) -> Dict[str, int]:
+    """Validate the frozen §13 limit snapshot at the runner boundary.
+
+    ``effective_output_limits`` crosses into the runner as a plain dict
+    (``Task.model_dump`` in main.py); the runner must NEVER index an
+    unvalidated external dict (§13, codex f86c66f5).  Allowed keys are
+    EXACTLY the four ``WRAPPER_LIMIT_KEYS`` plus optionally
+    ``sourceRevision`` (str): a missing limit key, an unknown extra key or a
+    non-dict payload raises ``ValueError`` naming the offending key, as does
+    any limit value that is not an int (bool is rejected — it is an int
+    subclass in Python) or is negative.  Returns a FRESH dict containing
+    exactly the four limit keys.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError(
+            "effective_output_limits must be a dict, got "
+            f"{type(payload).__name__}"
+        )
+    extra = sorted(set(payload) - set(WRAPPER_LIMIT_KEYS) - {"sourceRevision"})
+    if extra:
+        raise ValueError(
+            "effective_output_limits has unknown key(s): "
+            f"{', '.join(repr(key) for key in extra)}"
+        )
+    limits: Dict[str, int] = {}
+    for key in WRAPPER_LIMIT_KEYS:
+        if key not in payload:
+            raise ValueError(
+                f"effective_output_limits lacks limit key {key!r}"
+            )
+        value = payload[key]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(
+                f"effective_output_limits[{key!r}] must be an integer, got "
+                f"{type(value).__name__}"
+            )
+        if value < 0:
+            raise ValueError(
+                f"effective_output_limits[{key!r}] must be >= 0, got {value}"
+            )
+        limits[key] = value
+    source_revision = payload.get("sourceRevision", "")
+    if not isinstance(source_revision, str):
+        raise ValueError(
+            "effective_output_limits['sourceRevision'] must be a string, got "
+            f"{type(source_revision).__name__}"
+        )
+    return limits
+
+
 class _WrappedScriptResult:
     """ConsoleOutput stand-in for the wrapper path (exit_code/stdout/stderr)."""
 
@@ -1187,10 +1237,13 @@ def _read_capture_from_container(
 ) -> Dict[str, Any]:
     """Read the wrapper's bounded artifacts back BEFORE cleanup (§7.1 step 7).
 
-    Runs the stdlib ``capture_reader`` inside the container, decodes the
-    emitted JSON into a temporary directory, and hands the files to the
-    fail-closed host-side reader (``read_capture_artifacts``, codex c72db8f6
-    item 3: presence/byte-length/record-channel consistency all validated).
+    Runs the stdlib ``capture_reader`` inside the container WITH the four
+    frozen §13 limits (codex f86c66f5 / e083e181: the reader bounds every
+    artifact against them BEFORE readback, never trusting artifact
+    self-reported summaries), decodes the emitted JSON into a temporary
+    directory, and hands the files to the fail-closed host-side reader
+    (``read_capture_artifacts``, codex c72db8f6 item 3: presence/byte-
+    length/record-channel consistency/cap re-validation all performed).
     ANY inconsistency raises -> the task fails instead of reporting a
     half-formed finance_record_channel.
     """
@@ -1198,7 +1251,10 @@ def _read_capture_from_container(
         f"{task_workspace}/{WRAPPER_DIR_NAME}/app/capture_reader.py"
     )
     capture_dir = f"{task_workspace}/{CAPTURE_DIR_NAME}"
-    command = f"sh -lc {shlex.quote(f'{shlex.quote(interpreter)} {shlex.quote(reader_path)} {shlex.quote(capture_dir)}')}"
+    limit_args = " ".join(
+        shlex.quote(str(int(limits[key]))) for key in WRAPPER_LIMIT_KEYS
+    )
+    command = f"sh -lc {shlex.quote(f'{shlex.quote(interpreter)} {shlex.quote(reader_path)} {shlex.quote(capture_dir)} {limit_args}')}"
     output = session.execute_command(command)
     if output.exit_code != 0:
         raise RuntimeError(
@@ -1239,6 +1295,8 @@ def _read_capture_from_container(
             temp_dir,
             stdout_max_bytes=limits["stdoutMaxBytes"],
             stderr_max_bytes=limits["stderrMaxBytes"],
+            record_channel_max_bytes=limits["recordChannelMaxBytes"],
+            record_channel_max_records=limits["recordChannelMaxRecords"],
         )
 
 
@@ -1259,6 +1317,10 @@ def _run_bounded_wrapper_path(
     stdout (ordinary bytes first, then the COMPLETE record lines)/stderr, and
     the channel is the §5.1 snake_case dict built from the capture summary.
     """
+    # §13/codex f86c66f5: validate the frozen snapshot FIRST — before
+    # interpreter resolution or any session interaction — so the runner never
+    # indexes an unvalidated external dict.
+    limits = validate_effective_output_limits(limits)
     phase_timings: Dict[str, int] = {}
     if install_libraries:
         # llm-sandbox installs into the SHARED container venv — exactly why
