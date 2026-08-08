@@ -1045,5 +1045,90 @@ class WriteRuntimeEnvironmentToContainerTest(unittest.TestCase):
         )
 
 
+class RunInSandboxInitFailClosedTest(unittest.TestCase):
+    """codex 2026-08-08 23:28 (msg 0d67cf11) init fail-closed lifecycle:
+    ``initialize_runtime_environment`` MUST run inside the same
+    ``try/finally session.close()`` as ``run_in_open_session``. If the
+    helper raises (collect or container write), the freshly-created
+    session/container MUST be closed exactly once so we don't leak
+    containers into the pool.
+    """
+
+    def _config(self) -> SandboxConfig:
+        return _test_config()
+
+    def test_initialize_failure_closes_session_exactly_once(self) -> None:
+        from app import sandbox_runner
+
+        class _TrackingSession:
+            def __init__(self) -> None:
+                self.close_count = 0
+
+            def close(self) -> None:
+                self.close_count += 1
+
+            def copy_to_runtime(self, source: str, dest_path: str) -> None:
+                raise RuntimeError("container copy unreachable")
+
+        tracking_session = _TrackingSession()
+
+        def fake_create(config, **kwargs):
+            return tracking_session
+
+        with patch.object(sandbox_runner, "create_sandbox_session", side_effect=fake_create):
+            with self.assertRaises(RuntimeError):
+                sandbox_runner.run_in_sandbox(
+                    self._config(),
+                    "task-init-leak",
+                    "ds1",
+                    None,
+                    "print('ok')",
+                    None,
+                    None,
+                    5.0,
+                )
+        self.assertEqual(
+            1, tracking_session.close_count,
+            "run_in_sandbox init failure MUST close the just-created "
+            "session/container exactly once; otherwise we leak containers.",
+        )
+
+    def test_initialize_failure_does_not_call_run_in_open_session(self) -> None:
+        from app import sandbox_runner
+
+        class _TrackingSession:
+            def close(self) -> None:
+                pass
+
+            def copy_to_runtime(self, source: str, dest_path: str) -> None:
+                raise RuntimeError("container copy unreachable")
+
+        run_calls = []
+
+        def fake_run_in_open_session(*args, **kwargs):
+            run_calls.append((args, kwargs))
+            return {}
+
+        with patch.object(sandbox_runner, "create_sandbox_session", return_value=_TrackingSession()), \
+            patch.object(sandbox_runner, "run_in_open_session", side_effect=fake_run_in_open_session):
+            with self.assertRaises(RuntimeError):
+                sandbox_runner.run_in_sandbox(
+                    self._config(),
+                    "task-init-leak",
+                    "ds1",
+                    None,
+                    "print('ok')",
+                    None,
+                    None,
+                    5.0,
+                )
+        self.assertEqual(
+            [], run_calls,
+            "run_in_open_session MUST NOT be invoked when initialize raises; "
+            "otherwise the worker's user code runs against a stale or "
+            "half-initialized environment.",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1496,10 +1496,15 @@ def run_in_sandbox(
     # here), the AF_RUNTIME_ENVIRONMENT_FILE env var (set at container
     # creation), and the HTTP execution_environment field (passed to
     # run_in_open_session).
-    execution_environment = initialize_runtime_environment(
-        config, session, task_id=task_id,
-    )
+    #
+    # codex 2026-08-08 23:28 (msg 0d67cf11) init fail-closed lifecycle:
+    # ``initialize_runtime_environment`` MUST run inside the same
+    # ``try/finally session.close()`` as run_in_open_session, otherwise an init
+    # collect/copy failure raises and the just-created session/container leaks.
     try:
+        execution_environment = initialize_runtime_environment(
+            config, session, task_id=task_id,
+        )
         result = run_in_open_session(
             config,
             session,
