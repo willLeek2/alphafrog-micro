@@ -58,7 +58,6 @@ public class FinanceMethodResolverModelService implements FinanceMethodResolverC
     private final FinanceMethodResolverModelResolver resolverModelResolver;
     private final AgentPromptService promptService;
     private final AgentObservabilityService observabilityService;
-    private final AgentLlmProperties llmProperties;
 
     @Override
     public ResolverResult resolve(String query, String context, String catalogFragment) {
@@ -69,7 +68,9 @@ public class FinanceMethodResolverModelService implements FinanceMethodResolverC
         String safeContext = nvl(context);
         String safeCatalog = nvl(catalogFragment);
 
-        AgentLlmProperties.FinanceMethodResolver bounds = boundsConfig();
+        // 路由与边界读同一份 effective config（local 显式节优先，否则静态；见 resolver 的 javadoc），
+        // 每次调用只取一次快照，避免同一次调用内路由和边界取到不同来源。
+        AgentLlmProperties.FinanceMethodResolver bounds = resolverModelResolver.effectiveResolverConfig();
         int requestMaxBytes = positiveOr(bounds == null ? null : bounds.getRequestMaxBytes(), 8192);
         int responseMaxBytes = positiveOr(bounds == null ? null : bounds.getResponseMaxBytes(), 16384);
         int maxCandidates = positiveOr(bounds == null ? null : bounds.getMaxCandidates(), 8);
@@ -91,7 +92,7 @@ public class FinanceMethodResolverModelService implements FinanceMethodResolverC
                     "failed to serialize resolver request payload: " + nvl(e.getMessage()));
         }
 
-        SelectionAndModel selected = selectModel();
+        SelectionAndModel selected = selectModel(bounds);
         if (selected == null) {
             return new TechnicalError(ErrorKind.NO_ROUTE,
                     "no finance_method_resolver stage config and no enabled default route");
@@ -151,7 +152,7 @@ public class FinanceMethodResolverModelService implements FinanceMethodResolverC
                     new SystemMessage(systemPrompt),
                     new UserMessage(userPayload)
             );
-            int maxAttempts = resolveMaxAttempts();
+            int maxAttempts = resolveMaxAttempts(bounds);
 
             for (int attempt = 1; attempt <= maxAttempts; attempt++) {
                 try {
@@ -232,9 +233,11 @@ public class FinanceMethodResolverModelService implements FinanceMethodResolverC
     /**
      * 按 frozen 顺序尝试候选路由：dedicated stage 优先，其次 server default route；
      * 前一个候选构建失败继续尝试下一个，全部不可用才返回 null（NO_ROUTE）。严禁继承 execution 大模型。
+     * default route 腿读取与本次调用边界相同的 effective config。
      */
-    private SelectionAndModel selectModel() {
-        for (FinanceMethodResolverModelResolver.ResolvedStageModel candidate : resolverModelResolver.resolveCandidates()) {
+    private SelectionAndModel selectModel(AgentLlmProperties.FinanceMethodResolver effectiveConfig) {
+        for (FinanceMethodResolverModelResolver.ResolvedStageModel candidate
+                : resolverModelResolver.resolveCandidates(effectiveConfig)) {
             StageLlmConfig cfg = candidate.config();
             try {
                 AgentLlmResolver.ResolvedLlm resolved = aiServiceFactory.resolveLlm(
@@ -299,10 +302,6 @@ public class FinanceMethodResolverModelService implements FinanceMethodResolverC
         return endpointName.equalsIgnoreCase("dashscope");
     }
 
-    private AgentLlmProperties.FinanceMethodResolver boundsConfig() {
-        return llmProperties == null ? null : llmProperties.getFinanceMethodResolver();
-    }
-
     private String checkCatalogBudget(String catalog, AgentLlmProperties.FinanceMethodResolver config) {
         int maxBytes = positiveOr(config == null ? null : config.getCatalogPromptMaxBytes(), 8192);
         int maxTokens = positiveOr(config == null ? null : config.getCatalogPromptMaxTokens(), 2048);
@@ -317,8 +316,7 @@ public class FinanceMethodResolverModelService implements FinanceMethodResolverC
         return null;
     }
 
-    private int resolveMaxAttempts() {
-        AgentLlmProperties.FinanceMethodResolver config = boundsConfig();
+    private int resolveMaxAttempts(AgentLlmProperties.FinanceMethodResolver config) {
         if (config != null && config.getDefaultRoute() != null && config.getDefaultRoute().getMaxAttempts() != null) {
             return Math.max(1, config.getDefaultRoute().getMaxAttempts());
         }

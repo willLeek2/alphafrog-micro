@@ -131,6 +131,89 @@ class FinanceMethodResolverModelResolverTest {
         assertEquals(FinanceMethodResolverModelResolver.ModelSource.DEFAULT_ROUTE, candidates.get(0).source());
     }
 
+    @Test
+    void effectiveResolverConfig_shouldPreferLocalSectionWhenPresent() {
+        AgentLlmProperties staticProperties = propertiesWithDefaultRoute("static-endpoint", "static-model");
+        staticProperties.getFinanceMethodResolver().setRequestMaxBytes(8192);
+
+        AgentLlmProperties local = new AgentLlmProperties();
+        local.getFinanceMethodResolver().setRequestMaxBytes(6000);
+        AgentLlmLocalConfigLoader loader = org.mockito.Mockito.mock(AgentLlmLocalConfigLoader.class);
+        org.mockito.Mockito.when(loader.current()).thenReturn(Optional.of(local));
+        org.mockito.Mockito.when(loader.currentHasTopLevelSection(
+                FinanceMethodResolverModelResolver.LOCAL_SECTION)).thenReturn(true);
+
+        FinanceMethodResolverModelResolver resolver = new FinanceMethodResolverModelResolver(staticProperties, loader);
+
+        assertEquals(6000, resolver.effectiveResolverConfig().getRequestMaxBytes());
+    }
+
+    @Test
+    void effectiveResolverConfig_shouldFallBackToStaticWhenSectionAbsent() {
+        AgentLlmProperties staticProperties = propertiesWithDefaultRoute("static-endpoint", "static-model");
+        staticProperties.getFinanceMethodResolver().setRequestMaxBytes(7000);
+
+        AgentLlmProperties local = new AgentLlmProperties();
+        AgentLlmLocalConfigLoader loader = org.mockito.Mockito.mock(AgentLlmLocalConfigLoader.class);
+        org.mockito.Mockito.when(loader.current()).thenReturn(Optional.of(local));
+        org.mockito.Mockito.when(loader.currentHasTopLevelSection(
+                FinanceMethodResolverModelResolver.LOCAL_SECTION)).thenReturn(false);
+
+        FinanceMethodResolverModelResolver resolver = new FinanceMethodResolverModelResolver(staticProperties, loader);
+
+        assertEquals(7000, resolver.effectiveResolverConfig().getRequestMaxBytes());
+    }
+
+    @Test
+    void effectiveResolverConfig_shouldFallBackToStaticWhenNoLocalConfig() {
+        AgentLlmProperties staticProperties = propertiesWithDefaultRoute("static-endpoint", "static-model");
+        AgentLlmLocalConfigLoader loader = org.mockito.Mockito.mock(AgentLlmLocalConfigLoader.class);
+        org.mockito.Mockito.when(loader.current()).thenReturn(Optional.empty());
+        org.mockito.Mockito.when(loader.currentHasTopLevelSection(org.mockito.ArgumentMatchers.anyString()))
+                .thenReturn(false);
+
+        FinanceMethodResolverModelResolver resolver = new FinanceMethodResolverModelResolver(staticProperties, loader);
+
+        assertEquals("static-endpoint",
+                resolver.effectiveResolverConfig().getDefaultRoute().getEndpointName());
+    }
+
+    @Test
+    void resolveCandidates_shouldBuildDefaultRouteFromLocalSection() {
+        AgentLlmProperties staticProperties = new AgentLlmProperties();
+        AgentLlmProperties local = propertiesWithDefaultRoute("local-endpoint", "local-model");
+        AgentLlmLocalConfigLoader loader = org.mockito.Mockito.mock(AgentLlmLocalConfigLoader.class);
+        org.mockito.Mockito.when(loader.current()).thenReturn(Optional.of(local));
+        org.mockito.Mockito.when(loader.currentHasTopLevelSection(
+                FinanceMethodResolverModelResolver.LOCAL_SECTION)).thenReturn(true);
+
+        FinanceMethodResolverModelResolver resolver = new FinanceMethodResolverModelResolver(staticProperties, loader);
+
+        List<FinanceMethodResolverModelResolver.ResolvedStageModel> candidates = resolver.resolveCandidates();
+
+        assertEquals(1, candidates.size());
+        assertEquals(FinanceMethodResolverModelResolver.ModelSource.DEFAULT_ROUTE, candidates.get(0).source());
+        assertEquals("local-endpoint", candidates.get(0).config().getEndpointName());
+    }
+
+    @Test
+    void resolveCandidates_shouldHonorLocalExplicitDisableOverStaticEnabled() {
+        AgentLlmProperties staticProperties = propertiesWithDefaultRoute("static-endpoint", "static-model");
+        AgentLlmProperties local = new AgentLlmProperties();
+        local.getFinanceMethodResolver().getDefaultRoute().setEnabled(false);
+        local.getFinanceMethodResolver().getDefaultRoute().setEndpointName("ignored");
+        local.getFinanceMethodResolver().getDefaultRoute().setModelName("ignored");
+        AgentLlmLocalConfigLoader loader = org.mockito.Mockito.mock(AgentLlmLocalConfigLoader.class);
+        org.mockito.Mockito.when(loader.current()).thenReturn(Optional.of(local));
+        org.mockito.Mockito.when(loader.currentHasTopLevelSection(
+                FinanceMethodResolverModelResolver.LOCAL_SECTION)).thenReturn(true);
+
+        FinanceMethodResolverModelResolver resolver = new FinanceMethodResolverModelResolver(staticProperties, loader);
+
+        assertTrue(resolver.resolveCandidates().isEmpty(),
+                "本地显式 enabled=false 必须生效，不能回退到静态 enabled=true");
+    }
+
     private static StageLlmConfig stageConfig(String endpoint, String model) {
         StageLlmConfig config = new StageLlmConfig();
         config.setEndpointName(endpoint);

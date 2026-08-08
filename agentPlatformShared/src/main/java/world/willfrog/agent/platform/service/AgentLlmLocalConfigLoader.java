@@ -77,11 +77,15 @@ public class AgentLlmLocalConfigLoader {
     @Autowired(required = false)
     private StringRedisTemplate redisTemplate;
 
-    private volatile AgentLlmProperties localConfig;
     private volatile String loadedConfigPath = "";
     private volatile long loadedConfigLastModified = Long.MIN_VALUE;
     private volatile byte[] loadedConfigBytes = new byte[0];
     private volatile Map<String, Long> loadedPromptFileModifiedTimes = new LinkedHashMap<>();
+    /**
+     * 本地配置 + 显式顶层节的原子快照：单次 volatile 读同时拿到两者，
+     * 避免 refresh 窗口内旧 config 与新 sections 错配。
+     */
+    private volatile LocalConfigSnapshot localSnapshot = LocalConfigSnapshot.empty();
     private final Object reloadLock = new Object();
 
     private static final String FILE_PREFIX = "file:";
@@ -110,7 +114,7 @@ public class AgentLlmLocalConfigLoader {
         Path path = Paths.get(file).toAbsolutePath().normalize();
         synchronized (reloadLock) {
             if (!Files.exists(path)) {
-                if (force && this.localConfig == null) {
+                if (force && this.localSnapshot.config() == null) {
                     log.info("Local llm config file not found, skip: {}", path);
                 }
                 clearLocalConfigIfPresent("Local llm config file not found: " + path);
@@ -128,11 +132,16 @@ public class AgentLlmLocalConfigLoader {
                     byte[] bytes = in.readAllBytes();
                     JsonNode tree = objectMapper.readTree(bytes);
                     tree = preprocessAliasTree(tree);
+                    java.util.Set<String> topLevelSections = new java.util.LinkedHashSet<>();
+                    if (tree.isObject()) {
+                        tree.fieldNames().forEachRemaining(topLevelSections::add);
+                    }
                     AgentLlmProperties parsed = objectMapper.treeToValue(tree, AgentLlmProperties.class);
                     PlaceholderResolver.resolve(parsed);
                     AgentLlmProperties sanitized = sanitize(parsed);
                     Map<String, Long> promptFileTimes = resolvePromptFiles(sanitized, resolvePromptBaseDir(path));
-                    this.localConfig = sanitized;
+                    this.localSnapshot = new LocalConfigSnapshot(
+                            sanitized, java.util.Collections.unmodifiableSet(topLevelSections));
                     this.loadedConfigPath = normalizedPath;
                     this.loadedConfigLastModified = currentModified;
                     this.loadedConfigBytes = bytes;
@@ -224,7 +233,24 @@ public class AgentLlmLocalConfigLoader {
      * @return 当前生效的配置，可能为 empty
      */
     public Optional<AgentLlmProperties> current() {
-        return Optional.ofNullable(localConfig);
+        return Optional.ofNullable(localSnapshot.config());
+    }
+
+    /**
+     * 当前本地配置 JSON 是否显式包含指定顶层节（别名预处理后）。
+     *
+     * <p>用于区分"本地文件没有配置该节"与"该节字段恰好等于默认值"：只有前者才应回退到
+     * Spring/Nacos 静态配置，后者必须尊重本地显式取值（例如显式 {@code "enabled": false}）。</p>
+     */
+    public boolean currentHasTopLevelSection(String section) {
+        return section != null && localSnapshot.topLevelSections().contains(section);
+    }
+
+    /** 本地配置与显式顶层节的不可变快照（单 volatile 承载，保证读取原子性）。 */
+    public record LocalConfigSnapshot(AgentLlmProperties config, java.util.Set<String> topLevelSections) {
+        static LocalConfigSnapshot empty() {
+            return new LocalConfigSnapshot(null, java.util.Set.of());
+        }
     }
 
     private boolean promptFilesChanged() {
@@ -250,8 +276,8 @@ public class AgentLlmLocalConfigLoader {
 
     private void clearLocalConfigIfPresent(String reason) {
         synchronized (reloadLock) {
-            if (this.localConfig != null) {
-                this.localConfig = null;
+            if (this.localSnapshot.config() != null) {
+                this.localSnapshot = LocalConfigSnapshot.empty();
                 this.loadedConfigPath = "";
                 this.loadedConfigLastModified = Long.MIN_VALUE;
                 this.loadedPromptFileModifiedTimes = new LinkedHashMap<>();

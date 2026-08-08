@@ -101,7 +101,7 @@ class FinanceMethodResolverModelServiceTest {
 
     @Test
     void resolve_shouldReturnNoRouteWhenNoRouteConfigured() {
-        when(resolverModelResolver.resolveCandidates()).thenReturn(List.of());
+        when(resolverModelResolver.resolveCandidates(any())).thenReturn(List.of());
         FinanceMethodResolverModelService service = newService();
 
         ResolverResult result = service.resolve("query", null, "catalog-text");
@@ -268,7 +268,7 @@ class FinanceMethodResolverModelServiceTest {
         StageLlmConfig stage = new StageLlmConfig();
         stage.setEndpointName("dashscope");
         stage.setModelName("qwen-lite");
-        when(resolverModelResolver.resolveCandidates()).thenReturn(List.of(
+        when(resolverModelResolver.resolveCandidates(any())).thenReturn(List.of(
                 new FinanceMethodResolverModelResolver.ResolvedStageModel(
                         stage, FinanceMethodResolverModelResolver.ModelSource.STAGE_CONFIG)));
         AgentLlmResolver.ResolvedLlm resolved = new AgentLlmResolver.ResolvedLlm(
@@ -381,7 +381,7 @@ class FinanceMethodResolverModelServiceTest {
         StageLlmConfig defaultCfg = new StageLlmConfig();
         defaultCfg.setEndpointName("default-endpoint");
         defaultCfg.setModelName("default-model");
-        when(resolverModelResolver.resolveCandidates()).thenReturn(List.of(
+        when(resolverModelResolver.resolveCandidates(any())).thenReturn(List.of(
                 new FinanceMethodResolverModelResolver.ResolvedStageModel(
                         stageCfg, FinanceMethodResolverModelResolver.ModelSource.STAGE_CONFIG),
                 new FinanceMethodResolverModelResolver.ResolvedStageModel(
@@ -415,7 +415,7 @@ class FinanceMethodResolverModelServiceTest {
         StageLlmConfig stageCfg = new StageLlmConfig();
         stageCfg.setEndpointName("broken-endpoint");
         stageCfg.setModelName("broken-model");
-        when(resolverModelResolver.resolveCandidates()).thenReturn(List.of(
+        when(resolverModelResolver.resolveCandidates(any())).thenReturn(List.of(
                 new FinanceMethodResolverModelResolver.ResolvedStageModel(
                         stageCfg, FinanceMethodResolverModelResolver.ModelSource.STAGE_CONFIG)));
         when(aiServiceFactory.resolveLlm("broken-endpoint", "broken-model"))
@@ -434,7 +434,7 @@ class FinanceMethodResolverModelServiceTest {
         StageLlmConfig stageCfg = new StageLlmConfig();
         stageCfg.setEndpointName("custom-endpoint");
         stageCfg.setModelName("custom-model");
-        when(resolverModelResolver.resolveCandidates()).thenReturn(List.of(
+        when(resolverModelResolver.resolveCandidates(any())).thenReturn(List.of(
                 new FinanceMethodResolverModelResolver.ResolvedStageModel(
                         stageCfg, FinanceMethodResolverModelResolver.ModelSource.STAGE_CONFIG)));
         AgentLlmResolver.ResolvedLlm blankBaseUrl = new AgentLlmResolver.ResolvedLlm(
@@ -488,7 +488,7 @@ class FinanceMethodResolverModelServiceTest {
             }
         };
         FinanceMethodResolverModelService service = new FinanceMethodResolverModelService(
-                failingMapper, aiServiceFactory, resolverModelResolver, promptService, observabilityService, llmProperties);
+                failingMapper, aiServiceFactory, resolverModelResolver, promptService, observabilityService);
 
         ResolverResult result = service.resolve("query", null, "catalog-text");
 
@@ -597,7 +597,7 @@ class FinanceMethodResolverModelServiceTest {
         StageLlmConfig stage = new StageLlmConfig();
         stage.setEndpointName("resolver-endpoint");
         stage.setModelName("resolver-model");
-        when(resolverModelResolver.resolveCandidates()).thenReturn(List.of(
+        when(resolverModelResolver.resolveCandidates(any())).thenReturn(List.of(
                 new FinanceMethodResolverModelResolver.ResolvedStageModel(
                         stage, FinanceMethodResolverModelResolver.ModelSource.STAGE_CONFIG)));
         AgentLlmResolver.ResolvedLlm resolved = new AgentLlmResolver.ResolvedLlm(
@@ -610,7 +610,10 @@ class FinanceMethodResolverModelServiceTest {
     }
 
     private FinanceMethodResolverModelService newService() {
+        // 边界读取与生产同口径：effective config 来自 resolver；测试默认映射到静态 llmProperties。
+        lenient().when(resolverModelResolver.effectiveResolverConfig())
+                .thenAnswer(invocation -> llmProperties.getFinanceMethodResolver());
         return new FinanceMethodResolverModelService(
-                objectMapper, aiServiceFactory, resolverModelResolver, promptService, observabilityService, llmProperties);
+                objectMapper, aiServiceFactory, resolverModelResolver, promptService, observabilityService);
     }
 }

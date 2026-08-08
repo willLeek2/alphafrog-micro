@@ -307,7 +307,8 @@ class AgentLlmLocalConfigLoaderTest {
         world.willfrog.agent.platform.config.StageLlmConfig stage = new world.willfrog.agent.platform.config.StageLlmConfig();
         stage.setEndpointName("e2e-endpoint");
         stage.setModelName("e2e-model");
-        org.mockito.Mockito.when(modelResolver.resolveCandidates()).thenReturn(java.util.List.of(
+        org.mockito.Mockito.when(modelResolver.resolveCandidates(org.mockito.ArgumentMatchers.any()))
+                .thenReturn(java.util.List.of(
                 new FinanceMethodResolverModelResolver.ResolvedStageModel(
                         stage, FinanceMethodResolverModelResolver.ModelSource.STAGE_CONFIG)));
         AgentLlmResolver.ResolvedLlm resolved = new AgentLlmResolver.ResolvedLlm(
@@ -323,8 +324,7 @@ class AgentLlmLocalConfigLoaderTest {
                         .build());
 
         FinanceMethodResolverModelService service = new FinanceMethodResolverModelService(
-                new ObjectMapper(), aiServiceFactory, modelResolver, promptService, observability,
-                new AgentLlmProperties());
+                new ObjectMapper(), aiServiceFactory, modelResolver, promptService, observability);
 
         var result = service.resolve("query", null, "E2E-CATALOG");
 
@@ -849,5 +849,197 @@ class AgentLlmLocalConfigLoaderTest {
         assertNull(error.get());
         assertTrue(loader.current().isPresent());
         assertEquals(1000, loader.current().orElseThrow().getTools().getResult().getMaxStringLength());
+    }
+
+    /**
+     * 真实 loader + 真实 resolver + 真实 ModelService（仅 mock 路由构建/ChatModel/prompt/observability）
+     * 的 financeMethodResolver 消费链夹具。
+     */
+    private record RealResolverChain(
+            AgentLlmLocalConfigLoader loader,
+            FinanceMethodResolverModelResolver modelResolver,
+            FinanceMethodResolverModelService service,
+            dev.langchain4j.model.chat.ChatModel chatModel) {
+    }
+
+    private RealResolverChain realChain(Path configFile, AgentLlmProperties staticProperties) {
+        AgentLlmLocalConfigLoader loader = new AgentLlmLocalConfigLoader(new ObjectMapper());
+        ReflectionTestUtils.setField(loader, "configFile", configFile.toString());
+        loader.load();
+
+        FinanceMethodResolverModelResolver modelResolver =
+                new FinanceMethodResolverModelResolver(staticProperties, loader);
+
+        AgentAiServiceFactory aiServiceFactory = org.mockito.Mockito.mock(AgentAiServiceFactory.class);
+        AgentPromptService promptService = org.mockito.Mockito.mock(AgentPromptService.class);
+        AgentObservabilityService observability = org.mockito.Mockito.mock(AgentObservabilityService.class);
+        dev.langchain4j.model.chat.ChatModel chatModel = org.mockito.Mockito.mock(dev.langchain4j.model.chat.ChatModel.class);
+        org.mockito.Mockito.when(promptService.financeMethodResolverSystemPromptTemplate())
+                .thenReturn("resolver template {{RESOLVER_CATALOG}}");
+        AgentLlmResolver.ResolvedLlm resolved = new AgentLlmResolver.ResolvedLlm(
+                "local-endpoint", "https://local.example.com/v1", "local-model", "key", "", java.util.List.of(), null);
+        org.mockito.Mockito.lenient().when(aiServiceFactory.resolveLlm(
+                org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any())).thenReturn(resolved);
+        org.mockito.Mockito.lenient().when(aiServiceFactory.buildChatModelWithProviderOrderAndTemperature(
+                org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.anyList(),
+                org.mockito.ArgumentMatchers.anyDouble(), org.mockito.ArgumentMatchers.anyInt()))
+                .thenReturn(chatModel);
+        org.mockito.Mockito.lenient().when(chatModel.chat(org.mockito.ArgumentMatchers.anyList())).thenReturn(
+                dev.langchain4j.model.chat.response.ChatResponse.builder()
+                        .aiMessage(new dev.langchain4j.data.message.AiMessage("{\"status\":\"NO_ADVICE\",\"candidates\":[]}"))
+                        .build());
+
+        FinanceMethodResolverModelService service = new FinanceMethodResolverModelService(
+                new ObjectMapper(), aiServiceFactory, modelResolver, promptService, observability);
+        return new RealResolverChain(loader, modelResolver, service, chatModel);
+    }
+
+    @Test
+    void localSection_shouldDriveDefaultRouteAndBoundsThroughRealChain() throws Exception {
+        Path configFile = tempDir.resolve("agent-llm.local.json");
+        Files.writeString(configFile, """
+                {
+                  "financeMethodResolver": {
+                    "defaultRoute": {
+                      "enabled": true,
+                      "endpointName": "local-endpoint",
+                      "modelName": "local-model"
+                    },
+                    "requestMaxBytes": 32
+                  }
+                }
+                """, StandardCharsets.UTF_8);
+
+        RealResolverChain chain = realChain(configFile, new AgentLlmProperties());
+
+        // 路由消费：无 stage 时本地 default route 产生候选
+        var candidates = chain.modelResolver().resolveCandidates();
+        assertEquals(1, candidates.size());
+        assertEquals(FinanceMethodResolverModelResolver.ModelSource.DEFAULT_ROUTE, candidates.get(0).source());
+        assertEquals("local-endpoint", candidates.get(0).config().getEndpointName());
+
+        // 边界消费：本地 requestMaxBytes=32 在 chat() 前触发
+        var result = chain.service().resolve("query", null, "catalog");
+        var error = org.junit.jupiter.api.Assertions.assertInstanceOf(
+                world.willfrog.agent.platform.finance.FinanceMethodResolverClient.TechnicalError.class, result);
+        assertEquals(world.willfrog.agent.platform.finance.FinanceMethodResolverClient.ErrorKind.REQUEST_TOO_LARGE,
+                error.kind());
+        org.mockito.Mockito.verify(chain.chatModel(), org.mockito.Mockito.never())
+                .chat(org.mockito.ArgumentMatchers.anyList());
+    }
+
+    @Test
+    void localBoundsChange_shouldTakeEffectAfterRefresh() throws Exception {
+        Path configFile = tempDir.resolve("agent-llm.local.json");
+        Files.writeString(configFile, """
+                {
+                  "financeMethodResolver": {
+                    "defaultRoute": { "enabled": true, "endpointName": "local-endpoint", "modelName": "local-model" },
+                    "requestMaxBytes": 100000
+                  }
+                }
+                """, StandardCharsets.UTF_8);
+
+        RealResolverChain chain = realChain(configFile, new AgentLlmProperties());
+        var first = chain.service().resolve("query", null, "catalog");
+        org.junit.jupiter.api.Assertions.assertInstanceOf(
+                world.willfrog.agent.platform.finance.FinanceMethodResolverClient.Ok.class, first);
+
+        Thread.sleep(5L);
+        Files.writeString(configFile, """
+                {
+                  "financeMethodResolver": {
+                    "defaultRoute": { "enabled": true, "endpointName": "local-endpoint", "modelName": "local-model" },
+                    "requestMaxBytes": 32
+                  }
+                }
+                """, StandardCharsets.UTF_8);
+        chain.loader().refresh();
+
+        var second = chain.service().resolve("query", null, "catalog");
+        var error = org.junit.jupiter.api.Assertions.assertInstanceOf(
+                world.willfrog.agent.platform.finance.FinanceMethodResolverClient.TechnicalError.class, second);
+        assertEquals(world.willfrog.agent.platform.finance.FinanceMethodResolverClient.ErrorKind.REQUEST_TOO_LARGE,
+                error.kind());
+    }
+
+    @Test
+    void staticConfig_shouldApplyWhenLocalFileMissing() {
+        Path configFile = tempDir.resolve("missing-agent-llm.local.json");
+        AgentLlmProperties staticProperties = new AgentLlmProperties();
+        staticProperties.getFinanceMethodResolver().getDefaultRoute().setEnabled(true);
+        staticProperties.getFinanceMethodResolver().getDefaultRoute().setEndpointName("static-endpoint");
+        staticProperties.getFinanceMethodResolver().getDefaultRoute().setModelName("static-model");
+        staticProperties.getFinanceMethodResolver().setRequestMaxBytes(32);
+
+        RealResolverChain chain = realChain(configFile, staticProperties);
+
+        var candidates = chain.modelResolver().resolveCandidates();
+        assertEquals(1, candidates.size());
+        assertEquals("static-endpoint", candidates.get(0).config().getEndpointName());
+
+        var result = chain.service().resolve("query", null, "catalog");
+        var error = org.junit.jupiter.api.Assertions.assertInstanceOf(
+                world.willfrog.agent.platform.finance.FinanceMethodResolverClient.TechnicalError.class, result);
+        assertEquals(world.willfrog.agent.platform.finance.FinanceMethodResolverClient.ErrorKind.REQUEST_TOO_LARGE,
+                error.kind());
+    }
+
+    @Test
+    void localResponseMaxBytesAndMaxAttempts_shouldTakeEffectThroughRealChain() throws Exception {
+        Path configFile = tempDir.resolve("agent-llm.local.json");
+        Files.writeString(configFile, """
+                {
+                  "financeMethodResolver": {
+                    "defaultRoute": {
+                      "enabled": true,
+                      "endpointName": "local-endpoint",
+                      "modelName": "local-model",
+                      "maxAttempts": 1
+                    },
+                    "responseMaxBytes": 16
+                  }
+                }
+                """, StandardCharsets.UTF_8);
+
+        RealResolverChain chain = realChain(configFile, new AgentLlmProperties());
+
+        var result = chain.service().resolve("query", null, "catalog");
+        var error = org.junit.jupiter.api.Assertions.assertInstanceOf(
+                world.willfrog.agent.platform.finance.FinanceMethodResolverClient.TechnicalError.class, result);
+        assertEquals(world.willfrog.agent.platform.finance.FinanceMethodResolverClient.ErrorKind.BAD_JSON,
+                error.kind());
+        // maxAttempts=1 由真实本地配置驱动：响应超限后只调用 1 次 chat（默认 2 次则计数为 2）
+        org.mockito.Mockito.verify(chain.chatModel(), org.mockito.Mockito.times(1))
+                .chat(org.mockito.ArgumentMatchers.anyList());
+    }
+
+    @Test
+    void localMaxCandidates_shouldTakeEffectThroughRealChain() throws Exception {
+        Path configFile = tempDir.resolve("agent-llm.local.json");
+        Files.writeString(configFile, """
+                {
+                  "financeMethodResolver": {
+                    "defaultRoute": { "enabled": true, "endpointName": "local-endpoint", "modelName": "local-model" },
+                    "maxCandidates": 1
+                  }
+                }
+                """, StandardCharsets.UTF_8);
+
+        RealResolverChain chain = realChain(configFile, new AgentLlmProperties());
+        String twoCandidates = "{\"status\":\"AMBIGUOUS\",\"candidates\":["
+                + "{\"methodId\":\"a\",\"version\":\"1.0.0\",\"specDigest\":\"sha256:a\",\"matchReason\":\"x\"},"
+                + "{\"methodId\":\"b\",\"version\":\"1.0.0\",\"specDigest\":\"sha256:b\",\"matchReason\":\"y\"}]}";
+        org.mockito.Mockito.when(chain.chatModel().chat(org.mockito.ArgumentMatchers.anyList())).thenReturn(
+                dev.langchain4j.model.chat.response.ChatResponse.builder()
+                        .aiMessage(new dev.langchain4j.data.message.AiMessage(twoCandidates))
+                        .build());
+
+        var result = chain.service().resolve("query", null, "catalog");
+        var error = org.junit.jupiter.api.Assertions.assertInstanceOf(
+                world.willfrog.agent.platform.finance.FinanceMethodResolverClient.TechnicalError.class, result);
+        assertEquals(world.willfrog.agent.platform.finance.FinanceMethodResolverClient.ErrorKind.BAD_JSON,
+                error.kind());
+        assertTrue(error.message().contains("candidate count"));
     }
 }
