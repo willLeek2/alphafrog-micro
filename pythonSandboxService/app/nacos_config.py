@@ -1,51 +1,314 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import threading
-from dataclasses import replace
-from typing import Callable
+from dataclasses import dataclass, replace
+from typing import Callable, Mapping
 
-from .config import SandboxConfig
+from .config import HARD_OUTPUT_LIMIT_CEILINGS, OUTPUT_LIMIT_KEYS, SandboxConfig
 
 logger = logging.getLogger(__name__)
+
+
+# Verbatim dynamic keys accepted in python-sandbox.json / Nacos payloads
+# (Spec §7.2, frozen contract §13).
+KEY_CONTAINER_MAX_CONCURRENCY = "containerMaxConcurrency"
+KNOWN_DYNAMIC_KEYS = frozenset({KEY_CONTAINER_MAX_CONCURRENCY, *OUTPUT_LIMIT_KEYS})
+
+# Source revision of the effective dynamic config before any Nacos payload has
+# been applied (contract §13: the task snapshot fixes the source revision).
+STATIC_DEFAULT_SOURCE_REVISION = "static-default"
+
+# JSON key -> _DynamicConfigSnapshot field for the four output limits.
+_LIMIT_FIELD_BY_KEY: dict[str, str] = {
+    "stdoutMaxBytes": "stdout_max_bytes",
+    "stderrMaxBytes": "stderr_max_bytes",
+    "recordChannelMaxBytes": "record_channel_max_bytes",
+    "recordChannelMaxRecords": "record_channel_max_records",
+}
+
+
+@dataclass(frozen=True)
+class _DynamicConfigSnapshot:
+    """Complete, immutable last-known-good dynamic config state.
+
+    One instance holds every dynamically tunable value plus the source
+    revision. Updates build a new instance and swap it atomically under
+    ``DynamicSandboxConfig._lock``, so readers never observe a half-applied
+    config. Instances are never mutated after creation; handed-out snapshots
+    (``output_limits_snapshot()``) are fresh plain dicts of immutable values.
+    """
+
+    container_max_concurrency: int
+    stdout_max_bytes: int
+    stderr_max_bytes: int
+    record_channel_max_bytes: int
+    record_channel_max_records: int
+    source_revision: str
+
+
+def _is_plain_int(value: object) -> bool:
+    # bool is a subclass of int in Python; true/false are not valid limits.
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _derive_source_revision(payload: Mapping[str, object]) -> str:
+    """Revision of an applied payload: short sha256 of its canonical JSON.
+
+    Derived from the validated payload as published (not from the clamped
+    effective values), so the same Nacos content always maps to the same
+    revision; clamping is this service's code-side policy, not part of the
+    published content identity.
+    """
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
+    return f"nacos-sha256:{digest}"
 
 
 class DynamicSandboxConfig:
     """Mutable holder for config values that may be updated at runtime.
 
-    The base `SandboxConfig` dataclass is frozen and loaded once at startup.
+    The base ``SandboxConfig`` dataclass is frozen and loaded once at startup.
     Values that need Nacos hot-reload are mirrored here; new container workers
     pick up the current value when they are created.
+
+    Whole-object semantics (Spec §7.2, contract §13):
+      - A complete, immutable last-known-good snapshot is always retained.
+      - An incoming payload is applied only if the ENTIRE payload validates
+        (JSON object; every present known key has a valid type/range). Any
+        invalid payload keeps the last-known-good wholesale.
+      - Values above the static hard ceilings (``HARD_OUTPUT_LIMIT_CEILINGS``)
+        are clamped DOWN to the ceiling and an event is logged; dynamic config
+        can never raise a limit above its ceiling.
+      - Config load order: application defaults -> whole valid dynamic values
+        -> shrink to code hard ceilings.
+      - Tasks freeze ``output_limits_snapshot()`` at creation time and must
+        not re-read this hot config during execution.
     """
 
     def __init__(self, config: SandboxConfig) -> None:
         self._lock = threading.Lock()
-        self._container_max_concurrency = config.container_max_concurrency
+        self._snapshot = self._initial_snapshot(config)
+
+    # ------------------------------------------------------------------
+    # construction
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _initial_snapshot(config: SandboxConfig) -> _DynamicConfigSnapshot:
+        values: dict[str, int] = {}
+        for key, field in _LIMIT_FIELD_BY_KEY.items():
+            value = getattr(config, field)
+            ceiling = HARD_OUTPUT_LIMIT_CEILINGS[key]
+            if not _is_plain_int(value) or value < 0:
+                raise ValueError(f"Invalid {field}={value!r}: must be an int >= 0.")
+            if value > ceiling:
+                logger.warning(
+                    "DYNAMIC_CONFIG_CLAMPED %s: application default %s -> ceiling %s "
+                    "(static hard ceilings can only shrink values)",
+                    key,
+                    value,
+                    ceiling,
+                )
+                value = ceiling
+            values[field] = value
+        return _DynamicConfigSnapshot(
+            container_max_concurrency=config.container_max_concurrency,
+            source_revision=STATIC_DEFAULT_SOURCE_REVISION,
+            **values,
+        )
+
+    # ------------------------------------------------------------------
+    # readers
+    # ------------------------------------------------------------------
 
     @property
     def container_max_concurrency(self) -> int:
         with self._lock:
-            return self._container_max_concurrency
+            return self._snapshot.container_max_concurrency
+
+    @property
+    def source_revision(self) -> str:
+        """Source revision of the currently effective dynamic config."""
+        with self._lock:
+            return self._snapshot.source_revision
+
+    def output_limits_snapshot(self) -> dict[str, object]:
+        """Freeze the four output limits plus the source revision.
+
+        Returns a fresh dict with exactly the contract §13 keys
+        ``stdoutMaxBytes`` / ``stderrMaxBytes`` / ``recordChannelMaxBytes`` /
+        ``recordChannelMaxRecords`` / ``sourceRevision`` at their current
+        effective (default -> dynamic -> clamp-resolved) values. The dict is a
+        copy: later Nacos updates never mutate previously returned snapshots.
+        ``main.py`` freezes this into ``Task.effective_output_limits`` at
+        create_task; idempotent re-create returns the original snapshot.
+        """
+        with self._lock:
+            snapshot = self._snapshot
+        return {
+            "stdoutMaxBytes": snapshot.stdout_max_bytes,
+            "stderrMaxBytes": snapshot.stderr_max_bytes,
+            "recordChannelMaxBytes": snapshot.record_channel_max_bytes,
+            "recordChannelMaxRecords": snapshot.record_channel_max_records,
+            "sourceRevision": snapshot.source_revision,
+        }
+
+    # ------------------------------------------------------------------
+    # writers
+    # ------------------------------------------------------------------
 
     def update_container_max_concurrency(self, value: int) -> None:
-        if value < 1:
+        if not _is_plain_int(value) or value < 1:
             logger.warning("Ignoring invalid container_max_concurrency=%s (must be >= 1)", value)
             return
         with self._lock:
-            old = self._container_max_concurrency
-            self._container_max_concurrency = value
+            old = self._snapshot.container_max_concurrency
+            self._snapshot = replace(self._snapshot, container_max_concurrency=value)
         logger.info("DYNAMIC_CONFIG container_max_concurrency %s -> %s", old, value)
+
+    def apply_dynamic_content(self, content: str) -> bool:
+        """Parse Nacos ``python-sandbox.json`` content and whole-object apply.
+
+        Returns True only if the entire payload validated and replaced the
+        last-known-good snapshot. Invalid JSON / non-object content keeps the
+        last-known-good wholesale and logs a warning.
+        """
+        if content is None or not content.strip():
+            return False
+        try:
+            payload = json.loads(content)
+        except ValueError as exc:  # includes json.JSONDecodeError
+            logger.warning(
+                "DYNAMIC_CONFIG_REJECTED content is not valid JSON (%s); "
+                "keeping last-known-good (sourceRevision=%s)",
+                exc,
+                self.source_revision,
+            )
+            return False
+        return self.apply_dynamic_payload(payload)
+
+    def apply_dynamic_payload(self, payload: object) -> bool:
+        """Whole-object validation + atomic replacement (contract §13).
+
+        The payload is applied only if it is a JSON object and EVERY present
+        known key validates; otherwise the last-known-good snapshot is kept
+        wholesale (no partial application). Unknown keys are ignored with a
+        warning (forward compatibility; the data id is service-specific).
+        Present output-limit values above the static hard ceilings are clamped
+        down to the ceiling and each clamp is logged. An empty payload (no
+        known keys) is a no-op that keeps the current revision.
+        """
+        warnings: list[str] = []
+        infos: list[str] = []
+        if not isinstance(payload, dict):
+            logger.warning(
+                "DYNAMIC_CONFIG_REJECTED payload is not a JSON object (got %s); "
+                "keeping last-known-good (sourceRevision=%s)",
+                type(payload).__name__,
+                self.source_revision,
+            )
+            return False
+
+        unknown_keys = sorted(set(payload) - KNOWN_DYNAMIC_KEYS)
+        if unknown_keys:
+            warnings.append(f"DYNAMIC_CONFIG ignored unknown keys: {unknown_keys}")
+
+        # Phase 1: validate every present known key. Any failure rejects the
+        # WHOLE payload (last-known-good retained, nothing partially applied).
+        errors: list[str] = []
+        if KEY_CONTAINER_MAX_CONCURRENCY in payload:
+            raw = payload[KEY_CONTAINER_MAX_CONCURRENCY]
+            if not _is_plain_int(raw) or raw < 1:
+                errors.append(f"containerMaxConcurrency={raw!r} must be an int >= 1")
+        for key in OUTPUT_LIMIT_KEYS:
+            if key in payload:
+                raw = payload[key]
+                if not _is_plain_int(raw) or raw < 0:
+                    errors.append(f"{key}={raw!r} must be an int >= 0")
+        if errors:
+            logger.warning(
+                "DYNAMIC_CONFIG_REJECTED whole payload, %d invalid key(s): %s; "
+                "keeping last-known-good (sourceRevision=%s)",
+                len(errors),
+                "; ".join(errors),
+                self.source_revision,
+            )
+            for message in warnings:
+                logger.warning("%s", message)
+            return False
+
+        # Phase 2: merge over last-known-good, clamp down to hard ceilings,
+        # swap atomically under the lock.
+        changes: dict[str, int] = {}
+        clamps: list[tuple[str, int, int, int]] = []  # (key, payload, previous, ceiling)
+        with self._lock:
+            base = self._snapshot
+            if KEY_CONTAINER_MAX_CONCURRENCY in payload:
+                changes["container_max_concurrency"] = payload[KEY_CONTAINER_MAX_CONCURRENCY]
+            for key, field in _LIMIT_FIELD_BY_KEY.items():
+                if key in payload:
+                    value = payload[key]
+                    ceiling = HARD_OUTPUT_LIMIT_CEILINGS[key]
+                    if value > ceiling:
+                        clamps.append((key, value, getattr(base, field), ceiling))
+                        value = ceiling
+                    changes[field] = value
+            if not changes:
+                # No known keys present (empty or unknown-only payload): keep
+                # the last-known-good snapshot including its revision.
+                infos.append(
+                    "DYNAMIC_CONFIG payload has no known keys; keeping last-known-good "
+                    f"(sourceRevision={base.source_revision})"
+                )
+                new_snapshot = base
+            else:
+                new_snapshot = replace(
+                    base, source_revision=_derive_source_revision(payload), **changes
+                )
+                self._snapshot = new_snapshot
+
+        for message in warnings:
+            logger.warning("%s", message)
+        for key, raw_value, previous, ceiling in clamps:
+            logger.warning(
+                "DYNAMIC_CONFIG_CLAMPED %s: payload value %s -> %s (static ceiling; previous effective %s)",
+                key,
+                raw_value,
+                ceiling,
+                previous,
+            )
+        for message in infos:
+            logger.info("%s", message)
+        if changes:
+            if "container_max_concurrency" in changes and new_snapshot.container_max_concurrency != base.container_max_concurrency:
+                logger.info(
+                    "DYNAMIC_CONFIG container_max_concurrency %s -> %s",
+                    base.container_max_concurrency,
+                    new_snapshot.container_max_concurrency,
+                )
+            logger.info(
+                "DYNAMIC_CONFIG_APPLIED whole payload; sourceRevision %s -> %s",
+                base.source_revision,
+                new_snapshot.source_revision,
+            )
+        return bool(changes)
 
     def apply_to(self, config: SandboxConfig) -> SandboxConfig:
         """Return a copy of `config` with current dynamic values applied."""
-        current_cmc = self.container_max_concurrency
-        if current_cmc == config.container_max_concurrency:
-            return config
-        new_config = replace(config, container_max_concurrency=current_cmc)
+        with self._lock:
+            snapshot = self._snapshot
+        new_config = config
+        if snapshot.container_max_concurrency != config.container_max_concurrency:
+            new_config = replace(new_config, container_max_concurrency=snapshot.container_max_concurrency)
+        for key, field in _LIMIT_FIELD_BY_KEY.items():
+            if getattr(new_config, field) != getattr(snapshot, field):
+                new_config = replace(new_config, **{field: getattr(snapshot, field)})
         # container_max_concurrency > 1 is incompatible with the global input symlink.
-        if current_cmc > 1 and new_config.compat_input_path_enabled:
+        if new_config.container_max_concurrency > 1 and new_config.compat_input_path_enabled:
             new_config = replace(new_config, compat_input_path_enabled=False)
         return new_config
 
@@ -77,7 +340,11 @@ def start_nacos_listener(
       - AF_CONFIG_NACOS_GROUP: group (default "alphafrog-config")
       - AF_CONFIG_NACOS_DATA_ID: data id (default "python-sandbox.json")
 
-    Expected config content is JSON, e.g. {"containerMaxConcurrency": 5}.
+    Expected config content is a single JSON object, e.g.
+    {"containerMaxConcurrency": 5, "stdoutMaxBytes": 1048576,
+     "stderrMaxBytes": 262144, "recordChannelMaxBytes": 262144,
+     "recordChannelMaxRecords": 128}. The whole object must validate before
+    any of it is applied (contract §13 whole-object semantics).
     """
     if os.getenv("AF_CONFIG_NACOS_ENABLED", "").lower() != "true":
         logger.info("Nacos config listener disabled (AF_CONFIG_NACOS_ENABLED != true)")
@@ -100,22 +367,9 @@ def start_nacos_listener(
     data_id = os.getenv("AF_CONFIG_NACOS_DATA_ID", "python-sandbox.json")
 
     def _parse_content(content: str) -> None:
-        if not content or not content.strip():
-            return
-        try:
-            payload = json.loads(content)
-        except json.JSONDecodeError as exc:
-            logger.warning("Nacos config content is not valid JSON: %s", exc)
-            return
-        if not isinstance(payload, dict):
-            logger.warning("Nacos config content is not a JSON object")
-            return
-        raw = payload.get("containerMaxConcurrency")
-        if raw is not None:
-            try:
-                dynamic_config.update_container_max_concurrency(int(raw))
-            except (TypeError, ValueError) as exc:
-                logger.warning("Invalid containerMaxConcurrency in Nacos config: %s", exc)
+        # Whole-object parse/validate/apply lives in DynamicSandboxConfig so
+        # it is testable without the Nacos SDK or network.
+        dynamic_config.apply_dynamic_content(content)
 
     def _on_config_change(config_response: object) -> None:
         content = getattr(config_response, "raw", None)

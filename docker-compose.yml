@@ -639,7 +639,10 @@ services:
       AF_SANDBOX_WORKSPACE_ROOT: /sandbox/runs
       AF_SANDBOX_TASK_STORE_PATH: /data/sandbox_tasks/state.json
       AF_SANDBOX_COMPAT_INPUT_PATH: "true"
-      # Nacos dynamic config (mirrors Java services)
+      # Nacos dynamic config（mirrors Java services）。默认关闭：生产发布时显式
+      # 设 AF_CONFIG_NACOS_ENABLED=true 才启用。动态配置只能调低输出上限，不能
+      # 超过代码静态硬上限；四段输出上限测试（工作包 C/D）完成前，金融计算结果
+      # 通道保持关闭（Spec §7.2）。
       AF_CONFIG_NACOS_ENABLED: ${AF_CONFIG_NACOS_ENABLED:-false}
       AF_CONFIG_NACOS_NAMESPACE: ${AF_CONFIG_NACOS_NAMESPACE:-}
       AF_CONFIG_NACOS_GROUP: ${AF_CONFIG_NACOS_GROUP:-alphafrog-config}
