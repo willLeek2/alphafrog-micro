@@ -2,7 +2,7 @@ schemaVersion: "1"
 methodId: finance.risk.sharpe_ratio
 version: 1.0.0
 displayName: 夏普比率
-definition: 周期超额收益率的算术平均值除以周期收益率样本标准差，再按每年期数平方根换算的年化夏普比率
+definition: 周期超额收益均值除以周期收益率标准差、再按每年期数平方根换算的年化夏普比率；缺省规范路径为算术平均 + 样本标准差（ddof=1）+ 年化无风险利率折算，显式参数可选择其他口径并按所传参数执行
 resolverHints:
   aliases: [夏普比率, 夏普, Sharpe, Sharpe ratio]
   commonPhrases: [每承担一份波动换来多少收益, 风险调整后的收益水平]
