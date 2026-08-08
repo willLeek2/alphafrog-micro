@@ -50,6 +50,7 @@ public class FinanceRecordChannelConfigLoader {
             Snapshot snapshot = current;
             MapPayload payload = new MapPayload();
             payload.effectiveFinanceRecordConfig = new EffectiveConfig(snapshot.limits());
+            payload.targetEnvironment = snapshot.targetEnvironment();
             payload.sourceRevision = snapshot.sourceRevision();
             payload.limitsClamped = snapshot.limitsClamped();
             return objectMapper.writeValueAsString(payload);
@@ -61,12 +62,31 @@ public class FinanceRecordChannelConfigLoader {
     }
 
     public FinanceRecordChannelLimits parseFrozenLimits(String json) {
+        return parseFrozenSnapshot(json).limits();
+    }
+
+    /**
+     * Restores the complete immutable snapshot stored on a run/tool-job anchor.
+     * Terminal processing must not combine frozen limits with a later live target-environment config.
+     */
+    public Snapshot parseFrozenSnapshot(String json) {
         try {
             MapPayload payload = objectMapper.readValue(json, MapPayload.class);
             if (payload.effectiveFinanceRecordConfig == null) {
                 throw new IllegalArgumentException("effectiveFinanceRecordConfig is required");
             }
-            return payload.effectiveFinanceRecordConfig.toLimits();
+            FinanceRecordChannelLimits limits = payload.effectiveFinanceRecordConfig.toLimits();
+            FinanceEnvironmentFact targetEnvironment = payload.targetEnvironment;
+            if (targetEnvironment != null
+                    && !limits.targetEnvironmentId().equals(targetEnvironment.environmentId())) {
+                throw new IllegalArgumentException(
+                        "targetEnvironment.environmentId must match targetEnvironmentId");
+            }
+            return new Snapshot(
+                    limits,
+                    targetEnvironment,
+                    trim(payload.sourceRevision),
+                    Boolean.TRUE.equals(payload.limitsClamped));
         } catch (Exception exception) {
             throw new FinanceRecordProcessingException(
                     "FINANCE_RECORD_CONFIG_SNAPSHOT_INVALID",
@@ -183,6 +203,7 @@ public class FinanceRecordChannelConfigLoader {
 
     static class MapPayload {
         public EffectiveConfig effectiveFinanceRecordConfig;
+        public FinanceEnvironmentFact targetEnvironment;
         public String sourceRevision;
         public Boolean limitsClamped;
     }

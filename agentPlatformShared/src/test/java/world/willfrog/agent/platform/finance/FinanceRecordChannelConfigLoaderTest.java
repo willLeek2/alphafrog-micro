@@ -64,8 +64,34 @@ class FinanceRecordChannelConfigLoaderTest {
         JsonNode root = objectMapper.readTree(frozen);
         assertThat(root.path("effectiveFinanceRecordConfig").path("targetEnvironmentId").asText())
                 .isEqualTo("sha256:target");
-        assertThat(root.toString()).doesNotContain("imageDigest", "packageApis", "librarySetDigest");
+        assertThat(root.path("targetEnvironment").path("imageDigest").asText())
+                .isEqualTo("sha256:image");
+        assertThat(root.path("targetEnvironment").path("librarySetDigest").asText())
+                .isEqualTo("sha256:library");
+        assertThat(root.path("targetEnvironment").path("packageApis").get(0).path("apiVersion").asText())
+                .isEqualTo("1.0");
         assertThat(loader.parseFrozenLimits(frozen)).isEqualTo(loader.current().limits());
+
+        Files.writeString(config, """
+                {
+                  "enabled": true,
+                  "targetEnvironment": {
+                    "environmentId": "sha256:target-new",
+                    "imageDigest": "sha256:image-new",
+                    "librarySetDigest": "sha256:library-new",
+                    "packageApis": [{"name":"alphafrog_finance","version":"2.0.0","apiVersion":"2.0"}]
+                  }
+                }
+                """);
+        loader.reloadIfNeeded(true);
+
+        FinanceRecordChannelConfigLoader.Snapshot restored = loader.parseFrozenSnapshot(frozen);
+        assertThat(loader.current().targetEnvironment().environmentId()).isEqualTo("sha256:target-new");
+        assertThat(restored.targetEnvironment().environmentId()).isEqualTo("sha256:target");
+        assertThat(restored.targetEnvironment().imageDigest()).isEqualTo("sha256:image");
+        assertThat(restored.targetEnvironment().packageApis()).containsExactly(
+                new FinanceEnvironmentFact.PackageApi(
+                        "alphafrog_finance", "1.0.3", "1.0"));
     }
 
     @Test
