@@ -454,52 +454,6 @@ class RuntimeEnvironmentTest(unittest.TestCase):
         session.config = types.SimpleNamespace(skip_environment_setup=False)
         session.python_executable_path = "/sandbox/.sandbox-venv/bin/python"
         session.execute_command.return_value = _FakeCommandResult(
-            stdout=json.dumps({"alphafrog_finance": "1.7"}), exit_code=0
-        )
-        _probe_package_api_versions(
-            session, ["alphafrog_finance", "numpy", "beautifulsoup4"]
-        )
-        command = session.execute_command.call_args.args[0]
-        self.assertIn("alphafrog_finance", command)
-        self.assertNotIn("numpy", command)
-        self.assertNotIn("beautifulsoup4", command)
-
-    def test_library_set_digest_matches_golden_reference(self) -> None:
-        """Pin the canonical librarySetDigest for a fixed inventory.
-
-        This matches the H canonical JSON digest for the same packages and
-        apiVersion; a divergence here signals a schema drift that would
-        invalidate downstream compatibility checks.
-        """
-        from app.runtime_environment import collect_runtime_environment
-
-        fake_client = _FakeDockerClient(_FakeContainer("sha256:golden-image"))
-        session = _runtime_session(
-            [
-                {"name": "numpy", "version": "1.26.0"},
-                {"name": "alphafrog_finance", "version": "1.0.3"},
-            ],
-            {"alphafrog_finance": "1.7"},
-        )
-        with patch.dict(
-            "sys.modules",
-            {"docker": types.SimpleNamespace(from_env=lambda: fake_client)},
-        ):
-            env = collect_runtime_environment(
-                container_id="c-golden", session=session
-            )
-        self.assertEqual(
-            "sha256:d36c2ee55acb03458cd694a28477f911e8c0ffa71e978bf280eabbea1ecb2ee1",
-            env.library_set_digest,
-        )
-
-    def test_probe_package_api_versions_failure_is_incomplete(self) -> None:
-        from app.runtime_environment import _probe_package_api_versions
-
-        session = MagicMock()
-        session.config.skip_environment_setup = False
-        session.python_executable_path = "/sandbox/.sandbox-venv/bin/python"
-        session.execute_command.return_value = _FakeCommandResult(
             stdout="", exit_code=1
         )
         versions, complete = _probe_package_api_versions(
@@ -542,6 +496,114 @@ class RuntimeEnvironmentTest(unittest.TestCase):
         self.assertIn("alphafrog_finance", command)
         for unsupported in ("numpy", "beautifulsoup4", "scikit-learn"):
             self.assertNotIn(unsupported, command)
+
+    def test_library_set_digest_matches_h_golden_reference(self) -> None:
+        """Pin the canonical librarySetDigest to the H package's golden vector.
+
+        260808-finance-methodspec-v5 work package D (codex msg b92ef5bc): the
+        librarySetDigest MUST be byte-equal to the H canonical computation for
+        the same package list. The H fixed sample is alphafrog_finance 1.0.3
+        with apiVersion 1.0, numpy 2.1.3, and pandas 2.2.3 — see
+        `agent-micro-methodspec-v5-h/pythonSandboxService/tests/test_build_runtime_manifest.py`
+        ``GOLDEN_CANONICAL_BYTES`` / ``GOLDEN_LIBRARY_SET_DIGEST``. Any drift
+        here means D and H disagree on canonical encoding, which would break
+        the wire compatibility check downstream.
+        """
+        from app.runtime_environment import collect_runtime_environment
+
+        fake_client = _FakeDockerClient(_FakeContainer("sha256:golden-image"))
+        # H fixed sample pins alphafrog_finance apiVersion to "1.0" (matching
+        # the spec §12 example) — D's `_runtime_session` returns the same
+        # JSON when the probe reports "1.0".
+        session = _runtime_session(
+            [
+                {"name": "numpy", "version": "2.1.3"},
+                {"name": "alphafrog_finance", "version": "1.0.3"},
+                {"name": "pandas", "version": "2.2.3"},
+            ],
+            {"alphafrog_finance": "1.0"},
+        )
+        with patch.dict(
+            "sys.modules",
+            {"docker": types.SimpleNamespace(from_env=lambda: fake_client)},
+        ):
+            env = collect_runtime_environment(
+                container_id="c-golden", session=session
+            )
+        self.assertEqual(
+            "sha256:a69375e78e4f57c2c20bb82e9b6f0170fc91831b2ca659a958cdea266e56bd53",
+            env.library_set_digest,
+        )
+        self.assertTrue(env.inventory_complete)
+        alphafrog_api = next(
+            pkg for pkg in env.package_apis if pkg.name == "alphafrog_finance"
+        )
+        self.assertEqual("1.0", alphafrog_api.api_version)
+
+    def test_collect_runtime_environment_pip_missing_supported_api_is_incomplete(self) -> None:
+        """Adversarial: required-supported distribution not pip-installed.
+
+        260808-finance-methodspec-v5 work package D (codex msg b92ef5bc): if
+        `alphafrog_finance` is reachable via a process-time injection
+        (e.g. PYTHONPATH, sys.path tampering) but is NOT registered in the
+        container's pip metadata, the package-set-vs-supported cross-check
+        MUST force ``inventory_complete=False``. The wire MUST NOT trust an
+        apiVersion whose install path isn't pip-metadata-confirmed —
+        otherwise a missing distribution would silently fabricate a
+        fingerprint against a distribution the user never installed.
+
+        The probe here returns ``{"alphafrog_finance": "1.7"}`` to simulate a
+        worst-case scenario where the import succeeds despite the missing
+        pip install (e.g. a stale or shadowed ``alphafrog_finance`` module
+        discoverable on ``sys.path``). Even if the probe returned empty,
+        the cross-check has already fired; the asserted outcomes hold
+        regardless of probe payload.
+        """
+        from app.runtime_environment import collect_runtime_environment
+
+        class _AdversarialSession:
+            config = types.SimpleNamespace(skip_environment_setup=False)
+            using_existing_container = False
+            python_executable_path = "/sandbox/.sandbox-venv/bin/python"
+            calls = 0
+
+            def execute_command(self, command: str) -> _FakeCommandResult:
+                _AdversarialSession.calls += 1
+                if "-m pip list" in command:
+                    # pip-list reports ONLY numpy — alphafrog_finance is not
+                    # installed (it's only on PYTHONPATH in this scenario).
+                    return _FakeCommandResult(
+                        stdout=json.dumps(
+                            [{"name": "numpy", "version": "1.26.0"}]
+                        ),
+                        exit_code=0,
+                    )
+                # Probe still sees a hypothetical PYTHONPATH-injected
+                # alphafrog_finance — must be ignored by the cross-check.
+                return _FakeCommandResult(
+                    stdout=json.dumps({"alphafrog_finance": "1.7"}),
+                    exit_code=0,
+                )
+
+        fake_client = _FakeDockerClient(_FakeContainer("sha256:adversarial-img"))
+        session = _AdversarialSession()
+        with patch.dict(
+            "sys.modules",
+            {"docker": types.SimpleNamespace(from_env=lambda: fake_client)},
+        ):
+            env = collect_runtime_environment(
+                container_id="c-path-import",
+                session=session,
+            )
+
+        self.assertFalse(env.inventory_complete)
+        self.assertEqual([], env.package_apis)
+        self.assertTrue(env.environment_id.startswith("sha256:"))
+        # pip was probed (returned numpy) — the probe call only happens if
+        # the cross-check leaves a non-empty `supported ∩ installed` set,
+        # which is empty here for pip-only-numpy. The probe call is therefore
+        # NOT expected; nothing on the wire depends on its outcome.
+        self.assertEqual(1, _AdversarialSession.calls)
 
     def test_collect_runtime_environment_uses_container_api_version(self) -> None:
         from app import runtime_environment

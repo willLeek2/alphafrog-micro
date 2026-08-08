@@ -206,8 +206,26 @@ def collect_runtime_environment(
     image_digest = _inspect_container_image_digest(container_id)
     packages, inventory_complete = _read_installed_packages(session)
     packages_sorted = sorted(packages, key=lambda p: p["name"])
+    installed_names = {package["name"] for package in packages_sorted}
+    # 260808-finance-methodspec-v5 work package D (codex msg b92ef5bc):
+    # the wire apiVersion can only be trusted when the supported distribution
+    # is actually pip-installed in the same interpreter the probe runs in. A
+    # process-time PYTHONPATH injection that lets importlib find the module
+    # but leaves the pip metadata missing would otherwise fabricate a wire
+    # fingerprint against a distribution the user never installed. Cross-check
+    # required-supported-set against installed names; any missing required
+    # distribution forces inventory_complete=False.
+    required_supported = set(SUPPORTED_PACKAGE_API_NAMES)
+    missing_required = sorted(required_supported - installed_names)
+    if missing_required:
+        inventory_complete = False
+    # Probe only `supported ∩ installed`: required-but-not-installed names
+    # cannot be probed successfully anyway and were already flagged above.
+    # `package_apis` and the canonical packages below derive from the same
+    # installed row + probe value (one row, one source of truth).
+    probe_targets = sorted(required_supported & installed_names)
     api_versions, api_probe_complete = _probe_package_api_versions(
-        session, sorted(SUPPORTED_PACKAGE_API_NAMES)
+        session, probe_targets
     )
     inventory_complete = inventory_complete and api_probe_complete
 
