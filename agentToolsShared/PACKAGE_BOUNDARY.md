@@ -5,7 +5,7 @@
 | Package | Classes |
 |---------|---------|
 | `world.willfrog.agent.tools.dataset` | DatasetRegistry, DatasetWriter |
-| `world.willfrog.agent.tools.finance` | FinanceMethodSpec, FinanceMethodSpecCatalog, FinanceMethodResolverCatalog, FinanceMethodResolverClient, FinanceMethodResolutionValidator, FinanceMethodSuggestionRenderer, FinanceMethodResolutionSnapshot, FinanceMethodResolutionSink, FinanceMethodResolutionSinkException, FinanceMethodKnowledgeCatalog, FinanceMethodTools, FinanceResultModelProjector |
+| `world.willfrog.agent.tools.finance` | FinanceMethodSpec, FinanceMethodSpecCatalog, FinanceMethodResolverCatalog, FinanceMethodResolverClient, FinanceMethodResolutionValidator, FinanceMethodSuggestionRenderer, FinanceMethodResolutionSnapshot, FinanceMethodResolutionSink, FinanceMethodResolutionSinkException, FinanceMethodKnowledgeCatalog, FinanceMethodTools, FinanceResultModelProjector, FinanceTargetEnvironmentProvider |
 | `world.willfrog.agent.tools.market` | MarketDataTools |
 | `world.willfrog.agent.tools.python` | PythonSandboxTools |
 | `world.willfrog.agent.tools.rag` | RagTools |

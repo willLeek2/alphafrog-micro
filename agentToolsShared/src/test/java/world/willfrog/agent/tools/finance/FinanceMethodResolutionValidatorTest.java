@@ -255,4 +255,72 @@ class FinanceMethodResolutionValidatorTest {
         assertTrue(result.isValid());
         assertEquals("NEEDS_CLARIFICATION", result.getStatus());
     }
+
+    @Test
+    void rootNonStringMatchReasonRejected() throws Exception {
+        FinanceMethodSpec cagr = catalog.findByMethodId("finance.growth.cagr").orElseThrow();
+        String json = "{"
+                + "\"status\":\"MATCHED\","
+                + "\"candidates\":[{"
+                + "  \"methodId\":\"" + cagr.getMethodId() + "\","
+                + "  \"version\":\"" + cagr.getVersion() + "\","
+                + "  \"specDigest\":\"" + cagr.getSpecDigest() + "\","
+                + "  \"matchReason\":\"ok\","
+                + "  \"unresolvedTerms\":[],"
+                + "  \"clarificationQuestions\":[]"
+                + "}],"
+                + "\"matchReason\":123,"
+                + "\"unresolvedTerms\":[],"
+                + "\"clarificationQuestions\":[]"
+                + "}";
+        JsonNode node = objectMapper.readTree(json);
+        FinanceMethodResolutionValidator.ValidationResult result = validator.validate(node);
+        assertFalse(result.isValid());
+        assertEquals("MATCH_REASON_NOT_TEXTUAL", result.getErrorCode());
+    }
+
+    @Test
+    void candidateNonStringMatchReasonRejected() throws Exception {
+        FinanceMethodSpec cagr = catalog.findByMethodId("finance.growth.cagr").orElseThrow();
+        String json = "{"
+                + "\"status\":\"MATCHED\","
+                + "\"candidates\":[{"
+                + "  \"methodId\":\"" + cagr.getMethodId() + "\","
+                + "  \"version\":\"" + cagr.getVersion() + "\","
+                + "  \"specDigest\":\"" + cagr.getSpecDigest() + "\","
+                + "  \"matchReason\":{\" forged\":true},"
+                + "  \"unresolvedTerms\":[],"
+                + "  \"clarificationQuestions\":[]"
+                + "}],"
+                + "\"matchReason\":\"ok\","
+                + "\"unresolvedTerms\":[],"
+                + "\"clarificationQuestions\":[]"
+                + "}";
+        JsonNode node = objectMapper.readTree(json);
+        FinanceMethodResolutionValidator.ValidationResult result = validator.validate(node);
+        assertFalse(result.isValid());
+        assertEquals("MATCH_REASON_NOT_TEXTUAL", result.getErrorCode());
+    }
+
+    @Test
+    void numericMethodIdRejected() throws Exception {
+        String json = "{"
+                + "\"status\":\"MATCHED\","
+                + "\"candidates\":[{"
+                + "  \"methodId\":123,"
+                + "  \"version\":\"1.0.0\","
+                + "  \"specDigest\":\"sha256:deadbeef\","
+                + "  \"matchReason\":\"ok\","
+                + "  \"unresolvedTerms\":[],"
+                + "  \"clarificationQuestions\":[]"
+                + "}],"
+                + "\"matchReason\":\"\","
+                + "\"unresolvedTerms\":[],"
+                + "\"clarificationQuestions\":[]"
+                + "}";
+        JsonNode node = objectMapper.readTree(json);
+        FinanceMethodResolutionValidator.ValidationResult result = validator.validate(node);
+        assertFalse(result.isValid());
+        assertEquals("MISSING_METHOD_ID", result.getErrorCode());
+    }
 }

@@ -48,6 +48,9 @@ public class FinanceMethodTools {
     @Autowired(required = false)
     private FinanceMethodResolutionSink resolutionSink;
 
+    @Autowired(required = false)
+    private FinanceTargetEnvironmentProvider targetEnvironmentProvider;
+
     public FinanceMethodTools(FinanceMethodSpecCatalog specCatalog,
                               FinanceMethodResolverCatalog resolverCatalog,
                               FinanceMethodResolutionValidator validator,
@@ -69,6 +72,10 @@ public class FinanceMethodTools {
 
     void setResolutionSink(FinanceMethodResolutionSink resolutionSink) {
         this.resolutionSink = resolutionSink;
+    }
+
+    void setTargetEnvironmentProvider(FinanceTargetEnvironmentProvider targetEnvironmentProvider) {
+        this.targetEnvironmentProvider = targetEnvironmentProvider;
     }
 
     @Tool("""
@@ -118,7 +125,7 @@ public class FinanceMethodTools {
 
         if (resolverResult instanceof FinanceMethodResolverClient.Ok ok) {
             modelOutput = parseModelJson(ok.rawJson());
-            modelRouteJson = ok.modelRouteJson();
+            modelRouteJson = serializeRouteInfo(ok.route());
             usedExactAliasFallback = false;
         } else if (resolverResult instanceof FinanceMethodResolverClient.TechnicalError err) {
             // 技术失败先走精确别名兜底
@@ -153,8 +160,9 @@ public class FinanceMethodTools {
         }
 
         String status = validation.getStatus();
+        FinanceMethodSuggestionRenderer.TargetEnvironment targetEnv = readTargetEnvironment();
         List<Map<String, Object>> suggestions = renderSuggestions(
-                validation.getCandidates(), status, modelOutput);
+                validation.getCandidates(), status, modelOutput, targetEnv);
 
         // 有候选建议时才强制 runId 与 sink；NO_ADVICE 等空建议时允许不保存
         if (!suggestions.isEmpty()) {
@@ -167,7 +175,7 @@ public class FinanceMethodTools {
             }
             String todoId = nvl(AgentContext.getTodoId());
             List<FinanceMethodResolutionSnapshot> snapshots = buildSnapshots(
-                    runId, resolverToolCallId, todoId, status, suggestions, modelRouteJson);
+                    runId, resolverToolCallId, todoId, status, suggestions, modelRouteJson, targetEnv);
             try {
                 resolutionSink.saveAll(snapshots);
             } catch (FinanceMethodResolutionSinkException sinkEx) {
@@ -266,11 +274,11 @@ public class FinanceMethodTools {
         return fail(code, message);
     }
 
-    private List<Map<String, Object>> renderSuggestions(JsonNode candidates, String status, JsonNode modelOutput) {
+    private List<Map<String, Object>> renderSuggestions(JsonNode candidates, String status, JsonNode modelOutput,
+                                                        FinanceMethodSuggestionRenderer.TargetEnvironment targetEnv) {
         if (candidates == null || !candidates.isArray()) {
             return Collections.emptyList();
         }
-        FinanceMethodSuggestionRenderer.TargetEnvironment targetEnv = resolveTargetEnvironment();
         List<Map<String, Object>> result = new ArrayList<>();
         for (JsonNode cand : candidates) {
             String methodId = text(cand, "methodId");
@@ -285,10 +293,11 @@ public class FinanceMethodTools {
         return result;
     }
 
-    private FinanceMethodSuggestionRenderer.TargetEnvironment resolveTargetEnvironment() {
-        // 当前运行时Slice未从AgentContext获得环境清单；此处预留为可空。
-        // 实际环境清单由工作包C/E注入AgentContext后扩展。
-        return null;
+    private FinanceMethodSuggestionRenderer.TargetEnvironment readTargetEnvironment() {
+        if (targetEnvironmentProvider == null) {
+            return null;
+        }
+        return targetEnvironmentProvider.currentTargetEnvironment().orElse(null);
     }
 
     private List<FinanceMethodResolutionSnapshot> buildSnapshots(
@@ -297,7 +306,8 @@ public class FinanceMethodTools {
             String todoId,
             String status,
             List<Map<String, Object>> suggestions,
-            String modelRouteJson) {
+            String modelRouteJson,
+            FinanceMethodSuggestionRenderer.TargetEnvironment targetEnv) {
         if (runId.isBlank()) {
             return Collections.emptyList();
         }
@@ -306,6 +316,8 @@ public class FinanceMethodTools {
         String resolverPromptVersion = resolverCatalog.getPromptVersion();
         String resolutionPayloadJson = serializeSafe(suggestions);
         String resolutionContentDigest = sha256(resolutionPayloadJson.getBytes(StandardCharsets.UTF_8));
+        String targetEnvironmentId = targetEnv == null ? null : targetEnv.environmentId();
+        String targetPackageApiJson = targetEnv == null ? null : serializePackageApis(targetEnv.packageApis());
         for (Map<String, Object> suggestion : suggestions) {
             String methodId = String.valueOf(suggestion.get("methodId"));
             String version = String.valueOf(suggestion.get("version"));
@@ -325,8 +337,8 @@ public class FinanceMethodTools {
                     modelRouteJson,
                     matchReason,
                     clarificationJson,
-                    null, // targetEnvironmentId - 环境清单未接入
-                    null, // targetPackageApiJson
+                    targetEnvironmentId,
+                    targetPackageApiJson,
                     resolutionPayloadJson,
                     resolutionContentDigest,
                     Instant.now()
@@ -355,6 +367,32 @@ public class FinanceMethodTools {
             return "";
         }
         return value.asText("");
+    }
+
+    private String serializeRouteInfo(FinanceMethodResolverClient.RouteInfo route) {
+        if (route == null) {
+            return null;
+        }
+        Map<String, Object> map = new LinkedHashMap<>();
+        map.put("endpoint", route.endpoint());
+        map.put("model", route.model());
+        map.put("provider", route.provider());
+        return serializeSafe(map);
+    }
+
+    private String serializePackageApis(List<FinanceMethodSuggestionRenderer.TargetEnvironment.PackageApi> packageApis) {
+        if (packageApis == null) {
+            return null;
+        }
+        List<Map<String, Object>> list = new ArrayList<>(packageApis.size());
+        for (FinanceMethodSuggestionRenderer.TargetEnvironment.PackageApi api : packageApis) {
+            Map<String, Object> map = new LinkedHashMap<>();
+            map.put("name", api.name());
+            map.put("version", api.version());
+            map.put("apiVersion", api.apiVersion());
+            list.add(map);
+        }
+        return serializeSafe(list);
     }
 
     private String serializeSafe(Object value) {

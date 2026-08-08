@@ -51,7 +51,11 @@ public class FinanceMethodResolutionValidator {
             return invalid("MODEL_OUTPUT_NOT_OBJECT", "Model output must be a JSON object");
         }
 
-        String status = text(output, "status");
+        JsonNode statusNode = output.get("status");
+        if (statusNode == null || statusNode.isNull() || !statusNode.isTextual()) {
+            return invalid("INVALID_STATUS", "status must be a string");
+        }
+        String status = statusNode.asText();
         if (!ALLOWED_STATUSES.contains(status)) {
             return invalid("INVALID_STATUS", "Status must be one of " + ALLOWED_STATUSES);
         }
@@ -106,6 +110,11 @@ public class FinanceMethodResolutionValidator {
             return rootFieldResult;
         }
 
+        JsonNode rootMatchReason = output.get("matchReason");
+        if (rootMatchReason != null && !rootMatchReason.isNull() && !rootMatchReason.isTextual()) {
+            return invalid("MATCH_REASON_NOT_TEXTUAL", "matchReason must be a string");
+        }
+
         String matchReason = textOrNull(output, "matchReason");
         if (matchReason != null && matchReason.length() > MAX_REASON_LENGTH) {
             return invalid("MATCH_REASON_TOO_LONG",
@@ -125,19 +134,29 @@ public class FinanceMethodResolutionValidator {
     }
 
     private ValidationResult validateCandidate(JsonNode cand, int index) {
-        String methodId = text(cand, "methodId");
-        if (methodId.isBlank()) {
+        JsonNode methodIdNode = cand.get("methodId");
+        if (methodIdNode == null || methodIdNode.isNull() || !methodIdNode.isTextual() || methodIdNode.asText().isBlank()) {
             return invalid("MISSING_METHOD_ID", "Candidate " + index + " missing methodId");
         }
-        String version = text(cand, "version");
-        if (version.isBlank()) {
+        String methodId = methodIdNode.asText();
+
+        JsonNode versionNode = cand.get("version");
+        if (versionNode == null || versionNode.isNull() || !versionNode.isTextual() || versionNode.asText().isBlank()) {
             return invalid("MISSING_VERSION", "Candidate " + index + " missing version");
         }
-        String specDigest = text(cand, "specDigest");
-        if (specDigest.isBlank()) {
+        String version = versionNode.asText();
+
+        JsonNode specDigestNode = cand.get("specDigest");
+        if (specDigestNode == null || specDigestNode.isNull() || !specDigestNode.isTextual() || specDigestNode.asText().isBlank()) {
             return invalid("MISSING_SPEC_DIGEST", "Candidate " + index + " missing specDigest");
         }
-        String matchReason = text(cand, "matchReason");
+        String specDigest = specDigestNode.asText();
+
+        JsonNode matchReasonNode = cand.get("matchReason");
+        if (matchReasonNode != null && !matchReasonNode.isNull() && !matchReasonNode.isTextual()) {
+            return invalid("MATCH_REASON_NOT_TEXTUAL", "Candidate " + index + " matchReason must be a string");
+        }
+        String matchReason = matchReasonNode == null || matchReasonNode.isNull() ? "" : matchReasonNode.asText();
         if (matchReason.length() > MAX_REASON_LENGTH) {
             return invalid("MATCH_REASON_TOO_LONG",
                     "Candidate " + index + " matchReason exceeds " + MAX_REASON_LENGTH + " chars");

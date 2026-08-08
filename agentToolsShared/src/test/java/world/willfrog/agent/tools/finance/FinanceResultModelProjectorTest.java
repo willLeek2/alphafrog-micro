@@ -152,6 +152,88 @@ class FinanceResultModelProjectorTest {
     }
 
     @Test
+    void requiredParameterNotInNarrativeWrongTypeReturnsEmpty() {
+        FinanceMethodSpecCatalog mockCatalog = mock(FinanceMethodSpecCatalog.class);
+        FinanceResultModelProjector localProjector = new FinanceResultModelProjector(mockCatalog);
+
+        Map<String, FinanceMethodSpec.FinanceParameter> params = new LinkedHashMap<>();
+        params.put("visible", FinanceMethodSpec.FinanceParameter.builder()
+                .name("visible").type("number").required(true).build());
+        params.put("hidden", FinanceMethodSpec.FinanceParameter.builder()
+                .name("hidden").type("integer").required(true).build());
+
+        FinanceMethodSpec spec = FinanceMethodSpec.builder()
+                .methodId("test.wrongtype")
+                .version("1.0.0")
+                .specDigest("sha256:deadbeef")
+                .displayName("Test")
+                .parameters(params)
+                .conventions(Map.of("narrative", Map.of("narrativeTemplate", "value={visible}")))
+                .outputs(List.of(FinanceMethodSpec.FinanceOutput.builder()
+                        .name("out").unit("unit").description("d").build()))
+                .build();
+        when(mockCatalog.find(any(), any(), any())).thenReturn(Optional.of(spec));
+
+        FinanceResultModelProjector.FinanceResultProjectionInput input =
+                new FinanceResultModelProjector.FinanceResultProjectionInput(
+                        spec.getMethodId(), spec.getVersion(), spec.getSpecDigest(),
+                        1.0, "unit",
+                        Map.of("visible", 1.0, "hidden", "not-an-integer"),
+                        null, true);
+        assertFalse(localProjector.project(input).isPresent(),
+                "Required param with wrong type must fail closed even if not in narrative");
+    }
+
+    @Test
+    void fractionalIntegerReturnsEmpty() {
+        FinanceMethodSpecCatalog mockCatalog = mock(FinanceMethodSpecCatalog.class);
+        FinanceResultModelProjector localProjector = new FinanceResultModelProjector(mockCatalog);
+
+        Map<String, FinanceMethodSpec.FinanceParameter> params = new LinkedHashMap<>();
+        params.put("count", FinanceMethodSpec.FinanceParameter.builder()
+                .name("count").type("integer").required(true).build());
+
+        FinanceMethodSpec spec = FinanceMethodSpec.builder()
+                .methodId("test.integer")
+                .version("1.0.0")
+                .specDigest("sha256:integer")
+                .displayName("Integer Test")
+                .parameters(params)
+                .conventions(Map.of("narrative", Map.of("narrativeTemplate", "count={count}")))
+                .outputs(List.of(FinanceMethodSpec.FinanceOutput.builder()
+                        .name("out").unit("unit").description("d").build()))
+                .build();
+        when(mockCatalog.find(any(), any(), any())).thenReturn(Optional.of(spec));
+
+        FinanceResultModelProjector.FinanceResultProjectionInput fractional =
+                new FinanceResultModelProjector.FinanceResultProjectionInput(
+                        spec.getMethodId(), spec.getVersion(), spec.getSpecDigest(),
+                        1.0, "unit",
+                        Map.of("count", 1.5),
+                        null, true);
+        assertFalse(localProjector.project(fractional).isPresent(),
+                "Fractional value for integer parameter must be rejected");
+
+        FinanceResultModelProjector.FinanceResultProjectionInput doubleIntegral =
+                new FinanceResultModelProjector.FinanceResultProjectionInput(
+                        spec.getMethodId(), spec.getVersion(), spec.getSpecDigest(),
+                        1.0, "unit",
+                        Map.of("count", 2.0),
+                        null, true);
+        assertTrue(localProjector.project(doubleIntegral).isPresent(),
+                "Mathematical integer as double must be accepted");
+
+        FinanceResultModelProjector.FinanceResultProjectionInput whole =
+                new FinanceResultModelProjector.FinanceResultProjectionInput(
+                        spec.getMethodId(), spec.getVersion(), spec.getSpecDigest(),
+                        1.0, "unit",
+                        Map.of("count", 2),
+                        null, true);
+        assertTrue(localProjector.project(whole).isPresent(),
+                "Integral value must be accepted");
+    }
+
+    @Test
     void partialTripleVariantsReturnEmpty() {
         FinanceMethodSpec cagr = catalog.findByMethodId("finance.growth.cagr").orElseThrow();
         String[][] variants = {

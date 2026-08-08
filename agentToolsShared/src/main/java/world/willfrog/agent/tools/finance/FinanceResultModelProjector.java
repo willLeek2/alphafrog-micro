@@ -4,6 +4,8 @@ import lombok.extern.slf4j.Slf4j;
 
 import org.springframework.stereotype.Component;
 
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -87,6 +89,9 @@ public class FinanceResultModelProjector {
 
         Map<String, Object> effectiveParams = effectiveParameters(spec, in.parameters());
         if (!requiredParametersSatisfied(spec, effectiveParams)) {
+            return Optional.empty();
+        }
+        if (!allParameterTypesValid(spec, effectiveParams)) {
             return Optional.empty();
         }
 
@@ -213,6 +218,49 @@ public class FinanceResultModelProjector {
             return null;
         }
         return unit.trim();
+    }
+
+    private boolean allParameterTypesValid(FinanceMethodSpec spec, Map<String, Object> params) {
+        for (Map.Entry<String, FinanceMethodSpec.FinanceParameter> e : spec.getParameters().entrySet()) {
+            Object value = params.get(e.getKey());
+            if (value == null) {
+                continue; // 存在性由 requiredParametersSatisfied 负责；可选无值时无需类型校验
+            }
+            if (!isValueTypeValid(value, e.getValue().getType())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean isValueTypeValid(Object value, String declaredType) {
+        String type = declaredType == null ? "" : declaredType.toLowerCase();
+        return switch (type) {
+            case "array" -> value instanceof Collection<?> || value.getClass().isArray();
+            case "string" -> value instanceof String;
+            case "boolean" -> value instanceof Boolean;
+            case "number" -> value instanceof Number;
+            case "integer" -> value instanceof Number && isMathematicalInteger((Number) value);
+            case "object" -> false; // v1 fail-closed
+            default -> true; // 未声明类型时不额外收紧，避免破坏既有规范
+        };
+    }
+
+    private boolean isMathematicalInteger(Number value) {
+        if (value instanceof Integer || value instanceof Long
+                || value instanceof Short || value instanceof Byte || value instanceof BigInteger) {
+            return true;
+        }
+        if (value instanceof Double d) {
+            return Double.isFinite(d) && d == Math.rint(d);
+        }
+        if (value instanceof Float f) {
+            return Float.isFinite(f) && f == Math.rint(f);
+        }
+        if (value instanceof BigDecimal bd) {
+            return bd.stripTrailingZeros().scale() <= 0;
+        }
+        return false;
     }
 
     private boolean requiredParametersSatisfied(FinanceMethodSpec spec, Map<String, Object> params) {

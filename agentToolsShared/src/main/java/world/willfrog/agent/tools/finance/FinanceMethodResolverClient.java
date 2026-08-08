@@ -27,11 +27,31 @@ public interface FinanceMethodResolverClient {
     /**
      * 成功结果。
      *
-     * @param rawJson        模型原始输出 JSON 字符串
-     * @param modelRouteJson 真实 provider/endpoint/model 路由信息，由 platform 实现侧填入；
-     *                       仅用于可观测快照，不得把模型输出内容当作路由
+     * @param rawJson 模型原始输出 JSON 字符串
+     * @param route   真实 provider/endpoint/model 路由信息，由 platform 实现侧填入；
+     *                仅用于可观测快照，不得把模型输出内容当作路由
      */
-    record Ok(String rawJson, String modelRouteJson) implements ResolverResult {
+    record Ok(String rawJson, RouteInfo route) implements ResolverResult {
+    }
+
+    /**
+     * 模型路由信息。compact constructor 会 trim 并拒绝空值。
+     */
+    record RouteInfo(String provider, String endpoint, String model) {
+        public RouteInfo {
+            if (provider == null || provider.trim().isEmpty()) {
+                throw new IllegalArgumentException("provider must not be blank");
+            }
+            provider = provider.trim();
+            if (endpoint == null || endpoint.trim().isEmpty()) {
+                throw new IllegalArgumentException("endpoint must not be blank");
+            }
+            endpoint = endpoint.trim();
+            if (model == null || model.trim().isEmpty()) {
+                throw new IllegalArgumentException("model must not be blank");
+            }
+            model = model.trim();
+        }
     }
 
     record TechnicalError(ErrorKind kind, String message) implements ResolverResult {
