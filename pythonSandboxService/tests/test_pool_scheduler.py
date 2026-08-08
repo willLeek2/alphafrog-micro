@@ -21,6 +21,9 @@ from app.pool_scheduler import ContainerPoolScheduler, SandboxQueueTimeoutError
 
 
 class FakeSession:
+    def copy_to_runtime(self, source: str, dest_path: str) -> None:
+        pass
+
     def close(self) -> None:
         pass
 
@@ -430,6 +433,70 @@ class ContainerPoolSchedulerTest(unittest.TestCase):
                 a_release.set()
                 drain_permitted.set()
                 scheduler.close()
+
+    def test_pool_initialize_failure_closes_session_and_does_not_register_worker(self) -> None:
+        """codex 2026-08-08 23:44 (msg 044974a1) pool init lifecycle:
+        smoke + loader + initialize MUST share one close-on-error try, and
+        the worker MUST only register itself (idle/ready, holding
+        ``self.session/container_id``) AFTER initialize succeeds. Otherwise
+        an init collect/copy failure orphans the Docker container — the
+        manager never sees an idle worker, but the container stays alive.
+        """
+
+        class _TrackingSession:
+            def __init__(self) -> None:
+                self.close_count = 0
+
+            def close(self) -> None:
+                self.close_count += 1
+
+            def copy_to_runtime(self, source: str, dest_path: str) -> None:
+                raise RuntimeError("container copy unreachable")
+
+        tracking_session = _TrackingSession()
+
+        with patch("app.pool_scheduler.create_sandbox_session", return_value=tracking_session), \
+            patch("app.pool_scheduler.get_session_container_id", return_value="container-init-leak"), \
+            patch("app.pool_scheduler.smoke_check_session"), \
+            patch("app.pool_scheduler.prepare_container_loader_modules"), \
+            patch("app.pool_scheduler.run_in_open_session") as run_mock:
+            scheduler = ContainerPoolScheduler(
+                make_config(min_size=0, max_size=1, container_max_concurrency=1)
+            )
+            worker_ready_calls: list[object] = []
+            worker_failed_calls: list[object] = []
+
+            scheduler.worker_ready = lambda w: worker_ready_calls.append(w)  # type: ignore[method-assign]
+            scheduler.worker_failed_to_start = lambda w, exc: worker_failed_calls.append((w, exc))  # type: ignore[method-assign]
+
+            scheduler._start_worker(block_until_ready=False)
+            try:
+                time.sleep(0.5)
+            finally:
+                scheduler.close()
+
+        self.assertEqual(
+            1, tracking_session.close_count,
+            "pool init failure MUST close the just-created session exactly "
+            "once; otherwise the Docker container is orphaned.",
+        )
+        self.assertEqual(
+            [], worker_ready_calls,
+            "worker_ready MUST NOT be called when initialize fails; the "
+            "manager would otherwise accept jobs against a half-initialized "
+            "container.",
+        )
+        self.assertGreaterEqual(
+            len(worker_failed_calls), 1,
+            "worker_failed_to_start MUST be called when initialize raises "
+            "(caller worker_failed_to_start hook is responsible for evicting "
+            "the failed worker from the scheduler).",
+        )
+        self.assertEqual(
+            [], run_mock.call_args_list,
+            "run_in_open_session MUST NOT be invoked when pool initialize "
+            "fails.",
+        )
 
 
 if __name__ == "__main__":

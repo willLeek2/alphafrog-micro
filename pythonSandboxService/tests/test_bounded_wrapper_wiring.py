@@ -1780,16 +1780,30 @@ class AttachChannelHelperTest(unittest.TestCase):
     def test_missing_field_returns_same_instance(self):
         import app.main as main_module
 
-        result = self._result()
-        # Today's ExecuteResult has no finance_record_channel field (D owns
-        # the declaration); until then the validated channel is not attached.
-        self.assertNotIn(
-            "finance_record_channel", main_module.ExecuteResult.model_fields
-        )
+        # Tolerance branch: a DTO without the field (pre-merge shape) gets the
+        # result back unchanged. Owner merge 2026-08-09: the REAL ExecuteResult
+        # now declares the field (D landed), so this uses a fieldless stub.
+        class _NoFieldResult:
+            model_fields: dict = {}
+
+        result = _NoFieldResult()
         self.assertIs(
-            main_module._attach_finance_record_channel(result, {"emitted_record_count": 0}),
+            main_module._attach_finance_record_channel(
+                result, {"emitted_record_count": 0}, model_cls=_NoFieldResult
+            ),
             result,
         )
+
+    def test_real_execute_result_attaches_channel_post_merge(self):
+        import app.main as main_module
+
+        # Owner merge 2026-08-09: D's frozen §5.1 field now exists on the real
+        # ExecuteResult, so the validated channel attaches with no model_cls.
+        self.assertIn("finance_record_channel", main_module.ExecuteResult.model_fields)
+        channel = {"emitted_record_count": 0}
+        result = self._result()
+        updated = main_module._attach_finance_record_channel(result, channel)
+        self.assertEqual(updated.finance_record_channel, channel)
 
     def test_present_field_attaches_channel(self):
         import app.main as main_module

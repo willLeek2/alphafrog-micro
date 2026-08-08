@@ -14,6 +14,7 @@ from .sandbox_runner import (
     SANDBOX_WORKER_LABELS,
     create_sandbox_session,
     get_session_container_id,
+    initialize_runtime_environment,
     prepare_container_loader_modules,
     run_in_open_session,
     smoke_check_session,
@@ -125,6 +126,24 @@ class ContainerWorker:
             # Copy static loader modules once per warm container so concurrent
             # tasks do not race copying the same files into /sandbox.
             prepare_container_loader_modules(session, self.config)
+            # 260808-finance-methodspec-v5 work package D: collect runtime
+            # environment once per warm container. The same ExecutionEnvironment
+            # instance drives the workdir file (written by initialize_runtime_environment),
+            # the AF_RUNTIME_ENVIRONMENT_FILE env var (set at container creation),
+            # and the HTTP execution_environment field for every task in this
+            # container. All tasks in the same pool container share this env by
+            # construction (same image, same baked packages).
+            #
+            # codex 2026-08-08 23:44 (msg 044974a1) pool init lifecycle: smoke
+            # + loader + initialize MUST share the same close-on-error try;
+            # ``self.session/container_id/execution_environment`` and the
+            # idle/ready state MUST only be assigned AFTER initialize succeeds.
+            # Otherwise an init collect/copy failure would orphan an active
+            # Docker container (the manager never sees an idle worker, but
+            # Docker still holds the container until process exit).
+            self.execution_environment = initialize_runtime_environment(
+                self.config, session,
+            )
         except Exception:
             session.close()
             raise
@@ -238,6 +257,7 @@ class ContainerWorker:
             resource_class=job.resource_class,
             usage_sampling_interval_millis=self.config.usage_sampling_interval_millis,
             effective_output_limits=job.effective_output_limits,
+            execution_environment=self.execution_environment,
         )
 
     def _on_job_done(self, job: SandboxJob, future: Future) -> None:

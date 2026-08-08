@@ -74,6 +74,12 @@ message TaskResultResponse {
   // Harness-owned terminal classification. Presence is required: missing must
   // never be interpreted as the proto3 default false by downstream finalizers.
   optional bool retryable = 9;
+  // 260808-finance-methodspec-v5: v5 金融记录通道元数据。父消息存在才消费；
+  // 字段存在性按 presence 语义（has*()），不得读 proto3 默认值。
+  FinanceRecordChannelMetadata financeRecordChannel = 10;
+  // 260808-finance-methodspec-v5: 实际容器环境身份，proto 11 为权威值。
+  // 无 runtimeImageRef（Python 内部 C/H 任务事实，不进 DTO）。
+  SandboxEnvironmentIdentity executionEnvironment = 11;
 }
 
 message SandboxResourceUsage {
@@ -95,6 +101,37 @@ message SandboxResourceUsage {
   bool attributionComplete = 16;
   optional int64 samplingIntervalMillis = 17;
   repeated string missingFields = 18;
+}
+
+// 260808-finance-methodspec-v5: Python 沙箱返回给 Java 网关的实际通道元数据。
+// presence 语义：父消息不存在表示旧生产方尚未实现 v5 协议，不得把 proto3
+// 默认值当作完整批次。父消息存在但父字段未设，按"已实现但未取样"处理。
+// 顺序按 FROZEN 契约文档 7c695371 第 5.2 节锁定。
+message FinanceRecordChannelMetadata {
+  int32 emittedRecordCount = 1;
+  int64 emittedRecordBytes = 2;
+  bool recordSetComplete = 3;
+  string dropReason = 4;
+  string recordDigest = 5;
+  bool stdoutTruncated = 6;
+  bool stderrTruncated = 7;
+}
+
+message SandboxPackageApi {
+  string name = 1;
+  string version = 2;
+  string apiVersion = 3;
+}
+
+// 容器启动后由 Python runtime_environment.py 单源采集。
+// 同一份采集结果同时写入 {workdir}/runtime-environment.json 与 HTTP 顶层
+// executionEnvironment 字段，避免 Java 与 Python 端分别计算产生不同值。
+message SandboxEnvironmentIdentity {
+  string environmentId = 1;
+  string imageDigest = 2;
+  string librarySetDigest = 3;
+  repeated SandboxPackageApi packageApis = 4;
+  bool inventoryComplete = 5;
 }
 
 message GetTaskByOperationIdRequest {
