@@ -4,7 +4,6 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
@@ -35,9 +34,6 @@ import java.util.List;
 public class WorkspaceHealthVerifier {
 
     private final WorkspacePathResolver pathResolver;
-
-    @Value("${agent.tools.market-data.dataset.path:/data/agent_datasets}")
-    private String datasetPath;
 
     /**
      * 校验 collected assets 中所有 dataset reference 的健康状态。

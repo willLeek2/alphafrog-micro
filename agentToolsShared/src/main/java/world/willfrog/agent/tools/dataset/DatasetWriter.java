@@ -3,12 +3,14 @@ package world.willfrog.agent.tools.dataset;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.Builder;
 import lombok.Data;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
+import world.willfrog.agent.platform.storage.AgentStoragePaths;
 
 import java.io.BufferedWriter;
 import java.io.File;
@@ -22,11 +24,14 @@ import java.util.function.Function;
 import java.util.stream.Collectors;
 
 @Component
+@RequiredArgsConstructor
 @Slf4j
 public class DatasetWriter {
 
-    @Value("${agent.tools.market-data.dataset.path:/data/agent_datasets}")
-    private String datasetPath;
+    // D04：dataset 根目录改经统一存储门面解析（新键 agent.storage.dataset-root →
+    // 旧键别名 agent.tools.market-data.dataset.path → 默认 /data/agent_datasets），
+    // 本类不再直接持有根键 @Value
+    private final AgentStoragePaths storagePaths;
 
     @Value("${agent.tools.market-data.dataset.database-fetched-path:/data/database_fetched}")
     private String databaseFetchedPath;
@@ -47,7 +52,7 @@ public class DatasetWriter {
     }
 
     public String getDatasetPath() {
-        return datasetPath;
+        return storagePaths.datasetRoot().toString();
     }
 
     public String getDatabaseFetchedPath() {
@@ -134,7 +139,7 @@ public class DatasetWriter {
     }
 
     private void ensureDirectory() {
-        File dir = new File(datasetPath);
+        File dir = storagePaths.datasetRoot().toFile();
         if (!dir.exists()) {
             dir.mkdirs();
         }

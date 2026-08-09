@@ -26,14 +26,6 @@ class WorkspaceHealthVerifierTest {
                 tempRoot.resolve("datasets").toString()
         );
         verifier = new WorkspaceHealthVerifier(pathResolver);
-        // datasetPath 是 private final 字段（@Value 注入），通过反射设置避免改动 Verifier 构造签名
-        try {
-            java.lang.reflect.Field f = WorkspaceHealthVerifier.class.getDeclaredField("datasetPath");
-            f.setAccessible(true);
-            f.set(verifier, tempRoot.resolve("datasets").toString());
-        } catch (Exception e) {
-            throw new RuntimeException(e);
-        }
     }
 
     @Test
