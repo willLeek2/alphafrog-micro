@@ -480,6 +480,8 @@ services:
       AGENT_LANGCHAIN_SERVER_PORT: 50158
       # Agent LLM 配置（使用 agentLangchainService/config 作为共享静态 prompt/config 目录）
       AF_AGENT_LLM_CONFIG_FILE: ${AF_AGENT_LLM_CONFIG_FILE:-/app/config-dynamic/agent-llm.local.json}
+      AF_FINANCE_RECORD_CHANNEL_CONFIG_FILE: ${AF_FINANCE_RECORD_CHANNEL_CONFIG_FILE:-/app/config-dynamic/finance-record-channel.local.json}
+      AF_FINANCE_RECORD_CHANNEL_ENABLED: "false"
       AF_AGENT_LLM_PROMPT_BASE_DIR: ${AF_AGENT_LLM_PROMPT_BASE_DIR:-/app/config}
       AF_AGENT_API_KEY: ${AF_AGENT_API_KEY:-demo}
       AF_AGENT_DEFAULT_ENDPOINT: ${AF_AGENT_DEFAULT_ENDPOINT:-openrouter}
@@ -625,7 +627,23 @@ services:
       AF_SANDBOX_BACKEND: ${AF_SANDBOX_BACKEND:-docker}
       AF_SANDBOX_WORKDIR: /sandbox
       AF_SANDBOX_LOG_LEVEL: ${AF_SANDBOX_LOG_LEVEL:-INFO}
-      AF_SANDBOX_IMAGE: ${AF_SANDBOX_IMAGE:-alphafrog-sandbox-runtime:latest}
+      # MethodSpec V5 §12：生产 AF_SANDBOX_IMAGE 必须是 sha256 摘要引用（frog 发布时固定），
+      # 例如 registry.example/alphafrog/runtime@sha256:<64hex>（勿用占位符 REPLACE_WITH_...）。
+      # 此处【没有默认值】（round-2 R2-4）：未显式设置时透传为空，python-sandbox-service
+      # 会在配置加载时大声报错，绝不静默退回 latest。裸标签仅在显式设置
+      # AF_SANDBOX_IMAGE_ALLOW_DEV_TAG=true/1 且引用语法合法时允许。
+      AF_SANDBOX_IMAGE: ${AF_SANDBOX_IMAGE:-}
+      AF_SANDBOX_IMAGE_ALLOW_DEV_TAG: ${AF_SANDBOX_IMAGE_ALLOW_DEV_TAG:-}
+      # MethodSpec V5 §12 / 工作包 C 契约身份：沙箱子进程降权目标。运行时镜像
+      # （Dockerfile.runtime）固定创建非特权用户 alphafrog-sandbox（uid 10000，
+      # gid 10001，均非零）；此变量接受【用户名】或【uid:gid】两种形式，例如
+      # alphafrog-sandbox 或 10000:10001。工作包 C 的 wrapper 据此降权，镜像本身不切换 USER。
+      AF_SANDBOX_CHILD_USER: ${AF_SANDBOX_CHILD_USER:-alphafrog-sandbox}
+      # MethodSpec V5 §12 运行时镜像保留（pythonSandboxService/scripts/prune_runtime_images.sh）：
+      # 保护集 = 当前镜像 + 上一代镜像 + state.json 中 QUEUED/RUNNING 任务引用的镜像 + 运行中容器镜像。
+      AF_CURRENT_RUNTIME_IMAGE: ${AF_CURRENT_RUNTIME_IMAGE:-}
+      AF_PREVIOUS_RUNTIME_IMAGE: ${AF_PREVIOUS_RUNTIME_IMAGE:-}
+      AF_STATE_FILE: ${AF_STATE_FILE:-/data/sandbox_tasks/state.json}
       AF_SANDBOX_SKIP_ENVIRONMENT_SETUP: ${AF_SANDBOX_SKIP_ENVIRONMENT_SETUP:-true}
       AF_SANDBOX_PREINSTALLED_LIBRARIES: ${AF_SANDBOX_PREINSTALLED_LIBRARIES:-numpy,pandas,matplotlib,scipy}
       # Data-intense P0 保持一任务一容器，使内存上限与 resourceUsage 可归属到单个 attempt。
@@ -639,7 +657,10 @@ services:
       AF_SANDBOX_WORKSPACE_ROOT: /sandbox/runs
       AF_SANDBOX_TASK_STORE_PATH: /data/sandbox_tasks/state.json
       AF_SANDBOX_COMPAT_INPUT_PATH: "true"
-      # Nacos dynamic config (mirrors Java services)
+      # Nacos dynamic config（mirrors Java services）。默认关闭：生产发布时显式
+      # 设 AF_CONFIG_NACOS_ENABLED=true 才启用。动态配置只能调低输出上限，不能
+      # 超过代码静态硬上限；四段输出上限测试（工作包 C/D）完成前，金融计算结果
+      # 通道保持关闭（Spec §7.2）。
       AF_CONFIG_NACOS_ENABLED: ${AF_CONFIG_NACOS_ENABLED:-false}
       AF_CONFIG_NACOS_NAMESPACE: ${AF_CONFIG_NACOS_NAMESPACE:-}
       AF_CONFIG_NACOS_GROUP: ${AF_CONFIG_NACOS_GROUP:-alphafrog-config}

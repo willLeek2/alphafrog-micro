@@ -78,7 +78,8 @@ class LangchainLinearWorkflowResumeTest {
         assertThat(result.getCompletedTodos()).extracting(LangchainCompletedTodo::getTodoId)
                 .containsExactly("todo-1", "todo-2", "todo-3");
         assertThat(result.getCompletedTodos().get(1).displayOutput())
-                .contains("terminal-preview", "artifact://result-1");
+                .contains("terminal-preview")
+                .doesNotContain("artifact://result-1");
         assertThat(consumed.get()).isEqualTo(1);
         assertThat(resumeTokenSeenByNextTodo.get()).isEqualTo("token-1");
         assertThat(resumeVersionSeenByNextTodo.get()).isEqualTo(2L);
@@ -88,6 +89,50 @@ class LangchainLinearWorkflowResumeTest {
         verify(nodeExecutor, times(1)).execute(any(), executed.capture(), any(), any(), any());
         assertThat(executed.getValue().getId()).isEqualTo("todo-3");
         verify(nodeExecutor, times(1)).writeFinalAnswer(any(), any());
+    }
+
+    @Test
+    void terminalResultPreviewPreservesExactWhitespaceAndNewlines() {
+        LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
+        LangchainTodoNodeExecutor nodeExecutor = mock(LangchainTodoNodeExecutor.class);
+        LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
+        when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
+        when(nodeExecutor.execute(any(), any(), any(), any(), any()))
+                .thenReturn(LangchainTodoNodeResult.success("todo-3-output", 6));
+        when(nodeExecutor.writeFinalAnswer(any(), any())).thenReturn("final-answer");
+
+        LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
+                planner, nodeExecutor, guard, mock(AgentEventService.class));
+        LangchainTodoPlan plan = LangchainTodoPlan.builder()
+                .executionMode(PlanExecutionMode.LINEAR)
+                .items(List.of(item("todo-1", 1), item("todo-2", 2), item("todo-3", 3)))
+                .build();
+        CompletedTodoRecord prior = new CompletedTodoRecord();
+        prior.setTodoId("todo-1");
+        prior.setSequence(1);
+        prior.setDescription("todo-1-description");
+        prior.setOutput("prior-output");
+        // Meaningful leading/trailing whitespace and trailing newline — must survive byte-for-byte.
+        String exactPreview = "  {\"ok\":true,\"data\":{\"stdout\":\"rows=5\\n\"}}  \n";
+        ToolJobResumeContext context = new ToolJobResumeContext();
+        context.setRunId("run-1");
+        context.setTodoId("todo-2");
+        context.setResumeToken("token-1");
+        context.setResumeLeaseVersion(2);
+        context.setCompletedTodos(List.of(prior));
+        context.setToolCallsUsed(5);
+        context.setTerminalSuccess(true);
+        context.setTerminalResultPreview(exactPreview);
+        context.setTerminalRawRef("artifact://result-1");
+
+        LangchainLinearWorkflowResult result = executor.resumePlanned(
+                request(), plan, context, () -> true);
+
+        assertThat(result.isSuccess()).isTrue();
+        // Exact byte-for-byte equality — no trim, no rewrite, no rawRef appended.
+        assertThat(result.getCompletedTodos().get(1).displayOutput()).isEqualTo(exactPreview);
+        assertThat(result.getCompletedTodos().get(1).displayOutput())
+                .doesNotContain("artifact://result-1");
     }
 
     @Test

@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="world.willfrog.agent.platform.mapper.FinanceMetricRecordMapper">
+    <resultMap id="RecordMap" type="world.willfrog.agent.platform.finance.FinanceMetricRecord">
+        <id property="id" column="id"/>
+        <result property="recordId" column="record_id"/>
+        <result property="runId" column="run_id"/>
+        <result property="todoId" column="todo_id"/>
+        <result property="executePythonToolCallId" column="execute_python_tool_call_id"/>
+        <result property="recordIndex" column="record_index"/>
+        <result property="rawDigest" column="raw_digest"/>
+        <result property="rawPayload" column="raw_payload"/>
+        <result property="sourceResolverToolCallId" column="source_resolver_tool_call_id"/>
+        <result property="methodId" column="method_id"/>
+        <result property="methodVersion" column="method_version"/>
+        <result property="specDigest" column="spec_digest"/>
+        <result property="valueJson" column="value_json"/>
+        <result property="unit" column="unit"/>
+        <result property="parametersJson" column="parameters_json"/>
+        <result property="inputRefsJson" column="input_refs_json"/>
+        <result property="checksJson" column="checks_json"/>
+        <result property="formulaDescription" column="formula_description"/>
+        <result property="declaredEvidence" column="declared_evidence"/>
+        <result property="effectiveInternalEvidence" column="effective_internal_evidence"/>
+        <result property="actualEnvironmentId" column="actual_environment_id"/>
+        <result property="renderable" column="renderable"/>
+        <result property="validationErrorJson" column="validation_error_json"/>
+        <result property="createdAt" column="created_at"/>
+    </resultMap>
+
+    <sql id="Columns">
+        id, record_id, run_id, todo_id, execute_python_tool_call_id, record_index,
+        raw_digest, raw_payload, source_resolver_tool_call_id, method_id, method_version,
+        spec_digest, value_json::text AS value_json, unit,
+        parameters_json::text AS parameters_json, input_refs_json::text AS input_refs_json,
+        checks_json::text AS checks_json, formula_description, declared_evidence,
+        effective_internal_evidence, actual_environment_id, renderable,
+        validation_error_json::text AS validation_error_json, created_at
+    </sql>
+
+    <insert id="insertIgnore" parameterType="world.willfrog.agent.platform.finance.FinanceMetricRecord">
+        INSERT INTO alphafrog_agent_finance_record
+        (record_id, run_id, todo_id, execute_python_tool_call_id, record_index, raw_digest,
+         raw_payload, source_resolver_tool_call_id, method_id, method_version, spec_digest,
+         value_json, unit, parameters_json, input_refs_json, checks_json, formula_description,
+         declared_evidence, effective_internal_evidence, actual_environment_id, renderable,
+         validation_error_json)
+        VALUES
+        (#{recordId}, #{runId}, #{todoId}, #{executePythonToolCallId}, #{recordIndex}, #{rawDigest},
+         #{rawPayload}, #{sourceResolverToolCallId}, #{methodId}, #{methodVersion}, #{specDigest},
+         CAST(#{valueJson} AS jsonb), #{unit}, CAST(#{parametersJson} AS jsonb),
+         CAST(#{inputRefsJson} AS jsonb), CAST(#{checksJson} AS jsonb), #{formulaDescription},
+         #{declaredEvidence}, #{effectiveInternalEvidence}, #{actualEnvironmentId}, #{renderable},
+         CAST(#{validationErrorJson} AS jsonb))
+        ON CONFLICT (run_id, todo_id, execute_python_tool_call_id, record_index, raw_digest)
+        DO NOTHING
+    </insert>
+
+    <select id="findByIdentity" resultMap="RecordMap">
+        SELECT <include refid="Columns"/>
+        FROM alphafrog_agent_finance_record
+        WHERE run_id = #{runId}
+          AND todo_id = #{todoId}
+          AND execute_python_tool_call_id = #{executePythonToolCallId}
+          AND record_index = #{recordIndex}
+          AND raw_digest = #{rawDigest}
+        LIMIT 1
+    </select>
+
+    <select id="listByRunRenderable" resultMap="RecordMap">
+        SELECT <include refid="Columns"/>
+        FROM alphafrog_agent_finance_record
+        WHERE run_id = #{runId} AND renderable = TRUE
+        ORDER BY created_at, id
+    </select>
+
+    <select id="listByBatch" resultMap="RecordMap">
+        SELECT <include refid="Columns"/>
+        FROM alphafrog_agent_finance_record
+        WHERE run_id = #{runId}
+          AND todo_id = #{todoId}
+          AND execute_python_tool_call_id = #{executePythonToolCallId}
+        ORDER BY record_index, id
+    </select>
+</mapper>

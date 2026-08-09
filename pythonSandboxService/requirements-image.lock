@@ -1,0 +1,30 @@
+# AlphaFrog pythonSandboxService runtime-image package lockfile (MethodSpec V5, Spec §12).
+#
+# NEW FILE (work package H). The four package versions below are moved VERBATIM
+# from the inline PKGS literal that used to live in Dockerfile.runtime
+# (Spec §12 实施要求: "四个现有 Python 包版本从 Dockerfile 内联文字移到锁文件").
+# Nothing was added or upgraded -- this is a move, not an invention.
+#
+# This file is the single source of truth for the EXPECTED runtime library set:
+#   - Dockerfile.runtime installs exactly these pins;
+#   - docker_build.sh computes lockDigest = sha256:<hex> of this file's bytes;
+#   - library-set.json (baked into the image at /opt/alphafrog/runtime/) is
+#     built from the image's VERIFIED ACTUAL inventory (round-2 R2-2) and
+#     librarySetDigest is computed over the canonical JSON of that sorted
+#     array (Spec §12, lines 1358).
+#
+# NOTE (round-2 R2-1/R2-2): alphafrog_finance deliberately does NOT appear
+# here. The lock pins only the expected third-party library set; the
+# alphafrog_finance distribution (work package B) is pip-installed from
+# runtime/ as a separate build step, and its version/apiVersion "1.0" are read
+# from runtime/src/alphafrog_finance/__init__.py by
+# scripts/runtime_image_inventory.py. The baked library-set.json carries the
+# VERIFIED ACTUAL in-image inventory (lock pins + alphafrog-finance + observed
+# transitive deps), never a host-side inference from this file.
+#
+# Keep this file to one `name==version` pin per line (comments allowed);
+# docker_build.sh and Dockerfile.runtime parse exactly that shape.
+numpy==2.4.1
+pandas==2.3.3
+matplotlib==3.10.8
+scipy==1.17.0

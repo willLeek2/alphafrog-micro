@@ -100,6 +100,67 @@ class SandboxResourceUsage(BaseModel):
     missing_fields: List[str] = Field(default_factory=list)
 
 
+# 260808-finance-methodspec-v5 work package D-owned Pydantic classes.
+# 边界：ccmax D 拥有 class 定义；ccqwen C 只承载 ExecuteResult.finance_record_channel /
+# execution_environment 写入路径，不重定义（按 sub-task 01 thread f4341b21 + 3cbdbaac
+# 双向确认）。gateway presence-aware 映射负责 snake_case -> camelCase proto 转换，
+# runtime_environment.py 单源生成 environmentId / runtime-environment.json。
+# model_config: 调用方传 snake_case 字段（与现有 ExecuteRequest/ExecuteResult 风格一致），
+# 不引入 alias，保持 Pydantic 内部表示 + JSON 序列化两端 snake_case 一致。
+class SandboxPackageApi(BaseModel):
+    name: str = Field(..., description="Package name (e.g. alphafrog_finance)")
+    version: str = Field(..., description="Package version (e.g. 1.0.3)")
+    api_version: str = Field(..., description="Package API version (e.g. 1.0)")
+
+
+class FinanceRecordChannel(BaseModel):
+    emitted_record_count: int = Field(
+        default=0,
+        description="Marker line count after bounded capture; 0 means no markers in this batch",
+    )
+    emitted_record_bytes: int = Field(
+        default=0,
+        description="Sum of rawPayload UTF-8 byte lengths for this batch",
+    )
+    record_set_complete: bool = Field(
+        default=True,
+        description="True iff the channel finished without dropping records; drops set record_set_complete=False",
+    )
+    drop_reason: str = Field(
+        default="",
+        description="Stable reason when record_set_complete=False; empty when complete",
+    )
+    record_digest: str = Field(
+        default="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        description="SHA-256 of length-prefix concatenation; empty batch -> SHA-256 of empty bytes",
+    )
+    stdout_truncated: bool = Field(
+        default=False,
+        description="True iff ordinary stdout was clipped before the bounded file",
+    )
+    stderr_truncated: bool = Field(
+        default=False,
+        description="True iff stderr was clipped before the bounded file",
+    )
+
+
+class ExecutionEnvironment(BaseModel):
+    environment_id: str = Field(..., description="SHA-256 of the runtime environment snapshot")
+    image_digest: str = Field(..., description="SHA-256 of the immutable container image")
+    library_set_digest: str = Field(
+        ...,
+        description="SHA-256 of canonical-encoded library-set.json (sorted packages)",
+    )
+    package_apis: List[SandboxPackageApi] = Field(
+        default_factory=list,
+        description="Snapshot of installed package APIs visible to user code",
+    )
+    inventory_complete: bool = Field(
+        default=False,
+        description="True iff the inventory is comprehensive; false means unknown hidden packages",
+    )
+
+
 class ExecuteResult(BaseModel):
     exit_code: int
     stdout: str
@@ -108,6 +169,79 @@ class ExecuteResult(BaseModel):
     artifacts: Optional[dict] = None
     resource_usage: Optional[SandboxResourceUsage] = None
     retryable: Optional[bool] = None
+    # 260808-finance-methodspec-v5 work package D. Presence-aware:
+    # None = channel not active / pre-v5; non-None = v5 enabled (including empty
+    # but complete batch). Same convention applies to execution_environment.
+    finance_record_channel: Optional[FinanceRecordChannel] = None
+    execution_environment: Optional[ExecutionEnvironment] = None
+
+
+# === work-package-C (ccqwen) ===
+# Spec §7.2 / frozen contract §13: output-limit snapshot models.
+# Contract §13 spells the four Python task snapshot keys VERBATIM in camelCase
+# (recordChannelMaxRecords/recordChannelMaxBytes/stdoutMaxBytes/stderrMaxBytes)
+# plus a source revision; the snapshot is frozen at create_task (idempotent
+# create returns the original snapshot) and is the ONLY limit source execution
+# may read — hot config is never re-read mid-run.
+class EffectiveOutputLimits(BaseModel):
+    """Frozen per-task output limit snapshot (§7.2, contract §13)."""
+
+    stdoutMaxBytes: int = Field(..., ge=0)
+    stderrMaxBytes: int = Field(..., ge=0)
+    recordChannelMaxBytes: int = Field(..., ge=0)
+    recordChannelMaxRecords: int = Field(..., ge=0)
+    sourceRevision: str = Field(
+        default="",
+        description="Config generation this snapshot was frozen from",
+    )
+
+
+class BoundedExecRequest(BaseModel):
+    """§7.1 wrapper input (wrapper-input.json) shape, camelCase keys."""
+
+    scriptPath: str = Field(..., min_length=1)
+    timeoutSeconds: float = Field(..., ge=0)
+    effectiveOutputLimits: EffectiveOutputLimits
+    runtimeEnvironmentPath: Optional[str] = None
+
+    def wrapper_input_payload(self) -> dict:
+        """Serialize to the exact §7.1 input shape.
+
+        The wrapper (bounded_exec_wrapper.parse_wrapper_input) requires the
+        four §13 limit keys verbatim; the snapshot's sourceRevision is Task
+        metadata and is NOT part of the wrapper input.
+        """
+        limits = self.effectiveOutputLimits.model_dump()
+        limits.pop("sourceRevision", None)
+        payload: dict = {
+            "scriptPath": self.scriptPath,
+            "timeoutSeconds": self.timeoutSeconds,
+            "effectiveOutputLimits": limits,
+        }
+        if self.runtimeEnvironmentPath is not None:
+            payload["runtimeEnvironmentPath"] = self.runtimeEnvironmentPath
+        return payload
+
+
+class BoundedExecResult(BaseModel):
+    """§7.1 capture-result.json summary shape (wrapper layer, camelCase).
+
+    These are the wrapper's own reporting fields; the frozen consumer surface
+    is the §5.1 snake_case finance_record_channel built from them by
+    app.finance_record_channel.finance_channel_from_capture.
+    """
+
+    exitCode: int
+    ordinaryStdoutBytes: int = Field(..., ge=0)
+    stderrBytes: int = Field(..., ge=0)
+    stdoutTruncated: bool
+    stderrTruncated: bool
+    emittedRecordCount: int = Field(..., ge=0)
+    emittedRecordBytes: int = Field(..., ge=0)
+    recordSetComplete: bool
+    dropReason: str
+    recordDigest: str
+# === end work-package-C (ccqwen) ===
 
 
 class Task(BaseModel):
@@ -123,6 +257,15 @@ class Task(BaseModel):
     payload_digest: Optional[str] = None
     resource_usage: Optional[SandboxResourceUsage] = None
     retryable: Optional[bool] = None
+    # === work-package-C (ccqwen) ===
+    # §7.2/§13: the frozen output-limit snapshot, set once in create_task and
+    # read-only for the whole execution (idempotent create returns the
+    # original Task and snapshot). runtime_image_ref stores the digest
+    # reference of the image the task runs on (H owns resolution rules; C
+    # only stores). Both are backend facts, never model/user-visible.
+    effective_output_limits: Optional[EffectiveOutputLimits] = None
+    runtime_image_ref: Optional[str] = None
+    # === end work-package-C (ccqwen) ===
 
 
 class CreateTaskResponse(BaseModel):

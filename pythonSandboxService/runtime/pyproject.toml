@@ -1,0 +1,37 @@
+# === work-package-B (ccqwen) ===
+# Spec §6 / codex f1ed6ea9 — packaging layer of the AlphaFrog finance runtime.
+#
+# The runtime image must pip-install a REAL distribution: metadata name
+# "alphafrog_finance" and a version VERBATIM equal to the package's own
+# alphafrog_finance.__version__ (src/alphafrog_finance/__init__.py), hence
+# dynamic = ["version"] resolved via [tool.setuptools.dynamic] attr=.
+#
+# The wheel's package data carries alphafrog_finance/_generated/method_specs.json,
+# which is a BUILD PRODUCT, never committed: the image build first runs
+# runtime/scripts/generate_method_bindings.py against work package A's
+# canonical generated JSON (resolver-catalog.json + per-method spec files),
+# then pip-installs this distribution. Hand-copied method triples are
+# forbidden (Spec §6). The _generated/ directory is kept in git only via its
+# .gitignore placeholder (which excludes *.json), so package-data always has
+# a stable target once the generator has run.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alphafrog_finance"
+description = "AlphaFrog sandbox finance metric runtime (Spec §6 method identities ship via A-canonical generated bindings)"
+dynamic = ["version"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "alphafrog_finance.__version__"}
+
+[tool.setuptools.package-data]
+alphafrog_finance = ["_generated/*.json"]

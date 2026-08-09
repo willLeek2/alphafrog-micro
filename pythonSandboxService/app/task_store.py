@@ -17,6 +17,17 @@ from .models import ExecuteRequest, Task, TaskStatus
 SHA256_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 OPERATION_ID_PATTERN = re.compile(r"^[^:\s]+:[^:\s]+:[1-9][0-9]*$")
 
+# === work-package-C (ccqwen) ===
+# §7.1: `state.json` format versions.  v2 is the CURRENT write format; v1
+# documents stay readable (the bump is additive: Task.effective_output_limits
+# and Task.runtime_image_ref are optional fields, and D's future result fields
+# ride the same pydantic round-trip at owner merge).  Unknown versions fail
+# the load closed — a never-silently-migrate rule.
+SCHEMA_VERSION_V1 = "sandbox_task_store_v1"
+SCHEMA_VERSION_V2 = "sandbox_task_store_v2"
+SUPPORTED_SCHEMA_VERSIONS = frozenset({SCHEMA_VERSION_V1, SCHEMA_VERSION_V2})
+# === end work-package-C (ccqwen) ===
+
 
 class OperationConflictError(RuntimeError):
     pass
@@ -124,6 +135,11 @@ class DurableTaskStore:
             return
         try:
             document = json.loads(self.state_path.read_text(encoding="utf-8"))
+            schema_version = document.get("schema_version")
+            if schema_version not in SUPPORTED_SCHEMA_VERSIONS:
+                raise ValueError(
+                    f"unsupported state.json schema_version: {schema_version!r}"
+                )
             self.tasks = {
                 task_id: Task.model_validate(payload)
                 for task_id, payload in (document.get("tasks") or {}).items()
@@ -140,7 +156,7 @@ class DurableTaskStore:
     def _persist_locked(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         document = {
-            "schema_version": "sandbox_task_store_v1",
+            "schema_version": SCHEMA_VERSION_V2,
             "tasks": {task_id: task.model_dump(mode="json") for task_id, task in self.tasks.items()},
             "operations": self.operations,
         }

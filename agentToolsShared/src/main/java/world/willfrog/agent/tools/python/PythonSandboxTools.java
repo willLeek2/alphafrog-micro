@@ -10,9 +10,16 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.dataanalysis.*;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.finance.FinanceRecordChannelConfigLoader;
+import world.willfrog.agent.platform.finance.FinanceRecordChannelProcessor;
+import world.willfrog.agent.platform.finance.FinanceRecordExtractionRequest;
+import world.willfrog.agent.platform.finance.FinanceRecordExtractionResult;
+import world.willfrog.agent.platform.finance.FinanceRecordProcessingException;
+import world.willfrog.agent.platform.finance.FinanceToolResultFormatter;
 import world.willfrog.agent.platform.debug.DebugObservabilityRpcKeys;
 import world.willfrog.agent.platform.debug.DebugObservabilityService;
 import world.willfrog.agent.platform.util.PromptFileLoader;
+import world.willfrog.agent.tools.finance.FinanceResultModelAdapter;
 import world.willfrog.agent.workflow.AgentRunDatasetCsvWriter;
 import world.willfrog.agent.workflow.AgentRunDatasetEntry;
 import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
@@ -69,6 +76,10 @@ public class PythonSandboxTools {
             + "Sandbox input: paths_dataset.csv + path_manifest.csv; use "
             + "`from af_dataset_loader import load_manifest, load_datasets`. "
             + "Runtime preinstalled: numpy==2.4.1, pandas==2.3.3, matplotlib==3.10.8, scipy==1.17.0. "
+            + "Finance questions can pass the raw natural-language expression to resolveFinanceMethods first. "
+            + "If a candidate has unresolved boundaries, do not invent values; use compatible public libraries when available but not mandatory; "
+            + "custom calculations must declare generic fields; pass the resolver root resolverToolCallId to report() or report_custom() "
+            + "via the source_resolver_tool_call_id parameter. "
             + "See loadToolDescription() for full docs (load failure falls back to a hardcoded equivalent).";
 
     private static final String FALLBACK_TOOL_DESCRIPTION = "Execute Python code in a secure sandbox. REQUIRED: code and at least one of "
@@ -79,6 +90,10 @@ public class PythonSandboxTools {
             + "DatasetLoadResult with frame / failed_members / skipped_members; load_datasets('1') returns dict[from_ts_code, DataFrame]. "
             + "For multiple datasets/manifests, load one run-level number at a time in helper code and merge results. "
             + "Do not construct /sandbox/input/<dataset_id>/ or /sandbox/runs/<oldTaskId>/ paths. "
+            + "Finance questions can pass the raw natural-language expression to resolveFinanceMethods first. "
+            + "If a candidate has unresolved boundaries, do not invent values; use compatible public libraries when available but not mandatory; "
+            + "custom calculations must declare generic fields; pass the resolver root resolverToolCallId to report() or report_custom() "
+            + "via the source_resolver_tool_call_id parameter. "
             + "OPTIONAL: libraries (comma-separated, e.g. 'numpy,pandas'), timeout_seconds. "
             + "Runtime preinstalled: numpy==2.4.1, pandas==2.3.3, matplotlib==3.10.8, scipy==1.17.0. "
             + "Service stack: fastapi==0.128.0, uvicorn[standard]==0.40.0, pydantic==2.12.5, llm-sandbox[docker]==0.3.33. "
@@ -124,6 +139,17 @@ public class PythonSandboxTools {
     @Autowired(required = false)
     private DataAnalysisTerminalRecorder dataAnalysisTerminalRecorder;
 
+    @Autowired(required = false)
+    private FinanceRecordChannelConfigLoader financeRecordChannelConfigLoader;
+
+    @Autowired(required = false)
+    private FinanceRecordChannelProcessor financeRecordChannelProcessor;
+
+    @Autowired(required = false)
+    private FinanceResultModelAdapter financeResultModelAdapter;
+
+    private final FinanceToolResultFormatter financeToolResultFormatter;
+
     @Value("${agent.tool-job.fast-path-ms:1500}")
     private long fastPathMs = 1500L;
 
@@ -135,6 +161,7 @@ public class PythonSandboxTools {
     public PythonSandboxTools(ObjectMapper objectMapper) {
         this.objectMapper = objectMapper;
         this.metadataReader = new DatasetEntryMetadataReader(objectMapper);
+        this.financeToolResultFormatter = new FinanceToolResultFormatter(objectMapper);
     }
 
     /**
@@ -600,6 +627,9 @@ public class PythonSandboxTools {
         // reservation/estimate/dataset snapshot 都先写 anchor，确保旧 worker 退出前真相完整。
         anchor.setReservationJson(objectMapper.writeValueAsString(reservation));
         anchor.setEstimateJson(objectMapper.writeValueAsString(estimate));
+        if (financeRecordChannelConfigLoader != null) {
+            anchor.setFinanceRecordLimitsJson(financeRecordChannelConfigLoader.frozenSnapshotJson());
+        }
         anchor.setDatasetSnapshotJson(objectMapper.writeValueAsString(datasetSnapshot));
         anchor.setDatasetSnapshotDigest(datasetSnapshot.immutableDigest());
         // timeoutAt 和 nextPollAt 都是 durable 时间，重启后不重新计时。
@@ -1142,7 +1172,12 @@ public class PythonSandboxTools {
         if (dataAnalysisCapacityService.restoreReservation(confirmed) == DataAnalysisRestoreOutcome.CONFLICT) {
             return null;
         }
-        String preview = boundedPreview(result.getStdout());
+        FinanceRecordExtractionResult financeResult = processFinanceResult(
+                runId, identity, anchor, status, result);
+        // Build the public allowlist before persisting ENVELOPE. A projection/serialization
+        // failure must never leave a durable success preview behind.
+        String output = formatResult(status, result, financeResult);
+        String preview = output;
         String rawRef = blankToNull(result.getDatasetDir());
         String errorCode = blankToNull(result.getError());
         if (!"SUCCEEDED".equals(status) && errorCode == null) {
@@ -1164,9 +1199,7 @@ public class PythonSandboxTools {
         if (!pythonSandboxDispatchStore.persistAttached(runId, anchor)) {
             return null;
         }
-
         DataAnalysisResourceUsage usage = toUsage(confirmed.resourceClass(), result);
-        String output = formatResult(attached.taskId(), status, result);
         DataAnalysisTerminalEnvelope envelope = new DataAnalysisTerminalEnvelope(
                 runId, identity.toolCallId(), identity.attempt(), identity.operationId(),
                 attached.taskId(), status, "SUCCEEDED".equals(status), preview, rawRef,
@@ -1297,18 +1330,6 @@ public class PythonSandboxTools {
         } catch (Exception impossible) {
             throw new IllegalStateException("SHA-256 unavailable", impossible);
         }
-    }
-
-    private static String boundedPreview(String value) {
-        if (value == null || value.isBlank()) return null;
-        byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
-        if (bytes.length <= DataAnalysisTerminalEnvelope.MAX_RESULT_PREVIEW_BYTES) return value;
-        int limit = DataAnalysisTerminalEnvelope.MAX_RESULT_PREVIEW_BYTES - 3;
-        String prefix = new String(bytes, 0, limit, StandardCharsets.UTF_8);
-        while (prefix.getBytes(StandardCharsets.UTF_8).length > limit) {
-            prefix = prefix.substring(0, prefix.length() - 1);
-        }
-        return prefix + "...";
     }
 
     private static String blankToNull(String value) {
@@ -1454,41 +1475,111 @@ public class PythonSandboxTools {
     private String terminalOutput(String taskId, TaskStatusResponse statusResp) {
         String status = statusResp.getStatus();
         if ("SUCCEEDED".equals(status)) {
-            long fetchStartMs = System.currentTimeMillis();
-            installDebugRpcAttachments();
-            TaskResultResponse result = pythonSandboxService.getTaskResult(
-                    GetTaskResultRequest.newBuilder().setTaskId(taskId).build()
-            );
-            emitSandboxEvent("sandbox_fetch_result", Map.of(
-                    "durationMs", System.currentTimeMillis() - fetchStartMs,
-                    "status", "OK",
-                    "taskId", taskId,
-                    "exitCode", result == null ? -1 : result.getExitCode(),
-                    "stdoutLen", result == null || result.getStdout() == null ? 0 : result.getStdout().length(),
-                    "stderrLen", result == null || result.getStderr() == null ? 0 : result.getStderr().length()
-            ));
-            return formatResult(taskId, status, result);
+            TaskResultResponse result = fetchTerminalResult(taskId);
+            if (result == null) {
+                return resultLostFailure();
+            }
+            if (result.hasFinanceRecordChannel()
+                    || nvl(result.getStdout()).contains("__AF_FINANCE_RESULT_")) {
+                return unavailableFinanceWiringFailure();
+            }
+            return formatResult(status, result, null);
         }
         if ("FAILED".equals(status)) {
-            return fail("executePython", "TASK_FAILED", "Task failed", Map.of(
-                    "task_id", taskId,
-                    "status", status,
-                    "message", nvl(statusResp.getError())
-            ));
+            TaskResultResponse result = fetchTerminalResult(taskId);
+            if (result != null) {
+                if (result.hasFinanceRecordChannel()
+                        || nvl(result.getStdout()).contains("__AF_FINANCE_RESULT_")) {
+                    return unavailableFinanceWiringFailure();
+                }
+                return formatResult(status, result, null);
+            }
+            return formatter().formatFailure(
+                    "", nvl(statusResp.getError()),
+                    new FinanceToolResultFormatter.FailureDetail(
+                            "PYTHON_EXECUTION_FAILED",
+                            "Python 执行失败",
+                            true,
+                            "根据错误信息修正代码或输入后重试"));
         }
         if ("CANCELED".equals(status)) {
-            return fail("executePython", "TASK_CANCELED", "Task canceled", Map.of(
-                    "task_id", taskId,
-                    "status", status
-            ));
+            TaskResultResponse result = fetchTerminalResult(taskId);
+            if (result != null) {
+                if (result.hasFinanceRecordChannel()
+                        || nvl(result.getStdout()).contains("__AF_FINANCE_RESULT_")) {
+                    return unavailableFinanceWiringFailure();
+                }
+                return formatResult(status, result, null);
+            }
+            return formatter().formatFailure(
+                    "", "",
+                    new FinanceToolResultFormatter.FailureDetail(
+                            "PYTHON_EXECUTION_CANCELED",
+                            "Python 执行已取消",
+                            false,
+                            "确认仍需计算后重新提交任务"));
         }
         if ("NOT_FOUND".equals(status)) {
-            return fail("executePython", "TASK_NOT_FOUND", "Task not found", Map.of(
-                    "task_id", taskId,
-                    "status", status
-            ));
+            return resultLostFailure();
         }
         return null;
+    }
+
+    /**
+     * Fetches the complete terminal payload for the legacy polling path.
+     *
+     * <p>Failed and canceled executions can still carry bounded stdout/stderr. They must use the
+     * same public failure formatter as the durable path instead of losing those diagnostics. A
+     * transient read failure is represented as an absent result so the caller can return a
+     * deterministic result-lost/status-only failure without exposing RPC details.</p>
+     */
+    private TaskResultResponse fetchTerminalResult(String taskId) {
+        long fetchStartMs = System.currentTimeMillis();
+        TaskResultResponse result = null;
+        String fetchStatus = "OK";
+        try {
+            installDebugRpcAttachments();
+            result = pythonSandboxService.getTaskResult(
+                    GetTaskResultRequest.newBuilder().setTaskId(taskId).build());
+            if (result == null) {
+                fetchStatus = "EMPTY";
+            }
+            return result;
+        } catch (Exception exception) {
+            fetchStatus = "ERROR";
+            log.warn("Unable to fetch terminal sandbox result: taskId={}, error={}",
+                    taskId, exception.getMessage());
+            return null;
+        } finally {
+            emitSandboxEvent("sandbox_fetch_result", Map.of(
+                    "durationMs", System.currentTimeMillis() - fetchStartMs,
+                    "status", fetchStatus,
+                    "taskId", nvl(taskId),
+                    "exitCode", result == null ? -1 : result.getExitCode(),
+                    "stdoutLen", result == null ? 0 : nvl(result.getStdout()).length(),
+                    "stderrLen", result == null ? 0 : nvl(result.getStderr()).length()
+            ));
+        }
+    }
+
+    private String unavailableFinanceWiringFailure() {
+        return formatter().formatFailure(
+                "", "",
+                new FinanceToolResultFormatter.FailureDetail(
+                        "FINANCE_RECORD_DURABLE_WIRING_UNAVAILABLE",
+                        "结构化金融结果暂时无法安全保存",
+                        false,
+                        "稍后重试，或改为普通文本输出"));
+    }
+
+    private String resultLostFailure() {
+        return formatter().formatFailure(
+                "", "",
+                new FinanceToolResultFormatter.FailureDetail(
+                        "PYTHON_RESULT_LOST",
+                        "Python 执行结果已丢失",
+                        false,
+                        "重新提交计算任务"));
     }
 
     /**
@@ -1528,30 +1619,88 @@ public class PythonSandboxTools {
      * 进程 exit code 为 0 时走 {@link #ok}；非零时仍附带 stdout/stderr 到 {@code data}，但 {@code ok=false}，
      * 方便 LLM 读取输出内容的同时识别执行失败。
      */
-    private String formatResult(String taskId, String status, TaskResultResponse result) {
-        Map<String, Object> data = new LinkedHashMap<>();
-        data.put("task_id", taskId);
-        data.put("status", status);
-        data.put("exit_code", result.getExitCode());
-        data.put("stdout", nvl(result.getStdout()));
-        data.put("stderr", nvl(result.getStderr()));
-        data.put("dataset_dir", nvl(result.getDatasetDir()));
+    private String formatResult(
+            String status,
+            TaskResultResponse result,
+            FinanceRecordExtractionResult financeResult) {
+        String stdout = financeResult == null
+                ? nvl(result.getStdout()) : financeResult.ordinaryStdout();
 
         if ("SUCCEEDED".equals(status) && result.getExitCode() == 0) {
-            return ok("executePython", data);
+            if (financeResult == null) {
+                return formatter().formatSuccess(stdout, List.of(), List.of());
+            }
+            if (financeResultModelAdapter == null) {
+                throw new FinanceRecordProcessingException(
+                        "FINANCE_RESULT_PROJECTOR_UNAVAILABLE",
+                        "Finance result projector is unavailable");
+            }
+            FinanceResultModelAdapter.ProjectionBatch projection =
+                    financeResultModelAdapter.project(financeResult);
+            return formatter().formatSuccess(
+                    stdout, projection.results(), projection.notices());
         }
 
-        String errorCode = switch (status) {
-            case "FAILED" -> "TASK_FAILED";
-            case "CANCELED" -> "TASK_CANCELED";
-            default -> "NON_ZERO_EXIT";
-        };
-        return fail("executePython", errorCode, "Python execution did not succeed", Map.of(
-                "task_id", taskId,
-                "status", status,
-                "exit_code", result.getExitCode(),
-                "stderr", nvl(result.getStderr())
-        ), data);
+        String errorCode = "CANCELED".equals(status)
+                ? "PYTHON_EXECUTION_CANCELED" : "PYTHON_EXECUTION_FAILED";
+        String message = "CANCELED".equals(status)
+                ? "Python 执行已取消" : "Python 执行失败";
+        String action = result.getRetryable()
+                ? "根据 stderr 修正代码或输入后重试"
+                : "检查输入和资源限制；如问题持续，请联系管理员";
+        return formatter().formatFailure(
+                stdout,
+                nvl(result.getStderr()),
+                new FinanceToolResultFormatter.FailureDetail(
+                        errorCode, message, result.getRetryable(), action));
+    }
+
+    private FinanceRecordExtractionResult processFinanceResult(
+            String runId,
+            DataAnalysisOperationIdentity identity,
+            ToolJobAnchor anchor,
+            String status,
+            TaskResultResponse result) {
+        boolean hasFinancePayload = result.hasFinanceRecordChannel()
+                || nvl(result.getStdout()).contains("__AF_FINANCE_RESULT_");
+        if (!hasFinancePayload) {
+            return null;
+        }
+        if (financeRecordChannelProcessor == null || financeRecordChannelConfigLoader == null) {
+            throw new FinanceRecordProcessingException(
+                    "FINANCE_RECORD_PROCESSOR_UNAVAILABLE",
+                    "Finance record processor/config loader is unavailable");
+        }
+
+        if (anchor.getFinanceRecordLimitsJson() == null
+                || anchor.getFinanceRecordLimitsJson().isBlank()) {
+            throw new FinanceRecordProcessingException(
+                    "FINANCE_RECORD_CONFIG_SNAPSHOT_MISSING",
+                    "Finance record payload is present but the frozen configuration snapshot is missing");
+        }
+        FinanceRecordChannelConfigLoader.Snapshot frozen =
+                financeRecordChannelConfigLoader.parseFrozenSnapshot(
+                        anchor.getFinanceRecordLimitsJson());
+
+        return financeRecordChannelProcessor.process(new FinanceRecordExtractionRequest(
+                runId,
+                AgentContext.getUserId(),
+                anchor.getTodoId(),
+                identity.toolCallId(),
+                "sync",
+                anchor.getTaskId(),
+                status,
+                result.getExitCode(),
+                result.getStdout(),
+                result.getStderr(),
+                FinanceRecordProtoAdapter.channelMetadata(result),
+                FinanceRecordProtoAdapter.executionEnvironment(result),
+                frozen.targetEnvironment(),
+                frozen.limits()));
+    }
+
+    private FinanceToolResultFormatter formatter() {
+        return financeToolResultFormatter;
     }
 
     /** 构造 {@code ok=true} 的标准 JSON 工具响应。 */

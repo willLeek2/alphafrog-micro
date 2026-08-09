@@ -13,6 +13,10 @@ import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import world.willfrog.agent.platform.dataanalysis.*;
+import world.willfrog.agent.platform.finance.FinanceRecordChannelConfigLoader;
+import world.willfrog.agent.platform.finance.FinanceRecordChannelProcessor;
+import world.willfrog.agent.platform.finance.FinanceToolResultFormatter;
+import world.willfrog.agent.tools.finance.FinanceResultModelAdapter;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 
@@ -177,7 +181,7 @@ class ToolJobFinalizerP006Test {
 
         ToolJobFinalizer finalizer = new ToolJobFinalizer(
                 realService, redisCache, capacityFake, resumeService,
-                mock(ToolJobConfig.class));
+                mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
         inject(finalizer, "usageHook", (ToolJobUsageHook) usageFake);
         inject(finalizer, "eventHook", (ToolJobEventHook) eventFake);
 
@@ -219,7 +223,7 @@ class ToolJobFinalizerP006Test {
 
         ToolJobFinalizer finalizer1 = new ToolJobFinalizer(
                 spyService, redisCache, capacityFake, resumeService,
-                mock(ToolJobConfig.class));
+                mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
         inject(finalizer1, "usageHook", (ToolJobUsageHook) usageFake);
         inject(finalizer1, "eventHook", (ToolJobEventHook) eventFake);
 
@@ -264,7 +268,7 @@ class ToolJobFinalizerP006Test {
 
         ToolJobFinalizer finalizer2 = new ToolJobFinalizer(
                 reentryService, redisCache, capacityFake, resumeService,
-                mock(ToolJobConfig.class));
+                mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
         inject(finalizer2, "usageHook", (ToolJobUsageHook) usageFake);
         inject(finalizer2, "eventHook", (ToolJobEventHook) eventFake);
 

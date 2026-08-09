@@ -7,7 +7,10 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.dataanalysis.*;
+import world.willfrog.agent.platform.finance.*;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agent.tools.finance.FinanceResultModelAdapter;
+import world.willfrog.agent.tools.python.FinanceRecordProtoAdapter;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
 
 import java.nio.charset.StandardCharsets;
@@ -44,6 +47,10 @@ public class ToolJobFinalizer {
     private final DataAnalysisCapacityService capacityService;
     private final ToolJobResumeService resumeService;
     private final ToolJobConfig config;
+    private final FinanceRecordChannelProcessor financeProcessor;
+    private final FinanceRecordChannelConfigLoader configLoader;
+    private final FinanceToolResultFormatter formatter;
+    private final FinanceResultModelAdapter adapter;
     private final ObjectMapper objectMapper = new ObjectMapper().findAndRegisterModules();
 
     @Autowired(required = false)
@@ -56,12 +63,20 @@ public class ToolJobFinalizer {
                             ToolJobRedisCache redisCache,
                             DataAnalysisCapacityService capacityService,
                             ToolJobResumeService resumeService,
-                            ToolJobConfig config) {
+                            ToolJobConfig config,
+                            FinanceRecordChannelProcessor financeProcessor,
+                            FinanceRecordChannelConfigLoader configLoader,
+                            FinanceToolResultFormatter formatter,
+                            FinanceResultModelAdapter adapter) {
         this.anchorService = anchorService;
         this.redisCache = redisCache;
         this.capacityService = capacityService;
         this.resumeService = resumeService;
         this.config = config;
+        this.financeProcessor = financeProcessor;
+        this.configLoader = configLoader;
+        this.formatter = formatter;
+        this.adapter = adapter;
     }
 
     // ========== public entry points ==========
@@ -85,10 +100,117 @@ public class ToolJobFinalizer {
             anchor.setTerminalAt(now);
             // resultResp 可能在 RESULT_LOST 路径为空。
             if (resultResp != null) {
-                // stdout 只保存 16KB UTF-8 安全 preview，完整结果由 rawRef 指向。
-                anchor.setTerminalResultPreview(boundedPreview(resultResp.getStdout()));
+                String stdout = resultResp.getStdout();
+                String stderr = resultResp.getStderr();
+                boolean success = "SUCCEEDED".equals(terminalStatus);
+                boolean hasFinanceData = resultResp.hasFinanceRecordChannel()
+                        || (stdout != null && stdout.contains(FinanceRecordDecoder.MARKER_FAMILY));
+
+                String previewJson;
+                if (success) {
+                    if (hasFinanceData) {
+                        if (anchor.getFinanceRecordLimitsJson() == null
+                                || anchor.getFinanceRecordLimitsJson().isBlank()) {
+                            log.warn("Finance data present but snapshot missing for run={}", runId);
+                            anchor.setFinalizerError("finance_snapshot_missing");
+                            persistFinalizerAnchor(runId, anchor);
+                            return;
+                        }
+                        try {
+                            FinanceRecordChannelConfigLoader.Snapshot snapshot = configLoader
+                                    .parseFrozenSnapshot(anchor.getFinanceRecordLimitsJson());
+                            var channelMeta = FinanceRecordProtoAdapter.channelMetadata(resultResp);
+                            FinanceRecordExtractionRequest request = new FinanceRecordExtractionRequest(
+                                    runId,
+                                    "",
+                                    anchor.getTodoId(),
+                                    anchor.getToolCallId(),
+                                    "async",
+                                    anchor.getTaskId(),
+                                    terminalStatus,
+                                    resultResp.getExitCode(),
+                                    stdout,
+                                    stderr,
+                                    channelMeta,
+                                    FinanceRecordProtoAdapter.executionEnvironment(resultResp),
+                                    snapshot.targetEnvironment(),
+                                    snapshot.limits());
+                            FinanceRecordExtractionResult extraction =
+                                    financeProcessor.process(request);
+                            FinanceResultModelAdapter.ProjectionBatch projected =
+                                    adapter.project(extraction);
+                            previewJson = formatter.formatSuccess(
+                                    extraction.ordinaryStdout(),
+                                    projected.results(),
+                                    projected.notices());
+                        } catch (FinanceRecordProcessingException e) {
+                            log.warn("Finance processor failed for run={}: {} — "
+                                    + "ENVELOPE blocked, will retry", runId, e.getCode());
+                            anchor.setFinalizerError("finance_processing_failed");
+                            persistFinalizerAnchor(runId, anchor);
+                            return;
+                        } catch (RuntimeException e) {
+                            log.warn("Finance pipeline unexpected error for run={} — "
+                                    + "ENVELOPE blocked, will retry", runId, e.getMessage());
+                            anchor.setFinalizerError("finance_processing_failed");
+                            persistFinalizerAnchor(runId, anchor);
+                            return;
+                        }
+                    } else {
+                        previewJson = formatter.formatSuccess(stdout, List.of(), List.of());
+                    }
+                } else {
+                    // FAILED / CANCELED
+                    boolean retryable = resultResp.hasRetryable() && resultResp.getRetryable();
+                    String failureCode = "CANCELED".equals(terminalStatus)
+                            ? "PYTHON_EXECUTION_CANCELED" : "PYTHON_EXECUTION_FAILED";
+                    FinanceToolResultFormatter.FailureDetail failure =
+                            new FinanceToolResultFormatter.FailureDetail(
+                                    failureCode, "Sandbox " + terminalStatus, retryable,
+                                    retryable ? "检查代码后重试" : "检查代码或联系管理员");
+
+                    if (hasFinanceData) {
+                        if (anchor.getFinanceRecordLimitsJson() == null
+                                || anchor.getFinanceRecordLimitsJson().isBlank()) {
+                            log.warn("Finance data present but snapshot missing"
+                                    + " for FAILED/CANCELED run={}", runId);
+                            anchor.setFinalizerError("finance_snapshot_missing");
+                            persistFinalizerAnchor(runId, anchor);
+                            return;
+                        }
+                        try {
+                            FinanceRecordChannelConfigLoader.Snapshot snapshot = configLoader
+                                    .parseFrozenSnapshot(anchor.getFinanceRecordLimitsJson());
+                            FinanceRecordExtractionRequest request = new FinanceRecordExtractionRequest(
+                                    runId, "", anchor.getTodoId(), anchor.getToolCallId(),
+                                    "async", anchor.getTaskId(), terminalStatus,
+                                    resultResp.getExitCode(), stdout, stderr,
+                                    FinanceRecordProtoAdapter.channelMetadata(resultResp),
+                                    FinanceRecordProtoAdapter.executionEnvironment(resultResp),
+                                    snapshot.targetEnvironment(), snapshot.limits());
+                            FinanceRecordExtractionResult extraction =
+                                    financeProcessor.process(request);
+                            stdout = extraction.ordinaryStdout();
+                        } catch (FinanceRecordProcessingException e) {
+                            log.warn("Finance de-marker failed for run={}: {} — "
+                                    + "ENVELOPE blocked, will retry", runId, e.getCode());
+                            anchor.setFinalizerError("finance_demarker_failed");
+                            persistFinalizerAnchor(runId, anchor);
+                            return;
+                        }
+                    }
+                    // 移除 stderr 中的 finance marker 行，防止 formatter 永久拒绝
+                    if (stderr != null
+                            && stderr.contains(FinanceRecordDecoder.MARKER_FAMILY)) {
+                        stderr = stderr.lines()
+                                .filter(line -> !line.contains(FinanceRecordDecoder.MARKER_FAMILY))
+                                .collect(java.util.stream.Collectors.joining("\n"));
+                    }
+                    previewJson = formatter.formatFailure(stdout, stderr, failure);
+                }
+                anchor.setTerminalResultPreview(previewJson);
                 anchor.setTerminalRawRef(emptyToNull(resultResp.getDatasetDir()));
-                anchor.setTerminalStderrPreview(boundedPreview(resultResp.getStderr()));
+                anchor.setTerminalStderrPreview(boundedPreview(stderr));
                 // error 保存结构化失败码，不用异常 message 替代。
                 anchor.setTerminalErrorCode(emptyToNull(resultResp.getError()));
                 anchor.setTerminalExitReason(emptyToNull(resultResp.getResourceUsage().getExitReason()));
@@ -110,6 +232,10 @@ public class ToolJobFinalizer {
             } else if ("RESULT_LOST".equals(terminalStatus)) {
                 // 结果永久丢失是明确不可重试分类，而不是未知分类。
                 anchor.setTerminalRetryable(false);
+                anchor.setTerminalResultPreview(formatter.formatFailure("", "",
+                        new FinanceToolResultFormatter.FailureDetail(
+                                "PYTHON_RESULT_LOST",
+                                "沙箱结果永久丢失", false, "重新提交计算任务")));
             }
             // 先标记步骤，再连同 envelope 一起 CAS 写入，避免半步状态。
             anchor.setFinalizerStep(STEP_ENVELOPE);
@@ -581,4 +707,5 @@ public class ToolJobFinalizer {
         while (cut > 0 && (raw[cut] & 0xC0) == 0x80) cut--;
         return new String(raw, 0, cut, StandardCharsets.UTF_8) + suffix;
     }
+
 }

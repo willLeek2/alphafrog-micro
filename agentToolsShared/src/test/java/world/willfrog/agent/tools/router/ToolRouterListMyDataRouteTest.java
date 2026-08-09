@@ -13,6 +13,7 @@ import world.willfrog.agent.platform.service.AgentObservabilityService;
 import world.willfrog.agent.tools.compaction.RereadToolHandler;
 import world.willfrog.agent.tools.docs.LoadToolGuideTool;
 import world.willfrog.agent.tools.dataset.ListMyDataTool;
+import world.willfrog.agent.tools.finance.FinanceMethodTools;
 import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
 import world.willfrog.agent.tools.rag.RagTools;
@@ -58,6 +59,7 @@ class ToolRouterListMyDataRouteTest {
         });
         ToolRouter router = new ToolRouter(
                 mock(MarketDataTools.class), mock(RagTools.class), mock(SearchTools.class), python,
+                mock(FinanceMethodTools.class),
                 mock(LoadToolGuideTool.class), mock(ListMyDataTool.class),
                 new PythonStaticPrecheckService(), llmPropertiesWithStaticPrecheck(false),
                 cacheService, mock(RereadToolHandler.class), mock(AgentObservabilityService.class),
@@ -102,6 +104,7 @@ class ToolRouterListMyDataRouteTest {
                 mock(RagTools.class),
                 mock(SearchTools.class),
                 mock(PythonSandboxTools.class),
+                mock(FinanceMethodTools.class),
                 mock(LoadToolGuideTool.class),
                 listMyDataTool,
                 new PythonStaticPrecheckService(),
@@ -174,6 +177,7 @@ class ToolRouterListMyDataRouteTest {
                 mock(RagTools.class),
                 mock(SearchTools.class),
                 mock(PythonSandboxTools.class),
+                mock(FinanceMethodTools.class),
                 mock(LoadToolGuideTool.class),
                 listMyDataTool,
                 new PythonStaticPrecheckService(),
@@ -248,6 +252,7 @@ class ToolRouterListMyDataRouteTest {
                 mock(RagTools.class),
                 mock(SearchTools.class),
                 mock(PythonSandboxTools.class),
+                mock(FinanceMethodTools.class),
                 mock(LoadToolGuideTool.class),
                 listMyDataTool,
                 new PythonStaticPrecheckService(),
@@ -291,6 +296,7 @@ class ToolRouterListMyDataRouteTest {
                 mock(RagTools.class),
                 mock(SearchTools.class),
                 mock(PythonSandboxTools.class),
+                mock(FinanceMethodTools.class),
                 mock(LoadToolGuideTool.class),
                 mock(ListMyDataTool.class),
                 new PythonStaticPrecheckService(),

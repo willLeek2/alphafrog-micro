@@ -1,0 +1,7 @@
+{
+  "containerMaxConcurrency": 1,
+  "stdoutMaxBytes": 1048576,
+  "stderrMaxBytes": 262144,
+  "recordChannelMaxBytes": 262144,
+  "recordChannelMaxRecords": 128
+}

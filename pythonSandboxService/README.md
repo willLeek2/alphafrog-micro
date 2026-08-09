@@ -54,3 +54,24 @@ Java 侧建议将数据落盘：
 ## 说明
 - 采用 `copy-to-runtime`：请求时将数据文件复制到容器内的 `dataset_dir`。
 - 默认会安装 numpy（可通过 `libraries` 覆盖）。
+
+## 输出上限与 Nacos 配置快照（MethodSpec V5 §7.2）
+
+`python-sandbox.json`（Nacos data id）使用四个 camelCase 键：`stdoutMaxBytes`、
+`stderrMaxBytes`、`recordChannelMaxBytes`、`recordChannelMaxRecords`
+（示例见 `config/python-sandbox.example.json`）。
+
+- **应用默认值**：`app/config.py` 的 `DEFAULT_OUTPUT_LIMITS`，取自 Spec §7.1
+  包装器输入示例的形状值；正式生产数字必须由工作包 C/D 的四段测试确认后更新。
+- **静态硬上限**：`app/config.py` 的 `HARD_OUTPUT_LIMIT_CEILINGS`，写在代码里。
+  Nacos 只能把值调低或调到硬上限，超过硬上限的值会被钳制到硬上限并记录事件，
+  动态配置永远不能提高硬上限。
+- **整份校验 + last-known-good**：`DynamicSandboxConfig` 保存一份完整、不可变
+  的上一已知可用配置快照。整份 payload 校验通过（JSON 对象、每个已知键类型/
+  范围合法）才原子替换；任何非法 payload（坏 JSON、非对象、类型错误、负值）
+  整体拒绝并继续使用上一已知可用配置，不做部分应用。未知键忽略并告警。
+- **任务快照冻结**：`output_limits_snapshot()` 返回四个上限加 `sourceRevision`
+  共五个键；`create_task()` 创建任务时冻结该快照（幂等重复创建返回原快照），
+  执行中只读任务快照，不得重新读取热配置。
+- **Nacos 默认关闭**：`AF_CONFIG_NACOS_ENABLED` 缺省不为 `true` 即不启动监听；
+  生产发布时显式打开。四段测试未完成前，金融计算结果通道保持关闭。

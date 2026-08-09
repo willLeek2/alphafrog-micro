@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="world.willfrog.agent.platform.mapper.FinanceRecordBatchMapper">
+    <resultMap id="BatchMap" type="world.willfrog.agent.platform.finance.FinanceRecordBatch">
+        <id property="id" column="id"/>
+        <result property="runId" column="run_id"/>
+        <result property="todoId" column="todo_id"/>
+        <result property="executePythonToolCallId" column="execute_python_tool_call_id"/>
+        <result property="entryPoint" column="entry_point"/>
+        <result property="terminalStatus" column="terminal_status"/>
+        <result property="exitCode" column="exit_code"/>
+        <result property="recordCount" column="record_count"/>
+        <result property="recordBytes" column="record_bytes"/>
+        <result property="recordDigest" column="record_digest"/>
+        <result property="recordSetComplete" column="record_set_complete"/>
+        <result property="dropReason" column="drop_reason"/>
+        <result property="schemaValid" column="schema_valid"/>
+        <result property="renderable" column="renderable"/>
+        <result property="actualEnvironmentJson" column="actual_environment_json"/>
+        <result property="validationErrorJson" column="validation_error_json"/>
+        <result property="batchContentDigest" column="batch_content_digest"/>
+        <result property="createdAt" column="created_at"/>
+        <result property="updatedAt" column="updated_at"/>
+    </resultMap>
+
+    <sql id="Columns">
+        id, run_id, todo_id, execute_python_tool_call_id, entry_point, terminal_status,
+        exit_code, record_count, record_bytes, record_digest, record_set_complete,
+        drop_reason, schema_valid, renderable,
+        actual_environment_json::text AS actual_environment_json,
+        validation_error_json::text AS validation_error_json,
+        batch_content_digest, created_at, updated_at
+    </sql>
+
+    <insert id="insertIgnore" parameterType="world.willfrog.agent.platform.finance.FinanceRecordBatch">
+        INSERT INTO alphafrog_agent_finance_record_batch
+        (run_id, todo_id, execute_python_tool_call_id, entry_point, terminal_status, exit_code,
+         record_count, record_bytes, record_digest, record_set_complete, drop_reason,
+         schema_valid, renderable, actual_environment_json, validation_error_json,
+         batch_content_digest)
+        VALUES
+        (#{runId}, #{todoId}, #{executePythonToolCallId}, #{entryPoint}, #{terminalStatus}, #{exitCode},
+         #{recordCount}, #{recordBytes}, #{recordDigest}, #{recordSetComplete}, #{dropReason},
+         #{schemaValid}, #{renderable}, CAST(#{actualEnvironmentJson} AS jsonb),
+         CAST(#{validationErrorJson} AS jsonb), #{batchContentDigest})
+        ON CONFLICT (run_id, todo_id, execute_python_tool_call_id) DO NOTHING
+    </insert>
+
+    <select id="findByIdentity" resultMap="BatchMap">
+        SELECT <include refid="Columns"/>
+        FROM alphafrog_agent_finance_record_batch
+        WHERE run_id = #{runId}
+          AND todo_id = #{todoId}
+          AND execute_python_tool_call_id = #{executePythonToolCallId}
+        LIMIT 1
+    </select>
+</mapper>

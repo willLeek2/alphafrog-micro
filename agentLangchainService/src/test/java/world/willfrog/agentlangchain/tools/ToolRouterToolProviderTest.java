@@ -98,6 +98,23 @@ class ToolRouterToolProviderTest {
     }
 
     @Test
+    void provideTools_shouldExposeResolveFinanceMethodsAlways() {
+        ToolProviderResult result = provider.provideTools(request(Map.of(
+                LangchainToolInvocationKeys.WEB_SEARCH_ENABLED, false,
+                LangchainToolInvocationKeys.CODE_INTERPRETER_ENABLED, false
+        )));
+
+        Set<String> toolNames = result.tools().keySet().stream()
+                .map(ToolSpecification::name)
+                .collect(Collectors.toSet());
+
+        assertTrue(toolNames.contains("resolveFinanceMethods"),
+                "resolveFinanceMethods is an advisory tool and must not depend on webSearch/codeInterpreter flags");
+        assertNotNull(result.toolExecutorByName("resolveFinanceMethods"),
+                "AiService must be able to execute a resolveFinanceMethods tool_call");
+    }
+
+    @Test
     void provideTools_shouldHideSearchWhenWebSearchDisabled() {
         ToolProviderResult result = provider.provideTools(request(Map.of(
                 LangchainToolInvocationKeys.WEB_SEARCH_ENABLED, false,

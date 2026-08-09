@@ -4,6 +4,10 @@ import org.junit.jupiter.api.Test;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisCapacityService;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agent.platform.finance.FinanceRecordChannelConfigLoader;
+import world.willfrog.agent.platform.finance.FinanceRecordChannelProcessor;
+import world.willfrog.agent.platform.finance.FinanceToolResultFormatter;
+import world.willfrog.agent.tools.finance.FinanceResultModelAdapter;
 
 import java.lang.reflect.Field;
 
@@ -34,7 +38,7 @@ class ToolJobFinalizerCanceledGuardTest {
         ToolJobFinalizer finalizer = new ToolJobFinalizer(
                 anchorService, redisCache,
                 mock(DataAnalysisCapacityService.class), mock(ToolJobResumeService.class),
-                mock(ToolJobConfig.class));
+                mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
         inject(finalizer, "usageHook", usageHook);
         inject(finalizer, "eventHook", eventHook);
 
@@ -73,7 +77,7 @@ class ToolJobFinalizerCanceledGuardTest {
         ToolJobFinalizer finalizer = new ToolJobFinalizer(
                 anchorService, redisCache,
                 mock(DataAnalysisCapacityService.class), mock(ToolJobResumeService.class),
-                mock(ToolJobConfig.class));
+                mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
         inject(finalizer, "usageHook", usageHook);
         inject(finalizer, "eventHook", eventHook);
 

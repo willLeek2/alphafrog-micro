@@ -52,6 +52,7 @@ public class LangchainToolCatalogService {
 
         List<ToolSpecification> merged = MarketDataAdvancedToolCatalog.mergeCanonical(
                 ParallelLimitsToolCatalog.mergeCanonical(new ArrayList<>(specs.values())));
+        merged = ToolCatalogBuilder.addResolveFinanceMethodsIfAbsent(merged);
 
         List<AgentToolMessage> messages = new ArrayList<>();
         for (ToolSpecification spec : merged) {
