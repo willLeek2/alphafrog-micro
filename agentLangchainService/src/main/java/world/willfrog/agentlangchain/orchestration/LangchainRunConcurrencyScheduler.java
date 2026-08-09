@@ -56,6 +56,19 @@ public class LangchainRunConcurrencyScheduler {
     private static final long QUEUED_PROMOTED_WARN_INTERVAL_MS = 30_000;
     private static final long OLDEST_AGE_WARN_INTERVAL_MS = 60_000;
 
+    // ── Per-instance identification (for cross-instance snapshot aggregation) ──
+    private static final String INSTANCE_ID = resolveInstanceId();
+
+    private static String resolveInstanceId() {
+        String hostname;
+        try {
+            hostname = java.net.InetAddress.getLocalHost().getHostName();
+        } catch (java.net.UnknownHostException e) {
+            hostname = "unknown-host";
+        }
+        return hostname + "@" + ProcessHandle.current().pid();
+    }
+
     // ── Latest snapshot store (consumed by observability / actuator) ──
     private volatile Map<String, Object> latestSnapshot = Map.of();
 
@@ -324,17 +337,18 @@ public class LangchainRunConcurrencyScheduler {
         long oldestAgeMs = oldestQueuedAtMillis > 0
                 ? System.currentTimeMillis() - oldestQueuedAtMillis
                 : 0;
-        return Map.of(
-                "running", running,
-                "queued", reservedQueued,
-                "rejectedTotal", rejectedCount.get(),
-                "corePoolSize", current.getCorePoolSize(),
-                "maxPoolSize", current.getMaxPoolSize(),
-                "queueCapacity", current.getQueueCapacity(),
-                "hardCorePoolSize", hard.getCorePoolSize(),
-                "hardMaxPoolSize", hard.getMaxPoolSize(),
-                "hardQueueCapacity", hard.getQueueCapacity(),
-                "oldestQueuedAgeMs", oldestAgeMs
+        return Map.ofEntries(
+                Map.entry("instanceId", INSTANCE_ID),
+                Map.entry("running", running),
+                Map.entry("queued", reservedQueued),
+                Map.entry("rejectedTotal", rejectedCount.get()),
+                Map.entry("corePoolSize", current.getCorePoolSize()),
+                Map.entry("maxPoolSize", current.getMaxPoolSize()),
+                Map.entry("queueCapacity", current.getQueueCapacity()),
+                Map.entry("hardCorePoolSize", hard.getCorePoolSize()),
+                Map.entry("hardMaxPoolSize", hard.getMaxPoolSize()),
+                Map.entry("hardQueueCapacity", hard.getQueueCapacity()),
+                Map.entry("oldestQueuedAgeMs", oldestAgeMs)
         );
     }
 
