@@ -49,21 +49,23 @@ class AgentLangchainHealthControllerTest {
 
     @Test
     void schedulerReturnsSnapshot() throws Exception {
-        when(concurrencyScheduler.schedulerSnapshot()).thenReturn(Map.of(
-                "running", 3,
-                "queued", 5,
-                "rejectedTotal", 1L,
-                "corePoolSize", 50,
-                "maxPoolSize", 50,
-                "queueCapacity", 200,
-                "hardCorePoolSize", 100,
-                "hardMaxPoolSize", 100,
-                "hardQueueCapacity", 1000,
-                "oldestQueuedAgeMs", 45000L
+        when(concurrencyScheduler.schedulerSnapshot()).thenReturn(Map.ofEntries(
+                Map.entry("instanceId", "test-app@host-1@123"),
+                Map.entry("running", 3),
+                Map.entry("queued", 5),
+                Map.entry("rejectedTotal", 1L),
+                Map.entry("corePoolSize", 50),
+                Map.entry("maxPoolSize", 50),
+                Map.entry("queueCapacity", 200),
+                Map.entry("hardCorePoolSize", 100),
+                Map.entry("hardMaxPoolSize", 100),
+                Map.entry("hardQueueCapacity", 1000),
+                Map.entry("oldestQueuedAgeMs", 45000L)
         ));
 
         mockMvc.perform(get("/agent-langchain/scheduler"))
                 .andExpect(status().isOk())
+                .andExpect(jsonPath("$.instanceId", is("test-app@host-1@123")))
                 .andExpect(jsonPath("$.running", is(3)))
                 .andExpect(jsonPath("$.queued", is(5)))
                 .andExpect(jsonPath("$.rejectedTotal", is(1)))
