@@ -3,6 +3,7 @@ package world.willfrog.agentlangchain.facade;
 import org.junit.jupiter.api.Test;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.event.AgentRunFinalizationService;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentEventService;
@@ -30,9 +31,10 @@ class LangchainRunControlServiceTest {
     private final LangchainLinearRunPipeline pipeline = mock(LangchainLinearRunPipeline.class);
     private final AgentRunCreditSettlementService creditSettlementService = mock(AgentRunCreditSettlementService.class);
     private final ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
+    private final AgentRunFinalizationService finalizationService = mock(AgentRunFinalizationService.class);
     private final LangchainRunControlService service = new LangchainRunControlService(
             readService, runMapper, eventService, stateStore, observabilityService, pipeline,
-            creditSettlementService, anchorService);
+            creditSettlementService, anchorService, finalizationService);
 
     @Test
     void cancelFlushesObservabilityAndMarksCanceled() {
@@ -43,6 +45,10 @@ class LangchainRunControlServiceTest {
         when(observabilityService.attachObservabilityToSnapshot("r1", "{}", AgentRunStatus.CANCELED))
                 .thenReturn("{\"observability\":{}}");
         when(eventService.nextInterruptedExpiresAt()).thenReturn(OffsetDateTime.now().plusDays(7));
+        when(runMapper.updateSnapshot(eq("r1"), eq("u1"), eq(AgentRunStatus.CANCELED),
+                anyString(), eq(false), isNull())).thenReturn(1);
+        when(runMapper.updateStatusWithTtl(eq("r1"), eq("u1"), eq(AgentRunStatus.CANCELED), any()))
+                .thenReturn(1);
 
         var response = service.cancelRun(CancelAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build());
 
@@ -50,6 +56,63 @@ class LangchainRunControlServiceTest {
         verify(observabilityService).forceFlush("r1");
         verify(runMapper).updateSnapshot(eq("r1"), eq("u1"), eq(AgentRunStatus.CANCELED), anyString(), eq(false), isNull());
         verify(eventService).append(eq("r1"), eq("u1"), eq("CANCELED"), anyMap());
+        verify(finalizationService).publishFinalizedEvent("r1", "u1", "CANCELED");
+    }
+
+    @Test
+    void cancelPublisherFailureDoesNotRollbackCommittedTerminalState() {
+        AgentRun running = run(AgentRunStatus.EXECUTING);
+        AgentRun canceled = run(AgentRunStatus.CANCELED);
+        when(readService.requireWritableRun("r1", "u1")).thenReturn(running);
+        when(readService.requireReadableRun("r1", "u1")).thenReturn(canceled);
+        when(observabilityService.attachObservabilityToSnapshot("r1", "{}", AgentRunStatus.CANCELED))
+                .thenReturn("{\"observability\":{}}");
+        when(eventService.nextInterruptedExpiresAt()).thenReturn(OffsetDateTime.now().plusDays(7));
+        when(runMapper.updateSnapshot(eq("r1"), eq("u1"), eq(AgentRunStatus.CANCELED),
+                anyString(), eq(false), isNull())).thenReturn(1);
+        when(runMapper.updateStatusWithTtl(eq("r1"), eq("u1"), eq(AgentRunStatus.CANCELED), any()))
+                .thenReturn(1);
+        doThrow(new RuntimeException("listener unavailable"))
+                .when(finalizationService).publishFinalizedEvent("r1", "u1", "CANCELED");
+
+        var response = service.cancelRun(
+                CancelAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build());
+
+        assertEquals("CANCELED", response.getStatus());
+        verify(runMapper).updateStatusWithTtl(
+                eq("r1"), eq("u1"), eq(AgentRunStatus.CANCELED), any());
+        verify(finalizationService).publishFinalizedEvent("r1", "u1", "CANCELED");
+    }
+
+    @Test
+    void cancelPersistenceMismatchDoesNotPublish() {
+        AgentRun running = run(AgentRunStatus.EXECUTING);
+        AgentRun refreshed = run(AgentRunStatus.EXECUTING);
+        when(readService.requireWritableRun("r1", "u1")).thenReturn(running);
+        when(readService.requireReadableRun("r1", "u1")).thenReturn(refreshed);
+        when(observabilityService.attachObservabilityToSnapshot("r1", "{}", AgentRunStatus.CANCELED))
+                .thenReturn("{\"observability\":{}}");
+        when(eventService.nextInterruptedExpiresAt()).thenReturn(OffsetDateTime.now().plusDays(7));
+        when(runMapper.updateSnapshot(eq("r1"), eq("u1"), eq(AgentRunStatus.CANCELED),
+                anyString(), eq(false), isNull())).thenReturn(0);
+        when(runMapper.updateStatusWithTtl(eq("r1"), eq("u1"), eq(AgentRunStatus.CANCELED), any()))
+                .thenReturn(1);
+
+        service.cancelRun(CancelAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build());
+
+        verify(finalizationService, never()).publishFinalizedEvent(anyString(), anyString(), anyString());
+    }
+
+    @Test
+    void cancelTerminalReentryDoesNotPublishAgain() {
+        AgentRun canceled = run(AgentRunStatus.CANCELED);
+        when(readService.requireWritableRun("r1", "u1")).thenReturn(canceled);
+
+        var response = service.cancelRun(
+                CancelAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build());
+
+        assertEquals("CANCELED", response.getStatus());
+        verifyNoInteractions(finalizationService);
     }
 
     @Test
@@ -95,6 +158,7 @@ class LangchainRunControlServiceTest {
         // Oracle: snapshot updated with current status (not CANCELED)
         verify(runMapper).updateSnapshot(eq("r1"), eq("u1"), eq(AgentRunStatus.WAITING_TOOL_JOB),
                 anyString(), eq(false), isNull());
+        verify(finalizationService, never()).publishFinalizedEvent(anyString(), anyString(), anyString());
     }
 
     @Test

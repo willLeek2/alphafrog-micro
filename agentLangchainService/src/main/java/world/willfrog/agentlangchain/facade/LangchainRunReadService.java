@@ -9,6 +9,7 @@ import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.entity.AgentRunEvent;
 import world.willfrog.agent.platform.entity.AgentRunMessage;
+import world.willfrog.agent.platform.event.AgentRunFinalizationService;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentArtifactService;
@@ -139,6 +140,7 @@ public class LangchainRunReadService {
     private final ObjectMapper objectMapper;
     private final DataAnalysisObservabilityQuery dataAnalysisObservabilityQuery;
     private final DataAnalysisReadResponseSerializer dataAnalysisSerializer;
+    private final AgentRunFinalizationService finalizationService;
 
     @Value("${agent.run.list.default-days:30}")
     private int listDefaultDays;
@@ -525,13 +527,30 @@ public class LangchainRunReadService {
         }
         // 过期是读时发现并补写的状态：旧 run 没有后台定时器一直扫描。
         // 一旦某次读取发现超出保留窗口，就补 RUN_EXPIRED 事件并刷新 Redis 状态。
-        runMapper.updateStatus(run.getId(), run.getUserId(), AgentRunStatus.EXPIRED);
+        int updatedRows = runMapper.updateStatus(
+                run.getId(), run.getUserId(), AgentRunStatus.EXPIRED);
+        if (updatedRows != 1) {
+            log.warn("EXPIRED persistence was not exact; skip terminal side effects: "
+                    + "runId={} status={} rows={}", run.getId(), AgentRunStatus.EXPIRED, updatedRows);
+            return run;
+        }
         eventService.append(run.getId(), run.getUserId(), "RUN_EXPIRED", Map.of(
                 "run_id", run.getId(),
                 "expired_at", OffsetDateTime.now().toString()));
         stateStore.markRunStatus(run.getId(), AgentRunStatus.EXPIRED.name());
+        publishFinalizedEventSafely(run.getId(), run.getUserId(), AgentRunStatus.EXPIRED);
         AgentRun refreshed = runMapper.findByIdAndUser(run.getId(), run.getUserId());
         return refreshed == null ? run : refreshed;
+    }
+
+    /** Workspace dump 失败走 DB polling 兜底，不能反向破坏已经提交的过期终态。 */
+    private void publishFinalizedEventSafely(String runId, String userId, AgentRunStatus status) {
+        try {
+            finalizationService.publishFinalizedEvent(runId, userId, status.name());
+        } catch (RuntimeException e) {
+            log.warn("Workspace finalization publish failed after terminal commit: "
+                    + "runId={} status={} err={}", runId, status, e.getMessage(), e);
+        }
     }
 
     private String requireUserId(String userId) {

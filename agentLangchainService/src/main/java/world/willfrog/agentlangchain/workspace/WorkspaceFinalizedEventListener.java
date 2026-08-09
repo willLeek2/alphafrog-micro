@@ -10,6 +10,8 @@ import world.willfrog.agent.platform.event.AgentRunFinalizedEvent;
  * run 终态事件监听器。
  *
  * <p>订阅 {@link AgentRunFinalizedEvent} 后调 {@link WorkspaceDumpScheduler} 异步触发 workspace dump。
+ * 事件必须统一由 AgentRunFinalizationService 构造，使 EXPIRED-only conservative 语义与
+ * WorkspacePollingObserver 保持一致；本监听器只转发该规范化结果。
  *
  * @author wang
  */
