@@ -1303,18 +1303,21 @@ class PythonSandboxGatewayServiceImplD13Test {
         assertEquals(204, response.getErrorDetail().getDownstreamHttpStatus(),
                 "downstream_http_status MUST be actual 204, not hardcoded 200");
 
-        // JSONL telemetry — result fetch emits exactly ONE final ERROR event. The status
-        // precheck's OK event uses the /tasks/{id} endpoint, so filtering by /result
-        // endpoint + ERROR status isolates the result-fetch signal.
+        // JSONL telemetry — Cindy 67d306f6 assertion tightening: filter by /result endpoint
+        // ONLY, then assert size==1 BEFORE checking status. This catches a regression where
+        // /result erroneously emits OK first then ERROR (the round-1 fake-OK problem D13
+        // §4.2 red line 4 freezes). The status precheck's OK event uses /tasks/{id} (no
+        // /result suffix) so endpoint-only filtering naturally excludes it.
         List<String> allHttpEvents = readSandboxHttpEvents(sessionDir, "run-t204");
-        List<String> resultErrorEvents = allHttpEvents.stream()
+        List<String> resultEvents = allHttpEvents.stream()
                 .filter(line -> line.contains("\"endpoint\":\"http://sandbox/tasks/task-1/result\""))
-                .filter(line -> line.contains("\"status\":\"ERROR\""))
                 .toList();
-        assertEquals(1, resultErrorEvents.size(),
-                "result fetch MUST emit exactly ONE final ERROR event; got all events: "
-                        + allHttpEvents);
-        String event = resultErrorEvents.get(0);
+        assertEquals(1, resultEvents.size(),
+                "result fetch MUST emit exactly ONE final classified event (not OK+ERROR); "
+                        + "got all events: " + allHttpEvents);
+        String event = resultEvents.get(0);
+        assertTrue(event.contains("\"status\":\"ERROR\""),
+                "single result event MUST be classified as ERROR; got: " + event);
         assertTrue(event.contains(
                 "\"errorCategory\":\"GET_RESULT_SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED\""),
                 "result ERROR event MUST carry frozen GET_RESULT_..._UNSPECIFIED category; got: "
