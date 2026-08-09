@@ -786,6 +786,40 @@ class AgentControllerTest {
     }
 
     @Test
+    @SuppressWarnings("unchecked")
+    void nonAdminStatusPlanOmitsOrdinaryPlannerReasoningAndToolParameters() {
+        setNonAdmin();
+        when(agentDubboService.getStatus(any())).thenReturn(
+                AgentRunStatusMessage.newBuilder()
+                        .setId("run-1")
+                        .setStatus("EXECUTING")
+                        .setPlanJson(unsafePlanJson())
+                        .build());
+
+        var response = controller.status(authentication, "run-1");
+
+        assertEquals(ResponseCode.SUCCESS.getCode(), response.getCode());
+        assertSafeNonAdminPlan((Map<String, Object>) response.getData().plan());
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void nonAdminRunDetailPlanOmitsOrdinaryPlannerReasoningAndToolParameters() {
+        setNonAdmin();
+        when(agentDubboService.getRun(any())).thenReturn(
+                AgentRunMessage.newBuilder()
+                        .setId("run-1")
+                        .setStatus("EXECUTING")
+                        .setPlanJson(unsafePlanJson())
+                        .build());
+
+        var response = controller.get(authentication, "run-1");
+
+        assertEquals(ResponseCode.SUCCESS.getCode(), response.getCode());
+        assertSafeNonAdminPlan((Map<String, Object>) response.getData().plan());
+    }
+
+    @Test
     void malformedEventPayloadNeverEchoesRawInput() {
         setNonAdmin();
         when(agentDubboService.listEvents(any(ListAgentRunEventsRequest.class))).thenReturn(
@@ -820,6 +854,46 @@ class AgentControllerTest {
         nonAdmin.setUserId(99L);
         nonAdmin.setUserType(1);
         when(authService.getUserByUsername("admin")).thenReturn(nonAdmin);
+    }
+
+    private String unsafePlanJson() {
+        return """
+                {
+                  "analysis":"full planner reasoning",
+                  "executionMode":"DAG",
+                  "strategy":{"reasoning":"nested strategy reasoning"},
+                  "extractedEntities":["沪深300",{"reasoning":"nested entity reasoning"}],
+                  "items":[{
+                    "id":"todo-1","sequence":1,"type":"TOOL_CALL","toolName":"searchIndex",
+                    "description":"查询指数公开信息",
+                    "dependsOn":["todo-0",{"params":{"keyword":"nested dependency query"}}],
+                    "parallelizable":true,
+                    "params":{"keyword":"private business query"},
+                    "reasoning":"full todo reasoning"
+                  }]
+                }
+                """;
+    }
+
+    @SuppressWarnings("unchecked")
+    private void assertSafeNonAdminPlan(Map<String, Object> plan) {
+        assertNotNull(plan);
+        assertEquals("DAG", plan.get("executionMode"));
+        assertFalse(plan.containsKey("strategy"));
+        assertEquals(java.util.List.of("沪深300"), plan.get("extractedEntities"));
+        assertFalse(plan.containsKey("analysis"));
+        Map<String, Object> item = (Map<String, Object>) ((java.util.List<?>) plan.get("items")).get(0);
+        assertEquals("查询指数公开信息", item.get("description"));
+        assertEquals("searchIndex", item.get("toolName"));
+        assertEquals(java.util.List.of("todo-0"), item.get("dependsOn"));
+        assertFalse(item.containsKey("params"));
+        assertFalse(item.containsKey("reasoning"));
+        assertFalse(plan.toString().contains("private business query"));
+        assertFalse(plan.toString().contains("nested dependency query"));
+        assertFalse(plan.toString().contains("nested strategy reasoning"));
+        assertFalse(plan.toString().contains("nested entity reasoning"));
+        assertFalse(plan.toString().contains("full planner reasoning"));
+        assertFalse(plan.toString().contains("full todo reasoning"));
     }
 
     private static void assertGetRoute(Class<?> controllerType, String methodName, String expectedPath) {

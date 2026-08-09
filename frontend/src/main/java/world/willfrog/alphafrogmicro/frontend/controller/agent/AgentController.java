@@ -702,7 +702,7 @@ public class AgentController {
                     parseOutboundJson(status.getLastEventPayloadJson(), AgentExternalObservabilityMapper.View.EVENT),
                     parseOutboundJson(status.getPlanJson(), admin
                             ? AgentExternalObservabilityMapper.View.ADMIN
-                            : AgentExternalObservabilityMapper.View.STATUS),
+                            : AgentExternalObservabilityMapper.View.PLAN),
                     parseOutboundJson(status.getProgressJson(), admin
                             ? AgentExternalObservabilityMapper.View.ADMIN
                             : AgentExternalObservabilityMapper.View.STATUS),
@@ -1629,7 +1629,7 @@ public class AgentController {
                 run.getMaxSteps(),
                 parseOutboundJson(run.getPlanJson(), isAdmin
                         ? AgentExternalObservabilityMapper.View.ADMIN
-                        : AgentExternalObservabilityMapper.View.STATUS),
+                        : AgentExternalObservabilityMapper.View.PLAN),
                 parseOutboundJson(run.getSnapshotJson(), isAdmin
                         ? AgentExternalObservabilityMapper.View.ADMIN
                         : AgentExternalObservabilityMapper.View.RUN_SNAPSHOT),

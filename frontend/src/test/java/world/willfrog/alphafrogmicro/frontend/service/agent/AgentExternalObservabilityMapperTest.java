@@ -80,6 +80,49 @@ class AgentExternalObservabilityMapperTest {
 
     @Test
     @SuppressWarnings("unchecked")
+    void planViewUsesRootAndItemAllowlistsWithoutPlannerReasoningOrToolParameters() {
+        Map<String, Object> mapped = (Map<String, Object>) AgentExternalObservabilityMapper.parse(
+                objectMapper,
+                """
+                {
+                  "analysis":"full planner reasoning",
+                  "executionMode":"DAG",
+                  "strategy":{"reasoning":"nested strategy reasoning"},
+                  "extractedEntities":["沪深300",{"reasoning":"nested entity reasoning"}],
+                  "internalPlannerState":"hidden state",
+                  "items":[{
+                    "id":"todo-1","sequence":1,"type":"TOOL_CALL","toolName":"searchIndex",
+                    "description":"查询指数公开信息",
+                    "dependsOn":["todo-0",{"params":{"keyword":"nested dependency query"}}],
+                    "parallelizable":true,
+                    "params":{"keyword":"private business query"},
+                    "reasoning":"full todo reasoning","output":"full tool output"
+                  }]
+                }
+                """,
+                AgentExternalObservabilityMapper.View.PLAN);
+
+        assertEquals("DAG", mapped.get("executionMode"));
+        assertFalse(mapped.containsKey("strategy"));
+        assertEquals(List.of("沪深300"), mapped.get("extractedEntities"));
+        assertFalse(mapped.containsKey("analysis"));
+        assertFalse(mapped.containsKey("internalPlannerState"));
+        Map<String, Object> item = (Map<String, Object>) ((List<?>) mapped.get("items")).get(0);
+        assertEquals("查询指数公开信息", item.get("description"));
+        assertEquals("searchIndex", item.get("toolName"));
+        assertEquals(List.of("todo-0"), item.get("dependsOn"));
+        assertFalse(item.containsKey("params"));
+        assertFalse(item.containsKey("reasoning"));
+        assertFalse(item.containsKey("output"));
+        assertFalse(mapped.toString().contains("private business query"));
+        assertFalse(mapped.toString().contains("nested dependency query"));
+        assertFalse(mapped.toString().contains("nested strategy reasoning"));
+        assertFalse(mapped.toString().contains("nested entity reasoning"));
+        assertFalse(mapped.toString().contains("full todo reasoning"));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
     void eventViewDropsRawTraceFieldsAndCapsSafePreview() {
         String event = """
                 {

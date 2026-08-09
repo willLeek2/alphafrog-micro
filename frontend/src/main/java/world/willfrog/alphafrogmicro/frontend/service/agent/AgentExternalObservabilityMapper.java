@@ -28,6 +28,8 @@ public final class AgentExternalObservabilityMapper {
         STRUCTURED,
         /** 普通用户 Run snapshot / result payload：使用顶层与 completed_items 白名单。 */
         RUN_SNAPSHOT,
+        /** 普通用户 planner 计划：仅保留可展示的计划骨架，不返回 reasoning 或工具参数。 */
+        PLAN,
         /** 普通用户 status/summary。 */
         STATUS,
         /** 普通用户 event/timeline payload。 */
@@ -46,6 +48,15 @@ public final class AgentExternalObservabilityMapper {
             "skippedtodoids", "completeditems", "recoveryrationale", "recoveryjudgedecisionid"
     );
     private static final Set<String> COMPLETED_ITEM_KEYS = Set.of("todoid", "sequence", "description", "summary");
+    private static final Set<String> PLAN_ROOT_KEYS = Set.of(
+            "items", "tasks", "steps", "extractedentities", "executionmode", "strategy"
+    );
+    private static final Set<String> PLAN_ITEM_CONTAINER_KEYS = Set.of("items", "tasks", "steps");
+    private static final Set<String> PLAN_ID_LIST_KEYS = Set.of("dependson", "dependencies");
+    private static final Set<String> PLAN_ITEM_KEYS = Set.of(
+            "id", "sequence", "type", "toolname", "tool", "description", "status",
+            "dependson", "dependencies", "groupkey", "parallelizable", "executionmode", "maxsteps"
+    );
     private static final Set<String> SENSITIVE_KEYS = Set.of(
             "authorization", "proxyauthorization", "apikey", "xapikey", "secret", "clientsecret",
             "password", "passwd", "credential", "credentials", "cookie", "setcookie",
@@ -111,7 +122,93 @@ public final class AgentExternalObservabilityMapper {
 
     /** Recursively applies the selected outbound view to an already parsed value. */
     public static Object sanitize(Object value, View view) {
+        if (view == View.PLAN) {
+            return sanitizePlan(value);
+        }
         return sanitize(value, view, 0, "");
+    }
+
+    /**
+     * Planner output is treated as hostile even after JSON parsing. Keep only the documented
+     * display skeleton and enforce each field's shape so a polluted list/map cannot smuggle
+     * reasoning or tool arguments through an otherwise allowed key.
+     */
+    private static Object sanitizePlan(Object value) {
+        if (!(value instanceof Map<?, ?> map)) {
+            return null;
+        }
+        Map<String, Object> out = new LinkedHashMap<>();
+        for (Map.Entry<?, ?> entry : map.entrySet()) {
+            String key = String.valueOf(entry.getKey());
+            String normalized = normalizeKey(key);
+            if (!PLAN_ROOT_KEYS.contains(normalized)) {
+                continue;
+            }
+            Object sanitized;
+            if (PLAN_ITEM_CONTAINER_KEYS.contains(normalized)) {
+                sanitized = sanitizePlanItems(entry.getValue());
+            } else if ("extractedentities".equals(normalized)) {
+                sanitized = sanitizePlanScalarList(entry.getValue());
+            } else {
+                sanitized = sanitizePlanScalar(entry.getValue());
+            }
+            if (sanitized != null) {
+                out.put(key, sanitized);
+            }
+        }
+        return out;
+    }
+
+    private static Object sanitizePlanItems(Object value) {
+        if (!(value instanceof List<?> list)) {
+            return null;
+        }
+        List<Object> out = new ArrayList<>(list.size());
+        for (Object item : list) {
+            if (!(item instanceof Map<?, ?> map)) {
+                continue;
+            }
+            Map<String, Object> sanitizedItem = new LinkedHashMap<>();
+            for (Map.Entry<?, ?> entry : map.entrySet()) {
+                String key = String.valueOf(entry.getKey());
+                String normalized = normalizeKey(key);
+                if (!PLAN_ITEM_KEYS.contains(normalized)) {
+                    continue;
+                }
+                Object sanitized = PLAN_ID_LIST_KEYS.contains(normalized)
+                        ? sanitizePlanScalarList(entry.getValue())
+                        : sanitizePlanScalar(entry.getValue());
+                if (sanitized != null) {
+                    sanitizedItem.put(key, sanitized);
+                }
+            }
+            out.add(sanitizedItem);
+        }
+        return out;
+    }
+
+    private static Object sanitizePlanScalarList(Object value) {
+        if (!(value instanceof List<?> list)) {
+            return null;
+        }
+        List<Object> out = new ArrayList<>(list.size());
+        for (Object item : list) {
+            Object sanitized = sanitizePlanScalar(item);
+            if (sanitized != null) {
+                out.add(sanitized);
+            }
+        }
+        return out;
+    }
+
+    private static Object sanitizePlanScalar(Object value) {
+        if (value instanceof String text) {
+            return scrubString(text);
+        }
+        if (value instanceof Number || value instanceof Boolean) {
+            return value;
+        }
+        return null;
     }
 
     private static Object sanitize(Object value, View view, int depth, String parentKey) {
