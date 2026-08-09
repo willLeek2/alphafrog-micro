@@ -25,7 +25,6 @@ import world.willfrog.agent.workflow.AgentRunDatasetEntry;
 import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
 import world.willfrog.agent.workflow.AgentRunDatasetSnapshot;
 import world.willfrog.agent.tools.dataset.DatasetEntryMetadataReader;
-import world.willfrog.agent.tools.python.DataAnalysisCapacityServiceImpl.CapacityAdmissionException;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
 
 import com.google.protobuf.util.JsonFormat;

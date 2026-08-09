@@ -38,7 +38,7 @@ class LangchainRunConcurrencySchedulerTest {
         LangchainRunExecutorLimitsResolver resolver = mock(LangchainRunExecutorLimitsResolver.class);
         when(resolver.currentLimits()).thenAnswer(invocation -> currentLimits.get());
         when(resolver.hardLimits()).thenReturn(new LangchainRunExecutorLimits(3, 3, 2, "scheduler-test-"));
-        scheduler = new LangchainRunConcurrencyScheduler(executor, resolver);
+        scheduler = new LangchainRunConcurrencyScheduler(executor, resolver, "test-app");
     }
 
     @AfterEach
@@ -168,6 +168,7 @@ class LangchainRunConcurrencySchedulerTest {
     void schedulerSnapshot_shouldContainCoreMetrics() {
         Map<String, Object> snap = scheduler.schedulerSnapshot();
         assertThat(snap).containsKeys(
+                "instanceId",
                 "running", "queued", "rejectedTotal",
                 "corePoolSize", "maxPoolSize", "queueCapacity",
                 "hardCorePoolSize", "hardMaxPoolSize", "hardQueueCapacity",
@@ -178,6 +179,20 @@ class LangchainRunConcurrencySchedulerTest {
         assertThat(((Number) snap.get("corePoolSize")).intValue()).isEqualTo(2);
         assertThat(((Number) snap.get("maxPoolSize")).intValue()).isEqualTo(3);
         assertThat(((Number) snap.get("queueCapacity")).intValue()).isEqualTo(2);
+    }
+
+    @Test
+    void schedulerSnapshot_instanceIdShouldBeStableAndContainApplicationComponent() {
+        Map<String, Object> snap1 = scheduler.schedulerSnapshot();
+        Map<String, Object> snap2 = scheduler.schedulerSnapshot();
+
+        Object instanceId1 = snap1.get("instanceId");
+        Object instanceId2 = snap2.get("instanceId");
+
+        assertThat(instanceId1).isInstanceOf(String.class);
+        assertThat((String) instanceId1).isNotBlank();
+        assertThat(instanceId1).isEqualTo(instanceId2);
+        assertThat((String) instanceId1).startsWith("test-app@");
     }
 
     @Test
