@@ -1188,6 +1188,18 @@ def _flush_quietly(fileobj) -> None:
         pass
 
 
+# D15 §4.2 (Scenario B): the four AF_TASK_* env vars that the wrapper must
+# see in taskEnvironment before it will spawn the user child. Missing any of
+# them is fail-closed (no spawn, no global sitecustomize fallback) per
+# D15 §6 red line 4.
+REQUIRED_TASK_ENV_KEYS = (
+    "AF_TASK_WORKSPACE",
+    "AF_TASK_ARTIFACT_DIR",
+    "AF_TASK_TMP_DIR",
+    "AF_TASK_METRICS_PATH",
+)
+
+
 def parse_wrapper_input(path: Path) -> dict:
     """Parse and validate ``<wrapper-input.json>`` (§7.1 example shape)."""
     try:
@@ -1225,6 +1237,56 @@ def parse_wrapper_input(path: Path) -> dict:
             )
         limits[key] = value
 
+    # D15 §4.2 (Scenario B): taskWorkspace + taskEnvironment are the
+    # task-local replacement for the old global /sandbox/sitecustomize.py.
+    # The wrapper resolves them here and rejects anything that would force a
+    # silent fallback to writing a global bootstrap file (D15 §6 red line 4).
+    task_workspace = payload.get("taskWorkspace")
+    if not isinstance(task_workspace, str) or not task_workspace:
+        raise WrapperInputError(
+            "taskWorkspace must be a non-empty string "
+            "(D15 §4.2: AF_TASK_* isolation requires a task-local workspace "
+            "path; missing it is fail-closed, not a fallback to the legacy "
+            "global sitecustomize.py)"
+        )
+
+    task_env_payload = payload.get("taskEnvironment")
+    if not isinstance(task_env_payload, dict):
+        raise WrapperInputError(
+            "taskEnvironment must be a JSON object of strings "
+            "(D15 §4.2: AF_TASK_* must travel in the task-local wrapper "
+            "input, not the shared global sitecustomize.py)"
+        )
+    task_environment: dict[str, str] = {}
+    for key, value in task_env_payload.items():
+        if not isinstance(value, str):
+            raise WrapperInputError(
+                f"taskEnvironment.{key} must be a string"
+            )
+        task_environment[key] = value
+    missing_keys = [
+        key for key in REQUIRED_TASK_ENV_KEYS if not task_environment.get(key)
+    ]
+    if missing_keys:
+        raise WrapperInputError(
+            "taskEnvironment is missing required keys: "
+            f"{', '.join(missing_keys)} (D15 §4.2: each AF_TASK_* variable "
+            "MUST be present and non-empty before the wrapper will spawn; "
+            "no silent fallback to a global sitecustomize.py is permitted)"
+        )
+
+    # D15 §4.2: loaderPythonPath is the workdir the legacy sitecustomize
+    # prepended to sys.path so the user child can import af_dataset_loader
+    # and friends. Optional for backward-compat with old wrapper inputs in
+    # tests, but production always sets it.
+    loader_python_path = payload.get("loaderPythonPath")
+    if loader_python_path is not None and (
+        not isinstance(loader_python_path, str) or not loader_python_path
+    ):
+        raise WrapperInputError(
+            "loaderPythonPath must be a non-empty string when present"
+        )
+
     # runtimeEnvironmentPath is part of the §7.1 input shape but belongs to
     # work package D's schema (runtime_environment.py); the wrapper does not
     # consume it.
@@ -1232,6 +1294,9 @@ def parse_wrapper_input(path: Path) -> dict:
         "script_path": script_path,
         "timeout_seconds": timeout_seconds,
         "limits": limits,
+        "task_workspace": task_workspace,
+        "task_environment": task_environment,
+        "loader_python_path": loader_python_path,
     }
 
 
@@ -1242,6 +1307,9 @@ def run_bounded_capture(
     limits: dict,
     capture_dir: Path,
     child_identity: tuple | None = None,
+    task_workspace: str | None = None,
+    task_environment: dict[str, str] | None = None,
+    workdir_for_pythonpath: str | None = None,
 ) -> tuple:
     """Run the user script under bounded capture.
 
@@ -1258,6 +1326,13 @@ def run_bounded_capture(
     returning, EXCEPT when the spawn fails while a child identity is active
     (P0-4: no child, no summary).  On any internal exception everything is
     closed and the exception is re-raised.
+
+    D15 §4.2 (Scenario B): ``task_workspace`` and ``task_environment`` carry
+    the AF_TASK_* variables that previously lived in the shared global
+    /sandbox/sitecustomize.py. The wrapper performs makedirs / chdir /
+    sys.path setup itself pre-spawn, then injects the env into the user
+    child via Popen(env=...). Fail-closed: caller guarantees both are
+    non-empty (parse_wrapper_input rejects missing required keys).
     """
     capture_path = Path(capture_dir)
     capture_path.mkdir(parents=True, exist_ok=True)
@@ -1351,6 +1426,43 @@ def run_bounded_capture(
         # this raises BEFORE any Popen: no child, no summary.
         _set_child_subreaper()
 
+        # D15 §4.2 (Scenario B): the wrapper performs the makedirs/chdir/
+        # sys.path setup that the legacy global sitecustomize.py used to do
+        # at import time. makedirs is idempotent; chdir is achieved by
+        # passing cwd= to Popen (the child resolves its own cwd on exec);
+        # sys.path gets the loader-module dir (workdir) via PYTHONPATH on
+        # the child env. All three are now per-task, in-wrapper, with no
+        # global file write.
+        if task_environment is not None:
+            for sub_dir in (
+                task_environment.get("AF_TASK_ARTIFACT_DIR"),
+                task_environment.get("AF_TASK_TMP_DIR"),
+            ):
+                if sub_dir:
+                    Path(sub_dir).mkdir(parents=True, exist_ok=True)
+        spawn_cwd = (
+            task_workspace
+            if task_workspace
+            else str(Path(script_path).resolve().parent)
+        )
+
+        # Build the child env: wrapper's own env + AF_TASK_* (task-scoped) +
+        # PYTHONPATH extended with the loader-module workdir so af_dataset_
+        # loader etc. remain importable from the user child exactly as they
+        # were under the old sitecustomize regime.
+        child_env = os.environ.copy()
+        if task_environment:
+            for key, value in task_environment.items():
+                child_env[key] = value
+        if workdir_for_pythonpath:
+            existing_pythonpath = child_env.get("PYTHONPATH", "")
+            if existing_pythonpath:
+                child_env["PYTHONPATH"] = (
+                    f"{workdir_for_pythonpath}:{existing_pythonpath}"
+                )
+            else:
+                child_env["PYTHONPATH"] = workdir_for_pythonpath
+
         try:
             # The child's stdout/stderr are the capture pipes ONLY: the child
             # never inherits or shares the wrapper's own stdout fd, which
@@ -1360,7 +1472,8 @@ def run_bounded_capture(
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                cwd=str(Path(script_path).resolve().parent),
+                cwd=spawn_cwd,
+                env=child_env,
                 start_new_session=True,  # child owns a new process group
                 preexec_fn=_make_preexec(child_identity),
             )
@@ -1545,6 +1658,9 @@ def main(argv: list[str] | None = None) -> int:
             limits=parsed["limits"],
             capture_dir=capture_dir,
             child_identity=child_identity,
+            task_workspace=parsed["task_workspace"],
+            task_environment=parsed["task_environment"],
+            workdir_for_pythonpath=parsed.get("loader_python_path"),
         )
     except Exception as exc:  # last-resort guard; type name only (§18)
         sys.stderr.write(

@@ -401,6 +401,17 @@ class WrapperStagingTest(unittest.TestCase):
             runtimeEnvironmentPath=(
                 f"{self.config.workdir.rstrip('/')}/runtime-environment.json"
             ),
+            # D15 §4.2 (Scenario B): the four AF_TASK_* env vars now travel
+            # in the task-local wrapper-input.json instead of the shared
+            # global sitecustomize.py.
+            taskWorkspace=self.task_workspace,
+            taskEnvironment={
+                "AF_TASK_WORKSPACE": self.task_workspace,
+                "AF_TASK_ARTIFACT_DIR": f"{self.task_workspace}/artifacts",
+                "AF_TASK_TMP_DIR": f"{self.task_workspace}/tmp",
+                "AF_TASK_METRICS_PATH": f"{self.task_workspace}/metrics/loader_metrics.jsonl",
+            },
+            loaderPythonPath=self.config.workdir.rstrip("/"),
         ).wrapper_input_payload()
         self.assertEqual(staged, expected)
         # sourceRevision is Task metadata, never part of the wrapper input.
@@ -1251,6 +1262,17 @@ class CaptureTamperingWiringTest(unittest.TestCase):
                     "effectiveOutputLimits": {
                         key: self._TAMPER_LIMITS[key] for key in _LIMIT_KEYS
                     },
+                    # D15 §4.2 (Scenario B): taskWorkspace/taskEnvironment are
+                    # required by parse_wrapper_input, so supply valid ones
+                    # so the planted-symlink path is what trips the wrapper.
+                    "taskWorkspace": str(input_dir),
+                    "taskEnvironment": {
+                        "AF_TASK_WORKSPACE": str(input_dir),
+                        "AF_TASK_ARTIFACT_DIR": f"{input_dir}/artifacts",
+                        "AF_TASK_TMP_DIR": f"{input_dir}/tmp",
+                        "AF_TASK_METRICS_PATH": f"{input_dir}/metrics/x.jsonl",
+                    },
+                    "loaderPythonPath": str(input_dir),
                 }
             ),
             encoding="utf-8",

@@ -203,6 +203,19 @@ class BoundedExecRequest(BaseModel):
     timeoutSeconds: float = Field(..., ge=0)
     effectiveOutputLimits: EffectiveOutputLimits
     runtimeEnvironmentPath: Optional[str] = None
+    # D15 §4.2 (Scenario B): the four AF_TASK_* env vars and the task
+    # workspace path are now carried in the wrapper-input.json (which is
+    # already task-local — staged at {task_workspace}/wrapper-input.json
+    # by _stage_bounded_wrapper) instead of being written into the shared
+    # global /sandbox/sitecustomize.py. The wrapper validates these and
+    # injects them via Popen(env=...) when spawning the user child, so
+    # task A's AF_TASK_* can never be read by task B even if cleanup of
+    # the legacy sitecustomize.py fails.
+    taskWorkspace: Optional[str] = Field(default=None, min_length=1)
+    taskEnvironment: Optional[dict[str, str]] = None
+    # D15 §4.2: workdir the user child needs on sys.path so it can import
+    # af_dataset_loader etc. The wrapper prepends it to PYTHONPATH at spawn.
+    loaderPythonPath: Optional[str] = Field(default=None, min_length=1)
 
     def wrapper_input_payload(self) -> dict:
         """Serialize to the exact §7.1 input shape.
@@ -220,6 +233,12 @@ class BoundedExecRequest(BaseModel):
         }
         if self.runtimeEnvironmentPath is not None:
             payload["runtimeEnvironmentPath"] = self.runtimeEnvironmentPath
+        if self.taskWorkspace is not None:
+            payload["taskWorkspace"] = self.taskWorkspace
+        if self.taskEnvironment is not None:
+            payload["taskEnvironment"] = dict(self.taskEnvironment)
+        if self.loaderPythonPath is not None:
+            payload["loaderPythonPath"] = self.loaderPythonPath
         return payload
 
 
