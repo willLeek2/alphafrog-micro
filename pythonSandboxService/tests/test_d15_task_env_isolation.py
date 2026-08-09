@@ -37,6 +37,7 @@ import json
 import os
 import subprocess
 import sys
+import stat
 import tempfile
 import types
 import unittest
@@ -828,6 +829,253 @@ class LoaderRequiredAndConsistencyInvariantsTest(unittest.TestCase):
             self.ran_marker.exists(),
             "wrapper spawned user child despite AF_TASK_METRICS_PATH "
             "pointing outside taskWorkspace",
+        )
+
+
+class BootstrapPermissionAndRunpySemanticsTest(unittest.TestCase):
+    """D15 §4.2.3 round-3 (codex c9fee2f9 MUST-FIX #1 + #2).
+
+    Round-2 (d0c67439) closed the stale-sitecustomize core bug but missed
+    two production realities that host tests (same-UID) couldn't surface:
+
+    1. **Permission gap**: sandbox_runner chowns task_workspace to the
+       unprivileged child uid BEFORE the root wrapper creates the
+       ``_bootstrap`` dir + bootstrap file. Round-2 set the dir to 0o700
+       (root-only). Production child (non-root after preexec_fn) couldn't
+       traverse the root-owned 0o700 dir to read the bootstrap → child
+       startup fails immediately. Round-3 fix: dir 0o755 (world-traversable)
+       + file 0o444 (world-readable, root-writable via unlink+write).
+
+    2. **Sibling import gap**: round-2 bootstrap inserted LOADER_PATH at
+       ``sys.path[0]`` but never inserted user script's parent dir.
+       Direct ``python user_script.py`` puts script parent at
+       ``sys.path[0]`` enabling sibling imports like
+       ``import sibling_module``. runpy.run_path does NOT do this
+       automatically. Round-3 fix: bootstrap inserts user_script_dir at
+       ``sys.path[0]`` AFTER inserting LOADER_PATH, so final order is
+       ``[user_script_dir, LOADER_PATH, ...]`` — siblings win over
+       loader modules of same name (matches direct python priority).
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="af-d15-r3-")
+        self.root = Path(self._tmp.name).resolve()
+        self.task_workspace = self.root / "task_ws"
+        self.task_workspace.mkdir()
+        (self.task_workspace / "artifacts").mkdir()
+        (self.task_workspace / "tmp").mkdir()
+        (self.task_workspace / "metrics").mkdir()
+        # Loader path is a separate dir holding a (real) af_dataset_loader
+        # stub for some tests; for the permission/sibling tests below it
+        # can be empty.
+        self.loader_path = self.root / "loader"
+        self.loader_path.mkdir()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _write_input(self, script_path: Path) -> Path:
+        input_path = self.task_workspace / "wrapper-input.json"
+        _write_wrapper_input(
+            input_path,
+            script_path=script_path,
+            task_workspace=str(self.task_workspace),
+            task_env=_make_task_env(str(self.task_workspace)),
+            loader_python_path=str(self.loader_path),
+        )
+        return input_path
+
+    @staticmethod
+    def _decode_stdout(completed: subprocess.CompletedProcess) -> str:
+        import base64
+        envelope = json.loads(completed.stdout.decode("utf-8"))
+        return base64.b64decode(envelope["files"]["stdout.bin"]).decode("utf-8")
+
+    def test_bootstrap_dir_is_world_traversable_and_file_is_world_readable(self):
+        """Round-3 MUST-FIX #1: bootstrap dir MUST be 0o755 + file 0o444 so
+        the production non-root child can read it after preexec_fn drops
+        privileges. Round-2 used 0o700 which only the root wrapper could
+        traverse — production child failed at startup, host tests missed it
+        because they run same-UID."""
+        script = self.task_workspace / "user_script.py"
+        script.write_text("print('ok')\n", encoding="utf-8")
+        input_path = self._write_input(script)
+
+        completed = _run_wrapper(input_path)
+        self.assertEqual(
+            completed.returncode, 0,
+            f"wrapper failed: stderr={completed.stderr[:1024]!r}",
+        )
+
+        bootstrap_dir = self.task_workspace / "_bootstrap"
+        bootstrap_file = bootstrap_dir / "loader_bootstrap.py"
+        self.assertTrue(bootstrap_file.is_file(), "bootstrap file not staged")
+
+        dir_mode = stat.S_IMODE(bootstrap_dir.stat().st_mode)
+        file_mode = stat.S_IMODE(bootstrap_file.stat().st_mode)
+
+        self.assertEqual(
+            dir_mode & 0o755, 0o755,
+            f"bootstrap dir MUST be at least 0o755 (world-traversable) so the "
+            f"non-root child can cd into it; got 0o{dir_mode:o}",
+        )
+        # Owner-write MUST be off so the user child cannot modify the
+        # bootstrap even if same-UID (defense in depth).
+        self.assertEqual(
+            dir_mode & stat.S_IWGRP, 0,
+            "bootstrap dir MUST NOT be group-writable (the unprivileged "
+            f"child could then rename/replace the bootstrap); got 0o{dir_mode:o}",
+        )
+        self.assertEqual(
+            dir_mode & stat.S_IWOTH, 0,
+            "bootstrap dir MUST NOT be world-writable; "
+            f"got 0o{dir_mode:o}",
+        )
+
+        self.assertEqual(
+            file_mode & 0o444, 0o444,
+            f"bootstrap file MUST be at least world-readable (0o444) so the "
+            f"non-root child can read it; got 0o{file_mode:o}",
+        )
+        self.assertEqual(
+            file_mode & stat.S_IWUSR, 0,
+            "bootstrap file MUST NOT be user-writable (defense in depth: "
+            f"the unprivileged child must not modify the bootstrap); "
+            f"got 0o{file_mode:o}",
+        )
+        self.assertEqual(
+            file_mode & stat.S_IWGRP, 0,
+            "bootstrap file MUST NOT be group-writable; "
+            f"got 0o{file_mode:o}",
+        )
+        self.assertEqual(
+            file_mode & stat.S_IWOTH, 0,
+            "bootstrap file MUST NOT be world-writable; "
+            f"got 0o{file_mode:o}",
+        )
+
+    def test_user_script_sibling_imports_work_via_bootstrap(self):
+        """Round-3 MUST-FIX #2: ``import sibling_module`` from a same-dir
+        module MUST work. Round-2 bootstrap inserted LOADER_PATH at
+        ``sys.path[0]`` but never inserted user_script's parent, so sibling
+        imports failed with ModuleNotFoundError. codex independently
+        reproduced this — wrapper rc=0 but child exitCode=1."""
+        # Place sibling_module.py NEXT TO user_script.py (not in loader_path,
+        # not in task_workspace root) so it's only findable via direct-script
+        # sys.path semantics.
+        script_dir = self.task_workspace / "scripts"
+        script_dir.mkdir()
+        sibling = script_dir / "sibling_module.py"
+        sibling.write_text(
+            "def hello():\n    return 'sibling import ok'\n",
+            encoding="utf-8",
+        )
+        script = script_dir / "user_script.py"
+        script.write_text(
+            "import sibling_module\n"
+            "print(sibling_module.hello())\n",
+            encoding="utf-8",
+        )
+        input_path = self._write_input(script)
+
+        completed = _run_wrapper(input_path)
+        # Wrapper exit code MUST be 0. Round-2 broken behavior was wrapper
+        # rc=0 but child exitCode=1; with the envelope we need to decode
+        # the child's exit code separately.
+        self.assertEqual(
+            completed.returncode, 0,
+            f"wrapper failed: stderr={completed.stderr[:1024]!r}",
+        )
+        stdout = self._decode_stdout(completed)
+        self.assertIn(
+            "sibling import ok", stdout,
+            "user script could not import sibling_module from same dir — "
+            "round-2 bootstrap's sys.path semantics broke direct-script "
+            "sibling imports (codex c9fee2f9 MUST-FIX #2 NOT fixed). "
+            f"stdout={stdout!r}",
+        )
+
+    def test_user_script_sees_main_name_correct_file_and_argv(self):
+        """Round-3 invariant: ``runpy.run_path(..., run_name='__main__')``
+        MUST preserve direct-script semantics for ``__name__``,
+        ``__file__`` and ``sys.argv``. If a future bootstrap change breaks
+        this, user scripts that use ``if __name__ == '__main__':`` idiom
+        would silently no-op."""
+        script = self.task_workspace / "user_script.py"
+        script.write_text(
+            "import sys\n"
+            "print('__name__=' + __name__)\n"
+            "print('__file__=' + __file__)\n"
+            "print('argv0=' + sys.argv[0])\n",
+            encoding="utf-8",
+        )
+        input_path = self._write_input(script)
+
+        completed = _run_wrapper(input_path)
+        self.assertEqual(
+            completed.returncode, 0,
+            f"wrapper failed: stderr={completed.stderr[:1024]!r}",
+        )
+        stdout = self._decode_stdout(completed)
+
+        self.assertIn(
+            "__name__=__main__", stdout,
+            f"user script __name__ MUST be '__main__' (preserves "
+            f"'if __name__ == \"__main__\"' idiom); stdout={stdout!r}",
+        )
+        # __file__ should resolve to the user script path. runpy.run_path
+        # sets __file__ to whatever path was passed in — wrapper passes
+        # script_path as-is from wrapper-input.json.
+        script_path_str = str(script)
+        self.assertIn(
+            f"__file__={script_path_str}", stdout,
+            f"user script __file__ MUST resolve to the script path; "
+            f"stdout={stdout!r}",
+        )
+        self.assertIn(
+            f"argv0={script_path_str}", stdout,
+            f"sys.argv[0] MUST be the user script path (direct-script "
+            f"semantics); stdout={stdout!r}",
+        )
+
+    def test_user_script_system_exit_propagates_through_bootstrap(self):
+        """Round-3 invariant: ``SystemExit(N)`` raised by user script MUST
+        propagate through ``runpy.run_path`` and the bootstrap so the
+        wrapper observes a non-zero exit. This is the standard Python
+        behavior for direct ``python user_script.py``; the bootstrap mode
+        MUST NOT swallow it."""
+        import base64
+        script = self.task_workspace / "user_script.py"
+        script.write_text(
+            "print('about to exit')\n"
+            "raise SystemExit(7)\n",
+            encoding="utf-8",
+        )
+        input_path = self._write_input(script)
+
+        completed = _run_wrapper(input_path)
+        # Wrapper itself completes (rc=0 means wrapper ran fine); the user
+        # child's SystemExit(7) is captured in the envelope's
+        # capture-result.json file (base64-encoded JSON), not the wrapper's
+        # returncode.
+        self.assertEqual(
+            completed.returncode, 0,
+            f"wrapper itself failed (not the user script's SystemExit): "
+            f"stderr={completed.stderr[:1024]!r}",
+        )
+        envelope = json.loads(completed.stdout.decode("utf-8"))
+        capture_result_b64 = envelope["files"]["capture-result.json"]
+        capture_result = json.loads(
+            base64.b64decode(capture_result_b64).decode("utf-8"),
+        )
+        # The capture-result.json's exitCode field carries the user child's
+        # process exit code. SystemExit(7) → child exits with code 7.
+        child_exit = capture_result.get("exitCode")
+        self.assertEqual(
+            child_exit, 7,
+            f"user child's SystemExit(7) MUST propagate as exit code 7 "
+            f"through runpy.run_path + bootstrap; got {child_exit!r}. "
+            f"capture-result={capture_result!r}",
         )
 
 
