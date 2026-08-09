@@ -859,7 +859,17 @@
             updated_at = CURRENT_TIMESTAMP
         WHERE id = #{id}
           AND status = #{expectedStatus}
-          AND tool_job_anchor_json #>> '{resumeState}' IN ('LAUNCHING', 'ACCEPTED')
+          AND (
+                -- 合法组合：RECEIVED + LAUNCHING + 未接受（正常等待接管）
+                (status = 'RECEIVED'
+                 AND tool_job_anchor_json #>> '{resumeState}' = 'LAUNCHING'
+                 AND NOT COALESCE((tool_job_anchor_json #>> '{resultConsumed}')::boolean, false))
+                OR
+                -- 合法组合：EXECUTING + (LAUNCHING legacy 或 ACCEPTED) + 已接受
+                (status = 'EXECUTING'
+                 AND tool_job_anchor_json #>> '{resumeState}' IN ('LAUNCHING', 'ACCEPTED')
+                 AND COALESCE((tool_job_anchor_json #>> '{resultConsumed}')::boolean, false))
+              )
           AND tool_job_anchor_json #>> '{resumeToken}' = #{expectedResumeToken}
           AND (tool_job_anchor_json #>> '{resumeLeaseVersion}')::bigint = #{expectedLeaseVersion}
           AND (tool_job_anchor_json #>> '{resumeLauncherOwnerId}')
@@ -892,8 +902,17 @@
                 ),
             updated_at = CURRENT_TIMESTAMP
         WHERE id = #{id}
-          AND status IN ('RECEIVED', 'EXECUTING')
-          AND tool_job_anchor_json #>> '{resumeState}' IN ('LAUNCHING', 'ACCEPTED')
+          AND (
+                -- 合法组合：RECEIVED + LAUNCHING + 未接受
+                (status = 'RECEIVED'
+                 AND tool_job_anchor_json #>> '{resumeState}' = 'LAUNCHING'
+                 AND NOT COALESCE((tool_job_anchor_json #>> '{resultConsumed}')::boolean, false))
+                OR
+                -- 合法组合：EXECUTING + (LAUNCHING legacy 或 ACCEPTED) + 已接受
+                (status = 'EXECUTING'
+                 AND tool_job_anchor_json #>> '{resumeState}' IN ('LAUNCHING', 'ACCEPTED')
+                 AND COALESCE((tool_job_anchor_json #>> '{resultConsumed}')::boolean, false))
+              )
           AND tool_job_anchor_json #>> '{resumeToken}' = #{expectedResumeToken}
           AND (tool_job_anchor_json #>> '{resumeLeaseVersion}')::bigint = #{expectedLeaseVersion}
           AND tool_job_anchor_json #>> '{resumeLauncherOwnerId}' = #{expectedLauncherOwnerId}

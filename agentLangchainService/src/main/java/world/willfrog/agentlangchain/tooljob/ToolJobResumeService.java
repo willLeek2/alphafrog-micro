@@ -293,10 +293,8 @@ public class ToolJobResumeService {
     }
 
     /**
-     * Persists the first half of the resume handoff. The terminal result has
-     * been accepted by the workflow, but the old anchor is deliberately kept
-     * until the resumed workflow has durably reached either a final result or
-     * a later tool-job checkpoint.
+     * 持久化恢复 handoff 的前半部分。终态结果已被工作流接受，但旧 anchor 会被
+     * 故意保留，直到恢复后的工作流持久化到达最终结果或下一个工具任务检查点。
      */
     public boolean markHandoffAccepted(String runId, ToolJobResumeContext context) {
         // 交接上下文必须绑定当前 run/token/version，且 executor 已把 resultConsumed 推进为 true。
@@ -354,9 +352,8 @@ public class ToolJobResumeService {
     }
 
     /**
-     * Clears only the exact old handoff claim, after the pipeline callback has
-     * returned from durable result/checkpoint persistence. A later suspension
-     * has a different state/token/version and is therefore never cleared here.
+     * 仅清理精确匹配的旧 handoff claim。只在 pipeline 回调已从持久化结果/检查点
+     * 落盘返回后调用。后续挂起会产生不同的 state/token/version，因此绝不会被这里误清理。
      */
     public boolean completeHandoff(String runId, String token, long version, String ownerId) {
         // pipeline 回调只允许清理自己最初提交的旧 claim。

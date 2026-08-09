@@ -110,7 +110,7 @@ class AgentRunMapperResumeAcceptedPostgresIntegrationTest {
             assertThat(mapper.acceptResumeHandoff(
                     "run-acc-1", accepted.toJson(),
                     "tok-1", 5L, "owner-1", 30L))
-                    .as("acceptResumeHandoff: LAUNCHING→ACCEPTED must succeed")
+                    .as("acceptResumeHandoff: LAUNCHING→ACCEPTED 必须成功")
                     .isEqualTo(1);
 
             // 验证 DB 状态
@@ -154,7 +154,7 @@ class AgentRunMapperResumeAcceptedPostgresIntegrationTest {
                     AgentRunStatus.EXECUTING,
                     "tok-2", 7L, "owner-old",
                     "owner-new", 30L, 120L))
-                    .as("takeoverExpiredResumeLauncher: ACCEPTED+expired must succeed")
+                    .as("takeoverExpiredResumeLauncher: ACCEPTED+过期lease 必须成功")
                     .isEqualTo(1);
 
             // 验证新 owner
@@ -195,7 +195,7 @@ class AgentRunMapperResumeAcceptedPostgresIntegrationTest {
                     AgentRunStatus.EXECUTING,
                     "tok-2b", 5L, "owner-old",
                     "owner-new", 30L, 120L))
-                    .as("takeoverExpiredResumeLauncher: unexpired lease must return 0")
+                    .as("takeoverExpiredResumeLauncher: 未过期lease 必须返回0")
                     .isZero();
 
             // DB 状态不变
@@ -226,7 +226,7 @@ class AgentRunMapperResumeAcceptedPostgresIntegrationTest {
 
             assertThat(mapper.heartbeatResumeLauncher(
                     "run-acc-3", "tok-3", 3L, "owner-3", 30L))
-                    .as("heartbeatResumeLauncher: ACCEPTED+active lease must succeed")
+                    .as("heartbeatResumeLauncher: ACCEPTED+活跃lease 必须成功")
                     .isEqualTo(1);
         }
     }
@@ -249,13 +249,13 @@ class AgentRunMapperResumeAcceptedPostgresIntegrationTest {
             // 错误 owner → rows=0
             assertThat(mapper.heartbeatResumeLauncher(
                     "run-acc-3b", "tok-3b", 3L, "owner-wrong", 30L))
-                    .as("heartbeatResumeLauncher: wrong owner must return 0")
+                    .as("heartbeatResumeLauncher: 错误owner 必须返回0")
                     .isZero();
 
             // 错误 version → rows=0
             assertThat(mapper.heartbeatResumeLauncher(
                     "run-acc-3b", "tok-3b", 99L, "owner-3b", 30L))
-                    .as("heartbeatResumeLauncher: wrong version must return 0")
+                    .as("heartbeatResumeLauncher: 错误version 必须返回0")
                     .isZero();
         }
     }
@@ -285,7 +285,7 @@ class AgentRunMapperResumeAcceptedPostgresIntegrationTest {
                     "{\"steps\":[]}", "{\"snap\":1}",
                     true, null,
                     "tok-4", 4L, "owner-4"))
-                    .as("updateResumedTerminal: ACCEPTED+consumed must succeed")
+                    .as("updateResumedTerminal: ACCEPTED+consumed 必须成功")
                     .isEqualTo(1);
 
             AgentRun run = mapper.findById("run-acc-4");
@@ -314,7 +314,7 @@ class AgentRunMapperResumeAcceptedPostgresIntegrationTest {
                     "{\"steps\":[]}", "{\"snap\":1}",
                     true, null,
                     "tok-4b", 99L, "owner-4b"))
-                    .as("updateResumedTerminal: wrong version must return 0")
+                    .as("updateResumedTerminal: 错误version 必须返回0")
                     .isZero();
         }
     }
@@ -338,7 +338,7 @@ class AgentRunMapperResumeAcceptedPostgresIntegrationTest {
 
             assertThat(mapper.clearAcceptedResumeHandoff(
                     "run-acc-5", "tok-5", 5L, "owner-5"))
-                    .as("clearAcceptedResumeHandoff: ACCEPTED+COMPLETED must succeed")
+                    .as("clearAcceptedResumeHandoff: ACCEPTED+COMPLETED 必须成功")
                     .isEqualTo(1);
 
             // Anchor 已清空为 {}
@@ -353,8 +353,9 @@ class AgentRunMapperResumeAcceptedPostgresIntegrationTest {
 
     @Test
     void legacyLaunchingWithConsumedTrueTakeoverSucceeds() {
-        // 直接插入 D12 之前的原始 JSON（LAUNCHING + resultConsumed=true），
-        // 不经过 fromJson 归一化，验证 production mapper SQL 能正确处理。
+        // 直接插入 D12 之前的原始 JSON：EXECUTING + LAUNCHING + resultConsumed=true。
+        // 这是旧代码 acceptResumeHandoff 写入的真实 legacy 状态（handoff 已接受，
+        // status 已推进为 EXECUTING，但 resumeState 仍为 LAUNCHING）。
         Instant expiredLease = Instant.now().minusSeconds(10);
         String legacyJson = "{\"schemaVersion\":1," +
                 "\"operationId\":\"legacy-1:tc-1:1\"," +
@@ -366,7 +367,12 @@ class AgentRunMapperResumeAcceptedPostgresIntegrationTest {
                 "\"resumeClaimedAt\":\"" + Instant.now().minusSeconds(60) + "\"," +
                 "\"resultConsumed\":true}";
 
-        insertRun("run-legacy-1", AgentRunStatus.RECEIVED, legacyJson);
+        insertRun("run-legacy-1", AgentRunStatus.EXECUTING, legacyJson);
+
+        // fromJson 归一化：LAUNCHING+true → ACCEPTED，expectedStatus=EXECUTING
+        ToolJobAnchor loaded = ToolJobAnchor.fromJson(legacyJson);
+        assertThat(loaded.getResumeState()).isEqualTo("ACCEPTED");
+        assertThat(loaded.isResultConsumed()).isTrue();
 
         // 构造 takeover anchor：token/version 递增，owner 更换
         ToolJobAnchor takeover = resumeAnchor("legacy-1:tc-1:1", "ACCEPTED", true);
@@ -378,13 +384,14 @@ class AgentRunMapperResumeAcceptedPostgresIntegrationTest {
         try (SqlSession session = sqlSessionFactory.openSession(true)) {
             AgentRunMapper mapper = session.getMapper(AgentRunMapper.class);
 
-            // takeover 成功：SQL 匹配 LAUNCHING（原始 JSON 中的值）
+            // takeover 成功：DB 中 EXECUTING+LAUNCHING+true 匹配合法组合
+            // (EXECUTING + IN('LAUNCHING','ACCEPTED') + consumed=true)
             assertThat(mapper.takeoverExpiredResumeLauncher(
                     "run-legacy-1", takeover.toJson(),
-                    AgentRunStatus.RECEIVED,
+                    AgentRunStatus.EXECUTING,
                     "legacy-tok", 5L, "owner-legacy",
                     "owner-new", 30L, 120L))
-                    .as("takeover of legacy LAUNCHING+true JSON must succeed")
+                    .as("legacy EXECUTING+LAUNCHING+true 的 takeover 必须成功")
                     .isEqualTo(1);
 
             // DB 中的 JSON 已更新为新 token/version/owner
@@ -393,8 +400,6 @@ class AgentRunMapperResumeAcceptedPostgresIntegrationTest {
             assertThat(persisted.getResumeToken()).isEqualTo("legacy-tok-new");
             assertThat(persisted.getResumeLeaseVersion()).isEqualTo(6);
             assertThat(persisted.getResumeLauncherOwnerId()).isEqualTo("owner-new");
-            // fromJson 归一化：LAUNCHING+true → ACCEPTED
-            assertThat(persisted.getResumeState()).isEqualTo("ACCEPTED");
         }
     }
 
@@ -421,13 +426,13 @@ class AgentRunMapperResumeAcceptedPostgresIntegrationTest {
                     "run-bad-1", claimAnchor.toJson(),
                     AgentRunStatus.RECEIVED, AgentRunStatus.RECEIVED,
                     "bad-tok", 1L, "owner-x", 30L))
-                    .as("claimResumeLauncher: READY+true must return 0")
+                    .as("claimResumeLauncher: READY+true 必须返回0")
                     .isZero();
 
             // listResumeReadyAnchors 不包含矛盾行
             assertThat(mapper.listResumeReadyAnchors(20).stream()
                     .map(world.willfrog.agent.platform.entity.AgentRun::getId))
-                    .as("listResumeReadyAnchors must exclude READY+true")
+                    .as("listResumeReadyAnchors 必须排除 READY+true")
                     .doesNotContain("run-bad-1");
 
             // DB 不变
@@ -471,7 +476,7 @@ class AgentRunMapperResumeAcceptedPostgresIntegrationTest {
                     AgentRunStatus.RECEIVED,
                     "tok-launch", 3L, "owner-old",
                     "owner-new", 30L, 120L))
-                    .as("takeoverExpiredResumeLauncher: LAUNCHING+expired must still succeed")
+                    .as("takeoverExpiredResumeLauncher: LAUNCHING+过期lease 回归守卫必须成功")
                     .isEqualTo(1);
         }
     }
@@ -500,7 +505,116 @@ class AgentRunMapperResumeAcceptedPostgresIntegrationTest {
             assertThat(mapper.acceptResumeHandoff(
                     "run-fence-1", accepted.toJson(),
                     "tok-fence", 1L, "owner-fence", 30L))
-                    .as("acceptResumeHandoff: already ACCEPTED must return 0")
+                    .as("acceptResumeHandoff: 已ACCEPTED 必须返回0")
+                    .isZero();
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 约束栅栏：矛盾的 status/state/consumed 组合被拒绝
+    // ------------------------------------------------------------------
+
+    @Test
+    void takeoverRejectsReceivedWithAccepted() {
+        // RECEIVED+ACCEPTED 是矛盾组合（RECEIVED 要求 LAUNCHING+未接受）
+        Instant expiredLease = Instant.now().minusSeconds(10);
+        ToolJobAnchor accepted = resumeAnchor("bad-2:tc-1:1", "ACCEPTED", true);
+        accepted.setResumeToken("tok-bad2");
+        accepted.setResumeLeaseVersion(1);
+        accepted.setResumeLauncherOwnerId("owner-bad2");
+        accepted.setResumeLauncherLeaseUntil(expiredLease);
+        accepted.setResumeClaimedAt(Instant.now().minusSeconds(60));
+        accepted.setResultConsumed(true);
+
+        insertRun("run-bad-2", AgentRunStatus.RECEIVED, accepted.toJson());
+
+        ToolJobAnchor takeover = resumeAnchor("bad-2:tc-1:1", "ACCEPTED", true);
+        takeover.setResumeToken("tok-bad2-new");
+        takeover.setResumeLeaseVersion(2);
+        takeover.setResumeLauncherOwnerId("owner-new");
+        takeover.setResultConsumed(true);
+
+        try (SqlSession session = sqlSessionFactory.openSession(true)) {
+            AgentRunMapper mapper = session.getMapper(AgentRunMapper.class);
+            assertThat(mapper.takeoverExpiredResumeLauncher(
+                    "run-bad-2", takeover.toJson(),
+                    AgentRunStatus.RECEIVED,
+                    "tok-bad2", 1L, "owner-bad2",
+                    "owner-new", 30L, 120L))
+                    .as("takeover: RECEIVED+ACCEPTED 矛盾组合必须返回 0")
+                    .isZero();
+        }
+    }
+
+    @Test
+    void takeoverRejectsExecutingWithLaunchingNotConsumed() {
+        // EXECUTING+LAUNCHING+false 是矛盾组合（EXECUTING 要求 consumed=true）
+        Instant expiredLease = Instant.now().minusSeconds(10);
+        ToolJobAnchor launching = resumeAnchor("bad-3:tc-1:1", "LAUNCHING", false);
+        launching.setResumeToken("tok-bad3");
+        launching.setResumeLeaseVersion(1);
+        launching.setResumeLauncherOwnerId("owner-bad3");
+        launching.setResumeLauncherLeaseUntil(expiredLease);
+        launching.setResumeClaimedAt(Instant.now().minusSeconds(60));
+
+        insertRun("run-bad-3", AgentRunStatus.EXECUTING, launching.toJson());
+
+        ToolJobAnchor takeover = resumeAnchor("bad-3:tc-1:1", "LAUNCHING", false);
+        takeover.setResumeToken("tok-bad3-new");
+        takeover.setResumeLeaseVersion(2);
+        takeover.setResumeLauncherOwnerId("owner-new");
+
+        try (SqlSession session = sqlSessionFactory.openSession(true)) {
+            AgentRunMapper mapper = session.getMapper(AgentRunMapper.class);
+            assertThat(mapper.takeoverExpiredResumeLauncher(
+                    "run-bad-3", takeover.toJson(),
+                    AgentRunStatus.EXECUTING,
+                    "tok-bad3", 1L, "owner-bad3",
+                    "owner-new", 30L, 120L))
+                    .as("takeover: EXECUTING+LAUNCHING+false 矛盾组合必须返回 0")
+                    .isZero();
+        }
+    }
+
+    @Test
+    void heartbeatRejectsReceivedWithAccepted() {
+        // RECEIVED+ACCEPTED 矛盾组合不能续租
+        Instant lease = Instant.now().plusSeconds(60);
+        ToolJobAnchor accepted = resumeAnchor("bad-4:tc-1:1", "ACCEPTED", true);
+        accepted.setResumeToken("tok-bad4");
+        accepted.setResumeLeaseVersion(1);
+        accepted.setResumeLauncherOwnerId("owner-bad4");
+        accepted.setResumeLauncherLeaseUntil(lease);
+        accepted.setResultConsumed(true);
+
+        insertRun("run-bad-4", AgentRunStatus.RECEIVED, accepted.toJson());
+
+        try (SqlSession session = sqlSessionFactory.openSession(true)) {
+            AgentRunMapper mapper = session.getMapper(AgentRunMapper.class);
+            assertThat(mapper.heartbeatResumeLauncher(
+                    "run-bad-4", "tok-bad4", 1L, "owner-bad4", 30L))
+                    .as("heartbeat: RECEIVED+ACCEPTED 矛盾组合必须返回 0")
+                    .isZero();
+        }
+    }
+
+    @Test
+    void heartbeatRejectsExecutingWithLaunchingNotConsumed() {
+        // EXECUTING+LAUNCHING+false 矛盾组合不能续租
+        Instant lease = Instant.now().plusSeconds(60);
+        ToolJobAnchor launching = resumeAnchor("bad-5:tc-1:1", "LAUNCHING", false);
+        launching.setResumeToken("tok-bad5");
+        launching.setResumeLeaseVersion(1);
+        launching.setResumeLauncherOwnerId("owner-bad5");
+        launching.setResumeLauncherLeaseUntil(lease);
+
+        insertRun("run-bad-5", AgentRunStatus.EXECUTING, launching.toJson());
+
+        try (SqlSession session = sqlSessionFactory.openSession(true)) {
+            AgentRunMapper mapper = session.getMapper(AgentRunMapper.class);
+            assertThat(mapper.heartbeatResumeLauncher(
+                    "run-bad-5", "tok-bad5", 1L, "owner-bad5", 30L))
+                    .as("heartbeat: EXECUTING+LAUNCHING+false 矛盾组合必须返回 0")
                     .isZero();
         }
     }
