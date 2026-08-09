@@ -9,11 +9,10 @@ import world.willfrog.alphafrogmicro.agent.idl.GetAgentCreditsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentCreditsResponse;
 
 /**
- * Authoritative frontend boundary for Agent credit admission and reporting.
+ * Agent 积分准入与查询的前端权威边界。
  *
- * <p>Both create-Run admission and {@code /api/agent/credits} use the same
- * langchain response. Local {@code User.credit} is deliberately not consulted
- * here because it does not include the service-side usage calculation.</p>
+ * <p>创建 Run 的准入检查与 {@code /api/agent/credits} 使用同一份 langchain 响应。
+ * 此处不读取本地 {@code User.credit}，因为该字段不包含服务端用量计算结果。</p>
  */
 @Service
 public class AgentCreditGateway {

@@ -7,12 +7,10 @@ import world.willfrog.alphafrogmicro.common.pojo.user.User;
 import world.willfrog.alphafrogmicro.frontend.service.AuthService;
 
 /**
- * Single source for resolving the authenticated Agent API caller.
+ * 解析已认证 Agent API 调用方的单一入口。
  *
- * <p>The database user record, rather than a stale role claim carried by the
- * authentication token, is authoritative for both ownership and admin
- * decisions. A controller resolves this context once per request so a role
- * change cannot produce a mixed user/admin view inside one response.</p>
+ * <p>所有权与管理员判断均以数据库用户记录为准，不采用认证令牌中可能过期的角色声明。
+ * 控制器对每个请求只解析一次该上下文，避免角色变更导致同一响应混用普通用户与管理员视图。</p>
  */
 @Component
 @RequiredArgsConstructor

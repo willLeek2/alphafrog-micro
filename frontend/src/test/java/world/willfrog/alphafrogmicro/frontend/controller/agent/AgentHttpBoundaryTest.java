@@ -5,10 +5,13 @@ import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PutMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 
 import java.lang.reflect.Method;
 import java.util.Arrays;
 import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -64,6 +67,55 @@ class AgentHttpBoundaryTest {
     }
 
     @Test
+    void migratedBoundaryRequestParametersKeepLegacyNamesAndDefaults() throws Exception {
+        Map<String, List<RequestParameterContract>> expected = Map.ofEntries(
+                Map.entry("events", List.of(parameter("after_seq", "0"), parameter("limit", "200"))),
+                Map.entry("timeline", List.of(parameter("after_seq", "0"), parameter("limit", "100"))),
+                Map.entry("observabilityFull", List.of()),
+                Map.entry("traces", List.of(
+                        parameter("type", ""),
+                        parameter("phase", ""),
+                        parameter("after", "0"),
+                        parameter("limit", "100"))),
+                Map.entry("traceDetail", List.of(parameter("full", "false"), parameter("maxPartSize", "0"))),
+                Map.entry("llmCallDetail", List.of(parameter("includeThinking", "false"))),
+                Map.entry("toolCallDetail", List.of()),
+                Map.entry("traceFullParts", List.of(parameter("maxPartSize", "0"))),
+                Map.entry("traceFullPart", List.of(parameter("maxPartSize", "0"))),
+                Map.entry("snapshotParts", List.of(parameter("maxPartSize", "0"))),
+                Map.entry("snapshotPart", List.of(parameter("maxPartSize", "0"))),
+                Map.entry("artifacts", List.of()),
+                Map.entry("artifactParts", List.of(parameter("maxPartSize", "0"))),
+                Map.entry("artifactPart", List.of(parameter("maxPartSize", "0"))),
+                Map.entry("downloadArtifact", List.of()),
+                Map.entry("sendMessage", List.of()),
+                Map.entry("listMessages", List.of(
+                        parameter("limit", "50"),
+                        parameter("offset", "0"),
+                        parameter("include_initial", "true")))
+        );
+
+        Set<String> migratedMethods = new LinkedHashSet<>();
+        for (Class<?> boundary : ListHolder.BOUNDARIES) {
+            for (Method method : boundary.getDeclaredMethods()) {
+                if (!hasHttpMapping(method)) {
+                    continue;
+                }
+                migratedMethods.add(method.getName());
+                Method safeHandler = AgentController.class.getDeclaredMethod(
+                        method.getName(), method.getParameterTypes());
+                List<RequestParameterContract> actual = requestParameters(method);
+                assertEquals(expected.get(method.getName()), actual,
+                        method.getName() + " must preserve the legacy public query contract");
+                assertEquals(requestParameters(safeHandler), actual,
+                        method.getName() + " boundary and safe handler query contracts must match");
+            }
+        }
+        assertEquals(expected.keySet(), migratedMethods,
+                "every migrated endpoint must have an explicit compatibility contract");
+    }
+
+    @Test
     void agentApiControllersDoNotReintroducePrivateAuthResolversOrAdminConstants() {
         for (Class<?> controller : java.util.List.of(
                 AgentController.class,
@@ -114,6 +166,28 @@ class AgentHttpBoundaryTest {
                 || mapping.contains("/snapshot/parts")
                 || mapping.contains("/artifacts")
                 || mapping.contains("/messages");
+    }
+
+    private boolean hasHttpMapping(Method method) {
+        return method.isAnnotationPresent(GetMapping.class)
+                || method.isAnnotationPresent(PostMapping.class)
+                || method.isAnnotationPresent(PutMapping.class)
+                || method.isAnnotationPresent(DeleteMapping.class);
+    }
+
+    private List<RequestParameterContract> requestParameters(Method method) {
+        return Arrays.stream(method.getParameters())
+                .map(parameter -> parameter.getAnnotation(RequestParam.class))
+                .filter(java.util.Objects::nonNull)
+                .map(parameter -> parameter(parameter.value(), parameter.defaultValue()))
+                .toList();
+    }
+
+    private RequestParameterContract parameter(String name, String defaultValue) {
+        return new RequestParameterContract(name, defaultValue);
+    }
+
+    private record RequestParameterContract(String name, String defaultValue) {
     }
 
     private static final class ListHolder {

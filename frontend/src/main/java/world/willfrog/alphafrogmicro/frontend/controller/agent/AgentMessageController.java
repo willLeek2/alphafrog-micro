@@ -13,7 +13,7 @@ import world.willfrog.alphafrogmicro.frontend.model.agent.AgentMessageListRespon
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentMessageSendRequest;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentMessageSendResponse;
 
-/** HTTP boundary for follow-up Agent messages and message history. */
+/** Agent 后续消息与消息历史的 HTTP 边界。 */
 @RestController
 @RequiredArgsConstructor
 public class AgentMessageController {

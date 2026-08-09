@@ -14,7 +14,7 @@ import world.willfrog.alphafrogmicro.frontend.model.agent.TimelineResponse;
 import world.willfrog.alphafrogmicro.frontend.model.agent.TraceDetailResponse;
 import world.willfrog.alphafrogmicro.frontend.model.agent.TraceListResponse;
 
-/** HTTP boundary for Agent observability, trace and timeline views. */
+/** Agent 可观测性、trace 与 timeline 视图的 HTTP 边界。 */
 @RestController
 @RequiredArgsConstructor
 public class AgentObservabilityController {
@@ -37,7 +37,7 @@ public class AgentObservabilityController {
             Authentication authentication,
             @PathVariable("runId") String runId,
             @RequestParam(value = "after_seq", required = false, defaultValue = "0") int afterSeq,
-            @RequestParam(value = "limit", required = false, defaultValue = "200") int limit) {
+            @RequestParam(value = "limit", required = false, defaultValue = "100") int limit) {
         return safeHandlers.timeline(authentication, runId, afterSeq, limit);
     }
 

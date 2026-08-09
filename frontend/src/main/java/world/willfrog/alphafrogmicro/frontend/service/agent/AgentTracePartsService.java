@@ -9,7 +9,7 @@ import java.util.Arrays;
 import java.util.HexFormat;
 import java.util.zip.GZIPOutputStream;
 
-/** Builds deterministic gzip parts for the admin-only full trace API. */
+/** 为仅管理员可用的完整 trace API 构建确定性的 gzip 分片。 */
 @Service
 public class AgentTracePartsService {
 

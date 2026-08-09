@@ -14,7 +14,7 @@ import world.willfrog.alphafrogmicro.frontend.model.agent.AgentSnapshotPartsMeta
 
 import java.util.List;
 
-/** HTTP boundary for snapshot and Artifact payload transfer. */
+/** snapshot 与 Artifact 载荷传输的 HTTP 边界。 */
 @RestController
 @RequiredArgsConstructor
 public class AgentArtifactController {

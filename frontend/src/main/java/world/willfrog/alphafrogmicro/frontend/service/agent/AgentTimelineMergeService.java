@@ -11,7 +11,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 
-/** Traverses safe trace views and merges them into the event timeline. */
+/** 遍历安全 trace 视图，并将其合并到事件 timeline。 */
 @Service
 @RequiredArgsConstructor
 public class AgentTimelineMergeService {
@@ -40,7 +40,7 @@ public class AgentTimelineMergeService {
             append(items, diagnostics.get("toolTraces"), "tool", minEventTime, maxEventTime,
                     traceSeq, maxAdditionalItems);
         } catch (Exception ignored) {
-            // Timeline trace enrichment is optional and must never expose a raw parse fallback.
+            // timeline 的 trace 补充信息是可选项，解析失败时不得暴露原始数据作为降级结果。
         }
     }
 
