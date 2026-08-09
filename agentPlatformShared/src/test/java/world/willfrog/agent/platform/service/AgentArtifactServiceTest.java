@@ -488,6 +488,28 @@ class AgentArtifactServiceTest {
                     return h == null ? 0L : (h.remove(invocation.getArgument(1).toString()) != null ? 1L : 0L);
                 });
 
+        // D22 MUST-FIX：registry 值条件 HDEL 走 Lua execute()，fake 以同步块模拟原子 CAS。
+        Mockito.doAnswer(invocation -> {
+            Object[] args = invocation.getArguments();
+            @SuppressWarnings("unchecked")
+            List<String> keys = (List<String>) args[1];
+            String field = String.valueOf(args[2]);
+            String expected = String.valueOf(args[3]);
+            Map<String, String> h = hashes.get(keys.get(0));
+            if (h == null) {
+                return 0L;
+            }
+            synchronized (h) {
+                if (expected.equals(h.get(field))) {
+                    h.remove(field);
+                    return 1L;
+                }
+                return 0L;
+            }
+        }).when(template).execute(ArgumentMatchers.<org.springframework.data.redis.core.script.RedisScript<Long>>any(),
+                ArgumentMatchers.<List<String>>any(), ArgumentMatchers.<Object>any(),
+                ArgumentMatchers.<Object>any());
+
         SetOperations<String, String> setOps = mock(SetOperations.class);
         when(template.opsForSet()).thenReturn(setOps);
         when(setOps.add(ArgumentMatchers.anyString(), ArgumentMatchers.<String>any()))

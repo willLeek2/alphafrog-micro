@@ -7,12 +7,15 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.Cursor;
 import org.springframework.data.redis.core.ScanOptions;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.storage.AgentStoragePaths;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
@@ -41,21 +44,45 @@ import java.util.concurrent.TimeUnit;
  *   <li>{@link #registerExplicit} / {@link #registerExternalExplicit}：非幂等，runId/userId
  *       显式传入，不依赖 {@link AgentContext} 线程态；每次调用生成新 artifactId。</li>
  *   <li>{@link #registerIdempotent} / {@link #registerExternalIdempotent}：幂等，稳定身份
- *       (runId|type|logicalId[|path]) 经 Redis hash HSETNX 原子抢占；重复注册（重复 list、
- *       重启后 list、admin/normal 双 list）返回同一 artifactId，零重写、零重复项。</li>
+ *       (runId + collision-free 编码的 type/logicalId[/path]) 经 Redis hash HSETNX 原子抢占；
+ *       重复注册（重复 list、重启后 list、admin/normal 双 list）返回同一 artifactId，
+ *       零重写、零重复项。</li>
  *   <li>{@link #listByRunId}：run 级有界索引（SET），只读，不生成新 ID。</li>
  * </ul>
+ *
+ * <h3>幂等抢占协议（单一赢家不变量）</h3>
+ * <p>候选 file + meta 先备好，再经 HSETNX 原子 claim：赢家进入 run 索引（索引失败则
+ * 回滚身份 + 候选并外抛）；输家回滚候选（meta + 文件 + 索引痕迹）后采纳赢家结果。
+ * 因此身份字段恒指向 meta 已落盘的制品——若查无赢家 meta（清理竞态恰好删掉），
+ * 输家用 Lua 值条件 HDEL 原子清陈旧字段后以新候选重试（有界
+ * {@value #MAX_CLAIM_ATTEMPTS} 次，仍不结算则显式失败）。同一身份任意时刻至多
+ * 一份 meta / 一个文件 / 一条 run 索引项。</p>
+ *
+ * <h3>run 级有界索引（硬上限）</h3>
+ * <p>先 SADD 再 SCARD：超限即 SREM 回滚自身加入并抛错——注册失败可见，禁止
+ * silent meta-only 成功；已是成员（added==0）幂等成功。并发超限者可能一并被拒
+ * （保守），但索引绝不超 cap。cap<=0 视为配置错误，fail-closed。</p>
  *
  * <h3>Redis 结构</h3>
  * <ul>
  *   <li>{@code agent:persistent-artifact:{artifactId}} — meta JSON，TTL = ttlHours；</li>
  *   <li>{@code agent:persistent-artifact:run-list:{runId}} — SET，run 的 artifactId 索引，
- *       上限 {@code agent.persistent-artifact.run-list-cap}（默认 1000）；</li>
+ *       硬上限 {@code agent.persistent-artifact.run-list-cap}（默认 1000）；</li>
  *   <li>{@code agent:persistent-artifact:run-identity:{runId}} — hash，幂等身份
- *       field={@code type|logicalId[|path]} → artifactId。</li>
+ *       field={@link #identityField} collision-free 编码 → artifactId。</li>
  * </ul>
  * 注意：后两类键与 meta 共享 {@link #META_PREFIX} 前缀，cleanup 的 SCAN 会命中它们，
  * 循环内按前缀显式跳过（它们不是 meta JSON）。
+ *
+ * <h3>归属校验</h3>
+ * <p>{@link #matchesOwnerStrict}（四值非空且相等，空值 fail-closed）用于 user API 与
+ * 显式上下文路径；{@link #matchesOwnerLenient}（空侧跳过）仅保留给 legacy AgentContext
+ * 入口，user API 不可达。</p>
+ *
+ * <h3>读取入口（TOCTOU 强化）</h3>
+ * <p>{@link #readArtifactBytes} / {@link #readWithinArtifactRoot} / {@link #readContent} /
+ * {@link #readLocator}：读取前 realpath containment 复检 + no-follow 打开 + 哈希校验
+ * （内容制品）。注册后 symlink 换入 / 内容替换在读取时 fail-closed。</p>
  *
  * <h3>D22-5.1.3：external 路径门槛</h3>
  * <p>external 制品只允许落在 D04 批准根内（artifactRoot 或 datasetRoot），
@@ -64,7 +91,8 @@ import java.util.concurrent.TimeUnit;
  * <h3>兼容语义</h3>
  * <p>旧 {@link #register}/{@link #registerExternal} 入口保留为有界兼容 delegate：
  * runId/userId 从 {@link AgentContext} 线程态补齐后转调显式入口。清理（cleanup）
- * 在删除 meta + 文件的同时移除 run 索引与幂等身份字段（同删，不留悬挂引用）。</p>
+ * 在删除 meta + 文件的同时移除 run 索引与幂等身份字段（同删，不留悬挂引用；
+ * 身份字段经值条件 HDEL 原子清除，不误伤并发新抢占）。</p>
  *
  * @author wang
  */
@@ -78,8 +106,20 @@ public class PersistentArtifactRegistry {
     /** run 级 artifactId 索引（SET）。与 meta 共享前缀，cleanup SCAN 时按前缀跳过。 */
     private static final String RUN_LIST_KEY_PREFIX = META_PREFIX + "run-list:";
 
-    /** 幂等身份索引（hash：field type|logicalId[|path] → artifactId）。同上，SCAN 跳过。 */
+    /** 幂等身份索引（hash：field 为 collision-free 长度前缀编码 → artifactId）。同上，SCAN 跳过。 */
     private static final String RUN_IDENTITY_KEY_PREFIX = META_PREFIX + "run-identity:";
+
+    /** 幂等抢占最大尝试次数：遇到陈旧身份（赢家 meta 已被清理）值条件清除后有界重试，仍不结算则显式失败。 */
+    private static final int MAX_CLAIM_ATTEMPTS = 3;
+
+    /**
+     * 原子值条件 HDEL（Lua）：仅当 field 值仍等于期望 artifactId 时删除。
+     * 清理与幂等抢占双方都用它清身份字段，杜绝 get-then-delete 窗口误删并发新抢占。
+     */
+    private static final RedisScript<Long> CONDITIONAL_HDEL_SCRIPT = new DefaultRedisScript<>(
+            "if redis.call('hget', KEYS[1], ARGV[1]) == ARGV[2] then "
+                    + "return redis.call('hdel', KEYS[1], ARGV[1]) else return 0 end",
+            Long.class);
 
     private final StringRedisTemplate redisTemplate;
     private final ObjectMapper objectMapper;
@@ -96,7 +136,7 @@ public class PersistentArtifactRegistry {
     @Value("${agent.persistent-artifact.cleanup-scan-count:500}")
     private int cleanupScanCount;
 
-    /** run 级索引上限：超过后新制品仍可注册/按 ID 访问，只是不进入 listByRunId 索引。 */
+    /** run 级索引硬上限：超限的注册原子拒绝并回滚（可见失败，禁止 silent meta-only 成功）；cap<=0 fail-closed。 */
     @Value("${agent.persistent-artifact.run-list-cap:1000}")
     private int maxRunListEntries;
 
@@ -249,12 +289,27 @@ public class PersistentArtifactRegistry {
     }
 
     /**
-     * 归属校验：meta 的 runId/userId 与调用方匹配（list/download 授权共用此规则）。
+     * 严格归属校验：meta 与调用方的 runId/userId 四值全部非空且相等。
      *
-     * <p>宽容语义与历史数据兼容：meta 侧为空（早期无上下文注册）时不强校验该侧；
-     * 调用方侧为空（内部系统调用）时不校验该侧。两侧都有值则必须相等。</p>
+     * <p>user API（list/download）与显式上下文路径必须走这里——任一侧空值一律拒绝
+     * （fail-closed），不允许空值放行。</p>
      */
-    public static boolean matchesOwner(PersistentArtifactMeta meta, String runId, String userId) {
+    public static boolean matchesOwnerStrict(PersistentArtifactMeta meta, String runId, String userId) {
+        if (meta == null) {
+            return false;
+        }
+        return hasText(runId) && hasText(userId)
+                && hasText(meta.getRunId()) && hasText(meta.getUserId())
+                && meta.getRunId().equals(runId)
+                && meta.getUserId().equals(userId);
+    }
+
+    /**
+     * 宽容归属校验（仅 legacy seam，user API 不可达）：meta 侧为空（早期无上下文注册）
+     * 不强校验该侧；调用方侧为空（内部系统调用）不校验该侧；两侧都有值则必须相等。
+     * 仅供 AgentContext 旧入口兼容历史制品。
+     */
+    public static boolean matchesOwnerLenient(PersistentArtifactMeta meta, String runId, String userId) {
         if (meta == null) {
             return false;
         }
@@ -296,15 +351,50 @@ public class PersistentArtifactRegistry {
         if (Boolean.TRUE.equals(meta.getExternal())) {
             throw new IllegalArgumentException("External artifact has no registry-owned content: " + artifactId);
         }
+        if (!hasText(meta.getPath())) {
+            throw new IllegalArgumentException("Artifact path missing: " + artifactId);
+        }
         touch(meta);
-        return readPath(Path.of(meta.getPath()), meta.getContentHash());
+        Path real = verifyReadablePath(Path.of(meta.getPath()), false);
+        return new String(readBytesChecked(real, meta.getContentHash(), -1L), StandardCharsets.UTF_8);
     }
 
     public String readLocator(RawPayloadLocator locator) {
         if (locator == null || !hasText(locator.getPath())) {
             throw new IllegalArgumentException("Raw payload locator path is required");
         }
-        return readPath(Path.of(locator.getPath()), locator.getContentHash());
+        Path real = verifyReadablePath(Path.of(locator.getPath()), true);
+        return new String(readBytesChecked(real, locator.getContentHash(), -1L), StandardCharsets.UTF_8);
+    }
+
+    /**
+     * 权威字节读取入口（TOCTOU 强化）：读前 realpath containment 复检 + no-follow 打开
+     * + 哈希校验（内容制品）+ touch。external 制品也走这里（user 门面下载不再直读 meta.path）。
+     *
+     * @param maxBytes 读取字节上限，超出抛 {@code IllegalStateException("artifact too large to download")}；
+     *                 <=0 表示不限制
+     */
+    public byte[] readArtifactBytes(String artifactId, long maxBytes) {
+        PersistentArtifactMeta meta = find(artifactId)
+                .orElseThrow(() -> new IllegalArgumentException("Artifact not found: " + artifactId));
+        if (!hasText(meta.getPath())) {
+            throw new IllegalArgumentException("Artifact path missing: " + artifactId);
+        }
+        touch(meta);
+        Path real = verifyReadablePath(Path.of(meta.getPath()), Boolean.TRUE.equals(meta.getExternal()));
+        return readBytesChecked(real, meta.getContentHash(), maxBytes);
+    }
+
+    /**
+     * legacy 快照读取入口（Base64 只读回退用）：路径只允许位于 artifactRoot 内，
+     * 同样走 TOCTOU 强化读取；无 meta，不 touch、不做哈希校验。
+     */
+    public byte[] readWithinArtifactRoot(Path path, long maxBytes) {
+        if (path == null) {
+            throw new IllegalArgumentException("Artifact path is required");
+        }
+        Path real = verifyReadablePath(path, false);
+        return readBytesChecked(real, null, maxBytes);
     }
 
     @Scheduled(initialDelayString = "${agent.persistent-artifact.cleanup-initial-delay-ms:300000}",
@@ -354,34 +444,49 @@ public class PersistentArtifactRegistry {
         if (idempotent) {
             requireRunIdForIdentity(runId);
         }
-        String artifactId = safeType + ":" + UUID.randomUUID().toString().replace("-", "");
-        if (idempotent) {
-            PersistentArtifactRegistration existing = claimIdentity(runId,
-                    identityField(safeType, logicalId, null), artifactId, ttlHours);
-            if (existing != null) {
-                return existing;
-            }
-        }
         byte[] bytes = content == null ? new byte[0] : content.getBytes(StandardCharsets.UTF_8);
         String hash = sha256(bytes);
         Path root = rootPath();
         // D04 §4.3：写入前校验 artifact 根可达（挂载缺失/权限不足 → 显式失败信号）。
         storagePaths.requireWritableRoot(root, AgentStoragePaths.KEY_ARTIFACT_ROOT);
-        Path path = root.resolve(safeType).resolve(artifactId.replace(':', '_') + ".txt").normalize();
-        if (!path.startsWith(root)) {
-            throw new IllegalArgumentException("Artifact path escapes root");
+        String field = idempotent ? identityField(safeType, logicalId, null) : null;
+        for (int attempt = 1; attempt <= MAX_CLAIM_ATTEMPTS; attempt++) {
+            String artifactId = newArtifactId(safeType);
+            Path path = root.resolve(safeType).resolve(artifactId.replace(':', '_') + ".txt").normalize();
+            if (!path.startsWith(root)) {
+                throw new IllegalArgumentException("Artifact path escapes root");
+            }
+            try {
+                Files.createDirectories(path.getParent());
+                Files.write(path, bytes);
+            } catch (IOException e) {
+                throw new IllegalStateException("Failed to write persistent artifact " + artifactId, e);
+            }
+            PersistentArtifactMeta meta = buildMeta(artifactId, safeType, logicalId, displayName, path, hash,
+                    (long) bytes.length, ttlHours, false, true, runId, userId);
+            try {
+                // 候选 meta 先落盘再原子 claim：身份字段恒指向 meta 已写的制品
+                save(meta);
+                if (!idempotent) {
+                    addToRunList(runId, artifactId, ttlHours);
+                    return registration(meta);
+                }
+                CommitOutcome outcome = commitCandidate(runId, field, meta, ttlHours);
+                if (outcome.registration() != null) {
+                    return outcome.registration();
+                }
+                if (!outcome.retry()) {
+                    break;
+                }
+                // 陈旧身份已值条件清除：下一轮以新候选重试
+            } catch (RuntimeException e) {
+                // 注册失败（索引超限 / Redis 故障等）：回滚候选，禁止 meta-only 残留
+                rollbackCandidate(meta);
+                throw e;
+            }
         }
-        try {
-            Files.createDirectories(path.getParent());
-            Files.write(path, bytes);
-        } catch (IOException e) {
-            throw new IllegalStateException("Failed to write persistent artifact " + artifactId, e);
-        }
-        PersistentArtifactMeta meta = buildMeta(artifactId, safeType, logicalId, displayName, path, hash,
-                (long) bytes.length, ttlHours, false, true, runId, userId);
-        save(meta);
-        addToRunList(runId, artifactId, ttlHours);
-        return registration(meta);
+        throw new IllegalStateException("Idempotent artifact claim not settled after " + MAX_CLAIM_ATTEMPTS
+                + " attempts: runId=" + runId + ", identity=" + field);
     }
 
     private PersistentArtifactRegistration doRegisterExternal(String runId,
@@ -403,67 +508,152 @@ public class PersistentArtifactRegistry {
         if (idempotent) {
             requireRunIdForIdentity(runId);
         }
-        String artifactId = safeType + ":" + UUID.randomUUID().toString().replace("-", "");
-        if (idempotent) {
-            PersistentArtifactRegistration existing = claimIdentity(runId,
-                    identityField(safeType, logicalId, normalized.toString()), artifactId, ttlHours);
-            if (existing != null) {
-                return existing;
+        String field = idempotent ? identityField(safeType, logicalId, normalized.toString()) : null;
+        for (int attempt = 1; attempt <= MAX_CLAIM_ATTEMPTS; attempt++) {
+            String artifactId = newArtifactId(safeType);
+            Long size = null;
+            try {
+                if (Files.exists(normalized, LinkOption.NOFOLLOW_LINKS)
+                        && !Files.isDirectory(normalized, LinkOption.NOFOLLOW_LINKS)) {
+                    size = Files.size(normalized);
+                }
+            } catch (IOException e) {
+                log.debug("External artifact size unavailable for {}: {}", normalized, e.getMessage());
+            }
+            PersistentArtifactMeta meta = buildMeta(artifactId, safeType, logicalId, displayName, normalized, null,
+                    size, ttlHours, true, cleanupPath, runId, userId);
+            try {
+                save(meta);
+                if (!idempotent) {
+                    addToRunList(runId, artifactId, ttlHours);
+                    return registration(meta);
+                }
+                CommitOutcome outcome = commitCandidate(runId, field, meta, ttlHours);
+                if (outcome.registration() != null) {
+                    return outcome.registration();
+                }
+                if (!outcome.retry()) {
+                    break;
+                }
+            } catch (RuntimeException e) {
+                rollbackCandidate(meta);
+                throw e;
             }
         }
-        Long size = null;
-        try {
-            if (Files.exists(normalized, LinkOption.NOFOLLOW_LINKS) && !Files.isDirectory(normalized, LinkOption.NOFOLLOW_LINKS)) {
-                size = Files.size(normalized);
-            }
-        } catch (IOException e) {
-            log.debug("External artifact size unavailable for {}: {}", normalized, e.getMessage());
-        }
-        PersistentArtifactMeta meta = buildMeta(artifactId, safeType, logicalId, displayName, normalized, null,
-                size, ttlHours, true, cleanupPath, runId, userId);
-        save(meta);
-        addToRunList(runId, artifactId, ttlHours);
-        return registration(meta);
+        throw new IllegalStateException("Idempotent artifact claim not settled after " + MAX_CLAIM_ATTEMPTS
+                + " attempts: runId=" + runId + ", identity=" + field);
+    }
+
+    /** 抢占结算结果：registration 非空 = 已结算（候选胜出或采纳赢家）；retry = 陈旧身份已清，以新候选重试。 */
+    private record CommitOutcome(PersistentArtifactRegistration registration, boolean retry) {
     }
 
     /**
-     * 幂等身份原子抢占：HSETNX 成功 → 返回 null（调用方继续写文件 + meta）；
-     * 失败（已有赢家）→ 读赢家 artifactId，meta 有效则直接返回既有注册（零重写）；
-     * 赢家 meta 已失效（极端竞态：清理恰好删掉）→ 覆盖残留字段后按新注册继续。
+     * 候选原子结算（候选 file + meta 必须已备好，{@value #MAX_CLAIM_ATTEMPTS} 次尝试协议）。
+     *
+     * <p>HSETNX claim 成功 → 赢家：meta 已落盘，进入 run 索引；索引失败（cap 超限等）则
+     * 值条件清身份 + 回滚候选 + 原样外抛（注册失败可见）。claim 失败 → 输家：回滚候选
+     * （零残留）后采纳赢家；赢家 meta 已被清理（身份字段成为陈旧悬挂）时用值条件 HDEL
+     * 原子清除并返回 retry=true——身份恒指向 meta 已落盘制品，清陈旧不伤及任何活制品。</p>
      */
-    private PersistentArtifactRegistration claimIdentity(String runId, String field,
-                                                         String candidateArtifactId, long ttlHours) {
+    private CommitOutcome commitCandidate(String runId, String field, PersistentArtifactMeta candidateMeta,
+                                          long ttlHours) {
+        String candidateArtifactId = candidateMeta.getArtifactId();
         String identityKey = runIdentityKey(runId);
         Boolean claimed = redisTemplate.opsForHash().putIfAbsent(identityKey, field, candidateArtifactId);
         if (Boolean.TRUE.equals(claimed)) {
-            extendTtlIfNeeded(identityKey, ttlHours);
-            return null;
+            try {
+                extendTtlIfNeeded(identityKey, ttlHours);
+                addToRunList(runId, candidateArtifactId, ttlHours);
+            } catch (RuntimeException e) {
+                removeIdentityIfMatches(runId, field, candidateArtifactId);
+                rollbackCandidate(candidateMeta);
+                throw e;
+            }
+            return new CommitOutcome(registration(candidateMeta), false);
         }
+        // 输家：候选零残留，然后采纳赢家
+        rollbackCandidate(candidateMeta);
         Object winnerId = redisTemplate.opsForHash().get(identityKey, field);
         if (winnerId != null) {
             Optional<PersistentArtifactMeta> winnerMeta = find(winnerId.toString());
             if (winnerMeta.isPresent()) {
-                return registration(winnerMeta.get());
+                return new CommitOutcome(registration(winnerMeta.get()), false);
             }
+            // 赢家 meta 已被清理：原子值条件清陈旧字段，调用方以新候选重试
+            removeIdentityIfMatches(runId, field, winnerId.toString());
         }
-        // 残留身份（赢家 meta 已被清理）：覆盖后按新注册继续，索引随 cleanup 自愈。
-        redisTemplate.opsForHash().put(identityKey, field, candidateArtifactId);
-        extendTtlIfNeeded(identityKey, ttlHours);
-        return null;
+        return new CommitOutcome(null, true);
     }
 
+    /**
+     * 原子值条件清除身份字段：仅当 field 仍指向 expectedArtifactId 时删除
+     * （Lua {@link #CONDITIONAL_HDEL_SCRIPT}），防止 get-then-delete 窗口误删并发新抢占。
+     */
+    private void removeIdentityIfMatches(String runId, String field, String expectedArtifactId) {
+        try {
+            redisTemplate.execute(CONDITIONAL_HDEL_SCRIPT, List.of(runIdentityKey(runId)),
+                    field, expectedArtifactId);
+        } catch (Exception e) {
+            log.warn("Failed to clear artifact identity conditionally: runId={} artifactId={} err={}",
+                    runId, expectedArtifactId, e.getMessage());
+        }
+    }
+
+    /**
+     * 候选注册回滚：删 meta 与索引痕迹；内容制品删自有文件，external 制品绝不触碰底层路径
+     * （注册失败不得删除调用方文件，即使 cleanupPath=true）。
+     */
+    private void rollbackCandidate(PersistentArtifactMeta meta) {
+        if (meta == null || !hasText(meta.getArtifactId())) {
+            return;
+        }
+        try {
+            redisTemplate.delete(key(meta.getArtifactId()));
+        } catch (Exception e) {
+            log.warn("Failed to roll back artifact meta {}: {}", meta.getArtifactId(), e.getMessage());
+        }
+        removeFromIndices(meta);
+        if (Boolean.TRUE.equals(meta.getExternal()) || !hasText(meta.getPath())) {
+            return;
+        }
+        Path path = Path.of(meta.getPath()).toAbsolutePath().normalize();
+        if (!path.startsWith(rootPath())) {
+            return;
+        }
+        deletePath(path);
+    }
+
+    /**
+     * run 级索引原子有界加入：先 SADD（added==0 → 已是成员，幂等成功），再 SCARD；
+     * 超限即 SREM 回滚自身加入并抛错——禁止 silent meta-only 成功。并发超限者可能
+     * 一并被拒（保守），但索引绝不超 cap。cap<=0 视为配置错误，fail-closed。
+     */
     private void addToRunList(String runId, String artifactId, long ttlHours) {
         if (!hasText(runId)) {
             return;
         }
+        if (maxRunListEntries <= 0) {
+            throw new IllegalStateException(
+                    "Run artifact index capacity must be positive: cap=" + maxRunListEntries);
+        }
         String listKey = runListKey(runId);
-        Long size = redisTemplate.opsForSet().size(listKey);
-        if (size != null && maxRunListEntries > 0 && size >= maxRunListEntries) {
-            log.warn("Run artifact index full, skip indexing: runId={} artifactId={} cap={}",
-                    runId, artifactId, maxRunListEntries);
+        Long added = redisTemplate.opsForSet().add(listKey, artifactId);
+        if (added == null || added == 0L) {
+            extendTtlIfNeeded(listKey, ttlHours);
             return;
         }
-        redisTemplate.opsForSet().add(listKey, artifactId);
+        Long size = redisTemplate.opsForSet().size(listKey);
+        if (size != null && size > maxRunListEntries) {
+            try {
+                redisTemplate.opsForSet().remove(listKey, artifactId);
+            } catch (Exception e) {
+                log.warn("Failed to roll back run index entry: runId={} artifactId={} err={}",
+                        runId, artifactId, e.getMessage());
+            }
+            throw new IllegalStateException(
+                    "Run artifact index capacity exceeded: runId=" + runId + " cap=" + maxRunListEntries);
+        }
         extendTtlIfNeeded(listKey, ttlHours);
     }
 
@@ -528,10 +718,29 @@ public class PersistentArtifactRegistry {
         }
     }
 
-    /** 幂等身份字段：内容制品 type|logicalId；external 制品 type|logicalId|normalizedPath。 */
-    private static String identityField(String artifactType, String logicalId, String externalPath) {
-        String base = artifactType + "|" + logicalId;
-        return externalPath == null ? base : base + "|" + externalPath;
+    /**
+     * 幂等身份字段（collision-free 编码，registry 与 user 门面共用唯一实现）：
+     * 每个段编码为 {@code 长度:值|}，任意不同 (type, logicalId[, path]) 组合的编码必不相同。
+     * 例：{@code ("a|b","c")} → {@code 3:a|b|1:c|}；{@code ("a","b|c")} → {@code 1:a|3:b|c|}。
+     * 内容制品两段；external 制品追加 normalizedPath 第三段。
+     */
+    public static String identityField(String artifactType, String logicalId, String externalPath) {
+        StringBuilder sb = new StringBuilder();
+        appendIdentitySegment(sb, artifactType);
+        appendIdentitySegment(sb, logicalId);
+        if (externalPath != null) {
+            appendIdentitySegment(sb, externalPath);
+        }
+        return sb.toString();
+    }
+
+    private static void appendIdentitySegment(StringBuilder sb, String segment) {
+        String value = segment == null ? "" : segment;
+        sb.append(value.length()).append(':').append(value).append('|');
+    }
+
+    private static String newArtifactId(String safeType) {
+        return safeType + ":" + UUID.randomUUID().toString().replace("-", "");
     }
 
     private PersistentArtifactMeta buildMeta(String artifactId,
@@ -608,7 +817,8 @@ public class PersistentArtifactRegistry {
 
     /**
      * D22-5.1.3：过期清理同删 run 索引与幂等身份字段，不留悬挂引用。
-     * 身份字段仅在仍指向本 artifactId 时删除（避免误删并发新注册抢占的字段）。
+     * 身份字段经值条件 HDEL 原子清除（仅在仍指向本 artifactId 时删除），
+     * 避免误删并发新注册抢占的字段。
      */
     private void removeFromIndices(PersistentArtifactMeta meta) {
         String runId = meta.getRunId();
@@ -621,18 +831,8 @@ public class PersistentArtifactRegistry {
             log.warn("Failed to remove artifact from run index: runId={} artifactId={} err={}",
                     runId, meta.getArtifactId(), e.getMessage());
         }
-        String field = identityField(meta.getArtifactType(), meta.getLogicalId(),
-                Boolean.TRUE.equals(meta.getExternal()) ? meta.getPath() : null);
-        String identityKey = runIdentityKey(runId);
-        try {
-            Object current = redisTemplate.opsForHash().get(identityKey, field);
-            if (current != null && meta.getArtifactId().equals(current.toString())) {
-                redisTemplate.opsForHash().delete(identityKey, field);
-            }
-        } catch (Exception e) {
-            log.warn("Failed to remove artifact identity: runId={} artifactId={} err={}",
-                    runId, meta.getArtifactId(), e.getMessage());
-        }
+        removeIdentityIfMatches(runId, identityField(meta.getArtifactType(), meta.getLogicalId(),
+                Boolean.TRUE.equals(meta.getExternal()) ? meta.getPath() : null), meta.getArtifactId());
     }
 
     private void deletePath(Path path) {
@@ -643,22 +843,53 @@ public class PersistentArtifactRegistry {
         }
     }
 
-    private String readPath(Path path, String expectedHash) {
+    /**
+     * 读取前路径复检（TOCTOU 强化）：规范化 containment（内容制品仅 artifactRoot；
+     * external 另许 datasetRoot）→ realpath 解析（不存在即失败）→ 真实位置仍须位于
+     * 批准根内（根自身亦解析 symlink）。任一步失败即 fail-closed。
+     */
+    private Path verifyReadablePath(Path path, boolean externalAllowed) {
         Path normalized = path.toAbsolutePath().normalize();
-        if (!normalized.startsWith(rootPath())) {
-            throw new IllegalArgumentException("Raw payload path escapes artifact root");
+        Path artifactRoot = rootPath();
+        Path datasetRoot = storagePaths.datasetRoot().toAbsolutePath().normalize();
+        if (!normalized.startsWith(artifactRoot) && !(externalAllowed && normalized.startsWith(datasetRoot))) {
+            throw new IllegalArgumentException("Artifact path escapes approved storage roots: " + normalized);
         }
+        Path real;
         try {
-            byte[] bytes = Files.readAllBytes(normalized);
-            if (hasText(expectedHash)) {
-                String actual = sha256(bytes);
-                if (!expectedHash.equals(actual)) {
-                    throw new IllegalStateException("Raw payload hash mismatch");
-                }
-            }
-            return new String(bytes, StandardCharsets.UTF_8);
+            real = normalized.toRealPath();
         } catch (IOException e) {
-            throw new IllegalStateException("Failed to read raw payload " + normalized, e);
+            throw new IllegalStateException("Failed to resolve artifact path: " + normalized, e);
+        }
+        Path realArtifactRoot = toRealPathIfPossible(artifactRoot);
+        Path realDatasetRoot = toRealPathIfPossible(datasetRoot);
+        if (!real.startsWith(realArtifactRoot) && !(externalAllowed && real.startsWith(realDatasetRoot))) {
+            throw new SecurityException("Artifact path resolves outside approved storage roots: " + normalized);
+        }
+        // 复检通过后返回规范化原路径：随后按 no-follow 打开原路径，
+        // 注册后把路径换成 symlink 的 TOCTOU 攻击会在打开时 fail-closed。
+        return normalized;
+    }
+
+    /** no-follow 打开原路径 + 大小上限 + 哈希校验（如有）；任何异常 fail-closed。 */
+    private byte[] readBytesChecked(Path openPath, String expectedHash, long maxBytes) {
+        try {
+            long size = Files.size(openPath);
+            if (maxBytes > 0 && size > maxBytes) {
+                throw new IllegalStateException("artifact too large to download");
+            }
+            byte[] bytes;
+            try (InputStream in = Files.newInputStream(openPath, LinkOption.NOFOLLOW_LINKS)) {
+                bytes = in.readAllBytes();
+            }
+            if (hasText(expectedHash) && !expectedHash.equals(sha256(bytes))) {
+                throw new IllegalStateException("Raw payload hash mismatch");
+            }
+            return bytes;
+        } catch (IllegalStateException e) {
+            throw e;
+        } catch (IOException e) {
+            throw new IllegalStateException("Failed to read artifact " + openPath, e);
         }
     }
 

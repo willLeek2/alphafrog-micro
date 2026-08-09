@@ -16,6 +16,7 @@ import world.willfrog.alphafrogmicro.agent.idl.AgentArtifactMessage;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
@@ -56,7 +57,7 @@ import java.util.stream.Stream;
  * </ol>
  *
  * <h3>load/download 面（Registry-first）</h3>
- * <p>先 {@link PersistentArtifactRegistry#find} + {@link PersistentArtifactRegistry#matchesOwner}
+ * <p>先 {@link PersistentArtifactRegistry#find} + {@link PersistentArtifactRegistry#matchesOwnerStrict}
  * 归属校验；事件派生类型额外要求事件侧重放命中（retention/success-only 语义保持）。
  * 仅当 registry miss 时才允许对历史 Base64 {@code type|runId|ref} 格式 ID 做
  * <b>只读回退</b>：按旧快照位置读取内容，回退路径不写文件、不注册新制品。</p>
@@ -144,19 +145,22 @@ public class AgentArtifactService {
 
         Map<String, EventDerivedCandidate> candidateByIdentity = new HashMap<>();
         for (EventDerivedCandidate candidate : candidates) {
-            candidateByIdentity.put(candidate.type() + "|" + candidate.logicalId(), candidate);
+            candidateByIdentity.put(
+                    PersistentArtifactRegistry.identityField(candidate.type(), candidate.logicalId(), null),
+                    candidate);
         }
 
         List<RankedArtifact> ranked = new ArrayList<>();
         for (PersistentArtifactMeta meta : listed) {
-            if (!PersistentArtifactRegistry.matchesOwner(meta, runId, userId)) {
+            if (!PersistentArtifactRegistry.matchesOwnerStrict(meta, runId, userId)) {
                 continue;
             }
             if (EVENT_DERIVED_TYPES.contains(meta.getArtifactType())) {
                 // success-only 过滤：当前 scope 未重放出来的事件派生项不可见（normal 下的失败脚本、
                 // 事件源缺失时的全部事件派生项——与降级前 resolveArtifacts 语义一致）。
-                EventDerivedCandidate candidate =
-                        candidateByIdentity.get(meta.getArtifactType() + "|" + meta.getLogicalId());
+                EventDerivedCandidate candidate = candidateByIdentity.get(
+                        PersistentArtifactRegistry.identityField(
+                                meta.getArtifactType(), meta.getLogicalId(), null));
                 if (candidate == null) {
                     continue;
                 }
@@ -240,7 +244,7 @@ public class AgentArtifactService {
         Optional<PersistentArtifactMeta> found = artifactRegistry.find(artifactId);
         if (found.isPresent()) {
             PersistentArtifactMeta meta = found.get();
-            if (!PersistentArtifactRegistry.matchesOwner(meta, runId, userId)) {
+            if (!PersistentArtifactRegistry.matchesOwnerStrict(meta, runId, userId)) {
                 throw new IllegalArgumentException("artifact not found");
             }
             String filename;
@@ -417,20 +421,16 @@ public class AgentArtifactService {
         return registered;
     }
 
-    /** 与 registry 幂等身份字段一致：内容制品 type|logicalId；external 制品 type|logicalId|normalizedPath。 */
+    /** 幂等身份与 registry 共用唯一 collision-free 编码（{@link PersistentArtifactRegistry#identityField}）。 */
     private static String candidateIdentityOf(EventDerivedCandidate candidate) {
-        if (candidate.externalPath() == null) {
-            return candidate.type() + "|" + candidate.logicalId();
-        }
-        return candidate.type() + "|" + candidate.logicalId() + "|"
-                + candidate.externalPath().toAbsolutePath().normalize();
+        return PersistentArtifactRegistry.identityField(candidate.type(), candidate.logicalId(),
+                candidate.externalPath() == null ? null
+                        : candidate.externalPath().toAbsolutePath().normalize().toString());
     }
 
     private static String registryIdentityOf(PersistentArtifactMeta meta) {
-        if (Boolean.TRUE.equals(meta.getExternal())) {
-            return meta.getArtifactType() + "|" + meta.getLogicalId() + "|" + meta.getPath();
-        }
-        return meta.getArtifactType() + "|" + meta.getLogicalId();
+        return PersistentArtifactRegistry.identityField(meta.getArtifactType(), meta.getLogicalId(),
+                Boolean.TRUE.equals(meta.getExternal()) ? meta.getPath() : null);
     }
 
     /** 注册 TTL 取两档 retention 的长档；配置 <=0（永不过期）时取一年上界。 */
@@ -460,17 +460,11 @@ public class AgentArtifactService {
         if (meta.getPath() == null || meta.getPath().isBlank()) {
             throw new IllegalArgumentException("artifact source not found");
         }
-        Path path = Path.of(meta.getPath());
+        // D22 MUST-FIX ④：内容/external 一律经 registry 权威读取——读前 realpath containment
+        // 复检 + no-follow 打开 + 哈希校验（TOCTOU 强化），门面不再直读 meta.path。
+        long maxBytes = enforceDownloadMaxBytes ? downloadMaxBytes : -1L;
         try {
-            long size = Files.size(path);
-            if (enforceDownloadMaxBytes && downloadMaxBytes > 0 && size > downloadMaxBytes) {
-                throw new IllegalStateException("artifact too large to download");
-            }
-            if (Boolean.TRUE.equals(meta.getExternal())) {
-                return Files.readAllBytes(path);
-            }
-            // registry-owned 内容制品经 registry 读取（哈希校验 + touch）
-            return artifactRegistry.readContent(meta.getArtifactId()).getBytes(StandardCharsets.UTF_8);
+            return artifactRegistry.readArtifactBytes(meta.getArtifactId(), maxBytes);
         } catch (IllegalStateException e) {
             throw e;
         } catch (Exception e) {
@@ -547,16 +541,17 @@ public class AgentArtifactService {
     }
 
     private byte[] readLegacyFile(Path file, boolean enforceDownloadMaxBytes) {
+        // D22 MUST-FIX ④：legacy 快照读取收回 registry 权威 seam；门面侧先做 no-follow
+        // 常规文件预检（symlink/目录 fail-closed），再经 registry 复检读取。
+        if (!Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS)) {
+            throw new IllegalArgumentException("artifact not found");
+        }
+        long maxBytes = enforceDownloadMaxBytes ? downloadMaxBytes : -1L;
         try {
-            if (!Files.isRegularFile(file)) {
-                throw new IllegalArgumentException("artifact not found");
-            }
-            long size = Files.size(file);
-            if (enforceDownloadMaxBytes && downloadMaxBytes > 0 && size > downloadMaxBytes) {
-                throw new IllegalStateException("artifact too large to download");
-            }
-            return Files.readAllBytes(file);
-        } catch (IllegalArgumentException | IllegalStateException e) {
+            return artifactRegistry.readWithinArtifactRoot(file, maxBytes);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("artifact not found");
+        } catch (IllegalStateException e) {
             throw e;
         } catch (Exception e) {
             throw new IllegalStateException("read artifact failed", e);

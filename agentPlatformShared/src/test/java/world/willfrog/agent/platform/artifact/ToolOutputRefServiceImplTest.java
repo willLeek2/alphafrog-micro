@@ -132,6 +132,38 @@ class ToolOutputRefServiceImplTest {
     }
 
     @Test
+    void explicitReadShouldRejectWhenCallerContextMissing() {
+        // D22-5.1.3 MUST-FIX ③：显式入口严格校验——调用方任一值为空即拒（fail-closed）
+        PersistentArtifactRegistration registration =
+                service.registerRawOutput("run-x", "user-x", "tool-x", "工具输出", "payload");
+        String rawRef = registration.getArtifactId();
+
+        assertThrows(IllegalArgumentException.class,
+                () -> service.read(null, "user-x", rawRef, 0, 100, null));
+        assertThrows(IllegalArgumentException.class,
+                () -> service.read("run-x", " ", rawRef, 0, 100, null));
+        assertThrows(IllegalArgumentException.class,
+                () -> service.locatorFor(null, "user-x", rawRef));
+    }
+
+    @Test
+    void legacyReadShouldStayLenientForContextlessArtifactWhileExplicitRejects() {
+        // D22-5.1.3 MUST-FIX ③：legacy seam 宽容（历史无上下文制品仍可读），显式入口严格拒绝
+        AgentContext.clear();
+        PersistentArtifactRegistration registration =
+                service.registerRawOutput("tool-legacy", "旧输出", "legacy-payload");
+        AgentContext.setRunId("run-1");
+        AgentContext.setUserId("user-1");
+
+        ToolOutputReadResult legacyRead = service.read(registration.getArtifactId(), 0, 100, null);
+        // setUp 的 reread maxLimit=8 把 limit 截顶到 8 字符，故期望前 8 字符而非全文。
+        assertEquals("legacy-p", legacyRead.getContent());
+
+        assertThrows(IllegalArgumentException.class, () -> service.read(
+                "run-1", "user-1", registration.getArtifactId(), 0, 100, null));
+    }
+
+    @Test
     void cleanupExpiredArtifactsShouldDeleteOwnedFileAndMeta() throws Exception {
         PersistentArtifactRegistration registration = registry.register("raw-ref", "tool-1", "工具输出", "payload", 1);
         PersistentArtifactMeta meta = registry.find(registration.getArtifactId()).orElseThrow();
@@ -224,6 +256,30 @@ class ToolOutputRefServiceImplTest {
                     Map<String, String> h = hashes.get(invocation.getArgument(0));
                     return h == null ? 0L : (h.remove(invocation.getArgument(1).toString()) != null ? 1L : 0L);
                 });
+
+        // D22-5.1.3 MUST-FIX：registry 值条件 HDEL 走 Lua execute()，fake 以同步块模拟原子 CAS。
+        org.mockito.Mockito.doAnswer(invocation -> {
+            Object[] args = invocation.getArguments();
+            @SuppressWarnings("unchecked")
+            java.util.List<String> keys = (java.util.List<String>) args[1];
+            String field = String.valueOf(args[2]);
+            String expected = String.valueOf(args[3]);
+            Map<String, String> h = hashes.get(keys.get(0));
+            if (h == null) {
+                return 0L;
+            }
+            synchronized (h) {
+                if (expected.equals(h.get(field))) {
+                    h.remove(field);
+                    return 1L;
+                }
+                return 0L;
+            }
+        }).when(template).execute(
+                org.mockito.ArgumentMatchers.<org.springframework.data.redis.core.script.RedisScript<Long>>any(),
+                org.mockito.ArgumentMatchers.<java.util.List<String>>any(),
+                org.mockito.ArgumentMatchers.<Object>any(),
+                org.mockito.ArgumentMatchers.<Object>any());
 
         SetOperations<String, String> setOps = mock(SetOperations.class);
         when(template.opsForSet()).thenReturn(setOps);
