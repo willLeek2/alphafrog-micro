@@ -47,7 +47,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * 与上下游协作关系：
  * <ul>
  *   <li>上游调度：由 {@link LangchainDagWorkflowExecutor} 决定什么时候调用本类（依赖图就绪后并发调度）；</li>
- *   <li>Prompt 来源：{@link AgentPromptService#dagReactSystemPrompt()} 提供系统提示词（system prompt），包含时间基准、角色设定、工具使用规范；</li>
+ *   <li>Prompt 来源：{@link AgentPromptService#reactSystemPrompt()} 只提供稳定时间与全局规则；Todo 与工具能力通过 User 阶段说明注入；</li>
  *   <li>消息拼装：{@link LangchainTodoUserMessageBuilder} 负责把 todo 描述、已完成 todo 列表、dataset refs 拼成 user message；</li>
  *   <li>预算/观测：{@link AtomicInteger} toolCalls 由上游传入，用于累加 run 级别的总工具调用次数；{@link AgentContext} 用于注入 tracing/observability 上下文。</li>
  * </ul>

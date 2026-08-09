@@ -156,7 +156,7 @@ public class AgentContext {
     /**
      * 90% last-mile hint：当本 run 的任意预算维度首次跨过 90% 时，
      * {@code AgentRunBudgetService} 写入一段中文提示文本到本 ThreadLocal；
-     * 下一次 {@code LangchainTodoNodeExecutor} 的 {@code chatRequestTransformer} 读取并注入到 SystemMessage，
+     * 下一次 {@code LangchainTodoNodeExecutor} 的 {@code chatRequestTransformer} 读取并追加为 UserMessage，
      * 促使 LLM 在剩余预算内尽快给出最终结论。
      * <p>字符串内容由 budget service 拼装（含维度名 / 实际值 / 上限 / 建议话术），
      * transformer 只负责"读到就注入、读不到就透传"。</p>
@@ -600,7 +600,7 @@ public class AgentContext {
 
     /**
      * 设置 90% last-mile hint 文本（由 {@code AgentRunBudgetService} 在首次跨过 90% 阈值时调用）。
-     * 空白值等价于清理,避免误把空字符串当成有效 hint 注入到 SystemMessage。
+     * 空白值等价于清理,避免误把空字符串当成有效 User 阶段说明。
      */
     public static void setLastMileHint(String hint) {
         if (hint == null || hint.isBlank()) {
@@ -613,7 +613,7 @@ public class AgentContext {
     /**
      * 获取 90% last-mile hint,可能为 null(未设置或已清理)。
      * 由 {@code LangchainTodoNodeExecutor#chatRequestTransformer} 读取,
-     * 读到非空字符串时拼接到 SystemMessage 末尾促使 LLM 尽快给出最终结论。
+     * 读到非空字符串时追加为 UserMessage，促使 LLM 尽快给出最终结论且不改写稳定 System。
      */
     public static String getLastMileHint() {
         return LAST_MILE_HINT_HOLDER.get();
