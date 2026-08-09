@@ -85,11 +85,15 @@ class ToolJobFinalizerCanceledGuardTest {
         when(usageHook.upsertUsage(eq("run-2"), any())).thenReturn(true);
         ToolJobEventHook eventHook = mock(ToolJobEventHook.class);
         when(eventHook.emitTerminalEvent(eq("run-2"), any())).thenReturn(true);
+        AgentRunMapper runMapper = mock(AgentRunMapper.class);
+        AgentRunFinalizationService finalizationService = mock(AgentRunFinalizationService.class);
 
         ToolJobFinalizer finalizer = new ToolJobFinalizer(
                 anchorService, redisCache,
                 mock(DataAnalysisCapacityService.class), mock(ToolJobResumeService.class),
-                mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
+                mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class),
+                mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class),
+                mock(FinanceResultModelAdapter.class), runMapper, finalizationService);
         inject(finalizer, "usageHook", usageHook);
         inject(finalizer, "eventHook", eventHook);
 
@@ -105,6 +109,7 @@ class ToolJobFinalizerCanceledGuardTest {
         // Must NOT call updateAnchorAndStatus on reentry
         verify(anchorService, never()).updateAnchorAndStatus(eq("run-2"), any(ToolJobAnchor.class),
                 eq(AgentRunStatus.CANCELED), eq(AgentRunStatus.WAITING_TOOL_JOB));
+        verifyNoInteractions(runMapper, finalizationService);
         // Must still clear Redis
         verify(redisCache).removeDue("run-2");
         verify(redisCache).deletePendingCache("run-2");

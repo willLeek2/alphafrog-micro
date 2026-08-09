@@ -4,11 +4,9 @@ import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.springframework.context.ApplicationEventPublisher;
 
-import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -41,16 +39,5 @@ class AgentRunFinalizationServiceTest {
         service.publishFinalizedEvent("run-user", "not-a-number", "EXPIRED");
 
         verify(publisher, never()).publishEvent(org.mockito.ArgumentMatchers.any(Object.class));
-    }
-
-    @Test
-    void listenerFailureNeverEscapesAfterTerminalStateWasPersisted() {
-        ApplicationEventPublisher publisher = mock(ApplicationEventPublisher.class);
-        AgentRunFinalizedEvent expected = new AgentRunFinalizedEvent("run-c", 7L, "CANCELED", false);
-        doThrow(new RuntimeException("listener unavailable")).when(publisher).publishEvent(expected);
-        AgentRunFinalizationService service = new AgentRunFinalizationService(publisher);
-
-        assertDoesNotThrow(() -> service.publishFinalizedEvent("run-c", "7", "CANCELED"));
-        verify(publisher).publishEvent(expected);
     }
 }

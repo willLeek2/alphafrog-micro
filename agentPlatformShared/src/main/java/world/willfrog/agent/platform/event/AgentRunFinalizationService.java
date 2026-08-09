@@ -64,13 +64,6 @@ public class AgentRunFinalizationService {
         boolean conservative = "EXPIRED".equals(status);
         log.info("Publishing AgentRunFinalizedEvent: runId={} userId={} status={} conservative={}",
                 runId, uid, status, conservative);
-        try {
-            publisher.publishEvent(new AgentRunFinalizedEvent(runId, uid, status, conservative));
-        } catch (RuntimeException e) {
-            // Workspace dump 还有数据库 polling 兜底。事件监听失败不能反向破坏已经持久化的
-            // Run 终态，否则调用方会把“dump 触发失败”误当成“终态写入失败”并重复业务收口。
-            log.error("publishFinalizedEvent failed after terminal state persisted: "
-                    + "runId={} userId={} status={}", runId, uid, status, e);
-        }
+        publisher.publishEvent(new AgentRunFinalizedEvent(runId, uid, status, conservative));
     }
 }

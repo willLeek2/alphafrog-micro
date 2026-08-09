@@ -99,11 +99,12 @@ class LangchainRunReadServiceTest {
     @Test
     void getRunPublishesExpiredOnlyAfterTerminalStateIsPersisted() {
         AgentRun active = run("{\"run_provider\":\"langchain\"}");
-        active.setStatus(AgentRunStatus.COMPLETED);
+        active.setStatus(AgentRunStatus.CANCELED);
         AgentRun expired = run("{\"run_provider\":\"langchain\"}");
         expired.setStatus(AgentRunStatus.EXPIRED);
         when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(active, expired);
         when(eventService.shouldMarkExpired(active)).thenReturn(true);
+        when(runMapper.updateStatus("r1", "u1", AgentRunStatus.EXPIRED)).thenReturn(1);
 
         var message = service.getRun(GetAgentRunRequest.newBuilder()
                 .setUserId("u1")
@@ -116,6 +117,62 @@ class LangchainRunReadServiceTest {
         order.verify(eventService).append(eq("r1"), eq("u1"), eq("RUN_EXPIRED"), anyMap());
         order.verify(stateStore).markRunStatus("r1", "EXPIRED");
         order.verify(finalizationService).publishFinalizedEvent("r1", "u1", "EXPIRED");
+    }
+
+    @Test
+    void getRunPublisherFailureDoesNotRollbackPersistedExpiredState() {
+        AgentRun active = run("{\"run_provider\":\"langchain\"}");
+        active.setStatus(AgentRunStatus.CANCELED);
+        AgentRun expired = run("{\"run_provider\":\"langchain\"}");
+        expired.setStatus(AgentRunStatus.EXPIRED);
+        when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(active, expired);
+        when(eventService.shouldMarkExpired(active)).thenReturn(true);
+        when(runMapper.updateStatus("r1", "u1", AgentRunStatus.EXPIRED)).thenReturn(1);
+        doThrow(new RuntimeException("listener unavailable"))
+                .when(finalizationService).publishFinalizedEvent("r1", "u1", "EXPIRED");
+
+        var message = service.getRun(GetAgentRunRequest.newBuilder()
+                .setUserId("u1")
+                .setId("r1")
+                .build());
+
+        assertEquals("EXPIRED", message.getStatus());
+        verify(runMapper).updateStatus("r1", "u1", AgentRunStatus.EXPIRED);
+        verify(finalizationService).publishFinalizedEvent("r1", "u1", "EXPIRED");
+    }
+
+    @Test
+    void getRunExpiredPersistenceMismatchDoesNotPublish() {
+        AgentRun active = run("{\"run_provider\":\"langchain\"}");
+        active.setStatus(AgentRunStatus.CANCELED);
+        when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(active);
+        when(eventService.shouldMarkExpired(active)).thenReturn(true);
+        when(runMapper.updateStatus("r1", "u1", AgentRunStatus.EXPIRED)).thenReturn(0);
+
+        var message = service.getRun(GetAgentRunRequest.newBuilder()
+                .setUserId("u1")
+                .setId("r1")
+                .build());
+
+        assertEquals("CANCELED", message.getStatus());
+        verify(eventService, never()).append(anyString(), anyString(), anyString(), anyMap());
+        verify(finalizationService, never()).publishFinalizedEvent(anyString(), anyString(), anyString());
+    }
+
+    @Test
+    void getRunAlreadyExpiredDoesNotPublishAgain() {
+        AgentRun expired = run("{\"run_provider\":\"langchain\"}");
+        expired.setStatus(AgentRunStatus.EXPIRED);
+        when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(expired);
+        when(eventService.shouldMarkExpired(expired)).thenReturn(false);
+
+        var message = service.getRun(GetAgentRunRequest.newBuilder()
+                .setUserId("u1")
+                .setId("r1")
+                .build());
+
+        assertEquals("EXPIRED", message.getStatus());
+        verify(finalizationService, never()).publishFinalizedEvent(anyString(), anyString(), anyString());
     }
 
     @Test

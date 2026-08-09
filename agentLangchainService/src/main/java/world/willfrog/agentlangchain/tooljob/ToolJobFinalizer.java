@@ -463,8 +463,9 @@ public class ToolJobFinalizer {
             finalizationService.publishFinalizedEvent(
                     runId, run.getUserId(), AgentRunStatus.CANCELED.name());
         } catch (RuntimeException e) {
-            log.warn("Workspace finalization event failed after CANCELED CAS; polling will retry: "
-                    + "runId={} err={}", runId, e.getMessage(), e);
+            log.warn("Workspace finalization event failed after terminal CAS; polling will retry: "
+                    + "runId={} status={} err={}",
+                    runId, AgentRunStatus.CANCELED, e.getMessage(), e);
         }
     }
 

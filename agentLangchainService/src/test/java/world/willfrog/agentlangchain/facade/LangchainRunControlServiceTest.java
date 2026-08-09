@@ -45,6 +45,10 @@ class LangchainRunControlServiceTest {
         when(observabilityService.attachObservabilityToSnapshot("r1", "{}", AgentRunStatus.CANCELED))
                 .thenReturn("{\"observability\":{}}");
         when(eventService.nextInterruptedExpiresAt()).thenReturn(OffsetDateTime.now().plusDays(7));
+        when(runMapper.updateSnapshot(eq("r1"), eq("u1"), eq(AgentRunStatus.CANCELED),
+                anyString(), eq(false), isNull())).thenReturn(1);
+        when(runMapper.updateStatusWithTtl(eq("r1"), eq("u1"), eq(AgentRunStatus.CANCELED), any()))
+                .thenReturn(1);
 
         var response = service.cancelRun(CancelAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build());
 
@@ -53,6 +57,62 @@ class LangchainRunControlServiceTest {
         verify(runMapper).updateSnapshot(eq("r1"), eq("u1"), eq(AgentRunStatus.CANCELED), anyString(), eq(false), isNull());
         verify(eventService).append(eq("r1"), eq("u1"), eq("CANCELED"), anyMap());
         verify(finalizationService).publishFinalizedEvent("r1", "u1", "CANCELED");
+    }
+
+    @Test
+    void cancelPublisherFailureDoesNotRollbackCommittedTerminalState() {
+        AgentRun running = run(AgentRunStatus.EXECUTING);
+        AgentRun canceled = run(AgentRunStatus.CANCELED);
+        when(readService.requireWritableRun("r1", "u1")).thenReturn(running);
+        when(readService.requireReadableRun("r1", "u1")).thenReturn(canceled);
+        when(observabilityService.attachObservabilityToSnapshot("r1", "{}", AgentRunStatus.CANCELED))
+                .thenReturn("{\"observability\":{}}");
+        when(eventService.nextInterruptedExpiresAt()).thenReturn(OffsetDateTime.now().plusDays(7));
+        when(runMapper.updateSnapshot(eq("r1"), eq("u1"), eq(AgentRunStatus.CANCELED),
+                anyString(), eq(false), isNull())).thenReturn(1);
+        when(runMapper.updateStatusWithTtl(eq("r1"), eq("u1"), eq(AgentRunStatus.CANCELED), any()))
+                .thenReturn(1);
+        doThrow(new RuntimeException("listener unavailable"))
+                .when(finalizationService).publishFinalizedEvent("r1", "u1", "CANCELED");
+
+        var response = service.cancelRun(
+                CancelAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build());
+
+        assertEquals("CANCELED", response.getStatus());
+        verify(runMapper).updateStatusWithTtl(
+                eq("r1"), eq("u1"), eq(AgentRunStatus.CANCELED), any());
+        verify(finalizationService).publishFinalizedEvent("r1", "u1", "CANCELED");
+    }
+
+    @Test
+    void cancelPersistenceMismatchDoesNotPublish() {
+        AgentRun running = run(AgentRunStatus.EXECUTING);
+        AgentRun refreshed = run(AgentRunStatus.EXECUTING);
+        when(readService.requireWritableRun("r1", "u1")).thenReturn(running);
+        when(readService.requireReadableRun("r1", "u1")).thenReturn(refreshed);
+        when(observabilityService.attachObservabilityToSnapshot("r1", "{}", AgentRunStatus.CANCELED))
+                .thenReturn("{\"observability\":{}}");
+        when(eventService.nextInterruptedExpiresAt()).thenReturn(OffsetDateTime.now().plusDays(7));
+        when(runMapper.updateSnapshot(eq("r1"), eq("u1"), eq(AgentRunStatus.CANCELED),
+                anyString(), eq(false), isNull())).thenReturn(0);
+        when(runMapper.updateStatusWithTtl(eq("r1"), eq("u1"), eq(AgentRunStatus.CANCELED), any()))
+                .thenReturn(1);
+
+        service.cancelRun(CancelAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build());
+
+        verify(finalizationService, never()).publishFinalizedEvent(anyString(), anyString(), anyString());
+    }
+
+    @Test
+    void cancelTerminalReentryDoesNotPublishAgain() {
+        AgentRun canceled = run(AgentRunStatus.CANCELED);
+        when(readService.requireWritableRun("r1", "u1")).thenReturn(canceled);
+
+        var response = service.cancelRun(
+                CancelAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build());
+
+        assertEquals("CANCELED", response.getStatus());
+        verifyNoInteractions(finalizationService);
     }
 
     @Test
