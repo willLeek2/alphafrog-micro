@@ -43,7 +43,7 @@ public final class AgentExternalObservabilityMapper {
     private static final Set<String> EVENT_ONLY_INTERNAL_KEYS = Set.of("params", "output");
     private static final Set<String> RUN_SNAPSHOT_KEYS = Set.of(
             "answer", "answermarkdown", "status", "failurereason", "toolcallsused", "engine", "partial",
-            "skippedtodoids", "completeditems"
+            "skippedtodoids", "completeditems", "recoveryrationale", "recoveryjudgedecisionid"
     );
     private static final Set<String> COMPLETED_ITEM_KEYS = Set.of("todoid", "sequence", "description", "summary");
     private static final Set<String> SENSITIVE_KEYS = Set.of(
@@ -54,10 +54,24 @@ public final class AgentExternalObservabilityMapper {
     );
     private static final Pattern BEARER_VALUE = Pattern.compile("(?i)(bearer\\s+)[A-Za-z0-9._\\-+/=]+");
     private static final Pattern BASIC_VALUE = Pattern.compile("(?i)(basic\\s+)[A-Za-z0-9._\\-+/=]+");
+    private static final String SECRET_KEY_PATTERN =
+            "(?:api[_-]?key|x[_-]?api[_-]?key|openai[_-]?api[_-]?key|access[_-]?key"
+                    + "|secret|client[_-]?secret|password|passwd|credential|credentials|authorization"
+                    + "|proxy[_-]?authorization|token|access[_-]?token|refresh[_-]?token|auth[_-]?token"
+                    + "|x[_-]?auth[_-]?token|bearer[_-]?token|id[_-]?token|session[_-]?token"
+                    + "|private[_-]?key|csrf[_-]?token)";
+    /** Header values are line scoped: never leave a second cookie/header token visible. */
     private static final Pattern SENSITIVE_HEADER_VALUE = Pattern.compile(
-            "(?i)((?:authorization|cookie|set-cookie|x-api-key)\\s*[:=]\\s*)[^\\s,;]+");
-    private static final Pattern SECRET_ASSIGNMENT = Pattern.compile(
-            "(?i)([\"']?(?:api_?key|secret|password|access_?token|token)[\"']?\\s*[:=]\\s*[\"']?)[A-Za-z0-9._\\-+/=]+([\"']?)");
+            "(?i)(\\b(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|api-key|x-auth-token)"
+                    + "\\s*:\\s*)[^\\r\\n]*");
+    /** Quoted assignments accept whitespace and punctuation inside the secret value. */
+    private static final Pattern DOUBLE_QUOTED_SECRET_ASSIGNMENT = Pattern.compile(
+            "(?i)([\"']?" + SECRET_KEY_PATTERN + "[\"']?\\s*[:=]\\s*\")((?:\\\\.|[^\"])*)\"");
+    private static final Pattern SINGLE_QUOTED_SECRET_ASSIGNMENT = Pattern.compile(
+            "(?i)([\"']?" + SECRET_KEY_PATTERN + "[\"']?\\s*[:=]\\s*')((?:\\\\.|[^'])*)'");
+    /** Unquoted form/query assignments consume the whole value up to a real field delimiter. */
+    private static final Pattern UNQUOTED_SECRET_ASSIGNMENT = Pattern.compile(
+            "(?i)([\"']?" + SECRET_KEY_PATTERN + "[\"']?\\s*[:=]\\s*)(?![\"'])[^&;,\\r\\n]*");
     private static final Pattern URL_SECRET_PARAM = Pattern.compile(
             "(?i)([?&][^=&\\s]*(?:api_?key|secret|password|access_?token|token|key)[^=]*=)[^&#\\s]+");
     private static final Pattern CREDENTIAL_SHAPED = Pattern.compile(
@@ -110,8 +124,7 @@ public final class AgentExternalObservabilityMapper {
                 String key = String.valueOf(entry.getKey());
                 String normalized = normalizeKey(key);
                 if (view == View.RUN_SNAPSHOT && depth == 0
-                        && !RUN_SNAPSHOT_KEYS.contains(normalized)
-                        && !normalized.startsWith("recovery")) {
+                        && !RUN_SNAPSHOT_KEYS.contains(normalized)) {
                     continue;
                 }
                 if (view == View.RUN_SNAPSHOT && "completeditems".equals(normalizeKey(parentKey))
@@ -214,7 +227,9 @@ public final class AgentExternalObservabilityMapper {
         String out = BEARER_VALUE.matcher(text).replaceAll("$1" + REDACTION_TEXT);
         out = BASIC_VALUE.matcher(out).replaceAll("$1" + REDACTION_TEXT);
         out = SENSITIVE_HEADER_VALUE.matcher(out).replaceAll("$1" + REDACTION_TEXT);
-        out = SECRET_ASSIGNMENT.matcher(out).replaceAll("$1" + REDACTION_TEXT + "$2");
+        out = DOUBLE_QUOTED_SECRET_ASSIGNMENT.matcher(out).replaceAll("$1" + REDACTION_TEXT + "\"");
+        out = SINGLE_QUOTED_SECRET_ASSIGNMENT.matcher(out).replaceAll("$1" + REDACTION_TEXT + "'");
+        out = UNQUOTED_SECRET_ASSIGNMENT.matcher(out).replaceAll("$1" + REDACTION_TEXT);
         out = URL_SECRET_PARAM.matcher(out).replaceAll("$1" + REDACTION_TEXT);
         return CREDENTIAL_SHAPED.matcher(out).replaceAll(REDACTION_TEXT);
     }

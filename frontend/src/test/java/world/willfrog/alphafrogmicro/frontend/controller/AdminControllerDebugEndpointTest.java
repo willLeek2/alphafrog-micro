@@ -184,7 +184,11 @@ class AdminControllerDebugEndpointTest {
                         .setRun(AdminAgentRun.newBuilder().setRunId("run-1").build())
                         .setPlanJson("{broken raw-plan-secret")
                         .setSnapshotJson("{\"observability\":{\"items\":[{\"httpRequest\":{\"Authorization\":\"Bearer admin-secret-value\"}}],\"Cookie\":\"sid=admin-cookie-secret\"}}")
-                        .setLastError("api_key=admin-error-secret")
+                        .setLastError("""
+                                Cookie: session=admin-error-secret; refresh=admin-refresh-secret
+                                body={"password":"admin p@ss word!"}
+                                X-Api-Key: admin key with spaces
+                                """)
                         .build());
 
         ResponseEntity<?> response = controller.getAgentRun(authentication, "run-1");
@@ -196,6 +200,9 @@ class AdminControllerDebugEndpointTest {
         String combined = String.valueOf(body.get("snapshotJson")) + body.get("lastError");
         assertFalse(combined.contains("admin-secret-value"));
         assertFalse(combined.contains("admin-error-secret"));
+        assertFalse(combined.contains("admin-refresh-secret"));
+        assertFalse(combined.contains("admin p@ss word"));
+        assertFalse(combined.contains("admin key with spaces"));
         assertFalse(combined.contains("admin-cookie-secret"));
         assertTrue(combined.contains("REDACTED"));
     }

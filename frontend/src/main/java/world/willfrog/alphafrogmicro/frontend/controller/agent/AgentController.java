@@ -484,7 +484,8 @@ public class AgentController {
             String maxEventTime = null;
             for (var e : resp.getItemsList()) {
                 Object payload = parseOutboundJson(e.getPayloadJson(), AgentExternalObservabilityMapper.View.EVENT);
-                String eventTime = strVal(e.getCreatedAt());
+                String eventTime = safeTimelineString(e.getCreatedAt(), 128);
+                String eventType = safeTimelineString(e.getEventType(), 200);
                 if (minEventTime == null || eventTime.compareTo(minEventTime) < 0) {
                     minEventTime = eventTime;
                 }
@@ -495,9 +496,9 @@ public class AgentController {
                         e.getSeq(),
                         "event",
                         null,
-                        e.getEventType(),
-                        e.getCreatedAt(),
-                        timelineTitle(e.getEventType(), payload),
+                        eventType,
+                        eventTime,
+                        safeTimelineString(timelineTitle(eventType, payload), 120),
                         null,
                         payload
                 ));
@@ -1972,34 +1973,40 @@ public class AgentController {
             if (!(item instanceof Map<?, ?> trace)) {
                 continue;
             }
-            String traceTime = strVal(trace.get("time"));
+            Object mappedTrace = AgentExternalObservabilityMapper.sanitize(
+                    trace, AgentExternalObservabilityMapper.View.EVENT);
+            if (!(mappedTrace instanceof Map<?, ?> safeTrace)) {
+                continue;
+            }
+            String traceTime = safeTimelineString(safeTrace.get("time"), 128);
             if (!withinTimelineWindow(traceTime, minEventTime, maxEventTime)) {
                 continue;
             }
             Map<String, Object> detail = new LinkedHashMap<>();
-            detail.put("trace_id", strVal(trace.get("traceId")));
-            detail.put("phase", strVal(trace.get("phase")));
-            detail.put("todo_id", emptyToNull(strVal(trace.get("todoId"))));
-            detail.put("duration_ms", longVal(trace.get("durationMs")));
+            detail.put("trace_id", safeTimelineString(safeTrace.get("traceId"), 512));
+            detail.put("phase", safeTimelineString(safeTrace.get("phase"), 512));
+            detail.put("todo_id", emptyToNull(safeTimelineString(safeTrace.get("todoId"), 512)));
+            detail.put("duration_ms", longVal(safeTrace.get("durationMs")));
             if ("llm".equals(traceType)) {
-                detail.put("model", strVal(trace.get("model")));
-                detail.put("endpoint", strVal(trace.get("endpoint")));
-                detail.put("has_error", boolVal(trace.get("hasError")));
-                detail.put("input_tokens", nullableLong(trace.get("inputTokens")));
-                detail.put("output_tokens", nullableLong(trace.get("outputTokens")));
+                detail.put("model", safeTimelineString(safeTrace.get("model"), 512));
+                detail.put("endpoint", safeTimelineString(safeTrace.get("endpoint"), 2000));
+                detail.put("has_error", boolVal(safeTrace.get("hasError")));
+                detail.put("input_tokens", nullableLong(safeTrace.get("inputTokens")));
+                detail.put("output_tokens", nullableLong(safeTrace.get("outputTokens")));
             } else {
-                detail.put("tool_name", strVal(trace.get("toolName")));
-                detail.put("success", boolVal(trace.get("success")));
-                detail.put("cache_hit", boolVal(trace.get("cacheHit")));
+                detail.put("tool_name", safeTimelineString(safeTrace.get("toolName"), 512));
+                detail.put("success", boolVal(safeTrace.get("success")));
+                detail.put("cache_hit", boolVal(safeTrace.get("cacheHit")));
             }
+            String safeTraceId = safeTimelineString(safeTrace.get("traceId"), 512);
             items.add(new TimelineResponse.TimelineItem(
                     -traceSeq.getAndIncrement(),
                     "trace",
-                    strVal(trace.get("traceId")),
+                    safeTraceId,
                     traceType,
                     traceTime,
-                    traceTimelineTitle(traceType, trace),
-                    longVal(trace.get("durationMs")),
+                    traceTimelineTitle(traceType, safeTrace),
+                    longVal(safeTrace.get("durationMs")),
                     detail
             ));
         }
@@ -2019,13 +2026,22 @@ public class AgentController {
         return value == null ? "" : String.valueOf(value);
     }
 
+    private String safeTimelineString(Object value, int maxChars) {
+        String safe = AgentExternalObservabilityMapper.safePreview(value, maxChars);
+        return safe == null ? "" : safe;
+    }
+
     private String traceTimelineTitle(String traceType, Map<?, ?> trace) {
-        String phase = strVal(trace.get("phase"));
+        String phase = safeTimelineString(trace.get("phase"), 512);
         long durationMs = longVal(trace.get("durationMs"));
         if ("llm".equals(traceType)) {
-            return truncate("LLM " + phase + " " + strVal(trace.get("model")) + " " + durationMs + "ms", 120);
+            return safeTimelineString(
+                    "LLM " + phase + " " + safeTimelineString(trace.get("model"), 512) + " " + durationMs + "ms",
+                    120);
         }
-        return truncate("Tool " + phase + " " + strVal(trace.get("toolName")) + " " + durationMs + "ms", 120);
+        return safeTimelineString(
+                "Tool " + phase + " " + safeTimelineString(trace.get("toolName"), 512) + " " + durationMs + "ms",
+                120);
     }
 
     private String timelineTitle(String eventType, Object payload) {

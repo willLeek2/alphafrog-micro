@@ -56,6 +56,30 @@ class AgentExternalObservabilityMapperTest {
 
     @Test
     @SuppressWarnings("unchecked")
+    void runSnapshotAllowsOnlyNamedRecoveryFields() {
+        Map<String, Object> mapped = (Map<String, Object>) AgentExternalObservabilityMapper.parse(
+                objectMapper,
+                """
+                {
+                  "status":"PARTIAL",
+                  "recovery_rationale":"safe rationale",
+                  "recovery_judge_decision_id":"decision-1",
+                  "recovery_raw_http":{"body":"ordinary private payload"},
+                  "recovery_output":"full tool output"
+                }
+                """,
+                AgentExternalObservabilityMapper.View.RUN_SNAPSHOT);
+
+        assertEquals("safe rationale", mapped.get("recovery_rationale"));
+        assertEquals("decision-1", mapped.get("recovery_judge_decision_id"));
+        assertFalse(mapped.containsKey("recovery_raw_http"));
+        assertFalse(mapped.containsKey("recovery_output"));
+        assertFalse(mapped.toString().contains("ordinary private payload"));
+        assertFalse(mapped.toString().contains("full tool output"));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
     void eventViewDropsRawTraceFieldsAndCapsSafePreview() {
         String event = """
                 {
@@ -101,6 +125,34 @@ class AgentExternalObservabilityMapperTest {
         Map<String, Object> nested = (Map<String, Object>) mapped.get("nested");
         assertEquals(AgentExternalObservabilityMapper.REDACTION_TEXT, nested.get("openAiApiKey"));
         assertEquals(AgentExternalObservabilityMapper.REDACTION_TEXT, nested.get("xAuthToken"));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void stringScrubRedactsWholeHeaderAndQuotedValuesAcrossDeepLists() {
+        assertEquals("Cookie: " + AgentExternalObservabilityMapper.REDACTION_TEXT,
+                AgentExternalObservabilityMapper.safePreview(
+                        "Cookie: session=first-secret; refresh=second-secret", 10_000));
+        assertEquals("body={\"password\":\"" + AgentExternalObservabilityMapper.REDACTION_TEXT + "\"}",
+                AgentExternalObservabilityMapper.safePreview(
+                        "body={\"password\":\"p@ss word!\"}", 10_000));
+        assertEquals("X-Api-Key: " + AgentExternalObservabilityMapper.REDACTION_TEXT,
+                AgentExternalObservabilityMapper.safePreview("X-Api-Key: alpha beta", 10_000));
+        assertEquals("password=" + AgentExternalObservabilityMapper.REDACTION_TEXT,
+                AgentExternalObservabilityMapper.safePreview("password=p@ss word!:", 10_000));
+
+        Map<String, Object> mapped = (Map<String, Object>) AgentExternalObservabilityMapper.parse(
+                objectMapper,
+                """
+                {"nested":[
+                  {"openAiApiKey":"list-secret-one"},
+                  {"deeper":{"xAuthToken":"list-secret-two"}}
+                ]}
+                """,
+                AgentExternalObservabilityMapper.View.ADMIN);
+        assertFalse(mapped.toString().contains("list-secret-one"));
+        assertFalse(mapped.toString().contains("list-secret-two"));
+        assertTrue(mapped.toString().contains(AgentExternalObservabilityMapper.REDACTION_TEXT));
     }
 
     @Test

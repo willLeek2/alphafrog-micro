@@ -29,6 +29,7 @@ import world.willfrog.alphafrogmicro.frontend.model.agent.TimelineResponse;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentRawTraceDetailMapper;
 import world.willfrog.alphafrogmicro.frontend.service.AuthService;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentCallDetailBlobReader;
+import world.willfrog.alphafrogmicro.frontend.service.agent.AgentExternalObservabilityMapper;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentRunResultCacheService;
 
 import java.io.ByteArrayInputStream;
@@ -205,6 +206,55 @@ class AgentControllerTest {
         assertEquals(2, timeline.items().size());
         assertTrue(timeline.items().stream().anyMatch(item ->
                 "trace".equals(item.source()) && "llm-1".equals(item.traceId())));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void timeline_nonAdminScrubsEveryTraceStringBeforeReturningIt() {
+        User nonAdmin = new User();
+        nonAdmin.setUserId(99L);
+        nonAdmin.setUserType(1);
+        when(authService.getUserByUsername("admin")).thenReturn(nonAdmin);
+        when(agentDubboService.listEvents(any(ListAgentRunEventsRequest.class))).thenReturn(
+                ListAgentRunEventsResponse.newBuilder()
+                        .addItems(AgentRunEventMessage.newBuilder()
+                                .setSeq(1)
+                                .setRunId("run-1")
+                                .setEventType("TODO_STARTED")
+                                .setPayloadJson("{\"todo_id\":\"todo_1\"}")
+                                .setCreatedAt("2026-05-07T10:00:00Z")
+                                .build())
+                        .setNextAfterSeq(1)
+                        .setHasMore(false)
+                        .build());
+        String observability = """
+                {"summary":{},"diagnostics":{"llmTraces":[
+                  {"traceId":"llm-1","time":"2026-05-07T10:00:00Z",
+                   "phase":"body={\\"password\\":\\"phase secret!\\"}",
+                   "todoId":"Cookie: session=todo-secret; refresh=other-secret",
+                   "durationMs":42,"model":"X-Api-Key: model secret",
+                   "endpoint":"https://example.test/?api_key=timeline-secret",
+                   "hasError":false,"inputTokens":10,"outputTokens":5}
+                ],"toolTraces":[]}}
+                """;
+        when(agentDubboService.getResult(any(GetAgentRunResultRequest.class))).thenReturn(
+                AgentRunResultMessage.newBuilder().setObservabilityJson(observability).build());
+
+        TimelineResponse timeline = controller.timeline(authentication, "run-1", 0, 100).getData();
+
+        TimelineResponse.TimelineItem trace = timeline.items().stream()
+                .filter(item -> "trace".equals(item.source()))
+                .findFirst()
+                .orElseThrow();
+        Map<String, Object> detail = (Map<String, Object>) trace.detail();
+        assertEquals("https://example.test/?api_key=" + AgentExternalObservabilityMapper.REDACTION_TEXT,
+                detail.get("endpoint"));
+        assertTrue(timeline.toString().contains(AgentExternalObservabilityMapper.REDACTION_TEXT));
+        assertFalse(timeline.toString().contains("timeline-secret"));
+        assertFalse(timeline.toString().contains("phase secret"));
+        assertFalse(timeline.toString().contains("todo-secret"));
+        assertFalse(timeline.toString().contains("other-secret"));
+        assertFalse(timeline.toString().contains("model secret"));
     }
 
     @Test
