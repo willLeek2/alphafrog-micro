@@ -1,5 +1,14 @@
 # Shared agent platform config for active agent runtimes.
 agent:
+  # D04 统一存储路径门面（AgentStoragePaths，W5 task #105）：
+  # 解析顺序 = 新键 → 旧键别名 → 代码默认值；空白值视为未设置，回退旧键。
+  # 旧→新映射与迁移注意见 agentPlatformShared/docs/d04-storage-key-mapping-v1.md。
+  # 路径键无 Nacos 热更通道，根迁移只能走重启级发布。
+  storage:
+    workspace-root: ${AF_AGENT_STORAGE_WORKSPACE_ROOT:}
+    artifact-root: ${AF_AGENT_STORAGE_ARTIFACT_ROOT:}
+    dataset-root: ${AF_AGENT_STORAGE_DATASET_ROOT:}
+    observability-debug-file: ${AF_AGENT_STORAGE_OBSERVABILITY_DEBUG_FILE:}
   finance-record-channel:
     # 四段上限实测完成前保持关闭；动态配置只能在以下应用默认值和代码硬上限内缩小。
     enabled: ${AF_FINANCE_RECORD_CHANNEL_ENABLED:false}

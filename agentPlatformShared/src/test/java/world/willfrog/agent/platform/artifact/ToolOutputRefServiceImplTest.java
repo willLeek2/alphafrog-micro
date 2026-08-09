@@ -13,6 +13,7 @@ import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
+import world.willfrog.agent.platform.storage.AgentStoragePaths;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -43,8 +44,13 @@ class ToolOutputRefServiceImplTest {
     void setUp() {
         redis = new LinkedHashMap<>();
         redisTemplate = mockRedis(redis);
-        registry = new PersistentArtifactRegistry(redisTemplate, new ObjectMapper());
-        ReflectionTestUtils.setField(registry, "artifactRoot", tempDir.resolve("artifacts").toString());
+        // D04：artifact 根经统一存储门面注入（替代原 @Value artifactRoot 反射注入）。
+        AgentStoragePaths storagePaths = new AgentStoragePaths(
+                tempDir.resolve("workspaces").toString(),
+                tempDir.resolve("artifacts").toString(),
+                tempDir.resolve("datasets").toString(),
+                tempDir.resolve("obs-debug.log").toString());
+        registry = new PersistentArtifactRegistry(redisTemplate, new ObjectMapper(), storagePaths);
         ReflectionTestUtils.setField(registry, "defaultTtlHours", 12L);
         ReflectionTestUtils.setField(registry, "cleanupScanCount", 100);
         AgentLlmLocalConfigLoader loader = mock(AgentLlmLocalConfigLoader.class);

@@ -10,13 +10,13 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.storage.AgentStoragePaths;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
@@ -34,8 +34,11 @@ public class PersistentArtifactRegistry {
     private final StringRedisTemplate redisTemplate;
     private final ObjectMapper objectMapper;
 
-    @Value("${agent.persistent-artifact.root:/data/agent_artifacts}")
-    private String artifactRoot;
+    /**
+     * D04：artifact 根经统一存储门面解析（新键 agent.storage.artifact-root，
+     * 旧键别名 agent.persistent-artifact.root，默认 /data/agent_artifacts）。
+     */
+    private final AgentStoragePaths storagePaths;
 
     @Value("${agent.persistent-artifact.ttl-hours:12}")
     private long defaultTtlHours;
@@ -59,8 +62,11 @@ public class PersistentArtifactRegistry {
         String artifactId = safeType + ":" + UUID.randomUUID().toString().replace("-", "");
         byte[] bytes = content == null ? new byte[0] : content.getBytes(StandardCharsets.UTF_8);
         String hash = sha256(bytes);
-        Path path = rootPath().resolve(safeType).resolve(artifactId.replace(':', '_') + ".txt").normalize();
-        if (!path.startsWith(rootPath())) {
+        Path root = rootPath();
+        // D04 §4.3：写入前校验 artifact 根可达（挂载缺失/权限不足 → 显式失败信号）。
+        storagePaths.requireWritableRoot(root, AgentStoragePaths.KEY_ARTIFACT_ROOT);
+        Path path = root.resolve(safeType).resolve(artifactId.replace(':', '_') + ".txt").normalize();
+        if (!path.startsWith(root)) {
             throw new IllegalArgumentException("Artifact path escapes root");
         }
         try {
@@ -286,7 +292,7 @@ public class PersistentArtifactRegistry {
     }
 
     private Path rootPath() {
-        return Paths.get(artifactRoot).toAbsolutePath().normalize();
+        return storagePaths.artifactRoot();
     }
 
     private String key(String artifactId) {

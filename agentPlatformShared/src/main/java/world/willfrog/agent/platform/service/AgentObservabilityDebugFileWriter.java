@@ -5,11 +5,11 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
+import world.willfrog.agent.platform.storage.AgentStoragePaths;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.time.OffsetDateTime;
 import java.util.LinkedHashMap;
@@ -23,8 +23,11 @@ public class AgentObservabilityDebugFileWriter {
     @Value("${agent.observability.debug-file.enabled:false}")
     private boolean enabled;
 
-    @Value("${agent.observability.debug-file.path:/data/logs/agent-observability-debug.log}")
-    private String path;
+    /**
+     * D04：debug 文件路径经统一存储门面解析（新键 agent.storage.observability-debug-file，
+     * 旧键别名 agent.observability.debug-file.path，默认 /data/logs/agent-observability-debug.log）。
+     */
+    private final AgentStoragePaths storagePaths;
 
     private final ObjectMapper objectMapper;
     private final Object lock = new Object();
@@ -59,11 +62,9 @@ public class AgentObservabilityDebugFileWriter {
     }
 
     private Path resolvePath() {
-        if (path == null || path.isBlank()) {
-            warnOnce("Observability debug file path is blank", null);
-            return null;
-        }
-        Path output = Paths.get(path).normalize();
+        // debug sink 是 best-effort 遥测：路径不可达按既有 warn-once 信号降级，
+        // 不向上传播异常打断 run（与 D04 前的行为一致）。
+        Path output = storagePaths.observabilityDebugFile().normalize();
         try {
             Path parent = output.getParent();
             if (parent != null) {

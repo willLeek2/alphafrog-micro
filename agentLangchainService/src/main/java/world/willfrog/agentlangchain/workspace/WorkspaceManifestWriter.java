@@ -8,6 +8,7 @@ import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.entity.AgentRunMessage;
 import world.willfrog.agent.platform.service.AgentArtifactService.PythonScript;
+import world.willfrog.agent.platform.storage.AgentStoragePaths;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -31,6 +32,12 @@ import java.util.Map;
  * <p>workspace_state.json.fingerprint = (sourceRunCompletedAt, sourceRunUpdatedAt, lastMessageSeq)；
  * 一致时 skip，变化时覆盖重 dump。</p>
  *
+ * <h3>D04</h3>
+ * <p>dataset refPath 不再硬编码 {@code /data/agent_datasets/} 前缀，改经统一存储门面
+ * {@link AgentStoragePaths#datasetRoot()} 拼接；writeAll 入口先做
+ * {@link AgentStoragePaths#verifyDumpTarget(java.nio.file.Path)} 可达性 + 归属校验
+ * （§4.3：不可达/越界 → 明确失败信号，不静默写错位置）。</p>
+ *
  * @author wang
  */
 @Service
@@ -40,6 +47,8 @@ public class WorkspaceManifestWriter {
 
     private static final ObjectMapper MAPPER = new ObjectMapper()
             .enable(SerializationFeature.INDENT_OUTPUT);
+
+    private final AgentStoragePaths storagePaths;
 
     /**
      * 写入 workspace 所有文件。
@@ -57,6 +66,9 @@ public class WorkspaceManifestWriter {
         if (runDir == null) {
             throw new IllegalArgumentException("runDir 不能为空");
         }
+        // D04 §4.3：dump 入口可达性 + 归属校验——workspace 根不可达（挂载缺失等）
+        // 或 runDir 越出配置根时显式失败，不静默写错位置。
+        storagePaths.verifyDumpTarget(runDir);
         try {
             Files.createDirectories(runDir);
         } catch (IOException e) {
@@ -144,7 +156,8 @@ public class WorkspaceManifestWriter {
             asset.put("kind", isManifest ? "dataset_manifest" : "dataset");
             asset.put("assetId", datasetId);
             asset.put("mode", "reference");
-            asset.put("refPath", "/data/agent_datasets/" + datasetId);
+            // D04：dataset 根经统一存储门面解析（原为硬编码 /data/agent_datasets/ 前缀）。
+            asset.put("refPath", storagePaths.datasetRoot().resolve(datasetId).toString());
             if (isManifest) {
                 List<Map<String, Object>> members = new ArrayList<>();
                 for (ManifestMemberView m : health.manifestMembers()) {
