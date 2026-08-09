@@ -74,8 +74,8 @@ import java.util.concurrent.TimeUnit;
  *   <li><b>能力校验</b>：在路由前检查 run 级能力开关（如 webSearch 未开启时拒绝 searchWeb）。</li>
  *   <li><b>预算检查</b>：调用 {@link AgentRunBudgetService#checkBeforeToolCall} 检查
  *       run 总额度/总耗时预算是否已用尽。</li>
- *   <li><b>结果缓存</b>：通过 {@link ToolResultCacheService} 对工具结果按用户或全局 scope
- *       做缓存复用，节省重复调用成本。</li>
+ *   <li><b>结果缓存</b>：通过 {@link ToolResultCacheService} 对工具结果按 user/run scope
+ *       做缓存复用（缺身份时 fail-closed 跳过共享缓存），节省重复调用成本。</li>
  *   <li><b>观测记录</b>：通过 {@link AgentObservabilityService#recordToolCall} 记录每一次
  *       工具调用 trace（参数、结果摘要、耗时、是否命中缓存等），供 run 观测视图和
  *       safe detail 懒加载使用。</li>
@@ -137,7 +137,8 @@ public class ToolRouter {
     private final StressTestProperties stressTestProperties;
     /** 按 toolName 缓存 Timer 实例，避免每次调用重新构建（线程安全） */
     private final ConcurrentHashMap<String, Timer> toolCallTimers = new ConcurrentHashMap<>();
-    // D07：限流拒绝的独立低基数计数（toolName × layer），与成功 toolCalls 累加器分离
+    // D07：权重限流拒绝的独立低基数计数（toolName × layer，layer 当前恒为 weight_limit），
+    // 与成功 toolCalls 累加器分离；LC4j 层拒绝发生在进入 Router 之前，不经本计数器
     private final ConcurrentHashMap<String, Counter> throttleRejectionCounters = new ConcurrentHashMap<>();
 
     /**
@@ -250,7 +251,8 @@ public class ToolRouter {
                 /*
                  * D07 口径：限流拒绝 ≠ 已执行工具调用。不调用 recordObservability——
                  * 拒绝不得抬高 observability summary.toolCalls、不得消耗 maxToolCalls
-                 * 判定额度；拒绝用独立的低基数 Micrometer 计数观测（toolName × layer），
+                 * 判定额度；权重层拒绝用独立的低基数 Micrometer 计数观测
+                 * （tool.call.throttle.rejected{toolName, layer=weight_limit}），
                  * 与成功调用累加器完全分离。throttleRejected 标记随结果传给 executor，
                  * 由其在 TOOL_CALL_FINISHED payload 写 creditsConsumed=0。
                  */
@@ -349,11 +351,14 @@ public class ToolRouter {
     }
 
     /**
-     * 获取或创建限流拒绝计数器（D07）。
+     * 获取或创建权重限流拒绝计数器（D07）。
      *
      * <p>拒绝计数与 {@code tool.call} 执行计时分离：被拒绝的调用没有执行，不计时、
-     * 不进成功累加器。tag 仅 toolName（注册表 25 名内）与 layer（weight_limit /
-     * lc4j_semaphore），基数有界。</p>
+     * 不进成功累加器。tag 仅 toolName（注册表 25 名内）与 layer，基数有界。
+     * 本计数器只覆盖权重层，layer 当前恒为 {@code weight_limit}；LC4j 前台
+     * Semaphore 拒绝发生在进入本 Router 之前（ToolRouterToolExecutor 侧），其
+     * 低基数观测由 LangchainToolConcurrencyThrottle 自带 per-node 计数
+     * （timeoutCounts / waitMsTotal / waitCount，G7 冻结面）承担，不经本计数器。</p>
      */
     private Counter getOrCreateThrottleRejectionCounter(String toolName, String layer) {
         return throttleRejectionCounters.computeIfAbsent(toolName + "|" + layer, key ->
@@ -1105,8 +1110,10 @@ public class ToolRouter {
         /** 缓存元数据（是否符合缓存条件、是否命中、来源、剩余 TTL 等） */
         private ToolResultCacheService.CacheMeta cacheMeta;
         /**
-         * D07：是否因限流（权重/LC4j Semaphore）被拒绝而未真正执行。
-         * 拒绝结果不计成功工具预算、工具 credit 为 0，executor 据此写 FINISHED 契约字段。
+         * D07：是否因权重限流被拒绝而未真正执行（不消耗成功预算、工具 credit 为 0，
+         * executor 据此写 FINISHED 契约字段 throttle_layer=weight_limit）。LC4j 前台
+         * Semaphore 拒绝发生在进入 Router 之前，不经本标记传递，由 executor 直接标注
+         * throttle_layer=lc4j_semaphore。
          */
         private boolean throttleRejected;
     }

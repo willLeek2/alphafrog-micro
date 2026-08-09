@@ -40,7 +40,9 @@ import static org.mockito.Mockito.*;
  *   <li>不向 observability 写入 tool trace（不抬高 toolCalls / 不消耗预算）；</li>
  *   <li>只增加 {@code tool.call.throttle.rejected} counter，不记录 {@code tool.call} Timer；</li>
  *   <li>正常调用走成功路径；</li>
- *   <li>checkParallelLimits 元工具仍被 observability 豁免。</li>
+ *   <li>checkParallelLimits 元工具仍被 observability 豁免；</li>
+ *   <li>Router→cache scope 接线：user+run→{@code user:<id>}、仅 run→{@code run:<id>}、
+ *       皆无→blank（由缓存层 fail-closed，Router 不得改写为 global）。</li>
  * </ul>
  */
 class ToolRouterThrottleRejectionContractTest {
@@ -181,6 +183,71 @@ class ToolRouterThrottleRejectionContractTest {
                 anyString(), anyString(), anyString(), anyMap(), anyString(), anyLong(), anyBoolean(),
                 anyBoolean(), anyBoolean(), anyString(), anyString(), anyLong(), anyLong(), anyString()
         );
+    }
+
+    // ── D07 Router→cache scope 接线反测：resolveScope 回归为 global 时此处应失败 ──
+
+    @Test
+    void cacheScope_userAndRunPresent_prefersUserScope() {
+        // setUp 已同时设置 runId/userId：用户身份优先于 run
+        ToolRouter router = createRouter(passingLimitService("getStockInfo"));
+        stubCachePassthrough("getStockInfo");
+
+        ToolRouter.ToolInvocationResult result = router.invokeWithMeta("getStockInfo", Map.of("tsCode", "000001.SZ"));
+
+        assertTrue(result.isSuccess());
+        assertEquals("user:user-d07-1", captureScopeFor("getStockInfo"));
+    }
+
+    @Test
+    void cacheScope_onlyRunPresent_usesRunScope() {
+        AgentContext.clear();
+        AgentContext.setRunId("run-d07-anon");
+        ToolRouter router = createRouter(passingLimitService("getStockInfo"));
+        stubCachePassthrough("getStockInfo");
+
+        router.invokeWithMeta("getStockInfo", Map.of("tsCode", "000001.SZ"));
+
+        assertEquals("run:run-d07-anon", captureScopeFor("getStockInfo"));
+    }
+
+    @Test
+    void cacheScope_noUserNoRun_blankScopeForFailClosed() {
+        AgentContext.clear();
+        ToolRouter router = createRouter(passingLimitService("getStockInfo"));
+        stubCachePassthrough("getStockInfo");
+
+        router.invokeWithMeta("getStockInfo", Map.of("tsCode", "000001.SZ"));
+
+        // blank scope 交给缓存层 fail-closed；Router 自身不得改写为 global
+        assertEquals("", captureScopeFor("getStockInfo"));
+    }
+
+    private ToolWeightedLimitService passingLimitService(String toolName) {
+        ToolWeightedLimitService limitService = mock(ToolWeightedLimitService.class);
+        when(limitService.tryAcquire(eq(toolName), anyMap()))
+                .thenReturn(Optional.of(ToolWeightedLimitService.WeightLease.noop()));
+        return limitService;
+    }
+
+    private void stubCachePassthrough(String toolName) {
+        when(cacheService.executeWithCache(eq(toolName), anyMap(), anyString(), any(Supplier.class)))
+                .thenAnswer(inv -> {
+                    Supplier<ToolResultCacheService.ToolExecutionOutcome> supplier = inv.getArgument(3);
+                    ToolResultCacheService.ToolExecutionOutcome outcome = supplier.get();
+                    return ToolResultCacheService.CachedToolCallResult.builder()
+                            .result(outcome.getResult())
+                            .observabilityResult(outcome.getResult())
+                            .durationMs(outcome.getDurationMs())
+                            .success(outcome.isSuccess())
+                            .build();
+                });
+    }
+
+    private String captureScopeFor(String toolName) {
+        ArgumentCaptor<String> scopeCaptor = ArgumentCaptor.forClass(String.class);
+        verify(cacheService).executeWithCache(eq(toolName), anyMap(), scopeCaptor.capture(), any(Supplier.class));
+        return scopeCaptor.getValue();
     }
 
     private ToolRouter createRouter(ToolWeightedLimitService limitService) {

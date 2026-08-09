@@ -1,7 +1,7 @@
 # D07 — 工具限流拦截的预算/计费口径与缓存作用域说明
 
-版本：v1（26Q3 Stage1 W1，task #101）  
-范围：`agentToolsShared`（ToolRouter / ToolResultCacheService）、`agentLangchainService`（ToolRouterToolExecutor）、`agentPlatformShared`（AgentCreditService）  
+版本：v1（26Q3 Stage1 W1，task #101）
+范围：`agentToolsShared`（ToolRouter / ToolResultCacheService）、`agentLangchainService`（ToolRouterToolExecutor）、`agentPlatformShared`（AgentCreditService）
 关联：D05（注册表单一来源）、D25（集群扩展文档）、Risks 1.3.5 / 3.3.2、Overview 方面二-8
 
 ---
@@ -14,7 +14,7 @@
 |------|------|
 | Run 工具预算（maxToolCalls 判定） | **不消耗**。权重拒绝路径不再写入 observability 成功 toolCalls 累加器；LC4j 拒绝本就不进 Router。预算检查读取的计数源唯一（observability summary.toolCalls）。 |
 | 工具 credit（账单） | **不计**。`TOOL_CALL_FINISHED` 事件若因 UI 收尾需要保留，payload 必带 `creditsConsumed: 0`、`rejected_by_throttle: true`、`throttle_layer: weight_limit|lc4j_semaphore`；`AgentCreditService` 汇总侧对 `rejected_by_throttle=true` 显式跳过（优先于任何显式 credits 字段）。 |
-| 拒绝观测 | 独立低基数 Micrometer 计数器 `tool.call.throttle.rejected{toolName, layer}`；不写入业务 tool trace，不计入执行耗时 Timer。 |
+| 拒绝观测 | 两层各自有独立低基数观测，机制不同：权重层由 ToolRouter 新增 Micrometer 计数器 `tool.call.throttle.rejected{toolName, layer=weight_limit}`；LC4j 层沿用 `LangchainToolConcurrencyThrottle` 既有 per-node 计数（timeoutCounts / waitMsTotal / waitCount，G7 冻结面，本交付不改）。两层均不写入业务 tool trace、不计入执行耗时 Timer。 |
 | 模型可见 | 拒绝返回可解析错误（权重层为标准错误 JSON，LC4j 层为原因文本），模型可稍后重试或缩小批量。 |
 
 两层限流（`ToolWeightedLimitService` 权重层、`LangchainToolConcurrencyThrottle` LC4j 层）对「是否计预算 / 是否扣 credit」同口径，禁止分叉。
