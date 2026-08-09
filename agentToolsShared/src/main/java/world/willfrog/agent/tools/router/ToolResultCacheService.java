@@ -18,6 +18,7 @@ import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.artifact.RawPayloadLocator;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 import world.willfrog.agent.tools.compaction.ToolOutputCompactionService;
+import world.willfrog.agent.tools.registry.AgentToolRegistry;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -41,12 +42,13 @@ public class ToolResultCacheService {
     private static final String SOURCE_REDIS = "redis_tool_cache";
     private static final String SOURCE_DATASET_REGISTRY = "dataset_registry";
     private static final String SOURCE_NONE = "none";
-    private static final Set<String> SEARCH_TOOLS = Set.of(
-            "searchStock", "searchFund", "searchIndex", "searchAssetInfo");
-    private static final Set<String> INFO_TOOLS = Set.of("getStockInfo", "getIndexInfo");
-    private static final Set<String> DATASET_TOOLS = Set.of(
-            "getStockDaily", "getIndexDaily",
-            "getExchangeAssetDaily", "getOffExchangeAssetDaily", "getListedAssetShareSize", "getEtfAdj");
+    // 以下集合由 AgentToolRegistry 的 cacheFamily 元数据派生，与注册表单一真相源对齐
+    private static final Set<String> SEARCH_TOOLS = AgentToolRegistry.namesInCacheFamily(
+            AgentToolRegistry.CacheFamily.SEARCH);
+    private static final Set<String> INFO_TOOLS = AgentToolRegistry.namesInCacheFamily(
+            AgentToolRegistry.CacheFamily.INFO);
+    private static final Set<String> DATASET_TOOLS = AgentToolRegistry.namesInCacheFamily(
+            AgentToolRegistry.CacheFamily.DATASET);
     private static final DateTimeFormatter DATE_FORMATTER = DateTimeFormatter.BASIC_ISO_DATE;
 
     private final StringRedisTemplate redisTemplate;

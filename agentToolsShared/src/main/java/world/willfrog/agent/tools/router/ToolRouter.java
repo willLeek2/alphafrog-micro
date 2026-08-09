@@ -27,6 +27,7 @@ import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.agent.tools.market.advanced.AdvancedSearchRequest;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
 import world.willfrog.agent.tools.rag.RagTools;
+import world.willfrog.agent.tools.registry.AgentToolRegistry;
 import world.willfrog.agent.tools.search.SearchTools;
 
 import java.util.ArrayList;
@@ -40,8 +41,11 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
 /**
- * 工具调用统一路由器，是 LLM 决定调用工具后，所有业务工具（除 spawnSubAgent/waitForSubAgent
- * 这两个子代理控制工具外）的执行入口。
+ * 工具调用统一路由器，是 LLM 决定调用工具后，所有业务工具的执行入口。
+ *
+ * <p>可路由工具名集合由 {@link AgentToolRegistry#declaredToolNames()} 派生，
+ * 本路由器只负责分发已在注册表中声明的工具。spawnSubAgent / waitForSubAgent
+ * 不在 D05 生产声明面内，将在 D06 同生同死补齐。</p>
  *
  * <p>面试里如果只看 agentLangchainService 的 {@code ToolRouterToolExecutor}，
  * 只能知道 LC4j 的 tool call 如何进入 Java；真正的业务语义在这里：是否允许调用、
@@ -308,51 +312,18 @@ public class ToolRouter {
     /**
      * 返回路由器支持的全部工具名集合。
      *
-     * <p>用于上游（如 Planner 提示词生成、能力校验）枚举可路由的业务工具。
-     * 注意：spawnSubAgent / waitForSubAgent 属于子代理控制工具，
-     * 由 ReactTodoExecutor 直接处理而不经过本路由器。</p>
+     * <p>集合内容由 {@link AgentToolRegistry#declaredToolNames()} 派生，代表平台的
+     * 生产声明面，而不是当前 run 一定可用的工具列表。 capability gate 以注册表元数据
+     * 为准；实际执行仍由 executeDirect 中的能力校验决定。</p>
+     *
+     * <p>语义注意：searchWeb 还要受 AgentContext.isWebSearchEnabled 控制；
+     * getEtfAdj 还要受 adjFactorEnabled 控制；checkParallelLimits 是元工具，
+     * 返回当前配置下的批量上限。</p>
      *
      * @return 不可变的工具名集合
      */
     public Set<String> supportedTools() {
-        /*
-         * 这是平台工具白名单，而不是当前 run 一定可用的工具列表：
-         * - searchWeb 还要受 AgentContext.isWebSearchEnabled 控制；
-         * - getEtfAdj 还要受 adjFactorEnabled 控制；
-         * - checkParallelLimits 是元工具，返回当前配置下的批量上限。
-         *
-         * Planner 和 tool catalog 可以用它了解「系统理论上支持什么」，实际执行仍以
-         * executeDirect 中的能力校验为准。
-         */
-        return Set.of(
-                "getStockInfo",
-                "getStockDaily",
-                "getStockSwIndustryInfo",
-                "searchStock",
-                "searchFund",
-                "getIndexInfo",
-                "getIndexDaily",
-                "searchIndex",
-                "searchAssetInfo",
-                "checkParallelLimits",
-                "getTradingDaysSummary",
-                "isTradingDay",
-                "getExchangeAssetDaily",
-                "getOffExchangeAssetDaily",
-                "getEtfAdj",
-                "getListedAssetShareSize",
-                "getFinancialReport",
-                "ragSearch",
-                "loadDocument",
-                "searchWeb",
-                "executePython",
-                "resolveFinanceMethods",
-                "loadToolGuide",
-                "rereadToolResult",
-                "spawnSubAgent",
-                "waitForSubAgent",
-                "listMyData"
-        );
+        return AgentToolRegistry.declaredToolNames();
     }
 
     /**
