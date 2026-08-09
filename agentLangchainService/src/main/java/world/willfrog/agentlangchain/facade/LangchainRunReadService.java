@@ -25,7 +25,6 @@ import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agent.platform.service.SnapshotPartService;
 import world.willfrog.agent.platform.service.SnapshotPartsMeta;
-import world.willfrog.agentlangchain.routing.LangchainSingleWriterGuard;
 import world.willfrog.agentlangchain.tools.LangchainToolCatalogService;
 import world.willfrog.alphafrogmicro.agent.idl.AgentEmpty;
 import world.willfrog.alphafrogmicro.agent.idl.AgentFeatureConfigMessage;
@@ -94,25 +93,22 @@ import java.util.Map;
  *   <li>快照分段下载（大 run 的 snapshot 拆成多 part，分段拉取避免 OOM）</li>
  * </ul>
  *
- * <h2>读写一致性</h2>
+ * <h2>读写一致性边界</h2>
  * langchain 服务和 agent runtime 共享同一套 PG/Redis 存储。事件流目前由
- * {@link AgentEventService} 优先从 Redis ZSET 读取，只有 Redis 没有该 run 的事件时才回退 DB；
- * 这是压测后为了避免大量 event 长期堆在数据库中的过渡设计。
- * 本类的读操作依赖 {@link LangchainSingleWriterGuard} 保证：
- * 当前 langchain 实例有写入权时才允许直接读 PG，避免读到过期的本地缓存。
+ * {@link AgentEventService} 优先从 Redis ZSET 读取，只有 Redis 没有该 run 的事件时才回退 DB。
+ * 本类只校验 Run 存在且属于请求用户；当前没有跨实例的 Run 单写者租约。
+ * ToolJob 的 anchor/lease/CAS 只保护对应 ToolJob 状态，不等同于整个 Run 的写者归属。
  *
  * <h2>status 方法的 phase 推断</h2>
  * {@link #getStatus} 不仅返回 run 状态，还根据最近事件类型推断当前阶段
  * （PLANNING / EXECUTING / EXECUTING_TOOL / SUMMARIZING / PAUSED）。
- * 这是前端进度展示的核心数据源。面试被问"前端怎么知道 agent 正在干什么"，
- * 答案就在 {@link #resolvePhase}。
+ * 这是前端进度展示的核心数据源，具体映射集中在 {@link #resolvePhase}。
  *
  * <h2>过期标记</h2>
  * {@link #markExpiredIfNeeded} 在每次读取时检查 run 是否已过期（超过 TTL），
  * 如果是则更新状态并写入 EXPIRED 事件。这种"读时触发写"的模式保证过期状态
  * 即使没有定时任务也能被及时感知。
  *
- * @see LangchainSingleWriterGuard 读写权限守卫
  * @see LangchainRunControlService 写/控制路径（pause/cancel/resume）
  * @see AgentLangchainRunService 写路径入口（createRun）
  */
@@ -134,7 +130,6 @@ public class LangchainRunReadService {
     private final AgentMessageService messageService;
     private final SnapshotPartService snapshotPartService;
     private final LangchainToolCatalogService toolCatalogService;
-    private final LangchainSingleWriterGuard singleWriterGuard;
     private final AgentArtifactService artifactService;
     private final ObjectMapper objectMapper;
     private final DataAnalysisObservabilityQuery dataAnalysisObservabilityQuery;
@@ -489,15 +484,15 @@ public class LangchainRunReadService {
     }
 
     AgentRun requireReadableRun(String id, String userId) {
-        return singleWriterGuard.requireReadable(requireRun(id, userId));
+        return requireRun(id, userId);
     }
 
     AgentRun requireReadableRunForAdmin(String id) {
-        return singleWriterGuard.requireReadable(requireRunForAdmin(id));
+        return requireRunForAdmin(id);
     }
 
     AgentRun requireWritableRun(String id, String userId) {
-        return singleWriterGuard.requireWritable(requireRun(id, userId));
+        return requireRun(id, userId);
     }
 
     private AgentRun requireRun(String id, String userId) {

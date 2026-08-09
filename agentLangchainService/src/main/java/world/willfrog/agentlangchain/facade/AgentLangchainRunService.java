@@ -11,7 +11,6 @@ import world.willfrog.agent.platform.service.AgentCreditService;
 import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agentlangchain.orchestration.LangchainLinearRunPipeline;
 import world.willfrog.agentlangchain.orchestration.LangchainRunConcurrencyScheduler;
-import world.willfrog.agentlangchain.routing.LangchainSingleWriterGuard;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage;
 import world.willfrog.alphafrogmicro.agent.idl.CreateAgentRunRequest;
 import world.willfrog.alphafrogmicro.common.dao.user.UserDao;
@@ -30,7 +29,6 @@ public class AgentLangchainRunService {
     private final ObjectProvider<LangchainLinearRunPipeline> linearRunPipelineProvider;
     private final LangchainRunConcurrencyScheduler runConcurrencyScheduler;
     private final AgentRunMapper runMapper;
-    private final LangchainSingleWriterGuard singleWriterGuard;
     private final AgentCreditService creditService;
     private final UserDao userDao;
 
@@ -73,8 +71,6 @@ public class AgentLangchainRunService {
                     request.getStageConfigJson(),
                     isAdminUser(userId)
             );
-
-            run = singleWriterGuard.markLangchainOwner(run);
 
             if (pipeline != null) {
                 log.info("Launching langchain linear pipeline for run {}", run.getId());

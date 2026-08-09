@@ -18,6 +18,9 @@ import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+import static world.willfrog.agentlangchain.orchestration.AgentLangchainOrchestrator.LINEAR_PIPELINE_READY;
+import static world.willfrog.agentlangchain.orchestration.AgentLangchainOrchestrator.LINEAR_PIPELINE_UNAVAILABLE;
+import static world.willfrog.agentlangchain.orchestration.AgentLangchainOrchestrator.PROVIDER_DISABLED;
 
 @WebMvcTest(AgentLangchainHealthController.class)
 class AgentLangchainHealthControllerTest {
@@ -38,13 +41,43 @@ class AgentLangchainHealthControllerTest {
     private AgentLangchainOrchestrator orchestrator;
 
     @Test
-    void healthReportsOk() throws Exception {
+    void healthReportsProviderDisabledWithoutReadinessAlert() throws Exception {
         LangchainServiceProperties.Provider provider = new LangchainServiceProperties.Provider();
         when(properties.getProvider()).thenReturn(provider);
+        when(orchestrator.orchestrationStatus(false)).thenReturn(PROVIDER_DISABLED);
 
         mockMvc.perform(get("/agent-langchain/health"))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.status", is("UP")));
+                .andExpect(jsonPath("$.status", is("UP")))
+                .andExpect(jsonPath("$.version", is("UNKNOWN")))
+                .andExpect(jsonPath("$.providerEnabled", is(false)))
+                .andExpect(jsonPath("$.orchestrationStatus", is(PROVIDER_DISABLED)));
+    }
+
+    @Test
+    void healthReportsReadyPipelineWhenProviderEnabled() throws Exception {
+        LangchainServiceProperties.Provider provider = new LangchainServiceProperties.Provider();
+        provider.setEnabled(true);
+        when(properties.getProvider()).thenReturn(provider);
+        when(orchestrator.orchestrationStatus(true)).thenReturn(LINEAR_PIPELINE_READY);
+
+        mockMvc.perform(get("/agent-langchain/health"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status", is("UP")))
+                .andExpect(jsonPath("$.orchestrationStatus", is(LINEAR_PIPELINE_READY)));
+    }
+
+    @Test
+    void healthReportsUnavailablePipelineWhenProviderEnabled() throws Exception {
+        LangchainServiceProperties.Provider provider = new LangchainServiceProperties.Provider();
+        provider.setEnabled(true);
+        when(properties.getProvider()).thenReturn(provider);
+        when(orchestrator.orchestrationStatus(true)).thenReturn(LINEAR_PIPELINE_UNAVAILABLE);
+
+        mockMvc.perform(get("/agent-langchain/health"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status", is("UP")))
+                .andExpect(jsonPath("$.orchestrationStatus", is(LINEAR_PIPELINE_UNAVAILABLE)));
     }
 
     @Test

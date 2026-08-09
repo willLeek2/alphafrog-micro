@@ -1,24 +1,28 @@
 package world.willfrog.agentlangchain.orchestration;
 
-import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Component;
 
 @Component
-@RequiredArgsConstructor
 public class AgentLangchainOrchestrator {
 
-    private final UnsupportedOrchestrationService unsupportedOrchestrationService;
+    public static final String LINEAR_PIPELINE_READY = "LINEAR_PIPELINE_READY";
+    public static final String PROVIDER_DISABLED = "PROVIDER_DISABLED";
+    public static final String LINEAR_PIPELINE_UNAVAILABLE = "LINEAR_PIPELINE_UNAVAILABLE";
+
     private final ObjectProvider<LangchainLinearRunPipeline> linearRunPipelineProvider;
 
-    public void assertRunExecutionDisabled() {
-        unsupportedOrchestrationService.rejectExecution();
+    public AgentLangchainOrchestrator(ObjectProvider<LangchainLinearRunPipeline> linearRunPipelineProvider) {
+        this.linearRunPipelineProvider = linearRunPipelineProvider;
     }
 
-    public String unimplementedStatus() {
-        if (linearRunPipelineProvider.getIfAvailable() != null) {
-            return "langchain_linear_pipeline_registered";
+    /** 返回稳定的编排能力状态；该值用于 readiness 告警，不替代进程 liveness。 */
+    public String orchestrationStatus(boolean providerEnabled) {
+        if (!providerEnabled) {
+            return PROVIDER_DISABLED;
         }
-        return unsupportedOrchestrationService.statusMessage();
+        return linearRunPipelineProvider.getIfAvailable() == null
+                ? LINEAR_PIPELINE_UNAVAILABLE
+                : LINEAR_PIPELINE_READY;
     }
 }
