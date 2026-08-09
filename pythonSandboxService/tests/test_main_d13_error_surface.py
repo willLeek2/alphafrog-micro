@@ -20,11 +20,28 @@ codex 3d78edba; Cindy 8e21955c / 6a6e6158 / 45dafcda):
 * every unhandled exception surfaces as a JSON 500 via the global handler;
 * config fail-fast: ``queue_max_size < 1`` and
   ``max_task_timeout_seconds <= 0`` raise at load_config.
+
+Additive on f8a383e0 (codex 5457b713 cross-contract MUST-FIX 1/2):
+
+* MUST-FIX 2: the FINAL effective timeout is resolved and frozen at create
+  time. When both timeout fields are absent the frozen effective value is
+  ``config.execution_timeout_seconds`` (never re-derived at run time); a
+  configured default above the ceiling fails at load_config AND at the
+  create gate; ``max_task_timeout_seconds`` and
+  ``execution_timeout_seconds`` must be finite (inf/nan rejected).
+* MUST-FIX 1 (Python side): the canonical companion
+  ``AF_SANDBOX_MAX_TASK_TIMEOUT_MILLIS`` must equal
+  ``AF_SANDBOX_MAX_TASK_TIMEOUT_SECONDS * 1000`` exactly (decimal-exact)
+  when present -- default/equal-override PASS, mismatch/non-finite/
+  non-positive/non-numeric FAIL at load_config; an absent companion stays
+  permitted for dev/test (release presence is enforced by the compose
+  contract test in ccmax's release-binding commit).
 """
 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import json
 import os
@@ -55,7 +72,10 @@ from fastapi import HTTPException  # noqa: E402
 
 from app import main  # noqa: E402
 from app.canonical_fingerprint import CanonicalSandboxCreateSpec  # noqa: E402
-from app.config import load_config  # noqa: E402
+from app.config import (  # noqa: E402
+    load_config,
+    validate_max_task_timeout_binding,
+)
 from app.models import ExecuteRequest, Task, TaskStatus  # noqa: E402
 from app.task_store import DurableTaskStore  # noqa: E402
 
@@ -321,6 +341,180 @@ class MainD13ErrorSurfaceTest(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {"AF_SANDBOX_MAX_TASK_TIMEOUT_SECONDS": "0"}):
             with self.assertRaises(ValueError):
                 load_config()
+
+    # --- MF2: final effective timeout freeze (codex 5457b713 MUST-FIX 2) ---
+
+    async def test_absent_timeout_freezes_configured_default(self) -> None:
+        # Keyless create with BOTH timeout fields absent: the final
+        # effective timeout is config.execution_timeout_seconds and must be
+        # FROZEN into the persisted request (run_in_sandbox / pool.run_task
+        # must never re-derive an unvalidated value at execution time).
+        request = self.request(
+            operation_id=None, timeout_millis=None, timeout_seconds=None
+        )
+        response = await main.create_task(request)
+        self.assertFalse(response.existing)
+        self.assertEqual(self.queue.qsize(), 1)
+        task = self.store.tasks[response.task_id]
+        self.assertEqual(
+            task.request.timeout_seconds, main.config.execution_timeout_seconds
+        )
+
+    async def test_absent_timeout_rejected_when_configured_default_over_max(self) -> None:
+        # Create-gate half of codex 5457b713's exact counter-example:
+        # configured default execution timeout 1801 > max 1800, both request
+        # timeout fields absent → the frozen effective 1801 must be rejected
+        # at acceptance (400), never persisted, never run.
+        over_config = dataclasses.replace(
+            main.config,
+            execution_timeout_seconds=main.config.max_task_timeout_seconds + 1,
+        )
+        request = self.request(
+            operation_id=None, timeout_millis=None, timeout_seconds=None
+        )
+        with patch.object(main, "config", over_config):
+            with self.assertRaises(HTTPException) as raised:
+                await main.create_task(request)
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertIn("effective task timeout", raised.exception.detail)
+        self.assertEqual(self.queue.qsize(), 0)
+        self.assertEqual(len(self.store.tasks), 0)
+
+    def test_load_config_rejects_execution_timeout_over_max(self) -> None:
+        # Startup half of codex 5457b713's exact counter-example: a
+        # configured default execution timeout above the ceiling is a
+        # startup-time contradiction (fail-fast), not a per-request
+        # discovery.
+        env = {
+            "AF_SANDBOX_EXECUTION_TIMEOUT": "1801",
+            "AF_SANDBOX_MAX_TASK_TIMEOUT_SECONDS": "1800",
+        }
+        with patch.dict(os.environ, env):
+            with self.assertRaises(ValueError):
+                load_config()
+
+    def test_load_config_accepts_execution_timeout_at_exactly_max(self) -> None:
+        env = {
+            "AF_SANDBOX_EXECUTION_TIMEOUT": "1800",
+            "AF_SANDBOX_MAX_TASK_TIMEOUT_SECONDS": "1800",
+        }
+        with patch.dict(os.environ, env):
+            self.assertEqual(load_config().execution_timeout_seconds, 1800.0)
+
+    def test_load_config_rejects_infinite_max_task_timeout(self) -> None:
+        # The pre-fix `<= 0` check accepted inf, silently disabling the
+        # ceiling (codex 5457b713 MUST-FIX 2).
+        with patch.dict(os.environ, {"AF_SANDBOX_MAX_TASK_TIMEOUT_SECONDS": "inf"}):
+            with self.assertRaises(ValueError):
+                load_config()
+
+    def test_load_config_rejects_nan_max_task_timeout(self) -> None:
+        with patch.dict(os.environ, {"AF_SANDBOX_MAX_TASK_TIMEOUT_SECONDS": "nan"}):
+            with self.assertRaises(ValueError):
+                load_config()
+
+    def test_load_config_rejects_non_finite_execution_timeout(self) -> None:
+        for raw in ("inf", "nan"):
+            with self.subTest(raw=raw):
+                with patch.dict(os.environ, {"AF_SANDBOX_EXECUTION_TIMEOUT": raw}):
+                    with self.assertRaises(ValueError):
+                        load_config()
+
+    # --- MF1: release-binding companion millis (codex 5457b713 MUST-FIX 1) --
+
+    def test_companion_millis_equal_default_passes(self) -> None:
+        env = {
+            "AF_SANDBOX_MAX_TASK_TIMEOUT_SECONDS": "1800",
+            "AF_SANDBOX_MAX_TASK_TIMEOUT_MILLIS": "1800000",
+        }
+        with patch.dict(os.environ, env):
+            self.assertEqual(load_config().max_task_timeout_seconds, 1800.0)
+
+    def test_companion_millis_equal_override_passes(self) -> None:
+        env = {
+            "AF_SANDBOX_MAX_TASK_TIMEOUT_SECONDS": "1200",
+            "AF_SANDBOX_MAX_TASK_TIMEOUT_MILLIS": "1200000",
+        }
+        with patch.dict(os.environ, env):
+            self.assertEqual(load_config().max_task_timeout_seconds, 1200.0)
+
+    def test_companion_millis_fractional_seconds_exact_passes(self) -> None:
+        # Decimal-exact equivalence: no float-epsilon hole for fractional
+        # seconds (0.1-style binary artifacts must not cause false FAIL).
+        # execution timeout lowered alongside so it stays within the ceiling.
+        env = {
+            "AF_SANDBOX_MAX_TASK_TIMEOUT_SECONDS": "1.5",
+            "AF_SANDBOX_MAX_TASK_TIMEOUT_MILLIS": "1500",
+            "AF_SANDBOX_EXECUTION_TIMEOUT": "1.5",
+        }
+        with patch.dict(os.environ, env):
+            self.assertEqual(load_config().max_task_timeout_seconds, 1.5)
+
+    def test_companion_millis_mismatch_fails_fast(self) -> None:
+        for millis in ("1799999", "1800001", "1800000.5"):
+            with self.subTest(millis=millis):
+                env = {
+                    "AF_SANDBOX_MAX_TASK_TIMEOUT_SECONDS": "1800",
+                    "AF_SANDBOX_MAX_TASK_TIMEOUT_MILLIS": millis,
+                }
+                with patch.dict(os.environ, env):
+                    with self.assertRaises(ValueError):
+                        load_config()
+
+    def test_companion_millis_non_positive_fails_fast(self) -> None:
+        for millis in ("0", "-1000"):
+            with self.subTest(millis=millis):
+                env = {
+                    "AF_SANDBOX_MAX_TASK_TIMEOUT_SECONDS": "1800",
+                    "AF_SANDBOX_MAX_TASK_TIMEOUT_MILLIS": millis,
+                }
+                with patch.dict(os.environ, env):
+                    with self.assertRaises(ValueError):
+                        load_config()
+
+    def test_companion_millis_non_finite_fails_fast(self) -> None:
+        for millis in ("inf", "nan"):
+            with self.subTest(millis=millis):
+                env = {
+                    "AF_SANDBOX_MAX_TASK_TIMEOUT_SECONDS": "1800",
+                    "AF_SANDBOX_MAX_TASK_TIMEOUT_MILLIS": millis,
+                }
+                with patch.dict(os.environ, env):
+                    with self.assertRaises(ValueError):
+                        load_config()
+
+    def test_companion_millis_non_numeric_fails_fast(self) -> None:
+        for seconds, millis in (("1800", "abc"), ("xyz", "1800000")):
+            with self.subTest(seconds=seconds, millis=millis):
+                env = {
+                    "AF_SANDBOX_MAX_TASK_TIMEOUT_SECONDS": seconds,
+                    "AF_SANDBOX_MAX_TASK_TIMEOUT_MILLIS": millis,
+                }
+                with patch.dict(os.environ, env):
+                    with self.assertRaises(ValueError):
+                        load_config()
+
+    def test_companion_millis_absent_still_permitted_for_dev(self) -> None:
+        # Dev/test environments without the release binding keep working;
+        # release PRESENCE is enforced by the compose contract test in the
+        # release-binding commit (codex a1b749ad), not by mandatory
+        # presence here.
+        minimal_env = {
+            "AF_SANDBOX_IMAGE": os.environ["AF_SANDBOX_IMAGE"],
+            "AF_SANDBOX_MAX_TASK_TIMEOUT_SECONDS": "1200",
+        }
+        with patch.dict(os.environ, minimal_env, clear=True):
+            self.assertEqual(load_config().max_task_timeout_seconds, 1200.0)
+
+    def test_binding_seam_mismatch_error_names_both_release_keys(self) -> None:
+        # The compose contract test reuses validate_max_task_timeout_binding;
+        # its failure must be diagnosable from the message alone.
+        with self.assertRaises(ValueError) as raised:
+            validate_max_task_timeout_binding("1800", "999")
+        message = str(raised.exception)
+        self.assertIn("AF_SANDBOX_MAX_TASK_TIMEOUT_MILLIS", message)
+        self.assertIn("AF_SANDBOX_MAX_TASK_TIMEOUT_SECONDS", message)
+        self.assertIn("999", message)
 
 
 if __name__ == "__main__":

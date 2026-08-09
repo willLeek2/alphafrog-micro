@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 
@@ -213,7 +215,13 @@ class SandboxConfig:
     # `effective > max` — the Gateway long-read margin is NOT part of the
     # business limit (Cindy 6a6e6158). Both legacy timeout_seconds and
     # canonical timeout_millis are subject to this ceiling after they are
-    # normalized in create_task.
+    # normalized in create_task; tasks created with BOTH timeout fields
+    # absent are frozen to execution_timeout_seconds at create time and are
+    # subject to the same ceiling (codex 5457b713 MUST-FIX 2). The ceiling
+    # itself must be finite: load_config rejects inf/nan/<=0 (codex
+    # 5457b713). Release binding uses the canonical companion key
+    # AF_SANDBOX_MAX_TASK_TIMEOUT_MILLIS with fail-fast equivalence
+    # checking in load_config (codex 5457b713 MUST-FIX 1).
     max_task_timeout_seconds: float = 1800.0
     # MethodSpec V5 sandbox output limits (Spec §7.2 / contract §13).
     # Application defaults; the dynamic (Nacos) layer may only lower these or
@@ -222,6 +230,83 @@ class SandboxConfig:
     stderr_max_bytes: int = DEFAULT_OUTPUT_LIMITS["stderrMaxBytes"]
     record_channel_max_bytes: int = DEFAULT_OUTPUT_LIMITS["recordChannelMaxBytes"]
     record_channel_max_records: int = DEFAULT_OUTPUT_LIMITS["recordChannelMaxRecords"]
+
+
+# --- D13 (26Q3) release timeout binding keys --------------------------------
+# AF_SANDBOX_MAX_TASK_TIMEOUT_SECONDS (Python ceiling) and the canonical
+# companion AF_SANDBOX_MAX_TASK_TIMEOUT_MILLIS (same substitution source as
+# the Gateway key `sandbox.service.max-task-timeout-millis`) must be bound
+# to ONE canonical release value by the deployment layer (docker-compose
+# substitution; ccmax single-writer release-binding commit per codex
+# a1b749ad). Python fail-fast closes drift at startup: when the companion is
+# present it must equal seconds * 1000 EXACTLY (codex 5457b713 MUST-FIX 1).
+MAX_TASK_TIMEOUT_SECONDS_ENV = "AF_SANDBOX_MAX_TASK_TIMEOUT_SECONDS"
+MAX_TASK_TIMEOUT_MILLIS_ENV = "AF_SANDBOX_MAX_TASK_TIMEOUT_MILLIS"
+DEFAULT_MAX_TASK_TIMEOUT_SECONDS = "1800"
+
+
+def validate_max_task_timeout_binding(
+    seconds_raw: str | None,
+    millis_raw: str | None,
+) -> float:
+    """Validate the D13 release timeout binding; return the ceiling seconds.
+
+    MUST-FIX 1 (codex 5457b713): the Gateway key
+    ``sandbox.service.max-task-timeout-millis`` and the Python key
+    ``AF_SANDBOX_MAX_TASK_TIMEOUT_SECONDS`` must NOT be two independently
+    overridable defaults. The deployment layer injects the SAME canonical
+    millis value into both services; when the canonical companion
+    ``AF_SANDBOX_MAX_TASK_TIMEOUT_MILLIS`` is present, startup FAILS unless
+    it is finite, positive and EXACTLY ``seconds * 1000`` (decimal-exact
+    comparison -- no float epsilon). An absent companion stays permitted for
+    dev/test environments; release presence is enforced by the compose
+    contract test in the release-binding commit, not here.
+
+    MUST-FIX 2 (codex 5457b713): the ceiling itself must be finite -- the
+    pre-fix ``<= 0`` check accepted ``inf`` (and ``nan``), silently
+    disabling the ceiling.
+
+    Reusable seam: the compose contract test calls this same function so the
+    release-binding evidence exercises the production validation path.
+    """
+    if seconds_raw is None:
+        seconds_raw = DEFAULT_MAX_TASK_TIMEOUT_SECONDS
+    try:
+        seconds_dec = Decimal(seconds_raw.strip())
+    except InvalidOperation as error:
+        raise ValueError(
+            f"{MAX_TASK_TIMEOUT_SECONDS_ENV} must be a number; got {seconds_raw!r}"
+        ) from error
+    seconds_value = float(seconds_dec)
+    if (
+        not seconds_dec.is_finite()
+        or not math.isfinite(seconds_value)
+        or seconds_value <= 0
+    ):
+        raise ValueError(
+            f"{MAX_TASK_TIMEOUT_SECONDS_ENV} must be a finite positive number; "
+            f"got {seconds_raw!r}"
+        )
+    if millis_raw is not None and millis_raw.strip():
+        try:
+            millis_dec = Decimal(millis_raw.strip())
+        except InvalidOperation as error:
+            raise ValueError(
+                f"{MAX_TASK_TIMEOUT_MILLIS_ENV} must be a number; got {millis_raw!r}"
+            ) from error
+        if not millis_dec.is_finite() or millis_dec <= 0:
+            raise ValueError(
+                f"{MAX_TASK_TIMEOUT_MILLIS_ENV} must be a finite positive "
+                f"number; got {millis_raw!r}"
+            )
+        if millis_dec != seconds_dec * 1000:
+            raise ValueError(
+                "release timeout binding mismatch: "
+                f"{MAX_TASK_TIMEOUT_MILLIS_ENV}={millis_raw!r} must equal "
+                f"{MAX_TASK_TIMEOUT_SECONDS_ENV}={seconds_raw!r} * 1000 "
+                f"(expected {seconds_dec * 1000})"
+            )
+    return seconds_value
 
 
 def load_config() -> SandboxConfig:
@@ -279,7 +364,12 @@ def load_config() -> SandboxConfig:
     usage_sampling_interval_millis = int(os.getenv("AF_SANDBOX_USAGE_SAMPLE_MILLIS", "200"))
     task_store_path = Path(os.getenv("AF_SANDBOX_TASK_STORE_PATH", "/data/sandbox_tasks/state.json"))
     queue_max_size = int(os.getenv("AF_SANDBOX_QUEUE_MAX_SIZE", "128"))
-    max_task_timeout_seconds = float(os.getenv("AF_SANDBOX_MAX_TASK_TIMEOUT_SECONDS", "1800"))
+    # D13 (26Q3, codex 5457b713): finite/positive ceiling + canonical
+    # companion equivalence (MUST-FIX 1/2) are validated in the shared seam.
+    max_task_timeout_seconds = validate_max_task_timeout_binding(
+        os.getenv(MAX_TASK_TIMEOUT_SECONDS_ENV),
+        os.getenv(MAX_TASK_TIMEOUT_MILLIS_ENV),
+    )
 
     # Config validation
     if pool_enabled and pool_min_size > pool_max_size:
@@ -295,8 +385,23 @@ def load_config() -> SandboxConfig:
         raise ValueError("AF_SANDBOX_USAGE_SAMPLE_MILLIS must be positive")
     if queue_max_size < 1:
         raise ValueError("AF_SANDBOX_QUEUE_MAX_SIZE must be >= 1")
-    if max_task_timeout_seconds <= 0:
-        raise ValueError("AF_SANDBOX_MAX_TASK_TIMEOUT_SECONDS must be positive")
+    # D13 (26Q3, codex 5457b713 MUST-FIX 2): execution_timeout_seconds is
+    # the FINAL effective timeout for tasks created with both timeout fields
+    # absent (frozen at create time, see main.create_task). It must
+    # therefore be finite, positive and within the hard ceiling; a
+    # configured default above the ceiling is a startup-time contradiction,
+    # not a per-request discovery.
+    if not math.isfinite(execution_timeout) or execution_timeout <= 0:
+        raise ValueError(
+            "AF_SANDBOX_EXECUTION_TIMEOUT must be a finite positive number"
+        )
+    if execution_timeout > max_task_timeout_seconds:
+        raise ValueError(
+            f"AF_SANDBOX_EXECUTION_TIMEOUT ({execution_timeout}) must not exceed "
+            f"{MAX_TASK_TIMEOUT_SECONDS_ENV} ({max_task_timeout_seconds}): the "
+            "configured default execution timeout is the final effective timeout "
+            "for tasks created without an explicit timeout."
+        )
     if container_max_concurrency > 1 and compat_input_path_enabled:
         # The global /sandbox/input symlink would be overwritten by concurrent tasks.
         logger.warning(

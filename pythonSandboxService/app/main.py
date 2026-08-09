@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -493,22 +494,41 @@ async def create_task(request: ExecuteRequest):
             raise HTTPException(status_code=400, detail="timeout_seconds conflicts with timeout_millis")
         request.timeout_seconds = timeout_seconds
     # D13 (26Q3, Cindy 91490076 MUST-FIX 3 execution-entry side + Cindy
-    # 8e21955c/6a6e6158): after BOTH legacy timeout_seconds and canonical
-    # timeout_millis are consistency-normalized above, validate the FINAL
-    # effective timeout ONCE: `0 < effective <= max`. Rejection threshold is
-    # `effective > max` — the Gateway long-read margin is NOT part of this
-    # business limit. A Pydantic field constraint is deliberately NOT used:
-    # canonical timeout_millis is normalized into timeout_seconds AFTER field
-    # validation, so field revalidation may never fire (Cindy 8e21955c).
-    # The seconds-domain float comparison has no integer-truncation hole:
-    # millis → seconds is exact IEEE-754 division (e.g. 1800.0009s > 1800.0
-    # is rejected), and the chained comparison is False for NaN/Infinity/
-    # negative/zero, so all of those fail closed here too.
+    # 8e21955c/6a6e6158 + codex 5457b713 MUST-FIX 2): after BOTH legacy
+    # timeout_seconds and canonical timeout_millis are consistency-normalized
+    # above, RESOLVE AND FREEZE the FINAL effective timeout, then validate it
+    # ONCE: `0 < effective <= max`.
+    #
+    # MF2 freeze: when neither timeout_seconds nor timeout_millis is
+    # supplied, the execution path (run_in_sandbox / pool.run_task) falls
+    # back to config.execution_timeout_seconds — that configured default IS
+    # the final effective timeout. It is frozen into the persisted request
+    # HERE (same mutation precedent as the millis→seconds normalization
+    # above), so execution never re-derives an unvalidated value at run
+    # time and an idempotent re-create returns the original frozen task.
+    # load_config already rejects a configured default that exceeds the
+    # ceiling (fail-fast at startup); the gate below is defense in depth
+    # for both branches. The fingerprint is unaffected: the canonical spec
+    # binds timeout_millis (required for keyed creates), never
+    # timeout_seconds.
+    #
+    # Rejection threshold is `effective > max` — the Gateway long-read
+    # margin is NOT part of this business limit. A Pydantic field constraint
+    # is deliberately NOT used: canonical timeout_millis is normalized into
+    # timeout_seconds AFTER field validation, so field revalidation may
+    # never fire (Cindy 8e21955c). The seconds-domain float comparison has
+    # no integer-truncation hole: millis → seconds is exact IEEE-754
+    # division (e.g. 1800.0009s > 1800.0 is rejected); NaN/Infinity/
+    # negative/zero fail closed via math.isfinite + the chained comparison.
     # max_task_timeout_seconds (AF_SANDBOX_MAX_TASK_TIMEOUT_SECONDS, default
     # 1800s = 30min) is lock-step aligned with the Gateway-side key
     # `sandbox.service.max-task-timeout-millis` (default 1800000, ccmax
-    # a1687d2f); release config must bind both ends to the same value.
-    if request.timeout_seconds is not None and not (
+    # a1687d2f); release config binds both ends through the canonical
+    # companion AF_SANDBOX_MAX_TASK_TIMEOUT_MILLIS with fail-fast
+    # equivalence checking in load_config (codex 5457b713 MUST-FIX 1).
+    if request.timeout_seconds is None:
+        request.timeout_seconds = config.execution_timeout_seconds
+    if not math.isfinite(request.timeout_seconds) or not (
         0 < request.timeout_seconds <= config.max_task_timeout_seconds
     ):
         raise HTTPException(
