@@ -275,6 +275,24 @@ class RereadToolHandlerTest {
                     .totalLength(7)
                     .build();
         }
+
+        // D22-5.1.3 显式上下文 overload：本 stub 只服务 legacy reread 路径，新入口同语义兜底。
+        @Override
+        public world.willfrog.agent.platform.artifact.PersistentArtifactRegistration registerRawOutput(
+                String runId, String userId, String logicalId, String displayName, String content) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public RawPayloadLocator locatorFor(String runId, String userId, String rawRef) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public ToolOutputReadResult read(String runId, String userId, String rawRef,
+                                         int offset, int limit, String keyword) {
+            return read(rawRef, offset, limit, keyword);
+        }
     }
 
     private static class StubRunRawRefStore implements RunRawRefStore {
