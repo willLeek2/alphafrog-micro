@@ -435,10 +435,13 @@ class AgentRunMapperResumeAcceptedPostgresIntegrationTest {
                     .as("listResumeReadyAnchors 必须排除 READY+true")
                     .doesNotContain("run-bad-1");
 
-            // DB 不变
-            assertThat(mapper.findById("run-bad-1").getToolJobAnchorJson())
-                    .contains("\"resumeState\":\"READY\"")
-                    .contains("\"resultConsumed\":true");
+            // DB 不变：用 JSON tree 断言，避免依赖 PG jsonb 空白格式，
+            // 且不能走 fromJson（会对 READY+true 抛出矛盾异常）
+            String dbJson = mapper.findById("run-bad-1").getToolJobAnchorJson();
+            com.fasterxml.jackson.databind.JsonNode root =
+                    new com.fasterxml.jackson.databind.ObjectMapper().readTree(dbJson);
+            assertThat(root.get("resumeState").asText()).isEqualTo("READY");
+            assertThat(root.get("resultConsumed").asBoolean()).isTrue();
         }
 
         // fromJson 仍然 fail-closed（Java 层防御）
