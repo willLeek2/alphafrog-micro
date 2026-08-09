@@ -78,6 +78,7 @@ WRAPPER_MODULE_FILES = (
     "bounded_exec_wrapper.py",
     "capture_reader.py",
     "child_identity.py",
+    "payload_contract.py",
 )
 WRAPPER_DIR_NAME = "bounded-wrapper"
 
