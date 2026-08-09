@@ -2,6 +2,7 @@ package world.willfrog.agent.tools.router;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
 import lombok.Builder;
@@ -136,6 +137,8 @@ public class ToolRouter {
     private final StressTestProperties stressTestProperties;
     /** 按 toolName 缓存 Timer 实例，避免每次调用重新构建（线程安全） */
     private final ConcurrentHashMap<String, Timer> toolCallTimers = new ConcurrentHashMap<>();
+    // D07：限流拒绝的独立低基数计数（toolName × layer），与成功 toolCalls 累加器分离
+    private final ConcurrentHashMap<String, Counter> throttleRejectionCounters = new ConcurrentHashMap<>();
 
     /**
      * Run 级预算服务 — 可选注入（@Autowired(required = false)），
@@ -244,13 +247,20 @@ public class ToolRouter {
             if (acquired.isEmpty()) {
                 int effectiveWeight = toolWeightedLimitService.previewEffectiveWeight(toolName, params);
                 String errorResult = weightLimitExceeded(toolName, effectiveWeight);
-                recordObservability(toolName, params, errorResult, 0, false, null);
-                getOrCreateToolCallTimer(nvl(toolName)).record(0, TimeUnit.MILLISECONDS);
+                /*
+                 * D07 口径：限流拒绝 ≠ 已执行工具调用。不调用 recordObservability——
+                 * 拒绝不得抬高 observability summary.toolCalls、不得消耗 maxToolCalls
+                 * 判定额度；拒绝用独立的低基数 Micrometer 计数观测（toolName × layer），
+                 * 与成功调用累加器完全分离。throttleRejected 标记随结果传给 executor，
+                 * 由其在 TOOL_CALL_FINISHED payload 写 creditsConsumed=0。
+                 */
+                getOrCreateThrottleRejectionCounter(nvl(toolName), "weight_limit").increment();
                 return ToolInvocationResult.builder()
                         .output(errorResult)
                         .success(false)
                         .durationMs(0)
                         .cacheMeta(null)
+                        .throttleRejected(true)
                         .build();
             }
             weightLease = acquired;
@@ -335,6 +345,21 @@ public class ToolRouter {
         return toolCallTimers.computeIfAbsent(toolName, name ->
                 Timer.builder("tool.call")
                         .tag("toolName", name)
+                        .register(meterRegistry));
+    }
+
+    /**
+     * 获取或创建限流拒绝计数器（D07）。
+     *
+     * <p>拒绝计数与 {@code tool.call} 执行计时分离：被拒绝的调用没有执行，不计时、
+     * 不进成功累加器。tag 仅 toolName（注册表 25 名内）与 layer（weight_limit /
+     * lc4j_semaphore），基数有界。</p>
+     */
+    private Counter getOrCreateThrottleRejectionCounter(String toolName, String layer) {
+        return throttleRejectionCounters.computeIfAbsent(toolName + "|" + layer, key ->
+                Counter.builder("tool.call.throttle.rejected")
+                        .tag("toolName", toolName)
+                        .tag("layer", layer)
                         .register(meterRegistry));
     }
 
@@ -1006,17 +1031,23 @@ public class ToolRouter {
     }
 
     /**
-     * 解析工具结果缓存的 scope。
+     * 解析工具结果缓存的 scope（D07 Risks 3.3.2 口径）。
      *
-     * <p>默认按用户隔离（{@code user:<userId>}），无用户上下文时退化为 global，
-     * 后者意味着多个用户可能共享同一份结果（仅适用于完全无个人数据的工具）。</p>
+     * <p>优先按用户隔离（{@code user:<userId>}）；无用户上下文时按 run 隔离
+     * （{@code run:<runId>}），不同匿名 run 互不命中；二者皆无则返回空串，
+     * 由缓存层 fail-closed 跳过共享缓存读写，绝不退化为可跨租户串线的
+     * {@code global} 兜底。AgentContext 当前无 session 身份概念，run 即匿名隔离单元。</p>
      */
     private String resolveScope() {
         String userId = AgentContext.getUserId();
-        if (userId == null || userId.isBlank()) {
-            return "global";
+        if (userId != null && !userId.isBlank()) {
+            return "user:" + userId.trim();
         }
-        return "user:" + userId.trim();
+        String runId = AgentContext.getRunId();
+        if (runId != null && !runId.isBlank()) {
+            return "run:" + runId.trim();
+        }
+        return "";
     }
 
     /** 空安全：null 转为空字符串。 */
@@ -1073,5 +1104,10 @@ public class ToolRouter {
         private long durationMs;
         /** 缓存元数据（是否符合缓存条件、是否命中、来源、剩余 TTL 等） */
         private ToolResultCacheService.CacheMeta cacheMeta;
+        /**
+         * D07：是否因限流（权重/LC4j Semaphore）被拒绝而未真正执行。
+         * 拒绝结果不计成功工具预算、工具 credit 为 0，executor 据此写 FINISHED 契约字段。
+         */
+        private boolean throttleRejected;
     }
 }

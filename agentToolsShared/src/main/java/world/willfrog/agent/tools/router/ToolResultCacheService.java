@@ -217,7 +217,12 @@ public class ToolResultCacheService {
 
     private CachePlan buildPlan(String toolName, Map<String, Object> params, String scope) {
         CacheMode mode = resolveMode(toolName);
-        if (mode == CacheMode.NONE) {
+        /*
+         * D07 fail-closed（Risks 3.3.2）：blank scope（无 userId 且无 runId）不得
+         * 落 global 共享键；REDIS 共享缓存此时跳过读写、强制回源。DATASET_REGISTRY
+         * 为内容寻址的系统级市场数据复用，不经 Redis scope 键，不受此限。
+         */
+        if (mode == CacheMode.NONE || (mode == CacheMode.REDIS && blank(scope))) {
             return CachePlan.builder()
                     .mode(CacheMode.NONE)
                     .key("")
@@ -275,7 +280,12 @@ public class ToolResultCacheService {
         Map<String, String> normalizedArgs = normalizeArgs(toolName, params);
         String argsJson = safeWrite(normalizedArgs);
         String argsHash = sha256(argsJson);
-        String resolvedScope = safeToken(blank(scope) ? "global" : scope);
+        /*
+         * D07：不再把 blank scope 默认写成 global。REDIS 模式的 blank scope 已在
+         * buildPlan 被拒（跳过共享缓存）；这里仅 DATASET_REGISTRY 的观测性键可能
+         * 带 blank scope，用不可与真实 scope（user:/run: 前缀）碰撞的明示标签。
+         */
+        String resolvedScope = safeToken(blank(scope) ? "no-shared-scope" : scope);
         String version = safeToken(resolveVersion());
         return CACHE_PREFIX + safeToken(toolName) + ":" + argsHash + ":" + resolvedScope + ":" + version;
     }
