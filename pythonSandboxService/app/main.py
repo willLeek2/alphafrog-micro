@@ -7,7 +7,8 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Dict
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 
 from .canonical_fingerprint import (
     CanonicalFingerprintMismatch,
@@ -67,7 +68,12 @@ dynamic_config = DynamicSandboxConfig(config)
 # Durable task/result storage and operationId index
 task_store = DurableTaskStore(config.task_store_path)
 tasks: Dict[str, Task] = task_store.tasks
-task_queue: asyncio.Queue = asyncio.Queue()
+# D13 (26Q3): BOUNDED acceptance queue. create_task rejects 503 BEFORE
+# persisting when the queue is full, making capacity exhaustion
+# machine-observable (frozen D13 category OVERLOADED_OR_UNAVAILABLE →
+# Gateway maps purely by downstream HTTP status). Size comes from
+# AF_SANDBOX_QUEUE_MAX_SIZE (default 128, config.queue_max_size).
+task_queue: asyncio.Queue = asyncio.Queue(maxsize=config.queue_max_size)
 
 # Container scheduler (created in lifespan)
 pool: ContainerPoolScheduler | None = None
@@ -387,8 +393,12 @@ async def lifespan(app: FastAPI):
     global pool
     worker_count = max(1, config.max_concurrency)
 
-    for recovered_task_id in task_store.recover_after_restart():
-        await task_queue.put(recovered_task_id)
+    # D13 (26Q3): the acceptance queue is bounded (config.queue_max_size).
+    # Enqueueing recovered tasks BEFORE the workers start would deadlock
+    # startup whenever the recovered backlog exceeds the queue capacity, so
+    # recovery IDs are materialized here and only enqueued AFTER the workers
+    # exist (workers drain the queue while the backlog is being put).
+    recovered_task_ids = list(task_store.recover_after_restart())
 
     # Start Nacos config listener for hot-reloadable values.
     start_nacos_listener(config, dynamic_config)
@@ -402,6 +412,10 @@ async def lifespan(app: FastAPI):
         logger.info("Container pool disabled, using fresh containers per task")
 
     worker_tasks = [asyncio.create_task(worker(i + 1)) for i in range(worker_count)]
+    # D13 (26Q3): enqueue recovered tasks only after the workers exist so a
+    # backlog larger than the bounded queue cannot deadlock startup.
+    for recovered_task_id in recovered_task_ids:
+        await task_queue.put(recovered_task_id)
     stats_task = asyncio.create_task(_log_pool_stats())
     yield
 
@@ -419,6 +433,26 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="alphafrog-python-sandbox", version="0.3.0", lifespan=lifespan)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    # D13 (26Q3, ccqwen 1f4e16d4 #5): every unhandled exception must surface
+    # as a JSON 500 (→ Gateway DOWNSTREAM_FAILURE). This eliminates the
+    # non-JSON bare 500s that previously escaped straight out of the stack
+    # (e.g. task_store RuntimeError/OSError paths). HTTPException keeps its
+    # own dedicated handler, so the typed status codes raised by the
+    # endpoints above are unaffected.
+    logger.error(
+        "UNHANDLED_EXCEPTION method=%s path=%s error=%r",
+        request.method,
+        request.url.path,
+        exc,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"internal error: {type(exc).__name__}: {exc}"},
+    )
 
 
 @app.get("/health")
@@ -458,10 +492,44 @@ async def create_task(request: ExecuteRequest):
         if request.timeout_seconds is not None and abs(request.timeout_seconds - timeout_seconds) > 0.001:
             raise HTTPException(status_code=400, detail="timeout_seconds conflicts with timeout_millis")
         request.timeout_seconds = timeout_seconds
+    # D13 (26Q3, Cindy 91490076 MUST-FIX 3 execution-entry side + Cindy
+    # 8e21955c/6a6e6158): after BOTH legacy timeout_seconds and canonical
+    # timeout_millis are consistency-normalized above, validate the FINAL
+    # effective timeout ONCE: `0 < effective <= max`. Rejection threshold is
+    # `effective > max` — the Gateway long-read margin is NOT part of this
+    # business limit. A Pydantic field constraint is deliberately NOT used:
+    # canonical timeout_millis is normalized into timeout_seconds AFTER field
+    # validation, so field revalidation may never fire (Cindy 8e21955c).
+    # The seconds-domain float comparison has no integer-truncation hole:
+    # millis → seconds is exact IEEE-754 division (e.g. 1800.0009s > 1800.0
+    # is rejected), and the chained comparison is False for NaN/Infinity/
+    # negative/zero, so all of those fail closed here too.
+    # max_task_timeout_seconds (AF_SANDBOX_MAX_TASK_TIMEOUT_SECONDS, default
+    # 1800s = 30min) is lock-step aligned with the Gateway-side key
+    # `sandbox.service.max-task-timeout-millis` (default 1800000, ccmax
+    # a1687d2f); release config must bind both ends to the same value.
+    if request.timeout_seconds is not None and not (
+        0 < request.timeout_seconds <= config.max_task_timeout_seconds
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "effective task timeout must satisfy 0 < effective <= "
+                f"{config.max_task_timeout_seconds} seconds; got "
+                f"timeout_seconds={request.timeout_seconds!r}, "
+                f"timeout_millis={request.timeout_millis!r}"
+            ),
+        )
     try:
         verify_request_fingerprint(request)
     except CanonicalFingerprintMismatch as error:
-        raise HTTPException(status_code=409, detail=str(error)) from error
+        # D13 (26Q3, ccqwen 1f4e16d4 #1): a declared request_fingerprint that
+        # does not match the recomputed canonical fingerprint is
+        # SELF-CONTRADICTORY CLIENT DATA → 400 → Gateway INVALID_ARGUMENT
+        # (was 409). It is NOT a state conflict; a genuine conflict
+        # (operation_id already bound to another fingerprint/payload) stays
+        # 409 → CONFLICT at the store layer below.
+        raise HTTPException(status_code=400, detail=str(error)) from error
     except CanonicalSpecError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     task_id = str(uuid.uuid4())
@@ -477,6 +545,22 @@ async def create_task(request: ExecuteRequest):
     # the ORIGINAL task (original ref kept), execution never re-reads hot
     # config, and a later image change only affects NEW tasks.
     task.runtime_image_ref = config.sandbox_image
+    # D13 (26Q3, ccqwen 1f4e16d4 #4): bounded acceptance queue. Reject
+    # BEFORE persisting when the queue is already full so no task is ever
+    # stored without a queue entry (no orphan). 503 → frozen category
+    # OVERLOADED_OR_UNAVAILABLE. Fail-closed over-rejection is accepted:
+    # while the queue is full even an idempotent replay of an EXISTING
+    # operation is rejected (the store is not consulted first).
+    # task_store.create below is synchronous (no await between full() and
+    # put_nowait), so on this single-threaded event loop no other coroutine
+    # can interleave — the QueueFull backstop is defensive only; a task
+    # persisted in that impossible race would be re-enqueued by
+    # recover_after_restart on next startup.
+    if task_queue.full():
+        raise HTTPException(
+            status_code=503,
+            detail="sandbox task queue is full; retry later",
+        )
     try:
         decision = task_store.create(task)
     except OperationConflictError as error:
@@ -484,7 +568,13 @@ async def create_task(request: ExecuteRequest):
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     if not decision.existing:
-        await task_queue.put(decision.task.task_id)
+        try:
+            task_queue.put_nowait(decision.task.task_id)
+        except asyncio.QueueFull:
+            raise HTTPException(
+                status_code=503,
+                detail="sandbox task queue is full; retry later",
+            )
     return CreateTaskResponse(
         task_id=decision.task.task_id,
         status=decision.task.status,
@@ -524,6 +614,22 @@ async def get_task_result(task_id: str):
             if task.result is not None:
                 return task.result
             terminal_status = task.status.value.lower()
-            raise HTTPException(status_code=400, detail=f"Task {terminal_status}: {task.error}")
-        raise HTTPException(status_code=409, detail=f"Task not finished. Status: {task.status}")
+            # D13 (26Q3, ccqwen 1f4e16d4 #3): a TERMINAL task without a
+            # persisted result is an execution-entry INTERNAL failure (e.g.
+            # restart-recovery gap), not a client argument defect → JSON 500
+            # → Gateway DOWNSTREAM_FAILURE (was bare 400, which the Gateway
+            # would mis-map to INVALID_ARGUMENT).
+            raise HTTPException(
+                status_code=500,
+                detail=f"Task {terminal_status} without result: {task.error}",
+            )
+        # D13 (26Q3, ccqwen 1f4e16d4 #2): task not finished yet. 425 Too
+        # Early is an UNKNOWN 4xx to the Gateway mapping → UNSPECIFIED with
+        # the downstream status preserved → Gateway fails closed and keeps
+        # polling, instead of misreading a live task as a terminal 409
+        # CONFLICT (the pre-D13 behavior).
+        raise HTTPException(
+            status_code=425,
+            detail=f"Task not finished. Status: {task.status}",
+        )
     return task.result

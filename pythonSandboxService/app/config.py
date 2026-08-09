@@ -198,6 +198,23 @@ class SandboxConfig:
     queue_wait_timeout_seconds: float = 30.0
     usage_sampling_interval_millis: int = 200
     task_store_path: Path = Path("/data/sandbox_tasks/state.json")
+    # D13 (26Q3): bounded acceptance queue. create rejects with HTTP 503
+    # when the queue already holds queue_max_size waiting tasks, making
+    # capacity exhaustion machine-observable (frozen D13 category
+    # OVERLOADED_OR_UNAVAILABLE). The post-acceptance queue-wait timeout
+    # (queue_wait_timeout_seconds) remains a 200-data terminal outcome.
+    queue_max_size: int = 128
+    # D13 (26Q3, Cindy 91490076 MUST-FIX 3 execution-entry side): hard
+    # per-task timeout ceiling enforced at the execution entry. The value is
+    # aligned with the Gateway-side platform max key
+    # `sandbox.service.max-task-timeout-millis` (default 30min = 1800s,
+    # ccmax ac601ddd); release config must lock both ends to the same value
+    # to avoid runtime drift (Cindy 8e21955c). Rejection threshold is
+    # `effective > max` — the Gateway long-read margin is NOT part of the
+    # business limit (Cindy 6a6e6158). Both legacy timeout_seconds and
+    # canonical timeout_millis are subject to this ceiling after they are
+    # normalized in create_task.
+    max_task_timeout_seconds: float = 1800.0
     # MethodSpec V5 sandbox output limits (Spec §7.2 / contract §13).
     # Application defaults; the dynamic (Nacos) layer may only lower these or
     # clamp them down to HARD_OUTPUT_LIMIT_CEILINGS, never raise them.
@@ -261,6 +278,8 @@ def load_config() -> SandboxConfig:
     queue_wait_timeout_seconds = float(os.getenv("AF_SANDBOX_QUEUE_WAIT_TIMEOUT", "30"))
     usage_sampling_interval_millis = int(os.getenv("AF_SANDBOX_USAGE_SAMPLE_MILLIS", "200"))
     task_store_path = Path(os.getenv("AF_SANDBOX_TASK_STORE_PATH", "/data/sandbox_tasks/state.json"))
+    queue_max_size = int(os.getenv("AF_SANDBOX_QUEUE_MAX_SIZE", "128"))
+    max_task_timeout_seconds = float(os.getenv("AF_SANDBOX_MAX_TASK_TIMEOUT_SECONDS", "1800"))
 
     # Config validation
     if pool_enabled and pool_min_size > pool_max_size:
@@ -274,6 +293,10 @@ def load_config() -> SandboxConfig:
         raise ValueError("AF_SANDBOX_QUEUE_WAIT_TIMEOUT must be positive")
     if usage_sampling_interval_millis <= 0:
         raise ValueError("AF_SANDBOX_USAGE_SAMPLE_MILLIS must be positive")
+    if queue_max_size < 1:
+        raise ValueError("AF_SANDBOX_QUEUE_MAX_SIZE must be >= 1")
+    if max_task_timeout_seconds <= 0:
+        raise ValueError("AF_SANDBOX_MAX_TASK_TIMEOUT_SECONDS must be positive")
     if container_max_concurrency > 1 and compat_input_path_enabled:
         # The global /sandbox/input symlink would be overwritten by concurrent tasks.
         logger.warning(
@@ -308,6 +331,8 @@ def load_config() -> SandboxConfig:
         queue_wait_timeout_seconds=queue_wait_timeout_seconds,
         usage_sampling_interval_millis=usage_sampling_interval_millis,
         task_store_path=task_store_path,
+        queue_max_size=queue_max_size,
+        max_task_timeout_seconds=max_task_timeout_seconds,
     )
 
 
