@@ -20,6 +20,7 @@ import world.willfrog.agent.platform.dataanalysis.CompletedTodoRecord;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agent.platform.prompt.PromptRunSelection;
 import world.willfrog.agent.platform.service.AgentCreditService;
 import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agent.platform.service.AgentMessageService;
@@ -47,6 +48,7 @@ import java.util.Map;
 import java.util.ArrayList;
 import java.util.function.Consumer;
 import java.util.function.BooleanSupplier;
+import java.time.LocalDate;
 
 /**
  * agentLangchainService 的 run 级总控流水线。
@@ -273,6 +275,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
 
             // 从 ext 反序列化 run 启动时冻结的 dataFreshness 快照
             setDataFreshnessFromExt(run.getExt());
+            setPromptSelectionFromExt(run.getExt());
 
             // 这里先解析”当前 run 允许暴露给模型的工具列表”，planning（规划）阶段会把这些工具能力写进 prompt，
             // execution（执行）阶段也会用同一套 ToolSpecification 注册到 LC4j（LangChain4j）AiServices。
@@ -540,6 +543,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             AgentContext.setWebSearchEnabled(runConfig.webSearchEnabled());
             AgentContext.setWebSearchConfig(runConfig.webSearchConfig());
             setDataFreshnessFromExt(run.getExt());
+            setPromptSelectionFromExt(run.getExt());
             // 用相同运行配置重建工具目录，但不会再次调用 planner。
             List<ToolSpecification> toolSpecifications = resolveToolSpecifications(runConfig, userGoal);
             // 构造新的请求对象，把持久化数据重新放入当前 worker 的调用链。
@@ -1030,6 +1034,30 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             AgentContext.setDataFreshness(freshness);
         } catch (Exception e) {
             log.warn("Failed to parse data_freshness from ext for agent run, falling back to live config", e);
+        }
+    }
+
+    /** 从 run.ext 恢复 D02 冻结的 Prompt 选择；旧 Run 没有该字段时保持兼容的当前默认。 */
+    private void setPromptSelectionFromExt(String extJson) {
+        if (extJson == null || extJson.isBlank()) {
+            return;
+        }
+        try {
+            var extNode = objectMapper.readTree(extJson);
+            var node = extNode.get("prompt_selection");
+            if (node == null || node.isNull()) {
+                return;
+            }
+            PromptRunSelection selection = new PromptRunSelection(
+                    node.path("schema_version").asInt(-1),
+                    textOrNull(node, "bundle_version"),
+                    textOrNull(node, "variant"),
+                    textOrNull(node, "bundle_digest"),
+                    textOrNull(node, "capability_catalog_digest"),
+                    LocalDate.parse(textOrNull(node, "reference_date")));
+            AgentContext.setPromptRunSelection(selection);
+        } catch (Exception e) {
+            throw new IllegalStateException("PROMPT_SELECTION_INVALID", e);
         }
     }
 

@@ -1,0 +1,5 @@
+[Stage: PYTHON_REPAIR]
+当前是 executePython 失败后的修复轮次。必须根据终端诊断修改代码或有效参数，再实际调用 executePython 验证；不得只输出代码、JSON 或解释，也不得原样重放已失败请求。
+
+修复必须满足：
+{{requirements}}

@@ -3,7 +3,7 @@ package world.willfrog.agentlangchain.orchestration;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.langchain4j.data.message.ChatMessage;
-import dev.langchain4j.data.message.SystemMessage;
+import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.model.chat.request.ChatRequest;
 import dev.langchain4j.service.AiServices;
 import dev.langchain4j.service.tool.ToolProvider;
@@ -22,6 +22,7 @@ import world.willfrog.agent.workflow.TodoItem;
 import world.willfrog.agentlangchain.tools.LangchainDatasetRefContext;
 import world.willfrog.agentlangchain.tools.LangchainRepeatedToolCallContext;
 import world.willfrog.agentlangchain.tooljob.ToolJobResumeContext;
+import world.willfrog.agentlangchain.prompt.ToolCapabilityPromptRenderer;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -85,13 +86,6 @@ public class LangchainTodoNodeExecutor {
      * 附加到 user message 末尾的安全 recovery 提示。仅在第一次返回空输出后追加一次。
      * 设计为 50+ 字符强制回答 + 明确禁止再次调用工具，让模型直接给文字结论。
      */
-    private static final String RECOVERY_HINT = "\n\n[SYSTEM_RECOVERY_HINT]\n"
-            + "上一次你返回了空内容。请用至少 50 个字符直接回答：\n"
-            + "1) 你的判断结论（成功 / 失败 / 需要更多信息）；\n"
-            + "2) 如果是工具问题，列出调用过的工具及结果摘要；\n"
-            + "3) 如果是数据问题，列出具体哪些字段缺失。\n"
-            + "不要调用任何工具，直接给文字回答。";
-
     /**
      * recovery 触发的预算阈值观察口径：当前预算任一维度上限 > 0 时认为本次 todo 输出可能受预算约束。
      * 这是 config-only 粗粒度信号（避免在观测阶段调用 check()/exceeded() 主路径，#60 会改 AgentRunBudgetService.exceeded() 抛 RunBudgetException）。
@@ -253,11 +247,13 @@ public class LangchainTodoNodeExecutor {
                 completedTodos,
                 datasetRefs,
                 item.getDescription(),
-                request.getToolSpecifications());
+                request.getToolSpecifications(),
+                ToolCapabilityPromptRenderer.render(promptService, request.getToolSpecifications()));
         boolean pythonRepair = isPythonRepair(repairContext);
         AtomicBoolean acceptedPythonRepairExecution = new AtomicBoolean(false);
         if (pythonRepair) {
-            userMessage += buildPythonRepairUserMessage(repairContext);
+            userMessage += "\n\n" + promptService.pythonRepairStageInstruction()
+                    + buildPythonRepairUserMessage(repairContext);
             AgentContext.setPythonRefineAttempt(repairContext.getPythonRepairAttempt());
             AgentContext.setPythonRepairContext(new PythonRepairContext(
                     repairContext.getPythonRepairAttempt(),
@@ -431,7 +427,8 @@ public class LangchainTodoNodeExecutor {
         String recoveredOutput;
         String recoveryOutcome;
         try {
-            recoveredOutput = buildRecoveryAiService(request).execute(userMessage + RECOVERY_HINT);
+            recoveredOutput = buildRecoveryAiService(request).execute(
+                    userMessage + "\n\n" + promptService.emptyOutputRecoveryStageInstruction());
         } catch (Exception recEx) {
             recoveredOutput = null;
             recoveryOutcome = "exception";
@@ -499,7 +496,7 @@ public class LangchainTodoNodeExecutor {
     private LangchainTodoExecutionAiService buildRecoveryAiService(LangchainLinearWorkflowRequest request) {
         return AiServices.builder(LangchainTodoExecutionAiService.class)
                 .chatModel(request.executionModelOrDefault())
-                .systemMessageProvider(ignored -> promptService.dagReactSystemPrompt())
+                .systemMessageProvider(ignored -> promptService.reactSystemPrompt())
                 .chatRequestTransformer(chatRequest -> {
                     ensureRunnable(request);
                     return maybeInjectLastMileHint(chatRequest);
@@ -671,8 +668,8 @@ public class LangchainTodoNodeExecutor {
      * 配置要点（面试常问）：
      * <ul>
      *   <li><b>chatModel</b>：使用 execution 阶段模型（{@code request.executionModelOrDefault()}），可与 planning/final answer 阶段不同；</li>
-     *   <li><b>systemMessageProvider</b>：每次请求前动态获取 system prompt（{@link AgentPromptService#dagReactSystemPrompt()}），
-     *       保证时间基准、角色设定等上下文实时生效；</li>
+     *   <li><b>systemMessageProvider</b>：每次请求前获取稳定 System（{@link AgentPromptService#reactSystemPrompt()}）；
+     *       Todo 执行阶段正文由 User Message 单独注入；</li>
      *   <li><b>maxToolCallingRoundTrips</b>：单 todo 内模型↔工具的最大往返轮数，默认 30，受 {@link #resolveMaxToolRoundTrips} 约束；</li>
      *   <li><b>chatRequestTransformer</b>：每次发 LLM 请求前检查 run 是否被取消/暂停（{@link #ensureRunnable}），
      *       防止用户已点 cancel 但请求仍发出；</li>
@@ -701,8 +698,7 @@ public class LangchainTodoNodeExecutor {
         AiServices<LangchainTodoExecutionAiService> builder = AiServices
                 .builder(LangchainTodoExecutionAiService.class)
                 .chatModel(request.executionModelOrDefault())
-                .systemMessageProvider(ignored -> pythonRepair
-                        ? pythonRepairSystemPrompt() : promptService.dagReactSystemPrompt())
+                .systemMessageProvider(ignored -> promptService.reactSystemPrompt())
                 .maxToolCallingRoundTrips(resolveMaxToolRoundTrips(request.getMaxToolRoundTrips()))
                 .chatRequestTransformer(chatRequest -> {
                     ensureRunnable(request);
@@ -741,24 +737,6 @@ public class LangchainTodoNodeExecutor {
         }
     }
 
-    private String pythonRepairSystemPrompt() {
-        // pythonRefineSystemPrompt 的现有契约要求“只输出 JSON”，它原本供独立 refine
-        // 解析器使用，不能替换 tool-calling loop 的 system prompt；否则模型可能只返回
-        // 代码 JSON 而不真正调用 executePython。
-        StringBuilder prompt = new StringBuilder(promptService.dagReactSystemPrompt())
-                .append("\n\n当前是 executePython 失败后的修复轮次。")
-                .append("必须根据终端诊断修改代码或有效参数，再实际调用 executePython 验证；")
-                .append("不得只输出代码、JSON 或解释，也不得原样重放已失败请求。\n");
-        List<String> requirements = promptService.pythonRefineRequirements();
-        if (requirements != null && !requirements.isEmpty()) {
-            prompt.append("\n\n修复必须满足：\n");
-            for (String requirement : requirements) {
-                prompt.append("- ").append(requirement).append('\n');
-            }
-        }
-        return prompt.toString();
-    }
-
     /**
      * 构建用于生成最终回答（final answer）的 LC4j {@link AiServices} 实例。
      * <p>
@@ -777,7 +755,7 @@ public class LangchainTodoNodeExecutor {
     private LangchainFinalAnswerAiService buildFinalAnswerAiService(LangchainLinearWorkflowRequest request) {
         return AiServices.builder(LangchainFinalAnswerAiService.class)
                 .chatModel(request.finalAnswerModelOrDefault())
-                .systemMessageProvider(ignored -> promptService.dagReactSystemPrompt())
+                .systemMessageProvider(ignored -> promptService.reactSystemPrompt())
                 .chatRequestTransformer(chatRequest -> {
                     ensureRunnable(request);
                     return maybeInjectLastMileHint(chatRequest);
@@ -858,8 +836,7 @@ public class LangchainTodoNodeExecutor {
      * 触发条件：{@link AgentRunBudgetService} 在 run 用量首次跨过 90% 阈值时把提示写入
      * {@link AgentContext#setLastMileHint(String)}（per-run 一次性，原子 SADD gate 守门）。
      * <p>
-     * 注入位置：拼到 ChatRequest.messages 的第一个 {@link SystemMessage} 末尾；
-     * 如果当前消息列表里没有 SystemMessage，则在列表头部新增一条承载提示的 SystemMessage。
+     * 注入位置：作为新的 {@link UserMessage} 追加到 ChatRequest.messages 末尾，稳定 System 不变。
      * 注入后立即调用 {@link AgentContext#clearLastMileHint()} 清空 ThreadLocal，避免下次 tool-loop 再次消费同一份提示。
      * <p>
      * ChatRequest 的其他字段（{@code modelName} / {@code temperature} / {@code toolSpecifications} / {@code parameters} 等）
@@ -886,27 +863,10 @@ public class LangchainTodoNodeExecutor {
                 .build();
     }
 
-    /**
-     * 把 hint 文本合并到消息列表的第一个 SystemMessage；如果没有则前置一条新的 SystemMessage。
-     * <p>
-     * 仅对当前 list 做浅拷贝（{@link ArrayList#ArrayList(java.util.Collection)}），不动原引用。
-     * SystemMessage 文本拼接时使用 {@code "\n\n"} 分隔，保证与已有 prompt 之间有空行可读。
-     */
+    /** 把 last-mile 阶段说明作为新的 UserMessage 追加，绝不改写稳定 System。 */
     private static List<ChatMessage> rebuildMessagesWithHint(List<ChatMessage> original, String hint) {
-        List<ChatMessage> out = new ArrayList<>(original.size() + 1);
-        boolean injected = false;
-        for (ChatMessage msg : original) {
-            if (!injected && msg instanceof SystemMessage sm) {
-                String appended = sm.text() + "\n\n" + hint;
-                out.add(SystemMessage.from(appended));
-                injected = true;
-            } else {
-                out.add(msg);
-            }
-        }
-        if (!injected) {
-            out.add(0, SystemMessage.from(hint));
-        }
+        List<ChatMessage> out = new ArrayList<>(original);
+        out.add(UserMessage.from(hint));
         return out;
     }
 

@@ -10,6 +10,9 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.HexFormat;
 
 /**
  * Q-09 Prompt 权威源：{@code agentPlatformShared} classpath {@code prompts/}。
@@ -41,7 +44,16 @@ final class PromptAuthority {
             Map.entry("dagModeGuidancePrompt", "prompts/todo/dag_mode_guidance.txt"),
             Map.entry("planningStrategyStage", "prompts/todo/planning_strategy_stage.txt"),
             Map.entry("planningTodosStage", "prompts/todo/planning_todos_stage.txt"),
-            Map.entry("dagRecoveryJudgeSystemPromptTemplate", "prompts/judge/dag_recovery_judge_system.txt")
+            Map.entry("dagRecoveryJudgeSystemPromptTemplate", "prompts/judge/dag_recovery_judge_system.txt"),
+            Map.entry("planningAnalysisStage", "prompts/todo/planning_analysis_stage.txt"),
+            Map.entry("planningStructuredStage", "prompts/todo/planning_structured_stage.txt"),
+            Map.entry("planningLinearModeGuidance", "prompts/todo/planning_linear_mode_guidance.txt"),
+            Map.entry("planningDagModeGuidance", "prompts/todo/planning_dag_mode_guidance.txt"),
+            Map.entry("planningLinearConstraint", "prompts/todo/planning_linear_constraint.txt"),
+            Map.entry("pythonRepairStageInstruction", "prompts/python/python_repair_stage.txt"),
+            Map.entry("emptyOutputRecoveryStageInstruction", "prompts/todo/empty_output_recovery_stage.txt"),
+            Map.entry("budgetLastMileStageInstruction", "prompts/agent/budget_last_mile_stage.txt"),
+            Map.entry("toolCapabilityCatalog", "prompts/tools/tool_capability_catalog.json")
     );
 
     private static final String REQUIREMENTS_RESOURCE = "prompts/python/python_refine_requirements.txt";
@@ -84,6 +96,14 @@ final class PromptAuthority {
 
     List<AgentLlmProperties.DatasetFieldSpec> expectedDatasetFieldSpecs() {
         return copyPrompts(snapshot().prompts()).getDatasetFieldSpecs();
+    }
+
+    String bundleDigest() {
+        return digest(snapshot().texts());
+    }
+
+    String capabilityCatalogDigest() {
+        return sha256(expectedText("toolCapabilityCatalog"));
     }
 
     void validateText(String fieldName, String text, String source) {
@@ -150,6 +170,15 @@ final class PromptAuthority {
         validateIfPresent("planningStrategyStage", prompts.getPlanningStrategyStage(), source);
         validateIfPresent("planningTodosStage", prompts.getPlanningTodosStage(), source);
         validateIfPresent("dagRecoveryJudgeSystemPromptTemplate", prompts.getDagRecoveryJudgeSystemPromptTemplate(), source);
+        validateIfPresent("planningAnalysisStage", prompts.getPlanningAnalysisStage(), source);
+        validateIfPresent("planningStructuredStage", prompts.getPlanningStructuredStage(), source);
+        validateIfPresent("planningLinearModeGuidance", prompts.getPlanningLinearModeGuidance(), source);
+        validateIfPresent("planningDagModeGuidance", prompts.getPlanningDagModeGuidance(), source);
+        validateIfPresent("planningLinearConstraint", prompts.getPlanningLinearConstraint(), source);
+        validateIfPresent("pythonRepairStageInstruction", prompts.getPythonRepairStageInstruction(), source);
+        validateIfPresent("emptyOutputRecoveryStageInstruction", prompts.getEmptyOutputRecoveryStageInstruction(), source);
+        validateIfPresent("budgetLastMileStageInstruction", prompts.getBudgetLastMileStageInstruction(), source);
+        validateIfPresent("toolCapabilityCatalog", prompts.getToolCapabilityCatalog(), source);
         if (prompts.getPythonRefineRequirements() != null && !prompts.getPythonRefineRequirements().isEmpty()) {
             validateRequirements(prompts.getPythonRefineRequirements(), source);
         }
@@ -204,6 +233,15 @@ final class PromptAuthority {
         prompts.setPlanningStrategyStage(texts.get("planningStrategyStage"));
         prompts.setPlanningTodosStage(texts.get("planningTodosStage"));
         prompts.setDagRecoveryJudgeSystemPromptTemplate(texts.get("dagRecoveryJudgeSystemPromptTemplate"));
+        prompts.setPlanningAnalysisStage(texts.get("planningAnalysisStage"));
+        prompts.setPlanningStructuredStage(texts.get("planningStructuredStage"));
+        prompts.setPlanningLinearModeGuidance(texts.get("planningLinearModeGuidance"));
+        prompts.setPlanningDagModeGuidance(texts.get("planningDagModeGuidance"));
+        prompts.setPlanningLinearConstraint(texts.get("planningLinearConstraint"));
+        prompts.setPythonRepairStageInstruction(texts.get("pythonRepairStageInstruction"));
+        prompts.setEmptyOutputRecoveryStageInstruction(texts.get("emptyOutputRecoveryStageInstruction"));
+        prompts.setBudgetLastMileStageInstruction(texts.get("budgetLastMileStageInstruction"));
+        prompts.setToolCapabilityCatalog(texts.get("toolCapabilityCatalog"));
         prompts.setPythonRefineRequirements(readRequirements(requireResource(REQUIREMENTS_RESOURCE)));
         prompts.setDatasetFieldSpecs(readDatasetSpecs(requireResource(DATASET_SPECS_RESOURCE)));
         return new AuthoritySnapshot(Map.copyOf(texts), prompts);
@@ -281,7 +319,38 @@ final class PromptAuthority {
         copy.setPlanningStrategyStage(source.getPlanningStrategyStage());
         copy.setPlanningTodosStage(source.getPlanningTodosStage());
         copy.setDagRecoveryJudgeSystemPromptTemplate(source.getDagRecoveryJudgeSystemPromptTemplate());
+        copy.setPlanningAnalysisStage(source.getPlanningAnalysisStage());
+        copy.setPlanningStructuredStage(source.getPlanningStructuredStage());
+        copy.setPlanningLinearModeGuidance(source.getPlanningLinearModeGuidance());
+        copy.setPlanningDagModeGuidance(source.getPlanningDagModeGuidance());
+        copy.setPlanningLinearConstraint(source.getPlanningLinearConstraint());
+        copy.setPythonRepairStageInstruction(source.getPythonRepairStageInstruction());
+        copy.setEmptyOutputRecoveryStageInstruction(source.getEmptyOutputRecoveryStageInstruction());
+        copy.setBudgetLastMileStageInstruction(source.getBudgetLastMileStageInstruction());
+        copy.setToolCapabilityCatalog(source.getToolCapabilityCatalog());
         return copy;
+    }
+
+    private String digest(Map<String, String> texts) {
+        StringBuilder canonical = new StringBuilder();
+        texts.entrySet().stream()
+                .sorted(Map.Entry.comparingByKey())
+                .forEach(entry -> canonical.append(entry.getKey()).append('\n')
+                        .append(entry.getValue()).append('\n'));
+        canonical.append(REQUIREMENTS_RESOURCE).append('\n')
+                .append(requireResource(REQUIREMENTS_RESOURCE)).append('\n')
+                .append(DATASET_SPECS_RESOURCE).append('\n')
+                .append(requireResource(DATASET_SPECS_RESOURCE));
+        return sha256(canonical.toString());
+    }
+
+    private String sha256(String value) {
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            return "sha256:" + HexFormat.of().formatHex(md.digest(value.getBytes(StandardCharsets.UTF_8)));
+        } catch (Exception e) {
+            throw new PromptConfigurationException("digest_failed", "Prompt 权威正文摘要计算失败");
+        }
     }
 
     private record AuthoritySnapshot(Map<String, String> texts, AgentLlmProperties.Prompts prompts) {

@@ -386,6 +386,24 @@ public class AgentLlmLocalConfigLoader {
                 prompts::setOrchestratorPlanningSystemPrompt, explicitFields, baseDir, fileTimes, authority);
         resolveDirect("orchestratorSummarySystemPrompt", prompts::getOrchestratorSummarySystemPrompt,
                 prompts::setOrchestratorSummarySystemPrompt, explicitFields, baseDir, fileTimes, authority);
+        resolveDirect("planningAnalysisStage", prompts::getPlanningAnalysisStage,
+                prompts::setPlanningAnalysisStage, explicitFields, baseDir, fileTimes, authority);
+        resolveDirect("planningStructuredStage", prompts::getPlanningStructuredStage,
+                prompts::setPlanningStructuredStage, explicitFields, baseDir, fileTimes, authority);
+        resolveDirect("planningLinearModeGuidance", prompts::getPlanningLinearModeGuidance,
+                prompts::setPlanningLinearModeGuidance, explicitFields, baseDir, fileTimes, authority);
+        resolveDirect("planningDagModeGuidance", prompts::getPlanningDagModeGuidance,
+                prompts::setPlanningDagModeGuidance, explicitFields, baseDir, fileTimes, authority);
+        resolveDirect("planningLinearConstraint", prompts::getPlanningLinearConstraint,
+                prompts::setPlanningLinearConstraint, explicitFields, baseDir, fileTimes, authority);
+        resolveDirect("pythonRepairStageInstruction", prompts::getPythonRepairStageInstruction,
+                prompts::setPythonRepairStageInstruction, explicitFields, baseDir, fileTimes, authority);
+        resolveDirect("emptyOutputRecoveryStageInstruction", prompts::getEmptyOutputRecoveryStageInstruction,
+                prompts::setEmptyOutputRecoveryStageInstruction, explicitFields, baseDir, fileTimes, authority);
+        resolveDirect("budgetLastMileStageInstruction", prompts::getBudgetLastMileStageInstruction,
+                prompts::setBudgetLastMileStageInstruction, explicitFields, baseDir, fileTimes, authority);
+        resolveDirect("toolCapabilityCatalog", prompts::getToolCapabilityCatalog,
+                prompts::setToolCapabilityCatalog, explicitFields, baseDir, fileTimes, authority);
 
         resolvePaired("dagModeGuidancePrompt", prompts::getDagModeGuidancePrompt,
                 prompts::setDagModeGuidancePrompt, "dagModeGuidancePromptFile",

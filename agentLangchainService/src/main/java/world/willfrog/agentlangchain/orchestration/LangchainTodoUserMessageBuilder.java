@@ -24,7 +24,26 @@ final class LangchainTodoUserMessageBuilder {
                                        Map<String, String> datasetRefs,
                                        String todoDescription,
                                        List<ToolSpecification> toolSpecifications) {
+        Set<String> names = resolveToolNames(toolSpecifications);
+        return buildTodoUserMessage(
+                promptService,
+                userGoal,
+                completedTodos,
+                datasetRefs,
+                todoDescription,
+                toolSpecifications,
+                promptService.renderToolCapabilities(names));
+    }
+
+    static String buildTodoUserMessage(AgentPromptService promptService,
+                                       String userGoal,
+                                       List<LangchainCompletedTodo> completedTodos,
+                                       Map<String, String> datasetRefs,
+                                       String todoDescription,
+                                       List<ToolSpecification> toolSpecifications,
+                                       String renderedToolCapabilities) {
         StringBuilder message = new StringBuilder();
+        message.append(promptService.dagReactStageInstruction(renderedToolCapabilities)).append("\n\n");
         message.append(promptService.dynamicContextPrefix()).append("\n\n");
         message.append("用户目标：").append(safe(userGoal)).append("\n\n");
         Set<String> toolNames = resolveToolNames(toolSpecifications);

@@ -14,6 +14,7 @@ import world.willfrog.agent.platform.service.AgentPromptService;
 import world.willfrog.agent.platform.service.ReactConversationContext;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 import world.willfrog.agent.workflow.StructuredPlanningSupport;
+import world.willfrog.agentlangchain.prompt.ToolCapabilityPromptRenderer;
 
 import java.util.stream.Collectors;
 
@@ -168,15 +169,18 @@ public class LangchainAiPlanner {
             ReactConversationContext ctx = new ReactConversationContext();
             ctx.setSystemMessage(reactSystem);
             try {
-                String strategyStage = promptService.planningStrategyStageInstruction(toolList, maxTodos, maxDetailLength);
+                String strategyStage = promptService.planningStrategyStageInstruction(
+                        toolList,
+                        maxTodos,
+                        maxDetailLength,
+                        ToolCapabilityPromptRenderer.render(promptService, request.getToolSpecifications()));
                 if (mode == PlanExecutionMode.LINEAR) {
                     /*
                      * 本 Run 明确请求 LINEAR 时，约束不能只存在于最终 plan 字段；strategy
                      * LLM 也必须先按 LINEAR 思考，避免第二阶段根据一个 DAG strategy 生成
                      * 分支/汇合依赖。
                      */
-                    strategyStage += "\n\n本 Run 请求的执行模式为 LINEAR。"
-                            + "overallPlan.mode 必须返回 LINEAR，策略必须描述可按顺序执行的步骤。";
+                    strategyStage += "\n\n" + promptService.planningLinearConstraint();
                 }
                 String strategyContent = dialogueContext.isBlank()
                         ? dynamicPrefix + "\n" + strategyStage + "\n\n用户需求：" + request.getUserGoal()

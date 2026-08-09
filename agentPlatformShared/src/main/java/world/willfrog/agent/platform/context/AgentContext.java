@@ -5,6 +5,7 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 import world.willfrog.agent.platform.config.AgentLlmProperties;
+import world.willfrog.agent.platform.prompt.PromptRunSelection;
 import world.willfrog.agent.platform.config.RunStageConfig;
 import world.willfrog.agent.platform.config.StageLlmConfig;
 import world.willfrog.agent.platform.dataanalysis.PythonRepairContext;
@@ -138,6 +139,9 @@ public class AgentContext {
      * 同一 run 内不变，确保 planning → execution → final 看到的 dataFreshness 语义一致。
      */
     private static final ThreadLocal<AgentLlmProperties.DataFreshness> DATA_FRESHNESS_HOLDER = new ThreadLocal<>();
+
+    /** D02：Run 创建时冻结的 Prompt 版本、摘要和参考日期。 */
+    private static final ThreadLocal<PromptRunSelection> PROMPT_RUN_SELECTION_HOLDER = new ThreadLocal<>();
 
     /**
      * DashScope thinking 内容：从流式响应中提取的 reasoning_content。
@@ -548,6 +552,22 @@ public class AgentContext {
         DATA_FRESHNESS_HOLDER.remove();
     }
 
+    public static PromptRunSelection getPromptRunSelection() {
+        return PROMPT_RUN_SELECTION_HOLDER.get();
+    }
+
+    public static void setPromptRunSelection(PromptRunSelection selection) {
+        if (selection == null) {
+            PROMPT_RUN_SELECTION_HOLDER.remove();
+        } else {
+            PROMPT_RUN_SELECTION_HOLDER.set(selection);
+        }
+    }
+
+    public static void clearPromptRunSelection() {
+        PROMPT_RUN_SELECTION_HOLDER.remove();
+    }
+
     /** 设置流式响应中提取的 thinking 内容(DashScope reasoning_content 等)。 */
     public static void setThinkingContent(String content) {
         THINKING_CONTENT_HOLDER.set(content);
@@ -752,6 +772,7 @@ public class AgentContext {
                 getEffectiveExecutionStageConfig(),
                 getWorkflow(),
                 getDataFreshness(),
+                getPromptRunSelection(),
                 getLastMileHint(),
                 getDebugObservabilitySessionId(),
                 getToolJobResumeToken(),
@@ -834,6 +855,11 @@ public class AgentContext {
         } else {
             setDataFreshness(snapshot.dataFreshness());
         }
+        if (snapshot.promptRunSelection() == null) {
+            clearPromptRunSelection();
+        } else {
+            setPromptRunSelection(snapshot.promptRunSelection());
+        }
         // last-mile hint:子线程的 LLM 调用也需要继承,否则在并行 DAG 子节点里 hint 看不到
         if (snapshot.lastMileHint() == null) {
             clearLastMileHint();
@@ -885,6 +911,7 @@ public class AgentContext {
         clearStageConfig();
         clearEffectiveExecutionStageConfig();
         clearDataFreshness();
+        clearPromptRunSelection();
         clearThinkingContent();
         clearStreamingProgress();
         clearLastMileHint();
@@ -944,6 +971,7 @@ public class AgentContext {
             StageLlmConfig effectiveExecutionStageConfig,
             String workflow,
             AgentLlmProperties.DataFreshness dataFreshness,
+            PromptRunSelection promptRunSelection,
             String lastMileHint,
             String debugObservabilitySessionId,
             String toolJobResumeToken,

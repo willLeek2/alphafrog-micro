@@ -14,6 +14,7 @@ import world.willfrog.agent.platform.mapper.AgentRunEventMapper;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunEventEnvelope;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agent.platform.prompt.PromptRunSelection;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 
 import java.time.OffsetDateTime;
@@ -167,6 +168,9 @@ public class AgentEventService {
             ext.put("planner_candidate_count", plannerCandidateCount);
         }
         ext.put("checkpoint_version", resolveCheckpointVersion());
+        PromptRunSelection promptSelection = agentPromptService.snapshotPromptSelection(
+                runId, userId, contextJson);
+        ext.put("prompt_selection", promptSelection.toExtMap());
         // 260612-01-02: 落 admin 旁路信号，供 executor / pipeline 防御层使用
         ext.put("is_admin", isAdmin);
         if (stageConfigJson != null && !stageConfigJson.isBlank()) {

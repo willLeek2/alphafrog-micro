@@ -586,8 +586,10 @@ public class LangchainDagWorkflowExecutor {
         String previousStage = AgentContext.getStage();
         try {
             // 1. 构建 judge 的 system prompt + user message（user message 里包含所有 todo 的状态摘要和已完成节点的产出）
-            String systemPrompt = promptService.dagRecoveryJudgeSystemPrompt();
-            String userMessage = buildRecoveryJudgeUserMessage(items, graph, results, sharedContext, request);
+            String systemPrompt = promptService.reactSystemPrompt();
+            String userMessage = promptService.dagRecoveryJudgeStageInstruction()
+                    + "\n\n"
+                    + buildRecoveryJudgeUserMessage(items, graph, results, sharedContext, request);
 
             // 2. 设置 judge 专用的 phase/stage，让 ChatModel 产生的 trace 归属到 dag_recovery_judge，方便在 observability 中过滤
             AgentContext.setPhase("dag_recovery_judge");

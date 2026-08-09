@@ -201,20 +201,26 @@ class AgentPromptServiceCacheTest {
         String prompt = promptService.dagReactSystemPrompt();
         assertTrue(prompt.startsWith("当前时间：" + LocalDate.now().format(CN_DATE_FORMATTER)),
                 "DAG ReAct system prompt 应含与 planning 一致的时间基准前缀");
+        assertFalse(prompt.contains("[Stage: TODO_EXECUTION]"),
+                "稳定 System 不得包含 Todo 阶段正文");
+        assertFalse(prompt.contains("## 本次 Run 实际开放的工具"),
+                "稳定 System 不得包含本次 Run 动态工具清单");
     }
 
     @Test
-    void dagReactSystemPrompt_shouldSuggestSoftBatchGuidance() {
-        String prompt = promptService.dagReactSystemPrompt();
-        assertTrue(prompt.contains("批量/并行查询限制（必须先查询）"),
-                "ReAct system prompt 应包含批量上限查询要求");
+    void dagReactStageInstruction_shouldSuggestSoftBatchGuidanceInUserRole() {
+        String prompt = promptService.dagReactStageInstruction(
+                promptService.renderToolCapabilities(java.util.List.of(
+                        "checkParallelLimits", "searchAssetInfo")));
+        assertTrue(prompt.contains("批量前必须先查询当前批量/并行限制"),
+                "ReAct User 阶段指令应包含批量上限查询要求");
         assertTrue(prompt.contains("checkParallelLimits"),
-                "ReAct system prompt 应要求先调用 checkParallelLimits");
+                "ReAct User 阶段指令应要求先调用 checkParallelLimits");
         assertTrue(prompt.contains("发现式查询"),
-                "ReAct system prompt 应保留发现式逐步查询的边界说明");
+                "ReAct User 阶段指令应保留发现式逐步查询的边界说明");
         assertTrue(prompt.contains("searchAssetInfo"),
-                "ReAct system prompt 应列举支持批量的工具名");
+                "ReAct User 阶段指令应只列举本次实际开放的工具名");
         assertFalse(prompt.contains("单次最多"),
-                "ReAct system prompt 不应硬编码批量上限");
+                "ReAct User 阶段指令不应硬编码批量上限");
     }
 }

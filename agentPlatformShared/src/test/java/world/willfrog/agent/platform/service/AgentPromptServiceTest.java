@@ -8,9 +8,11 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.prompt.PromptRunSelection;
 import world.willfrog.agent.platform.util.PromptFileLoader;
 
 import java.lang.reflect.Method;
+import java.time.LocalDate;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -98,6 +100,42 @@ class AgentPromptServiceTest {
         assertNotNull(snap);
         assertEquals("2026-06-24-local", snap.getEndDate()); // from local (Nacos)
         assertEquals("2018-01-01", snap.getStartDate()); // from base (static)
+    }
+
+    @Test
+    void snapshotPromptSelection_shouldFreezeDefaultVersionAndDigests() {
+        PromptRunSelection selection = service.snapshotPromptSelection("run-1", "user-1", "{}");
+
+        assertEquals(PromptRunSelection.SCHEMA_VERSION, selection.schemaVersion());
+        assertEquals("default-v1", selection.bundleVersion());
+        assertEquals("control", selection.variant());
+        assertFalse(selection.bundleDigest().isBlank());
+        assertFalse(selection.capabilityCatalogDigest().isBlank());
+        assertEquals(LocalDate.now(), selection.referenceDate());
+        assertDoesNotThrow(() -> service.validatePromptSelection(selection));
+    }
+
+    @Test
+    void promptRendering_shouldUseFrozenRunReferenceDate() {
+        PromptRunSelection current = service.snapshotPromptSelection("run-1", "user-1", "{}");
+        AgentContext.setPromptRunSelection(new PromptRunSelection(
+                current.schemaVersion(), current.bundleVersion(), current.variant(),
+                current.bundleDigest(), current.capabilityCatalogDigest(), LocalDate.of(2025, 2, 3)));
+
+        assertEquals("今天是2025年02月03日。", service.dynamicContextPrefix());
+        assertTrue(service.reactSystemPrompt().startsWith("当前时间：2025年02月03日"));
+    }
+
+    @Test
+    void promptRendering_shouldFailClosedOnFrozenDigestMismatch() {
+        PromptRunSelection current = service.snapshotPromptSelection("run-1", "user-1", "{}");
+        AgentContext.setPromptRunSelection(new PromptRunSelection(
+                current.schemaVersion(), current.bundleVersion(), current.variant(),
+                "sha256:mismatch", current.capabilityCatalogDigest(), current.referenceDate()));
+
+        PromptConfigurationException error = assertThrows(
+                PromptConfigurationException.class, service::reactSystemPrompt);
+        assertTrue(error.getMessage().contains("prompt_selection_mismatch"));
     }
 
     private static AgentLlmProperties.DataFreshness freshness(String start, String end, String asOf, String desc) {

@@ -1,0 +1,1 @@
+当前是 LINEAR 模式，按 sequence 顺序执行即可。

@@ -1,15 +1,23 @@
 package world.willfrog.agent.platform.service;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.prompt.DefaultPromptVariantSelector;
+import world.willfrog.agent.platform.prompt.PromptRunSelection;
+import world.willfrog.agent.platform.prompt.PromptSelectionContext;
+import world.willfrog.agent.platform.prompt.PromptVariantSelector;
 
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.time.format.TextStyle;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Locale;
@@ -27,7 +35,8 @@ import java.util.Locale;
  * <h2>Prompt 的三层结构</h2>
  * <ol>
  *   <li><b>时间基准前缀</b>（harness，由 {@link #composeSystemPrompt(String)} 动态注入）：
- *       每次调用都根据 {@code LocalDate.now()} 计算当前年月日 + 相对年份映射规则。
+ *       Run 内根据建 Run 时冻结的 reference date 计算当前年月日 + 相对年份映射规则；
+ *       非 Run 的轻量调用才使用 {@code LocalDate.now()}。
  *       例如 "当前时间：2026年05月25日（星期一，2026年5月25日）...说去年，指2025年"。
  *       这是防止 LLM 把"去年"推理成错误年份的兜底机制。</li>
  *   <li><b>全局 agent 指令</b>（global，来自 {@code agentRunSystemPrompt}）：
@@ -55,7 +64,7 @@ import java.util.Locale;
  *   <li>{@link #dagReactSystemPrompt()} → 用于 DAG 节点执行（单 todo 的 ReAct 循环）的 System Message，
  *       {@code LangchainTodoNodeExecutor} 调用。</li>
  *   <li>{@link #planningStrategyStageInstruction(String, int, int)} → 规划第一阶段（统筹）的 User Message 指令，
- *       含 {@link #buildToolCapabilities(String)} 生成的工具能力清单。</li>
+ *       含 {@link #renderToolCapabilities(Collection)} 从权威目录渲染的实际工具能力清单。</li>
  *   <li>{@link #planningTodosStageInstruction(String, String, String, int)} → 规划第二阶段（任务拆解）的 User Message 指令。</li>
  *   <li>{@link #composeSystemPrompt(String)} → 所有 System Prompt 的统一入口，注入时间基准 + 全局指令。</li>
  * </ul>
@@ -95,19 +104,70 @@ public class AgentPromptService {
      *  Prompt 部分只用于校验部署投影；其他运行时配置仍按各自契约热更新。 */
     private final AgentLlmLocalConfigLoader localConfigLoader;
     private final PromptAuthority promptAuthority;
+    private final PromptVariantSelector promptVariantSelector;
+    private static final ObjectMapper CATALOG_MAPPER = new ObjectMapper();
+    private volatile Map<String, String> toolCapabilityCatalog;
 
     @Autowired
     public AgentPromptService(AgentLlmProperties properties,
+                              AgentLlmLocalConfigLoader localConfigLoader,
+                              PromptVariantSelector promptVariantSelector) {
+        this(properties, localConfigLoader, PromptAuthority.shared(), promptVariantSelector);
+    }
+
+    public AgentPromptService(AgentLlmProperties properties,
                               AgentLlmLocalConfigLoader localConfigLoader) {
-        this(properties, localConfigLoader, PromptAuthority.shared());
+        this(properties, localConfigLoader, PromptAuthority.shared(), new DefaultPromptVariantSelector());
     }
 
     AgentPromptService(AgentLlmProperties properties,
                        AgentLlmLocalConfigLoader localConfigLoader,
                        PromptAuthority promptAuthority) {
+        this(properties, localConfigLoader, promptAuthority, new DefaultPromptVariantSelector());
+    }
+
+    AgentPromptService(AgentLlmProperties properties,
+                       AgentLlmLocalConfigLoader localConfigLoader,
+                       PromptAuthority promptAuthority,
+                       PromptVariantSelector promptVariantSelector) {
         this.properties = properties;
         this.localConfigLoader = localConfigLoader;
         this.promptAuthority = promptAuthority;
+        this.promptVariantSelector = promptVariantSelector;
+    }
+
+    /** Run 创建时唯一允许调用的版本选择入口。 */
+    public PromptRunSelection snapshotPromptSelection(String runId, String userId, String experimentContext) {
+        PromptVariantSelector.SelectedVariant selected = promptVariantSelector.select(
+                new PromptSelectionContext(runId, userId, experimentContext));
+        if (!DefaultPromptVariantSelector.BUNDLE_VERSION.equals(selected.bundleVersion())
+                || !DefaultPromptVariantSelector.VARIANT.equals(selected.variant())) {
+            throw new PromptConfigurationException(
+                    "unsupported_prompt_variant",
+                    "当前构建未登记 Prompt 版本 " + selected.bundleVersion() + "/" + selected.variant());
+        }
+        return new PromptRunSelection(
+                PromptRunSelection.SCHEMA_VERSION,
+                selected.bundleVersion(),
+                selected.variant(),
+                promptAuthority.bundleDigest(),
+                promptAuthority.capabilityCatalogDigest(),
+                LocalDate.now());
+    }
+
+    /** 在消费正文前校验持久化选择仍对应当前不可变权威包。 */
+    public void validatePromptSelection(PromptRunSelection selection) {
+        if (selection == null) {
+            return;
+        }
+        if (!DefaultPromptVariantSelector.BUNDLE_VERSION.equals(selection.bundleVersion())
+                || !DefaultPromptVariantSelector.VARIANT.equals(selection.variant())
+                || !promptAuthority.bundleDigest().equals(selection.bundleDigest())
+                || !promptAuthority.capabilityCatalogDigest().equals(selection.capabilityCatalogDigest())) {
+            throw new PromptConfigurationException(
+                    "prompt_selection_mismatch",
+                    "Run 冻结的 Prompt 版本或摘要与当前权威资源不一致");
+        }
     }
 
     /**
@@ -122,15 +182,16 @@ public class AgentPromptService {
     }
 
     /**
-     * Todo Planner 的 System Prompt（用于让 LLM 把用户目标拆解为 Todo List）。
+     * Todo Planner 的历史 System 出口。D02 后只返回稳定层；模板仍加载并渲染以保持配置失败可见，
+     * 新消费方必须把相应阶段正文放入 User Message。
      *
      * <p>模板中的 {@code {{toolWhitelist}}} 和 {@code {{maxTodos}}} 占位符会被替换为实际值。
      * 模板正文来自 shared classpath 权威文件；Nacos / 外置文件只能提供逐字一致的投影。
-     * 最终会经过 {@link #composeSystemPrompt(String)} 注入时间基准。</p>
+     * 最终由 {@link #composeSystemPrompt(String)} 返回稳定时间/全局层，不再把渲染正文并入 System。</p>
      *
      * @param toolWhitelist 可用工具名列表，逗号分隔，如 "searchIndex,getIndexDaily,executePython"
      * @param maxTodos      总步骤数上限
-     * @return 拼接时间基准 + 全局指令 + 阶段指令后的完整 System Prompt
+     * @return 仅含时间基准、数据时效和全局指令的稳定 System Prompt
      */
     public String todoPlannerSystemPrompt(String toolWhitelist, int maxTodos) {
         String template = currentPrompts().getTodoPlannerSystemPromptTemplate();
@@ -159,7 +220,10 @@ public class AgentPromptService {
      * @return "今天是yyyy年MM月dd日。" 格式的日期字符串
      */
     public String dynamicContextPrefix() {
-        return "今天是" + LocalDate.now().format(CN_DATE_FORMATTER) + "。";
+        PromptRunSelection selection = AgentContext.getPromptRunSelection();
+        validatePromptSelection(selection);
+        LocalDate date = selection == null ? LocalDate.now() : selection.referenceDate();
+        return "今天是" + date.format(CN_DATE_FORMATTER) + "。";
     }
 
     /**
@@ -436,8 +500,14 @@ public class AgentPromptService {
      * @see #reactSystemPrompt() planning 阶段的 System Prompt
      */
     public String dagReactSystemPrompt() {
-        String specific = currentPrompts().getDagReactSystemPrompt();
-        return composeSystemPrompt(specific);
+        return reactSystemPrompt();
+    }
+
+    /** DAG/Todo 执行阶段正文，只能进入 User Message。 */
+    public String dagReactStageInstruction(String renderedToolCapabilities) {
+        return currentPrompts().getDagReactSystemPrompt()
+                + "\n\n## 本次 Run 实际开放的工具\n"
+                + safe(renderedToolCapabilities);
     }
 
     /**
@@ -459,8 +529,13 @@ public class AgentPromptService {
      * <p>通过 {@link #composeSystemPrompt(String)} 注入时间基准前缀与全局 agent_run 指令。</p>
      */
     public String dagRecoveryJudgeSystemPrompt() {
-        String specific = currentPrompts().getDagRecoveryJudgeSystemPromptTemplate();
-        return composeSystemPrompt(specific);
+        return reactSystemPrompt();
+    }
+
+    /** DAG recovery judge 阶段正文，只能进入 User Message。 */
+    public String dagRecoveryJudgeStageInstruction() {
+        return "[Stage: DAG_RECOVERY_JUDGE]\n"
+                + currentPrompts().getDagRecoveryJudgeSystemPromptTemplate();
     }
 
     /**
@@ -573,13 +648,11 @@ public class AgentPromptService {
      */
     @Deprecated
     public String planningAnalysisStageInstruction(String toolWhitelist, int maxTodos) {
-        String template = currentPrompts().getTodoPlannerSystemPromptTemplate();
-        String rendered = render(template, Map.of(
+        String template = currentPrompts().getPlanningAnalysisStage();
+        return render(template, Map.of(
                 "toolWhitelist", safe(toolWhitelist),
                 "maxTodos", String.valueOf(maxTodos)
         ));
-        return "[Stage: PLANNING_ANALYSIS]\n" + rendered
-                + "\n请先用自然语言分析用户需求和执行思路，暂时不要输出 JSON。";
     }
 
     /**
@@ -594,7 +667,7 @@ public class AgentPromptService {
      * <p>模板来自 shared classpath 权威文件 {@code prompts/todo/planning_strategy_stage.txt}；
      * Nacos 只允许提供逐字一致的部署投影。
      * 模板中可引用 {@code {{toolCapabilities}}} 占位符，
-     * 实际值由 {@link #buildToolCapabilities(String)} 动态生成（含 checkParallelLimits 引导）。</p>
+     * 实际值由 {@link #renderToolCapabilities(Collection)} 从权威目录按本次实际工具集生成。</p>
      *
      * @param toolWhitelist   可用工具白名单，逗号分隔
      * @param maxTodos        最大 todo 步骤数
@@ -602,17 +675,26 @@ public class AgentPromptService {
      * @return 含工具能力清单的 strategy 阶段 User Message 指令
      */
     public String planningStrategyStageInstruction(String toolWhitelist, int maxTodos, int maxDetailLength) {
+        return planningStrategyStageInstruction(
+                toolWhitelist, maxTodos, maxDetailLength,
+                renderToolCapabilities(splitToolNames(toolWhitelist)));
+    }
+
+    public String planningStrategyStageInstruction(String toolWhitelist,
+                                                   int maxTodos,
+                                                   int maxDetailLength,
+                                                   String renderedToolCapabilities) {
         String template = currentPrompts().getPlanningStrategyStage();
         return render(template, Map.of(
                 "toolWhitelist", safe(toolWhitelist),
                 "maxTodos", String.valueOf(maxTodos),
                 "strategyMaxDetailLength", String.valueOf(maxDetailLength),
-                "toolCapabilities", buildToolCapabilities(toolWhitelist)
+                "toolCapabilities", safe(renderedToolCapabilities)
         ));
     }
 
     /**
-     * 构建工具能力说明清单 —— 告诉规划阶段的 LLM 每个工具能做什么、是否支持批量、批量上限是多少。
+     * 构建工具能力说明清单 —— 告诉规划/执行阶段的 LLM 本次实际开放的工具能做什么。
      *
      * <p><b>设计要点（2026-05-25 PL-A 重构）</b>：</p>
      * <ul>
@@ -623,59 +705,35 @@ public class AgentPromptService {
      *       同时给出 fallback 规则："如果工具列表中未见 checkParallelLimits 或调用失败，默认不批量"。</li>
      *   <li>每个支持批量的工具（如 getIndexDaily、searchAssetInfo 等）的描述中注明
      *       "具体上限先调用 checkParallelLimits 查询"。</li>
-     *   <li>未知工具（白名单中有但 switch 未匹配）以工具名占位，保证不丢失信息。</li>
+     *   <li>未知或缺说明的工具直接失败，禁止无描述工具静默进入 Prompt。</li>
      * </ul>
      *
-     * @param toolWhitelist 可用工具名白名单，逗号分隔（来自 planning 阶段解析出的工具列表）
+     * @param toolNames 本次实际可用的工具名（生产调用先由 D05 registry 校验 membership）
      * @return 以换行分隔的工具能力说明文本，直接注入到 strategy stage instruction 中
      */
-    private String buildToolCapabilities(String toolWhitelist) {
-        List<String> tools = List.of(toolWhitelist.split(","));
-        List<String> capabilities = new ArrayList<>();
-
-        for (String tool : tools) {
-            tool = tool.trim();
-            switch (tool) {
-                case "checkParallelLimits" -> capabilities.add(
-                    "- checkParallelLimits: 查询当前批量/并行查询限制。任何工具批量调用前应先调用它；若工具列表中没有 checkParallelLimits 或调用失败，默认不要批量。");
-                case "getIndexDaily" -> capabilities.add(
-                    "- getIndexDaily: 查询指数日线数据。tsCode 支持 | 分隔或 JSON 数组批量；具体上限先调用 checkParallelLimits 查询，如 tsCode=\"000300.SH|000905.SH\"；批量返回 data.mode=batch 和 data.results。");
-                case "getStockDaily" -> capabilities.add(
-                    "- getStockDaily: 查询股票日线数据。tsCode 支持 | 分隔或 JSON 数组批量；具体上限先调用 checkParallelLimits 查询，如 tsCode=\"000001.SZ|600519.SH\"；批量返回 data.mode=batch 和 data.results。");
-                case "searchAssetInfo" -> capabilities.add(
-                    "- searchAssetInfo: 统一搜索股票/ETF/指数/场外基金。ETF 回测或行业主题 ETF 筛选优先用此工具并设 assetTypes=etf；场外基金用 assetTypes=off_exchange_fund。query 支持 | 分隔或 JSON 数组，具体上限先调用 checkParallelLimits 查询。");
-                case "getExchangeAssetDaily" -> capabilities.add(
-                    "- getExchangeAssetDaily: 查询场内资产日线（股票/ETF/指数）。tsCode 支持批量，具体上限先调用 checkParallelLimits 查询；ETF 需 A5 服务就绪。");
-                case "getOffExchangeAssetDaily" -> capabilities.add(
-                    "- getOffExchangeAssetDaily: 查询场外基金净值序列，不用于 ETF 场内回测。");
-                case "getListedAssetShareSize" -> capabilities.add(
-                    "- getListedAssetShareSize: 查询 ETF 份额规模时序；exchange 使用 SSE/SZSE/BSE。");
-                case "getEtfAdj" -> capabilities.add(
-                    "- getEtfAdj: 查询 ETF 复权因子；仅当 adjFactorEnabled=true 时可用。");
-                case "searchIndex" -> capabilities.add(
-                    "- searchIndex: 搜索指数代码。keyword 支持 | 分隔或 JSON 数组批量；具体上限先调用 checkParallelLimits 查询，如 keyword=\"沪深300|中证500\"；批量返回 data.mode=batch 和 data.results。");
-                case "searchStock" -> capabilities.add(
-                    "- searchStock: 搜索股票代码。keyword 支持 | 分隔或 JSON 数组批量；具体上限先调用 checkParallelLimits 查询，如 keyword=\"平安银行|万科A\"；批量返回 data.mode=batch 和 data.results。");
-                case "searchFund" -> capabilities.add(
-                    "- searchFund: 仅搜索场外基金（公募基金）基本信息，不用于 ETF 场内资产筛选。keyword 支持 | 分隔或 JSON 数组批量；具体上限先调用 checkParallelLimits 查询，如 keyword=\"易方达蓝筹精选|招商中证白酒\"；批量返回 data.mode=batch 和 data.results。");
-                case "executePython" -> capabilities.add(
-                    "- executePython: 执行 Python 代码进行数据分析。支持批量处理多个数据集（dataset_ids 用逗号分隔）。");
-                case "resolveFinanceMethods" -> capabilities.add(
-                    "- resolveFinanceMethods: 金融指标或计算方法建议工具。遇到金融计算类问题时，把用户的原始自然语言问题直接交给它，不要先把问题改写成固定的方法名、年份或期间字段。建议结果带有未解决表达（unresolvedTerms）时，先处理澄清或明确边界，再执行 Python。");
-                case "getIndexInfo" -> capabilities.add(
-                    "- getIndexInfo: 查询指数基本信息。tsCode 支持 | 分隔或 JSON 数组批量；具体上限先调用 checkParallelLimits 查询，如 tsCode=\"000300.SH|000905.SH\"。");
-                case "getStockInfo" -> capabilities.add(
-                    "- getStockInfo: 查询股票基本信息。tsCode 支持 | 分隔或 JSON 数组批量；具体上限先调用 checkParallelLimits 查询，如 tsCode=\"000001.SZ|600519.SH\"。");
-                case "getFinancialReport" -> capabilities.add(
-                    "- getFinancialReport: 查询财务报表数据（利润表、资产负债表、现金流量表）。");
-                case "ragSearch" -> capabilities.add(
-                    "- ragSearch: RAG语义检索，查询公告、研报、年报原文内容。");
-                case "loadDocument" -> capabilities.add(
-                    "- loadDocument: 加载文档进行向量化检索。");
-                default -> capabilities.add("- " + tool + ": 可用工具");
-            }
+    public String renderToolCapabilities(Collection<String> toolNames) {
+        if (toolNames == null || toolNames.isEmpty()) {
+            return "";
         }
-
+        Map<String, String> catalog = toolCapabilityCatalog();
+        List<String> ordered = new ArrayList<>();
+        if (toolNames.contains("checkParallelLimits")) {
+            ordered.add("checkParallelLimits");
+        }
+        toolNames.stream()
+                .filter(name -> name != null && !name.isBlank() && !"checkParallelLimits".equals(name))
+                .distinct()
+                .sorted()
+                .forEach(ordered::add);
+        List<String> capabilities = new ArrayList<>();
+        for (String name : ordered) {
+            String description = catalog.get(name);
+            if (description == null || description.isBlank()) {
+                throw new PromptConfigurationException(
+                        "tool_capability_missing", "工具 " + name + " 缺少权威能力说明");
+            }
+            capabilities.add("- " + name + ": " + description);
+        }
         return String.join("\n", capabilities);
     }
 
@@ -706,8 +764,8 @@ public class AgentPromptService {
                                                   String toolWhitelist, int maxTodos) {
         String template = currentPrompts().getPlanningTodosStage();
         String modeGuidance = "DAG".equalsIgnoreCase(mode)
-                ? "当前是 DAG 模式，请通过 dependsOn 表达任务依赖关系。"
-                : "当前是 LINEAR 模式，按 sequence 顺序执行即可。";
+                ? currentPrompts().getPlanningDagModeGuidance()
+                : currentPrompts().getPlanningLinearModeGuidance();
 
         return render(template, Map.of(
                 "mode", safe(mode),
@@ -728,23 +786,36 @@ public class AgentPromptService {
      * @return 含 JSON 格式示例和注意事项的 structured 阶段指令
      */
     public String planningStructuredStageInstruction() {
-        return "[Stage: PLANNING_STRUCTURED]\n"
-                + "请将上述分析转化为简化的 Todo List JSON，只输出 JSON，不要包含其他文字。\n"
-                + "\n"
-                + "格式示例：\n"
-                + "{\"analysis\":\"分析摘要\",\"items\":["
-                + "{\"id\":\"todo_1\",\"sequence\":1,\"description\":\"查询贵州茅台的股票代码\","
-                + "\"dependsOn\":[]},"
-                + "{\"id\":\"todo_2\",\"sequence\":2,\"description\":\"获取茅台2025年的日线数据\","
-                + "\"dependsOn\":[\"todo_1\"]},"
-                + "{\"id\":\"todo_3\",\"sequence\":3,\"description\":\"分析数据并回答用户关于涨跌幅的问题\","
-                + "\"dependsOn\":[\"todo_2\"]}]}\n"
-                + "\n"
-                + "注意：\n"
-                + "1. 每个 Todo 只需要 description 字段（1-3句话描述任务）\n"
-                + "2. 不要包含 toolName、params 等具体执行细节\n"
-                + "3. DAG 模式下可选 dependsOn 指定依赖关系（默认空数组）\n"
-                + "4. Todo 的具体执行将由 ReAct Agent 在执行时自主决策";
+        return currentPrompts().getPlanningStructuredStage();
+    }
+
+    public String planningLinearConstraint() {
+        return currentPrompts().getPlanningLinearConstraint();
+    }
+
+    public String pythonRepairStageInstruction() {
+        List<String> requirements = pythonRefineRequirements();
+        String renderedRequirements = requirements == null ? "" : requirements.stream()
+                .map(item -> "- " + item)
+                .reduce((left, right) -> left + "\n" + right)
+                .orElse("");
+        return render(currentPrompts().getPythonRepairStageInstruction(),
+                Map.of("requirements", renderedRequirements));
+    }
+
+    public String emptyOutputRecoveryStageInstruction() {
+        return currentPrompts().getEmptyOutputRecoveryStageInstruction();
+    }
+
+    public String budgetLastMileStageInstruction(String dimension,
+                                                  long actual,
+                                                  long limit,
+                                                  long ratioPct) {
+        return render(currentPrompts().getBudgetLastMileStageInstruction(), Map.of(
+                "dimension", safe(dimension),
+                "actual", String.valueOf(actual),
+                "limit", String.valueOf(limit),
+                "ratioPct", String.valueOf(ratioPct)));
     }
 
     /**
@@ -831,8 +902,8 @@ public class AgentPromptService {
      *   <li><b>全局 agent 指令（静态）</b>：来自 {@code agentRunSystemPrompt}
      *       （通常是 {@code agent_run_system.txt}），包含角色定义、通用约束等。
      *       这部分内容跨阶段保持不变，利于 OpenAI 兼容 API 的自动 KV 前缀缓存。</li>
-     *   <li><b>阶段专属 prompt（配置）</b>：{@code specificPrompt} 参数，
-     *       仅在内容与 global 不同时才拼接，避免重复。</li>
+     *   <li><b>阶段专属 prompt</b>：由调用方通过 {@code *StageInstruction()} 注入 User Message；
+     *       兼容参数不再进入 System。</li>
      * </ol>
      *
      * <h3>与 {@link #dynamicContextPrefix()} 的关系</h3>
@@ -840,16 +911,17 @@ public class AgentPromptService {
      * 这与本方法在 System Prompt 中注入的时间基准形成<b>双重时间锚点</b>：
      * System Prompt 一次 + User Message 一次，增强 LLM 的时间感知。</p>
      *
-     * @param specificPrompt 阶段专属 prompt 文本（如 todo planner 专用指令），可为空
-     * @return 三段拼接后的完整 System Prompt
+     * @param ignoredSpecificPrompt 历史兼容参数；D02 后不再写入 System
+     * @return 稳定时间基准、数据时效与全局指令组成的 System Prompt
      */
-    private String composeSystemPrompt(String specificPrompt) {
+    private String composeSystemPrompt(String ignoredSpecificPrompt) {
         String global = firstNonBlank(currentPrompts().getAgentRunSystemPrompt(), "");
-        String specific = firstNonBlank(specificPrompt, "");
 
         List<String> parts = new ArrayList<>();
-        // 第一段：时间基准 —— 动态计算，确保 LLM 正确推理"去年/今年/明年"等相对时间
-        LocalDate today = LocalDate.now();
+        PromptRunSelection selection = AgentContext.getPromptRunSelection();
+        validatePromptSelection(selection);
+        // Run 内使用冻结日期；非 Run 的轻量/测试调用才使用当前日期。
+        LocalDate today = selection == null ? LocalDate.now() : selection.referenceDate();
         int thisYear = today.getYear();
         int lastYear = thisYear - 1;
         int yearBeforeLast = thisYear - 2;
@@ -872,11 +944,44 @@ public class AgentPromptService {
         if (!global.isBlank()) {
             parts.add(global);
         }
-        // 第三段：阶段专属 prompt——只在与 global 内容不同时才追加，避免 System Prompt 冗余
-        if (!specific.isBlank() && !specific.equals(global)) {
-            parts.add(specific);
-        }
         return String.join("\n", parts).trim();
+    }
+
+    private List<String> splitToolNames(String toolWhitelist) {
+        if (toolWhitelist == null || toolWhitelist.isBlank()) {
+            return List.of();
+        }
+        return java.util.Arrays.stream(toolWhitelist.split(","))
+                .map(String::trim)
+                .filter(name -> !name.isBlank())
+                .toList();
+    }
+
+    private Map<String, String> toolCapabilityCatalog() {
+        Map<String, String> current = toolCapabilityCatalog;
+        if (current != null) {
+            return current;
+        }
+        synchronized (this) {
+            if (toolCapabilityCatalog == null) {
+                try {
+                    Map<String, String> parsed = CATALOG_MAPPER.readValue(
+                            currentPrompts().getToolCapabilityCatalog(),
+                            new TypeReference<LinkedHashMap<String, String>>() { });
+                    if (parsed == null || parsed.isEmpty()) {
+                        throw new PromptConfigurationException(
+                                "tool_capability_catalog_blank", "工具能力权威目录为空");
+                    }
+                    toolCapabilityCatalog = Map.copyOf(parsed);
+                } catch (PromptConfigurationException e) {
+                    throw e;
+                } catch (Exception e) {
+                    throw new PromptConfigurationException(
+                            "tool_capability_catalog_invalid", "工具能力权威目录不是合法 JSON");
+                }
+            }
+            return toolCapabilityCatalog;
+        }
     }
 
     /**
