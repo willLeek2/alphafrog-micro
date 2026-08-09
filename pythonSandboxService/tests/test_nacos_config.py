@@ -25,10 +25,13 @@ Covered behavior:
     applied payload (deterministically).
   - ``containerMaxConcurrency`` hot-reload regression (direct update method
     and whole-payload path, invalid values ignored) under the UNCONDITIONAL
-    cmc==1 safety invariant (codex c72db8f6 item 4 / 56d28076): cmc>1 is
-    fail-fast rejected at construction, in single-field hot updates and in
-    whole payloads, for EVERY configuration until the task-specific global
-    sitecustomize.py bootstrap becomes task-local.
+    cmc==1 safety invariant (codex c72db8f6 item 4 / 56d28076, refined by
+    D15 §4.2 on 2026-08-10): cmc>1 is fail-fast rejected at construction,
+    in single-field hot updates and in whole payloads, for EVERY
+    configuration. D15 §4.2 made the per-task AF_TASK_* bootstrap
+    task-local (it now travels in wrapper-input.json instead of the
+    shared global sitecustomize.py); the cmc==1 rule still holds, driven
+    by the dynamic-install venv mutation race (S3B-04 governs lifting).
 
 Constructed directly from a ``SandboxConfig`` instance; stdlib unittest only,
 no nacos SDK or network required.
@@ -370,15 +373,16 @@ class ContainerMaxConcurrencyRegressionTest(NacosConfigTest):
 
 
 class UnconditionalConcurrencyInvariantTest(NacosConfigTest):
-    """Unconditional cmc==1 safety invariant (codex c72db8f6 item 4 / 56d28076).
+    """Unconditional cmc==1 safety invariant (codex c72db8f6 item 4 / 56d28076),
+    refined by D15 §4.2 (2026-08-10).
 
-    The sandbox runner's task bootstrap still writes/deletes a task-specific
-    GLOBAL /sandbox/sitecustomize.py shared across concurrent tasks in the
-    same container, for ALL configurations (not only dynamic install). Until
-    that bootstrap becomes task-local, every configuration is fail-fast
-    restricted to container concurrency exactly 1: if this layer accepted a
-    hot update to >1 in preinstalled mode, new worker creation would fail
-    afterwards, breaking last-known-good semantics.
+    D15 §4.2 made the per-task AF_TASK_* bootstrap task-local: it now travels
+    inside the wrapper-input.json (taskWorkspace + taskEnvironment) and the
+    wrapper injects it via Popen(env=...); the legacy per-task write of the
+    GLOBAL /sandbox/sitecustomize.py is gone. The cmc==1 rule STILL holds,
+    now driven solely by the dynamic-install venv mutation race
+    (PoolWorker.execution_environment captured once and never refreshed).
+    Lifting cmc>1 is gated by S3B-04 and remains out of scope.
 
     The base config fails fast at construction; a violating single-field hot
     update and a violating whole payload are both rejected, keeping the

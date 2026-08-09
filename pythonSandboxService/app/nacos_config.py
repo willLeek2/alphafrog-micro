@@ -88,41 +88,50 @@ class DynamicSandboxConfig:
       - Tasks freeze ``output_limits_snapshot()`` at creation time and must
         not re-read this hot config during execution.
       - Concurrency safety invariant (UNCONDITIONAL, codex c72db8f6 item 4 /
-        56d28076): ``containerMaxConcurrency`` must be 1 for EVERY
-        configuration (dynamic-install and preinstalled alike), because the
-        runner's task bootstrap still writes/deletes a task-specific GLOBAL
-        /sandbox/sitecustomize.py shared across concurrent tasks in the same
-        container, which is not yet task-local. A violating base config fails
-        startup (constructor raises); a violating hot update is rejected
-        keeping the last-known-good value.
+        56d28076, refined by D15 §4.2.3 round-2 / codex fe54d9f0):
+        ``containerMaxConcurrency`` must be 1 for EVERY configuration.
+        D15 §4.2 (Scenario B) round-2 closed the per-task
+        ``/sandbox/sitecustomize.py`` race: AF_TASK_* now travels inside the
+        per-task wrapper-input.json, and the wrapper stages a per-task loader
+        bootstrap so a stale sitecustomize.py in the loader workdir can no
+        longer be auto-imported at Python startup. The cmc==1 rule is NOT
+        lifted by that fix: concurrency still has to stay 1 because the
+        dynamic-install venv mutation race (PoolWorker.execution_environment
+        captured once at warm-up and never refreshed) and other remaining
+        shared-state seams (S3B-04 governs the full lift) keep a second
+        concurrent task unsafe in the same container. Lifting cmc>1 is
+        explicitly out of scope for this round. A violating base config
+        fails startup (constructor raises); a violating hot update is
+        rejected keeping the last-known-good value.
     """
 
     def __init__(self, config: SandboxConfig) -> None:
         self._lock = threading.Lock()
         # Unconditional concurrency invariant (codex c72db8f6 item 4 /
-        # 56d28076): the sandbox runner's task bootstrap still writes/deletes
-        # a task-specific GLOBAL /sandbox/sitecustomize.py shared across
-        # concurrent tasks in the same container, for ALL configurations (not
-        # only dynamic install). codex 56d28076 wording: 现有 task-specific
-        # 全局 sitecustomize.py 写/删尚未 task-local 化，因此选择全配置
-        # fail-fast 的安全限制. Container concurrency must therefore stay
-        # exactly 1 for EVERY configuration: if this layer accepted a hot
-        # update to >1 in preinstalled mode, new worker creation would fail
-        # afterwards, breaking last-known-good semantics. The base config is
-        # fail-fast rejected here at construction; hot updates are rejected
-        # by update_container_max_concurrency/apply_dynamic_payload below,
-        # keeping the last-known-good value instead of breaking later at
-        # worker creation.
+        # 56d28076, refined by D15 §4.2.3 round-2 / codex fe54d9f0): cmc
+        # MUST stay 1 for every configuration. D15 §4.2 round-2 made the
+        # AF_TASK_* bootstrap fully task-local (per-task wrapper-input.json
+        # + per-task loader bootstrap, no shared sitecustomize auto-import),
+        # so the historical "task-specific global sitecustomize write is not
+        # yet task-local" reason is gone. cmc is STILL frozen at 1 because
+        # the dynamic-install venv mutation race (and other shared-state
+        # seams tracked under S3B-04) remain open. Lifting cmc>1 is out of
+        # scope for this round.
         #
-        # Restoration path: once the wrapper AF_TASK_* bootstrap becomes
-        # subprocess task-local env with no shared sitecustomize writes,
-        # preinstalled-mode (skip_environment_setup=true) cmc>1 may be
-        # restored behind concurrency-isolation tests.
+        # If this layer accepted a hot update to >1, new worker creation
+        # would fail afterwards (the venv race would corrupt environment
+        # identity under the surface), breaking last-known-good semantics.
+        # The base config is fail-fast rejected here at construction; hot
+        # updates are rejected by update_container_max_concurrency /
+        # apply_dynamic_payload below, keeping the last-known-good value
+        # instead of breaking later at worker creation.
         if config.container_max_concurrency > 1:
             raise ValueError(
                 "container_max_concurrency must be 1 for ALL configurations: "
-                "the task-specific global /sandbox/sitecustomize.py "
-                "write/delete is not yet task-local (codex 56d28076)"
+                "concurrency is still frozen by the dynamic-install venv "
+                "mutation race and other shared-state seams tracked under "
+                "S3B-04 (D15 §4.2.3 round-2 closed the sitecustomize race, "
+                "but lifting cmc>1 is out of scope for this round)"
             )
         self._snapshot = self._initial_snapshot(config)
 
@@ -202,16 +211,20 @@ class DynamicSandboxConfig:
             old = self._snapshot.container_max_concurrency
             if value > 1:
                 # Unconditional safety invariant (codex c72db8f6 item 4 /
-                # 56d28076): the task-specific global /sandbox/sitecustomize.py
-                # write/delete is not yet task-local, so cmc>1 is rejected for
-                # ALL configs. Fail-fast reject the hot update and KEEP the
-                # safe value: a later worker creation error would break new
-                # workers, whereas rejecting here leaves the running config
-                # intact (last-known-good).
+                # 56d28076, refined by D15 §4.2.3 round-2 / codex fe54d9f0):
+                # D15 round-2 closed the per-task sitecustomize race, but
+                # cmc>1 is STILL rejected for ALL configs because the
+                # dynamic-install venv mutation race and other shared-state
+                # seams (S3B-04) remain. Fail-fast reject the hot update and
+                # KEEP the safe value: a later worker creation error would
+                # break new workers, whereas rejecting here leaves the
+                # running config intact (last-known-good).
                 logger.warning(
-                    "DYNAMIC_CONFIG_REJECTED container_max_concurrency=%s: the "
-                    "task-specific global sitecustomize.py bootstrap is not yet "
-                    "task-local, so every config is restricted to concurrency 1; "
+                    "DYNAMIC_CONFIG_REJECTED container_max_concurrency=%s: "
+                    "concurrency is still frozen by the dynamic-install venv "
+                    "mutation race and other shared-state seams tracked under "
+                    "S3B-04 (D15 §4.2.3 round-2 closed the sitecustomize race, "
+                    "but lifting cmc>1 is out of scope for this round); "
                     "keeping %s",
                     value,
                     old,
@@ -276,14 +289,21 @@ class DynamicSandboxConfig:
                 errors.append(f"containerMaxConcurrency={raw!r} must be an int >= 1")
             elif raw > 1:
                 # Unconditional safety invariant (codex c72db8f6 item 4 /
-                # 56d28076): whole-object rejection keeps the last-known-good
-                # concurrency rather than letting a hot payload raise it above
-                # the only safe value (1) for ANY configuration, until the
-                # task-specific global sitecustomize.py bootstrap is task-local.
+                # 56d28076, refined by D15 §4.2.3 round-2 / codex fe54d9f0):
+                # whole-object rejection keeps the last-known-good concurrency
+                # rather than letting a hot payload raise it above the only
+                # safe value (1) for ANY configuration. The historical
+                # sitecustomize race is closed; cmc>1 is still rejected
+                # because the dynamic-install venv mutation race and other
+                # shared-state seams (S3B-04) remain open. Lifting cmc>1 is
+                # out of scope for this round.
                 errors.append(
                     f"containerMaxConcurrency={raw!r} must be 1 for all "
-                    "configurations until the task-specific global "
-                    "sitecustomize.py bootstrap is task-local"
+                    "configurations: concurrency is still frozen by the "
+                    "dynamic-install venv mutation race and other "
+                    "shared-state seams tracked under S3B-04 (D15 §4.2.3 "
+                    "round-2 closed the sitecustomize race, but lifting "
+                    "cmc>1 is out of scope for this round)"
                 )
         for key in OUTPUT_LIMIT_KEYS:
             if key in payload:

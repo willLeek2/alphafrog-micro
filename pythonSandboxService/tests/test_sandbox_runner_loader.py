@@ -354,8 +354,9 @@ class SandboxRunnerContainerWriteTest(unittest.TestCase):
     write_runtime_environment_json on the service host's local filesystem is
     invisible to a Python subprocess inside the execution container. The
     sandbox runner MUST push the file into the container via
-    session.copy_to_runtime and read it back via the per-task
-    AF_RUNTIME_ENVIRONMENT_FILE sitecustomize override.
+    session.copy_to_runtime and read it back via the container-creation
+    AF_RUNTIME_ENVIRONMENT_FILE env var (D15 §4.2 removed the per-task
+    sitecustomize.py override that previously broke pool reuse).
     """
 
     def _test_config(self, **overrides) -> SandboxConfig:
@@ -418,9 +419,11 @@ class SandboxRunnerContainerWriteTest(unittest.TestCase):
         """Verify the container-global runtime-environment.json is
         copy_to_runtime'd into the container at <workdir>/runtime-environment.json.
         codex (A) plan 2026-08-08 23:06: the file path is the container-global
-        <workdir>/runtime-environment.json set by create_sandbox_session. Per-
-        task sitecustomize overrides were removed because they were racy under
-        pool reuse. Without this, report() running inside the container could
+        <workdir>/runtime-environment.json set by create_sandbox_session. D15
+        §4.2 (Scenario B, 2026-08-10) additionally removed the per-task
+        sitecustomize.py write altogether — AF_TASK_* now travels via the
+        task-local wrapper-input.json taskEnvironment field. Without the
+        global runtime-environment.json, report() inside the container could
         not read environmentId.
         """
         baked_env = ExecutionEnvironment(
@@ -483,38 +486,35 @@ class SandboxRunnerContainerWriteTest(unittest.TestCase):
         self.assertEqual([], runtime_env_writes)
         self.assertEqual([], captured_runtime_env_payloads)
 
-        # sitecustomize.py write must also be present, but it MUST NOT
-        # override AF_RUNTIME_ENVIRONMENT_FILE per task. The container-
-        # creation env var (set by create_sandbox_session) already points
-        # at the container-global /sandbox/runtime-environment.json; an
-        # override per task would race on the same global sitecustomize.py
-        # under pool reuse.
-        self.assertGreaterEqual(
-            len(captured_sitecustomize_text), 1,
-            "sitecustomize.py must be copied into the container so "
-            "AF_TASK_* env vars propagate",
-        )
-        sitecustomize_text = captured_sitecustomize_text[0]
-        self.assertNotIn(
-            "AF_RUNTIME_ENVIRONMENT_FILE", sitecustomize_text,
-            "sitecustomize.py MUST NOT override AF_RUNTIME_ENVIRONMENT_FILE; "
-            "the container-creation env var handles that. Per-task overrides "
-            "race under pool reuse.",
+        # D15 §4.2 (Scenario B): the per-task write of /sandbox/sitecustomize.py
+        # is GONE — AF_TASK_* now travels inside the task-local wrapper-input.json
+        # (staged at {task_workspace}/wrapper-input.json) and the wrapper injects
+        # it via Popen(env=...). Asserting ZERO sitecustomize writes here pins
+        # the new contract: no global bootstrap file is written per task.
+        self.assertEqual(
+            [], captured_sitecustomize_text,
+            "D15 §4.2: _prepare_task_workspace must NOT write the global "
+            "sitecustomize.py per task; AF_TASK_* travels via the task-local "
+            "wrapper-input.json taskEnvironment field instead.",
         )
 
 
 class ValidateDynamicInstallSafetyTest(unittest.TestCase):
     """260808-finance-methodspec-v5 codex (A) plan 2026-08-08 23:06 +
-    codex 2026-08-08 23:16 (bc11e841 item 2):
+    codex 2026-08-08 23:16 (bc11e841 item 2), updated by D15 §4.2 (2026-08-10):
 
     The v5 safety invariant is ``container_max_concurrency == 1`` for every
-    SandboxConfig — both because dynamic install mutates the shared venv,
-    AND because the per-task bootstrap (AF_TASK_* env vars) is written into
-    the SHARED global file ``/sandbox/sitecustomize.py``. Concurrent tasks
-    would race on that file regardless of skip_environment_setup.
+    SandboxConfig. D15 §4.2 removed the historical driver — the per-task
+    write of AF_TASK_* into the SHARED global ``/sandbox/sitecustomize.py``
+    (those vars now travel via the task-local wrapper-input.json) — so the
+    sitecustomize race is no longer a concurrency blocker. The cmc==1 rule
+    STILL holds, now driven solely by the dynamic-install venv mutation
+    race (PoolWorker.execution_environment is captured once and never
+    refreshed, so concurrent tasks would see stale environmentId while the
+    venv had already been mutated by session.install()).
 
-    codex 2026-08-08 23:16 explicitly required extending the check from
-    "skip_environment_setup=False only" to "all configs".
+    Lifting cmc>1 is gated by S3B-04 and out of scope for D15. Tests here
+    still pin cmc==1 fail-fast for all configurations.
     """
 
     def _test_config(self, **overrides) -> SandboxConfig:
