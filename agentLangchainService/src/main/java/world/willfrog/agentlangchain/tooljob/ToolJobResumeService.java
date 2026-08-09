@@ -166,6 +166,12 @@ public class ToolJobResumeService {
         if (!launcherLeaseExpired(anchor, Instant.now())) {
             return false;
         }
+        // 同进程内已有活跃 launcher (runId + token + version)，避免同进程双 launch。
+        // 跨进程仍以 DB lease/version/token CAS 为唯一权威。
+        if (resumeLauncher.isActive(runId, anchor.getResumeToken(), anchor.getResumeLeaseVersion())) {
+            log.info("Launcher still active for LAUNCHING run={}, skipping stale recycle", runId);
+            return false;
+        }
 
         String expectedToken = anchor.getResumeToken();
         long expectedVersion = anchor.getResumeLeaseVersion();
