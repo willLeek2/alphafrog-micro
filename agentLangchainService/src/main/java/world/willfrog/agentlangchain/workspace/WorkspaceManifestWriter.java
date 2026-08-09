@@ -1,7 +1,9 @@
 package world.willfrog.agentlangchain.workspace;
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -21,6 +23,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * workspace 文件写入器。
@@ -30,7 +33,14 @@ import java.util.Map;
  *
  * <h3>fingerprint</h3>
  * <p>workspace_state.json.fingerprint = (sourceRunCompletedAt, sourceRunUpdatedAt, lastMessageSeq)；
- * 一致时 skip，变化时覆盖重 dump。</p>
+ * 计算统一走 {@link WorkspaceFingerprints}（写入侧与 skip 判定侧共用，D21-A）。
+ * 一致且上次 dump 完整（mode=full 且 brokenRefsCount=0）时 skip，变化或不完整时覆盖重 dump。</p>
+ *
+ * <h3>D21-A：mode 与 conservative 减量写入</h3>
+ * <p>workspace_state.json/meta.json 记录 {@code mode}（{@link #MODE_FULL}/{@link #MODE_CONSERVATIVE}）
+ * 与 {@code brokenRefsCount}，供 dump 前 skip 判定读回（{@link #readWorkspaceState}）。
+ * {@link #writeConservative} 是 EXPIRED 保守分支：只写 workspace_state.json + 有限 meta.json，
+ * 收集失败可降级为空资产；但写失败仍然上抛（由 scheduler 重试/DLQ 兜底），不静默吞错。</p>
  *
  * <h3>D04</h3>
  * <p>dataset refPath 不再硬编码 {@code /data/agent_datasets/} 前缀，改经统一存储门面
@@ -45,7 +55,20 @@ import java.util.Map;
 @Slf4j
 public class WorkspaceManifestWriter {
 
+    /** workspace_state.json / meta.json 的 mode 字段：完整 dump（五文件齐全）。 */
+    public static final String MODE_FULL = "full";
+    /** workspace_state.json / meta.json 的 mode 字段：EXPIRED 保守减量 dump（仅状态 + 有限 meta）。 */
+    public static final String MODE_CONSERVATIVE = "conservative";
+
+    private static final String STATE_FILE_NAME = "workspace_state.json";
+
+    // D21-A 修复：注册 JavaTimeModule 并以 ISO-8601 字符串落盘时间字段。
+    // 此前裸 ObjectMapper 序列化 OffsetDateTime（PythonScript.createdAt 等）会抛
+    // InvalidDefinitionException：writePythonScriptsJsonl 逐条 warn 吞掉（脚本静默丢失），
+    // writeMeta 直接失败（任何 startedAt 非空的真实 run 都无法完成 dump）。
     private static final ObjectMapper MAPPER = new ObjectMapper()
+            .registerModule(new JavaTimeModule())
+            .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS)
             .enable(SerializationFeature.INDENT_OUTPUT);
 
     private final AgentStoragePaths storagePaths;
@@ -85,13 +108,75 @@ public class WorkspaceManifestWriter {
         writeManifest(runDir, run, assets, health);
 
         // 4) meta.json
-        writeMeta(runDir, run, health);
+        writeMeta(runDir, run, health, MODE_FULL);
 
         // 5) workspace_state.json
-        WorkspaceState state = computeWorkspaceState(run, assets, health);
+        WorkspaceState state = computeWorkspaceState(run, assets, health, MODE_FULL);
         writeWorkspaceState(runDir, state);
 
         return new WriteResult(runDir, state.fingerprint(), health.brokenRefs().size());
+    }
+
+    /**
+     * EXPIRED 保守分支的减量写入（D21-A）。
+     *
+     * <p>只写 workspace_state.json（mode=conservative）+ 有限 meta.json，
+     * 不写 conversation.jsonl / python_scripts.jsonl / manifest.json：
+     * EXPIRED run 的消息/event 可能缺失，不伪造完整性声明。</p>
+     *
+     * <p>失败语义：入口同样走 D04 可达性校验；任何写失败向上抛，由
+     * {@link WorkspaceDumpScheduler} 重试/DLQ 兜底——conservative 指"减量写入"，
+     * 不是"静默吞错"。</p>
+     *
+     * @param runDir 已 resolve 的 run 目录
+     * @param run    关联 AgentRun
+     * @param assets 收集到的资产，可为 null（收集失败降级时）
+     * @param health 健康校验结果，可为 null（收集失败降级时；meta 不写 health 块）
+     * @return write 结果（brokenCount 恒为 0：conservative 不做完整性声明）
+     */
+    public WriteResult writeConservative(Path runDir, AgentRun run, CollectedAssets assets, WorkspaceHealth health) {
+        if (run == null) {
+            throw new IllegalArgumentException("run 不能为空");
+        }
+        if (runDir == null) {
+            throw new IllegalArgumentException("runDir 不能为空");
+        }
+        // D04 §4.3：与 full 路径同一可达性 + 归属门槛，保守分支不降低失败信号。
+        storagePaths.verifyDumpTarget(runDir);
+        try {
+            Files.createDirectories(runDir);
+        } catch (IOException e) {
+            throw new IllegalStateException("创建 runDir 失败: " + runDir, e);
+        }
+        WorkspaceState state = computeWorkspaceState(run, assets, health, MODE_CONSERVATIVE);
+        writeWorkspaceState(runDir, state);
+        writeMeta(runDir, run, health, MODE_CONSERVATIVE);
+        return new WriteResult(runDir, state.fingerprint(), 0);
+    }
+
+    /**
+     * 读回既有 workspace_state.json，供 dump 前 skip 判定（D21-A）。
+     *
+     * <p>宽容语义：文件不存在 / 不是普通文件 / 解析失败 → 返回 empty
+     * （按"无既有状态"处理，触发重写而不是让 dump 失败）。</p>
+     *
+     * @param runDir 已 resolve 的 run 目录
+     * @return 既有状态；缺失或损坏时 empty
+     */
+    public Optional<WorkspaceState> readWorkspaceState(Path runDir) {
+        if (runDir == null) {
+            return Optional.empty();
+        }
+        Path target = runDir.resolve(STATE_FILE_NAME);
+        if (!Files.isRegularFile(target)) {
+            return Optional.empty();
+        }
+        try {
+            return Optional.of(MAPPER.readValue(target.toFile(), WorkspaceState.class));
+        } catch (Exception e) {
+            log.warn("read workspace_state failed, treat as absent: path={} err={}", target, e.getMessage());
+            return Optional.empty();
+        }
     }
 
     private void writeConversationJsonl(Path runDir, List<AgentRunMessage> messages) {
@@ -218,27 +303,34 @@ public class WorkspaceManifestWriter {
         }
     }
 
-    private void writeMeta(Path runDir, AgentRun run, WorkspaceHealth health) {
+    private void writeMeta(Path runDir, AgentRun run, WorkspaceHealth health, String mode) {
         Path target = runDir.resolve("meta.json");
         Map<String, Object> meta = new LinkedHashMap<>();
         meta.put("schemaVersion", "v0");
         meta.put("workspaceVersion", "v0");
+        meta.put("mode", mode);
         meta.put("runId", run.getId());
         meta.put("userId", run.getUserId());
         meta.put("status", run.getStatus() == null ? null : run.getStatus().name());
-        meta.put("createdAt", run.getStartedAt());
-        meta.put("startedAt", run.getStartedAt());
-        meta.put("completedAt", run.getCompletedAt());
+        // D21-A 修复：裸 MAPPER 未注册 jackson-datatype-jsr310，直接放 OffsetDateTime
+        // 会抛 InvalidDefinitionException（此前任何 startedAt 非空的真实 run 都会在此失败）；
+        // 与本类其它文件一致，统一落 ISO-8601 字符串。
+        meta.put("createdAt", run.getStartedAt() == null ? null : run.getStartedAt().toString());
+        meta.put("startedAt", run.getStartedAt() == null ? null : run.getStartedAt().toString());
+        meta.put("completedAt", run.getCompletedAt() == null ? null : run.getCompletedAt().toString());
         meta.put("lastError", run.getLastError());
 
-        Map<String, Object> healthBlock = new LinkedHashMap<>();
-        healthBlock.put("verifiedAt", OffsetDateTime.now().toString());
-        healthBlock.put("totalRefs", health.totalRefs());
-        healthBlock.put("brokenRefs", health.brokenRefs().size());
-        double ratio = health.totalRefs() == 0 ? 0.0 :
-                (double) health.brokenRefs().size() / health.totalRefs();
-        healthBlock.put("brokenRatio", ratio);
-        meta.put("health", healthBlock);
+        // conservative 降级（health == null）时不写 health 块：没有校验数据就不伪造。
+        if (health != null) {
+            Map<String, Object> healthBlock = new LinkedHashMap<>();
+            healthBlock.put("verifiedAt", OffsetDateTime.now().toString());
+            healthBlock.put("totalRefs", health.totalRefs());
+            healthBlock.put("brokenRefs", health.brokenRefs().size());
+            double ratio = health.totalRefs() == 0 ? 0.0 :
+                    (double) health.brokenRefs().size() / health.totalRefs();
+            healthBlock.put("brokenRatio", ratio);
+            meta.put("health", healthBlock);
+        }
 
         meta.put("ext", run.getExt());
 
@@ -249,28 +341,26 @@ public class WorkspaceManifestWriter {
         }
     }
 
-    private WorkspaceState computeWorkspaceState(AgentRun run, CollectedAssets assets, WorkspaceHealth health) {
+    private WorkspaceState computeWorkspaceState(AgentRun run, CollectedAssets assets,
+                                                 WorkspaceHealth health, String mode) {
         OffsetDateTime completedAt = run.getCompletedAt();
         OffsetDateTime updatedAt = run.getUpdatedAt();
-        int lastSeq = 0;
-        List<AgentRunMessage> messages = assets.messages() == null ? List.of() : assets.messages();
-        for (AgentRunMessage m : messages) {
-            if (m.getSeq() != null && m.getSeq() > lastSeq) {
-                lastSeq = m.getSeq();
-            }
-        }
-        String fingerprint = String.format("%s|%s|%d",
-                completedAt == null ? "" : completedAt.toString(),
-                updatedAt == null ? "" : updatedAt.toString(),
-                lastSeq);
+        // conservative 降级时 assets 可为 null → lastSeq = 0。
+        List<AgentRunMessage> messages = assets == null || assets.messages() == null
+                ? List.of() : assets.messages();
+        int lastSeq = WorkspaceFingerprints.lastSeqOf(messages);
+        String fingerprint = WorkspaceFingerprints.compute(completedAt, updatedAt, lastSeq);
+        // 只有 full 模式做完整性声明；conservative 不落 brokenRefsCount（保持 null = 未知）。
+        Integer brokenRefsCount = MODE_FULL.equals(mode) && health != null
+                ? health.brokenRefs().size() : null;
         return new WorkspaceState(run.getId(), OffsetDateTime.now().toString(), "v0",
                 completedAt == null ? "" : completedAt.toString(),
                 updatedAt == null ? "" : updatedAt.toString(),
-                lastSeq, fingerprint);
+                lastSeq, fingerprint, mode, brokenRefsCount);
     }
 
     private void writeWorkspaceState(Path runDir, WorkspaceState state) {
-        Path target = runDir.resolve("workspace_state.json");
+        Path target = runDir.resolve(STATE_FILE_NAME);
         try {
             atomicWrite(target, MAPPER.writeValueAsString(state));
         } catch (Exception e) {
@@ -299,6 +389,17 @@ public class WorkspaceManifestWriter {
 
     public record WriteResult(Path runDir, String fingerprint, int brokenCount) {}
 
+    /**
+     * workspace_state.json 结构（D21-A 起新增 mode/brokenRefsCount 两字段）。
+     *
+     * <p>兼容语义：旧文件缺 {@code mode} → 读回为 null → skip 判定视为 legacy，
+     * 永不 skip、重 dump 一次后收敛到新格式；缺 {@code brokenRefsCount} → null = 未知，
+     * 同样不 skip。ignoreUnknown 保留对未来字段的前向兼容。</p>
+     *
+     * @param mode             {@link #MODE_FULL}（五文件齐全）/ {@link #MODE_CONSERVATIVE}（减量）；legacy 文件为 null
+     * @param brokenRefsCount  full 模式落盘时的 brokenRefs 数；conservative/legacy 为 null（不做完整性声明）
+     */
+    @JsonIgnoreProperties(ignoreUnknown = true)
     public record WorkspaceState(
             String lastRunId,
             String lastExtractedAt,
@@ -306,6 +407,8 @@ public class WorkspaceManifestWriter {
             String sourceRunCompletedAt,
             String sourceRunUpdatedAt,
             int lastMessageSeq,
-            String fingerprint
+            String fingerprint,
+            String mode,
+            Integer brokenRefsCount
     ) {}
 }
