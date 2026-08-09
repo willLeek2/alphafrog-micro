@@ -1509,11 +1509,19 @@ def _wrapper_run_command(
     makedirs/chdir/sys.path setup itself pre-spawn, so the global
     /sandbox/sitecustomize.py is no longer written per task.
 
-    The PYTHONPATH here therefore only needs the wrapper's own bootstrap dir
-    (so run_wrapper.py can locate ``app.bounded_exec_wrapper``); the user
+    D15 §4.2.3 (Scenario B) round-2 (codex fe54d9f0 core bug): the user
     child's sys.path entry for ``{workdir}`` (where af_dataset_loader and
-    other loader modules live) is added by the wrapper when it spawns the
-    child via its env.
+    other loader modules live) is NO LONGER added by the wrapper via
+    PYTHONPATH env on the child Popen. Putting it on PYTHONPATH would let
+    a stale sitecustomize.py left over in ``{workdir}`` from a previous
+    task be auto-imported by Python's site init phase BEFORE the user
+    script runs, and that stale sitecustomize could overwrite AF_TASK_*
+    back to a previous task's values. Instead, the wrapper stages a
+    per-task loader bootstrap at ``{task_workspace}/_bootstrap/`` that
+    inserts the loader workdir into sys.path AFTER site init finishes,
+    then runs the user script via runpy. PYTHONPATH on this Popen only
+    needs the wrapper's own bootstrap dir (so run_wrapper.py can locate
+    ``app.bounded_exec_wrapper``).
 
     P0-4: when ``child_spec`` is given it is exported verbatim as
     ``AF_SANDBOX_CHILD_USER`` for the wrapper's identity gate (the wrapper

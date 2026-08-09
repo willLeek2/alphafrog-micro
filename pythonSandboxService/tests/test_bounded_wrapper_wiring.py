@@ -632,6 +632,18 @@ class CaptureSpawnWiringTest(unittest.TestCase):
             limits=self._limits(),
             capture_dir=capture_dir,
             child_identity=None,
+            # D15 §4.2.3 round-2: bootstrap mode requires a task-local
+            # task_workspace + loader path. These wiring tests target
+            # capture-dir/pipe inheritance, not task isolation, but the
+            # spawn path now hard-requires them.
+            task_workspace=str(self.task_dir),
+            task_environment={
+                "AF_TASK_WORKSPACE": str(self.task_dir),
+                "AF_TASK_ARTIFACT_DIR": f"{self.task_dir}/artifacts",
+                "AF_TASK_TMP_DIR": f"{self.task_dir}/tmp",
+                "AF_TASK_METRICS_PATH": f"{self.task_dir}/metrics/loader.jsonl",
+            },
+            workdir_for_pythonpath=str(self.task_dir),
         )
         try:
             self.assertTrue(sweep_ok)
@@ -671,6 +683,16 @@ class CaptureSpawnWiringTest(unittest.TestCase):
                 limits=self._limits(),
                 capture_dir=capture_dir,
                 child_identity=None,
+                # D15 §4.2.3 round-2: bootstrap mode requires a task-local
+                # task_workspace + loader path; see the sibling test above.
+                task_workspace=str(self.task_dir),
+                task_environment={
+                    "AF_TASK_WORKSPACE": str(self.task_dir),
+                    "AF_TASK_ARTIFACT_DIR": f"{self.task_dir}/artifacts",
+                    "AF_TASK_TMP_DIR": f"{self.task_dir}/tmp",
+                    "AF_TASK_METRICS_PATH": f"{self.task_dir}/metrics/loader.jsonl",
+                },
+                workdir_for_pythonpath=str(self.task_dir),
             )
         try:
             self.assertTrue(sweep_ok)

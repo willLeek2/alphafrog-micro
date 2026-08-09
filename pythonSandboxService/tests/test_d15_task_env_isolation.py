@@ -477,5 +477,359 @@ class SitecustomizeWriteRemovedTest(unittest.TestCase):
                     )
 
 
+class StaleSitecustomizeBootstrapIsolationTest(unittest.TestCase):
+    """D15 §4.2.3 + §6 red line 3 reverse (codex fe54d9f0 MUST-FIX core bug).
+
+    The round-1 test suite ran every wrapper invocation in a clean temp
+    directory: the loader workdir (which doubles as PYTHONPATH under the
+    round-1 wiring) contained NO sitecustomize.py, so the site-init
+    auto-import race was never exercised. codex fe54d9f0 demonstrated the
+    bug independently: if the loader workdir contains a stale
+    sitecustomize.py from a previous task (e.g. cleanup failed), Python
+    auto-imports it DURING site init, BEFORE the user script runs, and
+    that stale sitecustomize can overwrite AF_TASK_* back to the previous
+    task's values.
+
+    The round-2 fix (loader bootstrap mode) makes the loader workdir
+    enter sys.path only AFTER site init finishes, by staging a per-task
+    ``loader_bootstrap.py`` under ``{task_workspace}/_bootstrap/`` and
+    running the user script THROUGH that bootstrap via runpy. The stale
+    sitecustomize is therefore never auto-imported.
+
+    This test class exercises the reverse scenario the round-1 suite
+    missed: pre-place a stale sitecustomize.py in the loader workdir that
+    attempts to overwrite AF_TASK_* + drop a sentinel file, then verify
+    the user child still sees TASK B's values and the sentinel is NEVER
+    created.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="af-d15-stale-")
+        self.root = Path(self._tmp.name).resolve()
+        # The "stale loader" path simulates a CONTAINER-GLOBAL loader
+        # workdir (production: /sandbox) that still hosts a previous task's
+        # sitecustomize.py because cleanup failed. The wrapper must NOT
+        # auto-import this file at child startup.
+        self.stale_loader_path = self.root / "stale_loader"
+        self.stale_loader_path.mkdir()
+        # Sentinel the stale sitecustomize would create if it ran. Use a
+        # path UNDER self.root so the test never touches /tmp directly
+        # (keeps the suite hermetic and CI-friendly).
+        self.sentinel = self.root / "STALE_A_sentinel"
+        # Build the stale sitecustomize body by plain string formatting.
+        # All AF_TASK_* values point at clearly-named STALE_A_* paths that
+        # the assertions can look for in the user child's stdout; the
+        # sentinel write proves whether the stale sitecustomize ran.
+        stale_workspace = str(self.root / "STALE_A_workspace")
+        stale_artifacts = str(self.root / "STALE_A_artifacts")
+        stale_tmp = str(self.root / "STALE_A_tmp")
+        stale_metrics = str(self.root / "STALE_A_metrics.jsonl")
+        stale_body = (
+            "import os\n"
+            f"os.environ['AF_TASK_WORKSPACE'] = {stale_workspace!r}\n"
+            f"os.environ['AF_TASK_ARTIFACT_DIR'] = {stale_artifacts!r}\n"
+            f"os.environ['AF_TASK_TMP_DIR'] = {stale_tmp!r}\n"
+            f"os.environ['AF_TASK_METRICS_PATH'] = {stale_metrics!r}\n"
+            f"with open({str(self.sentinel)!r}, 'w') as _f:\n"
+            "    _f.write('stale sitecustomize executed')\n"
+        )
+        (self.stale_loader_path / "sitecustomize.py").write_text(
+            stale_body, encoding="utf-8",
+        )
+        # Clean any pre-existing sentinel from a prior run.
+        if self.sentinel.exists():
+            self.sentinel.unlink()
+
+        # Fresh task_workspace for "task B" — its AF_TASK_* must win.
+        self.task_b_workspace = self.root / "task_B_ws"
+        self.task_b_workspace.mkdir()
+        (self.task_b_workspace / "artifacts").mkdir()
+        (self.task_b_workspace / "tmp").mkdir()
+        (self.task_b_workspace / "metrics").mkdir()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _write_user_script(self) -> Path:
+        """User script prints every AF_TASK_* it sees; if any is missing it
+        prints ``<missing>`` so the parent can detect leaks or holes."""
+        script = self.task_b_workspace / "user_script.py"
+        script.write_text(
+            "import os\n"
+            "for key in (\n"
+            "    'AF_TASK_WORKSPACE',\n"
+            "    'AF_TASK_ARTIFACT_DIR',\n"
+            "    'AF_TASK_TMP_DIR',\n"
+            "    'AF_TASK_METRICS_PATH',\n"
+            "):\n"
+            "    print(f'{key}=' + os.environ.get(key, '<missing>'))\n",
+            encoding="utf-8",
+        )
+        return script
+
+    def test_stale_global_sitecustomize_does_not_override_task_env(self):
+        """The headline reverse test (codex fe54d9f0 core bug).
+
+        Pre-conditions:
+          * A stale sitecustomize.py lives in the loader workdir that tries
+            to overwrite all four AF_TASK_* vars to STALE_A values AND
+            drops a sentinel file at a known path.
+          * Task B's wrapper-input.json carries the correct TASK B values
+            and points loaderPythonPath at the stale loader workdir.
+
+        Expected (after round-2 fix):
+          * The user child prints TASK B's AF_TASK_WORKSPACE / ARTIFACT_DIR.
+          * The user child does NOT print any STALE_A value.
+          * The sentinel file is NEVER created — the stale sitecustomize
+            was never auto-imported at Python startup.
+          * Wrapper exit code is 0.
+        """
+        script = self._write_user_script()
+        input_path = self.task_b_workspace / "wrapper-input.json"
+        _write_wrapper_input(
+            input_path,
+            script_path=script,
+            task_workspace=str(self.task_b_workspace),
+            task_env=_make_task_env(str(self.task_b_workspace)),
+            loader_python_path=str(self.stale_loader_path),
+        )
+
+        completed = _run_wrapper(input_path)
+        self.assertEqual(
+            completed.returncode, 0,
+            f"wrapper failed: stderr={completed.stderr[:1024]!r}",
+        )
+
+        import base64
+        envelope = json.loads(completed.stdout.decode("utf-8"))
+        stdout = base64.b64decode(envelope["files"]["stdout.bin"]).decode("utf-8")
+
+        # Task B's AF_TASK_WORKSPACE / ARTIFACT_DIR must be visible.
+        self.assertIn(
+            f"AF_TASK_WORKSPACE={self.task_b_workspace}", stdout,
+            "task B workspace not visible to user child",
+        )
+        self.assertIn(
+            f"AF_TASK_ARTIFACT_DIR={self.task_b_workspace}/artifacts", stdout,
+            "task B artifact dir not visible to user child",
+        )
+
+        # No STALE_A value may leak through.
+        self.assertNotIn(
+            "STALE_A_workspace", stdout,
+            "stale sitecustomize overrode AF_TASK_WORKSPACE — bootstrap "
+            "did not prevent site-init auto-import of the loader workdir's "
+            "sitecustomize.py (D15 §4.2.3 round-2 core bug NOT fixed)",
+        )
+        self.assertNotIn(
+            "STALE_A_artifacts", stdout,
+            "stale sitecustomize overrode AF_TASK_ARTIFACT_DIR",
+        )
+        self.assertNotIn(
+            "STALE_A_tmp", stdout,
+            "stale sitecustomize overrode AF_TASK_TMP_DIR",
+        )
+        self.assertNotIn(
+            "STALE_A_metrics", stdout,
+            "stale sitecustomize overrode AF_TASK_METRICS_PATH",
+        )
+
+        # The sentinel file must NOT exist — the stale sitecustomize must
+        # never have run. This is the most direct proof that the bootstrap
+        # blocked the auto-import path.
+        self.assertFalse(
+            self.sentinel.exists(),
+            "stale sitecustomize.py ran during site init and dropped its "
+            "sentinel file — the loader bootstrap mode did NOT prevent "
+            "auto-import (D15 §4.2.3 round-2 core bug NOT fixed)",
+        )
+
+    def test_loader_bootstrap_is_actually_staged_under_task_workspace(self):
+        """Round-2 contract: the wrapper writes loader_bootstrap.py to
+        {task_workspace}/_bootstrap/loader_bootstrap.py before Popen. After
+        a successful run that file must exist (proving the new path is in
+        use, not the round-1 direct-invocation path)."""
+        script = self._write_user_script()
+        input_path = self.task_b_workspace / "wrapper-input.json"
+        _write_wrapper_input(
+            input_path,
+            script_path=script,
+            task_workspace=str(self.task_b_workspace),
+            task_env=_make_task_env(str(self.task_b_workspace)),
+            loader_python_path=str(self.stale_loader_path),
+        )
+        completed = _run_wrapper(input_path)
+        self.assertEqual(completed.returncode, 0, repr(completed.stderr[:512]))
+
+        bootstrap_path = (
+            self.task_b_workspace / "_bootstrap" / "loader_bootstrap.py"
+        )
+        self.assertTrue(
+            bootstrap_path.is_file(),
+            "loader_bootstrap.py was not staged under "
+            "{task_workspace}/_bootstrap/ — round-2 bootstrap path is "
+            "not in use",
+        )
+        body = bootstrap_path.read_text(encoding="utf-8")
+        # The bootstrap must insert the loader path into sys.path AFTER
+        # site init (i.e. contain a sys.path.insert call) and run the user
+        # script via runpy.run_path. Pinning these textually makes future
+        # regressions visible even if the file is silently re-located.
+        self.assertIn("sys.path.insert(0, LOADER_PATH)", body)
+        self.assertIn('runpy.run_path(USER_SCRIPT, run_name="__main__")', body)
+        self.assertIn(str(self.stale_loader_path), body)
+
+
+class LoaderRequiredAndConsistencyInvariantsTest(unittest.TestCase):
+    """D15 §4.2.3 round-2 (codex fe54d9f0 MUST-FIX #1 + #2): loaderPythonPath
+    is now REQUIRED, and taskWorkspace must be self-consistent with the four
+    AF_TASK_* vars (each at-or-inside taskWorkspace, AF_TASK_WORKSPACE
+    exactly equal). A violating payload fails closed BEFORE the user child
+    spawns."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="af-d15-inv-")
+        self.task_dir = Path(self._tmp.name).resolve()
+        self.script = self.task_dir / "user_script.py"
+        self.script.write_text(
+            "import sys\n"
+            "sys.stderr.write('USER_CHILD_RAN\\n')\n"
+            "sys.exit(0)\n",
+            encoding="utf-8",
+        )
+        # Marker the user child would create if it ran.
+        self.ran_marker = self.task_dir / "child_ran.marker"
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _base_payload(self) -> dict:
+        return {
+            "scriptPath": str(self.script),
+            "timeoutSeconds": 30,
+            "effectiveOutputLimits": dict(_DEFAULT_LIMITS),
+            "runtimeEnvironmentPath": str(self.task_dir / "runtime-environment.json"),
+            "taskWorkspace": str(self.task_dir),
+            "taskEnvironment": _make_task_env(str(self.task_dir)),
+            "loaderPythonPath": str(self.task_dir),
+        }
+
+    def _write_input(self, payload: dict) -> Path:
+        input_path = self.task_dir / "wrapper-input.json"
+        input_path.write_text(json.dumps(payload), encoding="utf-8")
+        if self.ran_marker.exists():
+            self.ran_marker.unlink()
+        # Rewrite the user script to drop a marker we can check.
+        self.script.write_text(
+            f"open({str(self.ran_marker)!r}, 'w').close()\n"
+            "import sys\n"
+            "sys.exit(0)\n",
+            encoding="utf-8",
+        )
+        (self.task_dir / "runtime-environment.json").write_text(
+            "{}", encoding="utf-8"
+        )
+        return input_path
+
+    def test_missing_loader_python_path_fails_closed(self):
+        """loaderPythonPath is required — omitting it must fail closed."""
+        payload = self._base_payload()
+        payload.pop("loaderPythonPath")
+        input_path = self._write_input(payload)
+        completed = _run_wrapper(input_path)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn(b"loaderPythonPath", completed.stderr)
+        self.assertFalse(
+            self.ran_marker.exists(),
+            "wrapper spawned user child despite missing loaderPythonPath",
+        )
+
+    def test_empty_loader_python_path_fails_closed(self):
+        """loaderPythonPath must be non-empty — blank must fail closed."""
+        payload = self._base_payload()
+        payload["loaderPythonPath"] = ""
+        input_path = self._write_input(payload)
+        completed = _run_wrapper(input_path)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertFalse(
+            self.ran_marker.exists(),
+            "wrapper spawned user child despite empty loaderPythonPath",
+        )
+
+    def test_af_task_workspace_mismatch_fails_closed(self):
+        """taskWorkspace and AF_TASK_WORKSPACE disagree -> fail closed.
+
+        Without this invariant the wrapper could be fooled into a payload
+        whose cwd is task B but whose env points at task A. codex
+        fe54d9f0 MUST-FIX #2.
+        """
+        payload = self._base_payload()
+        # Make AF_TASK_WORKSPACE point somewhere else (still absolute, still
+        # a valid-looking path, but NOT taskWorkspace).
+        payload["taskEnvironment"] = dict(payload["taskEnvironment"])
+        payload["taskEnvironment"]["AF_TASK_WORKSPACE"] = str(
+            self.task_dir / "evil_twin"
+        )
+        input_path = self._write_input(payload)
+        completed = _run_wrapper(input_path)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertFalse(
+            self.ran_marker.exists(),
+            "wrapper spawned user child despite taskWorkspace / "
+            "AF_TASK_WORKSPACE mismatch",
+        )
+
+    def test_af_task_artifact_dir_outside_workspace_fails_closed(self):
+        """AF_TASK_ARTIFACT_DIR resolves outside taskWorkspace -> fail closed.
+
+        A relative '..' escape or an absolute path that does not live
+        beneath taskWorkspace must be rejected, otherwise a payload could
+        smuggle artifact writes outside the task-local workspace.
+        """
+        payload = self._base_payload()
+        payload["taskEnvironment"] = dict(payload["taskEnvironment"])
+        # Absolute path that does NOT live beneath task_dir.
+        payload["taskEnvironment"]["AF_TASK_ARTIFACT_DIR"] = "/etc"
+        input_path = self._write_input(payload)
+        completed = _run_wrapper(input_path)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertFalse(
+            self.ran_marker.exists(),
+            "wrapper spawned user child despite AF_TASK_ARTIFACT_DIR "
+            "pointing outside taskWorkspace",
+        )
+
+    def test_af_task_tmp_dir_dotdot_escape_fails_closed(self):
+        """AF_TASK_TMP_DIR uses '..' to escape taskWorkspace -> fail closed."""
+        payload = self._base_payload()
+        payload["taskEnvironment"] = dict(payload["taskEnvironment"])
+        # '..' escape: resolves outside task_dir.
+        payload["taskEnvironment"]["AF_TASK_TMP_DIR"] = (
+            str(self.task_dir) + "/../escape"
+        )
+        input_path = self._write_input(payload)
+        completed = _run_wrapper(input_path)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertFalse(
+            self.ran_marker.exists(),
+            "wrapper spawned user child despite AF_TASK_TMP_DIR using "
+            "'..' to escape taskWorkspace",
+        )
+
+    def test_af_task_metrics_path_outside_workspace_fails_closed(self):
+        """AF_TASK_METRICS_PATH resolves outside taskWorkspace -> fail closed."""
+        payload = self._base_payload()
+        payload["taskEnvironment"] = dict(payload["taskEnvironment"])
+        payload["taskEnvironment"]["AF_TASK_METRICS_PATH"] = "/tmp/elsewhere.json"
+        input_path = self._write_input(payload)
+        completed = _run_wrapper(input_path)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertFalse(
+            self.ran_marker.exists(),
+            "wrapper spawned user child despite AF_TASK_METRICS_PATH "
+            "pointing outside taskWorkspace",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
