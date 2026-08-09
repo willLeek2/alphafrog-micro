@@ -7,7 +7,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.params.provider.MethodSource;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.config.StressTestProperties;
 import world.willfrog.agent.platform.context.AgentContext;
@@ -59,34 +59,13 @@ class ToolRouterRegistryConsistencyTest {
         AgentContext.clear();
     }
 
+    // 直接以注册表声明面为数据源：新增声明若没有可执行路由，本参数化测试会立即失败
+    static Set<String> declaredToolNames() {
+        return AgentToolRegistry.declaredToolNames();
+    }
+
     @ParameterizedTest
-    @ValueSource(strings = {
-            "getStockInfo",
-            "getStockDaily",
-            "getStockSwIndustryInfo",
-            "searchStock",
-            "searchFund",
-            "getIndexInfo",
-            "getIndexDaily",
-            "searchIndex",
-            "searchAssetInfo",
-            "checkParallelLimits",
-            "getTradingDaysSummary",
-            "isTradingDay",
-            "getExchangeAssetDaily",
-            "getOffExchangeAssetDaily",
-            "getEtfAdj",
-            "getListedAssetShareSize",
-            "getFinancialReport",
-            "ragSearch",
-            "loadDocument",
-            "searchWeb",
-            "executePython",
-            "resolveFinanceMethods",
-            "loadToolGuide",
-            "rereadToolResult",
-            "listMyData"
-    })
+    @MethodSource("declaredToolNames")
     void everyDeclaredTool_doesNotReturnUnsupported(String toolName) throws Exception {
         ToolRouter.ToolInvocationResult result = invokeTool(toolName);
         JsonNode root = objectMapper.readTree(result.getOutput());
