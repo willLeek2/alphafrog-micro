@@ -6,6 +6,16 @@ from typing import List, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
+# D15 §4.2.3 round-4 (codex 56976668 MUST-FIX #3): single payload contract
+# shared with bounded_exec_wrapper.parse_wrapper_input. Imported at top
+# level — payload_contract.py is stdlib-only so this does NOT drag pydantic
+# into the wrapper's import graph (the wrapper imports payload_contract
+# directly, not via this module).
+from app.payload_contract import (
+    PayloadContractError,
+    validate_payload_contract,
+)
+
 
 class TaskStatus(str, Enum):
     QUEUED = "QUEUED"
@@ -218,6 +228,36 @@ class BoundedExecRequest(BaseModel):
     # _write_loader_bootstrap), so a stale sitecustomize in the loader
     # workdir is never auto-imported at startup.
     loaderPythonPath: str = Field(..., min_length=1)
+
+    @model_validator(mode="after")
+    def validate_d15_round4_payload_contract(self) -> "BoundedExecRequest":
+        """D15 §4.2.3 round-4 (codex 56976668 MUST-FIX #3): pydantic-side
+        mirror of the wrapper parser's payload contract. Calls the SAME
+        ``validate_payload_contract`` function (single source of truth in
+        ``app.payload_contract``) so a payload that passes pydantic
+        cannot fail at the wrapper parser on field-level invariants.
+
+        Filesystem-anchored checks (workspace == wrapper-input.json
+        parent; scriptPath regular file; loaderPythonPath existing
+        directory; ``_bootstrap`` symlink rejection) are NOT done here —
+        pydantic has no filesystem context. The wrapper parser adds those
+        on top when it has the wrapper-input.json path.
+
+        Without this validator the model could construct objects the
+        runtime would reject (smuggled PYTHONPATH, AF_TASK_WORKSPACE !=
+        taskWorkspace, AF sub-path equal to workspace, etc.) — codex
+        56976668 MUST-FIX #3 explicitly forbids that gap.
+        """
+        try:
+            validate_payload_contract(
+                self.wrapper_input_payload(), wrapper_input_path=None,
+            )
+        except PayloadContractError as exc:
+            # pydantic's model_validator protocol: raise ValueError (or
+            # AssertionError) to mark validation failure; pydantic then
+            # converts it to ValidationError for the caller.
+            raise ValueError(str(exc)) from exc
+        return self
 
     def wrapper_input_payload(self) -> dict:
         """Serialize to the exact §7.1 input shape.

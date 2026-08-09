@@ -1079,5 +1079,403 @@ class BootstrapPermissionAndRunpySemanticsTest(unittest.TestCase):
         )
 
 
+class PayloadContractRound4Test(unittest.TestCase):
+    """D15 §4.2.3 round-4 (codex 56976668 MUST-FIX #1 + #2 + #3).
+
+    Round-3 closed bootstrap permission + sibling import but left three
+    security gaps that host tests (same-UID, fresh temp dir) could not
+    surface:
+
+    1. **taskEnvironment had no whitelist** — caller could smuggle
+       ``PYTHONPATH``/``PYTHONHOME``/``PYTHONSTARTUP`` into the user
+       child's env, re-activating the stale-sitecustomize attack vector
+       the round-2 bootstrap mode just closed. codex 56976668 MUST-FIX #1.
+    2. **containment anchored on an unverified base** — taskWorkspace
+       had no anchor to wrapper-input.json's parent dir, so ``/``,
+       ``..``, parent dir, or a symlink to an external target could all
+       pass as "the workspace"; scriptPath/loaderPythonPath/_bootstrap
+       had no type/existence check; a pre-planted ``_bootstrap`` symlink
+       could let the root wrapper chmod/write an attacker-chosen external
+       target. codex 56976668 MUST-FIX #2.
+    3. **model vs parser semantics could drift** — required field count
+       aligned but the model could still construct objects the runtime
+       would reject. codex 56976668 MUST-FIX #3.
+
+    Round-4 closes all three by extracting a single
+    ``validate_payload_contract`` function in ``app.payload_contract``;
+    both the runtime parser (with wrapper_input_path) and the pydantic
+    model (without — no fs context at HTTP validation time) call it.
+    The wrapper adds filesystem evidence on top (scriptPath regular file,
+    loaderPythonPath existing directory, ``_bootstrap`` symlink rejection).
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="af-d15-r4-")
+        self.root = Path(self._tmp.name).resolve()
+        # The "task workspace" is a subdir of root; the wrapper-input.json
+        # is written INSIDE the workspace (matches production runner's
+        # {task_workspace}/wrapper-input.json layout) so the workspace
+        # anchor check passes for the base payload.
+        self.task_workspace = self.root / "task_ws"
+        self.task_workspace.mkdir()
+        (self.task_workspace / "artifacts").mkdir()
+        (self.task_workspace / "tmp").mkdir()
+        (self.task_workspace / "metrics").mkdir()
+        self.loader_path = self.root / "loader"
+        self.loader_path.mkdir()
+        self.script = self.task_workspace / "user_script.py"
+        self.script.write_text("print('user child ran')\n", encoding="utf-8")
+        # Marker the user child would create if it ran.
+        self.ran_marker = self.root / "child_ran.marker"
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _base_env(self) -> dict[str, str]:
+        return _make_task_env(str(self.task_workspace))
+
+    def _write_input(
+        self,
+        *,
+        input_path: Path | None = None,
+        task_workspace: str | None = None,
+        task_env: dict[str, str] | None = None,
+        script_path: str | None = None,
+        loader_python_path: str | None = None,
+    ) -> Path:
+        """Stage a wrapper-input.json. Defaults match a valid round-4
+        payload; tests override one field at a time to introduce the
+        violation under test."""
+        if input_path is None:
+            input_path = self.task_workspace / "wrapper-input.json"
+        if self.ran_marker.exists():
+            self.ran_marker.unlink()
+        # Rewrite the user script to drop a marker we can check.
+        self.script.write_text(
+            f"open({str(self.ran_marker)!r}, 'w').close()\n"
+            "import sys\n"
+            "sys.exit(0)\n",
+            encoding="utf-8",
+        )
+        _write_wrapper_input(
+            input_path,
+            script_path=Path(script_path) if script_path else self.script,
+            task_workspace=task_workspace or str(self.task_workspace),
+            task_env=task_env if task_env is not None else self._base_env(),
+            loader_python_path=loader_python_path or str(self.loader_path),
+        )
+        return input_path
+
+    # === codex 56976668 MUST-FIX #1: taskEnvironment whitelist ===
+
+    def test_smuggled_pythonpath_in_task_env_fails_closed(self):
+        """taskEnvironment carrying PYTHONPATH is the canonical round-4
+        attack: caller smuggles PYTHONPATH=<stale sitecustomize dir>
+        so the user child re-imports the stale sitecustomize at Python
+        startup, overriding AF_TASK_* back to a previous task's values.
+        Round-2 bootstrap mode is bypassed entirely because PYTHONPATH
+        is what triggers the site-init auto-import in the first place.
+        Wrapper MUST reject this payload before spawn."""
+        env = self._base_env()
+        env["PYTHONPATH"] = str(self.loader_path)
+        input_path = self._write_input(task_env=env)
+        completed = _run_wrapper(input_path)
+        self.assertNotEqual(completed.returncode, 0)
+        stderr = completed.stderr.decode("utf-8", errors="replace")
+        self.assertIn("PYTHONPATH", stderr)
+        self.assertIn("site-init hazard", stderr)
+        self.assertFalse(
+            self.ran_marker.exists(),
+            "wrapper spawned user child despite smuggled PYTHONPATH in "
+            "taskEnvironment (codex 56976668 MUST-FIX #1 NOT fixed)",
+        )
+
+    def test_smuggled_pythonhome_in_task_env_fails_closed(self):
+        """PYTHONHOME is another site-init hazard: it tells the
+        interpreter to use a different Python install, whose
+        site-packages may host an arbitrary sitecustomize.py."""
+        env = self._base_env()
+        env["PYTHONHOME"] = "/usr/local"
+        input_path = self._write_input(task_env=env)
+        completed = _run_wrapper(input_path)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertFalse(self.ran_marker.exists())
+
+    def test_unknown_extra_key_in_task_env_fails_closed(self):
+        """Any key outside the four AF_TASK_* + the explicit hazard list
+        is also rejected — the whitelist is closed: only the four AF_TASK_*
+        are accepted, period. A caller who wants to pass an arbitrary env
+        var to the user child must do it via the user script itself, not
+        via taskEnvironment."""
+        env = self._base_env()
+        env["SOME_UNKNOWN_VAR"] = "evil"
+        input_path = self._write_input(task_env=env)
+        completed = _run_wrapper(input_path)
+        self.assertNotEqual(completed.returncode, 0)
+        stderr = completed.stderr.decode("utf-8", errors="replace")
+        self.assertIn("non-allowlisted", stderr)
+        self.assertFalse(self.ran_marker.exists())
+
+    # === codex 56976668 MUST-FIX #2: containment anchor ===
+
+    def test_task_workspace_root_path_fails_closed(self):
+        """taskWorkspace="/" must be rejected: the workspace anchor
+        requires taskWorkspace to equal wrapper-input.json's parent dir,
+        and "/" can never equal any reasonable wrapper-input.json parent.
+        Without this check, every AF_TASK_* sub-path check below would
+        pass trivially because almost any path is "inside /"."""
+        # Override the input_path: still inside task_workspace (so the
+        # script + loader paths can resolve), but taskWorkspace claims "/".
+        # AF_TASK_WORKSPACE MUST also be "/" so the AF-vs-workspace
+        # consistency check passes; we want to isolate the anchor check.
+        env = _make_task_env("/")
+        input_path = self._write_input(task_workspace="/", task_env=env)
+        completed = _run_wrapper(input_path)
+        self.assertNotEqual(completed.returncode, 0)
+        stderr = completed.stderr.decode("utf-8", errors="replace")
+        self.assertIn("must equal the wrapper-input.json parent", stderr)
+        self.assertFalse(self.ran_marker.exists())
+
+    def test_task_workspace_parent_dir_fails_closed(self):
+        """taskWorkspace = wrapper-input.json's GRANDPARENT (root dir)
+        must be rejected. The wrapper-input.json is at
+        ``{task_workspace}/wrapper-input.json`` so its parent IS
+        task_workspace; claiming a different parent (the grandparent)
+        would let AF_TASK_* paths point outside the actual workspace."""
+        # Write wrapper-input.json inside task_workspace, but claim
+        # taskWorkspace is self.root (the parent). AF_TASK_WORKSPACE
+        # MUST also be self.root so the consistency check passes.
+        env = _make_task_env(str(self.root))
+        input_path = self._write_input(
+            task_workspace=str(self.root), task_env=env,
+        )
+        completed = _run_wrapper(input_path)
+        self.assertNotEqual(completed.returncode, 0)
+        stderr = completed.stderr.decode("utf-8", errors="replace")
+        self.assertIn("must equal the wrapper-input.json parent", stderr)
+        self.assertFalse(self.ran_marker.exists())
+
+    def test_task_workspace_sibling_dir_fails_closed(self):
+        """taskWorkspace = a sibling directory of the actual
+        wrapper-input.json parent must be rejected. This is the
+        common-case attack: caller places wrapper-input.json in
+        task_A's dir but claims taskWorkspace=task_B to make AF_TASK_*
+        paths resolve into task_B."""
+        sibling = self.root / "sibling_ws"
+        sibling.mkdir()
+        # AF_TASK_WORKSPACE MUST also be sibling so the consistency
+        # check passes; we want to isolate the anchor check.
+        env = _make_task_env(str(sibling))
+        input_path = self._write_input(
+            task_workspace=str(sibling), task_env=env,
+        )
+        completed = _run_wrapper(input_path)
+        self.assertNotEqual(completed.returncode, 0)
+        stderr = completed.stderr.decode("utf-8", errors="replace")
+        self.assertIn("must equal the wrapper-input.json parent", stderr)
+        self.assertFalse(self.ran_marker.exists())
+
+    # === codex 56976668 MUST-FIX #2: scriptPath type + containment ===
+
+    def test_script_path_outside_workspace_fails_closed(self):
+        """scriptPath must live STRICTLY BENEATH taskWorkspace. An
+        absolute path outside the workspace would let the wrapper
+        bootstrap and execute arbitrary code from anywhere on disk."""
+        external_script = self.root / "external.py"
+        external_script.write_text("print('external')\n", encoding="utf-8")
+        input_path = self._write_input(script_path=str(external_script))
+        completed = _run_wrapper(input_path)
+        self.assertNotEqual(completed.returncode, 0)
+        stderr = completed.stderr.decode("utf-8", errors="replace")
+        # The contract check fires before the fs type check; both
+        # messages are about scriptPath violations.
+        self.assertIn("scriptPath", stderr)
+        self.assertFalse(self.ran_marker.exists())
+
+    def test_script_path_is_a_directory_fails_closed(self):
+        """scriptPath must be a regular file, not a directory. Without
+        this check a smuggled directory path could let the wrapper
+        bootstrap an arbitrary loader from a directory's contents."""
+        input_path = self._write_input(script_path=str(self.task_workspace))
+        completed = _run_wrapper(input_path)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertFalse(self.ran_marker.exists())
+
+    def test_script_path_missing_fails_closed(self):
+        """scriptPath must exist. A path that does not exist is a
+        fail-closed (the wrapper cannot bootstrap a script that isn't
+        there)."""
+        missing = self.task_workspace / "does_not_exist.py"
+        input_path = self._write_input(script_path=str(missing))
+        completed = _run_wrapper(input_path)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertFalse(self.ran_marker.exists())
+
+    # === codex 56976668 MUST-FIX #2: loaderPythonPath type ===
+
+    def test_loader_path_missing_fails_closed(self):
+        """loaderPythonPath must EXIST. A path that does not exist is
+        fail-closed: the user child would otherwise silently lose import
+        visibility of af_dataset_loader, which violates the D15 §4.2
+        "task environment cannot be established -> fail-closed" rule."""
+        missing = self.root / "does_not_exist"
+        input_path = self._write_input(loader_python_path=str(missing))
+        completed = _run_wrapper(input_path)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertFalse(self.ran_marker.exists())
+
+    def test_loader_path_is_a_regular_file_fails_closed(self):
+        """loaderPythonPath must be a DIRECTORY, not a regular file.
+        A smuggled file path would cause Python's sys.path machinery
+        to misbehave or import from an attacker-controlled .pth file."""
+        loader_file = self.root / "loader_file"
+        loader_file.write_text("not a directory", encoding="utf-8")
+        input_path = self._write_input(loader_python_path=str(loader_file))
+        completed = _run_wrapper(input_path)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertFalse(self.ran_marker.exists())
+
+    # === codex 56976668 MUST-FIX #2: AF sub-path boundary ===
+
+    def test_af_task_artifact_dir_equals_workspace_fails_closed(self):
+        """AF_TASK_ARTIFACT_DIR = workspace itself must be rejected.
+        Round-3 accepted "at-or-inside" (equal was OK); round-4 tightens
+        to "strictly beneath" because codex 56976668 explicitly lists
+        "AF 子路径 ... 等于 workspace" as a violation."""
+        env = self._base_env()
+        env["AF_TASK_ARTIFACT_DIR"] = str(self.task_workspace)
+        input_path = self._write_input(task_env=env)
+        completed = _run_wrapper(input_path)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertFalse(self.ran_marker.exists())
+
+    def test_af_task_tmp_dir_prefix_sibling_fails_closed(self):
+        """AF_TASK_TMP_DIR = a sibling whose name is a prefix of
+        workspace must be rejected. Lexical containment checks without
+        trailing slash would let ``/ws-other`` slip past ``/ws``;
+        realpath + trailing-slash check closes this."""
+        env = self._base_env()
+        # /tmp/xxx/task_ws-other is a prefix sibling of /tmp/xxx/task_ws
+        sibling = self.root / "task_ws-other"
+        sibling.mkdir()
+        env["AF_TASK_TMP_DIR"] = str(sibling)
+        input_path = self._write_input(task_env=env)
+        completed = _run_wrapper(input_path)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertFalse(self.ran_marker.exists())
+
+    def test_af_task_metrics_path_parent_dir_fails_closed(self):
+        """AF_TASK_METRICS_PATH = workspace's parent must be rejected.
+        ``..``-style escapes via realpath resolution are caught."""
+        env = self._base_env()
+        env["AF_TASK_METRICS_PATH"] = str(self.root / "external.json")
+        input_path = self._write_input(task_env=env)
+        completed = _run_wrapper(input_path)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertFalse(self.ran_marker.exists())
+
+    # === codex 56976668 MUST-FIX #2: _bootstrap symlink rejection ===
+
+    def test_pre_placed_bootstrap_symlink_is_rejected(self):
+        """A pre-planted ``_bootstrap`` symlink under task_workspace
+        MUST be rejected (not followed). Without this check, the root
+        wrapper would mkdir(exist_ok=True) the symlink's target dir
+        (which already exists), then write_text + chmod the bootstrap
+        file at the symlink-resolved path — letting root write
+        attacker-chosen content to an attacker-chosen external target.
+
+        The test plants ``_bootstrap -> external_target/``, then verifies
+        (a) the wrapper fails closed, and (b) the external target was
+        NOT modified (no loader_bootstrap.py written there).
+        """
+        external_target = self.root / "external_bootstrap_target"
+        external_target.mkdir()
+        bootstrap_link = self.task_workspace / "_bootstrap"
+        bootstrap_link.symlink_to(external_target)
+
+        input_path = self._write_input()
+        completed = _run_wrapper(input_path)
+        self.assertNotEqual(completed.returncode, 0)
+        stderr = completed.stderr.decode("utf-8", errors="replace")
+        self.assertIn("symlink", stderr)
+        # External target must NOT have been written to.
+        external_file = external_target / "loader_bootstrap.py"
+        self.assertFalse(
+            external_file.exists(),
+            "wrapper followed the _bootstrap symlink and wrote "
+            "loader_bootstrap.py to an external attacker-chosen target "
+            "(codex 56976668 MUST-FIX #2 NOT fixed)",
+        )
+        self.assertFalse(self.ran_marker.exists())
+
+    # === codex 56976668 MUST-FIX #3: model/parser contract alignment ===
+
+    def test_pydantic_model_rejects_smuggled_pythonpath(self):
+        """The pydantic model MUST reject the same payloads the runtime
+        parser rejects (single contract). Without this, a caller could
+        construct a BoundedExecRequest that the runtime would refuse —
+        violating codex 56976668 MUST-FIX #3's "model/parser semantics
+        must align" rule.
+
+        This test exercises the model layer directly (no subprocess),
+        using the same PYTHONPATH smuggling vector as the wrapper-level
+        test above. The model's round-4 validator must catch it."""
+        from app.models import BoundedExecRequest, EffectiveOutputLimits
+        from pydantic import ValidationError
+
+        limits = EffectiveOutputLimits(
+            stdoutMaxBytes=1048576,
+            stderrMaxBytes=262144,
+            recordChannelMaxBytes=262144,
+            recordChannelMaxRecords=128,
+        )
+        # Smuggle PYTHONPATH via taskEnvironment. The model MUST reject
+        # this at construction time, NOT just at wrapper-input.json write
+        # time.
+        bad_env = self._base_env()
+        bad_env["PYTHONPATH"] = str(self.loader_path)
+        with self.assertRaises(ValidationError) as ctx:
+            BoundedExecRequest(
+                scriptPath=str(self.script),
+                timeoutSeconds=30,
+                effectiveOutputLimits=limits,
+                taskWorkspace=str(self.task_workspace),
+                taskEnvironment=bad_env,
+                loaderPythonPath=str(self.loader_path),
+            )
+        # The ValidationError's message MUST mention PYTHONPATH so the
+        # operator sees the actual attack vector.
+        message = str(ctx.exception)
+        self.assertIn("PYTHONPATH", message)
+
+    def test_pydantic_model_rejects_workspace_env_mismatch(self):
+        """The model layer MUST reject AF_TASK_WORKSPACE != taskWorkspace
+        at construction time. Without this, the runtime parser would
+        catch it but the model could silently construct an invalid
+        object — exactly the kind of drift codex 56976668 MUST-FIX #3
+        forbids."""
+        from app.models import BoundedExecRequest, EffectiveOutputLimits
+        from pydantic import ValidationError
+
+        limits = EffectiveOutputLimits(
+            stdoutMaxBytes=1048576,
+            stderrMaxBytes=262144,
+            recordChannelMaxBytes=262144,
+            recordChannelMaxRecords=128,
+        )
+        # AF_TASK_WORKSPACE disagrees with taskWorkspace.
+        env = self._base_env()
+        env["AF_TASK_WORKSPACE"] = str(self.root / "evil_twin")
+        with self.assertRaises(ValidationError):
+            BoundedExecRequest(
+                scriptPath=str(self.script),
+                timeoutSeconds=30,
+                effectiveOutputLimits=limits,
+                taskWorkspace=str(self.task_workspace),
+                taskEnvironment=env,
+                loaderPythonPath=str(self.loader_path),
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

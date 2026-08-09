@@ -208,6 +208,16 @@ from app.child_identity import (
     ChildIdentityError,
     parse_child_spec,
 )
+# D15 §4.2.3 round-4 (codex 56976668 MUST-FIX #3): single payload contract
+# shared with models.BoundedExecRequest. payload_contract.py is stdlib-only
+# so importing it here does NOT break this wrapper's stdlib-only invariant
+# (it does NOT drag pydantic into the wrapper's import graph — pydantic is
+# only pulled in if app.models is imported, which this wrapper never does).
+from app.payload_contract import (
+    ALLOWED_TASK_ENV_KEYS,
+    PayloadContractError,
+    validate_payload_contract,
+)
 # === end work-package-C =====================================================
 
 __all__ = [
@@ -1203,72 +1213,14 @@ def _flush_quietly(fileobj) -> None:
 # see in taskEnvironment before it will spawn the user child. Missing any of
 # them is fail-closed (no spawn, no global sitecustomize fallback) per
 # D15 §6 red line 4.
-REQUIRED_TASK_ENV_KEYS = (
-    "AF_TASK_WORKSPACE",
-    "AF_TASK_ARTIFACT_DIR",
-    "AF_TASK_TMP_DIR",
-    "AF_TASK_METRICS_PATH",
-)
-
-
-def _is_within(task_workspace: str, candidate: str) -> bool:
-    """Return True iff ``candidate`` is exactly ``task_workspace`` or lives
-    somewhere strictly beneath it.
-
-    Uses ``os.path.realpath`` on BOTH sides after normalization so a path
-    like ``/ws/../etc/passwd`` cannot slip past the check. A symlink that
-    resolves outside ``task_workspace`` likewise fails. ``task_workspace``
-    itself is accepted as the trivially-inside case (relevant for
-    AF_TASK_WORKSPACE which must EQUAL task_workspace).
-    """
-    if not task_workspace or not candidate:
-        return False
-    base = os.path.realpath(task_workspace)
-    target = os.path.realpath(candidate)
-    if target == base:
-        return True
-    # Strictly beneath: base + "/" + something. The trailing slash means a
-    # sibling directory whose name is a prefix of base (e.g. /ws vs /ws-other)
-    # is correctly rejected.
-    return target.startswith(base.rstrip("/") + "/")
-
-
-def _validate_task_env_consistency(
-    task_workspace: str, task_environment: dict[str, str]
-) -> None:
-    """D15 §4.2 (Scenario B) round-2 (codex fe54d9f0 MUST-FIX #2):
-    Reject a self-inconsistent payload where taskWorkspace and the four
-    AF_TASK_* vars disagree. Each AF_TASK_* var must point at or inside
-    taskWorkspace; AF_TASK_WORKSPACE must EQUAL taskWorkspace exactly.
-
-    Without this invariant the wrapper could be fooled into spawning a
-    child whose cwd is task B but whose env still points at task A's
-    paths, defeating the cross-task isolation D15 promises.
-
-    Raises ``WrapperInputError`` on any inconsistency. The check is
-    deliberately conservative: any path that resolves outside
-    task_workspace (after realpath/symlink resolution) is rejected.
-    """
-    af_workspace = task_environment.get("AF_TASK_WORKSPACE", "")
-    if af_workspace != task_workspace:
-        raise WrapperInputError(
-            "taskEnvironment.AF_TASK_WORKSPACE must equal taskWorkspace "
-            f"(got AF_TASK_WORKSPACE={af_workspace!r}, "
-            f"taskWorkspace={task_workspace!r}; D15 §4.2: a payload whose "
-            "cwd and env disagree is fail-closed, not a fallback)"
-        )
-    for env_key in (
-        "AF_TASK_ARTIFACT_DIR",
-        "AF_TASK_TMP_DIR",
-        "AF_TASK_METRICS_PATH",
-    ):
-        value = task_environment.get(env_key, "")
-        if not _is_within(task_workspace, value):
-            raise WrapperInputError(
-                f"taskEnvironment.{env_key}={value!r} must point at or "
-                f"inside taskWorkspace={task_workspace!r} (D15 §4.2: a "
-                "task-local path that escapes its workspace is fail-closed)"
-            )
+#
+# D15 §4.2.3 round-4 (codex 56976668 MUST-FIX #3): the canonical constant
+# and the validation logic now live in app.payload_contract (single source
+# of truth shared with models.BoundedExecRequest). The line below re-exports
+# the constant under this module's old name so existing imports keep
+# resolving during the transition; new code should import from
+# app.payload_contract directly.
+REQUIRED_TASK_ENV_KEYS = tuple(sorted(ALLOWED_TASK_ENV_KEYS))
 
 
 def parse_wrapper_input(path: Path) -> dict:
@@ -1363,16 +1315,59 @@ def parse_wrapper_input(path: Path) -> dict:
             "empty is fail-closed, not a silent loss of import visibility)"
         )
 
-    # D15 §4.2 (Scenario B) round-2 (codex fe54d9f0 MUST-FIX #2):
-    # taskWorkspace must be SELF-CONSISTENT with the four AF_TASK_* vars.
-    # Each of AF_TASK_WORKSPACE / AF_TASK_ARTIFACT_DIR / AF_TASK_TMP_DIR /
-    # AF_TASK_METRICS_PATH must point AT OR INSIDE taskWorkspace. Without
-    # this invariant the wrapper could be tricked into accepting a payload
-    # whose cwd is task B but whose env points at task A, breaking the
-    # very cross-task isolation D15 §4.2 promises. A path containing '..'
-    # that escapes taskWorkspace, or an absolute path outside it, is
-    # fail-closed here.
-    _validate_task_env_consistency(task_workspace, task_environment)
+    # D15 §4.2.3 round-4 (codex 56976668 MUST-FIX #3): single contract.
+    # Replaces the round-2 _validate_task_env_consistency helper. Calls
+    # the shared validate_payload_contract function in app.payload_contract
+    # so both this runtime parser and the pydantic model
+    # (models.BoundedExecRequest) enforce identical field-level invariants
+    # AND the wrapper-only filesystem-anchored invariants (workspace must
+    # equal wrapper-input.json parent dir; scriptPath must live at-or-inside
+    # workspace). The model validator calls the same function without
+    # wrapper_input_path (no fs context at HTTP validation time).
+    #
+    # What the contract closes (vs round-3):
+    #   * Whitelist: taskEnvironment may only carry the four AF_TASK_* keys;
+    #     PYTHONPATH/PYTHONHOME/PYTHONSTARTUP or any unknown key is rejected
+    #     so a stale sitecustomize cannot be re-activated via smuggled env.
+    #   * Containment anchor: taskWorkspace's realpath MUST equal the
+    #     wrapper-input.json parent dir's realpath. Without this, the
+    #     workspace could be "/", "..", or a symlink to an external target,
+    #     defeating every sub-path check below it.
+    #   * Strict-beneath: AF_TASK_ARTIFACT_DIR / TMP_DIR / METRICS_PATH must
+    #     be STRICTLY inside workspace (not equal to it).
+    #   * scriptPath at-or-inside workspace (filesystem-anchored).
+    try:
+        validate_payload_contract(payload, wrapper_input_path=str(path))
+    except PayloadContractError as exc:
+        raise WrapperInputError(str(exc)) from exc
+
+    # D15 §4.2.3 round-4 (codex 56976668 MUST-FIX #2): filesystem existence
+    # and type checks the contract cannot do (it only resolves realpath;
+    # it does not assert the resolved path exists with the right type).
+    # These run AFTER the contract so the error message a caller sees is
+    # the contract violation first (whitelist / anchor / containment),
+    # then the filesystem evidence.
+    script_path_real = os.path.realpath(script_path)
+    if not os.path.isfile(script_path_real):
+        raise WrapperInputError(
+            f"scriptPath={script_path!r} must be an existing regular "
+            f"file inside taskWorkspace (D15 §4.2.3 round-4 codex "
+            f"56976668 MUST-FIX #2: a missing path, a directory, or a "
+            f"non-regular file is fail-closed — without this, a smuggled "
+            f"directory or special file could let the wrapper bootstrap "
+            f"an attacker-controlled loader)"
+        )
+    loader_python_path_real = os.path.realpath(loader_python_path)
+    if not os.path.isdir(loader_python_path_real):
+        raise WrapperInputError(
+            f"loaderPythonPath={loader_python_path!r} must be an existing "
+            f"directory (D15 §4.2.3 round-4 codex 56976668 MUST-FIX #2: "
+            f"loaderPythonPath is the workdir the user child needs on "
+            f"sys.path so it can import af_dataset_loader; a missing path "
+            f"or a non-directory path is fail-closed — without this the "
+            f"user child would either silently lose import visibility or "
+            f"import from an attacker-controlled file)"
+        )
 
     # runtimeEnvironmentPath is part of the §7.1 input shape but belongs to
     # work package D's schema (runtime_environment.py); the wrapper does not
@@ -1436,6 +1431,21 @@ def _write_loader_bootstrap(
         )
 
     bootstrap_dir = Path(task_workspace) / LOADER_BOOTSTRAP_DIR_NAME
+    # D15 §4.2.3 round-4 (codex 56976668 MUST-FIX #2): if `_bootstrap` is
+    # already a symlink, do NOT follow it. The wrapper runs as root in
+    # production; a caller-planted symlink at `_bootstrap -> /etc/cron.d`
+    # would let mkdir(exist_ok=True) succeed (the target dir exists) and
+    # then let bootstrap_path.write_text / chmod land on an attacker-chosen
+    # EXTERNAL path. The is_symlink() check MUST run before mkdir because
+    # mkdir would silently follow the symlink.
+    if bootstrap_dir.is_symlink():
+        raise WrapperInputError(
+            f"refusing to stage loader bootstrap: {bootstrap_dir} is a "
+            f"symlink (D15 §4.2.3 round-4 codex 56976668 MUST-FIX #2: a "
+            f"pre-planted symlink would let the root wrapper chmod/write "
+            f"an attacker-chosen external target via the symlink; "
+            f"fail-closed, no follow)"
+        )
     bootstrap_dir.mkdir(parents=True, exist_ok=True)
     # D15 §4.2.3 round-3 (codex c9fee2f9 MUST-FIX #1): bootstrap dir MUST be
     # world-traversable (0o755) so the production child (which drops privileges
@@ -1446,6 +1456,24 @@ def _write_loader_bootstrap(
     # traverse+read but cannot write/rename entries in it.
     os.chmod(bootstrap_dir, 0o755)
     bootstrap_path = bootstrap_dir / LOADER_BOOTSTRAP_FILE_NAME
+    # D15 §4.2.3 round-4 (codex 56976668 MUST-FIX #2): defense in depth —
+    # also reject a pre-planted symlink at the bootstrap FILE path. mkdir
+    # already created _bootstrap as a real dir above, so the only way for
+    # loader_bootstrap.py to be a symlink now is if a concurrent actor
+    # planted it between mkdir and this check. The wrapper is pre-spawn
+    # at this point (no user child exists yet), so the attacker would have
+    # to be a sibling wrapper invocation or a process outside the sandbox
+    # — but the check is cheap and the consequence of following such a
+    # symlink (root write to attacker-chosen path) is severe enough to
+    # justify the belt-and-suspenders.
+    if bootstrap_path.is_symlink():
+        raise WrapperInputError(
+            f"refusing to stage loader bootstrap: {bootstrap_path} is a "
+            f"symlink (D15 §4.2.3 round-4 codex 56976668 MUST-FIX #2: a "
+            f"pre-planted file symlink would let the root wrapper write "
+            f"attacker-chosen content to an external target; fail-closed, "
+            f"no follow)"
+        )
 
     # Build the bootstrap body by plain string concatenation. Do NOT use
     # textwrap.dedent on an f-string here: any change in indentation of
