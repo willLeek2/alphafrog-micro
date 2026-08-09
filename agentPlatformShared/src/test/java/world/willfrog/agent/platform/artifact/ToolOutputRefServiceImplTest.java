@@ -19,6 +19,8 @@ import world.willfrog.agent.platform.storage.AgentStoragePaths;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -237,6 +239,11 @@ class ToolOutputRefServiceImplTest {
         when(template.scan(org.mockito.ArgumentMatchers.any(ScanOptions.class)))
                 .thenAnswer(invocation -> new MapCursor(store.keySet().iterator()));
 
+        // TTL 查询 fake：本文件不测滑动过期（归 PersistentArtifactRegistryTest），
+        // getExpire 一律返回"剩余充足"，使生产侧 extendTtlIfNeeded 成为无害空操作。
+        when(template.getExpire(org.mockito.ArgumentMatchers.anyString(),
+                org.mockito.ArgumentMatchers.any(TimeUnit.class))).thenReturn(9999L);
+
         // D22-5.1.3：registry 新增幂等身份 hash 与 run 索引 SET，fake 同步扩展。
         HashOperations<String, Object, Object> hashOps = mock(HashOperations.class);
         when(template.opsForHash()).thenReturn(hashOps);
@@ -287,11 +294,13 @@ class ToolOutputRefServiceImplTest {
                 org.mockito.ArgumentMatchers.<Object>any(),
                 org.mockito.ArgumentMatchers.<Object>any());
 
-        // D22-5.1.3 第二轮 MUST-FIX ①④：registry 新增两段 Lua 脚本——幂等认领（5 ARGV）
-        // 与 run 列表加入（4 ARGV）。Mockito 5 varargs 按每元素匹配：ARGV 个数不同必须
-        // 独立 stub，语义与生产脚本逐条对齐（见 PersistentArtifactRegistryTest 同款 fake）。
-        // run 列表加入脚本（4 ARGV：cap、幽灵预算、meta 前缀、artifactId）：
-        // 幽灵清理 → SCARD 容量检查 → SADD，原子；满则返回 FULL 且不写。
+        // D22-5.1.3 第二轮 MUST-FIX ①④ + 第三轮 62ad12bd：registry 两段 Lua 脚本——
+        // 幂等认领（6 ARGV）与 run 列表加入（5 ARGV）。Mockito 5 varargs 按每元素匹配：
+        // ARGV 个数不同必须独立 stub，语义与生产脚本逐条对齐（见 PersistentArtifactRegistryTest
+        // 同款 fake：游标轮转幽灵清理、EXISTS 分支列表成员资格修复）。
+        // run 列表加入脚本（KEYS=[列表 SET, 清理游标键]；5 ARGV：cap、幽灵预算、meta 前缀、
+        // artifactId、TTL 秒数）：游标轮转幽灵清理 → SCARD 容量检查 → SADD，原子；
+        // 满则返回 FULL 且不写。
         org.mockito.Mockito.doAnswer(invocation -> {
             Object[] args = invocation.getArguments();
             @SuppressWarnings("unchecked")
@@ -300,8 +309,8 @@ class ToolOutputRefServiceImplTest {
             int budget = Integer.parseInt(String.valueOf(args[3]));
             String metaPrefix = String.valueOf(args[4]);
             String artifactId = String.valueOf(args[5]);
+            purgeWithCursor(sets, store, keys.get(0), keys.get(1), metaPrefix, budget);
             Set<String> list = sets.get(keys.get(0));
-            purgeGhosts(list, metaPrefix, budget, store);
             int size = list == null ? 0 : list.size();
             if (size >= cap) {
                 return "FULL";
@@ -314,10 +323,12 @@ class ToolOutputRefServiceImplTest {
                 org.mockito.ArgumentMatchers.<Object>any(),
                 org.mockito.ArgumentMatchers.<Object>any(),
                 org.mockito.ArgumentMatchers.<Object>any(),
+                org.mockito.ArgumentMatchers.<Object>any(),
                 org.mockito.ArgumentMatchers.<Object>any());
 
-        // 幂等认领脚本（5 ARGV：field、候选 ID、cap、幽灵预算、meta 前缀）：
-        // 已有赢家→EXISTS:赢家ID（不写）；幽灵清理→容量检查；未满→HSET 身份+SADD 列表→CLAIMED。
+        // 幂等认领脚本（KEYS=[身份 hash, 列表 SET, 清理游标键]；6 ARGV：field、候选 ID、
+        // cap、幽灵预算、meta 前缀、TTL 秒数）：已有赢家→meta 仍在则修复列表成员资格
+        // （SADD 补回）→ EXISTS:赢家ID；幽灵清理→容量检查；未满→HSET 身份+SADD 列表→CLAIMED。
         org.mockito.Mockito.doAnswer(invocation -> {
             Object[] args = invocation.getArguments();
             @SuppressWarnings("unchecked")
@@ -330,10 +341,14 @@ class ToolOutputRefServiceImplTest {
             Map<String, String> identity = hashes.get(keys.get(0));
             String existing = identity == null ? null : identity.get(field);
             if (existing != null) {
+                if (store.containsKey(metaPrefix + existing)) {
+                    // 赢家 meta 仍活：修复列表成员资格（缺失即补回），杜绝采纳不可见赢家
+                    sets.computeIfAbsent(keys.get(1), k -> new LinkedHashSet<>()).add(existing);
+                }
                 return "EXISTS:" + existing;
             }
+            purgeWithCursor(sets, store, keys.get(1), keys.get(2), metaPrefix, budget);
             Set<String> list = sets.get(keys.get(1));
-            purgeGhosts(list, metaPrefix, budget, store);
             int size = list == null ? 0 : list.size();
             if (size >= cap) {
                 return "FULL";
@@ -344,6 +359,7 @@ class ToolOutputRefServiceImplTest {
         }).when(template).execute(
                 org.mockito.ArgumentMatchers.<org.springframework.data.redis.core.script.RedisScript<Object>>any(),
                 org.mockito.ArgumentMatchers.<java.util.List<String>>any(),
+                org.mockito.ArgumentMatchers.<Object>any(),
                 org.mockito.ArgumentMatchers.<Object>any(),
                 org.mockito.ArgumentMatchers.<Object>any(),
                 org.mockito.ArgumentMatchers.<Object>any(),
@@ -375,22 +391,45 @@ class ToolOutputRefServiceImplTest {
     }
 
     /**
-     * fake 侧幽灵清理：与生产 Lua 脚本同语义——至多检查 budget 个成员，
-     * meta 键（values 表）不存在者当场移除。
+     * fake 侧幽灵清理：与生产 Lua 脚本同语义的游标轮转版。游标以"下一次扫描的偏移量"
+     * 存进 values 表（模拟生产里独立的 run-purge-cursor 键，本 fake 复用 store）；每次
+     * 至多检查 budget 个成员（按排序快照取窗口 [from, to)），meta 键不存在者当场 SREM；
+     * 扫完一整轮（to 到达末尾）删除游标键，下次从头开始。保证：无论活成员排在前面还是
+     * 后面，ghost 都会在有限次写入内被清掉，不会被"每次只重复检查同一批活成员"卡死。
      */
-    private static void purgeGhosts(Set<String> list, String metaPrefix, int budget, Map<String, String> values) {
-        if (list == null || list.isEmpty() || budget <= 0) {
+    private static void purgeWithCursor(Map<String, Set<String>> sets, Map<String, String> store,
+                                        String listKey, String cursorKey, String metaPrefix, int budget) {
+        if (budget <= 0) {
             return;
         }
-        int checked = 0;
-        for (String member : Set.copyOf(list)) {
-            if (checked >= budget) {
-                break;
+        int offset = 0;
+        String cursorVal = store.get(cursorKey);
+        if (cursorVal != null) {
+            try {
+                offset = Integer.parseInt(cursorVal);
+            } catch (NumberFormatException ignored) {
+                // 游标值损坏视同从头扫
             }
-            checked++;
-            if (!values.containsKey(metaPrefix + member)) {
+        }
+        Set<String> list = sets.get(listKey);
+        if (list == null || list.isEmpty()) {
+            store.remove(cursorKey);
+            return;
+        }
+        java.util.List<String> snapshot = new ArrayList<>(list);
+        Collections.sort(snapshot);
+        int from = Math.min(offset, snapshot.size());
+        int to = Math.min(from + budget, snapshot.size());
+        for (int i = from; i < to; i++) {
+            String member = snapshot.get(i);
+            if (!store.containsKey(metaPrefix + member)) {
                 list.remove(member);
             }
+        }
+        if (to >= snapshot.size()) {
+            store.remove(cursorKey);
+        } else {
+            store.put(cursorKey, String.valueOf(to));
         }
     }
 

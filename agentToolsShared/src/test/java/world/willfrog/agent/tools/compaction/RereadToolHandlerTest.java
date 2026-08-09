@@ -98,6 +98,7 @@ class RereadToolHandlerTest {
     @Test
     void rereadShouldResolveRunScopedShortRawRef() throws Exception {
         AgentContext.setRunId("run-1");
+        AgentContext.setUserId("user-1");
         RereadToolHandler handler = new RereadToolHandler(
                 new StubToolOutputRefService(),
                 objectMapper,
@@ -201,6 +202,7 @@ class RereadToolHandlerTest {
     @Test
     void rereadRangeMax6000WithShortRawRefShouldSucceed() throws Exception {
         AgentContext.setRunId("run-range");
+        AgentContext.setUserId("user-range");
         AgentLlmLocalConfigLoader loader = mock(AgentLlmLocalConfigLoader.class);
         AgentLlmProperties cfg = new AgentLlmProperties();
         cfg.getTools().getResult().setMaxStringLength(2000);
@@ -211,7 +213,7 @@ class RereadToolHandlerTest {
         RunRawRefStore largeStore = mock(RunRawRefStore.class);
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < 6000; i++) sb.append("x");
-        when(largeStore.read(eq("run-range"), eq("raw_ref_001"), eq(0), eq(6000), isNull()))
+        when(largeStore.read(eq("run-range"), eq("user-range"), eq("raw_ref_001"), eq(0), eq(6000), isNull()))
                 .thenReturn(ToolOutputReadResult.builder()
                         .content(sb.toString()).hasMore(false).nextOffset(6000).totalLength(6000).build());
 
@@ -267,6 +269,39 @@ class RereadToolHandlerTest {
         assertEquals("rawRef does not belong to current run/user", thrown.getMessage());
     }
 
+    @Test
+    void rereadShortRawRefWithWrongUserShouldBeRejected() {
+        // 第三轮 MUST-FIX ② 反测：线程态 userId 是别的用户时，短格式 raw_ref 读取必须
+        // 在严格归属校验处 fail-closed——工具层原样抛出，不吞异常、不降级返回内容。
+        AgentContext.setRunId("run-1");
+        AgentContext.setUserId("user-evil");
+        RereadToolHandler handler = new RereadToolHandler(
+                new StubToolOutputRefService(),
+                objectMapper,
+                Optional.empty(),
+                Optional.of(new StubRunRawRefStore())
+        );
+
+        assertThrows(IllegalArgumentException.class,
+                () -> handler.reread("raw_ref_001", "现金流", 0, 80));
+    }
+
+    @Test
+    void rereadShortRawRefWithBlankUserShouldBeRejected() {
+        // 第三轮 MUST-FIX ② 反测：线程态只有 runId、没有 userId（空白）时，短格式读取
+        // 同样被拒——不存在只凭 runId 放行的读取路径。
+        AgentContext.setRunId("run-1");
+        RereadToolHandler handler = new RereadToolHandler(
+                new StubToolOutputRefService(),
+                objectMapper,
+                Optional.empty(),
+                Optional.of(new StubRunRawRefStore())
+        );
+
+        assertThrows(IllegalArgumentException.class,
+                () -> handler.reread("raw_ref_001", "现金流", 0, 80));
+    }
+
     private static class StubToolOutputRefService implements ToolOutputRefService {
         @Override
         public world.willfrog.agent.platform.artifact.PersistentArtifactRegistration registerRawOutput(
@@ -319,18 +354,24 @@ class RereadToolHandlerTest {
     }
 
     private static class StubRunRawRefStore implements RunRawRefStore {
+        private static final String OWNER_RUN = "run-1";
+        private static final String OWNER_USER = "user-1";
+
         @Override
         public String register(String runId, String userId, String displayName, String content, long ttlSeconds) {
             return "raw_ref_001";
         }
 
         @Override
-        public String read(String runId, String shortId) {
+        public String read(String runId, String userId, String shortId) {
+            requireOwner(runId, userId);
             return "short-content";
         }
 
         @Override
-        public ToolOutputReadResult read(String runId, String shortId, int offset, int limit, String keyword) {
+        public ToolOutputReadResult read(String runId, String userId, String shortId,
+                                         int offset, int limit, String keyword) {
+            requireOwner(runId, userId);
             return ToolOutputReadResult.builder()
                     .content("short-content")
                     .hasMore(false)
@@ -342,6 +383,15 @@ class RereadToolHandlerTest {
         @Override
         public boolean belongsToRun(String runId, String shortId) {
             return true;
+        }
+
+        // 第三轮 MUST-FIX ②：stub 模拟生产 readContentStrict 的合同——runId 与 userId
+        // 任一空白或与属主不一致即 fail-closed 抛异常，不存在只凭 runId 放行的读取。
+        private static void requireOwner(String runId, String userId) {
+            if (runId == null || runId.isBlank() || userId == null || userId.isBlank()
+                    || !OWNER_RUN.equals(runId) || !OWNER_USER.equals(userId)) {
+                throw new IllegalArgumentException("Artifact does not belong to current run/user");
+            }
         }
     }
 }

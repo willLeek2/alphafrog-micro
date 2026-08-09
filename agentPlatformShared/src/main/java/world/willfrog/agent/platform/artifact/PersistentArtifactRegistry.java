@@ -53,23 +53,38 @@ import java.util.concurrent.TimeUnit;
  *
  * <h3>幂等抢占协议（单一赢家不变量）</h3>
  * <p>候选 file + meta 先备好，再经单条 Lua 脚本（{@link #ATOMIC_CLAIM_SCRIPT}）原子提交：
- * 脚本内依次做「查身份是否已有赢家 → 有界清理幽灵成员 → SCARD 容量检查 → HSET 身份 +
- * SADD run 列表」，五步要么全部生效、要么全部不生效。因此：输家只有在脚本返回
- * EXISTS 时才采纳赢家，而 EXISTS 意味着赢家的身份项与列表项已在同一次脚本执行中
- * 原子落盘——输家不可能在赢家列表提交前拿到 ID，也不可能拿到幽灵 ID；容量不足时
- * 脚本返回 FULL 且不写任何索引，Java 侧回滚候选（meta + 文件）并外抛可见失败。
- * 若查无赢家 meta（清理竞态恰好删掉），输家用 Lua 值条件 HDEL 原子清陈旧字段后
- * 以新候选重试（有界 {@value #MAX_CLAIM_ATTEMPTS} 次，仍不结算则显式失败）。
- * 同一身份任意时刻至多一份 meta / 一个文件 / 一条 run 索引项。</p>
+ * 脚本内依次做「查身份是否已有赢家（有赢家则当场校验并修复其 run 列表成员资格、
+ * 刷新索引 TTL）→ 游标轮转有界清理幽灵成员 → SCARD 容量检查 → HSET 身份 +
+ * SADD run 列表 + 索引键只延长不缩短 TTL 刷新」，要么全部生效、要么全部不生效。
+ * 因此：输家只有在脚本返回 EXISTS 时才采纳赢家，而 EXISTS 意味着赢家的身份项与
+ * 列表项已在同一次脚本执行中原子落盘且列表成员资格已被校验/修复——输家不可能在
+ * 赢家列表提交前拿到 ID，不可能拿到幽灵 ID，也不可能采纳一个用户列表里看不见的
+ * 赢家；容量不足时脚本返回 FULL 且不写任何索引，Java 侧回滚候选（meta + 文件）
+ * 并外抛可见失败。若查无赢家 meta（清理竞态恰好删掉），输家用 Lua 值条件 HDEL
+ * 原子清陈旧字段后以新候选重试（有界 {@value #MAX_CLAIM_ATTEMPTS} 次，仍不结算
+ * 则显式失败）。同一身份任意时刻至多一份 meta / 一个文件 / 一条 run 索引项。</p>
  *
- * <h3>run 级有界索引（硬上限 + 幽灵自愈）</h3>
+ * <h3>run 级有界索引（硬上限 + 游标轮转幽灵自愈）</h3>
  * <p>认领（幂等路径）与加入（非幂等路径）都是单条 Lua 脚本内的原子操作：脚本先做
- * 有界幽灵清理（每次最多检查 {@value #GHOST_PURGE_BUDGET} 个成员，meta 键已不存在
- * 的成员当场移除），再 SCARD 容量检查，未满才写入——不存在多命令
- * SADD→SCARD→SREM 的检查-加入窗口，索引绝不超 cap。幽灵成员（meta 因 TTL 到期
- * 消失而 SET 成员残留）不会永久占用容量配额，{@link #listByRunId} 读取时也会顺手
- * 移除遇到的幽灵。注册失败可见，禁止 silent meta-only 成功。cap<=0 视为配置错误，
- * fail-closed。</p>
+ * 游标轮转的有界幽灵清理——读持久化扫描游标（{@code run-purge-cursor:{runId}}，
+ * 不存在则从 0 起），从游标位置 SSCAN 检查至多约 {@value #GHOST_PURGE_BUDGET} 个
+ * 成员（每次脚本执行只检查有界数量的成员，单次 Redis 工作量不先全量取出整个 SET），
+ * meta 键已不存在的成员当场 SREM，回写下一游标（游标归零 = 完成一整圈扫描，删除
+ * 游标键）；再 SCARD 容量检查，未满才写入——不存在多命令 SADD→SCARD→SREM 的
+ * 检查-加入窗口，索引绝不超 cap。进展保证：游标轮转让整圈扫描必然覆盖每一个成员——
+ * 即使前若干个窗口全是活成员、幽灵全在后面，至多 ceil(成员总数/{@value #GHOST_PURGE_BUDGET})
+ * 次索引写入后所有幽灵必然被清完、新注册必然恢复，幽灵不可能永久占用容量配额；
+ * {@link #listByRunId} 读取时也会顺手移除遇到的幽灵。注册失败可见，禁止 silent
+ * meta-only 成功。cap<=0 视为配置错误，fail-closed。</p>
+ *
+ * <h3>统一滑动过期协议（meta 与索引 TTL 零漂移）</h3>
+ * <p>meta、身份 hash、run 列表、幽灵清理游标四类键的 TTL 按同一滑动过期协议管理，
+ * 时长取该 meta 的 ttlHours：写路径（认领 CLAIMED / 加入 ADDED / EXISTS 修复）由
+ * Lua 脚本在原子提交内做只延长不缩短刷新（短 TTL 绝不覆盖长 TTL），读路径由
+ * {@link #touch} 在重写 meta 的同时对两张索引键做同款刷新。因此任何读取都会让
+ * 四类键同时续命，不存在「索引先于 meta 过期 → list 丢条目 → 同一幂等身份被第二次
+ * CLAIMED」的漂移窗口；EXISTS 分支还会当场修复列表成员资格，杜绝任何时序下
+ * 「身份在场而赢家在列表中不可见」。</p>
  *
  * <h3>Redis 结构</h3>
  * <ul>
@@ -77,19 +92,24 @@ import java.util.concurrent.TimeUnit;
  *   <li>{@code agent:persistent-artifact:run-list:{runId}} — SET，run 的 artifactId 索引，
  *       硬上限 {@code agent.persistent-artifact.run-list-cap}（默认 1000）；</li>
  *   <li>{@code agent:persistent-artifact:run-identity:{runId}} — hash，幂等身份
- *       field={@link #identityField} collision-free 编码 → artifactId。</li>
+ *       field={@link #identityField} collision-free 编码 → artifactId；</li>
+ *   <li>{@code agent:persistent-artifact:run-purge-cursor:{runId}} — 幽灵清理扫描轮转
+ *       游标键（值 = 下一次 SSCAN 游标；游标归零即删键），TTL 随索引键同步滑动。</li>
  * </ul>
- * 注意：后两类键与 meta 共享 {@link #META_PREFIX} 前缀，cleanup 的 SCAN 会命中它们，
+ * 注意：后三类键与 meta 共享 {@link #META_PREFIX} 前缀，cleanup 的 SCAN 会命中它们，
  * 循环内按前缀显式跳过（它们不是 meta JSON）。
  *
  * <h3>归属校验</h3>
  * <p>所有用户/工具可达的读取与定位入口一律走 {@link #matchesOwnerStrict}（meta 与调用方
  * 的 runId/userId 四值全部非空且相等，任一空值 fail-closed）——无论旧 AgentContext
- * 入口还是显式上下文入口，不存在宽容 seam（matchesOwnerLenient 已删除）。</p>
+ * 入口还是显式上下文入口，不存在宽容 seam（matchesOwnerLenient 已删除）。短格式
+ * raw_ref（{@code raw_ref_001}）读取一律经 {@link #readContentStrict} 携带 runId+userId
+ * 显式校验：同 runId 下 userId 错误或空白同样拒绝。</p>
  *
  * <h3>读取入口（TOCTOU 强化 + 有界流式读取）</h3>
  * <p>{@link #readArtifactBytes} / {@link #readWithinArtifactRoot} / {@link #readContent} /
- * {@link #readLocator}：读取前 realpath containment 复检（中间目录的 symlink 也会被解析，
+ * {@link #readContentStrict} / {@link #readLocator}：读取前 realpath containment 复检
+ * （中间目录的 symlink 也会被解析，
  * 父目录被换成指向根外的链接同样拒绝）+ no-follow 打开 + 哈希校验（内容制品）。
  * 大小上限由两层构成：Files.size 快速失败预检查 + 权威有界流式读取
  * （{@link #readBounded}：至多读 maxBytes+1 字节，读到多余字节即拒）——即使文件在
@@ -121,6 +141,13 @@ public class PersistentArtifactRegistry {
     /** 幂等身份索引（hash：field 为 collision-free 长度前缀编码 → artifactId）。同上，SCAN 跳过。 */
     private static final String RUN_IDENTITY_KEY_PREFIX = META_PREFIX + "run-identity:";
 
+    /**
+     * 幽灵清理扫描轮转游标键（值为下一次 SSCAN 的游标；键不存在或归零表示从头扫）。
+     * 与 meta 共享前缀，cleanup SCAN 时按前缀显式跳过。键自身 TTL 随索引键同步滑动
+     * （脚本内写入时同款只延长不缩短刷新），不会比索引键活得更久。
+     */
+    private static final String RUN_PURGE_CURSOR_KEY_PREFIX = META_PREFIX + "run-purge-cursor:";
+
     /** 幂等抢占最大尝试次数：遇到陈旧身份（赢家 meta 已被清理）值条件清除后有界重试，仍不结算则显式失败。 */
     private static final int MAX_CLAIM_ATTEMPTS = 3;
 
@@ -133,67 +160,117 @@ public class PersistentArtifactRegistry {
                     + "return redis.call('hdel', KEYS[1], ARGV[1]) else return 0 end",
             Long.class);
 
-    /** 幽灵自愈的有界预算：每次索引写入前最多检查多少个"缺 meta 的 SET 成员"并移除。 */
+    /** 幽灵自愈的有界预算：每次索引写入前的游标轮转清理最多检查多少个"缺 meta 的 SET 成员"。 */
     private static final int GHOST_PURGE_BUDGET = 128;
 
     /**
      * 幂等认领原子提交脚本（Lua，单条脚本内要么全做、要么全不做）。
      *
-     * <p>KEYS[1]=身份 hash 键，KEYS[2]=run 列表 SET 键；
+     * <p>KEYS[1]=身份 hash 键，KEYS[2]=run 列表 SET 键，KEYS[3]=幽灵清理游标键；
      * ARGV[1]=身份 field，ARGV[2]=候选 artifactId，ARGV[3]=容量上限，
-     * ARGV[4]=幽灵清理预算，ARGV[5]=meta 键前缀。步骤：
-     * ①身份已有赢家 → 直接返回 EXISTS:赢家ID（不写任何东西）；
-     * ②有界幽灵清理：最多检查 ARGV[4] 个 SET 成员，meta 键不存在者当场 SREM；
+     * ARGV[4]=幽灵清理预算，ARGV[5]=meta 键前缀，ARGV[6]=索引键 TTL（秒）。步骤：
+     * ①身份已有赢家：赢家 meta 仍在 → 校验并修复赢家在 run 列表中的成员资格
+     *   （SISMEMBER 缺失即 SADD 补回，杜绝"输家采纳一个用户列表里看不见的赢家"），
+     *   并对两张索引键做只延长不缩短的 TTL 刷新，随后返回 EXISTS:赢家ID（不写任何
+     *   新索引项）；赢家 meta 已缺失（陈旧悬挂）→ 同样返回 EXISTS:赢家ID，由 Java 侧
+     *   按既有协议值条件 HDEL 清除陈旧字段后重试；
+     * ②有界幽灵清理（游标轮转协议）：读取扫描游标（无则从 0 开始），从游标位置继续
+     *   SSCAN 检查至多约 ARGV[4] 个成员，meta 键不存在者当场 SREM；回写新游标
+     *   （游标归零 = 完成一整圈扫描 → 删除游标键）。每次脚本执行只检查有界数量的成员、
+     *   单次 Redis 工作量不先全量取出整个 SET；游标保证整圈扫描必然覆盖每一个成员，
+     *   因此幽灵不可能永久占用名额——至多 ceil(成员总数 / ARGV[4]) 次索引写入后，
+     *   所有幽灵必然被清完，新注册必然恢复；
      * ③SCARD 容量检查：已满 → 返回 FULL（不写任何东西）；
-     * ④HSET 身份 + SADD run 列表，返回 CLAIMED。</p>
+     * ④HSET 身份 + SADD run 列表 + 两张索引键只延长不缩短的 TTL 刷新
+     *   （与 meta 同滑动过期协议对齐，见 {@link #touch}），返回 CLAIMED。</p>
      *
      * <p>由此得到的不变量：输家观察到 EXISTS 时，赢家的身份项与列表项必然已在同一次
-     * 脚本执行中原子落盘（输家不可能提前返回、不可能拿到幽灵 ID）；FULL 路径从不写
-     * 索引（容量失败的注册不留任何痕迹）。</p>
+     * 脚本执行中原子落盘（输家不可能提前返回、不可能拿到幽灵 ID），且赢家必然在 run
+     * 列表中可见（成员资格丢失时脚本当场修复）；FULL 路径从不写索引（容量失败的注册
+     * 不留任何痕迹）。</p>
      */
     private static final RedisScript<String> ATOMIC_CLAIM_SCRIPT = new DefaultRedisScript<>(
             "local existing = redis.call('hget', KEYS[1], ARGV[1]) "
-                    + "if existing then return 'EXISTS:' .. existing end "
+                    + "if existing then "
+                    + "  if redis.call('exists', ARGV[5] .. existing) == 1 then "
+                    + "    if redis.call('sismember', KEYS[2], existing) == 0 then "
+                    + "      redis.call('sadd', KEYS[2], existing) "
+                    + "    end "
+                    + "    local ttl = tonumber(ARGV[6]) "
+                    + "    if ttl > 0 then "
+                    + "      local t1 = redis.call('ttl', KEYS[1]) "
+                    + "      if t1 < 0 or t1 < ttl then redis.call('expire', KEYS[1], ttl) end "
+                    + "      local t2 = redis.call('ttl', KEYS[2]) "
+                    + "      if t2 < 0 or t2 < ttl then redis.call('expire', KEYS[2], ttl) end "
+                    + "    end "
+                    + "  end "
+                    + "  return 'EXISTS:' .. existing "
+                    + "end "
                     + "local budget = tonumber(ARGV[4]) "
                     + "if budget > 0 then "
-                    + "  local members = redis.call('smembers', KEYS[2]) "
-                    + "  local checked = 0 "
-                    + "  for _, m in ipairs(members) do "
-                    + "    if checked >= budget then break end "
-                    + "    checked = checked + 1 "
+                    + "  local cursor = redis.call('get', KEYS[3]) or '0' "
+                    + "  local scan = redis.call('sscan', KEYS[2], cursor, 'COUNT', budget) "
+                    + "  local nextCursor = scan[1] "
+                    + "  for _, m in ipairs(scan[2]) do "
                     + "    if redis.call('exists', ARGV[5] .. m) == 0 then "
                     + "      redis.call('srem', KEYS[2], m) "
                     + "    end "
+                    + "  end "
+                    + "  if nextCursor == '0' then "
+                    + "    redis.call('del', KEYS[3]) "
+                    + "  else "
+                    + "    redis.call('set', KEYS[3], nextCursor) "
+                    + "    redis.call('expire', KEYS[3], math.max(1, tonumber(ARGV[6]))) "
                     + "  end "
                     + "end "
                     + "if redis.call('scard', KEYS[2]) >= tonumber(ARGV[3]) then return 'FULL' end "
                     + "redis.call('hset', KEYS[1], ARGV[1], ARGV[2]) "
                     + "redis.call('sadd', KEYS[2], ARGV[2]) "
+                    + "local ttl2 = tonumber(ARGV[6]) "
+                    + "if ttl2 > 0 then "
+                    + "  local t3 = redis.call('ttl', KEYS[1]) "
+                    + "  if t3 < 0 or t3 < ttl2 then redis.call('expire', KEYS[1], ttl2) end "
+                    + "  local t4 = redis.call('ttl', KEYS[2]) "
+                    + "  if t4 < 0 or t4 < ttl2 then redis.call('expire', KEYS[2], ttl2) end "
+                    + "end "
                     + "return 'CLAIMED'",
             String.class);
 
     /**
-     * 非幂等 run 列表加入脚本（Lua，原子：幽灵清理 → 容量检查 → SADD）。
+     * 非幂等 run 列表加入脚本（Lua，原子：游标轮转幽灵清理 → 容量检查 → SADD → TTL 刷新）。
      *
-     * <p>KEYS[1]=run 列表 SET 键；ARGV[1]=容量上限，ARGV[2]=幽灵清理预算，
-     * ARGV[3]=meta 键前缀，ARGV[4]=artifactId。已满返回 FULL（不写），否则写入返回 ADDED。
-     * 非幂等路径的 artifactId 每次全新生成，不存在"已是成员"情形。</p>
+     * <p>KEYS[1]=run 列表 SET 键，KEYS[2]=幽灵清理游标键；ARGV[1]=容量上限，
+     * ARGV[2]=幽灵清理预算，ARGV[3]=meta 键前缀，ARGV[4]=artifactId，
+     * ARGV[5]=索引键 TTL（秒）。幽灵清理与 {@link #ATOMIC_CLAIM_SCRIPT} 同款游标轮转
+     * 协议（有界、整圈必覆盖、单次不全量取出 SET）；TTL 刷新只延长不缩短。
+     * 已满返回 FULL（不写），否则写入返回 ADDED。非幂等路径的 artifactId 每次全新生成，
+     * 不存在"已是成员"情形。</p>
      */
     private static final RedisScript<String> RUN_LIST_ADD_SCRIPT = new DefaultRedisScript<>(
             "local budget = tonumber(ARGV[2]) "
                     + "if budget > 0 then "
-                    + "  local members = redis.call('smembers', KEYS[1]) "
-                    + "  local checked = 0 "
-                    + "  for _, m in ipairs(members) do "
-                    + "    if checked >= budget then break end "
-                    + "    checked = checked + 1 "
+                    + "  local cursor = redis.call('get', KEYS[2]) or '0' "
+                    + "  local scan = redis.call('sscan', KEYS[1], cursor, 'COUNT', budget) "
+                    + "  local nextCursor = scan[1] "
+                    + "  for _, m in ipairs(scan[2]) do "
                     + "    if redis.call('exists', ARGV[3] .. m) == 0 then "
                     + "      redis.call('srem', KEYS[1], m) "
                     + "    end "
                     + "  end "
+                    + "  if nextCursor == '0' then "
+                    + "    redis.call('del', KEYS[2]) "
+                    + "  else "
+                    + "    redis.call('set', KEYS[2], nextCursor) "
+                    + "    redis.call('expire', KEYS[2], math.max(1, tonumber(ARGV[5]))) "
+                    + "  end "
                     + "end "
                     + "if redis.call('scard', KEYS[1]) >= tonumber(ARGV[1]) then return 'FULL' end "
                     + "redis.call('sadd', KEYS[1], ARGV[4]) "
+                    + "local ttl = tonumber(ARGV[5]) "
+                    + "if ttl > 0 then "
+                    + "  local t = redis.call('ttl', KEYS[1]) "
+                    + "  if t < 0 or t < ttl then redis.call('expire', KEYS[1], ttl) end "
+                    + "end "
                     + "return 'ADDED'",
             String.class);
 
@@ -422,14 +499,48 @@ public class PersistentArtifactRegistry {
                 .build();
     }
 
+    /**
+     * 内容读取（不带归属校验的底层管线）：调用方必须自行完成严格归属校验
+     * （{@link #matchesOwnerStrict}）后才可使用。所有用户/工具可达的读取一律走
+     * {@link #readContentStrict}；仅内部已校验归属的门面（如 AgentArtifactService
+     * 的 user API 先经 assertVisible 等价校验）允许直接调用本方法。
+     */
     public String readContent(String artifactId) {
         PersistentArtifactMeta meta = find(artifactId)
                 .orElseThrow(() -> new IllegalArgumentException("Artifact not found: " + artifactId));
+        return readContentOfMeta(meta);
+    }
+
+    /**
+     * 严格归属校验的内容读取入口：先用 {@link #matchesOwnerStrict} 校验四值
+     * （调用方与 meta 的 runId/userId 全部非空且相等，任一空值或不一致一律拒绝，
+     * fail-closed），再走与 {@link #readContent} 完全相同的读取管线。
+     *
+     * <p>短格式 raw_ref（如 {@code raw_ref_001}，经 run 级索引解析到 artifactId）的
+     * 读取链路必须经由本方法：只有 runId 正确不足以放行，userId 错误或缺失同样拒绝，
+     * 同 runId 下其他用户的短格式引用无法读取内容。</p>
+     *
+     * @param artifactId 待读取制品
+     * @param runId      调用方 run 上下文（必须与 meta.runId 严格相等）
+     * @param userId     调用方 user 上下文（必须与 meta.userId 严格相等）
+     */
+    public String readContentStrict(String artifactId, String runId, String userId) {
+        PersistentArtifactMeta meta = find(artifactId)
+                .orElseThrow(() -> new IllegalArgumentException("Artifact not found: " + artifactId));
+        if (!matchesOwnerStrict(meta, runId, userId)) {
+            throw new IllegalArgumentException("Artifact does not belong to current run/user: " + artifactId);
+        }
+        return readContentOfMeta(meta);
+    }
+
+    /** 共享读取管线：external 拒绝 → 路径存在检查 → touch → realpath 复检 + no-follow 读 + 哈希校验。 */
+    private String readContentOfMeta(PersistentArtifactMeta meta) {
         if (Boolean.TRUE.equals(meta.getExternal())) {
-            throw new IllegalArgumentException("External artifact has no registry-owned content: " + artifactId);
+            throw new IllegalArgumentException(
+                    "External artifact has no registry-owned content: " + meta.getArtifactId());
         }
         if (!hasText(meta.getPath())) {
-            throw new IllegalArgumentException("Artifact path missing: " + artifactId);
+            throw new IllegalArgumentException("Artifact path missing: " + meta.getArtifactId());
         }
         touch(meta);
         Path real = verifyReadablePath(Path.of(meta.getPath()), false);
@@ -484,8 +595,9 @@ public class PersistentArtifactRegistry {
                 .build())) {
             while (cursor.hasNext()) {
                 String key = cursor.next();
-                // run 索引 / 幂等身份键与 meta 共享前缀，不是 meta JSON，显式跳过。
-                if (key.startsWith(RUN_LIST_KEY_PREFIX) || key.startsWith(RUN_IDENTITY_KEY_PREFIX)) {
+                // run 索引 / 幂等身份键 / 幽灵清理游标键与 meta 共享前缀，不是 meta JSON，显式跳过。
+                if (key.startsWith(RUN_LIST_KEY_PREFIX) || key.startsWith(RUN_IDENTITY_KEY_PREFIX)
+                        || key.startsWith(RUN_PURGE_CURSOR_KEY_PREFIX)) {
                     continue;
                 }
                 String json = redisTemplate.opsForValue().get(key);
@@ -628,28 +740,31 @@ public class PersistentArtifactRegistry {
     /**
      * 候选原子结算（候选 file + meta 必须已备好，{@value #MAX_CLAIM_ATTEMPTS} 次尝试协议）。
      *
-     * <p>整个「身份已有赢家？→ 幽灵清理 → 容量检查 → 写身份 + 写 run 列表」由单条
-     * Lua 脚本（{@link #ATOMIC_CLAIM_SCRIPT}）一次执行完成，不再有任何多命令窗口：</p>
+     * <p>整个「身份已有赢家？→ 游标轮转幽灵清理 → 容量检查 → 写身份 + 写 run 列表 +
+     * 索引键 TTL 只延长不缩短刷新」由单条 Lua 脚本（{@link #ATOMIC_CLAIM_SCRIPT}）
+     * 一次执行完成，不再有任何多命令窗口：</p>
      * <ul>
      *   <li>CLAIMED → 赢家：meta 已落盘，身份与列表项在同一次脚本执行中原子可见，
-     *       之后只做尽力而为的 TTL 延长（失败不阻断）。</li>
+     *       两张索引键的 TTL 也在同一次脚本执行中按统一滑动过期协议做只延长不缩短的
+     *       刷新（与 {@link #touch} 对齐），Java 侧不再补做。</li>
      *   <li>FULL → 容量超限：脚本没写任何索引，直接抛可见失败，由调用方 catch 回滚
      *       候选（meta + 文件），禁止 silent meta-only 成功。FULL 路径从不写身份，
      *       因此容量失败的注册不会给任何后来者留下幽灵身份。</li>
      *   <li>EXISTS:赢家ID → 输家：先回滚候选（零残留）再采纳。输家只有在脚本报告
      *       EXISTS 时才可能拿到赢家 ID，而 EXISTS 意味着赢家的身份项与列表项已经
-     *       原子落盘——输家不可能在赢家列表提交前返回，也不可能返回幽灵 ID。
-     *       赢家 meta 已被清理（身份字段成为陈旧悬挂）时用值条件 HDEL 原子清除并
-     *       返回 retry=true——身份恒指向 meta 已落盘制品，清陈旧不伤及任何活制品。</li>
+     *       原子落盘，且脚本已当场校验并修复赢家的 run 列表成员资格（SISMEMBER 缺失
+     *       即 SADD 补回）——输家不可能在赢家列表提交前返回，不可能返回幽灵 ID，
+     *       也不可能采纳一个用户列表里看不见的赢家。赢家 meta 已被清理（身份字段
+     *       成为陈旧悬挂）时用值条件 HDEL 原子清除并返回 retry=true——身份恒指向
+     *       meta 已落盘制品，清陈旧不伤及任何活制品。</li>
      * </ul>
      */
     private CommitOutcome commitCandidate(String runId, String field, PersistentArtifactMeta candidateMeta,
                                           long ttlHours) {
         String candidateArtifactId = candidateMeta.getArtifactId();
-        String result = executeAtomicClaim(runId, field, candidateArtifactId);
+        String result = executeAtomicClaim(runId, field, candidateArtifactId, ttlHours);
         if ("CLAIMED".equals(result)) {
-            extendTtlIfNeeded(runIdentityKey(runId), ttlHours);
-            extendTtlIfNeeded(runListKey(runId), ttlHours);
+            // 索引键 TTL 已在同一次脚本执行中只延长不缩短刷新（统一滑动过期协议），Java 侧不补做
             return new CommitOutcome(registration(candidateMeta), false);
         }
         if ("FULL".equals(result)) {
@@ -675,16 +790,23 @@ public class PersistentArtifactRegistry {
     /**
      * 执行幂等认领原子脚本。cap<=0 视为配置错误，在进脚本前 fail-closed。
      * 返回值：CLAIMED / FULL / EXISTS:{赢家ID}。
+     *
+     * <p>KEYS = [身份 hash 键, run 列表 SET 键, 幽灵清理游标键]；ARGV = [身份 field,
+     * 候选 artifactId, 容量上限, 幽灵清理预算, meta 键前缀, 索引键 TTL 秒数]。
+     * 索引 TTL 由候选 meta 的 ttlHours 换算（至少 1 小时）传入脚本，脚本内在
+     * CLAIMED / EXISTS 修复路径做只延长不缩短刷新（统一滑动过期协议，见
+     * {@link #ATOMIC_CLAIM_SCRIPT} 与 {@link #touch}）。</p>
      */
-    private String executeAtomicClaim(String runId, String field, String artifactId) {
+    private String executeAtomicClaim(String runId, String field, String artifactId, long ttlHours) {
         if (maxRunListEntries <= 0) {
             throw new IllegalStateException(
                     "Run artifact index capacity must be positive: cap=" + maxRunListEntries);
         }
         String result = redisTemplate.execute(ATOMIC_CLAIM_SCRIPT,
-                List.of(runIdentityKey(runId), runListKey(runId)),
+                List.of(runIdentityKey(runId), runListKey(runId), runPurgeCursorKey(runId)),
                 field, artifactId, String.valueOf(maxRunListEntries),
-                String.valueOf(GHOST_PURGE_BUDGET), META_PREFIX);
+                String.valueOf(GHOST_PURGE_BUDGET), META_PREFIX,
+                String.valueOf(TimeUnit.HOURS.toSeconds(Math.max(1L, ttlHours))));
         return result;
     }
 
@@ -728,9 +850,11 @@ public class PersistentArtifactRegistry {
 
     /**
      * run 级索引有界加入（非幂等路径）：单条 Lua 脚本（{@link #RUN_LIST_ADD_SCRIPT}）
-     * 内原子完成「幽灵清理 → SCARD 容量检查 → SADD」——超限时脚本不写任何东西并返回
-     * FULL，Java 侧抛可见失败，禁止 silent meta-only 成功；不存在旧实现
-     * SADD→SCARD→SREM 的多命令检查-加入窗口。cap<=0 视为配置错误，fail-closed。
+     * 内原子完成「游标轮转幽灵清理 → SCARD 容量检查 → SADD → 列表键 TTL 只延长不缩短
+     * 刷新」——超限时脚本不写任何东西并返回 FULL，Java 侧抛可见失败，禁止 silent
+     * meta-only 成功；不存在旧实现 SADD→SCARD→SREM 的多命令检查-加入窗口。
+     * cap<=0 视为配置错误，fail-closed。KEYS = [run 列表 SET 键, 幽灵清理游标键]，
+     * ARGV 末位为索引键 TTL 秒数（统一滑动过期协议，与 meta 同滑动）。
      */
     private void addToRunList(String runId, String artifactId, long ttlHours) {
         if (!hasText(runId)) {
@@ -741,17 +865,30 @@ public class PersistentArtifactRegistry {
                     "Run artifact index capacity must be positive: cap=" + maxRunListEntries);
         }
         String listKey = runListKey(runId);
-        String result = redisTemplate.execute(RUN_LIST_ADD_SCRIPT, List.of(listKey),
+        String result = redisTemplate.execute(RUN_LIST_ADD_SCRIPT,
+                List.of(listKey, runPurgeCursorKey(runId)),
                 String.valueOf(maxRunListEntries), String.valueOf(GHOST_PURGE_BUDGET),
-                META_PREFIX, artifactId);
+                META_PREFIX, artifactId,
+                String.valueOf(TimeUnit.HOURS.toSeconds(Math.max(1L, ttlHours))));
         if (!"ADDED".equals(result)) {
             throw new IllegalStateException(
                     "Run artifact index capacity exceeded: runId=" + runId + " cap=" + maxRunListEntries);
         }
-        extendTtlIfNeeded(listKey, ttlHours);
+        // 列表键 TTL 已在同一次脚本执行中只延长不缩短刷新（统一滑动过期协议），Java 侧不补做
     }
 
-    /** 仅在当前 TTL 不足时延长（索引键被同 run 多制品共享，不得用短 TTL 覆盖长 TTL）。 */
+    /**
+     * 只延长不缩短的 TTL 刷新（尽力而为）：索引键被同 run 多制品共享，绝不允许用
+     * 短 TTL 覆盖长 TTL。
+     *
+     * <p>统一滑动过期协议中的位置：meta（{@link #save}/{@link #touch} 重写时带满
+     * ttlHours）、身份 hash、run 列表、幽灵清理游标键四类键按同一 ttlHours 一起滑动。
+     * 写路径（认领/加入/EXISTS 修复）由 Lua 脚本在原子提交内做同款只延长刷新，
+     * 读路径由 {@link #touch} 补做，目标是不存在「索引先于 meta 过期」的漂移窗口——
+     * 索引一旦先过期，list 会丢失活制品条目，幂等认领还能对同一身份第二次 CLAIMED，
+     * 后果不可自愈（读取侧幽灵清理只会删除 meta 已不在的幽灵成员，无法把丢失的活
+     * 成员加回列表）。</p>
+     */
     private void extendTtlIfNeeded(String redisKey, long ttlHours) {
         long desired = Math.max(1L, ttlHours);
         try {
@@ -760,7 +897,7 @@ public class PersistentArtifactRegistry {
                 redisTemplate.expire(redisKey, desired, TimeUnit.HOURS);
             }
         } catch (Exception e) {
-            // TTL 维护失败不阻断注册：最坏结果是索引早于 meta 过期，list 侧自愈。
+            // TTL 维护失败不阻断注册；脚本内同款刷新与读侧 touch 仍会持续对齐索引 TTL。
             log.warn("Failed to maintain TTL for {}: {}", redisKey, e.getMessage());
         }
     }
@@ -881,9 +1018,22 @@ public class PersistentArtifactRegistry {
         }
     }
 
+    /**
+     * 读取 touch：更新访问时间并重写 meta（meta TTL 随之满额滑动），同时把该 run 的
+     * 两张索引键（run 列表 SET、幂等身份 hash）按同一 ttlHours 做只延长不缩短的 TTL
+     * 刷新——统一滑动过期协议的读侧一半：meta 与索引同滑动，杜绝「一次读取让 meta
+     * 活过索引」的漂移窗口（索引先于 meta 过期会导致 list 丢条目、同一幂等身份可被
+     * 第二次 CLAIMED）。写路径的另一半在两条 Lua 脚本内完成。
+     */
     private void touch(PersistentArtifactMeta meta) {
         meta.setLastAccessAtMillis(System.currentTimeMillis());
         save(meta);
+        String runId = meta.getRunId();
+        if (hasText(runId)) {
+            long ttlHours = Math.max(1L, meta.getTtlHours());
+            extendTtlIfNeeded(runListKey(runId), ttlHours);
+            extendTtlIfNeeded(runIdentityKey(runId), ttlHours);
+        }
     }
 
     private void deleteMetaAndFile(PersistentArtifactMeta meta) {
@@ -1043,6 +1193,10 @@ public class PersistentArtifactRegistry {
 
     private static String runIdentityKey(String runId) {
         return RUN_IDENTITY_KEY_PREFIX + runId;
+    }
+
+    private static String runPurgeCursorKey(String runId) {
+        return RUN_PURGE_CURSOR_KEY_PREFIX + runId;
     }
 
     private static boolean hasText(String value) {

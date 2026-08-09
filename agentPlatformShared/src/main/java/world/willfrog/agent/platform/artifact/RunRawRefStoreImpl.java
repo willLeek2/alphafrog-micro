@@ -47,15 +47,18 @@ public class RunRawRefStoreImpl implements RunRawRefStore {
     }
 
     @Override
-    public String read(String runId, String shortId) {
+    public String read(String runId, String userId, String shortId) {
         String artifactId = resolveArtifactId(runId, shortId);
-        return artifactRegistry.readContent(artifactId);
+        // 严格归属校验：短 ID 映射只证明该 shortId 在此 run 下注册过，不足以放行内容；
+        // 内容读取必须再经 readContentStrict 校验 runId+userId 四值严格相等（fail-closed）。
+        return artifactRegistry.readContentStrict(artifactId, runId, userId);
     }
 
     @Override
-    public ToolOutputReadResult read(String runId, String shortId, int offset, int limit, String keyword) {
+    public ToolOutputReadResult read(String runId, String userId, String shortId,
+                                     int offset, int limit, String keyword) {
         String artifactId = resolveArtifactId(runId, shortId);
-        String content = artifactRegistry.readContent(artifactId);
+        String content = artifactRegistry.readContentStrict(artifactId, runId, userId);
         String source = filterByKeyword(content, keyword);
         int total = source.length();
         int safeOffset = Math.max(0, Math.min(offset, total));

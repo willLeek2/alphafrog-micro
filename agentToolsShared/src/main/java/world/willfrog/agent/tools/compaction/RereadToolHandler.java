@@ -125,7 +125,10 @@ public class RereadToolHandler {
     private ToolOutputReadResult readRawRef(String rawRef, int offset, int limit, String keyword) {
         String runId = AgentContext.getRunId();
         if (isShortRawRef(rawRef) && runId != null && !runId.isBlank() && runRawRefStore.isPresent()) {
-            return runRawRefStore.get().read(runId, rawRef, offset, limit, keyword);
+            // 严格归属校验：短格式读取必须携带当前 user 上下文（AgentContext.getUserId()）。
+            // 映射层只能证明 shortId 属于该 run；内容放行还要 userId 与制品 meta 严格相等，
+            // 空白或不匹配的 userId 会在 registry.readContentStrict 处 fail-closed 拒绝。
+            return runRawRefStore.get().read(runId, AgentContext.getUserId(), rawRef, offset, limit, keyword);
         }
         return toolOutputRefService.read(rawRef, offset, limit, keyword);
     }

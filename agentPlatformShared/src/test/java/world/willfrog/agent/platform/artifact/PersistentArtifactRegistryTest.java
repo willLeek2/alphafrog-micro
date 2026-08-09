@@ -11,6 +11,7 @@ import org.springframework.data.redis.core.ScanOptions;
 import org.springframework.data.redis.core.SetOperations;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ValueOperations;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.context.AgentContext;
@@ -89,15 +90,34 @@ import static org.mockito.Mockito.when;
  *       / {@link #listByRunIdShouldFilterStaleIndexEntries}</li>
  * </ul>
  *
+ * <h3>第三轮 MUST-FIX 反测（62ad12bd，三组）</h3>
+ * <ul>
+ *   <li>①有界幽灵清理必须真「有界且保证进展」（游标轮转，不得 SMEMBERS 全量取出、
+ *       不得前窗全活时幽灵永占名额）——
+ *       {@link #ghostPurgeShouldMakeProgressEvenWhenFirstBudgetWindowIsAllLive}
+ *       / {@link #claimAndAddScriptsShouldUseSscanCursorRotationNotSmembers}</li>
+ *   <li>②短格式 raw_ref 严格 user 归属反测归 RunRawRefStoreImplTest 与
+ *       RereadToolHandlerTest（读取链路携带 userId 的四值校验合同），本文件不重复</li>
+ *   <li>③统一滑动过期协议：touch 带动索引 TTL 同滑动 / 滑动后索引不得先于 meta 过期、
+ *       同一身份不得二次 CLAIMED / EXISTS 分支修复丢失的列表成员资格 ——
+ *       {@link #touchShouldSlideIndexTtlsTogetherWithMeta}
+ *       / {@link #slidTtlShouldPreventIndexExpiryBeforeMetaAndDoubleClaim}
+ *       / {@link #existsBranchShouldRepairMissingRunListEntry}</li>
+ * </ul>
+ *
  * <p>Redis 用线程安全内存 fake（ConcurrentHashMap/concurrent set，支持真线程并发测试；
- * 三种 Lua 脚本——幂等认领、列表加入、值条件 HDEL——的 execute() 按 ARGV 个数分发，
- * 共用一把锁模拟 Redis 单线程原子执行），文件落 @TempDir；不碰生产 DB/Redis/Nacos。</p>
+ * 三种 Lua 脚本——幂等认领（6 ARGV）、列表加入（5 ARGV）、值条件 HDEL（2 ARGV）——
+ * 的 execute() 按 ARGV 个数分发，共用一把锁模拟 Redis 单线程原子执行。fake 另带
+ * 可控时钟 + 每键 deadline（惰性过期）、游标轮转 SSCAN 模拟与 getExpire/expire
+ * 跟踪，支撑滑动过期与幽灵清理进展保证的反测），文件落 @TempDir；
+ * 不碰生产 DB/Redis/Nacos。</p>
  */
 class PersistentArtifactRegistryTest {
 
     private static final String META_PREFIX = "agent:persistent-artifact:";
     private static final String RUN_LIST_PREFIX = META_PREFIX + "run-list:";
     private static final String RUN_IDENTITY_PREFIX = META_PREFIX + "run-identity:";
+    private static final String RUN_PURGE_CURSOR_PREFIX = META_PREFIX + "run-purge-cursor:";
 
     @TempDir
     Path tempDir;
@@ -105,6 +125,14 @@ class PersistentArtifactRegistryTest {
     private Map<String, String> values;
     private Map<String, Map<String, String>> hashes;
     private Map<String, Set<String>> sets;
+    /**
+     * fake 时钟 + 每键过期时刻（millis）。统一滑动过期协议的反测需要可控时间：
+     * 注册/读取按 fakeNow 记录 TTL 截止时间，advanceClock 推进后由 sweepExpired
+     * 惰性清除过期键（与真实 Redis 惰性/定期过期删除的可观察语义一致）。
+     * 直接 values.put 而不记录 deadline 的键视为无 TTL（持久），与 Redis PERSIST 等价。
+     */
+    private long fakeNow;
+    private Map<String, Long> deadlines;
     /**
      * 模拟 Redis 单线程执行：所有 Lua 脚本 fake（认领/加入/值条件 HDEL）共用这一把锁，
      * 保证任一脚本执行期间没有其他脚本插入——这是真实 Redis 原子性的最小等价模拟。
@@ -119,6 +147,8 @@ class PersistentArtifactRegistryTest {
         values = new ConcurrentHashMap<>();
         hashes = new ConcurrentHashMap<>();
         sets = new ConcurrentHashMap<>();
+        fakeNow = System.currentTimeMillis();
+        deadlines = new ConcurrentHashMap<>();
         StringRedisTemplate redisTemplate = mockRedis();
         artifactRoot = tempDir.resolve("artifacts");
         datasetRoot = tempDir.resolve("datasets");
@@ -362,7 +392,8 @@ class PersistentArtifactRegistryTest {
         // 被拒注册零残留：values 中恰两条 meta，type 目录恰两文件
         long metaCount = values.keySet().stream()
                 .filter(k -> k.startsWith(META_PREFIX)
-                        && !k.startsWith(RUN_LIST_PREFIX) && !k.startsWith(RUN_IDENTITY_PREFIX))
+                        && !k.startsWith(RUN_LIST_PREFIX) && !k.startsWith(RUN_IDENTITY_PREFIX)
+                        && !k.startsWith(RUN_PURGE_CURSOR_PREFIX))
                 .count();
         assertEquals(2, metaCount, "被拒注册不得残留 meta");
         try (var paths = Files.list(artifactRoot.resolve("raw-ref"))) {
@@ -433,7 +464,8 @@ class PersistentArtifactRegistryTest {
         // 无孤儿 meta：values 中的 meta 恰好都是成功注册
         Set<String> metaIds = values.keySet().stream()
                 .filter(k -> k.startsWith(META_PREFIX)
-                        && !k.startsWith(RUN_LIST_PREFIX) && !k.startsWith(RUN_IDENTITY_PREFIX))
+                        && !k.startsWith(RUN_LIST_PREFIX) && !k.startsWith(RUN_IDENTITY_PREFIX)
+                        && !k.startsWith(RUN_PURGE_CURSOR_PREFIX))
                 .map(k -> k.substring(META_PREFIX.length()))
                 .collect(Collectors.toSet());
         assertEquals(new HashSet<>(okIds), metaIds, "被拒注册不得残留 meta");
@@ -498,7 +530,8 @@ class PersistentArtifactRegistryTest {
         assertEquals(winnerId, identity.values().iterator().next());
         long metaCount = values.keySet().stream()
                 .filter(k -> k.startsWith(META_PREFIX)
-                        && !k.startsWith(RUN_LIST_PREFIX) && !k.startsWith(RUN_IDENTITY_PREFIX))
+                        && !k.startsWith(RUN_LIST_PREFIX) && !k.startsWith(RUN_IDENTITY_PREFIX)
+                        && !k.startsWith(RUN_PURGE_CURSOR_PREFIX))
                 .count();
         assertEquals(1, metaCount, "恰一条 meta，输家候选 meta 必须回滚");
     }
@@ -611,7 +644,8 @@ class PersistentArtifactRegistryTest {
                 "索引只含合法成员");
         long metaCount = values.keySet().stream()
                 .filter(k -> k.startsWith(META_PREFIX)
-                        && !k.startsWith(RUN_LIST_PREFIX) && !k.startsWith(RUN_IDENTITY_PREFIX))
+                        && !k.startsWith(RUN_LIST_PREFIX) && !k.startsWith(RUN_IDENTITY_PREFIX)
+                        && !k.startsWith(RUN_PURGE_CURSOR_PREFIX))
                 .count();
         assertEquals(1, metaCount, "被拒注册的 meta 必须回滚");
         Path typeDir = artifactRoot.resolve("python_script");
@@ -741,6 +775,8 @@ class PersistentArtifactRegistryTest {
         // 索引键与 meta 共享前缀且误存了可解析 JSON：cleanup 必须跳过、不得按 meta 处理
         values.put(RUN_LIST_PREFIX + "run-skip", expiredJson);
         values.put(RUN_IDENTITY_PREFIX + "run-skip", expiredJson);
+        // 第三轮新增的幽灵清理游标键同样共享前缀：同样必须跳过
+        values.put(RUN_PURGE_CURSOR_PREFIX + "run-skip", expiredJson);
 
         registry.cleanupExpiredArtifacts();
 
@@ -748,6 +784,165 @@ class PersistentArtifactRegistryTest {
         assertFalse(values.containsKey(metaKey));
         assertTrue(values.containsKey(RUN_LIST_PREFIX + "run-skip"));
         assertTrue(values.containsKey(RUN_IDENTITY_PREFIX + "run-skip"));
+        assertTrue(values.containsKey(RUN_PURGE_CURSOR_PREFIX + "run-skip"));
+    }
+
+    // ===== 第三轮 MUST-FIX ①：有界幽灵清理必须真「有界且保证进展」 =====
+
+    @Test
+    void ghostPurgeShouldMakeProgressEvenWhenFirstBudgetWindowIsAllLive() {
+        // codex 62ad12bd ① 反测：cap > 清理预算（128），前若干个预算窗口全是活成员、
+        // 幽灵排在后面——旧实现 SMEMBERS 全量取出后只查前 128 个，每次调用都重复检查
+        // 同一批活成员，幽灵永远扫不到、永久占用名额、注册永远 FULL。游标轮转协议必须
+        // 让清理状态跨调用推进：至多 ceil(成员总数/预算) 次索引写入内清完所有幽灵。
+        ReflectionTestUtils.setField(registry, "maxRunListEntries", 200);
+        String runId = "run-progress";
+        String listKey = RUN_LIST_PREFIX + runId;
+        String cursorKey = RUN_PURGE_CURSOR_PREFIX + runId;
+        // 预置 199 个活成员（meta 在 values 表 = exists 为真）+ 1 个幽灵（只有 SET 成员、
+        // 无 meta），幽灵命名为 zz- 保证排序后落在最末位（第一预算窗口 0..127 全是活成员）
+        for (int i = 0; i < 199; i++) {
+            String id = "raw-ref:live-" + String.format("%03d", i);
+            values.put(META_PREFIX + id, "{}");
+            sets.computeIfAbsent(listKey, k -> ConcurrentHashMap.newKeySet()).add(id);
+        }
+        sets.get(listKey).add("raw-ref:zz-ghost");
+        assertEquals(200, sets.get(listKey).size());
+
+        // 第 1 次注册：扫描窗口 [0,128) 全是活成员、无幽灵可清 → SCARD 仍 200 ≥ cap → FULL；
+        // 关键是游标必须前进并持久化（清理状态不再每次从零重复）
+        IllegalStateException full = assertThrows(IllegalStateException.class,
+                () -> registry.registerExplicit(runId, "user-1", "raw-ref", "new", "new", "payload", 6));
+        assertTrue(full.getMessage().contains("capacity exceeded"), full.getMessage());
+        assertEquals("128", values.get(cursorKey), "第一次扫描后游标必须推进到 128 并持久化");
+        assertTrue(sets.get(listKey).contains("raw-ref:zz-ghost"), "第一窗口扫不到幽灵，不得误清活成员");
+
+        // 第 2 次注册：从游标 128 继续扫描 [128,200) → 扫到末尾的幽灵并当场移除 →
+        // 整圈完成游标归零删键 → SCARD 199 < 200 → 注册恢复。
+        PersistentArtifactRegistration registration = registry.registerExplicit(
+                runId, "user-1", "raw-ref", "new", "new", "payload", 6);
+        assertNotNull(registration.getArtifactId());
+        Set<String> listed = sets.get(listKey);
+        assertEquals(200, listed.size(), "199 活成员 + 新制品，幽灵已清");
+        assertTrue(listed.contains(registration.getArtifactId()));
+        assertFalse(listed.contains("raw-ref:zz-ghost"), "幽灵必须在有界次数的写入内被清掉");
+        assertFalse(values.containsKey(cursorKey), "整圈扫描完成后游标键必须删除");
+        // 进展有界性：200 成员、预算 128 → ceil(200/128)=2 次索引写入内必然恢复（本测恰好 2 次）
+    }
+
+    @Test
+    void claimAndAddScriptsShouldUseSscanCursorRotationNotSmembers() throws Exception {
+        // codex 62ad12bd ① 反测（脚本形态守卫）：幽灵清理必须走 SSCAN 游标轮转——
+        // 单次脚本执行只取有界数量的成员，绝不先 SMEMBERS 全量取出整个 SET
+        // （大 SET 下全量取出 = 无界内存分配 + 阻塞）。脚本文本钉住该形态。
+        @SuppressWarnings("unchecked")
+        DefaultRedisScript<String> claim = (DefaultRedisScript<String>) ReflectionTestUtils.getField(
+                PersistentArtifactRegistry.class, "ATOMIC_CLAIM_SCRIPT");
+        @SuppressWarnings("unchecked")
+        DefaultRedisScript<String> add = (DefaultRedisScript<String>) ReflectionTestUtils.getField(
+                PersistentArtifactRegistry.class, "RUN_LIST_ADD_SCRIPT");
+        String claimText = claim.getScriptAsString();
+        String addText = add.getScriptAsString();
+
+        assertTrue(claimText.contains("sscan"), "认领脚本必须用 SSCAN 游标轮转清理");
+        assertFalse(claimText.toLowerCase().contains("smembers"), "认领脚本不得全量取出 SET");
+        assertTrue(addText.contains("sscan"), "加入脚本必须用 SSCAN 游标轮转清理");
+        assertFalse(addText.toLowerCase().contains("smembers"), "加入脚本不得全量取出 SET");
+        // 游标键以 KEYS 传入且写回旋转（归零删键），证明跨调用的推进状态在脚本内持久化
+        assertTrue(claimText.contains("KEYS[3]"), "认领脚本必须把游标键作为 KEYS 传入");
+        assertTrue(addText.contains("KEYS[2]"), "加入脚本必须把游标键作为 KEYS 传入");
+    }
+
+    // ===== 第三轮 MUST-FIX ③：统一滑动过期协议（touch 同滑动 / 防索引先过期 / EXISTS 修复） =====
+
+    @Test
+    void touchShouldSlideIndexTtlsTogetherWithMeta() {
+        // codex 62ad12bd ③ 反测：读取 touch 重写 meta（满额 TTL）的同时，必须把 run 列表
+        // 与幂等身份两张索引键按同一 ttlHours 一起滑动——否则一次读取就让 meta 活过索引，
+        // 索引先过期后 list 丢条目、同一幂等身份可被第二次 CLAIMED。
+        String runId = "run-slide";
+        long t0 = fakeNow;
+        PersistentArtifactRegistration registration = registry.registerIdempotent(
+                runId, "user-1", "raw-ref", "s", "1", "one", 6);
+        String metaKey = META_PREFIX + registration.getArtifactId();
+
+        // 注册后四类过期协议键（meta/列表/身份）的 deadline 完全一致（脚本内同款 TTL 写入）
+        assertEquals(t0 + TimeUnit.HOURS.toMillis(6), deadlines.get(metaKey));
+        assertEquals(deadlines.get(metaKey), deadlines.get(RUN_LIST_PREFIX + runId),
+                "注册后列表键 TTL 必须与 meta 对齐");
+        assertEquals(deadlines.get(metaKey), deadlines.get(RUN_IDENTITY_PREFIX + runId),
+                "注册后身份键 TTL 必须与 meta 对齐");
+
+        // 2 小时后读取：touch 必须把三类键一起滑回满额 6h（而不是只滑 meta）
+        advanceClock(TimeUnit.HOURS.toMillis(2));
+        assertEquals("one", registry.readContent(registration.getArtifactId()));
+        long expected = t0 + TimeUnit.HOURS.toMillis(8);
+        assertEquals(expected, deadlines.get(metaKey), "meta 必须滑动回满额");
+        assertEquals(expected, deadlines.get(RUN_LIST_PREFIX + runId), "列表键必须随 touch 同滑动");
+        assertEquals(expected, deadlines.get(RUN_IDENTITY_PREFIX + runId), "身份键必须随 touch 同滑动");
+    }
+
+    @Test
+    void slidTtlShouldPreventIndexExpiryBeforeMetaAndDoubleClaim() throws Exception {
+        // codex 62ad12bd ③ 反测（可控时钟/TTL 全链路）：注册后读取一次（touch 滑动），
+        // 再推进时钟越过「原始」过期时刻——滑动过的 meta 与索引必须都还活着；此时同一
+        // 幂等身份再次注册必须采纳原赢家（EXISTS），绝不允许索引先于 meta 过期导致
+        // 同一身份第二次 CLAIMED 出新 ID。最后推进越过滑动后的 deadline，全部过期后
+        // 重新认领必须拿到全新 ID（干净重注册，不继承悬挂状态）。
+        String runId = "run-drift";
+        long t0 = fakeNow;
+        PersistentArtifactRegistration first = registry.registerIdempotent(
+                runId, "user-1", "python_script", "dup", "脚本", "v1", 2);
+
+        // 推进 1h 后读取 → touch 把 meta/列表/身份全部滑动到 t0+1h+2h
+        advanceClock(TimeUnit.HOURS.toMillis(1));
+        assertEquals("v1", registry.readContent(first.getArtifactId()));
+
+        // 再推进 1.5h：fakeNow = t0+2.5h，已越过原始过期时刻 t0+2h，但未越过滑动后的
+        // t0+3h——meta 与两张索引键必须全部存活
+        advanceClock(TimeUnit.HOURS.toMillis(1) + TimeUnit.MINUTES.toMillis(30));
+        PersistentArtifactRegistration second = registry.registerIdempotent(
+                runId, "user-1", "python_script", "dup", "脚本", "v2", 2);
+        assertEquals(first.getArtifactId(), second.getArtifactId(),
+                "索引随 meta 滑动后，同一身份必须采纳原赢家，不得第二次 CLAIMED");
+        assertEquals(1, registry.listByRunId(runId).size(), "列表不得丢失或重复条目");
+        try (var paths = Files.list(artifactRoot.resolve("python_script"))) {
+            assertEquals(1, paths.count(), "输家候选文件必须回滚，type 目录恰一文件");
+        }
+        assertEquals("v1", registry.readContent(first.getArtifactId()), "内容仍是首次写入值");
+
+        // 推进越过所有滑动后的 deadline → 全部过期 → 干净重认领拿到全新 ID
+        advanceClock(TimeUnit.HOURS.toMillis(3));
+        PersistentArtifactRegistration third = registry.registerIdempotent(
+                runId, "user-1", "python_script", "dup", "脚本", "v3", 2);
+        assertNotEquals(first.getArtifactId(), third.getArtifactId(),
+                "全部过期后重新认领必须产生新 ID（身份已随索引一起过期清除）");
+        assertEquals("v3", registry.readContent(third.getArtifactId()));
+        assertEquals(1, registry.listByRunId(runId).size());
+    }
+
+    @Test
+    void existsBranchShouldRepairMissingRunListEntry() {
+        // codex 62ad12bd ③ 反测：身份字段在场、赢家的 run 列表成员资格却丢失时
+        // （列表键早于身份过期或被外力移除），EXISTS 分支不得只做透传——必须当场校验
+        // 并修复列表成员资格，否则输家采纳的赢家在用户列表里不可见。
+        String runId = "run-repair";
+        PersistentArtifactRegistration winner = registry.registerIdempotent(
+                runId, "user-1", "python_script", "shared", "脚本", "v1", 6);
+        // 模拟列表成员资格丢失：SET 成员被移除，但身份字段仍指向赢家
+        sets.get(RUN_LIST_PREFIX + runId).remove(winner.getArtifactId());
+        assertTrue(sets.get(RUN_LIST_PREFIX + runId).isEmpty());
+        assertEquals(winner.getArtifactId(),
+                hashes.get(RUN_IDENTITY_PREFIX + runId).get(
+                        PersistentArtifactRegistry.identityField("python_script", "shared", null)));
+
+        // 同一身份再次注册 → EXISTS 分支：修复成员资格 + 采纳赢家
+        PersistentArtifactRegistration adopted = registry.registerIdempotent(
+                runId, "user-1", "python_script", "shared", "脚本", "v2", 6);
+        assertEquals(winner.getArtifactId(), adopted.getArtifactId());
+        assertTrue(sets.get(RUN_LIST_PREFIX + runId).contains(winner.getArtifactId()),
+                "EXISTS 分支必须把赢家修复回 run 列表");
+        assertEquals(1, registry.listByRunId(runId).size(), "用户列表必须重新看见赢家");
     }
 
     // ===== fake redis（线程安全；支持认领/加入/值条件 HDEL 三种 Lua 脚本） =====
@@ -758,23 +953,77 @@ class PersistentArtifactRegistryTest {
 
         ValueOperations<String, String> valueOps = mock(ValueOperations.class);
         when(template.opsForValue()).thenReturn(valueOps);
+        // 带 TTL 写：记录 deadline = fakeNow + ttl（统一滑动过期协议的 meta 侧）
         org.mockito.Mockito.doAnswer(invocation -> {
-            values.put(invocation.getArgument(0), invocation.getArgument(1));
+            String key = invocation.getArgument(0);
+            long ttl = invocation.getArgument(2);
+            TimeUnit unit = invocation.getArgument(3);
+            values.put(key, invocation.getArgument(1));
+            deadlines.put(key, fakeNow + unit.toMillis(ttl));
             return null;
         }).when(valueOps).set(org.mockito.ArgumentMatchers.anyString(),
                 org.mockito.ArgumentMatchers.anyString(),
                 org.mockito.ArgumentMatchers.anyLong(), org.mockito.ArgumentMatchers.any(TimeUnit.class));
         when(valueOps.get(org.mockito.ArgumentMatchers.anyString()))
-                .thenAnswer(invocation -> values.get(invocation.getArgument(0)));
-        org.mockito.Mockito.doAnswer(invocation -> values.remove(invocation.getArgument(0)) != null)
-                .when(template).delete(org.mockito.ArgumentMatchers.anyString());
+                .thenAnswer(invocation -> {
+                    synchronized (redisLock) {
+                        sweepExpired();
+                        return values.get(invocation.getArgument(0));
+                    }
+                });
+        org.mockito.Mockito.doAnswer(invocation -> {
+            deadlines.remove(invocation.getArgument(0));
+            return values.remove(invocation.getArgument(0)) != null;
+        }).when(template).delete(org.mockito.ArgumentMatchers.anyString());
         // SCAN 返回三张表全部键（模拟真实 Redis 中索引键也会被 META_PREFIX* 命中）
         when(template.scan(org.mockito.ArgumentMatchers.any(ScanOptions.class)))
                 .thenAnswer(invocation -> {
-                    Set<String> all = new HashSet<>(values.keySet());
-                    all.addAll(hashes.keySet());
-                    all.addAll(sets.keySet());
-                    return new SetCursor(all.iterator());
+                    synchronized (redisLock) {
+                        sweepExpired();
+                        Set<String> all = new HashSet<>(values.keySet());
+                        all.addAll(hashes.keySet());
+                        all.addAll(sets.keySet());
+                        return new SetCursor(all.iterator());
+                    }
+                });
+        // TTL 查询/设置（统一滑动过期协议的 fake 侧）：
+        // getExpire 语义与真实 Redis 一致——键不存在/已过期 = -2，无 TTL = -1，否则剩余量；
+        // expire 对不存在的键是 no-op（真实 Redis 语义），只在键存在时记录 deadline。
+        when(template.getExpire(org.mockito.ArgumentMatchers.anyString(),
+                org.mockito.ArgumentMatchers.any(TimeUnit.class)))
+                .thenAnswer(invocation -> {
+                    String key = invocation.getArgument(0);
+                    TimeUnit unit = invocation.getArgument(1);
+                    synchronized (redisLock) {
+                        sweepExpired();
+                        if (!keyExistsInFake(key)) {
+                            return -2L;
+                        }
+                        Long deadline = deadlines.get(key);
+                        if (deadline == null) {
+                            return -1L;
+                        }
+                        long remaining = deadline - fakeNow;
+                        if (remaining <= 0) {
+                            return -2L;
+                        }
+                        return unit.convert(remaining, TimeUnit.MILLISECONDS);
+                    }
+                });
+        when(template.expire(org.mockito.ArgumentMatchers.anyString(),
+                org.mockito.ArgumentMatchers.anyLong(), org.mockito.ArgumentMatchers.any(TimeUnit.class)))
+                .thenAnswer(invocation -> {
+                    String key = invocation.getArgument(0);
+                    long ttl = invocation.getArgument(1);
+                    TimeUnit unit = invocation.getArgument(2);
+                    synchronized (redisLock) {
+                        sweepExpired();
+                        if (!keyExistsInFake(key)) {
+                            return false;
+                        }
+                        deadlines.put(key, fakeNow + unit.toMillis(ttl));
+                        return true;
+                    }
                 });
 
         HashOperations<String, Object, Object> hashOps = mock(HashOperations.class);
@@ -801,9 +1050,9 @@ class PersistentArtifactRegistryTest {
                     Map<String, String> h = hashes.get(invocation.getArgument(0));
                     return h == null ? 0L : (h.remove(invocation.getArgument(1).toString()) != null ? 1L : 0L);
                 });
-        // ===== Lua execute() fake（第二轮 MUST-FIX ①④）=====
+        // ===== Lua execute() fake（第三轮 MUST-FIX 后的协议）=====
         // Mockito 5 对 varargs 按"每个匹配器对一个可变参数"匹配，三种脚本 ARGV 个数不同
-        // （认领 5 / 加入 4 / 值条件 HDEL 2），各需独立 stub。三个 stub 共用 redisLock，
+        // （认领 6 / 加入 5 / 值条件 HDEL 2），各需独立 stub。三个 stub 共用 redisLock，
         // 模拟 Redis 单线程：任一脚本执行期间其他脚本不得插入（原子性最小等价模拟）。
 
         // 值条件 HDEL（2 个 ARGV：field、期望值）：仅当 field 值仍等于期望 artifactId 时删除
@@ -814,6 +1063,7 @@ class PersistentArtifactRegistryTest {
             String field = String.valueOf(args[2]);
             String expected = String.valueOf(args[3]);
             synchronized (redisLock) {
+                sweepExpired();
                 Map<String, String> h = hashes.get(keys.get(0));
                 if (h == null) {
                     return 0L;
@@ -829,8 +1079,9 @@ class PersistentArtifactRegistryTest {
                 org.mockito.ArgumentMatchers.<Object>any(),
                 org.mockito.ArgumentMatchers.<Object>any());
 
-        // run 列表加入脚本（4 个 ARGV：cap、幽灵预算、meta 前缀、artifactId）：
-        // 幽灵清理 → SCARD 容量检查 → SADD，原子；满则返回 FULL 且不写
+        // run 列表加入脚本（KEYS=[列表 SET, 清理游标键]；5 个 ARGV：cap、幽灵预算、
+        // meta 前缀、artifactId、TTL 秒数）：游标轮转幽灵清理 → SCARD 容量检查 → SADD
+        // → 列表键只延长不缩短 TTL 刷新，原子；满则返回 FULL 且不写
         org.mockito.Mockito.doAnswer(invocation -> {
             Object[] args = invocation.getArguments();
             @SuppressWarnings("unchecked")
@@ -839,14 +1090,17 @@ class PersistentArtifactRegistryTest {
             int budget = Integer.parseInt(String.valueOf(args[3]));
             String metaPrefix = String.valueOf(args[4]);
             String artifactId = String.valueOf(args[5]);
+            long ttlSeconds = Long.parseLong(String.valueOf(args[6]));
             synchronized (redisLock) {
+                sweepExpired();
+                purgeWithCursor(keys.get(0), keys.get(1), metaPrefix, budget, ttlSeconds);
                 Set<String> list = sets.get(keys.get(0));
-                purgeGhosts(list, metaPrefix, budget);
                 int size = list == null ? 0 : list.size();
                 if (size >= cap) {
                     return "FULL";
                 }
                 sets.computeIfAbsent(keys.get(0), k -> ConcurrentHashMap.newKeySet()).add(artifactId);
+                extendOnlyTtl(keys.get(0), ttlSeconds);
                 return "ADDED";
             }
         }).when(template).execute(org.mockito.ArgumentMatchers.<RedisScript<Object>>any(),
@@ -854,11 +1108,14 @@ class PersistentArtifactRegistryTest {
                 org.mockito.ArgumentMatchers.<Object>any(),
                 org.mockito.ArgumentMatchers.<Object>any(),
                 org.mockito.ArgumentMatchers.<Object>any(),
+                org.mockito.ArgumentMatchers.<Object>any(),
                 org.mockito.ArgumentMatchers.<Object>any());
 
-        // 幂等认领脚本（5 个 ARGV：field、候选 ID、cap、幽灵预算、meta 前缀）：
-        // 已有赢家→EXISTS:赢家ID（不写）；幽灵清理→容量检查；未满→HSET 身份+SADD 列表→CLAIMED。
-        // EXISTS 与写入互斥且整段原子——输家拿到 EXISTS 时赢家身份+列表必然已落盘
+        // 幂等认领脚本（KEYS=[身份 hash, 列表 SET, 清理游标键]；6 个 ARGV：field、候选 ID、
+        // cap、幽灵预算、meta 前缀、TTL 秒数）：已有赢家→meta 仍在则修复列表成员资格
+        // （SISMEMBER 缺失即 SADD 补回）+ 两索引键只延长 TTL → EXISTS:赢家ID；
+        // 否则游标轮转幽灵清理→容量检查；未满→HSET 身份+SADD 列表+TTL 刷新→CLAIMED。
+        // EXISTS 与写入互斥且整段原子——输家拿到 EXISTS 时赢家身份+列表必然已落盘且可见
         org.mockito.Mockito.doAnswer(invocation -> {
             Object[] args = invocation.getArguments();
             @SuppressWarnings("unchecked")
@@ -868,24 +1125,36 @@ class PersistentArtifactRegistryTest {
             int cap = Integer.parseInt(String.valueOf(args[4]));
             int budget = Integer.parseInt(String.valueOf(args[5]));
             String metaPrefix = String.valueOf(args[6]);
+            long ttlSeconds = Long.parseLong(String.valueOf(args[7]));
             synchronized (redisLock) {
+                sweepExpired();
                 Map<String, String> identity = hashes.get(keys.get(0));
                 String existing = identity == null ? null : identity.get(field);
                 if (existing != null) {
+                    if (values.containsKey(metaPrefix + existing)) {
+                        // 赢家 meta 仍活：修复列表成员资格 + 只延长不缩短 TTL 刷新
+                        sets.computeIfAbsent(keys.get(1), k -> ConcurrentHashMap.newKeySet())
+                                .add(existing);
+                        extendOnlyTtl(keys.get(0), ttlSeconds);
+                        extendOnlyTtl(keys.get(1), ttlSeconds);
+                    }
                     return "EXISTS:" + existing;
                 }
+                purgeWithCursor(keys.get(1), keys.get(2), metaPrefix, budget, ttlSeconds);
                 Set<String> list = sets.get(keys.get(1));
-                purgeGhosts(list, metaPrefix, budget);
                 int size = list == null ? 0 : list.size();
                 if (size >= cap) {
                     return "FULL";
                 }
                 hashes.computeIfAbsent(keys.get(0), k -> new ConcurrentHashMap<>()).put(field, artifactId);
                 sets.computeIfAbsent(keys.get(1), k -> ConcurrentHashMap.newKeySet()).add(artifactId);
+                extendOnlyTtl(keys.get(0), ttlSeconds);
+                extendOnlyTtl(keys.get(1), ttlSeconds);
                 return "CLAIMED";
             }
         }).when(template).execute(org.mockito.ArgumentMatchers.<RedisScript<Object>>any(),
                 org.mockito.ArgumentMatchers.<List<String>>any(),
+                org.mockito.ArgumentMatchers.<Object>any(),
                 org.mockito.ArgumentMatchers.<Object>any(),
                 org.mockito.ArgumentMatchers.<Object>any(),
                 org.mockito.ArgumentMatchers.<Object>any(),
@@ -917,23 +1186,91 @@ class PersistentArtifactRegistryTest {
     }
 
     /**
-     * fake 侧幽灵清理：与生产 Lua 脚本同语义——至多检查 budget 个成员，
-     * meta 键（values 表）不存在者当场移除。调用方必须已持有 redisLock。
+     * fake 侧游标轮转幽灵清理：与生产 Lua 脚本同语义——从持久化游标（本 fake 用
+     * 「排序快照内的偏移量」编码游标位置）继续，至多检查 budget 个成员，meta 键
+     * （values 表）不存在者当场 SREM，回写下一游标；游标归零（一整圈扫描完成）则
+     * 删除游标键。每次调用只检查有界数量的成员、不全量取出整个 SET；整圈扫描必然
+     * 覆盖每一个成员，幽灵不可能永久占用名额。调用方必须已持有 redisLock。
      */
-    private void purgeGhosts(Set<String> list, String metaPrefix, int budget) {
-        if (list == null || list.isEmpty() || budget <= 0) {
+    private void purgeWithCursor(String listKey, String cursorKey, String metaPrefix,
+                                 int budget, long ttlSeconds) {
+        if (budget <= 0) {
             return;
         }
-        int checked = 0;
-        for (String member : new ArrayList<>(list)) {
-            if (checked >= budget) {
-                break;
+        int offset = 0;
+        String cursorVal = values.get(cursorKey);
+        if (cursorVal != null) {
+            try {
+                offset = Integer.parseInt(cursorVal);
+            } catch (NumberFormatException ignored) {
+                offset = 0;
             }
-            checked++;
+        }
+        Set<String> list = sets.get(listKey);
+        if (list == null || list.isEmpty()) {
+            values.remove(cursorKey);
+            deadlines.remove(cursorKey);
+            return;
+        }
+        List<String> snapshot = new ArrayList<>(list);
+        Collections.sort(snapshot);
+        int from = Math.min(offset, snapshot.size());
+        int to = Math.min(from + budget, snapshot.size());
+        for (int i = from; i < to; i++) {
+            String member = snapshot.get(i);
             if (!values.containsKey(metaPrefix + member)) {
                 list.remove(member);
             }
         }
+        if (to >= snapshot.size()) {
+            // 一整圈扫描完成：游标归零即删键（与生产脚本 del 游标键一致）
+            values.remove(cursorKey);
+            deadlines.remove(cursorKey);
+        } else {
+            values.put(cursorKey, String.valueOf(to));
+            deadlines.put(cursorKey, fakeNow + TimeUnit.SECONDS.toMillis(Math.max(1L, ttlSeconds)));
+        }
+    }
+
+    /**
+     * fake 侧惰性过期：deadline 已到（相对 fakeNow）的键从三张表与 deadline 表移除。
+     * 与真实 Redis 惰性/定期过期删除的可观察语义一致。调用方必须已持有 redisLock。
+     */
+    private void sweepExpired() {
+        Iterator<Map.Entry<String, Long>> it = deadlines.entrySet().iterator();
+        while (it.hasNext()) {
+            Map.Entry<String, Long> entry = it.next();
+            if (entry.getValue() <= fakeNow) {
+                it.remove();
+                values.remove(entry.getKey());
+                hashes.remove(entry.getKey());
+                sets.remove(entry.getKey());
+            }
+        }
+    }
+
+    /**
+     * fake 侧只延长不缩短 TTL 刷新（对应生产脚本内 redis.call('ttl')/expire 段）。
+     * 调用方必须已持有 redisLock。
+     */
+    private void extendOnlyTtl(String key, long ttlSeconds) {
+        if (ttlSeconds <= 0) {
+            return;
+        }
+        long desired = fakeNow + TimeUnit.SECONDS.toMillis(ttlSeconds);
+        Long current = deadlines.get(key);
+        if (current == null || current < desired) {
+            deadlines.put(key, desired);
+        }
+    }
+
+    private boolean keyExistsInFake(String key) {
+        return values.containsKey(key) || hashes.containsKey(key) || sets.containsKey(key);
+    }
+
+    /** 推进 fake 时钟（millis）；随后的读取/脚本执行会按新时刻惰性清除过期键。 */
+    private void advanceClock(long millis) {
+        fakeNow += millis;
     }
 
     private static class SetCursor implements Cursor<String> {
