@@ -38,7 +38,7 @@ public final class StructuredPlanningSupport {
         }
     }
 
-    public static ValidationResult validateTodoPlan(JsonNode root, int maxTodos, Set<String> toolWhitelist) {
+    public static ValidationResult validateTodoPlan(JsonNode root, int maxTodos) {
         if (root == null || !root.isObject()) {
             return ValidationResult.invalid(CATEGORY_SCHEMA_VALIDATION_ERROR, "todo_plan_not_object");
         }

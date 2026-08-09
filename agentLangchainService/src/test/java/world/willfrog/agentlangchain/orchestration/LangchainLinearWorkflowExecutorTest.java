@@ -26,6 +26,16 @@ import static org.mockito.Mockito.when;
 class LangchainLinearWorkflowExecutorTest {
 
     @Test
+    void embeddedPlanningEntryPoint_shouldBeDeprecatedForRemoval() throws NoSuchMethodException {
+        Deprecated annotation = LangchainLinearWorkflowExecutor.class
+                .getDeclaredMethod("execute", LangchainLinearWorkflowRequest.class)
+                .getAnnotation(Deprecated.class);
+
+        assertThat(annotation).isNotNull();
+        assertThat(annotation.forRemoval()).isTrue();
+    }
+
+    @Test
     void execute_shouldRunPlanTodosAndFinalAnswerInOrder() {
         QueueChatModel model = new QueueChatModel(
                 """
@@ -43,7 +53,7 @@ class LangchainLinearWorkflowExecutorTest {
                 "final answer"
         );
         LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
-                LangchainTestFixtures.planner(),
+                LangchainTestFixtures.legacySingleStagePlanner(),
                 LangchainTestFixtures.todoNodeExecutor(),
                 noopExecutionGuard(),
                 mock(AgentEventService.class)
@@ -80,7 +90,7 @@ class LangchainLinearWorkflowExecutorTest {
                 "   "   // 第二次：recovery 也返回空 → empty_todo_output_after_recovery
         );
         LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
-                LangchainTestFixtures.planner(),
+                LangchainTestFixtures.legacySingleStagePlanner(),
                 LangchainTestFixtures.todoNodeExecutor(),
                 noopExecutionGuard(),
                 mock(AgentEventService.class)
@@ -114,7 +124,7 @@ class LangchainLinearWorkflowExecutorTest {
                 "final answer"
         );
         LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
-                LangchainTestFixtures.planner(),
+                LangchainTestFixtures.legacySingleStagePlanner(),
                 LangchainTestFixtures.todoNodeExecutor(),
                 noopExecutionGuard(),
                 mock(AgentEventService.class)

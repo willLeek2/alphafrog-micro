@@ -27,7 +27,11 @@ class LangchainAiPlannerTest {
 
     @Test
     void plan_shouldSetStructuredOutputSpecWhileCallingModel() {
-        StructuredOutputCapturingChatModel model = new StructuredOutputCapturingChatModel("""
+        StructuredOutputCapturingChatModel model = new StructuredOutputCapturingChatModel(
+                """
+                {"overallPlan":{"mode":"LINEAR","detail":"顺序规划。"}}
+                """,
+                """
                 {
                   "analysis": "ok",
                   "items": [{"id":"todo_1","sequence":1,"description":"查数据"}],
@@ -41,21 +45,21 @@ class LangchainAiPlannerTest {
                 .model(model)
                 .build());
 
-        assertThat(model.structuredOutputSeen).isTrue();
+        assertThat(model.structuredOutputSeen).containsExactly(true, true);
         assertThat(AgentContext.getStructuredOutputSpec()).isNull();
     }
 
     @Test
-    void plan_shouldUseAiServiceStructuredOutputAndNormalizeTodoPlan() {
+    void legacySingleStage_shouldUseSharedStructuredValidation() {
         RecordingChatModel model = new RecordingChatModel("""
                 {
                   "analysis": "先查数据再总结。",
                   "items": [
                     {
-                      "id": "",
-                      "sequence": 0,
+                      "id": "todo_1",
+                      "sequence": 1,
                       "description": "查询沪深300近一年走势。",
-                      "dependsOn": ["", "todo_0"],
+                      "dependsOn": [],
                       "parallelizable": true
                     },
                     {
@@ -68,7 +72,8 @@ class LangchainAiPlannerTest {
                 }
                 """);
 
-        LangchainTodoPlan plan = planner.plan(LangchainPlanningRequest.builder()
+        LangchainTodoPlan plan = LangchainTestFixtures.legacySingleStagePlanner().plan(
+                LangchainPlanningRequest.builder()
                 .runId("run-1")
                 .userId("user-1")
                 .userGoal("分析沪深300近一年走势")
@@ -86,7 +91,7 @@ class LangchainAiPlannerTest {
         assertThat(plan.getItems().get(0).getId()).isEqualTo("todo_1");
         assertThat(plan.getItems().get(0).getSequence()).isEqualTo(1);
         assertThat(plan.getItems().get(0).getStatus()).isEqualTo(TodoStatus.PENDING);
-        assertThat(plan.getItems().get(0).getDependsOn()).containsExactly("todo_0");
+        assertThat(plan.getItems().get(0).getDependsOn()).isEmpty();
         assertThat(plan.getItems().get(0).isParallelizable()).isTrue();
         assertThat(model.lastRequest.toString()).contains("searchIndex");
         assertThat(model.lastRequest.toString()).contains("步骤数尽可能少，上限 5");
@@ -108,7 +113,7 @@ class LangchainAiPlannerTest {
                 }
                 """);
 
-        LangchainTodoPlan plan = twoStagePlanner().plan(LangchainPlanningRequest.builder()
+        LangchainTodoPlan plan = planner.plan(LangchainPlanningRequest.builder()
                 .runId("run-forced-linear")
                 .userGoal("分析数据")
                 .model(model)
@@ -142,7 +147,7 @@ class LangchainAiPlannerTest {
                 }
                 """);
 
-        LangchainTodoPlan plan = twoStagePlanner().plan(LangchainPlanningRequest.builder()
+        LangchainTodoPlan plan = planner.plan(LangchainPlanningRequest.builder()
                 .runId("run-linear-dag-shape")
                 .userGoal("分析数据")
                 .model(model)
@@ -167,29 +172,50 @@ class LangchainAiPlannerTest {
     }
 
     @Test
-    void plan_shouldFailOnEmptyItems() {
+    void legacySingleStage_shouldRetrySharedValidationAndFailOnEmptyItems() {
         RecordingChatModel model = new RecordingChatModel("""
                 {"analysis":"empty","items":[],"extractedEntities":[]}
                 """);
 
-        assertThatThrownBy(() -> planner.plan(LangchainPlanningRequest.builder()
+        assertThatThrownBy(() -> LangchainTestFixtures.legacySingleStagePlanner().plan(
+                LangchainPlanningRequest.builder()
                 .userGoal("hello")
                 .model(model)
                 .build()))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("todo_plan_empty");
+                .hasMessageContaining("planning_retry_exhausted")
+                .hasMessageContaining("todo_plan_items_empty");
+        assertThat(model.requestCount).isEqualTo(2);
     }
 
-    static class StructuredOutputCapturingChatModel extends RecordingChatModel {
-        private boolean structuredOutputSeen;
+    @Test
+    void maxAttemptsConfig_shouldControlTwoStageValidationRetries() {
+        AgentLlmProperties properties = LangchainTestFixtures.llmProperties();
+        properties.getRuntime().getPlanning().getStructuredOutput().setMaxAttempts(3);
+        SequentialRecordingChatModel model = new SequentialRecordingChatModel(
+                "{}", "{}", "{}"
+        );
 
-        StructuredOutputCapturingChatModel(String response) {
-            super(response);
+        assertThatThrownBy(() -> planner(properties).plan(LangchainPlanningRequest.builder()
+                .runId("run-retry-config")
+                .userGoal("分析数据")
+                .model(model)
+                .build()))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("planning_retry_exhausted");
+        assertThat(model.requests).hasSize(3);
+    }
+
+    static class StructuredOutputCapturingChatModel extends SequentialRecordingChatModel {
+        private final java.util.ArrayList<Boolean> structuredOutputSeen = new java.util.ArrayList<>();
+
+        StructuredOutputCapturingChatModel(String... responses) {
+            super(responses);
         }
 
         @Override
         public ChatResponse doChat(ChatRequest request) {
-            structuredOutputSeen = AgentContext.getStructuredOutputSpec() != null;
+            structuredOutputSeen.add(AgentContext.getStructuredOutputSpec() != null);
             return super.doChat(request);
         }
     }
@@ -197,6 +223,7 @@ class LangchainAiPlannerTest {
     static class RecordingChatModel implements ChatModel {
         private final String response;
         private ChatRequest lastRequest;
+        private int requestCount;
 
         RecordingChatModel(String response) {
             this.response = response;
@@ -205,6 +232,7 @@ class LangchainAiPlannerTest {
         @Override
         public ChatResponse doChat(ChatRequest request) {
             this.lastRequest = request;
+            this.requestCount++;
             return ChatResponse.builder()
                     .aiMessage(AiMessage.from(response))
                     .build();
@@ -229,10 +257,7 @@ class LangchainAiPlannerTest {
         }
     }
 
-    private static LangchainAiPlanner twoStagePlanner() {
-        AgentLlmProperties properties = LangchainTestFixtures.llmProperties();
-        properties.getRuntime().getPlanning().getStructuredOutput()
-                .setStrategyStageEnabled(true);
+    private static LangchainAiPlanner planner(AgentLlmProperties properties) {
         ObjectMapper objectMapper = new ObjectMapper();
         AgentLlmLocalConfigLoader loader = new AgentLlmLocalConfigLoader(objectMapper);
         return new LangchainAiPlanner(
