@@ -2,6 +2,7 @@ package world.willfrog.agent.tools.router;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
 import lombok.Builder;
@@ -27,6 +28,7 @@ import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.agent.tools.market.advanced.AdvancedSearchRequest;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
 import world.willfrog.agent.tools.rag.RagTools;
+import world.willfrog.agent.tools.registry.AgentToolRegistry;
 import world.willfrog.agent.tools.search.SearchTools;
 
 import java.util.ArrayList;
@@ -40,8 +42,11 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
 /**
- * 工具调用统一路由器，是 LLM 决定调用工具后，所有业务工具（除 spawnSubAgent/waitForSubAgent
- * 这两个子代理控制工具外）的执行入口。
+ * 工具调用统一路由器，是 LLM 决定调用工具后，所有业务工具的执行入口。
+ *
+ * <p>可路由工具名集合由 {@link AgentToolRegistry#declaredToolNames()} 派生，
+ * 本路由器只负责分发已在注册表中声明的工具。spawnSubAgent / waitForSubAgent
+ * 不在 D05 生产声明面内，将在 D06 同生同死补齐。</p>
  *
  * <p>面试里如果只看 agentLangchainService 的 {@code ToolRouterToolExecutor}，
  * 只能知道 LC4j 的 tool call 如何进入 Java；真正的业务语义在这里：是否允许调用、
@@ -69,8 +74,8 @@ import java.util.concurrent.TimeUnit;
  *   <li><b>能力校验</b>：在路由前检查 run 级能力开关（如 webSearch 未开启时拒绝 searchWeb）。</li>
  *   <li><b>预算检查</b>：调用 {@link AgentRunBudgetService#checkBeforeToolCall} 检查
  *       run 总额度/总耗时预算是否已用尽。</li>
- *   <li><b>结果缓存</b>：通过 {@link ToolResultCacheService} 对工具结果按用户或全局 scope
- *       做缓存复用，节省重复调用成本。</li>
+ *   <li><b>结果缓存</b>：通过 {@link ToolResultCacheService} 对工具结果按 user/run scope
+ *       做缓存复用（缺身份时 fail-closed 跳过共享缓存），节省重复调用成本。</li>
  *   <li><b>观测记录</b>：通过 {@link AgentObservabilityService#recordToolCall} 记录每一次
  *       工具调用 trace（参数、结果摘要、耗时、是否命中缓存等），供 run 观测视图和
  *       safe detail 懒加载使用。</li>
@@ -132,6 +137,9 @@ public class ToolRouter {
     private final StressTestProperties stressTestProperties;
     /** 按 toolName 缓存 Timer 实例，避免每次调用重新构建（线程安全） */
     private final ConcurrentHashMap<String, Timer> toolCallTimers = new ConcurrentHashMap<>();
+    // D07：权重限流拒绝的独立低基数计数（toolName × layer，layer 当前恒为 weight_limit），
+    // 与成功 toolCalls 累加器分离；LC4j 层拒绝发生在进入 Router 之前，不经本计数器
+    private final ConcurrentHashMap<String, Counter> throttleRejectionCounters = new ConcurrentHashMap<>();
 
     /**
      * Run 级预算服务 — 可选注入（@Autowired(required = false)），
@@ -240,13 +248,21 @@ public class ToolRouter {
             if (acquired.isEmpty()) {
                 int effectiveWeight = toolWeightedLimitService.previewEffectiveWeight(toolName, params);
                 String errorResult = weightLimitExceeded(toolName, effectiveWeight);
-                recordObservability(toolName, params, errorResult, 0, false, null);
-                getOrCreateToolCallTimer(nvl(toolName)).record(0, TimeUnit.MILLISECONDS);
+                /*
+                 * D07 口径：限流拒绝 ≠ 已执行工具调用。不调用 recordObservability——
+                 * 拒绝不得抬高 observability summary.toolCalls、不得消耗 maxToolCalls
+                 * 判定额度；权重层拒绝用独立的低基数 Micrometer 计数观测
+                 * （tool.call.throttle.rejected{toolName, layer=weight_limit}），
+                 * 与成功调用累加器完全分离。throttleRejected 标记随结果传给 executor，
+                 * 由其在 TOOL_CALL_FINISHED payload 写 creditsConsumed=0。
+                 */
+                getOrCreateThrottleRejectionCounter(nvl(toolName), "weight_limit").increment();
                 return ToolInvocationResult.builder()
                         .output(errorResult)
                         .success(false)
                         .durationMs(0)
                         .cacheMeta(null)
+                        .throttleRejected(true)
                         .build();
             }
             weightLease = acquired;
@@ -308,51 +324,18 @@ public class ToolRouter {
     /**
      * 返回路由器支持的全部工具名集合。
      *
-     * <p>用于上游（如 Planner 提示词生成、能力校验）枚举可路由的业务工具。
-     * 注意：spawnSubAgent / waitForSubAgent 属于子代理控制工具，
-     * 由 ReactTodoExecutor 直接处理而不经过本路由器。</p>
+     * <p>集合内容由 {@link AgentToolRegistry#declaredToolNames()} 派生，代表平台的
+     * 生产声明面，而不是当前 run 一定可用的工具列表。 capability gate 以注册表元数据
+     * 为准；实际执行仍由 executeDirect 中的能力校验决定。</p>
+     *
+     * <p>语义注意：searchWeb 还要受 AgentContext.isWebSearchEnabled 控制；
+     * getEtfAdj 还要受 adjFactorEnabled 控制；checkParallelLimits 是元工具，
+     * 返回当前配置下的批量上限。</p>
      *
      * @return 不可变的工具名集合
      */
     public Set<String> supportedTools() {
-        /*
-         * 这是平台工具白名单，而不是当前 run 一定可用的工具列表：
-         * - searchWeb 还要受 AgentContext.isWebSearchEnabled 控制；
-         * - getEtfAdj 还要受 adjFactorEnabled 控制；
-         * - checkParallelLimits 是元工具，返回当前配置下的批量上限。
-         *
-         * Planner 和 tool catalog 可以用它了解「系统理论上支持什么」，实际执行仍以
-         * executeDirect 中的能力校验为准。
-         */
-        return Set.of(
-                "getStockInfo",
-                "getStockDaily",
-                "getStockSwIndustryInfo",
-                "searchStock",
-                "searchFund",
-                "getIndexInfo",
-                "getIndexDaily",
-                "searchIndex",
-                "searchAssetInfo",
-                "checkParallelLimits",
-                "getTradingDaysSummary",
-                "isTradingDay",
-                "getExchangeAssetDaily",
-                "getOffExchangeAssetDaily",
-                "getEtfAdj",
-                "getListedAssetShareSize",
-                "getFinancialReport",
-                "ragSearch",
-                "loadDocument",
-                "searchWeb",
-                "executePython",
-                "resolveFinanceMethods",
-                "loadToolGuide",
-                "rereadToolResult",
-                "spawnSubAgent",
-                "waitForSubAgent",
-                "listMyData"
-        );
+        return AgentToolRegistry.declaredToolNames();
     }
 
     /**
@@ -364,6 +347,24 @@ public class ToolRouter {
         return toolCallTimers.computeIfAbsent(toolName, name ->
                 Timer.builder("tool.call")
                         .tag("toolName", name)
+                        .register(meterRegistry));
+    }
+
+    /**
+     * 获取或创建权重限流拒绝计数器（D07）。
+     *
+     * <p>拒绝计数与 {@code tool.call} 执行计时分离：被拒绝的调用没有执行，不计时、
+     * 不进成功累加器。tag 仅 toolName（注册表 25 名内）与 layer，基数有界。
+     * 本计数器只覆盖权重层，layer 当前恒为 {@code weight_limit}；LC4j 前台
+     * Semaphore 拒绝发生在进入本 Router 之前（ToolRouterToolExecutor 侧），其
+     * 低基数观测由 LangchainToolConcurrencyThrottle 自带 per-node 计数
+     * （timeoutCounts / waitMsTotal / waitCount，G7 冻结面）承担，不经本计数器。</p>
+     */
+    private Counter getOrCreateThrottleRejectionCounter(String toolName, String layer) {
+        return throttleRejectionCounters.computeIfAbsent(toolName + "|" + layer, key ->
+                Counter.builder("tool.call.throttle.rejected")
+                        .tag("toolName", toolName)
+                        .tag("layer", layer)
                         .register(meterRegistry));
     }
 
@@ -1035,17 +1036,23 @@ public class ToolRouter {
     }
 
     /**
-     * 解析工具结果缓存的 scope。
+     * 解析工具结果缓存的 scope（D07 Risks 3.3.2 口径）。
      *
-     * <p>默认按用户隔离（{@code user:<userId>}），无用户上下文时退化为 global，
-     * 后者意味着多个用户可能共享同一份结果（仅适用于完全无个人数据的工具）。</p>
+     * <p>优先按用户隔离（{@code user:<userId>}）；无用户上下文时按 run 隔离
+     * （{@code run:<runId>}），不同匿名 run 互不命中；二者皆无则返回空串，
+     * 由缓存层 fail-closed 跳过共享缓存读写，绝不退化为可跨租户串线的
+     * {@code global} 兜底。AgentContext 当前无 session 身份概念，run 即匿名隔离单元。</p>
      */
     private String resolveScope() {
         String userId = AgentContext.getUserId();
-        if (userId == null || userId.isBlank()) {
-            return "global";
+        if (userId != null && !userId.isBlank()) {
+            return "user:" + userId.trim();
         }
-        return "user:" + userId.trim();
+        String runId = AgentContext.getRunId();
+        if (runId != null && !runId.isBlank()) {
+            return "run:" + runId.trim();
+        }
+        return "";
     }
 
     /** 空安全：null 转为空字符串。 */
@@ -1102,5 +1109,12 @@ public class ToolRouter {
         private long durationMs;
         /** 缓存元数据（是否符合缓存条件、是否命中、来源、剩余 TTL 等） */
         private ToolResultCacheService.CacheMeta cacheMeta;
+        /**
+         * D07：是否因权重限流被拒绝而未真正执行（不消耗成功预算、工具 credit 为 0，
+         * executor 据此写 FINISHED 契约字段 throttle_layer=weight_limit）。LC4j 前台
+         * Semaphore 拒绝发生在进入 Router 之前，不经本标记传递，由 executor 直接标注
+         * throttle_layer=lc4j_semaphore。
+         */
+        private boolean throttleRejected;
     }
 }

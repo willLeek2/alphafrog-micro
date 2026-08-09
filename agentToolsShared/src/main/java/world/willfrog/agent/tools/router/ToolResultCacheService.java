@@ -18,6 +18,7 @@ import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.artifact.RawPayloadLocator;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 import world.willfrog.agent.tools.compaction.ToolOutputCompactionService;
+import world.willfrog.agent.tools.registry.AgentToolRegistry;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -41,12 +42,13 @@ public class ToolResultCacheService {
     private static final String SOURCE_REDIS = "redis_tool_cache";
     private static final String SOURCE_DATASET_REGISTRY = "dataset_registry";
     private static final String SOURCE_NONE = "none";
-    private static final Set<String> SEARCH_TOOLS = Set.of(
-            "searchStock", "searchFund", "searchIndex", "searchAssetInfo");
-    private static final Set<String> INFO_TOOLS = Set.of("getStockInfo", "getIndexInfo");
-    private static final Set<String> DATASET_TOOLS = Set.of(
-            "getStockDaily", "getIndexDaily",
-            "getExchangeAssetDaily", "getOffExchangeAssetDaily", "getListedAssetShareSize", "getEtfAdj");
+    // 以下集合由 AgentToolRegistry 的 cacheFamily 元数据派生，与注册表单一真相源对齐
+    private static final Set<String> SEARCH_TOOLS = AgentToolRegistry.namesInCacheFamily(
+            AgentToolRegistry.CacheFamily.SEARCH);
+    private static final Set<String> INFO_TOOLS = AgentToolRegistry.namesInCacheFamily(
+            AgentToolRegistry.CacheFamily.INFO);
+    private static final Set<String> DATASET_TOOLS = AgentToolRegistry.namesInCacheFamily(
+            AgentToolRegistry.CacheFamily.DATASET);
     private static final DateTimeFormatter DATE_FORMATTER = DateTimeFormatter.BASIC_ISO_DATE;
 
     private final StringRedisTemplate redisTemplate;
@@ -215,7 +217,12 @@ public class ToolResultCacheService {
 
     private CachePlan buildPlan(String toolName, Map<String, Object> params, String scope) {
         CacheMode mode = resolveMode(toolName);
-        if (mode == CacheMode.NONE) {
+        /*
+         * D07 fail-closed（Risks 3.3.2）：blank scope（无 userId 且无 runId）不得
+         * 落 global 共享键；REDIS 共享缓存此时跳过读写、强制回源。DATASET_REGISTRY
+         * 为内容寻址的系统级市场数据复用，不经 Redis scope 键，不受此限。
+         */
+        if (mode == CacheMode.NONE || (mode == CacheMode.REDIS && blank(scope))) {
             return CachePlan.builder()
                     .mode(CacheMode.NONE)
                     .key("")
@@ -273,7 +280,12 @@ public class ToolResultCacheService {
         Map<String, String> normalizedArgs = normalizeArgs(toolName, params);
         String argsJson = safeWrite(normalizedArgs);
         String argsHash = sha256(argsJson);
-        String resolvedScope = safeToken(blank(scope) ? "global" : scope);
+        /*
+         * D07：不再把 blank scope 默认写成 global。REDIS 模式的 blank scope 已在
+         * buildPlan 被拒（跳过共享缓存）；这里仅 DATASET_REGISTRY 的观测性键可能
+         * 带 blank scope，用不可与真实 scope（user:/run: 前缀）碰撞的明示标签。
+         */
+        String resolvedScope = safeToken(blank(scope) ? "no-shared-scope" : scope);
         String version = safeToken(resolveVersion());
         return CACHE_PREFIX + safeToken(toolName) + ":" + argsHash + ":" + resolvedScope + ":" + version;
     }

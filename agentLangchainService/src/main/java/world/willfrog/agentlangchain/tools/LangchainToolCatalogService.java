@@ -2,7 +2,6 @@ package world.willfrog.agentlangchain.tools;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.langchain4j.agent.tool.ToolSpecification;
-import dev.langchain4j.agent.tool.ToolSpecifications;
 import dev.langchain4j.model.chat.request.json.JsonAnyOfSchema;
 import dev.langchain4j.model.chat.request.json.JsonArraySchema;
 import dev.langchain4j.model.chat.request.json.JsonBooleanSchema;
@@ -16,9 +15,9 @@ import dev.langchain4j.model.chat.request.json.JsonStringSchema;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
-import world.willfrog.agent.tools.catalog.MarketDataAdvancedToolCatalog;
-import world.willfrog.agent.tools.catalog.ParallelLimitsToolCatalog;
+import world.willfrog.agent.tools.compaction.RereadToolHandler;
 import world.willfrog.agent.tools.dataset.ListMyDataTool;
+import world.willfrog.agent.tools.docs.LoadToolGuideTool;
 import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
 import world.willfrog.agent.tools.rag.RagTools;
@@ -40,22 +39,36 @@ public class LangchainToolCatalogService {
     private final SearchTools searchTools;
     private final PythonSandboxTools pythonSandboxTools;
     private final ListMyDataTool listMyDataTool;
+    private final LoadToolGuideTool loadToolGuideTool;
+    private final RereadToolHandler rereadToolHandler;
     private final ObjectMapper objectMapper;
 
+    /**
+     * 返回对外 API 可见的工具目录。
+     *
+     * <p>当前 Dubbo 入口 {@code ListAgentToolsRequest} 仅携带 user_id，没有 run 级能力开关上下文，
+     * 因此这里构建的是「文档全量视图」：webSearch、codeInterpreter 两个能力门控按开启处理。
+     * 实际运行时 LLM 看到的目录由 {@link ToolRouterToolProvider} 根据
+     * {@link ToolCatalogBuilder} 的能力门控实时过滤，可能与全量视图不同。</p>
+     *
+     * <p>本方法复用 {@link ToolCatalogBuilder} 的共享构建路径，保证 API 目录与运行时目录的
+     * canonical 覆盖、resolveFinanceMethods 兜底逻辑完全一致。</p>
+     */
     public List<AgentToolMessage> listToolMessages() {
-        Map<String, ToolSpecification> specs = new LinkedHashMap<>();
-        addSpecs(specs, marketDataTools);
-        addSpecs(specs, ragTools);
-        addSpecs(specs, searchTools);
-        addSpecs(specs, pythonSandboxTools);
-        addSpecs(specs, listMyDataTool);
-
-        List<ToolSpecification> merged = MarketDataAdvancedToolCatalog.mergeCanonical(
-                ParallelLimitsToolCatalog.mergeCanonical(new ArrayList<>(specs.values())));
-        merged = ToolCatalogBuilder.addResolveFinanceMethodsIfAbsent(merged);
+        List<ToolSpecification> specifications = ToolCatalogBuilder.buildSpecifications(
+                marketDataTools,
+                ragTools,
+                searchTools,
+                pythonSandboxTools,
+                listMyDataTool,
+                loadToolGuideTool,
+                rereadToolHandler,
+                true,
+                true
+        );
 
         List<AgentToolMessage> messages = new ArrayList<>();
-        for (ToolSpecification spec : merged) {
+        for (ToolSpecification spec : specifications) {
             messages.add(AgentToolMessage.newBuilder()
                     .setName(nvl(spec.name()))
                     .setDescription(nvl(spec.description()))
@@ -63,22 +76,6 @@ public class LangchainToolCatalogService {
                     .build());
         }
         return messages;
-    }
-
-    private void addSpecs(Map<String, ToolSpecification> specs, Object toolBean) {
-        if (toolBean == null) {
-            return;
-        }
-        try {
-            for (ToolSpecification spec : ToolSpecifications.toolSpecificationsFrom(toolBean)) {
-                if (spec == null || spec.name() == null || spec.name().isBlank()) {
-                    continue;
-                }
-                specs.putIfAbsent(spec.name(), spec);
-            }
-        } catch (Exception e) {
-            log.warn("Read langchain tool specification failed: bean={}", toolBean.getClass().getName(), e);
-        }
     }
 
     private String writeParameters(ToolSpecification spec) {

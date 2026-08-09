@@ -12,13 +12,17 @@ import world.willfrog.agent.tools.docs.LoadToolGuideTool;
 import world.willfrog.agent.tools.market.MarketDataTools;
 import world.willfrog.agent.tools.python.PythonSandboxTools;
 import world.willfrog.agent.tools.rag.RagTools;
+import world.willfrog.agent.tools.registry.AgentToolRegistry;
+import world.willfrog.agent.tools.registry.AgentToolRegistry.CapabilityGate;
 import world.willfrog.agent.tools.search.SearchTools;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.stream.Collectors;
 
 /**
- * Builds the run-scoped tool catalog, mirroring legacy {@code AgentRunExecutor} capability filtering.
+ * 构建 run 级工具目录。能力过滤统一取自 {@link AgentToolRegistry} 的门控元数据，
+ * 不再对特定 Bean 做硬编码条件拼接，保证运行时目录、对外 API 目录和注册表单一真相源一致。
  */
 final class ToolCatalogBuilder {
 
@@ -35,21 +39,40 @@ final class ToolCatalogBuilder {
                                                        boolean webSearchEnabled,
                                                        boolean codeInterpreterEnabled) {
         List<ToolSpecification> specifications = new ArrayList<>();
-        specifications.addAll(ToolSpecifications.toolSpecificationsFrom(marketDataTools));
-        specifications.addAll(ToolSpecifications.toolSpecificationsFrom(ragTools));
-        if (webSearchEnabled) {
-            specifications.addAll(ToolSpecifications.toolSpecificationsFrom(searchTools));
-        }
-        if (codeInterpreterEnabled) {
-            specifications.addAll(ToolSpecifications.toolSpecificationsFrom(pythonSandboxTools));
-        }
-        specifications.addAll(ToolSpecifications.toolSpecificationsFrom(listMyDataTool));
-        specifications.addAll(ToolSpecifications.toolSpecificationsFrom(loadToolGuideTool));
-        specifications.addAll(ToolSpecifications.toolSpecificationsFrom(rereadToolHandler));
+        addSpecsIfPresent(specifications, marketDataTools);
+        addSpecsIfPresent(specifications, ragTools);
+        addSpecsIfPresent(specifications, searchTools);
+        addSpecsIfPresent(specifications, pythonSandboxTools);
+        addSpecsIfPresent(specifications, listMyDataTool);
+        addSpecsIfPresent(specifications, loadToolGuideTool);
+        addSpecsIfPresent(specifications, rereadToolHandler);
+
+        List<ToolSpecification> filtered = specifications.stream()
+                .filter(spec -> isCapabilityEnabled(AgentToolRegistry.require(spec.name()).capabilityGate(),
+                        webSearchEnabled, codeInterpreterEnabled))
+                .collect(Collectors.toCollection(ArrayList::new));
 
         List<ToolSpecification> merged = MarketDataAdvancedToolCatalog.mergeCanonical(
-                ParallelLimitsToolCatalog.mergeCanonical(specifications));
-        return addResolveFinanceMethodsIfAbsent(merged);
+                ParallelLimitsToolCatalog.mergeCanonical(filtered));
+        List<ToolSpecification> result = addResolveFinanceMethodsIfAbsent(merged);
+        // fail-closed：任何最终进入目录的名字必须已在注册表声明。
+        result.forEach(spec -> AgentToolRegistry.require(spec.name()));
+        return result;
+    }
+
+    private static void addSpecsIfPresent(List<ToolSpecification> target, Object toolBean) {
+        if (toolBean != null) {
+            target.addAll(ToolSpecifications.toolSpecificationsFrom(toolBean));
+        }
+    }
+
+    private static boolean isCapabilityEnabled(CapabilityGate gate, boolean webSearchEnabled, boolean codeInterpreterEnabled) {
+        return switch (gate) {
+            case NONE -> true;
+            case WEB_SEARCH -> webSearchEnabled;
+            case CODE_INTERPRETER -> codeInterpreterEnabled;
+            case ADJ_FACTOR -> true;
+        };
     }
 
     static ToolSpecification resolveFinanceMethodsSpecification() {

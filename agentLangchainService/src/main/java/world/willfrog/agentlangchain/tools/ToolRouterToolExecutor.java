@@ -117,6 +117,10 @@ final class ToolRouterToolExecutor implements ToolExecutor {
             Instant start = Instant.now();
             String output = null;
             boolean success = true;
+            // D07：限流拒绝（本层 LC4j Semaphore 或下游权重限流）未真正执行，
+            // FINISHED 只作 UI 收尾，须带 creditsConsumed=0 与可区分标记
+            boolean throttleRejected = false;
+            String throttleLayer = null;
 
             // sandbox tool throttle: acquire permit before invoking
             ToolThrottleResult throttleResult = toolThrottle.tryAcquire(request.name());
@@ -126,6 +130,8 @@ final class ToolRouterToolExecutor implements ToolExecutor {
                 log.warn("Tool throttled: tool={} reason={}", request.name(), reason);
                 output = reason;
                 success = false;
+                throttleRejected = true;
+                throttleLayer = "lc4j_semaphore";
             } else {
                 try {
                     // invokeWithMeta 可能快速返回普通结果，也可能在超时阈值后抛出 pending 控制信号。
@@ -133,6 +139,10 @@ final class ToolRouterToolExecutor implements ToolExecutor {
                     // 只有真正终态结果才进入普通 output/success 收尾链路。
                     output = result.getOutput();
                     success = result.isSuccess();
+                    if (result.isThrottleRejected()) {
+                        throttleRejected = true;
+                        throttleLayer = "weight_limit";
+                    }
                 } catch (ExternalToolJobPendingException pending) {
                     // pending 表示 Sandbox 后台任务仍在运行，不是工具失败。
                     // 这里不能转成字符串 output，否则 LLM 会误以为工具已经完成。
@@ -151,8 +161,12 @@ final class ToolRouterToolExecutor implements ToolExecutor {
             }
 
             long durationMs = Duration.between(start, Instant.now()).toMillis();
-            toolThrottle.recordExecution(request.name(), durationMs);
-            emitToolCallFinished(toolCallId, request.name(), params, success, output, durationMs);
+            // D07：限流拒绝未执行任何工具体，不计执行耗时指标
+            if (!throttleRejected) {
+                toolThrottle.recordExecution(request.name(), durationMs);
+            }
+            emitToolCallFinished(toolCallId, request.name(), params, success, output, durationMs,
+                    throttleRejected, throttleLayer);
             acknowledgeSynchronousPythonCompletion(toolCallId, request.name());
 
             Map<String, String> datasetRefs = LangchainDatasetRefContext.snapshot();
@@ -320,6 +334,12 @@ final class ToolRouterToolExecutor implements ToolExecutor {
      */
     private void emitToolCallFinished(String toolCallId, String toolName, Map<String, Object> arguments,
                                       boolean success, String output, long durationMs) {
+        emitToolCallFinished(toolCallId, toolName, arguments, success, output, durationMs, false, null);
+    }
+
+    private void emitToolCallFinished(String toolCallId, String toolName, Map<String, Object> arguments,
+                                      boolean success, String output, long durationMs,
+                                      boolean throttleRejected, String throttleLayer) {
         String runId = AgentContext.getRunId();
         String userId = AgentContext.getUserId();
         if (runId == null || userId == null) {
@@ -333,6 +353,16 @@ final class ToolRouterToolExecutor implements ToolExecutor {
         payload.put("success", success);
         payload.put("result_preview", preview(output));
         payload.put("duration_ms", durationMs);
+        if (throttleRejected) {
+            /*
+             * D07 计费契约：限流拒绝未执行工具体，显式写 creditsConsumed=0 使
+             * AgentCreditService 不按默认工具单价扣费；rejected_by_throttle /
+             * throttle_layer 供前端与汇总侧区分「执行失败」与「限流拒绝」。
+             */
+            payload.put("creditsConsumed", 0);
+            payload.put("rejected_by_throttle", true);
+            payload.put("throttle_layer", throttleLayer);
+        }
         String phase = AgentContext.getPhase();
         if (phase != null && !phase.isBlank()) {
             payload.put("phase", phase);
