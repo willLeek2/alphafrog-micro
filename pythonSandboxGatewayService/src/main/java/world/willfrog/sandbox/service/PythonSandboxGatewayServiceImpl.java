@@ -579,16 +579,50 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
                 .build();
     }
 
+    /**
+     * 260809-26Q3-stage1-w3 D15 §4.3.1: encode taskId as a single path segment.
+     * Mirrors the getTaskByOperationId URL construction pattern (lines ~432-436)
+     * to prevent route injection / misrouting when taskId contains '/', '%',
+     * spaces, or non-ASCII characters. Returns URI for direct use with
+     * RestTemplate#getForEntity(URI, Class).
+     *
+     * Red line D15 §6.5: status AND result AND telemetry endpoints all use
+     * path-segment encoding — bare `sandboxUrl + "/tasks/" + taskId` is forbidden.
+     */
+    private URI buildTaskStatusEndpoint(String taskId) {
+        return UriComponentsBuilder.fromHttpUrl(sandboxUrl)
+                .pathSegment("tasks", taskId)
+                .build()
+                .encode()
+                .toUri();
+    }
+
+    /**
+     * 260809-26Q3-stage1-w3 D15 §4.3.1: encode taskId + "/result" suffix using
+     * path-segment encoding. Same rationale as {@link #buildTaskStatusEndpoint}:
+     * result endpoint is also a taskId-bearing path and must use the same
+     * encoding level as operationId / status lookups.
+     */
+    private URI buildTaskResultEndpoint(String taskId) {
+        return UriComponentsBuilder.fromHttpUrl(sandboxUrl)
+                .pathSegment("tasks", taskId, "result")
+                .build()
+                .encode()
+                .toUri();
+    }
+
     @Override
     public TaskStatusResponse getTaskStatus(GetTaskStatusRequest request) {
         long startMs = System.currentTimeMillis();
         log.info("sandbox.getTaskStatus: taskId={}", request.getTaskId());
+        // 260809-26Q3-stage1-w3 D15 §4.3.1: encode taskId as single path segment.
+        // Declared before try so catch blocks can reference the same encoded form
+        // for telemetry (D15 red line 6: status AND telemetry一致 encoded).
+        URI endpointUri = buildTaskStatusEndpoint(request.getTaskId());
+        String endpoint = endpointUri.toASCIIString();
         try {
-            // 260809-26Q3-stage1-w3 D15 (separate commit): taskId as single path segment.
-            // For D13 we keep the raw concat shape; only switch bean to shortHttpClient.
-            String endpoint = sandboxUrl + "/tasks/" + request.getTaskId();
             long httpStart = System.currentTimeMillis();
-            ResponseEntity<HttpTask> response = shortHttpClient.getForEntity(endpoint, HttpTask.class);
+            ResponseEntity<HttpTask> response = shortHttpClient.getForEntity(endpointUri, HttpTask.class);
             log.info("sandbox.http: endpoint=GET {}, httpStatus={}, durationMs={}",
                     endpoint, response.getStatusCode().value(), System.currentTimeMillis() - httpStart);
             // 260809-26Q3-stage1-w3 D13 MUST-FIX 5 (Cindy 91490076 #5): do NOT emit OK
@@ -638,7 +672,7 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
                     request.getTaskId(), System.currentTimeMillis() - startMs);
             // 260809-26Q3-stage1-w3 D13 MUST-FIX 5 (Cindy 91490076 #5): 404 is a typed
             // failure (task resource doesn't exist) — emit ERROR + frozen category, not OK.
-            emitSandboxHttp("GET", sandboxUrl + "/tasks/" + request.getTaskId(), 404,
+            emitSandboxHttp("GET", endpoint, 404,
                     System.currentTimeMillis() - startMs, "ERROR",
                     "GET_STATUS_SANDBOX_HTTP_ERROR_CATEGORY_NOT_FOUND");
             SandboxErrorDetail detail = SandboxErrorDetail.newBuilder()
@@ -678,7 +712,7 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
             log.warn("sandbox.getTaskStatus.transportFailure: taskId={}, category={}, totalDurationMs={}, error={}",
                     request.getTaskId(), detail.getCategory().name(),
                     System.currentTimeMillis() - startMs, text, e);
-            emitSandboxHttp("GET", sandboxUrl + "/tasks/" + request.getTaskId(), -1,
+            emitSandboxHttp("GET", endpoint, -1,
                     System.currentTimeMillis() - startMs, "ERROR",
                     "GET_STATUS_" + detail.getCategory());
             return TaskStatusResponse.newBuilder()
@@ -689,7 +723,7 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
         } catch (Exception e) {
             log.error("sandbox.getTaskStatus.failed: taskId={}, totalDurationMs={}, error={}",
                     request.getTaskId(), System.currentTimeMillis() - startMs, e.getMessage(), e);
-            emitSandboxHttp("GET", sandboxUrl + "/tasks/" + request.getTaskId(), -1,
+            emitSandboxHttp("GET", endpoint, -1,
                     System.currentTimeMillis() - startMs, "ERROR", "GET_STATUS_FAILED");
             String text = nonBlankOr(e, "getTaskStatus failed");
             SandboxErrorDetail detail = SandboxErrorDetail.newBuilder()
@@ -712,7 +746,8 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
         log.warn("sandbox.{}: taskId={}, httpStatus={}, category={}, totalDurationMs={}, error={}",
                 logKey, taskId, statusCode, category.name(),
                 System.currentTimeMillis() - startMs, text, e);
-        emitSandboxHttp("GET", sandboxUrl + "/tasks/" + taskId, statusCode,
+        // 260809-26Q3-stage1-w3 D15 §4.3.1: helper-side URL also encoded.
+        emitSandboxHttp("GET", buildTaskStatusEndpoint(taskId).toASCIIString(), statusCode,
                 System.currentTimeMillis() - startMs, "ERROR",
                 "GET_STATUS_" + category.name());
         SandboxErrorDetail detail = SandboxErrorDetail.newBuilder()
@@ -730,15 +765,19 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
     public TaskResultResponse getTaskResult(GetTaskResultRequest request) {
         long startMs = System.currentTimeMillis();
         log.info("sandbox.getTaskResult: taskId={}", request.getTaskId());
+        // 260809-26Q3-stage1-w3 D15 §4.3.1: encode taskId + "result" as path segments.
+        // Declared before try so all catch blocks reference the same encoded form for
+        // telemetry (D15 red line 6: status AND result AND telemetry一致 encoded).
+        URI endpointUri = buildTaskResultEndpoint(request.getTaskId());
+        String endpoint = endpointUri.toASCIIString();
         try {
             // Check status first to ensure we don't hit 409. Status lookup uses the short
             // HTTP client (handled inside getTaskStatus). The result fetch below uses the
             // long HTTP client since it can wait for downstream task completion.
             TaskStatusResponse status = getTaskStatus(GetTaskStatusRequest.newBuilder().setTaskId(request.getTaskId()).build());
             if (isResultBearingTerminal(status.getStatus())) {
-                String endpoint = sandboxUrl + "/tasks/" + request.getTaskId() + "/result";
                 long httpStart = System.currentTimeMillis();
-                ResponseEntity<HttpExecuteResult> response = longHttpClient.getForEntity(endpoint, HttpExecuteResult.class);
+                ResponseEntity<HttpExecuteResult> response = longHttpClient.getForEntity(endpointUri, HttpExecuteResult.class);
                 int downstreamStatus = response.getStatusCode().value();
                 long resultDurationMs = System.currentTimeMillis() - httpStart;
                 log.info("sandbox.http: endpoint=GET {}, httpStatus={}, durationMs={}",
@@ -877,7 +916,7 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
             log.warn("sandbox.getTaskResult.transportFailure: taskId={}, category={}, totalDurationMs={}, error={}",
                     request.getTaskId(), detail.getCategory().name(),
                     System.currentTimeMillis() - startMs, text, e);
-            emitSandboxHttp("GET", sandboxUrl + "/tasks/" + request.getTaskId() + "/result", -1,
+            emitSandboxHttp("GET", endpoint, -1,
                     System.currentTimeMillis() - startMs, "ERROR",
                     "GET_RESULT_" + detail.getCategory());
             return TaskResultResponse.newBuilder()
@@ -887,7 +926,7 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
         } catch (Exception e) {
             log.error("sandbox.getTaskResult.failed: taskId={}, totalDurationMs={}, error={}",
                     request.getTaskId(), System.currentTimeMillis() - startMs, e.getMessage(), e);
-            emitSandboxHttp("GET", sandboxUrl + "/tasks/" + request.getTaskId() + "/result", -1,
+            emitSandboxHttp("GET", endpoint, -1,
                     System.currentTimeMillis() - startMs, "ERROR", "GET_RESULT_FAILED");
             String text = nonBlankOr(e, "getTaskResult failed");
             SandboxErrorDetail detail = SandboxErrorDetail.newBuilder()
@@ -909,7 +948,8 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
         log.warn("sandbox.{}: taskId={}, httpStatus={}, category={}, totalDurationMs={}, error={}",
                 logKey, taskId, statusCode, category.name(),
                 System.currentTimeMillis() - startMs, text, e);
-        emitSandboxHttp("GET", sandboxUrl + "/tasks/" + taskId + "/result", statusCode,
+        // 260809-26Q3-stage1-w3 D15 §4.3.1: helper-side URL also encoded.
+        emitSandboxHttp("GET", buildTaskResultEndpoint(taskId).toASCIIString(), statusCode,
                 System.currentTimeMillis() - startMs, "ERROR",
                 "GET_RESULT_" + category.name());
         SandboxErrorDetail detail = SandboxErrorDetail.newBuilder()
