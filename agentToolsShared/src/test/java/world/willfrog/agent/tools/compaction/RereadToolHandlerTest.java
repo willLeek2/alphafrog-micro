@@ -17,6 +17,7 @@ import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
@@ -248,6 +249,24 @@ class RereadToolHandlerTest {
         assertEquals(Boolean.FALSE, response.get("ok"));
     }
 
+    @Test
+    void rereadShouldPropagateRejectionForContextlessRawRef() {
+        // 复审修复第②项反测：模型可调用的 reread 工具没有任何绕过归属检查的 fallback——
+        // 服务层对无归属上下文的 rawRef 抛 IllegalArgumentException 时，工具层原样抛出，
+        // 不吞掉异常、不降级返回内容。
+        AgentLlmLocalConfigLoader loader = mock(AgentLlmLocalConfigLoader.class);
+        AgentLlmProperties cfg = new AgentLlmProperties();
+        cfg.getTools().getResult().setMaxStringLength(2000);
+        cfg.getTools().getReread().setMaxLimit(4000);
+        when(loader.current()).thenReturn(Optional.of(cfg));
+
+        RereadToolHandler handler = new RereadToolHandler(new StubToolOutputRefService(), objectMapper, Optional.of(loader));
+
+        IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
+                () -> handler.reread("raw-ref-contextless", null, 0, 2000));
+        assertEquals("rawRef does not belong to current run/user", thrown.getMessage());
+    }
+
     private static class StubToolOutputRefService implements ToolOutputRefService {
         @Override
         public world.willfrog.agent.platform.artifact.PersistentArtifactRegistration registerRawOutput(
@@ -268,6 +287,10 @@ class RereadToolHandlerTest {
 
         @Override
         public ToolOutputReadResult read(String rawRef, int offset, int limit, String keyword) {
+            // 模拟主代码全部入口改严格之后：无归属上下文的 rawRef 一律被服务层拒绝。
+            if ("raw-ref-contextless".equals(rawRef)) {
+                throw new IllegalArgumentException("rawRef does not belong to current run/user");
+            }
             return ToolOutputReadResult.builder()
                     .content("content")
                     .hasMore(false)

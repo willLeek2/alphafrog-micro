@@ -147,20 +147,26 @@ class ToolOutputRefServiceImplTest {
     }
 
     @Test
-    void legacyReadShouldStayLenientForContextlessArtifactWhileExplicitRejects() {
-        // D22-5.1.3 MUST-FIX ③：legacy seam 宽容（历史无上下文制品仍可读），显式入口严格拒绝
+    void legacyReadAndLocatorShouldRejectContextlessMetaLikeExplicit() {
+        // 复审修复第②项：历史无上下文制品（meta 的 runId/userId 为空）现在经任何入口
+        // 都拒绝读取/定位（fail-closed）——旧的"legacy 入口宽容放行"合同作废。旧入口
+        // （从 AgentContext 补齐上下文）与显式入口一律走同一套严格归属校验。
         AgentContext.clear();
         PersistentArtifactRegistration registration =
                 service.registerRawOutput("tool-legacy", "旧输出", "legacy-payload");
+        String rawRef = registration.getArtifactId();
         AgentContext.setRunId("run-1");
         AgentContext.setUserId("user-1");
 
-        ToolOutputReadResult legacyRead = service.read(registration.getArtifactId(), 0, 100, null);
-        // setUp 的 reread maxLimit=8 把 limit 截顶到 8 字符，故期望前 8 字符而非全文。
-        assertEquals("legacy-p", legacyRead.getContent());
-
-        assertThrows(IllegalArgumentException.class, () -> service.read(
-                "run-1", "user-1", registration.getArtifactId(), 0, 100, null));
+        // ① 旧入口 read：meta 无 runId/userId，严格校验拒绝
+        assertThrows(IllegalArgumentException.class,
+                () -> service.read(rawRef, 0, 100, null));
+        // ② 旧入口 locatorFor：同样拒绝
+        assertThrows(IllegalArgumentException.class,
+                () -> service.locatorFor(rawRef));
+        // ③ 显式入口 read：即使调用方四值齐全，meta 侧为空也拒绝
+        assertThrows(IllegalArgumentException.class,
+                () -> service.read("run-1", "user-1", rawRef, 0, 100, null));
     }
 
     @Test
@@ -281,6 +287,69 @@ class ToolOutputRefServiceImplTest {
                 org.mockito.ArgumentMatchers.<Object>any(),
                 org.mockito.ArgumentMatchers.<Object>any());
 
+        // D22-5.1.3 第二轮 MUST-FIX ①④：registry 新增两段 Lua 脚本——幂等认领（5 ARGV）
+        // 与 run 列表加入（4 ARGV）。Mockito 5 varargs 按每元素匹配：ARGV 个数不同必须
+        // 独立 stub，语义与生产脚本逐条对齐（见 PersistentArtifactRegistryTest 同款 fake）。
+        // run 列表加入脚本（4 ARGV：cap、幽灵预算、meta 前缀、artifactId）：
+        // 幽灵清理 → SCARD 容量检查 → SADD，原子；满则返回 FULL 且不写。
+        org.mockito.Mockito.doAnswer(invocation -> {
+            Object[] args = invocation.getArguments();
+            @SuppressWarnings("unchecked")
+            java.util.List<String> keys = (java.util.List<String>) args[1];
+            int cap = Integer.parseInt(String.valueOf(args[2]));
+            int budget = Integer.parseInt(String.valueOf(args[3]));
+            String metaPrefix = String.valueOf(args[4]);
+            String artifactId = String.valueOf(args[5]);
+            Set<String> list = sets.get(keys.get(0));
+            purgeGhosts(list, metaPrefix, budget, store);
+            int size = list == null ? 0 : list.size();
+            if (size >= cap) {
+                return "FULL";
+            }
+            sets.computeIfAbsent(keys.get(0), k -> new LinkedHashSet<>()).add(artifactId);
+            return "ADDED";
+        }).when(template).execute(
+                org.mockito.ArgumentMatchers.<org.springframework.data.redis.core.script.RedisScript<Object>>any(),
+                org.mockito.ArgumentMatchers.<java.util.List<String>>any(),
+                org.mockito.ArgumentMatchers.<Object>any(),
+                org.mockito.ArgumentMatchers.<Object>any(),
+                org.mockito.ArgumentMatchers.<Object>any(),
+                org.mockito.ArgumentMatchers.<Object>any());
+
+        // 幂等认领脚本（5 ARGV：field、候选 ID、cap、幽灵预算、meta 前缀）：
+        // 已有赢家→EXISTS:赢家ID（不写）；幽灵清理→容量检查；未满→HSET 身份+SADD 列表→CLAIMED。
+        org.mockito.Mockito.doAnswer(invocation -> {
+            Object[] args = invocation.getArguments();
+            @SuppressWarnings("unchecked")
+            java.util.List<String> keys = (java.util.List<String>) args[1];
+            String field = String.valueOf(args[2]);
+            String artifactId = String.valueOf(args[3]);
+            int cap = Integer.parseInt(String.valueOf(args[4]));
+            int budget = Integer.parseInt(String.valueOf(args[5]));
+            String metaPrefix = String.valueOf(args[6]);
+            Map<String, String> identity = hashes.get(keys.get(0));
+            String existing = identity == null ? null : identity.get(field);
+            if (existing != null) {
+                return "EXISTS:" + existing;
+            }
+            Set<String> list = sets.get(keys.get(1));
+            purgeGhosts(list, metaPrefix, budget, store);
+            int size = list == null ? 0 : list.size();
+            if (size >= cap) {
+                return "FULL";
+            }
+            hashes.computeIfAbsent(keys.get(0), k -> new LinkedHashMap<>()).put(field, artifactId);
+            sets.computeIfAbsent(keys.get(1), k -> new LinkedHashSet<>()).add(artifactId);
+            return "CLAIMED";
+        }).when(template).execute(
+                org.mockito.ArgumentMatchers.<org.springframework.data.redis.core.script.RedisScript<Object>>any(),
+                org.mockito.ArgumentMatchers.<java.util.List<String>>any(),
+                org.mockito.ArgumentMatchers.<Object>any(),
+                org.mockito.ArgumentMatchers.<Object>any(),
+                org.mockito.ArgumentMatchers.<Object>any(),
+                org.mockito.ArgumentMatchers.<Object>any(),
+                org.mockito.ArgumentMatchers.<Object>any());
+
         SetOperations<String, String> setOps = mock(SetOperations.class);
         when(template.opsForSet()).thenReturn(setOps);
         when(setOps.add(org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.<String>any()))
@@ -303,6 +372,26 @@ class ToolOutputRefServiceImplTest {
                     return s != null && s.remove(invocation.getArgument(1).toString()) ? 1L : 0L;
                 });
         return template;
+    }
+
+    /**
+     * fake 侧幽灵清理：与生产 Lua 脚本同语义——至多检查 budget 个成员，
+     * meta 键（values 表）不存在者当场移除。
+     */
+    private static void purgeGhosts(Set<String> list, String metaPrefix, int budget, Map<String, String> values) {
+        if (list == null || list.isEmpty() || budget <= 0) {
+            return;
+        }
+        int checked = 0;
+        for (String member : Set.copyOf(list)) {
+            if (checked >= budget) {
+                break;
+            }
+            checked++;
+            if (!values.containsKey(metaPrefix + member)) {
+                list.remove(member);
+            }
+        }
     }
 
     private static class MapCursor implements Cursor<String> {

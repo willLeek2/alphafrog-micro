@@ -14,11 +14,11 @@ import java.util.stream.Collectors;
  * 工具输出 rawRef 服务实现。
  *
  * <p>D22-5.1.3：注册/定位/读取均有显式上下文 overload（runId/userId 显式传入，
- * 不依赖 {@link AgentContext} 线程态），归属走
- * {@link PersistentArtifactRegistry#matchesOwnerStrict}（四值非空且相等，fail-closed）；
- * 旧入口保留为有界兼容 delegate，从 AgentContext 补齐上下文，归属走
- * {@link PersistentArtifactRegistry#matchesOwnerLenient}（宽容语义，仅 legacy seam，
- * user API 不可达）。</p>
+ * 不依赖 {@link AgentContext} 线程态）；旧入口为有界 delegate，从 AgentContext
+ * 补齐上下文后转调同一套实现。所有读取/定位路径（无论旧入口还是显式入口）的
+ * 归属校验一律走 {@link PersistentArtifactRegistry#matchesOwnerStrict}——元数据的
+ * runId/userId 与调用方的 runId/userId 四个值都必须非空且两两相等，任一为空或
+ * 不相等即拒绝（fail-closed），不保留任何宽容 seam。</p>
  */
 @Service
 @RequiredArgsConstructor
@@ -50,29 +50,29 @@ public class ToolOutputRefServiceImpl implements ToolOutputRefService {
 
     @Override
     public RawPayloadLocator locatorFor(String rawRef) {
-        assertVisible(AgentContext.getRunId(), AgentContext.getUserId(), rawRef, false);
+        assertVisible(AgentContext.getRunId(), AgentContext.getUserId(), rawRef);
         return artifactRegistry.locatorFor(rawRef);
     }
 
     @Override
     public RawPayloadLocator locatorFor(String runId, String userId, String rawRef) {
-        assertVisible(runId, userId, rawRef, true);
+        assertVisible(runId, userId, rawRef);
         return artifactRegistry.locatorFor(rawRef);
     }
 
     @Override
     public ToolOutputReadResult read(String rawRef, int offset, int limit, String keyword) {
-        return doRead(AgentContext.getRunId(), AgentContext.getUserId(), rawRef, offset, limit, keyword, false);
+        return doRead(AgentContext.getRunId(), AgentContext.getUserId(), rawRef, offset, limit, keyword);
     }
 
     @Override
     public ToolOutputReadResult read(String runId, String userId, String rawRef, int offset, int limit, String keyword) {
-        return doRead(runId, userId, rawRef, offset, limit, keyword, true);
+        return doRead(runId, userId, rawRef, offset, limit, keyword);
     }
 
     private ToolOutputReadResult doRead(String runId, String userId, String rawRef,
-                                        int offset, int limit, String keyword, boolean strict) {
-        assertVisible(runId, userId, rawRef, strict);
+                                        int offset, int limit, String keyword) {
+        assertVisible(runId, userId, rawRef);
         String content = artifactRegistry.readContent(rawRef);
         String source = filterByKeyword(content, keyword);
         int total = source.length();
@@ -88,17 +88,16 @@ public class ToolOutputRefServiceImpl implements ToolOutputRefService {
     }
 
     /**
-     * D22 MUST-FIX ③：显式上下文入口（runId/userId 显式传入）走严格归属校验——四值
-     * 非空且相等，任一侧空值 fail-closed；legacy AgentContext 入口保留宽容语义兼容
-     * 历史无上下文制品，该 seam 对 user API 不可达。
+     * 归属校验（全部 read/locator 入口共用同一套严格语义）：无论调用来自旧入口
+     * （从 AgentContext 补齐上下文）还是显式入口（runId/userId 显式传入），一律走
+     * {@link PersistentArtifactRegistry#matchesOwnerStrict}——元数据的 runId/userId 与
+     * 调用方的 runId/userId 四个值都必须非空且两两相等，任一为空或不相等即抛
+     * {@link IllegalArgumentException}（fail-closed）；不再保留任何宽容 seam。
      */
-    private void assertVisible(String runId, String userId, String rawRef, boolean strict) {
+    private void assertVisible(String runId, String userId, String rawRef) {
         PersistentArtifactMeta meta = artifactRegistry.find(rawRef)
                 .orElseThrow(() -> new IllegalArgumentException("rawRef not found: " + rawRef));
-        boolean owner = strict
-                ? PersistentArtifactRegistry.matchesOwnerStrict(meta, runId, userId)
-                : PersistentArtifactRegistry.matchesOwnerLenient(meta, runId, userId);
-        if (!owner) {
+        if (!PersistentArtifactRegistry.matchesOwnerStrict(meta, runId, userId)) {
             throw new IllegalArgumentException("rawRef does not belong to current run/user");
         }
     }

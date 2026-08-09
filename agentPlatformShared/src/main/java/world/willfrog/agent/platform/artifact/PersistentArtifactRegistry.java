@@ -14,6 +14,7 @@ import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.storage.AgentStoragePaths;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
@@ -44,24 +45,31 @@ import java.util.concurrent.TimeUnit;
  *   <li>{@link #registerExplicit} / {@link #registerExternalExplicit}：非幂等，runId/userId
  *       显式传入，不依赖 {@link AgentContext} 线程态；每次调用生成新 artifactId。</li>
  *   <li>{@link #registerIdempotent} / {@link #registerExternalIdempotent}：幂等，稳定身份
- *       (runId + collision-free 编码的 type/logicalId[/path]) 经 Redis hash HSETNX 原子抢占；
+ *       (runId + collision-free 编码的 type/logicalId[/path]) 经单条 Redis Lua 脚本原子抢占；
  *       重复注册（重复 list、重启后 list、admin/normal 双 list）返回同一 artifactId，
  *       零重写、零重复项。</li>
  *   <li>{@link #listByRunId}：run 级有界索引（SET），只读，不生成新 ID。</li>
  * </ul>
  *
  * <h3>幂等抢占协议（单一赢家不变量）</h3>
- * <p>候选 file + meta 先备好，再经 HSETNX 原子 claim：赢家进入 run 索引（索引失败则
- * 回滚身份 + 候选并外抛）；输家回滚候选（meta + 文件 + 索引痕迹）后采纳赢家结果。
- * 因此身份字段恒指向 meta 已落盘的制品——若查无赢家 meta（清理竞态恰好删掉），
- * 输家用 Lua 值条件 HDEL 原子清陈旧字段后以新候选重试（有界
- * {@value #MAX_CLAIM_ATTEMPTS} 次，仍不结算则显式失败）。同一身份任意时刻至多
- * 一份 meta / 一个文件 / 一条 run 索引项。</p>
+ * <p>候选 file + meta 先备好，再经单条 Lua 脚本（{@link #ATOMIC_CLAIM_SCRIPT}）原子提交：
+ * 脚本内依次做「查身份是否已有赢家 → 有界清理幽灵成员 → SCARD 容量检查 → HSET 身份 +
+ * SADD run 列表」，五步要么全部生效、要么全部不生效。因此：输家只有在脚本返回
+ * EXISTS 时才采纳赢家，而 EXISTS 意味着赢家的身份项与列表项已在同一次脚本执行中
+ * 原子落盘——输家不可能在赢家列表提交前拿到 ID，也不可能拿到幽灵 ID；容量不足时
+ * 脚本返回 FULL 且不写任何索引，Java 侧回滚候选（meta + 文件）并外抛可见失败。
+ * 若查无赢家 meta（清理竞态恰好删掉），输家用 Lua 值条件 HDEL 原子清陈旧字段后
+ * 以新候选重试（有界 {@value #MAX_CLAIM_ATTEMPTS} 次，仍不结算则显式失败）。
+ * 同一身份任意时刻至多一份 meta / 一个文件 / 一条 run 索引项。</p>
  *
- * <h3>run 级有界索引（硬上限）</h3>
- * <p>先 SADD 再 SCARD：超限即 SREM 回滚自身加入并抛错——注册失败可见，禁止
- * silent meta-only 成功；已是成员（added==0）幂等成功。并发超限者可能一并被拒
- * （保守），但索引绝不超 cap。cap<=0 视为配置错误，fail-closed。</p>
+ * <h3>run 级有界索引（硬上限 + 幽灵自愈）</h3>
+ * <p>认领（幂等路径）与加入（非幂等路径）都是单条 Lua 脚本内的原子操作：脚本先做
+ * 有界幽灵清理（每次最多检查 {@value #GHOST_PURGE_BUDGET} 个成员，meta 键已不存在
+ * 的成员当场移除），再 SCARD 容量检查，未满才写入——不存在多命令
+ * SADD→SCARD→SREM 的检查-加入窗口，索引绝不超 cap。幽灵成员（meta 因 TTL 到期
+ * 消失而 SET 成员残留）不会永久占用容量配额，{@link #listByRunId} 读取时也会顺手
+ * 移除遇到的幽灵。注册失败可见，禁止 silent meta-only 成功。cap<=0 视为配置错误，
+ * fail-closed。</p>
  *
  * <h3>Redis 结构</h3>
  * <ul>
@@ -75,14 +83,18 @@ import java.util.concurrent.TimeUnit;
  * 循环内按前缀显式跳过（它们不是 meta JSON）。
  *
  * <h3>归属校验</h3>
- * <p>{@link #matchesOwnerStrict}（四值非空且相等，空值 fail-closed）用于 user API 与
- * 显式上下文路径；{@link #matchesOwnerLenient}（空侧跳过）仅保留给 legacy AgentContext
- * 入口，user API 不可达。</p>
+ * <p>所有用户/工具可达的读取与定位入口一律走 {@link #matchesOwnerStrict}（meta 与调用方
+ * 的 runId/userId 四值全部非空且相等，任一空值 fail-closed）——无论旧 AgentContext
+ * 入口还是显式上下文入口，不存在宽容 seam（matchesOwnerLenient 已删除）。</p>
  *
- * <h3>读取入口（TOCTOU 强化）</h3>
+ * <h3>读取入口（TOCTOU 强化 + 有界流式读取）</h3>
  * <p>{@link #readArtifactBytes} / {@link #readWithinArtifactRoot} / {@link #readContent} /
- * {@link #readLocator}：读取前 realpath containment 复检 + no-follow 打开 + 哈希校验
- * （内容制品）。注册后 symlink 换入 / 内容替换在读取时 fail-closed。</p>
+ * {@link #readLocator}：读取前 realpath containment 复检（中间目录的 symlink 也会被解析，
+ * 父目录被换成指向根外的链接同样拒绝）+ no-follow 打开 + 哈希校验（内容制品）。
+ * 大小上限由两层构成：Files.size 快速失败预检查 + 权威有界流式读取
+ * （{@link #readBounded}：至多读 maxBytes+1 字节，读到多余字节即拒）——即使文件在
+ * 预检查与实读之间增大，内存最多分配 maxBytes+1 字节。注册后 symlink 换入 /
+ * 内容替换在读取时 fail-closed。</p>
  *
  * <h3>D22-5.1.3：external 路径门槛</h3>
  * <p>external 制品只允许落在 D04 批准根内（artifactRoot 或 datasetRoot），
@@ -120,6 +132,70 @@ public class PersistentArtifactRegistry {
             "if redis.call('hget', KEYS[1], ARGV[1]) == ARGV[2] then "
                     + "return redis.call('hdel', KEYS[1], ARGV[1]) else return 0 end",
             Long.class);
+
+    /** 幽灵自愈的有界预算：每次索引写入前最多检查多少个"缺 meta 的 SET 成员"并移除。 */
+    private static final int GHOST_PURGE_BUDGET = 128;
+
+    /**
+     * 幂等认领原子提交脚本（Lua，单条脚本内要么全做、要么全不做）。
+     *
+     * <p>KEYS[1]=身份 hash 键，KEYS[2]=run 列表 SET 键；
+     * ARGV[1]=身份 field，ARGV[2]=候选 artifactId，ARGV[3]=容量上限，
+     * ARGV[4]=幽灵清理预算，ARGV[5]=meta 键前缀。步骤：
+     * ①身份已有赢家 → 直接返回 EXISTS:赢家ID（不写任何东西）；
+     * ②有界幽灵清理：最多检查 ARGV[4] 个 SET 成员，meta 键不存在者当场 SREM；
+     * ③SCARD 容量检查：已满 → 返回 FULL（不写任何东西）；
+     * ④HSET 身份 + SADD run 列表，返回 CLAIMED。</p>
+     *
+     * <p>由此得到的不变量：输家观察到 EXISTS 时，赢家的身份项与列表项必然已在同一次
+     * 脚本执行中原子落盘（输家不可能提前返回、不可能拿到幽灵 ID）；FULL 路径从不写
+     * 索引（容量失败的注册不留任何痕迹）。</p>
+     */
+    private static final RedisScript<String> ATOMIC_CLAIM_SCRIPT = new DefaultRedisScript<>(
+            "local existing = redis.call('hget', KEYS[1], ARGV[1]) "
+                    + "if existing then return 'EXISTS:' .. existing end "
+                    + "local budget = tonumber(ARGV[4]) "
+                    + "if budget > 0 then "
+                    + "  local members = redis.call('smembers', KEYS[2]) "
+                    + "  local checked = 0 "
+                    + "  for _, m in ipairs(members) do "
+                    + "    if checked >= budget then break end "
+                    + "    checked = checked + 1 "
+                    + "    if redis.call('exists', ARGV[5] .. m) == 0 then "
+                    + "      redis.call('srem', KEYS[2], m) "
+                    + "    end "
+                    + "  end "
+                    + "end "
+                    + "if redis.call('scard', KEYS[2]) >= tonumber(ARGV[3]) then return 'FULL' end "
+                    + "redis.call('hset', KEYS[1], ARGV[1], ARGV[2]) "
+                    + "redis.call('sadd', KEYS[2], ARGV[2]) "
+                    + "return 'CLAIMED'",
+            String.class);
+
+    /**
+     * 非幂等 run 列表加入脚本（Lua，原子：幽灵清理 → 容量检查 → SADD）。
+     *
+     * <p>KEYS[1]=run 列表 SET 键；ARGV[1]=容量上限，ARGV[2]=幽灵清理预算，
+     * ARGV[3]=meta 键前缀，ARGV[4]=artifactId。已满返回 FULL（不写），否则写入返回 ADDED。
+     * 非幂等路径的 artifactId 每次全新生成，不存在"已是成员"情形。</p>
+     */
+    private static final RedisScript<String> RUN_LIST_ADD_SCRIPT = new DefaultRedisScript<>(
+            "local budget = tonumber(ARGV[2]) "
+                    + "if budget > 0 then "
+                    + "  local members = redis.call('smembers', KEYS[1]) "
+                    + "  local checked = 0 "
+                    + "  for _, m in ipairs(members) do "
+                    + "    if checked >= budget then break end "
+                    + "    checked = checked + 1 "
+                    + "    if redis.call('exists', ARGV[3] .. m) == 0 then "
+                    + "      redis.call('srem', KEYS[1], m) "
+                    + "    end "
+                    + "  end "
+                    + "end "
+                    + "if redis.call('scard', KEYS[1]) >= tonumber(ARGV[1]) then return 'FULL' end "
+                    + "redis.call('sadd', KEYS[1], ARGV[4]) "
+                    + "return 'ADDED'",
+            String.class);
 
     private final StringRedisTemplate redisTemplate;
     private final ObjectMapper objectMapper;
@@ -203,9 +279,9 @@ public class PersistentArtifactRegistry {
     /**
      * 幂等注册（显式上下文）：稳定身份 (runId|type|logicalId)，重复注册返回同一 artifactId。
      *
-     * <p>经 Redis hash HSETNX 原子抢占身份字段：赢家写文件 + meta + 索引；输家直接返回赢家
-     * 结果，零重写。事件派生制品的 lazy external registration 用
-     * {@link #registerExternalIdempotent}。</p>
+     * <p>经单条 Lua 脚本（{@link #ATOMIC_CLAIM_SCRIPT}）原子抢占身份字段并同步写入
+     * run 列表：赢家写文件 + meta + 索引；输家直接返回赢家结果，零重写。事件派生制品的
+     * lazy external registration 用 {@link #registerExternalIdempotent}。</p>
      *
      * @param runId 不得为空（幂等身份的组成部分）
      * @return 注册结果（重复注册时 meta 为既有制品）
@@ -264,23 +340,37 @@ public class PersistentArtifactRegistry {
      *
      * <p>只读，不生成新 artifactId；重复调用结果一致（meta 缺失项自动滤掉）。
      * 返回按创建时间升序、artifactId 次序的列表。</p>
+     *
+     * <p>幽灵自愈（读取侧）：meta 键已不存在的 SET 成员（幽灵，典型成因是 meta 的
+     * Redis TTL 先到期）在遍历时顺手 SREM 移除，避免其永久占用容量配额、让 SCARD
+     * 虚高导致后续注册持续被误判超限。</p>
      */
     public List<PersistentArtifactMeta> listByRunId(String runId) {
         if (!hasText(runId)) {
             return List.of();
         }
-        Set<String> artifactIds = redisTemplate.opsForSet().members(runListKey(runId));
+        String listKey = runListKey(runId);
+        Set<String> artifactIds = redisTemplate.opsForSet().members(listKey);
         if (artifactIds == null || artifactIds.isEmpty()) {
             return List.of();
         }
         List<PersistentArtifactMeta> metas = new ArrayList<>(artifactIds.size());
         for (String artifactId : artifactIds) {
-            find(artifactId).ifPresent(meta -> {
-                // 防御陈旧索引项：meta 的 runId 必须与请求 run 一致
-                if (runId.equals(meta.getRunId())) {
-                    metas.add(meta);
+            Optional<PersistentArtifactMeta> meta = find(artifactId);
+            if (meta.isEmpty()) {
+                // 幽灵成员：meta 已过期/缺失，读取侧顺手移除（写入侧另有有界清理）
+                try {
+                    redisTemplate.opsForSet().remove(listKey, artifactId);
+                } catch (Exception e) {
+                    log.warn("Failed to remove ghost run index entry: runId={} artifactId={} err={}",
+                            runId, artifactId, e.getMessage());
                 }
-            });
+                continue;
+            }
+            // 防御陈旧索引项：meta 的 runId 必须与请求 run 一致
+            if (runId.equals(meta.get().getRunId())) {
+                metas.add(meta.get());
+            }
         }
         metas.sort(Comparator
                 .comparing((PersistentArtifactMeta m) -> m.getCreatedAtMillis() == null ? 0L : m.getCreatedAtMillis())
@@ -289,10 +379,12 @@ public class PersistentArtifactRegistry {
     }
 
     /**
-     * 严格归属校验：meta 与调用方的 runId/userId 四值全部非空且相等。
+     * 严格归属校验（唯一归属校验，不存在宽容 seam）：meta 与调用方的 runId/userId
+     * 四值全部非空且相等。
      *
-     * <p>user API（list/download）与显式上下文路径必须走这里——任一侧空值一律拒绝
-     * （fail-closed），不允许空值放行。</p>
+     * <p>所有用户/工具可达的读取与定位路径——无论旧 AgentContext 入口还是显式上下文
+     * 入口——一律走这里：任一侧空值一律拒绝（fail-closed），不允许空值放行。
+     * 历史无上下文制品（meta 缺 runId/userId）经任何入口都拒绝读取。</p>
      */
     public static boolean matchesOwnerStrict(PersistentArtifactMeta meta, String runId, String userId) {
         if (meta == null) {
@@ -302,21 +394,6 @@ public class PersistentArtifactRegistry {
                 && hasText(meta.getRunId()) && hasText(meta.getUserId())
                 && meta.getRunId().equals(runId)
                 && meta.getUserId().equals(userId);
-    }
-
-    /**
-     * 宽容归属校验（仅 legacy seam，user API 不可达）：meta 侧为空（早期无上下文注册）
-     * 不强校验该侧；调用方侧为空（内部系统调用）不校验该侧；两侧都有值则必须相等。
-     * 仅供 AgentContext 旧入口兼容历史制品。
-     */
-    public static boolean matchesOwnerLenient(PersistentArtifactMeta meta, String runId, String userId) {
-        if (meta == null) {
-            return false;
-        }
-        if (hasText(meta.getRunId()) && hasText(runId) && !meta.getRunId().equals(runId)) {
-            return false;
-        }
-        return !hasText(meta.getUserId()) || !hasText(userId) || meta.getUserId().equals(userId);
     }
 
     public Optional<PersistentArtifactMeta> find(String artifactId) {
@@ -551,39 +628,64 @@ public class PersistentArtifactRegistry {
     /**
      * 候选原子结算（候选 file + meta 必须已备好，{@value #MAX_CLAIM_ATTEMPTS} 次尝试协议）。
      *
-     * <p>HSETNX claim 成功 → 赢家：meta 已落盘，进入 run 索引；索引失败（cap 超限等）则
-     * 值条件清身份 + 回滚候选 + 原样外抛（注册失败可见）。claim 失败 → 输家：回滚候选
-     * （零残留）后采纳赢家；赢家 meta 已被清理（身份字段成为陈旧悬挂）时用值条件 HDEL
-     * 原子清除并返回 retry=true——身份恒指向 meta 已落盘制品，清陈旧不伤及任何活制品。</p>
+     * <p>整个「身份已有赢家？→ 幽灵清理 → 容量检查 → 写身份 + 写 run 列表」由单条
+     * Lua 脚本（{@link #ATOMIC_CLAIM_SCRIPT}）一次执行完成，不再有任何多命令窗口：</p>
+     * <ul>
+     *   <li>CLAIMED → 赢家：meta 已落盘，身份与列表项在同一次脚本执行中原子可见，
+     *       之后只做尽力而为的 TTL 延长（失败不阻断）。</li>
+     *   <li>FULL → 容量超限：脚本没写任何索引，直接抛可见失败，由调用方 catch 回滚
+     *       候选（meta + 文件），禁止 silent meta-only 成功。FULL 路径从不写身份，
+     *       因此容量失败的注册不会给任何后来者留下幽灵身份。</li>
+     *   <li>EXISTS:赢家ID → 输家：先回滚候选（零残留）再采纳。输家只有在脚本报告
+     *       EXISTS 时才可能拿到赢家 ID，而 EXISTS 意味着赢家的身份项与列表项已经
+     *       原子落盘——输家不可能在赢家列表提交前返回，也不可能返回幽灵 ID。
+     *       赢家 meta 已被清理（身份字段成为陈旧悬挂）时用值条件 HDEL 原子清除并
+     *       返回 retry=true——身份恒指向 meta 已落盘制品，清陈旧不伤及任何活制品。</li>
+     * </ul>
      */
     private CommitOutcome commitCandidate(String runId, String field, PersistentArtifactMeta candidateMeta,
                                           long ttlHours) {
         String candidateArtifactId = candidateMeta.getArtifactId();
-        String identityKey = runIdentityKey(runId);
-        Boolean claimed = redisTemplate.opsForHash().putIfAbsent(identityKey, field, candidateArtifactId);
-        if (Boolean.TRUE.equals(claimed)) {
-            try {
-                extendTtlIfNeeded(identityKey, ttlHours);
-                addToRunList(runId, candidateArtifactId, ttlHours);
-            } catch (RuntimeException e) {
-                removeIdentityIfMatches(runId, field, candidateArtifactId);
-                rollbackCandidate(candidateMeta);
-                throw e;
-            }
+        String result = executeAtomicClaim(runId, field, candidateArtifactId);
+        if ("CLAIMED".equals(result)) {
+            extendTtlIfNeeded(runIdentityKey(runId), ttlHours);
+            extendTtlIfNeeded(runListKey(runId), ttlHours);
             return new CommitOutcome(registration(candidateMeta), false);
         }
-        // 输家：候选零残留，然后采纳赢家
-        rollbackCandidate(candidateMeta);
-        Object winnerId = redisTemplate.opsForHash().get(identityKey, field);
-        if (winnerId != null) {
-            Optional<PersistentArtifactMeta> winnerMeta = find(winnerId.toString());
+        if ("FULL".equals(result)) {
+            // 容量超限：脚本未写任何索引；外抛后由调用方 catch 回滚候选（可见失败）
+            throw new IllegalStateException(
+                    "Run artifact index capacity exceeded: runId=" + runId + " cap=" + maxRunListEntries);
+        }
+        if (result != null && result.startsWith("EXISTS:")) {
+            // 输家：候选零残留，然后采纳赢家（赢家身份+列表已原子落盘，无幽灵窗口）
+            rollbackCandidate(candidateMeta);
+            String winnerId = result.substring("EXISTS:".length());
+            Optional<PersistentArtifactMeta> winnerMeta = find(winnerId);
             if (winnerMeta.isPresent()) {
                 return new CommitOutcome(registration(winnerMeta.get()), false);
             }
             // 赢家 meta 已被清理：原子值条件清陈旧字段，调用方以新候选重试
-            removeIdentityIfMatches(runId, field, winnerId.toString());
+            removeIdentityIfMatches(runId, field, winnerId);
+            return new CommitOutcome(null, true);
         }
-        return new CommitOutcome(null, true);
+        throw new IllegalStateException("Unexpected atomic claim result: runId=" + runId + " result=" + result);
+    }
+
+    /**
+     * 执行幂等认领原子脚本。cap<=0 视为配置错误，在进脚本前 fail-closed。
+     * 返回值：CLAIMED / FULL / EXISTS:{赢家ID}。
+     */
+    private String executeAtomicClaim(String runId, String field, String artifactId) {
+        if (maxRunListEntries <= 0) {
+            throw new IllegalStateException(
+                    "Run artifact index capacity must be positive: cap=" + maxRunListEntries);
+        }
+        String result = redisTemplate.execute(ATOMIC_CLAIM_SCRIPT,
+                List.of(runIdentityKey(runId), runListKey(runId)),
+                field, artifactId, String.valueOf(maxRunListEntries),
+                String.valueOf(GHOST_PURGE_BUDGET), META_PREFIX);
+        return result;
     }
 
     /**
@@ -625,9 +727,10 @@ public class PersistentArtifactRegistry {
     }
 
     /**
-     * run 级索引原子有界加入：先 SADD（added==0 → 已是成员，幂等成功），再 SCARD；
-     * 超限即 SREM 回滚自身加入并抛错——禁止 silent meta-only 成功。并发超限者可能
-     * 一并被拒（保守），但索引绝不超 cap。cap<=0 视为配置错误，fail-closed。
+     * run 级索引有界加入（非幂等路径）：单条 Lua 脚本（{@link #RUN_LIST_ADD_SCRIPT}）
+     * 内原子完成「幽灵清理 → SCARD 容量检查 → SADD」——超限时脚本不写任何东西并返回
+     * FULL，Java 侧抛可见失败，禁止 silent meta-only 成功；不存在旧实现
+     * SADD→SCARD→SREM 的多命令检查-加入窗口。cap<=0 视为配置错误，fail-closed。
      */
     private void addToRunList(String runId, String artifactId, long ttlHours) {
         if (!hasText(runId)) {
@@ -638,19 +741,10 @@ public class PersistentArtifactRegistry {
                     "Run artifact index capacity must be positive: cap=" + maxRunListEntries);
         }
         String listKey = runListKey(runId);
-        Long added = redisTemplate.opsForSet().add(listKey, artifactId);
-        if (added == null || added == 0L) {
-            extendTtlIfNeeded(listKey, ttlHours);
-            return;
-        }
-        Long size = redisTemplate.opsForSet().size(listKey);
-        if (size != null && size > maxRunListEntries) {
-            try {
-                redisTemplate.opsForSet().remove(listKey, artifactId);
-            } catch (Exception e) {
-                log.warn("Failed to roll back run index entry: runId={} artifactId={} err={}",
-                        runId, artifactId, e.getMessage());
-            }
+        String result = redisTemplate.execute(RUN_LIST_ADD_SCRIPT, List.of(listKey),
+                String.valueOf(maxRunListEntries), String.valueOf(GHOST_PURGE_BUDGET),
+                META_PREFIX, artifactId);
+        if (!"ADDED".equals(result)) {
             throw new IllegalStateException(
                     "Run artifact index capacity exceeded: runId=" + runId + " cap=" + maxRunListEntries);
         }
@@ -871,17 +965,20 @@ public class PersistentArtifactRegistry {
         return normalized;
     }
 
-    /** no-follow 打开原路径 + 大小上限 + 哈希校验（如有）；任何异常 fail-closed。 */
+    /**
+     * no-follow 打开原路径 + 大小上限（两层）+ 哈希校验（如有）；任何异常 fail-closed。
+     *
+     * <p>大小上限第一层是 Files.size 快速失败预检查；第二层（权威）是
+     * {@link #readBounded} 有界流式读取——即使文件在预检查与实读之间被增大
+     * （TOCTOU），也至多读 maxBytes+1 字节后拒绝，绝不会把任意大文件整个读入内存。</p>
+     */
     private byte[] readBytesChecked(Path openPath, String expectedHash, long maxBytes) {
         try {
             long size = Files.size(openPath);
             if (maxBytes > 0 && size > maxBytes) {
                 throw new IllegalStateException("artifact too large to download");
             }
-            byte[] bytes;
-            try (InputStream in = Files.newInputStream(openPath, LinkOption.NOFOLLOW_LINKS)) {
-                bytes = in.readAllBytes();
-            }
+            byte[] bytes = readBounded(openPath, maxBytes);
             if (hasText(expectedHash) && !expectedHash.equals(sha256(bytes))) {
                 throw new IllegalStateException("Raw payload hash mismatch");
             }
@@ -890,6 +987,34 @@ public class PersistentArtifactRegistry {
             throw e;
         } catch (IOException e) {
             throw new IllegalStateException("Failed to read artifact " + openPath, e);
+        }
+    }
+
+    /**
+     * 有界流式读取（大小上限的权威执行点）：从流中至多读 maxBytes+1 字节，一旦读到
+     * 第 maxBytes+1 个字节立即拒绝。因此无论预检查（Files.size）是否已被绕过——
+     * 例如文件在预检查之后、实读之前增大——内存中最多只分配 maxBytes+1 字节。
+     * maxBytes<=0 表示不限制。包私有 + static，便于单元测试直接钉住该合同。
+     */
+    static byte[] readBounded(Path path, long maxBytes) throws IOException {
+        try (InputStream in = Files.newInputStream(path, LinkOption.NOFOLLOW_LINKS)) {
+            if (maxBytes <= 0) {
+                return in.readAllBytes();
+            }
+            ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+            byte[] chunk = new byte[8192];
+            long remaining = maxBytes + 1;
+            long total = 0;
+            int read;
+            while (remaining > 0 && (read = in.read(chunk, 0, (int) Math.min(chunk.length, remaining))) > 0) {
+                buffer.write(chunk, 0, read);
+                total += read;
+                remaining -= read;
+            }
+            if (total > maxBytes) {
+                throw new IllegalStateException("artifact too large to download");
+            }
+            return buffer.toByteArray();
         }
     }
 

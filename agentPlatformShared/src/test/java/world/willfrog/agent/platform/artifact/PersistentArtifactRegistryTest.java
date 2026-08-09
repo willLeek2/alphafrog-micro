@@ -16,6 +16,7 @@ import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.storage.AgentStoragePaths;
 
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -52,7 +53,7 @@ import static org.mockito.Mockito.when;
  *   <li>③同一 logical artifact 多次 list 不重复 —— {@link #idempotentRegistrationShouldReuseSameArtifactId}
  *       / {@link #externalIdempotentShouldReuseSameIdAndNotCleanupPath}</li>
  *   <li>④跨 run/user 拒绝 —— {@link #crossRunAndUserOwnershipShouldBeRejected}
- *       （strict 四值非空且相等 / lenient 仅 legacy seam）</li>
+ *       （strict 四值非空且相等，宽容 seam 已删除）</li>
  *   <li>⑤双 legacy 冲突启动失败 —— 归 AgentStoragePathsTest（K3 slice），此处不重复</li>
  *   <li>⑥路径逃逸拒绝 —— {@link #externalPathEscapeShouldBeRejected}</li>
  *   <li>⑦过期清理同删 meta + run index —— {@link #cleanupShouldDeleteMetaFileAndIndexEntries}</li>
@@ -73,8 +74,24 @@ import static org.mockito.Mockito.when;
  *   <li>⑤身份 collision-free —— {@link #identityFieldEncodingShouldBeCollisionFree}</li>
  * </ul>
  *
+ * <h3>第二轮 MUST-FIX 反测（ecdfa704，四组）</h3>
+ * <ul>
+ *   <li>①认领单条 Lua 原子提交：FULL 不留幽灵身份 / 输家采纳不先于赢家列表提交 ——
+ *       {@link #winnerCapFailureShouldNotLeaveGhostIdentityOrIndexTrace}
+ *       / {@link #loserAdoptionShouldReturnWinnerAlreadyCommittedToRunList}</li>
+ *   <li>②宽容读取 seam 的用户可达性反测归 ToolOutputRefServiceImplTest 与
+ *       RereadToolHandlerTest（服务层与工具层合同），本文件不重复</li>
+ *   <li>③有界流式读取（权威大小上限）+ 父目录 symlink 换入 ——
+ *       {@link #boundedStreamShouldRejectOversizedContentEvenWithoutPreCheck}
+ *       / {@link #parentDirectorySymlinkSwapShouldBeRejectedOnRead}</li>
+ *   <li>④幽灵成员自愈：幽灵占满 cap 后注册恢复 + 读取侧移除幽灵 ——
+ *       {@link #ghostsFillingCapShouldBePurgedSoNewRegistrationRecovers}
+ *       / {@link #listByRunIdShouldFilterStaleIndexEntries}</li>
+ * </ul>
+ *
  * <p>Redis 用线程安全内存 fake（ConcurrentHashMap/concurrent set，支持真线程并发测试；
- * 值条件 HDEL 的 Lua execute() 以同步块模拟原子 CAS），文件落 @TempDir；不碰生产 DB/Redis/Nacos。</p>
+ * 三种 Lua 脚本——幂等认领、列表加入、值条件 HDEL——的 execute() 按 ARGV 个数分发，
+ * 共用一把锁模拟 Redis 单线程原子执行），文件落 @TempDir；不碰生产 DB/Redis/Nacos。</p>
  */
 class PersistentArtifactRegistryTest {
 
@@ -88,6 +105,11 @@ class PersistentArtifactRegistryTest {
     private Map<String, String> values;
     private Map<String, Map<String, String>> hashes;
     private Map<String, Set<String>> sets;
+    /**
+     * 模拟 Redis 单线程执行：所有 Lua 脚本 fake（认领/加入/值条件 HDEL）共用这一把锁，
+     * 保证任一脚本执行期间没有其他脚本插入——这是真实 Redis 原子性的最小等价模拟。
+     */
+    private final Object redisLock = new Object();
     private PersistentArtifactRegistry registry;
     private Path artifactRoot;
     private Path datasetRoot;
@@ -219,7 +241,7 @@ class PersistentArtifactRegistryTest {
                 " ", "user-1", "python_script", "s", "脚本", "v", 6));
     }
 
-    // ===== ④ 跨 run/user 拒绝（strict fail-closed / lenient 仅 legacy seam） =====
+    // ===== ④ 跨 run/user 拒绝（strict fail-closed，无宽容 seam） =====
 
     @Test
     void crossRunAndUserOwnershipShouldBeRejected() {
@@ -236,19 +258,15 @@ class PersistentArtifactRegistryTest {
         assertFalse(PersistentArtifactRegistry.matchesOwnerStrict(meta, "run-1", " "), "调用方 userId 空必须拒");
         assertFalse(PersistentArtifactRegistry.matchesOwnerStrict(null, "run-1", "user-1"));
 
-        // meta 侧缺上下文（历史制品）：严格 matcher fail-closed；宽容 matcher 按边放行
+        // meta 侧缺上下文（历史制品）：严格 matcher fail-closed——宽容 seam 已整体删除，
+        // 历史无上下文制品经任何入口都拒绝（第二轮 MUST-FIX ②）
         PersistentArtifactRegistration noContext = registry.registerExplicit(
                 null, null, "raw-ref", "t", "旧制品", "old", 6);
         PersistentArtifactMeta legacyMeta = registry.find(noContext.getArtifactId()).orElseThrow();
         assertFalse(PersistentArtifactRegistry.matchesOwnerStrict(legacyMeta, "run-any", "user-any"),
                 "meta 侧空值：严格校验必须拒");
-        assertTrue(PersistentArtifactRegistry.matchesOwnerLenient(legacyMeta, "run-any", "user-any"),
-                "meta 侧空值：宽容校验仅 legacy seam 可用");
-        // 宽容 matcher：两侧都有值时同样拒绝跨 run/user
-        assertTrue(PersistentArtifactRegistry.matchesOwnerLenient(meta, "run-1", "user-1"));
-        assertFalse(PersistentArtifactRegistry.matchesOwnerLenient(meta, "run-2", "user-1"));
-        assertFalse(PersistentArtifactRegistry.matchesOwnerLenient(meta, "run-1", "user-2"));
-        assertFalse(PersistentArtifactRegistry.matchesOwnerLenient(null, "run-1", "user-1"));
+        assertFalse(PersistentArtifactRegistry.matchesOwnerStrict(legacyMeta, null, null),
+                "meta 侧与调用方均空：严格校验必须拒");
 
         // run 索引隔离：别的 run 列不到 run-1 的制品
         assertTrue(registry.listByRunId("run-2").isEmpty());
@@ -569,6 +587,131 @@ class PersistentArtifactRegistryTest {
         assertEquals("two", registry.readContent(r2.getArtifactId()));
     }
 
+    // ===== 第二轮 MUST-FIX ①：认领单条 Lua 原子提交（FULL 不留幽灵、输家不先于赢家列表提交） =====
+
+    @Test
+    void winnerCapFailureShouldNotLeaveGhostIdentityOrIndexTrace() throws Exception {
+        ReflectionTestUtils.setField(registry, "maxRunListEntries", 1);
+        // run 已有一个合法成员，占满唯一容量位
+        PersistentArtifactRegistration first = registry.registerExplicit(
+                "run-full", "user-1", "raw-ref", "first", "1", "one", 6);
+
+        // 幂等认领撞 FULL：可见失败，且不写任何身份字段——旧实现"先 HSETNX 身份、
+        // 后 SADD 列表"在列表容量失败时会留下"身份在、列表没进"的幽灵半成品；
+        // 新实现 FULL 路径不写任何索引
+        IllegalStateException e = assertThrows(IllegalStateException.class,
+                () -> registry.registerIdempotent(
+                        "run-full", "user-1", "python_script", "blocked", "脚本", "x", 6));
+        assertTrue(e.getMessage().contains("capacity exceeded"), e.getMessage());
+
+        Map<String, String> identity = hashes.get(RUN_IDENTITY_PREFIX + "run-full");
+        assertTrue(identity == null || identity.isEmpty(),
+                "FULL 路径不得写身份字段，否则输家会拿到幽灵 ID");
+        assertEquals(Set.of(first.getArtifactId()), sets.get(RUN_LIST_PREFIX + "run-full"),
+                "索引只含合法成员");
+        long metaCount = values.keySet().stream()
+                .filter(k -> k.startsWith(META_PREFIX)
+                        && !k.startsWith(RUN_LIST_PREFIX) && !k.startsWith(RUN_IDENTITY_PREFIX))
+                .count();
+        assertEquals(1, metaCount, "被拒注册的 meta 必须回滚");
+        Path typeDir = artifactRoot.resolve("python_script");
+        if (Files.exists(typeDir)) {
+            try (var paths = Files.list(typeDir)) {
+                assertEquals(0, paths.count(), "被拒注册的候选文件必须回滚");
+            }
+        }
+        // 重试同样拿不到幽灵 ID：仍 FULL、仍可见失败
+        assertThrows(IllegalStateException.class,
+                () -> registry.registerIdempotent(
+                        "run-full", "user-1", "python_script", "blocked", "脚本", "x", 6));
+    }
+
+    @Test
+    void loserAdoptionShouldReturnWinnerAlreadyCommittedToRunList() throws Exception {
+        PersistentArtifactRegistration winner = registry.registerIdempotent(
+                "run-adopt", "user-1", "python_script", "shared", "脚本", "v1", 6);
+
+        // 同一身份第二次注册是确定性输家：采纳赢家结果
+        PersistentArtifactRegistration adopted = registry.registerIdempotent(
+                "run-adopt", "user-1", "python_script", "shared", "脚本", "v2", 6);
+        assertEquals(winner.getArtifactId(), adopted.getArtifactId());
+
+        // 关键不变量：输家拿到赢家 ID 的时刻，赢家必须已在 run 列表里——新 Lua 协议下
+        // EXISTS 只能在赢家身份+列表原子提交之后被观察到，"输家已返回而赢家列表未提交"
+        // 的交错不再存在
+        assertTrue(sets.get(RUN_LIST_PREFIX + "run-adopt").contains(winner.getArtifactId()),
+                "输家采纳不得先于赢家列表提交");
+        assertEquals(1, registry.listByRunId("run-adopt").size());
+        // 输家候选零残留：type 目录恰一文件
+        try (var paths = Files.list(artifactRoot.resolve("python_script"))) {
+            assertEquals(1, paths.count());
+        }
+    }
+
+    // ===== 第二轮 MUST-FIX ③：有界流式读取 + 父目录 symlink 换入 =====
+
+    @Test
+    void boundedStreamShouldRejectOversizedContentEvenWithoutPreCheck() throws Exception {
+        // 直接调用权威执行点 readBounded（绕过 Files.size 预检查）——等价于确定性复现
+        // "文件在预检查之后、实读之前增大"：无论预检查当时如何通过，流式读取至多读
+        // maxBytes+1 字节后拒绝，绝不把任意大文件整个分配进内存
+        Path file = Files.writeString(tempDir.resolve("bounded.bin"), "0123456789"); // 10 字节
+        assertEquals("0123456789",
+                new String(PersistentArtifactRegistry.readBounded(file, 10), StandardCharsets.UTF_8),
+                "恰好等于上限必须完整返回");
+        IllegalStateException e = assertThrows(IllegalStateException.class,
+                () -> PersistentArtifactRegistry.readBounded(file, 9));
+        assertTrue(e.getMessage().contains("too large"), e.getMessage());
+        // maxBytes<=0 = 不限制
+        assertEquals("0123456789",
+                new String(PersistentArtifactRegistry.readBounded(file, -1), StandardCharsets.UTF_8));
+    }
+
+    @Test
+    void parentDirectorySymlinkSwapShouldBeRejectedOnRead() throws Exception {
+        // TOCTOU 变体：不换最终文件，而是把它的父目录换成指向根外的 symlink——
+        // 规范化 containment 是纯字符串前缀比较，看不穿中间目录；这正是读取时
+        // realpath 复检要拦的情形（旧测试只覆盖最终文件被换）
+        PersistentArtifactRegistration registration = registry.registerExplicit(
+                "run-parent-swap", "user-1", "raw-ref", "t", "工具", "payload", 6);
+        PersistentArtifactMeta meta = registry.find(registration.getArtifactId()).orElseThrow();
+        Path file = Path.of(meta.getPath());
+        Path typeDir = file.getParent();
+
+        Path outsideDir = Files.createDirectories(tempDir.resolve("outside-dir"));
+        Files.writeString(outsideDir.resolve(file.getFileName().toString()), "evil");
+
+        Files.delete(file);
+        Files.delete(typeDir);
+        Files.createSymbolicLink(typeDir, outsideDir);
+
+        assertThrows(SecurityException.class,
+                () -> registry.readContent(registration.getArtifactId()));
+    }
+
+    // ===== 第二轮 MUST-FIX ④：幽灵成员自愈（过期幽灵不得永久占 cap） =====
+
+    @Test
+    void ghostsFillingCapShouldBePurgedSoNewRegistrationRecovers() {
+        ReflectionTestUtils.setField(registry, "maxRunListEntries", 2);
+        // 预置 2 个幽灵成员：在 SET 里但 meta 键已不存在（典型成因：meta 的 Redis TTL 到期）——
+        // 旧实现 SCARD 把它们计入容量，出现"可见列表没满却持续容量超限"的怪象
+        sets.computeIfAbsent(RUN_LIST_PREFIX + "run-ghost", k -> ConcurrentHashMap.newKeySet())
+                .addAll(List.of("raw-ref:ghost-1", "raw-ref:ghost-2"));
+
+        // cap"名义已满"（SCARD==2）但全是幽灵：幂等认领经有界幽灵清理后必须恢复
+        PersistentArtifactRegistration registration = registry.registerIdempotent(
+                "run-ghost", "user-1", "raw-ref", "alive", "alive", "payload", 6);
+
+        assertNotNull(registration.getArtifactId());
+        assertEquals(Set.of(registration.getArtifactId()), sets.get(RUN_LIST_PREFIX + "run-ghost"),
+                "幽灵必须被清掉，索引只含新赢家");
+        assertEquals(1, registry.listByRunId("run-ghost").size());
+        Map<String, String> identity = hashes.get(RUN_IDENTITY_PREFIX + "run-ghost");
+        assertEquals(registration.getArtifactId(),
+                identity.get(PersistentArtifactRegistry.identityField("raw-ref", "alive", null)));
+    }
+
     // ===== 有界索引 / 陈旧索引自愈 / cleanup 键跳过 =====
 
     @Test
@@ -580,6 +723,9 @@ class PersistentArtifactRegistryTest {
 
         List<PersistentArtifactMeta> listed = registry.listByRunId("run-stale");
         assertEquals(1, listed.size(), "陈旧索引项必须被滤掉而不是让 list 失败");
+        // 第二轮 MUST-FIX ④：读取侧不仅过滤，还顺手 SREM 幽灵成员
+        assertFalse(sets.get(RUN_LIST_PREFIX + "run-stale").contains("raw-ref:ghost"),
+                "幽灵成员必须在读取遍历时被移除");
     }
 
     @Test
@@ -604,7 +750,7 @@ class PersistentArtifactRegistryTest {
         assertTrue(values.containsKey(RUN_IDENTITY_PREFIX + "run-skip"));
     }
 
-    // ===== fake redis（线程安全；支持 Lua 值条件 HDEL） =====
+    // ===== fake redis（线程安全；支持认领/加入/值条件 HDEL 三种 Lua 脚本） =====
 
     @SuppressWarnings("unchecked")
     private StringRedisTemplate mockRedis() {
@@ -655,17 +801,23 @@ class PersistentArtifactRegistryTest {
                     Map<String, String> h = hashes.get(invocation.getArgument(0));
                     return h == null ? 0L : (h.remove(invocation.getArgument(1).toString()) != null ? 1L : 0L);
                 });
-        // MUST-FIX ①：registry 值条件 HDEL 走 Lua execute()，fake 以同步块模拟原子 CAS
+        // ===== Lua execute() fake（第二轮 MUST-FIX ①④）=====
+        // Mockito 5 对 varargs 按"每个匹配器对一个可变参数"匹配，三种脚本 ARGV 个数不同
+        // （认领 5 / 加入 4 / 值条件 HDEL 2），各需独立 stub。三个 stub 共用 redisLock，
+        // 模拟 Redis 单线程：任一脚本执行期间其他脚本不得插入（原子性最小等价模拟）。
+
+        // 值条件 HDEL（2 个 ARGV：field、期望值）：仅当 field 值仍等于期望 artifactId 时删除
         org.mockito.Mockito.doAnswer(invocation -> {
             Object[] args = invocation.getArguments();
+            @SuppressWarnings("unchecked")
             List<String> keys = (List<String>) args[1];
             String field = String.valueOf(args[2]);
             String expected = String.valueOf(args[3]);
-            Map<String, String> h = hashes.get(keys.get(0));
-            if (h == null) {
-                return 0L;
-            }
-            synchronized (h) {
+            synchronized (redisLock) {
+                Map<String, String> h = hashes.get(keys.get(0));
+                if (h == null) {
+                    return 0L;
+                }
                 if (expected.equals(h.get(field))) {
                     h.remove(field);
                     return 1L;
@@ -674,6 +826,69 @@ class PersistentArtifactRegistryTest {
             }
         }).when(template).execute(org.mockito.ArgumentMatchers.<RedisScript<Long>>any(),
                 org.mockito.ArgumentMatchers.<List<String>>any(),
+                org.mockito.ArgumentMatchers.<Object>any(),
+                org.mockito.ArgumentMatchers.<Object>any());
+
+        // run 列表加入脚本（4 个 ARGV：cap、幽灵预算、meta 前缀、artifactId）：
+        // 幽灵清理 → SCARD 容量检查 → SADD，原子；满则返回 FULL 且不写
+        org.mockito.Mockito.doAnswer(invocation -> {
+            Object[] args = invocation.getArguments();
+            @SuppressWarnings("unchecked")
+            List<String> keys = (List<String>) args[1];
+            int cap = Integer.parseInt(String.valueOf(args[2]));
+            int budget = Integer.parseInt(String.valueOf(args[3]));
+            String metaPrefix = String.valueOf(args[4]);
+            String artifactId = String.valueOf(args[5]);
+            synchronized (redisLock) {
+                Set<String> list = sets.get(keys.get(0));
+                purgeGhosts(list, metaPrefix, budget);
+                int size = list == null ? 0 : list.size();
+                if (size >= cap) {
+                    return "FULL";
+                }
+                sets.computeIfAbsent(keys.get(0), k -> ConcurrentHashMap.newKeySet()).add(artifactId);
+                return "ADDED";
+            }
+        }).when(template).execute(org.mockito.ArgumentMatchers.<RedisScript<Object>>any(),
+                org.mockito.ArgumentMatchers.<List<String>>any(),
+                org.mockito.ArgumentMatchers.<Object>any(),
+                org.mockito.ArgumentMatchers.<Object>any(),
+                org.mockito.ArgumentMatchers.<Object>any(),
+                org.mockito.ArgumentMatchers.<Object>any());
+
+        // 幂等认领脚本（5 个 ARGV：field、候选 ID、cap、幽灵预算、meta 前缀）：
+        // 已有赢家→EXISTS:赢家ID（不写）；幽灵清理→容量检查；未满→HSET 身份+SADD 列表→CLAIMED。
+        // EXISTS 与写入互斥且整段原子——输家拿到 EXISTS 时赢家身份+列表必然已落盘
+        org.mockito.Mockito.doAnswer(invocation -> {
+            Object[] args = invocation.getArguments();
+            @SuppressWarnings("unchecked")
+            List<String> keys = (List<String>) args[1];
+            String field = String.valueOf(args[2]);
+            String artifactId = String.valueOf(args[3]);
+            int cap = Integer.parseInt(String.valueOf(args[4]));
+            int budget = Integer.parseInt(String.valueOf(args[5]));
+            String metaPrefix = String.valueOf(args[6]);
+            synchronized (redisLock) {
+                Map<String, String> identity = hashes.get(keys.get(0));
+                String existing = identity == null ? null : identity.get(field);
+                if (existing != null) {
+                    return "EXISTS:" + existing;
+                }
+                Set<String> list = sets.get(keys.get(1));
+                purgeGhosts(list, metaPrefix, budget);
+                int size = list == null ? 0 : list.size();
+                if (size >= cap) {
+                    return "FULL";
+                }
+                hashes.computeIfAbsent(keys.get(0), k -> new ConcurrentHashMap<>()).put(field, artifactId);
+                sets.computeIfAbsent(keys.get(1), k -> ConcurrentHashMap.newKeySet()).add(artifactId);
+                return "CLAIMED";
+            }
+        }).when(template).execute(org.mockito.ArgumentMatchers.<RedisScript<Object>>any(),
+                org.mockito.ArgumentMatchers.<List<String>>any(),
+                org.mockito.ArgumentMatchers.<Object>any(),
+                org.mockito.ArgumentMatchers.<Object>any(),
+                org.mockito.ArgumentMatchers.<Object>any(),
                 org.mockito.ArgumentMatchers.<Object>any(),
                 org.mockito.ArgumentMatchers.<Object>any());
 
@@ -699,6 +914,26 @@ class PersistentArtifactRegistryTest {
                     return s != null && s.remove(invocation.getArgument(1).toString()) ? 1L : 0L;
                 });
         return template;
+    }
+
+    /**
+     * fake 侧幽灵清理：与生产 Lua 脚本同语义——至多检查 budget 个成员，
+     * meta 键（values 表）不存在者当场移除。调用方必须已持有 redisLock。
+     */
+    private void purgeGhosts(Set<String> list, String metaPrefix, int budget) {
+        if (list == null || list.isEmpty() || budget <= 0) {
+            return;
+        }
+        int checked = 0;
+        for (String member : new ArrayList<>(list)) {
+            if (checked >= budget) {
+                break;
+            }
+            checked++;
+            if (!values.containsKey(metaPrefix + member)) {
+                list.remove(member);
+            }
+        }
     }
 
     private static class SetCursor implements Cursor<String> {

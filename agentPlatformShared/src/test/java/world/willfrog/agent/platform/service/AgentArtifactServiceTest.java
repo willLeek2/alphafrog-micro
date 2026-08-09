@@ -510,6 +510,63 @@ class AgentArtifactServiceTest {
                 ArgumentMatchers.<List<String>>any(), ArgumentMatchers.<Object>any(),
                 ArgumentMatchers.<Object>any());
 
+        // D22-5.1.3 第二轮 MUST-FIX ①④：registry 新增两段 Lua 脚本——幂等认领（5 ARGV）
+        // 与 run 列表加入（4 ARGV）。Mockito 5 varargs 按每元素匹配：ARGV 个数不同必须
+        // 独立 stub，语义与生产脚本逐条对齐（见 PersistentArtifactRegistryTest 同款 fake）。
+        // run 列表加入脚本（4 ARGV：cap、幽灵预算、meta 前缀、artifactId）：
+        // 幽灵清理 → SCARD 容量检查 → SADD，原子；满则返回 FULL 且不写。
+        Mockito.doAnswer(invocation -> {
+            Object[] args = invocation.getArguments();
+            @SuppressWarnings("unchecked")
+            List<String> keys = (List<String>) args[1];
+            int cap = Integer.parseInt(String.valueOf(args[2]));
+            int budget = Integer.parseInt(String.valueOf(args[3]));
+            String metaPrefix = String.valueOf(args[4]);
+            String artifactId = String.valueOf(args[5]);
+            Set<String> list = sets.get(keys.get(0));
+            purgeGhosts(list, metaPrefix, budget);
+            int size = list == null ? 0 : list.size();
+            if (size >= cap) {
+                return "FULL";
+            }
+            sets.computeIfAbsent(keys.get(0), k -> new LinkedHashSet<>()).add(artifactId);
+            return "ADDED";
+        }).when(template).execute(ArgumentMatchers.<org.springframework.data.redis.core.script.RedisScript<Object>>any(),
+                ArgumentMatchers.<List<String>>any(),
+                ArgumentMatchers.<Object>any(), ArgumentMatchers.<Object>any(),
+                ArgumentMatchers.<Object>any(), ArgumentMatchers.<Object>any());
+
+        // 幂等认领脚本（5 ARGV：field、候选 ID、cap、幽灵预算、meta 前缀）：
+        // 已有赢家→EXISTS:赢家ID（不写）；幽灵清理→容量检查；未满→HSET 身份+SADD 列表→CLAIMED。
+        Mockito.doAnswer(invocation -> {
+            Object[] args = invocation.getArguments();
+            @SuppressWarnings("unchecked")
+            List<String> keys = (List<String>) args[1];
+            String field = String.valueOf(args[2]);
+            String artifactId = String.valueOf(args[3]);
+            int cap = Integer.parseInt(String.valueOf(args[4]));
+            int budget = Integer.parseInt(String.valueOf(args[5]));
+            String metaPrefix = String.valueOf(args[6]);
+            Map<String, String> identity = hashes.get(keys.get(0));
+            String existing = identity == null ? null : identity.get(field);
+            if (existing != null) {
+                return "EXISTS:" + existing;
+            }
+            Set<String> list = sets.get(keys.get(1));
+            purgeGhosts(list, metaPrefix, budget);
+            int size = list == null ? 0 : list.size();
+            if (size >= cap) {
+                return "FULL";
+            }
+            hashes.computeIfAbsent(keys.get(0), k -> new LinkedHashMap<>()).put(field, artifactId);
+            sets.computeIfAbsent(keys.get(1), k -> new LinkedHashSet<>()).add(artifactId);
+            return "CLAIMED";
+        }).when(template).execute(ArgumentMatchers.<org.springframework.data.redis.core.script.RedisScript<Object>>any(),
+                ArgumentMatchers.<List<String>>any(),
+                ArgumentMatchers.<Object>any(), ArgumentMatchers.<Object>any(),
+                ArgumentMatchers.<Object>any(), ArgumentMatchers.<Object>any(),
+                ArgumentMatchers.<Object>any());
+
         SetOperations<String, String> setOps = mock(SetOperations.class);
         when(template.opsForSet()).thenReturn(setOps);
         when(setOps.add(ArgumentMatchers.anyString(), ArgumentMatchers.<String>any()))
@@ -532,5 +589,25 @@ class AgentArtifactServiceTest {
                     return s != null && s.remove(invocation.getArgument(1).toString()) ? 1L : 0L;
                 });
         return template;
+    }
+
+    /**
+     * fake 侧幽灵清理：与生产 Lua 脚本同语义——至多检查 budget 个成员，
+     * meta 键（values 表）不存在者当场移除。
+     */
+    private void purgeGhosts(Set<String> list, String metaPrefix, int budget) {
+        if (list == null || list.isEmpty() || budget <= 0) {
+            return;
+        }
+        int checked = 0;
+        for (String member : Set.copyOf(list)) {
+            if (checked >= budget) {
+                break;
+            }
+            checked++;
+            if (!values.containsKey(metaPrefix + member)) {
+                list.remove(member);
+            }
+        }
     }
 }
