@@ -9,7 +9,7 @@ from .events import RunViewState, is_terminal
 
 
 class RecoveryFailure(RuntimeError):
-    """Recoverable stream repair failure surfaced to the caller with a stable code."""
+    """可恢复的流修复失败；以稳定错误码暴露给调用方。"""
 
     def __init__(self, code: str, message: str) -> None:
         super().__init__(f"{code}: {message}")
@@ -17,11 +17,10 @@ class RecoveryFailure(RuntimeError):
 
 
 class AgentStreamRecovery:
-    """D20 SSE/REST cursor and recovery state machine used by ``af_light_client``.
+    """D20 SSE/REST 游标与恢复状态机，供 ``af_light_client`` 使用。
 
-    The cursor is the greatest durable seq actually applied from a server-confirmed
-    frame/page. It is never advanced by ``+1`` arithmetic, status event counts, or
-    live-only ``durable=false`` events.
+    游标始终等于从服务端确认的 frame/page 中实际应用的最大持久化 seq。
+    禁止通过 ``+1`` 算术、status eventCount 或 live-only ``durable=false`` 事件推进。
     """
 
     LARGE_RUN_EVENT_LIMIT = 5000
@@ -131,7 +130,7 @@ class AgentStreamRecovery:
             self.sleep(self.RETRY_DELAYS_SECONDS[failures - 1])
 
     def recover_degraded_large_run_once(self) -> None:
-        """Temporarily switch to REST-only without applying the healthy-run 10/30s SLA."""
+        """临时切换到仅 REST 模式，并跳过健康 Run 的 10/30 秒 SLA。"""
         if not self.degraded_large_run:
             return
         self.repair(target_seq=self.latest_server_seq or None, enforce_sla=False)
@@ -179,7 +178,7 @@ class AgentStreamRecovery:
             self._apply_state("agent.event", item)
             applied_max = max(applied_max, seq)
         next_after_seq = self._to_int(page.get("nextAfterSeq"))
-        # nextAfterSeq is accepted only when this page also supplied applied durable data.
+        # 仅当本页也提供了已应用的持久化数据时，才接受 nextAfterSeq。
         if durable_items:
             applied_max = max(applied_max, next_after_seq)
         self.confirmed_cursor = applied_max
@@ -230,7 +229,7 @@ class AgentStreamRecovery:
             return durable
         if isinstance(durable, str) and durable.lower() in {"true", "false"}:
             return durable.lower() == "true"
-        # Legacy envelopes had no durable field; positive seq was always persisted.
+        # 旧版 envelope 没有 durable 字段；正 seq 始终表示已持久化事件。
         return cls._to_int(event.get("seq")) >= 1
 
     @staticmethod
