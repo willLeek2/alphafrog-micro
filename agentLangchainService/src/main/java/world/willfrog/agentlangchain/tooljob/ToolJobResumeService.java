@@ -131,7 +131,7 @@ public class ToolJobResumeService {
             return false;
         }
         // 上下文恢复成功后才向 bounded run scheduler 提交任务。
-        return doLaunch(runId, anchor, expectedVersion, claimedToken, claimedVersion);
+        return doLaunch(runId, anchor, expectedVersion, claimedToken, claimedVersion, "READY");
     }
 
     private void rollbackToReady(String runId, ToolJobAnchor anchor, long originalVersion,
@@ -156,6 +156,31 @@ public class ToolJobResumeService {
         }
     }
 
+    private void rollbackToAccepted(String runId, ToolJobAnchor anchor, long originalVersion,
+                                    String claimedToken, long claimedVersion) {
+        // ACCEPTED rollback: keep ACCEPTED state (handoff was already accepted);
+        // only clear the lease so another instance can retry.
+        long nextVersion = claimedVersion + 1;
+        anchor.setResumeState("ACCEPTED");
+        anchor.setResumeLeaseVersion(nextVersion);
+        anchor.setResumeClaimedAt(null);
+        anchor.setResumeLauncherOwnerId(null);
+        anchor.setResumeLauncherLeaseUntil(null);
+        anchor.setResultConsumed(true);
+        anchorService.casResumeState(runId, anchor, AgentRunStatus.EXECUTING,
+                "ACCEPTED", claimedToken, claimedVersion);
+    }
+
+    private void rollbackFromState(String runId, ToolJobAnchor anchor, long originalVersion,
+                                   String claimedToken, long claimedVersion,
+                                   String previousResumeState) {
+        if ("ACCEPTED".equals(previousResumeState)) {
+            rollbackToAccepted(runId, anchor, originalVersion, claimedToken, claimedVersion);
+        } else {
+            rollbackToReady(runId, anchor, originalVersion, claimedToken, claimedVersion);
+        }
+    }
+
     private boolean reenterLaunching(String runId, ToolJobAnchor anchor) {
         log.info("Re-entering LAUNCHING resume for run={}", runId);
         if (resumeLauncher == null) {
@@ -173,6 +198,7 @@ public class ToolJobResumeService {
             return false;
         }
 
+        String previousResumeState = anchor.getResumeState();
         String expectedToken = anchor.getResumeToken();
         long expectedVersion = anchor.getResumeLeaseVersion();
         String expectedOwnerId = anchor.getResumeLauncherOwnerId();
@@ -192,29 +218,37 @@ public class ToolJobResumeService {
 
         if (!restoreDatasetRegistry(runId, anchor)) {
             log.error("Dataset restore failed after LAUNCHING takeover for run={}, rolling back", runId);
-            rollbackToReady(runId, anchor, expectedVersion,
-                    anchor.getResumeToken(), anchor.getResumeLeaseVersion());
+            if ("ACCEPTED".equals(previousResumeState)) {
+                rollbackToAccepted(runId, anchor, expectedVersion,
+                        anchor.getResumeToken(), anchor.getResumeLeaseVersion());
+            } else {
+                rollbackToReady(runId, anchor, expectedVersion,
+                        anchor.getResumeToken(), anchor.getResumeLeaseVersion());
+            }
             return false;
         }
         return doLaunch(runId, anchor, expectedVersion,
-                anchor.getResumeToken(), anchor.getResumeLeaseVersion());
+                anchor.getResumeToken(), anchor.getResumeLeaseVersion(), previousResumeState);
     }
 
     private boolean doLaunch(String runId, ToolJobAnchor anchor,
-                              long originalVersion, String claimedToken, long claimedVersion) {
+                              long originalVersion, String claimedToken, long claimedVersion,
+                              String previousResumeState) {
         // 只从已 claim 的 durable anchor 构建 context，不读取旧 worker 内存。
         ToolJobResumeContext ctx = buildResumeContext(runId, anchor);
         try {
             // launch=false 表示任务未进入 bounded scheduler，必须回滚 claim。
             if (!resumeLauncher.launch(runId, ctx)) {
-                rollbackToReady(runId, anchor, originalVersion, claimedToken, claimedVersion);
+                rollbackFromState(runId, anchor, originalVersion, claimedToken, claimedVersion,
+                        previousResumeState);
                 return false;
             }
             // true 表示 launcher 已幂等接受，实际 worker 可能仍在队列等待。
             return true;
         } catch (Exception e) {
             log.error("Launch threw for run={}, rolling back", runId, e);
-            rollbackToReady(runId, anchor, originalVersion, claimedToken, claimedVersion);
+            rollbackFromState(runId, anchor, originalVersion, claimedToken, claimedVersion,
+                    previousResumeState);
             return false;
         }
     }

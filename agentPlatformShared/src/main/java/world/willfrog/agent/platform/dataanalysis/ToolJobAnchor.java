@@ -148,7 +148,6 @@ public class ToolJobAnchor {
     // terminalEventEmitted 防止终态事件重复写入事件流。
     private boolean terminalEventEmitted;
     // resultConsumed 表示工作流已接受终态结果，anchor 才可安全清理。
-    @JsonProperty("resultConsumed")
     private boolean resultConsumed;
 
     // nextPollAt 决定 Redis due 索引中的下一次检查时间。
@@ -396,6 +395,11 @@ public class ToolJobAnchor {
 
     @JsonIgnore
     public boolean isResultConsumed() { return "ACCEPTED".equals(resumeState) || "CONSUMED".equals(resumeState); }
+
+    @JsonProperty("resultConsumed")
+    public boolean getResultConsumed() { return "ACCEPTED".equals(resumeState) || "CONSUMED".equals(resumeState); }
+
+    @JsonProperty("resultConsumed")
     public void setResultConsumed(boolean resultConsumed) { this.resultConsumed = resultConsumed; }
 
     public Instant getNextPollAt() { return nextPollAt; }

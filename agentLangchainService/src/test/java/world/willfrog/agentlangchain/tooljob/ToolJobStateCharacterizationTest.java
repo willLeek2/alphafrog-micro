@@ -4,7 +4,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -82,11 +81,11 @@ class ToolJobStateCharacterizationTest {
         @Test
         @DisplayName("old LAUNCHING + resultConsumed=true → normalized to ACCEPTED")
         void legacyLaunchingWithResultConsumedTrue() {
-            anchor.setOperationId("run-1:tc-1:1");
-            anchor.setResumeState("LAUNCHING");
-            anchor.setResultConsumed(true);
-
-            String json = anchor.toJson();
+            // Manually craft legacy JSON: old code wrote LAUNCHING with independent
+            // resultConsumed=true. The new serialization derives resultConsumed from
+            // state, so we must construct the legacy shape directly.
+            String json = "{\"schemaVersion\":1,\"operationId\":\"run-1:tc-1:1\","
+                    + "\"resumeState\":\"LAUNCHING\",\"resultConsumed\":true}";
             ToolJobAnchor restored = ToolJobAnchor.fromJson(json);
 
             // Normalized: resumeState upgraded from LAUNCHING to ACCEPTED
@@ -97,11 +96,9 @@ class ToolJobStateCharacterizationTest {
         @Test
         @DisplayName("old null resumeState + resultConsumed=true → normalized to ACCEPTED")
         void legacyNullResumeStateWithResultConsumedTrue() {
-            anchor.setOperationId("run-1:tc-1:1");
-            // resumeState is null (very old data)
-            anchor.setResultConsumed(true);
-
-            String json = anchor.toJson();
+            // Very old data: resultConsumed=true but no resumeState field at all
+            String json = "{\"schemaVersion\":1,\"operationId\":\"run-1:tc-1:1\","
+                    + "\"resultConsumed\":true}";
             ToolJobAnchor restored = ToolJobAnchor.fromJson(json);
 
             assertThat(restored.getResumeState()).isEqualTo("ACCEPTED");
@@ -111,11 +108,9 @@ class ToolJobStateCharacterizationTest {
         @Test
         @DisplayName("contradictory READY + resultConsumed=true → fail-closed")
         void contradictoryReadyAndConsumedFailsClosed() {
-            anchor.setOperationId("run-1:tc-1:1");
-            anchor.setResumeState("READY");
-            anchor.setResultConsumed(true);
-
-            String json = anchor.toJson();
+            // Contradictory: READY cannot have a consumed result
+            String json = "{\"schemaVersion\":1,\"operationId\":\"run-1:tc-1:1\","
+                    + "\"resumeState\":\"READY\",\"resultConsumed\":true}";
 
             assertThatThrownBy(() -> ToolJobAnchor.fromJson(json))
                     .isInstanceOf(IllegalArgumentException.class)
@@ -199,41 +194,140 @@ class ToolJobStateCharacterizationTest {
     }
 
     // ------------------------------------------------------------------
-    // Target migration seam (Step 3: activate after production changes)
+    // Target migration seam: ACCEPTED state characterization
     // ------------------------------------------------------------------
 
-    @Disabled("D12 Step 3: activate after ACCEPTED state passes full service-level tests")
     @Nested
-    @DisplayName("Target migration seam: ACCEPTED state in production services")
+    @DisplayName("Target migration seam: ACCEPTED state survives roundtrips")
     class TargetMigrationSeam {
 
         @Test
-        @DisplayName("[contract] ACCEPTED takeover keeps ACCEPTED state, not rolled back to LAUNCHING")
-        void acceptedTakeoverKeepsAcceptedState() {
-            // Contract: tryResume for expired ACCEPTED must keep resumeState=ACCEPTED
-            // after takeover, so ToolJobResumeContext.resultConsumed derives to true.
-            // Tested via ToolJobResumeServiceTest after ACCEPTED is wired.
-        }
-
-        @Test
-        @DisplayName("[contract] LAUNCHING without handoff is not consumed")
-        void launchingWithoutHandoffNotConsumed() {
-            anchor.setResumeState("LAUNCHING");
-            assertThat(anchor.isResultConsumed()).isFalse();
-        }
-
-        @Test
-        @DisplayName("[contract] ACCEPTED is consumed (handoff was accepted)")
-        void acceptedIsConsumedContract() {
+        @DisplayName("ACCEPTED anchor survives JSON roundtrip with resultConsumed=true")
+        void acceptedAnchorSurvivesRoundtrip() {
+            anchor.setOperationId("run-1:tc-1:1");
             anchor.setResumeState("ACCEPTED");
-            assertThat(anchor.isResultConsumed()).isTrue();
+            anchor.setResumeToken("token-v1");
+            anchor.setResumeLeaseVersion(5L);
+
+            ToolJobAnchor restored = ToolJobAnchor.fromJson(anchor.toJson());
+
+            assertThat(restored.getResumeState()).isEqualTo("ACCEPTED");
+            assertThat(restored.isResultConsumed()).isTrue();
         }
 
         @Test
-        @DisplayName("[contract] markHandoffAccepted CAS advances LAUNCHING → ACCEPTED")
-        void markHandoffAcceptedAdvancesToAccepted() {
-            // Contract: markHandoffAccepted must set resumeState=ACCEPTED
-            // in the same CAS, not just set resultConsumed=true.
+        @DisplayName("JSON output of ACCEPTED has resultConsumed=true derived from state")
+        void acceptedJsonHasResultConsumedTrue() {
+            anchor.setOperationId("run-1:tc-1:1");
+            anchor.setResumeState("ACCEPTED");
+
+            String json = anchor.toJson();
+
+            assertThat(json).contains("\"resultConsumed\":true");
+            assertThat(json).contains("\"resumeState\":\"ACCEPTED\"");
+        }
+
+        @Test
+        @DisplayName("JSON output of READY has resultConsumed=false derived from state")
+        void readyJsonHasResultConsumedFalse() {
+            anchor.setOperationId("run-1:tc-1:1");
+            anchor.setResumeState("READY");
+
+            String json = anchor.toJson();
+
+            assertThat(json).contains("\"resultConsumed\":false");
+        }
+
+        @Test
+        @DisplayName("markHandoffAccepted transition: LAUNCHING → ACCEPTED preserves identity fields")
+        void acceptedTransitionPreservesIdentity() {
+            anchor.setOperationId("run-1:tc-1:1");
+            anchor.setResumeState("LAUNCHING");
+            anchor.setResumeToken("token-v1");
+            anchor.setResumeLeaseVersion(5L);
+            anchor.setResumeLauncherOwnerId("owner-a");
+            anchor.setResultConsumed(true);
+
+            // Simulate markHandoffAccepted: advance to ACCEPTED
+            anchor.setResumeState("ACCEPTED");
+
+            ToolJobAnchor restored = ToolJobAnchor.fromJson(anchor.toJson());
+            assertThat(restored.getResumeState()).isEqualTo("ACCEPTED");
+            assertThat(restored.getResumeToken()).isEqualTo("token-v1");
+            assertThat(restored.getResumeLeaseVersion()).isEqualTo(5L);
+            assertThat(restored.isResultConsumed()).isTrue();
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Production XML seam: ACCEPTED in AgentRunMapper.xml
+    // ------------------------------------------------------------------
+
+    @Nested
+    @DisplayName("Production XML seam: AgentRunMapper.xml ACCEPTED predicates")
+    class ProductionXmlSeam {
+
+        private String xml;
+
+        @BeforeEach
+        void loadMapperXml() throws Exception {
+            java.io.InputStream is = getClass().getClassLoader()
+                    .getResourceAsStream("mapper/AgentRunMapper.xml");
+            assertThat(is).as("AgentRunMapper.xml must be on classpath").isNotNull();
+            xml = new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+        }
+
+        @Test
+        @DisplayName("5 SQL locations accept ACCEPTED state")
+        void acceptedInFivePredicates() {
+            // Count IN ('LAUNCHING', 'ACCEPTED') occurrences in SQL predicates.
+            // Exactly 5: takeoverExpiredResumeLauncher, heartbeatResumeLauncher,
+            // updateResumedTerminal, clearAcceptedResumeHandoff, listResumeReadyAnchors.
+            int count = countOccurrences(xml, "resumeState}' IN ('LAUNCHING', 'ACCEPTED')");
+            assertThat(count).as("5 SQL predicates must accept ACCEPTED").isEqualTo(5);
+        }
+
+        @Test
+        @DisplayName("acceptResumeHandoff stays LAUNCHING-only")
+        void acceptHandoffStaysLaunchingOnly() {
+            // acceptResumeHandoff transitions LAUNCHING→ACCEPTED; it must NOT
+            // already accept ACCEPTED as a precondition.
+            String acceptBlock = extractBetween(xml,
+                    "<update id=\"acceptResumeHandoff\">", "</update>");
+            assertThat(acceptBlock)
+                    .as("acceptResumeHandoff must check LAUNCHING only")
+                    .contains("resumeState}' = 'LAUNCHING'")
+                    .doesNotContain("IN ('LAUNCHING', 'ACCEPTED')");
+        }
+
+        @Test
+        @DisplayName("claimResumeLauncher stays READY-only")
+        void claimResumeLauncherStaysReadyOnly() {
+            String claimBlock = extractBetween(xml,
+                    "<update id=\"claimResumeLauncher\">", "</update>");
+            assertThat(claimBlock)
+                    .as("claimResumeLauncher must check READY only")
+                    .contains("resumeState}' = 'READY'");
+        }
+
+        // ---- helpers ----
+
+        private static int countOccurrences(String haystack, String needle) {
+            int count = 0;
+            int idx = 0;
+            while ((idx = haystack.indexOf(needle, idx)) != -1) {
+                count++;
+                idx += needle.length();
+            }
+            return count;
+        }
+
+        private static String extractBetween(String source, String start, String end) {
+            int s = source.indexOf(start);
+            if (s == -1) return "";
+            int e = source.indexOf(end, s + start.length());
+            if (e == -1) return "";
+            return source.substring(s, e + end.length());
         }
     }
 }

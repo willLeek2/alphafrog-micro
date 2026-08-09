@@ -777,7 +777,7 @@
                 )
                 OR (
                     status = 'EXECUTING'
-                    AND tool_job_anchor_json #>> '{resumeState}' = 'LAUNCHING'
+                    AND tool_job_anchor_json #>> '{resumeState}' IN ('LAUNCHING', 'ACCEPTED')
                     AND COALESCE((tool_job_anchor_json #>> '{resultConsumed}')::boolean, false)
                     AND (
                         tool_job_anchor_json #>> '{resumeLauncherLeaseUntil}' IS NULL
@@ -856,7 +856,7 @@
             updated_at = CURRENT_TIMESTAMP
         WHERE id = #{id}
           AND status = #{expectedStatus}
-          AND tool_job_anchor_json #>> '{resumeState}' = 'LAUNCHING'
+          AND tool_job_anchor_json #>> '{resumeState}' IN ('LAUNCHING', 'ACCEPTED')
           AND tool_job_anchor_json #>> '{resumeToken}' = #{expectedResumeToken}
           AND (tool_job_anchor_json #>> '{resumeLeaseVersion}')::bigint = #{expectedLeaseVersion}
           AND (tool_job_anchor_json #>> '{resumeLauncherOwnerId}')
@@ -890,7 +890,7 @@
             updated_at = CURRENT_TIMESTAMP
         WHERE id = #{id}
           AND status IN ('RECEIVED', 'EXECUTING')
-          AND tool_job_anchor_json #>> '{resumeState}' = 'LAUNCHING'
+          AND tool_job_anchor_json #>> '{resumeState}' IN ('LAUNCHING', 'ACCEPTED')
           AND tool_job_anchor_json #>> '{resumeToken}' = #{expectedResumeToken}
           AND (tool_job_anchor_json #>> '{resumeLeaseVersion}')::bigint = #{expectedLeaseVersion}
           AND tool_job_anchor_json #>> '{resumeLauncherOwnerId}' = #{expectedLauncherOwnerId}
@@ -935,7 +935,7 @@
         WHERE id = #{id}
           AND user_id = #{userId}
           AND status = 'EXECUTING'
-          AND tool_job_anchor_json #>> '{resumeState}' = 'LAUNCHING'
+          AND tool_job_anchor_json #>> '{resumeState}' IN ('LAUNCHING', 'ACCEPTED')
           AND COALESCE((tool_job_anchor_json #>> '{resultConsumed}')::boolean, false)
           AND tool_job_anchor_json #>> '{resumeToken}' = #{expectedResumeToken}
           AND (tool_job_anchor_json #>> '{resumeLeaseVersion}')::bigint = #{expectedLeaseVersion}
@@ -949,7 +949,7 @@
         SET tool_job_anchor_json = CAST('{}' AS jsonb),
             updated_at = CURRENT_TIMESTAMP
         WHERE id = #{id}
-          AND tool_job_anchor_json #>> '{resumeState}' = 'LAUNCHING'
+          AND tool_job_anchor_json #>> '{resumeState}' IN ('LAUNCHING', 'ACCEPTED')
           AND COALESCE((tool_job_anchor_json #>> '{resultConsumed}')::boolean, false)
           AND tool_job_anchor_json #>> '{resumeToken}' = #{expectedResumeToken}
           AND (tool_job_anchor_json #>> '{resumeLeaseVersion}')::bigint = #{expectedLeaseVersion}
