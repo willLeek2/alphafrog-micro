@@ -6,7 +6,9 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.springframework.data.redis.core.Cursor;
+import org.springframework.data.redis.core.HashOperations;
 import org.springframework.data.redis.core.ScanOptions;
+import org.springframework.data.redis.core.SetOperations;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ValueOperations;
 import org.springframework.test.util.ReflectionTestUtils;
@@ -17,10 +19,13 @@ import world.willfrog.agent.platform.storage.AgentStoragePaths;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -36,6 +41,8 @@ class ToolOutputRefServiceImplTest {
     Path tempDir;
 
     private Map<String, String> redis;
+    private Map<String, Map<String, String>> hashStore;
+    private Map<String, Set<String>> setStore;
     private StringRedisTemplate redisTemplate;
     private PersistentArtifactRegistry registry;
     private ToolOutputRefServiceImpl service;
@@ -43,7 +50,9 @@ class ToolOutputRefServiceImplTest {
     @BeforeEach
     void setUp() {
         redis = new LinkedHashMap<>();
-        redisTemplate = mockRedis(redis);
+        hashStore = new LinkedHashMap<>();
+        setStore = new LinkedHashMap<>();
+        redisTemplate = mockRedis(redis, hashStore, setStore);
         // D04：artifact 根经统一存储门面注入（替代原 @Value artifactRoot 反射注入）。
         AgentStoragePaths storagePaths = new AgentStoragePaths(
                 tempDir.resolve("workspaces").toString(),
@@ -53,6 +62,7 @@ class ToolOutputRefServiceImplTest {
         registry = new PersistentArtifactRegistry(redisTemplate, new ObjectMapper(), storagePaths);
         ReflectionTestUtils.setField(registry, "defaultTtlHours", 12L);
         ReflectionTestUtils.setField(registry, "cleanupScanCount", 100);
+        ReflectionTestUtils.setField(registry, "maxRunListEntries", 1000);
         AgentLlmLocalConfigLoader loader = mock(AgentLlmLocalConfigLoader.class);
         AgentLlmProperties cfg = new AgentLlmProperties();
         cfg.getTools().getReread().setMaxLimit(8);
@@ -103,6 +113,25 @@ class ToolOutputRefServiceImplTest {
     }
 
     @Test
+    void explicitContextOverloadsShouldBypassAgentContext() {
+        // D22-5.1.3：显式 overload 不读 AgentContext——线程态是别的 run 也能注册/读取目标 run。
+        PersistentArtifactRegistration registration =
+                service.registerRawOutput("run-x", "user-x", "tool-x", "工具输出", "explicit-payload");
+        assertEquals("run-x", registration.getMeta().getRunId());
+        assertEquals("user-x", registration.getMeta().getUserId());
+
+        // 当前线程态仍是 run-1/user-1：显式 overload 读取 run-x 不受影响
+        // （setUp maxLimit=8 截顶：16 字符 payload 只返回前 8 字符，hasMore=true）
+        ToolOutputReadResult explicitRead = service.read("run-x", "user-x",
+                registration.getArtifactId(), 0, 100, null);
+        assertEquals("explicit", explicitRead.getContent());
+        assertTrue(explicitRead.isHasMore());
+        // 旧入口语义不变：AgentContext(run-1) 读 run-x 的 ref 仍被拒
+        assertThrows(IllegalArgumentException.class,
+                () -> service.read(registration.getArtifactId(), 0, 10, null));
+    }
+
+    @Test
     void cleanupExpiredArtifactsShouldDeleteOwnedFileAndMeta() throws Exception {
         PersistentArtifactRegistration registration = registry.register("raw-ref", "tool-1", "工具输出", "payload", 1);
         PersistentArtifactMeta meta = registry.find(registration.getArtifactId()).orElseThrow();
@@ -114,12 +143,16 @@ class ToolOutputRefServiceImplTest {
 
         assertFalse(Files.exists(path));
         assertFalse(redis.containsKey("agent:persistent-artifact:" + meta.getArtifactId()));
+        // D22-5.1.3：cleanup 同删 run 索引项
+        assertTrue(setStore.getOrDefault("agent:persistent-artifact:run-list:run-1", Set.of()).isEmpty());
     }
 
     @Test
     void cleanupExpiredArtifactsShouldDeleteExternalSymlinkOnlyWhenMarked() throws Exception {
-        Path target = Files.createDirectory(tempDir.resolve("dataset-target"));
-        Path link = tempDir.resolve("dataset-link");
+        // D22-5.1.3：external 路径只能落批准根内——target 与 link 都放 datasetRoot 下。
+        Path datasetRoot = tempDir.resolve("datasets");
+        Path target = Files.createDirectories(datasetRoot.resolve("dataset-target"));
+        Path link = datasetRoot.resolve("dataset-link");
         Files.createSymbolicLink(link, target);
         PersistentArtifactRegistration registration = registry.registerExternal(
                 "dataset-symlink", "dataset-1", "compat_symlink", link, 1, true);
@@ -144,7 +177,9 @@ class ToolOutputRefServiceImplTest {
     }
 
     @SuppressWarnings("unchecked")
-    private StringRedisTemplate mockRedis(Map<String, String> store) {
+    private StringRedisTemplate mockRedis(Map<String, String> store,
+                                          Map<String, Map<String, String>> hashes,
+                                          Map<String, Set<String>> sets) {
         StringRedisTemplate template = mock(StringRedisTemplate.class);
         ValueOperations<String, String> ops = mock(ValueOperations.class);
         when(template.opsForValue()).thenReturn(ops);
@@ -163,6 +198,54 @@ class ToolOutputRefServiceImplTest {
                 .when(template).delete(org.mockito.ArgumentMatchers.anyString());
         when(template.scan(org.mockito.ArgumentMatchers.any(ScanOptions.class)))
                 .thenAnswer(invocation -> new MapCursor(store.keySet().iterator()));
+
+        // D22-5.1.3：registry 新增幂等身份 hash 与 run 索引 SET，fake 同步扩展。
+        HashOperations<String, Object, Object> hashOps = mock(HashOperations.class);
+        when(template.opsForHash()).thenReturn(hashOps);
+        when(hashOps.putIfAbsent(org.mockito.ArgumentMatchers.anyString(),
+                org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
+                .thenAnswer(invocation -> hashes
+                        .computeIfAbsent(invocation.getArgument(0), k -> new LinkedHashMap<>())
+                        .putIfAbsent(invocation.getArgument(1).toString(),
+                                invocation.getArgument(2).toString()) == null);
+        org.mockito.Mockito.doAnswer(invocation -> {
+            hashes.computeIfAbsent(invocation.getArgument(0), k -> new LinkedHashMap<>())
+                    .put(invocation.getArgument(1).toString(), invocation.getArgument(2).toString());
+            return null;
+        }).when(hashOps).put(org.mockito.ArgumentMatchers.anyString(),
+                org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any());
+        when(hashOps.get(org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.any()))
+                .thenAnswer(invocation -> {
+                    Map<String, String> h = hashes.get(invocation.getArgument(0));
+                    return h == null ? null : h.get(invocation.getArgument(1).toString());
+                });
+        when(hashOps.delete(org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.any()))
+                .thenAnswer(invocation -> {
+                    Map<String, String> h = hashes.get(invocation.getArgument(0));
+                    return h == null ? 0L : (h.remove(invocation.getArgument(1).toString()) != null ? 1L : 0L);
+                });
+
+        SetOperations<String, String> setOps = mock(SetOperations.class);
+        when(template.opsForSet()).thenReturn(setOps);
+        when(setOps.add(org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.<String>any()))
+                .thenAnswer(invocation -> sets
+                        .computeIfAbsent(invocation.getArgument(0), k -> new LinkedHashSet<>())
+                        .add(invocation.getArgument(1)) ? 1L : 0L);
+        when(setOps.members(org.mockito.ArgumentMatchers.anyString()))
+                .thenAnswer(invocation -> {
+                    Set<String> s = sets.get(invocation.getArgument(0));
+                    return s == null ? new HashSet<>() : new HashSet<>(s);
+                });
+        when(setOps.size(org.mockito.ArgumentMatchers.anyString()))
+                .thenAnswer(invocation -> {
+                    Set<String> s = sets.get(invocation.getArgument(0));
+                    return s == null ? 0L : (long) s.size();
+                });
+        when(setOps.remove(org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.<Object>any()))
+                .thenAnswer(invocation -> {
+                    Set<String> s = sets.get(invocation.getArgument(0));
+                    return s != null && s.remove(invocation.getArgument(1).toString()) ? 1L : 0L;
+                });
         return template;
     }
 

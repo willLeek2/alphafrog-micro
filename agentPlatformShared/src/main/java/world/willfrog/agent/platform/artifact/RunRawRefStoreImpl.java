@@ -31,8 +31,11 @@ public class RunRawRefStoreImpl implements RunRawRefStore {
         String shortId = SHORT_ID_PREFIX + String.format("%03d", seq);
 
         long ttlHours = Math.max(1, (ttlSeconds + 3599) / 3600);
-        PersistentArtifactRegistration registration = artifactRegistry.register(
-                ARTIFACT_TYPE, runId, displayName, content, ttlHours);
+        // D22-5.1.3：显式上下文入口——runId/userId 直接来自调用方参数（此前 userId 参数
+        // 未使用、meta 靠 AgentContext 线程态补齐）。注意必须走非幂等 registerExplicit：
+        // 本 store 的 logicalId 固定为 runId，同 run 多条 rawRef 若走幂等路径会撞身份字段。
+        PersistentArtifactRegistration registration = artifactRegistry.registerExplicit(
+                runId, userId, ARTIFACT_TYPE, runId, displayName, content, ttlHours);
 
         String mappingKey = mappingKey(runId);
         redisTemplate.opsForHash().put(mappingKey, shortId, registration.getArtifactId());

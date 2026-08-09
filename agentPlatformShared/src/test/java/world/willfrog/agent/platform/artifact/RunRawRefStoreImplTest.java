@@ -37,7 +37,10 @@ class RunRawRefStoreImplTest {
         PersistentArtifactRegistration reg = PersistentArtifactRegistration.builder()
                 .artifactId("raw-ref:test-uuid")
                 .build();
-        when(registry.register(eq("raw-ref"), anyString(), anyString(), anyString(), anyLong()))
+        // D22-5.1.3：store 改走显式上下文 registerExplicit（runId/userId 显式传递，
+        // logicalId 固定为 runId，非幂等——同 run 多条 rawRef 不撞身份）。
+        when(registry.registerExplicit(anyString(), anyString(), eq("raw-ref"),
+                anyString(), anyString(), anyString(), anyLong()))
                 .thenReturn(reg);
 
         store = new RunRawRefStoreImpl(registry, redisTemplate);
@@ -115,5 +118,15 @@ class RunRawRefStoreImplTest {
         store.register("run_ttl", "user_001", "test", "ttl_test", 30);
         verify(redisTemplate).expire("agent:raw-ref-counter:run_ttl", 30, TimeUnit.SECONDS);
         verify(redisTemplate).expire("agent:raw-ref-mapping:run_ttl", 30, TimeUnit.SECONDS);
+    }
+
+    @Test
+    void register_shouldForwardExplicitContextToRegistry() {
+        // D22-5.1.3：userId 参数必须真正传给 registry（此前被丢弃、靠 AgentContext 补）；
+        // 且走非幂等 registerExplicit（同 run 第二条 logicalId=runId 的 rawRef 不撞身份）。
+        when(valueOps.increment("agent:raw-ref-counter:run_ctx")).thenReturn(1L);
+        store.register("run_ctx", "user_ctx", "display", "payload", 3600);
+        verify(registry).registerExplicit("run_ctx", "user_ctx", "raw-ref", "run_ctx",
+                "display", "payload", 1L);
     }
 }

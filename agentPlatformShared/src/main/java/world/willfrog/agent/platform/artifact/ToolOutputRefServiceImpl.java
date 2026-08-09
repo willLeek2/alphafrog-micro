@@ -10,6 +10,14 @@ import java.util.Arrays;
 import java.util.Optional;
 import java.util.stream.Collectors;
 
+/**
+ * 工具输出 rawRef 服务实现。
+ *
+ * <p>D22-5.1.3：注册/定位/读取均有显式上下文 overload（runId/userId 显式传入，
+ * 不依赖 {@link AgentContext} 线程态）；旧入口保留为有界兼容 delegate，
+ * 从 AgentContext 补齐上下文后转调显式 overload。归属校验统一走
+ * {@link PersistentArtifactRegistry#matchesOwner}（meta runId/userId 匹配）。</p>
+ */
 @Service
 @RequiredArgsConstructor
 public class ToolOutputRefServiceImpl implements ToolOutputRefService {
@@ -22,7 +30,14 @@ public class ToolOutputRefServiceImpl implements ToolOutputRefService {
 
     @Override
     public PersistentArtifactRegistration registerRawOutput(String logicalId, String displayName, String content) {
-        return artifactRegistry.register("raw-ref", logicalId, displayName, content, resolveRawRefTtlHours());
+        return registerRawOutput(AgentContext.getRunId(), AgentContext.getUserId(), logicalId, displayName, content);
+    }
+
+    @Override
+    public PersistentArtifactRegistration registerRawOutput(String runId, String userId, String logicalId,
+                                                            String displayName, String content) {
+        return artifactRegistry.registerExplicit(runId, userId, "raw-ref", logicalId, displayName,
+                content, resolveRawRefTtlHours());
     }
 
     @Override
@@ -33,13 +48,23 @@ public class ToolOutputRefServiceImpl implements ToolOutputRefService {
 
     @Override
     public RawPayloadLocator locatorFor(String rawRef) {
-        assertVisible(rawRef);
+        return locatorFor(AgentContext.getRunId(), AgentContext.getUserId(), rawRef);
+    }
+
+    @Override
+    public RawPayloadLocator locatorFor(String runId, String userId, String rawRef) {
+        assertVisible(runId, userId, rawRef);
         return artifactRegistry.locatorFor(rawRef);
     }
 
     @Override
     public ToolOutputReadResult read(String rawRef, int offset, int limit, String keyword) {
-        assertVisible(rawRef);
+        return read(AgentContext.getRunId(), AgentContext.getUserId(), rawRef, offset, limit, keyword);
+    }
+
+    @Override
+    public ToolOutputReadResult read(String runId, String userId, String rawRef, int offset, int limit, String keyword) {
+        assertVisible(runId, userId, rawRef);
         String content = artifactRegistry.readContent(rawRef);
         String source = filterByKeyword(content, keyword);
         int total = source.length();
@@ -54,16 +79,11 @@ public class ToolOutputRefServiceImpl implements ToolOutputRefService {
                 .build();
     }
 
-    private void assertVisible(String rawRef) {
+    private void assertVisible(String runId, String userId, String rawRef) {
         PersistentArtifactMeta meta = artifactRegistry.find(rawRef)
                 .orElseThrow(() -> new IllegalArgumentException("rawRef not found: " + rawRef));
-        String currentRunId = AgentContext.getRunId();
-        String currentUserId = AgentContext.getUserId();
-        if (hasText(meta.getRunId()) && hasText(currentRunId) && !meta.getRunId().equals(currentRunId)) {
-            throw new IllegalArgumentException("rawRef does not belong to current run");
-        }
-        if (hasText(meta.getUserId()) && hasText(currentUserId) && !meta.getUserId().equals(currentUserId)) {
-            throw new IllegalArgumentException("rawRef does not belong to current user");
+        if (!PersistentArtifactRegistry.matchesOwner(meta, runId, userId)) {
+            throw new IllegalArgumentException("rawRef does not belong to current run/user");
         }
     }
 
