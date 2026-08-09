@@ -271,29 +271,29 @@ class ToolJobStateCharacterizationTest {
         void loadMapperXml() throws Exception {
             java.io.InputStream is = getClass().getClassLoader()
                     .getResourceAsStream("mapper/AgentRunMapper.xml");
-            assertThat(is).as("AgentRunMapper.xml must be on classpath").isNotNull();
+            assertThat(is).as("AgentRunMapper.xml 必须在 classpath 上").isNotNull();
             xml = new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
         }
 
         @Test
         @DisplayName("5 处 SQL 接受 ACCEPTED 状态")
         void acceptedInFivePredicates() {
-            // Count IN ('LAUNCHING', 'ACCEPTED') occurrences in SQL predicates.
+            // 统计 IN ('LAUNCHING', 'ACCEPTED') 在 SQL 谓词中的出现次数。
             // 恰好 5 处：takeoverExpiredResumeLauncher、heartbeatResumeLauncher、
             // updateResumedTerminal、clearAcceptedResumeHandoff、listResumeReadyAnchors。
             int count = countOccurrences(xml, "resumeState}' IN ('LAUNCHING', 'ACCEPTED')");
-            assertThat(count).as("5 SQL predicates must accept ACCEPTED").isEqualTo(5);
+            assertThat(count).as("5 处 SQL 谓词必须接受 ACCEPTED").isEqualTo(5);
         }
 
         @Test
         @DisplayName("acceptResumeHandoff 保持仅 LAUNCHING")
         void acceptHandoffStaysLaunchingOnly() {
-            // acceptResumeHandoff transitions LAUNCHING→ACCEPTED; it must NOT
-            // already accept ACCEPTED as a precondition.
+            // acceptResumeHandoff 将 LAUNCHING 推进为 ACCEPTED，其 WHERE
+            // 条件必须仅匹配 LAUNCHING，不能接受已经是 ACCEPTED 的行。
             String acceptBlock = extractBetween(xml,
                     "<update id=\"acceptResumeHandoff\">", "</update>");
             assertThat(acceptBlock)
-                    .as("acceptResumeHandoff must check LAUNCHING only")
+                    .as("acceptResumeHandoff 必须仅检查 LAUNCHING")
                     .contains("resumeState}' = 'LAUNCHING'")
                     .doesNotContain("IN ('LAUNCHING', 'ACCEPTED')");
         }
@@ -304,7 +304,7 @@ class ToolJobStateCharacterizationTest {
             String claimBlock = extractBetween(xml,
                     "<update id=\"claimResumeLauncher\">", "</update>");
             assertThat(claimBlock)
-                    .as("claimResumeLauncher must check READY only")
+                    .as("claimResumeLauncher 必须仅检查 READY")
                     .contains("resumeState}' = 'READY'");
         }
 
