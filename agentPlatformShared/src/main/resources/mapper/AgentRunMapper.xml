@@ -763,6 +763,8 @@
           AND (
                 (
                     status = 'RECEIVED'
+                    AND NOT (tool_job_anchor_json #>> '{resumeState}' = 'READY'
+                             AND COALESCE((tool_job_anchor_json #>> '{resultConsumed}')::boolean, false))
                     AND (
                         tool_job_anchor_json #>> '{resumeState}' = 'READY'
                         OR (
@@ -835,6 +837,7 @@
         WHERE id = #{id}
           AND status = #{expectedStatus}
           AND tool_job_anchor_json #>> '{resumeState}' = 'READY'
+          AND NOT COALESCE((tool_job_anchor_json #>> '{resultConsumed}')::boolean, false)
           AND tool_job_anchor_json #>> '{resumeToken}' = #{expectedResumeToken}
           AND (tool_job_anchor_json #>> '{resumeLeaseVersion}')::bigint = #{expectedLeaseVersion}
     </update>

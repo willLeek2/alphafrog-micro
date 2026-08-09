@@ -11,11 +11,9 @@ import org.junit.jupiter.api.Test;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 
 /**
- * Characterization tests for the D12 4-state resumeState model
- * (READY → LAUNCHING → ACCEPTED → CONSUMED).
+ * D12 四态 resumeState 模型的特征测试（READY → LAUNCHING → ACCEPTED → CONSUMED）。
  *
- * Uses real production seams: ToolJobAnchor.fromJson normalization,
- * isResultConsumed derivation from resumeState.
+ * 使用真实生产接缝：ToolJobAnchor.fromJson 归一化、isResultConsumed 从 resumeState 推导。
  */
 @DisplayName("ToolJob State Characterization (D12 Step 3)")
 class ToolJobStateCharacterizationTest {
@@ -28,7 +26,7 @@ class ToolJobStateCharacterizationTest {
     }
 
     // ------------------------------------------------------------------
-    // isResultConsumed derivation from 4-state resumeState
+    // isResultConsumed 从四态 resumeState 推导
     // ------------------------------------------------------------------
 
     @Nested
@@ -71,7 +69,7 @@ class ToolJobStateCharacterizationTest {
     }
 
     // ------------------------------------------------------------------
-    // Legacy normalization via fromJson
+    // 旧数据归一化 via fromJson
     // ------------------------------------------------------------------
 
     @Nested
@@ -81,14 +79,14 @@ class ToolJobStateCharacterizationTest {
         @Test
         @DisplayName("old LAUNCHING + resultConsumed=true → normalized to ACCEPTED")
         void legacyLaunchingWithResultConsumedTrue() {
-            // Manually craft legacy JSON: old code wrote LAUNCHING with independent
-            // resultConsumed=true. The new serialization derives resultConsumed from
-            // state, so we must construct the legacy shape directly.
+            // 手动构造旧格式 JSON：旧代码写入 LAUNCHING 时独立设置
+            // resultConsumed=true。新序列化从 resumeState 推导 resultConsumed，
+            // 因此必须直接构造旧格式。
             String json = "{\"schemaVersion\":1,\"operationId\":\"run-1:tc-1:1\","
                     + "\"resumeState\":\"LAUNCHING\",\"resultConsumed\":true}";
             ToolJobAnchor restored = ToolJobAnchor.fromJson(json);
 
-            // Normalized: resumeState upgraded from LAUNCHING to ACCEPTED
+            // 归一化：resumeState 从 LAUNCHING 升级为 ACCEPTED
             assertThat(restored.getResumeState()).isEqualTo("ACCEPTED");
             assertThat(restored.isResultConsumed()).isTrue();
         }
@@ -96,7 +94,7 @@ class ToolJobStateCharacterizationTest {
         @Test
         @DisplayName("old null resumeState + resultConsumed=true → normalized to ACCEPTED")
         void legacyNullResumeStateWithResultConsumedTrue() {
-            // Very old data: resultConsumed=true but no resumeState field at all
+            // 极旧数据：有 resultConsumed=true 但无 resumeState 字段
             String json = "{\"schemaVersion\":1,\"operationId\":\"run-1:tc-1:1\","
                     + "\"resultConsumed\":true}";
             ToolJobAnchor restored = ToolJobAnchor.fromJson(json);
@@ -108,7 +106,7 @@ class ToolJobStateCharacterizationTest {
         @Test
         @DisplayName("contradictory READY + resultConsumed=true → fail-closed")
         void contradictoryReadyAndConsumedFailsClosed() {
-            // Contradictory: READY cannot have a consumed result
+            // 矛盾状态：READY 不能有已消费的结果
             String json = "{\"schemaVersion\":1,\"operationId\":\"run-1:tc-1:1\","
                     + "\"resumeState\":\"READY\",\"resultConsumed\":true}";
 
@@ -150,19 +148,19 @@ class ToolJobStateCharacterizationTest {
         void cleanLaunchingWithoutResultConsumed() {
             anchor.setOperationId("run-1:tc-1:1");
             anchor.setResumeState("LAUNCHING");
-            // resultConsumed is false (default)
+            // resultConsumed 为 false（默认值）
 
             String json = anchor.toJson();
             ToolJobAnchor restored = ToolJobAnchor.fromJson(json);
 
-            // Not normalized: LAUNCHING + resultConsumed=false is the normal non-accepted state
+            // 不归一化：LAUNCHING + resultConsumed=false 是正常的未接受状态
             assertThat(restored.getResumeState()).isEqualTo("LAUNCHING");
             assertThat(restored.isResultConsumed()).isFalse();
         }
     }
 
     // ------------------------------------------------------------------
-    // Anchor identity fields preserved through roundtrip
+    // Anchor 身份字段在 JSON 往返后保持不变
     // ------------------------------------------------------------------
 
     @Nested
@@ -248,7 +246,7 @@ class ToolJobStateCharacterizationTest {
             anchor.setResumeLauncherOwnerId("owner-a");
             anchor.setResultConsumed(true);
 
-            // Simulate markHandoffAccepted: advance to ACCEPTED
+            // 模拟 markHandoffAccepted：推进到 ACCEPTED
             anchor.setResumeState("ACCEPTED");
 
             ToolJobAnchor restored = ToolJobAnchor.fromJson(anchor.toJson());
@@ -260,7 +258,7 @@ class ToolJobStateCharacterizationTest {
     }
 
     // ------------------------------------------------------------------
-    // Production XML seam: ACCEPTED in AgentRunMapper.xml
+    // 生产 XML 接缝：AgentRunMapper.xml 中的 ACCEPTED
     // ------------------------------------------------------------------
 
     @Nested
@@ -281,7 +279,7 @@ class ToolJobStateCharacterizationTest {
         @DisplayName("5 SQL locations accept ACCEPTED state")
         void acceptedInFivePredicates() {
             // Count IN ('LAUNCHING', 'ACCEPTED') occurrences in SQL predicates.
-            // Exactly 5: takeoverExpiredResumeLauncher, heartbeatResumeLauncher,
+            // 恰好 5 处：takeoverExpiredResumeLauncher、heartbeatResumeLauncher、
             // updateResumedTerminal, clearAcceptedResumeHandoff, listResumeReadyAnchors.
             int count = countOccurrences(xml, "resumeState}' IN ('LAUNCHING', 'ACCEPTED')");
             assertThat(count).as("5 SQL predicates must accept ACCEPTED").isEqualTo(5);
@@ -310,7 +308,7 @@ class ToolJobStateCharacterizationTest {
                     .contains("resumeState}' = 'READY'");
         }
 
-        // ---- helpers ----
+        // ---- 辅助方法 ----
 
         private static int countOccurrences(String haystack, String needle) {
             int count = 0;

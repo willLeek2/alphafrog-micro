@@ -66,7 +66,7 @@ public class ToolJobAnchor {
     private Instant cleanupSourceLeaseUntil;
     // autoResume=false 时只做终态收尾和容量释放，不自动重新入队。
     private boolean autoResume = true;
-    // resumeState 表示 READY、LAUNCHING、CONSUMED 三阶段交接状态。
+    // resumeState 表示 READY、LAUNCHING、ACCEPTED、CONSUMED 四阶段交接状态。
     private String resumeState;
     // resumeToken 为每轮 READY 生成随机令牌，提供启动幂等身份。
     private String resumeToken;
@@ -170,13 +170,13 @@ public class ToolJobAnchor {
     }
 
     /**
-     * Normalize legacy dual-track data to the ACCEPTED single-track model.
+     * 将旧双轨数据归一化为 ACCEPTED 单轨模型。
      *
-     * <p>Old data with {@code resultConsumed=true} but {@code resumeState} still
-     * LAUNCHING (or null) is upgraded to ACCEPTED. Contradictory READY+true
-     * fails closed rather than silently promoting.
+     * <p>旧数据中 {@code resultConsumed=true} 但 {@code resumeState} 仍为
+     * LAUNCHING（或 null）的，升级为 ACCEPTED。矛盾的 READY+true 会 fail-closed，
+     * 不会静默提升。
      *
-     * <p>This migration logic can be removed after 26Q3-W7.
+     * <p>此迁移逻辑可在 26Q3-W7 后移除。
      */
     private static void normalizeLegacyResultConsumed(ToolJobAnchor anchor) {
         if (!anchor.resultConsumed) {

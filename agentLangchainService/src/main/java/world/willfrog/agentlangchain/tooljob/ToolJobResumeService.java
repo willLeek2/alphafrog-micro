@@ -22,9 +22,10 @@ import java.util.UUID;
 /**
  * durable anchor 到新 Agent worker 之间的恢复租约状态机。
  *
- * <p>READY 负责竞争 claim，LAUNCHING 表示某个 token/version 已取得启动权，
- * CONSUMED 表示结果已被工作流接受。所有推进和清理都通过数据库 CAS；Redis 仅在
- * DB 成功后清理。数据集注册表在提交新 worker 前恢复，失败则回滚到新的 READY 租约。</p>
+ * <p>四阶段模型：READY 负责竞争 claim，LAUNCHING 表示某个 token/version 已取得启动权，
+ * ACCEPTED 表示 handoff 已被工作流接受，CONSUMED 表示结果已被最终消费且 anchor 可安全清理。
+ * 所有推进和清理都通过数据库 CAS；Redis 仅在 DB 成功后清理。数据集注册表在提交新 worker
+ * 前恢复，失败则按原状态回退（READY→READY，ACCEPTED→ACCEPTED）。</p>
  */
 @Service
 public class ToolJobResumeService {
@@ -158,8 +159,7 @@ public class ToolJobResumeService {
 
     private void rollbackToAccepted(String runId, ToolJobAnchor anchor, long originalVersion,
                                     String claimedToken, long claimedVersion) {
-        // ACCEPTED rollback: keep ACCEPTED state (handoff was already accepted);
-        // only clear the lease so another instance can retry.
+        // ACCEPTED 回退：保持 ACCEPTED 状态（handoff 已被接受），仅清除 lease 让其他实例可重试。
         long nextVersion = claimedVersion + 1;
         anchor.setResumeState("ACCEPTED");
         anchor.setResumeLeaseVersion(nextVersion);
@@ -182,9 +182,9 @@ public class ToolJobResumeService {
     }
 
     private boolean reenterLaunching(String runId, ToolJobAnchor anchor) {
-        log.info("Re-entering LAUNCHING resume for run={}", runId);
+        log.info("重入 LAUNCHING/ACCEPTED 恢复流程 run={}", runId);
         if (resumeLauncher == null) {
-            log.warn("No resumeLauncher wired — cannot recover LAUNCHING run={}", runId);
+            log.warn("未注入 resumeLauncher，无法恢复 run={}", runId);
             return false;
         }
         // 未过期的持久化 lease 无论属于本实例还是别的实例，都不能重复提交 pipeline。
@@ -194,7 +194,7 @@ public class ToolJobResumeService {
         // 同进程内已有活跃 launcher (runId + token + version)，避免同进程双 launch。
         // 跨进程仍以 DB lease/version/token CAS 为唯一权威。
         if (resumeLauncher.isActive(runId, anchor.getResumeToken(), anchor.getResumeLeaseVersion())) {
-            log.info("Launcher still active for LAUNCHING run={}, skipping stale recycle", runId);
+            log.info("同进程 launcher 仍活跃 run={}，跳过过期回收", runId);
             return false;
         }
 
@@ -366,7 +366,7 @@ public class ToolJobResumeService {
             return true;
         }
         // 若恢复执行再次挂起，anchor 已换 state/token/version；这里必须返回 false 且绝不清理。
-        // ACCEPTED is the post-handoff state (LAUNCHING was advanced in markHandoffAccepted).
+        // ACCEPTED 是 handoff 后的状态（markHandoffAccepted 已将 LAUNCHING 推进为 ACCEPTED）。
         if ((!"LAUNCHING".equals(anchor.getResumeState()) && !"ACCEPTED".equals(anchor.getResumeState()))
                 || !anchor.isResultConsumed()
                 || token == null || !token.equals(anchor.getResumeToken())
