@@ -8,9 +8,12 @@ import dev.langchain4j.model.chat.request.json.JsonObjectSchema;
 import dev.langchain4j.model.chat.request.json.JsonSchemaElement;
 import dev.langchain4j.model.chat.request.json.JsonStringSchema;
 
+import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 public final class MarketDataAdvancedToolCatalog {
 
@@ -30,6 +33,18 @@ public final class MarketDataAdvancedToolCatalog {
         byName.put("searchAssetInfo", searchAssetInfoSpec());
         byName.put("getExchangeAssetDaily", getExchangeAssetDailySpec());
         return List.copyOf(byName.values());
+    }
+
+    /**
+     * 返回本 helper 以 canonical schema 覆盖的工具名集合，用于与 {@code AgentToolRegistry} 的
+     * {@code canonicalSpec=MARKET_ADVANCED} 声明做契约对照。
+     */
+    public static Set<String> overriddenCanonicalNames() {
+        Set<String> names = new LinkedHashSet<>();
+        names.add("searchIndex");
+        names.add("searchAssetInfo");
+        names.add("getExchangeAssetDaily");
+        return Collections.unmodifiableSet(names);
     }
 
     public static ToolSpecification searchIndexSpec() {
