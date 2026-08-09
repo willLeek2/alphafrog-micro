@@ -173,6 +173,7 @@ class LangchainToolConcurrencyThrottleTest {
         throttle.recordExecution("executePython", 1500);
 
         Map<String, Object> metrics = throttle.throttleMetrics();
+        assertThat(metrics.get("scope")).isEqualTo("per-node");
         assertThat(metrics.get("enabled")).isEqualTo(true);
         assertThat(metrics.get("maxPermits")).isEqualTo(2);
 
