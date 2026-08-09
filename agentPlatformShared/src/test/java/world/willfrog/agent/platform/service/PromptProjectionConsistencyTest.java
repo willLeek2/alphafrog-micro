@@ -67,7 +67,7 @@ class PromptProjectionConsistencyTest {
             referenced.add(relative.startsWith("prompts") ? relative.subpath(1, relative.getNameCount()) : relative);
         });
 
-        assertEquals(23, referenced.size(), "示例 Prompt 投影引用数量变化时必须复核映射");
+        assertEquals(32, referenced.size(), "示例 Prompt 投影引用数量变化时必须复核映射");
         for (Path relative : referenced) {
             assertTrue(Files.isRegularFile(authorityRoot.resolve(relative)),
                     "示例引用缺少 shared 权威文件: " + relative);

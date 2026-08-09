@@ -35,8 +35,6 @@ class ActivePromptRunLevelContractTest {
 
     @ParameterizedTest
     @ValueSource(strings = {
-            "prompts/todo/dag_react_system.txt",
-            "prompts/todo/dag_react_system_default.txt",
             "prompts/todo/todo_planner_system.txt",
             "prompts/workflow/workflow_todo_recovery_system.txt",
             "prompts/sub_agent/sub_agent_planner_system.txt",
@@ -55,10 +53,7 @@ class ActivePromptRunLevelContractTest {
 
     @ParameterizedTest
     @ValueSource(strings = {
-            "prompts/agent/agent_run_system.txt",
             "prompts/python/execute_python_tool_description.txt",
-            "prompts/todo/dag_react_system.txt",
-            "prompts/todo/dag_react_system_default.txt",
             "prompts/workflow/workflow_todo_recovery_system.txt",
             "prompts/python/python_refine_requirements.txt",
     })
@@ -124,9 +119,6 @@ class ActivePromptRunLevelContractTest {
 
     @ParameterizedTest
     @ValueSource(strings = {
-            "prompts/agent/agent_run_system.txt",
-            "prompts/todo/dag_react_system.txt",
-            "prompts/todo/dag_react_system_default.txt",
             "prompts/workflow/workflow_todo_recovery_system.txt",
             "prompts/sub_agent/sub_agent_planner_system.txt",
     })
@@ -137,6 +129,23 @@ class ActivePromptRunLevelContractTest {
                 path + " 必须说明 rawRef 使用 rereadToolResult");
         assertTrue(prompt.contains("loadDocument"),
                 path + " 必须说明 rawRef 不传给 loadDocument");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "prompts/agent/agent_run_system.txt",
+            "prompts/todo/dag_react_system.txt",
+            "prompts/todo/dag_react_system_default.txt",
+    })
+    void stableAndGenericPromptLayers_shouldRemainCapabilityNeutral(String path) {
+        String prompt = PromptFileLoader.load(path);
+        assertFalse(prompt.isBlank(), path + " 必须可加载");
+        for (String toolName : new String[]{
+                "executePython", "listMyData", "searchWeb", "checkParallelLimits",
+                "rereadToolResult", "loadDocument"}) {
+            assertFalse(prompt.contains(toolName),
+                    path + " 不得泄漏未确认开放的工具 " + toolName);
+        }
     }
 
     @Test

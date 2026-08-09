@@ -24,7 +24,7 @@ import static org.mockito.Mockito.when;
 @ExtendWith(MockitoExtension.class)
 class AgentPromptServiceCacheTest {
 
-    private static final String GLOBAL_PROMPT = "你是专业金融分析代理。请使用可用工具获取市场数据并准确回答用户问题。";
+    private static final String GLOBAL_PROMPT = "你是专业金融分析代理。请只使用当前 User Message 与运行时 ToolSpecification 实际列出的工具获取数据并准确回答用户问题。";
     private static final DateTimeFormatter CN_DATE_FORMATTER = DateTimeFormatter.ofPattern("yyyy年MM月dd日");
 
     @Mock
@@ -212,12 +212,12 @@ class AgentPromptServiceCacheTest {
         String prompt = promptService.dagReactStageInstruction(
                 promptService.renderToolCapabilities(java.util.List.of(
                         "checkParallelLimits", "searchAssetInfo")));
-        assertTrue(prompt.contains("批量前必须先查询当前批量/并行限制"),
-                "ReAct User 阶段指令应包含批量上限查询要求");
+        assertTrue(prompt.contains("本次能力清单同时提供限制查询能力并已取得限制时，才可批量"),
+                "ReAct User 阶段指令应包含能力受限的批量上限要求");
         assertTrue(prompt.contains("checkParallelLimits"),
                 "ReAct User 阶段指令应要求先调用 checkParallelLimits");
-        assertTrue(prompt.contains("发现式查询"),
-                "ReAct User 阶段指令应保留发现式逐步查询的边界说明");
+        assertTrue(prompt.contains("搜索股票、ETF、指数和场外基金"),
+                "ReAct User 阶段指令应包含已开放发现能力的权威说明");
         assertTrue(prompt.contains("searchAssetInfo"),
                 "ReAct User 阶段指令应只列举本次实际开放的工具名");
         assertFalse(prompt.contains("单次最多"),

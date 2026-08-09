@@ -14,6 +14,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.when;
+import static world.willfrog.agentlangchain.support.LangchainTestFixtures.promptService;
 
 class LangchainTodoUserMessageBuilderTest {
 
@@ -32,13 +33,13 @@ class LangchainTodoUserMessageBuilderTest {
                 "run python analysis",
                 List.of());
 
-        assertTrue(message.contains("已有原始数据集 ID"));
+        assertTrue(message.contains("已有原始数据引用"));
         assertTrue(message.contains("raw-dataset-abc"));
-        assertTrue(message.contains("run-level dataset_ids/manifest_ids"));
-        assertTrue(message.contains("listMyData"));
-        assertTrue(message.contains("query_type=dataset"));
-        assertTrue(message.contains("query_type=manifest"));
-        assertTrue(message.contains("整数 dataset_ids / manifest_ids"));
+        assertFalse(message.contains("run-level dataset_ids/manifest_ids"));
+        assertFalse(message.contains("listMyData"));
+        assertFalse(message.contains("query_type=dataset"));
+        assertFalse(message.contains("query_type=manifest"));
+        assertFalse(message.contains("整数 dataset_ids / manifest_ids"));
         assertFalse(message.contains("已有数据集 (可用于 dataset_ids 参数)"));
         assertFalse(message.contains("必须将上述 dataset ID 通过 dataset_ids 参数传入"));
     }
@@ -67,5 +68,26 @@ class LangchainTodoUserMessageBuilderTest {
         assertTrue(message.contains("- listMyData: list current run data"));
         assertTrue(message.contains("当前可用工具：listMyData"));
         assertFalse(message.contains("searchWeb"));
+    }
+
+    @Test
+    void buildTodoUserMessage_withClosedCapabilities_shouldNotLeakToolNamesAcrossSystemAndUser() {
+        AgentPromptService promptService = promptService();
+
+        String fullPrompt = promptService.reactSystemPrompt() + "\n\n"
+                + LangchainTodoUserMessageBuilder.buildTodoUserMessage(
+                promptService,
+                "summarize the supplied facts",
+                List.of(),
+                Map.of(),
+                "write the summary",
+                List.of());
+
+        for (String closedTool : List.of(
+                "executePython", "listMyData", "searchWeb", "checkParallelLimits",
+                "rereadToolResult", "loadDocument")) {
+            assertFalse(fullPrompt.contains(closedTool),
+                    () -> "closed capability leaked into complete prompt: " + closedTool);
+        }
     }
 }

@@ -3,6 +3,7 @@ package world.willfrog.agentlangchain.orchestration;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.langchain4j.model.chat.ChatModel;
 import org.junit.jupiter.api.Test;
+import org.mockito.InOrder;
 import org.springframework.beans.factory.ObjectProvider;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
@@ -57,6 +58,8 @@ class LangchainLinearRunPipelineResumeTest {
                 mock(AgentRunCreditSettlementService.class);
         world.willfrog.agent.platform.event.AgentRunFinalizationService finalizationService =
                 mock(world.willfrog.agent.platform.event.AgentRunFinalizationService.class);
+        world.willfrog.agent.platform.service.AgentPromptService promptService =
+                mock(world.willfrog.agent.platform.service.AgentPromptService.class);
         LangchainTodoPlan plan = LangchainTodoPlan.builder()
                 .executionMode(PlanExecutionMode.LINEAR)
                 .items(List.of(TodoItem.builder().id("todo-2").sequence(2).description("resume").build()))
@@ -104,6 +107,7 @@ class LangchainLinearRunPipelineResumeTest {
                 LangchainRunSchedulerTestSupport.immediateScheduler(), mock(AgentCreditService.class),
                 settlementService,
                 finalizationService,
+                promptService,
                 mock(ObjectProvider.class), mock(ObjectProvider.class));
         ToolJobResumeContext context = new ToolJobResumeContext();
         context.setRunId("run-1");
@@ -119,6 +123,12 @@ class LangchainLinearRunPipelineResumeTest {
         assertThat(restoredSelection.get().bundleVersion()).isEqualTo("default-v1");
         assertThat(restoredSelection.get().variant()).isEqualTo("control");
         assertThat(restoredSelection.get().referenceDate().toString()).isEqualTo("2025-02-03");
+        verify(promptService).validatePromptSelection(argThat(selection ->
+                selection != null && "default-v1".equals(selection.bundleVersion())));
+        InOrder promptBoundaryOrder = inOrder(promptService, stageModels, followUp);
+        promptBoundaryOrder.verify(promptService).validatePromptSelection(any());
+        promptBoundaryOrder.verify(stageModels).resolve(run);
+        promptBoundaryOrder.verify(followUp).resolve(run);
         assertThat(AgentContext.getPromptRunSelection()).isNull();
         verify(observabilityService, times(1)).commitTerminalSnapshot(argThat(candidate ->
                 candidate.status() == world.willfrog.agent.platform.model.AgentRunStatus.COMPLETED));

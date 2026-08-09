@@ -140,6 +140,7 @@ class LangchainLinearRunPipelinePlanReadyTest {
                 mock(world.willfrog.agent.platform.service.AgentMessageService.class), executionGuard,
                 immediateScheduler(), creditService, mock(AgentRunCreditSettlementService.class),
                 mock(world.willfrog.agent.platform.event.AgentRunFinalizationService.class),
+                mock(world.willfrog.agent.platform.service.AgentPromptService.class),
                 mock(ObjectProvider.class), mock(ObjectProvider.class));
 
         pipeline.executeRun(run);
@@ -245,6 +246,7 @@ class LangchainLinearRunPipelinePlanReadyTest {
                 creditService,
                 mock(AgentRunCreditSettlementService.class),
                 mock(world.willfrog.agent.platform.event.AgentRunFinalizationService.class),
+                mock(world.willfrog.agent.platform.service.AgentPromptService.class),
                 mock(ObjectProvider.class),
                 mock(ObjectProvider.class)
         );
@@ -343,6 +345,7 @@ class LangchainLinearRunPipelinePlanReadyTest {
                 creditService,
                 mock(AgentRunCreditSettlementService.class),
                 mock(world.willfrog.agent.platform.event.AgentRunFinalizationService.class),
+                mock(world.willfrog.agent.platform.service.AgentPromptService.class),
                 mock(ObjectProvider.class),
                 mock(ObjectProvider.class));
 
