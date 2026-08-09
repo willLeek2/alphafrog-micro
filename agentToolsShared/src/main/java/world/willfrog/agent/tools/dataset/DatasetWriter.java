@@ -36,9 +36,6 @@ public class DatasetWriter {
     @Value("${agent.tools.market-data.dataset.database-fetched-path:/data/database_fetched}")
     private String databaseFetchedPath;
 
-    @Value("${agent.tools.market-data.dataset.manifests-path:/data/manifests}")
-    private String manifestsPath;
-
     @Value("${agent.tools.market-data.dataset.enabled:true}")
     private boolean enabled;
 

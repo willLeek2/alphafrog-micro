@@ -47,7 +47,6 @@ class DatasetWriterRegistryPathAlignmentTest {
                 tempDir.resolve("agent_datasets").toString(),
                 tempDir.resolve("obs.log").toString()));
         ReflectionTestUtils.setField(writer, "databaseFetchedPath", tempDir.resolve("database_fetched").toString());
-        ReflectionTestUtils.setField(writer, "manifestsPath", tempDir.resolve("manifests").toString());
         ReflectionTestUtils.setField(writer, "enabled", true);
         ReflectionTestUtils.setField(writer, "localConfigLoader", null);
     }
