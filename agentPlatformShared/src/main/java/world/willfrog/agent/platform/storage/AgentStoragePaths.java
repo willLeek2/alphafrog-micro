@@ -31,7 +31,9 @@ import java.nio.file.Paths;
  * <h3>旧键别名对照</h3>
  * <ul>
  *   <li>{@link #KEY_WORKSPACE_ROOT} ← {@code agent.workspace.root}（原 WorkspacePathResolver 键）</li>
- *   <li>{@link #KEY_ARTIFACT_ROOT} ← {@code agent.persistent-artifact.root}（原 PersistentArtifactRegistry 键）</li>
+ *   <li>{@link #KEY_ARTIFACT_ROOT} ← {@code agent.persistent-artifact.root}（原 PersistentArtifactRegistry 键）与
+ *       {@link #LEGACY_ARTIFACT_ROOT_SECONDARY}（原 AgentArtifactService 键，D22-5.1.3 第二别名；
+ *       双旧键取值冲突且新键未设时启动 fail-closed，见 {@link #resolveArtifactRoot(Environment)}）</li>
  *   <li>{@link #KEY_DATASET_ROOT} ← {@code agent.tools.market-data.dataset.path}（现存 dataset 根键；
  *       WorkspaceManifestWriter 原为硬编码前缀 {@code /data/agent_datasets/}，无旧键）</li>
  *   <li>{@link #KEY_OBSERVABILITY_DEBUG_FILE} ← {@code agent.observability.debug-file.path}</li>
@@ -47,8 +49,9 @@ import java.nio.file.Paths;
  * <ul>
  *   <li>不接管 {@code agent.llm.prompt-base-dir}（D01 权威）；</li>
  *   <li>不实现对象存储适配器 / 跨机共享本体（D04 §4.4）；</li>
- *   <li>不覆盖 K3 {@code agent.artifact.storage.path}（AgentArtifactService 独立子系统，
- *       与 K2 同树不同规则，统一方向待 D22-5.1.3 裁定，见映射文档）。</li>
+ *   <li>K3 {@code agent.artifact.storage.path} 自 D22-5.1.3 起已收敛为 artifactRoot 的第二
+ *       legacy alias（{@link #LEGACY_ARTIFACT_ROOT_SECONDARY}）：新键未设而双旧键取值不同
+ *       时启动 fail-closed（抛 {@link StorageRootUnavailableException}，消息只列键名不列值）。</li>
  * </ul>
  *
  * @author ccqwen
@@ -67,6 +70,15 @@ public class AgentStoragePaths {
     /** 旧键别名（一期兼容；新键未设时回退）。 */
     public static final String LEGACY_WORKSPACE_ROOT = "agent.workspace.root";
     public static final String LEGACY_ARTIFACT_ROOT = "agent.persistent-artifact.root";
+    /**
+     * artifactRoot 的第二 legacy alias（D22-5.1.3 K3 收敛）：原 AgentArtifactService 键。
+     *
+     * <p>仅在新键 {@link #KEY_ARTIFACT_ROOT} 未设置时参与回退；与
+     * {@link #LEGACY_ARTIFACT_ROOT} 同时设置且取值不同时，启动期 fail-closed：
+     * 抛 {@link StorageRootUnavailableException}，异常消息只列两个键名、绝不包含取值
+     * （防止路径值泄漏进日志 / 异常）。
+     */
+    public static final String LEGACY_ARTIFACT_ROOT_SECONDARY = "agent.artifact.storage.path";
     public static final String LEGACY_DATASET_ROOT = "agent.tools.market-data.dataset.path";
     public static final String LEGACY_OBSERVABILITY_DEBUG_FILE = "agent.observability.debug-file.path";
 
@@ -83,12 +95,16 @@ public class AgentStoragePaths {
 
     /**
      * Spring 入口：新键 → 旧键别名 → 默认值。
+     *
+     * <p>artifactRoot 独用双旧键解析链（D22-5.1.3 K3 收敛，冲突 fail-closed，
+     * 见 {@link #resolveArtifactRoot(Environment)}）；其余三根保持单旧键行为不变。
+     * 显式值构造器不经本解析链，不受冲突检查影响。
      */
     @Autowired
     public AgentStoragePaths(Environment environment) {
         this(
                 resolveRoot(environment, KEY_WORKSPACE_ROOT, LEGACY_WORKSPACE_ROOT, DEFAULT_WORKSPACE_ROOT),
-                resolveRoot(environment, KEY_ARTIFACT_ROOT, LEGACY_ARTIFACT_ROOT, DEFAULT_ARTIFACT_ROOT),
+                resolveArtifactRoot(environment),
                 resolveRoot(environment, KEY_DATASET_ROOT, LEGACY_DATASET_ROOT, DEFAULT_DATASET_ROOT),
                 resolveRoot(environment, KEY_OBSERVABILITY_DEBUG_FILE, LEGACY_OBSERVABILITY_DEBUG_FILE,
                         DEFAULT_OBSERVABILITY_DEBUG_FILE)
@@ -194,6 +210,44 @@ public class AgentStoragePaths {
             return legacy;
         }
         return defaultValue;
+    }
+
+    /**
+     * artifactRoot 专用解析链（D22-5.1.3 K3 收敛）：新键 → 双旧键别名 → 默认值。
+     *
+     * <ol>
+     *   <li>新键 {@link #KEY_ARTIFACT_ROOT} 非空白 → 直接短路返回，不读取也不比较任何旧键；</li>
+     *   <li>否则读取两条旧键（{@link #LEGACY_ARTIFACT_ROOT} / {@link #LEGACY_ARTIFACT_ROOT_SECONDARY}）：
+     *       均已设置且取值不同 → 启动期 fail-closed，抛 {@link StorageRootUnavailableException}
+     *       （消息只列两个键名，绝不包含取值，防止路径值泄漏进日志 / 异常）；
+     *       否则取任一非空白值（两者相等时即该值）；</li>
+     *   <li>均未设置 → {@link #DEFAULT_ARTIFACT_ROOT}。</li>
+     * </ol>
+     */
+    private static String resolveArtifactRoot(Environment environment) {
+        String value = environment == null ? null : environment.getProperty(KEY_ARTIFACT_ROOT);
+        if (value != null && !value.isBlank()) {
+            return value;
+        }
+        String legacy1 = environment == null ? null : environment.getProperty(LEGACY_ARTIFACT_ROOT);
+        String legacy2 = environment == null ? null : environment.getProperty(LEGACY_ARTIFACT_ROOT_SECONDARY);
+        boolean hasLegacy1 = legacy1 != null && !legacy1.isBlank();
+        boolean hasLegacy2 = legacy2 != null && !legacy2.isBlank();
+        if (hasLegacy1 && hasLegacy2 && !legacy1.equals(legacy2)) {
+            String message = "storage root unavailable: conflicting legacy aliases for artifact root, "
+                    + LEGACY_ARTIFACT_ROOT + " and " + LEGACY_ARTIFACT_ROOT_SECONDARY
+                    + " are both set with different values; unset one of them or set the canonical key "
+                    + KEY_ARTIFACT_ROOT + " (configured values intentionally not disclosed)";
+            log.error(message);
+            throw new StorageRootUnavailableException(message);
+        }
+        if (hasLegacy1) {
+            return legacy1;
+        }
+        if (hasLegacy2) {
+            return legacy2;
+        }
+        return DEFAULT_ARTIFACT_ROOT;
     }
 
     private static Path normalize(String value, String keyLabel) {

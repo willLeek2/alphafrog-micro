@@ -8,6 +8,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -15,6 +16,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * D04 统一存储路径门面测试（W5 task #105）。
  *
  * <p>覆盖：新键 → 旧键别名 → 默认值解析链、空白回退、dataset 旧键别名、
+ * artifactRoot 第二 legacy alias（D22-5.1.3 K3）与双旧键冲突 fail-closed、
  * §4.3 可达性失败信号（requireWritableRoot / verifyDumpTarget）。
  */
 class AgentStoragePathsTest {
@@ -98,6 +100,66 @@ class AgentStoragePathsTest {
         AgentStoragePaths paths = new AgentStoragePaths(env);
 
         assertEquals(Path.of("/custom/datasets"), paths.datasetRoot());
+    }
+
+    @Test
+    void newArtifactKeyShouldShortCircuitEvenWhenLegacyKeysConflict() {
+        // D22-5.1.3：新键设置时短路——不读取也不比较任何旧键，
+        // 即使两条旧键取值冲突也不应 fail-closed。
+        MockEnvironment env = new MockEnvironment()
+                .withProperty(AgentStoragePaths.KEY_ARTIFACT_ROOT, "/new/artifacts")
+                .withProperty(AgentStoragePaths.LEGACY_ARTIFACT_ROOT, "/legacy/a")
+                .withProperty(AgentStoragePaths.LEGACY_ARTIFACT_ROOT_SECONDARY, "/legacy/b");
+
+        AgentStoragePaths paths = new AgentStoragePaths(env);
+
+        assertEquals(Path.of("/new/artifacts"), paths.artifactRoot());
+    }
+
+    @Test
+    void legacyArtifactRootAloneShouldResolveArtifactRoot() {
+        MockEnvironment env = new MockEnvironment()
+                .withProperty(AgentStoragePaths.LEGACY_ARTIFACT_ROOT, "/legacy/artifacts");
+
+        AgentStoragePaths paths = new AgentStoragePaths(env);
+
+        assertEquals(Path.of("/legacy/artifacts"), paths.artifactRoot());
+    }
+
+    @Test
+    void legacyArtifactStoragePathAloneShouldResolveArtifactRoot() {
+        // D22-5.1.3：K3 agent.artifact.storage.path 成为 artifactRoot 的第二 legacy alias。
+        MockEnvironment env = new MockEnvironment()
+                .withProperty(AgentStoragePaths.LEGACY_ARTIFACT_ROOT_SECONDARY, "/k3/artifacts");
+
+        AgentStoragePaths paths = new AgentStoragePaths(env);
+
+        assertEquals(Path.of("/k3/artifacts"), paths.artifactRoot());
+    }
+
+    @Test
+    void equalLegacyArtifactValuesShouldResolveWithoutConflict() {
+        MockEnvironment env = new MockEnvironment()
+                .withProperty(AgentStoragePaths.LEGACY_ARTIFACT_ROOT, "/same/artifacts")
+                .withProperty(AgentStoragePaths.LEGACY_ARTIFACT_ROOT_SECONDARY, "/same/artifacts");
+
+        AgentStoragePaths paths = new AgentStoragePaths(env);
+
+        assertEquals(Path.of("/same/artifacts"), paths.artifactRoot());
+    }
+
+    @Test
+    void conflictingLegacyArtifactValuesShouldFailClosedAtConstruction() {
+        MockEnvironment env = new MockEnvironment()
+                .withProperty(AgentStoragePaths.LEGACY_ARTIFACT_ROOT, "/legacy/a")
+                .withProperty(AgentStoragePaths.LEGACY_ARTIFACT_ROOT_SECONDARY, "/legacy/b");
+
+        StorageRootUnavailableException ex = assertThrows(StorageRootUnavailableException.class,
+                () -> new AgentStoragePaths(env));
+        assertTrue(ex.getMessage().contains(AgentStoragePaths.LEGACY_ARTIFACT_ROOT));
+        assertTrue(ex.getMessage().contains(AgentStoragePaths.LEGACY_ARTIFACT_ROOT_SECONDARY));
+        assertFalse(ex.getMessage().contains("/legacy/a"));
+        assertFalse(ex.getMessage().contains("/legacy/b"));
     }
 
     @Test

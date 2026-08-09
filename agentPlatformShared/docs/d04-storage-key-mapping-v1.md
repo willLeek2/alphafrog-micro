@@ -27,6 +27,7 @@ D04 一期只收敛四个存储根/文件，全部经 `AgentStoragePaths` 单一
 ```
 
 - 新键或旧键取值为 `null`/空白 → 视为未设置，继续回退（yml `${ENV:}` 占位在 env 未设时解析为空串，同样按未设置处理）。
+- artifactRoot 独用双旧键解析链（D22-5.1.3 K3 收敛，见 §5-K3）：新键 > legacy；新键设置时短路，不读取也不比较任何旧键；新键未设而两 legacy 键同时设置且取值不同 → 启动 fail-closed（抛 `StorageRootUnavailableException`，消息只列键名不列值）。其余三根保持单旧键行为不变。
 - 解析发生在 bean 构造期（create-time freeze）：**路径键无 Nacos 热更通道**（审计 R8：Python 动态白名单 `nacos_config.py` `KNOWN_DYNAMIC_KEYS` 与 Java Nacos dataId 均不含路径键），运行期改 Nacos 不会影响已解析根；根迁移只能走重启级发布。
 - 所有 getter 返回规范化绝对路径（相对路径按进程 CWD 解析后 `toAbsolutePath().normalize()`）。
 
@@ -35,7 +36,7 @@ D04 一期只收敛四个存储根/文件，全部经 `AgentStoragePaths` 单一
 | 根 | 新键 | 旧键（一期别名） | 代码默认值 | yml env 占位 | 兼容期 | 迁移注意 |
 |---|---|---|---|---|---|---|
 | workspace | `agent.storage.workspace-root` | `agent.workspace.root` | `/data/agent_workspaces` | `AF_AGENT_STORAGE_WORKSPACE_ROOT` | 旧键长期保留为别名，一期无删除计划 | K1 原无任何 override，唯一消费链为 workspace dump 包；无读回 API，改根不影响既有查询面 |
-| artifact | `agent.storage.artifact-root` | `agent.persistent-artifact.root` | `/data/agent_artifacts` | `AF_AGENT_STORAGE_ARTIFACT_ROOT` | 同上 | 与 K3 `agent.artifact.storage.path` 共树（见 §5-K3）；Redis meta 存绝对路径（§6-R2） |
+| artifact | `agent.storage.artifact-root` | `agent.persistent-artifact.root`；`agent.artifact.storage.path`（第二 legacy alias，即 K3，D22-5.1.3 收敛） | `/data/agent_artifacts` | `AF_AGENT_STORAGE_ARTIFACT_ROOT` | 同上；兼容窗口 = 只要 legacy 键仍被任一组件设置即持续生效；退休条件 = 当所有部署环境确认停用 `agent.artifact.storage.path` 与 `agent.persistent-artifact.root`、统一使用新键后，legacy 解析可在后续版本移除 | 优先级新键 > legacy；两 legacy 冲突且新键未设 → 启动 fail closed（抛 `StorageRootUnavailableException`，只列键名不列值）；历史制品不搬迁不删除（已按旧键解析落盘的 artifact 文件保持原位，只读兼容）；Redis meta 存绝对路径（§6-R2） |
 | dataset | `agent.storage.dataset-root` | `agent.tools.market-data.dataset.path` | `/data/agent_datasets` | `AF_AGENT_STORAGE_DATASET_ROOT` | 同上；旧键仍是 market-data 工具链的现役键 | H1 硬编码前缀的原属根（§4）；K4 有 7 处独立 @Value 声明，一期只收敛门面触达的 consumer（§7） |
 | debug 文件 | `agent.storage.observability-debug-file` | `agent.observability.debug-file.path` | `/data/logs/agent-observability-debug.log` | `AF_AGENT_STORAGE_OBSERVABILITY_DEBUG_FILE` | 同上；伴生开关 `agent.observability.debug-file.enabled` 不变 | 默认路径无 volume 挂载（审计 R9），容器本地写 |
 
@@ -65,7 +66,7 @@ yml 声明位置：`agentLangchainService/src/main/resources/application-agent-p
 
 | 键 | 原因 |
 |---|---|
-| K3 `agent.artifact.storage.path`（`AgentArtifactService.java:51`） | 与 K2 共树 `/data/agent_artifacts` 但相对路径规则不同（`{runId}/scripts\|datasets/…`），且两键均无任何 override（审计 R1：只改其一会造成物理树静默分裂）。归 D22-5.1.3 主注册表方向裁决后一并收敛。 |
+| K3 `agent.artifact.storage.path`（`AgentArtifactService.java:51`） | **已于 D22-5.1.3 收敛**：作为 artifactRoot 的第二 legacy alias（`LEGACY_ARTIFACT_ROOT_SECONDARY`）并入门面解析链。优先级新键 > legacy（新键设置时短路，不读取也不比较旧键）；新键未设而两 legacy 键同时设置且取值不同 → 启动 fail closed（抛 `StorageRootUnavailableException`，消息只列键名不列值）。兼容政策：历史制品不搬迁不删除（已按旧键解析落盘的 artifact 文件保持原位，只读兼容）；兼容窗口 = 只要 legacy 键仍被任一组件设置即持续生效；退休条件 = 当所有部署环境确认停用 `agent.artifact.storage.path` 与 `agent.persistent-artifact.root`、统一使用新键后，legacy 解析可在后续版本移除。K3 与 K2 共树 `/data/agent_artifacts` 但相对路径规则不同（`{runId}/scripts\|datasets/…`，审计 R1），`AgentArtifactService` 本体仍直读 K3，消费方切换归后续 slice。 |
 | K5 `agent.tools.market-data.dataset.database-fetched-path`（`/data/database_fetched`）、K6 `…manifests-path`（`/data/manifests`） | dataset 域的邻近键，但属四层布局树（写方 `DatasetWriter`/`ManifestWriter`，消费链含 01→02 事件与沙箱 cp），归 D21-B/D22 slice，不与四根门面混改。 |
 | K8/K9/K10（llm config-file / prompt-base-dir 族） | D01 域（prompt/config 加载），非存储根。 |
 | K11/K12/H3/H4（debug observability 两路 `/app/logs/…`） | 注入方式异构（@ConfigurationProperties / System.getenv），且根在容器内、与四根无共享消费方；留后续收敛。 |
@@ -93,7 +94,7 @@ yml 声明位置：`agentLangchainService/src/main/resources/application-agent-p
 | `PersistentArtifactRegistry` | `artifactRoot()` 替换 @Value；`register` 前 `requireWritableRoot` |
 | `AgentObservabilityDebugFileWriter` | `observabilityDebugFile()` 替换 @Value 路径（best-effort 语义不变） |
 
-**仍直读、由后续 slice 收敛**：`AgentArtifactService`（K3/K4，D22）、`DatasetRegistry`/`DatasetWriter`/`ManifestWriter`（K4–K6，D21-B）、`WorkspaceHealthVerifier`/`WorkspaceAssetCollector`（K4，D21-A 协同；后者为 dead injection，审计 R11）、Python 侧 P1–P6（Kimi slice）、`DebugObservabilityService`/frontend debug 两路（K11/K12）。
+**仍直读、由后续 slice 收敛**：`AgentArtifactService`（K3 键已于 D22-5.1.3 收敛为门面第二 legacy alias，见 §5-K3；服务本体仍直读待切换；K4，D22）、`DatasetRegistry`/`DatasetWriter`/`ManifestWriter`（K4–K6，D21-B）、`WorkspaceHealthVerifier`/`WorkspaceAssetCollector`（K4，D21-A 协同；后者为 dead injection，审计 R11）、Python 侧 P1–P6（Kimi slice）、`DebugObservabilityService`/frontend debug 两路（K11/K12）。
 
 ## 8. §4.1 单点切换运维口径
 
@@ -106,7 +107,7 @@ yml 声明位置：`agentLangchainService/src/main/resources/application-agent-p
 
 ## 9. 验证
 
-- `AgentStoragePathsTest`（agentPlatformShared，13 用例）：默认值 / 旧键别名 / 新键优先 / 空白回退 / dataset 旧键=market-data 键 / `requireWritableRoot` 建目录与两类失败 / `verifyDumpTarget` 越界与 null / 显式构造器归一化与空白拒绝。
+- `AgentStoragePathsTest`（agentPlatformShared，18 用例）：默认值 / 旧键别名 / 新键优先 / 空白回退 / dataset 旧键=market-data 键 / artifactRoot 第二 legacy alias（K3 单设、双 legacy 同值、新键短路于双 legacy 冲突、双 legacy 冲突 fail-closed 且消息只列键名不列值）/ `requireWritableRoot` 建目录与两类失败 / `verifyDumpTarget` 越界与 null / 显式构造器归一化与空白拒绝。
 - `WorkspaceManifestWriterTest`（agentLangchainService，4 用例）：refPath 走配置根（断言不再出现 `/data/agent_datasets` 前缀）/ 越界目标 SecurityException 且零落盘 / 根不可达 StorageRootUnavailableException / 既有五文件契约不回归。
 - `ToolOutputRefServiceImplTest`（agentPlatformShared，6 用例）：改为经显式构造器注入门面根（替代原 @Value 反射注入），行为断言不变。
 - 红线自检：diff 无新增 `/data/agent_*` 硬编码（`DEFAULT_*` 常量为四根既有默认值的集中化，属现状继承）；四根清单齐全（§1）；可达性失败信号齐全（§4）；未触碰 `agent.llm.prompt-base-dir`（D01）；未引入对象存储/跨机共享（§4.4）。
