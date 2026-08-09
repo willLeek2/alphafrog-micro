@@ -1255,4 +1255,71 @@ class PythonSandboxGatewayServiceImplD13Test {
         assertTrue(event.contains(
                 "\"errorCategory\":\"OPERATION_LOOKUP_SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED\""));
     }
+
+    // === Round-2 MUST-FIX #1 regression (Cindy 50caba3f): terminal status + /result 2xx
+    //     empty body — exact regression for the production branch added in 7b6180cc.
+    //     Combines distinct-client layering + behavioral shape + JSONL telemetry in one
+    //     end-to-end case so the branch can never silently regress to not-ready again. ===
+
+    @Test
+    void getTaskResultTerminalStatusWithResult204EmptyBodyPreservesTypedDetailAndEmitsSingleResultError() throws Exception {
+        // Cindy 50caba3f: production branch `terminal status + /result 2xx empty body` MUST
+        // NOT fall through to not-ready. Verifies: taskId/status preserved, error non-blank,
+        // detail=UNSPECIFIED + actual 204 downstream status, short precheck + long result
+        // each called exactly once, and result fetch emits exactly ONE final ERROR event
+        // with frozen GET_RESULT_..._UNSPECIFIED category + ACTUAL 204 httpStatus. The status
+        // precheck's OK event uses the /tasks/{id} endpoint (no /result suffix), so filtering
+        // by /result isolates the result-fetch signal.
+        RestTemplate longClient = new RestTemplate();
+        RestTemplate shortClient = new RestTemplate();
+        MockRestServiceServer longServer = MockRestServiceServer.createServer(longClient);
+        MockRestServiceServer shortServer = MockRestServiceServer.createServer(shortClient);
+
+        PythonSandboxGatewayServiceImpl gateway = newGatewayDistinctClients(longClient, shortClient);
+
+        bindSession("run-t204", "sess-t204");
+        shortServer.expect(once(), requestTo("http://sandbox/tasks/task-1"))
+                .andRespond(withSuccess(
+                        "{\"task_id\":\"task-1\",\"status\":\"SUCCEEDED\"}",
+                        MediaType.APPLICATION_JSON));
+        longServer.expect(once(), requestTo("http://sandbox/tasks/task-1/result"))
+                .andRespond(withStatus(HttpStatus.NO_CONTENT));
+
+        TaskResultResponse response = gateway.getTaskResult(
+                GetTaskResultRequest.newBuilder().setTaskId("task-1").build());
+
+        longServer.verify();
+        shortServer.verify();
+
+        // Behavioral shape — preserves typed detail, does NOT fall through to not-ready.
+        assertEquals("task-1", response.getTaskId(), "taskId MUST be preserved");
+        assertEquals("SUCCEEDED", response.getStatus(), "status MUST be preserved");
+        assertFalse(response.getError().isBlank(), "error MUST be non-blank");
+        assertTrue(response.hasErrorDetail(), "typed detail MUST be present");
+        assertEquals(
+                SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED,
+                response.getErrorDetail().getCategory());
+        assertTrue(response.getErrorDetail().hasDownstreamHttpStatus());
+        assertEquals(204, response.getErrorDetail().getDownstreamHttpStatus(),
+                "downstream_http_status MUST be actual 204, not hardcoded 200");
+
+        // JSONL telemetry — result fetch emits exactly ONE final ERROR event. The status
+        // precheck's OK event uses the /tasks/{id} endpoint, so filtering by /result
+        // endpoint + ERROR status isolates the result-fetch signal.
+        List<String> allHttpEvents = readSandboxHttpEvents(sessionDir, "run-t204");
+        List<String> resultErrorEvents = allHttpEvents.stream()
+                .filter(line -> line.contains("\"endpoint\":\"http://sandbox/tasks/task-1/result\""))
+                .filter(line -> line.contains("\"status\":\"ERROR\""))
+                .toList();
+        assertEquals(1, resultErrorEvents.size(),
+                "result fetch MUST emit exactly ONE final ERROR event; got all events: "
+                        + allHttpEvents);
+        String event = resultErrorEvents.get(0);
+        assertTrue(event.contains(
+                "\"errorCategory\":\"GET_RESULT_SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED\""),
+                "result ERROR event MUST carry frozen GET_RESULT_..._UNSPECIFIED category; got: "
+                        + event);
+        assertTrue(event.contains("\"httpStatus\":204"),
+                "result ERROR event MUST carry ACTUAL 204 httpStatus; got: " + event);
+    }
 }
