@@ -26,6 +26,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -42,6 +43,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
@@ -118,10 +120,12 @@ import static org.mockito.Mockito.when;
  *       （{@link #ghostPurgeUnderConcurrentMutationShouldKeepHardBudgetAndProgress}）；
  *       脚本形态守卫 {@link #claimAndAddScriptsShouldUseZrangeWindowRotationNotSmembers}</li>
  *   <li>②游标键被短 TTL 候选覆盖 → 游标键整体废除：轮转状态编码在 score 排序本身，
- *       序号键 run-seq 与索引键同滑动过期；序号键丢失只退化为新成员可能排前、不丢数据不报错
+ *       序号键 run-seq 与索引键同滑动过期；序号键丢失不丢数据不报错——第六轮起发号前
+ *       先抬 seq 至当前最大 score，排序与持续推进也不降级
  *       （{@link #seqKeyLossShouldDegradeWithoutDataLossOrErrors}）</li>
  *   <li>③测试 fake 不是 Redis 语义 → 本文件 fake 全量重写：ZSET 按 (score 升序, 成员字典序)
- *       排序，INCRBY 保留键 TTL（Redis 语义），extendOnly 对 -2 no-op / 对 -1 补设，
+ *       排序，INCRBY 保留键 TTL（Redis 语义），extendOnly 对 -2 no-op、对既有永久键（-1）
+ *       保持永久绝不缩短、对本次新建键补设有限 TTL、既有有限键只延长，
  *       五种脚本按 ARGV 个数分发且共用一把锁模拟 Redis 单线程原子执行</li>
  *   <li>④TTL 归一化分裂（meta 12h vs 索引 1h → 双重认领）→ 唯一归一化点 effectiveTtlHours
  *       （{@link #ttlNormalizationShouldApplyDefaultBeforeMetaAndAllScriptArgs}）；
@@ -137,6 +141,22 @@ import static org.mockito.Mockito.when;
  *       {@link #scoresShouldBeStrictlyMonotonicEvenForSameMillisecondRegistrations}</li>
  *   <li>边界约束 1/3：已检查活成员严格移到未检查成员之后（进展）、v4 原子合同
  *       （身份 CAS → 清理 → 容量检查 → 写入单脚本）保留 —— 见窗口轮转与第二轮各组反测</li>
+ * </ul>
+ *
+ * <h3>第六轮 MUST-FIX 反测（1a74ca02 四项）</h3>
+ * <ul>
+ *   <li>①touch 状态码 2 必须"失败且零副作用"：身份冲突只读预检先于一切可见写入，
+ *       失败前后 meta 原文、meta TTL、run 列表 score、seq 值全量不变 ——
+ *       {@link #touchScriptStatusCodesShouldDriveJavaExceptions}（状态码 2 段）</li>
+ *   <li>②run-seq 丢失后持续推进不降级：每次发号前把 seq 原子抬到至少当前 ZSET 最大
+ *       score（floorSeqToTopScore）再 INCRBY ——
+ *       {@link #seqLossWithHighScoresAndGhostTailShouldStillAdvance}（N&gt;128 + 高分 +
+ *       删 seq + 后段 ghost：幸存者严格大于未检查最大值、声明轮数内清完）/
+ *       {@link #touchAfterSeqLossShouldMoveMemberToTrueTail}（touch 移到真正队尾）</li>
+ *   <li>③永久 TTL(-1) 既有保持永久 + 本次新建获得有限 TTL 两向 ——
+ *       {@link #extendOnlyShouldKeepPreexistingPersistentKeysAndGiveNewKeysTtl}</li>
+ *   <li>④Testcontainers 集成测试默认禁用门禁归 agentPlatformShared/pom.xml
+ *       （surefire excludes + redis-integration opt-in profile），本文件不涉及</li>
  * </ul>
  *
  * <p>Redis 用线程安全内存 fake（ConcurrentHashMap 三张表：values 字符串 / hashes 哈希 /
@@ -946,14 +966,21 @@ class PersistentArtifactRegistryTest {
         // codex 62ad12bd ① + 第五轮 ① 反测（脚本形态守卫）：幽灵清理必须走 ZRANGE 窗口
         // 轮转——单次脚本执行只取有界数量的成员（LIMIT 是构造性硬上限，不是 COUNT 式提示），
         // 绝不 SMEMBERS/SSCAN 全量或提示式扫描；轮转状态编码在 score 排序，没有游标键。
+        // v6 第六轮 ②：所有发号脚本必须带 floorSeqToTopScore（ZREVRANGE 有界读末尾 1 项，
+        // 发号前抬 seq 至当前最大 score）；第六轮 ①：touch 的身份冲突判断（HGET）必须
+        // 出现在第一笔可见写入（SET meta）之前。
         @SuppressWarnings("unchecked")
         DefaultRedisScript<String> claim = (DefaultRedisScript<String>) ReflectionTestUtils.getField(
                 PersistentArtifactRegistry.class, "ATOMIC_CLAIM_SCRIPT");
         @SuppressWarnings("unchecked")
         DefaultRedisScript<String> add = (DefaultRedisScript<String>) ReflectionTestUtils.getField(
                 PersistentArtifactRegistry.class, "RUN_LIST_ADD_SCRIPT");
+        @SuppressWarnings("unchecked")
+        DefaultRedisScript<Long> touch = (DefaultRedisScript<Long>) ReflectionTestUtils.getField(
+                PersistentArtifactRegistry.class, "TOUCH_SCRIPT");
         String claimText = claim.getScriptAsString();
         String addText = add.getScriptAsString();
+        String touchText = touch.getScriptAsString();
 
         assertTrue(claimText.contains("zrange"), "认领脚本必须用 ZRANGE 窗口轮转清理");
         assertTrue(claimText.contains("zrem"), "认领脚本必须当场移除幽灵成员");
@@ -973,6 +1000,21 @@ class PersistentArtifactRegistryTest {
         assertFalse(addText.toLowerCase().contains("sscan"), "加入脚本不得用提示式游标扫描");
         assertFalse(addText.toLowerCase().contains("cursor"), "轮转不得依赖独立游标键");
         assertTrue(addText.contains("KEYS[2]"), "加入脚本必须把 run-seq 键作为 KEYS 传入");
+
+        // v6 第六轮 ②：三个发号脚本都必须带 floorSeqToTopScore（ZREVRANGE 有界读末尾
+        // 1 项抬 seq）——seq 单键丢失后持续推进不降级的构造性保证
+        assertTrue(claimText.contains("zrevrange"), "认领脚本发号前必须抬 seq 至当前 ZSET 最大 score");
+        assertTrue(addText.contains("zrevrange"), "加入脚本发号前必须抬 seq 至当前 ZSET 最大 score");
+        assertTrue(touchText.contains("zrevrange"), "touch 发号前必须抬 seq 至当前 ZSET 最大 score");
+        // v6 第六轮 ①：touch 的身份冲突判断（hget）必须先于第一笔可见写入（set meta）——
+        // 文本序守卫 + 行为零副作用断言见 touchScriptStatusCodesShouldDriveJavaExceptions
+        int conflictCheckAt = touchText.indexOf("hget");
+        int firstWriteAt = touchText.indexOf("redis.call('set'");
+        assertTrue(conflictCheckAt >= 0, "touch 脚本必须做身份冲突判断（HGET）");
+        assertTrue(firstWriteAt >= 0, "touch 脚本必须 SET 新 meta");
+        assertTrue(conflictCheckAt < firstWriteAt,
+                "touch 的身份冲突判断必须先于第一笔可见写入（返回 2 零副作用）");
+        assertTrue(touchText.contains("hsetnx"), "touch 仍须以 HSETNX 补建丢失的身份项（严格赢家身份）");
     }
 
     // ===== 第三轮 MUST-FIX ③（第五轮重写）：统一滑动过期协议（touch 同滑动 / 防索引先过期 / EXISTS 修复） =====
@@ -1134,9 +1176,16 @@ class PersistentArtifactRegistryTest {
         // 第五轮 ④ 反测：EXISTS 分支的索引 TTL 刷新时长必须取赢家 meta 键自身的剩余
         // TTL（TTL 命令读回），绝不取输家传入的 ARGV——否则短 TTL 输家改短赢家索引、
         // 长 TTL 输家又把赢家索引拉得比 meta 更久，两个方向都产生漂移。
-        // 构造：赢家 3h 注册、推进 1h（赢家 meta 剩余 2h），人为摘掉三类索引键的
-        // deadline（模拟 TTL 意外丢失），短 TTL 输家（1h）走 EXISTS 采纳——修复后的
-        // 刷新必须把三类键全部补回「赢家 meta 剩余 2h」= 与 meta deadline 重新对齐。
+        // 构造：赢家 3h 注册、推进 1h（赢家 meta 剩余 2h），人为把三类索引键的
+        // deadline 压到只剩 30 分钟（模拟「索引 TTL 比 meta 短」的漂移状态——这正是
+        // 本反测要消灭的故障：索引先于 meta 过期 → 双重认领窗口），短 TTL 输家（1h）
+        // 走 EXISTS 采纳——只延长不缩短的刷新必须把三类键全部延长回「赢家 meta
+        // 剩余 2h」= 与 meta deadline 重新对齐。
+        // v6 第六轮调整（1a74ca02 ③）：旧构造是摘掉 deadline 模拟 TTL 丢失后期望补回，
+        // 但第六轮冻结口径是「既有永久键（无 TTL ≙ -1）保持永久、绝不缩短」，TTL 丢失
+        // 场景归 {@link #extendOnlyShouldKeepPreexistingPersistentKeysAndGiveNewKeysTtl}
+        // 两向反测；本测试改用「索引 deadline 比 meta 短」构造漂移，只延长语义下同样
+        // 能区分刷新时长取自赢家剩余还是输家 ARGV。
         String runId = "run-winner-ttl";
         String seqKey = RUN_SEQ_PREFIX + runId;
         long t0 = fakeNow;
@@ -1146,13 +1195,15 @@ class PersistentArtifactRegistryTest {
         assertEquals(metaDeadline, deadlines.get(META_PREFIX + winner.getArtifactId()));
 
         advanceClock(TimeUnit.HOURS.toMillis(1));
-        // 模拟索引键 TTL 意外丢失（键仍在、只是没有过期时刻）
-        deadlines.remove(RUN_LIST_PREFIX + runId);
-        deadlines.remove(RUN_IDENTITY_PREFIX + runId);
-        deadlines.remove(seqKey);
+        // 模拟索引键 TTL 漂移到比 meta 短（键仍在、deadline 只剩 30 分钟）
+        long driftedDeadline = fakeNow + TimeUnit.MINUTES.toMillis(30);
+        deadlines.put(RUN_LIST_PREFIX + runId, driftedDeadline);
+        deadlines.put(RUN_IDENTITY_PREFIX + runId, driftedDeadline);
+        deadlines.put(seqKey, driftedDeadline);
 
-        // 输家传 1h TTL：若刷新取输家 ARGV，三类键 deadline 会落在 t0+2h（比 meta 短 1h，
-        // 索引先于 meta 过期 → 双重认领窗口）；取赢家剩余 2h 才对齐回 t0+3h。
+        // 输家传 1h TTL：若刷新取输家 ARGV，三类键 deadline 会落在 fakeNow+1h = t0+2h
+        // （仍比 meta 短 1h，索引先于 meta 过期 → 双重认领窗口）；取赢家剩余 2h 才
+        // 对齐回 t0+3h。
         PersistentArtifactRegistration loser = registry.registerIdempotent(
                 runId, "user-1", "python_script", "shared", "脚本", "v2", 1);
         assertEquals(winner.getArtifactId(), loser.getArtifactId(), "输家必须采纳赢家");
@@ -1245,12 +1296,18 @@ class PersistentArtifactRegistryTest {
         // —— 状态码 2：身份槽位被其他 artifactId 占用 → IllegalStateException，绝不覆盖。
         //    手工构造入侵者 meta B：与赢家 A 同身份 field、不同 artifactId。
         String intruderId = "python_script:intruder";
+        String seqKey = RUN_SEQ_PREFIX + runId;
         PersistentArtifactMeta winnerMeta = registry.find(idem.getArtifactId()).orElseThrow();
         PersistentArtifactMeta intruder = registry.find(idem.getArtifactId()).orElseThrow();
         intruder.setArtifactId(intruderId);
         intruder.setIdempotent(Boolean.TRUE);
         values.put(META_PREFIX + intruderId, mapper.writeValueAsString(intruder));
         deadlines.put(META_PREFIX + intruderId, fakeNow + TimeUnit.HOURS.toMillis(6));
+        // v6 第六轮 ①：失败读取必须"零副作用"——先把失败前的世界拍快照
+        String intruderRawBefore = values.get(META_PREFIX + intruderId);
+        Long intruderDeadlineBefore = deadlines.get(META_PREFIX + intruderId);
+        Map<String, Double> listScoresBefore = new LinkedHashMap<>(zsets.get(listKey));
+        String seqBefore = values.get(seqKey);
         IllegalStateException occupied = assertThrows(IllegalStateException.class,
                 () -> registry.readContent(intruderId));
         assertTrue(occupied.getMessage().contains("identity slot occupied"), occupied.getMessage());
@@ -1259,6 +1316,16 @@ class PersistentArtifactRegistryTest {
         assertFalse(zsets.get(listKey).containsKey(intruderId),
                 "状态码 2 在成员同步之前返回，入侵者不得进入 run 列表");
         assertNotNull(winnerMeta);
+        // v6 第六轮 ①：零副作用全量断言——冲突预检先于一切写入，失败前后世界逐字节不变。
+        // 旧实现先 SET 新 meta 再查身份槽，返回 2 不回滚 → 失效制品可被失败读取反复续命。
+        assertEquals(intruderRawBefore, values.get(META_PREFIX + intruderId),
+                "状态码 2 零副作用：入侵者 meta 原文绝不被重写（lastAccess/expires 不得刷新）");
+        assertEquals(intruderDeadlineBefore, deadlines.get(META_PREFIX + intruderId),
+                "状态码 2 零副作用：入侵者 meta TTL 绝不被滑动（失效制品不得被失败读取续命）");
+        assertEquals(listScoresBefore, zsets.get(listKey),
+                "状态码 2 零副作用：run 列表所有成员 score 全量不变");
+        assertEquals(seqBefore, values.get(seqKey),
+                "状态码 2 零副作用：run-seq 值绝不前进（失败读取不得消耗序号）");
 
         // —— 状态码 0：meta 在 find 与 touch 之间消失 → IllegalArgumentException，绝不吞。
         //    （单线程 fake 无法在 find/touch 之间插入过期，直接对私有 touch 注入已消失的 meta）
@@ -1276,29 +1343,189 @@ class PersistentArtifactRegistryTest {
 
     @Test
     void seqKeyLossShouldDegradeWithoutDataLossOrErrors() {
-        // 第五轮 ② 反测（替代被废除的游标键）：run-seq 键若因 Redis 重启/逐出丢失，
-        // 发号从 1 重来——仅退化为"新成员可能排在旧成员之前"，绝不丢数据、绝不报错，
-        // 硬预算与持续进展仍成立。（旧游标键方案的对应故障是游标被短 TTL 候选覆盖，
-        // 本方案没有游标键，这类漂移从构造上消失。）
+        // 第五轮 ② 反测（替代被废除的游标键）+ v6 第六轮 ②：run-seq 键若因 Redis
+        // 重启/逐出丢失，绝不丢数据、绝不报错，硬预算与持续进展仍成立。第六轮起每次
+        // 发号前先把 seq 原子抬到至少当前 ZSET 最大 score 再 INCRBY——排序语义与
+        // 「幸存者严格移到未检查成员之后」的持续推进完全不降级。（旧游标键方案的对应
+        // 故障是游标被短 TTL 候选覆盖，本方案没有游标键，这类漂移从构造上消失。）
         String runId = "run-seqloss";
         String seqKey = RUN_SEQ_PREFIX + runId;
         registry.registerExplicit(runId, "user-1", "raw-ref", "a", "1", "one", 6);
         registry.registerExplicit(runId, "user-1", "raw-ref", "b", "2", "two", 6);
         registry.registerExplicit(runId, "user-1", "raw-ref", "c", "3", "three", 6);
         assertNotNull(values.get(seqKey), "注册后 run-seq 键必须在场");
+        double maxScoreBeforeLoss = zsets.get(RUN_LIST_PREFIX + runId).values().stream()
+                .mapToDouble(Double::doubleValue).max().orElseThrow();
 
         // 模拟序号键丢失（重启/逐出）
         values.remove(seqKey);
         deadlines.remove(seqKey);
 
-        // 下一次注册必须正常成功：窗口轮转重打分与新成员入列都从 1 重新发号
+        // 下一次注册必须正常成功：轮转重打分前先把 seq 抬到当前最大 score 再继续发号
         PersistentArtifactRegistration after = registry.registerExplicit(
                 runId, "user-1", "raw-ref", "d", "4", "four", 6);
         assertNotNull(after.getArtifactId(), "序号键丢失后注册不得失败");
         Map<String, Double> zset = zsets.get(RUN_LIST_PREFIX + runId);
         assertEquals(4, zset.size(), "四个成员一个都不能丢");
         assertEquals(4, registry.listByRunId(runId).size(), "列表必须完整可读");
-        assertEquals("4", values.get(seqKey), "发号从 1 重来：重打分 3 个 + 新成员 1 个");
+        // 三次注册共发号 6（每轮轮转重打分也发号），丢 seq 后抬到 6 → 重打分 +3 → 9
+        // → 新成员 +1 → 10：seq 严格接在旧最大 score 之后，绝不回到 0
+        assertEquals("10", values.get(seqKey), "丢 seq 后发号必须先抬到当前最大 score 再继续");
+        double minScore = zset.values().stream().mapToDouble(Double::doubleValue).min().orElseThrow();
+        assertTrue(minScore > maxScoreBeforeLoss,
+                "丢 seq 后重打分的所有成员必须严格大于丢失前的最大 score（持续推进不降级）");
+    }
+
+    // ===== 第六轮 ②：seq 丢失后持续推进不降级（N>128 + 高分 + 尾部 ghost） =====
+
+    @Test
+    void seqLossWithHighScoresAndGhostTailShouldStillAdvance() {
+        // 第六轮 ② 反测（codex 1a74ca02）：成员数超过幽灵清理预算（128）时，窗口轮转
+        // 只覆盖得分最低的 128 个成员，尾部高分成员留在未检查段。此时若 run-seq 键丢失，
+        // 旧实现的轮转从 0 重新 INCRBY，幸存者会被重打分到未检查段之前，直接破坏
+        // 「幸存者严格移到未检查成员之后」的前提（msg 11764111）与 c2f64dbe 承诺。v6
+        // 每次发号前先把 seq 原子抬到至少当前 ZSET 最大 score（floorSeqToTopScore）。
+        // 本测试构造 N=130 > 128 + 高 score + 窗口头 ghost + 尾部 ghost + 删 seq，断言：
+        // 第一轮窗口头 ghost 被清、尾部 ghost（在窗口外）存活、所有幸存者 score 严格大于
+        // 丢失前最大 score（未检查最大值）；第二轮尾部 ghost 也被清，固定集在声明轮数内
+        // 清到零 ghost，且全程一个活成员都不丢。
+        ReflectionTestUtils.setField(registry, "maxRunListEntries", 1000);
+        String runId = "run-seqloss-advance";
+        String seqKey = RUN_SEQ_PREFIX + runId;
+        String listKey = RUN_LIST_PREFIX + runId;
+        int n = 130; // > GHOST_PURGE_BUDGET（128）：尾部成员必然落在轮转窗口之外
+        for (int i = 0; i < n; i++) {
+            registry.registerExplicit(runId, "user-1", "raw-ref", "adv-" + i,
+                    "n" + i, "payload-" + i, 6);
+        }
+        Map<String, Double> zset = zsets.get(listKey);
+        assertEquals(n, zset.size(), "130 个成员必须全部入列");
+        long seqBeforeLoss = Long.parseLong(values.get(seqKey));
+        double maxScoreBeforeLoss = zset.values().stream()
+                .mapToDouble(Double::doubleValue).max().orElseThrow();
+        assertEquals((double) seqBeforeLoss, maxScoreBeforeLoss,
+                "floor 不变量：正常注册下 seq 恒等于当前最大 score");
+        List<String> sorted = sortedMembers(zset);
+        String windowGhost = sorted.get(0);     // 最低分：落在第一轮轮转窗口内
+        String secondToLast = sorted.get(n - 2); // 第一轮仍在未检查段（窗口外高分成员）
+        String tailGhost = sorted.get(n - 1);   // 最高分：第一轮窗口外的尾部 ghost
+        values.remove(META_PREFIX + windowGhost);
+        deadlines.remove(META_PREFIX + windowGhost);
+        values.remove(META_PREFIX + tailGhost);
+        deadlines.remove(META_PREFIX + tailGhost);
+        values.remove(seqKey); // 模拟序号键单键丢失（重启/逐出）
+        deadlines.remove(seqKey);
+
+        // 第一轮：窗口头 ghost 当场清除；尾部 ghost 在窗口外，本轮存活；所有幸存者
+        // 在 seq 抬高后重打分，严格大于丢失前最大 score（即未检查段最大值）
+        PersistentArtifactRegistration round1 = registry.registerExplicit(
+                runId, "user-1", "raw-ref", "adv-new1", "n1", "new-1", 6);
+        assertFalse(zset.containsKey(windowGhost), "窗口头 ghost 必须在第一轮被清除");
+        assertTrue(zset.containsKey(tailGhost), "尾部 ghost 在窗口外，第一轮必须存活");
+        for (Map.Entry<String, Double> entry : zset.entrySet()) {
+            String member = entry.getKey();
+            if (member.equals(tailGhost) || member.equals(secondToLast)
+                    || member.equals(round1.getArtifactId())) {
+                continue; // 未检查段两个成员与新成员分别断言
+            }
+            assertTrue(entry.getValue() > maxScoreBeforeLoss,
+                    "幸存者 " + member + " 必须严格移到未检查段之后：score=" + entry.getValue()
+                            + "，未检查最大值=" + maxScoreBeforeLoss);
+        }
+        assertTrue(zset.get(round1.getArtifactId()) > maxScoreBeforeLoss,
+                "新成员也必须严格大于丢失前最大 score");
+
+        // 第二轮：尾部 ghost 转入窗口被清除；固定集在声明轮数内清到零 ghost，
+        // 且一个活成员都不丢
+        registry.registerExplicit(runId, "user-1", "raw-ref", "adv-new2", "n2", "new-2", 6);
+        assertFalse(zset.containsKey(tailGhost), "尾部 ghost 必须在第二轮被清除");
+        assertEquals(n, zset.size(), "128 个活成员 + 2 个新成员，一个成员都不丢");
+        for (String member : zset.keySet()) {
+            assertTrue(values.containsKey(META_PREFIX + member),
+                    "幽灵清完：列表成员 " + member + " 必须有 meta 键");
+        }
+        assertEquals(n, registry.listByRunId(runId).size(), "列表必须完整可读");
+    }
+
+    @Test
+    void touchAfterSeqLossShouldMoveMemberToTrueTail() {
+        // 第六轮 ② 反测（codex 1a74ca02）：读取 touch 同样是发号点。run-seq 键丢失后，
+        // touch 必须先把 seq 抬到当前 ZSET 最大 score 再发号 +1，把被读取成员移到真正
+        // 队尾——绝不从 0 发号把成员塞回其他成员之前（那会让"最近读取"排在"最久未查"
+        // 之前，破坏清理窗口从最旧查起的语义）。
+        String runId = "run-seqloss-touch";
+        String seqKey = RUN_SEQ_PREFIX + runId;
+        PersistentArtifactRegistration a = registry.registerExplicit(
+                runId, "user-1", "raw-ref", "t-a", "1", "pa", 6);
+        PersistentArtifactRegistration b = registry.registerExplicit(
+                runId, "user-1", "raw-ref", "t-b", "2", "pb", 6);
+        PersistentArtifactRegistration c = registry.registerExplicit(
+                runId, "user-1", "raw-ref", "t-c", "3", "pc", 6);
+        values.remove(seqKey); // 模拟序号键单键丢失（重启/逐出）
+        deadlines.remove(seqKey);
+
+        assertEquals("pa", registry.readContent(a.getArtifactId()));
+        Map<String, Double> zset = zsets.get(RUN_LIST_PREFIX + runId);
+        assertTrue(zset.get(a.getArtifactId()) > zset.get(b.getArtifactId()),
+                "seq 丢失后被读取成员必须移到真正队尾（严格大于其他成员）");
+        assertTrue(zset.get(a.getArtifactId()) > zset.get(c.getArtifactId()),
+                "seq 丢失后被读取成员必须移到真正队尾（严格大于其他成员）");
+        assertEquals((long) Math.rint(zset.get(a.getArtifactId())), Long.parseLong(values.get(seqKey)),
+                "seq 必须等于队尾 score：先抬到旧最大值再发号 +1");
+    }
+
+    // ===== 第六轮 ③：永久 TTL(-1) 两向（既有保持永久 + 本次新建获有限 TTL） =====
+
+    @Test
+    void extendOnlyShouldKeepPreexistingPersistentKeysAndGiveNewKeysTtl() {
+        // 第六轮 ③ 两向反测（codex 1a74ca02）：旧 extendOnly 的 `t == -1 or t < ttl →
+        // EXPIRE` 会把永久键（TTL = -1）转成有限 TTL，与已冻结的 c2f64dbe 承诺
+        // 「-1 视为无限、永不缩短」直接相反。v6 区分「本次调用新建的键」（必须获得有限
+        // TTL，防止永久键泄漏）与「既有键」（只延长：有限键只延长不缩短，永久键保持
+        // 永久）。方向一：既有永久索引键经读取 touch 后仍永久，meta 照常满额滑动；
+        // 方向二：三类索引键整体消失后 touch 重建，重建键全部获得有限 TTL。
+        String runId = "run-persist-ttl";
+        long t0 = fakeNow;
+        PersistentArtifactRegistration registration = registry.registerIdempotent(
+                runId, "user-1", "python_script", "pt", "脚本", "v", 6);
+        String metaKey = META_PREFIX + registration.getArtifactId();
+        String listKey = RUN_LIST_PREFIX + runId;
+        String identityKey = RUN_IDENTITY_PREFIX + runId;
+        String seqKey = RUN_SEQ_PREFIX + runId;
+        // 注册后四类键 deadline 对齐（脚本内同款 TTL 写入）——钉住初始状态
+        assertEquals(t0 + TimeUnit.HOURS.toMillis(6), deadlines.get(metaKey));
+        assertEquals(deadlines.get(metaKey), deadlines.get(listKey));
+        assertEquals(deadlines.get(metaKey), deadlines.get(identityKey));
+        assertEquals(deadlines.get(metaKey), deadlines.get(seqKey));
+
+        // 方向一：既有永久键（无 deadline ≙ 真实 Redis TTL = -1）保持永久，绝不缩短
+        deadlines.remove(listKey);
+        deadlines.remove(identityKey);
+        deadlines.remove(seqKey);
+        advanceClock(TimeUnit.HOURS.toMillis(1));
+        assertEquals("v", registry.readContent(registration.getArtifactId()));
+        assertNull(deadlines.get(listKey), "既有永久列表键不得被缩短为有限 TTL");
+        assertNull(deadlines.get(identityKey), "既有永久身份键不得被缩短为有限 TTL");
+        assertNull(deadlines.get(seqKey), "既有永久序号键不得被缩短为有限 TTL");
+        assertEquals(t0 + TimeUnit.HOURS.toMillis(7), deadlines.get(metaKey),
+                "meta 自身按读取语义照旧满额滑动，不受索引键永久化影响");
+
+        // 方向二：本次调用新建的键必须获得有限 TTL（防止永久键泄漏）
+        zsets.remove(listKey);
+        values.remove(seqKey);
+        hashes.remove(identityKey);
+        deadlines.remove(listKey);
+        deadlines.remove(identityKey);
+        deadlines.remove(seqKey);
+        assertEquals("v", registry.readContent(registration.getArtifactId()));
+        assertEquals(fakeNow + TimeUnit.HOURS.toMillis(6), deadlines.get(listKey),
+                "本次新建的列表键必须获得有限 TTL");
+        assertEquals(fakeNow + TimeUnit.HOURS.toMillis(6), deadlines.get(identityKey),
+                "本次新建的身份键必须获得有限 TTL");
+        assertEquals(fakeNow + TimeUnit.HOURS.toMillis(6), deadlines.get(seqKey),
+                "本次新建的序号键必须获得有限 TTL");
+        assertTrue(zsets.get(listKey).containsKey(registration.getArtifactId()),
+                "重建的列表必须把成员补回");
     }
 
     // ===== 边界约束 2：score 是单调序号不是毫秒时间 =====
@@ -1491,9 +1718,10 @@ class PersistentArtifactRegistryTest {
 
         // 读取 touch 脚本（KEYS=[meta, 列表 ZSET, 身份 hash, run-seq]；4 个 ARGV：
         // 新 meta JSON、TTL 秒数、身份 field（非幂等传空串）、artifactId）：
-        // meta 缺失 → 0；SET 新 meta + 满额 EXPIRE；身份步（空槽 HSETNX 补建、他人占用 → 2、
-        // field='' 整步跳过）；成员 score 以新序号同步（缺失 ZADD NX 补回）；三类索引键
-        // 只延长不缩短 EXPIRE；成功 → 1
+        // meta 缺失 → 0；身份冲突只读预检（先于一切写入，他人占用 → 2 且零副作用）；
+        // SET 新 meta + 满额 EXPIRE；身份步（空槽 HSETNX 补建、field='' 整步跳过）；
+        // 抬 seq 至当前最大 score 后成员 score 以新序号同步（缺失 ZADD NX 补回）；
+        // 三类索引键 TTL 刷新（新建获 TTL、既有只延长、永久保持）；成功 → 1
         org.mockito.Mockito.doAnswer(invocation -> {
             Object[] args = invocation.getArguments();
             @SuppressWarnings("unchecked")
@@ -1516,7 +1744,8 @@ class PersistentArtifactRegistryTest {
 
         // run 列表加入脚本（KEYS=[列表 ZSET, run-seq]；5 个 ARGV：cap、幽灵预算、
         // meta 前缀、artifactId、TTL 秒数）：窗口轮转幽灵清理 → ZCARD 容量检查 →
-        // INCRBY 发号 + ZADD → 列表键与序号键只延长不缩短 TTL 刷新，原子；满则 FULL 不写
+        // 抬 seq 至当前最大 score → INCRBY 发号 + ZADD → 列表键与序号键 TTL 刷新
+        // （本次新建获 TTL、既有只延长不缩短、既有永久保持永久），原子；满则 FULL 不写
         org.mockito.Mockito.doAnswer(invocation -> {
             Object[] args = invocation.getArguments();
             @SuppressWarnings("unchecked")
@@ -1528,18 +1757,21 @@ class PersistentArtifactRegistryTest {
             long ttlSeconds = Long.parseLong(String.valueOf(args[6]));
             synchronized (redisLock) {
                 sweepExpired();
+                boolean listExisted = keyExistsInFake(keys.get(0));
+                boolean seqExisted = keyExistsInFake(keys.get(1));
                 purgeWindow(keys.get(0), keys.get(1), metaPrefix, budget);
                 Map<String, Double> zset = zsets.get(keys.get(0));
                 int size = zset == null ? 0 : zset.size();
                 if (size >= cap) {
                     return "FULL";
                 }
+                floorSeqToTopScore(keys.get(0), keys.get(1));
                 long seq = incrBy(keys.get(1), 1);
                 zsets.computeIfAbsent(keys.get(0), k -> new ConcurrentHashMap<>())
                         .put(artifactId, (double) seq);
                 if (ttlSeconds > 0) {
-                    extendOnlyTtl(keys.get(0), ttlSeconds);
-                    extendOnlyTtl(keys.get(1), ttlSeconds);
+                    extendOnlyTtl(keys.get(0), ttlSeconds, !listExisted);
+                    extendOnlyTtl(keys.get(1), ttlSeconds, !seqExisted);
                 }
                 return "ADDED";
             }
@@ -1553,10 +1785,11 @@ class PersistentArtifactRegistryTest {
 
         // 幂等认领脚本（KEYS=[身份 hash, 列表 ZSET, run-seq]；6 个 ARGV：field、候选 ID、
         // cap、幽灵预算、meta 前缀、TTL 秒数）：已有赢家 → meta 仍在则修复列表成员资格
-        // （ZSCORE 缺失即以新发序号 ZADD 补回）+ 按赢家 meta 键自身剩余 TTL 做三类索引键
-        // 只延长不缩短刷新（绝不取输家 ARGV）→ EXISTS:赢家ID；否则窗口轮转幽灵清理 →
-        // ZCARD 容量检查 → HSET 身份 + INCRBY 发号 + ZADD + TTL 刷新 → CLAIMED。
-        // EXISTS 与写入互斥且整段原子——输家拿到 EXISTS 时赢家身份+列表必然已落盘且可见
+        // （ZSCORE 缺失即抬 seq 后以新序号 ZADD 补回）+ 按赢家 meta 键自身剩余 TTL 做
+        // 三类索引键 TTL 刷新（绝不取输家 ARGV）→ EXISTS:赢家ID；否则窗口轮转幽灵清理
+        // → ZCARD 容量检查 → HSET 身份 + 抬 seq 发号 + ZADD + TTL 刷新（新建获 TTL、
+        // 既有只延长、永久保持）→ CLAIMED。EXISTS 与写入互斥且整段原子——输家拿到
+        // EXISTS 时赢家身份+列表必然已落盘且可见
         org.mockito.Mockito.doAnswer(invocation -> {
             Object[] args = invocation.getArguments();
             @SuppressWarnings("unchecked")
@@ -1585,20 +1818,26 @@ class PersistentArtifactRegistryTest {
     }
 
     /**
-     * fake 侧幂等认领脚本（与生产 ATOMIC_CLAIM_SCRIPT 逐步同语义）。
+     * fake 侧幂等认领脚本（与生产 ATOMIC_CLAIM_SCRIPT 逐步同语义）。v6 第六轮 ②：
+     * 三处发号（EXISTS 修复 / 轮转重打分 / 认领入列）前都先抬 seq 至当前 ZSET 最大
+     * score；③：TTL 刷新区分本次新建与既有键（既有永久保持永久）。
      * 调用方必须已持有 redisLock。
      */
     private String fakeClaim(String identityKey, String listKey, String seqKey,
                              String field, String artifactId, int cap, int budget,
                              String metaPrefix, long ttlSeconds) {
+        boolean identityExisted = keyExistsInFake(identityKey);
+        boolean listExisted = keyExistsInFake(listKey);
+        boolean seqExisted = keyExistsInFake(seqKey);
         Map<String, String> identity = hashes.get(identityKey);
         String existing = identity == null ? null : identity.get(field);
         if (existing != null) {
             if (values.containsKey(metaPrefix + existing)) {
-                // 赢家 meta 仍活：修复列表成员资格（ZSCORE 缺失即以新发序号 ZADD 补回）
+                // 赢家 meta 仍活：修复列表成员资格（ZSCORE 缺失即抬 seq 后以新序号 ZADD 补回）
                 Map<String, Double> zset = zsets.get(listKey);
                 Double score = zset == null ? null : zset.get(existing);
                 if (score == null) {
+                    floorSeqToTopScore(listKey, seqKey);
                     long repairSeq = incrBy(seqKey, 1);
                     zsets.computeIfAbsent(listKey, k -> new ConcurrentHashMap<>())
                             .put(existing, (double) repairSeq);
@@ -1606,9 +1845,9 @@ class PersistentArtifactRegistryTest {
                 // 索引 TTL 刷新只取赢家 meta 键自身剩余 TTL（绝不取输家传入的 ttlSeconds）
                 long winnerTtl = ttlOfSeconds(metaPrefix + existing);
                 if (winnerTtl > 0) {
-                    extendOnlyTtl(identityKey, winnerTtl);
-                    extendOnlyTtl(listKey, winnerTtl);
-                    extendOnlyTtl(seqKey, winnerTtl);
+                    extendOnlyTtl(identityKey, winnerTtl, !identityExisted);
+                    extendOnlyTtl(listKey, winnerTtl, !listExisted);
+                    extendOnlyTtl(seqKey, winnerTtl, !seqExisted);
                 }
             }
             return "EXISTS:" + existing;
@@ -1620,18 +1859,21 @@ class PersistentArtifactRegistryTest {
             return "FULL";
         }
         hashes.computeIfAbsent(identityKey, k -> new ConcurrentHashMap<>()).put(field, artifactId);
+        floorSeqToTopScore(listKey, seqKey);
         long claimSeq = incrBy(seqKey, 1);
         zsets.computeIfAbsent(listKey, k -> new ConcurrentHashMap<>()).put(artifactId, (double) claimSeq);
         if (ttlSeconds > 0) {
-            extendOnlyTtl(identityKey, ttlSeconds);
-            extendOnlyTtl(listKey, ttlSeconds);
-            extendOnlyTtl(seqKey, ttlSeconds);
+            extendOnlyTtl(identityKey, ttlSeconds, !identityExisted);
+            extendOnlyTtl(listKey, ttlSeconds, !listExisted);
+            extendOnlyTtl(seqKey, ttlSeconds, !seqExisted);
         }
         return "CLAIMED";
     }
 
     /**
      * fake 侧读取 touch 脚本（与生产 TOUCH_SCRIPT 逐步同语义，状态码合同 0/1/2）。
+     * v6 第六轮 ①：身份冲突判断（只读）先于一切可见写入——返回 2 路径零副作用；
+     * ②：发号前抬 seq 至当前 ZSET 最大 score；③：TTL 刷新区分本次新建与既有键。
      * 调用方必须已持有 redisLock。
      */
     private long fakeTouch(String metaKey, String listKey, String identityKey, String seqKey,
@@ -1639,24 +1881,27 @@ class PersistentArtifactRegistryTest {
         if (!values.containsKey(metaKey)) {
             return 0L; // meta 已在 find 与 touch 之间消失：读取必须失败，绝不复活
         }
+        if (!field.isEmpty()) {
+            // 身份冲突预检（只读，先于一切写入）：他人占用 → 2，零副作用
+            Map<String, String> identity = hashes.get(identityKey);
+            String holder = identity == null ? null : identity.get(field);
+            if (holder != null && !holder.equals(artifactId)) {
+                return 2L; // meta 原文/TTL、list score、seq 值全部原样，失败读取绝不续命
+            }
+        }
+        boolean listExisted = keyExistsInFake(listKey);
+        boolean identityExisted = keyExistsInFake(identityKey);
+        boolean seqExisted = keyExistsInFake(seqKey);
         values.put(metaKey, metaJson);
         if (ttlSeconds > 0) {
             deadlines.put(metaKey, fakeNow + TimeUnit.SECONDS.toMillis(ttlSeconds)); // 满额滑动
         }
         if (!field.isEmpty()) {
-            // 身份步（仅幂等制品）：空槽 HSETNX 补建；他人占用 → 2（绝不覆盖）
-            Map<String, String> identity = hashes.get(identityKey);
-            String holder = identity == null ? null : identity.get(field);
-            if (holder == null) {
-                boolean added = hashes.computeIfAbsent(identityKey, k -> new ConcurrentHashMap<>())
-                        .putIfAbsent(field, artifactId) == null;
-                if (!added) {
-                    return 2L;
-                }
-            } else if (!holder.equals(artifactId)) {
-                return 2L;
-            }
+            // 身份步（仅幂等制品）：预检通过后单线程内槽位不可能被抢走，HSETNX 必然成功
+            hashes.computeIfAbsent(identityKey, k -> new ConcurrentHashMap<>())
+                    .putIfAbsent(field, artifactId);
         }
+        floorSeqToTopScore(listKey, seqKey); // seq 丢失也严格移到真正队尾
         long seq = incrBy(seqKey, 1);
         Map<String, Double> zset = zsets.get(listKey);
         Double currentScore = zset == null ? null : zset.get(artifactId);
@@ -1664,12 +1909,12 @@ class PersistentArtifactRegistryTest {
             zsets.computeIfAbsent(listKey, k -> new ConcurrentHashMap<>())
                     .putIfAbsent(artifactId, (double) seq); // ZADD NX：绝不覆盖并发写入
         } else {
-            zset.put(artifactId, (double) seq); // 成员 score 同步到新序号（队尾）
+            zset.put(artifactId, (double) seq); // 成员 score 同步到新序号（真正队尾）
         }
         if (ttlSeconds > 0) {
-            extendOnlyTtl(listKey, ttlSeconds);
-            extendOnlyTtl(identityKey, ttlSeconds);
-            extendOnlyTtl(seqKey, ttlSeconds);
+            extendOnlyTtl(listKey, ttlSeconds, !listExisted);
+            extendOnlyTtl(identityKey, ttlSeconds, !identityExisted);
+            extendOnlyTtl(seqKey, ttlSeconds, !seqExisted);
         }
         return 1L;
     }
@@ -1708,9 +1953,10 @@ class PersistentArtifactRegistryTest {
     /**
      * fake 侧窗口轮转幽灵清理（与生产认领/加入脚本内的清理段同语义）：取当前 score
      * 最低的至多 budget 个成员（ZRANGE LIMIT 构造性硬上限），meta 键（values 表）不存在
-     * 者当场 ZREM；窗口内活成员用 INCRBY 新发的连续序号重新打分、整体移到所有未检查
-     * 成员之后（严格大于任何未检查成员的得分）。轮转状态编码在 score 排序本身，不存在
-     * 独立游标键。调用方必须已持有 redisLock。
+     * 者当场 ZREM；重打分发号前先把 seq 原子抬到至少当前 ZSET 最大 score（v6 第六轮
+     * ②，seq 键单键丢失也不降级），窗口内活成员再用 INCRBY 新发的连续序号重新打分、
+     * 整体移到所有未检查成员之后（严格大于任何未检查成员的得分）。轮转状态编码在
+     * score 排序本身，不存在独立游标键。调用方必须已持有 redisLock。
      */
     private void purgeWindow(String listKey, String seqKey, String metaPrefix, int budget) {
         if (budget <= 0) {
@@ -1731,6 +1977,7 @@ class PersistentArtifactRegistryTest {
             }
         }
         if (!live.isEmpty()) {
+            floorSeqToTopScore(listKey, seqKey); // 发号前抬 seq：幸存者严格大于未检查最大值
             long base = incrBy(seqKey, live.size());
             for (int i = 0; i < live.size(); i++) {
                 zset.put(live.get(i), (double) (base - live.size() + i + 1));
@@ -1784,18 +2031,53 @@ class PersistentArtifactRegistryTest {
     }
 
     /**
-     * fake 侧只延长不缩短 TTL 刷新（对应生产脚本内 extendOnly：t == -2 no-op，
-     * t == -1 补设，t < ttl 延长）。键不存在（-2）时 EXPIRE 是 no-op——绝不给已消失
-     * 的键凭空造 deadline。调用方必须已持有 redisLock。
+     * fake 侧 TTL 刷新（对应生产脚本内 extendOnly，v6 第六轮 ③：区分「本次调用新建
+     * 的键」与「既有键」）。createdHere = 本次脚本调用新建了该键 → 必须获得有限 TTL
+     * （防止永久键泄漏）；既有键只延长不缩短；既有永久键（无 deadline，对应 TTL = -1）
+     * 保持永久，绝不缩短为有限值；键不存在（-2）时 EXPIRE 是 no-op——绝不给已消失的
+     * 键凭空造 deadline。调用方必须已持有 redisLock。
      */
-    private void extendOnlyTtl(String key, long ttlSeconds) {
+    private void extendOnlyTtl(String key, long ttlSeconds, boolean createdHere) {
         if (!keyExistsInFake(key)) {
             return; // ttl == -2
         }
         long desired = fakeNow + TimeUnit.SECONDS.toMillis(ttlSeconds);
         Long current = deadlines.get(key);
-        if (current == null || current < desired) { // ttl == -1（无 TTL）补设；否则只延长
+        if (createdHere) { // 本次新建的键：获得有限 TTL（与索引键同滑动过期协议对齐）
             deadlines.put(key, desired);
+            return;
+        }
+        if (current != null && current < desired) { // 既有带 TTL 键：只延长不缩短
+            deadlines.put(key, desired);
+        }
+        // current == null：既有永久键（-1）保持永久，绝不缩短
+    }
+
+    /**
+     * fake 侧发号前抬 seq（对应生产脚本内 floorSeqToTopScore，v6 第六轮 ②）：把 seq
+     * 原子抬到至少当前 ZSET 最大 score（ZREVRANGE 0 0 WITHSCORES 的等价物——有界读
+     * 末尾 1 项，不全量遍历生产语义；fake 在内存表上取最大值），再交给调用方 INCRBY。
+     * seq 键单键丢失（重启/逐出）时从当前最大 score 继续发号，绝不回到 0——幸存者与
+     * 新成员严格落在所有未检查成员之后，持续推进不降级。INCRBY 保留键自身 TTL，fake
+     * 同样不触碰 deadlines。调用方必须已持有 redisLock。
+     */
+    private void floorSeqToTopScore(String listKey, String seqKey) {
+        Map<String, Double> zset = zsets.get(listKey);
+        if (zset == null || zset.isEmpty()) {
+            return;
+        }
+        long topScore = (long) zset.values().stream().mapToDouble(Double::doubleValue).max().orElse(0d);
+        long current = 0L;
+        String raw = values.get(seqKey);
+        if (raw != null) {
+            try {
+                current = Long.parseLong(raw.trim());
+            } catch (NumberFormatException ignored) {
+                current = 0L; // 损坏的 seq 值按丢失处理，抬到最大 score 自愈
+            }
+        }
+        if (topScore > current) {
+            incrBy(seqKey, topScore - current);
         }
     }
 

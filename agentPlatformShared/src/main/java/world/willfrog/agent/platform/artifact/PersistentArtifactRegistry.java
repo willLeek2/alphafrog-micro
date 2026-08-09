@@ -55,8 +55,9 @@ import java.util.concurrent.TimeUnit;
  * <p>候选 file + meta 先备好，再经单条 Lua 脚本（{@link #ATOMIC_CLAIM_SCRIPT}）原子提交：
  * 脚本内依次做「查身份是否已有赢家（有赢家则当场校验并修复其 run 列表成员资格、
  * 按赢家 meta 键自身剩余 TTL 刷新索引 TTL）→ 窗口轮转有界清理幽灵成员 → ZCARD
- * 容量检查 → HSET 身份 + ZADD run 列表（score = 单调序号）+ 索引键只延长不缩短
- * TTL 刷新」，要么全部生效、要么全部不生效。
+ * 容量检查 → 抬 seq 至当前最大 score → HSET 身份 + ZADD run 列表（score = 单调
+ * 序号）+ 索引键 TTL 刷新（新建获 TTL、既有只延长不缩短、既有永久保持永久）」，
+ * 要么全部生效、要么全部不生效。
  * 因此：输家只有在脚本返回 EXISTS 时才采纳赢家，而 EXISTS 意味着赢家的身份项与
  * 列表项已在同一次脚本执行中原子落盘且列表成员资格已被校验/修复——输家不可能在
  * 赢家列表提交前拿到 ID，不可能拿到幽灵 ID，也不可能采纳一个用户列表里看不见的
@@ -73,10 +74,12 @@ import java.util.concurrent.TimeUnit;
  * {@code ZRANGE list 0 budget-1} 取出当前得分最低的至多 {@value #GHOST_PURGE_BUDGET}
  * 个成员（ZRANGE 带 LIMIT 是构造性硬上限：单次脚本执行检查的成员数不可能超过
  * budget，这是 Redis 命令语义本身而不是提示），逐个 EXISTS 其 meta 键，meta 已不
- * 存在的幽灵成员当场 ZREM；窗口内的活成员随后用 INCRBY 新发的序号重新打分、移到
- * 所有未检查成员之后（严格大于任何未检查成员的得分）——轮转状态就编码在 score
- * 排序本身，不存在任何独立游标键，也就没有「游标键被短 TTL 候选覆盖/过期」这类
- * 漂移；再 ZCARD 容量检查，未满才写入——不存在多命令检查-加入窗口，索引绝不超
+ * 存在的幽灵成员当场 ZREM；发号前脚本先把 seq 原子抬到至少当前 ZSET 最大 score
+ * （floorSeqToTopScore），窗口内的活成员随后用 INCRBY 新发的序号重新打分、移到
+ * 所有未检查成员之后（严格大于任何未检查成员的得分——即使 seq 键单键丢失也不降级）
+ * ——轮转状态就编码在 score 排序本身，不存在任何独立游标键，也就没有「游标键被短
+ * TTL 候选覆盖/过期」这类漂移；再 ZCARD 容量检查，未满才写入——不存在多命令检查-
+ * 加入窗口，索引绝不超
  * cap。进展保证分两档如实表述：①成员集合固定、无并发注册/删除、且窗口内活成员
  * 一律移到未检查成员之后时，窗口每次严格前进，至多 ceil(成员总数 /
  * {@value #GHOST_PURGE_BUDGET}) 次索引写入后所有幽灵必然被清完；②有并发写入/
@@ -91,14 +94,17 @@ import java.util.concurrent.TimeUnit;
  * meta.expiresAtMillis、meta.ttlHours、meta 键 SET TTL、以及所有脚本的 TTL 秒数
  * ARGV 全部由这一个值派生，不存在第二处各自归一化导致的漂移。meta、身份 hash、
  * run 列表 ZSET、run 序号四类键按同一滑动过期协议管理：写路径（认领 CLAIMED /
- * 加入 ADDED）由 Lua 脚本在原子提交内做只延长不缩短刷新（短 TTL 绝不覆盖长 TTL，
- * 永久 TTL = -1 绝不缩短为有限值，缺失键 = -2 补设 TTL）；EXISTS 修复路径的刷新
- * 时长不取输家传入的 ARGV，而是取赢家 meta 键自身的剩余 TTL（{@code TTL} 命令读回），
- * 杜绝「短 TTL 输家把赢家索引 TTL 改短」；读路径由 {@link #touch} 的单条原子 Lua
- * 完成「重写 meta（同时更新 lastAccessAtMillis 与 expiresAtMillis）→ 成员 score
- * 同步 / 丢失成员与丢失身份项在严格赢家身份下修复（HSETNX / ZADD NX，绝不覆盖
- * 已被占用的槽位）→ 四类键只延长不缩短 EXPIRE」，返回状态码，Java 侧原样外抛、
- * 绝不吞异常报成功。因此任何读取都会让索引 TTL 不小于 meta 新 TTL，不存在「索引
+ * 加入 ADDED）由 Lua 脚本在原子提交内做 TTL 刷新——脚本内先记录每把索引键在本次
+ * 调用之前是否已存在：本次新建的键获得有限 TTL（防止永久键泄漏）；既有键只延长不
+ * 缩短（短 TTL 绝不覆盖长 TTL）；既有永久键（TTL = -1）保持永久，绝不缩短为有限值；
+ * 缺失键（-2）跳过。EXISTS 修复路径的刷新时长不取输家传入的 ARGV，而是取赢家 meta
+ * 键自身的剩余 TTL（{@code TTL} 命令读回），杜绝「短 TTL 输家把赢家索引 TTL 改短」；
+ * 读路径由 {@link #touch} 的单条原子 Lua 完成「身份冲突只读预检（先于一切写入，
+ * 冲突时返回 2 且零副作用）→ 重写 meta（同时更新 lastAccessAtMillis 与
+ * expiresAtMillis）→ 丢失身份项在严格赢家身份下 HSETNX 补建 → 发号前抬 seq 至当前
+ * ZSET 最大 score → 成员 score 同步 / 丢失成员 ZADD NX 补回 → 四类键 TTL 刷新
+ * （新建获 TTL、既有只延长、永久保持）」，返回状态码，Java 侧原样外抛、绝不吞异常
+ * 报成功。因此任何读取都会让索引 TTL 不小于 meta 新 TTL，不存在「索引
  * 先于 meta 过期 → list 丢条目 → 同一幂等身份被第二次 CLAIMED」的漂移窗口。</p>
  *
  * <h3>过期清理（Lua 原子判定，读回当前 expiresAtMillis）</h3>
@@ -119,8 +125,10 @@ import java.util.concurrent.TimeUnit;
  *       field={@link #identityField} collision-free 编码 → artifactId；</li>
  *   <li>{@code agent:persistent-artifact:run-seq:{runId}} — 字符串计数器，脚本内
  *       INCRBY 发号（窗口轮转重打分与新成员入列共用一把序号），TTL 随索引键同步
- *       滑动。序号键若因 Redis 重启/逐出丢失：新发号从 1 重来，仅退化为「新成员
- *       可能排在旧成员之前」，不丢数据、不报错、硬预算与持续进展仍成立。</li>
+ *       滑动。每次发号前脚本先把 seq 原子抬到至少当前 ZSET 最大 score（ZREVRANGE
+ *       0 0 WITHSCORES 有界读末尾 1 项）再 INCRBY——序号键即使因 Redis 重启/逐出
+ *       单键丢失，新发号也严格接在当前最高分之后：不丢数据、不报错、排序不降级，
+ *       硬预算与「已检查活成员严格移到未检查成员之后」的持续推进同样成立。</li>
  * </ul>
  * 注意：后三类键与 meta 共享 {@link #META_PREFIX} 前缀，cleanup 的 SCAN 会命中它们，
  * 循环内按前缀显式跳过（它们不是 meta JSON）。
@@ -169,10 +177,12 @@ public class PersistentArtifactRegistry {
 
     /**
      * run 序号计数器键（字符串，脚本内 INCRBY 发号）。窗口轮转给活成员重打分、新成员
-     * 入列，都从这把序号取值——序号严格单调递增，保证「已检查的活成员严格落在所有
-     * 未检查成员之后」。与 meta 共享前缀，cleanup SCAN 时按前缀显式跳过。键自身 TTL
-     * 随索引键同步滑动（脚本内同款只延长不缩短刷新），不会比索引键活得更久；键丢失
-     * （重启/逐出）时发号从 1 重来，只退化为新成员可能排在旧成员之前，不丢数据。
+     * 入列，都从这把序号取值——每次发号前脚本先把 seq 原子抬到至少当前 ZSET 最大
+     * score（floorSeqToTopScore）再 INCRBY，序号严格单调递增，保证「已检查的活成员
+     * 严格落在所有未检查成员之后」。与 meta 共享前缀，cleanup SCAN 时按前缀显式跳过。
+     * 键自身 TTL 随索引键同步滑动（脚本内同款 TTL 刷新：新建获 TTL、既有只延长不缩短、
+     * 既有永久保持永久），不会比索引键活得更久；键丢失（重启/逐出）时发号自动抬到
+     * 当前最大 score 之后继续，排序语义不变，不丢数据、不降级。
      */
     private static final String RUN_SEQ_KEY_PREFIX = META_PREFIX + "run-seq:";
 
@@ -199,45 +209,64 @@ public class PersistentArtifactRegistry {
      * ARGV[4]=幽灵清理预算，ARGV[5]=meta 键前缀，ARGV[6]=索引键 TTL（秒，由 Java 侧
      * 唯一归一化点 {@link #effectiveTtlHours} 派生）。步骤：
      * ①身份已有赢家：赢家 meta 仍在 → 校验并修复赢家在 run 列表中的成员资格
-     *   （ZSCORE 缺失即以新发序号 ZADD 补回，杜绝"输家采纳一个用户列表里看不见的
-     *   赢家"），并按赢家 meta 键自身的剩余 TTL（TTL 命令读回，绝不取输家 ARGV[6]）
-     *   对三类索引键做只延长不缩短刷新（永久 -1 绝不缩短；缺失 -2 补设），随后返回
+     *   （ZSCORE 缺失即先抬 seq 至当前最大 score 再以新发序号 ZADD 补回，杜绝"输家
+     *   采纳一个用户列表里看不见的赢家"），并按赢家 meta 键自身的剩余 TTL（TTL 命令
+     *   读回，绝不取输家 ARGV[6]）对三类索引键做 TTL 刷新（本次新建获 TTL、既有只
+     *   延长不缩短、既有永久保持永久），随后返回
      *   EXISTS:赢家ID（不写任何新索引项）；赢家 meta 已缺失（陈旧悬挂）→ 同样返回
      *   EXISTS:赢家ID，由 Java 侧按既有协议值条件 HDEL 清除陈旧字段后重试；
      * ②有界幽灵清理（窗口轮转协议）：ZRANGE 取当前得分最低的至多 ARGV[4] 个成员
-     *   （LIMIT 是构造性硬上限），逐个 EXISTS 其 meta 键，幽灵当场 ZREM；窗口内活
-     *   成员用 INCRBY 新发的连续序号重新打分、整体移到所有未检查成员之后（严格大于
-     *   任何未检查成员的得分）。轮转状态编码在 score 排序本身，无独立游标键。成员
-     *   集合固定且无并发写入时，至多 ceil(成员总数 / ARGV[4]) 次执行清完所有幽灵；
-     *   有并发写入时只保证每次执行的硬预算与持续进展；
+     *   （LIMIT 是构造性硬上限），逐个 EXISTS 其 meta 键，幽灵当场 ZREM；发号前先把
+     *   seq 原子抬到至少当前 ZSET 最大 score（floorSeqToTopScore，ZREVRANGE 0 0
+     *   WITHSCORES 有界读末尾 1 项），窗口内活成员再用 INCRBY 新发的连续序号重新打分、
+     *   整体移到所有未检查成员之后（严格大于任何未检查成员的得分——即使 seq 键单键
+     *   丢失也不降级）。轮转状态编码在 score 排序本身，无独立游标键。成员集合固定且
+     *   无并发写入时，至多 ceil(成员总数 / ARGV[4]) 次执行清完所有幽灵；有并发写入时
+     *   只保证每次执行的硬预算与持续进展；
      * ③ZCARD 容量检查：已满 → 返回 FULL（不写任何东西）；
-     * ④HSET 身份 + INCRBY 发号 + ZADD run 列表 + 三类索引键只延长不缩短的 TTL 刷新
-     *   （与 meta 同滑动过期协议对齐，见 {@link #touch}），返回 CLAIMED。</p>
+     * ④HSET 身份 + 抬 seq 后 INCRBY 发号 + ZADD run 列表 + 三类索引键 TTL 刷新
+     *   （本次新建键获得有限 TTL；既有键只延长不缩短、既有永久键保持永久；与 meta 同
+     *   滑动过期协议对齐，见 {@link #touch}），返回 CLAIMED。</p>
      *
      * <p>由此得到的不变量：输家观察到 EXISTS 时，赢家的身份项与列表项必然已在同一次
      * 脚本执行中原子落盘（输家不可能提前返回、不可能拿到幽灵 ID），且赢家必然在 run
-     * 列表中可见（成员资格丢失时脚本当场修复）；FULL 路径从不写索引（容量失败的注册
-     * 不留任何痕迹）；EXISTS 路径的索引 TTL 刷新时长只来自赢家 meta 键自身剩余 TTL，
-     * 短 TTL 输家不可能把赢家索引 TTL 改短。</p>
+     * 列表中可见（成员资格丢失时脚本当场修复，修复发号同样先抬 seq 到当前最大 score）；
+     * FULL 路径从不写索引（容量失败的注册不留任何痕迹）；EXISTS 路径的索引 TTL 刷新
+     * 时长只来自赢家 meta 键自身剩余 TTL，短 TTL 输家不可能把赢家索引 TTL 改短。</p>
      */
     private static final RedisScript<String> ATOMIC_CLAIM_SCRIPT = new DefaultRedisScript<>(
-            "local function extendOnly(key, ttl) "
+            "local function extendOnly(key, ttl, createdHere) "
                     + "  local t = redis.call('ttl', key) "
                     + "  if t == -2 then return end "
-                    + "  if t == -1 or t < ttl then redis.call('expire', key, ttl) end "
+                    + "  if createdHere == 1 then redis.call('expire', key, ttl) return end "
+                    + "  if t >= 0 and t < ttl then redis.call('expire', key, ttl) end "
                     + "end "
+                    + "local function floorSeqToTopScore(listKey, seqKey) "
+                    + "  local top = redis.call('zrevrange', listKey, 0, 0, 'WITHSCORES') "
+                    + "  if top[2] then "
+                    + "    local topScore = tonumber(top[2]) "
+                    + "    local raw = redis.call('get', seqKey) "
+                    + "    local cur = 0 "
+                    + "    if raw then cur = tonumber(raw) or 0 end "
+                    + "    if topScore > cur then redis.call('incrby', seqKey, topScore - cur) end "
+                    + "  end "
+                    + "end "
+                    + "local identityExisted = redis.call('exists', KEYS[1]) "
+                    + "local listExisted = redis.call('exists', KEYS[2]) "
+                    + "local seqExisted = redis.call('exists', KEYS[3]) "
                     + "local existing = redis.call('hget', KEYS[1], ARGV[1]) "
                     + "if existing then "
                     + "  if redis.call('exists', ARGV[5] .. existing) == 1 then "
                     + "    if redis.call('zscore', KEYS[2], existing) == false then "
+                    + "      floorSeqToTopScore(KEYS[2], KEYS[3]) "
                     + "      local repairSeq = redis.call('incrby', KEYS[3], 1) "
                     + "      redis.call('zadd', KEYS[2], repairSeq, existing) "
                     + "    end "
                     + "    local winnerTtl = redis.call('ttl', ARGV[5] .. existing) "
                     + "    if winnerTtl > 0 then "
-                    + "      extendOnly(KEYS[1], winnerTtl) "
-                    + "      extendOnly(KEYS[2], winnerTtl) "
-                    + "      extendOnly(KEYS[3], winnerTtl) "
+                    + "      extendOnly(KEYS[1], winnerTtl, 1 - identityExisted) "
+                    + "      extendOnly(KEYS[2], winnerTtl, 1 - listExisted) "
+                    + "      extendOnly(KEYS[3], winnerTtl, 1 - seqExisted) "
                     + "    end "
                     + "  end "
                     + "  return 'EXISTS:' .. existing "
@@ -254,6 +283,7 @@ public class PersistentArtifactRegistry {
                     + "    end "
                     + "  end "
                     + "  if #live > 0 then "
+                    + "    floorSeqToTopScore(KEYS[2], KEYS[3]) "
                     + "    local base = redis.call('incrby', KEYS[3], #live) "
                     + "    for i, m in ipairs(live) do "
                     + "      redis.call('zadd', KEYS[2], base - #live + i, m) "
@@ -262,34 +292,52 @@ public class PersistentArtifactRegistry {
                     + "end "
                     + "if redis.call('zcard', KEYS[2]) >= tonumber(ARGV[3]) then return 'FULL' end "
                     + "redis.call('hset', KEYS[1], ARGV[1], ARGV[2]) "
+                    + "floorSeqToTopScore(KEYS[2], KEYS[3]) "
                     + "local claimSeq = redis.call('incrby', KEYS[3], 1) "
                     + "redis.call('zadd', KEYS[2], claimSeq, ARGV[2]) "
                     + "local ttl2 = tonumber(ARGV[6]) "
                     + "if ttl2 > 0 then "
-                    + "  extendOnly(KEYS[1], ttl2) "
-                    + "  extendOnly(KEYS[2], ttl2) "
-                    + "  extendOnly(KEYS[3], ttl2) "
+                    + "  extendOnly(KEYS[1], ttl2, 1 - identityExisted) "
+                    + "  extendOnly(KEYS[2], ttl2, 1 - listExisted) "
+                    + "  extendOnly(KEYS[3], ttl2, 1 - seqExisted) "
                     + "end "
                     + "return 'CLAIMED'",
             String.class);
 
     /**
      * 非幂等 run 列表加入脚本（Lua，原子：窗口轮转幽灵清理 → ZCARD 容量检查 →
-     * INCRBY 发号 + ZADD → 只延长不缩短 TTL 刷新）。
+     * 抬 seq 至当前最大 score → INCRBY 发号 + ZADD → TTL 刷新）。
      *
      * <p>KEYS[1]=run 列表 ZSET 键，KEYS[2]=run 序号计数器键；ARGV[1]=容量上限，
      * ARGV[2]=幽灵清理预算，ARGV[3]=meta 键前缀，ARGV[4]=artifactId，
      * ARGV[5]=索引键 TTL（秒，同样只由 {@link #effectiveTtlHours} 派生）。幽灵清理与
      * {@link #ATOMIC_CLAIM_SCRIPT} 同款窗口轮转协议（ZRANGE LIMIT 硬预算、活成员严格
-     * 后移、无游标键）。已满返回 FULL（不写），否则写入返回 ADDED。非幂等路径的
+     * 后移、无游标键）。每次发号（轮转重打分与新成员入列）前先把 seq 原子抬到至少当前
+     * ZSET 最大 score（floorSeqToTopScore，ZREVRANGE 0 0 WITHSCORES 有界读末尾 1 项）
+     * 再 INCRBY——即使 seq 键单键丢失，幸存者与新成员也严格落在所有未检查成员之后，
+     * 持续推进不降级。TTL 刷新区分「本次新建键获得有限 TTL」与「既有键只延长不缩短、
+     * 既有永久键保持永久」。已满返回 FULL（不写），否则写入返回 ADDED。非幂等路径的
      * artifactId 每次全新生成，不存在"已是成员"情形。</p>
      */
     private static final RedisScript<String> RUN_LIST_ADD_SCRIPT = new DefaultRedisScript<>(
-            "local function extendOnly(key, ttl) "
+            "local function extendOnly(key, ttl, createdHere) "
                     + "  local t = redis.call('ttl', key) "
                     + "  if t == -2 then return end "
-                    + "  if t == -1 or t < ttl then redis.call('expire', key, ttl) end "
+                    + "  if createdHere == 1 then redis.call('expire', key, ttl) return end "
+                    + "  if t >= 0 and t < ttl then redis.call('expire', key, ttl) end "
                     + "end "
+                    + "local function floorSeqToTopScore(listKey, seqKey) "
+                    + "  local top = redis.call('zrevrange', listKey, 0, 0, 'WITHSCORES') "
+                    + "  if top[2] then "
+                    + "    local topScore = tonumber(top[2]) "
+                    + "    local raw = redis.call('get', seqKey) "
+                    + "    local cur = 0 "
+                    + "    if raw then cur = tonumber(raw) or 0 end "
+                    + "    if topScore > cur then redis.call('incrby', seqKey, topScore - cur) end "
+                    + "  end "
+                    + "end "
+                    + "local listExisted = redis.call('exists', KEYS[1]) "
+                    + "local seqExisted = redis.call('exists', KEYS[2]) "
                     + "local budget = tonumber(ARGV[2]) "
                     + "if budget > 0 then "
                     + "  local window = redis.call('zrange', KEYS[1], 0, budget - 1) "
@@ -302,6 +350,7 @@ public class PersistentArtifactRegistry {
                     + "    end "
                     + "  end "
                     + "  if #live > 0 then "
+                    + "    floorSeqToTopScore(KEYS[1], KEYS[2]) "
                     + "    local base = redis.call('incrby', KEYS[2], #live) "
                     + "    for i, m in ipairs(live) do "
                     + "      redis.call('zadd', KEYS[1], base - #live + i, m) "
@@ -309,19 +358,20 @@ public class PersistentArtifactRegistry {
                     + "  end "
                     + "end "
                     + "if redis.call('zcard', KEYS[1]) >= tonumber(ARGV[1]) then return 'FULL' end "
+                    + "floorSeqToTopScore(KEYS[1], KEYS[2]) "
                     + "local seq = redis.call('incrby', KEYS[2], 1) "
                     + "redis.call('zadd', KEYS[1], seq, ARGV[4]) "
                     + "local ttl = tonumber(ARGV[5]) "
                     + "if ttl > 0 then "
-                    + "  extendOnly(KEYS[1], ttl) "
-                    + "  extendOnly(KEYS[2], ttl) "
+                    + "  extendOnly(KEYS[1], ttl, 1 - listExisted) "
+                    + "  extendOnly(KEYS[2], ttl, 1 - seqExisted) "
                     + "end "
                     + "return 'ADDED'",
             String.class);
 
     /**
-     * 读取 touch 原子脚本（Lua，单条脚本内完成 meta 重写 + 成员/身份修复 + 四类键
-     * 滑动过期，返回状态码）。
+     * 读取 touch 原子脚本（Lua，单条脚本内完成身份冲突只读预检 + meta 重写 + 成员/身份
+     * 修复 + 四类键滑动过期，返回状态码）。
      *
      * <p>KEYS[1]=meta 键，KEYS[2]=run 列表 ZSET 键，KEYS[3]=身份 hash 键，
      * KEYS[4]=run 序号计数器键；ARGV[1]=新 meta JSON（Java 侧已把 lastAccessAtMillis
@@ -330,37 +380,59 @@ public class PersistentArtifactRegistry {
      * ARGV[4]=artifactId。步骤：
      * ①meta 键不存在 → 返回 0（制品已在 find 与 touch 之间过期/删除，读取必须失败，
      *   绝不复活）；
-     * ②SET 新 meta + EXPIRE 满额滑动（meta 的 TTL 每次读取重置为完整生效时长）；
-     * ③身份步（仅幂等制品）：槽位为空 → HSETNX 以本 artifactId 补建（补建失败 =
-     *   并发他人占用 → 返回 2）；槽位值 == 本 artifactId → 通过；槽位被其他 artifactId
-     *   占用 → 返回 2（绝不覆盖他人槽位）。非幂等制品（ARGV[3]=''）整步跳过——它们
-     *   本就没有身份项，绝不允许顺手创建；
-     * ④成员 score 同步：成员已在 ZSET → 以新发序号重新打分、移回队尾（读取即续检查
-     *   优先级无意义，但保证 score 单调链不断）；成员缺失 → ZADD NX 以新序号补回；
-     * ⑤ZSET/身份/序号三类键只延长不缩短 EXPIRE（永久 -1 绝不缩短；缺失 -2 补设）。
+     * ②身份冲突预检（仅幂等制品；只读，先于本脚本一切可见写入）：槽位被其他 artifactId
+     *   占用 → 立即返回 2。返回 2 路径不执行任何写入，严格零副作用——入侵者的 meta
+     *   原文与 TTL、run 列表 score、seq 值全部原样，失效制品绝不可能被失败读取反复续命；
+     * ③记录列表/身份/序号三类索引键在本次调用之前是否已存在（供步骤⑦区分「既有键」
+     *   与「本次新建键」）；
+     * ④SET 新 meta + EXPIRE 满额滑动（meta 的 TTL 每次读取重置为完整生效时长）；
+     * ⑤身份步（仅幂等制品）：槽位为空 → HSETNX 以本 artifactId 补建（②预检通过后 Lua
+     *   单线程保证槽位不可能被他人抢走，HSETNX 必然成功）；槽位值 == 本 artifactId →
+     *   通过。非幂等制品（ARGV[3]=''）整步跳过——它们本就没有身份项，绝不允许顺手创建；
+     * ⑥发号前先把 seq 原子抬到至少当前 ZSET 最大 score（floorSeqToTopScore，
+     *   ZREVRANGE 0 0 WITHSCORES 有界读末尾 1 项），再 INCRBY 发号 + 成员 score 同步：
+     *   成员已在 ZSET → 以新发序号重新打分、移回真正队尾；成员缺失 → ZADD NX 以新序号
+     *   补回。即使 seq 键单键丢失，touch 后成员也严格落在所有其他成员之后；
+     * ⑦ZSET/身份/序号三类键 TTL 刷新：本次调用新建的键获得有限 TTL（防止永久键泄漏）；
+     *   既有键只延长不缩短；既有永久键（-1）保持永久，绝不缩短为有限值；缺失（-2）跳过。
      * 返回 1。</p>
      *
-     * <p>状态码合同：0 = meta 已消失；1 = 成功；2 = 身份槽位被其他 artifactId 占用。
-     * Java 侧对 0/2/null 一律外抛异常，绝不吞掉报成功（见 {@link #touch}）。</p>
+     * <p>状态码合同：0 = meta 已消失；1 = 成功；2 = 身份槽位被其他 artifactId 占用
+     * （零副作用：预检在任何写入之前）。Java 侧对 0/2/null 一律外抛异常，绝不吞掉报成功
+     * （见 {@link #touch}）。</p>
      */
     private static final RedisScript<Long> TOUCH_SCRIPT = new DefaultRedisScript<>(
-            "local function extendOnly(key, ttl) "
+            "local function extendOnly(key, ttl, createdHere) "
                     + "  local t = redis.call('ttl', key) "
                     + "  if t == -2 then return end "
-                    + "  if t == -1 or t < ttl then redis.call('expire', key, ttl) end "
+                    + "  if createdHere == 1 then redis.call('expire', key, ttl) return end "
+                    + "  if t >= 0 and t < ttl then redis.call('expire', key, ttl) end "
+                    + "end "
+                    + "local function floorSeqToTopScore(listKey, seqKey) "
+                    + "  local top = redis.call('zrevrange', listKey, 0, 0, 'WITHSCORES') "
+                    + "  if top[2] then "
+                    + "    local topScore = tonumber(top[2]) "
+                    + "    local raw = redis.call('get', seqKey) "
+                    + "    local cur = 0 "
+                    + "    if raw then cur = tonumber(raw) or 0 end "
+                    + "    if topScore > cur then redis.call('incrby', seqKey, topScore - cur) end "
+                    + "  end "
                     + "end "
                     + "if redis.call('exists', KEYS[1]) == 0 then return 0 end "
+                    + "if ARGV[3] ~= '' then "
+                    + "  local holder = redis.call('hget', KEYS[3], ARGV[3]) "
+                    + "  if holder ~= false and holder ~= ARGV[4] then return 2 end "
+                    + "end "
+                    + "local listExisted = redis.call('exists', KEYS[2]) "
+                    + "local identityExisted = redis.call('exists', KEYS[3]) "
+                    + "local seqExisted = redis.call('exists', KEYS[4]) "
                     + "local ttl = tonumber(ARGV[2]) "
                     + "redis.call('set', KEYS[1], ARGV[1]) "
                     + "if ttl > 0 then redis.call('expire', KEYS[1], ttl) end "
                     + "if ARGV[3] ~= '' then "
-                    + "  local holder = redis.call('hget', KEYS[3], ARGV[3]) "
-                    + "  if holder == false then "
-                    + "    if redis.call('hsetnx', KEYS[3], ARGV[3], ARGV[4]) ~= 1 then return 2 end "
-                    + "  elseif holder ~= ARGV[4] then "
-                    + "    return 2 "
-                    + "  end "
+                    + "  redis.call('hsetnx', KEYS[3], ARGV[3], ARGV[4]) "
                     + "end "
+                    + "floorSeqToTopScore(KEYS[2], KEYS[4]) "
                     + "local seq = redis.call('incrby', KEYS[4], 1) "
                     + "if redis.call('zscore', KEYS[2], ARGV[4]) == false then "
                     + "  redis.call('zadd', KEYS[2], 'NX', seq, ARGV[4]) "
@@ -368,9 +440,9 @@ public class PersistentArtifactRegistry {
                     + "  redis.call('zadd', KEYS[2], seq, ARGV[4]) "
                     + "end "
                     + "if ttl > 0 then "
-                    + "  extendOnly(KEYS[2], ttl) "
-                    + "  extendOnly(KEYS[3], ttl) "
-                    + "  extendOnly(KEYS[4], ttl) "
+                    + "  extendOnly(KEYS[2], ttl, 1 - listExisted) "
+                    + "  extendOnly(KEYS[3], ttl, 1 - identityExisted) "
+                    + "  extendOnly(KEYS[4], ttl, 1 - seqExisted) "
                     + "end "
                     + "return 1",
             Long.class);
@@ -887,13 +959,14 @@ public class PersistentArtifactRegistry {
     /**
      * 候选原子结算（候选 file + meta 必须已备好，{@value #MAX_CLAIM_ATTEMPTS} 次尝试协议）。
      *
-     * <p>整个「身份已有赢家？→ 窗口轮转幽灵清理 → 容量检查 → 写身份 + 发号写 run
-     * 列表 + 索引键 TTL 只延长不缩短刷新」由单条 Lua 脚本（{@link #ATOMIC_CLAIM_SCRIPT}）
-     * 一次执行完成，不再有任何多命令窗口：</p>
+     * <p>整个「身份已有赢家？→ 窗口轮转幽灵清理 → 容量检查 → 抬 seq 至当前最大
+     * score → 写身份 + 发号写 run 列表 + 索引键 TTL 刷新」由单条 Lua 脚本
+     * （{@link #ATOMIC_CLAIM_SCRIPT}）一次执行完成，不再有任何多命令窗口：</p>
      * <ul>
      *   <li>CLAIMED → 赢家：meta 已落盘，身份与列表项在同一次脚本执行中原子可见，
-     *       三类索引键的 TTL 也在同一次脚本执行中按统一滑动过期协议做只延长不缩短的
-     *       刷新（与 {@link #touch} 对齐），Java 侧不再补做。</li>
+     *       三类索引键的 TTL 也在同一次脚本执行中按统一滑动过期协议刷新（本次新建获
+     *       TTL、既有只延长不缩短、既有永久保持永久，与 {@link #touch} 对齐），Java
+     *       侧不再补做。</li>
      *   <li>FULL → 容量超限：脚本没写任何索引，直接抛可见失败，由调用方 catch 回滚
      *       候选（meta + 文件），禁止 silent meta-only 成功。FULL 路径从不写身份，
      *       因此容量失败的注册不会给任何后来者留下幽灵身份。</li>
@@ -943,9 +1016,10 @@ public class PersistentArtifactRegistry {
      * <p>KEYS = [身份 hash 键, run 列表 ZSET 键, run 序号计数器键]；ARGV = [身份 field,
      * 候选 artifactId, 容量上限, 幽灵清理预算, meta 键前缀, 索引键 TTL 秒数]。
      * 入参 ttlHours 已是 {@link #effectiveTtlHours} 归一化后的生效时长（唯一归一化点，
-     * 此处只做单位换算）；脚本内在 CLAIMED 路径对三类索引键做只延长不缩短刷新，
-     * EXISTS 修复路径则按赢家 meta 键自身剩余 TTL 刷新（统一滑动过期协议，见
-     * {@link #ATOMIC_CLAIM_SCRIPT} 与 {@link #touch}）。</p>
+     * 此处只做单位换算）；脚本内在 CLAIMED 路径对三类索引键做 TTL 刷新（本次新建获
+     * TTL、既有只延长不缩短、既有永久保持永久），EXISTS 修复路径则按赢家 meta 键
+     * 自身剩余 TTL 同款刷新（统一滑动过期协议，见 {@link #ATOMIC_CLAIM_SCRIPT} 与
+     * {@link #touch}）。</p>
      */
     private String executeAtomicClaim(String runId, String field, String artifactId, long ttlHours) {
         if (maxRunListEntries <= 0) {
@@ -1000,8 +1074,9 @@ public class PersistentArtifactRegistry {
 
     /**
      * run 级索引有界加入（非幂等路径）：单条 Lua 脚本（{@link #RUN_LIST_ADD_SCRIPT}）
-     * 内原子完成「窗口轮转幽灵清理 → ZCARD 容量检查 → INCRBY 发号 + ZADD → 列表键与
-     * 序号键 TTL 只延长不缩短刷新」——超限时脚本不写任何东西并返回 FULL，Java 侧抛
+     * 内原子完成「窗口轮转幽灵清理 → ZCARD 容量检查 → 抬 seq 至当前 ZSET 最大 score
+     * → INCRBY 发号 + ZADD → 列表键与序号键 TTL 刷新（本次新建获 TTL、既有只延长不
+     * 缩短、既有永久保持永久）」——超限时脚本不写任何东西并返回 FULL，Java 侧抛
      * 可见失败，禁止 silent meta-only 成功；不存在多命令检查-加入窗口。cap<=0 视为
      * 配置错误，fail-closed。KEYS = [run 列表 ZSET 键, run 序号计数器键]；入参
      * ttlHours 已是 {@link #effectiveTtlHours} 归一化后的生效时长（唯一归一化点），
@@ -1164,19 +1239,23 @@ public class PersistentArtifactRegistry {
 
     /**
      * 读取 touch（单条原子 Lua，{@link #TOUCH_SCRIPT}，状态码合同，异常原样外抛）：
-     * 在同一次脚本执行内完成「meta 重写（同时更新 lastAccessAtMillis 与
-     * expiresAtMillis，第五轮 MUST-FIX ⑤——expiresAtMillis 不再停在注册时的旧值，
-     * cleanup 的 Lua 判定读到的就是本次滑动后的新值）→ 幂等制品的身份步（槽位空
-     * HSETNX 补建 / 本 artifactId 通过 / 他人占用拒绝，绝不覆盖）→ 成员 ZSET score
-     * 同步（缺失以 ZADD NX 补回）→ ZSET/身份/序号三类键只延长不缩短 EXPIRE」。
-     * meta 键自身的 TTL 每次读取满额滑动（重置为完整生效时长），索引键 TTL 因此恒
-     * 不小于 meta 新 TTL——统一滑动过期协议的读侧一半，杜绝「索引先于 meta 过期 →
-     * list 丢条目 → 同一幂等身份被第二次 CLAIMED」的漂移窗口。
+     * 在同一次脚本执行内完成「身份冲突只读预检（先于一切可见写入；冲突直接返回 2，
+     * 零副作用）→ meta 重写（同时更新 lastAccessAtMillis 与 expiresAtMillis，第五轮
+     * MUST-FIX ⑤——expiresAtMillis 不再停在注册时的旧值，cleanup 的 Lua 判定读到的
+     * 就是本次滑动后的新值）→ 幂等制品的身份步（槽位空 HSETNX 补建 / 本 artifactId
+     * 通过）→ 发号前抬 seq 至当前 ZSET 最大 score → 成员 ZSET score 同步（缺失以
+     * ZADD NX 补回）→ ZSET/身份/序号三类键 TTL 刷新（本次新建获 TTL、既有只延长不
+     * 缩短、既有永久保持永久）」。meta 键自身的 TTL 每次读取满额滑动（重置为完整
+     * 生效时长），索引键 TTL 因此恒不小于 meta 新 TTL——统一滑动过期协议的读侧一半，
+     * 杜绝「索引先于 meta 过期 → list 丢条目 → 同一幂等身份被第二次 CLAIMED」的漂移
+     * 窗口。
      *
      * <p>失败语义（绝不吞异常报成功）：脚本返回 0 = meta 已在 find 与 touch 之间消失
      * （制品过期/删除）→ 抛 {@link IllegalArgumentException}，读取失败；返回 2 = 身份
-     * 槽位被其他 artifactId 占用 → 抛 {@link IllegalStateException}；脚本异常（Redis
-     * 故障等）原样上抛。无 run 上下文的历史制品没有索引键，只做 meta 满额滑动。</p>
+     * 槽位被其他 artifactId 占用（预检在任何写入之前：meta 原文与 TTL、run 列表
+     * score、seq 值全部原样，失效制品绝不可能被失败读取续命）→ 抛
+     * {@link IllegalStateException}；脚本异常（Redis 故障等）原样上抛。无 run 上下文的
+     * 历史制品没有索引键，只做 meta 满额滑动。</p>
      */
     private void touch(PersistentArtifactMeta meta) {
         long now = System.currentTimeMillis();

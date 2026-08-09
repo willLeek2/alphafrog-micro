@@ -44,11 +44,14 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * <p><b>本类在本机绝不运行。</b>依据 frog 2026-08-09 的明确红线：本机禁止拉起
  * Docker。因此：</p>
  * <ul>
- *   <li>本类仅作为未来有 Docker 的<b>非本机环境</b>（CI / 其他开发机）的门禁；</li>
- *   <li>父 agent 会把本类加入 surefire 排除清单，本机 {@code mvn test} 不会触达它；</li>
- *   <li>本类当前<b>不计入任何「已验证」结论</b>——v5 的已验证结论仍以
- *       {@code PersistentArtifactRegistryTest}（内存 fake，38 例全绿）为准；</li>
- *   <li>任何人不得为了「跑一下看看」在本机手动执行本类。</li>
+ *   <li>本类已被加入 {@code agentPlatformShared/pom.xml} 中 surefire 的
+ *       {@code <excludes>} 排除清单，默认 {@code mvn test} 不会触达它；</li>
+ *   <li>只有在具备 Docker + 真 Redis 的<b>受批准环境</b>（CI / 其他开发机）显式执行
+ *       {@code mvn test -Predis-integration} 时，本类才会运行；</li>
+ *   <li>开发者本机绝不以任何方式运行本类（包括「跑一下看看」的手动执行）；</li>
+ *   <li>在上述受批准环境真正运行之前，本类保持<b>未运行/未验证</b>状态，不计入任何
+ *       「已验证」结论——v5 的已验证结论仍以
+ *       {@code PersistentArtifactRegistryTest}（内存 fake，38 例全绿）为准。</li>
  * </ul>
  *
  * <h3>测试清单（每项钉住的契约）</h3>

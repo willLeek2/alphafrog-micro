@@ -56,7 +56,10 @@ import static org.mockito.Mockito.when;
  * 每键 deadline 惰性过期 + 五种 Lua 脚本按 ARGV 个数分发共用一把锁模拟 Redis 单线程），
  * 另按本链路触达面补齐三类直操作：INCR（raw-ref 计数器原子发号）、EXPIRE（计数器/映射键
  * TTL）、hash 直读写（shortId→artifactId 映射）。ZSET 索引、run-seq 序号键、touch 状态码、
- * cleanup Lua 判定等 v5 语义与权威测试逐条一致。</p>
+ * cleanup Lua 判定等语义与权威测试逐条一致；v6 第六轮（1a74ca02）三项同样对齐：touch
+ * 身份冲突只读预检先于一切写入（状态码 2 零副作用）、每次发号前 floorSeqToTopScore 把
+ * seq 抬到至少当前 ZSET 最大 score、TTL 刷新区分本次新建（获有限 TTL）与既有键（只延长、
+ * 永久保持永久）。</p>
  *
  * <p>两钟分离：fakeNow 只管 Redis 键的 TTL deadline；meta JSON 内的 expiresAtMillis 用真实
  * 墙钟（生产 cleanup 用 System.currentTimeMillis()）。模拟「内容时间流逝」靠改写 meta JSON
@@ -538,18 +541,22 @@ class RawRefRereadCompositeChainTest {
             long ttlSeconds = Long.parseLong(String.valueOf(args[6]));
             synchronized (redisLock) {
                 sweepExpired();
+                boolean listExisted = keyExistsInFake(keys.get(0));
+                boolean seqExisted = keyExistsInFake(keys.get(1));
                 purgeWindow(keys.get(0), keys.get(1), metaPrefix, budget);
                 Map<String, Double> zset = zsets.get(keys.get(0));
                 int size = zset == null ? 0 : zset.size();
                 if (size >= cap) {
                     return "FULL";
                 }
+                floorSeqToTopScore(keys.get(0), keys.get(1)); // v6 ②：发号前抬 seq
                 long seq = incrBy(keys.get(1), 1);
                 zsets.computeIfAbsent(keys.get(0), k -> new ConcurrentHashMap<>())
                         .put(artifactId, (double) seq);
                 if (ttlSeconds > 0) {
-                    extendOnlyTtl(keys.get(0), ttlSeconds);
-                    extendOnlyTtl(keys.get(1), ttlSeconds);
+                    // v6 ③：本次新建获有限 TTL；既有只延长；永久保持永久
+                    extendOnlyTtl(keys.get(0), ttlSeconds, !listExisted);
+                    extendOnlyTtl(keys.get(1), ttlSeconds, !seqExisted);
                 }
                 return "ADDED";
             }
@@ -590,17 +597,27 @@ class RawRefRereadCompositeChainTest {
 
     // ===== fake 助手（与权威契约测试逐条同语义） =====
 
-    /** fake 侧幂等认领脚本（与生产 ATOMIC_CLAIM_SCRIPT 逐步同语义）。调用方必须已持有 redisLock。 */
+    /**
+     * fake 侧幂等认领脚本（与生产 ATOMIC_CLAIM_SCRIPT 逐步同语义）。v6 第六轮 ②：
+     * 三处发号（EXISTS 修复 / 轮转重打分 / 认领入列）前都先抬 seq 至当前 ZSET 最大
+     * score；③：TTL 刷新区分本次新建与既有键（既有永久保持永久）。
+     * 调用方必须已持有 redisLock。
+     */
     private String fakeClaim(String identityKey, String listKey, String seqKey,
                              String field, String artifactId, int cap, int budget,
                              String metaPrefix, long ttlSeconds) {
+        boolean identityExisted = keyExistsInFake(identityKey);
+        boolean listExisted = keyExistsInFake(listKey);
+        boolean seqExisted = keyExistsInFake(seqKey);
         Map<String, String> identity = hashes.get(identityKey);
         String existing = identity == null ? null : identity.get(field);
         if (existing != null) {
             if (values.containsKey(metaPrefix + existing)) {
+                // 赢家 meta 仍活：修复列表成员资格（ZSCORE 缺失即抬 seq 后以新序号 ZADD 补回）
                 Map<String, Double> zset = zsets.get(listKey);
                 Double score = zset == null ? null : zset.get(existing);
                 if (score == null) {
+                    floorSeqToTopScore(listKey, seqKey);
                     long repairSeq = incrBy(seqKey, 1);
                     zsets.computeIfAbsent(listKey, k -> new ConcurrentHashMap<>())
                             .put(existing, (double) repairSeq);
@@ -608,9 +625,9 @@ class RawRefRereadCompositeChainTest {
                 // 索引 TTL 刷新只取赢家 meta 键自身剩余 TTL（绝不取输家传入的 ttlSeconds）
                 long winnerTtl = ttlOfSeconds(metaPrefix + existing);
                 if (winnerTtl > 0) {
-                    extendOnlyTtl(identityKey, winnerTtl);
-                    extendOnlyTtl(listKey, winnerTtl);
-                    extendOnlyTtl(seqKey, winnerTtl);
+                    extendOnlyTtl(identityKey, winnerTtl, !identityExisted);
+                    extendOnlyTtl(listKey, winnerTtl, !listExisted);
+                    extendOnlyTtl(seqKey, winnerTtl, !seqExisted);
                 }
             }
             return "EXISTS:" + existing;
@@ -622,52 +639,62 @@ class RawRefRereadCompositeChainTest {
             return "FULL";
         }
         hashes.computeIfAbsent(identityKey, k -> new ConcurrentHashMap<>()).put(field, artifactId);
+        floorSeqToTopScore(listKey, seqKey);
         long claimSeq = incrBy(seqKey, 1);
         zsets.computeIfAbsent(listKey, k -> new ConcurrentHashMap<>()).put(artifactId, (double) claimSeq);
         if (ttlSeconds > 0) {
-            extendOnlyTtl(identityKey, ttlSeconds);
-            extendOnlyTtl(listKey, ttlSeconds);
-            extendOnlyTtl(seqKey, ttlSeconds);
+            extendOnlyTtl(identityKey, ttlSeconds, !identityExisted);
+            extendOnlyTtl(listKey, ttlSeconds, !listExisted);
+            extendOnlyTtl(seqKey, ttlSeconds, !seqExisted);
         }
         return "CLAIMED";
     }
 
-    /** fake 侧读取 touch 脚本（与生产 TOUCH_SCRIPT 逐步同语义，状态码合同 0/1/2）。调用方必须已持有 redisLock。 */
+    /**
+     * fake 侧读取 touch 脚本（与生产 TOUCH_SCRIPT 逐步同语义，状态码合同 0/1/2）。
+     * v6 第六轮 ①：身份冲突判断（只读）先于一切可见写入——返回 2 路径零副作用；
+     * ②：发号前抬 seq 至当前 ZSET 最大 score；③：TTL 刷新区分本次新建与既有键。
+     * 调用方必须已持有 redisLock。
+     */
     private long fakeTouch(String metaKey, String listKey, String identityKey, String seqKey,
                            String metaJson, long ttlSeconds, String field, String artifactId) {
         if (!values.containsKey(metaKey)) {
-            return 0L; // meta 已消失：读取必须失败，绝不复活
+            return 0L; // meta 已在 find 与 touch 之间消失：读取必须失败，绝不复活
         }
+        if (!field.isEmpty()) {
+            // 身份冲突预检（只读，先于一切写入）：他人占用 → 2，零副作用
+            Map<String, String> identity = hashes.get(identityKey);
+            String holder = identity == null ? null : identity.get(field);
+            if (holder != null && !holder.equals(artifactId)) {
+                return 2L; // meta 原文/TTL、list score、seq 值全部原样，失败读取绝不续命
+            }
+        }
+        boolean listExisted = keyExistsInFake(listKey);
+        boolean identityExisted = keyExistsInFake(identityKey);
+        boolean seqExisted = keyExistsInFake(seqKey);
         values.put(metaKey, metaJson);
         if (ttlSeconds > 0) {
             deadlines.put(metaKey, fakeNow + TimeUnit.SECONDS.toMillis(ttlSeconds)); // 满额滑动
         }
         if (!field.isEmpty()) {
-            Map<String, String> identity = hashes.get(identityKey);
-            String holder = identity == null ? null : identity.get(field);
-            if (holder == null) {
-                boolean added = hashes.computeIfAbsent(identityKey, k -> new ConcurrentHashMap<>())
-                        .putIfAbsent(field, artifactId) == null;
-                if (!added) {
-                    return 2L;
-                }
-            } else if (!holder.equals(artifactId)) {
-                return 2L;
-            }
+            // 身份步（仅幂等制品）：预检通过后单线程内槽位不可能被抢走，HSETNX 必然成功
+            hashes.computeIfAbsent(identityKey, k -> new ConcurrentHashMap<>())
+                    .putIfAbsent(field, artifactId);
         }
+        floorSeqToTopScore(listKey, seqKey); // seq 丢失也严格移到真正队尾
         long seq = incrBy(seqKey, 1);
         Map<String, Double> zset = zsets.get(listKey);
         Double currentScore = zset == null ? null : zset.get(artifactId);
         if (currentScore == null) {
             zsets.computeIfAbsent(listKey, k -> new ConcurrentHashMap<>())
-                    .putIfAbsent(artifactId, (double) seq);
+                    .putIfAbsent(artifactId, (double) seq); // ZADD NX：绝不覆盖并发写入
         } else {
-            zset.put(artifactId, (double) seq); // 成员 score 同步到新序号（队尾）
+            zset.put(artifactId, (double) seq); // 成员 score 同步到新序号（真正队尾）
         }
         if (ttlSeconds > 0) {
-            extendOnlyTtl(listKey, ttlSeconds);
-            extendOnlyTtl(identityKey, ttlSeconds);
-            extendOnlyTtl(seqKey, ttlSeconds);
+            extendOnlyTtl(listKey, ttlSeconds, !listExisted);
+            extendOnlyTtl(identityKey, ttlSeconds, !identityExisted);
+            extendOnlyTtl(seqKey, ttlSeconds, !seqExisted);
         }
         return 1L;
     }
@@ -699,7 +726,12 @@ class RawRefRereadCompositeChainTest {
         return 0L;
     }
 
-    /** fake 侧窗口轮转幽灵清理（与生产认领/加入脚本内的清理段同语义）。调用方必须已持有 redisLock。 */
+    /**
+     * fake 侧窗口轮转幽灵清理（与生产认领/加入脚本内的清理段同语义）：取当前 score
+     * 最低的至多 budget 个成员（ZRANGE LIMIT 构造性硬上限），meta 键不存在者当场 ZREM；
+     * 重打分发号前先把 seq 原子抬到至少当前 ZSET 最大 score（v6 第六轮 ②），幸存者
+     * 再用连续新序号整体移到所有未检查成员之后。调用方必须已持有 redisLock。
+     */
     private void purgeWindow(String listKey, String seqKey, String metaPrefix, int budget) {
         if (budget <= 0) {
             return;
@@ -715,10 +747,11 @@ class RawRefRereadCompositeChainTest {
             if (values.containsKey(metaPrefix + member)) {
                 live.add(member);
             } else {
-                zset.remove(member);
+                zset.remove(member); // 幽灵当场清除
             }
         }
         if (!live.isEmpty()) {
+            floorSeqToTopScore(listKey, seqKey); // 发号前抬 seq：幸存者严格大于未检查最大值
             long base = incrBy(seqKey, live.size());
             for (int i = 0; i < live.size(); i++) {
                 zset.put(live.get(i), (double) (base - live.size() + i + 1));
@@ -764,15 +797,53 @@ class RawRefRereadCompositeChainTest {
                 .collect(Collectors.toList());
     }
 
-    /** fake 侧只延长不缩短 TTL 刷新（t == -2 no-op，t == -1 补设，t < ttl 延长）。 */
-    private void extendOnlyTtl(String key, long ttlSeconds) {
+    /**
+     * fake 侧 TTL 刷新（对应生产脚本内 extendOnly，v6 第六轮 ③：区分「本次调用新建
+     * 的键」与「既有键」）。createdHere = 本次脚本调用新建了该键 → 必须获得有限 TTL
+     * （防止永久键泄漏）；既有键只延长不缩短；既有永久键（无 deadline，对应 TTL = -1）
+     * 保持永久，绝不缩短为有限值；键不存在（-2）时 EXPIRE 是 no-op——绝不给已消失的
+     * 键凭空造 deadline。调用方必须已持有 redisLock。
+     */
+    private void extendOnlyTtl(String key, long ttlSeconds, boolean createdHere) {
         if (!keyExistsInFake(key)) {
-            return;
+            return; // ttl == -2
         }
         long desired = fakeNow + TimeUnit.SECONDS.toMillis(ttlSeconds);
         Long current = deadlines.get(key);
-        if (current == null || current < desired) {
+        if (createdHere) { // 本次新建的键：获得有限 TTL（与索引键同滑动过期协议对齐）
             deadlines.put(key, desired);
+            return;
+        }
+        if (current != null && current < desired) { // 既有带 TTL 键：只延长不缩短
+            deadlines.put(key, desired);
+        }
+        // current == null：既有永久键（-1）保持永久，绝不缩短
+    }
+
+    /**
+     * fake 侧发号前抬 seq（对应生产脚本内 floorSeqToTopScore，v6 第六轮 ②）：把 seq
+     * 原子抬到至少当前 ZSET 最大 score（ZREVRANGE 0 0 WITHSCORES 的等价物——有界读
+     * 末尾 1 项；fake 在内存表上取最大值），再交给调用方 INCRBY。seq 键单键丢失时也
+     * 从当前最大 score 继续发号，绝不回到 0。INCRBY 保留键自身 TTL，fake 同样不触碰
+     * deadlines。调用方必须已持有 redisLock。
+     */
+    private void floorSeqToTopScore(String listKey, String seqKey) {
+        Map<String, Double> zset = zsets.get(listKey);
+        if (zset == null || zset.isEmpty()) {
+            return;
+        }
+        long topScore = (long) zset.values().stream().mapToDouble(Double::doubleValue).max().orElse(0d);
+        long current = 0L;
+        String raw = values.get(seqKey);
+        if (raw != null) {
+            try {
+                current = Long.parseLong(raw.trim());
+            } catch (NumberFormatException ignored) {
+                current = 0L; // 损坏值按 0 自愈，与生产 tonumber(raw) or 0 一致
+            }
+        }
+        if (topScore > current) {
+            incrBy(seqKey, topScore - current);
         }
     }
 
