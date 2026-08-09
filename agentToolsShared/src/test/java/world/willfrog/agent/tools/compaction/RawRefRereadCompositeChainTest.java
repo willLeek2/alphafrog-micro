@@ -59,7 +59,10 @@ import static org.mockito.Mockito.when;
  * cleanup Lua 判定等语义与权威测试逐条一致；v6 第六轮（1a74ca02）三项同样对齐：touch
  * 身份冲突只读预检先于一切写入（状态码 2 零副作用）、每次发号前 floorSeqToTopScore 把
  * seq 抬到至少当前 ZSET 最大 score、TTL 刷新区分本次新建（获有限 TTL）与既有键（只延长、
- * 永久保持永久）。</p>
+ * 永久保持永久）。v7（77a272a7）同样对齐：ZSET 最后一个成员被删除时 key 连同 deadline
+ * 当场自动删除（严格模拟真实 Redis 空集合语义，覆盖脚本内清理与脚本外 ZREM 两条路径）；
+ * 认领/加入脚本的「本次新建」判定在幽灵清理完成后即时重判，重建键按本次新建获有限 TTL，
+ * 不沿用脚本入口快照。</p>
  *
  * <p>两钟分离：fakeNow 只管 Redis 键的 TTL deadline；meta JSON 内的 expiresAtMillis 用真实
  * 墙钟（生产 cleanup 用 System.currentTimeMillis()）。模拟「内容时间流逝」靠改写 meta JSON
@@ -466,8 +469,16 @@ class RawRefRereadCompositeChainTest {
                     synchronized (redisLock) {
                         sweepExpired();
                         Map<String, Double> zset = zsets.get(invocation.getArgument(0));
-                        return zset != null && zset.remove(invocation.getArgument(1).toString()) != null
-                                ? 1L : 0L;
+                        if (zset == null || zset.remove(invocation.getArgument(1).toString()) == null) {
+                            return 0L;
+                        }
+                        if (zset.isEmpty()) {
+                            // v7：真实 Redis 语义——ZSET 最后一个成员被 ZREM 时 key 当场
+                            // 自动删除（连同 TTL）
+                            zsets.remove(invocation.getArgument(0));
+                            deadlines.remove(invocation.getArgument(0));
+                        }
+                        return 1L;
                     }
                 });
 
@@ -541,9 +552,11 @@ class RawRefRereadCompositeChainTest {
             long ttlSeconds = Long.parseLong(String.valueOf(args[6]));
             synchronized (redisLock) {
                 sweepExpired();
+                purgeWindow(keys.get(0), keys.get(1), metaPrefix, budget);
+                // v7（镜像生产）：清理完成后即时判定存在性，不取入口快照——清理刚删空
+                // ZSET 时 key 已被真实 Redis 语义自动删除，随后 ZADD 属重建（本次新建）
                 boolean listExisted = keyExistsInFake(keys.get(0));
                 boolean seqExisted = keyExistsInFake(keys.get(1));
-                purgeWindow(keys.get(0), keys.get(1), metaPrefix, budget);
                 Map<String, Double> zset = zsets.get(keys.get(0));
                 int size = zset == null ? 0 : zset.size();
                 if (size >= cap) {
@@ -600,7 +613,9 @@ class RawRefRereadCompositeChainTest {
     /**
      * fake 侧幂等认领脚本（与生产 ATOMIC_CLAIM_SCRIPT 逐步同语义）。v6 第六轮 ②：
      * 三处发号（EXISTS 修复 / 轮转重打分 / 认领入列）前都先抬 seq 至当前 ZSET 最大
-     * score；③：TTL 刷新区分本次新建与既有键（既有永久保持永久）。
+     * score；③：TTL 刷新区分本次新建与既有键（既有永久保持永久）。v7：CLAIMED 路径
+     * 的「本次新建」判定在幽灵清理完成后即时重判（清理可能删空 ZSET 使 key 自动删除，
+     * 随后 ZADD 属重建）；EXISTS 分支无删除操作，入口快照仍精确。
      * 调用方必须已持有 redisLock。
      */
     private String fakeClaim(String identityKey, String listKey, String seqKey,
@@ -633,6 +648,11 @@ class RawRefRereadCompositeChainTest {
             return "EXISTS:" + existing;
         }
         purgeWindow(listKey, seqKey, metaPrefix, budget);
+        // v7（镜像生产）：CLAIMED 路径在清理完成后即时重判 list/seq 存在性，不取入口
+        // 快照——清理刚删空 ZSET 时 key 已自动删除，随后 ZADD 属重建（本次新建）。
+        // EXISTS 分支没有任何成员删除，入口快照在那里仍然精确，不受本重判影响。
+        listExisted = keyExistsInFake(listKey);
+        seqExisted = keyExistsInFake(seqKey);
         Map<String, Double> zset = zsets.get(listKey);
         int size = zset == null ? 0 : zset.size();
         if (size >= cap) {
@@ -730,7 +750,9 @@ class RawRefRereadCompositeChainTest {
      * fake 侧窗口轮转幽灵清理（与生产认领/加入脚本内的清理段同语义）：取当前 score
      * 最低的至多 budget 个成员（ZRANGE LIMIT 构造性硬上限），meta 键不存在者当场 ZREM；
      * 重打分发号前先把 seq 原子抬到至少当前 ZSET 最大 score（v6 第六轮 ②），幸存者
-     * 再用连续新序号整体移到所有未检查成员之后。调用方必须已持有 redisLock。
+     * 再用连续新序号整体移到所有未检查成员之后。v7：清理后 ZSET 变空时按真实 Redis
+     * 「空 ZSET 自动删 key」语义当场删除键与 deadline（随后 ZADD 属重建，按本次新建获
+     * 有限 TTL）。调用方必须已持有 redisLock。
      */
     private void purgeWindow(String listKey, String seqKey, String metaPrefix, int budget) {
         if (budget <= 0) {
@@ -749,6 +771,14 @@ class RawRefRereadCompositeChainTest {
             } else {
                 zset.remove(member); // 幽灵当场清除
             }
+        }
+        if (zset.isEmpty()) {
+            // v7：真实 Redis 语义——ZSET 最后一个成员被 ZREM 时 key 当场自动删除（连同
+            // TTL）。严格模拟：条目与 deadline 一并删除；随后任何 ZADD 都属重建（本次
+            // 新建），必须获得有限 TTL。zset 空时 live 必空，无重打分可做。
+            zsets.remove(listKey);
+            deadlines.remove(listKey);
+            return;
         }
         if (!live.isEmpty()) {
             floorSeqToTopScore(listKey, seqKey); // 发号前抬 seq：幸存者严格大于未检查最大值

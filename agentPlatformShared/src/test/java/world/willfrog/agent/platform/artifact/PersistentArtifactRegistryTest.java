@@ -159,6 +159,21 @@ import static org.mockito.Mockito.when;
  *       （surefire excludes + redis-integration opt-in profile），本文件不涉及</li>
  * </ul>
  *
+ * <h3>v7 MUST-FIX 反测（77a272a7：空 ZSET 自动删 key + 脚本内重建）</h3>
+ * <ul>
+ *   <li>③延续——真实 Redis 中 ZSET 最后一个成员被 ZREM 时 key 当场自动删除；认领/加入
+ *       脚本若在幽灵清理后沿用入口存在性快照，重建的列表键会被误判为既有键而漏掉
+ *       TTL（永久键泄漏）。v7 在清理后即时重判，重建键按本次新建处理获有限 TTL ——
+ *       {@link #addScriptShouldGiveFiniteTtlToListRebuiltAfterPurgingLastGhost}（加入，
+ *       有限起点）/
+ *       {@link #addScriptShouldNotInheritPermanenceForListRebuiltAfterPurgingLastGhost}
+ *       （加入，永久起点）/
+ *       {@link #claimScriptShouldGiveFiniteTtlToListRebuiltAfterPurgingLastGhost}（认领，
+ *       有限起点）/
+ *       {@link #claimScriptShouldNotInheritPermanenceForListRebuiltAfterPurgingLastGhost}
+ *       （认领，永久起点）</li>
+ * </ul>
+ *
  * <p>Redis 用线程安全内存 fake（ConcurrentHashMap 三张表：values 字符串 / hashes 哈希 /
  * zsets 有序集合，支持真线程并发测试；五种 Lua 脚本——过期清理判定（1 ARGV）、
  * 值条件 HDEL（2 ARGV）、读取 touch（4 ARGV）、列表加入（5 ARGV）、幂等认领（6 ARGV）——
@@ -1116,9 +1131,12 @@ class PersistentArtifactRegistryTest {
         String seqKey = RUN_SEQ_PREFIX + runId;
         PersistentArtifactRegistration winner = registry.registerIdempotent(
                 runId, "user-1", "python_script", "shared", "脚本", "v1", 6);
-        // 模拟列表成员资格丢失：ZSET 成员被移除，但身份字段仍指向赢家
-        zsets.get(RUN_LIST_PREFIX + runId).remove(winner.getArtifactId());
-        assertTrue(zsets.get(RUN_LIST_PREFIX + runId).isEmpty());
+        // 模拟列表成员资格丢失：真实 Redis 不存在「空 ZSET 仍存在」的状态——最后一个
+        // 成员被移除时 key 当场自动删除（v7 严格语义），故等价状态是「列表键整体缺失」
+        // （列表键早于身份过期或被外力移除），身份字段仍指向赢家
+        zsets.remove(RUN_LIST_PREFIX + runId);
+        deadlines.remove(RUN_LIST_PREFIX + runId);
+        assertFalse(zsets.containsKey(RUN_LIST_PREFIX + runId));
         assertEquals(winner.getArtifactId(),
                 hashes.get(RUN_IDENTITY_PREFIX + runId).get(
                         PersistentArtifactRegistry.identityField("python_script", "shared", null)));
@@ -1528,6 +1546,120 @@ class PersistentArtifactRegistryTest {
                 "重建的列表必须把成员补回");
     }
 
+    // ===== v7 ③：空 ZSET 自动删 key + 脚本内重建（重建键必须获有限 TTL） =====
+
+    @Test
+    void addScriptShouldGiveFiniteTtlToListRebuiltAfterPurgingLastGhost() {
+        // v7 反测（codex 77a272a7，方向一·加入脚本）：真实 Redis 中 ZSET 最后一个成员
+        // 被 ZREM 时 key 当场自动删除。RUN_LIST_ADD_SCRIPT 若在幽灵清理后沿用入口
+        // listExisted 快照，重建的列表键会被 extendOnly 误判为既有键（TTL=-1 落在
+        // createdHere=0 分支既不返回也不 EXPIRE）→ 永久键泄漏。v7 在清理后即时重判：
+        // 重建键按本次新建处理，必须获得与滑动过期协议对齐的有限 TTL。
+        String runId = "run-rebuild-add";
+        long t0 = fakeNow;
+        String listKey = RUN_LIST_PREFIX + runId;
+        String seqKey = RUN_SEQ_PREFIX + runId;
+        PersistentArtifactRegistration ghost = registry.registerExplicit(
+                runId, "user-1", "raw-ref", "g1", "1", "ghost-payload", 6);
+        assertEquals(t0 + TimeUnit.HOURS.toMillis(6), deadlines.get(listKey),
+                "初始状态：列表键带有限 TTL（与 meta 同协议对齐）");
+        // 构造单幽灵：meta 消失、成员仍挂在列表里；列表键自身仍有有限 TTL
+        values.remove(META_PREFIX + ghost.getArtifactId());
+        deadlines.remove(META_PREFIX + ghost.getArtifactId());
+        advanceClock(TimeUnit.HOURS.toMillis(1));
+
+        // 非幂等新注册 → 清理删掉最后一个 ghost 成员 → key 自动删除 → ZADD 重建
+        PersistentArtifactRegistration fresh = registry.registerExplicit(
+                runId, "user-1", "raw-ref", "m1", "2", "fresh-payload", 6);
+        assertNotNull(fresh.getArtifactId(), "重建场景下注册不得失败");
+        Map<String, Double> zset = zsets.get(listKey);
+        assertNotNull(zset, "重建后的列表键必须在场");
+        assertEquals(1, zset.size(), "ghost 被清掉，只剩新成员");
+        assertTrue(zset.containsKey(fresh.getArtifactId()));
+        assertEquals(fakeNow + TimeUnit.HOURS.toMillis(6), deadlines.get(listKey),
+                "重建的列表键属本次新建：必须获得有限 TTL，绝不允留永久键");
+        assertEquals(fakeNow + TimeUnit.HOURS.toMillis(6), deadlines.get(seqKey),
+                "seq 键调用中未被删除，属既有键：只延长到新满额");
+        assertEquals(1, registry.listByRunId(runId).size(), "列表必须完整可读");
+    }
+
+    @Test
+    void addScriptShouldNotInheritPermanenceForListRebuiltAfterPurgingLastGhost() {
+        // v7 反测（codex 77a272a7，方向二·加入脚本）：列表键起点是永久（无 deadline ≙
+        // 真实 Redis TTL = -1）时，「既有永久保持永久」只适用于调用全程存在的键。
+        // 旧键在调用中途被清空删除后，它的永久属性已随键消失；重建键是本次新建，
+        // 必须获得有限 TTL，绝不继承已消失旧键的永久属性。
+        String runId = "run-rebuild-add-persistent";
+        String listKey = RUN_LIST_PREFIX + runId;
+        PersistentArtifactRegistration ghost = registry.registerExplicit(
+                runId, "user-1", "raw-ref", "g1", "1", "ghost-payload", 6);
+        values.remove(META_PREFIX + ghost.getArtifactId());
+        deadlines.remove(META_PREFIX + ghost.getArtifactId());
+        deadlines.remove(listKey); // 构造永久起点
+        advanceClock(TimeUnit.HOURS.toMillis(1));
+
+        PersistentArtifactRegistration fresh = registry.registerExplicit(
+                runId, "user-1", "raw-ref", "m1", "2", "fresh-payload", 6);
+        assertNotNull(fresh.getArtifactId());
+        assertEquals(fakeNow + TimeUnit.HOURS.toMillis(6), deadlines.get(listKey),
+                "重建键不得继承已消失旧键的永久属性：必须按本次新建获得有限 TTL");
+        assertEquals(1, zsets.get(listKey).size(), "ghost 被清掉，只剩新成员");
+    }
+
+    @Test
+    void claimScriptShouldGiveFiniteTtlToListRebuiltAfterPurgingLastGhost() {
+        // v7 反测（codex 77a272a7，方向一·认领脚本）：ATOMIC_CLAIM_SCRIPT 的 CLAIMED
+        // 路径同款边界——清理删空列表后重建的键必须按本次新建获有限 TTL。构造：首个
+        // 幂等身份注册后 meta 变 ghost（身份字段仍悬挂旧 ID），第二个不同身份走
+        // CLAIMED 路径（EXISTS 分支无删除操作、入口快照精确，不受本修正影响）。
+        String runId = "run-rebuild-claim";
+        long t0 = fakeNow;
+        String listKey = RUN_LIST_PREFIX + runId;
+        String identityKey = RUN_IDENTITY_PREFIX + runId;
+        PersistentArtifactRegistration ghost = registry.registerIdempotent(
+                runId, "user-1", "python_script", "pt", "脚本", "v", 6);
+        assertEquals(t0 + TimeUnit.HOURS.toMillis(6), deadlines.get(listKey),
+                "初始状态：列表键带有限 TTL（与 meta 同协议对齐）");
+        values.remove(META_PREFIX + ghost.getArtifactId());
+        deadlines.remove(META_PREFIX + ghost.getArtifactId());
+        advanceClock(TimeUnit.HOURS.toMillis(1));
+
+        PersistentArtifactRegistration fresh = registry.registerIdempotent(
+                runId, "user-1", "python_script", "pt2", "脚本2", "v", 6);
+        assertNotEquals(ghost.getArtifactId(), fresh.getArtifactId(),
+                "第二个身份必须走 CLAIMED 认领新 ID，不得采纳 ghost");
+        Map<String, Double> zset = zsets.get(listKey);
+        assertNotNull(zset, "重建后的列表键必须在场");
+        assertEquals(1, zset.size(), "ghost 被清掉，只剩新认领成员");
+        assertTrue(zset.containsKey(fresh.getArtifactId()));
+        assertEquals(fakeNow + TimeUnit.HOURS.toMillis(6), deadlines.get(listKey),
+                "重建的列表键属本次新建：必须获得有限 TTL，绝不允留永久键");
+        assertEquals(fakeNow + TimeUnit.HOURS.toMillis(6), deadlines.get(identityKey),
+                "身份 hash 调用中未被删除（HSET 只增字段）：既有键延长到新满额");
+        assertEquals(1, registry.listByRunId(runId).size(), "列表必须完整可读");
+    }
+
+    @Test
+    void claimScriptShouldNotInheritPermanenceForListRebuiltAfterPurgingLastGhost() {
+        // v7 反测（codex 77a272a7，方向二·认领脚本）：永久起点的列表键在调用中途被
+        // 清空删除后，重建键必须按本次新建获有限 TTL，不继承已消失旧键的永久属性。
+        String runId = "run-rebuild-claim-persistent";
+        String listKey = RUN_LIST_PREFIX + runId;
+        PersistentArtifactRegistration ghost = registry.registerIdempotent(
+                runId, "user-1", "python_script", "pt", "脚本", "v", 6);
+        values.remove(META_PREFIX + ghost.getArtifactId());
+        deadlines.remove(META_PREFIX + ghost.getArtifactId());
+        deadlines.remove(listKey); // 构造永久起点
+        advanceClock(TimeUnit.HOURS.toMillis(1));
+
+        PersistentArtifactRegistration fresh = registry.registerIdempotent(
+                runId, "user-1", "python_script", "pt2", "脚本2", "v", 6);
+        assertNotEquals(ghost.getArtifactId(), fresh.getArtifactId());
+        assertEquals(fakeNow + TimeUnit.HOURS.toMillis(6), deadlines.get(listKey),
+                "重建键不得继承已消失旧键的永久属性：必须按本次新建获得有限 TTL");
+        assertEquals(1, zsets.get(listKey).size(), "ghost 被清掉，只剩新认领成员");
+    }
+
     // ===== 边界约束 2：score 是单调序号不是毫秒时间 =====
 
     @Test
@@ -1667,8 +1799,16 @@ class PersistentArtifactRegistryTest {
                     synchronized (redisLock) {
                         sweepExpired();
                         Map<String, Double> zset = zsets.get(invocation.getArgument(0));
-                        return zset != null && zset.remove(invocation.getArgument(1).toString()) != null
-                                ? 1L : 0L;
+                        if (zset == null || zset.remove(invocation.getArgument(1).toString()) == null) {
+                            return 0L;
+                        }
+                        if (zset.isEmpty()) {
+                            // v7：真实 Redis 语义——ZSET 最后一个成员被 ZREM 时 key 当场
+                            // 自动删除（连同 TTL）
+                            zsets.remove(invocation.getArgument(0));
+                            deadlines.remove(invocation.getArgument(0));
+                        }
+                        return 1L;
                     }
                 });
 
@@ -1757,9 +1897,11 @@ class PersistentArtifactRegistryTest {
             long ttlSeconds = Long.parseLong(String.valueOf(args[6]));
             synchronized (redisLock) {
                 sweepExpired();
+                purgeWindow(keys.get(0), keys.get(1), metaPrefix, budget);
+                // v7（镜像生产）：清理完成后即时判定存在性，不取入口快照——清理刚删空
+                // ZSET 时 key 已被真实 Redis 语义自动删除，随后 ZADD 属重建（本次新建）
                 boolean listExisted = keyExistsInFake(keys.get(0));
                 boolean seqExisted = keyExistsInFake(keys.get(1));
-                purgeWindow(keys.get(0), keys.get(1), metaPrefix, budget);
                 Map<String, Double> zset = zsets.get(keys.get(0));
                 int size = zset == null ? 0 : zset.size();
                 if (size >= cap) {
@@ -1820,7 +1962,9 @@ class PersistentArtifactRegistryTest {
     /**
      * fake 侧幂等认领脚本（与生产 ATOMIC_CLAIM_SCRIPT 逐步同语义）。v6 第六轮 ②：
      * 三处发号（EXISTS 修复 / 轮转重打分 / 认领入列）前都先抬 seq 至当前 ZSET 最大
-     * score；③：TTL 刷新区分本次新建与既有键（既有永久保持永久）。
+     * score；③：TTL 刷新区分本次新建与既有键（既有永久保持永久）。v7：CLAIMED 路径
+     * 的「本次新建」判定在幽灵清理完成后即时重判（清理可能删空 ZSET 使 key 自动删除，
+     * 随后 ZADD 属重建）；EXISTS 分支无删除操作，入口快照仍精确。
      * 调用方必须已持有 redisLock。
      */
     private String fakeClaim(String identityKey, String listKey, String seqKey,
@@ -1853,6 +1997,11 @@ class PersistentArtifactRegistryTest {
             return "EXISTS:" + existing;
         }
         purgeWindow(listKey, seqKey, metaPrefix, budget);
+        // v7（镜像生产）：CLAIMED 路径在清理完成后即时重判 list/seq 存在性，不取入口
+        // 快照——清理刚删空 ZSET 时 key 已自动删除，随后 ZADD 属重建（本次新建）。
+        // EXISTS 分支没有任何成员删除，入口快照在那里仍然精确，不受本重判影响。
+        listExisted = keyExistsInFake(listKey);
+        seqExisted = keyExistsInFake(seqKey);
         Map<String, Double> zset = zsets.get(listKey);
         int size = zset == null ? 0 : zset.size();
         if (size >= cap) {
@@ -1956,7 +2105,9 @@ class PersistentArtifactRegistryTest {
      * 者当场 ZREM；重打分发号前先把 seq 原子抬到至少当前 ZSET 最大 score（v6 第六轮
      * ②，seq 键单键丢失也不降级），窗口内活成员再用 INCRBY 新发的连续序号重新打分、
      * 整体移到所有未检查成员之后（严格大于任何未检查成员的得分）。轮转状态编码在
-     * score 排序本身，不存在独立游标键。调用方必须已持有 redisLock。
+     * score 排序本身，不存在独立游标键。v7：清理后 ZSET 变空时按真实 Redis「空 ZSET
+     * 自动删 key」语义当场删除键与 deadline（随后 ZADD 属重建，按本次新建获有限 TTL）。
+     * 调用方必须已持有 redisLock。
      */
     private void purgeWindow(String listKey, String seqKey, String metaPrefix, int budget) {
         if (budget <= 0) {
@@ -1975,6 +2126,14 @@ class PersistentArtifactRegistryTest {
             } else {
                 zset.remove(member); // 幽灵当场清除
             }
+        }
+        if (zset.isEmpty()) {
+            // v7：真实 Redis 语义——ZSET 最后一个成员被 ZREM 时 key 当场自动删除（连同
+            // TTL）。严格模拟：条目与 deadline 一并删除；随后任何 ZADD 都属重建（本次
+            // 新建），必须获得有限 TTL。zset 空时 live 必空，无重打分可做。
+            zsets.remove(listKey);
+            deadlines.remove(listKey);
+            return;
         }
         if (!live.isEmpty()) {
             floorSeqToTopScore(listKey, seqKey); // 发号前抬 seq：幸存者严格大于未检查最大值
