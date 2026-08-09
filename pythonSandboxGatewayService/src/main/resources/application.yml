@@ -23,6 +23,19 @@ dubbo:
 sandbox:
   service:
     url: ${AF_SANDBOX_SERVICE_URL:http://localhost:8095}
+    # 260809-26Q3-stage1-w3 D13: Gateway HTTP client timeouts.
+    # Connect timeout covers TCP/SSL handshake; same for both long and short
+    # clients (fast-fail network issues, seconds-scale).
+    connect-timeout-millis: ${AF_SANDBOX_CONNECT_TIMEOUT_MILLIS:5000}
+    # Long-path read timeout applies to createTask + getTaskResult (downstream
+    # may run max task duration + queue/prepare overhead). MUST be >= platform
+    # max task timeout + queue/prepare margin. Default 35 min covers 30 min task
+    # + 5 min queue/prepare/final-write margin; operators may override.
+    long-read-timeout-millis: ${AF_SANDBOX_LONG_READ_TIMEOUT_MILLIS:2100000}
+    # Short-query read timeout applies to getTaskStatus + getTaskByOperationId
+    # + cancelTask (D11). These should return near-instantly; shorter timeout
+    # avoids Dubbo business thread being held on slow status queries.
+    short-read-timeout-millis: ${AF_SANDBOX_SHORT_READ_TIMEOUT_MILLIS:10000}
 
 # 260605-2 §3: gateway-side observability.
 # Default to INFO so that sandbox.createTask / sandbox.getTaskStatus / sandbox.getTaskResult

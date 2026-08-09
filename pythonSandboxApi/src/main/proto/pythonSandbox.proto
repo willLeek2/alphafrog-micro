@@ -44,6 +44,11 @@ message ExecuteResponse {
   string error = 3;
   bool existing = 4;
   string requestFingerprint = 5;
+  // 260809-26Q3-stage1-w3 D13: typed HTTP error detail. Presence semantics:
+  // absent = legacy producer (pre-D13); present = D13 mapping applied, category
+  // is the authoritative machine signal. Parent `error` remains the sole
+  // human-readable text and must stay non-blank on every failure path.
+  SandboxErrorDetail errorDetail = 6;
 }
 
 message GetTaskStatusRequest {
@@ -56,6 +61,8 @@ message TaskStatusResponse {
   string startedAt = 3;
   string finishedAt = 4;
   string error = 5;
+  // 260809-26Q3-stage1-w3 D13: typed HTTP error detail. See ExecuteResponse.errorDetail.
+  SandboxErrorDetail errorDetail = 6;
 }
 
 message GetTaskResultRequest {
@@ -80,6 +87,9 @@ message TaskResultResponse {
   // 260808-finance-methodspec-v5: 实际容器环境身份，proto 11 为权威值。
   // 无 runtimeImageRef（Python 内部 C/H 任务事实，不进 DTO）。
   SandboxEnvironmentIdentity executionEnvironment = 11;
+  // 260809-26Q3-stage1-w3 D13: typed HTTP error detail. See ExecuteResponse.errorDetail.
+  // Tag 12 chosen because 260808 additive fields already occupy 9/10/11.
+  SandboxErrorDetail errorDetail = 12;
 }
 
 message SandboxResourceUsage {
@@ -138,12 +148,58 @@ message GetTaskByOperationIdRequest {
   string operationId = 1;
 }
 
+// 260809-26Q3-stage1-w3 D13: Gateway HTTP 错误的稳定分类。codex msg 2110f215 +
+// Cindy msg 4b89c2d6/807334eb 冻结。8 frozen values map 1:1 to tags 0-7.
+// Tag 0 = SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED is the proto3 default; parent
+// message presence (has*()) distinguishes "D13 mapped but uncategorizable" from
+// "legacy producer did not map at all".
+enum SandboxHttpErrorCategory {
+  SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED = 0;
+  SANDBOX_HTTP_ERROR_CATEGORY_CONFLICT = 1;
+  SANDBOX_HTTP_ERROR_CATEGORY_INVALID_ARGUMENT = 2;
+  SANDBOX_HTTP_ERROR_CATEGORY_OVERLOADED_OR_UNAVAILABLE = 3;
+  SANDBOX_HTTP_ERROR_CATEGORY_NOT_FOUND = 4;
+  SANDBOX_HTTP_ERROR_CATEGORY_GATEWAY_TIMEOUT = 5;
+  SANDBOX_HTTP_ERROR_CATEGORY_TRANSPORT_FAILURE = 6;
+  SANDBOX_HTTP_ERROR_CATEGORY_DOWNSTREAM_FAILURE = 7;
+}
+
+// 260809-26Q3-stage1-w3 D13: typed HTTP error detail — the SOLE authoritative
+// machine contract for HTTP error classification (codex msg 2110f215).
+// Parent-message presence (hasErrorDetail()) is the new-producer signal:
+//   absent = legacy producer (pre-D13); consumer MUST fall back to conservative
+//           blank-vs-nonblank error text behavior and MUST NOT guess category.
+//   present = D13 mapping applied; category is the authoritative signal.
+// Only 2 fields: category + presence-aware downstream_http_status. No message
+// field (parent string error is the single human-text source). No retryable
+// field this round (codex 531cc154 + Cindy 70b94ca1).
+//
+// downstream_http_status records the ACTUAL downstream HTTP status received:
+//   - Gateway local reject (D14 operationId gate, no downstream call) → absent
+//   - Gateway connect/read timeout (no downstream HTTP response) → absent
+//   - Transport failure: DNS/conn refused/TLS/non-timeout IO → absent
+//   - Downstream 4xx/5xx received (Gateway proxied) → present with actual code
+// Downstream 504 → DOWNSTREAM_FAILURE + status=504 (NOT GATEWAY_TIMEOUT, since
+// downstream已响应). Downstream 401/403/unknown 4xx → UNSPECIFIED (not
+// INVALID_ARGUMENT, avoiding over-categorization of auth/permission errors).
+message SandboxErrorDetail {
+  SandboxHttpErrorCategory category = 1;
+  optional int32 downstream_http_status = 2;
+}
+
 message GetTaskByOperationIdResponse {
   bool found = 1;
   string taskId = 2;
   string status = 3;
   string requestFingerprint = 4;
   string error = 5;
+  // 260809-26Q3-stage1-w3 D13: typed HTTP error detail. See ExecuteResponse.errorDetail.
+  // Authoritative absence (D13 fail-closed red line 6) is expressed ONLY by:
+  //   found=false + error blank + errorDetail absent (legacy presence semantics)
+  // on this response. Any present errorDetail — including category=NOT_FOUND —
+  // MUST be treated as failure (fail-closed preserve PREPARING), never as
+  // authoritative absence.
+  SandboxErrorDetail errorDetail = 6;
 }
 
 service PythonSandboxService {
