@@ -8,6 +8,7 @@ import org.apache.dubbo.rpc.RpcContext;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
+import world.willfrog.agent.platform.dataanalysis.CapacityAdmissionException;
 import world.willfrog.agent.platform.dataanalysis.*;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.finance.FinanceRecordChannelConfigLoader;
@@ -25,7 +26,6 @@ import world.willfrog.agent.workflow.AgentRunDatasetEntry;
 import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
 import world.willfrog.agent.workflow.AgentRunDatasetSnapshot;
 import world.willfrog.agent.tools.dataset.DatasetEntryMetadataReader;
-import world.willfrog.agent.tools.python.DataAnalysisCapacityServiceImpl.CapacityAdmissionException;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
 
 import com.google.protobuf.util.JsonFormat;
