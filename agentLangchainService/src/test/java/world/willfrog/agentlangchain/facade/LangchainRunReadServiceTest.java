@@ -3,8 +3,10 @@ package world.willfrog.agentlangchain.facade;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.InOrder;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.entity.AgentRunEvent;
+import world.willfrog.agent.platform.event.AgentRunFinalizationService;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentArtifactService;
@@ -54,6 +56,7 @@ class LangchainRunReadServiceTest {
     private final AgentArtifactService artifactService = mock(AgentArtifactService.class);
     private final DataAnalysisObservabilityQuery dataAnalysisQuery = mock(DataAnalysisObservabilityQuery.class);
     private final DataAnalysisReadResponseSerializer dataAnalysisSerializer = new DataAnalysisReadResponseSerializer(new ObjectMapper());
+    private final AgentRunFinalizationService finalizationService = mock(AgentRunFinalizationService.class);
 
     private final LangchainRunReadService service = new LangchainRunReadService(
             runMapper,
@@ -72,7 +75,8 @@ class LangchainRunReadServiceTest {
             artifactService,
             new ObjectMapper(),
             dataAnalysisQuery,
-            dataAnalysisSerializer);
+            dataAnalysisSerializer,
+            finalizationService);
 
     @BeforeEach
     void stubDataAnalysisQuery() {
@@ -90,6 +94,28 @@ class LangchainRunReadServiceTest {
                 .build());
 
         assertEquals("r1", message.getId());
+    }
+
+    @Test
+    void getRunPublishesExpiredOnlyAfterTerminalStateIsPersisted() {
+        AgentRun active = run("{\"run_provider\":\"langchain\"}");
+        active.setStatus(AgentRunStatus.COMPLETED);
+        AgentRun expired = run("{\"run_provider\":\"langchain\"}");
+        expired.setStatus(AgentRunStatus.EXPIRED);
+        when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(active, expired);
+        when(eventService.shouldMarkExpired(active)).thenReturn(true);
+
+        var message = service.getRun(GetAgentRunRequest.newBuilder()
+                .setUserId("u1")
+                .setId("r1")
+                .build());
+
+        assertEquals("EXPIRED", message.getStatus());
+        InOrder order = inOrder(runMapper, eventService, stateStore, finalizationService);
+        order.verify(runMapper).updateStatus("r1", "u1", AgentRunStatus.EXPIRED);
+        order.verify(eventService).append(eq("r1"), eq("u1"), eq("RUN_EXPIRED"), anyMap());
+        order.verify(stateStore).markRunStatus("r1", "EXPIRED");
+        order.verify(finalizationService).publishFinalizedEvent("r1", "u1", "EXPIRED");
     }
 
     @Test

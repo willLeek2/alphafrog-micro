@@ -3,6 +3,7 @@ package world.willfrog.agentlangchain.facade;
 import org.junit.jupiter.api.Test;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.event.AgentRunFinalizationService;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentEventService;
@@ -30,9 +31,10 @@ class LangchainRunControlServiceTest {
     private final LangchainLinearRunPipeline pipeline = mock(LangchainLinearRunPipeline.class);
     private final AgentRunCreditSettlementService creditSettlementService = mock(AgentRunCreditSettlementService.class);
     private final ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
+    private final AgentRunFinalizationService finalizationService = mock(AgentRunFinalizationService.class);
     private final LangchainRunControlService service = new LangchainRunControlService(
             readService, runMapper, eventService, stateStore, observabilityService, pipeline,
-            creditSettlementService, anchorService);
+            creditSettlementService, anchorService, finalizationService);
 
     @Test
     void cancelFlushesObservabilityAndMarksCanceled() {
@@ -50,6 +52,7 @@ class LangchainRunControlServiceTest {
         verify(observabilityService).forceFlush("r1");
         verify(runMapper).updateSnapshot(eq("r1"), eq("u1"), eq(AgentRunStatus.CANCELED), anyString(), eq(false), isNull());
         verify(eventService).append(eq("r1"), eq("u1"), eq("CANCELED"), anyMap());
+        verify(finalizationService).publishFinalizedEvent("r1", "u1", "CANCELED");
     }
 
     @Test
@@ -95,6 +98,7 @@ class LangchainRunControlServiceTest {
         // Oracle: snapshot updated with current status (not CANCELED)
         verify(runMapper).updateSnapshot(eq("r1"), eq("u1"), eq(AgentRunStatus.WAITING_TOOL_JOB),
                 anyString(), eq(false), isNull());
+        verify(finalizationService, never()).publishFinalizedEvent(anyString(), anyString(), anyString());
     }
 
     @Test

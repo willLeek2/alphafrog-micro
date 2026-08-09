@@ -251,7 +251,8 @@ class ToolJobReconcilerP005ReverseTest {
         // Construct LangchainRunControlService with REAL mapper + anchor service + mocked dependencies
         controlService = new LangchainRunControlService(
                 readService, mapper, eventService, stateStore,
-                observabilityService, pipeline, creditSettlementService, anchorService);
+                observabilityService, pipeline, creditSettlementService, anchorService,
+                mock(world.willfrog.agent.platform.event.AgentRunFinalizationService.class));
 
         ToolJobResumeService resumeService = new ToolJobResumeService(
                 anchorService, redisCache, config, om);

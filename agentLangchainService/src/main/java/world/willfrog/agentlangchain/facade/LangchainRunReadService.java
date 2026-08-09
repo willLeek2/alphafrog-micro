@@ -9,6 +9,7 @@ import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.entity.AgentRunEvent;
 import world.willfrog.agent.platform.entity.AgentRunMessage;
+import world.willfrog.agent.platform.event.AgentRunFinalizationService;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentArtifactService;
@@ -139,6 +140,7 @@ public class LangchainRunReadService {
     private final ObjectMapper objectMapper;
     private final DataAnalysisObservabilityQuery dataAnalysisObservabilityQuery;
     private final DataAnalysisReadResponseSerializer dataAnalysisSerializer;
+    private final AgentRunFinalizationService finalizationService;
 
     @Value("${agent.run.list.default-days:30}")
     private int listDefaultDays;
@@ -530,6 +532,8 @@ public class LangchainRunReadService {
                 "run_id", run.getId(),
                 "expired_at", OffsetDateTime.now().toString()));
         stateStore.markRunStatus(run.getId(), AgentRunStatus.EXPIRED.name());
+        finalizationService.publishFinalizedEvent(
+                run.getId(), run.getUserId(), AgentRunStatus.EXPIRED.name());
         AgentRun refreshed = runMapper.findByIdAndUser(run.getId(), run.getUserId());
         return refreshed == null ? run : refreshed;
     }

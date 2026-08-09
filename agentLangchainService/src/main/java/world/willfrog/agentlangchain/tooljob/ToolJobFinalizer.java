@@ -7,7 +7,10 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.dataanalysis.*;
+import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.event.AgentRunFinalizationService;
 import world.willfrog.agent.platform.finance.*;
+import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.tools.finance.FinanceResultModelAdapter;
 import world.willfrog.agent.tools.python.FinanceRecordProtoAdapter;
@@ -51,6 +54,8 @@ public class ToolJobFinalizer {
     private final FinanceRecordChannelConfigLoader configLoader;
     private final FinanceToolResultFormatter formatter;
     private final FinanceResultModelAdapter adapter;
+    private final AgentRunMapper agentRunMapper;
+    private final AgentRunFinalizationService finalizationService;
     private final ObjectMapper objectMapper = new ObjectMapper().findAndRegisterModules();
 
     @Autowired(required = false)
@@ -59,6 +64,7 @@ public class ToolJobFinalizer {
     @Autowired(required = false)
     private ToolJobEventHook eventHook;
 
+    @Autowired
     public ToolJobFinalizer(ToolJobAnchorService anchorService,
                             ToolJobRedisCache redisCache,
                             DataAnalysisCapacityService capacityService,
@@ -67,7 +73,9 @@ public class ToolJobFinalizer {
                             FinanceRecordChannelProcessor financeProcessor,
                             FinanceRecordChannelConfigLoader configLoader,
                             FinanceToolResultFormatter formatter,
-                            FinanceResultModelAdapter adapter) {
+                            FinanceResultModelAdapter adapter,
+                            AgentRunMapper agentRunMapper,
+                            AgentRunFinalizationService finalizationService) {
         this.anchorService = anchorService;
         this.redisCache = redisCache;
         this.capacityService = capacityService;
@@ -77,6 +85,25 @@ public class ToolJobFinalizer {
         this.configLoader = configLoader;
         this.formatter = formatter;
         this.adapter = adapter;
+        this.agentRunMapper = agentRunMapper;
+        this.finalizationService = finalizationService;
+    }
+
+    /**
+     * 兼容纯单元测试和外部窄 fixture 的旧构造器。生产 Spring 装配固定走上面的完整构造器，
+     * 从数据库真相源补齐 userId 后才发布 workspace 终态事件。
+     */
+    public ToolJobFinalizer(ToolJobAnchorService anchorService,
+                            ToolJobRedisCache redisCache,
+                            DataAnalysisCapacityService capacityService,
+                            ToolJobResumeService resumeService,
+                            ToolJobConfig config,
+                            FinanceRecordChannelProcessor financeProcessor,
+                            FinanceRecordChannelConfigLoader configLoader,
+                            FinanceToolResultFormatter formatter,
+                            FinanceResultModelAdapter adapter) {
+        this(anchorService, redisCache, capacityService, resumeService, config,
+                financeProcessor, configLoader, formatter, adapter, null, null);
     }
 
     // ========== public entry points ==========
@@ -374,6 +401,7 @@ public class ToolJobFinalizer {
                     log.warn("CANCELED terminal transition failed for run={}, will retry", runId);
                     return;
                 }
+                publishCanceledWorkspaceFinalized(runId);
                 // DB 已持久化取消终态后才清 Redis due/cache，Redis 丢失不影响真相。
                 // STEP_CANCELED 排在最后，重入时所有前序步骤均视为完成。
                 redisCache.removeDue(runId);
@@ -414,6 +442,29 @@ public class ToolJobFinalizer {
             redisCache.writePendingCache(runId, anchor);
             // 立即尝试重入以降低延迟；失败/崩溃由 startup/reconciler 后续补扫。
             resumeService.tryResume(runId);
+        }
+    }
+
+    /**
+     * 长工具取消的 workspace 事件只能在 CANCELED CAS 成功后发布。
+     * 发布/读取失败走 polling 兜底，绝不能反向回滚已经提交的终态与容量释放收口。
+     */
+    private void publishCanceledWorkspaceFinalized(String runId) {
+        if (agentRunMapper == null || finalizationService == null) {
+            return;
+        }
+        try {
+            AgentRun run = agentRunMapper.findById(runId);
+            if (run == null || run.getUserId() == null || run.getUserId().isBlank()) {
+                log.warn("Workspace finalization event skipped after CANCELED CAS: "
+                        + "run/user missing runId={}", runId);
+                return;
+            }
+            finalizationService.publishFinalizedEvent(
+                    runId, run.getUserId(), AgentRunStatus.CANCELED.name());
+        } catch (RuntimeException e) {
+            log.warn("Workspace finalization event failed after CANCELED CAS; polling will retry: "
+                    + "runId={} err={}", runId, e.getMessage(), e);
         }
     }
 

@@ -4,6 +4,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.event.AgentRunFinalizationService;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentEventService;
@@ -72,6 +73,7 @@ public class LangchainRunControlService {
     private final LangchainLinearRunPipeline pipeline;
     private final AgentRunCreditSettlementService creditSettlementService;
     private final ToolJobAnchorService anchorService;
+    private final AgentRunFinalizationService finalizationService;
 
     /**
      * 删除 run 及其关联的状态数据（Redis）。
@@ -165,6 +167,11 @@ public class LangchainRunControlService {
                 "engine", "agentLangchainService"));
         // 7. 最后再把 Redis 状态从 CANCELING 改成 CANCELED（终态）
         stateStore.markRunStatus(runId, AgentRunStatus.CANCELED.name());
+        // 活跃长工具仍由 ToolJobFinalizer 持有终态 CAS 责任；这里只给已经真正写入 DB CANCELED
+        // 的普通取消发布 workspace dump 事件，不能把 WAITING_TOOL_JOB 提前伪装成持久终态。
+        if (!hasActiveAnchor) {
+            finalizationService.publishFinalizedEvent(runId, userId, AgentRunStatus.CANCELED.name());
+        }
         // 8. 260612-01-02: cancel 路径触发结算（可能已有部分 LLM 调用）
         try {
             creditSettlementService.settleAsync(runId, userId);

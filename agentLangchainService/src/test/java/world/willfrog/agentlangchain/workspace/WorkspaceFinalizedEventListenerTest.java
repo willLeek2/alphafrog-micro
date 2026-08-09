@@ -28,4 +28,36 @@ class WorkspaceFinalizedEventListenerTest {
 
         verifyNoInteractions(scheduler);
     }
+
+    @Test
+    void onRunFinalized_expiredAlwaysUsesConservativeDump() {
+        WorkspaceDumpScheduler scheduler = mock(WorkspaceDumpScheduler.class);
+        WorkspaceFinalizedEventListener listener = new WorkspaceFinalizedEventListener(scheduler);
+
+        listener.onRunFinalized(new AgentRunFinalizedEvent("run-expired", 7L, "EXPIRED", false));
+
+        verify(scheduler).enqueueDumpAsync("run-expired", true);
+    }
+
+    @Test
+    void onRunFinalized_canceledNeverUsesConservativeDump() {
+        WorkspaceDumpScheduler scheduler = mock(WorkspaceDumpScheduler.class);
+        WorkspaceFinalizedEventListener listener = new WorkspaceFinalizedEventListener(scheduler);
+
+        listener.onRunFinalized(new AgentRunFinalizedEvent("run-canceled", 7L, "CANCELED", true));
+
+        verify(scheduler).enqueueDumpAsync("run-canceled", false);
+    }
+
+    @Test
+    void onRunFinalized_malformedOrNonTerminalEventIgnored() {
+        WorkspaceDumpScheduler scheduler = mock(WorkspaceDumpScheduler.class);
+        WorkspaceFinalizedEventListener listener = new WorkspaceFinalizedEventListener(scheduler);
+
+        listener.onRunFinalized(new AgentRunFinalizedEvent(" ", 7L, "EXPIRED", true));
+        listener.onRunFinalized(new AgentRunFinalizedEvent("run-active", 7L, "EXECUTING", false));
+        listener.onRunFinalized(new AgentRunFinalizedEvent("run-unknown", 7L, null, false));
+
+        verifyNoInteractions(scheduler);
+    }
 }
