@@ -451,4 +451,311 @@ class PythonSandboxGatewayServiceImplD13Test {
                 .setCode("print(1)")
                 .build();
     }
+
+    // === MUST-FIX 1 (Cindy 91490076 #1): getTaskResult preserves status typed failure ===
+
+    @Test
+    void getTaskResultPropagatesStatusTypedFailure503WithoutCallingResultEndpoint() {
+        // Status pre-check returns 503 with typed detail; getTaskResult MUST propagate the
+        // same detail and NOT call /result endpoint.
+        RestTemplate restTemplate = new RestTemplate();
+        MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
+        PythonSandboxGatewayServiceImpl gateway = newGateway(restTemplate);
+
+        server.expect(once(), requestTo("http://sandbox/tasks/task-1"))
+                .andRespond(withStatus(HttpStatus.SERVICE_UNAVAILABLE));
+        // No expectation for /tasks/task-1/result — the test framework will fail if called.
+
+        TaskResultResponse response = gateway.getTaskResult(
+                GetTaskResultRequest.newBuilder().setTaskId("task-1").build());
+
+        server.verify();
+        assertTrue(response.hasErrorDetail());
+        assertEquals(
+                SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_OVERLOADED_OR_UNAVAILABLE,
+                response.getErrorDetail().getCategory()
+        );
+        assertEquals(503, response.getErrorDetail().getDownstreamHttpStatus());
+        assertFalse(response.getError().isBlank(), "parent error MUST be non-blank");
+    }
+
+    @Test
+    void getTaskResultPropagatesStatusGatewayTimeoutWithoutCallingResultEndpoint() {
+        // Status pre-check times out (GATEWAY_TIMEOUT); getTaskResult MUST propagate the
+        // same category + absent downstream_http_status, no result call.
+        RestTemplate restTemplate = new RestTemplate();
+        MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
+        PythonSandboxGatewayServiceImpl gateway = newGateway(restTemplate);
+
+        server.expect(once(), requestTo("http://sandbox/tasks/task-1"))
+                .andRespond(request -> {
+                    throw new org.springframework.web.client.ResourceAccessException(
+                            "I/O error: Read timed out",
+                            new java.net.SocketTimeoutException("Read timed out"));
+                });
+
+        TaskResultResponse response = gateway.getTaskResult(
+                GetTaskResultRequest.newBuilder().setTaskId("task-1").build());
+
+        server.verify();
+        assertTrue(response.hasErrorDetail());
+        assertEquals(
+                SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_GATEWAY_TIMEOUT,
+                response.getErrorDetail().getCategory()
+        );
+        assertFalse(response.getErrorDetail().hasDownstreamHttpStatus());
+        assertFalse(response.getError().isBlank());
+    }
+
+    // === MUST-FIX 2a (Cindy 91490076 #2): blank operationId dual-write ===
+
+    @Test
+    void getTaskByOperationIdBlankOperationIdDualWritesInvalidArgumentWithoutDownstreamStatus() {
+        // Local reject — no downstream HTTP call, downstream_http_status absent.
+        RestTemplate restTemplate = new RestTemplate();
+        MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
+        PythonSandboxGatewayServiceImpl gateway = newGateway(restTemplate);
+
+        // No expectation — blank operationId MUST short-circuit before HTTP.
+
+        GetTaskByOperationIdResponse response = gateway.getTaskByOperationId(
+                GetTaskByOperationIdRequest.newBuilder().setOperationId("").build());
+
+        server.verify();
+        assertFalse(response.getFound());
+        assertFalse(response.getError().isBlank());
+        assertTrue(response.hasErrorDetail());
+        assertEquals(
+                SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_INVALID_ARGUMENT,
+                response.getErrorDetail().getCategory()
+        );
+        assertFalse(response.getErrorDetail().hasDownstreamHttpStatus(),
+                "local reject MUST NOT fabricate downstream_http_status");
+    }
+
+    // === MUST-FIX 2b (Cindy 91490076 #2): found=true + error nonblank writes detail ===
+
+    @Test
+    void getTaskByOperationIdFoundTrueWithErrorNonblankWritesUnspecifiedDetail() {
+        // Contradictory body: found=true but error non-blank. Cindy 91490076 #2 says
+        // any non-blank body error MUST surface as typed failure detail.
+        RestTemplate restTemplate = new RestTemplate();
+        MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
+        PythonSandboxGatewayServiceImpl gateway = newGateway(restTemplate);
+
+        server.expect(once(), requestTo("http://sandbox/operations/run-1"))
+                .andRespond(withSuccess(
+                        "{\"found\":true,\"task_id\":\"task-x\",\"error\":\"partial state\"}",
+                        MediaType.APPLICATION_JSON));
+
+        GetTaskByOperationIdResponse response = gateway.getTaskByOperationId(
+                GetTaskByOperationIdRequest.newBuilder().setOperationId("run-1").build());
+
+        server.verify();
+        assertTrue(response.getFound(), "found=true from body still propagated");
+        assertTrue(response.hasErrorDetail(), "non-blank body error MUST surface typed detail");
+        assertEquals(
+                SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED,
+                response.getErrorDetail().getCategory()
+        );
+        assertEquals(200, response.getErrorDetail().getDownstreamHttpStatus());
+        assertEquals("partial state", response.getError());
+    }
+
+    // === MUST-FIX 2c (Cindy 91490076 #2): blank exception message uses fallback ===
+
+    @Test
+    void blankExceptionMessageUsesFallbackText() {
+        // nonBlankOr(Throwable, fallback) — null/blank/whitespace message MUST fall back.
+        Exception blankMsg = new RuntimeException("   ");
+        Exception nullMsg = new RuntimeException((String) null);
+        Exception realMsg = new RuntimeException("real failure");
+        assertEquals("fallback", PythonSandboxGatewayServiceImpl.nonBlankOr(blankMsg, "fallback"));
+        assertEquals("fallback", PythonSandboxGatewayServiceImpl.nonBlankOr(nullMsg, "fallback"));
+        assertEquals("real failure", PythonSandboxGatewayServiceImpl.nonBlankOr(realMsg, "fallback"));
+    }
+
+    // === MUST-FIX 3 (Cindy 91490076 #3 + 6a6e6158): timeout validation ===
+
+    @Test
+    void restTemplateConfigRejectsZeroConnectTimeout() {
+        assertTimeoutValidationFails(0, 10000, 2100000, 1800000, 300000, "connect-timeout-millis");
+    }
+
+    @Test
+    void restTemplateConfigRejectsNegativeLongReadTimeout() {
+        assertTimeoutValidationFails(5000, 10000, -1, 1800000, 300000, "long-read-timeout-millis");
+    }
+
+    @Test
+    void restTemplateConfigRejectsShortNotStrictlyLessThanLong() {
+        assertTimeoutValidationFails(5000, 2100000, 2100000, 1800000, 300000,
+                "short-read-timeout-millis");
+    }
+
+    @Test
+    void restTemplateConfigRejectsLongBelowMaxPlusMargin() {
+        // long = 1500000, max + margin = 1800000 + 300000 = 2100000 → long < required → reject.
+        assertTimeoutValidationFails(5000, 10000, 1500000, 1800000, 300000,
+                "long-read-timeout-millis");
+    }
+
+    @Test
+    void restTemplateConfigRejectsZeroMaxTaskTimeout() {
+        assertTimeoutValidationFails(5000, 10000, 2100000, 0, 300000, "max-task-timeout-millis");
+    }
+
+    @Test
+    void restTemplateConfigAcceptsValidFrozenDefaults() {
+        // Cindy 91490076 + ccqwen 5c543fea frozen defaults: connect=5s, short=10s, long=35min,
+        // max=30min, margin=5min → long (2100000) = max + margin (1800000 + 300000) ✓ and
+        // short (10000) < long (2100000) ✓.
+        org.springframework.context.ApplicationContextException thrown = null;
+        try {
+            world.willfrog.sandbox.config.RestTemplateConfig.validateTimeoutConfiguration(
+                    5000, 10000, 2100000, 1800000, 300000);
+        } catch (org.springframework.context.ApplicationContextException e) {
+            thrown = e;
+        }
+        org.junit.jupiter.api.Assertions.assertNull(thrown,
+                "frozen defaults MUST be accepted without throwing");
+    }
+
+    private static void assertTimeoutValidationFails(
+            long connect, long shortRead, long longRead, long max, long margin, String expectedToken
+    ) {
+        IllegalArgumentException ex = org.junit.jupiter.api.Assertions.assertThrows(
+                IllegalArgumentException.class,
+                () -> world.willfrog.sandbox.config.RestTemplateConfig.validateTimeoutConfiguration(
+                        connect, shortRead, longRead, max, margin)
+        );
+        assertTrue(ex.getMessage().contains(expectedToken),
+                "error message MUST mention " + expectedToken + "; got: " + ex.getMessage());
+    }
+
+    @Test
+    void createTaskLocalRejectsEffectiveTimeoutOverMaxWithInvalidArgumentAndAbsentDownstreamStatus() {
+        // Cindy 6a6e6158: threshold is `effective > max` (NOT > max + margin).
+        // max default = 1800000ms; set timeoutMillis to 1800001 → effective > max → local reject.
+        RestTemplate restTemplate = new RestTemplate();
+        MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
+        PythonSandboxGatewayServiceImpl gateway = newGateway(restTemplate);
+
+        // No HTTP expectation — local reject MUST short-circuit.
+
+        ExecuteResponse response = gateway.createTask(ExecuteRequest.newBuilder()
+                .setCode("print(1)")
+                .setTimeoutMillis(1800001L)
+                .build());
+
+        server.verify();
+        assertTrue(response.hasErrorDetail());
+        assertEquals(
+                SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_INVALID_ARGUMENT,
+                response.getErrorDetail().getCategory()
+        );
+        assertFalse(response.getErrorDetail().hasDownstreamHttpStatus(),
+                "local reject MUST NOT fabricate downstream_http_status");
+        assertFalse(response.getError().isBlank());
+    }
+
+    @Test
+    void createTaskLocalRejectUsesMaxOfLegacySecondsAndCanonicalMillis() {
+        // Legacy timeoutSeconds = 31 min (1860 sec → 1860000ms) > max 1800000 → reject.
+        RestTemplate restTemplate = new RestTemplate();
+        MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
+        PythonSandboxGatewayServiceImpl gateway = newGateway(restTemplate);
+
+        ExecuteResponse response = gateway.createTask(ExecuteRequest.newBuilder()
+                .setCode("print(1)")
+                .setTimeoutSeconds(1860.0)
+                .build());
+
+        server.verify();
+        assertTrue(response.hasErrorDetail());
+        assertEquals(
+                SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_INVALID_ARGUMENT,
+                response.getErrorDetail().getCategory()
+        );
+    }
+
+    // === MUST-FIX 4 (Cindy 91490076 #4): downstream_http_status = ACTUAL response status ===
+
+    @Test
+    void createTaskEmptyBody204UsesActualDownstreamStatusNotHardcoded200() {
+        // Spring's MockRestResponseCreators.withSuccess emits 200 by default; use withStatus
+        // for 204 explicitly to verify the actual status propagates.
+        RestTemplate restTemplate = new RestTemplate();
+        MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
+        PythonSandboxGatewayServiceImpl gateway = newGateway(restTemplate);
+
+        server.expect(once(), requestTo("http://sandbox/tasks"))
+                .andRespond(withStatus(HttpStatus.NO_CONTENT));
+
+        ExecuteResponse response = gateway.createTask(buildMinimalCreateRequest());
+
+        server.verify();
+        assertTrue(response.hasErrorDetail());
+        assertEquals(204, response.getErrorDetail().getDownstreamHttpStatus(),
+                "downstream_http_status MUST be actual 204, not hardcoded 200");
+    }
+
+    // === MUST-FIX 5 (Cindy 91490076 #5): 404 emits ERROR not OK ===
+    // (Implicitly tested via getTaskStatus404ReturnsNotFoundDetailWithDownstreamStatus above;
+    // telemetry-level JSONL emission assertion is out of unit-test scope but the production
+    // code at PythonSandboxGatewayServiceImpl.java emits "ERROR" + frozen category for 404.)
+
+    @Test
+    void getTaskStatusEmptyBodyUsesActualDownstreamStatus() {
+        RestTemplate restTemplate = new RestTemplate();
+        MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
+        PythonSandboxGatewayServiceImpl gateway = newGateway(restTemplate);
+
+        server.expect(once(), requestTo("http://sandbox/tasks/task-1"))
+                .andRespond(withStatus(HttpStatus.NO_CONTENT));
+
+        world.willfrog.alphafrogmicro.sandbox.idl.TaskStatusResponse response =
+                gateway.getTaskStatus(GetTaskStatusRequest.newBuilder().setTaskId("task-1").build());
+
+        server.verify();
+        assertTrue(response.hasErrorDetail());
+        assertEquals(204, response.getErrorDetail().getDownstreamHttpStatus(),
+                "downstream_http_status MUST be actual 204, not hardcoded 200");
+    }
+
+    @Test
+    void computeEffectiveTimeoutMillisReturnsMaxOfLegacyAndCanonical() {
+        // Both set: max wins.
+        ExecuteRequest both = ExecuteRequest.newBuilder()
+                .setTimeoutSeconds(10.0)   // 10000ms
+                .setTimeoutMillis(20000L)  // 20000ms
+                .build();
+        assertEquals(20000L, PythonSandboxGatewayServiceImpl.computeEffectiveTimeoutMillis(both));
+
+        // Only legacy seconds set.
+        ExecuteRequest secondsOnly = ExecuteRequest.newBuilder()
+                .setTimeoutSeconds(15.0)
+                .build();
+        assertEquals(15000L, PythonSandboxGatewayServiceImpl.computeEffectiveTimeoutMillis(secondsOnly));
+
+        // Only canonical millis set.
+        ExecuteRequest millisOnly = ExecuteRequest.newBuilder()
+                .setTimeoutMillis(25000L)
+                .build();
+        assertEquals(25000L, PythonSandboxGatewayServiceImpl.computeEffectiveTimeoutMillis(millisOnly));
+
+        // Neither set → 0 (no local reject; sandbox-side enforcement is ccqwen's slice).
+        ExecuteRequest neither = ExecuteRequest.newBuilder().build();
+        assertEquals(0L, PythonSandboxGatewayServiceImpl.computeEffectiveTimeoutMillis(neither));
+    }
+
+    @Test
+    void computeEffectiveTimeoutMillisGuardsAgainstOverflowFromSeconds() {
+        // Double seconds * 1000 may overflow long; helper MUST clamp to Long.MAX_VALUE so
+        // the request is rejected rather than computing a wrapped negative sum.
+        ExecuteRequest huge = ExecuteRequest.newBuilder()
+                .setTimeoutSeconds(Double.MAX_VALUE)
+                .build();
+        assertEquals(Long.MAX_VALUE, PythonSandboxGatewayServiceImpl.computeEffectiveTimeoutMillis(huge));
+    }
 }

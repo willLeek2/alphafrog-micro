@@ -38,6 +38,19 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
     @Value("${sandbox.service.url}")
     private String sandboxUrl;
 
+    // 260809-26Q3-stage1-w3 D13 MUST-FIX 3 (Cindy 91490076 #3 + 6a6e6158): platform max
+    // task timeout. Gateway rejects createTask requests whose effective timeout exceeds
+    // this value as local INVALID_ARGUMENT. MUST stay lock-step with Python-side
+    // max_task_timeout_seconds (ccqwen 5c543fea).
+    // Initializer mirrors @Value default so unit tests (which bypass Spring's @Value
+    // resolution via ReflectionTestUtils) start from a valid 30min/5min floor; Spring
+    // overwrites this when the context loads the resolved externalized value.
+    @Value("${sandbox.service.max-task-timeout-millis:1800000}")
+    private long maxTaskTimeoutMillis = 1800000L;
+
+    @Value("${sandbox.service.queue-prepare-margin-millis:300000}")
+    private long queuePrepareMarginMillis = 300000L;
+
     public PythonSandboxGatewayServiceImpl(
             @Qualifier("sandboxLongHttpClient") RestTemplate longHttpClient,
             @Qualifier("sandboxShortHttpClient") RestTemplate shortHttpClient,
@@ -51,6 +64,25 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
     @Override
     public ExecuteResponse createTask(ExecuteRequest request) {
         long startMs = System.currentTimeMillis();
+        // 260809-26Q3-stage1-w3 D13 MUST-FIX 3 (Cindy 91490076 #3 + 6a6e6158):
+        // Effective timeout validation BEFORE any downstream call. Effective = max of
+        // legacy `timeoutSeconds * 1000` and canonical `timeoutMillis`. If effective > max,
+        // local INVALID_ARGUMENT reject with downstream_http_status absent (no HTTP call).
+        // Margin is NOT applied here — business task limit is bound by max alone.
+        long effectiveTimeoutMillis = computeEffectiveTimeoutMillis(request);
+        if (effectiveTimeoutMillis > maxTaskTimeoutMillis) {
+            SandboxErrorDetail detail = SandboxErrorDetail.newBuilder()
+                    .setCategory(SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_INVALID_ARGUMENT)
+                    .build();
+            String text = "createTask rejected: effective timeout " + effectiveTimeoutMillis
+                    + "ms exceeds platform max " + maxTaskTimeoutMillis + "ms";
+            log.warn("sandbox.createTask.localRejectTimeoutOverMax: taskId=*, effectiveMs={}, maxMs={}, totalDurationMs={}",
+                    effectiveTimeoutMillis, maxTaskTimeoutMillis, System.currentTimeMillis() - startMs);
+            return ExecuteResponse.newBuilder()
+                    .setError(text)
+                    .setErrorDetail(detail)
+                    .build();
+        }
         // 260605-2 §3: gateway-side observability — log entry + RestTemplate duration.
         // We log code length (not content) and counts to keep INFO lines bounded and avoid PII/code leakage.
         int codeLen = request.getCode() == null ? 0 : request.getCode().length();
@@ -114,10 +146,12 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
             long httpStart = System.currentTimeMillis();
             ResponseEntity<HttpCreateTaskResponse> response = longHttpClient.postForEntity(
                     endpoint, httpRequest, HttpCreateTaskResponse.class);
+            int downstreamStatus = response.getStatusCode().value();
+            long durationMs = System.currentTimeMillis() - httpStart;
             log.info("sandbox.http: endpoint=POST {}, httpStatus={}, durationMs={}",
-                    endpoint, response.getStatusCode().value(), System.currentTimeMillis() - httpStart);
-            emitSandboxHttp("POST", endpoint, response.getStatusCode().value(),
-                    System.currentTimeMillis() - httpStart, "OK", null);
+                    endpoint, downstreamStatus, durationMs);
+            // 260809-26Q3-stage1-w3 D13 MUST-FIX 5 (Cindy 91490076 #5): final telemetry
+            // AFTER body shape classification, not before.
 
             if (response.getBody() != null) {
                 log.info("sandbox.createTask.result: taskId={}, status={}, totalDurationMs={}",
@@ -132,17 +166,21 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
                 if (response.getBody().getRequest_fingerprint() != null) {
                     builder.setRequestFingerprint(response.getBody().getRequest_fingerprint());
                 }
+                emitSandboxHttp("POST", endpoint, downstreamStatus, durationMs, "OK", null);
                 return builder.build();
             } else {
-                log.warn("sandbox.createTask.emptyBody: totalDurationMs={}", System.currentTimeMillis() - startMs);
+                log.warn("sandbox.createTask.emptyBody: totalDurationMs={}, httpStatus={}",
+                        System.currentTimeMillis() - startMs, downstreamStatus);
                 // Empty body received from downstream (HTTP success but no payload).
-                // D13 §4.2: not a categorizable downstream rejection — UNSPECIFIED with
-                // downstream_http_status=200 (proxied response was 2xx). Parent `error`
-                // non-blank per D13 red line 4/5.
+                // D13 §4.2 + Cindy 91490076 #4: not a categorizable downstream rejection —
+                // UNSPECIFIED with the ACTUAL downstream status (could be 200/201/202/204).
+                // Parent `error` non-blank per D13 red line 4/5.
                 SandboxErrorDetail detail = SandboxErrorDetail.newBuilder()
                         .setCategory(SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED)
-                        .setDownstreamHttpStatus(200)
+                        .setDownstreamHttpStatus(downstreamStatus)
                         .build();
+                emitSandboxHttp("POST", endpoint, downstreamStatus, durationMs, "ERROR",
+                        "CREATE_TASK_SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED");
                 return ExecuteResponse.newBuilder()
                         .setError("Empty response from sandbox")
                         .setErrorDetail(detail)
@@ -174,7 +212,7 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
         } catch (ResourceAccessException e) {
             // Transport-layer failure: timeout vs DNS/conn-refused/TLS/IO split per Cindy 313d871e #3.
             SandboxErrorDetail detail = buildTransportErrorDetail(e);
-            String text = e.getMessage() == null ? "createTask transport failure" : e.getMessage();
+            String text = nonBlankOr(e, "createTask transport failure");
             log.warn("sandbox.createTask.transportFailure: totalDurationMs={}, category={}, error={}",
                     System.currentTimeMillis() - startMs,
                     detail.getCategory().getNumber(), text, e);
@@ -194,7 +232,7 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
             SandboxErrorDetail detail = SandboxErrorDetail.newBuilder()
                     .setCategory(SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED)
                     .build();
-            String text = e.getMessage() == null ? "createTask failed" : e.getMessage();
+            String text = nonBlankOr(e, "createTask failed");
             return ExecuteResponse.newBuilder()
                     .setError(text)
                     .setErrorDetail(detail)
@@ -289,14 +327,62 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
         return fallback;
     }
 
+    /**
+     * 260809-26Q3-stage1-w3 D13 MUST-FIX 2c (Cindy 91490076 #2): null-OR-blank fallback
+     * helper. Frozen contract: every failure path MUST keep parent `error` non-blank;
+     * a blank exception message must NOT be propagated as the error text.
+     */
+    static String nonBlankOr(Throwable e, String fallback) {
+        if (e == null) return fallback;
+        return nonBlankOr(e.getMessage(), fallback);
+    }
+
+    static String nonBlankOr(String text, String fallback) {
+        if (text == null || text.isBlank()) return fallback;
+        return text;
+    }
+
+    /**
+     * 260809-26Q3-stage1-w3 D13 MUST-FIX 3 (Cindy 91490076 #3 + 6a6e6158): effective task
+     * timeout归一化 for local-reject validation. Returns max of:
+     *   - legacy `timeoutSeconds * 1000` (only if positive)
+     *   - canonical `timeoutMillis` (only if positive)
+     * Returns 0 if neither is set; callers compare against `maxTaskTimeoutMillis` (positive
+     * required). 0 < max means no local reject (legacy default-unlimited still flows through;
+     * sandbox-side enforcement is ccqwen's slice).
+     *
+     * Overflow-safe: if `timeoutSeconds * 1000` overflows Long, treats as Long.MAX_VALUE so
+     * the request is rejected without computing a wrapped sum.
+     */
+    static long computeEffectiveTimeoutMillis(ExecuteRequest request) {
+        long fromSeconds = 0;
+        if (request.getTimeoutSeconds() > 0) {
+            double secondsToMillis = (double) request.getTimeoutSeconds() * 1000.0;
+            if (secondsToMillis >= Long.MAX_VALUE) {
+                fromSeconds = Long.MAX_VALUE;
+            } else {
+                fromSeconds = (long) secondsToMillis;
+            }
+        }
+        long fromMillis = request.getTimeoutMillis() > 0 ? request.getTimeoutMillis() : 0;
+        return Math.max(fromSeconds, fromMillis);
+    }
+
     @Override
     public GetTaskByOperationIdResponse getTaskByOperationId(GetTaskByOperationIdRequest request) {
         long startMs = System.currentTimeMillis();
         String operationId = request.getOperationId();
         if (operationId == null || operationId.isBlank()) {
+            // 260809-26Q3-stage1-w3 D13 MUST-FIX 2a (Cindy 91490076 #2): Gateway-local
+            // input reject MUST dual-write typed detail. category=INVALID_ARGUMENT,
+            // downstream_http_status absent (no downstream call made).
+            SandboxErrorDetail detail = SandboxErrorDetail.newBuilder()
+                    .setCategory(SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_INVALID_ARGUMENT)
+                    .build();
             return GetTaskByOperationIdResponse.newBuilder()
                     .setFound(false)
                     .setError("operationId is required")
+                    .setErrorDetail(detail)
                     .build();
         }
         try {
@@ -315,17 +401,23 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
             long httpStart = System.currentTimeMillis();
             ResponseEntity<HttpOperationLookupResponse> response = shortHttpClient.getForEntity(
                     endpointUri, HttpOperationLookupResponse.class);
-            emitSandboxHttp("GET", endpoint, response.getStatusCode().value(),
-                    System.currentTimeMillis() - httpStart, "OK", null);
+            // 260809-26Q3-stage1-w3 D13 MUST-FIX 5 (Cindy 91490076 #5): do NOT emit OK
+            // telemetry before body validation; final emit happens after body shape is
+            // classified (success / authoritative absence / typed failure).
+            int downstreamStatus = response.getStatusCode().value();
             HttpOperationLookupResponse body = response.getBody();
             if (body == null) {
                 // HTTP success but empty body. Not authoritative absence (sandbox did not
                 // return a business negative; payload was malformed). D13 fail-closed red
-                // line 6: only `found=false + error blank + error_detail absent` is absence.
+                // line 6 + Cindy 91490076 #4: use ACTUAL downstream status (could be
+                // 200/201/202/204), not hardcoded 200.
+                long durationMs = System.currentTimeMillis() - httpStart;
                 SandboxErrorDetail detail = SandboxErrorDetail.newBuilder()
                         .setCategory(SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED)
-                        .setDownstreamHttpStatus(200)
+                        .setDownstreamHttpStatus(downstreamStatus)
                         .build();
+                emitSandboxHttp("GET", endpoint, downstreamStatus, durationMs, "ERROR",
+                        "OPERATION_LOOKUP_SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED");
                 return GetTaskByOperationIdResponse.newBuilder()
                         .setFound(false)
                         .setError("Empty response from sandbox")
@@ -339,25 +431,30 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
             if (body.getRequest_fingerprint() != null) {
                 builder.setRequestFingerprint(body.getRequest_fingerprint());
             }
-            // D13 fail-closed red line 6: authoritative absence = found=false + error blank
-            // + error_detail absent. New producer MUST NOT write error_detail on this path
-            // (preserve legacy presence=false signal). Any non-blank error from downstream
-            // body is treated as a classifiable failure → add UNSPECIFIED error_detail so
-            // downstream fails closed instead of guessing from text.
-            if (body.getError() != null) builder.setError(body.getError());
-            if (body.isFound() || (body.getError() != null && !body.getError().isBlank())) {
-                // Either found=true (success path) OR sandbox returned a non-blank error
-                // alongside found=false (sandbox-internal lookup failure). The latter MUST
-                // be surfaced as a present error_detail so consumer fail-closed (D13 §4.4
-                // row 4: operation lookup with non-blank error ≠ authoritative absent).
-                if (!body.isFound() && body.getError() != null && !body.getError().isBlank()) {
-                    builder.setErrorDetail(SandboxErrorDetail.newBuilder()
-                            .setCategory(SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED)
-                            .setDownstreamHttpStatus(200)
-                            .build());
-                }
+            // 260809-26Q3-stage1-w3 D13 MUST-FIX 2b + 4 (Cindy 91490076 #2/#4):
+            // - If body has non-blank error (whether found=true OR found=false), that is a
+            //   sandbox-side signal that the lookup encountered an issue. Surface it as
+            //   present error_detail so consumer fail-closed (D13 §4.4 row 4: any non-blank
+            //   body error ≠ authoritative absent, even when found=true).
+            // - downstream_http_status uses ACTUAL response status, not hardcoded 200.
+            // - Authoritative absence = found=false + error blank + error_detail absent
+            //   (the only path that MAY release PREPARING).
+            boolean bodyErrorPresent = body.getError() != null && !body.getError().isBlank();
+            if (bodyErrorPresent) {
+                builder.setError(body.getError());
+                builder.setErrorDetail(SandboxErrorDetail.newBuilder()
+                        .setCategory(SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED)
+                        .setDownstreamHttpStatus(downstreamStatus)
+                        .build());
             }
-            // else: found=false + blank error → authoritative absence; do NOT set error_detail.
+            long durationMs = System.currentTimeMillis() - httpStart;
+            // 260809-26Q3-stage1-w3 D13 MUST-FIX 5 (Cindy 91490076 #5): final telemetry
+            // after body classification. Authoritative absence + found=true both emit OK;
+            // body error emits ERROR + UNSPECIFIED category.
+            String telemetryStatus = bodyErrorPresent ? "ERROR" : "OK";
+            String telemetryCategory = bodyErrorPresent
+                    ? "OPERATION_LOOKUP_SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED" : null;
+            emitSandboxHttp("GET", endpoint, downstreamStatus, durationMs, telemetryStatus, telemetryCategory);
             log.info("sandbox.getTaskByOperationId.result: operationId={}, found={}, taskId={}, "
                             + "totalDurationMs={}",
                     operationId, body.isFound(), body.getTask_id(),
@@ -393,7 +490,7 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
                     "operationLookup.serverError", startMs);
         } catch (ResourceAccessException e) {
             SandboxErrorDetail detail = buildTransportErrorDetail(e);
-            String text = e.getMessage() == null ? "operation lookup transport failure" : e.getMessage();
+            String text = nonBlankOr(e, "operation lookup transport failure");
             log.warn("sandbox.operationLookup.transportFailure: operationId={}, category={}, totalDurationMs={}, error={}",
                     operationId, detail.getCategory().name(),
                     System.currentTimeMillis() - startMs, text, e);
@@ -408,7 +505,7 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
         } catch (Exception e) {
             log.error("sandbox.getTaskByOperationId.failed: operationId={}, totalDurationMs={}, error={}",
                     operationId, System.currentTimeMillis() - startMs, e.getMessage(), e);
-            String text = e.getMessage() == null ? "operation lookup failed" : e.getMessage();
+            String text = nonBlankOr(e, "operation lookup failed");
             SandboxErrorDetail detail = SandboxErrorDetail.newBuilder()
                     .setCategory(SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED)
                     .build();
@@ -457,8 +554,11 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
             ResponseEntity<HttpTask> response = shortHttpClient.getForEntity(endpoint, HttpTask.class);
             log.info("sandbox.http: endpoint=GET {}, httpStatus={}, durationMs={}",
                     endpoint, response.getStatusCode().value(), System.currentTimeMillis() - httpStart);
-            emitSandboxHttp("GET", endpoint, response.getStatusCode().value(),
-                    System.currentTimeMillis() - httpStart, "OK", null);
+            // 260809-26Q3-stage1-w3 D13 MUST-FIX 5 (Cindy 91490076 #5): do NOT emit OK
+            // telemetry before body validation; final emit happens after body shape is
+            // classified (success / typed failure).
+            int downstreamStatus = response.getStatusCode().value();
+            long durationMs = System.currentTimeMillis() - httpStart;
 
             if (response.getBody() != null) {
                 HttpTask task = response.getBody();
@@ -468,18 +568,22 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
                 if (task.getStarted_at() != null) builder.setStartedAt(task.getStarted_at());
                 if (task.getFinished_at() != null) builder.setFinishedAt(task.getFinished_at());
                 if (task.getError() != null) builder.setError(task.getError());
+                emitSandboxHttp("GET", endpoint, downstreamStatus, durationMs, "OK", null);
                 log.info("sandbox.getTaskStatus.result: taskId={}, status={}, totalDurationMs={}",
                         task.getTask_id(), task.getStatus(), System.currentTimeMillis() - startMs);
                 return builder.build();
             } else {
-                log.warn("sandbox.getTaskStatus.emptyBody: taskId={}, totalDurationMs={}",
-                        request.getTaskId(), System.currentTimeMillis() - startMs);
-                // HTTP success but empty body — malformed response. Not a 404; categorize as
-                // UNSPECIFIED with downstream_http_status=200 (proxied response was 2xx).
+                log.warn("sandbox.getTaskStatus.emptyBody: taskId={}, httpStatus={}, totalDurationMs={}",
+                        request.getTaskId(), downstreamStatus, System.currentTimeMillis() - startMs);
+                // 260809-26Q3-stage1-w3 D13 MUST-FIX 4 (Cindy 91490076 #4): HTTP success but
+                // empty body — malformed response. Use ACTUAL downstream status (could be
+                // 200/201/202/204), not hardcoded 200.
                 SandboxErrorDetail detail = SandboxErrorDetail.newBuilder()
                         .setCategory(SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED)
-                        .setDownstreamHttpStatus(200)
+                        .setDownstreamHttpStatus(downstreamStatus)
                         .build();
+                emitSandboxHttp("GET", endpoint, downstreamStatus, durationMs, "ERROR",
+                        "GET_STATUS_SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED");
                 return TaskStatusResponse.newBuilder()
                         .setStatus("UNKNOWN")
                         .setError("Task not available (empty body)")
@@ -495,8 +599,11 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
             // "sandbox was unreachable".
             log.info("sandbox.getTaskStatus.notFound: taskId={}, totalDurationMs={}",
                     request.getTaskId(), System.currentTimeMillis() - startMs);
+            // 260809-26Q3-stage1-w3 D13 MUST-FIX 5 (Cindy 91490076 #5): 404 is a typed
+            // failure (task resource doesn't exist) — emit ERROR + frozen category, not OK.
             emitSandboxHttp("GET", sandboxUrl + "/tasks/" + request.getTaskId(), 404,
-                    System.currentTimeMillis() - startMs, "OK", "NOT_FOUND");
+                    System.currentTimeMillis() - startMs, "ERROR",
+                    "GET_STATUS_SANDBOX_HTTP_ERROR_CATEGORY_NOT_FOUND");
             SandboxErrorDetail detail = SandboxErrorDetail.newBuilder()
                     .setCategory(SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_NOT_FOUND)
                     .setDownstreamHttpStatus(404)
@@ -530,7 +637,7 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
                     "getTaskStatus.serverError", startMs);
         } catch (ResourceAccessException e) {
             SandboxErrorDetail detail = buildTransportErrorDetail(e);
-            String text = e.getMessage() == null ? "getTaskStatus transport failure" : e.getMessage();
+            String text = nonBlankOr(e, "getTaskStatus transport failure");
             log.warn("sandbox.getTaskStatus.transportFailure: taskId={}, category={}, totalDurationMs={}, error={}",
                     request.getTaskId(), detail.getCategory().name(),
                     System.currentTimeMillis() - startMs, text, e);
@@ -547,7 +654,7 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
                     request.getTaskId(), System.currentTimeMillis() - startMs, e.getMessage(), e);
             emitSandboxHttp("GET", sandboxUrl + "/tasks/" + request.getTaskId(), -1,
                     System.currentTimeMillis() - startMs, "ERROR", "GET_STATUS_FAILED");
-            String text = e.getMessage() == null ? "getTaskStatus failed" : e.getMessage();
+            String text = nonBlankOr(e, "getTaskStatus failed");
             SandboxErrorDetail detail = SandboxErrorDetail.newBuilder()
                     .setCategory(SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED)
                     .build();
@@ -595,10 +702,12 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
                 String endpoint = sandboxUrl + "/tasks/" + request.getTaskId() + "/result";
                 long httpStart = System.currentTimeMillis();
                 ResponseEntity<HttpExecuteResult> response = longHttpClient.getForEntity(endpoint, HttpExecuteResult.class);
+                int downstreamStatus = response.getStatusCode().value();
+                long resultDurationMs = System.currentTimeMillis() - httpStart;
                 log.info("sandbox.http: endpoint=GET {}, httpStatus={}, durationMs={}",
-                        endpoint, response.getStatusCode().value(), System.currentTimeMillis() - httpStart);
-                emitSandboxHttp("GET", endpoint, response.getStatusCode().value(),
-                        System.currentTimeMillis() - httpStart, "OK", null);
+                        endpoint, downstreamStatus, resultDurationMs);
+                // 260809-26Q3-stage1-w3 D13 MUST-FIX 5 (Cindy 91490076 #5): final telemetry
+                // AFTER body shape classification, not before.
                 if (response.getBody() != null) {
                     HttpExecuteResult res = response.getBody();
                     int stdoutLen = res.getStdout() == null ? 0 : res.getStdout().length();
@@ -645,8 +754,28 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
                     if (executionEnvironment != null) {
                         builder.setExecutionEnvironment(executionEnvironment);
                     }
+                    emitSandboxHttp("GET", endpoint, downstreamStatus, resultDurationMs, "OK", null);
                     return builder.build();
                 }
+            }
+
+            // 260809-26Q3-stage1-w3 D13 MUST-FIX 1 (Cindy 91490076 #1): preserve typed
+            // failure from status pre-check. If status.hasErrorDetail() is true, the status
+            // lookup itself hit a typed failure (5xx/timeout/transport). Propagate fail-closed
+            // — do NOT access the result endpoint, do NOT rewrite to "Result not available".
+            if (status.hasErrorDetail()) {
+                log.warn("sandbox.getTaskResult.statusPrecheckFailure: taskId={}, category={}, totalDurationMs={}",
+                        request.getTaskId(), status.getErrorDetail().getCategory().name(),
+                        System.currentTimeMillis() - startMs);
+                TaskResultResponse.Builder builder = TaskResultResponse.newBuilder()
+                        .setTaskId(request.getTaskId())
+                        .setStatus(status.getStatus());
+                String statusError = status.getError();
+                builder.setError((statusError == null || statusError.isBlank())
+                        ? "Result not available (status pre-check failed)"
+                        : statusError);
+                builder.setErrorDetail(status.getErrorDetail());
+                return builder.build();
             }
 
             log.info("sandbox.getTaskResult.notReady: taskId={}, status={}, totalDurationMs={}",
@@ -686,7 +815,7 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
                     "getTaskResult.serverError", startMs);
         } catch (ResourceAccessException e) {
             SandboxErrorDetail detail = buildTransportErrorDetail(e);
-            String text = e.getMessage() == null ? "getTaskResult transport failure" : e.getMessage();
+            String text = nonBlankOr(e, "getTaskResult transport failure");
             log.warn("sandbox.getTaskResult.transportFailure: taskId={}, category={}, totalDurationMs={}, error={}",
                     request.getTaskId(), detail.getCategory().name(),
                     System.currentTimeMillis() - startMs, text, e);
@@ -702,7 +831,7 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
                     request.getTaskId(), System.currentTimeMillis() - startMs, e.getMessage(), e);
             emitSandboxHttp("GET", sandboxUrl + "/tasks/" + request.getTaskId() + "/result", -1,
                     System.currentTimeMillis() - startMs, "ERROR", "GET_RESULT_FAILED");
-            String text = e.getMessage() == null ? "getTaskResult failed" : e.getMessage();
+            String text = nonBlankOr(e, "getTaskResult failed");
             SandboxErrorDetail detail = SandboxErrorDetail.newBuilder()
                     .setCategory(SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED)
                     .build();
