@@ -404,7 +404,7 @@ class AgentRunMapperResumeAcceptedPostgresIntegrationTest {
     }
 
     @Test
-    void contradictoryReadyWithConsumedTrueIsRejectedByMappers() {
+    void contradictoryReadyWithConsumedTrueIsRejectedByMappers() throws Exception {
         // 直接插入矛盾的 READY + resultConsumed=true JSON
         String contradictoryJson = "{\"schemaVersion\":1," +
                 "\"operationId\":\"bad-1:tc-1:1\"," +
