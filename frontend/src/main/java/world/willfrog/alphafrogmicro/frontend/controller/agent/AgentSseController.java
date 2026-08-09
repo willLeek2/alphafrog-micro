@@ -10,9 +10,8 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
-import world.willfrog.alphafrogmicro.common.pojo.user.User;
-import world.willfrog.alphafrogmicro.frontend.service.AuthService;
 import world.willfrog.alphafrogmicro.frontend.service.AgentSseService;
+import world.willfrog.alphafrogmicro.frontend.service.agent.AgentAuthSupport;
 
 /**
  * Agent run SSE 实时事件流 endpoint。
@@ -37,15 +36,15 @@ import world.willfrog.alphafrogmicro.frontend.service.AgentSseService;
 public class AgentSseController {
 
     private final AgentSseService sseService;
-    private final AuthService authService;
+    private final AgentAuthSupport authSupport;
 
     @GetMapping(value = "/api/agent/runs/{runId}/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public SseEmitter stream(Authentication authentication,
                              @PathVariable("runId") String runId,
                              @RequestParam(value = "after_seq", required = false) Integer afterSeq,
                              @RequestHeader(value = "Last-Event-ID", required = false) String lastEventId) {
-        String userId = resolveUserId(authentication);
-        if (userId == null) {
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        if (!caller.authenticated()) {
             SseEmitter errorEmitter = new SseEmitter();
             try {
                 errorEmitter.send(SseEmitter.event()
@@ -58,7 +57,7 @@ public class AgentSseController {
         }
 
         SseEmitter emitter = new SseEmitter(-1L);
-        sseService.connect(runId, userId, resolveResumeAfterSeq(afterSeq, lastEventId), emitter);
+        sseService.connect(runId, caller.userId(), resolveResumeAfterSeq(afterSeq, lastEventId), emitter);
         return emitter;
     }
 
@@ -77,19 +76,4 @@ public class AgentSseController {
         }
     }
 
-    /**
-     * 从 Spring Security Authentication 获取 userId，
-     * 与 {@link AgentController#resolveUserId} 逻辑一致。
-     */
-    private String resolveUserId(Authentication authentication) {
-        if (authentication == null || !authentication.isAuthenticated()) {
-            return null;
-        }
-        String username = authentication.getName();
-        User user = authService.getUserByUsername(username);
-        if (user == null || user.getUserId() == null) {
-            return null;
-        }
-        return String.valueOf(user.getUserId());
-    }
 }

@@ -31,7 +31,12 @@ import world.willfrog.alphafrogmicro.frontend.service.AuthService;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentCallDetailBlobReader;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentExternalObservabilityMapper;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentRunResultCacheService;
+import world.willfrog.alphafrogmicro.frontend.service.agent.AgentAuthSupport;
+import world.willfrog.alphafrogmicro.frontend.service.agent.AgentCreditGateway;
+import world.willfrog.alphafrogmicro.frontend.service.agent.AgentTracePartsService;
+import world.willfrog.alphafrogmicro.frontend.service.agent.AgentTimelineMergeService;
 
+import java.math.BigDecimal;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
@@ -56,6 +61,7 @@ class AgentControllerTest {
     private AuthService authService;
     private AgentRunResultCacheService runResultCacheService;
     private AgentCallDetailBlobReader callDetailBlobReader;
+    private AgentCreditGateway creditGateway;
     private AgentController controller;
     private Authentication authentication;
 
@@ -67,11 +73,15 @@ class AgentControllerTest {
         ReflectionTestUtils.setField(runResultCacheService, "agentDubboService", agentDubboService);
         ReflectionTestUtils.setField(runResultCacheService, "cacheTtlSeconds", 30L);
         callDetailBlobReader = mock(AgentCallDetailBlobReader.class);
+        creditGateway = mock(AgentCreditGateway.class);
         when(callDetailBlobReader.loadLlmCallDetail(any(), any())).thenReturn(Optional.empty());
         when(callDetailBlobReader.loadToolCallDetail(any(), any())).thenReturn(Optional.empty());
         when(callDetailBlobReader.loadLlmCallRawContent(any(), any())).thenReturn(Optional.empty());
         when(callDetailBlobReader.loadLlmCallRawMeta(any(), any())).thenReturn(Optional.empty());
-        controller = new AgentController(authService, new ObjectMapper(), runResultCacheService, callDetailBlobReader);
+        ObjectMapper objectMapper = new ObjectMapper();
+        controller = new AgentController(new AgentAuthSupport(authService), creditGateway,
+                objectMapper, runResultCacheService, callDetailBlobReader, new AgentTracePartsService(),
+                new AgentTimelineMergeService(objectMapper));
         ReflectionTestUtils.setField(controller, "agentDubboServiceLangchain", agentDubboService);
 
         authentication = mock(Authentication.class);
@@ -108,6 +118,79 @@ class AgentControllerTest {
 
         assertEquals(ResponseCode.SUCCESS.getCode(), response.getCode());
         assertEquals("/api/agent/runs/run-new/stream", response.getData().streamUrl());
+        verify(creditGateway, never()).hasPositiveRemainingCredit(any());
+    }
+
+    @Test
+    void create_disabledAdminIsRejectedBeforeCreditExemption() {
+        when(authService.isUserActive(any(User.class))).thenReturn(false);
+
+        var response = controller.create(authentication,
+                new AgentRunCreateRequest("hello", null, null, null,
+                        null, null, null, null, null, null, null));
+
+        assertEquals(ResponseCode.FORBIDDEN.getCode(), response.getCode());
+        verify(creditGateway, never()).hasPositiveRemainingCredit(any());
+        verify(agentDubboService, never()).createRun(any());
+    }
+
+    @Test
+    void create_nonAdminAdmissionUsesDubboRemainingCreditsWhenLocalCreditIsZero() {
+        User nonAdmin = new User();
+        nonAdmin.setUserId(99L);
+        nonAdmin.setUserType(1);
+        nonAdmin.setCredit(BigDecimal.ZERO);
+        when(authService.getUserByUsername("admin")).thenReturn(nonAdmin);
+        when(authService.isUserActive(nonAdmin)).thenReturn(true);
+        when(creditGateway.hasPositiveRemainingCredit("99")).thenReturn(true);
+        when(agentDubboService.createRun(any())).thenReturn(
+                AgentRunMessage.newBuilder().setId("run-authoritative-credit").setStatus("RUN_RECEIVED").build());
+
+        var response = controller.create(authentication,
+                new AgentRunCreateRequest("hello", null, null, null,
+                        null, null, null, null, null, null, null));
+
+        assertEquals(ResponseCode.SUCCESS.getCode(), response.getCode());
+        verify(agentDubboService).createRun(any());
+    }
+
+    @Test
+    void create_nonAdminAdmissionRejectsDubboZeroWhenLocalCreditIsPositive() {
+        User nonAdmin = new User();
+        nonAdmin.setUserId(99L);
+        nonAdmin.setUserType(1);
+        nonAdmin.setCredit(BigDecimal.valueOf(100));
+        when(authService.getUserByUsername("admin")).thenReturn(nonAdmin);
+        when(authService.isUserActive(nonAdmin)).thenReturn(true);
+        when(creditGateway.hasPositiveRemainingCredit("99")).thenReturn(false);
+
+        var response = controller.create(authentication,
+                new AgentRunCreateRequest("hello", null, null, null,
+                        null, null, null, null, null, null, null));
+
+        assertEquals(ResponseCode.FORBIDDEN.getCode(), response.getCode());
+        verify(agentDubboService, never()).createRun(any());
+    }
+
+    @Test
+    void result_roleChangeUsesFreshAuthContextAndSeparateResultCacheEntry() {
+        User currentAdmin = new User();
+        currentAdmin.setUserId(99L);
+        currentAdmin.setUserType(1127);
+        User demotedUser = new User();
+        demotedUser.setUserId(99L);
+        demotedUser.setUserType(1);
+        when(authService.getUserByUsername("admin")).thenReturn(currentAdmin, demotedUser);
+        when(agentDubboService.getResult(any(GetAgentRunResultRequest.class))).thenReturn(
+                AgentRunResultMessage.newBuilder().setId("run-1").setStatus("COMPLETED").build());
+
+        controller.result(authentication, "run-1");
+        controller.result(authentication, "run-1");
+
+        ArgumentCaptor<GetAgentRunResultRequest> captor = ArgumentCaptor.forClass(GetAgentRunResultRequest.class);
+        verify(agentDubboService, org.mockito.Mockito.times(2)).getResult(captor.capture());
+        assertTrue(captor.getAllValues().get(0).getIsAdmin());
+        assertFalse(captor.getAllValues().get(1).getIsAdmin());
     }
 
     @Test
@@ -837,16 +920,16 @@ class AgentControllerTest {
 
     @Test
     void securitySensitiveRoutesRemainRegisteredAtCompatiblePaths() {
-        assertGetRoute(AgentController.class, "snapshotParts", "/api/agent/runs/{runId}/snapshot/parts");
-        assertGetRoute(AgentController.class, "snapshotPart", "/api/agent/runs/{runId}/snapshot/parts/{partIndex}");
-        assertGetRoute(AgentController.class, "events", "/api/agent/runs/{runId}/events");
-        assertGetRoute(AgentController.class, "timeline", "/api/agent/runs/{runId}/timeline");
+        assertGetRoute(AgentArtifactController.class, "snapshotParts", "/api/agent/runs/{runId}/snapshot/parts");
+        assertGetRoute(AgentArtifactController.class, "snapshotPart", "/api/agent/runs/{runId}/snapshot/parts/{partIndex}");
+        assertGetRoute(AgentObservabilityController.class, "events", "/api/agent/runs/{runId}/events");
+        assertGetRoute(AgentObservabilityController.class, "timeline", "/api/agent/runs/{runId}/timeline");
         assertGetRoute(AgentController.class, "result", "/api/agent/runs/{runId}/result");
-        assertGetRoute(AgentController.class, "observabilityFull", "/api/agent/runs/{runId}/observability/full");
-        assertGetRoute(AgentController.class, "traces", "/api/agent/runs/{runId}/traces");
-        assertGetRoute(AgentController.class, "traceDetail", "/api/agent/runs/{runId}/traces/{traceId}");
-        assertGetRoute(AgentController.class, "traceFullParts", "/api/agent/runs/{runId}/traces/{traceId}/full/parts");
-        assertGetRoute(AgentController.class, "traceFullPart", "/api/agent/runs/{runId}/traces/{traceId}/full/parts/{partIndex}");
+        assertGetRoute(AgentObservabilityController.class, "observabilityFull", "/api/agent/runs/{runId}/observability/full");
+        assertGetRoute(AgentObservabilityController.class, "traces", "/api/agent/runs/{runId}/traces");
+        assertGetRoute(AgentObservabilityController.class, "traceDetail", "/api/agent/runs/{runId}/traces/{traceId}");
+        assertGetRoute(AgentObservabilityController.class, "traceFullParts", "/api/agent/runs/{runId}/traces/{traceId}/full/parts");
+        assertGetRoute(AgentObservabilityController.class, "traceFullPart", "/api/agent/runs/{runId}/traces/{traceId}/full/parts/{partIndex}");
     }
 
     private void setNonAdmin() {

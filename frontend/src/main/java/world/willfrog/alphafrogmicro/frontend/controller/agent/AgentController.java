@@ -53,7 +53,6 @@ import world.willfrog.alphafrogmicro.agent.idl.ListAgentMessagesRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentMessagesResponse;
 import world.willfrog.alphafrogmicro.common.dto.ResponseCode;
 import world.willfrog.alphafrogmicro.common.dto.ResponseWrapper;
-import world.willfrog.alphafrogmicro.common.pojo.user.User;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentRunCreateRequest;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentArtifactResponse;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentArtifactPartsMetaResponse;
@@ -81,29 +80,26 @@ import world.willfrog.alphafrogmicro.frontend.model.agent.AgentCallDetailRespons
 import world.willfrog.alphafrogmicro.frontend.model.agent.TraceDetailResponse;
 import world.willfrog.alphafrogmicro.frontend.model.agent.TraceSpanItem;
 import world.willfrog.alphafrogmicro.frontend.model.agent.TimelineResponse;
-import world.willfrog.alphafrogmicro.frontend.service.AuthService;
+import world.willfrog.alphafrogmicro.frontend.service.agent.AgentAuthSupport;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentCallDetailBlobReader;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentCallDetailMapper;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentExternalObservabilityMapper;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentRawTraceDetailMapper;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentRunResultCacheService;
+import world.willfrog.alphafrogmicro.frontend.service.agent.AgentCreditGateway;
+import world.willfrog.alphafrogmicro.frontend.service.agent.AgentTracePartsService;
+import world.willfrog.alphafrogmicro.frontend.service.agent.AgentTimelineMergeService;
 
-import java.math.BigDecimal;
 import java.util.Optional;
 
-import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Comparator;
-import java.util.HexFormat;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.zip.GZIPOutputStream;
 
 /**
  * Agent run HTTP API.
@@ -116,20 +112,19 @@ public class AgentController {
 
     private static final String AGENT_RUNS = "/api/agent/runs";
 
-    private static final int ADMIN_USER_TYPE = 1127;
     private static final int OBSERVABILITY_FULL_MAX_BYTES = 5 * 1024 * 1024;
     private static final int INLINE_FULL_MAX_BYTES = 256 * 1024;
-    private static final int TRACE_FULL_DEFAULT_PART_SIZE = 512 * 1024;
-    private static final int TRACE_FULL_MIN_PART_SIZE = 64 * 1024;
-    private static final int TRACE_FULL_MAX_PART_SIZE = 2 * 1024 * 1024;
 
     @DubboReference(group = "langchain", check = false)
     private AgentDubboService agentDubboServiceLangchain;
 
-    private final AuthService authService;
+    private final AgentAuthSupport authSupport;
+    private final AgentCreditGateway creditGateway;
     private final ObjectMapper objectMapper;
     private final AgentRunResultCacheService runResultCacheService;
     private final AgentCallDetailBlobReader callDetailBlobReader;
+    private final AgentTracePartsService tracePartsService;
+    private final AgentTimelineMergeService timelineMergeService;
 
     private AgentDubboService resolveService() {
         return agentDubboServiceLangchain;
@@ -144,17 +139,25 @@ public class AgentController {
     private ResponseWrapper<AgentRunResponse> createRun(Authentication authentication,
                                                         AgentRunCreateRequest request,
                                                         AgentDubboService dubboService) {
-        String userId = resolveUserId(authentication);
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        String userId = caller.userId();
         if (userId == null) {
             return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
         }
-        User user = authService.getUserByUsername(authentication.getName());
-        if (!authService.isUserActive(user)) {
+        if (!caller.active()) {
             return ResponseWrapper.error(ResponseCode.FORBIDDEN, "账号已被禁用，无法创建新任务");
         }
-        boolean admin = isAdmin(authentication);
-        if (!admin && !hasPositiveCredit(user)) {
-            return ResponseWrapper.error(ResponseCode.FORBIDDEN, "credit 余额不足，无法创建新任务");
+        boolean admin = caller.admin();
+        if (!admin) {
+            try {
+                if (!creditGateway.hasPositiveRemainingCredit(userId)) {
+                    return ResponseWrapper.error(ResponseCode.FORBIDDEN, "credit 余额不足，无法创建新任务");
+                }
+            } catch (RpcException e) {
+                return handleRpcError(e, "查询 agent credit");
+            } catch (Exception e) {
+                return handleError(e, "查询 agent credit");
+            }
         }
         if (request == null || request.message() == null || request.message().isBlank()) {
             return ResponseWrapper.paramError("message 不能为空");
@@ -232,7 +235,8 @@ public class AgentController {
                                                       @RequestParam(value = "max", required = false) Integer max,
                                                       @RequestParam(value = "status", required = false, defaultValue = "") String status,
                                                       @RequestParam(value = "days", required = false, defaultValue = "0") int days) {
-        String userId = resolveUserId(authentication);
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        String userId = caller.userId();
         if (userId == null) {
             return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
         }
@@ -273,13 +277,14 @@ public class AgentController {
     @GetMapping(AGENT_RUNS + "/{runId}")
     public ResponseWrapper<AgentRunResponse> get(Authentication authentication,
                                                 @PathVariable("runId") String runId) {
-        String userId = resolveUserId(authentication);
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        String userId = caller.userId();
         if (userId == null) {
             return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
         }
         try {
             AgentRunMessage run = resolveService().getRun(GetAgentRunRequest.newBuilder().setUserId(userId).setId(runId).build());
-            return ResponseWrapper.success(toRunResponse(run, isAdmin(authentication)));
+            return ResponseWrapper.success(toRunResponse(run, caller.admin()));
         } catch (RpcException e) {
             return handleRpcError(e, "查询 agent run");
         } catch (Exception e) {
@@ -287,15 +292,15 @@ public class AgentController {
         }
     }
 
-    @GetMapping(AGENT_RUNS + "/{runId}/snapshot/parts")
     public ResponseWrapper<AgentSnapshotPartsMetaResponse> snapshotParts(Authentication authentication,
                                                                         @PathVariable("runId") String runId,
                                                                         @RequestParam(value = "maxPartSize", required = false, defaultValue = "0") int maxPartSize) {
-        String userId = resolveUserId(authentication);
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        String userId = caller.userId();
         if (userId == null) {
             return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
         }
-        if (!isAdmin(authentication)) {
+        if (!caller.admin()) {
             return ResponseWrapper.error(ResponseCode.FORBIDDEN, "完整 snapshot 仅管理员可访问");
         }
         try {
@@ -314,16 +319,16 @@ public class AgentController {
         }
     }
 
-    @GetMapping(AGENT_RUNS + "/{runId}/snapshot/parts/{partIndex}")
     public ResponseEntity<byte[]> snapshotPart(Authentication authentication,
                                                @PathVariable("runId") String runId,
                                                @PathVariable("partIndex") int partIndex,
                                                @RequestParam(value = "maxPartSize", required = false, defaultValue = "0") int maxPartSize) {
-        String userId = resolveUserId(authentication);
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        String userId = caller.userId();
         if (userId == null) {
             return snapshotPartError(401, "UNAUTHORIZED");
         }
-        if (!isAdmin(authentication)) {
+        if (!caller.admin()) {
             return snapshotPartError(403, "FORBIDDEN");
         }
         try {
@@ -358,7 +363,8 @@ public class AgentController {
     public ResponseWrapper<AgentRunResponse> update(Authentication authentication,
                                                     @PathVariable("runId") String runId,
                                                     @RequestBody(required = false) AgentRunUpdateRequest request) {
-        String userId = resolveUserId(authentication);
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        String userId = caller.userId();
         if (userId == null) {
             return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
         }
@@ -377,7 +383,7 @@ public class AgentController {
                             .setTitle(title)
                             .build()
             );
-            return ResponseWrapper.success(toRunResponse(run, isAdmin(authentication)));
+            return ResponseWrapper.success(toRunResponse(run, caller.admin()));
         } catch (RpcException e) {
             return handleRpcError(e, "更新 agent run");
         } catch (Exception e) {
@@ -409,7 +415,8 @@ public class AgentController {
     @DeleteMapping(AGENT_RUNS + "/{runId}")
     public ResponseWrapper<String> delete(Authentication authentication,
                                           @PathVariable("runId") String runId) {
-        String userId = resolveUserId(authentication);
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        String userId = caller.userId();
         if (userId == null) {
             return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
         }
@@ -423,12 +430,12 @@ public class AgentController {
         }
     }
 
-    @GetMapping(AGENT_RUNS + "/{runId}/events")
     public ResponseWrapper<AgentRunEventsPageResponse> events(Authentication authentication,
                                                              @PathVariable("runId") String runId,
                                                              @RequestParam(value = "after_seq", required = false, defaultValue = "0") int afterSeq,
                                                              @RequestParam(value = "limit", required = false, defaultValue = "200") int limit) {
-        String userId = resolveUserId(authentication);
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        String userId = caller.userId();
         if (userId == null) {
             return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
         }
@@ -460,12 +467,12 @@ public class AgentController {
         }
     }
 
-    @GetMapping(AGENT_RUNS + "/{runId}/timeline")
     public ResponseWrapper<TimelineResponse> timeline(Authentication authentication,
                                                       @PathVariable("runId") String runId,
                                                       @RequestParam(value = "after_seq", required = false, defaultValue = "0") int afterSeq,
                                                       @RequestParam(value = "limit", required = false, defaultValue = "100") int limit) {
-        String userId = resolveUserId(authentication);
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        String userId = caller.userId();
         if (userId == null) {
             return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
         }
@@ -503,7 +510,7 @@ public class AgentController {
                         payload
                 ));
             }
-            appendTraceTimelineItems(userId, runId, isAdmin(authentication), items, minEventTime, maxEventTime,
+            appendTraceTimelineItems(userId, runId, caller.admin(), items, minEventTime, maxEventTime,
                     Math.max(0, safeLimit - items.size()));
             items.sort(Comparator
                     .comparing(TimelineResponse.TimelineItem::time, Comparator.nullsLast(String::compareTo))
@@ -520,13 +527,14 @@ public class AgentController {
     @PostMapping(AGENT_RUNS + "/{runId}:cancel")
     public ResponseWrapper<AgentRunResponse> cancel(Authentication authentication,
                                                    @PathVariable("runId") String runId) {
-        String userId = resolveUserId(authentication);
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        String userId = caller.userId();
         if (userId == null) {
             return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
         }
         try {
             AgentRunMessage run = resolveService().cancelRun(CancelAgentRunRequest.newBuilder().setUserId(userId).setId(runId).build());
-            return ResponseWrapper.success(toRunResponse(run, isAdmin(authentication)));
+            return ResponseWrapper.success(toRunResponse(run, caller.admin()));
         } catch (RpcException e) {
             return handleRpcError(e, "取消 agent run");
         } catch (Exception e) {
@@ -537,13 +545,14 @@ public class AgentController {
     @PostMapping(AGENT_RUNS + "/{runId}:pause")
     public ResponseWrapper<AgentRunResponse> pause(Authentication authentication,
                                                   @PathVariable("runId") String runId) {
-        String userId = resolveUserId(authentication);
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        String userId = caller.userId();
         if (userId == null) {
             return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
         }
         try {
             AgentRunMessage run = resolveService().pauseRun(PauseAgentRunRequest.newBuilder().setUserId(userId).setId(runId).build());
-            return ResponseWrapper.success(toRunResponse(run, isAdmin(authentication)));
+            return ResponseWrapper.success(toRunResponse(run, caller.admin()));
         } catch (RpcException e) {
             return handleRpcError(e, "暂停 agent run");
         } catch (Exception e) {
@@ -555,7 +564,8 @@ public class AgentController {
     public ResponseWrapper<AgentRunResponse> resume(Authentication authentication,
                                                    @PathVariable("runId") String runId,
                                                    @RequestBody(required = false) AgentRunResumeRequest request) {
-        String userId = resolveUserId(authentication);
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        String userId = caller.userId();
         if (userId == null) {
             return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
         }
@@ -566,7 +576,7 @@ public class AgentController {
                     .setId(runId)
                     .setPlanOverrideJson(planOverrideJson)
                     .build());
-            return ResponseWrapper.success(toRunResponse(run, isAdmin(authentication)));
+            return ResponseWrapper.success(toRunResponse(run, caller.admin()));
         } catch (RpcException e) {
             return handleRpcError(e, "续做 agent run");
         } catch (Exception e) {
@@ -577,12 +587,13 @@ public class AgentController {
     @GetMapping(AGENT_RUNS + "/{runId}/result")
     public ResponseEntity<ResponseWrapper<AgentRunResultResponse>> result(Authentication authentication,
                                                                           @PathVariable("runId") String runId) {
-        String userId = resolveUserId(authentication);
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        String userId = caller.userId();
         if (userId == null) {
             return ResponseEntity.status(401).body(ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在"));
         }
         try {
-            boolean admin = isAdmin(authentication);
+            boolean admin = caller.admin();
             AgentRunResultMessage result = loadRunResult(userId, runId, admin);
             AgentRunResultResponse body = new AgentRunResultResponse(
                     result.getId(),
@@ -612,7 +623,8 @@ public class AgentController {
     @GetMapping(AGENT_RUNS + "/{runId}/cost")
     public ResponseWrapper<AgentRunCostResponse> cost(Authentication authentication,
                                                       @PathVariable("runId") String runId) {
-        String userId = resolveUserId(authentication);
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        String userId = caller.userId();
         if (userId == null) {
             return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
         }
@@ -634,7 +646,8 @@ public class AgentController {
     @GetMapping(AGENT_RUNS + "/{runId}/credits")
     public ResponseWrapper<AgentRunCreditsResponse> runCredits(Authentication authentication,
                                                                @PathVariable("runId") String runId) {
-        String userId = resolveUserId(authentication);
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        String userId = caller.userId();
         if (userId == null) {
             return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
         }
@@ -643,7 +656,7 @@ public class AgentController {
                     GetAgentRunCreditsRequest.newBuilder()
                             .setUserId(userId)
                             .setId(runId)
-                            .setIsAdmin(isAdmin(authentication))
+                            .setIsAdmin(caller.admin())
                             .build()
             );
             return ResponseWrapper.success(toRunCreditsResponse(resp));
@@ -657,7 +670,8 @@ public class AgentController {
     @PostMapping(AGENT_RUNS + "/{runId}/credits:refresh")
     public ResponseWrapper<AgentRunCreditsResponse> refreshRunCredits(Authentication authentication,
                                                                        @PathVariable("runId") String runId) {
-        String userId = resolveUserId(authentication);
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        String userId = caller.userId();
         if (userId == null) {
             return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
         }
@@ -666,7 +680,7 @@ public class AgentController {
                     RefreshAgentRunCreditsRequest.newBuilder()
                             .setUserId(userId)
                             .setId(runId)
-                            .setIsAdmin(isAdmin(authentication))
+                            .setIsAdmin(caller.admin())
                             .build()
             );
             return ResponseWrapper.success(toRunCreditsResponse(resp));
@@ -680,7 +694,8 @@ public class AgentController {
     @GetMapping(AGENT_RUNS + "/{runId}/status")
     public ResponseWrapper<AgentRunStatusResponse> status(Authentication authentication,
                                                           @PathVariable("runId") String runId) {
-        String userId = resolveUserId(authentication);
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        String userId = caller.userId();
         if (userId == null) {
             return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
         }
@@ -691,7 +706,7 @@ public class AgentController {
                             .setId(runId)
                             .build()
             );
-            boolean admin = isAdmin(authentication);
+            boolean admin = caller.admin();
             return ResponseWrapper.success(new AgentRunStatusResponse(
                     status.getId(),
                     emptyToNull(status.getStatus()),
@@ -724,14 +739,14 @@ public class AgentController {
         }
     }
 
-    @GetMapping(AGENT_RUNS + "/{runId}/observability/full")
     public ResponseWrapper<Object> observabilityFull(Authentication authentication,
                                                      @PathVariable("runId") String runId) {
-        String userId = resolveUserId(authentication);
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        String userId = caller.userId();
         if (userId == null) {
             return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
         }
-        if (!isAdmin(authentication)) {
+        if (!caller.admin()) {
             return ResponseWrapper.error(ResponseCode.FORBIDDEN,
                     "完整 observability 仅管理员可访问，请使用 traces、timeline 或 call detail");
         }
@@ -749,7 +764,7 @@ public class AgentController {
             if (observability == null) {
                 return ResponseWrapper.error(ResponseCode.DATA_NOT_FOUND, "observability 不存在");
             }
-            List<AgentArtifactResponse> artifacts = loadArtifactResponses(userId, runId, isAdmin(authentication));
+            List<AgentArtifactResponse> artifacts = loadArtifactResponses(userId, runId, caller.admin());
             return ResponseWrapper.success(attachArtifactsToObservability(observability, runId, artifacts));
         } catch (RpcException e) {
             return handleRpcError(e, "查询完整 observability");
@@ -758,19 +773,19 @@ public class AgentController {
         }
     }
 
-    @GetMapping(AGENT_RUNS + "/{runId}/traces")
     public ResponseWrapper<TraceListResponse> traces(Authentication authentication,
                                                      @PathVariable("runId") String runId,
                                                      @RequestParam(value = "type", required = false, defaultValue = "") String type,
                                                      @RequestParam(value = "phase", required = false, defaultValue = "") String phase,
                                                      @RequestParam(value = "after", required = false, defaultValue = "0") int after,
                                                      @RequestParam(value = "limit", required = false, defaultValue = "100") int limit) {
-        String userId = resolveUserId(authentication);
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        String userId = caller.userId();
         if (userId == null) {
             return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
         }
         try {
-            boolean admin = isAdmin(authentication);
+            boolean admin = caller.admin();
             AgentRunResultMessage result = loadRunResult(userId, runId, admin);
             String obsJson = result.getObservabilityJson();
             if (obsJson == null || obsJson.isBlank()) {
@@ -868,17 +883,17 @@ public class AgentController {
         }
     }
 
-    @GetMapping(AGENT_RUNS + "/{runId}/traces/{traceId}")
     public ResponseWrapper<TraceDetailResponse> traceDetail(Authentication authentication,
                                                             @PathVariable("runId") String runId,
                                                             @PathVariable("traceId") String traceId,
                                                             @RequestParam(value = "full", defaultValue = "false") boolean full,
                                                             @RequestParam(value = "maxPartSize", required = false, defaultValue = "0") int maxPartSize) {
-        String userId = resolveUserId(authentication);
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        String userId = caller.userId();
         if (userId == null) {
             return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
         }
-        boolean admin = isAdmin(authentication);
+        boolean admin = caller.admin();
         if (full && !admin) {
             return ResponseWrapper.error(ResponseCode.FORBIDDEN, "完整 trace 仅管理员可访问");
         }
@@ -965,34 +980,33 @@ public class AgentController {
         }
     }
 
-    @GetMapping(AGENT_RUNS + "/{runId}/llm-calls/{llmCallId}/detail")
     public ResponseWrapper<AgentCallDetailResponse> llmCallDetail(Authentication authentication,
                                                                 @PathVariable("runId") String runId,
                                                                 @PathVariable("llmCallId") String llmCallId,
                                                                 @RequestParam(value = "includeThinking", defaultValue = "false") boolean includeThinking) {
         // 强校验：thinking 字段只对 admin 开放；非 admin 即使传 true 也按 false 处理（不抛错，避免破坏普通用户调用）
-        boolean effectiveIncludeThinking = includeThinking && isAdmin(authentication);
-        return safeCallDetail(authentication, runId, "llm", llmCallId, effectiveIncludeThinking);
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        boolean effectiveIncludeThinking = includeThinking && caller.admin();
+        return safeCallDetail(caller, runId, "llm", llmCallId, effectiveIncludeThinking);
     }
 
-    @GetMapping(AGENT_RUNS + "/{runId}/tool-calls/{toolCallId}/detail")
     public ResponseWrapper<AgentCallDetailResponse> toolCallDetail(Authentication authentication,
                                                                    @PathVariable("runId") String runId,
                                                                    @PathVariable("toolCallId") String toolCallId) {
-        return safeCallDetail(authentication, runId, "tool", toolCallId, false);
+        return safeCallDetail(authSupport.resolve(authentication), runId, "tool", toolCallId, false);
     }
 
-    private ResponseWrapper<AgentCallDetailResponse> safeCallDetail(Authentication authentication,
+    private ResponseWrapper<AgentCallDetailResponse> safeCallDetail(AgentAuthSupport.AgentAuthContext caller,
                                                                   String runId,
                                                                   String type,
                                                                   String callId,
                                                                   boolean includeThinking) {
-        String userId = resolveUserId(authentication);
+        String userId = caller.userId();
         if (userId == null) {
             return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
         }
         try {
-            AgentRunResultMessage result = loadRunResult(userId, runId, isAdmin(authentication));
+            AgentRunResultMessage result = loadRunResult(userId, runId, caller.admin());
             String obsJson = result.getObservabilityJson();
             Map<String, Object> diagnostics = AgentCallDetailMapper.parseDiagnostics(obsJson);
             if ("llm".equals(type)) {
@@ -1023,16 +1037,16 @@ public class AgentController {
         }
     }
 
-    @GetMapping(AGENT_RUNS + "/{runId}/traces/{traceId}/full/parts")
     public ResponseWrapper<TraceDetailResponse.FullDetailParts> traceFullParts(Authentication authentication,
                                                                               @PathVariable("runId") String runId,
                                                                               @PathVariable("traceId") String traceId,
                                                                               @RequestParam(value = "maxPartSize", required = false, defaultValue = "0") int maxPartSize) {
-        String userId = resolveUserId(authentication);
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        String userId = caller.userId();
         if (userId == null) {
             return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
         }
-        if (!isAdmin(authentication)) {
+        if (!caller.admin()) {
             return ResponseWrapper.error(ResponseCode.FORBIDDEN, "完整 trace parts 仅管理员可访问");
         }
         try {
@@ -1046,7 +1060,7 @@ public class AgentController {
             if (payload == null) {
                 return rawTraceMissingResponse(runId, traceId, lookup.get());
             }
-            return ResponseWrapper.success(buildFullParts(runId, traceId, payload, maxPartSize));
+            return ResponseWrapper.success(tracePartsService.describe(runId, traceId, payload, maxPartSize));
         } catch (RpcException e) {
             return handleRpcError(e, "查询 trace full parts");
         } catch (Exception e) {
@@ -1054,17 +1068,17 @@ public class AgentController {
         }
     }
 
-    @GetMapping(AGENT_RUNS + "/{runId}/traces/{traceId}/full/parts/{partIndex}")
     public ResponseEntity<byte[]> traceFullPart(Authentication authentication,
                                                 @PathVariable("runId") String runId,
                                                 @PathVariable("traceId") String traceId,
                                                 @PathVariable("partIndex") int partIndex,
                                                 @RequestParam(value = "maxPartSize", required = false, defaultValue = "0") int maxPartSize) {
-        String userId = resolveUserId(authentication);
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        String userId = caller.userId();
         if (userId == null) {
             return traceFullPartError(401, "UNAUTHORIZED");
         }
-        if (!isAdmin(authentication)) {
+        if (!caller.admin()) {
             return traceFullPartError(403, "FORBIDDEN");
         }
         try {
@@ -1080,14 +1094,11 @@ public class AgentController {
                 return traceFullPartError(expired ? 410 : 404,
                         expired ? "RAW_TRACE_EXPIRED" : "RAW_TRACE_NOT_FOUND");
             }
-            PreparedFullParts prepared = prepareFullParts(payload, maxPartSize);
+            AgentTracePartsService.PreparedFullParts prepared = tracePartsService.prepare(payload, maxPartSize);
             if (partIndex < 0 || partIndex >= prepared.totalParts()) {
                 return traceFullPartError(400, "PART_INDEX_OUT_OF_RANGE");
             }
-            byte[] content = Arrays.copyOfRange(
-                    prepared.compressed(),
-                    partIndex * prepared.partSize(),
-                    Math.min(prepared.compressed().length, (partIndex + 1) * prepared.partSize()));
+            byte[] content = tracePartsService.part(prepared, partIndex);
             HttpHeaders headers = new HttpHeaders();
             headers.setContentType(MediaType.APPLICATION_OCTET_STREAM);
             headers.setContentLength(content.length);
@@ -1123,7 +1134,7 @@ public class AgentController {
         if (payload.thresholdBytes().length <= INLINE_FULL_MAX_BYTES) {
             response.setFullDetail(payload.fullDetail());
         } else {
-            response.setFullDetailParts(buildFullParts(runId, traceId, payload, maxPartSize));
+            response.setFullDetailParts(tracePartsService.describe(runId, traceId, payload, maxPartSize));
         }
         return ResponseWrapper.success(response);
     }
@@ -1168,31 +1179,6 @@ public class AgentController {
         return boolVal(lookup.trace().get("detailBlobStored"));
     }
 
-    private TraceDetailResponse.FullDetailParts buildFullParts(String runId,
-                                                               String traceId,
-                                                               AgentRawTraceDetailMapper.FullTracePayload payload,
-                                                               int maxPartSize) {
-        PreparedFullParts prepared = prepareFullParts(payload, maxPartSize);
-        return new TraceDetailResponse.FullDetailParts(
-                AGENT_RUNS + "/" + runId + "/traces/" + traceId + "/full/parts?maxPartSize=" + prepared.partSize(),
-                prepared.partSize(),
-                prepared.totalParts(),
-                (long) payload.fullDetailBytes().length,
-                (long) prepared.compressed().length,
-                "gzip",
-                prepared.checksum(),
-                nullableLong(payload.fullDetail().get("createdAtMillis")),
-                nullableLong(payload.fullDetail().get("expiresAtMillis"))
-        );
-    }
-
-    private PreparedFullParts prepareFullParts(AgentRawTraceDetailMapper.FullTracePayload payload, int maxPartSize) {
-        byte[] compressed = gzip(payload.fullDetailBytes());
-        int partSize = resolveTraceFullPartSize(maxPartSize);
-        int totalParts = compressed.length == 0 ? 0 : (compressed.length + partSize - 1) / partSize;
-        return new PreparedFullParts(compressed, partSize, totalParts, md5Hex(compressed));
-    }
-
     private Optional<TraceLookup> findTrace(String obsJson, String traceId) {
         if (obsJson == null || obsJson.isBlank()) {
             return Optional.empty();
@@ -1223,11 +1209,6 @@ public class AgentController {
         return Optional.empty();
     }
 
-    private int resolveTraceFullPartSize(int requestedPartSize) {
-        int effective = requestedPartSize > 0 ? requestedPartSize : TRACE_FULL_DEFAULT_PART_SIZE;
-        return Math.max(TRACE_FULL_MIN_PART_SIZE, Math.min(TRACE_FULL_MAX_PART_SIZE, effective));
-    }
-
     private ResponseEntity<byte[]> traceFullPartError(int status, String code) {
         HttpHeaders headers = new HttpHeaders();
         headers.setContentLength(0);
@@ -1235,41 +1216,18 @@ public class AgentController {
         return ResponseEntity.status(status).headers(headers).body(new byte[0]);
     }
 
-    private byte[] gzip(byte[] raw) {
-        try (ByteArrayOutputStream bos = new ByteArrayOutputStream(raw.length);
-             GZIPOutputStream gzip = new GZIPOutputStream(bos)) {
-            gzip.write(raw);
-            gzip.finish();
-            return bos.toByteArray();
-        } catch (Exception e) {
-            throw new IllegalStateException("failed to gzip trace full detail", e);
-        }
-    }
-
-    private String md5Hex(byte[] bytes) {
-        try {
-            MessageDigest digest = MessageDigest.getInstance("MD5");
-            return HexFormat.of().formatHex(digest.digest(bytes));
-        } catch (Exception e) {
-            throw new IllegalStateException("failed to compute trace full checksum", e);
-        }
-    }
-
     private record TraceLookup(String type, Map<?, ?> trace) {
     }
 
-    private record PreparedFullParts(byte[] compressed, int partSize, int totalParts, String checksum) {
-    }
-
-    @GetMapping(AGENT_RUNS + "/{runId}/artifacts")
     public ResponseWrapper<List<AgentArtifactResponse>> artifacts(Authentication authentication,
                                                                   @PathVariable("runId") String runId) {
-        String userId = resolveUserId(authentication);
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        String userId = caller.userId();
         if (userId == null) {
             return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
         }
         try {
-            return ResponseWrapper.success(loadArtifactResponses(userId, runId, isAdmin(authentication)));
+            return ResponseWrapper.success(loadArtifactResponses(userId, runId, caller.admin()));
         } catch (RpcException e) {
             return handleRpcError(e, "查询 artifacts");
         } catch (Exception e) {
@@ -1277,12 +1235,12 @@ public class AgentController {
         }
     }
 
-    @GetMapping(AGENT_RUNS + "/{runId}/artifacts/{artifactId}/parts")
     public ResponseWrapper<AgentArtifactPartsMetaResponse> artifactParts(Authentication authentication,
                                                                         @PathVariable("runId") String runId,
                                                                         @PathVariable("artifactId") String artifactId,
                                                                         @RequestParam(value = "maxPartSize", required = false, defaultValue = "0") int maxPartSize) {
-        String userId = resolveUserId(authentication);
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        String userId = caller.userId();
         if (userId == null) {
             return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
         }
@@ -1292,7 +1250,7 @@ public class AgentController {
                             .setUserId(userId)
                             .setArtifactId(artifactId)
                             .setMaxPartSize(maxPartSize)
-                            .setIsAdmin(isAdmin(authentication))
+                            .setIsAdmin(caller.admin())
                             .build()
             );
             return ResponseWrapper.success(toArtifactPartsMetaResponse(meta));
@@ -1303,13 +1261,13 @@ public class AgentController {
         }
     }
 
-    @GetMapping(AGENT_RUNS + "/{runId}/artifacts/{artifactId}/parts/{partIndex}")
     public ResponseEntity<byte[]> artifactPart(Authentication authentication,
                                                @PathVariable("runId") String runId,
                                                @PathVariable("artifactId") String artifactId,
                                                @PathVariable("partIndex") int partIndex,
                                                @RequestParam(value = "maxPartSize", required = false, defaultValue = "0") int maxPartSize) {
-        String userId = resolveUserId(authentication);
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        String userId = caller.userId();
         if (userId == null) {
             return artifactPartError(401, "UNAUTHORIZED");
         }
@@ -1323,7 +1281,7 @@ public class AgentController {
                             .setArtifactId(artifactId)
                             .setPartIndex(partIndex)
                             .setMaxPartSize(maxPartSize)
-                            .setIsAdmin(isAdmin(authentication))
+                            .setIsAdmin(caller.admin())
                             .build()
             );
             byte[] content = part.getContent().toByteArray();
@@ -1348,11 +1306,11 @@ public class AgentController {
         }
     }
 
-    @GetMapping(AGENT_RUNS + "/{runId}/artifacts/{artifactId}/download")
     public ResponseEntity<byte[]> downloadArtifact(Authentication authentication,
                                                    @PathVariable("runId") String runId,
                                                    @PathVariable("artifactId") String artifactId) {
-        String userId = resolveUserId(authentication);
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        String userId = caller.userId();
         if (userId == null) {
             return ResponseEntity.status(401).build();
         }
@@ -1364,7 +1322,7 @@ public class AgentController {
                     DownloadAgentArtifactRequest.newBuilder()
                             .setUserId(userId)
                             .setArtifactId(artifactId)
-                            .setIsAdmin(isAdmin(authentication))
+                            .setIsAdmin(caller.admin())
                             .build()
             );
             HttpHeaders headers = new HttpHeaders();
@@ -1408,7 +1366,8 @@ public class AgentController {
     public ResponseWrapper<String> feedback(Authentication authentication,
                                            @PathVariable("runId") String runId,
                                            @RequestBody(required = false) AgentFeedbackRequest request) {
-        String userId = resolveUserId(authentication);
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        String userId = caller.userId();
         if (userId == null) {
             return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
         }
@@ -1438,7 +1397,8 @@ public class AgentController {
     public ResponseWrapper<AgentExportResponse> export(Authentication authentication,
                                                       @PathVariable("runId") String runId,
                                                       @RequestBody(required = false) AgentExportRequest request) {
-        String userId = resolveUserId(authentication);
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        String userId = caller.userId();
         if (userId == null) {
             return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
         }
@@ -1470,11 +1430,11 @@ public class AgentController {
      * @param request        发送消息请求
      * @return 发送结果
      */
-    @PostMapping(AGENT_RUNS + "/{runId}/messages")
     public ResponseWrapper<AgentMessageSendResponse> sendMessage(Authentication authentication,
                                                                  @PathVariable("runId") String runId,
                                                                  @RequestBody AgentMessageSendRequest request) {
-        String userId = resolveUserId(authentication);
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        String userId = caller.userId();
         if (userId == null) {
             return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
         }
@@ -1485,7 +1445,7 @@ public class AgentController {
         // 处理 contextOverride：仅 admin + debugMode 可用
         String contextOverride = null;
         if (request.contextOverride() != null && !request.contextOverride().isBlank()) {
-            boolean admin = isAdmin(authentication);
+            boolean admin = caller.admin();
             boolean debugMode = Boolean.TRUE.equals(request.debugMode());
             if (admin && debugMode) {
                 contextOverride = request.contextOverride();
@@ -1528,13 +1488,13 @@ public class AgentController {
      * @param includeInitial   是否包含初始问题（默认 true）
      * @return 消息历史列表
      */
-    @GetMapping(AGENT_RUNS + "/{runId}/messages")
     public ResponseWrapper<AgentMessageListResponse> listMessages(Authentication authentication,
                                                                   @PathVariable("runId") String runId,
                                                                   @RequestParam(value = "limit", required = false, defaultValue = "50") int limit,
                                                                   @RequestParam(value = "offset", required = false, defaultValue = "0") int offset,
                                                                   @RequestParam(value = "include_initial", required = false, defaultValue = "true") boolean includeInitial) {
-        String userId = resolveUserId(authentication);
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        String userId = caller.userId();
         if (userId == null) {
             return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
         }
@@ -1570,31 +1530,6 @@ public class AgentController {
         } catch (Exception e) {
             return handleError(e, "查询消息历史");
         }
-    }
-
-    private String resolveUserId(Authentication authentication) {
-        if (authentication == null || !authentication.isAuthenticated()) {
-            return null;
-        }
-        String username = authentication.getName();
-        User user = authService.getUserByUsername(username);
-        if (user == null || user.getUserId() == null) {
-            return null;
-        }
-        return String.valueOf(user.getUserId());
-    }
-
-    private boolean isAdmin(Authentication authentication) {
-        if (authentication == null || !authentication.isAuthenticated()) {
-            return false;
-        }
-        String username = authentication.getName();
-        User user = authService.getUserByUsername(username);
-        if (user == null) {
-            return false;
-        }
-        Integer userType = user.getUserType();
-        return userType != null && userType == ADMIN_USER_TYPE;
     }
 
     private int resolveLimit(Integer limit, Integer size, Integer max) {
@@ -1916,16 +1851,10 @@ public class AgentController {
         return value == null ? "" : value;
     }
 
-    private boolean hasPositiveCredit(User user) {
-        BigDecimal credit = user == null ? null : user.getCredit();
-        return credit != null && credit.signum() > 0;
-    }
-
     private Object parseOutboundJson(String json, AgentExternalObservabilityMapper.View view) {
         return AgentExternalObservabilityMapper.parse(objectMapper, json, view);
     }
 
-    @SuppressWarnings("unchecked")
     private void appendTraceTimelineItems(String userId,
                                           String runId,
                                           boolean isAdmin,
@@ -1933,93 +1862,13 @@ public class AgentController {
                                           String minEventTime,
                                           String maxEventTime,
                                           int maxAdditionalItems) {
-        if (maxAdditionalItems <= 0) {
-            return;
-        }
         try {
             AgentRunResultMessage result = loadRunResult(userId, runId, isAdmin);
-            String observabilityJson = result.getObservabilityJson();
-            if (observabilityJson == null || observabilityJson.isBlank()
-                    || observabilityJson.getBytes(StandardCharsets.UTF_8).length > OBSERVABILITY_FULL_MAX_BYTES) {
-                return;
-            }
-            Map<String, Object> obs = objectMapper.readValue(observabilityJson, Map.class);
-            Map<String, Object> diagnostics = obs.get("diagnostics") instanceof Map
-                    ? (Map<String, Object>) obs.get("diagnostics") : Map.of();
-            AtomicInteger traceSeq = new AtomicInteger(1);
-            appendTraceTimelineItems(items, diagnostics.get("llmTraces"), "llm", minEventTime, maxEventTime,
-                    traceSeq, maxAdditionalItems);
-            appendTraceTimelineItems(items, diagnostics.get("toolTraces"), "tool", minEventTime, maxEventTime,
-                    traceSeq, maxAdditionalItems);
+            timelineMergeService.mergeTraceItems(result.getObservabilityJson(), items,
+                    minEventTime, maxEventTime, maxAdditionalItems);
         } catch (Exception e) {
             log.debug("合并 timeline trace 失败: runId={}, error={}", runId, e.getMessage());
         }
-    }
-
-    private void appendTraceTimelineItems(List<TimelineResponse.TimelineItem> items,
-                                          Object tracesObj,
-                                          String traceType,
-                                          String minEventTime,
-                                          String maxEventTime,
-                                          AtomicInteger traceSeq,
-                                          int maxAdditionalItems) {
-        if (!(tracesObj instanceof List<?> traces)) {
-            return;
-        }
-        for (Object item : traces) {
-            if (traceSeq.get() > maxAdditionalItems) {
-                return;
-            }
-            if (!(item instanceof Map<?, ?> trace)) {
-                continue;
-            }
-            Object mappedTrace = AgentExternalObservabilityMapper.sanitize(
-                    trace, AgentExternalObservabilityMapper.View.EVENT);
-            if (!(mappedTrace instanceof Map<?, ?> safeTrace)) {
-                continue;
-            }
-            String traceTime = safeTimelineString(safeTrace.get("time"), 128);
-            if (!withinTimelineWindow(traceTime, minEventTime, maxEventTime)) {
-                continue;
-            }
-            Map<String, Object> detail = new LinkedHashMap<>();
-            detail.put("trace_id", safeTimelineString(safeTrace.get("traceId"), 512));
-            detail.put("phase", safeTimelineString(safeTrace.get("phase"), 512));
-            detail.put("todo_id", emptyToNull(safeTimelineString(safeTrace.get("todoId"), 512)));
-            detail.put("duration_ms", longVal(safeTrace.get("durationMs")));
-            if ("llm".equals(traceType)) {
-                detail.put("model", safeTimelineString(safeTrace.get("model"), 512));
-                detail.put("endpoint", safeTimelineString(safeTrace.get("endpoint"), 2000));
-                detail.put("has_error", boolVal(safeTrace.get("hasError")));
-                detail.put("input_tokens", nullableLong(safeTrace.get("inputTokens")));
-                detail.put("output_tokens", nullableLong(safeTrace.get("outputTokens")));
-            } else {
-                detail.put("tool_name", safeTimelineString(safeTrace.get("toolName"), 512));
-                detail.put("success", boolVal(safeTrace.get("success")));
-                detail.put("cache_hit", boolVal(safeTrace.get("cacheHit")));
-            }
-            String safeTraceId = safeTimelineString(safeTrace.get("traceId"), 512);
-            items.add(new TimelineResponse.TimelineItem(
-                    -traceSeq.getAndIncrement(),
-                    "trace",
-                    safeTraceId,
-                    traceType,
-                    traceTime,
-                    traceTimelineTitle(traceType, safeTrace),
-                    longVal(safeTrace.get("durationMs")),
-                    detail
-            ));
-        }
-    }
-
-    private boolean withinTimelineWindow(String time, String minEventTime, String maxEventTime) {
-        if (time == null || time.isBlank()) {
-            return false;
-        }
-        if (minEventTime == null || maxEventTime == null) {
-            return true;
-        }
-        return time.compareTo(minEventTime) >= 0 && time.compareTo(maxEventTime) <= 0;
     }
 
     private String strVal(Object value) {
@@ -2029,19 +1878,6 @@ public class AgentController {
     private String safeTimelineString(Object value, int maxChars) {
         String safe = AgentExternalObservabilityMapper.safePreview(value, maxChars);
         return safe == null ? "" : safe;
-    }
-
-    private String traceTimelineTitle(String traceType, Map<?, ?> trace) {
-        String phase = safeTimelineString(trace.get("phase"), 512);
-        long durationMs = longVal(trace.get("durationMs"));
-        if ("llm".equals(traceType)) {
-            return safeTimelineString(
-                    "LLM " + phase + " " + safeTimelineString(trace.get("model"), 512) + " " + durationMs + "ms",
-                    120);
-        }
-        return safeTimelineString(
-                "Tool " + phase + " " + safeTimelineString(trace.get("toolName"), 512) + " " + durationMs + "ms",
-                120);
     }
 
     private String timelineTitle(String eventType, Object payload) {
