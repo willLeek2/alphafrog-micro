@@ -6,10 +6,10 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.mockito.ArgumentMatchers;
 import org.mockito.Mockito;
-import org.springframework.data.redis.core.HashOperations;
-import org.springframework.data.redis.core.SetOperations;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ValueOperations;
+import org.springframework.data.redis.core.ZSetOperations;
+import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.artifact.PersistentArtifactMeta;
 import world.willfrog.agent.platform.artifact.PersistentArtifactRegistration;
@@ -27,14 +27,15 @@ import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Base64;
-import java.util.Collections;
-import java.util.LinkedHashMap;
+import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -59,7 +60,11 @@ import static org.mockito.Mockito.when;
  *   <li>⑦retention 两档 + download max-bytes 保护保持</li>
  * </ul>
  *
- * <p>Redis 用内存 fake（values/hashes/sets 三张表），registry 为真实
+ * <p>Redis 用线程安全内存 fake（values/hashes/zsets 三张表 + 可控时钟与每键 deadline
+ * 惰性过期；run 级索引为 ZSET：成员 = artifactId，score = 每 run 一把单调序号，
+ * 没有任何游标键；五种 Lua 脚本——过期清理判定（1 ARGV）、值条件 HDEL（2 ARGV）、
+ * 读取 touch（4 ARGV）、列表加入（5 ARGV）、幂等认领（6 ARGV）——的 execute() 按
+ * ARGV 个数分发，共用一把锁模拟 Redis 单线程原子执行），registry 为真实
  * {@link PersistentArtifactRegistry} 实例，文件落 @TempDir；不起 Spring 上下文。
  * mock 风格与 {@code PersistentArtifactRegistryTest} / {@code ToolOutputRefServiceImplTest}
  * 一致：不起 MockitoExtension，纯 {@code mock()} 手工装配。</p>
@@ -80,7 +85,27 @@ class AgentArtifactServiceTest {
 
     private Map<String, String> values;
     private Map<String, Map<String, String>> hashes;
-    private Map<String, Set<String>> sets;
+    /**
+     * run 列表 fake（ZSET 语义）：键 → (成员 artifactId → score)。score = 每 run 一把
+     * 单调序号（run-seq 键 INCRBY 发号），不是毫秒时间。窗口轮转把已检查的活成员重新
+     * 打分到所有未检查成员之后——轮转状态编码在 score 排序本身，没有独立游标键。
+     */
+    private Map<String, Map<String, Double>> zsets;
+    /**
+     * fake 时钟 + 每键过期时刻（millis）：带 TTL 的写入按 fakeNow 记录截止时间，
+     * 所有 fake 操作入口先 sweepExpired 惰性清除过期键（与真实 Redis 惰性/定期过期
+     * 删除的可观察语义一致）。直接 values.put 而不记录 deadline 的键视为无 TTL（持久），
+     * 与 Redis PERSIST 等价。本文件不推进时钟（滑动过期归 PersistentArtifactRegistryTest
+     * 钉住），时钟机制在场只为与权威 fake 语义逐条一致。
+     */
+    private long fakeNow;
+    private Map<String, Long> deadlines;
+    /**
+     * 模拟 Redis 单线程执行：所有 Lua 脚本 fake（认领/加入/touch/清理判定/值条件 HDEL）
+     * 共用这一把锁，保证任一脚本执行期间没有其他脚本插入——这是真实 Redis 原子性的
+     * 最小等价模拟。
+     */
+    private final Object redisLock = new Object();
     private Path artifactRoot;
     private Path datasetRoot;
 
@@ -88,9 +113,11 @@ class AgentArtifactServiceTest {
     void setUp() {
         eventService = mock(AgentEventService.class);
         agentRunEventMapper = mock(AgentRunEventMapper.class);
-        values = new LinkedHashMap<>();
-        hashes = new LinkedHashMap<>();
-        sets = new LinkedHashMap<>();
+        values = new ConcurrentHashMap<>();
+        hashes = new ConcurrentHashMap<>();
+        zsets = new ConcurrentHashMap<>();
+        fakeNow = System.currentTimeMillis();
+        deadlines = new ConcurrentHashMap<>();
         artifactRoot = tempDir.resolve("artifacts");
         datasetRoot = tempDir.resolve("datasets");
         AgentStoragePaths storagePaths = new AgentStoragePaths(
@@ -205,12 +232,12 @@ class AgentArtifactServiceTest {
         // 重复 list：同 ID、run 索引项数不变、零新文件
         Set<String> firstIds = first.stream().map(AgentArtifactMessage::getArtifactId)
                 .collect(java.util.stream.Collectors.toSet());
-        int firstIndexSize = sets.get(RUN_LIST_PREFIX + "run-1").size();
+        int firstIndexSize = zsets.get(RUN_LIST_PREFIX + "run-1").size();
         List<AgentArtifactMessage> second = service.listArtifacts(run, false);
         assertEquals(firstIds, second.stream().map(AgentArtifactMessage::getArtifactId)
                         .collect(java.util.stream.Collectors.toSet()),
                 "重复 list 不得产生新 artifactId");
-        assertEquals(firstIndexSize, sets.get(RUN_LIST_PREFIX + "run-1").size(),
+        assertEquals(firstIndexSize, zsets.get(RUN_LIST_PREFIX + "run-1").size(),
                 "run 索引项数不得增长");
         try (Stream<Path> stream = Files.list(artifactRoot.resolve("python_script"))) {
             assertEquals(1, stream.count(), "重复 list 不得重写内容文件");
@@ -277,7 +304,7 @@ class AgentArtifactServiceTest {
         assertEquals(Optional.empty(), registry.find(legacyScriptId));
         assertEquals(Optional.empty(), registry.find(legacyCsvId));
         assertFalse(values.containsKey(META_PREFIX + legacyScriptId));
-        assertTrue(sets.getOrDefault(RUN_LIST_PREFIX + "run-1", Set.of()).isEmpty());
+        assertTrue(zsets.getOrDefault(RUN_LIST_PREFIX + "run-1", Map.of()).isEmpty());
         // 回退路径不写文件：新式内容制品目录不存在，旧快照内容未被改动
         assertFalse(Files.exists(artifactRoot.resolve("python_script")));
         assertEquals("legacy-script-content", Files.readString(legacyScript));
@@ -446,7 +473,8 @@ class AgentArtifactServiceTest {
         return List.of(start1, finish1, start2, finish2);
     }
 
-    // ===== fake redis（values/hashes/sets 三张表；模式同 PersistentArtifactRegistryTest） =====
+    // ===== fake redis（values/hashes/zsets 三张表 + 可控时钟；五种 Lua 脚本按 ARGV 个数分发；
+    //       模式同 PersistentArtifactRegistryTest） =====
 
     @SuppressWarnings("unchecked")
     private StringRedisTemplate mockRedis() {
@@ -454,72 +482,129 @@ class AgentArtifactServiceTest {
 
         ValueOperations<String, String> valueOps = mock(ValueOperations.class);
         when(template.opsForValue()).thenReturn(valueOps);
+        // 带 TTL 写：记录 deadline = fakeNow + ttl（统一滑动过期协议的 meta 侧）
         Mockito.doAnswer(invocation -> {
-            values.put(invocation.getArgument(0), invocation.getArgument(1));
+            String key = invocation.getArgument(0);
+            long ttl = invocation.getArgument(2);
+            TimeUnit unit = invocation.getArgument(3);
+            synchronized (redisLock) {
+                sweepExpired();
+                values.put(key, invocation.getArgument(1));
+                deadlines.put(key, fakeNow + unit.toMillis(ttl));
+            }
             return null;
         }).when(valueOps).set(ArgumentMatchers.anyString(),
                 ArgumentMatchers.anyString(),
                 ArgumentMatchers.anyLong(), ArgumentMatchers.any(TimeUnit.class));
         when(valueOps.get(ArgumentMatchers.anyString()))
-                .thenAnswer(invocation -> values.get(invocation.getArgument(0)));
-        Mockito.doAnswer(invocation -> values.remove(invocation.getArgument(0)) != null)
-                .when(template).delete(ArgumentMatchers.anyString());
-
-        HashOperations<String, Object, Object> hashOps = mock(HashOperations.class);
-        when(template.opsForHash()).thenReturn(hashOps);
-        when(hashOps.putIfAbsent(ArgumentMatchers.anyString(),
-                ArgumentMatchers.any(), ArgumentMatchers.any()))
-                .thenAnswer(invocation -> hashes
-                        .computeIfAbsent(invocation.getArgument(0), k -> new LinkedHashMap<>())
-                        .putIfAbsent(invocation.getArgument(1).toString(),
-                                invocation.getArgument(2).toString()) == null);
+                .thenAnswer(invocation -> {
+                    synchronized (redisLock) {
+                        sweepExpired();
+                        return values.get(invocation.getArgument(0));
+                    }
+                });
         Mockito.doAnswer(invocation -> {
-            hashes.computeIfAbsent(invocation.getArgument(0), k -> new LinkedHashMap<>())
-                    .put(invocation.getArgument(1).toString(), invocation.getArgument(2).toString());
-            return null;
-        }).when(hashOps).put(ArgumentMatchers.anyString(),
-                ArgumentMatchers.any(), ArgumentMatchers.any());
-        when(hashOps.get(ArgumentMatchers.anyString(), ArgumentMatchers.any()))
+            synchronized (redisLock) {
+                deadlines.remove(invocation.getArgument(0));
+                return values.remove(invocation.getArgument(0)) != null;
+            }
+        }).when(template).delete(ArgumentMatchers.anyString());
+
+        ZSetOperations<String, String> zsetOps = mock(ZSetOperations.class);
+        when(template.opsForZSet()).thenReturn(zsetOps);
+        // ZRANGE 语义：按 (score 升序, 成员字典序) 返回 [start, end] 区间（负索引从末尾数）
+        when(zsetOps.range(ArgumentMatchers.anyString(),
+                ArgumentMatchers.anyLong(), ArgumentMatchers.anyLong()))
                 .thenAnswer(invocation -> {
-                    Map<String, String> h = hashes.get(invocation.getArgument(0));
-                    return h == null ? null : h.get(invocation.getArgument(1).toString());
+                    synchronized (redisLock) {
+                        sweepExpired();
+                        return zrange(invocation.getArgument(0),
+                                invocation.getArgument(1), invocation.getArgument(2));
+                    }
                 });
-        when(hashOps.delete(ArgumentMatchers.anyString(), ArgumentMatchers.any()))
+        when(zsetOps.remove(ArgumentMatchers.anyString(), ArgumentMatchers.<Object>any()))
                 .thenAnswer(invocation -> {
-                    Map<String, String> h = hashes.get(invocation.getArgument(0));
-                    return h == null ? 0L : (h.remove(invocation.getArgument(1).toString()) != null ? 1L : 0L);
+                    synchronized (redisLock) {
+                        sweepExpired();
+                        Map<String, Double> zset = zsets.get(invocation.getArgument(0));
+                        return zset != null && zset.remove(invocation.getArgument(1).toString()) != null
+                                ? 1L : 0L;
+                    }
                 });
 
-        // D22 MUST-FIX：registry 值条件 HDEL 走 Lua execute()，fake 以同步块模拟原子 CAS。
+        // ===== Lua execute() fake =====
+        // Mockito 5 对 varargs 按"每个匹配器对一个可变参数"匹配，五种脚本 ARGV 个数不同
+        // （清理判定 1 / 值条件 HDEL 2 / touch 4 / 列表加入 5 / 幂等认领 6），各需独立 stub。
+        // 五个 stub 共用 redisLock，模拟 Redis 单线程：任一脚本执行期间其他脚本不得插入。
+        // stub 按 arity 3、4、6、7、8 的顺序注册（与 PersistentArtifactRegistryTest 一致）。
+
+        // 过期清理判定脚本（1 个 ARGV：now 毫秒）：读回当前 JSON，expiresAtMillis 是数字
+        // 且 <= now 才 DEL 返回 1；键缺失返回 0；JSON 损坏/非对象返回 -1；无日期返回 0
+        Mockito.doAnswer(invocation -> {
+            Object[] args = invocation.getArguments();
+            @SuppressWarnings("unchecked")
+            List<String> keys = (List<String>) args[1];
+            long now = Long.parseLong(String.valueOf(args[2]));
+            synchronized (redisLock) {
+                sweepExpired();
+                return fakeCleanupVerdict(keys.get(0), now);
+            }
+        }).when(template).execute(ArgumentMatchers.<RedisScript<Long>>any(),
+                ArgumentMatchers.<List<String>>any(),
+                ArgumentMatchers.<Object>any());
+
+        // 值条件 HDEL（2 个 ARGV：field、期望值）：仅当 field 值仍等于期望 artifactId 时删除
         Mockito.doAnswer(invocation -> {
             Object[] args = invocation.getArguments();
             @SuppressWarnings("unchecked")
             List<String> keys = (List<String>) args[1];
             String field = String.valueOf(args[2]);
             String expected = String.valueOf(args[3]);
-            Map<String, String> h = hashes.get(keys.get(0));
-            if (h == null) {
-                return 0L;
-            }
-            synchronized (h) {
+            synchronized (redisLock) {
+                sweepExpired();
+                Map<String, String> h = hashes.get(keys.get(0));
+                if (h == null) {
+                    return 0L;
+                }
                 if (expected.equals(h.get(field))) {
                     h.remove(field);
                     return 1L;
                 }
                 return 0L;
             }
-        }).when(template).execute(ArgumentMatchers.<org.springframework.data.redis.core.script.RedisScript<Long>>any(),
-                ArgumentMatchers.<List<String>>any(), ArgumentMatchers.<Object>any(),
+        }).when(template).execute(ArgumentMatchers.<RedisScript<Long>>any(),
+                ArgumentMatchers.<List<String>>any(),
+                ArgumentMatchers.<Object>any(),
                 ArgumentMatchers.<Object>any());
 
-        // D22-5.1.3 第三轮 MUST-FIX ①③：registry 两段 Lua 脚本升级为游标轮转幽灵清理
-        // + 脚本内只延长不缩短的 TTL 刷新——幂等认领（6 ARGV）与 run 列表加入（5 ARGV），
-        // 最后一个 ARGV 为 TTL 秒数，KEYS 各多一个清理游标键。Mockito 5 varargs 按每元素
-        // 匹配：ARGV 个数不同必须独立 stub，语义与生产脚本逐条对齐（见
-        // PersistentArtifactRegistryTest / ToolOutputRefServiceImplTest 同款 fake）。
-        // run 列表加入脚本（KEYS=[列表 SET, 清理游标键]；5 ARGV：cap、幽灵预算、meta 前缀、
-        // artifactId、TTL 秒数）：游标轮转幽灵清理 → SCARD 容量检查 → SADD，原子；
-        // 满则返回 FULL 且不写。
+        // 读取 touch 脚本（KEYS=[meta, 列表 ZSET, 身份 hash, run-seq]；4 个 ARGV：
+        // 新 meta JSON、TTL 秒数、身份 field（非幂等传空串）、artifactId）：
+        // meta 缺失 → 0；SET 新 meta + 满额 EXPIRE；身份步（空槽 HSETNX 补建、他人占用 → 2、
+        // field='' 整步跳过）；成员 score 以新序号同步（缺失 ZADD NX 补回）；三类索引键
+        // 只延长不缩短 EXPIRE；成功 → 1
+        Mockito.doAnswer(invocation -> {
+            Object[] args = invocation.getArguments();
+            @SuppressWarnings("unchecked")
+            List<String> keys = (List<String>) args[1];
+            String metaJson = String.valueOf(args[2]);
+            long ttlSeconds = Long.parseLong(String.valueOf(args[3]));
+            String field = String.valueOf(args[4]);
+            String artifactId = String.valueOf(args[5]);
+            synchronized (redisLock) {
+                sweepExpired();
+                return fakeTouch(keys.get(0), keys.get(1), keys.get(2), keys.get(3),
+                        metaJson, ttlSeconds, field, artifactId);
+            }
+        }).when(template).execute(ArgumentMatchers.<RedisScript<Long>>any(),
+                ArgumentMatchers.<List<String>>any(),
+                ArgumentMatchers.<Object>any(),
+                ArgumentMatchers.<Object>any(),
+                ArgumentMatchers.<Object>any(),
+                ArgumentMatchers.<Object>any());
+
+        // run 列表加入脚本（KEYS=[列表 ZSET, run-seq]；5 个 ARGV：cap、幽灵预算、
+        // meta 前缀、artifactId、TTL 秒数）：窗口轮转幽灵清理 → ZCARD 容量检查 →
+        // INCRBY 发号 + ZADD → 列表键与序号键只延长不缩短 TTL 刷新，原子；满则 FULL 不写
         Mockito.doAnswer(invocation -> {
             Object[] args = invocation.getArguments();
             @SuppressWarnings("unchecked")
@@ -528,25 +613,38 @@ class AgentArtifactServiceTest {
             int budget = Integer.parseInt(String.valueOf(args[3]));
             String metaPrefix = String.valueOf(args[4]);
             String artifactId = String.valueOf(args[5]);
-            // args[6] 为 TTL 秒数：本文件不测滑动过期（归 PersistentArtifactRegistryTest），
-            // fake 解析后忽略，与生产脚本"只延长不缩短"在本场景下等价（无 TTL 跟踪）。
-            purgeWithCursor(keys.get(0), keys.get(1), metaPrefix, budget);
-            Set<String> list = sets.get(keys.get(0));
-            int size = list == null ? 0 : list.size();
-            if (size >= cap) {
-                return "FULL";
+            long ttlSeconds = Long.parseLong(String.valueOf(args[6]));
+            synchronized (redisLock) {
+                sweepExpired();
+                purgeWindow(keys.get(0), keys.get(1), metaPrefix, budget);
+                Map<String, Double> zset = zsets.get(keys.get(0));
+                int size = zset == null ? 0 : zset.size();
+                if (size >= cap) {
+                    return "FULL";
+                }
+                long seq = incrBy(keys.get(1), 1);
+                zsets.computeIfAbsent(keys.get(0), k -> new ConcurrentHashMap<>())
+                        .put(artifactId, (double) seq);
+                if (ttlSeconds > 0) {
+                    extendOnlyTtl(keys.get(0), ttlSeconds);
+                    extendOnlyTtl(keys.get(1), ttlSeconds);
+                }
+                return "ADDED";
             }
-            sets.computeIfAbsent(keys.get(0), k -> new LinkedHashSet<>()).add(artifactId);
-            return "ADDED";
-        }).when(template).execute(ArgumentMatchers.<org.springframework.data.redis.core.script.RedisScript<Object>>any(),
+        }).when(template).execute(ArgumentMatchers.<RedisScript<Object>>any(),
                 ArgumentMatchers.<List<String>>any(),
-                ArgumentMatchers.<Object>any(), ArgumentMatchers.<Object>any(),
-                ArgumentMatchers.<Object>any(), ArgumentMatchers.<Object>any(),
+                ArgumentMatchers.<Object>any(),
+                ArgumentMatchers.<Object>any(),
+                ArgumentMatchers.<Object>any(),
+                ArgumentMatchers.<Object>any(),
                 ArgumentMatchers.<Object>any());
 
-        // 幂等认领脚本（KEYS=[身份 hash, 列表 SET, 清理游标键]；6 ARGV：field、候选 ID、
-        // cap、幽灵预算、meta 前缀、TTL 秒数）：已有赢家→meta 仍在则修复列表成员资格
-        // （SADD 补回）→ EXISTS:赢家ID；幽灵清理→容量检查；未满→HSET 身份+SADD 列表→CLAIMED。
+        // 幂等认领脚本（KEYS=[身份 hash, 列表 ZSET, run-seq]；6 个 ARGV：field、候选 ID、
+        // cap、幽灵预算、meta 前缀、TTL 秒数）：已有赢家 → meta 仍在则修复列表成员资格
+        // （ZSCORE 缺失即以新发序号 ZADD 补回）+ 按赢家 meta 键自身剩余 TTL 做三类索引键
+        // 只延长不缩短刷新（绝不取输家 ARGV）→ EXISTS:赢家ID；否则窗口轮转幽灵清理 →
+        // ZCARD 容量检查 → HSET 身份 + INCRBY 发号 + ZADD + TTL 刷新 → CLAIMED。
+        // EXISTS 与写入互斥且整段原子——输家拿到 EXISTS 时赢家身份+列表必然已落盘且可见
         Mockito.doAnswer(invocation -> {
             Object[] args = invocation.getArguments();
             @SuppressWarnings("unchecked")
@@ -556,91 +654,282 @@ class AgentArtifactServiceTest {
             int cap = Integer.parseInt(String.valueOf(args[4]));
             int budget = Integer.parseInt(String.valueOf(args[5]));
             String metaPrefix = String.valueOf(args[6]);
-            Map<String, String> identity = hashes.get(keys.get(0));
-            String existing = identity == null ? null : identity.get(field);
-            if (existing != null) {
-                if (values.containsKey(metaPrefix + existing)) {
-                    // 赢家 meta 仍活：修复列表成员资格（缺失即补回），杜绝采纳不可见赢家
-                    sets.computeIfAbsent(keys.get(1), k -> new LinkedHashSet<>()).add(existing);
-                }
-                return "EXISTS:" + existing;
+            long ttlSeconds = Long.parseLong(String.valueOf(args[7]));
+            synchronized (redisLock) {
+                sweepExpired();
+                return fakeClaim(keys.get(0), keys.get(1), keys.get(2),
+                        field, artifactId, cap, budget, metaPrefix, ttlSeconds);
             }
-            purgeWithCursor(keys.get(1), keys.get(2), metaPrefix, budget);
-            Set<String> list = sets.get(keys.get(1));
-            int size = list == null ? 0 : list.size();
-            if (size >= cap) {
-                return "FULL";
-            }
-            hashes.computeIfAbsent(keys.get(0), k -> new LinkedHashMap<>()).put(field, artifactId);
-            sets.computeIfAbsent(keys.get(1), k -> new LinkedHashSet<>()).add(artifactId);
-            return "CLAIMED";
-        }).when(template).execute(ArgumentMatchers.<org.springframework.data.redis.core.script.RedisScript<Object>>any(),
+        }).when(template).execute(ArgumentMatchers.<RedisScript<Object>>any(),
                 ArgumentMatchers.<List<String>>any(),
-                ArgumentMatchers.<Object>any(), ArgumentMatchers.<Object>any(),
-                ArgumentMatchers.<Object>any(), ArgumentMatchers.<Object>any(),
-                ArgumentMatchers.<Object>any(), ArgumentMatchers.<Object>any());
+                ArgumentMatchers.<Object>any(),
+                ArgumentMatchers.<Object>any(),
+                ArgumentMatchers.<Object>any(),
+                ArgumentMatchers.<Object>any(),
+                ArgumentMatchers.<Object>any(),
+                ArgumentMatchers.<Object>any());
 
-        SetOperations<String, String> setOps = mock(SetOperations.class);
-        when(template.opsForSet()).thenReturn(setOps);
-        when(setOps.add(ArgumentMatchers.anyString(), ArgumentMatchers.<String>any()))
-                .thenAnswer(invocation -> sets
-                        .computeIfAbsent(invocation.getArgument(0), k -> new LinkedHashSet<>())
-                        .add(invocation.getArgument(1)) ? 1L : 0L);
-        when(setOps.members(ArgumentMatchers.anyString()))
-                .thenAnswer(invocation -> {
-                    Set<String> s = sets.get(invocation.getArgument(0));
-                    return s == null ? new java.util.HashSet<>() : new java.util.HashSet<>(s);
-                });
-        when(setOps.size(ArgumentMatchers.anyString()))
-                .thenAnswer(invocation -> {
-                    Set<String> s = sets.get(invocation.getArgument(0));
-                    return s == null ? 0L : (long) s.size();
-                });
-        when(setOps.remove(ArgumentMatchers.anyString(), ArgumentMatchers.<Object>any()))
-                .thenAnswer(invocation -> {
-                    Set<String> s = sets.get(invocation.getArgument(0));
-                    return s != null && s.remove(invocation.getArgument(1).toString()) ? 1L : 0L;
-                });
         return template;
     }
 
     /**
-     * fake 侧幽灵清理：与生产 Lua 脚本同语义的游标轮转版。游标以"下一次扫描的偏移量"
-     * 存进 values 表（模拟生产里独立的 run-purge-cursor 键）；每次至多检查 budget 个成员
-     * （按排序快照取窗口 [from, to)），meta 键不存在者当场 SREM；扫完一整轮删除游标键。
+     * fake 侧幂等认领脚本（与生产 ATOMIC_CLAIM_SCRIPT 逐步同语义）。
+     * 调用方必须已持有 redisLock。
      */
-    private void purgeWithCursor(String listKey, String cursorKey, String metaPrefix, int budget) {
+    private String fakeClaim(String identityKey, String listKey, String seqKey,
+                             String field, String artifactId, int cap, int budget,
+                             String metaPrefix, long ttlSeconds) {
+        Map<String, String> identity = hashes.get(identityKey);
+        String existing = identity == null ? null : identity.get(field);
+        if (existing != null) {
+            if (values.containsKey(metaPrefix + existing)) {
+                // 赢家 meta 仍活：修复列表成员资格（ZSCORE 缺失即以新发序号 ZADD 补回）
+                Map<String, Double> zset = zsets.get(listKey);
+                Double score = zset == null ? null : zset.get(existing);
+                if (score == null) {
+                    long repairSeq = incrBy(seqKey, 1);
+                    zsets.computeIfAbsent(listKey, k -> new ConcurrentHashMap<>())
+                            .put(existing, (double) repairSeq);
+                }
+                // 索引 TTL 刷新只取赢家 meta 键自身剩余 TTL（绝不取输家传入的 ttlSeconds）
+                long winnerTtl = ttlOfSeconds(metaPrefix + existing);
+                if (winnerTtl > 0) {
+                    extendOnlyTtl(identityKey, winnerTtl);
+                    extendOnlyTtl(listKey, winnerTtl);
+                    extendOnlyTtl(seqKey, winnerTtl);
+                }
+            }
+            return "EXISTS:" + existing;
+        }
+        purgeWindow(listKey, seqKey, metaPrefix, budget);
+        Map<String, Double> zset = zsets.get(listKey);
+        int size = zset == null ? 0 : zset.size();
+        if (size >= cap) {
+            return "FULL";
+        }
+        hashes.computeIfAbsent(identityKey, k -> new ConcurrentHashMap<>()).put(field, artifactId);
+        long claimSeq = incrBy(seqKey, 1);
+        zsets.computeIfAbsent(listKey, k -> new ConcurrentHashMap<>()).put(artifactId, (double) claimSeq);
+        if (ttlSeconds > 0) {
+            extendOnlyTtl(identityKey, ttlSeconds);
+            extendOnlyTtl(listKey, ttlSeconds);
+            extendOnlyTtl(seqKey, ttlSeconds);
+        }
+        return "CLAIMED";
+    }
+
+    /**
+     * fake 侧读取 touch 脚本（与生产 TOUCH_SCRIPT 逐步同语义，状态码合同 0/1/2）。
+     * 调用方必须已持有 redisLock。
+     */
+    private long fakeTouch(String metaKey, String listKey, String identityKey, String seqKey,
+                           String metaJson, long ttlSeconds, String field, String artifactId) {
+        if (!values.containsKey(metaKey)) {
+            return 0L; // meta 已在 find 与 touch 之间消失：读取必须失败，绝不复活
+        }
+        values.put(metaKey, metaJson);
+        if (ttlSeconds > 0) {
+            deadlines.put(metaKey, fakeNow + TimeUnit.SECONDS.toMillis(ttlSeconds)); // 满额滑动
+        }
+        if (!field.isEmpty()) {
+            // 身份步（仅幂等制品）：空槽 HSETNX 补建；他人占用 → 2（绝不覆盖）
+            Map<String, String> identity = hashes.get(identityKey);
+            String holder = identity == null ? null : identity.get(field);
+            if (holder == null) {
+                boolean added = hashes.computeIfAbsent(identityKey, k -> new ConcurrentHashMap<>())
+                        .putIfAbsent(field, artifactId) == null;
+                if (!added) {
+                    return 2L;
+                }
+            } else if (!holder.equals(artifactId)) {
+                return 2L;
+            }
+        }
+        long seq = incrBy(seqKey, 1);
+        Map<String, Double> zset = zsets.get(listKey);
+        Double currentScore = zset == null ? null : zset.get(artifactId);
+        if (currentScore == null) {
+            zsets.computeIfAbsent(listKey, k -> new ConcurrentHashMap<>())
+                    .putIfAbsent(artifactId, (double) seq); // ZADD NX：绝不覆盖并发写入
+        } else {
+            zset.put(artifactId, (double) seq); // 成员 score 同步到新序号（队尾）
+        }
+        if (ttlSeconds > 0) {
+            extendOnlyTtl(listKey, ttlSeconds);
+            extendOnlyTtl(identityKey, ttlSeconds);
+            extendOnlyTtl(seqKey, ttlSeconds);
+        }
+        return 1L;
+    }
+
+    /**
+     * fake 侧过期清理判定（与生产 CLEANUP_META_SCRIPT 同语义：判定与 DEL 原子）。
+     * 返回 1 = 已删，0 = 保留（键缺失/无日期），-1 = 损坏（绝不盲删）。
+     * 调用方必须已持有 redisLock。
+     */
+    private long fakeCleanupVerdict(String metaKey, long now) {
+        String raw = values.get(metaKey);
+        if (raw == null) {
+            return 0L;
+        }
+        Object parsed;
+        try {
+            parsed = new ObjectMapper().readValue(raw, Object.class);
+        } catch (Exception e) {
+            return -1L; // cjson.decode 失败 → 损坏
+        }
+        if (!(parsed instanceof Map)) {
+            return -1L; // 非对象（数字/字符串等）→ 损坏
+        }
+        Object expiresAt = ((Map<?, ?>) parsed).get("expiresAtMillis");
+        if (!(expiresAt instanceof Number)) {
+            return 0L; // 缺失/null/非数字 → 永不过期语义，保守保留
+        }
+        if (((Number) expiresAt).longValue() <= now) {
+            deadlines.remove(metaKey);
+            values.remove(metaKey);
+            return 1L;
+        }
+        return 0L;
+    }
+
+    /**
+     * fake 侧窗口轮转幽灵清理（与生产认领/加入脚本内的清理段同语义）：取当前 score
+     * 最低的至多 budget 个成员（ZRANGE LIMIT 构造性硬上限），meta 键（values 表）不存在
+     * 者当场 ZREM；窗口内活成员用 INCRBY 新发的连续序号重新打分、整体移到所有未检查
+     * 成员之后（严格大于任何未检查成员的得分）。轮转状态编码在 score 排序本身，不存在
+     * 独立游标键。调用方必须已持有 redisLock。
+     */
+    private void purgeWindow(String listKey, String seqKey, String metaPrefix, int budget) {
         if (budget <= 0) {
             return;
         }
-        int offset = 0;
-        String cursorVal = values.get(cursorKey);
-        if (cursorVal != null) {
-            try {
-                offset = Integer.parseInt(cursorVal);
-            } catch (NumberFormatException ignored) {
-                // 游标值损坏视同从头扫
-            }
-        }
-        Set<String> list = sets.get(listKey);
-        if (list == null || list.isEmpty()) {
-            values.remove(cursorKey);
+        Map<String, Double> zset = zsets.get(listKey);
+        if (zset == null || zset.isEmpty()) {
             return;
         }
-        List<String> snapshot = new ArrayList<>(list);
-        Collections.sort(snapshot);
-        int from = Math.min(offset, snapshot.size());
-        int to = Math.min(from + budget, snapshot.size());
-        for (int i = from; i < to; i++) {
-            String member = snapshot.get(i);
-            if (!values.containsKey(metaPrefix + member)) {
-                list.remove(member);
+        List<String> sorted = sortedMembers(zset);
+        List<String> window = sorted.subList(0, Math.min(budget, sorted.size()));
+        List<String> live = new ArrayList<>();
+        for (String member : window) {
+            if (values.containsKey(metaPrefix + member)) {
+                live.add(member);
+            } else {
+                zset.remove(member); // 幽灵当场清除
             }
         }
-        if (to >= snapshot.size()) {
-            values.remove(cursorKey);
-        } else {
-            values.put(cursorKey, String.valueOf(to));
+        if (!live.isEmpty()) {
+            long base = incrBy(seqKey, live.size());
+            for (int i = 0; i < live.size(); i++) {
+                zset.put(live.get(i), (double) (base - live.size() + i + 1));
+            }
         }
+    }
+
+    /**
+     * fake 侧 INCRBY（run-seq 发号）：键缺失从 0 起算。真实 Redis INCRBY 保留键自身
+     * TTL——fake 同样不触碰 deadlines（序号键的过期只由脚本内 extendOnly 管理）。
+     * 调用方必须已持有 redisLock。
+     */
+    private long incrBy(String seqKey, long delta) {
+        long current = 0L;
+        String raw = values.get(seqKey);
+        if (raw != null) {
+            try {
+                current = Long.parseLong(raw.trim());
+            } catch (NumberFormatException ignored) {
+                current = 0L;
+            }
+        }
+        long next = current + delta;
+        values.put(seqKey, String.valueOf(next));
+        return next;
+    }
+
+    /**
+     * fake 侧 ZRANGE：按 (score 升序, 成员字典序) 返回 [start, end] 闭区间，
+     * 负索引从末尾数（与真实 Redis ZRANGE 一致）。调用方必须已持有 redisLock。
+     */
+    private Set<String> zrange(String key, long start, long end) {
+        Map<String, Double> zset = zsets.get(key);
+        if (zset == null || zset.isEmpty()) {
+            return new LinkedHashSet<>();
+        }
+        List<String> sorted = sortedMembers(zset);
+        int size = sorted.size();
+        int from = (int) (start < 0 ? Math.max(0, size + start) : Math.min(start, size));
+        int to = (int) (end < 0 ? Math.max(from, size + end + 1) : Math.min(end + 1, size));
+        return new LinkedHashSet<>(sorted.subList(from, to));
+    }
+
+    /** ZSET 成员按 (score 升序, 成员字典序) 排序——与真实 Redis ZSET 排序一致。 */
+    private static List<String> sortedMembers(Map<String, Double> zset) {
+        return zset.entrySet().stream()
+                .sorted(Map.Entry.<String, Double>comparingByValue()
+                        .thenComparing(Map.Entry.comparingByKey()))
+                .map(Map.Entry::getKey)
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * fake 侧只延长不缩短 TTL 刷新（对应生产脚本内 extendOnly：t == -2 no-op，
+     * t == -1 补设，t < ttl 延长）。键不存在（-2）时 EXPIRE 是 no-op——绝不给已消失
+     * 的键凭空造 deadline。调用方必须已持有 redisLock。
+     */
+    private void extendOnlyTtl(String key, long ttlSeconds) {
+        if (!keyExistsInFake(key)) {
+            return; // ttl == -2
+        }
+        long desired = fakeNow + TimeUnit.SECONDS.toMillis(ttlSeconds);
+        Long current = deadlines.get(key);
+        if (current == null || current < desired) { // ttl == -1（无 TTL）补设；否则只延长
+            deadlines.put(key, desired);
+        }
+    }
+
+    /**
+     * fake 侧 TTL 命令读回（秒）：键不存在/已过期 = -2，无 TTL = -1，否则剩余量。
+     * 与真实 Redis TTL 语义一致（EXISTS 分支按赢家 meta 键自身剩余 TTL 刷新索引用）。
+     * 调用方必须已持有 redisLock。
+     */
+    private long ttlOfSeconds(String key) {
+        if (!keyExistsInFake(key)) {
+            return -2L;
+        }
+        Long deadline = deadlines.get(key);
+        if (deadline == null) {
+            return -1L;
+        }
+        long remaining = deadline - fakeNow;
+        if (remaining <= 0) {
+            return -2L;
+        }
+        return TimeUnit.MILLISECONDS.toSeconds(remaining);
+    }
+
+    /**
+     * fake 侧惰性过期：deadline 已到（相对 fakeNow）的键从三张表与 deadline 表移除。
+     * 与真实 Redis 惰性/定期过期删除的可观察语义一致。调用方必须已持有 redisLock。
+     */
+    private void sweepExpired() {
+        Iterator<Map.Entry<String, Long>> it = deadlines.entrySet().iterator();
+        while (it.hasNext()) {
+            Map.Entry<String, Long> entry = it.next();
+            if (entry.getValue() <= fakeNow) {
+                it.remove();
+                values.remove(entry.getKey());
+                hashes.remove(entry.getKey());
+                zsets.remove(entry.getKey());
+            }
+        }
+    }
+
+    private boolean keyExistsInFake(String key) {
+        return values.containsKey(key) || hashes.containsKey(key) || zsets.containsKey(key);
+    }
+
+    /** 推进 fake 时钟（millis）；随后的读取/脚本执行会按新时刻惰性清除过期键。 */
+    private void advanceClock(long millis) {
+        fakeNow += millis;
     }
 }
