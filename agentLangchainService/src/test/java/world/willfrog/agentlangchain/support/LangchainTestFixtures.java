@@ -30,12 +30,8 @@ public final class LangchainTestFixtures {
         planning.setStructuredOutput(structuredOutput);
         runtime.setPlanning(planning);
         properties.setRuntime(runtime);
-        AgentLlmProperties.Prompts prompts = new AgentLlmProperties.Prompts();
-        prompts.setAgentRunSystemPrompt("你是专业金融分析代理。");
-        prompts.setTodoPlannerSystemPromptTemplate(
-                "你是任务规划器。只输出 JSON。工具: {{toolWhitelist}}，最多 {{maxTodos}} 步。");
-        prompts.setDagReactSystemPrompt("你是金融分析代理，使用工具完成任务。");
-        properties.setPrompts(prompts);
+        // Prompt 正文统一从 agentPlatformShared classpath 权威目录加载；测试夹具不再造第二份正文。
+        properties.setPrompts(new AgentLlmProperties.Prompts());
         return properties;
     }
 

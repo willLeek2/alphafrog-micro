@@ -2001,17 +2001,17 @@ public class AgentLlmProperties {
         private String dagReactSystemPromptFile;
         private String dagModeGuidancePrompt;
         private String dagModeGuidancePromptFile;
-        /** 第一阶段统筹规划 prompt 文件路径（相对于 config 目录） */
-        private String planningStrategyStageFile = "prompts/todo/planning_strategy_stage.txt";
+        /** 第一阶段统筹规划 prompt 投影文件路径（相对于 config 目录）；缺省时由 classpath 权威正文提供。 */
+        private String planningStrategyStageFile;
         /** 第一阶段统筹规划 prompt 内容（由 loader 从文件读取） */
         private String planningStrategyStage;
-        /** 第二阶段任务拆解 prompt 文件路径（相对于 config 目录） */
-        private String planningTodosStageFile = "prompts/todo/planning_todos_stage.txt";
+        /** 第二阶段任务拆解 prompt 投影文件路径（相对于 config 目录）；缺省时由 classpath 权威正文提供。 */
+        private String planningTodosStageFile;
         /** 第二阶段任务拆解 prompt 内容（由 loader 从文件读取） */
         private String planningTodosStage;
-        /** DAG recovery judge prompt 文件路径（Nacos file: 前缀时由 loader 解析为内容）。默认 null，走 classpath 兜底。 */
+        /** DAG recovery judge prompt 投影文件路径；loader 保留路径，并把校验后的正文写入 template 字段。 */
         private String dagRecoveryJudgeSystemPromptFile;
-        /** DAG recovery judge prompt 内容（由 loader 从 file: 解析或 Nacos 直接注入）。 */
+        /** DAG recovery judge prompt 内容（只能是 classpath 权威正文或其逐字一致投影）。 */
         private String dagRecoveryJudgeSystemPromptTemplate;
 
         public String getAgentRunSystemPrompt() {

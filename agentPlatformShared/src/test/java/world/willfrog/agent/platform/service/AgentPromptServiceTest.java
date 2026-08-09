@@ -8,6 +8,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.util.PromptFileLoader;
 
 import java.lang.reflect.Method;
 import java.util.Optional;
@@ -33,7 +34,6 @@ class AgentPromptServiceTest {
     @BeforeEach
     void setUp() throws Exception {
         AgentLlmProperties.Prompts prompts = new AgentLlmProperties.Prompts();
-        prompts.setAgentRunSystemPrompt("你是专业金融分析代理（测试）");
         lenient().when(properties.getPrompts()).thenReturn(prompts);
         AgentLlmProperties.Runtime runtime = new AgentLlmProperties.Runtime();
         lenient().when(properties.getRuntime()).thenReturn(runtime);
@@ -110,33 +110,27 @@ class AgentPromptServiceTest {
     }
 
     @Test
-    void financeMethodResolverTemplate_shouldPreferDirectConfigText() {
+    void financeMethodResolverTemplate_shouldRejectDivergentStaticProjection() {
         AgentLlmProperties.Prompts prompts = properties.getPrompts();
         prompts.setFinanceMethodResolverSystemPrompt("direct resolver template {{RESOLVER_CATALOG}}");
-        prompts.setFinanceMethodResolverSystemPromptFile("local file content that must lose");
 
-        String template = service.financeMethodResolverSystemPromptTemplate();
-
-        assertEquals("direct resolver template {{RESOLVER_CATALOG}}", template);
+        PromptConfigurationException error = assertThrows(
+                PromptConfigurationException.class, service::financeMethodResolverSystemPromptTemplate);
+        assertTrue(error.getMessage().contains("projection_mismatch"));
     }
 
     @Test
-    void financeMethodResolverTemplate_shouldUseResolvedLocalFileContentOverClasspath() {
-        // loader 已把 file: 引用解析成正文（多行，不可能是 classpath 资源名）；必须优先于 classpath 默认文件
+    void financeMethodResolverTemplate_shouldIgnorePathMetadataAndUseAuthority() {
         AgentLlmProperties.Prompts prompts = properties.getPrompts();
-        prompts.setFinanceMethodResolverSystemPromptFile("local resolver template line1\nline2 {{RESOLVER_CATALOG}}");
+        prompts.setFinanceMethodResolverSystemPromptFile("file:prompts/finance/finance_method_resolver_system.txt");
 
         String template = service.financeMethodResolverSystemPromptTemplate();
 
-        assertEquals("local resolver template line1\nline2 {{RESOLVER_CATALOG}}", template);
+        assertEquals(PromptFileLoader.load("prompts/finance/finance_method_resolver_system.txt"), template);
     }
 
     @Test
-    void financeMethodResolverTemplate_shouldLoadClasspathPathValue() {
-        // 历史取值语义：裸 classpath 路径（application-agent-llm-prompts.yml 的默认配置形态）
-        AgentLlmProperties.Prompts prompts = properties.getPrompts();
-        prompts.setFinanceMethodResolverSystemPromptFile("prompts/finance/finance_method_resolver_system.txt");
-
+    void financeMethodResolverTemplate_shouldUseClasspathAuthorityWhenUnset() {
         String template = service.financeMethodResolverSystemPromptTemplate();
 
         assertFalse(template.isBlank());
@@ -144,10 +138,31 @@ class AgentPromptServiceTest {
     }
 
     @Test
-    void financeMethodResolverTemplate_shouldFallBackToClasspathDefaultWhenUnset() {
-        String template = service.financeMethodResolverSystemPromptTemplate();
+    void agentRunSystemPrompt_shouldFailBeforeTimePrefixWhenAuthorityMissing() {
+        PromptAuthority missingGlobal = PromptAuthority.forTesting(path ->
+                "prompts/agent/agent_run_system.txt".equals(path) ? "" : PromptFileLoader.load(path));
+        AgentPromptService isolated = new AgentPromptService(properties, localConfigLoader, missingGlobal);
 
-        assertFalse(template.isBlank());
-        assertTrue(template.contains("{{RESOLVER_CATALOG}}"));
+        PromptConfigurationException error = assertThrows(
+                PromptConfigurationException.class, isolated::agentRunSystemPrompt);
+
+        assertTrue(error.getMessage().startsWith(
+                "PROMPT_CONFIGURATION_INVALID[authority_missing_or_blank]"));
+        assertFalse(error.getMessage().contains("当前时间"), "空正文不能被时间前缀掩盖");
+    }
+
+    @Test
+    void agentRunSystemPrompt_shouldRejectUnresolvedFileReferenceInAuthority() {
+        PromptAuthority unresolvedGlobal = PromptAuthority.forTesting(path ->
+                "prompts/agent/agent_run_system.txt".equals(path)
+                        ? "file:prompts/agent/agent_run_system.txt"
+                        : PromptFileLoader.load(path));
+        AgentPromptService isolated = new AgentPromptService(properties, localConfigLoader, unresolvedGlobal);
+
+        PromptConfigurationException error = assertThrows(
+                PromptConfigurationException.class, isolated::agentRunSystemPrompt);
+
+        assertTrue(error.getMessage().startsWith(
+                "PROMPT_CONFIGURATION_INVALID[authority_unresolved_file_reference]"));
     }
 }

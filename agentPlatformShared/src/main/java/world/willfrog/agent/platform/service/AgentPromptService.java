@@ -1,7 +1,7 @@
 package world.willfrog.agent.platform.service;
 
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
@@ -22,7 +22,7 @@ import java.util.Locale;
  * <h2>这个类解决什么问题</h2>
  * <p>agent 在不同阶段（planning 规划 / execution 执行 / final answer 最终回答 / recovery 恢复 / judge 判定）
  * 需要给 LLM 发送不同的 system prompt 和 user message。
- * 所有 prompt 的加载优先级、时间基准注入、阶段指令拼装、工具能力说明生成都集中在这里，避免散落在各处导致不一致。</p>
+ * 所有 prompt 的权威加载与投影校验、时间基准注入、阶段指令拼装、工具能力说明生成都集中在这里，避免散落在各处导致不一致。</p>
  *
  * <h2>Prompt 的三层结构</h2>
  * <ol>
@@ -39,15 +39,14 @@ import java.util.Locale;
  *       放在 User Message 的设计意图是保持 System Prompt 稳定以提升缓存命中率。</li>
  * </ol>
  *
- * <h2>配置加载的三级优先级</h2>
+ * <h2>Prompt 权威源与投影</h2>
  * <ol>
- *   <li><b>Nacos 热加载</b>：{@code agent-llm.local.json}，通过 {@link AgentLlmLocalConfigLoader} 10s 轮询，
- *       改配置后无需重启服务即可生效。 </li>
- *   <li><b>application.yml 静态配置</b>：Spring Boot 标准配置，作为热加载不可用时的 fallback（回退）。</li>
- *   <li><b>classpath 内置默认文件</b>：如 {@code prompts/todo/dag_react_system_default.txt}，
- *       Jar 包内自带，确保最差情况下仍有可用的 prompt。</li>
+ *   <li><b>唯一权威正文</b>：{@code agentPlatformShared} classpath {@code prompts/}。</li>
+ *   <li><b>Nacos / 外置文件</b>：仍可热加载，但只作为权威正文的部署投影；内容不一致时拒绝刷新。</li>
+ *   <li><b>application-agent-llm-prompts.yml</b>：不再维护第二份内联正文。</li>
  * </ol>
- * 所有 prompt 字段通过 {@link #currentPrompts()} 按以上优先级逐字段合并，本地非空则覆盖静态。
+ * 所有关键正文在追加时间前缀或阶段标记前完成加载和非空校验；缺失时抛出稳定配置异常，
+ * 不会用日期前缀把空 Prompt 伪装成可用消息。
  *
  * <h2>与规划（planning）和执行（execution）的协作关系</h2>
  * <ul>
@@ -72,9 +71,9 @@ import java.util.Locale;
  *   <li>"System Prompt 为什么按天变化？不会破坏 KV 缓存吗？"
  *       → 时间基准确实会让 system prompt 每天不同，降低跨日缓存命中率。但我们优先保证时间推理正确
  *       （否则 LLM 会把"去年"算成 2024 而非 2025），缓存损失可接受。</li>
- *   <li>"prompt 怎么热更新？"
- *       → Nacos 推送 agent-llm.local.json → AgentLlmLocalConfigLoader 10s 轮询 →
- *       currentPrompts() 逐字段合并 → 下次 LLM 调用自动使用新 prompt。全程不重启。</li>
+ *   <li>"prompt 怎么发布更新？"
+ *       → 先修改 shared classpath 权威正文，再生成/同步外置投影并发布新构建；
+ *       Nacos 热加载只接受逐字一致的投影，漂移候选会保留旧快照并产生失败指标。</li>
  *   <li>"checkParallelLimits 为什么放在 prompt 里引导而不是硬编码？"
  *       → 批量上限是运行时配置（可热改），硬编码在 prompt 里会导致配置改了但 LLM 仍按旧数字发请求。
  *       引导 LLM 先调 checkParallelLimits 获取当前上限，配置变更时 prompt 无需改动。</li>
@@ -84,19 +83,32 @@ import java.util.Locale;
  * @see AgentLlmProperties 配置结构定义
  */
 @Component
-@RequiredArgsConstructor
 @Slf4j
 public class AgentPromptService {
 
     /** 中文日期格式化器，"yyyy年MM月dd日"，如 "2026年05月25日"。
      *  用于 {@link #dynamicContextPrefix()} 和 {@link #composeSystemPrompt(String)} 中的日期展示。 */
     private static final DateTimeFormatter CN_DATE_FORMATTER = DateTimeFormatter.ofPattern("yyyy年MM月dd日");
-    /** Spring Boot 静态配置（application.yml / application-agent-llm-prompts.yml），
-     *  作为 Nacos 热加载不可用时的 fallback。 */
+    /** Spring Boot 其他 LLM 配置；其中 prompts 若非空，只能是 classpath 权威正文的投影。 */
     private final AgentLlmProperties properties;
-    /** Nacos 热加载配置（agent-llm.local.json），10s 轮询，支持不重启更新 prompt。
-     *  优先级高于 {@link #properties}。 */
+    /** Nacos 热加载配置（agent-llm.local.json），10s 轮询。
+     *  Prompt 部分只用于校验部署投影；其他运行时配置仍按各自契约热更新。 */
     private final AgentLlmLocalConfigLoader localConfigLoader;
+    private final PromptAuthority promptAuthority;
+
+    @Autowired
+    public AgentPromptService(AgentLlmProperties properties,
+                              AgentLlmLocalConfigLoader localConfigLoader) {
+        this(properties, localConfigLoader, PromptAuthority.shared());
+    }
+
+    AgentPromptService(AgentLlmProperties properties,
+                       AgentLlmLocalConfigLoader localConfigLoader,
+                       PromptAuthority promptAuthority) {
+        this.properties = properties;
+        this.localConfigLoader = localConfigLoader;
+        this.promptAuthority = promptAuthority;
+    }
 
     /**
      * 返回 Agent Run 入口的完整 System Prompt（含时间基准 + 全局指令）。
@@ -113,7 +125,7 @@ public class AgentPromptService {
      * Todo Planner 的 System Prompt（用于让 LLM 把用户目标拆解为 Todo List）。
      *
      * <p>模板中的 {@code {{toolWhitelist}}} 和 {@code {{maxTodos}}} 占位符会被替换为实际值。
-     * 若 Nacos 和 application.yml 都未配置模板，使用内置默认值（包含强约束 JSON 输出格式）。
+     * 模板正文来自 shared classpath 权威文件；Nacos / 外置文件只能提供逐字一致的投影。
      * 最终会经过 {@link #composeSystemPrompt(String)} 注入时间基准。</p>
      *
      * @param toolWhitelist 可用工具名列表，逗号分隔，如 "searchIndex,getIndexDaily,executePython"
@@ -121,19 +133,7 @@ public class AgentPromptService {
      * @return 拼接时间基准 + 全局指令 + 阶段指令后的完整 System Prompt
      */
     public String todoPlannerSystemPrompt(String toolWhitelist, int maxTodos) {
-        String template = firstNonBlank(
-                currentPrompts().getTodoPlannerSystemPromptTemplate(),
-                """
-                你是任务规划专家。请把用户目标拆解为 Todo List，只输出 JSON。
-                输出格式:
-                {"analysis":"...","items":[{"id":"todo_1","sequence":1,"type":"TOOL_CALL","toolName":"searchIndex","params":{"keyword":"沪深300"},"reasoning":"...","executionMode":"AUTO"}]}
-                规则:
-                1) 只能使用工具: {{toolWhitelist}}
-                2) 总步骤数不超过 {{maxTodos}}
-                3) type 仅允许 TOOL_CALL/SUB_AGENT/THOUGHT
-                4) executionMode 仅允许 AUTO/FORCE_SIMPLE/FORCE_SUB_AGENT
-                """
-        );
+        String template = currentPrompts().getTodoPlannerSystemPromptTemplate();
         String specific = render(template, Map.of(
                 "toolWhitelist", safe(toolWhitelist),
                 "maxTodos", String.valueOf(maxTodos)
@@ -349,9 +349,8 @@ public class AgentPromptService {
     /**
      * Finance MethodSpec resolver 的专用 system prompt 组装。
      *
-     * <p>由稳定模板 + 构建期生成的紧凑目录组成。模板中保留 {@code {{RESOLVER_CATALOG}}}
-     * 占位符，由调用方传入当前目录文本后替换。如果热加载或 application.yml 已配置正文，
-     * 优先使用配置内容；否则从 classpath 加载默认文件。</p>
+     * <p>由 shared classpath 权威模板 + 构建期生成的紧凑目录组成。模板中保留
+     * {@code {{RESOLVER_CATALOG}}} 占位符，由调用方传入当前目录文本后替换。</p>
      *
      * @param resolverCatalog 运行时紧凑目录文本（含 methodId/version/specDigest/aliases 等）
      * @return 替换占位符后的完整 system prompt
@@ -361,30 +360,16 @@ public class AgentPromptService {
     }
 
     /**
-     * 返回占位符替换前的 resolver system prompt 原始模板（含 local 配置正文/文件优先链）。
+     * 返回占位符替换前的 resolver system prompt 权威模板。
      *
      * <p>调用方（如 resolver 轻量模型服务）据此计算实际模板的版本摘要，
      * 保证持久化的 promptVersion 是真实使用模板的事实而非 classpath 默认。</p>
      *
-     * <p>优先链：直接配置正文 ＞ local file 引用（loader 已把 {@code file:} 引用解析为正文）
-     * ＞ 配置的 classpath 路径 ＞ 内置 classpath 默认文件。{@code financeMethodResolverSystemPromptFile}
-     * 的历史取值是 classpath 路径（见 application-agent-llm-prompts.yml），因此裸路径值仍按
-     * classpath 资源解析；只有加载不到资源时才把该值当作 literal 正文。</p>
+     * <p>local {@code *File} 字段只保存投影路径；loader 校验成功后把正文写入对应正文属性。
+     * 路径本身不会再被当作模型指令。</p>
      */
     public String financeMethodResolverSystemPromptTemplate() {
-        String direct = currentPrompts().getFinanceMethodResolverSystemPrompt();
-        if (!safe(direct).isBlank()) {
-            return direct;
-        }
-        String fileValue = currentPrompts().getFinanceMethodResolverSystemPromptFile();
-        if (!safe(fileValue).isBlank()) {
-            String loaded = loadPromptFileFromClasspath(fileValue.trim());
-            return !safe(loaded).isBlank() ? loaded : fileValue;
-        }
-        return firstNonBlank(
-                loadPromptFileFromClasspath("prompts/finance/finance_method_resolver_system.txt"),
-                ""
-        );
+        return currentPrompts().getFinanceMethodResolverSystemPrompt();
     }
 
     /**
@@ -439,14 +424,9 @@ public class AgentPromptService {
      * 它回答的是"作为一个被分配了具体任务的节点，你该怎么一步一步完成它"，
      * 与 {@link #reactSystemPrompt()} 回答的"全局角色是什么"是不同的层次。</p>
      *
-     * <p><b>加载优先级</b>（三级 fallback）：</p>
-     * <ol>
-     *   <li>{@code agent.llm.prompts.dagReactSystemPrompt} — Nacos / application.yml 直接配置的文本内容</li>
-     *   <li>{@code agent.llm.prompts.dagReactSystemPromptFile} —
-     *       通过 {@code file:prompts/todo/dag_react_system.txt} 引用外部文件，
-     *       由 {@link AgentLlmLocalConfigLoader} 解析为文本内容</li>
-     *   <li>classpath 内置默认文件 {@code prompts/todo/dag_react_system_default.txt} — Jar 包自带兜底</li>
-     * </ol>
+     * <p><b>加载契约</b>：正文来自 shared classpath 权威文件
+     * {@code prompts/todo/dag_react_system.txt}。Nacos 的直接正文或 {@code *File}
+     * 只作为逐字一致的部署投影；不再构成多级竞争 fallback。</p>
      *
      * <p><b>与 planning 一致</b>：通过 {@link #composeSystemPrompt(String)} 注入时间基准前缀与全局 agent_run 指令，
      * 保证执行阶段也能正确推理"去年是2025年"。这是 2026-05-25 commit 691cd51 修复的 harness bug——
@@ -456,11 +436,7 @@ public class AgentPromptService {
      * @see #reactSystemPrompt() planning 阶段的 System Prompt
      */
     public String dagReactSystemPrompt() {
-        String specific = firstNonBlank(
-                currentPrompts().getDagReactSystemPrompt(),
-                currentPrompts().getDagReactSystemPromptFile(),
-                defaultDagReactSystemPrompt()
-        );
+        String specific = currentPrompts().getDagReactSystemPrompt();
         return composeSystemPrompt(specific);
     }
 
@@ -468,46 +444,23 @@ public class AgentPromptService {
      * DAG 模式引导提示（用于 planning 阶段）。
      * 告诉规划器当前使用 DAG 模式，需要通过 dependsOn（依赖声明）表达任务之间的依赖关系。
      *
-     * <p>加载优先级：Nacos 直接配置内容 ＞ Nacos 文件引用 ＞ 空串（不引导）。</p>
+     * <p>正文来自 shared classpath 权威文件，运行时投影必须逐字一致。</p>
      */
     public String dagModeGuidancePrompt() {
-        return firstNonBlank(
-                currentPrompts().getDagModeGuidancePrompt(),
-                currentPrompts().getDagModeGuidancePromptFile(),
-                ""
-        );
+        return currentPrompts().getDagModeGuidancePrompt();
     }
 
     /**
      * DAG recovery judge System Prompt。
      *
-     * <p>加载优先级：Nacos 直接配置 ＞ Nacos 文件引用 ＞ classpath 内置文件
-     * ({@code prompts/judge/dag_recovery_judge_system.txt})。</p>
+     * <p>正文来自 shared classpath 权威文件
+     * {@code prompts/judge/dag_recovery_judge_system.txt}；运行时投影必须逐字一致。</p>
      *
      * <p>通过 {@link #composeSystemPrompt(String)} 注入时间基准前缀与全局 agent_run 指令。</p>
      */
     public String dagRecoveryJudgeSystemPrompt() {
-        // Template: Nacos 直接注入的 prompt 正文（优先级最高）
-        // File: loader 解析 file: 引用后的内容（Nacos file: 路径输入，默认为 null）
-        String specific = firstNonBlank(
-                currentPrompts().getDagRecoveryJudgeSystemPromptTemplate(),
-                currentPrompts().getDagRecoveryJudgeSystemPromptFile(),
-                defaultDagRecoveryJudgeSystemPrompt()
-        );
+        String specific = currentPrompts().getDagRecoveryJudgeSystemPromptTemplate();
         return composeSystemPrompt(specific);
-    }
-
-    private String defaultDagRecoveryJudgeSystemPrompt() {
-        try (java.io.InputStream is = getClass().getResourceAsStream(
-                "/prompts/judge/dag_recovery_judge_system.txt")) {
-            if (is != null) {
-                return new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
-            }
-        } catch (Exception e) {
-            log.warn("Failed to load default dag recovery judge system prompt from classpath", e);
-        }
-        log.error("dag_recovery_judge_system.txt not found in classpath; returning empty prompt");
-        return "";
     }
 
     /**
@@ -581,27 +534,6 @@ public class AgentPromptService {
         };
     }
 
-    /**
-     * 从 classpath 加载默认的 DAG ReAct System Prompt（Jar 包内置兜底）。
-     * 当 Nacos 和 application.yml 都未配置 dagReactSystemPrompt 时使用。
-     *
-     * <p>注意：返回的原始文本会再经过 {@link #composeSystemPrompt(String)} 注入时间基准，
-     * 最终 LLM 收到的 System Prompt 不止是这个文件的内容。</p>
-     *
-     * @return 默认 DAG ReAct 文本，classpath 文件不存在时返回空串（此时会记 error 日志）
-     */
-    private String defaultDagReactSystemPrompt() {
-        try (java.io.InputStream is = getClass().getResourceAsStream(
-                "/prompts/todo/dag_react_system_default.txt")) {
-            if (is != null) {
-                return new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
-            }
-        } catch (Exception e) {
-            log.warn("Failed to load default dag react system prompt from classpath", e);
-        }
-        log.error("dag_react_system_default.txt not found in classpath; returning empty prompt");
-        return "";
-    }
 
     // ─────────────────────────────────────────────────────────────
     // ReAct 统一 System Prompt + 各阶段 Stage Instruction（#28 重构）
@@ -641,17 +573,7 @@ public class AgentPromptService {
      */
     @Deprecated
     public String planningAnalysisStageInstruction(String toolWhitelist, int maxTodos) {
-        String template = firstNonBlank(
-                currentPrompts().getTodoPlannerSystemPromptTemplate(),
-                """
-                你是任务规划专家。请把用户目标拆解为 Todo List。
-                规则:
-                1) 只能使用工具: {{toolWhitelist}}
-                2) 步骤数必须尽可能少——只拆解真正必要的步骤，能合并则合并，绝不因为"上限允许"就多加步骤；步骤数硬性上限为 {{maxTodos}}，但目标是远少于上限
-                3) type 仅允许 TOOL_CALL/SUB_AGENT/THOUGHT
-                4) executionMode 仅允许 AUTO/FORCE_SIMPLE/FORCE_SUB_AGENT
-                """
-        );
+        String template = currentPrompts().getTodoPlannerSystemPromptTemplate();
         String rendered = render(template, Map.of(
                 "toolWhitelist", safe(toolWhitelist),
                 "maxTodos", String.valueOf(maxTodos)
@@ -669,7 +591,8 @@ public class AgentPromptService {
      * 和 {@code detail}（用自然语言描述的高层执行策略，如"先搜 ETF 代码，再批量拉日线，最后 Python 算收益率"）。
      * 这个 detail 会在第二阶段注入到 todo 拆解的指令中，作为上下文传递给 LLM。</p>
      *
-     * <p>模板来源：Nacos 配置 ＞ classpath 文件 {@code prompts/todo/planning_strategy_stage.txt}。
+     * <p>模板来自 shared classpath 权威文件 {@code prompts/todo/planning_strategy_stage.txt}；
+     * Nacos 只允许提供逐字一致的部署投影。
      * 模板中可引用 {@code {{toolCapabilities}}} 占位符，
      * 实际值由 {@link #buildToolCapabilities(String)} 动态生成（含 checkParallelLimits 引导）。</p>
      *
@@ -679,10 +602,7 @@ public class AgentPromptService {
      * @return 含工具能力清单的 strategy 阶段 User Message 指令
      */
     public String planningStrategyStageInstruction(String toolWhitelist, int maxTodos, int maxDetailLength) {
-        String template = firstNonBlank(
-                currentPrompts().getPlanningStrategyStage(),
-                loadPromptFileFromClasspath("prompts/todo/planning_strategy_stage.txt")
-        );
+        String template = currentPrompts().getPlanningStrategyStage();
         return render(template, Map.of(
                 "toolWhitelist", safe(toolWhitelist),
                 "maxTodos", String.valueOf(maxTodos),
@@ -773,7 +693,8 @@ public class AgentPromptService {
      *   <li>{@code modeGuidance} — 根据 mode 动态生成：DAG 模式提示填写 dependsOn，LINEAR 模式提示按 sequence 顺序</li>
      * </ul>
      *
-     * <p>模板来源：Nacos 配置 ＞ classpath 文件 {@code prompts/todo/planning_todos_stage.txt}。</p>
+     * <p>模板来自 shared classpath 权威文件 {@code prompts/todo/planning_todos_stage.txt}；
+     * Nacos 只允许提供逐字一致的部署投影。</p>
      *
      * @param mode         执行模式 "LINEAR" 或 "DAG"
      * @param detail       strategy 阶段产出的高层策略文本
@@ -783,10 +704,7 @@ public class AgentPromptService {
      */
     public String planningTodosStageInstruction(String mode, String detail,
                                                   String toolWhitelist, int maxTodos) {
-        String template = firstNonBlank(
-                currentPrompts().getPlanningTodosStage(),
-                loadPromptFileFromClasspath("prompts/todo/planning_todos_stage.txt")
-        );
+        String template = currentPrompts().getPlanningTodosStage();
         String modeGuidance = "DAG".equalsIgnoreCase(mode)
                 ? "当前是 DAG 模式，请通过 dependsOn 表达任务依赖关系。"
                 : "当前是 LINEAR 模式，按 sequence 顺序执行即可。";
@@ -798,26 +716,6 @@ public class AgentPromptService {
                 "toolWhitelist", safe(toolWhitelist),
                 "maxTodos", String.valueOf(maxTodos)
         ));
-    }
-
-    /**
-     * 从 classpath 安全加载 prompt 文本文件（如 {@code prompts/todo/planning_strategy_stage.txt}）。
-     *
-     * <p>文件不存在或读取失败时返回空串（warn 级别日志），不会抛异常导致上层调用中断。
-     * 这是刻意设计——prompt 缺失不应让整个 agent run 崩溃。</p>
-     *
-     * @param path classpath 相对路径，如 "prompts/todo/planning_strategy_stage.txt"
-     * @return 文件的 UTF-8 文本内容，文件不存在时返回空串
-     */
-    private String loadPromptFileFromClasspath(String path) {
-        try (java.io.InputStream is = getClass().getClassLoader().getResourceAsStream(path)) {
-            if (is != null) {
-                return new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
-            }
-        } catch (Exception e) {
-            log.warn("Failed to load prompt file from classpath: {}", path, e);
-        }
-        return "";
     }
 
     /**
@@ -1021,61 +919,24 @@ public class AgentPromptService {
     }
 
     /**
-     * 合并 Nacos 热加载配置与 Spring 静态配置，得到当前生效的 Prompts（提示词集合）。
+     * 返回 classpath 权威 Prompt，并验证运行时出现的静态/热加载投影。
      *
-     * <p><b>合并策略</b>：按字段粒度合并——本地热加载（Nacos）每个字段非空则覆盖静态（application.yml）的同名字段。
-     * 不是整体替换，所以可以只热更新部分 prompt 字段（如只改 dagReactSystemPrompt），
-     * 其他字段仍沿用静态配置值。</p>
+     * <p>本地配置仍可只列出部分字段；未列出的字段直接使用权威正文。列出的正文必须与权威源
+     * 逐字一致，否则 loader 拒绝候选快照。这里再做一道消费前校验，防止测试替身或未来调用
+     * 绕过加载器。</p>
      *
-     * <p><b>为什么需要字段级合并</b>：如果整体替换，热加载配置必须包含全部 prompt 字段，
-     * 否则未配置的字段会变成 null。字段级合并允许 Nacos 只下发改动的字段，
-     * 大大降低配置维护成本和出错概率。</p>
-     *
-     * @return 合并后的 Prompts 对象（永不为 null）
+     * @return 权威 Prompt 的防御性副本（永不为 null）
      */
     private AgentLlmProperties.Prompts currentPrompts() {
-        AgentLlmProperties.Prompts base = properties.getPrompts() == null
-                ? new AgentLlmProperties.Prompts()
-                : properties.getPrompts();
-        AgentLlmProperties.Prompts local = localConfigLoader.current()
-                .map(AgentLlmProperties::getPrompts)
-                .orElse(null);
-        if (local == null) {
-            return base;
+        promptAuthority.validateProjection(properties.getPrompts(), "Spring prompt projection");
+        AgentLlmLocalConfigLoader.LocalConfigSnapshot localSnapshot = localConfigLoader.currentSnapshot();
+        if (localSnapshot != null
+                && localSnapshot.config() != null
+                && localSnapshot.topLevelSections().contains("prompts")) {
+            promptAuthority.validateProjection(
+                    localSnapshot.config().getPrompts(), "local prompt projection");
         }
-        // 逐字段合并：Nacos 热加载值优先，为空时 fallback 到 application.yml 静态值
-        AgentLlmProperties.Prompts merged = new AgentLlmProperties.Prompts();
-        merged.setAgentRunSystemPrompt(firstNonBlank(local.getAgentRunSystemPrompt(), base.getAgentRunSystemPrompt()));
-        merged.setTodoPlannerSystemPromptTemplate(firstNonBlank(local.getTodoPlannerSystemPromptTemplate(), base.getTodoPlannerSystemPromptTemplate()));
-        merged.setWorkflowFinalSystemPrompt(firstNonBlank(local.getWorkflowFinalSystemPrompt(), base.getWorkflowFinalSystemPrompt()));
-        merged.setWorkflowTodoRecoverySystemPrompt(firstNonBlank(local.getWorkflowTodoRecoverySystemPrompt(), base.getWorkflowTodoRecoverySystemPrompt()));
-        merged.setParallelPlannerSystemPromptTemplate(firstNonBlank(local.getParallelPlannerSystemPromptTemplate(), base.getParallelPlannerSystemPromptTemplate()));
-        merged.setParallelFinalSystemPrompt(firstNonBlank(local.getParallelFinalSystemPrompt(), base.getParallelFinalSystemPrompt()));
-        merged.setParallelPatchPlannerSystemPromptTemplate(firstNonBlank(local.getParallelPatchPlannerSystemPromptTemplate(), base.getParallelPatchPlannerSystemPromptTemplate()));
-        merged.setPlanJudgeSystemPromptTemplate(firstNonBlank(local.getPlanJudgeSystemPromptTemplate(), base.getPlanJudgeSystemPromptTemplate()));
-        merged.setPlanJudgeRuntimeSystemPromptTemplate(firstNonBlank(local.getPlanJudgeRuntimeSystemPromptTemplate(), base.getPlanJudgeRuntimeSystemPromptTemplate()));
-        merged.setSemanticJudgeSystemPromptTemplate(firstNonBlank(local.getSemanticJudgeSystemPromptTemplate(), base.getSemanticJudgeSystemPromptTemplate()));
-        merged.setSubAgentPlannerSystemPromptTemplate(firstNonBlank(local.getSubAgentPlannerSystemPromptTemplate(), base.getSubAgentPlannerSystemPromptTemplate()));
-        merged.setSubAgentSummarySystemPrompt(firstNonBlank(local.getSubAgentSummarySystemPrompt(), base.getSubAgentSummarySystemPrompt()));
-        merged.setPythonRefineSystemPrompt(firstNonBlank(local.getPythonRefineSystemPrompt(), base.getPythonRefineSystemPrompt()));
-        merged.setPythonRefineOutputInstruction(firstNonBlank(local.getPythonRefineOutputInstruction(), base.getPythonRefineOutputInstruction()));
-        merged.setOrchestratorPlanningSystemPrompt(firstNonBlank(local.getOrchestratorPlanningSystemPrompt(), base.getOrchestratorPlanningSystemPrompt()));
-        merged.setOrchestratorSummarySystemPrompt(firstNonBlank(local.getOrchestratorSummarySystemPrompt(), base.getOrchestratorSummarySystemPrompt()));
-        merged.setPythonRefineRequirements(selectList(local.getPythonRefineRequirements(), base.getPythonRefineRequirements()));
-        merged.setDatasetFieldSpecs(selectList(local.getDatasetFieldSpecs(), base.getDatasetFieldSpecs()));
-        merged.setDagReactSystemPrompt(firstNonBlank(local.getDagReactSystemPrompt(), base.getDagReactSystemPrompt()));
-        merged.setDagReactSystemPromptFile(firstNonBlank(local.getDagReactSystemPromptFile(), base.getDagReactSystemPromptFile()));
-        merged.setDagModeGuidancePrompt(firstNonBlank(local.getDagModeGuidancePrompt(), base.getDagModeGuidancePrompt()));
-        merged.setDagModeGuidancePromptFile(firstNonBlank(local.getDagModeGuidancePromptFile(), base.getDagModeGuidancePromptFile()));
-        merged.setPlanningStrategyStageFile(firstNonBlank(local.getPlanningStrategyStageFile(), base.getPlanningStrategyStageFile()));
-        merged.setPlanningStrategyStage(firstNonBlank(local.getPlanningStrategyStage(), base.getPlanningStrategyStage()));
-        merged.setPlanningTodosStageFile(firstNonBlank(local.getPlanningTodosStageFile(), base.getPlanningTodosStageFile()));
-        merged.setPlanningTodosStage(firstNonBlank(local.getPlanningTodosStage(), base.getPlanningTodosStage()));
-        merged.setDagRecoveryJudgeSystemPromptTemplate(firstNonBlank(local.getDagRecoveryJudgeSystemPromptTemplate(), base.getDagRecoveryJudgeSystemPromptTemplate()));
-        merged.setDagRecoveryJudgeSystemPromptFile(firstNonBlank(local.getDagRecoveryJudgeSystemPromptFile(), base.getDagRecoveryJudgeSystemPromptFile()));
-        merged.setFinanceMethodResolverSystemPrompt(firstNonBlank(local.getFinanceMethodResolverSystemPrompt(), base.getFinanceMethodResolverSystemPrompt()));
-        merged.setFinanceMethodResolverSystemPromptFile(firstNonBlank(local.getFinanceMethodResolverSystemPromptFile(), base.getFinanceMethodResolverSystemPromptFile()));
-        return merged;
+        return promptAuthority.prompts();
     }
 
     private AgentLlmProperties.DataFreshness currentDataFreshness() {
@@ -1108,7 +969,7 @@ public class AgentPromptService {
     /**
      * 合并热加载与静态的 SubAgent（子代理）配置。
      *
-     * <p>合并策略与 {@link #currentPrompts()} 相同：字段级合并，本地非空则覆盖静态。
+     * <p>SubAgent 运行参数仍按字段级合并：本地非空则覆盖静态。
      * 支持的字段包括：enabled（是否启用）、complexityThreshold（复杂度阈值）、
      * maxSteps（最大步骤数）、maxCount（最大并行数）、endpointName（LLM 端点）、
      * modelName 及各复杂度等级的模型名。</p>
@@ -1231,20 +1092,6 @@ public class AgentPromptService {
             out = out.replace("{{" + entry.getKey() + "}}", safe(entry.getValue()));
         }
         return out;
-    }
-
-    /**
-     * 列表选择合并：本地列表非空则用本地，否则用静态配置。
-     *
-     * <p>列表类配置不做字段级合并（因为列表的语义是整体替换而非逐元素覆盖）。
-     * 例如 pythonRefineRequirements 本地配置了 3 条规则，就完整使用这 3 条，
-     * 不会尝试和静态配置的规则逐条对比合并。</p>
-     */
-    private <T> List<T> selectList(List<T> local, List<T> base) {
-        if (local != null && !local.isEmpty()) {
-            return local;
-        }
-        return base == null ? List.of() : base;
     }
 
     /**

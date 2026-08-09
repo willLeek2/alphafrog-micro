@@ -24,7 +24,7 @@ import static org.mockito.Mockito.when;
 @ExtendWith(MockitoExtension.class)
 class AgentPromptServiceCacheTest {
 
-    private static final String GLOBAL_PROMPT = "你是一个专业的金融分析助手。";
+    private static final String GLOBAL_PROMPT = "你是专业金融分析代理。请使用可用工具获取市场数据并准确回答用户问题。";
     private static final DateTimeFormatter CN_DATE_FORMATTER = DateTimeFormatter.ofPattern("yyyy年MM月dd日");
 
     @Mock
@@ -36,7 +36,6 @@ class AgentPromptServiceCacheTest {
     void setUp() {
         AgentLlmProperties properties = new AgentLlmProperties();
         AgentLlmProperties.Prompts prompts = new AgentLlmProperties.Prompts();
-        prompts.setAgentRunSystemPrompt(GLOBAL_PROMPT);
         properties.setPrompts(prompts);
         lenient().when(localConfigLoader.current()).thenReturn(Optional.empty());
         promptService = new AgentPromptService(properties, localConfigLoader);
@@ -154,9 +153,6 @@ class AgentPromptServiceCacheTest {
     @Test
     void planningStrategyStageInstruction_shouldDescribeMarketDataBatchSyntax() {
         AgentLlmProperties properties = new AgentLlmProperties();
-        AgentLlmProperties.Prompts prompts = new AgentLlmProperties.Prompts();
-        prompts.setPlanningStrategyStage("{{toolCapabilities}}");
-        properties.setPrompts(prompts);
         AgentPromptService service = new AgentPromptService(properties, localConfigLoader);
 
         String instruction = service.planningStrategyStageInstruction(

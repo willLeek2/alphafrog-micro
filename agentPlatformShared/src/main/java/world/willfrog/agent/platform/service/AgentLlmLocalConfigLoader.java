@@ -4,6 +4,8 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -27,6 +29,10 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Consumer;
+import java.util.function.Supplier;
 
 /**
  * 本地 LLM 配置热加载器 —— Nacos 推送的 {@code agent-llm.local.json} 通过此组件加载到内存。
@@ -46,7 +52,7 @@ import java.util.Optional;
  *
  * <h2>面试常考点</h2>
  * <ul>
- *   <li>"配置怎么热更新？"→ Nacos 写文件 → 10s 轮询 → 检测 MD5 变化 → 原子替换</li>
+ *   <li>"配置怎么热更新？"→ Nacos 写文件 → 10s 轮询 → 检测配置/Prompt 文件修改时间 → 原子替换</li>
  *   <li>"为什么不用 Redis pub/sub？"→ 文件轮询更简单，Nacos 本身负责把配置分发到文件，
  *       不需要额外引入消息通道</li>
  *   <li>"热加载失败怎么办？"→ 沿用上一次成功加载的配置，不影响正在运行的 agent</li>
@@ -77,6 +83,9 @@ public class AgentLlmLocalConfigLoader {
     @Autowired(required = false)
     private StringRedisTemplate redisTemplate;
 
+    @Autowired(required = false)
+    private MeterRegistry meterRegistry;
+
     private volatile String loadedConfigPath = "";
     private volatile long loadedConfigLastModified = Long.MIN_VALUE;
     private volatile byte[] loadedConfigBytes = new byte[0];
@@ -87,6 +96,7 @@ public class AgentLlmLocalConfigLoader {
      */
     private volatile LocalConfigSnapshot localSnapshot = LocalConfigSnapshot.empty();
     private final Object reloadLock = new Object();
+    private final AtomicLong promptReloadFailureCount = new AtomicLong();
 
     private static final String FILE_PREFIX = "file:";
     private static final String FILE_PREFIX_ALT = "file://";
@@ -116,8 +126,10 @@ public class AgentLlmLocalConfigLoader {
             if (!Files.exists(path)) {
                 if (force && this.localSnapshot.config() == null) {
                     log.info("Local llm config file not found, skip: {}", path);
+                } else if (this.localSnapshot.config() != null) {
+                    markPromptReloadFailure("config_file_missing");
+                    log.error("Local llm config file disappeared; retaining last valid snapshot: {}", path);
                 }
-                clearLocalConfigIfPresent("Local llm config file not found: " + path);
                 return;
             }
             try {
@@ -136,10 +148,12 @@ public class AgentLlmLocalConfigLoader {
                     if (tree.isObject()) {
                         tree.fieldNames().forEachRemaining(topLevelSections::add);
                     }
+                    Set<String> explicitPromptFields = explicitPromptFields(tree);
                     AgentLlmProperties parsed = objectMapper.treeToValue(tree, AgentLlmProperties.class);
                     PlaceholderResolver.resolve(parsed);
                     AgentLlmProperties sanitized = sanitize(parsed);
-                    Map<String, Long> promptFileTimes = resolvePromptFiles(sanitized, resolvePromptBaseDir(path));
+                    Map<String, Long> promptFileTimes = resolvePromptFiles(
+                            sanitized, resolvePromptBaseDir(path), explicitPromptFields);
                     this.localSnapshot = new LocalConfigSnapshot(
                             sanitized, java.util.Collections.unmodifiableSet(topLevelSections));
                     this.loadedConfigPath = normalizedPath;
@@ -162,10 +176,39 @@ public class AgentLlmLocalConfigLoader {
                             sanitized.getModels().size(),
                             endpointModels);
                 }
+            } catch (PromptConfigurationException e) {
+                markPromptReloadFailure(e.reason());
+                log.error("Rejected local llm prompt projection from {}; retaining last valid snapshot: {}",
+                        path, e.getMessage());
             } catch (IOException e) {
+                markPromptReloadFailure("config_read_or_parse_failed");
                 log.error("Failed to load local llm config from {}", path, e);
             }
         }
+    }
+
+    private Set<String> explicitPromptFields(JsonNode tree) {
+        if (tree == null || !tree.isObject() || !tree.path("prompts").isObject()) {
+            return Set.of();
+        }
+        Set<String> fields = new java.util.LinkedHashSet<>();
+        tree.path("prompts").fieldNames().forEachRemaining(fields::add);
+        return java.util.Collections.unmodifiableSet(fields);
+    }
+
+    private void markPromptReloadFailure(String reason) {
+        promptReloadFailureCount.incrementAndGet();
+        if (meterRegistry != null) {
+            Counter.builder("agent.prompt.config.reload.failures")
+                    .description("被拒绝的 Prompt 配置刷新次数")
+                    .tag("reason", hasText(reason) ? reason : "unknown")
+                    .register(meterRegistry)
+                    .increment();
+        }
+    }
+
+    long promptReloadFailureCount() {
+        return promptReloadFailureCount.get();
     }
 
     private void reportState(byte[] contentBytes) {
@@ -301,82 +344,198 @@ public class AgentLlmLocalConfigLoader {
         return configPath == null ? null : configPath.getParent();
     }
 
-    private Map<String, Long> resolvePromptFiles(AgentLlmProperties cfg, Path baseDir) {
+    private Map<String, Long> resolvePromptFiles(AgentLlmProperties cfg,
+                                                  Path baseDir,
+                                                  Set<String> explicitFields) {
         Map<String, Long> fileTimes = new LinkedHashMap<>();
-        if (cfg == null || cfg.getPrompts() == null || baseDir == null) {
+        if (cfg == null || cfg.getPrompts() == null || baseDir == null || explicitFields.isEmpty()) {
             return fileTimes;
         }
         AgentLlmProperties.Prompts prompts = cfg.getPrompts();
-        prompts.setAgentRunSystemPrompt(resolvePromptText(prompts.getAgentRunSystemPrompt(), baseDir, fileTimes));
-        prompts.setTodoPlannerSystemPromptTemplate(resolvePromptText(prompts.getTodoPlannerSystemPromptTemplate(), baseDir, fileTimes));
-        prompts.setWorkflowFinalSystemPrompt(resolvePromptText(prompts.getWorkflowFinalSystemPrompt(), baseDir, fileTimes));
-        prompts.setWorkflowTodoRecoverySystemPrompt(resolvePromptText(prompts.getWorkflowTodoRecoverySystemPrompt(), baseDir, fileTimes));
-        prompts.setParallelPlannerSystemPromptTemplate(resolvePromptText(prompts.getParallelPlannerSystemPromptTemplate(), baseDir, fileTimes));
-        prompts.setParallelFinalSystemPrompt(resolvePromptText(prompts.getParallelFinalSystemPrompt(), baseDir, fileTimes));
-        prompts.setParallelPatchPlannerSystemPromptTemplate(resolvePromptText(prompts.getParallelPatchPlannerSystemPromptTemplate(), baseDir, fileTimes));
-        prompts.setPlanJudgeSystemPromptTemplate(resolvePromptText(prompts.getPlanJudgeSystemPromptTemplate(), baseDir, fileTimes));
-        prompts.setSemanticJudgeSystemPromptTemplate(resolvePromptText(prompts.getSemanticJudgeSystemPromptTemplate(), baseDir, fileTimes));
-        prompts.setSubAgentPlannerSystemPromptTemplate(resolvePromptText(prompts.getSubAgentPlannerSystemPromptTemplate(), baseDir, fileTimes));
-        prompts.setSubAgentSummarySystemPrompt(resolvePromptText(prompts.getSubAgentSummarySystemPrompt(), baseDir, fileTimes));
-        prompts.setPythonRefineSystemPrompt(resolvePromptText(prompts.getPythonRefineSystemPrompt(), baseDir, fileTimes));
-        prompts.setPythonRefineOutputInstruction(resolvePromptText(prompts.getPythonRefineOutputInstruction(), baseDir, fileTimes));
-        prompts.setOrchestratorPlanningSystemPrompt(resolvePromptText(prompts.getOrchestratorPlanningSystemPrompt(), baseDir, fileTimes));
-        prompts.setOrchestratorSummarySystemPrompt(resolvePromptText(prompts.getOrchestratorSummarySystemPrompt(), baseDir, fileTimes));
-        prompts.setPlanJudgeRuntimeSystemPromptTemplate(resolvePromptText(prompts.getPlanJudgeRuntimeSystemPromptTemplate(), baseDir, fileTimes));
-        prompts.setDagModeGuidancePrompt(resolvePromptText(prompts.getDagModeGuidancePrompt(), baseDir, fileTimes));
-        prompts.setDagModeGuidancePromptFile(resolvePromptText(prompts.getDagModeGuidancePromptFile(), baseDir, fileTimes));
-        prompts.setDagReactSystemPromptFile(resolvePromptText(prompts.getDagReactSystemPromptFile(), baseDir, fileTimes));
-        prompts.setDagRecoveryJudgeSystemPromptTemplate(resolvePromptText(prompts.getDagRecoveryJudgeSystemPromptTemplate(), baseDir, fileTimes));
-        prompts.setDagRecoveryJudgeSystemPromptFile(resolvePromptText(prompts.getDagRecoveryJudgeSystemPromptFile(), baseDir, fileTimes));
-        prompts.setFinanceMethodResolverSystemPromptFile(resolvePromptText(prompts.getFinanceMethodResolverSystemPromptFile(), baseDir, fileTimes));
+        PromptAuthority authority = PromptAuthority.shared();
 
-        // 加载两阶段 planning 的 prompt 文件（复用 resolvePromptText 处理 file: 前缀）
-        prompts.setPlanningStrategyStage(resolvePromptText(prompts.getPlanningStrategyStageFile(), baseDir, fileTimes));
-        prompts.setPlanningTodosStage(resolvePromptText(prompts.getPlanningTodosStageFile(), baseDir, fileTimes));
+        resolveDirect("agentRunSystemPrompt", prompts::getAgentRunSystemPrompt,
+                prompts::setAgentRunSystemPrompt, explicitFields, baseDir, fileTimes, authority);
+        resolveDirect("todoPlannerSystemPromptTemplate", prompts::getTodoPlannerSystemPromptTemplate,
+                prompts::setTodoPlannerSystemPromptTemplate, explicitFields, baseDir, fileTimes, authority);
+        resolveDirect("workflowFinalSystemPrompt", prompts::getWorkflowFinalSystemPrompt,
+                prompts::setWorkflowFinalSystemPrompt, explicitFields, baseDir, fileTimes, authority);
+        resolveDirect("workflowTodoRecoverySystemPrompt", prompts::getWorkflowTodoRecoverySystemPrompt,
+                prompts::setWorkflowTodoRecoverySystemPrompt, explicitFields, baseDir, fileTimes, authority);
+        resolveDirect("parallelPlannerSystemPromptTemplate", prompts::getParallelPlannerSystemPromptTemplate,
+                prompts::setParallelPlannerSystemPromptTemplate, explicitFields, baseDir, fileTimes, authority);
+        resolveDirect("parallelFinalSystemPrompt", prompts::getParallelFinalSystemPrompt,
+                prompts::setParallelFinalSystemPrompt, explicitFields, baseDir, fileTimes, authority);
+        resolveDirect("parallelPatchPlannerSystemPromptTemplate", prompts::getParallelPatchPlannerSystemPromptTemplate,
+                prompts::setParallelPatchPlannerSystemPromptTemplate, explicitFields, baseDir, fileTimes, authority);
+        resolveDirect("planJudgeSystemPromptTemplate", prompts::getPlanJudgeSystemPromptTemplate,
+                prompts::setPlanJudgeSystemPromptTemplate, explicitFields, baseDir, fileTimes, authority);
+        resolveDirect("planJudgeRuntimeSystemPromptTemplate", prompts::getPlanJudgeRuntimeSystemPromptTemplate,
+                prompts::setPlanJudgeRuntimeSystemPromptTemplate, explicitFields, baseDir, fileTimes, authority);
+        resolveDirect("semanticJudgeSystemPromptTemplate", prompts::getSemanticJudgeSystemPromptTemplate,
+                prompts::setSemanticJudgeSystemPromptTemplate, explicitFields, baseDir, fileTimes, authority);
+        resolveDirect("subAgentPlannerSystemPromptTemplate", prompts::getSubAgentPlannerSystemPromptTemplate,
+                prompts::setSubAgentPlannerSystemPromptTemplate, explicitFields, baseDir, fileTimes, authority);
+        resolveDirect("subAgentSummarySystemPrompt", prompts::getSubAgentSummarySystemPrompt,
+                prompts::setSubAgentSummarySystemPrompt, explicitFields, baseDir, fileTimes, authority);
+        resolveDirect("pythonRefineSystemPrompt", prompts::getPythonRefineSystemPrompt,
+                prompts::setPythonRefineSystemPrompt, explicitFields, baseDir, fileTimes, authority);
+        resolveDirect("pythonRefineOutputInstruction", prompts::getPythonRefineOutputInstruction,
+                prompts::setPythonRefineOutputInstruction, explicitFields, baseDir, fileTimes, authority);
+        resolveDirect("orchestratorPlanningSystemPrompt", prompts::getOrchestratorPlanningSystemPrompt,
+                prompts::setOrchestratorPlanningSystemPrompt, explicitFields, baseDir, fileTimes, authority);
+        resolveDirect("orchestratorSummarySystemPrompt", prompts::getOrchestratorSummarySystemPrompt,
+                prompts::setOrchestratorSummarySystemPrompt, explicitFields, baseDir, fileTimes, authority);
 
-        if (hasText(prompts.getPythonRefineRequirementsFile())) {
-            List<String> requirements = readPromptLines(prompts.getPythonRefineRequirementsFile(), baseDir, fileTimes);
-            if (!requirements.isEmpty()) {
-                prompts.setPythonRefineRequirements(requirements);
-            }
-        }
+        resolvePaired("dagModeGuidancePrompt", prompts::getDagModeGuidancePrompt,
+                prompts::setDagModeGuidancePrompt, "dagModeGuidancePromptFile",
+                prompts::getDagModeGuidancePromptFile, explicitFields, baseDir, fileTimes, authority);
+        resolvePaired("dagReactSystemPrompt", prompts::getDagReactSystemPrompt,
+                prompts::setDagReactSystemPrompt, "dagReactSystemPromptFile",
+                prompts::getDagReactSystemPromptFile, explicitFields, baseDir, fileTimes, authority);
+        resolvePaired("dagRecoveryJudgeSystemPromptTemplate", prompts::getDagRecoveryJudgeSystemPromptTemplate,
+                prompts::setDagRecoveryJudgeSystemPromptTemplate, "dagRecoveryJudgeSystemPromptFile",
+                prompts::getDagRecoveryJudgeSystemPromptFile, explicitFields, baseDir, fileTimes, authority);
+        resolvePaired("financeMethodResolverSystemPrompt", prompts::getFinanceMethodResolverSystemPrompt,
+                prompts::setFinanceMethodResolverSystemPrompt, "financeMethodResolverSystemPromptFile",
+                prompts::getFinanceMethodResolverSystemPromptFile, explicitFields, baseDir, fileTimes, authority);
+        resolvePaired("planningStrategyStage", prompts::getPlanningStrategyStage,
+                prompts::setPlanningStrategyStage, "planningStrategyStageFile",
+                prompts::getPlanningStrategyStageFile, explicitFields, baseDir, fileTimes, authority);
+        resolvePaired("planningTodosStage", prompts::getPlanningTodosStage,
+                prompts::setPlanningTodosStage, "planningTodosStageFile",
+                prompts::getPlanningTodosStageFile, explicitFields, baseDir, fileTimes, authority);
 
-        if (hasText(prompts.getDatasetFieldSpecsFile())) {
-            List<AgentLlmProperties.DatasetFieldSpec> specs = readDatasetFieldSpecs(prompts.getDatasetFieldSpecsFile(), baseDir, fileTimes);
-            if (!specs.isEmpty()) {
-                prompts.setDatasetFieldSpecs(specs);
-            }
-        }
+        resolveRequirements(prompts, explicitFields, baseDir, fileTimes, authority);
+        resolveDatasetSpecs(prompts, explicitFields, baseDir, fileTimes, authority);
 
         return fileTimes;
     }
 
-    private String resolvePromptText(String value, Path baseDir, Map<String, Long> fileTimes) {
+    private void resolveDirect(String fieldName,
+                               Supplier<String> getter,
+                               Consumer<String> setter,
+                               Set<String> explicitFields,
+                               Path baseDir,
+                               Map<String, Long> fileTimes,
+                               PromptAuthority authority) {
+        if (!explicitFields.contains(fieldName)) {
+            return;
+        }
+        String resolved = resolvePromptTextRequired(fieldName, getter.get(), baseDir, fileTimes);
+        authority.validateText(fieldName, resolved, "local prompt projection");
+        setter.accept(resolved);
+    }
+
+    private void resolvePaired(String bodyField,
+                               Supplier<String> bodyGetter,
+                               Consumer<String> bodySetter,
+                               String fileField,
+                               Supplier<String> fileGetter,
+                               Set<String> explicitFields,
+                               Path baseDir,
+                               Map<String, Long> fileTimes,
+                               PromptAuthority authority) {
+        boolean hasBody = explicitFields.contains(bodyField) && hasText(bodyGetter.get());
+        boolean hasFile = explicitFields.contains(fileField) && hasText(fileGetter.get());
+        if (hasBody && hasFile) {
+            throw new PromptConfigurationException(
+                    "ambiguous_body_and_file", bodyField + " 与 " + fileField + " 不能同时配置非空值");
+        }
+        if (hasBody) {
+            String resolved = resolvePromptTextRequired(bodyField, bodyGetter.get(), baseDir, fileTimes);
+            authority.validateText(bodyField, resolved, "local prompt projection");
+            bodySetter.accept(resolved);
+            return;
+        }
+        if (hasFile) {
+            String resolved = readPromptFileRequired(fileField, fileGetter.get(), baseDir, fileTimes);
+            authority.validateText(bodyField, resolved, "local prompt projection");
+            bodySetter.accept(resolved);
+            return;
+        }
+        if (explicitFields.contains(bodyField)) {
+            resolvePromptTextRequired(bodyField, bodyGetter.get(), baseDir, fileTimes);
+        }
+        if (explicitFields.contains(fileField)) {
+            readPromptFileRequired(fileField, fileGetter.get(), baseDir, fileTimes);
+        }
+    }
+
+    private String resolvePromptTextRequired(String fieldName,
+                                             String value,
+                                             Path baseDir,
+                                             Map<String, Long> fileTimes) {
         if (!hasText(value)) {
-            return value;
+            throw new PromptConfigurationException("blank", fieldName + " 为空");
         }
         String raw = value.trim();
         String pathRef = stripFilePrefix(raw);
         if (pathRef == null) {
             return value;
         }
-        Path filePath = resolveFilePath(pathRef, baseDir);
+        return readPromptFileRequired(fieldName, pathRef, baseDir, fileTimes);
+    }
+
+    private String readPromptFileRequired(String fieldName,
+                                          String fileRef,
+                                          Path baseDir,
+                                          Map<String, Long> fileTimes) {
+        Path filePath = resolveFilePath(stripFilePrefixOrSelf(fileRef), baseDir);
         if (filePath == null) {
-            return "";
+            throw new PromptConfigurationException("file_path_blank", fieldName + " 的文件路径为空");
         }
         try {
             recordFileModifiedTime(filePath, fileTimes);
-            return Files.readString(filePath, StandardCharsets.UTF_8);
+            String text = Files.readString(filePath, StandardCharsets.UTF_8);
+            if (text.isBlank()) {
+                throw new PromptConfigurationException("file_blank", fieldName + " 的文件内容为空: " + filePath);
+            }
+            return text;
+        } catch (PromptConfigurationException e) {
+            throw e;
         } catch (Exception e) {
-            log.error("Failed to load prompt file: {}", filePath, e);
-            return "";
+            throw new PromptConfigurationException(
+                    "file_read_failed", fieldName + " 的文件读取失败: " + filePath + " (" + e.getClass().getSimpleName() + ")");
         }
     }
 
-    private List<String> readPromptLines(String fileRef, Path baseDir, Map<String, Long> fileTimes) {
+    private void resolveRequirements(AgentLlmProperties.Prompts prompts,
+                                     Set<String> explicitFields,
+                                     Path baseDir,
+                                     Map<String, Long> fileTimes,
+                                     PromptAuthority authority) {
+        boolean hasBody = explicitFields.contains("pythonRefineRequirements")
+                && prompts.getPythonRefineRequirements() != null
+                && !prompts.getPythonRefineRequirements().isEmpty();
+        boolean hasFile = explicitFields.contains("pythonRefineRequirementsFile")
+                && hasText(prompts.getPythonRefineRequirementsFile());
+        if (hasBody && hasFile) {
+            throw new PromptConfigurationException(
+                    "ambiguous_body_and_file", "pythonRefineRequirements 与 pythonRefineRequirementsFile 不能同时配置");
+        }
+        if (hasBody) {
+            authority.validateRequirements(prompts.getPythonRefineRequirements(), "local prompt projection");
+        } else if (hasFile) {
+            List<String> requirements = readPromptLinesRequired(
+                    "pythonRefineRequirementsFile", prompts.getPythonRefineRequirementsFile(), baseDir, fileTimes);
+            authority.validateRequirements(requirements, "local prompt projection");
+            prompts.setPythonRefineRequirements(requirements);
+        } else if (explicitFields.contains("pythonRefineRequirements")) {
+            authority.validateRequirements(prompts.getPythonRefineRequirements(), "local prompt projection");
+        } else if (explicitFields.contains("pythonRefineRequirementsFile")) {
+            readPromptLinesRequired(
+                    "pythonRefineRequirementsFile", prompts.getPythonRefineRequirementsFile(), baseDir, fileTimes);
+        }
+    }
+
+    private List<String> readPromptLinesRequired(String fieldName,
+                                                 String fileRef,
+                                                 Path baseDir,
+                                                 Map<String, Long> fileTimes) {
         Path filePath = resolveFilePath(stripFilePrefixOrSelf(fileRef), baseDir);
         if (filePath == null) {
-            return List.of();
+            throw new PromptConfigurationException("file_path_blank", fieldName + " 的文件路径为空");
         }
         try {
             recordFileModifiedTime(filePath, fileTimes);
@@ -389,26 +548,68 @@ public class AgentLlmLocalConfigLoader {
                 }
                 out.add(trimmed);
             }
+            if (out.isEmpty()) {
+                throw new PromptConfigurationException("file_blank", fieldName + " 的文件没有有效条目: " + filePath);
+            }
             return out;
+        } catch (PromptConfigurationException e) {
+            throw e;
         } catch (Exception e) {
-            log.error("Failed to load prompt lines: {}", filePath, e);
-            return List.of();
+            throw new PromptConfigurationException(
+                    "file_read_failed", fieldName + " 的文件读取失败: " + filePath + " (" + e.getClass().getSimpleName() + ")");
         }
     }
 
-    private List<AgentLlmProperties.DatasetFieldSpec> readDatasetFieldSpecs(String fileRef,
-                                                                            Path baseDir,
-                                                                            Map<String, Long> fileTimes) {
+    private void resolveDatasetSpecs(AgentLlmProperties.Prompts prompts,
+                                     Set<String> explicitFields,
+                                     Path baseDir,
+                                     Map<String, Long> fileTimes,
+                                     PromptAuthority authority) {
+        boolean hasBody = explicitFields.contains("datasetFieldSpecs")
+                && prompts.getDatasetFieldSpecs() != null
+                && !prompts.getDatasetFieldSpecs().isEmpty();
+        boolean hasFile = explicitFields.contains("datasetFieldSpecsFile")
+                && hasText(prompts.getDatasetFieldSpecsFile());
+        if (hasBody && hasFile) {
+            throw new PromptConfigurationException(
+                    "ambiguous_body_and_file", "datasetFieldSpecs 与 datasetFieldSpecsFile 不能同时配置");
+        }
+        if (hasBody) {
+            authority.validateDatasetFieldSpecs(prompts.getDatasetFieldSpecs(), "local prompt projection");
+        } else if (hasFile) {
+            List<AgentLlmProperties.DatasetFieldSpec> specs = readDatasetFieldSpecsRequired(
+                    "datasetFieldSpecsFile", prompts.getDatasetFieldSpecsFile(), baseDir, fileTimes);
+            authority.validateDatasetFieldSpecs(specs, "local prompt projection");
+            prompts.setDatasetFieldSpecs(specs);
+        } else if (explicitFields.contains("datasetFieldSpecs")) {
+            authority.validateDatasetFieldSpecs(prompts.getDatasetFieldSpecs(), "local prompt projection");
+        } else if (explicitFields.contains("datasetFieldSpecsFile")) {
+            readDatasetFieldSpecsRequired(
+                    "datasetFieldSpecsFile", prompts.getDatasetFieldSpecsFile(), baseDir, fileTimes);
+        }
+    }
+
+    private List<AgentLlmProperties.DatasetFieldSpec> readDatasetFieldSpecsRequired(String fieldName,
+                                                                                     String fileRef,
+                                                                                     Path baseDir,
+                                                                                     Map<String, Long> fileTimes) {
         Path filePath = resolveFilePath(stripFilePrefixOrSelf(fileRef), baseDir);
         if (filePath == null) {
-            return List.of();
+            throw new PromptConfigurationException("file_path_blank", fieldName + " 的文件路径为空");
         }
         try (InputStream in = Files.newInputStream(filePath)) {
             recordFileModifiedTime(filePath, fileTimes);
-            return objectMapper.readValue(in, new TypeReference<List<AgentLlmProperties.DatasetFieldSpec>>() {});
+            List<AgentLlmProperties.DatasetFieldSpec> specs = objectMapper.readValue(
+                    in, new TypeReference<List<AgentLlmProperties.DatasetFieldSpec>>() { });
+            if (specs == null || specs.isEmpty()) {
+                throw new PromptConfigurationException("file_blank", fieldName + " 的文件没有字段定义: " + filePath);
+            }
+            return specs;
+        } catch (PromptConfigurationException e) {
+            throw e;
         } catch (Exception e) {
-            log.error("Failed to load dataset field specs: {}", filePath, e);
-            return List.of();
+            throw new PromptConfigurationException(
+                    "file_read_failed", fieldName + " 的文件读取失败: " + filePath + " (" + e.getClass().getSimpleName() + ")");
         }
     }
 

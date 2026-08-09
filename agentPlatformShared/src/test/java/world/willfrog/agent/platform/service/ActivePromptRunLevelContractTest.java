@@ -112,29 +112,14 @@ class ActivePromptRunLevelContractTest {
     }
 
     @Test
-    void applicationAgentLlmPromptsYml_shouldNotContainOldContractPatterns() {
+    void applicationAgentLlmPromptsYml_shouldNotMaintainInlinePromptBodies() {
         String yaml = loadResourceAsString("application-agent-llm-prompts.yml");
         assertFalse(yaml.isBlank(), "application-agent-llm-prompts.yml 必须可加载");
-        assertFalse(yaml.contains("data.dataset_id"),
-                "application-agent-llm-prompts.yml 不得出现旧 data.dataset_id 引用");
-        assertFalse(yaml.contains("glob.glob('/sandbox/input/*')"),
-                "application-agent-llm-prompts.yml 不得要求 glob 遍历旧挂载目录");
-        assertFalse(yaml.contains("/sandbox/input/<dataset_id>/<dataset_id>.meta.json"),
-                "application-agent-llm-prompts.yml 不得出现旧 meta.json 路径");
-        assertFalse(yaml.contains("scopeHash"),
-                "application-agent-llm-prompts.yml 不得出现 scopeHash");
-        assertFalse(yaml.contains("originalId"),
-                "application-agent-llm-prompts.yml 不得向 LLM 暴露 originalId");
-        assertFalse(yaml.contains("coding_context"),
-                "application-agent-llm-prompts.yml 不得再鼓励 LLM 传 coding_context");
-        assertTrue(yaml.contains("run-level"),
-                "application-agent-llm-prompts.yml 必须说明 run-level 编号");
-        assertTrue(yaml.contains("listMyData"),
-                "application-agent-llm-prompts.yml 必须说明 listMyData");
-        assertTrue(yaml.contains("rereadToolResult"),
-                "application-agent-llm-prompts.yml 必须说明 rawRef 使用 rereadToolResult");
-        assertTrue(yaml.contains("loadDocument 只接收"),
-                "application-agent-llm-prompts.yml 必须说明 rawRef 不传给 loadDocument");
+        assertTrue(yaml.contains("prompts: {}"), "YAML 应只保留空 prompts 投影入口");
+        assertTrue(yaml.contains("Prompt 权威正文只保存在"), "YAML 必须说明 Q-09 权威边界");
+        assertFalse(yaml.contains("agent-run-system-prompt:"), "YAML 不得手写第二份 Prompt 正文");
+        assertFalse(yaml.contains("python-refine-requirements:"), "YAML 不得手写第二份列表正文");
+        assertFalse(yaml.contains("dataset-field-specs:"), "YAML 不得手写第二份字段规格");
     }
 
     @ParameterizedTest

@@ -24,7 +24,7 @@
 | checkParallelLimits | `{}` |
 | executePython | `{"code": "<Python代码>", "dataset_ids": "<run-level dataset 编号列表，可选>", "manifest_ids": "<run-level manifest 编号列表，可选>", "libraries": "<可选，逗号分隔>", "timeout_seconds": "<可选，整数>"}` |
 | loadToolGuide | `{"topic": "python_sandbox|dataset_manifest|advanced_market_data|execute_python_tips"}` |
-| rereadToolResult | `{"rawRef": "raw-ref:...", "keyword": "<可选关键词>", "offset": 0, "limit": 0}` |
+| rereadToolResult | keyword: `{"rawRef": "raw_ref_001", "keyword": "<非空关键词>", "limit": 3000}`；range: `{"rawRef": "raw_ref_001", "offset": 0, "limit": 3000}` |
 | searchWeb | `{"query": "<搜索查询文本>", "scene": "general|finance|news", "backend": "perplexity|tavily|exa|", "strength": "<搜索强度，可空>", "skipHotCache": true|false, "skipRagPrefetch": true|false, "timeRangeStart": "<ISO8601，可空>", "timeRangeEnd": "<ISO8601，可空>", "maxResults": 5}` |
 
 ## 数据查询时效性（全局）
@@ -53,7 +53,7 @@
 
 ### 1. 搜索类工具（searchIndex/searchStock/searchFund/searchAssetInfo）
 - **searchFund 仅用于场外基金（公募基金）基本信息检索**，不用于 ETF、场内上市 ETF、行业主题 ETF 筛选
-- **ETF 回测 / 行业主题 ETF / 场内资产筛选** 必须使用 `searchAssetInfo`，并设置 `assetTypes=etf`（可按需含 index/stock），**禁止**使用 searchFund
+- **ETF 回测 / 行业主题 ETF 筛选** 必须使用 `searchAssetInfo`，并设置 `assetTypes=etf`（可按需含 index/stock），**禁止**使用 searchFund
 - searchIndex/searchStock/searchFund **仅允许**使用 `keyword` 参数（不是 `keywords` 或 `query`）；searchAssetInfo 使用 `query` + `assetTypes`
 - 同一任务需要搜索多个关键词时，优先合并为一次批量调用：`keyword="沪深300|中证500"`，也可传 JSON 数组字符串；不要改用逗号分隔
 - 批量返回 `data.mode=batch`、`data.results`、`success_count`、`failure_count`，从每个 result 的 `data.items` 中选取匹配项
@@ -102,7 +102,7 @@
   - `loadToolGuide(topic=execute_python_tips)` — trade_date 解析等常见陷阱
 - 使用 `searchAssetInfo` / `searchIndex` 的 **advanced 模式**前，若上下文无 advanced 说明，调用 `loadToolGuide(topic=advanced_market_data)`。
 - 上下文**已有**对应 guide 全文时，直接写代码/查数，**不要重复调用** loadToolGuide。
-- 工具结果里若出现 `data.rawRef`（形如 `raw-ref:...`），不要把 rawRef 当作需要分页浏览的正文。所有工具输出都是结构化 JSON；优先使用当前可见的 `data` 字段、`${todo.output.data...}` 引用、`listMyData` 和后续数据工具。只有确实缺少某个必要字段时，才用 `rereadToolResult` 做少量、带 `keyword`/窄 `limit` 的定向补读；不要把 rawRef 传给 `loadDocument`，`loadDocument` 只接收 ragSearch 返回的 `oss_url`。
+- 工具结果里若出现 `data.rawRef`（形如 `raw_ref_001` 或 `raw-ref:...`），不要把 rawRef 当作正文或 citation。优先使用当前可见的 `data` 字段、`${todo.output.data...}` 引用、`listMyData` 和后续数据工具。只有确实缺少某个必要字段时，才用 `rereadToolResult` 做少量定向补读：keyword 模式必须给非空 `keyword`；range 模式不传 `keyword`，必须给合法 `offset/limit`。loadDocument 只接收 RAG 文档定位参数（如 oss_url / source_key / section），不能接收 rawRef。
 
 ### 2.3 大篇幅结构化输出处理
 
@@ -119,7 +119,7 @@
 每次调用 `executePython` 都会在一个**全新的独立沙盒环境**中运行，之前的执行状态（变量、内存数据）不会被保留。
 
 **推荐策略**：
-- **大篇幅结构化数据处理**（JSON/CSV、dataset、manifest、批量行情结果）：优先使用 `executePython` 一次性解析、筛选、聚合和计算，避免用 `rereadToolResult` 多次分页读取。
+- **大篇幅结构化数据处理**（搜索得到的结构化JSON，【包括但不限于】拉取行情等密集数据得到的CSV、dataset、manifest）：优先使用 `executePython` 一次性解析、筛选、聚合和计算，避免用 `rereadToolResult` 多次分页读取。
 - **简单分析任务**（如计算收益率、对比数据）：建议**一次性完成**——加载数据、分析计算、输出结果，全部在一个代码块中完成，减少多次调用的开销。
 - **复杂分析任务**（如多阶段建模、迭代优化）：可以分多次调用，每次输出明确的中间结果，便于后续步骤基于前序成果继续推进。
 
