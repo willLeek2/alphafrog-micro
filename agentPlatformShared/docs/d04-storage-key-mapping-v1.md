@@ -5,7 +5,8 @@
 - 代码入口：`agentPlatformShared/src/main/java/world/willfrog/agent/platform/storage/AgentStoragePaths.java`（facade）+ `StorageRootUnavailableException.java`（§4.3 失败信号）。
 - 现状审计依据：`notes-w5/D04-path-key-inventory.md`（W5 worktree 内，未跟踪工作底稿；其 K/H/N/R 编号在本文被引用）。
 - 现状同步：本次修订对齐 D22-5.1.3 四提交（`ac6d4c16` → `77b95fe5` → `3edca994` → `904a42bc`）后的代码现状，涉及 §3、§5-K3、§7、§9；§10 registry 权威语义进一步同步至第二轮复审修复后的代码（认领原子提交、严格归属校验、有界读取大小上限、幽灵成员自愈）。
-- v5 同步：`PersistentArtifactRegistry` 完成 v5 重写（第五轮 MUST-FIX），本次修订同步更新 §9 验证（`PersistentArtifactRegistryTest` 全量重写、38 例）与 §10 registry 权威语义。v5 变化总纲：run 制品索引由「集合 SET（SADD/SCARD）+ SSCAN 提示式游标幽灵清理 + 独立游标键 `run-purge-cursor`」改为「有序集合 ZSET（成员 = artifactId，score = 每 run 一把单调序号，由 run-seq 计数器键脚本内 INCRBY 发号）+ 窗口轮转幽灵清理（ZRANGE 带 LIMIT 是构造性硬预算，轮转状态编码在 score 排序本身，游标键整体废除）」；读取 touch 改为单条原子 Lua（同一次脚本执行内同时更新 meta 的 lastAccessAtMillis/expiresAtMillis 与四类键 TTL，返回状态码 0/1/2，Java 侧绝不吞异常报成功）；过期 cleanup 改为每条 meta 走一条 Lua 原子判定（在 Redis 单线程内读回当前 JSON 的 expiresAtMillis 才删；JSON 损坏/无日期一律不删）；幂等认领脚本的 EXISTS 分支（输家采纳赢家）做索引 TTL 刷新时只取赢家 meta 键自身剩余 TTL，绝不取输家传入的 TTL；TTL 归一化收口到唯一权威点 `effectiveTtlHours`。键清单新增 `agent:persistent-artifact:run-seq:{runId}` 一类（详见 §10）。
+- v5 同步：`PersistentArtifactRegistry` 完成 v5 重写（第五轮 MUST-FIX），本次修订同步更新 §9 验证（`PersistentArtifactRegistryTest` 全量重写、38 例）与 §10 registry 权威语义。
+- owner 合入同步（Kimi D04 消费方收口片 `6bd55989` 经 owner 复核合入后）：§3 K4 声明计数与 §7 consumer 迁移状态同步至合并后现状——dataset 根键 K4 的 7 处独立 @Value 声明已全部收敛（D22-5.1.3 摘除 `AgentArtifactService` 1 处；`6bd55989` 将 `DatasetWriter` 迁门面、删除 `DatasetRegistry`/`ManifestWriter`/`WorkspaceAssetCollector`/`WorkspaceHealthVerifier` 4 处从未被读取的死注入；仅剩 `WorkspacePathResolver` 保留供测试的旧构造器 1 处）。`manifests-path`（K6）属性本身仍是活属性（`DatasetRegistry`/`ManifestWriter` 各有真实写链读取），此前仅 `DatasetWriter` 内一个同名 @Value 字段声明后从未被读取，该死字段及其测试反射注入已由 owner 清理提交删除。v5 变化总纲：run 制品索引由「集合 SET（SADD/SCARD）+ SSCAN 提示式游标幽灵清理 + 独立游标键 `run-purge-cursor`」改为「有序集合 ZSET（成员 = artifactId，score = 每 run 一把单调序号，由 run-seq 计数器键脚本内 INCRBY 发号）+ 窗口轮转幽灵清理（ZRANGE 带 LIMIT 是构造性硬预算，轮转状态编码在 score 排序本身，游标键整体废除）」；读取 touch 改为单条原子 Lua（同一次脚本执行内同时更新 meta 的 lastAccessAtMillis/expiresAtMillis 与四类键 TTL，返回状态码 0/1/2，Java 侧绝不吞异常报成功）；过期 cleanup 改为每条 meta 走一条 Lua 原子判定（在 Redis 单线程内读回当前 JSON 的 expiresAtMillis 才删；JSON 损坏/无日期一律不删）；幂等认领脚本的 EXISTS 分支（输家采纳赢家）做索引 TTL 刷新时只取赢家 meta 键自身剩余 TTL，绝不取输家传入的 TTL；TTL 归一化收口到唯一权威点 `effectiveTtlHours`。键清单新增 `agent:persistent-artifact:run-seq:{runId}` 一类（详见 §10）。
 
 ---
 
@@ -39,7 +40,7 @@ D04 一期只收敛四个存储根/文件，全部经 `AgentStoragePaths` 单一
 |---|---|---|---|---|---|---|
 | workspace | `agent.storage.workspace-root` | `agent.workspace.root` | `/data/agent_workspaces` | `AF_AGENT_STORAGE_WORKSPACE_ROOT` | 旧键长期保留为别名，一期无删除计划 | K1 原无任何 override，唯一消费链为 workspace dump 包；无读回 API，改根不影响既有查询面 |
 | artifact | `agent.storage.artifact-root` | `agent.persistent-artifact.root`；`agent.artifact.storage.path`（第二 legacy alias，即 K3，D22-5.1.3 收敛） | `/data/agent_artifacts` | `AF_AGENT_STORAGE_ARTIFACT_ROOT` | 同上；兼容窗口 = 只要 legacy 键仍被任一组件设置即持续生效；退休条件 = 当所有部署环境确认停用 `agent.artifact.storage.path` 与 `agent.persistent-artifact.root`、统一使用新键后，legacy 解析可在后续版本移除 | 优先级新键 > legacy；两 legacy 冲突且新键未设 → 启动 fail closed（抛 `StorageRootUnavailableException`，只列键名不列值）；历史制品不搬迁不删除（已按旧键解析落盘的 artifact 文件保持原位，只读兼容）；Redis meta 存绝对路径（§6-R2） |
-| dataset | `agent.storage.dataset-root` | `agent.tools.market-data.dataset.path` | `/data/agent_datasets` | `AF_AGENT_STORAGE_DATASET_ROOT` | 同上；旧键仍是 market-data 工具链的现役键 | H1 硬编码前缀的原属根（§4）；K4 现有 6 处独立 @Value 声明（原 `AgentArtifactService` 一处于 D22-5.1.3 摘除，见 §5-K3/§7），一期只收敛门面触达的 consumer（§7） |
+| dataset | `agent.storage.dataset-root` | `agent.tools.market-data.dataset.path` | `/data/agent_datasets` | `AF_AGENT_STORAGE_DATASET_ROOT` | 同上；旧键经门面 legacy alias 链继续生效 | H1 硬编码前缀的原属根（§4）；K4 原有 7 处独立 @Value 声明，现已全部收敛：`AgentArtifactService` 一处于 D22-5.1.3 摘除（§5-K3/§7），D04 消费方收口片 `6bd55989` 将 `DatasetWriter` 迁门面并删除 `DatasetRegistry`/`ManifestWriter`/`WorkspaceAssetCollector`/`WorkspaceHealthVerifier` 四处死注入，仅剩 `WorkspacePathResolver` 保留供测试的旧构造器一处（§7） |
 | debug 文件 | `agent.storage.observability-debug-file` | `agent.observability.debug-file.path` | `/data/logs/agent-observability-debug.log` | `AF_AGENT_STORAGE_OBSERVABILITY_DEBUG_FILE` | 同上；伴生开关 `agent.observability.debug-file.enabled` 不变 | 默认路径无 volume 挂载（审计 R9），容器本地写 |
 
 yml 声明位置：`agentLangchainService/src/main/resources/application-agent-platform-shared.yml` `agent.storage.*` 段（四个键默认留空 → 回退旧键 → 回退代码默认值；生产 env 未设时行为与 D04 前完全一致）。
@@ -87,7 +88,7 @@ yml 声明位置：`agentLangchainService/src/main/resources/application-agent-p
 
 ## 7. Consumer 迁移状态
 
-**已经由门面（D04 本次交付 + D22-5.1.3 增量）**：
+**已经由门面（D04 本次交付 + D22-5.1.3 增量 + D04 消费方收口片 `6bd55989`）**：
 
 | Consumer | 收敛点 |
 |---|---|
@@ -96,8 +97,10 @@ yml 声明位置：`agentLangchainService/src/main/resources/application-agent-p
 | `PersistentArtifactRegistry` | `artifactRoot()` 替换 @Value；`register` 前 `requireWritableRoot` |
 | `AgentObservabilityDebugFileWriter` | `observabilityDebugFile()` 替换 @Value 路径（best-effort 语义不变） |
 | `AgentArtifactService` | D22-5.1.3 切换：原 K3/K4 @Value 摘除，artifact 根 / dataset 根经 `AgentStoragePaths` 注入；list/load 经 `PersistentArtifactRegistry`（registry-first + 惰性幂等注册），legacy Base64 ID 仅只读回退（见 §5-K3、§10） |
+| `DatasetWriter` | D04 消费方收口片 `6bd55989`：dataset 根迁门面构造注入（`datasetRoot()`），`ensureDirectory` 走门面根；`getDatasetPath()` 保留为门面委托（队列要求保留；合并后无调用方）；K4 @Value 删除（同类 `database-fetched-path`/`enabled` 为 K5/开关，非四根键，未动；同类曾残留的 `manifests-path` 死字段由 owner 清理提交删除） |
+| `DatasetRegistry` / `ManifestWriter` / `WorkspaceAssetCollector` / `WorkspaceHealthVerifier` | D04 消费方收口片 `6bd55989`：四处从未被读取的 K4 死注入 @Value 字段删除（`WorkspaceAssetCollector`/`WorkspaceHealthVerifier` 连带删除不再使用的 @Value import；`ManifestWriter` 类注释中「复用 dataset.path 配置」的不实陈述一并删除——manifest 实际走 K6 `manifests-path`） |
 
-**仍直读、由后续 slice 收敛**：`DatasetRegistry`/`DatasetWriter`/`ManifestWriter`（K4–K6，D21-B）、`WorkspaceHealthVerifier`/`WorkspaceAssetCollector`（K4，D21-A 协同；后者为 dead injection，审计 R11）、Python 侧 P1–P6（Kimi slice）、`DebugObservabilityService`/frontend debug 两路（K11/K12）。（`AgentArtifactService` 已于 D22-5.1.3 移出本清单：经 `AgentStoragePaths` + `PersistentArtifactRegistry` 切换完成，见上表。）
+**仍直读、由后续 slice 收敛**：K5 `database-fetched-path` 与 K6 `manifests-path`（§5 未纳入键）仍由 `DatasetWriter`/`DatasetRegistry`/`ManifestWriter` 直读（D21-B）、Python 侧 P1–P6（Kimi slice）、`DebugObservabilityService`/frontend debug 两路（K11/K12）。（`AgentArtifactService` 已于 D22-5.1.3 移出本清单；`DatasetRegistry`/`DatasetWriter`/`ManifestWriter`/`WorkspaceHealthVerifier`/`WorkspaceAssetCollector` 的 K4 dataset 根已于收口片 `6bd55989` 迁门面或删除死注入，见上表与 §3 迁移注意。）
 
 ## 8. §4.1 单点切换运维口径
 
