@@ -3,16 +3,23 @@ package world.willfrog.sandbox.service;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.apache.dubbo.rpc.RpcContext;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.test.util.ReflectionTestUtils;
 import org.springframework.test.web.client.MockRestServiceServer;
 import org.springframework.web.client.RestTemplate;
+import world.willfrog.agent.platform.debug.DebugObservabilityRpcKeys;
 import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskResultRequest;
 import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskStatusRequest;
 import world.willfrog.alphafrogmicro.sandbox.idl.TaskResultResponse;
 import world.willfrog.alphafrogmicro.sandbox.idl.TaskStatusResponse;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.List;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -42,6 +49,13 @@ import static org.springframework.test.web.client.response.MockRestResponseCreat
  * assert the exact encoded URL the gateway emits.
  */
 class PythonSandboxGatewayServiceImplD15Test {
+
+    // D15 round-2 (codex 8d293d31 #3): JSONL telemetry endpoint assertions need a real
+    // sessionDir + RpcContext attachments so DebugObservabilityJsonlAppender writes
+    // sandbox-<runId>.jsonl on the temp dir; clear attachments after each test so the
+    // thread-local does not leak between cases.
+    @TempDir
+    Path sessionDir;
 
     @AfterEach
     void clearRpcContext() {
@@ -77,6 +91,25 @@ class PythonSandboxGatewayServiceImplD15Test {
                 + "\"stdout\": \"ok\", "
                 + "\"stderr\": \"\""
                 + "}";
+    }
+
+    // === D15 round-2 (codex 8d293d31 #3): JSONL telemetry helpers ===
+
+    private void bindSession(String runId, String sessionId) {
+        // Bind RpcContext attachments so DebugObservabilityJsonlAppender writes to the
+        // @TempDir-backed sessionDir. Lets D15 round-2 tests assert sandbox_http.endpoint
+        // equals the encoded form (D15 red line 6: telemetry出口和 HTTP URL出口编码一致).
+        RpcContext ctx = RpcContext.getServiceContext();
+        ctx.setAttachment(DebugObservabilityRpcKeys.SESSION_DIR, sessionDir.toString());
+        ctx.setAttachment(DebugObservabilityRpcKeys.RUN_ID, runId);
+        ctx.setAttachment(DebugObservabilityRpcKeys.SESSION_ID, sessionId);
+    }
+
+    private static List<String> readSandboxHttpEvents(Path sessionDir, String runId) throws Exception {
+        Path runFile = sessionDir.resolve("sandbox-" + runId + ".jsonl");
+        try (Stream<String> lines = Files.lines(runFile)) {
+            return lines.filter(line -> line.contains("\"eventType\":\"sandbox_http\"")).toList();
+        }
     }
 
     // === getTaskStatus: each special character must encode as a single path segment ===
@@ -314,5 +347,112 @@ class PythonSandboxGatewayServiceImplD15Test {
         server.verify();
         assertTrue(response.hasErrorDetail());
         assertEquals("UNKNOWN", response.getStatus());
+    }
+
+    // === D15 round-2 (codex 8d293d31): missing coverage gaps ===
+
+    @Test
+    void getTaskResultEncodesSpaceInTaskIdAsPercent20OnResultEndpoint() throws Exception {
+        // D15 §4.3.2 + codex 8d293d31 MUST-FIX #1: result endpoint previously only covered
+        // `/`, `%`, 中文 — space `%20` was missing. Adds it here.
+        RestTemplate restTemplate = new RestTemplate();
+        MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
+        PythonSandboxGatewayServiceImpl gateway = newGateway(restTemplate);
+
+        server.expect(once(), requestTo("http://sandbox/tasks/task%20space"))
+                .andRespond(withSuccess(
+                        taskStatusJsonBody("task space", "SUCCEEDED"),
+                        MediaType.APPLICATION_JSON));
+        server.expect(once(), requestTo("http://sandbox/tasks/task%20space/result"))
+                .andRespond(withSuccess(taskResultJsonBody(), MediaType.APPLICATION_JSON));
+
+        TaskResultResponse response = gateway.getTaskResult(GetTaskResultRequest.newBuilder()
+                .setTaskId("task space").build());
+
+        server.verify();
+        assertEquals("SUCCEEDED", response.getStatus());
+    }
+
+    @Test
+    void getTaskStatus404FailureEmitsEncodedEndpointInTelemetry() throws Exception {
+        // D15 §4.3.1 + red line 6 (codex 8d293d31 MUST-FIX #3): status failure path MUST
+        // bind SESSION_DIR + read JSONL + assert sandbox_http.endpoint equals the encoded
+        // form. The bare assertion `requestTo("http://sandbox/tasks/task%2Fslash")` only
+        // proves HTTP URL encoding, NOT telemetry出口encoding. This test真锁住 telemetry.
+        RestTemplate restTemplate = new RestTemplate();
+        MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
+        PythonSandboxGatewayServiceImpl gateway = newGateway(restTemplate);
+
+        bindSession("run-d15-status-404", "sess-d15-status-404");
+        server.expect(once(), requestTo("http://sandbox/tasks/task%2Fslash"))
+                .andRespond(withStatus(HttpStatus.NOT_FOUND));
+
+        TaskStatusResponse response = gateway.getTaskStatus(GetTaskStatusRequest.newBuilder()
+                .setTaskId("task/slash").build());
+
+        server.verify();
+        assertTrue(response.hasErrorDetail());
+
+        List<String> httpEvents = readSandboxHttpEvents(sessionDir, "run-d15-status-404");
+        assertEquals(1, httpEvents.size(),
+                "404 MUST emit exactly one final sandbox_http event; got: " + httpEvents);
+        String event = httpEvents.get(0);
+        assertTrue(event.contains("\"status\":\"ERROR\""),
+                "404 event status MUST be ERROR; got: " + event);
+        assertTrue(event.contains("\"endpoint\":\"http://sandbox/tasks/task%2Fslash\""),
+                "D15 red line 6: telemetry endpoint MUST use encoded form "
+                        + "(http://sandbox/tasks/task%2Fslash); got: " + event);
+        assertTrue(event.contains("\"errorCategory\":\"GET_STATUS_SANDBOX_HTTP_ERROR_CATEGORY_NOT_FOUND\""),
+                "404 event errorCategory MUST be frozen NOT_FOUND label; got: " + event);
+    }
+
+    @Test
+    void getTaskResult500FailureEmitsEncodedEndpointInTelemetry() throws Exception {
+        // D15 §4.3.1 + red line 6 (codex 8d293d31 MUST-FIX #2/#3): result failure path MUST
+        // be covered with JSONL endpoint assertion. Result endpoint is reached only after
+        // status precheck returns terminal, so test first mocks status success (SUCCEEDED),
+        // then /result 500. Asserts telemetry carries the encoded /result endpoint, NOT
+        // just the encoded status endpoint.
+        RestTemplate restTemplate = new RestTemplate();
+        MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
+        PythonSandboxGatewayServiceImpl gateway = newGateway(restTemplate);
+
+        bindSession("run-d15-result-500", "sess-d15-result-500");
+        // Status precheck: GET /tasks/task%2Fslash → 200 SUCCEEDED (terminal, will fetch /result)
+        server.expect(once(), requestTo("http://sandbox/tasks/task%2Fslash"))
+                .andRespond(withSuccess(
+                        taskStatusJsonBody("task/slash", "SUCCEEDED"),
+                        MediaType.APPLICATION_JSON));
+        // Result fetch: GET /tasks/task%2Fslash/result → 500 (DOWNSTREAM_FAILURE)
+        server.expect(once(), requestTo("http://sandbox/tasks/task%2Fslash/result"))
+                .andRespond(withStatus(HttpStatus.INTERNAL_SERVER_ERROR));
+
+        TaskResultResponse response = gateway.getTaskResult(GetTaskResultRequest.newBuilder()
+                .setTaskId("task/slash").build());
+
+        server.verify();
+        assertTrue(response.hasErrorDetail(),
+                "result 500 MUST propagate typed error detail");
+
+        List<String> httpEvents = readSandboxHttpEvents(sessionDir, "run-d15-result-500");
+        // Two events expected: 1 OK for status (200 SUCCEEDED) + 1 ERROR for /result (500).
+        assertEquals(2, httpEvents.size(),
+                "Expected 2 sandbox_http events (1 OK status + 1 ERROR result); got: " + httpEvents);
+
+        // Identify the ERROR event (the /result one).
+        String resultErrorEvent = httpEvents.stream()
+                .filter(e -> e.contains("\"status\":\"ERROR\""))
+                .findFirst()
+                .orElse(null);
+        assertTrue(resultErrorEvent != null,
+                "MUST have at least one ERROR event for the /result 500; got: " + httpEvents);
+        assertTrue(
+                resultErrorEvent.contains("\"endpoint\":\"http://sandbox/tasks/task%2Fslash/result\""),
+                "D15 red line 6: result failure telemetry endpoint MUST use encoded form "
+                        + "(http://sandbox/tasks/task%2Fslash/result); got: " + resultErrorEvent);
+        assertTrue(
+                resultErrorEvent.contains("\"errorCategory\":\"GET_RESULT_SANDBOX_HTTP_ERROR_CATEGORY_DOWNSTREAM_FAILURE\""),
+                "500 from /result MUST map to DOWNSTREAM_FAILURE category in telemetry; got: "
+                        + resultErrorEvent);
     }
 }
