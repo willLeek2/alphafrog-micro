@@ -88,8 +88,8 @@ public class ToolJobResumeService {
         }
         // READY 需要竞争新启动租约。
         if ("READY".equals(state)) return launchFromReady(runId, anchor);
-        // LAUNCHING 可能是正在运行，也可能是进程崩溃留下，需要活性/TTL 判断。
-        if ("LAUNCHING".equals(state)) return reenterLaunching(runId, anchor);
+        // LAUNCHING or ACCEPTED: may be running or crashed; check lease TTL + isActive.
+        if ("LAUNCHING".equals(state) || "ACCEPTED".equals(state)) return reenterLaunching(runId, anchor);
         return false;
     }
 
@@ -300,8 +300,9 @@ public class ToolJobResumeService {
         anchor.setPythonFailedRequestFingerprints(context.getPythonFailedRequestFingerprints());
         anchor.setResultConsumed(true);
         anchor.setResumeLauncherLeaseUntil(Instant.now().plusSeconds(leaseSeconds()));
-        // 同一条 CAS 持久化“结果已接受”并把 Run 从 RECEIVED 恢复为 EXECUTING。
-        // 旧 LAUNCHING anchor 继续保留，直到最终结果落稳或被下一次 PREPARING 精确替换。
+        // Advance resumeState to ACCEPTED in the same CAS that restores Run to EXECUTING.
+        // The old anchor is kept until the next durable checkpoint or final result.
+        anchor.setResumeState("ACCEPTED");
         boolean accepted = anchorService.acceptResumeHandoff(
                 runId, anchor, context.getResumeToken(), context.getResumeLeaseVersion(),
                 context.getResumeLauncherOwnerId(), leaseSeconds());
@@ -331,7 +332,9 @@ public class ToolJobResumeService {
             return true;
         }
         // 若恢复执行再次挂起，anchor 已换 state/token/version；这里必须返回 false 且绝不清理。
-        if (!"LAUNCHING".equals(anchor.getResumeState()) || !anchor.isResultConsumed()
+        // ACCEPTED is the post-handoff state (LAUNCHING was advanced in markHandoffAccepted).
+        if ((!"LAUNCHING".equals(anchor.getResumeState()) && !"ACCEPTED".equals(anchor.getResumeState()))
+                || !anchor.isResultConsumed()
                 || token == null || !token.equals(anchor.getResumeToken())
                 || version != anchor.getResumeLeaseVersion()
                 || ownerId == null || !ownerId.equals(anchor.getResumeLauncherOwnerId())) {

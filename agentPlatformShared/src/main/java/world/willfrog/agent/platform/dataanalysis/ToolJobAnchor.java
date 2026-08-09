@@ -1,6 +1,8 @@
 package world.willfrog.agent.platform.dataanalysis;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
@@ -146,6 +148,7 @@ public class ToolJobAnchor {
     // terminalEventEmitted 防止终态事件重复写入事件流。
     private boolean terminalEventEmitted;
     // resultConsumed 表示工作流已接受终态结果，anchor 才可安全清理。
+    @JsonProperty("resultConsumed")
     private boolean resultConsumed;
 
     // nextPollAt 决定 Redis due 索引中的下一次检查时间。
@@ -158,10 +161,40 @@ public class ToolJobAnchor {
     public static ToolJobAnchor fromJson(String json) {
         try {
             // 统一使用注册 Java Time 模块的 mapper，确保 Instant 可跨重启还原。
-            return MAPPER.readValue(json, ToolJobAnchor.class);
+            ToolJobAnchor anchor = MAPPER.readValue(json, ToolJobAnchor.class);
+            normalizeLegacyResultConsumed(anchor);
+            return anchor;
         } catch (JsonProcessingException e) {
             // 锚点损坏必须显式失败；静默构造空对象会绕过 CAS 身份保护。
             throw new IllegalArgumentException("Failed to parse ToolJobAnchor", e);
+        }
+    }
+
+    /**
+     * Normalize legacy dual-track data to the ACCEPTED single-track model.
+     *
+     * <p>Old data with {@code resultConsumed=true} but {@code resumeState} still
+     * LAUNCHING (or null) is upgraded to ACCEPTED. Contradictory READY+true
+     * fails closed rather than silently promoting.
+     *
+     * <p>This migration logic can be removed after 26Q3-W7.
+     */
+    private static void normalizeLegacyResultConsumed(ToolJobAnchor anchor) {
+        if (!anchor.resultConsumed) {
+            return; // nothing to normalize
+        }
+        if ("CONSUMED".equals(anchor.resumeState) || "ACCEPTED".equals(anchor.resumeState)) {
+            return; // already consistent
+        }
+        if ("LAUNCHING".equals(anchor.resumeState) || anchor.resumeState == null) {
+            // Legacy: handoff was accepted but resumeState wasn't advanced. Upgrade.
+            anchor.resumeState = "ACCEPTED";
+            return;
+        }
+        if ("READY".equals(anchor.resumeState)) {
+            // Contradictory: READY cannot have consumed result. Fail closed.
+            throw new IllegalArgumentException(
+                    "ToolJobAnchor has contradictory state: resumeState=READY but resultConsumed=true");
         }
     }
 
@@ -361,7 +394,8 @@ public class ToolJobAnchor {
     public boolean isTerminalEventEmitted() { return terminalEventEmitted; }
     public void setTerminalEventEmitted(boolean terminalEventEmitted) { this.terminalEventEmitted = terminalEventEmitted; }
 
-    public boolean isResultConsumed() { return resultConsumed; }
+    @JsonIgnore
+    public boolean isResultConsumed() { return "ACCEPTED".equals(resumeState) || "CONSUMED".equals(resumeState); }
     public void setResultConsumed(boolean resultConsumed) { this.resultConsumed = resultConsumed; }
 
     public Instant getNextPollAt() { return nextPollAt; }

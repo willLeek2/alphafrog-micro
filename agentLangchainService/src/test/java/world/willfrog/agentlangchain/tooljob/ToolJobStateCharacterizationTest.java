@@ -1,9 +1,7 @@
 package world.willfrog.agentlangchain.tooljob;
 
 import static org.assertj.core.api.Assertions.assertThat;
-
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Disabled;
@@ -14,16 +12,14 @@ import org.junit.jupiter.api.Test;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 
 /**
- * Characterization tests that lock current ToolJob resume state behavior
- * through real production seams (JSON roundtrip, launcher identity).
+ * Characterization tests for the D12 4-state resumeState model
+ * (READY → LAUNCHING → ACCEPTED → CONSUMED).
  *
- * Target: D12 resumeState single authority migration seam.
+ * Uses real production seams: ToolJobAnchor.fromJson normalization,
+ * isResultConsumed derivation from resumeState.
  */
-@DisplayName("ToolJob State Characterization (D12 Step 1)")
+@DisplayName("ToolJob State Characterization (D12 Step 3)")
 class ToolJobStateCharacterizationTest {
-
-    private static final ObjectMapper objectMapper = new ObjectMapper()
-            .registerModule(new JavaTimeModule());
 
     private ToolJobAnchor anchor;
 
@@ -33,140 +29,211 @@ class ToolJobStateCharacterizationTest {
     }
 
     // ------------------------------------------------------------------
-    // Dual-track: JSON roundtrip proves independent fields
+    // isResultConsumed derivation from 4-state resumeState
     // ------------------------------------------------------------------
 
     @Nested
-    @DisplayName("JSON roundtrip preserves dual-track independence")
-    class JsonRoundtrip {
+    @DisplayName("isResultConsumed derives from resumeState (single authority)")
+    class ResultConsumedDerivation {
 
         @Test
-        @DisplayName("roundtrip preserves resumeState=LAUNCHING + resultConsumed=true independently")
-        void roundtripPreservesBothFieldsIndependently() throws Exception {
+        @DisplayName("READY → isResultConsumed = false")
+        void readyIsNotConsumed() {
+            anchor.setResumeState("READY");
+            assertThat(anchor.isResultConsumed()).isFalse();
+        }
+
+        @Test
+        @DisplayName("LAUNCHING (not accepted) → isResultConsumed = false")
+        void launchingNotAcceptedIsNotConsumed() {
+            anchor.setResumeState("LAUNCHING");
+            assertThat(anchor.isResultConsumed()).isFalse();
+        }
+
+        @Test
+        @DisplayName("ACCEPTED → isResultConsumed = true")
+        void acceptedIsConsumed() {
+            anchor.setResumeState("ACCEPTED");
+            assertThat(anchor.isResultConsumed()).isTrue();
+        }
+
+        @Test
+        @DisplayName("CONSUMED → isResultConsumed = true")
+        void consumedIsConsumed() {
+            anchor.setResumeState("CONSUMED");
+            assertThat(anchor.isResultConsumed()).isTrue();
+        }
+
+        @Test
+        @DisplayName("null resumeState → isResultConsumed = false")
+        void nullResumeStateIsNotConsumed() {
+            assertThat(anchor.isResultConsumed()).isFalse();
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Legacy normalization via fromJson
+    // ------------------------------------------------------------------
+
+    @Nested
+    @DisplayName("Legacy normalization: fromJson upgrades old dual-track data")
+    class LegacyNormalization {
+
+        @Test
+        @DisplayName("old LAUNCHING + resultConsumed=true → normalized to ACCEPTED")
+        void legacyLaunchingWithResultConsumedTrue() {
             anchor.setOperationId("run-1:tc-1:1");
-            anchor.setTaskId("task-1");
             anchor.setResumeState("LAUNCHING");
             anchor.setResultConsumed(true);
 
-            String json = objectMapper.writeValueAsString(anchor);
-            ToolJobAnchor restored = objectMapper.readValue(json, ToolJobAnchor.class);
+            String json = anchor.toJson();
+            ToolJobAnchor restored = ToolJobAnchor.fromJson(json);
 
-            // Both fields survive JSON roundtrip independently
-            assertThat(restored.getResumeState()).isEqualTo("LAUNCHING");
+            // Normalized: resumeState upgraded from LAUNCHING to ACCEPTED
+            assertThat(restored.getResumeState()).isEqualTo("ACCEPTED");
             assertThat(restored.isResultConsumed()).isTrue();
-            // Proves: resultConsumed is a serialized field, not derived from resumeState
         }
 
         @Test
-        @DisplayName("roundtrip preserves resumeState=CONSUMED + resultConsumed=false (write-order gap)")
-        void roundtripPreservesWriteOrderGap() throws Exception {
+        @DisplayName("old null resumeState + resultConsumed=true → normalized to ACCEPTED")
+        void legacyNullResumeStateWithResultConsumedTrue() {
+            anchor.setOperationId("run-1:tc-1:1");
+            // resumeState is null (very old data)
+            anchor.setResultConsumed(true);
+
+            String json = anchor.toJson();
+            ToolJobAnchor restored = ToolJobAnchor.fromJson(json);
+
+            assertThat(restored.getResumeState()).isEqualTo("ACCEPTED");
+            assertThat(restored.isResultConsumed()).isTrue();
+        }
+
+        @Test
+        @DisplayName("contradictory READY + resultConsumed=true → fail-closed")
+        void contradictoryReadyAndConsumedFailsClosed() {
+            anchor.setOperationId("run-1:tc-1:1");
+            anchor.setResumeState("READY");
+            anchor.setResultConsumed(true);
+
+            String json = anchor.toJson();
+
+            assertThatThrownBy(() -> ToolJobAnchor.fromJson(json))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("contradictory");
+        }
+
+        @Test
+        @DisplayName("clean CONSUMED + resultConsumed=true → no change (already consistent)")
+        void cleanConsumedWithResultConsumedTrue() {
             anchor.setOperationId("run-1:tc-1:1");
             anchor.setResumeState("CONSUMED");
-            // resultConsumed NOT set — the dual-track gap
+            anchor.setResultConsumed(true);
 
-            String json = objectMapper.writeValueAsString(anchor);
-            ToolJobAnchor restored = objectMapper.readValue(json, ToolJobAnchor.class);
+            String json = anchor.toJson();
+            ToolJobAnchor restored = ToolJobAnchor.fromJson(json);
 
             assertThat(restored.getResumeState()).isEqualTo("CONSUMED");
-            assertThat(restored.isResultConsumed()).isFalse();
-            // Proves: the gap survives serialization — JSON has both fields at different values
+            assertThat(restored.isResultConsumed()).isTrue();
         }
 
         @Test
-        @DisplayName("roundtrip preserves full anchor identity (all CAS-relevant fields)")
-        void roundtripPreservesAnchorIdentity() throws Exception {
+        @DisplayName("clean ACCEPTED + resultConsumed=true → no change (already consistent)")
+        void cleanAcceptedWithResultConsumedTrue() {
+            anchor.setOperationId("run-1:tc-1:1");
+            anchor.setResumeState("ACCEPTED");
+            anchor.setResultConsumed(true);
+
+            String json = anchor.toJson();
+            ToolJobAnchor restored = ToolJobAnchor.fromJson(json);
+
+            assertThat(restored.getResumeState()).isEqualTo("ACCEPTED");
+            assertThat(restored.isResultConsumed()).isTrue();
+        }
+
+        @Test
+        @DisplayName("clean LAUNCHING without resultConsumed → stays LAUNCHING (not accepted)")
+        void cleanLaunchingWithoutResultConsumed() {
+            anchor.setOperationId("run-1:tc-1:1");
+            anchor.setResumeState("LAUNCHING");
+            // resultConsumed is false (default)
+
+            String json = anchor.toJson();
+            ToolJobAnchor restored = ToolJobAnchor.fromJson(json);
+
+            // Not normalized: LAUNCHING + resultConsumed=false is the normal non-accepted state
+            assertThat(restored.getResumeState()).isEqualTo("LAUNCHING");
+            assertThat(restored.isResultConsumed()).isFalse();
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Anchor identity fields preserved through roundtrip
+    // ------------------------------------------------------------------
+
+    @Nested
+    @DisplayName("Anchor identity fields survive JSON roundtrip")
+    class AnchorIdentityRoundtrip {
+
+        @Test
+        @DisplayName("full identity fields preserved through fromJson/toJson")
+        void fullIdentityPreserved() {
             anchor.setOperationId("run-1:tc-1:1");
             anchor.setTaskId("task-123");
             anchor.setToolCallId("tc-1");
             anchor.setAttempt(1);
-            anchor.setResumeState("READY");
+            anchor.setResumeState("LAUNCHING");
             anchor.setResumeToken("token-v1");
             anchor.setResumeLeaseVersion(5L);
             anchor.setResumeLauncherOwnerId("owner-a");
 
-            String json = objectMapper.writeValueAsString(anchor);
-            ToolJobAnchor restored = objectMapper.readValue(json, ToolJobAnchor.class);
+            ToolJobAnchor restored = ToolJobAnchor.fromJson(anchor.toJson());
 
             assertThat(restored.getOperationId()).isEqualTo("run-1:tc-1:1");
             assertThat(restored.getTaskId()).isEqualTo("task-123");
-            assertThat(restored.getResumeState()).isEqualTo("READY");
+            assertThat(restored.getResumeState()).isEqualTo("LAUNCHING");
             assertThat(restored.getResumeToken()).isEqualTo("token-v1");
             assertThat(restored.getResumeLeaseVersion()).isEqualTo(5L);
             assertThat(restored.getResumeLauncherOwnerId()).isEqualTo("owner-a");
-        }
-
-        @Test
-        @DisplayName("default anchor has null resumeState and false resultConsumed after roundtrip")
-        void defaultAnchorHasNullResumeStateAndFalseResultConsumed() throws Exception {
-            anchor.setOperationId("run-1:tc-1:1");
-
-            String json = objectMapper.writeValueAsString(anchor);
-            ToolJobAnchor restored = objectMapper.readValue(json, ToolJobAnchor.class);
-
-            assertThat(restored.getResumeState()).isNull();
             assertThat(restored.isResultConsumed()).isFalse();
         }
     }
 
     // ------------------------------------------------------------------
-    // Target: resultConsumed derived from resumeState (migration seam)
+    // Target migration seam (Step 3: activate after production changes)
     // ------------------------------------------------------------------
 
-    @Disabled("D12 Step 3 production migration contract — activate when resumeState getter is authoritative")
+    @Disabled("D12 Step 3: activate after ACCEPTED state passes full service-level tests")
     @Nested
-    @DisplayName("Target migration seam: resultConsumed derivation")
+    @DisplayName("Target migration seam: ACCEPTED state in production services")
     class TargetMigrationSeam {
 
-        /**
-         * Target derivation — resumeState is the single authority.
-         * In production, ToolJobAnchor.isResultConsumed() will use this logic.
-         */
-        private static boolean targetResultConsumed(ToolJobAnchor a) {
-            return "CONSUMED".equals(a.getResumeState());
+        @Test
+        @DisplayName("[contract] ACCEPTED takeover keeps ACCEPTED state, not rolled back to LAUNCHING")
+        void acceptedTakeoverKeepsAcceptedState() {
+            // Contract: tryResume for expired ACCEPTED must keep resumeState=ACCEPTED
+            // after takeover, so ToolJobResumeContext.resultConsumed derives to true.
+            // Tested via ToolJobResumeServiceTest after ACCEPTED is wired.
         }
 
         @Test
-        @DisplayName("target: resumeState=CONSUMED → resultConsumed=true (single truth)")
-        void consumedDerivesTrue() {
-            anchor.setResumeState("CONSUMED");
-
-            assertThat(targetResultConsumed(anchor)).isTrue();
-            // After D12: no independent setResultConsumed(true) needed
-        }
-
-        @Test
-        @DisplayName("target: resumeState=READY → resultConsumed=false")
-        void readyDerivesFalse() {
-            anchor.setResumeState("READY");
-
-            assertThat(targetResultConsumed(anchor)).isFalse();
-        }
-
-        @Test
-        @DisplayName("target: resumeState=LAUNCHING → resultConsumed=false")
-        void launchingDerivesFalse() {
+        @DisplayName("[contract] LAUNCHING without handoff is not consumed")
+        void launchingWithoutHandoffNotConsumed() {
             anchor.setResumeState("LAUNCHING");
-
-            assertThat(targetResultConsumed(anchor)).isFalse();
+            assertThat(anchor.isResultConsumed()).isFalse();
         }
 
         @Test
-        @DisplayName("target legacy compat: old resultConsumed=true field still readable during migration")
-        void legacyFieldStillReadableDuringMigration() throws Exception {
-            // Simulate old DB row: LAUNCHING + resultConsumed=true
-            anchor.setOperationId("run-1:tc-1:1");
-            anchor.setResumeState("LAUNCHING");
-            anchor.setResultConsumed(true);
+        @DisplayName("[contract] ACCEPTED is consumed (handoff was accepted)")
+        void acceptedIsConsumedContract() {
+            anchor.setResumeState("ACCEPTED");
+            assertThat(anchor.isResultConsumed()).isTrue();
+        }
 
-            String json = objectMapper.writeValueAsString(anchor);
-            ToolJobAnchor restored = objectMapper.readValue(json, ToolJobAnchor.class);
-
-            // Migration-period read: recognize old combination
-            boolean migrationResult = "CONSUMED".equals(restored.getResumeState())
-                    || restored.isResultConsumed();
-            assertThat(migrationResult).isTrue();
-            // After W7: remove the || restored.isResultConsumed() clause
+        @Test
+        @DisplayName("[contract] markHandoffAccepted CAS advances LAUNCHING → ACCEPTED")
+        void markHandoffAcceptedAdvancesToAccepted() {
+            // Contract: markHandoffAccepted must set resumeState=ACCEPTED
+            // in the same CAS, not just set resultConsumed=true.
         }
     }
-
 }
