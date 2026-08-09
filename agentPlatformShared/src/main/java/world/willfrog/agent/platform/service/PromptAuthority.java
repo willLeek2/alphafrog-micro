@@ -24,6 +24,7 @@ final class PromptAuthority {
 
     private static final Map<String, String> TEXT_FIELDS = Map.ofEntries(
             Map.entry("agentRunSystemPrompt", "prompts/agent/agent_run_system.txt"),
+            Map.entry("followUpSummarySystemPrompt", "prompts/agent/follow_up_summary_system.txt"),
             Map.entry("todoPlannerSystemPromptTemplate", "prompts/todo/todo_planner_system.txt"),
             Map.entry("workflowFinalSystemPrompt", "prompts/workflow/workflow_final_system.txt"),
             Map.entry("workflowTodoRecoverySystemPrompt", "prompts/workflow/workflow_todo_recovery_system.txt"),
@@ -149,6 +150,7 @@ final class PromptAuthority {
             return;
         }
         validateIfPresent("agentRunSystemPrompt", prompts.getAgentRunSystemPrompt(), source);
+        validateIfPresent("followUpSummarySystemPrompt", prompts.getFollowUpSummarySystemPrompt(), source);
         validateIfPresent("todoPlannerSystemPromptTemplate", prompts.getTodoPlannerSystemPromptTemplate(), source);
         validateIfPresent("workflowFinalSystemPrompt", prompts.getWorkflowFinalSystemPrompt(), source);
         validateIfPresent("workflowTodoRecoverySystemPrompt", prompts.getWorkflowTodoRecoverySystemPrompt(), source);
@@ -212,6 +214,7 @@ final class PromptAuthority {
 
         AgentLlmProperties.Prompts prompts = new AgentLlmProperties.Prompts();
         prompts.setAgentRunSystemPrompt(texts.get("agentRunSystemPrompt"));
+        prompts.setFollowUpSummarySystemPrompt(texts.get("followUpSummarySystemPrompt"));
         prompts.setTodoPlannerSystemPromptTemplate(texts.get("todoPlannerSystemPromptTemplate"));
         prompts.setWorkflowFinalSystemPrompt(texts.get("workflowFinalSystemPrompt"));
         prompts.setWorkflowTodoRecoverySystemPrompt(texts.get("workflowTodoRecoverySystemPrompt"));
@@ -295,6 +298,7 @@ final class PromptAuthority {
     private AgentLlmProperties.Prompts copyPrompts(AgentLlmProperties.Prompts source) {
         AgentLlmProperties.Prompts copy = new AgentLlmProperties.Prompts();
         copy.setAgentRunSystemPrompt(source.getAgentRunSystemPrompt());
+        copy.setFollowUpSummarySystemPrompt(source.getFollowUpSummarySystemPrompt());
         copy.setTodoPlannerSystemPromptTemplate(source.getTodoPlannerSystemPromptTemplate());
         copy.setWorkflowFinalSystemPrompt(source.getWorkflowFinalSystemPrompt());
         copy.setWorkflowTodoRecoverySystemPrompt(source.getWorkflowTodoRecoverySystemPrompt());

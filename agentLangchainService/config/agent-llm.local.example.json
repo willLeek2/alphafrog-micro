@@ -415,6 +415,7 @@
   },
   "prompts": {
     "agentRunSystemPrompt": "file:prompts/agent/agent_run_system.txt",
+    "followUpSummarySystemPrompt": "file:prompts/agent/follow_up_summary_system.txt",
     "todoPlannerSystemPromptTemplate": "file:prompts/todo/todo_planner_system.txt",
     "workflowFinalSystemPrompt": "file:prompts/workflow/workflow_final_system.txt",
     "workflowTodoRecoverySystemPrompt": "file:prompts/workflow/workflow_todo_recovery_system.txt",

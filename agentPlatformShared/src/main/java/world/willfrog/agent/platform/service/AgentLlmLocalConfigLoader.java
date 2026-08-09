@@ -356,6 +356,8 @@ public class AgentLlmLocalConfigLoader {
 
         resolveDirect("agentRunSystemPrompt", prompts::getAgentRunSystemPrompt,
                 prompts::setAgentRunSystemPrompt, explicitFields, baseDir, fileTimes, authority);
+        resolveDirect("followUpSummarySystemPrompt", prompts::getFollowUpSummarySystemPrompt,
+                prompts::setFollowUpSummarySystemPrompt, explicitFields, baseDir, fileTimes, authority);
         resolveDirect("todoPlannerSystemPromptTemplate", prompts::getTodoPlannerSystemPromptTemplate,
                 prompts::setTodoPlannerSystemPromptTemplate, explicitFields, baseDir, fileTimes, authority);
         resolveDirect("workflowFinalSystemPrompt", prompts::getWorkflowFinalSystemPrompt,

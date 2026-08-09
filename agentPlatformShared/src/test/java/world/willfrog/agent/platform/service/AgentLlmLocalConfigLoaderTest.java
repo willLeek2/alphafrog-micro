@@ -65,6 +65,38 @@ class AgentLlmLocalConfigLoaderTest {
     }
 
     @Test
+    void refresh_shouldRetainLastSnapshotWhenFollowUpSummaryProjectionDrifts() throws Exception {
+        Path promptsDir = tempDir.resolve("prompts").resolve("agent");
+        Files.createDirectories(promptsDir);
+        Path summaryPromptFile = promptsDir.resolve("follow_up_summary_system.txt");
+        String authorityText = authorityText("prompts/agent/follow_up_summary_system.txt");
+        Files.writeString(summaryPromptFile, authorityText, StandardCharsets.UTF_8);
+
+        Path configFile = tempDir.resolve("agent-llm.local.json");
+        Files.writeString(configFile, """
+                {
+                  "prompts": {
+                    "followUpSummarySystemPrompt": "file:prompts/agent/follow_up_summary_system.txt"
+                  }
+                }
+                """, StandardCharsets.UTF_8);
+
+        AgentLlmLocalConfigLoader loader = new AgentLlmLocalConfigLoader(new ObjectMapper());
+        ReflectionTestUtils.setField(loader, "configFile", configFile.toString());
+        loader.load();
+        assertEquals(authorityText,
+                loader.current().orElseThrow().getPrompts().getFollowUpSummarySystemPrompt());
+
+        Thread.sleep(5L);
+        Files.writeString(summaryPromptFile, "divergent follow-up summary prompt", StandardCharsets.UTF_8);
+        loader.refresh();
+
+        assertEquals(authorityText,
+                loader.current().orElseThrow().getPrompts().getFollowUpSummarySystemPrompt());
+        assertEquals(1L, loader.promptReloadFailureCount());
+    }
+
+    @Test
     void load_shouldParseNewExecutionJudgeAndSemanticPromptFields() throws Exception {
         Path promptsDir = tempDir.resolve("prompts").resolve("judge");
         Files.createDirectories(promptsDir);

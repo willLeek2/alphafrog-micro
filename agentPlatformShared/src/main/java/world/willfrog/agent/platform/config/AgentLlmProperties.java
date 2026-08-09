@@ -1976,6 +1976,8 @@ public class AgentLlmProperties {
 
     public static class Prompts {
         private String agentRunSystemPrompt;
+        /** 多轮 follow-up 历史摘要的稳定 System Prompt；正文来自 shared classpath 权威资源。 */
+        private String followUpSummarySystemPrompt;
         private String todoPlannerSystemPromptTemplate;
         private String workflowFinalSystemPrompt;
         private String workflowTodoRecoverySystemPrompt;
@@ -2038,6 +2040,14 @@ public class AgentLlmProperties {
 
         public void setAgentRunSystemPrompt(String agentRunSystemPrompt) {
             this.agentRunSystemPrompt = agentRunSystemPrompt;
+        }
+
+        public String getFollowUpSummarySystemPrompt() {
+            return followUpSummarySystemPrompt;
+        }
+
+        public void setFollowUpSummarySystemPrompt(String followUpSummarySystemPrompt) {
+            this.followUpSummarySystemPrompt = followUpSummarySystemPrompt;
         }
 
         public String getTodoPlannerSystemPromptTemplate() {

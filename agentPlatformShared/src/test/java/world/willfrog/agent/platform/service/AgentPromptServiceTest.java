@@ -116,6 +116,18 @@ class AgentPromptServiceTest {
     }
 
     @Test
+    void bundleDigest_shouldCoverFollowUpSummaryAuthority() {
+        String resource = "prompts/agent/follow_up_summary_system.txt";
+        PromptAuthority baseline = PromptAuthority.forTesting(PromptFileLoader::load);
+        PromptAuthority changed = PromptAuthority.forTesting(path -> resource.equals(path)
+                ? PromptFileLoader.load(path) + "\n测试漂移"
+                : PromptFileLoader.load(path));
+
+        assertNotEquals(baseline.bundleDigest(), changed.bundleDigest(),
+                "follow-up 摘要正文变化必须改变 Prompt bundle digest");
+    }
+
+    @Test
     void promptRendering_shouldUseFrozenRunReferenceDate() {
         PromptRunSelection current = service.snapshotPromptSelection("run-1", "user-1", "{}");
         AgentContext.setPromptRunSelection(new PromptRunSelection(
