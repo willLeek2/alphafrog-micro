@@ -57,7 +57,8 @@ public class AgentSseController {
         }
 
         SseEmitter emitter = new SseEmitter(-1L);
-        sseService.connect(runId, caller.userId(), resolveResumeAfterSeq(afterSeq, lastEventId), emitter);
+        sseService.connect(runId, caller.userId(), caller.admin(),
+                resolveResumeAfterSeq(afterSeq, lastEventId), emitter);
         return emitter;
     }
 

@@ -886,6 +886,24 @@ class AgentControllerTest {
     }
 
     @Test
+    void statusExposesActualLatestSeqInsteadOfEventCountAndNormalizesAlias() {
+        when(agentDubboService.getStatus(any())).thenReturn(
+                AgentRunStatusMessage.newBuilder().setId("run-1").setStatus(" timed_out ")
+                        .setEventCount(2).build());
+        when(agentDubboService.listEvents(any(ListAgentRunEventsRequest.class))).thenReturn(
+                ListAgentRunEventsResponse.newBuilder()
+                        .addItems(AgentRunEventMessage.newBuilder().setRunId("run-1").setSeq(7).build())
+                        .build());
+
+        var response = controller.status(authentication, "run-1");
+
+        assertEquals(ResponseCode.SUCCESS.getCode(), response.getCode());
+        assertEquals("EXPIRED", response.getData().status());
+        assertEquals(2, response.getData().eventCount());
+        assertEquals(7, response.getData().lastSeq());
+    }
+
+    @Test
     @SuppressWarnings("unchecked")
     void nonAdminRunDetailPlanOmitsOrdinaryPlannerReasoningAndToolParameters() {
         setNonAdmin();
@@ -915,7 +933,12 @@ class AgentControllerTest {
         var response = controller.events(authentication, "run-1", 0, 20);
 
         assertEquals(ResponseCode.SUCCESS.getCode(), response.getCode());
-        assertEquals(null, response.getData().items().get(0).payload());
+        var event = response.getData().items().get(0);
+        assertEquals(1, event.schemaVersion());
+        assertEquals("agent.event", event.type());
+        assertEquals(true, event.durable());
+        assertEquals("INVALID_JSON", event.payload().get("value"));
+        assertFalse(event.payload().toString().contains("raw-secret"));
     }
 
     @Test

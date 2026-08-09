@@ -51,6 +51,7 @@ import world.willfrog.alphafrogmicro.agent.idl.SendAgentMessageRequest;
 import world.willfrog.alphafrogmicro.agent.idl.SendAgentMessageResponse;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentMessagesRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentMessagesResponse;
+import world.willfrog.alphafrogmicro.common.agent.AgentRunTerminalStatus;
 import world.willfrog.alphafrogmicro.common.dto.ResponseCode;
 import world.willfrog.alphafrogmicro.common.dto.ResponseWrapper;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentRunCreateRequest;
@@ -83,6 +84,7 @@ import world.willfrog.alphafrogmicro.frontend.model.agent.TimelineResponse;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentAuthSupport;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentCallDetailBlobReader;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentCallDetailMapper;
+import world.willfrog.alphafrogmicro.frontend.service.agent.AgentEventEnvelopeMapper;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentExternalObservabilityMapper;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentRawTraceDetailMapper;
 import world.willfrog.alphafrogmicro.frontend.service.agent.AgentRunResultCacheService;
@@ -450,14 +452,7 @@ public class AgentController {
             );
             List<AgentRunEventResponse> items = new ArrayList<>();
             for (var e : resp.getItemsList()) {
-                items.add(new AgentRunEventResponse(
-                        e.getId(),
-                        e.getRunId(),
-                        e.getSeq(),
-                        e.getEventType(),
-                        parseOutboundJson(e.getPayloadJson(), AgentExternalObservabilityMapper.View.EVENT),
-                        e.getCreatedAt()
-                ));
+                items.add(AgentEventEnvelopeMapper.fromEventMessage(objectMapper, e));
             }
             return ResponseWrapper.success(new AgentRunEventsPageResponse(items, resp.getNextAfterSeq(), resp.getHasMore()));
         } catch (RpcException e) {
@@ -700,7 +695,8 @@ public class AgentController {
             return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
         }
         try {
-            AgentRunStatusMessage status = resolveService().getStatus(
+            AgentDubboService service = resolveService();
+            AgentRunStatusMessage status = service.getStatus(
                     GetAgentRunStatusRequest.newBuilder()
                             .setUserId(userId)
                             .setId(runId)
@@ -709,7 +705,7 @@ public class AgentController {
             boolean admin = caller.admin();
             return ResponseWrapper.success(new AgentRunStatusResponse(
                     status.getId(),
-                    emptyToNull(status.getStatus()),
+                    AgentRunTerminalStatus.normalize(status.getStatus()),
                     emptyToNull(status.getPhase()),
                     emptyToNull(status.getCurrentTool()),
                     emptyToNull(status.getLastEventType()),
@@ -728,6 +724,7 @@ public class AgentController {
                     status.getObservabilityFullAvailable(),
                     Math.max(0, status.getTotalCreditsConsumed()),
                     status.getEventCount() > 0 ? status.getEventCount() : null,
+                    latestEventSeq(service, userId, runId),
                     status.getStartedAtMs() > 0 ? status.getStartedAtMs() : null,
                     status.getCompletedAtMs() > 0 ? status.getCompletedAtMs() : null,
                     status.getElapsedMs() > 0 ? status.getElapsedMs() : null
@@ -736,6 +733,30 @@ public class AgentController {
             return handleRpcError(e, "查询 agent status");
         } catch (Exception e) {
             return handleError(e, "查询 agent status");
+        }
+    }
+
+    /** REST 恢复只使用实际 durable seq，禁止用 eventCount 推算游标。 */
+    private Integer latestEventSeq(AgentDubboService service, String userId, String runId) {
+        try {
+            ListAgentRunEventsResponse latest = service.listEvents(
+                    ListAgentRunEventsRequest.newBuilder()
+                            .setUserId(userId)
+                            .setId(runId)
+                            .setLatest(true)
+                            .setLimit(1)
+                            .build());
+            if (latest == null) {
+                return null;
+            }
+            int maxSeq = 0;
+            for (var event : latest.getItemsList()) {
+                maxSeq = Math.max(maxSeq, event.getSeq());
+            }
+            return maxSeq > 0 ? maxSeq : null;
+        } catch (Exception e) {
+            log.debug("Unable to load latest durable seq for runId={}: {}", runId, e.getMessage());
+            return null;
         }
     }
 
