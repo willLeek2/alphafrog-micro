@@ -1,12 +1,16 @@
 package world.willfrog.sandbox.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.dubbo.rpc.RpcContext;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.test.util.ReflectionTestUtils;
 import org.springframework.test.web.client.MockRestServiceServer;
 import org.springframework.web.client.RestTemplate;
+import world.willfrog.agent.platform.debug.DebugObservabilityRpcKeys;
 import world.willfrog.alphafrogmicro.sandbox.idl.ExecuteRequest;
 import world.willfrog.alphafrogmicro.sandbox.idl.ExecuteResponse;
 import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskByOperationIdRequest;
@@ -17,6 +21,11 @@ import world.willfrog.alphafrogmicro.sandbox.idl.GetTaskResultRequest;
 import world.willfrog.alphafrogmicro.sandbox.idl.TaskResultResponse;
 import world.willfrog.alphafrogmicro.sandbox.idl.SandboxErrorDetail;
 import world.willfrog.alphafrogmicro.sandbox.idl.SandboxHttpErrorCategory;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.List;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -42,12 +51,44 @@ import static org.springframework.test.web.client.response.MockRestResponseCreat
  */
 class PythonSandboxGatewayServiceImplD13Test {
 
+    // 260809-26Q3-stage1-w3 D13 round-2 #3 (Cindy 1b29792d #3): JSONL telemetry
+    // assertions need a real sessionDir + RpcContext attachments so DebugObservabilityJsonlAppender
+    // writes sandbox-<runId>.jsonl on the temp dir; clear attachments after each test so the
+    // thread-local does not leak between cases.
+    @TempDir
+    Path sessionDir;
+
+    @AfterEach
+    void clearRpcContext() {
+        try {
+            RpcContext.getServiceContext().clearAttachments();
+        } catch (Exception ignored) {
+            // defensive: RPC context cleanup must not fail the test
+        }
+    }
+
     private static PythonSandboxGatewayServiceImpl newGateway(RestTemplate restTemplate) {
         // D13 dual RestTemplate constructor. Tests use the same instance for both beans;
         // MockRestServiceServer intercepts at the request level regardless of which bean
         // issued the call.
         PythonSandboxGatewayServiceImpl gateway =
                 new PythonSandboxGatewayServiceImpl(restTemplate, restTemplate, new ObjectMapper());
+        ReflectionTestUtils.setField(gateway, "sandboxUrl", "http://sandbox");
+        return gateway;
+    }
+
+    // 260809-26Q3-stage1-w3 D13 round-2 #3 (Cindy 1b29792d #3 + 179de723):
+    // distinct-client helper. Long + short client each get their own MockRestServiceServer
+    // so tests can prove which bean a given entry point routes through. Per Cindy 179de723:
+    //   - createTask: long only (1 POST on long, 0 on short)
+    //   - getTaskStatus: short only (1 GET on short, 0 on long)
+    //   - getTaskByOperationId: short only (1 GET on short, 0 on long)
+    //   - getTaskResult: short for status + long for result (1 GET each)
+    private static PythonSandboxGatewayServiceImpl newGatewayDistinctClients(
+            RestTemplate longClient, RestTemplate shortClient
+    ) {
+        PythonSandboxGatewayServiceImpl gateway =
+                new PythonSandboxGatewayServiceImpl(longClient, shortClient, new ObjectMapper());
         ReflectionTestUtils.setField(gateway, "sandboxUrl", "http://sandbox");
         return gateway;
     }
@@ -757,5 +798,461 @@ class PythonSandboxGatewayServiceImplD13Test {
                 .setTimeoutSeconds(Double.MAX_VALUE)
                 .build();
         assertEquals(Long.MAX_VALUE, PythonSandboxGatewayServiceImpl.computeEffectiveTimeoutMillis(huge));
+    }
+
+    // === Round-2 MUST-FIX #2 (Cindy 1b29792d #2 + codex aa8987d1): effective-timeout
+    //     precision + NaN/Infinity/negative reject + zero-margin reject ===
+
+    @Test
+    void computeEffectiveTimeoutMillisRoundsUpFractionalSeconds() {
+        // codex aa8987d1: fractional seconds MUST conservative-round (ceil) so max+ε
+        // doesn't slip through as exactly max. 1800.0009s → 1800000.9ms → ceil → 1800001ms.
+        ExecuteRequest fractional = ExecuteRequest.newBuilder()
+                .setTimeoutSeconds(1800.0009)
+                .build();
+        assertEquals(1800001L,
+                PythonSandboxGatewayServiceImpl.computeEffectiveTimeoutMillis(fractional),
+                "fractional seconds MUST ceil up so max+ε rejects, not truncate to max");
+    }
+
+    @Test
+    void computeEffectiveTimeoutMillisReturnsSentinelForNaNSeconds() {
+        ExecuteRequest nanSeconds = ExecuteRequest.newBuilder()
+                .setTimeoutSeconds(Double.NaN)
+                .build();
+        assertEquals(-1L,
+                PythonSandboxGatewayServiceImpl.computeEffectiveTimeoutMillis(nanSeconds),
+                "NaN seconds MUST signal invalid (-1) so caller rejects, not silently numericize");
+    }
+
+    @Test
+    void computeEffectiveTimeoutMillisReturnsSentinelForInfiniteSeconds() {
+        ExecuteRequest infSeconds = ExecuteRequest.newBuilder()
+                .setTimeoutSeconds(Double.POSITIVE_INFINITY)
+                .build();
+        assertEquals(-1L,
+                PythonSandboxGatewayServiceImpl.computeEffectiveTimeoutMillis(infSeconds),
+                "Infinity seconds MUST signal invalid (-1) so caller rejects");
+    }
+
+    @Test
+    void computeEffectiveTimeoutMillisReturnsSentinelForNegativeSeconds() {
+        ExecuteRequest negSeconds = ExecuteRequest.newBuilder()
+                .setTimeoutSeconds(-1.0)
+                .build();
+        assertEquals(-1L,
+                PythonSandboxGatewayServiceImpl.computeEffectiveTimeoutMillis(negSeconds),
+                "negative seconds MUST signal invalid (-1), not silently drop to zero");
+    }
+
+    @Test
+    void computeEffectiveTimeoutMillisReturnsSentinelForNegativeMillis() {
+        ExecuteRequest negMillis = ExecuteRequest.newBuilder()
+                .setTimeoutMillis(-1L)
+                .build();
+        assertEquals(-1L,
+                PythonSandboxGatewayServiceImpl.computeEffectiveTimeoutMillis(negMillis),
+                "negative timeoutMillis MUST signal invalid (-1), not silently drop to zero");
+    }
+
+    @Test
+    void computeEffectiveTimeoutMillisPreservesExactZeroAsProtoAbsent() {
+        // codex aa8987d1: only exact 0 retains proto3 default/absent semantics — no reject.
+        ExecuteRequest zeroSeconds = ExecuteRequest.newBuilder().build();
+        assertEquals(0L,
+                PythonSandboxGatewayServiceImpl.computeEffectiveTimeoutMillis(zeroSeconds));
+    }
+
+    @Test
+    void createTaskRejectsNaNSessionTimeoutAsInvalidArgumentWithAbsentDownstreamStatus() {
+        // Cindy 1b29792d #2 + codex aa8987d1: NaN/Infinity/negative MUST local-reject as
+        // INVALID_ARGUMENT with downstream_http_status absent (no downstream call made).
+        RestTemplate restTemplate = new RestTemplate();
+        MockRestServiceServer.createServer(restTemplate); // intercept would fail if hit
+        PythonSandboxGatewayServiceImpl gateway = newGateway(restTemplate);
+
+        ExecuteResponse response = gateway.createTask(ExecuteRequest.newBuilder()
+                .setCode("print(1)")
+                .setTimeoutSeconds(Double.NaN)
+                .build());
+
+        assertTrue(response.hasErrorDetail());
+        assertEquals(
+                SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_INVALID_ARGUMENT,
+                response.getErrorDetail().getCategory()
+        );
+        assertFalse(response.getErrorDetail().hasDownstreamHttpStatus(),
+                "NaN reject MUST NOT fabricate downstream_http_status");
+        assertFalse(response.getError().isBlank());
+    }
+
+    @Test
+    void createTaskRejectsInfinityTimeoutAsInvalidArgumentWithAbsentDownstreamStatus() {
+        RestTemplate restTemplate = new RestTemplate();
+        MockRestServiceServer.createServer(restTemplate);
+        PythonSandboxGatewayServiceImpl gateway = newGateway(restTemplate);
+
+        ExecuteResponse response = gateway.createTask(ExecuteRequest.newBuilder()
+                .setCode("print(1)")
+                .setTimeoutSeconds(Double.POSITIVE_INFINITY)
+                .build());
+
+        assertTrue(response.hasErrorDetail());
+        assertEquals(
+                SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_INVALID_ARGUMENT,
+                response.getErrorDetail().getCategory()
+        );
+        assertFalse(response.getErrorDetail().hasDownstreamHttpStatus());
+    }
+
+    @Test
+    void createTaskRejectsNegativeTimeoutSecondsAsInvalidArgumentWithAbsentDownstreamStatus() {
+        RestTemplate restTemplate = new RestTemplate();
+        MockRestServiceServer.createServer(restTemplate);
+        PythonSandboxGatewayServiceImpl gateway = newGateway(restTemplate);
+
+        ExecuteResponse response = gateway.createTask(ExecuteRequest.newBuilder()
+                .setCode("print(1)")
+                .setTimeoutSeconds(-0.001) // tiny negative
+                .build());
+
+        assertTrue(response.hasErrorDetail());
+        assertEquals(
+                SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_INVALID_ARGUMENT,
+                response.getErrorDetail().getCategory()
+        );
+        assertFalse(response.getErrorDetail().hasDownstreamHttpStatus());
+    }
+
+    @Test
+    void createTaskRejectsNegativeTimeoutMillisAsInvalidArgumentWithAbsentDownstreamStatus() {
+        RestTemplate restTemplate = new RestTemplate();
+        MockRestServiceServer.createServer(restTemplate);
+        PythonSandboxGatewayServiceImpl gateway = newGateway(restTemplate);
+
+        ExecuteResponse response = gateway.createTask(ExecuteRequest.newBuilder()
+                .setCode("print(1)")
+                .setTimeoutMillis(-1L)
+                .build());
+
+        assertTrue(response.hasErrorDetail());
+        assertEquals(
+                SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_INVALID_ARGUMENT,
+                response.getErrorDetail().getCategory()
+        );
+        assertFalse(response.getErrorDetail().hasDownstreamHttpStatus());
+    }
+
+    @Test
+    void createTaskRejectsFractionalSecondsAtMaxPlusEpsilon() {
+        // Cindy 1b29792d #2 + codex aa8987d1: 1800.0009s effective = ceil(1800000.9) = 1800001ms
+        // > max 1800000ms → local reject. Verifies ceil precision is wired end-to-end.
+        RestTemplate restTemplate = new RestTemplate();
+        MockRestServiceServer.createServer(restTemplate);
+        PythonSandboxGatewayServiceImpl gateway = newGateway(restTemplate);
+
+        ExecuteResponse response = gateway.createTask(ExecuteRequest.newBuilder()
+                .setCode("print(1)")
+                .setTimeoutSeconds(1800.0009)
+                .build());
+
+        assertTrue(response.hasErrorDetail());
+        assertEquals(
+                SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_INVALID_ARGUMENT,
+                response.getErrorDetail().getCategory()
+        );
+        assertFalse(response.getErrorDetail().hasDownstreamHttpStatus());
+        assertFalse(response.getError().isBlank());
+    }
+
+    @Test
+    void createTaskAcceptsExactMaxEffectiveTimeout() {
+        // codex aa8987d1: exactly max (1800.0s, no fractional) MUST NOT trigger reject.
+        // Sets both legacy seconds and canonical millis to exactly max for completeness.
+        RestTemplate restTemplate = new RestTemplate();
+        MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
+        PythonSandboxGatewayServiceImpl gateway = newGateway(restTemplate);
+
+        server.expect(once(), requestTo("http://sandbox/tasks"))
+                .andRespond(withSuccess("{\"task_id\":\"t-1\",\"status\":\"QUEUED\"}",
+                        MediaType.APPLICATION_JSON));
+
+        ExecuteResponse response = gateway.createTask(ExecuteRequest.newBuilder()
+                .setCode("print(1)")
+                .setTimeoutSeconds(1800.0)
+                .setTimeoutMillis(1800000L)
+                .build());
+
+        server.verify();
+        assertEquals("t-1", response.getTaskId(),
+                "exactly-max effective timeout MUST be forwarded to downstream, not local-rejected");
+    }
+
+    @Test
+    void restTemplateConfigRejectsZeroMargin() {
+        // Cindy 1b29792d #2 + codex 3d78edba: margin MUST be strictly positive — zero margin
+        // would silently allow long-read == max-task-timeout, defeating the budget proof
+        // (long-read needs to cover max + queue/prepare overhead).
+        assertTimeoutValidationFails(5000, 10000, 2100000, 1800000, 0,
+                "queue-prepare-margin-millis");
+    }
+
+    @Test
+    void restTemplateConfigRejectsNegativeMargin() {
+        assertTimeoutValidationFails(5000, 10000, 2100000, 1800000, -1,
+                "queue-prepare-margin-millis");
+    }
+
+    @Test
+    void restTemplateConfigRejectsMaxPlusMarginOverflow() {
+        // Cindy 6a6e6158 + codex 3d78edba: max + margin addition MUST be overflow-safe.
+        // max=Long.MAX_VALUE, margin=1 → overflow → reject without computing wrapped sum.
+        IllegalArgumentException ex = org.junit.jupiter.api.Assertions.assertThrows(
+                IllegalArgumentException.class,
+                () -> world.willfrog.sandbox.config.RestTemplateConfig.validateTimeoutConfiguration(
+                        5000, 10000, Long.MAX_VALUE, Long.MAX_VALUE, 1L)
+        );
+        // long=MAX_VALUE passes short<long check (MAX > 10000) and the per-value positive
+        // checks; the overflow guard is what trips first. Either "overflow" or
+        // "must be > 0" is fine here — but the overflow branch must execute before any
+        // wrapped-sum comparison would have produced a wrong answer.
+        assertTrue(ex.getMessage().contains("overflow")
+                        || ex.getMessage().contains("long-read-timeout-millis"),
+                "max+margin overflow MUST reject via overflow guard, not silently compute; got: "
+                        + ex.getMessage());
+    }
+
+    // === Round-2 MUST-FIX #3a (Cindy 1b29792d #3 + 179de723): distinct-client tests ===
+
+    @Test
+    void createTaskUsesOnlyLongHttpClient() {
+        // Per Cindy 179de723: createTask is long-path only. The short client MUST receive
+        // zero requests; if any code path accidentally routes through shortHttpClient, the
+        // short server's strict mock would fail.
+        RestTemplate longClient = new RestTemplate();
+        RestTemplate shortClient = new RestTemplate();
+        MockRestServiceServer longServer = MockRestServiceServer.createServer(longClient);
+        // createClient's mock server is strict by default — any unexpected request throws.
+        MockRestServiceServer.createServer(shortClient);
+
+        PythonSandboxGatewayServiceImpl gateway = newGatewayDistinctClients(longClient, shortClient);
+
+        longServer.expect(once(), requestTo("http://sandbox/tasks"))
+                .andRespond(withSuccess("{\"task_id\":\"t-1\",\"status\":\"QUEUED\"}",
+                        MediaType.APPLICATION_JSON));
+
+        ExecuteResponse response = gateway.createTask(buildMinimalCreateRequest());
+
+        longServer.verify();
+        assertEquals("t-1", response.getTaskId());
+    }
+
+    @Test
+    void getTaskStatusUsesOnlyShortHttpClient() {
+        // Per Cindy 179de723: getTaskStatus is short-query only.
+        RestTemplate longClient = new RestTemplate();
+        RestTemplate shortClient = new RestTemplate();
+        MockRestServiceServer shortServer = MockRestServiceServer.createServer(shortClient);
+        MockRestServiceServer.createServer(longClient); // strict: any long request throws
+
+        PythonSandboxGatewayServiceImpl gateway = newGatewayDistinctClients(longClient, shortClient);
+
+        shortServer.expect(once(), requestTo("http://sandbox/tasks/task-1"))
+                .andRespond(withSuccess(
+                        "{\"task_id\":\"task-1\",\"status\":\"SUCCEEDED\"}",
+                        MediaType.APPLICATION_JSON));
+
+        TaskStatusResponse response = gateway.getTaskStatus(
+                GetTaskStatusRequest.newBuilder().setTaskId("task-1").build());
+
+        shortServer.verify();
+        assertEquals("SUCCEEDED", response.getStatus());
+    }
+
+    @Test
+    void getTaskByOperationIdUsesOnlyShortHttpClient() {
+        // Per Cindy 179de723: getTaskByOperationId is short-query only.
+        RestTemplate longClient = new RestTemplate();
+        RestTemplate shortClient = new RestTemplate();
+        MockRestServiceServer shortServer = MockRestServiceServer.createServer(shortClient);
+        MockRestServiceServer.createServer(longClient);
+
+        PythonSandboxGatewayServiceImpl gateway = newGatewayDistinctClients(longClient, shortClient);
+
+        shortServer.expect(once(), requestTo("http://sandbox/operations/op-1"))
+                .andRespond(withSuccess("{\"found\":true,\"task_id\":\"t-1\"}",
+                        MediaType.APPLICATION_JSON));
+
+        GetTaskByOperationIdResponse response = gateway.getTaskByOperationId(
+                GetTaskByOperationIdRequest.newBuilder().setOperationId("op-1").build());
+
+        shortServer.verify();
+        assertTrue(response.getFound());
+    }
+
+    @Test
+    void getTaskResultUsesShortForStatusAndLongForResult() {
+        // Per Cindy 179de723: getTaskResult routes the status pre-check through SHORT
+        // (1 GET /tasks/{id}) and the result fetch through LONG (1 GET /tasks/{id}/result).
+        // Verifies per-entry layering — pre-check is NOT silently promoted to long, and
+        // result is NOT silently demoted to short.
+        RestTemplate longClient = new RestTemplate();
+        RestTemplate shortClient = new RestTemplate();
+        MockRestServiceServer longServer = MockRestServiceServer.createServer(longClient);
+        MockRestServiceServer shortServer = MockRestServiceServer.createServer(shortClient);
+
+        PythonSandboxGatewayServiceImpl gateway = newGatewayDistinctClients(longClient, shortClient);
+
+        shortServer.expect(once(), requestTo("http://sandbox/tasks/task-1"))
+                .andRespond(withSuccess(
+                        "{\"task_id\":\"task-1\",\"status\":\"SUCCEEDED\"}",
+                        MediaType.APPLICATION_JSON));
+        longServer.expect(once(), requestTo("http://sandbox/tasks/task-1/result"))
+                .andRespond(withSuccess(
+                        "{\"exit_code\":0,\"stdout\":\"ok\"}",
+                        MediaType.APPLICATION_JSON));
+
+        TaskResultResponse response = gateway.getTaskResult(
+                GetTaskResultRequest.newBuilder().setTaskId("task-1").build());
+
+        longServer.verify();
+        shortServer.verify();
+        assertEquals("SUCCEEDED", response.getStatus());
+        assertEquals(0, response.getExitCode());
+    }
+
+    // === Round-2 MUST-FIX #3b (Cindy 1b29792d #3): JSONL telemetry assertions ===
+
+    private void bindSession(String runId, String sessionId) {
+        // Bind RpcContext attachments so DebugObservabilityJsonlAppender writes to the
+        // @TempDir-backed sessionDir. Verifies the emitSandboxHttp path actually appends
+        // one final sandbox_http event per entry, with status + category matching the
+        // behavioral response shape.
+        RpcContext ctx = RpcContext.getServiceContext();
+        ctx.setAttachment(DebugObservabilityRpcKeys.SESSION_DIR, sessionDir.toString());
+        ctx.setAttachment(DebugObservabilityRpcKeys.RUN_ID, runId);
+        ctx.setAttachment(DebugObservabilityRpcKeys.SESSION_ID, sessionId);
+    }
+
+    private static List<String> readSandboxHttpEvents(Path sessionDir, String runId) throws Exception {
+        Path runFile = sessionDir.resolve("sandbox-" + runId + ".jsonl");
+        try (Stream<String> lines = Files.lines(runFile)) {
+            return lines.filter(line -> line.contains("\"eventType\":\"sandbox_http\"")).toList();
+        }
+    }
+
+    @Test
+    void getTaskStatus404EmitsSingleErrorTelemetryWithFrozenCategory() throws Exception {
+        // Per Cindy 1b29792d #3: 404 path MUST emit exactly ONE final sandbox_http event
+        // with status=ERROR + category GET_STATUS_..._NOT_FOUND (not OK).
+        RestTemplate restTemplate = new RestTemplate();
+        MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
+        PythonSandboxGatewayServiceImpl gateway = newGateway(restTemplate);
+
+        bindSession("run-404", "sess-404");
+        server.expect(once(), requestTo("http://sandbox/tasks/task-missing"))
+                .andRespond(withStatus(HttpStatus.NOT_FOUND));
+
+        TaskStatusResponse response = gateway.getTaskStatus(
+                GetTaskStatusRequest.newBuilder().setTaskId("task-missing").build());
+
+        server.verify();
+        assertEquals(
+                SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_NOT_FOUND,
+                response.getErrorDetail().getCategory());
+
+        List<String> httpEvents = readSandboxHttpEvents(sessionDir, "run-404");
+        assertEquals(1, httpEvents.size(),
+                "404 MUST emit exactly one final sandbox_http event; got: " + httpEvents);
+        String event = httpEvents.get(0);
+        assertTrue(event.contains("\"status\":\"ERROR\""), "404 event status MUST be ERROR; got: " + event);
+        assertTrue(event.contains("\"errorCategory\":\"GET_STATUS_SANDBOX_HTTP_ERROR_CATEGORY_NOT_FOUND\""),
+                "404 event errorCategory MUST be frozen NOT_FOUND label; got: " + event);
+    }
+
+    @Test
+    void getTaskStatus204EmptyBodyEmitsSingleErrorTelemetryWithUnspecified() throws Exception {
+        // Per Cindy 1b29792d #3 + MUST-FIX #4: 204 empty body MUST emit ERROR + UNSPECIFIED
+        // (NOT OK), with the ACTUAL 204 in the event (not hardcoded 200).
+        RestTemplate restTemplate = new RestTemplate();
+        MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
+        PythonSandboxGatewayServiceImpl gateway = newGateway(restTemplate);
+
+        bindSession("run-204", "sess-204");
+        server.expect(once(), requestTo("http://sandbox/tasks/task-1"))
+                .andRespond(withStatus(HttpStatus.NO_CONTENT));
+
+        TaskStatusResponse response = gateway.getTaskStatus(
+                GetTaskStatusRequest.newBuilder().setTaskId("task-1").build());
+
+        server.verify();
+        assertEquals(204, response.getErrorDetail().getDownstreamHttpStatus());
+
+        List<String> httpEvents = readSandboxHttpEvents(sessionDir, "run-204");
+        assertEquals(1, httpEvents.size(),
+                "204 empty body MUST emit exactly one final sandbox_http event; got: " + httpEvents);
+        String event = httpEvents.get(0);
+        assertTrue(event.contains("\"status\":\"ERROR\""));
+        assertTrue(event.contains("\"errorCategory\":\"GET_STATUS_SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED\""));
+        assertTrue(event.contains("\"httpStatus\":204"),
+                "event MUST carry the ACTUAL downstream status (204), not hardcoded 200; got: " + event);
+    }
+
+    @Test
+    void getTaskByOperationIdAuthoritativeAbsenceEmitsSingleOkTelemetry() throws Exception {
+        // Per Cindy 1b29792d #3: authoritative absence (found=false + blank error +
+        // absent detail) MUST emit exactly ONE OK event (no ERROR line).
+        RestTemplate restTemplate = new RestTemplate();
+        MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
+        PythonSandboxGatewayServiceImpl gateway = newGateway(restTemplate);
+
+        bindSession("run-abs", "sess-abs");
+        server.expect(once(), requestTo("http://sandbox/operations/run-1:call-1:1"))
+                .andRespond(withSuccess("{\"found\":false}", MediaType.APPLICATION_JSON));
+
+        GetTaskByOperationIdResponse response = gateway.getTaskByOperationId(
+                GetTaskByOperationIdRequest.newBuilder()
+                        .setOperationId("run-1:call-1:1")
+                        .build());
+
+        server.verify();
+        assertFalse(response.hasErrorDetail(), "authoritative absence MUST NOT surface error_detail");
+
+        List<String> httpEvents = readSandboxHttpEvents(sessionDir, "run-abs");
+        assertEquals(1, httpEvents.size(),
+                "authoritative absence MUST emit exactly one OK sandbox_http event; got: " + httpEvents);
+        String event = httpEvents.get(0);
+        assertTrue(event.contains("\"status\":\"OK\""), "authoritative absence event status MUST be OK");
+        assertFalse(event.contains("errorCategory"),
+                "OK event MUST NOT carry errorCategory; got: " + event);
+    }
+
+    @Test
+    void getTaskByOperationIdBodyErrorEmitsSingleErrorTelemetryWithUnspecified() throws Exception {
+        // Per Cindy 1b29792d #3: found=true + non-blank body error MUST emit ERROR + UNSPECIFIED
+        // (single event), proving the dual-write (typed detail + telemetry ERROR) is consistent.
+        RestTemplate restTemplate = new RestTemplate();
+        MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
+        PythonSandboxGatewayServiceImpl gateway = newGateway(restTemplate);
+
+        bindSession("run-berr", "sess-berr");
+        server.expect(once(), requestTo("http://sandbox/operations/run-1"))
+                .andRespond(withSuccess(
+                        "{\"found\":true,\"task_id\":\"t-x\",\"error\":\"partial state\"}",
+                        MediaType.APPLICATION_JSON));
+
+        GetTaskByOperationIdResponse response = gateway.getTaskByOperationId(
+                GetTaskByOperationIdRequest.newBuilder().setOperationId("run-1").build());
+
+        server.verify();
+        assertTrue(response.hasErrorDetail());
+
+        List<String> httpEvents = readSandboxHttpEvents(sessionDir, "run-berr");
+        assertEquals(1, httpEvents.size(),
+                "body error MUST emit exactly one final sandbox_http event; got: " + httpEvents);
+        String event = httpEvents.get(0);
+        assertTrue(event.contains("\"status\":\"ERROR\""));
+        assertTrue(event.contains(
+                "\"errorCategory\":\"OPERATION_LOOKUP_SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED\""));
     }
 }

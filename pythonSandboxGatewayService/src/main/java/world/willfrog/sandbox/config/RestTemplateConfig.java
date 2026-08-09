@@ -55,15 +55,17 @@ public class RestTemplateConfig {
     }
 
     /**
-     * D13 MUST-FIX 3 (Cindy 91490076 #3): runtime invariants. Throws IllegalArgumentException
+     * D13 MUST-FIX 3 + round-2 #2 (Cindy 91490076 #3 + 6a6e6158 + 1b29792d #2 +
+     * codex 3d78edba/aa8987d1): runtime invariants. Throws IllegalArgumentException
      * on any violation so Spring context fails to start instead of silently accepting bad config.
      *
-     * Checks (long arithmetic with overflow guard):
+     * Checks (long arithmetic with overflow guard — every value MUST be a positive long):
      *   1. connectMillis > 0
      *   2. shortReadMillis > 0
      *   3. longReadMillis > 0
      *   4. maxTaskTimeoutMillis > 0
-     *   5. queuePrepareMarginMillis >= 0 (margin may be zero, but never negative)
+     *   5. queuePrepareMarginMillis > 0 (margin must be strictly positive — zero margin
+     *      would silently allow long-read == max-task-timeout, defeating the budget proof)
      *   6. shortReadMillis < longReadMillis (long-path is strictly longer than short-query)
      *   7. longReadMillis >= maxTaskTimeoutMillis + queuePrepareMarginMillis (with overflow guard)
      */
@@ -87,9 +89,9 @@ public class RestTemplateConfig {
             throw new IllegalArgumentException(
                     "sandbox.service.max-task-timeout-millis must be > 0, got " + maxTaskTimeoutMillis);
         }
-        if (queuePrepareMarginMillis < 0) {
+        if (queuePrepareMarginMillis <= 0) {
             throw new IllegalArgumentException(
-                    "sandbox.service.queue-prepare-margin-millis must be >= 0, got "
+                    "sandbox.service.queue-prepare-margin-millis must be > 0, got "
                             + queuePrepareMarginMillis);
         }
         if (shortReadMillis >= longReadMillis) {

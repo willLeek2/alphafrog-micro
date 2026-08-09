@@ -64,12 +64,32 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
     @Override
     public ExecuteResponse createTask(ExecuteRequest request) {
         long startMs = System.currentTimeMillis();
-        // 260809-26Q3-stage1-w3 D13 MUST-FIX 3 (Cindy 91490076 #3 + 6a6e6158):
-        // Effective timeout validation BEFORE any downstream call. Effective = max of
-        // legacy `timeoutSeconds * 1000` and canonical `timeoutMillis`. If effective > max,
-        // local INVALID_ARGUMENT reject with downstream_http_status absent (no HTTP call).
-        // Margin is NOT applied here — business task limit is bound by max alone.
+        // 260809-26Q3-stage1-w3 D13 MUST-FIX 3 + round-2 #2 (Cindy 91490076 #3 +
+        // 6a6e6158 + 1b29792d #2 + codex 3d78edba/aa8987d1): effective timeout
+        // validation BEFORE any downstream call. Effective = max of legacy
+        // `timeoutSeconds * 1000` (conservative ceil) and canonical `timeoutMillis`.
+        // Two reject branches, both local INVALID_ARGUMENT with downstream_http_status absent:
+        //   - computeEffectiveTimeoutMillis returns -1: some field is NaN/Infinity/negative
+        //     (must NOT be silently numericized as valid-unset; must NOT be silently dropped)
+        //   - effective > max: requested task timeout exceeds platform cap
+        // Margin is NOT applied here — business task limit is bound by max alone
+        // (Cindy 6a6e6158: threshold = `effective > max`, NOT `> max + margin`).
         long effectiveTimeoutMillis = computeEffectiveTimeoutMillis(request);
+        if (effectiveTimeoutMillis < 0) {
+            SandboxErrorDetail detail = SandboxErrorDetail.newBuilder()
+                    .setCategory(SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_INVALID_ARGUMENT)
+                    .build();
+            String text = "createTask rejected: timeoutSeconds/timeoutMillis is NaN/Infinity/negative"
+                    + " (seconds=" + request.getTimeoutSeconds()
+                    + ", millis=" + request.getTimeoutMillis() + ")";
+            log.warn("sandbox.createTask.localRejectTimeoutInvalid: taskId=*, seconds={}, millis={}, totalDurationMs={}",
+                    request.getTimeoutSeconds(), request.getTimeoutMillis(),
+                    System.currentTimeMillis() - startMs);
+            return ExecuteResponse.newBuilder()
+                    .setError(text)
+                    .setErrorDetail(detail)
+                    .build();
+        }
         if (effectiveTimeoutMillis > maxTaskTimeoutMillis) {
             SandboxErrorDetail detail = SandboxErrorDetail.newBuilder()
                     .setCategory(SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_INVALID_ARGUMENT)
@@ -343,28 +363,45 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
     }
 
     /**
-     * 260809-26Q3-stage1-w3 D13 MUST-FIX 3 (Cindy 91490076 #3 + 6a6e6158): effective task
-     * timeout归一化 for local-reject validation. Returns max of:
-     *   - legacy `timeoutSeconds * 1000` (only if positive)
-     *   - canonical `timeoutMillis` (only if positive)
-     * Returns 0 if neither is set; callers compare against `maxTaskTimeoutMillis` (positive
-     * required). 0 < max means no local reject (legacy default-unlimited still flows through;
-     * sandbox-side enforcement is ccqwen's slice).
+     * 260809-26Q3-stage1-w3 D13 MUST-FIX 3 (Cindy 91490076 #3 + 6a6e6158 + 1b29792d #2 +
+     * codex 3d78edba/aa8987d1): effective task timeout归一化 for local-reject validation.
      *
-     * Overflow-safe: if `timeoutSeconds * 1000` overflows Long, treats as Long.MAX_VALUE so
-     * the request is rejected without computing a wrapped sum.
+     * Return contract:
+     *   -1                  : signal that some timeout field is NaN/Infinity/negative —
+     *                         caller MUST local-reject as INVALID_ARGUMENT (downstream_http_status
+     *                         absent). NaN/Infinity不可数值化为有效未设置；负值不可静默丢弃。
+     *   0                   : neither field set (proto3 default 0 = absent), no local reject;
+     *                         sandbox-side enforcement is ccqwen's slice.
+     *   positive long       : conservative ceiling of max(timeoutSeconds * 1000, timeoutMillis),
+     *                         caller compares against `maxTaskTimeoutMillis`.
+     *
+     * Precision: uses `Math.ceil` (conservative upper bound) so fractional seconds like
+     * 1800.0009s (real effective 1800000.9ms > 1800000ms max) round UP to 1800001ms and
+     * trigger local reject, instead of being truncated to 1800000ms and slipping through.
+     *
+     * Overflow-safe: if `seconds * 1000.0` >= Long.MAX_VALUE, clamps to Long.MAX_VALUE so
+     * the request is rejected without computing a wrapped negative sum.
      */
     static long computeEffectiveTimeoutMillis(ExecuteRequest request) {
-        long fromSeconds = 0;
-        if (request.getTimeoutSeconds() > 0) {
-            double secondsToMillis = (double) request.getTimeoutSeconds() * 1000.0;
+        double seconds = request.getTimeoutSeconds();
+        long millis = request.getTimeoutMillis();
+
+        boolean secondsInvalid = !Double.isFinite(seconds) || seconds < 0;
+        boolean millisInvalid = millis < 0;
+        if (secondsInvalid || millisInvalid) {
+            return -1L;
+        }
+
+        long fromSeconds = 0L;
+        if (seconds > 0) {
+            double secondsToMillis = seconds * 1000.0;
             if (secondsToMillis >= Long.MAX_VALUE) {
                 fromSeconds = Long.MAX_VALUE;
             } else {
-                fromSeconds = (long) secondsToMillis;
+                fromSeconds = (long) Math.ceil(secondsToMillis);
             }
         }
-        long fromMillis = request.getTimeoutMillis() > 0 ? request.getTimeoutMillis() : 0;
+        long fromMillis = millis > 0 ? millis : 0L;
         return Math.max(fromSeconds, fromMillis);
     }
 
@@ -757,6 +794,27 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
                     emitSandboxHttp("GET", endpoint, downstreamStatus, resultDurationMs, "OK", null);
                     return builder.build();
                 }
+                // 260809-26Q3-stage1-w3 D13 MUST-FIX round-2 #1 (Cindy 1b29792d #1):
+                // terminal status + /result 2xx empty body — MUST NOT fall through to
+                // not-ready branch (which would lose typed detail). Return typed failure
+                // preserving taskId/status, dual-write non-blank error + UNSPECIFIED detail
+                // with ACTUAL downstream status, emit single final ERROR event.
+                SandboxErrorDetail emptyDetail = SandboxErrorDetail.newBuilder()
+                        .setCategory(SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED)
+                        .setDownstreamHttpStatus(downstreamStatus)
+                        .build();
+                emitSandboxHttp("GET", endpoint, downstreamStatus, resultDurationMs, "ERROR",
+                        "GET_RESULT_SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED");
+                log.warn("sandbox.getTaskResult.terminalEmptyBody: taskId={}, status={}, httpStatus={}, totalDurationMs={}",
+                        request.getTaskId(), status.getStatus(), downstreamStatus,
+                        System.currentTimeMillis() - startMs);
+                return TaskResultResponse.newBuilder()
+                        .setTaskId(request.getTaskId())
+                        .setStatus(status.getStatus())
+                        .setError("Result body empty (downstream returned "
+                                + downstreamStatus + " for terminal task)")
+                        .setErrorDetail(emptyDetail)
+                        .build();
             }
 
             // 260809-26Q3-stage1-w3 D13 MUST-FIX 1 (Cindy 91490076 #1): preserve typed
