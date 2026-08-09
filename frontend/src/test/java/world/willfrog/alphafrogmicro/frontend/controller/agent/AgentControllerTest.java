@@ -6,11 +6,13 @@ import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.springframework.security.core.Authentication;
 import org.springframework.test.util.ReflectionTestUtils;
+import org.springframework.web.bind.annotation.GetMapping;
 import world.willfrog.alphafrogmicro.agent.idl.AgentDubboService;
 import world.willfrog.alphafrogmicro.agent.idl.AgentArtifactMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunEventMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunResultMessage;
+import world.willfrog.alphafrogmicro.agent.idl.AgentRunStatusMessage;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunResultRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentRunEventsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentRunEventsResponse;
@@ -333,6 +335,12 @@ class AgentControllerTest {
 
         assertEquals(ResponseCode.SUCCESS.getCode(), response.getCode());
         TraceDetailResponse detail = response.getData();
+        assertEquals(null, detail.getHttpRequest());
+        assertEquals(null, detail.getHttpResponse());
+        assertEquals(null, detail.getCurlCommand());
+        assertEquals(null, detail.getInputMessages());
+        assertEquals(null, detail.getOutputText());
+        assertEquals(null, detail.getReasoningText());
         assertNotNull(detail.getFullDetail());
         assertEquals(null, detail.getFullDetailParts());
         String requestJson = new String(Base64.getDecoder().decode(
@@ -351,7 +359,10 @@ class AgentControllerTest {
         String observability = """
                 {"summary":{},"diagnostics":{"llmTraces":[
                   {"traceId":"llm-1","time":"2026-05-07T10:00:00Z","phase":"execution",
-                   "durationMs":42,"model":"qwen-plus","hasError":false,"detailBlobStored":true}
+                   "durationMs":42,"model":"qwen-plus","hasError":false,"detailBlobStored":true,
+                   "inputMessages":[{"role":"user","content":"raw-input"}],"outputText":"raw-output",
+                   "reasoningText":"raw-reasoning","httpRequest":{"secret":"raw-http"},
+                   "httpResponse":{"body":"raw-response"},"curlCommand":"curl raw"}
                 ],"toolTraces":[]}}
                 """;
         when(agentDubboService.getResult(any(GetAgentRunResultRequest.class))).thenReturn(
@@ -366,6 +377,12 @@ class AgentControllerTest {
         assertEquals("llm-1", detail.getTraceId());
         assertEquals(null, detail.getFullDetail());
         assertEquals(null, detail.getFullDetailParts());
+        assertEquals(null, detail.getInputMessages());
+        assertEquals(null, detail.getOutputText());
+        assertEquals(null, detail.getReasoningText());
+        assertEquals(null, detail.getHttpRequest());
+        assertEquals(null, detail.getHttpResponse());
+        assertEquals(null, detail.getCurlCommand());
         verify(callDetailBlobReader, never()).loadLlmCallRawContent(any(), any());
         verify(callDetailBlobReader, never()).loadLlmCallRawMeta(any(), any());
     }
@@ -419,6 +436,10 @@ class AgentControllerTest {
         assertEquals(ResponseCode.SUCCESS.getCode(), response.getCode());
         TraceDetailResponse trace = response.getData();
         assertEquals("tool", trace.getType());
+        assertEquals(null, trace.getParams());
+        assertEquals(null, trace.getOutput());
+        assertEquals(null, trace.getCacheKey());
+        assertEquals(null, trace.getDecisionExcerpt());
         assertNotNull(trace.getFullDetail());
         String paramsJson = new String(Base64.getDecoder().decode(
                 String.valueOf(trace.getFullDetail().get("paramsBase64"))), StandardCharsets.UTF_8);
@@ -563,6 +584,202 @@ class AgentControllerTest {
         if (detail.getLlm() != null) {
             assertEquals(null, detail.getLlm().getReasoningContent());
         }
+    }
+
+    @Test
+    void nonAdminObservabilityAndRawPartsAreForbiddenBeforeLoadingStorage() {
+        setNonAdmin();
+
+        var observability = controller.observabilityFull(authentication, "run-1");
+        var snapshotParts = controller.snapshotParts(authentication, "run-1", 0);
+        var snapshotPart = controller.snapshotPart(authentication, "run-1", 0, 0);
+        var traceParts = controller.traceFullParts(authentication, "run-1", "llm-1", 0);
+        var tracePart = controller.traceFullPart(authentication, "run-1", "llm-1", 0, 0);
+
+        assertEquals(ResponseCode.FORBIDDEN.getCode(), observability.getCode());
+        assertEquals(ResponseCode.FORBIDDEN.getCode(), snapshotParts.getCode());
+        assertEquals(403, snapshotPart.getStatusCode().value());
+        assertEquals(ResponseCode.FORBIDDEN.getCode(), traceParts.getCode());
+        assertEquals(403, tracePart.getStatusCode().value());
+        verify(agentDubboService, never()).getResult(any(GetAgentRunResultRequest.class));
+        verify(agentDubboService, never()).getSnapshotPartsMeta(any());
+        verify(agentDubboService, never()).getSnapshotPart(any());
+        verify(callDetailBlobReader, never()).loadLlmCallRawContent(any(), any());
+        verify(callDetailBlobReader, never()).loadToolCallDetail(any(), any());
+    }
+
+    @Test
+    void nonAdminTraceDetailFullFalseIsSafeAndFullTrueIsForbidden() throws Exception {
+        setNonAdmin();
+        String observability = """
+                {"summary":{},"diagnostics":{"llmTraces":[{
+                  "traceId":"llm-1","phase":"execution","model":"qwen-plus","hasError":true,
+                  "error":"api_key=plain-secret","inputMessages":[{"content":"raw-input"}],
+                  "outputText":"raw-output","reasoningText":"raw-reasoning","attempts":[{"raw":true}],
+                  "httpRequest":{"Authorization":"Bearer plain-secret"},"httpResponse":{"body":"raw"},
+                  "curlCommand":"curl --header secret"}],"toolTraces":[]}}
+                """;
+        when(agentDubboService.getResult(any(GetAgentRunResultRequest.class))).thenReturn(
+                AgentRunResultMessage.newBuilder().setObservabilityJson(observability).build());
+
+        var safe = controller.traceDetail(authentication, "run-1", "llm-1", false, 0);
+        var forbidden = controller.traceDetail(authentication, "run-1", "llm-1", true, 0);
+
+        assertEquals(ResponseCode.SUCCESS.getCode(), safe.getCode());
+        String json = new ObjectMapper().writeValueAsString(safe.getData());
+        assertFalse(json.contains("raw-input"));
+        assertFalse(json.contains("raw-output"));
+        assertFalse(json.contains("raw-reasoning"));
+        assertFalse(json.contains("plain-secret"));
+        assertFalse(json.contains("httpRequest"));
+        assertFalse(json.contains("curlCommand"));
+        assertEquals(ResponseCode.FORBIDDEN.getCode(), forbidden.getCode());
+        verify(callDetailBlobReader, never()).loadLlmCallRawContent(any(), any());
+    }
+
+    @Test
+    void traceListUsesOnlySafePreviewFields() {
+        setNonAdmin();
+        String observability = """
+                {"summary":{"llmCalls":1,"toolCalls":1},"diagnostics":{
+                  "llmTraces":[{"traceId":"llm-1","outputText":"legacy-raw-llm","responsePreview":"safe-llm"}],
+                  "toolTraces":[{"traceId":"tool-1","output":"legacy-raw-tool","outputPreview":"safe-tool"}]}}
+                """;
+        when(agentDubboService.getResult(any(GetAgentRunResultRequest.class))).thenReturn(
+                AgentRunResultMessage.newBuilder().setObservabilityJson(observability).build());
+
+        var response = controller.traces(authentication, "run-1", "", "", 0, 100);
+
+        assertEquals(ResponseCode.SUCCESS.getCode(), response.getCode());
+        assertEquals("safe-llm", response.getData().spans().stream()
+                .filter(span -> "llm".equals(span.getType())).findFirst().orElseThrow().getOutputSummary());
+        assertEquals("safe-tool", response.getData().spans().stream()
+                .filter(span -> "tool".equals(span.getType())).findFirst().orElseThrow().getOutputSummary());
+        assertFalse(response.getData().toString().contains("legacy-raw"));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void nonAdminResultAndRunSnapshotStripNestedObservabilityAndRawCompletedOutputs() {
+        setNonAdmin();
+        String snapshot = """
+                {"answer":"ok","status":"COMPLETED","observability":{"diagnostics":{"raw":"leak"}},
+                 "completed_items":[{"todoId":"todo-1","sequence":1,"summary":"done",
+                 "output":"raw-tool-output","modelOutput":"raw-model-output"}],"internal":"hidden"}
+                """;
+        when(agentDubboService.getResult(any(GetAgentRunResultRequest.class))).thenReturn(
+                AgentRunResultMessage.newBuilder().setId("run-1").setStatus("COMPLETED")
+                        .setPayloadJson(snapshot).setStructuredAnswerJson("{\"final\":\"safe\"}").build());
+        when(agentDubboService.getRun(any())).thenReturn(
+                AgentRunMessage.newBuilder().setId("run-1").setStatus("COMPLETED")
+                        .setPlanJson("{\"steps\":[]}").setSnapshotJson(snapshot)
+                        .setLastError("api_key=run-error-secret")
+                        .setExt("{\"api_key\":\"ext-secret\",\"execution_mode\":\"AUTO\"}").build());
+
+        var result = controller.result(authentication, "run-1");
+        var run = controller.get(authentication, "run-1");
+
+        Map<String, Object> resultPayload = (Map<String, Object>) result.getBody().getData().payload();
+        Map<String, Object> runSnapshot = (Map<String, Object>) run.getData().snapshot();
+        String combined = resultPayload.toString() + runSnapshot;
+        assertTrue(combined.contains("answer=ok"));
+        assertFalse(combined.contains("observability"));
+        assertFalse(combined.contains("raw-tool-output"));
+        assertFalse(combined.contains("raw-model-output"));
+        assertFalse(combined.contains("internal"));
+        assertFalse(run.getData().lastError().contains("run-error-secret"));
+        assertFalse(run.getData().ext().contains("ext-secret"));
+        assertTrue(run.getData().ext().contains("execution_mode"));
+    }
+
+    @Test
+    void nonAdminArtifactMetadataIsStrictlyParsedAndScrubbed() {
+        setNonAdmin();
+        when(agentDubboService.listArtifacts(any())).thenReturn(
+                ListAgentArtifactsResponse.newBuilder()
+                        .addItems(AgentArtifactMessage.newBuilder()
+                                .setArtifactId("artifact-1")
+                                .setMetaJson("{\"httpRequest\":{\"Authorization\":\"Bearer artifact-secret\"},\"label\":\"safe\"}")
+                                .build())
+                        .addItems(AgentArtifactMessage.newBuilder()
+                                .setArtifactId("artifact-2")
+                                .setMetaJson("{broken artifact-raw-secret")
+                                .build())
+                        .build());
+
+        var response = controller.artifacts(authentication, "run-1");
+
+        assertEquals(ResponseCode.SUCCESS.getCode(), response.getCode());
+        assertFalse(response.getData().get(0).metaJson().contains("artifact-secret"));
+        assertTrue(response.getData().get(0).metaJson().contains("safe"));
+        assertEquals(null, response.getData().get(1).metaJson());
+    }
+
+    @Test
+    void nonAdminStatusNeverReturnsFullObservabilityOrMalformedRawPayload() {
+        setNonAdmin();
+        when(agentDubboService.getStatus(any())).thenReturn(
+                AgentRunStatusMessage.newBuilder()
+                        .setId("run-1")
+                        .setStatus("EXECUTING")
+                        .setLastEventPayloadJson("{broken raw-secret")
+                        .setObservabilityJson("{\"diagnostics\":{\"raw\":\"leak\"}}")
+                        .setObservabilitySummaryJson("{\"llmCalls\":1}")
+                        .build());
+
+        var response = controller.status(authentication, "run-1");
+
+        assertEquals(ResponseCode.SUCCESS.getCode(), response.getCode());
+        assertEquals(null, response.getData().observability());
+        assertEquals(null, response.getData().lastEventPayload());
+        assertNotNull(response.getData().observabilitySummary());
+    }
+
+    @Test
+    void malformedEventPayloadNeverEchoesRawInput() {
+        setNonAdmin();
+        when(agentDubboService.listEvents(any(ListAgentRunEventsRequest.class))).thenReturn(
+                ListAgentRunEventsResponse.newBuilder()
+                        .addItems(AgentRunEventMessage.newBuilder()
+                                .setRunId("run-1").setSeq(1).setEventType("TOOL_CALL_FINISHED")
+                                .setPayloadJson("{broken raw-secret").build())
+                        .build());
+
+        var response = controller.events(authentication, "run-1", 0, 20);
+
+        assertEquals(ResponseCode.SUCCESS.getCode(), response.getCode());
+        assertEquals(null, response.getData().items().get(0).payload());
+    }
+
+    @Test
+    void securitySensitiveRoutesRemainRegisteredAtCompatiblePaths() {
+        assertGetRoute(AgentController.class, "snapshotParts", "/api/agent/runs/{runId}/snapshot/parts");
+        assertGetRoute(AgentController.class, "snapshotPart", "/api/agent/runs/{runId}/snapshot/parts/{partIndex}");
+        assertGetRoute(AgentController.class, "events", "/api/agent/runs/{runId}/events");
+        assertGetRoute(AgentController.class, "timeline", "/api/agent/runs/{runId}/timeline");
+        assertGetRoute(AgentController.class, "result", "/api/agent/runs/{runId}/result");
+        assertGetRoute(AgentController.class, "observabilityFull", "/api/agent/runs/{runId}/observability/full");
+        assertGetRoute(AgentController.class, "traces", "/api/agent/runs/{runId}/traces");
+        assertGetRoute(AgentController.class, "traceDetail", "/api/agent/runs/{runId}/traces/{traceId}");
+        assertGetRoute(AgentController.class, "traceFullParts", "/api/agent/runs/{runId}/traces/{traceId}/full/parts");
+        assertGetRoute(AgentController.class, "traceFullPart", "/api/agent/runs/{runId}/traces/{traceId}/full/parts/{partIndex}");
+    }
+
+    private void setNonAdmin() {
+        User nonAdmin = new User();
+        nonAdmin.setUserId(99L);
+        nonAdmin.setUserType(1);
+        when(authService.getUserByUsername("admin")).thenReturn(nonAdmin);
+    }
+
+    private static void assertGetRoute(Class<?> controllerType, String methodName, String expectedPath) {
+        var method = java.util.Arrays.stream(controllerType.getDeclaredMethods())
+                .filter(candidate -> candidate.getName().equals(methodName))
+                .findFirst()
+                .orElseThrow();
+        GetMapping mapping = method.getAnnotation(GetMapping.class);
+        assertNotNull(mapping);
+        assertTrue(java.util.Arrays.asList(mapping.value()).contains(expectedPath));
     }
 
     private static byte[] gunzip(byte[] compressed) throws Exception {

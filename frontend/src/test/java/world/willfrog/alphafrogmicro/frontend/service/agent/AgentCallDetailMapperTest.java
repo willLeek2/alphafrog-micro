@@ -166,6 +166,26 @@ class AgentCallDetailMapperTest {
   }
 
   @Test
+  void toolSafeDetail_shouldScrubCredentialsFromWhitelistedParamsOutputAndError() throws Exception {
+    Map<String, Object> trace = new LinkedHashMap<>();
+    trace.put("traceId", "tool-credential");
+    trace.put("toolName", "searchWeb");
+    trace.put("success", false);
+    trace.put("error", "Authorization: Bearer error-secret-value");
+    trace.put("params", Map.of("query", "api_key=query-secret-value", "backend", "tavily"));
+    trace.put("output", "callback?access_token=output-secret-value");
+
+    AgentCallDetailResponse detail = AgentCallDetailMapper.fromToolTrace(
+            trace, "tool-credential", "run-1");
+    String json = objectMapper.writeValueAsString(detail);
+
+    assertFalse(json.contains("error-secret-value"));
+    assertFalse(json.contains("query-secret-value"));
+    assertFalse(json.contains("output-secret-value"));
+    assertTrue(json.contains(AgentExternalObservabilityMapper.REDACTION_TEXT));
+  }
+
+  @Test
   void resolveLlmDetail_includeThinkingWithReasoningBlob_mapsReasoningContent() throws Exception {
     Map<String, Object> trace = new LinkedHashMap<>();
     trace.put("traceId", "llm-think");
@@ -187,6 +207,26 @@ class AgentCallDetailMapperTest {
     assertNotNull(detail.getLlm());
     assertEquals("I should first search for the asset", detail.getLlm().getReasoningContent());
     assertNull(detail.getReasoningUnavailable());
+  }
+
+  @Test
+  void resolveLlmDetail_includeThinkingStillScrubsCredentials() throws Exception {
+    Map<String, Object> trace = new LinkedHashMap<>();
+    trace.put("traceId", "llm-think-secret");
+    trace.put("model", "kimi-k2.6");
+    trace.put("hasError", false);
+    trace.put("detailBlobStored", true);
+
+    String blobJson = objectMapper.writeValueAsString(Map.of(
+        "reasoningText", "I used api_key=reasoning-secret-value"
+    ));
+
+    AgentCallDetailResponse detail = AgentCallDetailMapper.resolveLlmDetail(
+            trace, "llm-think-secret", "run-1", Optional.of(blobJson), true);
+
+    assertFalse(detail.getLlm().getReasoningContent().contains("reasoning-secret-value"));
+    assertTrue(detail.getLlm().getReasoningContent().contains(
+            AgentExternalObservabilityMapper.REDACTION_TEXT));
   }
 
   @Test

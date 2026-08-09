@@ -7,6 +7,12 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.Authentication;
+import org.springframework.test.util.ReflectionTestUtils;
+import org.springframework.web.bind.annotation.GetMapping;
+import world.willfrog.alphafrogmicro.admin.idl.AdminAgentRun;
+import world.willfrog.alphafrogmicro.admin.idl.AdminService;
+import world.willfrog.alphafrogmicro.admin.idl.GetAdminAgentRunRequest;
+import world.willfrog.alphafrogmicro.admin.idl.GetAdminAgentRunResponse;
 import world.willfrog.alphafrogmicro.common.dao.user.UserDao;
 import world.willfrog.alphafrogmicro.common.pojo.user.User;
 import world.willfrog.alphafrogmicro.frontend.service.AuthService;
@@ -34,12 +40,15 @@ class AdminControllerDebugEndpointTest {
     private UserDao userDao;
     @Mock
     private AuthObservabilityManager authObservabilityManager;
+    @Mock
+    private AdminService adminService;
 
     private AdminController controller;
 
     @BeforeEach
     void setUp() {
         controller = new AdminController(authService, rateLimitingService, userDao, authObservabilityManager);
+        ReflectionTestUtils.setField(controller, "adminService", adminService);
     }
 
     @Test
@@ -164,6 +173,41 @@ class AdminControllerDebugEndpointTest {
         @SuppressWarnings("unchecked")
         Map<String, Object> body = (Map<String, Object>) response.getBody();
         assertEquals(false, body.get("active"));
+    }
+
+    @Test
+    void getAgentRun_shouldScrubAdminSnapshotAndNeverEchoMalformedJson() {
+        Authentication authentication = adminAuthentication();
+        when(adminService.getAgentRun(any(GetAdminAgentRunRequest.class))).thenReturn(
+                GetAdminAgentRunResponse.newBuilder()
+                        .setSuccess(true)
+                        .setRun(AdminAgentRun.newBuilder().setRunId("run-1").build())
+                        .setPlanJson("{broken raw-plan-secret")
+                        .setSnapshotJson("{\"observability\":{\"items\":[{\"httpRequest\":{\"Authorization\":\"Bearer admin-secret-value\"}}],\"Cookie\":\"sid=admin-cookie-secret\"}}")
+                        .setLastError("api_key=admin-error-secret")
+                        .build());
+
+        ResponseEntity<?> response = controller.getAgentRun(authentication, "run-1");
+
+        assertEquals(200, response.getStatusCode().value());
+        @SuppressWarnings("unchecked")
+        Map<String, Object> body = (Map<String, Object>) response.getBody();
+        assertEquals(null, body.get("planJson"));
+        String combined = String.valueOf(body.get("snapshotJson")) + body.get("lastError");
+        assertFalse(combined.contains("admin-secret-value"));
+        assertFalse(combined.contains("admin-error-secret"));
+        assertFalse(combined.contains("admin-cookie-secret"));
+        assertTrue(combined.contains("REDACTED"));
+    }
+
+    @Test
+    void getAgentRunRouteRemainsCompatible() throws Exception {
+        GetMapping mapping = AdminController.class
+                .getDeclaredMethod("getAgentRun", Authentication.class, String.class)
+                .getAnnotation(GetMapping.class);
+
+        assertNotNull(mapping);
+        assertTrue(java.util.Arrays.asList(mapping.value()).contains("/agent-runs/{runId}"));
     }
 
     private Authentication adminAuthentication() {
