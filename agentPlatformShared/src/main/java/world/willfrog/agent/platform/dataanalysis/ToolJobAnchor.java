@@ -180,18 +180,18 @@ public class ToolJobAnchor {
      */
     private static void normalizeLegacyResultConsumed(ToolJobAnchor anchor) {
         if (!anchor.resultConsumed) {
-            return; // nothing to normalize
+            return; // 无需归一化
         }
         if ("CONSUMED".equals(anchor.resumeState) || "ACCEPTED".equals(anchor.resumeState)) {
-            return; // already consistent
+            return; // 已经一致
         }
         if ("LAUNCHING".equals(anchor.resumeState) || anchor.resumeState == null) {
-            // Legacy: handoff was accepted but resumeState wasn't advanced. Upgrade.
+            // 旧数据：handoff 已被接受但 resumeState 未推进，升级为 ACCEPTED。
             anchor.resumeState = "ACCEPTED";
             return;
         }
         if ("READY".equals(anchor.resumeState)) {
-            // Contradictory: READY cannot have consumed result. Fail closed.
+            // 矛盾状态：READY 不可能有已消费的结果，fail-closed。
             throw new IllegalArgumentException(
                     "ToolJobAnchor has contradictory state: resumeState=READY but resultConsumed=true");
         }

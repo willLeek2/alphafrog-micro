@@ -196,11 +196,11 @@ class ToolJobStateCharacterizationTest {
     // ------------------------------------------------------------------
 
     @Nested
-    @DisplayName("Target migration seam: ACCEPTED state survives roundtrips")
+    @DisplayName("目标迁移接缝：ACCEPTED 状态在 JSON 往返后存活")
     class TargetMigrationSeam {
 
         @Test
-        @DisplayName("ACCEPTED anchor survives JSON roundtrip with resultConsumed=true")
+        @DisplayName("ACCEPTED anchor JSON 往返后保持 resultConsumed=true")
         void acceptedAnchorSurvivesRoundtrip() {
             anchor.setOperationId("run-1:tc-1:1");
             anchor.setResumeState("ACCEPTED");
@@ -214,7 +214,7 @@ class ToolJobStateCharacterizationTest {
         }
 
         @Test
-        @DisplayName("JSON output of ACCEPTED has resultConsumed=true derived from state")
+        @DisplayName("ACCEPTED 的 JSON 输出中 resultConsumed=true 从状态推导")
         void acceptedJsonHasResultConsumedTrue() {
             anchor.setOperationId("run-1:tc-1:1");
             anchor.setResumeState("ACCEPTED");
@@ -226,7 +226,7 @@ class ToolJobStateCharacterizationTest {
         }
 
         @Test
-        @DisplayName("JSON output of READY has resultConsumed=false derived from state")
+        @DisplayName("READY 的 JSON 输出中 resultConsumed=false 从状态推导")
         void readyJsonHasResultConsumedFalse() {
             anchor.setOperationId("run-1:tc-1:1");
             anchor.setResumeState("READY");
@@ -237,7 +237,7 @@ class ToolJobStateCharacterizationTest {
         }
 
         @Test
-        @DisplayName("markHandoffAccepted transition: LAUNCHING → ACCEPTED preserves identity fields")
+        @DisplayName("markHandoffAccepted 转换：LAUNCHING→ACCEPTED 保持身份字段")
         void acceptedTransitionPreservesIdentity() {
             anchor.setOperationId("run-1:tc-1:1");
             anchor.setResumeState("LAUNCHING");
@@ -262,7 +262,7 @@ class ToolJobStateCharacterizationTest {
     // ------------------------------------------------------------------
 
     @Nested
-    @DisplayName("Production XML seam: AgentRunMapper.xml ACCEPTED predicates")
+    @DisplayName("生产 XML 接缝：AgentRunMapper.xml 中的 ACCEPTED 谓词")
     class ProductionXmlSeam {
 
         private String xml;
@@ -276,17 +276,17 @@ class ToolJobStateCharacterizationTest {
         }
 
         @Test
-        @DisplayName("5 SQL locations accept ACCEPTED state")
+        @DisplayName("5 处 SQL 接受 ACCEPTED 状态")
         void acceptedInFivePredicates() {
             // Count IN ('LAUNCHING', 'ACCEPTED') occurrences in SQL predicates.
             // 恰好 5 处：takeoverExpiredResumeLauncher、heartbeatResumeLauncher、
-            // updateResumedTerminal, clearAcceptedResumeHandoff, listResumeReadyAnchors.
+            // updateResumedTerminal、clearAcceptedResumeHandoff、listResumeReadyAnchors。
             int count = countOccurrences(xml, "resumeState}' IN ('LAUNCHING', 'ACCEPTED')");
             assertThat(count).as("5 SQL predicates must accept ACCEPTED").isEqualTo(5);
         }
 
         @Test
-        @DisplayName("acceptResumeHandoff stays LAUNCHING-only")
+        @DisplayName("acceptResumeHandoff 保持仅 LAUNCHING")
         void acceptHandoffStaysLaunchingOnly() {
             // acceptResumeHandoff transitions LAUNCHING→ACCEPTED; it must NOT
             // already accept ACCEPTED as a precondition.
@@ -299,7 +299,7 @@ class ToolJobStateCharacterizationTest {
         }
 
         @Test
-        @DisplayName("claimResumeLauncher stays READY-only")
+        @DisplayName("claimResumeLauncher 保持仅 READY")
         void claimResumeLauncherStaysReadyOnly() {
             String claimBlock = extractBetween(xml,
                     "<update id=\"claimResumeLauncher\">", "</update>");

@@ -488,7 +488,7 @@ class AgentRunMapperResumeAcceptedPostgresIntegrationTest {
     @Test
     void acceptResumeHandoffRejectsAlreadyAccepted() {
         Instant lease = Instant.now().plusSeconds(60);
-        // DB has ACCEPTED (not LAUNCHING)
+        // DB 中已是 ACCEPTED（不是 LAUNCHING）
         ToolJobAnchor accepted = resumeAnchor("fence-1:tc-1:1", "ACCEPTED", true);
         accepted.setResumeToken("tok-fence");
         accepted.setResumeLeaseVersion(1);
@@ -501,7 +501,7 @@ class AgentRunMapperResumeAcceptedPostgresIntegrationTest {
         try (SqlSession session = sqlSessionFactory.openSession(true)) {
             AgentRunMapper mapper = session.getMapper(AgentRunMapper.class);
 
-            // acceptResumeHandoff requires LAUNCHING — ACCEPTED must fail
+            // acceptResumeHandoff 要求 DB 中是 LAUNCHING — ACCEPTED 必须失败
             assertThat(mapper.acceptResumeHandoff(
                     "run-fence-1", accepted.toJson(),
                     "tok-fence", 1L, "owner-fence", 30L))

@@ -89,7 +89,7 @@ public class ToolJobResumeService {
         }
         // READY 需要竞争新启动租约。
         if ("READY".equals(state)) return launchFromReady(runId, anchor);
-        // LAUNCHING or ACCEPTED: may be running or crashed; check lease TTL + isActive.
+        // LAUNCHING 或 ACCEPTED：可能正在运行或已崩溃，检查 lease TTL + isActive。
         if ("LAUNCHING".equals(state) || "ACCEPTED".equals(state)) return reenterLaunching(runId, anchor);
         return false;
     }
@@ -332,8 +332,8 @@ public class ToolJobResumeService {
         anchor.setPythonFailedRequestFingerprints(context.getPythonFailedRequestFingerprints());
         anchor.setResultConsumed(true);
         anchor.setResumeLauncherLeaseUntil(Instant.now().plusSeconds(leaseSeconds()));
-        // Advance resumeState to ACCEPTED in the same CAS that restores Run to EXECUTING.
-        // The old anchor is kept until the next durable checkpoint or final result.
+        // 在将 Run 恢复为 EXECUTING 的同一条 CAS 中将 resumeState 推进为 ACCEPTED。
+        // 旧 anchor 保留至下一个持久化检查点或最终结果。
         anchor.setResumeState("ACCEPTED");
         boolean accepted = anchorService.acceptResumeHandoff(
                 runId, anchor, context.getResumeToken(), context.getResumeLeaseVersion(),
