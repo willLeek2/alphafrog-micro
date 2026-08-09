@@ -176,6 +176,23 @@ class LangchainToolConcurrencyThrottleTest {
         assertThat(metrics.get("scope")).isEqualTo("per-node");
         assertThat(metrics.get("enabled")).isEqualTo(true);
         assertThat(metrics.get("maxPermits")).isEqualTo(2);
+        // Additive-only contract：新增 scope 不得改动既有 key / 值语义。
+        assertThat(metrics.keySet()).containsExactlyInAnyOrder(
+                "scope",
+                "enabled",
+                "maxPermits",
+                "availablePermits",
+                "queueLength",
+                "timeoutSeconds",
+                "timeoutCounts",
+                "waitMsTotal",
+                "waitCount",
+                "execMsTotal",
+                "execCount"
+        );
+        assertThat(metrics.get("availablePermits")).isEqualTo(0);
+        assertThat(metrics.get("queueLength")).isEqualTo(0);
+        assertThat(metrics.get("timeoutSeconds")).isEqualTo(1L);
 
         @SuppressWarnings("unchecked")
         Map<String, Object> timeoutCounts = (Map<String, Object>) metrics.get("timeoutCounts");
