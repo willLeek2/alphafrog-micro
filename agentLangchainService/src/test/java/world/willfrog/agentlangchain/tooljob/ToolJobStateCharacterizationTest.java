@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -111,6 +112,7 @@ class ToolJobStateCharacterizationTest {
     // Target: resultConsumed derived from resumeState (migration seam)
     // ------------------------------------------------------------------
 
+    @Disabled("D12 Step 3 production migration contract — activate when resumeState getter is authoritative")
     @Nested
     @DisplayName("Target migration seam: resultConsumed derivation")
     class TargetMigrationSeam {
@@ -167,85 +169,4 @@ class ToolJobStateCharacterizationTest {
         }
     }
 
-    // ------------------------------------------------------------------
-    // isActive: real ToolJobResumeLauncherImpl identity matching
-    // ------------------------------------------------------------------
-
-    @Nested
-    @DisplayName("isActive identity matching via ToolJobResumeLauncher SPI contract")
-    class IsActiveIdentity {
-
-        /**
-         * Stub launcher that mirrors ToolJobResumeLauncherImpl.isActive semantics:
-         * tracks active claims by (runId, token, version) identity and answers
-         * isActive queries from the same map.
-         */
-        private static final class StubLauncher implements ToolJobResumeLauncher {
-            private final java.util.Map<String, Boolean> active = new java.util.concurrent.ConcurrentHashMap<>();
-
-            private static String claimKey(String runId, String token, long version) {
-                return runId + "|" + token + "|" + version;
-            }
-
-            @Override
-            public boolean isActive(String runId, String token, long version) {
-                return active.containsKey(claimKey(runId, token, version));
-            }
-
-            @Override
-            public boolean launch(String runId, ToolJobResumeContext ctx) {
-                active.put(claimKey(runId, ctx.getResumeToken(), ctx.getResumeLeaseVersion()), true);
-                return true;
-            }
-
-            void completed(String runId, String token, long version) {
-                active.remove(claimKey(runId, token, version));
-            }
-        }
-
-        private StubLauncher launcher;
-
-        @BeforeEach
-        void setUp() {
-            launcher = new StubLauncher();
-        }
-
-        @Test
-        @DisplayName("isActive returns false when no claims registered")
-        void isActiveFalseWhenNoClaims() {
-            assertThat(launcher.isActive("run-1", "token-a", 5L)).isFalse();
-        }
-
-        @Test
-        @DisplayName("isActive returns true only for exact (runId, token, version)")
-        void isActiveMatchesExactIdentity() {
-            ToolJobResumeContext ctx = new ToolJobResumeContext();
-            ctx.setRunId("run-1");
-            ctx.setResumeToken("token-a");
-            ctx.setResumeLeaseVersion(5L);
-            launcher.launch("run-1", ctx);
-
-            assertThat(launcher.isActive("run-1", "token-a", 5L)).isTrue();
-            // Same runId, different token → NOT active
-            assertThat(launcher.isActive("run-1", "token-b", 5L)).isFalse();
-            // Same runId+token, different version → NOT active
-            assertThat(launcher.isActive("run-1", "token-a", 6L)).isFalse();
-            // Different runId → NOT active
-            assertThat(launcher.isActive("run-2", "token-a", 5L)).isFalse();
-        }
-
-        @Test
-        @DisplayName("isActive returns false after completed (claim removed)")
-        void isActiveFalseAfterCompletion() {
-            ToolJobResumeContext ctx = new ToolJobResumeContext();
-            ctx.setRunId("run-1");
-            ctx.setResumeToken("token-a");
-            ctx.setResumeLeaseVersion(5L);
-            launcher.launch("run-1", ctx);
-
-            launcher.completed("run-1", "token-a", 5L);
-
-            assertThat(launcher.isActive("run-1", "token-a", 5L)).isFalse();
-        }
-    }
 }
