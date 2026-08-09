@@ -1,14 +1,13 @@
 package world.willfrog.agent.platform.dataanalysis;
 
 /**
- * Capacity-layer admission error. The {@link Reason} mirrors the §6.8 error-code vocabulary
- * so the tool layer can translate to {@code DATA_ANALYSIS_SERVER_BUSY} or
- * {@code DATA_ANALYSIS_TASK_TOO_LARGE} without leaking the in-memory details.
+ * 容量层准入失败异常。{@link Reason} 与 §6.8 错误码词汇表镜像，
+ * 工具层据此翻译为 {@code DATA_ANALYSIS_SERVER_BUSY} 或
+ * {@code DATA_ANALYSIS_TASK_TOO_LARGE}，不泄漏 in-memory 实现细节。
  *
- * <p>Lives in the interface package so consumers depend on the seam, not on
- * {@code DataAnalysisCapacityServiceImpl}.</p>
+ * <p>位于接口包内，consumer 依赖接缝而非 {@code DataAnalysisCapacityServiceImpl}。</p>
  */
-public class CapacityAdmissionException extends RuntimeException {
+public final class CapacityAdmissionException extends RuntimeException {
 
     public enum Reason { RECOVERING, SERVER_BUSY, TASK_TOO_LARGE, ALREADY_RESERVED, ILLEGAL_RESTORE }
 

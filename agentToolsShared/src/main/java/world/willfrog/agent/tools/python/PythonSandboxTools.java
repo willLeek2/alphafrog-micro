@@ -8,7 +8,6 @@ import org.apache.dubbo.rpc.RpcContext;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
-import world.willfrog.agent.platform.dataanalysis.CapacityAdmissionException;
 import world.willfrog.agent.platform.dataanalysis.*;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.finance.FinanceRecordChannelConfigLoader;

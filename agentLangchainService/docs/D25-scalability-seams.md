@@ -46,19 +46,29 @@
 
 ### 3.3 Snapshot 字段 (per-node)
 
-`buildSnapshot()` 暴露 (commit `b32d6166` G4 加入 `instanceId`)：
+`buildSnapshot()` 暴露 (`b32d6166` G4 加入 `instanceId`，`a4dc10b0` G4 v2 改为 `<appName>@<hostname>@<pid>` + uuid fallback)：
 
 | 字段 | 语义 |
 |------|------|
-| `instanceId` | `hostname@pid`，JVM 启动时一次性解析，标识 snapshot 来源 |
+| `instanceId` | `<appName>@<hostname>@<pid>`，构造时一次性解析；hostname 解析失败时 fallback 为 `<appName>@unknown-host-<uuid8>@<pid>` 防止跨实例碰撞 |
 | `running` | 已交线程池、未从 Runnable finally 退出的 Run 数 |
 | `queued` | 已 reserve 未 submit + 已入 queue 的名额 |
-| `rejectedTotal` | 累计拒绝数 (仅观测) |
+| `rejectedTotal` | 累计拒绝数 (仅观测，per-instance counter，JVM 重启归零) |
 | `corePoolSize` / `maxPoolSize` / `queueCapacity` | 当前动态限制 (`currentLimits()`) |
 | `hardCorePoolSize` / `hardMaxPoolSize` / `hardQueueCapacity` | 启动冻结硬上限 (`hardLimits()`) |
 | `oldestQueuedAgeMs` | 队首入队时间 |
 
-所有字段都是 per-node。跨实例聚合必须由外部观测系统 (Prometheus / Grafana) 按 `instanceId` label 求和。
+所有字段都是 per-node 单实例口径。跨实例聚合时，外部观测系统 (Prometheus / Grafana) 必须按字段语义选择聚合方式，不能一律求和：
+
+| 字段 | cluster 口径 |
+|------|-------------|
+| `running` / `queued` | SUM (gauge，瞬时在途) |
+| `corePoolSize` / `maxPoolSize` / `queueCapacity` / `hardCorePoolSize` / `hardMaxPoolSize` / `hardQueueCapacity` | SUM (per-instance 上限 × 实例数 = 全局上限) |
+| `oldestQueuedAgeMs` | MAX (取最坏值，非求和) |
+| `rejectedTotal` | per-instance counter (JVM 重启归零)；按实例算 rate/delta 后再 SUM，不可把 raw 累计值长期相加 |
+| `instanceId` | 来源 dimension / label，非 aggregable metric |
+
+`instanceId` 是来源维度而非可加指标；`oldestQueuedAgeMs` 是 gauged duration 应取 max；`rejectedTotal` 因 JVM 重启归零，raw 累加会 over-count 重启前的累计拒绝数。
 
 ### 3.4 HTTP 暴露与 per-node 语义
 
