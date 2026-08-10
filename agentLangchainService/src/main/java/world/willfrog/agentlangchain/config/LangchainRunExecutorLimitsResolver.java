@@ -75,10 +75,15 @@ public class LangchainRunExecutorLimitsResolver {
     /**
      * 暴露启动冻结 hard 与当前配置 requested 之间的差距，供 health/snapshot 端点查询。
      *
-     * <p>restartRequired 由 requested 超出 hard 或 threadNamePrefix 与 hard 不同决定；
-     * adaptive core 覆盖不影响 restartRequired。</p>
+     * <p>单次读取热配置，同时计算 requested 与 effective，避免快照中
+     * A 版本的 requested 与 B 版本的 effective 拼在一起。</p>
+     *
+     * <p>restartRequired 只由 requested 超过 hard 或 threadNamePrefix 变化决定；
+     * adaptive core 覆盖造成的临时缩放不触发 restartRequired，但会通过
+     * adaptiveOverride 字段单独暴露。</p>
      */
     public Map<String, Object> getHardVersusEffectiveGap() {
+        // 一次读取热配置，同时用于 requested 和 effective 的计算
         AgentLlmProperties.ExecutorConfig executorConfig = configLoader.current()
                 .map(AgentLlmProperties::getExecutor)
                 .orElse(null);
@@ -100,25 +105,24 @@ public class LangchainRunExecutorLimitsResolver {
                 currentConfig == null ? null : currentConfig.getThreadNamePrefix(),
                 hardLimits.getThreadNamePrefix());
 
-        LangchainRunExecutorLimits effective = currentLimits();
+        // 用已捕获的 currentConfig 计算 effective，不二次读取热配置
+        LangchainRunExecutorLimits clamped = clampCurrent(currentConfig);
+        LangchainRunExecutorLimits effective = applyOverrideIfSet(clamped);
 
-        Map<String, Object> coreDim = new LinkedHashMap<>();
-        coreDim.put("hard", hardLimits.getCorePoolSize());
-        coreDim.put("requested", requestedCore);
-        coreDim.put("effective", effective.getCorePoolSize());
-        coreDim.put("clamped", requestedCore > hardLimits.getCorePoolSize());
+        Integer adaptiveOverride = this.adaptiveCoreOverride;
+        // adaptive 是否实际改变了 core（overridden effective ≠ un-overridden clamped）
+        boolean adaptiveAdjusted = adaptiveOverride != null
+                && effective.getCorePoolSize() != clamped.getCorePoolSize();
 
-        Map<String, Object> maxDim = new LinkedHashMap<>();
-        maxDim.put("hard", hardLimits.getMaxPoolSize());
-        maxDim.put("requested", requestedMax);
-        maxDim.put("effective", effective.getMaxPoolSize());
-        maxDim.put("clamped", requestedMax > hardLimits.getMaxPoolSize());
+        // clamped = effective 与 requested 不同（捕获硬门、跨维度 core-to-max、负数归一）
+        Map<String, Object> coreDim = clampedDim(hardLimits.getCorePoolSize(), requestedCore,
+                effective.getCorePoolSize());
 
-        Map<String, Object> queueDim = new LinkedHashMap<>();
-        queueDim.put("hard", hardLimits.getQueueCapacity());
-        queueDim.put("requested", requestedQueue);
-        queueDim.put("effective", effective.getQueueCapacity());
-        queueDim.put("clamped", requestedQueue > hardLimits.getQueueCapacity());
+        Map<String, Object> maxDim = clampedDim(hardLimits.getMaxPoolSize(), requestedMax,
+                effective.getMaxPoolSize());
+
+        Map<String, Object> queueDim = clampedDim(hardLimits.getQueueCapacity(), requestedQueue,
+                effective.getQueueCapacity());
 
         boolean prefixChanged = !requestedPrefix.equals(hardLimits.getThreadNamePrefix());
         Map<String, Object> prefixDim = new LinkedHashMap<>();
@@ -128,7 +132,7 @@ public class LangchainRunExecutorLimitsResolver {
         prefixDim.put("clamped", prefixChanged);
 
         // restartRequired 只看 requested 是否超过 hard 或前缀已变化；
-        // adaptive core 覆盖造成的临时变化不触发 restartRequired。
+        // adaptive core 覆盖不触发 restartRequired。
         boolean restartRequired = requestedCore > hardLimits.getCorePoolSize()
                 || requestedMax > hardLimits.getMaxPoolSize()
                 || requestedQueue > hardLimits.getQueueCapacity()
@@ -143,7 +147,23 @@ public class LangchainRunExecutorLimitsResolver {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("restartRequired", restartRequired);
         result.put("dimensions", dimensions);
+        if (adaptiveOverride != null) {
+            result.put("adaptiveOverride", adaptiveOverride);
+        }
+        if (adaptiveAdjusted) {
+            result.put("adaptiveAdjusted", true);
+        }
         return result;
+    }
+
+    private Map<String, Object> clampedDim(int hard, int requested, int effective) {
+        Map<String, Object> dim = new LinkedHashMap<>();
+        dim.put("hard", hard);
+        dim.put("requested", requested);
+        dim.put("effective", effective);
+        // clamped 捕获一切形式的静态夹断：硬门、跨维度 core-to-max、负数/零归一
+        dim.put("clamped", effective != requested);
+        return dim;
     }
 
     /** 设置运行期 core 覆盖；传 null 清除覆盖并回到当前配置值。 */

@@ -210,13 +210,16 @@ class LangchainRunExecutorLimitsResolverTest {
         LangchainRunExecutorLimitsResolver resolver =
                 new LangchainRunExecutorLimitsResolver(1, 1, 1, "default-", loader);
 
-        // 设置 adaptive core 覆盖，把 core 临时降到 3
         resolver.setAdaptiveCoreOverride(3);
 
         Map<String, Object> gap = resolver.getHardVersusEffectiveGap();
 
-        // 因为 requested(10) ≤ hard(10)，不受 adaptive 影响，restartRequired 仍为 false
+        // restartRequired 不受 adaptive 影响（requested ≤ hard）
         assertThat(gap.get("restartRequired")).isEqualTo(false);
+
+        // adaptiveOverride 应被暴露
+        assertThat(gap.get("adaptiveOverride")).isEqualTo(3);
+        assertThat(gap.get("adaptiveAdjusted")).isEqualTo(true);
 
         @SuppressWarnings("unchecked")
         Map<String, Object> dims = (Map<String, Object>) gap.get("dimensions");
@@ -227,8 +230,8 @@ class LangchainRunExecutorLimitsResolverTest {
         assertThat(core.get("requested")).isEqualTo(10);
         // effective 反映 adaptive 降低后的值
         assertThat(core.get("effective")).isEqualTo(3);
-        // clamped 仍基于 requested vs hard 比较，不是 adaptive 造成的降低
-        assertThat(core.get("clamped")).isEqualTo(false);
+        // clamped=true 因为 effective(3) != requested(10)，但 restartRequired 仍 false
+        assertThat(core.get("clamped")).isEqualTo(true);
     }
 
     @Test
@@ -258,6 +261,64 @@ class LangchainRunExecutorLimitsResolverTest {
         // effective 仍是启动 hard 值（thread name 不支持 hot-reload）
         assertThat(prefix.get("effective")).isEqualTo("agent-run-v1-");
         assertThat(prefix.get("clamped")).isEqualTo(true);
+    }
+
+    @Test
+    void gap_crossDimensionCoreClampedByMaxDetected() {
+        // requested core=8 但 requested max=2：core 被跨维度夹到 max
+        // hard 够大不会触发硬门，但 core 仍被 clamp
+        AgentLlmProperties cfg = configWithHardAndCurrent(
+                100, 100, 1000, "agent-run-",
+                8, 2, 100, "agent-run-");
+
+        AgentLlmLocalConfigLoader loader = mock(AgentLlmLocalConfigLoader.class);
+        when(loader.current()).thenReturn(Optional.of(cfg));
+
+        LangchainRunExecutorLimitsResolver resolver =
+                new LangchainRunExecutorLimitsResolver(1, 1, 1, "default-", loader);
+
+        Map<String, Object> gap = resolver.getHardVersusEffectiveGap();
+
+        // requested 未超 hard，restartRequired=false
+        assertThat(gap.get("restartRequired")).isEqualTo(false);
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> dims = (Map<String, Object>) gap.get("dimensions");
+
+        // core：requested=8，但被 max=2 夹到 effective=2
+        @SuppressWarnings("unchecked")
+        Map<String, Object> core = (Map<String, Object>) dims.get("corePoolSize");
+        assertThat(core.get("hard")).isEqualTo(100);
+        assertThat(core.get("requested")).isEqualTo(8);
+        assertThat(core.get("effective")).isEqualTo(2); // clamped to max
+        assertThat(core.get("clamped")).isEqualTo(true); // effective != requested
+
+        // max：requested=2，hard=100 → not hard-clamped
+        @SuppressWarnings("unchecked")
+        Map<String, Object> max = (Map<String, Object>) dims.get("maxPoolSize");
+        assertThat(max.get("effective")).isEqualTo(2);
+        assertThat(max.get("clamped")).isEqualTo(false);
+    }
+
+    @Test
+    void exampleJsonDoesNotBreakConfigLoading() throws Exception {
+        // 用与生产一致的 ObjectMapper 配置读取真实 example JSON，
+        // 证明 _restartNote 未知字段不会导致热配置拒载
+        // Spring Boot 默认 FAIL_ON_UNKNOWN_PROPERTIES = false
+        com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+        mapper.configure(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+        java.io.File exampleFile = new java.io.File("config/agent-llm.local.example.json");
+        assertThat(exampleFile).exists();
+
+        // 不应抛异常
+        AgentLlmProperties props = mapper.readValue(exampleFile, AgentLlmProperties.class);
+
+        assertThat(props.getExecutor()).isNotNull();
+        assertThat(props.getExecutor().getParallel()).isNotNull();
+        assertThat(props.getExecutor().getParallel().getHard()).isNotNull();
+        assertThat(props.getExecutor().getParallel().getHard().getCorePoolSize()).isEqualTo(100);
+        assertThat(props.getExecutor().getParallel().getCurrent()).isNotNull();
+        assertThat(props.getExecutor().getParallel().getCurrent().getCorePoolSize()).isEqualTo(10);
     }
 
     private static AgentLlmProperties configWithHardAndCurrent(
