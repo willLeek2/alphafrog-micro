@@ -5,6 +5,7 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 import world.willfrog.agent.platform.config.AgentLlmProperties;
+import world.willfrog.agent.platform.prompt.PromptRunSelection;
 import world.willfrog.agent.platform.config.RunStageConfig;
 import world.willfrog.agent.platform.config.StageLlmConfig;
 import world.willfrog.agent.platform.dataanalysis.PythonRepairContext;
@@ -139,6 +140,9 @@ public class AgentContext {
      */
     private static final ThreadLocal<AgentLlmProperties.DataFreshness> DATA_FRESHNESS_HOLDER = new ThreadLocal<>();
 
+    /** D02：Run 创建时冻结的 Prompt 版本、摘要和参考日期。 */
+    private static final ThreadLocal<PromptRunSelection> PROMPT_RUN_SELECTION_HOLDER = new ThreadLocal<>();
+
     /**
      * DashScope thinking 内容：从流式响应中提取的 reasoning_content。
      */
@@ -152,7 +156,7 @@ public class AgentContext {
     /**
      * 90% last-mile hint：当本 run 的任意预算维度首次跨过 90% 时，
      * {@code AgentRunBudgetService} 写入一段中文提示文本到本 ThreadLocal；
-     * 下一次 {@code LangchainTodoNodeExecutor} 的 {@code chatRequestTransformer} 读取并注入到 SystemMessage，
+     * 下一次 {@code LangchainTodoNodeExecutor} 的 {@code chatRequestTransformer} 读取并追加为 UserMessage，
      * 促使 LLM 在剩余预算内尽快给出最终结论。
      * <p>字符串内容由 budget service 拼装（含维度名 / 实际值 / 上限 / 建议话术），
      * transformer 只负责"读到就注入、读不到就透传"。</p>
@@ -548,6 +552,22 @@ public class AgentContext {
         DATA_FRESHNESS_HOLDER.remove();
     }
 
+    public static PromptRunSelection getPromptRunSelection() {
+        return PROMPT_RUN_SELECTION_HOLDER.get();
+    }
+
+    public static void setPromptRunSelection(PromptRunSelection selection) {
+        if (selection == null) {
+            PROMPT_RUN_SELECTION_HOLDER.remove();
+        } else {
+            PROMPT_RUN_SELECTION_HOLDER.set(selection);
+        }
+    }
+
+    public static void clearPromptRunSelection() {
+        PROMPT_RUN_SELECTION_HOLDER.remove();
+    }
+
     /** 设置流式响应中提取的 thinking 内容(DashScope reasoning_content 等)。 */
     public static void setThinkingContent(String content) {
         THINKING_CONTENT_HOLDER.set(content);
@@ -580,7 +600,7 @@ public class AgentContext {
 
     /**
      * 设置 90% last-mile hint 文本（由 {@code AgentRunBudgetService} 在首次跨过 90% 阈值时调用）。
-     * 空白值等价于清理,避免误把空字符串当成有效 hint 注入到 SystemMessage。
+     * 空白值等价于清理,避免误把空字符串当成有效 User 阶段说明。
      */
     public static void setLastMileHint(String hint) {
         if (hint == null || hint.isBlank()) {
@@ -593,7 +613,7 @@ public class AgentContext {
     /**
      * 获取 90% last-mile hint,可能为 null(未设置或已清理)。
      * 由 {@code LangchainTodoNodeExecutor#chatRequestTransformer} 读取,
-     * 读到非空字符串时拼接到 SystemMessage 末尾促使 LLM 尽快给出最终结论。
+     * 读到非空字符串时追加为 UserMessage，促使 LLM 尽快给出最终结论且不改写稳定 System。
      */
     public static String getLastMileHint() {
         return LAST_MILE_HINT_HOLDER.get();
@@ -752,6 +772,7 @@ public class AgentContext {
                 getEffectiveExecutionStageConfig(),
                 getWorkflow(),
                 getDataFreshness(),
+                getPromptRunSelection(),
                 getLastMileHint(),
                 getDebugObservabilitySessionId(),
                 getToolJobResumeToken(),
@@ -834,6 +855,11 @@ public class AgentContext {
         } else {
             setDataFreshness(snapshot.dataFreshness());
         }
+        if (snapshot.promptRunSelection() == null) {
+            clearPromptRunSelection();
+        } else {
+            setPromptRunSelection(snapshot.promptRunSelection());
+        }
         // last-mile hint:子线程的 LLM 调用也需要继承,否则在并行 DAG 子节点里 hint 看不到
         if (snapshot.lastMileHint() == null) {
             clearLastMileHint();
@@ -885,6 +911,7 @@ public class AgentContext {
         clearStageConfig();
         clearEffectiveExecutionStageConfig();
         clearDataFreshness();
+        clearPromptRunSelection();
         clearThinkingContent();
         clearStreamingProgress();
         clearLastMileHint();
@@ -944,6 +971,7 @@ public class AgentContext {
             StageLlmConfig effectiveExecutionStageConfig,
             String workflow,
             AgentLlmProperties.DataFreshness dataFreshness,
+            PromptRunSelection promptRunSelection,
             String lastMileHint,
             String debugObservabilitySessionId,
             String toolJobResumeToken,

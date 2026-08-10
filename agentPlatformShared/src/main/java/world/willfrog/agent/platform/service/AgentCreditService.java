@@ -103,12 +103,22 @@ public class AgentCreditService {
                 continue;
             }
             Map<String, Object> payload = readJsonMap(event.getPayloadJson());
+            // D07：限流拒绝（未执行工具体）一律 0 credit；该判定优先于显式 credits 字段，
+            // 防止未来某个发射点漏写 creditsConsumed=0 时按默认单价误扣。
+            Boolean throttleRejected = toBoolean(payload.get("rejected_by_throttle"));
+            if (Boolean.TRUE.equals(throttleRejected)) {
+                continue;
+            }
+            String toolName = firstString(payload.get("toolName"), payload.get("tool_name"));
+            // D07：元工具豁免（预算/业务 trace/credit），checkParallelLimits 不产生按次工具执行 credit
+            if ("checkParallelLimits".equals(toolName)) {
+                continue;
+            }
             Integer payloadCredits = firstInt(payload.get("creditsConsumed"), payload.get("credits_consumed"));
             if (payloadCredits != null && payloadCredits >= 0) {
                 toolCredits += payloadCredits;
                 continue;
             }
-            String toolName = firstString(payload.get("toolName"), payload.get("tool_name"));
             boolean cacheHit = extractCacheHit(payload);
             toolCredits += calculateToolCredits(toolName, cacheHit);
         }

@@ -15,8 +15,10 @@ import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.entity.AgentRunEvent;
 import world.willfrog.agent.platform.mapper.AgentRunEventMapper;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
+import world.willfrog.agent.platform.prompt.PromptRunSelection;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 
+import java.time.LocalDate;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -67,6 +69,12 @@ class AgentEventServiceTest {
                 messageService,
                 mockPromptService
         );
+        org.mockito.Mockito.lenient().when(mockPromptService.snapshotPromptSelection(
+                        anyString(), anyString(), any()))
+                .thenReturn(new PromptRunSelection(
+                        PromptRunSelection.SCHEMA_VERSION,
+                        "default-v1", "control", "bundle-digest", "capability-digest",
+                        LocalDate.of(2025, 2, 3)));
     }
 
     @Test
@@ -275,6 +283,12 @@ class AgentEventServiceTest {
         assertEquals("{}", captured.getToolJobAnchorJson());
         Map<?, ?> ext = objectMapper.readValue(captured.getExt(), Map.class);
         assertEquals("DAG", ext.get("execution_mode"));
+        Map<?, ?> promptSelection = (Map<?, ?>) ext.get("prompt_selection");
+        assertEquals("default-v1", promptSelection.get("bundle_version"));
+        assertEquals("control", promptSelection.get("variant"));
+        assertEquals("bundle-digest", promptSelection.get("bundle_digest"));
+        assertEquals("capability-digest", promptSelection.get("capability_catalog_digest"));
+        assertEquals("2025-02-03", promptSelection.get("reference_date"));
         Map<?, ?> df = (Map<?, ?>) ext.get("data_freshness");
         assertEquals("2020-01-01", df.get("start_date"));
         assertEquals("2026-06-24", df.get("end_date"));

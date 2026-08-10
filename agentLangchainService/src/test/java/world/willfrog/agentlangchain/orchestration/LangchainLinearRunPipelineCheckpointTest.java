@@ -95,6 +95,7 @@ class LangchainLinearRunPipelineCheckpointTest {
                 LangchainRunSchedulerTestSupport.immediateScheduler(), credit,
                 mock(AgentRunCreditSettlementService.class),
                 mock(world.willfrog.agent.platform.event.AgentRunFinalizationService.class),
+                mock(world.willfrog.agent.platform.service.AgentPromptService.class),
                 registryProvider, mock(ObjectProvider.class));
         Field field = LangchainLinearRunPipelineImpl.class.getDeclaredField("toolJobCheckpointWriter");
         field.setAccessible(true);

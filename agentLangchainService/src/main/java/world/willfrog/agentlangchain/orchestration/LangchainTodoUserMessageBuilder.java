@@ -24,7 +24,26 @@ final class LangchainTodoUserMessageBuilder {
                                        Map<String, String> datasetRefs,
                                        String todoDescription,
                                        List<ToolSpecification> toolSpecifications) {
+        Set<String> names = resolveToolNames(toolSpecifications);
+        return buildTodoUserMessage(
+                promptService,
+                userGoal,
+                completedTodos,
+                datasetRefs,
+                todoDescription,
+                toolSpecifications,
+                promptService.renderToolCapabilities(names));
+    }
+
+    static String buildTodoUserMessage(AgentPromptService promptService,
+                                       String userGoal,
+                                       List<LangchainCompletedTodo> completedTodos,
+                                       Map<String, String> datasetRefs,
+                                       String todoDescription,
+                                       List<ToolSpecification> toolSpecifications,
+                                       String renderedToolCapabilities) {
         StringBuilder message = new StringBuilder();
+        message.append(promptService.dagReactStageInstruction(renderedToolCapabilities)).append("\n\n");
         message.append(promptService.dynamicContextPrefix()).append("\n\n");
         message.append("用户目标：").append(safe(userGoal)).append("\n\n");
         Set<String> toolNames = resolveToolNames(toolSpecifications);
@@ -40,15 +59,10 @@ final class LangchainTodoUserMessageBuilder {
         }
         message.append("当前任务: ").append(safe(todoDescription)).append("\n\n");
         if (datasetRefs != null && !datasetRefs.isEmpty()) {
-            message.append("已有原始数据集 ID:\n");
+            message.append("已有原始数据引用（来自前序工具输出，仅用于定位前序产出）:\n");
             datasetRefs.keySet().forEach(id -> message.append("  - ").append(id).append("\n"));
             message.append("\n");
         }
-        message.append("请决定如何完成。\n");
-        message.append("需要调用工具时请直接使用系统提供的工具调用能力，不要手写 JSON。\n");
-        message.append("如果当前任务要求调用工具，下一条消息必须是实际工具调用；不要只说明计划或展示参数。\n");
-        message.append("无需工具时，请直接输出最终回答内容。\n");
-        message.append("⚠️ 警告：工具参数名必须与工具规范完全一致。");
         return message.toString();
     }
 
@@ -69,14 +83,6 @@ final class LangchainTodoUserMessageBuilder {
                 }
             }
         }
-        context.append("\n请根据以上所有任务结果，生成对用户问题可直接展示的最终回答。");
-        context.append("\n请直接输出 Markdown，不要把回答包在 JSON 或代码块里。");
-        // Spec §11 块外隔离（codex e740f454）：金融数值表由服务端在模型文本之后确定性追加，
-        // 模型只写块外说明，且块外文字同样不得复述环境、证据或任何内部身份。
-        context.append("\n金融计算的数值结果表由服务端在你的回答之后自动追加，你只需撰写必要的文字解释，不要自己拼表。");
-        context.append("\n禁止在回答中复述或拼接任何内部身份与后台信息：方法版本、规范或内容 digest（含 sha256: 前缀值）、"
-                + "运行/记录/批次/结果块/任务/数据集/工具调用等 ID、执行环境或镜像身份、包/API 版本、"
-                + "证据类型或等级、来源 resolver 信息，以及任何内部警告。");
         return context.toString();
     }
 

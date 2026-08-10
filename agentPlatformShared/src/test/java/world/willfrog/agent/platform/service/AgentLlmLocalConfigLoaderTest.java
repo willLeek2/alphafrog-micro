@@ -1,11 +1,12 @@
 package world.willfrog.agent.platform.service;
 
-import world.willfrog.agent.platform.service.*;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
+import world.willfrog.agent.platform.util.PromptFileLoader;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -27,11 +28,81 @@ class AgentLlmLocalConfigLoaderTest {
     Path tempDir;
 
     @Test
+    void realLocalExample_shouldResolveEveryConfiguredPromptProjection() throws Exception {
+        Path root = repositoryRoot();
+        Path example = root.resolve("agentLangchainService/config/agent-llm.local.example.json");
+        ObjectMapper mapper = new ObjectMapper();
+        AgentLlmLocalConfigLoader loader = new AgentLlmLocalConfigLoader(mapper);
+        ReflectionTestUtils.setField(loader, "configFile", example.toString());
+
+        loader.load();
+
+        AgentLlmProperties.Prompts prompts = loader.current().orElseThrow().getPrompts();
+        var configured = mapper.readTree(Files.readString(example)).path("prompts");
+        configured.fieldNames().forEachRemaining(field -> {
+            try {
+                if ("pythonRefineRequirementsFile".equals(field)) {
+                    assertFalse(prompts.getPythonRefineRequirements().isEmpty());
+                    return;
+                }
+                if ("datasetFieldSpecsFile".equals(field)) {
+                    assertFalse(prompts.getDatasetFieldSpecs().isEmpty());
+                    return;
+                }
+                String bodyField = field.endsWith("File")
+                        ? field.substring(0, field.length() - "File".length())
+                        : field;
+                String getter = "get" + Character.toUpperCase(bodyField.charAt(0)) + bodyField.substring(1);
+                Object value = AgentLlmProperties.Prompts.class.getMethod(getter).invoke(prompts);
+                assertTrue(value instanceof String && !((String) value).isBlank(),
+                        "示例字段未解析为正文: " + field);
+            } catch (ReflectiveOperationException e) {
+                throw new AssertionError("示例字段没有对应正文 getter: " + field, e);
+            }
+        });
+        PromptAuthority.shared().validateProjection(prompts, "real local example");
+        assertEquals(0L, loader.promptReloadFailureCount());
+    }
+
+    @Test
+    void refresh_shouldRetainLastSnapshotWhenFollowUpSummaryProjectionDrifts() throws Exception {
+        Path promptsDir = tempDir.resolve("prompts").resolve("agent");
+        Files.createDirectories(promptsDir);
+        Path summaryPromptFile = promptsDir.resolve("follow_up_summary_system.txt");
+        String authorityText = authorityText("prompts/agent/follow_up_summary_system.txt");
+        Files.writeString(summaryPromptFile, authorityText, StandardCharsets.UTF_8);
+
+        Path configFile = tempDir.resolve("agent-llm.local.json");
+        Files.writeString(configFile, """
+                {
+                  "prompts": {
+                    "followUpSummarySystemPrompt": "file:prompts/agent/follow_up_summary_system.txt"
+                  }
+                }
+                """, StandardCharsets.UTF_8);
+
+        AgentLlmLocalConfigLoader loader = new AgentLlmLocalConfigLoader(new ObjectMapper());
+        ReflectionTestUtils.setField(loader, "configFile", configFile.toString());
+        loader.load();
+        assertEquals(authorityText,
+                loader.current().orElseThrow().getPrompts().getFollowUpSummarySystemPrompt());
+
+        Thread.sleep(5L);
+        Files.writeString(summaryPromptFile, "divergent follow-up summary prompt", StandardCharsets.UTF_8);
+        loader.refresh();
+
+        assertEquals(authorityText,
+                loader.current().orElseThrow().getPrompts().getFollowUpSummarySystemPrompt());
+        assertEquals(1L, loader.promptReloadFailureCount());
+    }
+
+    @Test
     void load_shouldParseNewExecutionJudgeAndSemanticPromptFields() throws Exception {
         Path promptsDir = tempDir.resolve("prompts").resolve("judge");
         Files.createDirectories(promptsDir);
         Path semanticPromptFile = promptsDir.resolve("semantic_judge_system.txt");
-        Files.writeString(semanticPromptFile, "semantic prompt v1", StandardCharsets.UTF_8);
+        String authorityText = authorityText("prompts/judge/semantic_judge_system.txt");
+        Files.writeString(semanticPromptFile, authorityText, StandardCharsets.UTF_8);
 
         Path configFile = tempDir.resolve("agent-llm.local.json");
         Files.writeString(configFile, """
@@ -91,15 +162,16 @@ class AgentLlmLocalConfigLoaderTest {
         assertEquals("openrouter", judge.getRoutes().get(0).getEndpointName());
         assertEquals("openai/gpt-5.2", judge.getRoutes().get(0).getModels().get(0));
 
-        assertEquals("semantic prompt v1", local.getPrompts().getSemanticJudgeSystemPromptTemplate());
+        assertEquals(authorityText, local.getPrompts().getSemanticJudgeSystemPromptTemplate());
     }
 
     @Test
-    void refresh_shouldReloadWhenSemanticPromptFileChanges() throws Exception {
+    void refresh_shouldRetainLastSnapshotWhenSemanticProjectionDrifts() throws Exception {
         Path promptsDir = tempDir.resolve("prompts").resolve("judge");
         Files.createDirectories(promptsDir);
         Path semanticPromptFile = promptsDir.resolve("semantic_judge_system.txt");
-        Files.writeString(semanticPromptFile, "semantic prompt v1", StandardCharsets.UTF_8);
+        String authorityText = authorityText("prompts/judge/semantic_judge_system.txt");
+        Files.writeString(semanticPromptFile, authorityText, StandardCharsets.UTF_8);
 
         Path configFile = tempDir.resolve("agent-llm.local.json");
         Files.writeString(configFile, """
@@ -117,13 +189,14 @@ class AgentLlmLocalConfigLoaderTest {
         AgentLlmLocalConfigLoader loader = new AgentLlmLocalConfigLoader(new ObjectMapper());
         ReflectionTestUtils.setField(loader, "configFile", configFile.toString());
         loader.load();
-        assertEquals("semantic prompt v1", loader.current().orElseThrow().getPrompts().getSemanticJudgeSystemPromptTemplate());
+        assertEquals(authorityText, loader.current().orElseThrow().getPrompts().getSemanticJudgeSystemPromptTemplate());
 
         Thread.sleep(5L);
-        Files.writeString(semanticPromptFile, "semantic prompt v2", StandardCharsets.UTF_8);
+        Files.writeString(semanticPromptFile, "divergent semantic prompt", StandardCharsets.UTF_8);
         loader.refresh();
 
-        assertEquals("semantic prompt v2", loader.current().orElseThrow().getPrompts().getSemanticJudgeSystemPromptTemplate());
+        assertEquals(authorityText, loader.current().orElseThrow().getPrompts().getSemanticJudgeSystemPromptTemplate());
+        assertEquals(1L, loader.promptReloadFailureCount());
     }
 
     @Test
@@ -189,7 +262,8 @@ class AgentLlmLocalConfigLoaderTest {
         Path promptsDir = tempDir.resolve("prompts").resolve("finance");
         Files.createDirectories(promptsDir);
         Path resolverPromptFile = promptsDir.resolve("finance_method_resolver_system.txt");
-        Files.writeString(resolverPromptFile, "resolver prompt local {{RESOLVER_CATALOG}}", StandardCharsets.UTF_8);
+        String authorityText = authorityText("prompts/finance/finance_method_resolver_system.txt");
+        Files.writeString(resolverPromptFile, authorityText, StandardCharsets.UTF_8);
 
         Path configFile = tempDir.resolve("agent-llm.local.json");
         Files.writeString(configFile, """
@@ -204,16 +278,19 @@ class AgentLlmLocalConfigLoaderTest {
         ReflectionTestUtils.setField(loader, "configFile", configFile.toString());
         loader.load();
 
-        assertEquals("resolver prompt local {{RESOLVER_CATALOG}}",
-                loader.current().orElseThrow().getPrompts().getFinanceMethodResolverSystemPromptFile());
+        var prompts = loader.current().orElseThrow().getPrompts();
+        assertEquals("file:prompts/finance/finance_method_resolver_system.txt",
+                prompts.getFinanceMethodResolverSystemPromptFile());
+        assertEquals(authorityText, prompts.getFinanceMethodResolverSystemPrompt());
     }
 
     @Test
-    void refresh_shouldReloadWhenFinanceMethodResolverPromptFileChanges() throws Exception {
+    void refresh_shouldRetainLastSnapshotWhenFinanceProjectionDrifts() throws Exception {
         Path promptsDir = tempDir.resolve("prompts").resolve("finance");
         Files.createDirectories(promptsDir);
         Path resolverPromptFile = promptsDir.resolve("finance_method_resolver_system.txt");
-        Files.writeString(resolverPromptFile, "resolver prompt v1", StandardCharsets.UTF_8);
+        String authorityText = authorityText("prompts/finance/finance_method_resolver_system.txt");
+        Files.writeString(resolverPromptFile, authorityText, StandardCharsets.UTF_8);
 
         Path configFile = tempDir.resolve("agent-llm.local.json");
         Files.writeString(configFile, """
@@ -227,25 +304,175 @@ class AgentLlmLocalConfigLoaderTest {
         AgentLlmLocalConfigLoader loader = new AgentLlmLocalConfigLoader(new ObjectMapper());
         ReflectionTestUtils.setField(loader, "configFile", configFile.toString());
         loader.load();
-        assertEquals("resolver prompt v1",
-                loader.current().orElseThrow().getPrompts().getFinanceMethodResolverSystemPromptFile());
+        assertEquals(authorityText,
+                loader.current().orElseThrow().getPrompts().getFinanceMethodResolverSystemPrompt());
 
         Thread.sleep(5L);
-        Files.writeString(resolverPromptFile, "resolver prompt v2", StandardCharsets.UTF_8);
+        Files.writeString(resolverPromptFile, "divergent resolver prompt", StandardCharsets.UTF_8);
         loader.refresh();
 
-        assertEquals("resolver prompt v2",
-                loader.current().orElseThrow().getPrompts().getFinanceMethodResolverSystemPromptFile());
+        assertEquals(authorityText,
+                loader.current().orElseThrow().getPrompts().getFinanceMethodResolverSystemPrompt());
+        assertEquals(1L, loader.promptReloadFailureCount());
     }
 
     @Test
-    void localFileOverride_shouldDriveActualSystemPromptAndPromptVersionEndToEnd() throws Exception {
-        // codex 80166252 item 6 端到端：临时 local file 内容 → loader resolvePromptText →
-        // AgentPromptService 实际模板（local 优先于 classpath）→ 渲染后 system prompt 与模板摘要一致。
+    void load_shouldKeepInlinePlanningBodyWhenFileFieldIsBlank() throws Exception {
+        String authorityText = authorityText("prompts/todo/planning_strategy_stage.txt");
+        ObjectMapper mapper = new ObjectMapper();
+        var root = mapper.createObjectNode();
+        var promptsNode = root.putObject("prompts");
+        promptsNode.put("planningStrategyStage", authorityText);
+        promptsNode.put("planningStrategyStageFile", "   ");
+        Path configFile = tempDir.resolve("agent-llm.local.json");
+        Files.writeString(configFile, mapper.writeValueAsString(root), StandardCharsets.UTF_8);
+
+        AgentLlmLocalConfigLoader loader = new AgentLlmLocalConfigLoader(mapper);
+        ReflectionTestUtils.setField(loader, "configFile", configFile.toString());
+        loader.load();
+
+        var prompts = loader.current().orElseThrow().getPrompts();
+        assertEquals(authorityText, prompts.getPlanningStrategyStage());
+        assertTrue(prompts.getPlanningStrategyStageFile().isBlank());
+    }
+
+    @Test
+    void load_shouldUsePlanningFileWhenInlineBodyIsBlank() throws Exception {
+        String authorityText = authorityText("prompts/todo/planning_strategy_stage.txt");
+        Path promptFile = tempDir.resolve("planning_strategy_stage.txt");
+        Files.writeString(promptFile, authorityText, StandardCharsets.UTF_8);
+        ObjectMapper mapper = new ObjectMapper();
+        var root = mapper.createObjectNode();
+        var promptsNode = root.putObject("prompts");
+        promptsNode.put("planningStrategyStage", "   ");
+        promptsNode.put("planningStrategyStageFile", promptFile.toString());
+        Path configFile = tempDir.resolve("agent-llm.local.json");
+        Files.writeString(configFile, mapper.writeValueAsString(root), StandardCharsets.UTF_8);
+
+        AgentLlmLocalConfigLoader loader = new AgentLlmLocalConfigLoader(mapper);
+        ReflectionTestUtils.setField(loader, "configFile", configFile.toString());
+        loader.load();
+
+        var prompts = loader.current().orElseThrow().getPrompts();
+        assertEquals(authorityText, prompts.getPlanningStrategyStage());
+        assertEquals(promptFile.toString(), prompts.getPlanningStrategyStageFile());
+    }
+
+    @Test
+    void load_shouldRejectBlankFileFieldWhenItIsTheOnlyConfiguredSource() throws Exception {
+        Path configFile = tempDir.resolve("agent-llm.local.json");
+        Files.writeString(configFile, """
+                {"prompts":{"planningStrategyStageFile":"   "}}
+                """, StandardCharsets.UTF_8);
+
+        AgentLlmLocalConfigLoader loader = new AgentLlmLocalConfigLoader(new ObjectMapper());
+        ReflectionTestUtils.setField(loader, "configFile", configFile.toString());
+        loader.load();
+
+        assertTrue(loader.current().isEmpty());
+        assertEquals(1L, loader.promptReloadFailureCount());
+    }
+
+    @Test
+    void load_shouldRejectAmbiguousBodyAndFileAndExposeMetric() throws Exception {
+        String authorityText = authorityText("prompts/todo/planning_strategy_stage.txt");
+        Path promptFile = tempDir.resolve("planning_strategy_stage.txt");
+        Files.writeString(promptFile, authorityText, StandardCharsets.UTF_8);
+        ObjectMapper mapper = new ObjectMapper();
+        var root = mapper.createObjectNode();
+        var promptsNode = root.putObject("prompts");
+        promptsNode.put("planningStrategyStage", authorityText);
+        promptsNode.put("planningStrategyStageFile", promptFile.toString());
+        Path configFile = tempDir.resolve("agent-llm.local.json");
+        Files.writeString(configFile, mapper.writeValueAsString(root), StandardCharsets.UTF_8);
+
+        AgentLlmLocalConfigLoader loader = new AgentLlmLocalConfigLoader(mapper);
+        SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
+        ReflectionTestUtils.setField(loader, "configFile", configFile.toString());
+        ReflectionTestUtils.setField(loader, "meterRegistry", meterRegistry);
+        loader.load();
+
+        assertTrue(loader.current().isEmpty(), "歧义候选不能成为当前快照");
+        assertEquals(1L, loader.promptReloadFailureCount());
+        assertEquals(1.0D, meterRegistry.counter(
+                "agent.prompt.config.reload.failures", "reason", "ambiguous_body_and_file").count());
+    }
+
+    @Test
+    void load_shouldResolveFileReferencePlacedInFinanceBodyField() throws Exception {
+        String authorityText = authorityText("prompts/finance/finance_method_resolver_system.txt");
+        Path promptFile = tempDir.resolve("finance_method_resolver_system.txt");
+        Files.writeString(promptFile, authorityText, StandardCharsets.UTF_8);
+        ObjectMapper mapper = new ObjectMapper();
+        var root = mapper.createObjectNode();
+        root.putObject("prompts")
+                .put("financeMethodResolverSystemPrompt", "file:" + promptFile);
+        Path configFile = tempDir.resolve("agent-llm.local.json");
+        Files.writeString(configFile, mapper.writeValueAsString(root), StandardCharsets.UTF_8);
+
+        AgentLlmLocalConfigLoader loader = new AgentLlmLocalConfigLoader(mapper);
+        ReflectionTestUtils.setField(loader, "configFile", configFile.toString());
+        loader.load();
+
+        var prompts = loader.current().orElseThrow().getPrompts();
+        assertEquals(authorityText, prompts.getFinanceMethodResolverSystemPrompt());
+        assertNull(prompts.getFinanceMethodResolverSystemPromptFile());
+    }
+
+    @Test
+    void load_shouldRejectMissingPromptFileInsteadOfSubmittingBlankSnapshot() throws Exception {
+        Path configFile = tempDir.resolve("agent-llm.local.json");
+        Files.writeString(configFile, """
+                {"prompts":{"dagReactSystemPrompt":"file:missing/dag.txt"}}
+                """, StandardCharsets.UTF_8);
+
+        AgentLlmLocalConfigLoader loader = new AgentLlmLocalConfigLoader(new ObjectMapper());
+        ReflectionTestUtils.setField(loader, "configFile", configFile.toString());
+        loader.load();
+
+        assertTrue(loader.current().isEmpty());
+        assertEquals(1L, loader.promptReloadFailureCount());
+    }
+
+    @Test
+    void refresh_shouldRetainLastSnapshotWhenConfigFileTemporarilyDisappears() throws Exception {
+        Path configFile = tempDir.resolve("agent-llm.local.json");
+        Files.writeString(configFile, """
+                {"runtime":{"request":{"maxRetries":7}}}
+                """, StandardCharsets.UTF_8);
+        AgentLlmLocalConfigLoader loader = new AgentLlmLocalConfigLoader(new ObjectMapper());
+        ReflectionTestUtils.setField(loader, "configFile", configFile.toString());
+        loader.load();
+        assertEquals(7, loader.current().orElseThrow().getRuntime().getRequest().getMaxRetries());
+
+        Files.delete(configFile);
+        loader.refresh();
+
+        assertEquals(7, loader.current().orElseThrow().getRuntime().getRequest().getMaxRetries());
+        assertEquals(1L, loader.promptReloadFailureCount());
+    }
+
+    @Test
+    void load_emptyPrompts_shouldNotTurnDefaultPathIntoPlanningBody() throws Exception {
+        Path configFile = tempDir.resolve("agent-llm.local.json");
+        Files.writeString(configFile, "{\"prompts\":{}}", StandardCharsets.UTF_8);
+        AgentLlmLocalConfigLoader loader = new AgentLlmLocalConfigLoader(new ObjectMapper());
+        ReflectionTestUtils.setField(loader, "configFile", configFile.toString());
+        loader.load();
+
+        var prompts = loader.current().orElseThrow().getPrompts();
+        assertNull(prompts.getPlanningStrategyStage());
+        assertNull(prompts.getPlanningStrategyStageFile());
+        assertNull(prompts.getPlanningTodosStage());
+        assertNull(prompts.getPlanningTodosStageFile());
+    }
+
+    @Test
+    void localProjection_shouldDriveActualSystemPromptWithoutCreatingSecondTruth() throws Exception {
         Path promptsDir = tempDir.resolve("prompts").resolve("finance");
         Files.createDirectories(promptsDir);
         Path resolverPromptFile = promptsDir.resolve("finance_method_resolver_system.txt");
-        String localTemplate = "LOCAL resolver template body\n目录如下：{{RESOLVER_CATALOG}}\n结束";
+        String localTemplate = authorityText("prompts/finance/finance_method_resolver_system.txt");
         Files.writeString(resolverPromptFile, localTemplate, StandardCharsets.UTF_8);
 
         Path configFile = tempDir.resolve("agent-llm.local.json");
@@ -266,22 +493,17 @@ class AgentLlmLocalConfigLoaderTest {
         assertEquals(localTemplate, template);
 
         String rendered = promptService.financeMethodResolverSystemPrompt("COMPACT-CATALOG");
-        assertTrue(rendered.contains("LOCAL resolver template body"));
+        assertTrue(rendered.contains("金融方法建议器"));
         assertTrue(rendered.contains("COMPACT-CATALOG"));
         assertFalse(rendered.contains("{{RESOLVER_CATALOG}}"));
-        // promptVersion 摘要输入就是上面的 template（ModelService 侧测试已断言 sha256 计算），
-        // 这里钉死"local file 内容 == 实际模板"这一端到端事实即可。
     }
 
     @Test
-    void localFileOverride_shouldDriveResolverModelServiceSystemMessageAndPromptVersion() throws Exception {
-        // 真实链：loader → AgentPromptService → FinanceMethodResolverModelService（仅 mock route/ChatModel）。
-        // 断言实际 SystemMessage 精确等于 local template 单次插入 catalog，且 Ok.resolverPromptVersion
-        // 是 local template 逐字节的 sha256，而不是 classpath 默认模板摘要。
+    void localProjection_shouldKeepResolverPromptVersionEqualToClasspathAuthority() throws Exception {
         Path promptsDir = tempDir.resolve("prompts").resolve("finance");
         Files.createDirectories(promptsDir);
         Path resolverPromptFile = promptsDir.resolve("finance_method_resolver_system.txt");
-        String localTemplate = "E2E local resolver template body\n目录：{{RESOLVER_CATALOG}}\n末尾";
+        String localTemplate = authorityText("prompts/finance/finance_method_resolver_system.txt");
         Files.writeString(resolverPromptFile, localTemplate, StandardCharsets.UTF_8);
 
         Path configFile = tempDir.resolve("agent-llm.local.json");
@@ -342,8 +564,8 @@ class AgentLlmLocalConfigLoaderTest {
         }
         String classpathDigest = "sha256:" + java.util.HexFormat.of().formatHex(
                 java.security.MessageDigest.getInstance("SHA-256").digest(classpathBytes));
-        org.junit.jupiter.api.Assertions.assertNotEquals(classpathDigest, ok.resolverPromptVersion(),
-                "local override 必须驱动 promptVersion，不能落回 classpath 默认模板摘要");
+        assertEquals(classpathDigest, ok.resolverPromptVersion(),
+                "外置投影不能产生不同于 classpath 权威正文的 promptVersion");
 
         org.mockito.ArgumentCaptor<java.util.List<dev.langchain4j.data.message.ChatMessage>> captor =
                 org.mockito.ArgumentCaptor.forClass(java.util.List.class);
@@ -506,7 +728,8 @@ class AgentLlmLocalConfigLoaderTest {
         Path promptsDir = tempDir.resolve("prompts").resolve("todo");
         Files.createDirectories(promptsDir);
         Path guidanceFile = promptsDir.resolve("dag_mode_guidance.txt");
-        Files.writeString(guidanceFile, "dag guidance v1", StandardCharsets.UTF_8);
+        String authorityText = authorityText("prompts/todo/dag_mode_guidance.txt");
+        Files.writeString(guidanceFile, authorityText, StandardCharsets.UTF_8);
 
         Path configFile = tempDir.resolve("agent-llm.local.json");
         Files.writeString(configFile, """
@@ -522,7 +745,9 @@ class AgentLlmLocalConfigLoaderTest {
         loader.load();
 
         var local = loader.current().orElseThrow();
-        assertEquals("dag guidance v1", local.getPrompts().getDagModeGuidancePromptFile());
+        assertEquals("file:prompts/todo/dag_mode_guidance.txt",
+                local.getPrompts().getDagModeGuidancePromptFile());
+        assertEquals(authorityText, local.getPrompts().getDagModeGuidancePrompt());
     }
 
     @Test
@@ -781,6 +1006,8 @@ class AgentLlmLocalConfigLoaderTest {
         loader.load();
 
         assertTrue(loader.current().isEmpty());
+        assertEquals(1L, loader.promptReloadFailureCount(),
+                "损坏的热加载文件必须产生可告警失败信号");
     }
 
     @Test
@@ -1041,5 +1268,23 @@ class AgentLlmLocalConfigLoaderTest {
         assertEquals(world.willfrog.agent.platform.finance.FinanceMethodResolverClient.ErrorKind.BAD_JSON,
                 error.kind());
         assertTrue(error.message().contains("candidate count"));
+    }
+
+    private static String authorityText(String path) {
+        String text = PromptFileLoader.load(path);
+        assertFalse(text.isBlank(), "测试所需权威 Prompt 必须存在: " + path);
+        return text;
+    }
+
+    private static Path repositoryRoot() {
+        Path current = Path.of("").toAbsolutePath().normalize();
+        while (current != null) {
+            if (Files.isDirectory(current.resolve("agentPlatformShared"))
+                    && Files.isDirectory(current.resolve("agentLangchainService"))) {
+                return current;
+            }
+            current = current.getParent();
+        }
+        throw new IllegalStateException("找不到仓库根目录");
     }
 }

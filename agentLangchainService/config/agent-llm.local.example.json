@@ -415,6 +415,7 @@
   },
   "prompts": {
     "agentRunSystemPrompt": "file:prompts/agent/agent_run_system.txt",
+    "followUpSummarySystemPrompt": "file:prompts/agent/follow_up_summary_system.txt",
     "todoPlannerSystemPromptTemplate": "file:prompts/todo/todo_planner_system.txt",
     "workflowFinalSystemPrompt": "file:prompts/workflow/workflow_final_system.txt",
     "workflowTodoRecoverySystemPrompt": "file:prompts/workflow/workflow_todo_recovery_system.txt",
@@ -436,6 +437,15 @@
     "dagReactSystemPromptFile": "file:prompts/todo/dag_react_system.txt",
     "dagModeGuidancePromptFile": "file:prompts/todo/dag_mode_guidance.txt",
     "planningStrategyStageFile": "file:prompts/todo/planning_strategy_stage.txt",
-    "planningTodosStageFile": "file:prompts/todo/planning_todos_stage.txt"
+    "planningTodosStageFile": "file:prompts/todo/planning_todos_stage.txt",
+    "planningAnalysisStage": "file:prompts/todo/planning_analysis_stage.txt",
+    "planningStructuredStage": "file:prompts/todo/planning_structured_stage.txt",
+    "planningLinearModeGuidance": "file:prompts/todo/planning_linear_mode_guidance.txt",
+    "planningDagModeGuidance": "file:prompts/todo/planning_dag_mode_guidance.txt",
+    "planningLinearConstraint": "file:prompts/todo/planning_linear_constraint.txt",
+    "pythonRepairStageInstruction": "file:prompts/python/python_repair_stage.txt",
+    "emptyOutputRecoveryStageInstruction": "file:prompts/todo/empty_output_recovery_stage.txt",
+    "budgetLastMileStageInstruction": "file:prompts/agent/budget_last_mile_stage.txt",
+    "toolCapabilityCatalog": "file:prompts/tools/tool_capability_catalog.json"
   }
 }
