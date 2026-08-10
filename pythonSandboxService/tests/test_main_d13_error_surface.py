@@ -94,8 +94,18 @@ class MainD13ErrorSurfaceTest(unittest.IsolatedAsyncioTestCase):
         self.store_patch.start()
         self.tasks_patch.start()
         self.queue_patch.start()
+        # D14: this suite still exercises keyless create for timeout-surface
+        # fixtures. Explicit non-production compat — production refuse coverage
+        # lives in test_main_d14_operation_id_gate.py.
+        self.config_patch = patch.object(
+            main,
+            "config",
+            dataclasses.replace(main.config, allow_create_without_operation_id=True),
+        )
+        self.config_patch.start()
 
     async def asyncTearDown(self) -> None:
+        self.config_patch.stop()
         self.queue_patch.stop()
         self.tasks_patch.stop()
         self.store_patch.stop()

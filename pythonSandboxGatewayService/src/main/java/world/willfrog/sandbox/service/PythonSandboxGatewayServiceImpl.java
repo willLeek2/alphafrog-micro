@@ -51,6 +51,15 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
     @Value("${sandbox.service.queue-prepare-margin-millis:300000}")
     private long queuePrepareMarginMillis = 300000L;
 
+    /**
+     * D14 (Q-14): production create requires a non-blank operationId and
+     * grouped canonical identity. Default false = fail-closed. Set true only
+     * for explicitly annotated non-production fixtures (no idempotent recovery;
+     * "resourceClass-only" transitional clients must not hit production).
+     */
+    @Value("${sandbox.gateway.allow-create-without-operation-id:false}")
+    private boolean allowCreateWithoutOperationId = false;
+
     public PythonSandboxGatewayServiceImpl(
             @Qualifier("sandboxLongHttpClient") RestTemplate longHttpClient,
             @Qualifier("sandboxShortHttpClient") RestTemplate shortHttpClient,
@@ -134,12 +143,36 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
              * libraries 和 timeoutSeconds，导致 Python 侧退回默认 STANDARD 资源配置，同时完全
              * 收不到 operationId/requestFingerprint，createTask 的幂等索引形同虚设。
              *
+             * D14 (Q-14): production rejects blank operationId before HTTP. The
+             * transitional "resourceClass only" path is non-production-only behind
+             * sandbox.gateway.allow-create-without-operation-id=true.
+             *
              * proto3 标量没有 presence；因此只有 operationId 非空时才把 canonical 数值零值也
-             * 写入 HTTP DTO。旧客户端没有 operationId 时继续沿用 Python 默认值，避免把空字符串
-             * resource_class 或 0 memory_limit_bytes 发送给 Pydantic 后被 422 拒绝。
+             * 写入 HTTP DTO。
              */
             boolean canonicalCreate = request.getOperationId() != null
                     && !request.getOperationId().isBlank();
+            if (!canonicalCreate) {
+                if (!allowCreateWithoutOperationId) {
+                    SandboxErrorDetail detail = SandboxErrorDetail.newBuilder()
+                            .setCategory(SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_INVALID_ARGUMENT)
+                            .build();
+                    String text = "createTask rejected: operationId is required "
+                            + "(D14 production refuse create without idempotency key; "
+                            + "resourceClass-only transitional clients are non-production only — "
+                            + "set sandbox.gateway.allow-create-without-operation-id=true explicitly)";
+                    log.warn("sandbox.createTask.localRejectMissingOperationId: resourceClass={}, totalDurationMs={}",
+                            request.getResourceClass(),
+                            System.currentTimeMillis() - startMs);
+                    return ExecuteResponse.newBuilder()
+                            .setError(text)
+                            .setErrorDetail(detail)
+                            .build();
+                }
+                log.warn("sandbox.createTask.allowWithoutOperationId: "
+                        + "allow-create-without-operation-id=true "
+                        + "(NON-PRODUCTION: no idempotent recovery)");
+            }
             if (canonicalCreate) {
                 httpRequest.setResource_class(request.getResourceClass());
                 httpRequest.setEstimated_rows(request.getEstimatedRows());
@@ -158,7 +191,7 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
                 httpRequest.setLibraries_digest(request.getLibrariesDigest());
                 httpRequest.setSandbox_options_digest(request.getSandboxOptionsDigest());
             } else if (request.getResourceClass() != null && !request.getResourceClass().isBlank()) {
-                // 兼容尚未启用 canonical identity、但已经声明资源档位的过渡客户端。
+                // Non-production transitional clients only (gate above).
                 httpRequest.setResource_class(request.getResourceClass());
             }
 

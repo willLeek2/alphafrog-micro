@@ -595,6 +595,21 @@ async def health() -> dict:
 
 @app.post("/tasks", response_model=CreateTaskResponse)
 async def create_task(request: ExecuteRequest):
+    # D14 (Q-14): production refuse create without operation_id. Non-production
+    # fixtures must set AF_SANDBOX_ALLOW_CREATE_WITHOUT_OPERATION_ID=true
+    # (no operation index / no idempotent recovery).
+    operation_id = (request.operation_id or "").strip()
+    if not operation_id and not config.allow_create_without_operation_id:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "operation_id is required for sandbox create "
+                "(D14 production refuse create without idempotency key; "
+                "set AF_SANDBOX_ALLOW_CREATE_WITHOUT_OPERATION_ID=true only for "
+                "explicit non-production fixtures — no global capacity admission, "
+                "no idempotent recovery)"
+            ),
+        )
     expected_memory = (
         config.heavy_memory_limit_bytes
         if request.resource_class == "HEAVY"
