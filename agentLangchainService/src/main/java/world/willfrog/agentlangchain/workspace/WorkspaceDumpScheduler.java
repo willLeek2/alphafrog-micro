@@ -261,6 +261,11 @@ public class WorkspaceDumpScheduler {
         Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
     }
 
+    /** 删除单个淘汰候选文件。提取为 package-private 方法以便测试注入确定性的删除失败。 */
+    void deleteEvictionCandidate(Path path) throws IOException {
+        Files.delete(path);
+    }
+
     /** 淘汰候选：Path 与可选的 runId 绑定，避免下标错位把错误的 runId 从内存移除。 */
     private record EvictionCandidate(Path path, String runId) {}
 
@@ -306,7 +311,7 @@ public class WorkspaceDumpScheduler {
         List<String> actuallyDeleted = new ArrayList<>();
         for (EvictionCandidate c : evictionBatch) {
             try {
-                Files.delete(c.path);
+                deleteEvictionCandidate(c.path);
                 deleted++;
                 if (c.runId != null) {
                     actuallyDeleted.add(c.runId);
@@ -405,6 +410,11 @@ public class WorkspaceDumpScheduler {
 
     public int dlqMemorySize() {
         return dlqMemory.size();
+    }
+
+    /** 测试用：检查指定 runId 是否在内存热队列中。 */
+    boolean dlqMemoryContains(String runId) {
+        return dlqMemory.contains(runId);
     }
 
     public long dlqFailedCount() {

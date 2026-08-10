@@ -377,35 +377,55 @@ class WorkspaceDlqPersistenceTest {
     // ===== 淘汰 runId 映射正确性 =====
 
     @Test
-    void eviction_doesNotRemoveWrongRunIdWhenPreviousCandidateHasNoValidRunId() throws Exception {
-        // 场景：候选列表第一个文件 parse 失败(runId=null)，第二个文件删除失败
-        // 验证不会把第二个文件的 runId 从 dlqMemory 错误移除
+    void eviction_doesNotRemoveWrongRunIdWhenDeleteFails() throws Exception {
         Files.createDirectories(dlqDir);
-        // 先在内存热队列中放入两个 runId
-        ReflectionTestUtils.setField(scheduler, "dlqMemory", new ConcurrentLinkedDeque<>());
-        scheduler.pushDlq("run-a", false, new RuntimeException("a"));
-        scheduler.pushDlq("run-b", false, new RuntimeException("b"));
-        // 确保内存中有 run-a 和 run-b
-        assertThat(scheduler.dlqMemorySize()).isGreaterThanOrEqualTo(2);
 
-        // 写入超过 1000 个 .json 文件触发淘汰
-        // 其中前两个文件是：corrupt（无 runId）和 entry-run-b
-        Path corrupt = dlqDir.resolve("entry-zzzz-corrupt.json");
-        Files.writeString(corrupt, "{not valid json!!!");
-        // 写入大量普通条目使总量超 1000
+        // 阻断 quarantine，使无 runId 的文件不会被移走，eviction 可以直接删除它
+        Path quarantineDir = dlqDir.resolve("quarantine");
+        Files.write(quarantineDir, "block".getBytes(StandardCharsets.UTF_8));
+
+        // 文件 0：无 runId（readEntry 尝试 quarantine 但失败 → 文件保留在原位 → evictRunIds 无此项）
+        // 旧双列表下标错位：evictRunIds[0] 实为文件 1 的 run-b
+        Path fileNoRunId = dlqDir.resolve("entry-0000-noid.json");
+        Files.writeString(fileNoRunId, "{\"conservative\":false,\"reason\":\"test\",\"enqueuedAt\":\"2026-01-01T00:00:00Z\"}");
+        fileNoRunId.toFile().setLastModified(0);
+
+        // 文件 1：runId="run-b"，删除失败
+        Path runBFile = dlqDir.resolve("entry-0001-run-b.json");
+        Files.writeString(runBFile, "{\"runId\":\"run-b\",\"conservative\":false,\"reason\":\"test\",\"enqueuedAt\":\"2026-01-01T00:00:00Z\"}");
+        runBFile.toFile().setLastModified(1000);
+
+        // 填入足够多普通条目使总量超过 1000
         for (int i = 0; i < 1050; i++) {
-            Path f = dlqDir.resolve("entry-mapping-" + String.format("%04d", i) + ".json");
-            Files.writeString(f, "{\"runId\":\"run-mapping-" + i + "\",\"conservative\":false,\"reason\":\"test\",\"enqueuedAt\":\"2026-01-01T00:00:00Z\"}");
+            Path f = dlqDir.resolve("entry-fill-" + String.format("%04d", i) + ".json");
+            Files.writeString(f, "{\"runId\":\"run-fill-" + i + "\",\"conservative\":false,\"reason\":\"test\",\"enqueuedAt\":\"2026-01-01T00:00:00Z\"}");
         }
 
-        // 构造 scheduler 并触发淘汰
-        WorkspaceDumpScheduler mapScheduler = new WorkspaceDumpScheduler(dumpService, pathResolver, dumpExecutor);
-        // 淘汰会删除最旧的 .json（包括 corrupt 和 run-a/run-b 对应的 entry）
-        mapScheduler.pushDlq("run-trigger", false, new RuntimeException("trigger"));
+        java.util.concurrent.atomic.AtomicBoolean seamCalled = new java.util.concurrent.atomic.AtomicBoolean(false);
+        WorkspaceDumpScheduler testScheduler = new WorkspaceDumpScheduler(dumpService, pathResolver, dumpExecutor) {
+            @Override
+            void deleteEvictionCandidate(Path path) throws IOException {
+                if (path.getFileName().toString().equals("entry-0001-run-b.json")) {
+                    seamCalled.set(true);
+                    throw new IOException("simulated delete failure");
+                }
+                super.deleteEvictionCandidate(path);
+            }
+        };
+        @SuppressWarnings("unchecked")
+        java.util.Deque<String> mem = (java.util.Deque<String>) ReflectionTestUtils.getField(testScheduler, "dlqMemory");
+        mem.add("run-a");
+        mem.add("run-b");
+        assertThat(testScheduler.dlqMemoryContains("run-a")).isTrue();
+        assertThat(testScheduler.dlqMemoryContains("run-b")).isTrue();
 
-        // corrupt 的 Files.delete 成功但 runId 为 null，不应往 actuallyDeleted 加任何东西
-        // 验证：既不会因为 corrupt 导致 NPE，也不会因为下标错位而错误地移除其他 runId
-        // 如果代码有下标错位 bug，run-a 或 run-b 对应的 entry 被删后，会错误地把相邻的 runId 从内存移除
+        testScheduler.pushDlq("run-trigger", false, new RuntimeException("trigger"));
+
+        assertThat(seamCalled.get()).as("seam must be invoked for the test to be valid").isTrue();
+        // run-b 文件删除失败 → 文件仍在
+        assertThat(runBFile).exists();
+        // 关键断言：旧双列表下标错位会把 run-b 从内存错误移除，EvictionCandidate 绑定不会
+        assertThat(testScheduler.dlqMemoryContains("run-b")).isTrue();
     }
 
     // ===== 启动事件：确定性并发证明 =====
