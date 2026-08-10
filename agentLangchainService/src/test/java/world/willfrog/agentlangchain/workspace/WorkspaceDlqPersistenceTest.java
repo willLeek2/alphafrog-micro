@@ -422,6 +422,8 @@ class WorkspaceDlqPersistenceTest {
         testScheduler.pushDlq("run-trigger", false, new RuntimeException("trigger"));
 
         assertThat(seamCalled.get()).as("seam must be invoked for the test to be valid").isTrue();
+        // 前一条无 runId 文件已删除（否则旧双列表错位不会被触发，测试变假绿）
+        assertThat(fileNoRunId).doesNotExist();
         // run-b 文件删除失败 → 文件仍在
         assertThat(runBFile).exists();
         // 关键断言：旧双列表下标错位会把 run-b 从内存错误移除，EvictionCandidate 绑定不会
