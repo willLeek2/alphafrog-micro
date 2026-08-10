@@ -55,6 +55,15 @@ llm_sandbox_exceptions.SandboxTimeoutError = TimeoutError
 sys.modules.setdefault("llm_sandbox", llm_sandbox)
 sys.modules.setdefault("llm_sandbox.exceptions", llm_sandbox_exceptions)
 
+# D15 release-binding (codex a1b749ad) made AF_SANDBOX_IMAGE required at
+# config load (no implicit default, no silent 'latest' fallback). Set a
+# valid digest reference before any app.main import; same pattern as
+# test_main_d14_operation_id_gate.
+os.environ.setdefault(
+    "AF_SANDBOX_IMAGE",
+    "registry.local/alphafrog/runtime@sha256:" + "a" * 64,
+)
+
 _SERVICE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _SERVICE_ROOT not in sys.path:
     sys.path.insert(0, _SERVICE_ROOT)
@@ -1465,6 +1474,17 @@ class CreateTaskSnapshotTest(unittest.IsolatedAsyncioTestCase):
                 main_module.tasks,
                 main_module.dynamic_config,
             )
+            # D14 (task #112) made operation_id required at production. This
+            # pre-D14 test pins snapshot/store semantics, not operationId gate
+            # behavior, so toggle the in-memory config flag (read from
+            # main_module.config at create_task time, not at module import).
+            # config is a frozen dataclass so use object.__setattr__.
+            saved_allow_legacy = main_module.config.allow_create_without_operation_id
+            object.__setattr__(
+                main_module.config,
+                "allow_create_without_operation_id",
+                True,
+            )
             main_module.task_store = store
             main_module.tasks = store.tasks
             main_module.dynamic_config = dynamic
@@ -1533,6 +1553,11 @@ class CreateTaskSnapshotTest(unittest.IsolatedAsyncioTestCase):
                     main_module.config.sandbox_image,
                 )
             finally:
+                object.__setattr__(
+                    main_module.config,
+                    "allow_create_without_operation_id",
+                    saved_allow_legacy,
+                )
                 (
                     main_module.task_store,
                     main_module.tasks,
