@@ -2,8 +2,6 @@ package world.willfrog.agentlangchain.facade;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.entity.AgentRun;
@@ -13,7 +11,6 @@ import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentArtifactService;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilityQuery;
-import world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilityReadMode;
 import world.willfrog.agent.platform.service.AgentCreditService;
 import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agent.platform.service.AgentMessageService;
@@ -102,7 +99,7 @@ import java.util.Map;
  * <h2>status 方法的 phase 推断</h2>
  * {@link #getStatus} 不仅返回 run 状态，还根据最近事件类型推断当前阶段
  * （PLANNING / EXECUTING / EXECUTING_TOOL / SUMMARIZING / PAUSED）。
- * 这是前端进度展示的核心数据源，具体映射集中在 {@link #resolvePhase}。
+ * 这是前端进度展示的核心数据源，具体聚合已下沉到 {@link LangchainRunStatusReadModel}。
  *
  * <h2>过期标记</h2>
  * {@link #markExpiredIfNeeded} 在每次读取时检查 run 是否已过期（超过 TTL），
@@ -115,8 +112,6 @@ import java.util.Map;
 @Service
 @RequiredArgsConstructor
 public class LangchainRunReadService {
-
-    private static final Logger log = LoggerFactory.getLogger(LangchainRunReadService.class);
 
     private final AgentRunMapper runMapper;
     private final AgentEventService eventService;
@@ -231,7 +226,7 @@ public class LangchainRunReadService {
                 : requireReadableRun(request.getId(), request.getUserId());
         String snapshotJson = nvl(run.getSnapshotJson());
         String observabilityJson = nvl(observabilityService.loadObservabilityJson(run.getId(), snapshotJson));
-        observabilityJson = mergeDataAnalysisResultView(run, observabilityJson);
+        observabilityJson = dataAnalysisOverlay().mergeResult(run, observabilityJson);
         Map<String, Object> snapshot = readExtMap(snapshotJson);
         String answerMarkdown = firstNonBlank(stringValue(snapshot.get("answer_markdown")), stringValue(snapshot.get("answer")));
         String structuredAnswerJson = "";
@@ -278,7 +273,7 @@ public class LangchainRunReadService {
      * <p>返回当前 run 的轻量状态快照，包含：
      * <ul>
      *   <li>基础状态（COMPLETED/FAILED/EXECUTING 等）</li>
-     *   <li>阶段推断（PLANNING/EXECUTING/SUMMARIZING，由 {@link #resolvePhase} 推断）</li>
+     *   <li>阶段推断（PLANNING/EXECUTING/SUMMARIZING，由 {@link LangchainRunStatusReadModel} 聚合）</li>
      *   <li>当前正在执行的 tool 名称（从 TOOL_CALL_STARTED 事件 payload 中提取）</li>
      *   <li>计划进度（planJson + progressJson）</li>
      *   <li>observability 摘要和完整数据可用性标记（不直接返回完整 traces）</li>
@@ -291,36 +286,7 @@ public class LangchainRunReadService {
      * 需要完整观测或安全调用详情时，由结果/详情接口按需加载。
      */
     public AgentRunStatusMessage getStatus(GetAgentRunStatusRequest request) {
-        AgentRun run = requireReadableRun(request.getId(), request.getUserId());
-        AgentRunEvent latestEvent = eventService.findLatestByRunId(run.getId());
-        String planJson = nvl(run.getPlanJson());
-        var cachedPlan = stateStore.loadPlan(run.getId());
-        if (cachedPlan.isPresent()) {
-            // 执行中 run 的 Redis plan 更新更及时；DB plan 用于历史和 Redis 过期后的读取。
-            // status 接口优先 Redis，是为了前端轮询时看到最新 HITL/plan override 状态。
-            planJson = cachedPlan.get();
-        }
-        String progressJson = planJson.isBlank() ? "" : stateStore.buildProgressJson(run.getId(), planJson);
-        // status 是高频轮询接口，只返回 summary，不拉完整 observability。
-        // 完整 trace 可能很大，应该由详情页或 matrix 按需读取。
-        String observabilitySummaryJson = observabilityService.loadObservabilitySummaryJson(run.getId(), run.getSnapshotJson());
-        observabilitySummaryJson = mergeDataAnalysisStatusView(run, observabilitySummaryJson);
-        boolean observabilityFullAvailable = observabilityService.isFullObservabilityAvailable(run.getId(), run.getSnapshotJson());
-        int totalCredits = creditService.calculateRunTotalCredits(run, eventService.listByRunId(run.getId()), observabilitySummaryJson);
-        Integer maxSeq = eventService.findMaxSeq(run.getId());
-        return toStatusMessage(
-                run,
-                latestEvent,
-                planJson,
-                progressJson,
-                "",
-                observabilitySummaryJson,
-                observabilityFullAvailable,
-                totalCredits,
-                maxSeq == null ? 0 : maxSeq,
-                toEpochMillis(run.getStartedAt()),
-                toEpochMillis(run.getCompletedAt()),
-                computeElapsedMs(run, System.currentTimeMillis()));
+        return statusReadModel().build(requireReadableRun(request.getId(), request.getUserId()));
     }
 
     public ListAgentToolsResponse listTools(ListAgentToolsRequest request) {
@@ -562,95 +528,24 @@ public class LangchainRunReadService {
                 .build();
     }
 
-    private AgentRunStatusMessage toStatusMessage(AgentRun run,
-                                                  AgentRunEvent lastEvent,
-                                                  String planJson,
-                                                  String progressJson,
-                                                  String observabilityJson,
-                                                  String observabilitySummaryJson,
-                                                  boolean observabilityFullAvailable,
-                                                  int totalCreditsConsumed,
-                                                  int eventCount,
-                                                  long startedAtMs,
-                                                  long completedAtMs,
-                                                  long elapsedMs) {
-        String lastEventType = lastEvent == null ? "" : nvl(lastEvent.getEventType());
-        return AgentRunStatusMessage.newBuilder()
-                .setId(nvl(run.getId()))
-                .setStatus(run.getStatus() == null ? "" : run.getStatus().name())
-                .setPhase(resolvePhase(run.getStatus(), lastEventType))
-                .setCurrentTool(resolveCurrentTool(lastEventType, lastEvent == null ? null : lastEvent.getPayloadJson()))
-                .setLastEventType(lastEventType)
-                .setLastEventAt(lastEvent == null || lastEvent.getCreatedAt() == null ? "" : lastEvent.getCreatedAt().toString())
-                .setLastEventPayloadJson(lastEvent == null ? "" : nvl(lastEvent.getPayloadJson()))
-                .setPlanJson(nvl(planJson))
-                .setProgressJson(nvl(progressJson))
-                .setObservabilityJson(nvl(observabilityJson))
-                .setObservabilitySummaryJson(nvl(observabilitySummaryJson))
-                .setObservabilityFullAvailable(observabilityFullAvailable)
-                .setTotalCreditsConsumed(Math.max(0, totalCreditsConsumed))
-                .setEventCount(eventCount)
-                .setStartedAtMs(startedAtMs)
-                .setCompletedAtMs(completedAtMs)
-                .setElapsedMs(elapsedMs)
-                .build();
+
+    private LangchainRunStatusReadModel statusReadModel() {
+        return new LangchainRunStatusReadModel(
+                eventService,
+                stateStore,
+                observabilityService,
+                creditService,
+                objectMapper,
+                dataAnalysisOverlay());
     }
 
-    /**
-     * 根据 run 状态和最近事件类型推断当前阶段，用于前端进度展示。
-     *
-     * <p>为什么不只用 status？因为 EXECUTING 状态涵盖多种子阶段
-     * （planning 结束但还没开始执行、正在执行 tool、正在写 final answer 等），
-     * 只靠 status 无法区分。配合最近事件类型可以更精确推断。
-     *
-     * <p>推断优先级：终态 ＞ WAITING（PAUSED） ＞ 事件推断 ＞ status fallback。
-     */
-    private String resolvePhase(AgentRunStatus status, String lastEventType) {
-        if (status == null) {
-            return "";
-        }
-        if (status == AgentRunStatus.COMPLETED || status == AgentRunStatus.PARTIAL
-                || status == AgentRunStatus.FAILED
-                || status == AgentRunStatus.CANCELED || status == AgentRunStatus.EXPIRED) {
-            return status.name();
-        }
-        if (status == AgentRunStatus.WAITING) {
-            return "PAUSED";
-        }
-        if (status == AgentRunStatus.WAITING_TOOL_JOB) {
-            // 直接暴露持久阶段，避免把“已释放 worker、等待外部结果”误显示成普通 PAUSED 或 EXECUTING。
-            // 这里的 phase 只用于读取/UI，不参与 resume 决策；真正的重入资格仍来自 anchor 的
-            // READY/LAUNCHING、resumeToken 与 leaseVersion，客户端刷新不会触发任何执行副作用。
-            return "WAITING_TOOL_JOB";
-        }
-        if ("PLAN_READY".equals(lastEventType)
-                || "PLANNING_STARTED".equals(lastEventType)
-                || "TODO_LIST_CREATED".equals(lastEventType)) {
-            // PLAN_READY 已经有计划，但还没有 TODO_NODE_STARTED/TOOL_CALL_STARTED，
-            // 对前端来说仍应展示为规划阶段结束、执行尚未正式展开。
-            return "PLANNING";
-        }
-        if ("FINAL_ANSWER_GENERATING".equals(lastEventType) || "SUMMARIZING_STARTED".equals(lastEventType)) {
-            return "SUMMARIZING";
-        }
-        if ("TOOL_CALL_STARTED".equals(lastEventType)) {
-            // 当前工具名从 payload 中解析，phase 只负责告诉前端这是工具执行中。
-            return "EXECUTING_TOOL";
-        }
-        if ("EXECUTION_STARTED".equals(lastEventType) || "TODO_STARTED".equals(lastEventType)
-                || "TODO_FINISHED".equals(lastEventType) || "WORKFLOW_RESUMED".equals(lastEventType)) {
-            return "EXECUTING";
-        }
-        return status.name();
+    private LangchainDataAnalysisReadOverlay dataAnalysisOverlay() {
+        return new LangchainDataAnalysisReadOverlay(
+                dataAnalysisObservabilityQuery,
+                dataAnalysisSerializer,
+                objectMapper);
     }
 
-    private String resolveCurrentTool(String lastEventType, String payloadJson) {
-        if (!"TOOL_CALL_STARTED".equals(lastEventType) || payloadJson == null || payloadJson.isBlank()) {
-            return "";
-        }
-        Map<String, Object> payload = readExtMap(payloadJson);
-        return firstNonBlank(stringValue(payload.get("tool_name")), stringValue(payload.get("tool")));
-    }
 
     private Map<String, Object> readExtMap(String json) {
         if (json == null || json.isBlank()) {
@@ -690,20 +585,7 @@ public class LangchainRunReadService {
         return normalized;
     }
 
-    private long toEpochMillis(OffsetDateTime time) {
-        return time == null ? 0L : time.toInstant().toEpochMilli();
-    }
 
-    private long computeElapsedMs(AgentRun run, long nowMs) {
-        if (run.getStartedAt() == null) {
-            return 0L;
-        }
-        long startMs = run.getStartedAt().toInstant().toEpochMilli();
-        if (run.getCompletedAt() != null) {
-            return Math.max(0L, run.getCompletedAt().toInstant().toEpochMilli() - startMs);
-        }
-        return Math.max(0L, nowMs - startMs);
-    }
 
     private int nonNegativeInt(Integer value) {
         return value == null ? 0 : Math.max(0, value);
@@ -728,73 +610,7 @@ public class LangchainRunReadService {
         return value == null ? "" : value;
     }
 
-    private String mergeDataAnalysisStatusView(AgentRun run, String existingJson) {
-        String runId = run.getId();
-        try {
-            String dataAnalysisJson = dataAnalysisSerializer.serializeStatusFromSummary(
-                    runId,
-                    dataAnalysisObservabilityQuery.findSummaryByRunId(
-                            runId, dataAnalysisReadMode(run.getStatus())));
-            if (dataAnalysisJson.equals("{}")) {
-                return existingJson;
-            }
-            return mergeJsonObjects(runId, "status", existingJson, dataAnalysisJson);
-        } catch (Exception e) {
-            log.warn("合并 data-analysis status 视图失败 runId={} 异常={}/{}",
-                    runId, e.getClass().getSimpleName(), e.getMessage());
-            return existingJson;
-        }
-    }
 
-    private String mergeDataAnalysisResultView(AgentRun run, String existingJson) {
-        String runId = run.getId();
-        try {
-            String dataAnalysisJson = dataAnalysisSerializer.serializeResultView(
-                    dataAnalysisObservabilityQuery.findByRunId(
-                            runId, dataAnalysisReadMode(run.getStatus())));
-            if (dataAnalysisJson.equals("{}")) {
-                return existingJson;
-            }
-            return mergeJsonObjects(runId, "result", existingJson, dataAnalysisJson);
-        } catch (Exception e) {
-            log.warn("合并 data-analysis result 视图失败 runId={} 异常={}/{}",
-                    runId, e.getClass().getSimpleName(), e.getMessage());
-            return existingJson;
-        }
-    }
 
-    private DataAnalysisObservabilityReadMode dataAnalysisReadMode(AgentRunStatus status) {
-        if (status == AgentRunStatus.COMPLETED || status == AgentRunStatus.PARTIAL
-                || status == AgentRunStatus.FAILED || status == AgentRunStatus.CANCELED
-                || status == AgentRunStatus.EXPIRED) {
-            return DataAnalysisObservabilityReadMode.TERMINAL_DB_ONLY;
-        }
-        return DataAnalysisObservabilityReadMode.RUNNING_CACHE_FIRST;
-    }
 
-    private String mergeJsonObjects(String runId, String view, String baseJson, String overlayJson) {
-        if (baseJson == null || baseJson.isBlank()) {
-            return overlayJson;
-        }
-        try {
-            com.fasterxml.jackson.databind.JsonNode baseNode = objectMapper.readTree(baseJson);
-            if (!baseNode.isObject()) {
-                log.warn("base JSON 非对象 runId={} view={}，保留原始响应", runId, view);
-                return baseJson;
-            }
-            com.fasterxml.jackson.databind.JsonNode overlayNode = objectMapper.readTree(overlayJson);
-            if (!overlayNode.isObject()) {
-                log.warn("overlay JSON 非对象 runId={} view={}，保留原始响应", runId, view);
-                return baseJson;
-            }
-            Map<String, Object> base = objectMapper.convertValue(baseNode, Map.class);
-            Map<String, Object> overlay = objectMapper.convertValue(overlayNode, Map.class);
-            base.putAll(overlay);
-            return objectMapper.writeValueAsString(base);
-        } catch (Exception e) {
-            log.warn("JSON merge 失败 runId={} view={} 异常={}/{}，保留原始响应",
-                    runId, view, e.getClass().getSimpleName(), e.getMessage());
-            return baseJson;
-        }
-    }
 }
