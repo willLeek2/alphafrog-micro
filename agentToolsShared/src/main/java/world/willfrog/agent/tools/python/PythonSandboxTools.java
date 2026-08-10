@@ -394,24 +394,22 @@ public class PythonSandboxTools {
             }
 
             // D14 (Q-14): production must not silently degrade to Legacy create.
+            // Fail before any Gateway call. Public error stays stable (no bean/
+            // config inventory); presence details stay in operator logs only.
             if (!allowLegacyWithoutCapacity) {
+                log.error("sandbox.create.wiringIncomplete: production refuses "
+                        + "Legacy create; capacityWiringPresent={}",
+                        dataIntenseWiringAvailable());
                 emitSandboxToolTotal(toolStartMs, "ERROR", "SANDBOX_CAPACITY_WIRING_INCOMPLETE");
                 return fail(
                         "executePython",
                         "SANDBOX_CAPACITY_WIRING_INCOMPLETE",
-                        "Python sandbox Data-intense wiring incomplete; "
-                                + "production refuses Legacy create without capacity reservation "
-                                + "and operationId. Missing one of: capacity service, capacity "
-                                + "properties, dispatch store, terminal recorder. "
-                                + "Non-production fixtures may set "
+                        "Python sandbox production wiring incomplete; "
+                                + "refuses Legacy create without capacity reservation "
+                                + "and operationId. Non-production fixtures may set "
                                 + "sandbox.create.allow-legacy-without-capacity=true "
                                 + "(no global capacity admission / no idempotent recovery).",
-                        Map.of(
-                                "capacity_service", dataAnalysisCapacityService != null,
-                                "capacity_properties", dataAnalysisCapacityProperties != null,
-                                "dispatch_store", pythonSandboxDispatchStore != null,
-                                "terminal_recorder", dataAnalysisTerminalRecorder != null
-                        ));
+                        Map.of());
             }
             log.warn("sandbox.create.legacyWithoutCapacity: allow-legacy-without-capacity=true "
                     + "(NON-PRODUCTION: no global capacity admission, no operationId recovery)");

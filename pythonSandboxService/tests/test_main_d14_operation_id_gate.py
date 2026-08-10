@@ -113,12 +113,36 @@ class MainD14OperationIdGateTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("operation_id is required", str(raised.exception.detail))
         self.assertEqual(len(self.store.tasks), 0)
 
+    async def test_production_rejects_whitespace_only_operation_id(self) -> None:
+        request = self.keyless_request()
+        request.operation_id = "   "
+        with self.assertRaises(HTTPException) as raised:
+            await main.create_task(request)
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertIn("operation_id is required", str(raised.exception.detail))
+        self.assertEqual(len(self.store.tasks), 0)
+
     async def test_keyed_create_still_succeeds_and_indexes_operation(self) -> None:
         response = await main.create_task(self.keyed_request())
         self.assertTrue(response.task_id)
         lookup = await main.get_task_by_operation_id("run-1:call-1:1")
         self.assertTrue(lookup.found)
         self.assertEqual(lookup.task_id, response.task_id)
+
+    async def test_compat_flag_does_not_bypass_keyed_units_validation(self) -> None:
+        """Compat switch only admits keyless creates; keyed still validates."""
+        request = self.keyed_request()
+        request.capacity_units = 99  # STANDARD expects 1
+        with patch.object(
+            main,
+            "config",
+            dataclasses.replace(main.config, allow_create_without_operation_id=True),
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                await main.create_task(request)
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertIn("capacity_units", str(raised.exception.detail))
+        self.assertEqual(len(self.store.tasks), 0)
 
     async def test_explicit_non_production_flag_allows_keyless_create(self) -> None:
         with patch.object(

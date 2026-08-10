@@ -143,15 +143,21 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
              * libraries 和 timeoutSeconds，导致 Python 侧退回默认 STANDARD 资源配置，同时完全
              * 收不到 operationId/requestFingerprint，createTask 的幂等索引形同虚设。
              *
-             * D14 (Q-14): production rejects blank operationId before HTTP. The
-             * transitional "resourceClass only" path is non-production-only behind
+             * D14 (Q-14): production rejects blank operationId before HTTP.
+             * Non-empty is judged AFTER trim; empty / all-whitespace are rejected.
+             * Never invent a key. The transitional "resourceClass only" path is
+             * non-production-only behind
              * sandbox.gateway.allow-create-without-operation-id=true.
+             * That switch only admits keyless creates — keyed creates still
+             * forward the full canonical group and keep Python-side validation.
              *
              * proto3 标量没有 presence；因此只有 operationId 非空时才把 canonical 数值零值也
              * 写入 HTTP DTO。
              */
-            boolean canonicalCreate = request.getOperationId() != null
-                    && !request.getOperationId().isBlank();
+            String operationId = request.getOperationId() == null
+                    ? ""
+                    : request.getOperationId().trim();
+            boolean canonicalCreate = !operationId.isEmpty();
             if (!canonicalCreate) {
                 if (!allowCreateWithoutOperationId) {
                     SandboxErrorDetail detail = SandboxErrorDetail.newBuilder()
@@ -179,7 +185,7 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
                 httpRequest.setEstimated_bytes(request.getEstimatedBytes());
                 httpRequest.setFile_count(request.getFileCount());
                 httpRequest.setCapacity_units(request.getCapacityUnits());
-                httpRequest.setOperation_id(request.getOperationId());
+                httpRequest.setOperation_id(operationId);
                 httpRequest.setRequest_fingerprint(request.getRequestFingerprint());
                 httpRequest.setMemory_limit_bytes(request.getMemoryLimitBytes());
                 httpRequest.setTimeout_millis(request.getTimeoutMillis());

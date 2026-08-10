@@ -74,6 +74,27 @@ class PythonSandboxGatewayServiceImplD14Test {
     }
 
     @Test
+    void createTaskRejectsWhitespaceOnlyOperationIdWithoutHttp() {
+        RestTemplate restTemplate = new RestTemplate();
+        MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
+        PythonSandboxGatewayServiceImpl gateway = newGateway(restTemplate);
+        server.expect(never(), requestTo("http://sandbox/tasks"));
+
+        ExecuteResponse response = gateway.createTask(ExecuteRequest.newBuilder()
+                .setCode("print(1)")
+                .setOperationId("   ")
+                .setResourceClass("STANDARD")
+                .build());
+
+        server.verify();
+        assertTrue(response.getError().contains("operationId is required"));
+        assertEquals(
+                SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_INVALID_ARGUMENT,
+                response.getErrorDetail().getCategory());
+        assertFalse(response.getErrorDetail().hasDownstreamHttpStatus());
+    }
+
+    @Test
     void createTaskWithOperationIdStillForwardsCanonicalCreate() {
         RestTemplate restTemplate = new RestTemplate();
         MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
