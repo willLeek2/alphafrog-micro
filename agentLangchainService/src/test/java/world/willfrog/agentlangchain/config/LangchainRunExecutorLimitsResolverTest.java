@@ -311,7 +311,7 @@ class LangchainRunExecutorLimitsResolverTest {
         // 指向真实 example JSON
         org.springframework.test.util.ReflectionTestUtils.setField(loader, "configFile",
                 "config/agent-llm.local.example.json");
-        org.springframework.test.util.ReflectionTestUtils.setField(loader, "promptBaseDir", ".");
+        org.springframework.test.util.ReflectionTestUtils.setField(loader, "promptBaseDir", "config");
 
         // 调用生产 load() → current() 路径，不应抛异常
         loader.load();

@@ -2,6 +2,8 @@ package world.willfrog.agentlangchain.facade;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.entity.AgentRun;
@@ -113,6 +115,8 @@ import java.util.Map;
 @Service
 @RequiredArgsConstructor
 public class LangchainRunReadService {
+
+    private static final Logger log = LoggerFactory.getLogger(LangchainRunReadService.class);
 
     private final AgentRunMapper runMapper;
     private final AgentEventService eventService;
