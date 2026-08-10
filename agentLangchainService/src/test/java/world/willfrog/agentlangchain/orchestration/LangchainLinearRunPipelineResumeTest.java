@@ -3,10 +3,12 @@ package world.willfrog.agentlangchain.orchestration;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.langchain4j.model.chat.ChatModel;
 import org.junit.jupiter.api.Test;
+import org.mockito.InOrder;
 import org.springframework.beans.factory.ObjectProvider;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
+import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.service.*;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 import world.willfrog.agent.workflow.TodoItem;
@@ -21,6 +23,7 @@ import world.willfrog.agentlangchain.tooljob.ToolJobCheckpointWriter;
 import java.lang.reflect.Field;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.*;
@@ -55,6 +58,8 @@ class LangchainLinearRunPipelineResumeTest {
                 mock(AgentRunCreditSettlementService.class);
         world.willfrog.agent.platform.event.AgentRunFinalizationService finalizationService =
                 mock(world.willfrog.agent.platform.event.AgentRunFinalizationService.class);
+        world.willfrog.agent.platform.service.AgentPromptService promptService =
+                mock(world.willfrog.agent.platform.service.AgentPromptService.class);
         LangchainTodoPlan plan = LangchainTodoPlan.builder()
                 .executionMode(PlanExecutionMode.LINEAR)
                 .items(List.of(TodoItem.builder().id("todo-2").sequence(2).description("resume").build()))
@@ -62,7 +67,11 @@ class LangchainLinearRunPipelineResumeTest {
         AgentRun run = new AgentRun();
         run.setId("run-1");
         run.setUserId("user-1");
-        run.setExt("{}");
+        run.setExt("""
+                {"prompt_selection":{"schema_version":1,"bundle_version":"default-v1",
+                "variant":"control","bundle_digest":"bundle-digest",
+                "capability_catalog_digest":"capability-digest","reference_date":"2025-02-03"}}
+                """);
         run.setPlanJson(objectMapper.writeValueAsString(plan));
         when(runMapper.findById("run-1")).thenReturn(run);
         when(runMapper.updateResumedTerminal(eq("run-1"), eq("user-1"),
@@ -70,20 +79,26 @@ class LangchainLinearRunPipelineResumeTest {
                 any(), any(), eq(true), isNull(), eq("token-1"), eq(3L), eq("owner-1")))
                 .thenReturn(1);
         when(events.isRunnable("run-1", "user-1")).thenReturn(true);
-        when(events.extractRunConfig("{}")).thenReturn(AgentEventService.RunConfig.defaults());
+        when(events.extractRunConfig(anyString())).thenReturn(AgentEventService.RunConfig.defaults());
         ChatModel model = mock(ChatModel.class);
         when(stageModels.resolve(run)).thenReturn(new LangchainRunStageModelResolver.StageModels(
                 model, model, model, "endpoint", "model", List.of()));
         when(followUp.resolve(run)).thenReturn(new LangchainFollowUpContextSupport.ExecutionContext("goal", ""));
         when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
-        when(linear.resumePlanned(any(), any(), any(), any())).thenReturn(
-                LangchainLinearWorkflowResult.builder()
-                        .success(true)
-                        .finalAnswer("done")
-                        .plan(plan)
-                        .completedTodos(List.of())
-                        .toolCallsUsed(4)
-                        .build());
+        AtomicReference<world.willfrog.agent.platform.prompt.PromptRunSelection> restoredSelection =
+                new AtomicReference<>();
+        when(linear.resumePlanned(any(), any(), any(), any())).thenAnswer(invocation -> {
+            if (AgentContext.getPromptRunSelection() != null) {
+                restoredSelection.set(AgentContext.getPromptRunSelection());
+            }
+            return LangchainLinearWorkflowResult.builder()
+                    .success(true)
+                    .finalAnswer("done")
+                    .plan(plan)
+                    .completedTodos(List.of())
+                    .toolCallsUsed(4)
+                    .build();
+        });
         LangchainLinearRunPipelineImpl pipeline = new LangchainLinearRunPipelineImpl(
                 planner, linear, mock(LangchainDagWorkflowExecutor.class), stageModels,
                 runMapper, events, objectMapper, mock(ObjectProvider.class), mock(ObjectProvider.class),
@@ -92,6 +107,7 @@ class LangchainLinearRunPipelineResumeTest {
                 LangchainRunSchedulerTestSupport.immediateScheduler(), mock(AgentCreditService.class),
                 settlementService,
                 finalizationService,
+                promptService,
                 mock(ObjectProvider.class), mock(ObjectProvider.class));
         ToolJobResumeContext context = new ToolJobResumeContext();
         context.setRunId("run-1");
@@ -103,6 +119,17 @@ class LangchainLinearRunPipelineResumeTest {
         context.setToolCallsUsed(4);
 
         assertThat(pipeline.executeResumedRun(run, context, () -> true)).isTrue();
+        assertThat(restoredSelection.get()).isNotNull();
+        assertThat(restoredSelection.get().bundleVersion()).isEqualTo("default-v1");
+        assertThat(restoredSelection.get().variant()).isEqualTo("control");
+        assertThat(restoredSelection.get().referenceDate().toString()).isEqualTo("2025-02-03");
+        verify(promptService).validatePromptSelection(argThat(selection ->
+                selection != null && "default-v1".equals(selection.bundleVersion())));
+        InOrder promptBoundaryOrder = inOrder(promptService, stageModels, followUp);
+        promptBoundaryOrder.verify(promptService).validatePromptSelection(any());
+        promptBoundaryOrder.verify(stageModels).resolve(run);
+        promptBoundaryOrder.verify(followUp).resolve(run);
+        assertThat(AgentContext.getPromptRunSelection()).isNull();
         verify(observabilityService, times(1)).commitTerminalSnapshot(argThat(candidate ->
                 candidate.status() == world.willfrog.agent.platform.model.AgentRunStatus.COMPLETED));
 

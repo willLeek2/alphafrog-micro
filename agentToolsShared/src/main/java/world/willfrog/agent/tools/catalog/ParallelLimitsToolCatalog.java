@@ -18,6 +18,14 @@ public final class ParallelLimitsToolCatalog {
 
     public static final String TOOL_NAME = "checkParallelLimits";
 
+    /**
+     * 返回本 helper 以 canonical schema 覆盖的工具名，用于与 {@code AgentToolRegistry} 的
+     * {@code canonicalSpec=PARALLEL_LIMITS} 声明做契约对照。
+     */
+    public static String canonicalToolName() {
+        return TOOL_NAME;
+    }
+
     private static final String DESCRIPTION =
             "查询当前批量/并行查询限制。返回 search 和 daily 工具组的热加载 maxItems，以及各工具组包含哪些工具。"
                     + "使用任何批量参数前必须先调用本工具；如果没有本工具，默认并行查询关闭。";

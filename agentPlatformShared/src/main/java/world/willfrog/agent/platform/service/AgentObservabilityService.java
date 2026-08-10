@@ -1823,6 +1823,7 @@ public class AgentObservabilityService {
         trace.setCompletedAtMillis(completedAtMillis > 0 ? completedAtMillis : 0);
         trace.setEndpoint(nvl(endpointName));
         trace.setModel(nvl(modelName));
+        applyPromptSelection(trace);
         trace.setHasError(errorMessage != null && !errorMessage.isBlank());
         trace.setError(trim(errorMessage, 1000));
         if (captureDetails) {
@@ -1848,6 +1849,17 @@ public class AgentObservabilityService {
         while (traces.size() > limit) {
             traces.remove(0);
         }
+    }
+
+    private static void applyPromptSelection(LlmTrace trace) {
+        var selection = AgentContext.getPromptRunSelection();
+        if (trace == null || selection == null) {
+            return;
+        }
+        trace.setPromptBundleVersion(selection.bundleVersion());
+        trace.setPromptVariant(selection.variant());
+        trace.setPromptBundleDigest(selection.bundleDigest());
+        trace.setPromptCapabilityCatalogDigest(selection.capabilityCatalogDigest());
     }
     
     /**
@@ -1917,6 +1929,7 @@ public class AgentObservabilityService {
         trace.setCompletedAtMillis(completedAtMillis > 0 ? completedAtMillis : 0);
         trace.setEndpoint(nvl(endpointName));
         trace.setModel(nvl(modelName));
+        applyPromptSelection(trace);
         trace.setHasError(errorMessage != null && !errorMessage.isBlank());
         trace.setError(trim(errorMessage, 1000));
         if (captureDetails) {
@@ -2583,6 +2596,14 @@ public class AgentObservabilityService {
         private String endpoint;
         /** 模型名 */
         private String model;
+        /** D02：本 Run 冻结的 Prompt 逻辑版本。 */
+        private String promptBundleVersion;
+        /** D02：当前默认固定为 control，未来 selector 也只能在建 Run 时选择一次。 */
+        private String promptVariant;
+        /** D02：不含正文的权威资源包摘要。 */
+        private String promptBundleDigest;
+        /** D02：不含正文的工具能力目录摘要。 */
+        private String promptCapabilityCatalogDigest;
         /** 是否发生错误 */
         private boolean hasError;
         /** 错误信息（截断到 1000 字符） */

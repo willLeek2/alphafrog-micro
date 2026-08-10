@@ -1976,6 +1976,8 @@ public class AgentLlmProperties {
 
     public static class Prompts {
         private String agentRunSystemPrompt;
+        /** 多轮 follow-up 历史摘要的稳定 System Prompt；正文来自 shared classpath 权威资源。 */
+        private String followUpSummarySystemPrompt;
         private String todoPlannerSystemPromptTemplate;
         private String workflowFinalSystemPrompt;
         private String workflowTodoRecoverySystemPrompt;
@@ -2001,17 +2003,35 @@ public class AgentLlmProperties {
         private String dagReactSystemPromptFile;
         private String dagModeGuidancePrompt;
         private String dagModeGuidancePromptFile;
-        /** 第一阶段统筹规划 prompt 文件路径（相对于 config 目录） */
-        private String planningStrategyStageFile = "prompts/todo/planning_strategy_stage.txt";
+        /** 第一阶段统筹规划 prompt 投影文件路径（相对于 config 目录）；缺省时由 classpath 权威正文提供。 */
+        private String planningStrategyStageFile;
         /** 第一阶段统筹规划 prompt 内容（由 loader 从文件读取） */
         private String planningStrategyStage;
-        /** 第二阶段任务拆解 prompt 文件路径（相对于 config 目录） */
-        private String planningTodosStageFile = "prompts/todo/planning_todos_stage.txt";
+        /** 第二阶段任务拆解 prompt 投影文件路径（相对于 config 目录）；缺省时由 classpath 权威正文提供。 */
+        private String planningTodosStageFile;
         /** 第二阶段任务拆解 prompt 内容（由 loader 从文件读取） */
         private String planningTodosStage;
-        /** DAG recovery judge prompt 文件路径（Nacos file: 前缀时由 loader 解析为内容）。默认 null，走 classpath 兜底。 */
+        /** D02：规划分析兼容阶段说明。 */
+        private String planningAnalysisStage;
+        /** D02：规划结构化输出阶段说明。 */
+        private String planningStructuredStage;
+        /** D02：LINEAR 模式说明。 */
+        private String planningLinearModeGuidance;
+        /** D02：DAG 模式说明。 */
+        private String planningDagModeGuidance;
+        /** D02：强制 LINEAR 时追加到 planning User 的约束。 */
+        private String planningLinearConstraint;
+        /** D02：executePython 修复轮次 User 阶段说明。 */
+        private String pythonRepairStageInstruction;
+        /** D02：空输出恢复 User 阶段说明。 */
+        private String emptyOutputRecoveryStageInstruction;
+        /** D02：预算 last-mile User 阶段说明模板。 */
+        private String budgetLastMileStageInstruction;
+        /** D02：按工具名登记的能力说明 JSON。 */
+        private String toolCapabilityCatalog;
+        /** DAG recovery judge prompt 投影文件路径；loader 保留路径，并把校验后的正文写入 template 字段。 */
         private String dagRecoveryJudgeSystemPromptFile;
-        /** DAG recovery judge prompt 内容（由 loader 从 file: 解析或 Nacos 直接注入）。 */
+        /** DAG recovery judge prompt 内容（只能是 classpath 权威正文或其逐字一致投影）。 */
         private String dagRecoveryJudgeSystemPromptTemplate;
 
         public String getAgentRunSystemPrompt() {
@@ -2020,6 +2040,14 @@ public class AgentLlmProperties {
 
         public void setAgentRunSystemPrompt(String agentRunSystemPrompt) {
             this.agentRunSystemPrompt = agentRunSystemPrompt;
+        }
+
+        public String getFollowUpSummarySystemPrompt() {
+            return followUpSummarySystemPrompt;
+        }
+
+        public void setFollowUpSummarySystemPrompt(String followUpSummarySystemPrompt) {
+            this.followUpSummarySystemPrompt = followUpSummarySystemPrompt;
         }
 
         public String getTodoPlannerSystemPromptTemplate() {
@@ -2252,6 +2280,78 @@ public class AgentLlmProperties {
 
         public void setPlanningTodosStage(String planningTodosStage) {
             this.planningTodosStage = planningTodosStage;
+        }
+
+        public String getPlanningAnalysisStage() {
+            return planningAnalysisStage;
+        }
+
+        public void setPlanningAnalysisStage(String planningAnalysisStage) {
+            this.planningAnalysisStage = planningAnalysisStage;
+        }
+
+        public String getPlanningStructuredStage() {
+            return planningStructuredStage;
+        }
+
+        public void setPlanningStructuredStage(String planningStructuredStage) {
+            this.planningStructuredStage = planningStructuredStage;
+        }
+
+        public String getPlanningLinearModeGuidance() {
+            return planningLinearModeGuidance;
+        }
+
+        public void setPlanningLinearModeGuidance(String planningLinearModeGuidance) {
+            this.planningLinearModeGuidance = planningLinearModeGuidance;
+        }
+
+        public String getPlanningDagModeGuidance() {
+            return planningDagModeGuidance;
+        }
+
+        public void setPlanningDagModeGuidance(String planningDagModeGuidance) {
+            this.planningDagModeGuidance = planningDagModeGuidance;
+        }
+
+        public String getPlanningLinearConstraint() {
+            return planningLinearConstraint;
+        }
+
+        public void setPlanningLinearConstraint(String planningLinearConstraint) {
+            this.planningLinearConstraint = planningLinearConstraint;
+        }
+
+        public String getPythonRepairStageInstruction() {
+            return pythonRepairStageInstruction;
+        }
+
+        public void setPythonRepairStageInstruction(String pythonRepairStageInstruction) {
+            this.pythonRepairStageInstruction = pythonRepairStageInstruction;
+        }
+
+        public String getEmptyOutputRecoveryStageInstruction() {
+            return emptyOutputRecoveryStageInstruction;
+        }
+
+        public void setEmptyOutputRecoveryStageInstruction(String emptyOutputRecoveryStageInstruction) {
+            this.emptyOutputRecoveryStageInstruction = emptyOutputRecoveryStageInstruction;
+        }
+
+        public String getBudgetLastMileStageInstruction() {
+            return budgetLastMileStageInstruction;
+        }
+
+        public void setBudgetLastMileStageInstruction(String budgetLastMileStageInstruction) {
+            this.budgetLastMileStageInstruction = budgetLastMileStageInstruction;
+        }
+
+        public String getToolCapabilityCatalog() {
+            return toolCapabilityCatalog;
+        }
+
+        public void setToolCapabilityCatalog(String toolCapabilityCatalog) {
+            this.toolCapabilityCatalog = toolCapabilityCatalog;
         }
 
         public String getDagRecoveryJudgeSystemPromptFile() {

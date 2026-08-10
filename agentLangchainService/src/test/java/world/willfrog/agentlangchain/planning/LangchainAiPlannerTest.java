@@ -11,6 +11,7 @@ import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 import world.willfrog.agent.platform.service.AgentPromptService;
+import world.willfrog.agent.tools.registry.AgentToolRegistry;
 import world.willfrog.agentlangchain.support.LangchainTestFixtures;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 import world.willfrog.agent.workflow.TodoStatus;
@@ -129,6 +130,34 @@ class LangchainAiPlannerTest {
         assertThat(model.requests.get(1).toString())
                 .contains("\"mode\":\"LINEAR\"")
                 .doesNotContain("\"mode\":\"DAG\"");
+    }
+
+    @Test
+    void twoStagePlannerWithNoTools_shouldNotLeakAnyRegistryToolIntoSystemOrUserMessages() {
+        SequentialRecordingChatModel model = new SequentialRecordingChatModel(
+                """
+                {"overallPlan":{"mode":"LINEAR","detail":"顺序分析。"}}
+                """,
+                """
+                {"analysis":"直接回答。","items":[{"id":"todo_1","sequence":1,"description":"整理结论"}]}
+                """);
+
+        planner.plan(LangchainPlanningRequest.builder()
+                .runId("run-no-tools")
+                .userGoal("整理现有信息")
+                .model(model)
+                .toolSpecifications(List.of())
+                .executionMode(PlanExecutionMode.LINEAR)
+                .maxTodos(3)
+                .build());
+
+        assertThat(model.requests).hasSize(2);
+        String completePlanningMessages = model.requests.toString();
+        for (String toolName : AgentToolRegistry.declaredToolNames()) {
+            assertThat(completePlanningMessages)
+                    .as("没有开放工具时，planning 的完整 System+User 不得泄漏 %s", toolName)
+                    .doesNotContain(toolName);
+        }
     }
 
     @Test

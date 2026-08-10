@@ -14,6 +14,7 @@ import world.willfrog.agent.platform.mapper.AgentRunEventMapper;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunEventEnvelope;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agent.platform.prompt.PromptRunSelection;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 
 import java.time.OffsetDateTime;
@@ -23,6 +24,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 
 @Service
 @RequiredArgsConstructor
@@ -167,6 +169,9 @@ public class AgentEventService {
             ext.put("planner_candidate_count", plannerCandidateCount);
         }
         ext.put("checkpoint_version", resolveCheckpointVersion());
+        PromptRunSelection promptSelection = agentPromptService.snapshotPromptSelection(
+                runId, userId, contextJson);
+        ext.put("prompt_selection", promptSelection.toExtMap());
         // 260612-01-02: 落 admin 旁路信号，供 executor / pipeline 防御层使用
         ext.put("is_admin", isAdmin);
         if (stageConfigJson != null && !stageConfigJson.isBlank()) {
@@ -394,6 +399,19 @@ public class AgentEventService {
     }
 
     /**
+     * 按 run 与去重键读取 PostgreSQL 权威事件。
+     *
+     * <p>去重键是 durable 生命周期状态的主键，不能只读可能过期的 Redis 投影。
+     * D06 子代理用它在进程内句柄丢失后重放已持久化的 accepted/terminal 状态。</p>
+     */
+    public Optional<AgentRunEvent> findByDedupeKey(String runId, String dedupeKey) {
+        if (runId == null || runId.isBlank() || dedupeKey == null || dedupeKey.isBlank()) {
+            return Optional.empty();
+        }
+        return Optional.ofNullable(eventMapper.findByRunIdAndDedupeKey(runId, dedupeKey.trim()));
+    }
+
+    /**
      * 读取 run 最近 N 条事件（默认 Redis；Redis 无该 run 数据时回退 DB）。
      */
     public List<AgentRunEvent> listLatestByRunId(String runId, int limit) {
@@ -456,7 +474,8 @@ public class AgentEventService {
                  "WORKFLOW_FAILED",
                  "CANCELED",
                  "RUN_EXPIRED",
-                 "DAG_EXECUTION_COMPLETED" -> true;
+                 "DAG_EXECUTION_COMPLETED",
+                 "SUB_AGENT_TERMINAL" -> true;
             default -> false;
         };
     }

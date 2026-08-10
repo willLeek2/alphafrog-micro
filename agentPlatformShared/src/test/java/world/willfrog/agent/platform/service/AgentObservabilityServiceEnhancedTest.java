@@ -12,7 +12,9 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agent.platform.prompt.PromptRunSelection;
 
+import java.time.LocalDate;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -73,6 +75,41 @@ class AgentObservabilityServiceEnhancedTest {
             savedJson.set(inv.getArgument(1));
             return null;
         }).when(stateStore).saveObservability(eq(runId), anyString());
+    }
+
+    @Test
+    void promptSelectionIdentity_shouldRemainOnOrdinaryAndRawMinimalTraces() throws Exception {
+        ReflectionTestUtils.setField(service, "llmTraceEnabled", false);
+        PromptRunSelection selection = new PromptRunSelection(
+                PromptRunSelection.SCHEMA_VERSION,
+                "default-v1", "control", "bundle-digest", "capability-digest",
+                LocalDate.of(2025, 2, 3));
+        AgentContext.setPromptRunSelection(selection);
+
+        setupStateStore("prompt-ordinary");
+        service.recordLlmCall("prompt-ordinary", "planning", new TokenUsage(1, 2, 3),
+                10L, 100L, 110L, null, "endpoint-a", "model-a",
+                Map.of("messages", List.of()), "response");
+        AgentObservabilityService.ObservabilityState ordinary = objectMapper.readValue(
+                savedJson.get(), AgentObservabilityService.ObservabilityState.class);
+        assertPromptSelection(ordinary.getDiagnostics().getLlmTraces().get(0));
+
+        savedJson.set(null);
+        setupStateStore("prompt-raw");
+        service.recordLlmCallWithRawHttp(
+                "prompt-raw", "execution", new TokenUsage(1, 2, 3), null,
+                10L, 100L, 110L, "endpoint-b", "model-b", null,
+                null, null, null);
+        AgentObservabilityService.ObservabilityState raw = objectMapper.readValue(
+                savedJson.get(), AgentObservabilityService.ObservabilityState.class);
+        assertPromptSelection(raw.getDiagnostics().getLlmTraces().get(0));
+    }
+
+    private static void assertPromptSelection(AgentObservabilityService.LlmTrace trace) {
+        assertEquals("default-v1", trace.getPromptBundleVersion());
+        assertEquals("control", trace.getPromptVariant());
+        assertEquals("bundle-digest", trace.getPromptBundleDigest());
+        assertEquals("capability-digest", trace.getPromptCapabilityCatalogDigest());
     }
 
     // ==================== 5.2 LLM inputMessages / outputText ====================

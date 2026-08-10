@@ -25,8 +25,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * <ul>
  *   <li>ThreadLocal 无 hint → 原样返回（不重建 ChatRequest）</li>
  *   <li>ThreadLocal hint 为 null / blank → 原样返回，不消费</li>
- *   <li>ThreadLocal hint 存在 + 首个消息是 SystemMessage → 追加到 SystemMessage 文本末尾</li>
- *   <li>ThreadLocal hint 存在 + 没有 SystemMessage → 头部前置一条新 SystemMessage</li>
+ *   <li>ThreadLocal hint 存在 → 作为新的 UserMessage 追加，稳定 System 字节不变</li>
  *   <li>注入完成后 AgentContext 必须被清空，避免下次 tool-loop 再次消费同一份 hint</li>
  *   <li>重建后的 ChatRequest 必须保留 temperature / toolSpecifications 等原始字段（拷贝构造器继承）</li>
  * </ul>
@@ -61,7 +60,7 @@ class LangchainTodoNodeExecutorLastMileHintTest {
     }
 
     @Test
-    void hintWithExistingSystemMessageShouldAppendToFirstSystemMessage() {
+    void hintWithExistingSystemMessageShouldAppendNewUserMessage() {
         String hint = "[last_mile_hint] 9/10 tool_calls (90%)";
         AgentContext.setLastMileHint(hint);
         ChatRequest request = ChatRequest.builder()
@@ -75,18 +74,18 @@ class LangchainTodoNodeExecutorLastMileHintTest {
         ChatRequest result = LangchainTodoNodeExecutor.maybeInjectLastMileHint(request);
 
         List<ChatMessage> msgs = result.messages();
-        assertEquals(2, msgs.size(), "must not insert new SystemMessage; just append into the first one");
+        assertEquals(3, msgs.size(), "must append one UserMessage and preserve existing messages");
         ChatMessage first = msgs.get(0);
         assertTrue(first instanceof SystemMessage, "first message should still be SystemMessage");
         String text = ((SystemMessage) first).text();
-        assertTrue(text.contains("原始系统提示"));
-        assertTrue(text.contains(hint), "hint must be appended into the SystemMessage text");
-        assertTrue(text.indexOf(hint) > text.indexOf("原始系统提示"), "hint must come after original prompt");
+        assertEquals("原始系统提示", text, "stable System must remain byte-identical");
+        assertTrue(msgs.get(2) instanceof UserMessage);
+        assertEquals(hint, ((UserMessage) msgs.get(2)).singleText());
         assertNull(AgentContext.getLastMileHint(), "ThreadLocal must be consumed after injection");
     }
 
     @Test
-    void hintWithoutSystemMessageShouldPrependNewSystemMessage() {
+    void hintWithoutSystemMessageShouldAppendNewUserMessage() {
         String hint = "[last_mile_hint] 90% tokens";
         AgentContext.setLastMileHint(hint);
         ChatRequest request = ChatRequest.builder()
@@ -100,13 +99,13 @@ class LangchainTodoNodeExecutorLastMileHintTest {
         ChatRequest result = LangchainTodoNodeExecutor.maybeInjectLastMileHint(request);
 
         List<ChatMessage> msgs = result.messages();
-        assertEquals(4, msgs.size(), "must prepend one SystemMessage, keep original order intact");
+        assertEquals(4, msgs.size(), "must append one UserMessage, keep original order intact");
         ChatMessage first = msgs.get(0);
-        assertTrue(first instanceof SystemMessage, "new first message should be SystemMessage");
-        assertEquals(hint, ((SystemMessage) first).text());
-        assertEquals("user1", ((UserMessage) msgs.get(1)).singleText());
-        assertEquals("ai1", ((AiMessage) msgs.get(2)).text());
-        assertEquals("user2", ((UserMessage) msgs.get(3)).singleText());
+        assertTrue(first instanceof UserMessage, "original first message must remain first");
+        assertEquals("user1", ((UserMessage) msgs.get(0)).singleText());
+        assertEquals("ai1", ((AiMessage) msgs.get(1)).text());
+        assertEquals("user2", ((UserMessage) msgs.get(2)).singleText());
+        assertEquals(hint, ((UserMessage) msgs.get(3)).singleText());
         assertNull(AgentContext.getLastMileHint());
     }
 

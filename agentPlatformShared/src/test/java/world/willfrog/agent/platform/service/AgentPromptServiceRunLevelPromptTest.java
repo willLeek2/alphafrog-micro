@@ -13,25 +13,17 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class AgentPromptServiceRunLevelPromptTest {
 
     @Test
-    void agentRunSystemPromptClasspathFile_shouldContainRunLevelInstructions() {
+    void agentRunSystemPromptClasspathFile_shouldRemainCapabilityNeutral() {
         String prompt = PromptFileLoader.load("prompts/agent/agent_run_system.txt");
         assertFalse(prompt.isBlank(), "classpath agent_run_system.txt 必须可加载");
-        assertTrue(prompt.contains("run 内为每个 dataset / manifest 分配一个从 1 开始递增的整数编号"),
-                "system prompt 必须说明 run-level 编号机制");
-        assertTrue(prompt.contains("优先传 manifest 编号"),
-                "system prompt 必须说明优先使用 manifest 编号");
-        assertTrue(prompt.contains("不要传入原始 dataset_id、文件路径、scope hash 或 runId"),
-                "system prompt 必须禁止传入旧式 id/路径");
-        assertTrue(prompt.contains("paths_dataset.csv"),
-                "system prompt 必须说明 paths_dataset.csv");
-        assertTrue(prompt.contains("path_manifest.csv"),
-                "system prompt 必须说明 path_manifest.csv");
-        assertTrue(prompt.contains("UNCERTAIN"),
-                "system prompt 必须说明 UNCERTAIN 语义");
-        assertTrue(prompt.contains("listMyData"),
-                "system prompt 必须说明 listMyData 恢复路径");
-        assertTrue(prompt.contains("连续失败 2 次"),
-                "system prompt 必须说明连续失败停止策略");
+        assertFalse(prompt.contains("paths_dataset.csv"),
+                "稳定 System 不得携带只有 executePython 开放时才适用的数据路径规则");
+        assertFalse(prompt.contains("path_manifest.csv"),
+                "稳定 System 不得携带只有 executePython 开放时才适用的 manifest 路径规则");
+        assertFalse(prompt.contains("listMyData"),
+                "稳定 System 不得泄漏本次 Run 未开放的恢复工具");
+        assertFalse(prompt.contains("executePython"),
+                "稳定 System 不得泄漏本次 Run 未开放的代码执行工具");
     }
 
     @Test

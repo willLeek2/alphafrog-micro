@@ -20,10 +20,12 @@ import world.willfrog.agent.platform.dataanalysis.CompletedTodoRecord;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agent.platform.prompt.PromptRunSelection;
 import world.willfrog.agent.platform.service.AgentCreditService;
 import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agent.platform.service.AgentMessageService;
 import world.willfrog.agent.platform.service.AgentObservabilityService;
+import world.willfrog.agent.platform.service.AgentPromptService;
 import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agent.platform.event.AgentRunFinalizationService;
@@ -47,6 +49,7 @@ import java.util.Map;
 import java.util.ArrayList;
 import java.util.function.Consumer;
 import java.util.function.BooleanSupplier;
+import java.time.LocalDate;
 
 /**
  * agentLangchainService 的 run 级总控流水线。
@@ -90,6 +93,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
     private final AgentCreditService creditService;
     private final AgentRunCreditSettlementService creditSettlementService;
     private final AgentRunFinalizationService finalizationService;
+    private final AgentPromptService promptService;
     /**
      * 260623-agent-service-deprecation task #47 (P0-2)：agentLangchainService 的 run 级执行
      * 完毕后清理 {@link AgentRunDatasetRegistry} 的 per-run 状态，避免长生命周期进程里
@@ -123,6 +127,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                                           AgentCreditService creditService,
                                           AgentRunCreditSettlementService creditSettlementService,
                                           AgentRunFinalizationService finalizationService,
+                                          AgentPromptService promptService,
                                           ObjectProvider<AgentRunDatasetRegistry> agentRunDatasetRegistryProvider,
                                           ObjectProvider<DebugObservabilityService> debugObservabilityServiceProvider) {
         this.planner = planner;
@@ -143,6 +148,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         this.creditService = creditService;
         this.creditSettlementService = creditSettlementService;
         this.finalizationService = finalizationService;
+        this.promptService = promptService;
         this.agentRunDatasetRegistryProvider = agentRunDatasetRegistryProvider;
         this.debugObservabilityServiceProvider = debugObservabilityServiceProvider;
     }
@@ -213,6 +219,9 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             // 后续 OpenRouterProviderRoutedChatModel、ToolRouterToolProvider、可观测服务都会从这里取 runId/userId/phase。
             AgentContext.setRunId(runId);
             AgentContext.setUserId(userId);
+            // D02：先恢复并校验 run 级 Prompt 身份，再允许任何模型解析、观测初始化或
+            // follow-up 摘要调用。坏摘要必须在第一次 LLM 副作用之前 fail closed。
+            setPromptSelectionFromExt(run.getExt());
             DebugObservabilityService debugObservabilityService = debugObservabilityServiceProvider.getIfAvailable();
             if (debugObservabilityService != null) {
                 DebugObservabilityRequest debugRequest = debugObservabilityService.parseFromExt(run.getExt());
@@ -514,6 +523,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             // 新线程不会继承旧 worker 的 ThreadLocal，必须从持久化身份重新建立。
             AgentContext.setRunId(runId);
             AgentContext.setUserId(userId);
+            // durable resume 使用同一前置门；不能让 follow-up 摘要先于 digest 校验调用模型。
+            setPromptSelectionFromExt(run.getExt());
             // 恢复排队期间若用户已暂停/取消，不能继续执行原 Todo。
             if (!eventService.isRunnable(runId, userId)) {
                 // 只有停止状态已经持久化，才算这次 launcher 可以安全完成交接。
@@ -1030,6 +1041,31 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             AgentContext.setDataFreshness(freshness);
         } catch (Exception e) {
             log.warn("Failed to parse data_freshness from ext for agent run, falling back to live config", e);
+        }
+    }
+
+    /** 从 run.ext 恢复 D02 冻结的 Prompt 选择；旧 Run 没有该字段时保持兼容的当前默认。 */
+    private void setPromptSelectionFromExt(String extJson) {
+        if (extJson == null || extJson.isBlank()) {
+            return;
+        }
+        try {
+            var extNode = objectMapper.readTree(extJson);
+            var node = extNode.get("prompt_selection");
+            if (node == null || node.isNull()) {
+                return;
+            }
+            PromptRunSelection selection = new PromptRunSelection(
+                    node.path("schema_version").asInt(-1),
+                    textOrNull(node, "bundle_version"),
+                    textOrNull(node, "variant"),
+                    textOrNull(node, "bundle_digest"),
+                    textOrNull(node, "capability_catalog_digest"),
+                    LocalDate.parse(textOrNull(node, "reference_date")));
+            AgentContext.setPromptRunSelection(selection);
+            promptService.validatePromptSelection(selection);
+        } catch (Exception e) {
+            throw new IllegalStateException("PROMPT_SELECTION_INVALID", e);
         }
     }
 

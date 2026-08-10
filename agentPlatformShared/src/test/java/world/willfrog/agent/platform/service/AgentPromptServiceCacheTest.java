@@ -24,7 +24,7 @@ import static org.mockito.Mockito.when;
 @ExtendWith(MockitoExtension.class)
 class AgentPromptServiceCacheTest {
 
-    private static final String GLOBAL_PROMPT = "你是一个专业的金融分析助手。";
+    private static final String GLOBAL_PROMPT = "你是专业金融分析代理。请只使用当前 User Message 与运行时 ToolSpecification 实际列出的工具获取数据并准确回答用户问题。";
     private static final DateTimeFormatter CN_DATE_FORMATTER = DateTimeFormatter.ofPattern("yyyy年MM月dd日");
 
     @Mock
@@ -36,7 +36,6 @@ class AgentPromptServiceCacheTest {
     void setUp() {
         AgentLlmProperties properties = new AgentLlmProperties();
         AgentLlmProperties.Prompts prompts = new AgentLlmProperties.Prompts();
-        prompts.setAgentRunSystemPrompt(GLOBAL_PROMPT);
         properties.setPrompts(prompts);
         lenient().when(localConfigLoader.current()).thenReturn(Optional.empty());
         promptService = new AgentPromptService(properties, localConfigLoader);
@@ -154,9 +153,6 @@ class AgentPromptServiceCacheTest {
     @Test
     void planningStrategyStageInstruction_shouldDescribeMarketDataBatchSyntax() {
         AgentLlmProperties properties = new AgentLlmProperties();
-        AgentLlmProperties.Prompts prompts = new AgentLlmProperties.Prompts();
-        prompts.setPlanningStrategyStage("{{toolCapabilities}}");
-        properties.setPrompts(prompts);
         AgentPromptService service = new AgentPromptService(properties, localConfigLoader);
 
         String instruction = service.planningStrategyStageInstruction(
@@ -205,20 +201,26 @@ class AgentPromptServiceCacheTest {
         String prompt = promptService.dagReactSystemPrompt();
         assertTrue(prompt.startsWith("当前时间：" + LocalDate.now().format(CN_DATE_FORMATTER)),
                 "DAG ReAct system prompt 应含与 planning 一致的时间基准前缀");
+        assertFalse(prompt.contains("[Stage: TODO_EXECUTION]"),
+                "稳定 System 不得包含 Todo 阶段正文");
+        assertFalse(prompt.contains("## 本次 Run 实际开放的工具"),
+                "稳定 System 不得包含本次 Run 动态工具清单");
     }
 
     @Test
-    void dagReactSystemPrompt_shouldSuggestSoftBatchGuidance() {
-        String prompt = promptService.dagReactSystemPrompt();
-        assertTrue(prompt.contains("批量/并行查询限制（必须先查询）"),
-                "ReAct system prompt 应包含批量上限查询要求");
+    void dagReactStageInstruction_shouldSuggestSoftBatchGuidanceInUserRole() {
+        String prompt = promptService.dagReactStageInstruction(
+                promptService.renderToolCapabilities(java.util.List.of(
+                        "checkParallelLimits", "searchAssetInfo")));
+        assertTrue(prompt.contains("本次能力清单同时提供限制查询能力并已取得限制时，才可批量"),
+                "ReAct User 阶段指令应包含能力受限的批量上限要求");
         assertTrue(prompt.contains("checkParallelLimits"),
-                "ReAct system prompt 应要求先调用 checkParallelLimits");
-        assertTrue(prompt.contains("发现式查询"),
-                "ReAct system prompt 应保留发现式逐步查询的边界说明");
+                "ReAct User 阶段指令应要求先调用 checkParallelLimits");
+        assertTrue(prompt.contains("搜索股票、ETF、指数和场外基金"),
+                "ReAct User 阶段指令应包含已开放发现能力的权威说明");
         assertTrue(prompt.contains("searchAssetInfo"),
-                "ReAct system prompt 应列举支持批量的工具名");
+                "ReAct User 阶段指令应只列举本次实际开放的工具名");
         assertFalse(prompt.contains("单次最多"),
-                "ReAct system prompt 不应硬编码批量上限");
+                "ReAct User 阶段指令不应硬编码批量上限");
     }
 }

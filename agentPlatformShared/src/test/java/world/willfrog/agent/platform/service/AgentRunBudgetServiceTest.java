@@ -37,13 +37,24 @@ class AgentRunBudgetServiceTest {
     private AgentEventService eventService;
     @Mock
     private AgentLlmLocalConfigLoader localConfigLoader;
+    @Mock
+    private AgentPromptService promptService;
 
     private AgentRunBudgetService service;
 
     @BeforeEach
     void setUp() {
         AgentLlmProperties llmProperties = new AgentLlmProperties();
-        service = new AgentRunBudgetService(stateStore, eventService, new ObjectMapper(), llmProperties);
+        service = new AgentRunBudgetService(
+                stateStore, eventService, new ObjectMapper(), llmProperties, promptService);
+        lenient().when(promptService.budgetLastMileStageInstruction(
+                        org.mockito.ArgumentMatchers.anyString(),
+                        org.mockito.ArgumentMatchers.anyLong(),
+                        org.mockito.ArgumentMatchers.anyLong(),
+                        org.mockito.ArgumentMatchers.anyLong()))
+                .thenAnswer(invocation -> "[Stage: BUDGET_LAST_MILE] "
+                        + invocation.getArgument(0) + " " + invocation.getArgument(1)
+                        + "/" + invocation.getArgument(2) + " " + invocation.getArgument(3) + "%");
         ReflectionTestUtils.setField(service, "localConfigLoader", localConfigLoader);
         ReflectionTestUtils.setField(service, "defaultMaxWallClockMs", 600000L);
         ReflectionTestUtils.setField(service, "defaultMaxLlmCalls", 50L);
@@ -204,7 +215,7 @@ class AgentRunBudgetServiceTest {
 
         // hint 必须落到 AgentContext ThreadLocal,供下次 chatRequestTransformer 读取
         String hint = AgentContext.getLastMileHint();
-        assertTrue(hint != null && hint.contains("[last_mile_hint]") && hint.contains("tool_calls")
+        assertTrue(hint != null && hint.contains("[Stage: BUDGET_LAST_MILE]") && hint.contains("tool_calls")
                 && hint.contains("9/10") && hint.contains("90%"));
     }
 
