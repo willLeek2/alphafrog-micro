@@ -253,6 +253,12 @@ class ToolJobFinalizerRetryableTest {
         when(anchorService.updateAnchorAndStatus(eq("run-bf"), any(ToolJobAnchor.class),
                 eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.WAITING_TOOL_JOB)))
                 .thenReturn(true);
+        // task #115: shared atomic promote wins; loadAnchor returns persisted READY
+        when(anchorService.promoteCasStatusToResumeReady(
+                eq("run-bf"), eq("run-bf:tc-bf:1"), eq("tc-bf"), eq(1), eq("task-bf"),
+                eq(0L), anyString())).thenReturn(1);
+        when(anchorService.loadAnchor("run-bf"))
+                .thenReturn(buildPersistedReadyAnchor("run-bf", "tc-bf", 1, "task-bf"));
         when(capacityService.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
         when(capacityService.releaseReservation(any())).thenReturn(DataAnalysisReleaseOutcome.RELEASED);
         when(usageHook.upsertUsage(eq("run-bf"), any())).thenReturn(true);
@@ -394,6 +400,12 @@ class ToolJobFinalizerRetryableTest {
         when(anchorService.updateAnchorAndStatus(eq("run-rlb"), any(ToolJobAnchor.class),
                 eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.WAITING_TOOL_JOB)))
                 .thenReturn(true);
+        // task #115: shared atomic promote wins; loadAnchor returns persisted READY
+        when(anchorService.promoteCasStatusToResumeReady(
+                eq("run-rlb"), eq("run-rlb:tc-rlb:1"), eq("tc-rlb"), eq(1), eq("task-rlb"),
+                eq(0L), anyString())).thenReturn(1);
+        when(anchorService.loadAnchor("run-rlb"))
+                .thenReturn(buildPersistedReadyAnchor("run-rlb", "tc-rlb", 1, "task-rlb"));
 
         ToolJobFinalizer finalizer = new ToolJobFinalizer(anchorService, mock(ToolJobRedisCache.class),
                 capacityService, resumeService, mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class), mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class), mock(FinanceResultModelAdapter.class));
@@ -478,6 +490,12 @@ class ToolJobFinalizerRetryableTest {
                 any(AgentRunStatus.class))).thenReturn(true);
         when(anchorService.updateAnchorAndStatus(eq("run-legacy"), any(ToolJobAnchor.class),
                 eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.WAITING_TOOL_JOB))).thenReturn(true);
+        // task #115: shared atomic promote wins; loadAnchor returns persisted READY
+        when(anchorService.promoteCasStatusToResumeReady(
+                eq("run-legacy"), eq("run-legacy:tc-legacy:1"), eq("tc-legacy"), eq(1),
+                eq("task-legacy"), eq(0L), anyString())).thenReturn(1);
+        when(anchorService.loadAnchor("run-legacy"))
+                .thenReturn(buildPersistedReadyAnchor("run-legacy", "tc-legacy", 1, "task-legacy"));
         DataAnalysisCapacityService capacityService = mock(DataAnalysisCapacityService.class);
         when(capacityService.restoreReservation(any())).thenReturn(DataAnalysisRestoreOutcome.ADDED);
         when(capacityService.releaseReservation(any())).thenReturn(DataAnalysisReleaseOutcome.RELEASED);
@@ -540,6 +558,21 @@ class ToolJobFinalizerRetryableTest {
     }
 
     // ===== helpers =====
+
+    private static ToolJobAnchor buildPersistedReadyAnchor(String runId, String toolCallId,
+                                                            int attempt, String taskId) {
+        ToolJobAnchor a = new ToolJobAnchor();
+        a.setOperationId(runId + ":" + toolCallId + ":" + attempt);
+        a.setToolCallId(toolCallId);
+        a.setAttempt(attempt);
+        a.setTaskId(taskId);
+        a.setFinalizerStep("RESUME_READY");
+        a.setResumeState("READY");
+        a.setResumeToken("token-" + runId);
+        a.setResumeLeaseVersion(1);
+        a.setResumeClaimedAt(java.time.Instant.now());
+        return a;
+    }
 
     private static void inject(Object target, String name, Object value) throws Exception {
         Field field = target.getClass().getDeclaredField(name);

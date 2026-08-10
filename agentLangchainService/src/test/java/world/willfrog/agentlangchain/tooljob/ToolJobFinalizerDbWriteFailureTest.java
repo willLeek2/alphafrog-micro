@@ -59,6 +59,12 @@ class ToolJobFinalizerDbWriteFailureTest {
         when(anchorService.updateAnchorAndStatus(eq("run-1"), any(ToolJobAnchor.class),
                 eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.WAITING_TOOL_JOB)))
                 .thenReturn(true);
+        // task #115: shared atomic promote wins; loadAnchor returns persisted READY
+        when(anchorService.promoteCasStatusToResumeReady(
+                eq("run-1"), eq("run-1:tc-1:1"), eq("tc-1"), eq(1), eq("task-1"),
+                eq(0L), anyString())).thenReturn(1);
+        when(anchorService.loadAnchor("run-1"))
+                .thenReturn(buildPersistedReadyAnchor("run-1", "tc-1", 1, "task-1"));
 
         when(usageHook.upsertUsage(eq("run-1"), any(ToolJobAnchor.class))).thenReturn(true);
         when(eventHook.emitTerminalEvent(eq("run-1"), any(ToolJobAnchor.class))).thenReturn(true);
@@ -117,6 +123,12 @@ class ToolJobFinalizerDbWriteFailureTest {
         when(anchorService.updateAnchorAndStatus(eq("run-2"), any(ToolJobAnchor.class),
                 eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.WAITING_TOOL_JOB)))
                 .thenReturn(true);
+        // task #115: shared atomic promote wins; loadAnchor returns persisted READY
+        when(anchorService.promoteCasStatusToResumeReady(
+                eq("run-2"), eq("run-2:tc-2:1"), eq("tc-2"), eq(1), eq("task-2"),
+                eq(0L), anyString())).thenReturn(1);
+        when(anchorService.loadAnchor("run-2"))
+                .thenReturn(buildPersistedReadyAnchor("run-2", "tc-2", 1, "task-2"));
 
         when(usageHook.upsertUsage(eq("run-2"), any(ToolJobAnchor.class))).thenReturn(true);
         when(eventHook.emitTerminalEvent(eq("run-2"), any(ToolJobAnchor.class))).thenReturn(true);
@@ -170,6 +182,12 @@ class ToolJobFinalizerDbWriteFailureTest {
         when(anchorService.updateAnchorAndStatus(eq("run-3"), any(ToolJobAnchor.class),
                 eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.WAITING_TOOL_JOB)))
                 .thenReturn(true);
+        // task #115: shared atomic promote wins; loadAnchor returns persisted READY
+        when(anchorService.promoteCasStatusToResumeReady(
+                eq("run-3"), eq("run-3:tc-3:1"), eq("tc-3"), eq(1), eq("task-3"),
+                eq(0L), anyString())).thenReturn(1);
+        when(anchorService.loadAnchor("run-3"))
+                .thenReturn(buildPersistedReadyAnchor("run-3", "tc-3", 1, "task-3"));
 
         String releasedJson = buildReservationJson("run-3", "tc-3", 1, "task-3",
                 DataAnalysisReservationState.RELEASED);
@@ -225,6 +243,12 @@ class ToolJobFinalizerDbWriteFailureTest {
         when(anchorService.updateAnchorAndStatus(eq("run-4"), any(ToolJobAnchor.class),
                 eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.WAITING_TOOL_JOB)))
                 .thenReturn(true);
+        // task #115: shared atomic promote wins; loadAnchor returns persisted READY
+        when(anchorService.promoteCasStatusToResumeReady(
+                eq("run-4"), eq("run-4:tc-4:1"), eq("tc-4"), eq(1), eq("task-4"),
+                eq(0L), anyString())).thenReturn(1);
+        when(anchorService.loadAnchor("run-4"))
+                .thenReturn(buildPersistedReadyAnchor("run-4", "tc-4", 1, "task-4"));
 
         String releasedJson = buildReservationJson("run-4", "tc-4", 1, "task-4",
                 DataAnalysisReservationState.RELEASED);
@@ -371,6 +395,21 @@ class ToolJobFinalizerDbWriteFailureTest {
     }
 
     // ===== helpers =====
+
+    private static ToolJobAnchor buildPersistedReadyAnchor(String runId, String toolCallId,
+                                                            int attempt, String taskId) {
+        ToolJobAnchor a = new ToolJobAnchor();
+        a.setOperationId(runId + ":" + toolCallId + ":" + attempt);
+        a.setToolCallId(toolCallId);
+        a.setAttempt(attempt);
+        a.setTaskId(taskId);
+        a.setFinalizerStep("RESUME_READY");
+        a.setResumeState("READY");
+        a.setResumeToken("token-" + runId);
+        a.setResumeLeaseVersion(1);
+        a.setResumeClaimedAt(Instant.now());
+        return a;
+    }
 
     private static void inject(Object target, String name, Object value) throws Exception {
         Field field = target.getClass().getDeclaredField(name);
