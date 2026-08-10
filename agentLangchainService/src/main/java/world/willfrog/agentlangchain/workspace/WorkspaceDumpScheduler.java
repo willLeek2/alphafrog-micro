@@ -241,14 +241,9 @@ public class WorkspaceDumpScheduler {
         try {
             Files.createDirectories(dlqDir);
             String fileName = "entry-" + UUID.randomUUID() + ".json";
-            Path tmp = dlqDir.resolve("." + fileName + ".tmp");
-            Path target = dlqDir.resolve(fileName);
-            byte[] json = MAPPER.writeValueAsBytes(entry.toMap());
-            Files.write(tmp, json);
-            Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            writeEntryToDisk(fileName, entry);
             dlqMemory.addLast(runId);
             log.warn("DLQ push: runId={} conservative={} file={}", runId, conservative, fileName);
-            // 写入成功后才触发容量治理，避免新条目没写成旧条目反被淘汰
             evictIfNeeded();
             return true;
         } catch (IOException e) {
@@ -256,6 +251,18 @@ public class WorkspaceDumpScheduler {
             return false;
         }
     }
+
+    /** 原子写入 DLQ 条目到磁盘（.tmp 写 → ATOMIC_MOVE）。提取为 package-private 方法以便测试注入失败。 */
+    void writeEntryToDisk(String fileName, DlqEntry entry) throws IOException {
+        Path tmp = dlqDir.resolve("." + fileName + ".tmp");
+        Path target = dlqDir.resolve(fileName);
+        byte[] json = MAPPER.writeValueAsBytes(entry.toMap());
+        Files.write(tmp, json);
+        Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+    }
+
+    /** 淘汰候选：Path 与可选的 runId 绑定，避免下标错位把错误的 runId 从内存移除。 */
+    private record EvictionCandidate(Path path, String runId) {}
 
     private void evictIfNeeded() {
         // 容量统计 .json + .processing；quarantine/ 和 eviction.log 不计入
@@ -265,13 +272,13 @@ public class WorkspaceDumpScheduler {
         if (total <= DLQ_MAX_FILES) return;
 
         // 只淘汰尚未 claim 的 .json；活跃 .processing 永远不删
-        List<Path> candidates = new ArrayList<>(jsonFiles);
-        candidates.sort(Comparator.comparing(p -> {
+        List<Path> sortedJson = new ArrayList<>(jsonFiles);
+        sortedJson.sort(Comparator.comparing(p -> {
             try { return Files.getLastModifiedTime(p).toMillis(); }
             catch (IOException e) { return 0L; }
         }));
 
-        int toEvict = Math.min(DLQ_EVICTION_BATCH, candidates.size());
+        int toEvict = Math.min(DLQ_EVICTION_BATCH, sortedJson.size());
         if (toEvict == 0) {
             log.error("DLQ capacity exceeded (total={}, cap={}) but no evictable .json files available; "
                     + "{} .processing files are in-flight and cannot be evicted",
@@ -279,37 +286,38 @@ public class WorkspaceDumpScheduler {
             return;
         }
 
-        List<String> evictedRunIds = new ArrayList<>();
-        List<Path> toDelete = new ArrayList<>();
+        // 绑定 Path 与 runId，避免下标错位
+        List<EvictionCandidate> evictionBatch = new ArrayList<>();
+        List<String> auditRunIds = new ArrayList<>();
         for (int i = 0; i < toEvict; i++) {
-            Path f = candidates.get(i);
+            Path f = sortedJson.get(i);
             DlqEntry e = readEntry(f);
-            if (e != null) evictedRunIds.add(e.runId);
-            toDelete.add(f);
+            String rid = e != null ? e.runId : null;
+            evictionBatch.add(new EvictionCandidate(f, rid));
+            if (rid != null) auditRunIds.add(rid);
         }
 
-        if (!appendEvictionLog("capacity", evictedRunIds)) {
-            log.error("DLQ eviction audit log write failed, refusing to delete {} entries", toDelete.size());
+        if (!appendEvictionLog("capacity", auditRunIds)) {
+            log.error("DLQ eviction audit log write failed, refusing to delete {} entries", evictionBatch.size());
             return;
         }
 
         int deleted = 0;
         List<String> actuallyDeleted = new ArrayList<>();
-        for (int i = 0; i < toDelete.size(); i++) {
-            Path f = toDelete.get(i);
+        for (EvictionCandidate c : evictionBatch) {
             try {
-                Files.delete(f);
+                Files.delete(c.path);
                 deleted++;
-                if (i < evictedRunIds.size()) {
-                    actuallyDeleted.add(evictedRunIds.get(i));
+                if (c.runId != null) {
+                    actuallyDeleted.add(c.runId);
                 }
             } catch (IOException ex) {
-                log.error("DLQ eviction delete failed for {}: {}", f.getFileName(), ex.getMessage());
+                log.error("DLQ eviction delete failed for {}: {}", c.path.getFileName(), ex.getMessage());
             }
         }
         actuallyDeleted.forEach(dlqMemory::remove);
         log.warn("DLQ evicted {}/{} attempted entries (cap={}, total={}): {}",
-                deleted, toDelete.size(), DLQ_MAX_FILES, total, evictedRunIds);
+                deleted, evictionBatch.size(), DLQ_MAX_FILES, total, auditRunIds);
     }
 
     /** @return true if audit log was written successfully */

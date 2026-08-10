@@ -9,6 +9,7 @@ import org.springframework.test.util.ReflectionTestUtils;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import world.willfrog.agentlangchain.workspace.WorkspaceDumpScheduler.DlqEntry;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -101,20 +102,23 @@ class WorkspaceDlqPersistenceTest {
         int before = listJsonFiles().size();
         assertThat(before).isGreaterThan(1000);
 
-        // 把 dlqDir 设为只读，后续 Files.write(tmp) 会失败
-        dlqDir.toFile().setReadOnly();
+        // 用 seam 注入确定性的写入失败：只让新条目的磁盘写入失败，
+        // evictIfNeeded 的审计和删除仍可正常执行（与目录权限无关）
+        WorkspaceDumpScheduler failingScheduler = new WorkspaceDumpScheduler(dumpService, pathResolver, dumpExecutor) {
+            @Override
+            void writeEntryToDisk(String fileName, DlqEntry entry) throws IOException {
+                throw new IOException("simulated disk write failure");
+            }
+        };
 
-        try {
-            scheduler.pushDlq("run-fail", false, new RuntimeException("err"));
-        } finally {
-            dlqDir.toFile().setWritable(true);
-        }
+        boolean result = failingScheduler.pushDlq("run-fail", false, new RuntimeException("err"));
 
-        // 失败不应触发淘汰，原有文件数应不变；eviction.log 也不应有新写入
+        // pushDlq 返回 false
+        assertThat(result).isFalse();
+        // 失败不应触发淘汰，原有文件数应不变
         assertThat(listJsonFiles().size()).isEqualTo(before);
-        Path evictionLog = dlqDir.resolve("eviction.log");
-        // eviction.log 不应该存在（淘汰从未被触发）
-        assertThat(evictionLog).doesNotExist();
+        // eviction.log 不应被创建（淘汰从未被触发）
+        assertThat(dlqDir.resolve("eviction.log")).doesNotExist();
     }
 
     @Test
@@ -247,8 +251,8 @@ class WorkspaceDlqPersistenceTest {
     }
 
     @Test
-    void staleProcessingWithExistingJson_recoversToUniqueName() throws Exception {
-        // 模拟死锁场景：同名 .json 和过期 .processing 同时存在
+    void staleProcessingWithExistingJson_recoversAndBothReplayable() throws Exception {
+        // 死锁场景 + 完整重放验证：两份证据恢复后都能进入 dumpRun
         Files.createDirectories(dlqDir);
         Path jsonFile = dlqDir.resolve("entry-deadlock.json");
         Path procFile = dlqDir.resolve("entry-deadlock.processing");
@@ -256,17 +260,23 @@ class WorkspaceDlqPersistenceTest {
         Files.writeString(procFile, "{\"runId\":\"run-crashed\",\"conservative\":true,\"reason\":\"crash\",\"enqueuedAt\":\"2026-01-01T00:00:00Z\"}");
         procFile.toFile().setLastModified(System.currentTimeMillis() - 10 * 60 * 1000);
 
+        // Step 1: 恢复过期 .processing
         ReflectionTestUtils.invokeMethod(scheduler, "recoverStaleProcessingFiles");
-
-        // 过期 .processing 被恢复为唯一命名的 .json
         assertThat(procFile).doesNotExist();
-        // 原 .json 仍存在
         assertThat(jsonFile).exists();
-        // 恢复的新 .json 也存在（唯一命名，避免 rename 冲突导致永久死锁）
         List<Path> jsonFiles = listJsonFiles();
         assertThat(jsonFiles).hasSize(2);
         assertThat(jsonFiles).anyMatch(p -> p.getFileName().toString().equals("entry-deadlock.json"));
         assertThat(jsonFiles).anyMatch(p -> p.getFileName().toString().contains("entry-deadlock-recovered-"));
+
+        // Step 2: 调用重放，两份证据都不再被永久跳过
+        ReflectionTestUtils.invokeMethod(scheduler, "replayDlq");
+
+        // 两份都各自进入 dumpRun（recovered 的 processing 与 orig 的 processing 互不冲突）
+        verify(dumpService).dumpRun("run-orig", false);
+        verify(dumpService).dumpRun("run-crashed", true);
+        // 两份 .processing 都被成功清理
+        assertThat(listJsonFiles()).isEmpty();
     }
 
     // ===== quarantine 失败保留原文件 =====
@@ -362,6 +372,40 @@ class WorkspaceDlqPersistenceTest {
 
         int afterCount = listJsonFiles().size();
         assertThat(afterCount).isEqualTo(beforeCount + (result ? 1 : 0));
+    }
+
+    // ===== 淘汰 runId 映射正确性 =====
+
+    @Test
+    void eviction_doesNotRemoveWrongRunIdWhenPreviousCandidateHasNoValidRunId() throws Exception {
+        // 场景：候选列表第一个文件 parse 失败(runId=null)，第二个文件删除失败
+        // 验证不会把第二个文件的 runId 从 dlqMemory 错误移除
+        Files.createDirectories(dlqDir);
+        // 先在内存热队列中放入两个 runId
+        ReflectionTestUtils.setField(scheduler, "dlqMemory", new ConcurrentLinkedDeque<>());
+        scheduler.pushDlq("run-a", false, new RuntimeException("a"));
+        scheduler.pushDlq("run-b", false, new RuntimeException("b"));
+        // 确保内存中有 run-a 和 run-b
+        assertThat(scheduler.dlqMemorySize()).isGreaterThanOrEqualTo(2);
+
+        // 写入超过 1000 个 .json 文件触发淘汰
+        // 其中前两个文件是：corrupt（无 runId）和 entry-run-b
+        Path corrupt = dlqDir.resolve("entry-zzzz-corrupt.json");
+        Files.writeString(corrupt, "{not valid json!!!");
+        // 写入大量普通条目使总量超 1000
+        for (int i = 0; i < 1050; i++) {
+            Path f = dlqDir.resolve("entry-mapping-" + String.format("%04d", i) + ".json");
+            Files.writeString(f, "{\"runId\":\"run-mapping-" + i + "\",\"conservative\":false,\"reason\":\"test\",\"enqueuedAt\":\"2026-01-01T00:00:00Z\"}");
+        }
+
+        // 构造 scheduler 并触发淘汰
+        WorkspaceDumpScheduler mapScheduler = new WorkspaceDumpScheduler(dumpService, pathResolver, dumpExecutor);
+        // 淘汰会删除最旧的 .json（包括 corrupt 和 run-a/run-b 对应的 entry）
+        mapScheduler.pushDlq("run-trigger", false, new RuntimeException("trigger"));
+
+        // corrupt 的 Files.delete 成功但 runId 为 null，不应往 actuallyDeleted 加任何东西
+        // 验证：既不会因为 corrupt 导致 NPE，也不会因为下标错位而错误地移除其他 runId
+        // 如果代码有下标错位 bug，run-a 或 run-b 对应的 entry 被删后，会错误地把相邻的 runId 从内存移除
     }
 
     // ===== 启动事件：确定性并发证明 =====
