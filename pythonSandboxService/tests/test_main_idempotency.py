@@ -119,6 +119,10 @@ class MainIdempotencyTest(unittest.IsolatedAsyncioTestCase):
             status=TaskStatus.QUEUED,
             request=ExecuteRequest(dataset_id="dataset-1", code="raise SystemExit(2)"),
         )
+        # D11 (task #108): process_task now gates on the store's QUEUED→RUNNING
+        # transition (begin_execution), which mirrors the real production flow
+        # (create_task persists BEFORE enqueue) — the task must be saved first.
+        self.store.save(task)
         runner_result = {
             "exit_code": 2,
             "stdout": "",
@@ -156,6 +160,8 @@ class MainIdempotencyTest(unittest.IsolatedAsyncioTestCase):
             status=TaskStatus.QUEUED,
             request=ExecuteRequest(dataset_id="dataset-1", code="print(1)"),
         )
+        # D11: same begin_execution gate as the real production flow.
+        self.store.save(task)
 
         with patch.object(main, "pool", None), patch.object(
             main, "run_in_sandbox", side_effect=RuntimeError("runner failed before usage")
@@ -177,6 +183,8 @@ class MainIdempotencyTest(unittest.IsolatedAsyncioTestCase):
             status=TaskStatus.QUEUED,
             request=ExecuteRequest(dataset_id="dataset-1", code="print(1)"),
         )
+        # D11: same begin_execution gate as the real production flow.
+        self.store.save(task)
         runner_exc = RuntimeError("wrapper boom after successful recollect")
         runner_exc.execution_environment = ExecutionEnvironment(
             environment_id="sha256:post-install",

@@ -19,6 +19,12 @@ def classify_terminal_retryable(
         return None
 
     exit_reason = (resource_usage.exit_reason or "").strip().upper()
+    # 260809-26Q3 D11 (task #108): a run classified CANCELED (the wrapper
+    # observed the cancel marker and killed its own child group) is terminal
+    # by user intent — never retryable.  Checked BEFORE the OOM branch so a
+    # cancel that raced an OOM flag still resolves to the cancel outcome.
+    if exit_reason == "CANCELED":
+        return False
     if resource_usage.oom_killed or exit_reason == "OOM_KILLED":
         return True
     if exit_reason == "QUEUE_TIMEOUT":
