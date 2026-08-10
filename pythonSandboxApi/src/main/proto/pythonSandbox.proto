@@ -293,13 +293,25 @@ message CancelTaskResponse {
   // 第 五 节 stable taskId 收口）。outcome=CANCEL_INTENT_RECORDED 时 taskId
   // 已分配但 result 尚未 honest，调用方需轮询直到 outcome 转为 CANCELED。
   string taskId = 2;
-  // 当前沙箱侧持久态。冻结合法值（与 Python 沙箱任务表 status 列 1:1）：
-  //   PREPARING / CREATED / RUNNING / CANCELING / CANCELED / SUCCEEDED / FAILED
-  // 注意：不一定是 terminal（CANCELING 也是合法值），名字 status 不再误导
+  // 当前沙箱侧持久态。**当前** Python TaskStatus 已实现的合法值（与现有
+  // TaskStatusResponse.status / TaskResultResponse.status 同一套词汇，调用方拿
+  // stable taskId 轮询 getTaskStatus/getTaskResult 看到的是同一组词）：
+  //   QUEUED / RUNNING / SUCCEEDED / FAILED / CANCELED
+  // proto 字段不在同一 taskId 上引入两套状态词（codex f25b394a 第 2 节）。
+  //
+  // outcome=CANCEL_INTENT_RECORDED 时 status 仍是当前 QUEUED/RUNNING，最终查询
+  // 转为 CANCELED；调用方据 outcome 判断进度，不靠 status=canceling 这种中间态
   // （codex a3aee2ad 第 四 节 2：terminalStatus 改名 status）。
-  // Java 的 CANCELLING（dag_frontier_json.phase）与沙箱的 CANCELING 不混用 ——
-  // Java 侧用 -ING 表示进行时，沙箱侧任务表用 -ING 同义；调用方跨语言读时按
-  // 各自表锁定的拼写，不在 proto 字符串里跨语言归一化。
+  //
+  // 中间态 CANCELING（取消进行中）：当前 Python TaskStatus 尚未实现此值。如果
+  // endpoint 实现（ccqwen Python D11 child task）确实需要 CANCELING 中间态，必须
+  // 由 endpoint 实现者同时扩展 Python TaskStatus、getTaskStatus/getTaskResult
+  // 两个查询响应、相关测试，再在本字段冻结；proto 现在不提前声称 CANCELING
+  // 已实现或与任务表 1:1。
+  //
+  // Java 侧 dag_frontier_json.phase 用 CANCELLING 表示 D08 worker 进行时（Java
+  // 单数形式 + -ING），是 D08 worker 侧状态；**不**与本字段共享词汇。调用方跨
+  // 语言读时按各自表锁定的拼写，不在 proto 字符串里跨语言归一化。
   string status = 3;
   // 人类可读文本（仅日志/诊断）；分支判断必须用 outcome + errorDetail.category。
   string error = 4;
