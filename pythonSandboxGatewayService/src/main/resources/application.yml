@@ -23,6 +23,31 @@ dubbo:
 sandbox:
   service:
     url: ${AF_SANDBOX_SERVICE_URL:http://localhost:8095}
+    # 260809-26Q3-stage1-w3 D13: Gateway HTTP client timeouts.
+    # Connect timeout covers TCP/SSL handshake; same for both long and short
+    # clients (fast-fail network issues, seconds-scale).
+    connect-timeout-millis: ${AF_SANDBOX_CONNECT_TIMEOUT_MILLIS:5000}
+    # Long-path read timeout applies to createTask + getTaskResult (downstream
+    # may run max task duration + queue/prepare overhead). MUST be >= platform
+    # max task timeout + queue/prepare margin. Default 35 min covers 30 min task
+    # + 5 min queue/prepare/final-write margin; operators may override.
+    long-read-timeout-millis: ${AF_SANDBOX_LONG_READ_TIMEOUT_MILLIS:2100000}
+    # Short-query read timeout applies to getTaskStatus + getTaskByOperationId
+    # + cancelTask (D11). These should return near-instantly; shorter timeout
+    # avoids Dubbo business thread being held on slow status queries.
+    short-read-timeout-millis: ${AF_SANDBOX_SHORT_READ_TIMEOUT_MILLIS:10000}
+    # 260809-26Q3-stage1-w3 D13 MUST-FIX 3 (Cindy 91490076 #3 + 6a6e6158):
+    # Platform max task timeout. Gateway rejects createTask requests whose
+    # effective timeout (max of legacy timeoutSeconds * 1000 and canonical
+    # timeoutMillis) exceeds this value — local INVALID_ARGUMENT reject with
+    # downstream_http_status absent. Default 30 min (1800000ms); MUST stay in
+    # lock-step with Python-side max_task_timeout_seconds (ccqwen 5c543fea).
+    max-task-timeout-millis: ${AF_SANDBOX_MAX_TASK_TIMEOUT_MILLIS:1800000}
+    # Queue + prepare margin used to prove long-read >= max-task-timeout + margin
+    # (long-path HTTP budget must cover downstream task duration + overhead).
+    # This margin is NOT a request-side extension — business task limit is bound
+    # by max-task-timeout-millis alone (Cindy 6a6e6158).
+    queue-prepare-margin-millis: ${AF_SANDBOX_QUEUE_PREPARE_MARGIN_MILLIS:300000}
 
 # 260605-2 §3: gateway-side observability.
 # Default to INFO so that sandbox.createTask / sandbox.getTaskStatus / sandbox.getTaskResult

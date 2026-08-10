@@ -81,7 +81,7 @@ CAPTURE_FILE_NAMES = (
     "finance-records-unknown-marker.jsonl",
 )
 
-# capture-result.json is wrapper-produced (the 13 frozen summary keys, a few
+# capture-result.json is wrapper-produced (the 14 frozen summary keys, a few
 # hundred bytes at most); it can never LEGITIMATELY exceed this fixed small
 # cap, so the reader bounds it without any external limit argument.
 CAPTURE_SUMMARY_MAX_BYTES = 65536

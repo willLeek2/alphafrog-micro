@@ -586,6 +586,15 @@ class ToolJobReconcilerP009ForwardTest {
         }
         @Override public CompletableFuture<GetTaskByOperationIdResponse> getTaskByOperationIdAsync(
                 GetTaskByOperationIdRequest r) { throw new UnsupportedOperationException(); }
+        // D11 cancelTask RPC (W2 task #102 — ccmax proto/Gateway 单 writer).
+        // 测试桩不在本波实现 cancelTask；与 PythonSandboxService 接口的其他 RPC 一致，
+        // 抛 UnsupportedOperationException 让任何意外调用立即失败。
+        @Override public CancelTaskResponse cancelTask(CancelTaskRequest r) {
+            throw new UnsupportedOperationException();
+        }
+        @Override public CompletableFuture<CancelTaskResponse> cancelTaskAsync(CancelTaskRequest r) {
+            throw new UnsupportedOperationException();
+        }
     }
 
     /**

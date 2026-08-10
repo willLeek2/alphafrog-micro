@@ -299,9 +299,13 @@ def _verify_capture_consistency(summary: Dict, record_payloads: List[bytes]) -> 
 
 
 # capture-result.json is wrapper-produced and frozen at exactly these keys:
-# the ten §7.1 summary fields plus the three internal unknown-marker audit
+# the ten §7.1 summary fields, the D11 cancelObserved cancellation-evidence
+# flag (260809-26Q3 task #108), plus the three internal unknown-marker audit
 # counters (§4.1/§4.2).  The reader is fail-closed: missing OR extra keys are
-# corruption, never silently tolerated.
+# corruption, never silently tolerated.  NOTE: the wrapper (producer) and
+# this key set (reader) must change TOGETHER in one commit — a wrapper that
+# emits cancelObserved against a reader that does not expect it would fail
+# EVERY task's readback as "unknown key".
 _SUMMARY_KEYS = frozenset(
     (
         "exitCode",
@@ -317,6 +321,7 @@ _SUMMARY_KEYS = frozenset(
         "unknownMarkerLines",
         "unknownMarkerBytes",
         "unknownMarkerTruncated",
+        "cancelObserved",
     )
 )
 
@@ -332,6 +337,8 @@ _SUMMARY_BOOL_KEYS = (
     "stderrTruncated",
     "recordSetComplete",
     "unknownMarkerTruncated",
+    # D11: strictly boolean — an int here would be a corrupt capture.
+    "cancelObserved",
 )
 
 
@@ -396,7 +403,7 @@ def read_capture_artifacts(
     and the caller fails the task — never silent success:
 
     * ``capture-result.json`` must exist, parse as a JSON object, and match
-      the frozen 13-key shape with exact types (``_validate_summary_shape``);
+      the frozen 14-key shape with exact types (``_validate_summary_shape``);
       the seven channel fields are re-validated by
       ``finance_channel_from_capture``.
     * ``stdout.bin`` / ``stderr.bin`` MUST exist; their lengths must equal

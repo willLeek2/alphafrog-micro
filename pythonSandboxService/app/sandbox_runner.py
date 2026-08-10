@@ -23,6 +23,7 @@ from .bounded_exec_wrapper import (
     STDOUT_FILE_NAME,
     UNKNOWN_MARKER_AUDIT_FILE_NAME,
 )
+from .cancel_registry import registry as cancel_registry
 from .capture_reader import CAPTURE_FILE_NAMES
 from .child_identity import (
     CHILD_USER_ENV_NAME,
@@ -91,6 +92,27 @@ WRAPPER_BOOTSTRAP_NAME = "run_wrapper.py"
 WRAPPER_INPUT_FILE_NAME = "wrapper-input.json"
 USER_SCRIPT_FILE_NAME = "user_script.py"
 RUNTIME_ENVIRONMENT_FILE_NAME = "runtime-environment.json"
+
+# === 260809-26Q3-stage1-w2 D11 (task #108): task cancel control root =======
+# A RUNNING task's cancel marker file lives at a root-owned, task-local
+# control path INSIDE the container:
+#     <control_root>/<taskId>/cancel
+# The runner creates the directory chain root:root 0700 BEFORE the wrapper
+# runs and registers a marker writer with the cancel registry; the wrapper
+# then lstat-verifies the REAL file type, ownership and mode of the whole
+# parent chain fail-closed before it trusts the marker (codex 4334bc9d
+# constraint 2 — symlinks rejected, child uid/gid must have no write path).
+# The user child can therefore neither forge nor remove the marker: only
+# root can create anything under this tree.  AF_TASK_CONTROL_ROOT overrides
+# the default for host-side tests (the wrapper derives the SAME path from
+# the SAME env var).
+TASK_CONTROL_ROOT_DEFAULT = "/run/alphafrog-task-control"
+TASK_CONTROL_ROOT_ENV_NAME = "AF_TASK_CONTROL_ROOT"
+TASK_CONTROL_MARKER_NAME = "cancel"
+# A stale control dir after cleanup is a residue the single-use container
+# policy must not leave behind: cleanup failure recycles the container.
+RECYCLE_REASON_CONTROL_CLEANUP_FAILED = "control_cleanup_failed"
+# === end D11 cancel control root ============================================
 
 # Contract §13 line 644: the four frozen limit keys, verbatim.
 WRAPPER_LIMIT_KEYS = (
@@ -1421,6 +1443,97 @@ def _chown_workspace_for_child(
 # === end P0-4 ================================================================
 
 
+# === 260809-26Q3-stage1-w2 D11 (task #108): cancel control path helpers ====
+
+
+def task_control_root() -> str:
+    """In-container control root for cancel markers (env override aware)."""
+    override = os.environ.get(TASK_CONTROL_ROOT_ENV_NAME)
+    if override and override.strip():
+        return override.strip().rstrip("/")
+    return TASK_CONTROL_ROOT_DEFAULT
+
+
+def task_control_paths(task_id: str) -> Tuple[str, str]:
+    """``(control_dir, marker_path)`` for one task's cancel marker."""
+    control_dir = f"{task_control_root()}/{task_id}"
+    return control_dir, f"{control_dir}/{TASK_CONTROL_MARKER_NAME}"
+
+
+def _create_task_control_dir(session: SandboxSession, task_id: str) -> str:
+    """Create the root-owned 0700 control dir chain for this task.
+
+    Fail-closed on any failure (``_exec_checked`` raises): a bounded task
+    that cannot get its control directory cannot be canceled honestly, and
+    the wrapper's pre-spawn permission verification would reject the marker
+    path anyway — so the runner surfaces the problem immediately instead of
+    starting an un-cancelable child.  Returns the marker path that goes into
+    the wrapper input.
+    """
+    root = task_control_root()
+    control_dir, marker_path = task_control_paths(task_id)
+    command = (
+        f"mkdir -p {shlex.quote(control_dir)} && "
+        f"chmod 0700 {shlex.quote(root)} && "
+        f"chmod 0700 {shlex.quote(control_dir)}"
+    )
+    _exec_checked(session, command, f"create_task_control_dir task={task_id}")
+    return marker_path
+
+
+def _cleanup_task_control_dir(session: SandboxSession, task_id: str) -> bool:
+    """Remove this task's control dir; best-effort like workspace cleanup."""
+    control_dir, _ = task_control_paths(task_id)
+    try:
+        _exec_checked(
+            session,
+            f"rm -rf {shlex.quote(control_dir)}",
+            f"cleanup_task_control_dir task={task_id}",
+        )
+        return True
+    except Exception as exc:
+        logger.warning(
+            "TASK_CONTROL_CLEANUP_FAILED task=%s dir=%s error=%s",
+            task_id, control_dir, exc,
+        )
+        return False
+
+
+def _make_marker_writer(session: SandboxSession, task_id: str):
+    """Build the cancel-marker write closure registered with the registry.
+
+    The registry dispatches it on its dedicated marker-write pool when a
+    stop is requested for a RUNNING task.  codex 0113bc67: the writer only
+    ever touches the marker FILE itself (touch) — the root-owned directory
+    chain was already created and is never re-created or chmod'd here.  A
+    failed touch is logged and swallowed: per d6841a2e rule 3, when the
+    child finishes before the marker lands the task keeps its genuine result —
+    a failed cancel attempt is honest silence, never a forced CANCELED.
+    """
+    _, marker_path = task_control_paths(task_id)
+    command = f"touch {shlex.quote(marker_path)}"
+
+    def _write_marker() -> None:
+        try:
+            _exec_checked(
+                session, command, f"write_cancel_marker task={task_id}"
+            )
+            logger.info(
+                "CANCEL_MARKER_WRITTEN task=%s path=%s", task_id, marker_path
+            )
+        except Exception as exc:
+            logger.warning(
+                "CANCEL_MARKER_WRITE_FAILED_IN_CONTAINER task=%s path=%s"
+                " error=%s",
+                task_id, marker_path, exc,
+            )
+
+    return _write_marker
+
+
+# === end D11 cancel control path helpers ====================================
+
+
 def _stage_bounded_wrapper(
     session: SandboxSession,
     config: SandboxConfig,
@@ -1429,12 +1542,17 @@ def _stage_bounded_wrapper(
     code: str,
     timeout_seconds: float,
     limits: Dict[str, Any],
+    cancel_marker_path: str | None = None,
 ) -> str:
     """Stage the task-local wrapper package, user script and wrapper-input.json.
 
     Everything lands under ``{task_workspace}`` — no global paths are written,
     so concurrent tasks in one container can never race on wrapper code.
     Returns the wrapper-input.json path.
+
+    D11 (task #108): ``cancel_marker_path`` is the root-owned control path
+    the wrapper polls while the child runs; the wrapper validates the exact
+    task-local binding fail-closed.  Absent (None) for pre-D11 callers.
     """
     workdir = config.workdir.rstrip("/")
     wrapper_dir = f"{task_workspace}/{WRAPPER_DIR_NAME}"
@@ -1464,6 +1582,10 @@ def _stage_bounded_wrapper(
         "effectiveOutputLimits": {key: limits[key] for key in WRAPPER_LIMIT_KEYS},
         "runtimeEnvironmentPath": f"{workdir}/{RUNTIME_ENVIRONMENT_FILE_NAME}",
     }
+    # D11 (task #108): the cancel marker the wrapper polls while the child
+    # runs; only present when the runner created the control dir.
+    if cancel_marker_path is not None:
+        wrapper_input["cancelMarkerPath"] = cancel_marker_path
     wrapper_input_path = f"{task_workspace}/{WRAPPER_INPUT_FILE_NAME}"
     _copy_text_to_runtime(
         session,
@@ -1589,18 +1711,32 @@ def _run_bounded_wrapper_path(
     timeout_seconds: float,
     limits: Dict[str, Any],
     child_spec: str | None = None,
-) -> Tuple[_WrappedScriptResult, Dict[str, Any], Dict[str, int]]:
+) -> Tuple[_WrappedScriptResult, Dict[str, Any], Dict[str, int], bool]:
     """§7.1 steps 1-2/7-8 production path: install -> stage -> wrapper -> readback.
 
-    Returns ``(result, finance_record_channel, phase_timings)`` where
-    ``result`` carries the child's exit code and the reassembled §4.2 bounded
-    stdout (ordinary bytes first, then the COMPLETE record lines)/stderr, and
-    the channel is the §5.1 snake_case dict built from the capture summary.
+    Returns ``(result, finance_record_channel, phase_timings, cancel_observed)``
+    where ``result`` carries the child's exit code and the reassembled §4.2
+    bounded stdout (ordinary bytes first, then the COMPLETE record
+    lines)/stderr, the channel is the §5.1 snake_case dict built from the
+    capture summary, and ``cancel_observed`` is True iff the wrapper OBSERVED
+    the D11 cancel marker and, because of it, killed its own child process
+    group (d6841a2e rule 2 — the only evidence that justifies CANCELED for a
+    task whose child was actually running).
     """
     # §13/codex f86c66f5: validate the frozen snapshot FIRST — before
     # interpreter resolution or any session interaction — so the runner never
     # indexes an unvalidated external dict.
     limits = validate_effective_output_limits(limits)
+    # D11 (task #108): create the root-owned control dir BEFORE staging and
+    # register the marker writer with this task's cancel handle.  A stop
+    # request that already landed is delivered immediately on attach
+    # (set_marker_writer checks the handle's stop flag), so no cancel can be
+    # lost to ordering.  Control-dir creation is fail-closed: the wrapper
+    # would reject an unverifiable marker path before spawn anyway.
+    cancel_marker_path = _create_task_control_dir(session, task_id)
+    handle = cancel_registry.get(task_id)
+    if handle is not None:
+        handle.set_marker_writer(_make_marker_writer(session, task_id))
     phase_timings: Dict[str, int] = {}
     if install_libraries:
         # llm-sandbox installs into the SHARED container venv — exactly why
@@ -1614,7 +1750,8 @@ def _run_bounded_wrapper_path(
 
     t_stage = time.monotonic()
     _stage_bounded_wrapper(
-        session, config, task_id, task_workspace, code, timeout_seconds, limits
+        session, config, task_id, task_workspace, code, timeout_seconds, limits,
+        cancel_marker_path=cancel_marker_path,
     )
     phase_timings["wrapper_stage_ms"] = int((time.monotonic() - t_stage) * 1000)
 
@@ -1645,7 +1782,13 @@ def _run_bounded_wrapper_path(
         stdout=decode_capture_text(artifacts["stdout_bytes"]),
         stderr=decode_capture_text(artifacts["stderr_bytes"]),
     )
-    return result, artifacts["channel"], phase_timings
+    # D11 (task #108): the wrapper's own observation flag, re-validated like
+    # every other summary field by read_capture_artifacts (bool type, part of
+    # the frozen 14-key shape).  False when the marker was never observed —
+    # including the rule-3 case where the child finished before the stop
+    # took effect and kept its genuine result.
+    cancel_observed = bool(artifacts["summary"].get("cancelObserved", False))
+    return result, artifacts["channel"], phase_timings, cancel_observed
 
 
 # === end work-package-C =====================================================
@@ -1725,6 +1868,11 @@ def run_in_open_session(
     oom_killed = False
     exit_reason = "UNKNOWN"
     resource_usage = None
+    # D11 (task #108): True only when the bounded wrapper OBSERVED the
+    # cancel marker and killed its own child because of it (set by the
+    # wrapper path below; stays False on the legacy path and every error
+    # path — an exception is never cancellation evidence, d6841a2e rule 4).
+    cancel_observed = False
     # Spec §8 L1019 + Kimi rework 2026-08-08: when this task actually installs
     # non-preinstalled packages, re-collect the runtime environment after the
     # install so the task's HTTP execution_environment field reflects the
@@ -1896,7 +2044,7 @@ def run_in_open_session(
             # an EMPTY list so llm-sandbox never installs twice (one-install) and
             # user code inside the wrapper reads the post-install env file
             # (same-environmentId).
-            result, finance_record_channel, wrapper_phase_timings = (
+            result, finance_record_channel, wrapper_phase_timings, cancel_observed = (
                 _run_bounded_wrapper_path(
                     session,
                     config,
@@ -1920,7 +2068,14 @@ def run_in_open_session(
             f"script_end exit_code={result.exit_code} stdout_len={len(result.stdout or '')} stderr_len={len(result.stderr or '')} "
             f"wrapper={'on' if finance_record_channel is not None else 'off'}",
         )
-        exit_reason = "SUCCEEDED" if result.exit_code == 0 else "NON_ZERO_EXIT"
+        # D11 (task #108): an observed cancel is its own exit reason; the
+        # child's real exit code and captured bytes stay untouched in the
+        # result (genuine observations, never fabricated — the terminal
+        # CANCELED classification itself happens in the store).
+        if cancel_observed:
+            exit_reason = "CANCELED"
+        else:
+            exit_reason = "SUCCEEDED" if result.exit_code == 0 else "NON_ZERO_EXIT"
 
         t_artifact_start = time.monotonic()
         _flush_container_log(session, task_id, config)
@@ -1948,12 +2103,26 @@ def run_in_open_session(
         artifact_bytes_written = _read_runtime_size(session, task_workspace + "/artifacts")
         temporary_bytes_written = _read_task_temporary_bytes(session, task_workspace)
         oom_killed = _container_oom_killed(actual_container_id)
-        if oom_killed:
+        # D11 (task #108): an OBSERVED cancel keeps the CANCELED exit reason
+        # even if the container also shows an OOM mark — the cancellation is
+        # the evidenced terminal cause (the OOM mark may be stale/container-
+        # wide).  Without cancel evidence the pre-D11 OOM override stands.
+        if oom_killed and exit_reason != "CANCELED":
             exit_reason = "OOM_KILLED"
         t_cleanup_start = time.monotonic()
         cleanup_ok = True
         if workspace_created:
             cleanup_ok = _cleanup_task_workspace(session, task_id, config)
+            # D11 (task #108): remove this task's control dir alongside its
+            # workspace.  The root dir itself is reused across tasks; only
+            # the task subdir goes.  A failed cleanup recycles the container
+            # (single-use policy) but never changes the task outcome — the
+            # marker write window is over by now.
+            if bounded_path_selected:
+                if not _cleanup_task_control_dir(session, task_id):
+                    container_recycled = True
+                    if recycle_reason is None:
+                        recycle_reason = RECYCLE_REASON_CONTROL_CLEANUP_FAILED
         timings["workspace_cleanup_ms"] = int((time.monotonic() - t_cleanup_start) * 1000)
         if not cleanup_ok:
             container_recycled = True
@@ -2036,6 +2205,10 @@ def run_in_open_session(
         # §5.1 write path: the snake_case channel built from the capture
         # summary, or None when the run did not go through the wrapper.
         "finance_record_channel": finance_record_channel,
+        # D11 (task #108): wrapper-observed cancellation evidence (d6841a2e
+        # rule 2).  False on the legacy path and every error path; the store
+        # turns MARKER_OBSERVED into the CANCELED terminal state.
+        "cancel_observed": cancel_observed,
         # 260808-finance-methodspec-v5 work package D: caller-supplied
         # ExecutionEnvironment instance is surfaced here on the HTTP
         # ExecuteResult; gateway presence-aware mapping then sets the proto

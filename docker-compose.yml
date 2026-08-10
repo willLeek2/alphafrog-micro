@@ -622,6 +622,12 @@ services:
       AF_SANDBOX_DEBUG: ${AF_SANDBOX_DEBUG:-false}
       AF_SANDBOX_MAX_CONCURRENCY: ${AF_SANDBOX_MAX_CONCURRENCY:-20}
       AF_SANDBOX_EXECUTION_TIMEOUT: ${AF_SANDBOX_EXECUTION_TIMEOUT:-5}
+      # D13 release-binding (codex a1b749ad single-writer裁定): canonical companion
+      # _SECONDS + _MILLIS 必须同值绑定 (millis == seconds*1000)，Python load_config
+      # 经 validate_max_task_timeout_binding 校验 fail-fast。两 service _MILLIS 同读
+      # 外层 AF_SANDBOX_MAX_TASK_TIMEOUT_MILLIS，deployer 设一个两 service 同接。
+      AF_SANDBOX_MAX_TASK_TIMEOUT_SECONDS: ${AF_SANDBOX_MAX_TASK_TIMEOUT_SECONDS:-1800}
+      AF_SANDBOX_MAX_TASK_TIMEOUT_MILLIS: ${AF_SANDBOX_MAX_TASK_TIMEOUT_MILLIS:-1800000}
       AF_SANDBOX_MEMORY: ${AF_SANDBOX_MEMORY:-512m}
       AF_SANDBOX_MEMSWAP: ${AF_SANDBOX_MEMSWAP:-512m}
       AF_SANDBOX_BACKEND: ${AF_SANDBOX_BACKEND:-docker}
@@ -699,6 +705,10 @@ services:
       TZ: Asia/Shanghai
       NACOS_ADDRESS: nacos
       AF_SANDBOX_SERVICE_URL: http://python-sandbox-service:8095
+      # D13 release-binding: 同 Python service _MILLIS 同 substitution source;
+      # Gateway Spring sandbox.service.max-task-timeout-millis 经此 env 接入,
+      # 与 Python AF_SANDBOX_MAX_TASK_TIMEOUT_SECONDS 同值绑定 (a1b749ad)。
+      AF_SANDBOX_MAX_TASK_TIMEOUT_MILLIS: ${AF_SANDBOX_MAX_TASK_TIMEOUT_MILLIS:-1800000}
       AF_DEBUG_OBSERVABILITY_ROOT: /app/logs/agent-debug-observability
       # Memory Optimization (Light)
       JAVA_TOOL_OPTIONS: "-Xms256m -Xmx256m"
