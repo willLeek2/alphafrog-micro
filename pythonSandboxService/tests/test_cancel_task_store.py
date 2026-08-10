@@ -549,11 +549,12 @@ class ExecutionTransitionTests(_TaskStoreTestBase):
         self.assertEqual(live.status, TaskStatus.RUNNING)
         self.assertIsNotNone(live.started_at)
 
-    def test_marker_observed_completion_forces_canceled_classification(self) -> None:
-        # Contract (d6841a2e): MARKER_OBSERVED evidence turns the terminal
-        # state CANCELED, keeps the wrapper's observed result but forces
-        # retryable=False and exit_reason=CANCELED.
+    def test_marker_observed_with_intent_forces_canceled(self) -> None:
+        # Contract (d6841a2e + codex c6c49248): MARKER_OBSERVED evidence
+        # PLUS a durable cancel intent (cancel_requested True) forces
+        # CANCELED.  Without the intent the genuine result stands.
         task = self.add_queued_task("task-mo")
+        task.cancel_requested = True  # cancel intent was already recorded
         self.assertTrue(self.store.begin_execution("task-mo"))
         usage = SandboxResourceUsage(
             resource_class="STANDARD", exit_reason="KILLED", cpu_millis=12
@@ -591,10 +592,11 @@ class ExecutionTransitionTests(_TaskStoreTestBase):
         self.assertIsNone(task.error)
         self.assertIsNotNone(task.finished_at)
 
-    def test_canceled_before_start_completion_builds_canceled_result(self) -> None:
-        # Contract: CANCELED_BEFORE_START evidence replaces any candidate
-        # result with the honest build_canceled_result(request).
+    def test_canceled_before_start_with_intent_builds_canceled_result(self) -> None:
+        # Contract: CANCELED_BEFORE_START evidence PLUS cancel_requested=True
+        # replaces the candidate result with the honest build_canceled_result.
         task = self.add_queued_task("task-cbs")
+        task.cancel_requested = True
         self.assertTrue(self.store.begin_execution("task-cbs"))
         never_ran = ExecuteResult(
             exit_code=99, stdout="discarded", stderr="", dataset_dir="", retryable=True
@@ -619,6 +621,35 @@ class ExecutionTransitionTests(_TaskStoreTestBase):
         self.assertFalse(task.result.retryable)
         self.assertFalse(task.retryable)
 
+    def test_evidence_without_intent_preserves_genuine_result(self) -> None:
+        # codex c6c49248: MARKER_OBSERVED or CANCELED_BEFORE_START evidence
+        # WITHOUT a durable cancel intent (cancel_requested=False) must NOT
+        # force CANCELED — a leftover marker or a stale stop signal must not
+        # fabricate a cancellation for a task that was never cancelled.
+        for evidence, label in (
+            (CancellationEvidence.MARKER_OBSERVED, "marker"),
+            (CancellationEvidence.CANCELED_BEFORE_START, "cbs"),
+        ):
+            with self.subTest(evidence=label):
+                task = self.add_queued_task(f"task-no-intent-{label}")
+                self.assertTrue(self.store.begin_execution(f"task-no-intent-{label}"))
+                result = ExecuteResult(
+                    exit_code=0, stdout="ok", stderr="", dataset_dir=""
+                )
+                self.store.complete_execution(
+                    f"task-no-intent-{label}",
+                    CompletionCandidate(
+                        status=TaskStatus.SUCCEEDED,
+                        result=result,
+                        evidence=evidence,
+                    ),
+                )
+                self.assertEqual(task.status, TaskStatus.SUCCEEDED)
+                self.assertEqual(task.result.exit_code, 0)
+                self.assertEqual(
+                    task.cancellation_evidence, CancellationEvidence.NONE
+                )
+
     def test_terminal_task_ignores_late_completion(self) -> None:
         # Contract: an already-terminal task is returned as-is; a late
         # completion (e.g. the cancel terminalized it first) changes nothing.
@@ -641,6 +672,37 @@ class ExecutionTransitionTests(_TaskStoreTestBase):
         self.assertEqual(task.status, TaskStatus.SUCCEEDED)
         self.assertEqual(task.result.exit_code, 0)
         self.assertIsNone(task.error)
+
+    def test_snapshot_modification_does_not_affect_store(self) -> None:
+        """codex c6c49248: begin_execution returns a deep copy.  Mutating the
+        snapshot must never corrupt the store's authoritative Task."""
+        self.add_queued_task("task-snap-write")
+        snapshot = self.store.begin_execution("task-snap-write")
+        self.assertIsNotNone(snapshot)
+
+        snapshot.request.dataset_id = "corrupted"
+        authoritative = self.store.get("task-snap-write")
+        self.assertNotEqual(authoritative.request.dataset_id, "corrupted")
+
+    def test_store_mutation_after_snapshot_does_not_retroactively_change(self) -> None:
+        """codex c6c49248: a cancel (or any concurrent write) that mutates the
+        store Task AFTER begin_execution must NOT alter the snapshot that was
+        already handed to the execution path."""
+        task = self.add_queued_task("task-snap-read")
+        # Simulate cancel intent arriving before begin_execution.
+        task.cancel_requested = True
+        snapshot = self.store.begin_execution("task-snap-read")
+        self.assertIsNotNone(snapshot)
+        self.assertTrue(snapshot.cancel_requested)
+
+        # Later: the store Task is mutated (rogue mutation / reset).
+        authoritative = self.store.get("task-snap-read")
+        authoritative.cancel_requested = False
+        self.store.save(authoritative)
+
+        # The snapshot preserves the value it had when it was taken.
+        self.assertTrue(snapshot.cancel_requested)
+        self.assertFalse(self.store.get("task-snap-read").cancel_requested)
 
     def test_invalid_evidence_or_status_rejected(self) -> None:
         # Contract: completion status must be SUCCEEDED/FAILED and evidence

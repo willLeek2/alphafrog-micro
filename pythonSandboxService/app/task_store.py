@@ -405,21 +405,27 @@ class DurableTaskStore:
     # execution transitions
     # ------------------------------------------------------------------ #
 
-    def begin_execution(self, task_id: str) -> bool:
-        """Atomically QUEUED→RUNNING.
+    def begin_execution(self, task_id: str) -> Task | None:
+        """Atomically QUEUED→RUNNING and return a DEEP-COPY execution snapshot.
 
-        Returns False when the task is not QUEUED (a cancel terminalized it
+        Returns None when the task is not QUEUED (a cancel terminalized it
         inside the store lock between dequeue and now, or it is already
         terminal); the caller must then NOT touch the task at all.
+
+        The returned Task is a standalone copy (codex c6c49248 review):
+        modifying it cannot corrupt the store's authoritative Task, and a
+        concurrent cancel thread that mutates the store's Task cannot change
+        what the execution path reads.  Only ``complete_execution`` writes
+        the terminal state back through the store lock.
         """
         with self._lock:
             task = self.tasks.get(task_id)
             if task is None or task.status != TaskStatus.QUEUED:
-                return False
+                return None
             task.status = TaskStatus.RUNNING
             task.started_at = datetime.utcnow()
             self._persist_locked()
-            return True
+            return task.model_copy(deep=True)
 
     def complete_execution(self, task_id: str, candidate: CompletionCandidate) -> Task:
         """Persist the terminal state of one execution attempt.
@@ -459,23 +465,35 @@ class DurableTaskStore:
                 CancellationEvidence.CANCELED_BEFORE_START,
                 CancellationEvidence.MARKER_OBSERVED,
             ):
-                task.status = TaskStatus.CANCELED
-                task.cancellation_evidence = candidate.evidence
-                if candidate.evidence == CancellationEvidence.MARKER_OBSERVED:
-                    # Keep the wrapper's honest observations (the child's
-                    # real signal exit code and the captured bytes) and only
-                    # force the terminal classification fields.
-                    result = candidate.result
-                    result.retryable = False
-                    if result.resource_usage is not None:
-                        result.resource_usage.exit_reason = "CANCELED"
-                    task.result = result
-                    task.resource_usage = result.resource_usage
+                # D11 (task #108, codex c6c49248 review): execution evidence
+                # alone is NOT enough to force CANCELED — a durable cancel
+                # intent MUST have been recorded first.  Without it, a
+                # leftover marker or an erroneous stop signal could fabricate
+                # a CANCELED terminal state for a task that was never
+                # cancelled.  With both evidence AND intent the classification
+                # stands (d6841a2e rules 2+4).
+                if task.cancel_requested:
+                    task.status = TaskStatus.CANCELED
+                    task.cancellation_evidence = candidate.evidence
+                    if candidate.evidence == CancellationEvidence.MARKER_OBSERVED:
+                        result = candidate.result
+                        result.retryable = False
+                        if result.resource_usage is not None:
+                            result.resource_usage.exit_reason = "CANCELED"
+                        task.result = result
+                        task.resource_usage = result.resource_usage
+                    else:
+                        task.result = build_canceled_result(task.request)
+                        task.resource_usage = task.result.resource_usage
+                    task.retryable = False
+                    task.error = None
                 else:
-                    task.result = build_canceled_result(task.request)
-                    task.resource_usage = task.result.resource_usage
-                task.retryable = False
-                task.error = None
+                    # No cancel intent — the genuine completion result stands.
+                    task.status = candidate.status
+                    task.result = candidate.result
+                    task.resource_usage = candidate.result.resource_usage
+                    task.retryable = candidate.result.retryable
+                    task.error = candidate.error
             else:
                 task.status = candidate.status
                 task.result = candidate.result

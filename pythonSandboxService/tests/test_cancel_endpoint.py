@@ -21,10 +21,14 @@ import asyncio
 import hashlib
 import sys
 import tempfile
+import threading
+import time
 import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+from fastapi.testclient import TestClient
 
 llm_sandbox = types.ModuleType("llm_sandbox")
 llm_sandbox.SandboxSession = object
@@ -548,6 +552,111 @@ class CancelEndpointTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(create_response.status, TaskStatus.CANCELED)
         # The queue was never touched: adoption bypasses admission entirely.
         self.assertEqual(stub.put_nowait_calls, [])
+
+    # ------------------------------------------------------------------ #
+    # codex c6c49248: cancel replay must RE-DISPATCH the marker after a
+    # first write finishes (success or failure).  Writer failures on the
+    # first attempt must not block retry through same-key replay or a
+    # fresh cancelRequestId.
+    # ------------------------------------------------------------------ #
+
+    async def test_replay_re_dispatches_marker_via_same_or_new_key(self) -> None:
+        # Register a handle with a synchronous (incrementing) marker writer
+        # so the dispatch count is deterministic.
+        task = self.save_task("task-replay-dispatch", TaskStatus.RUNNING)
+        handle = cancel_registry_module.registry.register("task-replay-dispatch")
+        self.registered_task_ids.append("task-replay-dispatch")
+        dispatch_counter: list[int] = [0]
+
+        def marker_writer() -> None:
+            dispatch_counter[0] += 1
+
+        handle.set_marker_writer(marker_writer)
+
+        # First cancel: dispatches (count = 1).
+        resp1 = await main.cancel_task(
+            CancelTaskRequest(
+                by_task_id=TaskIdCancelTarget(task_id="task-replay-dispatch"),
+                cancel_request_id="cr-d1",
+            )
+        )
+        self.assertEqual(resp1.outcome, CancelOutcome.CANCEL_INTENT_RECORDED)
+        self.assertEqual(dispatch_counter[0], 1)
+
+        # Let the pool thread finish the first write — the reset to idle
+        # is in the writer's finally block on that thread.
+        await asyncio.sleep(0.2)
+        self.assertEqual(dispatch_counter[0], 1)  # still exactly one write
+
+        # Second cancel (different cancelRequestId, same RUNNING task):
+        # re-dispatches after the first write completed (idle is True).
+        resp2 = await main.cancel_task(
+            CancelTaskRequest(
+                by_task_id=TaskIdCancelTarget(task_id="task-replay-dispatch"),
+                cancel_request_id="cr-d2",
+            )
+        )
+        self.assertEqual(resp2.outcome, CancelOutcome.CANCEL_INTENT_RECORDED)
+        await asyncio.sleep(0.2)
+        self.assertGreaterEqual(dispatch_counter[0], 2)
+
+
+class CancelEndpointHttpLayerTest(unittest.TestCase):
+    """codex c6c49248: real HTTP-layer tests that catch body-type 422 leaks.
+
+    The endpoint handler validates fields inside the function body (400),
+    but FastAPI's builtin request-body parsing runs BEFORE the handler and
+    answers 422 for type/shape defects by default.  The exception handler
+    mapped on /tasks/cancel must convert those to 400.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.client = TestClient(main.app)
+
+    def test_cancel_with_object_body_where_array_expected_returns_400(self) -> None:
+        """by_task_id must be an object; passing an array is a schema fault."""
+        resp = self.client.post(
+            "/tasks/cancel",
+            json={"by_task_id": [1, 2, 3], "cancel_request_id": "cr-test"},
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_cancel_with_scalar_type_instead_of_object_returns_400(self) -> None:
+        """cancel_request_id must be a string; a number is a schema fault."""
+        resp = self.client.post(
+            "/tasks/cancel",
+            json={
+                "by_task_id": {"task_id": "task-x"},
+                "cancel_request_id": 42,
+            },
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_cancel_with_non_object_request_body_returns_400(self) -> None:
+        """The body must be a JSON object; a bare array must answer 400."""
+        resp = self.client.post("/tasks/cancel", json=[1, 2, 3])
+        self.assertEqual(resp.status_code, 400)
+
+    def test_cancel_with_malformed_json_returns_400(self) -> None:
+        """An undecodable body must also be 400, not a bare 422."""
+        resp = self.client.post(
+            "/tasks/cancel",
+            data=b"not json",
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_cancel_with_nested_field_type_mismatch_returns_400(self) -> None:
+        """task_id inside by_task_id is a string; a number must answer 400."""
+        resp = self.client.post(
+            "/tasks/cancel",
+            json={
+                "by_task_id": {"task_id": 123},
+                "cancel_request_id": "cr-test",
+            },
+        )
+        self.assertEqual(resp.status_code, 400)
 
 
 if __name__ == "__main__":

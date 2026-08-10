@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import Dict
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from .canonical_fingerprint import (
@@ -245,17 +246,20 @@ async def _process_task_inner(task: Task, worker_id: int):
             ),
         )
         return
-    if not task_store.begin_execution(task.task_id):
-        # D11 (task #108): the task is no longer QUEUED — a cancel
-        # terminalized it inside the store lock between dequeue and now
-        # (QUEUED_CANCEL evidence + honest result already persisted by the
-        # cancel path).  The worker must not touch that terminal state.
+    # D11 (task #108, codex c6c49248 review): begin_execution returns a
+    # deep copy snapshot so the execution path reads a stable frozen task
+    # and cannot accidentally overwrite a cancel terminal-state through a
+    # stray save().  None means the task is no longer QUEUED inside the
+    # store lock — a cancel terminalized it (QUEUED_CANCEL) and the worker
+    # must not touch it.
+    task_id = task.task_id
+    task = task_store.begin_execution(task_id)
+    if task is None:
         logger.info(
             "TASK_CANCELED_BEFORE_START task=%s worker=%s queued_ms=%s",
-            task.task_id, worker_id, queued_ms,
+            task_id, worker_id, queued_ms,
         )
         return
-    task = task_store.get(task.task_id)
     logger.info(
         "TASK_START task=%s worker=%s queued_ms=%s dataset=%s pool_enabled=%s",
         task.task_id, worker_id, queued_ms,
@@ -552,6 +556,25 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
         status_code=500,
         content={"detail": f"internal error: {type(exc).__name__}: {exc}"},
     )
+
+
+@app.exception_handler(RequestValidationError)
+async def cancel_validation_handler(request: Request, exc: RequestValidationError):
+    # D11 (task #108, codex c6c49248 review): FastAPI's default 422 for a
+    # request-body type/shape defect is NOT in the frozen D13 status vocabulary
+    # (only 400 / 409 / 500 / 503).  Every body defect on the /tasks/cancel
+    # route must answer 400 → Gateway INVALID_ARGUMENT, which is what the
+    # endpoint already does for the business-rule validations inside the
+    # handler body.  Other routes keep their builtin 422 behavior untouched
+    # (this handler is deliberately route-scoped, not global).
+    if request.url.path == "/tasks/cancel":
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "invalid request body"},
+        )
+    # Let FastAPI's builtin 422 handler render the default error for other
+    # routes — do not intercept those.
+    raise exc
 
 
 @app.get("/health")

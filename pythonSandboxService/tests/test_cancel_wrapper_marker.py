@@ -37,6 +37,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -52,6 +53,7 @@ from app.bounded_exec_wrapper import (
     TASK_CONTROL_ROOT_ENV_NAME,
     WrapperInputError,
     _cancel_marker_exists,
+    _kill_process_group,
     expected_cancel_marker_path,
     verify_control_path_permissions,
 )
@@ -575,6 +577,31 @@ class CancelMarkerExistsHelperTest(unittest.TestCase):
             self.assertFalse(
                 _cancel_marker_exists(str(Path(tmp) / "nope" / "cancel"))
             )
+
+
+class WrapperKillRaceUnitTest(unittest.TestCase):
+    """codex c6c49248: the poll()→killpg() window must not produce a false
+    cancelObserved.  When the child exits between the two calls the killpg
+    raises ProcessLookupError — canceled must stay False."""
+
+    @patch("os.killpg")
+    def test_process_lookup_error_means_child_exited_on_its_own(self, mock_killpg):
+        mock_killpg.side_effect = ProcessLookupError
+        result = _kill_process_group(99999)
+        self.assertFalse(result)
+        mock_killpg.assert_called_once_with(99999, signal.SIGKILL)
+
+    @patch("os.killpg")
+    def test_successful_kill_returns_true(self, mock_killpg):
+        mock_killpg.return_value = None
+        result = _kill_process_group(99999)
+        self.assertTrue(result)
+
+    @patch("os.killpg")
+    def test_generic_os_error_also_returns_false(self, mock_killpg):
+        mock_killpg.side_effect = OSError("permission denied")
+        result = _kill_process_group(99999)
+        self.assertFalse(result)
 
 
 if __name__ == "__main__":

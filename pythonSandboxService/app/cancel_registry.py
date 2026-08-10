@@ -62,10 +62,12 @@ class CancelHandle:
         self._stop_requested = False
         self._future: Optional[Future] = None
         self._marker_writer: Optional[Callable[[], None]] = None
-        # Single-dispatch guard: even if many cancel requests pile onto the
-        # same task, the marker write is dispatched at most once per task.
-        # This IS the per-task coalescing of marker writes.
-        self._marker_dispatched = False
+        # D11 (task #108, codex c6c49248 review): the marker dispatch state
+        # is NOT a permanent one-shot fuse.  "idle" → "dispatching" on each
+        # stop request that starts a write; the completion callback resets it
+        # to "idle" so a later replay can re-dispatch.  Concurrent replays
+        # while a dispatch is in-flight are coalesced (skip submit).
+        self._marker_dispatch_idle = True
 
     def stop_requested(self) -> bool:
         with self._lock:
@@ -89,11 +91,11 @@ class CancelHandle:
         dispatch_now = False
         with self._lock:
             self._marker_writer = writer
-            if self._stop_requested and not self._marker_dispatched:
-                self._marker_dispatched = True
+            if self._stop_requested and self._marker_dispatch_idle:
+                self._marker_dispatch_idle = False
                 dispatch_now = True
         if dispatch_now:
-            dispatch_marker_write(writer, self._task_id)
+            self._submit_marker_write()
             logger.info(
                 "CANCEL_HANDLE_MARKER_DISPATCHED_ON_ATTACH task_id=%s", self._task_id
             )
@@ -102,26 +104,56 @@ class CancelHandle:
         """Record the stop request; act on whatever is already attached.
 
         Returns True iff THIS call newly recorded the stop (the first one);
-        later calls return False so callers can log/act exactly once.
+        later calls return False.
         """
         future_to_cancel: Optional[Future] = None
-        writer_to_dispatch: Optional[Callable[[], None]] = None
+        dispatch_now = False
         with self._lock:
             if self._stop_requested:
-                return False
-            self._stop_requested = True
-            if self._future is not None:
+                newly_requested = False
+            else:
+                self._stop_requested = True
+                newly_requested = True
+            # Future.cancel is idempotent — always re-attempt.
+            if self._future is not None and not self._future.done():
                 future_to_cancel = self._future
-            if self._marker_writer is not None and not self._marker_dispatched:
-                self._marker_dispatched = True
-                writer_to_dispatch = self._marker_writer
+            # Marker: coalesce an in-flight write (skip), but re-dispatch
+            # once the previous write finished (success or failure) so a
+            # replay or a different cancelRequestId can push again.
+            if self._marker_writer is not None and self._marker_dispatch_idle:
+                self._marker_dispatch_idle = False
+                dispatch_now = True
         # Side effects OUTSIDE the handle lock.
         if future_to_cancel is not None:
             future_to_cancel.cancel()
             logger.info("CANCEL_HANDLE_FUTURE_CANCELED task_id=%s", self._task_id)
-        if writer_to_dispatch is not None:
-            dispatch_marker_write(writer_to_dispatch, self._task_id)
-        return True
+        if dispatch_now:
+            self._submit_marker_write()
+        return newly_requested
+
+    # --- internal --------------------------------------------------------
+
+    def _submit_marker_write(self) -> None:
+        writer = self._marker_writer
+        task_id = self._task_id
+
+        def _run() -> None:
+            try:
+                writer()
+            except Exception:
+                logger.exception("CANCEL_MARKER_WRITE_FAILED task_id=%s", task_id)
+            finally:
+                with self._lock:
+                    self._marker_dispatch_idle = True
+
+        try:
+            _get_write_pool().submit(_run)
+        except RuntimeError:
+            logger.warning(
+                "CANCEL_MARKER_WRITE_SKIPPED_POOL_SHUTDOWN task_id=%s", task_id
+            )
+            with self._lock:
+                self._marker_dispatch_idle = True
 
 
 # --- Marker write pool -------------------------------------------------------

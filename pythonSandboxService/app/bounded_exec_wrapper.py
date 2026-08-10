@@ -1148,12 +1148,22 @@ def _sweep_process_tree(root_pid: int, threads, pipe_fds) -> bool:
 # === end P0-2 ================================================================
 
 
-def _kill_process_group(pgid: int) -> None:
-    """SIGKILL every current member of the process group (§7.1 实施方式 6)."""
+def _kill_process_group(pgid: int) -> bool:
+    """SIGKILL every current member of the process group (§7.1 实施方式 6).
+
+    Returns True iff the signal was delivered to a still-existing process
+    group.  ProcessLookupError means the group was already dead, which in
+    the cancel-marker loop is the narrow rule-3 window: the child exited
+    on its own between ``poll()`` and ``killpg()``, so the wrapper must
+    NOT claim ``cancelObserved=true``.
+    """
     try:
         os.killpg(pgid, signal.SIGKILL)
+        return True
+    except ProcessLookupError:
+        return False
     except OSError:
-        pass  # group already gone (or never fully started)
+        return False  # cannot signal at all
 
 
 def _make_preexec(child_identity):
@@ -1601,9 +1611,13 @@ def run_bounded_capture(
                 # d6841a2e rule 2: the wrapper OBSERVED the marker.  That
                 # observation is cancellation evidence ONLY when it causes
                 # this wrapper to kill its own still-running child group.
+                # Rule 3 narrow window: poll() says alive, but between
+                # poll() and killpg() the child exited — the kill returns
+                # False and canceled stays False so the genuine result
+                # stands (codex c6c49248 review).
                 if proc.poll() is None:
-                    canceled = True
-                    _kill_process_group(pgid)
+                    if _kill_process_group(pgid):
+                        canceled = True
                 # Rule 3: the child already exited on its own (poll() is not
                 # None) — the marker arrived too late to matter.  Break with
                 # canceled still False so the genuine exit result stands; a
