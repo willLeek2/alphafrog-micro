@@ -230,8 +230,8 @@ class LangchainRunExecutorLimitsResolverTest {
         assertThat(core.get("requested")).isEqualTo(10);
         // effective 反映 adaptive 降低后的值
         assertThat(core.get("effective")).isEqualTo(3);
-        // clamped=true 因为 effective(3) != requested(10)，但 restartRequired 仍 false
-        assertThat(core.get("clamped")).isEqualTo(true);
+        // clamped=false：static 夹断只比较 pre-adaptive 的 clampCurrent(10) vs requested(10)
+        assertThat(core.get("clamped")).isEqualTo(false);
     }
 
     @Test
@@ -301,24 +301,29 @@ class LangchainRunExecutorLimitsResolverTest {
     }
 
     @Test
-    void exampleJsonDoesNotBreakConfigLoading() throws Exception {
-        // 用与生产一致的 ObjectMapper 配置读取真实 example JSON，
-        // 证明 _restartNote 未知字段不会导致热配置拒载
-        // Spring Boot 默认 FAIL_ON_UNKNOWN_PROPERTIES = false
+    void exampleJsonLoadsViaProductionLoader() throws Exception {
+        // 走真实 AgentLlmLocalConfigLoader 路径，证明 _restartNote 不会导致热配置拒载
         com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
         mapper.configure(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
-        java.io.File exampleFile = new java.io.File("config/agent-llm.local.example.json");
-        assertThat(exampleFile).exists();
 
-        // 不应抛异常
-        AgentLlmProperties props = mapper.readValue(exampleFile, AgentLlmProperties.class);
+        world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader loader =
+                new world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader(mapper);
+        // 指向真实 example JSON
+        org.springframework.test.util.ReflectionTestUtils.setField(loader, "configFile",
+                "config/agent-llm.local.example.json");
+        org.springframework.test.util.ReflectionTestUtils.setField(loader, "promptBaseDir", ".");
 
-        assertThat(props.getExecutor()).isNotNull();
-        assertThat(props.getExecutor().getParallel()).isNotNull();
-        assertThat(props.getExecutor().getParallel().getHard()).isNotNull();
-        assertThat(props.getExecutor().getParallel().getHard().getCorePoolSize()).isEqualTo(100);
-        assertThat(props.getExecutor().getParallel().getCurrent()).isNotNull();
-        assertThat(props.getExecutor().getParallel().getCurrent().getCorePoolSize()).isEqualTo(10);
+        // 调用生产 load() → current() 路径，不应抛异常
+        loader.load();
+        java.util.Optional<AgentLlmProperties> props = loader.current();
+
+        assertThat(props).isPresent();
+        assertThat(props.get().getExecutor()).isNotNull();
+        assertThat(props.get().getExecutor().getParallel()).isNotNull();
+        assertThat(props.get().getExecutor().getParallel().getHard()).isNotNull();
+        assertThat(props.get().getExecutor().getParallel().getHard().getCorePoolSize()).isEqualTo(100);
+        assertThat(props.get().getExecutor().getParallel().getCurrent()).isNotNull();
+        assertThat(props.get().getExecutor().getParallel().getCurrent().getCorePoolSize()).isEqualTo(10);
     }
 
     private static AgentLlmProperties configWithHardAndCurrent(

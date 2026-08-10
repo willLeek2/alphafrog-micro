@@ -110,19 +110,21 @@ public class LangchainRunExecutorLimitsResolver {
         LangchainRunExecutorLimits effective = applyOverrideIfSet(clamped);
 
         Integer adaptiveOverride = this.adaptiveCoreOverride;
-        // adaptive 是否实际改变了 core（overridden effective ≠ un-overridden clamped）
+        // adaptive 是否实际改变了 core（final effective ≠ pre-adaptive clamped）
         boolean adaptiveAdjusted = adaptiveOverride != null
                 && effective.getCorePoolSize() != clamped.getCorePoolSize();
 
-        // clamped = effective 与 requested 不同（捕获硬门、跨维度 core-to-max、负数归一）
+        // clamped 只反映静态夹断（hard 上限、core/max 交叉约束、负数归一），
+        // 比较 requested 与 apply adaptive 之前的 clampCurrent 结果。
+        // effective 仍返回 apply adaptive 之后的最终生效值。
         Map<String, Object> coreDim = clampedDim(hardLimits.getCorePoolSize(), requestedCore,
-                effective.getCorePoolSize());
+                clamped.getCorePoolSize(), effective.getCorePoolSize());
 
         Map<String, Object> maxDim = clampedDim(hardLimits.getMaxPoolSize(), requestedMax,
-                effective.getMaxPoolSize());
+                clamped.getMaxPoolSize(), effective.getMaxPoolSize());
 
         Map<String, Object> queueDim = clampedDim(hardLimits.getQueueCapacity(), requestedQueue,
-                effective.getQueueCapacity());
+                clamped.getQueueCapacity(), effective.getQueueCapacity());
 
         boolean prefixChanged = !requestedPrefix.equals(hardLimits.getThreadNamePrefix());
         Map<String, Object> prefixDim = new LinkedHashMap<>();
@@ -156,13 +158,19 @@ public class LangchainRunExecutorLimitsResolver {
         return result;
     }
 
-    private Map<String, Object> clampedDim(int hard, int requested, int effective) {
+    /**
+     * @param hard          启动冻结 hard 值
+     * @param requested     热配置请求值
+     * @param staticClamped apply adaptive 之前的 clampCurrent 结果（仅静态夹断）
+     * @param finalEffective apply adaptive 之后的最终生效值
+     */
+    private Map<String, Object> clampedDim(int hard, int requested, int staticClamped, int finalEffective) {
         Map<String, Object> dim = new LinkedHashMap<>();
         dim.put("hard", hard);
         dim.put("requested", requested);
-        dim.put("effective", effective);
-        // clamped 捕获一切形式的静态夹断：硬门、跨维度 core-to-max、负数/零归一
-        dim.put("clamped", effective != requested);
+        dim.put("effective", finalEffective);
+        // clamped 只看静态夹断（hard 上限、core/max 交叉约束、负数归一），排除 adaptive
+        dim.put("clamped", requested != staticClamped);
         return dim;
     }
 
