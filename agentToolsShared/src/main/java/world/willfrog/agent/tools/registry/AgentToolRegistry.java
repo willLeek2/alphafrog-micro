@@ -19,8 +19,8 @@ import java.util.Set;
  * <p>不变量「声明 ⊆ 可路由」：本注册表出现的每个名字都必须在 {@code ToolRouter}
  * 有可执行分发（能力关闭返回 {@code CAPABILITY_DISABLED} 属已实现语义，允许；
  * 仅因未实现而 {@code UNSUPPORTED_TOOL} 不允许）。{@code spawnSubAgent} /
- * {@code waitForSubAgent} 在 D06 补齐可执行路由前不得登记入本表（Q-10 计划语义保留；
- * D06 实现后声明与路由同时生效、同生同灭）。</p>
+ * {@code waitForSubAgent} 由 D06 的 {@code SubAgentControlHandler} 提供真实路由，
+ * 与声明面同生同灭。</p>
  *
  * <p>本表只承载「声明与能力归属」真相；限流拒绝是否计费、匿名缓存隔离等运行时治理
  * 口径归 D07，不在本表展开。</p>
@@ -59,7 +59,7 @@ public final class AgentToolRegistry {
 
     /** canonical 规格覆盖来源。NONE=Bean 反射；其余为各 catalog helper 或手工构建。 */
     public enum CanonicalSpec {
-        NONE, MARKET_ADVANCED, PARALLEL_LIMITS, MANUAL_FINANCE
+        NONE, MARKET_ADVANCED, PARALLEL_LIMITS, MANUAL_FINANCE, MANUAL_SUB_AGENT
     }
 
     /**
@@ -171,7 +171,13 @@ public final class AgentToolRegistry {
                     CacheFamily.NONE, Set.of(), BatchCountKeys.NONE, CanonicalSpec.NONE, "RereadToolHandler"),
             new ToolDeclaration("listMyData", Domain.DATASET, CapabilityGate.NONE,
                     Compression.EXEMPT, "run 级数据集/清单注册查询，响应体量小；现状未纳入压缩白名单",
-                    CacheFamily.NONE, Set.of(), BatchCountKeys.NONE, CanonicalSpec.NONE, "ListMyDataTool")
+                    CacheFamily.NONE, Set.of(), BatchCountKeys.NONE, CanonicalSpec.NONE, "ListMyDataTool"),
+            new ToolDeclaration("spawnSubAgent", Domain.META, CapabilityGate.NONE,
+                    Compression.EXCLUDED, null, CacheFamily.NONE,
+                    Set.of(), BatchCountKeys.NONE, CanonicalSpec.MANUAL_SUB_AGENT, "SubAgentControlHandler"),
+            new ToolDeclaration("waitForSubAgent", Domain.META, CapabilityGate.NONE,
+                    Compression.EXCLUDED, null, CacheFamily.NONE,
+                    Set.of(), BatchCountKeys.NONE, CanonicalSpec.MANUAL_SUB_AGENT, "SubAgentControlHandler")
     );
 
     private static final Map<String, ToolDeclaration> BY_NAME;

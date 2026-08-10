@@ -30,6 +30,7 @@ import world.willfrog.agent.tools.python.PythonSandboxTools;
 import world.willfrog.agent.tools.rag.RagTools;
 import world.willfrog.agent.tools.registry.AgentToolRegistry;
 import world.willfrog.agent.tools.search.SearchTools;
+import world.willfrog.agent.tools.subagent.SubAgentControlHandler;
 
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
@@ -46,7 +47,7 @@ import java.util.concurrent.TimeUnit;
  *
  * <p>可路由工具名集合由 {@link AgentToolRegistry#declaredToolNames()} 派生，
  * 本路由器只负责分发已在注册表中声明的工具。spawnSubAgent / waitForSubAgent
- * 不在 D05 生产声明面内，将在 D06 同生同死补齐。</p>
+ * 由 D06 的 {@link SubAgentControlHandler} 提供控制语义；声明、目录与路由同时生效。</p>
  *
  * <p>面试里如果只看 agentLangchainService 的 {@code ToolRouterToolExecutor}，
  * 只能知道 LC4j 的 tool call 如何进入 Java；真正的业务语义在这里：是否允许调用、
@@ -60,11 +61,9 @@ import java.util.concurrent.TimeUnit;
  * {@code runId + tool_call_id} 懒加载 safe detail，而不是扫描整份 trace。</p>
  *
  * <h3>位置与角色</h3>
- * 本路由器是 {@link world.willfrog.agent.workflow.ReactTodoExecutor} 在 ReAct 循环中
- * 处理 LLM 返回的 {@code tool_calls} 时的核心依赖：当 LLM 返回某个 tool_call 后，
- * ReactTodoExecutor 将工具名和参数交给 {@link #invokeWithMeta(String, Map)} 路由执行。
- * 在 agentLangchainService 中，{@code ToolRouterToolExecutor} 也会调用同一个入口，
- * 所以 legacy 与 langchain 两条执行链共享同一套工具预算、缓存和观测语义。
+ * 在 agentLangchainService 中，{@code ToolRouterToolExecutor} 将 LLM 返回的
+ * {@code tool_calls} 交给 {@link #invokeWithMeta(String, Map)}。业务工具与子代理控制工具
+ * 因而共享同一套预算、限流、缓存选择和观测入口，不依赖已删除的 legacy 执行器旁路。
  *
  * <h3>核心职责</h3>
  * <ol>
@@ -95,7 +94,6 @@ import java.util.concurrent.TimeUnit;
  * }
  * </pre>
  *
- * @see world.willfrog.agent.workflow.ReactTodoExecutor
  * @see world.willfrog.agentlangchain.tools.ToolRouterToolExecutor
  * @see ToolResultCacheService
  * @see AgentObservabilityService
@@ -164,6 +162,14 @@ public class ToolRouter {
      */
     @Autowired(required = false)
     private ToolWeightedLimitService toolWeightedLimitService;
+
+    /**
+     * D06 子代理控制实现。共享 Router 不依赖 LangChain4j；生产实现由
+     * agentLangchainService 注入。缺少实现时返回稳定的不可用错误，绝不落到
+     * UNSUPPORTED_TOOL，也不会启动临时线程或使用进程内假实现。
+     */
+    @Autowired(required = false)
+    private SubAgentControlHandler subAgentControlHandler;
 
     /**
      * 简化入口：仅返回工具输出文本，丢弃成功标志、耗时、缓存元数据等。
@@ -660,6 +666,12 @@ public class ToolRouter {
                         toIntOrNull(params.get("offset"), params.get("arg2")),
                         toIntOrNull(params.get("limit"), params.get("arg3"))
                 );
+                case "spawnSubAgent" -> subAgentControlHandler == null
+                        ? subAgentUnavailable(toolName)
+                        : subAgentControlHandler.spawn(params);
+                case "waitForSubAgent" -> subAgentControlHandler == null
+                        ? subAgentUnavailable(toolName)
+                        : subAgentControlHandler.waitFor(params);
                 default -> unsupported(toolName);
             };
         } catch (ExternalToolJobPendingException pending) {
@@ -699,6 +711,17 @@ public class ToolRouter {
                 .durationMs(Math.max(0L, System.currentTimeMillis() - startedAt))
                 .success(isToolSuccess(result))
                 .build();
+    }
+
+    private String subAgentUnavailable(String toolName) {
+        return writeJson(Map.of(
+                "ok", false,
+                "tool", nvl(toolName),
+                "data", Map.of(),
+                "error", Map.of(
+                        "code", "SUB_AGENT_UNAVAILABLE",
+                        "message", "Sub-agent execution is unavailable in this runtime",
+                        "details", Map.of())));
     }
 
     /**

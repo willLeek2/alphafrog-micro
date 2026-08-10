@@ -8,6 +8,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.config.StressTestProperties;
 import world.willfrog.agent.platform.context.AgentContext;
@@ -21,6 +22,7 @@ import world.willfrog.agent.tools.python.PythonSandboxTools;
 import world.willfrog.agent.tools.rag.RagTools;
 import world.willfrog.agent.tools.registry.AgentToolRegistry;
 import world.willfrog.agent.tools.search.SearchTools;
+import world.willfrog.agent.tools.subagent.SubAgentControlHandler;
 
 import java.util.Map;
 import java.util.Set;
@@ -105,7 +107,32 @@ class ToolRouterRegistryConsistencyTest {
         assertEquals("UNSUPPORTED_TOOL", root.path("error").path("code").asText());
     }
 
+    @Test
+    void subAgentControls_delegateToProductionHandler() throws Exception {
+        SubAgentControlHandler handler = new SubAgentControlHandler() {
+            @Override
+            public String spawn(Map<String, Object> params) {
+                return okJson("spawnSubAgent");
+            }
+
+            @Override
+            public String waitFor(Map<String, Object> params) {
+                return okJson("waitForSubAgent");
+            }
+        };
+
+        assertTrue(objectMapper.readTree(invokeTool("spawnSubAgent", handler).getOutput())
+                .path("ok").asBoolean());
+        assertTrue(objectMapper.readTree(invokeTool("waitForSubAgent", handler).getOutput())
+                .path("ok").asBoolean());
+    }
+
     private ToolRouter.ToolInvocationResult invokeTool(String toolName) throws Exception {
+        return invokeTool(toolName, null);
+    }
+
+    private ToolRouter.ToolInvocationResult invokeTool(String toolName,
+                                                       SubAgentControlHandler subAgentControlHandler) throws Exception {
         MarketDataTools marketDataTools = mock(MarketDataTools.class);
         when(marketDataTools.checkParallelLimits()).thenReturn(okJson("checkParallelLimits"));
         when(marketDataTools.getStockInfo(anyString())).thenReturn(okJson("getStockInfo"));
@@ -179,6 +206,7 @@ class ToolRouterRegistryConsistencyTest {
                 new SimpleMeterRegistry(),
                 new StressTestProperties()
         );
+        ReflectionTestUtils.setField(router, "subAgentControlHandler", subAgentControlHandler);
 
         Map<String, Object> params = toolSpecificParams(toolName);
         return router.invokeWithMeta(toolName, params);
@@ -203,6 +231,8 @@ class ToolRouterRegistryConsistencyTest {
             case "loadToolGuide" -> Map.of("topic", "t");
             case "rereadToolResult" -> Map.of("rawRef", "ref");
             case "listMyData" -> Map.of("query_type", "dataset");
+            case "spawnSubAgent" -> Map.of("goal", "check one bounded fact");
+            case "waitForSubAgent" -> Map.of("subAgentIds", java.util.List.of("sa_1"));
             default -> Map.of();
         };
     }

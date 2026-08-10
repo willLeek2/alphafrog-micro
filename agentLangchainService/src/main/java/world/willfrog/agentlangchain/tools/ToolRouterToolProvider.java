@@ -24,6 +24,9 @@ import world.willfrog.agentlangchain.config.LangchainToolConcurrencyThrottle;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
+
+import static world.willfrog.agent.platform.service.AgentObservabilityService.PHASE_SUB_AGENT;
 
 /**
  * LangChain4j（LC4j）{@link ToolProvider} 适配层：把内部 {@link ToolRouter} 工具目录暴露给
@@ -121,6 +124,13 @@ public class ToolRouterToolProvider implements ToolProvider {
                 webSearchEnabled,
                 codeInterpreterEnabled
         );
+        if (PHASE_SUB_AGENT.equals(AgentContext.getPhase())) {
+            // D06 防止子代理递归生成子代理：模型目录和 Router 运行时门闩同时关闭。
+            specifications = specifications.stream()
+                    .filter(spec -> !"spawnSubAgent".equals(spec.name())
+                            && !"waitForSubAgent".equals(spec.name()))
+                    .collect(Collectors.toCollection(java.util.ArrayList::new));
+        }
 
         ToolExecutor executor = new ToolRouterToolExecutor(
                 toolRouter, objectMapper, eventService, toolThrottle, pythonSandboxDispatchStore);

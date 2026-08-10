@@ -5,7 +5,6 @@ import org.junit.jupiter.api.Test;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -18,17 +17,17 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class AgentToolRegistryContractTest {
 
     @Test
-    void declaredToolNames_hasExactly25UniqueNames() {
+    void declaredToolNames_hasExactly27UniqueNames() {
         Set<String> names = AgentToolRegistry.declaredToolNames();
-        assertEquals(25, names.size(), "生产声明面应保持 25 个工具名");
-        assertEquals(25, names.stream().distinct().count(), "工具名必须唯一");
+        assertEquals(27, names.size(), "生产声明面应保持 27 个工具名");
+        assertEquals(27, names.stream().distinct().count(), "工具名必须唯一");
     }
 
     @Test
-    void declaredToolNames_doesNotContainSpawnOrWaitSubAgent() {
+    void declaredToolNames_containsD06SubAgentControls() {
         Set<String> names = AgentToolRegistry.declaredToolNames();
-        assertFalse(names.contains("spawnSubAgent"), "spawnSubAgent 在 D06 前不得登记");
-        assertFalse(names.contains("waitForSubAgent"), "waitForSubAgent 在 D06 前不得登记");
+        assertTrue(names.contains("spawnSubAgent"), "D06 必须登记 spawnSubAgent");
+        assertTrue(names.contains("waitForSubAgent"), "D06 必须登记 waitForSubAgent");
     }
 
     @Test
@@ -69,7 +68,12 @@ class AgentToolRegistryContractTest {
 
     @Test
     void excludedSet_matchesFrozenGroundTruth() {
-        Set<String> expected = Set.of("executePython", "searchWeb");
+        Set<String> expected = Set.of(
+                "executePython",
+                "searchWeb",
+                "spawnSubAgent",
+                "waitForSubAgent"
+        );
         Set<String> actual = AgentToolRegistry.namesWithCompression(AgentToolRegistry.Compression.EXCLUDED);
         assertEquals(expected, actual, "EXCLUDED 集合必须与注册表现状一致");
     }
@@ -181,6 +185,14 @@ class AgentToolRegistryContractTest {
     void canonicalManualFinance_matchesFrozenGroundTruth() {
         Set<String> expected = Set.of("resolveFinanceMethods");
         Set<String> actual = AgentToolRegistry.namesWithCanonicalSpec(AgentToolRegistry.CanonicalSpec.MANUAL_FINANCE);
+        assertEquals(expected, actual);
+    }
+
+    @Test
+    void canonicalManualSubAgent_matchesFrozenGroundTruth() {
+        Set<String> expected = Set.of("spawnSubAgent", "waitForSubAgent");
+        Set<String> actual = AgentToolRegistry.namesWithCanonicalSpec(
+                AgentToolRegistry.CanonicalSpec.MANUAL_SUB_AGENT);
         assertEquals(expected, actual);
     }
 

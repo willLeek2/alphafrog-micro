@@ -115,6 +115,32 @@ class ToolRouterToolProviderTest {
     }
 
     @Test
+    void provideTools_shouldExposeSubAgentControlsForParentRun() {
+        ToolProviderResult result = provider.provideTools(request(Map.of()));
+        Set<String> toolNames = result.tools().keySet().stream()
+                .map(ToolSpecification::name)
+                .collect(Collectors.toSet());
+
+        assertTrue(toolNames.contains("spawnSubAgent"));
+        assertTrue(toolNames.contains("waitForSubAgent"));
+        assertNotNull(result.toolExecutorByName("spawnSubAgent"));
+        assertNotNull(result.toolExecutorByName("waitForSubAgent"));
+    }
+
+    @Test
+    void provideTools_shouldHideSubAgentControlsInsideChildPhase() {
+        AgentContext.setPhase(world.willfrog.agent.platform.service.AgentObservabilityService.PHASE_SUB_AGENT);
+
+        ToolProviderResult result = provider.provideTools(request(Map.of()));
+        Set<String> toolNames = result.tools().keySet().stream()
+                .map(ToolSpecification::name)
+                .collect(Collectors.toSet());
+
+        assertFalse(toolNames.contains("spawnSubAgent"));
+        assertFalse(toolNames.contains("waitForSubAgent"));
+    }
+
+    @Test
     void provideTools_shouldHideSearchWhenWebSearchDisabled() {
         ToolProviderResult result = provider.provideTools(request(Map.of(
                 LangchainToolInvocationKeys.WEB_SEARCH_ENABLED, false,

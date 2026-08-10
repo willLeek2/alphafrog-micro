@@ -11,6 +11,7 @@
 | `world.willfrog.agent.tools.rag` | RagTools |
 | `world.willfrog.agent.tools.search` | SearchTools |
 | `world.willfrog.agent.tools.router` | ToolRouter, ToolResultCacheService, ToolWeightedLimitService, PythonStaticPrecheckService |
+| `world.willfrog.agent.tools.subagent` | SubAgentControlHandler（共享路由与 LangChain 编排实现之间的无框架控制接口） |
 
 ## Dependencies
 
@@ -18,14 +19,14 @@
 - Dubbo API modules for market/rag/search/python tools
 - Must not depend on `agentService` or `workflow/*` executors
 
-## Out of scope (not active in agentLangchainService)
+## Out of scope
 
-- `spawnSubAgent` / `waitForSubAgent` tool specs
 - `AgentToolCatalogService`, simple tool fast path
 
-`spawnSubAgent` / `waitForSubAgent` 在 D05 之后已从生产声明面移除；当前 `ToolRouter.supportedTools()`
-和 `AgentToolRegistry` 均不包含这两个工具。D06 会在补齐同生同死的可执行路由与注册表声明后，
-再让它们同时回归声明面。
+`spawnSubAgent` / `waitForSubAgent` 已由 D06 回归生产声明面。`AgentToolRegistry` 是唯一声明源，
+`ToolRouter` 通过 `SubAgentControlHandler` 分发，生产生命周期实现位于 `agentLangchainService`。
+tools 模块只依赖这个小接口，不依赖 LangChain4j 或 workflow executor；子代理内部也必须继续
+通过同一个 `ToolRouter` 调业务工具，不能复活 `ReactTodoExecutor`/`SubAgentRunner` 旁路。
 
 ## Single source of truth
 

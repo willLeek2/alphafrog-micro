@@ -296,7 +296,8 @@ public class LangchainTodoNodeExecutor {
         int currentPromptBudget = userMessage.length();
         String lastNonEmptyTodoId = lastNonEmptyTodoId(completedTodos);
 
-        try {
+        try (LangchainSubAgentExecutionContext.Scope ignored =
+                     LangchainSubAgentExecutionContext.install(request, datasetRefs, toolCalls)) {
             // 发 LLM 请求前先检查 run 是否已被取消
             ensureRunnable(request);
             String output = buildTodoAiService(

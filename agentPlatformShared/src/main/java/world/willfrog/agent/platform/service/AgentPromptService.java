@@ -558,6 +558,25 @@ public class AgentPromptService {
         return 3;
     }
 
+    /** 返回单个子代理允许的最大逻辑步骤数；缺省为 6。 */
+    public int maxSubAgentSteps() {
+        try {
+            AgentLlmProperties.SubAgent subAgent = currentSubAgentConfig();
+            if (subAgent != null && subAgent.getMaxSteps() != null && subAgent.getMaxSteps() > 0) {
+                return subAgent.getMaxSteps();
+            }
+        } catch (Exception e) {
+            log.warn("Failed to read maxSubAgentSteps from config, using default 6: {}", e.getMessage());
+        }
+        return 6;
+    }
+
+    /** 子代理能力是否开启；缺省关闭以避免残缺配置意外暴露执行入口。 */
+    public boolean subAgentEnabled() {
+        AgentLlmProperties.SubAgent subAgent = currentSubAgentConfig();
+        return subAgent != null && Boolean.TRUE.equals(subAgent.getEnabled());
+    }
+
     /**
      * Sub-Agent 的 LLM endpoint 名称。
      * 为空时表示沿用主 Agent 的 endpoint（即不单独指定）。
