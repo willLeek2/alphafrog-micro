@@ -1,6 +1,8 @@
 package world.willfrog.agentlangchain.config;
 
 import lombok.extern.slf4j.Slf4j;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
@@ -70,6 +72,80 @@ public class LangchainRunExecutorLimitsResolver {
         return new LangchainRunExecutorLimits(core, base.getMaxPoolSize(), base.getQueueCapacity(), base.getThreadNamePrefix());
     }
 
+    /**
+     * 暴露启动冻结 hard 与当前配置 requested 之间的差距，供 health/snapshot 端点查询。
+     *
+     * <p>restartRequired 由 requested 超出 hard 或 threadNamePrefix 与 hard 不同决定；
+     * adaptive core 覆盖不影响 restartRequired。</p>
+     */
+    public Map<String, Object> getHardVersusEffectiveGap() {
+        AgentLlmProperties.ExecutorConfig executorConfig = configLoader.current()
+                .map(AgentLlmProperties::getExecutor)
+                .orElse(null);
+        AgentLlmProperties.ExecutorConfig currentConfig = null;
+        if (executorConfig != null && executorConfig.getParallel() != null) {
+            currentConfig = executorConfig.getParallel().getCurrent();
+        }
+        if (currentConfig == null) {
+            currentConfig = executorConfig;
+        }
+
+        int requestedCore = valueOrDefault(currentConfig == null ? null : currentConfig.getCorePoolSize(),
+                hardLimits.getCorePoolSize());
+        int requestedMax = valueOrDefault(currentConfig == null ? null : currentConfig.getMaxPoolSize(),
+                hardLimits.getMaxPoolSize());
+        int requestedQueue = valueOrDefault(currentConfig == null ? null : currentConfig.getQueueCapacity(),
+                hardLimits.getQueueCapacity());
+        String requestedPrefix = firstNonBlank(
+                currentConfig == null ? null : currentConfig.getThreadNamePrefix(),
+                hardLimits.getThreadNamePrefix());
+
+        LangchainRunExecutorLimits effective = currentLimits();
+
+        Map<String, Object> coreDim = new LinkedHashMap<>();
+        coreDim.put("hard", hardLimits.getCorePoolSize());
+        coreDim.put("requested", requestedCore);
+        coreDim.put("effective", effective.getCorePoolSize());
+        coreDim.put("clamped", requestedCore > hardLimits.getCorePoolSize());
+
+        Map<String, Object> maxDim = new LinkedHashMap<>();
+        maxDim.put("hard", hardLimits.getMaxPoolSize());
+        maxDim.put("requested", requestedMax);
+        maxDim.put("effective", effective.getMaxPoolSize());
+        maxDim.put("clamped", requestedMax > hardLimits.getMaxPoolSize());
+
+        Map<String, Object> queueDim = new LinkedHashMap<>();
+        queueDim.put("hard", hardLimits.getQueueCapacity());
+        queueDim.put("requested", requestedQueue);
+        queueDim.put("effective", effective.getQueueCapacity());
+        queueDim.put("clamped", requestedQueue > hardLimits.getQueueCapacity());
+
+        boolean prefixChanged = !requestedPrefix.equals(hardLimits.getThreadNamePrefix());
+        Map<String, Object> prefixDim = new LinkedHashMap<>();
+        prefixDim.put("hard", hardLimits.getThreadNamePrefix());
+        prefixDim.put("requested", requestedPrefix);
+        prefixDim.put("effective", effective.getThreadNamePrefix());
+        prefixDim.put("clamped", prefixChanged);
+
+        // restartRequired 只看 requested 是否超过 hard 或前缀已变化；
+        // adaptive core 覆盖造成的临时变化不触发 restartRequired。
+        boolean restartRequired = requestedCore > hardLimits.getCorePoolSize()
+                || requestedMax > hardLimits.getMaxPoolSize()
+                || requestedQueue > hardLimits.getQueueCapacity()
+                || prefixChanged;
+
+        Map<String, Object> dimensions = new LinkedHashMap<>();
+        dimensions.put("corePoolSize", coreDim);
+        dimensions.put("maxPoolSize", maxDim);
+        dimensions.put("queueCapacity", queueDim);
+        dimensions.put("threadNamePrefix", prefixDim);
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("restartRequired", restartRequired);
+        result.put("dimensions", dimensions);
+        return result;
+    }
+
     /** 设置运行期 core 覆盖；传 null 清除覆盖并回到当前配置值。 */
     public void setAdaptiveCoreOverride(Integer core) {
         this.adaptiveCoreOverride = core;
@@ -116,12 +192,15 @@ public class LangchainRunExecutorLimitsResolver {
         int max = Math.min(Math.max(1, requestedMax), hardLimits.getMaxPoolSize());
         int core = Math.min(Math.max(1, requestedCore), Math.min(max, hardLimits.getCorePoolSize()));
         int queue = Math.min(Math.max(0, requestedQueue), hardLimits.getQueueCapacity());
-        if (core != requestedCore || max != requestedMax || queue != requestedQueue) {
-            log.warn("Langchain run current executor limits exceed hard gate, clamped from core={}, max={}, queue={} to {}",
-                    requestedCore, requestedMax, requestedQueue,
-                    new LangchainRunExecutorLimits(core, max, queue, requestedPrefix).summary());
+        // threadNamePrefix 启动冻结，hot-reload 无法重命名已创建线程
+        String prefix = hardLimits.getThreadNamePrefix();
+        if (core != requestedCore || max != requestedMax || queue != requestedQueue
+                || !requestedPrefix.equals(prefix)) {
+            log.warn("Langchain run current executor limits exceed hard gate, clamped from core={}, max={}, queue={}, prefix={} to {}",
+                    requestedCore, requestedMax, requestedQueue, requestedPrefix,
+                    new LangchainRunExecutorLimits(core, max, queue, prefix).summary());
         }
-        return new LangchainRunExecutorLimits(core, max, queue, requestedPrefix);
+        return new LangchainRunExecutorLimits(core, max, queue, prefix);
     }
 
     private int valueOrDefault(Integer value, int fallback) {
