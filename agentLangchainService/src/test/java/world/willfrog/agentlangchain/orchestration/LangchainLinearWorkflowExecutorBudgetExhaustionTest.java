@@ -52,7 +52,6 @@ class LangchainLinearWorkflowExecutorBudgetExhaustionTest {
         AgentContext.setRunId("run-test");
         AgentContext.setUserId("user-test");
         executor = new LangchainLinearWorkflowExecutor(
-                world.willfrog.agentlangchain.support.LangchainTestFixtures.planner(),
                 todoNodeExecutor,
                 noopExecutionGuard(),
                 eventService);

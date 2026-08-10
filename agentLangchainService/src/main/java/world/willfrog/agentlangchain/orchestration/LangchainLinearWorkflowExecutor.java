@@ -7,12 +7,9 @@ import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agent.platform.service.CodeRefineLocalConfigLoader;
 import world.willfrog.agent.workflow.DatasetRefRegistry;
-import world.willfrog.agent.workflow.PlanExecutionMode;
 import world.willfrog.agent.workflow.TodoItem;
 import world.willfrog.agent.platform.dataanalysis.CompletedTodoRecord;
 import world.willfrog.agentlangchain.tooljob.ToolJobResumeContext;
-import world.willfrog.agentlangchain.planning.LangchainAiPlanner;
-import world.willfrog.agentlangchain.planning.LangchainPlanningRequest;
 import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
 
 
@@ -54,7 +51,6 @@ public class LangchainLinearWorkflowExecutor {
     private static final int DEFAULT_MAX_PYTHON_ATTEMPTS = 3;
     private static final int MAX_PYTHON_ATTEMPTS = 10;
 
-    private final LangchainAiPlanner planner;
     private final LangchainTodoNodeExecutor todoNodeExecutor;
     private final LangchainRunExecutionGuard executionGuard;
     private final AgentEventService eventService;
@@ -64,16 +60,14 @@ public class LangchainLinearWorkflowExecutor {
     private static final Set<String> REPAIRABLE_PYTHON_EXIT_REASONS = Set.of("NON_ZERO_EXIT");
 
     /**
-     * 生产构造器显式选择六个依赖，避免存在测试便利构造器时 Spring 猜错构造器。
+     * 生产构造器显式选择五个依赖，避免存在测试便利构造器时 Spring 猜错构造器。
      */
     @Autowired
-    public LangchainLinearWorkflowExecutor(LangchainAiPlanner planner,
-                                           LangchainTodoNodeExecutor todoNodeExecutor,
+    public LangchainLinearWorkflowExecutor(LangchainTodoNodeExecutor todoNodeExecutor,
                                            LangchainRunExecutionGuard executionGuard,
                                            AgentEventService eventService,
                                            CodeRefineLocalConfigLoader codeRefineConfigLoader,
                                            CodeRefineProperties startupCodeRefineProperties) {
-        this.planner = planner;
         this.todoNodeExecutor = todoNodeExecutor;
         this.executionGuard = executionGuard;
         this.eventService = eventService;
@@ -82,51 +76,11 @@ public class LangchainLinearWorkflowExecutor {
     }
 
     /** 测试与历史直接构造调用的兼容入口；生产 Spring 必须使用上面的 @Autowired 构造器。 */
-    public LangchainLinearWorkflowExecutor(LangchainAiPlanner planner,
-                                           LangchainTodoNodeExecutor todoNodeExecutor,
+    public LangchainLinearWorkflowExecutor(LangchainTodoNodeExecutor todoNodeExecutor,
                                            LangchainRunExecutionGuard executionGuard,
                                            AgentEventService eventService) {
-        this(planner, todoNodeExecutor, executionGuard, eventService,
+        this(todoNodeExecutor, executionGuard, eventService,
                 null, new CodeRefineProperties());
-    }
-
-    /**
-     * 仅供遗留测试兼容的“规划并执行”入口。
-     *
-     * <p>生产 Run 必须先由 {@code LangchainLinearRunPipelineImpl} 完成一次规划并冻结
-     * effectivePlan，再调用 {@link #executePlanned}；新代码不得从执行器重新规划。</p>
-     */
-    @Deprecated(forRemoval = true)
-    public LangchainLinearWorkflowResult execute(LangchainLinearWorkflowRequest request) {
-        validate(request);
-        AtomicInteger toolCalls = new AtomicInteger();
-        try {
-            applyRunContext(request);
-            AgentContext.setPhase("planning");
-            LangchainTodoPlan plan = planner.plan(LangchainPlanningRequest.builder()
-                    .runId(request.getRunId())
-                    .userId(request.getUserId())
-                    .userGoal(request.getUserGoal())
-                    .dialogueContext(request.getDialogueContext())
-                    .model(request.planningModelOrDefault())
-                    .planningEndpointName(request.getPlanningEndpointName())
-                    .planningModelName(request.getPlanningModelName())
-                    .planningProviderOrder(request.getPlanningProviderOrder())
-                    .toolSpecifications(request.getToolSpecifications())
-                    .executionMode(PlanExecutionMode.LINEAR)
-                    .maxTodos(request.getMaxTodos())
-                    .build());
-            plan = LangchainWorkflowRouting.effectivePlan(plan, true);
-            return executePlanned(request, plan, toolCalls, null, null);
-        } catch (Exception e) {
-            return LangchainLinearWorkflowResult.builder()
-                    .success(false)
-                    .failureReason(e.getMessage())
-                    .toolCallsUsed(toolCalls.get())
-                    .build();
-        } finally {
-            AgentContext.clear();
-        }
     }
 
     public LangchainLinearWorkflowResult executePlanned(LangchainLinearWorkflowRequest request,
