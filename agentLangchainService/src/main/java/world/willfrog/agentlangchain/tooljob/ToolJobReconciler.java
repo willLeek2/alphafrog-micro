@@ -117,6 +117,15 @@ public class ToolJobReconciler {
                 if (a != null) { redisCache.atomicWritePendingAndDue(run.getId(), a); resumeService.tryResume(run.getId()); }
             }
         } catch (Exception e) { log.error("Resume-ready scan error", e); }
+        try {
+            // 第三段：补扫 CAS_STATUS→RESUME_READY 半状态。
+            // completeResumeReady 内部用精确旧值 CAS 保证只有一个实例推进成功。
+            for (AgentRun run : anchorService.listStuckAtCasStatus(20)) {
+                ToolJobAnchor a = anchorService.loadAnchor(run.getId());
+                if (a == null) continue;
+                finalizer.completeResumeReady(run.getId(), a);
+            }
+        } catch (Exception e) { log.error("CAS_STATUS stuck scan error", e); }
     }
 
     private void processItem(String runId) {

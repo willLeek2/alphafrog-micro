@@ -423,26 +423,67 @@ public class ToolJobFinalizer {
             }
         }
 
-        // 第六步：生成一轮新的恢复租约并把 anchor 标记 READY。
+        // 第六步：原子推进 CAS_STATUS→RESUME_READY。正常 finalizer 与 backfill 恢复共享同一条入口。
         if (!isStepDone(anchor, STEP_RESUME_READY)) {
-            // READY 表示可被任一进程 claim，但尚未启动 worker。
-            anchor.setResumeState("READY");
-            // 每轮随机 token 防止旧 launcher 重放。
-            anchor.setResumeToken(UUID.randomUUID().toString());
-            // 单调 leaseVersion 是跨进程 fencing token。
-            anchor.setResumeLeaseVersion(anchor.getResumeLeaseVersion() + 1);
-            // claimedAt 同时作为 LAUNCHING 超时回收的基准时间。
-            anchor.setResumeClaimedAt(now);
-            anchor.setFinalizerStep(STEP_RESUME_READY);
-            if (!anchorService.updateAnchor(runId, anchor, AgentRunStatus.RECEIVED)) {
-                log.warn("RESUME_READY anchor update failed for run={}", runId);
-                return;
-            }
-            // Redis 只加速扫描；即使写失败，启动恢复仍能从 DB 的 READY 找回。
-            redisCache.writePendingCache(runId, anchor);
-            // 立即尝试重入以降低延迟；失败/崩溃由 startup/reconciler 后续补扫。
-            resumeService.tryResume(runId);
+            completeResumeReady(runId, anchor);
         }
+    }
+
+    /**
+     * 原子推进 CAS_STATUS→RESUME_READY。正常 finalizer 第六步和 backfill 恢复都走此入口。
+     *
+     * <p>内存 anchor 保持在 CAS_STATUS 旧值；SQL 使用 {@code jsonb ||} 只合并写入 5 个恢复字段，
+     * claimedAt 用数据库 CURRENT_TIMESTAMP，leaseVersion 在 DB 内自增。WHERE 绑定 10 个精确旧值
+     * 条件。只有 rows=1 的调用者才是胜者，才重读落地 anchor、写 Redis 并调用 tryResume。
+     * 输家立即退出，不写 Redis、不启动 worker。</p>
+     */
+    void completeResumeReady(String runId, ToolJobAnchor anchor) {
+        if (!STEP_CAS_STATUS.equals(anchor.getFinalizerStep())) {
+            return;
+        }
+        String rs = anchor.getResumeState();
+        if (rs != null && !rs.isBlank()) {
+            return; // 已被其他路径推进
+        }
+
+        String opId = anchor.getOperationId();
+        String tcId = anchor.getToolCallId();
+        String taskId = anchor.getTaskId();
+        int attempt = anchor.getAttempt();
+
+        if (opId == null || opId.isBlank()
+                || tcId == null || tcId.isBlank()
+                || taskId == null || taskId.isBlank()
+                || attempt <= 0
+                || anchor.getResumeLeaseVersion() < 0
+                || anchor.getResumeLeaseVersion() >= Long.MAX_VALUE) {
+            log.error("completeResumeReady fail-closed for run={}: missing identity "
+                    + "operationId={} toolCallId={} taskId={} attempt={}",
+                    runId, opId, tcId, taskId, attempt);
+            return;
+        }
+
+        String newToken = UUID.randomUUID().toString();
+
+        int rows = anchorService.promoteCasStatusToResumeReady(
+                runId, opId, tcId, attempt, taskId,
+                anchor.getResumeLeaseVersion(),
+                newToken);
+
+        if (rows != 1) {
+            log.warn("promoteCasStatusToResumeReady lost race for run={}", runId);
+            return; // 输家不写 Redis，不启动 worker
+        }
+
+        // 胜者从 DB 重读落地 anchor，确保 Redis 和 tryResume 基于持久化数据
+        ToolJobAnchor persisted = anchorService.loadAnchor(runId);
+        if (persisted == null) {
+            log.warn("completeResumeReady winner failed to reload anchor for run={}, "
+                    + "leaving READY for next cycle", runId);
+            return; // 不回滚 READY；下一轮既有 READY 扫描会接管
+        }
+        redisCache.writePendingCache(runId, persisted);
+        resumeService.tryResume(runId);
     }
 
     /**

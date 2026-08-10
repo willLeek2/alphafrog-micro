@@ -291,6 +291,28 @@ public class ToolJobAnchorService {
     }
 
     /**
+     * 发现 CAS_STATUS→RESUME_READY 半状态：RECEIVED + finalizerStep=CAS_STATUS + resumeState 空。
+     * 只用于发现；推进必须走 {@link #promoteCasStatusToResumeReady}。
+     */
+    public List<AgentRun> listStuckAtCasStatus(int limit) {
+        return agentRunMapper.listStuckAtCasStatusAnchors(limit);
+    }
+
+    /**
+     * 原子推进 CAS_STATUS→RESUME_READY。
+     * WHERE 绑定 10 个精确旧值条件；SET 只合并写 5 个恢复字段。
+     * 只有 rows=1 的调用者是胜者。输家不得写 Redis 或启动 worker。
+     */
+    public int promoteCasStatusToResumeReady(String runId, String operationId,
+                                              String toolCallId, int attempt, String taskId,
+                                              long expectedResumeLeaseVersion,
+                                              String newResumeToken) {
+        return agentRunMapper.promoteCasStatusToResumeReady(
+                runId, operationId, toolCallId, attempt, taskId,
+                expectedResumeLeaseVersion, newResumeToken);
+    }
+
+    /**
      * Atomic CAS: updates the anchor JSON only if the run status, resumeState,
      * resumeToken, AND resumeLeaseVersion all match expected values.
      * Prevents dual-launch races and stale-claim replays.

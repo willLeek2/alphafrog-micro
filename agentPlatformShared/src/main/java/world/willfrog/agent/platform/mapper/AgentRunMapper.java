@@ -315,6 +315,29 @@ public interface AgentRunMapper {
     List<AgentRun> listResumeReadyAnchors(@Param("limit") int limit);
 
     /**
+     * 发现 CAS_STATUS→RESUME_READY 半状态：RECEIVED + finalizerStep=CAS_STATUS + resumeState 空。
+     * 只用于发现，不承担并发正确性。推进必须走 {@link #promoteCasStatusToResumeReady}。
+     */
+    List<AgentRun> listStuckAtCasStatusAnchors(@Param("limit") int limit);
+
+    /**
+     * 原子推进 CAS_STATUS→RESUME_READY。
+     * WHERE 绑定 RECEIVED + finalizerStep=CAS_STATUS + resumeState 空
+     * + operationId + toolCallId + attempt + taskId + expectedLeaseVersion。
+     * SET 只合并写 resumeState/token/leaseVersion/claimedAt/finalizerStep，不覆盖其余字段。
+     * claimedAt 使用数据库 CURRENT_TIMESTAMP，leaseVersion 在 DB 内自增。
+     * @return 更新行数（1=胜者，0=并发输家或条件不满足）
+     */
+    int promoteCasStatusToResumeReady(
+            @Param("id") String id,
+            @Param("expectedOperationId") String expectedOperationId,
+            @Param("expectedToolCallId") String expectedToolCallId,
+            @Param("expectedAttempt") int expectedAttempt,
+            @Param("expectedTaskId") String expectedTaskId,
+            @Param("expectedResumeLeaseVersion") long expectedResumeLeaseVersion,
+            @Param("newResumeToken") String newResumeToken);
+
+    /**
      * 原子 CAS 更新 resumeState，同时约束 Run 状态、旧 state、token 与 lease version。
      * READY→LAUNCHING 和过期 LAUNCHING→READY 都经此入口，防止双 launch 与旧租约回滚新声明。
      */

@@ -823,6 +823,113 @@
     </select>
 
     <!--
+        CAS_STATUS→RESUME_READY 半状态发现查询。只用于发现，不承担并发正确性。
+        RECEIVED + finalizerStep=CAS_STATUS + resumeState 为空（含空白字符串）。
+
+        同时排除 identity 缺失、attempt 非法、resumeLeaseVersion 非数字或负值的损坏记录，
+        防止它们占满 LIMIT 导致合法恢复记录被饿死。Java fail-closed guard 仍保留。
+    -->
+    <select id="listStuckAtCasStatusAnchors" resultMap="AgentRunResultMap">
+        SELECT id,
+               user_id,
+               status,
+               current_step,
+               max_steps,
+               plan_json::text AS plan_json,
+               snapshot_json::text AS snapshot_json,
+               last_error,
+               ttl_expires_at,
+               started_at,
+               updated_at,
+               completed_at,
+               ext::text AS ext,
+               tool_job_anchor_json::text AS tool_job_anchor_json,
+               0 AS duration_ms,
+               0 AS total_tokens,
+               0 AS tool_calls
+        FROM alphafrog_agent_run
+        WHERE tool_job_anchor_json IS NOT NULL
+          AND tool_job_anchor_json &lt;&gt; '{}'::jsonb
+          AND status = 'RECEIVED'
+          AND tool_job_anchor_json ->> 'finalizerStep' = 'CAS_STATUS'
+          AND (tool_job_anchor_json #>> '{resumeState}' IS NULL
+               OR btrim(tool_job_anchor_json #>> '{resumeState}') = '')
+          AND tool_job_anchor_json ->> 'operationId' IS NOT NULL
+          AND btrim(tool_job_anchor_json ->> 'operationId') &lt;&gt; ''
+          AND tool_job_anchor_json ->> 'toolCallId' IS NOT NULL
+          AND btrim(tool_job_anchor_json ->> 'toolCallId') &lt;&gt; ''
+          AND tool_job_anchor_json ->> 'taskId' IS NOT NULL
+          AND btrim(tool_job_anchor_json ->> 'taskId') &lt;&gt; ''
+          AND CASE WHEN tool_job_anchor_json ->> 'attempt' ~ '^[0-9]{1,10}$'
+                   THEN (tool_job_anchor_json ->> 'attempt')::bigint
+                   ELSE -1 END
+              BETWEEN 1 AND 2147483647
+          AND (
+              tool_job_anchor_json ->> 'resumeLeaseVersion' IS NULL
+              OR btrim(tool_job_anchor_json ->> 'resumeLeaseVersion') = ''
+              OR (
+                  CASE WHEN tool_job_anchor_json ->> 'resumeLeaseVersion' ~ '^[0-9]{1,19}$'
+                       THEN (tool_job_anchor_json ->> 'resumeLeaseVersion')::numeric
+                       ELSE -1 END
+                  BETWEEN 0 AND 9223372036854775806
+              )
+          )
+        ORDER BY updated_at ASC
+        LIMIT #{limit}
+    </select>
+
+    <!--
+        原子推进 CAS_STATUS→RESUME_READY。
+        WHERE 绑定 10 个精确旧值条件；SET 使用 jsonb || 只合并 5 个恢复字段。
+        claimedAt 使用数据库 CURRENT_TIMESTAMP；leaseVersion 在 DB 内自增。
+        只有更新 1 行的实例是胜者，才能写 Redis 并启动 worker。
+    -->
+    <update id="promoteCasStatusToResumeReady">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = tool_job_anchor_json || jsonb_build_object(
+            'resumeState', 'READY',
+            'resumeToken', #{newResumeToken}::text,
+            'resumeLeaseVersion',
+                CASE WHEN tool_job_anchor_json ->> 'resumeLeaseVersion' IS NULL
+                          OR btrim(tool_job_anchor_json ->> 'resumeLeaseVersion') = ''
+                     THEN 1
+                     WHEN CASE WHEN tool_job_anchor_json ->> 'resumeLeaseVersion' ~ '^[0-9]{1,19}$'
+                               THEN (tool_job_anchor_json ->> 'resumeLeaseVersion')::numeric
+                               ELSE -1 END
+                          BETWEEN 0 AND 9223372036854775806
+                     THEN (tool_job_anchor_json ->> 'resumeLeaseVersion')::bigint + 1
+                     ELSE -1 END,
+            'resumeClaimedAt', CURRENT_TIMESTAMP,
+            'finalizerStep', 'RESUME_READY'
+        ),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status = 'RECEIVED'
+          AND tool_job_anchor_json IS NOT NULL
+          AND tool_job_anchor_json ->> 'finalizerStep' = 'CAS_STATUS'
+          AND (tool_job_anchor_json #>> '{resumeState}' IS NULL
+               OR btrim(tool_job_anchor_json #>> '{resumeState}') = '')
+          AND tool_job_anchor_json ->> 'operationId' = #{expectedOperationId}
+          AND tool_job_anchor_json ->> 'toolCallId' = #{expectedToolCallId}
+          AND CASE WHEN tool_job_anchor_json ->> 'attempt' ~ '^[0-9]{1,10}$'
+                   THEN (tool_job_anchor_json ->> 'attempt')::bigint
+                   ELSE -1 END = #{expectedAttempt}
+          AND tool_job_anchor_json ->> 'taskId' = #{expectedTaskId}
+          AND COALESCE(
+                  CASE WHEN tool_job_anchor_json ->> 'resumeLeaseVersion' IS NULL
+                            OR btrim(tool_job_anchor_json ->> 'resumeLeaseVersion') = ''
+                       THEN 0
+                       WHEN tool_job_anchor_json ->> 'resumeLeaseVersion' ~ '^[0-9]{1,19}$'
+                            AND CASE WHEN tool_job_anchor_json ->> 'resumeLeaseVersion' ~ '^[0-9]{1,19}$'
+                                     THEN (tool_job_anchor_json ->> 'resumeLeaseVersion')::numeric
+                                     ELSE -1 END
+                                BETWEEN 0 AND 9223372036854775806
+                       THEN (tool_job_anchor_json ->> 'resumeLeaseVersion')::bigint
+                       ELSE -1 END,
+                  0) = #{expectedResumeLeaseVersion}
+    </update>
+
+    <!--
         恢复租约 CAS：Run 状态、resumeState、resumeToken 和 resumeLeaseVersion 必须全相等。
         任何一个旧 launcher 成功推进后，其余进程的 UPDATE 都返回 0。
     -->
