@@ -25,7 +25,7 @@ public class AgentLangchainHealthController {
     private final LangchainRunConcurrencyScheduler concurrencyScheduler;
     private final LangchainToolConcurrencyThrottle toolThrottle;
 
-    @Value("${agent.langchain.service.version:P0-skeleton}")
+    @Value("${agent.langchain.service.version:UNKNOWN}")
     private String serviceVersion;
 
     @GetMapping("/health")
@@ -33,8 +33,9 @@ public class AgentLangchainHealthController {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("service", "agentLangchainService");
         body.put("version", serviceVersion);
-        body.put("providerEnabled", properties.getProvider().isEnabled());
-        body.put("orchestrationStatus", orchestrator.unimplementedStatus());
+        boolean providerEnabled = properties.getProvider().isEnabled();
+        body.put("providerEnabled", providerEnabled);
+        body.put("orchestrationStatus", orchestrator.orchestrationStatus(providerEnabled));
         body.put("platformSharedLoaded", isClassLoaded(PlatformModuleMarker.class));
         body.put("toolsSharedLoaded", isClassLoaded(ToolRouter.class));
         body.put("status", "UP");

@@ -1,6 +1,5 @@
 package world.willfrog.alphafrogmicro.frontend.service;
 
-import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
@@ -19,15 +18,18 @@ import world.willfrog.alphafrogmicro.agent.idl.AgentRunStatusMessage;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunStatusRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentRunEventsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentRunEventsResponse;
+import world.willfrog.alphafrogmicro.common.agent.AgentRunTerminalStatus;
 import world.willfrog.alphafrogmicro.frontend.model.agent.AgentRunEventResponse;
+import world.willfrog.alphafrogmicro.frontend.service.agent.AgentEventEnvelopeMapper;
+import world.willfrog.alphafrogmicro.frontend.service.agent.AgentExternalObservabilityMapper;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -37,15 +39,14 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * SSE 实时事件流服务 —— 管理 SSE 连接、snapshot/replay、Redis pub/sub、status watcher 和 heartbeat。
+ * SSE 实时事件流服务，统一 snapshot/replay/live schema 并管理连接生命周期。
  *
- * <p>Redis 侧在应用启动时通过 {@link PatternTopic} 订阅一次 {@code agent:events:*}，
- * 连接建立/断开仅维护内存 session 注册表，避免并发 SUB/UNSUB 损坏共享 {@link RedisMessageListenerContainer}。</p>
- *
- * <p>外部 SSE 契约在本服务边界完成规范化：DB/Redis 内部仍传 {@code payloadJson}，
- * 但对前端输出的 {@code agent.event.data.payload} 始终是 JSON object。</p>
+ * <p>连接注册后始终先缓冲 Redis live，首帧 snapshot 发送成功后再执行 replay，最后在同一
+ * 临界区内完成 buffer flush → live 切换。这样 snapshot 与 replay 之间不会丢失、重复或交叉
+ * durable event；seq=0 的 live-only event 仍会送达，但不带 SSE id，也不推进 durable cursor。</p>
  */
 @Service
 @Slf4j
@@ -53,16 +54,11 @@ public class AgentSseService {
 
     static final String REDIS_CHANNEL_PREFIX = "agent:events:";
     private static final String REDIS_PATTERN_TOPIC = REDIS_CHANNEL_PREFIX + "*";
-
     private static final int SNAPSHOT_EVENT_COUNT = 10;
     private static final int REPLAY_PAGE_SIZE = 200;
-    private static final int LIVE_REPLAY_BUFFER_LIMIT = 500;
+    static final int LIVE_REPLAY_BUFFER_LIMIT = 500;
     private static final long HEARTBEAT_INTERVAL_MS = 30_000L;
     private static final long STATUS_WATCH_INTERVAL_MS = 5_000L;
-    private static final TypeReference<Map<String, Object>> MAP_TYPE = new TypeReference<>() {};
-    private static final Set<String> TERMINAL_STATUSES = Set.of(
-            "COMPLETED", "PARTIAL", "FAILED", "CANCELED", "CANCELLED", "EXPIRED", "TIMEOUT", "TIMED_OUT"
-    );
 
     @DubboReference(group = "langchain", check = false)
     private AgentDubboService agentDubboService;
@@ -72,6 +68,18 @@ public class AgentSseService {
     private final RedisMessageListenerContainer redisListenerContainer;
     private final ObjectMapper objectMapper;
 
+    private final ConcurrentHashMap<String, Set<SseSession>> sessionsByRunId = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<SseEmitter, SseSession> emitterSessions = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<SseEmitter, ScheduledFuture<?>> heartbeatTasks = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<SseEmitter, ScheduledFuture<?>> statusTasks = new ConcurrentHashMap<>();
+    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(4, runnable -> {
+        Thread thread = new Thread(runnable, "agent-sse");
+        thread.setDaemon(true);
+        return thread;
+    });
+    private final MessageListener globalRedisListener = this::onRedisMessage;
+    private final AtomicBoolean redisFanoutRegistered = new AtomicBoolean(false);
+
     public AgentSseService(StringRedisTemplate stringRedisTemplate,
                            RedisMessageListenerContainer redisListenerContainer,
                            ObjectMapper objectMapper) {
@@ -79,20 +87,6 @@ public class AgentSseService {
         this.redisListenerContainer = redisListenerContainer;
         this.objectMapper = objectMapper;
     }
-
-    private final ConcurrentHashMap<String, Set<SseSession>> sessionsByRunId = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<SseEmitter, SseSession> emitterSessions = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<SseEmitter, ScheduledFuture<?>> heartbeatTasks = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<SseEmitter, ScheduledFuture<?>> statusTasks = new ConcurrentHashMap<>();
-
-    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(4, r -> {
-        Thread t = new Thread(r, "agent-sse");
-        t.setDaemon(true);
-        return t;
-    });
-
-    private final MessageListener globalRedisListener = this::onRedisMessage;
-    private final AtomicBoolean redisFanoutRegistered = new AtomicBoolean(false);
 
     @PostConstruct
     void initRedisFanoutSubscription() {
@@ -103,41 +97,34 @@ public class AgentSseService {
         log.info("Agent SSE Redis fan-out subscribed: pattern={}", REDIS_PATTERN_TOPIC);
     }
 
-    /**
-     * 建立 SSE 连接。
-     *
-     * <p>无恢复 cursor 时发送 snapshot；有 cursor 时先 replay {@code seq > resumeAfterSeq}
-     * 的 durable DB event，再进入 live 模式。session 会先注册并在 replay 期间缓冲 live
-     * event，减少补发窗口里的丢失风险。</p>
-     */
+    /** 兼容旧调用面；普通用户 snapshot 使用严格 {@code View.PLAN}。 */
     public void connect(String runId, String userId, Integer resumeAfterSeq, SseEmitter emitter) {
-        int safeResumeAfterSeq = resumeAfterSeq == null ? 0 : Math.max(0, resumeAfterSeq);
-        AtomicBoolean replaying = new AtomicBoolean(safeResumeAfterSeq > 0);
-        List<Map<String, Object>> liveBuffer = new ArrayList<>();
-        AtomicBoolean overflow = new AtomicBoolean(false);
-        AtomicBoolean doneSent = new AtomicBoolean(false);
-        StatusState statusState = new StatusState();
+        connect(runId, userId, false, resumeAfterSeq, emitter);
+    }
 
-        SseSession session = new SseSession(
-                runId, userId, emitter, replaying, liveBuffer, overflow, doneSent, statusState);
+    /** 建立 snapshot-first SSE 连接。 */
+    public void connect(String runId, String userId, boolean admin,
+                        Integer resumeAfterSeq, SseEmitter emitter) {
+        int safeResumeAfterSeq = resumeAfterSeq == null ? 0 : Math.max(0, resumeAfterSeq);
+        SseSession session = new SseSession(runId, userId, emitter);
         registerSession(session);
+        registerEmitterCallbacks(session);
 
         try {
+            SnapshotData snapshotData = buildSnapshot(runId, userId, admin, safeResumeAfterSeq);
+            session.lastDurableSeq.set(snapshotData.lastSeq());
+            sendJsonEvent(emitter, SseEmitter.event().name("snapshot"), snapshotData.snapshot());
+            emitRunStatus(session, snapshotData.status());
+
+            int replayMaxSeq = snapshotData.lastSeq();
             if (safeResumeAfterSeq > 0) {
-                int replayMaxSeq = replayEvents(runId, userId, safeResumeAfterSeq, emitter);
-                replaying.set(false);
-                flushLiveBuffer(emitter, liveBuffer, replayMaxSeq);
-                if (overflow.get()) {
-                    sendErrorAndClose(emitter, "LIVE_REPLAY_BUFFER_OVERFLOW",
-                            "SSE live buffer overflow; please repair via REST events");
-                    cleanup(emitter);
-                    return;
-                }
-            } else {
-                SnapshotData snapshotData = buildSnapshot(runId, userId);
-                sendJsonEvent(emitter, SseEmitter.event().name("snapshot"), snapshotData.snapshot());
-                emitRunStatus(emitter, runId, snapshotData.status(), statusState);
-                emitRunDoneIfTerminal(emitter, runId, snapshotData.status(), doneSent);
+                replayMaxSeq = replayEvents(session, snapshotData.lastSeq());
+            }
+            if (!session.finishInitialization(replayMaxSeq)) {
+                return;
+            }
+            if (emitRunDoneIfTerminal(session, snapshotData.status())) {
+                return;
             }
         } catch (Exception e) {
             log.warn("SSE initialization failed for runId={}, sending error and closing", runId, e);
@@ -146,44 +133,53 @@ public class AgentSseService {
             return;
         }
 
+        scheduleHeartbeat(session);
+        scheduleStatusWatcher(session);
+        log.info("SSE connected for runId={}, resumeAfterSeq={}", runId, safeResumeAfterSeq);
+    }
+
+    private void registerEmitterCallbacks(SseSession session) {
+        session.emitter.onCompletion(() -> {
+            log.debug("SSE completed for runId={}", session.runId);
+            cleanup(session.emitter);
+        });
+        session.emitter.onError(error -> {
+            log.debug("SSE error for runId={}: {}", session.runId, error.getMessage());
+            cleanup(session.emitter);
+        });
+        session.emitter.onTimeout(() -> {
+            log.debug("SSE timeout for runId={}", session.runId);
+            cleanup(session.emitter);
+        });
+    }
+
+    private void scheduleHeartbeat(SseSession session) {
         ScheduledFuture<?> heartbeat = scheduler.scheduleWithFixedDelay(() -> {
-            Map<String, Object> hb = new LinkedHashMap<>();
-            hb.put("type", "heartbeat");
-            hb.put("runId", runId);
-            hb.put("ts", System.currentTimeMillis());
+            Map<String, Object> payload = new LinkedHashMap<>();
+            payload.put("type", "heartbeat");
+            payload.put("runId", session.runId);
+            payload.put("ts", System.currentTimeMillis());
             try {
-                sendJsonEvent(emitter, SseEmitter.event().name("heartbeat"), hb);
+                sendJsonEvent(session.emitter, SseEmitter.event().name("heartbeat"), payload);
             } catch (Exception e) {
-                log.debug("SSE heartbeat failed for runId={}, likely client disconnected", runId);
+                log.debug("SSE heartbeat failed for runId={}, closing session", session.runId);
+                cleanup(session.emitter);
             }
         }, HEARTBEAT_INTERVAL_MS, HEARTBEAT_INTERVAL_MS, TimeUnit.MILLISECONDS);
-        heartbeatTasks.put(emitter, heartbeat);
+        heartbeatTasks.put(session.emitter, heartbeat);
+    }
 
-        ScheduledFuture<?> statusWatcher = scheduler.scheduleWithFixedDelay(() -> {
+    private void scheduleStatusWatcher(SseSession session) {
+        ScheduledFuture<?> watcher = scheduler.scheduleWithFixedDelay(() -> {
             try {
-                AgentRunStatusMessage status = loadStatus(runId, userId);
-                emitRunStatusIfChanged(emitter, runId, status, statusState);
-                emitRunDoneIfTerminal(emitter, runId, status, doneSent);
+                AgentRunStatusMessage status = loadStatus(session.runId, session.userId);
+                emitRunStatusIfChanged(session, status);
+                emitRunDoneIfTerminal(session, status);
             } catch (Exception e) {
-                log.debug("SSE status watcher failed for runId={}: {}", runId, e.getMessage());
+                log.debug("SSE status watcher failed for runId={}: {}", session.runId, e.getMessage());
             }
         }, STATUS_WATCH_INTERVAL_MS, STATUS_WATCH_INTERVAL_MS, TimeUnit.MILLISECONDS);
-        statusTasks.put(emitter, statusWatcher);
-
-        emitter.onCompletion(() -> {
-            log.debug("SSE completed for runId={}", runId);
-            cleanup(emitter);
-        });
-        emitter.onError(ex -> {
-            log.debug("SSE error for runId={}: {}", runId, ex.getMessage());
-            cleanup(emitter);
-        });
-        emitter.onTimeout(() -> {
-            log.debug("SSE timeout for runId={}", runId);
-            cleanup(emitter);
-        });
-
-        log.info("SSE connected for runId={}, resumeAfterSeq={}", runId, safeResumeAfterSeq);
+        statusTasks.put(session.emitter, watcher);
     }
 
     void onRedisMessage(Message message, byte[] pattern) {
@@ -195,11 +191,16 @@ public class AgentSseService {
         if (sessions == null || sessions.isEmpty()) {
             return;
         }
-        Map<String, Object> normalized;
+        AgentRunEventResponse normalized;
         try {
-            normalized = normalizeEnvelopeJson(new String(message.getBody(), StandardCharsets.UTF_8));
+            normalized = AgentEventEnvelopeMapper.fromRedisEnvelope(
+                    objectMapper, new String(message.getBody(), StandardCharsets.UTF_8));
         } catch (Exception e) {
             log.debug("Ignore invalid Redis envelope for runId={}: {}", runId, e.getMessage());
+            return;
+        }
+        if (!runId.equals(normalized.runId())) {
+            log.warn("Ignore Redis envelope with mismatched runId: channel={}, envelope={}", runId, normalized.runId());
             return;
         }
         for (SseSession session : sessions) {
@@ -228,11 +229,11 @@ public class AgentSseService {
             return;
         }
         emitterSessions.remove(session.emitter, session);
-        Set<SseSession> runSessions = sessionsByRunId.get(session.runId);
-        if (runSessions != null) {
-            runSessions.remove(session);
-            if (runSessions.isEmpty()) {
-                sessionsByRunId.remove(session.runId, runSessions);
+        Set<SseSession> sessions = sessionsByRunId.get(session.runId);
+        if (sessions != null) {
+            sessions.remove(session);
+            if (sessions.isEmpty()) {
+                sessionsByRunId.remove(session.runId, sessions);
             }
         }
     }
@@ -241,133 +242,187 @@ public class AgentSseService {
         private final String runId;
         private final String userId;
         private final SseEmitter emitter;
-        private final AtomicBoolean replaying;
-        private final List<Map<String, Object>> liveBuffer;
-        private final AtomicBoolean overflow;
-        private final AtomicBoolean doneSent;
-        private final StatusState statusState;
+        private final Object bufferLock = new Object();
+        private final List<AgentRunEventResponse> liveBuffer = new ArrayList<>();
+        private final AtomicBoolean doneSent = new AtomicBoolean(false);
+        private final AtomicInteger lastDurableSeq = new AtomicInteger(0);
+        private final StatusState statusState = new StatusState();
+        private boolean initializing = true;
+        private boolean overflow;
+        private boolean overflowClosed;
 
-        private SseSession(String runId,
-                           String userId,
-                           SseEmitter emitter,
-                           AtomicBoolean replaying,
-                           List<Map<String, Object>> liveBuffer,
-                           AtomicBoolean overflow,
-                           AtomicBoolean doneSent,
-                           StatusState statusState) {
+        private SseSession(String runId, String userId, SseEmitter emitter) {
             this.runId = runId;
             this.userId = userId;
             this.emitter = emitter;
-            this.replaying = replaying;
-            this.liveBuffer = liveBuffer;
-            this.overflow = overflow;
-            this.doneSent = doneSent;
-            this.statusState = statusState;
         }
 
-        void dispatchRedisMessage(Map<String, Object> normalized) {
-            try {
-                synchronized (liveBuffer) {
-                    if (replaying.get()) {
-                        if (liveBuffer.size() >= LIVE_REPLAY_BUFFER_LIMIT) {
-                            overflow.set(true);
-                        } else {
-                            liveBuffer.add(normalized);
+        void dispatchRedisMessage(AgentRunEventResponse event) {
+            boolean closeForOverflow = false;
+            boolean sendDirect = false;
+            synchronized (bufferLock) {
+                if (initializing) {
+                    if (liveBuffer.size() >= LIVE_REPLAY_BUFFER_LIMIT) {
+                        if (!overflow) {
+                            overflow = true;
+                            overflowClosed = true;
+                            closeForOverflow = true;
                         }
-                        return;
+                    } else if (!overflow) {
+                        liveBuffer.add(event);
+                    }
+                } else {
+                    sendDirect = true;
+                }
+            }
+            if (closeForOverflow) {
+                sendErrorAndClose(emitter, "LIVE_REPLAY_BUFFER_OVERFLOW",
+                        "SSE live buffer overflow; please repair via REST events");
+                cleanup(emitter);
+                return;
+            }
+            if (sendDirect) {
+                try {
+                    sendAgentEvent(this, event);
+                } catch (Exception e) {
+                    log.debug("SSE live event send failed for runId={}, closing session: {}",
+                            runId, e.getMessage());
+                    cleanup(emitter);
+                }
+            }
+        }
+
+        /** 原子完成 replay → buffered live → direct live 切换。 */
+        boolean finishInitialization(int replayAfterSeq) {
+            int cursor = Math.max(lastDurableSeq.get(), replayAfterSeq);
+            Set<String> sentIdentities = new HashSet<>();
+            while (true) {
+                List<AgentRunEventResponse> buffered;
+                synchronized (bufferLock) {
+                    if (overflow) {
+                        initializing = false;
+                        if (!overflowClosed) {
+                            overflowClosed = true;
+                            sendErrorAndClose(emitter, "LIVE_REPLAY_BUFFER_OVERFLOW",
+                                    "SSE live buffer overflow; please repair via REST events");
+                        }
+                        cleanup(emitter);
+                        return false;
+                    }
+                    if (liveBuffer.isEmpty()) {
+                        lastDurableSeq.accumulateAndGet(cursor, Math::max);
+                        initializing = false;
+                        return true;
+                    }
+                    buffered = new ArrayList<>(liveBuffer);
+                    liveBuffer.clear();
+                }
+
+                List<AgentRunEventResponse> durableEvents = buffered.stream()
+                        .filter(AgentRunEventResponse::durable)
+                        .sorted(Comparator.comparingInt(AgentRunEventResponse::seq))
+                        .toList();
+                for (AgentRunEventResponse event : durableEvents) {
+                    String identity = event.runId() + ":" + event.seq();
+                    if (event.seq() <= cursor || !sentIdentities.add(identity)) {
+                        continue;
+                    }
+                    sendAgentEvent(this, event);
+                    cursor = Math.max(cursor, event.seq());
+                }
+                for (AgentRunEventResponse event : buffered) {
+                    if (!event.durable()) {
+                        sendAgentEvent(this, event);
                     }
                 }
-                sendAgentEvent(emitter, normalized);
-            } catch (Exception e) {
-                log.debug("SSE live event send failed for runId={}, likely client disconnected: {}",
-                        runId, e.getMessage());
             }
         }
     }
 
-    private int replayEvents(String runId, String userId, int afterSeq, SseEmitter emitter) {
+    private int replayEvents(SseSession session, int afterSeq) {
         int cursor = afterSeq;
-        int replayMaxSeq = afterSeq;
         while (true) {
             ListAgentRunEventsResponse page = agentDubboService.listEvents(
                     ListAgentRunEventsRequest.newBuilder()
-                            .setUserId(userId)
-                            .setId(runId)
+                            .setUserId(session.userId)
+                            .setId(session.runId)
                             .setAfterSeq(cursor)
                             .setLimit(REPLAY_PAGE_SIZE)
                             .build());
-            int maxSeqInPage = cursor;
-            for (AgentRunEventMessage event : page.getItemsList()) {
-                Map<String, Object> normalized = normalizeEventMessage(event);
-                sendAgentEvent(emitter, normalized);
-                maxSeqInPage = Math.max(maxSeqInPage, event.getSeq());
-                replayMaxSeq = Math.max(replayMaxSeq, event.getSeq());
+            List<AgentRunEventResponse> events = page.getItemsList().stream()
+                    .map(event -> AgentEventEnvelopeMapper.fromEventMessage(objectMapper, event))
+                    .sorted(Comparator.comparingInt(AgentRunEventResponse::seq))
+                    .toList();
+            int confirmedCursor = cursor;
+            for (AgentRunEventResponse event : events) {
+                if (event.seq() <= confirmedCursor) {
+                    continue;
+                }
+                sendAgentEvent(session, event);
+                confirmedCursor = event.seq();
             }
-            if (!page.getHasMore() || page.getNextAfterSeq() <= cursor || page.getItemsCount() == 0) {
-                break;
+            session.lastDurableSeq.accumulateAndGet(confirmedCursor, Math::max);
+            if (!page.getHasMore() || page.getItemsCount() == 0) {
+                return confirmedCursor;
             }
-            cursor = Math.max(page.getNextAfterSeq(), maxSeqInPage);
-        }
-        return replayMaxSeq;
-    }
-
-    private void flushLiveBuffer(SseEmitter emitter, List<Map<String, Object>> liveBuffer, int replayAfterSeq) {
-        List<Map<String, Object>> buffered;
-        synchronized (liveBuffer) {
-            buffered = new ArrayList<>(liveBuffer);
-            liveBuffer.clear();
-        }
-        buffered.sort(Comparator.comparingInt(AgentSseService.this::seqOf));
-        int lastSentSeq = replayAfterSeq;
-        for (Map<String, Object> event : buffered) {
-            int seq = seqOf(event);
-            if (seq <= lastSentSeq) {
-                continue;
+            int nextCursor = Math.max(confirmedCursor, page.getNextAfterSeq());
+            if (nextCursor <= cursor) {
+                throw new IllegalStateException("Agent event replay cursor did not advance");
             }
-            sendAgentEvent(emitter, event);
-            lastSentSeq = seq;
+            cursor = nextCursor;
         }
     }
 
-    private SnapshotData buildSnapshot(String runId, String userId) {
+    private SnapshotData buildSnapshot(String runId, String userId, boolean admin, int resumeAfterSeq) {
         Map<String, Object> snapshot = new LinkedHashMap<>();
         snapshot.put("type", "snapshot");
+        snapshot.put("schemaVersion", AgentEventEnvelopeMapper.SCHEMA_VERSION);
         snapshot.put("runId", runId);
         snapshot.put("ts", System.currentTimeMillis());
 
-        AgentRunStatusMessage statusMsg = loadStatus(runId, userId);
-        snapshot.put("status", emptyToNull(statusMsg.getStatus()));
-        snapshot.put("phase", emptyToNull(statusMsg.getPhase()));
-        snapshot.put("startedAtMs", statusMsg.getStartedAtMs() > 0 ? statusMsg.getStartedAtMs() : null);
-        snapshot.put("completedAtMs", statusMsg.getCompletedAtMs() > 0 ? statusMsg.getCompletedAtMs() : null);
+        AgentRunStatusMessage status = loadStatus(runId, userId);
+        snapshot.put("status", AgentRunTerminalStatus.normalize(status.getStatus()));
+        snapshot.put("phase", emptyToNull(status.getPhase()));
+        snapshot.put("startedAtMs", status.getStartedAtMs() > 0 ? status.getStartedAtMs() : null);
+        snapshot.put("completedAtMs", status.getCompletedAtMs() > 0 ? status.getCompletedAtMs() : null);
 
-        String planJson = statusMsg.getPlanJson();
+        String planJson = status.getPlanJson();
         if (planJson != null && !planJson.isBlank()) {
-            snapshot.put("plan", parseJsonOrNull(planJson));
+            AgentExternalObservabilityMapper.View view = admin
+                    ? AgentExternalObservabilityMapper.View.ADMIN
+                    : AgentExternalObservabilityMapper.View.PLAN;
+            snapshot.put("plan", AgentExternalObservabilityMapper.parse(objectMapper, planJson, view));
         }
 
-        List<AgentRunEventResponse> recentEvents = new ArrayList<>();
-        ListAgentRunEventsResponse eventsResp = agentDubboService.listEvents(
+        ListAgentRunEventsResponse response = agentDubboService.listEvents(
                 ListAgentRunEventsRequest.newBuilder()
                         .setUserId(userId)
                         .setId(runId)
                         .setLimit(Math.max(1, SNAPSHOT_EVENT_COUNT))
                         .setLatest(true)
                         .build());
-        for (var e : eventsResp.getItemsList()) {
-            recentEvents.add(new AgentRunEventResponse(
-                    e.getId(), e.getRunId(), e.getSeq(), e.getEventType(),
-                    parsePayloadObject(e.getPayloadJson()), e.getCreatedAt()));
+        int serverLastSeq = 0;
+        for (AgentRunEventMessage event : response.getItemsList()) {
+            serverLastSeq = Math.max(serverLastSeq, event.getSeq());
         }
+        int confirmedResumeAfterSeq = Math.min(resumeAfterSeq, serverLastSeq);
+        List<AgentRunEventResponse> recentEvents = new ArrayList<>();
+        for (AgentRunEventMessage event : response.getItemsList()) {
+            if (confirmedResumeAfterSeq > 0 && event.getSeq() > confirmedResumeAfterSeq) {
+                continue;
+            }
+            recentEvents.add(AgentEventEnvelopeMapper.fromEventMessage(objectMapper, event));
+        }
+        recentEvents.sort(Comparator.comparingInt(AgentRunEventResponse::seq));
         snapshot.put("events", recentEvents);
-        snapshot.put("eventCount", recentEvents.size());
+        snapshot.put("eventCount", Math.max(0, status.getEventCount()));
 
-        int maxSeq = Math.max(0, statusMsg.getEventCount());
+        int lastSeq = confirmedResumeAfterSeq;
         for (AgentRunEventResponse event : recentEvents) {
-            maxSeq = Math.max(maxSeq, event.seq());
+            lastSeq = Math.max(lastSeq, event.seq());
         }
-        snapshot.put("lastSeq", maxSeq);
-        return new SnapshotData(snapshot, statusMsg);
+        snapshot.put("lastSeq", lastSeq);
+        return new SnapshotData(snapshot, status, lastSeq);
     }
 
     private AgentRunStatusMessage loadStatus(String runId, String userId) {
@@ -376,76 +431,75 @@ public class AgentSseService {
     }
 
     Map<String, Object> normalizeEnvelopeJson(String envelopeJson) {
-        Map<String, Object> envelope;
-        try {
-            envelope = objectMapper.readValue(envelopeJson, MAP_TYPE);
-        } catch (Exception e) {
-            throw new IllegalArgumentException("Invalid agent event envelope JSON", e);
-        }
-        Map<String, Object> normalized = new LinkedHashMap<>();
-        normalized.put("type", "agent.event");
-        normalized.put("runId", strVal(envelope.get("runId")));
-        normalized.put("seq", intVal(envelope.get("seq")));
-        normalized.put("eventType", strVal(envelope.get("eventType")));
-        normalized.put("payload", parsePayloadObject(strVal(envelope.get("payloadJson"))));
-        normalized.put("createdAt", emptyToNull(strVal(envelope.get("createdAt"))));
-        normalized.put("ts", System.currentTimeMillis());
-        return normalized;
+        return AgentEventEnvelopeMapper.fromRedisEnvelope(objectMapper, envelopeJson).toWireMap();
     }
 
     Map<String, Object> normalizeEventMessage(AgentRunEventMessage event) {
-        Map<String, Object> normalized = new LinkedHashMap<>();
-        normalized.put("type", "agent.event");
-        normalized.put("runId", event.getRunId());
-        normalized.put("seq", event.getSeq());
-        normalized.put("eventType", event.getEventType());
-        normalized.put("payload", parsePayloadObject(event.getPayloadJson()));
-        normalized.put("createdAt", emptyToNull(event.getCreatedAt()));
-        normalized.put("ts", System.currentTimeMillis());
-        return normalized;
+        return AgentEventEnvelopeMapper.fromEventMessage(objectMapper, event).toWireMap();
     }
 
-    private void sendAgentEvent(SseEmitter emitter, Map<String, Object> event) {
-        sendJsonEvent(emitter, SseEmitter.event()
-                .name("agent.event")
-                .id(String.valueOf(seqOf(event))), event);
+    private void sendAgentEvent(SseSession session, AgentRunEventResponse event) {
+        SseEmitter.SseEventBuilder builder = SseEmitter.event().name("agent.event");
+        if (event.durable() && event.seq() >= 1) {
+            builder.id(String.valueOf(event.seq()));
+        }
+        sendJsonEvent(session.emitter, builder, event.toWireMap());
+        if (event.durable() && event.seq() >= 1) {
+            session.lastDurableSeq.accumulateAndGet(event.seq(), Math::max);
+        }
     }
 
-    private void emitRunStatus(SseEmitter emitter, String runId, AgentRunStatusMessage status, StatusState state) {
-        state.status = emptyToNull(status.getStatus());
-        state.phase = emptyToNull(status.getPhase());
-        sendJsonEvent(emitter, SseEmitter.event().name("run.status"), statusPayload(runId, status));
+    private void emitRunStatus(SseSession session, AgentRunStatusMessage status) {
+        session.statusState.status = AgentRunTerminalStatus.normalize(status.getStatus());
+        session.statusState.phase = emptyToNull(status.getPhase());
+        sendJsonEvent(session.emitter, SseEmitter.event().name("run.status"), statusPayload(session, status));
     }
 
-    private void emitRunStatusIfChanged(SseEmitter emitter, String runId,
-                                        AgentRunStatusMessage status, StatusState state) {
-        String statusValue = emptyToNull(status.getStatus());
+    private void emitRunStatusIfChanged(SseSession session, AgentRunStatusMessage status) {
+        String statusValue = AgentRunTerminalStatus.normalize(status.getStatus());
         String phaseValue = emptyToNull(status.getPhase());
-        if (equalsNullable(statusValue, state.status) && equalsNullable(phaseValue, state.phase)) {
+        if (equalsNullable(statusValue, session.statusState.status)
+                && equalsNullable(phaseValue, session.statusState.phase)) {
             return;
         }
-        state.status = statusValue;
-        state.phase = phaseValue;
-        sendJsonEvent(emitter, SseEmitter.event().name("run.status"), statusPayload(runId, status));
+        session.statusState.status = statusValue;
+        session.statusState.phase = phaseValue;
+        sendJsonEvent(session.emitter, SseEmitter.event().name("run.status"), statusPayload(session, status));
     }
 
-    private void emitRunDoneIfTerminal(SseEmitter emitter, String runId,
-                                       AgentRunStatusMessage status, AtomicBoolean doneSent) {
-        if (!isTerminalStatus(status.getStatus()) || !doneSent.compareAndSet(false, true)) {
-            return;
+    /**
+     * 终态成功发送后立即 complete + cleanup；发送失败也 fail-closed 关闭，不创建新 watcher。
+     */
+    private boolean emitRunDoneIfTerminal(SseSession session, AgentRunStatusMessage status) {
+        String terminalStatus = AgentRunTerminalStatus.normalize(status.getStatus());
+        if (!AgentRunTerminalStatus.isTerminal(terminalStatus)) {
+            return false;
         }
-        Map<String, Object> payload = statusPayload(runId, status);
-        payload.put("type", "run.done");
-        sendJsonEvent(emitter, SseEmitter.event().name("run.done"), payload);
+        if (!session.doneSent.compareAndSet(false, true)) {
+            return true;
+        }
+        try {
+            Map<String, Object> payload = statusPayload(session, status);
+            payload.put("type", "run.done");
+            payload.put("status", terminalStatus);
+            sendJsonEvent(session.emitter, SseEmitter.event().name("run.done"), payload);
+            session.emitter.complete();
+        } catch (Exception e) {
+            log.warn("SSE run.done send failed for runId={}, closing stream: {}", session.runId, e.getMessage());
+            sendErrorAndClose(session.emitter, "RUN_DONE_SEND_FAILED", "run.done 发送失败");
+        } finally {
+            cleanup(session.emitter);
+        }
+        return true;
     }
 
-    private Map<String, Object> statusPayload(String runId, AgentRunStatusMessage status) {
+    private Map<String, Object> statusPayload(SseSession session, AgentRunStatusMessage status) {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("type", "run.status");
-        payload.put("runId", runId);
-        payload.put("status", emptyToNull(status.getStatus()));
+        payload.put("runId", session.runId);
+        payload.put("status", AgentRunTerminalStatus.normalize(status.getStatus()));
         payload.put("phase", emptyToNull(status.getPhase()));
-        payload.put("lastSeq", Math.max(0, status.getEventCount()));
+        payload.put("lastSeq", Math.max(0, session.lastDurableSeq.get()));
         payload.put("startedAtMs", status.getStartedAtMs() > 0 ? status.getStartedAtMs() : null);
         payload.put("completedAtMs", status.getCompletedAtMs() > 0 ? status.getCompletedAtMs() : null);
         payload.put("ts", System.currentTimeMillis());
@@ -453,7 +507,7 @@ public class AgentSseService {
     }
 
     boolean isTerminalStatus(String status) {
-        return status != null && TERMINAL_STATUSES.contains(status.trim().toUpperCase(Locale.ROOT));
+        return AgentRunTerminalStatus.isTerminal(status);
     }
 
     private void sendJsonEvent(SseEmitter emitter, SseEmitter.SseEventBuilder builder, Object data) {
@@ -482,81 +536,32 @@ public class AgentSseService {
         }
     }
 
-    @PreDestroy
-    public void shutdown() {
-        scheduler.shutdownNow();
-    }
-
     private void cleanup(SseEmitter emitter) {
         ScheduledFuture<?> heartbeat = heartbeatTasks.remove(emitter);
         if (heartbeat != null) {
             heartbeat.cancel(false);
         }
-        ScheduledFuture<?> statusWatcher = statusTasks.remove(emitter);
-        if (statusWatcher != null) {
-            statusWatcher.cancel(false);
+        ScheduledFuture<?> watcher = statusTasks.remove(emitter);
+        if (watcher != null) {
+            watcher.cancel(false);
         }
-        SseSession session = emitterSessions.remove(emitter);
-        unregisterSession(session);
+        unregisterSession(emitterSessions.get(emitter));
     }
 
-    private Object parseJsonOrNull(String json) {
-        if (json == null || json.isBlank()) {
-            return null;
-        }
-        try {
-            return objectMapper.readValue(json, Object.class);
-        } catch (Exception e) {
-            return json;
-        }
+    @PreDestroy
+    public void shutdown() {
+        scheduler.shutdownNow();
     }
 
-    @SuppressWarnings("unchecked")
-    private Map<String, Object> parsePayloadObject(String json) {
-        Object value = parseJsonOrNull(json);
-        if (value instanceof Map<?, ?> map) {
-            Map<String, Object> result = new LinkedHashMap<>();
-            map.forEach((k, v) -> result.put(String.valueOf(k), v));
-            return result;
-        }
-        Map<String, Object> result = new LinkedHashMap<>();
-        if (value != null) {
-            result.put("value", value);
-        }
-        return result;
-    }
-
-    private int seqOf(Map<String, Object> event) {
-        return intVal(event.get("seq"));
-    }
-
-    private int intVal(Object value) {
-        if (value instanceof Number number) {
-            return number.intValue();
-        }
-        if (value == null) {
-            return 0;
-        }
-        try {
-            return Integer.parseInt(String.valueOf(value));
-        } catch (NumberFormatException e) {
-            return 0;
-        }
-    }
-
-    private String strVal(Object value) {
-        return value == null ? "" : String.valueOf(value);
-    }
-
-    private String emptyToNull(String value) {
+    private static String emptyToNull(String value) {
         return value == null || value.isBlank() ? null : value;
     }
 
-    private boolean equalsNullable(String left, String right) {
+    private static boolean equalsNullable(String left, String right) {
         return left == null ? right == null : left.equals(right);
     }
 
-    private record SnapshotData(Map<String, Object> snapshot, AgentRunStatusMessage status) {
+    private record SnapshotData(Map<String, Object> snapshot, AgentRunStatusMessage status, int lastSeq) {
     }
 
     private static final class StatusState {

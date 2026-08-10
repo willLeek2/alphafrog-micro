@@ -11,6 +11,7 @@ import world.willfrog.agentlangchain.config.LangchainRunExecutorLimits;
 import world.willfrog.agentlangchain.config.LangchainRunExecutorLimitsResolver;
 
 import java.util.ArrayDeque;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Queue;
 import java.util.UUID;
@@ -342,19 +343,20 @@ public class LangchainRunConcurrencyScheduler {
         long oldestAgeMs = oldestQueuedAtMillis > 0
                 ? System.currentTimeMillis() - oldestQueuedAtMillis
                 : 0;
-        return Map.ofEntries(
-                Map.entry("instanceId", instanceId),
-                Map.entry("running", running),
-                Map.entry("queued", reservedQueued),
-                Map.entry("rejectedTotal", rejectedCount.get()),
-                Map.entry("corePoolSize", current.getCorePoolSize()),
-                Map.entry("maxPoolSize", current.getMaxPoolSize()),
-                Map.entry("queueCapacity", current.getQueueCapacity()),
-                Map.entry("hardCorePoolSize", hard.getCorePoolSize()),
-                Map.entry("hardMaxPoolSize", hard.getMaxPoolSize()),
-                Map.entry("hardQueueCapacity", hard.getQueueCapacity()),
-                Map.entry("oldestQueuedAgeMs", oldestAgeMs)
-        );
+        Map<String, Object> snap = new LinkedHashMap<>();
+        snap.put("instanceId", instanceId);
+        snap.put("running", running);
+        snap.put("queued", reservedQueued);
+        snap.put("rejectedTotal", rejectedCount.get());
+        snap.put("corePoolSize", current.getCorePoolSize());
+        snap.put("maxPoolSize", current.getMaxPoolSize());
+        snap.put("queueCapacity", current.getQueueCapacity());
+        snap.put("hardCorePoolSize", hard.getCorePoolSize());
+        snap.put("hardMaxPoolSize", hard.getMaxPoolSize());
+        snap.put("hardQueueCapacity", hard.getQueueCapacity());
+        snap.put("oldestQueuedAgeMs", oldestAgeMs);
+        snap.put("hardVsEffectiveGap", limitsResolver.getHardVersusEffectiveGap());
+        return snap;
     }
 
     @Scheduled(fixedDelayString = "${agent.langchain.run.executor.diag-interval-ms:30000}")

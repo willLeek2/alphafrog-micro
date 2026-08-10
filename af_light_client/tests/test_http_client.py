@@ -383,6 +383,19 @@ class AgentHttpClientRestPullTest(unittest.TestCase):
         self.assertEqual(payload, {"items": []})
         self.assertEqual(req.call_args.kwargs["params"], {"after_seq": 7, "limit": 500})
 
+    def test_stream_events_explicit_resume_cursor_is_added_before_token(self) -> None:
+        client = self._client()
+        response = MagicMock()
+        response.status_code = 200
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        response.iter_lines.return_value = iter(["event: snapshot", "data: {}", ""])
+        with patch.object(client.session, "get", return_value=response) as request:
+            list(client.stream_events("/runs/{run_id}/stream", "run-1", after_seq=17))
+        url = request.call_args.args[0]
+        self.assertIn("after_seq=17", url)
+        self.assertIn("token=tok", url)
+
     def test_get_timeline_uses_after_seq_and_limit(self) -> None:
         client = self._client()
         ok = _mock_response(200, json_payload={"data": {"items": []}})

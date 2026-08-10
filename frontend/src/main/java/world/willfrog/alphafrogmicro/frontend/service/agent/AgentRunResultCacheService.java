@@ -22,10 +22,7 @@ public class AgentRunResultCacheService {
     @Value("${agent.run-result.cache-ttl-seconds:30}")
     private long cacheTtlSeconds;
 
-    public AgentRunResultMessage getRunResult(String userId, String runId) {
-        return getRunResult(userId, runId, false);
-    }
-
+    /** Role is an explicit part of both the upstream authorization request and the cache key. */
     public AgentRunResultMessage getRunResult(String userId, String runId, boolean isAdmin) {
         if (userId == null || userId.isBlank() || runId == null || runId.isBlank()) {
             throw new IllegalArgumentException("userId and runId are required");

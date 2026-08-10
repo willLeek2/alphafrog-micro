@@ -12,3 +12,4 @@ nav:
       - 查询与观测接口: agent-run/reads-and-observability.md
       - 产物、反馈与追问: agent-run/artifacts-feedback-messages.md
       - 错误与脚本覆盖: agent-run/errors-and-script-coverage.md
+  - 工程诚实度清单: agent-framework/honesty-matrix.md

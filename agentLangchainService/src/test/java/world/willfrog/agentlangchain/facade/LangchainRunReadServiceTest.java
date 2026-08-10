@@ -20,7 +20,6 @@ import world.willfrog.agent.platform.service.AgentRunCreditQueryService;
 import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agent.platform.service.SnapshotPartService;
-import world.willfrog.agentlangchain.routing.LangchainSingleWriterGuard;
 import world.willfrog.agentlangchain.tools.LangchainToolCatalogService;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilityContractFixtures;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilityQuery;
@@ -52,7 +51,6 @@ class LangchainRunReadServiceTest {
     private final AgentMessageService messageService = mock(AgentMessageService.class);
     private final SnapshotPartService snapshotPartService = mock(SnapshotPartService.class);
     private final LangchainToolCatalogService toolCatalogService = mock(LangchainToolCatalogService.class);
-    private final LangchainSingleWriterGuard guard = new LangchainSingleWriterGuard();
     private final AgentArtifactService artifactService = mock(AgentArtifactService.class);
     private final DataAnalysisObservabilityQuery dataAnalysisQuery = mock(DataAnalysisObservabilityQuery.class);
     private final DataAnalysisReadResponseSerializer dataAnalysisSerializer = new DataAnalysisReadResponseSerializer(new ObjectMapper());
@@ -71,7 +69,6 @@ class LangchainRunReadServiceTest {
             messageService,
             snapshotPartService,
             toolCatalogService,
-            guard,
             artifactService,
             new ObjectMapper(),
             dataAnalysisQuery,
@@ -84,7 +81,7 @@ class LangchainRunReadServiceTest {
     }
 
     @Test
-    void getRunAllowsExistingRunWithoutOwnerMarker() {
+    void getRunAllowsExistingUserScopedRun() {
         AgentRun run = run("{\"run_provider\":\"legacy\"}");
         when(runMapper.findByIdAndUser("r1", "u1")).thenReturn(run);
 

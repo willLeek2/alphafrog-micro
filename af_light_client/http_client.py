@@ -209,10 +209,13 @@ class AgentHttpClient:
         except Exception as exc:  # best-effort on Ctrl+C
             self.warnings.add(f"cancel failed: {exc}")
 
-    def stream_events(self, template: str, run_id: str) -> Iterator[SseFrame]:
+    def stream_events(self, template: str, run_id: str, *, after_seq: int = 0) -> Iterator[SseFrame]:
         path = template.format(run_id=run_id)
         token = normalize_bearer(self.token)
         sep = "&" if "?" in path else "?"
+        if after_seq > 0:
+            path = f"{path}{sep}after_seq={int(after_seq)}"
+            sep = "&"
         path = f"{path}{sep}token={quote(token, safe='')}" if token else path
         url = self._url(path)
         headers = {

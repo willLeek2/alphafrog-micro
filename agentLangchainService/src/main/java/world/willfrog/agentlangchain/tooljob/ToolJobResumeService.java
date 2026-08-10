@@ -22,9 +22,10 @@ import java.util.UUID;
 /**
  * durable anchor 到新 Agent worker 之间的恢复租约状态机。
  *
- * <p>READY 负责竞争 claim，LAUNCHING 表示某个 token/version 已取得启动权，
- * CONSUMED 表示结果已被工作流接受。所有推进和清理都通过数据库 CAS；Redis 仅在
- * DB 成功后清理。数据集注册表在提交新 worker 前恢复，失败则回滚到新的 READY 租约。</p>
+ * <p>四阶段模型：READY 负责竞争 claim，LAUNCHING 表示某个 token/version 已取得启动权，
+ * ACCEPTED 表示 handoff 已被工作流接受，CONSUMED 表示结果已被最终消费且 anchor 可安全清理。
+ * 所有推进和清理都通过数据库 CAS；Redis 仅在 DB 成功后清理。数据集注册表在提交新 worker
+ * 前恢复，失败则按原状态回退（READY→READY，ACCEPTED→ACCEPTED）。</p>
  */
 @Service
 public class ToolJobResumeService {
@@ -88,8 +89,8 @@ public class ToolJobResumeService {
         }
         // READY 需要竞争新启动租约。
         if ("READY".equals(state)) return launchFromReady(runId, anchor);
-        // LAUNCHING 可能是正在运行，也可能是进程崩溃留下，需要活性/TTL 判断。
-        if ("LAUNCHING".equals(state)) return reenterLaunching(runId, anchor);
+        // LAUNCHING 或 ACCEPTED：可能正在运行或已崩溃，检查 lease TTL + isActive。
+        if ("LAUNCHING".equals(state) || "ACCEPTED".equals(state)) return reenterLaunching(runId, anchor);
         return false;
     }
 
@@ -131,7 +132,7 @@ public class ToolJobResumeService {
             return false;
         }
         // 上下文恢复成功后才向 bounded run scheduler 提交任务。
-        return doLaunch(runId, anchor, expectedVersion, claimedToken, claimedVersion);
+        return doLaunch(runId, anchor, expectedVersion, claimedToken, claimedVersion, "READY");
     }
 
     private void rollbackToReady(String runId, ToolJobAnchor anchor, long originalVersion,
@@ -156,17 +157,48 @@ public class ToolJobResumeService {
         }
     }
 
+    private void rollbackToAccepted(String runId, ToolJobAnchor anchor, long originalVersion,
+                                    String claimedToken, long claimedVersion) {
+        // ACCEPTED 回退：保持 ACCEPTED 状态（handoff 已被接受），仅清除 lease 让其他实例可重试。
+        long nextVersion = claimedVersion + 1;
+        anchor.setResumeState("ACCEPTED");
+        anchor.setResumeLeaseVersion(nextVersion);
+        anchor.setResumeClaimedAt(null);
+        anchor.setResumeLauncherOwnerId(null);
+        anchor.setResumeLauncherLeaseUntil(null);
+        anchor.setResultConsumed(true);
+        anchorService.casResumeState(runId, anchor, AgentRunStatus.EXECUTING,
+                "ACCEPTED", claimedToken, claimedVersion);
+    }
+
+    private void rollbackFromState(String runId, ToolJobAnchor anchor, long originalVersion,
+                                   String claimedToken, long claimedVersion,
+                                   String previousResumeState) {
+        if ("ACCEPTED".equals(previousResumeState)) {
+            rollbackToAccepted(runId, anchor, originalVersion, claimedToken, claimedVersion);
+        } else {
+            rollbackToReady(runId, anchor, originalVersion, claimedToken, claimedVersion);
+        }
+    }
+
     private boolean reenterLaunching(String runId, ToolJobAnchor anchor) {
-        log.info("Re-entering LAUNCHING resume for run={}", runId);
+        log.info("重入 LAUNCHING/ACCEPTED 恢复流程 run={}", runId);
         if (resumeLauncher == null) {
-            log.warn("No resumeLauncher wired — cannot recover LAUNCHING run={}", runId);
+            log.warn("未注入 resumeLauncher，无法恢复 run={}", runId);
             return false;
         }
         // 未过期的持久化 lease 无论属于本实例还是别的实例，都不能重复提交 pipeline。
         if (!launcherLeaseExpired(anchor, Instant.now())) {
             return false;
         }
+        // 同进程内已有活跃 launcher (runId + token + version)，避免同进程双 launch。
+        // 跨进程仍以 DB lease/version/token CAS 为唯一权威。
+        if (resumeLauncher.isActive(runId, anchor.getResumeToken(), anchor.getResumeLeaseVersion())) {
+            log.info("同进程 launcher 仍活跃 run={}，跳过过期回收", runId);
+            return false;
+        }
 
+        String previousResumeState = anchor.getResumeState();
         String expectedToken = anchor.getResumeToken();
         long expectedVersion = anchor.getResumeLeaseVersion();
         String expectedOwnerId = anchor.getResumeLauncherOwnerId();
@@ -186,29 +218,37 @@ public class ToolJobResumeService {
 
         if (!restoreDatasetRegistry(runId, anchor)) {
             log.error("Dataset restore failed after LAUNCHING takeover for run={}, rolling back", runId);
-            rollbackToReady(runId, anchor, expectedVersion,
-                    anchor.getResumeToken(), anchor.getResumeLeaseVersion());
+            if ("ACCEPTED".equals(previousResumeState)) {
+                rollbackToAccepted(runId, anchor, expectedVersion,
+                        anchor.getResumeToken(), anchor.getResumeLeaseVersion());
+            } else {
+                rollbackToReady(runId, anchor, expectedVersion,
+                        anchor.getResumeToken(), anchor.getResumeLeaseVersion());
+            }
             return false;
         }
         return doLaunch(runId, anchor, expectedVersion,
-                anchor.getResumeToken(), anchor.getResumeLeaseVersion());
+                anchor.getResumeToken(), anchor.getResumeLeaseVersion(), previousResumeState);
     }
 
     private boolean doLaunch(String runId, ToolJobAnchor anchor,
-                              long originalVersion, String claimedToken, long claimedVersion) {
+                              long originalVersion, String claimedToken, long claimedVersion,
+                              String previousResumeState) {
         // 只从已 claim 的 durable anchor 构建 context，不读取旧 worker 内存。
         ToolJobResumeContext ctx = buildResumeContext(runId, anchor);
         try {
             // launch=false 表示任务未进入 bounded scheduler，必须回滚 claim。
             if (!resumeLauncher.launch(runId, ctx)) {
-                rollbackToReady(runId, anchor, originalVersion, claimedToken, claimedVersion);
+                rollbackFromState(runId, anchor, originalVersion, claimedToken, claimedVersion,
+                        previousResumeState);
                 return false;
             }
             // true 表示 launcher 已幂等接受，实际 worker 可能仍在队列等待。
             return true;
         } catch (Exception e) {
             log.error("Launch threw for run={}, rolling back", runId, e);
-            rollbackToReady(runId, anchor, originalVersion, claimedToken, claimedVersion);
+            rollbackFromState(runId, anchor, originalVersion, claimedToken, claimedVersion,
+                    previousResumeState);
             return false;
         }
     }
@@ -253,10 +293,8 @@ public class ToolJobResumeService {
     }
 
     /**
-     * Persists the first half of the resume handoff. The terminal result has
-     * been accepted by the workflow, but the old anchor is deliberately kept
-     * until the resumed workflow has durably reached either a final result or
-     * a later tool-job checkpoint.
+     * 持久化恢复 handoff 的前半部分。终态结果已被工作流接受，但旧 anchor 会被
+     * 故意保留，直到恢复后的工作流持久化到达最终结果或下一个工具任务检查点。
      */
     public boolean markHandoffAccepted(String runId, ToolJobResumeContext context) {
         // 交接上下文必须绑定当前 run/token/version，且 executor 已把 resultConsumed 推进为 true。
@@ -294,8 +332,9 @@ public class ToolJobResumeService {
         anchor.setPythonFailedRequestFingerprints(context.getPythonFailedRequestFingerprints());
         anchor.setResultConsumed(true);
         anchor.setResumeLauncherLeaseUntil(Instant.now().plusSeconds(leaseSeconds()));
-        // 同一条 CAS 持久化“结果已接受”并把 Run 从 RECEIVED 恢复为 EXECUTING。
-        // 旧 LAUNCHING anchor 继续保留，直到最终结果落稳或被下一次 PREPARING 精确替换。
+        // 在将 Run 恢复为 EXECUTING 的同一条 CAS 中将 resumeState 推进为 ACCEPTED。
+        // 旧 anchor 保留至下一个持久化检查点或最终结果。
+        anchor.setResumeState("ACCEPTED");
         boolean accepted = anchorService.acceptResumeHandoff(
                 runId, anchor, context.getResumeToken(), context.getResumeLeaseVersion(),
                 context.getResumeLauncherOwnerId(), leaseSeconds());
@@ -313,9 +352,8 @@ public class ToolJobResumeService {
     }
 
     /**
-     * Clears only the exact old handoff claim, after the pipeline callback has
-     * returned from durable result/checkpoint persistence. A later suspension
-     * has a different state/token/version and is therefore never cleared here.
+     * 仅清理精确匹配的旧 handoff claim。只在 pipeline 回调已从持久化结果/检查点
+     * 落盘返回后调用。后续挂起会产生不同的 state/token/version，因此绝不会被这里误清理。
      */
     public boolean completeHandoff(String runId, String token, long version, String ownerId) {
         // pipeline 回调只允许清理自己最初提交的旧 claim。
@@ -325,7 +363,9 @@ public class ToolJobResumeService {
             return true;
         }
         // 若恢复执行再次挂起，anchor 已换 state/token/version；这里必须返回 false 且绝不清理。
-        if (!"LAUNCHING".equals(anchor.getResumeState()) || !anchor.isResultConsumed()
+        // ACCEPTED 是 handoff 后的状态（markHandoffAccepted 已将 LAUNCHING 推进为 ACCEPTED）。
+        if ((!"LAUNCHING".equals(anchor.getResumeState()) && !"ACCEPTED".equals(anchor.getResumeState()))
+                || !anchor.isResultConsumed()
                 || token == null || !token.equals(anchor.getResumeToken())
                 || version != anchor.getResumeLeaseVersion()
                 || ownerId == null || !ownerId.equals(anchor.getResumeLauncherOwnerId())) {

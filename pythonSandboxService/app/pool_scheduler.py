@@ -5,10 +5,16 @@ import queue
 import threading
 import time
 from collections import Counter
-from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from concurrent.futures import (
+    CancelledError as FutureCancelledError,
+    Future,
+    ThreadPoolExecutor,
+    TimeoutError as FutureTimeoutError,
+)
 from dataclasses import dataclass
 from typing import List
 
+from .cancel_registry import registry as cancel_registry
 from .config import SandboxConfig
 from .sandbox_runner import (
     SANDBOX_WORKER_LABELS,
@@ -25,6 +31,14 @@ logger = logging.getLogger(__name__)
 
 class SandboxQueueTimeoutError(TimeoutError):
     """Raised when a task waits too long for scheduler execution."""
+
+
+# 260809-26Q3-stage1-w2 D11 (task #108): raised when a pool task's Future
+# was canceled BEFORE any container worker started executing it — the only
+# pool-side evidence for the CANCELED_BEFORE_START cancellation kind
+# (d6841a2e rule 2: the cancel was OBSERVED by the pool before work began).
+class SandboxTaskCanceledBeforeStart(Exception):
+    """The task's pool Future was canceled before execution started."""
 
 
 @dataclass(frozen=True)
@@ -355,6 +369,14 @@ class ContainerPoolScheduler:
             raise RuntimeError("sandbox pool is not started")
 
         future: Future = Future()
+        # 260809-26Q3-stage1-w2 D11 (task #108, v4-2): attach the Future to
+        # the task's cancel handle BEFORE enqueueing the job.  A stop request
+        # that lands between Future() and _jobs.put() is not lost: the handle
+        # remembers the stop and set_future cancels immediately on attach; a
+        # stop that lands after the attach cancels this same Future here.
+        # Either way the future.result() below raises FutureCancelledError,
+        # translated to SandboxTaskCanceledBeforeStart for the worker.
+        cancel_registry.attach_future(task_id, future)
         self._jobs.put(
             SandboxJob(
                 task_id=task_id,
@@ -376,6 +398,13 @@ class ContainerPoolScheduler:
         wait_timeout = self._task_wait_timeout(timeout_seconds)
         try:
             return future.result(timeout=wait_timeout)
+        except FutureCancelledError as exc:
+            # The cancel handle canceled this Future before any worker set a
+            # result: the task never executed.  Translate into the typed
+            # evidence the worker turns into CANCELED_BEFORE_START.
+            raise SandboxTaskCanceledBeforeStart(
+                f"sandbox task {task_id} was canceled before pool execution started"
+            ) from exc
         except FutureTimeoutError as exc:
             future.cancel()
             raise SandboxQueueTimeoutError(

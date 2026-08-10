@@ -15,8 +15,6 @@ import world.willfrog.agent.platform.service.ReactConversationContext;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 import world.willfrog.agent.workflow.StructuredPlanningSupport;
 
-import java.util.LinkedHashSet;
-import java.util.Set;
 import java.util.stream.Collectors;
 
 /**
@@ -105,16 +103,17 @@ public class LangchainAiPlanner {
                 ? PlanExecutionMode.LINEAR
                 : request.getExecutionMode();
         String toolList = buildToolList(request.getToolSpecifications());
-        Set<String> toolWhitelist = buildToolWhitelist(request.getToolSpecifications());
 
         AgentContext.setPhase(AgentObservabilityService.PHASE_PLANNING);
         String previousStage = AgentContext.getStage();
         AgentContext.StructuredOutputSpec previousSpec = AgentContext.getStructuredOutputSpec();
         try {
             if (structuredOutputSettings.strategyStageEnabled()) {
-                return planTwoStageStructured(request, mode, maxTodos, toolList, toolWhitelist);
+                return planTwoStageStructured(request, mode, maxTodos, toolList);
             }
-            return planSingleStageLegacyTemplate(request, mode, maxTodos, toolList, toolWhitelist);
+            log.warn("[LangchainAiPlanner] runId={} legacy_single_stage_planning_enabled",
+                    nvl(request.getRunId()));
+            return planSingleStageLegacyTemplate(request, mode, maxTodos, toolList);
         } finally {
             restoreStructuredOutputSpec(previousSpec);
             restoreStage(previousStage);
@@ -140,7 +139,7 @@ public class LangchainAiPlanner {
      * 2. Strategy 阶段：LLM 输出 OverallPlan（含 mode、detail）
      * 3. 校验 Strategy JSON（通过 StructuredPlanningSupport）
      * 4. Todos 阶段：将 strategy 作为 assistant 消息注入，LLM 输出 Todo 列表
-     * 5. 校验 Todo JSON（schema + toolWhitelist）
+     * 5. 使用共享 schema 规则校验 Todo JSON；工具授权仍由执行期 ToolRouter 负责
      * 6. 成功返回；失败则重试（最多 maxAttempts 次）
      * </pre>
      *
@@ -156,8 +155,7 @@ public class LangchainAiPlanner {
     private LangchainTodoPlan planTwoStageStructured(LangchainPlanningRequest request,
                                                      PlanExecutionMode mode,
                                                      int maxTodos,
-                                                     String toolList,
-                                                     Set<String> toolWhitelist) {
+                                                     String toolList) {
         int maxAttempts = resolvePlanningMaxAttempts();
         int maxDetailLength = structuredOutputSettings.strategyMaxDetailLength();
         boolean structuredEnabled = structuredOutputSettings.structuredEnabled();
@@ -235,14 +233,7 @@ public class LangchainAiPlanner {
                 );
                 ChatResponse todosResponse = request.getModel().chat(ctx.getMessages());
                 String todosRaw = todosResponse.aiMessage() == null ? "" : nvl(todosResponse.aiMessage().text());
-                JsonNode todosRoot = StructuredPlanningSupport.parseStructuredJson(objectMapper, todosRaw);
-                StructuredPlanningSupport.ValidationResult todosValidation =
-                        StructuredPlanningSupport.validateTodoPlan(todosRoot, maxTodos, toolWhitelist);
-                if (!todosValidation.valid()) {
-                    throw new StructuredPlanningSupport.StructuredPlanningException(
-                            todosValidation.category(), todosValidation.message());
-                }
-                LangchainTodoPlan plan = LangchainTodoPlanParser.fromJsonRoot(todosRoot, mode, maxTodos);
+                LangchainTodoPlan plan = parseValidateTodoPlan(todosRaw, mode, maxTodos);
                 if (overallPlan.detail() != null && !overallPlan.detail().isBlank()) {
                     plan = LangchainTodoPlan.builder()
                             .analysis(overallPlan.detail())
@@ -271,8 +262,7 @@ public class LangchainAiPlanner {
                 AgentContext.clearStructuredOutputSpec();
             }
         }
-        throw new IllegalStateException("planning_retry_exhausted:"
-                + (lastError == null ? "unknown" : lastError.category() + ":" + lastError.getMessage()));
+        throw planningRetryExhausted(lastError);
     }
 
     /**
@@ -281,19 +271,14 @@ public class LangchainAiPlanner {
      * <h3>与两阶段路径的关键差异</h3>
      * <ol>
      *   <li>不先问 strategy，直接把动态前缀 + Todo 阶段指令 + 用户目标拼成一条消息发给 LLM</li>
-     *   <li>使用 LC4j 的 {@code AiServices.builder()} 创建代理，
-     *       LLM 返回的 JSON 通过 {@link LangchainTodoPlanResponse} POJO 自动反序列化</li>
-     *   <li>不走 {@link StructuredPlanningSupport} 的校验逻辑，
-     *       而是通过 {@link #normalizeResponse} 对 POJO 字段做规范化处理</li>
+     *   <li>使用 LC4j 的 {@code AiServices.builder()} 创建代理并取得原始 JSON</li>
+     *   <li>与两阶段 Todo 阶段复用同一套 JSON 解析、结构校验和重试配置</li>
      * </ol>
      *
-     * <h3>为什么 LC4j POJO 返回也需要 ThreadLocal</h3>
-     * LC4j 的 {@code @AiService} 在检测到 POJO 返回类型时，会自动向
-     * {@code ChatRequest} 注入 {@code response_format = json_schema}。
-     * 但 {@code OpenRouterProviderRoutedChatModel} 不读
-     * {@code ChatRequest.responseFormat()}，只读 ThreadLocal 中的
-     * {@link AgentContext.StructuredOutputSpec}。
-     * 因此仍需在调用前显式设置 structured output spec。
+     * <h3>为什么原始字符串返回仍需要 ThreadLocal</h3>
+     * {@code OpenRouterProviderRoutedChatModel} 只从 ThreadLocal 读取
+     * {@link AgentContext.StructuredOutputSpec}。因此单阶段即使返回原始 JSON，
+     * 也必须显式设置与两阶段 Todo 相同的 schema。
      *
      * <h3>systemMessageProvider 的作用</h3>
      * {@code systemMessageProvider(ignored -> promptService.reactSystemPrompt())}
@@ -303,19 +288,20 @@ public class LangchainAiPlanner {
      * 不走 systemMessageProvider。）
      *
      * @see LangchainPlannerAiService 规划专用的 LC4j AI Service 接口
-     * @see LangchainTodoPlanResponse 自动反序列化的响应 POJO
+     * @see StructuredPlanningSupport 共享 JSON 解析与结构校验
      */
     private LangchainTodoPlan planSingleStageLegacyTemplate(LangchainPlanningRequest request,
                                                             PlanExecutionMode mode,
                                                             int maxTodos,
-                                                            String toolList,
-                                                            Set<String> toolWhitelist) {
+                                                            String toolList) {
         LangchainPlannerAiService service = dev.langchain4j.service.AiServices.builder(LangchainPlannerAiService.class)
                 .chatModel(request.getModel())
                 .systemMessageProvider(ignored -> promptService.reactSystemPrompt())
                 .build();
         AgentContext.setStage("planning_todos");
         boolean structuredEnabled = structuredOutputSettings.structuredEnabled();
+        int maxAttempts = resolvePlanningMaxAttempts();
+        StructuredPlanningSupport.StructuredPlanningException lastError = null;
         try {
             if (structuredEnabled) {
                 AgentContext.setStructuredOutputSpec(new AgentContext.StructuredOutputSpec(
@@ -338,11 +324,35 @@ public class LangchainAiPlanner {
                         + "\n\n历史对话压缩内容：\n" + dialogueCtx
                         + "\n\n当前轮次用户需求：" + request.getUserGoal();
             }
-            LangchainTodoPlanResponse response = service.plan(userMessage);
-            return normalizeResponse(response, maxTodos, mode);
+            for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+                try {
+                    LangchainTodoPlan plan = parseValidateTodoPlan(service.plan(userMessage), mode, maxTodos);
+                    log.info("[LangchainAiPlanner] runId={} legacy_single_stage_planning ok attempt={} todos={}",
+                            nvl(request.getRunId()), attempt, plan.getItems().size());
+                    return plan;
+                } catch (StructuredPlanningSupport.StructuredPlanningException e) {
+                    lastError = e;
+                    log.warn("[LangchainAiPlanner] runId={} legacy planning attempt {} failed: {} {}",
+                            nvl(request.getRunId()), attempt, e.category(), e.getMessage());
+                }
+            }
+            throw planningRetryExhausted(lastError);
         } finally {
             AgentContext.clearStructuredOutputSpec();
         }
+    }
+
+    private LangchainTodoPlan parseValidateTodoPlan(String raw,
+                                                    PlanExecutionMode mode,
+                                                    int maxTodos) {
+        JsonNode root = StructuredPlanningSupport.parseStructuredJson(objectMapper, raw);
+        StructuredPlanningSupport.ValidationResult validation =
+                StructuredPlanningSupport.validateTodoPlan(root, maxTodos);
+        if (!validation.valid()) {
+            throw new StructuredPlanningSupport.StructuredPlanningException(
+                    validation.category(), validation.message());
+        }
+        return LangchainTodoPlanParser.fromJsonRoot(root, mode, maxTodos);
     }
 
     /**
@@ -378,66 +388,6 @@ public class LangchainAiPlanner {
     }
 
     /**
-     * 将 LC4j AI Service 返回的 POJO 规范化（normalize）为统一的 {@link LangchainTodoPlan}。
-     *
-     * <p>主要做以下几件事：
-     * <ol>
-     *   <li>过滤掉 description 为空的无效 Todo 项</li>
-     *   <li>截断到 maxTodos 上限</li>
-     *   <li>补全缺失的 id/sequence（LLM 可能不填或填错）</li>
-     *   <li>规范化 dependsOn/groupKey/parallelizable 等 DAG 相关字段</li>
-     *   <li>统一 status 为 PENDING、创建时间为当前时刻</li>
-     * </ol>
-     *
-     * <p>这个方法是单阶段路径的质量防线——LLM 输出的 JSON 可能缺少字段、
-     * 字段值非法、或包含无意义的描述，这里全部兜底处理。
-     *
-     * @throws IllegalStateException 如果规范化后没有任何有效 Todo 项
-     */
-    private LangchainTodoPlan normalizeResponse(LangchainTodoPlanResponse response, int maxTodos, PlanExecutionMode mode) {
-        if (response == null || response.getItems() == null || response.getItems().isEmpty()) {
-            throw new IllegalStateException("todo_plan_empty");
-        }
-        java.util.List<world.willfrog.agent.workflow.TodoItem> items = new java.util.ArrayList<>();
-        int sequence = 1;
-        for (LangchainTodoPlanResponse.TodoItemResponse itemResponse : response.getItems()) {
-            if (itemResponse == null || isBlank(itemResponse.getDescription())) {
-                continue;
-            }
-            if (items.size() >= maxTodos) {
-                break;
-            }
-            int effectiveSequence = itemResponse.getSequence() != null && itemResponse.getSequence() > 0
-                    ? itemResponse.getSequence()
-                    : sequence;
-            String id = nvl(itemResponse.getId()).trim();
-            if (id.isBlank()) {
-                id = "todo_" + effectiveSequence;
-            }
-            items.add(world.willfrog.agent.workflow.TodoItem.builder()
-                    .id(id)
-                    .sequence(effectiveSequence)
-                    .description(itemResponse.getDescription().trim())
-                    .dependsOn(sanitizeList(itemResponse.getDependsOn()))
-                    .groupKey(blankToNull(itemResponse.getGroupKey()))
-                    .parallelizable(Boolean.TRUE.equals(itemResponse.getParallelizable()))
-                    .status(world.willfrog.agent.workflow.TodoStatus.PENDING)
-                    .createdAt(java.time.Instant.now())
-                    .build());
-            sequence++;
-        }
-        if (items.isEmpty()) {
-            throw new IllegalStateException("todo_plan_empty");
-        }
-        return LangchainTodoPlan.builder()
-                .analysis(nvl(response.getAnalysis()))
-                .items(items)
-                .extractedEntities(sanitizeList(response.getExtractedEntities()))
-                .executionMode(mode)
-                .build();
-    }
-
-    /**
      * 解析最大 Todo 数量：取请求值（如果有效）与 Nacos 配置值的较小者。
      * 最终结果 clamp 到 [1, 50]。
      */
@@ -452,12 +402,19 @@ public class LangchainAiPlanner {
     /**
      * 返回规划阶段的最大重试次数。
      *
-     * <p>当前为硬编码的 {@value #DEFAULT_MAX_ATTEMPTS}，未来可扩展为 Nacos 配置。
-     * 两阶段规划的 JSON schema 校验失败时会重试，直到次数耗尽后抛出
+     * <p>唯一配置键为
+     * {@code agent.llm.runtime.planning.structured-output.max-attempts}；
+     * 两条规划路径的 JSON schema 校验失败时都会重试，直到次数耗尽后抛出
      * {@code IllegalStateException("planning_retry_exhausted")}。</p>
      */
     private int resolvePlanningMaxAttempts() {
-        return DEFAULT_MAX_ATTEMPTS;
+        return structuredOutputSettings.planningMaxAttempts(DEFAULT_MAX_ATTEMPTS);
+    }
+
+    private IllegalStateException planningRetryExhausted(
+            StructuredPlanningSupport.StructuredPlanningException lastError) {
+        return new IllegalStateException("planning_retry_exhausted:"
+                + (lastError == null ? "unknown" : lastError.category() + ":" + lastError.getMessage()));
     }
 
     /**
@@ -493,52 +450,6 @@ public class LangchainAiPlanner {
                 .distinct()
                 .sorted()
                 .collect(Collectors.joining(", "));
-    }
-
-    /**
-     * 构建工具白名单（Set 形式），注入 planning prompt 供 LLM 参考可用的工具集合。
-     * 保留插入顺序（{@link LinkedHashSet}），方便日志排查。
-     * Todo 的结构字段校验由 {@link StructuredPlanningSupport#validateTodoPlan} 负责。
-     */
-    private Set<String> buildToolWhitelist(java.util.List<ToolSpecification> specifications) {
-        if (specifications == null || specifications.isEmpty()) {
-            return Set.of();
-        }
-        return specifications.stream()
-                .map(ToolSpecification::name)
-                .filter(name -> !isBlank(name))
-                .collect(Collectors.toCollection(LinkedHashSet::new));
-    }
-
-    /**
-     * 清理字符串列表：去重、去空、保留原始顺序。
-     *
-     * <p>用于规范化 LLM 输出的 dependsOn / extractedEntities 等列表字段，
-     * 防止空字符串或重复值进入后续的 Todo 执行流程。</p>
-     */
-    private java.util.List<String> sanitizeList(java.util.List<String> values) {
-        if (values == null || values.isEmpty()) {
-            return java.util.List.of();
-        }
-        Set<String> unique = new LinkedHashSet<>();
-        for (String value : values) {
-            String normalized = nvl(value).trim();
-            if (!normalized.isBlank()) {
-                unique.add(normalized);
-            }
-        }
-        return java.util.List.copyOf(unique);
-    }
-
-    /**
-     * 将空白字符串转为 null，保留非空值。
-     *
-     * <p>用于处理 LLM 可能输出的空 groupKey / id 等字段，
-     * 避免空字符串污染 DAG 依赖解析。</p>
-     */
-    private String blankToNull(String value) {
-        String normalized = nvl(value).trim();
-        return normalized.isBlank() ? null : normalized;
     }
 
     /** 判断字符串是否为 null 或仅含空白字符。 */

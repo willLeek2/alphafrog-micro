@@ -14,7 +14,6 @@ import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agentlangchain.orchestration.LangchainLinearRunPipeline;
 import world.willfrog.agentlangchain.orchestration.LangchainRunConcurrencyScheduler;
 import world.willfrog.agentlangchain.orchestration.LangchainRunRejectedException;
-import world.willfrog.agentlangchain.routing.LangchainSingleWriterGuard;
 import world.willfrog.alphafrogmicro.agent.idl.CreateAgentRunRequest;
 import world.willfrog.alphafrogmicro.common.dao.user.UserDao;
 
@@ -38,8 +37,6 @@ class AgentLangchainRunServiceTest {
     @Mock
     private AgentRunMapper runMapper;
     @Mock
-    private LangchainSingleWriterGuard singleWriterGuard;
-    @Mock
     private AgentCreditService creditService;
     @Mock
     private UserDao userDao;
@@ -49,7 +46,7 @@ class AgentLangchainRunServiceTest {
     @BeforeEach
     void setUp() {
         runService = new AgentLangchainRunService(eventServiceProvider, pipelineProvider, scheduler, runMapper,
-                singleWriterGuard, creditService, userDao);
+                creditService, userDao);
         lenient().when(creditService.hasPositiveCredit(anyString())).thenReturn(true);
     }
 
@@ -67,8 +64,6 @@ class AgentLangchainRunServiceTest {
         run.setStatus(AgentRunStatus.RECEIVED);
         when(eventService.createRun(anyString(), anyString(), any(), any(), any(), any(),
                 anyBoolean(), any(), anyInt(), anyBoolean(), any(), anyBoolean())).thenReturn(run);
-        when(singleWriterGuard.markLangchainOwner(run)).thenReturn(run);
-
         CreateAgentRunRequest request = CreateAgentRunRequest.newBuilder()
                 .setUserId("u1")
                 .setMessage("analyze stocks")
@@ -76,7 +71,6 @@ class AgentLangchainRunServiceTest {
 
         var message = runService.createRun(request);
         assertEquals("run123", message.getId());
-        verify(singleWriterGuard).markLangchainOwner(run);
         verify(pipeline).launchAsync(run, reservation);
     }
 

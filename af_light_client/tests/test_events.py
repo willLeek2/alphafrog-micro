@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from af_light_client.events import RunViewState, normalize_sse_frame
+from af_light_client.events import RunViewState, is_terminal, normalize_sse_frame, resolve_agent_payload
 
 
 class RunStatusLastSeqTest(unittest.TestCase):
@@ -27,6 +27,31 @@ class RunStatusLastSeqTest(unittest.TestCase):
 
 
 class RunViewStateLayoutRegressionTest(unittest.TestCase):
+    def test_payload_dual_read_wraps_canonical_and_legacy_scalars(self) -> None:
+        self.assertEqual(resolve_agent_payload({"payload": True}), ({"value": True}, "payload"))
+        self.assertEqual(
+            resolve_agent_payload({"payloadJson": "[1, 2]"}),
+            ({"value": [1, 2]}, "payloadJson"),
+        )
+
+    def test_durable_identity_is_run_id_and_seq_not_event_type(self) -> None:
+        state = RunViewState(max_trace_lines=5)
+        state.set_run_id("run-1")
+        state.ingest_agent_event(
+            {"runId": "run-1", "seq": 2, "eventType": "A", "payload": {"message": "first"}}
+        )
+        state.ingest_agent_event(
+            {"runId": "run-1", "seq": 2, "eventType": "B", "payload": {"message": "duplicate"}}
+        )
+        self.assertEqual(state.snapshot().trace, ["first"])
+
+    def test_terminal_aliases_are_normalized_but_canceling_is_not_terminal(self) -> None:
+        state = RunViewState()
+        state.ingest_sse("run.status", {"status": " cancelled "})
+        self.assertEqual(state.snapshot().status, "CANCELED")
+        self.assertTrue(is_terminal("timeout"))
+        self.assertFalse(is_terminal("CANCELING"))
+
     def test_warning_copy_is_deduped_across_renders(self) -> None:
         state = RunViewState(max_warnings=4)
         state.add_warning("login ok")

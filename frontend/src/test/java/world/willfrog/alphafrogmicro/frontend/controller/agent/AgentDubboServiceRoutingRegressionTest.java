@@ -7,6 +7,7 @@ import org.springframework.core.type.classreading.CachingMetadataReaderFactory;
 import org.springframework.core.type.classreading.MetadataReader;
 import org.springframework.util.ClassUtils;
 import world.willfrog.alphafrogmicro.agent.idl.AgentDubboService;
+import world.willfrog.alphafrogmicro.frontend.service.agent.AgentCreditGateway;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -70,7 +71,7 @@ class AgentDubboServiceRoutingRegressionTest {
                 AgentController.class,
                 AgentConfigController.class,
                 AgentToolsController.class,
-                AgentCreditController.class
+                AgentCreditGateway.class
         )) {
             boolean hasLangchainStub = false;
             boolean hasResolveService = false;

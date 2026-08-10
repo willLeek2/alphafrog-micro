@@ -32,7 +32,7 @@ import static org.mockito.Mockito.when;
 class LangchainC1ParityIntegrationTest {
 
     private final LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
-            LangchainTestFixtures.planner(),
+            LangchainTestFixtures.legacySingleStagePlanner(),
             LangchainTestFixtures.todoNodeExecutor(),
             noopExecutionGuard(),
             mock(AgentEventService.class)

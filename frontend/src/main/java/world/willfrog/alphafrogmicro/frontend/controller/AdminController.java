@@ -1,5 +1,6 @@
 package world.willfrog.alphafrogmicro.frontend.controller;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.dubbo.config.annotation.DubboReference;
@@ -15,6 +16,7 @@ import world.willfrog.alphafrogmicro.frontend.service.AuthService;
 import world.willfrog.alphafrogmicro.frontend.service.RateLimitingService;
 import world.willfrog.alphafrogmicro.frontend.service.debug.AuthObservabilityManager;
 import world.willfrog.alphafrogmicro.frontend.service.debug.AuthObservabilityScope;
+import world.willfrog.alphafrogmicro.frontend.service.agent.AgentExternalObservabilityMapper;
 
 import java.util.HashMap;
 import java.util.List;
@@ -28,6 +30,7 @@ import java.util.stream.Collectors;
 public class AdminController {
 
     private static final int ADMIN_USER_TYPE = 1127;
+    private static final ObjectMapper OUTBOUND_JSON = new ObjectMapper();
 
     private static final String STATUS_ACTIVE = "ACTIVE";
     private static final String STATUS_DISABLED = "DISABLED";
@@ -685,9 +688,11 @@ public class AdminController {
         }
         Map<String, Object> payload = new HashMap<>();
         payload.put("run", convertAdminAgentRunToMap(response.getRun()));
-        payload.put("planJson", response.getPlanJson());
-        payload.put("snapshotJson", response.getSnapshotJson());
-        payload.put("lastError", response.getLastError());
+        payload.put("planJson", AgentExternalObservabilityMapper.parseToJson(
+                OUTBOUND_JSON, response.getPlanJson(), AgentExternalObservabilityMapper.View.ADMIN));
+        payload.put("snapshotJson", AgentExternalObservabilityMapper.parseToJson(
+                OUTBOUND_JSON, response.getSnapshotJson(), AgentExternalObservabilityMapper.View.ADMIN));
+        payload.put("lastError", AgentExternalObservabilityMapper.safePreview(response.getLastError(), 10_000));
         return ResponseEntity.ok(payload);
     }
 
