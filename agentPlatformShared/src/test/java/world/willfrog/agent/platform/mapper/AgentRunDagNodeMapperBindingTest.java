@@ -523,53 +523,46 @@ class AgentRunDagNodeMapperBindingTest {
                 .isNotNegative()
                 .isGreaterThan(outerOpen);
 
-        // 6) 三项 identity fence 完整比较：JSON 键 = ?，且 ? 对应的 ParameterMapping 正确
-        assertFenceComplete("'{resumeToken}'", "expectedResumeToken",
-                sql, qmPositions, pms);
-
-        assertFenceComplete("'{resumeLauncherOwnerId}'", "expectedOwnerId",
-                sql, qmPositions, pms);
-
-        assertFenceComplete("'{resumeLeaseVersion}'", "expectedResumeLeaseVersion",
-                sql, qmPositions, pms);
+        // 6) 三项 identity fence 完整形状 + ParameterMapping 双锁
+        //    用规范化 WHERE 做完整形状断言，用 raw SQL Position → ParameterMapping 做 @Param 校验
+        assertFenceComplete(whereClause, sql, qmPositions, pms,
+                "resumeToken", "expectedResumeToken",
+                "tool_job_anchor_json\\s*#>>\\s*'\\{resumeToken\\}'\\s*(?<![<>!])=\\s*\\?");
+        assertFenceComplete(whereClause, sql, qmPositions, pms,
+                "resumeLauncherOwnerId", "expectedOwnerId",
+                "tool_job_anchor_json\\s*#>>\\s*'\\{resumeLauncherOwnerId\\}'\\s*(?<![<>!])=\\s*\\?");
+        assertFenceComplete(whereClause, sql, qmPositions, pms,
+                "resumeLeaseVersion", "expectedResumeLeaseVersion",
+                "\\(tool_job_anchor_json\\s*#>>\\s*'\\{resumeLeaseVersion\\}'\\)::bigint\\s*(?<![<>!])=\\s*\\?");
     }
 
     /**
-     * 验证 frontier_result WHERE 中 JSON 键完整比较：key = ? 且 ? 对应正确 @Param。
-     * 重点拒绝 key IS NOT NULL AND ? IS NOT NULL 这类伪围栏：
-     * 前者失去相等比较语义，后者把参数挪到无关位置后现有 ParameterMapping 检查仍可能通过。
+     * 验证 frontier_result WHERE 中一条 identity fence 的完整形状和参数绑定。
+     * completeShapeRegex 使用 (?<![<>!])= 确保操作符是严格 = 而非 >= / <= / !=。
+     * 再通过 raw SQL 中 ? 的位置 → ParameterMapping 锁住 @Param 名称。
      */
-    private void assertFenceComplete(String jsonKey, String expectedParam,
-                                      String fullSql,
+    private void assertFenceComplete(String whereClause, String fullSql,
                                       List<Integer> qmPositions,
-                                      List<ParameterMapping> pms) {
-        // 在完整 SQL 中找 JSON 键
+                                      List<ParameterMapping> pms,
+                                      String jsonKeyName, String expectedParam,
+                                      String completeShapeRegex) {
+        // 1) 规范化 WHERE 中完整形状断言：从 JSON 路径到 ? 必须是 = 比较
+        assertThat(whereClause)
+                .as(jsonKeyName + " fence 必须是完整等号比较，拒绝 >= / <= / != / IS NOT NULL 等")
+                .containsPattern(completeShapeRegex);
+
+        // 2) raw SQL 中找 JSON 键及其后的 ?，通过 ParameterMapping 锁 @Param
+        String jsonKey = "'{" + jsonKeyName + "}'";
         int keyPos = fullSql.indexOf(jsonKey);
         assertThat(keyPos).as(jsonKey + " 应在 SQL 中").isNotNegative();
-
-        // 确认 JSON 键在 frontier_result CTE 范围内（RETURNING 1 之前）
-        int frontierReturning = fullSql.indexOf("RETURNING 1", keyPos);
-        assertThat(frontierReturning).as("RETURNING 1 应在 " + jsonKey + " 之后").isNotNegative();
-
-        // 找 JSON 键之后最近的 ?
         int qmIdx = fullSql.indexOf('?', keyPos);
         assertThat(qmIdx).as(jsonKey + " 之后应有 ? 占位符").isNotNegative();
+        int frontierReturning = fullSql.indexOf("RETURNING 1", keyPos);
         assertThat(qmIdx).as(jsonKey + " 的 ? 应在 frontier_result 的 RETURNING 1 之前")
                 .isLessThan(frontierReturning);
 
-        // 锁住键与 ? 之间为 = 比较，拒绝 key IS NOT NULL AND ? IS NOT NULL 等伪围栏
-        String between = fullSql.substring(keyPos + jsonKey.length(), qmIdx);
-        assertThat(between)
-                .as(jsonKey + " 与 ? 之间必须是 = 相等比较（可能带 ::bigint 转型），"
-                    + "不能是 IS NOT NULL / IS NULL / <>")
-                .contains("=")
-                .doesNotContain("IS NOT")
-                .doesNotContain("IS NULL")
-                .doesNotContain("<>");
-
-        // 通过 ? 位置索引 → ParameterMapping 校验 @Param 名称
         int pmIndex = qmPositions.indexOf(qmIdx);
-        assertThat(pmIndex).as(jsonKey + " = ? 的 ? 应有对应 ParameterMapping").isNotNegative();
+        assertThat(pmIndex).as(jsonKey + " 的 ? 应有对应 ParameterMapping").isNotNegative();
         String prop = pms.get(pmIndex).getProperty();
         String root = prop.contains(".") ? prop.substring(0, prop.indexOf('.')) : prop;
         assertThat(root).as(jsonKey + " = ? 的 ? 必须对应 @Param(\"" + expectedParam + "\")")
