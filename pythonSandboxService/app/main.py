@@ -9,6 +9,10 @@ from datetime import datetime
 from typing import Dict
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exception_handlers import (
+    request_validation_exception_handler as _fastapi_422_handler,
+)
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from .canonical_fingerprint import (
@@ -17,7 +21,12 @@ from .canonical_fingerprint import (
     verify_request_fingerprint,
 )
 from .config import load_config
+from .cancel_registry import registry as cancel_registry, shutdown_marker_write_pool
 from .models import (
+    CancelOutcome,
+    CancelTaskRequest,
+    CancelTaskResponse,
+    CancellationEvidence,
     CreateTaskResponse,
     EffectiveOutputLimits,
     ExecuteRequest,
@@ -30,10 +39,19 @@ from .models import (
     TaskStatus,
 )
 from .nacos_config import DynamicSandboxConfig, start_nacos_listener
-from .pool_scheduler import ContainerPoolScheduler
+from .pool_scheduler import (
+    ContainerPoolScheduler,
+    SandboxTaskCanceledBeforeStart,
+)
 from .retry_classification import classify_terminal_retryable
 from .sandbox_runner import run_in_sandbox
-from .task_store import DurableTaskStore, OperationConflictError
+from .task_store import (
+    CancelRequestBindingError,
+    CompletionCandidate,
+    DurableTaskStore,
+    OperationConflictError,
+    build_canceled_result,
+)
 
 # Setup logging with Asia/Shanghai timezone
 from zoneinfo import ZoneInfo
@@ -168,13 +186,24 @@ def _safe_parse_execution_environment(payload):
 
 
 async def process_task(task: Task, worker_id: int):
+    # 260809-26Q3-stage1-w2 D11 (task #108): this task's cancel handle exists
+    # before any other processing, so a stop request that arrives at ANY
+    # moment (pool Future not built yet / job enqueued / child running) can
+    # be delivered by the registry; it is removed only after the terminal
+    # state is persisted.  register() is idempotent, so a handle created by
+    # an earlier interleaving is reused, never replaced.
+    cancel_registry.register(task.task_id)
+    try:
+        await _process_task_inner(task, worker_id)
+    finally:
+        cancel_registry.unregister(task.task_id)
+
+
+async def _process_task_inner(task: Task, worker_id: int):
     started_at = datetime.utcnow()
     queued_ms = int((started_at - task.created_at).total_seconds() * 1000)
     if queued_ms > int(config.queue_wait_timeout_seconds * 1000):
-        task.status = TaskStatus.FAILED
-        task.finished_at = started_at
-        task.error = "sandbox queue wait timeout"
-        task.resource_usage = SandboxResourceUsage(
+        resource_usage = SandboxResourceUsage(
             resource_class=task.request.resource_class,
             queue_wait_millis=queued_ms,
             exit_reason="QUEUE_TIMEOUT",
@@ -189,28 +218,51 @@ async def process_task(task: Task, worker_id: int):
                 "datasetOpenCount",
             ],
         )
-        task.retryable = classify_terminal_retryable(
-            status=task.status,
-            exit_code=-1,
-            resource_usage=task.resource_usage,
-        )
-        task.result = ExecuteResult(
+        result = ExecuteResult(
             exit_code=-1,
             stdout="",
-            stderr=task.error,
+            stderr="sandbox queue wait timeout",
             dataset_dir=f"{config.workdir}/input/{task.request.dataset_id}",
-            resource_usage=task.resource_usage,
-            retryable=task.retryable,
+            resource_usage=resource_usage,
+            retryable=classify_terminal_retryable(
+                status=TaskStatus.FAILED,
+                exit_code=-1,
+                resource_usage=resource_usage,
+            ),
             # 260808-finance-methodspec-v5 work package D: queue timeout runs
             # before sandbox opens, so no execution_environment is available;
             # presence-aware consumers see hasExecutionEnvironment() == false.
             execution_environment=None,
         )
-        task_store.save(task)
+        # D11: the terminal state is persisted through the same
+        # complete_execution gate as every other outcome — if a cancel
+        # already terminalized the task in the store lock, the CANCELED
+        # state wins and this timeout result is dropped (d6841a2e rule 3).
+        # No TASK_COMPLETED log on this branch (pre-D11 behavior kept).
+        task_store.complete_execution(
+            task.task_id,
+            CompletionCandidate(
+                status=TaskStatus.FAILED,
+                result=result,
+                evidence=CancellationEvidence.NONE,
+                error="sandbox queue wait timeout",
+            ),
+        )
         return
-    task.status = TaskStatus.RUNNING
-    task.started_at = started_at
-    task_store.save(task)
+    # D11 (task #108, codex c6c49248 review): begin_execution returns a
+    # deep copy snapshot so the execution path reads a stable frozen task
+    # and cannot accidentally overwrite a cancel terminal-state through a
+    # stray save().  None means the task is no longer QUEUED inside the
+    # store lock — a cancel terminalized it (QUEUED_CANCEL) and the worker
+    # must not touch it.
+    task_id = task.task_id
+    task = task_store.begin_execution(task_id)
+    if task is None:
+        logger.info(
+            "TASK_CANCELED_BEFORE_START task=%s worker=%s queued_ms=%s",
+            task_id, worker_id, queued_ms,
+        )
+        return
     logger.info(
         "TASK_START task=%s worker=%s queued_ms=%s dataset=%s pool_enabled=%s",
         task.task_id, worker_id, queued_ms,
@@ -261,15 +313,15 @@ async def process_task(task: Task, worker_id: int):
                 effective_output_limits=frozen_limits,
             )
         usage_payload = result_dict.get("resource_usage")
+        resource_usage = None
         if usage_payload:
-            task.resource_usage = SandboxResourceUsage.model_validate(usage_payload)
-        task.status = TaskStatus.SUCCEEDED if result_dict["exit_code"] == 0 else TaskStatus.FAILED
-        task.retryable = classify_terminal_retryable(
-            status=task.status,
-            exit_code=result_dict["exit_code"],
-            resource_usage=task.resource_usage,
+            resource_usage = SandboxResourceUsage.model_validate(usage_payload)
+        status = (
+            TaskStatus.SUCCEEDED
+            if result_dict["exit_code"] == 0
+            else TaskStatus.FAILED
         )
-        task.result = ExecuteResult(
+        result = ExecuteResult(
             exit_code=result_dict["exit_code"],
             stdout=result_dict["stdout"],
             stderr=result_dict["stderr"],
@@ -280,8 +332,12 @@ async def process_task(task: Task, worker_id: int):
                 "container_recycled": result_dict.get("container_recycled", False),
                 "recycle_reason": result_dict.get("recycle_reason"),
             },
-            resource_usage=task.resource_usage,
-            retryable=task.retryable,
+            resource_usage=resource_usage,
+            retryable=classify_terminal_retryable(
+                status=status,
+                exit_code=result_dict["exit_code"],
+                resource_usage=resource_usage,
+            ),
             # 260808-finance-methodspec-v5 work package D: same ExecutionEnvironment
             # instance that drove the workdir file is surfaced here on the HTTP
             # ExecuteResult; gateway presence-aware mapping then sets the proto
@@ -292,20 +348,52 @@ async def process_task(task: Task, worker_id: int):
         )
         # §5.1: attach the validated channel from the §7.1 write path (the
         # attach is merge-safe: it no-ops until D's frozen DTO field lands).
-        task.result = _attach_finance_record_channel(
-            task.result, result_dict.get("finance_record_channel")
+        result = _attach_finance_record_channel(
+            result, result_dict.get("finance_record_channel")
         )
-        if task.status == TaskStatus.FAILED:
-            task.error = f"sandbox exited with code {result_dict['exit_code']}"
+        # D11 (task #108): MARKER_OBSERVED is the ONLY evidence that may turn
+        # a genuinely completed run into CANCELED — it means the wrapper saw
+        # the cancel marker and, because of it, killed its own child process
+        # group (d6841a2e rule 2).  Without that observation the genuine
+        # SUCCEEDED/FAILED result stands even when a cancel was requested
+        # (rules 3+4: the child may have finished before the stop landed).
+        evidence = (
+            CancellationEvidence.MARKER_OBSERVED
+            if result_dict.get("cancel_observed")
+            else CancellationEvidence.NONE
+        )
+        candidate = CompletionCandidate(
+            status=status,
+            result=result,
+            evidence=evidence,
+            error=(
+                f"sandbox exited with code {result_dict['exit_code']}"
+                if status == TaskStatus.FAILED
+                else None
+            ),
+        )
+    except SandboxTaskCanceledBeforeStart as canceled_exc:
+        # D11 (task #108): the pool Future was canceled BEFORE any container
+        # worker started this job — observed cancellation evidence (d6841a2e
+        # rule 2).  complete_execution turns it into the CANCELED terminal
+        # state with the shared honest canceled result.
+        logger.info(
+            "Task %s canceled before pool execution started: %s",
+            task.task_id, canceled_exc,
+        )
+        candidate = CompletionCandidate(
+            status=TaskStatus.FAILED,
+            result=build_canceled_result(task.request),
+            evidence=CancellationEvidence.CANCELED_BEFORE_START,
+            error=str(canceled_exc),
+        )
     except Exception as e:
         logger.error("Task %s failed: %s", task.task_id, e)
-        task.error = str(e)
-        task.status = TaskStatus.FAILED
         usage_payload = getattr(e, "resource_usage", None)
         if usage_payload:
-            task.resource_usage = SandboxResourceUsage.model_validate(usage_payload)
+            resource_usage = SandboxResourceUsage.model_validate(usage_payload)
         else:
-            task.resource_usage = SandboxResourceUsage(
+            resource_usage = SandboxResourceUsage(
                 resource_class=task.request.resource_class,
                 queue_wait_millis=queued_ms,
                 exit_reason="EXECUTION_ERROR",
@@ -320,19 +408,18 @@ async def process_task(task: Task, worker_id: int):
                     "datasetOpenCount",
                 ],
             )
-        task.retryable = classify_terminal_retryable(
-            status=task.status,
-            exit_code=-1,
-            resource_usage=task.resource_usage,
-        )
-        task.result = ExecuteResult(
+        result = ExecuteResult(
             exit_code=-1,
             stdout="",
             stderr=str(e),
             dataset_dir=f"{config.workdir}/input/{task.request.dataset_id}",
             artifacts={"timings": getattr(e, "timings", {})},
-            resource_usage=task.resource_usage,
-            retryable=task.retryable,
+            resource_usage=resource_usage,
+            retryable=classify_terminal_retryable(
+                status=TaskStatus.FAILED,
+                exit_code=-1,
+                resource_usage=resource_usage,
+            ),
             # 260808-finance-methodspec-v5 work package D: execution_environment
             # may be missing or partially populated if the exception happened
             # before/around runtime_environment collection. _safe_parse handles
@@ -347,46 +434,60 @@ async def process_task(task: Task, worker_id: int):
                 else result_dict.get("execution_environment"),
             ),
         )
-    finally:
-        task.finished_at = datetime.utcnow()
-        task_store.save(task)
-        duration_ms = int((task.finished_at - task.started_at).total_seconds() * 1000)
-
-        timings = result_dict.get("timings", {})
-        container_recycled = result_dict.get("container_recycled", False)
-        recycle_reason = result_dict.get("recycle_reason")
-        container_id = result_dict.get("container_id", "-")
-        container_create_ms = timings.get("container_create_ms")
-        if container_create_ms is None:
-            container_create_ms = "n/a" if config.pool_enabled else "-"
-
-        status_label = "SUCCESS" if task.status == TaskStatus.SUCCEEDED else "FAILED"
-        logger.info(
-            "TASK_COMPLETED task=%s worker=%s status=%s duration_ms=%s "
-            "queued_ms=%s pool_enabled=%s queue_wait_ms=%s container_id=%s container_create_ms=%s "
-            "workspace_prepare_ms=%s script_run_ms=%s workspace_cleanup_ms=%s "
-            "env_load_ms=%s code_exec_ms=%s artifact_collect_ms=%s "
-            "total_runner_ms=%s total_duration_ms=%s container_recycled=%s recycle_reason=%s",
-            task.task_id,
-            worker_id,
-            status_label,
-            duration_ms,
-            queued_ms,
-            config.pool_enabled,
-            timings.get("queue_wait_ms", "-"),
-            container_id,
-            container_create_ms,
-            timings.get("workspace_prepare_ms", "-"),
-            timings.get("script_run_ms", "-"),
-            timings.get("workspace_cleanup_ms", "-"),
-            timings.get("env_load_ms", "-"),
-            timings.get("code_exec_ms", "-"),
-            timings.get("artifact_collect_ms", "-"),
-            timings.get("total_runner_ms", "-"),
-            timings.get("total_duration_ms", "-"),
-            container_recycled,
-            recycle_reason or "none",
+        # D11 (task #108): a runner exception is genuine failure evidence,
+        # never cancellation evidence — even with cancel_requested set, a
+        # crash is not an observed stop (d6841a2e rule 4).
+        candidate = CompletionCandidate(
+            status=TaskStatus.FAILED,
+            result=result,
+            evidence=CancellationEvidence.NONE,
+            error=str(e),
         )
+    final_task = task_store.complete_execution(task.task_id, candidate)
+    duration_ms = int(
+        (final_task.finished_at - final_task.started_at).total_seconds() * 1000
+    )
+
+    timings = result_dict.get("timings", {})
+    container_recycled = result_dict.get("container_recycled", False)
+    recycle_reason = result_dict.get("recycle_reason")
+    container_id = result_dict.get("container_id", "-")
+    container_create_ms = timings.get("container_create_ms")
+    if container_create_ms is None:
+        container_create_ms = "n/a" if config.pool_enabled else "-"
+
+    if final_task.status == TaskStatus.SUCCEEDED:
+        status_label = "SUCCESS"
+    elif final_task.status == TaskStatus.CANCELED:
+        status_label = "CANCELED"
+    else:
+        status_label = "FAILED"
+    logger.info(
+        "TASK_COMPLETED task=%s worker=%s status=%s duration_ms=%s "
+        "queued_ms=%s pool_enabled=%s queue_wait_ms=%s container_id=%s container_create_ms=%s "
+        "workspace_prepare_ms=%s script_run_ms=%s workspace_cleanup_ms=%s "
+        "env_load_ms=%s code_exec_ms=%s artifact_collect_ms=%s "
+        "total_runner_ms=%s total_duration_ms=%s container_recycled=%s recycle_reason=%s",
+        task.task_id,
+        worker_id,
+        status_label,
+        duration_ms,
+        queued_ms,
+        config.pool_enabled,
+        timings.get("queue_wait_ms", "-"),
+        container_id,
+        container_create_ms,
+        timings.get("workspace_prepare_ms", "-"),
+        timings.get("script_run_ms", "-"),
+        timings.get("workspace_cleanup_ms", "-"),
+        timings.get("env_load_ms", "-"),
+        timings.get("code_exec_ms", "-"),
+        timings.get("artifact_collect_ms", "-"),
+        timings.get("total_runner_ms", "-"),
+        timings.get("total_duration_ms", "-"),
+        container_recycled,
+        recycle_reason or "none",
+    )
 
 
 @asynccontextmanager
@@ -432,6 +533,10 @@ async def lifespan(app: FastAPI):
         pool.close()
         pool = None
 
+    # D11 (task #108): stop accepting cancel-marker writes.  wait=False:
+    # marker writes are best-effort by contract and must never hang shutdown.
+    shutdown_marker_write_pool()
+
 
 app = FastAPI(title="alphafrog-python-sandbox", version="0.3.0", lifespan=lifespan)
 
@@ -456,6 +561,26 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
     )
 
 
+@app.exception_handler(RequestValidationError)
+async def cancel_validation_handler(request: Request, exc: RequestValidationError):
+    # D11 (task #108, codex c6c49248 review): FastAPI's default 422 for a
+    # request-body type/shape defect is NOT in the frozen D13 status vocabulary
+    # (only 400 / 409 / 500 / 503).  Every body defect on the /tasks/cancel
+    # route must answer 400 → Gateway INVALID_ARGUMENT, which is what the
+    # endpoint already does for the business-rule validations inside the
+    # handler body.  Other routes keep their builtin 422 behavior untouched
+    # (this handler is deliberately route-scoped, not global).
+    if request.url.path == "/tasks/cancel":
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "invalid request body"},
+        )
+    # Other routes: explicitly delegate back to FastAPI's builtin 422
+    # handler.  Raising the exception would instead land in the generic
+    # unhandled_exception_handler above → an incorrect 500.
+    return await _fastapi_422_handler(request, exc)
+
+
 @app.get("/health")
 async def health() -> dict:
     result = {"status": "ok", "pool_enabled": config.pool_enabled}
@@ -470,6 +595,30 @@ async def health() -> dict:
 
 @app.post("/tasks", response_model=CreateTaskResponse)
 async def create_task(request: ExecuteRequest):
+    # D14 (Q-14): production refuse create without operation_id. Non-empty is
+    # judged AFTER strip; empty / all-whitespace are rejected and never
+    # auto-generated. Non-production fixtures must set
+    # AF_SANDBOX_ALLOW_CREATE_WITHOUT_OPERATION_ID=true (no operation index /
+    # no idempotent recovery). The switch only admits keyless creates —
+    # keyed creates still run fingerprint/units/memory validation below.
+    operation_id = (request.operation_id or "").strip()
+    if not operation_id and not config.allow_create_without_operation_id:
+        logger.warning(
+            "sandbox.create.reject_missing_operation_id "
+            "non_production_switch=AF_SANDBOX_ALLOW_CREATE_WITHOUT_OPERATION_ID"
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "operation_id is required for sandbox create "
+                "(D14 production refuse create without idempotency key; "
+                "non-production fixtures must enable the documented Legacy "
+                "compatibility switches as a group — no global capacity "
+                "admission, no idempotent recovery)"
+            ),
+        )
+    if operation_id:
+        request.operation_id = operation_id
     expected_memory = (
         config.heavy_memory_limit_bytes
         if request.resource_class == "HEAVY"
@@ -552,54 +701,194 @@ async def create_task(request: ExecuteRequest):
         raise HTTPException(status_code=400, detail=str(error)) from error
     except CanonicalSpecError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
-    task_id = str(uuid.uuid4())
-    task = Task(task_id=task_id, status=TaskStatus.QUEUED, request=request)
     # §7.2/§13: freeze the output-limit snapshot at creation time.  An
     # idempotent re-create returns the ORIGINAL task from the store, so the
     # original snapshot is kept untouched by any later Nacos update.
-    task.effective_output_limits = EffectiveOutputLimits(
-        **dynamic_config.output_limits_snapshot()
-    )
     # §7.1 (codex b5a92810, C/H seam): freeze the validated image reference
     # the task will run on.  Set ONCE here: an idempotent re-create returns
     # the ORIGINAL task (original ref kept), execution never re-reads hot
     # config, and a later image change only affects NEW tasks.
-    task.runtime_image_ref = config.sandbox_image
-    # D13 (26Q3, ccqwen 1f4e16d4 #4): bounded acceptance queue. Reject
-    # BEFORE persisting when the queue is already full so no task is ever
-    # stored without a queue entry (no orphan). 503 → frozen category
-    # OVERLOADED_OR_UNAVAILABLE. Fail-closed over-rejection is accepted:
-    # while the queue is full even an idempotent replay of an EXISTING
-    # operation is rejected (the store is not consulted first).
-    # task_store.create below is synchronous (no await between full() and
-    # put_nowait), so on this single-threaded event loop no other coroutine
-    # can interleave — the QueueFull backstop is defensive only; a task
-    # persisted in that impossible race would be re-enqueued by
-    # recover_after_restart on next startup.
-    if task_queue.full():
-        raise HTTPException(
-            status_code=503,
-            detail="sandbox task queue is full; retry later",
-        )
+    # D11 (task #108, v4-3): both values are frozen BEFORE any store consult
+    # so a pre-create tombstone adoption fills exactly the same snapshot an
+    # ordinary create would have used.
+    frozen_limits = EffectiveOutputLimits(
+        **dynamic_config.output_limits_snapshot()
+    )
+    frozen_image_ref = config.sandbox_image
+    # D11 (task #108, v4-4 re-check #1): the authoritative store consult
+    # BEFORE the capacity check.  An idempotent replay and a pre-create
+    # tombstone adoption need no queue slot, so they must never be rejected
+    # by a full queue (cancellation cannot be bypassed by racing capacity);
+    # None means the operation is still unknown and a fresh create proceeds.
     try:
-        decision = task_store.create(task)
+        early_decision = task_store.find_existing_or_adopt_tombstone(
+            request, frozen_limits, frozen_image_ref
+        )
     except OperationConflictError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
-    if not decision.existing:
+    if early_decision is not None:
+        return CreateTaskResponse(
+            task_id=early_decision.task.task_id,
+            status=early_decision.task.status,
+            existing=early_decision.existing,
+            request_fingerprint=early_decision.task.request_fingerprint,
+        )
+    task_id = str(uuid.uuid4())
+    task = Task(
+        task_id=task_id,
+        status=TaskStatus.QUEUED,
+        request=request,
+        effective_output_limits=frozen_limits,
+        runtime_image_ref=frozen_image_ref,
+    )
+    # D13 (26Q3, ccqwen 1f4e16d4 #4): bounded acceptance queue. Reject
+    # BEFORE persisting when the queue is already full so no task is ever
+    # stored without a queue entry (no orphan). 503 → frozen category
+    # OVERLOADED_OR_UNAVAILABLE.
+    # D11 (task #108, v4-4 re-check #2): a by_operation cancel may have
+    # created a tombstone for this operation between re-check #1 and now —
+    # consult the store once more before rejecting, because adopting a
+    # tombstone needs no queue slot.  Only a genuinely unknown operation is
+    # rejected with 503 while the queue is full.
+    if task_queue.full():
         try:
-            task_queue.put_nowait(decision.task.task_id)
-        except asyncio.QueueFull:
-            raise HTTPException(
-                status_code=503,
-                detail="sandbox task queue is full; retry later",
+            full_decision = task_store.find_existing_or_adopt_tombstone(
+                request, frozen_limits, frozen_image_ref
             )
+        except OperationConflictError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        if full_decision is not None:
+            return CreateTaskResponse(
+                task_id=full_decision.task.task_id,
+                status=full_decision.task.status,
+                existing=full_decision.existing,
+                request_fingerprint=full_decision.task.request_fingerprint,
+            )
+        raise HTTPException(
+            status_code=503,
+            detail="sandbox task queue is full; retry later",
+        )
+    # D11 / codex 4334bc9d constraint 1 (v4-4 re-check #3): the final dedup
+    # re-check, the insert, the persist AND the queue admission share ONE
+    # store critical section.  When the queue filled between full() above
+    # and the admission, the store rolls the just-written records back under
+    # the SAME lock before the QueueFull propagates — a rejected create
+    # leaves no durable trace, so the 503 below is honest.  (Crash boundary:
+    # if the process dies after the persist but before the enqueue returns,
+    # the task stays QUEUED on disk and recover_after_restart re-enqueues it
+    # on the next startup — the documented honest resolution.)
+    try:
+        decision = task_store.create_with_admission(
+            task, admission=lambda: task_queue.put_nowait(task.task_id)
+        )
+    except OperationConflictError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except asyncio.QueueFull as error:
+        raise HTTPException(
+            status_code=503,
+            detail="sandbox task queue is full; retry later",
+        ) from error
     return CreateTaskResponse(
         task_id=decision.task.task_id,
         status=decision.task.status,
         existing=decision.existing,
         request_fingerprint=decision.task.request_fingerprint,
+    )
+
+
+# === 260809-26Q3-stage1-w2 D11 (task #108): POST /tasks/cancel ============
+# HTTP mirror of the frozen proto cancelTask RPC (pythonSandbox.proto, codex
+# a3aee2ad v3).  Business outcomes answer 200 + body — including the
+# business NOT_FOUND (an authoritative "this taskId never existed here");
+# failure outcomes follow the D13 convention and are expressed purely by
+# HTTP status (400 INVALID_ARGUMENT / 409 CONFLICT), because this service
+# has no errorDetail body field and the Gateway maps by status code.
+@app.post("/tasks/cancel", response_model=CancelTaskResponse)
+async def cancel_task(request: CancelTaskRequest):
+    # Deliberate endpoint-side validation (the pydantic model is loose on
+    # purpose): the frozen D13 status vocabulary has no 422, so every body
+    # defect must answer a plain 400.  proto3 oneof only gives compile-time
+    # mutual exclusion; these runtime checks are the service-side equivalent
+    # (codex a3aee2ad section 二).
+    cancel_request_id = (request.cancel_request_id or "").strip()
+    if not cancel_request_id:
+        raise HTTPException(
+            status_code=400, detail="cancel_request_id must not be empty"
+        )
+    has_by_task_id = request.by_task_id is not None
+    has_by_operation = request.by_operation is not None
+    if has_by_task_id == has_by_operation:
+        raise HTTPException(
+            status_code=400,
+            detail="exactly one of by_task_id or by_operation must be set",
+        )
+    reason = (request.reason or "").strip()
+    if has_by_task_id:
+        target_task_id = (request.by_task_id.task_id or "").strip()
+        if not target_task_id:
+            raise HTTPException(
+                status_code=400, detail="by_task_id.task_id must not be empty"
+            )
+        try:
+            decision = task_store.cancel_by_task_id(
+                cancel_request_id, target_task_id, reason
+            )
+        except CancelRequestBindingError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+    else:
+        operation_id = (request.by_operation.operation_id or "").strip()
+        fingerprint = (request.by_operation.request_fingerprint or "").strip()
+        if not operation_id or not fingerprint:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "by_operation.operation_id and"
+                    " by_operation.request_fingerprint must not be empty"
+                ),
+            )
+        try:
+            decision = task_store.cancel_by_operation(
+                cancel_request_id, operation_id, fingerprint, reason
+            )
+        except OperationConflictError as error:
+            # Same operationId, different fingerprint (codex a3aee2ad
+            # section 四末: the by_operation path verifies identity before
+            # answering) → UNSPECIFIED outcome + CONFLICT category → 409.
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except CancelRequestBindingError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+    # The actual stop signal for a RUNNING task travels the cancel registry
+    # OUTSIDE the store lock: pool Future cancellation / cancel-marker write
+    # are best-effort deliveries, and the durable CANCELED terminal state is
+    # only ever written by complete_execution once the execution layer
+    # reports real observed evidence (d6841a2e rules 2+4).  A repeated or
+    # replayed CANCEL_INTENT_RECORDED re-requests idempotently (the handle
+    # deduplicates).
+    if (
+        decision.outcome == CancelOutcome.CANCEL_INTENT_RECORDED.value
+        and decision.task_id
+    ):
+        stop_newly_requested = cancel_registry.request_stop(decision.task_id)
+        logger.info(
+            "TASK_CANCEL_STOP task=%s newly_requested=%s outcome=%s reason=%s",
+            decision.task_id,
+            stop_newly_requested,
+            decision.outcome,
+            reason or "none",
+        )
+    return CancelTaskResponse(
+        outcome=CancelOutcome(decision.outcome),
+        task_id=decision.task_id,
+        status=decision.status,
+        error=None,
     )
 
 

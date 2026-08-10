@@ -3,13 +3,9 @@ package world.willfrog.alphafrogmicro.frontend.service.agent;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
-import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
 import java.util.Base64;
 import java.util.LinkedHashMap;
-import java.util.List;
 import java.util.Map;
-import java.util.regex.Pattern;
 
 /**
  * Builds sanitized full trace payloads. Inline and parts endpoints must use this same mapper.
@@ -19,17 +15,6 @@ public final class AgentRawTraceDetailMapper {
     public static final String REDACTION_TEXT = "***REDACTED***";
 
     private static final TypeReference<Map<String, Object>> MAP_TYPE = new TypeReference<>() {};
-    private static final Pattern SENSITIVE_KEY = Pattern.compile(
-            "(?i)(authorization|api[-_]?key|secret|password|access[-_]?token|token|credential|cookie|set-cookie|x-api-key)");
-    private static final Pattern BEARER_VALUE = Pattern.compile("(?i)(bearer\\s+)[A-Za-z0-9._\\-+/=]+");
-    private static final Pattern BASIC_VALUE = Pattern.compile("(?i)(basic\\s+)[A-Za-z0-9._\\-+/=]+");
-    private static final Pattern SECRET_ASSIGNMENT = Pattern.compile(
-            "(?i)([\"']?(?:api_?key|secret|password|access_?token|token)[\"']?\\s*[:=]\\s*[\"']?)[A-Za-z0-9._\\-+/=]+([\"']?)");
-    private static final Pattern URL_SECRET_PARAM = Pattern.compile(
-            "(?i)([?&][^=&\\s]*(?:api_?key|secret|password|access_?token|token|key)[^=]*=)[^&#\\s]+");
-    private static final Pattern CREDENTIAL_SHAPED = Pattern.compile(
-            "(?i)\\b(sk|ak|pk|rk|ghp|xox[baprs]|ya29)_[A-Za-z0-9._\\-]{12,}\\b|\\bsk-[A-Za-z0-9._\\-]{12,}\\b");
-
     private AgentRawTraceDetailMapper() {
     }
 
@@ -102,44 +87,9 @@ public final class AgentRawTraceDetailMapper {
     }
 
     private static Object scrub(Object value) {
-        if (value == null) {
-            return null;
-        }
-        if (value instanceof Map<?, ?> map) {
-            Map<String, Object> out = new LinkedHashMap<>();
-            for (Map.Entry<?, ?> entry : map.entrySet()) {
-                String key = String.valueOf(entry.getKey());
-                if (SENSITIVE_KEY.matcher(key).find()) {
-                    out.put(key, REDACTION_TEXT);
-                } else {
-                    out.put(key, scrub(entry.getValue()));
-                }
-            }
-            return out;
-        }
-        if (value instanceof List<?> list) {
-            List<Object> out = new ArrayList<>();
-            for (Object item : list) {
-                out.add(scrub(item));
-            }
-            return out;
-        }
-        if (value instanceof String text) {
-            return scrubString(text);
-        }
-        return value;
-    }
-
-    private static String scrubString(String text) {
-        if (text == null || text.isBlank()) {
-            return text;
-        }
-        String out = BEARER_VALUE.matcher(text).replaceAll("$1" + REDACTION_TEXT);
-        out = BASIC_VALUE.matcher(out).replaceAll("$1" + REDACTION_TEXT);
-        out = SECRET_ASSIGNMENT.matcher(out).replaceAll("$1" + REDACTION_TEXT + "$2");
-        out = URL_SECRET_PARAM.matcher(out).replaceAll("$1" + REDACTION_TEXT);
-        out = CREDENTIAL_SHAPED.matcher(out).replaceAll(REDACTION_TEXT);
-        return out;
+        return AgentExternalObservabilityMapper.sanitize(
+                value,
+                AgentExternalObservabilityMapper.View.ADMIN);
     }
 
     private static Map<String, Object> parseMap(ObjectMapper objectMapper, String json) {
@@ -149,9 +99,7 @@ public final class AgentRawTraceDetailMapper {
         try {
             return objectMapper.readValue(json, MAP_TYPE);
         } catch (Exception e) {
-            Map<String, Object> fallback = new LinkedHashMap<>();
-            fallback.put("raw", scrubString(json));
-            return fallback;
+            throw new IllegalArgumentException("malformed raw trace detail", e);
         }
     }
 
@@ -163,7 +111,7 @@ public final class AgentRawTraceDetailMapper {
         try {
             return objectMapper.writeValueAsBytes(value == null ? Map.of() : value);
         } catch (Exception e) {
-            return String.valueOf(value).getBytes(StandardCharsets.UTF_8);
+            throw new IllegalStateException("failed to serialize sanitized trace detail", e);
         }
     }
 

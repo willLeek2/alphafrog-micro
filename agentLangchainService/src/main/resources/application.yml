@@ -18,7 +18,7 @@ agent:
     provider:
       enabled: false
     service:
-      version: P0-skeleton
+      version: UNKNOWN
   llm:
     config-file: ${AF_AGENT_LLM_CONFIG_FILE:}
     prompt-base-dir: ${AF_AGENT_LLM_PROMPT_BASE_DIR:}

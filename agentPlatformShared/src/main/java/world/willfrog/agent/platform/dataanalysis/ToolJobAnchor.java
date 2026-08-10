@@ -1,6 +1,8 @@
 package world.willfrog.agent.platform.dataanalysis;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
@@ -64,7 +66,7 @@ public class ToolJobAnchor {
     private Instant cleanupSourceLeaseUntil;
     // autoResume=false 时只做终态收尾和容量释放，不自动重新入队。
     private boolean autoResume = true;
-    // resumeState 表示 READY、LAUNCHING、CONSUMED 三阶段交接状态。
+    // resumeState 表示 READY、LAUNCHING、ACCEPTED、CONSUMED 四阶段交接状态。
     private String resumeState;
     // resumeToken 为每轮 READY 生成随机令牌，提供启动幂等身份。
     private String resumeToken;
@@ -158,10 +160,40 @@ public class ToolJobAnchor {
     public static ToolJobAnchor fromJson(String json) {
         try {
             // 统一使用注册 Java Time 模块的 mapper，确保 Instant 可跨重启还原。
-            return MAPPER.readValue(json, ToolJobAnchor.class);
+            ToolJobAnchor anchor = MAPPER.readValue(json, ToolJobAnchor.class);
+            normalizeLegacyResultConsumed(anchor);
+            return anchor;
         } catch (JsonProcessingException e) {
             // 锚点损坏必须显式失败；静默构造空对象会绕过 CAS 身份保护。
             throw new IllegalArgumentException("Failed to parse ToolJobAnchor", e);
+        }
+    }
+
+    /**
+     * 将旧双轨数据归一化为 ACCEPTED 单轨模型。
+     *
+     * <p>旧数据中 {@code resultConsumed=true} 但 {@code resumeState} 仍为
+     * LAUNCHING（或 null）的，升级为 ACCEPTED。矛盾的 READY+true 会 fail-closed，
+     * 不会静默提升。
+     *
+     * <p>此迁移逻辑可在 26Q3-W7 后移除。
+     */
+    private static void normalizeLegacyResultConsumed(ToolJobAnchor anchor) {
+        if (!anchor.resultConsumed) {
+            return; // 无需归一化
+        }
+        if ("CONSUMED".equals(anchor.resumeState) || "ACCEPTED".equals(anchor.resumeState)) {
+            return; // 已经一致
+        }
+        if ("LAUNCHING".equals(anchor.resumeState) || anchor.resumeState == null) {
+            // 旧数据：handoff 已被接受但 resumeState 未推进，升级为 ACCEPTED。
+            anchor.resumeState = "ACCEPTED";
+            return;
+        }
+        if ("READY".equals(anchor.resumeState)) {
+            // 矛盾状态：READY 不可能有已消费的结果，fail-closed。
+            throw new IllegalArgumentException(
+                    "ToolJobAnchor has contradictory state: resumeState=READY but resultConsumed=true");
         }
     }
 
@@ -361,7 +393,13 @@ public class ToolJobAnchor {
     public boolean isTerminalEventEmitted() { return terminalEventEmitted; }
     public void setTerminalEventEmitted(boolean terminalEventEmitted) { this.terminalEventEmitted = terminalEventEmitted; }
 
-    public boolean isResultConsumed() { return resultConsumed; }
+    @JsonIgnore
+    public boolean isResultConsumed() { return "ACCEPTED".equals(resumeState) || "CONSUMED".equals(resumeState); }
+
+    @JsonProperty("resultConsumed")
+    public boolean getResultConsumed() { return "ACCEPTED".equals(resumeState) || "CONSUMED".equals(resumeState); }
+
+    @JsonProperty("resultConsumed")
     public void setResultConsumed(boolean resultConsumed) { this.resultConsumed = resultConsumed; }
 
     public Instant getNextPollAt() { return nextPollAt; }

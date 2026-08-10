@@ -4,8 +4,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
-
-import java.util.Set;
+import world.willfrog.alphafrogmicro.common.agent.AgentRunTerminalStatus;
 
 /**
  * 终态发布收敛服务（agentPlatformShared 公共入口）。
@@ -29,11 +28,6 @@ import java.util.Set;
 @Slf4j
 public class AgentRunFinalizationService {
 
-    /** v0 处理的终态集合 */
-    public static final Set<String> TERMINAL_STATUSES = Set.of(
-            "COMPLETED", "PARTIAL", "FAILED", "CANCELED", "EXPIRED"
-    );
-
     private final ApplicationEventPublisher publisher;
 
     /**
@@ -48,8 +42,8 @@ public class AgentRunFinalizationService {
             log.warn("publishFinalizedEvent skipped: runId 为空, status={}", terminalStatus);
             return;
         }
-        String status = terminalStatus == null ? "" : terminalStatus.trim();
-        if (!TERMINAL_STATUSES.contains(status)) {
+        String status = AgentRunTerminalStatus.normalize(terminalStatus);
+        if (!AgentRunTerminalStatus.isTerminal(status)) {
             log.warn("publishFinalizedEvent skipped: 非终态 status={} runId={}", status, runId);
             return;
         }

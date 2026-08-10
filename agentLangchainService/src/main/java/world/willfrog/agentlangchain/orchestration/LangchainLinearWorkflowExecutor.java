@@ -32,11 +32,9 @@ import java.util.stream.Collectors;
  * <h2>与 DAG 执行器的关系</h2>
  * DAG 是主线（支持并行依赖图），LINEAR 是降级简化版（顺序执行）。
  * 当 planning LLM 判断任务无需并行（或 DAG 执行失败触发 FALLBACK_TO_LINEAR）时走此路径。
- * 面试被问"你们执行模式有几种"，答案在本类和 DAG 执行器。
- *
  * <h2>执行流程</h2>
  * <ol>
- *   <li>调用 planner 生成 Todo 列表</li>
+ *   <li>接收 pipeline 已冻结的 Todo 计划</li>
  *   <li>逐个执行 Todo（每个 Todo 经过 {@link LangchainTodoNodeExecutor}）</li>
  *   <li>每完成一个 Todo 后注册 dataset ref，供后续 Todo 引用</li>
  *   <li>执行前后各检查一次 cancel/pause 状态</li>
@@ -92,6 +90,13 @@ public class LangchainLinearWorkflowExecutor {
                 null, new CodeRefineProperties());
     }
 
+    /**
+     * 仅供遗留测试兼容的“规划并执行”入口。
+     *
+     * <p>生产 Run 必须先由 {@code LangchainLinearRunPipelineImpl} 完成一次规划并冻结
+     * effectivePlan，再调用 {@link #executePlanned}；新代码不得从执行器重新规划。</p>
+     */
+    @Deprecated(forRemoval = true)
     public LangchainLinearWorkflowResult execute(LangchainLinearWorkflowRequest request) {
         validate(request);
         AtomicInteger toolCalls = new AtomicInteger();

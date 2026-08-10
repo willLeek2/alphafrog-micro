@@ -141,3 +141,14 @@ alphafrog:
       max-units: ${AF_DATA_ANALYSIS_CAPACITY_MAX_UNITS:20}
       max-active: ${AF_DATA_ANALYSIS_CAPACITY_MAX_ACTIVE:20}
       max-heavy-active: ${AF_DATA_ANALYSIS_CAPACITY_MAX_HEAVY_ACTIVE:6}
+
+# D14 (Q-14): non-production Legacy create without capacity wiring.
+# Default false = fail-closed. Set true ONLY together with Gateway
+# `sandbox.gateway.allow-create-without-operation-id` and Python
+# `AF_SANDBOX_ALLOW_CREATE_WITHOUT_OPERATION_ID` for annotated fixtures.
+# Enabling only this switch is not enough: the other layers still refuse.
+# NON-PRODUCTION ONLY — no global capacity admission, no idempotent recovery;
+# must not point at production Gateway/Python.
+sandbox:
+  create:
+    allow-legacy-without-capacity: ${AF_SANDBOX_ALLOW_LEGACY_WITHOUT_CAPACITY:false}

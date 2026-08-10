@@ -252,8 +252,18 @@ class WrapperPathFunctionalTest(unittest.TestCase):
         # child's os.getcwd() reports the real path.
         self.root = Path(self._tmp.name).resolve()
         _make_dataset(self.root)
+        # D11 (task #108): the host-backed fake session cannot create /run
+        # (read-only host root).  Point the task control root at a writable
+        # dir under this test's root; runner and wrapper read the SAME env
+        # (AF_TASK_CONTROL_ROOT), and the wrapper subprocess inherits it.
+        self._saved_control_root = os.environ.get("AF_TASK_CONTROL_ROOT")
+        os.environ["AF_TASK_CONTROL_ROOT"] = str(self.root / "task-control")
 
     def tearDown(self):
+        if self._saved_control_root is None:
+            os.environ.pop("AF_TASK_CONTROL_ROOT", None)
+        else:
+            os.environ["AF_TASK_CONTROL_ROOT"] = self._saved_control_root
         self._tmp.cleanup()
 
     def _run(self, code, *, limits=None, timeout_seconds=30, task_id="task-wire"):
@@ -594,6 +604,8 @@ class CaptureReadbackTest(unittest.TestCase):
             "unknownMarkerLines": 0,
             "unknownMarkerBytes": 0,
             "unknownMarkerTruncated": False,
+            # D11: the 14th frozen key — a consistent capture carries it.
+            "cancelObserved": False,
         }
         document = json.dumps(
             {
@@ -1119,8 +1131,15 @@ class CaptureTamperingWiringTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory(prefix="af-tamper-test-")
         self.root = Path(self._tmp.name).resolve()
         _make_dataset(self.root)
+        # D11: host fake session cannot create /run — see WrapperPathFunctionalTest.
+        self._saved_control_root = os.environ.get("AF_TASK_CONTROL_ROOT")
+        os.environ["AF_TASK_CONTROL_ROOT"] = str(self.root / "task-control")
 
     def tearDown(self):
+        if self._saved_control_root is None:
+            os.environ.pop("AF_TASK_CONTROL_ROOT", None)
+        else:
+            os.environ["AF_TASK_CONTROL_ROOT"] = self._saved_control_root
         self._tmp.cleanup()
 
     def _run(self, code, *, task_id="task-tamper", session_cls=None):
@@ -1493,12 +1512,12 @@ class CreateTaskSnapshotTest(unittest.IsolatedAsyncioTestCase):
                     frozen_stdout,
                 )
 
-                # state.json round-trip: §7.1 bumped the store format to
-                # sandbox_task_store_v2 (v1 stays readable); reload restores
+                # state.json round-trip: D11 bumped the store format to
+                # sandbox_task_store_v3 (v1/v2 stay readable); reload restores
                 # the frozen snapshots and image refs.
                 document = json.loads(state_path.read_text(encoding="utf-8"))
                 self.assertEqual(
-                    document["schema_version"], "sandbox_task_store_v2"
+                    document["schema_version"], "sandbox_task_store_v3"
                 )
                 reloaded = main_module.DurableTaskStore(state_path)
                 self.assertEqual(
@@ -1613,23 +1632,24 @@ class CreateTaskSnapshotTest(unittest.IsolatedAsyncioTestCase):
                 ) = saved
 
 
-class TaskStoreSchemaV2Test(unittest.TestCase):
-    """§7.1: state.json upgraded to sandbox_task_store_v2, v1 readable."""
+class TaskStoreSchemaV3Test(unittest.TestCase):
+    """D11 (task #108): state.json upgraded to sandbox_task_store_v3
+    (cancel_requests binding map added); v1/v2 stay readable."""
 
     def _task(self):
         import app.main as main_module
 
         return main_module.Task(
-            task_id="task-v2",
+            task_id="task-v3",
             status=main_module.TaskStatus.QUEUED,
             request=main_module.ExecuteRequest(dataset_id="ds1", code="print(1)"),
         )
 
-    def test_writes_v2_reads_v1_rejects_unknown(self):
+    def test_writes_v3_reads_v1_rejects_unknown(self):
         import app.main as main_module
 
-        with tempfile.TemporaryDirectory(prefix="af-store-v2-") as tmp:
-            # Current writes are v2 and carry the frozen §7.2 fields.
+        with tempfile.TemporaryDirectory(prefix="af-store-v3-") as tmp:
+            # Current writes are v3 and carry the frozen §7.2 fields.
             state_path = Path(tmp) / "state.json"
             store = main_module.DurableTaskStore(state_path)
             task = self._task()
@@ -1645,16 +1665,17 @@ class TaskStoreSchemaV2Test(unittest.TestCase):
             )
             store.create(task)
             document = json.loads(state_path.read_text(encoding="utf-8"))
-            self.assertEqual(document["schema_version"], "sandbox_task_store_v2")
+            self.assertEqual(document["schema_version"], "sandbox_task_store_v3")
             self.assertEqual(
                 main_module.DurableTaskStore(state_path)
-                .get("task-v2")
+                .get("task-v3")
                 .effective_output_limits,
                 task.effective_output_limits,
             )
 
             # Legacy v1 documents (no frozen fields) still load.
             v1_payload = self._task().model_dump(mode="json")
+            v1_payload["task_id"] = "task-v1"
             v1_path = Path(tmp) / "state-v1.json"
             v1_path.write_text(
                 json.dumps(
@@ -1670,12 +1691,13 @@ class TaskStoreSchemaV2Test(unittest.TestCase):
             self.assertIsNone(legacy_task.effective_output_limits)
             self.assertIsNone(legacy_task.runtime_image_ref)
 
-            # Unknown versions fail closed (never silently migrate).
+            # Unknown versions fail closed (never silently migrate).  D11
+            # bumped the known versions to v1/v2/v3, so v4 is the unknown one.
             bad_path = Path(tmp) / "state-bad.json"
             bad_path.write_text(
                 json.dumps(
                     {
-                        "schema_version": "sandbox_task_store_v3",
+                        "schema_version": "sandbox_task_store_v4",
                         "tasks": {},
                         "operations": {},
                     }
@@ -1700,8 +1722,15 @@ class ProcessTaskPersistenceTest(unittest.IsolatedAsyncioTestCase):
         self._tmp = tempfile.TemporaryDirectory(prefix="af-ptask-test-")
         self.root = Path(self._tmp.name).resolve()
         _make_dataset(self.root)
+        # D11: host fake session cannot create /run — see WrapperPathFunctionalTest.
+        self._saved_control_root = os.environ.get("AF_TASK_CONTROL_ROOT")
+        os.environ["AF_TASK_CONTROL_ROOT"] = str(self.root / "task-control")
 
     def tearDown(self):
+        if self._saved_control_root is None:
+            os.environ.pop("AF_TASK_CONTROL_ROOT", None)
+        else:
+            os.environ["AF_TASK_CONTROL_ROOT"] = self._saved_control_root
         self._tmp.cleanup()
 
     def _harness(self, session_cls):
@@ -1804,6 +1833,8 @@ class ProcessTaskPersistenceTest(unittest.IsolatedAsyncioTestCase):
             "unknownMarkerLines": 0,
             "unknownMarkerBytes": 0,
             "unknownMarkerTruncated": False,
+            # D11: the 14th frozen key — a consistent capture carries it.
+            "cancelObserved": False,
         }
         tampered_document = json.dumps(
             {
@@ -1848,7 +1879,7 @@ class ProcessTaskPersistenceTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(task.error, task.result.stderr)
 
             persisted = json.loads(state_path.read_text(encoding="utf-8"))
-            self.assertEqual(persisted["schema_version"], "sandbox_task_store_v2")
+            self.assertEqual(persisted["schema_version"], "sandbox_task_store_v3")
             saved_result = persisted["tasks"]["task-ptask-bad"]["result"]
             self.assertEqual(saved_result["stdout"], "")
             self.assertEqual(saved_result["stderr"], task.error)
@@ -1867,7 +1898,7 @@ class ProcessTaskPersistenceTest(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(task.status, main_module.TaskStatus.SUCCEEDED)
             persisted = json.loads(state_path.read_text(encoding="utf-8"))
-            self.assertEqual(persisted["schema_version"], "sandbox_task_store_v2")
+            self.assertEqual(persisted["schema_version"], "sandbox_task_store_v3")
             saved_task = persisted["tasks"]["task-ptask-ok"]
             saved_result = saved_task["result"]
             # The persisted stdout is EXACTLY the bounded §4.2 reassembly and
@@ -1986,8 +2017,15 @@ class SecurityFloorWiringTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory(prefix="af-wiring-floor-")
         self.root = Path(self._tmp.name).resolve()
         _make_dataset(self.root)
+        # D11: host fake session cannot create /run — see WrapperPathFunctionalTest.
+        self._saved_control_root = os.environ.get("AF_TASK_CONTROL_ROOT")
+        os.environ["AF_TASK_CONTROL_ROOT"] = str(self.root / "task-control")
 
     def tearDown(self):
+        if self._saved_control_root is None:
+            os.environ.pop("AF_TASK_CONTROL_ROOT", None)
+        else:
+            os.environ["AF_TASK_CONTROL_ROOT"] = self._saved_control_root
         self._tmp.cleanup()
 
     def _run_bounded(self, session, task_id, code, root=None):

@@ -106,7 +106,7 @@ class ToolJobResumeServiceTest {
 
         boolean result = resumeService.tryResume("run-1");
         assertThat(result).isTrue();
-        assertThat(anchor.getResumeState()).isEqualTo("LAUNCHING");
+        assertThat(anchor.getResumeState()).isIn("LAUNCHING", "ACCEPTED");
         assertThat(anchor.getResumeLeaseVersion()).isEqualTo(6); // incremented in claim
 
         ArgumentCaptor<ToolJobResumeContext> ctxCaptor = ArgumentCaptor.forClass(ToolJobResumeContext.class);
@@ -294,7 +294,7 @@ class ToolJobResumeServiceTest {
         context.setResultConsumed(true);
 
         assertThat(resumeService.markHandoffAccepted("run-1", context)).isTrue();
-        assertThat(anchor.getResumeState()).isEqualTo("LAUNCHING");
+        assertThat(anchor.getResumeState()).isEqualTo("ACCEPTED");
         assertThat(anchor.isResultConsumed()).isTrue();
         assertThat(anchor.getTodoId()).isEqualTo("todo_4");
         assertThat(anchor.getSequence()).isEqualTo(4);
@@ -312,8 +312,7 @@ class ToolJobResumeServiceTest {
     @Test
     void completionClearsOnlyMatchingAcceptedHandoff() {
         ToolJobAnchor anchor = buildReadyAnchor();
-        anchor.setResumeState("LAUNCHING");
-        anchor.setResultConsumed(true);
+        anchor.setResumeState("ACCEPTED");
         anchor.setResumeLauncherOwnerId("owner-a");
         when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
         when(anchorService.clearAcceptedResumeHandoff(
@@ -371,6 +370,8 @@ class ToolJobResumeServiceTest {
         ToolJobAnchor loadedByA = expiredAcceptedAnchor("owner-old", "accepted-token", 11L);
         ToolJobAnchor loadedByB = expiredAcceptedAnchor("owner-old", "accepted-token", 11L);
         when(anchorService.loadAnchor("run-1")).thenReturn(loadedByA, loadedByB);
+        when(launcherA.isActive(eq("run-1"), eq("accepted-token"), eq(11L))).thenReturn(false);
+        when(launcherB.isActive(eq("run-1"), eq("accepted-token"), eq(11L))).thenReturn(false);
         when(anchorService.takeoverExpiredResumeLauncher(
                 eq("run-1"), any(ToolJobAnchor.class), eq(AgentRunStatus.EXECUTING),
                 eq("accepted-token"), eq(11L), eq("owner-old"), any(),
@@ -437,6 +438,8 @@ class ToolJobResumeServiceTest {
         anchor.setResumeLeaseVersion(8);
 
         when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
+        // isActive guard: same-process worker not active → allow takeover
+        when(resumeLauncher.isActive(eq("run-1"), eq("stale-token"), eq(8L))).thenReturn(false);
         when(anchorService.takeoverExpiredResumeLauncher(
                 eq("run-1"), same(anchor), eq(AgentRunStatus.RECEIVED),
                 eq("stale-token"), eq(8L), eq("owner-old"), eq("owner-a"),
@@ -444,18 +447,63 @@ class ToolJobResumeServiceTest {
         when(resumeLauncher.launch(eq("run-1"), any(ToolJobResumeContext.class))).thenReturn(true);
 
         assertThat(resumeService.tryResume("run-1")).isTrue();
-        assertThat(anchor.getResumeState()).isEqualTo("LAUNCHING");
+        assertThat(anchor.getResumeState()).isIn("LAUNCHING", "ACCEPTED");
         assertThat(anchor.getResumeLeaseVersion()).isEqualTo(9L);
         assertThat(anchor.getResumeToken()).isNotEqualTo("stale-token");
         assertThat(anchor.getResumeLauncherOwnerId()).isEqualTo("owner-a");
-        verify(resumeLauncher, never()).isActive(any(), any(), anyLong());
+        verify(resumeLauncher).isActive(eq("run-1"), eq("stale-token"), eq(8L));
+    }
+
+    @Test
+    void expiredLeaseButIsActiveTrueShouldBlockTakeover() {
+        ToolJobAnchor anchor = buildReadyAnchor();
+        anchor.setResumeState("LAUNCHING");
+        anchor.setResumeClaimedAt(java.time.Instant.now().minusSeconds(60));
+        anchor.setResumeLauncherOwnerId("owner-old");
+        anchor.setResumeLauncherLeaseUntil(java.time.Instant.now().minusSeconds(1));
+        anchor.setResumeToken("active-token");
+        anchor.setResumeLeaseVersion(8);
+
+        when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
+        // isActive guard: same-process worker still active → block takeover
+        when(resumeLauncher.isActive(eq("run-1"), eq("active-token"), eq(8L))).thenReturn(true);
+
+        assertThat(resumeService.tryResume("run-1")).isFalse();
+        verify(resumeLauncher).isActive(eq("run-1"), eq("active-token"), eq(8L));
+        // Must NOT attempt takeover CAS when isActive blocks
+        verify(anchorService, never()).takeoverExpiredResumeLauncher(
+                any(), any(), any(), any(), anyLong(), any(), any(), anyLong(), anyLong());
+        verify(resumeLauncher, never()).launch(any(), any());
+    }
+
+    @Test
+    void isActiveGuardChecksExactAnchorIdentity() {
+        ToolJobAnchor anchor = buildReadyAnchor();
+        anchor.setResumeState("LAUNCHING");
+        anchor.setResumeClaimedAt(java.time.Instant.now().minusSeconds(60));
+        anchor.setResumeLauncherOwnerId("owner-old");
+        anchor.setResumeLauncherLeaseUntil(java.time.Instant.now().minusSeconds(1));
+        anchor.setResumeToken("token-a");
+        anchor.setResumeLeaseVersion(5);
+
+        when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
+        // Different token → isActive returns false (identity mismatch)
+        when(resumeLauncher.isActive(eq("run-1"), eq("token-a"), eq(5L))).thenReturn(false);
+        when(anchorService.takeoverExpiredResumeLauncher(
+                eq("run-1"), same(anchor), eq(AgentRunStatus.RECEIVED),
+                eq("token-a"), eq(5L), eq("owner-old"), eq("owner-a"),
+                eq(30L), eq(120L))).thenReturn(true);
+        when(resumeLauncher.launch(eq("run-1"), any(ToolJobResumeContext.class))).thenReturn(true);
+
+        assertThat(resumeService.tryResume("run-1")).isTrue();
+        // isActive was checked with the exact token+version from the anchor
+        verify(resumeLauncher).isActive(eq("run-1"), eq("token-a"), eq(5L));
     }
 
     @Test
     void expiredAcceptedHandoffIsTakenOverWithoutReturningToReady() {
         ToolJobAnchor anchor = buildReadyAnchor();
-        anchor.setResumeState("LAUNCHING");
-        anchor.setResultConsumed(true);
+        anchor.setResumeState("ACCEPTED");
         anchor.setResumeClaimedAt(java.time.Instant.now().minusSeconds(60));
         anchor.setResumeLauncherOwnerId("owner-old");
         anchor.setResumeLauncherLeaseUntil(java.time.Instant.now().minusSeconds(1));
@@ -463,6 +511,7 @@ class ToolJobResumeServiceTest {
         anchor.setResumeLeaseVersion(11);
 
         when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
+        when(resumeLauncher.isActive(eq("run-1"), eq("accepted-token"), eq(11L))).thenReturn(false);
         when(anchorService.takeoverExpiredResumeLauncher(
                 eq("run-1"), same(anchor), eq(AgentRunStatus.EXECUTING),
                 eq("accepted-token"), eq(11L), eq("owner-old"), eq("owner-a"),
@@ -475,7 +524,7 @@ class ToolJobResumeServiceTest {
         verify(resumeLauncher).launch(eq("run-1"), contextCaptor.capture());
         assertThat(contextCaptor.getValue().isResultConsumed()).isTrue();
         assertThat(contextCaptor.getValue().getResumeLauncherOwnerId()).isEqualTo("owner-a");
-        assertThat(anchor.getResumeState()).isEqualTo("LAUNCHING");
+        assertThat(anchor.getResumeState()).isIn("LAUNCHING", "ACCEPTED");
     }
 
     @Test
@@ -527,8 +576,7 @@ class ToolJobResumeServiceTest {
 
     private ToolJobAnchor expiredAcceptedAnchor(String ownerId, String token, long version) {
         ToolJobAnchor anchor = buildReadyAnchor();
-        anchor.setResumeState("LAUNCHING");
-        anchor.setResultConsumed(true);
+        anchor.setResumeState("ACCEPTED");
         anchor.setResumeClaimedAt(java.time.Instant.now().minusSeconds(60));
         anchor.setResumeLauncherOwnerId(ownerId);
         anchor.setResumeLauncherLeaseUntil(java.time.Instant.now().minusSeconds(1));

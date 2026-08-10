@@ -98,6 +98,40 @@ class ToolJobResumeLauncherImplTest {
         assertThat(launcher.isActive("run-1", "token-1", 7L)).isFalse();
     }
 
+    @Test
+    void isActiveMatchesExactIdentityAcrossTokenVersionAndRunId() {
+        AgentRunMapper runMapper = mock(AgentRunMapper.class);
+        LangchainLinearRunPipelineImpl pipeline = mock(LangchainLinearRunPipelineImpl.class);
+        @SuppressWarnings("unchecked")
+        ObjectProvider<ToolJobResumeService> provider = mock(ObjectProvider.class);
+        ToolJobResumeService resumeService = mock(ToolJobResumeService.class);
+        when(provider.getIfAvailable()).thenReturn(resumeService);
+        AgentRun run = new AgentRun();
+        run.setId("run-1");
+        when(runMapper.findById("run-1")).thenReturn(run);
+        when(pipeline.launchResumedAsync(eq(run), any(), any(), any())).thenReturn(true);
+
+        ToolJobResumeLauncherImpl launcher = new ToolJobResumeLauncherImpl(runMapper, pipeline, provider);
+
+        ToolJobResumeContext ctx = new ToolJobResumeContext();
+        ctx.setRunId("run-1");
+        ctx.setTodoId("todo-2");
+        ctx.setResumeToken("token-a");
+        ctx.setResumeLeaseVersion(5);
+        ctx.setResumeLauncherOwnerId("owner-1");
+
+        launcher.launch("run-1", ctx);
+
+        // Exact identity match
+        assertThat(launcher.isActive("run-1", "token-a", 5L)).isTrue();
+        // Different token → NOT active
+        assertThat(launcher.isActive("run-1", "token-b", 5L)).isFalse();
+        // Same token, different version → NOT active
+        assertThat(launcher.isActive("run-1", "token-a", 6L)).isFalse();
+        // Different runId → NOT active
+        assertThat(launcher.isActive("run-2", "token-a", 5L)).isFalse();
+    }
+
     private static ToolJobResumeContext context() {
         ToolJobResumeContext context = new ToolJobResumeContext();
         context.setRunId("run-1");

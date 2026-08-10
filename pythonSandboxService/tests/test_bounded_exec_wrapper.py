@@ -190,6 +190,8 @@ class BoundedExecWrapperTest(unittest.TestCase):
         self.assertEqual(result["unknownMarkerLines"], 0)
         self.assertEqual(result["unknownMarkerBytes"], 0)
         self.assertFalse(result["unknownMarkerTruncated"])
+        # D11: a plain run has no cancel marker — no cancellation evidence.
+        self.assertFalse(result["cancelObserved"])
 
         records_path = self._capture_dir() / "finance-records.jsonl"
         if records_path.exists():
@@ -200,9 +202,10 @@ class BoundedExecWrapperTest(unittest.TestCase):
         )
 
     def test_capture_result_json_matches_spec_field_shape(self) -> None:
-        """§7.1 capture-result.json shape: exactly the ten frozen keys plus
-        the three internal unknown-marker audit counters (§4.1/§4.2); nothing
-        else may appear (the reader rejects unknown keys fail-closed)."""
+        """§7.1 capture-result.json shape: exactly the ten frozen keys, the
+        D11 cancelObserved flag, plus the three internal unknown-marker audit
+        counters (§4.1/§4.2); nothing else may appear (the reader rejects
+        unknown keys fail-closed)."""
         script = self._write_script("print('shape-probe')\n")
         self._run_wrapper(script)
 
@@ -224,6 +227,9 @@ class BoundedExecWrapperTest(unittest.TestCase):
             "unknownMarkerLines",
             "unknownMarkerBytes",
             "unknownMarkerTruncated",
+            # D11 (task #108): the cancellation-evidence flag, consumed by
+            # the runner to classify MARKER_OBSERVED cancellations.
+            "cancelObserved",
         }
         self.assertEqual(set(result.keys()), expected_fields)
 

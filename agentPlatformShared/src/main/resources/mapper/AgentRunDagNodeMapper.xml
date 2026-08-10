@@ -1,0 +1,1033 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="world.willfrog.agent.platform.mapper.AgentRunDagNodeMapper">
+
+    <!-- ==================== Stage 1: 计划写入 ==================== -->
+
+    <!-- 1a: CAS 写入 dag_frontier_json，同时推进 status=EXECUTING -->
+    <update id="casWriteFrontier">
+        UPDATE alphafrog_agent_run SET
+            dag_frontier_json = CAST(#{frontierJson} AS jsonb),
+            status = 'EXECUTING', updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{runId}
+          AND (dag_frontier_json IS NULL
+               OR ((dag_frontier_json #>> '{generation}')::bigint = #{oldGeneration}
+                   AND (dag_frontier_json #>> '{phase}')::text IN ('COMPLETED','CANCELLED')))
+    </update>
+
+    <!-- 1b: 批量插入 DRAFT 子节点，返回实际插入的多行 node_id -->
+    <select id="batchInsertChildren" resultType="string">
+        WITH inserted AS (
+            INSERT INTO alphafrog_agent_run_dag_node (run_id, generation, node_id, tool_job_anchor_json)
+            SELECT #{runId}, #{newGeneration}, n.node_id,
+                   '{"nodePhase":"DRAFT","nodeVersion":0}'::jsonb
+            FROM jsonb_array_elements_text(CAST(#{allNodeIdsJson} AS jsonb)) n(node_id)
+            ON CONFLICT (run_id, generation, node_id) DO NOTHING
+            RETURNING node_id
+        )
+        SELECT node_id FROM inserted ORDER BY node_id
+    </select>
+
+    <!-- ==================== Stage 2: per-node PREPARING ==================== -->
+
+    <!-- 2a: DRAFT → PREPARING CAS -->
+    <update id="casDraftToPreparing">
+        UPDATE alphafrog_agent_run_dag_node SET
+            tool_job_anchor_json = CAST(#{anchorJson} AS jsonb),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE run_id = #{runId} AND generation = #{generation} AND node_id = #{nodeId}
+          AND tool_job_anchor_json #>> '{nodePhase}' = 'DRAFT'
+          AND (tool_job_anchor_json #>> '{nodeVersion}')::bigint = #{expectedNodeVersion}
+          AND CAST(#{anchorJson} AS jsonb) IS NOT NULL
+          AND jsonb_typeof(CAST(#{anchorJson} AS jsonb)) = 'object'
+          AND CAST(#{anchorJson} AS jsonb) #>> '{nodePhase}' = 'PREPARING'
+          AND CAST(#{anchorJson} AS jsonb) #>> '{operationId}' = #{operationId}
+          AND CAST(#{anchorJson} AS jsonb) #>> '{toolCallId}' = #{toolCallId}
+          AND CAST(#{anchorJson} AS jsonb) #>> '{attempt}' = #{attempt}::text
+          AND CAST(#{anchorJson} AS jsonb) #>> '{requestDigest}' = #{requestDigest}
+          AND (CAST(#{anchorJson} AS jsonb) #>> '{nodeVersion}')::bigint = #{expectedNodeVersion} + 1
+          AND #{operationId} IS NOT NULL AND btrim(#{operationId}) &lt;&gt; ''
+          AND #{toolCallId} IS NOT NULL AND btrim(#{toolCallId}) &lt;&gt; ''
+          AND CAST(#{attempt} AS integer) &gt;= 1
+          AND #{requestDigest} ~ '^[0-9a-f]{64}$'
+    </update>
+
+    <!-- 2b: frontier nodeStates → SUSPENDING -->
+    <update id="updateFrontierNodeSuspending">
+        UPDATE alphafrog_agent_run SET
+            dag_frontier_json = jsonb_set(jsonb_set(dag_frontier_json,
+                  ARRAY['nodeStates', #{nodeId}], '"SUSPENDING"'::jsonb),
+                  '{frontierVersion}', to_jsonb(COALESCE((dag_frontier_json #>> '{frontierVersion}')::bigint,0) + 1)),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{runId}
+          AND (dag_frontier_json #>> '{generation}')::bigint = #{generation}
+          AND (dag_frontier_json #>> '{phase}')::text = 'SUSPENDING'
+          AND (dag_frontier_json #>> '{frontierVersion}')::bigint = #{expectedFrontierVersion}
+          AND (dag_frontier_json #>> '{cancelled}')::boolean IS NOT TRUE
+          AND status = 'EXECUTING'
+    </update>
+
+    <!-- 2c: 诊断查询 — 2a 返回 0 时读取当前 anchor -->
+    <select id="selectAnchorForDiagnostic" resultType="string">
+        SELECT tool_job_anchor_json::text FROM alphafrog_agent_run_dag_node
+        WHERE run_id = #{runId} AND generation = #{generation} AND node_id = #{nodeId}
+        FOR UPDATE
+    </select>
+
+    <!-- 2d: 显式失败回退 CTE -->
+    <update id="revertPreparingToDraft">
+        WITH reverted AS (
+            UPDATE alphafrog_agent_run_dag_node SET
+                tool_job_anchor_json = jsonb_build_object(
+                    'nodePhase','DRAFT',
+                    'nodeVersion',(tool_job_anchor_json #>> '{nodeVersion}')::bigint + 1),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE run_id = #{runId} AND generation = #{generation} AND node_id = #{nodeId}
+              AND tool_job_anchor_json #>> '{nodePhase}' = 'PREPARING'
+              AND (tool_job_anchor_json #>> '{nodeVersion}')::bigint = #{expectedNodeVersion}
+              AND tool_job_anchor_json #>> '{operationId}' = #{operationId}
+              AND tool_job_anchor_json #>> '{toolCallId}' = #{toolCallId}
+              AND tool_job_anchor_json #>> '{attempt}' = #{attempt}::text
+              AND tool_job_anchor_json #>> '{requestDigest}' = #{requestDigest}
+            RETURNING 1
+        )
+        UPDATE alphafrog_agent_run SET
+            dag_frontier_json = jsonb_set(jsonb_set(dag_frontier_json,
+                  ARRAY['nodeStates', #{nodeId}], '"PENDING"'::jsonb),
+                  '{frontierVersion}', to_jsonb(COALESCE((dag_frontier_json #>> '{frontierVersion}')::bigint,0) + 1)),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{runId}
+          AND (dag_frontier_json #>> '{generation}')::bigint = #{generation}
+          AND (dag_frontier_json #>> '{phase}')::text = 'SUSPENDING'
+          AND (dag_frontier_json #>> '{frontierVersion}')::bigint = #{expectedFrontierVersion}
+          AND (dag_frontier_json #>> '{cancelled}')::boolean IS NOT TRUE
+          AND status = 'EXECUTING'
+          AND EXISTS(SELECT 1 FROM reverted)
+    </update>
+
+    <!-- ==================== Stage 3: 聚合 ==================== -->
+
+    <!-- 3a: COMPLETED 聚合 -->
+    <update id="aggregateCompleted">
+        UPDATE alphafrog_agent_run r SET
+            dag_frontier_json = jsonb_set(
+              jsonb_set(jsonb_set(jsonb_set(r.dag_frontier_json,
+                ARRAY['nodeStates', #{nodeId}], '"COMPLETED"'::jsonb),
+                '{completedNodeIds}', COALESCE(r.dag_frontier_json->'completedNodeIds','{}'::jsonb) || jsonb_build_object(#{nodeId}, true)),
+                '{frontierVersion}', to_jsonb(COALESCE((r.dag_frontier_json #>> '{frontierVersion}')::bigint,0) + 1)),
+              ARRAY['completedOutputs', #{nodeId}],
+              (SELECT dn.tool_job_anchor_json->'resultJson'
+               FROM alphafrog_agent_run_dag_node dn
+               WHERE dn.run_id = r.id AND dn.generation = #{generation} AND dn.node_id = #{nodeId}
+                 AND dn.tool_job_anchor_json #>> '{nodePhase}' = 'FINALIZED'
+                 AND dn.tool_job_anchor_json #>> '{terminalOutcome}' = 'COMPLETED')),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE r.id = #{runId}
+          AND (r.dag_frontier_json #>> '{generation}')::bigint = #{generation}
+          AND (r.dag_frontier_json #>> '{phase}')::text = 'SUSPENDING'
+          AND (r.dag_frontier_json #>> '{frontierVersion}')::bigint = #{expectedFrontierVersion}
+          AND (r.dag_frontier_json #>> '{cancelled}')::boolean IS NOT TRUE
+          AND r.status = 'EXECUTING'
+          AND NOT COALESCE(r.dag_frontier_json->'completedNodeIds' ? #{nodeId}, false)
+          AND EXISTS (SELECT 1 FROM alphafrog_agent_run_dag_node dn
+              WHERE dn.run_id = r.id AND dn.generation = #{generation} AND dn.node_id = #{nodeId}
+                AND dn.tool_job_anchor_json #>> '{nodePhase}' = 'FINALIZED'
+                AND dn.tool_job_anchor_json #>> '{terminalOutcome}' = 'COMPLETED'
+                AND dn.tool_job_anchor_json #>> '{operationId}' = #{operationId}
+                AND dn.tool_job_anchor_json #>> '{toolCallId}' = #{toolCallId}
+                AND dn.tool_job_anchor_json #>> '{attempt}' = #{attempt}::text
+                AND dn.tool_job_anchor_json #>> '{requestDigest}' = #{requestDigest}
+                AND (dn.tool_job_anchor_json->'resultJson') IS NOT NULL
+                AND (dn.tool_job_anchor_json->'resultJson') IS DISTINCT FROM 'null'::jsonb
+                AND jsonb_typeof(dn.tool_job_anchor_json->'resultJson') = 'object')
+    </update>
+
+    <!-- 3b: FAILED 聚合 -->
+    <update id="aggregateFailed">
+        UPDATE alphafrog_agent_run r SET
+            dag_frontier_json = jsonb_set(
+              jsonb_set(jsonb_set(jsonb_set(r.dag_frontier_json,
+                ARRAY['nodeStates', #{nodeId}], '"FAILED"'::jsonb),
+                '{completedNodeIds}', COALESCE(r.dag_frontier_json->'completedNodeIds','{}'::jsonb) || jsonb_build_object(#{nodeId}, true)),
+                '{frontierVersion}', to_jsonb(COALESCE((r.dag_frontier_json #>> '{frontierVersion}')::bigint,0) + 1)),
+              ARRAY['completedErrors', #{nodeId}],
+              (SELECT dn.tool_job_anchor_json->'terminalError'
+               FROM alphafrog_agent_run_dag_node dn
+               WHERE dn.run_id = r.id AND dn.generation = #{generation} AND dn.node_id = #{nodeId}
+                 AND dn.tool_job_anchor_json #>> '{nodePhase}' = 'FINALIZED'
+                 AND dn.tool_job_anchor_json #>> '{terminalOutcome}' = 'FAILED')),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE r.id = #{runId}
+          AND (r.dag_frontier_json #>> '{generation}')::bigint = #{generation}
+          AND (r.dag_frontier_json #>> '{phase}')::text = 'SUSPENDING'
+          AND (r.dag_frontier_json #>> '{frontierVersion}')::bigint = #{expectedFrontierVersion}
+          AND (r.dag_frontier_json #>> '{cancelled}')::boolean IS NOT TRUE
+          AND r.status = 'EXECUTING'
+          AND NOT COALESCE(r.dag_frontier_json->'completedNodeIds' ? #{nodeId}, false)
+          AND EXISTS (SELECT 1 FROM alphafrog_agent_run_dag_node dn
+              WHERE dn.run_id = r.id AND dn.generation = #{generation} AND dn.node_id = #{nodeId}
+                AND dn.tool_job_anchor_json #>> '{nodePhase}' = 'FINALIZED'
+                AND dn.tool_job_anchor_json #>> '{terminalOutcome}' = 'FAILED'
+                AND dn.tool_job_anchor_json #>> '{operationId}' = #{operationId}
+                AND dn.tool_job_anchor_json #>> '{toolCallId}' = #{toolCallId}
+                AND dn.tool_job_anchor_json #>> '{attempt}' = #{attempt}::text
+                AND dn.tool_job_anchor_json #>> '{requestDigest}' = #{requestDigest}
+                AND (dn.tool_job_anchor_json->'terminalError') IS NOT NULL
+                AND (dn.tool_job_anchor_json->'terminalError') IS DISTINCT FROM 'null'::jsonb
+                AND jsonb_typeof(dn.tool_job_anchor_json->'terminalError') = 'object'
+                AND (dn.tool_job_anchor_json->'terminalError') ? 'errorCode'
+                AND jsonb_typeof(dn.tool_job_anchor_json->'terminalError'->'errorCode') = 'string'
+                AND btrim(dn.tool_job_anchor_json #>> '{terminalError,errorCode}') &lt;&gt; ''
+                AND (dn.tool_job_anchor_json->'terminalError') ? 'message'
+                AND jsonb_typeof(dn.tool_job_anchor_json->'terminalError'->'message') = 'string'
+                AND btrim(dn.tool_job_anchor_json #>> '{terminalError,message}') &lt;&gt; '')
+    </update>
+
+    <!-- ==================== Stage 4: 普通节点终态 ==================== -->
+
+    <update id="stage4CompleteFrontier">
+        UPDATE alphafrog_agent_run SET
+            dag_frontier_json = jsonb_set(jsonb_set(jsonb_set(jsonb_set(
+              jsonb_set(dag_frontier_json,
+                '{sharedContext}', COALESCE(dag_frontier_json->'sharedContext','{}'::jsonb) || COALESCE(CAST(#{sharedContextPatch} AS jsonb),'{}'::jsonb)),
+              ARRAY['nodeStates', #{nodeId}], '"COMPLETED"'::jsonb),
+              '{completedNodeIds}', COALESCE(dag_frontier_json->'completedNodeIds','{}'::jsonb) || jsonb_build_object(#{nodeId}, true)),
+              ARRAY['completedOutputs', #{nodeId}], CAST(#{outputJson} AS jsonb)),
+              '{frontierVersion}', to_jsonb(COALESCE((dag_frontier_json #>> '{frontierVersion}')::bigint,0) + 1)),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{runId}
+          AND (dag_frontier_json #>> '{generation}')::bigint = #{generation}
+          AND (dag_frontier_json #>> '{phase}')::text IN ('SUSPENDING','RESUMING')
+          AND (dag_frontier_json #>> '{frontierVersion}')::bigint = #{expectedFrontierVersion}
+          AND (dag_frontier_json #>> '{cancelled}')::boolean IS NOT TRUE
+          AND status IN ('EXECUTING','WAITING_TOOL_JOB')
+          AND ((dag_frontier_json #>> '{phase}')::text &lt;&gt; 'RESUMING'
+               OR ((dag_frontier_json #>> '{resumeToken}')::text = #{resumeToken}
+                   AND (dag_frontier_json #>> '{resumeLauncherOwnerId}')::text = #{ownerId}
+                   AND (dag_frontier_json #>> '{resumeLeaseVersion}')::bigint = #{expectedResumeLeaseVersion}))
+          AND NOT COALESCE(dag_frontier_json->'completedNodeIds' ? #{nodeId}, false)
+          AND jsonb_typeof(COALESCE(dag_frontier_json->'sharedContext','{}'::jsonb)) = 'object'
+          AND CAST(#{outputJson} AS jsonb) IS NOT NULL
+          AND jsonb_typeof(CAST(#{outputJson} AS jsonb)) = 'object'
+          AND CAST(#{outputJson} AS jsonb) ? 'outputRef'
+    </update>
+
+    <update id="stage4CompleteChild">
+        UPDATE alphafrog_agent_run_dag_node SET
+            tool_job_anchor_json = jsonb_build_object(
+                'nodePhase','FINALIZED','terminalOutcome','COMPLETED',
+                'nodeVersion',COALESCE((tool_job_anchor_json #>> '{nodeVersion}')::bigint,0) + 1),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE run_id = #{runId} AND generation = #{generation} AND node_id = #{nodeId}
+          AND tool_job_anchor_json #>> '{nodePhase}' = 'DRAFT'
+          AND (tool_job_anchor_json #>> '{nodeVersion}')::bigint = 0
+    </update>
+
+    <update id="stage4FailedFrontier">
+        UPDATE alphafrog_agent_run SET
+            dag_frontier_json = jsonb_set(jsonb_set(jsonb_set(jsonb_set(
+              jsonb_set(dag_frontier_json,
+                '{sharedContext}', COALESCE(dag_frontier_json->'sharedContext','{}'::jsonb) || COALESCE(CAST(#{sharedContextPatch} AS jsonb),'{}'::jsonb)),
+              ARRAY['nodeStates', #{nodeId}], '"FAILED"'::jsonb),
+              '{completedNodeIds}', COALESCE(dag_frontier_json->'completedNodeIds','{}'::jsonb) || jsonb_build_object(#{nodeId}, true)),
+              ARRAY['completedErrors', #{nodeId}], CAST(#{errorJson} AS jsonb)),
+              '{frontierVersion}', to_jsonb(COALESCE((dag_frontier_json #>> '{frontierVersion}')::bigint,0) + 1)),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{runId}
+          AND (dag_frontier_json #>> '{generation}')::bigint = #{generation}
+          AND (dag_frontier_json #>> '{phase}')::text IN ('SUSPENDING','RESUMING')
+          AND (dag_frontier_json #>> '{frontierVersion}')::bigint = #{expectedFrontierVersion}
+          AND (dag_frontier_json #>> '{cancelled}')::boolean IS NOT TRUE
+          AND status IN ('EXECUTING','WAITING_TOOL_JOB')
+          AND ((dag_frontier_json #>> '{phase}')::text &lt;&gt; 'RESUMING'
+               OR ((dag_frontier_json #>> '{resumeToken}')::text = #{resumeToken}
+                   AND (dag_frontier_json #>> '{resumeLauncherOwnerId}')::text = #{ownerId}
+                   AND (dag_frontier_json #>> '{resumeLeaseVersion}')::bigint = #{expectedResumeLeaseVersion}))
+          AND NOT COALESCE(dag_frontier_json->'completedNodeIds' ? #{nodeId}, false)
+          AND CAST(#{errorJson} AS jsonb) IS NOT NULL
+          AND jsonb_typeof(CAST(#{errorJson} AS jsonb)) = 'object'
+          AND CAST(#{errorJson} AS jsonb) ? 'errorCode'
+          AND CAST(#{errorJson} AS jsonb) ? 'message'
+    </update>
+
+    <update id="stage4FailedChild">
+        UPDATE alphafrog_agent_run_dag_node SET
+            tool_job_anchor_json = jsonb_build_object(
+                'nodePhase','FINALIZED','terminalOutcome','FAILED',
+                'terminalError',CAST(#{errorJson} AS jsonb),
+                'nodeVersion',COALESCE((tool_job_anchor_json #>> '{nodeVersion}')::bigint,0) + 1),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE run_id = #{runId} AND generation = #{generation} AND node_id = #{nodeId}
+          AND tool_job_anchor_json #>> '{nodePhase}' = 'DRAFT'
+          AND (tool_job_anchor_json #>> '{nodeVersion}')::bigint = 0
+    </update>
+
+    <update id="stage4SkippedFrontier">
+        UPDATE alphafrog_agent_run SET
+            dag_frontier_json = jsonb_set(jsonb_set(jsonb_set(jsonb_set(
+              jsonb_set(dag_frontier_json,
+                '{sharedContext}', COALESCE(dag_frontier_json->'sharedContext','{}'::jsonb) || COALESCE(CAST(#{sharedContextPatch} AS jsonb),'{}'::jsonb)),
+              ARRAY['nodeStates', #{nodeId}], '"SKIPPED"'::jsonb),
+              '{completedNodeIds}', COALESCE(dag_frontier_json->'completedNodeIds','{}'::jsonb) || jsonb_build_object(#{nodeId}, true)),
+              ARRAY['completedErrors', #{nodeId}], CAST(#{errorJson} AS jsonb)),
+              '{frontierVersion}', to_jsonb(COALESCE((dag_frontier_json #>> '{frontierVersion}')::bigint,0) + 1)),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{runId}
+          AND (dag_frontier_json #>> '{generation}')::bigint = #{generation}
+          AND (dag_frontier_json #>> '{phase}')::text IN ('SUSPENDING','RESUMING')
+          AND (dag_frontier_json #>> '{frontierVersion}')::bigint = #{expectedFrontierVersion}
+          AND (dag_frontier_json #>> '{cancelled}')::boolean IS NOT TRUE
+          AND status IN ('EXECUTING','WAITING_TOOL_JOB')
+          AND ((dag_frontier_json #>> '{phase}')::text &lt;&gt; 'RESUMING'
+               OR ((dag_frontier_json #>> '{resumeToken}')::text = #{resumeToken}
+                   AND (dag_frontier_json #>> '{resumeLauncherOwnerId}')::text = #{ownerId}
+                   AND (dag_frontier_json #>> '{resumeLeaseVersion}')::bigint = #{expectedResumeLeaseVersion}))
+          AND NOT COALESCE(dag_frontier_json->'completedNodeIds' ? #{nodeId}, false)
+          AND CAST(#{errorJson} AS jsonb) IS NOT NULL
+          AND jsonb_typeof(CAST(#{errorJson} AS jsonb)) = 'object'
+          AND CAST(#{errorJson} AS jsonb) #>> '{errorCode}' = 'SKIPPED'
+    </update>
+
+    <update id="stage4SkippedChild">
+        UPDATE alphafrog_agent_run_dag_node SET
+            tool_job_anchor_json = jsonb_build_object(
+                'nodePhase','FINALIZED','terminalOutcome','FAILED',
+                'terminalError',CAST(#{errorJson} AS jsonb),
+                'nodeVersion',COALESCE((tool_job_anchor_json #>> '{nodeVersion}')::bigint,0) + 1),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE run_id = #{runId} AND generation = #{generation} AND node_id = #{nodeId}
+          AND tool_job_anchor_json #>> '{nodePhase}' = 'DRAFT'
+          AND (tool_job_anchor_json #>> '{nodeVersion}')::bigint = 0
+    </update>
+
+    <!-- ==================== Stage 5: 单节点收口 ==================== -->
+
+    <update id="writeB2Created">
+        UPDATE alphafrog_agent_run_dag_node dn SET
+            tool_job_anchor_json = dn.tool_job_anchor_json || jsonb_build_object(
+                'nodePhase','CREATED','taskId',#{taskId}::text,
+                'nodeVersion',COALESCE((dn.tool_job_anchor_json #>> '{nodeVersion}')::bigint,0) + 1),
+            updated_at = CURRENT_TIMESTAMP
+        FROM alphafrog_agent_run r
+        WHERE dn.run_id = r.id AND dn.run_id = #{runId}
+          AND dn.generation = #{generation} AND dn.node_id = #{nodeId}
+          AND dn.tool_job_anchor_json #>> '{nodePhase}' = 'PREPARING'
+          AND (dn.tool_job_anchor_json #>> '{nodeVersion}')::bigint = #{expectedNodeVersion}
+          AND dn.tool_job_anchor_json #>> '{operationId}' = #{operationId}
+          AND dn.tool_job_anchor_json #>> '{toolCallId}' = #{toolCallId}
+          AND dn.tool_job_anchor_json #>> '{attempt}' = #{attempt}::text
+          AND dn.tool_job_anchor_json #>> '{requestDigest}' = #{requestDigest}
+          AND (r.dag_frontier_json #>> '{generation}')::bigint = dn.generation
+          AND CAST(#{taskId} AS text) IS NOT NULL AND btrim(CAST(#{taskId} AS text)) &lt;&gt; ''
+    </update>
+
+    <update id="write5bTerminal">
+        UPDATE alphafrog_agent_run_dag_node dn SET
+            tool_job_anchor_json = dn.tool_job_anchor_json || jsonb_build_object(
+                'nodePhase','TERMINAL','terminalOutcome',#{outcome}::text,
+                'terminalError',CAST(#{terminalErrorJson} AS jsonb),
+                'nodeVersion',COALESCE((dn.tool_job_anchor_json #>> '{nodeVersion}')::bigint,0) + 1),
+            updated_at = CURRENT_TIMESTAMP
+        FROM alphafrog_agent_run r
+        WHERE dn.run_id = r.id AND dn.run_id = #{runId}
+          AND dn.generation = #{generation} AND dn.node_id = #{nodeId}
+          AND dn.tool_job_anchor_json #>> '{nodePhase}' IN ('PREPARING','CREATED','RUNNING')
+          AND (dn.tool_job_anchor_json #>> '{nodeVersion}')::bigint = #{expectedNodeVersion}
+          AND dn.tool_job_anchor_json #>> '{operationId}' = #{operationId}
+          AND dn.tool_job_anchor_json #>> '{toolCallId}' = #{toolCallId}
+          AND dn.tool_job_anchor_json #>> '{attempt}' = #{attempt}::text
+          AND dn.tool_job_anchor_json #>> '{requestDigest}' = #{requestDigest}
+          AND (r.dag_frontier_json #>> '{generation}')::bigint = dn.generation
+          AND #{outcome}::text IN ('COMPLETED','FAILED','CANCELED')
+    </update>
+
+    <update id="write5cResultValidated">
+        UPDATE alphafrog_agent_run_dag_node dn SET
+            tool_job_anchor_json = dn.tool_job_anchor_json || jsonb_build_object(
+                'nodePhase','RESULT_VALIDATED','resultJson',CAST(#{resultJson} AS jsonb),
+                'nodeVersion',COALESCE((dn.tool_job_anchor_json #>> '{nodeVersion}')::bigint,0) + 1),
+            updated_at = CURRENT_TIMESTAMP
+        FROM alphafrog_agent_run r
+        WHERE dn.run_id = r.id AND dn.run_id = #{runId}
+          AND dn.generation = #{generation} AND dn.node_id = #{nodeId}
+          AND dn.tool_job_anchor_json #>> '{nodePhase}' = 'TERMINAL'
+          AND dn.tool_job_anchor_json #>> '{terminalOutcome}' = 'COMPLETED'
+          AND (dn.tool_job_anchor_json #>> '{nodeVersion}')::bigint = #{expectedNodeVersion}
+          AND dn.tool_job_anchor_json #>> '{operationId}' = #{operationId}
+          AND dn.tool_job_anchor_json #>> '{toolCallId}' = #{toolCallId}
+          AND dn.tool_job_anchor_json #>> '{attempt}' = #{attempt}::text
+          AND dn.tool_job_anchor_json #>> '{requestDigest}' = #{requestDigest}
+          AND (r.dag_frontier_json #>> '{generation}')::bigint = dn.generation
+          AND CAST(#{resultJson} AS jsonb) IS NOT NULL
+          AND CAST(#{resultJson} AS jsonb) IS DISTINCT FROM 'null'::jsonb
+          AND jsonb_typeof(CAST(#{resultJson} AS jsonb)) = 'object'
+    </update>
+
+    <update id="write5dUsageRecorded">
+        UPDATE alphafrog_agent_run_dag_node dn SET
+            tool_job_anchor_json = dn.tool_job_anchor_json || CASE
+                WHEN dn.tool_job_anchor_json #>> '{terminalOutcome}' = 'FAILED'
+                 AND dn.tool_job_anchor_json #>> '{terminalError,errorCode}' = 'RESULT_LOST'
+                THEN jsonb_build_object(
+                    'nodePhase','USAGE_RECORDED','usageRecorded',true,
+                    'usageRecordId',0,'payloadSha256','','usageStatus','MISSING',
+                    'modelId','unknown','tokensIn',0,'tokensOut',0,'costUSD',0,
+                    'nodeVersion',COALESCE((dn.tool_job_anchor_json #>> '{nodeVersion}')::bigint,0) + 1)
+                ELSE jsonb_build_object(
+                    'nodePhase','USAGE_RECORDED','usageRecorded',true,
+                    'usageRecordId',#{usageRecordId}::bigint,'payloadSha256',#{payloadSha256}::text,
+                    'nodeVersion',COALESCE((dn.tool_job_anchor_json #>> '{nodeVersion}')::bigint,0) + 1)
+                END,
+            updated_at = CURRENT_TIMESTAMP
+        FROM alphafrog_agent_run r
+        WHERE dn.run_id = r.id AND dn.run_id = #{runId}
+          AND dn.generation = #{generation} AND dn.node_id = #{nodeId}
+          AND (dn.tool_job_anchor_json #>> '{nodeVersion}')::bigint = #{expectedNodeVersion}
+          AND dn.tool_job_anchor_json #>> '{operationId}' = #{operationId}
+          AND dn.tool_job_anchor_json #>> '{toolCallId}' = #{toolCallId}
+          AND dn.tool_job_anchor_json #>> '{attempt}' = #{attempt}::text
+          AND dn.tool_job_anchor_json #>> '{requestDigest}' = #{requestDigest}
+          AND (r.dag_frontier_json #>> '{generation}')::bigint = dn.generation
+          AND ((dn.tool_job_anchor_json #>> '{nodePhase}' = 'RESULT_VALIDATED'
+                AND dn.tool_job_anchor_json #>> '{terminalOutcome}' = 'COMPLETED')
+               OR (dn.tool_job_anchor_json #>> '{nodePhase}' = 'TERMINAL'
+                   AND dn.tool_job_anchor_json #>> '{terminalOutcome}' IN ('FAILED','CANCELED')))
+          AND ((dn.tool_job_anchor_json #>> '{nodePhase}' = 'TERMINAL'
+                AND dn.tool_job_anchor_json #>> '{terminalOutcome}' = 'FAILED'
+                AND dn.tool_job_anchor_json #>> '{terminalError,errorCode}' = 'RESULT_LOST')
+               OR (#{usageRecordId} &gt; 0 AND #{payloadSha256} ~ '^[0-9a-f]{64}$'))
+    </update>
+
+    <update id="write5fReleased">
+        UPDATE alphafrog_agent_run_dag_node dn SET
+            tool_job_anchor_json = dn.tool_job_anchor_json || jsonb_build_object(
+                'nodePhase','RELEASED',
+                'nodeVersion',COALESCE((dn.tool_job_anchor_json #>> '{nodeVersion}')::bigint,0) + 1),
+            updated_at = CURRENT_TIMESTAMP
+        FROM alphafrog_agent_run r
+        WHERE dn.run_id = r.id AND dn.run_id = #{runId}
+          AND dn.generation = #{generation} AND dn.node_id = #{nodeId}
+          AND dn.tool_job_anchor_json #>> '{nodePhase}' = 'USAGE_RECORDED'
+          AND (dn.tool_job_anchor_json #>> '{nodeVersion}')::bigint = #{expectedNodeVersion}
+          AND dn.tool_job_anchor_json #>> '{operationId}' = #{operationId}
+          AND dn.tool_job_anchor_json #>> '{toolCallId}' = #{toolCallId}
+          AND dn.tool_job_anchor_json #>> '{attempt}' = #{attempt}::text
+          AND dn.tool_job_anchor_json #>> '{requestDigest}' = #{requestDigest}
+          AND (r.dag_frontier_json #>> '{generation}')::bigint = dn.generation
+    </update>
+
+    <update id="write5gFinalized">
+        UPDATE alphafrog_agent_run_dag_node dn SET
+            tool_job_anchor_json = dn.tool_job_anchor_json || jsonb_build_object(
+                'nodePhase','FINALIZED',
+                'nodeVersion',COALESCE((dn.tool_job_anchor_json #>> '{nodeVersion}')::bigint,0) + 1),
+            updated_at = CURRENT_TIMESTAMP
+        FROM alphafrog_agent_run r
+        WHERE dn.run_id = r.id AND dn.run_id = #{runId}
+          AND dn.generation = #{generation} AND dn.node_id = #{nodeId}
+          AND dn.tool_job_anchor_json #>> '{nodePhase}' = 'RELEASED'
+          AND (dn.tool_job_anchor_json #>> '{nodeVersion}')::bigint = #{expectedNodeVersion}
+          AND dn.tool_job_anchor_json #>> '{operationId}' = #{operationId}
+          AND dn.tool_job_anchor_json #>> '{toolCallId}' = #{toolCallId}
+          AND dn.tool_job_anchor_json #>> '{attempt}' = #{attempt}::text
+          AND dn.tool_job_anchor_json #>> '{requestDigest}' = #{requestDigest}
+          AND (r.dag_frontier_json #>> '{generation}')::bigint = dn.generation
+    </update>
+
+    <!-- 5h 聚合 ×5 -->
+
+    <update id="aggregate5hCompleted">
+        UPDATE alphafrog_agent_run r SET dag_frontier_json = jsonb_set(
+              jsonb_set(jsonb_set(jsonb_set(r.dag_frontier_json,
+                ARRAY['nodeStates', #{nodeId}], '"COMPLETED"'::jsonb),
+                '{completedNodeIds}', COALESCE(r.dag_frontier_json->'completedNodeIds','{}'::jsonb) || jsonb_build_object(#{nodeId}, true)),
+                '{frontierVersion}', to_jsonb(COALESCE((r.dag_frontier_json #>> '{frontierVersion}')::bigint,0) + 1)),
+              ARRAY['completedOutputs', #{nodeId}],
+              (SELECT dn.tool_job_anchor_json->'resultJson' FROM alphafrog_agent_run_dag_node dn
+               WHERE dn.run_id = r.id AND dn.generation = #{generation} AND dn.node_id = #{nodeId}
+                 AND dn.tool_job_anchor_json #>> '{nodePhase}' = 'FINALIZED'
+                 AND dn.tool_job_anchor_json #>> '{terminalOutcome}' = 'COMPLETED')),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE r.id = #{runId}
+          AND (r.dag_frontier_json #>> '{generation}')::bigint = #{generation}
+          AND (r.dag_frontier_json #>> '{phase}')::text IN ('SUSPENDING','SUSPENDED','RESUMING')
+          AND (r.dag_frontier_json #>> '{frontierVersion}')::bigint = #{expectedFrontierVersion}
+          AND (r.dag_frontier_json #>> '{cancelled}')::boolean IS NOT TRUE
+          AND r.status IN ('EXECUTING','WAITING_TOOL_JOB')
+          AND NOT COALESCE(r.dag_frontier_json->'completedNodeIds' ? #{nodeId}, false)
+          AND EXISTS (SELECT 1 FROM alphafrog_agent_run_dag_node dn
+              WHERE dn.run_id = r.id AND dn.generation = #{generation} AND dn.node_id = #{nodeId}
+                AND dn.tool_job_anchor_json #>> '{nodePhase}' = 'FINALIZED'
+                AND dn.tool_job_anchor_json #>> '{terminalOutcome}' = 'COMPLETED'
+                AND dn.tool_job_anchor_json #>> '{operationId}' = #{operationId}
+                AND dn.tool_job_anchor_json #>> '{toolCallId}' = #{toolCallId}
+                AND dn.tool_job_anchor_json #>> '{attempt}' = #{attempt}::text
+                AND dn.tool_job_anchor_json #>> '{requestDigest}' = #{requestDigest}
+                AND (dn.tool_job_anchor_json->'resultJson') IS NOT NULL
+                AND jsonb_typeof(dn.tool_job_anchor_json->'resultJson') = 'object')
+    </update>
+
+    <update id="aggregate5hFailed">
+        UPDATE alphafrog_agent_run r SET dag_frontier_json = jsonb_set(
+              jsonb_set(jsonb_set(jsonb_set(r.dag_frontier_json,
+                ARRAY['nodeStates', #{nodeId}], '"FAILED"'::jsonb),
+                '{completedNodeIds}', COALESCE(r.dag_frontier_json->'completedNodeIds','{}'::jsonb) || jsonb_build_object(#{nodeId}, true)),
+                '{frontierVersion}', to_jsonb(COALESCE((r.dag_frontier_json #>> '{frontierVersion}')::bigint,0) + 1)),
+              ARRAY['completedErrors', #{nodeId}],
+              (SELECT dn.tool_job_anchor_json->'terminalError' FROM alphafrog_agent_run_dag_node dn
+               WHERE dn.run_id = r.id AND dn.generation = #{generation} AND dn.node_id = #{nodeId}
+                 AND dn.tool_job_anchor_json #>> '{nodePhase}' = 'FINALIZED'
+                 AND dn.tool_job_anchor_json #>> '{terminalOutcome}' = 'FAILED')),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE r.id = #{runId}
+          AND (r.dag_frontier_json #>> '{generation}')::bigint = #{generation}
+          AND (r.dag_frontier_json #>> '{phase}')::text IN ('SUSPENDING','SUSPENDED','RESUMING')
+          AND (r.dag_frontier_json #>> '{frontierVersion}')::bigint = #{expectedFrontierVersion}
+          AND (r.dag_frontier_json #>> '{cancelled}')::boolean IS NOT TRUE
+          AND r.status IN ('EXECUTING','WAITING_TOOL_JOB')
+          AND NOT COALESCE(r.dag_frontier_json->'completedNodeIds' ? #{nodeId}, false)
+          AND EXISTS (SELECT 1 FROM alphafrog_agent_run_dag_node dn
+              WHERE dn.run_id = r.id AND dn.generation = #{generation} AND dn.node_id = #{nodeId}
+                AND dn.tool_job_anchor_json #>> '{nodePhase}' = 'FINALIZED'
+                AND dn.tool_job_anchor_json #>> '{terminalOutcome}' = 'FAILED'
+                AND dn.tool_job_anchor_json #>> '{operationId}' = #{operationId}
+                AND dn.tool_job_anchor_json #>> '{toolCallId}' = #{toolCallId}
+                AND dn.tool_job_anchor_json #>> '{attempt}' = #{attempt}::text
+                AND dn.tool_job_anchor_json #>> '{requestDigest}' = #{requestDigest}
+                AND (dn.tool_job_anchor_json->'terminalError') IS NOT NULL
+                AND (dn.tool_job_anchor_json->'terminalError') ? 'errorCode'
+                AND (dn.tool_job_anchor_json->'terminalError') ? 'message')
+    </update>
+
+    <update id="aggregate5hCancelCompleted">
+        UPDATE alphafrog_agent_run r SET dag_frontier_json = jsonb_set(
+              jsonb_set(jsonb_set(jsonb_set(r.dag_frontier_json,
+                ARRAY['nodeStates', #{nodeId}], '"COMPLETED"'::jsonb),
+                '{completedNodeIds}', COALESCE(r.dag_frontier_json->'completedNodeIds','{}'::jsonb) || jsonb_build_object(#{nodeId}, true)),
+                '{frontierVersion}', to_jsonb(COALESCE((r.dag_frontier_json #>> '{frontierVersion}')::bigint,0) + 1)),
+              ARRAY['completedOutputs', #{nodeId}],
+              (SELECT dn.tool_job_anchor_json->'resultJson' FROM alphafrog_agent_run_dag_node dn
+               WHERE dn.run_id = r.id AND dn.generation = #{generation} AND dn.node_id = #{nodeId}
+                 AND dn.tool_job_anchor_json #>> '{nodePhase}' = 'FINALIZED'
+                 AND dn.tool_job_anchor_json #>> '{terminalOutcome}' = 'COMPLETED')),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE r.id = #{runId}
+          AND (r.dag_frontier_json #>> '{generation}')::bigint = #{generation}
+          AND (r.dag_frontier_json #>> '{phase}')::text = 'CANCELLING'
+          AND (r.dag_frontier_json #>> '{frontierVersion}')::bigint = #{expectedFrontierVersion}
+          AND (r.dag_frontier_json #>> '{cancelled}')::boolean IS TRUE
+          AND r.status IN ('EXECUTING','WAITING_TOOL_JOB')
+          AND NOT COALESCE(r.dag_frontier_json->'completedNodeIds' ? #{nodeId}, false)
+          AND EXISTS (SELECT 1 FROM alphafrog_agent_run_dag_node dn
+              WHERE dn.run_id = r.id AND dn.generation = #{generation} AND dn.node_id = #{nodeId}
+                AND dn.tool_job_anchor_json #>> '{nodePhase}' = 'FINALIZED'
+                AND dn.tool_job_anchor_json #>> '{terminalOutcome}' = 'COMPLETED'
+                AND dn.tool_job_anchor_json #>> '{operationId}' = #{operationId}
+                AND dn.tool_job_anchor_json #>> '{toolCallId}' = #{toolCallId}
+                AND dn.tool_job_anchor_json #>> '{attempt}' = #{attempt}::text
+                AND dn.tool_job_anchor_json #>> '{requestDigest}' = #{requestDigest}
+                AND (dn.tool_job_anchor_json->'resultJson') IS NOT NULL
+                AND jsonb_typeof(dn.tool_job_anchor_json->'resultJson') = 'object')
+    </update>
+
+    <update id="aggregate5hCancelFailed">
+        UPDATE alphafrog_agent_run r SET dag_frontier_json = jsonb_set(
+              jsonb_set(jsonb_set(jsonb_set(r.dag_frontier_json,
+                ARRAY['nodeStates', #{nodeId}], '"FAILED"'::jsonb),
+                '{completedNodeIds}', COALESCE(r.dag_frontier_json->'completedNodeIds','{}'::jsonb) || jsonb_build_object(#{nodeId}, true)),
+                '{frontierVersion}', to_jsonb(COALESCE((r.dag_frontier_json #>> '{frontierVersion}')::bigint,0) + 1)),
+              ARRAY['completedErrors', #{nodeId}],
+              (SELECT dn.tool_job_anchor_json->'terminalError' FROM alphafrog_agent_run_dag_node dn
+               WHERE dn.run_id = r.id AND dn.generation = #{generation} AND dn.node_id = #{nodeId}
+                 AND dn.tool_job_anchor_json #>> '{nodePhase}' = 'FINALIZED'
+                 AND dn.tool_job_anchor_json #>> '{terminalOutcome}' = 'FAILED')),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE r.id = #{runId}
+          AND (r.dag_frontier_json #>> '{generation}')::bigint = #{generation}
+          AND (r.dag_frontier_json #>> '{phase}')::text = 'CANCELLING'
+          AND (r.dag_frontier_json #>> '{frontierVersion}')::bigint = #{expectedFrontierVersion}
+          AND (r.dag_frontier_json #>> '{cancelled}')::boolean IS TRUE
+          AND r.status IN ('EXECUTING','WAITING_TOOL_JOB')
+          AND NOT COALESCE(r.dag_frontier_json->'completedNodeIds' ? #{nodeId}, false)
+          AND EXISTS (SELECT 1 FROM alphafrog_agent_run_dag_node dn
+              WHERE dn.run_id = r.id AND dn.generation = #{generation} AND dn.node_id = #{nodeId}
+                AND dn.tool_job_anchor_json #>> '{nodePhase}' = 'FINALIZED'
+                AND dn.tool_job_anchor_json #>> '{terminalOutcome}' = 'FAILED'
+                AND dn.tool_job_anchor_json #>> '{operationId}' = #{operationId}
+                AND dn.tool_job_anchor_json #>> '{toolCallId}' = #{toolCallId}
+                AND dn.tool_job_anchor_json #>> '{attempt}' = #{attempt}::text
+                AND dn.tool_job_anchor_json #>> '{requestDigest}' = #{requestDigest}
+                AND (dn.tool_job_anchor_json->'terminalError') IS NOT NULL
+                AND (dn.tool_job_anchor_json->'terminalError') ? 'errorCode'
+                AND (dn.tool_job_anchor_json->'terminalError') ? 'message')
+    </update>
+
+    <update id="aggregate5hCancelCanceled">
+        UPDATE alphafrog_agent_run r SET dag_frontier_json = jsonb_set(
+              jsonb_set(jsonb_set(r.dag_frontier_json,
+                ARRAY['nodeStates', #{nodeId}], '"CANCELED"'::jsonb),
+                '{completedNodeIds}', COALESCE(r.dag_frontier_json->'completedNodeIds','{}'::jsonb) || jsonb_build_object(#{nodeId}, true)),
+                '{frontierVersion}', to_jsonb(COALESCE((r.dag_frontier_json #>> '{frontierVersion}')::bigint,0) + 1)),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE r.id = #{runId}
+          AND (r.dag_frontier_json #>> '{generation}')::bigint = #{generation}
+          AND (r.dag_frontier_json #>> '{phase}')::text = 'CANCELLING'
+          AND (r.dag_frontier_json #>> '{frontierVersion}')::bigint = #{expectedFrontierVersion}
+          AND (r.dag_frontier_json #>> '{cancelled}')::boolean IS TRUE
+          AND r.status IN ('EXECUTING','WAITING_TOOL_JOB')
+          AND NOT COALESCE(r.dag_frontier_json->'completedNodeIds' ? #{nodeId}, false)
+          AND EXISTS (SELECT 1 FROM alphafrog_agent_run_dag_node dn
+              WHERE dn.run_id = r.id AND dn.generation = #{generation} AND dn.node_id = #{nodeId}
+                AND dn.tool_job_anchor_json #>> '{nodePhase}' = 'FINALIZED'
+                AND dn.tool_job_anchor_json #>> '{terminalOutcome}' = 'CANCELED'
+                AND dn.tool_job_anchor_json #>> '{operationId}' = #{operationId}
+                AND dn.tool_job_anchor_json #>> '{toolCallId}' = #{toolCallId}
+                AND dn.tool_job_anchor_json #>> '{attempt}' = #{attempt}::text
+                AND dn.tool_job_anchor_json #>> '{requestDigest}' = #{requestDigest})
+    </update>
+
+    <!-- ==================== Cancel 协议 ==================== -->
+
+    <!-- Phase A: CANCELLING frontier + 标记活跃 child -->
+    <select id="cancelFrontierAndChildrenCTE" resultType="world.willfrog.agent.platform.dag.CancelResult" flushCache="true" affectData="true">
+        WITH frontier_result AS (
+            UPDATE alphafrog_agent_run SET
+                dag_frontier_json = jsonb_set(
+                  jsonb_set(
+                    jsonb_set(jsonb_set(jsonb_set(
+                      dag_frontier_json,
+                      '{phase}', '"CANCELLING"'::jsonb),
+                      '{cancelled}', 'true'::jsonb),
+                      '{cancelTime}', to_jsonb(#{cancelTime}::text)),
+                    '{cancelRequestId}', to_jsonb(#{cancelRequestId}::text)),
+                  '{frontierVersion}', to_jsonb(COALESCE((dag_frontier_json #>> '{frontierVersion}')::bigint,0) + 1)),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = #{runId}
+              AND (dag_frontier_json #>> '{generation}')::bigint = #{generation}
+              AND (dag_frontier_json #>> '{phase}')::text IN ('SUSPENDING','SUSPENDED')
+              AND (dag_frontier_json #>> '{cancelled}')::boolean IS NOT TRUE
+              AND (dag_frontier_json #>> '{frontierVersion}')::bigint = #{expectedFrontierVersion}
+              AND status IN ('EXECUTING','WAITING_TOOL_JOB')
+            RETURNING 1
+        ),
+        child_marked AS (
+            UPDATE alphafrog_agent_run_dag_node dn SET
+                tool_job_anchor_json = CASE
+                    WHEN dn.tool_job_anchor_json #>> '{nodePhase}' IN ('PREPARING','CREATED','RUNNING')
+                    THEN dn.tool_job_anchor_json || jsonb_build_object(
+                        'disposition','CANCELED','autoResume',false,
+                        'cancelNotfoundRetryCount',0,
+                        'cancelNextAttemptAt',to_jsonb(CAST(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) + #{initialBackoffSeconds} AS bigint)),
+                        'cancelRpcRetryCount',0,
+                        'nodeVersion',COALESCE((dn.tool_job_anchor_json #>> '{nodeVersion}')::bigint,0) + 1)
+                    ELSE dn.tool_job_anchor_json || jsonb_build_object(
+                        'disposition','CANCELED','autoResume',false,
+                        'nodeVersion',COALESCE((dn.tool_job_anchor_json #>> '{nodeVersion}')::bigint,0) + 1)
+                    END,
+                updated_at = CURRENT_TIMESTAMP
+            FROM alphafrog_agent_run r
+            WHERE dn.run_id = r.id
+              AND dn.run_id = #{runId}
+              AND dn.generation = #{generation}
+              AND dn.tool_job_anchor_json #>> '{nodePhase}' IN ('DRAFT','PREPARING','CREATED','RUNNING','TERMINAL','RESULT_VALIDATED','USAGE_RECORDED')
+              AND EXISTS(SELECT 1 FROM frontier_result)
+            RETURNING 1
+        )
+        SELECT
+            true AS success,
+            (SELECT COUNT(*) FROM frontier_result) AS frontier_rows,
+            (SELECT COUNT(*) FROM child_marked) AS child_marked_rows
+    </select>
+
+    <!-- Phase A RESUMING 变体：(RECEIVED+LAUNCHING+resultConsumed!=true) OR (EXECUTING+(LAUNCHING|ACCEPTED)+resultConsumed=true) + lease triple fence -->
+    <select id="cancelFrontierAndChildrenCTE_resume" resultType="world.willfrog.agent.platform.dag.CancelResult" flushCache="true" affectData="true">
+        WITH frontier_result AS (
+            UPDATE alphafrog_agent_run SET
+                dag_frontier_json = jsonb_set(
+                  jsonb_set(
+                    jsonb_set(jsonb_set(jsonb_set(
+                      dag_frontier_json,
+                      '{phase}', '"CANCELLING"'::jsonb),
+                      '{cancelled}', 'true'::jsonb),
+                      '{cancelTime}', to_jsonb(#{cancelTime}::text)),
+                    '{cancelRequestId}', to_jsonb(#{cancelRequestId}::text)),
+                  '{frontierVersion}', to_jsonb(COALESCE((dag_frontier_json #>> '{frontierVersion}')::bigint,0) + 1)),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = #{runId}
+              AND (dag_frontier_json #>> '{generation}')::bigint = #{generation}
+              AND (dag_frontier_json #>> '{phase}')::text = 'RESUMING'
+              AND (dag_frontier_json #>> '{cancelled}')::boolean IS NOT TRUE
+              AND (dag_frontier_json #>> '{frontierVersion}')::bigint = #{expectedFrontierVersion}
+              AND (
+                  (status = 'RECEIVED' AND tool_job_anchor_json #>> '{resumeState}' = 'LAUNCHING'
+                   AND (tool_job_anchor_json #>> '{resultConsumed}')::boolean IS NOT TRUE)
+                  OR
+                  (status = 'EXECUTING' AND tool_job_anchor_json #>> '{resumeState}' IN ('LAUNCHING','ACCEPTED')
+                   AND (tool_job_anchor_json #>> '{resultConsumed}')::boolean IS TRUE)
+              )
+              AND tool_job_anchor_json #>> '{resumeToken}' = #{expectedResumeToken}
+              AND tool_job_anchor_json #>> '{resumeLauncherOwnerId}' = #{expectedOwnerId}
+              AND (tool_job_anchor_json #>> '{resumeLeaseVersion}')::bigint = #{expectedResumeLeaseVersion}
+            RETURNING 1
+        ),
+        child_marked AS (
+            UPDATE alphafrog_agent_run_dag_node dn SET
+                tool_job_anchor_json = CASE
+                    WHEN dn.tool_job_anchor_json #>> '{nodePhase}' IN ('PREPARING','CREATED','RUNNING')
+                    THEN dn.tool_job_anchor_json || jsonb_build_object(
+                        'disposition','CANCELED','autoResume',false,
+                        'cancelNotfoundRetryCount',0,
+                        'cancelNextAttemptAt',to_jsonb(CAST(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) + #{initialBackoffSeconds} AS bigint)),
+                        'cancelRpcRetryCount',0,
+                        'nodeVersion',COALESCE((dn.tool_job_anchor_json #>> '{nodeVersion}')::bigint,0) + 1)
+                    ELSE dn.tool_job_anchor_json || jsonb_build_object(
+                        'disposition','CANCELED','autoResume',false,
+                        'nodeVersion',COALESCE((dn.tool_job_anchor_json #>> '{nodeVersion}')::bigint,0) + 1)
+                    END,
+                updated_at = CURRENT_TIMESTAMP
+            FROM alphafrog_agent_run r
+            WHERE dn.run_id = r.id
+              AND dn.run_id = #{runId}
+              AND dn.generation = #{generation}
+              AND dn.tool_job_anchor_json #>> '{nodePhase}' IN ('DRAFT','PREPARING','CREATED','RUNNING','TERMINAL','RESULT_VALIDATED','USAGE_RECORDED')
+              AND EXISTS(SELECT 1 FROM frontier_result)
+            RETURNING 1
+        )
+        SELECT
+            true AS success,
+            (SELECT COUNT(*) FROM frontier_result) AS frontier_rows,
+            (SELECT COUNT(*) FROM child_marked) AS child_marked_rows
+    </select>
+
+    <!-- 崩溃恢复：补标记漏网的 child -->
+    <update id="recoverCancelChildMarking">
+        UPDATE alphafrog_agent_run_dag_node dn SET
+            tool_job_anchor_json = CASE
+                WHEN dn.tool_job_anchor_json #>> '{disposition}' IS DISTINCT FROM 'CANCELED'
+                 AND dn.tool_job_anchor_json #>> '{nodePhase}' IN ('PREPARING','CREATED','RUNNING')
+                THEN dn.tool_job_anchor_json || jsonb_build_object(
+                    'disposition','CANCELED','autoResume',false,
+                    'cancelNotfoundRetryCount',0,
+                    'cancelNextAttemptAt',to_jsonb(CAST(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) + #{initialBackoffSeconds} AS bigint)),
+                    'cancelRpcRetryCount',0,
+                    'nodeVersion',COALESCE((dn.tool_job_anchor_json #>> '{nodeVersion}')::bigint,0) + 1)
+                WHEN dn.tool_job_anchor_json #>> '{disposition}' IS DISTINCT FROM 'CANCELED'
+                THEN dn.tool_job_anchor_json || jsonb_build_object(
+                    'disposition','CANCELED','autoResume',false,
+                    'nodeVersion',COALESCE((dn.tool_job_anchor_json #>> '{nodeVersion}')::bigint,0) + 1)
+                WHEN dn.tool_job_anchor_json #>> '{nodePhase}' IN ('PREPARING','CREATED','RUNNING')
+                 AND (dn.tool_job_anchor_json #>> '{cancelNotfoundRetryCount}') IS NULL
+                THEN dn.tool_job_anchor_json || jsonb_build_object(
+                    'cancelNotfoundRetryCount',0,
+                    'cancelNextAttemptAt',to_jsonb(CAST(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) + #{initialBackoffSeconds} AS bigint)),
+                    'cancelRpcRetryCount',0)
+                ELSE dn.tool_job_anchor_json
+                END,
+            updated_at = CURRENT_TIMESTAMP
+        FROM alphafrog_agent_run r
+        WHERE dn.run_id = r.id
+          AND dn.run_id = #{runId}
+          AND dn.generation = #{generation}
+          AND (r.dag_frontier_json #>> '{phase}')::text = 'CANCELLING'
+          AND (r.dag_frontier_json #>> '{cancelled}')::boolean IS TRUE
+          AND r.dag_frontier_json #>> '{cancelRequestId}' = #{cancelRequestId}
+          AND (r.dag_frontier_json #>> '{generation}')::bigint = dn.generation
+    </update>
+
+    <select id="selectFrontierForUpdate" resultType="string">
+        SELECT dag_frontier_json::text FROM alphafrog_agent_run
+        WHERE id = #{runId}
+        FOR UPDATE
+    </select>
+
+    <!-- ==================== Selector：六桶路由 ==================== -->
+
+    <select id="selectCancelDueChildren" resultType="java.util.LinkedHashMap">
+        SELECT
+            dn.node_id AS "nodeId",
+            (dn.tool_job_anchor_json #>> '{nodeVersion}')::bigint AS "nodeVersion",
+            dn.tool_job_anchor_json #>> '{operationId}' AS "operationId",
+            dn.tool_job_anchor_json #>> '{toolCallId}' AS "toolCallId",
+            (dn.tool_job_anchor_json #>> '{attempt}')::int AS "attempt",
+            dn.tool_job_anchor_json #>> '{requestDigest}' AS "requestDigest",
+            dn.tool_job_anchor_json #>> '{taskId}' AS "taskId",
+            (dn.tool_job_anchor_json #>> '{cancelNotfoundRetryCount}')::int AS "cancelNotfoundRetryCount",
+            (dn.tool_job_anchor_json #>> '{cancelRpcRetryCount}')::int AS "cancelRpcRetryCount",
+            dn.tool_job_anchor_json #>> '{nodePhase}' AS "nodePhase",
+            CASE
+                WHEN dn.tool_job_anchor_json #>> '{nodePhase}' = 'PREPARING'
+                 AND dn.tool_job_anchor_json #>> '{cancelPreparingExhausted}' = 'true'
+                    THEN NULL
+                WHEN dn.tool_job_anchor_json #>> '{nodePhase}' = 'PREPARING'
+                 AND COALESCE((dn.tool_job_anchor_json #>> '{cancelNotfoundRetryCount}')::int, 0) >= 10
+                    THEN 'PREPARING_STUCK'
+                WHEN dn.tool_job_anchor_json #>> '{nodePhase}' = 'PREPARING'
+                    THEN 'PREPARING'
+                WHEN dn.tool_job_anchor_json #>> '{nodePhase}' IN ('CREATED','RUNNING')
+                 AND COALESCE((dn.tool_job_anchor_json #>> '{cancelNotfoundRetryCount}')::int, 0) >= 6
+                    THEN 'RECOVERY'
+                WHEN dn.tool_job_anchor_json #>> '{nodePhase}' IN ('CREATED','RUNNING')
+                 AND dn.tool_job_anchor_json #>> '{cancelRpcExhausted}' = 'true'
+                    THEN NULL
+                WHEN dn.tool_job_anchor_json #>> '{nodePhase}' IN ('CREATED','RUNNING')
+                 AND COALESCE((dn.tool_job_anchor_json #>> '{cancelRpcRetryCount}')::int, 0) >= 12
+                    THEN 'RPC_EXHAUSTED'
+                WHEN (dn.tool_job_anchor_json #>> '{cancelNotfoundRetryCount}') IS NULL
+                    THEN 'FIRST'
+                ELSE 'RETRY'
+                END AS "cancelBucket"
+        FROM alphafrog_agent_run_dag_node dn
+        JOIN alphafrog_agent_run r ON dn.run_id = r.id
+        WHERE dn.run_id = #{runId}
+          AND dn.generation = #{generation}
+          AND dn.tool_job_anchor_json #>> '{disposition}' = 'CANCELED'
+          AND dn.tool_job_anchor_json #>> '{nodePhase}' IN ('PREPARING','CREATED','RUNNING')
+          AND (dn.tool_job_anchor_json #>> '{cancelPreparingExhausted}') IS DISTINCT FROM 'true'
+          AND (dn.tool_job_anchor_json #>> '{cancelRpcExhausted}') IS DISTINCT FROM 'true'
+          AND (r.dag_frontier_json #>> '{phase}')::text = 'CANCELLING'
+          AND (r.dag_frontier_json #>> '{cancelled}')::boolean IS TRUE
+          AND r.dag_frontier_json #>> '{cancelRequestId}' = #{cancelRequestId}
+          AND (r.dag_frontier_json #>> '{generation}')::bigint = #{generation}
+          AND ((dn.tool_job_anchor_json #>> '{cancelNextAttemptAt}') IS NULL
+               OR (dn.tool_job_anchor_json #>> '{cancelNextAttemptAt}')::bigint &lt;= CAST(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) AS bigint))
+        ORDER BY dn.node_id
+        LIMIT #{batchSize}
+        FOR UPDATE SKIP LOCKED
+    </select>
+
+    <!-- ==================== Cancel 原子操作 ==================== -->
+
+    <select id="incrementCancelNotfoundRetryCount" resultType="world.willfrog.agent.platform.dag.RetryAdvance" flushCache="true" affectData="true">
+        UPDATE alphafrog_agent_run_dag_node dn SET
+            tool_job_anchor_json = dn.tool_job_anchor_json || jsonb_build_object(
+                'cancelNotfoundRetryCount',COALESCE((dn.tool_job_anchor_json #>> '{cancelNotfoundRetryCount}')::int,0) + 1,
+                'cancelNextAttemptAt',to_jsonb(CAST(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) + #{backoffSeconds} AS bigint)),
+                'nodeVersion',COALESCE((dn.tool_job_anchor_json #>> '{nodeVersion}')::bigint,0) + 1),
+            updated_at = CURRENT_TIMESTAMP
+        FROM alphafrog_agent_run r
+        WHERE dn.run_id = r.id
+          AND dn.run_id = #{runId}
+          AND dn.generation = #{generation}
+          AND dn.node_id = #{nodeId}
+          AND dn.tool_job_anchor_json #>> '{nodePhase}' IN ('PREPARING','CREATED','RUNNING')
+          AND dn.tool_job_anchor_json #>> '{disposition}' = 'CANCELED'
+          AND (dn.tool_job_anchor_json #>> '{nodeVersion}')::bigint = #{expectedNodeVersion}
+          AND COALESCE((dn.tool_job_anchor_json #>> '{cancelNotfoundRetryCount}')::int, 0)
+              IS NOT DISTINCT FROM #{expectedNotfoundRetryCount}
+          AND (r.dag_frontier_json #>> '{phase}')::text = 'CANCELLING'
+          AND (r.dag_frontier_json #>> '{cancelled}')::boolean IS TRUE
+          AND r.dag_frontier_json #>> '{cancelRequestId}' = #{cancelRequestId}
+          AND (r.dag_frontier_json #>> '{generation}')::bigint = dn.generation
+        RETURNING
+            COALESCE((dn.tool_job_anchor_json #>> '{cancelNotfoundRetryCount}')::int,0) AS "newNotfoundRetryCount",
+            (dn.tool_job_anchor_json #>> '{nodeVersion}')::bigint AS "newNodeVersion"
+    </select>
+
+    <select id="incrementCancelRpcRetryCount" resultType="world.willfrog.agent.platform.dag.RpcRetryAdvance" flushCache="true" affectData="true">
+        UPDATE alphafrog_agent_run_dag_node dn SET
+            tool_job_anchor_json = dn.tool_job_anchor_json || jsonb_build_object(
+                'cancelRpcRetryCount',COALESCE((dn.tool_job_anchor_json #>> '{cancelRpcRetryCount}')::int,0) + 1,
+                'cancelNextAttemptAt',to_jsonb(CAST(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) + #{backoffSeconds} AS bigint)),
+                'nodeVersion',COALESCE((dn.tool_job_anchor_json #>> '{nodeVersion}')::bigint,0) + 1),
+            updated_at = CURRENT_TIMESTAMP
+        FROM alphafrog_agent_run r
+        WHERE dn.run_id = r.id
+          AND dn.run_id = #{runId}
+          AND dn.generation = #{generation}
+          AND dn.node_id = #{nodeId}
+          AND dn.tool_job_anchor_json #>> '{nodePhase}' IN ('PREPARING','CREATED','RUNNING')
+          AND dn.tool_job_anchor_json #>> '{disposition}' = 'CANCELED'
+          AND (dn.tool_job_anchor_json #>> '{nodeVersion}')::bigint = #{expectedNodeVersion}
+          AND COALESCE((dn.tool_job_anchor_json #>> '{cancelRpcRetryCount}')::int, 0)
+              IS NOT DISTINCT FROM #{expectedRpcRetryCount}
+          AND (r.dag_frontier_json #>> '{phase}')::text = 'CANCELLING'
+          AND (r.dag_frontier_json #>> '{cancelled}')::boolean IS TRUE
+          AND r.dag_frontier_json #>> '{cancelRequestId}' = #{cancelRequestId}
+          AND (r.dag_frontier_json #>> '{generation}')::bigint = dn.generation
+        RETURNING
+            COALESCE((dn.tool_job_anchor_json #>> '{cancelRpcRetryCount}')::int,0) AS "newRpcRetryCount",
+            (dn.tool_job_anchor_json #>> '{nodeVersion}')::bigint AS "newNodeVersion"
+    </select>
+
+    <select id="atomicTerminalLost" resultType="world.willfrog.agent.platform.dag.TerminalAdvance" flushCache="true" affectData="true">
+        UPDATE alphafrog_agent_run_dag_node dn SET
+            tool_job_anchor_json = dn.tool_job_anchor_json || jsonb_build_object(
+                'nodePhase','TERMINAL',
+                'terminalOutcome','FAILED',
+                'terminalError',jsonb_build_object('errorCode','RESULT_LOST','message','Cancel task not found after 6 retries'),
+                'nodeVersion',COALESCE((dn.tool_job_anchor_json #>> '{nodeVersion}')::bigint,0) + 1),
+            updated_at = CURRENT_TIMESTAMP
+        FROM alphafrog_agent_run r
+        WHERE dn.run_id = r.id
+          AND dn.run_id = #{runId}
+          AND dn.generation = #{generation}
+          AND dn.node_id = #{nodeId}
+          AND dn.tool_job_anchor_json #>> '{nodePhase}' IN ('CREATED','RUNNING')
+          AND dn.tool_job_anchor_json #>> '{disposition}' = 'CANCELED'
+          AND (dn.tool_job_anchor_json #>> '{nodeVersion}')::bigint = #{expectedNodeVersion}
+          AND COALESCE((dn.tool_job_anchor_json #>> '{cancelNotfoundRetryCount}')::int, 0) &gt;= 5
+          AND COALESCE((dn.tool_job_anchor_json #>> '{cancelNotfoundRetryCount}')::int, 0)
+              IS NOT DISTINCT FROM #{expectedNotfoundRetryCount}
+          AND (r.dag_frontier_json #>> '{phase}')::text = 'CANCELLING'
+          AND (r.dag_frontier_json #>> '{cancelled}')::boolean IS TRUE
+          AND r.dag_frontier_json #>> '{cancelRequestId}' = #{cancelRequestId}
+          AND (r.dag_frontier_json #>> '{generation}')::bigint = dn.generation
+        RETURNING
+            (dn.tool_job_anchor_json #>> '{nodeVersion}')::bigint AS "newNodeVersion"
+    </select>
+
+    <select id="writePreparingStuck" resultType="world.willfrog.agent.platform.dag.ExhaustedAdvance" flushCache="true" affectData="true">
+        UPDATE alphafrog_agent_run_dag_node dn SET
+            tool_job_anchor_json = dn.tool_job_anchor_json || jsonb_build_object(
+                'cancelPreparingExhausted',true,
+                'nodeVersion',COALESCE((dn.tool_job_anchor_json #>> '{nodeVersion}')::bigint,0) + 1),
+            updated_at = CURRENT_TIMESTAMP
+        FROM alphafrog_agent_run r
+        WHERE dn.run_id = r.id
+          AND dn.run_id = #{runId}
+          AND dn.generation = #{generation}
+          AND dn.node_id = #{nodeId}
+          AND dn.tool_job_anchor_json #>> '{nodePhase}' = 'PREPARING'
+          AND dn.tool_job_anchor_json #>> '{disposition}' = 'CANCELED'
+          AND (dn.tool_job_anchor_json #>> '{nodeVersion}')::bigint = #{expectedNodeVersion}
+          AND COALESCE((dn.tool_job_anchor_json #>> '{cancelNotfoundRetryCount}')::int, 0) &gt;= 10
+          AND (dn.tool_job_anchor_json #>> '{cancelPreparingExhausted}') IS DISTINCT FROM 'true'
+          AND (r.dag_frontier_json #>> '{phase}')::text = 'CANCELLING'
+          AND (r.dag_frontier_json #>> '{cancelled}')::boolean IS TRUE
+          AND r.dag_frontier_json #>> '{cancelRequestId}' = #{cancelRequestId}
+          AND (r.dag_frontier_json #>> '{generation}')::bigint = dn.generation
+        RETURNING
+            (dn.tool_job_anchor_json #>> '{nodeVersion}')::bigint AS "newNodeVersion"
+    </select>
+
+    <select id="writeRpcExhausted" resultType="world.willfrog.agent.platform.dag.ExhaustedAdvance" flushCache="true" affectData="true">
+        UPDATE alphafrog_agent_run_dag_node dn SET
+            tool_job_anchor_json = dn.tool_job_anchor_json || jsonb_build_object(
+                'cancelRpcExhausted',true,
+                'nodeVersion',COALESCE((dn.tool_job_anchor_json #>> '{nodeVersion}')::bigint,0) + 1),
+            updated_at = CURRENT_TIMESTAMP
+        FROM alphafrog_agent_run r
+        WHERE dn.run_id = r.id
+          AND dn.run_id = #{runId}
+          AND dn.generation = #{generation}
+          AND dn.node_id = #{nodeId}
+          AND dn.tool_job_anchor_json #>> '{nodePhase}' IN ('CREATED','RUNNING')
+          AND dn.tool_job_anchor_json #>> '{disposition}' = 'CANCELED'
+          AND (dn.tool_job_anchor_json #>> '{nodeVersion}')::bigint = #{expectedNodeVersion}
+          AND COALESCE((dn.tool_job_anchor_json #>> '{cancelRpcRetryCount}')::int, 0) &gt;= 12
+          AND (dn.tool_job_anchor_json #>> '{cancelRpcExhausted}') IS DISTINCT FROM 'true'
+          AND (r.dag_frontier_json #>> '{phase}')::text = 'CANCELLING'
+          AND (r.dag_frontier_json #>> '{cancelled}')::boolean IS TRUE
+          AND r.dag_frontier_json #>> '{cancelRequestId}' = #{cancelRequestId}
+          AND (r.dag_frontier_json #>> '{generation}')::bigint = dn.generation
+        RETURNING
+            (dn.tool_job_anchor_json #>> '{nodeVersion}')::bigint AS "newNodeVersion"
+    </select>
+
+    <update id="writeChildFinalizedTombstone">
+        UPDATE alphafrog_agent_run_dag_node dn SET
+            tool_job_anchor_json = jsonb_build_object(
+                'nodePhase','FINALIZED','terminalOutcome','CANCELED',
+                'operationId',#{operationId}::text,
+                'toolCallId',#{toolCallId}::text,
+                'attempt',#{attempt}::int,
+                'requestDigest',#{requestDigest}::text,
+                'cancelRequestId',#{cancelRequestId}::text,
+                'nodeVersion',COALESCE((dn.tool_job_anchor_json #>> '{nodeVersion}')::bigint,0) + 1),
+            updated_at = CURRENT_TIMESTAMP
+        FROM alphafrog_agent_run r
+        WHERE dn.run_id = r.id
+          AND dn.run_id = #{runId}
+          AND dn.generation = #{generation}
+          AND dn.node_id = #{nodeId}
+          AND dn.tool_job_anchor_json #>> '{nodePhase}' = 'PREPARING'
+          AND dn.tool_job_anchor_json #>> '{disposition}' = 'CANCELED'
+          AND (dn.tool_job_anchor_json #>> '{nodeVersion}')::bigint = #{expectedNodeVersion}
+          AND dn.tool_job_anchor_json #>> '{operationId}' = #{operationId}
+          AND dn.tool_job_anchor_json #>> '{toolCallId}' = #{toolCallId}
+          AND dn.tool_job_anchor_json #>> '{attempt}' = #{attempt}::text
+          AND dn.tool_job_anchor_json #>> '{requestDigest}' = #{requestDigest}
+          AND (r.dag_frontier_json #>> '{phase}')::text = 'CANCELLING'
+          AND (r.dag_frontier_json #>> '{cancelled}')::boolean IS TRUE
+          AND r.dag_frontier_json #>> '{cancelRequestId}' = #{cancelRequestId}
+          AND (r.dag_frontier_json #>> '{generation}')::bigint = dn.generation
+    </update>
+
+    <update id="writePreparingToCreatedCancel">
+        UPDATE alphafrog_agent_run_dag_node dn SET
+            tool_job_anchor_json = dn.tool_job_anchor_json || jsonb_build_object(
+                'nodePhase','CREATED','taskId',#{taskId}::text,
+                'cancelNotfoundRetryCount',0,
+                'cancelNextAttemptAt',to_jsonb(CAST(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) + #{initialBackoffSeconds} AS bigint)),
+                'cancelRpcRetryCount',0,
+                'nodeVersion',COALESCE((dn.tool_job_anchor_json #>> '{nodeVersion}')::bigint,0) + 1),
+            updated_at = CURRENT_TIMESTAMP
+        FROM alphafrog_agent_run r
+        WHERE dn.run_id = r.id
+          AND dn.run_id = #{runId}
+          AND dn.generation = #{generation}
+          AND dn.node_id = #{nodeId}
+          AND dn.tool_job_anchor_json #>> '{nodePhase}' = 'PREPARING'
+          AND dn.tool_job_anchor_json #>> '{disposition}' = 'CANCELED'
+          AND (dn.tool_job_anchor_json #>> '{nodeVersion}')::bigint = #{expectedNodeVersion}
+          AND dn.tool_job_anchor_json #>> '{operationId}' = #{operationId}
+          AND dn.tool_job_anchor_json #>> '{toolCallId}' = #{toolCallId}
+          AND dn.tool_job_anchor_json #>> '{attempt}' = #{attempt}::text
+          AND dn.tool_job_anchor_json #>> '{requestDigest}' = #{requestDigest}
+          AND CAST(#{taskId} AS text) IS NOT NULL AND btrim(CAST(#{taskId} AS text)) &lt;&gt; ''
+          AND (r.dag_frontier_json #>> '{phase}')::text = 'CANCELLING'
+          AND (r.dag_frontier_json #>> '{cancelled}')::boolean IS TRUE
+          AND r.dag_frontier_json #>> '{cancelRequestId}' = #{cancelRequestId}
+          AND (r.dag_frontier_json #>> '{generation}')::bigint = dn.generation
+    </update>
+
+    <!-- ==================== CancelReconciler 扫描与 claim ==================== -->
+
+    <select id="selectCANCELLINGRuns" resultType="java.util.LinkedHashMap">
+        SELECT id AS "runId",
+               (dag_frontier_json #>> '{generation}')::int AS "generation",
+               dag_frontier_json #>> '{cancelRequestId}' AS "cancelRequestId"
+        FROM alphafrog_agent_run
+        WHERE dag_frontier_json #>> '{phase}' = 'CANCELLING'
+          AND (dag_frontier_json #>> '{cancelled}')::boolean IS TRUE
+          AND ((dag_frontier_json #>> '{reconcilerLeaseUntil}') IS NULL
+               OR (dag_frontier_json #>> '{reconcilerLeaseUntil}')::bigint &lt;= CAST(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) AS bigint))
+        ORDER BY updated_at
+        LIMIT #{limit}
+    </select>
+
+    <update id="claimReconcilerLease">
+        UPDATE alphafrog_agent_run SET
+            dag_frontier_json = jsonb_set(jsonb_set(
+                dag_frontier_json,
+                '{reconcilerOwner}', to_jsonb(#{ownerId}::text)),
+                '{reconcilerLeaseUntil}', to_jsonb(CAST(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) + #{leaseSeconds} AS bigint))),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{runId}
+          AND (dag_frontier_json #>> '{generation}')::bigint = #{generation}
+          AND dag_frontier_json #>> '{phase}' = 'CANCELLING'
+          AND dag_frontier_json #>> '{cancelRequestId}' = #{cancelRequestId}
+          AND ((dag_frontier_json #>> '{reconcilerLeaseUntil}') IS NULL
+               OR (dag_frontier_json #>> '{reconcilerLeaseUntil}')::bigint &lt;= CAST(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) AS bigint))
+    </update>
+
+    <update id="releaseReconcilerLease">
+        UPDATE alphafrog_agent_run SET
+            dag_frontier_json = dag_frontier_json - 'reconcilerOwner' - 'reconcilerLeaseUntil',
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{runId}
+          AND (dag_frontier_json #>> '{generation}')::bigint = #{generation}
+          AND dag_frontier_json #>> '{cancelRequestId}' = #{cancelRequestId}
+          AND dag_frontier_json #>> '{reconcilerOwner}' = #{ownerId}
+    </update>
+
+    <!-- ==================== Usage 沉底 ==================== -->
+
+    <insert id="insertUsageRecord">
+        INSERT INTO alphafrog_agent_usage_record (operation_id, payload, payload_sha256)
+        VALUES (#{operationId}, CAST(#{payload} AS jsonb), #{payloadSha256})
+        ON CONFLICT (operation_id) DO NOTHING
+    </insert>
+
+</mapper>

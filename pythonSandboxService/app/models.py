@@ -25,6 +25,28 @@ class TaskStatus(str, Enum):
     CANCELED = "CANCELED"
 
 
+# 260809-26Q3-stage1-w2 D11 (task #108): how a CANCELED terminal state was
+# evidenced.  Frozen by codex d6841a2e's four rules: a cancellation is only
+# real when the execution layer OBSERVED it — a stop request or an issued
+# kill alone is never enough (rule 4), and a child that finished before the
+# stop took effect keeps its genuine SUCCEEDED/FAILED result (rule 3).
+class CancellationEvidence(str, Enum):
+    NONE = "none"
+    # by_operation cancel arrived BEFORE any create was persisted: tombstone
+    # task (schema v3), no request ever existed, nothing ever ran.
+    PRE_CREATE_CANCEL = "pre_create_cancel"
+    # cancel arrived while the task was QUEUED: terminalized inside the store
+    # lock before any worker started it — nothing ever ran.
+    QUEUED_CANCEL = "queued_cancel"
+    # cancel arrived after dispatch but execution never started (the pool
+    # Future was canceled before a container worker picked the job up).
+    CANCELED_BEFORE_START = "canceled_before_start"
+    # the bounded wrapper OBSERVED the root-owned cancel marker and, because
+    # of it, killed its own child process group — the only evidence that
+    # justifies CANCELED for a task whose child was actually running.
+    MARKER_OBSERVED = "marker_observed"
+
+
 class ExecuteRequest(BaseModel):
     dataset_id: str = Field(..., description="Dataset identifier")
     dataset_ids: Optional[List[str]] = Field(
@@ -228,6 +250,11 @@ class BoundedExecRequest(BaseModel):
     # _write_loader_bootstrap), so a stale sitecustomize in the loader
     # workdir is never auto-imported at startup.
     loaderPythonPath: str = Field(..., min_length=1)
+    # 260809-26Q3-stage1-w2 D11 (task #108): the root-owned cancel marker
+    # file the wrapper polls while the child runs. Optional for backward
+    # compatibility with pre-D11 inputs; when present the wrapper validates
+    # the EXACT task-local binding (root/<taskId>/cancel) fail-closed.
+    cancelMarkerPath: Optional[str] = None
 
     @model_validator(mode="after")
     def validate_d15_round4_payload_contract(self) -> "BoundedExecRequest":
@@ -278,6 +305,8 @@ class BoundedExecRequest(BaseModel):
         }
         if self.runtimeEnvironmentPath is not None:
             payload["runtimeEnvironmentPath"] = self.runtimeEnvironmentPath
+        if self.cancelMarkerPath is not None:
+            payload["cancelMarkerPath"] = self.cancelMarkerPath
         return payload
 
 
@@ -299,13 +328,25 @@ class BoundedExecResult(BaseModel):
     recordSetComplete: bool
     dropReason: str
     recordDigest: str
+    # 260809-26Q3-stage1-w2 D11 (task #108): True iff the wrapper OBSERVED
+    # the cancel marker and, because of it, killed its own child process
+    # group (d6841a2e rule 2). A child that finished before the marker was
+    # observed keeps cancelObserved=False and its genuine result (rule 3).
+    cancelObserved: bool = False
 # === end work-package-C (ccqwen) ===
 
 
 class Task(BaseModel):
     task_id: str
     status: TaskStatus
-    request: ExecuteRequest
+    # 260809-26Q3-stage1-w2 D11 (task #108, schema v3): request is None ONLY
+    # for a pre-create cancel tombstone — a by_operation cancel that arrived
+    # before any create payload was persisted, so there was never a request
+    # to store.  The first matching create ADOPTS the tombstone and fills the
+    # request (plus payload digest / frozen limits / image ref).  Every
+    # non-tombstone task always carries its request; v1/v2 state files can
+    # never contain a request-less task (task_store._load enforces both).
+    request: Optional[ExecuteRequest] = None
     result: Optional[ExecuteResult] = None
     error: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
@@ -324,6 +365,18 @@ class Task(BaseModel):
     effective_output_limits: Optional[EffectiveOutputLimits] = None
     runtime_image_ref: Optional[str] = None
     # === end work-package-C (ccqwen) ===
+    # === 260809-26Q3-stage1-w2 D11 (task #108): cancellation bookkeeping ===
+    # cancellation_evidence records HOW the CANCELED terminal state was
+    # evidenced (see CancellationEvidence); it stays NONE for every task that
+    # was never canceled.  cancel_requested is the durable audit flag that a
+    # cancel was asked for a RUNNING task (it does NOT by itself justify a
+    # forced CANCELED — d6841a2e rule 4).  cancel_reason carries the
+    # caller-supplied audit reason (USER_REQUEST / QUEUE_TIMEOUT /
+    # RUN_CANCELED / TOOLJOB_FINALIZER), never used for routing.
+    cancellation_evidence: CancellationEvidence = CancellationEvidence.NONE
+    cancel_reason: Optional[str] = None
+    cancel_requested: bool = False
+    # === end D11 (task #108) ===
 
 
 class CreateTaskResponse(BaseModel):
@@ -339,3 +392,71 @@ class OperationLookupResponse(BaseModel):
     status: Optional[TaskStatus] = None
     request_fingerprint: Optional[str] = None
     error: Optional[str] = None
+
+
+# === 260809-26Q3-stage1-w2 D11 (task #108): POST /tasks/cancel API ===
+# HTTP mirror of the frozen proto CancelTaskRequest/CancelTaskResponse
+# (pythonSandbox.proto, codex a3aee2ad v3).  The body is snake_case like the
+# rest of this service; the Gateway owns the proto mapping.  Business
+# outcomes answer 200 + body (including the business NOT_FOUND); failure
+# outcomes follow the D13 status-code convention (409 CONFLICT / 400
+# INVALID_ARGUMENT) because this service maps errors purely by HTTP status.
+class TaskIdCancelTarget(BaseModel):
+    task_id: Optional[str] = None
+
+
+class OperationCancelTarget(BaseModel):
+    operation_id: Optional[str] = None
+    request_fingerprint: Optional[str] = None
+
+
+class CancelTaskRequest(BaseModel):
+    """POST /tasks/cancel body.
+
+    Deliberately LOOSE at the pydantic layer: the endpoint validates the
+    target exclusivity and the non-blank field rules itself and answers 400
+    (the D13 INVALID_ARGUMENT surface) instead of FastAPI's default 422,
+    which the frozen D13 status vocabulary does not cover.  proto3 oneof
+    only guarantees compile-time mutual exclusion; the runtime checks here
+    are the service-side equivalent (codex a3aee2ad section 二).
+    """
+
+    by_task_id: Optional[TaskIdCancelTarget] = None
+    by_operation: Optional[OperationCancelTarget] = None
+    # cancelRequestId is a DURABLE binding, not an optional cache (codex
+    # a3aee2ad section 六 ruling 3): the same id must always carry the same
+    # target identity (a rebind answers 409), and a same-target replay
+    # returns the first recorded outcome.  The endpoint rejects an empty id.
+    cancel_request_id: Optional[str] = None
+    # Audit-only cancel reason; never influences routing or outcome.
+    reason: Optional[str] = None
+
+
+class CancelOutcome(str, Enum):
+    """proto CancelOutcome names, verbatim (the Gateway maps body -> proto)."""
+
+    UNSPECIFIED = "CANCEL_OUTCOME_UNSPECIFIED"
+    CANCEL_INTENT_RECORDED = "CANCEL_INTENT_RECORDED"
+    CANCELED = "CANCELED"
+    ALREADY_TERMINAL = "ALREADY_TERMINAL"
+    NOT_FOUND = "NOT_FOUND"
+
+
+class CancelTaskResponse(BaseModel):
+    """200-body of POST /tasks/cancel.
+
+    outcome is the branch signal (never the error text); task_id is the
+    stable taskId assigned when the cancel intent was persisted (absent for
+    the business NOT_FOUND); status is the CURRENT sandbox-side durable
+    state of that task — the same QUEUED/RUNNING/SUCCEEDED/FAILED/CANCELED
+    vocabulary as getTaskStatus/getTaskResult, no second status word set
+    (codex f25b394a section 2).  For CANCEL_INTENT_RECORDED the status
+    still shows QUEUED/RUNNING and callers poll until it turns CANCELED —
+    this service never reports a CANCELING intermediate state.
+    """
+
+    outcome: CancelOutcome
+    task_id: Optional[str] = None
+    status: Optional[TaskStatus] = None
+    error: Optional[str] = None
+# === end D11 (task #108) ===

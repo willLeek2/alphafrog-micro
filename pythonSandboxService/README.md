@@ -19,6 +19,25 @@ uvicorn app.main:app --host 0.0.0.0 --port 8095
 - `AF_SANDBOX_WORKDIR`：容器工作目录（默认 `/sandbox`）
 - `AF_SANDBOX_SKIP_ENVIRONMENT_SETUP`：是否跳过 llm-sandbox 每次创建 venv/升级 pip 的环境初始化（默认 `true`，依赖运行时镜像预装库）
 - `AF_SANDBOX_PREINSTALLED_LIBRARIES`：运行时镜像已预装、无需每次 pip install 的库（默认 `numpy,pandas,matplotlib,scipy`）
+- `AF_SANDBOX_ALLOW_CREATE_WITHOUT_OPERATION_ID`：是否允许无 `operation_id` 的旧创建路径（默认 `false`，生产失败关闭）
+
+### D14 非生产兼容开关（必须成组启用）
+
+生产 create 默认要求非空 `operation_id` 与完整 canonical 身份字段，并写入 operation 索引。
+
+若开发/单测需要无键 Legacy 夹具，必须**同时**显式打开三层开关（只开一层会在下一层失败）：
+
+| 层 | 开关 | 默认 |
+|---|---|---|
+| Java Tools | `sandbox.create.allow-legacy-without-capacity` / `AF_SANDBOX_ALLOW_LEGACY_WITHOUT_CAPACITY` | `false` |
+| Gateway | `sandbox.gateway.allow-create-without-operation-id` / `AF_SANDBOX_GATEWAY_ALLOW_CREATE_WITHOUT_OPERATION_ID` | `false` |
+| Python | `AF_SANDBOX_ALLOW_CREATE_WITHOUT_OPERATION_ID` | `false` |
+
+约束（违反即不可接生产）：
+
+- 无全局容量准入
+- 无 `operationId` 幂等恢复
+- 不可把启用了上述开关的进程指向生产 Gateway/Python
 
 ## 数据约定
 Java 侧建议将数据落盘：

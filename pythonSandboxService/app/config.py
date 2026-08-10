@@ -223,6 +223,11 @@ class SandboxConfig:
     # AF_SANDBOX_MAX_TASK_TIMEOUT_MILLIS with fail-fast equivalence
     # checking in load_config (codex 5457b713 MUST-FIX 1).
     max_task_timeout_seconds: float = 1800.0
+    # D14 (Q-14): production refuses create without operation_id by default.
+    # Set AF_SANDBOX_ALLOW_CREATE_WITHOUT_OPERATION_ID=true only for explicitly
+    # annotated non-production fixtures (no global capacity admission, no
+    # idempotent recovery — must not be pointed at production clients).
+    allow_create_without_operation_id: bool = False
     # MethodSpec V5 sandbox output limits (Spec §7.2 / contract §13).
     # Application defaults; the dynamic (Nacos) layer may only lower these or
     # clamp them down to HARD_OUTPUT_LIMIT_CEILINGS, never raise them.
@@ -364,6 +369,12 @@ def load_config() -> SandboxConfig:
     usage_sampling_interval_millis = int(os.getenv("AF_SANDBOX_USAGE_SAMPLE_MILLIS", "200"))
     task_store_path = Path(os.getenv("AF_SANDBOX_TASK_STORE_PATH", "/data/sandbox_tasks/state.json"))
     queue_max_size = int(os.getenv("AF_SANDBOX_QUEUE_MAX_SIZE", "128"))
+    # D14 (Q-14): default false = production refuse create without operation_id.
+    # Explicit true only for annotated non-production fixtures.
+    allow_create_without_operation_id = _parse_bool(
+        os.getenv("AF_SANDBOX_ALLOW_CREATE_WITHOUT_OPERATION_ID"),
+        default=False,
+    )
     # D13 (26Q3, codex 5457b713): finite/positive ceiling + canonical
     # companion equivalence (MUST-FIX 1/2) are validated in the shared seam.
     max_task_timeout_seconds = validate_max_task_timeout_binding(
@@ -438,6 +449,7 @@ def load_config() -> SandboxConfig:
         task_store_path=task_store_path,
         queue_max_size=queue_max_size,
         max_task_timeout_seconds=max_task_timeout_seconds,
+        allow_create_without_operation_id=allow_create_without_operation_id,
     )
 
 
