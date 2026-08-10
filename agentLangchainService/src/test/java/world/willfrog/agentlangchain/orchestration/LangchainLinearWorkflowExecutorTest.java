@@ -26,46 +26,33 @@ import static org.mockito.Mockito.when;
 class LangchainLinearWorkflowExecutorTest {
 
     @Test
-    void embeddedPlanningEntryPoint_shouldBeDeprecatedForRemoval() throws NoSuchMethodException {
-        Deprecated annotation = LangchainLinearWorkflowExecutor.class
-                .getDeclaredMethod("execute", LangchainLinearWorkflowRequest.class)
-                .getAnnotation(Deprecated.class);
-
-        assertThat(annotation).isNotNull();
-        assertThat(annotation.forRemoval()).isTrue();
-    }
-
-    @Test
-    void execute_shouldRunPlanTodosAndFinalAnswerInOrder() {
+    void executePlanned_shouldRunPlanTodosAndFinalAnswerInOrder() {
         QueueChatModel model = new QueueChatModel(
-                """
-                {
-                  "analysis": "linear",
-                  "items": [
-                    {"id":"todo_1","sequence":1,"description":"查询沪深300"},
-                    {"id":"todo_2","sequence":2,"description":"总结走势"}
-                  ],
-                  "extractedEntities": ["沪深300"]
-                }
-                """,
                 "todo1 output",
                 "todo2 output based on todo1",
                 "final answer"
         );
         LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
-                LangchainTestFixtures.legacySingleStagePlanner(),
                 LangchainTestFixtures.todoNodeExecutor(),
                 noopExecutionGuard(),
                 mock(AgentEventService.class)
         );
+        LangchainTodoPlan plan = LangchainTodoPlan.builder()
+                .items(List.of(
+                        TodoItem.builder().id("todo_1").sequence(1).description("查询沪深300").build(),
+                        TodoItem.builder().id("todo_2").sequence(2).description("总结走势").build()))
+                .extractedEntities(List.of("沪深300"))
+                .build();
 
-        LangchainLinearWorkflowResult result = executor.execute(LangchainLinearWorkflowRequest.builder()
-                .runId("run-linear-1")
-                .userId("user-1")
-                .userGoal("分析沪深300")
-                .model(model)
-                .maxTodos(5)
-                .build());
+        LangchainLinearWorkflowResult result = executor.executePlanned(
+                LangchainLinearWorkflowRequest.builder()
+                        .runId("run-linear-1")
+                        .userId("user-1")
+                        .userGoal("分析沪深300")
+                        .model(model)
+                        .maxTodos(5)
+                        .build(),
+                plan);
 
         assertThat(result.isSuccess()).isTrue();
         assertThat(result.getFinalAnswer()).isEqualTo("final answer");
@@ -73,33 +60,35 @@ class LangchainLinearWorkflowExecutorTest {
         assertThat(result.getCompletedTodos().get(0).getOutput()).isEqualTo("todo1 output");
         assertThat(result.getCompletedTodos().get(1).getOutput()).contains("todo1");
         assertThat(result.getPlan().getExtractedEntities()).containsExactly("沪深300");
-        assertThat(model.requests()).hasSize(4);
-        assertThat(model.requests().get(2).toString()).contains("todo1 output");
-        assertThat(model.requests().get(3).toString()).contains("todo2 output based on todo1");
+        assertThat(model.requests()).hasSize(3);
+        assertThat(model.requests().get(1).toString()).contains("todo1 output");
+        assertThat(model.requests().get(2).toString()).contains("todo2 output based on todo1");
         assertThat(AgentContext.getRunId()).isNull();
     }
 
     @Test
-    void execute_shouldFailWhenTodoOutputIsBlank() {
+    void executePlanned_shouldFailWhenTodoOutputIsBlank() {
         // ccmax #59: 第一次返回空 → executor 走 recovery（第二次）→ recovery 也空 → failure(empty_todo_output_after_recovery:...)
         QueueChatModel model = new QueueChatModel(
-                """
-                {"analysis":"linear","items":[{"id":"todo_1","sequence":1,"description":"查询"}],"extractedEntities":[]}
-                """,
                 "   ",  // 第一次：todo 执行返回空
                 "   "   // 第二次：recovery 也返回空 → empty_todo_output_after_recovery
         );
         LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
-                LangchainTestFixtures.legacySingleStagePlanner(),
                 LangchainTestFixtures.todoNodeExecutor(),
                 noopExecutionGuard(),
                 mock(AgentEventService.class)
         );
+        LangchainTodoPlan plan = LangchainTodoPlan.builder()
+                .items(List.of(TodoItem.builder().id("todo_1").sequence(1).description("查询").build()))
+                .extractedEntities(List.of())
+                .build();
 
-        LangchainLinearWorkflowResult result = executor.execute(LangchainLinearWorkflowRequest.builder()
-                .userGoal("分析")
-                .model(model)
-                .build());
+        LangchainLinearWorkflowResult result = executor.executePlanned(
+                LangchainLinearWorkflowRequest.builder()
+                        .userGoal("分析")
+                        .model(model)
+                        .build(),
+                plan);
 
         assertThat(result.isSuccess()).isFalse();
         assertThat(result.getFailureReason()).isEqualTo("empty_todo_output_after_recovery:todo_1");
@@ -107,44 +96,41 @@ class LangchainLinearWorkflowExecutorTest {
     }
 
     @Test
-    void execute_shouldInjectDatasetRefsIntoLaterTodoPrompt() {
+    void executePlanned_shouldInjectDatasetRefsIntoLaterTodoPrompt() {
         QueueChatModel model = new QueueChatModel(
-                """
-                {
-                  "analysis": "linear",
-                  "items": [
-                    {"id":"todo_1","sequence":1,"description":"获取指数数据"},
-                    {"id":"todo_2","sequence":2,"description":"用 Python 计算收益"}
-                  ],
-                  "extractedEntities": ["沪深300"]
-                }
-                """,
                 "{\"ok\":true,\"tool\":\"getIndexDaily\",\"data\":{\"dataset_id\":\"dataset-hs300\"}}",
                 "calculated result",
                 "final answer"
         );
         LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
-                LangchainTestFixtures.legacySingleStagePlanner(),
                 LangchainTestFixtures.todoNodeExecutor(),
                 noopExecutionGuard(),
                 mock(AgentEventService.class)
         );
+        LangchainTodoPlan plan = LangchainTodoPlan.builder()
+                .items(List.of(
+                        TodoItem.builder().id("todo_1").sequence(1).description("获取指数数据").build(),
+                        TodoItem.builder().id("todo_2").sequence(2).description("用 Python 计算收益").build()))
+                .extractedEntities(List.of("沪深300"))
+                .build();
 
-        LangchainLinearWorkflowResult result = executor.execute(LangchainLinearWorkflowRequest.builder()
-                .runId("run-dataset-1")
-                .userId("user-1")
-                .userGoal("计算收益")
-                .model(model)
-                .maxTodos(5)
-                .build());
+        LangchainLinearWorkflowResult result = executor.executePlanned(
+                LangchainLinearWorkflowRequest.builder()
+                        .runId("run-dataset-1")
+                        .userId("user-1")
+                        .userGoal("计算收益")
+                        .model(model)
+                        .maxTodos(5)
+                        .build(),
+                plan);
 
         assertThat(result.isSuccess()).isTrue();
-        assertThat(model.requests()).hasSize(4);
-        assertThat(model.requests().get(2).toString())
-                .contains("已有原始数据集 ID")
+        assertThat(model.requests()).hasSize(3);
+        assertThat(model.requests().get(1).toString())
+                .contains("已有原始数据引用")
                 .contains("dataset-hs300")
-                .contains("run-level dataset_ids/manifest_ids")
-                .contains("listMyData");
+                .doesNotContain("run-level dataset_ids/manifest_ids")
+                .doesNotContain("listMyData");
     }
 
     @Test
@@ -156,7 +142,7 @@ class LangchainLinearWorkflowExecutorTest {
         when(nodeExecutor.execute(any(), any(), any(), any(), any()))
                 .thenReturn(LangchainTodoNodeResult.suspended(pending));
         LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
-                LangchainTestFixtures.planner(), nodeExecutor, noopExecutionGuard(), events);
+                nodeExecutor, noopExecutionGuard(), events);
         TodoItem todo = TodoItem.builder().id("todo_2").sequence(2).description("long python").build();
         LangchainTodoPlan plan = LangchainTodoPlan.builder().items(List.of(todo)).build();
 

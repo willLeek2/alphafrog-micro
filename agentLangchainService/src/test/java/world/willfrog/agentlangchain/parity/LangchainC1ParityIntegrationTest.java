@@ -8,11 +8,13 @@ import org.junit.jupiter.api.Test;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.workflow.TodoItem;
 import world.willfrog.agentlangchain.orchestration.LangchainLinearRunPipelineImpl;
 import world.willfrog.agentlangchain.orchestration.LangchainLinearWorkflowExecutor;
 import world.willfrog.agentlangchain.orchestration.LangchainRunExecutionGuard;
 import world.willfrog.agentlangchain.orchestration.LangchainLinearWorkflowRequest;
 import world.willfrog.agentlangchain.orchestration.LangchainLinearWorkflowResult;
+import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
 import world.willfrog.agentlangchain.support.LangchainTestFixtures;
 
 import java.util.ArrayList;
@@ -32,7 +34,6 @@ import static org.mockito.Mockito.when;
 class LangchainC1ParityIntegrationTest {
 
     private final LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
-            LangchainTestFixtures.legacySingleStagePlanner(),
             LangchainTestFixtures.todoNodeExecutor(),
             noopExecutionGuard(),
             mock(AgentEventService.class)
@@ -41,17 +42,13 @@ class LangchainC1ParityIntegrationTest {
     @Test
     void linear_simple_success_matchesLegacyOutcomeShape() {
         QueueChatModel model = new QueueChatModel(
-                """
-                {
-                  "analysis": "single todo",
-                  "items": [{"id":"t1","sequence":1,"description":"查询 512800.SH 最近一周走势"}]
-                }
-                """,
                 "{\"ok\":true,\"data\":{\"dataset_id\":\"ds_etf_daily\"}}",
                 "512800.SH 最近一周呈震荡上行。"
         );
 
-        LangchainLinearWorkflowResult result = executor.execute(request(model, "查询 512800.SH 最近一周走势"));
+        LangchainLinearWorkflowResult result = executor.executePlanned(
+                request(model, "查询 512800.SH 最近一周走势"),
+                singleTodoPlan("查询 512800.SH 最近一周走势"));
 
         assertLegacyAlignedSuccess(result, "512800.SH 最近一周呈震荡上行。");
         assertThat(result.getCompletedTodos()).hasSize(1);
@@ -61,14 +58,13 @@ class LangchainC1ParityIntegrationTest {
     @Test
     void empty_final_answer_failed_matchesLegacyFailureShape() {
         QueueChatModel model = new QueueChatModel(
-                """
-                {"analysis":"x","items":[{"id":"t1","sequence":1,"description":"分析某只股票"}]}
-                """,
                 "{\"ok\":true,\"data\":{}}",
                 "   "
         );
 
-        LangchainLinearWorkflowResult result = executor.execute(request(model, "分析某只股票"));
+        LangchainLinearWorkflowResult result = executor.executePlanned(
+                request(model, "分析某只股票"),
+                singleTodoPlan("分析某只股票"));
 
         assertLegacyAlignedFailure(result);
         assertThat(result.getFailureReason()).isEqualTo("empty_final_answer");
@@ -77,13 +73,12 @@ class LangchainC1ParityIntegrationTest {
     @Test
     void empty_todo_output_failed_matchesLegacyTodoFailureSemantics() {
         QueueChatModel model = new QueueChatModel(
-                """
-                {"analysis":"x","items":[{"id":"t1","sequence":1,"description":"查询"}]}
-                """,
                 ""
         );
 
-        LangchainLinearWorkflowResult result = executor.execute(request(model, "查询"));
+        LangchainLinearWorkflowResult result = executor.executePlanned(
+                request(model, "查询"),
+                singleTodoPlan("查询"));
 
         assertLegacyAlignedFailure(result);
         assertThat(result.getFailureReason()).isEqualTo("empty_todo_output_after_recovery:t1");
@@ -96,6 +91,16 @@ class LangchainC1ParityIntegrationTest {
                 .userId("u1")
                 .userGoal(goal)
                 .model(model)
+                .build();
+    }
+
+    private static LangchainTodoPlan singleTodoPlan(String description) {
+        return LangchainTodoPlan.builder()
+                .items(List.of(TodoItem.builder()
+                        .id("t1")
+                        .sequence(1)
+                        .description(description)
+                        .build()))
                 .build();
     }
 

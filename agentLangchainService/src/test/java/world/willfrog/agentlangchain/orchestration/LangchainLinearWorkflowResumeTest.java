@@ -11,7 +11,6 @@ import world.willfrog.agent.platform.service.AgentEventService;
 import world.willfrog.agent.platform.service.CodeRefineLocalConfigLoader;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 import world.willfrog.agent.workflow.TodoItem;
-import world.willfrog.agentlangchain.planning.LangchainAiPlanner;
 import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
 import world.willfrog.agentlangchain.tooljob.ToolJobResumeContext;
 
@@ -27,8 +26,7 @@ import static org.mockito.Mockito.*;
 class LangchainLinearWorkflowResumeTest {
 
     @Test
-    void resumeSkipsPlannerAndPriorTodosInjectsCurrentResultWithoutExtraToolCall() {
-        LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
+    void resumeSkipsPriorTodosAndInjectsCurrentResultWithoutExtraToolCall() {
         LangchainTodoNodeExecutor nodeExecutor = mock(LangchainTodoNodeExecutor.class);
         LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
         AgentEventService events = mock(AgentEventService.class);
@@ -43,8 +41,7 @@ class LangchainLinearWorkflowResumeTest {
                 });
         when(nodeExecutor.writeFinalAnswer(any(), any())).thenReturn("final-answer");
 
-        LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
-                planner, nodeExecutor, guard, events);
+        LangchainLinearWorkflowExecutor executor = productionExecutor(nodeExecutor, guard, events);
         LangchainTodoPlan plan = LangchainTodoPlan.builder()
                 .executionMode(PlanExecutionMode.LINEAR)
                 .items(List.of(item("todo-1", 1), item("todo-2", 2), item("todo-3", 3)))
@@ -83,7 +80,6 @@ class LangchainLinearWorkflowResumeTest {
         assertThat(consumed.get()).isEqualTo(1);
         assertThat(resumeTokenSeenByNextTodo.get()).isEqualTo("token-1");
         assertThat(resumeVersionSeenByNextTodo.get()).isEqualTo(2L);
-        verifyNoInteractions(planner);
 
         ArgumentCaptor<TodoItem> executed = ArgumentCaptor.forClass(TodoItem.class);
         verify(nodeExecutor, times(1)).execute(any(), executed.capture(), any(), any(), any());
@@ -93,7 +89,6 @@ class LangchainLinearWorkflowResumeTest {
 
     @Test
     void terminalResultPreviewPreservesExactWhitespaceAndNewlines() {
-        LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
         LangchainTodoNodeExecutor nodeExecutor = mock(LangchainTodoNodeExecutor.class);
         LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
         when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
@@ -101,8 +96,8 @@ class LangchainLinearWorkflowResumeTest {
                 .thenReturn(LangchainTodoNodeResult.success("todo-3-output", 6));
         when(nodeExecutor.writeFinalAnswer(any(), any())).thenReturn("final-answer");
 
-        LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
-                planner, nodeExecutor, guard, mock(AgentEventService.class));
+        LangchainLinearWorkflowExecutor executor = productionExecutor(
+                nodeExecutor, guard, mock(AgentEventService.class));
         LangchainTodoPlan plan = LangchainTodoPlan.builder()
                 .executionMode(PlanExecutionMode.LINEAR)
                 .items(List.of(item("todo-1", 1), item("todo-2", 2), item("todo-3", 3)))
@@ -137,12 +132,11 @@ class LangchainLinearWorkflowResumeTest {
 
     @Test
     void consumeFailureStopsBeforeAnyLaterTodoAndRemainsRetryable() {
-        LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
         LangchainTodoNodeExecutor nodeExecutor = mock(LangchainTodoNodeExecutor.class);
         LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
         when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
-        LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
-                planner, nodeExecutor, guard, mock(AgentEventService.class));
+        LangchainLinearWorkflowExecutor executor = productionExecutor(
+                nodeExecutor, guard, mock(AgentEventService.class));
         LangchainTodoPlan plan = LangchainTodoPlan.builder()
                 .executionMode(PlanExecutionMode.LINEAR)
                 .items(List.of(item("todo-2", 2), item("todo-3", 3)))
@@ -159,22 +153,20 @@ class LangchainLinearWorkflowResumeTest {
         assertThat(result.isSuccess()).isFalse();
         assertThat(result.getFailureReason()).isEqualTo("resume_result_consume_failed");
         assertThat(result.getToolCallsUsed()).isEqualTo(5);
-        verifyNoInteractions(planner);
         verify(nodeExecutor, never()).execute(any(), any(), any(), any(), any());
         verify(nodeExecutor, never()).writeFinalAnswer(any(), any());
     }
 
     @Test
     void restartAfterAcceptedHandoffDoesNotRepeatCurrentToolCall() {
-        LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
         LangchainTodoNodeExecutor nodeExecutor = mock(LangchainTodoNodeExecutor.class);
         LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
         when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
         when(nodeExecutor.execute(any(), any(), any(), any(), any()))
                 .thenReturn(LangchainTodoNodeResult.success("todo-3-output", 6));
         when(nodeExecutor.writeFinalAnswer(any(), any())).thenReturn("final-answer");
-        LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
-                planner, nodeExecutor, guard, mock(AgentEventService.class));
+        LangchainLinearWorkflowExecutor executor = productionExecutor(
+                nodeExecutor, guard, mock(AgentEventService.class));
         LangchainTodoPlan plan = LangchainTodoPlan.builder()
                 .executionMode(PlanExecutionMode.LINEAR)
                 .items(List.of(item("todo-2", 2), item("todo-3", 3)))
@@ -212,12 +204,10 @@ class LangchainLinearWorkflowResumeTest {
         ArgumentCaptor<TodoItem> executed = ArgumentCaptor.forClass(TodoItem.class);
         verify(nodeExecutor, times(1)).execute(any(), executed.capture(), any(), any(), any());
         assertThat(executed.getValue().getId()).isEqualTo("todo-3");
-        verifyNoInteractions(planner);
     }
 
     @Test
     void consecutiveTwoLongPythonTodosConsumeFirstThenSuspendAtSecondWithSameFence() {
-        LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
         LangchainTodoNodeExecutor nodeExecutor = mock(LangchainTodoNodeExecutor.class);
         LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
         when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
@@ -233,8 +223,8 @@ class LangchainLinearWorkflowResumeTest {
                             new ExternalToolJobPendingException(
                                     "run-1", "python-call-2", 1, "second long python pending"));
                 });
-        LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
-                planner, nodeExecutor, guard, mock(AgentEventService.class));
+        LangchainLinearWorkflowExecutor executor = productionExecutor(
+                nodeExecutor, guard, mock(AgentEventService.class));
         LangchainTodoPlan plan = LangchainTodoPlan.builder()
                 .executionMode(PlanExecutionMode.LINEAR)
                 .items(List.of(item("todo-1", 1), item("todo-2", 2), item("todo-3", 3)))
@@ -275,12 +265,10 @@ class LangchainLinearWorkflowResumeTest {
         assertThat(resumeTokenSeenBySecondTool.get()).isEqualTo("python-token-1");
         assertThat(resumeVersionSeenBySecondTool.get()).isEqualTo(11L);
         verify(nodeExecutor, times(1)).execute(any(), any(), any(), any(), any());
-        verifyNoInteractions(planner);
     }
 
     @Test
     void userCodeTerminalFailureReentersSameTodoWithDurableRepairContext() {
-        LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
         LangchainTodoNodeExecutor nodeExecutor = mock(LangchainTodoNodeExecutor.class);
         LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
         when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
@@ -292,8 +280,8 @@ class LangchainLinearWorkflowResumeTest {
             return LangchainTodoNodeResult.success("repaired-output", 1);
         });
         when(nodeExecutor.writeFinalAnswer(any(), any())).thenReturn("final-after-repair");
-        LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
-                planner, nodeExecutor, guard, mock(AgentEventService.class));
+        LangchainLinearWorkflowExecutor executor = productionExecutor(
+                nodeExecutor, guard, mock(AgentEventService.class));
         LangchainTodoPlan plan = LangchainTodoPlan.builder()
                 .executionMode(PlanExecutionMode.LINEAR)
                 .items(List.of(item("todo-2", 2)))
@@ -318,12 +306,10 @@ class LangchainLinearWorkflowResumeTest {
         assertThat(result.getCompletedTodos()).extracting(LangchainCompletedTodo::getTodoId)
                 .containsExactly("todo-2");
         verify(nodeExecutor).execute(any(), any(), any(), any(), any(), same(context));
-        verifyNoInteractions(planner);
     }
 
     @Test
     void acceptedPythonRepairCrashReentryDoesNotConsumeOrIncrementAgain() {
-        LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
         LangchainTodoNodeExecutor nodeExecutor = mock(LangchainTodoNodeExecutor.class);
         LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
         when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
@@ -331,8 +317,8 @@ class LangchainLinearWorkflowResumeTest {
                 any(ToolJobResumeContext.class)))
                 .thenReturn(LangchainTodoNodeResult.success("repaired-output", 1));
         when(nodeExecutor.writeFinalAnswer(any(), any())).thenReturn("final-after-restart");
-        LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
-                planner, nodeExecutor, guard, mock(AgentEventService.class));
+        LangchainLinearWorkflowExecutor executor = productionExecutor(
+                nodeExecutor, guard, mock(AgentEventService.class));
         LangchainTodoPlan plan = LangchainTodoPlan.builder()
                 .executionMode(PlanExecutionMode.LINEAR)
                 .items(List.of(item("todo-2", 2)))
@@ -351,7 +337,6 @@ class LangchainLinearWorkflowResumeTest {
         assertThat(context.getPythonRepairAttempt()).isEqualTo(1);
         assertThat(context.isPythonRepairPending()).isTrue();
         verify(nodeExecutor).execute(any(), any(), any(), any(), any(), same(context));
-        verifyNoInteractions(planner);
     }
 
     @Test
@@ -372,12 +357,11 @@ class LangchainLinearWorkflowResumeTest {
 
     @Test
     void pythonRepairExhaustionConsumesTerminalAndFailsWithoutAnotherLlmCall() {
-        LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
         LangchainTodoNodeExecutor nodeExecutor = mock(LangchainTodoNodeExecutor.class);
         LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
         when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
-        LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
-                planner, nodeExecutor, guard, mock(AgentEventService.class));
+        LangchainLinearWorkflowExecutor executor = productionExecutor(
+                nodeExecutor, guard, mock(AgentEventService.class));
         LangchainTodoPlan plan = LangchainTodoPlan.builder()
                 .executionMode(PlanExecutionMode.LINEAR)
                 .items(List.of(item("todo-2", 2)))
@@ -402,17 +386,15 @@ class LangchainLinearWorkflowResumeTest {
         verify(nodeExecutor, never()).execute(any(), any(), any(), any(), any());
         verify(nodeExecutor, never()).execute(any(), any(), any(), any(), any(), any());
         verify(nodeExecutor, never()).writeFinalAnswer(any(), any());
-        verifyNoInteractions(planner);
     }
 
     @Test
     void crashAfterPersistedRepairExhaustionFailsDeterministicallyWithoutAnotherLlmCall() {
-        LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
         LangchainTodoNodeExecutor nodeExecutor = mock(LangchainTodoNodeExecutor.class);
         LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
         when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
-        LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
-                planner, nodeExecutor, guard, mock(AgentEventService.class));
+        LangchainLinearWorkflowExecutor executor = productionExecutor(
+                nodeExecutor, guard, mock(AgentEventService.class));
         LangchainTodoPlan plan = LangchainTodoPlan.builder()
                 .executionMode(PlanExecutionMode.LINEAR)
                 .items(List.of(item("todo-2", 2)))
@@ -429,12 +411,11 @@ class LangchainLinearWorkflowResumeTest {
         assertThat(result.isSuccess()).isFalse();
         assertThat(result.getFailureReason()).isEqualTo("python_repair_exhausted");
         assertThat(result.getFailureMetadata()).containsEntry("max_attempts", 3);
-        verifyNoInteractions(nodeExecutor, planner);
+        verifyNoInteractions(nodeExecutor);
     }
 
     @Test
     void hotReloadedMaxAttemptsChangesExhaustionGateWithoutRestart() {
-        LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
         LangchainTodoNodeExecutor nodeExecutor = mock(LangchainTodoNodeExecutor.class);
         LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
         AgentEventService events = mock(AgentEventService.class);
@@ -449,7 +430,7 @@ class LangchainLinearWorkflowResumeTest {
                 .thenReturn(LangchainTodoNodeResult.success("repaired-output", 1));
         when(nodeExecutor.writeFinalAnswer(any(), any())).thenReturn("final-after-repair");
         LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
-                planner, nodeExecutor, guard, events, loader, startup);
+                nodeExecutor, guard, events, loader, startup);
         LangchainTodoPlan plan = LangchainTodoPlan.builder()
                 .executionMode(PlanExecutionMode.LINEAR)
                 .items(List.of(item("todo-2", 2)))
@@ -469,19 +450,17 @@ class LangchainLinearWorkflowResumeTest {
         assertThat(allowed.isSuccess()).isTrue();
         verify(nodeExecutor).execute(any(), any(), any(), any(), any(), same(allowedAtFour));
         verify(nodeExecutor).writeFinalAnswer(any(), any());
-        verifyNoInteractions(planner);
     }
 
     @Test
     void invalidHotReloadedMaxAttemptsUsesSameDefaultAsLoaderSanitizer() {
-        LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
         LangchainTodoNodeExecutor nodeExecutor = mock(LangchainTodoNodeExecutor.class);
         LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
         CodeRefineLocalConfigLoader loader = mock(CodeRefineLocalConfigLoader.class);
         when(loader.current()).thenReturn(Optional.of(attempts(0)));
         when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
         LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
-                planner, nodeExecutor, guard, mock(AgentEventService.class), loader, attempts(5));
+                nodeExecutor, guard, mock(AgentEventService.class), loader, attempts(5));
         ToolJobResumeContext context = failedPythonContext(false, 2);
 
         LangchainLinearWorkflowResult result = executor.resumePlanned(
@@ -489,17 +468,16 @@ class LangchainLinearWorkflowResumeTest {
 
         assertThat(result.getFailureReason()).isEqualTo("python_repair_exhausted");
         assertThat(result.getFailureMetadata()).containsEntry("max_attempts", 3);
-        verifyNoInteractions(nodeExecutor, planner);
+        verifyNoInteractions(nodeExecutor);
     }
 
     @Test
     void executionErrorRemainsFailFastInsteadOfEnteringCodeRepair() {
-        LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
         LangchainTodoNodeExecutor nodeExecutor = mock(LangchainTodoNodeExecutor.class);
         LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
         when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
-        LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
-                planner, nodeExecutor, guard, mock(AgentEventService.class));
+        LangchainLinearWorkflowExecutor executor = productionExecutor(
+                nodeExecutor, guard, mock(AgentEventService.class));
         LangchainTodoPlan plan = LangchainTodoPlan.builder()
                 .executionMode(PlanExecutionMode.LINEAR)
                 .items(List.of(item("todo-2", 2)))
@@ -511,7 +489,7 @@ class LangchainLinearWorkflowResumeTest {
                 request(), plan, context, () -> true);
 
         assertThat(result.getFailureReason()).isEqualTo("external_tool_terminal_failure");
-        verifyNoInteractions(nodeExecutor, planner);
+        verifyNoInteractions(nodeExecutor);
     }
 
     @Test
@@ -553,12 +531,11 @@ class LangchainLinearWorkflowResumeTest {
 
     private static void assertInvalidPendingRepairFailsClosed(
             String exitReason, boolean exhausted, String expectedFailure) {
-        LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
         LangchainTodoNodeExecutor nodeExecutor = mock(LangchainTodoNodeExecutor.class);
         LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
         when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
-        LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
-                planner, nodeExecutor, guard, mock(AgentEventService.class));
+        LangchainLinearWorkflowExecutor executor = productionExecutor(
+                nodeExecutor, guard, mock(AgentEventService.class));
         ToolJobResumeContext context = failedPythonContext(true, 1);
         context.setTerminalExitReason(exitReason);
         context.setPythonRepairExhausted(exhausted);
@@ -568,13 +545,23 @@ class LangchainLinearWorkflowResumeTest {
                 () -> { throw new AssertionError("accepted handoff must not be consumed twice"); });
 
         assertThat(result.getFailureReason()).isEqualTo(expectedFailure);
-        verifyNoInteractions(nodeExecutor, planner);
+        verifyNoInteractions(nodeExecutor);
     }
 
     private static CodeRefineProperties attempts(int value) {
         CodeRefineProperties properties = new CodeRefineProperties();
         properties.setMaxAttempts(value);
         return properties;
+    }
+
+    private static LangchainLinearWorkflowExecutor productionExecutor(
+            LangchainTodoNodeExecutor nodeExecutor,
+            LangchainRunExecutionGuard guard,
+            AgentEventService events) {
+        CodeRefineLocalConfigLoader loader = mock(CodeRefineLocalConfigLoader.class);
+        when(loader.current()).thenReturn(Optional.empty());
+        return new LangchainLinearWorkflowExecutor(
+                nodeExecutor, guard, events, loader, new CodeRefineProperties());
     }
 
     private static LangchainTodoPlan singleTodoPlan() {
