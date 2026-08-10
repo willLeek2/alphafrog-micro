@@ -460,13 +460,27 @@ class AgentRunDagNodeMapperBindingTest {
         String fullId = AgentRunDagNodeMapper.class.getName() + ".cancelFrontierAndChildrenCTE_resume";
         assertThat(configuration.hasStatement(fullId)).isTrue();
         MappedStatement ms = configuration.getMappedStatement(fullId);
-        String sql = ms.getSqlSource().getBoundSql(Map.of()).getSql();
+
+        // 用带参数的 BoundSql 以便通过 ParameterMapping 校验 identity fence
+        Set<String> javaParams = methodParams.getOrDefault("cancelFrontierAndChildrenCTE_resume", Set.of());
+        Map<String, Object> paramMap = new HashMap<>();
+        for (String p : javaParams) paramMap.put(p, buildDummyValue(p));
+        BoundSql boundSql = ms.getSqlSource().getBoundSql(paramMap);
+        String sql = boundSql.getSql();
+        List<ParameterMapping> pms = boundSql.getParameterMappings();
+
+        // 构建 ? 位置 → ParameterMapping 索引的映射
+        List<Integer> qmPositions = new ArrayList<>();
+        int idx = 0;
+        while ((idx = sql.indexOf('?', idx)) != -1) {
+            qmPositions.add(idx);
+            idx++;
+        }
 
         // 1) 规范化：折叠空白、trim
         String norm = sql.replaceAll("\\s+", " ").trim();
 
         // 2) 提取 frontier_result UPDATE 的 WHERE 子句
-        //    结构：WITH frontier_result AS ( UPDATE ... SET ... WHERE ... RETURNING 1 ), child_marked AS (
         int frontierStart = norm.indexOf("frontier_result AS (");
         assertThat(frontierStart).as("SQL 应包含 frontier_result CTE").isNotNegative();
         int returnIdx = norm.indexOf("RETURNING 1", frontierStart);
@@ -477,21 +491,21 @@ class AgentRunDagNodeMapperBindingTest {
         assertThat(whereIdx).as("frontier_result UPDATE 应有 WHERE 子句").isNotNegative();
         String whereClause = frontierBlock.substring(whereIdx);
 
-        // 3) 谓词组一完整结构：status = 'RECEIVED' AND resumeState = 'LAUNCHING' AND resultConsumed IS NOT TRUE
+        // 3) 谓词组一：status = 'RECEIVED' AND resumeState = 'LAUNCHING' AND resultConsumed IS NOT TRUE
         assertThat(whereClause)
-                .as("谓词组一应完整：status='RECEIVED' + resumeState='LAUNCHING' + resultConsumed IS NOT TRUE，三条件用 AND 连接")
+                .as("谓词组一：三条件必须用 AND 连接，不能出现 OR")
                 .containsPattern(
                         "status\\s*=\\s*'RECEIVED'"
-                        + ".*resumeState.*'LAUNCHING'"
-                        + ".*resultConsumed.*IS\\s+NOT\\s+TRUE");
+                        + "\\s+AND\\s+.+resumeState.+'LAUNCHING'"
+                        + "\\s+AND\\s+.+resultConsumed.+IS\\s+NOT\\s+TRUE");
 
-        // 4) 谓词组二完整结构：status = 'EXECUTING' AND resumeState IN ('LAUNCHING','ACCEPTED') AND resultConsumed IS TRUE
+        // 4) 谓词组二：status = 'EXECUTING' AND resumeState IN ('LAUNCHING','ACCEPTED') AND resultConsumed IS TRUE
         assertThat(whereClause)
-                .as("谓词组二应完整：status='EXECUTING' + resumeState IN (LAUNCHING,ACCEPTED) + resultConsumed IS TRUE，三条件用 AND 连接")
+                .as("谓词组二：三条件必须用 AND 连接，不能出现 OR")
                 .containsPattern(
                         "status\\s*=\\s*'EXECUTING'"
-                        + ".*resumeState.*IN\\s*\\(\\s*'LAUNCHING'\\s*,\\s*'ACCEPTED'\\s*\\)"
-                        + ".*resultConsumed.*IS\\s+TRUE");
+                        + "\\s+AND\\s+.+resumeState.+IN\\s*\\(\\s*'LAUNCHING'\\s*,\\s*'ACCEPTED'\\s*\\)"
+                        + "\\s+AND\\s+.+resultConsumed.+IS\\s+TRUE");
 
         // 5) 两组之间用 OR 连接（非 AND），且包裹在同一对外层括号内
         int group1End = whereClause.indexOf("IS NOT TRUE)") + "IS NOT TRUE)".length();
@@ -501,7 +515,7 @@ class AgentRunDagNodeMapperBindingTest {
                 .as("group1 和 group2 之间应由 OR 连接，不能是 AND")
                 .isEqualTo("OR");
 
-        // 外层结构：AND ( (group1) OR (group2) ) AND tool_job_anchor_json — 锁住两组和 fence 在同一 WHERE
+        // 外层结构：AND ( (group1) OR (group2) ) AND tool_job_anchor_json
         int outerOpen = whereClause.indexOf("AND ( (status = 'RECEIVED'");
         int outerClose = whereClause.indexOf(") ) AND tool_job_anchor_json");
         assertThat(outerOpen).as("外层应形如 AND ( (group1...").isNotNegative();
@@ -509,20 +523,43 @@ class AgentRunDagNodeMapperBindingTest {
                 .isNotNegative()
                 .isGreaterThan(outerOpen);
 
-        // 6) 三项 identity fence 均在 frontier_result 的 WHERE 子句中
-        assertThat(whereClause).as("resumeToken fence 应在 frontier_result WHERE 中")
-                .contains("'{resumeToken}'");
-        assertThat(whereClause).as("resumeLauncherOwnerId fence 应在 frontier_result WHERE 中")
-                .contains("'{resumeLauncherOwnerId}'");
-        assertThat(whereClause).as("resumeLeaseVersion fence 应在 frontier_result WHERE 中")
-                .contains("'{resumeLeaseVersion}'");
+        // 6) 三项 identity fence 完整比较：JSON 键 = ?，且 ? 对应的 ParameterMapping 正确
+        assertFenceComplete("'{resumeToken}'", "expectedResumeToken",
+                norm, sql, qmPositions, pms, frontierStart);
 
-        // 7) 三个 fence 在 WHERE 中的顺序：resumeToken → resumeLauncherOwnerId → resumeLeaseVersion
-        int tokenPos = whereClause.indexOf("'{resumeToken}'");
-        int ownerPos = whereClause.indexOf("'{resumeLauncherOwnerId}'");
-        int leasePos = whereClause.indexOf("'{resumeLeaseVersion}'");
-        assertThat(tokenPos).as("resumeToken 位置").isLessThan(ownerPos);
-        assertThat(ownerPos).as("resumeLauncherOwnerId 位置").isLessThan(leasePos);
+        assertFenceComplete("'{resumeLauncherOwnerId}'", "expectedOwnerId",
+                norm, sql, qmPositions, pms, frontierStart);
+
+        assertFenceComplete("'{resumeLeaseVersion}'", "expectedResumeLeaseVersion",
+                norm, sql, qmPositions, pms, frontierStart);
+    }
+
+    /** 验证 frontier_result WHERE 中 JSON 键完整比较：key = ? 且 ? 对应正确 @Param */
+    private void assertFenceComplete(String jsonKey, String expectedParam,
+                                      String norm, String fullSql,
+                                      List<Integer> qmPositions,
+                                      List<ParameterMapping> pms,
+                                      int frontierStart) {
+        // 在完整 SQL 中找到 frontier_result 块内该 JSON 键后的 ?
+        int keyPos = fullSql.indexOf(jsonKey, frontierStart);
+        assertThat(keyPos).as(jsonKey + " 应在 frontier_result 块内").isNotNegative();
+
+        // 找到该键之后最近的 ?
+        int qmIdx = fullSql.indexOf('?', keyPos);
+        assertThat(qmIdx).as(jsonKey + " 之后应有 ? 占位符").isNotNegative();
+
+        // 确认 ? 在 frontier_result CTE 范围内（RETURNING 1 之前）
+        int frontierReturning = fullSql.indexOf("RETURNING 1", frontierStart);
+        assertThat(qmIdx).as(jsonKey + " 的 ? 应在 frontier_result 的 RETURNING 1 之前")
+                .isLessThan(frontierReturning);
+
+        // 通过 ? 位置找到对应的 ParameterMapping
+        int pmIndex = qmPositions.indexOf(qmIdx);
+        assertThat(pmIndex).as(jsonKey + " 的 ? 应有对应 ParameterMapping").isNotNegative();
+        String prop = pms.get(pmIndex).getProperty();
+        String root = prop.contains(".") ? prop.substring(0, prop.indexOf('.')) : prop;
+        assertThat(root).as(jsonKey + " = ? 的 ? 必须对应 @Param(\"" + expectedParam + "\")")
+                .isEqualTo(expectedParam);
     }
 
     @Test
