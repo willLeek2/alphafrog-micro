@@ -95,6 +95,9 @@ DEPLOY_SCRIPT = REPO_ROOT / "deploy_latest.sh"
 DOCKER_BUILD_SCRIPT = SANDBOX_SERVICE_ROOT / "docker_build.sh"
 RUNTIME_BUILD_DIR = SANDBOX_SERVICE_ROOT / ".runtime-build"
 MAPPING_FILE = RUNTIME_BUILD_DIR / "image-digest-mapping.json"
+IIDFILE = RUNTIME_BUILD_DIR / "image-id"
+LIBRARY_SET_FILE = RUNTIME_BUILD_DIR / "library-set.json"
+OCI_LIBRARY_SET_LABEL = "com.alphafrog.librarySetDigest"
 
 # Shared accept/reject vectors (single source of truth pinning identical
 # semantics at every digest-validation entry point, Spec §12 hardening).
@@ -238,6 +241,7 @@ case "$cmd" in
       exit 1
     fi
     iid=""
+    labels_json="{}"
     while [ "$#" -gt 0 ]; do
       arg="$1"
       shift
@@ -246,10 +250,74 @@ case "$cmd" in
         --iidfile)
           if [ "$#" -gt 0 ]; then iid="$1"; shift; fi
           ;;
+        --build-arg=*)
+          barg="${arg#--build-arg=}"
+          if [ "${barg%%=*}" = "AF_LIBRARY_SET_DIGEST" ]; then
+            labels_json="$(LABEL_KEY="com.alphafrog.librarySetDigest" LABEL_VAL="${barg#*=}" LABEL_JSON="$labels_json" python3 -c 'import json,os; d=json.loads(os.environ["LABEL_JSON"]); d[os.environ["LABEL_KEY"]]=os.environ["LABEL_VAL"]; print(json.dumps(d,separators=(",",":")))')"
+          fi
+          ;;
+        --build-arg)
+          if [ "$#" -gt 0 ]; then
+            barg="$1"; shift
+            if [ "${barg%%=*}" = "AF_LIBRARY_SET_DIGEST" ]; then
+              labels_json="$(LABEL_KEY="com.alphafrog.librarySetDigest" LABEL_VAL="${barg#*=}" LABEL_JSON="$labels_json" python3 -c 'import json,os; d=json.loads(os.environ["LABEL_JSON"]); d[os.environ["LABEL_KEY"]]=os.environ["LABEL_VAL"]; print(json.dumps(d,separators=(",",":")))')"
+            fi
+          fi
+          ;;
+        --label=*)
+          lab="${arg#--label=}"
+          key="${lab%%=*}"
+          val="${lab#*=}"
+          labels_json="$(LABEL_KEY="$key" LABEL_VAL="$val" LABEL_JSON="$labels_json" python3 -c 'import json,os; d=json.loads(os.environ["LABEL_JSON"]); d[os.environ["LABEL_KEY"]]=os.environ["LABEL_VAL"]; print(json.dumps(d,separators=(",",":")))')"
+          ;;
+        --label)
+          if [ "$#" -gt 0 ]; then
+            lab="$1"; shift
+            key="${lab%%=*}"
+            val="${lab#*=}"
+            labels_json="$(LABEL_KEY="$key" LABEL_VAL="$val" LABEL_JSON="$labels_json" python3 -c 'import json,os; d=json.loads(os.environ["LABEL_JSON"]); d[os.environ["LABEL_KEY"]]=os.environ["LABEL_VAL"]; print(json.dumps(d,separators=(",",":")))')"
+          fi
+          ;;
       esac
     done
+    image_id="${FAKE_DOCKER_BUILD_IMAGE_ID:-sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef}"
     if [ -n "$iid" ]; then
-      printf '%s\n' "${FAKE_DOCKER_BUILD_IMAGE_ID:-sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef}" > "$iid"
+      printf '%s\n' "$image_id" > "$iid"
+    fi
+    if [ -n "${FAKE_DOCKER_IMAGES_FILE:-}" ]; then
+      if ! grep -qxF "$image_id" "$FAKE_DOCKER_IMAGES_FILE" 2>/dev/null; then
+        printf '%s\n' "$image_id" >> "$FAKE_DOCKER_IMAGES_FILE"
+      fi
+    fi
+    if [ -n "${FAKE_DOCKER_ALIASES_FILE:-}" ]; then
+      printf '%s %s\n' "$image_id" "$image_id" >> "$FAKE_DOCKER_ALIASES_FILE"
+    fi
+    # Persist OCI labels for subsequent `docker image inspect` (Tier2a gate).
+    if [ -n "${FAKE_DOCKER_LABELS_FILE:-}" ] && [ "$labels_json" != "{}" ]; then
+      FAKE_DOCKER_LABELS_FILE="$FAKE_DOCKER_LABELS_FILE" BUILD_ID="$image_id" BUILD_LABELS="$labels_json" python3 -c '
+import json, os
+path = os.environ["FAKE_DOCKER_LABELS_FILE"]
+image_id = os.environ["BUILD_ID"]
+new_labels = json.loads(os.environ["BUILD_LABELS"])
+rows = []
+found = False
+if os.path.exists(path):
+    for line in open(path, encoding="utf-8"):
+        line = line.rstrip("\n")
+        if not line.strip():
+            continue
+        parts = line.split(" ", 1)
+        if parts[0] == image_id:
+            existing = json.loads(parts[1]) if len(parts) > 1 else {}
+            existing.update(new_labels)
+            rows.append(image_id + " " + json.dumps(existing, separators=(",", ":")))
+            found = True
+        else:
+            rows.append(line)
+if not found:
+    rows.append(image_id + " " + json.dumps(new_labels, separators=(",", ":")))
+open(path, "w", encoding="utf-8").write("\n".join(rows) + "\n")
+'
     fi
     ;;
   run)
@@ -297,7 +365,20 @@ case "$cmd" in
     fi
     cat "${FAKE_DOCKER_PS_FILE:?}"
     ;;
-  inspect)
+  image)
+    # `docker image inspect ...` — used by D15 Tier2a OCI label probe.
+    if [ "${1:-}" != "inspect" ]; then
+      exit 0
+    fi
+    shift
+    # Fall through into the shared inspect implementation below by
+    # re-entering this script as `inspect ...` would (no bash-4 ;& needed).
+    set -- inspect "$@"
+    cmd="inspect"
+    ;;
+esac
+# Shared inspect path (also reached after rewriting `image inspect`).
+if [ "$cmd" = "inspect" ]; then
     if [ "${FAKE_DOCKER_FAIL:-}" = "inspect" ]; then
       echo "fake docker: inspect failed" >&2
       exit 1
@@ -309,6 +390,7 @@ case "$cmd" in
       arg="$1"
       shift
       case "$arg" in
+        inspect) ;;
         --type=*) typ="${arg#--type=}" ;;
         --type)
           if [ "$#" -gt 0 ]; then typ="$1"; shift; fi
@@ -360,6 +442,13 @@ case "$cmd" in
         continue
       fi
       case "$fmt" in
+        *librarySetDigest*)
+          labels="{}"
+          while read -r id lab; do
+            if [ "$id" = "$canon" ]; then labels="$lab"; break; fi
+          done < "${FAKE_DOCKER_LABELS_FILE:?}"
+          FAKE_LABELS_JSON="$labels" python3 -c 'import json,os; d=json.loads(os.environ["FAKE_LABELS_JSON"] or "{}"); print(d.get("com.alphafrog.librarySetDigest",""))'
+          ;;
         *Labels*)
           labels="null"
           while read -r id lab; do
@@ -373,7 +462,8 @@ case "$cmd" in
       esac
     done <<< "$refs"
     exit "$status"
-    ;;
+fi
+case "$cmd" in
   rmi)
     for ref in "$@"; do
       echo "Untagged: $ref"
@@ -503,6 +593,52 @@ class RuntimeImageRetentionTestBase(unittest.TestCase):
         with open(self.env["FAKE_DOCKER_ALIASES_FILE"], "a", encoding="utf-8") as fh:
             fh.write(f"{ref} {image_id}\n")
 
+    def register_image_id(self, image_id: str) -> None:
+        """Ensure bare immutable image IDs resolve in fake ``docker inspect``."""
+        images_path = Path(self.env["FAKE_DOCKER_IMAGES_FILE"])
+        existing = images_path.read_text(encoding="utf-8")
+        if image_id not in existing.splitlines():
+            images_path.write_text(existing.rstrip("\n") + "\n" + image_id + "\n", encoding="utf-8")
+        self.add_alias(image_id, image_id)
+
+    def set_image_labels(self, image_id: str, labels: dict) -> None:
+        """Merge ``labels`` into the fake docker Labels fixture for ``image_id``."""
+        path = Path(self.env["FAKE_DOCKER_LABELS_FILE"])
+        rows: list[str] = []
+        found = False
+        if path.exists():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                parts = line.split(" ", 1)
+                if parts[0] == image_id:
+                    existing = json.loads(parts[1]) if len(parts) > 1 else {}
+                    existing.update(labels)
+                    rows.append(image_id + " " + json.dumps(existing, separators=(",", ":")))
+                    found = True
+                else:
+                    rows.append(line)
+        if not found:
+            rows.append(image_id + " " + json.dumps(labels, separators=(",", ":")))
+        path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    def write_library_set_file(self, library_set_digest: str = LEGAL_ENTRY_DIGESTS["librarySetDigest"]) -> None:
+        RUNTIME_BUILD_DIR.mkdir(parents=True, exist_ok=True)
+        LIBRARY_SET_FILE.write_text(
+            json.dumps(
+                {
+                    "apiVersion": "1.0",
+                    "librarySetDigest": library_set_digest,
+                    "packages": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def write_iidfile(self, image_id: str = FAKE_BUILD_IMAGE_ID) -> None:
+        RUNTIME_BUILD_DIR.mkdir(parents=True, exist_ok=True)
+        IIDFILE.write_text(image_id + "\n", encoding="utf-8")
+
     def write_mapping_file(self, mapping) -> None:
         """Write the build-artifact image-digest-mapping.json consumed by the
         deploy_latest.sh R2-3 target-binding gate (str == raw bytes, dict ==
@@ -513,6 +649,38 @@ class RuntimeImageRetentionTestBase(unittest.TestCase):
         else:
             MAPPING_FILE.write_text(json.dumps(mapping), encoding="utf-8")
         self.addCleanup(shutil.rmtree, str(RUNTIME_BUILD_DIR), True)
+
+    def write_deploy_build_artifacts(
+        self,
+        mapping=None,
+        *,
+        image_id: str = FAKE_BUILD_IMAGE_ID,
+        library_set_digest: str | None = None,
+        install_oci_label: bool = True,
+    ) -> None:
+        """Write mapping + iidfile + library-set.json and optional OCI label.
+
+        D15-A deploy gates require all three build artifacts before the
+        historical mapping/releasable assertions can fire.
+        """
+        if mapping is None:
+            mapping = self.bound_mapping(image_id=image_id)
+        if library_set_digest is None:
+            if isinstance(mapping, dict):
+                entry = mapping.get("images", {}).get(image_id) or {}
+                library_set_digest = entry.get(
+                    "librarySetDigest", LEGAL_ENTRY_DIGESTS["librarySetDigest"]
+                )
+            else:
+                library_set_digest = LEGAL_ENTRY_DIGESTS["librarySetDigest"]
+        self.write_mapping_file(mapping)
+        self.write_iidfile(image_id)
+        self.write_library_set_file(library_set_digest)
+        self.register_image_id(image_id)
+        if install_oci_label:
+            self.set_image_labels(
+                image_id, {OCI_LIBRARY_SET_LABEL: library_set_digest}
+            )
 
     def bound_mapping(self, image_id: str = FAKE_BUILD_IMAGE_ID, **entry_overrides) -> dict:
         """A single-entry mapping whose entry BINDS ``image_id`` (its key) and
@@ -1026,7 +1194,7 @@ class DeployLatestImageGateTest(RuntimeImageRetentionTestBase):
         refs = [ACCEPT_REFS[0], "alphafrog-sandbox-runtime:latest", *VALID_DEV_REFERENCES]
         for ref in refs:
             self.add_alias(ref, FAKE_BUILD_IMAGE_ID)
-        self.write_mapping_file(self.bound_mapping())
+        self.write_deploy_build_artifacts(self.bound_mapping())
 
     def deploy_env(self, **overrides: str) -> dict:
         env = dict(self.env)
@@ -1161,6 +1329,56 @@ class DeployLatestImageGateTest(RuntimeImageRetentionTestBase):
                 f"stdout={result.stdout}\nstderr={result.stderr}",
             )
 
+    def test_digest_ref_still_runs_tier2a_when_dev_allow_permission_set(self) -> None:
+        # Permission switch alone must NOT skip Tier2a for a digest publish.
+        env = self.deploy_env(
+            AF_SANDBOX_IMAGE=ACCEPT_REFS[0],
+            AF_SANDBOX_IMAGE_ALLOW_DEV_TAG="true",
+        )
+        result = self.run_deploy(env, "--deploy-only", "python-sandbox-service")
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"stdout={result.stdout}\nstderr={result.stderr}",
+        )
+        combined = result.stdout + result.stderr
+        self.assertNotIn("skipping Tier2a gate", combined)
+        self.assertIn("D15_TIER2A_PASS", combined)
+        self.assertIn("Deployment completed", result.stdout)
+
+    def test_digest_ref_with_dev_allow_fails_on_oci_label_mismatch(self) -> None:
+        # Digest + leftover AF_SANDBOX_IMAGE_ALLOW_DEV_TAG=true must still
+        # enforce OCI librarySetDigest == library-set.json.
+        self.set_image_labels(
+            FAKE_BUILD_IMAGE_ID,
+            {OCI_LIBRARY_SET_LABEL: "sha256:" + "11" * 32},
+        )
+        env = self.deploy_env(
+            AF_SANDBOX_IMAGE=ACCEPT_REFS[0],
+            AF_SANDBOX_IMAGE_ALLOW_DEV_TAG="true",
+        )
+        result = self.run_deploy(env, "--deploy-only", "python-sandbox-service")
+        self.assertEqual(result.returncode, 1, f"stdout={result.stdout}\nstderr={result.stderr}")
+        combined = result.stdout + result.stderr
+        self.assertIn("Tier2a", combined)
+        self.assertIn("OCI label", combined)
+        self.assertNotIn("Deployment completed", result.stdout)
+
+    def test_bare_tag_with_dev_allow_skips_tier2a_only(self) -> None:
+        env = self.deploy_env(
+            AF_SANDBOX_IMAGE="alphafrog-sandbox-runtime:latest",
+            AF_SANDBOX_IMAGE_ALLOW_DEV_TAG="true",
+        )
+        result = self.run_deploy(env, "--deploy-only", "python-sandbox-service")
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"stdout={result.stdout}\nstderr={result.stderr}",
+        )
+        combined = result.stdout + result.stderr
+        self.assertIn("skipping Tier2a gate", combined)
+        self.assertIn("Deployment completed", result.stdout)
+
 
 class DeployReleaseGateTest(RuntimeImageRetentionTestBase):
     """Item 3 at the deploy entry point: deploy_latest.sh must refuse to
@@ -1181,12 +1399,20 @@ class DeployReleaseGateTest(RuntimeImageRetentionTestBase):
         self.add_alias(ACCEPT_REFS[0], FAKE_BUILD_IMAGE_ID)
 
     def write_mapping(self, mapping) -> None:
-        RUNTIME_BUILD_DIR.mkdir(parents=True, exist_ok=True)
-        if isinstance(mapping, str):
-            MAPPING_FILE.write_text(mapping, encoding="utf-8")
-        else:
-            MAPPING_FILE.write_text(json.dumps(mapping), encoding="utf-8")
-        self.addCleanup(shutil.rmtree, str(RUNTIME_BUILD_DIR), True)
+        # Keep the historical helper name, but always install the D15-A
+        # iidfile + library-set + OCI label companions so reverse tests still
+        # reach their intended mapping/releasable assertions.
+        library_set_digest = LEGAL_ENTRY_DIGESTS["librarySetDigest"]
+        if isinstance(mapping, dict):
+            entry = (mapping.get("images") or {}).get(FAKE_BUILD_IMAGE_ID) or {}
+            digest = entry.get("librarySetDigest") if isinstance(entry, dict) else None
+            if isinstance(digest, str) and digest.startswith("sha256:") and len(digest) == 71:
+                library_set_digest = digest
+        self.write_deploy_build_artifacts(
+            mapping,
+            image_id=FAKE_BUILD_IMAGE_ID,
+            library_set_digest=library_set_digest,
+        )
 
     def mapping(self, releasable, incomplete=()) -> dict:
         entry = {
@@ -1342,8 +1568,18 @@ class DeployReleaseGateTest(RuntimeImageRetentionTestBase):
         # The entry corresponds to the chosen ref (via imageRef) but binds a
         # DIFFERENT immutable image ID than docker inspect resolves: the
         # deploy target is NOT the built image -> fail closed.
+        # D15-A HARD gate runs first and refuses because inspected_id has no
+        # mapping entry (R2-3 identity); diagnostics still carry the inspected
+        # immutable ID.
         self.write_mapping(
             self.bound_mapping(image_id=OTHER_IMAGE_ID, imageRef=ACCEPT_REFS[0])
+        )
+        # Companion artifacts bind the inspected ID; mapping identity still fails.
+        self.write_iidfile(FAKE_BUILD_IMAGE_ID)
+        self.write_library_set_file(LEGAL_ENTRY_DIGESTS["librarySetDigest"])
+        self.set_image_labels(
+            FAKE_BUILD_IMAGE_ID,
+            {OCI_LIBRARY_SET_LABEL: LEGAL_ENTRY_DIGESTS["librarySetDigest"]},
         )
         result = self.run_deploy_with_releasable_gate()
         self.assertEqual(
@@ -1361,7 +1597,7 @@ class DeployReleaseGateTest(RuntimeImageRetentionTestBase):
     def test_deploy_rejects_unresolvable_target_image(self) -> None:
         # docker inspect cannot resolve the chosen ref -> no immutable ID to
         # bind -> fail closed.
-        self.write_mapping_file(self.bound_mapping())
+        self.write_deploy_build_artifacts(self.bound_mapping())
         self.env["FAKE_DOCKER_FAIL_INSPECT_REF"] = ACCEPT_REFS[0]
         result = self.run_deploy_with_releasable_gate()
         self.assertEqual(
@@ -1390,7 +1626,12 @@ class DeployReleaseGateTest(RuntimeImageRetentionTestBase):
             "methodSpecIndexDigest",
         ):
             for bad in bad_values:
-                self.write_mapping_file(self.bound_mapping(**{field: bad}))
+                # Keep companion library-set.json legal so the failure lands on
+                # mapping/HARD integrity of the mapping entry itself.
+                self.write_deploy_build_artifacts(
+                    self.bound_mapping(**{field: bad}),
+                    library_set_digest=LEGAL_ENTRY_DIGESTS["librarySetDigest"],
+                )
                 result = self.run_deploy_with_releasable_gate()
                 self.assertEqual(
                     result.returncode,
@@ -1398,7 +1639,15 @@ class DeployReleaseGateTest(RuntimeImageRetentionTestBase):
                     f"entry with bad {field}={bad!r} was deployed\n"
                     f"stdout={result.stdout}\nstderr={result.stderr}",
                 )
-                self.assertIn("releasable", result.stderr)
+                combined = result.stderr
+                self.assertTrue(
+                    ("releasable" in combined)
+                    or ("librarySetDigest" in combined)
+                    or ("HARD" in combined)
+                    or ("mismatch" in combined),
+                    f"expected integrity fail-closed marker missing for {field}={bad!r}\n"
+                    f"stderr={result.stderr}",
+                )
                 self.assertNotIn("Deployment completed", result.stdout)
 
 

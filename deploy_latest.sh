@@ -303,6 +303,10 @@ if is_in_list "python-sandbox-service" "${SELECTED[@]}" || is_in_list "python-sa
   # 引用语法门禁（round-2 R2-4）：空值总是被拒绝（即使开了开发开关）；
   # digest 引用按全锚定/仅小写语义校验；开发开关只放行语法合法的裸引用，
   # 不是无条件豁免。
+  # DEPLOY_USING_BARE_DEV_REF：仅当「本次实际选用合法裸引用」时为 1。
+  # AF_SANDBOX_IMAGE_ALLOW_DEV_TAG 只是权限开关，不能单独跳过 Tier2a；
+  # 合法 digest 即使 permission=true 也必须跑完整 Tier2a/OCI gate。
+  DEPLOY_USING_BARE_DEV_REF=0
   if [[ -z "$DEPLOY_SANDBOX_IMAGE" ]]; then
     echo "[deploy] ERROR: AF_SANDBOX_IMAGE 未设置或为空 (MethodSpec V5 §12)。" >&2
     echo "  生产部署目标镜像必须是 repo/name@sha256:<64hex> 摘要引用（frog 发布时固定）。" >&2
@@ -312,6 +316,7 @@ if is_in_list "python-sandbox-service" "${SELECTED[@]}" || is_in_list "python-sa
   if af_is_digest_reference "$DEPLOY_SANDBOX_IMAGE"; then
     : # 生产 digest 引用，合法。
   elif [[ "$DEPLOY_DEV_ALLOW" == "1" ]] && af_is_valid_dev_reference "$DEPLOY_SANDBOX_IMAGE"; then
+    DEPLOY_USING_BARE_DEV_REF=1
     echo "[deploy] WARNING: AF_SANDBOX_IMAGE 是裸引用，仅因显式开关 AF_SANDBOX_IMAGE_ALLOW_DEV_TAG 而放行（开发用途，勿用于生产）。" >&2
   elif [[ "$DEPLOY_DEV_ALLOW" == "1" ]]; then
     echo "[deploy] ERROR: AF_SANDBOX_IMAGE 既不是合法的 sha256 摘要引用，也不是语法合法的裸引用 (MethodSpec V5 §12 R2-4)。" >&2
@@ -381,7 +386,10 @@ if is_in_list "python-sandbox-service" "${SELECTED[@]}" || is_in_list "python-sa
   DEPLOY_IIDFILE="$ROOT_DIR/pythonSandboxService/.runtime-build/image-id"
   DEPLOY_LIBSET_FILE="$ROOT_DIR/pythonSandboxService/.runtime-build/library-set.json"
 
-  [ -f "$DEPLOY_MAPPING_FILE" ] || { echo "[deploy] ERROR: 构建产物映射文件缺失" >&2; exit 1; }
+  [ -f "$DEPLOY_MAPPING_FILE" ] || {
+    echo "[deploy] ERROR: 构建产物映射文件缺失 (image-digest-mapping.json)" >&2
+    exit 1
+  }
   [ -s "$DEPLOY_IIDFILE" ] || { echo "[deploy] ERROR: iidfile 缺失" >&2; exit 1; }
   DEPLOY_INSPECTED_ID="$(docker inspect --type=image --format '{{.Id}}' "$DEPLOY_SANDBOX_IMAGE" 2>/dev/null || true)"
   [ -n "$DEPLOY_INSPECTED_ID" ] || { echo "[deploy] ERROR: docker inspect failed" >&2; exit 1; }
@@ -396,7 +404,8 @@ if is_in_list "python-sandbox-service" "${SELECTED[@]}" || is_in_list "python-sa
     --mapping "$DEPLOY_MAPPING_FILE" --inspected-id "$DEPLOY_INSPECTED_ID" \
     --library-set-digest "$DEPLOY_LIBSET_DIGEST" --iidfile "$DEPLOY_IIDFILE")"
   [ "$DEPLOY_HARD_VERDICT" = "ok" ] || {
-    echo "[deploy] ERROR: HARD target binding = $DEPLOY_HARD_VERDICT (永不放宽)" >&2; exit 1
+    echo "[deploy] ERROR: HARD target binding = $DEPLOY_HARD_VERDICT (R2-3 永不放宽; inspected=$DEPLOY_INSPECTED_ID)" >&2
+    exit 1
   }
 
   DEPLOY_GATE_VERDICT="$(python3 "$ROOT_DIR/pythonSandboxService/scripts/d15_release_verify.py" \
@@ -408,16 +417,21 @@ if is_in_list "python-sandbox-service" "${SELECTED[@]}" || is_in_list "python-sa
       if [[ "$DEPLOY_INCOMPLETE_DEV_ALLOW" == "1" ]]; then
         echo "[deploy] WARNING: mapping=not-releasable + AF_SANDBOX_ALLOW_INCOMPLETE_DEV_BUILD bypass"
       else
-        echo "[deploy] ERROR: mapping=$DEPLOY_GATE_VERDICT" >&2; exit 1
+        echo "[deploy] ERROR: mapping=$DEPLOY_GATE_VERDICT (releasable)" >&2; exit 1
       fi
+      ;;
+    target-mismatch)
+      echo "[deploy] ERROR: mapping=$DEPLOY_GATE_VERDICT (R2-3; inspected=$DEPLOY_INSPECTED_ID)" >&2
+      exit 1
       ;;
     *) echo "[deploy] ERROR: mapping=$DEPLOY_GATE_VERDICT" >&2; exit 1 ;;
   esac
   # END_D15_MAPPING_VERIFIER
 
-  if [[ "$DEPLOY_DEV_ALLOW" == "1" ]]; then
+  # Tier2a 仅在「本次实际使用合法裸 dev ref」时可跳过；digest 发布路径始终执行。
+  if [[ "$DEPLOY_USING_BARE_DEV_REF" == "1" ]]; then
     # BEGIN_D15_DEV_BYPASS
-    echo "[deploy] dev bypass active: AF_SANDBOX_IMAGE_ALLOW_DEV_TAG=true, skipping Tier2a gate (dev only)"
+    echo "[deploy] dev bypass active: bare AF_SANDBOX_IMAGE + AF_SANDBOX_IMAGE_ALLOW_DEV_TAG=true, skipping Tier2a gate (dev only)"
     # END_D15_DEV_BYPASS
   else
     # BEGIN_D15_TIER2A_GATE
