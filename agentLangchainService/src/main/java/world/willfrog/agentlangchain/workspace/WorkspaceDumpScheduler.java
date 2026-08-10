@@ -135,6 +135,14 @@ public class WorkspaceDumpScheduler {
                     String name = procFile.getFileName().toString();
                     String jsonName = name.substring(0, name.length() - ".processing".length()) + ".json";
                     Path jsonFile = dlqDir.resolve(jsonName);
+                    // 若同名 .json 已存在（上次崩溃残留 + 新一轮写入），
+                    // 为恢复条目生成唯一名以保留两份证据，避免 rename 冲突导致永久死锁
+                    if (Files.exists(jsonFile)) {
+                        String base = jsonName.substring(0, jsonName.length() - ".json".length());
+                        String uniqueName = base + "-recovered-" + UUID.randomUUID().toString().substring(0, 8) + ".json";
+                        jsonFile = dlqDir.resolve(uniqueName);
+                        log.info("Stale .processing recovered to unique name: {} → {}", name, uniqueName);
+                    }
                     Files.move(procFile, jsonFile, StandardCopyOption.ATOMIC_MOVE);
                     recovered++;
                 }
@@ -286,15 +294,20 @@ public class WorkspaceDumpScheduler {
         }
 
         int deleted = 0;
-        for (Path f : toDelete) {
+        List<String> actuallyDeleted = new ArrayList<>();
+        for (int i = 0; i < toDelete.size(); i++) {
+            Path f = toDelete.get(i);
             try {
                 Files.delete(f);
                 deleted++;
+                if (i < evictedRunIds.size()) {
+                    actuallyDeleted.add(evictedRunIds.get(i));
+                }
             } catch (IOException ex) {
                 log.error("DLQ eviction delete failed for {}: {}", f.getFileName(), ex.getMessage());
             }
         }
-        evictedRunIds.forEach(dlqMemory::remove);
+        actuallyDeleted.forEach(dlqMemory::remove);
         log.warn("DLQ evicted {}/{} attempted entries (cap={}, total={}): {}",
                 deleted, toDelete.size(), DLQ_MAX_FILES, total, evictedRunIds);
     }

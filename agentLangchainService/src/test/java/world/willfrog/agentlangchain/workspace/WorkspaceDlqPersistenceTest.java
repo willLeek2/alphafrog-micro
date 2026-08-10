@@ -89,9 +89,9 @@ class WorkspaceDlqPersistenceTest {
 
     @Test
     void pushDlq_doesNotEvictOnFailure() throws Exception {
-        // 写入足够多的有效条目到 dlqDir
+        // 写入超过 1000 个 .json 文件，确保失败时容量已超阈值
         Files.createDirectories(dlqDir);
-        for (int i = 0; i < 10; i++) {
+        for (int i = 0; i < 1100; i++) {
             String content = String.format(
                     "{\"runId\":\"run-%d\",\"conservative\":false,\"reason\":\"test\",\"enqueuedAt\":\"2026-01-01T00:00:00Z\"}",
                     i);
@@ -99,6 +99,7 @@ class WorkspaceDlqPersistenceTest {
             Files.writeString(f, content);
         }
         int before = listJsonFiles().size();
+        assertThat(before).isGreaterThan(1000);
 
         // 把 dlqDir 设为只读，后续 Files.write(tmp) 会失败
         dlqDir.toFile().setReadOnly();
@@ -109,8 +110,11 @@ class WorkspaceDlqPersistenceTest {
             dlqDir.toFile().setWritable(true);
         }
 
-        // 失败不应触发淘汰，原有文件数应不变
+        // 失败不应触发淘汰，原有文件数应不变；eviction.log 也不应有新写入
         assertThat(listJsonFiles().size()).isEqualTo(before);
+        Path evictionLog = dlqDir.resolve("eviction.log");
+        // eviction.log 不应该存在（淘汰从未被触发）
+        assertThat(evictionLog).doesNotExist();
     }
 
     @Test
@@ -240,6 +244,29 @@ class WorkspaceDlqPersistenceTest {
 
         assertThat(recent).exists();
         assertThat(dlqDir.resolve("entry-recent.json")).doesNotExist();
+    }
+
+    @Test
+    void staleProcessingWithExistingJson_recoversToUniqueName() throws Exception {
+        // 模拟死锁场景：同名 .json 和过期 .processing 同时存在
+        Files.createDirectories(dlqDir);
+        Path jsonFile = dlqDir.resolve("entry-deadlock.json");
+        Path procFile = dlqDir.resolve("entry-deadlock.processing");
+        Files.writeString(jsonFile, "{\"runId\":\"run-orig\",\"conservative\":false,\"reason\":\"orig\",\"enqueuedAt\":\"2026-01-01T00:00:00Z\"}");
+        Files.writeString(procFile, "{\"runId\":\"run-crashed\",\"conservative\":true,\"reason\":\"crash\",\"enqueuedAt\":\"2026-01-01T00:00:00Z\"}");
+        procFile.toFile().setLastModified(System.currentTimeMillis() - 10 * 60 * 1000);
+
+        ReflectionTestUtils.invokeMethod(scheduler, "recoverStaleProcessingFiles");
+
+        // 过期 .processing 被恢复为唯一命名的 .json
+        assertThat(procFile).doesNotExist();
+        // 原 .json 仍存在
+        assertThat(jsonFile).exists();
+        // 恢复的新 .json 也存在（唯一命名，避免 rename 冲突导致永久死锁）
+        List<Path> jsonFiles = listJsonFiles();
+        assertThat(jsonFiles).hasSize(2);
+        assertThat(jsonFiles).anyMatch(p -> p.getFileName().toString().equals("entry-deadlock.json"));
+        assertThat(jsonFiles).anyMatch(p -> p.getFileName().toString().contains("entry-deadlock-recovered-"));
     }
 
     // ===== quarantine 失败保留原文件 =====
