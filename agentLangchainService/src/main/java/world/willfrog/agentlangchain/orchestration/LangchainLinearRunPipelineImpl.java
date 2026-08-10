@@ -16,8 +16,6 @@ import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.debug.DebugObservabilityRequest;
 import world.willfrog.agent.platform.debug.DebugObservabilityService;
 import world.willfrog.agent.platform.entity.AgentRun;
-import world.willfrog.agent.platform.dataanalysis.CompletedTodoRecord;
-import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.prompt.PromptRunSelection;
@@ -38,7 +36,6 @@ import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
 import world.willfrog.agentlangchain.failure.LangchainFailureDecision;
 import world.willfrog.agentlangchain.failure.LangchainFailureMapper;
 import world.willfrog.agentlangchain.tools.LangchainToolInvocationKeys;
-import world.willfrog.agentlangchain.tooljob.ToolJobCheckpointRequest;
 import world.willfrog.agentlangchain.tooljob.ToolJobCheckpointWriter;
 import world.willfrog.agentlangchain.tooljob.ToolJobResumeContext;
 import world.willfrog.agentlangchain.tooljob.ToolJobCheckpointFailureRecoveryService;
@@ -46,7 +43,6 @@ import world.willfrog.agentlangchain.tooljob.ToolJobCheckpointFailureRecoverySer
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.ArrayList;
 import java.util.function.Consumer;
 import java.util.function.BooleanSupplier;
 import java.time.LocalDate;
@@ -362,47 +358,11 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 return;
             }
 
-            // agentLangchainService 的“Linear”（线性执行）历史命名保留下来了，但这里已经是混合执行入口：
-            // 简单串行任务走 linear executor；存在依赖图或 planner 明确要求时走 DAG executor。
-            LangchainLinearWorkflowResult result = useDag
-                    ? dagWorkflowExecutor.executePlanned(workflowRequest, plan)
-                    : linearWorkflowExecutor.executePlanned(workflowRequest, plan);
-
-            // suspended 是“后台工具仍在运行”的正常控制结果，不按失败或完成落终态。
-            if (result.isSuspended()) {
-                // DAG 本阶段使用节点内 blocking poll，不拥有可恢复 frontier；严禁误写 LINEAR checkpoint。
-                if (useDag) {
-                    throw new IllegalStateException("dag_workflow_suspended_without_frontier_checkpoint");
-                }
-                // 必须先持久化完整 checkpoint，之后才允许当前 Runnable 返回并释放 worker。
-                ToolJobCheckpointAttempt checkpoint = persistToolJobCheckpoint(runId, result);
-                // checkpoint CAS 失败时不能假装已经安全挂起，否则原 worker 一退出上下文就丢失。
-                if (!checkpoint.persisted()) {
-                    log.error("Durable tool-job checkpoint failed for run={} todo={}",
-                            runId, result.getSuspendedTodoId());
-                    // failure recovery 要么确认已有更新 checkpoint，要么持久化明确的失败/重试 owner。
-                    if (recordCheckpointFailure(runId, userId, result, checkpoint.request())
-                            != ToolJobCheckpointFailureRecoveryService.Outcome.HEALTHY_CHECKPOINT) {
-                        // 返回后调度器会释放 worker；后续由 durable failure owner 负责收尾。
-                        return;
-                    }
-                }
-                // checkpoint 已落稳后再发挂起事件，事件消费者读 DB 时能看到一致上下文。
-                Map<String, Object> payload = new LinkedHashMap<>();
-                // run_id 让前端把事件关联到当前运行实例。
-                payload.put("run_id", runId);
-                // tool_call_id + attempt 唯一定位仍在后台运行的那一轮工具调用。
-                payload.put("tool_call_id", nvl(result.getPendingToolCallId()));
-                payload.put("attempt", result.getPendingAttempt());
-                // todo_id + sequence 描述恢复时向哪个计划节点注入终态结果。
-                payload.put("todo_id", nvl(result.getSuspendedTodoId()));
-                payload.put("todo_sequence", result.getSuspendedTodoSequence() == null
-                        ? 0 : result.getSuspendedTodoSequence());
-                payload.put("workflow", useDag ? "dag" : "linear");
-                eventService.append(runId, userId, "TOOL_CALL_SUSPENDED", payload);
-                log.info("LangChain run {} suspended for external tool job {}",
-                        runId, result.getPendingToolCallId());
-                // 正常 return 结束当前 Runnable；scheduler finally 随即归还 Agent worker。
+            // 已冻结计划的步骤执行与长工具挂起交接由独立协作类负责。
+            LangchainWorkflowStepCoordinator.Outcome stepOutcome = stepCoordinator().execute(
+                    runId, userId, workflowRequest, plan, useDag);
+            LangchainLinearWorkflowResult result = stepOutcome.result();
+            if (stepOutcome.workerReleased()) {
                 return;
             }
 
@@ -628,10 +588,10 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         // 恢复过程中还可能再次遇到另一个长工具，因此允许二次挂起。
         if (result.isSuspended()) {
             // 二次挂起必须覆盖为新的完整 checkpoint，再释放这次恢复 worker。
-            ToolJobCheckpointAttempt checkpoint = persistToolJobCheckpoint(runId, result);
+            LangchainToolJobCheckpointCoordinator.Attempt checkpoint = checkpointCoordinator().persist(runId, result);
             // 写失败时仍使用同一 durable failure ownership 协议。
             if (!checkpoint.persisted()
-                    && recordCheckpointFailure(runId, userId, result, checkpoint.request())
+                    && checkpointCoordinator().recordFailure(runId, userId, result, checkpoint.request())
                     != ToolJobCheckpointFailureRecoveryService.Outcome.HEALTHY_CHECKPOINT) {
                 return false;
             }
@@ -743,156 +703,23 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 || latest.getStatus() == AgentRunStatus.PARTIAL;
     }
 
-    private ToolJobCheckpointAttempt persistToolJobCheckpoint(String runId,
-                                                              LangchainLinearWorkflowResult result) {
-        // 只有明确 suspended 的控制结果才允许写上下文切换 checkpoint。
-        if (result == null || !result.isSuspended()) {
-            return new ToolJobCheckpointAttempt(false, null);
-        }
-        // 先保留最小 request 变量，异常路径也能交给 failure recovery 绑定 owner。
-        ToolJobCheckpointRequest request = null;
-        try {
-            // 工具分发阶段已经建立 anchor；这里重新读取以取得最新 checkpointVersion。
-            AgentRun latest = runMapper.findById(runId);
-            // 没有 anchor 就无法绑定后台任务身份，不能安全释放 worker。
-            if (latest == null || isBlank(latest.getToolJobAnchorJson())) {
-                return new ToolJobCheckpointAttempt(false, null);
-            }
-            // anchor 是数据库真相源，不使用异常对象中可能过期的任务字段补写身份。
-            ToolJobAnchor anchor = ToolJobAnchor.fromJson(latest.getToolJobAnchorJson());
-            // 先构造只含身份/挂起点的最小请求；后续依赖缺失时仍可持久化失败归属。
-            request = ToolJobCheckpointRequest.builder(runId)
-                    // operationId 约束同一外部操作。
-                    .operationId(anchor.getOperationId())
-                    // toolCallId + attempt 约束同一逻辑调用轮次。
-                    .toolCallId(anchor.getToolCallId())
-                    .attempt(anchor.getAttempt())
-                    // taskId 约束同一 Sandbox 后台任务。
-                    .taskId(anchor.getTaskId())
-                    // expectedCheckpointVersion 防止覆盖另一个 worker 已写入的新上下文。
-                    .expectedCheckpointVersion(anchor.getCheckpointVersion())
-                    // todoId + sequence 保存恢复注入位置。
-                    .todoId(result.getSuspendedTodoId())
-                    .sequence(result.getSuspendedTodoSequence() == null
-                            ? 0 : result.getSuspendedTodoSequence())
-                    .completedTodos(List.of())
-                    // 工具调用预算先写入最小请求，失败诊断仍知道挂起点计数。
-                    .toolCallsUsed(result.getToolCallsUsed())
-                    .build();
-            // writer 未装配时 fail-closed；不能只发 suspended 事件而没有持久化上下文。
-            if (toolJobCheckpointWriter == null) {
-                return new ToolJobCheckpointAttempt(false, request);
-            }
-            // dataset registry 是恢复编号映射的必需来源，缺失时同样不能安全挂起。
-            AgentRunDatasetRegistry registry = agentRunDatasetRegistryProvider.getIfAvailable();
-            if (registry == null) {
-                return new ToolJobCheckpointAttempt(false, request);
-            }
-            // snapshot 在旧 worker 退出前捕获；新 worker 会校验 digest 后恢复。
-            var datasetSnapshot = registry.snapshot(runId);
-            // 把堆内 LangchainCompletedTodo 转成 shared 模块可序列化的稳定记录。
-            List<CompletedTodoRecord> records = new ArrayList<>();
-            if (result.getCompletedTodos() != null) {
-                for (LangchainCompletedTodo todo : result.getCompletedTodos()) {
-                    // 每个已完成节点都保存身份、顺序、语义和输出，恢复时无需重跑。
-                    CompletedTodoRecord record = new CompletedTodoRecord();
-                    record.setTodoId(todo.getTodoId());
-                    record.setSequence(todo.getSequence());
-                    record.setDescription(todo.getDescription());
-                    record.setModelOutput(todo.getModelOutput());
-                    record.setOutput(todo.getOutput());
-                    record.setSummary(todo.getSummary());
-                    // 保持原计划顺序追加；恢复端还会按 sequence 做一致性校验。
-                    records.add(record);
-                }
-            }
-            // 兼容早期 anchor 中的 datasetRefsJson；空值显式规范成 JSON 空数组。
-            String refsJson = isBlank(anchor.getDatasetRefsJson()) ? "[]" : anchor.getDatasetRefsJson();
-            // 用完整上下文重建 request，覆盖上面的最小失败诊断版本。
-            request = ToolJobCheckpointRequest.builder(runId)
-                    .operationId(anchor.getOperationId())
-                    .toolCallId(anchor.getToolCallId())
-                    .attempt(anchor.getAttempt())
-                    .taskId(anchor.getTaskId())
-                    .expectedCheckpointVersion(anchor.getCheckpointVersion())
-                    .todoId(result.getSuspendedTodoId())
-                    .sequence(result.getSuspendedTodoSequence() == null
-                            ? 0 : result.getSuspendedTodoSequence())
-                    .completedTodos(records)
-                    // 快照正文供恢复，digest 供不可变一致性验证。
-                    .datasetSnapshotJson(objectMapper.writeValueAsString(datasetSnapshot))
-                    .datasetSnapshotDigest(datasetSnapshot.immutableDigest())
-                    .datasetRefsJson(refsJson)
-                    .toolCallsUsed(result.getToolCallsUsed())
-                    .estimateJson(anchor.getEstimateJson())
-                    .build();
-            // captureAndSave 执行字段校验和数据库原子 merge；返回 false 表示 CAS 未获所有权。
-            return new ToolJobCheckpointAttempt(
-                    toolJobCheckpointWriter.captureAndSave(request), request);
-        } catch (Exception e) {
-            // 任何捕获/序列化/写库异常都返回失败，不允许继续走“已安全挂起”。
-            log.error("Failed to persist tool-job checkpoint runId={}: {}", runId, e.getMessage());
-            return new ToolJobCheckpointAttempt(false, request);
-        }
+    private LangchainToolJobCheckpointCoordinator checkpointCoordinator() {
+        return new LangchainToolJobCheckpointCoordinator(
+                runMapper,
+                eventService,
+                objectMapper,
+                agentRunDatasetRegistryProvider,
+                toolJobCheckpointWriter,
+                checkpointFailureRecoveryService);
     }
 
-    private ToolJobCheckpointFailureRecoveryService.Outcome recordCheckpointFailure(
-            String runId,
-            String userId,
-            LangchainLinearWorkflowResult result,
-            ToolJobCheckpointRequest failedRequest) {
-        ToolJobCheckpointFailureRecoveryService.Outcome outcome =
-                ToolJobCheckpointFailureRecoveryService.Outcome.UNOWNED;
-        // 连最小请求都无法构造，说明 anchor 身份缺失，只能把 Run 明确标记失败。
-        if (failedRequest == null) {
-            // updateSnapshot 的返回值决定本线程是否真正取得失败处置权。
-            boolean failed = runMapper.updateSnapshot(runId, userId, AgentRunStatus.FAILED,
-                    "{\"failure\":\"tool_job_checkpoint_anchor_missing\"}", true,
-                    "tool_job_checkpoint_anchor_missing") == 1;
-            emitCheckpointFailure(runId, userId, result, failed, false);
-            return failed ? ToolJobCheckpointFailureRecoveryService.Outcome.FAILURE_OWNED
-                    : ToolJobCheckpointFailureRecoveryService.Outcome.UNOWNED;
-        }
-        // 有完整身份时交给 recovery service 冻结 checkpoint 失败 owner 或识别更新版本。
-        if (checkpointFailureRecoveryService != null && failedRequest != null) {
-            try {
-                outcome = checkpointFailureRecoveryService.handleFailure(failedRequest);
-            } catch (Exception e) {
-                log.error("Failed to establish checkpoint-failure owner runId={}: {}",
-                        runId, e.getMessage());
-            }
-        }
-        // HEALTHY_CHECKPOINT 表示另一个并发写者已落稳更高版本，本次失败不应终止 Run。
-        if (outcome == ToolJobCheckpointFailureRecoveryService.Outcome.HEALTHY_CHECKPOINT) {
-            log.info("Checkpoint failure superseded by healthy durable owner run={} todo={}",
-                    runId, result.getSuspendedTodoId());
-            return outcome;
-        }
-        // 事件使用固定 dedupe key，重复恢复不会制造多条失败通知。
-        emitCheckpointFailure(runId, userId, result,
-                outcome == ToolJobCheckpointFailureRecoveryService.Outcome.FAILURE_OWNED,
-                outcome == ToolJobCheckpointFailureRecoveryService.Outcome.RETRY_OWNED);
-        return outcome;
+    private LangchainWorkflowStepCoordinator stepCoordinator() {
+        return new LangchainWorkflowStepCoordinator(
+                linearWorkflowExecutor,
+                dagWorkflowExecutor,
+                eventService,
+                checkpointCoordinator());
     }
-
-    private void emitCheckpointFailure(String runId,
-                                       String userId,
-                                       LangchainLinearWorkflowResult result,
-                                       boolean durable,
-                                       boolean retryable) {
-        String dedupeKey = runId + ":" + nvl(result.getPendingToolCallId())
-                + ":" + result.getPendingAttempt() + ":checkpoint_failed";
-        eventService.appendOnce(runId, userId, "TOOL_JOB_CHECKPOINT_FAILED", dedupeKey, Map.of(
-                "run_id", runId,
-                "tool_call_id", nvl(result.getPendingToolCallId()),
-                "attempt", result.getPendingAttempt(),
-                "todo_id", nvl(result.getSuspendedTodoId()),
-                "durable_failure_disposition", durable,
-                "retryable", retryable
-        ));
-    }
-
-    private record ToolJobCheckpointAttempt(boolean persisted, ToolJobCheckpointRequest request) {}
 
     private void persistPlan(String runId, String userId, LangchainTodoPlan plan) {
         String planJson = writeJson(plan);
