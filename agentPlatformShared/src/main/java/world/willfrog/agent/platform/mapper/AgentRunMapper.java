@@ -86,6 +86,13 @@ public interface AgentRunMapper {
                                                @Param("fromTime") OffsetDateTime fromTime,
                                                @Param("limit") int limit);
 
+    /** D21-B 5.2.3: 复合游标查询 (cursorTime, cursorRunId)，防止同秒超批永久漏扫。 */
+    List<AgentRun> listByStatusAndUpdatedAfterComposite(
+            @Param("statuses") List<AgentRunStatus> statuses,
+            @Param("cursorTime") OffsetDateTime cursorTime,
+            @Param("cursorRunId") String cursorRunId,
+            @Param("limit") int limit);
+
     /**
      * 根据 run ID 和用户 ID 删除指定的 Agent Run。
      * <p>

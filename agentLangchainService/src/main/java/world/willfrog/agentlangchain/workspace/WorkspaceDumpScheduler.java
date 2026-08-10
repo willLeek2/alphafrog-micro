@@ -1,51 +1,179 @@
 package world.willfrog.agentlangchain.workspace;
 
-import lombok.RequiredArgsConstructor;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
 import org.springframework.scheduling.annotation.Async;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.stereotype.Component;
 
-import java.util.ArrayDeque;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.DirectoryStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
+import java.time.Instant;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.Deque;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * workspace dump 异步调度器。
  *
- * <p>在 {@code workspaceDumpExecutor} 线程池上异步执行 dump；失败时按指数/线性重试 3 次，
- * 仍失败则入内存 DLQ（容量 1000，FIFO 淘汰），避免静默丢失任务。
+ * <p>在 {@code workspaceDumpExecutor} 线程池上异步执行 dump；失败时 3 次重试，
+ * 仍失败则入磁盘 DLQ（基于 D04 WorkspacePathResolver）。
+ *
+ * <h3>DLQ 持久化（D21-B 5.2.4）</h3>
+ * <ul>
+ *   <li>介质：{workspaceRoot}/_dlq/entry-{uuid}.json</li>
+ *   <li>原子写入：写 .tmp → ATOMIC_MOVE 替换</li>
+ *   <li>多进程安全：重放时 .json → .processing 原子 rename claim，另一进程 rename 失败则跳过</li>
+ *   <li>崩溃恢复：启动时扫描超过 STALE_PROCESSING_TIMEOUT 的 .processing 文件，rename 回 .json 重新参与重放</li>
+ *   <li>启动重放：{@code @EventListener(ApplicationReadyEvent.class)} 通过显式注入的 {@code workspaceDumpExecutor} 提交，
+ *       不依赖 {@code @Async} 代理自调用</li>
+ *   <li>重放成功：删 .processing 文件；重放失败：保留 .processing 文件供下次重启重试</li>
+ *   <li>容量计算：仅统计待处理 .json 与正在处理 .processing 文件；quarantine/ 与 eviction.log 不计入容量，不被淘汰清理</li>
+ *   <li>淘汰审计：先写 eviction.log，写成功后再删文件；审计写失败时禁止删除，保留全部条目</li>
+ *   <li>损坏：JSON 解析失败或必填字段缺失 → ERROR + 移入 quarantine/ 子目录隔离</li>
+ *   <li>透明性：pushDlq 返回 boolean + 内部维护 dlqFailedCount 原子计数器供外部快照查询</li>
+ * </ul>
  *
  * <h3>协作关系</h3>
  * <ul>
- *   <li>调用方：{@link WorkspaceFinalizedEventListener}（同包，发布事件后回调）</li>
- *   <li>被调方：{@code WorkspaceDumpService}（其它 agent 并行编写，本类只持有引用不构造循环）</li>
+ *   <li>调用方：{@link WorkspaceFinalizedEventListener} / {@link WorkspacePollingObserver}</li>
+ *   <li>被调方：{@code WorkspaceDumpService}</li>
  * </ul>
  *
  * @author wang
  */
 @Component
-@RequiredArgsConstructor
 @Slf4j
 public class WorkspaceDumpScheduler {
 
-    /** 最大重试次数（含首次执行），即 1 次成功或 N-1 次重试后入 DLQ */
     private static final int MAX_ATTEMPTS = 3;
-
-    /** 内存 DLQ 容量上限 */
-    private static final int DLQ_CAPACITY = 1000;
+    private static final int DLQ_MAX_FILES = 1000;
+    private static final int DLQ_EVICTION_BATCH = 100;
+    private static final String DLQ_DIR_NAME = "_dlq";
+    private static final String QUARANTINE_DIR_NAME = "quarantine";
+    private static final String EVICTION_LOG_NAME = "eviction.log";
+    /** .processing 文件超过此时间视为崩溃残留，rename 回 .json 重新参与重放 */
+    private static final long STALE_PROCESSING_TIMEOUT_MS = 5 * 60 * 1000;
+    private static final ObjectMapper MAPPER = new ObjectMapper()
+            .registerModule(new JavaTimeModule());
 
     private final WorkspaceDumpService dumpService;
+    private final ThreadPoolTaskExecutor dumpExecutor;
+    private final Path dlqDir;
+    private final Path quarantineDir;
 
-    /** 失败任务内存 DLQ：FIFO 淘汰，仅做 v0 兜底；v0.1 接入持久化告警通道。 */
-    private final Deque<String> dlq = new ArrayDeque<>();
+    /** 内存热缓存，供快速查询当前 DLQ 条目；真相源是磁盘文件 */
+    private final Deque<String> dlqMemory = new ConcurrentLinkedDeque<>();
 
-    /**
-     * 异步触发 run workspace dump。
-     *
-     * <p>由 {@code workspaceDumpExecutor} 线程执行；内部捕获所有异常，3 次重试后入 DLQ 并 warn。
-     *
-     * @param runId       run 主键
-     * @param conservative true = EXPIRED 保守分支（缺消息/event 时只写状态 + 有限 meta）
-     */
+    /** pushDlq 磁盘写入失败次数，供外部快照/告警查询 */
+    private final AtomicLong dlqFailedCount = new AtomicLong();
+
+    /** 构造只初始化路径，不执行 IO 和重放；重放由 ApplicationReadyEvent 通过显式 executor 触发。 */
+    public WorkspaceDumpScheduler(WorkspaceDumpService dumpService,
+                                  WorkspacePathResolver pathResolver,
+                                  @Qualifier("workspaceDumpExecutor") ThreadPoolTaskExecutor dumpExecutor) {
+        this.dumpService = dumpService;
+        this.dumpExecutor = dumpExecutor;
+        this.dlqDir = pathResolver.getWorkspaceRoot().resolve(DLQ_DIR_NAME);
+        this.quarantineDir = dlqDir.resolve(QUARANTINE_DIR_NAME);
+    }
+
+    // ===== 启动重放（ApplicationReadyEvent + 显式 executor，不依赖 @Async 代理自调用） =====
+
+    @EventListener(ApplicationReadyEvent.class)
+    public void onApplicationReady() {
+        dumpExecutor.execute(() -> {
+            recoverStaleProcessingFiles();
+            replayDlq();
+        });
+    }
+
+    /** 将超过 STALE_PROCESSING_TIMEOUT 的 .processing 文件 rename 回 .json，使其重新参与重放。 */
+    private void recoverStaleProcessingFiles() {
+        if (!Files.isDirectory(dlqDir)) {
+            return;
+        }
+        List<Path> processingFiles = listDlqFilesByExtension(".processing");
+        if (processingFiles.isEmpty()) return;
+        long now = Instant.now().toEpochMilli();
+        int recovered = 0;
+        for (Path procFile : processingFiles) {
+            try {
+                long mtime = Files.getLastModifiedTime(procFile).toMillis();
+                if (now - mtime >= STALE_PROCESSING_TIMEOUT_MS) {
+                    String name = procFile.getFileName().toString();
+                    String jsonName = name.substring(0, name.length() - ".processing".length()) + ".json";
+                    Path jsonFile = dlqDir.resolve(jsonName);
+                    Files.move(procFile, jsonFile, StandardCopyOption.ATOMIC_MOVE);
+                    recovered++;
+                }
+            } catch (IOException e) {
+                log.warn("Failed to recover stale processing file {}: {}", procFile.getFileName(), e.getMessage());
+            }
+        }
+        if (recovered > 0) {
+            log.info("Recovered {} stale .processing files back to .json for re-claim", recovered);
+        }
+    }
+
+    private void replayDlq() {
+        if (!Files.isDirectory(dlqDir)) {
+            return;
+        }
+        List<Path> entries = listDlqFilesByExtension(".json");
+        if (entries.isEmpty()) return;
+        log.info("DLQ replay starting: {} entries in {}", entries.size(), dlqDir);
+        for (Path jsonFile : entries) {
+            String jsonName = jsonFile.getFileName().toString();
+            String procName = jsonName.substring(0, jsonName.length() - ".json".length()) + ".processing";
+            Path procFile = dlqDir.resolve(procName);
+
+            // 先检查 .processing 是否已存在（另一进程已 claim），避免 macOS 上 ATOMIC_MOVE 静默覆盖
+            if (Files.exists(procFile)) {
+                // 另一进程已 claim，删除残留 .json（另一进程负责处理）
+                deleteFile(jsonFile);
+                continue;
+            }
+            try {
+                Files.move(jsonFile, procFile, StandardCopyOption.ATOMIC_MOVE);
+            } catch (IOException e) {
+                log.warn("DLQ claim failed for {}: {}", jsonName, e.getMessage());
+                continue;
+            }
+            // 已 claim，开始处理
+            DlqEntry entry = readEntry(procFile);
+            if (entry == null) {
+                continue;
+            }
+            try {
+                dumpService.dumpRun(entry.runId, entry.conservative);
+                deleteFile(procFile);
+                log.info("DLQ replay success, deleted: {}", procFile.getFileName());
+            } catch (Exception e) {
+                log.warn("DLQ replay failed, keeping {}: {}", procFile.getFileName(), e.getMessage());
+            }
+        }
+    }
+
+    // ===== 异步 dump =====
+
     @Async("workspaceDumpExecutor")
     public void enqueueDumpAsync(String runId, boolean conservative) {
         if (runId == null || runId.isBlank()) {
@@ -69,30 +197,193 @@ public class WorkspaceDumpScheduler {
                         attempt, MAX_ATTEMPTS, runId, e.getMessage());
             }
         }
-        pushDlq(runId, conservative, lastError);
+        boolean persisted = pushDlq(runId, conservative, lastError);
+        if (!persisted) {
+            dlqFailedCount.incrementAndGet();
+            log.error("DLQ push failed, entry permanently lost: runId={}", runId);
+        }
     }
+
+    // ===== DLQ 入队 =====
 
     /**
-     * 任务入内存 DLQ：超出容量时淘汰队首，warn 告警。
+     * 将 dump 失败条目持久化到磁盘 DLQ。
+     *
+     * @return true 表示磁盘写入成功且已加入内存热队列；false 表示写入失败
      */
-    private void pushDlq(String runId, boolean conservative, Throwable lastError) {
-        synchronized (dlq) {
-            if (dlq.size() >= DLQ_CAPACITY) {
-                String evicted = dlq.pollFirst();
-                log.warn("Workspace dump DLQ full (cap={}), evicted oldest entry: {}",
-                        DLQ_CAPACITY, evicted);
-            }
-            dlq.addLast(runId);
+    boolean pushDlq(String runId, boolean conservative, Throwable lastError) {
+        String reason = lastError == null ? "unknown" : lastError.getMessage();
+        if (reason == null) reason = lastError.getClass().getName();
+        DlqEntry entry = new DlqEntry(runId, conservative, reason, Instant.now());
+
+        try {
+            Files.createDirectories(dlqDir);
+            String fileName = "entry-" + UUID.randomUUID() + ".json";
+            Path tmp = dlqDir.resolve("." + fileName + ".tmp");
+            Path target = dlqDir.resolve(fileName);
+            byte[] json = MAPPER.writeValueAsBytes(entry.toMap());
+            Files.write(tmp, json);
+            Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            dlqMemory.addLast(runId);
+            log.warn("DLQ push: runId={} conservative={} file={}", runId, conservative, fileName);
+            return true;
+        } catch (IOException e) {
+            log.error("DLQ push failed, entry lost: runId={} err={}", runId, e.getMessage());
+            return false;
+        } finally {
+            evictIfNeeded();
         }
-        log.warn("Workspace dump exhausted retries ({}), runId={} conservative={} pushed to in-memory DLQ (size will be reported in v0.1 metrics); lastError={}",
-                MAX_ATTEMPTS, runId, conservative,
-                lastError == null ? "null" : lastError.getMessage());
     }
 
-    /** 当前 DLQ 容量，供 v0.1 指标接入。 */
-    public int dlqSize() {
-        synchronized (dlq) {
-            return dlq.size();
+    private void evictIfNeeded() {
+        // 容量只统计 .json（待处理）和 .processing（正在处理）；quarantine/ 和 eviction.log 不计入
+        List<Path> jsonFiles = listDlqFilesByExtension(".json");
+        List<Path> processingFiles = listDlqFilesByExtension(".processing");
+        int total = jsonFiles.size() + processingFiles.size();
+        if (total <= DLQ_MAX_FILES) return;
+
+        // 优先淘汰最旧的 .json（尚未被 claim 的），合并排序
+        List<Path> candidates = new ArrayList<>();
+        candidates.addAll(jsonFiles);
+        candidates.addAll(processingFiles);
+        candidates.sort(Comparator.comparing(p -> {
+            try { return Files.getLastModifiedTime(p).toMillis(); }
+            catch (IOException e) { return 0L; }
+        }));
+
+        List<String> evictedRunIds = new ArrayList<>();
+        List<Path> toDelete = new ArrayList<>();
+        int toEvict = Math.min(DLQ_EVICTION_BATCH, candidates.size());
+        for (int i = 0; i < toEvict && i < candidates.size(); i++) {
+            Path f = candidates.get(i);
+            DlqEntry e = readEntry(f);
+            if (e != null) evictedRunIds.add(e.runId);
+            toDelete.add(f);
+        }
+
+        // 先写审计日志，写成功后才执行删除
+        if (!appendEvictionLog("capacity", evictedRunIds)) {
+            log.error("DLQ eviction audit log write failed, refusing to delete {} entries", toDelete.size());
+            return;
+        }
+
+        int deleted = 0;
+        for (Path f : toDelete) {
+            try {
+                Files.delete(f);
+                deleted++;
+            } catch (IOException ex) {
+                log.error("DLQ eviction delete failed for {}: {}", f.getFileName(), ex.getMessage());
+            }
+        }
+        evictedRunIds.forEach(dlqMemory::remove);
+        log.warn("DLQ evicted {}/{} attempted entries (cap={}): {}", deleted, toDelete.size(), DLQ_MAX_FILES, evictedRunIds);
+    }
+
+    /** @return true if audit log was written successfully */
+    private boolean appendEvictionLog(String reason, List<String> evictedRunIds) {
+        try {
+            Files.createDirectories(dlqDir);
+            Path logFile = dlqDir.resolve(EVICTION_LOG_NAME);
+            String line = Instant.now() + " reason=" + reason + " count=" + evictedRunIds.size()
+                    + " runIds=" + evictedRunIds + "\n";
+            Files.write(logFile, line.getBytes(StandardCharsets.UTF_8),
+                    StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+            return true;
+        } catch (IOException e) {
+            log.error("Failed to write DLQ eviction log: {}", e.getMessage());
+            return false;
+        }
+    }
+
+    // ===== 磁盘读写 =====
+
+    private List<Path> listDlqFilesByExtension(String extension) {
+        List<Path> files = new ArrayList<>();
+        if (!Files.isDirectory(dlqDir)) {
+            return files;
+        }
+        try (DirectoryStream<Path> ds = Files.newDirectoryStream(dlqDir, "*" + extension)) {
+            for (Path p : ds) files.add(p);
+        } catch (IOException e) {
+            log.warn("DLQ directory listing failed: {}", e.getMessage());
+        }
+        files.sort(Comparator.comparing(Path::getFileName, Comparator.naturalOrder()));
+        return files;
+    }
+
+    private DlqEntry readEntry(Path file) {
+        try {
+            byte[] raw = Files.readAllBytes(file);
+            Map<String, Object> map = MAPPER.readValue(raw, new TypeReference<LinkedHashMap<String, Object>>() {});
+            String runId = (String) map.get("runId");
+            if (runId == null || runId.isBlank()) {
+                log.error("DLQ entry missing runId, quarantining: {}", file.getFileName());
+                quarantine(file);
+                return null;
+            }
+            Boolean conservative = map.get("conservative") instanceof Boolean b ? b : false;
+            String reason = map.get("reason") instanceof String s ? s : "unknown";
+            String enqueuedAtStr = map.get("enqueuedAt") instanceof String s ? s : null;
+            Instant enqueuedAt = enqueuedAtStr != null ? Instant.parse(enqueuedAtStr) : Instant.now();
+            return new DlqEntry(runId, conservative, reason, enqueuedAt);
+        } catch (Exception e) {
+            log.error("DLQ entry corrupt, quarantining: {} err={}", file.getFileName(), e.getMessage());
+            quarantine(file);
+            return null;
+        }
+    }
+
+    /** 将损坏/不可解析的条目移入 quarantine 子目录，而不是直接删除。 */
+    private void quarantine(Path file) {
+        try {
+            Files.createDirectories(quarantineDir);
+            Path target = quarantineDir.resolve(file.getFileName());
+            Files.move(file, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        } catch (IOException e) {
+            log.error("Failed to quarantine corrupt DLQ entry {}, deleting: {}", file.getFileName(), e.getMessage());
+            try { Files.delete(file); } catch (IOException ignored) {}
+        }
+    }
+
+    private void deleteFile(Path file) {
+        try {
+            Files.delete(file);
+        } catch (IOException ignored) {}
+    }
+
+    // ===== 公共查询 =====
+
+    public int dlqDiskSize() {
+        return listDlqFilesByExtension(".json").size() + listDlqFilesByExtension(".processing").size();
+    }
+
+    public int dlqProcessingSize() {
+        return listDlqFilesByExtension(".processing").size();
+    }
+
+    public int dlqMemorySize() {
+        return dlqMemory.size();
+    }
+
+    public long dlqFailedCount() {
+        return dlqFailedCount.get();
+    }
+
+    public Path getDlqDir() {
+        return dlqDir;
+    }
+
+    // ===== DLQ 条目 =====
+
+    record DlqEntry(String runId, boolean conservative, String reason, Instant enqueuedAt) {
+        Map<String, Object> toMap() {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("runId", runId);
+            m.put("conservative", conservative);
+            m.put("reason", reason);
+            m.put("enqueuedAt", DateTimeFormatter.ISO_INSTANT.format(enqueuedAt));
+            return m;
         }
     }
 }

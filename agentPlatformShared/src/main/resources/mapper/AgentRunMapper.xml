@@ -173,6 +173,36 @@
         LIMIT #{limit}
     </select>
 
+    <!-- D21-B 5.2.3: 复合游标查询，条件等价于 (updated_at > cursorTime OR (updated_at = cursorTime AND id > cursorRunId)) -->
+    <select id="listByStatusAndUpdatedAfterComposite" resultMap="AgentRunResultMap">
+        SELECT id,
+               user_id,
+               status,
+               current_step,
+               max_steps,
+               plan_json::text AS plan_json,
+               snapshot_json::text AS snapshot_json,
+               last_error,
+               ttl_expires_at,
+               started_at,
+               updated_at,
+               completed_at,
+               ext::text AS ext,
+               tool_job_anchor_json::text AS tool_job_anchor_json,
+               0 AS duration_ms,
+               0 AS total_tokens,
+               0 AS tool_calls
+        FROM alphafrog_agent_run
+        WHERE status IN
+        <foreach collection="statuses" item="s" open="(" separator="," close=")">
+            CAST(#{s} AS VARCHAR)
+        </foreach>
+          AND (updated_at &gt; #{cursorTime}
+               OR (updated_at = #{cursorTime} AND id &gt; #{cursorRunId}))
+        ORDER BY updated_at ASC, id ASC
+        LIMIT #{limit}
+    </select>
+
     <select id="sumCompletedCreditsByUser" resultType="int">
         SELECT COALESCE(SUM(
                    CASE
