@@ -203,6 +203,88 @@ class PythonSandboxGatewayServiceImplD14Test {
     }
 
     @Test
+    void createTaskForwardsNonDefaultPositiveMemoryWithoutHardcodingTierBytes() {
+        long customMemory = 777L * 1024L * 1024L;
+        RestTemplate restTemplate = new RestTemplate();
+        MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
+        PythonSandboxGatewayServiceImpl gateway = newGateway(restTemplate);
+        server.expect(once(), requestTo("http://sandbox/tasks"))
+                .andExpect(content().json("""
+                        {
+                          "resource_class":"STANDARD",
+                          "capacity_units":1,
+                          "operation_id":"run-1:call-1:1",
+                          "memory_limit_bytes":814743552
+                        }
+                        """, false))
+                .andRespond(withSuccess(
+                        "{\"task_id\":\"t-mem\",\"status\":\"QUEUED\"}",
+                        MediaType.APPLICATION_JSON));
+
+        ExecuteResponse response = gateway.createTask(completeCanonicalBuilder()
+                .setMemoryLimitBytes(customMemory)
+                .build());
+
+        server.verify();
+        assertEquals("t-mem", response.getTaskId());
+        assertTrue(response.getError().isBlank());
+    }
+
+    @Test
+    void createTaskRejectsNonPositiveMemoryWithoutHttp() {
+        RestTemplate restTemplate = new RestTemplate();
+        MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
+        PythonSandboxGatewayServiceImpl gateway = newGateway(restTemplate);
+        server.expect(never(), requestTo("http://sandbox/tasks"));
+
+        ExecuteResponse zero = gateway.createTask(completeCanonicalBuilder()
+                .setMemoryLimitBytes(0L)
+                .build());
+        ExecuteResponse negative = gateway.createTask(completeCanonicalBuilder()
+                .setMemoryLimitBytes(-1L)
+                .build());
+
+        server.verify();
+        assertTrue(zero.getError().contains("incomplete canonical identity"));
+        assertTrue(negative.getError().contains("incomplete canonical identity"));
+        assertEquals(
+                SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_INVALID_ARGUMENT,
+                zero.getErrorDetail().getCategory());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "requestFingerprint",
+            "codeHash",
+            "immutableDatasetSnapshotDigest",
+            "librariesDigest",
+            "sandboxOptionsDigest"
+    })
+    void createTaskRejectsMalformedSha256IdentityFieldWithoutHttp(String field) {
+        RestTemplate restTemplate = new RestTemplate();
+        MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
+        PythonSandboxGatewayServiceImpl gateway = newGateway(restTemplate);
+        server.expect(never(), requestTo("http://sandbox/tasks"));
+
+        ExecuteRequest.Builder builder = completeCanonicalBuilder();
+        switch (field) {
+            case "requestFingerprint" -> builder.setRequestFingerprint("fp-1");
+            case "codeHash" -> builder.setCodeHash("x");
+            case "immutableDatasetSnapshotDigest" -> builder.setImmutableDatasetSnapshotDigest("sha256:not-hex");
+            case "librariesDigest" -> builder.setLibrariesDigest("sha256:" + "g".repeat(64));
+            case "sandboxOptionsDigest" -> builder.setSandboxOptionsDigest("sha256:" + "a".repeat(63));
+            default -> throw new IllegalArgumentException(field);
+        }
+
+        ExecuteResponse response = gateway.createTask(builder.build());
+
+        server.verify();
+        assertTrue(response.getError().contains("incomplete canonical identity"));
+        assertEquals(field, PythonSandboxGatewayServiceImpl.findCanonicalCreateDefect(builder.build()));
+        assertFalse(response.getErrorDetail().hasDownstreamHttpStatus());
+    }
+
+    @Test
     void explicitNonProductionFlagAllowsKeylessCreate() {
         RestTemplate restTemplate = new RestTemplate();
         MockRestServiceServer server = MockRestServiceServer.createServer(restTemplate);
@@ -223,7 +305,7 @@ class PythonSandboxGatewayServiceImplD14Test {
     }
 
     @Test
-    void heavyTierRequireMatchingUnitsAndMemory() {
+    void heavyTierRequireMatchingUnitsAndPositiveMemory() {
         assertEquals("capacityUnits",
                 PythonSandboxGatewayServiceImpl.findCanonicalCreateDefect(
                         completeCanonicalBuilder()
@@ -231,19 +313,19 @@ class PythonSandboxGatewayServiceImplD14Test {
                                 .setCapacityUnits(1)
                                 .setMemoryLimitBytes(HEAVY_MEMORY)
                                 .build()));
-        assertEquals("memoryLimitBytes",
-                PythonSandboxGatewayServiceImpl.findCanonicalCreateDefect(
-                        completeCanonicalBuilder()
-                                .setResourceClass("HEAVY")
-                                .setCapacityUnits(3)
-                                .setMemoryLimitBytes(STANDARD_MEMORY)
-                                .build()));
         assertEquals(null,
                 PythonSandboxGatewayServiceImpl.findCanonicalCreateDefect(
                         completeCanonicalBuilder()
                                 .setResourceClass("HEAVY")
                                 .setCapacityUnits(3)
-                                .setMemoryLimitBytes(HEAVY_MEMORY)
+                                .setMemoryLimitBytes(1L)
+                                .build()));
+        assertEquals("memoryLimitBytes",
+                PythonSandboxGatewayServiceImpl.findCanonicalCreateDefect(
+                        completeCanonicalBuilder()
+                                .setResourceClass("HEAVY")
+                                .setCapacityUnits(3)
+                                .setMemoryLimitBytes(0L)
                                 .build()));
     }
 }

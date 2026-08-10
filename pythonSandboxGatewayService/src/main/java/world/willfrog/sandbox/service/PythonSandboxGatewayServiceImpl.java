@@ -412,9 +412,18 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
      * field name for operator logs, or null when the full identity group is present.
      * Does not invent defaults or recompute fingerprints.
      *
-     * <p>Capacity/memory tier contract mirrors Java DataAnalysisCapacityProperties and
-     * Python sandbox defaults: STANDARD → 1 unit / 512MiB; HEAVY → 3 units / 1536MiB.
+     * <p>capacityUnits stay frozen by resource class (STANDARD=1, HEAVY=3).
+     * memoryLimitBytes only requires a positive value here — the actual configured
+     * STANDARD/HEAVY memory bytes live in Java DataAnalysisCapacityProperties and
+     * Python AF_SANDBOX_*_MEMORY_BYTES; Gateway must not hardcode a third copy.
+     *
+     * <p>The five SHA-256 identity fields are syntax-checked the same way as Python
+     * {@code normalize_sha256}: optional {@code sha256:} prefix + 64 hex digits.
+     * Gateway does not recompute fingerprint or verify codeHash against code bytes.
      */
+    private static final java.util.regex.Pattern SHA256_DIGEST =
+            java.util.regex.Pattern.compile("^(?:sha256:)?([0-9a-fA-F]{64})$");
+
     static String findCanonicalCreateDefect(ExecuteRequest request) {
         String resourceClass = request.getResourceClass() == null
                 ? ""
@@ -423,19 +432,16 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
             return "resourceClass";
         }
         int expectedUnits = "HEAVY".equals(resourceClass) ? 3 : 1;
-        long expectedMemoryBytes = "HEAVY".equals(resourceClass)
-                ? 1536L * 1024L * 1024L
-                : 512L * 1024L * 1024L;
         if (request.getCapacityUnits() != expectedUnits) {
             return "capacityUnits";
         }
-        if (request.getMemoryLimitBytes() != expectedMemoryBytes) {
+        if (request.getMemoryLimitBytes() <= 0L) {
             return "memoryLimitBytes";
         }
         if (request.getTimeoutMillis() <= 0L) {
             return "timeoutMillis";
         }
-        if (isBlank(request.getRequestFingerprint())) {
+        if (!isSha256Digest(request.getRequestFingerprint())) {
             return "requestFingerprint";
         }
         if (isBlank(request.getCanonicalSpecSchemaVersion())
@@ -445,16 +451,16 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
         if (isBlank(request.getRuntimeEnvironmentVersion())) {
             return "runtimeEnvironmentVersion";
         }
-        if (isBlank(request.getCodeHash())) {
+        if (!isSha256Digest(request.getCodeHash())) {
             return "codeHash";
         }
-        if (isBlank(request.getImmutableDatasetSnapshotDigest())) {
+        if (!isSha256Digest(request.getImmutableDatasetSnapshotDigest())) {
             return "immutableDatasetSnapshotDigest";
         }
-        if (isBlank(request.getLibrariesDigest())) {
+        if (!isSha256Digest(request.getLibrariesDigest())) {
             return "librariesDigest";
         }
-        if (isBlank(request.getSandboxOptionsDigest())) {
+        if (!isSha256Digest(request.getSandboxOptionsDigest())) {
             return "sandboxOptionsDigest";
         }
         return null;
@@ -462,6 +468,13 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
 
     private static boolean isBlank(String value) {
         return value == null || value.isBlank();
+    }
+
+    private static boolean isSha256Digest(String value) {
+        if (value == null) {
+            return false;
+        }
+        return SHA256_DIGEST.matcher(value.trim()).matches();
     }
 
     /**
