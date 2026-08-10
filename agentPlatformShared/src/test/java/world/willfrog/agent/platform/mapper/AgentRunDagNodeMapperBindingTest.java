@@ -525,37 +525,51 @@ class AgentRunDagNodeMapperBindingTest {
 
         // 6) 三项 identity fence 完整比较：JSON 键 = ?，且 ? 对应的 ParameterMapping 正确
         assertFenceComplete("'{resumeToken}'", "expectedResumeToken",
-                norm, sql, qmPositions, pms, frontierStart);
+                sql, qmPositions, pms);
 
         assertFenceComplete("'{resumeLauncherOwnerId}'", "expectedOwnerId",
-                norm, sql, qmPositions, pms, frontierStart);
+                sql, qmPositions, pms);
 
         assertFenceComplete("'{resumeLeaseVersion}'", "expectedResumeLeaseVersion",
-                norm, sql, qmPositions, pms, frontierStart);
+                sql, qmPositions, pms);
     }
 
-    /** 验证 frontier_result WHERE 中 JSON 键完整比较：key = ? 且 ? 对应正确 @Param */
+    /**
+     * 验证 frontier_result WHERE 中 JSON 键完整比较：key = ? 且 ? 对应正确 @Param。
+     * 重点拒绝 key IS NOT NULL AND ? IS NOT NULL 这类伪围栏：
+     * 前者失去相等比较语义，后者把参数挪到无关位置后现有 ParameterMapping 检查仍可能通过。
+     */
     private void assertFenceComplete(String jsonKey, String expectedParam,
-                                      String norm, String fullSql,
+                                      String fullSql,
                                       List<Integer> qmPositions,
-                                      List<ParameterMapping> pms,
-                                      int frontierStart) {
-        // 在完整 SQL 中找到 frontier_result 块内该 JSON 键后的 ?
-        int keyPos = fullSql.indexOf(jsonKey, frontierStart);
-        assertThat(keyPos).as(jsonKey + " 应在 frontier_result 块内").isNotNegative();
+                                      List<ParameterMapping> pms) {
+        // 在完整 SQL 中找 JSON 键
+        int keyPos = fullSql.indexOf(jsonKey);
+        assertThat(keyPos).as(jsonKey + " 应在 SQL 中").isNotNegative();
 
-        // 找到该键之后最近的 ?
+        // 确认 JSON 键在 frontier_result CTE 范围内（RETURNING 1 之前）
+        int frontierReturning = fullSql.indexOf("RETURNING 1", keyPos);
+        assertThat(frontierReturning).as("RETURNING 1 应在 " + jsonKey + " 之后").isNotNegative();
+
+        // 找 JSON 键之后最近的 ?
         int qmIdx = fullSql.indexOf('?', keyPos);
         assertThat(qmIdx).as(jsonKey + " 之后应有 ? 占位符").isNotNegative();
-
-        // 确认 ? 在 frontier_result CTE 范围内（RETURNING 1 之前）
-        int frontierReturning = fullSql.indexOf("RETURNING 1", frontierStart);
         assertThat(qmIdx).as(jsonKey + " 的 ? 应在 frontier_result 的 RETURNING 1 之前")
                 .isLessThan(frontierReturning);
 
-        // 通过 ? 位置找到对应的 ParameterMapping
+        // 锁住键与 ? 之间为 = 比较，拒绝 key IS NOT NULL AND ? IS NOT NULL 等伪围栏
+        String between = fullSql.substring(keyPos + jsonKey.length(), qmIdx);
+        assertThat(between)
+                .as(jsonKey + " 与 ? 之间必须是 = 相等比较（可能带 ::bigint 转型），"
+                    + "不能是 IS NOT NULL / IS NULL / <>")
+                .contains("=")
+                .doesNotContain("IS NOT")
+                .doesNotContain("IS NULL")
+                .doesNotContain("<>");
+
+        // 通过 ? 位置索引 → ParameterMapping 校验 @Param 名称
         int pmIndex = qmPositions.indexOf(qmIdx);
-        assertThat(pmIndex).as(jsonKey + " 的 ? 应有对应 ParameterMapping").isNotNegative();
+        assertThat(pmIndex).as(jsonKey + " = ? 的 ? 应有对应 ParameterMapping").isNotNegative();
         String prop = pms.get(pmIndex).getProperty();
         String root = prop.contains(".") ? prop.substring(0, prop.indexOf('.')) : prop;
         assertThat(root).as(jsonKey + " = ? 的 ? 必须对应 @Param(\"" + expectedParam + "\")")
