@@ -3,7 +3,6 @@ package world.willfrog.agentlangchain.workspace;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.test.util.ReflectionTestUtils;
 
@@ -11,12 +10,13 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.anyBoolean;
@@ -88,11 +88,34 @@ class WorkspaceDlqPersistenceTest {
     }
 
     @Test
-    void pushDlq_failureIncrementsFailedCountWhenCalledFromEnqueue() {
-        // pushDlq 返回 false 时 enqueueDumpAsync 内部递增 dlqFailedCount
-        // 这里直接测 pushDlq 返回值 + dlqFailedCount 的外部查询接口
-        assertThat(scheduler.dlqFailedCount()).isEqualTo(0);
+    void pushDlq_doesNotEvictOnFailure() throws Exception {
+        // 写入足够多的有效条目到 dlqDir
+        Files.createDirectories(dlqDir);
+        for (int i = 0; i < 10; i++) {
+            String content = String.format(
+                    "{\"runId\":\"run-%d\",\"conservative\":false,\"reason\":\"test\",\"enqueuedAt\":\"2026-01-01T00:00:00Z\"}",
+                    i);
+            Path f = dlqDir.resolve("entry-keep-" + String.format("%04d", i) + ".json");
+            Files.writeString(f, content);
+        }
+        int before = listJsonFiles().size();
 
+        // 把 dlqDir 设为只读，后续 Files.write(tmp) 会失败
+        dlqDir.toFile().setReadOnly();
+
+        try {
+            scheduler.pushDlq("run-fail", false, new RuntimeException("err"));
+        } finally {
+            dlqDir.toFile().setWritable(true);
+        }
+
+        // 失败不应触发淘汰，原有文件数应不变
+        assertThat(listJsonFiles().size()).isEqualTo(before);
+    }
+
+    @Test
+    void pushDlq_failureIncrementsFailedCountWhenCalledFromEnqueue() {
+        assertThat(scheduler.dlqFailedCount()).isEqualTo(0);
         boolean ok = scheduler.pushDlq("run-ok", false, new RuntimeException("transient"));
         assertThat(ok).isTrue();
         assertThat(scheduler.dlqMemorySize()).isEqualTo(1);
@@ -114,8 +137,8 @@ class WorkspaceDlqPersistenceTest {
     }
 
     @Test
-    void replayDlq_skipsFileWhenProcessingAlreadyExists() throws Exception {
-        // 写入 .json 文件，同时预先创建同名 .processing 文件（模拟另一进程已 claim）
+    void replayDlq_keepsJsonWhenProcessingAlreadyExists() throws Exception {
+        // 写入 .json 文件，同时预先创建同名 .processing 文件
         scheduler.pushDlq("run-claimed", false, new RuntimeException("err"));
         List<Path> jsonFiles = listJsonFiles();
         assertThat(jsonFiles).hasSize(1);
@@ -123,19 +146,19 @@ class WorkspaceDlqPersistenceTest {
         String jsonName = jsonFile.getFileName().toString();
         String procName = jsonName.substring(0, jsonName.length() - ".json".length()) + ".processing";
         Path procFile = dlqDir.resolve(procName);
-        Files.copy(jsonFile, procFile); // 另一进程已 claim 的证据
+        Files.copy(jsonFile, procFile);
 
         ReflectionTestUtils.setField(scheduler, "dlqMemory", new ConcurrentLinkedDeque<>());
 
-        // 重放：检测到 .processing 已存在 → 删除残留 .json → 跳过
+        // 重放：.processing 已存在 → 保留源 .json → 跳过
         ReflectionTestUtils.invokeMethod(scheduler, "replayDlq");
 
-        // dumpService 不应被调用（已被另一进程 claim）
+        // dumpService 不应被调用
         verify(dumpService, never()).dumpRun(anyString(), anyBoolean());
-        // .processing 应保持不动（由另一进程负责）
+        // .processing 保持不动
         assertThat(procFile).exists();
-        // 残留 .json 应被删除
-        assertThat(jsonFile).doesNotExist();
+        // 源 .json 应保留（不再删除，由 stale recovery 后续处理）
+        assertThat(jsonFile).exists();
     }
 
     @Test
@@ -151,7 +174,7 @@ class WorkspaceDlqPersistenceTest {
         assertThat(quarantineDir).isDirectory();
         List<Path> quarantined;
         try (var ds = Files.newDirectoryStream(quarantineDir)) {
-            quarantined = new java.util.ArrayList<>();
+            quarantined = new ArrayList<>();
             for (Path p : ds) quarantined.add(p);
         }
         assertThat(quarantined).hasSize(1);
@@ -182,10 +205,10 @@ class WorkspaceDlqPersistenceTest {
         ReflectionTestUtils.invokeMethod(scheduler, "replayDlq");
 
         verify(dumpService).dumpRun("run-keep", false);
-        // 重放失败，.processing 文件应保留（下一轮重启重试）
+        // 重放失败，.processing 文件应保留
         List<Path> processingFiles;
         try (var ds = Files.newDirectoryStream(dlqDir, "*.processing")) {
-            processingFiles = new java.util.ArrayList<>();
+            processingFiles = new ArrayList<>();
             for (Path p : ds) processingFiles.add(p);
         }
         assertThat(processingFiles).hasSize(1);
@@ -215,25 +238,67 @@ class WorkspaceDlqPersistenceTest {
 
         ReflectionTestUtils.invokeMethod(scheduler, "recoverStaleProcessingFiles");
 
-        // 新鲜 .processing 不应被抢回
         assertThat(recent).exists();
         assertThat(dlqDir.resolve("entry-recent.json")).doesNotExist();
     }
 
-    // ===== 容量淘汰 =====
+    // ===== quarantine 失败保留原文件 =====
+
+    @Test
+    void quarantine_keepsOriginalFileOnFailure() throws Exception {
+        Files.createDirectories(dlqDir);
+        Path corrupt = dlqDir.resolve("entry-corrupt.json");
+        Files.writeString(corrupt, "{bad json");
+
+        // 把 quarantine 目录路径变成一个普通文件，使 createDirectories 失败
+        Path quarantineDir = dlqDir.resolve("quarantine");
+        Files.write(quarantineDir, "block".getBytes(StandardCharsets.UTF_8));
+
+        assertThat(scheduler.quarantineFailedCount()).isEqualTo(0);
+
+        ReflectionTestUtils.invokeMethod(scheduler, "replayDlq");
+
+        // quarantine 失败时，已 claim 的 .processing 文件必须保留（原 .json 已被 rename 为 .processing）
+        Path procFile = dlqDir.resolve("entry-corrupt.processing");
+        assertThat(procFile).exists();
+        assertThat(scheduler.quarantineFailedCount()).isEqualTo(1);
+    }
+
+    // ===== 容量淘汰：.processing 不被淘汰 =====
+
+    @Test
+    void eviction_preservesProcessingFilesWhenOnlyJsonCanBeEvicted() throws Exception {
+        Files.createDirectories(dlqDir);
+        // 写 500 个 .json + 600 个 .processing → total=1100 > 1000，但只能淘汰 .json
+        for (int i = 0; i < 500; i++) {
+            Path f = dlqDir.resolve("entry-json-" + String.format("%04d", i) + ".json");
+            Files.writeString(f, "{\"runId\":\"run-json-" + i + "\",\"conservative\":false,\"reason\":\"test\",\"enqueuedAt\":\"2026-01-01T00:00:00Z\"}");
+        }
+        for (int i = 0; i < 600; i++) {
+            Path f = dlqDir.resolve("entry-proc-" + String.format("%04d", i) + ".processing");
+            Files.writeString(f, "{\"runId\":\"run-proc-" + i + "\"}");
+        }
+
+        scheduler = new WorkspaceDumpScheduler(dumpService, pathResolver, dumpExecutor);
+        scheduler.pushDlq("run-trigger", false, new RuntimeException("trigger"));
+
+        // .processing 文件应全部保留
+        int remainingProc = 0;
+        try (var ds = Files.newDirectoryStream(dlqDir, "*.processing")) {
+            for (Path p : ds) remainingProc++;
+        }
+        assertThat(remainingProc).isEqualTo(600);
+    }
 
     @Test
     void eviction_skipsQuarantineAndEvictionLog() throws Exception {
-        // 在 quarantine/ 下放文件，验证不会被淘汰
         Path quarantineDir = dlqDir.resolve("quarantine");
         Files.createDirectories(quarantineDir);
         Files.writeString(quarantineDir.resolve("corrupt.json"), "garbage");
 
-        // 在 dlqDir 下放 eviction.log
         Files.createDirectories(dlqDir);
         Files.writeString(dlqDir.resolve("eviction.log"), "old log");
 
-        // 写大量 .json 触发淘汰
         for (int i = 0; i < 1001; i++) {
             String content = String.format(
                     "{\"runId\":\"run-%d\",\"conservative\":false,\"reason\":\"test\",\"enqueuedAt\":\"2026-01-01T00:00:00Z\"}",
@@ -245,19 +310,16 @@ class WorkspaceDlqPersistenceTest {
         scheduler = new WorkspaceDumpScheduler(dumpService, pathResolver, dumpExecutor);
         scheduler.pushDlq("run-new", false, new RuntimeException("trigger eviction"));
 
-        // quarantine/ 和 eviction.log 不应被删除
         assertThat(quarantineDir.resolve("corrupt.json")).exists();
         assertThat(dlqDir.resolve("eviction.log")).exists();
     }
 
     @Test
     void eviction_abortsIfAuditLogWriteFails() throws Exception {
-        // 把 eviction.log 变成一个目录，使 appendEvictionLog 写失败
         Files.createDirectories(dlqDir);
         Path logAsDir = dlqDir.resolve("eviction.log");
         Files.createDirectories(logAsDir);
 
-        // 写 1001 个条目触发淘汰
         for (int i = 0; i < 1001; i++) {
             String content = String.format(
                     "{\"runId\":\"run-%d\",\"conservative\":false,\"reason\":\"test\",\"enqueuedAt\":\"2026-01-01T00:00:00Z\"}",
@@ -269,52 +331,56 @@ class WorkspaceDlqPersistenceTest {
         scheduler = new WorkspaceDumpScheduler(dumpService, pathResolver, dumpExecutor);
         int beforeCount = listJsonFiles().size();
 
-        // pushDlq 触发 evictIfNeeded，但审计日志写失败 → 不应删除任何文件
         boolean result = scheduler.pushDlq("run-new", false, new RuntimeException("trigger"));
 
-        // 文件数应不变（审计失败阻止了删除）
         int afterCount = listJsonFiles().size();
         assertThat(afterCount).isEqualTo(beforeCount + (result ? 1 : 0));
     }
 
-    // ===== 启动事件线程及时返回 =====
+    // ===== 启动事件：确定性并发证明 =====
 
     @Test
-    void onApplicationReady_returnsImmediatelyWhileReplayRunsOnExecutor() throws Exception {
-        // 先写入一个 DLQ 条目，使 replayDlq 有工作要做
+    void onApplicationReady_submitsReplayAndReturnsWithoutBlocking() throws Exception {
+        // 写入 DLQ 条目
         scheduler.pushDlq("run-block", false, new RuntimeException("block-test"));
         ReflectionTestUtils.setField(scheduler, "dlqMemory", new ConcurrentLinkedDeque<>());
 
-        // 让 dumpService.dumpRun 阻塞在 latch 上
-        CountDownLatch blockLatch = new CountDownLatch(1);
+        // 双栅栏：enteredLatch 证明 worker 已进入 dump，blockLatch 让 worker 阻塞
         CountDownLatch enteredLatch = new CountDownLatch(1);
-        AtomicBoolean dumpCalled = new AtomicBoolean(false);
+        CountDownLatch blockLatch = new CountDownLatch(1);
+        CompletableFuture<Boolean> methodReturned = new CompletableFuture<>();
+        AtomicBoolean dumpEntered = new AtomicBoolean(false);
+
         doAnswer(inv -> {
-            dumpCalled.set(true);
+            dumpEntered.set(true);
             enteredLatch.countDown();
             blockLatch.await(10, TimeUnit.SECONDS);
             return null;
         }).when(dumpService).dumpRun("run-block", false);
 
-        // 调用 onApplicationReady，必须在合理时间内返回
-        long start = System.currentTimeMillis();
-        scheduler.onApplicationReady();
-        long elapsed = System.currentTimeMillis() - start;
+        // 另一个线程调用 onApplicationReady，通过 CompletableFuture 证明方法已返回
+        Thread caller = new Thread(() -> {
+            scheduler.onApplicationReady();
+            methodReturned.complete(true);
+        });
+        caller.start();
 
-        // 验证方法立即返回（executor 只是提交任务，不阻塞调用线程）
-        assertThat(elapsed).isLessThan(500); // 500ms 内必须返回
-
-        // 等待 executor 线程进入 dump
+        // 等待 worker 进入 dump（证明 executor 已接收任务）
         assertThat(enteredLatch.await(5, TimeUnit.SECONDS)).isTrue();
+        assertThat(dumpEntered.get()).isTrue();
 
-        // 释放阻塞，让 executor 线程完成
+        // 此时 worker 阻塞在 blockLatch 上，onApplicationReady 应已返回
+        // （executor.execute 是异步提交，不等待任务完成）
+        assertThat(methodReturned.get(5, TimeUnit.SECONDS)).isTrue();
+
+        // 断言对象是"方法已完成"和"worker 已进入"，不是墙钟耗时
+
+        // 释放 worker
         blockLatch.countDown();
+        caller.join(5000);
 
-        // 等待 executor 线程退出
         dumpExecutor.shutdown();
         assertThat(dumpExecutor.getThreadPoolExecutor().awaitTermination(5, TimeUnit.SECONDS)).isTrue();
-
-        assertThat(dumpCalled.get()).isTrue();
     }
 
     // ===== 构造不阻塞 =====
@@ -334,7 +400,7 @@ class WorkspaceDlqPersistenceTest {
     // ===== 辅助方法 =====
 
     private List<Path> listJsonFiles() {
-        List<Path> files = new java.util.ArrayList<>();
+        List<Path> files = new ArrayList<>();
         if (!Files.isDirectory(dlqDir)) return files;
         try (var ds = Files.newDirectoryStream(dlqDir, "*.json")) {
             for (Path p : ds) files.add(p);

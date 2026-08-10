@@ -28,10 +28,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * workspace dump 异步调度器。
+ * workspace dump 异步调度器（单进程 writer）。
  *
  * <p>在 {@code workspaceDumpExecutor} 线程池上异步执行 dump；失败时 3 次重试，
  * 仍失败则入磁盘 DLQ（基于 D04 WorkspacePathResolver）。
@@ -40,15 +41,19 @@ import java.util.concurrent.atomic.AtomicLong;
  * <ul>
  *   <li>介质：{workspaceRoot}/_dlq/entry-{uuid}.json</li>
  *   <li>原子写入：写 .tmp → ATOMIC_MOVE 替换</li>
- *   <li>多进程安全：重放时 .json → .processing 原子 rename claim，另一进程 rename 失败则跳过</li>
+ *   <li>单进程 writer：重放时 .json → .processing 原子 rename claim；
+ *       若目标 .processing 已存在则保留源 .json（由 stale recovery 后续处理）</li>
  *   <li>崩溃恢复：启动时扫描超过 STALE_PROCESSING_TIMEOUT 的 .processing 文件，rename 回 .json 重新参与重放</li>
  *   <li>启动重放：{@code @EventListener(ApplicationReadyEvent.class)} 通过显式注入的 {@code workspaceDumpExecutor} 提交，
- *       不依赖 {@code @Async} 代理自调用</li>
+ *       不依赖 {@code @Async} 代理自调用；executor 拒绝时 ERROR + 递增 replayRejectedCount</li>
  *   <li>重放成功：删 .processing 文件；重放失败：保留 .processing 文件供下次重启重试</li>
- *   <li>容量计算：仅统计待处理 .json 与正在处理 .processing 文件；quarantine/ 与 eviction.log 不计入容量，不被淘汰清理</li>
- *   <li>淘汰审计：先写 eviction.log，写成功后再删文件；审计写失败时禁止删除，保留全部条目</li>
- *   <li>损坏：JSON 解析失败或必填字段缺失 → ERROR + 移入 quarantine/ 子目录隔离</li>
- *   <li>透明性：pushDlq 返回 boolean + 内部维护 dlqFailedCount 原子计数器供外部快照查询</li>
+ *   <li>容量计算：统计待处理 .json 与正在处理 .processing；quarantine/ 与 eviction.log 不计入</li>
+ *   <li>淘汰：仅淘汰尚未 claim 的 .json；活跃 .processing 永远不被淘汰删除。
+ *       若可淘汰 .json 不足，保留超限状态并 ERROR</li>
+ *   <li>淘汰审计：先写 eviction.log，写成功后再删文件；审计写失败时禁止删除</li>
+ *   <li>损坏：JSON 解析失败或必填字段缺失 → ERROR + 移入 quarantine/ 子目录隔离；
+ *       quarantine 失败时保留原文件 + ERROR + 递增 quarantineFailedCount</li>
+ *   <li>透明性：pushDlq 返回 boolean + dlqFailedCount / quarantineFailedCount / replayRejectedCount 原子计数器</li>
  * </ul>
  *
  * <h3>协作关系</h3>
@@ -82,8 +87,12 @@ public class WorkspaceDumpScheduler {
     /** 内存热缓存，供快速查询当前 DLQ 条目；真相源是磁盘文件 */
     private final Deque<String> dlqMemory = new ConcurrentLinkedDeque<>();
 
-    /** pushDlq 磁盘写入失败次数，供外部快照/告警查询 */
+    /** pushDlq 磁盘写入失败次数 */
     private final AtomicLong dlqFailedCount = new AtomicLong();
+    /** quarantine 失败次数（原文件保留，但未能移入隔离目录） */
+    private final AtomicLong quarantineFailedCount = new AtomicLong();
+    /** 启动重放被 executor 拒绝的次数 */
+    private final AtomicLong replayRejectedCount = new AtomicLong();
 
     /** 构造只初始化路径，不执行 IO 和重放；重放由 ApplicationReadyEvent 通过显式 executor 触发。 */
     public WorkspaceDumpScheduler(WorkspaceDumpService dumpService,
@@ -95,14 +104,19 @@ public class WorkspaceDumpScheduler {
         this.quarantineDir = dlqDir.resolve(QUARANTINE_DIR_NAME);
     }
 
-    // ===== 启动重放（ApplicationReadyEvent + 显式 executor，不依赖 @Async 代理自调用） =====
+    // ===== 启动重放（ApplicationReadyEvent + 显式 executor） =====
 
     @EventListener(ApplicationReadyEvent.class)
     public void onApplicationReady() {
-        dumpExecutor.execute(() -> {
-            recoverStaleProcessingFiles();
-            replayDlq();
-        });
+        try {
+            dumpExecutor.execute(() -> {
+                recoverStaleProcessingFiles();
+                replayDlq();
+            });
+        } catch (RejectedExecutionException e) {
+            replayRejectedCount.incrementAndGet();
+            log.error("DLQ replay rejected by workspaceDumpExecutor: {}", e.getMessage());
+        }
     }
 
     /** 将超过 STALE_PROCESSING_TIMEOUT 的 .processing 文件 rename 回 .json，使其重新参与重放。 */
@@ -145,10 +159,10 @@ public class WorkspaceDumpScheduler {
             String procName = jsonName.substring(0, jsonName.length() - ".json".length()) + ".processing";
             Path procFile = dlqDir.resolve(procName);
 
-            // 先检查 .processing 是否已存在（另一进程已 claim），避免 macOS 上 ATOMIC_MOVE 静默覆盖
+            // 单进程 writer：若同名 .processing 已存在（上次崩溃残留），保留源 .json
+            // 等待 stale recovery 将过期 .processing 回退为 .json 后重新参与重放
             if (Files.exists(procFile)) {
-                // 另一进程已 claim，删除残留 .json（另一进程负责处理）
-                deleteFile(jsonFile);
+                log.warn("DLQ claim conflict: .processing already exists for {}, keeping source .json", jsonName);
                 continue;
             }
             try {
@@ -226,42 +240,46 @@ public class WorkspaceDumpScheduler {
             Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
             dlqMemory.addLast(runId);
             log.warn("DLQ push: runId={} conservative={} file={}", runId, conservative, fileName);
+            // 写入成功后才触发容量治理，避免新条目没写成旧条目反被淘汰
+            evictIfNeeded();
             return true;
         } catch (IOException e) {
             log.error("DLQ push failed, entry lost: runId={} err={}", runId, e.getMessage());
             return false;
-        } finally {
-            evictIfNeeded();
         }
     }
 
     private void evictIfNeeded() {
-        // 容量只统计 .json（待处理）和 .processing（正在处理）；quarantine/ 和 eviction.log 不计入
+        // 容量统计 .json + .processing；quarantine/ 和 eviction.log 不计入
         List<Path> jsonFiles = listDlqFilesByExtension(".json");
         List<Path> processingFiles = listDlqFilesByExtension(".processing");
         int total = jsonFiles.size() + processingFiles.size();
         if (total <= DLQ_MAX_FILES) return;
 
-        // 优先淘汰最旧的 .json（尚未被 claim 的），合并排序
-        List<Path> candidates = new ArrayList<>();
-        candidates.addAll(jsonFiles);
-        candidates.addAll(processingFiles);
+        // 只淘汰尚未 claim 的 .json；活跃 .processing 永远不删
+        List<Path> candidates = new ArrayList<>(jsonFiles);
         candidates.sort(Comparator.comparing(p -> {
             try { return Files.getLastModifiedTime(p).toMillis(); }
             catch (IOException e) { return 0L; }
         }));
 
+        int toEvict = Math.min(DLQ_EVICTION_BATCH, candidates.size());
+        if (toEvict == 0) {
+            log.error("DLQ capacity exceeded (total={}, cap={}) but no evictable .json files available; "
+                    + "{} .processing files are in-flight and cannot be evicted",
+                    total, DLQ_MAX_FILES, processingFiles.size());
+            return;
+        }
+
         List<String> evictedRunIds = new ArrayList<>();
         List<Path> toDelete = new ArrayList<>();
-        int toEvict = Math.min(DLQ_EVICTION_BATCH, candidates.size());
-        for (int i = 0; i < toEvict && i < candidates.size(); i++) {
+        for (int i = 0; i < toEvict; i++) {
             Path f = candidates.get(i);
             DlqEntry e = readEntry(f);
             if (e != null) evictedRunIds.add(e.runId);
             toDelete.add(f);
         }
 
-        // 先写审计日志，写成功后才执行删除
         if (!appendEvictionLog("capacity", evictedRunIds)) {
             log.error("DLQ eviction audit log write failed, refusing to delete {} entries", toDelete.size());
             return;
@@ -277,7 +295,8 @@ public class WorkspaceDumpScheduler {
             }
         }
         evictedRunIds.forEach(dlqMemory::remove);
-        log.warn("DLQ evicted {}/{} attempted entries (cap={}): {}", deleted, toDelete.size(), DLQ_MAX_FILES, evictedRunIds);
+        log.warn("DLQ evicted {}/{} attempted entries (cap={}, total={}): {}",
+                deleted, toDelete.size(), DLQ_MAX_FILES, total, evictedRunIds);
     }
 
     /** @return true if audit log was written successfully */
@@ -334,15 +353,16 @@ public class WorkspaceDumpScheduler {
         }
     }
 
-    /** 将损坏/不可解析的条目移入 quarantine 子目录，而不是直接删除。 */
+    /** 将损坏/不可解析的条目移入 quarantine 子目录。失败时保留原文件，不删除。 */
     private void quarantine(Path file) {
         try {
             Files.createDirectories(quarantineDir);
             Path target = quarantineDir.resolve(file.getFileName());
             Files.move(file, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
         } catch (IOException e) {
-            log.error("Failed to quarantine corrupt DLQ entry {}, deleting: {}", file.getFileName(), e.getMessage());
-            try { Files.delete(file); } catch (IOException ignored) {}
+            quarantineFailedCount.incrementAndGet();
+            log.error("Failed to quarantine corrupt DLQ entry {}, keeping original file: {}",
+                    file.getFileName(), e.getMessage());
         }
     }
 
@@ -368,6 +388,14 @@ public class WorkspaceDumpScheduler {
 
     public long dlqFailedCount() {
         return dlqFailedCount.get();
+    }
+
+    public long quarantineFailedCount() {
+        return quarantineFailedCount.get();
+    }
+
+    public long replayRejectedCount() {
+        return replayRejectedCount.get();
     }
 
     public Path getDlqDir() {
