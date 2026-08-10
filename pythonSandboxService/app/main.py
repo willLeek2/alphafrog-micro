@@ -603,14 +603,18 @@ async def create_task(request: ExecuteRequest):
     # keyed creates still run fingerprint/units/memory validation below.
     operation_id = (request.operation_id or "").strip()
     if not operation_id and not config.allow_create_without_operation_id:
+        logger.warning(
+            "sandbox.create.reject_missing_operation_id "
+            "non_production_switch=AF_SANDBOX_ALLOW_CREATE_WITHOUT_OPERATION_ID"
+        )
         raise HTTPException(
             status_code=400,
             detail=(
                 "operation_id is required for sandbox create "
                 "(D14 production refuse create without idempotency key; "
-                "set AF_SANDBOX_ALLOW_CREATE_WITHOUT_OPERATION_ID=true only for "
-                "explicit non-production fixtures — no global capacity admission, "
-                "no idempotent recovery)"
+                "non-production fixtures must enable the documented Legacy "
+                "compatibility switches as a group — no global capacity "
+                "admission, no idempotent recovery)"
             ),
         )
     if operation_id:

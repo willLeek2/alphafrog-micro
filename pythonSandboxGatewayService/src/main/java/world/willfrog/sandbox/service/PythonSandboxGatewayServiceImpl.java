@@ -163,11 +163,13 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
                     SandboxErrorDetail detail = SandboxErrorDetail.newBuilder()
                             .setCategory(SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_INVALID_ARGUMENT)
                             .build();
+                    // Stable caller-facing text: no config-key inventory.
                     String text = "createTask rejected: operationId is required "
                             + "(D14 production refuse create without idempotency key; "
-                            + "resourceClass-only transitional clients are non-production only — "
-                            + "set sandbox.gateway.allow-create-without-operation-id=true explicitly)";
-                    log.warn("sandbox.createTask.localRejectMissingOperationId: resourceClass={}, totalDurationMs={}",
+                            + "resourceClass-only transitional clients are non-production only)";
+                    log.warn("sandbox.createTask.localRejectMissingOperationId: resourceClass={}, "
+                                    + "totalDurationMs={}, nonProductionSwitch=sandbox.gateway."
+                                    + "allow-create-without-operation-id",
                             request.getResourceClass(),
                             System.currentTimeMillis() - startMs);
                     return ExecuteResponse.newBuilder()
@@ -177,9 +179,28 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
                 }
                 log.warn("sandbox.createTask.allowWithoutOperationId: "
                         + "allow-create-without-operation-id=true "
-                        + "(NON-PRODUCTION: no idempotent recovery)");
+                        + "(NON-PRODUCTION: no idempotent recovery; must also enable "
+                        + "companion Java/Python switches as a group)");
             }
             if (canonicalCreate) {
+                // D14 MUST-FIX: keyed create must carry a complete canonical identity
+                // group BEFORE HTTP. Do not invent defaults or recompute fingerprint;
+                // incomplete half-sets are local INVALID_ARGUMENT.
+                String defect = findCanonicalCreateDefect(request);
+                if (defect != null) {
+                    SandboxErrorDetail detail = SandboxErrorDetail.newBuilder()
+                            .setCategory(SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_INVALID_ARGUMENT)
+                            .build();
+                    String text = "createTask rejected: incomplete canonical identity "
+                            + "for keyed create";
+                    log.warn("sandbox.createTask.localRejectIncompleteCanonical: "
+                                    + "operationId={}, missingOrInvalidField={}, totalDurationMs={}",
+                            operationId, defect, System.currentTimeMillis() - startMs);
+                    return ExecuteResponse.newBuilder()
+                            .setError(text)
+                            .setErrorDetail(detail)
+                            .build();
+                }
                 httpRequest.setResource_class(request.getResourceClass());
                 httpRequest.setEstimated_rows(request.getEstimatedRows());
                 httpRequest.setEstimated_bytes(request.getEstimatedBytes());
@@ -384,6 +405,63 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
         if (e == null) return fallback;
         if (e.getMessage() != null && !e.getMessage().isBlank()) return e.getMessage();
         return fallback;
+    }
+
+    /**
+     * D14: keyed create local completeness check. Returns the first missing/invalid
+     * field name for operator logs, or null when the full identity group is present.
+     * Does not invent defaults or recompute fingerprints.
+     *
+     * <p>Capacity/memory tier contract mirrors Java DataAnalysisCapacityProperties and
+     * Python sandbox defaults: STANDARD → 1 unit / 512MiB; HEAVY → 3 units / 1536MiB.
+     */
+    static String findCanonicalCreateDefect(ExecuteRequest request) {
+        String resourceClass = request.getResourceClass() == null
+                ? ""
+                : request.getResourceClass().trim();
+        if (!"STANDARD".equals(resourceClass) && !"HEAVY".equals(resourceClass)) {
+            return "resourceClass";
+        }
+        int expectedUnits = "HEAVY".equals(resourceClass) ? 3 : 1;
+        long expectedMemoryBytes = "HEAVY".equals(resourceClass)
+                ? 1536L * 1024L * 1024L
+                : 512L * 1024L * 1024L;
+        if (request.getCapacityUnits() != expectedUnits) {
+            return "capacityUnits";
+        }
+        if (request.getMemoryLimitBytes() != expectedMemoryBytes) {
+            return "memoryLimitBytes";
+        }
+        if (request.getTimeoutMillis() <= 0L) {
+            return "timeoutMillis";
+        }
+        if (isBlank(request.getRequestFingerprint())) {
+            return "requestFingerprint";
+        }
+        if (isBlank(request.getCanonicalSpecSchemaVersion())
+                || !"sandbox_create_v1".equals(request.getCanonicalSpecSchemaVersion().trim())) {
+            return "canonicalSpecSchemaVersion";
+        }
+        if (isBlank(request.getRuntimeEnvironmentVersion())) {
+            return "runtimeEnvironmentVersion";
+        }
+        if (isBlank(request.getCodeHash())) {
+            return "codeHash";
+        }
+        if (isBlank(request.getImmutableDatasetSnapshotDigest())) {
+            return "immutableDatasetSnapshotDigest";
+        }
+        if (isBlank(request.getLibrariesDigest())) {
+            return "librariesDigest";
+        }
+        if (isBlank(request.getSandboxOptionsDigest())) {
+            return "sandboxOptionsDigest";
+        }
+        return null;
+    }
+
+    private static boolean isBlank(String value) {
+        return value == null || value.isBlank();
     }
 
     /**

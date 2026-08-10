@@ -50,7 +50,7 @@ class PythonSandboxGatewayServiceImplTest {
                           "capacity_units":3,
                           "operation_id":"run-1:call-1:1",
                           "request_fingerprint":"sha256:request",
-                          "memory_limit_bytes":1073741824,
+                          "memory_limit_bytes":1610612736,
                           "timeout_millis":30000,
                           "runtime_environment_version":"python-v1",
                           "canonical_spec_schema_version":"sandbox_create_v1",
@@ -78,7 +78,7 @@ class PythonSandboxGatewayServiceImplTest {
                 .setCapacityUnits(3)
                 .setOperationId("run-1:call-1:1")
                 .setRequestFingerprint("sha256:request")
-                .setMemoryLimitBytes(1073741824L)
+                .setMemoryLimitBytes(1536L * 1024L * 1024L)
                 .setTimeoutMillis(30000)
                 .setRuntimeEnvironmentVersion("python-v1")
                 .setCanonicalSpecSchemaVersion("sandbox_create_v1")

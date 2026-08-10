@@ -398,7 +398,8 @@ public class PythonSandboxTools {
             // config inventory); presence details stay in operator logs only.
             if (!allowLegacyWithoutCapacity) {
                 log.error("sandbox.create.wiringIncomplete: production refuses "
-                        + "Legacy create; capacityWiringPresent={}",
+                        + "Legacy create; capacityWiringPresent={}; "
+                        + "nonProductionSwitch=sandbox.create.allow-legacy-without-capacity",
                         dataIntenseWiringAvailable());
                 emitSandboxToolTotal(toolStartMs, "ERROR", "SANDBOX_CAPACITY_WIRING_INCOMPLETE");
                 return fail(
@@ -406,13 +407,14 @@ public class PythonSandboxTools {
                         "SANDBOX_CAPACITY_WIRING_INCOMPLETE",
                         "Python sandbox production wiring incomplete; "
                                 + "refuses Legacy create without capacity reservation "
-                                + "and operationId. Non-production fixtures may set "
-                                + "sandbox.create.allow-legacy-without-capacity=true "
+                                + "and operationId. Non-production fixtures must enable "
+                                + "the documented Legacy compatibility switches as a group "
                                 + "(no global capacity admission / no idempotent recovery).",
                         Map.of());
             }
             log.warn("sandbox.create.legacyWithoutCapacity: allow-legacy-without-capacity=true "
-                    + "(NON-PRODUCTION: no global capacity admission, no operationId recovery)");
+                    + "(NON-PRODUCTION: no global capacity admission, no operationId recovery; "
+                    + "must also enable companion Gateway/Python switches as a group)");
 
             long createStartMs = System.currentTimeMillis();
             installDebugRpcAttachments();
