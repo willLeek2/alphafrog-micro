@@ -327,6 +327,10 @@ class ToolJobFinalizerRetryableTest {
                 eq(AgentRunStatus.WAITING_TOOL_JOB));
         verify(anchorService).updateAnchorAndStatus(eq("run-bf"), any(ToolJobAnchor.class),
                 eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.WAITING_TOOL_JOB));
+        // task #115: shared atomic promote called exactly once with exact identity
+        verify(anchorService).promoteCasStatusToResumeReady(
+                eq("run-bf"), eq("run-bf:tc-bf:1"), eq("tc-bf"), eq(1), eq("task-bf"),
+                eq(0L), anyString());
         verify(resumeService).tryResume("run-bf");
     }
 

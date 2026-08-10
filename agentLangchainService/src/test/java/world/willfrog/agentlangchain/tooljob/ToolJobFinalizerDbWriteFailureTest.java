@@ -99,6 +99,10 @@ class ToolJobFinalizerDbWriteFailureTest {
         assertThat(capacityFake.transitionCount).isEqualTo(1);
         // Same reservation identity throughout
         assertThat(capacityFake.distinctReservationIds()).isEqualTo(1);
+        // task #115: shared atomic promote called exactly once with exact identity
+        verify(anchorService).promoteCasStatusToResumeReady(
+                eq("run-1"), eq("run-1:tc-1:1"), eq("tc-1"), eq(1), eq("task-1"),
+                eq(0L), anyString());
         verify(resumeService, times(1)).tryResume("run-1");
     }
 
