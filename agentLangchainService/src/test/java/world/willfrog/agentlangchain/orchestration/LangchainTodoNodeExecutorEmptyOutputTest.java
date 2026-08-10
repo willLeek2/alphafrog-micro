@@ -111,9 +111,10 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
     // ========== 不走 recovery 的场景 ==========
 
     @Test
-    void execute_shouldSkipRecoveryAndFailImmediatelyWhenToolSpecificationsNotEmpty() {
-        // 该 todo 配置了工具（toolSpecifications 非空） → 不走 recovery（避免消耗额外 LLM 调用）
-        QueueChatModel model = new QueueChatModel("   ");
+    void execute_shouldRecoverWhenToolSpecsPresentButNoToolActuallyStarted() {
+        // D10 fix: 工具规范非空但当前 attempt 无实际工具执行 → 仍应走 recovery。
+        // 旧语义是"有 toolSpec 就不恢复"，生产默认总有工具，导致 recovery 永远不可达。
+        QueueChatModel model = new QueueChatModel("   ", "RECOVERED_ANSWER");
         LangchainTodoNodeExecutor executor = LangchainTestFixtures.todoNodeExecutor();
 
         LangchainLinearWorkflowRequest request = LangchainLinearWorkflowRequest.builder()
@@ -132,11 +133,34 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
         LangchainTodoNodeResult result = executor.execute(
                 request, item, Collections.emptyList(), new LinkedHashMap<>(), toolCalls);
 
-        assertThat(result.isSuccess()).isFalse();
-        assertThat(result.getFailureReason()).isEqualTo("empty_todo_output:todo_4");
-        assertThat(result.getFailureMetadata().get("recovery_attempted")).isEqualTo(false);
-        assertThat(result.getFailureMetadata().get("recovery_outcome")).isEqualTo("not_attempted");
-        assertThat(model.requests()).hasSize(1); // 只发了一次 LLM
+        // tool spec 非空，但 beforeToolExecution 从未被调用（模型直接返回空）→ 应恢复
+        assertThat(result.isSuccess()).isTrue();
+        assertThat(result.isRecovered()).isTrue();
+        assertThat(result.getRecoveryOutcome()).isEqualTo("success");
+        assertThat(result.getOutput()).isEqualTo("RECOVERED_ANSWER");
+        assertThat(model.requests()).hasSize(2); // 两次 LLM 调用（原始 + recovery）
+    }
+
+    @Test
+    void execute_shouldSkipRecoveryWhenCurrentAttemptToolAlreadyStarted() {
+        // D10 fix: 当前 attempt 已有工具执行证据 → 不得恢复。
+        // 共享 toolCalls 计数器被另一个并行 todo 增加，但当前 attempt 的本地
+        // currentAttemptToolStarted 为 false → 仍应恢复（证明没有退回共享 counter delta）。
+        QueueChatModel model = new QueueChatModel("   ", "RECOVERED_ANSWER");
+        LangchainTodoNodeExecutor executor = LangchainTestFixtures.todoNodeExecutor();
+
+        LangchainLinearWorkflowRequest request = baseRequest(model);
+        TodoItem item = todo("todo_parallel", 1, "分析");
+        // 模拟另一个并行 todo 增加了共享计数器，但当前 attempt 没执行工具
+        AtomicInteger toolCalls = new AtomicInteger(5);
+
+        LangchainTodoNodeResult result = executor.execute(
+                request, item, Collections.emptyList(), new LinkedHashMap<>(), toolCalls);
+
+        // 共享 counter 不应影响恢复判断 → 当前 attempt 没工具证据 → 仍恢复
+        assertThat(result.isSuccess()).isTrue();
+        assertThat(result.isRecovered()).isTrue();
+        assertThat(model.requests()).hasSize(2);
     }
 
     @Test
@@ -165,6 +189,8 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
         assertThat(result.getFailureReason()).isEqualTo("empty_todo_output:todo_5");
         assertThat(result.getFailureMetadata().get("budget_hit")).isEqualTo(true);
         assertThat(result.getFailureMetadata().get("recovery_outcome")).isEqualTo("not_attempted");
+        assertThat(result.getFailureMetadata().get("recovery_skip_reason")).isEqualTo("budget_near_limit");
+        assertThat(result.getFailureMetadata().get("current_attempt_had_tool_evidence")).isEqualTo(false);
         assertThat(model.requests()).hasSize(1);
     }
 
