@@ -220,7 +220,7 @@ public class LangchainTodoNodeExecutor {
      * </ul>
      * <p>
      * 注意：{@code toolCalls} 是上游传入的引用，本方法在 tool loop 的 {@code afterToolExecution} 回调里对其进行 increment，
-     * 因此调用前后差值即为当前 todo 实际消耗的工具调用次数。
+     * 共享计数器差值仅用于结果统计，绝不能作为当前 todo 的工具执行证据或恢复判断门闩；恢复只看本地 per-attempt 信号。
      *
      * @param request      当前 run 的完整请求上下文（含模型、用户目标、runId 等）
      * @param item         待执行的 todo 节点
@@ -276,7 +276,7 @@ public class LangchainTodoNodeExecutor {
             AgentContext.clearPythonRefineAttempt();
             AgentContext.clearPythonRepairContext();
         }
-        // 记录 tool loop 开始前的计数，执行后用差值算出当前 todo 实际消耗的 tool call 次数
+        // 记录 tool loop 开始前的共享计数，差值仅用于结果统计，不作为工具执行证据
         int callsBefore = toolCalls.get();
         // 把 datasetRefs 注入到 ThreadLocal 上下文中，让工具执行时能读取上游节点产生的数据引用
         LangchainDatasetRefContext.set(datasetRefs);
@@ -450,6 +450,13 @@ public class LangchainTodoNodeExecutor {
         try {
             recoveredOutput = buildRecoveryAiService(request).execute(userMessage + RECOVERY_HINT);
         } catch (Exception recEx) {
+            // 取消/挂起/预算终止等控制信号必须原样向上传播，不能被改写成 recovery 失败文本。
+            if (LangchainTerminalToolErrorHandler.isTerminalSignal(recEx)) {
+                if (recEx instanceof RuntimeException re) {
+                    throw re;
+                }
+                throw new IllegalStateException("terminal signal in recovery", recEx);
+            }
             recoveredOutput = null;
             recoveryOutcome = "exception";
             log.warn("empty_todo_output recovery exception for todo={} (runId={}): {}",

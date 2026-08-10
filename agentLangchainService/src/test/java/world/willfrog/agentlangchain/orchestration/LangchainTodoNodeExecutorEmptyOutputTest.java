@@ -25,21 +25,26 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 /**
- * ccmax #59: empty_todo_output 安全 recovery + 结构化观测的单测。
+ * empty_todo_output 安全 recovery + 结构化观测的单测。
  *
  * <p>覆盖以下关键路径：
  * <ul>
- *   <li>无工具 todo（toolSpecifications 为空）→ 第一次 LLM 返回空 → 触发 recovery</li>
+ *   <li>当前 attempt 无工具执行证据 → 第一次 LLM 返回空 → 触发一次无工具 recovery（与 toolSpecifications 非空无关）</li>
+ *   <li>当前 attempt 已有工具执行证据 → 第一次 LLM 返回空 → <b>不</b>走 recovery（直接失败）</li>
  *   <li>recovery 成功 → success(recovered=true, recovery_outcome=success)</li>
  *   <li>recovery 仍空 → failure(reason=empty_todo_output_after_recovery, recovery_outcome=still_blank)</li>
- *   <li>recovery 抛异常 → failure(reason=empty_todo_output_after_recovery, recovery_outcome=exception)</li>
- *   <li>有工具 todo（toolSpecifications 非空）→ 第一次 LLM 返回空 → <b>不</b>走 recovery（直接失败）</li>
+ *   <li>recovery 抛普通 LLM 异常 → failure(recovery_outcome=exception)；控制信号原样向上抛</li>
  *   <li>finish_reason 字段：null → "no_response"，"   " → "blank_after_trim"</li>
  *   <li>MF6: last_non_empty_todo_id = 已完成 todo 中最后一个非空 id</li>
  *   <li>MF1: stage / todoId / model 在 try 块外捕获，不受 finally 清 ThreadLocal 影响</li>
+ *   <li>并行 todo 增加共享 toolCalls 计数器不影响当前 attempt 的恢复判断</li>
  * </ul>
  */
 class LangchainTodoNodeExecutorEmptyOutputTest {
+
+    private final AgentRunBudgetService budgetService = mock(AgentRunBudgetService.class);
+    private final world.willfrog.agent.platform.service.AgentRunStateStore stateStore =
+            mock(world.willfrog.agent.platform.service.AgentRunStateStore.class);
 
     @AfterEach
     void cleanup() {
@@ -142,25 +147,126 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
     }
 
     @Test
-    void execute_shouldSkipRecoveryWhenCurrentAttemptToolAlreadyStarted() {
-        // D10 fix: 当前 attempt 已有工具执行证据 → 不得恢复。
-        // 共享 toolCalls 计数器被另一个并行 todo 增加，但当前 attempt 的本地
-        // currentAttemptToolStarted 为 false → 仍应恢复（证明没有退回共享 counter delta）。
-        QueueChatModel model = new QueueChatModel("   ", "RECOVERED_ANSWER");
-        LangchainTodoNodeExecutor executor = LangchainTestFixtures.todoNodeExecutor();
+    void execute_shouldSkipRecoveryWhenToolAlreadyExecutedBeforeEmptyOutput() {
+        // D10: 当前 attempt 先返回 ToolExecutionRequest（触发 beforeToolExecution → tool started），
+        // 再返回空白 → 不得恢复。
+        var model = new ScriptedChatModel(
+                dev.langchain4j.data.message.AiMessage.from(
+                        dev.langchain4j.agent.tool.ToolExecutionRequest.builder()
+                                .id("call-1")
+                                .name("getIndexDaily")
+                                .arguments("{}")
+                                .build()),
+                dev.langchain4j.data.message.AiMessage.from("   "));
+        var toolProvider = new dev.langchain4j.service.tool.ToolProvider() {
+            @Override
+            public dev.langchain4j.service.tool.ToolProviderResult provideTools(
+                    dev.langchain4j.service.tool.ToolProviderRequest request) {
+                return new dev.langchain4j.service.tool.ToolProviderResult(
+                        java.util.Map.of(
+                                dev.langchain4j.agent.tool.ToolSpecification.builder()
+                                        .name("getIndexDaily")
+                                        .build(),
+                                (dev.langchain4j.service.tool.ToolExecutor) (toolRequest, memoryId) ->
+                                        "{\"ok\":true,\"data\":[]}"));
+            }
+        };
 
-        LangchainLinearWorkflowRequest request = baseRequest(model);
-        TodoItem item = todo("todo_parallel", 1, "分析");
-        // 模拟另一个并行 todo 增加了共享计数器，但当前 attempt 没执行工具
-        AtomicInteger toolCalls = new AtomicInteger(5);
+        LangchainTodoNodeExecutor executor = LangchainTestFixtures.todoNodeExecutor(
+                java.util.Optional.of(toolProvider));
+
+        LangchainLinearWorkflowRequest request = LangchainLinearWorkflowRequest.builder()
+                .runId("run-1")
+                .userId("user-1")
+                .userGoal("分析指数")
+                .model(model)
+                .toolSpecifications(List.of(
+                        dev.langchain4j.agent.tool.ToolSpecification.builder()
+                                .name("getIndexDaily")
+                                .build()))
+                .maxToolRoundTrips(2)
+                .build();
+        TodoItem item = todo("todo_tool_evidence", 1, "调用工具");
+        AtomicInteger toolCalls = new AtomicInteger();
 
         LangchainTodoNodeResult result = executor.execute(
                 request, item, Collections.emptyList(), new LinkedHashMap<>(), toolCalls);
 
-        // 共享 counter 不应影响恢复判断 → 当前 attempt 没工具证据 → 仍恢复
+        // 工具确实执行了一次，然后模型返回空白 → 不恢复，直接失败
+        assertThat(result.isSuccess()).isFalse();
+        assertThat(result.getFailureReason()).isEqualTo("empty_todo_output:todo_tool_evidence");
+        assertThat(result.getFailureMetadata().get("recovery_attempted")).isEqualTo(false);
+        assertThat(result.getFailureMetadata().get("recovery_outcome")).isEqualTo("not_attempted");
+        assertThat(result.getFailureMetadata().get("current_attempt_had_tool_evidence")).isEqualTo(true);
+        assertThat(result.getFailureMetadata().get("recovery_skip_reason")).isEqualTo("current_attempt_tool_already_executed");
+        assertThat(model.requests()).hasSize(2); // 第一次 tool request + tool result 后的第二次空白
+        assertThat(toolCalls.get()).isEqualTo(1);
+    }
+
+    @Test
+    void execute_shouldStillRecoverWhenParallelTodoIncreasesSharedCounter() {
+        // D10: 并行 todo 增加了共享 toolCalls，但当前 attempt 没执行工具 → 仍应恢复。
+        // 证明没有用共享计数器差值替代 per-attempt 信号。
+        AtomicInteger toolCalls = new AtomicInteger(5); // 并行 todo 已增加计数
+        // 在第一次 LLM 调用时再由"并行方"增加一次，模拟两方同时执行
+        var model = new CallbackChatModel("   ", "RECOVERED_ANSWER") {
+            @Override
+            public dev.langchain4j.model.chat.response.ChatResponse doChat(
+                    dev.langchain4j.model.chat.request.ChatRequest request) {
+                if (requests().isEmpty()) {
+                    toolCalls.incrementAndGet(); // 并行 todo 又增加了一次
+                }
+                return super.doChat(request);
+            }
+        };
+        LangchainTodoNodeExecutor executor = LangchainTestFixtures.todoNodeExecutor();
+
+        LangchainLinearWorkflowRequest request = baseRequest(model);
+        TodoItem item = todo("todo_parallel", 1, "分析");
+        int callsBefore = toolCalls.get();
+
+        LangchainTodoNodeResult result = executor.execute(
+                request, item, Collections.emptyList(), new LinkedHashMap<>(), toolCalls);
+
+        // 共享计数被并行 todo 改变，但当前 attempt 无工具证据 → 仍恢复
         assertThat(result.isSuccess()).isTrue();
         assertThat(result.isRecovered()).isTrue();
-        assertThat(model.requests()).hasSize(2);
+        assertThat(model.requests()).hasSize(2); // 原始 + recovery，恰好 2 次
+        // 并行 todo 确实增加了共享计数，且原始+recovery 都没执行工具 → 差值即 callback 增加的 1
+        assertThat(toolCalls.get() - callsBefore).isEqualTo(1);
+    }
+
+    // ========== 取消不被 recovery 吞掉 ==========
+
+    @Test
+    void execute_shouldNotSwallowCancelDuringRecovery() {
+        // D10: 用户在第一次空白与 recovery 请求之间取消 →
+        // RUN_INTERRUPTED 必须原样向上抛，不能被改写成 empty_todo_output_after_recovery。
+        LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
+        // 前两次 check（execute 入口 + 第一次 chatRequestTransformer）→ 可运行
+        when(guard.stopReason("run-1", "user-1"))
+                .thenReturn(java.util.Optional.empty())
+                .thenReturn(java.util.Optional.empty())
+                // 第三次 check（recovery 的 chatRequestTransformer）→ 已取消
+                .thenReturn(java.util.Optional.of("CANCEL_REQUESTED"));
+        ObjectProvider<dev.langchain4j.service.tool.ToolProvider> provider = emptyToolProvider();
+        LangchainTodoNodeExecutor executor = new LangchainTodoNodeExecutor(
+                LangchainTestFixtures.promptService(), provider, guard, budgetService, stateStore,
+                LangchainTestFixtures.noopFinanceResultComposer());
+
+        QueueChatModel model = new QueueChatModel("   ");
+        LangchainLinearWorkflowRequest request = baseRequest(model);
+        TodoItem item = todo("todo_cancel", 1, "分析");
+        AtomicInteger toolCalls = new AtomicInteger();
+
+        LangchainTodoNodeResult result = executor.execute(
+                request, item, Collections.emptyList(), new LinkedHashMap<>(), toolCalls);
+
+        // 取消信号被保留，没有被 recovery 异常分支吞掉
+        assertThat(result.isSuccess()).isFalse();
+        assertThat(result.getFailureReason()).contains("RUN_INTERRUPTED:CANCEL_REQUESTED");
+        assertThat(result.getFailureReason()).doesNotContain("empty_todo_output");
+        assertThat(model.requests()).hasSize(1); // 只发了一次 LLM，recovery 被阻止
     }
 
     @Test
@@ -420,6 +526,38 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
 
         List<ChatRequest> requests() {
             return requests;
+        }
+    }
+
+    /**
+     * ChatModel 按照预置的 AiMessage 列表顺序返回（支持 ToolExecutionRequest）。
+     * 用于测试 tool-request → blank 的流程。
+     */
+    static class ScriptedChatModel implements ChatModel {
+        private final List<AiMessage> messages;
+        private final List<ChatRequest> requests = new ArrayList<>();
+        private int index;
+
+        ScriptedChatModel(AiMessage... messages) {
+            this.messages = List.of(messages);
+        }
+
+        @Override
+        public ChatResponse doChat(ChatRequest request) {
+            requests.add(request);
+            AiMessage msg = index < messages.size() ? messages.get(index++) : AiMessage.from("");
+            return ChatResponse.builder().aiMessage(msg).build();
+        }
+
+        List<ChatRequest> requests() { return requests; }
+    }
+
+    /**
+     * 可被子类覆写 doChat 的 QueueChatModel，用于在 LLM 调用时注入副作用（如模拟并行 todo 增加共享计数器）。
+     */
+    static class CallbackChatModel extends QueueChatModel {
+        CallbackChatModel(String... responses) {
+            super(responses);
         }
     }
 }
