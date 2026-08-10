@@ -2,7 +2,7 @@
 
 本文面向需要接入、排障或维护 Agent Run 的开发者。它解释当前系统为什么分成六层、一次运行怎样经过这些层，以及 `executePython` 这类长任务如何在进程重启后继续收口。
 
-本文只描述已经进入代码的能力，不把计划中的功能写成现状。内容最后按本地集成提交 `b77e1126ba514f4dcfac928ae206e0e17f599aa2` 核对。修改本文列出的核心类或状态字段时，应在同一个变更中更新本文和相关 API 页面。
+本文只描述已经进入代码的能力，不把计划中的功能写成现状。内容最后按本地生产提交 `b4bcae05d3405b39a1c98fcd995c67fc3f4b3f3e` 核对。修改本文列出的核心类或状态字段时，应在同一个变更中更新本文和相关 API 页面。
 
 如果只想调用接口，先看[认证与运行生命周期](../agent-run/auth-and-lifecycle.md)。如果正在处理断线重连或排障，再配合阅读 [SSE 事件流](../agent-run/sse-stream.md)和[查询与观测接口](../agent-run/reads-and-observability.md)。
 
@@ -125,10 +125,11 @@ Todo 调用 executePython
 
 所有关键推进都使用数据库 compare-and-set（比较旧值后才更新，简称 CAS）。旧 worker、重复回调或另一台实例如果持有过期 token/version，只能得到更新行数为 0，不能覆盖新状态。
 
-Redis 只保存 pending/due 加速索引和热副本。大多数仍处于等待、收尾或恢复交接的 anchor，
-可以在 Redis 丢失后由启动恢复和周期补扫从 PostgreSQL 重建索引；因此“Redis 里没有 due 项”
-不能单独证明任务已经丢失或完成。当前仍有一个下面会单列的例外：Run 已写成 `RECEIVED`、
-`finalizerStep=CAS_STATUS`，但 `resumeState` 还为空时，现有 PostgreSQL 查询不会重新选中它。
+Redis 只保存 pending/due 加速索引和热副本。仍处于等待、收尾或恢复交接的 anchor，可以在
+Redis 丢失后由启动恢复和周期补扫从 PostgreSQL 重建索引；因此“Redis 里没有 due 项”不能
+单独证明任务已经丢失或完成。Run 已写成 `RECEIVED`、`finalizerStep=CAS_STATUS`，但
+`resumeState` 仍为空的半完成状态，也有专门的 PostgreSQL 补扫和原子推进路径，不再依赖
+原进程留下的 Redis due 索引。
 
 ## 六、终态为什么要分步收口
 
@@ -141,12 +142,14 @@ Sandbox 返回终态后，`ToolJobFinalizer` 不会一次性做完所有副作�
 5. `CAS_STATUS`：把 Run 从 `WAITING_TOOL_JOB` 原子推进到 `RECEIVED`；
 6. `RESUME_READY`：生成新恢复 token 和 lease version，把 anchor 置为 `READY`。
 
-大多数步骤之间发生进程退出时，下一次补扫会从第一个未完成步骤继续。当前有一个已知空窗：
-`CAS_STATUS` 先把 Run 写成 `RECEIVED`，下一条独立数据库更新才写 `RESUME_READY`。如果进程
-恰好在两次更新之间退出，而且 Redis due 索引也不可用，数据库会留下
-`RECEIVED + finalizerStep=CAS_STATUS + resumeState 为空`；现有 PostgreSQL 补扫不会选中这条
-记录，不能承诺它会自动恢复。容量释放出现“此前已经释放”会被当作幂等成功，但身份不一致、
-用量钩子未装配或终态分类缺失会阻止后续步骤，不能为了让 Run 看起来结束而跳过账本与事件。
+步骤之间发生进程退出时，下一次补扫会从第一个未完成步骤继续。第五步与第六步之间仍是两条
+数据库更新，但系统会专门发现
+`RECEIVED + finalizerStep=CAS_STATUS + resumeState 为空`。正常 finalizer 与后台补扫共同调用
+同一条原子推进语句：它同时核对 Run 状态、步骤、空恢复状态、operationId、toolCallId、attempt、
+taskId 和读取时的 lease version，只合并写入五个恢复字段。只有更新一行的竞争者才能重新读取
+已经落库的 READY anchor、重建 Redis 提醒并启动恢复；其他竞争者不会覆盖 token，也不会启动
+第二个 worker。容量释放出现“此前已经释放”会被当作幂等成功，但身份不一致、数值损坏、用量
+钩子未装配或终态分类缺失会阻止后续步骤，不能为了让 Run 看起来结束而跳过账本与事件。
 
 上面六步是“工具正常收尾后继续原 Run”的主线。实现中的步骤顺序还定义了第七个
 `CANCELED` 标记，但它不是每次收尾都执行：当 Run 已经进入取消流程时，前四步仍先保存
@@ -167,16 +170,18 @@ Sandbox 返回终态后，`ToolJobFinalizer` 不会一次性做完所有副作�
 
 - 每 **5 秒**执行一次 due 扫描：从 Redis 取最多 20 个到期 Run，逐个从 PostgreSQL 重新读取
   最新 anchor，再查询 Sandbox 或继续 finalizer。Redis 在这里提供低延迟，不决定真实状态。
-- 每 **60 秒**执行一次 PostgreSQL 补扫：重建丢失的 Redis pending/due 索引，并单独扫描
-  `RECEIVED + READY`、租约过期的 `RECEIVED + LAUNCHING`，以及结果已被工作流接受、结果消费
-  标记已经持久化、但恢复 worker 的租约已过期的 `EXECUTING + ACCEPTED`。最后一种情况用于
-  接管“工作流已接收长工具结果，原恢复 worker 随后退出”的交接。
+- 每 **60 秒**执行一次 PostgreSQL 补扫：重建丢失的 Redis pending/due 索引，并分别扫描
+  `RECEIVED + READY`、租约过期的 `RECEIVED + LAUNCHING`、结果已被工作流接受且消费标记已经
+  持久化但恢复 worker 租约已过期的 `EXECUTING + ACCEPTED`，以及
+  `RECEIVED + CAS_STATUS + resumeState 为空`。最后一种扫描只接纳身份字段完整、attempt 与
+  lease version 在合法数值范围内的记录，避免损坏的老记录占满每批 20 条，让后面的合法记录
+  永远得不到处理。
 
 这两个周期不能合成一句“每 5 秒恢复”。5 秒循环只处理已经进入 due 索引的任务；60 秒循环
 负责从数据库找回符合其查询条件、但因为 Redis 丢失、过期或进程重启而不再出现在热索引中的
 任务。两条路径最终都必须重新通过数据库 CAS 和恢复租约，扫描频率本身不会赋予旧 worker
-所有权。上面列出的 `RECEIVED + CAS_STATUS + resumeState 为空` 当前不符合任一补扫条件，
-值班人员不能只等待下一个 60 秒周期。
+所有权。半完成的 `CAS_STATUS` 记录会在 60 秒补扫中尝试推进；如果它持续存在，应检查身份字段、
+attempt、lease version 和原子更新日志，而不是手工把任意 `RECEIVED` Run 改成 READY。
 
 ## 七、幂等、取消和重启的关键规则
 
@@ -214,8 +219,9 @@ Sandbox 返回终态后，`ToolJobFinalizer` 不会一次性做完所有副作�
 2. `operationId`、`taskId`、`toolCallId`、attempt 和 checkpointVersion 是否属于同一轮；
 3. reservation 是 `PREPARING`、`TASK_ATTACHED`、`PENDING_TRANSFERRED`、`TERMINAL_CONFIRMED` 还是 `RELEASED`；
 4. Sandbox 是否已经终态，但 `finalizerStep` 仍停在 `ENVELOPE`、`RELEASE`、`USAGE`、`EVENT`
-   或 `CAS_STATUS`；若 Run 已是 `RECEIVED`、步骤是 `CAS_STATUS` 且 `resumeState` 为空，当前不能
-   靠普通 PostgreSQL 补扫自动继续，需要按已知恢复空窗处理；
+   或 `CAS_STATUS`；若 Run 已是 `RECEIVED`、步骤是 `CAS_STATUS` 且 `resumeState` 为空，先确认
+   60 秒 PostgreSQL 补扫是否发现它，再检查 operationId、toolCallId、attempt、taskId 与 lease
+   version 是否完整且在合法范围内，以及原子推进是否因竞争失败或持久化记录漂移而返回 0；
 5. `resumeState`、token、leaseVersion、launcher owner 和 leaseUntil 是否停在 `READY`、
    `LAUNCHING` 或 `ACCEPTED`；对于 `ACCEPTED`，还要检查结果消费标记、Run 是否为
    `EXECUTING` 以及数据库租约是否已经过期，判断是否满足接管条件；
@@ -293,8 +299,8 @@ Spring 终态事件不是持久消息，所以系统还用 `WorkspacePollingObse
 
 - 真实 PostgreSQL 下的跨实例并发 CAS 和故障恢复；
 - 真实 Redis 丢失、过期和恢复扫描；
-- `CAS_STATUS` 已写入、`RESUME_READY` 尚未写入且 Redis due 同时不可用时，PostgreSQL 补扫
-  当前不会自动找回这条恢复交接；
+- `CAS_STATUS` 已写入、`RESUME_READY` 尚未写入且 Redis due 同时不可用时，真实 PostgreSQL
+  补扫与两实例同时竞争同一记录的行为；宿主机测试只验证了查询、参数绑定和胜负分支；
 - 真实容器中的 marker、进程组取消和资源用量回传；
 - Java → Gateway → Python 的完整跨服务取消与恢复；
 - 多进程共同使用文件型 artifact/workspace 存储时的竞争行为；
