@@ -7,6 +7,14 @@ import org.apache.ibatis.mapping.MappedStatement;
 import org.apache.ibatis.mapping.ParameterMapping;
 import org.apache.ibatis.mapping.SqlCommandType;
 import org.apache.ibatis.session.Configuration;
+import org.apache.ibatis.session.LocalCacheScope;
+import org.apache.ibatis.session.RowBounds;
+import org.apache.ibatis.session.ResultHandler;
+import org.apache.ibatis.session.defaults.DefaultSqlSession;
+import org.apache.ibatis.transaction.Transaction;
+import org.apache.ibatis.executor.BaseExecutor;
+import org.apache.ibatis.executor.BatchResult;
+import org.apache.ibatis.cursor.Cursor;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -15,8 +23,15 @@ import java.lang.reflect.Method;
 import java.lang.reflect.Parameter;
 import java.nio.file.Files;
 import java.nio.file.Paths;
+import java.sql.Connection;
+import java.sql.SQLException;
 import java.util.*;
 import java.util.stream.Collectors;
+
+import world.willfrog.agent.platform.dag.CancelResult;
+import world.willfrog.agent.platform.dag.ExhaustedAdvance;
+import world.willfrog.agent.platform.dag.RetryAdvance;
+import world.willfrog.agent.platform.dag.TerminalAdvance;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -30,11 +45,54 @@ class AgentRunDagNodeMapperBindingTest {
     private Set<String> xmlStatements;
     private Map<String, Set<String>> methodParams; // methodName -> @Param name set
 
-    @BeforeEach
-    void setUp() throws Exception {
-        configuration = new Configuration();
-        configuration.setMapUnderscoreToCamelCase(true);
-        configuration.addMapper(AgentRunDagNodeMapper.class);
+    // ===== SqlSession/Executor 测试支持 =====
+
+    /** 无操作事务，让 BaseExecutor 的 close/commit/rollback 不抛 NPE */
+    private static final Transaction NOOP_TX = new Transaction() {
+        @Override public Connection getConnection() { return null; }
+        @Override public void commit() {}
+        @Override public void rollback() {}
+        @Override public void close() {}
+        @Override public Integer getTimeout() { return null; }
+    };
+
+    /** 可控 Executor：返回预置的 Java 对象列表，绕过 JDBC 层，专用于验证 selectOne 零行→null / 一行→record */
+    static class ControlledExecutor extends BaseExecutor {
+        private final Map<String, List<?>> statementResults = new HashMap<>();
+
+        ControlledExecutor(Configuration configuration) {
+            super(configuration, NOOP_TX);
+        }
+
+        void setResults(String statementId, List<?> results) {
+            statementResults.put(statementId, results);
+        }
+
+        @Override public int doUpdate(MappedStatement ms, Object parameter) { return 0; }
+
+        @Override public <E> List<E> doQuery(MappedStatement ms, Object parameter,
+                                              RowBounds rowBounds, ResultHandler resultHandler,
+                                              BoundSql boundSql) {
+            List<?> results = statementResults.getOrDefault(ms.getId(), List.of());
+            @SuppressWarnings("unchecked")
+            List<E> typed = (List<E>) results;
+            return typed;
+        }
+
+        @Override public List<BatchResult> doFlushStatements(boolean isRollback) { return List.of(); }
+
+        @Override protected <E> Cursor<E> doQueryCursor(MappedStatement ms, Object parameter,
+                                                          RowBounds rowBounds, BoundSql boundSql) {
+            throw new UnsupportedOperationException("cursor not supported in test");
+        }
+    }
+
+    /** 构建包含 Mapper + XML 的 Configuration（可被 setUp 和 SqlSession 测试复用） */
+    private static Configuration buildConfiguration() throws Exception {
+        Configuration cfg = new Configuration();
+        cfg.setMapUnderscoreToCamelCase(true);
+        cfg.setLocalCacheScope(LocalCacheScope.STATEMENT);
+        cfg.addMapper(AgentRunDagNodeMapper.class);
 
         String xmlPath = System.getProperty("user.dir")
                 + "/../agentPlatformShared/src/main/resources/mapper/AgentRunDagNodeMapper.xml";
@@ -45,8 +103,14 @@ class AgentRunDagNodeMapperBindingTest {
             xmlPath = "mapper/AgentRunDagNodeMapper.xml";
             xml = new String(Resources.getResourceAsStream(xmlPath).readAllBytes());
         }
-        new XMLMapperBuilder(new StringReader(xml), configuration, xmlPath,
-                configuration.getSqlFragments()).parse();
+        new XMLMapperBuilder(new StringReader(xml), cfg, xmlPath,
+                cfg.getSqlFragments()).parse();
+        return cfg;
+    }
+
+    @BeforeEach
+    void setUp() throws Exception {
+        configuration = buildConfiguration();
 
         xmlStatements = new HashSet<>();
         for (MappedStatement ms : configuration.getMappedStatements()) {
@@ -291,9 +355,8 @@ class AgentRunDagNodeMapperBindingTest {
     }
 
     @Test
-    void returningRecordStatementsAreSelectNotUpdate() throws Exception {
-        // UPDATE...RETURNING 使用 <select> 标签，MyBatis selectOne 零行→null
-        // 确认所有 DML-returning statement 的 SqlCommandType 是 SELECT
+    void returningRecordStatementsAreSelectNotUpdate() {
+        // 静态前提：所有 DML-returning statement 的 SqlCommandType 是 SELECT 且有 resultMap
         for (String id : List.of("incrementCancelNotfoundRetryCount", "incrementCancelRpcRetryCount",
                 "atomicTerminalLost", "writePreparingStuck", "writeRpcExhausted",
                 "cancelFrontierAndChildrenCTE", "cancelFrontierAndChildrenCTE_resume")) {
@@ -301,10 +364,68 @@ class AgentRunDagNodeMapperBindingTest {
             assertThat(configuration.hasStatement(fullId)).isTrue();
             MappedStatement ms = configuration.getMappedStatement(fullId);
             assertThat(ms.getSqlCommandType())
-                    .as(id + " 必须是 SELECT（确保 selectOne 零行→null 语义）")
-                    .isEqualTo(SqlCommandType.SELECT);
-            assertThat(ms.getResultMaps()).as(id + " 必须有 resultMap（零行→null 的前提）")
-                    .isNotEmpty();
+                    .as(id + " 必须是 SELECT").isEqualTo(SqlCommandType.SELECT);
+            assertThat(ms.getResultMaps()).as(id + " 必须有 resultMap").isNotEmpty();
+        }
+    }
+
+    @Test
+    void returningMethodsReturnNullForZeroRowsAndRecordForOneRow() throws Exception {
+        // 用 ControlledExecutor 绕过 JDBC，实际验证 mapper.selectOne 的零行→null、一行→record 行为
+        Configuration cfg = buildConfiguration();
+        ControlledExecutor executor = new ControlledExecutor(cfg);
+
+        DefaultSqlSession session = new DefaultSqlSession(cfg, executor, false);
+        try {
+            AgentRunDagNodeMapper mapper = session.getMapper(AgentRunDagNodeMapper.class);
+
+            // ---- RetryAdvance（incrementCancelNotfoundRetryCount）----
+            String retryId = AgentRunDagNodeMapper.class.getName() + ".incrementCancelNotfoundRetryCount";
+            executor.setResults(retryId, List.of());
+            assertThat(mapper.incrementCancelNotfoundRetryCount(
+                    "run-1", 2, "node-1", 0, 30, "req-a", 1L))
+                    .as("RetryAdvance 零行应返回 null").isNull();
+
+            RetryAdvance expectedRetry = new RetryAdvance(1, 5L);
+            executor.setResults(retryId, List.of(expectedRetry));
+            assertThat(mapper.incrementCancelNotfoundRetryCount(
+                    "run-1", 2, "node-1", 0, 30, "req-a", 1L))
+                    .as("RetryAdvance 一行应返回对应 record").isEqualTo(expectedRetry);
+
+            // ---- ExhaustedAdvance（writePreparingStuck）----
+            String exhaustedId = AgentRunDagNodeMapper.class.getName() + ".writePreparingStuck";
+            executor.setResults(exhaustedId, List.of());
+            assertThat(mapper.writePreparingStuck("run-1", 2, "node-1", "req-a", 1L))
+                    .as("ExhaustedAdvance 零行应返回 null").isNull();
+
+            ExhaustedAdvance expectedExhausted = new ExhaustedAdvance(3L);
+            executor.setResults(exhaustedId, List.of(expectedExhausted));
+            assertThat(mapper.writePreparingStuck("run-1", 2, "node-1", "req-a", 1L))
+                    .as("ExhaustedAdvance 一行应返回对应 record").isEqualTo(expectedExhausted);
+
+            // ---- TerminalAdvance（atomicTerminalLost）----
+            String terminalId = AgentRunDagNodeMapper.class.getName() + ".atomicTerminalLost";
+            executor.setResults(terminalId, List.of());
+            assertThat(mapper.atomicTerminalLost("run-1", 2, "node-1", 5, "req-a", 1L))
+                    .as("TerminalAdvance 零行应返回 null").isNull();
+
+            TerminalAdvance expectedTerminal = new TerminalAdvance(7L);
+            executor.setResults(terminalId, List.of(expectedTerminal));
+            assertThat(mapper.atomicTerminalLost("run-1", 2, "node-1", 5, "req-a", 1L))
+                    .as("TerminalAdvance 一行应返回对应 record").isEqualTo(expectedTerminal);
+
+            // ---- CancelResult（cancelFrontierAndChildrenCTE）----
+            String cancelId = AgentRunDagNodeMapper.class.getName() + ".cancelFrontierAndChildrenCTE";
+            executor.setResults(cancelId, List.of());
+            assertThat(mapper.cancelFrontierAndChildrenCTE("run-1", 2, 1L, "2026-01-01", "req-a", 60))
+                    .as("CancelResult 零行应返回 null").isNull();
+
+            CancelResult expectedCancel = new CancelResult(true, 1, 3);
+            executor.setResults(cancelId, List.of(expectedCancel));
+            assertThat(mapper.cancelFrontierAndChildrenCTE("run-1", 2, 1L, "2026-01-01", "req-a", 60))
+                    .as("CancelResult 一行应返回对应 record").isEqualTo(expectedCancel);
+        } finally {
+            session.close();
         }
     }
 
@@ -341,28 +462,67 @@ class AgentRunDagNodeMapperBindingTest {
         MappedStatement ms = configuration.getMappedStatement(fullId);
         String sql = ms.getSqlSource().getBoundSql(Map.of()).getSql();
 
-        // 验证两组合法状态谓词完整存在（不是笛卡尔式交叉）
-        assertThat(sql)
-                .as("包含 RECEIVED + LAUNCHING + resultConsumed IS NOT TRUE 的完整配对")
-                .contains("RECEIVED")
-                .contains("LAUNCHING")
-                .contains("resultConsumed")
-                .contains("IS NOT TRUE");
+        // 1) 规范化：折叠空白、trim
+        String norm = sql.replaceAll("\\s+", " ").trim();
 
-        assertThat(sql)
-                .as("包含 EXECUTING + (LAUNCHING|ACCEPTED) + resultConsumed IS TRUE 的完整配对")
-                .contains("EXECUTING")
-                .contains("ACCEPTED")
-                .contains("IS TRUE");
+        // 2) 提取 frontier_result UPDATE 的 WHERE 子句
+        //    结构：WITH frontier_result AS ( UPDATE ... SET ... WHERE ... RETURNING 1 ), child_marked AS (
+        int frontierStart = norm.indexOf("frontier_result AS (");
+        assertThat(frontierStart).as("SQL 应包含 frontier_result CTE").isNotNegative();
+        int returnIdx = norm.indexOf("RETURNING 1", frontierStart);
+        assertThat(returnIdx).as("frontier_result 应有 RETURNING 1").isNotNegative();
+        String frontierBlock = norm.substring(frontierStart, returnIdx);
 
-        // 验证 resume lease triple fence 在 frontier_result UPDATE 的 WHERE 中
-        assertThat(sql).as("resumeToken fence").contains("resumeToken");
-        assertThat(sql).as("resumeLauncherOwnerId fence").contains("resumeLauncherOwnerId");
-        assertThat(sql).as("resumeLeaseVersion fence").contains("resumeLeaseVersion");
+        int whereIdx = frontierBlock.indexOf("WHERE");
+        assertThat(whereIdx).as("frontier_result UPDATE 应有 WHERE 子句").isNotNegative();
+        String whereClause = frontierBlock.substring(whereIdx);
 
-        // 验证两组 OR 结构存在（不是笛卡尔式 IN 列表）
-        assertThat(sql).as("应使用 OR 连接两组配对条件而非笛卡尔式 IN")
-                .contains("OR");
+        // 3) 谓词组一完整结构：status = 'RECEIVED' AND resumeState = 'LAUNCHING' AND resultConsumed IS NOT TRUE
+        assertThat(whereClause)
+                .as("谓词组一应完整：status='RECEIVED' + resumeState='LAUNCHING' + resultConsumed IS NOT TRUE，三条件用 AND 连接")
+                .containsPattern(
+                        "status\\s*=\\s*'RECEIVED'"
+                        + ".*resumeState.*'LAUNCHING'"
+                        + ".*resultConsumed.*IS\\s+NOT\\s+TRUE");
+
+        // 4) 谓词组二完整结构：status = 'EXECUTING' AND resumeState IN ('LAUNCHING','ACCEPTED') AND resultConsumed IS TRUE
+        assertThat(whereClause)
+                .as("谓词组二应完整：status='EXECUTING' + resumeState IN (LAUNCHING,ACCEPTED) + resultConsumed IS TRUE，三条件用 AND 连接")
+                .containsPattern(
+                        "status\\s*=\\s*'EXECUTING'"
+                        + ".*resumeState.*IN\\s*\\(\\s*'LAUNCHING'\\s*,\\s*'ACCEPTED'\\s*\\)"
+                        + ".*resultConsumed.*IS\\s+TRUE");
+
+        // 5) 两组之间用 OR 连接（非 AND），且包裹在同一对外层括号内
+        int group1End = whereClause.indexOf("IS NOT TRUE)") + "IS NOT TRUE)".length();
+        int group2Start = whereClause.indexOf("(status = 'EXECUTING'");
+        assertThat(group1End).as("group1 结束位置应在 group2 之前").isLessThan(group2Start);
+        assertThat(whereClause.substring(group1End, group2Start).trim())
+                .as("group1 和 group2 之间应由 OR 连接，不能是 AND")
+                .isEqualTo("OR");
+
+        // 外层结构：AND ( (group1) OR (group2) ) AND tool_job_anchor_json — 锁住两组和 fence 在同一 WHERE
+        int outerOpen = whereClause.indexOf("AND ( (status = 'RECEIVED'");
+        int outerClose = whereClause.indexOf(") ) AND tool_job_anchor_json");
+        assertThat(outerOpen).as("外层应形如 AND ( (group1...").isNotNegative();
+        assertThat(outerClose).as("外层应形如 ...group2) ) AND tool_job_anchor_json")
+                .isNotNegative()
+                .isGreaterThan(outerOpen);
+
+        // 6) 三项 identity fence 均在 frontier_result 的 WHERE 子句中
+        assertThat(whereClause).as("resumeToken fence 应在 frontier_result WHERE 中")
+                .contains("'{resumeToken}'");
+        assertThat(whereClause).as("resumeLauncherOwnerId fence 应在 frontier_result WHERE 中")
+                .contains("'{resumeLauncherOwnerId}'");
+        assertThat(whereClause).as("resumeLeaseVersion fence 应在 frontier_result WHERE 中")
+                .contains("'{resumeLeaseVersion}'");
+
+        // 7) 三个 fence 在 WHERE 中的顺序：resumeToken → resumeLauncherOwnerId → resumeLeaseVersion
+        int tokenPos = whereClause.indexOf("'{resumeToken}'");
+        int ownerPos = whereClause.indexOf("'{resumeLauncherOwnerId}'");
+        int leasePos = whereClause.indexOf("'{resumeLeaseVersion}'");
+        assertThat(tokenPos).as("resumeToken 位置").isLessThan(ownerPos);
+        assertThat(ownerPos).as("resumeLauncherOwnerId 位置").isLessThan(leasePos);
     }
 
     @Test
