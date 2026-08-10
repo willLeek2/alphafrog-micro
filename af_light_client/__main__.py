@@ -17,6 +17,7 @@ from .config import LightClientConfig
 from .debug import DebugRunLogger, TuiBatchSnapshotWriter
 from .events import RunViewState, final_answer_from_result, is_terminal
 from .http_client import AgentHttpClient, WarningStore
+from .recovery import AgentStreamRecovery
 from .render import TerminalRenderer
 
 
@@ -94,34 +95,60 @@ def main() -> int:
         warnings.add(f"run created: {run_id}")
         _render(args, renderer, snapshot_renderer, tui_snapshots, state, warnings, state_lock=state_lock)
         snapshot_loop.start()
-
-        for frame in client.stream_events(cfg.stream_endpoint_template, run_id):
-            parsed = frame.parsed_data()
-            debug.log_sse_frame(frame, parsed)
-            with state_lock:
-                state.ingest_sse(frame.event_type, parsed)
-                _copy_warnings(state, warnings)
-            if args.no_tui:
+        recovery = AgentStreamRecovery(
+            client,
+            events_endpoint_template=cfg.events_endpoint_template,
+            status_endpoint_template=cfg.status_endpoint_template,
+            run_id=run_id,
+            state=state,
+            warnings=warnings,
+            state_lock=state_lock,
+        )
+        resume_after_seq = 0
+        while True:
+            recovery.reconnect_requested = False
+            for frame in client.stream_events(
+                cfg.stream_endpoint_template,
+                run_id,
+                after_seq=resume_after_seq,
+            ):
+                parsed = frame.parsed_data()
+                debug.log_sse_frame(frame, parsed)
+                recovery.ingest_sse(frame.event_type, parsed)
                 with state_lock:
-                    trace = state.snapshot().trace
-                _print_event_line(frame.event_type, trace)
-            now = time.monotonic()
-            if now - last_render >= cfg.refresh_seconds:
-                _render(
-                    args,
-                    renderer,
-                    snapshot_renderer,
-                    tui_snapshots,
-                    state,
-                    warnings,
-                    state_lock=state_lock,
-                    monotonic_now=now,
-                )
-                last_render = now
+                    _copy_warnings(state, warnings)
+                if args.no_tui:
+                    with state_lock:
+                        trace = state.snapshot().trace
+                    _print_event_line(frame.event_type, trace)
+                now = time.monotonic()
+                if now - last_render >= cfg.refresh_seconds:
+                    _render(
+                        args,
+                        renderer,
+                        snapshot_renderer,
+                        tui_snapshots,
+                        state,
+                        warnings,
+                        state_lock=state_lock,
+                        monotonic_now=now,
+                    )
+                    last_render = now
+                with state_lock:
+                    snap = state.snapshot()
+                if is_terminal(snap.status) or recovery.degraded_large_run or recovery.reconnect_requested:
+                    break
+
             with state_lock:
-                snap = state.snapshot()
-            if is_terminal(snap.status):
+                terminal = is_terminal(state.snapshot().status)
+            if terminal:
                 break
+            if recovery.degraded_large_run:
+                recovery.recover_degraded_large_run_once()
+            if recovery.reconnect_requested:
+                resume_after_seq = recovery.confirmed_cursor
+                continue
+            break
 
     except KeyboardInterrupt:
         interrupted = True

@@ -15,6 +15,7 @@ public record AgentRunStatusResponse(
         Boolean observabilityFullAvailable,
         Integer totalCreditsConsumed,
         Integer eventCount,
+        Integer lastSeq,
         Long startedAtMs,
         Long completedAtMs,
         Long elapsedMs

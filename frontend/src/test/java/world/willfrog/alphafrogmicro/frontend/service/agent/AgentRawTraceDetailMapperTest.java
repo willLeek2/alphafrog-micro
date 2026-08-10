@@ -8,7 +8,11 @@ import java.util.Base64;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.when;
 
 class AgentRawTraceDetailMapperTest {
 
@@ -100,5 +104,37 @@ class AgentRawTraceDetailMapperTest {
         assertFalse(combined.contains("plain-password"));
         assertFalse(combined.contains("ya29_tool_secret"));
         assertTrue(combined.contains(AgentRawTraceDetailMapper.REDACTION_TEXT));
+    }
+
+    @Test
+    void malformedRawDetail_shouldFailClosedWithoutEchoingInput() {
+        String malformed = "{broken Cookie: sid=ordinary-business-secret";
+
+        IllegalArgumentException error = assertThrows(
+                IllegalArgumentException.class,
+                () -> AgentRawTraceDetailMapper.buildToolPayload(
+                        objectMapper,
+                        "run-1",
+                        "tool-1",
+                        malformed));
+
+        assertFalse(error.getMessage().contains(malformed));
+        assertFalse(error.getMessage().contains("ordinary-business-secret"));
+    }
+
+    @Test
+    void serializationFailure_shouldThrowWithoutStringFallback() throws Exception {
+        ObjectMapper failingMapper = spy(new ObjectMapper());
+        when(failingMapper.writeValueAsBytes(any())).thenThrow(new IllegalStateException("serializer failed"));
+
+        IllegalStateException error = assertThrows(
+                IllegalStateException.class,
+                () -> AgentRawTraceDetailMapper.buildToolPayload(
+                        failingMapper,
+                        "run-1",
+                        "tool-1",
+                        "{\"traceId\":\"tool-1\",\"params\":{},\"output\":\"safe\"}"));
+
+        assertTrue(error.getMessage().contains("serialize sanitized trace detail"));
     }
 }
