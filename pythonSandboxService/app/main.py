@@ -595,6 +595,30 @@ async def health() -> dict:
 
 @app.post("/tasks", response_model=CreateTaskResponse)
 async def create_task(request: ExecuteRequest):
+    # D14 (Q-14): production refuse create without operation_id. Non-empty is
+    # judged AFTER strip; empty / all-whitespace are rejected and never
+    # auto-generated. Non-production fixtures must set
+    # AF_SANDBOX_ALLOW_CREATE_WITHOUT_OPERATION_ID=true (no operation index /
+    # no idempotent recovery). The switch only admits keyless creates —
+    # keyed creates still run fingerprint/units/memory validation below.
+    operation_id = (request.operation_id or "").strip()
+    if not operation_id and not config.allow_create_without_operation_id:
+        logger.warning(
+            "sandbox.create.reject_missing_operation_id "
+            "non_production_switch=AF_SANDBOX_ALLOW_CREATE_WITHOUT_OPERATION_ID"
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "operation_id is required for sandbox create "
+                "(D14 production refuse create without idempotency key; "
+                "non-production fixtures must enable the documented Legacy "
+                "compatibility switches as a group — no global capacity "
+                "admission, no idempotent recovery)"
+            ),
+        )
+    if operation_id:
+        request.operation_id = operation_id
     expected_memory = (
         config.heavy_memory_limit_bytes
         if request.resource_class == "HEAVY"

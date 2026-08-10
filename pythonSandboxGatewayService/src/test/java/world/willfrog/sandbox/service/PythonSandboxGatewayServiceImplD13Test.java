@@ -74,6 +74,10 @@ class PythonSandboxGatewayServiceImplD13Test {
         PythonSandboxGatewayServiceImpl gateway =
                 new PythonSandboxGatewayServiceImpl(restTemplate, restTemplate, new ObjectMapper());
         ReflectionTestUtils.setField(gateway, "sandboxUrl", "http://sandbox");
+        // D14: existing D13 HTTP-error-surface fixtures intentionally exercise keyless
+        // create against MockRestServiceServer. Explicit non-production compat mode —
+        // production gate coverage lives in PythonSandboxGatewayServiceImplD14Test.
+        ReflectionTestUtils.setField(gateway, "allowCreateWithoutOperationId", true);
         return gateway;
     }
 
@@ -90,6 +94,7 @@ class PythonSandboxGatewayServiceImplD13Test {
         PythonSandboxGatewayServiceImpl gateway =
                 new PythonSandboxGatewayServiceImpl(longClient, shortClient, new ObjectMapper());
         ReflectionTestUtils.setField(gateway, "sandboxUrl", "http://sandbox");
+        ReflectionTestUtils.setField(gateway, "allowCreateWithoutOperationId", true);
         return gateway;
     }
 

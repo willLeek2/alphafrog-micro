@@ -6,6 +6,16 @@ from typing import List, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
+# D15 §4.2.3 round-4 (codex 56976668 MUST-FIX #3): single payload contract
+# shared with bounded_exec_wrapper.parse_wrapper_input. Imported at top
+# level — payload_contract.py is stdlib-only so this does NOT drag pydantic
+# into the wrapper's import graph (the wrapper imports payload_contract
+# directly, not via this module).
+from app.payload_contract import (
+    PayloadContractError,
+    validate_payload_contract,
+)
+
 
 class TaskStatus(str, Enum):
     QUEUED = "QUEUED"
@@ -225,11 +235,56 @@ class BoundedExecRequest(BaseModel):
     timeoutSeconds: float = Field(..., ge=0)
     effectiveOutputLimits: EffectiveOutputLimits
     runtimeEnvironmentPath: Optional[str] = None
+    # D15 §4.2 (Scenario B) round-2 (codex fe54d9f0 MUST-FIX #3):
+    # taskWorkspace + taskEnvironment + loaderPythonPath are REQUIRED. The
+    # wrapper parser treats them as required (missing or empty is
+    # fail-closed per D15 §4.2), so the schema MUST agree: a model that
+    # could omit them while the parser rejects them would let callers
+    # build payloads that fail at runtime instead of at validation time.
+    # D15 is a new feature; there is no backwards-compat migration path.
+    taskWorkspace: str = Field(..., min_length=1)
+    taskEnvironment: dict[str, str]
+    # D15 §4.2: workdir the user child needs on sys.path so it can import
+    # af_dataset_loader etc. The wrapper stages a per-task bootstrap that
+    # inserts this path AFTER Python site init (see bounded_exec_wrapper
+    # _write_loader_bootstrap), so a stale sitecustomize in the loader
+    # workdir is never auto-imported at startup.
+    loaderPythonPath: str = Field(..., min_length=1)
     # 260809-26Q3-stage1-w2 D11 (task #108): the root-owned cancel marker
     # file the wrapper polls while the child runs. Optional for backward
     # compatibility with pre-D11 inputs; when present the wrapper validates
     # the EXACT task-local binding (root/<taskId>/cancel) fail-closed.
     cancelMarkerPath: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_d15_round4_payload_contract(self) -> "BoundedExecRequest":
+        """D15 §4.2.3 round-4 (codex 56976668 MUST-FIX #3): pydantic-side
+        mirror of the wrapper parser's payload contract. Calls the SAME
+        ``validate_payload_contract`` function (single source of truth in
+        ``app.payload_contract``) so a payload that passes pydantic
+        cannot fail at the wrapper parser on field-level invariants.
+
+        Filesystem-anchored checks (workspace == wrapper-input.json
+        parent; scriptPath regular file; loaderPythonPath existing
+        directory; ``_bootstrap`` symlink rejection) are NOT done here —
+        pydantic has no filesystem context. The wrapper parser adds those
+        on top when it has the wrapper-input.json path.
+
+        Without this validator the model could construct objects the
+        runtime would reject (smuggled PYTHONPATH, AF_TASK_WORKSPACE !=
+        taskWorkspace, AF sub-path equal to workspace, etc.) — codex
+        56976668 MUST-FIX #3 explicitly forbids that gap.
+        """
+        try:
+            validate_payload_contract(
+                self.wrapper_input_payload(), wrapper_input_path=None,
+            )
+        except PayloadContractError as exc:
+            # pydantic's model_validator protocol: raise ValueError (or
+            # AssertionError) to mark validation failure; pydantic then
+            # converts it to ValidationError for the caller.
+            raise ValueError(str(exc)) from exc
+        return self
 
     def wrapper_input_payload(self) -> dict:
         """Serialize to the exact §7.1 input shape.
@@ -244,6 +299,9 @@ class BoundedExecRequest(BaseModel):
             "scriptPath": self.scriptPath,
             "timeoutSeconds": self.timeoutSeconds,
             "effectiveOutputLimits": limits,
+            "taskWorkspace": self.taskWorkspace,
+            "taskEnvironment": dict(self.taskEnvironment),
+            "loaderPythonPath": self.loaderPythonPath,
         }
         if self.runtimeEnvironmentPath is not None:
             payload["runtimeEnvironmentPath"] = self.runtimeEnvironmentPath

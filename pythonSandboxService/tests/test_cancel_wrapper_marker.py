@@ -143,6 +143,20 @@ class WrapperMarkerSubprocessTest(unittest.TestCase):
     def write_wrapper_input(
         self, script: Path, marker_path: str | None
     ) -> Path:
+        # D15 §4.2 made taskWorkspace + taskEnvironment + loaderPythonPath
+        # required (fail-closed if missing). The cancel wrapper marker tests
+        # were written pre-D15; after merging W3 D15 into the W2 integration
+        # line the wrapper rejects any payload without these keys at parse
+        # time. Use the script's parent dir (the per-task workspace) as the
+        # taskWorkspace/loaderPythonPath, matching how the runner stages a
+        # task workspace; AF_TASK_* env vars mirror test_bounded_exec_wrapper.
+        task_workspace = str(script.parent)
+        task_env = {
+            "AF_TASK_WORKSPACE": task_workspace,
+            "AF_TASK_ARTIFACT_DIR": f"{task_workspace}/artifacts",
+            "AF_TASK_TMP_DIR": f"{task_workspace}/tmp",
+            "AF_TASK_METRICS_PATH": f"{task_workspace}/metrics/loader.jsonl",
+        }
         payload = {
             "scriptPath": str(script),
             "timeoutSeconds": 30,
@@ -152,10 +166,15 @@ class WrapperMarkerSubprocessTest(unittest.TestCase):
                 "recordChannelMaxBytes": 65536,
                 "recordChannelMaxRecords": 100,
             },
+            "taskWorkspace": task_workspace,
+            "taskEnvironment": task_env,
+            "loaderPythonPath": task_workspace,
         }
         if marker_path is not None:
             payload["cancelMarkerPath"] = marker_path
-        input_path = self.input_dir / "wrapper-input.json"
+        # Stage wrapper-input.json INSIDE task_workspace (script.parent) so
+        # D15 §4.2.3 round-4 anchoring (taskWorkspace == input parent) holds.
+        input_path = script.parent / "wrapper-input.json"
         input_path.write_text(json.dumps(payload), encoding="utf-8")
         return input_path
 

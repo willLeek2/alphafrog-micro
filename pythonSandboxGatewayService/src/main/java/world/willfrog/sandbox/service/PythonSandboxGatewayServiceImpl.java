@@ -51,6 +51,15 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
     @Value("${sandbox.service.queue-prepare-margin-millis:300000}")
     private long queuePrepareMarginMillis = 300000L;
 
+    /**
+     * D14 (Q-14): production create requires a non-blank operationId and
+     * grouped canonical identity. Default false = fail-closed. Set true only
+     * for explicitly annotated non-production fixtures (no idempotent recovery;
+     * "resourceClass-only" transitional clients must not hit production).
+     */
+    @Value("${sandbox.gateway.allow-create-without-operation-id:false}")
+    private boolean allowCreateWithoutOperationId = false;
+
     public PythonSandboxGatewayServiceImpl(
             @Qualifier("sandboxLongHttpClient") RestTemplate longHttpClient,
             @Qualifier("sandboxShortHttpClient") RestTemplate shortHttpClient,
@@ -134,19 +143,70 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
              * libraries 和 timeoutSeconds，导致 Python 侧退回默认 STANDARD 资源配置，同时完全
              * 收不到 operationId/requestFingerprint，createTask 的幂等索引形同虚设。
              *
+             * D14 (Q-14): production rejects blank operationId before HTTP.
+             * Non-empty is judged AFTER trim; empty / all-whitespace are rejected.
+             * Never invent a key. The transitional "resourceClass only" path is
+             * non-production-only behind
+             * sandbox.gateway.allow-create-without-operation-id=true.
+             * That switch only admits keyless creates — keyed creates still
+             * forward the full canonical group and keep Python-side validation.
+             *
              * proto3 标量没有 presence；因此只有 operationId 非空时才把 canonical 数值零值也
-             * 写入 HTTP DTO。旧客户端没有 operationId 时继续沿用 Python 默认值，避免把空字符串
-             * resource_class 或 0 memory_limit_bytes 发送给 Pydantic 后被 422 拒绝。
+             * 写入 HTTP DTO。
              */
-            boolean canonicalCreate = request.getOperationId() != null
-                    && !request.getOperationId().isBlank();
+            String operationId = request.getOperationId() == null
+                    ? ""
+                    : request.getOperationId().trim();
+            boolean canonicalCreate = !operationId.isEmpty();
+            if (!canonicalCreate) {
+                if (!allowCreateWithoutOperationId) {
+                    SandboxErrorDetail detail = SandboxErrorDetail.newBuilder()
+                            .setCategory(SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_INVALID_ARGUMENT)
+                            .build();
+                    // Stable caller-facing text: no config-key inventory.
+                    String text = "createTask rejected: operationId is required "
+                            + "(D14 production refuse create without idempotency key; "
+                            + "resourceClass-only transitional clients are non-production only)";
+                    log.warn("sandbox.createTask.localRejectMissingOperationId: resourceClass={}, "
+                                    + "totalDurationMs={}, nonProductionSwitch=sandbox.gateway."
+                                    + "allow-create-without-operation-id",
+                            request.getResourceClass(),
+                            System.currentTimeMillis() - startMs);
+                    return ExecuteResponse.newBuilder()
+                            .setError(text)
+                            .setErrorDetail(detail)
+                            .build();
+                }
+                log.warn("sandbox.createTask.allowWithoutOperationId: "
+                        + "allow-create-without-operation-id=true "
+                        + "(NON-PRODUCTION: no idempotent recovery; must also enable "
+                        + "companion Java/Python switches as a group)");
+            }
             if (canonicalCreate) {
+                // D14 MUST-FIX: keyed create must carry a complete canonical identity
+                // group BEFORE HTTP. Do not invent defaults or recompute fingerprint;
+                // incomplete half-sets are local INVALID_ARGUMENT.
+                String defect = findCanonicalCreateDefect(request);
+                if (defect != null) {
+                    SandboxErrorDetail detail = SandboxErrorDetail.newBuilder()
+                            .setCategory(SandboxHttpErrorCategory.SANDBOX_HTTP_ERROR_CATEGORY_INVALID_ARGUMENT)
+                            .build();
+                    String text = "createTask rejected: incomplete canonical identity "
+                            + "for keyed create";
+                    log.warn("sandbox.createTask.localRejectIncompleteCanonical: "
+                                    + "operationId={}, missingOrInvalidField={}, totalDurationMs={}",
+                            operationId, defect, System.currentTimeMillis() - startMs);
+                    return ExecuteResponse.newBuilder()
+                            .setError(text)
+                            .setErrorDetail(detail)
+                            .build();
+                }
                 httpRequest.setResource_class(request.getResourceClass());
                 httpRequest.setEstimated_rows(request.getEstimatedRows());
                 httpRequest.setEstimated_bytes(request.getEstimatedBytes());
                 httpRequest.setFile_count(request.getFileCount());
                 httpRequest.setCapacity_units(request.getCapacityUnits());
-                httpRequest.setOperation_id(request.getOperationId());
+                httpRequest.setOperation_id(operationId);
                 httpRequest.setRequest_fingerprint(request.getRequestFingerprint());
                 httpRequest.setMemory_limit_bytes(request.getMemoryLimitBytes());
                 httpRequest.setTimeout_millis(request.getTimeoutMillis());
@@ -158,7 +218,7 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
                 httpRequest.setLibraries_digest(request.getLibrariesDigest());
                 httpRequest.setSandbox_options_digest(request.getSandboxOptionsDigest());
             } else if (request.getResourceClass() != null && !request.getResourceClass().isBlank()) {
-                // 兼容尚未启用 canonical identity、但已经声明资源档位的过渡客户端。
+                // Non-production transitional clients only (gate above).
                 httpRequest.setResource_class(request.getResourceClass());
             }
 
@@ -345,6 +405,76 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
         if (e == null) return fallback;
         if (e.getMessage() != null && !e.getMessage().isBlank()) return e.getMessage();
         return fallback;
+    }
+
+    /**
+     * D14: keyed create local completeness check. Returns the first missing/invalid
+     * field name for operator logs, or null when the full identity group is present.
+     * Does not invent defaults or recompute fingerprints.
+     *
+     * <p>capacityUnits stay frozen by resource class (STANDARD=1, HEAVY=3).
+     * memoryLimitBytes only requires a positive value here — the actual configured
+     * STANDARD/HEAVY memory bytes live in Java DataAnalysisCapacityProperties and
+     * Python AF_SANDBOX_*_MEMORY_BYTES; Gateway must not hardcode a third copy.
+     *
+     * <p>The five SHA-256 identity fields are syntax-checked the same way as Python
+     * {@code normalize_sha256}: optional {@code sha256:} prefix + 64 hex digits.
+     * Gateway does not recompute fingerprint or verify codeHash against code bytes.
+     */
+    private static final java.util.regex.Pattern SHA256_DIGEST =
+            java.util.regex.Pattern.compile("^(?:sha256:)?([0-9a-fA-F]{64})$");
+
+    static String findCanonicalCreateDefect(ExecuteRequest request) {
+        String resourceClass = request.getResourceClass() == null
+                ? ""
+                : request.getResourceClass().trim();
+        if (!"STANDARD".equals(resourceClass) && !"HEAVY".equals(resourceClass)) {
+            return "resourceClass";
+        }
+        int expectedUnits = "HEAVY".equals(resourceClass) ? 3 : 1;
+        if (request.getCapacityUnits() != expectedUnits) {
+            return "capacityUnits";
+        }
+        if (request.getMemoryLimitBytes() <= 0L) {
+            return "memoryLimitBytes";
+        }
+        if (request.getTimeoutMillis() <= 0L) {
+            return "timeoutMillis";
+        }
+        if (!isSha256Digest(request.getRequestFingerprint())) {
+            return "requestFingerprint";
+        }
+        if (isBlank(request.getCanonicalSpecSchemaVersion())
+                || !"sandbox_create_v1".equals(request.getCanonicalSpecSchemaVersion().trim())) {
+            return "canonicalSpecSchemaVersion";
+        }
+        if (isBlank(request.getRuntimeEnvironmentVersion())) {
+            return "runtimeEnvironmentVersion";
+        }
+        if (!isSha256Digest(request.getCodeHash())) {
+            return "codeHash";
+        }
+        if (!isSha256Digest(request.getImmutableDatasetSnapshotDigest())) {
+            return "immutableDatasetSnapshotDigest";
+        }
+        if (!isSha256Digest(request.getLibrariesDigest())) {
+            return "librariesDigest";
+        }
+        if (!isSha256Digest(request.getSandboxOptionsDigest())) {
+            return "sandboxOptionsDigest";
+        }
+        return null;
+    }
+
+    private static boolean isBlank(String value) {
+        return value == null || value.isBlank();
+    }
+
+    private static boolean isSha256Digest(String value) {
+        if (value == null) {
+            return false;
+        }
+        return SHA256_DIGEST.matcher(value.trim()).matches();
     }
 
     /**
@@ -579,16 +709,50 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
                 .build();
     }
 
+    /**
+     * 260809-26Q3-stage1-w3 D15 §4.3.1: encode taskId as a single path segment.
+     * Mirrors the getTaskByOperationId URL construction pattern (lines ~432-436)
+     * to prevent route injection / misrouting when taskId contains '/', '%',
+     * spaces, or non-ASCII characters. Returns URI for direct use with
+     * RestTemplate#getForEntity(URI, Class).
+     *
+     * Red line D15 §6.5: status AND result AND telemetry endpoints all use
+     * path-segment encoding — bare `sandboxUrl + "/tasks/" + taskId` is forbidden.
+     */
+    private URI buildTaskStatusEndpoint(String taskId) {
+        return UriComponentsBuilder.fromHttpUrl(sandboxUrl)
+                .pathSegment("tasks", taskId)
+                .build()
+                .encode()
+                .toUri();
+    }
+
+    /**
+     * 260809-26Q3-stage1-w3 D15 §4.3.1: encode taskId + "/result" suffix using
+     * path-segment encoding. Same rationale as {@link #buildTaskStatusEndpoint}:
+     * result endpoint is also a taskId-bearing path and must use the same
+     * encoding level as operationId / status lookups.
+     */
+    private URI buildTaskResultEndpoint(String taskId) {
+        return UriComponentsBuilder.fromHttpUrl(sandboxUrl)
+                .pathSegment("tasks", taskId, "result")
+                .build()
+                .encode()
+                .toUri();
+    }
+
     @Override
     public TaskStatusResponse getTaskStatus(GetTaskStatusRequest request) {
         long startMs = System.currentTimeMillis();
         log.info("sandbox.getTaskStatus: taskId={}", request.getTaskId());
+        // 260809-26Q3-stage1-w3 D15 §4.3.1: encode taskId as single path segment.
+        // Declared before try so catch blocks can reference the same encoded form
+        // for telemetry (D15 red line 6: status AND telemetry一致 encoded).
+        URI endpointUri = buildTaskStatusEndpoint(request.getTaskId());
+        String endpoint = endpointUri.toASCIIString();
         try {
-            // 260809-26Q3-stage1-w3 D15 (separate commit): taskId as single path segment.
-            // For D13 we keep the raw concat shape; only switch bean to shortHttpClient.
-            String endpoint = sandboxUrl + "/tasks/" + request.getTaskId();
             long httpStart = System.currentTimeMillis();
-            ResponseEntity<HttpTask> response = shortHttpClient.getForEntity(endpoint, HttpTask.class);
+            ResponseEntity<HttpTask> response = shortHttpClient.getForEntity(endpointUri, HttpTask.class);
             log.info("sandbox.http: endpoint=GET {}, httpStatus={}, durationMs={}",
                     endpoint, response.getStatusCode().value(), System.currentTimeMillis() - httpStart);
             // 260809-26Q3-stage1-w3 D13 MUST-FIX 5 (Cindy 91490076 #5): do NOT emit OK
@@ -638,7 +802,7 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
                     request.getTaskId(), System.currentTimeMillis() - startMs);
             // 260809-26Q3-stage1-w3 D13 MUST-FIX 5 (Cindy 91490076 #5): 404 is a typed
             // failure (task resource doesn't exist) — emit ERROR + frozen category, not OK.
-            emitSandboxHttp("GET", sandboxUrl + "/tasks/" + request.getTaskId(), 404,
+            emitSandboxHttp("GET", endpoint, 404,
                     System.currentTimeMillis() - startMs, "ERROR",
                     "GET_STATUS_SANDBOX_HTTP_ERROR_CATEGORY_NOT_FOUND");
             SandboxErrorDetail detail = SandboxErrorDetail.newBuilder()
@@ -678,7 +842,7 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
             log.warn("sandbox.getTaskStatus.transportFailure: taskId={}, category={}, totalDurationMs={}, error={}",
                     request.getTaskId(), detail.getCategory().name(),
                     System.currentTimeMillis() - startMs, text, e);
-            emitSandboxHttp("GET", sandboxUrl + "/tasks/" + request.getTaskId(), -1,
+            emitSandboxHttp("GET", endpoint, -1,
                     System.currentTimeMillis() - startMs, "ERROR",
                     "GET_STATUS_" + detail.getCategory());
             return TaskStatusResponse.newBuilder()
@@ -689,7 +853,7 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
         } catch (Exception e) {
             log.error("sandbox.getTaskStatus.failed: taskId={}, totalDurationMs={}, error={}",
                     request.getTaskId(), System.currentTimeMillis() - startMs, e.getMessage(), e);
-            emitSandboxHttp("GET", sandboxUrl + "/tasks/" + request.getTaskId(), -1,
+            emitSandboxHttp("GET", endpoint, -1,
                     System.currentTimeMillis() - startMs, "ERROR", "GET_STATUS_FAILED");
             String text = nonBlankOr(e, "getTaskStatus failed");
             SandboxErrorDetail detail = SandboxErrorDetail.newBuilder()
@@ -712,7 +876,8 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
         log.warn("sandbox.{}: taskId={}, httpStatus={}, category={}, totalDurationMs={}, error={}",
                 logKey, taskId, statusCode, category.name(),
                 System.currentTimeMillis() - startMs, text, e);
-        emitSandboxHttp("GET", sandboxUrl + "/tasks/" + taskId, statusCode,
+        // 260809-26Q3-stage1-w3 D15 §4.3.1: helper-side URL also encoded.
+        emitSandboxHttp("GET", buildTaskStatusEndpoint(taskId).toASCIIString(), statusCode,
                 System.currentTimeMillis() - startMs, "ERROR",
                 "GET_STATUS_" + category.name());
         SandboxErrorDetail detail = SandboxErrorDetail.newBuilder()
@@ -730,15 +895,19 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
     public TaskResultResponse getTaskResult(GetTaskResultRequest request) {
         long startMs = System.currentTimeMillis();
         log.info("sandbox.getTaskResult: taskId={}", request.getTaskId());
+        // 260809-26Q3-stage1-w3 D15 §4.3.1: encode taskId + "result" as path segments.
+        // Declared before try so all catch blocks reference the same encoded form for
+        // telemetry (D15 red line 6: status AND result AND telemetry一致 encoded).
+        URI endpointUri = buildTaskResultEndpoint(request.getTaskId());
+        String endpoint = endpointUri.toASCIIString();
         try {
             // Check status first to ensure we don't hit 409. Status lookup uses the short
             // HTTP client (handled inside getTaskStatus). The result fetch below uses the
             // long HTTP client since it can wait for downstream task completion.
             TaskStatusResponse status = getTaskStatus(GetTaskStatusRequest.newBuilder().setTaskId(request.getTaskId()).build());
             if (isResultBearingTerminal(status.getStatus())) {
-                String endpoint = sandboxUrl + "/tasks/" + request.getTaskId() + "/result";
                 long httpStart = System.currentTimeMillis();
-                ResponseEntity<HttpExecuteResult> response = longHttpClient.getForEntity(endpoint, HttpExecuteResult.class);
+                ResponseEntity<HttpExecuteResult> response = longHttpClient.getForEntity(endpointUri, HttpExecuteResult.class);
                 int downstreamStatus = response.getStatusCode().value();
                 long resultDurationMs = System.currentTimeMillis() - httpStart;
                 log.info("sandbox.http: endpoint=GET {}, httpStatus={}, durationMs={}",
@@ -877,7 +1046,7 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
             log.warn("sandbox.getTaskResult.transportFailure: taskId={}, category={}, totalDurationMs={}, error={}",
                     request.getTaskId(), detail.getCategory().name(),
                     System.currentTimeMillis() - startMs, text, e);
-            emitSandboxHttp("GET", sandboxUrl + "/tasks/" + request.getTaskId() + "/result", -1,
+            emitSandboxHttp("GET", endpoint, -1,
                     System.currentTimeMillis() - startMs, "ERROR",
                     "GET_RESULT_" + detail.getCategory());
             return TaskResultResponse.newBuilder()
@@ -887,7 +1056,7 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
         } catch (Exception e) {
             log.error("sandbox.getTaskResult.failed: taskId={}, totalDurationMs={}, error={}",
                     request.getTaskId(), System.currentTimeMillis() - startMs, e.getMessage(), e);
-            emitSandboxHttp("GET", sandboxUrl + "/tasks/" + request.getTaskId() + "/result", -1,
+            emitSandboxHttp("GET", endpoint, -1,
                     System.currentTimeMillis() - startMs, "ERROR", "GET_RESULT_FAILED");
             String text = nonBlankOr(e, "getTaskResult failed");
             SandboxErrorDetail detail = SandboxErrorDetail.newBuilder()
@@ -909,7 +1078,8 @@ public class PythonSandboxGatewayServiceImpl extends DubboPythonSandboxServiceTr
         log.warn("sandbox.{}: taskId={}, httpStatus={}, category={}, totalDurationMs={}, error={}",
                 logKey, taskId, statusCode, category.name(),
                 System.currentTimeMillis() - startMs, text, e);
-        emitSandboxHttp("GET", sandboxUrl + "/tasks/" + taskId + "/result", statusCode,
+        // 260809-26Q3-stage1-w3 D15 §4.3.1: helper-side URL also encoded.
+        emitSandboxHttp("GET", buildTaskResultEndpoint(taskId).toASCIIString(), statusCode,
                 System.currentTimeMillis() - startMs, "ERROR",
                 "GET_RESULT_" + category.name());
         SandboxErrorDetail detail = SandboxErrorDetail.newBuilder()

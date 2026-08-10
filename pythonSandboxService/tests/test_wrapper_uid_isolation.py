@@ -476,11 +476,23 @@ class WrapperIdentityGateDevTest(unittest.TestCase):
         )
         runtime_env = self.task_dir / "runtime-environment.json"
         runtime_env.write_text("{}", encoding="utf-8")
+        # D15 §4.2 (Scenario B): wrapper now requires taskWorkspace +
+        # taskEnvironment (AF_TASK_* isolation moved out of the global
+        # sitecustomize.py).
+        task_workspace = str(self.task_dir)
         payload = {
             "scriptPath": str(script),
             "timeoutSeconds": 30,
             "effectiveOutputLimits": dict(DEV_LIMITS),
             "runtimeEnvironmentPath": str(runtime_env),
+            "taskWorkspace": task_workspace,
+            "taskEnvironment": {
+                "AF_TASK_WORKSPACE": task_workspace,
+                "AF_TASK_ARTIFACT_DIR": f"{task_workspace}/artifacts",
+                "AF_TASK_TMP_DIR": f"{task_workspace}/tmp",
+                "AF_TASK_METRICS_PATH": f"{task_workspace}/metrics/x.jsonl",
+            },
+            "loaderPythonPath": task_workspace,
         }
         input_path = self.task_dir / "wrapper-input.json"
         input_path.write_text(json.dumps(payload), encoding="utf-8")

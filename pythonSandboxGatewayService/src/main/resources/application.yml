@@ -48,6 +48,14 @@ sandbox:
     # This margin is NOT a request-side extension — business task limit is bound
     # by max-task-timeout-millis alone (Cindy 6a6e6158).
     queue-prepare-margin-millis: ${AF_SANDBOX_QUEUE_PREPARE_MARGIN_MILLIS:300000}
+  # D14 (Q-14): non-production keyless create compatibility.
+  # Default false = fail-closed. Set true ONLY together with the companion
+  # Java switch `sandbox.create.allow-legacy-without-capacity` and Python
+  # `AF_SANDBOX_ALLOW_CREATE_WITHOUT_OPERATION_ID` for annotated fixtures.
+  # Enabling only this switch is not enough: the other layers still refuse.
+  # NON-PRODUCTION ONLY — no idempotent recovery; must not point at production.
+  gateway:
+    allow-create-without-operation-id: ${AF_SANDBOX_GATEWAY_ALLOW_CREATE_WITHOUT_OPERATION_ID:false}
 
 # 260605-2 §3: gateway-side observability.
 # Default to INFO so that sandbox.createTask / sandbox.getTaskStatus / sandbox.getTaskResult

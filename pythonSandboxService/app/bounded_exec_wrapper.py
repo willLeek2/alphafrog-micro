@@ -229,6 +229,16 @@ from app.child_identity import (
     ChildIdentityError,
     parse_child_spec,
 )
+# D15 §4.2.3 round-4 (codex 56976668 MUST-FIX #3): single payload contract
+# shared with models.BoundedExecRequest. payload_contract.py is stdlib-only
+# so importing it here does NOT break this wrapper's stdlib-only invariant
+# (it does NOT drag pydantic into the wrapper's import graph — pydantic is
+# only pulled in if app.models is imported, which this wrapper never does).
+from app.payload_contract import (
+    ALLOWED_TASK_ENV_KEYS,
+    PayloadContractError,
+    validate_payload_contract,
+)
 # === end work-package-C =====================================================
 
 __all__ = [
@@ -260,6 +270,17 @@ STDERR_FILE_NAME = "stderr.bin"
 RECORDS_FILE_NAME = "finance-records.jsonl"
 UNKNOWN_MARKER_AUDIT_FILE_NAME = "finance-records-unknown-marker.jsonl"
 CAPTURE_RESULT_FILE_NAME = "capture-result.json"
+
+# D15 §4.2.3 (Scenario B) round-2 (codex fe54d9f0 MUST-FIX core bug): the
+# wrapper writes a task-local LOADER bootstrap (loader_bootstrap.py) into
+# {task_workspace}/_bootstrap/ and runs the user script THROUGH that
+# bootstrap. The bootstrap inserts the loader workdir into sys.path AFTER
+# the Python interpreter's site init phase has finished, so a stale
+# sitecustomize.py left over in the loader workdir from a previous task can
+# NEVER be auto-imported at startup. See _write_loader_bootstrap and the
+# Popen argv in run_bounded_capture.
+LOADER_BOOTSTRAP_DIR_NAME = "_bootstrap"
+LOADER_BOOTSTRAP_FILE_NAME = "loader_bootstrap.py"
 
 # Contract §13 line 644: the four frozen Python-side limit snapshot keys.
 LIMIT_KEYS = (
@@ -1242,6 +1263,20 @@ def _flush_quietly(fileobj) -> None:
         pass
 
 
+# D15 §4.2 (Scenario B): the four AF_TASK_* env vars that the wrapper must
+# see in taskEnvironment before it will spawn the user child. Missing any of
+# them is fail-closed (no spawn, no global sitecustomize fallback) per
+# D15 §6 red line 4.
+#
+# D15 §4.2.3 round-4 (codex 56976668 MUST-FIX #3): the canonical constant
+# and the validation logic now live in app.payload_contract (single source
+# of truth shared with models.BoundedExecRequest). The line below re-exports
+# the constant under this module's old name so existing imports keep
+# resolving during the transition; new code should import from
+# app.payload_contract directly.
+REQUIRED_TASK_ENV_KEYS = tuple(sorted(ALLOWED_TASK_ENV_KEYS))
+
+
 def parse_wrapper_input(path: Path) -> dict:
     """Parse and validate ``<wrapper-input.json>`` (§7.1 example shape)."""
     try:
@@ -1279,6 +1314,115 @@ def parse_wrapper_input(path: Path) -> dict:
             )
         limits[key] = value
 
+    # D15 §4.2 (Scenario B): taskWorkspace + taskEnvironment are the
+    # task-local replacement for the old global /sandbox/sitecustomize.py.
+    # The wrapper resolves them here and rejects anything that would force a
+    # silent fallback to writing a global bootstrap file (D15 §6 red line 4).
+    task_workspace = payload.get("taskWorkspace")
+    if not isinstance(task_workspace, str) or not task_workspace:
+        raise WrapperInputError(
+            "taskWorkspace must be a non-empty string "
+            "(D15 §4.2: AF_TASK_* isolation requires a task-local workspace "
+            "path; missing it is fail-closed, not a fallback to the legacy "
+            "global sitecustomize.py)"
+        )
+
+    task_env_payload = payload.get("taskEnvironment")
+    if not isinstance(task_env_payload, dict):
+        raise WrapperInputError(
+            "taskEnvironment must be a JSON object of strings "
+            "(D15 §4.2: AF_TASK_* must travel in the task-local wrapper "
+            "input, not the shared global sitecustomize.py)"
+        )
+    task_environment: dict[str, str] = {}
+    for key, value in task_env_payload.items():
+        if not isinstance(value, str):
+            raise WrapperInputError(
+                f"taskEnvironment.{key} must be a string"
+            )
+        task_environment[key] = value
+    missing_keys = [
+        key for key in REQUIRED_TASK_ENV_KEYS if not task_environment.get(key)
+    ]
+    if missing_keys:
+        raise WrapperInputError(
+            "taskEnvironment is missing required keys: "
+            f"{', '.join(missing_keys)} (D15 §4.2: each AF_TASK_* variable "
+            "MUST be present and non-empty before the wrapper will spawn; "
+            "no silent fallback to a global sitecustomize.py is permitted)"
+        )
+
+    # D15 §4.2 (Scenario B) round-2 (codex fe54d9f0 MUST-FIX #1 + #2):
+    # loaderPythonPath is the workdir the legacy sitecustomize used to
+    # prepend to sys.path so the user child can import af_dataset_loader
+    # and friends. It is REQUIRED: if it is missing or empty the user
+    # child would silently lose visibility of af_dataset_loader, which
+    # violates the D15 §4.2 "task environment cannot be established ->
+    # fail-closed" rule. There is no backwards-compat path: D15 is a new
+    # feature, every input must carry a real loader path.
+    loader_python_path = payload.get("loaderPythonPath")
+    if not isinstance(loader_python_path, str) or not loader_python_path:
+        raise WrapperInputError(
+            "loaderPythonPath must be a non-empty string "
+            "(D15 §4.2: the user child needs the loader workdir on "
+            "sys.path so it can import af_dataset_loader; missing or "
+            "empty is fail-closed, not a silent loss of import visibility)"
+        )
+
+    # D15 §4.2.3 round-4 (codex 56976668 MUST-FIX #3): single contract.
+    # Replaces the round-2 _validate_task_env_consistency helper. Calls
+    # the shared validate_payload_contract function in app.payload_contract
+    # so both this runtime parser and the pydantic model
+    # (models.BoundedExecRequest) enforce identical field-level invariants
+    # AND the wrapper-only filesystem-anchored invariants (workspace must
+    # equal wrapper-input.json parent dir; scriptPath must live at-or-inside
+    # workspace). The model validator calls the same function without
+    # wrapper_input_path (no fs context at HTTP validation time).
+    #
+    # What the contract closes (vs round-3):
+    #   * Whitelist: taskEnvironment may only carry the four AF_TASK_* keys;
+    #     PYTHONPATH/PYTHONHOME/PYTHONSTARTUP or any unknown key is rejected
+    #     so a stale sitecustomize cannot be re-activated via smuggled env.
+    #   * Containment anchor: taskWorkspace's realpath MUST equal the
+    #     wrapper-input.json parent dir's realpath. Without this, the
+    #     workspace could be "/", "..", or a symlink to an external target,
+    #     defeating every sub-path check below it.
+    #   * Strict-beneath: AF_TASK_ARTIFACT_DIR / TMP_DIR / METRICS_PATH must
+    #     be STRICTLY inside workspace (not equal to it).
+    #   * scriptPath at-or-inside workspace (filesystem-anchored).
+    try:
+        validate_payload_contract(payload, wrapper_input_path=str(path))
+    except PayloadContractError as exc:
+        raise WrapperInputError(str(exc)) from exc
+
+    # D15 §4.2.3 round-4 (codex 56976668 MUST-FIX #2): filesystem existence
+    # and type checks the contract cannot do (it only resolves realpath;
+    # it does not assert the resolved path exists with the right type).
+    # These run AFTER the contract so the error message a caller sees is
+    # the contract violation first (whitelist / anchor / containment),
+    # then the filesystem evidence.
+    script_path_real = os.path.realpath(script_path)
+    if not os.path.isfile(script_path_real):
+        raise WrapperInputError(
+            f"scriptPath={script_path!r} must be an existing regular "
+            f"file inside taskWorkspace (D15 §4.2.3 round-4 codex "
+            f"56976668 MUST-FIX #2: a missing path, a directory, or a "
+            f"non-regular file is fail-closed — without this, a smuggled "
+            f"directory or special file could let the wrapper bootstrap "
+            f"an attacker-controlled loader)"
+        )
+    loader_python_path_real = os.path.realpath(loader_python_path)
+    if not os.path.isdir(loader_python_path_real):
+        raise WrapperInputError(
+            f"loaderPythonPath={loader_python_path!r} must be an existing "
+            f"directory (D15 §4.2.3 round-4 codex 56976668 MUST-FIX #2: "
+            f"loaderPythonPath is the workdir the user child needs on "
+            f"sys.path so it can import af_dataset_loader; a missing path "
+            f"or a non-directory path is fail-closed — without this the "
+            f"user child would either silently lose import visibility or "
+            f"import from an attacker-controlled file)"
+        )
+
     # runtimeEnvironmentPath is part of the §7.1 input shape but belongs to
     # work package D's schema (runtime_environment.py); the wrapper does not
     # consume it.
@@ -1297,8 +1441,196 @@ def parse_wrapper_input(path: Path) -> dict:
         "script_path": script_path,
         "timeout_seconds": timeout_seconds,
         "limits": limits,
+        "task_workspace": task_workspace,
+        "task_environment": task_environment,
+        "loader_python_path": loader_python_path,
         "cancel_marker_path": cancel_marker_path,
     }
+
+
+def _write_loader_bootstrap(
+    *, task_workspace: str, loader_path: str
+) -> Path:
+    """D15 §4.2.3 (Scenario B) round-2 (codex fe54d9f0 MUST-FIX core bug).
+
+    Write a per-task ``loader_bootstrap.py`` into
+    ``{task_workspace}/_bootstrap/`` and return its path. The bootstrap is
+    the entry point the user child runs as ``__main__``; AFTER Python's
+    site init phase has finished it inserts ``loader_path`` into
+    ``sys.path`` and then runs the user script via ``runpy.run_path``.
+
+    Why this design (and not "just delete the stale sitecustomize before
+    spawn"): the loader workdir is typically a CONTAINER-GLOBAL directory
+    like ``/sandbox``. The previous task may have left a
+    ``sitecustomize.py`` there if its cleanup failed. Deleting that file
+    right before spawn would still be (a) a write to a shared global path
+    racing with any sibling wrapper invocation and (b) a TOCTOU window
+    between unlink() and the child's site init. codex fe54d9f0 explicitly
+    forbids that "rm before spawn" pattern as a correctness fix.
+
+    The bootstrap approach instead makes the stale sitecustomize
+    HARMLESS: by giving the interpreter a bootstrap file that lives under
+    the per-task workspace (which the wrapper itself freshly created and
+    which therefore cannot host any prior task's sitecustomize), the
+    loader workdir is NEVER on the site-init sys.path. Site init finishes
+    with no auto-import of any sitecustomize. Only AFTER site init does
+    the bootstrap add ``loader_path`` to sys.path, which is enough for
+    ``import af_dataset_loader`` to work, while never exposing the
+    interpreter's startup to a stale sitecustomize.
+
+    Failure to write the bootstrap is fail-closed: the wrapper raises
+    rather than spawning the user child with a direct
+    ``[python, script]`` invocation (the latter would silently re-introduce
+    the very sitecustomize auto-import race this fix closes).
+    """
+    if not task_workspace:
+        raise WrapperInputError(
+            "taskWorkspace is required to stage the loader bootstrap "
+            "(D15 §4.2.3 round-2: the bootstrap lives under the per-task "
+            "workspace, never a shared global path)"
+        )
+    if not loader_path:
+        raise WrapperInputError(
+            "loaderPythonPath is required to stage the loader bootstrap "
+            "(D15 §4.2.3 round-2: the user child needs the loader workdir "
+            "on sys.path; missing or empty is fail-closed)"
+        )
+
+    bootstrap_dir = Path(task_workspace) / LOADER_BOOTSTRAP_DIR_NAME
+    # D15 §4.2.3 round-4 (codex 56976668 MUST-FIX #2): if `_bootstrap` is
+    # already a symlink, do NOT follow it. The wrapper runs as root in
+    # production; a caller-planted symlink at `_bootstrap -> /etc/cron.d`
+    # would let mkdir(exist_ok=True) succeed (the target dir exists) and
+    # then let bootstrap_path.write_text / chmod land on an attacker-chosen
+    # EXTERNAL path. The is_symlink() check MUST run before mkdir because
+    # mkdir would silently follow the symlink.
+    if bootstrap_dir.is_symlink():
+        raise WrapperInputError(
+            f"refusing to stage loader bootstrap: {bootstrap_dir} is a "
+            f"symlink (D15 §4.2.3 round-4 codex 56976668 MUST-FIX #2: a "
+            f"pre-planted symlink would let the root wrapper chmod/write "
+            f"an attacker-chosen external target via the symlink; "
+            f"fail-closed, no follow)"
+        )
+    bootstrap_dir.mkdir(parents=True, exist_ok=True)
+    # D15 §4.2.3 round-3 (codex c9fee2f9 MUST-FIX #1): bootstrap dir MUST be
+    # world-traversable (0o755) so the production child (which drops privileges
+    # to a non-root uid before exec) can cd into the wrapper-owned dir and read
+    # the bootstrap file. The previous 0o700 broke this — host tests run as
+    # the same UID as the wrapper, so 16/16 missed the production fact. The
+    # dir is still root-owned (wrapper creates it), so the user child can
+    # traverse+read but cannot write/rename entries in it.
+    os.chmod(bootstrap_dir, 0o755)
+    bootstrap_path = bootstrap_dir / LOADER_BOOTSTRAP_FILE_NAME
+    # D15 §4.2.3 round-4 (codex 56976668 MUST-FIX #2): defense in depth —
+    # also reject a pre-planted symlink at the bootstrap FILE path. mkdir
+    # already created _bootstrap as a real dir above, so the only way for
+    # loader_bootstrap.py to be a symlink now is if a concurrent actor
+    # planted it between mkdir and this check. The wrapper is pre-spawn
+    # at this point (no user child exists yet), so the attacker would have
+    # to be a sibling wrapper invocation or a process outside the sandbox
+    # — but the check is cheap and the consequence of following such a
+    # symlink (root write to attacker-chosen path) is severe enough to
+    # justify the belt-and-suspenders.
+    if bootstrap_path.is_symlink():
+        raise WrapperInputError(
+            f"refusing to stage loader bootstrap: {bootstrap_path} is a "
+            f"symlink (D15 §4.2.3 round-4 codex 56976668 MUST-FIX #2: a "
+            f"pre-planted file symlink would let the root wrapper write "
+            f"attacker-chosen content to an external target; fail-closed, "
+            f"no follow)"
+        )
+
+    # Build the bootstrap body by plain string concatenation. Do NOT use
+    # textwrap.dedent on an f-string here: any change in indentation of
+    # the surrounding literal would silently shift the embedded code and
+    # break Python syntax. A flat template with a single .replace() for
+    # the loader path keeps the body readable AND indentation-safe.
+    body = (
+        "# Auto-generated by bounded_exec_wrapper "
+        "(D15 §4.2.3 Scenario B round-2 + round-3 fix).\n"
+        "#\n"
+        "# This bootstrap runs AFTER Python's site initialization phase\n"
+        "# has completed, so any stale sitecustomize.py that may still\n"
+        "# live in the loader workdir is NOT auto-imported at startup.\n"
+        "# Only AFTER site init does this bootstrap insert the loader\n"
+        "# workdir into sys.path, then run the user script via runpy.\n"
+        "#\n"
+        "# Round-3 (codex c9fee2f9 MUST-FIX #2): also restore direct-script\n"
+        "# sys.path semantics — `python user_script.py` puts user_script's\n"
+        "# parent directory at sys.path[0], enabling sibling imports like\n"
+        "# `import sibling_module` to find same-directory modules.\n"
+        "# runpy.run_path does NOT do this automatically; we replicate it\n"
+        "# here. User script dir wins over loader modules of same name\n"
+        "# (matches direct `python user_script.py` priority).\n"
+        "import sys\n"
+        "import runpy\n"
+        "import os\n"
+        "\n"
+        'LOADER_PATH = "__LOADER_PATH__"\n'
+        "USER_SCRIPT = sys.argv[1]\n"
+        "USER_ARGS = sys.argv[2:]\n"
+        "sys.argv = [USER_SCRIPT] + USER_ARGS\n"
+        "# Insert in reverse priority order so final order is\n"
+        "# [user_script_dir, LOADER_PATH, ...] — user script siblings win.\n"
+        "if LOADER_PATH:\n"
+        "    sys.path.insert(0, LOADER_PATH)\n"
+        "user_script_dir = os.path.dirname(os.path.abspath(USER_SCRIPT))\n"
+        "if user_script_dir:\n"
+        "    sys.path.insert(0, user_script_dir)\n"
+        'runpy.run_path(USER_SCRIPT, run_name="__main__")\n'
+    )
+    # The loader path may contain characters that need escaping inside a
+    # Python string literal (backslashes on Windows, quotes in pathological
+    # paths). Use repr() to obtain a safe Python-source representation,
+    # then strip the outer single quotes so we can embed it inside our own
+    # double-quoted literal deterministically. Re-validate by parsing the
+    # final body before writing: if ast.parse fails we abort the spawn.
+    safe_loader_literal = repr(loader_path)[1:-1]
+    body = body.replace("__LOADER_PATH__", safe_loader_literal)
+
+    import ast as _ast
+    try:
+        _ast.parse(body)
+    except SyntaxError as exc:
+        # Should be impossible given the construction above, but a
+        # pathological loader_path (e.g. one containing a literal newline
+        # after repr) could still trip us. Fail-closed: do NOT spawn with
+        # a broken bootstrap, do NOT silently fall back to direct mode.
+        raise WrapperInputError(
+            "internal error: generated loader bootstrap is not valid "
+            f"Python (loader_path={loader_path!r}): {exc}"
+        ) from exc
+
+    try:
+        # unlink before write so a stale bootstrap from a previous run in
+        # the same task_workspace (defensive: tests do this, production
+        # gets a fresh task_workspace each task) cannot survive. Errors
+        # from a missing file are ignored by unlink(missing_ok=True).
+        bootstrap_path.unlink(missing_ok=True)
+        bootstrap_path.write_text(body, encoding="utf-8")
+    except OSError as exc:
+        raise WrapperInputError(
+            "failed to stage the loader bootstrap at "
+            f"{bootstrap_path}: {exc} (D15 §4.2.3 round-2: staging the "
+            "task-local bootstrap is a hard spawn gate, no fallback)"
+        ) from exc
+
+    # D15 §4.2.3 round-3 (codex c9fee2f9 MUST-FIX #1): file MUST be
+    # world-readable (0o444) so the production non-root child can read it
+    # after preexec_fn drops privileges. Root wrapper can still overwrite
+    # via unlink+write on subsequent runs (unlink only needs parent dir
+    # write access, which 0o755 parent grants to root owner).
+    try:
+        os.chmod(bootstrap_path, 0o444)
+    except OSError as exc:
+        raise WrapperInputError(
+            "failed to set read-only permissions on the loader bootstrap at "
+            f"{bootstrap_path}: {exc} (D15 §4.2.3 round-3: bootstrap MUST be "
+            "world-readable for the unprivileged child, fail-closed if chmod fails)"
+        ) from exc
+
+    return bootstrap_path
 
 
 def _task_control_root() -> str:
@@ -1434,6 +1766,9 @@ def run_bounded_capture(
     limits: dict,
     capture_dir: Path,
     child_identity: tuple | None = None,
+    task_workspace: str | None = None,
+    task_environment: dict[str, str] | None = None,
+    workdir_for_pythonpath: str | None = None,
     cancel_marker_path: str | None = None,
 ) -> tuple:
     """Run the user script under bounded capture.
@@ -1459,6 +1794,13 @@ def run_bounded_capture(
     returning, EXCEPT when the spawn fails while a child identity is active
     (P0-4: no child, no summary).  On any internal exception everything is
     closed and the exception is re-raised.
+
+    D15 §4.2 (Scenario B): ``task_workspace`` and ``task_environment`` carry
+    the AF_TASK_* variables that previously lived in the shared global
+    /sandbox/sitecustomize.py. The wrapper performs makedirs / chdir /
+    sys.path setup itself pre-spawn, then injects the env into the user
+    child via Popen(env=...). Fail-closed: caller guarantees both are
+    non-empty (parse_wrapper_input rejects missing required keys).
     """
     capture_path = Path(capture_dir)
     capture_path.mkdir(parents=True, exist_ok=True)
@@ -1562,16 +1904,77 @@ def run_bounded_capture(
         # this raises BEFORE any Popen: no child, no summary.
         _set_child_subreaper()
 
+        # D15 §4.2 (Scenario B): the wrapper performs the makedirs/chdir/
+        # sys.path setup that the legacy global sitecustomize.py used to do
+        # at import time. makedirs is idempotent; chdir is achieved by
+        # passing cwd= to Popen (the child resolves its own cwd on exec);
+        # sys.path gets the loader-module dir (workdir) via PYTHONPATH on
+        # the child env. All three are now per-task, in-wrapper, with no
+        # global file write.
+        if task_environment is not None:
+            for sub_dir in (
+                task_environment.get("AF_TASK_ARTIFACT_DIR"),
+                task_environment.get("AF_TASK_TMP_DIR"),
+            ):
+                if sub_dir:
+                    Path(sub_dir).mkdir(parents=True, exist_ok=True)
+        spawn_cwd = (
+            task_workspace
+            if task_workspace
+            else str(Path(script_path).resolve().parent)
+        )
+
+        # Build the child env: wrapper's own env + AF_TASK_* (task-scoped).
+        # D15 §4.2.3 (Scenario B) round-2 (codex fe54d9f0 MUST-FIX core bug):
+        # the loader workdir is NO LONGER placed on PYTHONPATH here. A
+        # directory on PYTHONPATH that contains a stale sitecustomize.py
+        # would have its sitecustomize auto-imported by the Python
+        # interpreter DURING site init (BEFORE any user code runs), and
+        # that legacy sitecustomize could overwrite AF_TASK_* back to a
+        # previous task's values. The user child instead receives the
+        # loader workdir via a task-local bootstrap (see below), which
+        # inserts the workdir into sys.path AFTER site init has finished.
+        child_env = os.environ.copy()
+        if task_environment:
+            for key, value in task_environment.items():
+                child_env[key] = value
+
+        # D15 §4.2.3 (Scenario B) round-2: write a task-local loader
+        # bootstrap into {task_workspace}/_bootstrap/loader_bootstrap.py
+        # and run the user script THROUGH it. The bootstrap is generated
+        # per-task, lives under the per-task workspace (which is freshly
+        # created for THIS task and can never host a stale sitecustomize
+        # from a previous task), and its only job is: AFTER Python's site
+        # init phase has ended (so any stale sitecustomize in the loader
+        # workdir has lost its chance to be auto-imported at startup),
+        # insert the loader workdir into sys.path, then run the user
+        # script via runpy.run_path under __main__ so user code sees the
+        # same __name__ / argv it would have seen under the direct
+        # `[python, script]` invocation. Failure to write the bootstrap
+        # is fail-closed: no Popen, no spawn, no silent fallback.
+        bootstrap_path = _write_loader_bootstrap(
+            task_workspace=task_workspace,
+            loader_path=workdir_for_pythonpath,
+        )
+
         try:
             # The child's stdout/stderr are the capture pipes ONLY: the child
             # never inherits or shares the wrapper's own stdout fd, which
             # later carries the single bounded envelope (PIN 2).
+            #
+            # D15 §4.2.3 round-2: the Python interpreter is given
+            # ``loader_bootstrap.py`` as __main__, NOT the user script. The
+            # user script path travels as bootstrap's argv[1]; the bootstrap
+            # runs it via runpy.run_path(..., run_name="__main__") so the
+            # user code still observes __name__ == "__main__" and the same
+            # sys.argv shape it would have seen under direct invocation.
             proc = subprocess.Popen(
-                [sys.executable, str(script_path)],
+                [sys.executable, str(bootstrap_path), str(script_path)],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                cwd=str(Path(script_path).resolve().parent),
+                cwd=spawn_cwd,
+                env=child_env,
                 start_new_session=True,  # child owns a new process group
                 preexec_fn=_make_preexec(child_identity),
             )
@@ -1819,8 +2222,18 @@ def main(argv: list[str] | None = None) -> int:
             limits=parsed["limits"],
             capture_dir=capture_dir,
             child_identity=child_identity,
+            task_workspace=parsed["task_workspace"],
+            task_environment=parsed["task_environment"],
+            workdir_for_pythonpath=parsed.get("loader_python_path"),
             cancel_marker_path=cancel_marker_path,
         )
+    except WrapperInputError as exc:
+        # D15 §4.2.3 round-2: _write_loader_bootstrap raises WrapperInputError
+        # on staging failure (no spawn gate). Surface the diagnostic verbatim
+        # so the operator sees the underlying cause; never user content
+        # (§18 stop condition — paths only).
+        sys.stderr.write(f"bounded_exec_wrapper: {exc}\n")
+        return 2
     except Exception as exc:  # last-resort guard; type name only (§18)
         sys.stderr.write(
             f"bounded_exec_wrapper: internal error: {type(exc).__name__}\n"

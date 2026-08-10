@@ -65,8 +65,9 @@ TEMP_MANIFEST_DIR_PREFIX = "_agent_run_manifest_"
 # === work-package-C: §7.1 bounded wrapper production wiring ================
 # The wrapper runs from a TASK-LOCAL copy of the app package staged under the
 # task workspace (zero global-path writes, so it stays safe under future
-# per-container concurrency; codex 56d28076 — the global sitecustomize.py
-# write/delete is what is NOT task-local yet, not this package).
+# per-container concurrency). D15 §4.2 (Scenario B) closed the last
+# global-path write — AF_TASK_* now travels via the task-local
+# wrapper-input.json and the wrapper injects it through Popen(env=...).
 # capture_reader.py is staged because the wrapper IMPORTS it pre-spawn
 # (PIN 1) for the in-memory wrapper-tail readback; child_identity.py is
 # staged because the wrapper imports it pre-spawn for the P0-4 privilege
@@ -78,6 +79,7 @@ WRAPPER_MODULE_FILES = (
     "bounded_exec_wrapper.py",
     "capture_reader.py",
     "child_identity.py",
+    "payload_contract.py",
 )
 WRAPPER_DIR_NAME = "bounded-wrapper"
 
@@ -565,25 +567,17 @@ def _prepare_task_workspace(
     metrics_path = f"{task_workspace}/metrics/loader_metrics.jsonl"
     artifact_dir = f"{task_workspace}/artifacts"
     temporary_dir = f"{task_workspace}/tmp"
-    sitecustomize = (
-        "import os, sys\n"
-        f"os.environ['AF_TASK_METRICS_PATH'] = {metrics_path!r}\n"
-        f"os.environ['AF_TASK_WORKSPACE'] = {task_workspace!r}\n"
-        f"os.environ['AF_TASK_ARTIFACT_DIR'] = {artifact_dir!r}\n"
-        f"os.environ['AF_TASK_TMP_DIR'] = {temporary_dir!r}\n"
-        # 260808-finance-methodspec-v5 work package D (codex (A) plan 2026-08-08
-        # 23:06): do NOT override AF_RUNTIME_ENVIRONMENT_FILE here. The
-        # container-creation env var (set by create_sandbox_session) points at
-        # the global <workdir>/runtime-environment.json that
-        # initialize_runtime_environment() wrote once per container. Each task
-        # in the same container reads the SAME file; concurrency=1 is enforced
-        # via validate_dynamic_install_safety so the venv state cannot drift.
-        f"os.makedirs({artifact_dir!r}, exist_ok=True)\n"
-        f"os.makedirs({temporary_dir!r}, exist_ok=True)\n"
-        f"sys.path.insert(0, {config.workdir.rstrip('/')!r})\n"
-        f"os.chdir({task_workspace!r})\n"
-    )
-    _copy_text_to_runtime(session, sitecustomize, f"{config.workdir.rstrip('/')}/sitecustomize.py")
+    # D15 §4.2 (Scenario B): the four AF_TASK_* env vars are no longer written
+    # into the shared global /sandbox/sitecustomize.py. The wrapper-input.json
+    # (staged at {task_workspace}/wrapper-input.json by _stage_bounded_wrapper,
+    # which is already task-local) now carries them as the taskEnvironment
+    # field, and bounded_exec_wrapper injects them via Popen(env=...) when
+    # spawning the user child. makedirs/chdir/sys.path for the user child are
+    # likewise performed by the wrapper pre-spawn. Removing the per-task write
+    # to the global sitecustomize.py eliminates the cross-task race that
+    # cleanup-failure / pool reuse previously exposed (D15 §6 red line 3).
+    # AF_RUNTIME_ENVIRONMENT_FILE is unchanged: still set once per container by
+    # create_sandbox_session and read by every task in that container.
 
     return task_workspace
 
@@ -981,6 +975,13 @@ def _cleanup_task_workspace(
         # Remove compatibility symlink
         if config.compat_input_path_enabled:
             _exec_checked(session, f"rm -rf {config.workdir}/input", "cleanup_input_symlink")
+        # D15 §4.2.3 (Scenario B): this rm is DEFENSIVE ONLY. Correctness no
+        # longer depends on it — _prepare_task_workspace stopped writing the
+        # global /sandbox/sitecustomize.py per task. A pre-D15 container may
+        # still host a stale sitecustomize.py from an earlier task in the same
+        # container, so the rm is kept as best-effort cleanup. Removing it
+        # would not break task isolation because AF_TASK_* now travels via the
+        # task-local wrapper-input.json (D15 §6 red line 3 satisfied).
         _exec_checked(
             session,
             "rm -f "
@@ -1001,46 +1002,47 @@ def validate_dynamic_install_safety(config: SandboxConfig) -> None:
     """Spec §8 L1019 + codex (A) plan 2026-08-08 23:06 safety invariant.
 
     finance-methodspec-v5 enforces ``container_max_concurrency == 1`` for
-    every config (regardless of skip_environment_setup) because every
-    SandboxConfig writes a per-task bootstrap into the SHARED global file
-    ``/sandbox/sitecustomize.py`` (AF_TASK_WORKSPACE / AF_TASK_ARTIFACT_DIR /
-    AF_TASK_TMP_DIR / AF_TASK_METRICS_PATH) and deletes that same file on
-    cleanup. Concurrent tasks would race on that file even without dynamic
-    install — the bootstrap file is shared mutable state by construction.
+    every config (regardless of skip_environment_setup). D15 §4.2 (Scenario B)
+    removed the per-task write of AF_TASK_* into the SHARED global
+    ``/sandbox/sitecustomize.py``: those vars now travel inside the
+    task-local wrapper-input.json and the wrapper injects them per-child via
+    Popen(env=...). That eliminates the sitecustomize race as a concurrency
+    blocker. The cmc==1 invariant STILL holds, now driven solely by the
+    dynamic-install venv race described below — lifting cmc>1 is gated by
+    S3B-04 and out of scope for D15.
 
-    Dynamic install (skip_environment_setup=False) additionally mutates the
-    shared venv via ``session.install()``, which compounds the race:
-    ``PoolWorker.execution_environment`` is captured once at warm-up and
-    never refreshed, so a second task in the same worker would read the
-    baked environmentId while the container's actual venv had already been
-    mutated by ``session.install()`` from the previous task.
-
-    Both invariants collapse to the same rule: exactly one task per
-    worker container at a time. Raise ``ConfigurationError`` (with a stable
-    code) if the invariant is violated. Callers that mutate config
-    dynamically (Nacos hot-reload, pool_min_size adjustment, etc.) MUST
-    re-run this check before accepting the new config; failing closed
-    prevents silent throughput drift that would corrupt environment
-    identity under the surface.
+    Dynamic install (skip_environment_setup=False) mutates the shared venv
+    via ``session.install()``: ``PoolWorker.execution_environment`` is
+    captured once at warm-up and never refreshed, so a second task in the
+    same worker would read the baked environmentId while the container's
+    actual venv had already been mutated by ``session.install()`` from the
+    previous task. To prevent that drift, exactly one task per worker
+    container at a time. Raise ``ConfigurationError`` (with a stable code)
+    if the invariant is violated. Callers that mutate config dynamically
+    (Nacos hot-reload, pool_min_size adjustment, etc.) MUST re-run this
+    check before accepting the new config; failing closed prevents silent
+    throughput drift that would corrupt environment identity under the
+    surface.
 
     codex 2026-08-08 23:16 (bc11e841 item 2): the original plan only
-    enforced this for skip_environment_setup=False; sitecustomize.py races
-    even for preinstalled-only configs because the per-task AF_TASK_* env
-    vars are still written into the same global file. This invariant now
-    applies to ALL SandboxConfig instances.
+    enforced this for skip_environment_setup=False; the per-task bootstrap
+    race (now eliminated by D15 §4.2) required extending it to all configs.
+    The cmc==1 rule continues to apply to ALL SandboxConfig instances
+    because of the venv mutation race alone.
     """
     if config.container_max_concurrency != 1:
         raise ConfigurationError(
             "CONTAINER_MAX_CONCURRENCY_REQUIRES_ONE: "
             f"container_max_concurrency={config.container_max_concurrency} "
-            "is not allowed. SandboxConfig writes per-task bootstrap "
-            "(AF_TASK_WORKSPACE / AF_TASK_ARTIFACT_DIR / AF_TASK_TMP_DIR / "
-            "AF_TASK_METRICS_PATH) into the shared global file "
-            "/sandbox/sitecustomize.py and deletes that same file on cleanup; "
-            "concurrent tasks would race on the bootstrap. Dynamic install "
-            "(skip_environment_setup=False) additionally mutates the shared "
-            "venv via session.install(), which compounds the race. Both "
-            "invariants collapse to: one task per worker container at a time."
+            "is not allowed. Dynamic install (skip_environment_setup=False) "
+            "mutates the shared venv via session.install(); "
+            "PoolWorker.execution_environment is captured once at warm-up "
+            "and never refreshed, so a second task in the same worker would "
+            "read a stale environmentId while the container's venv had "
+            "already been mutated. (D15 §4.2 removed the historical "
+            "sitecustomize.py race as a concurrency blocker; lifting cmc>1 "
+            "is gated by S3B-04 and remains out of scope.) Both invariants "
+            "collapse to: one task per worker container at a time."
         )
 
 
@@ -1574,6 +1576,24 @@ def _stage_bounded_wrapper(
     script_path = f"{task_workspace}/{USER_SCRIPT_FILE_NAME}"
     _copy_text_to_runtime(session, code, script_path)
 
+    # D15 §4.2 (Scenario B): AF_TASK_* env vars travel in the wrapper-input
+    # JSON (already task-local at {task_workspace}/wrapper-input.json) instead
+    # of being written into the shared global /sandbox/sitecustomize.py. The
+    # wrapper resolves them pre-spawn and injects via Popen(env=...), so task
+    # A's env cannot leak to task B even if cleanup of legacy files fails.
+    # loaderPythonPath is the workdir that the legacy sitecustomize used to
+    # prepend to sys.path so user code can import af_dataset_loader etc.;
+    # the wrapper prepends it to the child's PYTHONPATH at spawn.
+    metrics_path = f"{task_workspace}/metrics/loader_metrics.jsonl"
+    artifact_dir = f"{task_workspace}/artifacts"
+    temporary_dir = f"{task_workspace}/tmp"
+    task_environment = {
+        "AF_TASK_WORKSPACE": task_workspace,
+        "AF_TASK_ARTIFACT_DIR": artifact_dir,
+        "AF_TASK_TMP_DIR": temporary_dir,
+        "AF_TASK_METRICS_PATH": metrics_path,
+    }
+
     # §7.1 wrapper input; the four §13 limit keys verbatim.  sourceRevision is
     # Task metadata, not part of the wrapper input (models.BoundedExecRequest).
     wrapper_input = {
@@ -1581,6 +1601,9 @@ def _stage_bounded_wrapper(
         "timeoutSeconds": timeout_seconds,
         "effectiveOutputLimits": {key: limits[key] for key in WRAPPER_LIMIT_KEYS},
         "runtimeEnvironmentPath": f"{workdir}/{RUNTIME_ENVIRONMENT_FILE_NAME}",
+        "taskWorkspace": task_workspace,
+        "taskEnvironment": task_environment,
+        "loaderPythonPath": workdir,
     }
     # D11 (task #108): the cancel marker the wrapper polls while the child
     # runs; only present when the runner created the control dir.
@@ -1603,11 +1626,25 @@ def _wrapper_run_command(
 ) -> str:
     """Build the in-container wrapper invocation.
 
-    ``PYTHONPATH={workdir}`` makes the sitecustomize.py written by
-    ``_prepare_task_workspace`` auto-import in the wrapper AND child
-    processes: AF_TASK_* env vars, the workdir sys.path entry (loader
-    modules) and the chdir into the task workspace — exact equivalence with
-    the legacy ``session.run`` path without rewriting any user code.
+    D15 §4.2 (Scenario B): the wrapper now receives AF_TASK_* via the
+    taskEnvironment field of wrapper-input.json (task-local, never shared)
+    and injects them into the user child via Popen(env=...). It also performs
+    makedirs/chdir/sys.path setup itself pre-spawn, so the global
+    /sandbox/sitecustomize.py is no longer written per task.
+
+    D15 §4.2.3 (Scenario B) round-2 (codex fe54d9f0 core bug): the user
+    child's sys.path entry for ``{workdir}`` (where af_dataset_loader and
+    other loader modules live) is NO LONGER added by the wrapper via
+    PYTHONPATH env on the child Popen. Putting it on PYTHONPATH would let
+    a stale sitecustomize.py left over in ``{workdir}`` from a previous
+    task be auto-imported by Python's site init phase BEFORE the user
+    script runs, and that stale sitecustomize could overwrite AF_TASK_*
+    back to a previous task's values. Instead, the wrapper stages a
+    per-task loader bootstrap at ``{task_workspace}/_bootstrap/`` that
+    inserts the loader workdir into sys.path AFTER site init finishes,
+    then runs the user script via runpy. PYTHONPATH on this Popen only
+    needs the wrapper's own bootstrap dir (so run_wrapper.py can locate
+    ``app.bounded_exec_wrapper``).
 
     P0-4: when ``child_spec`` is given it is exported verbatim as
     ``AF_SANDBOX_CHILD_USER`` for the wrapper's identity gate (the wrapper
@@ -1617,7 +1654,7 @@ def _wrapper_run_command(
     wrapper_dir = f"{task_workspace}/{WRAPPER_DIR_NAME}"
     bootstrap = f"{wrapper_dir}/{WRAPPER_BOOTSTRAP_NAME}"
     wrapper_input_path = f"{task_workspace}/{WRAPPER_INPUT_FILE_NAME}"
-    pythonpath = f"{workdir}:{wrapper_dir}"
+    pythonpath = wrapper_dir
     export_lines = ""
     if child_spec is not None:
         export_lines = (

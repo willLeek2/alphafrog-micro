@@ -55,6 +55,15 @@ llm_sandbox_exceptions.SandboxTimeoutError = TimeoutError
 sys.modules.setdefault("llm_sandbox", llm_sandbox)
 sys.modules.setdefault("llm_sandbox.exceptions", llm_sandbox_exceptions)
 
+# D15 release-binding (codex a1b749ad) made AF_SANDBOX_IMAGE required at
+# config load (no implicit default, no silent 'latest' fallback). Set a
+# valid digest reference before any app.main import; same pattern as
+# test_main_d14_operation_id_gate.
+os.environ.setdefault(
+    "AF_SANDBOX_IMAGE",
+    "registry.local/alphafrog/runtime@sha256:" + "a" * 64,
+)
+
 _SERVICE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _SERVICE_ROOT not in sys.path:
     sys.path.insert(0, _SERVICE_ROOT)
@@ -411,6 +420,17 @@ class WrapperStagingTest(unittest.TestCase):
             runtimeEnvironmentPath=(
                 f"{self.config.workdir.rstrip('/')}/runtime-environment.json"
             ),
+            # D15 §4.2 (Scenario B): the four AF_TASK_* env vars now travel
+            # in the task-local wrapper-input.json instead of the shared
+            # global sitecustomize.py.
+            taskWorkspace=self.task_workspace,
+            taskEnvironment={
+                "AF_TASK_WORKSPACE": self.task_workspace,
+                "AF_TASK_ARTIFACT_DIR": f"{self.task_workspace}/artifacts",
+                "AF_TASK_TMP_DIR": f"{self.task_workspace}/tmp",
+                "AF_TASK_METRICS_PATH": f"{self.task_workspace}/metrics/loader_metrics.jsonl",
+            },
+            loaderPythonPath=self.config.workdir.rstrip("/"),
         ).wrapper_input_payload()
         self.assertEqual(staged, expected)
         # sourceRevision is Task metadata, never part of the wrapper input.
@@ -452,6 +472,92 @@ class WrapperStagingTest(unittest.TestCase):
         os.unlink(self.session.python_executable_path)
         with self.assertRaises(RuntimeError):
             _resolve_wrapper_interpreter(self.session, self.config, "t")
+
+    def test_staged_wrapper_package_imports_cleanly_without_repo_source(self):
+        """D15-B round-5 (codex cc97f2e6 MUST-FIX): prove the staged wrapper
+        package is SELF-CONTAINED — actually IMPORT ``app.bounded_exec_wrapper``
+        from the staged pkg with NO repo source on sys.path.
+
+        Pre-round-5 regression: the round-4 commit added a new
+        ``app.payload_contract`` module that ``bounded_exec_wrapper.py``
+        imports at startup, but did not add it to
+        ``sandbox_runner.WRAPPER_MODULE_FILES``. The production staging
+        loop (sandbox_runner.py ``_stage_bounded_wrapper``) iterates that
+        list to decide which files to copy into the task-local
+        ``bounded-wrapper/app/`` dir, so ``payload_contract.py`` was NOT
+        staged. At child startup ``run_wrapper.py`` would have failed
+        with ``ModuleNotFoundError: app.payload_contract``.
+
+        The existing wiring check at lines 424-427
+        (``for name in WRAPPER_MODULE_FILES: assertTrue(pkg_dir/name)``)
+        did NOT catch this — it walks the SAME incomplete list production
+        uses to stage, so a file missing from the list is also missing
+        from the assertion set. The bug was a self-consistent check
+        masking an incomplete manifest.
+
+        The positive test below simulates production end-to-end:
+          1. Stage the wrapper via the real ``_stage_bounded_wrapper``.
+          2. Subprocess a python that adds the staged pkg dir to
+             sys.path[0] and imports ``app.bounded_exec_wrapper``.
+          3. Assert the import succeeds AND ``app.__file__`` resolves
+             inside the staged pkg (so a stray ``app`` package in
+             site-packages cannot give a false positive).
+
+        If a future change adds a new transitive dep to
+        ``bounded_exec_wrapper.py`` without updating
+        ``WRAPPER_MODULE_FILES``, this test fails immediately at the
+        import line.
+        """
+        # Stage the wrapper via the production code path.
+        _stage_bounded_wrapper(
+            self.session,
+            self.config,
+            "task-import-probe",
+            self.task_workspace,
+            "print('hi')",
+            30.0,
+            dict(_LIMITS),
+        )
+        staged_pkg_root = Path(self.task_workspace, "bounded-wrapper")
+
+        # Build a minimal clean env: drop inherited PYTHONPATH/PYTHONHOME
+        # so the test runner's own cwd (the repo source, where the full
+        # app/ package lives) cannot leak into the subprocess. -E below
+        # also ignores them, but belt-and-suspenders.
+        clean_env = {
+            "PATH": os.environ.get("PATH", ""),
+        }
+        # -E: ignore PYTHON* env vars; -c: run code string. The code
+        # explicitly adds the staged pkg to sys.path[0] (mirroring what
+        # production's run_wrapper.py does), then imports
+        # bounded_exec_wrapper + payload_contract + asserts the loaded
+        # `app` package came from the staged pkg, not site-packages.
+        result = subprocess.run(
+            [sys.executable, "-E", "-c",
+             "import sys; "
+             f"sys.path.insert(0, {str(staged_pkg_root)!r}); "
+             "import app; "
+             f"assert app.__file__ is not None and app.__file__.startswith("
+             f"{str(staged_pkg_root)!r}), "
+             f"'app loaded from wrong location: ' + (app.__file__ or 'None'); "
+             "import app.bounded_exec_wrapper; "
+             "from app import payload_contract; "
+             "print('imports OK from staged pkg')"],
+            cwd=str(staged_pkg_root.parent),
+            env=clean_env,
+            capture_output=True,
+            timeout=30,
+        )
+        self.assertEqual(
+            result.returncode, 0,
+            f"staged wrapper package is NOT self-contained — a transitive "
+            f"import failed. This means WRAPPER_MODULE_FILES in "
+            f"sandbox_runner.py is missing a module that "
+            f"bounded_exec_wrapper.py imports at startup. In production "
+            f"(task-local staging) the wrapper would fail with the same "
+            f"ModuleNotFoundError at child startup. "
+            f"stderr={result.stderr.decode('utf-8', 'replace')[:2048]!r}",
+        )
 
 
 class CaptureReadbackTest(unittest.TestCase):
@@ -633,6 +739,18 @@ class CaptureSpawnWiringTest(unittest.TestCase):
             limits=self._limits(),
             capture_dir=capture_dir,
             child_identity=None,
+            # D15 §4.2.3 round-2: bootstrap mode requires a task-local
+            # task_workspace + loader path. These wiring tests target
+            # capture-dir/pipe inheritance, not task isolation, but the
+            # spawn path now hard-requires them.
+            task_workspace=str(self.task_dir),
+            task_environment={
+                "AF_TASK_WORKSPACE": str(self.task_dir),
+                "AF_TASK_ARTIFACT_DIR": f"{self.task_dir}/artifacts",
+                "AF_TASK_TMP_DIR": f"{self.task_dir}/tmp",
+                "AF_TASK_METRICS_PATH": f"{self.task_dir}/metrics/loader.jsonl",
+            },
+            workdir_for_pythonpath=str(self.task_dir),
         )
         try:
             self.assertTrue(sweep_ok)
@@ -672,6 +790,16 @@ class CaptureSpawnWiringTest(unittest.TestCase):
                 limits=self._limits(),
                 capture_dir=capture_dir,
                 child_identity=None,
+                # D15 §4.2.3 round-2: bootstrap mode requires a task-local
+                # task_workspace + loader path; see the sibling test above.
+                task_workspace=str(self.task_dir),
+                task_environment={
+                    "AF_TASK_WORKSPACE": str(self.task_dir),
+                    "AF_TASK_ARTIFACT_DIR": f"{self.task_dir}/artifacts",
+                    "AF_TASK_TMP_DIR": f"{self.task_dir}/tmp",
+                    "AF_TASK_METRICS_PATH": f"{self.task_dir}/metrics/loader.jsonl",
+                },
+                workdir_for_pythonpath=str(self.task_dir),
             )
         try:
             self.assertTrue(sweep_ok)
@@ -1270,6 +1398,17 @@ class CaptureTamperingWiringTest(unittest.TestCase):
                     "effectiveOutputLimits": {
                         key: self._TAMPER_LIMITS[key] for key in _LIMIT_KEYS
                     },
+                    # D15 §4.2 (Scenario B): taskWorkspace/taskEnvironment are
+                    # required by parse_wrapper_input, so supply valid ones
+                    # so the planted-symlink path is what trips the wrapper.
+                    "taskWorkspace": str(input_dir),
+                    "taskEnvironment": {
+                        "AF_TASK_WORKSPACE": str(input_dir),
+                        "AF_TASK_ARTIFACT_DIR": f"{input_dir}/artifacts",
+                        "AF_TASK_TMP_DIR": f"{input_dir}/tmp",
+                        "AF_TASK_METRICS_PATH": f"{input_dir}/metrics/x.jsonl",
+                    },
+                    "loaderPythonPath": str(input_dir),
                 }
             ),
             encoding="utf-8",
@@ -1334,6 +1473,17 @@ class CreateTaskSnapshotTest(unittest.IsolatedAsyncioTestCase):
                 main_module.task_store,
                 main_module.tasks,
                 main_module.dynamic_config,
+            )
+            # D14 (task #112) made operation_id required at production. This
+            # pre-D14 test pins snapshot/store semantics, not operationId gate
+            # behavior, so toggle the in-memory config flag (read from
+            # main_module.config at create_task time, not at module import).
+            # config is a frozen dataclass so use object.__setattr__.
+            saved_allow_legacy = main_module.config.allow_create_without_operation_id
+            object.__setattr__(
+                main_module.config,
+                "allow_create_without_operation_id",
+                True,
             )
             main_module.task_store = store
             main_module.tasks = store.tasks
@@ -1403,6 +1553,11 @@ class CreateTaskSnapshotTest(unittest.IsolatedAsyncioTestCase):
                     main_module.config.sandbox_image,
                 )
             finally:
+                object.__setattr__(
+                    main_module.config,
+                    "allow_create_without_operation_id",
+                    saved_allow_legacy,
+                )
                 (
                     main_module.task_store,
                     main_module.tasks,

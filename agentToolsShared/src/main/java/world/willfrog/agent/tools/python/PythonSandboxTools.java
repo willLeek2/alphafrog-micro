@@ -156,6 +156,16 @@ public class PythonSandboxTools {
     @Value("${sandbox.runtime-environment-version:python-sandbox-v1}")
     private String runtimeEnvironmentVersion = "python-sandbox-v1";
 
+    /**
+     * D14 (Q-14): production fail-closed switch. When false (default), incomplete
+     * Data-intense wiring MUST NOT silently fall back to Legacy create (no
+     * reserve / no operationId). Set true only for explicitly annotated
+     * non-production fixtures: no global capacity admission, no idempotent
+     * recovery — must not be pointed at production Gateway.
+     */
+    @Value("${sandbox.create.allow-legacy-without-capacity:false}")
+    private boolean allowLegacyWithoutCapacity = false;
+
     private final DatasetEntryMetadataReader metadataReader;
 
     public PythonSandboxTools(ObjectMapper objectMapper) {
@@ -382,6 +392,29 @@ public class PythonSandboxTools {
                         runId, subSnapshot, allDatasets, resolvedManifests,
                         legacyRequest, timeout, toolStartMs);
             }
+
+            // D14 (Q-14): production must not silently degrade to Legacy create.
+            // Fail before any Gateway call. Public error stays stable (no bean/
+            // config inventory); presence details stay in operator logs only.
+            if (!allowLegacyWithoutCapacity) {
+                log.error("sandbox.create.wiringIncomplete: production refuses "
+                        + "Legacy create; capacityWiringPresent={}; "
+                        + "nonProductionSwitch=sandbox.create.allow-legacy-without-capacity",
+                        dataIntenseWiringAvailable());
+                emitSandboxToolTotal(toolStartMs, "ERROR", "SANDBOX_CAPACITY_WIRING_INCOMPLETE");
+                return fail(
+                        "executePython",
+                        "SANDBOX_CAPACITY_WIRING_INCOMPLETE",
+                        "Python sandbox production wiring incomplete; "
+                                + "refuses Legacy create without capacity reservation "
+                                + "and operationId. Non-production fixtures must enable "
+                                + "the documented Legacy compatibility switches as a group "
+                                + "(no global capacity admission / no idempotent recovery).",
+                        Map.of());
+            }
+            log.warn("sandbox.create.legacyWithoutCapacity: allow-legacy-without-capacity=true "
+                    + "(NON-PRODUCTION: no global capacity admission, no operationId recovery; "
+                    + "must also enable companion Gateway/Python switches as a group)");
 
             long createStartMs = System.currentTimeMillis();
             installDebugRpcAttachments();

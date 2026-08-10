@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import queue
 import sys
 import tempfile
@@ -28,6 +29,16 @@ import unittest
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
+
+# D15 release-binding (codex a1b749ad) made AF_SANDBOX_IMAGE required at
+# config load (no implicit default, no silent 'latest' fallback). Set a
+# valid digest reference before app.main import so the cancel endpoint
+# tests can load the production config. Same pattern as
+# test_main_d14_operation_id_gate.
+os.environ.setdefault(
+    "AF_SANDBOX_IMAGE",
+    "registry.local/alphafrog/runtime@sha256:" + "a" * 64,
+)
 
 from fastapi.testclient import TestClient
 

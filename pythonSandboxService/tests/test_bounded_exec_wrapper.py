@@ -100,11 +100,24 @@ class BoundedExecWrapperTest(unittest.TestCase):
             # The runtime-environment.json schema belongs to another work
             # package; these tests only need the path to exist.
             runtime_env.write_text("{}", encoding="utf-8")
+        # D15 §4.2 (Scenario B): the wrapper now requires task-scoped
+        # taskWorkspace + taskEnvironment (AF_TASK_* isolation moves out of
+        # the global sitecustomize.py). Tests stage them under the task_dir.
+        task_workspace = str(self.task_dir)
+        task_env = {
+            "AF_TASK_WORKSPACE": task_workspace,
+            "AF_TASK_ARTIFACT_DIR": f"{task_workspace}/artifacts",
+            "AF_TASK_TMP_DIR": f"{task_workspace}/tmp",
+            "AF_TASK_METRICS_PATH": f"{task_workspace}/metrics/loader.jsonl",
+        }
         payload = {
             "scriptPath": str(script),
             "timeoutSeconds": timeout_seconds,
             "effectiveOutputLimits": merged,
             "runtimeEnvironmentPath": str(runtime_env),
+            "taskWorkspace": task_workspace,
+            "taskEnvironment": task_env,
+            "loaderPythonPath": task_workspace,
         }
         input_path = self.task_dir / "wrapper-input.json"
         input_path.write_text(json.dumps(payload), encoding="utf-8")
@@ -745,11 +758,24 @@ class ProcessTreeSweepTest(unittest.TestCase):
         return script
 
     def _run_wrapper(self, script: Path, timeout_seconds: int = 30):
+        # D15 §4.2 (Scenario B): wrapper-input now carries AF_TASK_* in
+        # taskEnvironment + a task-local taskWorkspace, replacing the legacy
+        # global /sandbox/sitecustomize.py bootstrap.
+        task_workspace = str(self.task_dir)
+        task_env = {
+            "AF_TASK_WORKSPACE": task_workspace,
+            "AF_TASK_ARTIFACT_DIR": f"{task_workspace}/artifacts",
+            "AF_TASK_TMP_DIR": f"{task_workspace}/tmp",
+            "AF_TASK_METRICS_PATH": f"{task_workspace}/metrics/loader.jsonl",
+        }
         payload = {
             "scriptPath": str(script),
             "timeoutSeconds": timeout_seconds,
             "effectiveOutputLimits": dict(DEFAULT_LIMITS),
             "runtimeEnvironmentPath": str(self.task_dir / "runtime-environment.json"),
+            "taskWorkspace": task_workspace,
+            "taskEnvironment": task_env,
+            "loaderPythonPath": task_workspace,
         }
         (self.task_dir / "runtime-environment.json").write_text("{}", encoding="utf-8")
         input_path = self.task_dir / "wrapper-input.json"
@@ -1079,6 +1105,15 @@ class StreamingStdoutEndToEndTest(unittest.TestCase):
                 "stdoutMaxBytes": cap,
             },
             "runtimeEnvironmentPath": str(self.task_dir / "runtime-environment.json"),
+            # D15 §4.2 (Scenario B): task-scoped AF_TASK_* isolation.
+            "taskWorkspace": str(self.task_dir),
+            "taskEnvironment": {
+                "AF_TASK_WORKSPACE": str(self.task_dir),
+                "AF_TASK_ARTIFACT_DIR": f"{self.task_dir}/artifacts",
+                "AF_TASK_TMP_DIR": f"{self.task_dir}/tmp",
+                "AF_TASK_METRICS_PATH": f"{self.task_dir}/metrics/loader.jsonl",
+            },
+            "loaderPythonPath": str(self.task_dir),
         }
         (self.task_dir / "runtime-environment.json").write_text("{}", encoding="utf-8")
         input_path = self.task_dir / "wrapper-input.json"
