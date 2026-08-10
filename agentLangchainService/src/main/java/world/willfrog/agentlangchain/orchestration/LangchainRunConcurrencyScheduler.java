@@ -2,6 +2,7 @@ package world.willfrog.agentlangchain.orchestration;
 
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.stereotype.Component;
@@ -10,6 +11,7 @@ import world.willfrog.agentlangchain.config.LangchainRunExecutorLimits;
 import world.willfrog.agentlangchain.config.LangchainRunExecutorLimitsResolver;
 
 import java.util.ArrayDeque;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Queue;
 import java.util.UUID;
@@ -56,14 +58,31 @@ public class LangchainRunConcurrencyScheduler {
     private static final long QUEUED_PROMOTED_WARN_INTERVAL_MS = 30_000;
     private static final long OLDEST_AGE_WARN_INTERVAL_MS = 60_000;
 
+    // ── 单实例标识 (用于跨实例 snapshot 聚合时的来源区分) ──
+    // 格式: <applicationName>@<hostname>@<pid>; hostname 解析失败时 fallback 为
+    // unknown-host-<uuid8> (JVM 启动时一次性解析), 防止容器场景下相同 PID (例如 1) 碰撞.
+    private final String instanceId;
+
+    private static String resolveInstanceId(String applicationName) {
+        String hostname;
+        try {
+            hostname = java.net.InetAddress.getLocalHost().getHostName();
+        } catch (java.net.UnknownHostException e) {
+            hostname = "unknown-host-" + UUID.randomUUID().toString().substring(0, 8);
+        }
+        return applicationName + "@" + hostname + "@" + ProcessHandle.current().pid();
+    }
+
     // ── Latest snapshot store (consumed by observability / actuator) ──
     private volatile Map<String, Object> latestSnapshot = Map.of();
 
     public LangchainRunConcurrencyScheduler(
             @Qualifier("agentLangchainRunTaskExecutor") ThreadPoolTaskExecutor executor,
-            LangchainRunExecutorLimitsResolver limitsResolver) {
+            LangchainRunExecutorLimitsResolver limitsResolver,
+            @Value("${spring.application.name:unknown-app}") String applicationName) {
         this.executor = executor;
         this.limitsResolver = limitsResolver;
+        this.instanceId = resolveInstanceId(applicationName);
     }
 
     public Reservation reserve() {
@@ -324,18 +343,20 @@ public class LangchainRunConcurrencyScheduler {
         long oldestAgeMs = oldestQueuedAtMillis > 0
                 ? System.currentTimeMillis() - oldestQueuedAtMillis
                 : 0;
-        return Map.of(
-                "running", running,
-                "queued", reservedQueued,
-                "rejectedTotal", rejectedCount.get(),
-                "corePoolSize", current.getCorePoolSize(),
-                "maxPoolSize", current.getMaxPoolSize(),
-                "queueCapacity", current.getQueueCapacity(),
-                "hardCorePoolSize", hard.getCorePoolSize(),
-                "hardMaxPoolSize", hard.getMaxPoolSize(),
-                "hardQueueCapacity", hard.getQueueCapacity(),
-                "oldestQueuedAgeMs", oldestAgeMs
-        );
+        Map<String, Object> snap = new LinkedHashMap<>();
+        snap.put("instanceId", instanceId);
+        snap.put("running", running);
+        snap.put("queued", reservedQueued);
+        snap.put("rejectedTotal", rejectedCount.get());
+        snap.put("corePoolSize", current.getCorePoolSize());
+        snap.put("maxPoolSize", current.getMaxPoolSize());
+        snap.put("queueCapacity", current.getQueueCapacity());
+        snap.put("hardCorePoolSize", hard.getCorePoolSize());
+        snap.put("hardMaxPoolSize", hard.getMaxPoolSize());
+        snap.put("hardQueueCapacity", hard.getQueueCapacity());
+        snap.put("oldestQueuedAgeMs", oldestAgeMs);
+        snap.put("hardVsEffectiveGap", limitsResolver.getHardVersusEffectiveGap());
+        return snap;
     }
 
     @Scheduled(fixedDelayString = "${agent.langchain.run.executor.diag-interval-ms:30000}")

@@ -158,12 +158,13 @@ class RagToolsTest {
         }
 
         @Override
-        public String read(String runId, String shortId) {
+        public String read(String runId, String userId, String shortId) {
             return registeredContent;
         }
 
         @Override
-        public ToolOutputReadResult read(String runId, String shortId, int offset, int limit, String keyword) {
+        public ToolOutputReadResult read(String runId, String userId, String shortId,
+                                         int offset, int limit, String keyword) {
             return ToolOutputReadResult.builder()
                     .content("window")
                     .hasMore(false)

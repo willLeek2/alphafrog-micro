@@ -5,6 +5,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.springframework.test.util.ReflectionTestUtils;
+import world.willfrog.agent.platform.storage.AgentStoragePaths;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -39,10 +40,13 @@ class DatasetWriterRegistryPathAlignmentTest {
 
     @BeforeEach
     void setUp() {
-        writer = new DatasetWriter();
-        ReflectionTestUtils.setField(writer, "datasetPath", tempDir.resolve("agent_datasets").toString());
+        // D04：dataset 根目录改经统一存储门面注入；本测试用显式值入口把根指到 tempDir
+        writer = new DatasetWriter(new AgentStoragePaths(
+                tempDir.resolve("workspaces").toString(),
+                tempDir.resolve("artifacts").toString(),
+                tempDir.resolve("agent_datasets").toString(),
+                tempDir.resolve("obs.log").toString()));
         ReflectionTestUtils.setField(writer, "databaseFetchedPath", tempDir.resolve("database_fetched").toString());
-        ReflectionTestUtils.setField(writer, "manifestsPath", tempDir.resolve("manifests").toString());
         ReflectionTestUtils.setField(writer, "enabled", true);
         ReflectionTestUtils.setField(writer, "localConfigLoader", null);
     }

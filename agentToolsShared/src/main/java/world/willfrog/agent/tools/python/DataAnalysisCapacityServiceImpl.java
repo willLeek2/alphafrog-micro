@@ -11,6 +11,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
+import world.willfrog.agent.platform.dataanalysis.CapacityAdmissionException;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisAdmissionState;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisCapacityRecoveryReport;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisCapacityService;
@@ -476,27 +477,6 @@ public class DataAnalysisCapacityServiceImpl implements DataAnalysisCapacityServ
 
     int heavyActiveCountSnapshot() {
         return heavyActiveCount.get();
-    }
-
-    /**
-     * Capacity-layer admission error. The {@code reason} mirrors the §6.8 error-code vocabulary
-     * so the tool layer can translate to {@code DATA_ANALYSIS_SERVER_BUSY} or
-     * {@code DATA_ANALYSIS_TASK_TOO_LARGE} without leaking the in-memory details.
-     */
-    public static final class CapacityAdmissionException extends RuntimeException {
-
-        public enum Reason { RECOVERING, SERVER_BUSY, TASK_TOO_LARGE, ALREADY_RESERVED, ILLEGAL_RESTORE }
-
-        private final Reason reason;
-
-        public CapacityAdmissionException(Reason reason, String message) {
-            super(message);
-            this.reason = reason;
-        }
-
-        public Reason reason() {
-            return reason;
-        }
     }
 
     /** Static factory used by tests to keep dependency wiring free. */

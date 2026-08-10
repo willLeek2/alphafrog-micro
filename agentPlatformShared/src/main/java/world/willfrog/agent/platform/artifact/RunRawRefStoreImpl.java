@@ -31,8 +31,11 @@ public class RunRawRefStoreImpl implements RunRawRefStore {
         String shortId = SHORT_ID_PREFIX + String.format("%03d", seq);
 
         long ttlHours = Math.max(1, (ttlSeconds + 3599) / 3600);
-        PersistentArtifactRegistration registration = artifactRegistry.register(
-                ARTIFACT_TYPE, runId, displayName, content, ttlHours);
+        // D22-5.1.3：显式上下文入口——runId/userId 直接来自调用方参数（此前 userId 参数
+        // 未使用、meta 靠 AgentContext 线程态补齐）。注意必须走非幂等 registerExplicit：
+        // 本 store 的 logicalId 固定为 runId，同 run 多条 rawRef 若走幂等路径会撞身份字段。
+        PersistentArtifactRegistration registration = artifactRegistry.registerExplicit(
+                runId, userId, ARTIFACT_TYPE, runId, displayName, content, ttlHours);
 
         String mappingKey = mappingKey(runId);
         redisTemplate.opsForHash().put(mappingKey, shortId, registration.getArtifactId());
@@ -44,15 +47,18 @@ public class RunRawRefStoreImpl implements RunRawRefStore {
     }
 
     @Override
-    public String read(String runId, String shortId) {
+    public String read(String runId, String userId, String shortId) {
         String artifactId = resolveArtifactId(runId, shortId);
-        return artifactRegistry.readContent(artifactId);
+        // 严格归属校验：短 ID 映射只证明该 shortId 在此 run 下注册过，不足以放行内容；
+        // 内容读取必须再经 readContentStrict 校验 runId+userId 四值严格相等（fail-closed）。
+        return artifactRegistry.readContentStrict(artifactId, runId, userId);
     }
 
     @Override
-    public ToolOutputReadResult read(String runId, String shortId, int offset, int limit, String keyword) {
+    public ToolOutputReadResult read(String runId, String userId, String shortId,
+                                     int offset, int limit, String keyword) {
         String artifactId = resolveArtifactId(runId, shortId);
-        String content = artifactRegistry.readContent(artifactId);
+        String content = artifactRegistry.readContentStrict(artifactId, runId, userId);
         String source = filterByKeyword(content, keyword);
         int total = source.length();
         int safeOffset = Math.max(0, Math.min(offset, total));

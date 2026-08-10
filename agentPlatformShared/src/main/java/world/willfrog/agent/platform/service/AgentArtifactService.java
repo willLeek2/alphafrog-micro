@@ -2,36 +2,71 @@ package world.willfrog.agent.platform.service;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import lombok.Builder;
-import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
+import world.willfrog.agent.platform.artifact.PersistentArtifactMeta;
+import world.willfrog.agent.platform.artifact.PersistentArtifactRegistry;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.entity.AgentRunEvent;
 import world.willfrog.agent.platform.mapper.AgentRunEventMapper;
+import world.willfrog.agent.platform.storage.AgentStoragePaths;
 import world.willfrog.alphafrogmicro.agent.idl.AgentArtifactMessage;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.nio.file.StandardCopyOption;
-import java.nio.file.attribute.FileTime;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
+/**
+ * 用户侧制品 API 门面 + legacy 适配器（D22-5.1.3 起，codex 裁决 f0ee72cb）。
+ *
+ * <p>本服务不再是第二套自管存储实现：注册、索引、归属、清理的唯一权威是
+ * {@link PersistentArtifactRegistry}；存储根一律经 D04 门面 {@link AgentStoragePaths}
+ * 解析（原直连键 K3 {@code agent.artifact.storage.path} 与 K4
+ * {@code agent.tools.market-data.dataset.path} 已摘除，双 legacy alias 收敛与
+ * fail-closed 在门面内实现）。</p>
+ *
+ * <h3>list 面（Registry-first）</h3>
+ * <ol>
+ *   <li>重放 run 事件得出事件派生候选（python script / dataset 文件），沿用
+ *       success-only 过滤与 retention 两档语义；</li>
+ *   <li>对事件派生但尚未注册的制品做<b>惰性幂等注册</b>：脚本走
+ *       {@link PersistentArtifactRegistry#registerIdempotent}（内容制品），
+ *       dataset 文件走 {@link PersistentArtifactRegistry#registerExternalIdempotent}
+ *       （原地引用，不复制文件、不双树写入）；重复 list 复用同一 artifactId；</li>
+ *   <li>最终以 {@link PersistentArtifactRegistry#listByRunId} 为权威清单映射 DTO；
+ *       事件派生项的 createdAt/expiresAt/metaJson 按事件侧重放值重建（零漂移）。</li>
+ * </ol>
+ *
+ * <h3>load/download 面（Registry-first）</h3>
+ * <p>先 {@link PersistentArtifactRegistry#find} + {@link PersistentArtifactRegistry#matchesOwnerStrict}
+ * 归属校验；事件派生类型额外要求事件侧重放命中（retention/success-only 语义保持）。
+ * 仅当 registry miss 时才允许对历史 Base64 {@code type|runId|ref} 格式 ID 做
+ * <b>只读回退</b>：按旧快照位置读取内容，回退路径不写文件、不注册新制品。</p>
+ *
+ * <p>历史兼容：旧 Base64 ID 与旧快照树（{artifactRoot}/{runId}/scripts|datasets/…）
+ * 保持只读可用；历史制品不搬迁、不删除。</p>
+ *
+ * @author wang
+ */
 @Service
 @RequiredArgsConstructor
 @Slf4j
@@ -40,16 +75,26 @@ public class AgentArtifactService {
     private static final Pattern DATASET_ID_PATTERN = Pattern.compile("^[A-Za-z0-9._-]+$");
     private static final DateTimeFormatter TIME_FORMATTER = DateTimeFormatter.ISO_OFFSET_DATE_TIME;
 
+    private static final String TYPE_PYTHON_SCRIPT = "python_script";
+
+    /**
+     * 事件派生制品类型：list 的 scope/retention 过滤与 load 的可见性判定都依赖事件重放，
+     * 非事件派生制品（rawRef / tool-output / DatasetRegistry 注册项等）由 registry 自管生命周期。
+     */
+    private static final Set<String> EVENT_DERIVED_TYPES = Set.of(
+            TYPE_PYTHON_SCRIPT, "dataset_csv", "dataset_json", "dataset_meta", "dataset_file");
+
+    /** retention 配置为 <=0（永不过期）时的注册 TTL 兜底：meta TTL 无法表达无限，取一年上界。 */
+    private static final long UNLIMITED_TTL_HOURS = 24L * 365L;
+
     private final AgentEventService eventService;
     /** DB event mapper；workspace v0 走 DB，不依赖 Redis 事件流。 */
     private final AgentRunEventMapper agentRunEventMapper;
     private final ObjectMapper objectMapper;
-
-    @Value("${agent.tools.market-data.dataset.path:/data/agent_datasets}")
-    private String datasetPath;
-
-    @Value("${agent.artifact.storage.path:/data/agent_artifacts}")
-    private String artifactStoragePath;
+    /** D22-5.1.3：唯一权威制品注册表（注册 / 索引 / 归属 / 读取 / 清理均经此）。 */
+    private final PersistentArtifactRegistry artifactRegistry;
+    /** D04 统一存储门面：artifactRoot / datasetRoot（K3/K4 legacy alias 收敛在门面内）。 */
+    private final AgentStoragePaths storagePaths;
 
     @Value("${agent.artifact.retention-days.normal:7}")
     private int normalRetentionDays;
@@ -61,25 +106,86 @@ public class AgentArtifactService {
     private long downloadMaxBytes;
 
     public String extractRunId(String artifactId) {
-        ArtifactRef ref = decodeArtifactId(artifactId);
-        return ref.runId();
+        if (artifactId == null || artifactId.isBlank()) {
+            throw new IllegalArgumentException("artifact_id is required");
+        }
+        // Registry-first：注册制品直接取 meta.runId；仅历史 Base64 ID 走解码回退。
+        try {
+            Optional<PersistentArtifactMeta> meta = artifactRegistry.find(artifactId);
+            if (meta.isPresent()) {
+                String runId = meta.get().getRunId();
+                if (runId != null && !runId.isBlank()) {
+                    return runId;
+                }
+                throw new IllegalArgumentException("invalid artifact id");
+            }
+        } catch (IllegalArgumentException e) {
+            throw e;
+        } catch (Exception e) {
+            // registry 不可用时退回纯解码路径：legacy ID 不依赖 Redis；registry ID 会在解码处显式失败。
+            log.warn("Artifact registry lookup failed during extractRunId, fallback to legacy decode: {}",
+                    e.getMessage());
+        }
+        return decodeArtifactId(artifactId).runId();
     }
 
     public List<AgentArtifactMessage> listArtifacts(AgentRun run, boolean isAdmin) {
-        List<ResolvedArtifact> artifacts = resolveArtifacts(run, isAdmin);
         String runId = run == null || run.getId() == null ? "" : run.getId();
-        List<AgentArtifactMessage> result = new ArrayList<>();
-        for (ResolvedArtifact artifact : artifacts) {
-            result.add(AgentArtifactMessage.newBuilder()
-                    .setArtifactId(artifact.getArtifactId())
-                    .setType(artifact.getType())
-                    .setName(artifact.getName())
-                    .setContentType(artifact.getContentType())
-                    .setUrl("/api/agent/runs/" + runId + "/artifacts/" + artifact.getArtifactId() + "/download")
-                    .setMetaJson(artifact.getMetaJson())
-                    .setCreatedAt(formatTime(artifact.getCreatedAt()))
-                    .setExpiresAtMillis(artifact.getExpiresAtMillis())
-                    .build());
+        if (runId.isBlank()) {
+            return List.of();
+        }
+        String userId = run.getUserId();
+
+        List<EventDerivedCandidate> candidates = buildEventCandidates(run, isAdmin);
+        List<PersistentArtifactMeta> listed = artifactRegistry.listByRunId(runId);
+        if (registerMissingEventDerived(runId, userId, candidates, listed)) {
+            // 惰性注册后以 registry 为权威重读
+            listed = artifactRegistry.listByRunId(runId);
+        }
+
+        Map<String, EventDerivedCandidate> candidateByIdentity = new HashMap<>();
+        for (EventDerivedCandidate candidate : candidates) {
+            candidateByIdentity.put(
+                    PersistentArtifactRegistry.identityField(candidate.type(), candidate.logicalId(), null),
+                    candidate);
+        }
+
+        List<RankedArtifact> ranked = new ArrayList<>();
+        for (PersistentArtifactMeta meta : listed) {
+            if (!PersistentArtifactRegistry.matchesOwnerStrict(meta, runId, userId)) {
+                continue;
+            }
+            if (EVENT_DERIVED_TYPES.contains(meta.getArtifactType())) {
+                // success-only 过滤：当前 scope 未重放出来的事件派生项不可见（normal 下的失败脚本、
+                // 事件源缺失时的全部事件派生项——与降级前 resolveArtifacts 语义一致）。
+                EventDerivedCandidate candidate = candidateByIdentity.get(
+                        PersistentArtifactRegistry.identityField(
+                                meta.getArtifactType(), meta.getLogicalId(), null));
+                if (candidate == null) {
+                    continue;
+                }
+                long createdAtMillis = candidate.createdAtMillis();
+                long expiresAtMillis = calcExpiresAtMillis(createdAtMillis, isAdmin);
+                if (isExpired(expiresAtMillis)) {
+                    continue;
+                }
+                ranked.add(new RankedArtifact(toMessage(runId,
+                        meta.getArtifactId(), meta.getArtifactType(), candidate.displayName(),
+                        writeJson(buildEventDerivedMetaJson(candidate, isAdmin)),
+                        createdAtMillis, expiresAtMillis), createdAtMillis));
+            } else {
+                long createdAtMillis = meta.getCreatedAtMillis() == null ? 0L : meta.getCreatedAtMillis();
+                long expiresAtMillis = meta.getExpiresAtMillis() == null ? 0L : meta.getExpiresAtMillis();
+                ranked.add(new RankedArtifact(toMessage(runId,
+                        meta.getArtifactId(), meta.getArtifactType(), displayNameOf(meta),
+                        writeJson(buildRegistryMetaJson(meta, isAdmin)),
+                        createdAtMillis, expiresAtMillis), createdAtMillis));
+            }
+        }
+        ranked.sort((a, b) -> Long.compare(b.createdAtMillis(), a.createdAtMillis()));
+        List<AgentArtifactMessage> result = new ArrayList<>(ranked.size());
+        for (RankedArtifact item : ranked) {
+            result.add(item.message());
         }
         return result;
     }
@@ -130,31 +236,50 @@ public class AgentArtifactService {
     }
 
     private ArtifactContent loadArtifact(AgentRun run, boolean isAdmin, String artifactId, boolean enforceDownloadMaxBytes) {
-        List<ResolvedArtifact> artifacts = resolveArtifacts(run, isAdmin);
-        ResolvedArtifact target = artifacts.stream()
-                .filter(item -> Objects.equals(item.getArtifactId(), artifactId))
-                .findFirst()
-                .orElseThrow(() -> new IllegalArgumentException("artifact not found"));
+        String runId = run == null || run.getId() == null ? "" : run.getId();
+        String userId = run == null ? null : run.getUserId();
 
-        if (target.getFilePath() == null) {
-            throw new IllegalArgumentException("artifact source not found");
-        }
-
-        try {
-            long size = Files.size(target.getFilePath());
-            if (enforceDownloadMaxBytes && downloadMaxBytes > 0 && size > downloadMaxBytes) {
-                throw new IllegalStateException("artifact too large to download");
+        // Registry-first：命中即走权威路径；事件派生类型额外要求事件侧重放命中
+        // （retention 两档 + success-only 过滤语义保持，与降级前 resolveArtifacts 一致）。
+        Optional<PersistentArtifactMeta> found = artifactRegistry.find(artifactId);
+        if (found.isPresent()) {
+            PersistentArtifactMeta meta = found.get();
+            if (!PersistentArtifactRegistry.matchesOwnerStrict(meta, runId, userId)) {
+                throw new IllegalArgumentException("artifact not found");
             }
-            byte[] bytes = Files.readAllBytes(target.getFilePath());
-            return new ArtifactContent(target.getArtifactId(), target.getName(), target.getContentType(), bytes);
-        } catch (IllegalStateException e) {
-            throw e;
-        } catch (Exception e) {
-            throw new IllegalStateException("read artifact failed", e);
+            String filename;
+            if (EVENT_DERIVED_TYPES.contains(meta.getArtifactType())) {
+                EventDerivedCandidate candidate =
+                        findCandidate(run, isAdmin, meta.getArtifactType(), meta.getLogicalId());
+                if (candidate == null) {
+                    throw new IllegalArgumentException("artifact not found");
+                }
+                filename = candidate.displayName();
+            } else {
+                Long expiresAtMillis = meta.getExpiresAtMillis();
+                if (expiresAtMillis != null && System.currentTimeMillis() > expiresAtMillis) {
+                    throw new IllegalArgumentException("artifact not found");
+                }
+                filename = displayNameOf(meta);
+            }
+            byte[] bytes = readRegistryArtifact(meta, enforceDownloadMaxBytes);
+            return new ArtifactContent(meta.getArtifactId(), filename,
+                    contentTypeFor(meta.getArtifactType()), bytes);
         }
+
+        // Registry miss：仅历史 Base64 type|runId|ref ID 允许只读回退（不写文件、不注册）。
+        return loadLegacyArtifact(run, isAdmin, artifactId, enforceDownloadMaxBytes);
     }
 
-    private List<ResolvedArtifact> resolveArtifacts(AgentRun run, boolean isAdmin) {
+    // ===== list 侧：事件派生候选 + 惰性幂等注册 =====
+
+    /**
+     * 事件派生候选：事件重放 + scope 过滤 + retention 过滤后的可注册项。
+     *
+     * <p>脚本候选携带代码内容（内容制品）；dataset 文件候选携带 dataset 根内的原位路径
+     * （external 引用制品，注册不复制文件）。</p>
+     */
+    private List<EventDerivedCandidate> buildEventCandidates(AgentRun run, boolean isAdmin) {
         List<AgentRunEvent> events = eventService.listByRunId(run.getId());
         ParsedEvents parsed = parseEvents(events);
 
@@ -165,63 +290,48 @@ public class AgentArtifactService {
         }
         selectedDatasetIds.addAll(parsed.fallbackDatasetIds());
 
-        List<ResolvedArtifact> artifacts = new ArrayList<>();
+        List<EventDerivedCandidate> candidates = new ArrayList<>();
         for (PythonInvocation invocation : selectedInvocations) {
             if (invocation.code() == null || invocation.code().isBlank()) {
                 continue;
             }
             long createdAtMillis = toMillis(invocation.createdAt(), run);
-            long expiresAtMillis = calcExpiresAtMillis(createdAtMillis, isAdmin);
-            if (isExpired(expiresAtMillis)) {
+            if (isExpired(calcExpiresAtMillis(createdAtMillis, isAdmin))) {
                 continue;
             }
-            String artifactId = encodeArtifactId("script", run.getId(), invocation.ref());
-            Path scriptFile = snapshotPythonScript(run.getId(), invocation.ref(), invocation.code(), createdAtMillis);
-            if (scriptFile == null) {
-                continue;
-            }
-            Map<String, Object> meta = new HashMap<>();
-            meta.put("kind", "python_script");
-            meta.put("scope", isAdmin ? "admin" : "normal");
-            meta.put("source", invocation.source());
-            meta.put("seq", invocation.seq());
-            meta.put("success", invocation.success());
-            artifacts.add(ResolvedArtifact.builder()
-                    .artifactId(artifactId)
-                    .type("python_script")
-                    .name(scriptFile.getFileName().toString())
-                    .contentType("text/x-python")
-                    .metaJson(writeJson(meta))
-                    .createdAt(toOffsetDateTime(createdAtMillis))
-                    .expiresAtMillis(expiresAtMillis)
-                    .filePath(scriptFile)
-                    .build());
+            Map<String, Object> extras = new LinkedHashMap<>();
+            extras.put("source", invocation.source());
+            extras.put("seq", invocation.seq());
+            extras.put("success", invocation.success());
+            candidates.add(new EventDerivedCandidate(
+                    TYPE_PYTHON_SCRIPT,
+                    invocation.ref(),
+                    sanitizeFileName(invocation.ref()) + ".py",
+                    createdAtMillis,
+                    invocation.code(),
+                    null,
+                    extras));
         }
 
-        Path baseDir = Paths.get(datasetPath);
+        Path datasetRoot = storagePaths.datasetRoot();
         for (String datasetId : selectedDatasetIds) {
             if (datasetId == null || datasetId.isBlank()) {
                 continue;
             }
-            Path datasetDir = baseDir.resolve(datasetId).normalize();
-            if (!datasetDir.startsWith(baseDir)) {
+            Path datasetDir = datasetRoot.resolve(datasetId).normalize();
+            if (!datasetDir.startsWith(datasetRoot)) {
                 continue;
             }
-            addDatasetFileArtifacts(artifacts, run.getId(), datasetId, datasetDir, isAdmin);
+            addDatasetFileCandidates(candidates, run.getId(), datasetId, datasetDir, isAdmin);
         }
-
-        artifacts.sort((a, b) -> Long.compare(
-                b.getCreatedAt() == null ? 0L : b.getCreatedAt().toInstant().toEpochMilli(),
-                a.getCreatedAt() == null ? 0L : a.getCreatedAt().toInstant().toEpochMilli()
-        ));
-        return artifacts;
+        return candidates;
     }
 
-    private void addDatasetFileArtifacts(List<ResolvedArtifact> artifacts,
-                                         String runId,
-                                         String datasetId,
-                                         Path datasetDir,
-                                         boolean isAdmin) {
+    private void addDatasetFileCandidates(List<EventDerivedCandidate> candidates,
+                                          String runId,
+                                          String datasetId,
+                                          Path datasetDir,
+                                          boolean isAdmin) {
         try {
             if (!Files.exists(datasetDir) || !Files.isDirectory(datasetDir)) {
                 return;
@@ -231,98 +341,292 @@ public class AgentArtifactService {
                         .filter(Files::isRegularFile)
                         .sorted((a, b) -> a.getFileName().toString().compareTo(b.getFileName().toString()))
                         .forEach(file -> {
-                            DatasetFileKind kind = resolveDatasetFileKind(datasetId, file.getFileName().toString());
-                            addDatasetFileArtifact(artifacts, runId, datasetId, file, kind.type(), kind.contentType(), isAdmin);
+                            try {
+                                if (!Files.exists(file) || !Files.isRegularFile(file)) {
+                                    return;
+                                }
+                                long createdAtMillis = Files.getLastModifiedTime(file).toMillis();
+                                if (isExpired(calcExpiresAtMillis(createdAtMillis, isAdmin))) {
+                                    return;
+                                }
+                                String fileName = file.getFileName().toString();
+                                DatasetFileKind kind = resolveDatasetFileKind(datasetId, fileName);
+                                Map<String, Object> extras = new LinkedHashMap<>();
+                                extras.put("dataset_id", datasetId);
+                                extras.put("file_name", fileName);
+                                extras.put("format", datasetFormat(fileName, kind.type()));
+                                candidates.add(new EventDerivedCandidate(
+                                        kind.type(),
+                                        canonicalDatasetArtifactRef(datasetId, fileName, kind.type()),
+                                        fileName,
+                                        createdAtMillis,
+                                        null,
+                                        file,
+                                        extras));
+                            } catch (Exception e) {
+                                log.warn("Resolve dataset artifact candidate failed: runId={}, datasetId={}, file={}",
+                                        runId, datasetId, file, e);
+                            }
                         });
             }
         } catch (Exception e) {
-            log.warn("Resolve dataset artifacts failed: runId={}, datasetId={}, dir={}", runId, datasetId, datasetDir, e);
+            log.warn("Resolve dataset artifact candidates failed: runId={}, datasetId={}, dir={}",
+                    runId, datasetId, datasetDir, e);
         }
     }
 
-    private void addDatasetFileArtifact(List<ResolvedArtifact> artifacts,
-                                        String runId,
-                                        String datasetId,
-                                        Path filePath,
-                                        String type,
-                                        String contentType,
-                                        boolean isAdmin) {
+    /**
+     * 惰性幂等注册：只注册 run 索引中尚不存在的候选。
+     *
+     * <p>幂等身份 (runId|type|logicalId[|path]) 由 registry 的 HSETNX 原子抢占兜底，
+     * 重复 list / 并发 list / 重启后 list 均不产生新 artifactId、不重写文件。
+     * 注册失败（如 Redis 不可达）warn-degrade：该候选本次 list 缺席，下次 list 重试。</p>
+     *
+     * @return 是否发生过注册尝试（调用方据此重读权威清单）
+     */
+    private boolean registerMissingEventDerived(String runId,
+                                                String userId,
+                                                List<EventDerivedCandidate> candidates,
+                                                List<PersistentArtifactMeta> alreadyListed) {
+        if (candidates.isEmpty()) {
+            return false;
+        }
+        Set<String> registeredIdentities = new HashSet<>();
+        for (PersistentArtifactMeta meta : alreadyListed) {
+            registeredIdentities.add(registryIdentityOf(meta));
+        }
+        long ttlHours = registrationTtlHours();
+        boolean registered = false;
+        for (EventDerivedCandidate candidate : candidates) {
+            String identity = candidateIdentityOf(candidate);
+            if (registeredIdentities.contains(identity)) {
+                continue;
+            }
+            registered = true;
+            try {
+                if (candidate.externalPath() == null) {
+                    artifactRegistry.registerIdempotent(runId, userId, candidate.type(),
+                            candidate.logicalId(), candidate.displayName(),
+                            candidate.scriptContent(), ttlHours);
+                } else {
+                    artifactRegistry.registerExternalIdempotent(runId, userId, candidate.type(),
+                            candidate.logicalId(), candidate.displayName(),
+                            candidate.externalPath(), ttlHours);
+                }
+            } catch (Exception e) {
+                log.warn("Lazy artifact registration failed: runId={}, type={}, logicalId={}, err={}",
+                        runId, candidate.type(), candidate.logicalId(), e.getMessage());
+            }
+        }
+        return registered;
+    }
+
+    /** 幂等身份与 registry 共用唯一 collision-free 编码（{@link PersistentArtifactRegistry#identityField}）。 */
+    private static String candidateIdentityOf(EventDerivedCandidate candidate) {
+        return PersistentArtifactRegistry.identityField(candidate.type(), candidate.logicalId(),
+                candidate.externalPath() == null ? null
+                        : candidate.externalPath().toAbsolutePath().normalize().toString());
+    }
+
+    private static String registryIdentityOf(PersistentArtifactMeta meta) {
+        return PersistentArtifactRegistry.identityField(meta.getArtifactType(), meta.getLogicalId(),
+                Boolean.TRUE.equals(meta.getExternal()) ? meta.getPath() : null);
+    }
+
+    /** 注册 TTL 取两档 retention 的长档；配置 <=0（永不过期）时取一年上界。 */
+    private long registrationTtlHours() {
+        long days = Math.max(normalRetentionDays, adminRetentionDays);
+        if (days <= 0) {
+            return UNLIMITED_TTL_HOURS;
+        }
+        return days * 24L;
+    }
+
+    private EventDerivedCandidate findCandidate(AgentRun run, boolean isAdmin, String type, String logicalId) {
+        if (run == null || run.getId() == null || type == null || logicalId == null) {
+            return null;
+        }
+        for (EventDerivedCandidate candidate : buildEventCandidates(run, isAdmin)) {
+            if (type.equals(candidate.type()) && logicalId.equals(candidate.logicalId())) {
+                return candidate;
+            }
+        }
+        return null;
+    }
+
+    // ===== load 侧：registry 读取 + legacy 只读回退 =====
+
+    private byte[] readRegistryArtifact(PersistentArtifactMeta meta, boolean enforceDownloadMaxBytes) {
+        if (meta.getPath() == null || meta.getPath().isBlank()) {
+            throw new IllegalArgumentException("artifact source not found");
+        }
+        // D22 MUST-FIX ④：内容/external 一律经 registry 权威读取——读前 realpath containment
+        // 复检 + no-follow 打开 + 哈希校验（TOCTOU 强化），门面不再直读 meta.path。
+        long maxBytes = enforceDownloadMaxBytes ? downloadMaxBytes : -1L;
         try {
-            if (!Files.exists(filePath) || !Files.isRegularFile(filePath)) {
-                return;
-            }
-            long createdAtMillis = Files.getLastModifiedTime(filePath).toMillis();
-            long expiresAtMillis = calcExpiresAtMillis(createdAtMillis, isAdmin);
-            if (isExpired(expiresAtMillis)) {
-                return;
-            }
-            Path copiedFile = snapshotDatasetFile(runId, datasetId, filePath);
-            if (copiedFile == null) {
-                return;
-            }
-            String fileName = copiedFile.getFileName().toString();
-            String artifactRef = canonicalDatasetArtifactRef(datasetId, fileName, type);
-            String artifactId = encodeArtifactId(type, runId, artifactRef);
-            Map<String, Object> meta = new HashMap<>();
-            meta.put("kind", type);
-            meta.put("dataset_id", datasetId);
-            meta.put("file_name", fileName);
-            meta.put("format", datasetFormat(fileName, type));
-            meta.put("scope", isAdmin ? "admin" : "normal");
-            artifacts.add(ResolvedArtifact.builder()
-                    .artifactId(artifactId)
-                    .type(type)
-                    .name(copiedFile.getFileName().toString())
-                    .contentType(contentType)
-                    .metaJson(writeJson(meta))
-                    .createdAt(toOffsetDateTime(createdAtMillis))
-                    .expiresAtMillis(expiresAtMillis)
-                    .filePath(copiedFile)
-                    .build());
+            return artifactRegistry.readArtifactBytes(meta.getArtifactId(), maxBytes);
+        } catch (IllegalStateException e) {
+            throw e;
         } catch (Exception e) {
-            log.warn("Resolve dataset artifact failed: runId={}, datasetId={}, file={}", runId, datasetId, filePath, e);
+            throw new IllegalStateException("read artifact failed", e);
         }
     }
 
-    private DatasetFileKind resolveDatasetFileKind(String datasetId, String fileName) {
-        String safeFileName = fileName == null ? "" : fileName;
-        if (safeFileName.equals(datasetId + ".meta.json") || safeFileName.endsWith(".meta.json")) {
-            return new DatasetFileKind("dataset_meta", "application/json");
+    /**
+     * 历史 Base64 {@code type|runId|ref} ID 的只读回退：按旧快照位置
+     * （{artifactRoot}/{runId}/scripts|datasets/…）读取内容。
+     * 回退路径绝不写文件、绝不注册新制品；retention/success-only 语义经事件候选重放保持。
+     */
+    private ArtifactContent loadLegacyArtifact(AgentRun run, boolean isAdmin, String artifactId,
+                                               boolean enforceDownloadMaxBytes) {
+        ArtifactRef ref = decodeArtifactId(artifactId);
+        String runId = run == null || run.getId() == null ? "" : run.getId();
+        if (!Objects.equals(ref.runId(), runId)) {
+            throw new IllegalArgumentException("artifact not found");
         }
-        if (safeFileName.endsWith(".csv")) {
-            return new DatasetFileKind("dataset_csv", "text/csv");
+        boolean script = "script".equals(ref.type());
+        String type = script ? TYPE_PYTHON_SCRIPT : ref.type();
+        if (!EVENT_DERIVED_TYPES.contains(type)) {
+            throw new IllegalArgumentException("artifact not found");
         }
-        if (safeFileName.endsWith(".json")) {
-            return new DatasetFileKind("dataset_json", "application/json");
+        // retention/success-only 保持：当前 scope 重放不出该候选即视为 not found（与降级前一致）
+        EventDerivedCandidate candidate = findCandidate(run, isAdmin, type, ref.ref());
+        if (candidate == null) {
+            throw new IllegalArgumentException("artifact not found");
         }
-        return new DatasetFileKind("dataset_file", "application/octet-stream");
+        Path file = script
+                ? legacyScriptPath(runId, ref.ref())
+                : legacyDatasetPath(runId, ref.type(), ref.ref());
+        byte[] bytes = readLegacyFile(file, enforceDownloadMaxBytes);
+        return new ArtifactContent(artifactId, file.getFileName().toString(), contentTypeFor(type), bytes);
     }
 
-    private String canonicalDatasetArtifactRef(String datasetId, String fileName, String type) {
-        if (fileName.equals(datasetId + ".csv") && "dataset_csv".equals(type)) {
-            return datasetId;
-        }
-        if (fileName.equals(datasetId + ".meta.json") && "dataset_meta".equals(type)) {
-            return datasetId;
-        }
-        if (fileName.equals(datasetId + ".json") && "dataset_json".equals(type)) {
-            return datasetId;
-        }
-        return datasetId + "/" + fileName;
+    /** 旧脚本快照位置（只读）：{artifactRoot}/{runId}/scripts/{sanitizedRef}.py。 */
+    private Path legacyScriptPath(String runId, String ref) {
+        Path runDir = legacyRunDir(runId);
+        return runDir.resolve("scripts").resolve(sanitizeFileName(ref) + ".py").normalize();
     }
 
-    private String datasetFormat(String fileName, String type) {
-        if ("dataset_meta".equals(type)) {
-            return "meta";
+    /** 旧 dataset 快照副本位置（只读）：{artifactRoot}/{runId}/datasets/{datasetId}/{fileName}。 */
+    private Path legacyDatasetPath(String runId, String type, String ref) {
+        int slash = ref.indexOf('/');
+        String datasetId = slash < 0 ? ref : ref.substring(0, slash);
+        String fileName;
+        if (slash >= 0) {
+            fileName = ref.substring(slash + 1);
+        } else if ("dataset_csv".equals(type)) {
+            fileName = datasetId + ".csv";
+        } else if ("dataset_meta".equals(type)) {
+            fileName = datasetId + ".meta.json";
+        } else if ("dataset_json".equals(type)) {
+            fileName = datasetId + ".json";
+        } else {
+            throw new IllegalArgumentException("invalid artifact id");
         }
-        if (fileName.endsWith(".csv")) {
-            return "csv";
+        Path runDir = legacyRunDir(runId);
+        Path file = runDir.resolve("datasets").resolve(datasetId).resolve(fileName).normalize();
+        if (!file.startsWith(runDir)) {
+            throw new IllegalArgumentException("invalid artifact id");
         }
-        if (fileName.endsWith(".json")) {
-            return "json";
-        }
-        return "file";
+        return file;
     }
+
+    private Path legacyRunDir(String runId) {
+        Path baseDir = storagePaths.artifactRoot().toAbsolutePath().normalize();
+        Path runDir = baseDir.resolve(runId).normalize();
+        if (!runDir.startsWith(baseDir)) {
+            throw new IllegalArgumentException("invalid run id path");
+        }
+        return runDir;
+    }
+
+    private byte[] readLegacyFile(Path file, boolean enforceDownloadMaxBytes) {
+        // D22 MUST-FIX ④：legacy 快照读取收回 registry 权威 seam；门面侧先做 no-follow
+        // 常规文件预检（symlink/目录 fail-closed），再经 registry 复检读取。
+        if (!Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS)) {
+            throw new IllegalArgumentException("artifact not found");
+        }
+        long maxBytes = enforceDownloadMaxBytes ? downloadMaxBytes : -1L;
+        try {
+            return artifactRegistry.readWithinArtifactRoot(file, maxBytes);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("artifact not found");
+        } catch (IllegalStateException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IllegalStateException("read artifact failed", e);
+        }
+    }
+
+    // ===== DTO 映射（字段零漂移） =====
+
+    private AgentArtifactMessage toMessage(String runId,
+                                           String artifactId,
+                                           String type,
+                                           String name,
+                                           String metaJson,
+                                           long createdAtMillis,
+                                           long expiresAtMillis) {
+        return AgentArtifactMessage.newBuilder()
+                .setArtifactId(artifactId)
+                .setType(type)
+                .setName(name)
+                .setContentType(contentTypeFor(type))
+                .setUrl("/api/agent/runs/" + runId + "/artifacts/" + artifactId + "/download")
+                .setMetaJson(metaJson)
+                .setCreatedAt(formatTime(toOffsetDateTime(createdAtMillis)))
+                .setExpiresAtMillis(expiresAtMillis)
+                .build();
+    }
+
+    private static String contentTypeFor(String artifactType) {
+        String type = artifactType == null ? "" : artifactType;
+        switch (type) {
+            case TYPE_PYTHON_SCRIPT:
+                return "text/x-python";
+            case "dataset_csv":
+                return "text/csv";
+            case "dataset_json":
+            case "dataset_meta":
+                return "application/json";
+            default:
+                return "application/octet-stream";
+        }
+    }
+
+    private static String displayNameOf(PersistentArtifactMeta meta) {
+        if (meta.getDisplayName() != null && !meta.getDisplayName().isBlank()) {
+            return meta.getDisplayName();
+        }
+        if (meta.getPath() != null && !meta.getPath().isBlank()) {
+            try {
+                Path fileName = Path.of(meta.getPath()).getFileName();
+                if (fileName != null) {
+                    return fileName.toString();
+                }
+            } catch (Exception ignored) {
+                // 非法路径回退 artifactId
+            }
+        }
+        return meta.getArtifactId();
+    }
+
+    private Map<String, Object> buildEventDerivedMetaJson(EventDerivedCandidate candidate, boolean isAdmin) {
+        Map<String, Object> meta = new LinkedHashMap<>();
+        meta.put("kind", candidate.type());
+        meta.put("scope", isAdmin ? "admin" : "normal");
+        meta.putAll(candidate.metaExtras());
+        return meta;
+    }
+
+    private Map<String, Object> buildRegistryMetaJson(PersistentArtifactMeta meta, boolean isAdmin) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("kind", meta.getArtifactType());
+        result.put("scope", isAdmin ? "admin" : "normal");
+        return result;
+    }
+
+    // ===== 事件解析（与降级前一致，未改动） =====
 
     private ParsedEvents parseEvents(List<AgentRunEvent> events) {
         List<MutableInvocation> invocations = new ArrayList<>();
@@ -610,64 +914,44 @@ public class AgentArtifactService {
         }
     }
 
-    private Path snapshotPythonScript(String runId, String ref, String code, long createdAtMillis) {
-        if (runId == null || runId.isBlank() || code == null) {
-            return null;
+    private DatasetFileKind resolveDatasetFileKind(String datasetId, String fileName) {
+        String safeFileName = fileName == null ? "" : fileName;
+        if (safeFileName.equals(datasetId + ".meta.json") || safeFileName.endsWith(".meta.json")) {
+            return new DatasetFileKind("dataset_meta", "application/json");
         }
-        try {
-            Path targetDir = resolveRunArtifactDir(runId).resolve("scripts");
-            Files.createDirectories(targetDir);
-            Path targetFile = targetDir.resolve(sanitizeFileName(ref) + ".py");
-            Files.writeString(targetFile, code, StandardCharsets.UTF_8);
-            if (createdAtMillis > 0) {
-                Files.setLastModifiedTime(targetFile, FileTime.fromMillis(createdAtMillis));
-            }
-            return targetFile;
-        } catch (Exception e) {
-            log.warn("Snapshot python script failed: runId={}, ref={}", runId, ref, e);
-            return null;
+        if (safeFileName.endsWith(".csv")) {
+            return new DatasetFileKind("dataset_csv", "text/csv");
         }
+        if (safeFileName.endsWith(".json")) {
+            return new DatasetFileKind("dataset_json", "application/json");
+        }
+        return new DatasetFileKind("dataset_file", "application/octet-stream");
     }
 
-    // Artifact snapshots assume per-run tool execution is effectively serialized by the workflow executor.
-    private Path snapshotDatasetFile(String runId, String datasetId, Path sourceFile) {
-        if (runId == null || runId.isBlank() || datasetId == null || datasetId.isBlank()) {
-            return null;
+    private String canonicalDatasetArtifactRef(String datasetId, String fileName, String type) {
+        if (fileName.equals(datasetId + ".csv") && "dataset_csv".equals(type)) {
+            return datasetId;
         }
-        try {
-            Path targetDir = resolveRunArtifactDir(runId).resolve("datasets").resolve(datasetId);
-            Files.createDirectories(targetDir);
-            Path targetFile = targetDir.resolve(sourceFile.getFileName().toString());
-            if (!Files.exists(targetFile)) {
-                Files.copy(sourceFile, targetFile, StandardCopyOption.REPLACE_EXISTING);
-            } else {
-                long srcMtime = Files.getLastModifiedTime(sourceFile).toMillis();
-                long dstMtime = Files.getLastModifiedTime(targetFile).toMillis();
-                if (srcMtime > dstMtime) {
-                    Files.copy(sourceFile, targetFile, StandardCopyOption.REPLACE_EXISTING);
-                }
-            }
-            return targetFile;
-        } catch (Exception e) {
-            log.warn("Snapshot dataset file failed: runId={}, datasetId={}, source={}", runId, datasetId, sourceFile, e);
-            return null;
+        if (fileName.equals(datasetId + ".meta.json") && "dataset_meta".equals(type)) {
+            return datasetId;
         }
+        if (fileName.equals(datasetId + ".json") && "dataset_json".equals(type)) {
+            return datasetId;
+        }
+        return datasetId + "/" + fileName;
     }
 
-    private Path resolveRunArtifactDir(String runId) {
-        Path baseDir = Paths.get(artifactStoragePath).normalize();
-        Path runDir = baseDir.resolve(runId).normalize();
-        if (!runDir.startsWith(baseDir)) {
-            throw new IllegalArgumentException("invalid run id path");
+    private String datasetFormat(String fileName, String type) {
+        if ("dataset_meta".equals(type)) {
+            return "meta";
         }
-        return runDir;
-    }
-
-    private String sanitizeFileName(String value) {
-        if (value == null || value.isBlank()) {
-            return "artifact";
+        if (fileName.endsWith(".csv")) {
+            return "csv";
         }
-        return value.replaceAll("[^A-Za-z0-9._-]", "_");
+        if (fileName.endsWith(".json")) {
+            return "json";
+        }
+        return "file";
     }
 
     private void collectDatasetIds(LinkedHashSet<String> target, String text) {
@@ -933,9 +1217,11 @@ public class AgentArtifactService {
         return "";
     }
 
-    private String encodeArtifactId(String type, String runId, String ref) {
-        String raw = type + "|" + runId + "|" + ref;
-        return Base64.getUrlEncoder().withoutPadding().encodeToString(raw.getBytes(StandardCharsets.UTF_8));
+    private String sanitizeFileName(String value) {
+        if (value == null || value.isBlank()) {
+            return "artifact";
+        }
+        return value.replaceAll("[^A-Za-z0-9._-]", "_");
     }
 
     private ArtifactRef decodeArtifactId(String artifactId) {
@@ -1015,17 +1301,18 @@ public class AgentArtifactService {
     private record DatasetFileKind(String type, String contentType) {
     }
 
-    @Getter
-    @Builder
-    private static class ResolvedArtifact {
-        private String artifactId;
-        private String type;
-        private String name;
-        private String contentType;
-        private String metaJson;
-        private OffsetDateTime createdAt;
-        private long expiresAtMillis;
-        private Path filePath;
+    /** 事件派生候选：脚本携带内容（内容制品），dataset 文件携带原位路径（external 引用制品）。 */
+    private record EventDerivedCandidate(String type,
+                                         String logicalId,
+                                         String displayName,
+                                         long createdAtMillis,
+                                         String scriptContent,
+                                         Path externalPath,
+                                         Map<String, Object> metaExtras) {
+    }
+
+    /** list 排序辅助：createdAt 降序（与降级前一致）。 */
+    private record RankedArtifact(AgentArtifactMessage message, long createdAtMillis) {
     }
 
     private static class MutableInvocation {

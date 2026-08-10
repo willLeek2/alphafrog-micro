@@ -8,7 +8,7 @@ final class LangchainRunSchedulerTestSupport {
     }
 
     static LangchainRunConcurrencyScheduler immediateScheduler() {
-        return new LangchainRunConcurrencyScheduler(null, null) {
+        return new LangchainRunConcurrencyScheduler(null, null, "test-support-app") {
             @Override
             public Reservation reserve() {
                 return null;

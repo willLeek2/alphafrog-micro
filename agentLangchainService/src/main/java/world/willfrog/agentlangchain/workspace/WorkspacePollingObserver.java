@@ -63,12 +63,16 @@ public class WorkspacePollingObserver {
     private int initialLookbackMinutes;
 
     /**
-     * lastSeenAt：只扫 updated_at > lastSeenAt 的 run。
-     * 初始值 = 启动时刻 - initialLookbackMinutes（重启后从该时刻起扫）。
-     * 每批处理完成后推进到本批最大 updated_at。
+     * D21-B 5.2.3: 复合游标 (updatedAt, runId)，防止同秒超批永久漏扫。
+     * 每批处理完成后推进到本批最后一条记录的 (updatedAt, runId)。
      */
-    private final AtomicReference<OffsetDateTime> lastSeenAt = new AtomicReference<>(
-            OffsetDateTime.now(ZoneOffset.UTC).minusMinutes(60));
+    private volatile OffsetDateTime lastSeenTime;
+    private volatile String lastSeenRunId;
+
+    {
+        lastSeenTime = OffsetDateTime.now(ZoneOffset.UTC).minusMinutes(60);
+        lastSeenRunId = "";
+    }
 
     @Scheduled(
             fixedDelayString = "${agent.workspace.polling.interval-ms:30000}",
@@ -85,22 +89,23 @@ public class WorkspacePollingObserver {
     }
 
     private void doScan() {
-        OffsetDateTime fromTime = lastSeenAt.get();
-        List<AgentRun> runs = runMapper.listByStatusAndUpdatedAfter(
+        OffsetDateTime cursorTime = lastSeenTime;
+        String cursorRunId = lastSeenRunId;
+        List<AgentRun> runs = runMapper.listByStatusAndUpdatedAfterComposite(
                 List.of(
                         AgentRunStatus.COMPLETED,
                         AgentRunStatus.PARTIAL,
                         AgentRunStatus.FAILED,
                         AgentRunStatus.CANCELED,
                         AgentRunStatus.EXPIRED),
-                fromTime,
+                cursorTime,
+                cursorRunId,
                 batchSize);
         if (runs == null || runs.isEmpty()) {
             return;
         }
-        log.info("WorkspacePollingObserver found terminal runs: count={} fromTime={}",
-                runs.size(), fromTime);
-        OffsetDateTime maxUpdatedAt = fromTime;
+        log.info("WorkspacePollingObserver found terminal runs: count={} cursorTime={} cursorRunId={}",
+                runs.size(), cursorTime, cursorRunId);
         boolean submissionFailed = false;
         for (AgentRun run : runs) {
             if (run == null || run.getId() == null) {
@@ -109,34 +114,48 @@ public class WorkspacePollingObserver {
             try {
                 boolean conservative = run.getStatus() == AgentRunStatus.EXPIRED;
                 dumpScheduler.enqueueDumpAsync(run.getId(), conservative);
-                if (run.getUpdatedAt() != null && run.getUpdatedAt().isAfter(maxUpdatedAt)) {
-                    maxUpdatedAt = run.getUpdatedAt();
-                }
             } catch (Exception e) {
-                // enqueue 自身失败表示任务尚未进入 scheduler 的重试/DLQ 责任域；
-                // 不推进本批水位，下一轮 polling 会重扫并再次提交。
                 submissionFailed = true;
                 log.warn("WorkspacePollingObserver enqueue dump failed: runId={} status={} err={}",
                         run.getId(), run.getStatus(), e.getMessage());
             }
         }
         if (submissionFailed) {
-            log.warn("WorkspacePollingObserver lastSeenAt not advanced because at least one dump submission failed: from={}",
-                    fromTime);
+            log.warn("WorkspacePollingObserver cursor not advanced: at least one submission failed cursorTime={}",
+                    cursorTime);
             return;
         }
-        // 推进 lastSeenAt：只有当本批至少处理过一条 + 推进时间晚于当前值时
-        if (maxUpdatedAt.isAfter(fromTime)) {
-            lastSeenAt.set(maxUpdatedAt);
-            log.info("WorkspacePollingObserver lastSeenAt advanced: from={} to={}",
-                    fromTime, maxUpdatedAt);
+        // 推进复合游标到本批最后一条有效记录的 (updatedAt, runId)
+        AgentRun last = lastNonNull(runs);
+        if (last == null) {
+            return;
+        }
+        OffsetDateTime newTime = last.getUpdatedAt() != null ? last.getUpdatedAt() : cursorTime;
+        String newRunId = last.getId() != null ? last.getId() : "";
+        if (newTime.isAfter(cursorTime) || (newTime.isEqual(cursorTime) && newRunId.compareTo(cursorRunId) > 0)) {
+            lastSeenTime = newTime;
+            lastSeenRunId = newRunId;
+            log.info("WorkspacePollingObserver cursor advanced: ({},{}) → ({},{})",
+                    cursorTime, cursorRunId, newTime, newRunId);
         }
     }
 
+    /** 从列表尾部向前查找第一个非 null、id 非 null 的条目，用于安全推进游标。 */
+    private AgentRun lastNonNull(List<AgentRun> runs) {
+        for (int i = runs.size() - 1; i >= 0; i--) {
+            AgentRun r = runs.get(i);
+            if (r != null && r.getId() != null) {
+                return r;
+            }
+        }
+        return null;
+    }
+
     /**
-     * 测试 / 运维用：重置 lastSeenAt。
+     * 测试 / 运维用：重置复合游标。
      */
-    public void resetLastSeenAt() {
-        lastSeenAt.set(OffsetDateTime.now(ZoneOffset.UTC).minusMinutes(initialLookbackMinutes));
+    public void resetCursor() {
+        lastSeenTime = OffsetDateTime.now(ZoneOffset.UTC).minusMinutes(initialLookbackMinutes);
+        lastSeenRunId = "";
     }
 }

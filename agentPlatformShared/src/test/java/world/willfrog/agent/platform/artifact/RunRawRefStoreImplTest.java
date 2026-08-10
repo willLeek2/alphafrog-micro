@@ -37,7 +37,10 @@ class RunRawRefStoreImplTest {
         PersistentArtifactRegistration reg = PersistentArtifactRegistration.builder()
                 .artifactId("raw-ref:test-uuid")
                 .build();
-        when(registry.register(eq("raw-ref"), anyString(), anyString(), anyString(), anyLong()))
+        // D22-5.1.3：store 改走显式上下文 registerExplicit（runId/userId 显式传递，
+        // logicalId 固定为 runId，非幂等——同 run 多条 rawRef 不撞身份）。
+        when(registry.registerExplicit(anyString(), anyString(), eq("raw-ref"),
+                anyString(), anyString(), anyString(), anyLong()))
                 .thenReturn(reg);
 
         store = new RunRawRefStoreImpl(registry, redisTemplate);
@@ -72,8 +75,9 @@ class RunRawRefStoreImplTest {
         store.register("run_read", "user_001", "test", "hello from raw ref", 3600);
         when(hashOps.get("agent:raw-ref-mapping:run_read", "raw_ref_001"))
                 .thenReturn("raw-ref:test-uuid");
-        when(registry.readContent("raw-ref:test-uuid")).thenReturn("hello from raw ref");
-        String content = store.read("run_read", "raw_ref_001");
+        when(registry.readContentStrict("raw-ref:test-uuid", "run_read", "user_001"))
+                .thenReturn("hello from raw ref");
+        String content = store.read("run_read", "user_001", "raw_ref_001");
         assertEquals("hello from raw ref", content);
     }
 
@@ -85,10 +89,35 @@ class RunRawRefStoreImplTest {
         store.register("run_limit", "user_001", "test", sb.toString(), 3600);
         when(hashOps.get("agent:raw-ref-mapping:run_limit", "raw_ref_001"))
                 .thenReturn("raw-ref:test-uuid");
-        when(registry.readContent("raw-ref:test-uuid")).thenReturn(sb.toString());
-        ToolOutputReadResult result = store.read("run_limit", "raw_ref_001", 0, 6000, null);
+        when(registry.readContentStrict("raw-ref:test-uuid", "run_limit", "user_001"))
+                .thenReturn(sb.toString());
+        ToolOutputReadResult result = store.read("run_limit", "user_001", "raw_ref_001", 0, 6000, null);
         assertEquals(6000, result.getContent().length());
         assertFalse(result.isHasMore());
+    }
+
+    @Test
+    void read_shouldRejectWrongOrBlankUser() {
+        // 第三轮 MUST-FIX ② 反测：短格式 raw_ref 读取不再因 runId 对上就放行——
+        // 内容读取一律经 readContentStrict 四值严格归属校验，userId 错误或空白都
+        // 由 store 层 fail-closed 抛出（全量读与窗口读两条入口都覆盖）。
+        when(valueOps.increment("agent:raw-ref-counter:run_reject")).thenReturn(1L);
+        store.register("run_reject", "user_001", "test", "secret", 3600);
+        when(hashOps.get("agent:raw-ref-mapping:run_reject", "raw_ref_001"))
+                .thenReturn("raw-ref:test-uuid");
+        when(registry.readContentStrict("raw-ref:test-uuid", "run_reject", "user_evil"))
+                .thenThrow(new IllegalArgumentException(
+                        "Artifact does not belong to current run/user: raw-ref:test-uuid"));
+        when(registry.readContentStrict("raw-ref:test-uuid", "run_reject", " "))
+                .thenThrow(new IllegalArgumentException(
+                        "Artifact does not belong to current run/user: raw-ref:test-uuid"));
+
+        assertThrows(IllegalArgumentException.class,
+                () -> store.read("run_reject", "user_evil", "raw_ref_001"));
+        assertThrows(IllegalArgumentException.class,
+                () -> store.read("run_reject", " ", "raw_ref_001"));
+        assertThrows(IllegalArgumentException.class,
+                () -> store.read("run_reject", "user_evil", "raw_ref_001", 0, 100, null));
     }
 
     @Test
@@ -115,5 +144,15 @@ class RunRawRefStoreImplTest {
         store.register("run_ttl", "user_001", "test", "ttl_test", 30);
         verify(redisTemplate).expire("agent:raw-ref-counter:run_ttl", 30, TimeUnit.SECONDS);
         verify(redisTemplate).expire("agent:raw-ref-mapping:run_ttl", 30, TimeUnit.SECONDS);
+    }
+
+    @Test
+    void register_shouldForwardExplicitContextToRegistry() {
+        // D22-5.1.3：userId 参数必须真正传给 registry（此前被丢弃、靠 AgentContext 补）；
+        // 且走非幂等 registerExplicit（同 run 第二条 logicalId=runId 的 rawRef 不撞身份）。
+        when(valueOps.increment("agent:raw-ref-counter:run_ctx")).thenReturn(1L);
+        store.register("run_ctx", "user_ctx", "display", "payload", 3600);
+        verify(registry).registerExplicit("run_ctx", "user_ctx", "raw-ref", "run_ctx",
+                "display", "payload", 1L);
     }
 }

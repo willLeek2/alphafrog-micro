@@ -359,12 +359,14 @@
     "threadNamePrefix": "agent-langchain-run-",
     "parallel": {
       "hard": {
+        "_restartNote": "修改 hard 值需滚动重启；hot-reload 只能在 hard 上限内缩小 current",
         "corePoolSize": 100,
         "maxPoolSize": 100,
         "queueCapacity": 1000,
         "threadNamePrefix": "agent-langchain-run-"
       },
       "current": {
+        "_restartNote": "修改此值超出 hard 上限会被 clamped，需滚动重启才能生效；threadNamePrefix 与 hard 不同也需重启",
         "corePoolSize": 10,
         "maxPoolSize": 10,
         "queueCapacity": 100,

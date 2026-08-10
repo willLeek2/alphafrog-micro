@@ -1,7 +1,9 @@
 package world.willfrog.agentlangchain.workspace;
 
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
+import world.willfrog.agent.platform.storage.AgentStoragePaths;
 
 import java.io.IOException;
 import java.nio.file.LinkOption;
@@ -19,10 +21,12 @@ import java.util.regex.Pattern;
  * <p>防护策略：字符串层先拒 ../、绝对路径前缀，再走
  * Path.resolve + toRealPath(NOFOLLOW_LINKS) 二次校验。
  *
- * <h3>依赖</h3>
+ * <h3>依赖（D04 后经统一存储门面）</h3>
  * <ul>
- *   <li>agent.workspace.root — workspace 根目录，默认 /data/agent_workspaces</li>
- *   <li>agent.tools.market-data.dataset.path — dataset 根目录，默认 /data/agent_datasets</li>
+ *   <li>{@link AgentStoragePaths#workspaceRoot()} — workspace 根目录，默认 /data/agent_workspaces
+ *       （新键 agent.storage.workspace-root，旧键别名 agent.workspace.root）</li>
+ *   <li>{@link AgentStoragePaths#datasetRoot()} — dataset 根目录，默认 /data/agent_datasets
+ *       （新键 agent.storage.dataset-root，旧键别名 agent.tools.market-data.dataset.path）</li>
  * </ul>
  *
  * @author wang
@@ -51,6 +55,15 @@ public class WorkspacePathResolver {
             @Value("${agent.tools.market-data.dataset.path:/data/agent_datasets}") String datasetPath) {
         this.workspaceRoot = Paths.get(workspaceRoot).toAbsolutePath().normalize();
         this.datasetPath = Paths.get(datasetPath).toAbsolutePath().normalize();
+    }
+
+    /**
+     * D04 Spring 装配入口：两个根经统一存储门面解析（新键 → 旧键别名 → 默认值），
+     * 不再由本类直接持有根键。
+     */
+    @Autowired
+    public WorkspacePathResolver(AgentStoragePaths storagePaths) {
+        this(storagePaths.workspaceRoot().toString(), storagePaths.datasetRoot().toString());
     }
 
     /**

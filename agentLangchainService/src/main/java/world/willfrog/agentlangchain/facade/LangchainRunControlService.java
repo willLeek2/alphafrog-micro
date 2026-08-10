@@ -4,6 +4,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.entity.AgentRun;
+import world.willfrog.agent.platform.event.AgentRunFinalizationService;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentEventService;
@@ -72,6 +73,7 @@ public class LangchainRunControlService {
     private final LangchainLinearRunPipeline pipeline;
     private final AgentRunCreditSettlementService creditSettlementService;
     private final ToolJobAnchorService anchorService;
+    private final AgentRunFinalizationService finalizationService;
 
     /**
      * 删除 run 及其关联的状态数据（Redis）。
@@ -151,13 +153,21 @@ public class LangchainRunControlService {
         String snapshot = observabilityService.attachObservabilityToSnapshot(
                 runId, run.getSnapshotJson(), AgentRunStatus.CANCELED);
         // 5. 更新 DB：snapshot、status、TTL（中断的 run 过期时间比正常完成的短）
+        boolean canceledPersisted = false;
         if (hasActiveAnchor) {
             // 有活跃 anchor 时保留数据库现状，给 finalizer 留住 CAS 前置条件；这里只更新可观测快照。
             // terminal sinks 与容量释放完成后，finalizer 才把持久状态收口为 CANCELED。
             runMapper.updateSnapshot(runId, userId, run.getStatus(), snapshot, false, null);
         } else {
-            runMapper.updateSnapshot(runId, userId, AgentRunStatus.CANCELED, snapshot, false, null);
-            runMapper.updateStatusWithTtl(runId, userId, AgentRunStatus.CANCELED, eventService.nextInterruptedExpiresAt());
+            int snapshotRows = runMapper.updateSnapshot(
+                    runId, userId, AgentRunStatus.CANCELED, snapshot, false, null);
+            int ttlRows = runMapper.updateStatusWithTtl(
+                    runId, userId, AgentRunStatus.CANCELED, eventService.nextInterruptedExpiresAt());
+            canceledPersisted = snapshotRows == 1 && ttlRows == 1;
+            if (!canceledPersisted) {
+                log.warn("CANCELED persistence was not exact: runId={} snapshotRows={} ttlRows={}",
+                        runId, snapshotRows, ttlRows);
+            }
         }
         // 6. 发 CANCELED 事件 → 前端 SSE 收到后更新 UI 为已取消
         eventService.append(runId, userId, "CANCELED", Map.of(
@@ -165,6 +175,11 @@ public class LangchainRunControlService {
                 "engine", "agentLangchainService"));
         // 7. 最后再把 Redis 状态从 CANCELING 改成 CANCELED（终态）
         stateStore.markRunStatus(runId, AgentRunStatus.CANCELED.name());
+        // 活跃长工具仍由 ToolJobFinalizer 持有终态 CAS 责任；这里只给已经真正写入 DB CANCELED
+        // 的普通取消发布 workspace dump 事件，不能把 WAITING_TOOL_JOB 提前伪装成持久终态。
+        if (!hasActiveAnchor && canceledPersisted) {
+            publishFinalizedEventSafely(runId, userId, AgentRunStatus.CANCELED);
+        }
         // 8. 260612-01-02: cancel 路径触发结算（可能已有部分 LLM 调用）
         try {
             creditSettlementService.settleAsync(runId, userId);
@@ -180,6 +195,16 @@ public class LangchainRunControlService {
                     .build();
         }
         return AgentLangchainRunMessageMapper.toRunMessage(refreshed);
+    }
+
+    /** Workspace dump 失败走 DB polling 兜底，不能反向破坏已经提交的取消终态。 */
+    private void publishFinalizedEventSafely(String runId, String userId, AgentRunStatus status) {
+        try {
+            finalizationService.publishFinalizedEvent(runId, userId, status.name());
+        } catch (RuntimeException e) {
+            log.warn("Workspace finalization publish failed after terminal commit: "
+                    + "runId={} status={} err={}", runId, status, e.getMessage(), e);
+        }
     }
 
     /**
