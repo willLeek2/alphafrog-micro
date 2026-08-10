@@ -19,11 +19,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import queue
 import sys
 import tempfile
 import threading
 import types
 import unittest
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -77,6 +79,40 @@ class _QueueStub:
     def put_nowait(self, item: object) -> None:
         self.put_nowait_calls.append(item)
         raise asyncio.QueueFull
+
+
+class _CapturingExecutor:
+    """A ThreadPoolExecutor that captures every submitted Future in a queue.
+
+    Used by the marker-retry tests so they can wait for the COMPLETE dispatch
+    cycle — writer execution, exception handling, AND the outer finally that
+    resets ``_marker_dispatch_idle`` — before asserting on the handle state.
+    """
+
+    def __init__(self, max_workers: int = 2) -> None:
+        self._pool = ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix="af-test-marker"
+        )
+        self._queue: queue.Queue[Future] = queue.Queue()
+
+    def submit(self, fn, *args, **kwargs) -> Future:
+        future: Future = self._pool.submit(fn, *args, **kwargs)
+        self._queue.put(future)
+        return future
+
+    def captured(self) -> Future:
+        """Block until a Future is available, then return it."""
+        return self._queue.get(timeout=5.0)
+
+    def captured_nowait(self) -> Future | None:
+        """Return a Future if one was submitted, else None immediately."""
+        try:
+            return self._queue.get(timeout=0.1)
+        except queue.Empty:
+            return None
+
+    def shutdown(self, wait: bool = True) -> None:
+        self._pool.shutdown(wait=wait)
 
 
 class CancelEndpointTest(unittest.IsolatedAsyncioTestCase):
@@ -560,150 +596,159 @@ class CancelEndpointTest(unittest.IsolatedAsyncioTestCase):
     # ------------------------------------------------------------------ #
 
     async def test_writer_failure_then_same_key_replay_re_dispatches(self) -> None:
-        """codex 5e7f7a48: when the first writer raises, the handle resets
-        to idle, and a same-key replay can dispatch again successfully."""
+        """First writer raises → outer finally resets idle → same-key replay
+        dispatches again.  Synced via captured Future, not writer signals."""
         self.save_task("task-replay-fail", TaskStatus.RUNNING)
         handle = cancel_registry_module.registry.register("task-replay-fail")
         self.registered_task_ids.append("task-replay-fail")
+        executor = _CapturingExecutor(max_workers=2)
         dispatch_log: list[str] = []
         fail_next: list[bool] = [True]
-        failed: threading.Event = threading.Event()
-        succeeded: threading.Event = threading.Event()
 
         def writer():
             if fail_next[0]:
                 fail_next[0] = False
                 dispatch_log.append("fail")
-                failed.set()
                 raise RuntimeError("simulated marker write failure")
             dispatch_log.append("success")
-            succeeded.set()
 
         handle.set_marker_writer(writer)
 
-        resp1 = await main.cancel_task(
-            CancelTaskRequest(
-                by_task_id=TaskIdCancelTarget(task_id="task-replay-fail"),
-                cancel_request_id="cr-fail",
-            )
-        )
-        self.assertEqual(resp1.outcome, CancelOutcome.CANCEL_INTENT_RECORDED)
-        self.assertTrue(await asyncio.to_thread(failed.wait, 5.0))
-        self.assertEqual(dispatch_log, ["fail"])
+        try:
+            with patch.object(
+                cancel_registry_module, "_get_write_pool", return_value=executor
+            ):
+                resp1 = await main.cancel_task(
+                    CancelTaskRequest(
+                        by_task_id=TaskIdCancelTarget(task_id="task-replay-fail"),
+                        cancel_request_id="cr-fail",
+                    )
+                )
+                self.assertEqual(resp1.outcome, CancelOutcome.CANCEL_INTENT_RECORDED)
+                # Await the complete dispatch cycle — writer ran, exception
+                # caught, outer finally reset _marker_dispatch_idle.
+                await asyncio.to_thread(executor.captured().result, 5.0)
+                self.assertEqual(dispatch_log, ["fail"])
 
-        # Same-key replay dispatches again — the writer's second call succeeds.
-        replay = await main.cancel_task(
-            CancelTaskRequest(
-                by_task_id=TaskIdCancelTarget(task_id="task-replay-fail"),
-                cancel_request_id="cr-fail",
-            )
-        )
-        self.assertEqual(replay.outcome, CancelOutcome.CANCEL_INTENT_RECORDED)
-        self.assertTrue(await asyncio.to_thread(succeeded.wait, 5.0))
-        self.assertEqual(dispatch_log, ["fail", "success"])
+                # Same-key replay: idle is True now, dispatches again.
+                replay = await main.cancel_task(
+                    CancelTaskRequest(
+                        by_task_id=TaskIdCancelTarget(task_id="task-replay-fail"),
+                        cancel_request_id="cr-fail",
+                    )
+                )
+                self.assertEqual(replay.outcome, CancelOutcome.CANCEL_INTENT_RECORDED)
+                await asyncio.to_thread(executor.captured().result, 5.0)
+                self.assertEqual(dispatch_log, ["fail", "success"])
+        finally:
+            executor.shutdown(wait=True)
 
     async def test_different_cancel_request_id_re_dispatches_marker(self) -> None:
-        """codex 5e7f7a48: a fresh cancelRequestId on the same RUNNING task
-        must push the marker again after the first dispatch completed."""
+        """Fresh cancelRequestId on same RUNNING task re-dispatches after
+        the first complete cycle finishes.  Precise count == 2."""
         self.save_task("task-replay-diff", TaskStatus.RUNNING)
         handle = cancel_registry_module.registry.register("task-replay-diff")
         self.registered_task_ids.append("task-replay-diff")
+        executor = _CapturingExecutor(max_workers=2)
         dispatch_counter: list[int] = [0]
-        first_done: threading.Event = threading.Event()
-        second_done: threading.Event = threading.Event()
 
         def writer():
-            n = dispatch_counter[0] + 1
-            dispatch_counter[0] = n
-            if n == 1:
-                first_done.set()
-            elif n == 2:
-                second_done.set()
+            dispatch_counter[0] += 1
 
         handle.set_marker_writer(writer)
 
-        resp1 = await main.cancel_task(
-            CancelTaskRequest(
-                by_task_id=TaskIdCancelTarget(task_id="task-replay-diff"),
-                cancel_request_id="cr-a",
-            )
-        )
-        self.assertEqual(resp1.outcome, CancelOutcome.CANCEL_INTENT_RECORDED)
-        self.assertTrue(await asyncio.to_thread(first_done.wait, 5.0))
-        self.assertEqual(dispatch_counter[0], 1)
+        try:
+            with patch.object(
+                cancel_registry_module, "_get_write_pool", return_value=executor
+            ):
+                resp1 = await main.cancel_task(
+                    CancelTaskRequest(
+                        by_task_id=TaskIdCancelTarget(task_id="task-replay-diff"),
+                        cancel_request_id="cr-a",
+                    )
+                )
+                self.assertEqual(resp1.outcome, CancelOutcome.CANCEL_INTENT_RECORDED)
+                await asyncio.to_thread(executor.captured().result, 5.0)
+                self.assertEqual(dispatch_counter[0], 1)
 
-        resp2 = await main.cancel_task(
-            CancelTaskRequest(
-                by_task_id=TaskIdCancelTarget(task_id="task-replay-diff"),
-                cancel_request_id="cr-b",
-            )
-        )
-        self.assertEqual(resp2.outcome, CancelOutcome.CANCEL_INTENT_RECORDED)
-        self.assertTrue(await asyncio.to_thread(second_done.wait, 5.0))
-        self.assertEqual(dispatch_counter[0], 2)
+                resp2 = await main.cancel_task(
+                    CancelTaskRequest(
+                        by_task_id=TaskIdCancelTarget(task_id="task-replay-diff"),
+                        cancel_request_id="cr-b",
+                    )
+                )
+                self.assertEqual(resp2.outcome, CancelOutcome.CANCEL_INTENT_RECORDED)
+                await asyncio.to_thread(executor.captured().result, 5.0)
+                self.assertEqual(dispatch_counter[0], 2)
+        finally:
+            executor.shutdown(wait=True)
 
     async def test_concurrent_replays_coalesce_to_one_inflight_write(self) -> None:
-        """codex 5e7f7a48: when a writer is still in-flight, concurrent
-        stop requests coalesce — at most one mark dispatched at a time.
-        The next retry may come only after the write completes.
-
-        Zero fixed sleeps: every synchronisation point is an Event."""
+        """While a writer is blocked, concurrent stops coalesce.  After release
+        and the captured Future proves the full cycle ended, the next stop
+        dispatches exactly once more.  Zero sleeps."""
         self.save_task("task-coalesce", TaskStatus.RUNNING)
         handle = cancel_registry_module.registry.register("task-coalesce")
         self.registered_task_ids.append("task-coalesce")
+        executor = _CapturingExecutor(max_workers=2)
         dispatch_counter: list[int] = [0]
         entered: threading.Event = threading.Event()
         release: threading.Event = threading.Event()
-        first_done: threading.Event = threading.Event()
-        second_done: threading.Event = threading.Event()
 
         def blocking_writer():
-            n = dispatch_counter[0] + 1
-            dispatch_counter[0] = n
-            if n == 1:
-                entered.set()        # tell test: we are in-flight
-                release.wait()       # wait for test to release us
-                first_done.set()     # signal completion
-            elif n == 2:
-                second_done.set()
+            dispatch_counter[0] += 1
+            entered.set()
+            release.wait()  # test controls when this writer finishes
 
         handle.set_marker_writer(blocking_writer)
 
-        # First cancel — the writer blocks inside the pool thread.
-        await main.cancel_task(
-            CancelTaskRequest(
-                by_task_id=TaskIdCancelTarget(task_id="task-coalesce"),
-                cancel_request_id="cr-blocked",
-            )
-        )
-        self.assertTrue(await asyncio.to_thread(entered.wait, 5.0))
-        self.assertEqual(dispatch_counter[0], 1)
-
-        # Fire more stops while the first writer is blocked.  All must
-        # coalesce — no additional dispatch while idle is False.
-        for i in range(3):
-            await main.cancel_task(
-                CancelTaskRequest(
-                    by_task_id=TaskIdCancelTarget(task_id="task-coalesce"),
-                    cancel_request_id=f"cr-coalesce-{i}",
+        try:
+            with patch.object(
+                cancel_registry_module, "_get_write_pool", return_value=executor
+            ):
+                # First cancel — the writer blocks inside the pool thread.
+                await main.cancel_task(
+                    CancelTaskRequest(
+                        by_task_id=TaskIdCancelTarget(task_id="task-coalesce"),
+                        cancel_request_id="cr-blocked",
+                    )
                 )
-            )
-        self.assertEqual(dispatch_counter[0], 1)  # still exactly one
+                # Snapshot the in-flight Future so we can wait for it later.
+                in_flight = executor.captured()
+                self.assertTrue(await asyncio.to_thread(entered.wait, 5.0))
+                self.assertEqual(dispatch_counter[0], 1)
 
-        # Release the blocked writer and wait for its completion.
-        release.set()
-        self.assertTrue(await asyncio.to_thread(first_done.wait, 5.0))
-        self.assertEqual(dispatch_counter[0], 1)
+                # Fire more stops while the writer is blocked.
+                for i in range(3):
+                    await main.cancel_task(
+                        CancelTaskRequest(
+                            by_task_id=TaskIdCancelTarget(task_id="task-coalesce"),
+                            cancel_request_id=f"cr-coalesce-{i}",
+                        )
+                    )
+                # None submitted a second Future — all coalesced.
+                self.assertIsNone(executor.captured_nowait())
+                self.assertEqual(dispatch_counter[0], 1)
 
-        # Now idle is True; a further stop dispatches exactly once more.
-        await main.cancel_task(
-            CancelTaskRequest(
-                by_task_id=TaskIdCancelTarget(task_id="task-coalesce"),
-                cancel_request_id="cr-after-unblock",
-            )
-        )
-        self.assertTrue(await asyncio.to_thread(second_done.wait, 5.0))
-        self.assertEqual(dispatch_counter[0], 2)
+                # Release the blocked writer and wait for the full cycle.
+                release.set()
+                await asyncio.to_thread(in_flight.result, 5.0)
+                self.assertEqual(dispatch_counter[0], 1)
+
+                # Now idle is True; a further stop dispatches once more.
+                await main.cancel_task(
+                    CancelTaskRequest(
+                        by_task_id=TaskIdCancelTarget(task_id="task-coalesce"),
+                        cancel_request_id="cr-after-unblock",
+                    )
+                )
+                await asyncio.to_thread(executor.captured().result, 5.0)
+                self.assertEqual(dispatch_counter[0], 2)
+
+                # No stray third Future either.
+                self.assertIsNone(executor.captured_nowait())
+        finally:
+            executor.shutdown(wait=True)
 
 
 class CancelEndpointHttpLayerTest(unittest.TestCase):
