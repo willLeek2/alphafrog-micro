@@ -10,6 +10,7 @@
 - [查询与观测接口](agent-run/reads-and-observability.md)：运行列表、状态、结果、成本、事件、timeline、observability、trace 详情。
 - [产物、反馈与追问](agent-run/artifacts-feedback-messages.md)：snapshot 分片、artifact 下载、export、feedback、follow-up messages。
 - [错误与脚本覆盖](agent-run/errors-and-script-coverage.md)：通用错误、压测脚本实际覆盖范围。
+- [Agent 调度与长任务恢复](agent-framework/scheduling-and-tooljob-recovery.md)：六层调度、LINEAR/DAG 边界、ToolJob 状态机、取消、重启与排障顺序。
 
 ## 写作约定
 

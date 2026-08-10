@@ -1,5 +1,7 @@
 # SSE 事件流
 
+如果需要理解 `PLAN_READY`、长工具挂起、DAG 和恢复事件背后的状态推进，请先看 [Agent 调度与长任务恢复](../agent-framework/scheduling-and-tooljob-recovery.md)。
+
 SSE 是 v1.0 Agent 运行进度的实时主通道。轻客户端（TUI、压测脚本、浏览器小工具）应把 SSE 当作首选来源，只在断线修复或运行结束后用 REST 查询做补充读取。
 
 ## 打开事件流
