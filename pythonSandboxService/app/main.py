@@ -9,6 +9,9 @@ from datetime import datetime
 from typing import Dict
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exception_handlers import (
+    request_validation_exception_handler as _fastapi_422_handler,
+)
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
@@ -572,9 +575,10 @@ async def cancel_validation_handler(request: Request, exc: RequestValidationErro
             status_code=400,
             content={"detail": "invalid request body"},
         )
-    # Let FastAPI's builtin 422 handler render the default error for other
-    # routes — do not intercept those.
-    raise exc
+    # Other routes: explicitly delegate back to FastAPI's builtin 422
+    # handler.  Raising the exception would instead land in the generic
+    # unhandled_exception_handler above → an incorrect 500.
+    return await _fastapi_422_handler(request, exc)
 
 
 @app.get("/health")
