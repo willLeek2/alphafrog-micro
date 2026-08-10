@@ -107,3 +107,7 @@ remote_pr/
 migrate_config.yml
 
 node_modules/
+
+# 260809-26Q3-stage1-w3 D13: task-local audit notes, not for owner code commit
+# (codex 531cc154 + Cindy 313d871e non-blocking)
+notes-w3/

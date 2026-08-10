@@ -40,12 +40,9 @@ final class LangchainTodoUserMessageBuilder {
         }
         message.append("当前任务: ").append(safe(todoDescription)).append("\n\n");
         if (datasetRefs != null && !datasetRefs.isEmpty()) {
-            message.append("已有原始数据集 ID（来自前序工具输出，仅用于定位数据，不可直接作为 executePython 的 run-level dataset_ids/manifest_ids 参数）:\n");
+            message.append("已有原始数据集 ID:\n");
             datasetRefs.keySet().forEach(id -> message.append("  - ").append(id).append("\n"));
             message.append("\n");
-            message.append("⚠️ 注意：executePython 需要当前 run 内的整数 dataset_ids / manifest_ids。");
-            message.append("如果不确定整数 ID，请先调用 listMyData（query_type=dataset 或 query_type=manifest）解析，");
-            message.append("不要把上述原始 dataset_id / manifest_id、路径或 scope hash 直接传给 executePython。\n\n");
         }
         message.append("请决定如何完成。\n");
         message.append("需要调用工具时请直接使用系统提供的工具调用能力，不要手写 JSON。\n");

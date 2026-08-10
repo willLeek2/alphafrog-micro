@@ -44,6 +44,11 @@ message ExecuteResponse {
   string error = 3;
   bool existing = 4;
   string requestFingerprint = 5;
+  // 260809-26Q3-stage1-w3 D13: typed HTTP error detail. Presence semantics:
+  // absent = legacy producer (pre-D13); present = D13 mapping applied, category
+  // is the authoritative machine signal. Parent `error` remains the sole
+  // human-readable text and must stay non-blank on every failure path.
+  SandboxErrorDetail errorDetail = 6;
 }
 
 message GetTaskStatusRequest {
@@ -56,6 +61,8 @@ message TaskStatusResponse {
   string startedAt = 3;
   string finishedAt = 4;
   string error = 5;
+  // 260809-26Q3-stage1-w3 D13: typed HTTP error detail. See ExecuteResponse.errorDetail.
+  SandboxErrorDetail errorDetail = 6;
 }
 
 message GetTaskResultRequest {
@@ -80,6 +87,9 @@ message TaskResultResponse {
   // 260808-finance-methodspec-v5: 实际容器环境身份，proto 11 为权威值。
   // 无 runtimeImageRef（Python 内部 C/H 任务事实，不进 DTO）。
   SandboxEnvironmentIdentity executionEnvironment = 11;
+  // 260809-26Q3-stage1-w3 D13: typed HTTP error detail. See ExecuteResponse.errorDetail.
+  // Tag 12 chosen because 260808 additive fields already occupy 9/10/11.
+  SandboxErrorDetail errorDetail = 12;
 }
 
 message SandboxResourceUsage {
@@ -138,12 +148,179 @@ message GetTaskByOperationIdRequest {
   string operationId = 1;
 }
 
+// 260809-26Q3-stage1-w3 D13: Gateway HTTP 错误的稳定分类。codex msg 2110f215 +
+// Cindy msg 4b89c2d6/807334eb 冻结。8 frozen values map 1:1 to tags 0-7.
+// Tag 0 = SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED is the proto3 default; parent
+// message presence (has*()) distinguishes "D13 mapped but uncategorizable" from
+// "legacy producer did not map at all".
+enum SandboxHttpErrorCategory {
+  SANDBOX_HTTP_ERROR_CATEGORY_UNSPECIFIED = 0;
+  SANDBOX_HTTP_ERROR_CATEGORY_CONFLICT = 1;
+  SANDBOX_HTTP_ERROR_CATEGORY_INVALID_ARGUMENT = 2;
+  SANDBOX_HTTP_ERROR_CATEGORY_OVERLOADED_OR_UNAVAILABLE = 3;
+  SANDBOX_HTTP_ERROR_CATEGORY_NOT_FOUND = 4;
+  SANDBOX_HTTP_ERROR_CATEGORY_GATEWAY_TIMEOUT = 5;
+  SANDBOX_HTTP_ERROR_CATEGORY_TRANSPORT_FAILURE = 6;
+  SANDBOX_HTTP_ERROR_CATEGORY_DOWNSTREAM_FAILURE = 7;
+}
+
+// 260809-26Q3-stage1-w3 D13: typed HTTP error detail — the SOLE authoritative
+// machine contract for HTTP error classification (codex msg 2110f215).
+// Parent-message presence (hasErrorDetail()) is the new-producer signal:
+//   absent = legacy producer (pre-D13); consumer MUST fall back to conservative
+//           blank-vs-nonblank error text behavior and MUST NOT guess category.
+//   present = D13 mapping applied; category is the authoritative signal.
+// Only 2 fields: category + presence-aware downstream_http_status. No message
+// field (parent string error is the single human-text source). No retryable
+// field this round (codex 531cc154 + Cindy 70b94ca1).
+//
+// downstream_http_status records the ACTUAL downstream HTTP status received:
+//   - Gateway local reject (D14 operationId gate, no downstream call) → absent
+//   - Gateway connect/read timeout (no downstream HTTP response) → absent
+//   - Transport failure: DNS/conn refused/TLS/non-timeout IO → absent
+//   - Downstream 4xx/5xx received (Gateway proxied) → present with actual code
+// Downstream 504 → DOWNSTREAM_FAILURE + status=504 (NOT GATEWAY_TIMEOUT, since
+// downstream已响应). Downstream 401/403/unknown 4xx → UNSPECIFIED (not
+// INVALID_ARGUMENT, avoiding over-categorization of auth/permission errors).
+message SandboxErrorDetail {
+  SandboxHttpErrorCategory category = 1;
+  optional int32 downstream_http_status = 2;
+}
+
 message GetTaskByOperationIdResponse {
   bool found = 1;
   string taskId = 2;
   string status = 3;
   string requestFingerprint = 4;
   string error = 5;
+  // 260809-26Q3-stage1-w3 D13: typed HTTP error detail. See ExecuteResponse.errorDetail.
+  // Authoritative absence (D13 fail-closed red line 6) is expressed ONLY by:
+  //   found=false + error blank + errorDetail absent (legacy presence semantics)
+  // on this response. Any present errorDetail — including category=NOT_FOUND —
+  // MUST be treated as failure (fail-closed preserve PREPARING), never as
+  // authoritative absence.
+  SandboxErrorDetail errorDetail = 6;
+}
+
+// ===================================================================
+// 260809-26Q3-stage1 W2 task #102 D11 — Run 取消生命周期闭环（Model U）
+// 单 cancelTask RPC + 复用 getTaskStatus/getTaskResult/getTaskByOperationId
+// 三个查询接口；不新增 cancelCreate/getCanceledResult/getTerminalResult。
+//
+// 裁定链：
+//   - codex 3b81d1aa C 裁定（single cancelTask + 复用现有查询）
+//   - codex 60c42f97 3 项合同纠正（oneof sub-message / CANCEL_INTENT_RECORDED
+//     仅沙箱侧 tombstone 不等于 D08 child 终态 / 复用 D13 SandboxErrorDetail）
+//   - codex a3aee2ad v2 MUST-FIX 5 项 v3 落地（基线锁定 05c24462 + 调用方向
+//     Java worker→Gateway→Python + outcome 语义修订 + stable taskId 收口 +
+//     errorDetail message 引用而非字段复制 + cancelRequestId durable binding +
+//     status 改名 + by_operation 必须先验证 fingerprint）
+//
+// 调用方向（codex a3aee2ad 第 三 节）：
+//   用户取消 → Java run-control/D08 入口 → startCancel Java/PG 原子置 CANCELLING
+//   → Java Reconciler/CancelWorker 扫到 child → 外调 Gateway cancelTask
+//   → Gateway 转发 Python endpoint → Java 按 outcome 重试/等待 → Finalizer 收口
+// ===================================================================
+
+// D11 by_task_id 路径：客户端已通过 createTask 拿到 taskId 时使用（CREATED/RUNNING）。
+// 注意：taskId 路径不依赖指纹路由；调用方审计需求通过 cancelRequestId + 日志满足，
+// 不在子消息里再加 requestFingerprint（codex a3aee2ad 第 二 节末：删 taskId 路径
+// 的 requestFingerprint，避免「审计用且不参与判断」制造调用者误解）。
+message TaskIdCancelTarget {
+  string taskId = 1;
+}
+
+// D11 by_operation 路径：PREPARING 期（createTask 未持久化）或客户端未拿到 taskId 时使用。
+// 重要：proto3 oneof 只编译期保证两条 target 路径互斥（选了 by_task_id 就不能同时
+// by_operation），不保证子消息里的字符串非空。Gateway/Python 运行时必须校验
+// operationId 与 requestFingerprint 非空、格式合法（codex a3aee2ad 第 二 节）。
+message OperationCancelTarget {
+  string operationId = 1;
+  string requestFingerprint = 2;
+}
+
+message CancelTaskRequest {
+  // target 二选一：by_task_id 或 by_operation。oneof 内是两个 sub-message，
+  // 生成代码（Java）以 getTargetCase() 判路径，hasByTaskId()/hasByOperation()
+  // 判子消息是否设置；空 sub-message 仍需运行时拒绝。
+  oneof target {
+    TaskIdCancelTarget by_task_id = 1;
+    OperationCancelTarget by_operation = 2;
+  }
+  // cancelRequestId 是 durable binding，不是可选缓存（codex a3aee2ad 第 六 节
+  // 裁定 3）：同一 cancelRequestId 必须绑定同一 target 身份；同键换 taskId/
+  // operationId/fingerprint 必须 outcome=UNSPECIFIED + errorDetail.category=
+  // CONFLICT。同键同 target 重放不重复副作用，返回首次 outcome（status 字段
+  // 可单独随响应更新）。不同 cancelRequestId 对同 target 按当前持久态安全幂等。
+  string cancelRequestId = 3;
+  // 取消原因（审计用），不影响路由与 outcome。
+  // 建议值：USER_REQUEST / QUEUE_TIMEOUT / RUN_CANCELED / TOOLJOB_FINALIZER。
+  string reason = 4;
+}
+
+// 取消结果分类（codex a3aee2ad 第 四 节语义修订）：
+//   - CANCEL_INTENT_RECORDED：沙箱控制面已持久化 cancel-intent（含 stable taskId），
+//     但任务尚未到达终态；调用方应轮询 getTaskByOperationId/getTaskStatus/
+//     getTaskResult 直到 terminal。**不等于** D08 child 已终态（codex 60c42f97
+//     第 2 项：D08 侧 outcome 后保持 CANCELLING，Finalizer 收口）。
+//   - CANCELED：沙箱已持久化终态 CANCELED 且 getTaskResult 可读到 honest result
+//     （retryable=false、usage 不伪造、缺失测量明确 incomplete）。仅在终态真正
+//     落稳后返回，禁止提前宣告成功（codex a3aee2ad 第 四 节 1）。
+//   - ALREADY_TERMINAL：任务已处于终态（SUCCEEDED/FAILED/CANCELED），本调用未
+//     改变状态。幂等语义。by_operation 路径必须先验证 fingerprint 一致再返回此
+//     outcome，不能绕过身份检查（codex a3aee2ad 第 四 节末）。
+//   - NOT_FOUND（业务）：一次成功到达下游后的权威不存在（如 by_task_id 的 taskId
+//     在沙箱侧不存在）。与 HTTP/transport 的 errorDetail.category=NOT_FOUND 必须
+//     区分（codex a3aee2ad 第 四 节 3）。
+//   - UNSPECIFIED：失败 outcome，具体失败原因由 errorDetail.category 区分（CONFLICT
+//     用于 cancelRequestId 重绑定 target / by_operation fingerprint 不匹配 / 同
+//     operationId 不同 fingerprint；INVALID_ARGUMENT 用于字段格式非法；其他 D13
+//     category 按场景复用）。调用方必须按 errorDetail.category 分支，禁止读 error
+//     字符串判分支。
+enum CancelOutcome {
+  CANCEL_OUTCOME_UNSPECIFIED = 0;
+  CANCEL_INTENT_RECORDED = 1;
+  CANCELED = 2;
+  ALREADY_TERMINAL = 3;
+  NOT_FOUND = 4;
+}
+
+message CancelTaskResponse {
+  // 结果分类，调用方据此分支，不读 error。
+  CancelOutcome outcome = 1;
+  // stable taskId：cancel-intent 持久化时由沙箱分配的稳定标识，让现有
+  // getTaskStatus/getTaskResult 可读 honest CANCELED result（codex a3aee2ad
+  // 第 五 节 stable taskId 收口）。outcome=CANCEL_INTENT_RECORDED 时 taskId
+  // 已分配但 result 尚未 honest，调用方需轮询直到 outcome 转为 CANCELED。
+  string taskId = 2;
+  // 当前沙箱侧持久态。**当前** Python TaskStatus 已实现的合法值（与现有
+  // TaskStatusResponse.status / TaskResultResponse.status 同一套词汇，调用方拿
+  // stable taskId 轮询 getTaskStatus/getTaskResult 看到的是同一组词）：
+  //   QUEUED / RUNNING / SUCCEEDED / FAILED / CANCELED
+  // proto 字段不在同一 taskId 上引入两套状态词（codex f25b394a 第 2 节）。
+  //
+  // outcome=CANCEL_INTENT_RECORDED 时 status 仍是当前 QUEUED/RUNNING，最终查询
+  // 转为 CANCELED；调用方据 outcome 判断进度，不靠 status=canceling 这种中间态
+  // （codex a3aee2ad 第 四 节 2：terminalStatus 改名 status）。
+  //
+  // 中间态 CANCELING（取消进行中）：当前 Python TaskStatus 尚未实现此值。如果
+  // endpoint 实现（ccqwen Python D11 child task）确实需要 CANCELING 中间态，必须
+  // 由 endpoint 实现者同时扩展 Python TaskStatus、getTaskStatus/getTaskResult
+  // 两个查询响应、相关测试，再在本字段冻结；proto 现在不提前声称 CANCELING
+  // 已实现或与任务表 1:1。
+  //
+  // Java 侧 dag_frontier_json.phase 用 CANCELLING 表示 D08 worker 进行时（Java
+  // 单数形式 + -ING），是 D08 worker 侧状态；**不**与本字段共享词汇。调用方跨
+  // 语言读时按各自表锁定的拼写，不在 proto 字符串里跨语言归一化。
+  string status = 3;
+  // 人类可读文本（仅日志/诊断）；分支判断必须用 outcome + errorDetail.category。
+  string error = 4;
+  // D13 typed error detail 复用（codex a3aee2ad 第 六 节裁定 5 + 第 一 节）：
+  // 父消息 presence 即 D13 已有语义（hasErrorDetail()：absent=未分类，present=
+  // D13 mapping applied）。不复制 category/downstream_http_status 两个独立字段，
+  // 不重复 enum，不在 D11 顺手扩 D13 合同。category 是权威机器信号，下游按 D13
+  // 契约（SandboxHttpErrorCategory 8 frozen values）解析。
+  SandboxErrorDetail errorDetail = 5;
 }
 
 service PythonSandboxService {
@@ -151,4 +328,10 @@ service PythonSandboxService {
   rpc getTaskStatus(GetTaskStatusRequest) returns (TaskStatusResponse);
   rpc getTaskResult(GetTaskResultRequest) returns (TaskResultResponse);
   rpc getTaskByOperationId(GetTaskByOperationIdRequest) returns (GetTaskByOperationIdResponse);
+  // D11 cancel RPC（Model U）：单一接口接住 PREPARING/CREATED/RUNNING 三阶段。
+  // 调用方向：Java D08 worker（Reconciler/CancelWorker）→ Gateway cancelTask →
+  // Python endpoint（codex a3aee2ad 第 三 节）。Gateway 实现仍遵守 D14 装配依赖，
+  // 本波只落 proto additive + Gateway 默认 UNIMPLEMENTED（不写假 override，
+  // codex a3aee2ad 第 六 节裁定 4）。
+  rpc cancelTask(CancelTaskRequest) returns (CancelTaskResponse);
 }

@@ -55,8 +55,10 @@ with the capture artifacts at all)::
                                           the combined stored bytes of both
                                           files never exceed it.
     capture-result.json                   the §7.1 summary: the ten frozen
-                                          fields plus three internal
-                                          unknown-marker counters
+                                          fields, the D11 cancelObserved
+                                          cancellation-evidence flag, plus
+                                          three internal unknown-marker
+                                          counters
                                           (unknownMarkerLines /
                                           unknownMarkerBytes /
                                           unknownMarkerTruncated) that stay
@@ -93,6 +95,24 @@ only.  Timeout (§7.1 实施方式 6): SIGKILL the entire process group so no or
 grandchild survives in the reused container, then still write
 ``capture-result.json`` — the timeout fact is carried by the non-zero
 ``exitCode`` (negative signal translation, e.g. -9 for SIGKILL).
+
+Cancel marker (260809-26Q3 D11, task #108, d6841a2e rules): when the wrapper
+input carries ``cancelMarkerPath``, the deadline loop polls that path every
+iteration.  OBSERVING the marker while the child is still alive is the ONLY
+valid cancellation evidence (rule 2): the wrapper kills the entire process
+group exactly like a timeout kill and reports ``cancelObserved=true`` in the
+summary.  A marker that appears only after the child already exited normally
+changes nothing (rule 3 — the genuine SUCCEEDED/FAILED result stands), and a
+kill issued anywhere outside this observation (or a stop request that never
+produced a marker) is NOT evidence (rule 4).  Before the spawn, main()
+fail-closed verifies (a) that the marker path equals
+``<control_root>/<taskId>/cancel`` derived from ``scriptPath`` — the control
+root is ``/run/alphafrog-task-control`` inside the container, overridable via
+``AF_TASK_CONTROL_ROOT`` so host-side tests and the runner agree on ONE
+location — and (b) when the wrapper runs as root, that the whole control path
+chain lstats to real root-owned directories the child identity cannot write
+(codex 4334bc9d constraint 2; a violator exits 2 with no child and no
+summary).
 
 Process-tree cleanup (P0-2, codex b39f5e6b / 1d81ca85): a child that exits
 promptly can leave grandchildren that inherited the stdout/stderr pipes
@@ -180,12 +200,13 @@ import hashlib
 import json
 import os
 import signal
+import stat
 import struct
 import subprocess
 import sys
 import threading
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from app.output_capture import (
     MARKER_FAMILY_PREFIX_BYTES,
@@ -218,12 +239,17 @@ __all__ = [
     "UNKNOWN_MARKER_AUDIT_FILE_NAME",
     "CAPTURE_RESULT_FILE_NAME",
     "LIMIT_KEYS",
+    "CANCEL_MARKER_FILE_NAME",
+    "TASK_CONTROL_ROOT_ENV_NAME",
+    "TASK_CONTROL_ROOT_DEFAULT",
     "PROCESS_SWEEP_BUDGET_SECONDS",
     "SWEEP_TERM_GRACE_SECONDS",
     "SWEEP_POLL_INTERVAL_SECONDS",
     "WrapperInputError",
     "record_batch_digest",
     "parse_wrapper_input",
+    "expected_cancel_marker_path",
+    "verify_control_path_permissions",
     "run_bounded_capture",
     "main",
 ]
@@ -242,6 +268,24 @@ LIMIT_KEYS = (
     "recordChannelMaxBytes",
     "recordChannelMaxRecords",
 )
+
+# === 260809-26Q3-stage1-w2 D11 (task #108): cancel marker polling ==========
+# The runner creates the control chain <control_root>/<taskId>/ root:root
+# 0700 inside the container and hands the EXACT marker path via the wrapper
+# input.  While the child runs, the wrapper polls that path on every timeout
+# loop turn; when it OBSERVES the marker it kills its OWN child process
+# group and reports cancelObserved=true (d6841a2e rule 2 — the only
+# evidence that justifies CANCELED for a running child).  The binding is
+# verified fail-closed BEFORE spawn: the supplied path must equal the
+# task-local derivation <control_root>/<scriptDirName>/cancel, and under
+# root the whole parent chain must be real root-owned directories with no
+# write path for the child identity (lstat-based, symlinks rejected —
+# codex 4334bc9d constraint 2).  AF_TASK_CONTROL_ROOT overrides the default
+# for host-side tests; the runner derives the same path from the same env.
+CANCEL_MARKER_FILE_NAME = "cancel"
+TASK_CONTROL_ROOT_ENV_NAME = "AF_TASK_CONTROL_ROOT"
+TASK_CONTROL_ROOT_DEFAULT = "/run/alphafrog-task-control"
+# === end D11 cancel marker polling ==========================================
 
 # Pipe read size: large enough to keep a flooding child from ever filling the
 # 64 KiB pipe buffer between scheduler turns.
@@ -1104,12 +1148,22 @@ def _sweep_process_tree(root_pid: int, threads, pipe_fds) -> bool:
 # === end P0-2 ================================================================
 
 
-def _kill_process_group(pgid: int) -> None:
-    """SIGKILL every current member of the process group (§7.1 实施方式 6)."""
+def _kill_process_group(pgid: int) -> bool:
+    """SIGKILL every current member of the process group (§7.1 实施方式 6).
+
+    Returns True iff the signal was delivered to a still-existing process
+    group.  ProcessLookupError means the group was already dead, which in
+    the cancel-marker loop is the narrow rule-3 window: the child exited
+    on its own between ``poll()`` and ``killpg()``, so the wrapper must
+    NOT claim ``cancelObserved=true``.
+    """
     try:
         os.killpg(pgid, signal.SIGKILL)
+        return True
+    except ProcessLookupError:
+        return False
     except OSError:
-        pass  # group already gone (or never fully started)
+        return False  # cannot signal at all
 
 
 def _make_preexec(child_identity):
@@ -1228,11 +1282,149 @@ def parse_wrapper_input(path: Path) -> dict:
     # runtimeEnvironmentPath is part of the §7.1 input shape but belongs to
     # work package D's schema (runtime_environment.py); the wrapper does not
     # consume it.
+    # D11 (task #108): cancelMarkerPath is OPTIONAL for backward
+    # compatibility with pre-D11 inputs; when present it must be a
+    # non-empty string and is exact-bound-verified against the task-local
+    # control derivation in main() before anything runs.
+    cancel_marker_path = payload.get("cancelMarkerPath")
+    if cancel_marker_path is not None and (
+        not isinstance(cancel_marker_path, str) or not cancel_marker_path
+    ):
+        raise WrapperInputError(
+            "cancelMarkerPath must be a non-empty string when present"
+        )
     return {
         "script_path": script_path,
         "timeout_seconds": timeout_seconds,
         "limits": limits,
+        "cancel_marker_path": cancel_marker_path,
     }
+
+
+def _task_control_root() -> str:
+    """The control root for cancel markers (env override aware)."""
+    override = os.environ.get(TASK_CONTROL_ROOT_ENV_NAME)
+    if override and override.strip():
+        return override.strip().rstrip("/")
+    return TASK_CONTROL_ROOT_DEFAULT
+
+
+def expected_cancel_marker_path(script_path: str) -> str:
+    """The ONLY cancel marker path this wrapper run may accept (D11).
+
+    The runner builds every task workspace as ``<workspace_root>/<taskId>``
+    (sandbox_runner ``_prepare_task_workspace``) and stages the user script
+    directly inside it, so the script's parent directory name IS the
+    taskId.  The marker must be exactly ``<control_root>/<taskId>/cancel`` —
+    any other path (another task's marker, a child-suggested location) is
+    rejected fail-closed by the binding check in main().
+    """
+    task_id = PurePosixPath(script_path).parent.name
+    return f"{_task_control_root()}/{task_id}/{CANCEL_MARKER_FILE_NAME}"
+
+
+def verify_control_path_permissions(
+    marker_path: str,
+    child_uid: int,
+    child_gid: int,
+    stat_fn=os.lstat,
+) -> None:
+    """Fail-closed parent-chain verification of the cancel marker path (D11).
+
+    codex 4334bc9d constraint 2: check the REAL file type and the whole
+    parent chain, and judge the child's write path by its actual uid/gid.
+    Every level — the task control dir, the control root, and the control
+    root's own parent (the ``/run`` equivalent) — must lstat to a REAL
+    directory (``S_ISDIR`` on lstat means symlinks are rejected, never
+    followed).  The task dir and the control root must additionally be
+    root-owned and free of group/world write bits.  The child identity must
+    have NO write path into ANY level: a child that could create or remove
+    the marker could forge or suppress cancellations.  The marker file
+    itself may legitimately not exist yet (the cancel writer touches it on
+    demand); if present it must be a root-owned regular file without a
+    child write path.
+
+    Pure function (``stat_fn`` injectable) so tests can exercise it with
+    synthetic stat results.  Any violation raises ``WrapperInputError`` —
+    the wrapper then exits non-zero with NO child and NO summary.
+    """
+    if child_uid == 0:
+        raise WrapperInputError(
+            "cancel marker verification refuses a root child identity"
+        )
+    marker = PurePosixPath(marker_path)
+    task_dir = marker.parent
+    control_root = task_dir.parent
+    grand_parent = control_root.parent
+    levels = (
+        (task_dir, True),
+        (control_root, True),
+        (grand_parent, False),
+    )
+    for level, require_root_owned in levels:
+        try:
+            st = stat_fn(str(level))
+        except OSError as exc:
+            raise WrapperInputError(
+                f"cancel control path {level} cannot be lstat'ed: {exc}"
+            ) from exc
+        if not stat.S_ISDIR(st.st_mode):
+            raise WrapperInputError(
+                f"cancel control path {level} is not a real directory"
+                " (symlinks are rejected)"
+            )
+        if require_root_owned and st.st_uid != 0:
+            raise WrapperInputError(
+                f"cancel control path {level} must be owned by root"
+            )
+        if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise WrapperInputError(
+                f"cancel control path {level} must not be group/world"
+                " writable"
+            )
+        if st.st_uid == child_uid and st.st_mode & stat.S_IWUSR:
+            raise WrapperInputError(
+                f"cancel control path {level} is writable by the child uid"
+            )
+        if st.st_gid == child_gid and st.st_mode & stat.S_IWGRP:
+            raise WrapperInputError(
+                f"cancel control path {level} is writable by the child gid"
+            )
+    # The marker itself: absent is normal (created on cancel); present means
+    # it must be a root-owned regular file with no child write path.
+    try:
+        marker_st = stat_fn(str(marker))
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise WrapperInputError(
+            f"cancel marker {marker} cannot be lstat'ed: {exc}"
+        ) from exc
+    if not stat.S_ISREG(marker_st.st_mode):
+        raise WrapperInputError("cancel marker must be a regular file")
+    if marker_st.st_uid != 0:
+        raise WrapperInputError("cancel marker must be owned by root")
+    if marker_st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise WrapperInputError(
+            "cancel marker must not be group/world writable"
+        )
+    if marker_st.st_uid == child_uid and marker_st.st_mode & stat.S_IWUSR:
+        raise WrapperInputError("cancel marker is writable by the child uid")
+    if marker_st.st_gid == child_gid and marker_st.st_mode & stat.S_IWGRP:
+        raise WrapperInputError("cancel marker is writable by the child gid")
+
+
+def _cancel_marker_exists(marker_path: str) -> bool:
+    """True iff the cancel marker file is observable right now (D11).
+
+    Any error is treated as "no marker": cancellation is fail-observe — a
+    marker that cannot be stat'ed must not change the run, because only an
+    OBSERVED marker is cancellation evidence (d6841a2e rules 2/3).
+    """
+    try:
+        return os.path.exists(marker_path)
+    except OSError:
+        return False
 
 
 def run_bounded_capture(
@@ -1242,17 +1434,26 @@ def run_bounded_capture(
     limits: dict,
     capture_dir: Path,
     child_identity: tuple | None = None,
+    cancel_marker_path: str | None = None,
 ) -> tuple:
     """Run the user script under bounded capture.
 
     Returns ``(summary, capture_files, sweep_ok)``:
 
-    * ``summary`` — the 13 frozen capture-result.json fields;
+    * ``summary`` — the 14 frozen capture-result.json fields;
     * ``capture_files`` — the STILL-OPEN pre-spawn capture file objects
       (name -> file object) the caller must read via
       ``capture_reader.read_capture_files_from_fds`` and then close;
     * ``sweep_ok`` — False when the post-exit process-tree sweep exceeded its
       budget: the caller must exit non-zero WITHOUT emitting the envelope.
+
+    ``cancel_marker_path`` (260809-26Q3 D11, task #108): when not None the
+    deadline loop polls this path on every iteration.  OBSERVING the marker
+    while the child is still alive is the ONLY valid cancellation evidence
+    (d6841a2e rule 2): the wrapper then kills the entire process group
+    exactly like a timeout and reports ``cancelObserved=true``.  A marker
+    observed only AFTER the child already exited changes nothing (rule 3 —
+    the genuine exit result stands, ``cancelObserved`` stays false).
 
     Writes ``capture-result.json`` through its pre-opened fd before
     returning, EXCEPT when the spawn fails while a child identity is active
@@ -1282,6 +1483,12 @@ def run_bounded_capture(
         "unknownMarkerLines": 0,
         "unknownMarkerBytes": 0,
         "unknownMarkerTruncated": False,
+        # 260809-26Q3 D11 (task #108): the cancellation-evidence flag.  True
+        # ONLY when this wrapper OBSERVED the cancel marker while the child
+        # was still alive and therefore killed its process group itself
+        # (d6841a2e rule 2).  A kill issued anywhere else (or a marker that
+        # appeared after the child's normal exit) leaves it false — rules 3/4.
+        "cancelObserved": False,
     }
 
     capture_files: dict = {}
@@ -1290,6 +1497,10 @@ def run_bounded_capture(
     audit: _UnknownMarkerAudit | None = None
     proc: subprocess.Popen | None = None
     timed_out = False
+    # D11: set ONLY by the deadline loop when it observes the cancel marker
+    # while the child is still alive — the wrapper's own kill of its own
+    # process group is the cancellation evidence (d6841a2e rule 2).
+    canceled = False
     spawned = False
     success = False
     # P0-4: with an active identity a FAILED spawn must leave no summary.
@@ -1389,9 +1600,29 @@ def run_bounded_capture(
         stdout_thread.start()
         stderr_thread.start()
 
-        # Timeout monitoring on the main thread while the readers drain.
+        # Timeout + cancel-marker monitoring on the main thread while the
+        # readers drain.  The marker is polled at the head of every loop
+        # iteration (≤0.2s granularity, bounded by proc.wait below).
         deadline = time.monotonic() + float(timeout_seconds)
         while True:
+            if cancel_marker_path is not None and _cancel_marker_exists(
+                cancel_marker_path
+            ):
+                # d6841a2e rule 2: the wrapper OBSERVED the marker.  That
+                # observation is cancellation evidence ONLY when it causes
+                # this wrapper to kill its own still-running child group.
+                # Rule 3 narrow window: poll() says alive, but between
+                # poll() and killpg() the child exited — the kill returns
+                # False and canceled stays False so the genuine result
+                # stands (codex c6c49248 review).
+                if proc.poll() is None:
+                    if _kill_process_group(pgid):
+                        canceled = True
+                # Rule 3: the child already exited on its own (poll() is not
+                # None) — the marker arrived too late to matter.  Break with
+                # canceled still False so the genuine exit result stands; a
+                # late marker must NEVER rewrite a real SUCCEEDED/FAILED.
+                break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 timed_out = True
@@ -1403,7 +1634,9 @@ def run_bounded_capture(
             except subprocess.TimeoutExpired:
                 continue
 
-        if timed_out:
+        if timed_out or canceled:
+            # Same reap discipline for timeout kills and cancel kills: both
+            # SIGKILL the whole process group and must leave no survivor.
             try:
                 proc.wait(timeout=PROCESS_SWEEP_BUDGET_SECONDS)
             except subprocess.TimeoutExpired:
@@ -1446,14 +1679,19 @@ def run_bounded_capture(
                 # written (== joint-budget bytes used by the audit class).
                 "unknownMarkerBytes": audit.stored_bytes,
                 "unknownMarkerTruncated": audit.truncated,
+                # D11: whether THIS wrapper observed the marker and killed
+                # its own child group (the only cancellation evidence).
+                "cancelObserved": canceled,
             }
         )
 
         exit_code = proc.returncode
         if exit_code is None:
             exit_code = 1
-        elif timed_out and exit_code == 0:
-            exit_code = 124  # defensive: a timed-out run never reports success
+        elif (timed_out or canceled) and exit_code == 0:
+            # Defensive: a run the wrapper force-killed (timeout or cancel)
+            # never reports success, even if the kill raced a clean exit.
+            exit_code = 124
         summary["exitCode"] = exit_code
 
         # Presence in the envelope means "the wrapper held that fd": a
@@ -1537,6 +1775,42 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
+    # === 260809-26Q3 D11 (task #108): cancel-marker gates, BEFORE spawn ====
+    # The runner passed the marker path it created for THIS task.  Two
+    # fail-closed checks run before any child exists:
+    #   1. EXACT BINDING — the path must equal the control path derived from
+    #      scriptPath (the script's parent directory name IS the taskId).
+    #      A mismatched path (another task's marker, a child-suggested
+    #      location, a stale value) is rejected: exit 2, no child, no summary.
+    #   2. PERMISSION CHAIN — when the wrapper runs as root (the production
+    #      shape), the whole control path chain must lstat to real root-owned
+    #      directories with no write path for the child identity
+    #      (codex 4334bc9d constraint 2).  Non-root dev mode skips the OS
+    #      check (the binding check above still runs).
+    cancel_marker_path = parsed["cancel_marker_path"]
+    if cancel_marker_path is not None:
+        expected_marker_path = expected_cancel_marker_path(parsed["script_path"])
+        if cancel_marker_path != expected_marker_path:
+            # Diagnostics only — never user content (§18 stop condition).
+            sys.stderr.write(
+                "bounded_exec_wrapper: cancelMarkerPath does not match the "
+                "task control path derived from scriptPath\n"
+            )
+            return 2
+        if os.geteuid() == 0:
+            # child_identity is guaranteed non-None here: the root gate above
+            # refuses to continue without a resolvable non-root identity.
+            try:
+                verify_control_path_permissions(
+                    cancel_marker_path,
+                    child_identity[0],
+                    child_identity[1],
+                )
+            except WrapperInputError as exc:
+                sys.stderr.write(f"bounded_exec_wrapper: {exc}\n")
+                return 2
+    # === end D11 gates ======================================================
+
     capture_dir = input_path.resolve().parent / CAPTURE_DIR_NAME
     try:
         summary, capture_files, sweep_ok = run_bounded_capture(
@@ -1545,6 +1819,7 @@ def main(argv: list[str] | None = None) -> int:
             limits=parsed["limits"],
             capture_dir=capture_dir,
             child_identity=child_identity,
+            cancel_marker_path=cancel_marker_path,
         )
     except Exception as exc:  # last-resort guard; type name only (§18)
         sys.stderr.write(

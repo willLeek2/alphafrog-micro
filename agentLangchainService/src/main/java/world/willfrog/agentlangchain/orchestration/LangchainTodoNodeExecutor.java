@@ -124,7 +124,9 @@ public class LangchainTodoNodeExecutor {
             long previousTodoTotalLength,
             int currentTodoPromptBudgetChars,
             boolean recoveryAttempted,
-            String recoveryOutcome
+            String recoveryOutcome,
+            boolean currentAttemptHadToolEvidence,
+            String recoverySkipReason
     ) {
         Map<String, Object> toMap() {
             Map<String, Object> out = new LinkedHashMap<>();
@@ -142,6 +144,10 @@ public class LangchainTodoNodeExecutor {
             out.put("current_todo_prompt_budget_chars", currentTodoPromptBudgetChars);
             out.put("recovery_attempted", recoveryAttempted);
             out.put("recovery_outcome", recoveryOutcome);
+            out.put("current_attempt_had_tool_evidence", currentAttemptHadToolEvidence);
+            if (recoverySkipReason != null) {
+                out.put("recovery_skip_reason", recoverySkipReason);
+            }
             return out;
         }
     }
@@ -214,7 +220,7 @@ public class LangchainTodoNodeExecutor {
      * </ul>
      * <p>
      * 注意：{@code toolCalls} 是上游传入的引用，本方法在 tool loop 的 {@code afterToolExecution} 回调里对其进行 increment，
-     * 因此调用前后差值即为当前 todo 实际消耗的工具调用次数。
+     * 共享计数器差值仅用于结果统计，绝不能作为当前 todo 的工具执行证据或恢复判断门闩；恢复只看本地 per-attempt 信号。
      *
      * @param request      当前 run 的完整请求上下文（含模型、用户目标、runId 等）
      * @param item         待执行的 todo 节点
@@ -256,6 +262,10 @@ public class LangchainTodoNodeExecutor {
                 request.getToolSpecifications());
         boolean pythonRepair = isPythonRepair(repairContext);
         AtomicBoolean acceptedPythonRepairExecution = new AtomicBoolean(false);
+        // 仅当前 todo / 当前模型尝试的本地信号：只有本条 execute() 的 tool loop 里真正
+        // 开始执行工具（beforeToolExecution 通过 ensureRunnable 后）才设为 true。
+        // 不能被 run 级共享计数器、其他并行 todo 或旧 attempt 的痕迹替代。
+        AtomicBoolean currentAttemptToolStarted = new AtomicBoolean(false);
         if (pythonRepair) {
             userMessage += buildPythonRepairUserMessage(repairContext);
             AgentContext.setPythonRefineAttempt(repairContext.getPythonRepairAttempt());
@@ -266,7 +276,7 @@ public class LangchainTodoNodeExecutor {
             AgentContext.clearPythonRefineAttempt();
             AgentContext.clearPythonRepairContext();
         }
-        // 记录 tool loop 开始前的计数，执行后用差值算出当前 todo 实际消耗的 tool call 次数
+        // 记录 tool loop 开始前的共享计数，差值仅用于结果统计，不作为工具执行证据
         int callsBefore = toolCalls.get();
         // 把 datasetRefs 注入到 ThreadLocal 上下文中，让工具执行时能读取上游节点产生的数据引用
         LangchainDatasetRefContext.set(datasetRefs);
@@ -294,7 +304,8 @@ public class LangchainTodoNodeExecutor {
             // 发 LLM 请求前先检查 run 是否已被取消
             ensureRunnable(request);
             String output = buildTodoAiService(
-                    request, toolCalls, datasetRefs, pythonRepair, acceptedPythonRepairExecution)
+                    request, toolCalls, datasetRefs, pythonRepair, acceptedPythonRepairExecution,
+                    currentAttemptToolStarted)
                     .execute(userMessage);
             // 极端情况：LLM 返回了空字符串（例如被安全过滤或模型异常），视为失败
             if (isBlank(output)) {
@@ -302,7 +313,8 @@ public class LangchainTodoNodeExecutor {
                         request, item, datasetRefs, toolCalls, callsBefore,
                         output, userMessage,
                         capturedStage, capturedModel, capturedProvider, budgetStatus,
-                        previousTodoTotalLength, currentPromptBudget, lastNonEmptyTodoId);
+                        previousTodoTotalLength, currentPromptBudget, lastNonEmptyTodoId,
+                        currentAttemptToolStarted);
             }
             String trimmed = output.trim();
             // Prompt 只能表达意图，不能作为执行证明。修复轮次若没有真正完成一次新的
@@ -395,7 +407,7 @@ public class LangchainTodoNodeExecutor {
      * 入口条件：第一次 LLM 返回 null 或 trim 后为空的字符串。
      * 行为：
      * <ul>
-     *   <li>不可恢复（带工具 / 预算触发 / 配置不允许）→ 直接返回 {@code empty_todo_output:<id>} 失败并附 observation；</li>
+     *   <li>不可恢复（当前 attempt 已执行工具 / 预算触发）→ 直接返回 {@code empty_todo_output:<id>} 失败并附 observation；</li>
      *   <li>可恢复 → 走 {@link #buildRecoveryAiService} 第二次调用；success → 标 recovered=true，still blank / exception → 走 {@code empty_todo_output_after_recovery} 失败并附 observation。</li>
      * </ul>
      */
@@ -412,17 +424,22 @@ public class LangchainTodoNodeExecutor {
                                                        BudgetStatus budgetStatus,
                                                        long previousTodoTotalLength,
                                                        int currentPromptBudget,
-                                                       String lastNonEmptyTodoId) {
+                                                       String lastNonEmptyTodoId,
+                                                       AtomicBoolean currentAttemptToolStarted) {
         String finishReason = firstOutput == null ? "no_response" : "blank_after_trim";
         int rawOutputLength = firstOutput == null ? 0 : firstOutput.length();
         int trimmedOutputLength = firstOutput == null ? 0 : firstOutput.trim().length();
 
-        if (!shouldRecover(request, budgetStatus)) {
+        if (!shouldRecover(currentAttemptToolStarted, budgetStatus)) {
+            boolean hadToolEvidence = currentAttemptToolStarted.get();
+            String skipReason = hadToolEvidence
+                    ? "current_attempt_tool_already_executed"
+                    : "budget_near_limit";
             EmptyOutputObservation observation = new EmptyOutputObservation(
                     item.getId(), item.getSequence(), capturedStage, capturedModel, capturedProvider,
                     finishReason, rawOutputLength, trimmedOutputLength, budgetStatus.budgetHit,
                     lastNonEmptyTodoId, previousTodoTotalLength, currentPromptBudget,
-                    false, "not_attempted");
+                    false, "not_attempted", hadToolEvidence, skipReason);
             return LangchainTodoNodeResult.failure(
                     "empty_todo_output:" + item.getId(), observation.toMap());
         }
@@ -433,6 +450,13 @@ public class LangchainTodoNodeExecutor {
         try {
             recoveredOutput = buildRecoveryAiService(request).execute(userMessage + RECOVERY_HINT);
         } catch (Exception recEx) {
+            // 取消/挂起/预算终止等控制信号必须原样向上传播，不能被改写成 recovery 失败文本。
+            if (LangchainTerminalToolErrorHandler.isTerminalSignal(recEx)) {
+                if (recEx instanceof RuntimeException re) {
+                    throw re;
+                }
+                throw new IllegalStateException("terminal signal in recovery", recEx);
+            }
             recoveredOutput = null;
             recoveryOutcome = "exception";
             log.warn("empty_todo_output recovery exception for todo={} (runId={}): {}",
@@ -441,7 +465,7 @@ public class LangchainTodoNodeExecutor {
                     item.getId(), item.getSequence(), capturedStage, capturedModel, capturedProvider,
                     finishReason, rawOutputLength, trimmedOutputLength, budgetStatus.budgetHit,
                     lastNonEmptyTodoId, previousTodoTotalLength, currentPromptBudget,
-                    true, recoveryOutcome);
+                    true, recoveryOutcome, false, null);
             return LangchainTodoNodeResult.failure(
                     "empty_todo_output_after_recovery:" + item.getId(), observation.toMap());
         }
@@ -460,30 +484,24 @@ public class LangchainTodoNodeExecutor {
                 item.getId(), item.getSequence(), capturedStage, capturedModel, capturedProvider,
                 finishReason, rawOutputLength, trimmedOutputLength, budgetStatus.budgetHit,
                 lastNonEmptyTodoId, previousTodoTotalLength, currentPromptBudget,
-                true, recoveryOutcome);
+                true, recoveryOutcome, false, null);
         return LangchainTodoNodeResult.failure(
                 "empty_todo_output_after_recovery:" + item.getId(), observation.toMap());
     }
 
     /**
      * 判定是否允许走一次安全 recovery。
-     * 三条件 AND：
+     * 条件：
      * <ol>
-     *   <li>请求级工具规范为空（{@code request.getToolSpecifications() == null || isEmpty()}）——
-     *       这是 per-todo 真实可用工具的更准确信号，比 class 级 Spring toolProvider 更可靠。</li>
-     *   <li>预算未被触发（{@code budgetHit == false}）—— 避免在预算紧时白消耗 LLM 调用；</li>
-     *   <li>非 null 防御。</li>
+     *   <li>当前 attempt 尚未实际开始任何工具执行（{@code !currentAttemptToolStarted.get()}）——
+     *       仅看本条 execute() 的本地信号，不受 run 级共享计数器、并行 todo 或旧 attempt 干扰；</li>
+     *   <li>预算未触发（{@code budgetHit == false}）—— 避免在预算紧时白消耗 LLM 调用。</li>
      * </ol>
      * 注意：这里故意不看 {@link LangchainTodoNodeExecutor#toolProvider}（class 级 ObjectProvider），
-     * 因为它可能包含该 run 全局可用的工具，但本次 todo 实际未被授权调用。
+     * 也不看 request 的工具规范列表（生产默认总有工具，用它判断会让 recovery 永远不可达）。
      */
-    private boolean shouldRecover(LangchainLinearWorkflowRequest request, BudgetStatus budgetStatus) {
-        if (request == null) {
-            return false;
-        }
-        List<dev.langchain4j.agent.tool.ToolSpecification> specs = request.getToolSpecifications();
-        boolean noTools = specs == null || specs.isEmpty();
-        return noTools && !budgetStatus.budgetHit;
+    private boolean shouldRecover(AtomicBoolean currentAttemptToolStarted, BudgetStatus budgetStatus) {
+        return !currentAttemptToolStarted.get() && !budgetStatus.budgetHit;
     }
 
     /**
@@ -697,7 +715,8 @@ public class LangchainTodoNodeExecutor {
                                                                AtomicInteger toolCalls,
                                                                Map<String, String> datasetRefs,
                                                                boolean pythonRepair,
-                                                               AtomicBoolean acceptedPythonRepairExecution) {
+                                                               AtomicBoolean acceptedPythonRepairExecution,
+                                                               AtomicBoolean currentAttemptToolStarted) {
         AiServices<LangchainTodoExecutionAiService> builder = AiServices
                 .builder(LangchainTodoExecutionAiService.class)
                 .chatModel(request.executionModelOrDefault())
@@ -708,7 +727,12 @@ public class LangchainTodoNodeExecutor {
                     ensureRunnable(request);
                     return maybeInjectLastMileHint(chatRequest);
                 })
-                .beforeToolExecution(ignored -> ensureRunnable(request))
+                .beforeToolExecution(ignored -> {
+                    ensureRunnable(request);
+                    // 只在实际即将执行工具时才标记，确保工具随后成功/失败/抛异常都不会
+                    // 再被空回复恢复逻辑误判为“未执行工具”。
+                    currentAttemptToolStarted.set(true);
+                })
                 .toolExecutionErrorHandler(LangchainTerminalToolErrorHandler::handle)
                 .afterToolExecution(result -> {
                     toolCalls.incrementAndGet();

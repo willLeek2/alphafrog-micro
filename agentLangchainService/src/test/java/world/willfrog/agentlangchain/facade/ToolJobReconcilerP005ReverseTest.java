@@ -692,6 +692,21 @@ class ToolJobReconcilerP005ReverseTest {
                 GetTaskByOperationIdRequest request) {
             throw new UnsupportedOperationException("Not implemented in stub");
         }
+
+        // D11 cancelTask RPC (W2 task #102 — ccmax proto/Gateway 单 writer).
+        // 测试桩不在本波实现 cancelTask；与 PythonSandboxService 接口的其他 RPC 一致，
+        // 抛 UnsupportedOperationException 让任何意外调用立即失败。生产 Gateway 实现遵守
+        // D14 装配依赖（codex a3aee2ad 第 六 节裁定 4），DubboPythonSandboxServiceTriple
+        // 生成的默认 cancelTask 返回 UNIMPLEMENTED，不写假 override。
+        @Override
+        public CancelTaskResponse cancelTask(CancelTaskRequest request) {
+            throw new UnsupportedOperationException("Not implemented in stub");
+        }
+
+        @Override
+        public CompletableFuture<CancelTaskResponse> cancelTaskAsync(CancelTaskRequest request) {
+            throw new UnsupportedOperationException("Not implemented in stub");
+        }
     }
 
     /**
