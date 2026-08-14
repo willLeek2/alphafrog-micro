@@ -44,6 +44,7 @@ from .pool_scheduler import (
     SandboxTaskCanceledBeforeStart,
 )
 from .retry_classification import classify_terminal_retryable
+from .runtime_image_verify import build_docker_client, verify_local_image_id
 from .sandbox_runner import run_in_sandbox
 from .task_store import (
     CancelRequestBindingError,
@@ -494,6 +495,16 @@ async def _process_task_inner(task: Task, worker_id: int):
 async def lifespan(app: FastAPI):
     global pool
     worker_count = max(1, config.max_concurrency)
+
+    # 260814 scheduler-03: in local-image-id mode the configured Image ID must
+    # exist on this host before anything else starts. Fail CLOSED: missing
+    # image, unreachable socket or a tag-check mismatch refuses startup.
+    if config.verify_mode == "local-image-id":
+        verify_local_image_id(
+            config.sandbox_image,
+            client=build_docker_client(),
+            tag_check=config.image_tag_check,
+        )
 
     # D13 (26Q3): the acceptance queue is bounded (config.queue_max_size).
     # Enqueueing recovered tasks BEFORE the workers start would deadlock

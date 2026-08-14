@@ -55,11 +55,15 @@ from unittest.mock import patch
 
 # app.config.load_config() runs at import time and requires a valid
 # AF_SANDBOX_IMAGE digest reference (Spec §12). Pin a dev digest reference
-# for the test process unless the environment already provides one.
+# for the test process unless the environment already provides one, and pin
+# strict-release mode: the 260814 default (local-image-id) would reject a
+# registry digest reference, and this module's tests exercise D13 timeout
+# binding, not the image reference policy.
 os.environ.setdefault(
     "AF_SANDBOX_IMAGE",
     "registry.local/alphafrog/runtime@sha256:" + "a" * 64,
 )
+os.environ.setdefault("AF_SANDBOX_IMAGE_VERIFY_MODE", "strict-release")
 
 llm_sandbox = types.ModuleType("llm_sandbox")
 llm_sandbox.SandboxSession = object

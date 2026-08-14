@@ -344,3 +344,49 @@ anything digest-shaped must satisfy the anchored lowercase digest grammar
 EVEN UNDER the switch. The shared vector sets `VALID_DEV_REFERENCES` /
 `MALFORMED_UNDER_DEV_REFS` in `tests/digest_reference_vectors.py` pin all
 three surfaces (config / manifest / deploy).
+
+## 7. 260814 scheduler-03: verify-mode selection (local-image-id vs strict-release)
+
+`AF_SANDBOX_IMAGE_VERIFY_MODE` selects which image reference contract
+applies; accepted values are `local-image-id` (default) and `strict-release`.
+The two modes are independent — enabling one never silently re-enables the
+other's escape hatches.
+
+### local-image-id（默认，单机正式模式）
+
+- `AF_SANDBOX_IMAGE` must BE the local Image ID: exactly `sha256:<64
+  lowercase hex>`, no repository prefix. Tags and repo digests are rejected;
+  `AF_SANDBOX_IMAGE_ALLOW_DEV_TAG` does not apply in this mode (there is no
+  dev-allow escape — local-image-id is itself the supported single-machine
+  contract).
+- The service (FastAPI lifespan) refuses to start unless the configured ID
+  exists on the host, verified through the mounted Docker socket
+  (`app/runtime_image_verify.py`). Missing image, unreachable socket or any
+  query failure fails CLOSED.
+- Optional `AF_SANDBOX_IMAGE_TAG_CHECK` (e.g.
+  `alphafrog-sandbox-runtime:latest`): resolved exactly ONCE at startup and
+  must point to the SAME Image ID. Task creation never re-resolves the tag;
+  the frozen ref comes from `AF_SANDBOX_IMAGE` only.
+- `docker_build.sh` in this mode runs the real gates (import checks, smoke
+  gate, inventory gate) and prints the final immutable Image ID for deploy
+  config; the strict-release inputs (base digest, SBOM, external mapping,
+  Tier2a) are not build success conditions and the mapping is not written.
+- `deploy_latest.sh` in this mode validates the ID shape and requires
+  `docker inspect` to resolve to EXACTLY the configured ID (plus the optional
+  tag check). The D15 mapping/Tier2a chain is skipped; the script never
+  downgrades itself to tag mode.
+
+### strict-release（未来仓库发布链，Spec §12）
+
+The pre-existing digest-reference policy (anchored lowercase
+`repo@sha256:<64hex>` + the explicit `AF_SANDBOX_IMAGE_ALLOW_DEV_TAG`
+switch) and the full D15 registry digest / SBOM / mapping / Tier2a chain
+remain unchanged, selected explicitly with
+`AF_SANDBOX_IMAGE_VERIFY_MODE=strict-release`. `AF_SANDBOX_IMAGE_TAG_CHECK`
+is rejected in this mode.
+
+No real Docker daemon, image or container is required by the unit tests:
+config vectors, the verify function (injectable docker client) and the
+build/deploy script gates are pinned with fake docker fixtures
+(`tests/test_config_image_mode.py`, `tests/test_runtime_image_verify.py`,
+`tests/test_runtime_image_retention.py` local-mode classes).

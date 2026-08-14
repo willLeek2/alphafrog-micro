@@ -168,6 +168,60 @@ def validate_sandbox_image(value: str, *, allow_dev_tag: bool) -> None:
     )
 
 
+# --- AF_SANDBOX_IMAGE_VERIFY_MODE (260814 scheduler-03, Spec §14.2) ----------
+# Single-machine default mode: AF_SANDBOX_IMAGE must be a LOCAL immutable
+# Image ID (``sha256:<64 lowercase hex>``, no repository prefix). The service
+# refuses to start unless the configured ID exists on the host (verified via
+# the mounted Docker socket at startup, see runtime_image_verify.py). A mutable
+# tag is NEVER accepted in this mode -- there is no dev-allow escape, because
+# local-image-id IS the officially supported single-machine mode.
+#
+# ``strict-release`` keeps the pre-existing Spec §12 digest-reference policy
+# (including the independent AF_SANDBOX_IMAGE_ALLOW_DEV_TAG switch) for the
+# future registry-based release chain. The two modes are independent: enabling
+# strict-release must not silently re-enable tag acceptance in local mode and
+# vice versa.
+_VERIFY_MODE_LOCAL_IMAGE_ID = "local-image-id"
+_VERIFY_MODE_STRICT_RELEASE = "strict-release"
+_VERIFY_MODES = frozenset({_VERIFY_MODE_LOCAL_IMAGE_ID, _VERIFY_MODE_STRICT_RELEASE})
+
+# A local Docker Image ID is EXACTLY ``sha256:`` + 64 lowercase hex chars.
+# ``docker image inspect`` on the host returns this form; nothing shorter,
+# longer, uppercase or repo-prefixed is a local Image ID.
+_LOCAL_IMAGE_ID_RE = re.compile(r"sha256:[0-9a-f]{64}")
+
+
+def validate_local_image_id(value: str) -> None:
+    """Validate an ``AF_SANDBOX_IMAGE`` value in local-image-id mode.
+
+    Only a complete local Image ID (``sha256:<64 lowercase hex>``) is
+    accepted. Registry digest references (``repo@sha256:...``), bare tags and
+    everything else are rejected -- in this mode the value must BE the local
+    ID, not something that resolves to one.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(
+            "AF_SANDBOX_IMAGE must be a local Image ID "
+            "(sha256:<64 lowercase hex>) in local-image-id mode; got %r. "
+            "There is no implicit default and no tag fallback." % (value,)
+        )
+    if _LOCAL_IMAGE_ID_RE.fullmatch(value):
+        return
+    if value.startswith("sha256:") or "@sha256:" in value:
+        raise ValueError(
+            "AF_SANDBOX_IMAGE %r is not a valid local Image ID: local-image-id "
+            "mode requires exactly sha256:<64 lowercase hex> with no "
+            "repository prefix. Registry digest references belong to "
+            "strict-release mode (AF_SANDBOX_IMAGE_VERIFY_MODE=strict-release)."
+            % (value,)
+        )
+    raise ValueError(
+        "AF_SANDBOX_IMAGE %r is not a local Image ID and not a digest "
+        "reference: local-image-id mode requires sha256:<64 lowercase hex>. "
+        "Bare tags are never accepted in this mode." % (value,)
+    )
+
+
 @dataclass(frozen=True)
 class SandboxConfig:
     data_dir: Path
@@ -235,6 +289,14 @@ class SandboxConfig:
     stderr_max_bytes: int = DEFAULT_OUTPUT_LIMITS["stderrMaxBytes"]
     record_channel_max_bytes: int = DEFAULT_OUTPUT_LIMITS["recordChannelMaxBytes"]
     record_channel_max_records: int = DEFAULT_OUTPUT_LIMITS["recordChannelMaxRecords"]
+    # 260814 scheduler-03: which image reference policy validates and pins
+    # sandbox_image at startup: local-image-id (default, single machine) or
+    # strict-release (registry digest chain, Spec §12).
+    verify_mode: str = _VERIFY_MODE_LOCAL_IMAGE_ID
+    # Optional cross-check (local-image-id mode only): a mutable tag that must
+    # currently resolve to the SAME local Image ID at startup. Resolution
+    # happens exactly once; task creation never re-resolves it.
+    image_tag_check: str = ""
 
 
 # --- D13 (26Q3) release timeout binding keys --------------------------------
@@ -324,22 +386,53 @@ def load_config() -> SandboxConfig:
     workdir = os.getenv("AF_SANDBOX_WORKDIR", "/sandbox")
     log_level = os.getenv("AF_SANDBOX_LOG_LEVEL", "INFO")
     # Spec §12: AF_SANDBOX_IMAGE has NO implicit default (the pre-§12 silent
-    # fallback to "alphafrog-sandbox-runtime:latest" is removed). Production
-    # requires a sha256 digest reference; a bare tag is accepted only when the
-    # explicit dev-allow switch AF_SANDBOX_IMAGE_ALLOW_DEV_TAG is true/1.
+    # fallback to "alphafrog-sandbox-runtime:latest" is removed).
+    # 260814 scheduler-03: which reference grammar applies is selected by
+    # AF_SANDBOX_IMAGE_VERIFY_MODE -- local-image-id (default) requires a bare
+    # local Image ID; strict-release keeps the Spec §12 digest-reference policy
+    # (with the independent AF_SANDBOX_IMAGE_ALLOW_DEV_TAG dev switch).
     sandbox_image = os.getenv("AF_SANDBOX_IMAGE", "").strip()
+    verify_mode = (
+        os.getenv("AF_SANDBOX_IMAGE_VERIFY_MODE", _VERIFY_MODE_LOCAL_IMAGE_ID)
+        .strip()
+        .lower()
+    )
+    image_tag_check = os.getenv("AF_SANDBOX_IMAGE_TAG_CHECK", "").strip()
     sandbox_image_allow_dev_tag = (
         os.getenv("AF_SANDBOX_IMAGE_ALLOW_DEV_TAG", "").strip().lower()
         in _DEV_TAG_ALLOW_VALUES
     )
+    if verify_mode not in _VERIFY_MODES:
+        raise ValueError(
+            "AF_SANDBOX_IMAGE_VERIFY_MODE must be one of %s; got %r."
+            % (sorted(_VERIFY_MODES), verify_mode)
+        )
     if not sandbox_image:
         raise ValueError(
             "AF_SANDBOX_IMAGE must be set explicitly; there is no implicit "
-            "default and no silent fallback to 'latest' (Spec §12). Production "
-            "requires a sha256 digest reference, e.g. "
-            "registry.example/alphafrog/runtime@sha256:<64hex>."
+            "default and no silent fallback to 'latest' (Spec §12). "
+            "local-image-id mode requires a local Image ID "
+            "(sha256:<64 lowercase hex>); strict-release requires a sha256 "
+            "digest reference, e.g. registry.example/alphafrog/runtime@sha256:<64hex>."
         )
-    validate_sandbox_image(sandbox_image, allow_dev_tag=sandbox_image_allow_dev_tag)
+    if verify_mode == _VERIFY_MODE_LOCAL_IMAGE_ID:
+        validate_local_image_id(sandbox_image)
+        if image_tag_check and not is_valid_dev_reference(image_tag_check):
+            raise ValueError(
+                "AF_SANDBOX_IMAGE_TAG_CHECK must be a valid bare tag/reference "
+                "(e.g. alphafrog-sandbox-runtime:latest); got %r."
+                % (image_tag_check,)
+            )
+    else:
+        validate_sandbox_image(sandbox_image, allow_dev_tag=sandbox_image_allow_dev_tag)
+        if image_tag_check:
+            raise ValueError(
+                "AF_SANDBOX_IMAGE_TAG_CHECK is only supported in "
+                "local-image-id mode; remove it or switch "
+                "AF_SANDBOX_IMAGE_VERIFY_MODE. strict-release has its own "
+                "digest verification chain (Spec §12) and does not resolve "
+                "mutable tags."
+            )
     skip_environment_setup = _parse_bool(os.getenv("AF_SANDBOX_SKIP_ENVIRONMENT_SETUP"), default=True)
     preinstalled_libraries = frozenset(
         item.strip().lower()
@@ -431,6 +524,8 @@ def load_config() -> SandboxConfig:
         workdir=workdir,
         log_level=log_level,
         sandbox_image=sandbox_image,
+        verify_mode=verify_mode,
+        image_tag_check=image_tag_check,
         skip_environment_setup=skip_environment_setup,
         preinstalled_libraries=preinstalled_libraries,
         container_max_concurrency=container_max_concurrency,

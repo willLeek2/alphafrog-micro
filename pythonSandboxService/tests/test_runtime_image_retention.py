@@ -1202,8 +1202,14 @@ class DeployLatestImageGateTest(RuntimeImageRetentionTestBase):
             "AF_SANDBOX_IMAGE",
             "AF_SANDBOX_IMAGE_ALLOW_DEV_TAG",
             "AF_SANDBOX_ALLOW_INCOMPLETE_DEV_BUILD",
+            "AF_SANDBOX_IMAGE_VERIFY_MODE",
+            "AF_SANDBOX_IMAGE_TAG_CHECK",
         ):
             env.pop(key, None)
+        # These deploy tests pin the Spec §12 strict-release path; the
+        # 260814 default (local-image-id) is covered by
+        # DeployLocalImageIdModeTest below.
+        env["AF_SANDBOX_IMAGE_VERIFY_MODE"] = "strict-release"
         env.update(overrides)
         return env
 
@@ -1432,6 +1438,8 @@ class DeployReleaseGateTest(RuntimeImageRetentionTestBase):
         env = dict(self.env)
         for key in ("AF_SANDBOX_IMAGE", "AF_SANDBOX_IMAGE_ALLOW_DEV_TAG", "AF_SANDBOX_ALLOW_INCOMPLETE_DEV_BUILD"):
             env.pop(key, None)
+        # These deploy-gate tests pin the Spec §12 strict-release path.
+        env["AF_SANDBOX_IMAGE_VERIFY_MODE"] = "strict-release"
         env["AF_SANDBOX_IMAGE"] = ACCEPT_REFS[0]
         env.update(extra_env)
         return subprocess.run(
@@ -1676,8 +1684,13 @@ class DockerBuildReleaseGateTest(RuntimeImageRetentionTestBase):
             "BASE_IMAGE_DIGEST",
             "METHOD_SPEC_INDEX_DIGEST",
             "AF_SANDBOX_ALLOW_INCOMPLETE_DEV_BUILD",
+            "AF_SANDBOX_IMAGE_VERIFY_MODE",
         ):
             env.pop(key, None)
+        # These build-gate tests pin the Spec §12 strict-release path; the
+        # 260814 default (local-image-id) is covered by
+        # DockerBuildLocalImageIdModeTest below.
+        env["AF_SANDBOX_IMAGE_VERIFY_MODE"] = "strict-release"
         env["USE_PROXY"] = "0"
         # Minimal PATH: stub docker + system dirs only. This keeps the
         # presence/absence of syft deterministic across machines.
@@ -2165,6 +2178,8 @@ class SyftImmutableIdRegressionTest(DockerBuildReleaseGateTest):
         ):
             env.pop(key, None)
         env["AF_SANDBOX_IMAGE"] = image
+        # These deploy-gate tests pin the Spec §12 strict-release path.
+        env["AF_SANDBOX_IMAGE_VERIFY_MODE"] = "strict-release"
         env.update(extra_env)
         self.assertTrue(DEPLOY_SCRIPT.is_file(), f"missing: {DEPLOY_SCRIPT}")
         return subprocess.run(
@@ -2281,6 +2296,170 @@ class SyftImmutableIdRegressionTest(DockerBuildReleaseGateTest):
         self.assertIn("phase-2 --iidfile image ID", result.stderr)
         self.assertEqual(self.syft_calls(), [])
         self.assertFalse(MAPPING_FILE.exists())
+
+
+class DeployLocalImageIdModeTest(RuntimeImageRetentionTestBase):
+    """260814 scheduler-03: deploy_latest.sh local-image-id mode (the new
+    default). The configured AF_SANDBOX_IMAGE must BE a bare local Image ID
+    (sha256:<64hex>) and docker inspect must resolve to exactly that ID; tags
+    and repo digests are rejected without any dev-allow escape, and the
+    strict-release mapping/Tier2a chain is not required."""
+
+    def run_deploy_local(self, **extra_env: str) -> subprocess.CompletedProcess:
+        env = dict(self.env)
+        for key in (
+            "AF_SANDBOX_IMAGE",
+            "AF_SANDBOX_IMAGE_ALLOW_DEV_TAG",
+            "AF_SANDBOX_ALLOW_INCOMPLETE_DEV_BUILD",
+            "AF_SANDBOX_IMAGE_VERIFY_MODE",
+            "AF_SANDBOX_IMAGE_TAG_CHECK",
+        ):
+            env.pop(key, None)
+        env.update(extra_env)
+        self.assertTrue(DEPLOY_SCRIPT.is_file(), f"missing: {DEPLOY_SCRIPT}")
+        return subprocess.run(
+            ["bash", str(DEPLOY_SCRIPT), "--deploy-only", "python-sandbox-service"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+
+    def test_default_mode_accepts_matching_local_image_id(self) -> None:
+        # IMAGE_CURRENT is served by the fake `docker images` file, so a bare
+        # ID inspect resolves to itself. No verify-mode env -> default
+        # local-image-id. No mapping/iidfile artifacts exist in this fixture,
+        # so acceptance also proves the strict chain is not required.
+        result = self.run_deploy_local(AF_SANDBOX_IMAGE=IMAGE_CURRENT)
+        self.assertEqual(result.returncode, 0, f"stdout={result.stdout}\nstderr={result.stderr}")
+        self.assertIn("已校验本机 Image ID", result.stdout)
+        self.assertIn(IMAGE_CURRENT, result.stdout)
+
+    def test_explicit_local_mode_matches_same(self) -> None:
+        result = self.run_deploy_local(
+            AF_SANDBOX_IMAGE=IMAGE_CURRENT,
+            AF_SANDBOX_IMAGE_VERIFY_MODE="local-image-id",
+        )
+        self.assertEqual(result.returncode, 0, f"stdout={result.stdout}\nstderr={result.stderr}")
+
+    def test_bare_tag_rejected_even_with_dev_switch(self) -> None:
+        # local-image-id IS the single-machine contract; there is no
+        # AF_SANDBOX_IMAGE_ALLOW_DEV_TAG escape in this mode.
+        self.add_alias("alphafrog-sandbox-runtime:latest", IMAGE_CURRENT)
+        result = self.run_deploy_local(
+            AF_SANDBOX_IMAGE="alphafrog-sandbox-runtime:latest",
+            AF_SANDBOX_IMAGE_ALLOW_DEV_TAG="true",
+        )
+        self.assertEqual(result.returncode, 1, f"stdout={result.stdout}\nstderr={result.stderr}")
+        self.assertIn("local-image-id 模式要求", result.stderr)
+
+    def test_repo_digest_rejected_in_local_mode(self) -> None:
+        digest = "registry.local/alphafrog/runtime@sha256:" + "a1" * 32
+        result = self.run_deploy_local(AF_SANDBOX_IMAGE=digest)
+        self.assertEqual(result.returncode, 1, f"stdout={result.stdout}\nstderr={result.stderr}")
+        self.assertIn("local-image-id 模式要求", result.stderr)
+
+    def test_missing_image_fails_closed(self) -> None:
+        # Not in the fake images file and no alias -> inspect fails -> refuse.
+        missing_id = "sha256:" + "ff" * 32
+        result = self.run_deploy_local(AF_SANDBOX_IMAGE=missing_id)
+        self.assertEqual(result.returncode, 1, f"stdout={result.stdout}\nstderr={result.stderr}")
+        self.assertIn("docker inspect", result.stderr)
+
+    def test_mismatched_resolution_fails_closed(self) -> None:
+        # Configured ID resolves (via alias) to a DIFFERENT image ID.
+        self.add_alias(IMAGE_CURRENT, IMAGE_OLD_RUNTIME)
+        result = self.run_deploy_local(AF_SANDBOX_IMAGE=IMAGE_CURRENT)
+        self.assertEqual(result.returncode, 1, f"stdout={result.stdout}\nstderr={result.stderr}")
+        self.assertIn("解析到不同镜像", result.stderr)
+
+    def test_tag_check_matching_passes(self) -> None:
+        self.add_alias("alphafrog-sandbox-runtime:latest", IMAGE_CURRENT)
+        result = self.run_deploy_local(
+            AF_SANDBOX_IMAGE=IMAGE_CURRENT,
+            AF_SANDBOX_IMAGE_TAG_CHECK="alphafrog-sandbox-runtime:latest",
+        )
+        self.assertEqual(result.returncode, 0, f"stdout={result.stdout}\nstderr={result.stderr}")
+        self.assertIn("标签复核通过", result.stdout)
+
+    def test_tag_check_drift_fails_closed(self) -> None:
+        self.add_alias("alphafrog-sandbox-runtime:latest", IMAGE_OLD_RUNTIME)
+        result = self.run_deploy_local(
+            AF_SANDBOX_IMAGE=IMAGE_CURRENT,
+            AF_SANDBOX_IMAGE_TAG_CHECK="alphafrog-sandbox-runtime:latest",
+        )
+        self.assertEqual(result.returncode, 1, f"stdout={result.stdout}\nstderr={result.stderr}")
+        self.assertIn("不一致", result.stderr)
+
+    def test_unknown_mode_rejected(self) -> None:
+        result = self.run_deploy_local(
+            AF_SANDBOX_IMAGE=IMAGE_CURRENT,
+            AF_SANDBOX_IMAGE_VERIFY_MODE="bogus",
+        )
+        self.assertEqual(result.returncode, 1, f"stdout={result.stdout}\nstderr={result.stderr}")
+        self.assertIn("AF_SANDBOX_IMAGE_VERIFY_MODE", result.stderr)
+
+    def test_strict_release_does_not_accept_local_id(self) -> None:
+        # Cross-mode independence: a bare local Image ID is NOT a digest
+        # reference; strict-release must keep rejecting it.
+        result = self.run_deploy_local(
+            AF_SANDBOX_IMAGE=IMAGE_CURRENT,
+            AF_SANDBOX_IMAGE_VERIFY_MODE="strict-release",
+        )
+        self.assertEqual(result.returncode, 1, f"stdout={result.stdout}\nstderr={result.stderr}")
+
+
+class DockerBuildLocalImageIdModeTest(RuntimeImageRetentionTestBase):
+    """260814 scheduler-03: docker_build.sh in local-image-id mode (default)
+    skips the strict-release inputs (base digest / SBOM / external mapping)
+    but keeps the real gates (smoke + inventory) and prints the final
+    immutable Image ID for deploy config."""
+
+    def build_env_local(self, **overrides: str) -> dict:
+        env = dict(self.env)
+        for key in (
+            "BASE_IMAGE_DIGEST",
+            "METHOD_SPEC_INDEX_DIGEST",
+            "AF_SANDBOX_ALLOW_INCOMPLETE_DEV_BUILD",
+            "AF_SANDBOX_IMAGE_VERIFY_MODE",
+        ):
+            env.pop(key, None)
+        # Default mode (local-image-id) is exercised by NOT setting the mode.
+        env["USE_PROXY"] = "0"
+        env["PATH"] = str(self.stub_dir) + os.pathsep + "/usr/bin" + os.pathsep + "/bin"
+        env["FAKE_DOCKER_BUILD_IMAGE_ID"] = FAKE_BUILD_IMAGE_ID
+        env["METHOD_SPEC_CANONICAL_DIR"] = str(CANONICAL_FIXTURES_DIR)
+        env.update(overrides)
+        return env
+
+    def run_build_local(self, env: dict) -> subprocess.CompletedProcess:
+        self.assertTrue(DOCKER_BUILD_SCRIPT.is_file(), f"missing: {DOCKER_BUILD_SCRIPT}")
+        return subprocess.run(
+            ["bash", str(DOCKER_BUILD_SCRIPT), "runtime"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+
+    def test_local_mode_skips_release_inputs_and_prints_image_id(self) -> None:
+        # No BASE_IMAGE_DIGEST, no syft -> strict-release would fail closed;
+        # local-image-id (default) must succeed and print the frozen ID.
+        env = self.build_env_local()
+        result = self.run_build_local(env)
+        self.assertEqual(result.returncode, 0, f"stdout={result.stdout}\nstderr={result.stderr}")
+        self.assertIn("verified local Image ID: " + FAKE_BUILD_IMAGE_ID, result.stdout)
+        self.assertIn("AF_SANDBOX_IMAGE=" + FAKE_BUILD_IMAGE_ID, result.stdout)
+        # The strict-release evidence mapping is not written in local mode.
+        self.assertFalse(MAPPING_FILE.exists())
+
+    def test_unknown_mode_fails_closed(self) -> None:
+        env = self.build_env_local(AF_SANDBOX_IMAGE_VERIFY_MODE="bogus")
+        result = self.run_build_local(env)
+        self.assertEqual(result.returncode, 1, f"stdout={result.stdout}\nstderr={result.stderr}")
+        self.assertIn("AF_SANDBOX_IMAGE_VERIFY_MODE", result.stderr)
 
 
 if __name__ == "__main__":

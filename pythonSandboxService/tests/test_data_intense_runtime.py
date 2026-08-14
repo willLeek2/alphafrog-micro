@@ -46,7 +46,8 @@ class DataIntenseRuntimeTest(unittest.TestCase):
         # reference is always accepted (no dev-allow switch needed).
         with patch.dict(
             "os.environ",
-            {"AF_SANDBOX_IMAGE": "registry.local/alphafrog/runtime@sha256:" + "ab" * 32},
+            {"AF_SANDBOX_IMAGE": "registry.local/alphafrog/runtime@sha256:" + "ab" * 32,
+             "AF_SANDBOX_IMAGE_VERIFY_MODE": "strict-release"},
             clear=True,
         ):
             config = load_config()
@@ -103,7 +104,8 @@ class DataIntenseRuntimeTest(unittest.TestCase):
         # reference is always accepted (no dev-allow switch needed).
         with patch.dict(
             "os.environ",
-            {"AF_SANDBOX_IMAGE": "registry.local/alphafrog/runtime@sha256:" + "ab" * 32},
+            {"AF_SANDBOX_IMAGE": "registry.local/alphafrog/runtime@sha256:" + "ab" * 32,
+             "AF_SANDBOX_IMAGE_VERIFY_MODE": "strict-release"},
             clear=True,
         ):
             config = load_config()
@@ -179,7 +181,8 @@ class ConfigImagePolicyTest(unittest.TestCase):
     def test_load_config_rejects_uppercase_digest_reference(self) -> None:
         with patch.dict(
             "os.environ",
-            {"AF_SANDBOX_IMAGE": f"{REPO}@sha256:{HEX64.upper()}"},
+            {"AF_SANDBOX_IMAGE": f"{REPO}@sha256:{HEX64.upper()}",
+             "AF_SANDBOX_IMAGE_VERIFY_MODE": "strict-release"},
             clear=True,
         ):
             with self.assertRaises(ValueError):
@@ -188,7 +191,8 @@ class ConfigImagePolicyTest(unittest.TestCase):
     def test_load_config_rejects_trailing_hex_after_digest(self) -> None:
         with patch.dict(
             "os.environ",
-            {"AF_SANDBOX_IMAGE": f"{REPO}@sha256:{HEX64}a"},
+            {"AF_SANDBOX_IMAGE": f"{REPO}@sha256:{HEX64}a",
+             "AF_SANDBOX_IMAGE_VERIFY_MODE": "strict-release"},
             clear=True,
         ):
             with self.assertRaises(ValueError):
@@ -197,7 +201,8 @@ class ConfigImagePolicyTest(unittest.TestCase):
     def test_load_config_rejects_undigested_ref_without_dev_switch(self) -> None:
         with patch.dict(
             "os.environ",
-            {"AF_SANDBOX_IMAGE": "alphafrog-sandbox-runtime:latest"},
+            {"AF_SANDBOX_IMAGE": "alphafrog-sandbox-runtime:latest",
+             "AF_SANDBOX_IMAGE_VERIFY_MODE": "strict-release"},
             clear=True,
         ):
             with self.assertRaises(ValueError):
@@ -210,6 +215,7 @@ class ConfigImagePolicyTest(unittest.TestCase):
                 {
                     "AF_SANDBOX_IMAGE": "alphafrog-sandbox-runtime:latest",
                     "AF_SANDBOX_IMAGE_ALLOW_DEV_TAG": switch_value,
+                    "AF_SANDBOX_IMAGE_VERIFY_MODE": "strict-release",
                 },
                 clear=True,
             ):
@@ -224,6 +230,7 @@ class ConfigImagePolicyTest(unittest.TestCase):
                 {
                     "AF_SANDBOX_IMAGE": "alphafrog-sandbox-runtime:latest",
                     "AF_SANDBOX_IMAGE_ALLOW_DEV_TAG": switch_value,
+                    "AF_SANDBOX_IMAGE_VERIFY_MODE": "strict-release",
                 },
                 clear=True,
             ):
@@ -283,7 +290,9 @@ class ConfigDevReferenceSharedVectorsTest(unittest.TestCase):
         for ref in VALID_DEV_REFERENCES:
             with patch.dict(
                 "os.environ",
-                {"AF_SANDBOX_IMAGE": ref, "AF_SANDBOX_IMAGE_ALLOW_DEV_TAG": "true"},
+                {"AF_SANDBOX_IMAGE": ref,
+             "AF_SANDBOX_IMAGE_ALLOW_DEV_TAG": "true",
+             "AF_SANDBOX_IMAGE_VERIFY_MODE": "strict-release"},
                 clear=True,
             ):
                 config = load_config()
@@ -309,7 +318,8 @@ class ConfigDevReferenceSharedVectorsTest(unittest.TestCase):
     def test_load_config_rejects_empty_ref_even_with_dev_switch(self) -> None:
         with patch.dict(
             "os.environ",
-            {"AF_SANDBOX_IMAGE": "", "AF_SANDBOX_IMAGE_ALLOW_DEV_TAG": "true"},
+            {"AF_SANDBOX_IMAGE": "", "AF_SANDBOX_IMAGE_ALLOW_DEV_TAG": "true",
+             "AF_SANDBOX_IMAGE_VERIFY_MODE": "strict-release"},
             clear=True,
         ):
             with self.assertRaises(ValueError):

@@ -280,6 +280,19 @@ if is_in_list "python-sandbox-service" "${SELECTED[@]}" || is_in_list "python-sa
   DEPLOY_SANDBOX_IMAGE="${AF_SANDBOX_IMAGE:-}"
   DEPLOY_DEV_ALLOW="${AF_SANDBOX_IMAGE_ALLOW_DEV_TAG:-}"
   DEPLOY_INCOMPLETE_DEV_ALLOW="${AF_SANDBOX_ALLOW_INCOMPLETE_DEV_BUILD:-}"
+  # 260814 scheduler-03: image verify-mode selection. local-image-id (default)
+  # is the single-machine contract: the configured value must BE the local
+  # Image ID (sha256:<64hex>) and docker inspect must resolve to exactly that
+  # ID. strict-release keeps the Spec §12 digest/mapping/Tier2a chain.
+  DEPLOY_VERIFY_MODE="${AF_SANDBOX_IMAGE_VERIFY_MODE:-local-image-id}"
+  case "$DEPLOY_VERIFY_MODE" in
+    local-image-id|strict-release) ;;
+    *)
+      echo "[deploy] ERROR: AF_SANDBOX_IMAGE_VERIFY_MODE must be local-image-id or strict-release; got '${DEPLOY_VERIFY_MODE}'." >&2
+      exit 1
+      ;;
+  esac
+  DEPLOY_TAG_CHECK="${AF_SANDBOX_IMAGE_TAG_CHECK:-}"
   # compose 自动读取 .env；进程环境未设置时回退解析 .env（与 compose 取值保持一致）
   if [[ -f "$ROOT_DIR/.env" ]]; then
     if [[ -z "$DEPLOY_SANDBOX_IMAGE" ]]; then
@@ -309,11 +322,43 @@ if is_in_list "python-sandbox-service" "${SELECTED[@]}" || is_in_list "python-sa
   DEPLOY_USING_BARE_DEV_REF=0
   if [[ -z "$DEPLOY_SANDBOX_IMAGE" ]]; then
     echo "[deploy] ERROR: AF_SANDBOX_IMAGE 未设置或为空 (MethodSpec V5 §12)。" >&2
-    echo "  生产部署目标镜像必须是 repo/name@sha256:<64hex> 摘要引用（frog 发布时固定）。" >&2
-    echo "  开发环境可显式设置 AF_SANDBOX_IMAGE_ALLOW_DEV_TAG=true 使用语法合法的裸标签。" >&2
+    echo "  local-image-id 模式要求 sha256:<64位小写hex> 本机 Image ID；" >&2
+    echo "  strict-release 模式要求 repo/name@sha256:<64hex> 摘要引用（frog 发布时固定）。" >&2
+    echo "  开发环境可显式设置 AF_SANDBOX_IMAGE_ALLOW_DEV_TAG=true 使用语法合法的裸标签（仅 strict-release）。" >&2
     exit 1
   fi
-  if af_is_digest_reference "$DEPLOY_SANDBOX_IMAGE"; then
+  if [[ "$DEPLOY_VERIFY_MODE" == "local-image-id" ]]; then
+    # 260814 scheduler-03 local-image-id gate: the configured value must BE
+    # the local Image ID and docker inspect must resolve to exactly that ID.
+    # A mutable tag or a repo digest is rejected in this mode -- there is no
+    # dev-allow escape and the script never downgrades itself to tag mode.
+    if [[ ! "$DEPLOY_SANDBOX_IMAGE" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+      echo "[deploy] ERROR: local-image-id 模式要求 AF_SANDBOX_IMAGE=sha256:<64位小写hex>（本机 Image ID，不是标签也不是仓库摘要）；got '${DEPLOY_SANDBOX_IMAGE}'。" >&2
+      exit 1
+    fi
+    DEPLOY_INSPECTED_LOCAL_ID="$(docker inspect --type=image --format '{{.Id}}' "$DEPLOY_SANDBOX_IMAGE" 2>/dev/null || true)"
+    if [[ -z "$DEPLOY_INSPECTED_LOCAL_ID" ]]; then
+      echo "[deploy] ERROR: docker inspect 无法解析本机 Image ID ${DEPLOY_SANDBOX_IMAGE}（镜像缺失或 Docker socket 不可访问）。" >&2
+      exit 1
+    fi
+    if [[ "$DEPLOY_INSPECTED_LOCAL_ID" != "sha256:${DEPLOY_SANDBOX_IMAGE#sha256:}" ]]; then
+      echo "[deploy] ERROR: docker inspect 解析到不同镜像（${DEPLOY_INSPECTED_LOCAL_ID}）≠ 配置的 Image ID（${DEPLOY_SANDBOX_IMAGE}）。" >&2
+      exit 1
+    fi
+    if [[ -n "$DEPLOY_TAG_CHECK" ]]; then
+      DEPLOY_TAG_ID="$(docker inspect --type=image --format '{{.Id}}' "$DEPLOY_TAG_CHECK" 2>/dev/null || true)"
+      if [[ -z "$DEPLOY_TAG_ID" ]]; then
+        echo "[deploy] ERROR: AF_SANDBOX_IMAGE_TAG_CHECK '${DEPLOY_TAG_CHECK}' 无法解析。" >&2
+        exit 1
+      fi
+      if [[ "$DEPLOY_TAG_ID" != "$DEPLOY_INSPECTED_LOCAL_ID" ]]; then
+        echo "[deploy] ERROR: 标签 '${DEPLOY_TAG_CHECK}' 解析到 ${DEPLOY_TAG_ID}，与配置的 Image ID ${DEPLOY_SANDBOX_IMAGE} 不一致。" >&2
+        exit 1
+      fi
+      echo "[deploy] local-image-id 模式：标签复核通过（${DEPLOY_TAG_CHECK} -> ${DEPLOY_INSPECTED_LOCAL_ID}）。"
+    fi
+    echo "[deploy] local-image-id 模式：已校验本机 Image ID ${DEPLOY_SANDBOX_IMAGE}（docker inspect 精确匹配）。"
+  elif af_is_digest_reference "$DEPLOY_SANDBOX_IMAGE"; then
     : # 生产 digest 引用，合法。
   elif [[ "$DEPLOY_DEV_ALLOW" == "1" ]] && af_is_valid_dev_reference "$DEPLOY_SANDBOX_IMAGE"; then
     DEPLOY_USING_BARE_DEV_REF=1
@@ -382,6 +427,10 @@ fi
 if is_in_list "python-sandbox-service" "${SELECTED[@]}" || is_in_list "python-sandbox-runtime" "${SELECTED[@]}"; then
 
   # BEGIN_D15_MAPPING_VERIFIER (v14: prod+dev-tag 公共路径, v14 MF1 HARD gate 在前)
+  # 260814 scheduler-03: the mapping/Tier2a chain is strict-release evidence
+  # only. In local-image-id mode the deploy gate above (docker inspect exact
+  # match on the bare Image ID) already ran and this whole block is skipped.
+  if [[ "$DEPLOY_VERIFY_MODE" == "strict-release" ]]; then
   DEPLOY_MAPPING_FILE="$ROOT_DIR/pythonSandboxService/.runtime-build/image-digest-mapping.json"
   DEPLOY_IIDFILE="$ROOT_DIR/pythonSandboxService/.runtime-build/image-id"
   DEPLOY_LIBSET_FILE="$ROOT_DIR/pythonSandboxService/.runtime-build/library-set.json"
@@ -442,6 +491,7 @@ if is_in_list "python-sandbox-service" "${SELECTED[@]}" || is_in_list "python-sa
     }
     # END_D15_TIER2A_GATE
   fi
+  fi  # strict-release only (260814 scheduler-03)
 fi
 
 
