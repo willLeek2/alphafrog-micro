@@ -25,6 +25,7 @@ import static org.mockito.Mockito.when;
 class WorkflowCheckpointServiceTest {
 
     private AgentRunMapper runMapper;
+    private RunRawRefStore rawRefStore;
     private ObjectMapper objectMapper;
     private WorkflowCheckpointService service;
 
@@ -34,6 +35,8 @@ class WorkflowCheckpointServiceTest {
         objectMapper = JsonMapper.builder().findAndAddModules().build();
         @SuppressWarnings("unchecked")
         ObjectProvider<RunRawRefStore> rawRefProvider = mock(ObjectProvider.class);
+        rawRefStore = mock(RunRawRefStore.class);
+        when(rawRefProvider.getIfAvailable()).thenReturn(rawRefStore);
         service = new WorkflowCheckpointService(
                 runMapper, objectMapper, rawRefProvider, new ToolRetrySafetyCatalog());
         when(runMapper.updateExecutionCheckpoint(anyString(), anyString(), anyString())).thenReturn(1);
@@ -86,6 +89,32 @@ class WorkflowCheckpointServiceTest {
                 jsonCaptor.getAllValues().get(5), WorkflowExecutionCheckpoint.class);
         assertThat(completed.getStartedTools()).isEmpty();
         assertThat(completed.getNextTodoId()).isEqualTo(WorkflowExecutionCheckpoint.FINAL_TODO_ID);
+    }
+
+    @Test
+    void restartValidatesSequentialAndCompactionRawRefs() throws Exception {
+        LangchainTodoPlan plan = LangchainTodoPlan.builder()
+                .executionMode(PlanExecutionMode.LINEAR)
+                .items(List.of(TodoItem.builder().id("todo_1").sequence(1).description("read").build()))
+                .build();
+        String compactionRef = "raw_01234567-89ab-cdef-0123-456789abcdef";
+        WorkflowExecutionCheckpoint checkpoint = service.persistLinearProgress(
+                "run-1", "user-1", plan,
+                List.of(LangchainCompletedTodo.builder()
+                        .todoId("todo_1")
+                        .sequence(1)
+                        .description("read")
+                        .modelOutput("short=raw_ref_001 compact=" + compactionRef)
+                        .output("done")
+                        .summary("done")
+                        .build()),
+                1);
+        AgentRun run = run("run-1", "user-1", objectMapper.writeValueAsString(checkpoint));
+
+        service.parseAndValidate(run, plan);
+
+        verify(rawRefStore).read("run-1", "user-1", "raw_ref_001", 0, 1, null);
+        verify(rawRefStore).read("run-1", "user-1", compactionRef, 0, 1, null);
     }
 
     private AgentRun run(String runId, String userId, String checkpointJson) {

@@ -32,7 +32,8 @@ import java.util.regex.Pattern;
 @RequiredArgsConstructor
 public class WorkflowCheckpointService {
 
-    private static final Pattern RAW_REF_PATTERN = Pattern.compile("(?<![A-Za-z0-9_])raw_ref_[A-Za-z0-9_-]+(?![A-Za-z0-9_-])");
+    private static final Pattern RAW_REF_PATTERN = Pattern.compile(
+            "(?<![A-Za-z0-9_])(?:raw_ref_[A-Za-z0-9_-]+|raw_[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?![A-Za-z0-9_-])");
 
     private final AgentRunMapper runMapper;
     private final ObjectMapper objectMapper;
