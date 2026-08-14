@@ -120,15 +120,30 @@ public class ToolResultCacheService {
                     cacheLookupTimer.record(durationMs, TimeUnit.MILLISECONDS);
                     String result = cached.getResult();
                     if (cached.isCompactionApplied() && cached.getRawLocator() != null) {
-                        result = toolOutputCompactionService.rebindForCacheHit(result, cached.getRawLocator());
+                        try {
+                            result = toolOutputCompactionService.rebindForCacheHit(result, cached.getRawLocator());
+                        } catch (IllegalArgumentException e) {
+                            // 260814 scheduler-03 review fix：rebind 只允许读当前
+                            // AgentContext 拥有的 ref。缓存里的 locator 不属于当前
+                            // Run（跨 Run 命中）或来源 Run 已终态清理时，此缓存视为
+                            // 失效——删除并回源真实工具调用，绝不跨 Run 复制 raw
+                            // 内容，也不让 cache hit 以异常中断工具调用链。
+                            redisTemplate.delete(plan.getKey());
+                            log.info("Tool cache rawRef no longer owned by current run, "
+                                    + "invalidating cache and falling back to loader, key={}", plan.getKey());
+                            result = null;
+                        }
                     }
-                    return CachedToolCallResult.builder()
-                            .result(result)
-                            .observabilityResult(result)
-                            .durationMs(durationMs)
-                            .success(true)
-                            .cacheMeta(meta)
-                            .build();
+                    if (result != null) {
+                        return CachedToolCallResult.builder()
+                                .result(result)
+                                .observabilityResult(result)
+                                .durationMs(durationMs)
+                                .success(true)
+                                .cacheMeta(meta)
+                                .build();
+                    }
+                    // result == null：缓存失效，落到下方 loader 路径按 miss 处理
                 }
             }
         }

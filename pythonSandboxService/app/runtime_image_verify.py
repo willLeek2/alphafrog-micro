@@ -44,11 +44,23 @@ def verify_local_image_id(image_id: str, *, client, tag_check: str = "") -> str:
     resolves to the same ID. Returns the frozen image ID on success; raises
     :class:`ImageVerificationError` on ANY failure (fail-closed).
 
+    The ID reported by Docker for the configured reference must be EXACTLY
+    equal to the configured ID (both normalized to a bare 64-hex digest):
+    a query that succeeds but resolves to a different ID is a verification
+    failure, not a pass.
+
     ``client`` is a docker SDK client (or any object exposing
     ``images.get(ref).id`` and raising ``docker.errors.ImageNotFound`` /
     ``docker.errors.DockerException`` on failure).
     """
     actual_id = _inspect_image_id(image_id, client, description="configured Image ID")
+    configured_id = image_id.removeprefix("sha256:")
+    if actual_id != configured_id:
+        raise ImageVerificationError(
+            "Docker resolved the configured reference to Image ID %s, but the "
+            "configured value is %s. The actual Image ID must be exactly equal "
+            "to the configured one; refusing to start." % (actual_id, image_id)
+        )
     if not tag_check:
         logger.info(
             "runtime image verified: local Image ID %s exists on this host",
@@ -57,7 +69,7 @@ def verify_local_image_id(image_id: str, *, client, tag_check: str = "") -> str:
         return image_id
 
     tag_id = _inspect_image_id(tag_check, client, description="tag-check reference")
-    if tag_id != actual_id:
+    if tag_id != configured_id:
         raise ImageVerificationError(
             "AF_SANDBOX_IMAGE_TAG_CHECK %r resolves to %s, but the configured "
             "Image ID is %s. The mutable tag no longer points at the verified "

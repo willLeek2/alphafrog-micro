@@ -39,6 +39,10 @@ os.environ.setdefault(
     "AF_SANDBOX_IMAGE",
     "registry.local/alphafrog/runtime@sha256:" + "a" * 64,
 )
+# 260814 scheduler-03: 默认校验模式 local-image-id 只接受裸 sha256:<64hex>；
+# 本测试用 digest 引用（registry/...@sha256:...），按 test_main_d13_error_surface
+# 同款方式固定 strict-release 模式。
+os.environ.setdefault("AF_SANDBOX_IMAGE_VERIFY_MODE", "strict-release")
 
 from fastapi.testclient import TestClient
 

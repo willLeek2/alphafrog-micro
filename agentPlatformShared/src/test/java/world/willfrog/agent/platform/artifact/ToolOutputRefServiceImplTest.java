@@ -81,20 +81,40 @@ class ToolOutputRefServiceImplTest {
     }
 
     @Test
-    void rebindFromLocatorShouldCreateCurrentRunRawRef() {
+    void rebindFromLocatorShouldWorkWithinCurrentRun() {
+        // 同 Run 内 rebind（AgentContext 不变）：允许，重绑定后内容一致
+        PersistentArtifactRegistration first = service.registerRawOutput("tool-1", "工具输出", "payload");
+        RawPayloadLocator locator = service.locatorFor(first.getArtifactId());
+
+        PersistentArtifactRegistration rebound = service.rebindFromLocator("tool-1", "工具输出", locator);
+
+        assertEquals("payload", service.read(rebound.getArtifactId(), 0, 100, null).getContent());
+        assertEquals("payload",
+                service.read("run-1", "user-1", first.getArtifactId(), 0, 100, null).getContent());
+    }
+
+    @Test
+    void rebindFromLocatorShouldRejectCrossRun() {
+        // review MUST-FIX：跨 Run rebind 破坏 Run 隔离（缓存 locator 会让别的
+        // Run 读到来源 Run 的工具输出），必须 fail-closed。
         PersistentArtifactRegistration first = service.registerRawOutput("tool-1", "工具输出", "payload");
         RawPayloadLocator locator = service.locatorFor(first.getArtifactId());
         AgentContext.setRunId("run-2");
 
-        PersistentArtifactRegistration rebound = service.rebindFromLocator("tool-1", "工具输出", locator);
-
-        // 重绑定的新 ref 落在当前上下文 run-2 下：run-2 可读，run-1 被拒。
-        assertEquals("payload", service.read(rebound.getArtifactId(), 0, 100, null).getContent());
         assertThrows(IllegalArgumentException.class,
-                () -> service.read("run-1", "user-1", rebound.getArtifactId(), 0, 100, null));
-        // 原 run-1 的 ref 不受影响，仍归属 run-1。
-        assertEquals("payload",
-                service.read("run-1", "user-1", first.getArtifactId(), 0, 100, null).getContent());
+                () -> service.rebindFromLocator("tool-1", "工具输出", locator));
+    }
+
+    @Test
+    void rebindFromLocatorShouldRejectWhenLocatorCleaned() {
+        // review MUST-FIX：来源 Run 终态清理后 locator 失效，rebind 必须
+        // fail-closed（上层缓存服务据此删缓存回源）。
+        PersistentArtifactRegistration first = service.registerRawOutput("tool-1", "工具输出", "payload");
+        RawPayloadLocator locator = service.locatorFor(first.getArtifactId());
+        localStore.cleanupRun("run-1");
+
+        assertThrows(IllegalArgumentException.class,
+                () -> service.rebindFromLocator("tool-1", "工具输出", locator));
     }
 
     @Test

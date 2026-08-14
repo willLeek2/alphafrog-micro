@@ -52,11 +52,13 @@ public class ToolOutputRefServiceImpl implements ToolOutputRefService {
 
     @Override
     public PersistentArtifactRegistration rebindFromLocator(String logicalId, String displayName, RawPayloadLocator locator) {
-        // Cache-hit rebind: the locator carries an unguessable ref issued by
-        // this store (possibly in an earlier process on the same machine).
-        // Internal unguarded read mirrors the legacy readLocator seam; the
-        // result is then re-registered under the CURRENT run context.
-        String content = localStore.readByRefInternal(locator.getPath());
+        // 260814 scheduler-03 review fix：cache-hit rebind 必须保持 Run 隔离——
+        // 只允许读当前 AgentContext 的 runId+userId 所拥有的 ref（同 Run 重启
+        // 后仍可读）。不属于当前 Run、来源 Run 已终态清理、或 locator 无效时，
+        // assertVisible 抛 IllegalArgumentException，由上层缓存服务视为缓存
+        // 失效（删缓存回源），绝不跨 Run 复制 raw 内容。
+        assertVisible(AgentContext.getRunId(), AgentContext.getUserId(), locator.getPath());
+        String content = localStore.read(AgentContext.getRunId(), AgentContext.getUserId(), locator.getPath());
         return registerRawOutput(logicalId, displayName, content);
     }
 

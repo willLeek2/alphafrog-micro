@@ -189,7 +189,10 @@ public class LangchainRunReadService {
                     .setStatus(effectiveStatus == null ? "" : effectiveStatus.name())
                     .setCreatedAt(run.getStartedAt() == null ? "" : run.getStartedAt().toString())
                     .setCompletedAt(run.getCompletedAt() == null ? "" : run.getCompletedAt().toString())
-                    .setHasArtifacts(!artifactService.listArtifacts(run, false).isEmpty())
+                    // 260814 scheduler-03 review fix：列表读路径同样先查冻结开关，
+                    // 关闭时直接 hasArtifacts=false，绝不触发 artifact 惰性注册。
+                    .setHasArtifacts(LangchainArtifactFacadeService.generateArtifactsRequested(run)
+                            && !artifactService.listArtifacts(run, false).isEmpty())
                     .setDurationMs(nonNegativeLong(run.getDurationMs()))
                     .setTotalTokens(nonNegativeInt(run.getTotalTokens()))
                     .setToolCalls(nonNegativeInt(run.getToolCalls()))

@@ -515,6 +515,10 @@ class MainD13ErrorSurfaceTest(unittest.IsolatedAsyncioTestCase):
         # presence here.
         minimal_env = {
             "AF_SANDBOX_IMAGE": os.environ["AF_SANDBOX_IMAGE"],
+            # 260814 scheduler-03: clear=True 会清掉模块级 strict-release 固定，
+            # 而默认 local-image-id 模式拒绝 digest 引用；minimal env 必须显式
+            # 带上校验模式。
+            "AF_SANDBOX_IMAGE_VERIFY_MODE": "strict-release",
             "AF_SANDBOX_MAX_TASK_TIMEOUT_SECONDS": "1200",
         }
         with patch.dict(os.environ, minimal_env, clear=True):

@@ -22,11 +22,14 @@ class FakeImage:
 class FakeDockerClient:
     """Docker SDK surface emulation for images.get(ref).id."""
 
-    def __init__(self, *, present_ids=(), tag_aliases=None, socket_error=None):
+    def __init__(self, *, present_ids=(), tag_aliases=None, id_aliases=None, socket_error=None):
         # present_ids: full "sha256:..." IDs that exist locally.
         self._present = set(present_ids)
         # tag_aliases: {tag_ref: "sha256:..." id}
         self._tags = dict(tag_aliases or {})
+        # id_aliases: {ref: returned id} for emulating a daemon that resolves a
+        # reference to a DIFFERENT image than the queried ref.
+        self._id_aliases = dict(id_aliases or {})
         # socket_error: exception raised for EVERY images.get call (daemon
         # unreachable / API error emulation).
         self._socket_error = socket_error
@@ -38,6 +41,8 @@ class FakeDockerClient:
             raise self._socket_error
         if ref in self._tags:
             return FakeImage(self._tags[ref])
+        if ref in self._id_aliases:
+            return FakeImage(self._id_aliases[ref])
         if ref in self._present:
             return FakeImage(ref)
         raise LookupError("image not found: %r" % ref)
@@ -134,6 +139,40 @@ class VerifyLocalImageIdTest(unittest.TestCase):
         verify_local_image_id(GOOD_ID, client=client)
         # Only the configured ID is inspected; no extra resolution happens.
         self.assertEqual(client.inspect_calls, [GOOD_ID])
+
+    def test_query_succeeds_but_returns_different_id_fails_closed(self):
+        # Reviewer MUST-FIX: a daemon that resolves the configured reference to
+        # a DIFFERENT Image ID must not pass verification.
+        client = self.client(present_ids={GOOD_ID}, id_aliases={GOOD_ID: OTHER_ID})
+        with self.assertRaises(ImageVerificationError) as ctx:
+            verify_local_image_id(GOOD_ID, client=client)
+        self.assertIn("refusing to start", str(ctx.exception))
+
+    def test_returned_id_with_sha256_prefix_matches(self):
+        # Normalization: the daemon normally reports IDs with the sha256:
+        # prefix; stripping it must still compare equal to the configured value.
+        client = self.client(id_aliases={GOOD_ID: GOOD_ID})
+        self.assertEqual(verify_local_image_id(GOOD_ID, client=client), GOOD_ID)
+
+    def test_returned_bare_digest_matches(self):
+        # A daemon reporting the bare 64-hex digest (no sha256: prefix) is also
+        # an exact match after normalization.
+        client = self.client(id_aliases={GOOD_ID: GOOD_ID[len("sha256:"):]})
+        self.assertEqual(verify_local_image_id(GOOD_ID, client=client), GOOD_ID)
+
+    def test_tag_check_compares_against_configured_id_not_resolved_id(self):
+        # The tag must point at the CONFIGURED Image ID; when the daemon
+        # resolves the configured ref to a different ID the startup already
+        # fails before any tag resolution.
+        client = self.client(
+            present_ids={GOOD_ID},
+            id_aliases={GOOD_ID: OTHER_ID},
+            tag_aliases={"alphafrog-sandbox-runtime:latest": OTHER_ID},
+        )
+        with self.assertRaises(ImageVerificationError):
+            verify_local_image_id(
+                GOOD_ID, client=client, tag_check="alphafrog-sandbox-runtime:latest"
+            )
 
 
 if __name__ == "__main__":

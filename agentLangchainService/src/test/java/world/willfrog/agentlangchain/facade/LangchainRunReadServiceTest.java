@@ -25,10 +25,12 @@ import world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilityContr
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilityQuery;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilityReadMode;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilitySnapshot;
+import world.willfrog.alphafrogmicro.agent.idl.AgentArtifactMessage;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunResultRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunStatusRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentRunEventsRequest;
+import world.willfrog.alphafrogmicro.agent.idl.ListAgentRunsRequest;
 
 import java.time.OffsetDateTime;
 import java.util.List;
@@ -455,5 +457,44 @@ class LangchainRunReadServiceTest {
         event.setPayloadJson("{}");
         event.setCreatedAt(OffsetDateTime.now());
         return event;
+    }
+
+    @Test
+    void listRuns_shouldSkipArtifactsWhenGateOff() {
+        // 260814 scheduler-03 review fix：generate_artifacts 未开启（ext 缺失）
+        // 时 hasArtifacts 恒为 false，且绝不调用 artifactService（不触发惰性注册）。
+        AgentRun gated = run(null);
+        when(runMapper.listByUser(any(), any(), any(), anyInt(), anyInt()))
+                .thenReturn(List.of(gated));
+        when(runMapper.countByUser(any(), any(), any())).thenReturn(1);
+
+        var response = service.listRuns(ListAgentRunsRequest.newBuilder()
+                .setUserId("u1")
+                .build());
+
+        assertEquals(1, response.getItemsCount());
+        assertFalse(response.getItems(0).getHasArtifacts());
+        verify(artifactService, never()).listArtifacts(any(), anyBoolean());
+    }
+
+    @Test
+    void listRuns_shouldDeferToArtifactsWhenGateOn() {
+        // 开关开启时：空产物 → false；非空产物 → true。
+        AgentRun empty = run("{\"generate_artifacts\": true}");
+        AgentRun withArtifact = run("{\"generate_artifacts\": true}");
+        when(runMapper.listByUser(any(), any(), any(), anyInt(), anyInt()))
+                .thenReturn(List.of(empty, withArtifact));
+        when(runMapper.countByUser(any(), any(), any())).thenReturn(2);
+        when(artifactService.listArtifacts(empty, false)).thenReturn(List.of());
+        when(artifactService.listArtifacts(withArtifact, false)).thenReturn(List.of(
+                AgentArtifactMessage.newBuilder().setArtifactId("a1").build()));
+
+        var response = service.listRuns(ListAgentRunsRequest.newBuilder()
+                .setUserId("u1")
+                .build());
+
+        assertEquals(2, response.getItemsCount());
+        assertFalse(response.getItems(0).getHasArtifacts());
+        assertTrue(response.getItems(1).getHasArtifacts());
     }
 }

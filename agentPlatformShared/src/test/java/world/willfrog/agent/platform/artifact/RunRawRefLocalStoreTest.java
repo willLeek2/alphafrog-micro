@@ -68,14 +68,13 @@ class RunRawRefLocalStoreTest {
     }
 
     @Test
-    void readByRefInternal_shouldSurviveRestartOnSameMachine() {
+    void uuidRef_shouldSurviveRestartOnSameMachine() {
         // plan §6.3：同一台机器上服务进程重启后，未终态 Run 的 rawRef 仍可读。
         // 全局 index.json 在每次注册时原子重写，新实例首次访问时惰性加载。
         RunRawRefLocalStore first = newStore();
         String ref = first.register("run_restart", "user_1", "test", "kept across restart", 3600, false);
 
         RunRawRefLocalStore restarted = newStore();
-        assertEquals("kept across restart", restarted.readByRefInternal(ref));
         assertEquals("kept across restart", restarted.read("run_restart", "user_1", ref));
     }
 
@@ -218,6 +217,168 @@ class RunRawRefLocalStoreTest {
                 () -> store.register("run_1", "user_1", "d", null, 3600, true));
         assertThrows(IllegalArgumentException.class,
                 () -> store.register("run_1", "user_1", "d", "payload", 0, true));
+    }
+
+    @Test
+    void register_shouldRejectTraversalRunId() {
+        // reviewer MUST-FIX：runId 直接拼进 rootDir 路径，任何分隔符/../绝对
+        // 路径都必须在注册源头拒绝，且绝不能产生 root 之外的目录。
+        RunRawRefLocalStore store = newStore();
+        String absolute = tempDir.resolve("evil-abs").toString();
+        String[] bad = {"../evil", "a/b", "a\\b", ".", "..", absolute};
+        for (String runId : bad) {
+            assertThrows(IllegalArgumentException.class,
+                    () -> store.register(runId, "user_1", "d", "payload", 3600, true),
+                    "runId 应被拒绝: " + runId);
+        }
+        assertFalse(Files.exists(tempDir.resolve("evil")), "root 外不得产生 evil 目录");
+        assertFalse(Files.exists(tempDir.resolve("evil-abs")), "绝对路径 runId 不得落盘");
+    }
+
+    @Test
+    void cleanupRun_shouldRejectTraversalRunIdAndTouchNothingOutside() throws Exception {
+        // reviewer MUST-FIX：cleanupRun 是递归删除，穿越 runId 绝不能碰 root
+        // 之外的文件。
+        RunRawRefLocalStore store = newStore();
+        Path outsideDir = Files.createDirectories(tempDir.resolve("evil"));
+        Path outsideFile = Files.writeString(outsideDir.resolve("keep.txt"), "keep");
+
+        assertThrows(IllegalArgumentException.class, () -> store.cleanupRun("../evil"));
+        assertThrows(IllegalArgumentException.class, () -> store.cleanupRun("a/b"));
+        assertThrows(IllegalArgumentException.class,
+                () -> store.cleanupRun(tempDir.resolve("evil").toString()));
+
+        assertTrue(Files.exists(outsideFile), "root 之外的文件必须原样保留");
+    }
+
+    @Test
+    void read_shouldRejectTraversalRunId() {
+        RunRawRefLocalStore store = newStore();
+        String ref = store.register("run_ok", "user_1", "d", "payload", 3600, true);
+        assertThrows(IllegalArgumentException.class,
+                () -> store.read("../evil", "user_1", ref));
+        assertThrows(IllegalArgumentException.class,
+                () -> store.read("a/b", "user_1", ref));
+        assertEquals("payload", store.read("run_ok", "user_1", ref));
+    }
+
+    @Test
+    void indexPathField_shouldBeIgnoredInFavorOfDerivedPath() throws Exception {
+        // reviewer MUST-FIX：索引加载不得信任 index.json 里的任意绝对路径——
+        // path 字段指向 root 之外时被整体忽略，一律按 root/runId/ref.txt 重新
+        // 推导；内容落在推导路径上才可读，外面的路径绝不被触碰。
+        Path index = root.resolve(RunRawRefLocalStore.INDEX_FILE_NAME);
+        Files.createDirectories(root);
+        Path outsideFile = Files.writeString(tempDir.resolve("outside.txt"), "outside-content");
+        Files.writeString(index, """
+                [{"ref":"raw_ref_001","runId":"run_x","userId":"user_1",
+                  "displayName":"d","path":"%s","bytes":15,
+                  "createdAtMillis":%d,"ttlSeconds":3600}]
+                """.formatted(
+                        outsideFile.toString().replace("\\", "\\\\"),
+                        System.currentTimeMillis()));
+        Path derivedFile = root.resolve("run_x").resolve("raw_ref_001.txt");
+        Files.createDirectories(derivedFile.getParent());
+        Files.writeString(derivedFile, "derived-content");
+
+        RunRawRefLocalStore restarted = newStore();
+        restarted.sweepAtStartup();
+
+        assertEquals("derived-content", restarted.read("run_x", "user_1", "raw_ref_001"),
+                "必须按推导路径读取，而不是索引里的 path 字段");
+        assertEquals("outside-content", Files.readString(outsideFile), "root 之外的文件不得被改动");
+    }
+
+    @Test
+    void indexEntryWithTraversalRunId_shouldFailFastOnLoad() throws Exception {
+        Path index = root.resolve(RunRawRefLocalStore.INDEX_FILE_NAME);
+        Files.createDirectories(root);
+        Files.writeString(index, """
+                [{"ref":"raw_ref_001","runId":"../evil","userId":"user_1",
+                  "displayName":"d","path":"x","bytes":5,
+                  "createdAtMillis":%d,"ttlSeconds":3600}]
+                """.formatted(System.currentTimeMillis()));
+
+        RunRawRefLocalStore restarted = newStore();
+        assertThrows(IllegalStateException.class, restarted::sweepAtStartup);
+    }
+
+    @Test
+    void corruptIndex_shouldFailFastAndKeepDirectories() throws Exception {
+        // reviewer MUST-FIX：索引损坏时绝不能按空索引继续然后把全部内容目录
+        // 当孤儿删掉——fail-fast 且现有目录原样保留。
+        Path index = root.resolve(RunRawRefLocalStore.INDEX_FILE_NAME);
+        Files.createDirectories(root);
+        Files.writeString(index, "{definitely not valid json");
+        Path dataDir = Files.createDirectories(root.resolve("run_data"));
+        Path dataFile = Files.writeString(dataDir.resolve("raw_ref_001.txt"), "data");
+
+        RunRawRefLocalStore restarted = newStore();
+        assertThrows(IllegalStateException.class, restarted::sweepAtStartup);
+        assertTrue(Files.exists(dataFile), "损坏索引时绝不允许清扫删除数据目录");
+    }
+
+    @Test
+    void register_shouldRollbackWhenIndexPersistFails() throws Exception {
+        // reviewer MUST-FIX：索引落盘失败时注册必须显式失败并回滚（内存条目 +
+        // 内容文件），绝不能返回一个重启即丢失的"可用"引用。
+        RunRawRefLocalStore store = newStore();
+        // 把 index.json 的位置占成一个目录，使原子 rename 必然失败
+        Files.createDirectories(root);
+        Files.createDirectory(root.resolve(RunRawRefLocalStore.INDEX_FILE_NAME));
+
+        assertThrows(IllegalStateException.class,
+                () -> store.register("run_fail", "user_1", "d", "payload", 3600, true));
+        assertFalse(store.belongsToRun("run_fail", "raw_ref_001"), "失败注册不得留内存条目");
+        assertFalse(Files.exists(root.resolve("run_fail").resolve("raw_ref_001.txt")),
+                "失败注册不得留内容文件");
+    }
+
+    @Test
+    void register_shouldRejectSymlinkedRunDir() throws Exception {
+        // reviewer 追加要求：字符串校验挡不住 root/<合法runId> 本身是指向
+        // root 之外的符号链接——注册必须拒绝跟随链接写入。
+        RunRawRefLocalStore store = newStore();
+        Files.createDirectories(root);
+        Path outside = Files.createDirectories(tempDir.resolve("outside"));
+        Path outsideFile = Files.writeString(outside.resolve("keep.txt"), "keep");
+        Files.createSymbolicLink(root.resolve("run_link"), outside.toAbsolutePath());
+
+        assertThrows(IllegalArgumentException.class,
+                () -> store.register("run_link", "user_1", "d", "payload", 3600, true));
+        assertEquals("keep", Files.readString(outsideFile), "root 之外的内容不得被写入或改动");
+    }
+
+    @Test
+    void cleanupRun_shouldDeleteOnlySymlinkNotTarget() throws Exception {
+        // reviewer 追加要求：递归删除绝不跟随符号链接——只删链接本身，
+        // 链接目标（root 之外）的内容原样保留。
+        RunRawRefLocalStore store = newStore();
+        Files.createDirectories(root);
+        Path outside = Files.createDirectories(tempDir.resolve("outside"));
+        Path outsideFile = Files.writeString(outside.resolve("keep.txt"), "keep");
+        Files.createSymbolicLink(root.resolve("run_link"), outside.toAbsolutePath());
+
+        store.cleanupRun("run_link");
+
+        assertFalse(Files.exists(root.resolve("run_link")), "链接本身应被删除");
+        assertTrue(Files.exists(outsideFile), "链接目标内容必须原样保留");
+        assertEquals("keep", Files.readString(outsideFile));
+    }
+
+    @Test
+    void startupSweep_shouldDeleteOnlySymlinkNotTarget() throws Exception {
+        RunRawRefLocalStore first = newStore();
+        first.register("run_live", "user_1", "d", "live", 3600, true);
+        Path outside = Files.createDirectories(tempDir.resolve("outside"));
+        Path outsideFile = Files.writeString(outside.resolve("keep.txt"), "keep");
+        Files.createSymbolicLink(root.resolve("stale-link"), outside.toAbsolutePath());
+
+        RunRawRefLocalStore restarted = newStore();
+        restarted.sweepAtStartup();
+
+        assertFalse(Files.exists(root.resolve("stale-link")), "无引用链接应被清扫（只删链接）");
+        assertTrue(Files.exists(outsideFile), "链接目标内容必须原样保留");
     }
 
     @Test
