@@ -268,6 +268,25 @@ class LangchainRunConcurrencySchedulerCapacityTest {
     }
 
     @Test
+    void overweightRunRejectedImmediatelyOnIdleScheduler() {
+        SimpleMeterRegistry registry = new SimpleMeterRegistry();
+        // 单 Run 权重 5 > 容量 4：即使调度器完全空闲也必须立即拒绝，不能排队堵死队首。
+        TestScheduler ts = build(new LangchainRunExecutorLimits(2, 3, 2, "c"),
+                runId -> 5, 4, registry);
+        LangchainRunConcurrencyScheduler scheduler = ts.scheduler();
+
+        assertThatThrownBy(() -> submitBlocking(scheduler, "run-overweight"))
+                .isInstanceOf(LangchainRunRejectedException.class)
+                .satisfies(e -> assertThat(((LangchainRunRejectedException) e).getReason())
+                        .isEqualTo("capacity_full"));
+
+        assertThat(scheduler.runningCount()).isZero();
+        assertThat(scheduler.queuedCount()).isZero();
+        assertThat(registry.counter("alphafrog.scheduler.rejected.total", "reason", "capacity_full")
+                .count()).isEqualTo(1.0);
+    }
+
+    @Test
     void rejectedReservationDoesNotLeakCapacity() throws Exception {
         SimpleMeterRegistry registry = new SimpleMeterRegistry();
         TestScheduler ts = build(new LangchainRunExecutorLimits(1, 1, 0, "c"),

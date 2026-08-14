@@ -52,6 +52,15 @@ class DefaultRunAdmissionPolicyTest {
     }
 
     @Test
+    void weightAboveTotalCapacityRejectedImmediatelyEvenWithQueueRoom() {
+        // 权重 5 > 容量 4：即使队列有名额也必须立即拒绝，否则永久堵死队首。
+        var state = state(0, true, 0, 2, 0, 4, 2, 3, 5);
+        var decision = policy.evaluate(state);
+        assertThat(decision).isEqualTo(RunAdmissionPolicy.AdmissionDecision.REJECTED);
+        assertThat(decision.rejectReason(state)).isEqualTo("capacity_full");
+    }
+
+    @Test
     void capacityInsufficientStillAllowsQueuing() {
         // 队列有名额时容量不足也允许排队等待，不误拒。
         var decision = policy.evaluate(state(1, false, 0, 2, 4, 4, 2, 3, 1));

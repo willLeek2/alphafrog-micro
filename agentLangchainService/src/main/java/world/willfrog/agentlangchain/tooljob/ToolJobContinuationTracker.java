@@ -114,20 +114,40 @@ public class ToolJobContinuationTracker {
         ToolJobAnchor anchor = anchorService.loadAnchor(runId);
         if (anchor == null || !entry.operationId().equals(anchor.getOperationId())) {
             log.info("Continuation anchor gone or replaced for run={}, unregistering", runId);
-            entries.remove(runId);
+            // 条件移除：只有当前登记仍是本轮条目时才删，避免误删同一 run 的新登记。
+            entries.remove(runId, entry);
             return;
         }
         // resumeState 已推进说明恢复链已在执行（防御：本进程内只会由我们触发）。
         String resumeState = anchor.getResumeState();
         if (resumeState != null && !resumeState.isBlank()) {
-            entries.remove(runId);
+            entries.remove(runId, entry);
             return;
         }
 
-        // 取消信号：用户取消已在 anchor 上持久化 CANCELED disposition（autoResume=false）。
+        // 取消意图：第一次意图即开始收口窗口计时（无论 RPC 成败）；窗口内每轮重试
+        // cancel RPC。cancel RPC 失败同样占用轮询失败预算，防止"RPC 永远失败但
+        // 状态可读"时超时任务被无限轮询。
         boolean cancelRequested = entry.cancelRequestedAt() != null;
-        if (!cancelRequested && needsCancel(entry, anchor)) {
-            requestCancel(entry);
+        if (needsCancel(entry, anchor)) {
+            boolean rpcOk = sendCancelRpc(runId, entry.taskId());
+            if (!cancelRequested && rpcOk) {
+                metrics.recordCancelled("running");
+            }
+            if (!rpcOk) {
+                int failures = entry.consecutivePollFailures() + 1;
+                if (failures >= config.getContinuationMaxConsecutivePollFailures()) {
+                    log.error("Continuation cancel RPC budget exhausted for run={}, "
+                            + "finalizing as RESULT_LOST", runId);
+                    finalizeResultLost(runId, entry, anchor);
+                    return;
+                }
+                entry = entry.withPollFailures(failures);
+            }
+            if (!cancelRequested) {
+                entry = entry.withCancelRequestedAt(Instant.now());
+            }
+            entries.put(runId, entry);
             cancelRequested = true;
         }
 
@@ -141,8 +161,7 @@ public class ToolJobContinuationTracker {
             if (failures >= config.getContinuationMaxConsecutivePollFailures()) {
                 log.error("Continuation poll RPC budget exhausted for run={}, "
                         + "finalizing as RESULT_LOST", runId);
-                entries.remove(runId);
-                finalizer.handleTerminal(runId, anchor, "RESULT_LOST", null, anchor.isAutoResume());
+                finalizeResultLost(runId, entry, anchor);
                 return;
             }
             entries.put(runId, entry.withPollFailures(failures));
@@ -156,8 +175,7 @@ public class ToolJobContinuationTracker {
                     && Instant.now().isAfter(entry.cancelRequestedAt()
                     .plusSeconds(config.getTerminalRetentionSeconds()))) {
                 log.warn("Continuation cancel window expired for run={}, finalizing as RESULT_LOST", runId);
-                entries.remove(runId);
-                finalizer.handleTerminal(runId, anchor, "RESULT_LOST", null, anchor.isAutoResume());
+                finalizeResultLost(runId, entry, anchor);
             }
             return;
         }
@@ -169,19 +187,26 @@ public class ToolJobContinuationTracker {
             int failures = entry.consecutivePollFailures() + 1;
             if (failures >= config.getContinuationMaxConsecutivePollFailures()) {
                 log.error("Continuation result fetch budget exhausted for run={}, finalizing as RESULT_LOST", runId);
-                entries.remove(runId);
-                finalizer.handleTerminal(runId, anchor, "RESULT_LOST", null, anchor.isAutoResume());
+                finalizeResultLost(runId, entry, anchor);
                 return;
             }
             entries.put(runId, entry.withPollFailures(failures));
             return;
         }
 
-        entries.remove(runId);
         log.info("Continuation terminal for run={} status={}, handing to finalizer", runId, status);
         // finalizer 完成 ENVELOPE/RELEASE/USAGE/EVENT/CAS_STATUS，并在 autoResume
         // 时通过 completeResumeReady → resumeService.tryResume 触发续接入队。
-        finalizer.handleTerminal(runId, anchor, status, resultResp, anchor.isAutoResume());
+        // 只有 finalizer 成功返回后才移除登记；失败保留登记下一轮重试，
+        // 最终只形成一个终态结果由 finalizer 的可重入六步保证。
+        try {
+            finalizer.handleTerminal(runId, anchor, status, resultResp, anchor.isAutoResume());
+        } catch (Exception finalizeFailure) {
+            log.error("Continuation finalizer failed for run={} status={}; "
+                    + "keeping registration for retry", runId, status, finalizeFailure);
+            return;
+        }
+        entries.remove(runId, entry);
 
         // 观测：确认恢复链确实推进（LAUNCHING/ACCEPTED/CONSUMED）或 Run 已终态。
         ToolJobAnchor after = anchorService.loadAnchor(runId);
@@ -192,6 +217,18 @@ public class ToolJobContinuationTracker {
                 metrics.recordContinuationRequeued();
             }
         }
+    }
+
+    /** RESULT_LOST 统一收口：finalizer 成功后才移除登记，失败保留下一轮重试。 */
+    private void finalizeResultLost(String runId, ContinuationEntry entry, ToolJobAnchor anchor) {
+        try {
+            finalizer.handleTerminal(runId, anchor, "RESULT_LOST", null, anchor.isAutoResume());
+        } catch (Exception finalizeFailure) {
+            log.error("Continuation RESULT_LOST finalizer failed for run={}; "
+                    + "keeping registration for retry", runId, finalizeFailure);
+            return;
+        }
+        entries.remove(runId, entry);
     }
 
     private boolean needsCancel(ContinuationEntry entry, ToolJobAnchor anchor) {
@@ -209,21 +246,20 @@ public class ToolJobContinuationTracker {
                 || run.getStatus() == AgentRunStatus.CANCELED);
     }
 
-    private void requestCancel(ContinuationEntry entry) {
+    /** 发送取消 RPC；成功返回 true。计时、预算与指标由调用方推进。 */
+    private boolean sendCancelRpc(String runId, String taskId) {
         try {
             sandboxService.cancelTask(CancelTaskRequest.newBuilder()
-                    .setByTaskId(TaskIdCancelTarget.newBuilder().setTaskId(entry.taskId()).build())
-                    .setCancelRequestId("continuation-" + entry.runId() + "-" + entry.taskId())
+                    .setByTaskId(TaskIdCancelTarget.newBuilder().setTaskId(taskId).build())
+                    .setCancelRequestId("continuation-" + runId + "-" + taskId)
                     .setReason("agent continuation timeout/cancel")
                     .build());
-            entries.put(entry.runId(), entry.withCancelRequestedAt(Instant.now()));
-            metrics.recordCancelled("running");
-            log.info("Continuation cancel requested for run={} taskId={}",
-                    entry.runId(), entry.taskId());
+            log.info("Continuation cancel requested for run={} taskId={}", runId, taskId);
+            return true;
         } catch (Exception e) {
-            // cancel RPC 失败不致命：下一轮继续尝试；结果拉取失败预算最终会 RESULT_LOST。
             log.warn("Continuation cancelTask failed for run={} taskId={}: {}",
-                    entry.runId(), entry.taskId(), e.getMessage());
+                    runId, taskId, e.getMessage());
+            return false;
         }
     }
 

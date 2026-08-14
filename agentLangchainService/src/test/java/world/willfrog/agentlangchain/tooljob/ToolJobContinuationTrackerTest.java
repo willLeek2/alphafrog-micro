@@ -247,4 +247,66 @@ class ToolJobContinuationTrackerTest {
         assertThat(tracker.registeredCount()).isEqualTo(1);
         verify(finalizer, never()).handleTerminal(any(), any(), any(), any(), anyBoolean());
     }
+
+    @Test
+    void cancelRpcFailureBudgetExhaustionFinalizesResultLost() {
+        // cancel RPC 永远失败但状态可读：不能无限轮询，必须按失败预算收口。
+        ToolJobAnchor anchor = pendingAnchor();
+        anchor.setRunDisposition("CANCELED");
+        when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
+        when(runMapper.findById("run-1")).thenReturn(null);
+        when(sandboxService.cancelTask(any(CancelTaskRequest.class)))
+                .thenThrow(new RuntimeException("cancel rpc down"));
+        when(sandboxService.getTaskStatus(any(GetTaskStatusRequest.class)))
+                .thenReturn(TaskStatusResponse.newBuilder().setStatus("RUNNING").build());
+
+        ToolJobContinuationTracker tracker = tracker();
+        tracker.register("run-1", anchor);
+        for (int i = 0; i < config.getContinuationMaxConsecutivePollFailures(); i++) {
+            tracker.pollPending();
+        }
+
+        verify(sandboxService, times(config.getContinuationMaxConsecutivePollFailures()))
+                .cancelTask(any(CancelTaskRequest.class));
+        verify(finalizer).handleTerminal(eq("run-1"), eq(anchor), eq("RESULT_LOST"),
+                isNull(), eq(true));
+        assertThat(tracker.registeredCount()).isZero();
+    }
+
+    @Test
+    void finalizerFailureKeepsRegistrationAndRetriesNextPoll() {
+        // finalizer 首次失败（数据库写异常）：登记必须保留，下一轮重试且只形成一个最终结果。
+        ToolJobAnchor anchor = pendingAnchor();
+        ToolJobAnchor after = pendingAnchor();
+        after.setResumeState("LAUNCHING");
+        when(anchorService.loadAnchor("run-1")).thenReturn(anchor, anchor, after);
+        when(runMapper.findById("run-1")).thenReturn(null);
+        when(sandboxService.getTaskStatus(any(GetTaskStatusRequest.class)))
+                .thenReturn(TaskStatusResponse.newBuilder().setStatus("SUCCEEDED").build());
+        when(sandboxService.getTaskResult(any(GetTaskResultRequest.class)))
+                .thenReturn(TaskResultResponse.newBuilder()
+                        .setTaskId("task-1")
+                        .setStatus("SUCCEEDED")
+                        .setStdout("done")
+                        .build());
+        doThrow(new RuntimeException("db write failed"))
+                .doNothing()
+                .when(finalizer).handleTerminal(
+                        eq("run-1"), eq(anchor), eq("SUCCEEDED"), any(), eq(true));
+
+        ToolJobContinuationTracker tracker = tracker();
+        tracker.register("run-1", anchor);
+        tracker.pollPending();
+        // 第一次 finalizer 失败：登记保留，Run 不会停在 WAITING_TOOL_JOB 无人发现。
+        assertThat(tracker.registeredCount()).isEqualTo(1);
+
+        tracker.pollPending();
+        // 第二轮成功收口；之后登记已移除，不再产生任何新的终态调用。
+        verify(finalizer, times(2)).handleTerminal(
+                eq("run-1"), eq(anchor), eq("SUCCEEDED"), any(), eq(true));
+        assertThat(tracker.registeredCount()).isZero();
+
+        tracker.pollPending();
+        verify(finalizer, times(2)).handleTerminal(any(), any(), any(), any(), anyBoolean());
+    }
 }
