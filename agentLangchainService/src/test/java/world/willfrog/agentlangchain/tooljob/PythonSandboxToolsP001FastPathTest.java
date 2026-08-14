@@ -170,8 +170,15 @@ class PythonSandboxToolsP001FastPathTest {
         // Real dispatch store backed by PG + real Redis
         AgentRunMapper mapper = newMapper();
         ToolJobAnchorService anchorService = new ToolJobAnchorService(mapper);
-        ToolJobRedisCache redisCache = new ToolJobRedisCache(redisTemplate, om, new ToolJobConfig());
-        dispatchStore = spy(new PythonSandboxDispatchStoreImpl(anchorService, redisCache));
+        ToolJobConfig toolJobConfig = new ToolJobConfig();
+        toolJobConfig.setDurableRecoveryEnabled(true);
+        ToolJobRedisCache redisCache = new ToolJobRedisCache(redisTemplate, om, toolJobConfig);
+        @SuppressWarnings("unchecked")
+        ObjectProvider<ToolJobContinuationTracker> trackerProvider = mock(ObjectProvider.class);
+        dispatchStore = spy(new PythonSandboxDispatchStoreImpl(
+                anchorService, redisCache, toolJobConfig, trackerProvider,
+                new world.willfrog.agentlangchain.orchestration.scheduler.LangchainSchedulerMetrics(
+                        new io.micrometer.core.instrument.simple.SimpleMeterRegistry())));
 
         // PythonSandboxTools with real dispatch store (rest mocked per existing pattern)
         tools = new PythonSandboxTools(om);

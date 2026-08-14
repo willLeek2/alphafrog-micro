@@ -3,12 +3,12 @@ package world.willfrog.agentlangchain.tooljob;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
-import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agentlangchain.orchestration.LangchainLinearRunPipelineImpl;
 
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
@@ -18,6 +18,9 @@ import java.util.concurrent.ConcurrentMap;
  * <p>进程内 activeClaims 只做同一 token/version 的快速去重，数据库 lease 才是
  * 跨进程真相。launcher 负责“两阶段交接”：工作流注入终态后先 markHandoffAccepted，
  * pipeline 结果持久化后再 completeHandoff，任何一步失败都保留 anchor 供重入。</p>
+ *
+ * <p>数据库 lease 的周期续租已拆到 {@link ToolJobResumeLauncherHeartbeat}，只在
+ * 耐久恢复开启时创建；本类自身不持有任何定时线程。</p>
  */
 @Service
 @RequiredArgsConstructor
@@ -27,7 +30,7 @@ public class ToolJobResumeLauncherImpl implements ToolJobResumeLauncher {
     private final AgentRunMapper runMapper;
     private final LangchainLinearRunPipelineImpl pipeline;
     private final ObjectProvider<ToolJobResumeService> resumeServiceProvider;
-    private final ConcurrentMap<ClaimKey, Boolean> activeClaims = new ConcurrentHashMap<>();
+    private final ConcurrentMap<ToolJobResumeClaimKey, Boolean> activeClaims = new ConcurrentHashMap<>();
 
     @Override
     public boolean launch(String runId, ToolJobResumeContext context) {
@@ -36,8 +39,8 @@ public class ToolJobResumeLauncherImpl implements ToolJobResumeLauncher {
             return false;
         }
         // ClaimKey 与数据库 LAUNCHING 租约一一对应。
-        ClaimKey key = new ClaimKey(runId, context.getResumeToken(), context.getResumeLeaseVersion(),
-                context.getResumeLauncherOwnerId());
+        ToolJobResumeClaimKey key = new ToolJobResumeClaimKey(runId, context.getResumeToken(),
+                context.getResumeLeaseVersion(), context.getResumeLauncherOwnerId());
         // putIfAbsent 保证同一 JVM 内重复扫描只提交一次 pipeline Runnable。
         if (activeClaims.putIfAbsent(key, Boolean.TRUE) != null) {
             // 已接收同一逻辑 claim 时幂等返回 true，不重复入队。
@@ -99,27 +102,14 @@ public class ToolJobResumeLauncherImpl implements ToolJobResumeLauncher {
                 && key.token().equals(token) && key.version() == version);
     }
 
-    /**
-     * Active 包含正在排队和正在执行的恢复任务。每轮只做数据库窄续租；如果 rows=0，
-     * 说明 token/version/owner 已被 takeover 或下一次 PREPARING 替换，本实例立即停止续租。
-     */
-    @Scheduled(fixedDelayString = "${agent.tool-job.resume-launcher-heartbeat-interval-ms:5000}")
-    void heartbeatActiveClaims() {
-        ToolJobResumeService service = resumeServiceProvider.getIfAvailable();
-        if (service == null) {
-            return;
-        }
-        for (ClaimKey key : activeClaims.keySet()) {
-            try {
-                if (!service.heartbeat(key.runId(), key.token(), key.version(), key.ownerId())) {
-                    activeClaims.remove(key);
-                }
-            } catch (Exception e) {
-                // 数据库暂时不可用时保留本地声明，下一轮继续续租；数据库 lease 仍会自然过期并允许接管。
-                log.warn("Resume heartbeat failed runId={} token={} version={}: {}",
-                        key.runId(), key.token(), key.version(), e.getMessage());
-            }
-        }
+    /** heartbeat 组件可读的活跃 claim 快照（包内协作用）。 */
+    Set<ToolJobResumeClaimKey> activeClaimKeys() {
+        return Set.copyOf(activeClaims.keySet());
+    }
+
+    /** heartbeat 续租失败（rows=0）后由心跳组件撤销本地去重键。 */
+    void removeClaim(ToolJobResumeClaimKey key) {
+        activeClaims.remove(key);
     }
 
     private boolean valid(String runId, ToolJobResumeContext context) {
@@ -135,6 +125,4 @@ public class ToolJobResumeLauncherImpl implements ToolJobResumeLauncher {
                 && context.getTodoId() != null
                 && !context.getTodoId().isBlank();
     }
-
-    private record ClaimKey(String runId, String token, long version, String ownerId) {}
 }

@@ -90,11 +90,13 @@ class ToolJobResumeLauncherImplTest {
         when(resumeService.heartbeat("run-1", "token-1", 7L, "owner-1"))
                 .thenReturn(true, false);
         ToolJobResumeLauncherImpl launcher = new ToolJobResumeLauncherImpl(runMapper, pipeline, provider);
+        ToolJobResumeLauncherHeartbeat heartbeat =
+                new ToolJobResumeLauncherHeartbeat(launcher, provider);
 
         assertThat(launcher.launch("run-1", context())).isTrue();
-        launcher.heartbeatActiveClaims();
+        heartbeat.heartbeatActiveClaims();
         assertThat(launcher.isActive("run-1", "token-1", 7L)).isTrue();
-        launcher.heartbeatActiveClaims();
+        heartbeat.heartbeatActiveClaims();
         assertThat(launcher.isActive("run-1", "token-1", 7L)).isFalse();
     }
 

@@ -3,6 +3,7 @@ package world.willfrog.agentlangchain.tooljob;
 import org.apache.dubbo.config.annotation.DubboReference;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Service;
@@ -21,8 +22,15 @@ import java.util.List;
  *
  * <p>先从 durable reservation 重建容量账本，再重建 Redis due/cache，最后恢复
  * READY/LAUNCHING handoff。顺序不可交换：容量状态未恢复前开放准入可能超卖。</p>
+ *
+ * <p>仅在 {@code agent.tool-job.durable-recovery-enabled=true} 时创建；默认关闭，
+ * 服务重启后的遗留 Run 由工作流启动扫描（task #118）处理。</p>
  */
 @Service
+@ConditionalOnProperty(
+        name = "agent.tool-job.durable-recovery-enabled",
+        havingValue = "true",
+        matchIfMissing = false)
 public class ToolJobStartupRecovery {
 
     private static final Logger log = LoggerFactory.getLogger(ToolJobStartupRecovery.class);

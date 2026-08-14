@@ -38,6 +38,16 @@ public class ToolJobConfig {
     /** 恢复 launcher 的持久化租约时长；活跃 launcher 必须在过期前续租。 */
     private long resumeLauncherLeaseSeconds = 30;
 
+    /**
+     * 跨进程耐久恢复总开关。false（默认）时不创建 ToolJobReconciler、
+     * ToolJobStartupRecovery 和 resume launcher heartbeat，长工具终态由进程内
+     * ToolJobContinuationTracker 跟踪；true 时恢复原 Redis/PG 扫描接管链。
+     */
+    private boolean durableRecoveryEnabled = false;
+
+    /** 进程内 continuation tracker 连续轮询 RPC 失败上限；超过后按 RESULT_LOST 收口。 */
+    private int continuationMaxConsecutivePollFailures = 5;
+
     public long getFastPathMs() { return fastPathMs; }
     public void setFastPathMs(long fastPathMs) { this.fastPathMs = fastPathMs; }
 
@@ -65,6 +75,18 @@ public class ToolJobConfig {
     public long getResumeLauncherLeaseSeconds() { return resumeLauncherLeaseSeconds; }
     public void setResumeLauncherLeaseSeconds(long resumeLauncherLeaseSeconds) {
         this.resumeLauncherLeaseSeconds = resumeLauncherLeaseSeconds;
+    }
+
+    public boolean isDurableRecoveryEnabled() { return durableRecoveryEnabled; }
+    public void setDurableRecoveryEnabled(boolean durableRecoveryEnabled) {
+        this.durableRecoveryEnabled = durableRecoveryEnabled;
+    }
+
+    public int getContinuationMaxConsecutivePollFailures() {
+        return continuationMaxConsecutivePollFailures;
+    }
+    public void setContinuationMaxConsecutivePollFailures(int continuationMaxConsecutivePollFailures) {
+        this.continuationMaxConsecutivePollFailures = continuationMaxConsecutivePollFailures;
     }
 
 }

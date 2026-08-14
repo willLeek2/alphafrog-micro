@@ -7,6 +7,11 @@ import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agentlangchain.config.LangchainRunExecutorLimits;
 import world.willfrog.agentlangchain.config.LangchainRunExecutorLimitsResolver;
+import world.willfrog.agentlangchain.orchestration.scheduler.DefaultRunAdmissionPolicy;
+import world.willfrog.agentlangchain.orchestration.scheduler.DefaultRunPriorityPolicy;
+import world.willfrog.agentlangchain.orchestration.scheduler.DefaultRunWeightPolicy;
+import world.willfrog.agentlangchain.orchestration.scheduler.InProcessRunCapacityLedger;
+import world.willfrog.agentlangchain.orchestration.scheduler.LangchainSchedulerMetrics;
 
 import java.util.List;
 import java.util.Map;
@@ -38,7 +43,18 @@ class LangchainRunConcurrencySchedulerTest {
         LangchainRunExecutorLimitsResolver resolver = mock(LangchainRunExecutorLimitsResolver.class);
         when(resolver.currentLimits()).thenAnswer(invocation -> currentLimits.get());
         when(resolver.hardLimits()).thenReturn(new LangchainRunExecutorLimits(3, 3, 2, "scheduler-test-"));
-        scheduler = new LangchainRunConcurrencyScheduler(executor, resolver, "test-app");
+        // 默认权重 1 × 最大并发 3 < 容量 4：容量维度不改变旧有伸缩语义的断言。
+        InProcessRunCapacityLedger ledger = new InProcessRunCapacityLedger(4);
+        scheduler = new LangchainRunConcurrencyScheduler(
+                executor,
+                resolver,
+                new DefaultRunAdmissionPolicy(),
+                new DefaultRunPriorityPolicy(),
+                new DefaultRunWeightPolicy(),
+                ledger,
+                new LangchainSchedulerMetrics(new io.micrometer.core.instrument.simple.SimpleMeterRegistry()),
+                "test-app",
+                true);
     }
 
     @AfterEach

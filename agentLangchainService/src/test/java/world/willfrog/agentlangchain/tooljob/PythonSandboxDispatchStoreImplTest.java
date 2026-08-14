@@ -1,9 +1,11 @@
 package world.willfrog.agentlangchain.tooljob;
 
 import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.ObjectProvider;
 import world.willfrog.agent.platform.dataanalysis.DagBlockingWorkerLease;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agentlangchain.orchestration.scheduler.LangchainSchedulerMetrics;
 
 import java.time.Instant;
 
@@ -16,8 +18,20 @@ class PythonSandboxDispatchStoreImplTest {
 
     private final ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
     private final ToolJobRedisCache redisCache = mock(ToolJobRedisCache.class);
+    private final ToolJobConfig config = new ToolJobConfig();
+    @SuppressWarnings("unchecked")
+    private final ObjectProvider<ToolJobContinuationTracker> trackerProvider =
+            mock(ObjectProvider.class);
+    private final LangchainSchedulerMetrics metrics =
+            new LangchainSchedulerMetrics(new io.micrometer.core.instrument.simple.SimpleMeterRegistry());
     private final PythonSandboxDispatchStoreImpl store =
-            new PythonSandboxDispatchStoreImpl(anchorService, redisCache);
+            new PythonSandboxDispatchStoreImpl(
+                    anchorService, redisCache, config, trackerProvider, metrics);
+
+    {
+        // 本测试类覆盖 durable Redis 派生路径；进程内 tracker 路径由专门测试覆盖。
+        config.setDurableRecoveryEnabled(true);
+    }
 
     @Test
     void preparingClaimCannotOverwriteAnExistingAnchor() {
@@ -68,6 +82,45 @@ class PythonSandboxDispatchStoreImplTest {
 
         assertThat(store.transferToPending("run-1", anchor)).isFalse();
         verifyNoInteractions(redisCache);
+    }
+
+    @Test
+    void pendingTransferRegistersInProcessTrackerWhenDurableOff() {
+        config.setDurableRecoveryEnabled(false);
+        try {
+            ToolJobAnchor anchor = anchor("PENDING");
+            ToolJobContinuationTracker tracker = mock(ToolJobContinuationTracker.class);
+            when(trackerProvider.getIfAvailable()).thenReturn(tracker);
+            when(anchorService.updateActiveAndStatus(
+                    "run-1", anchor, AgentRunStatus.WAITING_TOOL_JOB,
+                    AgentRunStatus.EXECUTING, "run-1:call-1:1"))
+                    .thenReturn(true);
+
+            assertThat(store.transferToPending("run-1", anchor)).isTrue();
+
+            verify(tracker).register("run-1", anchor);
+            verify(redisCache, never()).atomicWritePendingAndDue(any(), any());
+        } finally {
+            config.setDurableRecoveryEnabled(true);
+        }
+    }
+
+    @Test
+    void pendingTransferFailsClosedWhenTrackerMissingAndDurableOff() {
+        config.setDurableRecoveryEnabled(false);
+        try {
+            ToolJobAnchor anchor = anchor("PENDING");
+            when(trackerProvider.getIfAvailable()).thenReturn(null);
+            when(anchorService.updateActiveAndStatus(
+                    "run-1", anchor, AgentRunStatus.WAITING_TOOL_JOB,
+                    AgentRunStatus.EXECUTING, "run-1:call-1:1"))
+                    .thenReturn(true);
+
+            // 同开关下 tracker bean 缺失属于装配错误：不允许一个 Run 无人发现终态。
+            assertThat(store.transferToPending("run-1", anchor)).isFalse();
+        } finally {
+            config.setDurableRecoveryEnabled(true);
+        }
     }
 
     @Test

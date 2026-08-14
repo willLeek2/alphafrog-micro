@@ -3,6 +3,7 @@ package world.willfrog.agentlangchain.tooljob;
 import org.apache.dubbo.config.annotation.DubboReference;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
@@ -25,8 +26,15 @@ import java.util.Set;
  *
  * <p>Redis due 集合负责低延迟轮询，PostgreSQL anchor 周期补扫负责灾后恢复。
  * 本类只发现状态并调用 finalizer/resume service；所有持久化所有权仍由数据库 CAS 决定。</p>
+ *
+ * <p>仅在 {@code agent.tool-job.durable-recovery-enabled=true} 时创建；默认关闭时
+ * 由进程内 ToolJobContinuationTracker 承担发现职责，避免两套机制接管同一个 Run。</p>
  */
 @Service
+@ConditionalOnProperty(
+        name = "agent.tool-job.durable-recovery-enabled",
+        havingValue = "true",
+        matchIfMissing = false)
 public class ToolJobReconciler {
 
     private static final Logger log = LoggerFactory.getLogger(ToolJobReconciler.class);
