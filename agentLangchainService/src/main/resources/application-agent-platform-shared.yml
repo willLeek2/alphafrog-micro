@@ -22,6 +22,10 @@ agent:
   tool-job:
     # durable 工具的同步快路径；超过该阈值后 Run 先落 checkpoint，再转 WAITING_TOOL_JOB。
     fast-path-ms: ${AF_AGENT_TOOL_JOB_FAST_PATH_MS:1500}
+    # 默认只允许当前进程的 continuation tracker 发现并续接长工具；旧的跨进程
+    # reconciler/startup/heartbeat 只有显式开启后才注册，避免两套恢复链同时接管。
+    durable-recovery-enabled: ${AF_AGENT_TOOL_JOB_DURABLE_RECOVERY_ENABLED:false}
+    continuation-max-consecutive-poll-failures: ${AF_AGENT_TOOL_JOB_CONTINUATION_MAX_FAILURES:5}
   # D06 production sub-agent execution. The executor is bounded and independent
   # from the main Agent worker pool. A task timeout is best-effort interrupt;
   # terminal state is persisted before any late completion can win.
@@ -67,6 +71,9 @@ agent:
         queue-capacity: ${AF_AGENT_RUN_EXECUTOR_QUEUE_CAPACITY:100}
         # 修改 thread-name-prefix 与启动 hard 值不同时实际不会生效，需滚动重启
         thread-name-prefix: ${AF_AGENT_RUN_EXECUTOR_THREAD_NAME_PREFIX:agent-run-}
+      scheduler:
+        max-capacity-units: ${AF_AGENT_RUN_SCHEDULER_MAX_CAPACITY_UNITS:4}
+        advanced-diagnostics-enabled: ${AF_AGENT_RUN_SCHEDULER_ADVANCED_DIAGNOSTICS_ENABLED:false}
   tool-cache:
     version: ${AF_AGENT_TOOL_CACHE_VERSION:v1}
     search-ttl-seconds: ${AF_AGENT_TOOL_CACHE_SEARCH_TTL_SECONDS:3600}

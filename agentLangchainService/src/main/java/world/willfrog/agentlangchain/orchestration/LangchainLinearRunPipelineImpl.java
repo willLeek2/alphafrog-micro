@@ -31,6 +31,7 @@ import world.willfrog.agent.platform.event.AgentRunFinalizationService;
 import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 import world.willfrog.agentlangchain.orchestration.dag.LangchainDagWorkflowExecutor;
+import world.willfrog.agentlangchain.orchestration.scheduler.LangchainSchedulerMetrics;
 import world.willfrog.agentlangchain.planning.LangchainAiPlanner;
 import world.willfrog.agentlangchain.planning.LangchainPlanningRequest;
 import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
@@ -111,6 +112,9 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
 
     @Autowired(required = false)
     private AgentRunDagNodeMapper dagNodeMapper;
+
+    @Autowired(required = false)
+    private LangchainSchedulerMetrics schedulerMetrics;
 
     public LangchainLinearRunPipelineImpl(LangchainAiPlanner planner,
                                           LangchainLinearWorkflowExecutor linearWorkflowExecutor,
@@ -256,9 +260,13 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 }
                 String blockedSnapshot = attachObservability(
                         runId, run.getSnapshotJson(), AgentRunStatus.FAILED, "CreditBlocked", reason);
-                runMapper.updateSnapshot(runId, userId, AgentRunStatus.FAILED, blockedSnapshot, true, reason);
-                runMapper.updateStatusWithTtl(runId, userId, AgentRunStatus.FAILED,
-                        eventService.nextInterruptedExpiresAt());
+                int snapshotRows = runMapper.updateSnapshot(
+                        runId, userId, AgentRunStatus.FAILED, blockedSnapshot, true, reason);
+                int ttlRows = runMapper.updateStatusWithTtl(
+                        runId, userId, AgentRunStatus.FAILED, eventService.nextInterruptedExpiresAt());
+                if (snapshotRows == 1 && ttlRows == 1) {
+                    recordSchedulerCompletion(AgentRunStatus.FAILED);
+                }
                 eventService.append(runId, userId, "EXECUTION_BLOCKED",
                         Map.of("reason", reason, "by", "credit_pre_check", "engine", "agentLangchainService"));
                 markRunStatus(runId, AgentRunStatus.FAILED);
@@ -443,7 +451,11 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 // assistant message 最后写，是因为 follow-up 只应该引用已经确定落库的最终答案。
                 String snapshot = attachObservability(
                         runId, buildSnapshot(userGoal, result, AgentRunStatus.COMPLETED), AgentRunStatus.COMPLETED, null, null);
-                runMapper.updateSnapshot(runId, userId, AgentRunStatus.COMPLETED, snapshot, true, null);
+                int completedRows = runMapper.updateSnapshot(
+                        runId, userId, AgentRunStatus.COMPLETED, snapshot, true, null);
+                if (completedRows == 1) {
+                    recordSchedulerCompletion(AgentRunStatus.COMPLETED);
+                }
                 markRunStatus(runId, AgentRunStatus.COMPLETED);
                 eventService.append(runId, userId, "WORKFLOW_COMPLETED", Map.of(
                         "answer", result.getFinalAnswer(),
@@ -462,8 +474,11 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 String snapshot = attachObservability(
                         runId, buildPartialSnapshot(userGoal, result), AgentRunStatus.PARTIAL, null,
                         result.getFailureReason());
-                runMapper.updateSnapshot(runId, userId, AgentRunStatus.PARTIAL, snapshot, true,
-                        result.getFailureReason());
+                int partialRows = runMapper.updateSnapshot(
+                        runId, userId, AgentRunStatus.PARTIAL, snapshot, true, result.getFailureReason());
+                if (partialRows == 1) {
+                    recordSchedulerCompletion(AgentRunStatus.PARTIAL);
+                }
                 markRunStatus(runId, AgentRunStatus.PARTIAL);
                 Map<String, Object> payload = new LinkedHashMap<>();
                 payload.put("answer", nvl(result.getFinalAnswer()));
@@ -686,6 +701,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 return false;
             }
             commitResumedTerminalObservability(prepared);
+            recordSchedulerCompletion(AgentRunStatus.COMPLETED);
             try {
                 // 以下副作用发生在 durable snapshot 之后，失败不会回滚已确定的工作流结果。
                 markRunStatus(runId, AgentRunStatus.COMPLETED);
@@ -716,6 +732,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 return false;
             }
             commitResumedTerminalObservability(prepared);
+            recordSchedulerCompletion(AgentRunStatus.PARTIAL);
             try {
                 markRunStatus(runId, AgentRunStatus.PARTIAL);
                 eventService.append(runId, userId, "WORKFLOW_PARTIAL_COMPLETED", Map.of(
@@ -1060,6 +1077,9 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         if (requireDurableWrite) {
             commitResumedTerminalObservability(prepared);
         }
+        if (updated == 1) {
+            recordSchedulerCompletion(AgentRunStatus.FAILED);
+        }
         try {
             markRunStatus(runId, AgentRunStatus.FAILED);
             // 260618-workspace-v0: 触发终态事件
@@ -1149,6 +1169,13 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             String snapshot,
             AgentObservabilityService service,
             AgentObservabilityService.TerminalSnapshotCandidate candidate) {
+    }
+
+    /** 只有数据库已经接受终态写入后，才把本次 Run 计入调度完成结果。 */
+    private void recordSchedulerCompletion(AgentRunStatus status) {
+        if (schedulerMetrics != null) {
+            schedulerMetrics.recordCompletion(status);
+        }
     }
 
     private void tryScheduleSettlement(String runId, String userId) {

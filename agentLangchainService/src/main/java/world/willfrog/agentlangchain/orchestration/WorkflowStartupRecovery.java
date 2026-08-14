@@ -2,6 +2,7 @@ package world.willfrog.agentlangchain.orchestration;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
@@ -12,6 +13,7 @@ import world.willfrog.agent.platform.event.AgentRunFinalizationService;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agentlangchain.orchestration.scheduler.LangchainSchedulerMetrics;
 
 import java.time.OffsetDateTime;
 import java.util.List;
@@ -34,6 +36,9 @@ public class WorkflowStartupRecovery {
     private final LangchainLinearRunPipeline pipeline;
     private final AgentEventService eventService;
     private final AgentRunFinalizationService finalizationService;
+
+    @Autowired(required = false)
+    private LangchainSchedulerMetrics schedulerMetrics;
 
     @Value("${agent.workflow-restart.max-restart-attempts:1}")
     private int maxRestartAttempts;
@@ -63,6 +68,9 @@ public class WorkflowStartupRecovery {
         try {
             if (status == AgentRunStatus.CANCELING) {
                 if (runMapper.completeStartupCancellation(runId) == 1) {
+                    if (schedulerMetrics != null) {
+                        schedulerMetrics.recordCompletion(AgentRunStatus.CANCELED);
+                    }
                     eventService.append(runId, userId, "WORKFLOW_RESTART_CANCELED", Map.of(
                             "reason", "canceling_during_service_restart"));
                     finalizationService.publishFinalizedEvent(
@@ -133,6 +141,9 @@ public class WorkflowStartupRecovery {
     }
 
     private void publishRejected(AgentRun run, String reason) {
+        if (schedulerMetrics != null) {
+            schedulerMetrics.recordCompletion(AgentRunStatus.FAILED);
+        }
         try {
             eventService.append(run.getId(), run.getUserId(), "WORKFLOW_RESTART_REJECTED", Map.of(
                     "reason", reason,

@@ -8,6 +8,7 @@ import world.willfrog.agent.platform.event.AgentRunFinalizationService;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agentlangchain.orchestration.scheduler.LangchainSchedulerMetrics;
 
 import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.eq;
@@ -22,6 +23,7 @@ class WorkflowStartupRecoveryTest {
     private LangchainLinearRunPipeline pipeline;
     private AgentEventService eventService;
     private AgentRunFinalizationService finalizationService;
+    private LangchainSchedulerMetrics schedulerMetrics;
     private WorkflowStartupRecovery recovery;
 
     @BeforeEach
@@ -30,7 +32,9 @@ class WorkflowStartupRecoveryTest {
         pipeline = mock(LangchainLinearRunPipeline.class);
         eventService = mock(AgentEventService.class);
         finalizationService = mock(AgentRunFinalizationService.class);
+        schedulerMetrics = mock(LangchainSchedulerMetrics.class);
         recovery = new WorkflowStartupRecovery(runMapper, pipeline, eventService, finalizationService);
+        ReflectionTestUtils.setField(recovery, "schedulerMetrics", schedulerMetrics);
         ReflectionTestUtils.setField(recovery, "maxRestartAttempts", 1);
         ReflectionTestUtils.setField(recovery, "scanLimit", 100);
     }
@@ -63,6 +67,7 @@ class WorkflowStartupRecoveryTest {
         verify(eventService).append(eq("run-1"), eq("user-1"),
                 eq("WORKFLOW_RESTART_REJECTED"), anyMap());
         verify(finalizationService).publishFinalizedEvent("run-1", "user-1", "FAILED");
+        verify(schedulerMetrics).recordCompletion(AgentRunStatus.FAILED);
     }
 
     @Test
@@ -74,6 +79,7 @@ class WorkflowStartupRecoveryTest {
 
         verify(pipeline, never()).launchRestartedAsync(candidate);
         verify(finalizationService).publishFinalizedEvent("run-1", "user-1", "CANCELED");
+        verify(schedulerMetrics).recordCompletion(AgentRunStatus.CANCELED);
     }
 
     private AgentRun run(AgentRunStatus status, int restartAttempt, String planJson) {

@@ -2,6 +2,7 @@ package world.willfrog.agentlangchain.facade;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.event.AgentRunFinalizationService;
@@ -13,6 +14,7 @@ import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agentlangchain.orchestration.LangchainLinearRunPipeline;
+import world.willfrog.agentlangchain.orchestration.scheduler.LangchainSchedulerMetrics;
 import world.willfrog.agentlangchain.tooljob.ToolJobAnchorService;
 import world.willfrog.alphafrogmicro.agent.idl.AgentEmpty;
 import world.willfrog.alphafrogmicro.agent.idl.CancelAgentRunRequest;
@@ -74,6 +76,9 @@ public class LangchainRunControlService {
     private final AgentRunCreditSettlementService creditSettlementService;
     private final ToolJobAnchorService anchorService;
     private final AgentRunFinalizationService finalizationService;
+
+    @Autowired(required = false)
+    private LangchainSchedulerMetrics schedulerMetrics;
 
     /**
      * 删除 run 及其关联的状态数据（Redis）。
@@ -168,6 +173,9 @@ public class LangchainRunControlService {
                 log.warn("CANCELED persistence was not exact: runId={} snapshotRows={} ttlRows={}",
                         runId, snapshotRows, ttlRows);
             }
+        }
+        if (canceledPersisted && schedulerMetrics != null) {
+            schedulerMetrics.recordCompletion(AgentRunStatus.CANCELED);
         }
         // 6. 发 CANCELED 事件 → 前端 SSE 收到后更新 UI 为已取消
         eventService.append(runId, userId, "CANCELED", Map.of(

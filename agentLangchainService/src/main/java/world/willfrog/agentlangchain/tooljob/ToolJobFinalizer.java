@@ -12,6 +12,7 @@ import world.willfrog.agent.platform.event.AgentRunFinalizationService;
 import world.willfrog.agent.platform.finance.*;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.agentlangchain.orchestration.scheduler.LangchainSchedulerMetrics;
 import world.willfrog.agent.tools.finance.FinanceResultModelAdapter;
 import world.willfrog.agent.tools.python.FinanceRecordProtoAdapter;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
@@ -63,6 +64,9 @@ public class ToolJobFinalizer {
 
     @Autowired(required = false)
     private ToolJobEventHook eventHook;
+
+    @Autowired(required = false)
+    private LangchainSchedulerMetrics schedulerMetrics;
 
     @Autowired
     public ToolJobFinalizer(ToolJobAnchorService anchorService,
@@ -400,6 +404,9 @@ public class ToolJobFinalizer {
                         AgentRunStatus.CANCELED, AgentRunStatus.WAITING_TOOL_JOB)) {
                     log.warn("CANCELED terminal transition failed for run={}, will retry", runId);
                     return;
+                }
+                if (schedulerMetrics != null) {
+                    schedulerMetrics.recordCompletion(AgentRunStatus.CANCELED);
                 }
                 publishCanceledWorkspaceFinalized(runId);
                 // DB 已持久化取消终态后才清 Redis due/cache，Redis 丢失不影响真相。
