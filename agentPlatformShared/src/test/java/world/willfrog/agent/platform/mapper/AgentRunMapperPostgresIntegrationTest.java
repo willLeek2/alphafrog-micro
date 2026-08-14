@@ -65,6 +65,8 @@ class AgentRunMapperPostgresIntegrationTest {
                         updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
                         completed_at TIMESTAMPTZ,
                         ext JSONB NOT NULL DEFAULT '{}',
+                        execution_checkpoint_json JSONB NOT NULL DEFAULT '{}',
+                        restart_attempt INT NOT NULL DEFAULT 0,
                         tool_job_anchor_json JSONB NOT NULL DEFAULT '{}'
                     )
                     """);
@@ -113,7 +115,10 @@ class AgentRunMapperPostgresIntegrationTest {
         try (SqlSession session = sqlSessionFactory.openSession(true)) {
             AgentRunMapper mapper = session.getMapper(AgentRunMapper.class);
             assertThat(mapper.insert(run)).isEqualTo(1);
-            assertThat(mapper.findById(run.getId()).getToolJobAnchorJson()).isEqualTo("{}");
+            AgentRun stored = mapper.findById(run.getId());
+            assertThat(stored.getToolJobAnchorJson()).isEqualTo("{}");
+            assertThat(stored.getExecutionCheckpointJson()).isEqualTo("{}");
+            assertThat(stored.getRestartAttempt()).isZero();
         }
     }
 

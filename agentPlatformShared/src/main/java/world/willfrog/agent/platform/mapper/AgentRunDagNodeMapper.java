@@ -13,6 +13,12 @@ import java.util.List;
 @Mapper
 public interface AgentRunDagNodeMapper {
 
+    /** 服务重启整图重跑前清空旧 generation/frontier 展示状态。 */
+    int clearFrontierForWorkflowRestart(@Param("runId") String runId);
+
+    /** 服务重启整图重跑不复用旧节点行。 */
+    int deleteByRunId(@Param("runId") String runId);
+
     // ===== Stage 1: 计划写入 =====
 
     /** 1a: CAS 写入 dag_frontier_json，同时推进 status=EXECUTING */

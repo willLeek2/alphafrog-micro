@@ -55,6 +55,28 @@ final class LangchainWorkflowRouting {
         return false;
     }
 
+    /** 服务重启前验证数据库中的 Plan 确实已经冻结，不能再次猜测 AUTO 或修补拓扑。 */
+    static void validateFrozenPlan(LangchainTodoPlan plan) {
+        if (plan == null || plan.getItems() == null || plan.getItems().isEmpty()) {
+            throw new IllegalStateException("workflow_restart_plan_empty");
+        }
+        if (plan.getExecutionMode() == null || plan.getExecutionMode() == PlanExecutionMode.AUTO) {
+            throw new IllegalStateException("workflow_restart_plan_mode_not_frozen");
+        }
+        if (plan.getItems().stream().anyMatch(java.util.Objects::isNull)) {
+            throw new IllegalStateException("workflow_restart_plan_contains_null_todo");
+        }
+        if (plan.getExecutionMode() == PlanExecutionMode.LINEAR) {
+            if (!isAlreadyCanonicalLinear(plan)) {
+                throw new IllegalStateException("workflow_restart_linear_plan_not_canonical");
+            }
+            stableTopologicalOrder(plan.getItems());
+            return;
+        }
+        // DAG 从头重跑也必须先证明节点 ID、依赖与无环性有效。
+        stableTopologicalOrder(plan.getItems());
+    }
+
     /**
      * 把 Run 创建时的 requested mode 与 planner 输出合并成唯一 effective plan。
      *

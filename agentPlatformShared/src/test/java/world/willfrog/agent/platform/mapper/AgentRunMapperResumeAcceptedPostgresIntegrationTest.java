@@ -61,6 +61,8 @@ class AgentRunMapperResumeAcceptedPostgresIntegrationTest {
                         updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
                         completed_at TIMESTAMPTZ,
                         ext JSONB NOT NULL DEFAULT '{}',
+                        execution_checkpoint_json JSONB NOT NULL DEFAULT '{}',
+                        restart_attempt INT NOT NULL DEFAULT 0,
                         tool_job_anchor_json JSONB NOT NULL DEFAULT '{}'
                     )
                     """);

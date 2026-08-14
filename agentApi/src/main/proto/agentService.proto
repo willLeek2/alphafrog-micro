@@ -36,6 +36,7 @@ message CreateAgentRunRequest {
   int32 planner_candidate_count = 9;
   bool debug_mode = 10;
   string stage_config_json = 11;  // 各阶段 LLM 配置（包含 planning/execution/sub_agent）
+  bool generate_artifacts = 12;   // 默认 false；只控制用户可查询/下载的正式产物
 }
 
 message GetAgentRunRequest {

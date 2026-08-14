@@ -17,6 +17,7 @@ import world.willfrog.agent.platform.debug.DebugObservabilityRequest;
 import world.willfrog.agent.platform.debug.DebugObservabilityService;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
+import world.willfrog.agent.platform.mapper.AgentRunDagNodeMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.prompt.PromptRunSelection;
 import world.willfrog.agent.platform.service.AgentCreditService;
@@ -105,6 +106,12 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
     @Autowired(required = false)
     private ToolJobCheckpointFailureRecoveryService checkpointFailureRecoveryService;
 
+    @Autowired(required = false)
+    private WorkflowCheckpointService workflowCheckpointService;
+
+    @Autowired(required = false)
+    private AgentRunDagNodeMapper dagNodeMapper;
+
     public LangchainLinearRunPipelineImpl(LangchainAiPlanner planner,
                                           LangchainLinearWorkflowExecutor linearWorkflowExecutor,
                                           LangchainDagWorkflowExecutor dagWorkflowExecutor,
@@ -161,6 +168,15 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         runConcurrencyScheduler.submit(reservation, run, () -> executeRun(run));
     }
 
+    @Override
+    public boolean launchRestartedAsync(AgentRun run) {
+        if (run == null || isBlank(run.getId())) {
+            return false;
+        }
+        runConcurrencyScheduler.submit(null, run, () -> executeRun(run, true));
+        return true;
+    }
+
     /**
      * 把一次持久化恢复提交到普通 Run 共用的有界调度器。
      *
@@ -197,6 +213,10 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
     }
 
     void executeRun(AgentRun initialRun) {
+        executeRun(initialRun, false);
+    }
+
+    void executeRun(AgentRun initialRun, boolean serviceRestart) {
         if (initialRun == null || isBlank(initialRun.getId())) {
             return;
         }
@@ -251,7 +271,9 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             eventService.append(runId, userId, "EXECUTION_STARTED", Map.of(
                     "run_id", runId,
                     "engine", "agentLangchainService",
-                    "workflow", "pending_plan"
+                    "workflow", serviceRestart ? "frozen_plan_restart" : "pending_plan",
+                    "service_restart", serviceRestart,
+                    "restart_attempt", run.getRestartAttempt() == null ? 0 : run.getRestartAttempt()
             ));
 
             // 阶段模型解析是 run 级配置落地的入口：
@@ -308,62 +330,102 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             PlanExecutionMode requestedExecutionMode = AgentEventService.parseExecutionMode(
                     eventService.extractExecutionMode(run.getExt()));
 
-            // planning（规划）阶段只负责把用户目标变成 todo plan（任务计划）。
-            // 显式 LINEAR/DAG 会约束 planner；AUTO 则由计划特征交给 routing 裁决。
-            AgentContext.setPhase("planning");
-            LangchainTodoPlan plan = planner.plan(LangchainPlanningRequest.builder()
-                    .runId(runId)
-                    .userId(userId)
-                    .userGoal(userGoal)
-                    .dialogueContext(dialogueContext)
-                    .model(stageModels.planningModel())
-                    .planningEndpointName(stageModels.planningEndpointName())
-                    .planningModelName(stageModels.planningModelName())
-                    .planningProviderOrder(stageModels.planningProviderOrder())
-                    .toolSpecifications(toolSpecifications)
-                    .executionMode(requestedExecutionMode)
-                    .build());
-
-            /*
-             * requested mode 与 planner 输出在这里一次性冻结成 effective plan。显式
-             * LINEAR 保留稳定拓扑正规化；显式 DAG 保留 DAG；AUTO 按计划路由。后续持久化、
-             * PLAN_READY 和 executor 全部只使用这份 effective plan。
-             */
-            LangchainTodoPlan planned = plan;
-            plan = LangchainWorkflowRouting.effectivePlan(plan, requestedExecutionMode);
-            boolean useDag = LangchainWorkflowRouting.shouldUseDag(plan);
-            PlanExecutionMode effectiveExecutionMode = useDag
-                    ? PlanExecutionMode.DAG
-                    : PlanExecutionMode.LINEAR;
-            if (planned != plan) {
-                log.info("Resolved effective workflow plan: runId={} requestedMode={} plannerMode={} effectiveMode={}",
-                        runId, requestedExecutionMode, planned.getExecutionMode(), effectiveExecutionMode);
+            LangchainTodoPlan plan;
+            boolean useDag;
+            PlanExecutionMode effectiveExecutionMode;
+            WorkflowExecutionCheckpoint restartCheckpoint = null;
+            if (serviceRestart) {
+                // 服务重启只读取数据库里的冻结 Plan；这里绝不调用 planner。
+                if (isBlank(run.getPlanJson()) || "{}".equals(run.getPlanJson().trim())) {
+                    throw new IllegalStateException("workflow_restart_plan_missing");
+                }
+                plan = objectMapper.readValue(run.getPlanJson(), LangchainTodoPlan.class);
+                validateFrozenPlan(plan);
+                useDag = LangchainWorkflowRouting.shouldUseDag(plan);
+                effectiveExecutionMode = useDag ? PlanExecutionMode.DAG : PlanExecutionMode.LINEAR;
+                if (useDag) {
+                    if (workflowCheckpointService == null) {
+                        throw new IllegalStateException("workflow_checkpoint_service_unavailable");
+                    }
+                    // DAG 从头重跑，但仍必须确认崩溃前没有启动过 UNSAFE 工具。
+                    workflowCheckpointService.parseAndValidateDagRestart(run);
+                    // DAG 不复用旧节点执行进度；删除仅用于 durable 展示/恢复的节点行。
+                    if (dagNodeMapper != null) {
+                        dagNodeMapper.deleteByRunId(runId);
+                        dagNodeMapper.clearFrontierForWorkflowRestart(runId);
+                    }
+                } else {
+                    if (workflowCheckpointService == null) {
+                        throw new IllegalStateException("workflow_checkpoint_service_unavailable");
+                    }
+                    restartCheckpoint = workflowCheckpointService.parseAndValidate(run, plan);
+                }
+                int restartAttempt = run.getRestartAttempt() == null ? 0 : run.getRestartAttempt();
+                eventService.appendOnce(runId, userId, "WORKFLOW_RESTARTED",
+                        runId + ":restart:" + restartAttempt,
+                        Map.of(
+                                "run_id", runId,
+                                "restart_attempt", restartAttempt,
+                                "planner_skipped", true,
+                                "workflow", useDag ? "dag" : "linear",
+                                "restart_from", useDag ? "graph_start" : restartCheckpoint.getNextTodoId()
+                        ));
+            } else {
+                // planning（规划）阶段只负责把用户目标变成 todo plan（任务计划）。
+                AgentContext.setPhase("planning");
+                LangchainTodoPlan planned = planner.plan(LangchainPlanningRequest.builder()
+                        .runId(runId)
+                        .userId(userId)
+                        .userGoal(userGoal)
+                        .dialogueContext(dialogueContext)
+                        .model(stageModels.planningModel())
+                        .planningEndpointName(stageModels.planningEndpointName())
+                        .planningModelName(stageModels.planningModelName())
+                        .planningProviderOrder(stageModels.planningProviderOrder())
+                        .toolSpecifications(toolSpecifications)
+                        .executionMode(requestedExecutionMode)
+                        .build());
+                plan = LangchainWorkflowRouting.effectivePlan(planned, requestedExecutionMode);
+                useDag = LangchainWorkflowRouting.shouldUseDag(plan);
+                effectiveExecutionMode = useDag ? PlanExecutionMode.DAG : PlanExecutionMode.LINEAR;
+                if (planned != plan) {
+                    log.info("Resolved effective workflow plan: runId={} requestedMode={} plannerMode={} effectiveMode={}",
+                            runId, requestedExecutionMode, planned.getExecutionMode(), effectiveExecutionMode);
+                }
+                // PLAN_READY 前先把冻结 Plan 和 LINEAR 初始 checkpoint 写稳。
+                persistPlan(runId, userId, plan);
+                if (workflowCheckpointService != null) {
+                    if (useDag) {
+                        workflowCheckpointService.initializeDag(runId, userId);
+                    } else {
+                        workflowCheckpointService.initializeLinear(runId, userId, plan);
+                    }
+                }
+                eventService.append(runId, userId, "PLAN_READY", Map.of(
+                        "execution_mode", effectiveExecutionMode.name(),
+                        "requested_execution_mode", requestedExecutionMode.name(),
+                        "effective_execution_mode", effectiveExecutionMode.name(),
+                        "workflow", useDag ? "dag" : "linear",
+                        "todo_count", plan.getItems() == null ? 0 : plan.getItems().size(),
+                        "plan", plan
+                ));
             }
-            // PLAN_READY 既是实时 UI 的启动信号，也是断线重连后的恢复锚点。
-            // 因此先把 plan 写入 DB/Redis，再发带完整 plan payload 的事件；这样前端收到事件后，
-            // 即使立刻调用 snapshot/status，也能读到同一份计划。
-            // Redis 里的 plan 服务于执行中轮询，DB 里的 plan 服务于历史查询和 Redis 过期后的恢复。
-            persistPlan(runId, userId, plan);
-            eventService.append(runId, userId, "PLAN_READY", Map.of(
-                    // execution_mode 保留给既有消费者，语义升级为 effective mode。
-                    "execution_mode", effectiveExecutionMode.name(),
-                    "requested_execution_mode", requestedExecutionMode.name(),
-                    "effective_execution_mode", effectiveExecutionMode.name(),
-                    "workflow", useDag ? "dag" : "linear",
-                    "todo_count", plan.getItems() == null ? 0 : plan.getItems().size(),
-                    "plan", plan
-            ));
 
             if (abortIfStopped(runId, userId, "before_execution")) {
                 return;
             }
 
-            // 已冻结计划的步骤执行与长工具挂起交接由独立协作类负责。
-            LangchainWorkflowStepCoordinator.Outcome stepOutcome = stepCoordinator().execute(
-                    runId, userId, workflowRequest, plan, useDag);
-            LangchainLinearWorkflowResult result = stepOutcome.result();
-            if (stepOutcome.workerReleased()) {
-                return;
+            // LINEAR 重启从 checkpoint 边界继续；DAG 重启与首次执行一样从整图开头调度。
+            LangchainLinearWorkflowResult result;
+            if (serviceRestart && !useDag) {
+                result = linearWorkflowExecutor.restartPlanned(workflowRequest, plan, restartCheckpoint);
+            } else {
+                LangchainWorkflowStepCoordinator.Outcome stepOutcome = stepCoordinator().execute(
+                        runId, userId, workflowRequest, plan, useDag);
+                result = stepOutcome.result();
+                if (stepOutcome.workerReleased()) {
+                    return;
+                }
             }
 
             // cancel/pause 可能发生在 todo 执行和最终落库之间。
@@ -730,6 +792,10 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             // valid=true 说明这是 planner 生成并被 pipeline 接受的计划，不是 HITL 修改中的临时草稿。
             stateStore.recordPlan(runId, planJson, true);
         }
+    }
+
+    private void validateFrozenPlan(LangchainTodoPlan plan) {
+        LangchainWorkflowRouting.validateFrozenPlan(plan);
     }
 
     private List<ToolSpecification> resolveToolSpecifications(AgentEventService.RunConfig runConfig, String userGoal) {

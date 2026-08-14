@@ -17,6 +17,8 @@
         <result property="updatedAt" column="updated_at"/>
         <result property="completedAt" column="completed_at"/>
         <result property="ext" column="ext"/>
+        <result property="executionCheckpointJson" column="execution_checkpoint_json"/>
+        <result property="restartAttempt" column="restart_attempt"/>
         <result property="toolJobAnchorJson" column="tool_job_anchor_json"/>
         <result property="durationMs" column="duration_ms"/>
         <result property="totalTokens" column="total_tokens"/>
@@ -25,10 +27,12 @@
 
     <insert id="insert" parameterType="world.willfrog.agent.platform.entity.AgentRun">
         INSERT INTO alphafrog_agent_run
-        (id, user_id, status, current_step, max_steps, plan_json, snapshot_json, last_error, ttl_expires_at, ext, tool_job_anchor_json)
+        (id, user_id, status, current_step, max_steps, plan_json, snapshot_json, last_error, ttl_expires_at, ext,
+         execution_checkpoint_json, restart_attempt, tool_job_anchor_json)
         VALUES
         (#{id}, #{userId}, #{status}, #{currentStep}, #{maxSteps},
          CAST(#{planJson} AS jsonb), CAST(#{snapshotJson} AS jsonb), #{lastError}, #{ttlExpiresAt}, CAST(#{ext} AS jsonb),
+         COALESCE(CAST(#{executionCheckpointJson} AS jsonb), '{}'::jsonb), COALESCE(#{restartAttempt}, 0),
          COALESCE(CAST(#{toolJobAnchorJson} AS jsonb), '{}'::jsonb))
     </insert>
 
@@ -46,6 +50,8 @@
                updated_at,
                completed_at,
                ext::text AS ext,
+               execution_checkpoint_json::text AS execution_checkpoint_json,
+               restart_attempt,
                tool_job_anchor_json::text AS tool_job_anchor_json
         FROM alphafrog_agent_run
         WHERE id = #{id}
@@ -66,6 +72,8 @@
                updated_at,
                completed_at,
                ext::text AS ext,
+               execution_checkpoint_json::text AS execution_checkpoint_json,
+               restart_attempt,
                tool_job_anchor_json::text AS tool_job_anchor_json
         FROM alphafrog_agent_run
         WHERE id = #{id}
@@ -242,6 +250,72 @@
             updated_at = CURRENT_TIMESTAMP
         WHERE id = #{id}
           AND user_id = #{userId}
+    </update>
+
+    <update id="updateExecutionCheckpoint">
+        UPDATE alphafrog_agent_run
+        SET execution_checkpoint_json = CAST(#{executionCheckpointJson} AS jsonb),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND user_id = #{userId}
+    </update>
+
+    <select id="listStartupRecoveryCandidates" resultMap="AgentRunResultMap">
+        SELECT id,
+               user_id,
+               status,
+               current_step,
+               max_steps,
+               plan_json::text AS plan_json,
+               snapshot_json::text AS snapshot_json,
+               last_error,
+               ttl_expires_at,
+               started_at,
+               updated_at,
+               completed_at,
+               ext::text AS ext,
+               execution_checkpoint_json::text AS execution_checkpoint_json,
+               restart_attempt,
+               tool_job_anchor_json::text AS tool_job_anchor_json
+        FROM alphafrog_agent_run
+        WHERE started_at &lt; #{startedBefore}
+          AND status IN ('RECEIVED', 'PLANNING', 'EXECUTING', 'SUMMARIZING', 'WAITING_TOOL_JOB', 'CANCELING')
+        ORDER BY started_at ASC, id ASC
+        LIMIT #{limit}
+    </select>
+
+    <update id="claimStartupRestart">
+        UPDATE alphafrog_agent_run
+        SET status = 'RECEIVED',
+            restart_attempt = restart_attempt + 1,
+            tool_job_anchor_json = '{}'::jsonb,
+            last_error = NULL,
+            completed_at = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status = #{expectedStatus}
+          AND restart_attempt = #{expectedRestartAttempt}
+          AND restart_attempt &lt; #{maxRestartAttempts}
+    </update>
+
+    <update id="completeStartupCancellation">
+        UPDATE alphafrog_agent_run
+        SET status = 'CANCELED',
+            last_error = COALESCE(last_error, 'canceled_during_service_restart'),
+            completed_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status = 'CANCELING'
+    </update>
+
+    <update id="failStartupRecovery">
+        UPDATE alphafrog_agent_run
+        SET status = 'FAILED',
+            last_error = #{lastError},
+            completed_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status = #{expectedStatus}
     </update>
 
     <update id="updateExt">

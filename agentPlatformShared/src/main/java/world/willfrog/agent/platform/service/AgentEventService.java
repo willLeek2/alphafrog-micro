@@ -132,7 +132,7 @@ public class AgentEventService {
                               boolean debugMode,
                               String stageConfigJson) {
         return createRun(userId, message, contextJson, idempotencyKey, modelName, endpointName,
-                captureLlmRequests, provider, plannerCandidateCount, debugMode, stageConfigJson, false);
+                captureLlmRequests, provider, plannerCandidateCount, debugMode, stageConfigJson, false, false);
     }
 
     /**
@@ -150,6 +150,27 @@ public class AgentEventService {
                               int plannerCandidateCount,
                               boolean debugMode,
                               String stageConfigJson,
+                              boolean isAdmin) {
+        return createRun(userId, message, contextJson, idempotencyKey, modelName, endpointName,
+                captureLlmRequests, provider, plannerCandidateCount, debugMode, stageConfigJson,
+                false, isAdmin);
+    }
+
+    /**
+     * 完整创建入口。generateArtifacts 只冻结用户是否请求正式产物，不控制模型内部 rawRef。
+     */
+    public AgentRun createRun(String userId,
+                              String message,
+                              String contextJson,
+                              String idempotencyKey,
+                              String modelName,
+                              String endpointName,
+                              boolean captureLlmRequests,
+                              String provider,
+                              int plannerCandidateCount,
+                              boolean debugMode,
+                              String stageConfigJson,
+                              boolean generateArtifacts,
                               boolean isAdmin) {
         log.info("[AgentEventService] 创建 Run: userId={}, stageConfigJson={}, isAdmin={}", userId, stageConfigJson, isAdmin);
         // 生成无连字符 UUID 作为 runId
@@ -174,6 +195,7 @@ public class AgentEventService {
         ext.put("prompt_selection", promptSelection.toExtMap());
         // 260612-01-02: 落 admin 旁路信号，供 executor / pipeline 防御层使用
         ext.put("is_admin", isAdmin);
+        ext.put("generate_artifacts", generateArtifacts);
         if (stageConfigJson != null && !stageConfigJson.isBlank()) {
             try {
                 // 存储为 JSON 对象而非字符串，便于后续解析
@@ -225,6 +247,8 @@ public class AgentEventService {
         run.setLastError(null);
         run.setTtlExpiresAt(OffsetDateTime.now().plusMinutes(ttlMinutes));
         run.setExt(writeJson(ext));
+        run.setExecutionCheckpointJson("{}");
+        run.setRestartAttempt(0);
         run.setToolJobAnchorJson("{}");
 
         runMapper.insert(run);

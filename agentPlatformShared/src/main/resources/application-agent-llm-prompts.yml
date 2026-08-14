@@ -1,6 +1,5 @@
 # Q-09：Prompt 权威正文只保存在 agentPlatformShared classpath prompts/。
 # 这个 YAML 保留导入位置，但不再手写第二份 Prompt 正文；冷启动由 AgentPromptService
 # 直接加载权威文件，外置 config/prompts 只作为经过一致性校验的部署投影。
-agent:
-  llm:
-    prompts: {}
+# 不声明 agent.llm 或 agent.llm.prompts：AgentLlmProperties 已提供强类型默认对象。
+# 某些外置配置加载器会把 YAML 的空 map 保留为 LinkedHashMap，导致 Spring 无法绑定到强类型配置类。

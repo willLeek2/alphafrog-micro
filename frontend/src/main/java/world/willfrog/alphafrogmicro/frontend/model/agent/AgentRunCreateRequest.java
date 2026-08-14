@@ -14,6 +14,7 @@ public record AgentRunCreateRequest(
         String provider,
         Integer plannerCandidateCount,
         Boolean debugMode,
+        Boolean generateArtifacts,
         @JsonProperty("stage_config_json") String stageConfigJson
 ) {
 }

@@ -12,4 +12,9 @@ public interface LangchainLinearRunPipeline {
     default void launchAsync(AgentRun run, LangchainRunConcurrencyScheduler.Reservation reservation) {
         launchAsync(run);
     }
+
+    /** 复用冻结 Plan 的服务重启入口；实现必须跳过 planner。 */
+    default boolean launchRestartedAsync(AgentRun run) {
+        return false;
+    }
 }

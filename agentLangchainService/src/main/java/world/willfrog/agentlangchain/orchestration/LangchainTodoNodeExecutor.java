@@ -9,6 +9,7 @@ import dev.langchain4j.service.AiServices;
 import dev.langchain4j.service.tool.ToolProvider;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.context.AgentContext;
@@ -189,6 +190,14 @@ public class LangchainTodoNodeExecutor {
      */
     private final world.willfrog.agentlangchain.finance.FinanceResultComposer financeResultComposer;
 
+    /** 工具真正开始前写入恢复安全日志；测试的极简上下文可以不装配。 */
+    @Autowired(required = false)
+    private WorkflowCheckpointService workflowCheckpointService;
+
+    /** Todo 语义重试策略；生产 Spring 上下文装配，历史单元测试可保持为空。 */
+    @Autowired(required = false)
+    private TodoRetryPolicy todoRetryPolicy;
+
 
     /**
      * 执行单个 DAG todo 节点：构建 user message → 启动 LC4j tool loop → 收集结果。
@@ -241,6 +250,16 @@ public class LangchainTodoNodeExecutor {
                                            Map<String, String> datasetRefs,
                                            AtomicInteger toolCalls,
                                            ToolJobResumeContext repairContext) {
+        return executeInternal(request, item, completedTodos, datasetRefs, toolCalls, repairContext, null);
+    }
+
+    private LangchainTodoNodeResult executeInternal(LangchainLinearWorkflowRequest request,
+                                                    TodoItem item,
+                                                    List<LangchainCompletedTodo> completedTodos,
+                                                    Map<String, String> datasetRefs,
+                                                    AtomicInteger toolCalls,
+                                                    ToolJobResumeContext repairContext,
+                                                    TodoRetryContext retryContext) {
         if (item == null) {
             return LangchainTodoNodeResult.failure("todo_item_required");
         }
@@ -255,6 +274,9 @@ public class LangchainTodoNodeExecutor {
                 item.getDescription(),
                 request.getToolSpecifications(),
                 ToolCapabilityPromptRenderer.render(promptService, request.getToolSpecifications()));
+        if (retryContext != null) {
+            userMessage += buildTodoRetryUserMessage(retryContext);
+        }
         boolean pythonRepair = isPythonRepair(repairContext);
         AtomicBoolean acceptedPythonRepairExecution = new AtomicBoolean(false);
         // 仅当前 todo / 当前模型尝试的本地信号：只有本条 execute() 的 tool loop 里真正
@@ -268,6 +290,11 @@ public class LangchainTodoNodeExecutor {
             AgentContext.setPythonRepairContext(new PythonRepairContext(
                     repairContext.getPythonRepairAttempt(),
                     repairContext.getPythonFailedRequestFingerprints()));
+        } else if (retryContext != null && EXECUTE_PYTHON_TOOL.equals(retryContext.toolName())) {
+            // 通用 Todo 重试已经是 executePython 的第二次语义执行。若它再次进入异步 pending，
+            // anchor 必须记住 attempt=1，终态恢复时才能拒绝第三次执行。
+            AgentContext.setPythonRefineAttempt(1);
+            AgentContext.clearPythonRepairContext();
         } else {
             AgentContext.clearPythonRefineAttempt();
             AgentContext.clearPythonRepairContext();
@@ -334,6 +361,35 @@ public class LangchainTodoNodeExecutor {
                 // 转成结构化 suspended 结果而不是失败；LINEAR executor 会停止当前 Todo 循环。
                 return LangchainTodoNodeResult.suspended(pending);
             }
+            TodoToolExecutionException toolFailure = findTodoToolFailure(e);
+            if (toolFailure != null && todoRetryPolicy != null) {
+                TodoRetryPolicy.Decision decision = todoRetryPolicy.evaluate(item.getId(), toolFailure);
+                Map<String, Object> retryMetadata = todoRetryMetadata(decision, false);
+                // retryContext 非空表示当前已经是唯一允许的第二次执行，绝不继续递归。
+                if (retryContext == null && repairContext == null && decision.retry()) {
+                    todoRetryPolicy.recordAttempt(decision);
+                    LangchainTodoNodeResult retried = executeInternal(
+                            request, item, completedTodos, datasetRefs, toolCalls, repairContext,
+                            new TodoRetryContext(
+                                    decision.toolName(), decision.previousArguments(),
+                                    decision.failureCategory(), decision.failureSummary(), decision.safety()));
+                    retried.setTodoRetryAttempts(1);
+                    if (retried.isSuccess()) {
+                        retried.setTodoRetryOutcome("success");
+                    } else {
+                        retried.setTodoRetryOutcome("exhausted");
+                        todoRetryPolicy.recordFailure(decision);
+                        Map<String, Object> exhausted = new LinkedHashMap<>();
+                        if (retried.getFailureMetadata() != null) {
+                            exhausted.putAll(retried.getFailureMetadata());
+                        }
+                        exhausted.putAll(todoRetryMetadata(decision, true));
+                        retried.setFailureMetadata(exhausted);
+                    }
+                    return retried;
+                }
+                return LangchainTodoNodeResult.failure(toolFailure.getMessage(), retryMetadata);
+            }
             // ensureRunnable 抛出的 RUN_INTERRUPTED 异常、tool loop 内的工具异常、LLM 超时等都会在这里捕获，
             // 统一转为失败结果；上层 DagWorkflowExecutor 根据 isSuccess() 决定是否 skip 下游节点
             Map<String, Object> budgetMetadata = extractBudgetFailureMetadata(e);
@@ -346,6 +402,50 @@ public class LangchainTodoNodeExecutor {
             AgentContext.clearPythonRepairContext();
             AgentContext.clearTodoContext();
         }
+    }
+
+    private static String buildTodoRetryUserMessage(TodoRetryContext context) {
+        return "\n\n[TODO_RETRY_CONTEXT]\n"
+                + "这是本 Todo 唯一允许的一次语义重试。请根据失败信息修正工具参数；如果无法安全修正，直接说明失败，不要重复相同调用。\n"
+                + "tool: " + safeRetryText(context.toolName(), 256) + "\n"
+                + "tool_safety: " + context.safety().name() + "\n"
+                + "failure_category: " + safeRetryText(context.failureCategory(), 256) + "\n"
+                + "failure_summary: " + safeRetryText(context.failureSummary(), 2048) + "\n"
+                + "previous_arguments:\n" + safeRetryText(context.previousArguments(), 8192) + "\n";
+    }
+
+    private static String safeRetryText(String value, int maxChars) {
+        if (value == null || value.isBlank()) {
+            return "(unavailable)";
+        }
+        String trimmed = value.trim();
+        return trimmed.length() <= maxChars ? trimmed : trimmed.substring(0, maxChars) + "…";
+    }
+
+    private static Map<String, Object> todoRetryMetadata(TodoRetryPolicy.Decision decision,
+                                                         boolean exhausted) {
+        Map<String, Object> metadata = new LinkedHashMap<>();
+        metadata.put("failure_category", decision.failureCategory());
+        metadata.put("retryable", decision.failureRetryable());
+        metadata.put("todo_retry_allowed", decision.retry());
+        metadata.put("tool_name", decision.toolName());
+        metadata.put("tool_retry_safety", decision.safety().name());
+        metadata.put("todo_retry_attempts", exhausted ? 1 : 0);
+        if (exhausted) {
+            metadata.put("todo_retry_exhausted", true);
+        }
+        return metadata;
+    }
+
+    private static TodoToolExecutionException findTodoToolFailure(Throwable throwable) {
+        Throwable current = throwable;
+        while (current != null) {
+            if (current instanceof TodoToolExecutionException toolFailure) {
+                return toolFailure;
+            }
+            current = current.getCause();
+        }
+        return null;
     }
 
     private boolean isPythonRepair(ToolJobResumeContext context) {
@@ -721,8 +821,13 @@ public class LangchainTodoNodeExecutor {
                     ensureRunnable(request);
                     return maybeInjectLastMileHint(chatRequest);
                 })
-                .beforeToolExecution(ignored -> {
+                .beforeToolExecution(before -> {
                     ensureRunnable(request);
+                    if (workflowCheckpointService != null && before != null && before.request() != null) {
+                        // 数据库安全日志必须先于工具副作用完成；写失败则本次工具不执行。
+                        workflowCheckpointService.markToolStarted(
+                                request.getRunId(), request.getUserId(), before.request().name());
+                    }
                     // 只在实际即将执行工具时才标记，确保工具随后成功/失败/抛异常都不会
                     // 再被空回复恢复逻辑误判为“未执行工具”。
                     currentAttemptToolStarted.set(true);

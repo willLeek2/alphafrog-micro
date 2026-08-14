@@ -219,6 +219,7 @@ public class AgentController {
                             .setPlannerCandidateCount(plannerCandidateCountForRpc)
                             .setDebugMode(debugMode)
                             .setStageConfigJson(stageConfigJson)
+                            .setGenerateArtifacts(Boolean.TRUE.equals(request.generateArtifacts()))
                             .build());
             return ResponseWrapper.success(toRunResponse(run, admin));
         } catch (RpcException e) {

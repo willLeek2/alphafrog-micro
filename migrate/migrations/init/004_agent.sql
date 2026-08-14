@@ -13,7 +13,9 @@ CREATE TABLE IF NOT EXISTS alphafrog_agent_run (
     started_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     completed_at TIMESTAMPTZ,
-    ext JSONB NOT NULL DEFAULT '{}'::jsonb
+    ext JSONB NOT NULL DEFAULT '{}'::jsonb,
+    execution_checkpoint_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    restart_attempt INT NOT NULL DEFAULT 0 CHECK (restart_attempt >= 0)
 );
 
 CREATE TABLE IF NOT EXISTS alphafrog_agent_run_event (

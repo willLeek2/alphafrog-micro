@@ -47,6 +47,15 @@ agent:
       max-tool-calls: ${AF_AGENT_RUN_BUDGET_MAX_TOOL_CALLS:30}
       max-tokens: ${AF_AGENT_RUN_BUDGET_MAX_TOKENS:300000}
       max-http-attempts-per-logical-call: ${AF_AGENT_RUN_BUDGET_MAX_HTTP_ATTEMPTS_PER_LOGICAL_CALL:3}
+  workflow-restart:
+    # 当前只允许单 Agent 实例启用；多实例前必须关闭或升级为有租约的所有权协议。
+    enabled: ${AF_AGENT_WORKFLOW_RESTART_ENABLED:true}
+    max-restart-attempts: ${AF_AGENT_WORKFLOW_MAX_RESTART_ATTEMPTS:1}
+    scan-limit: ${AF_AGENT_WORKFLOW_RESTART_SCAN_LIMIT:100}
+    checkpoint:
+      max-json-chars: ${AF_AGENT_WORKFLOW_CHECKPOINT_MAX_JSON_CHARS:262144}
+      max-output-chars-per-todo: ${AF_AGENT_WORKFLOW_CHECKPOINT_MAX_TODO_OUTPUT_CHARS:32768}
+      max-output-chars-per-run: ${AF_AGENT_WORKFLOW_CHECKPOINT_MAX_RUN_OUTPUT_CHARS:131072}
   langchain:
     run:
       # 这是 LangchainRunExecutorLimitsResolver 实际读取的命名空间。

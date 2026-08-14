@@ -3,6 +3,18 @@
         "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
 <mapper namespace="world.willfrog.agent.platform.mapper.AgentRunDagNodeMapper">
 
+    <update id="clearFrontierForWorkflowRestart">
+        UPDATE alphafrog_agent_run
+        SET dag_frontier_json = '{}'::jsonb,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{runId}
+    </update>
+
+    <delete id="deleteByRunId">
+        DELETE FROM alphafrog_agent_run_dag_node
+        WHERE run_id = #{runId}
+    </delete>
+
     <!-- ==================== Stage 1: 计划写入 ==================== -->
 
     <!-- 1a: CAS 写入 dag_frontier_json，同时推进 status=EXECUTING -->

@@ -30,6 +30,13 @@ public class LangchainTodoNodeResult {
      */
     private String recoveryOutcome;
 
+    /** 与 LC4j HTTP retry、服务重启 restartAttempt 分离的 Todo 语义重试次数。 */
+    @Builder.Default
+    private int todoRetryAttempts = 0;
+
+    /** Todo 重试最终结果：success / exhausted；未尝试时为空。 */
+    private String todoRetryOutcome;
+
     /**
      * 结构化观测数据。empty_todo_output 场景下填充，由 executor 在 {@code try} 块内构造、在 {@code finally} 清 ThreadLocal 之前写入。
      * 链路：LangchainTodoNodeResult → LangchainLinearWorkflowResult → publishFailure event payload

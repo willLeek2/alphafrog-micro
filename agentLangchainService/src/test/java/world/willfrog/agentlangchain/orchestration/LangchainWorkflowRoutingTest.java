@@ -161,4 +161,31 @@ class LangchainWorkflowRoutingTest {
         assertThat(effectiveDag.getExecutionMode()).isEqualTo(PlanExecutionMode.DAG);
         assertThat(LangchainWorkflowRouting.shouldUseDag(effectiveDag)).isTrue();
     }
+
+    @Test
+    void restartRejectsAutoPlanBecauseItsExecutionModeWasNotFrozen() {
+        LangchainTodoPlan plan = LangchainTodoPlan.builder()
+                .executionMode(PlanExecutionMode.AUTO)
+                .items(List.of(TodoItem.builder().id("t1").sequence(1).description("a").build()))
+                .build();
+
+        assertThatThrownBy(() -> LangchainWorkflowRouting.validateFrozenPlan(plan))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("workflow_restart_plan_mode_not_frozen");
+    }
+
+    @Test
+    void restartRejectsLinearPlanThatWouldNeedRenumberingOrDependencyRepair() {
+        LangchainTodoPlan plan = LangchainTodoPlan.builder()
+                .executionMode(PlanExecutionMode.LINEAR)
+                .items(List.of(
+                        TodoItem.builder().id("t2").sequence(2).description("b")
+                                .dependsOn(List.of("t1")).build(),
+                        TodoItem.builder().id("t1").sequence(1).description("a").build()))
+                .build();
+
+        assertThatThrownBy(() -> LangchainWorkflowRouting.validateFrozenPlan(plan))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("workflow_restart_linear_plan_not_canonical");
+    }
 }

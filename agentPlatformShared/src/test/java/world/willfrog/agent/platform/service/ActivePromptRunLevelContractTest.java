@@ -3,6 +3,12 @@ package world.willfrog.agent.platform.service;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.springframework.boot.context.properties.bind.Bindable;
+import org.springframework.boot.context.properties.bind.Binder;
+import org.springframework.boot.env.YamlPropertySourceLoader;
+import org.springframework.core.env.StandardEnvironment;
+import org.springframework.core.io.ClassPathResource;
+import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.util.PromptFileLoader;
 
 import java.io.BufferedReader;
@@ -12,6 +18,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -110,11 +117,29 @@ class ActivePromptRunLevelContractTest {
     void applicationAgentLlmPromptsYml_shouldNotMaintainInlinePromptBodies() {
         String yaml = loadResourceAsString("application-agent-llm-prompts.yml");
         assertFalse(yaml.isBlank(), "application-agent-llm-prompts.yml 必须可加载");
-        assertTrue(yaml.contains("prompts: {}"), "YAML 应只保留空 prompts 投影入口");
+        assertFalse(yaml.contains("prompts: {}"), "YAML 不得用空 Map 覆盖强类型 Prompts 默认对象");
+        assertFalse(yaml.contains("llm: {}"), "YAML 不得用空 Map 覆盖整个 AgentLlmProperties");
         assertTrue(yaml.contains("Prompt 权威正文只保存在"), "YAML 必须说明 Q-09 权威边界");
         assertFalse(yaml.contains("agent-run-system-prompt:"), "YAML 不得手写第二份 Prompt 正文");
         assertFalse(yaml.contains("python-refine-requirements:"), "YAML 不得手写第二份列表正文");
         assertFalse(yaml.contains("dataset-field-specs:"), "YAML 不得手写第二份字段规格");
+    }
+
+    @Test
+    void applicationAgentLlmPromptsYml_shouldKeepStronglyTypedPromptsObjectAfterSpringBinding() throws Exception {
+        StandardEnvironment environment = new StandardEnvironment();
+        var sources = new YamlPropertySourceLoader().load(
+                "agent-llm-prompts", new ClassPathResource("application-agent-llm-prompts.yml"));
+        for (var source : sources) {
+            environment.getPropertySources().addFirst(source);
+        }
+
+        AgentLlmProperties properties = Binder.get(environment)
+                .bindOrCreate("agent.llm", Bindable.of(AgentLlmProperties.class));
+
+        assertNotNull(properties.getPrompts(), "空 YAML 导入不得把强类型 Prompts 默认对象绑定成 null");
+        assertNotNull(properties.getPrompts().getPythonRefineRequirements(),
+                "Prompts 内的默认列表必须保留，不能被空 Map 覆盖");
     }
 
     @ParameterizedTest

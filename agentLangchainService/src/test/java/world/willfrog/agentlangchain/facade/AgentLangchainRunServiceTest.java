@@ -63,14 +63,17 @@ class AgentLangchainRunServiceTest {
         run.setUserId("u1");
         run.setStatus(AgentRunStatus.RECEIVED);
         when(eventService.createRun(anyString(), anyString(), any(), any(), any(), any(),
-                anyBoolean(), any(), anyInt(), anyBoolean(), any(), anyBoolean())).thenReturn(run);
+                anyBoolean(), any(), anyInt(), anyBoolean(), any(), anyBoolean(), anyBoolean())).thenReturn(run);
         CreateAgentRunRequest request = CreateAgentRunRequest.newBuilder()
                 .setUserId("u1")
                 .setMessage("analyze stocks")
+                .setGenerateArtifacts(true)
                 .build();
 
         var message = runService.createRun(request);
         assertEquals("run123", message.getId());
+        verify(eventService).createRun(eq("u1"), eq("analyze stocks"), any(), any(), any(), any(),
+                anyBoolean(), any(), anyInt(), anyBoolean(), any(), eq(true), anyBoolean());
         verify(pipeline).launchAsync(run, reservation);
     }
 
@@ -87,7 +90,7 @@ class AgentLangchainRunServiceTest {
 
         assertThrows(LangchainRunRejectedException.class, () -> runService.createRun(request));
         verify(eventService, never()).createRun(anyString(), anyString(), any(), any(), any(), any(),
-                anyBoolean(), any(), anyInt(), anyBoolean(), any(), anyBoolean());
+                anyBoolean(), any(), anyInt(), anyBoolean(), any(), anyBoolean(), anyBoolean());
         verify(pipeline, never()).launchAsync(any(), any());
     }
 

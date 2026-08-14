@@ -281,8 +281,11 @@ class AgentEventServiceTest {
         verify(runMapper).insert(runCaptor.capture());
         AgentRun captured = runCaptor.getValue();
         assertEquals("{}", captured.getToolJobAnchorJson());
+        assertEquals("{}", captured.getExecutionCheckpointJson());
+        assertEquals(0, captured.getRestartAttempt());
         Map<?, ?> ext = objectMapper.readValue(captured.getExt(), Map.class);
         assertEquals("DAG", ext.get("execution_mode"));
+        assertEquals(false, ext.get("generate_artifacts"));
         Map<?, ?> promptSelection = (Map<?, ?>) ext.get("prompt_selection");
         assertEquals("default-v1", promptSelection.get("bundle_version"));
         assertEquals("control", promptSelection.get("variant"));
@@ -313,6 +316,22 @@ class AgentEventServiceTest {
         Map<?, ?> ext = objectMapper.readValue(runCaptor.getValue().getExt(), Map.class);
         assertEquals("AUTO", ext.get("execution_mode"));
         assertFalse(ext.containsKey("data_freshness"));
+    }
+
+    @Test
+    void createRun_shouldFreezeExplicitArtifactRequestInExt() throws Exception {
+        when(redisTemplate.opsForValue()).thenReturn(valueOperations);
+        when(valueOperations.increment(anyString())).thenReturn(1L);
+        when(eventMapper.insert(any())).thenReturn(1);
+        when(runMapper.findByIdAndUser(anyString(), anyString())).thenReturn(run("r-artifact", "u-artifact"));
+
+        service.createRun("u-artifact", "hello", "{}", "idem", "m", "e",
+                false, "openrouter", 2, false, "{}", true, false);
+
+        ArgumentCaptor<AgentRun> runCaptor = ArgumentCaptor.forClass(AgentRun.class);
+        verify(runMapper).insert(runCaptor.capture());
+        Map<?, ?> ext = objectMapper.readValue(runCaptor.getValue().getExt(), Map.class);
+        assertEquals(true, ext.get("generate_artifacts"));
     }
 
     private AgentRun run(String runId, String userId) {

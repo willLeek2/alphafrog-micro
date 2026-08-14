@@ -31,6 +31,13 @@ public class AgentRun {
     private OffsetDateTime completedAt;
     private String ext; // JSON string
     /**
+     * 工作流级粗粒度恢复检查点。它只描述冻结 Plan 的执行边界，不保存长工具任务身份，
+     * 因此不能与 {@link #toolJobAnchorJson} 混用。
+     */
+    private String executionCheckpointJson;
+    /** 服务重启后自动重新执行的次数；与 LLM HTTP retry、Todo retry 分开计数。 */
+    private Integer restartAttempt;
+    /**
      * 外部长工具的 durable anchor JSON。
      * 包含 operation/toolCall/attempt 身份、todo 坐标、已完成结果、dataset snapshot、工具预算、
      * terminal envelope、resume token/state/lease version；进程重启后仅凭数据库即可重建恢复流程。

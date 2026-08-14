@@ -42,6 +42,35 @@ public interface AgentRunMapper {
                        @Param("userId") String userId,
                        @Param("planJson") String planJson);
 
+    int updateExecutionCheckpoint(@Param("id") String id,
+                                  @Param("userId") String userId,
+                                  @Param("executionCheckpointJson") String executionCheckpointJson);
+
+    /**
+     * 列出服务启动前遗留、可能需要恢复的 Run。调用者必须再逐条校验 Plan/checkpoint，
+     * 本查询只负责有界发现，不把人工暂停 WAITING 或终态带入恢复链。
+     */
+    List<AgentRun> listStartupRecoveryCandidates(
+            @Param("startedBefore") OffsetDateTime startedBefore,
+            @Param("limit") int limit);
+
+    /**
+     * 单实例启动扫描的窄 CAS：状态和 restartAttempt 同时匹配才取得本次恢复权。
+     * 当前不提供多实例租约；多实例部署必须关闭启动恢复或升级所有权协议。
+     */
+    int claimStartupRestart(@Param("id") String id,
+                            @Param("expectedStatus") AgentRunStatus expectedStatus,
+                            @Param("expectedRestartAttempt") int expectedRestartAttempt,
+                            @Param("maxRestartAttempts") int maxRestartAttempts);
+
+    /** CANCELING 遗留记录只收口到 CANCELED，不重新进入执行器。 */
+    int completeStartupCancellation(@Param("id") String id);
+
+    /** 校验失败或达到自动重启上限时，按当前状态原子写成可见失败。 */
+    int failStartupRecovery(@Param("id") String id,
+                            @Param("expectedStatus") AgentRunStatus expectedStatus,
+                            @Param("lastError") String lastError);
+
     int updateExt(@Param("id") String id,
                   @Param("userId") String userId,
                   @Param("ext") String ext);

@@ -69,6 +69,7 @@ public class AgentLangchainRunService {
                     request.getPlannerCandidateCount(),
                     request.getDebugMode(),
                     request.getStageConfigJson(),
+                    request.getGenerateArtifacts(),
                     isAdminUser(userId)
             );
 

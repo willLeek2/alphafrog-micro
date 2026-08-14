@@ -491,7 +491,8 @@ public class LangchainDagWorkflowExecutor {
                 ));
                 emitEventBestEffort(runId, userId, "TODO_NODE_COMPLETED", todoNodeResultPayload(
                         item, true, record.getSummary(), durationMs, record.getToolCallsUsed(),
-                        null, null, record.isRecovered(), record.getRecoveryOutcome()));
+                        null, todoRetryEventMetadata(record),
+                        record.isRecovered(), record.getRecoveryOutcome()));
             } else {
                 long durationMs = System.currentTimeMillis() - nodeStartMs;
                 // 失败：状态记录和事件通知，下游节点会因 nodeSuccess=false 而被跳过
@@ -1204,14 +1205,29 @@ public class LangchainDagWorkflowExecutor {
             }
         }
         if (failureMetadata != null && !failureMetadata.isEmpty()) {
+            if (failureMetadata.containsKey("todo_retry_attempts")) {
+                payload.put("todo_retry_attempts", failureMetadata.get("todo_retry_attempts"));
+                if (failureMetadata.get("todo_retry_outcome") != null) {
+                    payload.put("todo_retry_outcome", failureMetadata.get("todo_retry_outcome"));
+                }
+            }
             // Phase 3.2 A3: failureMetadata 按语义路由到 budget_failure / empty_output_observation / failure_metadata，
             // 避免 budget failure 被误挂 empty_output_observation。
             String field = LangchainTodoNodeResult.routeFailureMetadataField(failureMetadata);
-            if (field != null) {
+            if (field != null && !success) {
                 payload.put(field, failureMetadata);
             }
         }
         return payload;
+    }
+
+    private Map<String, Object> todoRetryEventMetadata(LangchainTodoNodeResult result) {
+        if (result == null || result.getTodoRetryAttempts() <= 0) {
+            return null;
+        }
+        return Map.of(
+                "todo_retry_attempts", result.getTodoRetryAttempts(),
+                "todo_retry_outcome", nvl(result.getTodoRetryOutcome(), "success"));
     }
 
     /**

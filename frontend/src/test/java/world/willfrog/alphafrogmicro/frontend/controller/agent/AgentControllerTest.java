@@ -114,11 +114,27 @@ class AgentControllerTest {
 
         var response = controller.create(authentication,
                 new AgentRunCreateRequest("hello", null, null, null,
-                        null, null, null, null, null, null, null));
+                        null, null, null, null, null, null, null, null));
 
         assertEquals(ResponseCode.SUCCESS.getCode(), response.getCode());
         assertEquals("/api/agent/runs/run-new/stream", response.getData().streamUrl());
         verify(creditGateway, never()).hasPositiveRemainingCredit(any());
+    }
+
+    @Test
+    void create_shouldPropagateExplicitArtifactRequestToAgentService() {
+        when(authService.isUserActive(any(User.class))).thenReturn(true);
+        when(agentDubboService.createRun(any())).thenReturn(
+                AgentRunMessage.newBuilder().setId("run-artifact").setStatus("RUN_RECEIVED").build());
+
+        controller.create(authentication,
+                new AgentRunCreateRequest("hello", null, null, null,
+                        null, null, null, null, null, null, true, null));
+
+        ArgumentCaptor<world.willfrog.alphafrogmicro.agent.idl.CreateAgentRunRequest> captor =
+                ArgumentCaptor.forClass(world.willfrog.alphafrogmicro.agent.idl.CreateAgentRunRequest.class);
+        verify(agentDubboService).createRun(captor.capture());
+        assertTrue(captor.getValue().getGenerateArtifacts());
     }
 
     @Test
@@ -127,7 +143,7 @@ class AgentControllerTest {
 
         var response = controller.create(authentication,
                 new AgentRunCreateRequest("hello", null, null, null,
-                        null, null, null, null, null, null, null));
+                        null, null, null, null, null, null, null, null));
 
         assertEquals(ResponseCode.FORBIDDEN.getCode(), response.getCode());
         verify(creditGateway, never()).hasPositiveRemainingCredit(any());
@@ -148,7 +164,7 @@ class AgentControllerTest {
 
         var response = controller.create(authentication,
                 new AgentRunCreateRequest("hello", null, null, null,
-                        null, null, null, null, null, null, null));
+                        null, null, null, null, null, null, null, null));
 
         assertEquals(ResponseCode.SUCCESS.getCode(), response.getCode());
         verify(agentDubboService).createRun(any());
@@ -166,7 +182,7 @@ class AgentControllerTest {
 
         var response = controller.create(authentication,
                 new AgentRunCreateRequest("hello", null, null, null,
-                        null, null, null, null, null, null, null));
+                        null, null, null, null, null, null, null, null));
 
         assertEquals(ResponseCode.FORBIDDEN.getCode(), response.getCode());
         verify(agentDubboService, never()).createRun(any());

@@ -322,7 +322,7 @@ CREATE TABLE IF NOT EXISTS alphafrog_strategy_nav (
 CREATE TABLE IF NOT EXISTS alphafrog_agent_run (
     id VARCHAR(64) PRIMARY KEY,
     user_id VARCHAR(64) NOT NULL,
-    status VARCHAR(32) NOT NULL DEFAULT 'RECEIVED' CHECK (status IN ('RECEIVED', 'PLANNING', 'EXECUTING', 'WAITING', 'SUMMARIZING', 'COMPLETED', 'FAILED', 'CANCELED', 'EXPIRED')),
+    status VARCHAR(32) NOT NULL DEFAULT 'RECEIVED' CHECK (status IN ('RECEIVED', 'PLANNING', 'EXECUTING', 'WAITING', 'WAITING_TOOL_JOB', 'SUMMARIZING', 'COMPLETED', 'PARTIAL', 'FAILED', 'CANCELING', 'CANCELED', 'EXPIRED')),
     current_step INT NOT NULL DEFAULT 0,
     max_steps INT NOT NULL DEFAULT 12,
     plan_json JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -332,7 +332,10 @@ CREATE TABLE IF NOT EXISTS alphafrog_agent_run (
     started_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     completed_at TIMESTAMPTZ,
-    ext JSONB NOT NULL DEFAULT '{}'::jsonb
+    ext JSONB NOT NULL DEFAULT '{}'::jsonb,
+    execution_checkpoint_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    restart_attempt INT NOT NULL DEFAULT 0 CHECK (restart_attempt >= 0),
+    tool_job_anchor_json JSONB NOT NULL DEFAULT '{}'::jsonb
 );
 
 CREATE TABLE IF NOT EXISTS alphafrog_agent_run_event (

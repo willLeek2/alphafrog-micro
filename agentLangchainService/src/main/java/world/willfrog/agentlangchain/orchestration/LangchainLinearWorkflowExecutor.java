@@ -48,8 +48,9 @@ import java.util.stream.Collectors;
 @Service
 public class LangchainLinearWorkflowExecutor {
 
-    private static final int DEFAULT_MAX_PYTHON_ATTEMPTS = 3;
-    private static final int MAX_PYTHON_ATTEMPTS = 10;
+    // Python 初次执行加一次语义修正，总共最多两次；不能与 HTTP retry 或 restartAttempt 混用。
+    private static final int DEFAULT_MAX_PYTHON_ATTEMPTS = 2;
+    private static final int MAX_PYTHON_ATTEMPTS = 2;
 
     private final LangchainTodoNodeExecutor todoNodeExecutor;
     private final LangchainRunExecutionGuard executionGuard;
@@ -57,7 +58,11 @@ public class LangchainLinearWorkflowExecutor {
     private final CodeRefineLocalConfigLoader codeRefineConfigLoader;
     private final CodeRefineProperties startupCodeRefineProperties;
 
-    private static final Set<String> REPAIRABLE_PYTHON_EXIT_REASONS = Set.of("NON_ZERO_EXIT");
+    /**
+     * 工作流级 Todo 边界 checkpoint。测试或极简上下文可以不装配；生产 Spring 上下文必须存在。
+     */
+    @Autowired(required = false)
+    private WorkflowCheckpointService workflowCheckpointService;
 
     /**
      * 生产构造器显式选择五个依赖，避免存在测试便利构造器时 Spring 猜错构造器。
@@ -90,7 +95,7 @@ public class LangchainLinearWorkflowExecutor {
         try {
             applyRunContext(request);
             plan = LangchainWorkflowRouting.effectivePlan(plan, true);
-            return executePlanned(request, plan, toolCalls, null, null);
+            return executePlanned(request, plan, toolCalls, null, null, null);
         } catch (Exception e) {
             return LangchainLinearWorkflowResult.builder()
                     .success(false)
@@ -128,7 +133,7 @@ public class LangchainLinearWorkflowExecutor {
             // 新 worker 需要重新建立 AgentContext，旧线程已经在 finally 中清理。
             applyRunContext(request);
             // 传入原计划与恢复上下文，执行器会跳过已完成前缀。
-            return executePlanned(request, plan, toolCalls, context, terminalConsumed);
+            return executePlanned(request, plan, toolCalls, context, terminalConsumed, null);
         } catch (Exception e) {
             // 把恢复异常转换为普通 workflow result，由 pipeline 统一持久化。
             return LangchainLinearWorkflowResult.builder()
@@ -143,19 +148,49 @@ public class LangchainLinearWorkflowExecutor {
         }
     }
 
+    /**
+     * 服务重启后的 LINEAR 执行：复用冻结 Plan 和已完成前缀，从 checkpoint 指向的 Todo 开头重跑。
+     * 这不是 ToolJob handoff，不设置 resume token，也不尝试接管崩溃前的 Sandbox 任务。
+     */
+    public LangchainLinearWorkflowResult restartPlanned(LangchainLinearWorkflowRequest request,
+                                                        LangchainTodoPlan plan,
+                                                        WorkflowExecutionCheckpoint checkpoint) {
+        validate(request);
+        if (plan == null || checkpoint == null) {
+            throw new IllegalArgumentException("restart_plan_and_checkpoint_required");
+        }
+        AtomicInteger toolCalls = new AtomicInteger(Math.max(0, checkpoint.getToolCallsUsed()));
+        try {
+            applyRunContext(request);
+            return executePlanned(request, plan, toolCalls, null, null, checkpoint);
+        } catch (Exception e) {
+            return LangchainLinearWorkflowResult.builder()
+                    .success(false)
+                    .failureReason(e.getMessage())
+                    .plan(plan)
+                    .toolCallsUsed(toolCalls.get())
+                    .build();
+        } finally {
+            AgentContext.clear();
+        }
+    }
+
     private LangchainLinearWorkflowResult executePlanned(LangchainLinearWorkflowRequest request,
                                                          LangchainTodoPlan plan,
                                                          AtomicInteger toolCalls,
                                                          ToolJobResumeContext resumeContext,
-                                                         BooleanSupplier terminalConsumed) {
+                                                         BooleanSupplier terminalConsumed,
+                                                         WorkflowExecutionCheckpoint restartCheckpoint) {
         // 恢复和首次执行共享本方法；resumeContext 为 null 表示首次执行。
         AgentContext.setWorkflow("linear");
         // extractedEntities 来自原 plan，不重新运行 planning LLM。
         AgentContext.setExtractedEntities(plan.getExtractedEntities());
         // 首次执行从空列表开始；恢复执行从 anchor 还原已完成前缀。
-        List<LangchainCompletedTodo> completedTodos = resumeContext == null
-                ? new ArrayList<>()
-                : restoreCompletedTodos(resumeContext.getCompletedTodos());
+        List<LangchainCompletedTodo> completedTodos = resumeContext != null
+                ? restoreCompletedTodos(resumeContext.getCompletedTodos())
+                : restartCheckpoint != null
+                        ? restoreCompletedTodos(restartCheckpoint.getCompletedTodos())
+                        : new ArrayList<>();
         // datasetRefs 是当前 worker 的堆内映射，必须从已完成输出重新注册。
         Map<String, String> datasetRefs = LangchainTodoUserMessageBuilder.newDatasetRefMap();
         completedTodos.forEach(todo -> DatasetRefRegistry.registerFromJson(todo.displayOutput(), datasetRefs));
@@ -175,22 +210,34 @@ public class LangchainLinearWorkflowExecutor {
         // FINAL_TODO_ID 表示所有 Todo 已完成，本轮只需要生成最终答案。
         boolean resumeAtFinal = handoffAccepted
                 && ToolJobResumeContext.FINAL_TODO_ID.equals(resumeContext.getTodoId());
-        // 未消费终态时找到原挂起 Todo，稍后把终态输出注入该节点。
-        TodoItem suspendedItem = resumeContext == null || resumeAtFinal ? null : plan.getItems().stream()
-                .filter(item -> java.util.Objects.equals(item.getId(), resumeContext.getTodoId()))
+        boolean restartAtFinal = restartCheckpoint != null
+                && WorkflowExecutionCheckpoint.FINAL_TODO_ID.equals(restartCheckpoint.getNextTodoId());
+        String boundaryTodoId = resumeContext != null
+                ? resumeContext.getTodoId()
+                : restartCheckpoint == null ? null : restartCheckpoint.getNextTodoId();
+        // ToolJob resume 找原挂起 Todo；服务重启找 checkpoint 指向的下一 Todo。
+        TodoItem suspendedItem = (resumeContext == null && restartCheckpoint == null)
+                || resumeAtFinal || restartAtFinal ? null : plan.getItems().stream()
+                .filter(item -> java.util.Objects.equals(item.getId(), boundaryTodoId))
                 .findFirst()
                 .orElse(null);
         // checkpoint 指向原 plan 中不存在的节点说明上下文损坏，必须 fail-closed。
-        if (resumeContext != null && suspendedItem == null && !resumeAtFinal) {
-            return failure(plan, completedTodos, "resume_todo_not_in_plan", toolCalls.get(), null);
+        if ((resumeContext != null || restartCheckpoint != null)
+                && suspendedItem == null && !resumeAtFinal && !restartAtFinal) {
+            return failure(plan, completedTodos,
+                    resumeContext != null ? "resume_todo_not_in_plan" : "restart_todo_not_in_plan",
+                    toolCalls.get(), null);
         }
         // resumeSequence 是恢复前缀的严格边界；最终回答哨兵放在所有 Todo 之后。
-        int resumeSequence = resumeAtFinal ? Integer.MAX_VALUE : suspendedItem == null
+        int resumeSequence = (resumeAtFinal || restartAtFinal) ? Integer.MAX_VALUE : suspendedItem == null
                 ? Integer.MIN_VALUE : suspendedItem.getSequence();
         // 已完成快照不能包含挂起节点或其后节点，否则说明 checkpoint 顺序自相矛盾。
-        if (resumeContext != null && completedTodos.stream()
+        if ((resumeContext != null || restartCheckpoint != null) && completedTodos.stream()
                 .anyMatch(todo -> todo.getSequence() >= resumeSequence)) {
-            return failure(plan, completedTodos, "resume_completed_todo_out_of_order",
+            return failure(plan, completedTodos,
+                    resumeContext != null
+                            ? "resume_completed_todo_out_of_order"
+                            : "restart_completed_todo_out_of_order",
                     toolCalls.get(), null);
         }
         // 已消费的失败终态不允许继续后续 Todo，直接恢复为确定性失败。
@@ -210,11 +257,12 @@ public class LangchainLinearWorkflowExecutor {
                     && java.util.Objects.equals(item.getId(), resumeContext.getTodoId())
                     ? resumeContext : null;
             // 已完成节点已经在 completedTodos 中恢复，绝不重复执行。
-            if (resumeContext != null && completedIds.contains(item.getId())) {
+            if ((resumeContext != null || restartCheckpoint != null) && completedIds.contains(item.getId())) {
                 continue;
             }
             // 对旧格式 checkpoint，sequence 边界提供第二层跳过保护。
-            if (resumeContext != null && item.getSequence() < resumeSequence) {
+            if ((resumeContext != null || restartCheckpoint != null)
+                    && item.getSequence() < resumeSequence) {
                 continue;
             }
             // 只有尚未消费终态且正好到原挂起节点时，执行结果注入分支。
@@ -285,6 +333,7 @@ public class LangchainLinearWorkflowExecutor {
                             .output(injectedOutput)
                             .summary("external_tool_result")
                             .build());
+                    persistWorkflowCheckpoint(request, plan, completedTodos, toolCalls.get());
                     emitTodoNodeEvent(request.getRunId(), request.getUserId(),
                             "TODO_NODE_COMPLETED", item, null,
                             System.currentTimeMillis() - nodeStartMs, null, false, null);
@@ -360,7 +409,8 @@ public class LangchainLinearWorkflowExecutor {
             }
             emitTodoNodeEvent(request.getRunId(), request.getUserId(),
                     "TODO_NODE_COMPLETED", item, null, nodeDurationMs,
-                    null, nodeResult.isRecovered(), nodeResult.getRecoveryOutcome());
+                    todoRetryEventMetadata(nodeResult),
+                    nodeResult.isRecovered(), nodeResult.getRecoveryOutcome());
             String trimmed = nodeResult.getOutput();
             DatasetRefRegistry.registerFromJson(trimmed, datasetRefs);
             completedTodos.add(LangchainCompletedTodo.builder()
@@ -370,6 +420,8 @@ public class LangchainLinearWorkflowExecutor {
                     .output(trimmed)
                     .summary(nodeResult.getSummary())
                     .build());
+            // checkpoint 写成功后才进入下一 Todo；写失败会被外层转换为明确 workflow failure。
+            persistWorkflowCheckpoint(request, plan, completedTodos, toolCalls.get());
         }
 
         Optional<String> stopBeforeAnswer = executionGuard.stopReason(request.getRunId(), request.getUserId());
@@ -390,6 +442,17 @@ public class LangchainLinearWorkflowExecutor {
                 .completedTodos(completedTodos)
                 .toolCallsUsed(toolCalls.get())
                 .build();
+    }
+
+    private void persistWorkflowCheckpoint(LangchainLinearWorkflowRequest request,
+                                           LangchainTodoPlan plan,
+                                           List<LangchainCompletedTodo> completedTodos,
+                                           int toolCallsUsed) {
+        if (workflowCheckpointService == null) {
+            return;
+        }
+        workflowCheckpointService.persistLinearProgress(
+                request.getRunId(), request.getUserId(), plan, completedTodos, toolCallsUsed);
     }
 
     private void prepareAcceptedHandoff(ToolJobResumeContext context,
@@ -467,9 +530,8 @@ public class LangchainLinearWorkflowExecutor {
         return context != null
                 && !context.isTerminalSuccess()
                 && "FAILED".equals(context.getTerminalStatus())
-                && Boolean.FALSE.equals(context.getTerminalRetryable())
-                && REPAIRABLE_PYTHON_EXIT_REASONS.contains(
-                        nvl(context.getTerminalExitReason(), "").toUpperCase(java.util.Locale.ROOT))
+                // 终态提供方必须明确声明可重试；未知或 false 一律不重放 Sandbox。
+                && Boolean.TRUE.equals(context.getTerminalRetryable())
                 && context.getPythonFailedRequestFingerprints() != null
                 && !context.getPythonFailedRequestFingerprints().isEmpty();
     }
@@ -747,8 +809,14 @@ public class LangchainLinearWorkflowExecutor {
         // 让压测报告 / dashboard 能直接消费，不必回 trace 翻。
         // Phase 3.2 A3: budget metadata 不再误挂 empty_output_observation，避免 budget failure 被误归类为 empty_todo_output。
         if (failureMetadata != null && !failureMetadata.isEmpty()) {
+            if (failureMetadata.containsKey("todo_retry_attempts")) {
+                payload.put("todo_retry_attempts", failureMetadata.get("todo_retry_attempts"));
+                if (failureMetadata.get("todo_retry_outcome") != null) {
+                    payload.put("todo_retry_outcome", failureMetadata.get("todo_retry_outcome"));
+                }
+            }
             String field = LangchainTodoNodeResult.routeFailureMetadataField(failureMetadata);
-            if (field != null) {
+            if (field != null && "TODO_NODE_FAILED".equals(eventType)) {
                 payload.put(field, failureMetadata);
             }
         }
@@ -757,5 +825,14 @@ public class LangchainLinearWorkflowExecutor {
         } catch (Exception e) {
             // 事件失败不影响节点执行
         }
+    }
+
+    private Map<String, Object> todoRetryEventMetadata(LangchainTodoNodeResult result) {
+        if (result == null || result.getTodoRetryAttempts() <= 0) {
+            return null;
+        }
+        return Map.of(
+                "todo_retry_attempts", result.getTodoRetryAttempts(),
+                "todo_retry_outcome", nvl(result.getTodoRetryOutcome(), "success"));
     }
 }

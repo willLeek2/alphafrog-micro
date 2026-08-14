@@ -1,5 +1,9 @@
 package world.willfrog.agentlangchain.orchestration;
 
+import dev.langchain4j.agent.tool.ToolExecutionRequest;
+import dev.langchain4j.data.message.UserMessage;
+import dev.langchain4j.invocation.InvocationContext;
+import dev.langchain4j.service.tool.ToolErrorContext;
 import org.junit.jupiter.api.Test;
 import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingException;
 
@@ -33,12 +37,28 @@ class LangchainTerminalToolErrorHandlerTest {
     }
 
     @Test
-    void handle_shouldReturnRecoverableToolErrorText() {
-        var result = LangchainTerminalToolErrorHandler.handle(
-                new IllegalArgumentException("invalid parameter"),
-                null);
+    void handle_shouldEscalateOrdinaryToolErrorToTodoBoundaryWithRequestContext() {
+        ToolExecutionRequest request = ToolExecutionRequest.builder()
+                .id("call-1")
+                .name("searchWeb")
+                .arguments("{\"query\":\"alpha\"}")
+                .build();
+        ToolErrorContext context = ToolErrorContext.builder()
+                .toolExecutionRequest(request)
+                .invocationContext(InvocationContext.builder()
+                        .userMessage(UserMessage.from("test"))
+                        .timestampNow()
+                        .build())
+                .build();
 
-        assertEquals("invalid parameter", result.text());
+        TodoToolExecutionException thrown = assertThrows(
+                TodoToolExecutionException.class,
+                () -> LangchainTerminalToolErrorHandler.handle(
+                        new IllegalArgumentException("invalid parameter"), context));
+
+        assertEquals("invalid parameter", thrown.getMessage());
+        assertEquals("searchWeb", thrown.getToolName());
+        assertEquals("{\"query\":\"alpha\"}", thrown.getToolArguments());
     }
 
     @Test
