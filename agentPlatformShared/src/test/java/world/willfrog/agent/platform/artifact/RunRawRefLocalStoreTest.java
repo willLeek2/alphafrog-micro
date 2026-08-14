@@ -367,6 +367,23 @@ class RunRawRefLocalStoreTest {
     }
 
     @Test
+    void startupSweep_shouldDeleteExpiredEntryFileButKeepLiveSibling() {
+        // reviewer 追加要求：同一 Run 一个过期、一个仍有效时，启动清扫必须删掉
+        // 过期条目的内容文件（不能只摘索引条目），且有效引用仍可读。
+        RunRawRefLocalStore store = newStore();
+        String live = store.register("run_mix", "user_1", "d", "live", 3600, true);
+        String dead = store.register("run_mix", "user_1", "d", "dead", 1, true);
+        Path deadFile = root.resolve("run_mix").resolve(dead + ".txt");
+        ageEntryToPast(store, dead);
+
+        store.sweepAtStartup();
+
+        assertFalse(Files.exists(deadFile), "过期条目文件必须被启动清扫删除");
+        assertEquals("live", store.read("run_mix", "user_1", live), "同 Run 有效引用必须仍可读");
+        assertFalse(store.belongsToRun("run_mix", dead), "过期条目必须从索引摘除");
+    }
+
+    @Test
     void startupSweep_shouldDeleteOnlySymlinkNotTarget() throws Exception {
         RunRawRefLocalStore first = newStore();
         first.register("run_live", "user_1", "d", "live", 3600, true);

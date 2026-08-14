@@ -14,6 +14,7 @@ import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -87,25 +88,39 @@ public class RunRawRefLocalStore {
     @PostConstruct
     void sweepAtStartup() {
         ensureIndexLoaded();
-        long now = System.currentTimeMillis();
-        entries.entrySet().removeIf(e -> isExpired(e.getValue(), now));
-        try {
-            if (!Files.isDirectory(rootDir)) {
-                return;
+        synchronized (this) {
+            long now = System.currentTimeMillis();
+            List<Entry> expired = new ArrayList<>();
+            entries.entrySet().removeIf(e -> {
+                if (isExpired(e.getValue(), now)) {
+                    expired.add(e.getValue());
+                    return true;
+                }
+                return false;
+            });
+            // TTL 清理合同：过期条目必须连同内容文件一起删除，不能只摘索引
+            // 条目（否则同 Run 仍有有效 ref 时过期文件会一直留到 Run 终态）。
+            for (Entry entry : expired) {
+                deleteQuietly(entry.path());
             }
-            try (DirectoryStream<Path> dirs = Files.newDirectoryStream(rootDir, Files::isDirectory)) {
-                for (Path runDir : dirs) {
-                    boolean stillReferenced = entries.values().stream()
-                            .anyMatch(entry -> runDir.equals(entry.runDir()));
-                    if (!stillReferenced) {
-                        deleteRecursively(runDir);
+            try {
+                if (!Files.isDirectory(rootDir)) {
+                    return;
+                }
+                try (DirectoryStream<Path> dirs = Files.newDirectoryStream(rootDir, Files::isDirectory)) {
+                    for (Path runDir : dirs) {
+                        boolean stillReferenced = entries.values().stream()
+                                .anyMatch(entry -> runDir.equals(entry.runDir()));
+                        if (!stillReferenced) {
+                            deleteRecursively(runDir);
+                        }
                     }
                 }
+            } catch (IOException e) {
+                log.warn("rawRef startup sweep failed: {}", e.getMessage());
             }
-        } catch (IOException e) {
-            log.warn("rawRef startup sweep failed: {}", e.getMessage());
+            persistIndexQuietly();
         }
-        persistIndexQuietly();
     }
 
     /**
@@ -267,7 +282,12 @@ public class RunRawRefLocalStore {
         return now > entry.createdAtMillis() + entry.ttlSeconds() * 1000L;
     }
 
-    private void evict(Entry entry) {
+    /**
+     * review fix（并发耐久性）：evict 必须与注册/清理同锁串行化——条目摘除与
+     * 索引快照原子替换之间若有其他线程注册新 ref，两次临时索引 rename 顺序
+     * 可能反转，较旧快照覆盖较新快照，导致"注册已成功但重启后新 ref 消失"。
+     */
+    private synchronized void evict(Entry entry) {
         entries.remove(new Key(entry.runId(), entry.ref()));
         deleteQuietly(entry.path());
         persistIndexQuietly();
@@ -341,8 +361,11 @@ public class RunRawRefLocalStore {
     /**
      * 索引落盘（throwing 版）：注册路径用——索引是重启后恢复引用的唯一依据，
      * 写失败必须让注册显式失败并回滚，绝不静默放行。
+     *
+     * <p>两个 persist 方法自身都持 this 锁（与注册/清理/驱逐/清扫的可重入锁
+     * 同一把）：entries 快照读取与原子替换绝不允许与任何条目变更并发交错。</p>
      */
-    private void persistIndex() {
+    private synchronized void persistIndex() {
         try {
             writeIndexAtomic();
         } catch (IOException e) {
@@ -353,7 +376,7 @@ public class RunRawRefLocalStore {
 
     /** 索引落盘（尽力而为版）：清理/驱逐路径用，失败只告警（TTL 与重启加载的
      * 过期过滤兜底，最坏情况是重启后残留条目因文件缺失而 fail-closed）。 */
-    private void persistIndexQuietly() {
+    private synchronized void persistIndexQuietly() {
         try {
             writeIndexAtomic();
         } catch (IOException e) {
