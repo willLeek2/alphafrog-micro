@@ -26,6 +26,11 @@ public class LangchainArtifactFacadeService {
 
     public ListAgentArtifactsResponse listArtifacts(ListAgentArtifactsRequest request) {
         AgentRun run = readService.requireReadableRun(request.getId(), request.getUserId());
+        if (!generateArtifactsRequested(run)) {
+            // 260814 scheduler-03: artifact 默认关闭。未请求的 Run 查询 artifact
+            // 列表返回空列表，且不触发 AgentArtifactService 的惰性注册。
+            return ListAgentArtifactsResponse.newBuilder().build();
+        }
         return ListAgentArtifactsResponse.newBuilder()
                 .addAllItems(artifactService.listArtifacts(run, request.getIsAdmin()))
                 .build();
@@ -34,6 +39,7 @@ public class LangchainArtifactFacadeService {
     public DownloadAgentArtifactResponse downloadArtifact(DownloadAgentArtifactRequest request) {
         String runId = artifactService.extractRunId(request.getArtifactId());
         AgentRun run = readService.requireReadableRun(runId, request.getUserId());
+        requireArtifactsEnabled(run);
         AgentArtifactService.ArtifactContent artifact = artifactService.loadArtifact(
                 run,
                 request.getIsAdmin(),
@@ -49,6 +55,7 @@ public class LangchainArtifactFacadeService {
     public AgentArtifactPartsMetaMessage getArtifactPartsMeta(GetAgentArtifactPartsRequest request) {
         String runId = artifactService.extractRunId(request.getArtifactId());
         AgentRun run = readService.requireReadableRun(runId, request.getUserId());
+        requireArtifactsEnabled(run);
         AgentArtifactService.ArtifactContent artifact = artifactService.loadArtifactForParts(
                 run,
                 request.getIsAdmin(),
@@ -73,6 +80,7 @@ public class LangchainArtifactFacadeService {
     public AgentArtifactPartMessage getArtifactPart(GetAgentArtifactPartRequest request) {
         String runId = artifactService.extractRunId(request.getArtifactId());
         AgentRun run = readService.requireReadableRun(runId, request.getUserId());
+        requireArtifactsEnabled(run);
         AgentArtifactService.ArtifactContent artifact = artifactService.loadArtifactForParts(
                 run,
                 request.getIsAdmin(),
@@ -96,6 +104,33 @@ public class LangchainArtifactFacadeService {
                 .setContent(ByteString.copyFrom(content))
                 .setCompression(nvl(meta.getCompression()))
                 .build();
+    }
+
+    /**
+     * 260814 scheduler-03: artifact 是显式按请求开启的能力。创建 Run 时由
+     * task #118 把请求字段冻结进 ext.generate_artifacts（缺失/无法解析按
+     * false）。未开启的 Run 不得产生或暴露任何 artifact。
+     */
+    private void requireArtifactsEnabled(AgentRun run) {
+        if (!generateArtifactsRequested(run)) {
+            throw new IllegalArgumentException("artifact not found");
+        }
+    }
+
+    private static boolean generateArtifactsRequested(AgentRun run) {
+        String ext = run == null ? null : run.getExt();
+        if (ext == null || ext.isBlank()) {
+            return false;
+        }
+        try {
+            return com.fasterxml.jackson.databind.json.JsonMapper.builder()
+                    .build()
+                    .readTree(ext)
+                    .path("generate_artifacts")
+                    .asBoolean(false);
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     private static String nvl(String value) {

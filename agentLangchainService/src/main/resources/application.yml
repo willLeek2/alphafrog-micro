@@ -39,6 +39,17 @@ agent:
     openrouter:
       http-referer: ${AF_OPENROUTER_HTTP_REFERER:}
       title: ${AF_OPENROUTER_TITLE:}
+  # 260814 scheduler-03: workspace export 总开关（默认关闭）。关闭时终态事件
+  # 监听器、polling observer、dump executor、磁盘 _dlq 与启动重放均不创建。
+  workspace:
+    export-enabled: ${AF_AGENT_WORKSPACE_EXPORT_ENABLED:false}
+  run:
+    # 260814 scheduler-03: rawRef 本地临时存储（当前 Run 生命周期）。
+    raw-ref:
+      root-dir: ${AF_AGENT_RAW_REF_ROOT_DIR:${java.io.tmpdir}/alphafrog-raw-ref}
+      max-entry-bytes: ${AF_AGENT_RAW_REF_MAX_ENTRY_BYTES:8388608}
+      max-entries-per-run: ${AF_AGENT_RAW_REF_MAX_ENTRIES_PER_RUN:512}
+      max-total-bytes-per-run: ${AF_AGENT_RAW_REF_MAX_TOTAL_BYTES_PER_RUN:536870912}
 
 langchain4j:
   open-ai:

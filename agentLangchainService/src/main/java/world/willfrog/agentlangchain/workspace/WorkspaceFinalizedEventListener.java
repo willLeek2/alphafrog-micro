@@ -2,6 +2,7 @@ package world.willfrog.agentlangchain.workspace;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.event.AgentRunFinalizedEvent;
@@ -16,6 +17,9 @@ import world.willfrog.agent.platform.event.AgentRunFinalizedEvent;
  * @author wang
  */
 @Component
+// 260814 scheduler-03: workspace export 总开关默认关闭；关闭时本监听器不注册，
+// Run 终态不会触发任何 workspace dump 副作用。
+@ConditionalOnProperty(name = "agent.workspace.export-enabled", havingValue = "true", matchIfMissing = false)
 @RequiredArgsConstructor
 @Slf4j
 public class WorkspaceFinalizedEventListener {
