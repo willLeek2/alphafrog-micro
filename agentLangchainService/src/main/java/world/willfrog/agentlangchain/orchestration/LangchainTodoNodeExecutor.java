@@ -468,6 +468,7 @@ public class LangchainTodoNodeExecutor {
                 .append(safeRepairBlock(context.getTerminalResultPreview())).append('\n')
                 .append("stderr_preview:\n")
                 .append(safeRepairBlock(context.getTerminalStderrPreview())).append('\n')
+                .append("repair_instruction: 必须根据上述诊断生成修正后的新代码，禁止原样重放失败请求。\n")
                 .append("failed_code_preview (untrusted):\n")
                 .append(safeRepairBlock(context.getPythonFailedCodePreview())).append('\n');
         return out.toString();

@@ -48,15 +48,18 @@ import java.util.stream.Collectors;
 @Service
 public class LangchainLinearWorkflowExecutor {
 
-    // Python 初次执行加一次语义修正，总共最多两次；不能与 HTTP retry 或 restartAttempt 混用。
-    private static final int DEFAULT_MAX_PYTHON_ATTEMPTS = 2;
-    private static final int MAX_PYTHON_ATTEMPTS = 2;
+    // Python code-refine 是“生成修正后的新代码再试”，不是重放原工具请求。
+    // 它保留原有的独立次数上限，不与 Todo semantic retry 或 restartAttempt 混用。
+    private static final int DEFAULT_MAX_PYTHON_ATTEMPTS = 3;
+    private static final int MAX_PYTHON_ATTEMPTS = 10;
 
     private final LangchainTodoNodeExecutor todoNodeExecutor;
     private final LangchainRunExecutionGuard executionGuard;
     private final AgentEventService eventService;
     private final CodeRefineLocalConfigLoader codeRefineConfigLoader;
     private final CodeRefineProperties startupCodeRefineProperties;
+
+    private static final Set<String> REPAIRABLE_PYTHON_EXIT_REASONS = Set.of("NON_ZERO_EXIT");
 
     /**
      * 工作流级 Todo 边界 checkpoint。测试或极简上下文可以不装配；生产 Spring 上下文必须存在。
@@ -530,8 +533,10 @@ public class LangchainLinearWorkflowExecutor {
         return context != null
                 && !context.isTerminalSuccess()
                 && "FAILED".equals(context.getTerminalStatus())
-                // 终态提供方必须明确声明可重试；未知或 false 一律不重放 Sandbox。
-                && Boolean.TRUE.equals(context.getTerminalRetryable())
+                // false 表示不得原样重放已失败的 Sandbox 请求；这里会先让模型生成不同代码。
+                && Boolean.FALSE.equals(context.getTerminalRetryable())
+                && REPAIRABLE_PYTHON_EXIT_REASONS.contains(
+                        nvl(context.getTerminalExitReason(), "").toUpperCase(java.util.Locale.ROOT))
                 && context.getPythonFailedRequestFingerprints() != null
                 && !context.getPythonFailedRequestFingerprints().isEmpty();
     }
