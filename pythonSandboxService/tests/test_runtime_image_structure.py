@@ -388,6 +388,8 @@ class TestThreeStageBuildDockerE2E(unittest.TestCase):
                 str(iid1),
                 "--build-arg",
                 f"RUNTIME_BASE_IMAGE_REF={self._BASE_TAG}",
+                "--build-arg",
+                f"AF_RUNTIME_INSTALL_IMAGE={self._BASE_TAG}",
             ],
             timeout=1800,
         )

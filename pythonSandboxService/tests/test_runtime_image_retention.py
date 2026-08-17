@@ -2063,6 +2063,17 @@ class DockerBuildReleaseGateTest(RuntimeImageRetentionTestBase):
             any(token.startswith("RUNTIME_BASE_IMAGE_REF=") for token in build_calls[0]),
             f"phase 1 missing RUNTIME_BASE_IMAGE_REF build arg: {build_calls[0]}",
         )
+        phase1_base_ref = next(
+            token.split("=", 1)[1]
+            for token in build_calls[0]
+            if token.startswith("RUNTIME_BASE_IMAGE_REF=")
+        )
+        self.assertIn(
+            f"AF_RUNTIME_INSTALL_IMAGE={phase1_base_ref}",
+            build_calls[0],
+            "BuildKit parses every FROM before honoring --target, so phase 1 "
+            "must override the phase-2 placeholder with a valid reference",
+        )
         self.assertTrue(
             any(
                 token == f"AF_RUNTIME_INSTALL_IMAGE={FAKE_BUILD_IMAGE_ID}"
@@ -2131,7 +2142,8 @@ class DockerBuildReleaseGateTest(RuntimeImageRetentionTestBase):
         )
         phase2 = first_index(
             lambda c: c[:1] == ["build"]
-            and any(t.startswith("AF_RUNTIME_INSTALL_IMAGE=") for t in c)
+            and f"AF_RUNTIME_INSTALL_IMAGE={FAKE_BUILD_IMAGE_ID}" in c
+            and "runtime-install" not in c
         )
         self.assertLess(phase1, smoke_system, "smoke must run after phase 1")
         self.assertLess(phase1, smoke_venv, "venv smoke must run after phase 1")
@@ -2452,6 +2464,8 @@ class DockerBuildLocalImageIdModeTest(RuntimeImageRetentionTestBase):
         self.assertEqual(result.returncode, 0, f"stdout={result.stdout}\nstderr={result.stderr}")
         self.assertIn("verified local Image ID: " + FAKE_BUILD_IMAGE_ID, result.stdout)
         self.assertIn("AF_SANDBOX_IMAGE=" + FAKE_BUILD_IMAGE_ID, result.stdout)
+        self.assertIn("local-image-id mode: building FROM local base tag", result.stdout)
+        self.assertNotIn("placeholder base digest + explicit dev switch", result.stderr)
         # The strict-release evidence mapping is not written in local mode.
         self.assertFalse(MAPPING_FILE.exists())
 

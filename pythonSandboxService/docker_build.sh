@@ -502,20 +502,29 @@ print(match.group(1))
     build_revision="git:$(git -C "$REPO_ROOT" rev-parse --verify HEAD)"
   fi
 
-  # 7) FROM ref: the verified base image pinned by digest; ONLY with the
-  #    explicit dev switch and a placeholder base digest does the build fall
-  #    back to the bare base tag (structural dev build, releasable=false).
+  # 7) FROM ref: local-image-id mode intentionally uses the local base tag;
+  #    strict-release uses the verified digest and falls back to the bare tag
+  #    only behind its explicit incomplete-build development switch.
   local runtime_base_image_ref
   if is_missing_or_placeholder "$base_image_digest"; then
     runtime_base_image_ref="python:${RUNTIME_BASE_IMAGE_TAG:-3.13-slim}"
-    echo "[pythonSandbox] WARNING: dev structural build FROM bare base tag '${runtime_base_image_ref}'" >&2
-    echo "[pythonSandbox]   (placeholder base digest + explicit dev switch). NOT releasable." >&2
+    if [ "$verify_mode" = "local-image-id" ]; then
+      echo "[pythonSandbox] local-image-id mode: building FROM local base tag '${runtime_base_image_ref}'."
+    else
+      echo "[pythonSandbox] WARNING: dev structural build FROM bare base tag '${runtime_base_image_ref}'" >&2
+      echo "[pythonSandbox]   (placeholder base digest + explicit dev switch). NOT releasable." >&2
+    fi
   else
     runtime_base_image_ref="python:${RUNTIME_BASE_IMAGE_TAG:-3.13-slim}@${base_image_digest}"
   fi
 
   # 8) PHASE 1 build (runtime-install stage): installs the locked library set
   #    and pip-installs the REAL alphafrog_finance distribution from runtime/.
+  #    BuildKit parses every FROM before honoring --target. Give the phase-2
+  #    FROM a syntactically valid reference during phase 1 so the Dockerfile's
+  #    loud-fail default placeholder cannot abort parsing. The runtime-install
+  #    target never executes phase 2; the real phase-1 immutable ID still
+  #    replaces this value in the second build below.
   local iid_install_file="$out_dir/image-install-stage-id"
   rm -f "$iid_install_file"
   run_docker_build \
@@ -523,6 +532,7 @@ print(match.group(1))
     -f "$SCRIPT_DIR/Dockerfile.runtime" \
     --iidfile "$iid_install_file" \
     --build-arg "RUNTIME_BASE_IMAGE_REF=${runtime_base_image_ref}" \
+    --build-arg "AF_RUNTIME_INSTALL_IMAGE=${runtime_base_image_ref}" \
     "$SCRIPT_DIR"
   local install_image_id
   install_image_id="$(cat "$iid_install_file")"
