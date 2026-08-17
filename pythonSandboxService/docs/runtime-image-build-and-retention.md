@@ -40,19 +40,23 @@ Spec §12 line 1304: 基础镜像固定到已验证摘要，不使用裸 `python
 `Dockerfile.runtime`:
 
 ```dockerfile
-ARG RUNTIME_BASE_IMAGE_REF=REPLACE_WITH_VERIFIED_BASE_IMAGE_REF
+ARG RUNTIME_BASE_IMAGE_REF=invalid.invalid/alphafrog/replace-with-verified-base-image-ref
 FROM ${RUNTIME_BASE_IMAGE_REF}
 ```
 
-`REPLACE_WITH_VERIFIED_BASE_IMAGE_REF` is a placeholder, not an image
-reference: `docker build` fails at `FROM` until frog pins the verified value.
+The `invalid.invalid/...` value is a syntactically valid but unreachable
+placeholder. BuildKit parses every `FROM` before honoring `--target`, so an
+uppercase non-reference placeholder would abort parsing even when
+`docker_build.sh` supplied the other stage correctly. A direct build still
+fails closed against the reserved `.invalid` domain.
 `docker_build.sh` passes the pinned value as
 `--build-arg RUNTIME_BASE_IMAGE_REF=python:<tag>@sha256:<64 lowercase hex>`
 (env `BASE_IMAGE_DIGEST`, validated anchored/lowercase-only) and refuses to
-treat placeholder tokens or malformed digests as verified values. ONLY a dev
-structural build behind the explicit `AF_SANDBOX_ALLOW_INCOMPLETE_DEV_BUILD`
-switch may FROM the bare base tag instead — such a build is marked
-`releasable=false`.
+treat placeholder tokens or malformed digests as verified values. The
+single-machine `local-image-id` mode intentionally uses the local base tag;
+in `strict-release`, only an explicit
+`AF_SANDBOX_ALLOW_INCOMPLETE_DEV_BUILD` switch may fall back to that tag, and
+the result is marked `releasable=false`.
 
 ## 2. Runtime packages live in a lockfile, not inline Dockerfile text
 

@@ -605,6 +605,7 @@ print(match.group(1))
     -t alphafrog-sandbox-runtime:latest \
     -f "$SCRIPT_DIR/Dockerfile.runtime" \
     --iidfile "$iid_file" \
+    --build-arg "RUNTIME_BASE_IMAGE_REF=${runtime_base_image_ref}" \
     --build-arg "AF_RUNTIME_INSTALL_IMAGE=${install_image_id}" \
     --build-arg "AF_BASE_IMAGE_DIGEST=${base_image_digest}" \
     --build-arg "AF_LOCK_DIGEST=${lock_digest}" \

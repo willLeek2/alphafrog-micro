@@ -2074,6 +2074,12 @@ class DockerBuildReleaseGateTest(RuntimeImageRetentionTestBase):
             "BuildKit parses every FROM before honoring --target, so phase 1 "
             "must override the phase-2 placeholder with a valid reference",
         )
+        self.assertIn(
+            f"RUNTIME_BASE_IMAGE_REF={phase1_base_ref}",
+            build_calls[1],
+            "BuildKit parses the phase-1 FROM during phase 2, so the second "
+            "build must also carry the real base reference",
+        )
         self.assertTrue(
             any(
                 token == f"AF_RUNTIME_INSTALL_IMAGE={FAKE_BUILD_IMAGE_ID}"

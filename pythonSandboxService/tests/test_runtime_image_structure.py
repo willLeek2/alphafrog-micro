@@ -75,7 +75,12 @@ CANONICAL_FILES = (
     "sharpe_ratio.json",
 )
 
-_PLACEHOLDER_INSTALL_IMAGE = "REPLACE_WITH_RUNTIME_INSTALL_STAGE_IMAGE_ID"
+_PLACEHOLDER_BASE_IMAGE = (
+    "invalid.invalid/alphafrog/replace-with-verified-base-image-ref"
+)
+_PLACEHOLDER_INSTALL_IMAGE = (
+    "invalid.invalid/alphafrog/replace-with-runtime-install-stage-image-id"
+)
 
 
 def _dockerfile_lines() -> list:
@@ -133,6 +138,7 @@ class TestDockerfileArgScope(unittest.TestCase):
         ]
         self.assertEqual(len(declarations), 1)
         self.assertLess(declarations[0], first_from)
+        self.assertIn(_PLACEHOLDER_BASE_IMAGE, lines[declarations[0]])
 
     def test_exactly_two_froms_in_documented_phase_order(self):
         froms = [l for l in _dockerfile_lines() if re.match(r"^FROM\s", l)]
@@ -407,6 +413,8 @@ class TestThreeStageBuildDockerE2E(unittest.TestCase):
             "Dockerfile.runtime",
             "--iidfile",
             str(iid2),
+            "--build-arg",
+            f"RUNTIME_BASE_IMAGE_REF={self._BASE_TAG}",
             "--build-arg",
             f"AF_RUNTIME_INSTALL_IMAGE={install_id}",
             "--build-arg",

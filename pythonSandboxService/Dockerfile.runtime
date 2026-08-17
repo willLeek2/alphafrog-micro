@@ -28,23 +28,23 @@
 #     static metadata, so librarySetDigest can only be written here, after the
 #     actual inventory was queried and verified.
 #
-# PLACEHOLDER WARNING: RUNTIME_BASE_IMAGE_REF below is a documented
-# placeholder token, not a real image reference. frog (the human release
-# owner) pins the verified base image (python:<tag>@sha256:<64 lowercase
+# PLACEHOLDER WARNING: RUNTIME_BASE_IMAGE_REF below is a documented,
+# syntactically valid but deliberately unreachable reference. frog (the human
+# release owner) pins the verified base image (python:<tag>@sha256:<64 lowercase
 # hex>) at release time (Spec §12: agents never invent production values).
-# Until it is replaced, any real `docker build` will fail at the FROM step --
-# that failure is intentional and loud. docker_build.sh normally supplies the
-# verified reference; ONLY a dev structural build behind the explicit switch
-# AF_SANDBOX_ALLOW_INCOMPLETE_DEV_BUILD may pass the bare base tag instead
-# (such a build is marked releasable=false and refused by deploy_latest.sh).
-ARG RUNTIME_BASE_IMAGE_REF=REPLACE_WITH_VERIFIED_BASE_IMAGE_REF
+# BuildKit parses every FROM before honoring --target, so defaults must be
+# syntactically valid image references. The reserved .invalid registry keeps
+# a direct build fail-closed without producing InvalidDefaultArgInFrom parser
+# errors. docker_build.sh supplies the real reference in both build phases.
+ARG RUNTIME_BASE_IMAGE_REF=invalid.invalid/alphafrog/replace-with-verified-base-image-ref
 # AF_RUNTIME_INSTALL_IMAGE MUST be declared in GLOBAL scope (before the first
 # FROM): a Dockerfile FROM instruction can only expand ARGs declared before
 # the first FROM -- a stage-scoped declaration expands to EMPTY here and the
 # phase-2 FROM silently breaks (Spec §12 two-phase build). docker_build.sh
-# phase 2 supplies the immutable phase-1 image ID; the placeholder token
-# makes any direct `docker build` fail loudly at the second FROM.
-ARG AF_RUNTIME_INSTALL_IMAGE=REPLACE_WITH_RUNTIME_INSTALL_STAGE_IMAGE_ID
+# phase 2 supplies the immutable phase-1 image ID. The reserved .invalid
+# default makes any direct build fail loudly without being syntactically
+# invalid during BuildKit's whole-file parse.
+ARG AF_RUNTIME_INSTALL_IMAGE=invalid.invalid/alphafrog/replace-with-runtime-install-stage-image-id
 FROM ${RUNTIME_BASE_IMAGE_REF} AS runtime-install
 
 ARG PIP_INDEX_URL
