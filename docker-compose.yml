@@ -643,10 +643,10 @@ services:
       # AF_SANDBOX_IMAGE_ALLOW_DEV_TAG=true/1 且引用语法合法时允许。
       AF_SANDBOX_IMAGE: ${AF_SANDBOX_IMAGE:-}
       AF_SANDBOX_IMAGE_ALLOW_DEV_TAG: ${AF_SANDBOX_IMAGE_ALLOW_DEV_TAG:-}
-      # MethodSpec V5 §12 / 工作包 C 契约身份：沙箱子进程降权目标。运行时镜像
-      # （Dockerfile.runtime）固定创建非特权用户 alphafrog-sandbox（uid 10000，
-      # gid 10001，均非零）；此变量接受【用户名】或【uid:gid】两种形式，例如
-      # alphafrog-sandbox 或 10000:10001。工作包 C 的 wrapper 据此降权，镜像本身不切换 USER。
+      # 260818 非根简化（frog 9dab5e2d）：沙箱容器创建时即以此用户运行（docker --user 语义）。
+      # 容器内全程无 root（wrapper 与用户代码同为该身份），原 wrapper 降权链已整体移除。
+      # 接受【用户名】或【uid:gid】，用户须存在于运行时镜像（alphafrog-sandbox = uid 10000/gid 10001）。
+      # 留空会被 python-sandbox-service 配置加载拒绝（fail-fast），默认 alphafrog-sandbox。
       AF_SANDBOX_CHILD_USER: ${AF_SANDBOX_CHILD_USER:-alphafrog-sandbox}
       # MethodSpec V5 §12 运行时镜像保留（pythonSandboxService/scripts/prune_runtime_images.sh）：
       # 保护集 = 当前镜像 + 上一代镜像 + state.json 中 QUEUED/RUNNING 任务引用的镜像 + 运行中容器镜像。

@@ -19,8 +19,9 @@ Covered here (MethodSpec V5 work package H, FINAL round):
   The fixture index.json digest is pinned verbatim.
 * ITEM D — dedicated unprivileged identity: the image creates a FIXED
   non-zero uid/gid user (alphafrog-sandbox, uid 10000 / gid 10001) as the
-  AF_SANDBOX_CHILD_USER contract identity for the work package C wrapper
-  (accepts username or uid:gid); compose + env example carry the entry.
+  AF_SANDBOX_CHILD_USER container-run identity (the service creates the
+  sandbox container AS this user; accepts username or uid:gid); compose
+  + env example carry the entry.
 * ITEM B — docker-gated three-stage E2E (skip unless AF_RUN_DOCKER_TESTS=1
   AND a reachable docker daemon): phase-1 build, exact-ID verification of a
   temporary local tag, phase-2 build FROM that bridge, layer-prefix
@@ -197,8 +198,9 @@ class TestChildIndexUserContract(unittest.TestCase):
         self.assertNotEqual(uid, 0, "contract user must NOT be root")
         self.assertNotEqual(gid, 0, "contract group must NOT be root")
         self.assertEqual((uid, gid), (10000, 10001))
-        # The image must NOT switch its default USER to the contract user:
-        # privilege dropping is the work package C wrapper's job.
+        # The image must NOT switch its default USER: build-time steps
+        # need root; the service passes the unprivileged user at
+        # container creation (docker --user) instead.
         self.assertIsNone(
             re.search(r"^USER\s", text, re.MULTILINE),
             "image default USER must stay root",

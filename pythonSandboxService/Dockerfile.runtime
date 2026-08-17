@@ -178,14 +178,15 @@ LABEL com.alphafrog.runtime="true" \
       com.alphafrog.methodSpecIndexDigest="${AF_METHOD_SPEC_INDEX_DIGEST}" \
       com.alphafrog.baseImageDigest="${AF_BASE_IMAGE_DIGEST}"
 
-# Dedicated UNPRIVILEGED sandbox identity (Spec §12): the CONTRACT identity
-# the work package C wrapper drops sandbox child processes to, selected via
-# AF_SANDBOX_CHILD_USER (accepts a username OR a uid:gid pair). FIXED numeric
-# IDs, both NON-zero, so the wrapper can drop privileges deterministically:
+# Dedicated UNPRIVILEGED sandbox identity (260818 non-root simplification):
+# the sandbox container is CREATED as this user (docker --user, selected via
+# AF_SANDBOX_CHILD_USER — accepts a username OR a uid:gid pair). FIXED
+# numeric IDs, both NON-zero:
 #   user  alphafrog-sandbox  uid 10000
 #   group alphafrog-sandbox  gid 10001
-# The image's default USER deliberately stays root: sandbox session setup
-# needs it, and privilege dropping is the wrapper's job, never the image's.
+# The image itself keeps the default USER unset (build-time steps need root);
+# the service passes --user at container creation, so nothing inside a
+# running sandbox container ever executes as root.
 RUN set -eux; \
     groupadd --gid 10001 alphafrog-sandbox; \
     useradd --uid 10000 --gid 10001 --home-dir /sandbox --no-create-home \

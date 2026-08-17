@@ -222,6 +222,32 @@ def validate_local_image_id(value: str) -> None:
     )
 
 
+def _reject_root_container_user(user: str) -> None:
+    """The sandbox container must never come back as root via this knob.
+
+    260818 non-root simplification: the whole point of the container-level
+    user is that nothing inside the container runs as root; a literal
+    "root" username or a uid:gid pair with a zero field would silently
+    reintroduce root containers, so both are rejected fail-fast.
+    """
+    lowered = user.lower()
+    root_names = {"root", "0", "0:0"}
+    if lowered in root_names:
+        raise ValueError(
+            "AF_SANDBOX_CHILD_USER must not be root: the sandbox container "
+            "is always created as an unprivileged user"
+        )
+    if ":" in user:
+        uid_text, _, gid_text = user.partition(":")
+        if (uid_text.isdigit() and int(uid_text) == 0) or (
+            gid_text.isdigit() and int(gid_text) == 0
+        ):
+            raise ValueError(
+                "AF_SANDBOX_CHILD_USER must not have a zero uid or gid: the "
+                "sandbox container is always created as an unprivileged user"
+            )
+
+
 @dataclass(frozen=True)
 class SandboxConfig:
     data_dir: Path
@@ -293,6 +319,14 @@ class SandboxConfig:
     # sandbox_image at startup: local-image-id (default, single machine) or
     # strict-release (registry digest chain, Spec §12).
     verify_mode: str = _VERIFY_MODE_LOCAL_IMAGE_ID
+    # 260817 non-root simplification: the sandbox container is CREATED as
+    # this user (docker --user semantics; "alphafrog-sandbox" = uid 10000/
+    # gid 10001 baked into the runtime image). Everything inside the
+    # container — wrapper and user code alike — runs with this single
+    # unprivileged identity; there is no in-container privilege drop.
+    # load_config always passes the AF_SANDBOX_CHILD_USER-derived value
+    # explicitly; the default only exists so test constructors stay small.
+    container_user: str = "alphafrog-sandbox"
     # Optional cross-check (local-image-id mode only): a mutable tag that must
     # currently resolve to the SAME local Image ID at startup. Resolution
     # happens exactly once; task creation never re-resolves it.
@@ -385,6 +419,18 @@ def load_config() -> SandboxConfig:
     docker_backend = os.getenv("AF_SANDBOX_BACKEND", "docker")
     workdir = os.getenv("AF_SANDBOX_WORKDIR", "/sandbox")
     log_level = os.getenv("AF_SANDBOX_LOG_LEVEL", "INFO")
+    # 260817 non-root simplification: container-level unprivileged user
+    # (docker --user). Accepts a username or uid:gid pair, resolved by the
+    # container runtime against the runtime image's passwd database.
+    container_user = os.getenv("AF_SANDBOX_CHILD_USER", "alphafrog-sandbox").strip()
+    if not container_user:
+        raise ValueError(
+            "AF_SANDBOX_CHILD_USER must not be empty: the sandbox container "
+            "is always created as this unprivileged user (set it to "
+            "'alphafrog-sandbox' or a uid:gid pair, or unset it for the "
+            "default)"
+        )
+    _reject_root_container_user(container_user)
     # Spec §12: AF_SANDBOX_IMAGE has NO implicit default (the pre-§12 silent
     # fallback to "alphafrog-sandbox-runtime:latest" is removed).
     # 260814 scheduler-03: which reference grammar applies is selected by
@@ -524,6 +570,7 @@ def load_config() -> SandboxConfig:
         workdir=workdir,
         log_level=log_level,
         sandbox_image=sandbox_image,
+        container_user=container_user,
         verify_mode=verify_mode,
         image_tag_check=image_tag_check,
         skip_environment_setup=skip_environment_setup,

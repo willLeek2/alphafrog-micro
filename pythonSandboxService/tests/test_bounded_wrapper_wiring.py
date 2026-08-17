@@ -691,18 +691,14 @@ class CaptureReaderModuleTest(unittest.TestCase):
         # pins the import to module-load time (no lazy post-exit import).
         import app.bounded_exec_wrapper as wrapper_module
         import app.capture_reader as reader_module
-        import app.child_identity as child_identity_module
 
         self.assertIs(wrapper_module.capture_reader, reader_module)
         self.assertTrue(callable(wrapper_module.capture_reader.read_capture_files))
-        # The production fd-pinned entry point AND the child-identity parser
-        # (P0-4) are top-level bindings too — held as function objects from
-        # module-load time, never re-imported after the child exits.
+        # The production fd-pinned entry point is a top-level binding too —
+        # held as a function object from module-load time, never re-imported
+        # after the child exits.
         self.assertTrue(
             callable(wrapper_module.capture_reader.read_capture_files_from_fds)
-        )
-        self.assertIs(
-            wrapper_module.parse_child_spec, child_identity_module.parse_child_spec
         )
 
 
@@ -738,7 +734,6 @@ class CaptureSpawnWiringTest(unittest.TestCase):
             timeout_seconds=30,
             limits=self._limits(),
             capture_dir=capture_dir,
-            child_identity=None,
             # D15 §4.2.3 round-2: bootstrap mode requires a task-local
             # task_workspace + loader path. These wiring tests target
             # capture-dir/pipe inheritance, not task isolation, but the
@@ -772,10 +767,13 @@ class CaptureSpawnWiringTest(unittest.TestCase):
 
         class RecordingPopen:
             def __init__(self, *args, **kwargs):
-                # Record ONLY the user-child spawn — it is the only Popen
-                # that carries preexec_fn (the sweep's lsof utility helper
-                # also calls Popen and must not overwrite the evidence).
-                if "preexec_fn" in kwargs:
+                # Record ONLY the user-child spawn: its argv runs the loader
+                # bootstrap (the sweep's lsof utility helper also calls
+                # Popen and must not overwrite the evidence).
+                argv = args[0] if args else kwargs.get("args")
+                if argv and any(
+                    "loader_bootstrap.py" in str(part) for part in argv
+                ):
                     captured_kwargs.update(kwargs)
                 self._proc = real_popen(*args, **kwargs)
 
@@ -789,8 +787,7 @@ class CaptureSpawnWiringTest(unittest.TestCase):
                 timeout_seconds=30,
                 limits=self._limits(),
                 capture_dir=capture_dir,
-                child_identity=None,
-                # D15 §4.2.3 round-2: bootstrap mode requires a task-local
+                    # D15 §4.2.3 round-2: bootstrap mode requires a task-local
                 # task_workspace + loader path; see the sibling test above.
                 task_workspace=str(self.task_dir),
                 task_environment={
@@ -849,8 +846,8 @@ class SubreaperHardGateTest(unittest.TestCase):
         return {key: _LIMITS[key] for key in _LIMIT_KEYS}
 
     def _assert_gate_closed(self, capture_dir):
-        # The child never ran, and with an active identity a failed spawn
-        # leaves NO summary: the pre-opened summary file stays empty.
+        # The child never ran, and a failed spawn leaves NO summary: the
+        # pre-opened summary file stays empty (no child, no summary).
         self.assertFalse(
             self.marker.exists(), "the child must never be spawned"
         )
@@ -881,7 +878,6 @@ class SubreaperHardGateTest(unittest.TestCase):
                     timeout_seconds=30,
                     limits=self._limits(),
                     capture_dir=capture_dir,
-                    child_identity=(1000, 10001),
                 )
         self._assert_gate_closed(capture_dir)
 
@@ -895,7 +891,6 @@ class SubreaperHardGateTest(unittest.TestCase):
                     timeout_seconds=30,
                     limits=self._limits(),
                     capture_dir=capture_dir,
-                    child_identity=(1000, 10001),
                 )
         self._assert_gate_closed(capture_dir)
 

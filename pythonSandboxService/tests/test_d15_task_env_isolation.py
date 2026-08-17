@@ -838,13 +838,12 @@ class BootstrapPermissionAndRunpySemanticsTest(unittest.TestCase):
     Round-2 (d0c67439) closed the stale-sitecustomize core bug but missed
     two production realities that host tests (same-UID) couldn't surface:
 
-    1. **Permission gap**: sandbox_runner chowns task_workspace to the
-       unprivileged child uid BEFORE the root wrapper creates the
-       ``_bootstrap`` dir + bootstrap file. Round-2 set the dir to 0o700
-       (root-only). Production child (non-root after preexec_fn) couldn't
-       traverse the root-owned 0o700 dir to read the bootstrap → child
-       startup fails immediately. Round-3 fix: dir 0o755 (world-traversable)
-       + file 0o444 (world-readable, root-writable via unlink+write).
+    1. **Permission gap** (historical round-3 record): round-2 set the
+       ``_bootstrap`` dir to 0o700, which the then-unprivileged child
+       couldn't traverse. Round-3 fix: dir 0o755 + file 0o444.  The
+       privilege-drop machinery is gone since the 260818 non-root
+       simplification (container created AS the unprivileged user); the
+       modes are kept as-is.
 
     2. **Sibling import gap**: round-2 bootstrap inserted LOADER_PATH at
        ``sys.path[0]`` but never inserted user script's parent dir.
@@ -892,11 +891,10 @@ class BootstrapPermissionAndRunpySemanticsTest(unittest.TestCase):
         return base64.b64decode(envelope["files"]["stdout.bin"]).decode("utf-8")
 
     def test_bootstrap_dir_is_world_traversable_and_file_is_world_readable(self):
-        """Round-3 MUST-FIX #1: bootstrap dir MUST be 0o755 + file 0o444 so
-        the production non-root child can read it after preexec_fn drops
-        privileges. Round-2 used 0o700 which only the root wrapper could
-        traverse — production child failed at startup, host tests missed it
-        because they run same-UID."""
+        """Round-3 MUST-FIX #1 (historical): bootstrap dir stays 0o755 +
+        file 0o444. Since the 260818 non-root simplification the wrapper
+        and the user child share the container-level unprivileged uid, so
+        this is mode hygiene rather than a privilege boundary."""
         script = self.task_workspace / "user_script.py"
         script.write_text("print('ok')\n", encoding="utf-8")
         input_path = self._write_input(script)

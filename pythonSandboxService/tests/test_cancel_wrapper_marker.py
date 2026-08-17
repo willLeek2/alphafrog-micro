@@ -17,17 +17,14 @@ Two layers are pinned here:
    appears after the child already exited leaves the genuine result
    intact — ``cancelObserved`` stays false and the real exitCode stands.
 
-2. PURE-FUNCTION unit tests for the fail-closed gates that run BEFORE the
+2. PURE-FUNCTION unit tests for the fail-closed gate that runs BEFORE the
    spawn: ``expected_cancel_marker_path`` (the exact task-local binding,
-   env override aware) and ``verify_control_path_permissions`` (codex
-   4334bc9d constraint 2 — lstat-based parent-chain verification with the
-   child's write path judged by its actual uid/gid; exercised with
-   synthetic stat results through the injected ``stat_fn``).
+   env override aware).  (The historical root-owned parent-chain
+   permission gate was removed with the privilege-drop machinery —
+   sandbox containers no longer contain root.)
 
 No Docker, no container: these tests run the wrapper as an ordinary host
-subprocess in dev mode (non-root wrapper), where the OS permission gate
-is skipped by design and the binding gate still runs.  The in-container
-root-path permission gate is exercised by the synthetic-stat unit tests
+subprocess; the binding gate runs exactly as in production.
 below; a real-container concurrent-cancel run remains UNVERIFIED on this
 host (delivery note, codex 5f054201 point 8).
 """
@@ -38,14 +35,12 @@ import base64
 import json
 import os
 import signal
-import stat
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.bounded_exec_wrapper import (
@@ -55,7 +50,6 @@ from app.bounded_exec_wrapper import (
     _cancel_marker_exists,
     _kill_process_group,
     expected_cancel_marker_path,
-    verify_control_path_permissions,
 )
 
 SERVICE_ROOT = Path(__file__).resolve().parents[1]
@@ -407,179 +401,6 @@ class ExpectedCancelMarkerPathTest(unittest.TestCase):
             self.assertEqual("/tmp/ctl/task-b/cancel", second)
 
 
-def _fake_stat(mode: int, uid: int = 0, gid: int = 0):
-    return SimpleNamespace(st_mode=mode, st_uid=uid, st_gid=gid)
-
-
-_DIR_ROOT_0700 = stat.S_IFDIR | 0o700   # root-owned, only root can write
-_DIR_ROOT_0755 = stat.S_IFDIR | 0o755   # root-owned, world-readable
-_MARKER_ROOT_0600 = stat.S_IFREG | 0o600
-
-
-class VerifyControlPathPermissionsTest(unittest.TestCase):
-    """codex 4334bc9d constraint 2: the lstat-based parent-chain gate.
-
-    Every case injects synthetic stat results through ``stat_fn`` so the
-    in-container root-path shape (which the non-root macOS host cannot
-    create) is exercised deterministically.  The marker path layout is
-    ``/ctl/<taskId>/cancel``: task dir ``/ctl/<taskId>``, control root
-    ``/ctl``, grand parent ``/``.
-    """
-
-    def setUp(self) -> None:
-        self.marker = "/ctl/task-1/cancel"
-        self.levels = {
-            "/ctl/task-1": _fake_stat(_DIR_ROOT_0700),
-            "/ctl": _fake_stat(_DIR_ROOT_0700),
-            "/": _fake_stat(_DIR_ROOT_0755),
-        }
-
-    def stat_fn(self, path: str):
-        # Any path not present in ``levels`` — including the marker by
-        # default — is reported absent (the writer creates it on demand).
-        try:
-            return self.levels[path]
-        except KeyError:
-            raise FileNotFoundError(path) from None
-
-    def verify(self, child_uid: int = 1000, child_gid: int = 1000) -> None:
-        verify_control_path_permissions(
-            self.marker, child_uid, child_gid, stat_fn=self.stat_fn
-        )
-
-    # --- happy paths --------------------------------------------------------
-
-    def test_happy_path_with_absent_marker(self) -> None:
-        self.verify()  # no exception: absent marker is the normal state
-
-    def test_happy_path_with_root_owned_regular_marker(self) -> None:
-        self.levels[self.marker] = _fake_stat(_MARKER_ROOT_0600)
-        self.verify()
-
-    def test_grand_parent_may_be_non_root_owned(self) -> None:
-        # Only the task dir and the control root must be root-owned; the
-        # control root's own parent just has to be a real directory the
-        # child cannot write (owner 2000 != child uid 1000, no group/world
-        # write bits).
-        self.levels["/"] = _fake_stat(_DIR_ROOT_0755, uid=2000)
-        self.verify()
-
-    # --- child identity refusals ---------------------------------------------
-
-    def test_root_child_identity_is_refused(self) -> None:
-        with self.assertRaises(WrapperInputError) as raised:
-            self.verify(child_uid=0)
-        self.assertIn("root child identity", str(raised.exception))
-
-    # --- directory chain refusals --------------------------------------------
-
-    def test_symlinked_level_is_rejected(self) -> None:
-        # lstat sees the link itself: S_ISDIR is false → reject, never follow.
-        self.levels["/ctl/task-1"] = _fake_stat(stat.S_IFLNK | 0o700)
-        with self.assertRaises(WrapperInputError) as raised:
-            self.verify()
-        self.assertIn("not a real directory", str(raised.exception))
-
-    def test_missing_level_is_rejected(self) -> None:
-        del self.levels["/ctl"]
-        with self.assertRaises(WrapperInputError) as raised:
-            self.verify()
-        self.assertIn("cannot be lstat'ed", str(raised.exception))
-
-    def test_non_directory_level_is_rejected(self) -> None:
-        self.levels["/ctl"] = _fake_stat(stat.S_IFREG | 0o700)
-        with self.assertRaises(WrapperInputError):
-            self.verify()
-
-    def test_control_root_must_be_root_owned(self) -> None:
-        self.levels["/ctl"] = _fake_stat(_DIR_ROOT_0700, uid=1000)
-        with self.assertRaises(WrapperInputError) as raised:
-            self.verify()
-        self.assertIn("owned by root", str(raised.exception))
-
-    def test_task_dir_must_be_root_owned(self) -> None:
-        self.levels["/ctl/task-1"] = _fake_stat(_DIR_ROOT_0700, uid=1000)
-        with self.assertRaises(WrapperInputError):
-            self.verify()
-
-    def test_group_writable_level_is_rejected(self) -> None:
-        self.levels["/ctl"] = _fake_stat(stat.S_IFDIR | 0o770)
-        with self.assertRaises(WrapperInputError) as raised:
-            self.verify()
-        self.assertIn("group/world", str(raised.exception))
-
-    def test_world_writable_level_is_rejected(self) -> None:
-        self.levels["/ctl/task-1"] = _fake_stat(stat.S_IFDIR | 0o707)
-        with self.assertRaises(WrapperInputError):
-            self.verify()
-
-    def test_child_owned_task_dir_is_rejected_by_root_ownership_first(self) -> None:
-        # A task dir owned by the child uid is rejected by the
-        # root-ownership requirement, which fires BEFORE the child-write
-        # check for the two root-required levels (task dir, control root).
-        # The child-write-path check itself is reachable only on the
-        # grand parent (covered by
-        # test_child_writable_grand_parent_is_rejected).
-        self.levels["/ctl/task-1"] = _fake_stat(
-            stat.S_IFDIR | 0o700, uid=1000
-        )
-        with self.assertRaises(WrapperInputError) as raised:
-            self.verify(child_uid=1000)
-        self.assertIn("owned by root", str(raised.exception))
-
-    def test_child_writable_grand_parent_is_rejected(self) -> None:
-        # No root-ownership requirement on the grand parent, but the child
-        # write path check still applies to it.
-        self.levels["/"] = _fake_stat(stat.S_IFDIR | 0o700, uid=1000)
-        with self.assertRaises(WrapperInputError) as raised:
-            self.verify(child_uid=1000)
-        self.assertIn("writable by the child uid", str(raised.exception))
-
-    # --- marker file refusals -------------------------------------------------
-
-    def test_marker_symlink_is_rejected(self) -> None:
-        self.levels[self.marker] = _fake_stat(stat.S_IFLNK | 0o600)
-        with self.assertRaises(WrapperInputError) as raised:
-            self.verify()
-        self.assertIn("regular file", str(raised.exception))
-
-    def test_marker_must_be_root_owned(self) -> None:
-        self.levels[self.marker] = _fake_stat(_MARKER_ROOT_0600, uid=1000)
-        with self.assertRaises(WrapperInputError) as raised:
-            self.verify()
-        self.assertIn("owned by root", str(raised.exception))
-
-    def test_marker_group_writable_is_rejected(self) -> None:
-        self.levels[self.marker] = _fake_stat(stat.S_IFREG | 0o660)
-        with self.assertRaises(WrapperInputError):
-            self.verify()
-
-    def test_marker_child_owned_is_rejected_by_root_ownership_first(self) -> None:
-        # The marker must be root-owned, and that check fires BEFORE the
-        # child-write check; since the marker owner must be uid 0 while the
-        # child uid is always non-zero, the marker child-write branch is
-        # only reachable as a defense-in-depth backstop.  Assert the
-        # ordering that actually triggers.
-        self.levels[self.marker] = _fake_stat(
-            stat.S_IFREG | 0o600, uid=1000
-        )
-        with self.assertRaises(WrapperInputError) as raised:
-            self.verify(child_uid=1000)
-        self.assertIn("owned by root", str(raised.exception))
-
-    def test_marker_generic_os_error_is_rejected(self) -> None:
-        marker = self.marker
-
-        def stat_fn(path: str):
-            if path == marker:
-                raise PermissionError("stat blocked")
-            return self.levels[path]
-
-        with self.assertRaises(WrapperInputError) as raised:
-            verify_control_path_permissions(
-                marker, 1000, 1000, stat_fn=stat_fn
-            )
-        self.assertIn("cannot be lstat'ed", str(raised.exception))
 
 
 class CancelMarkerExistsHelperTest(unittest.TestCase):
