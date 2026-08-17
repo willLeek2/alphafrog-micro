@@ -34,8 +34,11 @@
 #   6. first invocation of scripts/build_runtime_manifest.py writes
 #      library-set.json from the VERIFIED ACTUAL inventory and yields
 #      librarySetDigest;
-#   7. PHASE 2 `docker build --iidfile` FROM the phase-1 image ID bakes the
-#      canonical index.json (re-hashed INSIDE the image against the
+#   7. PHASE 2 `docker build --iidfile` FROM a process-unique local tag that
+#      is immediately verified against the phase-1 image ID. The tag exists
+#      only because BuildKit cannot use a bare local sha256:<Image ID> in
+#      FROM; it is removed after phase 2 and never becomes evidence. Phase 2
+#      bakes canonical index.json (re-hashed INSIDE the image against the
 #      host-computed methodSpecIndexDigest -- mismatch fails closed) plus the
 #      verified library-set.json, and sets the OCI labels (labels are static
 #      metadata, so librarySetDigest can only be set after verification);
@@ -523,8 +526,8 @@ print(match.group(1))
   #    BuildKit parses every FROM before honoring --target. Give the phase-2
   #    FROM a syntactically valid reference during phase 1 so the Dockerfile's
   #    loud-fail default placeholder cannot abort parsing. The runtime-install
-  #    target never executes phase 2; the real phase-1 immutable ID still
-  #    replaces this value in the second build below.
+  #    target never executes phase 2; a temporary local tag verified against
+  #    the real phase-1 immutable ID replaces this value in the second build.
   local iid_install_file="$out_dir/image-install-stage-id"
   rm -f "$iid_install_file"
   run_docker_build \
