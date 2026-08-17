@@ -50,6 +50,9 @@ the exact flags the script passes. Fixture env hooks:
                                    ``docker build --iidfile`` emulation used
                                    by the docker_build.sh gate tests (BOTH
                                    build phases write the same ID);
+* ``FAKE_DOCKER_FAIL_RUNTIME_FINAL_BUILD`` set to ``1`` fails only the
+                                   phase-2 build, after the temporary local
+                                   bridge tag exists, so cleanup is testable;
 * ``FAKE_DOCKER_SMOKE_EXIT``       exit code of the fake ``docker run``
                                    smoke-gate invocations (default 0);
 * ``FAKE_DOCKER_INVENTORY_FILE``   inventory JSON document printed by the
@@ -240,6 +243,11 @@ case "$cmd" in
       echo "fake docker: build failed" >&2
       exit 1
     fi
+    if [ "${FAKE_DOCKER_FAIL_RUNTIME_FINAL_BUILD:-}" = "1" ] && \
+       grep -q '^alphafrog-runtime-install:' "${FAKE_DOCKER_ALIASES_FILE:?}"; then
+      echo "fake docker: final runtime build failed" >&2
+      exit 1
+    fi
     iid=""
     labels_json="{}"
     while [ "$#" -gt 0 ]; do
@@ -320,6 +328,31 @@ open(path, "w", encoding="utf-8").write("\n".join(rows) + "\n")
 '
     fi
     ;;
+  tag)
+    # docker_build.sh uses a temporary, process-unique tag to bridge the
+    # phase-1 local image into BuildKit's phase-2 FROM. Record that alias so
+    # the immediate `docker image inspect` equality check can resolve it.
+    source_ref="${1:-}"
+    target_ref="${2:-}"
+    if [ -z "$source_ref" ] || [ -z "$target_ref" ]; then
+      echo "fake docker: tag requires source and target" >&2
+      exit 1
+    fi
+    canon=""
+    while read -r alias id; do
+      if [ "$alias" = "$source_ref" ]; then canon="$id"; break; fi
+    done < "${FAKE_DOCKER_ALIASES_FILE:?}"
+    if [ -z "$canon" ]; then
+      while IFS= read -r id; do
+        if [ "$id" = "$source_ref" ]; then canon="$id"; break; fi
+      done < "${FAKE_DOCKER_IMAGES_FILE:?}"
+    fi
+    if [ -z "$canon" ]; then
+      echo "fake docker: no such source image $source_ref" >&2
+      exit 1
+    fi
+    printf '%s %s\n' "$target_ref" "$canon" >> "${FAKE_DOCKER_ALIASES_FILE:?}"
+    ;;
   run)
     # docker_build.sh round-2 gate tests: serve the smoke gate (R2-1) and the
     # actual-inventory query (R2-2) that run against the phase-1 image.
@@ -366,15 +399,38 @@ open(path, "w", encoding="utf-8").write("\n".join(rows) + "\n")
     cat "${FAKE_DOCKER_PS_FILE:?}"
     ;;
   image)
-    # `docker image inspect ...` — used by D15 Tier2a OCI label probe.
-    if [ "${1:-}" != "inspect" ]; then
-      exit 0
-    fi
-    shift
-    # Fall through into the shared inspect implementation below by
-    # re-entering this script as `inspect ...` would (no bash-4 ;& needed).
-    set -- inspect "$@"
-    cmd="inspect"
+    case "${1:-}" in
+      inspect)
+        # Used both by the phase-bridge equality check and the D15 Tier2a OCI
+        # label probe. Fall through into the shared inspect implementation.
+        shift
+        set -- inspect "$@"
+        cmd="inspect"
+        ;;
+      rm)
+        # Removing a tag must remove only that alias, not the underlying
+        # immutable image ID. The shell stub uses Python for literal matching.
+        shift
+        for ref in "$@"; do
+          FAKE_ALIAS_REF="$ref" python3 -c '
+import os
+path = os.environ["FAKE_DOCKER_ALIASES_FILE"]
+ref = os.environ["FAKE_ALIAS_REF"]
+rows = []
+if os.path.exists(path):
+    for line in open(path, encoding="utf-8"):
+        if line.rstrip("\n").split(" ", 1)[0] != ref:
+            rows.append(line)
+open(path, "w", encoding="utf-8").writelines(rows)
+'
+          echo "Untagged: $ref"
+        done
+        exit 0
+        ;;
+      *)
+        exit 0
+        ;;
+    esac
     ;;
 esac
 # Shared inspect path (also reached after rewriting `image inspect`).
@@ -2047,7 +2103,8 @@ class DockerBuildReleaseGateTest(RuntimeImageRetentionTestBase):
     def test_build_wiring_two_phase_order_smoke_inventory_then_bake(self) -> None:
         # R2-1/R2-2 wiring order: phase-1 build (runtime-install) -> smoke
         # gate under BOTH interpreters -> inventory query -> phase-2 bake FROM
-        # the phase-1 immutable ID with the verified librarySetDigest.
+        # a temporary local tag verified against the phase-1 immutable ID,
+        # with the verified librarySetDigest.
         env = self.build_env(AF_SANDBOX_ALLOW_INCOMPLETE_DEV_BUILD="true")
         result = self.run_build(env)
         self.assertEqual(
@@ -2080,13 +2137,26 @@ class DockerBuildReleaseGateTest(RuntimeImageRetentionTestBase):
             "BuildKit parses the phase-1 FROM during phase 2, so the second "
             "build must also carry the real base reference",
         )
-        self.assertTrue(
-            any(
-                token == f"AF_RUNTIME_INSTALL_IMAGE={FAKE_BUILD_IMAGE_ID}"
-                for token in build_calls[1]
-            ),
-            f"phase 2 must build FROM the phase-1 immutable image ID: {build_calls[1]}",
+        tag_calls = self.calls_for("tag")
+        self.assertEqual(len(tag_calls), 1, f"expected one temporary tag: {tag_calls}")
+        self.assertEqual(tag_calls[0][1], FAKE_BUILD_IMAGE_ID)
+        install_stage_ref = tag_calls[0][2]
+        self.assertRegex(
+            install_stage_ref,
+            rf"^alphafrog-runtime-install:{FAKE_BUILD_IMAGE_ID.removeprefix('sha256:')}-[0-9]+$",
         )
+        self.assertIn(
+            f"AF_RUNTIME_INSTALL_IMAGE={install_stage_ref}",
+            build_calls[1],
+            "phase 2 must build FROM the temporary local tag verified against "
+            f"the phase-1 immutable image ID: {build_calls[1]}",
+        )
+        image_calls = self.calls_for("image")
+        self.assertIn(
+            ["image", "inspect", "--format", "{{.Id}}", install_stage_ref],
+            image_calls,
+        )
+        self.assertIn(["image", "rm", install_stage_ref], image_calls)
         self.assertTrue(
             any(token.startswith("AF_LIBRARY_SET_DIGEST=sha256:") for token in build_calls[1]),
             f"phase 2 missing the verified librarySetDigest label arg: {build_calls[1]}",
@@ -2148,14 +2218,46 @@ class DockerBuildReleaseGateTest(RuntimeImageRetentionTestBase):
         )
         phase2 = first_index(
             lambda c: c[:1] == ["build"]
-            and f"AF_RUNTIME_INSTALL_IMAGE={FAKE_BUILD_IMAGE_ID}" in c
+            and f"AF_RUNTIME_INSTALL_IMAGE={install_stage_ref}" in c
             and "runtime-install" not in c
         )
+        tag = first_index(lambda c: c[:2] == ["tag", FAKE_BUILD_IMAGE_ID])
+        tag_inspect = first_index(
+            lambda c: c[:4] == ["image", "inspect", "--format", "{{.Id}}"]
+            and install_stage_ref in c
+        )
+        untag = first_index(lambda c: c == ["image", "rm", install_stage_ref])
         self.assertLess(phase1, smoke_system, "smoke must run after phase 1")
         self.assertLess(phase1, smoke_venv, "venv smoke must run after phase 1")
         self.assertLess(smoke_system, inventory, "inventory gate must follow the smoke gate")
         self.assertLess(smoke_venv, inventory, "inventory gate must follow the smoke gate")
-        self.assertLess(inventory, phase2, "the bake must follow the inventory gate")
+        self.assertLess(inventory, tag, "the temporary tag must follow inventory verification")
+        self.assertLess(tag, tag_inspect, "the temporary tag must be inspected before use")
+        self.assertLess(tag_inspect, phase2, "phase 2 must follow exact-ID tag verification")
+        self.assertLess(phase2, untag, "the temporary tag must be removed after phase 2")
+
+    def test_phase2_failure_removes_temporary_bridge_tag(self) -> None:
+        env = self.build_env(
+            AF_SANDBOX_ALLOW_INCOMPLETE_DEV_BUILD="true",
+            FAKE_DOCKER_FAIL_RUNTIME_FINAL_BUILD="1",
+        )
+        result = self.run_build(env)
+        self.assertEqual(
+            result.returncode,
+            1,
+            f"phase-2 failure must fail the build\nstdout={result.stdout}\nstderr={result.stderr}",
+        )
+        tag_calls = self.calls_for("tag")
+        self.assertEqual(len(tag_calls), 1, tag_calls)
+        install_stage_ref = tag_calls[0][2]
+        calls = self.docker_calls()
+        failed_build_index = max(i for i, call in enumerate(calls) if call[:1] == ["build"])
+        cleanup_index = next(
+            i for i, call in enumerate(calls) if call == ["image", "rm", install_stage_ref]
+        )
+        self.assertLess(failed_build_index, cleanup_index)
+        self.assertIn("phase-2 runtime image build FAILED", result.stderr)
+        self.assertFalse(MAPPING_FILE.exists())
 
 
 class SyftImmutableIdRegressionTest(DockerBuildReleaseGateTest):
@@ -2297,7 +2399,7 @@ class SyftImmutableIdRegressionTest(DockerBuildReleaseGateTest):
         )
         self.assertIn("Deployment completed", result.stdout)
 
-    def test_malformed_phase2_iidfile_fails_closed_before_syft_and_mapping(self) -> None:
+    def test_malformed_iidfile_fails_closed_before_phase_bridge_syft_and_mapping(self) -> None:
         self.write_fake_syft(0)
         env = self.build_env(
             BASE_IMAGE_DIGEST=self.BASE_DIGEST,
@@ -2311,7 +2413,7 @@ class SyftImmutableIdRegressionTest(DockerBuildReleaseGateTest):
             f"malformed iidfile ID entered the evidence chain\n"
             f"stdout={result.stdout}\nstderr={result.stderr}",
         )
-        self.assertIn("phase-2 --iidfile image ID", result.stderr)
+        self.assertIn("phase-1 --iidfile image ID", result.stderr)
         self.assertEqual(self.syft_calls(), [])
         self.assertFalse(MAPPING_FILE.exists())
 

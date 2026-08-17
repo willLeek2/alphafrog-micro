@@ -307,7 +307,14 @@ TWO-PHASE build:
    `finance.risk.annualized_volatility` / `finance.risk.sharpe_ratio`, each
    methodVersion `1.0.0`, specDigests
    `sha256:cff05d88…`, `sha256:2843745f…`, `sha256:fccc1f0f…`). Any failure
-   aborts the build.
+   aborts the build;
+5. PHASE 2 cannot put the bare local `sha256:<Image ID>` directly in
+   Dockerfile `FROM`: BuildKit interprets it as a registry reference. The
+   script therefore creates a process-unique local tag from the phase-1 ID,
+   immediately verifies with `docker image inspect` that the tag resolves to
+   that exact ID, uses it only to bridge `FROM`, and removes it on success or
+   failure. The temporary tag is never written into SBOM, mapping, deploy
+   configuration, or other release evidence.
 
 ### R2-2 — verified ACTUAL inventory replaces lockfile inference
 
@@ -321,8 +328,8 @@ fail-closed against the expected set (lock pins + alphafrog_finance
 version/apiVersion from the runtime source): missing/extra managed package,
 version or apiVersion mismatch aborts the build. The verified inventory feeds
 `library-set.json`, the OCI `librarySetDigest` label (PHASE 2 bakes both,
-FROM the phase-1 immutable ID) and the external mapping — all three carry the
-SAME verified set.
+FROM the verified temporary local bridge to the phase-1 immutable ID) and the
+external mapping — all three carry the SAME verified set.
 
 ### R2-3 — deploy target binding
 

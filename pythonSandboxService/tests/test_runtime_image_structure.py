@@ -22,9 +22,10 @@ Covered here (MethodSpec V5 work package H, FINAL round):
   AF_SANDBOX_CHILD_USER contract identity for the work package C wrapper
   (accepts username or uid:gid); compose + env example carry the entry.
 * ITEM B — docker-gated three-stage E2E (skip unless AF_RUN_DOCKER_TESTS=1
-  AND a reachable docker daemon): phase-1 build, phase-2 build FROM the
-  phase-1 immutable ID, layer-prefix verification, in-image re-hash gate
-  (positive + negative), dist metadata + contract user verification.
+  AND a reachable docker daemon): phase-1 build, exact-ID verification of a
+  temporary local tag, phase-2 build FROM that bridge, layer-prefix
+  verification, in-image re-hash gate (positive + negative), dist metadata
+  + contract user verification.
 
 Run from pythonSandboxService/:
 
@@ -407,7 +408,39 @@ class TestThreeStageBuildDockerE2E(unittest.TestCase):
         )
         install_id = iid1.read_text(encoding="utf-8").strip()
 
-        # --- phase 2: FROM the immutable phase-1 ID ---
+        # --- phase bridge: local tag verified against the immutable ID ---
+        # BuildKit interprets a bare local sha256:<Image ID> in FROM as a
+        # registry reference. Match docker_build.sh: create a unique local
+        # tag and immediately prove that it resolves to the exact phase-1 ID.
+        install_ref = (
+            "alphafrog-runtime-install-test:"
+            f"{install_id.removeprefix('sha256:')}-{os.getpid()}"
+        )
+        tagged = subprocess.run(
+            ["docker", "tag", install_id, install_ref],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(tagged.returncode, 0, tagged.stderr)
+        self.addCleanup(
+            subprocess.run,
+            ["docker", "image", "rm", install_ref],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        inspected = subprocess.run(
+            ["docker", "image", "inspect", "--format", "{{.Id}}", install_ref],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(inspected.returncode, 0, inspected.stderr)
+        self.assertEqual(inspected.stdout.strip(), install_id)
+
+        # --- phase 2: FROM the verified local bridge to the phase-1 ID ---
         phase2_args = [
             "-f",
             "Dockerfile.runtime",
@@ -416,7 +449,7 @@ class TestThreeStageBuildDockerE2E(unittest.TestCase):
             "--build-arg",
             f"RUNTIME_BASE_IMAGE_REF={self._BASE_TAG}",
             "--build-arg",
-            f"AF_RUNTIME_INSTALL_IMAGE={install_id}",
+            f"AF_RUNTIME_INSTALL_IMAGE={install_ref}",
             "--build-arg",
             f"AF_BASE_IMAGE_DIGEST={self._TEST_BASE_DIGEST}",
             "--build-arg",

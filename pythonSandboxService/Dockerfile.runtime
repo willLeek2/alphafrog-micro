@@ -23,7 +23,11 @@
 #     SYSTEM python AND the compat venv) and the inventory query
 #     (scripts/runtime_image_inventory.py), verified fail-closed against
 #     requirements-image.lock;
-#   phase 2 (final stage): FROM the phase-1 image by IMMUTABLE ID, bakes the
+#   phase 2 (final stage): FROM a process-unique local tag that
+#     docker_build.sh creates from, and immediately verifies against, the
+#     phase-1 IMMUTABLE ID. BuildKit interprets a bare sha256:<local Image ID>
+#     in FROM as a registry reference, so the verified temporary tag is only
+#     a local bridge and is removed after the build. Phase 2 bakes the
 #     inventory-VERIFIED library-set.json and sets the OCI labels. Labels are
 #     static metadata, so librarySetDigest can only be written here, after the
 #     actual inventory was queried and verified.
@@ -41,9 +45,10 @@ ARG RUNTIME_BASE_IMAGE_REF=invalid.invalid/alphafrog/replace-with-verified-base-
 # FROM): a Dockerfile FROM instruction can only expand ARGs declared before
 # the first FROM -- a stage-scoped declaration expands to EMPTY here and the
 # phase-2 FROM silently breaks (Spec §12 two-phase build). docker_build.sh
-# phase 2 supplies the immutable phase-1 image ID. The reserved .invalid
-# default makes any direct build fail loudly without being syntactically
-# invalid during BuildKit's whole-file parse.
+# phase 2 supplies a temporary local tag that it has verified resolves to the
+# immutable phase-1 image ID. The reserved .invalid default makes any direct
+# build fail loudly without being syntactically invalid during BuildKit's
+# whole-file parse.
 ARG AF_RUNTIME_INSTALL_IMAGE=invalid.invalid/alphafrog/replace-with-runtime-install-stage-image-id
 FROM ${RUNTIME_BASE_IMAGE_REF} AS runtime-install
 
@@ -132,12 +137,14 @@ print("sandbox-smoke: venv imports passed")
 PY
 
 # --- phase 2: finalize with the inventory-VERIFIED manifest (R2-2) ---------
-# FROM the phase-1 image by IMMUTABLE ID: docker_build.sh supplies it only
-# after the smoke gate and the inventory verification passed against exactly
-# that image. Never a mutable tag -- the two phases must refer to the SAME
-# verified install. The ARG itself is declared in GLOBAL scope above (a FROM
-# can only expand pre-FROM ARGs). Direct `docker build` without
-# docker_build.sh fails loudly at this FROM (placeholder token).
+# FROM the phase-1 image through a process-unique local tag: docker_build.sh
+# creates it from the immutable phase-1 ID only after smoke + inventory pass,
+# immediately verifies the tag resolves to that exact ID, and removes it after
+# phase 2. It is not a reusable release tag or evidence alias. This bridge is
+# required because BuildKit interprets a bare sha256:<local Image ID> in FROM
+# as a registry reference. The ARG itself is declared in GLOBAL scope above
+# (a FROM can only expand pre-FROM ARGs). Direct `docker build` without
+# docker_build.sh fails loudly at this FROM (reserved .invalid reference).
 FROM ${AF_RUNTIME_INSTALL_IMAGE}
 
 # Build attestation inputs, supplied by docker_build.sh (Spec §12).

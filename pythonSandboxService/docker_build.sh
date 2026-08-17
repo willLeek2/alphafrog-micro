@@ -536,6 +536,7 @@ print(match.group(1))
     "$SCRIPT_DIR"
   local install_image_id
   install_image_id="$(cat "$iid_install_file")"
+  require_sha256_value "phase-1 --iidfile image ID" "$install_image_id"
   echo "[pythonSandbox] install-stage image=${install_image_id} (immutable image ID via --iidfile)"
 
   # 9) SMOKE GATE (R2-1, fail-closed): assert inside the target interpreters
@@ -586,32 +587,64 @@ print(match.group(1))
   library_set_digest="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["librarySetDigest"])' "$out_dir/library-set.json")"
   echo "[pythonSandbox] librarySetDigest=${library_set_digest} (verified actual inventory)"
 
-  # 12) PHASE 2 build: FROM the phase-1 image by immutable ID; bakes the
-  #     canonical index.json (re-hashed in-image against the computed
-  #     methodSpecIndexDigest) plus the verified library-set.json and sets
-  #     the OCI labels. --iidfile captures the FINAL immutable image ID.
+  # 12) PHASE 2 build: BuildKit does not resolve a bare local sha256:<Image
+  #     ID> in FROM; it treats that text as a registry reference. Create a
+  #     process-unique local tag, verify immediately that it resolves to the
+  #     exact phase-1 ID, use only that tag as the FROM bridge, then remove it.
+  #     The tag is transient routing, never evidence: the phase-1 iidfile ID
+  #     remains the identity that passed smoke + inventory verification.
+  #
+  #     The phase-2 image bakes canonical index.json (re-hashed in-image
+  #     against the computed methodSpecIndexDigest) plus the verified
+  #     library-set.json and sets the OCI labels. --iidfile captures the
+  #     FINAL immutable image ID.
   #     The Dockerfile COPYs .runtime-build/index.json, so stage the SAME
   #     bytes the digest was computed from (never a re-serialization).
   cp "$canonical_dir/index.json" "$out_dir/index.json"
   local iid_file="$out_dir/image-id"
   rm -f "$iid_file"
+  local install_stage_ref="alphafrog-runtime-install:${install_image_id#sha256:}-$$"
+  if ! docker tag "$install_image_id" "$install_stage_ref"; then
+    echo "[pythonSandbox] ERROR: cannot create the temporary phase bridge tag '${install_stage_ref}'." >&2
+    exit 1
+  fi
+  local tagged_install_image_id
+  if ! tagged_install_image_id="$(docker image inspect --format '{{.Id}}' "$install_stage_ref")"; then
+    echo "[pythonSandbox] ERROR: cannot inspect the temporary phase bridge tag '${install_stage_ref}'." >&2
+    docker image rm "$install_stage_ref" >/dev/null 2>&1 || true
+    exit 1
+  fi
+  if [ "$tagged_install_image_id" != "$install_image_id" ]; then
+    echo "[pythonSandbox] ERROR: temporary phase bridge tag '${install_stage_ref}' resolves to" >&2
+    echo "[pythonSandbox]   ${tagged_install_image_id}, expected ${install_image_id}; refusing phase 2." >&2
+    docker image rm "$install_stage_ref" >/dev/null 2>&1 || true
+    exit 1
+  fi
+  echo "[pythonSandbox] phase bridge tag verified: ${install_stage_ref} -> ${install_image_id}"
   # NOTE: the `-t alphafrog-sandbox-runtime:latest` tag is a NON-evidence
   # alias kept ONLY for local convenience (docker run by tag during dev). It
   # NEVER enters the SBOM, the external mapping, or the deploy chain: all
   # evidence below binds the immutable --iidfile image ID exclusively
   # (Spec §12 immutable same-origin; the tag can be retargeted by any
   # concurrent/manual build at any time).
-  run_docker_build \
+  if ! run_docker_build \
     -t alphafrog-sandbox-runtime:latest \
     -f "$SCRIPT_DIR/Dockerfile.runtime" \
     --iidfile "$iid_file" \
     --build-arg "RUNTIME_BASE_IMAGE_REF=${runtime_base_image_ref}" \
-    --build-arg "AF_RUNTIME_INSTALL_IMAGE=${install_image_id}" \
+    --build-arg "AF_RUNTIME_INSTALL_IMAGE=${install_stage_ref}" \
     --build-arg "AF_BASE_IMAGE_DIGEST=${base_image_digest}" \
     --build-arg "AF_LOCK_DIGEST=${lock_digest}" \
     --build-arg "AF_METHOD_SPEC_INDEX_DIGEST=${method_spec_index_digest}" \
     --build-arg "AF_LIBRARY_SET_DIGEST=${library_set_digest}" \
-    "$SCRIPT_DIR"
+    "$SCRIPT_DIR"; then
+    echo "[pythonSandbox] ERROR: phase-2 runtime image build FAILED." >&2
+    docker image rm "$install_stage_ref" >/dev/null 2>&1 || true
+    exit 1
+  fi
+  if ! docker image rm "$install_stage_ref" >/dev/null; then
+    echo "[pythonSandbox] WARNING: built phase 2, but could not remove temporary tag '${install_stage_ref}'." >&2
+  fi
 
   local image_digest
   image_digest="$(cat "$iid_file")"
