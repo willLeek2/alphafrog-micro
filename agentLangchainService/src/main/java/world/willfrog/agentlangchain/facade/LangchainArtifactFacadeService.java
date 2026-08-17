@@ -25,7 +25,7 @@ public class LangchainArtifactFacadeService {
     private final SnapshotPartService snapshotPartService;
 
     public ListAgentArtifactsResponse listArtifacts(ListAgentArtifactsRequest request) {
-        AgentRun run = readService.requireReadableRun(request.getId(), request.getUserId());
+        AgentRun run = requireReadableRun(request.getId(), request.getUserId(), request.getIsAdmin());
         if (!generateArtifactsRequested(run)) {
             // 260814 scheduler-03: artifact 默认关闭。未请求的 Run 查询 artifact
             // 列表返回空列表，且不触发 AgentArtifactService 的惰性注册。
@@ -38,7 +38,7 @@ public class LangchainArtifactFacadeService {
 
     public DownloadAgentArtifactResponse downloadArtifact(DownloadAgentArtifactRequest request) {
         String runId = artifactService.extractRunId(request.getArtifactId());
-        AgentRun run = readService.requireReadableRun(runId, request.getUserId());
+        AgentRun run = requireReadableRun(runId, request.getUserId(), request.getIsAdmin());
         requireArtifactsEnabled(run);
         AgentArtifactService.ArtifactContent artifact = artifactService.loadArtifact(
                 run,
@@ -54,7 +54,7 @@ public class LangchainArtifactFacadeService {
 
     public AgentArtifactPartsMetaMessage getArtifactPartsMeta(GetAgentArtifactPartsRequest request) {
         String runId = artifactService.extractRunId(request.getArtifactId());
-        AgentRun run = readService.requireReadableRun(runId, request.getUserId());
+        AgentRun run = requireReadableRun(runId, request.getUserId(), request.getIsAdmin());
         requireArtifactsEnabled(run);
         AgentArtifactService.ArtifactContent artifact = artifactService.loadArtifactForParts(
                 run,
@@ -79,7 +79,7 @@ public class LangchainArtifactFacadeService {
 
     public AgentArtifactPartMessage getArtifactPart(GetAgentArtifactPartRequest request) {
         String runId = artifactService.extractRunId(request.getArtifactId());
-        AgentRun run = readService.requireReadableRun(runId, request.getUserId());
+        AgentRun run = requireReadableRun(runId, request.getUserId(), request.getIsAdmin());
         requireArtifactsEnabled(run);
         AgentArtifactService.ArtifactContent artifact = artifactService.loadArtifactForParts(
                 run,
@@ -138,6 +138,17 @@ public class LangchainArtifactFacadeService {
         } catch (Exception e) {
             return false;
         }
+    }
+
+    /**
+     * 管理员读取其他用户的 Run 时，不能再套用普通用户的 owner 条件；否则上层已经
+     * 通过管理员校验的 observability 查询会在补充 artifact 时被误判为 Run 不存在。
+     * 四个 artifact 入口共用这里，保证列表里返回的下载和分片链接也能按同一权限读取。
+     */
+    private AgentRun requireReadableRun(String runId, String userId, boolean isAdmin) {
+        return isAdmin
+                ? readService.requireReadableRunForAdmin(runId)
+                : readService.requireReadableRun(runId, userId);
     }
 
     private static String nvl(String value) {

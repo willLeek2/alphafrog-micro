@@ -14,9 +14,10 @@ import world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunResultMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunStatusMessage;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunResultRequest;
+import world.willfrog.alphafrogmicro.agent.idl.ListAgentArtifactsRequest;
+import world.willfrog.alphafrogmicro.agent.idl.ListAgentArtifactsResponse;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentRunEventsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentRunEventsResponse;
-import world.willfrog.alphafrogmicro.agent.idl.ListAgentArtifactsResponse;
 import world.willfrog.alphafrogmicro.agent.idl.SendAgentMessageRequest;
 import world.willfrog.alphafrogmicro.agent.idl.SendAgentMessageResponse;
 import world.willfrog.alphafrogmicro.common.dto.ResponseCode;
@@ -271,6 +272,17 @@ class AgentControllerTest {
         assertTrue(data.containsKey("dataset_artifacts"));
         assertTrue(data.toString().contains("ds1.json"));
         assertTrue(data.toString().contains("/api/agent/runs/run-1/artifacts/artifact-1/parts"));
+
+        ArgumentCaptor<GetAgentRunResultRequest> resultRequest =
+                ArgumentCaptor.forClass(GetAgentRunResultRequest.class);
+        verify(agentDubboService).getResult(resultRequest.capture());
+        assertTrue(resultRequest.getValue().getIsAdmin());
+        ArgumentCaptor<ListAgentArtifactsRequest> artifactsRequest =
+                ArgumentCaptor.forClass(ListAgentArtifactsRequest.class);
+        verify(agentDubboService).listArtifacts(artifactsRequest.capture());
+        assertTrue(artifactsRequest.getValue().getIsAdmin());
+        assertEquals("1127", artifactsRequest.getValue().getUserId());
+        assertEquals("run-1", artifactsRequest.getValue().getId());
     }
 
     @Test

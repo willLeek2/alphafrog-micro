@@ -4,11 +4,14 @@ import org.junit.jupiter.api.Test;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.service.AgentArtifactService;
 import world.willfrog.agent.platform.service.SnapshotPartService;
+import world.willfrog.agent.platform.service.SnapshotPartsMeta;
 import world.willfrog.alphafrogmicro.agent.idl.AgentArtifactMessage;
 import world.willfrog.alphafrogmicro.agent.idl.DownloadAgentArtifactRequest;
+import world.willfrog.alphafrogmicro.agent.idl.GetAgentArtifactPartRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentArtifactPartsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentArtifactsRequest;
 
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -54,6 +57,24 @@ class LangchainArtifactFacadeServiceTest {
     }
 
     @Test
+    void listArtifactsForAdminReadsCrossUserRunWithoutOwnerFilter() {
+        AgentRun run = runWithArtifactsEnabled();
+        when(readService.requireReadableRunForAdmin("r1")).thenReturn(run);
+        when(artifactService.listArtifacts(run, true)).thenReturn(List.of(
+                AgentArtifactMessage.newBuilder().setArtifactId("a1").build()));
+
+        var response = service.listArtifacts(ListAgentArtifactsRequest.newBuilder()
+                .setId("r1")
+                .setUserId("admin-user")
+                .setIsAdmin(true)
+                .build());
+
+        assertEquals(1, response.getItemsCount());
+        verify(readService).requireReadableRunForAdmin("r1");
+        verify(readService, never()).requireReadableRun("r1", "admin-user");
+    }
+
+    @Test
     void downloadArtifactValidatesOwnershipThroughReadService() {
         AgentRun run = runWithArtifactsEnabled();
         when(artifactService.extractRunId("artifact-1")).thenReturn("r1");
@@ -68,6 +89,65 @@ class LangchainArtifactFacadeServiceTest {
 
         assertEquals("artifact-1", response.getArtifactId());
         assertEquals("out.csv", response.getFilename());
+    }
+
+    @Test
+    void downloadArtifactForAdminReadsCrossUserRunWithoutOwnerFilter() {
+        AgentRun run = runWithArtifactsEnabled();
+        when(artifactService.extractRunId("artifact-1")).thenReturn("r1");
+        when(readService.requireReadableRunForAdmin("r1")).thenReturn(run);
+        when(artifactService.loadArtifact(run, true, "artifact-1")).thenReturn(
+                new AgentArtifactService.ArtifactContent(
+                        "artifact-1", "out.csv", "text/csv", "x".getBytes(StandardCharsets.UTF_8)));
+
+        var response = service.downloadArtifact(DownloadAgentArtifactRequest.newBuilder()
+                .setUserId("admin-user")
+                .setArtifactId("artifact-1")
+                .setIsAdmin(true)
+                .build());
+
+        assertEquals("artifact-1", response.getArtifactId());
+        verify(readService).requireReadableRunForAdmin("r1");
+        verify(readService, never()).requireReadableRun("r1", "admin-user");
+    }
+
+    @Test
+    void artifactPartsForAdminReadCrossUserRunWithoutOwnerFilter() {
+        AgentRun run = runWithArtifactsEnabled();
+        byte[] content = "artifact-content".getBytes(StandardCharsets.UTF_8);
+        when(artifactService.extractRunId("artifact-1")).thenReturn("r1");
+        when(readService.requireReadableRunForAdmin("r1")).thenReturn(run);
+        when(artifactService.loadArtifactForParts(run, true, "artifact-1")).thenReturn(
+                new AgentArtifactService.ArtifactContent("artifact-1", "out.csv", "text/csv", content));
+        when(snapshotPartService.getOrBuildBytesMeta("artifact:artifact-1", content, 1024)).thenReturn(
+                SnapshotPartsMeta.builder()
+                        .partSize(1024)
+                        .totalParts(1)
+                        .uncompressedSize(content.length)
+                        .compressedSize(content.length)
+                        .compression("none")
+                        .checksum("checksum")
+                        .build());
+        when(snapshotPartService.getBytesPart("artifact:artifact-1", content, 0, 1024)).thenReturn(content);
+
+        var meta = service.getArtifactPartsMeta(GetAgentArtifactPartsRequest.newBuilder()
+                .setUserId("admin-user")
+                .setArtifactId("artifact-1")
+                .setMaxPartSize(1024)
+                .setIsAdmin(true)
+                .build());
+        var part = service.getArtifactPart(GetAgentArtifactPartRequest.newBuilder()
+                .setUserId("admin-user")
+                .setArtifactId("artifact-1")
+                .setPartIndex(0)
+                .setMaxPartSize(1024)
+                .setIsAdmin(true)
+                .build());
+
+        assertEquals(1, meta.getTotalParts());
+        assertEquals("artifact-content", part.getContent().toStringUtf8());
+        verify(readService, times(2)).requireReadableRunForAdmin("r1");
+        verify(readService, never()).requireReadableRun("r1", "admin-user");
     }
 
     @Test
