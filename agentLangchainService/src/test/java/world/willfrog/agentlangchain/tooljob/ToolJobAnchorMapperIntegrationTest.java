@@ -1198,29 +1198,85 @@ class ToolJobAnchorMapperIntegrationTest {
     }
 
     /**
-     * 260819（grace must-fix-1）：Redis due 丢失/重启后，终态取消残留必须能被
-     * listActiveToolJobAnchors 60s 补扫重新发现。正常取消收口后的锚点已清成 '{}'
-     * 不会入选；无 CANCELED 处置的终态残留不在本支。
+     * 260819（grace must-fix-1 + round-2）：Redis due 丢失/重启后，终态取消残留必须能被
+     * listActiveToolJobAnchors 60s 补扫重新发现，且筛选与 closeResidualCanceledAnchorOnTerminalRun
+     * 的清理能力严格对齐：只有显式 autoResume=false 且 finalizerStep 已达 EVENT 及之后的
+     * 记录入选；早期步骤/autoResume 缺失或为 true 的记录不入选——它们在终态状态下无法
+     * 推进步骤，入选只会按 updated_at ASC 占满 LIMIT 批次饿死真正可清理的记录。
      */
     @Test
     void activeBackfillDiscoversTerminalCanceledResiduals() throws Exception {
-        // e572 签名（FAILED）与正常取消落库签名（CANCELED + step=CANCELED）都要入选
-        insertRun("run-scan-e572", "FAILED", """
-            {"operationId":"run-scan-e572:call-1:1","autoResume":false,
-             "runDisposition":"CANCELED","finalizerStep":"RESUME_READY"}""");
+        // 四种安全步骤全部入选
+        for (String step : new String[] {"EVENT", "CAS_STATUS", "RESUME_READY", "CANCELED"}) {
+            String runId = "run-scan-ok-" + step.toLowerCase().replace('_', '-');
+            insertRun(runId, "FAILED", """
+                {"operationId":"%s:call-1:1","autoResume":false,
+                 "runDisposition":"CANCELED","finalizerStep":"%s"}""".formatted(runId, step));
+        }
+        // 正常取消落库签名（CANCELED + step=CANCELED）入选
         insertRun("run-scan-postcas", "CANCELED", """
             {"operationId":"run-scan-postcas:call-1:1","autoResume":false,
              "runDisposition":"CANCELED","finalizerStep":"CANCELED"}""");
-        // 对照组：无取消处置的终态残留不入选
+
+        // 拒绝项：早期步骤、步骤缺失、autoResume 缺失/为 true、无取消处置
+        for (String step : new String[] {"ENVELOPE", "RELEASE", "USAGE"}) {
+            String runId = "run-scan-no-" + step.toLowerCase();
+            insertRun(runId, "FAILED", """
+                {"operationId":"%s:call-1:1","autoResume":false,
+                 "runDisposition":"CANCELED","finalizerStep":"%s"}""".formatted(runId, step));
+        }
+        insertRun("run-scan-nostep", "FAILED", """
+            {"operationId":"run-scan-nostep:call-1:1","autoResume":false,
+             "runDisposition":"CANCELED"}""");
+        insertRun("run-scan-noauto", "FAILED", """
+            {"operationId":"run-scan-noauto:call-1:1",
+             "runDisposition":"CANCELED","finalizerStep":"RESUME_READY"}""");
+        insertRun("run-scan-autotrue", "FAILED", """
+            {"operationId":"run-scan-autotrue:call-1:1","autoResume":true,
+             "runDisposition":"CANCELED","finalizerStep":"RESUME_READY"}""");
         insertRun("run-scan-nodisp", "FAILED", """
             {"operationId":"run-scan-nodisp:call-1:1","autoResume":false,
              "finalizerStep":"RESUME_READY"}""");
 
         AgentRunMapper mapper = newMapper();
-        assertThat(mapper.listActiveToolJobAnchors(10))
+        assertThat(mapper.listActiveToolJobAnchors(50))
                 .extracting(AgentRun::getId)
-                .contains("run-scan-e572", "run-scan-postcas")
-                .doesNotContain("run-scan-nodisp");
+                .contains("run-scan-ok-event", "run-scan-ok-cas-status",
+                        "run-scan-ok-resume-ready", "run-scan-ok-canceled",
+                        "run-scan-postcas")
+                .doesNotContain("run-scan-no-envelope", "run-scan-no-release",
+                        "run-scan-no-usage", "run-scan-nostep", "run-scan-noauto",
+                        "run-scan-autotrue", "run-scan-nodisp");
+    }
+
+    /**
+     * 260819（grace round-2）：100 条更旧的不可清理残留不能把合法 e572 记录挤出
+     * limit=100 批次——不可清理记录被 WHERE 排除，不占用批次名额。
+     */
+    @Test
+    void activeBackfillLimitBatchNotStarvedByUnclosableResiduals() throws Exception {
+        for (int i = 0; i < 100; i++) {
+            insertRun("run-starve-" + i, "FAILED", """
+                {"operationId":"run-starve-x:call-1:1","autoResume":false,
+                 "runDisposition":"CANCELED","finalizerStep":"RELEASE"}"""
+                    .replace("run-starve-x", "run-starve-" + i));
+        }
+        insertRun("run-starve-valid", "FAILED", """
+            {"operationId":"run-starve-valid:call-1:1","autoResume":false,
+             "runDisposition":"CANCELED","finalizerStep":"RESUME_READY"}""");
+        // 不可清理记录标记为更旧，模拟长期滞留的 updated_at ASC 排序压力
+        DataSource ds = dataSource();
+        try (Connection conn = ds.getConnection();
+             Statement stmt = conn.createStatement()) {
+            stmt.execute("UPDATE alphafrog_agent_run SET updated_at = '2020-01-01T00:00:00Z'"
+                    + " WHERE id LIKE 'run-starve-%' AND id <> 'run-starve-valid'");
+        }
+
+        AgentRunMapper mapper = newMapper();
+        assertThat(mapper.listActiveToolJobAnchors(100))
+                .extracting(AgentRun::getId)
+                .contains("run-starve-valid")
+                .doesNotContain("run-starve-0", "run-starve-99");
     }
 
     // ========== Production service chain: version race ==========
