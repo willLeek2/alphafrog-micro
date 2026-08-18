@@ -385,8 +385,11 @@ class ExpectedCancelMarkerPathTest(unittest.TestCase):
         env = dict(os.environ)
         env.pop(TASK_CONTROL_ROOT_ENV_NAME, None)
         with patch.dict(os.environ, env, clear=True):
+            # 260818 non-root fix (grace review): the default control root
+            # moved under /sandbox — a non-root container user can never
+            # create directories under the root-owned /run.
             self.assertEqual(
-                "/run/alphafrog-task-control/task-9/cancel",
+                "/sandbox/alphafrog-task-control/task-9/cancel",
                 expected_cancel_marker_path("/sandbox/ws/task-9/user_script.py"),
             )
 

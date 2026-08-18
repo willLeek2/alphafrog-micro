@@ -100,6 +100,15 @@ class DataIntenseRuntimeTest(unittest.TestCase):
             def open(self):
                 return None
 
+            def execute_command(self, command: str):
+                # create_sandbox_session resolves the container user's
+                # identity after open() (non-root contract, 260818).
+                flag = command.split()[-1]
+                uid_gid = {"-u": "10000", "-g": "10001"}.get(flag, "")
+                return types.SimpleNamespace(
+                    exit_code=0, stdout=uid_gid, stderr=""
+                )
+
         # Spec §12: AF_SANDBOX_IMAGE has no implicit default; a digest
         # reference is always accepted (no dev-allow switch needed).
         with patch.dict(
@@ -129,9 +138,30 @@ class DataIntenseRuntimeTest(unittest.TestCase):
             def __init__(self):
                 self.destinations = []
                 self.commands = []
+                # Non-root staging surface (260818): the temp-file copy now
+                # travels as a put_archive tar entry owned by the container
+                # user; record the destination the same way.
+                from tests.nonroot_fakes import prime_fake_session
+
+                prime_fake_session(self)
+
+                def recording_put(dest_dir, data):
+                    import io as _io
+                    import tarfile as _tarfile
+
+                    with _tarfile.open(fileobj=_io.BytesIO(data)) as tar:
+                        for member in tar.getmembers():
+                            self.destinations.append(
+                                f"{dest_dir.rstrip('/')}/{member.name}"
+                            )
+
+                self.container.put_archive = recording_put
 
             def copy_to_runtime(self, _source: str, dest_path: str):
-                self.destinations.append(dest_path)
+                raise AssertionError(
+                    "production must stage via container.put_archive "
+                    "(non-root contract, 260818)"
+                )
 
             def execute_command(self, command: str):
                 self.commands.append(command)

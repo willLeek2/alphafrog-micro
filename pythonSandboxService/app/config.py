@@ -225,27 +225,42 @@ def validate_local_image_id(value: str) -> None:
 def _reject_root_container_user(user: str) -> None:
     """The sandbox container must never come back as root via this knob.
 
-    260818 non-root simplification: the whole point of the container-level
-    user is that nothing inside the container runs as root; a literal
-    "root" username or a uid:gid pair with a zero field would silently
-    reintroduce root containers, so both are rejected fail-fast.
+    260818 non-root simplification + grace review: docker accepts
+    ``user[:group]`` where each side may be a name OR a numeric id, so the
+    check must parse both sides independently — ``root:10001`` (uid 0) and
+    ``alphafrog-sandbox:root`` (gid 0) are legal docker spellings that
+    still produce root.  Rejected fail-fast: name ``root`` on either side,
+    numeric ``0`` on either side, empty fields, extra colons, or any other
+    malformed shape.
     """
-    lowered = user.lower()
-    root_names = {"root", "0", "0:0"}
-    if lowered in root_names:
-        raise ValueError(
-            "AF_SANDBOX_CHILD_USER must not be root: the sandbox container "
-            "is always created as an unprivileged user"
-        )
-    if ":" in user:
-        uid_text, _, gid_text = user.partition(":")
-        if (uid_text.isdigit() and int(uid_text) == 0) or (
-            gid_text.isdigit() and int(gid_text) == 0
-        ):
+
+    def _reject_field(field: str, kind: str) -> None:
+        if field == "":
             raise ValueError(
-                "AF_SANDBOX_CHILD_USER must not have a zero uid or gid: the "
+                f"AF_SANDBOX_CHILD_USER has an empty {kind} field: the "
+                "sandbox container user must be a username or uid:gid pair"
+            )
+        if field.lower() == "root":
+            raise ValueError(
+                f"AF_SANDBOX_CHILD_USER must not name root as the {kind}: "
+                "the sandbox container is always created as an unprivileged "
+                "user"
+            )
+        if field.isdigit() and int(field) == 0:
+            raise ValueError(
+                f"AF_SANDBOX_CHILD_USER must not have a zero {kind}: the "
                 "sandbox container is always created as an unprivileged user"
             )
+
+    parts = user.split(":")
+    if len(parts) > 2:
+        raise ValueError(
+            "AF_SANDBOX_CHILD_USER must be 'user' or 'user:group' — extra "
+            "colons are malformed"
+        )
+    _reject_field(parts[0], "user")
+    if len(parts) == 2:
+        _reject_field(parts[1], "group")
 
 
 @dataclass(frozen=True)

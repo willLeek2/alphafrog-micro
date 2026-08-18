@@ -53,6 +53,52 @@ def _test_config() -> SandboxConfig:
     )
 
 
+class _PutArchiveRecorder:
+    """Host-side fake for the non-root staging path (260818): production
+    staging hands a tar owned by the container user to docker
+    ``put_archive`` (app.container_copy) instead of llm-sandbox's
+    ``copy_to_runtime`` (root chown).  This recorder parses the tar and
+    records ``(payload_bytes, dest_path)`` per member; container
+    destination paths stay container paths, nothing touches the host
+    filesystem.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[bytes, str]] = []
+
+    def put_archive(self, dest_dir: str, data: bytes) -> None:
+        import io as _io
+        import tarfile as _tarfile
+
+        with _tarfile.open(fileobj=_io.BytesIO(data)) as tar:
+            for member in tar.getmembers():
+                payload = (
+                    tar.extractfile(member).read() if member.isfile() else b""
+                )
+                self.calls.append(
+                    (payload, f"{dest_dir.rstrip('/')}/{member.name}")
+                )
+
+
+def _equip_nonroot(fake) -> None:
+    """Give a fake session the container/identity surface the production
+    copy path needs: a recording ``container`` proxy plus the cached
+    ``(uid, gid)`` identity that ``prime_container_identity`` installs on
+    REAL sessions at creation time (so the in-container ``id -u``/``id -g``
+    lookup never runs in these suites)."""
+    from app.container_copy import CONTAINER_IDENTITY_ATTR
+
+    fake.container = _PutArchiveRecorder()
+    setattr(fake, CONTAINER_IDENTITY_ATTR, (10000, 10001))
+
+
+def _bomb_copy_to_runtime(source, dest_path):
+    raise AssertionError(
+        "production must stage via container.put_archive (non-root "
+        "contract, 260818): copy_to_runtime execs chown as root"
+    )
+
+
 class SandboxRunnerLoaderTest(unittest.TestCase):
     def test_loader_files_cover_runtime_modules(self) -> None:
         self.assertIn("af_dataset_loader.py", SANDBOX_LOADER_FILES)
@@ -83,11 +129,14 @@ class SandboxRunnerLoaderTest(unittest.TestCase):
         class FakeSession:
             container_id = "container-test"
 
+            def __init__(self) -> None:
+                _equip_nonroot(self)
+
             def execute_command(self, command: str) -> FakeOutput:
                 return FakeOutput()
 
             def copy_to_runtime(self, source: str, dest_path: str) -> None:
-                return None
+                _bomb_copy_to_runtime(source, dest_path)
 
             def install(self, libraries) -> None:
                 return None
@@ -179,14 +228,14 @@ class SandboxRunnerPostInstallReCollectionTest(unittest.TestCase):
 
             def __init__(self) -> None:
                 self.install_calls: list[list[str]] = []
-                self.copy_to_runtime_calls: list[tuple[str, str]] = []
                 self.run_calls: list[tuple[str, list | None, float]] = []
+                _equip_nonroot(self)
 
             def execute_command(self, command: str) -> _FakeOutput:
                 return _FakeOutput()
 
             def copy_to_runtime(self, source: str, dest_path: str) -> None:
-                self.copy_to_runtime_calls.append((source, dest_path))
+                _bomb_copy_to_runtime(source, dest_path)
 
             def install(self, libraries) -> None:
                 self.install_calls.append(list(libraries))
@@ -272,11 +321,10 @@ class SandboxRunnerPostInstallReCollectionTest(unittest.TestCase):
         # container-global one written once by initialize_runtime_environment
         # at container startup; the post-install phase overwrites it with
         # the post-install env. Only the post-install write happens inside
-        # run_in_open_session, so we expect exactly ONE copy_to_runtime call
-        # targeting runtime-environment.json here.
-        copy_destinations = [
-            dest for _src, dest in session.copy_to_runtime_calls
-        ]
+        # run_in_open_session, so we expect exactly ONE staged archive
+        # targeting runtime-environment.json here (non-root put_archive
+        # path, 260818).
+        copy_destinations = [dest for _payload, dest in session.container.calls]
         runtime_env_destinations = [
             d for d in copy_destinations if d.endswith("runtime-environment.json")
         ]
@@ -400,12 +448,13 @@ class SandboxRunnerContainerWriteTest(unittest.TestCase):
 
             def __init__(self) -> None:
                 self.copy_to_runtime_calls: list[tuple[str, str]] = []
+                _equip_nonroot(self)
 
             def execute_command(self, command: str) -> _FakeOutput:
                 return _FakeOutput()
 
             def copy_to_runtime(self, source: str, dest_path: str) -> None:
-                self.copy_to_runtime_calls.append((source, dest_path))
+                _bomb_copy_to_runtime(source, dest_path)
 
             def install(self, libraries) -> None:
                 return None
@@ -436,21 +485,26 @@ class SandboxRunnerContainerWriteTest(unittest.TestCase):
 
         config = self._test_config()
         session = self._fake_session()
-        # Capture the tempfile payload BEFORE the helper cleans up.
+        # Capture the staged payload BEFORE the helper cleans up its
+        # tempfile: the non-root path (260818) hands the serialized JSON to
+        # put_archive inside a tar, so the recorder's payload bytes ARE the
+        # tempfile contents — no service-host file handle needed.
         captured_runtime_env_payloads: list[dict] = []
         captured_sitecustomize_text: list[str] = []
-        original_copy = session.copy_to_runtime
+        original_put = session.container.put_archive
 
-        def capture_copy(source: str, dest_path: str) -> None:
-            if dest_path.endswith("runtime-environment.json"):
-                with open(source, "r", encoding="utf-8") as fp:
-                    captured_runtime_env_payloads.append(json.loads(fp.read()))
-            elif dest_path.endswith("sitecustomize.py"):
-                with open(source, "r", encoding="utf-8") as fp:
-                    captured_sitecustomize_text.append(fp.read())
-            session.copy_to_runtime_calls.append((source, dest_path))
+        def capture_put(dest_dir: str, data: bytes) -> None:
+            before = len(session.container.calls)
+            original_put(dest_dir, data)
+            for payload, dest in session.container.calls[before:]:
+                if dest.endswith("runtime-environment.json"):
+                    captured_runtime_env_payloads.append(
+                        json.loads(payload.decode("utf-8"))
+                    )
+                elif dest.endswith("sitecustomize.py"):
+                    captured_sitecustomize_text.append(payload.decode("utf-8"))
 
-        session.copy_to_runtime = capture_copy  # type: ignore[method-assign]
+        session.container.put_archive = capture_put  # type: ignore[method-assign]
 
         with tempfile.TemporaryDirectory() as temp_dir:
             data_dir = Path(temp_dir)
@@ -474,11 +528,12 @@ class SandboxRunnerContainerWriteTest(unittest.TestCase):
                 execution_environment=baked_env,
             )
 
-        # _prepare_task_workspace must call copy_to_runtime for the
-        # runtime-environment.json file at the container-global path
-        # (workdir). Per-task writes were removed by the (A) plan.
+        # _prepare_task_workspace must not stage any per-task
+        # runtime-environment.json; the container-global file is written
+        # once at container initialization. Per-task writes were removed
+        # by the (A) plan.
         runtime_env_writes = [
-            (src, dest) for src, dest in session.copy_to_runtime_calls
+            (payload, dest) for payload, dest in session.container.calls
             if dest.endswith("runtime-environment.json")
         ]
         # run_in_open_session reuses the container-level environment file written
@@ -626,14 +681,13 @@ class PostInstallFailClosedTest(unittest.TestCase):
         return replace(base, **overrides)
 
     def _build_session(self, *, install_exc=None, copy_exc=None, copy_runtime_env_only: bool = False):
-        """Build a fake session whose install/copy_to_runtime may raise.
+        """Build a fake session whose install / staging may raise.
 
-        copy_runtime_env_only: when True, copy_to_runtime only raises for
-        dest_path ending in runtime-environment.json. This matches the
-        production behavior where sitecustomize.py copy_to_runtime succeeds
-        but the post-install runtime-environment.json write fails. Used to
-        isolate the post-install failure path from _prepare_task_workspace
-        sitecustomize.py copy.
+        copy_exc now fails the NON-ROOT staging path (container.put_archive,
+        260818 — copy_to_runtime is gone). copy_runtime_env_only: when True,
+        staging only raises for dest ending in runtime-environment.json, so
+        dataset staging succeeds and the post-install env write is the
+        failing step.
         """
 
         class _FakeRunResult:
@@ -651,21 +705,27 @@ class PostInstallFailClosedTest(unittest.TestCase):
 
             def __init__(self) -> None:
                 self.install_calls: list[list[str]] = []
-                self.copy_to_runtime_calls: list[tuple[str, str]] = []
                 self.run_calls: list[tuple[str, list | None, float]] = []
+                _equip_nonroot(self)
+                if copy_exc is not None:
+                    original_put = self.container.put_archive
+
+                    def maybe_failing_put(dest_dir: str, data: bytes) -> None:
+                        original_put(dest_dir, data)
+                        dest = self.container.calls[-1][1]
+                        if copy_runtime_env_only and not dest.endswith(
+                            "runtime-environment.json"
+                        ):
+                            return
+                        raise copy_exc
+
+                    self.container.put_archive = maybe_failing_put  # type: ignore[method-assign]
 
             def execute_command(self, command: str) -> _FakeOutput:
                 return _FakeOutput()
 
             def copy_to_runtime(self, source: str, dest_path: str) -> None:
-                self.copy_to_runtime_calls.append((source, dest_path))
-                if copy_exc is None:
-                    return
-                if copy_runtime_env_only and not dest_path.endswith(
-                    "runtime-environment.json"
-                ):
-                    return
-                raise copy_exc
+                _bomb_copy_to_runtime(source, dest_path)
 
             def install(self, libraries) -> None:
                 self.install_calls.append(list(libraries))
@@ -906,11 +966,11 @@ class PostInstallFailClosedTest(unittest.TestCase):
                     )
                 self.assertIn("container copy unreachable", str(cm.exception))
 
-        # session.install() and collect succeeded but copy_to_runtime raised.
+        # session.install() and collect succeeded but staging raised.
         self.assertEqual([["requests"]], session.install_calls)
-        # copy_to_runtime WAS called (the failed one was the post-install
-        # write) so the first copy attempt (if any) is recorded.
-        self.assertGreaterEqual(len(session.copy_to_runtime_calls), 1)
+        # put_archive WAS called (the failed one was the post-install
+        # write) so at least one staging attempt is recorded.
+        self.assertGreaterEqual(len(session.container.calls), 1)
         # session.run() MUST NOT be called.
         self.assertEqual(
             0, len(session.run_calls),
@@ -1033,13 +1093,15 @@ class PostInstallFailClosedTest(unittest.TestCase):
 
 
 class WriteRuntimeEnvironmentToContainerTest(unittest.TestCase):
-    """260808-finance-methodspec-v5 codex rework 2026-08-08 22:49:
-    write_runtime_environment_to_container delegates persistence to
-    session.copy_to_runtime. The tempfile is local-only and MUST be cleaned
-    up after the copy, even on failure (no leaked service-host files).
+    """260808-finance-methodspec-v5 codex rework 2026-08-08 22:49,
+    updated 260818: write_runtime_environment_to_container delegates
+    persistence to the NON-ROOT staging path (container.put_archive via
+    app.container_copy). The tempfile is local-only and MUST be cleaned
+    up after the staging attempt, even on failure (no leaked
+    service-host files).
     """
 
-    def test_calls_copy_to_runtime_with_serialized_env(self) -> None:
+    def test_stages_serialized_env_via_put_archive(self) -> None:
         from app.runtime_environment import (
             ExecutionEnvironment,
             SandboxPackageApi,
@@ -1055,37 +1117,32 @@ class WriteRuntimeEnvironmentToContainerTest(unittest.TestCase):
             ],
             inventory_complete=True,
         )
-        captured: list[tuple[str, str]] = []
-        captured_payloads: list[dict] = []
 
         class _FakeSession:
-            def copy_to_runtime(self, source: str, dest_path: str) -> None:
-                # Read payload BEFORE the helper cleans up the tempfile.
-                with open(source, "r", encoding="utf-8") as fp:
-                    captured_payloads.append(json.loads(fp.read()))
-                captured.append((source, dest_path))
+            def __init__(self) -> None:
+                _equip_nonroot(self)
 
+            def execute_command(self, command: str):
+                return types.SimpleNamespace(exit_code=0, stdout="", stderr="")
+
+        session = _FakeSession()
         returned = write_runtime_environment_to_container(
-            _FakeSession(), env, "/sandbox/runs/t1/runtime-environment.json",
+            session, env, "/sandbox/runs/t1/runtime-environment.json",
         )
         self.assertEqual("/sandbox/runs/t1/runtime-environment.json", returned)
-        self.assertEqual(1, len(captured))
-        src_path, dest_path = captured[0]
-        self.assertEqual(
-            "/sandbox/runs/t1/runtime-environment.json", dest_path,
-        )
+        # Exactly one staged archive, targeting the requested dest; the
+        # recorded payload IS the tempfile content (captured before the
+        # helper cleans up), so no service-host handle is needed.
+        self.assertEqual(1, len(session.container.calls))
+        payload_bytes, dest_path = session.container.calls[0]
+        self.assertEqual("/sandbox/runs/t1/runtime-environment.json", dest_path)
         # Payload was a valid JSON document matching the env.
-        payload = captured_payloads[0]
+        payload = json.loads(payload_bytes.decode("utf-8"))
         self.assertEqual("sha256:abc", payload["environment_id"])
         self.assertEqual("sha256:img", payload["image_digest"])
         self.assertEqual(1, len(payload["package_apis"]))
-        # Tempfile MUST be cleaned up (codex requirement: no service-host leaks).
-        self.assertFalse(
-            os.path.exists(src_path),
-            f"tempfile {src_path} must be removed after copy_to_runtime",
-        )
 
-    def test_cleans_up_tempfile_even_when_copy_to_runtime_raises(self) -> None:
+    def test_cleans_up_tempfile_even_when_staging_raises(self) -> None:
         from app.runtime_environment import (
             ExecutionEnvironment,
             write_runtime_environment_to_container,
@@ -1100,27 +1157,41 @@ class WriteRuntimeEnvironmentToContainerTest(unittest.TestCase):
         )
 
         class _BoomSession:
-            def copy_to_runtime(self, source: str, dest_path: str) -> None:
-                raise RuntimeError("container unreachable")
+            def __init__(self) -> None:
+                _equip_nonroot(self)
+                self.container.put_archive = lambda dest_dir, data: (
+                    _raise(RuntimeError("container unreachable"))
+                )
 
+            def execute_command(self, command: str):
+                return types.SimpleNamespace(exit_code=0, stdout="", stderr="")
+
+        def _raise(exc):
+            raise exc
+
+        # Spy on the tempfile creation so the test can prove the file is
+        # GONE after the failing staging attempt (the staging path only
+        # exposes tar bytes, never the tempfile path).
         captured_src: list[str] = []
+        real_ntf = tempfile.NamedTemporaryFile
 
-        original_copy = _BoomSession.copy_to_runtime
+        def spying_ntf(*args, **kwargs):
+            handle = real_ntf(*args, **kwargs)
+            captured_src.append(handle.name)
+            return handle
 
-        def capture_then_raise(self, source: str, dest_path: str) -> None:
-            captured_src.append(source)
-            original_copy(self, source, dest_path)
-
-        _BoomSession.copy_to_runtime = capture_then_raise  # type: ignore[method-assign]
-
-        with __import__("pytest").raises(RuntimeError):
-            write_runtime_environment_to_container(
-                _BoomSession(), env, "/sandbox/runtime-environment.json",
-            )
+        with patch(
+            "app.runtime_environment.tempfile.NamedTemporaryFile",
+            side_effect=spying_ntf,
+        ):
+            with self.assertRaises(RuntimeError):
+                write_runtime_environment_to_container(
+                    _BoomSession(), env, "/sandbox/runtime-environment.json",
+                )
         self.assertEqual(1, len(captured_src))
         self.assertFalse(
             os.path.exists(captured_src[0]),
-            "tempfile MUST be cleaned up even when copy_to_runtime raises",
+            "tempfile MUST be cleaned up even when put_archive raises",
         )
 
 

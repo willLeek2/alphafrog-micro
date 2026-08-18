@@ -63,6 +63,10 @@ os.environ.setdefault(
     "AF_SANDBOX_IMAGE",
     "registry.local/alphafrog/runtime@sha256:" + "a" * 64,
 )
+# The registry-form digest above only validates under strict-release; in a
+# full discovery run test_cancel_endpoint's module import sets this first,
+# but a standalone run of THIS file needs it too (default is local-image-id).
+os.environ.setdefault("AF_SANDBOX_IMAGE_VERIFY_MODE", "strict-release")
 
 _SERVICE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _SERVICE_ROOT not in sys.path:
@@ -135,6 +139,37 @@ def _test_config(root: Path, *, skip_environment_setup: bool) -> SandboxConfig:
     )
 
 
+class HostArchiveContainer:
+    """Host-backed stand-in for the docker container's archive API.
+
+    ``put_archive(dest_dir, tar_bytes)`` extracts each tar member into the
+    literal host directory (fakes use host paths as container paths) and
+    records ``(dest_dir, name, uid, gid, mode, size)`` per entry so tests
+    can assert the non-root ownership contract of app.container_copy.
+    """
+
+    def __init__(self) -> None:
+        self.archive_entries: list = []
+
+    def put_archive(self, dest_dir: str, data: bytes) -> None:
+        import io as _io
+        import tarfile as _tarfile
+
+        entries = []
+        with _tarfile.open(fileobj=_io.BytesIO(data)) as tar:
+            for member in tar.getmembers():
+                entries.append(
+                    (dest_dir, member.name, member.uid, member.gid,
+                     member.mode, member.size)
+                )
+                # Host extraction runs as the dev uid; keep the recorded
+                # uid/gid as the assertion evidence and extract the bytes.
+                member.uid, member.gid = os.getuid(), os.getgid()
+                member.uname = member.gname = ""
+                tar.extract(member, dest_dir)
+        self.archive_entries.extend(entries)
+
+
 class FakeContainerSession:
     """Host-backed stand-in for llm_sandbox.SandboxSession.
 
@@ -161,6 +196,11 @@ class FakeContainerSession:
         self.python_executable_path = (
             f"{self.root}/sandbox/.sandbox-venv/bin/python"
         )
+        # Non-root copy path (grace review): a host-backed stand-in for the
+        # docker container object — put_archive extracts the staged tar into
+        # the literal host dir and RECORDS each entry's uid/gid/mode so tests
+        # can assert the ownership contract of app.container_copy.
+        self.container = HostArchiveContainer()
         if not skip_environment_setup:
             venv_python = Path(self.python_executable_path)
             venv_python.parent.mkdir(parents=True, exist_ok=True)
@@ -174,9 +214,13 @@ class FakeContainerSession:
         path.chmod(0o755)
 
     def copy_to_runtime(self, source: str, dest_path: str) -> None:
-        dest = Path(dest_path)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source, dest)
+        # Non-root contract (grace review): production staging must use the
+        # put_archive path exclusively; reaching the llm-sandbox copy API
+        # here means a regression back to its root-chown copy path.
+        raise AssertionError(
+            "session.copy_to_runtime must never be called: staging goes "
+            "through app.container_copy (no-root contract)"
+        )
 
     def execute_command(self, command: str, workdir=None):
         self.executed_commands.append(command)
@@ -703,8 +747,12 @@ class CaptureReaderModuleTest(unittest.TestCase):
 
 
 # --- spawn-time wiring facts (b3b28d1f item 2) ----------------------------
-# The capture files are pre-opened BEFORE the spawn (fd-pinned readback) and
-# must stay root-only: dir 0700 / files 0600.  The child may inherit ONLY
+# The capture files are pre-opened BEFORE the spawn (fd-pinned readback)
+# with dir 0700 / files 0600.  Same-uid note (260818): the child shares the
+# wrapper's uid, so the 0700/0600 bits are hygiene, NOT a boundary — the
+# real protections are fd-pinning (defeats path replacement) plus the
+# host-side byte-length/digest consistency checks (turn same-inode
+# tampering into a fail-closed task error).  The child may inherit ONLY
 # the capture pipes (stdin/stdout/stderr) — never the capture file fds
 # (no pass_fds leak).
 
@@ -752,7 +800,9 @@ class CaptureSpawnWiringTest(unittest.TestCase):
             self.assertEqual(
                 stat.S_IMODE(capture_dir.stat().st_mode),
                 0o700,
-                "capture dir must be owner-only so the child cannot enter",
+                "capture dir must stay 0700 (hygiene; same-uid child is not "
+                "blocked by it — fd-pinning + consistency checks are the "
+                "boundary)",
             )
             for name, handle in capture_files.items():
                 mode = stat.S_IMODE(os.fstat(handle.fileno()).st_mode)
@@ -1261,6 +1311,23 @@ class CaptureTamperingWiringTest(unittest.TestCase):
         self.assertNotIn(
             "finance-records-unknown-marker.jsonl", document["files"]
         )
+
+    def test_same_inode_append_fails_closed(self):
+        """Same-uid limit (260818 review, grace): fd pinning defeats path
+        REPLACEMENT, but the child shares the wrapper's uid and can open the
+        very same inode.  An in-place append makes the file longer than the
+        summary's ordinaryStdoutBytes, and the host-side consistency checks
+        must converge that into a fail-closed task error — never into a
+        task that reports tampered content as its stdout."""
+        code = (
+            "import os\n"
+            "with open(os.path.join('capture', 'stdout.bin'), 'ab') as fh:\n"
+            "    fh.write(b'EVIL-SAME-INODE-APPEND' * 100)\n"
+            "print('ordinary-line')\n"
+        )
+        with self.assertRaises(RuntimeError) as raised:
+            self._run(code, session_cls=RecordingFakeContainerSession)
+        self.assertIn("task=task-tamper", str(raised.exception))
 
     def test_renamed_capture_dir_leaves_fd_pinned_readback_unaffected(self):
         """fd-pinning immunity: the child renames the ENTIRE capture

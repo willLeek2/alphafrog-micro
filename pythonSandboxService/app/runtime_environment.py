@@ -9,6 +9,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
+from . import container_copy
 from .models import ExecutionEnvironment, SandboxPackageApi
 
 
@@ -315,7 +316,7 @@ def write_runtime_environment_to_container(
     container at dest_path. The tempfile is cleaned up regardless of outcome.
 
     Returns dest_path so callers can chain it (e.g., echo into log lines).
-    Raises whatever session.copy_to_runtime raises; callers may catch and
+    Raises whatever the non-root copy path raises; callers may catch and
     downgrade to a warning if best-effort, but Spec §8 treats the container
     file as the runtime-visible single source of truth for environmentId.
     """
@@ -327,7 +328,10 @@ def write_runtime_environment_to_container(
         ) as handle:
             json.dump(payload, handle, indent=2, sort_keys=True, ensure_ascii=False)
             temp_path = handle.name
-        session.copy_to_runtime(temp_path, dest_path)
+        # Non-root copy path (grace review): llm-sandbox copy_to_runtime
+        # ends with a root chown; container_copy stages the file as the
+        # container user with no root exec.
+        container_copy.copy_file_to_container(session, temp_path, dest_path)
         return dest_path
     finally:
         if temp_path is not None:

@@ -70,10 +70,17 @@ All capture files are opened BEFORE the child is spawned (``O_NOFOLLOW``,
 mode 0600) and the wrapper KEEPS the fds: the summary is written through its
 pre-opened fd and the readback (§7.1 step 7) reads EXACTLY those fds —
 ``capture_reader.read_capture_files_from_fds`` — so there is ZERO path
-resolution after the spawn (P0-4, codex 03b4d034 / d384119d): a malicious
-child that renames, unlinks, replaces or symlinks anything under the capture
-directory while it runs cannot influence the readback, because the paths are
-never consulted again.
+resolution after the spawn: a malicious child that renames, unlinks,
+replaces or symlinks anything under the capture directory while it runs
+cannot influence the readback, because the paths are never consulted again.
+Honest same-uid limit (260818 review, grace): the user child shares the
+wrapper's uid, so it CAN open the very same inodes and rewrite/truncate
+them in place — fd pinning defeats path replacement, not same-inode
+writes.  That tampering is caught, not trusted: the fail-closed readback
+cross-checks each file's byte length and the record digest against the
+summary, so an in-place rewrite converges to a task FAILURE instead of a
+forged result (and the child could write arbitrary content to its own
+stdout anyway).
 
 Over-limit semantics (§7.1 实施方式 4-5, contract §4.1/§4.2): when a limit is
 hit the wrapper keeps draining (the child must never see a full pipe) but
@@ -106,10 +113,21 @@ kill issued anywhere outside this observation (or a stop request that never
 produced a marker) is NOT evidence (rule 4).  Before the spawn, main()
 fail-closed verifies that the marker path equals
 ``<control_root>/<taskId>/cancel`` derived from ``scriptPath`` — the control
-root is ``/run/alphafrog-task-control`` inside the container, overridable via
+root defaults to ``/sandbox/alphafrog-task-control`` inside the container
+(UNDER THE IMAGE'S WORLD-WRITABLE /sandbox: the container user must be able
+to create it; there is no root anymore to mkdir under /run), overridable via
 ``AF_TASK_CONTROL_ROOT`` so host-side tests and the runner agree on ONE
-location (the historical root-ownership chain check was removed with the
-privilege-drop machinery — containers no longer contain root).
+location.
+
+Honest cancel guarantee under same-uid (260818 review, grace): the wrapper,
+the user child and the control dir all share the container uid, so a
+MALICIOUS user child can delete or continuously clean its own marker file.
+The observable effect is not limited to self-cancellation: it can SUPPRESS
+an externally requested cancel, and the task then keeps occupying its
+container until the ordinary timeout (bounded by max task timeout).  The
+root-owned control chain that used to prevent this was removed with the
+privilege-drop machinery; accepting this residual risk is frog's documented
+trade-off for the non-root simplification.
 
 Process-tree cleanup (P0-2, codex b39f5e6b / 1d81ca85): a child that exits
 promptly can leave grandchildren that inherited the stdout/stderr pipes
@@ -279,7 +297,7 @@ LIMIT_KEYS = (
 # for host-side tests; the runner derives the same path from the same env.
 CANCEL_MARKER_FILE_NAME = "cancel"
 TASK_CONTROL_ROOT_ENV_NAME = "AF_TASK_CONTROL_ROOT"
-TASK_CONTROL_ROOT_DEFAULT = "/run/alphafrog-task-control"
+TASK_CONTROL_ROOT_DEFAULT = "/sandbox/alphafrog-task-control"
 # === end D11 cancel marker polling ==========================================
 
 # Pipe read size: large enough to keep a flooding child from ever filling the

@@ -23,6 +23,7 @@ from .bounded_exec_wrapper import (
     STDOUT_FILE_NAME,
     UNKNOWN_MARKER_AUDIT_FILE_NAME,
 )
+from . import container_copy
 from .cancel_registry import registry as cancel_registry
 from .capture_reader import CAPTURE_FILE_NAMES
 from .config import SandboxConfig
@@ -92,15 +93,23 @@ RUNTIME_ENVIRONMENT_FILE_NAME = "runtime-environment.json"
 # A RUNNING task's cancel marker file lives at a task-local control path
 # INSIDE the container:
 #     <control_root>/<taskId>/cancel
-# The runner creates the directory chain BEFORE the wrapper runs and
-# registers a marker writer with the cancel registry; the wrapper binds the
-# marker path EXACTLY to this derivation before it trusts the marker
-# (another task's marker or a stale path is rejected fail-closed).
-# Containers are single-use on the bounded-wrapper path (P0-5 recycle), so
-# no other task's child can pre-plant a marker in this tree.
+# The runner creates the directory chain BEFORE the wrapper runs (as the
+# container user — there is no root anymore) and registers a marker writer
+# with the cancel registry; the wrapper binds the marker path EXACTLY to
+# this derivation before it trusts the marker (another task's marker or a
+# stale path is rejected fail-closed).
+# The default root lives UNDER THE IMAGE'S WORLD-WRITABLE /sandbox: the
+# container user must be able to mkdir it (the old /run default required
+# root).  Honest same-uid trade-off (260818 review, grace): the user child
+# shares the container uid, so a malicious child can delete its own marker
+# and thereby SUPPRESS an external cancel until the ordinary timeout —
+# accepting that residual risk is frog's documented decision for the
+# non-root simplification.  Containers are single-use on the
+# bounded-wrapper path (P0-5 recycle), so no OTHER task's child can
+# pre-plant or clean a marker in this tree.
 # AF_TASK_CONTROL_ROOT overrides the default for host-side tests (the
 # wrapper derives the SAME path from the SAME env var).
-TASK_CONTROL_ROOT_DEFAULT = "/run/alphafrog-task-control"
+TASK_CONTROL_ROOT_DEFAULT = "/sandbox/alphafrog-task-control"
 TASK_CONTROL_ROOT_ENV_NAME = "AF_TASK_CONTROL_ROOT"
 TASK_CONTROL_MARKER_NAME = "cancel"
 # A stale control dir after cleanup is a residue the single-use container
@@ -283,7 +292,13 @@ def _copy_dataset_file(
     source: Path,
     dest_path: str,
 ) -> None:
-    session.copy_to_runtime(str(source), dest_path)
+    """Stage one file as the container user (no root exec, no root chown).
+
+    Delegates to app.container_copy — llm-sandbox's copy_to_runtime ends
+    with a root ``chown -R``, which the non-root container contract
+    forbids; see container_copy's module docstring.
+    """
+    container_copy.copy_file_to_container(session, source, dest_path)
 
 
 def _copy_text_to_runtime(
@@ -1053,6 +1068,20 @@ def create_sandbox_session(
     The caller owns the returned session and must close it.
     """
     validate_dynamic_install_safety(config)
+    if not config.skip_environment_setup:
+        # Non-root contract (grace review on 874b77ad): llm-sandbox 0.3.33's
+        # session.open() environment_setup() path calls _ensure_ownership,
+        # which execs `chown -R` AS ROOT — and the image's
+        # /sandbox/.sandbox-venv + .sandbox-pip-cache are build-time
+        # root-owned, so dynamic install cannot work as uid 10000 either.
+        # Dynamic install stays supported only with the historical root
+        # container, which this configuration no longer creates.
+        raise ValueError(
+            "AF_SANDBOX_SKIP_ENVIRONMENT_SETUP=false is incompatible with "
+            "the non-root sandbox container (llm-sandbox environment_setup "
+            "execs chown as root and the baked venv is root-owned); the "
+            "supported non-root mode is skip_environment_setup=true"
+        )
     effective_memory_limit: int | str = memory_limit_bytes or config.memory_limit
     runtime_configs = {
         "mem_limit": effective_memory_limit,
@@ -1065,6 +1094,18 @@ def create_sandbox_session(
         # Nothing inside the container ever runs as root, which replaced the
         # old wrapper-side privilege-drop machinery wholesale.
         "user": config.container_user,
+        # Container-boundary replacements for the two child-side protections
+        # the old drop chain enforced (grace review: non-root uid alone does
+        # not provide them — setuid/file-capability binaries in the image
+        # would remain an escalation path):
+        #   * no-new-privileges  == the old PR_SET_NO_NEW_PRIVS, now applied
+        #     to EVERY process in the container at the kernel level;
+        #   * cap_drop ALL       == the old explicit capset(empty), now the
+        #     container's bounding+effective sets start empty.
+        # Hardcoded on purpose: these are the contract, not deploy knobs —
+        # no environment variable may turn them off.
+        "security_opt": ["no-new-privileges:true"],
+        "cap_drop": ["ALL"],
         # 260808-finance-methodspec-v5 work package D: contract with package
         # B/C (ccqwen). The Python finance library reads environmentId from
         # the read-only task environment file; the file path is communicated
@@ -1085,6 +1126,12 @@ def create_sandbox_session(
         skip_environment_setup=config.skip_environment_setup,
     )
     session.open()
+    # Non-root contract, enforced at runtime (grace review): replace
+    # llm-sandbox's root-chown hook with a raiser and guard exec_run against
+    # root requests, so "no root process ever starts in this container" is a
+    # checked fact rather than a code-review promise.
+    container_copy.install_no_root_guards(session)
+    container_copy.prime_container_identity(session, config.container_user)
     return session
 
 
@@ -1359,14 +1406,15 @@ def task_control_paths(task_id: str) -> Tuple[str, str]:
 
 
 def _create_task_control_dir(session: SandboxSession, task_id: str) -> str:
-    """Create the root-owned 0700 control dir chain for this task.
+    """Create the container-user-owned 0700 control dir chain for this task.
 
-    Fail-closed on any failure (``_exec_checked`` raises): a bounded task
-    that cannot get its control directory cannot be canceled honestly, and
-    the wrapper's pre-spawn permission verification would reject the marker
-    path anyway — so the runner surfaces the problem immediately instead of
-    starting an un-cancelable child.  Returns the marker path that goes into
-    the wrapper input.
+    Runs as the container user (there is no root in the container), so the
+    control root must live under a writable location — the default is under
+    the image's world-writable /sandbox.  Fail-closed on any failure
+    (``_exec_checked`` raises): a bounded task that cannot get its control
+    directory cannot carry cancel evidence, so the runner surfaces the
+    problem immediately instead of starting a child whose marker path the
+    wrapper would reject.  Returns the marker path for the wrapper input.
     """
     root = task_control_root()
     control_dir, marker_path = task_control_paths(task_id)
