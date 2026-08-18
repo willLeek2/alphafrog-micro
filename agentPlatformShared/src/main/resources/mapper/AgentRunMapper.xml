@@ -642,6 +642,25 @@
     </update>
 
     <!--
+        260819：终态 Run 残留取消锚点的兜底收口。Run 已经由其他写入方落入任意业务终态
+        （如 20:13 中间部署经未栅栏 updateResumedTerminal 写 FAILED），上面的
+        cancelToolJobAnchorFromStatuses 因 status 不在 (WAITING_TOOL_JOB, EXECUTING)
+        永远返回 0，finalizer 每 5s 重试形成告警循环（e572：32 分钟 383 条 warn）。
+        本语句只清残留锚点，不改写已落的业务终态；三重栅栏：终态 status 集合、
+        精确 operationId、runDisposition='CANCELED'。调用方还必须先确认 ENVELOPE/
+        RELEASE/USAGE/EVENT 四步已完成（容量已释放、用量与事件已落账）。
+    -->
+    <update id="closeResidualCanceledAnchorOnTerminalRun">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = CAST('{}' AS jsonb),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status IN ('FAILED', 'CANCELED', 'COMPLETED', 'PARTIAL', 'EXPIRED')
+          AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{expectedOperationId}
+          AND tool_job_anchor_json -&gt;&gt; 'runDisposition' = 'CANCELED'
+    </update>
+
+    <!--
         清理 active anchor 仍需 operationId 所有权；不存在“按 runId 无条件清空”的旁路。
     -->
     <update id="clearActiveToolJobAnchor">

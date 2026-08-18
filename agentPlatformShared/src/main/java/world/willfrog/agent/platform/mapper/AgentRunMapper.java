@@ -258,6 +258,17 @@ public interface AgentRunMapper {
             @Param("newStatus") AgentRunStatus newStatus,
             @Param("expectedOperationId") String expectedOperationId);
 
+    /**
+     * 260819：终态 Run 残留取消锚点的兜底收口。Run 已被其他写入方落进任意业务终态
+     * （FAILED/CANCELED/COMPLETED/PARTIAL/EXPIRED）后，cancelToolJobAnchorFromStatuses
+     * 永远 0 行，finalizer 每 5s 重试形成告警循环。本语句只清空残留锚点，不改写已落
+     * 的业务终态；要求 runDisposition='CANCELED' 且 operationId 精确匹配。调用方必须
+     * 先确认 ENVELOPE/RELEASE/USAGE/EVENT 四步已完成（容量/用量/事件已落账）。
+     */
+    int closeResidualCanceledAnchorOnTerminalRun(
+            @Param("id") String id,
+            @Param("expectedOperationId") String expectedOperationId);
+
     /** 只清理仍属于指定 operation 的活跃 anchor，防止旧清理动作删除新一轮工具上下文。 */
     int clearActiveToolJobAnchor(@Param("id") String id,
                                  @Param("expectedStatus") AgentRunStatus expectedStatus,

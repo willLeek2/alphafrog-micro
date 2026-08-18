@@ -200,6 +200,20 @@ public class ToolJobAnchorService {
                 runId, anchor.toJson(), newStatus, anchor.getOperationId()) == 1;
     }
 
+    /**
+     * 260819：终态 Run 残留取消锚点的兜底收口。Run 已被其他写入方落进业务终态后，
+     * 正常取消 CAS 永远 0 行；本方法在终态 status + runDisposition=CANCELED +
+     * 精确 operationId 三重栅栏下只清空残留锚点，不改写已落的业务终态。
+     * 调用方必须先确认 ENVELOPE/RELEASE/USAGE/EVENT 四步已完成。
+     */
+    public boolean closeResidualCanceledAnchor(String runId, String operationId) {
+        if (operationId == null || operationId.isBlank()) {
+            return false;
+        }
+        return agentRunMapper.closeResidualCanceledAnchorOnTerminalRun(
+                runId, operationId) == 1;
+    }
+
     public boolean clearActive(String runId, AgentRunStatus expectedStatus, String operationId) {
         // 仅当前 operation owner 可以清空；旧回调不能删除新任务 anchor。
         return agentRunMapper.clearActiveToolJobAnchor(runId, expectedStatus, operationId) == 1;
