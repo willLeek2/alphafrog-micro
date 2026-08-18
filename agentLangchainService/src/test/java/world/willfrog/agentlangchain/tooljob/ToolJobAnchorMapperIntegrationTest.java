@@ -1100,8 +1100,9 @@ class ToolJobAnchorMapperIntegrationTest {
 
     /**
      * 260819：终态 Run 残留取消锚点的兜底收口（e572 告警循环）。Run 已被其他写入方
-     * 落进业务终态后，正常取消 CAS 永远 0 行；本语句在终态 status + 精确 operationId +
-     * runDisposition=CANCELED 三重栅栏下只清锚点，不改写已落的业务终态。
+     * 落进业务终态后，正常取消 CAS 永远 0 行；本语句在 WHERE 内完整复核终态 status、
+     * 精确 operationId、runDisposition=CANCELED、显式 autoResume=false 与
+     * finalizerStep 已达 EVENT，只清锚点，不改写已落的业务终态。
      */
     @Test
     void residualCanceledAnchorClosesOnTerminalRunAndKeepsBusinessStatus() throws Exception {
@@ -1119,6 +1120,15 @@ class ToolJobAnchorMapperIntegrationTest {
         assertThat(closed.getStatus()).isEqualTo(AgentRunStatus.FAILED);
         assertThat(closed.getToolJobAnchorJson()).isEqualTo("{}");
 
+        // status=CANCELED + finalizerStep=CANCELED：正常取消 CAS 落库后的终态锚点
+        // （grace must-fix-2：CAS 写整份 JSON 不清锚点，历史存量也要能清）
+        insertRun("run-postcas", "CANCELED", """
+            {"operationId":"run-postcas:call-1:1","autoResume":false,
+             "runDisposition":"CANCELED","finalizerStep":"CANCELED"}""");
+        assertThat(mapper.closeResidualCanceledAnchorOnTerminalRun(
+                "run-postcas", "run-postcas:call-1:1")).isEqualTo(1);
+        assertThat(mapper.findById("run-postcas").getToolJobAnchorJson()).isEqualTo("{}");
+
         // status=CANCELED（启动取消路径落库）同样允许收口
         insertRun("run-startup-cancel", "CANCELED", """
             {"operationId":"run-startup-cancel:call-1:1","autoResume":false,
@@ -1127,6 +1137,37 @@ class ToolJobAnchorMapperIntegrationTest {
                 "run-startup-cancel", "run-startup-cancel:call-1:1")).isEqualTo(1);
         assertThat(mapper.findById("run-startup-cancel").getToolJobAnchorJson())
                 .isEqualTo("{}");
+
+        // finalizerStep=EVENT（刚好达线）允许；RELEASE/USAGE/ENVELOPE 未完成用量或事件 → 0 行
+        insertRun("run-res-event", "FAILED", """
+            {"operationId":"run-res-event:call-1:1","autoResume":false,
+             "runDisposition":"CANCELED","finalizerStep":"EVENT"}""");
+        assertThat(mapper.closeResidualCanceledAnchorOnTerminalRun(
+                "run-res-event", "run-res-event:call-1:1")).isEqualTo(1);
+        for (String step : new String[] {"RELEASE", "USAGE", "ENVELOPE"}) {
+            String stepRun = "run-res-" + step.toLowerCase();
+            insertRun(stepRun, "FAILED", """
+                {"operationId":"%s:call-1:1","autoResume":false,
+                 "runDisposition":"CANCELED","finalizerStep":"%s"}""".formatted(stepRun, step));
+            assertThat(mapper.closeResidualCanceledAnchorOnTerminalRun(
+                    stepRun, stepRun + ":call-1:1"))
+                    .as("finalizerStep=%s must reject close", step)
+                    .isZero();
+        }
+
+        // finalizerStep 缺失 → 0 行
+        insertRun("run-res-nostep", "FAILED", """
+            {"operationId":"run-res-nostep:call-1:1","autoResume":false,
+             "runDisposition":"CANCELED"}""");
+        assertThat(mapper.closeResidualCanceledAnchorOnTerminalRun(
+                "run-res-nostep", "run-res-nostep:call-1:1")).isZero();
+
+        // autoResume 缺省（COALESCE→true）→ 0 行：清理只服务显式取消的锚点
+        insertRun("run-res-noauto", "FAILED", """
+            {"operationId":"run-res-noauto:call-1:1",
+             "runDisposition":"CANCELED","finalizerStep":"RESUME_READY"}""");
+        assertThat(mapper.closeResidualCanceledAnchorOnTerminalRun(
+                "run-res-noauto", "run-res-noauto:call-1:1")).isZero();
 
         // 非终态（EXECUTING）必须仍然 0 行——那是正常取消 CAS 的领地
         insertRun("run-res-exec", "EXECUTING", """
@@ -1154,6 +1195,32 @@ class ToolJobAnchorMapperIntegrationTest {
                 "run-res-nodisp", "run-res-nodisp:call-1:1")).isZero();
         assertThat(mapper.findById("run-res-nodisp").getToolJobAnchorJson())
                 .contains("run-res-nodisp:call-1:1");
+    }
+
+    /**
+     * 260819（grace must-fix-1）：Redis due 丢失/重启后，终态取消残留必须能被
+     * listActiveToolJobAnchors 60s 补扫重新发现。正常取消收口后的锚点已清成 '{}'
+     * 不会入选；无 CANCELED 处置的终态残留不在本支。
+     */
+    @Test
+    void activeBackfillDiscoversTerminalCanceledResiduals() throws Exception {
+        // e572 签名（FAILED）与正常取消落库签名（CANCELED + step=CANCELED）都要入选
+        insertRun("run-scan-e572", "FAILED", """
+            {"operationId":"run-scan-e572:call-1:1","autoResume":false,
+             "runDisposition":"CANCELED","finalizerStep":"RESUME_READY"}""");
+        insertRun("run-scan-postcas", "CANCELED", """
+            {"operationId":"run-scan-postcas:call-1:1","autoResume":false,
+             "runDisposition":"CANCELED","finalizerStep":"CANCELED"}""");
+        // 对照组：无取消处置的终态残留不入选
+        insertRun("run-scan-nodisp", "FAILED", """
+            {"operationId":"run-scan-nodisp:call-1:1","autoResume":false,
+             "finalizerStep":"RESUME_READY"}""");
+
+        AgentRunMapper mapper = newMapper();
+        assertThat(mapper.listActiveToolJobAnchors(10))
+                .extracting(AgentRun::getId)
+                .contains("run-scan-e572", "run-scan-postcas")
+                .doesNotContain("run-scan-nodisp");
     }
 
     // ========== Production service chain: version race ==========

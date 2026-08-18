@@ -646,9 +646,10 @@
         （如 20:13 中间部署经未栅栏 updateResumedTerminal 写 FAILED），上面的
         cancelToolJobAnchorFromStatuses 因 status 不在 (WAITING_TOOL_JOB, EXECUTING)
         永远返回 0，finalizer 每 5s 重试形成告警循环（e572：32 分钟 383 条 warn）。
-        本语句只清残留锚点，不改写已落的业务终态；三重栅栏：终态 status 集合、
-        精确 operationId、runDisposition='CANCELED'。调用方还必须先确认 ENVELOPE/
-        RELEASE/USAGE/EVENT 四步已完成（容量已释放、用量与事件已落账）。
+        本语句只清残留锚点，不改写已落的业务终态。数据库侧完整栅栏：终态 status 集合、
+        精确 operationId、runDisposition='CANCELED'、显式 autoResume=false，以及
+        finalizerStep 已达 EVENT 之后（ENVELOPE/RELEASE/USAGE/EVENT 均已落库——容量
+        已释放、用量与终态事件已落账），不依赖调用方内存对象的步骤判断。
     -->
     <update id="closeResidualCanceledAnchorOnTerminalRun">
         UPDATE alphafrog_agent_run
@@ -658,6 +659,9 @@
           AND status IN ('FAILED', 'CANCELED', 'COMPLETED', 'PARTIAL', 'EXPIRED')
           AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{expectedOperationId}
           AND tool_job_anchor_json -&gt;&gt; 'runDisposition' = 'CANCELED'
+          AND COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true) = false
+          AND tool_job_anchor_json -&gt;&gt; 'finalizerStep'
+                  IN ('EVENT', 'CAS_STATUS', 'RESUME_READY', 'CANCELED')
     </update>
 
     <!--
@@ -931,6 +935,15 @@
                     status IN ('FAILED', 'CANCELED')
                     AND tool_job_anchor_json -&gt;&gt; 'runDisposition'
                         IN ('DAG_BLOCKING_WORKER_LOST', 'DAG_BLOCKING_PREPARING_ABORT')
+                )
+                OR (
+                    -- 260819（grace must-fix-1）：终态取消残留必须能被补扫重新发现——
+                    -- Redis due 丢失/重启后由本扫描重建索引，再由 processItem 的直接
+                    -- 清理入口（不查 Sandbox）走 closeResidualCanceledAnchorOnTerminalRun。
+                    -- 正常取消的锚点在收口后被清成 '{}'，不会入选；容量恢复侧对
+                    -- RELEASED reservation 直接跳过，不产生账本影响。
+                    status IN ('FAILED', 'CANCELED', 'COMPLETED', 'PARTIAL', 'EXPIRED')
+                    AND tool_job_anchor_json -&gt;&gt; 'runDisposition' = 'CANCELED'
                 )
               )
         ORDER BY updated_at ASC

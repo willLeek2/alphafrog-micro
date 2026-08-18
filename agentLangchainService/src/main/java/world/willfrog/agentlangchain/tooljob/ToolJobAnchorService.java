@@ -202,9 +202,9 @@ public class ToolJobAnchorService {
 
     /**
      * 260819：终态 Run 残留取消锚点的兜底收口。Run 已被其他写入方落进业务终态后，
-     * 正常取消 CAS 永远 0 行；本方法在终态 status + runDisposition=CANCELED +
-     * 精确 operationId 三重栅栏下只清空残留锚点，不改写已落的业务终态。
-     * 调用方必须先确认 ENVELOPE/RELEASE/USAGE/EVENT 四步已完成。
+     * 正常取消 CAS 永远 0 行；本方法只清空残留锚点，不改写已落的业务终态。终态
+     * status、精确 operationId、runDisposition=CANCELED、显式 autoResume=false 与
+     * finalizerStep 已达 EVENT 的全部安全条件都在 SQL WHERE 内复核。
      */
     public boolean closeResidualCanceledAnchor(String runId, String operationId) {
         if (operationId == null || operationId.isBlank()) {

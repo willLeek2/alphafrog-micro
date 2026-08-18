@@ -395,13 +395,18 @@ public class ToolJobFinalizer {
             // canceled Run 同样必须先释放容量，再原子落 CANCELED。
             if ("CANCELED".equals(anchor.getRunDisposition())) {
                 if (isStepDone(anchor, STEP_CANCELED)) {
-                    redisCache.removeDue(runId);
-                    redisCache.deletePendingCache(runId);
+                    // 260819（grace must-fix-2）：重入时也要清掉终态锚点本身，不能只删
+                    // Redis。清理失败保留 due 作为重试入口，下一轮重入再试。
+                    if (anchorService.closeResidualCanceledAnchor(
+                            runId, anchor.getOperationId())) {
+                        redisCache.removeDue(runId);
+                        redisCache.deletePendingCache(runId);
+                    } else {
+                        log.warn("CANCELED anchor clear deferred for run={}, will retry via due",
+                                runId);
+                    }
                     return;
                 }
-                // 残留清理的进度门控必须引用数据库真实步骤：setFinalizerStep(STEP_CANCELED)
-                // 的内存推进会让之后的 isStepDone 对所有步骤恒真，先捕获再推进。
-                boolean durableThroughEvent = isStepDone(anchor, STEP_EVENT);
                 anchor.setFinalizerStep(STEP_CANCELED);
                 // 260818：取消可能落在 WAITING_TOOL_JOB（后台工具等待期）或 EXECUTING
                 // （markHandoffAccepted 已恢复执行、accepted handoff 仍在）。此前只接受
@@ -412,12 +417,10 @@ public class ToolJobFinalizer {
                     // 260819：Run 可能已被其他写入方落进任意业务终态（如 20:13 中间部署
                     // 经未栅栏 updateResumedTerminal 写 FAILED），正常取消 CAS 永远 0 行，
                     // 本分支每 5s 重试形成告警循环（e572：32 分钟 383 条 warn）。此时不再
-                    // 改写已落的业务终态，只清残留锚点；durableThroughEvent 确保
-                    // ENVELOPE/RELEASE/USAGE/EVENT 已在数据库完成，不跳过容量释放或
-                    // 用量/事件落账。
-                    if (durableThroughEvent
-                            && anchorService.closeResidualCanceledAnchor(
-                                    runId, anchor.getOperationId())) {
+                    // 改写已落的业务终态，只清残留锚点；步骤完成度、autoResume=false 与
+                    // 任务身份全部由 SQL WHERE 复核，不依赖本内存对象。
+                    if (anchorService.closeResidualCanceledAnchor(
+                            runId, anchor.getOperationId())) {
                         log.warn("Residual CANCELED anchor closed on already-terminal run={}, "
                                 + "operationId={}", runId, anchor.getOperationId());
                         redisCache.removeDue(runId);
@@ -431,11 +434,18 @@ public class ToolJobFinalizer {
                     schedulerMetrics.recordCompletion(AgentRunStatus.CANCELED);
                 }
                 publishCanceledWorkspaceFinalized(runId);
-                // DB 已持久化取消终态后才清 Redis due/cache，Redis 丢失不影响真相。
-                // STEP_CANCELED 排在最后，重入时所有前序步骤均视为完成。
-                redisCache.removeDue(runId);
-                redisCache.deletePendingCache(runId);
-                log.info("Canceled terminal finalized for run={}, capacity released", runId);
+                // 260819（grace must-fix-2）：CAS 只把 Run 收口成 CANCELED，锚点本身仍以
+                // finalizerStep=CANCELED 留在数据库；这里用同一条终态清理语句清成 '{}'。
+                // 清理失败时保留 due（重入路径会重试清理），不提前删掉唯一重试入口。
+                if (anchorService.closeResidualCanceledAnchor(
+                        runId, anchor.getOperationId())) {
+                    redisCache.removeDue(runId);
+                    redisCache.deletePendingCache(runId);
+                    log.info("Canceled terminal finalized for run={}, capacity released", runId);
+                } else {
+                    log.warn("CANCELED anchor clear deferred for run={}, will retry via due",
+                            runId);
+                }
                 return;
             }
             // 暂停状态保留 WAITING_TOOL_JOB，不生成 READY，等待用户明确恢复。

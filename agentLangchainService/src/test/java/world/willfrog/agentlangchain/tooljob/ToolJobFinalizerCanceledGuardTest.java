@@ -32,12 +32,14 @@ import static org.mockito.Mockito.*;
 class ToolJobFinalizerCanceledGuardTest {
 
     @Test
-    void firstCanceledEntryPerformsCasAndClearsRedis() throws Exception {
+    void firstCanceledEntryPerformsCasClearsAnchorAndRedis() throws Exception {
         ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
         when(anchorService.updateAnchor(eq("run-1"), any(ToolJobAnchor.class),
                 eq(AgentRunStatus.WAITING_TOOL_JOB))).thenReturn(true);
         when(anchorService.cancelFromStatuses(eq("run-1"), any(ToolJobAnchor.class),
                 eq(AgentRunStatus.CANCELED))).thenReturn(true);
+        when(anchorService.closeResidualCanceledAnchor("run-1", "run-1:call-1:1"))
+                .thenReturn(true);
 
         ToolJobRedisCache redisCache = mock(ToolJobRedisCache.class);
         ToolJobUsageHook usageHook = mock(ToolJobUsageHook.class);
@@ -73,26 +75,20 @@ class ToolJobFinalizerCanceledGuardTest {
         // Must have performed the cancel CAS (WAITING_TOOL_JOB or EXECUTING accepted)
         verify(anchorService).cancelFromStatuses(eq("run-1"), any(ToolJobAnchor.class),
                 eq(AgentRunStatus.CANCELED));
+        // 260819 must-fix-2：CAS 成功后锚点本身也清成 '{}'
+        verify(anchorService).closeResidualCanceledAnchor("run-1", "run-1:call-1:1");
         verify(finalizationService).publishFinalizedEvent("run-1", "7", "CANCELED");
-        // Must have cleared Redis after successful CAS
         verify(redisCache).removeDue("run-1");
         verify(redisCache).deletePendingCache("run-1");
     }
 
     @Test
-    void reentryWhenAlreadyCanceledSkipsCasAndStillClearsRedis() throws Exception {
+    void reentryWhenAlreadyCanceledClearsAnchorAndRedisWithoutCas() throws Exception {
         ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
-        when(anchorService.updateAnchor(eq("run-2"), any(ToolJobAnchor.class),
-                eq(AgentRunStatus.WAITING_TOOL_JOB))).thenReturn(true);
-        // cancelFromStatuses should NOT be called in reentry — but mock it anyway
-        when(anchorService.cancelFromStatuses(eq("run-2"), any(ToolJobAnchor.class),
-                eq(AgentRunStatus.CANCELED))).thenReturn(true);
+        when(anchorService.closeResidualCanceledAnchor("run-2", "run-2:call-1:1"))
+                .thenReturn(true);
 
         ToolJobRedisCache redisCache = mock(ToolJobRedisCache.class);
-        ToolJobUsageHook usageHook = mock(ToolJobUsageHook.class);
-        when(usageHook.upsertUsage(eq("run-2"), any())).thenReturn(true);
-        ToolJobEventHook eventHook = mock(ToolJobEventHook.class);
-        when(eventHook.emitTerminalEvent(eq("run-2"), any())).thenReturn(true);
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
         AgentRunFinalizationService finalizationService = mock(AgentRunFinalizationService.class);
 
@@ -102,8 +98,6 @@ class ToolJobFinalizerCanceledGuardTest {
                 mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class),
                 mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class),
                 mock(FinanceResultModelAdapter.class), runMapper, finalizationService);
-        inject(finalizer, "usageHook", usageHook);
-        inject(finalizer, "eventHook", eventHook);
 
         ToolJobAnchor anchor = new ToolJobAnchor();
         anchor.setOperationId("run-2:call-1:1");
@@ -118,8 +112,9 @@ class ToolJobFinalizerCanceledGuardTest {
         // Must NOT call the cancel CAS on reentry
         verify(anchorService, never()).cancelFromStatuses(eq("run-2"), any(ToolJobAnchor.class),
                 eq(AgentRunStatus.CANCELED));
+        // 260819 must-fix-2：重入路径也要清掉终态锚点，而不是只删 Redis
+        verify(anchorService).closeResidualCanceledAnchor("run-2", "run-2:call-1:1");
         verifyNoInteractions(runMapper, finalizationService);
-        // Must still clear Redis
         verify(redisCache).removeDue("run-2");
         verify(redisCache).deletePendingCache("run-2");
     }
@@ -131,6 +126,8 @@ class ToolJobFinalizerCanceledGuardTest {
                 eq(AgentRunStatus.WAITING_TOOL_JOB))).thenReturn(true);
         when(anchorService.cancelFromStatuses(eq("run-3"), any(ToolJobAnchor.class),
                 eq(AgentRunStatus.CANCELED))).thenReturn(true);
+        when(anchorService.closeResidualCanceledAnchor("run-3", "run-3:call-1:1"))
+                .thenReturn(true);
         ToolJobRedisCache redisCache = mock(ToolJobRedisCache.class);
         ToolJobUsageHook usageHook = mock(ToolJobUsageHook.class);
         when(usageHook.upsertUsage(eq("run-3"), any())).thenReturn(true);
@@ -199,9 +196,9 @@ class ToolJobFinalizerCanceledGuardTest {
         finalizer.handleTerminal("run-4", anchor, "SUCCEEDED", null, false);
 
         verifyNoInteractions(runMapper, finalizationService);
-        // 260819：残留清理 CAS 未胜出（mock 默认 false）时维持既有重试语义，不清 Redis。
-        // 步骤门控为真：finalizerStep=null 的锚点在本轮补跑完 RELEASE/USAGE/EVENT 并逐条
-        // 持久化成功（生产中每步都是真实 CAS）后，允许尝试残留清理是安全语义。
+        // 260819：残留清理 CAS 未胜出（mock 默认 false，SQL 栅栏拒绝）时维持既有重试语义，
+        // 不清 Redis——唯一重试入口（due）保留。
+        verify(anchorService).closeResidualCanceledAnchor("run-4", "run-4:call-1:1");
         verify(redisCache, never()).removeDue("run-4");
         verify(redisCache, never()).deletePendingCache("run-4");
     }
@@ -275,11 +272,15 @@ class ToolJobFinalizerCanceledGuardTest {
     }
 
     @Test
-    void residualCloseNotAttemptedWhenCancelCasSucceeds() throws Exception {
-        // 正常路径（WAITING_TOOL_JOB/EXECUTING）不受兜底影响：CAS 成功即完整收口。
+    void postCasAnchorClearFailureKeepsDueForRetry() throws Exception {
+        // 260819 must-fix-2：CAS 已把 Run 收口成 CANCELED，但锚点清理输掉（如瞬时 DB 故障）
+        // 时保留 due——重入路径（finalizerStep=CANCELED）会重试清理。事件在清理前已发布
+        // 且重入路径不重发，不会重复。
         ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
         when(anchorService.cancelFromStatuses(eq("run-7"), any(ToolJobAnchor.class),
                 eq(AgentRunStatus.CANCELED))).thenReturn(true);
+        when(anchorService.closeResidualCanceledAnchor("run-7", "run-7:call-1:1"))
+                .thenReturn(false);
         ToolJobRedisCache redisCache = mock(ToolJobRedisCache.class);
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
         AgentRun canceledRun = new AgentRun();
@@ -304,9 +305,41 @@ class ToolJobFinalizerCanceledGuardTest {
 
         finalizer.handleTerminal("run-7", anchor, "SUCCEEDED", null, false);
 
-        verify(anchorService, never()).closeResidualCanceledAnchor(any(), any());
+        verify(anchorService).closeResidualCanceledAnchor("run-7", "run-7:call-1:1");
         verify(finalizationService).publishFinalizedEvent("run-7", "7", "CANCELED");
-        verify(redisCache).removeDue("run-7");
+        verify(redisCache, never()).removeDue("run-7");
+        verify(redisCache, never()).deletePendingCache("run-7");
+    }
+
+    @Test
+    void reentryAnchorClearFailureKeepsDueForRetry() throws Exception {
+        // 重入路径清理输掉：保留 due 供下一轮重试，不提前删除唯一重试入口。
+        ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
+        when(anchorService.closeResidualCanceledAnchor("run-8", "run-8:call-1:1"))
+                .thenReturn(false);
+        ToolJobRedisCache redisCache = mock(ToolJobRedisCache.class);
+        AgentRunMapper runMapper = mock(AgentRunMapper.class);
+        AgentRunFinalizationService finalizationService = mock(AgentRunFinalizationService.class);
+
+        ToolJobFinalizer finalizer = new ToolJobFinalizer(
+                anchorService, redisCache,
+                mock(DataAnalysisCapacityService.class), mock(ToolJobResumeService.class),
+                mock(ToolJobConfig.class), mock(FinanceRecordChannelProcessor.class),
+                mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class),
+                mock(FinanceResultModelAdapter.class), runMapper, finalizationService);
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId("run-8:call-1:1");
+        anchor.setAutoResume(false);
+        anchor.setRunDisposition("CANCELED");
+        anchor.setTerminalRetryable(false);
+        anchor.setFinalizerStep("CANCELED");
+
+        finalizer.handleTerminal("run-8", anchor, "SUCCEEDED", null, false);
+
+        verify(anchorService).closeResidualCanceledAnchor("run-8", "run-8:call-1:1");
+        verify(anchorService, never()).cancelFromStatuses(any(), any(), any());
+        verify(redisCache, never()).removeDue("run-8");
+        verify(redisCache, never()).deletePendingCache("run-8");
     }
 
     private static void inject(Object target, String name, Object value) throws Exception {
