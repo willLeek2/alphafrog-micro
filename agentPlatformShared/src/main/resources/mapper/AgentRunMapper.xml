@@ -845,8 +845,17 @@
           AND tool_job_anchor_json &lt;&gt; '{}'::jsonb
           AND NOT (
                 status = 'EXECUTING'
-                AND tool_job_anchor_json #>> '{resumeState}' = 'LAUNCHING'
-                AND COALESCE((tool_job_anchor_json #>> '{resultConsumed}')::boolean, false)
+                AND (
+                    (tool_job_anchor_json #>> '{resumeState}' = 'LAUNCHING'
+                     AND COALESCE((tool_job_anchor_json #>> '{resultConsumed}')::boolean, false))
+                    OR
+                    -- 260818：正常 autoResume 的 ACCEPTED handoff 已由恢复 worker 持有，
+                    -- 不能被 60s 补扫重新写回 due 再次进入 Sandbox finalizer；
+                    -- 取消（autoResume=false）的 ACCEPTED 仍需被发现并走终态收口。
+                    (tool_job_anchor_json #>> '{resumeState}' = 'ACCEPTED'
+                     AND COALESCE((tool_job_anchor_json #>> '{resultConsumed}')::boolean, false)
+                     AND COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true))
+                )
               )
           AND (
                 status IN ('EXECUTING', 'WAITING_TOOL_JOB', 'WAITING')

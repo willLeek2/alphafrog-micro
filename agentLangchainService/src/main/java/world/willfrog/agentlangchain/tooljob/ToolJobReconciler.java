@@ -148,7 +148,13 @@ public class ToolJobReconciler {
             ToolJobAnchor anchor = anchorService.loadAnchor(runId);
             // DB 已无 active anchor 时清理 Redis 残留，幂等结束。
             if (anchor == null) { redisCache.removeDue(runId); redisCache.deletePendingCache(runId); return; }
-            if ("LAUNCHING".equals(anchor.getResumeState()) && anchor.isResultConsumed()) {
+            // 260818（grace round-1）：已接受 handoff 的真实状态是 ACCEPTED（CONSUMED 同源），
+            // 旧的 "LAUNCHING && isResultConsumed()" 组合在四态模型下永远为 false（死分支），
+            // 导致 EXECUTING+ACCEPTED 的 Run 被 60s 补扫重新写回 due 并反复进入 Sandbox
+            // finalizer。isResultConsumed() 从 resumeState 推导（ACCEPTED/CONSUMED），是
+            // 可实际读取的字段；autoResume=false（取消/暂停锚点）必须继续走终态收口，
+            // 不能被这条快速路径提前返回。
+            if (anchor.isResultConsumed() && anchor.isAutoResume()) {
                 // 已接受 handoff 的 Run 处于 EXECUTING；旧 due 不能再次进入 Sandbox terminal finalizer。
                 redisCache.removeDue(runId);
                 redisCache.deletePendingCache(runId);

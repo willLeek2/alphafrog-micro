@@ -750,6 +750,34 @@ class ToolJobAnchorMapperIntegrationTest {
                 .doesNotContain("run-resume-scan");
     }
 
+    /**
+     * 260818（grace round-1）：正常 autoResume（默认 true）的 EXECUTING+ACCEPTED+consumed
+     * handoff 由恢复 worker 持有，不能被 60s 补扫写回 due 再次进入 Sandbox finalizer；
+     * 取消后的 autoResume=false ACCEPTED 仍必须能被补扫发现并走终态收口。
+     */
+    @Test
+    void activeBackfillExcludesNormalAcceptedHandoffButKeepsCanceledAccepted() throws Exception {
+        // 正常恢复执行中：autoResume 缺省 = true → 排除
+        insertRun("run-accepted-normal", "EXECUTING", """
+            {"operationId":"run-accepted-normal:call-1:1","anchorState":"TERMINAL",
+             "resumeState":"ACCEPTED","resumeToken":"tok-n","resumeLeaseVersion":5,
+             "resumeLauncherOwnerId":"owner-n",
+             "resumeLauncherLeaseUntil":"2999-01-01T00:00:00Z","resultConsumed":true}""");
+        // 取消 disposition 落在恢复执行期：autoResume=false → 保留（终态收口要发现它）
+        insertRun("run-accepted-cancel", "EXECUTING", """
+            {"operationId":"run-accepted-cancel:call-1:1","anchorState":"TERMINAL",
+             "resumeState":"ACCEPTED","resumeToken":"tok-c","resumeLeaseVersion":6,
+             "resumeLauncherOwnerId":"owner-c",
+             "resumeLauncherLeaseUntil":"2999-01-01T00:00:00Z","resultConsumed":true,
+             "autoResume":false,"runDisposition":"CANCELED"}""");
+
+        AgentRunMapper mapper = newMapper();
+        assertThat(mapper.listActiveToolJobAnchors(10))
+                .extracting(AgentRun::getId)
+                .doesNotContain("run-accepted-normal")
+                .contains("run-accepted-cancel");
+    }
+
     @Test
     void twoIndependentLaunchersOnlyFirstReadyClaimWins() throws Exception {
         insertRun("run-resume-claim", "RECEIVED", """
