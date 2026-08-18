@@ -153,6 +153,41 @@ class ResolveIdentityTest(unittest.TestCase):
             verify_container_identity(session, "10000:10001")
         self.assertIsNone(getattr(session, CONTAINER_IDENTITY_ATTR, None))
 
+    # --- grace round-4: every NUMERIC field is verified on its own side ---
+    # Docker-legal forms the round-3 code skipped: a bare numeric uid,
+    # numeric uid + name group, and name user + numeric gid.  All three
+    # repros use a container whose LIVE identity is 12345:12345.
+
+    def test_bare_numeric_uid_is_verified_against_live_uid(self):
+        wrong = FakeSession(self.root, uid=12345, gid=12345)
+        with self.assertRaisesRegex(NonRootContractError, "uid"):
+            verify_container_identity(wrong, "10000")
+        # Matching uid + any non-root live gid passes (no gid was pinned).
+        ok = FakeSession(self.root, uid=10000, gid=12345)
+        self.assertEqual(
+            verify_container_identity(ok, "10000"), (10000, 12345)
+        )
+
+    def test_numeric_uid_with_name_group_is_verified_on_uid_side(self):
+        wrong = FakeSession(self.root, uid=12345, gid=12345)
+        with self.assertRaisesRegex(NonRootContractError, "uid"):
+            verify_container_identity(wrong, "10000:staff")
+        # The name-group side resolves via the container's group database;
+        # only the numeric uid side is pre-compared.
+        ok = FakeSession(self.root, uid=10000, gid=12345)
+        self.assertEqual(
+            verify_container_identity(ok, "10000:staff"), (10000, 12345)
+        )
+
+    def test_name_user_with_numeric_group_is_verified_on_gid_side(self):
+        wrong = FakeSession(self.root, uid=12345, gid=12345)
+        with self.assertRaisesRegex(NonRootContractError, "gid"):
+            verify_container_identity(wrong, "alice:10001")
+        ok = FakeSession(self.root, uid=12345, gid=10001)
+        self.assertEqual(
+            verify_container_identity(ok, "alice:10001"), (12345, 10001)
+        )
+
     def test_username_form_verified_live(self):
         session = FakeSession(self.root, uid=10000, gid=10001)
         identity = verify_container_identity(session, "alphafrog-sandbox")

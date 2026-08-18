@@ -283,18 +283,23 @@ LIMIT_KEYS = (
 )
 
 # === 260809-26Q3-stage1-w2 D11 (task #108): cancel marker polling ==========
-# The runner creates the control chain <control_root>/<taskId>/ root:root
-# 0700 inside the container and hands the EXACT marker path via the wrapper
-# input.  While the child runs, the wrapper polls that path on every timeout
-# loop turn; when it OBSERVES the marker it kills its OWN child process
-# group and reports cancelObserved=true (d6841a2e rule 2 — the only
-# evidence that justifies CANCELED for a running child).  The binding is
-# verified fail-closed BEFORE spawn: the supplied path must equal the
-# task-local derivation <control_root>/<scriptDirName>/cancel, and under
-# root the whole parent chain must be real root-owned directories with no
-# write path for the child identity (lstat-based, symlinks rejected —
-# codex 4334bc9d constraint 2).  AF_TASK_CONTROL_ROOT overrides the default
-# for host-side tests; the runner derives the same path from the same env.
+# The runner creates the control chain <control_root>/<taskId>/ inside the
+# container as the CONTAINER'S UNPRIVILEGED USER (260818 non-root
+# simplification: the old root:root 0700 chain and its lstat ownership
+# verification were removed with the privilege-drop machinery) and hands
+# the EXACT marker path via the wrapper input.  While the child runs, the
+# wrapper polls that path on every timeout loop turn; when it OBSERVES the
+# marker it kills its OWN child process group and reports
+# cancelObserved=true (d6841a2e rule 2 — the only evidence that justifies
+# CANCELED for a running child).  The binding is verified fail-closed
+# BEFORE spawn: the supplied path must equal the task-local derivation
+# <control_root>/<scriptDirName>/cancel.  Because the child shares the
+# container user's uid, malicious user code CAN delete its own marker and
+# thereby SUPPRESS an external cancel until the max task timeout — the
+# documented trade-off frog accepted on 2026-08-18 (see the UID-model
+# paragraph in this module's docstring).  AF_TASK_CONTROL_ROOT overrides
+# the default for host-side tests; the runner derives the same path from
+# the same env.
 CANCEL_MARKER_FILE_NAME = "cancel"
 TASK_CONTROL_ROOT_ENV_NAME = "AF_TASK_CONTROL_ROOT"
 TASK_CONTROL_ROOT_DEFAULT = "/sandbox/alphafrog-task-control"

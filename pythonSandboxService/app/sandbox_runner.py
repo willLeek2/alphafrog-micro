@@ -1467,8 +1467,9 @@ def _make_marker_writer(session: SandboxSession, task_id: str):
 
     The registry dispatches it on its dedicated marker-write pool when a
     stop is requested for a RUNNING task.  codex 0113bc67: the writer only
-    ever touches the marker FILE itself (touch) — the root-owned directory
-    chain was already created and is never re-created or chmod'd here.  A
+    ever touches the marker FILE itself (touch) — the control directory
+    chain (owned by the container's unprivileged user, 260818) was already
+    created and is never re-created or chmod'd here.  A
     failed touch is logged and swallowed: per d6841a2e rule 3, when the
     child finishes before the marker lands the task keeps its genuine result —
     a failed cancel attempt is honest silence, never a forced CANCELED.
@@ -1513,9 +1514,12 @@ def _stage_bounded_wrapper(
     so concurrent tasks in one container can never race on wrapper code.
     Returns the wrapper-input.json path.
 
-    D11 (task #108): ``cancel_marker_path`` is the root-owned control path
-    the wrapper polls while the child runs; the wrapper validates the exact
-    task-local binding fail-closed.  Absent (None) for pre-D11 callers.
+    D11 (task #108): ``cancel_marker_path`` is the control path (owned by
+    the container's unprivileged user — a same-uid user child CAN delete
+    the marker and suppress a cancel, the trade-off frog accepted on
+    2026-08-18) the wrapper polls while the child runs; the wrapper
+    validates the exact task-local binding fail-closed.  Absent (None) for
+    pre-D11 callers.
     """
     workdir = config.workdir.rstrip("/")
     wrapper_dir = f"{task_workspace}/{WRAPPER_DIR_NAME}"
@@ -1717,7 +1721,8 @@ def _run_bounded_wrapper_path(
     # interpreter resolution or any session interaction — so the runner never
     # indexes an unvalidated external dict.
     limits = validate_effective_output_limits(limits)
-    # D11 (task #108): create the root-owned control dir BEFORE staging and
+    # D11 (task #108): create the control dir (owned by the container's
+    # unprivileged user) BEFORE staging and
     # register the marker writer with this task's cancel handle.  A stop
     # request that already landed is delivered immediately on attach
     # (set_marker_writer checks the handle's stop flag), so no cancel can be

@@ -72,7 +72,7 @@ Java 侧建议将数据落盘：
 ```
 
 ## 说明
-- 采用 `copy-to-runtime`：请求时将数据文件复制到容器内的 `dataset_dir`。
+- 非根拷贝通道（`container_copy` → docker `put_archive`，tar 条目属主=容器用户）：请求时将数据文件复制到容器内的 `dataset_dir`；llm-sandbox 的 `copy_to_runtime`（内部以 root 执行 chown）已从所有生产路径移除。
 - 默认会安装 numpy（可通过 `libraries` 覆盖）。
 
 ## 输出上限与 Nacos 配置快照（MethodSpec V5 §7.2）

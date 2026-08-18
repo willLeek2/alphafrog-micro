@@ -41,7 +41,9 @@ class CancellationEvidence(str, Enum):
     # cancel arrived after dispatch but execution never started (the pool
     # Future was canceled before a container worker picked the job up).
     CANCELED_BEFORE_START = "canceled_before_start"
-    # the bounded wrapper OBSERVED the root-owned cancel marker and, because
+    # the bounded wrapper OBSERVED the cancel marker (owned by the
+    # container's unprivileged user — deletable by the same-uid user child,
+    # the cancel-resistance trade-off frog accepted 2026-08-18) and, because
     # of it, killed its own child process group — the only evidence that
     # justifies CANCELED for a task whose child was actually running.
     MARKER_OBSERVED = "marker_observed"
@@ -250,10 +252,14 @@ class BoundedExecRequest(BaseModel):
     # _write_loader_bootstrap), so a stale sitecustomize in the loader
     # workdir is never auto-imported at startup.
     loaderPythonPath: str = Field(..., min_length=1)
-    # 260809-26Q3-stage1-w2 D11 (task #108): the root-owned cancel marker
-    # file the wrapper polls while the child runs. Optional for backward
+    # 260809-26Q3-stage1-w2 D11 (task #108): the cancel marker file the
+    # wrapper polls while the child runs — owned by the container's
+    # unprivileged user (NOT root-protected: a same-uid user child can
+    # delete it and suppress a cancel, the trade-off frog accepted
+    # 2026-08-18). Optional for backward
     # compatibility with pre-D11 inputs; when present the wrapper validates
-    # the EXACT task-local binding (root/<taskId>/cancel) fail-closed.
+    # the EXACT task-local binding (<control_root>/<taskId>/cancel)
+    # fail-closed.
     cancelMarkerPath: Optional[str] = None
 
     @model_validator(mode="after")

@@ -107,26 +107,33 @@ def _reject_zero_identity(identity: tuple) -> None:
 def verify_container_identity(session, container_user: str) -> tuple:
     """VERIFY the container's live identity right after ``session.open()``.
 
-    grace round-3 MUST-FIX 1: both config forms (username and numeric
-    ``uid:gid``) must be validated against the container's ACTUAL running
+    grace round-3 MUST-FIX 1 (+ round-4 gap): both config forms (username
+    and numeric) must be validated against the container's ACTUAL running
     identity, read live via ``id -u`` / ``id -g`` (any stale cache is
     ignored).  Rules:
 
     * either side reading 0 → NonRootContractError (root is never
       acceptable, whatever the config said);
-    * a numeric ``uid:gid`` spec must match the live values EXACTLY — a
-      mismatch means the container runtime did not adopt the configured
-      identity, which is a contract break, not a cosmetic difference.
+    * every NUMERIC field in the spec is compared against the live value
+      on its own side — ``10000`` checks the actual uid,
+      ``10000:staff`` checks the actual uid, ``alice:10001`` checks the
+      actual gid, and a full ``uid:gid`` pair checks both.  A mismatch
+      means the container runtime did not adopt the configured identity.
+      Name-only sides cannot be pre-compared numerically (the container's
+      passwd/group database resolves them at creation — that resolution
+      is what the zero-reject observes), which is the honest boundary of
+      this check.
 
     On success the verified pair is cached on the session for the staging
     path (``copy_file_to_container`` reads it and re-checks non-zero).
     """
     spec = container_user.strip()
-    expected = None
-    if ":" in spec:
-        uid_text, _, gid_text = spec.partition(":")
-        if uid_text.isdigit() and gid_text.isdigit():
-            expected = (int(uid_text), int(gid_text))
+    user_part, _, group_part = spec.partition(":")
+    expected: dict = {}
+    if user_part.isdigit():
+        expected["uid"] = int(user_part)
+    if group_part and group_part.isdigit():
+        expected["gid"] = int(group_part)
 
     # Read LIVE state: drop any cached value so the verification cannot
     # be satisfied by an assumption.
@@ -145,12 +152,19 @@ def verify_container_identity(session, container_user: str) -> tuple:
 
     identity = (_read_id("-u"), _read_id("-g"))
     _reject_zero_identity(identity)
-    if expected is not None and identity != expected:
+    mismatches = []
+    for side, value in expected.items():
+        actual = identity[0] if side == "uid" else identity[1]
+        if actual != value:
+            mismatches.append(
+                f"{side} configured={value} actual={actual}"
+            )
+    if mismatches:
         raise NonRootContractError(
-            f"container identity mismatch: configured uid:gid="
-            f"{expected[0]}:{expected[1]} but the container reports "
-            f"uid={identity[0]} gid={identity[1]} — the container runtime "
-            "did not adopt the configured user (grace round-3 MUST-FIX 1)"
+            f"container identity mismatch: configured user={spec!r} but "
+            f"the container reports uid={identity[0]} gid={identity[1]} "
+            f"({'; '.join(mismatches)}) — the container runtime did not "
+            "adopt the configured identity (grace round-3/4)"
         )
     setattr(session, CONTAINER_IDENTITY_ATTR, identity)
     return identity
