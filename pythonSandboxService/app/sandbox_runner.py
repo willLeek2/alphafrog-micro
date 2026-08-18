@@ -441,20 +441,29 @@ def _flush_container_log(
 # explicitly quoted ``sh -lc`` argument — operators then live INSIDE one
 # argv element and are interpreted by that shell (the pattern already used
 # by the wrapper bootstrap and loader smoke check).
+# 260818 (grace round-2 on the operator guard): the tokens below are shell
+# syntax that docker's exec path NEVER interprets — docker-py shlex.splits
+# the string into argv, so each of these reaches the container as (part of)
+# a literal argument.  Command/variable substitution ($(...), ${...}, bare
+# $), backticks, globs (* and ?), background & (single or glued), newline,
+# and the redirect/pipe/sequence operators all belong here.
 _SHELL_OPERATOR_SUBSTRINGS = (
-    "&&", "||", ";", "|", ">>", ">", "<", "2>&1", "2>/dev/null",
+    "&&", "||", ";", "|", ">>", ">", "<", "&", "$", "`", "*", "?", "\n",
 )
 
 
 def _reject_bare_shell_operators(command: str) -> None:
-    """Fail closed if a command relies on shell operators at the top level.
+    """Fail closed unless the command is provably shell-free.
 
-    shlex.split mirrors docker-py's string handling.  Any argument (past
-    argv[0]) CONTAINING a shell operator means that operator reaches the
-    container as (part of) a literal argument — including glued forms like
-    ``/a;``.  ``sh -lc '<script>'`` (and ``sh -c``) passes untouched: the
-    script quotes into ONE token whose internal operators are interpreted
-    by that inner shell.
+    Contract (grace's binding formulation): the ONLY way to run shell
+    syntax is ``sh -lc <one-complete-quoted-script>`` (or ``sh -c``) —
+    after shlex.split EXACTLY three tokens, so the script is a single
+    argument whose internals the inner shell interprets.  Everything else
+    is scanned across ALL tokens INCLUDING the program name (glued forms
+    like ``echo;`` must not slip through argv[0]), plus the raw string for
+    newlines.  A loose ``sh -lc echo hi >> x`` (script not quoted whole)
+    is NOT an exemption: sh would treat only ``echo`` as the script and
+    the redirection would still never run.
     """
     try:
         tokens = shlex.split(command)
@@ -462,13 +471,41 @@ def _reject_bare_shell_operators(command: str) -> None:
         raise ValueError(
             f"unquotable exec command {command!r}: {error}"
         ) from error
-    if len(tokens) >= 2 and tokens[0] == "sh" and tokens[1] in ("-lc", "-c"):
-        return
-    for token in tokens[1:]:
+
+    if (
+        len(tokens) == 3
+        and tokens[0] == "sh"
+        and tokens[1] in ("-lc", "-c")
+    ):
+        return  # one complete quoted script — the inner shell owns it
+
+    if (
+        len(tokens) >= 2
+        and tokens[0] == "sh"
+        and tokens[1] in ("-lc", "-c")
+    ):
+        raise ValueError(
+            f"`sh {tokens[1]}` must carry the WHOLE script as one quoted "
+            f"argument (shlex.split yields {len(tokens)} tokens): {command!r}. "
+            "Without whole-script quoting the extras become positional "
+            "parameters and shell syntax still never executes."
+        )
+
+    # Newlines never survive shlex.split (they are token separators), so
+    # the raw command string itself is checked: a multi-line command that
+    # is not a single quoted sh script is a sequence, not one command.
+    if "\n" in command:
+        raise ValueError(
+            f"exec command contains a newline (a shell sequence), but the "
+            f"container exec path runs WITHOUT a shell: {command!r}. Put "
+            "the whole multi-line script inside `sh -lc <quoted-script>`."
+        )
+
+    for token in tokens:
         for operator in _SHELL_OPERATOR_SUBSTRINGS:
             if operator in token:
                 raise ValueError(
-                    f"exec command contains shell operator {operator!r} "
+                    f"exec command contains shell syntax {operator!r} "
                     f"inside argument {token!r}, but the container exec "
                     f"path runs WITHOUT a shell (docker shlex.splits the "
                     f"string, so it would become a literal argument): "

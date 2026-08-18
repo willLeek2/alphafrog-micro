@@ -240,15 +240,29 @@ class FakeContainerSession:
         import shlex as _shlex
 
         tokens = _shlex.split(command)
-        _OPERATORS = ("&&", "||", ";", "|", ">>", ">", "<", "2>&1", "2>/dev/null")
-        is_sh_script = (
-            len(tokens) >= 2 and tokens[0] == "sh" and tokens[1] in ("-lc", "-c")
+        # Same binding contract as _reject_bare_shell_operators: the ONLY
+        # shell-form allowed is `sh -lc <one-complete-quoted-script>` /
+        # `sh -c <...>` (exactly three tokens).  Everything else is scanned
+        # across ALL tokens for shell syntax, glued forms included.
+        _OPERATORS = ("&&", "||", ";", "|", ">>", ">", "<", "&", "$", "`", "*", "?", "\n")
+        strict_sh = (
+            len(tokens) == 3 and tokens[0] == "sh" and tokens[1] in ("-lc", "-c")
         )
-        if not is_sh_script:
-            for token in tokens[1:]:
+        loose_sh = (
+            not strict_sh
+            and len(tokens) >= 2
+            and tokens[0] == "sh"
+            and tokens[1] in ("-lc", "-c")
+        )
+        assert not loose_sh, (
+            f"`sh {tokens[1]}` script must be ONE quoted argument "
+            f"(got {len(tokens)} tokens): {command!r}"
+        )
+        if not strict_sh:
+            for token in tokens:
                 for operator in _OPERATORS:
                     assert operator not in token, (
-                        f"exec command relies on shell operator "
+                        f"exec command relies on shell syntax "
                         f"{operator!r} inside argument {token!r}; the real "
                         f"docker exec path would pass it as a LITERAL "
                         f"argument: {command!r}"
@@ -958,7 +972,7 @@ class ExecCommandOperatorDisciplineTest(unittest.TestCase):
             "cd /a; python m",
         ):
             with self.subTest(command=bad):
-                with self.assertRaisesRegex(ValueError, "shell operator"):
+                with self.assertRaisesRegex(ValueError, "shell syntax"):
                     _exec_checked(self.session, bad)
         self.assertEqual(self.session.commands, [])
 
@@ -1023,6 +1037,39 @@ class ExecCommandOperatorDisciplineTest(unittest.TestCase):
         _reject_bare_shell_operators("chmod 0700 /a/b/c")
         _reject_bare_shell_operators("cat /a/b/task.log")
         _reject_bare_shell_operators("sh -lc 'echo a && echo b >> /x'")
+
+    def test_guard_rejects_grace_round2_counterexamples(self):
+        # grace's binding counterexamples on 99d8f6ee: substitution,
+        # backticks, globs, background &, newline, argv[0]-glued operators
+        # and the loose sh -lc exemption ALL reached the container as
+        # literal arguments under the old guard.
+        for bad in (
+            "echo $(date)",
+            "echo `date`",
+            "rm -rf /sandbox/*",
+            "sleep 1 &",
+            "echo ${HOME}",
+            "echo $HOME",
+            "echo; hi",  # ';' glued to argv[0] — argv[0] must be scanned
+            "echo a\nrm -rf /",  # newline: sequence separator
+            "find /x -name '*.csv'",  # glob intended for the shell
+            "sh -lc echo hi >> /tmp/x",  # script NOT one quoted argument
+            "sh -c echo hi >> /tmp/x",
+        ):
+            with self.subTest(command=bad):
+                with self.assertRaises(ValueError):
+                    _reject_bare_shell_operators(bad)
+
+    def test_guard_loose_sh_lc_is_not_an_exemption(self):
+        # Even operator-free, a loose `sh -lc echo hi` (script split into
+        # several tokens) must fail: sh would run only `echo` and treat the
+        # rest as positional parameters — the command would silently do
+        # the wrong thing.
+        with self.assertRaisesRegex(ValueError, "one quoted"):
+            _reject_bare_shell_operators("sh -lc echo hi")
+        # The exact three-token form remains the only shell escape hatch.
+        _reject_bare_shell_operators("sh -lc 'echo hi'")
+        _reject_bare_shell_operators("sh -c 'echo hi'")
 
 
 class SubreaperHardGateTest(unittest.TestCase):
