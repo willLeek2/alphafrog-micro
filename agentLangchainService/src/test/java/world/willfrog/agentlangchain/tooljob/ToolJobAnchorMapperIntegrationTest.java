@@ -975,6 +975,61 @@ class ToolJobAnchorMapperIntegrationTest {
                 .doesNotContain("run-scan-cancel");
     }
 
+    /**
+     * 260818（grace round-3）：取消先落库后，身份完全匹配的旧恢复线程在
+     * 第二长工具接管 / 恢复终态写入 / 恢失败回滚三组入口都必须被数据库
+     * autoResume 栅栏拒绝，取消字段保持原样。
+     */
+    @Test
+    void cancelDispositionBlocksSecondPreparingTakeoverTerminalWriteAndRollback() throws Exception {
+        AgentRunMapper mapper = newMapper();
+        updateUserId("run-r3", "user-1");
+
+        // ① 第二长工具接管：EXECUTING+ACCEPTED+consumed，取消已落，身份字段与旧对象一致
+        insertRun("run-r3", "EXECUTING", """
+            {"operationId":"run-r3:call-1:1","anchorState":"TERMINAL",
+             "resumeState":"ACCEPTED","resumeToken":"tok-3","resumeLeaseVersion":9,
+             "resumeLauncherOwnerId":"owner-3",
+             "resumeLauncherLeaseUntil":"2999-01-01T00:00:00Z","resultConsumed":true,
+             "autoResume":false,"runDisposition":"CANCELED"}""");
+        String secondPreparing = """
+            {"operationId":"run-r3:call-2:1","anchorState":"PREPARING"}""";
+        assertThat(mapper.claimPreparingToolJobAnchorFromResume(
+                "run-r3", secondPreparing, "tok-3", 9L)).isZero();
+
+        // ② 恢复终态写入：同锚点（仍 EXECUTING、租约未过期），旧工作流尝试写 COMPLETED
+        assertThat(mapper.updateResumedTerminal(
+                "run-r3", "user-1", AgentRunStatus.COMPLETED,
+                "{\"plan\":\"new\"}", "{\"snapshot\":\"done\"}", true, null,
+                "tok-3", 9L, "owner-3")).isZero();
+        assertThat(mapper.findById("run-r3").getStatus()).isEqualTo(AgentRunStatus.EXECUTING);
+
+        // ③ 恢失败回滚：takeover 成功后的旧对象尝试退回 READY / ACCEPTED
+        //    （cancel 落在 claim/takeover 与回滚之间）
+        String rollbackJson = """
+            {"operationId":"run-r3:call-1:1","anchorState":"TERMINAL",
+             "resumeState":"READY","resumeToken":"tok-3","resumeLeaseVersion":10,
+             "autoResume":true}""";
+        assertThat(mapper.casUpdateAnchorResumeState(
+                "run-r3", rollbackJson, AgentRunStatus.EXECUTING,
+                "ACCEPTED", "tok-3", 9L)).isZero();
+        String rollbackWithStatus = """
+            {"operationId":"run-r3:call-1:1","anchorState":"TERMINAL",
+             "resumeState":"READY","resumeToken":"tok-3","resumeLeaseVersion":10,
+             "autoResume":true}""";
+        assertThat(mapper.casUpdateAnchorResumeStateAndStatus(
+                "run-r3", rollbackWithStatus, AgentRunStatus.RECEIVED, AgentRunStatus.EXECUTING,
+                "ACCEPTED", "tok-3", 9L)).isZero();
+
+        // 复读数据库：三组入口全部被拒，取消字段原样
+        ToolJobAnchor after = ToolJobAnchor.fromJson(
+                mapper.findById("run-r3").getToolJobAnchorJson());
+        assertThat(after.getRunDisposition()).isEqualTo("CANCELED");
+        assertThat(after.isAutoResume()).isFalse();
+        assertThat(after.getResumeState()).isEqualTo("ACCEPTED");
+        assertThat(mapper.findById("run-r3").getStatus()).isEqualTo(AgentRunStatus.EXECUTING);
+    }
+
     // ========== Production service chain: version race ==========
 
     private ToolJobCheckpointService newServiceChain() throws Exception {

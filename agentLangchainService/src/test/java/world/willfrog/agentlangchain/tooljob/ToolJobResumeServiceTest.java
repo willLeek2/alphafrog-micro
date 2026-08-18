@@ -21,6 +21,7 @@ import static org.mockito.ArgumentMatchers.same;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -205,6 +206,31 @@ class ToolJobResumeServiceTest {
         assertThat(result).isFalse();
         assertThat(anchor.getResumeState()).isEqualTo("READY");
         assertThat(anchor.getResumeLeaseVersion()).isEqualTo(7); // monotonic: claimedVersion+1, not reverted
+    }
+
+    // ---- 260818 (grace round-3): 回滚 CAS 输掉（如取消先落库）后无后续启动副作用 ----
+
+    @Test
+    void launchRejectedWithLosingRollbackProducesNoFurtherLaunchSideEffects() {
+        ToolJobAnchor anchor = buildReadyAnchor();
+        when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
+        when(anchorService.claimResumeLauncher(eq("run-1"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.RECEIVED), eq(AgentRunStatus.RECEIVED),
+                eq("token-v1"), eq(5L), eq("owner-a"), eq(30L))).thenReturn(true);
+        when(resumeLauncher.launch(eq("run-1"), any(ToolJobResumeContext.class))).thenReturn(false);
+        // 回滚 CAS 返回 0 行——数据库里锚点已被取消线程改成 autoResume=false+CANCELED
+        //（或被其他 owner 接管）。旧对象必须退场，不得再产生任何启动副作用。
+        when(anchorService.casResumeState(eq("run-1"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.RECEIVED), eq("LAUNCHING"), eq("token-v1"), eq(6L)))
+                .thenReturn(false);
+
+        boolean result = resumeService.tryResume("run-1");
+        assertThat(result).isFalse();
+        // 恰好一次启动尝试；回滚输掉后没有重试启动、没有二次 claim
+        verify(resumeLauncher, times(1)).launch(eq("run-1"), any(ToolJobResumeContext.class));
+        verify(anchorService, times(1)).claimResumeLauncher(
+                any(), any(), any(), any(), any(), anyLong(), any(), anyLong());
+        verifyNoInteractions(redisCache);
     }
 
     @Test

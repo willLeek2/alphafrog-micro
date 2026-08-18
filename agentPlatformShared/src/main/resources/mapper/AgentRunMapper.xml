@@ -445,6 +445,9 @@
           AND COALESCE((tool_job_anchor_json #>> '{resultConsumed}')::boolean, false)
           AND tool_job_anchor_json #>> '{resumeToken}' = #{expectedResumeToken}
           AND (tool_job_anchor_json #>> '{resumeLeaseVersion}')::bigint = #{expectedLeaseVersion}
+          <!-- 260818（grace round-3）：取消先落 autoResume=false 后，同一 token/version 的
+               第二长工具接管必须被拒——不能把取消锚点整体替换成新 PREPARING。 -->
+          AND COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true)
     </update>
 
     <!--
@@ -1049,6 +1052,9 @@
           AND tool_job_anchor_json #>> '{resumeState}' = #{expectedResumeState}
           AND tool_job_anchor_json #>> '{resumeToken}' = #{expectedResumeToken}
           AND (tool_job_anchor_json #>> '{resumeLeaseVersion}')::bigint = #{expectedLeaseVersion}
+          <!-- 260818（grace round-3）：数据库层 autoResume 栅栏——取消写不轮换 token/version，
+               旧对象的整体覆盖不能抹掉已落的 autoResume=false+CANCELED。 -->
+          AND COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true)
     </update>
 
     <update id="casUpdateAnchorResumeStateAndStatus">
@@ -1061,6 +1067,9 @@
           AND tool_job_anchor_json #>> '{resumeState}' = #{expectedResumeState}
           AND tool_job_anchor_json #>> '{resumeToken}' = #{expectedResumeToken}
           AND (tool_job_anchor_json #>> '{resumeLeaseVersion}')::bigint = #{expectedLeaseVersion}
+          <!-- 260818（grace round-3）：数据库层 autoResume 栅栏——取消写不轮换 token/version，
+               旧对象的整体覆盖不能抹掉已落的 autoResume=false+CANCELED。 -->
+          AND COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true)
     </update>
 
     <!--
@@ -1218,6 +1227,10 @@
           AND tool_job_anchor_json #>> '{resumeLauncherOwnerId}' = #{expectedLauncherOwnerId}
           AND (tool_job_anchor_json #>> '{resumeLauncherLeaseUntil}')::timestamptz
                 &gt; CURRENT_TIMESTAMP
+          <!-- 260818（grace round-3）：取消已落时旧恢复工作流不能把 Run 推成
+               COMPLETED/PARTIAL/FAILED——执行循环的停止检查挡不住最后一次检查
+               与本 UPDATE 之间的取消。 -->
+          AND COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true)
     </update>
 
     <update id="clearAcceptedResumeHandoff">
