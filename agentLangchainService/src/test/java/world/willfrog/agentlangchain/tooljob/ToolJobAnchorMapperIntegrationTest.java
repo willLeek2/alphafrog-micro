@@ -886,6 +886,95 @@ class ToolJobAnchorMapperIntegrationTest {
                 .contains("\"toolCallCount\": 1");
     }
 
+    /**
+     * 260818（grace round-2）：取消与恢复的三层封锁在数据库层的证明。
+     * 取消写（updateAnchor）不轮换 token/version——恢复线程持旧 autoResume=true 对象、
+     * 取消线程先落 autoResume=false+CANCELED 时，三个所有权 CAS（claim / takeover /
+     * accept）都必须因数据库 autoResume 栅栏返回 0，且取消字段保持不变。
+     */
+    @Test
+    void staleResumeWriterCannotOverwriteCancelDisposition() throws Exception {
+        AgentRunMapper mapper = newMapper();
+
+        // takeover 场景：EXECUTING+ACCEPTED+consumed，取消已落，租约已过期。
+        insertRun("run-race-takeover", "EXECUTING", """
+            {"operationId":"run-race-takeover:call-1:1","anchorState":"TERMINAL",
+             "resumeState":"ACCEPTED","resumeToken":"tok-t","resumeLeaseVersion":7,
+             "resumeLauncherOwnerId":"owner-old",
+             "resumeLauncherLeaseUntil":"2000-01-01T00:00:00Z","resultConsumed":true,
+             "autoResume":false,"runDisposition":"CANCELED"}""");
+        // 恢复线程手里的旧对象：autoResume 仍是 true，token/version 与数据库一致。
+        String staleTakeover = """
+            {"operationId":"run-race-takeover:call-1:1","anchorState":"TERMINAL",
+             "resumeState":"ACCEPTED","resumeToken":"tok-t","resumeLeaseVersion":7,
+             "resumeLauncherOwnerId":"owner-old","resultConsumed":true,
+             "autoResume":true,"resumeLauncherLeaseUntil":"2000-01-01T00:00:00Z"}""";
+        assertThat(mapper.takeoverExpiredResumeLauncher(
+                "run-race-takeover", staleTakeover, AgentRunStatus.EXECUTING,
+                "tok-t", 7L, "owner-old", "owner-new", 30L, 120L)).isZero();
+        ToolJobAnchor afterTakeover = ToolJobAnchor.fromJson(
+                mapper.findById("run-race-takeover").getToolJobAnchorJson());
+        assertThat(afterTakeover.getRunDisposition()).isEqualTo("CANCELED");
+        assertThat(afterTakeover.isAutoResume()).isFalse();
+
+        // claim 场景：RECEIVED+READY，取消已落。
+        insertRun("run-race-claim", "RECEIVED", """
+            {"resumeState":"READY","resumeToken":"tok-r","resumeLeaseVersion":2,
+             "autoResume":false,"runDisposition":"CANCELED"}""");
+        String staleClaim = """
+            {"resumeState":"LAUNCHING","resumeToken":"tok-r","resumeLeaseVersion":3,
+             "resumeLauncherOwnerId":"owner-new","autoResume":true}""";
+        assertThat(mapper.claimResumeLauncher(
+                "run-race-claim", staleClaim, AgentRunStatus.RECEIVED, AgentRunStatus.RECEIVED,
+                "tok-r", 2L, "owner-new", 30L)).isZero();
+        ToolJobAnchor afterClaim = ToolJobAnchor.fromJson(
+                mapper.findById("run-race-claim").getToolJobAnchorJson());
+        assertThat(afterClaim.getRunDisposition()).isEqualTo("CANCELED");
+        assertThat(afterClaim.isAutoResume()).isFalse();
+
+        // accept 场景：RECEIVED+LAUNCHING 未消费、租约未过期，取消已落。
+        insertRun("run-race-accept", "RECEIVED", """
+            {"operationId":"run-race-accept:call-1:1","anchorState":"TERMINAL",
+             "resumeState":"LAUNCHING","resumeToken":"tok-a","resumeLeaseVersion":4,
+             "resumeLauncherOwnerId":"owner-live",
+             "resumeLauncherLeaseUntil":"2999-01-01T00:00:00Z","resultConsumed":false,
+             "autoResume":false,"runDisposition":"CANCELED"}""");
+        String staleAccept = """
+            {"operationId":"run-race-accept:call-1:1","anchorState":"TERMINAL",
+             "resumeState":"ACCEPTED","resumeToken":"tok-a","resumeLeaseVersion":4,
+             "resumeLauncherOwnerId":"owner-live","resultConsumed":true,
+             "autoResume":true}""";
+        assertThat(mapper.acceptResumeHandoff(
+                "run-race-accept", staleAccept, "tok-a", 4L, "owner-live", 30L)).isZero();
+        ToolJobAnchor afterAccept = ToolJobAnchor.fromJson(
+                mapper.findById("run-race-accept").getToolJobAnchorJson());
+        assertThat(afterAccept.getRunDisposition()).isEqualTo("CANCELED");
+        assertThat(afterAccept.isAutoResume()).isFalse();
+    }
+
+    @Test
+    void resumeReadyScanExcludesCanceledAnchorButKeepsNormalExpiredHandoff() throws Exception {
+        // 正常 autoResume 的过期 ACCEPTED handoff 仍要被恢复补扫发现（恢复服务接管重试）
+        insertRun("run-scan-normal", "EXECUTING", """
+            {"operationId":"run-scan-normal:call-1:1","anchorState":"TERMINAL",
+             "resumeState":"ACCEPTED","resumeToken":"tok-n","resumeLeaseVersion":9,
+             "resumeLauncherOwnerId":"owner-n",
+             "resumeLauncherLeaseUntil":"2000-01-01T00:00:00Z","resultConsumed":true}""");
+        // 取消锚点（autoResume=false）不进恢复补扫——由终态处理路径负责
+        insertRun("run-scan-cancel", "EXECUTING", """
+            {"operationId":"run-scan-cancel:call-1:1","anchorState":"TERMINAL",
+             "resumeState":"ACCEPTED","resumeToken":"tok-c","resumeLeaseVersion":10,
+             "resumeLauncherOwnerId":"owner-c",
+             "resumeLauncherLeaseUntil":"2000-01-01T00:00:00Z","resultConsumed":true,
+             "autoResume":false,"runDisposition":"CANCELED"}""");
+
+        AgentRunMapper mapper = newMapper();
+        assertThat(mapper.listResumeReadyAnchors(10))
+                .extracting(AgentRun::getId)
+                .contains("run-scan-normal")
+                .doesNotContain("run-scan-cancel");
+    }
+
     // ========== Production service chain: version race ==========
 
     private ToolJobCheckpointService newServiceChain() throws Exception {

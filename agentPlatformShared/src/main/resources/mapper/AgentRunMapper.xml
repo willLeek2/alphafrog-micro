@@ -894,6 +894,9 @@
         FROM alphafrog_agent_run
         WHERE tool_job_anchor_json IS NOT NULL
           AND tool_job_anchor_json &lt;&gt; '{}'::jsonb
+          <!-- 260818（grace round-2）：取消/暂停锚点不进入恢复补扫，由 listActiveToolJobAnchors
+               保留并交给终态处理。 -->
+          AND COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true)
           AND (
                 (
                     status = 'RECEIVED'
@@ -1081,6 +1084,9 @@
           AND NOT COALESCE((tool_job_anchor_json #>> '{resultConsumed}')::boolean, false)
           AND tool_job_anchor_json #>> '{resumeToken}' = #{expectedResumeToken}
           AND (tool_job_anchor_json #>> '{resumeLeaseVersion}')::bigint = #{expectedLeaseVersion}
+          <!-- 260818（grace round-2）：取消写不轮换 token/version，必须在此数据库栅栏
+               拒绝"旧 autoResume=true 对象覆盖已落取消标记"的竞态。 -->
+          AND COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true)
     </update>
 
     <!--
@@ -1115,6 +1121,10 @@
           AND (tool_job_anchor_json #>> '{resumeLeaseVersion}')::bigint = #{expectedLeaseVersion}
           AND (tool_job_anchor_json #>> '{resumeLauncherOwnerId}')
                 IS NOT DISTINCT FROM #{expectedLauncherOwnerId,jdbcType=VARCHAR}
+          <!-- 260818（grace round-2）：数据库层 autoResume 栅栏——取消写（updateAnchor）
+               不轮换 token/version，恢复线程若持旧 autoResume=true 对象在取消落库后执行
+               本 CAS，必须因 autoResume=false 返回 0，不能整体覆盖取消标记。 -->
+          AND COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true)
           AND (
                 (
                     tool_job_anchor_json #>> '{resumeLauncherLeaseUntil}' IS NOT NULL
@@ -1181,6 +1191,9 @@
           AND tool_job_anchor_json #>> '{resumeLauncherOwnerId}' = #{expectedLauncherOwnerId}
           AND (tool_job_anchor_json #>> '{resumeLauncherLeaseUntil}')::timestamptz
                 &gt; CURRENT_TIMESTAMP
+          <!-- 260818（grace round-2）：同类取消竞态栅栏——取消可在 RECEIVED+LAUNCHING 期间
+               落 autoResume=false，旧对象的整体覆盖必须被数据库拒绝。 -->
+          AND COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true)
     </update>
 
     <!--

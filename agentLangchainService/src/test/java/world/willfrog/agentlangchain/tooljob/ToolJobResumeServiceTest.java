@@ -22,6 +22,7 @@ import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
@@ -80,6 +81,48 @@ class ToolJobResumeServiceTest {
                 eq("consumed-token"), eq(10L))).thenReturn(true);
 
         assertThat(resumeService.tryResume("run-1")).isTrue();
+        verify(redisCache).removeDue("run-1");
+        verify(redisCache).deletePendingCache("run-1");
+    }
+
+    // ---- 260818 (grace round-2): 取消锚点不自动恢复，CONSUMED 清理不受门控影响 ----
+
+    @Test
+    void shouldNotResumeCanceledAnchorEvenWithExpiredLease() {
+        ToolJobAnchor anchor = buildReadyAnchor();
+        anchor.setResumeState("ACCEPTED");
+        anchor.setAutoResume(false);
+        anchor.setRunDisposition("CANCELED");
+        anchor.setResumeToken("cancel-token");
+        anchor.setResumeLeaseVersion(27);
+        anchor.setResumeLauncherOwnerId("owner-a");
+        anchor.setResumeLauncherLeaseUntil(java.time.Instant.now().minusSeconds(60));
+        when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
+
+        assertThat(resumeService.tryResume("run-1")).isFalse();
+        verify(anchorService, never()).takeoverExpiredResumeLauncher(
+                any(), any(), any(), any(), anyLong(), any(), any(), anyLong(), anyLong());
+        verify(anchorService, never()).claimResumeLauncher(
+                any(), any(), any(), any(), any(), anyLong(), any(), anyLong());
+        verifyNoInteractions(resumeLauncher);
+    }
+
+    @Test
+    void consumedCleanupStillRunsWithoutAutoResume() {
+        // CONSUMED 的幂等清理在 autoResume 门控之前执行——取消后的收尾清理不能被挡。
+        ToolJobAnchor anchor = buildReadyAnchor();
+        anchor.setResumeState("CONSUMED");
+        anchor.setAutoResume(false);
+        anchor.setRunDisposition("CANCELED");
+        anchor.setResumeToken("consumed-token");
+        anchor.setResumeLeaseVersion(12);
+        when(anchorService.loadAnchor("run-1")).thenReturn(anchor);
+        when(anchorService.clearAnchorWithToken(eq("run-1"), eq("CONSUMED"),
+                eq("consumed-token"), eq(12L))).thenReturn(true);
+
+        assertThat(resumeService.tryResume("run-1")).isTrue();
+        verify(anchorService).clearAnchorWithToken(eq("run-1"), eq("CONSUMED"),
+                eq("consumed-token"), eq(12L));
         verify(redisCache).removeDue("run-1");
         verify(redisCache).deletePendingCache("run-1");
     }

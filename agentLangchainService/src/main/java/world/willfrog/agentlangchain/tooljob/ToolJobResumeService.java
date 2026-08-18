@@ -87,6 +87,14 @@ public class ToolJobResumeService {
             redisCache.deletePendingCache(runId);
             return true;
         }
+        // 260818（grace round-2）：取消/暂停锚点（autoResume=false）只做终态收尾与容量
+        // 释放，不自动恢复；CONSUMED 的幂等清理在上方分支，不受此门控影响。服务层判断
+        // 只是第一层，所有权 CAS（claimResumeLauncher / takeoverExpiredResumeLauncher /
+        // acceptResumeHandoff）在数据库层还有同一 autoResume 栅栏，防"读到旧 autoResume
+        // =true 对象后，取消线程先落 autoResume=false，恢复线程再整体覆盖锚点"的丢取消竞态。
+        if (!anchor.isAutoResume()) {
+            return false;
+        }
         // READY 需要竞争新启动租约。
         if ("READY".equals(state)) return launchFromReady(runId, anchor);
         // LAUNCHING 或 ACCEPTED：可能正在运行或已崩溃，检查 lease TTL + isActive。
