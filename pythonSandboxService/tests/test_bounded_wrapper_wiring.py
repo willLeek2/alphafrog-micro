@@ -986,6 +986,27 @@ class ExecCommandOperatorDisciplineTest(unittest.TestCase):
             "EXACTLY, keeping the glob a literal argument",
         )
 
+    def test_argv_entry_type_contract(self):
+        # grace round-4: the container type is checked FIRST — a raw
+        # command STRING is iterable and would otherwise be silently
+        # exploded into one argument per character by shlex.join.
+        for bad in ("echo", ("mkdir", "-p", "/x"), b"echo", {"cmd": 1}):
+            with self.subTest(bad=bad):
+                with self.assertRaisesRegex(ValueError, "list of str"):
+                    _exec_checked_argv(self.session, bad)
+        with self.assertRaisesRegex(ValueError, "non-empty"):
+            _exec_checked_argv(self.session, [])
+        with self.assertRaisesRegex(ValueError, "list of str"):
+            _exec_checked_argv(self.session, ["mkdir", "-p", 42])
+        # Nothing reached the container on any rejected input.
+        self.assertEqual(self.session.commands, [])
+        # A valid list still round-trips completely.
+        _exec_checked_argv(self.session, ["echo", "a b", "c*d"])
+        (command,) = self.session.commands
+        self.assertEqual(
+            self._shlex.split(command), ["echo", "a b", "c*d"]
+        )
+
     def test_env_prefix_and_cd_fail_loudly(self):
         # Structured argv makes shell-only constructs impossible to
         # disguise: an env-prefix element becomes argv[0]="AF_MODE=test"

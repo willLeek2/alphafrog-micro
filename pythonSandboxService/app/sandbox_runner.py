@@ -470,9 +470,23 @@ def _exec_checked_argv(
     argv: "list[str]",
     context: str = "",
 ) -> None:
-    """Run one no-shell command given as an argv list, fail-closed."""
-    if not argv or not all(isinstance(item, str) for item in argv):
-        raise ValueError(f"argv must be a non-empty list of str: {argv!r}")
+    """Run one no-shell command given as an argv list, fail-closed.
+
+    Contract (grace round-4): argv must be a LIST of str — checked as a
+    container type FIRST.  A raw string is iterable, so without the
+    isinstance check `shlex.join("echo")` would silently expand into one
+    argument per character; the structured interface must reject a
+    hand-written command string at the call site instead.
+    """
+    if not isinstance(argv, list):
+        raise ValueError(
+            f"argv must be a list of str (got {type(argv).__name__}): "
+            f"{argv!r} — pass each argument as its own list element"
+        )
+    if not argv:
+        raise ValueError("argv must be a non-empty list of str")
+    if not all(isinstance(item, str) for item in argv):
+        raise ValueError(f"argv must be a list of str: {argv!r}")
     _exec_checked(session, shlex.join(argv), context)
 
 
