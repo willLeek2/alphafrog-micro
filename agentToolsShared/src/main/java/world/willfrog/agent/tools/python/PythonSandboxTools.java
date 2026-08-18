@@ -692,8 +692,11 @@ public class PythonSandboxTools {
         if (!preparingPersisted) {
             // 未取得 anchor owner 时释放尚未转交的容量。
             releasePreDispatch(reservation);
+            // 260818：retryable=false——该失败由 anchor 状态机决定，同一 run 内立刻重试
+            // 必然同样失败（批次 20260818-182948 中 LLM 无停止信号连试 7 次烧完 480s）。
             return fail("executePython", "TOOL_JOB_ANCHOR_INVALID",
-                    "Failed to persist PREPARING tool-job anchor", Map.of("operation_id", identity.operationId()));
+                    "Failed to persist PREPARING tool-job anchor",
+                    Map.of("operation_id", identity.operationId(), "retryable", false));
         }
 
         /*

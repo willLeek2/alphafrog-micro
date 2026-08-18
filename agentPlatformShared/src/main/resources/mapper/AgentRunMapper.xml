@@ -428,7 +428,12 @@
 
     <!--
         恢复 worker 的第二次长工具接管：旧 handoff 已经消费且 Run 已回到 EXECUTING，
-        只有持有精确 LAUNCHING token/version 的 worker 能原子替换为新 PREPARING。
+        只有持有精确 token/version 的 worker 能原子替换为新 PREPARING。
+        260818：resumeState 同时接受 LAUNCHING（结果已注入、尚未 accept）与
+        ACCEPTED（markHandoffAccepted 已推进、恢复执行仍在跑）——此前只认
+        LAUNCHING，恢复后的第二次长工具必然两路 CAS 全败（TOOL_JOB_ANCHOR_INVALID，
+        批次 20260818-182948 15 次快速失败的根因）。token/version 栅栏不变：
+        takeover 轮换 version 后旧 worker 的替换仍被拒。
     -->
     <update id="claimPreparingToolJobAnchorFromResume">
         UPDATE alphafrog_agent_run
@@ -436,7 +441,7 @@
             updated_at = CURRENT_TIMESTAMP
         WHERE id = #{id}
           AND status = 'EXECUTING'
-          AND tool_job_anchor_json #>> '{resumeState}' = 'LAUNCHING'
+          AND tool_job_anchor_json #>> '{resumeState}' IN ('LAUNCHING', 'ACCEPTED')
           AND COALESCE((tool_job_anchor_json #>> '{resultConsumed}')::boolean, false)
           AND tool_job_anchor_json #>> '{resumeToken}' = #{expectedResumeToken}
           AND (tool_job_anchor_json #>> '{resumeLeaseVersion}')::bigint = #{expectedLeaseVersion}
@@ -568,6 +573,22 @@
             updated_at = CURRENT_TIMESTAMP
         WHERE id = #{id}
           AND status = #{expectedStatus}
+          AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{expectedOperationId}
+    </update>
+
+    <!--
+        260818：CANCELED 终态收口。expectedStatus 固定为 WAITING_TOOL_JOB 或 EXECUTING：
+        取消可能落在后台工具等待期（WAITING_TOOL_JOB），也可能落在
+        markHandoffAccepted 已把 Run 恢复为 EXECUTING 之后（accepted handoff 期间）。
+        operationId 栅栏：旧 finalizer 不能覆盖已被第二次长工具替换的新 anchor。
+    -->
+    <update id="cancelToolJobAnchorFromStatuses">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = CAST(#{toolJobAnchorJson} AS jsonb),
+            status = #{newStatus},
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status IN ('WAITING_TOOL_JOB', 'EXECUTING')
           AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{expectedOperationId}
     </update>
 

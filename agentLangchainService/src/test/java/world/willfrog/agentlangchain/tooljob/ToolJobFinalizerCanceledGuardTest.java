@@ -21,6 +21,13 @@ import static org.mockito.Mockito.*;
 /**
  * Verifies the CANCELED branch isStepDone guard added to prevent the 5-second
  * hot-loop when an already-finalized CANCELED run is re-entered.
+ *
+ * <p>260818: the terminal CAS now goes through {@code cancelFromStatuses},
+ * which accepts both WAITING_TOOL_JOB (cancel during background wait) and
+ * EXECUTING (cancel landing after markHandoffAccepted resumed execution —
+ * batch 20260818-182948's permanent-EXECUTING + dual retry loop root cause).
+ * The status-pair semantics live in the SQL and are pinned by
+ * {@code ToolJobAnchorMapperIntegrationTest}; this class pins the wiring.
  */
 class ToolJobFinalizerCanceledGuardTest {
 
@@ -29,8 +36,8 @@ class ToolJobFinalizerCanceledGuardTest {
         ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
         when(anchorService.updateAnchor(eq("run-1"), any(ToolJobAnchor.class),
                 eq(AgentRunStatus.WAITING_TOOL_JOB))).thenReturn(true);
-        when(anchorService.updateAnchorAndStatus(eq("run-1"), any(ToolJobAnchor.class),
-                eq(AgentRunStatus.CANCELED), eq(AgentRunStatus.WAITING_TOOL_JOB))).thenReturn(true);
+        when(anchorService.cancelFromStatuses(eq("run-1"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.CANCELED))).thenReturn(true);
 
         ToolJobRedisCache redisCache = mock(ToolJobRedisCache.class);
         ToolJobUsageHook usageHook = mock(ToolJobUsageHook.class);
@@ -54,6 +61,7 @@ class ToolJobFinalizerCanceledGuardTest {
         inject(finalizer, "eventHook", eventHook);
 
         ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId("run-1:call-1:1");
         anchor.setAutoResume(false);
         anchor.setRunDisposition("CANCELED");
         anchor.setTerminalRetryable(false);
@@ -62,9 +70,9 @@ class ToolJobFinalizerCanceledGuardTest {
 
         finalizer.handleTerminal("run-1", anchor, "SUCCEEDED", null, false);
 
-        // Must have performed the CAS to CANCELED
-        verify(anchorService).updateAnchorAndStatus(eq("run-1"), any(ToolJobAnchor.class),
-                eq(AgentRunStatus.CANCELED), eq(AgentRunStatus.WAITING_TOOL_JOB));
+        // Must have performed the cancel CAS (WAITING_TOOL_JOB or EXECUTING accepted)
+        verify(anchorService).cancelFromStatuses(eq("run-1"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.CANCELED));
         verify(finalizationService).publishFinalizedEvent("run-1", "7", "CANCELED");
         // Must have cleared Redis after successful CAS
         verify(redisCache).removeDue("run-1");
@@ -76,9 +84,9 @@ class ToolJobFinalizerCanceledGuardTest {
         ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
         when(anchorService.updateAnchor(eq("run-2"), any(ToolJobAnchor.class),
                 eq(AgentRunStatus.WAITING_TOOL_JOB))).thenReturn(true);
-        // updateAnchorAndStatus should NOT be called in reentry — but mock it anyway
-        when(anchorService.updateAnchorAndStatus(eq("run-2"), any(ToolJobAnchor.class),
-                eq(AgentRunStatus.CANCELED), eq(AgentRunStatus.WAITING_TOOL_JOB))).thenReturn(true);
+        // cancelFromStatuses should NOT be called in reentry — but mock it anyway
+        when(anchorService.cancelFromStatuses(eq("run-2"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.CANCELED))).thenReturn(true);
 
         ToolJobRedisCache redisCache = mock(ToolJobRedisCache.class);
         ToolJobUsageHook usageHook = mock(ToolJobUsageHook.class);
@@ -98,6 +106,7 @@ class ToolJobFinalizerCanceledGuardTest {
         inject(finalizer, "eventHook", eventHook);
 
         ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId("run-2:call-1:1");
         anchor.setAutoResume(false);
         anchor.setRunDisposition("CANCELED");
         anchor.setTerminalRetryable(false);
@@ -106,9 +115,9 @@ class ToolJobFinalizerCanceledGuardTest {
 
         finalizer.handleTerminal("run-2", anchor, "SUCCEEDED", null, false);
 
-        // Must NOT call updateAnchorAndStatus on reentry
-        verify(anchorService, never()).updateAnchorAndStatus(eq("run-2"), any(ToolJobAnchor.class),
-                eq(AgentRunStatus.CANCELED), eq(AgentRunStatus.WAITING_TOOL_JOB));
+        // Must NOT call the cancel CAS on reentry
+        verify(anchorService, never()).cancelFromStatuses(eq("run-2"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.CANCELED));
         verifyNoInteractions(runMapper, finalizationService);
         // Must still clear Redis
         verify(redisCache).removeDue("run-2");
@@ -120,8 +129,8 @@ class ToolJobFinalizerCanceledGuardTest {
         ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
         when(anchorService.updateAnchor(eq("run-3"), any(ToolJobAnchor.class),
                 eq(AgentRunStatus.WAITING_TOOL_JOB))).thenReturn(true);
-        when(anchorService.updateAnchorAndStatus(eq("run-3"), any(ToolJobAnchor.class),
-                eq(AgentRunStatus.CANCELED), eq(AgentRunStatus.WAITING_TOOL_JOB))).thenReturn(true);
+        when(anchorService.cancelFromStatuses(eq("run-3"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.CANCELED))).thenReturn(true);
         ToolJobRedisCache redisCache = mock(ToolJobRedisCache.class);
         ToolJobUsageHook usageHook = mock(ToolJobUsageHook.class);
         when(usageHook.upsertUsage(eq("run-3"), any())).thenReturn(true);
@@ -145,14 +154,15 @@ class ToolJobFinalizerCanceledGuardTest {
         inject(finalizer, "usageHook", usageHook);
         inject(finalizer, "eventHook", eventHook);
         ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId("run-3:call-1:1");
         anchor.setAutoResume(false);
         anchor.setRunDisposition("CANCELED");
         anchor.setTerminalRetryable(false);
 
         finalizer.handleTerminal("run-3", anchor, "SUCCEEDED", null, false);
 
-        verify(anchorService).updateAnchorAndStatus(eq("run-3"), any(ToolJobAnchor.class),
-                eq(AgentRunStatus.CANCELED), eq(AgentRunStatus.WAITING_TOOL_JOB));
+        verify(anchorService).cancelFromStatuses(eq("run-3"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.CANCELED));
         verify(redisCache).removeDue("run-3");
         verify(redisCache).deletePendingCache("run-3");
     }
@@ -162,8 +172,8 @@ class ToolJobFinalizerCanceledGuardTest {
         ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);
         when(anchorService.updateAnchor(eq("run-4"), any(ToolJobAnchor.class),
                 eq(AgentRunStatus.WAITING_TOOL_JOB))).thenReturn(true);
-        when(anchorService.updateAnchorAndStatus(eq("run-4"), any(ToolJobAnchor.class),
-                eq(AgentRunStatus.CANCELED), eq(AgentRunStatus.WAITING_TOOL_JOB))).thenReturn(false);
+        when(anchorService.cancelFromStatuses(eq("run-4"), any(ToolJobAnchor.class),
+                eq(AgentRunStatus.CANCELED))).thenReturn(false);
         ToolJobRedisCache redisCache = mock(ToolJobRedisCache.class);
         ToolJobUsageHook usageHook = mock(ToolJobUsageHook.class);
         when(usageHook.upsertUsage(eq("run-4"), any())).thenReturn(true);
@@ -181,6 +191,7 @@ class ToolJobFinalizerCanceledGuardTest {
         inject(finalizer, "usageHook", usageHook);
         inject(finalizer, "eventHook", eventHook);
         ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId("run-4:call-1:1");
         anchor.setAutoResume(false);
         anchor.setRunDisposition("CANCELED");
         anchor.setTerminalRetryable(false);

@@ -173,6 +173,32 @@ class PythonSandboxToolsDataIntenseTest {
         verify(dispatchStore, times(2)).persistPreparing(eq("run-test"), any());
     }
 
+    /**
+     * 260818 (batch 20260818-182948): when both anchor CAS paths fail the tool
+     * must return a NON-retryable error carrying the operation_id — the LLM
+     * previously saw no stop signal and burned the whole 480s client budget
+     * retrying (7 attempts in run e572). Capacity reserved for the aborted
+     * dispatch must also be released (releasePreDispatch).
+     */
+    @Test
+    void anchorPersistenceFailureIsNonRetryableAndReleasesCapacity() throws Exception {
+        fixtureDataset();
+        when(capacity.reserve(any(), any())).thenReturn(preparingReservation());
+        when(capacity.releaseReservation(any())).thenReturn(
+                DataAnalysisReleaseOutcome.RELEASED);
+        when(dispatchStore.persistPreparing(eq("run-test"), any())).thenReturn(false);
+
+        String result = tools.executePython("print(1)", "1", null, null, 30);
+
+        assertThat(result)
+                .contains("\"ok\":false")
+                .contains("\"code\":\"TOOL_JOB_ANCHOR_INVALID\"")
+                .contains("\"operation_id\":\"run-test:call-1:1\"")
+                .contains("\"retryable\":false");
+        verify(capacity, times(1)).releaseReservation(any());
+        verify(sandbox, never()).createTask(any());
+    }
+
     @Test
     void resumedSlowTaskConsumesExactOldHandoffBeforeSandboxCreate() throws Exception {
         fixtureDataset();

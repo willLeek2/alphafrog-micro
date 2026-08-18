@@ -400,8 +400,12 @@ public class ToolJobFinalizer {
                     return;
                 }
                 anchor.setFinalizerStep(STEP_CANCELED);
-                if (!anchorService.updateAnchorAndStatus(runId, anchor,
-                        AgentRunStatus.CANCELED, AgentRunStatus.WAITING_TOOL_JOB)) {
+                // 260818：取消可能落在 WAITING_TOOL_JOB（后台工具等待期）或 EXECUTING
+                // （markHandoffAccepted 已恢复执行、accepted handoff 仍在）。此前只接受
+                // WAITING_TOOL_JOB，后者永远 CAS 失败：Run 永久 EXECUTING + finalizer
+                // 5s 重试 + resume 租约轮换双循环（批次 20260818-182948）。
+                // operationId 栅栏防止旧 finalizer 覆盖第二次长工具的新 anchor。
+                if (!anchorService.cancelFromStatuses(runId, anchor, AgentRunStatus.CANCELED)) {
                     log.warn("CANCELED terminal transition failed for run={}, will retry", runId);
                     return;
                 }

@@ -236,6 +236,18 @@ public interface AgentRunMapper {
             @Param("expectedStatus") AgentRunStatus expectedStatus,
             @Param("expectedOperationId") String expectedOperationId);
 
+    /**
+     * 260818：CANCELED 终态收口专用。expectedStatus 同时接受 WAITING_TOOL_JOB（正常
+     * 后台工具取消）与 EXECUTING（取消落在 markHandoffAccepted 已恢复执行之后——批次
+     * 20260818-182948 两个 Run 因此永久 EXECUTING 并触发 finalizer 5s / resume 60s
+     * 双循环）。operationId 栅栏保证旧 finalizer 不能覆盖已被第二次长工具替换的新 anchor。
+     */
+    int cancelToolJobAnchorFromStatuses(
+            @Param("id") String id,
+            @Param("toolJobAnchorJson") String toolJobAnchorJson,
+            @Param("newStatus") AgentRunStatus newStatus,
+            @Param("expectedOperationId") String expectedOperationId);
+
     /** 只清理仍属于指定 operation 的活跃 anchor，防止旧清理动作删除新一轮工具上下文。 */
     int clearActiveToolJobAnchor(@Param("id") String id,
                                  @Param("expectedStatus") AgentRunStatus expectedStatus,

@@ -371,4 +371,32 @@ class ToolJobAnchorServiceTest {
                 "token-v1", 3L);
         assertThat(result).isFalse();
     }
+
+    // ===== 260818: CANCELED 终态收口专用 CAS（取消可落在恢复执行期） =====
+
+    @Test
+    void cancelFromStatusesDelegatesWithAnchorOperationIdFence() {
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId("run-1:tc-9:2");
+        when(agentRunMapper.cancelToolJobAnchorFromStatuses(
+                eq("run-1"), anyString(), eq(AgentRunStatus.CANCELED),
+                eq("run-1:tc-9:2")))
+                .thenReturn(1);
+
+        assertThat(anchorService.cancelFromStatuses("run-1", anchor, AgentRunStatus.CANCELED))
+                .isTrue();
+        verify(agentRunMapper).cancelToolJobAnchorFromStatuses(
+                eq("run-1"), anyString(), eq(AgentRunStatus.CANCELED), eq("run-1:tc-9:2"));
+    }
+
+    @Test
+    void cancelFromStatusesRejectsNonCanceledTargetStatus() {
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId("run-1:tc-9:2");
+
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
+                () -> anchorService.cancelFromStatuses("run-1", anchor, AgentRunStatus.FAILED));
+        verify(agentRunMapper, never()).cancelToolJobAnchorFromStatuses(
+                anyString(), anyString(), any(), anyString());
+    }
 }

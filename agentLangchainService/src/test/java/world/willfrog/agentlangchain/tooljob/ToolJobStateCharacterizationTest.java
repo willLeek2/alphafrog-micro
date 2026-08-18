@@ -276,13 +276,15 @@ class ToolJobStateCharacterizationTest {
         }
 
         @Test
-        @DisplayName("5 处 SQL 接受 ACCEPTED 状态")
+        @DisplayName("6 处 SQL 接受 ACCEPTED 状态")
         void acceptedInFivePredicates() {
             // 统计 IN ('LAUNCHING', 'ACCEPTED') 在 SQL 谓词中的出现次数。
-            // 恰好 5 处：takeoverExpiredResumeLauncher、heartbeatResumeLauncher、
-            // updateResumedTerminal、clearAcceptedResumeHandoff、listResumeReadyAnchors。
+            // 恰好 6 处：takeoverExpiredResumeLauncher、heartbeatResumeLauncher、
+            // updateResumedTerminal、clearAcceptedResumeHandoff、listResumeReadyAnchors、
+            // claimPreparingToolJobAnchorFromResume（260818 加入：恢复执行期间第二次
+            // 长工具必须能替换 ACCEPTED handoff，批次 20260818-182948 根因 1）。
             int count = countOccurrences(xml, "resumeState}' IN ('LAUNCHING', 'ACCEPTED')");
-            assertThat(count).as("5 处 SQL 谓词必须接受 ACCEPTED").isEqualTo(5);
+            assertThat(count).as("6 处 SQL 谓词必须接受 ACCEPTED").isEqualTo(6);
         }
 
         @Test

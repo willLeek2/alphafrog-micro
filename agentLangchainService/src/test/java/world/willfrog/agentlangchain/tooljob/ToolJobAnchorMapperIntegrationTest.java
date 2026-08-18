@@ -621,6 +621,117 @@ class ToolJobAnchorMapperIntegrationTest {
                 .doesNotContain("resume-token");
     }
 
+    // ========== 260818: batch 20260818-182948 root causes ==========
+
+    /**
+     * Root cause 1: production {@code markHandoffAccepted} advances the anchor to
+     * resumeState=ACCEPTED (resultConsumed=true) for the WHOLE resumed execution,
+     * so the second long tool necessarily meets an ACCEPTED handoff — the SQL
+     * previously matched only 'LAUNCHING' and both CAS paths failed
+     * (TOOL_JOB_ANCHOR_INVALID ×15, 5-17ms each).
+     */
+    @Test
+    void secondPreparingReplacesAcceptedStateHandoffDuringResumedExecution() throws Exception {
+        insertRun("run-accepted-handoff", "EXECUTING", """
+            {"operationId":"run-accepted-handoff:call-1:1","anchorState":"TERMINAL",
+             "resumeState":"ACCEPTED","resumeToken":"accepted-token","resumeLeaseVersion":11,
+             "resumeLauncherOwnerId":"owner-1",
+             "resumeLauncherLeaseUntil":"2999-01-01T00:00:00Z","resultConsumed":true}""");
+        AgentRunMapper mapper = newMapper();
+        String nextPreparing = """
+            {"operationId":"run-accepted-handoff:call-2:1","anchorState":"PREPARING"}""";
+
+        // token/version fences stay intact under the widened resumeState match
+        assertThat(mapper.claimPreparingToolJobAnchorFromResume(
+                "run-accepted-handoff", nextPreparing, "stale-token", 11L)).isEqualTo(0);
+        assertThat(mapper.claimPreparingToolJobAnchorFromResume(
+                "run-accepted-handoff", nextPreparing, "accepted-token", 10L)).isEqualTo(0);
+        // the 260818 fix: exact credentials replace the ACCEPTED handoff
+        assertThat(mapper.claimPreparingToolJobAnchorFromResume(
+                "run-accepted-handoff", nextPreparing, "accepted-token", 11L)).isEqualTo(1);
+        assertThat(mapper.findById("run-accepted-handoff").getToolJobAnchorJson())
+                .contains("run-accepted-handoff:call-2:1", "PREPARING")
+                .doesNotContain("accepted-token");
+    }
+
+    @Test
+    void secondPreparingStillRejectedWhenAcceptedHandoffNotConsumed() throws Exception {
+        // resultConsumed=false means the terminal result is not durable yet —
+        // the handoff must NOT be replaceable (fail-closed retention).
+        insertRun("run-accepted-unconsumed", "EXECUTING", """
+            {"operationId":"run-accepted-unconsumed:call-1:1","anchorState":"TERMINAL",
+             "resumeState":"ACCEPTED","resumeToken":"tok","resumeLeaseVersion":3,
+             "resumeLauncherOwnerId":"owner-1",
+             "resumeLauncherLeaseUntil":"2999-01-01T00:00:00Z","resultConsumed":false}""");
+        AgentRunMapper mapper = newMapper();
+        assertThat(mapper.claimPreparingToolJobAnchorFromResume(
+                "run-accepted-unconsumed",
+                "{\"operationId\":\"run-accepted-unconsumed:call-2:1\",\"anchorState\":\"PREPARING\"}",
+                "tok", 3L)).isEqualTo(0);
+        assertThat(mapper.findById("run-accepted-unconsumed").getToolJobAnchorJson())
+                .contains("run-accepted-unconsumed:call-1:1");
+    }
+
+    /**
+     * Root cause 2: cancel landing after markHandoffAccepted leaves the run
+     * EXECUTING with a CANCELED-disposition anchor; the finalizer's terminal
+     * CAS previously required WAITING_TOOL_JOB only and retried forever
+     * (5s finalizer loop + ~60s resume takeover loop, resumeLeaseVersion → 27).
+     */
+    @Test
+    void cancelTerminalCasAcceptsExecutingAndWaitingToolJobAndFencesOperation() throws Exception {
+        // EXECUTING + matching operationId → CANCELED lands (the fixed gap)
+        insertRun("run-cancel-exec", "EXECUTING", """
+            {"operationId":"run-cancel-exec:call-1:1","anchorState":"TERMINAL",
+             "resumeState":"ACCEPTED","resumeToken":"tok","resumeLeaseVersion":27,
+             "runDisposition":"CANCELED","resultConsumed":true}""");
+        AgentRunMapper mapper = newMapper();
+        String canceledAnchor = """
+            {"operationId":"run-cancel-exec:call-1:1","anchorState":"TERMINAL",
+             "resumeState":"ACCEPTED","resumeToken":"tok","resumeLeaseVersion":27,
+             "runDisposition":"CANCELED","finalizerStep":"CANCELED","resultConsumed":true}""";
+        assertThat(mapper.cancelToolJobAnchorFromStatuses(
+                "run-cancel-exec", canceledAnchor, AgentRunStatus.CANCELED,
+                "run-cancel-exec:call-1:1")).isEqualTo(1);
+        assertThat(mapper.findById("run-cancel-exec").getStatus())
+                .isEqualTo(AgentRunStatus.CANCELED);
+
+        // Wrong operationId (anchor replaced by a newer dispatch) → fenced out,
+        // neither status nor anchor changes
+        insertRun("run-cancel-fence", "EXECUTING", """
+            {"operationId":"run-cancel-fence:call-2:1","anchorState":"PREPARING"}""");
+        assertThat(mapper.cancelToolJobAnchorFromStatuses(
+                "run-cancel-fence", canceledAnchor, AgentRunStatus.CANCELED,
+                "run-cancel-fence:call-1:1")).isEqualTo(0);
+        AgentRun fenced = mapper.findById("run-cancel-fence");
+        assertThat(fenced.getStatus()).isEqualTo(AgentRunStatus.EXECUTING);
+        assertThat(fenced.getToolJobAnchorJson()).contains("call-2:1").doesNotContain("CANCELED");
+
+        // WAITING_TOOL_JOB regression: the normal background-wait cancel still lands
+        insertRun("run-cancel-wait", "WAITING_TOOL_JOB", """
+            {"operationId":"run-cancel-wait:call-1:1","anchorState":"PENDING",
+             "runDisposition":"CANCELED"}""");
+        assertThat(mapper.cancelToolJobAnchorFromStatuses(
+                "run-cancel-wait",
+                "{\"operationId\":\"run-cancel-wait:call-1:1\",\"anchorState\":\"PENDING\","
+                        + "\"runDisposition\":\"CANCELED\",\"finalizerStep\":\"CANCELED\"}",
+                AgentRunStatus.CANCELED, "run-cancel-wait:call-1:1")).isEqualTo(1);
+        assertThat(mapper.findById("run-cancel-wait").getStatus())
+                .isEqualTo(AgentRunStatus.CANCELED);
+
+        // Any other status (e.g. RECEIVED) → rejected
+        insertRun("run-cancel-other", "RECEIVED", """
+            {"operationId":"run-cancel-other:call-1:1","anchorState":"TERMINAL",
+             "runDisposition":"CANCELED"}""");
+        assertThat(mapper.cancelToolJobAnchorFromStatuses(
+                "run-cancel-other",
+                "{\"operationId\":\"run-cancel-other:call-1:1\",\"anchorState\":\"TERMINAL\","
+                        + "\"runDisposition\":\"CANCELED\",\"finalizerStep\":\"CANCELED\"}",
+                AgentRunStatus.CANCELED, "run-cancel-other:call-1:1")).isEqualTo(0);
+        assertThat(mapper.findById("run-cancel-other").getStatus())
+                .isEqualTo(AgentRunStatus.RECEIVED);
+    }
+
     @Test
     void acceptedExecutingHandoffWithLiveLeaseIsNotRequeuedOrTreatedAsDispatch() throws Exception {
         insertRun("run-resume-scan", "EXECUTING", """

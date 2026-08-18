@@ -172,6 +172,21 @@ public class ToolJobAnchorService {
                 runId, anchor.toJson(), newStatus, expectedStatus, operationId) == 1;
     }
 
+    /**
+     * 260818：CANCELED 终态收口专用 CAS——Run 允许仍处于 WAITING_TOOL_JOB 或
+     * EXECUTING（取消落在 accepted handoff 恢复执行期间），同时以 operationId 栅栏
+     * 拒绝覆盖已被第二次长工具替换的新 anchor。调用方必须传入 CANCELED 作为 newStatus。
+     */
+    public boolean cancelFromStatuses(String runId, ToolJobAnchor anchor,
+                                      AgentRunStatus newStatus) {
+        if (newStatus != AgentRunStatus.CANCELED) {
+            throw new IllegalArgumentException(
+                    "cancelFromStatuses only writes CANCELED, got " + newStatus);
+        }
+        return agentRunMapper.cancelToolJobAnchorFromStatuses(
+                runId, anchor.toJson(), newStatus, anchor.getOperationId()) == 1;
+    }
+
     public boolean clearActive(String runId, AgentRunStatus expectedStatus, String operationId) {
         // 仅当前 operation owner 可以清空；旧回调不能删除新任务 anchor。
         return agentRunMapper.clearActiveToolJobAnchor(runId, expectedStatus, operationId) == 1;
