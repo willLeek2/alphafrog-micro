@@ -106,9 +106,13 @@ def _read_installed_packages(session: Any) -> Tuple[List[dict], bool]:
         return [], False
     try:
         interpreter = shlex.quote(_resolve_target_interpreter(session))
+        # 260818: no trailing `2>/dev/null` — the exec path has no shell
+        # (docker-py shlex.splits the string), so a redirect would be a
+        # literal argument.  pip list happens to tolerate it, but keep the
+        # command operator-free by construction.
         command = (
             f"{interpreter} -m pip list --format=json "
-            "--disable-pip-version-check 2>/dev/null"
+            "--disable-pip-version-check"
         )
         output = session.execute_command(command)
         if getattr(output, "exit_code", 0) != 0:

@@ -394,7 +394,15 @@ def _log_in_container(
 ) -> None:
     """Write a timestamped log line inside the container for debugging."""
     log_path = f"{config.workspace_root}/{task_id}/task.log"
-    cmd = f"echo '[$(date -Iseconds)] {message}' >> {log_path}"
+    # 260818 fix: the exec path has no shell (see _exec_checked's operator
+    # guard), so redirection/command-substitution must live inside an
+    # explicit `sh -lc` script with the timestamp computed HOST-side.
+    timestamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+    inner = (
+        f"echo {shlex.quote(f'[{timestamp}] {message}')} "
+        f">> {shlex.quote(log_path)}"
+    )
+    cmd = f"sh -lc {shlex.quote(inner)}"
     try:
         session.execute_command(cmd)
     except Exception:
@@ -414,12 +422,60 @@ def _flush_container_log(
     """
     log_path = f"{config.workspace_root}/{task_id}/task.log"
     try:
-        output = session.execute_command(f"cat {log_path} 2>/dev/null || true")
+        output = session.execute_command(f"cat {shlex.quote(log_path)}")
         if output.stdout:
             for line in output.stdout.strip().splitlines():
                 logger.info("[container-log] task=%s %s", task_id, line)
     except Exception:
         pass
+
+
+# 260818 (stress batch 20260818-152331): the container exec path has NO
+# shell.  llm-sandbox 0.3.33 hands the command string to docker
+# ``exec_run``, and docker-py's ``exec_create`` turns a string cmd into
+# argv via shlex.split — shell operators become LITERAL arguments (the D11
+# ``mkdir -p X && chmod ...`` chain died exactly this way: mkdir tried to
+# create directories named ``&&``/``chmod``/``0700`` in the container's
+# root-owned working directory).  Commands that genuinely need shell
+# features (pipelines, redirection) must wrap the whole script in an
+# explicitly quoted ``sh -lc`` argument — operators then live INSIDE one
+# argv element and are interpreted by that shell (the pattern already used
+# by the wrapper bootstrap and loader smoke check).
+_SHELL_OPERATOR_SUBSTRINGS = (
+    "&&", "||", ";", "|", ">>", ">", "<", "2>&1", "2>/dev/null",
+)
+
+
+def _reject_bare_shell_operators(command: str) -> None:
+    """Fail closed if a command relies on shell operators at the top level.
+
+    shlex.split mirrors docker-py's string handling.  Any argument (past
+    argv[0]) CONTAINING a shell operator means that operator reaches the
+    container as (part of) a literal argument — including glued forms like
+    ``/a;``.  ``sh -lc '<script>'`` (and ``sh -c``) passes untouched: the
+    script quotes into ONE token whose internal operators are interpreted
+    by that inner shell.
+    """
+    try:
+        tokens = shlex.split(command)
+    except ValueError as error:
+        raise ValueError(
+            f"unquotable exec command {command!r}: {error}"
+        ) from error
+    if len(tokens) >= 2 and tokens[0] == "sh" and tokens[1] in ("-lc", "-c"):
+        return
+    for token in tokens[1:]:
+        for operator in _SHELL_OPERATOR_SUBSTRINGS:
+            if operator in token:
+                raise ValueError(
+                    f"exec command contains shell operator {operator!r} "
+                    f"inside argument {token!r}, but the container exec "
+                    f"path runs WITHOUT a shell (docker shlex.splits the "
+                    f"string, so it would become a literal argument): "
+                    f"{command!r}. Wrap the whole script in "
+                    "`sh -lc <quoted-script>` or issue separate single "
+                    "commands."
+                )
 
 
 def _exec_checked(
@@ -428,6 +484,7 @@ def _exec_checked(
     context: str = "",
 ) -> None:
     """Execute a command in the sandbox and raise if exit code is non-zero."""
+    _reject_bare_shell_operators(command)
     output = session.execute_command(command)
     if output.exit_code != 0:
         ctx = f" ({context})" if context else ""
@@ -1258,11 +1315,17 @@ def _read_runtime_text(session: SandboxSession, command: str) -> str:
 
 
 def _read_runtime_size(session: SandboxSession, path: str) -> int:
-    text = _read_runtime_text(
-        session,
+    # 260818 fix: pipelines/redirection need a real shell — the exec path
+    # shlex.splits strings into argv with NO shell interpretation (see
+    # _exec_checked's operator guard), so the whole script is wrapped in an
+    # explicitly quoted `sh -lc` argument.
+    script = (
         f"if [ -e {shlex.quote(path)} ]; then "
         f"find {shlex.quote(path)} -type f -exec stat -c %s {{}} + 2>/dev/null | "
-        "awk '{total += $1} END {print total + 0}'; else echo 0; fi",
+        "awk '{total += $1} END {print total + 0}'; else echo 0; fi"
+    )
+    text = _read_runtime_text(
+        session, f"sh -lc {shlex.quote(script)}",
     ).strip()
     try:
         return max(0, int(text.splitlines()[-1]))
@@ -1272,7 +1335,8 @@ def _read_runtime_size(session: SandboxSession, path: str) -> int:
 
 def _read_task_temporary_bytes(session: SandboxSession, task_workspace: str) -> int:
     quoted = shlex.quote(task_workspace)
-    command = (
+    # 260818 fix: see _read_runtime_size — pipeline wrapped in `sh -lc`.
+    script = (
         f"find {quoted} -type f "
         f"! -path {shlex.quote(task_workspace + '/input/*')} "
         f"! -path {shlex.quote(task_workspace + '/metrics/*')} "
@@ -1280,7 +1344,9 @@ def _read_task_temporary_bytes(session: SandboxSession, task_workspace: str) -> 
         f"! -name task.log -exec stat -c %s {{}} + 2>/dev/null | "
         "awk '{total += $1} END {print total + 0}'"
     )
-    text = _read_runtime_text(session, command).strip()
+    text = _read_runtime_text(
+        session, f"sh -lc {shlex.quote(script)}",
+    ).strip()
     try:
         return max(0, int(text.splitlines()[-1]))
     except (ValueError, IndexError):
@@ -1435,12 +1501,25 @@ def _create_task_control_dir(session: SandboxSession, task_id: str) -> str:
     """
     root = task_control_root()
     control_dir, marker_path = task_control_paths(task_id)
-    command = (
-        f"mkdir -p {shlex.quote(control_dir)} && "
-        f"chmod 0700 {shlex.quote(root)} && "
-        f"chmod 0700 {shlex.quote(control_dir)}"
+    # 260818 fix (stress batch 20260818-152331): the execution path has NO
+    # shell — llm-sandbox hands the string to docker exec_run, and docker-py
+    # shlex.splits it into argv (see _exec_checked's operator guard).  The
+    # old `mkdir -p X && chmod ... && chmod ...` single string therefore ran
+    # mkdir with literal `&&`/`chmod`/`0700` arguments: masked for 8 days by
+    # the root container (root could create those junk dirs in /), fatal
+    # since the non-root switch.  One command per exec, no operators.
+    _exec_checked(
+        session, f"mkdir -p {shlex.quote(control_dir)}",
+        f"create_task_control_dir task={task_id}",
     )
-    _exec_checked(session, command, f"create_task_control_dir task={task_id}")
+    _exec_checked(
+        session, f"chmod 0700 {shlex.quote(root)}",
+        f"create_task_control_dir chmod root task={task_id}",
+    )
+    _exec_checked(
+        session, f"chmod 0700 {shlex.quote(control_dir)}",
+        f"create_task_control_dir chmod dir task={task_id}",
+    )
     return marker_path
 
 
@@ -2076,7 +2155,7 @@ def run_in_open_session(
     finally:
         loader_metrics_jsonl = _read_runtime_text(
             session,
-            f"cat {shlex.quote(task_workspace + '/metrics/loader_metrics.jsonl')} 2>/dev/null || true",
+            f"cat {shlex.quote(task_workspace + '/metrics/loader_metrics.jsonl')}",
         )
         artifact_bytes_written = _read_runtime_size(session, task_workspace + "/artifacts")
         temporary_bytes_written = _read_task_temporary_bytes(session, task_workspace)

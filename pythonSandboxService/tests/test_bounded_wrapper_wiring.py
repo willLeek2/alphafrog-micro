@@ -90,7 +90,12 @@ from app.config import SandboxConfig  # noqa: E402
 from app.models import BoundedExecRequest, EffectiveOutputLimits  # noqa: E402
 from app.output_capture import MARKER_V1_PREFIX, record_batch_digest  # noqa: E402
 from app.sandbox_runner import (  # noqa: E402
+    _create_task_control_dir,
+    _exec_checked,
+    _log_in_container,
     _read_capture_from_container,
+    _read_runtime_size,
+    _reject_bare_shell_operators,
     _resolve_wrapper_interpreter,
     _run_bounded_wrapper_path,
     _stage_bounded_wrapper,
@@ -224,11 +229,34 @@ class FakeContainerSession:
 
     def execute_command(self, command: str, workdir=None):
         self.executed_commands.append(command)
+        # 260818 (stress batch 20260818-152331): mirror the REAL execution
+        # semantics — llm-sandbox hands the string to docker exec_run and
+        # docker-py shlex.splits it into argv with NO shell.  The previous
+        # host-shell fake (subprocess shell=True) happily interpreted `&&`
+        # and masked the D11 mkdir-chaining bug for 8 days.  Two guards:
+        # 1. a LOUD audit assertion on top-level shell operators (they
+        #    would be literal argv elements in production);
+        # 2. argv execution without a shell, exactly like docker exec.
+        import shlex as _shlex
+
+        tokens = _shlex.split(command)
+        _OPERATORS = ("&&", "||", ";", "|", ">>", ">", "<", "2>&1", "2>/dev/null")
+        is_sh_script = (
+            len(tokens) >= 2 and tokens[0] == "sh" and tokens[1] in ("-lc", "-c")
+        )
+        if not is_sh_script:
+            for token in tokens[1:]:
+                for operator in _OPERATORS:
+                    assert operator not in token, (
+                        f"exec command relies on shell operator "
+                        f"{operator!r} inside argument {token!r}; the real "
+                        f"docker exec path would pass it as a LITERAL "
+                        f"argument: {command!r}"
+                    )
         env = dict(os.environ)
         env["PATH"] = f"{self.bin_dir}{os.pathsep}{env.get('PATH', '')}"
         completed = subprocess.run(
-            command,
-            shell=True,
+            tokens,
             capture_output=True,
             text=True,
             env=env,
@@ -864,6 +892,137 @@ class CaptureSpawnWiringTest(unittest.TestCase):
         finally:
             for handle in capture_files.values():
                 handle.close()
+
+
+class ExecCommandOperatorDisciplineTest(unittest.TestCase):
+    """260818 fix (stress batch 20260818-152331, 0/5 runs): the container
+    exec path has NO shell — docker-py shlex.splits the command string into
+    argv, so shell operators are literal arguments.  The D11
+    ``mkdir -p X && chmod ... && chmod ...`` single string died exactly
+    that way in prod (mkdir created junk dirs named ``&&``/``chmod``/
+    ``0700`` in the root-owned working directory → Permission denied ×6 →
+    every task failed).  Masked for 8 days by the root container; exposed
+    by the non-root switch.  These tests pin the discipline: single
+    commands, or the whole script inside one quoted ``sh -lc`` argument.
+    """
+
+    def setUp(self):
+        import shlex as _shlex
+
+        self._shlex = _shlex
+        self._tmp = tempfile.TemporaryDirectory(prefix="af-opdisc-")
+        self.root = Path(self._tmp.name)
+
+        class RecordingSession:
+            def __init__(self):
+                self.commands = []
+
+            def execute_command(self, command, workdir=None):
+                self.commands.append(command)
+                return SimpleNamespace(exit_code=0, stdout="", stderr="")
+
+        self.session = RecordingSession()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_control_dir_is_three_operator_free_commands(self):
+        with mock.patch.dict(
+            os.environ, {"AF_TASK_CONTROL_ROOT": str(self.root / "ctl")}
+        ):
+            marker = _create_task_control_dir(self.session, "task-opdisc")
+        self.assertEqual(
+            self.session.commands,
+            [
+                f"mkdir -p {self._shlex.quote(str(self.root / 'ctl' / 'task-opdisc'))}",
+                f"chmod 0700 {self._shlex.quote(str(self.root / 'ctl'))}",
+                f"chmod 0700 {self._shlex.quote(str(self.root / 'ctl' / 'task-opdisc'))}",
+            ],
+            "control-dir creation must be THREE separate single commands "
+            "(the old `mkdir && chmod && chmod` string is fatal without a "
+            "shell — see class docstring)",
+        )
+        for command in self.session.commands:
+            _reject_bare_shell_operators(command)  # must not raise
+        self.assertTrue(
+            marker.endswith("/task-opdisc/cancel"), marker
+        )
+
+    def test_exec_checked_rejects_bare_operators(self):
+        for bad in (
+            "mkdir -p /a && chmod 0700 /a",
+            "cat /x || true",
+            "find /x | awk '{print}'",
+            "echo hi >> /x/y",
+            "cat /x 2>/dev/null",
+            "cd /a; python m",
+        ):
+            with self.subTest(command=bad):
+                with self.assertRaisesRegex(ValueError, "shell operator"):
+                    _exec_checked(self.session, bad)
+        self.assertEqual(self.session.commands, [])
+
+    def test_exec_checked_allows_sh_lc_quoted_scripts(self):
+        script = "set -e\ncd /work && python run.py input"
+        command = f"sh -lc {self._shlex.quote(script)}"
+        _exec_checked(self.session, command)
+        self.assertEqual(self.session.commands, [command])
+
+    def test_log_in_container_wraps_append_in_sh_lc(self):
+        from app.config import SandboxConfig  # local import keeps diff small
+
+        config = SandboxConfig(
+            data_dir=self.root / "data",
+            max_concurrency=1,
+            execution_timeout_seconds=5.0,
+            memory_limit="512m",
+            memswap_limit="512m",
+            docker_backend="docker",
+            workdir="/sandbox",
+            log_level="INFO",
+            sandbox_image="alphafrog-sandbox-runtime:latest",
+            skip_environment_setup=True,
+            preinstalled_libraries=frozenset(),
+            container_max_concurrency=1,
+            pool_enabled=False,
+            pool_min_size=0,
+            pool_max_size=1,
+            pool_acquire_timeout_seconds=30.0,
+            pool_idle_timeout_seconds=None,
+            pool_max_container_uses=None,
+            workspace_root=str(self.root / "runs"),
+            compat_input_path_enabled=True,
+        )
+        _log_in_container(self.session, "task-opdisc", config, "script_error error=X")
+        (command,) = self.session.commands
+        self.assertTrue(
+            command.startswith("sh -lc "),
+            f"the echo>> append must run inside sh -lc: {command!r}",
+        )
+        # Top-level tokens are exactly ["sh", "-lc", "<script>"] — the
+        # append operator lives INSIDE the quoted script.
+        self.assertEqual(len(self._shlex.split(command)), 3)
+        self.assertIn(">>", self._shlex.split(command)[2])
+
+    def test_read_runtime_size_wraps_pipeline_in_sh_lc(self):
+        self.session.commands.clear()
+        _read_runtime_size(self.session, str(self.root))
+        (command,) = self.session.commands
+        self.assertTrue(
+            command.startswith("sh -lc "), command
+        )
+        self.assertEqual(len(self._shlex.split(command)), 3)
+
+    def test_guard_token_table(self):
+        for token in ("&&", "||", ";", "|", ">>", ">", "<", "2>/dev/null", "2>&1"):
+            with self.subTest(token=token):
+                with self.assertRaises(ValueError):
+                    _reject_bare_shell_operators(f"echo a {token} b")
+        # Plain single commands and quoted sh -lc scripts pass.
+        _reject_bare_shell_operators("mkdir -p /a/b/c")
+        _reject_bare_shell_operators("chmod 0700 /a/b/c")
+        _reject_bare_shell_operators("cat /a/b/task.log")
+        _reject_bare_shell_operators("sh -lc 'echo a && echo b >> /x'")
 
 
 class SubreaperHardGateTest(unittest.TestCase):
