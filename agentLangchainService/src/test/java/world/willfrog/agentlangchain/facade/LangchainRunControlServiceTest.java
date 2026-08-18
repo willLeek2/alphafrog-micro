@@ -140,21 +140,22 @@ class LangchainRunControlServiceTest {
                 .thenReturn("{\"observability\":{}}");
         when(eventService.nextInterruptedExpiresAt()).thenReturn(OffsetDateTime.now().plusDays(7));
 
-        // Anchor exists and CAS succeeds
+        // Anchor exists and the narrow cancel write succeeds
         ToolJobAnchor anchor = new ToolJobAnchor();
         anchor.setOperationId("r1:tc-1:1");
         when(anchorService.loadAnchor("r1")).thenReturn(anchor);
-        when(anchorService.updateAnchor(eq("r1"), any(), eq(AgentRunStatus.WAITING_TOOL_JOB)))
+        when(anchorService.persistCancelDisposition(
+                eq("r1"), eq("r1:tc-1:1"), eq(AgentRunStatus.WAITING_TOOL_JOB)))
                 .thenReturn(true);
 
         var response = service.cancelRun(CancelAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build());
 
         // Oracle: API response shows CANCELED even though DB is WAITING_TOOL_JOB
         assertEquals("CANCELED", response.getStatus());
-        // Oracle: anchor disposition was set
-        verify(anchorService).updateAnchor(eq("r1"), argThat(a ->
-                !a.isAutoResume() && "CANCELED".equals(a.getRunDisposition())),
-                eq(AgentRunStatus.WAITING_TOOL_JOB));
+        // Oracle: cancel disposition persisted via the narrow jsonb merge (260818 grace round-4)
+        verify(anchorService).persistCancelDisposition(
+                eq("r1"), eq("r1:tc-1:1"), eq(AgentRunStatus.WAITING_TOOL_JOB));
+        verify(anchorService, never()).updateAnchor(anyString(), any(), any());
         // Oracle: snapshot updated with current status (not CANCELED)
         verify(runMapper).updateSnapshot(eq("r1"), eq("u1"), eq(AgentRunStatus.WAITING_TOOL_JOB),
                 anyString(), eq(false), isNull());
@@ -166,11 +167,13 @@ class LangchainRunControlServiceTest {
         AgentRun running = run(AgentRunStatus.WAITING_TOOL_JOB);
         when(readService.requireWritableRun("r1", "u1")).thenReturn(running);
 
-        // Anchor exists but CAS returns false
+        // Anchor exists but the narrow cancel CAS returns false; the re-read shows the
+        // SAME operationId (status raced), so there is no second attempt and we fail closed.
         ToolJobAnchor anchor = new ToolJobAnchor();
         anchor.setOperationId("r1:tc-1:1");
         when(anchorService.loadAnchor("r1")).thenReturn(anchor);
-        when(anchorService.updateAnchor(eq("r1"), any(), eq(AgentRunStatus.WAITING_TOOL_JOB)))
+        when(anchorService.persistCancelDisposition(
+                eq("r1"), eq("r1:tc-1:1"), eq(AgentRunStatus.WAITING_TOOL_JOB)))
                 .thenReturn(false);
 
         // Oracle: throws to prevent capacity leak (fail-closed)
@@ -208,7 +211,8 @@ class LangchainRunControlServiceTest {
         ToolJobAnchor anchor = new ToolJobAnchor();
         anchor.setOperationId("r1:tc-1:1");
         when(anchorService.loadAnchor("r1")).thenReturn(anchor);
-        when(anchorService.updateAnchor(eq("r1"), any(), eq(AgentRunStatus.WAITING_TOOL_JOB)))
+        when(anchorService.persistCancelDisposition(
+                eq("r1"), eq("r1:tc-1:1"), eq(AgentRunStatus.WAITING_TOOL_JOB)))
                 .thenThrow(new RuntimeException("PG write failure"));
 
         assertThrows(IllegalStateException.class, () ->
@@ -230,16 +234,18 @@ class LangchainRunControlServiceTest {
         anchor.setOperationId("r1:tc-1:1");
         when(anchorService.loadAnchor("r1")).thenReturn(anchor);
 
-        // First call: CAS fails
-        when(anchorService.updateAnchor(eq("r1"), any(), eq(AgentRunStatus.WAITING_TOOL_JOB)))
+        // First call: narrow CAS fails
+        when(anchorService.persistCancelDisposition(
+                eq("r1"), eq("r1:tc-1:1"), eq(AgentRunStatus.WAITING_TOOL_JOB)))
                 .thenReturn(false);
         assertThrows(IllegalStateException.class, () ->
                 service.cancelRun(CancelAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build()));
 
-        // Second call (retry): CAS succeeds
+        // Second call (client retry): narrow CAS succeeds
         AgentRun refreshed = run(AgentRunStatus.WAITING_TOOL_JOB);
         when(readService.requireReadableRun("r1", "u1")).thenReturn(refreshed);
-        when(anchorService.updateAnchor(eq("r1"), any(), eq(AgentRunStatus.WAITING_TOOL_JOB)))
+        when(anchorService.persistCancelDisposition(
+                eq("r1"), eq("r1:tc-1:1"), eq(AgentRunStatus.WAITING_TOOL_JOB)))
                 .thenReturn(true);
         when(observabilityService.attachObservabilityToSnapshot("r1", "{}", AgentRunStatus.CANCELED))
                 .thenReturn("{\"observability\":{}}");
@@ -249,9 +255,71 @@ class LangchainRunControlServiceTest {
 
         // Oracle: retry succeeds, disposition persisted, API shows CANCELED
         assertEquals("CANCELED", response.getStatus());
-        verify(anchorService, times(2)).updateAnchor(eq("r1"), argThat(a ->
-                !a.isAutoResume() && "CANCELED".equals(a.getRunDisposition())),
-                eq(AgentRunStatus.WAITING_TOOL_JOB));
+        verify(anchorService, times(2)).persistCancelDisposition(
+                eq("r1"), eq("r1:tc-1:1"), eq(AgentRunStatus.WAITING_TOOL_JOB));
+    }
+
+    // ---- 260818 (grace round-4): 取消写入与并发第二工具/取消失败的对称交错 ----
+
+    @Test
+    void cancelReReadsCurrentOperationAndRetriesWhenAnchorWasReplaced() {
+        // 取消线程读到第一个 operationId，窄写输给并发开始的第二个长工具（operationId 已变），
+        // 重读当前锚点后用新 operationId 重试成功——取消意图跟随当前任务而不是旧快照。
+        AgentRun running = run(AgentRunStatus.WAITING_TOOL_JOB);
+        AgentRun refreshed = run(AgentRunStatus.WAITING_TOOL_JOB);
+        when(readService.requireWritableRun("r1", "u1")).thenReturn(running);
+        when(readService.requireReadableRun("r1", "u1")).thenReturn(refreshed);
+        when(observabilityService.attachObservabilityToSnapshot("r1", "{}", AgentRunStatus.CANCELED))
+                .thenReturn("{\"observability\":{}}");
+        when(eventService.nextInterruptedExpiresAt()).thenReturn(OffsetDateTime.now().plusDays(7));
+
+        ToolJobAnchor first = new ToolJobAnchor();
+        first.setOperationId("r1:tc-1:1");
+        ToolJobAnchor second = new ToolJobAnchor();
+        second.setOperationId("r1:tc-2:1");
+        when(anchorService.loadAnchor("r1")).thenReturn(first, second);
+        when(anchorService.persistCancelDisposition(
+                eq("r1"), eq("r1:tc-1:1"), eq(AgentRunStatus.WAITING_TOOL_JOB)))
+                .thenReturn(false);
+        when(anchorService.persistCancelDisposition(
+                eq("r1"), eq("r1:tc-2:1"), eq(AgentRunStatus.WAITING_TOOL_JOB)))
+                .thenReturn(true);
+
+        var response = service.cancelRun(CancelAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build());
+
+        assertEquals("CANCELED", response.getStatus());
+        verify(anchorService).persistCancelDisposition(
+                eq("r1"), eq("r1:tc-2:1"), eq(AgentRunStatus.WAITING_TOOL_JOB));
+        verify(anchorService, never()).updateAnchor(anyString(), any(), any());
+    }
+
+    @Test
+    void cancelFailsClosedWhenReplacedOperationAlsoLoses() {
+        // 重读后的新 operationId 二次窄写仍输（任务又被替换或状态再变）：
+        // 按既有语义失败关闭，不写 Redis CANCELING/CANCELED、不发事件、不结算。
+        AgentRun running = run(AgentRunStatus.WAITING_TOOL_JOB);
+        when(readService.requireWritableRun("r1", "u1")).thenReturn(running);
+
+        ToolJobAnchor first = new ToolJobAnchor();
+        first.setOperationId("r1:tc-1:1");
+        ToolJobAnchor second = new ToolJobAnchor();
+        second.setOperationId("r1:tc-2:1");
+        when(anchorService.loadAnchor("r1")).thenReturn(first, second);
+        when(anchorService.persistCancelDisposition(
+                eq("r1"), anyString(), eq(AgentRunStatus.WAITING_TOOL_JOB)))
+                .thenReturn(false);
+
+        assertThrows(IllegalStateException.class, () ->
+                service.cancelRun(CancelAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build()));
+
+        verify(stateStore, never()).markRunStatus(eq("r1"), anyString());
+        verify(runMapper, never()).updateSnapshot(anyString(), anyString(), any(), anyString(), anyBoolean(), any());
+        verify(eventService, never()).append(anyString(), anyString(), anyString(), anyMap());
+        verify(creditSettlementService, never()).settleAsync(anyString(), anyString());
+        // 恰好两次窄写尝试（旧 operationId 一次 + 重读后的新 operationId 一次），没有整份写回
+        verify(anchorService, times(2)).persistCancelDisposition(
+                eq("r1"), anyString(), eq(AgentRunStatus.WAITING_TOOL_JOB));
+        verify(anchorService, never()).updateAnchor(anyString(), any(), any());
     }
 
     private AgentRun run(AgentRunStatus status) {

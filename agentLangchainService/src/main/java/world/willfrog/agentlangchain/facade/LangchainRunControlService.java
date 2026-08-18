@@ -118,9 +118,20 @@ public class LangchainRunControlService {
             ToolJobAnchor toolAnchor = anchorService.loadAnchor(runId);
             if (toolAnchor != null && toolAnchor.getOperationId() != null
                     && !toolAnchor.getOperationId().isBlank()) {
-                toolAnchor.setAutoResume(false);
-                toolAnchor.setRunDisposition("CANCELED");
-                boolean persisted = anchorService.updateAnchor(runId, toolAnchor, run.getStatus());
+                // 260818（grace round-4）：窄合并写——绝不整份写回内存旧锚点，防止把
+                // 并发开始的第二个长工具的 PREPARING/新 operationId 抹掉。operationId
+                // 已变时先重读当前任务重试一次，仍失败则按既有语义失败关闭。
+                boolean persisted = anchorService.persistCancelDisposition(
+                        runId, toolAnchor.getOperationId(), run.getStatus());
+                if (!persisted) {
+                    ToolJobAnchor current = anchorService.loadAnchor(runId);
+                    if (current != null && current.getOperationId() != null
+                            && !current.getOperationId().isBlank()
+                            && !current.getOperationId().equals(toolAnchor.getOperationId())) {
+                        persisted = anchorService.persistCancelDisposition(
+                                runId, current.getOperationId(), run.getStatus());
+                    }
+                }
                 if (!persisted) {
                     log.warn("Cancel CAS failed for run={}: unable to persist anchor disposition — "
                             + "run left untouched to prevent capacity leak. "

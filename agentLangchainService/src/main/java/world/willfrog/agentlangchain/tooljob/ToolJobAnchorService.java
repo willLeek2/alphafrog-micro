@@ -65,6 +65,19 @@ public class ToolJobAnchorService {
         return rows == 1;
     }
 
+    /**
+     * 260818（grace round-4）：取消意图的窄持久化——只合并 autoResume=false 与
+     * runDisposition=CANCELED 两个字段，绑定精确 operationId，绝不整份写回旧锚点。
+     * 第二个长工具已替换锚点时返回 false，调用方重读当前任务后重试或失败关闭。
+     */
+    public boolean persistCancelDisposition(String runId, String operationId,
+                                             AgentRunStatus expectedStatus) {
+        if (operationId == null || operationId.isBlank()) {
+            return false;
+        }
+        return agentRunMapper.persistCancelDisposition(runId, expectedStatus, operationId) == 1;
+    }
+
     public boolean claimPreparing(String runId, ToolJobAnchor anchor, AgentRunStatus expectedStatus) {
         // 只有空 anchor 才能创建 PREPARING owner，重复分发会返回 false。
         return agentRunMapper.claimPreparingToolJobAnchor(

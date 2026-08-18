@@ -1030,6 +1030,74 @@ class ToolJobAnchorMapperIntegrationTest {
         assertThat(mapper.findById("run-r3").getStatus()).isEqualTo(AgentRunStatus.EXECUTING);
     }
 
+    /**
+     * 260818（grace round-4）：取消写入自身的两个对称交错。
+     * ① 新工具先赢：第二个 PREPARING 已提交后，持旧 operationId 的取消请求必须被拒
+     *   （不能把第二个任务的持久身份整份抹回第一条 ACCEPTED）；对当前 operationId
+     *   的取消是 jsonb 窄合并，只写 autoResume=false+CANCELED，任务身份原样保留。
+     * ② 取消先写：持旧 autoResume=true 对象的 finalizer/reconciler 整份写入
+     *   （updateToolJobAnchor / updateToolJobAnchorAndStatus / updateActiveToolJobAnchor /
+     *   updateToolJobAnchorAndStatusByOperation）必须因读写一致性检查返回 0，
+     *   取消标记不被改回；取消后读取（autoResume=false）的写入者仍然可用。
+     */
+    @Test
+    void narrowCancelWriteSurvivesBothInterleavingsWithWholeAnchorWriters() throws Exception {
+        AgentRunMapper mapper = newMapper();
+
+        // ---------- ① 新工具先赢，取消后写 ----------
+        insertRun("run-r4", "EXECUTING", """
+            {"operationId":"run-r4:tc-2:1","anchorState":"PREPARING",
+             "resumeToken":"tok-4","resumeLeaseVersion":3}""");
+        // 取消线程读取时看到的是旧 operationId：必须返回 0，第二个任务的身份不动
+        assertThat(mapper.persistCancelDisposition(
+                "run-r4", AgentRunStatus.EXECUTING, "run-r4:tc-1:1")).isZero();
+        ToolJobAnchor untouched = ToolJobAnchor.fromJson(
+                mapper.findById("run-r4").getToolJobAnchorJson());
+        assertThat(untouched.getOperationId()).isEqualTo("run-r4:tc-2:1");
+        assertThat(untouched.getAnchorState()).isEqualTo("PREPARING");
+        assertThat(untouched.getRunDisposition()).isNull();
+        // 对当前 operationId 的取消：窄合并成功，PREPARING 身份保留
+        assertThat(mapper.persistCancelDisposition(
+                "run-r4", AgentRunStatus.EXECUTING, "run-r4:tc-2:1")).isEqualTo(1);
+        ToolJobAnchor canceled = ToolJobAnchor.fromJson(
+                mapper.findById("run-r4").getToolJobAnchorJson());
+        assertThat(canceled.getOperationId()).isEqualTo("run-r4:tc-2:1");
+        assertThat(canceled.getAnchorState()).isEqualTo("PREPARING");
+        assertThat(canceled.getRunDisposition()).isEqualTo("CANCELED");
+        assertThat(canceled.isAutoResume()).isFalse();
+
+        // ---------- ② 取消先写，普通整份写入后写 ----------
+        // 旧 finalizer/reconciler 对象：autoResume=true，其余身份与数据库一致
+        String staleWhole = """
+            {"operationId":"run-r4:tc-2:1","anchorState":"ATTACHED","taskId":"task-2",
+             "resumeToken":"tok-4","resumeLeaseVersion":3,"autoResume":true}""";
+        assertThat(mapper.updateToolJobAnchor(
+                "run-r4", staleWhole, AgentRunStatus.EXECUTING)).isZero();
+        assertThat(mapper.updateToolJobAnchorAndStatus(
+                "run-r4", staleWhole, AgentRunStatus.WAITING_TOOL_JOB,
+                AgentRunStatus.EXECUTING)).isZero();
+        assertThat(mapper.updateActiveToolJobAnchor(
+                "run-r4", staleWhole, AgentRunStatus.EXECUTING, "run-r4:tc-2:1")).isZero();
+        assertThat(mapper.updateToolJobAnchorAndStatusByOperation(
+                "run-r4", staleWhole, AgentRunStatus.WAITING_TOOL_JOB,
+                AgentRunStatus.EXECUTING, "run-r4:tc-2:1")).isZero();
+
+        ToolJobAnchor afterStaleWriters = ToolJobAnchor.fromJson(
+                mapper.findById("run-r4").getToolJobAnchorJson());
+        assertThat(afterStaleWriters.getRunDisposition()).isEqualTo("CANCELED");
+        assertThat(afterStaleWriters.isAutoResume()).isFalse();
+        assertThat(afterStaleWriters.getOperationId()).isEqualTo("run-r4:tc-2:1");
+        assertThat(mapper.findById("run-r4").getStatus()).isEqualTo(AgentRunStatus.EXECUTING);
+
+        // 取消之后读取的写入者（对象里 autoResume=false）不受影响
+        String postCancelWriter = """
+            {"operationId":"run-r4:tc-2:1","anchorState":"ATTACHED","taskId":"task-2",
+             "resumeToken":"tok-4","resumeLeaseVersion":3,
+             "autoResume":false,"runDisposition":"CANCELED"}""";
+        assertThat(mapper.updateToolJobAnchor(
+                "run-r4", postCancelWriter, AgentRunStatus.EXECUTING)).isEqualTo(1);
+    }
+
     // ========== Production service chain: version race ==========
 
     private ToolJobCheckpointService newServiceChain() throws Exception {

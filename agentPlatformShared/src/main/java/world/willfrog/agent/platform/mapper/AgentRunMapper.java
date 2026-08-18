@@ -158,6 +158,16 @@ public interface AgentRunMapper {
                                      @Param("expectedStatus") AgentRunStatus expectedStatus);
 
     /**
+     * 260818（grace round-4）：取消意图专用窄写——仅在 Run 状态与精确 operationId 仍
+     * 匹配时，用 jsonb 合并只写 autoResume=false 与 runDisposition=CANCELED，绝不写回
+     * 内存中的整份旧锚点。返回 0 表示 operationId 已被新工具任务替换（或状态已变），
+     * 调用方必须重读当前任务重试或按既有语义失败关闭。
+     */
+    int persistCancelDisposition(@Param("id") String id,
+                                 @Param("expectedStatus") AgentRunStatus expectedStatus,
+                                 @Param("expectedOperationId") String expectedOperationId);
+
+    /**
      * 第一次 PREPARING dispatch 只允许占用空 anchor。
      * 这是长工具 operation 的最初所有权 CAS，可阻止同一 Run 的并发工具调用互相覆盖恢复坐标。
      */

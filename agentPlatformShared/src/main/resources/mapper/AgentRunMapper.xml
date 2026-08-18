@@ -402,6 +402,13 @@
             updated_at = CURRENT_TIMESTAMP
         WHERE id = #{id}
           AND status = #{expectedStatus}
+
+          <!-- 260818（grace round-4）：整份覆盖写与取消标记的读写一致性——数据库当前
+               autoResume 必须仍等于调用方锚点 JSON 里携带的旧值；取消在读取与写入
+               之间落库（autoResume 翻转）时本条件失败返回 0，取消标记不会被改回。 -->
+          AND COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true)
+              = COALESCE((CAST(#{toolJobAnchorJson} AS jsonb) -&gt;&gt; 'autoResume')::boolean, true)
+
     </update>
 
     <update id="updateToolJobAnchorAndStatus">
@@ -411,6 +418,13 @@
             updated_at = CURRENT_TIMESTAMP
         WHERE id = #{id}
           AND status = #{expectedStatus}
+
+          <!-- 260818（grace round-4）：整份覆盖写与取消标记的读写一致性——数据库当前
+               autoResume 必须仍等于调用方锚点 JSON 里携带的旧值；取消在读取与写入
+               之间落库（autoResume 翻转）时本条件失败返回 0，取消标记不会被改回。 -->
+          AND COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true)
+              = COALESCE((CAST(#{toolJobAnchorJson} AS jsonb) -&gt;&gt; 'autoResume')::boolean, true)
+
     </update>
 
     <!--
@@ -424,6 +438,24 @@
         WHERE id = #{id}
           AND status = #{expectedStatus}
           AND (tool_job_anchor_json IS NULL OR tool_job_anchor_json = '{}'::jsonb)
+    </update>
+
+    <!--
+        260818（grace round-4）：取消意图专用窄写。只在与读取时相同的 Run 状态和精确
+        operationId 下，用 jsonb 合并仅写 autoResume=false 与 runDisposition=CANCELED，
+        绝不把内存中的整份旧锚点写回——第二个长工具已替换锚点（operationId 变化）时
+        返回 0，由调用方重读当前任务后重试或按既有语义失败关闭。
+    -->
+    <update id="persistCancelDisposition">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = tool_job_anchor_json || jsonb_build_object(
+                'autoResume', false,
+                'runDisposition', 'CANCELED'
+            ),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status = #{expectedStatus}
+          AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{expectedOperationId}
     </update>
 
     <!--
@@ -461,6 +493,13 @@
         WHERE id = #{id}
           AND status = #{expectedStatus}
           AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{expectedOperationId}
+
+          <!-- 260818（grace round-4）：整份覆盖写与取消标记的读写一致性——数据库当前
+               autoResume 必须仍等于调用方锚点 JSON 里携带的旧值；取消在读取与写入
+               之间落库（autoResume 翻转）时本条件失败返回 0，取消标记不会被改回。 -->
+          AND COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true)
+              = COALESCE((CAST(#{toolJobAnchorJson} AS jsonb) -&gt;&gt; 'autoResume')::boolean, true)
+
     </update>
 
     <!--
@@ -577,6 +616,13 @@
         WHERE id = #{id}
           AND status = #{expectedStatus}
           AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{expectedOperationId}
+
+          <!-- 260818（grace round-4）：整份覆盖写与取消标记的读写一致性——数据库当前
+               autoResume 必须仍等于调用方锚点 JSON 里携带的旧值；取消在读取与写入
+               之间落库（autoResume 翻转）时本条件失败返回 0，取消标记不会被改回。 -->
+          AND COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true)
+              = COALESCE((CAST(#{toolJobAnchorJson} AS jsonb) -&gt;&gt; 'autoResume')::boolean, true)
+
     </update>
 
     <!--
