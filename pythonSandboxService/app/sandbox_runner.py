@@ -325,9 +325,9 @@ def _atomic_copy_text_to_runtime(
 ) -> None:
     temp_dest = dest_path + ".tmp"
     _copy_text_to_runtime(session, content, temp_dest)
-    _exec_checked(
+    _exec_checked_argv(
         session,
-        f"mv {shlex.quote(temp_dest)} {shlex.quote(dest_path)}",
+        ["mv", temp_dest, dest_path],
         "atomic_metadata_rename",
     )
 
@@ -338,7 +338,9 @@ def _copy_runtime_loader_modules(
 ) -> None:
     """Copy af_dataset_loader helpers into the sandbox execution container."""
     sandbox_dir = config.workdir.rstrip("/")
-    _exec_checked(session, f"mkdir -p {sandbox_dir}", "create_sandbox_module_dir")
+    _exec_checked_argv(
+        session, ["mkdir", "-p", sandbox_dir], "create_sandbox_module_dir"
+    )
     for filename in SANDBOX_LOADER_FILES:
         source = APP_DIR / filename
         if not source.is_file():
@@ -369,8 +371,10 @@ def _loader_smoke_check_command(config: SandboxConfig) -> str:
         "from af_dataset_loader import load_manifest; "
         "print('sandbox_loader_ok')"
     )
-    script = f"set -e\ncd {shlex.quote(workdir)}\npython -c {shlex.quote(import_check)}"
-    return f"sh -lc {shlex.quote(script)}"
+    return (
+        f"set -e\ncd {shlex.quote(workdir)}\n"
+        f"python -c {shlex.quote(import_check)}"
+    )
 
 
 def _smoke_check_loader_modules(
@@ -379,7 +383,7 @@ def _smoke_check_loader_modules(
     task_id: str,
 ) -> None:
     """Verify copied loader modules are importable without rewriting user code."""
-    _exec_checked(
+    _exec_checked_script(
         session,
         _loader_smoke_check_command(config),
         f"loader_smoke_import task={task_id}",
@@ -398,13 +402,12 @@ def _log_in_container(
     # guard), so redirection/command-substitution must live inside an
     # explicit `sh -lc` script with the timestamp computed HOST-side.
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%S")
-    inner = (
+    script = (
         f"echo {shlex.quote(f'[{timestamp}] {message}')} "
         f">> {shlex.quote(log_path)}"
     )
-    cmd = f"sh -lc {shlex.quote(inner)}"
     try:
-        session.execute_command(cmd)
+        session.execute_command(_sh_script(script))
     except Exception:
         # Best-effort: container logging should not break the task
         pass
@@ -422,7 +425,7 @@ def _flush_container_log(
     """
     log_path = f"{config.workspace_root}/{task_id}/task.log"
     try:
-        output = session.execute_command(f"cat {shlex.quote(log_path)}")
+        output = session.execute_command(shlex.join(["cat", log_path]))
         if output.stdout:
             for line in output.stdout.strip().splitlines():
                 logger.info("[container-log] task=%s %s", task_id, line)
@@ -441,78 +444,50 @@ def _flush_container_log(
 # explicitly quoted ``sh -lc`` argument — operators then live INSIDE one
 # argv element and are interpreted by that shell (the pattern already used
 # by the wrapper bootstrap and loader smoke check).
-# 260818 (grace round-2 on the operator guard): the tokens below are shell
-# syntax that docker's exec path NEVER interprets — docker-py shlex.splits
-# the string into argv, so each of these reaches the container as (part of)
-# a literal argument.  Command/variable substitution ($(...), ${...}, bare
-# $), backticks, globs (* and ?), background & (single or glued), newline,
-# and the redirect/pipe/sequence operators all belong here.
-_SHELL_OPERATOR_SUBSTRINGS = (
-    "&&", "||", ";", "|", ">>", ">", "<", "&", "$", "`", "*", "?", "\n",
-)
+# 260818 structured exec interface (grace round-3 on the guard): a
+# character blacklist can NEVER prove a command shell-free — it keeps
+# missing real shell syntax (env prefixes like `FOO=bar cmd`, `cd`,
+# `~`, brace expansion, unquoted globs, `#` comments) while rejecting
+# legitimate literal arguments (a quoted `*.csv` meant for
+# `find -name`).  The container exec path has NO shell (docker-py
+# shlex.splits the string into argv), so the two helpers below make the
+# intent STRUCTURAL instead:
+#
+# * ``_exec_checked_argv`` takes an argv LIST.  ``shlex.join`` quotes
+#   every element, and docker's shlex.split round-trips it EXACTLY —
+#   ``*``, ``$``, ``;`` inside a list element are unambiguously plain
+#   arguments.  A confused command (``["cd", "/x"]``, an env-prefix
+#   element) fails LOUDLY at exec time (no such program) instead of
+#   silently doing the wrong thing.
+# * ``_exec_checked_script`` takes ONE complete script text and is the
+#   ONLY place that constructs ``sh -lc <quoted script>``.  Callers can
+#   no longer hand-write loose ``sh -lc`` strings whose extra tokens
+#   become positional parameters.
 
 
-def _reject_bare_shell_operators(command: str) -> None:
-    """Fail closed unless the command is provably shell-free.
+def _exec_checked_argv(
+    session: SandboxSession,
+    argv: "list[str]",
+    context: str = "",
+) -> None:
+    """Run one no-shell command given as an argv list, fail-closed."""
+    if not argv or not all(isinstance(item, str) for item in argv):
+        raise ValueError(f"argv must be a non-empty list of str: {argv!r}")
+    _exec_checked(session, shlex.join(argv), context)
 
-    Contract (grace's binding formulation): the ONLY way to run shell
-    syntax is ``sh -lc <one-complete-quoted-script>`` (or ``sh -c``) —
-    after shlex.split EXACTLY three tokens, so the script is a single
-    argument whose internals the inner shell interprets.  Everything else
-    is scanned across ALL tokens INCLUDING the program name (glued forms
-    like ``echo;`` must not slip through argv[0]), plus the raw string for
-    newlines.  A loose ``sh -lc echo hi >> x`` (script not quoted whole)
-    is NOT an exemption: sh would treat only ``echo`` as the script and
-    the redirection would still never run.
-    """
-    try:
-        tokens = shlex.split(command)
-    except ValueError as error:
-        raise ValueError(
-            f"unquotable exec command {command!r}: {error}"
-        ) from error
 
-    if (
-        len(tokens) == 3
-        and tokens[0] == "sh"
-        and tokens[1] in ("-lc", "-c")
-    ):
-        return  # one complete quoted script — the inner shell owns it
+def _sh_script(script: str) -> str:
+    """Serialize one complete shell script as a strict ``sh -lc`` command."""
+    return f"sh -lc {shlex.quote(script)}"
 
-    if (
-        len(tokens) >= 2
-        and tokens[0] == "sh"
-        and tokens[1] in ("-lc", "-c")
-    ):
-        raise ValueError(
-            f"`sh {tokens[1]}` must carry the WHOLE script as one quoted "
-            f"argument (shlex.split yields {len(tokens)} tokens): {command!r}. "
-            "Without whole-script quoting the extras become positional "
-            "parameters and shell syntax still never executes."
-        )
 
-    # Newlines never survive shlex.split (they are token separators), so
-    # the raw command string itself is checked: a multi-line command that
-    # is not a single quoted sh script is a sequence, not one command.
-    if "\n" in command:
-        raise ValueError(
-            f"exec command contains a newline (a shell sequence), but the "
-            f"container exec path runs WITHOUT a shell: {command!r}. Put "
-            "the whole multi-line script inside `sh -lc <quoted-script>`."
-        )
-
-    for token in tokens:
-        for operator in _SHELL_OPERATOR_SUBSTRINGS:
-            if operator in token:
-                raise ValueError(
-                    f"exec command contains shell syntax {operator!r} "
-                    f"inside argument {token!r}, but the container exec "
-                    f"path runs WITHOUT a shell (docker shlex.splits the "
-                    f"string, so it would become a literal argument): "
-                    f"{command!r}. Wrap the whole script in "
-                    "`sh -lc <quoted-script>` or issue separate single "
-                    "commands."
-                )
+def _exec_checked_script(
+    session: SandboxSession,
+    script: str,
+    context: str = "",
+) -> None:
+    """Run one COMPLETE shell script via ``sh -lc``, fail-closed."""
+    _exec_checked(session, _sh_script(script), context)
 
 
 def _exec_checked(
@@ -521,7 +496,6 @@ def _exec_checked(
     context: str = "",
 ) -> None:
     """Execute a command in the sandbox and raise if exit code is non-zero."""
-    _reject_bare_shell_operators(command)
     output = session.execute_command(command)
     if output.exit_code != 0:
         ctx = f" ({context})" if context else ""
@@ -558,13 +532,23 @@ def _prepare_task_workspace(
     task_input = f"{task_workspace}/input"
 
     # Create workspace
-    _exec_checked(session, f"mkdir -p {task_input}", "create_task_workspace")
+    _exec_checked_argv(
+        session, ["mkdir", "-p", task_input], "create_task_workspace"
+    )
     _log_in_container(session, task_id, config, f"task_start workspace={task_workspace}")
 
     # Set up /sandbox/input compatibility symlink if enabled
     if config.compat_input_path_enabled:
-        _exec_checked(session, f"rm -rf {config.workdir}/input", "remove_old_input")
-        _exec_checked(session, f"ln -s {task_input} {config.workdir}/input", "create_input_symlink")
+        _exec_checked_argv(
+            session,
+            ["rm", "-rf", f"{config.workdir}/input"],
+            "remove_old_input",
+        )
+        _exec_checked_argv(
+            session,
+            ["ln", "-s", task_input, f"{config.workdir}/input"],
+            "create_input_symlink",
+        )
 
     # MF5 (260623-02 round 1 review fix): agent run 模式下，CSVs 非空表示 caller 显式
     # 选了 run-level dataset/manifest 路径，必须走 CSV source_path cp。如果 CSVs 给到了
@@ -636,7 +620,9 @@ def _prepare_task_workspace(
             dataset_dir = _resolve_dataset_dir(config, ds_id)
             files_to_copy = _list_files(dataset_dir, files)
             dataset_mount = f"{task_input}/{ds_id}"
-            _exec_checked(session, f"mkdir -p {dataset_mount}", "create_dataset_mount")
+            _exec_checked_argv(
+                session, ["mkdir", "-p", dataset_mount], "create_dataset_mount"
+            )
             for file_path in files_to_copy:
                 dest = f"{dataset_mount}/{file_path.name}"
                 _copy_dataset_file(session, file_path, dest)
@@ -1024,7 +1010,9 @@ def _materialize_none_manifest(
     temp_dir = f"{task_input_prefix}{TEMP_MANIFEST_DIR_PREFIX}{safe_id}"
     temp_path = f"{temp_dir}/manifest.json"
     try:
-        output = session.execute_command(f"mkdir -p {shlex.quote(temp_dir)}")
+        output = session.execute_command(
+            shlex.join(["mkdir", "-p", temp_dir])
+        )
         if getattr(output, "exit_code", 0) != 0:
             stderr = getattr(output, "stderr", "") or ""
             logger.warning(
@@ -1073,10 +1061,17 @@ def _cleanup_task_workspace(
     _log_in_container(session, task_id, config, "cleanup_start")
     try:
         # Remove task workspace
-        _exec_checked(session, f"rm -rf {task_workspace}", "cleanup_task_workspace")
+        _exec_checked_argv(
+            session, ["rm", "-rf", task_workspace],
+            "cleanup_task_workspace",
+        )
         # Remove compatibility symlink
         if config.compat_input_path_enabled:
-            _exec_checked(session, f"rm -rf {config.workdir}/input", "cleanup_input_symlink")
+            _exec_checked_argv(
+                session,
+                ["rm", "-rf", f"{config.workdir}/input"],
+                "cleanup_input_symlink",
+            )
         # D15 §4.2.3 (Scenario B): this rm is DEFENSIVE ONLY. Correctness no
         # longer depends on it — _prepare_task_workspace stopped writing the
         # global /sandbox/sitecustomize.py per task. A pre-D15 container may
@@ -1084,14 +1079,17 @@ def _cleanup_task_workspace(
         # container, so the rm is kept as best-effort cleanup. Removing it
         # would not break task isolation because AF_TASK_* now travels via the
         # task-local wrapper-input.json (D15 §6 red line 3 satisfied).
-        _exec_checked(
+        base = config.workdir.rstrip("/")
+        _exec_checked_argv(
             session,
-            "rm -f "
-            f"{shlex.quote(config.workdir.rstrip('/') + '/sitecustomize.py')} "
-            f"{shlex.quote(config.workdir.rstrip('/') + '/paths_dataset.csv')} "
-            f"{shlex.quote(config.workdir.rstrip('/') + '/path_manifest.csv')} "
-            f"{shlex.quote(config.workdir.rstrip('/') + '/paths_dataset_meta.json')} "
-            f"{shlex.quote(config.workdir.rstrip('/') + '/path_manifest_meta.json')}",
+            [
+                "rm", "-f",
+                f"{base}/sitecustomize.py",
+                f"{base}/paths_dataset.csv",
+                f"{base}/path_manifest.csv",
+                f"{base}/paths_dataset_meta.json",
+                f"{base}/path_manifest_meta.json",
+            ],
             "cleanup_public_task_files",
         )
         return True
@@ -1339,8 +1337,9 @@ if [ -x {shlex.quote(config.workdir)}/.sandbox-venv/bin/python ]; then
 fi
 test -w {shlex.quote(config.workdir)}
 """
-    smoke_cmd = f"sh -lc {shlex.quote(script)}"
-    _exec_checked(session, smoke_cmd, f"ready_check container={container_id}")
+    _exec_checked_script(
+        session, script, f"ready_check container={container_id}"
+    )
 
 
 def _read_runtime_text(session: SandboxSession, command: str) -> str:
@@ -1362,7 +1361,7 @@ def _read_runtime_size(session: SandboxSession, path: str) -> int:
         "awk '{total += $1} END {print total + 0}'; else echo 0; fi"
     )
     text = _read_runtime_text(
-        session, f"sh -lc {shlex.quote(script)}",
+        session, _sh_script(script),
     ).strip()
     try:
         return max(0, int(text.splitlines()[-1]))
@@ -1382,7 +1381,7 @@ def _read_task_temporary_bytes(session: SandboxSession, task_workspace: str) -> 
         "awk '{total += $1} END {print total + 0}'"
     )
     text = _read_runtime_text(
-        session, f"sh -lc {shlex.quote(script)}",
+        session, _sh_script(script),
     ).strip()
     try:
         return max(0, int(text.splitlines()[-1]))
@@ -1497,9 +1496,9 @@ def _resolve_wrapper_interpreter(
     candidate = getattr(session, "python_executable_path", None) or (
         f"{config.workdir.rstrip('/')}/.sandbox-venv/bin/python"
     )
-    _exec_checked(
+    _exec_checked_argv(
         session,
-        f"test -x {shlex.quote(candidate)}",
+        ["test", "-x", candidate],
         f"wrapper_interpreter_check task={task_id}",
     )
     return candidate
@@ -1545,16 +1544,16 @@ def _create_task_control_dir(session: SandboxSession, task_id: str) -> str:
     # mkdir with literal `&&`/`chmod`/`0700` arguments: masked for 8 days by
     # the root container (root could create those junk dirs in /), fatal
     # since the non-root switch.  One command per exec, no operators.
-    _exec_checked(
-        session, f"mkdir -p {shlex.quote(control_dir)}",
+    _exec_checked_argv(
+        session, ["mkdir", "-p", control_dir],
         f"create_task_control_dir task={task_id}",
     )
-    _exec_checked(
-        session, f"chmod 0700 {shlex.quote(root)}",
+    _exec_checked_argv(
+        session, ["chmod", "0700", root],
         f"create_task_control_dir chmod root task={task_id}",
     )
-    _exec_checked(
-        session, f"chmod 0700 {shlex.quote(control_dir)}",
+    _exec_checked_argv(
+        session, ["chmod", "0700", control_dir],
         f"create_task_control_dir chmod dir task={task_id}",
     )
     return marker_path
@@ -1564,9 +1563,9 @@ def _cleanup_task_control_dir(session: SandboxSession, task_id: str) -> bool:
     """Remove this task's control dir; best-effort like workspace cleanup."""
     control_dir, _ = task_control_paths(task_id)
     try:
-        _exec_checked(
+        _exec_checked_argv(
             session,
-            f"rm -rf {shlex.quote(control_dir)}",
+            ["rm", "-rf", control_dir],
             f"cleanup_task_control_dir task={task_id}",
         )
         return True
@@ -1591,12 +1590,12 @@ def _make_marker_writer(session: SandboxSession, task_id: str):
     a failed cancel attempt is honest silence, never a forced CANCELED.
     """
     _, marker_path = task_control_paths(task_id)
-    command = f"touch {shlex.quote(marker_path)}"
+    marker_argv = ["touch", marker_path]
 
     def _write_marker() -> None:
         try:
-            _exec_checked(
-                session, command, f"write_cancel_marker task={task_id}"
+            _exec_checked_argv(
+                session, marker_argv, f"write_cancel_marker task={task_id}"
             )
             logger.info(
                 "CANCEL_MARKER_WRITTEN task=%s path=%s", task_id, marker_path
@@ -1640,9 +1639,9 @@ def _stage_bounded_wrapper(
     workdir = config.workdir.rstrip("/")
     wrapper_dir = f"{task_workspace}/{WRAPPER_DIR_NAME}"
     wrapper_pkg_dir = f"{wrapper_dir}/app"
-    _exec_checked(
+    _exec_checked_argv(
         session,
-        f"mkdir -p {shlex.quote(wrapper_pkg_dir)}",
+        ["mkdir", "-p", wrapper_pkg_dir],
         f"create_wrapper_dir task={task_id}",
     )
     for filename in WRAPPER_MODULE_FILES:
@@ -1741,7 +1740,7 @@ def _wrapper_run_command(
         f"PYTHONPATH={shlex.quote(pythonpath)} {shlex.quote(interpreter)} "
         f"{shlex.quote(bootstrap)} {shlex.quote(wrapper_input_path)}\n"
     )
-    return f"sh -lc {shlex.quote(script)}"
+    return _sh_script(script)
 
 
 def _read_capture_from_container(

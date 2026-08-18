@@ -91,13 +91,14 @@ from app.models import BoundedExecRequest, EffectiveOutputLimits  # noqa: E402
 from app.output_capture import MARKER_V1_PREFIX, record_batch_digest  # noqa: E402
 from app.sandbox_runner import (  # noqa: E402
     _create_task_control_dir,
-    _exec_checked,
+    _exec_checked_argv,
+    _exec_checked_script,
     _log_in_container,
     _read_capture_from_container,
     _read_runtime_size,
-    _reject_bare_shell_operators,
     _resolve_wrapper_interpreter,
     _run_bounded_wrapper_path,
+    _sh_script,
     _stage_bounded_wrapper,
     run_in_open_session,
     validate_effective_output_limits,
@@ -233,49 +234,47 @@ class FakeContainerSession:
         # semantics — llm-sandbox hands the string to docker exec_run and
         # docker-py shlex.splits it into argv with NO shell.  The previous
         # host-shell fake (subprocess shell=True) happily interpreted `&&`
-        # and masked the D11 mkdir-chaining bug for 8 days.  Two guards:
-        # 1. a LOUD audit assertion on top-level shell operators (they
-        #    would be literal argv elements in production);
-        # 2. argv execution without a shell, exactly like docker exec.
+        # and masked the D11 mkdir-chaining bug for 8 days.
+        #
+        # 260818 grace round-3: the audit is STRUCTURAL, not a character
+        # blacklist (blacklists keep missing shell syntax and reject
+        # legitimate literal args like a quoted `*.csv`).  Production now
+        # goes through the structured helpers, so the only invariant left
+        # to police here is the shell-script form: a `sh -lc`/`sh -c`
+        # command must be EXACTLY three tokens (the one quoted script).
+        # Everything else is plain argv semantics and executes without a
+        # shell — a confused command (e.g. argv[0]="cd") then fails
+        # LOUDLY (exit 127), exactly like docker, instead of silently
+        # doing the wrong thing.
         import shlex as _shlex
 
         tokens = _shlex.split(command)
-        # Same binding contract as _reject_bare_shell_operators: the ONLY
-        # shell-form allowed is `sh -lc <one-complete-quoted-script>` /
-        # `sh -c <...>` (exactly three tokens).  Everything else is scanned
-        # across ALL tokens for shell syntax, glued forms included.
-        _OPERATORS = ("&&", "||", ";", "|", ">>", ">", "<", "&", "$", "`", "*", "?", "\n")
-        strict_sh = (
-            len(tokens) == 3 and tokens[0] == "sh" and tokens[1] in ("-lc", "-c")
-        )
-        loose_sh = (
-            not strict_sh
-            and len(tokens) >= 2
+        if (
+            len(tokens) >= 2
             and tokens[0] == "sh"
             and tokens[1] in ("-lc", "-c")
-        )
-        assert not loose_sh, (
-            f"`sh {tokens[1]}` script must be ONE quoted argument "
-            f"(got {len(tokens)} tokens): {command!r}"
-        )
-        if not strict_sh:
-            for token in tokens:
-                for operator in _OPERATORS:
-                    assert operator not in token, (
-                        f"exec command relies on shell syntax "
-                        f"{operator!r} inside argument {token!r}; the real "
-                        f"docker exec path would pass it as a LITERAL "
-                        f"argument: {command!r}"
-                    )
+            and len(tokens) != 3
+        ):
+            raise AssertionError(
+                f"`sh {tokens[1]}` command must carry the WHOLE script as "
+                f"ONE quoted argument (got {len(tokens)} tokens): "
+                f"{command!r} — production must use _exec_checked_script"
+            )
         env = dict(os.environ)
         env["PATH"] = f"{self.bin_dir}{os.pathsep}{env.get('PATH', '')}"
-        completed = subprocess.run(
-            tokens,
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=90,
-        )
+        try:
+            completed = subprocess.run(
+                tokens,
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=90,
+            )
+        except FileNotFoundError:
+            # docker returns 126/127 for a missing program; mirror that so
+            # shell-builtins ("cd") and env-prefix argv ("FOO=bar cmd")
+            # surface as loud exec failures, not host exceptions.
+            return SimpleNamespace(exit_code=127, stdout="", stderr="")
         return SimpleNamespace(
             exit_code=completed.returncode,
             stdout=completed.stdout,
@@ -909,15 +908,22 @@ class CaptureSpawnWiringTest(unittest.TestCase):
 
 
 class ExecCommandOperatorDisciplineTest(unittest.TestCase):
-    """260818 fix (stress batch 20260818-152331, 0/5 runs): the container
-    exec path has NO shell — docker-py shlex.splits the command string into
-    argv, so shell operators are literal arguments.  The D11
-    ``mkdir -p X && chmod ... && chmod ...`` single string died exactly
-    that way in prod (mkdir created junk dirs named ``&&``/``chmod``/
-    ``0700`` in the root-owned working directory → Permission denied ×6 →
-    every task failed).  Masked for 8 days by the root container; exposed
-    by the non-root switch.  These tests pin the discipline: single
-    commands, or the whole script inside one quoted ``sh -lc`` argument.
+    """260818 (stress batch 20260818-152331 + grace rounds): the container
+    exec path has NO shell — docker-py shlex.splits the command string
+    into argv, so the D11 ``mkdir -p X && chmod ...`` chain ran mkdir with
+    literal ``&&`` arguments and every task failed.  The discipline is now
+    STRUCTURAL (grace round-3: a character blacklist can never prove a
+    command shell-free):
+
+    * no-shell commands go through ``_exec_checked_argv`` as argv LISTS —
+      ``shlex.join`` quoting round-trips through docker's shlex.split
+      EXACTLY, so ``*``/``$``/``;`` inside a list element are unambiguous
+      plain arguments, and confused commands (``cd``, an env-prefix
+      element) fail LOUDLY (exit 127) instead of silently misbehaving;
+    * shell commands go through ``_exec_checked_script`` with ONE
+      complete script — the only place ``sh -lc`` is constructed;
+    * the wiring fake executes argv without a shell and rejects loose
+      ``sh -lc`` strings outright.
     """
 
     def setUp(self):
@@ -940,47 +946,118 @@ class ExecCommandOperatorDisciplineTest(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def test_control_dir_is_three_operator_free_commands(self):
+    def test_control_dir_is_three_argv_commands(self):
+        control_root = str(self.root / "ctl")
+        control_dir = f"{control_root}/task-opdisc"
+        expected_argv = [
+            ["mkdir", "-p", control_dir],
+            ["chmod", "0700", control_root],
+            ["chmod", "0700", control_dir],
+        ]
         with mock.patch.dict(
-            os.environ, {"AF_TASK_CONTROL_ROOT": str(self.root / "ctl")}
+            os.environ, {"AF_TASK_CONTROL_ROOT": control_root}
         ):
             marker = _create_task_control_dir(self.session, "task-opdisc")
         self.assertEqual(
             self.session.commands,
-            [
-                f"mkdir -p {self._shlex.quote(str(self.root / 'ctl' / 'task-opdisc'))}",
-                f"chmod 0700 {self._shlex.quote(str(self.root / 'ctl'))}",
-                f"chmod 0700 {self._shlex.quote(str(self.root / 'ctl' / 'task-opdisc'))}",
-            ],
-            "control-dir creation must be THREE separate single commands "
+            [self._shlex.join(argv) for argv in expected_argv],
+            "control-dir creation must be THREE separate argv commands "
             "(the old `mkdir && chmod && chmod` string is fatal without a "
             "shell — see class docstring)",
         )
-        for command in self.session.commands:
-            _reject_bare_shell_operators(command)  # must not raise
-        self.assertTrue(
-            marker.endswith("/task-opdisc/cancel"), marker
+        # docker-side round-trip: every command parses back to exactly the
+        # intended argv — no shell semantics anywhere.
+        for command, argv in zip(self.session.commands, expected_argv):
+            self.assertEqual(self._shlex.split(command), argv)
+        self.assertTrue(marker.endswith("/task-opdisc/cancel"), marker)
+
+    def test_argv_carries_literal_globs_safely(self):
+        # A quoted `*.csv` inside an argv element is a PLAIN argument for
+        # find's own matching — grace's counterexample to the character
+        # blacklist, which rejected exactly this legitimate pattern.
+        _exec_checked_argv(
+            self.session, ["find", "/x", "-name", "*.csv"]
+        )
+        (command,) = self.session.commands
+        self.assertEqual(
+            self._shlex.split(command),
+            ["find", "/x", "-name", "*.csv"],
+            "shlex.join→docker-shlex.split must round-trip the argv "
+            "EXACTLY, keeping the glob a literal argument",
         )
 
-    def test_exec_checked_rejects_bare_operators(self):
-        for bad in (
-            "mkdir -p /a && chmod 0700 /a",
-            "cat /x || true",
-            "find /x | awk '{print}'",
-            "echo hi >> /x/y",
-            "cat /x 2>/dev/null",
-            "cd /a; python m",
-        ):
-            with self.subTest(command=bad):
-                with self.assertRaisesRegex(ValueError, "shell syntax"):
-                    _exec_checked(self.session, bad)
-        self.assertEqual(self.session.commands, [])
+    def test_env_prefix_and_cd_fail_loudly(self):
+        # Structured argv makes shell-only constructs impossible to
+        # disguise: an env-prefix element becomes argv[0]="AF_MODE=test"
+        # and `cd` has no binary — both fail as loud exec errors, never
+        # as silent misbehavior.
+        class NoShellSession:
+            def __init__(self):
+                self.commands = []
 
-    def test_exec_checked_allows_sh_lc_quoted_scripts(self):
-        script = "set -e\ncd /work && python run.py input"
-        command = f"sh -lc {self._shlex.quote(script)}"
-        _exec_checked(self.session, command)
-        self.assertEqual(self.session.commands, [command])
+            def execute_command(self, command, workdir=None):
+                import shlex as _shlex
+                import subprocess as _subprocess
+
+                self.commands.append(command)
+                try:
+                    completed = _subprocess.run(
+                        self._shlex_split(command),
+                        capture_output=True, text=True, timeout=30,
+                    )
+                    return SimpleNamespace(
+                        exit_code=completed.returncode,
+                        stdout=completed.stdout,
+                        stderr=completed.stderr,
+                    )
+                except FileNotFoundError:
+                    return SimpleNamespace(
+                        exit_code=127, stdout="", stderr="not found"
+                    )
+
+            @staticmethod
+            def _shlex_split(command):
+                import shlex as _shlex
+
+                return _shlex.split(command)
+
+        session = NoShellSession()
+        for argv in (
+            ["cd", "/sandbox"],
+            ["AF_MODE=test", "python", "-V"],
+        ):
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(RuntimeError, "Command failed"):
+                    _exec_checked_argv(session, argv)
+
+    def test_script_helper_is_the_only_sh_form(self):
+        script = "set -e\ncd /work\npython run.py input\n"
+        _exec_checked_script(self.session, script)
+        (command,) = self.session.commands
+        self.assertEqual(
+            self._shlex.split(command), ["sh", "-lc", script],
+            "_sh_script must serialize to EXACTLY ['sh', '-lc', <script>]",
+        )
+        # The helper is also usable for command STRINGS that need shell
+        # features (pipelines, appends) — always as one quoted script.
+        self.assertEqual(
+            self._shlex.split(_sh_script("echo hi >> /tmp/x")),
+            ["sh", "-lc", "echo hi >> /tmp/x"],
+        )
+
+    def test_wiring_fake_rejects_loose_sh_lc(self):
+        # The end-to-end fake polices the same invariant: a `sh -lc`
+        # command with more than three tokens is a hand-written string,
+        # not a helper product.
+        session = FakeContainerSession(
+            self.root, skip_environment_setup=True
+        )
+        with self.assertRaises(AssertionError):
+            session.execute_command("sh -lc echo hi")
+        # The strict three-token form executes through the inner shell.
+        output = session.execute_command(_sh_script("printf hello"))
+        self.assertEqual(output.exit_code, 0)
+        self.assertEqual(output.stdout, "hello")
 
     def test_log_in_container_wraps_append_in_sh_lc(self):
         from app.config import SandboxConfig  # local import keeps diff small
@@ -1026,50 +1103,6 @@ class ExecCommandOperatorDisciplineTest(unittest.TestCase):
             command.startswith("sh -lc "), command
         )
         self.assertEqual(len(self._shlex.split(command)), 3)
-
-    def test_guard_token_table(self):
-        for token in ("&&", "||", ";", "|", ">>", ">", "<", "2>/dev/null", "2>&1"):
-            with self.subTest(token=token):
-                with self.assertRaises(ValueError):
-                    _reject_bare_shell_operators(f"echo a {token} b")
-        # Plain single commands and quoted sh -lc scripts pass.
-        _reject_bare_shell_operators("mkdir -p /a/b/c")
-        _reject_bare_shell_operators("chmod 0700 /a/b/c")
-        _reject_bare_shell_operators("cat /a/b/task.log")
-        _reject_bare_shell_operators("sh -lc 'echo a && echo b >> /x'")
-
-    def test_guard_rejects_grace_round2_counterexamples(self):
-        # grace's binding counterexamples on 99d8f6ee: substitution,
-        # backticks, globs, background &, newline, argv[0]-glued operators
-        # and the loose sh -lc exemption ALL reached the container as
-        # literal arguments under the old guard.
-        for bad in (
-            "echo $(date)",
-            "echo `date`",
-            "rm -rf /sandbox/*",
-            "sleep 1 &",
-            "echo ${HOME}",
-            "echo $HOME",
-            "echo; hi",  # ';' glued to argv[0] — argv[0] must be scanned
-            "echo a\nrm -rf /",  # newline: sequence separator
-            "find /x -name '*.csv'",  # glob intended for the shell
-            "sh -lc echo hi >> /tmp/x",  # script NOT one quoted argument
-            "sh -c echo hi >> /tmp/x",
-        ):
-            with self.subTest(command=bad):
-                with self.assertRaises(ValueError):
-                    _reject_bare_shell_operators(bad)
-
-    def test_guard_loose_sh_lc_is_not_an_exemption(self):
-        # Even operator-free, a loose `sh -lc echo hi` (script split into
-        # several tokens) must fail: sh would run only `echo` and treat the
-        # rest as positional parameters — the command would silently do
-        # the wrong thing.
-        with self.assertRaisesRegex(ValueError, "one quoted"):
-            _reject_bare_shell_operators("sh -lc echo hi")
-        # The exact three-token form remains the only shell escape hatch.
-        _reject_bare_shell_operators("sh -lc 'echo hi'")
-        _reject_bare_shell_operators("sh -c 'echo hi'")
 
 
 class SubreaperHardGateTest(unittest.TestCase):

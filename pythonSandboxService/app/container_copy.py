@@ -197,7 +197,7 @@ def copy_file_to_container(session, source, dest_path: str) -> None:
     if not name:
         raise ValueError(f"dest_path must name a file: {dest_path!r}")
 
-    mkdir = session.execute_command(f"mkdir -p {shlex.quote(parent)}")
+    mkdir = session.execute_command(shlex.join(["mkdir", "-p", parent]))
     if getattr(mkdir, "exit_code", 0) != 0:
         raise NonRootContractError(
             f"mkdir -p {parent!r} failed as the container user "
