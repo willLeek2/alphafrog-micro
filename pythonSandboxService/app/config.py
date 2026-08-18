@@ -222,16 +222,20 @@ def validate_local_image_id(value: str) -> None:
     )
 
 
-def _reject_root_container_user(user: str) -> None:
-    """The sandbox container must never come back as root via this knob.
+def reject_root_container_user(user: str) -> None:
+    """Reject any docker ``user[:group]`` spelling that still means root.
 
     260818 non-root simplification + grace review: docker accepts
     ``user[:group]`` where each side may be a name OR a numeric id, so the
     check must parse both sides independently — ``root:10001`` (uid 0) and
     ``alphafrog-sandbox:root`` (gid 0) are legal docker spellings that
-    still produce root.  Rejected fail-fast: name ``root`` on either side,
-    numeric ``0`` on either side, empty fields, extra colons, or any other
-    malformed shape.
+    still produce root.  Rejected fail-fast: name ``root`` on either side
+    (case-insensitive), numeric ``0`` on either side, empty fields, extra
+    colons, or any other malformed shape.
+
+    Public because app.container_copy reuses this exact parser for the
+    runtime root-exec guard — one grammar, no drift between the startup
+    config check and the runtime check (grace round-3 MUST-FIX 2).
     """
 
     def _reject_field(field: str, kind: str) -> None:
@@ -445,7 +449,7 @@ def load_config() -> SandboxConfig:
             "'alphafrog-sandbox' or a uid:gid pair, or unset it for the "
             "default)"
         )
-    _reject_root_container_user(container_user)
+    reject_root_container_user(container_user)
     # Spec §12: AF_SANDBOX_IMAGE has NO implicit default (the pre-§12 silent
     # fallback to "alphafrog-sandbox-runtime:latest" is removed).
     # 260814 scheduler-03: which reference grammar applies is selected by

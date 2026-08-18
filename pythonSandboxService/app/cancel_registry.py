@@ -28,8 +28,10 @@ recorded by task_store.complete_execution from the CompletionCandidate the
 worker computes.  A request_stop() that nobody observes produces no CANCELED.
 
 Marker writing is deliberately NOT done inline in the endpoint: the marker
-file lives inside the sandbox container (a root-owned /run control dir), so
-writing it means one container exec command.  That can take seconds and must
+file lives inside the sandbox container (the task control dir under
+/sandbox, owned by the same unprivileged user the whole container runs as —
+260818 non-root simplification), so writing it means one container exec
+command.  That can take seconds and must
 never block the HTTP endpoint, so it runs on a small dedicated thread pool.
 A failed marker write is logged and swallowed on purpose: per rule 3, if the
 child finishes normally before the marker could be written, the task keeps

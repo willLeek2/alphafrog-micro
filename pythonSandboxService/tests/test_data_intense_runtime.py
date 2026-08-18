@@ -96,13 +96,20 @@ class DataIntenseRuntimeTest(unittest.TestCase):
         class FakeSession:
             def __init__(self, **kwargs):
                 captured.update(kwargs)
+                # Post-open non-root contract (260818): create_sandbox_session
+                # installs the root-exec guards and verifies the live
+                # identity, both against the container proxy.
+                self.container = types.SimpleNamespace(
+                    put_archive=lambda *a, **k: None,
+                    exec_run=lambda *a, **k: types.SimpleNamespace(exit_code=0),
+                )
 
             def open(self):
                 return None
 
             def execute_command(self, command: str):
-                # create_sandbox_session resolves the container user's
-                # identity after open() (non-root contract, 260818).
+                # create_sandbox_session verifies the container user's
+                # LIVE identity after open() (grace round-3).
                 flag = command.split()[-1]
                 uid_gid = {"-u": "10000", "-g": "10001"}.get(flag, "")
                 return types.SimpleNamespace(

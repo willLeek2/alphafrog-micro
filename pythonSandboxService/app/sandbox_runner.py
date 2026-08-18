@@ -874,7 +874,7 @@ def _materialize_none_manifest(
 
     Returns:
         物化成功：sandbox 内绝对路径（``<task_input>/_agent_run_manifest_<id>/manifest.json``）
-        物化失败（mkdir 失败 / JSON 失败 / copy_to_runtime 失败 / manifest_number 非数字）：返回
+        物化失败（mkdir 失败 / JSON 失败 / staging 失败 / manifest_number 非数字）：返回
         ``MANIFEST_NONE_MARKER`` 原文，让 sandbox 内 af_dataset_loader 报明确错误。
     """
     safe_id = (manifest_number or "").strip()
@@ -925,7 +925,8 @@ def _materialize_none_manifest(
         "members": members,
     }
 
-    # 写临时 manifest.json：先 mkdir（copy_to_runtime 不创建父目录），再 copy_to_runtime
+    # 写临时 manifest.json：先 mkdir（staging 不创建父目录），再走非 root
+    # 拷贝通道（container_copy → put_archive，260818）
     temp_dir = f"{task_input_prefix}{TEMP_MANIFEST_DIR_PREFIX}{safe_id}"
     temp_path = f"{temp_dir}/manifest.json"
     try:
@@ -956,7 +957,7 @@ def _materialize_none_manifest(
         _copy_text_to_runtime(session, manifest_json, temp_path)
     except Exception as e:  # noqa: BLE001 — sandbox 写入容错
         logger.warning(
-            "agent_run NONE manifest copy_to_runtime 失败：path=%s err=%s",
+            "agent_run NONE manifest staging 失败：path=%s err=%s",
             temp_path, e,
         )
         return MANIFEST_NONE_MARKER
@@ -1129,9 +1130,24 @@ def create_sandbox_session(
     # Non-root contract, enforced at runtime (grace review): replace
     # llm-sandbox's root-chown hook with a raiser and guard exec_run against
     # root requests, so "no root process ever starts in this container" is a
-    # checked fact rather than a code-review promise.
-    container_copy.install_no_root_guards(session)
-    container_copy.prime_container_identity(session, config.container_user)
+    # checked fact rather than a code-review promise.  Grace round-3
+    # MUST-FIX 1/3: the container's LIVE identity is verified against the
+    # configured user (uid/gid 0 rejected, numeric specs matched exactly),
+    # and ANY failure in these post-open steps closes the just-started
+    # container before re-raising — the caller cannot reach this local
+    # session, so leaking it here would leak a Docker container.
+    try:
+        container_copy.install_no_root_guards(session)
+        container_copy.verify_container_identity(session, config.container_user)
+    except BaseException:
+        try:
+            session.close()
+        except Exception as close_error:  # noqa: BLE001 - best-effort cleanup
+            logger.warning(
+                "SANDBOX_SESSION_CLOSE_FAILED after non-root contract "
+                "failure: %s", close_error,
+            )
+        raise
     return session
 
 
@@ -1146,7 +1162,8 @@ def initialize_runtime_environment(
     Called once per container after create_sandbox_session(). The
     AF_RUNTIME_ENVIRONMENT_FILE env var was set at container creation to
     ``<workdir>/runtime-environment.json``; this function writes the file
-    at that path via ``copy_to_runtime`` so user code (e.g. ccqwen's
+    at that path via the non-root staging path (container_copy → docker
+    ``put_archive``) so user code (e.g. ccqwen's
     reporting library) reads it from inside the container. Failure to push
     the file into the container raises — the worker cannot become ready
     without an honest runtime environment file for user code to consult.

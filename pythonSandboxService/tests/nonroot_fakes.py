@@ -40,6 +40,7 @@ class RecordingPutArchive:
 
     def __init__(self) -> None:
         self.calls: list[tuple[bytes, str]] = []
+        self.exec_run_calls: list = []
 
     def put_archive(self, dest_dir: str, data: bytes) -> None:
         with tarfile.open(fileobj=io.BytesIO(data)) as tar:
@@ -50,15 +51,22 @@ class RecordingPutArchive:
                     payload = b""
                 self.calls.append((payload, f"{dest_dir.rstrip('/')}/{member.name}"))
 
+    def exec_run(self, *args, **kwargs):
+        # docker SDK surface needed by install_no_root_guards.
+        self.exec_run_calls.append((args, kwargs))
+        from types import SimpleNamespace
+
+        return SimpleNamespace(exit_code=0, stdout=b"", stderr=b"")
+
 
 def prime_fake_session(session) -> None:
     """Equip a fake session for app.container_copy:
 
-    * a recording ``container`` proxy (``put_archive``);
+    * a recording ``container`` proxy (``put_archive`` + ``exec_run``);
     * the cached container identity ``(10000, 10001)`` — the same
-      attribute ``prime_container_identity`` installs on REAL sessions
-      at creation time, so the in-container ``id -u``/``id -g`` lookup
-      never runs in these suites.
+      attribute ``verify_container_identity`` installs on REAL sessions
+      right after ``session.open()`` (suites that bypass session
+      creation pre-set it so the staging path skips the ``id`` lookup).
     """
     session.container = RecordingPutArchive()
     setattr(

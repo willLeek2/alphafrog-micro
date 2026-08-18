@@ -304,7 +304,8 @@ def write_runtime_environment_to_container(
     env: ExecutionEnvironment,
     dest_path: str,
 ) -> str:
-    """Serialize env and push it into the execution container via copy_to_runtime.
+    """Serialize env and push it into the execution container via the
+    non-root staging path (container_copy → docker ``put_archive``).
 
     Spec §8 L1019 (codex rework 2026-08-08 22:49): the runtime-environment.json
     that user code (e.g., report()) reads MUST live inside the execution

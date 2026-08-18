@@ -18,6 +18,7 @@ import os
 import sys
 import types
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 # Host-runnable llm_sandbox stub (same pattern as test_bounded_wrapper_wiring:
@@ -133,14 +134,52 @@ class ContainerUserConfigTest(_EnvIsolation):
                     load_config()
 
 
+class _ContractFakeSession:
+    """Open-session fake satisfying the post-open non-root contract:
+    open()/close() bookkeeping, a guardable container proxy (put_archive
+    + exec_run), and an in-container ``id`` that reports uid/gid 10000/
+    10001.  ``uid``/``gid``/``container`` let tests break the contract
+    on purpose."""
+
+    def __init__(self, *args, **kwargs):
+        self.constructor_kwargs = kwargs
+        self.closed = 0
+        self._uid = 10000
+        self._gid = 10001
+        self.container = SimpleNamespace(
+            put_archive=lambda *a, **k: None,
+            exec_run=lambda *a, **k: SimpleNamespace(exit_code=0),
+        )
+
+    def open(self):
+        return None
+
+    def close(self):
+        self.closed += 1
+
+    def execute_command(self, command: str):
+        flag = command.split()[-1]
+        out = {"-u": str(self._uid), "-g": str(self._gid)}.get(flag, "")
+        return SimpleNamespace(exit_code=0, stdout=out, stderr="")
+
+
 class CreateSessionUserPassthroughTest(_EnvIsolation):
+    def _created_session(self, config):
+        session = _ContractFakeSession()
+
+        def factory(*args, **kwargs):
+            session.constructor_kwargs = kwargs
+            return session
+
+        with mock.patch("app.sandbox_runner.SandboxSession", side_effect=factory):
+            create_sandbox_session(config)
+        return session
+
     def test_runtime_configs_carry_container_user(self):
         config = load_config()
-        with mock.patch("app.sandbox_runner.SandboxSession") as session_cls:
-            create_sandbox_session(config)
-        kwargs = session_cls.call_args.kwargs
+        session = self._created_session(config)
         self.assertEqual(
-            kwargs["runtime_configs"].get("user"),
+            session.constructor_kwargs["runtime_configs"].get("user"),
             config.container_user,
             "the container must be created as the unprivileged user "
             "(docker --user), replacing the removed privilege-drop machinery",
@@ -154,9 +193,8 @@ class CreateSessionUserPassthroughTest(_EnvIsolation):
         # (the old empty capset) are pinned here EXACTLY, hardcoded in
         # production with no env knob to turn them off.
         config = load_config()
-        with mock.patch("app.sandbox_runner.SandboxSession") as session_cls:
-            create_sandbox_session(config)
-        runtime_configs = session_cls.call_args.kwargs["runtime_configs"]
+        session = self._created_session(config)
+        runtime_configs = session.constructor_kwargs["runtime_configs"]
         self.assertEqual(runtime_configs.get("security_opt"), ["no-new-privileges:true"])
         self.assertEqual(runtime_configs.get("cap_drop"), ["ALL"])
 
@@ -173,6 +211,43 @@ class CreateSessionUserPassthroughTest(_EnvIsolation):
         message = str(raised.exception)
         self.assertIn("AF_SANDBOX_SKIP_ENVIRONMENT_SETUP", message)
         self.assertIn("non-root", message)
+
+    def test_post_open_identity_failure_closes_session_once(self):
+        # grace round-3 MUST-FIX 3: the identity verification added after
+        # open() can fail; the just-started container MUST be closed
+        # exactly once before the error propagates (the caller cannot
+        # reach this local session to clean it up itself).
+        root_session = _ContractFakeSession()
+        root_session._uid = 0
+        root_session._gid = 0
+        with mock.patch(
+            "app.sandbox_runner.SandboxSession",
+            side_effect=lambda *a, **kw: root_session,
+        ):
+            with self.assertRaisesRegex(Exception, "root"):
+                create_sandbox_session(load_config())
+        self.assertEqual(
+            root_session.closed, 1,
+            "a failed post-open identity check MUST close the started "
+            "container exactly once — otherwise it leaks",
+        )
+
+    def test_post_open_guard_failure_closes_session_once(self):
+        # Same lifecycle contract for a guard that cannot be installed
+        # (container proxy without exec_run — fail closed by design).
+        unguardable = _ContractFakeSession()
+        unguardable.container = SimpleNamespace(put_archive=lambda *a, **k: None)
+        with mock.patch(
+            "app.sandbox_runner.SandboxSession",
+            side_effect=lambda *a, **kw: unguardable,
+        ):
+            with self.assertRaisesRegex(Exception, "exec_run"):
+                create_sandbox_session(load_config())
+        self.assertEqual(
+            unguardable.closed, 1,
+            "a failed guard install MUST close the started container "
+            "exactly once — otherwise it leaks",
+        )
 
 
 class TaskControlRootDefaultTest(unittest.TestCase):

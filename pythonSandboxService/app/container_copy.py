@@ -15,11 +15,16 @@ NOTHING ever runs as root inside a sandbox container, so this module:
 * installs runtime guards that make "no root process in the container"
   an enforced, testable contract instead of a code-review promise: the
   backend session's ``_ensure_ownership`` is replaced with a raiser and
-  (when the docker container proxy accepts attribute assignment) the
-  container's ``exec_run`` is wrapped so any ``user=root``/``user=0``
-  execution fails loudly.
-
-Stdlib only (io/os/posixpath/shlex/tarfile) — importable everywhere.
+  the container proxy's ``exec_run`` is wrapped so any keyword
+  ``user=`` request that still means root on either side (per the
+  shared strict parser from app.config) fails loudly.  Guards FAIL
+  CLOSED: if they cannot be installed at all, that is a contract break
+  (grace round-3 MUST-FIX 2), never a silent skip;
+* verifies the container's LIVE identity (``id -u``/``id -g``) right
+  after ``session.open()``: uid/gid 0 is rejected for both config forms,
+  and a numeric ``uid:gid`` spec must match the live values exactly
+  (grace round-3 MUST-FIX 1) — identity is a checked runtime fact, not
+  a config assumption.
 """
 
 from __future__ import annotations
@@ -30,6 +35,8 @@ import posixpath
 import shlex
 import tarfile
 from pathlib import Path
+
+from .config import reject_root_container_user
 
 CONTAINER_IDENTITY_ATTR = "af_container_uid_gid"
 
@@ -55,15 +62,19 @@ def resolve_container_identity(session) -> tuple:
     """Resolve the container user to a numeric ``(uid, gid)`` pair.
 
     Priority: the session-cached pair (installed by
-    ``prime_container_identity`` at session creation, which understands
-    the ``uid:gid`` config form) → ``id -u`` / ``id -g`` executed INSIDE
-    the container as the container user (the container's passwd database
-    is authoritative for username specs).  Resolution runs as the
-    container user, never as root, and the result is cached on the
-    session object.
+    ``verify_container_identity`` at session creation) → ``id -u`` /
+    ``id -g`` executed INSIDE the container as the container user (the
+    container's passwd database is authoritative for username specs).
+    Resolution runs as the container user, never as root, and the result
+    is cached on the session object.
+
+    grace round-3 MUST-FIX 1: a resolved identity with uid 0 or gid 0 is
+    REJECTED — "which user does the container run as" must be a checked
+    runtime fact, never a cached assumption.
     """
     cached = getattr(session, CONTAINER_IDENTITY_ATTR, None)
     if cached is not None:
+        _reject_zero_identity(cached)
         return cached
 
     def _read_id(flag: str) -> int:
@@ -77,25 +88,72 @@ def resolve_container_identity(session) -> tuple:
         return int(text)
 
     identity = (_read_id("-u"), _read_id("-g"))
+    _reject_zero_identity(identity)
     setattr(session, CONTAINER_IDENTITY_ATTR, identity)
     return identity
 
 
-def prime_container_identity(session, container_user: str) -> tuple:
-    """Pre-resolve a ``uid:gid`` config spec onto the session (fast path).
+def _reject_zero_identity(identity: tuple) -> None:
+    uid, gid = identity
+    if uid == 0 or gid == 0:
+        raise NonRootContractError(
+            f"the sandbox container reports identity uid={uid} gid={gid}: "
+            "a root uid or gid violates the non-root container contract "
+            "(grace round-3 MUST-FIX 1 — identity is a runtime-checked "
+            "fact, not a config assumption)"
+        )
 
-    Numeric specs are parsed without touching the container; any other
-    form (username) is left to ``resolve_container_identity``'s in-container
-    ``id`` lookup, which is the authoritative resolution for names.
+
+def verify_container_identity(session, container_user: str) -> tuple:
+    """VERIFY the container's live identity right after ``session.open()``.
+
+    grace round-3 MUST-FIX 1: both config forms (username and numeric
+    ``uid:gid``) must be validated against the container's ACTUAL running
+    identity, read live via ``id -u`` / ``id -g`` (any stale cache is
+    ignored).  Rules:
+
+    * either side reading 0 → NonRootContractError (root is never
+      acceptable, whatever the config said);
+    * a numeric ``uid:gid`` spec must match the live values EXACTLY — a
+      mismatch means the container runtime did not adopt the configured
+      identity, which is a contract break, not a cosmetic difference.
+
+    On success the verified pair is cached on the session for the staging
+    path (``copy_file_to_container`` reads it and re-checks non-zero).
     """
     spec = container_user.strip()
+    expected = None
     if ":" in spec:
         uid_text, _, gid_text = spec.partition(":")
         if uid_text.isdigit() and gid_text.isdigit():
-            identity = (int(uid_text), int(gid_text))
-            setattr(session, CONTAINER_IDENTITY_ATTR, identity)
-            return identity
-    return resolve_container_identity(session)
+            expected = (int(uid_text), int(gid_text))
+
+    # Read LIVE state: drop any cached value so the verification cannot
+    # be satisfied by an assumption.
+    if getattr(session, CONTAINER_IDENTITY_ATTR, None) is not None:
+        delattr(session, CONTAINER_IDENTITY_ATTR)
+
+    def _read_id(flag: str) -> int:
+        result = session.execute_command(f"id {flag}")
+        text = (getattr(result, "stdout", "") or "").strip()
+        if getattr(result, "exit_code", 1) != 0 or not text.isdigit():
+            raise NonRootContractError(
+                f"cannot verify the container user's {flag} inside the "
+                f"container (exit={getattr(result, 'exit_code', '?')})"
+            )
+        return int(text)
+
+    identity = (_read_id("-u"), _read_id("-g"))
+    _reject_zero_identity(identity)
+    if expected is not None and identity != expected:
+        raise NonRootContractError(
+            f"container identity mismatch: configured uid:gid="
+            f"{expected[0]}:{expected[1]} but the container reports "
+            f"uid={identity[0]} gid={identity[1]} — the container runtime "
+            "did not adopt the configured user (grace round-3 MUST-FIX 1)"
+        )
+    setattr(session, CONTAINER_IDENTITY_ATTR, identity)
+    return identity
 
 
 def copy_file_to_container(session, source, dest_path: str) -> None:
@@ -156,42 +214,85 @@ def _forbidden_ensure_ownership(paths) -> None:
     )
 
 
-def install_no_root_guards(session) -> None:
-    """Enforce the no-root contract on an OPEN session (runtime checkable).
+def _is_root_exec_user(user) -> bool:
+    """True iff a ``user=`` exec request still means root on either side.
 
-    * the backend session's ``_ensure_ownership`` is replaced by a raiser
-      (instance attribute — the library's own ``copy_to_runtime`` /
-      ``environment_setup`` path now fails loudly instead of silently
-      starting a root process);
-    * the docker container proxy's ``exec_run`` is wrapped so any call
-      asking for ``user`` root (name or numeric 0) is rejected. When the
-      proxy does not accept attribute assignment the exec guard is
-      skipped — the ``_ensure_ownership`` guard still holds for every
-      path llm-sandbox 0.3.33 actually uses.
+    Reuses the startup config parser (``reject_root_container_user``) so
+    the runtime guard and the config check share ONE grammar: ``root``,
+    ``0``, ``root:10001``, ``0:10001``, ``10000:root``, ``10000:0``,
+    ``root:root`` (and case variants) are all root spellings.  ``None``
+    or ``""`` means "the container's default user" — the container is
+    CREATED as the unprivileged user, so that stays allowed.
+    """
+    if user is None or user == "":
+        return False
+    if isinstance(user, int):
+        return user == 0
+    try:
+        reject_root_container_user(str(user))
+    except ValueError:
+        return True
+    return False
+
+
+def install_no_root_guards(session) -> None:
+    """Enforce the no-root contract on an OPEN session — FAIL CLOSED.
+
+    grace round-3 MUST-FIX 2: "no root process at runtime" is a contract,
+    so a guard that cannot be INSTALLED is a contract break, not a
+    degraded-but-okay state:
+
+    * the backend session's ``_ensure_ownership`` is replaced by a
+      raiser — if the assignment itself fails (exotic proxy), raise;
+    * the docker container proxy MUST be reachable and MUST expose
+      ``exec_run``; its ``exec_run`` is wrapped so any keyword
+      ``user=`` request that still means root on either side (per the
+      shared strict parser) is rejected.  Scope note: the guard covers
+      the keyword form used by the docker SDK and llm-sandbox; a
+      positional ``user`` argument is outside this contract and not
+      claimed.
+
+    Idempotent: installing twice keeps exactly one wrapper.
     """
     backend = getattr(session, "_backend_session", None) or session
     try:
         backend._ensure_ownership = _forbidden_ensure_ownership
-    except (AttributeError, TypeError):  # pragma: no cover - exotic proxy
-        pass
+    except (AttributeError, TypeError) as error:
+        raise NonRootContractError(
+            "cannot install the _ensure_ownership root-chown guard on "
+            f"the session backend {type(backend).__name__!r}: the "
+            "non-root contract is enforced, not best-effort"
+        ) from error
 
     container = _session_container(session)
     if container is None:
-        return
+        raise NonRootContractError(
+            "session has no container object for the root-exec guard: "
+            "refusing to run without the non-root contract in force"
+        )
     original = getattr(container, "exec_run", None)
-    if original is None or getattr(original, "_af_no_root_guard", False):
-        return
+    if original is None:
+        raise NonRootContractError(
+            "the container proxy exposes no exec_run to guard: refusing "
+            "to run without the non-root contract in force"
+        )
+    if getattr(original, "_af_no_root_guard", False):
+        return  # already guarded — idempotent install
 
     def guarded_exec_run(*args, **kwargs):
         user = kwargs.get("user")
-        if user in ("root", "0", 0, "0:0"):
+        if _is_root_exec_user(user):
             raise NonRootContractError(
-                "exec_run requested as root inside the sandbox container"
+                f"exec_run requested as root inside the sandbox container "
+                f"(user={user!r})"
             )
         return original(*args, **kwargs)
 
     guarded_exec_run._af_no_root_guard = True  # type: ignore[attr-defined]
     try:
         container.exec_run = guarded_exec_run
-    except (AttributeError, TypeError):  # pragma: no cover - exotic proxy
-        pass
+    except (AttributeError, TypeError) as error:
+        raise NonRootContractError(
+            "cannot wrap the container proxy's exec_run with the root "
+            "guard: the non-root contract is enforced, not best-effort"
+        ) from error

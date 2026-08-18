@@ -53,8 +53,8 @@ from app.container_copy import (  # noqa: E402
     NonRootContractError,
     copy_file_to_container,
     install_no_root_guards,
-    prime_container_identity,
     resolve_container_identity,
+    verify_container_identity,
 )
 
 
@@ -117,6 +117,15 @@ class FakeSession:
 
 
 class ResolveIdentityTest(unittest.TestCase):
+    """grace round-3 MUST-FIX 1: identity is a runtime-CHECKED fact.
+
+    Both config forms must be verified against the container's LIVE
+    ``id -u``/``id -g`` after open(): uid/gid 0 is rejected whatever the
+    config said, and a numeric ``uid:gid`` spec must match the live
+    values exactly (a mismatch means docker did not adopt the configured
+    user).
+    """
+
     def setUp(self):
         import tempfile
 
@@ -126,29 +135,56 @@ class ResolveIdentityTest(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def test_numeric_uid_gid_resolves_without_touching_the_container(self):
-        session = FakeSession(self.root)
-        identity = prime_container_identity(session, "10000:10001")
+    def test_numeric_spec_verified_against_live_identity(self):
+        session = FakeSession(self.root, uid=10000, gid=10001)
+        identity = verify_container_identity(session, "10000:10001")
         self.assertEqual(identity, (10000, 10001))
-        self.assertNotEqual(identity[0], 0)
-        self.assertNotEqual(identity[1], 0)
-        self.assertEqual(session.executed_commands, [])
+        # The numeric form is no longer trusted blindly: the container IS
+        # queried and the live values must match the config exactly.
+        self.assertIn("id -u", session.executed_commands)
+        self.assertIn("id -g", session.executed_commands)
         self.assertEqual(
             getattr(session, CONTAINER_IDENTITY_ATTR), (10000, 10001)
         )
 
-    def test_username_form_resolves_via_in_container_id_lookup(self):
+    def test_numeric_spec_mismatch_with_live_identity_rejected(self):
+        session = FakeSession(self.root, uid=12345, gid=12345)
+        with self.assertRaisesRegex(NonRootContractError, "mismatch"):
+            verify_container_identity(session, "10000:10001")
+        self.assertIsNone(getattr(session, CONTAINER_IDENTITY_ATTR, None))
+
+    def test_username_form_verified_live(self):
         session = FakeSession(self.root, uid=10000, gid=10001)
-        identity = prime_container_identity(session, "alphafrog-sandbox")
+        identity = verify_container_identity(session, "alphafrog-sandbox")
         self.assertEqual(identity, (10000, 10001))
-        self.assertNotEqual(identity[0], 0)
-        self.assertNotEqual(identity[1], 0)
         self.assertIn("id -u", session.executed_commands)
         self.assertIn("id -g", session.executed_commands)
 
-    def test_identity_is_cached_after_first_resolution(self):
+    def test_live_root_identity_rejected_even_for_username_form(self):
+        # grace's exact repro: a container that reports (0, 0) must fail
+        # verification no matter WHAT the config form says.
+        for spec in ("alphafrog-sandbox", "10000:10001", "0:0"):
+            with self.subTest(spec=spec):
+                root_session = FakeSession(self.root, uid=0, gid=0)
+                with self.assertRaisesRegex(NonRootContractError, "root"):
+                    verify_container_identity(root_session, spec)
+
+    def test_verification_ignores_stale_cache(self):
+        # A pre-set (even root-poisoned) cache cannot influence
+        # verification: the LIVE id query runs regardless — here the live
+        # identity is healthy, so verification SUCCEEDS and overwrites
+        # the poisoned cache (grace: "checked result, not assumption").
+        session = FakeSession(self.root, uid=10000, gid=10001)
+        setattr(session, CONTAINER_IDENTITY_ATTR, (0, 0))
+        identity = verify_container_identity(session, "10000:10001")
+        self.assertEqual(identity, (10000, 10001))
+        self.assertEqual(
+            getattr(session, CONTAINER_IDENTITY_ATTR), (10000, 10001)
+        )
+
+    def test_identity_is_cached_after_verification(self):
         session = FakeSession(self.root)
-        prime_container_identity(session, "alphafrog-sandbox")
+        verify_container_identity(session, "alphafrog-sandbox")
         again = resolve_container_identity(session)
         self.assertEqual(again, (10000, 10001))
         self.assertEqual(
@@ -164,7 +200,7 @@ class ResolveIdentityTest(unittest.TestCase):
 
         session = BrokenSession(self.root)
         with self.assertRaises(NonRootContractError):
-            prime_container_identity(session, "alphafrog-sandbox")
+            verify_container_identity(session, "alphafrog-sandbox")
 
     def test_non_numeric_id_output_fails_closed(self):
         class WeirdSession(FakeSession):
@@ -210,7 +246,7 @@ class CopyFileToContainerTest(unittest.TestCase):
 
     def test_stages_tar_entry_owned_by_container_user_with_source_mode(self):
         self.source.chmod(0o755)
-        prime_container_identity(self.session, "10000:10001")
+        verify_container_identity(self.session, "10000:10001")
         copy_file_to_container(self.session, self.source, self.dest)
 
         # The parent directory is created via the session's normal exec
@@ -231,7 +267,7 @@ class CopyFileToContainerTest(unittest.TestCase):
         self.assertFalse(self.session._ensure_ownership_ran)
 
     def test_restage_replaces_the_existing_file_bytes_exactly(self):
-        prime_container_identity(self.session, "10000:10001")
+        verify_container_identity(self.session, "10000:10001")
         copy_file_to_container(self.session, self.source, self.dest)
         first_size = (self.dest_dir / "payload.py").stat().st_size
 
@@ -283,15 +319,34 @@ class NoRootGuardTest(unittest.TestCase):
         self.assertFalse(self.session._ensure_ownership_ran)
 
     def test_root_exec_run_is_rejected_and_others_pass_through(self):
+        # grace round-3 MUST-FIX 2: every legal docker spelling of a root
+        # side must be rejected — the old ("root", "0", 0, "0:0") allowlist
+        # let "root:10001" and friends straight through.
         install_no_root_guards(self.session)
-        for user in ("root", "0", 0, "0:0"):
+        for user in (
+            "root",
+            "0",
+            0,
+            "0:0",
+            "root:10001",
+            "0:10001",
+            "root:root",
+            "ROOT",
+            "Root:Users",
+            "alphafrog-sandbox:root",
+            "10000:0",
+        ):
             with self.subTest(user=user):
                 with self.assertRaisesRegex(NonRootContractError, "root"):
                     self.session.container.exec_run("id", user=user)
         self.assertEqual(self.session.container.exec_run_calls, [])
-        # Non-root executions reach the container untouched.
-        self.session.container.exec_run("id", user="alphafrog-sandbox")
-        self.assertEqual(len(self.session.container.exec_run_calls), 1)
+        # Non-root executions — including the container-default forms
+        # (None/"" mean "the user the container was created as") — reach
+        # the container untouched.
+        for user in ("alphafrog-sandbox", "10000:10001", None, ""):
+            with self.subTest(allowed=user):
+                self.session.container.exec_run("id", user=user)
+        self.assertEqual(len(self.session.container.exec_run_calls), 4)
 
     def test_guard_install_is_idempotent(self):
         install_no_root_guards(self.session)
@@ -299,15 +354,33 @@ class NoRootGuardTest(unittest.TestCase):
         self.session.container.exec_run("id", user="alphafrog-sandbox")
         self.assertEqual(len(self.session.container.exec_run_calls), 1)
 
-    def test_container_without_exec_run_attribute_is_tolerated(self):
-        # A container proxy exposing ONLY put_archive: the exec guard is
-        # skipped while the _ensure_ownership guard still holds.
+    def test_missing_exec_run_fails_closed(self):
+        # grace round-3 MUST-FIX 2: a container proxy that cannot be
+        # guarded is a contract break, not a tolerated degraded state
+        # (the old test pinned tolerance — inverted on purpose).
         self.session.container = SimpleNamespace(
             put_archive=self.session.container.put_archive
         )
-        install_no_root_guards(self.session)  # must not raise
+        with self.assertRaisesRegex(NonRootContractError, "exec_run"):
+            install_no_root_guards(self.session)
+
+    def test_missing_container_object_fails_guard_install(self):
+        del self.session.container
+        with self.assertRaisesRegex(NonRootContractError, "no container object"):
+            install_no_root_guards(self.session)
+
+    def test_unwritable_backend_fails_closed(self):
+        # If the backend proxy refuses the _ensure_ownership replacement,
+        # the install fails instead of silently continuing unguarded.
+        class Locked:
+            __slots__ = ("container",)
+
+            def __init__(self, container):
+                self.container = container
+
+        locked = Locked(self.session.container)
         with self.assertRaisesRegex(NonRootContractError, "_ensure_ownership"):
-            self.session._ensure_ownership([])
+            install_no_root_guards(locked)
 
 
 class ProductionEntryPointsTest(unittest.TestCase):
