@@ -42,6 +42,7 @@ message CreateAgentRunRequest {
 message GetAgentRunRequest {
   string user_id = 1;
   string id = 2;
+  bool is_admin = 3;
 }
 
 message UpdateAgentRunRequest {
@@ -112,6 +113,7 @@ message ListAgentRunEventsRequest {
   int32 after_seq = 3;
   int32 limit = 4;
   bool latest = 5; // true 时忽略 after_seq，返回最近 limit 条事件（按 seq 升序输出）
+  bool is_admin = 6;
 }
 
 message ListAgentRunEventsResponse {
@@ -172,6 +174,7 @@ message AgentRunCostMessage {
 message GetAgentRunStatusRequest {
   string user_id = 1;
   string id = 2;
+  bool is_admin = 3;
 }
 
 message AgentRunResultMessage {
@@ -234,6 +237,7 @@ message ListAgentArtifactsRequest {
   string user_id = 1;
   string id = 2;
   bool is_admin = 3;
+  bool skip_lazy_registration = 4;
 }
 
 message ListAgentArtifactsResponse {
@@ -466,6 +470,7 @@ message ListAgentMessagesRequest {
   int32 limit = 3;              // 默认 50，最大 200
   int32 offset = 4;             // 分页偏移
   bool include_initial = 5;     // 是否包含初始问题（默认 true）
+  bool is_admin = 6;
 }
 
 // 获取消息历史响应
@@ -507,7 +512,22 @@ message AgentSnapshotPartMessage {
   string compression = 6;
 }
 
+// 管理员诊断采集在触碰具体 Run 前先读取这组能力，避免新脚本连接到旧服务时
+// 误以为 GET 一定无副作用。该 RPC 本身不读取 Run，也不修改任何业务状态。
+message GetAgentDiagnosticReadCapabilitiesRequest {
+  string user_id = 1;
+  bool is_admin = 2;
+}
+
+message GetAgentDiagnosticReadCapabilitiesResponse {
+  bool admin_cross_user_read = 1;
+  bool no_touch_run_lifecycle = 2;
+  bool artifact_skip_lazy_registration = 3;
+}
+
 service AgentDubboService {
+  rpc GetDiagnosticReadCapabilities(GetAgentDiagnosticReadCapabilitiesRequest)
+      returns (GetAgentDiagnosticReadCapabilitiesResponse);
   rpc CreateRun(CreateAgentRunRequest) returns (AgentRunMessage);
   rpc GetRun(GetAgentRunRequest) returns (AgentRunMessage);
   rpc UpdateRun(UpdateAgentRunRequest) returns (AgentRunMessage);

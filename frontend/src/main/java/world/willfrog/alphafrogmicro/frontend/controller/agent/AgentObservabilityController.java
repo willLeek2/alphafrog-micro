@@ -14,6 +14,8 @@ import world.willfrog.alphafrogmicro.frontend.model.agent.TimelineResponse;
 import world.willfrog.alphafrogmicro.frontend.model.agent.TraceDetailResponse;
 import world.willfrog.alphafrogmicro.frontend.model.agent.TraceListResponse;
 
+import java.util.Map;
+
 /** Agent 可观测性、trace 与 timeline 视图的 HTTP 边界。 */
 @RestController
 @RequiredArgsConstructor
@@ -22,6 +24,12 @@ public class AgentObservabilityController {
     private static final String AGENT_RUNS = "/api/agent/runs";
 
     private final AgentController safeHandlers;
+
+    @GetMapping("/api/agent/diagnostics/read-capabilities")
+    public ResponseWrapper<Map<String, Boolean>> diagnosticReadCapabilities(
+            Authentication authentication) {
+        return safeHandlers.diagnosticReadCapabilities(authentication);
+    }
 
     @GetMapping(AGENT_RUNS + "/{runId}/events")
     public ResponseWrapper<AgentRunEventsPageResponse> events(

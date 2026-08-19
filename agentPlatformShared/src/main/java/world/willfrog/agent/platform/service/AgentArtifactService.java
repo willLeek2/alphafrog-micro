@@ -130,15 +130,28 @@ public class AgentArtifactService {
     }
 
     public List<AgentArtifactMessage> listArtifacts(AgentRun run, boolean isAdmin) {
+        return listArtifacts(run, isAdmin, true);
+    }
+
+    /**
+     * 列出制品；管理员诊断采集可关闭事件派生制品的惰性注册，保证 GET 不写注册表。
+     * 已经存在于注册表中的制品仍正常返回。
+     */
+    public List<AgentArtifactMessage> listArtifacts(AgentRun run,
+                                                    boolean isAdmin,
+                                                    boolean allowLazyRegistration) {
         String runId = run == null || run.getId() == null ? "" : run.getId();
         if (runId.isBlank()) {
             return List.of();
         }
         String userId = run.getUserId();
 
-        List<EventDerivedCandidate> candidates = buildEventCandidates(run, isAdmin);
-        List<PersistentArtifactMeta> listed = artifactRegistry.listByRunId(runId);
-        if (registerMissingEventDerived(runId, userId, candidates, listed)) {
+        List<EventDerivedCandidate> candidates = buildEventCandidates(
+                run, isAdmin, !allowLazyRegistration);
+        // 诊断读取关闭惰性注册时也必须关闭幽灵索引 ZREM，保证 Redis 严格只读。
+        List<PersistentArtifactMeta> listed = artifactRegistry.listByRunId(
+                runId, allowLazyRegistration);
+        if (allowLazyRegistration && registerMissingEventDerived(runId, userId, candidates, listed)) {
             // 惰性注册后以 registry 为权威重读
             listed = artifactRegistry.listByRunId(runId);
         }
@@ -228,14 +241,19 @@ public class AgentArtifactService {
     }
 
     public ArtifactContent loadArtifact(AgentRun run, boolean isAdmin, String artifactId) {
-        return loadArtifact(run, isAdmin, artifactId, true);
+        return loadArtifact(run, isAdmin, artifactId, true, false);
     }
 
     public ArtifactContent loadArtifactForParts(AgentRun run, boolean isAdmin, String artifactId) {
-        return loadArtifact(run, isAdmin, artifactId, false);
+        // 管理员诊断分片必须严格只读：不刷新 registry retention，也不冲刷 pending 事件。
+        return loadArtifact(run, isAdmin, artifactId, false, isAdmin);
     }
 
-    private ArtifactContent loadArtifact(AgentRun run, boolean isAdmin, String artifactId, boolean enforceDownloadMaxBytes) {
+    private ArtifactContent loadArtifact(AgentRun run,
+                                         boolean isAdmin,
+                                         String artifactId,
+                                         boolean enforceDownloadMaxBytes,
+                                         boolean diagnosticNoTouch) {
         String runId = run == null || run.getId() == null ? "" : run.getId();
         String userId = run == null ? null : run.getUserId();
 
@@ -250,7 +268,8 @@ public class AgentArtifactService {
             String filename;
             if (EVENT_DERIVED_TYPES.contains(meta.getArtifactType())) {
                 EventDerivedCandidate candidate =
-                        findCandidate(run, isAdmin, meta.getArtifactType(), meta.getLogicalId());
+                        findCandidate(run, isAdmin, meta.getArtifactType(), meta.getLogicalId(),
+                                isAdmin || diagnosticNoTouch);
                 if (candidate == null) {
                     throw new IllegalArgumentException("artifact not found");
                 }
@@ -262,13 +281,14 @@ public class AgentArtifactService {
                 }
                 filename = displayNameOf(meta);
             }
-            byte[] bytes = readRegistryArtifact(meta, enforceDownloadMaxBytes);
+            byte[] bytes = readRegistryArtifact(meta, enforceDownloadMaxBytes, diagnosticNoTouch);
             return new ArtifactContent(meta.getArtifactId(), filename,
                     contentTypeFor(meta.getArtifactType()), bytes);
         }
 
         // Registry miss：仅历史 Base64 type|runId|ref ID 允许只读回退（不写文件、不注册）。
-        return loadLegacyArtifact(run, isAdmin, artifactId, enforceDownloadMaxBytes);
+        return loadLegacyArtifact(run, isAdmin, artifactId, enforceDownloadMaxBytes,
+                isAdmin || diagnosticNoTouch);
     }
 
     // ===== list 侧：事件派生候选 + 惰性幂等注册 =====
@@ -279,8 +299,14 @@ public class AgentArtifactService {
      * <p>脚本候选携带代码内容（内容制品）；dataset 文件候选携带 dataset 根内的原位路径
      * （external 引用制品，注册不复制文件）。</p>
      */
-    private List<EventDerivedCandidate> buildEventCandidates(AgentRun run, boolean isAdmin) {
-        List<AgentRunEvent> events = eventService.listByRunId(run.getId());
+    private List<EventDerivedCandidate> buildEventCandidates(AgentRun run,
+                                                             boolean isAdmin,
+                                                             boolean diagnosticNoTouch) {
+        // 严格诊断读取必须绕过 Redis 事件投影，否则普通 listByRunId 会先 flush
+        // 进程内 pending 并刷新 Redis TTL。
+        List<AgentRunEvent> events = diagnosticNoTouch
+                ? eventService.listByRunIdFromDatabase(run.getId())
+                : eventService.listByRunId(run.getId());
         ParsedEvents parsed = parseEvents(events);
 
         List<PythonInvocation> selectedInvocations = selectInvocations(parsed.invocations(), isAdmin);
@@ -442,11 +468,15 @@ public class AgentArtifactService {
         return days * 24L;
     }
 
-    private EventDerivedCandidate findCandidate(AgentRun run, boolean isAdmin, String type, String logicalId) {
+    private EventDerivedCandidate findCandidate(AgentRun run,
+                                                boolean isAdmin,
+                                                String type,
+                                                String logicalId,
+                                                boolean diagnosticNoTouch) {
         if (run == null || run.getId() == null || type == null || logicalId == null) {
             return null;
         }
-        for (EventDerivedCandidate candidate : buildEventCandidates(run, isAdmin)) {
+        for (EventDerivedCandidate candidate : buildEventCandidates(run, isAdmin, diagnosticNoTouch)) {
             if (type.equals(candidate.type()) && logicalId.equals(candidate.logicalId())) {
                 return candidate;
             }
@@ -456,7 +486,9 @@ public class AgentArtifactService {
 
     // ===== load 侧：registry 读取 + legacy 只读回退 =====
 
-    private byte[] readRegistryArtifact(PersistentArtifactMeta meta, boolean enforceDownloadMaxBytes) {
+    private byte[] readRegistryArtifact(PersistentArtifactMeta meta,
+                                        boolean enforceDownloadMaxBytes,
+                                        boolean diagnosticNoTouch) {
         if (meta.getPath() == null || meta.getPath().isBlank()) {
             throw new IllegalArgumentException("artifact source not found");
         }
@@ -464,7 +496,8 @@ public class AgentArtifactService {
         // 复检 + no-follow 打开 + 哈希校验（TOCTOU 强化），门面不再直读 meta.path。
         long maxBytes = enforceDownloadMaxBytes ? downloadMaxBytes : -1L;
         try {
-            return artifactRegistry.readArtifactBytes(meta.getArtifactId(), maxBytes);
+            return artifactRegistry.readArtifactBytes(
+                    meta.getArtifactId(), maxBytes, !diagnosticNoTouch);
         } catch (IllegalStateException e) {
             throw e;
         } catch (Exception e) {
@@ -478,7 +511,8 @@ public class AgentArtifactService {
      * 回退路径绝不写文件、绝不注册新制品；retention/success-only 语义经事件候选重放保持。
      */
     private ArtifactContent loadLegacyArtifact(AgentRun run, boolean isAdmin, String artifactId,
-                                               boolean enforceDownloadMaxBytes) {
+                                               boolean enforceDownloadMaxBytes,
+                                               boolean diagnosticNoTouch) {
         ArtifactRef ref = decodeArtifactId(artifactId);
         String runId = run == null || run.getId() == null ? "" : run.getId();
         if (!Objects.equals(ref.runId(), runId)) {
@@ -490,7 +524,8 @@ public class AgentArtifactService {
             throw new IllegalArgumentException("artifact not found");
         }
         // retention/success-only 保持：当前 scope 重放不出该候选即视为 not found（与降级前一致）
-        EventDerivedCandidate candidate = findCandidate(run, isAdmin, type, ref.ref());
+        EventDerivedCandidate candidate = findCandidate(
+                run, isAdmin, type, ref.ref(), diagnosticNoTouch);
         if (candidate == null) {
             throw new IllegalArgumentException("artifact not found");
         }

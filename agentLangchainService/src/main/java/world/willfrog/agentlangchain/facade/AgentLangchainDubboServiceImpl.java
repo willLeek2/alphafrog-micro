@@ -26,6 +26,8 @@ import world.willfrog.alphafrogmicro.agent.idl.GetAgentConfigRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentConfigResponse;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentCreditsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentCreditsResponse;
+import world.willfrog.alphafrogmicro.agent.idl.GetAgentDiagnosticReadCapabilitiesRequest;
+import world.willfrog.alphafrogmicro.agent.idl.GetAgentDiagnosticReadCapabilitiesResponse;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCostRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCreditsRequest;
@@ -91,6 +93,12 @@ public class AgentLangchainDubboServiceImpl extends DubboAgentDubboServiceTriple
     private final LangchainRunControlService controlService;
     private final LangchainFollowUpService followUpService;
     private final LangchainArtifactFacadeService artifactFacadeService;
+
+    @Override
+    public GetAgentDiagnosticReadCapabilitiesResponse getDiagnosticReadCapabilities(
+            GetAgentDiagnosticReadCapabilitiesRequest request) {
+        return readService.getDiagnosticReadCapabilities(request);
+    }
 
     @Override
     public AgentRunMessage createRun(CreateAgentRunRequest request) {

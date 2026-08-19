@@ -24,6 +24,8 @@ import world.willfrog.alphafrogmicro.agent.idl.CreateAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.DeleteAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.DownloadAgentArtifactRequest;
 import world.willfrog.alphafrogmicro.agent.idl.DownloadAgentArtifactResponse;
+import world.willfrog.alphafrogmicro.agent.idl.GetAgentDiagnosticReadCapabilitiesRequest;
+import world.willfrog.alphafrogmicro.agent.idl.GetAgentDiagnosticReadCapabilitiesResponse;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentArtifactPartRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentArtifactPartsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunRequest;
@@ -130,6 +132,38 @@ public class AgentController {
 
     private AgentDubboService resolveService() {
         return agentDubboServiceLangchain;
+    }
+
+    /**
+     * 管理员采集脚本的无副作用读取握手。通过 Dubbo provider 实际返回能力，避免
+     * frontend 已升级而后端仍是旧版本时错误放行。
+     */
+    public ResponseWrapper<Map<String, Boolean>> diagnosticReadCapabilities(
+            Authentication authentication) {
+        AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
+        String userId = caller.userId();
+        if (userId == null) {
+            return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
+        }
+        if (!caller.admin()) {
+            return ResponseWrapper.error(ResponseCode.FORBIDDEN, "仅管理员可读取诊断采集能力");
+        }
+        try {
+            GetAgentDiagnosticReadCapabilitiesResponse capabilities =
+                    resolveService().getDiagnosticReadCapabilities(
+                            GetAgentDiagnosticReadCapabilitiesRequest.newBuilder()
+                                    .setUserId(userId)
+                                    .setIsAdmin(true)
+                                    .build());
+            return ResponseWrapper.success(Map.of(
+                    "adminCrossUserRead", capabilities.getAdminCrossUserRead(),
+                    "noTouchRunLifecycle", capabilities.getNoTouchRunLifecycle(),
+                    "artifactSkipLazyRegistration", capabilities.getArtifactSkipLazyRegistration()));
+        } catch (RpcException e) {
+            return handleRpcError(e, "查询管理员诊断读取能力");
+        } catch (Exception e) {
+            return handleError(e, "查询管理员诊断读取能力");
+        }
     }
 
     @PostMapping(AGENT_RUNS)
@@ -286,7 +320,11 @@ public class AgentController {
             return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
         }
         try {
-            AgentRunMessage run = resolveService().getRun(GetAgentRunRequest.newBuilder().setUserId(userId).setId(runId).build());
+            AgentRunMessage run = resolveService().getRun(GetAgentRunRequest.newBuilder()
+                    .setUserId(userId)
+                    .setId(runId)
+                    .setIsAdmin(caller.admin())
+                    .build());
             return ResponseWrapper.success(toRunResponse(run, caller.admin()));
         } catch (RpcException e) {
             return handleRpcError(e, "查询 agent run");
@@ -449,6 +487,7 @@ public class AgentController {
                             .setId(runId)
                             .setAfterSeq(Math.max(0, afterSeq))
                             .setLimit(Math.min(Math.max(1, limit), 500))
+                            .setIsAdmin(caller.admin())
                             .build()
             );
             List<AgentRunEventResponse> items = new ArrayList<>();
@@ -480,6 +519,7 @@ public class AgentController {
                             .setId(runId)
                             .setAfterSeq(Math.max(0, afterSeq))
                             .setLimit(safeLimit)
+                            .setIsAdmin(caller.admin())
                             .build()
             );
             List<TimelineResponse.TimelineItem> items = new ArrayList<>();
@@ -701,6 +741,7 @@ public class AgentController {
                     GetAgentRunStatusRequest.newBuilder()
                             .setUserId(userId)
                             .setId(runId)
+                            .setIsAdmin(caller.admin())
                             .build()
             );
             boolean admin = caller.admin();
@@ -725,7 +766,7 @@ public class AgentController {
                     status.getObservabilityFullAvailable(),
                     Math.max(0, status.getTotalCreditsConsumed()),
                     status.getEventCount() > 0 ? status.getEventCount() : null,
-                    latestEventSeq(service, userId, runId),
+                    latestEventSeq(service, userId, runId, admin),
                     status.getStartedAtMs() > 0 ? status.getStartedAtMs() : null,
                     status.getCompletedAtMs() > 0 ? status.getCompletedAtMs() : null,
                     status.getElapsedMs() > 0 ? status.getElapsedMs() : null
@@ -738,7 +779,7 @@ public class AgentController {
     }
 
     /** REST 恢复只使用实际 durable seq，禁止用 eventCount 推算游标。 */
-    private Integer latestEventSeq(AgentDubboService service, String userId, String runId) {
+    private Integer latestEventSeq(AgentDubboService service, String userId, String runId, boolean admin) {
         try {
             ListAgentRunEventsResponse latest = service.listEvents(
                     ListAgentRunEventsRequest.newBuilder()
@@ -746,6 +787,7 @@ public class AgentController {
                             .setId(runId)
                             .setLatest(true)
                             .setLimit(1)
+                            .setIsAdmin(admin)
                             .build());
             if (latest == null) {
                 return null;
@@ -786,7 +828,8 @@ public class AgentController {
             if (observability == null) {
                 return ResponseWrapper.error(ResponseCode.DATA_NOT_FOUND, "observability 不存在");
             }
-            List<AgentArtifactResponse> artifacts = loadArtifactResponses(userId, runId, caller.admin());
+            List<AgentArtifactResponse> artifacts = loadArtifactResponses(
+                    userId, runId, caller.admin(), true);
             return ResponseWrapper.success(attachArtifactsToObservability(observability, runId, artifacts));
         } catch (RpcException e) {
             return handleRpcError(e, "查询完整 observability");
@@ -1243,13 +1286,20 @@ public class AgentController {
 
     public ResponseWrapper<List<AgentArtifactResponse>> artifacts(Authentication authentication,
                                                                   @PathVariable("runId") String runId) {
+        return artifacts(authentication, runId, false);
+    }
+
+    public ResponseWrapper<List<AgentArtifactResponse>> artifacts(Authentication authentication,
+                                                                  String runId,
+                                                                  boolean skipLazyRegistration) {
         AgentAuthSupport.AgentAuthContext caller = authSupport.resolve(authentication);
         String userId = caller.userId();
         if (userId == null) {
             return ResponseWrapper.error(ResponseCode.UNAUTHORIZED, "未登录或用户不存在");
         }
         try {
-            return ResponseWrapper.success(loadArtifactResponses(userId, runId, caller.admin()));
+            return ResponseWrapper.success(loadArtifactResponses(
+                    userId, runId, caller.admin(), skipLazyRegistration));
         } catch (RpcException e) {
             return handleRpcError(e, "查询 artifacts");
         } catch (Exception e) {
@@ -1528,6 +1578,7 @@ public class AgentController {
                             .setLimit(Math.min(Math.max(1, limit), 200))
                             .setOffset(Math.max(0, offset))
                             .setIncludeInitial(includeInitial)
+                            .setIsAdmin(caller.admin())
                             .build()
             );
             List<AgentMessageItemResponse> items = new ArrayList<>();
@@ -1638,12 +1689,16 @@ public class AgentController {
         );
     }
 
-    private List<AgentArtifactResponse> loadArtifactResponses(String userId, String runId, boolean isAdmin) {
+    private List<AgentArtifactResponse> loadArtifactResponses(String userId,
+                                                              String runId,
+                                                              boolean isAdmin,
+                                                              boolean skipLazyRegistration) {
         ListAgentArtifactsResponse resp = resolveService().listArtifacts(
                 ListAgentArtifactsRequest.newBuilder()
                         .setUserId(userId)
                         .setId(runId)
                         .setIsAdmin(isAdmin)
+                        .setSkipLazyRegistration(skipLazyRegistration)
                         .build()
         );
         List<AgentArtifactResponse> items = new ArrayList<>();

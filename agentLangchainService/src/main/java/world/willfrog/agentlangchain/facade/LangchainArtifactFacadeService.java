@@ -32,7 +32,10 @@ public class LangchainArtifactFacadeService {
             return ListAgentArtifactsResponse.newBuilder().build();
         }
         return ListAgentArtifactsResponse.newBuilder()
-                .addAllItems(artifactService.listArtifacts(run, request.getIsAdmin()))
+                .addAllItems(artifactService.listArtifacts(
+                        run,
+                        request.getIsAdmin(),
+                        !request.getSkipLazyRegistration()))
                 .build();
     }
 

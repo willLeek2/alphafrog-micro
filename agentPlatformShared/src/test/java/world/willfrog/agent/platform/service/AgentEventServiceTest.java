@@ -10,6 +10,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ValueOperations;
+import org.springframework.data.redis.core.ZSetOperations;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.entity.AgentRunEvent;
@@ -19,7 +20,10 @@ import world.willfrog.agent.platform.prompt.PromptRunSelection;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 
 import java.time.LocalDate;
+import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -75,6 +79,56 @@ class AgentEventServiceTest {
                         PromptRunSelection.SCHEMA_VERSION,
                         "default-v1", "control", "bundle-digest", "capability-digest",
                         LocalDate.of(2025, 2, 3)));
+    }
+
+    @Test
+    void diagnosticDatabaseReadsDoNotFlushPendingRedisEventsButOrdinaryReadStillDoes() {
+        AgentLlmProperties properties = new AgentLlmProperties();
+        AgentLlmProperties.EventStoreConfig eventStoreConfig = new AgentLlmProperties.EventStoreConfig();
+        eventStoreConfig.setRedisFlushBatchSize(10);
+        properties.setEventStore(eventStoreConfig);
+        when(llmLocalConfigLoader.current()).thenReturn(Optional.of(properties));
+
+        AgentRunEventRedisStore realRedisStore = new AgentRunEventRedisStore(
+                redisTemplate, objectMapper, llmLocalConfigLoader);
+        AgentEventService realService = new AgentEventService(
+                runMapper,
+                eventMapper,
+                realRedisStore,
+                objectMapper,
+                redisTemplate,
+                llmLocalConfigLoader,
+                messageService,
+                mockPromptService
+        );
+        AgentRunEvent pending = new AgentRunEvent();
+        pending.setRunId("r1");
+        pending.setSeq(7);
+        pending.setEventType("TODO_STARTED");
+        pending.setPayloadJson("{}");
+        realRedisStore.append(pending);
+
+        when(eventMapper.listByRunIdAfterSeq("r1", 2, 20)).thenReturn(List.of(pending));
+        when(eventMapper.listLatestByRunId("r1", 5)).thenReturn(List.of(pending));
+        when(eventMapper.listByRunId("r1")).thenReturn(List.of(pending));
+        when(eventMapper.findLatestByRunId("r1")).thenReturn(pending);
+        when(eventMapper.findMaxSeq("r1")).thenReturn(7);
+
+        assertEquals(List.of(pending), realService.listByRunIdAfterSeqFromDatabase("r1", 2, 20));
+        assertEquals(List.of(pending), realService.listLatestByRunIdFromDatabase("r1", 5));
+        assertEquals(List.of(pending), realService.listByRunIdFromDatabase("r1"));
+        assertEquals(pending, realService.findLatestByRunIdFromDatabase("r1"));
+        assertEquals(7, realService.findMaxSeqFromDatabase("r1"));
+        verify(redisTemplate, never()).executePipelined(any(org.springframework.data.redis.core.SessionCallback.class));
+
+        @SuppressWarnings("unchecked")
+        ZSetOperations<String, String> zSetOperations = org.mockito.Mockito.mock(ZSetOperations.class);
+        when(redisTemplate.opsForZSet()).thenReturn(zSetOperations);
+        when(zSetOperations.rangeByScoreWithScores(anyString(), any(Double.class), any(Double.class), eq(0L), eq(20L)))
+                .thenReturn(Set.of());
+
+        assertTrue(realService.listByRunIdAfterSeq("r1", 2, 20).isEmpty());
+        verify(redisTemplate).executePipelined(any(org.springframework.data.redis.core.SessionCallback.class));
     }
 
     @Test

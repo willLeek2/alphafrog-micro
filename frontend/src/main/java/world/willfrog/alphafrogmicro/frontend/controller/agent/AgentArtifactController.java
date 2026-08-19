@@ -43,8 +43,10 @@ public class AgentArtifactController {
     @GetMapping(AGENT_RUNS + "/{runId}/artifacts")
     public ResponseWrapper<List<AgentArtifactResponse>> artifacts(
             Authentication authentication,
-            @PathVariable("runId") String runId) {
-        return safeHandlers.artifacts(authentication, runId);
+            @PathVariable("runId") String runId,
+            @RequestParam(value = "skip_lazy_registration", required = false, defaultValue = "false")
+            boolean skipLazyRegistration) {
+        return safeHandlers.artifacts(authentication, runId, skipLazyRegistration);
     }
 
     @GetMapping(AGENT_RUNS + "/{runId}/artifacts/{artifactId}/parts")

@@ -44,6 +44,8 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
@@ -248,6 +250,34 @@ class AgentArtifactServiceTest {
         assertFalse(Files.exists(artifactRoot.resolve("run-1")));
     }
 
+    @Test
+    void listArtifacts_canSkipLazyRegistrationForDiagnosticReads() throws Exception {
+        Path datasetDir = datasetRoot.resolve("ds1");
+        Files.createDirectories(datasetDir);
+        Files.writeString(datasetDir.resolve("ds1.csv"), "a,b\n1,2\n");
+        Files.writeString(datasetDir.resolve("ds1.json"), "{\"columns\":[\"a\"],\"rows\":[[1]]}");
+        Files.writeString(datasetDir.resolve("ds1.meta.json"), "{\"id\":\"ds1\"}");
+        when(eventService.listByRunIdFromDatabase("run-1"))
+                .thenReturn(todoEvents("run-1", OffsetDateTime.now(ZoneOffset.UTC)));
+        String listKey = RUN_LIST_PREFIX + "run-1";
+        zsets.computeIfAbsent(listKey, key -> new ConcurrentHashMap<>())
+                .put("python_script:ghost", 1.0);
+
+        List<AgentArtifactMessage> artifacts = service.listArtifacts(
+                run("run-1", "u1"), true, false);
+
+        assertTrue(artifacts.isEmpty());
+        assertTrue(zsets.get(listKey).containsKey("python_script:ghost"),
+                "诊断读取不得顺手 ZREM 幽灵索引");
+        assertFalse(Files.exists(artifactRoot.resolve("python_script")));
+        assertFalse(Files.exists(artifactRoot.resolve("run-1")));
+        try (Stream<Path> stream = Files.list(datasetDir)) {
+            assertEquals(3, stream.count(), "诊断读取不得在 dataset 目录新增文件");
+        }
+        verify(eventService).listByRunIdFromDatabase("run-1");
+        verify(eventService, never()).listByRunId("run-1");
+    }
+
     // ===== ③ load Registry-first =====
 
     @Test
@@ -268,6 +298,40 @@ class AgentArtifactServiceTest {
         assertArrayEquals("print(1)".getBytes(StandardCharsets.UTF_8), content.content());
         // 加载路径不落任何 legacy 快照
         assertFalse(Files.exists(artifactRoot.resolve("run-1")));
+    }
+
+    @Test
+    void adminArtifactPartsShouldUseDatabaseEventsAndNotTouchRegistry() throws Exception {
+        OffsetDateTime eventTime = OffsetDateTime.now(ZoneOffset.UTC);
+        when(eventService.listByRunId("run-1")).thenReturn(todoEvents("run-1", eventTime));
+        AgentRun run = run("run-1", "u1");
+        AgentArtifactMessage script = service.listArtifacts(run, false).stream()
+                .filter(a -> "python_script".equals(a.getType())).findFirst().orElseThrow();
+
+        Mockito.reset(eventService);
+        when(eventService.listByRunIdFromDatabase("run-1"))
+                .thenReturn(todoEvents("run-1", eventTime));
+        Map<String, String> valuesBefore = new java.util.LinkedHashMap<>(values);
+        Map<String, Map<String, String>> hashesBefore = hashes.entrySet().stream()
+                .collect(Collectors.toMap(Map.Entry::getKey,
+                        entry -> new java.util.LinkedHashMap<>(entry.getValue()),
+                        (left, right) -> left, java.util.LinkedHashMap::new));
+        Map<String, Map<String, Double>> zsetsBefore = zsets.entrySet().stream()
+                .collect(Collectors.toMap(Map.Entry::getKey,
+                        entry -> new java.util.LinkedHashMap<>(entry.getValue()),
+                        (left, right) -> left, java.util.LinkedHashMap::new));
+        Map<String, Long> deadlinesBefore = new java.util.LinkedHashMap<>(deadlines);
+
+        AgentArtifactService.ArtifactContent content =
+                service.loadArtifactForParts(run, true, script.getArtifactId());
+
+        assertArrayEquals("print(1)".getBytes(StandardCharsets.UTF_8), content.content());
+        verify(eventService).listByRunIdFromDatabase("run-1");
+        verify(eventService, never()).listByRunId("run-1");
+        assertEquals(valuesBefore, values, "诊断分片读取不得改 meta 或 seq 值");
+        assertEquals(hashesBefore, hashes, "诊断分片读取不得改 identity hash");
+        assertEquals(zsetsBefore, zsets, "诊断分片读取不得重排 run 索引");
+        assertEquals(deadlinesBefore, deadlines, "诊断分片读取不得刷新任何 Redis TTL");
     }
 
     // ===== ④ Base64 回退只读 =====

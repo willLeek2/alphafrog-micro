@@ -32,11 +32,12 @@ final class LangchainDataAnalysisReadOverlay {
         this.objectMapper = objectMapper;
     }
 
-    String mergeStatus(AgentRun run, String existingJson) {
+    String mergeStatus(AgentRun run, String existingJson, boolean diagnosticNoTouch) {
         String runId = run.getId();
         try {
             String dataAnalysisJson = serializer.serializeStatusFromSummary(
-                    runId, query.findSummaryByRunId(runId, readMode(run.getStatus())));
+                    runId, query.findSummaryByRunId(
+                            runId, readMode(run.getStatus(), diagnosticNoTouch)));
             return dataAnalysisJson.equals("{}")
                     ? existingJson
                     : mergeJsonObjects(runId, "status", existingJson, dataAnalysisJson);
@@ -47,11 +48,11 @@ final class LangchainDataAnalysisReadOverlay {
         }
     }
 
-    String mergeResult(AgentRun run, String existingJson) {
+    String mergeResult(AgentRun run, String existingJson, boolean diagnosticNoTouch) {
         String runId = run.getId();
         try {
             String dataAnalysisJson = serializer.serializeResultView(
-                    query.findByRunId(runId, readMode(run.getStatus())));
+                    query.findByRunId(runId, readMode(run.getStatus(), diagnosticNoTouch)));
             return dataAnalysisJson.equals("{}")
                     ? existingJson
                     : mergeJsonObjects(runId, "result", existingJson, dataAnalysisJson);
@@ -62,7 +63,11 @@ final class LangchainDataAnalysisReadOverlay {
         }
     }
 
-    private DataAnalysisObservabilityReadMode readMode(AgentRunStatus status) {
+    private DataAnalysisObservabilityReadMode readMode(AgentRunStatus status,
+                                                        boolean diagnosticNoTouch) {
+        if (diagnosticNoTouch) {
+            return DataAnalysisObservabilityReadMode.DIAGNOSTIC_DB_ONLY;
+        }
         if (status == AgentRunStatus.COMPLETED || status == AgentRunStatus.PARTIAL
                 || status == AgentRunStatus.FAILED || status == AgentRunStatus.CANCELED
                 || status == AgentRunStatus.EXPIRED) {

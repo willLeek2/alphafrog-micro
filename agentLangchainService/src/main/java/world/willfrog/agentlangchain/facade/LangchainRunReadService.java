@@ -45,6 +45,8 @@ import world.willfrog.alphafrogmicro.agent.idl.GetAgentConfigRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentConfigResponse;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentCreditsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentCreditsResponse;
+import world.willfrog.alphafrogmicro.agent.idl.GetAgentDiagnosticReadCapabilitiesRequest;
+import world.willfrog.alphafrogmicro.agent.idl.GetAgentDiagnosticReadCapabilitiesResponse;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCostRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunCreditsRequest;
@@ -95,8 +97,10 @@ import java.util.Map;
  *
  * <h2>读写一致性边界</h2>
  * langchain 服务和 agent runtime 共享同一套 PG/Redis 存储。事件流目前由
- * {@link AgentEventService} 优先从 Redis ZSET 读取，只有 Redis 没有该 run 的事件时才回退 DB。
- * 本类只校验 Run 存在且属于请求用户；当前没有跨实例的 Run 单写者租约。
+ * {@link AgentEventService} 为普通用户优先从 Redis ZSET 读取，只有 Redis 没有该 run 的事件时才回退 DB；
+ * 管理员诊断读取直接使用 PostgreSQL 权威事件，避免 GET 冲刷 Redis pending 或刷新 TTL。
+ * 普通用户读取校验 Run 属于请求用户；管理员诊断读取按 Run ID 校验存在性，并且
+ * 不触发下面所述的惰性过期写回。当前没有跨实例的 Run 单写者租约。
  * ToolJob 的 anchor/lease/CAS 只保护对应 ToolJob 状态，不等同于整个 Run 的写者归属。
  *
  * <h2>status 方法的 phase 推断</h2>
@@ -105,9 +109,9 @@ import java.util.Map;
  * 这是前端进度展示的核心数据源，具体聚合已下沉到 {@link LangchainRunStatusReadModel}。
  *
  * <h2>过期标记</h2>
- * {@link #markExpiredIfNeeded} 在每次读取时检查 run 是否已过期（超过 TTL），
+ * 普通用户读取通过 {@link #markExpiredIfNeeded} 检查 run 是否已过期（超过 TTL），
  * 如果是则更新状态并写入 EXPIRED 事件。这种"读时触发写"的模式保证过期状态
- * 即使没有定时任务也能被及时感知。
+ * 即使没有定时任务也能被及时感知；管理员诊断读取明确绕过这一写回路径。
  *
  * @see LangchainRunControlService 写/控制路径（pause/cancel/resume）
  * @see AgentLangchainRunService 写路径入口（createRun）
@@ -149,7 +153,27 @@ public class LangchainRunReadService {
     private int maxPollingIntervalSeconds;
 
     public world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage getRun(GetAgentRunRequest request) {
-        return AgentLangchainRunMessageMapper.toRunMessage(requireReadableRun(request.getId(), request.getUserId()));
+        AgentRun run = request.getIsAdmin()
+                ? requireReadableRunForAdmin(request.getId())
+                : requireReadableRun(request.getId(), request.getUserId());
+        return AgentLangchainRunMessageMapper.toRunMessage(run);
+    }
+
+    /**
+     * 返回管理员诊断读取能力。这个探测不接收 Run ID，也不读取 Run，供采集脚本在
+     * 发出任何 Run 请求前确认当前 frontend 和 provider 都已支持无副作用读取。
+     */
+    public GetAgentDiagnosticReadCapabilitiesResponse getDiagnosticReadCapabilities(
+            GetAgentDiagnosticReadCapabilitiesRequest request) {
+        requireUserId(request.getUserId());
+        if (!request.getIsAdmin()) {
+            throw new IllegalArgumentException("admin access required");
+        }
+        return GetAgentDiagnosticReadCapabilitiesResponse.newBuilder()
+                .setAdminCrossUserRead(true)
+                .setNoTouchRunLifecycle(true)
+                .setArtifactSkipLazyRegistration(true)
+                .build();
     }
 
     public world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage updateRun(UpdateAgentRunRequest request) {
@@ -202,7 +226,11 @@ public class LangchainRunReadService {
     }
 
     public ListAgentRunEventsResponse listEvents(ListAgentRunEventsRequest request) {
-        requireReadableRun(request.getId(), request.getUserId());
+        if (request.getIsAdmin()) {
+            requireReadableRunForAdmin(request.getId());
+        } else {
+            requireReadableRun(request.getId(), request.getUserId());
+        }
         int afterSeq = Math.max(0, request.getAfterSeq());
         int limit = request.getLimit() <= 0 ? 200 : Math.min(request.getLimit(), 500);
         List<AgentRunEvent> events;
@@ -210,9 +238,13 @@ public class LangchainRunReadService {
         if (request.getLatest()) {
             // snapshot 阶段只需要最近 N 条事件，前端用它补足首屏上下文；
             // 常规补洞仍走 afterSeq，避免每次都传完整事件流。
-            events = eventService.listLatestByRunId(request.getId(), limit);
+            events = request.getIsAdmin()
+                    ? eventService.listLatestByRunIdFromDatabase(request.getId(), limit)
+                    : eventService.listLatestByRunId(request.getId(), limit);
         } else {
-            events = eventService.listByRunIdAfterSeq(request.getId(), afterSeq, limit + 1);
+            events = request.getIsAdmin()
+                    ? eventService.listByRunIdAfterSeqFromDatabase(request.getId(), afterSeq, limit + 1)
+                    : eventService.listByRunIdAfterSeq(request.getId(), afterSeq, limit + 1);
             hasMore = events.size() > limit;
             if (hasMore) {
                 events = events.subList(0, limit);
@@ -235,14 +267,18 @@ public class LangchainRunReadService {
                 : requireReadableRun(request.getId(), request.getUserId());
         String snapshotJson = nvl(run.getSnapshotJson());
         String observabilityJson = nvl(observabilityService.loadObservabilityJson(run.getId(), snapshotJson));
-        observabilityJson = dataAnalysisOverlay().mergeResult(run, observabilityJson);
+        observabilityJson = dataAnalysisOverlay().mergeResult(
+                run, observabilityJson, request.getIsAdmin());
         Map<String, Object> snapshot = readExtMap(snapshotJson);
         String answerMarkdown = firstNonBlank(stringValue(snapshot.get("answer_markdown")), stringValue(snapshot.get("answer")));
         String structuredAnswerJson = "";
         if (snapshot.get("structured_answer") != null) {
             structuredAnswerJson = writeJson(snapshot.get("structured_answer"));
         }
-        int totalCredits = creditService.calculateRunTotalCredits(run, eventService.listByRunId(run.getId()), observabilityJson);
+        List<AgentRunEvent> events = request.getIsAdmin()
+                ? eventService.listByRunIdFromDatabase(run.getId())
+                : eventService.listByRunId(run.getId());
+        int totalCredits = creditService.calculateRunTotalCredits(run, events, observabilityJson);
         return AgentRunResultMessage.newBuilder()
                 .setId(nvl(run.getId()))
                 .setStatus(run.getStatus() == null ? "" : run.getStatus().name())
@@ -295,7 +331,10 @@ public class LangchainRunReadService {
      * 需要完整观测或安全调用详情时，由结果/详情接口按需加载。
      */
     public AgentRunStatusMessage getStatus(GetAgentRunStatusRequest request) {
-        return statusReadModel().build(requireReadableRun(request.getId(), request.getUserId()));
+        AgentRun run = request.getIsAdmin()
+                ? requireReadableRunForAdmin(request.getId())
+                : requireReadableRun(request.getId(), request.getUserId());
+        return statusReadModel().build(run, request.getIsAdmin());
     }
 
     public ListAgentToolsResponse listTools(ListAgentToolsRequest request) {
@@ -390,7 +429,11 @@ public class LangchainRunReadService {
     public ListAgentMessagesResponse listMessages(ListAgentMessagesRequest request) {
         String userId = requireUserId(request.getUserId());
         String runId = requireId(request.getRunId(), "run_id");
-        requireReadableRun(runId, userId);
+        if (request.getIsAdmin()) {
+            requireReadableRunForAdmin(runId);
+        } else {
+            requireReadableRun(runId, userId);
+        }
         int limit = request.getLimit() <= 0 ? 50 : Math.min(request.getLimit(), 200);
         int offset = Math.max(0, request.getOffset());
         boolean includeInitial = request.getIncludeInitial();
@@ -486,7 +529,10 @@ public class LangchainRunReadService {
         if (run == null) {
             throw new IllegalArgumentException("run not found");
         }
-        return markExpiredIfNeeded(run);
+        // 管理员诊断读取必须保持无副作用。普通用户读取仍会按既有合同惰性推进
+        // EXPIRED；管理员批量采集不能因为并发 GET 改写 Run 状态、追加终态事件或
+        // 发布 finalized 事件。
+        return run;
     }
 
     private AgentRun markExpiredIfNeeded(AgentRun run) {

@@ -26,9 +26,11 @@ import world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilityQuery
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilityReadMode;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilitySnapshot;
 import world.willfrog.alphafrogmicro.agent.idl.AgentArtifactMessage;
+import world.willfrog.alphafrogmicro.agent.idl.GetAgentDiagnosticReadCapabilitiesRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunResultRequest;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunStatusRequest;
+import world.willfrog.alphafrogmicro.agent.idl.ListAgentMessagesRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentRunEventsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentRunsRequest;
 
@@ -93,6 +95,96 @@ class LangchainRunReadServiceTest {
                 .build());
 
         assertEquals("r1", message.getId());
+    }
+
+    @Test
+    void diagnosticReadCapabilitiesAreAdminOnlyAndNeverTouchRunStorage() {
+        var capabilities = service.getDiagnosticReadCapabilities(
+                GetAgentDiagnosticReadCapabilitiesRequest.newBuilder()
+                        .setUserId("admin-user")
+                        .setIsAdmin(true)
+                        .build());
+
+        assertTrue(capabilities.getAdminCrossUserRead());
+        assertTrue(capabilities.getNoTouchRunLifecycle());
+        assertTrue(capabilities.getArtifactSkipLazyRegistration());
+        assertThrows(IllegalArgumentException.class, () -> service.getDiagnosticReadCapabilities(
+                GetAgentDiagnosticReadCapabilitiesRequest.newBuilder()
+                        .setUserId("ordinary-user")
+                        .setIsAdmin(false)
+                        .build()));
+        verifyNoInteractions(runMapper, eventService, stateStore, artifactService);
+    }
+
+    @Test
+    void adminReadEndpointsUseRunIdLookupAcrossUserOwnership() {
+        AgentRun run = run("{\"run_provider\":\"langchain\"}");
+        when(runMapper.findById("r1")).thenReturn(run);
+        when(eventService.shouldMarkExpired(run)).thenReturn(true);
+        when(eventService.listByRunIdAfterSeqFromDatabase("r1", 0, 201)).thenReturn(List.of());
+        when(stateStore.loadPlan("r1")).thenReturn(Optional.empty());
+        when(eventService.listByRunIdFromDatabase("r1")).thenReturn(List.of());
+        when(observabilityService.loadObservabilitySummaryJson(eq("r1"), any())).thenReturn("{}");
+        when(messageService.listMessagesWithPagination("r1", 50, 0)).thenReturn(List.of());
+
+        service.getRun(GetAgentRunRequest.newBuilder()
+                .setUserId("admin-user").setId("r1").setIsAdmin(true).build());
+        service.listEvents(ListAgentRunEventsRequest.newBuilder()
+                .setUserId("admin-user").setId("r1").setIsAdmin(true).build());
+        service.getStatus(GetAgentRunStatusRequest.newBuilder()
+                .setUserId("admin-user").setId("r1").setIsAdmin(true).build());
+        service.listMessages(ListAgentMessagesRequest.newBuilder()
+                .setUserId("admin-user").setRunId("r1").setIncludeInitial(true).setIsAdmin(true).build());
+
+        verify(runMapper, times(4)).findById("r1");
+        verify(runMapper, never()).findByIdAndUser("r1", "admin-user");
+        verify(eventService, never()).shouldMarkExpired(run);
+        verify(runMapper, never()).updateStatus(anyString(), anyString(), any());
+        verify(eventService, never()).append(eq("r1"), eq("u1"), eq("RUN_EXPIRED"), anyMap());
+        verify(eventService).listByRunIdAfterSeqFromDatabase("r1", 0, 201);
+        verify(eventService).findLatestByRunIdFromDatabase("r1");
+        verify(eventService).listByRunIdFromDatabase("r1");
+        verify(eventService).findMaxSeqFromDatabase("r1");
+        verify(eventService, never()).listByRunIdAfterSeq(anyString(), anyInt(), anyInt());
+        verify(eventService, never()).findLatestByRunId(anyString());
+        verify(eventService, never()).listByRunId(anyString());
+        verify(eventService, never()).findMaxSeq(anyString());
+    }
+
+    @Test
+    void adminLatestEventsUseDatabaseWithoutTouchingRedisProjection() {
+        AgentRun run = run("{\"run_provider\":\"langchain\"}");
+        when(runMapper.findById("r1")).thenReturn(run);
+        when(eventService.listLatestByRunIdFromDatabase("r1", 10))
+                .thenReturn(List.of(event(9, "TOOL_CALL_STARTED"), event(10, "TOOL_CALL_FINISHED")));
+
+        var response = service.listEvents(ListAgentRunEventsRequest.newBuilder()
+                .setUserId("admin-user")
+                .setId("r1")
+                .setLimit(10)
+                .setLatest(true)
+                .setIsAdmin(true)
+                .build());
+
+        assertEquals(2, response.getItemsCount());
+        assertEquals(10, response.getNextAfterSeq());
+        verify(eventService).listLatestByRunIdFromDatabase("r1", 10);
+        verify(eventService, never()).listLatestByRunId(anyString(), anyInt());
+    }
+
+    @Test
+    void nonAdminReadEndpointsCannotBypassRunOwnership() {
+        assertThrows(IllegalArgumentException.class, () -> service.getRun(GetAgentRunRequest.newBuilder()
+                .setUserId("other-user").setId("r1").build()));
+        assertThrows(IllegalArgumentException.class, () -> service.listEvents(ListAgentRunEventsRequest.newBuilder()
+                .setUserId("other-user").setId("r1").build()));
+        assertThrows(IllegalArgumentException.class, () -> service.getStatus(GetAgentRunStatusRequest.newBuilder()
+                .setUserId("other-user").setId("r1").build()));
+        assertThrows(IllegalArgumentException.class, () -> service.listMessages(ListAgentMessagesRequest.newBuilder()
+                .setUserId("other-user").setRunId("r1").setIncludeInitial(true).build()));
+
+        verify(runMapper, times(4)).findByIdAndUser("r1", "other-user");
+        verify(runMapper, never()).findById("r1");
     }
 
     @Test
@@ -436,6 +528,52 @@ class LangchainRunReadServiceTest {
         verify(dataAnalysisQuery).findSummaryByRunId(
                 "r1", DataAnalysisObservabilityReadMode.RUNNING_CACHE_FIRST);
         verify(dataAnalysisQuery, never()).findByRunId(anyString(), any());
+    }
+
+    @Test
+    void adminRunningStatusUsesNoTouchDataAnalysisMode() {
+        AgentRun run = run("{\"run_provider\":\"legacy\"}");
+        run.setStatus(AgentRunStatus.EXECUTING);
+        when(runMapper.findById("r1")).thenReturn(run);
+        when(stateStore.loadPlan("r1")).thenReturn(Optional.empty());
+        when(observabilityService.loadObservabilitySummaryJson(eq("r1"), any())).thenReturn("{}");
+        when(eventService.listByRunIdFromDatabase("r1")).thenReturn(List.of());
+        when(dataAnalysisQuery.findSummaryByRunId(
+                "r1", DataAnalysisObservabilityReadMode.DIAGNOSTIC_DB_ONLY))
+                .thenReturn(Optional.empty());
+
+        service.getStatus(GetAgentRunStatusRequest.newBuilder()
+                .setUserId("admin-user").setId("r1").setIsAdmin(true).build());
+
+        verify(dataAnalysisQuery).findSummaryByRunId(
+                "r1", DataAnalysisObservabilityReadMode.DIAGNOSTIC_DB_ONLY);
+        verify(dataAnalysisQuery, never()).findByRunId(anyString(), any());
+        verify(eventService).findLatestByRunIdFromDatabase("r1");
+        verify(eventService).listByRunIdFromDatabase("r1");
+        verify(eventService).findMaxSeqFromDatabase("r1");
+        verify(eventService, never()).findLatestByRunId(anyString());
+        verify(eventService, never()).listByRunId(anyString());
+        verify(eventService, never()).findMaxSeq(anyString());
+    }
+
+    @Test
+    void adminRunningResultUsesNoTouchDataAnalysisMode() {
+        AgentRun run = run("{\"run_provider\":\"legacy\"}");
+        run.setStatus(AgentRunStatus.EXECUTING);
+        when(runMapper.findById("r1")).thenReturn(run);
+        when(observabilityService.loadObservabilityJson(eq("r1"), any())).thenReturn("{}");
+        when(eventService.listByRunIdFromDatabase("r1")).thenReturn(List.of());
+        when(dataAnalysisQuery.findByRunId(
+                "r1", DataAnalysisObservabilityReadMode.DIAGNOSTIC_DB_ONLY))
+                .thenReturn(Optional.empty());
+
+        service.getResult(GetAgentRunResultRequest.newBuilder()
+                .setUserId("admin-user").setId("r1").setIsAdmin(true).build());
+
+        verify(dataAnalysisQuery).findByRunId(
+                "r1", DataAnalysisObservabilityReadMode.DIAGNOSTIC_DB_ONLY);
+        verify(eventService).listByRunIdFromDatabase("r1");
+        verify(eventService, never()).listByRunId(anyString());
     }
 
     private AgentRun run(String ext) {

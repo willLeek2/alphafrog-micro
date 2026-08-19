@@ -13,9 +13,15 @@ import world.willfrog.alphafrogmicro.agent.idl.AgentRunEventMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunResultMessage;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunStatusMessage;
+import world.willfrog.alphafrogmicro.agent.idl.GetAgentDiagnosticReadCapabilitiesRequest;
+import world.willfrog.alphafrogmicro.agent.idl.GetAgentDiagnosticReadCapabilitiesResponse;
 import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunResultRequest;
+import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunRequest;
+import world.willfrog.alphafrogmicro.agent.idl.GetAgentRunStatusRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentArtifactsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentArtifactsResponse;
+import world.willfrog.alphafrogmicro.agent.idl.ListAgentMessagesRequest;
+import world.willfrog.alphafrogmicro.agent.idl.ListAgentMessagesResponse;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentRunEventsRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ListAgentRunEventsResponse;
 import world.willfrog.alphafrogmicro.agent.idl.SendAgentMessageRequest;
@@ -211,6 +217,115 @@ class AgentControllerTest {
     }
 
     @Test
+    void adminReadRoutesPropagateTrustedAdminFlagToDubboRequests() {
+        when(agentDubboService.getRun(any(GetAgentRunRequest.class))).thenReturn(
+                AgentRunMessage.newBuilder().setId("run-1").setStatus("COMPLETED").build());
+        when(agentDubboService.listEvents(any(ListAgentRunEventsRequest.class))).thenReturn(
+                ListAgentRunEventsResponse.newBuilder().build());
+        when(agentDubboService.getStatus(any(GetAgentRunStatusRequest.class))).thenReturn(
+                AgentRunStatusMessage.newBuilder().setId("run-1").setStatus("COMPLETED").build());
+        when(agentDubboService.getResult(any(GetAgentRunResultRequest.class))).thenReturn(
+                AgentRunResultMessage.newBuilder().setId("run-1").build());
+        when(agentDubboService.listMessages(any(ListAgentMessagesRequest.class))).thenReturn(
+                ListAgentMessagesResponse.newBuilder().build());
+
+        controller.get(authentication, "run-1");
+        controller.events(authentication, "run-1", 0, 20);
+        controller.timeline(authentication, "run-1", 0, 20);
+        controller.status(authentication, "run-1");
+        controller.listMessages(authentication, "run-1", 50, 0, true);
+
+        ArgumentCaptor<GetAgentRunRequest> runRequest = ArgumentCaptor.forClass(GetAgentRunRequest.class);
+        verify(agentDubboService).getRun(runRequest.capture());
+        assertTrue(runRequest.getValue().getIsAdmin());
+
+        ArgumentCaptor<ListAgentRunEventsRequest> eventsRequest =
+                ArgumentCaptor.forClass(ListAgentRunEventsRequest.class);
+        verify(agentDubboService, org.mockito.Mockito.times(3)).listEvents(eventsRequest.capture());
+        assertTrue(eventsRequest.getAllValues().stream().allMatch(ListAgentRunEventsRequest::getIsAdmin));
+
+        ArgumentCaptor<GetAgentRunStatusRequest> statusRequest =
+                ArgumentCaptor.forClass(GetAgentRunStatusRequest.class);
+        verify(agentDubboService).getStatus(statusRequest.capture());
+        assertTrue(statusRequest.getValue().getIsAdmin());
+
+        ArgumentCaptor<ListAgentMessagesRequest> messagesRequest =
+                ArgumentCaptor.forClass(ListAgentMessagesRequest.class);
+        verify(agentDubboService).listMessages(messagesRequest.capture());
+        assertTrue(messagesRequest.getValue().getIsAdmin());
+    }
+
+    @Test
+    void diagnosticReadCapabilitiesRequireAdminAndComeFromProvider() {
+        when(agentDubboService.getDiagnosticReadCapabilities(
+                any(GetAgentDiagnosticReadCapabilitiesRequest.class))).thenReturn(
+                GetAgentDiagnosticReadCapabilitiesResponse.newBuilder()
+                        .setAdminCrossUserRead(true)
+                        .setNoTouchRunLifecycle(true)
+                        .setArtifactSkipLazyRegistration(true)
+                        .build());
+
+        var response = new AgentObservabilityController(controller)
+                .diagnosticReadCapabilities(authentication);
+
+        assertEquals(ResponseCode.SUCCESS.getCode(), response.getCode());
+        assertEquals(Boolean.TRUE, response.getData().get("adminCrossUserRead"));
+        assertEquals(Boolean.TRUE, response.getData().get("noTouchRunLifecycle"));
+        assertEquals(Boolean.TRUE, response.getData().get("artifactSkipLazyRegistration"));
+        ArgumentCaptor<GetAgentDiagnosticReadCapabilitiesRequest> request =
+                ArgumentCaptor.forClass(GetAgentDiagnosticReadCapabilitiesRequest.class);
+        verify(agentDubboService).getDiagnosticReadCapabilities(request.capture());
+        assertEquals("1127", request.getValue().getUserId());
+        assertTrue(request.getValue().getIsAdmin());
+
+        setNonAdmin();
+        var forbidden = new AgentObservabilityController(controller)
+                .diagnosticReadCapabilities(authentication);
+        assertEquals(ResponseCode.FORBIDDEN.getCode(), forbidden.getCode());
+        verify(agentDubboService).getDiagnosticReadCapabilities(any());
+    }
+
+    @Test
+    void nonAdminReadRoutesNeverEscalateDubboRequests() {
+        setNonAdmin();
+        when(agentDubboService.getRun(any(GetAgentRunRequest.class))).thenReturn(
+                AgentRunMessage.newBuilder().setId("run-1").setStatus("COMPLETED").build());
+        when(agentDubboService.listEvents(any(ListAgentRunEventsRequest.class))).thenReturn(
+                ListAgentRunEventsResponse.newBuilder().build());
+        when(agentDubboService.getStatus(any(GetAgentRunStatusRequest.class))).thenReturn(
+                AgentRunStatusMessage.newBuilder().setId("run-1").setStatus("COMPLETED").build());
+        when(agentDubboService.getResult(any(GetAgentRunResultRequest.class))).thenReturn(
+                AgentRunResultMessage.newBuilder().setId("run-1").build());
+        when(agentDubboService.listMessages(any(ListAgentMessagesRequest.class))).thenReturn(
+                ListAgentMessagesResponse.newBuilder().build());
+
+        controller.get(authentication, "run-1");
+        controller.events(authentication, "run-1", 0, 20);
+        controller.timeline(authentication, "run-1", 0, 20);
+        controller.status(authentication, "run-1");
+        controller.listMessages(authentication, "run-1", 50, 0, true);
+
+        ArgumentCaptor<GetAgentRunRequest> runRequest = ArgumentCaptor.forClass(GetAgentRunRequest.class);
+        verify(agentDubboService).getRun(runRequest.capture());
+        assertFalse(runRequest.getValue().getIsAdmin());
+
+        ArgumentCaptor<ListAgentRunEventsRequest> eventsRequest =
+                ArgumentCaptor.forClass(ListAgentRunEventsRequest.class);
+        verify(agentDubboService, org.mockito.Mockito.times(3)).listEvents(eventsRequest.capture());
+        assertTrue(eventsRequest.getAllValues().stream().noneMatch(ListAgentRunEventsRequest::getIsAdmin));
+
+        ArgumentCaptor<GetAgentRunStatusRequest> statusRequest =
+                ArgumentCaptor.forClass(GetAgentRunStatusRequest.class);
+        verify(agentDubboService).getStatus(statusRequest.capture());
+        assertFalse(statusRequest.getValue().getIsAdmin());
+
+        ArgumentCaptor<ListAgentMessagesRequest> messagesRequest =
+                ArgumentCaptor.forClass(ListAgentMessagesRequest.class);
+        verify(agentDubboService).listMessages(messagesRequest.capture());
+        assertFalse(messagesRequest.getValue().getIsAdmin());
+    }
+
+    @Test
     void sendMessage_shouldAllowContextOverrideOnlyWhenDebugModeTrue() {
         controller.sendMessage(authentication, "run-1",
                 new AgentMessageSendRequest("hello", "{\"x\":1}", true, false));
@@ -281,8 +396,25 @@ class AgentControllerTest {
                 ArgumentCaptor.forClass(ListAgentArtifactsRequest.class);
         verify(agentDubboService).listArtifacts(artifactsRequest.capture());
         assertTrue(artifactsRequest.getValue().getIsAdmin());
+        assertTrue(artifactsRequest.getValue().getSkipLazyRegistration());
         assertEquals("1127", artifactsRequest.getValue().getUserId());
         assertEquals("run-1", artifactsRequest.getValue().getId());
+    }
+
+    @Test
+    void artifactDiagnosticRouteCanSkipLazyRegistration() {
+        when(agentDubboService.listArtifacts(any())).thenReturn(
+                ListAgentArtifactsResponse.newBuilder().build());
+
+        var response = new AgentArtifactController(controller)
+                .artifacts(authentication, "run-1", true);
+
+        assertEquals(ResponseCode.SUCCESS.getCode(), response.getCode());
+        ArgumentCaptor<ListAgentArtifactsRequest> request =
+                ArgumentCaptor.forClass(ListAgentArtifactsRequest.class);
+        verify(agentDubboService).listArtifacts(request.capture());
+        assertTrue(request.getValue().getIsAdmin());
+        assertTrue(request.getValue().getSkipLazyRegistration());
     }
 
     @Test
@@ -971,6 +1103,8 @@ class AgentControllerTest {
 
     @Test
     void securitySensitiveRoutesRemainRegisteredAtCompatiblePaths() {
+        assertGetRoute(AgentObservabilityController.class, "diagnosticReadCapabilities",
+                "/api/agent/diagnostics/read-capabilities");
         assertGetRoute(AgentArtifactController.class, "snapshotParts", "/api/agent/runs/{runId}/snapshot/parts");
         assertGetRoute(AgentArtifactController.class, "snapshotPart", "/api/agent/runs/{runId}/snapshot/parts/{partIndex}");
         assertGetRoute(AgentObservabilityController.class, "events", "/api/agent/runs/{runId}/events");

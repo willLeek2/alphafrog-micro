@@ -423,6 +423,16 @@ public class AgentEventService {
     }
 
     /**
+     * 管理员诊断读取专用：直接读取 PostgreSQL 权威事件，不探测或冲刷 Redis 投影。
+     *
+     * <p>普通读路径会先把进程内 pending 事件批量写入 Redis，以保证在线页面不漏事件；
+     * 诊断采集承诺 GET 不产生 Redis 写入，因此必须显式使用这组数据库直读方法。</p>
+     */
+    public List<AgentRunEvent> listByRunIdAfterSeqFromDatabase(String runId, int afterSeq, int limit) {
+        return eventMapper.listByRunIdAfterSeq(runId, afterSeq, limit);
+    }
+
+    /**
      * 按 run 与去重键读取 PostgreSQL 权威事件。
      *
      * <p>去重键是 durable 生命周期状态的主键，不能只读可能过期的 Redis 投影。
@@ -446,6 +456,11 @@ public class AgentEventService {
         return eventMapper.listLatestByRunId(runId, limit);
     }
 
+    /** 管理员诊断读取专用：直接读取 PostgreSQL 最近事件，不冲刷 Redis pending。 */
+    public List<AgentRunEvent> listLatestByRunIdFromDatabase(String runId, int limit) {
+        return eventMapper.listLatestByRunId(runId, limit);
+    }
+
     /**
      * 读取 run 全部事件（默认 Redis；Redis 无该 run 数据时回退 DB）。
      */
@@ -457,6 +472,11 @@ public class AgentEventService {
         return eventMapper.listByRunId(runId);
     }
 
+    /** 管理员诊断读取专用：直接读取 PostgreSQL 全量事件，不冲刷 Redis pending。 */
+    public List<AgentRunEvent> listByRunIdFromDatabase(String runId) {
+        return eventMapper.listByRunId(runId);
+    }
+
     public AgentRunEvent findLatestByRunId(String runId) {
         if (eventRedisStore.hasEvents(runId)) {
             return eventRedisStore.findLatestByRunId(runId);
@@ -465,11 +485,21 @@ public class AgentEventService {
         return eventMapper.findLatestByRunId(runId);
     }
 
+    /** 管理员诊断读取专用：直接读取 PostgreSQL 最后一条事件，不冲刷 Redis pending。 */
+    public AgentRunEvent findLatestByRunIdFromDatabase(String runId) {
+        return eventMapper.findLatestByRunId(runId);
+    }
+
     public Integer findMaxSeq(String runId) {
         if (eventRedisStore.hasEvents(runId)) {
             return eventRedisStore.findMaxSeq(runId);
         }
         // TRANSITIONAL: remove this database fallback once historical runs age out.
+        return eventMapper.findMaxSeq(runId);
+    }
+
+    /** 管理员诊断读取专用：直接读取 PostgreSQL 最大事件序号，不冲刷 Redis pending。 */
+    public Integer findMaxSeqFromDatabase(String runId) {
         return eventMapper.findMaxSeq(runId);
     }
 

@@ -675,6 +675,47 @@ class PersistentArtifactRegistryTest {
         assertTrue(e.getMessage().contains("hash mismatch"), e.getMessage());
     }
 
+    @Test
+    void diagnosticByteReadShouldNotTouchRegistryOrIndexState() {
+        PersistentArtifactRegistration registration = registry.registerExplicit(
+                "run-diagnostic-read", "user-1", "report", "r1", "报告", "payload", 6);
+
+        Map<String, String> valuesBefore = new LinkedHashMap<>(values);
+        Map<String, Map<String, String>> hashesBefore = hashes.entrySet().stream()
+                .collect(Collectors.toMap(Map.Entry::getKey,
+                        entry -> new LinkedHashMap<>(entry.getValue()),
+                        (left, right) -> left, LinkedHashMap::new));
+        Map<String, Map<String, Double>> zsetsBefore = zsets.entrySet().stream()
+                .collect(Collectors.toMap(Map.Entry::getKey,
+                        entry -> new LinkedHashMap<>(entry.getValue()),
+                        (left, right) -> left, LinkedHashMap::new));
+        Map<String, Long> deadlinesBefore = new LinkedHashMap<>(deadlines);
+
+        assertEquals("payload", new String(registry.readArtifactBytes(
+                registration.getArtifactId(), -1L, false), StandardCharsets.UTF_8));
+
+        assertEquals(valuesBefore, values, "诊断读取不得改 meta 或 seq 值");
+        assertEquals(hashesBefore, hashes, "诊断读取不得改 identity hash");
+        assertEquals(zsetsBefore, zsets, "诊断读取不得重排 run 索引");
+        assertEquals(deadlinesBefore, deadlines, "诊断读取不得刷新任何 Redis TTL");
+    }
+
+    @Test
+    void diagnosticByteReadShouldStillEnforceSizeAndHashChecks() throws Exception {
+        PersistentArtifactRegistration registration = registry.registerExplicit(
+                "run-diagnostic-guards", "user-1", "report", "r1", "报告", "payload", 6);
+
+        IllegalStateException oversized = assertThrows(IllegalStateException.class,
+                () -> registry.readArtifactBytes(registration.getArtifactId(), 6L, false));
+        assertTrue(oversized.getMessage().contains("too large"), oversized.getMessage());
+
+        Path path = Path.of(registry.find(registration.getArtifactId()).orElseThrow().getPath());
+        Files.writeString(path, "tampered");
+        IllegalStateException tampered = assertThrows(IllegalStateException.class,
+                () -> registry.readArtifactBytes(registration.getArtifactId(), -1L, false));
+        assertTrue(tampered.getMessage().contains("hash mismatch"), tampered.getMessage());
+    }
+
     // ===== MUST-FIX ⑤：身份 collision-free 编码 =====
 
     @Test
@@ -846,6 +887,20 @@ class PersistentArtifactRegistryTest {
         // 读取侧不仅过滤，还顺手 ZREM 幽灵成员
         assertFalse(zsets.get(RUN_LIST_PREFIX + "run-stale").containsKey("raw-ref:ghost"),
                 "幽灵成员必须在读取遍历时被移除");
+    }
+
+    @Test
+    void diagnosticListShouldFilterGhostWithoutRemovingIt() {
+        registry.registerExplicit("run-diagnostic", "user-1", "raw-ref", "a", "1", "one", 6);
+        String listKey = RUN_LIST_PREFIX + "run-diagnostic";
+        zsets.computeIfAbsent(listKey, k -> new ConcurrentHashMap<>())
+                .put("raw-ref:ghost", 2.0);
+
+        List<PersistentArtifactMeta> listed = registry.listByRunId("run-diagnostic", false);
+
+        assertEquals(1, listed.size(), "诊断列表仍应返回存在的 meta");
+        assertTrue(zsets.get(listKey).containsKey("raw-ref:ghost"),
+                "诊断列表只能过滤幽灵，不得 ZREM 修改 Redis");
     }
 
     @Test

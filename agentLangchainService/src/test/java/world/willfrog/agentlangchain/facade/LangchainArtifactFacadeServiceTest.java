@@ -44,7 +44,7 @@ class LangchainArtifactFacadeServiceTest {
     void listArtifactsDelegatesToSharedService() {
         AgentRun run = runWithArtifactsEnabled();
         when(readService.requireReadableRun("r1", "u1")).thenReturn(run);
-        when(artifactService.listArtifacts(run, false)).thenReturn(List.of(
+        when(artifactService.listArtifacts(run, false, true)).thenReturn(List.of(
                 AgentArtifactMessage.newBuilder().setArtifactId("a1").build()));
 
         var response = service.listArtifacts(ListAgentArtifactsRequest.newBuilder()
@@ -60,7 +60,7 @@ class LangchainArtifactFacadeServiceTest {
     void listArtifactsForAdminReadsCrossUserRunWithoutOwnerFilter() {
         AgentRun run = runWithArtifactsEnabled();
         when(readService.requireReadableRunForAdmin("r1")).thenReturn(run);
-        when(artifactService.listArtifacts(run, true)).thenReturn(List.of(
+        when(artifactService.listArtifacts(run, true, true)).thenReturn(List.of(
                 AgentArtifactMessage.newBuilder().setArtifactId("a1").build()));
 
         var response = service.listArtifacts(ListAgentArtifactsRequest.newBuilder()
@@ -72,6 +72,25 @@ class LangchainArtifactFacadeServiceTest {
         assertEquals(1, response.getItemsCount());
         verify(readService).requireReadableRunForAdmin("r1");
         verify(readService, never()).requireReadableRun("r1", "admin-user");
+    }
+
+    @Test
+    void listArtifactsCanSkipLazyRegistrationForDiagnosticRead() {
+        AgentRun run = runWithArtifactsEnabled();
+        when(readService.requireReadableRunForAdmin("r1")).thenReturn(run);
+        when(artifactService.listArtifacts(run, true, false)).thenReturn(List.of(
+                AgentArtifactMessage.newBuilder().setArtifactId("existing").build()));
+
+        var response = service.listArtifacts(ListAgentArtifactsRequest.newBuilder()
+                .setId("r1")
+                .setUserId("admin-user")
+                .setIsAdmin(true)
+                .setSkipLazyRegistration(true)
+                .build());
+
+        assertEquals(1, response.getItemsCount());
+        verify(artifactService).listArtifacts(run, true, false);
+        verify(artifactService, never()).listArtifacts(run, true, true);
     }
 
     @Test
@@ -165,7 +184,7 @@ class LangchainArtifactFacadeServiceTest {
                 .build());
 
         assertEquals(0, response.getItemsCount());
-        verify(artifactService, never()).listArtifacts(any(), anyBoolean());
+        verifyNoInteractions(artifactService);
     }
 
     @Test
@@ -182,7 +201,7 @@ class LangchainArtifactFacadeServiceTest {
                 .build());
 
         assertEquals(0, response.getItemsCount());
-        verify(artifactService, never()).listArtifacts(any(), anyBoolean());
+        verifyNoInteractions(artifactService);
     }
 
     @Test

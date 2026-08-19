@@ -38,8 +38,10 @@ final class LangchainRunStatusReadModel {
         this.dataAnalysisOverlay = dataAnalysisOverlay;
     }
 
-    AgentRunStatusMessage build(AgentRun run) {
-        AgentRunEvent latestEvent = eventService.findLatestByRunId(run.getId());
+    AgentRunStatusMessage build(AgentRun run, boolean diagnosticNoTouch) {
+        AgentRunEvent latestEvent = diagnosticNoTouch
+                ? eventService.findLatestByRunIdFromDatabase(run.getId())
+                : eventService.findLatestByRunId(run.getId());
         String planJson = nvl(run.getPlanJson());
         var cachedPlan = stateStore.loadPlan(run.getId());
         if (cachedPlan.isPresent()) {
@@ -48,11 +50,16 @@ final class LangchainRunStatusReadModel {
         String progressJson = planJson.isBlank() ? "" : stateStore.buildProgressJson(run.getId(), planJson);
         String observabilitySummaryJson = observabilityService.loadObservabilitySummaryJson(
                 run.getId(), run.getSnapshotJson());
-        observabilitySummaryJson = dataAnalysisOverlay.mergeStatus(run, observabilitySummaryJson);
+        observabilitySummaryJson = dataAnalysisOverlay.mergeStatus(
+                run, observabilitySummaryJson, diagnosticNoTouch);
         boolean fullAvailable = observabilityService.isFullObservabilityAvailable(run.getId(), run.getSnapshotJson());
-        int totalCredits = creditService.calculateRunTotalCredits(
-                run, eventService.listByRunId(run.getId()), observabilitySummaryJson);
-        Integer maxSeq = eventService.findMaxSeq(run.getId());
+        var events = diagnosticNoTouch
+                ? eventService.listByRunIdFromDatabase(run.getId())
+                : eventService.listByRunId(run.getId());
+        int totalCredits = creditService.calculateRunTotalCredits(run, events, observabilitySummaryJson);
+        Integer maxSeq = diagnosticNoTouch
+                ? eventService.findMaxSeqFromDatabase(run.getId())
+                : eventService.findMaxSeq(run.getId());
         return toMessage(run, latestEvent, planJson, progressJson, observabilitySummaryJson,
                 fullAvailable, totalCredits, maxSeq == null ? 0 : maxSeq);
     }

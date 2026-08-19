@@ -48,7 +48,8 @@ import java.util.concurrent.TimeUnit;
  *       (runId + collision-free 编码的 type/logicalId[/path]) 经单条 Redis Lua 脚本原子抢占；
  *       重复注册（重复 list、重启后 list、admin/normal 双 list）返回同一 artifactId，
  *       零重写、零重复项。</li>
- *   <li>{@link #listByRunId}：run 级有界索引（SET），只读，不生成新 ID。</li>
+ *   <li>{@link #listByRunId}：run 级有界索引（ZSET），不生成新 ID；普通读取会清理幽灵
+ *       成员，严格诊断读取可关闭该清理。</li>
  * </ul>
  *
  * <h3>幂等抢占协议（单一赢家不变量）</h3>
@@ -84,8 +85,8 @@ import java.util.concurrent.TimeUnit;
  * 一律移到未检查成员之后时，窗口每次严格前进，至多 ceil(成员总数 /
  * {@value #GHOST_PURGE_BUDGET}) 次索引写入后所有幽灵必然被清完；②有并发写入/
  * 删除时只保证「每次执行至多检查 budget 个成员（硬预算）+ 已检查的活成员严格后移
- * （持续进展）」，不承诺圈数上界。{@link #listByRunId} 读取时也会顺手移除遇到的
- * 幽灵。注册失败可见，禁止 silent meta-only 成功。cap<=0 视为配置错误，
+ * （持续进展）」，不承诺圈数上界。{@link #listByRunId} 普通读取也会顺手移除遇到的
+ * 幽灵；严格诊断读取只过滤不移除。注册失败可见，禁止 silent meta-only 成功。cap<=0 视为配置错误，
  * fail-closed。</p>
  *
  * <h3>统一滑动过期协议（meta 与索引 TTL 零漂移，单一归一化点）</h3>
@@ -628,11 +629,20 @@ public class PersistentArtifactRegistry {
      * <p>只读，不生成新 artifactId；重复调用结果一致（meta 缺失项自动滤掉）。
      * 返回按创建时间升序、artifactId 次序的列表。</p>
      *
-     * <p>幽灵自愈（读取侧）：meta 键已不存在的 ZSET 成员（幽灵，典型成因是 meta 的
+     * <p>幽灵自愈（普通读取侧）：meta 键已不存在的 ZSET 成员（幽灵，典型成因是 meta 的
      * Redis TTL 先到期）在遍历时顺手 ZREM 移除，避免其永久占用容量配额、让 ZCARD
-     * 虚高导致后续注册持续被误判超限。</p>
+     * 虚高导致后续注册持续被误判超限。需要严格无副作用的诊断读取应调用
+     * {@link #listByRunId(String, boolean)} 并传 {@code false}。</p>
      */
     public List<PersistentArtifactMeta> listByRunId(String runId) {
+        return listByRunId(runId, true);
+    }
+
+    /**
+     * run 级制品列表，可显式控制是否清理幽灵索引。传 {@code false} 时仍会过滤缺失
+     * meta，但绝不执行 ZREM，供管理员诊断采集保持 Redis 严格只读。
+     */
+    public List<PersistentArtifactMeta> listByRunId(String runId, boolean removeGhostEntries) {
         if (!hasText(runId)) {
             return List.of();
         }
@@ -645,12 +655,14 @@ public class PersistentArtifactRegistry {
         for (String artifactId : artifactIds) {
             Optional<PersistentArtifactMeta> meta = find(artifactId);
             if (meta.isEmpty()) {
-                // 幽灵成员：meta 已过期/缺失，读取侧顺手移除（写入侧另有有界清理）
-                try {
-                    redisTemplate.opsForZSet().remove(listKey, artifactId);
-                } catch (Exception e) {
-                    log.warn("Failed to remove ghost run index entry: runId={} artifactId={} err={}",
-                            runId, artifactId, e.getMessage());
+                if (removeGhostEntries) {
+                    // 普通读取顺手自愈；严格诊断读取只过滤，不修改 Redis。
+                    try {
+                        redisTemplate.opsForZSet().remove(listKey, artifactId);
+                    } catch (Exception e) {
+                        log.warn("Failed to remove ghost run index entry: runId={} artifactId={} err={}",
+                                runId, artifactId, e.getMessage());
+                    }
                 }
                 continue;
             }
@@ -773,12 +785,28 @@ public class PersistentArtifactRegistry {
      *                 <=0 表示不限制
      */
     public byte[] readArtifactBytes(String artifactId, long maxBytes) {
+        return readArtifactBytes(artifactId, maxBytes, true);
+    }
+
+    /**
+     * 权威字节读取入口的诊断变体。
+     *
+     * <p>{@code refreshRetention=false} 只关闭访问时间和过期时间续期；路径约束、no-follow
+     * 打开、大小上限和内容哈希校验全部保留。管理员只读诊断用它读取分片，避免 GET 修改
+     * meta、run 索引、identity、seq 及其 Redis TTL。</p>
+     *
+     * @param maxBytes 读取字节上限；<=0 表示不限制
+     * @param refreshRetention 是否刷新制品访问时间、过期时间和相关索引 TTL
+     */
+    public byte[] readArtifactBytes(String artifactId, long maxBytes, boolean refreshRetention) {
         PersistentArtifactMeta meta = find(artifactId)
                 .orElseThrow(() -> new IllegalArgumentException("Artifact not found: " + artifactId));
         if (!hasText(meta.getPath())) {
             throw new IllegalArgumentException("Artifact path missing: " + artifactId);
         }
-        touch(meta);
+        if (refreshRetention) {
+            touch(meta);
+        }
         Path real = verifyReadablePath(Path.of(meta.getPath()), Boolean.TRUE.equals(meta.getExternal()));
         return readBytesChecked(real, meta.getContentHash(), maxBytes);
     }

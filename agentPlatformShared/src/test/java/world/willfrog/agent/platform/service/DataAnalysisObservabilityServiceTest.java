@@ -185,6 +185,26 @@ class DataAnalysisObservabilityServiceTest {
         verify(stateStore, never()).loadDataAnalysisObservabilitySummary(anyString());
     }
 
+    @Test
+    void diagnosticDbOnlyReadsSummaryAndFullWithoutTouchingRedis() throws Exception {
+        DataAnalysisObservabilitySnapshot snapshot = DataAnalysisObservabilitySnapshot.of(
+                "run-1", List.of(world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilityCall
+                        .fromEnvelope(envelope("run-1", "call-1", 1, 99L))));
+        when(mapper.findDataAnalysisObservabilitySummaryJsonById("run-1"))
+                .thenReturn(objectMapper.writeValueAsString(snapshot.summary()));
+        when(mapper.findDataAnalysisObservabilityJsonById("run-1"))
+                .thenReturn(objectMapper.writeValueAsString(snapshot));
+
+        assertThat(service.findSummaryByRunId(
+                "run-1", DataAnalysisObservabilityReadMode.DIAGNOSTIC_DB_ONLY))
+                .contains(snapshot.summary());
+        assertThat(service.findByRunId(
+                "run-1", DataAnalysisObservabilityReadMode.DIAGNOSTIC_DB_ONLY))
+                .contains(snapshot);
+
+        verifyNoInteractions(stateStore);
+    }
+
     private DataAnalysisTerminalEnvelope envelope(
             String runId, String toolCallId, int attempt, long cpuMillis) {
         DataAnalysisOperationIdentity identity = new DataAnalysisOperationIdentity(runId, toolCallId, attempt);
