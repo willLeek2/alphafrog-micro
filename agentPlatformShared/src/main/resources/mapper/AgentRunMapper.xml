@@ -642,6 +642,29 @@
     </update>
 
     <!--
+        260819：终态 Run 残留取消锚点的兜底收口。Run 已经由其他写入方落入任意业务终态
+        （如 20:13 中间部署经未栅栏 updateResumedTerminal 写 FAILED），上面的
+        cancelToolJobAnchorFromStatuses 因 status 不在 (WAITING_TOOL_JOB, EXECUTING)
+        永远返回 0，finalizer 每 5s 重试形成告警循环（e572：32 分钟 383 条 warn）。
+        本语句只清残留锚点，不改写已落的业务终态。数据库侧完整栅栏：终态 status 集合、
+        精确 operationId、runDisposition='CANCELED'、显式 autoResume=false，以及
+        finalizerStep 已达 EVENT 之后（ENVELOPE/RELEASE/USAGE/EVENT 均已落库——容量
+        已释放、用量与终态事件已落账），不依赖调用方内存对象的步骤判断。
+    -->
+    <update id="closeResidualCanceledAnchorOnTerminalRun">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = CAST('{}' AS jsonb),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status IN ('FAILED', 'CANCELED', 'COMPLETED', 'PARTIAL', 'EXPIRED')
+          AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{expectedOperationId}
+          AND tool_job_anchor_json -&gt;&gt; 'runDisposition' = 'CANCELED'
+          AND COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true) = false
+          AND tool_job_anchor_json -&gt;&gt; 'finalizerStep'
+                  IN ('EVENT', 'CAS_STATUS', 'RESUME_READY', 'CANCELED')
+    </update>
+
+    <!--
         清理 active anchor 仍需 operationId 所有权；不存在“按 runId 无条件清空”的旁路。
     -->
     <update id="clearActiveToolJobAnchor">
@@ -867,9 +890,13 @@
     </update>
 
     <!--
-        补扫真相源中的 active anchor。除常规 active 状态外，只把
-        DAG cleanup/abort 的 FAILED / CANCELED Run 纳入，覆盖 pipeline 先失败/取消、容量后收尾。
-        普通 CANCELED（非 cleanup disposition）不纳入，由其自身的 finalizer 完成收尾后不再重入。
+        补扫真相源中的 active anchor。除常规 active 状态外，还纳入两类终态 Run：
+        ①DAG cleanup/abort 处置的 FAILED / CANCELED（pipeline 先失败/取消、容量后收尾）；
+        ②260819 终态取消残留——筛选条件与 closeResidualCanceledAnchorOnTerminalRun 的
+        清理能力严格对齐（显式 autoResume=false + finalizerStep 已达 EVENT），只发现
+        直接清理语句确实能处理的记录。已终态但只走到早期步骤（ENVELOPE/RELEASE/USAGE/
+        缺失）或 autoResume 缺失/为 true 的残留不入选：它们无法在终态状态下推进步骤，
+        放进来只会占满 LIMIT 批次，饿死真正可清理的记录。
     -->
     <select id="listActiveToolJobAnchors" resultMap="AgentRunResultMap">
         SELECT id,
@@ -912,6 +939,20 @@
                     status IN ('FAILED', 'CANCELED')
                     AND tool_job_anchor_json -&gt;&gt; 'runDisposition'
                         IN ('DAG_BLOCKING_WORKER_LOST', 'DAG_BLOCKING_PREPARING_ABORT')
+                )
+                OR (
+                    -- 260819（grace must-fix-1/round-2）：终态取消残留必须能被补扫重新
+                    -- 发现——Redis due 丢失/重启后由本扫描重建索引，再由 processItem
+                    -- 的直接清理入口（不查 Sandbox）走 closeResidualCanceledAnchorOnTerminalRun。
+                    -- 筛选与清理语句的 WHERE 严格对齐（显式 autoResume=false +
+                    -- finalizerStep 已达 EVENT）：只发现确实能直接清理的记录，避免
+                    -- 清不掉的早期步骤残留按 updated_at ASC 长期占满 LIMIT 批次，
+                    -- 饿死真正可清理的记录。容量恢复侧对 RELEASED reservation 直接跳过。
+                    status IN ('FAILED', 'CANCELED', 'COMPLETED', 'PARTIAL', 'EXPIRED')
+                    AND tool_job_anchor_json -&gt;&gt; 'runDisposition' = 'CANCELED'
+                    AND COALESCE((tool_job_anchor_json -&gt;&gt; 'autoResume')::boolean, true) = false
+                    AND tool_job_anchor_json -&gt;&gt; 'finalizerStep'
+                            IN ('EVENT', 'CAS_STATUS', 'RESUME_READY', 'CANCELED')
                 )
               )
         ORDER BY updated_at ASC

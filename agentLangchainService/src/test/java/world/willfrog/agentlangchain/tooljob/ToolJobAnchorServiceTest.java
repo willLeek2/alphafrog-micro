@@ -19,6 +19,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import org.mockito.ArgumentCaptor;
@@ -398,5 +399,33 @@ class ToolJobAnchorServiceTest {
                 () -> anchorService.cancelFromStatuses("run-1", anchor, AgentRunStatus.FAILED));
         verify(agentRunMapper, never()).cancelToolJobAnchorFromStatuses(
                 anyString(), anyString(), any(), anyString());
+    }
+
+    // ===== 260819: 终态 Run 残留取消锚点兜底收口 =====
+
+    @Test
+    void closeResidualCanceledAnchorDelegatesWithOperationIdFence() {
+        when(agentRunMapper.closeResidualCanceledAnchorOnTerminalRun("run-1", "run-1:tc-9:2"))
+                .thenReturn(1);
+
+        assertThat(anchorService.closeResidualCanceledAnchor("run-1", "run-1:tc-9:2"))
+                .isTrue();
+        verify(agentRunMapper).closeResidualCanceledAnchorOnTerminalRun("run-1", "run-1:tc-9:2");
+    }
+
+    @Test
+    void closeResidualCanceledAnchorRejectsBlankOperationId() {
+        assertThat(anchorService.closeResidualCanceledAnchor("run-1", null)).isFalse();
+        assertThat(anchorService.closeResidualCanceledAnchor("run-1", " ")).isFalse();
+        verifyNoInteractions(agentRunMapper);
+    }
+
+    @Test
+    void closeResidualCanceledAnchorReturnsFalseWhenFenceRejects() {
+        when(agentRunMapper.closeResidualCanceledAnchorOnTerminalRun("run-1", "run-1:tc-9:2"))
+                .thenReturn(0);
+
+        assertThat(anchorService.closeResidualCanceledAnchor("run-1", "run-1:tc-9:2"))
+                .isFalse();
     }
 }

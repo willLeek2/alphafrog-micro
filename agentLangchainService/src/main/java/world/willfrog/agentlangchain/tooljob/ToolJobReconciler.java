@@ -170,6 +170,20 @@ public class ToolJobReconciler {
                 // live worker 的 lease 未到期时只重排 expiry；过期后必须先赢 fenced CAS。
                 if (!recoverLiveDagBlocking(runId, anchor)) return;
             }
+            // 260819（grace must-fix-1）：终态取消残留的直接清理入口——不查 Sandbox。
+            // 旧任务结果过保存期后 checkPausedTerminal 的结果拉取链可能永远走不到
+            // finalizer 的 CANCELED 分支；这里让数据库语句自己复核终态 status、任务
+            // 身份、取消处置、autoResume=false 与步骤完成度。非终态 Run（正常取消
+            // 收口中）返回 0 行，继续走下面的 Sandbox 终态确认。
+            if (CANCELED.equals(anchor.getRunDisposition())
+                    && anchorService.closeResidualCanceledAnchor(
+                            runId, anchor.getOperationId())) {
+                log.warn("Residual CANCELED anchor closed via backfill for run={}, "
+                        + "operationId={}", runId, anchor.getOperationId());
+                redisCache.removeDue(runId);
+                redisCache.deletePendingCache(runId);
+                return;
+            }
             // taskId 是查询 Sandbox 的真实任务主键。
             String taskId = anchor.getTaskId();
             if (taskId == null || taskId.isBlank()) {
