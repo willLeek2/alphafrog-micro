@@ -71,8 +71,8 @@ import java.util.function.Supplier;
  *       便于 LangchainTodoNodeExecutor 统一解析和错误处理。</li>
  * </ul>
  *
- * <p>面试高频追问点：批量查询怎么实现的、checkParallelLimits 的作用、dataset 产物怎么传递、
- * 复权因子怎么补充的、统一错误码设计。</p>
+ * <p>讲解要点见
+ * {@code agent-working-docs/code-review/phase2/agent-run-overall/tool-routing-interview-points.md}。</p>
  */
 @Slf4j
 @Component
