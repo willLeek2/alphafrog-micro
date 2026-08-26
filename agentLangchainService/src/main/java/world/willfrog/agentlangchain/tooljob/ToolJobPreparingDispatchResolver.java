@@ -18,7 +18,7 @@ import world.willfrog.alphafrogmicro.sandbox.idl.PythonSandboxService;
 /**
  * 恢复 PREPARING dispatch 的共享解析器。
  *
- * <p>调用方必须区分远端暂不可决与 durable 证据损坏。前者可以按同一 operationId
+ * <p>调用方必须区分远端暂不可决与数据库里的证据损坏。前者可以按同一 operationId
  * 在线重试；后者不能继续查询或重放，以免把错误任务附着到 Run。</p>
  */
 final class ToolJobPreparingDispatchResolver {
@@ -110,8 +110,8 @@ final class ToolJobPreparingDispatchResolver {
             }
             /*
              * create 已到达 Sandbox 但响应丢失、报错或身份不完整时，下一轮必须先按
-             * operationId 再查，不能把这种不确定结果当作 durable 身份损坏。
-             * taskId/fingerprint 都非空却与 durable fingerprint 明确矛盾则不同：
+             * operationId 再查，不能把这种不确定结果当作数据库里的身份证据损坏。
+             * taskId/fingerprint 都非空却与数据库里的 fingerprint 明确矛盾则不同：
              * 这是可判定的错误证据，必须隔离，不能无限重放同一矛盾响应。
              */
             if (created == null

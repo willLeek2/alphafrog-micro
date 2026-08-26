@@ -15,8 +15,8 @@ import java.util.UUID;
 /**
  * Cancel Reconciler — 周期性扫描 CANCELLING 状态的 run，为每个 run 启动 CancelWorker。
  *
- * <p>默认关闭（matchIfMissing=false）。在 D11 cancelTask RPC 与调用方都就绪后，
- * 由组合分支显式打开 {@code alphafrog.cancel.reconciler.enabled=true}。
+ * <p>默认关闭（matchIfMissing=false）。等 cancelTask RPC 与调用方都就绪后，
+ * 再通过配置显式打开 {@code alphafrog.cancel.reconciler.enabled=true}。
  */
 @Component
 @ConditionalOnProperty(name = "alphafrog.cancel.reconciler.enabled", havingValue = "true", matchIfMissing = false)
@@ -107,7 +107,7 @@ public class CancelReconciler {
                 log.error("CancelReconciler: CancelWorker 异常 runId={} generation={}",
                         runId, generation, e);
             } finally {
-                // owner-fenced release：只有当前 owner 能释放自己的 lease
+                // 释放条件带 ownerId，只有当前持有者能释放自己的 lease
                 try {
                     int released = dagNodeMapper.releaseReconcilerLease(
                             runId, generation, cancelRequestId, ownerId);

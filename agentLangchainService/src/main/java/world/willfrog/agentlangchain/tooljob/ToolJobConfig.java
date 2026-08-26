@@ -9,7 +9,7 @@ public class ToolJobConfig {
 
     /**
      * 工具同步快路径的最长等待时间（毫秒）。
-     * durable adapter 在该窗口内完成就直接返回；超过窗口后必须先写 ToolJob anchor 和
+     * 写库在该窗口内完成就直接返回；超过窗口后必须先写 ToolJob anchor 和
      * checkpoint，再让 Agent Run 进入 WAITING_TOOL_JOB 并释放 run worker。
      */
     private long fastPathMs = 1500;
@@ -23,7 +23,7 @@ public class ToolJobConfig {
     /** 工具没有显式 timeout 时采用的 Sandbox 默认超时秒数。 */
     private int defaultTimeoutSeconds = 300;
 
-    /** 已确认终态后拉取结果的最大次数；超过后进入 RESULT_LOST 收口。 */
+    /** 已确认终态后拉取结果的最大次数；超过后进入 RESULT_LOST 终态处理。 */
     private int resultFetchMaxAttempts = 10;
 
     /** 终态结果可重试拉取的总保留时间；到期后必须明确写 RESULT_LOST，不能无限占容量。 */
@@ -41,11 +41,11 @@ public class ToolJobConfig {
     /**
      * 跨进程耐久恢复总开关。false（默认）时不创建 ToolJobReconciler、
      * ToolJobStartupRecovery 和 resume launcher heartbeat，长工具终态由进程内
-     * ToolJobContinuationTracker 跟踪；true 时恢复原 Redis/PG 扫描接管链。
+     * ToolJobContinuationTracker 跟踪；true 时恢复原来的 Redis/PG 扫描接管路径。
      */
     private boolean durableRecoveryEnabled = false;
 
-    /** 进程内 continuation tracker 连续轮询 RPC 失败上限；超过后按 RESULT_LOST 收口。 */
+    /** 进程内 continuation tracker 连续轮询 RPC 失败上限；超过后按 RESULT_LOST 走完终态处理。 */
     private int continuationMaxConsecutivePollFailures = 5;
 
     public long getFastPathMs() { return fastPathMs; }

@@ -66,9 +66,9 @@ public class ToolJobAnchorService {
     }
 
     /**
-     * 260818（grace round-4）：取消意图的窄持久化——只合并 autoResume=false 与
-     * runDisposition=CANCELED 两个字段，绑定精确 operationId，绝不整份写回旧锚点。
-     * 第二个长工具已替换锚点时返回 false，调用方重读当前任务后重试或失败关闭。
+     * 取消意图的窄持久化：只合并 autoResume=false 与 runDisposition=CANCELED
+     * 两个字段，绑定精确 operationId，不整份写回旧锚点。
+     * 第二个长工具已替换锚点时返回 false，调用方应重读当前任务，再决定重试或放弃本次取消。
      */
     public boolean persistCancelDisposition(String runId, String operationId,
                                              AgentRunStatus expectedStatus) {
@@ -186,8 +186,8 @@ public class ToolJobAnchorService {
     }
 
     /**
-     * 260818：CANCELED 终态收口专用 CAS——Run 允许仍处于 WAITING_TOOL_JOB 或
-     * EXECUTING（取消落在 accepted handoff 恢复执行期间），同时以 operationId 栅栏
+     * 写 CANCELED 终态用的 CAS：Run 允许仍处于 WAITING_TOOL_JOB 或 EXECUTING
+     * （取消可能落在 accepted handoff 恢复执行期间），同时以 operationId 栅栏
      * 拒绝覆盖已被第二次长工具替换的新 anchor。调用方必须传入 CANCELED 作为 newStatus。
      */
     public boolean cancelFromStatuses(String runId, ToolJobAnchor anchor,
@@ -201,8 +201,8 @@ public class ToolJobAnchorService {
     }
 
     /**
-     * 260819：终态 Run 残留取消锚点的兜底收口。Run 已被其他写入方落进业务终态后，
-     * 正常取消 CAS 永远 0 行；本方法只清空残留锚点，不改写已落的业务终态。终态
+     * 终态 Run 残留取消锚点的备用清理：Run 已被其他写入方写进业务终态后，
+     * 正常取消 CAS 永远 0 行；本方法只清空残留锚点，不改写已写入的业务终态。终态
      * status、精确 operationId、runDisposition=CANCELED、显式 autoResume=false 与
      * finalizerStep 已达 EVENT 的全部安全条件都在 SQL WHERE 内复核。
      */
@@ -325,7 +325,7 @@ public class ToolJobAnchorService {
     /**
      * Lists RECEIVED READY/LAUNCHING runs and EXECUTING accepted LAUNCHING handoffs.
      * 后者覆盖终态已消费、状态已回到执行中，但 resumed worker 在最终结果或下一工具 checkpoint
-     * 落稳前崩溃的窗口。
+     * 已确认写入数据库之前崩溃的窗口。
      */
     public List<AgentRun> listResumeReady(int limit) {
         // READY 与超时 LAUNCHING 都需要启动恢复扫描，具体租约判断在 ResumeService。

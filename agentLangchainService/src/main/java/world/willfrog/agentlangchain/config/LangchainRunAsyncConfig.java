@@ -25,7 +25,8 @@ public class LangchainRunAsyncConfig {
         ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
         executor.setCorePoolSize(hard.getCorePoolSize());
         executor.setMaxPoolSize(hard.getMaxPoolSize());
-        // 业务调度器维护唯一队列，物理线程池不得再藏一层无法热缩放、无法观测的 backlog。
+        // 业务调度器维护唯一队列，物理线程池的 queueCapacity 设为 0，
+        // 避免再出现一层无法热缩放、无法观测的积压。
         executor.setQueueCapacity(0);
         executor.setKeepAliveSeconds(keepAliveSeconds);
         executor.setThreadNamePrefix(hard.getThreadNamePrefix());

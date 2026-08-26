@@ -24,7 +24,7 @@ import java.util.stream.Collectors;
 
 /**
  * 构建 run 级工具目录。能力过滤统一取自 {@link AgentToolRegistry} 的门控元数据，
- * 不再对特定 Bean 做硬编码条件拼接，保证运行时目录、对外 API 目录和注册表单一真相源一致。
+ * 保证运行时目录、对外 API 目录与注册表的单一真相源一致。
  */
 final class ToolCatalogBuilder {
 
@@ -58,7 +58,7 @@ final class ToolCatalogBuilder {
                 ParallelLimitsToolCatalog.mergeCanonical(filtered));
         List<ToolSpecification> result = addSubAgentControlToolsIfAbsent(
                 addResolveFinanceMethodsIfAbsent(merged));
-        // fail-closed：任何最终进入目录的名字必须已在注册表声明。
+        // 目录里的每个工具名都必须已在注册表登记，未登记就直接抛错，避免漏进未登记工具。
         result.forEach(spec -> AgentToolRegistry.require(spec.name()));
         return result;
     }

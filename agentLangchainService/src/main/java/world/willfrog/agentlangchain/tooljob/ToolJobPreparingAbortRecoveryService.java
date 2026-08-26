@@ -17,13 +17,14 @@ import java.time.Instant;
 import java.util.UUID;
 
 /**
- * 在不查询 Sandbox 的前提下重入 durable DAG PREPARING abort。
+ * 在不查询 Sandbox 的前提下重入已持久化的 DAG PREPARING abort 流程。
  *
  * <p>anchor 会在进程内容量释放前先把 reservation 写成 RELEASED；而
  * {@link DataAnalysisReleaseRequest} 对
  * {@link DataAnalysisReleaseProof.PreDispatchAbort} 只接受 PREPARING
- * reservation。恢复路径因此按同一 identity 重建释放前快照，同时把数据库里的
- * RELEASED anchor 继续当作权威 intent。只有携带完整证明的幂等 outcome 才能清理。</p>
+ * reservation。恢复路径因此按同一 identity 重建释放前快照，同时把数据库里
+ * 已写成 RELEASED 的 anchor 继续当作权威的取消意图。只有携带完整证明的幂等
+ * outcome 才能清理。</p>
  */
 public final class ToolJobPreparingAbortRecoveryService {
 

@@ -24,7 +24,7 @@ import java.util.*;
 /**
  * 外部工具终态的可重入收尾状态机。
  *
- * <p>每一步完成后先写入 durable anchor；进程在任意两步之间崩溃，下一次补扫都从
+ * <p>每一步完成后先写入数据库里的 anchor 记录；进程在任意两步之间崩溃，下一次补扫都从
  * 第一个未完成步骤继续。顺序固定为：保存终态 envelope → 释放 Sandbox capacity →
  * 落资源用量 → 发唯一终态事件 → 把 Run CAS 回 RECEIVED → 生成恢复租约并触发重入。</p>
  */
@@ -122,7 +122,7 @@ public class ToolJobFinalizer {
         Instant now = Instant.now();
         // 第一步：把 Sandbox 终态和有界结果摘要写入真相源。
         if (!isStepDone(anchor, STEP_ENVELOPE)) {
-            // TERMINAL 是后续 release/clear 的 durable 状态证明，不只依赖进程内调用栈。
+            // TERMINAL 作为数据库状态证明写入真相源，进程重启后 release/clear 依然有据可依。
             anchor.setAnchorState("TERMINAL");
             // terminalStatus 是 reconciler 已确认的规范化终态。
             anchor.setTerminalStatus(terminalStatus);
@@ -256,7 +256,7 @@ public class ToolJobFinalizer {
                 } catch (Exception e) {
                     log.warn("Failed to serialize resourceUsage for run={}", runId, e);
                 }
-                // presence-aware 字段区分 false 与协议缺失；缺失时 release fail-closed。
+                // presence-aware 字段区分 false 与协议缺失；缺失时直接阻断 release，不留中间状态。
                 if (resultResp.hasRetryable()) {
                     anchor.setTerminalRetryable(resultResp.getRetryable());
                 }
@@ -300,7 +300,7 @@ public class ToolJobFinalizer {
             }
             if (backfilled) {
                 // 新分类已经补齐，清除先前的缺失诊断。
-                anchor.setFinalizerError(null); // clear missing diagnostic
+                anchor.setFinalizerError(null);
                 if (!persistFinalizerAnchor(runId, anchor)) {
                     log.warn("terminalRetryable backfill CAS failed for run={}", runId);
                     return;
@@ -316,7 +316,7 @@ public class ToolJobFinalizer {
             return;
         }
 
-        // 第二步：凭 durable reservation 与终态证明释放 Sandbox capacity。
+        // 第二步：凭数据库里的 reservation 记录与终态证明释放 Sandbox capacity。
         if (!isStepDone(anchor, STEP_RELEASE)) {
             // releaseCapacity 同时处理首次释放和崩溃后 ALREADY_RELEASED。
             if (!releaseCapacity(anchor)) {
@@ -383,7 +383,7 @@ public class ToolJobFinalizer {
                         + "(EXECUTING fails, existing FAILED/CANCELED is preserved)", runId);
                 return;
             }
-            // checkpoint 失败由 finalizer 在完成 envelope/release/usage/event 后落 Run FAILED。
+            // checkpoint 失败由 finalizer 在完成 envelope/release/usage/event 后把 Run 写成 FAILED。
             if ("CHECKPOINT_FAILED".equals(anchor.getRunDisposition())) {
                 anchor.setFinalizerError("durable_checkpoint_write_failed");
                 if (!anchorService.updateAnchorAndStatus(runId, anchor,
@@ -392,11 +392,11 @@ public class ToolJobFinalizer {
                 }
                 return;
             }
-            // canceled Run 同样必须先释放容量，再原子落 CANCELED。
+            // canceled Run 同样必须先释放容量，再把状态原子写成 CANCELED。
             if ("CANCELED".equals(anchor.getRunDisposition())) {
                 if (isStepDone(anchor, STEP_CANCELED)) {
-                    // 260819（grace must-fix-2）：重入时也要清掉终态锚点本身，不能只删
-                    // Redis。清理失败保留 due 作为重试入口，下一轮重入再试。
+                    // 重入时也要清掉终态锚点本身，不能只删 Redis。
+                    // 清理失败保留 due 作为重试入口，下一轮重入再试。
                     if (anchorService.closeResidualCanceledAnchor(
                             runId, anchor.getOperationId())) {
                         redisCache.removeDue(runId);
@@ -408,17 +408,16 @@ public class ToolJobFinalizer {
                     return;
                 }
                 anchor.setFinalizerStep(STEP_CANCELED);
-                // 260818：取消可能落在 WAITING_TOOL_JOB（后台工具等待期）或 EXECUTING
-                // （markHandoffAccepted 已恢复执行、accepted handoff 仍在）。此前只接受
-                // WAITING_TOOL_JOB，后者永远 CAS 失败：Run 永久 EXECUTING + finalizer
-                // 5s 重试 + resume 租约轮换双循环（批次 20260818-182948）。
-                // operationId 栅栏防止旧 finalizer 覆盖第二次长工具的新 anchor。
+                // 取消可能落在 WAITING_TOOL_JOB（后台工具等待期）或 EXECUTING
+                // （markHandoffAccepted 已恢复执行、accepted handoff 仍在）。如果只接受
+                // WAITING_TOOL_JOB，后一种情况永远 CAS 失败，会形成 Run 永久 EXECUTING、
+                // finalizer 每 5 秒重试、resume 租约轮换的死循环。
+                // operationId 条件防止旧 finalizer 覆盖第二次长工具的新 anchor。
                 if (!anchorService.cancelFromStatuses(runId, anchor, AgentRunStatus.CANCELED)) {
-                    // 260819：Run 可能已被其他写入方落进任意业务终态（如 20:13 中间部署
-                    // 经未栅栏 updateResumedTerminal 写 FAILED），正常取消 CAS 永远 0 行，
-                    // 本分支每 5s 重试形成告警循环（e572：32 分钟 383 条 warn）。此时不再
-                    // 改写已落的业务终态，只清残留锚点；步骤完成度、autoResume=false 与
-                    // 任务身份全部由 SQL WHERE 复核，不依赖本内存对象。
+                    // Run 可能已被其他写入方写进任意业务终态，正常取消 CAS 永远 0 行，
+                    // 本分支会每 5 秒重试并不断告警。此时不再改写已写入的业务终态，
+                    // 只清残留锚点；步骤完成度、autoResume=false 与任务身份全部由
+                    // SQL WHERE 复核，不依赖本内存对象。
                     if (anchorService.closeResidualCanceledAnchor(
                             runId, anchor.getOperationId())) {
                         log.warn("Residual CANCELED anchor closed on already-terminal run={}, "
@@ -434,7 +433,7 @@ public class ToolJobFinalizer {
                     schedulerMetrics.recordCompletion(AgentRunStatus.CANCELED);
                 }
                 publishCanceledWorkspaceFinalized(runId);
-                // 260819（grace must-fix-2）：CAS 只把 Run 收口成 CANCELED，锚点本身仍以
+                // 上面的 CAS 只把 Run 状态写成 CANCELED，锚点本身仍以
                 // finalizerStep=CANCELED 留在数据库；这里用同一条终态清理语句清成 '{}'。
                 // 清理失败时保留 due（重入路径会重试清理），不提前删掉唯一重试入口。
                 if (anchorService.closeResidualCanceledAnchor(
@@ -473,7 +472,7 @@ public class ToolJobFinalizer {
      *
      * <p>内存 anchor 保持在 CAS_STATUS 旧值；SQL 使用 {@code jsonb ||} 只合并写入 5 个恢复字段，
      * claimedAt 用数据库 CURRENT_TIMESTAMP，leaseVersion 在 DB 内自增。WHERE 绑定 10 个精确旧值
-     * 条件。只有 rows=1 的调用者才是胜者，才重读落地 anchor、写 Redis 并调用 tryResume。
+     * 条件。只有 rows=1 的调用者才是胜者，才重读数据库里的 anchor、写 Redis 并调用 tryResume。
      * 输家立即退出，不写 Redis、不启动 worker。</p>
      */
     void completeResumeReady(String runId, ToolJobAnchor anchor) {
@@ -514,7 +513,7 @@ public class ToolJobFinalizer {
             return; // 输家不写 Redis，不启动 worker
         }
 
-        // 胜者从 DB 重读落地 anchor，确保 Redis 和 tryResume 基于持久化数据
+        // 胜者从 DB 重读已写入的 anchor，确保 Redis 和 tryResume 基于持久化数据
         ToolJobAnchor persisted = anchorService.loadAnchor(runId);
         if (persisted == null) {
             log.warn("completeResumeReady winner failed to reload anchor for run={}, "
@@ -527,7 +526,7 @@ public class ToolJobFinalizer {
 
     /**
      * 长工具取消的 workspace 事件只能在 CANCELED CAS 成功后发布。
-     * 发布/读取失败走 polling 兜底，绝不能反向回滚已经提交的终态与容量释放收口。
+     * 发布或读取失败改由 polling 轮询重试，绝不能反向回滚已经提交的终态与容量释放。
      */
     private void publishCanceledWorkspaceFinalized(String runId) {
         if (agentRunMapper == null || finalizationService == null) {
@@ -559,7 +558,7 @@ public class ToolJobFinalizer {
             anchor.setResultFetchAttempts(attempts);
             if (elapsed > config.getResultRetentionDeadlineSeconds()
                     || attempts >= config.getResultFetchMaxAttempts()) {
-                // 超过任一上限后冻结 RESULT_LOST，再复用正常 finalizer 释放容量与落事件。
+                // 超过任一上限后冻结 RESULT_LOST，再复用正常 finalizer 释放容量与写事件。
                 anchor.setResultFetchState("LOST");
                 anchor.setTerminalStatus("RESULT_LOST");
                 anchor.setTerminalAt(now);
@@ -588,7 +587,7 @@ public class ToolJobFinalizer {
         // 没有 reservation 的兼容任务不占用 Sandbox capacity，可直接视为已释放。
         if (anchor.getReservationJson() == null || anchor.getReservationJson().isBlank()) return true;
         try {
-            // 从 durable anchor 还原准入时的 reservation，不按当前配置重新估算。
+            // 从数据库里的 anchor 还原准入时的 reservation，不按当前配置重新估算。
             DataAnalysisReservation current = objectMapper.readValue(
                     anchor.getReservationJson(), DataAnalysisReservation.class);
             // 已经写回 RELEASED 的重入路径直接幂等成功。
@@ -644,7 +643,7 @@ public class ToolJobFinalizer {
                 return false;
             }
 
-            // 把 RELEASED 写回 durable anchor；否则重启恢复会从旧 PENDING/CONFIRMED 快照重新占用容量。
+            // 把 RELEASED 写回数据库里的 anchor；否则重启恢复会从旧 PENDING/CONFIRMED 快照重新占用容量。
             return writeReleasedReservation(anchor, confirmed);
         } catch (Exception e) {
             log.error("releaseCapacity failed for reservation", e);
@@ -654,7 +653,7 @@ public class ToolJobFinalizer {
 
     /**
      * 把已释放 reservation 序列化回 anchor。
-     * 入参保留原 reservation 身份；返回 true 表示内存 anchor 已更新，外层随后负责 CAS 落库。
+     * 入参保留原 reservation 身份；返回 true 表示内存 anchor 已更新，外层随后负责用 CAS 写库。
      */
     private boolean writeReleasedReservation(ToolJobAnchor anchor,
                                               DataAnalysisReservation confirmed) throws Exception {
@@ -674,7 +673,7 @@ public class ToolJobFinalizer {
             // 实际 usage 必须与 reservation.resourceClass 一致。
             DataAnalysisResourceUsage usage = buildResourceUsage(reservation.resourceClass(),
                     anchor.getTerminalUsageJson());
-            // estimate 缺失/损坏时 fail-closed，不能构造不完整 release proof。
+            // estimate 缺失或损坏时直接阻断，不能构造不完整的 release 证明。
             DataAnalysisEstimate estimate = parseEstimate(anchor.getEstimateJson());
             if (estimate == null) return null;
             /*
@@ -686,7 +685,7 @@ public class ToolJobFinalizer {
              *
              * 修复上线后新任务不会再产生这种组合。这里仅识别已知的窄签名
              * HEAVY/3 + 空 hints + STANDARD/1，并用实际 reservation 修正 estimate；
-             * 其他任意 mismatch 仍然 fail-closed，不能把未知数据损坏伪装成兼容迁移。
+             * 其他任意 mismatch 仍然直接阻断，不能把未知数据损坏伪装成兼容迁移。
              */
             estimate = normalizeKnownLegacyEstimateMismatch(estimate, reservation, anchor);
             if (estimate == null) return null;
@@ -724,7 +723,7 @@ public class ToolJobFinalizer {
         return ToolJobResourceUsageParser.parse(objectMapper, rc, usageJson);
     }
 
-    /** @return parsed estimate or null (fail-closed: blocks RELEASE) */
+    /** @return 解析出的 estimate；解析失败返回 null（阻断 RELEASE） */
     private DataAnalysisEstimate parseEstimate(String estimateJson) {
         if (estimateJson == null || estimateJson.isBlank()) {
             log.warn("estimateJson missing — cannot build valid envelope");

@@ -20,7 +20,7 @@ import java.util.List;
 import java.util.UUID;
 
 /**
- * durable anchor 到新 Agent worker 之间的恢复租约状态机。
+ * 数据库里的 anchor 到新 Agent worker 之间的恢复租约状态机。
  *
  * <p>四阶段模型：READY 负责竞争 claim，LAUNCHING 表示某个 token/version 已取得启动权，
  * ACCEPTED 表示 handoff 已被工作流接受，CONSUMED 表示结果已被最终消费且 anchor 可安全清理。
@@ -80,18 +80,19 @@ public class ToolJobResumeService {
             if (!anchorService.clearAnchorWithToken(runId, "CONSUMED", token,
                     anchor.getResumeLeaseVersion())) {
                 log.warn("CONSUMED durable clear failed for run={}, leaving Redis for retry", runId);
-                return true; // anchor still CONSUMED, will retry next scan
+                return true;
             }
-            // durable clear 已成功，Redis 残留现在可以安全删除。
+            // 数据库清理已成功，Redis 残留现在可以安全删除。
             redisCache.removeDue(runId);
             redisCache.deletePendingCache(runId);
             return true;
         }
-        // 260818（grace round-2）：取消/暂停锚点（autoResume=false）只做终态收尾与容量
-        // 释放，不自动恢复；CONSUMED 的幂等清理在上方分支，不受此门控影响。服务层判断
-        // 只是第一层，所有权 CAS（claimResumeLauncher / takeoverExpiredResumeLauncher /
-        // acceptResumeHandoff）在数据库层还有同一 autoResume 栅栏，防"读到旧 autoResume
-        // =true 对象后，取消线程先落 autoResume=false，恢复线程再整体覆盖锚点"的丢取消竞态。
+        // 取消/暂停锚点（autoResume=false）只做终态收尾与容量释放，不自动恢复；
+        // CONSUMED 的幂等清理在上方分支，不受此门控影响。服务层判断只是第一层，
+        // 所有权 CAS（claimResumeLauncher / takeoverExpiredResumeLauncher /
+        // acceptResumeHandoff）在数据库层还有同一 autoResume 条件，防止
+        // "读到旧 autoResume=true 对象后，取消线程先把 autoResume=false 写进数据库，
+        // 恢复线程再整体覆盖锚点"的丢取消竞态。
         if (!anchor.isAutoResume()) {
             return false;
         }
@@ -118,7 +119,7 @@ public class ToolJobResumeService {
         anchor.setResumeLauncherOwnerId(launcherOwnerId);
         anchor.setResumeLauncherLeaseUntil(Instant.now().plusSeconds(leaseSeconds()));
 
-        // owner 与数据库时间 lease 和 token/version 在同一条 CAS 中落稳。
+        // owner、数据库时间 lease 和 token/version 在同一条 CAS 中一起确认写入。
         boolean claimed = anchorService.claimResumeLauncher(
                 runId, anchor,
                 anchor.isResultConsumed() ? AgentRunStatus.EXECUTING : AgentRunStatus.RECEIVED,
@@ -242,7 +243,7 @@ public class ToolJobResumeService {
     private boolean doLaunch(String runId, ToolJobAnchor anchor,
                               long originalVersion, String claimedToken, long claimedVersion,
                               String previousResumeState) {
-        // 只从已 claim 的 durable anchor 构建 context，不读取旧 worker 内存。
+        // 只从已 claim 的数据库 anchor 构建 context，不读取旧 worker 内存。
         ToolJobResumeContext ctx = buildResumeContext(runId, anchor);
         try {
             // launch=false 表示任务未进入 bounded scheduler，必须回滚 claim。
@@ -275,7 +276,7 @@ public class ToolJobResumeService {
             return anchorService.updateAnchor(runId, anchor, AgentRunStatus.RECEIVED);
         }
 
-        // 副作用都已落稳时先 CAS 写 CONSUMED，再执行 token-gated clear。
+        // 副作用都已确认写入数据库时先 CAS 写 CONSUMED，再执行 token-gated clear。
         anchor.setResumeState("CONSUMED");
         anchor.setResultConsumed(true);
         if (!anchorService.updateAnchor(runId, anchor, AgentRunStatus.RECEIVED)) {
@@ -292,7 +293,7 @@ public class ToolJobResumeService {
         if (!anchorService.clearAnchorWithToken(runId, "CONSUMED", token,
                 anchor.getResumeLeaseVersion())) {
             log.warn("Token+state+version-gated clear failed for run={} — mismatch, retrying", runId);
-            return false; // keep Redis cache, retry on next cycle
+            return false;
         }
         redisCache.removeDue(runId);
         redisCache.deletePendingCache(runId);
@@ -330,7 +331,7 @@ public class ToolJobResumeService {
             log.warn("Failed to serialize accepted resume handoff for run={}", runId, e);
             return false;
         }
-        // todoId 已被 executor 推进到下一节点或 FINAL 哨兵。
+        // todoId 已被 executor 推进到下一节点，或已到全部节点完成后的结尾标记。
         anchor.setTodoId(context.getTodoId());
         anchor.setSequence(context.getTodoSequence());
         anchor.setToolCallsUsed(context.getToolCallsUsed());
@@ -360,8 +361,8 @@ public class ToolJobResumeService {
     }
 
     /**
-     * 仅清理精确匹配的旧 handoff claim。只在 pipeline 回调已从持久化结果/检查点
-     * 落盘返回后调用。后续挂起会产生不同的 state/token/version，因此绝不会被这里误清理。
+     * 仅清理精确匹配的旧 handoff claim。只在 pipeline 回调已把最终结果或检查点
+     * 写入数据库并返回后调用。后续挂起会产生不同的 state/token/version，因此绝不会被这里误清理。
      */
     public boolean completeHandoff(String runId, String token, long version, String ownerId) {
         // pipeline 回调只允许清理自己最初提交的旧 claim。
@@ -379,7 +380,7 @@ public class ToolJobResumeService {
                 || ownerId == null || !ownerId.equals(anchor.getResumeLauncherOwnerId())) {
             return false;
         }
-        // DB token-gated clear 是最终 durable gate。
+        // DB token-gated clear 是最后一道数据库校验闸门。
         if (!anchorService.clearAcceptedResumeHandoff(runId, token, version, ownerId)) {
             return false;
         }
@@ -504,7 +505,7 @@ public class ToolJobResumeService {
                 List<String> ids = objectMapper.readValue(json, new TypeReference<List<String>>() {});
                 return ids.stream().map(id -> { var r = new CompletedTodoRecord(); r.setTodoId(id); return r; }).toList();
             } catch (JsonProcessingException ex2) {
-                // 两种格式都无法解析时返回空前缀并记录警告；上层顺序校验仍会 fail-closed。
+                // 两种格式都无法解析时返回空前缀并记录警告；上层顺序校验仍会拒绝。
                 log.warn("Failed to parse completedTodosJson", ex2);
                 return Collections.emptyList();
             }

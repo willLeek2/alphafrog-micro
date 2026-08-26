@@ -14,7 +14,7 @@ import java.util.Map;
 /**
  * 把 data-analysis 可观测读模型叠加到普通 Run status/result JSON 上。
  *
- * <p>这类旁路查询不再挤在 RPC 门面里；失败仍按既有合同保留原响应，不影响用户读取 Run。</p>
+ * <p>这类旁路查询由本类独立承担，RPC 门面保持只做协议路由；失败时仍按既有合同保留原响应，不影响用户读取 Run。</p>
  */
 final class LangchainDataAnalysisReadOverlay {
 

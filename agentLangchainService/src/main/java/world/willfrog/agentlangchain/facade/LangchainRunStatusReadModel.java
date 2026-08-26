@@ -17,22 +17,22 @@ import java.util.Map;
 /** 高频 status 查询的只读聚合器；不拥有 Run 权限校验或控制写路径。 */
 final class LangchainRunStatusReadModel {
 
-    private final AgentEventService eventService;
+    private final AgentEventService agentEventService;
     private final AgentRunStateStore stateStore;
-    private final AgentObservabilityService observabilityService;
+    private final AgentObservabilityService agentObservabilityService;
     private final AgentCreditService creditService;
     private final ObjectMapper objectMapper;
     private final LangchainDataAnalysisReadOverlay dataAnalysisOverlay;
 
-    LangchainRunStatusReadModel(AgentEventService eventService,
+    LangchainRunStatusReadModel(AgentEventService agentEventService,
                                 AgentRunStateStore stateStore,
-                                AgentObservabilityService observabilityService,
+                                AgentObservabilityService agentObservabilityService,
                                 AgentCreditService creditService,
                                 ObjectMapper objectMapper,
                                 LangchainDataAnalysisReadOverlay dataAnalysisOverlay) {
-        this.eventService = eventService;
+        this.agentEventService = agentEventService;
         this.stateStore = stateStore;
-        this.observabilityService = observabilityService;
+        this.agentObservabilityService = agentObservabilityService;
         this.creditService = creditService;
         this.objectMapper = objectMapper;
         this.dataAnalysisOverlay = dataAnalysisOverlay;
@@ -40,26 +40,26 @@ final class LangchainRunStatusReadModel {
 
     AgentRunStatusMessage build(AgentRun run, boolean diagnosticNoTouch) {
         AgentRunEvent latestEvent = diagnosticNoTouch
-                ? eventService.findLatestByRunIdFromDatabase(run.getId())
-                : eventService.findLatestByRunId(run.getId());
+                ? agentEventService.findLatestByRunIdFromDatabase(run.getId())
+                : agentEventService.findLatestByRunId(run.getId());
         String planJson = nvl(run.getPlanJson());
         var cachedPlan = stateStore.loadPlan(run.getId());
         if (cachedPlan.isPresent()) {
             planJson = cachedPlan.get();
         }
         String progressJson = planJson.isBlank() ? "" : stateStore.buildProgressJson(run.getId(), planJson);
-        String observabilitySummaryJson = observabilityService.loadObservabilitySummaryJson(
+        String observabilitySummaryJson = agentObservabilityService.loadObservabilitySummaryJson(
                 run.getId(), run.getSnapshotJson());
         observabilitySummaryJson = dataAnalysisOverlay.mergeStatus(
                 run, observabilitySummaryJson, diagnosticNoTouch);
-        boolean fullAvailable = observabilityService.isFullObservabilityAvailable(run.getId(), run.getSnapshotJson());
+        boolean fullAvailable = agentObservabilityService.isFullObservabilityAvailable(run.getId(), run.getSnapshotJson());
         var events = diagnosticNoTouch
-                ? eventService.listByRunIdFromDatabase(run.getId())
-                : eventService.listByRunId(run.getId());
+                ? agentEventService.listByRunIdFromDatabase(run.getId())
+                : agentEventService.listByRunId(run.getId());
         int totalCredits = creditService.calculateRunTotalCredits(run, events, observabilitySummaryJson);
         Integer maxSeq = diagnosticNoTouch
-                ? eventService.findMaxSeqFromDatabase(run.getId())
-                : eventService.findMaxSeq(run.getId());
+                ? agentEventService.findMaxSeqFromDatabase(run.getId())
+                : agentEventService.findMaxSeq(run.getId());
         return toMessage(run, latestEvent, planJson, progressJson, observabilitySummaryJson,
                 fullAvailable, totalCredits, maxSeq == null ? 0 : maxSeq);
     }

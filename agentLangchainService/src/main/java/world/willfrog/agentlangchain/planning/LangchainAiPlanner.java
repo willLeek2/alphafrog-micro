@@ -19,11 +19,11 @@ import world.willfrog.agentlangchain.prompt.ToolCapabilityPromptRenderer;
 import java.util.stream.Collectors;
 
 /**
- * Agent 规划阶段（planning）的核心类。
+ * Agent 规划阶段（planning）的主要实现类。
  *
  * <h2>在 agent run 生命周期中的位置</h2>
  * 每个 agent run 的第一步都是规划（planning）——把用户输入的自然语言目标拆分为可执行的
- * Todo 列表。本类是 agentLangchainService 中唯一负责这个步骤的组件。
+ * Todo 列表。本类负责 agentLangchainService 中这个规划步骤的实现。
  *
  * <h2>两套规划路径</h2>
  * 实际存在两套规划实现，通过 Nacos 配置项
@@ -77,7 +77,7 @@ public class LangchainAiPlanner {
     /**
      * 执行一次完整的 agent 规划，返回 Todo 计划。
      *
-     * <h3>调用链路</h3>
+     * <h3>调用路径</h3>
      * 在 agent run 生命周期中，本方法由
      * {@code LangchainLinearRunPipelineImpl.executeRun()} 中调用。
      * 传入的 {@code request} 中已包含 pipeline 层解析好的
@@ -132,7 +132,7 @@ public class LangchainAiPlanner {
      *   <li>多轮对话场景下缺少对历史上下文的整体分析</li>
      * </ol>
      * 两阶段规划让 LLM 先输出一个"整体策略"（分析用户意图、决定执行模式），
-     * 再将策略作为提示词的一部分注入第二阶段（Todo 生成），显著提高 Todo 质量。
+     * 再将策略作为提示词的一部分注入第二阶段（Todo 生成），明显提高 Todo 质量。
      *
      * <h3>执行流程</h3>
      * <pre>
@@ -176,9 +176,8 @@ public class LangchainAiPlanner {
                         ToolCapabilityPromptRenderer.render(promptService, request.getToolSpecifications()));
                 if (mode == PlanExecutionMode.LINEAR) {
                     /*
-                     * 本 Run 明确请求 LINEAR 时，约束不能只存在于最终 plan 字段；strategy
-                     * LLM 也必须先按 LINEAR 思考，避免第二阶段根据一个 DAG strategy 生成
-                     * 分支/汇合依赖。
+                     * 本 Run 明确请求 LINEAR 时，strategy 阶段的 LLM 也必须先按 LINEAR
+                     * 思考；否则第二阶段可能根据一个 DAG strategy 生成分支/汇合依赖。
                      */
                     strategyStage += "\n\n" + promptService.planningLinearConstraint();
                 }
@@ -211,8 +210,9 @@ public class LangchainAiPlanner {
                         : overallPlan.mode();
                 if (mode == PlanExecutionMode.LINEAR) {
                     /*
-                     * 即便 provider 忽略第一阶段指令返回 DAG，也不能把自相矛盾的 assistant
-                     * 消息带入 Todo 阶段；先把 strategy 正规化为 LINEAR，再生成真正的顺序计划。
+                     * provider 可能忽略第一阶段的 LINEAR 指令而返回 DAG；这里先把
+                     * strategy 内容正规化为 LINEAR，避免把自相矛盾的 assistant 消息
+                     * 带入 Todo 阶段。
                      */
                     var normalizedStrategy = objectMapper.createObjectNode();
                     var normalizedOverallPlan = normalizedStrategy.putObject("overallPlan");
@@ -272,7 +272,7 @@ public class LangchainAiPlanner {
     /**
      * 单阶段规划：通过 LangChain4j 的 {@code @AiService} 接口代理直接生成 Todo 列表。
      *
-     * <h3>与两阶段路径的关键差异</h3>
+     * <h3>与两阶段路径的主要差异</h3>
      * <ol>
      *   <li>不先问 strategy，直接把动态前缀 + Todo 阶段指令 + 用户目标拼成一条消息发给 LLM</li>
      *   <li>使用 LC4j 的 {@code AiServices.builder()} 创建代理并取得原始 JSON</li>
@@ -363,7 +363,7 @@ public class LangchainAiPlanner {
      * 向 {@link AgentContext} ThreadLocal 写入 structured output 配置。
      *
      * <p>这是连接 langchain planner 和 shared 层
-     * {@code OpenRouterProviderRoutedChatModel} 的关键桥梁。
+     * {@code OpenRouterProviderRoutedChatModel} 的主要桥梁。
      * 后者不读取 LC4j 的 {@code ChatRequest.responseFormat()}，
      * 只从 ThreadLocal 读取 {@link AgentContext.StructuredOutputSpec}。
      *
@@ -456,7 +456,6 @@ public class LangchainAiPlanner {
                 .collect(Collectors.joining(", "));
     }
 
-    /** 判断字符串是否为 null 或仅含空白字符。 */
     private boolean isBlank(String value) {
         return value == null || value.trim().isEmpty();
     }

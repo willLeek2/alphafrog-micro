@@ -16,13 +16,12 @@ import java.util.concurrent.atomic.AtomicLong;
 /**
  * 用公平 {@link Semaphore} 限制 executePython 的前台并发。
  *
- * <p>当前 allowlist 固定为 executePython，其他工具直接通过。permit 只保护工具调用入口，
- * 不能替代 durable capacity reservation，也不会让同步工具自动具备后台恢复能力。等待时间、
- * 超时数和执行耗时按工具累计，供观测与后续自适应使用。</p>
+ * <p>当前 allowlist 固定为 executePython，其他工具直接通过。permit 的作用范围是工具
+ * 调用入口，数据库里的持久容量预留由其他机制负责，同步工具也不会因此自动获得
+ * 后台恢复能力。等待时间、超时数和执行耗时按工具累计，供观测与后续自适应使用。</p>
  *
- * <p><b>作用域（D25 / Risks 3.1.4）</b>：本类使用的是 <em>JVM 进程内</em> Semaphore；
- * 多实例部署时各实例各自计数、各自封顶，<em>不是</em>分布式容量保证，也不得宣传为
- * 「全集群封顶」。运维估算时使用公式：
+ * <p><b>作用域</b>：本类使用 <em>JVM 进程内</em> Semaphore；多实例部署时每个实例
+ * 各自计数、各自封顶，容量保证只覆盖单个进程。运维估算全局限流时使用公式：
  * {@code 全局许可近似 ≈ 实例数 × 每实例 maxPermits}（本类默认/配置的每实例 permits）。
  * 观测快照字段 {@code scope} 固定为 {@code "per-node"}，低基数、无用户/run 标识。</p>
  */
@@ -50,7 +49,7 @@ public class LangchainToolConcurrencyThrottle {
         this.enabled = enabled;
         this.timeoutSeconds = timeoutSeconds;
         this.maxPermits = Math.max(1, maxConcurrent);
-        // 当前仅精确匹配 executePython；注释不得误导为已经支持配置化 allowlist。
+        // 当前固定只匹配 executePython 这一个工具名。
         this.throttledTools = Set.of("executePython");
         this.semaphore = new Semaphore(this.maxPermits, true); // 公平模式按等待顺序发 permit。
     }
@@ -103,7 +102,8 @@ public class LangchainToolConcurrencyThrottle {
     }
 
     /**
-     * 记录所有工具的执行耗时作为基线；等待/超时指标只覆盖被限流工具，这是有意的不对称。
+     * 记录所有工具的执行耗时作为基线；等待与超时指标按被限流的工具分别累计，
+     * 与全量耗时基线不同是设计使然。
      */
     public void recordExecution(String toolName, long durationMs) {
         if (durationMs <= 0) return;

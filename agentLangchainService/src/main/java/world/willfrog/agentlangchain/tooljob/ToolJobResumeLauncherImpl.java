@@ -13,7 +13,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
 /**
- * 把 durable LAUNCHING claim 提交到 bounded Agent Run scheduler 的生产实现。
+ * 把数据库里的 LAUNCHING claim 提交到 bounded Agent Run scheduler 的生产实现。
  *
  * <p>进程内 activeClaims 只做同一 token/version 的快速去重，数据库 lease 才是
  * 跨进程真相。launcher 负责“两阶段交接”：工作流注入终态后先 markHandoffAccepted，
@@ -73,7 +73,7 @@ public class ToolJobResumeLauncherImpl implements ToolJobResumeLauncher {
                                         context.getResumeLauncherOwnerId());
                             }
                         } finally {
-                            // 不论 durable 与否都移除本地 active；失败时 DB anchor 会驱动下一轮重入。
+                            // 无论回调报告是否已写入数据库，都移除本地 active；失败时 DB anchor 会驱动下一轮重入。
                             activeClaims.remove(key);
                         }
                     });
@@ -83,7 +83,7 @@ public class ToolJobResumeLauncherImpl implements ToolJobResumeLauncher {
             }
             return accepted;
         } catch (Exception e) {
-            // 入队异常同样只清本地状态，不清 durable LAUNCHING anchor。
+            // 入队异常同样只清本地状态，不清数据库里的 LAUNCHING anchor。
             activeClaims.remove(key);
             log.warn("Resume launch rejected runId={} token={} version={}: {}",
                     runId, context.getResumeToken(), context.getResumeLeaseVersion(), e.getMessage());

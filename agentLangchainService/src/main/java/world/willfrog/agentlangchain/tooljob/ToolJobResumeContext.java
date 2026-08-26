@@ -6,7 +6,7 @@ import java.util.Collections;
 import java.util.List;
 
 /**
- * 从 durable anchor 解码出的单次恢复交接对象。
+ * 从数据库里的 anchor 记录解码出的单次恢复交接对象。
  *
  * <p>ResumeService 创建它，Launcher 把它交给 pipeline，LINEAR executor 再用它
  * 跳过 planner、还原已完成 Todo 和 dataset 快照，并把外部工具终态注入原挂起节点。
@@ -14,7 +14,7 @@ import java.util.List;
  */
 public class ToolJobResumeContext {
 
-    // 已消费挂起 Todo 且没有后续节点时，用哨兵表示恢复点已经推进到最终回答阶段。
+    // 已消费挂起 Todo 且没有后续节点时，用这个特殊结尾标记表示恢复点已经推进到最终回答阶段。
     public static final String FINAL_TODO_ID = "__FINAL__";
 
     // runId 约束本次交接只能恢复对应的 Agent Run。
@@ -29,7 +29,7 @@ public class ToolJobResumeContext {
     private long resumeLeaseVersion;
     // resumeLauncherOwnerId 绑定取得数据库租约的 launcher 实例，终态写入还会复核该 owner。
     private String resumeLauncherOwnerId;
-    // completedTodos 是挂起前已经落稳的工作流前缀，恢复后不会重复执行。
+    // completedTodos 是挂起前已经确认写入数据库的工作流前缀，恢复后不会重复执行。
     private List<CompletedTodoRecord> completedTodos = Collections.emptyList();
     // datasetSnapshotJson 保存 run 级数据集编号到真实引用的映射。
     private String datasetSnapshotJson;
@@ -37,7 +37,7 @@ public class ToolJobResumeContext {
     private String datasetSnapshotDigest;
     // toolCallsUsed 延续预算计数，防止切换 worker 后重新从零计费。
     private int toolCallsUsed;
-    // terminalSuccess 决定恢复节点按完成还是失败落事件。
+    // terminalSuccess 决定恢复节点按完成还是失败写事件。
     private boolean terminalSuccess;
     // preview 是可直接注入后续模型上下文的有界结果摘要。
     private String terminalResultPreview;
@@ -49,9 +49,9 @@ public class ToolJobResumeContext {
     private String terminalErrorCode;
     private String terminalExitReason;
     private Boolean terminalRetryable;
-    // 从 durable createRequestJson 投影出的有界原代码，供无会话记忆的新 worker 修复。
+    // 从数据库里的 createRequestJson 投影出的有界原代码，供无会话记忆的新 worker 修复。
     private String pythonFailedCodePreview;
-    // durable Python 修复状态：已启动轮次与已失败请求内容指纹。
+    // 数据库里的 Python 修复状态：已启动轮次与已失败请求内容指纹。
     private int pythonRepairAttempt;
     private boolean pythonRepairPending;
     private boolean pythonRepairExhausted;

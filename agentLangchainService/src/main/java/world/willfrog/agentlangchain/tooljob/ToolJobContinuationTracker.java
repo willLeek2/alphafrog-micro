@@ -17,13 +17,13 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
 /**
- * 进程内长工具续接跟踪器（durable-recovery 默认关闭时的唯一发现入口）。
+ * 进程内长工具续接跟踪器（跨进程恢复开关默认关闭时的唯一发现入口）。
  *
  * <p>suspend 成功后按 runId 登记 {taskId, todoId, operationId, timeoutAt}；
  * 低频轮询 Sandbox 任务状态，终态时复用现有的
- * finalizer → resume service → launcher → 有界调度器 整条链继续原 Run。
+ * finalizer → resume service → launcher → 有界调度器 整条流程继续原 Run。
  * 用户取消与工具超时都通过 Sandbox cancelTask RPC 传播。服务退出后本表随
- * 进程丢失，不承诺任何崩溃恢复；崩溃后的处理由工作流重启规则（task #118）负责。</p>
+ * 进程丢失，不承诺任何崩溃恢复；崩溃后的处理由工作流重启规则负责。</p>
  *
  * <p>本组件只在 {@code agent.tool-job.durable-recovery-enabled=false}（默认）时创建；
  * 开启耐久恢复时由 ToolJobReconciler 承担发现职责，两者不会同时存在。</p>
@@ -64,7 +64,7 @@ public class ToolJobContinuationTracker {
     }
 
     /**
-     * suspend 的 durable CAS 成功后登记。anchor 必须已经处于 PENDING。
+     * suspend 的写库 CAS 成功后登记。anchor 必须已经处于 PENDING。
      * 之后由本 tracker 独占该 Run 的终态发现；登记失败不阻止 suspend 本身。
      */
     public void register(String runId, ToolJobAnchor anchor) {
@@ -101,7 +101,7 @@ public class ToolJobContinuationTracker {
             try {
                 processEntry(entry);
             } catch (Exception e) {
-                // 单项异常不阻塞其他 Run 的轮询；fail 预算耗尽会走 RESULT_LOST 收口。
+                // 单项异常不阻塞其他 Run 的轮询；失败预算耗尽会按 RESULT_LOST 走完终态处理。
                 log.error("Continuation poll failed for run={}: {}", entry.runId(), e.getMessage(), e);
             }
         }
@@ -110,7 +110,7 @@ public class ToolJobContinuationTracker {
     private void processEntry(ContinuationEntry entry) {
         String runId = entry.runId();
 
-        // 每轮都从 DB 读最新 anchor；anchor 已消失或换了 operation，说明被其他路径收口。
+        // 每轮都从 DB 读最新 anchor；anchor 已消失或换了 operation，说明终态已由其他路径处理完。
         ToolJobAnchor anchor = anchorService.loadAnchor(runId);
         if (anchor == null || !entry.operationId().equals(anchor.getOperationId())) {
             log.info("Continuation anchor gone or replaced for run={}, unregistering", runId);
@@ -125,7 +125,7 @@ public class ToolJobContinuationTracker {
             return;
         }
 
-        // 取消意图：第一次意图即开始收口窗口计时（无论 RPC 成败）；窗口内每轮重试
+        // 取消意图：第一次意图即开始取消等待窗口计时（无论 RPC 成败）；窗口内每轮重试
         // cancel RPC。cancel RPC 失败同样占用轮询失败预算，防止"RPC 永远失败但
         // 状态可读"时超时任务被无限轮询。
         boolean cancelRequested = entry.cancelRequestedAt() != null;
@@ -151,7 +151,7 @@ public class ToolJobContinuationTracker {
             cancelRequested = true;
         }
 
-        // 轮询 Sandbox 状态；RPC 连续失败计入预算，超预算按 RESULT_LOST 收口。
+        // 轮询 Sandbox 状态；RPC 连续失败计入预算，超预算按 RESULT_LOST 走完终态处理。
         TaskStatusResponse statusResp;
         try {
             statusResp = sandboxService.getTaskStatus(
@@ -170,7 +170,7 @@ public class ToolJobContinuationTracker {
 
         String status = statusResp.getStatus();
         if (!isTerminal(status)) {
-            // 已请求取消但迟迟看不到终态：给 cancel 一个收口窗口，超窗按 RESULT_LOST。
+            // 已请求取消但迟迟看不到终态：给 cancel 一个等待窗口，超窗按 RESULT_LOST 走完终态处理。
             if (cancelRequested && entry.cancelRequestedAt() != null
                     && Instant.now().isAfter(entry.cancelRequestedAt()
                     .plusSeconds(config.getTerminalRetentionSeconds()))) {
@@ -180,7 +180,7 @@ public class ToolJobContinuationTracker {
             return;
         }
 
-        // 终态：拉取并校验结果，然后交给 finalizer 走统一的收口链。
+        // 终态：拉取并校验结果，然后交给 finalizer 走统一的终态处理流程。
         TaskResultResponse resultResp = fetchResult(entry.taskId(), runId, status);
         if (resultResp == null) {
             // 结果体暂时不可用：下轮重试，轮询失败预算同样约束这里。
@@ -219,7 +219,7 @@ public class ToolJobContinuationTracker {
         }
     }
 
-    /** RESULT_LOST 统一收口：finalizer 成功后才移除登记，失败保留下一轮重试。 */
+    /** RESULT_LOST 统一终态处理：finalizer 成功后才移除登记，失败保留下一轮重试。 */
     private void finalizeResultLost(String runId, ContinuationEntry entry, ToolJobAnchor anchor) {
         try {
             finalizer.handleTerminal(runId, anchor, "RESULT_LOST", null, anchor.isAutoResume());
@@ -280,7 +280,7 @@ public class ToolJobContinuationTracker {
     }
 
     /**
-     * 进程内续接登记项。字段在 suspend 时从 durable anchor 快照而来；
+     * 进程内续接登记项。字段在 suspend 时从数据库里的 anchor 记录复制而来；
      * cancelRequestedAt 与 pollFailures 由 tracker 在轮询中推进。
      */
     record ContinuationEntry(

@@ -25,7 +25,7 @@ public class AgentLangchainRunService {
 
     private static final int ADMIN_USER_TYPE = 1127;
 
-    private final ObjectProvider<AgentEventService> eventServiceProvider;
+    private final ObjectProvider<AgentEventService> agentEventServiceProvider;
     private final ObjectProvider<LangchainLinearRunPipeline> linearRunPipelineProvider;
     private final LangchainRunConcurrencyScheduler runConcurrencyScheduler;
     private final AgentRunMapper runMapper;
@@ -45,8 +45,8 @@ public class AgentLangchainRunService {
             throw new IllegalStateException("credit 余额不足，无法创建新任务");
         }
 
-        AgentEventService eventService = eventServiceProvider.getIfAvailable();
-        if (eventService == null) {
+        AgentEventService agentEventService = agentEventServiceProvider.getIfAvailable();
+        if (agentEventService == null) {
             throw new IllegalStateException("agent_event_service_unavailable");
         }
 
@@ -57,7 +57,7 @@ public class AgentLangchainRunService {
             reservation = runConcurrencyScheduler.reserve();
         }
         try {
-            run = eventService.createRun(
+            run = agentEventService.createRun(
                     userId,
                     message,
                     request.getContextJson(),
@@ -86,7 +86,7 @@ public class AgentLangchainRunService {
                 runConcurrencyScheduler.release(reservation);
             }
             if (run != null) {
-                markEnqueueFailed(eventService, run, e);
+                markEnqueueFailed(agentEventService, run, e);
             }
             throw e;
         }
@@ -103,9 +103,9 @@ public class AgentLangchainRunService {
         return user != null && user.getUserType() != null && user.getUserType() == ADMIN_USER_TYPE;
     }
 
-    private void markEnqueueFailed(AgentEventService eventService, AgentRun run, RuntimeException error) {
+    private void markEnqueueFailed(AgentEventService agentEventService, AgentRun run, RuntimeException error) {
         try {
-            eventService.append(run.getId(), run.getUserId(), "RUN_ENQUEUE_FAILED", Map.of(
+            agentEventService.append(run.getId(), run.getUserId(), "RUN_ENQUEUE_FAILED", Map.of(
                     "engine", "agentLangchainService",
                     "reason", error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage()
             ));

@@ -196,7 +196,7 @@ public class ToolJobRedisCache {
      * Add or update a run in the due ZSET and its ownership sidecar.
      */
     public void upsertDue(String runId, ToolJobAnchor anchor) {
-        // ZSET score 使用 durable nextPollAt；缺失时立即到期以便补扫修复。
+        // ZSET score 使用数据库里的 nextPollAt；缺失时立即到期以便补扫修复。
         Instant nextPoll = anchor.getNextPollAt();
         if (nextPoll == null) {
             nextPoll = Instant.now();
@@ -334,7 +334,7 @@ public class ToolJobRedisCache {
      * <p>初次 claim 只接受同一 operation、owner、lease 的 PREPARING/ABORTING 热副本；
      * takeover 接受精确旧 token/lease，或数据库首次进入 CLEARING 后、Redis 尚未更新就崩溃
      * 时冻结的原 worker 身份。暂停后恢复的过期 owner 因此无法覆盖新 token；新 operation
-     * 即使错误复用 operationId，只要 owner/lease 不同也会 fail closed。</p>
+     * 即使错误复用 operationId，只要 owner/lease 不同也会被拒绝。</p>
      */
     public OwnedIndexClaimResult claimPreparingAbortCleanupIndexes(
             String runId,

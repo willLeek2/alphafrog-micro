@@ -20,11 +20,11 @@ import java.util.List;
 /**
  * 服务启动后的上下文切换灾后恢复入口。
  *
- * <p>先从 durable reservation 重建容量账本，再重建 Redis due/cache，最后恢复
+ * <p>先从数据库里的 reservation 记录重建容量账本，再重建 Redis due/cache，最后恢复
  * READY/LAUNCHING handoff。顺序不可交换：容量状态未恢复前开放准入可能超卖。</p>
  *
  * <p>仅在 {@code agent.tool-job.durable-recovery-enabled=true} 时创建；默认关闭，
- * 服务重启后的遗留 Run 由工作流启动扫描（task #118）处理。</p>
+ * 服务重启后的遗留 Run 由工作流启动扫描处理。</p>
  */
 @Service
 @ConditionalOnProperty(
@@ -118,7 +118,7 @@ public class ToolJobStartupRecovery {
                             == ToolJobPreparingAbortRecoveryService.Outcome.OWNERSHIP_LOST) {
                         /*
                          * 另一 operation 已经成为 PG winner。不能删除或用 stale abort
-                         * 重排它的 Redis 索引；容量恢复保持 fail-closed，等待下一轮新快照。
+                         * 重排它的 Redis 索引；容量恢复保持不开放准入，等待下一轮新快照。
                          */
                         quarantinedRuns.add(run.getId());
                         continue;
@@ -131,8 +131,8 @@ public class ToolJobStartupRecovery {
                         && reservation.state() == DataAnalysisReservationState.PREPARING) {
                     if (ToolJobRunDisposition.isLiveDagBlocking(anchor.getRunDisposition())) {
                         /*
-                         * DAG worker may still be inside createTask. A new process must first
-                         * respect its durable lease instead of treating PREPARING as abandoned.
+                         * DAG worker 可能仍在 createTask 内。新进程必须先尊重它
+                         * 在数据库里的 lease，不能把 PREPARING 当成已无人认领。
                          */
                         if (!hasDagBlockingIdentity(anchor)) {
                             quarantinedRuns.add(run.getId());
@@ -147,8 +147,8 @@ public class ToolJobStartupRecovery {
                                 recoverLiveDagBlocking(run.getId(), anchor, recoveryNow);
                             } catch (Exception scheduleFailure) {
                                 /*
-                                 * Redis is only a wake-up index. Its outage must not turn a
-                                 * proven durable reservation into a capacity quarantine.
+                                 * Redis 只是唤醒索引。它不可用不能把数据库里已证明的
+                                 * reservation 变成容量隔离。
                                  */
                                 log.error("Failed to schedule live DAG lease expiry for run={}; "
                                                 + "restoring durable PREPARING capacity",
@@ -159,8 +159,8 @@ public class ToolJobStartupRecovery {
                         }
                         if (!recoverLiveDagBlocking(run.getId(), anchor, recoveryNow)) {
                             /*
-                             * Another process won the takeover CAS. Keep the stale durable
-                             * reservation counted locally; the winner owns all further writes.
+                             * 另一进程赢得了 takeover CAS。把过期的数据库 reservation
+                             * 继续计入本地账本；后续写入全部由胜者负责。
                              */
                             durableReservations.add(reservation);
                             continue;
@@ -189,7 +189,7 @@ public class ToolJobStartupRecovery {
                             || resolution.outcome()
                             == ToolJobPreparingDispatchResolver.Outcome.DURABLE_WRITE_UNCERTAIN)) {
                         /*
-                         * 另一恢复者已经推进 durable anchor。当前快照只用于保守计账，
+                         * 另一恢复者已经推进数据库里的 anchor。当前快照只用于保守计账，
                          * 不能再写回 PREPARING 覆盖 winner；runId due 会重新读取 PG。
                          */
                         durableReservations.add(reservation);
@@ -217,7 +217,7 @@ public class ToolJobStartupRecovery {
             }
         }
 
-        // 任一 reservation 无法证明时 fail-closed，避免漏算容量后超额准入。
+        // 任一 reservation 无法证明时就拒绝开放准入，避免漏算容量后超额准入。
         if (!quarantinedRuns.isEmpty()) {
             log.error("CAPACITY QUARANTINE: {} run(s) have unparseable reservationJson — "
                     + "BLOCKING admission recovery to prevent over-admission. Runs: {}",
@@ -272,7 +272,7 @@ public class ToolJobStartupRecovery {
                     }
                     continue;
                 }
-                // 以下分支按 durable resume/finalizer 状态重建相应索引。
+                // 以下分支按数据库里的 resume/finalizer 状态重建相应索引。
                 String resumeState = anchor.getResumeState();
                 if ("CONSUMED".equals(resumeState)) {
                     // 与在线路径相同：先 token-gated 清 DB，再清 Redis。
@@ -283,7 +283,7 @@ public class ToolJobStartupRecovery {
                                 token, anchor.getResumeLeaseVersion());
                     }
                     if (!cleared && token != null && !token.isBlank()) {
-                        // durable clear 失败时保留 Redis，下一轮继续重试。
+                        // 数据库清理失败时保留 Redis，下一轮继续重试。
                         log.warn("Startup CONSUMED clear failed for run={}, leaving Redis for retry", run.getId());
                         continue;
                     }
@@ -401,7 +401,7 @@ public class ToolJobStartupRecovery {
         String operationId = anchor.getOperationId();
         String ownerId = anchor.getBlockingOwnerId();
         if (!DagBlockingWorkerLease.isExpired(anchor.getBlockingLeaseUntil(), now)) {
-            // Redis is only a wake-up index. Keep the durable lease untouched.
+            // Redis 只是唤醒索引。数据库里的 lease 保持不动。
             anchor.setNextPollAt(anchor.getBlockingLeaseUntil());
             redisCache.atomicWritePendingAndDue(runId, anchor);
             log.info("DAG blocking lease still live for run={}, owner={}, due={}",
@@ -480,7 +480,7 @@ public class ToolJobStartupRecovery {
             }
             /*
              * CAS 失败通常表示另一恢复者已推进。只补 runId wake-up，让下一轮从 PG
-             * 重新读取；不能拿当前 stale anchor 再做 durable write。
+             * 重新读取；不能再拿当前 stale anchor 写数据库。
              */
             redisCache.upsertDue(runId, anchor);
         } catch (Exception persistenceFailure) {
@@ -499,7 +499,7 @@ public class ToolJobStartupRecovery {
     }
 
     private boolean transferRecoveredAttached(String runId, ToolJobAnchor anchor) {
-        // 没有 durable reservation 无法证明/恢复容量，拒绝转 WAITING_TOOL_JOB。
+        // 没有数据库里的 reservation 记录就无法证明和恢复容量，拒绝转 WAITING_TOOL_JOB。
         if (anchor.getReservationJson() == null || anchor.getReservationJson().isBlank()) {
             return false;
         }
@@ -511,7 +511,7 @@ public class ToolJobStartupRecovery {
                     anchor.getReservationJson(), DataAnalysisReservation.class);
             DataAnalysisReservation pending = current;
             if (current.state() == DataAnalysisReservationState.TASK_ATTACHED) {
-                // 工具任务已附着后，把容量所有权转交给后台 pending 生命周期。
+                // 工具任务已附着后，把占用的资源名额转给后台任务继续管理。
                 pending = new DataAnalysisReservation(
                         current.reservationId(), current.identity(), current.resourceClass(),
                         current.capacityUnits(), DataAnalysisReservationState.PENDING_TRANSFERRED,
@@ -534,7 +534,7 @@ public class ToolJobStartupRecovery {
             if (anchor.getNextPollAt() == null) {
                 anchor.setNextPollAt(Instant.now().plusMillis(config.getPollIntervalMs()));
             }
-            // 单条 CAS 把 EXECUTING→WAITING_TOOL_JOB 与 anchor 更新一起提交。
+            // 一条 SQL 同时更新 anchor 与 Run 状态（EXECUTING→WAITING_TOOL_JOB），要么都成功、要么都不改。
             if (!anchorService.updateActiveAndStatus(
                     runId, anchor, AgentRunStatus.WAITING_TOOL_JOB,
                     AgentRunStatus.EXECUTING, anchor.getOperationId())) {

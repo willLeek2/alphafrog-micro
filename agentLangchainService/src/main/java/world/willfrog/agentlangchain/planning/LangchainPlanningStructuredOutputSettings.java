@@ -11,7 +11,8 @@ import java.util.Map;
 import java.util.Optional;
 
 /**
- * Reads Nacos/local planning structured-output flags for langchain planner parity with legacy {@code TodoPlanner}.
+ * 读取 Nacos 与本地配置中的规划 structured-output 开关，
+ * 让 langchain 规划器与旧版 {@code TodoPlanner} 的行为保持一致。
  */
 @Component
 @RequiredArgsConstructor
@@ -58,9 +59,9 @@ public class LangchainPlanningStructuredOutputSettings {
     }
 
     /**
-     * OpenRouter: do not set {@code provider.require_parameters=true} for planning — it narrows routing
-     * to providers that natively support every request field (often only deepseek for Kimi), which
-     * conflicts with explicit client provider order.
+     * OpenRouter 规划接口不设置 {@code provider.require_parameters=true}：
+     * 该参数会把路由限制在原生支持请求中全部字段的 provider（对 Kimi 往往只剩
+     * deepseek），与客户端显式指定的 provider 顺序冲突。
      */
     public boolean requireProviderParameters(String planningEndpointName) {
         if (isOpenRouterPlanningEndpoint(planningEndpointName)) {
@@ -108,9 +109,6 @@ public class LangchainPlanningStructuredOutputSettings {
         return base != null && base;
     }
 
-    /**
-     * JSON schema aligned with legacy {@code StructuredPlanningSupport#todoPlanningJsonSchema()}.
-     */
     public boolean strategyStageEnabled() {
         Optional<Boolean> local = localConfigLoader.current()
                 .map(AgentLlmProperties::getRuntime)

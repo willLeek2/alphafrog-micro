@@ -31,8 +31,8 @@ import java.util.UUID;
  *
  * <p>与 {@link ToolRouterToolProvider} 的配合：Provider 负责「有哪些工具」；本类负责
  * 「选中某个工具后怎么跑」。所有工具名最终都进入 {@link ToolRouter#invokeWithMeta(String, Map)}，
- * 因此预算检查、observability trace、结果缓存、统一 JSON 响应格式都在 ToolRouter 内完成，
- * 本类不重复实现那些横切逻辑。</p>
+ * 因此预算检查、observability trace、结果缓存、统一 JSON 响应格式都由 ToolRouter
+ * 统一完成。</p>
  *
  * <p>单次调用的处理顺序（{@link #execute}）：</p>
  * <ol>
@@ -68,7 +68,7 @@ import java.util.UUID;
 @Slf4j
 final class ToolRouterToolExecutor implements ToolExecutor {
 
-    /** 事件 payload 中 output 预览的最大字符数，避免超大结果打爆事件体 */
+    /** 事件 payload 中 output 预览的最大字符数，避免超大结果超出事件体大小限制。 */
     private static final int OUTPUT_PREVIEW_MAX_CHARS = 500;
 
     private static final TypeReference<Map<String, Object>> MAP_TYPE = new TypeReference<>() {
@@ -106,7 +106,7 @@ final class ToolRouterToolExecutor implements ToolExecutor {
             LangchainRepeatedToolCallGuard.Decision repeatDecision =
                     LangchainRepeatedToolCallGuard.beforeInvoke(request.name(), params, objectMapper);
             if (repeatDecision.blocked()) {
-                // 重复调用被 block 时也 emit finish，避免 UI card 一直转圈
+                // 重复调用被拦截时也发射 FINISHED 事件，避免前端 UI card 一直转圈
                 emitToolCallFinished(toolCallId, request.name(), params, false, repeatDecision.outputOrHint(), 0L);
                 return repeatDecision.outputOrHint();
             }
@@ -117,15 +117,14 @@ final class ToolRouterToolExecutor implements ToolExecutor {
             Instant start = Instant.now();
             String output = null;
             boolean success = true;
-            // D07：限流拒绝（本层 LC4j Semaphore 或下游权重限流）未真正执行，
-            // FINISHED 只作 UI 收尾，须带 creditsConsumed=0 与可区分标记
+            // 限流拒绝（本层 LC4j Semaphore 或下游权重限流）时工具没有真正执行，
+            // FINISHED 事件只用于前端展示收尾，必须带 creditsConsumed=0 和可区分的拒绝标记
             boolean throttleRejected = false;
             String throttleLayer = null;
 
-            // sandbox tool throttle: acquire permit before invoking
             ToolThrottleResult throttleResult = toolThrottle.tryAcquire(request.name());
             if (!throttleResult.acquired() && throttleResult.failureReason() != null) {
-                // throttle timeout / interrupted — return error to model, don't fail the run
+                // 限流等待超时或被打断时，只把错误文本返回给模型，不把整个 run 判为失败
                 String reason = throttleResult.failureReason();
                 log.warn("Tool throttled: tool={} reason={}", request.name(), reason);
                 output = reason;
@@ -134,9 +133,10 @@ final class ToolRouterToolExecutor implements ToolExecutor {
                 throttleLayer = "lc4j_semaphore";
             } else {
                 try {
-                    // invokeWithMeta 可能快速返回普通结果，也可能在超时阈值后抛出 pending 控制信号。
+                    // invokeWithMeta 可能直接返回结果；后台任务超时未完成时，会抛出专门的
+                    // 挂起信号异常，通知上层任务已转后台、可以释放线程。
                     ToolRouter.ToolInvocationResult result = toolRouter.invokeWithMeta(request.name(), params);
-                    // 只有真正终态结果才进入普通 output/success 收尾链路。
+                    // 只有真正的终态结果才走普通的 output/success 收尾流程。
                     output = result.getOutput();
                     success = result.isSuccess();
                     if (result.isThrottleRejected()) {
@@ -144,10 +144,11 @@ final class ToolRouterToolExecutor implements ToolExecutor {
                         throttleLayer = "weight_limit";
                     }
                 } catch (ExternalToolJobPendingException pending) {
-                    // pending 表示 Sandbox 后台任务仍在运行，不是工具失败。
+                    // 挂起异常表示 Sandbox 后台任务仍在运行，等待终态事件到来。
                     // 这里不能转成字符串 output，否则 LLM 会误以为工具已经完成。
-                    // 这里也不能写 TOOL_CALL_FINISHED；唯一终态事件归 reconciler/finalizer 所有。
-                    // 原样重抛可保留 runId/toolCallId/attempt，供上层生成可恢复挂起结果。
+                    // 这里也不能写 TOOL_CALL_FINISHED；终态事件由 reconciler/finalizer
+                    //（后台任务的进度对账与终态处理组件）负责写入。
+                    // 原样重抛可保留 runId/toolCallId/attempt，供上层生成可恢复的挂起结果。
                     throw pending;
                 } catch (Exception e) {
                     output = e.getMessage();
@@ -161,7 +162,7 @@ final class ToolRouterToolExecutor implements ToolExecutor {
             }
 
             long durationMs = Duration.between(start, Instant.now()).toMillis();
-            // D07：限流拒绝未执行任何工具体，不计执行耗时指标
+            // 限流拒绝时工具没有真正执行，不计入执行耗时统计
             if (!throttleRejected) {
                 toolThrottle.recordExecution(request.name(), durationMs);
             }
@@ -321,9 +322,9 @@ final class ToolRouterToolExecutor implements ToolExecutor {
      * 发射 TOOL_CALL_FINISHED 事件，经 SSE 推送 + Redis 持久化。
      *
      * <p>payload 包含 tool_call_id、执行结果（success/duration_ms）、result_preview（截断预览，
-     * 避免超大结果打爆事件体），以及 {@link AgentSsePayloadSupport} 注入的归属信息。
-     * 重复调用被 block 时也会 emit，使前端 UI card 能从「loading」状态恢复为错误展示，
-     * 而不是永远转圈。</p>
+     * 避免超大结果超出事件体大小限制），以及 {@link AgentSsePayloadSupport} 注入的归属信息。
+     * 重复调用被拦截时也会发射本事件，使前端 UI card 能从「loading」状态恢复为错误展示，
+     * 不会一直转圈。</p>
      *
      * @param toolCallId  本次 tool call 的稳定 ID
      * @param toolName    工具名
@@ -355,7 +356,7 @@ final class ToolRouterToolExecutor implements ToolExecutor {
         payload.put("duration_ms", durationMs);
         if (throttleRejected) {
             /*
-             * D07 计费契约：限流拒绝未执行工具体，显式写 creditsConsumed=0 使
+             * 限流拒绝时工具没有真正执行，显式写 creditsConsumed=0，让
              * AgentCreditService 不按默认工具单价扣费；rejected_by_throttle /
              * throttle_layer 供前端与汇总侧区分「执行失败」与「限流拒绝」。
              */

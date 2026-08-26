@@ -35,7 +35,7 @@ import java.util.Map;
  *                                                               (delete)  → （清除）
  * </pre>
  *
- * <h2>cancel 的关键步骤</h2>
+ * <h2>cancel 的主要步骤</h2>
  * <ol>
  *   <li>写 Redis 状态为 CANCELING —— 执行中的 todo loop 通过
  *       {@code LangchainRunExecutionGuard} 检测到后停止工具调用</li>
@@ -43,7 +43,7 @@ import java.util.Map;
  *   <li>forceFlush observability —— 把当前观测数据刷新到 Redis</li>
  *   <li>attachObservabilityToSnapshot —— 最终观测写入 snapshot JSON</li>
  *   <li>updateSnapshot + updateStatusWithTtl —— 写 DB 并设中断 TTL</li>
- *   <li>eventService.append —— 写入 CANCELED 事件</li>
+ *   <li>agentEventService.append —— 写入 CANCELED 事件</li>
  * </ol>
  *
  * <h2>resume 的特殊处理</h2>
@@ -60,11 +60,11 @@ import java.util.Map;
 @Slf4j
 public class LangchainRunControlService {
 
-    private final LangchainRunReadService readService;
+    private final LangchainRunReadService runReadService;
     private final AgentRunMapper runMapper;
-    private final AgentEventService eventService;
+    private final AgentEventService agentEventService;
     private final AgentRunStateStore stateStore;
-    private final AgentObservabilityService observabilityService;
+    private final AgentObservabilityService agentObservabilityService;
     private final LangchainLinearRunPipeline pipeline;
     private final AgentRunCreditSettlementService creditSettlementService;
     private final ToolJobAnchorService anchorService;
@@ -78,7 +78,7 @@ public class LangchainRunControlService {
      * 仅允许在非运行状态下删除；正在执行的 run 需要先 cancel 或 pause。
      */
     public AgentEmpty deleteRun(DeleteAgentRunRequest request) {
-        AgentRun run = readService.requireWritableRun(request.getId(), request.getUserId());
+        AgentRun run = runReadService.requireWritableRun(request.getId(), request.getUserId());
         if (isRunning(run.getStatus())) {
             throw new IllegalStateException("run is running, cancel/pause first");
         }
@@ -95,25 +95,25 @@ public class LangchainRunControlService {
      * 已在终态的 run 直接返回当前状态（幂等）。
      */
     public world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage cancelRun(CancelAgentRunRequest request) {
-        AgentRun run = readService.requireWritableRun(request.getId(), request.getUserId());
+        AgentRun run = runReadService.requireWritableRun(request.getId(), request.getUserId());
         if (isTerminal(run.getStatus())) {
             return AgentLangchainRunMessageMapper.toRunMessage(run);
         }
         String runId = run.getId();
         String userId = run.getUserId();
 
-        // 0. 先处理 durable disposition：取消一个正在等待长工具的 Run 时，不能直接把数据库状态改成
-        //    CANCELED。finalizer 后续仍需以 WAITING_TOOL_JOB 为 CAS 前置条件接管 terminal result、释放
-        //    Sandbox 容量并完成幂等收口，因此这里只在 anchor 中关闭 autoResume、记录 CANCELED 意图。
-        //    任何 anchor 读写失败都保持 Run 原状，让 reconciler 未来仍能处理，顺序必须是持久层先于 Redis。
+        // 0. 先写取消标记：取消一个正在等待长工具的 Run 时，不能直接把数据库状态改成 CANCELED。
+        //    收尾组件后续还要以「等待长工具」状态为前提接管终态结果、释放沙箱容量并走完终态流程，
+        //    所以这里只在进度记录里关闭自动恢复开关、记下取消意图。任何进度记录读写失败都保持
+        //    Run 原状，让恢复扫描未来仍能处理；顺序必须是数据库先于 Redis。
         boolean hasActiveAnchor = false;
         try {
             ToolJobAnchor toolAnchor = anchorService.loadAnchor(runId);
             if (toolAnchor != null && toolAnchor.getOperationId() != null
                     && !toolAnchor.getOperationId().isBlank()) {
-                // 260818（grace round-4）：窄合并写——绝不整份写回内存旧锚点，防止把
-                // 并发开始的第二个长工具的 PREPARING/新 operationId 抹掉。operationId
-                // 已变时先重读当前任务重试一次，仍失败则按既有语义失败关闭。
+                // 窄合并写：绝不整份写回内存里的旧进度记录，防止把并发开始的第二个
+                // 长工具的 PREPARING（准备中）状态和新 operationId 抹掉。operationId
+                // 已变时先重读当前任务重试一次，仍失败则按既有语义拒绝执行。
                 boolean persisted = anchorService.persistCancelDisposition(
                         runId, toolAnchor.getOperationId(), run.getStatus());
                 if (!persisted) {
@@ -138,8 +138,9 @@ public class LangchainRunControlService {
         } catch (IllegalStateException e) {
             throw e;
         } catch (Exception e) {
-            // fail-closed：不能退化到普通取消路径；否则 WAITING_TOOL_JOB 被提前覆盖后，finalizer CAS
-            // 永远失败，外部工具 reservation 也就失去唯一的释放责任人。
+            // 失败即关闭（条件不满足就拒绝执行）：不能退化到普通取消路径；否则
+            // WAITING_TOOL_JOB 被提前覆盖后，finalizer 的条件更新永远失败，
+            // 外部工具的资源名额也就失去唯一的释放责任人。
             log.error("Failed to persist cancel disposition on tool-job anchor for run={} — "
                     + "cancel aborted to prevent capacity leak: {}", runId, e.getMessage());
             throw new IllegalStateException(
@@ -157,21 +158,21 @@ public class LangchainRunControlService {
             log.warn("Cancel langchain run {} interrupted during observability flush wait", runId);
         }
         // 3. 把当前 Redis 中的 observability 数据强制刷新（运行中的累积数据可能在内存缓冲区）
-        observabilityService.forceFlush(runId);
+        agentObservabilityService.forceFlush(runId);
         // 4. 从 Redis 读取最新 observability → scrub 敏感信息 → 写回 DB snapshot 字段作为终态存档
-        String snapshot = observabilityService.attachObservabilityToSnapshot(
+        String snapshot = agentObservabilityService.attachObservabilityToSnapshot(
                 runId, run.getSnapshotJson(), AgentRunStatus.CANCELED);
         // 5. 更新 DB：snapshot、status、TTL（中断的 run 过期时间比正常完成的短）
         boolean canceledPersisted = false;
         if (hasActiveAnchor) {
-            // 有活跃 anchor 时保留数据库现状，给 finalizer 留住 CAS 前置条件；这里只更新可观测快照。
-            // terminal sinks 与容量释放完成后，finalizer 才把持久状态收口为 CANCELED。
+            // 有活跃进度记录时保留数据库现状，给 finalizer 留住条件更新的前提；这里只更新可观测快照。
+            // 终态事件与容量释放完成后，finalizer 才把数据库状态改成 CANCELED。
             runMapper.updateSnapshot(runId, userId, run.getStatus(), snapshot, false, null);
         } else {
             int snapshotRows = runMapper.updateSnapshot(
                     runId, userId, AgentRunStatus.CANCELED, snapshot, false, null);
             int ttlRows = runMapper.updateStatusWithTtl(
-                    runId, userId, AgentRunStatus.CANCELED, eventService.nextInterruptedExpiresAt());
+                    runId, userId, AgentRunStatus.CANCELED, agentEventService.nextInterruptedExpiresAt());
             canceledPersisted = snapshotRows == 1 && ttlRows == 1;
             if (!canceledPersisted) {
                 log.warn("CANCELED persistence was not exact: runId={} snapshotRows={} ttlRows={}",
@@ -182,7 +183,7 @@ public class LangchainRunControlService {
             schedulerMetrics.recordCompletion(AgentRunStatus.CANCELED);
         }
         // 6. 发 CANCELED 事件 → 前端 SSE 收到后更新 UI 为已取消
-        eventService.append(runId, userId, "CANCELED", Map.of(
+        agentEventService.append(runId, userId, "CANCELED", Map.of(
                 "run_id", runId,
                 "engine", "agentLangchainService"));
         // 7. 最后再把 Redis 状态从 CANCELING 改成 CANCELED（终态）
@@ -192,16 +193,17 @@ public class LangchainRunControlService {
         if (!hasActiveAnchor && canceledPersisted) {
             publishFinalizedEventSafely(runId, userId, AgentRunStatus.CANCELED);
         }
-        // 8. 260612-01-02: cancel 路径触发结算（可能已有部分 LLM 调用）
+        // 8. 取消也要结算本次已产生的模型调用费用。
         try {
             creditSettlementService.settleAsync(runId, userId);
         } catch (Exception settleEx) {
             log.warn("Failed to schedule settlement on langchain cancel: runId={} err={}", runId, settleEx.getMessage());
         }
-        AgentRun refreshed = readService.requireReadableRun(runId, userId);
+        AgentRun refreshed = runReadService.requireReadableRun(runId, userId);
         if (hasActiveAnchor) {
-            // API 立即展示 CANCELED 以响应用户，但数据库暂时仍是 WAITING_TOOL_JOB；这是展示态与
-            // 收口态的有意分离，不代表 worker 仍被占用。最终持久状态由 finalizer 在释放容量后写入。
+            // API 立即展示 CANCELED 以响应用户，但数据库暂时仍是 WAITING_TOOL_JOB：
+            // 展示给用户的状态先变了，数据库里的最终状态要等 finalizer 释放容量后才写入；
+            // 执行线程此时早已释放，这里只是展示态先行、持久态随后跟上。
             return AgentLangchainRunMessageMapper.toRunMessage(refreshed).toBuilder()
                     .setStatus(AgentRunStatus.CANCELED.name())
                     .build();
@@ -209,7 +211,7 @@ public class LangchainRunControlService {
         return AgentLangchainRunMessageMapper.toRunMessage(refreshed);
     }
 
-    /** Workspace dump 失败走 DB polling 兜底，不能反向破坏已经提交的取消终态。 */
+    /** 工作区归档事件发送失败时走数据库轮询备用路径，不能反向破坏已经提交的取消终态。 */
     private void publishFinalizedEventSafely(String runId, String userId, AgentRunStatus status) {
         try {
             finalizationService.publishFinalizedEvent(runId, userId, status.name());
@@ -224,20 +226,20 @@ public class LangchainRunControlService {
      * 已在终态的 run 直接返回（幂等）。
      */
     public world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage pauseRun(PauseAgentRunRequest request) {
-        AgentRun run = readService.requireWritableRun(request.getId(), request.getUserId());
+        AgentRun run = runReadService.requireWritableRun(request.getId(), request.getUserId());
         if (isTerminal(run.getStatus())) {
             return AgentLangchainRunMessageMapper.toRunMessage(run);
         }
-        String snapshot = observabilityService.attachObservabilityToSnapshot(
+        String snapshot = agentObservabilityService.attachObservabilityToSnapshot(
                 run.getId(), run.getSnapshotJson(), AgentRunStatus.WAITING);
         runMapper.updateSnapshot(run.getId(), run.getUserId(), AgentRunStatus.WAITING, snapshot, false, null);
         runMapper.updateStatusWithTtl(run.getId(), run.getUserId(), AgentRunStatus.WAITING,
-                eventService.nextInterruptedExpiresAt());
-        eventService.append(run.getId(), run.getUserId(), "PAUSED", Map.of(
+                agentEventService.nextInterruptedExpiresAt());
+        agentEventService.append(run.getId(), run.getUserId(), "PAUSED", Map.of(
                 "run_id", run.getId(),
                 "engine", "agentLangchainService"));
         stateStore.markRunStatus(run.getId(), AgentRunStatus.WAITING.name());
-        return AgentLangchainRunMessageMapper.toRunMessage(readService.requireReadableRun(run.getId(), run.getUserId()));
+        return AgentLangchainRunMessageMapper.toRunMessage(runReadService.requireReadableRun(run.getId(), run.getUserId()));
     }
 
     /**
@@ -245,7 +247,7 @@ public class LangchainRunControlService {
      * 先清除旧 plan 再存入新 plan，然后重置状态为 RECEIVED 异步重新执行。
      */
     public world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage resumeRun(ResumeAgentRunRequest request) {
-        AgentRun run = readService.requireWritableRun(request.getId(), request.getUserId());
+        AgentRun run = runReadService.requireWritableRun(request.getId(), request.getUserId());
         if (run.getStatus() == AgentRunStatus.EXPIRED) {
             throw new IllegalStateException("run expired");
         }
@@ -258,12 +260,15 @@ public class LangchainRunControlService {
             stateStore.clearTasks(run.getId());
             stateStore.storePlanOverride(run.getId(), request.getPlanOverrideJson());
         }
-        runMapper.resetForResume(run.getId(), run.getUserId(), eventService.nextTtlExpiresAt());
-        eventService.append(run.getId(), run.getUserId(), "WORKFLOW_RESUMED", Map.of(
+        runMapper.resetForResume(run.getId(), run.getUserId(), agentEventService.nextTtlExpiresAt());
+        agentEventService.append(run.getId(), run.getUserId(), "WORKFLOW_RESUMED", Map.of(
                 "run_id", run.getId(),
                 "engine", "agentLangchainService"));
         stateStore.markRunStatus(run.getId(), AgentRunStatus.RECEIVED.name());
-        AgentRun refreshed = readService.requireReadableRun(run.getId(), run.getUserId());
+        AgentRun refreshed = runReadService.requireReadableRun(run.getId(), run.getUserId());
+        // 这一行把 Run 重新交给全局调度闸门：线程池有空位就立刻执行，满了就进有界优先级
+        // 队列排队；手动恢复和长工具自动恢复走的是同一个调度入口。调度器和队列都满时
+        // 这一行会直接抛「队列已满」异常，调用方收到失败，不会阻塞等待。
         pipeline.launchAsync(refreshed);
         return AgentLangchainRunMessageMapper.toRunMessage(refreshed);
     }
