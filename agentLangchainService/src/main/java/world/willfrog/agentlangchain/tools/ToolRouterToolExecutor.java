@@ -34,6 +34,9 @@ import java.util.UUID;
  * 因此预算检查、observability trace、结果缓存、统一 JSON 响应格式都由 ToolRouter
  * 统一完成。</p>
  *
+ * <p>工具路由的讲解要点已迁出，见
+ * {@code agent-working-docs/code-review/phase2/agent-run-overall/tool-routing-interview-points.md}。</p>
+ *
  * <p>单次调用的处理顺序（{@link #execute}）：</p>
  * <ol>
  *   <li>解析或生成 {@code tool_call_id}：优先复用 LC4j 请求中的 ID，若无则 fallback 到 UUID，
@@ -49,15 +52,6 @@ import java.util.UUID;
  *   <li>若 output 暗示 dataset 缺失/无效，或发生重复调用，在结果末尾追加 {@code _retry_hint_}
  *       引导模型改参（不抛异常，让模型在下一轮 tool loop 自行纠正）。</li>
  * </ol>
- *
- * <p>面试常考点：</p>
- * <ul>
- *   <li>「LC4j tool call 怎么落到 MarketDataTools？」→ 本类 → ToolRouter → 具体工具 Bean；</li>
- *   <li>「为什么 cancel 后还能拦住后续工具/LLM？」→ LC4j 层由
- *       {@link world.willfrog.agentlangchain.orchestration.LangchainRunExecutionGuard} 在发 LLM 前和工具前检查；
- *       {@link ToolRouter} 负责预算与工具运行时横切逻辑，不承担 cancel 状态机；</li>
- *   <li>「dataset 怎么跨 todo 传递？」→ 本类注册 ref + TodoNodeExecutor 把 refs 写进 user message。</li>
- * </ul>
  *
  * @see ToolRouterToolProvider 工具目录入口
  * @see world.willfrog.agent.tools.router.ToolRouter 统一执行与观测
@@ -76,7 +70,7 @@ final class ToolRouterToolExecutor implements ToolExecutor {
 
     private final ToolRouter toolRouter;
     private final ObjectMapper objectMapper;
-    private final AgentEventService eventService;
+    private final AgentEventService agentEventService;
     private final LangchainToolConcurrencyThrottle toolThrottle;
     private final PythonSandboxDispatchStore pythonSandboxDispatchStore;
 
@@ -315,7 +309,7 @@ final class ToolRouterToolExecutor implements ToolExecutor {
             payload.put("phase", phase);
         }
         AgentSsePayloadSupport.putExecutionAttribution(payload);
-        eventService.append(runId, userId, "TOOL_CALL_STARTED", payload);
+        agentEventService.append(runId, userId, "TOOL_CALL_STARTED", payload);
     }
 
     /**
@@ -371,9 +365,9 @@ final class ToolRouterToolExecutor implements ToolExecutor {
         AgentSsePayloadSupport.putExecutionAttribution(payload);
         if ("executePython".equals(toolName)) {
             String dedupeKey = runId + ":" + toolCallId + ":logical_terminal";
-            eventService.appendOnce(runId, userId, "TOOL_CALL_FINISHED", dedupeKey, payload);
+            agentEventService.appendOnce(runId, userId, "TOOL_CALL_FINISHED", dedupeKey, payload);
         } else {
-            eventService.append(runId, userId, "TOOL_CALL_FINISHED", payload);
+            agentEventService.append(runId, userId, "TOOL_CALL_FINISHED", payload);
         }
     }
 

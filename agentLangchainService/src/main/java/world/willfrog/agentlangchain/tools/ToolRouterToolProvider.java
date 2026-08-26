@@ -42,7 +42,10 @@ import static world.willfrog.agent.platform.service.AgentObservabilityService.PH
  *       {@code ToolRouter.java} 的注释）。</li>
  * </ul>
  *
- * <p>调用路径（面试常问「工具怎么进 raw HTTP tools 数组」）：</p>
+ * <p>工具路由的讲解要点已迁出，见
+ * {@code agent-working-docs/code-review/phase2/agent-run-overall/tool-routing-interview-points.md}。</p>
+ *
+ * <p>调用路径：</p>
  * <ol>
  *   <li>{@link world.willfrog.agentlangchain.orchestration.LangchainTodoNodeExecutor} 构建 AiServices 时
  *       注入 {@code ObjectProvider<ToolProvider>}（Spring Bean 为 {@link world.willfrog.agentlangchain.config.LangchainToolsConfiguration#langchainToolProvider}）；</li>
@@ -54,15 +57,6 @@ import static world.willfrog.agent.platform.service.AgentObservabilityService.PH
  *       {@code checkParallelLimits}（避免 0 参数 {@code @Tool} 反射漏注册）；</li>
  *   <li>返回的 {@link ToolProviderResult} 中，所有 spec 共享一个 {@link ToolRouterToolExecutor} 实例。</li>
  * </ol>
- *
- * <p>面试常考点：</p>
- * <ul>
- *   <li>「langchain 和 legacy 工具列表为何一致？」→ 同一套 {@link ToolCatalogBuilder} 过滤逻辑；</li>
- *   <li>「为什么 searchWeb / executePython 有时不在 tools 里？」→
- *       {@link LangchainToolInvocationKeys#WEB_SEARCH_ENABLED}、
- *       {@link LangchainToolInvocationKeys#CODE_INTERPRETER_ENABLED}；</li>
- *   <li>「Provider 和 Executor 为什么要拆两个类？」→ LC4j 接口分离：目录发现 vs 单次 invoke。</li>
- * </ul>
  *
  * @see ToolRouterToolExecutor 工具执行委托
  * @see ToolCatalogBuilder run 级工具目录拼装
@@ -85,7 +79,7 @@ public class ToolRouterToolProvider implements ToolProvider {
      * 事件服务，传递给 {@link ToolRouterToolExecutor} 用于发射 TOOL_CALL_STARTED / TOOL_CALL_FINISHED
      * SSE 事件（经 Redis pub-sub 推送）。
      */
-    private final AgentEventService eventService;
+    private final AgentEventService agentEventService;
     private final LangchainToolConcurrencyThrottle toolThrottle;
     private final PythonSandboxDispatchStore pythonSandboxDispatchStore;
 
@@ -133,7 +127,7 @@ public class ToolRouterToolProvider implements ToolProvider {
         }
 
         ToolExecutor executor = new ToolRouterToolExecutor(
-                toolRouter, objectMapper, eventService, toolThrottle, pythonSandboxDispatchStore);
+                toolRouter, objectMapper, agentEventService, toolThrottle, pythonSandboxDispatchStore);
         Map<ToolSpecification, ToolExecutor> tools = new LinkedHashMap<>();
         for (ToolSpecification specification : specifications) {
             tools.put(specification, executor);
