@@ -197,7 +197,7 @@ public class LangchainLinearWorkflowExecutor {
         // datasetRefs 是当前 worker 的堆内映射，必须从已完成输出重新注册。
         Map<String, String> datasetRefs = LangchainTodoUserMessageBuilder.newDatasetRefMap();
         completedTodos.forEach(todo -> DatasetRefRegistry.registerFromJson(todo.displayOutput(), datasetRefs));
-        // completedIds 用于 O(1) 跳过已经落稳的 Todo，防止重复工具副作用。
+        // completedIds 用于 O(1) 跳过已经落稳的 待办节点，防止重复工具副作用。
         java.util.Set<String> completedIds = completedTodos.stream()
                 .map(LangchainCompletedTodo::getTodoId)
                 .filter(java.util.Objects::nonNull)
@@ -210,7 +210,7 @@ public class LangchainLinearWorkflowExecutor {
             AgentContext.setToolJobResumeHandoff(
                     resumeContext.getResumeToken(), resumeContext.getResumeLeaseVersion());
         }
-        // FINAL_TODO_ID 表示所有 Todo 已完成，本轮只需要生成最终答案。
+        // FINAL_TODO_ID 表示所有 待办节点已完成，本轮只需要生成最终答案。
         boolean resumeAtFinal = handoffAccepted
                 && ToolJobResumeContext.FINAL_TODO_ID.equals(resumeContext.getTodoId());
         boolean restartAtFinal = restartCheckpoint != null
@@ -218,7 +218,7 @@ public class LangchainLinearWorkflowExecutor {
         String boundaryTodoId = resumeContext != null
                 ? resumeContext.getTodoId()
                 : restartCheckpoint == null ? null : restartCheckpoint.getNextTodoId();
-        // ToolJob resume 找原挂起 Todo；服务重启找 checkpoint 指向的下一 Todo。
+        // ToolJob resume 找原挂起的待办节点；服务重启找 checkpoint 指向的下一待办节点。
         TodoItem suspendedItem = (resumeContext == null && restartCheckpoint == null)
                 || resumeAtFinal || restartAtFinal ? null : plan.getItems().stream()
                 .filter(item -> java.util.Objects.equals(item.getId(), boundaryTodoId))
@@ -231,7 +231,7 @@ public class LangchainLinearWorkflowExecutor {
                     resumeContext != null ? "resume_todo_not_in_plan" : "restart_todo_not_in_plan",
                     toolCalls.get(), null);
         }
-        // resumeSequence 是恢复前缀的严格边界；最终回答哨兵放在所有 Todo 之后。
+        // resumeSequence 是恢复前缀的严格边界；最终回答哨兵放在所有待办节点之后。
         int resumeSequence = (resumeAtFinal || restartAtFinal) ? Integer.MAX_VALUE : suspendedItem == null
                 ? Integer.MIN_VALUE : suspendedItem.getSequence();
         // 已完成快照不能包含挂起节点或其后节点，否则说明 checkpoint 顺序自相矛盾。
@@ -243,7 +243,7 @@ public class LangchainLinearWorkflowExecutor {
                             : "restart_completed_todo_out_of_order",
                     toolCalls.get(), null);
         }
-        // 已消费的失败终态不允许继续后续 Todo，直接恢复为确定性失败。
+        // 已消费的失败终态不允许继续后续待办节点，直接恢复为确定性失败。
         if (handoffAccepted && !activePythonRepair
                 && (!resumeContext.isTerminalSuccess() || resumeContext.isPythonRepairPending())) {
             if (resumeContext.isPythonRepairExhausted()) {

@@ -50,13 +50,6 @@ import java.util.Map;
  * <p>如果请求带有 {@code planOverrideJson}，会先清除旧 plan 再存入新 plan，
  * 然后重置 run 状态为 RECEIVED 并异步启动新一次执行。</p>
  *
- * <h2>面试常考点</h2>
- * <ul>
- *   <li>"cancel 为什么 sleep 200ms？"→ 给执行器一个窗口去感知 CANCELING 状态并自行停止，
- *       而非直接强制 kill。这比硬 kill 更安全，正在执行的工具调用可以自然完成当前轮。</li>
- *   <li>"pause 和 cancel 有什么区别？"→ pause 把状态改为 WAITING 并保留 snapshot，
- *       resume 后从原状态继续；cancel 是终态不可恢复。</li>
- * </ul>
  *
  * @see LangchainRunReadService 读路径，提供 requireWritableRun
  * @see LangchainLinearRunPipeline 异步执行入口
