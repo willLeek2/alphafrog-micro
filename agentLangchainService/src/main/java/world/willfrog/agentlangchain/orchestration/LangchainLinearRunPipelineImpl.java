@@ -716,7 +716,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
 
     /**
      * PARTIAL（部分完成）终态的持久化与收尾副作用，正常执行与恢复执行共用，
-     * 持久化两轨的划分与 {@link #persistCompletedOutcome} 相同。
+     * 持久化两条路径的划分与 {@link #persistCompletedOutcome} 相同。
      */
     private boolean persistPartialOutcome(AgentRun run,
                                           String userGoal,
