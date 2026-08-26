@@ -224,11 +224,18 @@ public class LangchainRunControlService {
     /**
      * 暂停 run：状态改为 WAITING，可被 resume 恢复。
      * 已在终态的 run 直接返回（幂等）。
+     * 等待长工具结果（WAITING_TOOL_JOB）的 run 暂不支持暂停：此时暂停只改状态、不处置锚点，
+     * 长工具终态到达后清理链第一步的条件更新会命中 0 行，配额释放与终态事件随之丢失。
+     * 需要停止这类 run 请改用取消（cancel 已对该状态做了锚点处置）。
      */
     public world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage pauseRun(PauseAgentRunRequest request) {
         AgentRun run = runReadService.requireWritableRun(request.getId(), request.getUserId());
         if (isTerminal(run.getStatus())) {
             return AgentLangchainRunMessageMapper.toRunMessage(run);
+        }
+        if (run.getStatus() == AgentRunStatus.WAITING_TOOL_JOB) {
+            throw new IllegalStateException(
+                    "run is waiting for a long-running tool job; pause is temporarily unsupported in this state, use cancel instead");
         }
         String snapshot = agentObservabilityService.attachObservabilityToSnapshot(
                 run.getId(), run.getSnapshotJson(), AgentRunStatus.WAITING);

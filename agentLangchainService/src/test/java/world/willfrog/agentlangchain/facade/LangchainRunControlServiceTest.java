@@ -13,12 +13,14 @@ import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agentlangchain.orchestration.LangchainLinearRunPipeline;
 import world.willfrog.agentlangchain.tooljob.ToolJobAnchorService;
 import world.willfrog.alphafrogmicro.agent.idl.CancelAgentRunRequest;
+import world.willfrog.alphafrogmicro.agent.idl.PauseAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ResumeAgentRunRequest;
 
 import java.time.OffsetDateTime;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.*;
 
 class LangchainRunControlServiceTest {
@@ -128,6 +130,23 @@ class LangchainRunControlServiceTest {
         assertEquals("RECEIVED", response.getStatus());
         verify(runMapper).resetForResume(eq("r1"), eq("u1"), any());
         verify(pipeline).launchAsync(received);
+    }
+
+    @Test
+    void pauseRejectsRunWaitingToolJob() {
+        // 等待长工具的 run 调暂停必须明确拒绝并提示改用取消：
+        // 只改状态不处置锚点，清理链第一步条件更新会命中 0 行（配额与终态事件丢失）。
+        AgentRun waitingToolJob = run(AgentRunStatus.WAITING_TOOL_JOB);
+        when(readService.requireWritableRun("r1", "u1")).thenReturn(waitingToolJob);
+
+        IllegalStateException ex = assertThrows(IllegalStateException.class, () ->
+                service.pauseRun(PauseAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build()));
+
+        assertTrue(ex.getMessage().contains("use cancel instead"));
+        verify(runMapper, never()).updateSnapshot(anyString(), anyString(), any(), anyString(), anyBoolean(), any());
+        verify(runMapper, never()).updateStatusWithTtl(anyString(), anyString(), any(), any());
+        verify(stateStore, never()).markRunStatus(anyString(), anyString());
+        verify(eventService, never()).append(anyString(), anyString(), anyString(), anyMap());
     }
 
     @Test
