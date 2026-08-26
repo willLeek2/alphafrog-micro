@@ -273,7 +273,7 @@ class LangchainLinearWorkflowResumeTest {
         LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
         when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
         AtomicReference<ToolJobResumeContext> repairSeen = new AtomicReference<>();
-        when(nodeExecutor.execute(any(), any(), any(), any(), any(),
+        when(nodeExecutor.executeRepairRound(any(), any(), any(), any(), any(),
                 any(ToolJobResumeContext.class))).thenAnswer(invocation -> {
             repairSeen.set(invocation.getArgument(5));
             assertThat(AgentContext.getToolJobResumeToken()).isEqualTo("repair-token");
@@ -305,7 +305,7 @@ class LangchainLinearWorkflowResumeTest {
         assertThat(repairSeen.get()).isSameAs(context);
         assertThat(result.getCompletedTodos()).extracting(LangchainCompletedTodo::getTodoId)
                 .containsExactly("todo-2");
-        verify(nodeExecutor).execute(any(), any(), any(), any(), any(), same(context));
+        verify(nodeExecutor).executeRepairRound(any(), any(), any(), any(), any(), same(context));
     }
 
     @Test
@@ -313,7 +313,7 @@ class LangchainLinearWorkflowResumeTest {
         LangchainTodoNodeExecutor nodeExecutor = mock(LangchainTodoNodeExecutor.class);
         LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
         when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
-        when(nodeExecutor.execute(any(), any(), any(), any(), any(),
+        when(nodeExecutor.executeRepairRound(any(), any(), any(), any(), any(),
                 any(ToolJobResumeContext.class)))
                 .thenReturn(LangchainTodoNodeResult.success("repaired-output", 1));
         when(nodeExecutor.writeFinalAnswer(any(), any())).thenReturn("final-after-restart");
@@ -336,7 +336,7 @@ class LangchainLinearWorkflowResumeTest {
         assertThat(consumed.get()).isZero();
         assertThat(context.getPythonRepairAttempt()).isEqualTo(1);
         assertThat(context.isPythonRepairPending()).isTrue();
-        verify(nodeExecutor).execute(any(), any(), any(), any(), any(), same(context));
+        verify(nodeExecutor).executeRepairRound(any(), any(), any(), any(), any(), same(context));
     }
 
     @Test
@@ -384,7 +384,7 @@ class LangchainLinearWorkflowResumeTest {
         assertThat(context.isPythonRepairPending()).isFalse();
         assertThat(context.isPythonRepairExhausted()).isTrue();
         verify(nodeExecutor, never()).execute(any(), any(), any(), any(), any());
-        verify(nodeExecutor, never()).execute(any(), any(), any(), any(), any(), any());
+        verify(nodeExecutor, never()).executeRepairRound(any(), any(), any(), any(), any(), any());
         verify(nodeExecutor, never()).writeFinalAnswer(any(), any());
     }
 
@@ -425,7 +425,7 @@ class LangchainLinearWorkflowResumeTest {
                 new java.util.concurrent.atomic.AtomicReference<>(attempts(2));
         when(loader.current()).thenAnswer(ignored -> Optional.ofNullable(live.get()));
         when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
-        when(nodeExecutor.execute(any(), any(), any(), any(), any(),
+        when(nodeExecutor.executeRepairRound(any(), any(), any(), any(), any(),
                 any(ToolJobResumeContext.class)))
                 .thenReturn(LangchainTodoNodeResult.success("repaired-output", 1));
         when(nodeExecutor.writeFinalAnswer(any(), any())).thenReturn("final-after-repair");
@@ -448,7 +448,7 @@ class LangchainLinearWorkflowResumeTest {
         LangchainLinearWorkflowResult allowed = executor.resumePlanned(
                 request(), plan, allowedAtFour, () -> true);
         assertThat(allowed.isSuccess()).isTrue();
-        verify(nodeExecutor).execute(any(), any(), any(), any(), any(), same(allowedAtFour));
+        verify(nodeExecutor).executeRepairRound(any(), any(), any(), any(), any(), same(allowedAtFour));
         verify(nodeExecutor).writeFinalAnswer(any(), any());
     }
 

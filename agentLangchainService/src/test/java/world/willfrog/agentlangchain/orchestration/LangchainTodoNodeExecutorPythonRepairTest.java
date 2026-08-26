@@ -172,7 +172,7 @@ class LangchainTodoNodeExecutorPythonRepairTest {
                 .sequence(1)
                 .description("run corrected analysis")
                 .build();
-        return executor.execute(
+        return executor.executeRepairRound(
                 request, item, List.of(), new LinkedHashMap<>(), toolCalls, repairContext());
     }
 

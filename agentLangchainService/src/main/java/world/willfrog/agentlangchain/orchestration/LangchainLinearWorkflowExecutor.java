@@ -374,7 +374,7 @@ public class LangchainLinearWorkflowExecutor {
             long nodeStartMs = System.currentTimeMillis();
             LangchainTodoNodeResult nodeResult = repairExecutionContext == null
                     ? todoNodeExecutor.execute(request, item, completedTodos, datasetRefs, toolCalls)
-                    : todoNodeExecutor.execute(
+                    : todoNodeExecutor.executeRepairRound(
                             request, item, completedTodos, datasetRefs, toolCalls, repairExecutionContext);
             long nodeDurationMs = System.currentTimeMillis() - nodeStartMs;
             // 外部工具 pending 不属于节点失败：保存挂起身份并立刻返回到 pipeline。
