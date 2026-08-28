@@ -666,11 +666,15 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
     /**
      * COMPLETED 终态的持久化与收尾副作用，正常执行与恢复执行共用。
      *
-     * <p>resumeContext 为空表示正常执行：直接附加可观测摘要并更新终态快照，
-     * 副作用异常向上传播，由外层统一失败出口处理。resumeContext 非空表示恢复执行：
-     * 先预生成可观测候选项，再按恢复租约做条件更新（数据库未接受写入时返回 false，
-     * 保留恢复锚点供重试），写入成功后提交可观测；副作用降级为尽力而为——终态已
-     * 持久化，收尾动作失败不应把结果伪装成可重试。</p>
+     * <p>两条执行路径共用同一个提交点语义：终态快照成功写入数据库，本次 Run 就算已提交；
+     * 之后的收尾动作（调度完成计数、Redis 控制状态、事件、assistant 消息、结算、终态广播）
+     * 全部是尽力而为——失败只记录告警、不再向外传播，避免外层失败出口把已提交的结果改写成失败。</p>
+     *
+     * <p>resumeContext 为空表示正常执行：直接附加可观测摘要并更新终态快照；数据库没有
+     * 接受写入（updateSnapshot 的条件只有 id 与 user_id，写不进说明这行对当前用户已不可见）
+     * 时记录告警并返回 false，不广播终态。resumeContext 非空表示恢复执行：先预生成可观测
+     * 候选项，再按恢复租约做条件更新（数据库未接受写入时返回 false，保留恢复锚点供重试），
+     * 写入成功后提交可观测。</p>
      */
     private boolean persistCompletedOutcome(AgentRun run,
                                             String userGoal,
@@ -708,16 +712,23 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 runId, buildSnapshot(userGoal, result, AgentRunStatus.COMPLETED), AgentRunStatus.COMPLETED, null, null);
         int completedRows = runMapper.updateSnapshot(
                 runId, userId, AgentRunStatus.COMPLETED, snapshot, true, null);
-        if (completedRows == 1) {
-            recordSchedulerCompletion(AgentRunStatus.COMPLETED);
+        if (completedRows != 1) {
+            log.warn("Completed snapshot was not persisted for run={} rows={}", runId, completedRows);
+            return false;
         }
-        appendCompletedSideEffects(runId, userId, stageModels, result, false);
+        recordSchedulerCompletion(AgentRunStatus.COMPLETED);
+        try {
+            appendCompletedSideEffects(runId, userId, stageModels, result, false);
+        } catch (Exception sideEffect) {
+            log.warn("Completed side effect failed after durable snapshot run={}: {}",
+                    runId, sideEffect.getMessage());
+        }
         return true;
     }
 
     /**
      * PARTIAL（部分完成）终态的持久化与收尾副作用，正常执行与恢复执行共用，
-     * 持久化两条路径的划分与 {@link #persistCompletedOutcome} 相同。
+     * 持久化两条路径的划分与提交点语义同 {@link #persistCompletedOutcome}。
      */
     private boolean persistPartialOutcome(AgentRun run,
                                           String userGoal,
@@ -750,10 +761,17 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 result.getFailureReason());
         int partialRows = runMapper.updateSnapshot(
                 runId, userId, AgentRunStatus.PARTIAL, snapshot, true, result.getFailureReason());
-        if (partialRows == 1) {
-            recordSchedulerCompletion(AgentRunStatus.PARTIAL);
+        if (partialRows != 1) {
+            log.warn("Partial snapshot was not persisted for run={} rows={}", runId, partialRows);
+            return false;
         }
-        appendPartialSideEffects(runId, userId, stageModels, result, false);
+        recordSchedulerCompletion(AgentRunStatus.PARTIAL);
+        try {
+            appendPartialSideEffects(runId, userId, stageModels, result, false);
+        } catch (Exception sideEffect) {
+            log.warn("Partial side effect failed after durable snapshot run={}: {}",
+                    runId, sideEffect.getMessage());
+        }
         return true;
     }
 
