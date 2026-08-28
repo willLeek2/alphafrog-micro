@@ -667,8 +667,9 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
      * COMPLETED 终态的持久化与收尾副作用，正常执行与恢复执行共用。
      *
      * <p>两条执行路径共用同一个提交点语义：终态快照成功写入数据库，本次 Run 就算已提交；
-     * 之后的收尾动作（调度完成计数、Redis 控制状态、事件、assistant 消息、结算、终态广播）
-     * 全部是尽力而为——失败只记录告警、不再向外传播，避免外层失败出口把已提交的结果改写成失败。</p>
+     * 之后的收尾动作（Redis 控制状态、事件、assistant 消息、结算、终态广播）全部是尽力而为
+     * ——失败只记录告警、不再向外传播，避免外层失败出口把已提交的结果改写成失败。
+     * 调度完成计数在尽力而为段之前、提交之后立即记录（与恢复路径的位置一致）。</p>
      *
      * <p>resumeContext 为空表示正常执行：直接附加可观测摘要并更新终态快照；数据库没有
      * 接受写入（updateSnapshot 的条件只有 id 与 user_id，写不进说明这行对当前用户已不可见）
