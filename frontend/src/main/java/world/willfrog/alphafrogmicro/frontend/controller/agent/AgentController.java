@@ -1811,6 +1811,9 @@ public class AgentController {
         if (msg.contains("run expired")) {
             return ResponseWrapper.error(ResponseCode.BUSINESS_ERROR, "run 已过期，不能断点续跑，请新建 run");
         }
+        if (msg.contains("use cancel instead")) {
+            return ResponseWrapper.error(ResponseCode.BUSINESS_ERROR, "run 正在等待长工具结果，暂不支持暂停，请改用取消");
+        }
         if (msg.contains("snapshot_version_incompatible")) {
             return ResponseWrapper.error(
                     ResponseCode.BUSINESS_ERROR,
@@ -1834,6 +1837,9 @@ public class AgentController {
         }
         if (msg.contains("run expired")) {
             return ResponseWrapper.error(ResponseCode.BUSINESS_ERROR, "run 已过期，不能断点续跑，请新建 run");
+        }
+        if (msg.contains("use cancel instead")) {
+            return ResponseWrapper.error(ResponseCode.BUSINESS_ERROR, "run 正在等待长工具结果，暂不支持暂停，请改用取消");
         }
         if (msg.contains("snapshot_version_incompatible")) {
             return ResponseWrapper.error(
