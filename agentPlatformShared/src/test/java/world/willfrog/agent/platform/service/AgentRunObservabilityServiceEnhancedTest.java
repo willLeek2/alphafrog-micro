@@ -38,9 +38,9 @@ import org.mockito.ArgumentCaptor;
  * 可观测性增强测试：验证 5.2~5.5 的核心改动。
  */
 @ExtendWith(MockitoExtension.class)
-class AgentObservabilityServiceEnhancedTest {
+class AgentRunObservabilityServiceEnhancedTest {
 
-    private AgentObservabilityService service;
+    private AgentRunObservabilityService service;
     private ObjectMapper objectMapper;
 
     @Mock
@@ -54,7 +54,7 @@ class AgentObservabilityServiceEnhancedTest {
     @BeforeEach
     void setUp() {
         objectMapper = new ObjectMapper();
-        service = new AgentObservabilityService(stateStore, objectMapper, debugFileWriter);
+        service = new AgentRunObservabilityService(stateStore, objectMapper, debugFileWriter);
         ReflectionTestUtils.setField(service, "llmTraceEnabled", true);
         ReflectionTestUtils.setField(service, "llmTraceMaxCalls", 100);
         ReflectionTestUtils.setField(service, "llmTraceMaxTextChars", 20000);
@@ -90,8 +90,8 @@ class AgentObservabilityServiceEnhancedTest {
         service.recordLlmCall("prompt-ordinary", "planning", new TokenUsage(1, 2, 3),
                 10L, 100L, 110L, null, "endpoint-a", "model-a",
                 Map.of("messages", List.of()), "response");
-        AgentObservabilityService.ObservabilityState ordinary = objectMapper.readValue(
-                savedJson.get(), AgentObservabilityService.ObservabilityState.class);
+        AgentRunObservabilityService.ObservabilityState ordinary = objectMapper.readValue(
+                savedJson.get(), AgentRunObservabilityService.ObservabilityState.class);
         assertPromptSelection(ordinary.getDiagnostics().getLlmTraces().get(0));
 
         savedJson.set(null);
@@ -100,12 +100,12 @@ class AgentObservabilityServiceEnhancedTest {
                 "prompt-raw", "execution", new TokenUsage(1, 2, 3), null,
                 10L, 100L, 110L, "endpoint-b", "model-b", null,
                 null, null, null);
-        AgentObservabilityService.ObservabilityState raw = objectMapper.readValue(
-                savedJson.get(), AgentObservabilityService.ObservabilityState.class);
+        AgentRunObservabilityService.ObservabilityState raw = objectMapper.readValue(
+                savedJson.get(), AgentRunObservabilityService.ObservabilityState.class);
         assertPromptSelection(raw.getDiagnostics().getLlmTraces().get(0));
     }
 
-    private static void assertPromptSelection(AgentObservabilityService.LlmTrace trace) {
+    private static void assertPromptSelection(AgentRunObservabilityService.LlmTrace trace) {
         assertEquals("default-v1", trace.getPromptBundleVersion());
         assertEquals("control", trace.getPromptVariant());
         assertEquals("bundle-digest", trace.getPromptBundleDigest());
@@ -131,9 +131,9 @@ class AgentObservabilityServiceEnhancedTest {
                 300L, 100L, 400L, null, null, null,
                 requestSnapshot, responseText);
 
-        AgentObservabilityService.ObservabilityState state =
-                objectMapper.readValue(savedJson.get(), AgentObservabilityService.ObservabilityState.class);
-        AgentObservabilityService.LlmTrace trace = state.getDiagnostics().getLlmTraces().get(0);
+        AgentRunObservabilityService.ObservabilityState state =
+                objectMapper.readValue(savedJson.get(), AgentRunObservabilityService.ObservabilityState.class);
+        AgentRunObservabilityService.LlmTrace trace = state.getDiagnostics().getLlmTraces().get(0);
 
         assertNull(trace.getInputMessages(), "raw inputMessages must not remain in observability trace");
         assertNull(trace.getOutputText(), "raw outputText must not remain in observability trace");
@@ -233,9 +233,9 @@ class AgentObservabilityServiceEnhancedTest {
                 "test-endpoint", "test-model", null,
                 httpRequest, httpResponse, "curl ...");
 
-        AgentObservabilityService.ObservabilityState state =
-                objectMapper.readValue(savedJson.get(), AgentObservabilityService.ObservabilityState.class);
-        AgentObservabilityService.LlmTrace trace = state.getDiagnostics().getLlmTraces().get(0);
+        AgentRunObservabilityService.ObservabilityState state =
+                objectMapper.readValue(savedJson.get(), AgentRunObservabilityService.ObservabilityState.class);
+        AgentRunObservabilityService.LlmTrace trace = state.getDiagnostics().getLlmTraces().get(0);
 
         assertNull(trace.getInputMessages(), "parsed inputMessages must not remain on trace");
         assertNull(trace.getOutputText(), "parsed outputText must not remain on trace");
@@ -275,9 +275,9 @@ class AgentObservabilityServiceEnhancedTest {
                 150L, 0L, 0L, null, null, null,
                 null, "执行搜索操作");
 
-        AgentObservabilityService.ObservabilityState state =
-                objectMapper.readValue(savedJson.get(), AgentObservabilityService.ObservabilityState.class);
-        AgentObservabilityService.LlmTrace trace = state.getDiagnostics().getLlmTraces().get(0);
+        AgentRunObservabilityService.ObservabilityState state =
+                objectMapper.readValue(savedJson.get(), AgentRunObservabilityService.ObservabilityState.class);
+        AgentRunObservabilityService.LlmTrace trace = state.getDiagnostics().getLlmTraces().get(0);
 
         assertEquals("todo_search_index", trace.getTodoId(), "todoId should come from AgentContext");
         assertEquals(1, trace.getTodoSequence(), "todoSequence should come from AgentContext");
@@ -298,9 +298,9 @@ class AgentObservabilityServiceEnhancedTest {
                 "test-endpoint", "test-model", null,
                 null, null, null);
 
-        AgentObservabilityService.ObservabilityState state =
-                objectMapper.readValue(savedJson.get(), AgentObservabilityService.ObservabilityState.class);
-        AgentObservabilityService.LlmTrace trace = state.getDiagnostics().getLlmTraces().get(0);
+        AgentRunObservabilityService.ObservabilityState state =
+                objectMapper.readValue(savedJson.get(), AgentRunObservabilityService.ObservabilityState.class);
+        AgentRunObservabilityService.LlmTrace trace = state.getDiagnostics().getLlmTraces().get(0);
 
         assertEquals("node_parallel_1", trace.getTodoId());
         assertEquals(3, trace.getTodoSequence());
@@ -320,8 +320,8 @@ class AgentObservabilityServiceEnhancedTest {
                 Map.of("query", "512800"), "{\"ok\":true}",
                 50L, true, false, false, null, null, 0, 0, null);
 
-        AgentObservabilityService.ObservabilityState state =
-                objectMapper.readValue(savedJson.get(), AgentObservabilityService.ObservabilityState.class);
+        AgentRunObservabilityService.ObservabilityState state =
+                objectMapper.readValue(savedJson.get(), AgentRunObservabilityService.ObservabilityState.class);
         assertEquals("functions.searchWeb:0", state.getDiagnostics().getToolTraces().get(0).getTraceId());
         AgentContext.clearToolCallId();
     }
@@ -340,9 +340,9 @@ class AgentObservabilityServiceEnhancedTest {
                 Map.of("keyword", "test"), longOutput,
                 100L, true, false, false, null, null, 0, 0, null);
 
-        AgentObservabilityService.ObservabilityState state =
-                objectMapper.readValue(savedJson.get(), AgentObservabilityService.ObservabilityState.class);
-        AgentObservabilityService.ToolTrace trace = state.getDiagnostics().getToolTraces().get(0);
+        AgentRunObservabilityService.ObservabilityState state =
+                objectMapper.readValue(savedJson.get(), AgentRunObservabilityService.ObservabilityState.class);
+        AgentRunObservabilityService.ToolTrace trace = state.getDiagnostics().getToolTraces().get(0);
 
         assertNull(trace.getOutput(), "full output must not remain on observability trace");
         assertNotNull(trace.getOutputPreview(), "safe preview kept on trace index");
@@ -372,9 +372,9 @@ class AgentObservabilityServiceEnhancedTest {
                 Map.of("keyword", "test"), shortOutput,
                 100L, true, false, false, null, null, 0, 0, null);
 
-        AgentObservabilityService.ObservabilityState state =
-                objectMapper.readValue(savedJson.get(), AgentObservabilityService.ObservabilityState.class);
-        AgentObservabilityService.ToolTrace trace = state.getDiagnostics().getToolTraces().get(0);
+        AgentRunObservabilityService.ObservabilityState state =
+                objectMapper.readValue(savedJson.get(), AgentRunObservabilityService.ObservabilityState.class);
+        AgentRunObservabilityService.ToolTrace trace = state.getDiagnostics().getToolTraces().get(0);
 
         assertNull(trace.getOutput(), "full output must not remain on observability trace");
         assertEquals(shortOutput, trace.getOutputPreview(), "short output preview kept on trace index");
@@ -449,7 +449,7 @@ class AgentObservabilityServiceEnhancedTest {
         String persistedSnapshotBeforePreview = savedJson.get();
         clearInvocations(stateStore);
 
-        AgentObservabilityService.TerminalSnapshotCandidate candidate =
+        AgentRunObservabilityService.TerminalSnapshotCandidate candidate =
                 service.prepareTerminalSnapshot(
                         runId,
                         "{\"answer_markdown\":\"failed\"}",
@@ -503,7 +503,7 @@ class AgentObservabilityServiceEnhancedTest {
 
     @Test
     void toolTrace_setOutputPreview_shouldSetPreviewFieldNotOutput() {
-        AgentObservabilityService.ToolTrace trace = new AgentObservabilityService.ToolTrace();
+        AgentRunObservabilityService.ToolTrace trace = new AgentRunObservabilityService.ToolTrace();
         trace.setOutputPreview("test value");
         assertEquals("test value", trace.getOutputPreview());
         assertNull(trace.getOutput());
@@ -522,9 +522,9 @@ class AgentObservabilityServiceEnhancedTest {
                 100L, 0L, 0L, null, null, null,
                 null, "some response");
 
-        AgentObservabilityService.ObservabilityState state =
-                objectMapper.readValue(savedJson.get(), AgentObservabilityService.ObservabilityState.class);
-        AgentObservabilityService.LlmTrace trace = state.getDiagnostics().getLlmTraces().get(0);
+        AgentRunObservabilityService.ObservabilityState state =
+                objectMapper.readValue(savedJson.get(), AgentRunObservabilityService.ObservabilityState.class);
+        AgentRunObservabilityService.LlmTrace trace = state.getDiagnostics().getLlmTraces().get(0);
 
         assertEquals("", trace.getTodoId(), "todoId should be empty when not set");
         assertNull(trace.getTodoSequence(), "todoSequence should be null when not set");

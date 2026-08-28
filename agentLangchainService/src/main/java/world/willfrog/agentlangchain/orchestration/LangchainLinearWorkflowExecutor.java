@@ -4,7 +4,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.config.CodeRefineProperties;
 import world.willfrog.agent.platform.context.AgentContext;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.CodeRefineLocalConfigLoader;
 import world.willfrog.agent.workflow.DatasetRefRegistry;
 import world.willfrog.agent.workflow.TodoItem;
@@ -53,7 +53,7 @@ public class LangchainLinearWorkflowExecutor {
 
     private final LangchainTodoNodeExecutor todoNodeExecutor;
     private final LangchainRunExecutionGuard executionGuard;
-    private final AgentEventService eventService;
+    private final AgentRunEventService eventService;
     private final CodeRefineLocalConfigLoader codeRefineConfigLoader;
     private final CodeRefineProperties startupCodeRefineProperties;
     private final WorkflowResumeValidator resumeValidator = new WorkflowResumeValidator();
@@ -70,7 +70,7 @@ public class LangchainLinearWorkflowExecutor {
     @Autowired
     public LangchainLinearWorkflowExecutor(LangchainTodoNodeExecutor todoNodeExecutor,
                                            LangchainRunExecutionGuard executionGuard,
-                                           AgentEventService eventService,
+                                           AgentRunEventService eventService,
                                            CodeRefineLocalConfigLoader codeRefineConfigLoader,
                                            CodeRefineProperties startupCodeRefineProperties) {
         this.todoNodeExecutor = todoNodeExecutor;
@@ -83,7 +83,7 @@ public class LangchainLinearWorkflowExecutor {
     /** 测试与历史直接构造调用的兼容入口；生产 Spring 必须使用上面的 @Autowired 构造器。 */
     public LangchainLinearWorkflowExecutor(LangchainTodoNodeExecutor todoNodeExecutor,
                                            LangchainRunExecutionGuard executionGuard,
-                                           AgentEventService eventService) {
+                                           AgentRunEventService eventService) {
         this(todoNodeExecutor, executionGuard, eventService,
                 null, new CodeRefineProperties());
     }

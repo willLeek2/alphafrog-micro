@@ -34,7 +34,7 @@ class AgentRunBudgetServiceTest {
     @Mock
     private AgentRunStateStore stateStore;
     @Mock
-    private AgentEventService eventService;
+    private AgentRunEventService eventService;
     @Mock
     private AgentLlmLocalConfigLoader localConfigLoader;
     @Mock

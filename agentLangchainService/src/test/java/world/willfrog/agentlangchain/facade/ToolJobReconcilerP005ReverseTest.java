@@ -23,8 +23,8 @@ import world.willfrog.agent.tools.finance.FinanceResultModelAdapter;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
-import world.willfrog.agent.platform.service.AgentEventService;
-import world.willfrog.agent.platform.service.AgentObservabilityService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
+import world.willfrog.agent.platform.service.AgentRunObservabilityService;
 import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agentlangchain.orchestration.LangchainLinearRunPipeline;
@@ -141,9 +141,9 @@ class ToolJobReconcilerP005ReverseTest {
 
     // Mocked dependencies for LangchainRunControlService
     private LangchainRunReadService readService;
-    private AgentEventService eventService;
+    private AgentRunEventService eventService;
     private AgentRunStateStore stateStore;
-    private AgentObservabilityService observabilityService;
+    private AgentRunObservabilityService observabilityService;
     private LangchainLinearRunPipeline pipeline;
     private AgentRunCreditSettlementService creditSettlementService;
 
@@ -213,9 +213,9 @@ class ToolJobReconcilerP005ReverseTest {
 
         // ---- Mocked dependencies for LangchainRunControlService ----
         readService = mock(LangchainRunReadService.class);
-        eventService = mock(AgentEventService.class);
+        eventService = mock(AgentRunEventService.class);
         stateStore = mock(AgentRunStateStore.class);
-        observabilityService = mock(AgentObservabilityService.class);
+        observabilityService = mock(AgentRunObservabilityService.class);
         pipeline = mock(LangchainLinearRunPipeline.class);
         creditSettlementService = mock(AgentRunCreditSettlementService.class);
 

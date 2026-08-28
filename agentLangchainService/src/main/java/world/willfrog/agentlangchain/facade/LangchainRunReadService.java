@@ -15,10 +15,10 @@ import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentArtifactService;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilityQuery;
 import world.willfrog.agent.platform.service.AgentCreditService;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.AgentMessageService;
 import world.willfrog.agent.platform.service.AgentModelCatalogService;
-import world.willfrog.agent.platform.service.AgentObservabilityService;
+import world.willfrog.agent.platform.service.AgentRunObservabilityService;
 import world.willfrog.agent.platform.service.AgentRunCostService;
 import world.willfrog.agent.platform.service.AgentRunCreditQueryService;
 import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
@@ -98,7 +98,7 @@ import java.util.Map;
  *
  * <h2>读写一致性的范围</h2>
  * langchain 服务和 agent runtime 共享同一套 PG/Redis 存储。事件流目前由
- * {@link AgentEventService} 为普通用户优先从 Redis ZSET 读取，只有 Redis 没有该 run 的事件时才回退 DB；
+ * {@link AgentRunEventService} 为普通用户优先从 Redis ZSET 读取，只有 Redis 没有该 run 的事件时才回退 DB；
  * 管理员诊断读取直接使用 PostgreSQL 权威事件，避免 GET 冲刷 Redis pending 或刷新 TTL。
  * 普通用户读取校验 Run 属于请求用户；管理员诊断读取按 Run ID 校验存在性，并且
  * 不触发下面所述的惰性过期写回。当前没有跨实例的 Run 单写者租约。
@@ -124,9 +124,9 @@ public class LangchainRunReadService {
     private static final Logger log = LoggerFactory.getLogger(LangchainRunReadService.class);
 
     private final AgentRunMapper runMapper;
-    private final AgentEventService agentEventService;
+    private final AgentRunEventService agentEventService;
     private final AgentRunStateStore stateStore;
-    private final AgentObservabilityService agentObservabilityService;
+    private final AgentRunObservabilityService agentObservabilityService;
     private final AgentCreditService creditService;
     private final AgentRunCostService runCostService;
     private final AgentRunCreditQueryService runCreditQueryService;

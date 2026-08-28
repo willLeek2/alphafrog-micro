@@ -66,7 +66,7 @@ class FinanceMethodResolverModelServiceTest {
     private AgentPromptService promptService;
 
     @Mock
-    private AgentObservabilityService observabilityService;
+    private AgentRunObservabilityService observabilityService;
 
     private AgentLlmProperties llmProperties;
 

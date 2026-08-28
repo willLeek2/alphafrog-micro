@@ -9,7 +9,7 @@ import world.willfrog.agent.platform.config.RunStageConfig;
 import world.willfrog.agent.platform.config.StageLlmConfig;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.service.AgentAiServiceFactory;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.AgentLlmResolver;
 import world.willfrog.agent.platform.service.StageConfigResolver;
 import world.willfrog.agent.platform.service.StageConfigValidator;
@@ -29,7 +29,7 @@ import java.util.List;
  *   <li><b>客户端 stage_config_json</b>：用户请求 ext 字段中携带的 per-stage 配置（endpoint/model/maxTokens/temperature 等），
  *       通过 {@link #parseClientStageConfig} 解析；</li>
  *   <li><b>运行时请求参数</b>：用户请求中显式指定的 endpointName / modelName / providerOrder，
- *       通过 {@link AgentEventService#extractEndpointName} / {@link AgentEventService#extractModelName} 提取；</li>
+ *       通过 {@link AgentRunEventService#extractEndpointName} / {@link AgentRunEventService#extractModelName} 提取；</li>
  *   <li><b>Nacos / classpath 默认配置</b>：{@link RunStageConfig} 中定义的 execution / planning / finalAnswer fallback 配置，
  *       由 {@link StageConfigResolver} 解析、{@link StageConfigValidator} 校验。</li>
  * </ol>
@@ -50,7 +50,7 @@ public class LangchainRunStageModelResolver {
     private final StageConfigResolver stageConfigResolver;
     private final StageConfigValidator stageConfigValidator;
     private final AgentAiServiceFactory aiServiceFactory;
-    private final AgentEventService eventService;
+    private final AgentRunEventService eventService;
     private final ObjectMapper objectMapper;
 
     /**

@@ -10,7 +10,7 @@ import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentCreditService;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agentlangchain.orchestration.LangchainLinearRunPipeline;
 import world.willfrog.agentlangchain.orchestration.LangchainRunConcurrencyScheduler;
 import world.willfrog.agentlangchain.orchestration.LangchainRunRejectedException;
@@ -25,11 +25,11 @@ import static org.mockito.Mockito.*;
 class AgentLangchainRunServiceTest {
 
     @Mock
-    private ObjectProvider<AgentEventService> eventServiceProvider;
+    private ObjectProvider<AgentRunEventService> eventServiceProvider;
     @Mock
     private ObjectProvider<LangchainLinearRunPipeline> pipelineProvider;
     @Mock
-    private AgentEventService eventService;
+    private AgentRunEventService eventService;
     @Mock
     private LangchainLinearRunPipeline pipeline;
     @Mock

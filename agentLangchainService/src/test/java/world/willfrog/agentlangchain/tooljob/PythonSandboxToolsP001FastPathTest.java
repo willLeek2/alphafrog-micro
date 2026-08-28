@@ -31,7 +31,7 @@ import world.willfrog.agent.platform.entity.AgentRunEvent;
 import world.willfrog.agent.platform.mapper.AgentRunEventMapper;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 import world.willfrog.agent.platform.service.AgentMessageService;
 import world.willfrog.agent.platform.service.AgentPromptService;
@@ -372,15 +372,15 @@ class PythonSandboxToolsP001FastPathTest {
         assertThat(anchorInPg).isNotNull();
         assertThat(anchorInPg.getOperationId()).isEqualTo(RUN_ID + ":" + TOOL_CALL_ID + ":1");
 
-        // Build real AgentEventService (spy for verification + InOrder)
+        // Build real AgentRunEventService (spy for verification + InOrder)
         AgentLlmLocalConfigLoader llmConfigLoader = mock(AgentLlmLocalConfigLoader.class);
         AgentRunEventRedisStore eventRedisStore = new AgentRunEventRedisStore(
                 redisTemplate, om, llmConfigLoader);
-        AgentEventService realEventService = new AgentEventService(
+        AgentRunEventService realEventService = new AgentRunEventService(
                 newMapper(), newEventMapper(), eventRedisStore, om, redisTemplate,
                 llmConfigLoader, mock(AgentMessageService.class), mock(AgentPromptService.class));
         injectEventServiceFields(realEventService);
-        AgentEventService eventService = spy(realEventService);
+        AgentRunEventService eventService = spy(realEventService);
 
         // Mock ToolRouter — returns fast-path result
         ToolRouter toolRouter = mock(ToolRouter.class);
@@ -438,20 +438,20 @@ class PythonSandboxToolsP001FastPathTest {
         assertThat(afterClear.getResumeState()).isNull();
     }
 
-    private static void injectEventServiceFields(AgentEventService svc) throws Exception {
-        java.lang.reflect.Field ttlField = AgentEventService.class.getDeclaredField("ttlMinutes");
+    private static void injectEventServiceFields(AgentRunEventService svc) throws Exception {
+        java.lang.reflect.Field ttlField = AgentRunEventService.class.getDeclaredField("ttlMinutes");
         ttlField.setAccessible(true);
         ttlField.set(svc, 60);
-        java.lang.reflect.Field ittlField = AgentEventService.class.getDeclaredField("interruptedTtlDays");
+        java.lang.reflect.Field ittlField = AgentRunEventService.class.getDeclaredField("interruptedTtlDays");
         ittlField.setAccessible(true);
         ittlField.set(svc, 7);
-        java.lang.reflect.Field cvField = AgentEventService.class.getDeclaredField("checkpointVersion");
+        java.lang.reflect.Field cvField = AgentRunEventService.class.getDeclaredField("checkpointVersion");
         cvField.setAccessible(true);
         cvField.set(svc, "v1");
-        java.lang.reflect.Field pcField = AgentEventService.class.getDeclaredField("payloadMaxChars");
+        java.lang.reflect.Field pcField = AgentRunEventService.class.getDeclaredField("payloadMaxChars");
         pcField.setAccessible(true);
         pcField.set(svc, 50000);
-        java.lang.reflect.Field ppField = AgentEventService.class.getDeclaredField("payloadPreviewChars");
+        java.lang.reflect.Field ppField = AgentRunEventService.class.getDeclaredField("payloadPreviewChars");
         ppField.setAccessible(true);
         ppField.set(svc, 500);
     }
@@ -483,15 +483,15 @@ class PythonSandboxToolsP001FastPathTest {
             }
         };
 
-        // Real AgentEventService (spy) + real ToolJobEventHookImpl
+        // Real AgentRunEventService (spy) + real ToolJobEventHookImpl
         AgentLlmLocalConfigLoader llmConfigLoader = mock(AgentLlmLocalConfigLoader.class);
         AgentRunEventRedisStore eventRedisStore = new AgentRunEventRedisStore(
                 redisTemplate, om, llmConfigLoader);
-        AgentEventService realEventSvc = new AgentEventService(
+        AgentRunEventService realEventSvc = new AgentRunEventService(
                 newMapper(), newEventMapper(), eventRedisStore, om, redisTemplate,
                 llmConfigLoader, mock(AgentMessageService.class), mock(AgentPromptService.class));
         injectEventServiceFields(realEventSvc);
-        AgentEventService eventServiceSpy = spy(realEventSvc);
+        AgentRunEventService eventServiceSpy = spy(realEventSvc);
 
         // Production ToolJobEventHookImpl with real runMapper + spy eventService
         ToolJobEventHookImpl eventHook = new ToolJobEventHookImpl(newMapper(), eventServiceSpy);
@@ -710,7 +710,7 @@ class PythonSandboxToolsP001FastPathTest {
         // Real event hook for EVENT step
         AgentLlmLocalConfigLoader llmLoader1 = mock(AgentLlmLocalConfigLoader.class);
         AgentRunEventRedisStore eventRedis1 = new AgentRunEventRedisStore(redisTemplate, om, llmLoader1);
-        AgentEventService eventSvc1 = new AgentEventService(
+        AgentRunEventService eventSvc1 = new AgentRunEventService(
                 newMapper(), newEventMapper(), eventRedis1, om, redisTemplate,
                 llmLoader1, mock(AgentMessageService.class), mock(AgentPromptService.class));
         injectEventServiceFields(eventSvc1);
@@ -914,7 +914,7 @@ class PythonSandboxToolsP001FastPathTest {
         AgentLlmLocalConfigLoader llmConfigLoader = mock(AgentLlmLocalConfigLoader.class);
         AgentRunEventRedisStore eventRedisStore = new AgentRunEventRedisStore(
                 redisTemplate, om, llmConfigLoader);
-        AgentEventService eventService = new AgentEventService(
+        AgentRunEventService eventService = new AgentRunEventService(
                 newMapper(), newEventMapper(), eventRedisStore, om, redisTemplate,
                 llmConfigLoader, mock(AgentMessageService.class), mock(AgentPromptService.class));
         injectEventServiceFields(eventService);

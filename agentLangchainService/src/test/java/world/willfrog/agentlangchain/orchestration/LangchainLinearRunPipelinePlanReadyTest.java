@@ -8,7 +8,7 @@ import org.springframework.beans.factory.ObjectProvider;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.service.AgentCreditService;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agent.workflow.PlanExecutionMode;
@@ -93,7 +93,7 @@ class LangchainLinearRunPipelinePlanReadyTest {
     @SuppressWarnings("unchecked")
     void executeRun_shouldFailClosedWhenSuspensionCheckpointIsUnavailable() {
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
-        AgentEventService eventService = mock(AgentEventService.class);
+        AgentRunEventService eventService = mock(AgentRunEventService.class);
         AgentRunStateStore stateStore = mock(AgentRunStateStore.class);
         LangchainRunStageModelResolver stageModelResolver = mock(LangchainRunStageModelResolver.class);
         LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
@@ -108,7 +108,7 @@ class LangchainLinearRunPipelinePlanReadyTest {
                 eq(world.willfrog.agent.platform.model.AgentRunStatus.FAILED),
                 any(), eq(true), eq("tool_job_checkpoint_anchor_missing"))).thenReturn(1);
         when(eventService.isRunnable("run-pending-1", "user-1")).thenReturn(true);
-        when(eventService.extractRunConfig("{}")).thenReturn(AgentEventService.RunConfig.defaults());
+        when(eventService.extractRunConfig("{}")).thenReturn(AgentRunEventService.RunConfig.defaults());
         when(eventService.extractUserGoal("{}")).thenReturn("goal");
         when(stageModelResolver.resolve(run)).thenReturn(new LangchainRunStageModelResolver.StageModels(
                 null, null, null, "openrouter", "kimi", List.of()));
@@ -163,7 +163,7 @@ class LangchainLinearRunPipelinePlanReadyTest {
     @SuppressWarnings("unchecked")
     void executeRun_autoDagWithCodeInterpreterShouldPersistAndExecuteEffectiveDagPlan() throws Exception {
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
-        AgentEventService eventService = mock(AgentEventService.class);
+        AgentRunEventService eventService = mock(AgentRunEventService.class);
         AgentRunStateStore stateStore = mock(AgentRunStateStore.class);
         LangchainRunStageModelResolver stageModelResolver = mock(LangchainRunStageModelResolver.class);
         LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
@@ -182,7 +182,7 @@ class LangchainLinearRunPipelinePlanReadyTest {
         when(eventService.extractEndpointName(run.getExt())).thenReturn("openrouter");
         when(eventService.extractModelName(run.getExt())).thenReturn("kimi");
         when(eventService.extractUserGoal(run.getExt())).thenReturn("goal");
-        when(eventService.extractRunConfig(run.getExt())).thenReturn(AgentEventService.RunConfig.defaults());
+        when(eventService.extractRunConfig(run.getExt())).thenReturn(AgentRunEventService.RunConfig.defaults());
         when(eventService.extractExecutionMode(run.getExt())).thenReturn("AUTO");
         when(stageModelResolver.resolve(run)).thenReturn(new LangchainRunStageModelResolver.StageModels(
                 null, null, null, "openrouter", "kimi", List.of()));
@@ -296,7 +296,7 @@ class LangchainLinearRunPipelinePlanReadyTest {
                                     PlanExecutionMode expectedMode,
                                     boolean expectDag) throws Exception {
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
-        AgentEventService eventService = mock(AgentEventService.class);
+        AgentRunEventService eventService = mock(AgentRunEventService.class);
         AgentRunStateStore stateStore = mock(AgentRunStateStore.class);
         LangchainRunStageModelResolver stageModelResolver = mock(LangchainRunStageModelResolver.class);
         LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
@@ -311,7 +311,7 @@ class LangchainLinearRunPipelinePlanReadyTest {
         when(runMapper.findById(run.getId())).thenReturn(run);
         when(eventService.isRunnable(run.getId(), run.getUserId())).thenReturn(true);
         when(eventService.extractExecutionMode(run.getExt())).thenReturn(requestedMode.name());
-        when(eventService.extractRunConfig(run.getExt())).thenReturn(AgentEventService.RunConfig.defaults());
+        when(eventService.extractRunConfig(run.getExt())).thenReturn(AgentRunEventService.RunConfig.defaults());
         when(stageModelResolver.resolve(run)).thenReturn(new LangchainRunStageModelResolver.StageModels(
                 null, null, null, "openrouter", "kimi", List.of()));
         when(executionGuard.stopReason(run.getId(), run.getUserId())).thenReturn(Optional.empty());

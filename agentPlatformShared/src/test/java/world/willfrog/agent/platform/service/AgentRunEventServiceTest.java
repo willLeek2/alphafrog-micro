@@ -38,7 +38,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
-class AgentEventServiceTest {
+class AgentRunEventServiceTest {
 
     @Mock
     private AgentRunMapper runMapper;
@@ -57,13 +57,13 @@ class AgentEventServiceTest {
     @Mock
     private AgentPromptService mockPromptService;
 
-    private AgentEventService service;
+    private AgentRunEventService service;
     private ObjectMapper objectMapper;
 
     @BeforeEach
     void setUp() {
         objectMapper = new ObjectMapper();
-        service = new AgentEventService(
+        service = new AgentRunEventService(
                 runMapper,
                 eventMapper,
                 eventRedisStore,
@@ -91,7 +91,7 @@ class AgentEventServiceTest {
 
         AgentRunEventRedisStore realRedisStore = new AgentRunEventRedisStore(
                 redisTemplate, objectMapper, llmLocalConfigLoader);
-        AgentEventService realService = new AgentEventService(
+        AgentRunEventService realService = new AgentRunEventService(
                 runMapper,
                 eventMapper,
                 realRedisStore,
@@ -230,7 +230,7 @@ class AgentEventServiceTest {
         ));
         String extJson = objectMapper.writeValueAsString(Map.of("context_json", contextJson));
 
-        AgentEventService.RunConfig config = service.extractRunConfig(extJson);
+        AgentRunEventService.RunConfig config = service.extractRunConfig(extJson);
 
         assertTrue(config.webSearchEnabled());
         assertEquals("exa", config.webSearchConfig().backend());
@@ -247,7 +247,7 @@ class AgentEventServiceTest {
     void extractRunConfig_shouldFallbackToCompatibleDefaultsWhenConfigMissing() throws Exception {
         String extJson = objectMapper.writeValueAsString(Map.of("context_json", "{}"));
 
-        AgentEventService.RunConfig config = service.extractRunConfig(extJson);
+        AgentRunEventService.RunConfig config = service.extractRunConfig(extJson);
 
         assertFalse(config.webSearchEnabled());
         assertTrue(config.codeInterpreterEnabled());
@@ -259,7 +259,7 @@ class AgentEventServiceTest {
     void extractRunConfig_shouldFallbackToDefaultsWhenContextJsonMalformed() throws Exception {
         String extJson = objectMapper.writeValueAsString(Map.of("context_json", "{broken-json"));
 
-        AgentEventService.RunConfig config = service.extractRunConfig(extJson);
+        AgentRunEventService.RunConfig config = service.extractRunConfig(extJson);
 
         assertFalse(config.webSearchEnabled());
         assertTrue(config.codeInterpreterEnabled());

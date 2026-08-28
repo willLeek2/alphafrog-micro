@@ -12,7 +12,7 @@ import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.event.AgentRunFinalizationService;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agentlangchain.orchestration.scheduler.LangchainSchedulerMetrics;
 
 import java.time.OffsetDateTime;
@@ -34,7 +34,7 @@ public class WorkflowStartupRecovery {
 
     private final AgentRunMapper runMapper;
     private final LangchainLinearRunPipeline pipeline;
-    private final AgentEventService eventService;
+    private final AgentRunEventService eventService;
     private final AgentRunFinalizationService finalizationService;
 
     @Autowired(required = false)

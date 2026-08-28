@@ -11,10 +11,10 @@ import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentArtifactService;
 import world.willfrog.agent.platform.service.AgentCreditService;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.AgentMessageService;
 import world.willfrog.agent.platform.service.AgentModelCatalogService;
-import world.willfrog.agent.platform.service.AgentObservabilityService;
+import world.willfrog.agent.platform.service.AgentRunObservabilityService;
 import world.willfrog.agent.platform.service.AgentRunCostService;
 import world.willfrog.agent.platform.service.AgentRunCreditQueryService;
 import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
@@ -44,9 +44,9 @@ import static org.mockito.Mockito.*;
 class LangchainRunReadServiceTest {
 
     private final AgentRunMapper runMapper = mock(AgentRunMapper.class);
-    private final AgentEventService eventService = mock(AgentEventService.class);
+    private final AgentRunEventService eventService = mock(AgentRunEventService.class);
     private final AgentRunStateStore stateStore = mock(AgentRunStateStore.class);
-    private final AgentObservabilityService observabilityService = mock(AgentObservabilityService.class);
+    private final AgentRunObservabilityService observabilityService = mock(AgentRunObservabilityService.class);
     private final AgentCreditService creditService = mock(AgentCreditService.class);
     private final AgentRunCostService runCostService = mock(AgentRunCostService.class);
     private final AgentRunCreditQueryService runCreditQueryService = mock(AgentRunCreditQueryService.class);

@@ -35,7 +35,7 @@ public class SearchEvidenceJudgeService {
     private final AgentAiServiceFactory aiServiceFactory;
     private final SearchEvidenceJudgeModelResolver judgeModelResolver;
     private final JudgeModelSelectorService judgeModelSelectorService;
-    private final AgentObservabilityService observabilityService;
+    private final AgentRunObservabilityService observabilityService;
 
     public JudgeResult judge(String query,
                              List<String> requestedEntities,
@@ -59,7 +59,7 @@ public class SearchEvidenceJudgeService {
             AgentContext.clearLastRecordedLlmTraceId();
             AgentContext.setLlmCallRequestMeta(buildJudgeRequestMeta(
                     selected, safeHits.size(), safeCitations.size()));
-            AgentContext.setPhase(AgentObservabilityService.PHASE_SUMMARIZING);
+            AgentContext.setPhase(AgentRunObservabilityService.PHASE_SUMMARIZING);
             AgentContext.setStage(STAGE);
             ChatResponse response = selected.model().chat(buildMessages(query, requestedEntities, safeHits, safeCitations));
             long durationMs = System.currentTimeMillis() - startedAtMillis;
@@ -160,7 +160,7 @@ public class SearchEvidenceJudgeService {
             requestSnapshot.put("stage", STAGE);
             observabilityService.recordLlmCall(
                     runId,
-                    AgentObservabilityService.PHASE_SUMMARIZING,
+                    AgentRunObservabilityService.PHASE_SUMMARIZING,
                     tokenUsage,
                     durationMs,
                     startedAtMillis,

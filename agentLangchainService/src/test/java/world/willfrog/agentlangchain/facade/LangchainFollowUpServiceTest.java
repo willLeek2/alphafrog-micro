@@ -5,7 +5,7 @@ import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.entity.AgentRunMessage;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.AgentMessageService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agentlangchain.orchestration.LangchainLinearRunPipeline;
@@ -21,7 +21,7 @@ class LangchainFollowUpServiceTest {
 
     private final LangchainRunReadService readService = mock(LangchainRunReadService.class);
     private final AgentRunMapper runMapper = mock(AgentRunMapper.class);
-    private final AgentEventService eventService = mock(AgentEventService.class);
+    private final AgentRunEventService eventService = mock(AgentRunEventService.class);
     private final AgentMessageService messageService = mock(AgentMessageService.class);
     private final AgentRunStateStore stateStore = mock(AgentRunStateStore.class);
     private final LangchainLinearRunPipeline pipeline = mock(LangchainLinearRunPipeline.class);

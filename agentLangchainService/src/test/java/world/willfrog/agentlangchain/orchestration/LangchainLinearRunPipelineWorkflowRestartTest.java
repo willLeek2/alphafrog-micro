@@ -7,7 +7,7 @@ import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.service.AgentCreditService;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agent.workflow.PlanExecutionMode;
@@ -35,7 +35,7 @@ class LangchainLinearRunPipelineWorkflowRestartTest {
     void restartedLinearRunSkipsPlannerAndContinuesFromCheckpoint() throws Exception {
         ObjectMapper objectMapper = new ObjectMapper().findAndRegisterModules();
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
-        AgentEventService events = mock(AgentEventService.class);
+        AgentRunEventService events = mock(AgentRunEventService.class);
         LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
         LangchainLinearWorkflowExecutor linear = mock(LangchainLinearWorkflowExecutor.class);
         LangchainDagWorkflowExecutor dag = mock(LangchainDagWorkflowExecutor.class);
@@ -61,7 +61,7 @@ class LangchainLinearRunPipelineWorkflowRestartTest {
         run.setRestartAttempt(1);
         when(runMapper.findById(run.getId())).thenReturn(run);
         when(events.isRunnable(run.getId(), run.getUserId())).thenReturn(true);
-        when(events.extractRunConfig(run.getExt())).thenReturn(AgentEventService.RunConfig.defaults());
+        when(events.extractRunConfig(run.getExt())).thenReturn(AgentRunEventService.RunConfig.defaults());
         when(models.resolve(run)).thenReturn(new LangchainRunStageModelResolver.StageModels(
                 null, null, null, "endpoint", "model", List.of()));
         when(guard.stopReason(any(), any())).thenReturn(Optional.empty());

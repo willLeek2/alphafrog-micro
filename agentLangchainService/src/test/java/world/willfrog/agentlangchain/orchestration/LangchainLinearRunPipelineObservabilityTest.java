@@ -8,8 +8,8 @@ import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.service.AgentCreditService;
-import world.willfrog.agent.platform.service.AgentEventService;
-import world.willfrog.agent.platform.service.AgentObservabilityService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
+import world.willfrog.agent.platform.service.AgentRunObservabilityService;
 import world.willfrog.agent.platform.service.AgentPromptService;
 import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
 import world.willfrog.agent.platform.debug.DebugObservabilityService;
@@ -42,8 +42,8 @@ class LangchainLinearRunPipelineObservabilityTest {
     @Test
     void executeRun_shouldInitializeObservabilityWithCaptureFlagFromExt() {
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
-        AgentEventService eventService = mock(AgentEventService.class);
-        AgentObservabilityService observabilityService = mock(AgentObservabilityService.class);
+        AgentRunEventService eventService = mock(AgentRunEventService.class);
+        AgentRunObservabilityService observabilityService = mock(AgentRunObservabilityService.class);
         LangchainRunStageModelResolver stageModelResolver = mock(LangchainRunStageModelResolver.class);
 
         AgentRun run = new AgentRun();
@@ -61,12 +61,12 @@ class LangchainLinearRunPipelineObservabilityTest {
         when(eventService.extractEndpointName(run.getExt())).thenReturn("openrouter");
         when(eventService.extractModelName(run.getExt())).thenReturn("kimi-k2.6");
         when(eventService.extractUserGoal(run.getExt())).thenReturn("goal");
-        when(eventService.extractRunConfig(run.getExt())).thenReturn(AgentEventService.RunConfig.defaults());
+        when(eventService.extractRunConfig(run.getExt())).thenReturn(AgentRunEventService.RunConfig.defaults());
         when(stageModelResolver.resolve(run)).thenReturn(new LangchainRunStageModelResolver.StageModels(
                 null, null, null, "openrouter-plan", "kimi-k2.5", List.of()));
 
         @SuppressWarnings("unchecked")
-        ObjectProvider<AgentObservabilityService> observabilityProvider = mock(ObjectProvider.class);
+        ObjectProvider<AgentRunObservabilityService> observabilityProvider = mock(ObjectProvider.class);
         when(observabilityProvider.getIfAvailable()).thenReturn(observabilityService);
 
         @SuppressWarnings("unchecked")
@@ -138,8 +138,8 @@ class LangchainLinearRunPipelineObservabilityTest {
     @Test
     void executeRun_withPromptSelectionMismatch_shouldFailBeforeModelSummaryOrObservabilityInitialization() {
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
-        AgentEventService eventService = mock(AgentEventService.class);
-        AgentObservabilityService observabilityService = mock(AgentObservabilityService.class);
+        AgentRunEventService eventService = mock(AgentRunEventService.class);
+        AgentRunObservabilityService observabilityService = mock(AgentRunObservabilityService.class);
         LangchainRunStageModelResolver stageModelResolver = mock(LangchainRunStageModelResolver.class);
         LangchainFollowUpContextSupport followUpContextSupport = mock(LangchainFollowUpContextSupport.class);
         LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
@@ -159,7 +159,7 @@ class LangchainLinearRunPipelineObservabilityTest {
                 .when(promptService).validatePromptSelection(any());
 
         @SuppressWarnings("unchecked")
-        ObjectProvider<AgentObservabilityService> observabilityProvider = mock(ObjectProvider.class);
+        ObjectProvider<AgentRunObservabilityService> observabilityProvider = mock(ObjectProvider.class);
         when(observabilityProvider.getIfAvailable()).thenReturn(observabilityService);
 
         LangchainLinearRunPipelineImpl pipeline = new LangchainLinearRunPipelineImpl(

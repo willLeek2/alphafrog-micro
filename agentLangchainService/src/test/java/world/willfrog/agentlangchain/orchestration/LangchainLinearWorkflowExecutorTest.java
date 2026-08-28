@@ -7,7 +7,7 @@ import dev.langchain4j.model.chat.response.ChatResponse;
 import org.junit.jupiter.api.Test;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingException;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.workflow.TodoItem;
 import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
 import world.willfrog.agentlangchain.support.LangchainTestFixtures;
@@ -35,7 +35,7 @@ class LangchainLinearWorkflowExecutorTest {
         LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
                 LangchainTestFixtures.todoNodeExecutor(),
                 noopExecutionGuard(),
-                mock(AgentEventService.class)
+                mock(AgentRunEventService.class)
         );
         LangchainTodoPlan plan = LangchainTodoPlan.builder()
                 .items(List.of(
@@ -76,7 +76,7 @@ class LangchainLinearWorkflowExecutorTest {
         LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
                 LangchainTestFixtures.todoNodeExecutor(),
                 noopExecutionGuard(),
-                mock(AgentEventService.class)
+                mock(AgentRunEventService.class)
         );
         LangchainTodoPlan plan = LangchainTodoPlan.builder()
                 .items(List.of(TodoItem.builder().id("todo_1").sequence(1).description("查询").build()))
@@ -105,7 +105,7 @@ class LangchainLinearWorkflowExecutorTest {
         LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
                 LangchainTestFixtures.todoNodeExecutor(),
                 noopExecutionGuard(),
-                mock(AgentEventService.class)
+                mock(AgentRunEventService.class)
         );
         LangchainTodoPlan plan = LangchainTodoPlan.builder()
                 .items(List.of(
@@ -136,7 +136,7 @@ class LangchainLinearWorkflowExecutorTest {
     @Test
     void executePlanned_shouldReturnSuspendedAtCurrentTodo() {
         LangchainTodoNodeExecutor nodeExecutor = mock(LangchainTodoNodeExecutor.class);
-        AgentEventService events = mock(AgentEventService.class);
+        AgentRunEventService events = mock(AgentRunEventService.class);
         ExternalToolJobPendingException pending =
                 new ExternalToolJobPendingException("run-pending", "tc-pending", 3, "pending");
         when(nodeExecutor.execute(any(), any(), any(), any(), any()))

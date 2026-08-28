@@ -9,7 +9,7 @@ import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.config.StressTestProperties;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingException;
-import world.willfrog.agent.platform.service.AgentObservabilityService;
+import world.willfrog.agent.platform.service.AgentRunObservabilityService;
 import world.willfrog.agent.tools.compaction.RereadToolHandler;
 import world.willfrog.agent.tools.docs.LoadToolGuideTool;
 import world.willfrog.agent.tools.dataset.ListMyDataTool;
@@ -62,7 +62,7 @@ class ToolRouterListMyDataRouteTest {
                 mock(FinanceMethodTools.class),
                 mock(LoadToolGuideTool.class), mock(ListMyDataTool.class),
                 new PythonStaticPrecheckService(), llmPropertiesWithStaticPrecheck(false),
-                cacheService, mock(RereadToolHandler.class), mock(AgentObservabilityService.class),
+                cacheService, mock(RereadToolHandler.class), mock(AgentRunObservabilityService.class),
                 new ObjectMapper(), new SimpleMeterRegistry(), new StressTestProperties());
 
         ExternalToolJobPendingException thrown = assertThrows(
@@ -111,7 +111,7 @@ class ToolRouterListMyDataRouteTest {
                 llmPropertiesWithStaticPrecheck(true),
                 cacheService,
                 mock(RereadToolHandler.class),
-                mock(AgentObservabilityService.class),
+                mock(AgentRunObservabilityService.class),
                 new ObjectMapper(),
                 new SimpleMeterRegistry(),
                 new StressTestProperties()
@@ -184,7 +184,7 @@ class ToolRouterListMyDataRouteTest {
                 llmPropertiesWithStaticPrecheck(true),
                 cacheService,
                 mock(RereadToolHandler.class),
-                mock(AgentObservabilityService.class),
+                mock(AgentRunObservabilityService.class),
                 new ObjectMapper(),
                 new SimpleMeterRegistry(),
                 new StressTestProperties()
@@ -259,7 +259,7 @@ class ToolRouterListMyDataRouteTest {
                 llmPropertiesWithStaticPrecheck(true),
                 cacheService,
                 mock(RereadToolHandler.class),
-                mock(AgentObservabilityService.class),
+                mock(AgentRunObservabilityService.class),
                 new ObjectMapper(),
                 new SimpleMeterRegistry(),
                 new StressTestProperties()
@@ -303,7 +303,7 @@ class ToolRouterListMyDataRouteTest {
                 llmPropertiesWithStaticPrecheck(true),
                 mock(ToolResultCacheService.class),
                 mock(RereadToolHandler.class),
-                mock(AgentObservabilityService.class),
+                mock(AgentRunObservabilityService.class),
                 new ObjectMapper(),
                 new SimpleMeterRegistry(),
                 new StressTestProperties()

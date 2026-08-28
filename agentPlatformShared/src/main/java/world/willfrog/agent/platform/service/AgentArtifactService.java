@@ -87,7 +87,7 @@ public class AgentArtifactService {
     /** retention 配置为 <=0（永不过期）时的注册 TTL 兜底：meta TTL 无法表达无限，取一年上界。 */
     private static final long UNLIMITED_TTL_HOURS = 24L * 365L;
 
-    private final AgentEventService eventService;
+    private final AgentRunEventService eventService;
     /** DB event mapper；workspace v0 走 DB，不依赖 Redis 事件流。 */
     private final AgentRunEventMapper agentRunEventMapper;
     private final ObjectMapper objectMapper;

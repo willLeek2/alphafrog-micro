@@ -6,7 +6,7 @@ import org.junit.jupiter.api.Test;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.config.StressTestProperties;
 import world.willfrog.agent.platform.context.AgentContext;
-import world.willfrog.agent.platform.service.AgentObservabilityService;
+import world.willfrog.agent.platform.service.AgentRunObservabilityService;
 import world.willfrog.agent.tools.compaction.RereadToolHandler;
 import world.willfrog.agent.tools.dataset.ListMyDataTool;
 import world.willfrog.agent.tools.docs.LoadToolGuideTool;
@@ -63,7 +63,7 @@ class ToolRouterFinanceMethodRouteTest {
                 llmPropertiesWithStaticPrecheck(true),
                 cacheService,
                 mock(RereadToolHandler.class),
-                mock(AgentObservabilityService.class),
+                mock(AgentRunObservabilityService.class),
                 new ObjectMapper(),
                 new SimpleMeterRegistry(),
                 new StressTestProperties()
@@ -92,7 +92,7 @@ class ToolRouterFinanceMethodRouteTest {
                 llmPropertiesWithStaticPrecheck(true),
                 mock(ToolResultCacheService.class),
                 mock(RereadToolHandler.class),
-                mock(AgentObservabilityService.class),
+                mock(AgentRunObservabilityService.class),
                 new ObjectMapper(),
                 new SimpleMeterRegistry(),
                 new StressTestProperties()

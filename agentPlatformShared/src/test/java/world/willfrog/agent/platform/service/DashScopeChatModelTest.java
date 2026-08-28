@@ -135,7 +135,7 @@ class DashScopeChatModelTest {
     void reportLlmCall_shouldPassLlmCallIdAsTraceIdOverride() {
         AgentContext.clear();
         AgentContext.setRunId("run-dashscope-trace");
-        AgentObservabilityService observabilityService = mock(AgentObservabilityService.class);
+        AgentRunObservabilityService observabilityService = mock(AgentRunObservabilityService.class);
         when(observabilityService.recordLlmCallWithRawHttp(
                 eq("run-dashscope-trace"),
                 anyString(),
@@ -166,7 +166,7 @@ class DashScopeChatModelTest {
                 "dashscope",
                 true,
                 mock(AgentLlmLocalConfigLoader.class),
-                mock(AgentEventService.class),
+                mock(AgentRunEventService.class),
                 mock(LangchainLlmLatencyWindow.class)
         );
 
@@ -249,7 +249,7 @@ class DashScopeChatModelTest {
     void applyRequestFormatting_shouldDisableThinking_whenStructuredOutputEnabledInConfig() {
         AgentContext.clear();
         AgentLlmLocalConfigLoader loader = mockStructuredOutputLoader(null);
-        DashScopeChatModel model = newModel("qwen3.6-max-preview", true, mock(AgentEventService.class), loader);
+        DashScopeChatModel model = newModel("qwen3.6-max-preview", true, mock(AgentRunEventService.class), loader);
         Map<String, Object> request = new LinkedHashMap<>();
         request.put("stream", true);
 
@@ -266,7 +266,7 @@ class DashScopeChatModelTest {
     void applyRequestFormatting_shouldEnableThinking_whenStructuredOutputDisabledInConfig() {
         AgentContext.clear();
         AgentLlmLocalConfigLoader loader = mockStructuredOutputLoader(false);
-        DashScopeChatModel model = newModel("qwen3.6-max-preview", true, mock(AgentEventService.class), loader);
+        DashScopeChatModel model = newModel("qwen3.6-max-preview", true, mock(AgentRunEventService.class), loader);
         Map<String, Object> request = new LinkedHashMap<>();
         request.put("stream", true);
 
@@ -303,7 +303,7 @@ class DashScopeChatModelTest {
         AgentContext.setRunId("run-dashscope-live");
         AgentContext.setUserId("user-1");
         AgentContext.setPhase("planning");
-        AgentEventService eventService = mock(AgentEventService.class);
+        AgentRunEventService eventService = mock(AgentRunEventService.class);
         DashScopeChatModel model = newModel("qwen3.6-flash", true, eventService);
 
         ReflectionTestUtils.invokeMethod(model, "emitLlmCallStarted", "trace-live-1", true);
@@ -358,16 +358,16 @@ class DashScopeChatModelTest {
     }
 
     private DashScopeChatModel newModel(String modelName, boolean enableThinking) {
-        return newModel(modelName, enableThinking, mock(AgentEventService.class));
+        return newModel(modelName, enableThinking, mock(AgentRunEventService.class));
     }
 
-    private DashScopeChatModel newModel(String modelName, boolean enableThinking, AgentEventService eventService) {
+    private DashScopeChatModel newModel(String modelName, boolean enableThinking, AgentRunEventService eventService) {
         return newModel(modelName, enableThinking, eventService, mock(AgentLlmLocalConfigLoader.class));
     }
 
     private DashScopeChatModel newModel(String modelName,
                                         boolean enableThinking,
-                                        AgentEventService eventService,
+                                        AgentRunEventService eventService,
                                         AgentLlmLocalConfigLoader localConfigLoader) {
         return new DashScopeChatModel(
                 new ObjectMapper(),
@@ -377,7 +377,7 @@ class DashScopeChatModelTest {
                 0.6D,
                 1024,
                 mock(RawHttpLogger.class),
-                mock(AgentObservabilityService.class),
+                mock(AgentRunObservabilityService.class),
                 "dashscope",
                 enableThinking,
                 localConfigLoader,

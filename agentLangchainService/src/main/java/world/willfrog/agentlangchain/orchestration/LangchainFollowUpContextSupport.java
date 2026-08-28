@@ -6,7 +6,7 @@ import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.entity.AgentRunMessage;
 import world.willfrog.agent.platform.service.AgentContextCompressor;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.AgentMessageService;
 
 import java.util.List;
@@ -18,7 +18,7 @@ public class LangchainFollowUpContextSupport {
 
     private final AgentMessageService messageService;
     private final AgentContextCompressor contextCompressor;
-    private final AgentEventService eventService;
+    private final AgentRunEventService eventService;
 
     public ExecutionContext resolve(AgentRun run) {
         String runId = run.getId();

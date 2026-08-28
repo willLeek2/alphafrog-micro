@@ -7,7 +7,7 @@ import org.springframework.beans.factory.ObjectProvider;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.service.AgentCreditService;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 import world.willfrog.agent.workflow.TodoItem;
@@ -66,13 +66,13 @@ class LangchainLinearRunPipelineEmptyOutputTest {
 
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
         when(runMapper.findById("run-empty-1")).thenReturn(run);
-        AgentEventService eventService = mock(AgentEventService.class);
+        AgentRunEventService eventService = mock(AgentRunEventService.class);
         when(eventService.isRunnable("run-empty-1", "user-1")).thenReturn(true);
         when(eventService.extractCaptureLlmRequests(run.getExt())).thenReturn(false);
         when(eventService.extractEndpointName(run.getExt())).thenReturn("openrouter");
         when(eventService.extractModelName(run.getExt())).thenReturn("kimi");
         when(eventService.extractUserGoal(run.getExt())).thenReturn("goal");
-        when(eventService.extractRunConfig(run.getExt())).thenReturn(AgentEventService.RunConfig.defaults());
+        when(eventService.extractRunConfig(run.getExt())).thenReturn(AgentRunEventService.RunConfig.defaults());
         LangchainRunStageModelResolver stageModelResolver = mock(LangchainRunStageModelResolver.class);
         when(stageModelResolver.resolve(run)).thenReturn(new LangchainRunStageModelResolver.StageModels(
                 null, null, null, "openrouter", "kimi", List.of()));
@@ -144,13 +144,13 @@ class LangchainLinearRunPipelineEmptyOutputTest {
 
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
         when(runMapper.findById("run-empty-2")).thenReturn(run);
-        AgentEventService eventService = mock(AgentEventService.class);
+        AgentRunEventService eventService = mock(AgentRunEventService.class);
         when(eventService.isRunnable("run-empty-2", "user-1")).thenReturn(true);
         when(eventService.extractCaptureLlmRequests(run.getExt())).thenReturn(false);
         when(eventService.extractEndpointName(run.getExt())).thenReturn("openrouter");
         when(eventService.extractModelName(run.getExt())).thenReturn("kimi");
         when(eventService.extractUserGoal(run.getExt())).thenReturn("goal");
-        when(eventService.extractRunConfig(run.getExt())).thenReturn(AgentEventService.RunConfig.defaults());
+        when(eventService.extractRunConfig(run.getExt())).thenReturn(AgentRunEventService.RunConfig.defaults());
         LangchainRunStageModelResolver stageModelResolver = mock(LangchainRunStageModelResolver.class);
         when(stageModelResolver.resolve(run)).thenReturn(new LangchainRunStageModelResolver.StageModels(
                 null, null, null, "openrouter", "kimi", List.of()));
@@ -199,7 +199,7 @@ class LangchainLinearRunPipelineEmptyOutputTest {
     private static LangchainLinearRunPipelineImpl newPipeline(LangchainAiPlanner planner,
                                                               LangchainLinearWorkflowExecutor linear,
                                                               AgentRunMapper runMapper,
-                                                              AgentEventService eventService,
+                                                              AgentRunEventService eventService,
                                                               LangchainRunStageModelResolver stageModelResolver,
                                                               LangchainFollowUpContextSupport followUpContextSupport,
                                                               AgentCreditService creditService) {

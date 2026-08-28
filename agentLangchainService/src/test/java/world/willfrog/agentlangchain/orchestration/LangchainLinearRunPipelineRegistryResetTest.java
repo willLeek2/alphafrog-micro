@@ -6,7 +6,7 @@ import org.springframework.beans.factory.ObjectProvider;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.service.AgentCreditService;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
 import world.willfrog.agentlangchain.failure.LangchainFailureMapper;
 import world.willfrog.agentlangchain.orchestration.dag.LangchainDagWorkflowExecutor;
@@ -51,7 +51,7 @@ class LangchainLinearRunPipelineRegistryResetTest {
     @SuppressWarnings("unchecked")
     private LangchainLinearRunPipelineImpl buildPipeline(ObjectProvider<AgentRunDatasetRegistry> registryProvider) {
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
-        AgentEventService eventService = mock(AgentEventService.class);
+        AgentRunEventService eventService = mock(AgentRunEventService.class);
         LangchainRunStageModelResolver stageModelResolver = mock(LangchainRunStageModelResolver.class);
         LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
         LangchainLinearWorkflowExecutor linear = mock(LangchainLinearWorkflowExecutor.class);
@@ -64,7 +64,7 @@ class LangchainLinearRunPipelineRegistryResetTest {
         when(runMapper.findById(RUN_ID)).thenReturn(run);
         when(eventService.isRunnable(RUN_ID, "u1")).thenReturn(true);
         lenient().when(eventService.extractCaptureLlmRequests(any())).thenReturn(false);
-        lenient().when(eventService.extractRunConfig(any())).thenReturn(AgentEventService.RunConfig.defaults());
+        lenient().when(eventService.extractRunConfig(any())).thenReturn(AgentRunEventService.RunConfig.defaults());
         lenient().when(stageModelResolver.resolve(any())).thenReturn(
                 new LangchainRunStageModelResolver.StageModels(null, null, null, "ep", "model", List.of()));
         when(planner.plan(any())).thenReturn(LangchainTodoPlan.builder()
@@ -169,7 +169,7 @@ class LangchainLinearRunPipelineRegistryResetTest {
     @SuppressWarnings("unchecked")
     private LangchainLinearRunPipelineImpl buildPipelineThrowingPlanner(ObjectProvider<AgentRunDatasetRegistry> registryProvider) {
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
-        AgentEventService eventService = mock(AgentEventService.class);
+        AgentRunEventService eventService = mock(AgentRunEventService.class);
         LangchainRunStageModelResolver stageModelResolver = mock(LangchainRunStageModelResolver.class);
         LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
         LangchainLinearWorkflowExecutor linear = mock(LangchainLinearWorkflowExecutor.class);
@@ -182,7 +182,7 @@ class LangchainLinearRunPipelineRegistryResetTest {
         when(runMapper.findById(RUN_ID)).thenReturn(run);
         when(eventService.isRunnable(RUN_ID, "u1")).thenReturn(true);
         lenient().when(eventService.extractCaptureLlmRequests(any())).thenReturn(false);
-        lenient().when(eventService.extractRunConfig(any())).thenReturn(AgentEventService.RunConfig.defaults());
+        lenient().when(eventService.extractRunConfig(any())).thenReturn(AgentRunEventService.RunConfig.defaults());
         lenient().when(stageModelResolver.resolve(any())).thenReturn(
                 new LangchainRunStageModelResolver.StageModels(null, null, null, "ep", "model", List.of()));
         // 让 planner 抛 RuntimeException → 触发 executeRun 的 catch → 走 finally

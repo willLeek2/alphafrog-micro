@@ -1,7 +1,7 @@
 package world.willfrog.agentlangchain.orchestration;
 
 import lombok.extern.slf4j.Slf4j;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agentlangchain.orchestration.dag.LangchainDagWorkflowExecutor;
 import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
 import world.willfrog.agentlangchain.tooljob.ToolJobCheckpointFailureRecoveryService;
@@ -20,12 +20,12 @@ final class LangchainWorkflowStepCoordinator {
 
     private final LangchainLinearWorkflowExecutor linearExecutor;
     private final LangchainDagWorkflowExecutor dagExecutor;
-    private final AgentEventService eventService;
+    private final AgentRunEventService eventService;
     private final LangchainToolJobCheckpointCoordinator checkpointCoordinator;
 
     LangchainWorkflowStepCoordinator(LangchainLinearWorkflowExecutor linearExecutor,
                                      LangchainDagWorkflowExecutor dagExecutor,
-                                     AgentEventService eventService,
+                                     AgentRunEventService eventService,
                                      LangchainToolJobCheckpointCoordinator checkpointCoordinator) {
         this.linearExecutor = linearExecutor;
         this.dagExecutor = dagExecutor;

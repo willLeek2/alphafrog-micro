@@ -7,7 +7,7 @@ import world.willfrog.agent.platform.config.CodeRefineProperties;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.dataanalysis.CompletedTodoRecord;
 import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingException;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.CodeRefineLocalConfigLoader;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 import world.willfrog.agent.workflow.TodoItem;
@@ -29,7 +29,7 @@ class LangchainLinearWorkflowResumeTest {
     void resumeSkipsPriorTodosAndInjectsCurrentResultWithoutExtraToolCall() {
         LangchainTodoNodeExecutor nodeExecutor = mock(LangchainTodoNodeExecutor.class);
         LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
-        AgentEventService events = mock(AgentEventService.class);
+        AgentRunEventService events = mock(AgentRunEventService.class);
         when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
         AtomicReference<String> resumeTokenSeenByNextTodo = new AtomicReference<>();
         AtomicReference<Long> resumeVersionSeenByNextTodo = new AtomicReference<>();
@@ -97,7 +97,7 @@ class LangchainLinearWorkflowResumeTest {
         when(nodeExecutor.writeFinalAnswer(any(), any())).thenReturn("final-answer");
 
         LangchainLinearWorkflowExecutor executor = productionExecutor(
-                nodeExecutor, guard, mock(AgentEventService.class));
+                nodeExecutor, guard, mock(AgentRunEventService.class));
         LangchainTodoPlan plan = LangchainTodoPlan.builder()
                 .executionMode(PlanExecutionMode.LINEAR)
                 .items(List.of(item("todo-1", 1), item("todo-2", 2), item("todo-3", 3)))
@@ -136,7 +136,7 @@ class LangchainLinearWorkflowResumeTest {
         LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
         when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
         LangchainLinearWorkflowExecutor executor = productionExecutor(
-                nodeExecutor, guard, mock(AgentEventService.class));
+                nodeExecutor, guard, mock(AgentRunEventService.class));
         LangchainTodoPlan plan = LangchainTodoPlan.builder()
                 .executionMode(PlanExecutionMode.LINEAR)
                 .items(List.of(item("todo-2", 2), item("todo-3", 3)))
@@ -166,7 +166,7 @@ class LangchainLinearWorkflowResumeTest {
                 .thenReturn(LangchainTodoNodeResult.success("todo-3-output", 6));
         when(nodeExecutor.writeFinalAnswer(any(), any())).thenReturn("final-answer");
         LangchainLinearWorkflowExecutor executor = productionExecutor(
-                nodeExecutor, guard, mock(AgentEventService.class));
+                nodeExecutor, guard, mock(AgentRunEventService.class));
         LangchainTodoPlan plan = LangchainTodoPlan.builder()
                 .executionMode(PlanExecutionMode.LINEAR)
                 .items(List.of(item("todo-2", 2), item("todo-3", 3)))
@@ -224,7 +224,7 @@ class LangchainLinearWorkflowResumeTest {
                                     "run-1", "python-call-2", 1, "second long python pending"));
                 });
         LangchainLinearWorkflowExecutor executor = productionExecutor(
-                nodeExecutor, guard, mock(AgentEventService.class));
+                nodeExecutor, guard, mock(AgentRunEventService.class));
         LangchainTodoPlan plan = LangchainTodoPlan.builder()
                 .executionMode(PlanExecutionMode.LINEAR)
                 .items(List.of(item("todo-1", 1), item("todo-2", 2), item("todo-3", 3)))
@@ -281,7 +281,7 @@ class LangchainLinearWorkflowResumeTest {
         });
         when(nodeExecutor.writeFinalAnswer(any(), any())).thenReturn("final-after-repair");
         LangchainLinearWorkflowExecutor executor = productionExecutor(
-                nodeExecutor, guard, mock(AgentEventService.class));
+                nodeExecutor, guard, mock(AgentRunEventService.class));
         LangchainTodoPlan plan = LangchainTodoPlan.builder()
                 .executionMode(PlanExecutionMode.LINEAR)
                 .items(List.of(item("todo-2", 2)))
@@ -318,7 +318,7 @@ class LangchainLinearWorkflowResumeTest {
                 .thenReturn(LangchainTodoNodeResult.success("repaired-output", 1));
         when(nodeExecutor.writeFinalAnswer(any(), any())).thenReturn("final-after-restart");
         LangchainLinearWorkflowExecutor executor = productionExecutor(
-                nodeExecutor, guard, mock(AgentEventService.class));
+                nodeExecutor, guard, mock(AgentRunEventService.class));
         LangchainTodoPlan plan = LangchainTodoPlan.builder()
                 .executionMode(PlanExecutionMode.LINEAR)
                 .items(List.of(item("todo-2", 2)))
@@ -361,7 +361,7 @@ class LangchainLinearWorkflowResumeTest {
         LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
         when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
         LangchainLinearWorkflowExecutor executor = productionExecutor(
-                nodeExecutor, guard, mock(AgentEventService.class));
+                nodeExecutor, guard, mock(AgentRunEventService.class));
         LangchainTodoPlan plan = LangchainTodoPlan.builder()
                 .executionMode(PlanExecutionMode.LINEAR)
                 .items(List.of(item("todo-2", 2)))
@@ -394,7 +394,7 @@ class LangchainLinearWorkflowResumeTest {
         LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
         when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
         LangchainLinearWorkflowExecutor executor = productionExecutor(
-                nodeExecutor, guard, mock(AgentEventService.class));
+                nodeExecutor, guard, mock(AgentRunEventService.class));
         LangchainTodoPlan plan = LangchainTodoPlan.builder()
                 .executionMode(PlanExecutionMode.LINEAR)
                 .items(List.of(item("todo-2", 2)))
@@ -418,7 +418,7 @@ class LangchainLinearWorkflowResumeTest {
     void hotReloadedMaxAttemptsChangesExhaustionGateWithoutRestart() {
         LangchainTodoNodeExecutor nodeExecutor = mock(LangchainTodoNodeExecutor.class);
         LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
-        AgentEventService events = mock(AgentEventService.class);
+        AgentRunEventService events = mock(AgentRunEventService.class);
         CodeRefineLocalConfigLoader loader = mock(CodeRefineLocalConfigLoader.class);
         CodeRefineProperties startup = attempts(5);
         java.util.concurrent.atomic.AtomicReference<CodeRefineProperties> live =
@@ -460,7 +460,7 @@ class LangchainLinearWorkflowResumeTest {
         when(loader.current()).thenReturn(Optional.of(attempts(0)));
         when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
         LangchainLinearWorkflowExecutor executor = new LangchainLinearWorkflowExecutor(
-                nodeExecutor, guard, mock(AgentEventService.class), loader, attempts(5));
+                nodeExecutor, guard, mock(AgentRunEventService.class), loader, attempts(5));
         ToolJobResumeContext context = failedPythonContext(false, 2);
 
         LangchainLinearWorkflowResult result = executor.resumePlanned(
@@ -477,7 +477,7 @@ class LangchainLinearWorkflowResumeTest {
         LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
         when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
         LangchainLinearWorkflowExecutor executor = productionExecutor(
-                nodeExecutor, guard, mock(AgentEventService.class));
+                nodeExecutor, guard, mock(AgentRunEventService.class));
         LangchainTodoPlan plan = LangchainTodoPlan.builder()
                 .executionMode(PlanExecutionMode.LINEAR)
                 .items(List.of(item("todo-2", 2)))
@@ -535,7 +535,7 @@ class LangchainLinearWorkflowResumeTest {
         LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
         when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
         LangchainLinearWorkflowExecutor executor = productionExecutor(
-                nodeExecutor, guard, mock(AgentEventService.class));
+                nodeExecutor, guard, mock(AgentRunEventService.class));
         ToolJobResumeContext context = failedPythonContext(true, 1);
         context.setTerminalExitReason(exitReason);
         context.setPythonRepairExhausted(exhausted);
@@ -557,7 +557,7 @@ class LangchainLinearWorkflowResumeTest {
     private static LangchainLinearWorkflowExecutor productionExecutor(
             LangchainTodoNodeExecutor nodeExecutor,
             LangchainRunExecutionGuard guard,
-            AgentEventService events) {
+            AgentRunEventService events) {
         CodeRefineLocalConfigLoader loader = mock(CodeRefineLocalConfigLoader.class);
         when(loader.current()).thenReturn(Optional.empty());
         return new LangchainLinearWorkflowExecutor(

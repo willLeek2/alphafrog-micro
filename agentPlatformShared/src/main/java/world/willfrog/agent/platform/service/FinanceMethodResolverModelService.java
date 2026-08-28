@@ -57,7 +57,7 @@ public class FinanceMethodResolverModelService implements FinanceMethodResolverC
     private final AgentAiServiceFactory aiServiceFactory;
     private final FinanceMethodResolverModelResolver resolverModelResolver;
     private final AgentPromptService promptService;
-    private final AgentObservabilityService observabilityService;
+    private final AgentRunObservabilityService observabilityService;
 
     @Override
     public ResolverResult resolve(String query, String context, String catalogFragment) {

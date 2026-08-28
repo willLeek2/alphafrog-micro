@@ -7,7 +7,7 @@ import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.event.AgentRunFinalizationService;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agentlangchain.orchestration.scheduler.LangchainSchedulerMetrics;
 
 import static org.mockito.ArgumentMatchers.anyMap;
@@ -21,7 +21,7 @@ class WorkflowStartupRecoveryTest {
 
     private AgentRunMapper runMapper;
     private LangchainLinearRunPipeline pipeline;
-    private AgentEventService eventService;
+    private AgentRunEventService eventService;
     private AgentRunFinalizationService finalizationService;
     private LangchainSchedulerMetrics schedulerMetrics;
     private WorkflowStartupRecovery recovery;
@@ -30,7 +30,7 @@ class WorkflowStartupRecoveryTest {
     void setUp() {
         runMapper = mock(AgentRunMapper.class);
         pipeline = mock(LangchainLinearRunPipeline.class);
-        eventService = mock(AgentEventService.class);
+        eventService = mock(AgentRunEventService.class);
         finalizationService = mock(AgentRunFinalizationService.class);
         schedulerMetrics = mock(LangchainSchedulerMetrics.class);
         recovery = new WorkflowStartupRecovery(runMapper, pipeline, eventService, finalizationService);

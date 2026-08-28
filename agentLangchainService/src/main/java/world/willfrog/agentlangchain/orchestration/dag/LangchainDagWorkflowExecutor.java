@@ -6,7 +6,7 @@ import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.context.AgentContext;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.AgentPromptService;
 import world.willfrog.agent.workflow.TodoItem;
 import world.willfrog.agent.workflow.TodoStatus;
@@ -84,7 +84,7 @@ public class LangchainDagWorkflowExecutor {
 
     private final LangchainTodoNodeExecutor todoNodeExecutor;
     private final LangchainDagStateRecorder stateRecorder;
-    private final AgentEventService eventService;
+    private final AgentRunEventService eventService;
     private final LangchainRunExecutionGuard executionGuard;
     private final AgentPromptService promptService;
     private final ObjectMapper objectMapper;

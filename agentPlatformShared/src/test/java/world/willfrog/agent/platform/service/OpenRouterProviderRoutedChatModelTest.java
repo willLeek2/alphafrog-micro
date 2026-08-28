@@ -45,7 +45,7 @@ class OpenRouterProviderRoutedChatModelTest {
         AgentContext.setPhase("execution");
         AgentContext.setTodoContext("todo-1", 2);
         AgentContext.setWorkflow("dag");
-        AgentEventService eventService = mock(AgentEventService.class);
+        AgentRunEventService eventService = mock(AgentRunEventService.class);
         OpenRouterProviderRoutedChatModel model = new OpenRouterProviderRoutedChatModel(
                 new ObjectMapper(),
                 "https://openrouter.ai/api/v1",
@@ -56,7 +56,7 @@ class OpenRouterProviderRoutedChatModelTest {
                 1024,
                 List.of("fireworks"),
                 mock(RawHttpLogger.class),
-                mock(AgentObservabilityService.class),
+                mock(AgentRunObservabilityService.class),
                 mock(OpenRouterCostService.class),
                 eventService,
                 "openrouter",
@@ -146,7 +146,7 @@ class OpenRouterProviderRoutedChatModelTest {
         OpenRouterProviderRoutedChatModel.applyStreamingOptions(
                 payload,
                 "https://openrouter.ai/api/v1",
-                AgentObservabilityService.PHASE_PLANNING
+                AgentRunObservabilityService.PHASE_PLANNING
         );
 
         assertFalse(payload.containsKey("stream_options"));

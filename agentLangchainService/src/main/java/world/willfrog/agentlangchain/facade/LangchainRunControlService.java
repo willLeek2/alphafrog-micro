@@ -8,8 +8,8 @@ import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.event.AgentRunFinalizationService;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
-import world.willfrog.agent.platform.service.AgentEventService;
-import world.willfrog.agent.platform.service.AgentObservabilityService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
+import world.willfrog.agent.platform.service.AgentRunObservabilityService;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
@@ -53,7 +53,7 @@ import java.util.Map;
  *
  * @see LangchainRunReadService 读路径，提供 requireWritableRun
  * @see LangchainLinearRunPipeline 异步执行入口
- * @see AgentObservabilityService observability 落盘
+ * @see AgentRunObservabilityService observability 落盘
  */
 @Service
 @RequiredArgsConstructor
@@ -62,9 +62,9 @@ public class LangchainRunControlService {
 
     private final LangchainRunReadService runReadService;
     private final AgentRunMapper runMapper;
-    private final AgentEventService agentEventService;
+    private final AgentRunEventService agentEventService;
     private final AgentRunStateStore stateStore;
-    private final AgentObservabilityService agentObservabilityService;
+    private final AgentRunObservabilityService agentObservabilityService;
     private final LangchainLinearRunPipeline pipeline;
     private final AgentRunCreditSettlementService creditSettlementService;
     private final ToolJobAnchorService anchorService;

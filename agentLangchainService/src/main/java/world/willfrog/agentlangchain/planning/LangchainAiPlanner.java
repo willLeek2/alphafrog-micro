@@ -9,7 +9,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.context.AgentContext;
-import world.willfrog.agent.platform.service.AgentObservabilityService;
+import world.willfrog.agent.platform.service.AgentRunObservabilityService;
 import world.willfrog.agent.platform.service.AgentPromptService;
 import world.willfrog.agent.platform.service.ReactConversationContext;
 import world.willfrog.agent.workflow.PlanExecutionMode;
@@ -105,7 +105,7 @@ public class LangchainAiPlanner {
                 : request.getExecutionMode();
         String toolList = buildToolList(request.getToolSpecifications());
 
-        AgentContext.setPhase(AgentObservabilityService.PHASE_PLANNING);
+        AgentContext.setPhase(AgentRunObservabilityService.PHASE_PLANNING);
         String previousStage = AgentContext.getStage();
         AgentContext.StructuredOutputSpec previousSpec = AgentContext.getStructuredOutputSpec();
         try {

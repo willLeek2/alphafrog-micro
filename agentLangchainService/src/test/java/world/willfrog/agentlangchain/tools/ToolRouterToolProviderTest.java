@@ -18,7 +18,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.artifact.ToolOutputRefService;
 import world.willfrog.agent.platform.context.AgentContext;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.SearchEvidenceJudgeService;
 import world.willfrog.agent.tools.compaction.RereadToolHandler;
 import world.willfrog.agent.tools.dataset.DatasetRegistry;
@@ -52,7 +52,7 @@ class ToolRouterToolProviderTest {
     private ToolRouter toolRouter;
 
     @Mock
-    private AgentEventService eventService;
+    private AgentRunEventService eventService;
 
     private ToolRouterToolProvider provider;
 
@@ -129,7 +129,7 @@ class ToolRouterToolProviderTest {
 
     @Test
     void provideTools_shouldHideSubAgentControlsInsideChildPhase() {
-        AgentContext.setPhase(world.willfrog.agent.platform.service.AgentObservabilityService.PHASE_SUB_AGENT);
+        AgentContext.setPhase(world.willfrog.agent.platform.service.AgentRunObservabilityService.PHASE_SUB_AGENT);
 
         ToolProviderResult result = provider.provideTools(request(Map.of()));
         Set<String> toolNames = result.tools().keySet().stream()

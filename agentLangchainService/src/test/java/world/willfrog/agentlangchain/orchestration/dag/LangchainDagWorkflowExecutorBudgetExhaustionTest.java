@@ -9,7 +9,7 @@ import org.mockito.ArgumentCaptor;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.context.AgentContext;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 import world.willfrog.agent.workflow.TodoItem;
 import world.willfrog.agentlangchain.orchestration.LangchainLinearWorkflowRequest;
@@ -53,7 +53,7 @@ import static org.mockito.Mockito.when;
  */
 class LangchainDagWorkflowExecutorBudgetExhaustionTest {
 
-    private AgentEventService eventService;
+    private AgentRunEventService eventService;
     private LangchainTodoNodeExecutor nodeExecutor;
     private world.willfrog.agent.platform.service.AgentPromptService promptService;
     private LangchainDagWorkflowExecutor executor;
@@ -62,7 +62,7 @@ class LangchainDagWorkflowExecutorBudgetExhaustionTest {
     void setUp() {
         AgentContext.setRunId("run-test");
         AgentContext.setUserId("user-test");
-        eventService = mock(AgentEventService.class);
+        eventService = mock(AgentRunEventService.class);
         nodeExecutor = mock(LangchainTodoNodeExecutor.class);
         LangchainDagStateRecorder stateRecorder = mock(LangchainDagStateRecorder.class);
         LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);

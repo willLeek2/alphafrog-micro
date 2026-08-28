@@ -8,7 +8,7 @@ import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
 import world.willfrog.agentlangchain.tooljob.ToolJobCheckpointFailureRecoveryService;
 import world.willfrog.agentlangchain.tooljob.ToolJobCheckpointRequest;
@@ -28,14 +28,14 @@ import java.util.Map;
 final class LangchainToolJobCheckpointCoordinator {
 
     private final AgentRunMapper runMapper;
-    private final AgentEventService eventService;
+    private final AgentRunEventService eventService;
     private final ObjectMapper objectMapper;
     private final ObjectProvider<AgentRunDatasetRegistry> datasetRegistryProvider;
     private final ToolJobCheckpointWriter checkpointWriter;
     private final ToolJobCheckpointFailureRecoveryService failureRecoveryService;
 
     LangchainToolJobCheckpointCoordinator(AgentRunMapper runMapper,
-                                          AgentEventService eventService,
+                                          AgentRunEventService eventService,
                                           ObjectMapper objectMapper,
                                           ObjectProvider<AgentRunDatasetRegistry> datasetRegistryProvider,
                                           ToolJobCheckpointWriter checkpointWriter,

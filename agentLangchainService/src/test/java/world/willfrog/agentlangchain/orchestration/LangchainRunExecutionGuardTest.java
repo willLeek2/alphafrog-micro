@@ -5,7 +5,7 @@ import org.springframework.beans.factory.ObjectProvider;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
 
 import java.util.Optional;
@@ -20,7 +20,7 @@ class LangchainRunExecutionGuardTest {
     @Test
     void stopReasonReturnsRedisCancelingBeforeDbStillRunnable() {
         AgentRunStateStore stateStore = mock(AgentRunStateStore.class);
-        AgentEventService eventService = mock(AgentEventService.class);
+        AgentRunEventService eventService = mock(AgentRunEventService.class);
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
         @SuppressWarnings("unchecked")
         ObjectProvider<AgentRunStateStore> provider = mock(ObjectProvider.class);
@@ -36,7 +36,7 @@ class LangchainRunExecutionGuardTest {
     @Test
     void stopReasonReturnsDbWaitingWhenNotRunnable() {
         AgentRunStateStore stateStore = mock(AgentRunStateStore.class);
-        AgentEventService eventService = mock(AgentEventService.class);
+        AgentRunEventService eventService = mock(AgentRunEventService.class);
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
         @SuppressWarnings("unchecked")
         ObjectProvider<AgentRunStateStore> provider = mock(ObjectProvider.class);

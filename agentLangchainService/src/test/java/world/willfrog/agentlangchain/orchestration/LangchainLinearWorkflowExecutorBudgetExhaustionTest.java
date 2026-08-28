@@ -6,7 +6,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import world.willfrog.agent.platform.context.AgentContext;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.workflow.TodoItem;
 import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
 
@@ -41,13 +41,13 @@ import static org.mockito.Mockito.when;
  */
 class LangchainLinearWorkflowExecutorBudgetExhaustionTest {
 
-    private AgentEventService eventService;
+    private AgentRunEventService eventService;
     private LangchainTodoNodeExecutor todoNodeExecutor;
     private LangchainLinearWorkflowExecutor executor;
 
     @BeforeEach
     void setUp() {
-        eventService = mock(AgentEventService.class);
+        eventService = mock(AgentRunEventService.class);
         todoNodeExecutor = mock(LangchainTodoNodeExecutor.class);
         AgentContext.setRunId("run-test");
         AgentContext.setUserId("user-test");

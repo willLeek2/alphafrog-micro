@@ -38,20 +38,20 @@ class LangchainLinearRunPipelineResumeTest {
         LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
         LangchainLinearWorkflowExecutor linear = mock(LangchainLinearWorkflowExecutor.class);
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
-        AgentEventService events = mock(AgentEventService.class);
+        AgentRunEventService events = mock(AgentRunEventService.class);
         LangchainRunStageModelResolver stageModels = mock(LangchainRunStageModelResolver.class);
         LangchainRunExecutionGuard guard = mock(LangchainRunExecutionGuard.class);
         LangchainFollowUpContextSupport followUp = mock(LangchainFollowUpContextSupport.class);
         AgentMessageService messageService = mock(AgentMessageService.class);
-        AgentObservabilityService observabilityService = mock(AgentObservabilityService.class);
-        ObjectProvider<AgentObservabilityService> observabilityProvider = mock(ObjectProvider.class);
+        AgentRunObservabilityService observabilityService = mock(AgentRunObservabilityService.class);
+        ObjectProvider<AgentRunObservabilityService> observabilityProvider = mock(ObjectProvider.class);
         when(observabilityProvider.getIfAvailable()).thenReturn(observabilityService);
         when(observabilityService.prepareTerminalSnapshot(
                 eq("run-1"), anyString(), any(), any(), any()))
                 .thenAnswer(invocation -> {
                     world.willfrog.agent.platform.model.AgentRunStatus status = invocation.getArgument(2);
                     String snapshot = invocation.getArgument(1);
-                    return new AgentObservabilityService.TerminalSnapshotCandidate(
+                    return new AgentRunObservabilityService.TerminalSnapshotCandidate(
                             "run-1", status, snapshot, "{\"status\":\"" + status.name() + "\"}", 1, 1);
                 });
         AgentRunCreditSettlementService settlementService =
@@ -79,7 +79,7 @@ class LangchainLinearRunPipelineResumeTest {
                 any(), any(), eq(true), isNull(), eq("token-1"), eq(3L), eq("owner-1")))
                 .thenReturn(1);
         when(events.isRunnable("run-1", "user-1")).thenReturn(true);
-        when(events.extractRunConfig(anyString())).thenReturn(AgentEventService.RunConfig.defaults());
+        when(events.extractRunConfig(anyString())).thenReturn(AgentRunEventService.RunConfig.defaults());
         ChatModel model = mock(ChatModel.class);
         when(stageModels.resolve(run)).thenReturn(new LangchainRunStageModelResolver.StageModels(
                 model, model, model, "endpoint", "model", List.of()));
