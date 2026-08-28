@@ -7,7 +7,7 @@ import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentCreditService;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
 import world.willfrog.agentlangchain.failure.LangchainFailureMapper;
 import world.willfrog.agentlangchain.orchestration.dag.LangchainDagWorkflowExecutor;
@@ -30,7 +30,7 @@ class LangchainLinearRunPipelineInterruptTest {
     @Test
     void executeRun_shouldNotPersistCompletedWhenStoppedBeforePersist() {
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
-        AgentEventService eventService = mock(AgentEventService.class);
+        AgentRunEventService eventService = mock(AgentRunEventService.class);
         LangchainRunStageModelResolver stageModelResolver = mock(LangchainRunStageModelResolver.class);
         LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
         LangchainLinearWorkflowExecutor linear = mock(LangchainLinearWorkflowExecutor.class);
@@ -43,7 +43,7 @@ class LangchainLinearRunPipelineInterruptTest {
         when(runMapper.findById("r1")).thenReturn(run);
         when(eventService.isRunnable("r1", "u1")).thenReturn(true);
         when(eventService.extractCaptureLlmRequests(any())).thenReturn(false);
-        when(eventService.extractRunConfig(any())).thenReturn(AgentEventService.RunConfig.defaults());
+        when(eventService.extractRunConfig(any())).thenReturn(AgentRunEventService.RunConfig.defaults());
         when(stageModelResolver.resolve(run)).thenReturn(new LangchainRunStageModelResolver.StageModels(
                 null, null, null, "ep", "model", List.of()));
         when(planner.plan(any())).thenReturn(LangchainTodoPlan.builder()

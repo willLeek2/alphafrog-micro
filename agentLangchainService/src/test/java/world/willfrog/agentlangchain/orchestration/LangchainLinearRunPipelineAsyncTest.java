@@ -5,7 +5,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.ObjectProvider;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.service.AgentCreditService;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
 
 import java.util.concurrent.CountDownLatch;
@@ -30,7 +30,7 @@ class LangchainLinearRunPipelineAsyncTest {
                 mock(world.willfrog.agentlangchain.orchestration.dag.LangchainDagWorkflowExecutor.class),
                 mock(LangchainRunStageModelResolver.class),
                 mock(world.willfrog.agent.platform.mapper.AgentRunMapper.class),
-                mock(AgentEventService.class),
+                mock(AgentRunEventService.class),
                 mock(ObjectMapper.class),
                 mock(ObjectProvider.class),
                 mock(ObjectProvider.class),

@@ -20,9 +20,9 @@ import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
-class AgentObservabilityServiceCacheTest {
+class AgentRunObservabilityServiceCacheTest {
 
-    private AgentObservabilityService service;
+    private AgentRunObservabilityService service;
     private ObjectMapper objectMapper;
 
     @Mock
@@ -34,7 +34,7 @@ class AgentObservabilityServiceCacheTest {
     @BeforeEach
     void setUp() {
         objectMapper = new ObjectMapper();
-        service = new AgentObservabilityService(stateStore, objectMapper, debugFileWriter);
+        service = new AgentRunObservabilityService(stateStore, objectMapper, debugFileWriter);
         ReflectionTestUtils.setField(service, "llmTraceEnabled", true);
         ReflectionTestUtils.setField(service, "llmTraceMaxCalls", 100);
         ReflectionTestUtils.setField(service, "llmTraceMaxTextChars", 20000);
@@ -115,8 +115,8 @@ class AgentObservabilityServiceCacheTest {
         assertNotNull(stored);
 
         try {
-            AgentObservabilityService.ObservabilityState state =
-                    objectMapper.readValue(stored, AgentObservabilityService.ObservabilityState.class);
+            AgentRunObservabilityService.ObservabilityState state =
+                    objectMapper.readValue(stored, AgentRunObservabilityService.ObservabilityState.class);
             assertEquals(1300, state.getSummary().getCachedTokens());
             assertEquals(1300, state.getPhases().get("planning").getCachedTokens());
         } catch (Exception e) {
@@ -155,9 +155,9 @@ class AgentObservabilityServiceCacheTest {
         assertNotNull(stored);
 
         try {
-            AgentObservabilityService.ObservabilityState state =
-                    objectMapper.readValue(stored, AgentObservabilityService.ObservabilityState.class);
-            AgentObservabilityService.LlmTrace trace = state.getDiagnostics().getLlmTraces().stream()
+            AgentRunObservabilityService.ObservabilityState state =
+                    objectMapper.readValue(stored, AgentRunObservabilityService.ObservabilityState.class);
+            AgentRunObservabilityService.LlmTrace trace = state.getDiagnostics().getLlmTraces().stream()
                     .filter(t -> traceId.equals(t.getTraceId()))
                     .findFirst()
                     .orElseThrow();
@@ -219,9 +219,9 @@ class AgentObservabilityServiceCacheTest {
         assertNotNull(stored);
 
         try {
-            AgentObservabilityService.ObservabilityState state =
-                    objectMapper.readValue(stored, AgentObservabilityService.ObservabilityState.class);
-            AgentObservabilityService.LlmTrace trace = state.getDiagnostics().getLlmTraces().stream()
+            AgentRunObservabilityService.ObservabilityState state =
+                    objectMapper.readValue(stored, AgentRunObservabilityService.ObservabilityState.class);
+            AgentRunObservabilityService.LlmTrace trace = state.getDiagnostics().getLlmTraces().stream()
                     .filter(t -> traceId.equals(t.getTraceId()))
                     .findFirst()
                     .orElseThrow();
@@ -278,9 +278,9 @@ class AgentObservabilityServiceCacheTest {
 
         assertNotNull(savedJson.get());
         try {
-            AgentObservabilityService.ObservabilityState state =
-                    objectMapper.readValue(savedJson.get(), AgentObservabilityService.ObservabilityState.class);
-            AgentObservabilityService.LlmTrace trace = state.getDiagnostics().getLlmTraces().stream()
+            AgentRunObservabilityService.ObservabilityState state =
+                    objectMapper.readValue(savedJson.get(), AgentRunObservabilityService.ObservabilityState.class);
+            AgentRunObservabilityService.LlmTrace trace = state.getDiagnostics().getLlmTraces().stream()
                     .filter(t -> traceId.equals(t.getTraceId()))
                     .findFirst()
                     .orElseThrow();

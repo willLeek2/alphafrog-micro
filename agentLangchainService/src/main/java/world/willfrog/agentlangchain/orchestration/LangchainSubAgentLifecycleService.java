@@ -11,9 +11,9 @@ import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.entity.AgentRunEvent;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
-import world.willfrog.agent.platform.service.AgentObservabilityService;
+import world.willfrog.agent.platform.service.AgentRunObservabilityService;
 import world.willfrog.agent.platform.service.AgentPromptService;
 import world.willfrog.agent.tools.subagent.SubAgentControlHandler;
 import world.willfrog.agent.workflow.TodoItem;
@@ -65,7 +65,7 @@ public class LangchainSubAgentLifecycleService implements SubAgentControlHandler
 
     private final LangchainTodoNodeExecutor todoExecutor;
     private final LangchainRunExecutionGuard executionGuard;
-    private final AgentEventService eventService;
+    private final AgentRunEventService eventService;
     private final AgentPromptService promptService;
     private final AgentLlmProperties llmProperties;
     private final AgentLlmLocalConfigLoader localConfigLoader;
@@ -95,7 +95,7 @@ public class LangchainSubAgentLifecycleService implements SubAgentControlHandler
     public LangchainSubAgentLifecycleService(
             LangchainTodoNodeExecutor todoExecutor,
             LangchainRunExecutionGuard executionGuard,
-            AgentEventService eventService,
+            AgentRunEventService eventService,
             AgentPromptService promptService,
             AgentLlmProperties llmProperties,
             AgentLlmLocalConfigLoader localConfigLoader,
@@ -126,7 +126,7 @@ public class LangchainSubAgentLifecycleService implements SubAgentControlHandler
         if (!promptService.subAgentEnabled()) {
             return error(SPAWN_TOOL, "SUB_AGENT_DISABLED", "Sub-agent execution is disabled", Map.of());
         }
-        if (AgentObservabilityService.PHASE_SUB_AGENT.equals(AgentContext.getPhase())) {
+        if (AgentRunObservabilityService.PHASE_SUB_AGENT.equals(AgentContext.getPhase())) {
             return error(SPAWN_TOOL, "SUB_AGENT_RECURSION_FORBIDDEN",
                     "A child agent cannot create another child agent", Map.of());
         }
@@ -228,7 +228,7 @@ public class LangchainSubAgentLifecycleService implements SubAgentControlHandler
             return error(WAIT_TOOL, "SUB_AGENT_RUN_CONTEXT_REQUIRED",
                     "Sub-agent wait requires the current run and user context", Map.of());
         }
-        if (AgentObservabilityService.PHASE_SUB_AGENT.equals(AgentContext.getPhase())) {
+        if (AgentRunObservabilityService.PHASE_SUB_AGENT.equals(AgentContext.getPhase())) {
             return error(WAIT_TOOL, "SUB_AGENT_RECURSION_FORBIDDEN",
                     "A child agent cannot wait for child agents", Map.of());
         }
@@ -290,7 +290,7 @@ public class LangchainSubAgentLifecycleService implements SubAgentControlHandler
                           int maxSteps,
                           int maxToolRoundTrips) {
         AgentContext.restoreRunContext(environment.runContext());
-        AgentContext.setPhase(AgentObservabilityService.PHASE_SUB_AGENT);
+        AgentContext.setPhase(AgentRunObservabilityService.PHASE_SUB_AGENT);
         AgentContext.setStage("sub_agent_execution");
         AgentContext.setSubAgentStepIndex(1);
         eventService.appendOnce(handle.runId, handle.userId, RUNNING_EVENT,

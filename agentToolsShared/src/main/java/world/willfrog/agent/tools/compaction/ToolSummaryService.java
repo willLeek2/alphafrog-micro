@@ -13,7 +13,7 @@ import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.service.AgentAiServiceFactory;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 import world.willfrog.agent.platform.service.AgentLlmResolver;
-import world.willfrog.agent.platform.service.AgentObservabilityService;
+import world.willfrog.agent.platform.service.AgentRunObservabilityService;
 
 /**
  * 工具结果摘要 LLM，独立 plain ChatModel，phase=tool_result_summary。
@@ -28,7 +28,7 @@ public class ToolSummaryService {
 
     private final AgentAiServiceFactory aiServiceFactory;
     private final AgentLlmLocalConfigLoader localConfigLoader;
-    private final AgentObservabilityService observabilityService;
+    private final AgentRunObservabilityService observabilityService;
 
     public String summarize(String toolName, String rawOutput, String todoGoal) {
         int attempts = Math.max(0, resolveSummaryMaxRetries()) + 1;

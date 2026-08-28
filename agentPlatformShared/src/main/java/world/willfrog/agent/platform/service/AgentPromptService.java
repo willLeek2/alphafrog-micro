@@ -1007,7 +1007,7 @@ public class AgentPromptService {
      * 数据时效 Prompt 注入。
      *
      * <p>优先级：AgentContext 快照（run 启动时从 ext.data_freshness 反序列化）> Nacos 热加载 > 静态配置。
-     * ext 快照由 {@code AgentEventService.createRun()} 写入、{@code LangchainLinearRunPipelineImpl.executeRun()}
+     * ext 快照由 {@code AgentRunEventService.createRun()} 写入、{@code LangchainLinearRunPipelineImpl.executeRun()}
      * 入口从 ext 解析回 ThreadLocal。快照为 null 时 fallback 到 {@link #currentDataFreshness()}。</p>
      */
     private String dataFreshnessPrompt() {
@@ -1081,7 +1081,7 @@ public class AgentPromptService {
 
     /**
      * 公开的快照方法：返回当前生效的合并后 DataFreshness 的防御性副本。
-     * 调用方（如 {@code AgentEventService.createRun()}）在 run 创建时调用一次，
+     * 调用方（如 {@code AgentRunEventService.createRun()}）在 run 创建时调用一次，
      * 写入 ext JSON 作为该 run 的不可变快照，保证 run 生命周期内数据时效语义稳定。
      *
      * @return 合并后的 DataFreshness 副本，不会随后续 Nacos 热加载变化

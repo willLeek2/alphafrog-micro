@@ -37,7 +37,7 @@ class SearchEvidenceJudgeServiceTest {
     private final AgentAiServiceFactory aiServiceFactory = mock(AgentAiServiceFactory.class);
     private final SearchEvidenceJudgeModelResolver judgeModelResolver = mock(SearchEvidenceJudgeModelResolver.class);
     private final JudgeModelSelectorService selectorService = mock(JudgeModelSelectorService.class);
-    private final AgentObservabilityService observabilityService = mock(AgentObservabilityService.class);
+    private final AgentRunObservabilityService observabilityService = mock(AgentRunObservabilityService.class);
     private final ChatModel model = mock(ChatModel.class);
 
     @AfterEach

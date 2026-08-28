@@ -39,7 +39,7 @@ import java.util.*;
  *       capture-endpoints: [fireworks, openrouter]  # 只捕获这些 endpoint
  * </pre>
  * 
- * @see AgentObservabilityService
+ * @see AgentRunObservabilityService
  * @see OpenRouterProviderRoutedChatModel
  * @since ALP-25
  */

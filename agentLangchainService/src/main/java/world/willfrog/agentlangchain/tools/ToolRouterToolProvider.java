@@ -9,7 +9,7 @@ import dev.langchain4j.service.tool.ToolProviderRequest;
 import dev.langchain4j.service.tool.ToolProviderResult;
 import lombok.RequiredArgsConstructor;
 import world.willfrog.agent.platform.context.AgentContext;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore;
 import world.willfrog.agent.tools.compaction.RereadToolHandler;
 import world.willfrog.agent.tools.dataset.ListMyDataTool;
@@ -26,7 +26,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
-import static world.willfrog.agent.platform.service.AgentObservabilityService.PHASE_SUB_AGENT;
+import static world.willfrog.agent.platform.service.AgentRunObservabilityService.PHASE_SUB_AGENT;
 
 /**
  * LangChain4j（LC4j）{@link ToolProvider} 适配层：把内部 {@link ToolRouter} 工具目录暴露给
@@ -79,7 +79,7 @@ public class ToolRouterToolProvider implements ToolProvider {
      * 事件服务，传递给 {@link ToolRouterToolExecutor} 用于发射 TOOL_CALL_STARTED / TOOL_CALL_FINISHED
      * SSE 事件（经 Redis pub-sub 推送）。
      */
-    private final AgentEventService agentEventService;
+    private final AgentRunEventService agentEventService;
     private final LangchainToolConcurrencyThrottle toolThrottle;
     private final PythonSandboxDispatchStore pythonSandboxDispatchStore;
 

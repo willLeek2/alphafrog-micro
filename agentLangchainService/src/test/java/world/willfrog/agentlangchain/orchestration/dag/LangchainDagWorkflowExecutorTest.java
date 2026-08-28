@@ -3,7 +3,7 @@ package world.willfrog.agentlangchain.orchestration.dag;
 import dev.langchain4j.model.chat.ChatModel;
 import org.junit.jupiter.api.Test;
 import org.springframework.test.util.ReflectionTestUtils;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 import world.willfrog.agent.workflow.TodoItem;
 import world.willfrog.agentlangchain.orchestration.LangchainLinearWorkflowRequest;
@@ -31,7 +31,7 @@ class LangchainDagWorkflowExecutorTest {
     void executePlanned_shouldNotOccupyWorkerWhileWaitingForDependencies() {
         LangchainTodoNodeExecutor nodeExecutor = mock(LangchainTodoNodeExecutor.class);
         LangchainDagStateRecorder stateRecorder = mock(LangchainDagStateRecorder.class);
-        AgentEventService eventService = mock(AgentEventService.class);
+        AgentRunEventService eventService = mock(AgentRunEventService.class);
         LangchainRunExecutionGuard executionGuard = mock(LangchainRunExecutionGuard.class);
         when(executionGuard.stopReason(any(), any())).thenReturn(Optional.empty());
         LangchainDagWorkflowExecutor executor = new LangchainDagWorkflowExecutor(

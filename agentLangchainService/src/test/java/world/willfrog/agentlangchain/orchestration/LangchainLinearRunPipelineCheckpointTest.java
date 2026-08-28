@@ -34,7 +34,7 @@ class LangchainLinearRunPipelineCheckpointTest {
     @SuppressWarnings("unchecked")
     void suspendedPipelineWritesFullDurableCheckpointBeforeReturning() throws Exception {
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
-        AgentEventService events = mock(AgentEventService.class);
+        AgentRunEventService events = mock(AgentRunEventService.class);
         LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
         LangchainLinearWorkflowExecutor linear = mock(LangchainLinearWorkflowExecutor.class);
         LangchainRunStageModelResolver models = mock(LangchainRunStageModelResolver.class);
@@ -62,7 +62,7 @@ class LangchainLinearRunPipelineCheckpointTest {
         anchored.setToolJobAnchorJson(anchor.toJson());
         when(runMapper.findById("run-1")).thenReturn(run, anchored);
         when(events.isRunnable("run-1", "user-1")).thenReturn(true);
-        when(events.extractRunConfig("{}")).thenReturn(AgentEventService.RunConfig.defaults());
+        when(events.extractRunConfig("{}")).thenReturn(AgentRunEventService.RunConfig.defaults());
         when(models.resolve(run)).thenReturn(new LangchainRunStageModelResolver.StageModels(
                 null, null, null, "endpoint", "model", List.of()));
         when(followUp.resolve(run)).thenReturn(new LangchainFollowUpContextSupport.ExecutionContext("goal", ""));
@@ -115,7 +115,7 @@ class LangchainLinearRunPipelineCheckpointTest {
         reset(events);
         when(runMapper.findById("run-1")).thenReturn(run, anchored);
         when(events.isRunnable("run-1", "user-1")).thenReturn(true);
-        when(events.extractRunConfig("{}")).thenReturn(AgentEventService.RunConfig.defaults());
+        when(events.extractRunConfig("{}")).thenReturn(AgentRunEventService.RunConfig.defaults());
         when(writer.captureAndSave(any())).thenReturn(false);
         ToolJobCheckpointFailureRecoveryService recoveryService =
                 mock(ToolJobCheckpointFailureRecoveryService.class);
@@ -147,7 +147,7 @@ class LangchainLinearRunPipelineCheckpointTest {
         newer.setToolJobAnchorJson(newerAnchor.toJson());
         when(runMapper.findById("run-1")).thenReturn(run, anchored, newer);
         when(events.isRunnable("run-1", "user-1")).thenReturn(true);
-        when(events.extractRunConfig("{}")).thenReturn(AgentEventService.RunConfig.defaults());
+        when(events.extractRunConfig("{}")).thenReturn(AgentRunEventService.RunConfig.defaults());
         when(recoveryService.handleFailure(any(ToolJobCheckpointRequest.class)))
                 .thenReturn(ToolJobCheckpointFailureRecoveryService.Outcome.HEALTHY_CHECKPOINT);
         pipeline.executeRun(run);
@@ -161,7 +161,7 @@ class LangchainLinearRunPipelineCheckpointTest {
         clearInvocations(recoveryService);
         when(runMapper.findById("run-1")).thenReturn(run, anchored, anchored);
         when(events.isRunnable("run-1", "user-1")).thenReturn(true);
-        when(events.extractRunConfig("{}")).thenReturn(AgentEventService.RunConfig.defaults());
+        when(events.extractRunConfig("{}")).thenReturn(AgentRunEventService.RunConfig.defaults());
         when(recoveryService.handleFailure(any(ToolJobCheckpointRequest.class)))
                 .thenThrow(new IllegalStateException("conflict"));
         pipeline.executeRun(run);
@@ -174,7 +174,7 @@ class LangchainLinearRunPipelineCheckpointTest {
         clearInvocations(recoveryService);
         when(runMapper.findById("run-1")).thenReturn(run, anchored);
         when(events.isRunnable("run-1", "user-1")).thenReturn(true);
-        when(events.extractRunConfig("{}")).thenReturn(AgentEventService.RunConfig.defaults());
+        when(events.extractRunConfig("{}")).thenReturn(AgentRunEventService.RunConfig.defaults());
         when(recoveryService.handleFailure(any(ToolJobCheckpointRequest.class)))
                 .thenReturn(ToolJobCheckpointFailureRecoveryService.Outcome.FAILURE_OWNED);
         field.set(pipeline, null);
@@ -188,7 +188,7 @@ class LangchainLinearRunPipelineCheckpointTest {
         when(registryProvider.getIfAvailable()).thenReturn(null);
         when(runMapper.findById("run-1")).thenReturn(run, anchored);
         when(events.isRunnable("run-1", "user-1")).thenReturn(true);
-        when(events.extractRunConfig("{}")).thenReturn(AgentEventService.RunConfig.defaults());
+        when(events.extractRunConfig("{}")).thenReturn(AgentRunEventService.RunConfig.defaults());
         pipeline.executeRun(run);
         verify(recoveryService).handleFailure(any(ToolJobCheckpointRequest.class));
 
@@ -201,7 +201,7 @@ class LangchainLinearRunPipelineCheckpointTest {
                 eq(world.willfrog.agent.platform.model.AgentRunStatus.FAILED),
                 any(), eq(true), eq("tool_job_checkpoint_anchor_missing"))).thenReturn(1);
         when(events.isRunnable("run-1", "user-1")).thenReturn(true);
-        when(events.extractRunConfig("{}")).thenReturn(AgentEventService.RunConfig.defaults());
+        when(events.extractRunConfig("{}")).thenReturn(AgentRunEventService.RunConfig.defaults());
         pipeline.executeRun(run);
         verify(runMapper).updateSnapshot(eq("run-1"), eq("user-1"),
                 eq(world.willfrog.agent.platform.model.AgentRunStatus.FAILED),

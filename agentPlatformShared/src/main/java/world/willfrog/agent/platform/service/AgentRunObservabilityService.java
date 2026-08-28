@@ -87,7 +87,7 @@ import java.util.function.Consumer;
 @Service
 @RequiredArgsConstructor
 @Slf4j
-public class AgentObservabilityService {
+public class AgentRunObservabilityService {
 
     /** 阶段常量：规划阶段（生成 Todo Plan） */
     public static final String PHASE_PLANNING = "planning";

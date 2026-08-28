@@ -2,7 +2,7 @@ package world.willfrog.agent.platform.rag;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
-import world.willfrog.agent.platform.service.AgentObservabilityService;
+import world.willfrog.agent.platform.service.AgentRunObservabilityService;
 
 import java.util.List;
 import java.util.Map;
@@ -20,8 +20,8 @@ class RagObservabilityBuilderTest {
     @Test
     @SuppressWarnings("unchecked")
     void build_shouldAggregateRagDetailsRereadModesAndCitationMarkers() {
-        AgentObservabilityService.ToolTrace ragTrace = toolTrace("rag-1", "ragSearch");
-        AgentObservabilityService.ToolTrace rereadTrace = toolTrace("reread-1", "rereadToolResult");
+        AgentRunObservabilityService.ToolTrace ragTrace = toolTrace("rag-1", "ragSearch");
+        AgentRunObservabilityService.ToolTrace rereadTrace = toolTrace("reread-1", "rereadToolResult");
         Map<String, String> details = Map.of(
                 "rag-1", toolDetail(
                         Map.of("query", "alpha"),
@@ -64,7 +64,7 @@ class RagObservabilityBuilderTest {
 
     @Test
     void build_shouldMarkSourceIncompleteWhenDetailBlobMissing() {
-        AgentObservabilityService.ToolTrace ragTrace = toolTrace("missing-1", "ragSearch");
+        AgentRunObservabilityService.ToolTrace ragTrace = toolTrace("missing-1", "ragSearch");
 
         Map<String, Object> result = builder.build(
                 "run-1",
@@ -89,8 +89,8 @@ class RagObservabilityBuilderTest {
         assertTrue(result.isEmpty());
     }
 
-    private AgentObservabilityService.ToolTrace toolTrace(String traceId, String toolName) {
-        AgentObservabilityService.ToolTrace trace = new AgentObservabilityService.ToolTrace();
+    private AgentRunObservabilityService.ToolTrace toolTrace(String traceId, String toolName) {
+        AgentRunObservabilityService.ToolTrace trace = new AgentRunObservabilityService.ToolTrace();
         trace.setTraceId(traceId);
         trace.setToolName(toolName);
         trace.setSuccess(true);

@@ -11,7 +11,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.tools.router.ToolRouter;
 import world.willfrog.agentlangchain.config.LangchainToolConcurrencyThrottle;
 import world.willfrog.agentlangchain.orchestration.ToolThrottleResult;
@@ -40,7 +40,7 @@ class ToolRouterThrottleFinishedContractTest {
     private ToolRouter toolRouter;
 
     @Mock
-    private AgentEventService eventService;
+    private AgentRunEventService eventService;
 
     @Mock
     private PythonSandboxDispatchStore pythonSandboxDispatchStore;

@@ -8,7 +8,7 @@ import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentCreditService;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agentlangchain.orchestration.LangchainLinearRunPipeline;
 import world.willfrog.agentlangchain.orchestration.LangchainRunConcurrencyScheduler;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage;
@@ -25,7 +25,7 @@ public class AgentLangchainRunService {
 
     private static final int ADMIN_USER_TYPE = 1127;
 
-    private final ObjectProvider<AgentEventService> agentEventServiceProvider;
+    private final ObjectProvider<AgentRunEventService> agentEventServiceProvider;
     private final ObjectProvider<LangchainLinearRunPipeline> linearRunPipelineProvider;
     private final LangchainRunConcurrencyScheduler runConcurrencyScheduler;
     private final AgentRunMapper runMapper;
@@ -45,7 +45,7 @@ public class AgentLangchainRunService {
             throw new IllegalStateException("credit 余额不足，无法创建新任务");
         }
 
-        AgentEventService agentEventService = agentEventServiceProvider.getIfAvailable();
+        AgentRunEventService agentEventService = agentEventServiceProvider.getIfAvailable();
         if (agentEventService == null) {
             throw new IllegalStateException("agent_event_service_unavailable");
         }
@@ -103,7 +103,7 @@ public class AgentLangchainRunService {
         return user != null && user.getUserType() != null && user.getUserType() == ADMIN_USER_TYPE;
     }
 
-    private void markEnqueueFailed(AgentEventService agentEventService, AgentRun run, RuntimeException error) {
+    private void markEnqueueFailed(AgentRunEventService agentEventService, AgentRun run, RuntimeException error) {
         try {
             agentEventService.append(run.getId(), run.getUserId(), "RUN_ENQUEUE_FAILED", Map.of(
                     "engine", "agentLangchainService",

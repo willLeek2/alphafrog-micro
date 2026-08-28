@@ -6,7 +6,7 @@ import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
 
 import java.util.Optional;
@@ -24,7 +24,7 @@ import java.util.Optional;
 public class LangchainRunExecutionGuard {
 
     private final ObjectProvider<AgentRunStateStore> stateStoreProvider;
-    private final AgentEventService eventService;
+    private final AgentRunEventService eventService;
     private final AgentRunMapper runMapper;
 
     public boolean shouldStop(String runId, String userId) {

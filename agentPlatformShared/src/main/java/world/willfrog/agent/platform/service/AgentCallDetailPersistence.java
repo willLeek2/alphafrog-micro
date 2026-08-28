@@ -26,7 +26,7 @@ public final class AgentCallDetailPersistence {
         return blob != null && (blob.get("httpRequest") != null || blob.get("httpResponse") != null);
     }
 
-    public static Map<String, Object> toLlmDetailBlob(AgentObservabilityService.LlmTrace trace) {
+    public static Map<String, Object> toLlmDetailBlob(AgentRunObservabilityService.LlmTrace trace) {
         Map<String, Object> blob = new LinkedHashMap<>();
         blob.put("type", "llm");
         blob.put("traceId", trace.getTraceId());
@@ -38,7 +38,7 @@ public final class AgentCallDetailPersistence {
         return blob;
     }
 
-    public static Map<String, Object> toLlmRawContentBlob(String runId, AgentObservabilityService.LlmTrace trace) {
+    public static Map<String, Object> toLlmRawContentBlob(String runId, AgentRunObservabilityService.LlmTrace trace) {
         Map<String, Object> blob = new LinkedHashMap<>();
         blob.put("type", "llm_raw_http");
         blob.put("runId", runId);
@@ -48,7 +48,7 @@ public final class AgentCallDetailPersistence {
         return blob;
     }
 
-    public static Map<String, Object> toToolDetailBlob(AgentObservabilityService.ToolTrace trace) {
+    public static Map<String, Object> toToolDetailBlob(AgentRunObservabilityService.ToolTrace trace) {
         Map<String, Object> blob = new LinkedHashMap<>();
         blob.put("type", "tool");
         blob.put("traceId", trace.getTraceId());
@@ -59,11 +59,11 @@ public final class AgentCallDetailPersistence {
         return blob;
     }
 
-    public static void scrubLlmTrace(AgentObservabilityService.LlmTrace trace) {
+    public static void scrubLlmTrace(AgentRunObservabilityService.LlmTrace trace) {
         scrubLlmTrace(trace, false);
     }
 
-    public static void scrubLlmTrace(AgentObservabilityService.LlmTrace trace, boolean detailBlobStored) {
+    public static void scrubLlmTrace(AgentRunObservabilityService.LlmTrace trace, boolean detailBlobStored) {
         if (trace == null) {
             return;
         }
@@ -81,11 +81,11 @@ public final class AgentCallDetailPersistence {
         trace.setDetailBlobStored(detailBlobStored);
     }
 
-    public static void scrubToolTrace(AgentObservabilityService.ToolTrace trace) {
+    public static void scrubToolTrace(AgentRunObservabilityService.ToolTrace trace) {
         scrubToolTrace(trace, false);
     }
 
-    public static void scrubToolTrace(AgentObservabilityService.ToolTrace trace, boolean detailBlobStored) {
+    public static void scrubToolTrace(AgentRunObservabilityService.ToolTrace trace, boolean detailBlobStored) {
         if (trace == null) {
             return;
         }

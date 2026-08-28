@@ -16,7 +16,7 @@ import world.willfrog.agent.platform.config.StressTestProperties;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingException;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
-import world.willfrog.agent.platform.service.AgentObservabilityService;
+import world.willfrog.agent.platform.service.AgentRunObservabilityService;
 import world.willfrog.agent.platform.service.AgentRunBudgetService;
 import world.willfrog.agent.platform.artifact.RawPayloadLocator;
 import world.willfrog.agent.tools.docs.LoadToolGuideTool;
@@ -76,7 +76,7 @@ import java.util.concurrent.TimeUnit;
  *       run 总额度/总耗时预算是否已用尽。</li>
  *   <li><b>结果缓存</b>：通过 {@link ToolResultCacheService} 对工具结果按 user/run scope
  *       做缓存复用（缺身份时 fail-closed 跳过共享缓存），节省重复调用成本。</li>
- *   <li><b>观测记录</b>：通过 {@link AgentObservabilityService#recordToolCall} 记录每一次
+ *   <li><b>观测记录</b>：通过 {@link AgentRunObservabilityService#recordToolCall} 记录每一次
  *       工具调用 trace（参数、结果摘要、耗时、是否命中缓存等），供 run 观测视图和
  *       safe detail 懒加载使用。</li>
  *   <li><b>并发权重限制</b>：通过 {@link ToolWeightedLimitService} 对批量工具调用按有效权重限流，
@@ -97,7 +97,7 @@ import java.util.concurrent.TimeUnit;
  *
  * @see world.willfrog.agentlangchain.tools.ToolRouterToolExecutor
  * @see ToolResultCacheService
- * @see AgentObservabilityService
+ * @see AgentRunObservabilityService
  */
 @Component
 @RequiredArgsConstructor
@@ -127,7 +127,7 @@ public class ToolRouter {
     /** rawRef 重读工具 */
     private final RereadToolHandler rereadToolHandler;
     /** 观测数据服务，记录每次工具调用的 trace（参数、结果、耗时、缓存元数据等） */
-    private final AgentObservabilityService observabilityService;
+    private final AgentRunObservabilityService observabilityService;
     /** JSON 序列化/反序列化，用于构建标准响应和判断工具成功状态 */
     private final ObjectMapper objectMapper;
     /** Micrometer 指标注册中心，用于按 toolName 标签上报工具调用耗时 */
@@ -289,7 +289,7 @@ public class ToolRouter {
         long durationMs = Math.max(0L, cached.getDurationMs());
         ToolResultCacheService.CacheMeta cacheMeta = cached.getCacheMeta();
         // 记录观测 trace（参数、结果摘要、耗时、缓存命中信息）。
-        // AgentObservabilityService 会把大输出拆到 Redis detail blob，snapshot 中只保留安全索引。
+        // AgentRunObservabilityService 会把大输出拆到 Redis detail blob，snapshot 中只保留安全索引。
         // checkParallelLimits 是工具目录自检，不计入 run 级 tool_calls 预算/统计，也不提供展开详情。
         if (!"checkParallelLimits".equals(toolName)) {
             recordObservability(toolName, params, observabilityResult, durationMs, success, cacheMeta);

@@ -12,7 +12,7 @@ import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisOperationIdentity;
 import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingException;
 import world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.AgentSsePayloadSupport;
 import world.willfrog.agent.workflow.DatasetRefRegistry;
 import world.willfrog.agent.tools.router.ToolRouter;
@@ -70,7 +70,7 @@ final class ToolRouterToolExecutor implements ToolExecutor {
 
     private final ToolRouter toolRouter;
     private final ObjectMapper objectMapper;
-    private final AgentEventService agentEventService;
+    private final AgentRunEventService agentEventService;
     private final LangchainToolConcurrencyThrottle toolThrottle;
     private final PythonSandboxDispatchStore pythonSandboxDispatchStore;
 
@@ -390,7 +390,7 @@ final class ToolRouterToolExecutor implements ToolExecutor {
      * 截断工具输出文本，用于事件 payload 的 result_preview 字段。
      *
      * <p>防止超大结果（如包含数千行的日线数据）直接塞进 SSE 事件体导致 payload 过大。
-     * 完整输出会先由 {@code AgentObservabilityService} 写入 Redis detail blob；
+     * 完整输出会先由 {@code AgentRunObservabilityService} 写入 Redis detail blob；
      * 持久化后的 observability trace 只保留 outputPreview / detailBlobStored 等索引字段，
      * 前端通过 safe detail API 按需读取，过期则返回 expired/unavailable。</p>
      *

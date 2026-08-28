@@ -3,7 +3,7 @@ package world.willfrog.agentlangchain.orchestration;
 import org.junit.jupiter.api.Test;
 import org.springframework.context.annotation.AnnotationConfigApplicationContext;
 import world.willfrog.agent.platform.config.CodeRefineProperties;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.CodeRefineLocalConfigLoader;
 
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -19,7 +19,7 @@ class LangchainLinearWorkflowExecutorSpringContextTest {
                     () -> mock(LangchainTodoNodeExecutor.class));
             context.registerBean(LangchainRunExecutionGuard.class,
                     () -> mock(LangchainRunExecutionGuard.class));
-            context.registerBean(AgentEventService.class, () -> mock(AgentEventService.class));
+            context.registerBean(AgentRunEventService.class, () -> mock(AgentRunEventService.class));
             context.registerBean(CodeRefineLocalConfigLoader.class,
                     () -> mock(CodeRefineLocalConfigLoader.class));
             context.registerBean(CodeRefineProperties.class, CodeRefineProperties::new);

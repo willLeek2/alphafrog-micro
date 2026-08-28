@@ -4,7 +4,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
-import world.willfrog.agent.platform.service.AgentObservabilityService;
+import world.willfrog.agent.platform.service.AgentRunObservabilityService;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -37,7 +37,7 @@ public class RagObservabilityBuilder {
 
     public Map<String, Object> build(String runId,
                                      String finalAnswerText,
-                                     List<AgentObservabilityService.ToolTrace> toolTraces,
+                                     List<AgentRunObservabilityService.ToolTrace> toolTraces,
                                      Function<String, Optional<String>> toolDetailLoader) {
         List<Map<String, Object>> ragToolCalls = new ArrayList<>();
         List<Map<String, Object>> rereadToolCalls = new ArrayList<>();
@@ -47,7 +47,7 @@ public class RagObservabilityBuilder {
         Aggregate aggregate = new Aggregate();
 
         if (toolTraces != null) {
-            for (AgentObservabilityService.ToolTrace trace : toolTraces) {
+            for (AgentRunObservabilityService.ToolTrace trace : toolTraces) {
                 if (trace == null || trace.getToolName() == null) {
                     continue;
                 }
@@ -103,7 +103,7 @@ public class RagObservabilityBuilder {
     }
 
     private Optional<ToolDetail> loadToolDetail(String runId,
-                                                AgentObservabilityService.ToolTrace trace,
+                                                AgentRunObservabilityService.ToolTrace trace,
                                                 Function<String, Optional<String>> toolDetailLoader,
                                                 List<String> sourceIncomplete) {
         if (trace.getTraceId() == null || trace.getTraceId().isBlank() || toolDetailLoader == null) {
@@ -136,7 +136,7 @@ public class RagObservabilityBuilder {
         }
     }
 
-    private void collectRagToolCall(AgentObservabilityService.ToolTrace trace,
+    private void collectRagToolCall(AgentRunObservabilityService.ToolTrace trace,
                                     ToolDetail detail,
                                     LinkedHashSet<String> visibleRefRegistry,
                                     Aggregate aggregate,
@@ -170,7 +170,7 @@ public class RagObservabilityBuilder {
         ragToolCalls.add(call);
     }
 
-    private void collectRereadToolCall(AgentObservabilityService.ToolTrace trace,
+    private void collectRereadToolCall(AgentRunObservabilityService.ToolTrace trace,
                                        ToolDetail detail,
                                        LinkedHashSet<String> rereadModes,
                                        List<Map<String, Object>> rereadToolCalls) {
@@ -209,7 +209,7 @@ public class RagObservabilityBuilder {
         return refs;
     }
 
-    private Map<String, Object> baseCall(AgentObservabilityService.ToolTrace trace) {
+    private Map<String, Object> baseCall(AgentRunObservabilityService.ToolTrace trace) {
         Map<String, Object> call = new LinkedHashMap<>();
         call.put("tool_call_id", nvl(trace.getTraceId()));
         call.put("tool", nvl(trace.getToolName()));
@@ -273,7 +273,7 @@ public class RagObservabilityBuilder {
         return value == null ? "" : value;
     }
 
-    private static String reason(AgentObservabilityService.ToolTrace trace, String reason) {
+    private static String reason(AgentRunObservabilityService.ToolTrace trace, String reason) {
         return nvl(trace.getToolName()) + ":" + nvl(trace.getTraceId()) + ":" + reason;
     }
 

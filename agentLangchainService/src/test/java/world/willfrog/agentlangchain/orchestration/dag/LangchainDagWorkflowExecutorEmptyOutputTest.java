@@ -2,7 +2,7 @@ package world.willfrog.agentlangchain.orchestration.dag;
 
 import org.junit.jupiter.api.Test;
 import org.springframework.test.util.ReflectionTestUtils;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.workflow.TodoItem;
 
 import java.util.LinkedHashMap;
@@ -127,7 +127,7 @@ class LangchainDagWorkflowExecutorEmptyOutputTest {
         return new LangchainDagWorkflowExecutor(
                 mock(world.willfrog.agentlangchain.orchestration.LangchainTodoNodeExecutor.class),
                 mock(LangchainDagStateRecorder.class),
-                mock(AgentEventService.class),
+                mock(AgentRunEventService.class),
                 mock(world.willfrog.agentlangchain.orchestration.LangchainRunExecutionGuard.class),
                 mock(world.willfrog.agent.platform.service.AgentPromptService.class),
                 new com.fasterxml.jackson.databind.ObjectMapper(),

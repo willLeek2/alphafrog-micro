@@ -6,7 +6,7 @@ import org.springframework.beans.factory.ObjectProvider;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.service.AgentCreditService;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 import world.willfrog.agent.workflow.TodoItem;
@@ -31,7 +31,7 @@ class LangchainLinearRunPipelineFailureMappingTest {
     @Test
     void executeRun_shouldEmitBudgetExceededEventWhenMapperSaysSo() {
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
-        AgentEventService eventService = mock(AgentEventService.class);
+        AgentRunEventService eventService = mock(AgentRunEventService.class);
         LangchainRunStageModelResolver stageModelResolver = mock(LangchainRunStageModelResolver.class);
 
         AgentRun run = new AgentRun();
@@ -44,7 +44,7 @@ class LangchainLinearRunPipelineFailureMappingTest {
         when(eventService.extractEndpointName(run.getExt())).thenReturn("openrouter");
         when(eventService.extractModelName(run.getExt())).thenReturn("kimi");
         when(eventService.extractUserGoal(run.getExt())).thenReturn("goal");
-        when(eventService.extractRunConfig(run.getExt())).thenReturn(AgentEventService.RunConfig.defaults());
+        when(eventService.extractRunConfig(run.getExt())).thenReturn(AgentRunEventService.RunConfig.defaults());
         when(stageModelResolver.resolve(run)).thenReturn(new LangchainRunStageModelResolver.StageModels(
                 null, null, null, "openrouter", "kimi", List.of()));
 

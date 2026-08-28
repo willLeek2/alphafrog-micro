@@ -523,7 +523,7 @@ class AgentLlmLocalConfigLoaderTest {
 
         AgentAiServiceFactory aiServiceFactory = org.mockito.Mockito.mock(AgentAiServiceFactory.class);
         FinanceMethodResolverModelResolver modelResolver = org.mockito.Mockito.mock(FinanceMethodResolverModelResolver.class);
-        AgentObservabilityService observability = org.mockito.Mockito.mock(AgentObservabilityService.class);
+        AgentRunObservabilityService observability = org.mockito.Mockito.mock(AgentRunObservabilityService.class);
         dev.langchain4j.model.chat.ChatModel chatModel = org.mockito.Mockito.mock(dev.langchain4j.model.chat.ChatModel.class);
 
         world.willfrog.agent.platform.config.StageLlmConfig stage = new world.willfrog.agent.platform.config.StageLlmConfig();
@@ -1099,7 +1099,7 @@ class AgentLlmLocalConfigLoaderTest {
 
         AgentAiServiceFactory aiServiceFactory = org.mockito.Mockito.mock(AgentAiServiceFactory.class);
         AgentPromptService promptService = org.mockito.Mockito.mock(AgentPromptService.class);
-        AgentObservabilityService observability = org.mockito.Mockito.mock(AgentObservabilityService.class);
+        AgentRunObservabilityService observability = org.mockito.Mockito.mock(AgentRunObservabilityService.class);
         dev.langchain4j.model.chat.ChatModel chatModel = org.mockito.Mockito.mock(dev.langchain4j.model.chat.ChatModel.class);
         org.mockito.Mockito.when(promptService.financeMethodResolverSystemPromptTemplate())
                 .thenReturn("resolver template {{RESOLVER_CATALOG}}");

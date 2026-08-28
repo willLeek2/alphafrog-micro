@@ -58,7 +58,7 @@ import java.util.Map;
  * <ol>
  *   <li><b>Provider 优先级路由</b>：通过 providerOrder 指定优先使用的 Provider</li>
  *   <li><b>原始 HTTP 捕获</b>：完整记录请求/响应信息</li>
- *   <li><b>可观测性上报</b>：将 HTTP 观测数据上报到 AgentObservabilityService</li>
+ *   <li><b>可观测性上报</b>：将 HTTP 观测数据上报到 AgentRunObservabilityService</li>
  *   <li><b>默认流式输出</b>：对 LLM Provider 使用 stream=true，内部聚合 SSE 流</li>
  *   <li><b>实时事件契约</b>：为每次逻辑调用生成 {@code llm_call_id}，并在
  *       {@code LLM_CALL_STARTED/DELTA/FINISHED} 中带上 todo/workflow/stage 归属</li>
@@ -71,7 +71,7 @@ import java.util.Map;
  * 
  * @see AgentAiServiceFactory
  * @see RawHttpLogger
- * @see AgentObservabilityService
+ * @see AgentRunObservabilityService
  * @since ALP-25
  */
 @RequiredArgsConstructor
@@ -97,9 +97,9 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
     
     // ALP-25 新增：HTTP 记录和观测
     private final RawHttpLogger httpLogger;
-    private final AgentObservabilityService observabilityService;
+    private final AgentRunObservabilityService observabilityService;
     private final OpenRouterCostService openRouterCostService;
-    private final AgentEventService eventService;
+    private final AgentRunEventService eventService;
     private final String endpointName;
 
     // Debug 配置加载器（热加载）
@@ -1095,7 +1095,7 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
             requestJsonMap.put("perf_metrics_in_response", true);
             return;
         }
-        if (AgentObservabilityService.PHASE_PLANNING.equals(phase)) {
+        if (AgentRunObservabilityService.PHASE_PLANNING.equals(phase)) {
             requestJsonMap.remove("stream_options");
             requestJsonMap.remove("perf_metrics_in_response");
             return;

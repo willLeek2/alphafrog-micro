@@ -5,8 +5,8 @@ import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.entity.AgentRunEvent;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentCreditService;
-import world.willfrog.agent.platform.service.AgentEventService;
-import world.willfrog.agent.platform.service.AgentObservabilityService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
+import world.willfrog.agent.platform.service.AgentRunObservabilityService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.alphafrogmicro.agent.idl.AgentRunStatusMessage;
 
@@ -17,16 +17,16 @@ import java.util.Map;
 /** 高频 status 查询的只读聚合器；不拥有 Run 权限校验或控制写路径。 */
 final class LangchainRunStatusReadModel {
 
-    private final AgentEventService agentEventService;
+    private final AgentRunEventService agentEventService;
     private final AgentRunStateStore stateStore;
-    private final AgentObservabilityService agentObservabilityService;
+    private final AgentRunObservabilityService agentObservabilityService;
     private final AgentCreditService creditService;
     private final ObjectMapper objectMapper;
     private final LangchainDataAnalysisReadOverlay dataAnalysisOverlay;
 
-    LangchainRunStatusReadModel(AgentEventService agentEventService,
+    LangchainRunStatusReadModel(AgentRunEventService agentEventService,
                                 AgentRunStateStore stateStore,
-                                AgentObservabilityService agentObservabilityService,
+                                AgentRunObservabilityService agentObservabilityService,
                                 AgentCreditService creditService,
                                 ObjectMapper objectMapper,
                                 LangchainDataAnalysisReadOverlay dataAnalysisOverlay) {

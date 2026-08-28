@@ -72,7 +72,7 @@ import java.util.Map;
 public class AgentRunBudgetService {
 
     private final AgentRunStateStore stateStore;
-    private final AgentEventService eventService;
+    private final AgentRunEventService eventService;
     private final ObjectMapper objectMapper;
     private final AgentLlmProperties llmProperties;
     private final AgentPromptService promptService;
@@ -375,7 +375,7 @@ public class AgentRunBudgetService {
 
     /**
      * 从 observability JSON 中加载当前 run 的累计统计（llmCalls / toolCalls / totalTokens / startedAtMillis）。
-     * 数据由 {@code AgentObservabilityService} 在每次 LLM 调用后写入。
+     * 数据由 {@code AgentRunObservabilityService} 在每次 LLM 调用后写入。
      */
     private Map<String, Object> loadSummary(String runId) {
         try {

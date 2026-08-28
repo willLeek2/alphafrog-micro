@@ -12,7 +12,7 @@ import org.mockito.ArgumentCaptor;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.config.StressTestProperties;
 import world.willfrog.agent.platform.context.AgentContext;
-import world.willfrog.agent.platform.service.AgentObservabilityService;
+import world.willfrog.agent.platform.service.AgentRunObservabilityService;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 import world.willfrog.agent.tools.compaction.RereadToolHandler;
 import world.willfrog.agent.tools.dataset.ListMyDataTool;
@@ -48,7 +48,7 @@ import static org.mockito.Mockito.*;
 class ToolRouterThrottleRejectionContractTest {
 
     private final ObjectMapper objectMapper = new ObjectMapper();
-    private AgentObservabilityService observabilityService;
+    private AgentRunObservabilityService observabilityService;
     private SimpleMeterRegistry meterRegistry;
     private ToolResultCacheService cacheService;
 
@@ -56,7 +56,7 @@ class ToolRouterThrottleRejectionContractTest {
     void setUp() {
         AgentContext.setRunId("run-d07-1");
         AgentContext.setUserId("user-d07-1");
-        observabilityService = mock(AgentObservabilityService.class);
+        observabilityService = mock(AgentRunObservabilityService.class);
         meterRegistry = new SimpleMeterRegistry();
         cacheService = mock(ToolResultCacheService.class);
     }

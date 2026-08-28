@@ -10,7 +10,7 @@ import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.entity.AgentRunEvent;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 import world.willfrog.agent.platform.service.AgentPromptService;
 
@@ -45,7 +45,7 @@ class LangchainSubAgentLifecycleServiceTest {
     private ScheduledExecutorService timeoutScheduler;
     private LangchainTodoNodeExecutor todoExecutor;
     private LangchainRunExecutionGuard executionGuard;
-    private AgentEventService eventService;
+    private AgentRunEventService eventService;
     private AgentPromptService promptService;
     private LangchainSubAgentLifecycleService service;
 
@@ -53,7 +53,7 @@ class LangchainSubAgentLifecycleServiceTest {
     void setUp() throws Exception {
         todoExecutor = mock(LangchainTodoNodeExecutor.class);
         executionGuard = mock(LangchainRunExecutionGuard.class);
-        eventService = mock(AgentEventService.class);
+        eventService = mock(AgentRunEventService.class);
         promptService = mock(AgentPromptService.class);
         AgentLlmLocalConfigLoader localConfigLoader = mock(AgentLlmLocalConfigLoader.class);
         AgentLlmProperties llmProperties = new AgentLlmProperties();
@@ -201,7 +201,7 @@ class LangchainSubAgentLifecycleServiceTest {
             assertFalse(foreign.path("ok").asBoolean());
             assertEquals("SUB_AGENT_NOT_FOUND", foreign.path("error").path("code").asText());
 
-            AgentContext.setPhase(world.willfrog.agent.platform.service.AgentObservabilityService.PHASE_SUB_AGENT);
+            AgentContext.setPhase(world.willfrog.agent.platform.service.AgentRunObservabilityService.PHASE_SUB_AGENT);
             JsonNode recursive = json(service.spawn(Map.of("goal", "nested")));
             assertFalse(recursive.path("ok").asBoolean());
             assertEquals("SUB_AGENT_RECURSION_FORBIDDEN",

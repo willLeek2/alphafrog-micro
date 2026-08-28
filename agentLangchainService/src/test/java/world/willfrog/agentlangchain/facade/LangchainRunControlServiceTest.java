@@ -6,8 +6,8 @@ import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.event.AgentRunFinalizationService;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
-import world.willfrog.agent.platform.service.AgentEventService;
-import world.willfrog.agent.platform.service.AgentObservabilityService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
+import world.willfrog.agent.platform.service.AgentRunObservabilityService;
 import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agentlangchain.orchestration.LangchainLinearRunPipeline;
@@ -27,9 +27,9 @@ class LangchainRunControlServiceTest {
 
     private final LangchainRunReadService readService = mock(LangchainRunReadService.class);
     private final AgentRunMapper runMapper = mock(AgentRunMapper.class);
-    private final AgentEventService eventService = mock(AgentEventService.class);
+    private final AgentRunEventService eventService = mock(AgentRunEventService.class);
     private final AgentRunStateStore stateStore = mock(AgentRunStateStore.class);
-    private final AgentObservabilityService observabilityService = mock(AgentObservabilityService.class);
+    private final AgentRunObservabilityService observabilityService = mock(AgentRunObservabilityService.class);
     private final LangchainLinearRunPipeline pipeline = mock(LangchainLinearRunPipeline.class);
     private final AgentRunCreditSettlementService creditSettlementService = mock(AgentRunCreditSettlementService.class);
     private final ToolJobAnchorService anchorService = mock(ToolJobAnchorService.class);

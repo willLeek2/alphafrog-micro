@@ -5,7 +5,7 @@ import org.mockito.ArgumentCaptor;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 
 import java.util.Map;
 
@@ -18,7 +18,7 @@ class ToolJobEventHookImplTest {
     @Test
     void emitsStableLogicalTerminalKeyAndTreatsDuplicateAsSuccess() {
         AgentRunMapper mapper = mock(AgentRunMapper.class);
-        AgentEventService events = mock(AgentEventService.class);
+        AgentRunEventService events = mock(AgentRunEventService.class);
         AgentRun run = new AgentRun();
         run.setId("run-1");
         run.setUserId("user-1");

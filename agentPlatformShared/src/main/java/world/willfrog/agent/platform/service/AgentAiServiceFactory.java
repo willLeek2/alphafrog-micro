@@ -23,9 +23,9 @@ public class AgentAiServiceFactory {
     private final AgentLlmProperties llmProperties;
     private final ObjectMapper objectMapper;
     private final RawHttpLogger httpLogger;
-    private final AgentObservabilityService observabilityService;
+    private final AgentRunObservabilityService observabilityService;
     private final OpenRouterCostService openRouterCostService;
-    private final AgentEventService eventService;
+    private final AgentRunEventService eventService;
     private final AgentLlmLocalConfigLoader localConfigLoader;
     private final LangchainLlmLatencyWindow latencyWindow;
 

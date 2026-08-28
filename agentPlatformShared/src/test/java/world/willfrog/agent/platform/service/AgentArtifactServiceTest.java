@@ -76,7 +76,7 @@ class AgentArtifactServiceTest {
     private static final String RUN_LIST_PREFIX = "agent:persistent-artifact:run-list:";
     private static final String META_PREFIX = "agent:persistent-artifact:";
 
-    private AgentEventService eventService;
+    private AgentRunEventService eventService;
     private AgentRunEventMapper agentRunEventMapper;
 
     private AgentArtifactService service;
@@ -113,7 +113,7 @@ class AgentArtifactServiceTest {
 
     @BeforeEach
     void setUp() {
-        eventService = mock(AgentEventService.class);
+        eventService = mock(AgentRunEventService.class);
         agentRunEventMapper = mock(AgentRunEventMapper.class);
         values = new ConcurrentHashMap<>();
         hashes = new ConcurrentHashMap<>();

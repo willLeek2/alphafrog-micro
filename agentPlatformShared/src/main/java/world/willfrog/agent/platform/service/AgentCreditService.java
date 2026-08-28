@@ -32,7 +32,7 @@ public class AgentCreditService {
     private final AgentCreditApplicationDao creditApplicationDao;
     private final AgentCreditLedgerDao creditLedgerDao;
     private final AgentRunMapper runMapper;
-    private final AgentEventService eventService;
+    private final AgentRunEventService eventService;
     private final AgentModelCatalogService modelCatalogService;
     private final ObjectMapper objectMapper;
 

@@ -21,9 +21,9 @@ import world.willfrog.agent.platform.mapper.AgentRunDagNodeMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.prompt.PromptRunSelection;
 import world.willfrog.agent.platform.service.AgentCreditService;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.AgentMessageService;
-import world.willfrog.agent.platform.service.AgentObservabilityService;
+import world.willfrog.agent.platform.service.AgentRunObservabilityService;
 import world.willfrog.agent.platform.service.AgentPromptService;
 import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
@@ -78,11 +78,11 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
     private final LangchainDagWorkflowExecutor dagWorkflowExecutor;
     private final LangchainRunStageModelResolver stageModelResolver;
     private final AgentRunMapper runMapper;
-    private final AgentEventService eventService;
+    private final AgentRunEventService eventService;
     private final ObjectMapper objectMapper;
     private final ObjectProvider<ToolProvider> toolProviderProvider;
     private final ObjectProvider<AgentRunStateStore> stateStoreProvider;
-    private final ObjectProvider<AgentObservabilityService> observabilityServiceProvider;
+    private final ObjectProvider<AgentRunObservabilityService> observabilityServiceProvider;
     private final LangchainFailureMapper failureMapper;
     private final LangchainFollowUpContextSupport followUpContextSupport;
     private final AgentMessageService messageService;
@@ -121,11 +121,11 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                                           LangchainDagWorkflowExecutor dagWorkflowExecutor,
                                           LangchainRunStageModelResolver stageModelResolver,
                                           AgentRunMapper runMapper,
-                                          AgentEventService eventService,
+                                          AgentRunEventService eventService,
                                           ObjectMapper objectMapper,
                                           ObjectProvider<ToolProvider> toolProviderProvider,
                                           ObjectProvider<AgentRunStateStore> stateStoreProvider,
-                                          ObjectProvider<AgentObservabilityService> observabilityServiceProvider,
+                                          ObjectProvider<AgentRunObservabilityService> observabilityServiceProvider,
                                           LangchainFailureMapper failureMapper,
                                           LangchainFollowUpContextSupport followUpContextSupport,
                                           AgentMessageService messageService,
@@ -254,7 +254,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             if (!hasAdminCreditBypass(run) && !creditService.hasPositiveCredit(userId)) {
                 String reason = "insufficient_credit";
                 log.warn("LangChain run blocked by credit pre-check: runId={} userId={}", runId, userId);
-                AgentObservabilityService observability = observabilityServiceProvider.getIfAvailable();
+                AgentRunObservabilityService observability = observabilityServiceProvider.getIfAvailable();
                 if (observability != null) {
                     observability.recordFailure(runId, "CREDIT_BLOCK", reason);
                 }
@@ -288,7 +288,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             // 用户请求、stage_config_json、Nacos agent-llm 配置会在这里合并成 planning/execution/final 三个 ChatModel。
             LangchainRunStageModelResolver.StageModels stageModels = stageModelResolver.resolve(run);
             boolean captureLlmRequests = eventService.extractCaptureLlmRequests(run.getExt());
-            AgentObservabilityService observabilityService = observabilityServiceProvider.getIfAvailable();
+            AgentRunObservabilityService observabilityService = observabilityServiceProvider.getIfAvailable();
             if (observabilityService != null) {
                 // initializeRun 只初始化观测容器和默认模型信息，实际每次 LLM/tool 调用会在各自组件里继续追加 trace。
                 observabilityService.initializeRun(
@@ -302,7 +302,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             LangchainFollowUpContextSupport.ExecutionContext executionContext = followUpContextSupport.resolve(run);
             userGoal = executionContext.userGoal();
             String dialogueContext = executionContext.dialogueContext();
-            AgentEventService.RunConfig runConfig = eventService.extractRunConfig(run.getExt());
+            AgentRunEventService.RunConfig runConfig = eventService.extractRunConfig(run.getExt());
             AgentContext.setWebSearchEnabled(runConfig.webSearchEnabled());
             AgentContext.setWebSearchConfig(runConfig.webSearchConfig());
 
@@ -322,7 +322,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
              * executePython，不能再覆盖 LINEAR / DAG / AUTO。非法值由统一解析器 fail-closed；
              * 缺省值保持 AUTO。
              */
-            PlanExecutionMode requestedExecutionMode = AgentEventService.parseExecutionMode(
+            PlanExecutionMode requestedExecutionMode = AgentRunEventService.parseExecutionMode(
                     eventService.extractExecutionMode(run.getExt()));
 
             LangchainTodoPlan plan;
@@ -521,7 +521,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             LangchainFollowUpContextSupport.ExecutionContext executionContext = followUpContextSupport.resolve(run);
             userGoal = executionContext.userGoal();
             // 工具开关、检索配置和数据新鲜度都从持久化 ext 恢复。
-            AgentEventService.RunConfig runConfig = eventService.extractRunConfig(run.getExt());
+            AgentRunEventService.RunConfig runConfig = eventService.extractRunConfig(run.getExt());
             AgentContext.setWebSearchEnabled(runConfig.webSearchEnabled());
             AgentContext.setWebSearchConfig(runConfig.webSearchConfig());
             setDataFreshnessFromExt(run.getExt());
@@ -643,7 +643,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                                                                  String dialogueContext,
                                                                  LangchainRunStageModelResolver.StageModels stageModels,
                                                                  List<ToolSpecification> toolSpecifications,
-                                                                 AgentEventService.RunConfig runConfig) {
+                                                                 AgentRunEventService.RunConfig runConfig) {
         return LangchainLinearWorkflowRequest.builder()
                 .runId(runId)
                 .userId(userId)
@@ -858,7 +858,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         LangchainWorkflowRouting.validateFrozenPlan(plan);
     }
 
-    private List<ToolSpecification> resolveToolSpecifications(AgentEventService.RunConfig runConfig, String userGoal) {
+    private List<ToolSpecification> resolveToolSpecifications(AgentRunEventService.RunConfig runConfig, String userGoal) {
         ToolProvider provider = toolProviderProvider.getIfAvailable();
         if (provider == null) {
             return List.of();
@@ -887,7 +887,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                                  LangchainLinearWorkflowResult result,
                                  AgentRunStatus status) {
         // snapshot 是给前端、调试脚本和恢复流程看的业务快照；它不是完整观测明细。
-        // 大体积 LLM/tool 明细由 AgentObservabilityService 拆成摘要索引 + Redis detail blob，
+        // 大体积 LLM/tool 明细由 AgentRunObservabilityService 拆成摘要索引 + Redis detail blob，
         // 普通用户展开调用详情时走 safe detail API，不再从 snapshot 直接读取 raw HTTP / raw reasoning。
         // 因此这里保留的是“能解释最终答案从哪些 todo 来”的结构，而不是每次模型调用的全部证据。
         Map<String, Object> snapshot = new LinkedHashMap<>();
@@ -1183,11 +1183,11 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             AgentRunStatus status,
             String failureType,
             String failureReason) {
-        AgentObservabilityService observabilityService = observabilityServiceProvider.getIfAvailable();
+        AgentRunObservabilityService observabilityService = observabilityServiceProvider.getIfAvailable();
         if (observabilityService == null) {
             return new PreparedResumedTerminal(snapshot, null, null);
         }
-        AgentObservabilityService.TerminalSnapshotCandidate candidate =
+        AgentRunObservabilityService.TerminalSnapshotCandidate candidate =
                 observabilityService.prepareTerminalSnapshot(
                         runId, snapshot, status,
                         isBlank(failureType) ? "WorkflowFailed" : failureType,
@@ -1210,8 +1210,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
 
     private record PreparedResumedTerminal(
             String snapshot,
-            AgentObservabilityService service,
-            AgentObservabilityService.TerminalSnapshotCandidate candidate) {
+            AgentRunObservabilityService service,
+            AgentRunObservabilityService.TerminalSnapshotCandidate candidate) {
     }
 
     /** 只有数据库已经接受终态写入后，才把本次 Run 计入调度完成结果。 */
@@ -1256,7 +1256,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                                        AgentRunStatus status,
                                        String observabilityFailureType,
                                        String failureReason) {
-        AgentObservabilityService observabilityService = observabilityServiceProvider.getIfAvailable();
+        AgentRunObservabilityService observabilityService = observabilityServiceProvider.getIfAvailable();
         if (observabilityService == null) {
             return snapshot;
         }

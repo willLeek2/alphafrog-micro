@@ -6,7 +6,7 @@ import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
-import world.willfrog.agent.platform.service.AgentEventService;
+import world.willfrog.agent.platform.service.AgentRunEventService;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -18,7 +18,7 @@ import java.util.Map;
 public class ToolJobEventHookImpl implements ToolJobEventHook {
 
     private final AgentRunMapper runMapper;
-    private final AgentEventService agentEventService;
+    private final AgentRunEventService agentEventService;
 
     @Override
     public boolean emitTerminalEvent(String runId, ToolJobAnchor anchor) {

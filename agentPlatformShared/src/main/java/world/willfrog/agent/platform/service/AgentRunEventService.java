@@ -62,7 +62,7 @@ import java.util.Optional;
  * - {@link #nextInterruptedExpiresAt()} 计算中断状态(FAILED/WAITING/CANCELED)的延长 TTL,
  *   允许用户在更长时间窗口内查询失败原因
  */
-public class AgentEventService {
+public class AgentRunEventService {
 
     /** Redis 事件序号 key 前缀,完整 key 为 {@code agent:run:event_seq:<runId>} */
     private static final String EVENT_SEQ_KEY_PREFIX = "agent:run:event_seq:";
@@ -172,7 +172,7 @@ public class AgentEventService {
                               String stageConfigJson,
                               boolean generateArtifacts,
                               boolean isAdmin) {
-        log.info("[AgentEventService] 创建 Run: userId={}, stageConfigJson={}, isAdmin={}", userId, stageConfigJson, isAdmin);
+        log.info("[AgentRunEventService] 创建 Run: userId={}, stageConfigJson={}, isAdmin={}", userId, stageConfigJson, isAdmin);
         // 生成无连字符 UUID 作为 runId
         String runId = java.util.UUID.randomUUID().toString().replace("-", "");
 
@@ -200,14 +200,14 @@ public class AgentEventService {
             try {
                 // 存储为 JSON 对象而非字符串，便于后续解析
                 ext.put("stage_config_json", objectMapper.readTree(stageConfigJson));
-                log.info("[AgentEventService] stage_config_json 已存入 ext: {}", stageConfigJson);
+                log.info("[AgentRunEventService] stage_config_json 已存入 ext: {}", stageConfigJson);
             } catch (Exception e) {
                 // 解析失败时保留原始字符串,后续解析时按字符串再 fallback 一次
-                log.warn("[AgentEventService] 解析 stage_config_json 失败，存储为原始字符串: {}", e.getMessage());
+                log.warn("[AgentRunEventService] 解析 stage_config_json 失败，存储为原始字符串: {}", e.getMessage());
                 ext.put("stage_config_json", stageConfigJson);
             }
         } else {
-            log.warn("[AgentEventService] stageConfigJson 为空，未存入 ext");
+            log.warn("[AgentRunEventService] stageConfigJson 为空，未存入 ext");
         }
 
         /*
@@ -549,7 +549,7 @@ public class AgentEventService {
             );
             redisTemplate.convertAndSend(eventChannel(runId), writeJson(envelope));
         } catch (Exception e) {
-            log.warn("[AgentEventService] live event publish failed: runId={}, eventType={}, seq={}, error={}",
+            log.warn("[AgentRunEventService] live event publish failed: runId={}, eventType={}, seq={}, error={}",
                     runId, eventType, seq, e.getMessage());
         }
     }
