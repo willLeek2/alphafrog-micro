@@ -313,22 +313,9 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             // execution（执行）阶段也会用同一套 ToolSpecification 注册到 LC4j（LangChain4j）AiServices。
             // 如果两处工具目录不一致，planner 可能安排一个执行阶段拿不到的工具，这是最难排查的类型之一。
             List<ToolSpecification> toolSpecifications = resolveToolSpecifications(runConfig, userGoal);
-            LangchainLinearWorkflowRequest workflowRequest = LangchainLinearWorkflowRequest.builder()
-                    .runId(runId)
-                    .userId(userId)
-                    .userGoal(userGoal)
-                    .dialogueContext(dialogueContext)
-                    .model(stageModels.executionModel())
-                    .planningModel(stageModels.planningModel())
-                    .executionModel(stageModels.executionModel())
-                    .finalAnswerModel(stageModels.finalAnswerModel())
-                    .planningEndpointName(stageModels.planningEndpointName())
-                    .planningModelName(stageModels.planningModelName())
-                    .planningProviderOrder(stageModels.planningProviderOrder())
-                    .toolSpecifications(toolSpecifications)
-                    .webSearchEnabled(runConfig.webSearchEnabled())
-                    .codeInterpreterEnabled(runConfig.codeInterpreterEnabled())
-                    .build();
+            LangchainLinearWorkflowRequest workflowRequest = buildWorkflowRequest(
+                    runId, userId, userGoal, dialogueContext, stageModels,
+                    toolSpecifications, runConfig);
 
             /*
              * execution mode 是 Run 创建时冻结的用户契约。代码解释器开关只决定是否暴露
@@ -446,59 +433,9 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
 
             runMapper.updatePlanJson(runId, userId, writeJson(result.getPlan()));
             if (result.isSuccess()) {
-                // 成功路径的状态写入顺序：运行快照带可观测摘要 → 数据库状态 COMPLETED → Redis 控制状态 → 事件 → assistant 消息。
-                // 这样前端先看到终态时，通常也能拿到完整答案和可观测摘要。
-                // assistant message 最后写，是因为 follow-up 只应该引用已经确定落库的最终答案。
-                String snapshot = attachObservability(
-                        runId, buildSnapshot(userGoal, result, AgentRunStatus.COMPLETED), AgentRunStatus.COMPLETED, null, null);
-                int completedRows = runMapper.updateSnapshot(
-                        runId, userId, AgentRunStatus.COMPLETED, snapshot, true, null);
-                if (completedRows == 1) {
-                    recordSchedulerCompletion(AgentRunStatus.COMPLETED);
-                }
-                markRunStatus(runId, AgentRunStatus.COMPLETED);
-                eventService.append(runId, userId, "WORKFLOW_COMPLETED", Map.of(
-                        "answer", result.getFinalAnswer(),
-                        "toolCallsUsed", result.getToolCallsUsed(),
-                        "engine", "agentLangchainService"
-                ));
-                persistAssistantMessage(runId, userId, stageModels, result.getFinalAnswer());
-                // 260612-01-02: 成功路径触发结算
-                tryScheduleSettlement(runId, userId);
-                // 260623-agent-service-delete: workspace listener 已迁移到 agentLangchainService，同 JVM 触发 dump。
-                finalizationService.publishFinalizedEvent(runId, userId, AgentRunStatus.COMPLETED.name());
+                persistCompletedOutcome(run, userGoal, stageModels, result, null);
             } else if (result.isPartial()) {
-                // DAG recovery judge 判定部分完成：写入 PARTIAL 状态 + 部分答案。
-                // PARTIAL 不是普通失败：它表示部分 todo 被明确跳过，最终答案可供用户参考，
-                // 所以要记录 skippedTodoIds / recoveryRationale，方便前端解释为什么不是完整完成。
-                String snapshot = attachObservability(
-                        runId, buildPartialSnapshot(userGoal, result), AgentRunStatus.PARTIAL, null,
-                        result.getFailureReason());
-                int partialRows = runMapper.updateSnapshot(
-                        runId, userId, AgentRunStatus.PARTIAL, snapshot, true, result.getFailureReason());
-                if (partialRows == 1) {
-                    recordSchedulerCompletion(AgentRunStatus.PARTIAL);
-                }
-                markRunStatus(runId, AgentRunStatus.PARTIAL);
-                Map<String, Object> payload = new LinkedHashMap<>();
-                payload.put("answer", nvl(result.getFinalAnswer()));
-                payload.put("toolCallsUsed", result.getToolCallsUsed());
-                payload.put("engine", "agentLangchainService");
-                payload.put("partial", true);
-                if (result.getSkippedTodoIds() != null) {
-                    payload.put("skippedTodoIds", result.getSkippedTodoIds());
-                }
-                if (result.getRecoveryRationale() != null) {
-                    payload.put("recoveryRationale", result.getRecoveryRationale());
-                }
-                eventService.append(runId, userId, "WORKFLOW_PARTIAL_COMPLETED", payload);
-                if (!isBlank(result.getFinalAnswer())) {
-                    persistAssistantMessage(runId, userId, stageModels, result.getFinalAnswer());
-                }
-                // 260612-01-02: 部分完成也触发结算
-                tryScheduleSettlement(runId, userId);
-                // 260618-workspace-v0: 触发终态事件
-                finalizationService.publishFinalizedEvent(runId, userId, AgentRunStatus.PARTIAL.name());
+                persistPartialOutcome(run, userGoal, stageModels, result, null);
             } else {
                 publishFailure(runId, userId, userGoal, result, null);
                 tryScheduleSettlement(runId, userId);
@@ -591,22 +528,9 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             // 用相同运行配置重建工具目录，但不会再次调用 planner。
             List<ToolSpecification> toolSpecifications = resolveToolSpecifications(runConfig, userGoal);
             // 构造新的请求对象，把持久化数据重新放入当前 worker 的调用链。
-            LangchainLinearWorkflowRequest workflowRequest = LangchainLinearWorkflowRequest.builder()
-                    .runId(runId)
-                    .userId(userId)
-                    .userGoal(userGoal)
-                    .dialogueContext(executionContext.dialogueContext())
-                    .model(stageModels.executionModel())
-                    .planningModel(stageModels.planningModel())
-                    .executionModel(stageModels.executionModel())
-                    .finalAnswerModel(stageModels.finalAnswerModel())
-                    .planningEndpointName(stageModels.planningEndpointName())
-                    .planningModelName(stageModels.planningModelName())
-                    .planningProviderOrder(stageModels.planningProviderOrder())
-                    .toolSpecifications(toolSpecifications)
-                    .webSearchEnabled(runConfig.webSearchEnabled())
-                    .codeInterpreterEnabled(runConfig.codeInterpreterEnabled())
-                    .build();
+            LangchainLinearWorkflowRequest workflowRequest = buildWorkflowRequest(
+                    runId, userId, userGoal, executionContext.dialogueContext(),
+                    stageModels, toolSpecifications, runConfig);
 
             // token + leaseVersion 使重复 launcher 只能写出一条 WORKFLOW_RESUMED 事件。
             String resumedDedupeKey = runId + ":" + resumeContext.getResumeToken()
@@ -690,69 +614,10 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             return hasDurableStopState(runId);
         }
         if (result.isSuccess()) {
-            // CAS 前只生成观测候选项；失去 lease 的 worker 不能写 Redis 或清理终态锁。
-            PreparedResumedTerminal prepared = prepareResumedTerminalObservability(runId,
-                    buildSnapshot(userGoal, result, AgentRunStatus.COMPLETED),
-                    AgentRunStatus.COMPLETED, null, null);
-            if (persistResumedTerminal(runId, userId, AgentRunStatus.COMPLETED,
-                    result, prepared.snapshot(), null, resumeContext) != 1) {
-                // DB 没接受写入就返回 false，不能清理恢复 anchor。
-                log.warn("Resumed COMPLETED snapshot was not persisted for run={}", runId);
-                return false;
-            }
-            commitResumedTerminalObservability(prepared);
-            recordSchedulerCompletion(AgentRunStatus.COMPLETED);
-            try {
-                // 以下副作用发生在 durable snapshot 之后，失败不会回滚已确定的工作流结果。
-                markRunStatus(runId, AgentRunStatus.COMPLETED);
-                eventService.append(runId, userId, "WORKFLOW_COMPLETED", Map.of(
-                        "answer", result.getFinalAnswer(),
-                        "toolCallsUsed", result.getToolCallsUsed(),
-                        "engine", "agentLangchainService",
-                        "resumed", true
-                ));
-                persistAssistantMessage(runId, userId, stageModels, result.getFinalAnswer());
-                tryScheduleSettlement(runId, userId);
-                finalizationService.publishFinalizedEvent(
-                        runId, userId, AgentRunStatus.COMPLETED.name());
-            } catch (Exception sideEffect) {
-                log.warn("Resumed COMPLETED side effect failed after durable snapshot run={}: {}",
-                        runId, sideEffect.getMessage());
-            }
-            // durable 主结果已存在，允许 handoff 完成。
-            return true;
+            return persistCompletedOutcome(run, userGoal, stageModels, result, resumeContext);
         }
         if (result.isPartial()) {
-            PreparedResumedTerminal prepared = prepareResumedTerminalObservability(
-                    runId, buildPartialSnapshot(userGoal, result),
-                    AgentRunStatus.PARTIAL, null, result.getFailureReason());
-            if (persistResumedTerminal(runId, userId, AgentRunStatus.PARTIAL,
-                    result, prepared.snapshot(), result.getFailureReason(), resumeContext) != 1) {
-                log.warn("Resumed PARTIAL snapshot was not persisted for run={}", runId);
-                return false;
-            }
-            commitResumedTerminalObservability(prepared);
-            recordSchedulerCompletion(AgentRunStatus.PARTIAL);
-            try {
-                markRunStatus(runId, AgentRunStatus.PARTIAL);
-                eventService.append(runId, userId, "WORKFLOW_PARTIAL_COMPLETED", Map.of(
-                        "answer", nvl(result.getFinalAnswer()),
-                        "toolCallsUsed", result.getToolCallsUsed(),
-                        "engine", "agentLangchainService",
-                        "partial", true,
-                        "resumed", true
-                ));
-                if (!isBlank(result.getFinalAnswer())) {
-                    persistAssistantMessage(runId, userId, stageModels, result.getFinalAnswer());
-                }
-                tryScheduleSettlement(runId, userId);
-                finalizationService.publishFinalizedEvent(
-                        runId, userId, AgentRunStatus.PARTIAL.name());
-            } catch (Exception sideEffect) {
-                log.warn("Resumed PARTIAL side effect failed after durable snapshot run={}: {}",
-                        runId, sideEffect.getMessage());
-            }
-            return true;
+            return persistPartialOutcome(run, userGoal, stageModels, result, resumeContext);
         }
         if ("resume_result_consume_failed".equals(result.getFailureReason())) {
             // 终态结果已注入内存，但消费确认没有持久化。
@@ -766,6 +631,184 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             tryScheduleSettlement(runId, userId);
         }
         return durable;
+    }
+
+    /**
+     * 组装执行器所需的运行环境参数。正常执行与恢复执行使用完全相同的字段集，
+     * 收成单一构造点后，两处调用不会再各自维护一份字段清单。
+     */
+    private LangchainLinearWorkflowRequest buildWorkflowRequest(String runId,
+                                                                 String userId,
+                                                                 String userGoal,
+                                                                 String dialogueContext,
+                                                                 LangchainRunStageModelResolver.StageModels stageModels,
+                                                                 List<ToolSpecification> toolSpecifications,
+                                                                 AgentEventService.RunConfig runConfig) {
+        return LangchainLinearWorkflowRequest.builder()
+                .runId(runId)
+                .userId(userId)
+                .userGoal(userGoal)
+                .dialogueContext(dialogueContext)
+                .model(stageModels.executionModel())
+                .planningModel(stageModels.planningModel())
+                .executionModel(stageModels.executionModel())
+                .finalAnswerModel(stageModels.finalAnswerModel())
+                .planningEndpointName(stageModels.planningEndpointName())
+                .planningModelName(stageModels.planningModelName())
+                .planningProviderOrder(stageModels.planningProviderOrder())
+                .toolSpecifications(toolSpecifications)
+                .webSearchEnabled(runConfig.webSearchEnabled())
+                .codeInterpreterEnabled(runConfig.codeInterpreterEnabled())
+                .build();
+    }
+
+    /**
+     * COMPLETED 终态的持久化与收尾副作用，正常执行与恢复执行共用。
+     *
+     * <p>resumeContext 为空表示正常执行：直接附加可观测摘要并更新终态快照，
+     * 副作用异常向上传播，由外层统一失败出口处理。resumeContext 非空表示恢复执行：
+     * 先预生成可观测候选项，再按恢复租约做条件更新（数据库未接受写入时返回 false，
+     * 保留恢复锚点供重试），写入成功后提交可观测；副作用降级为尽力而为——终态已
+     * 持久化，收尾动作失败不应把结果伪装成可重试。</p>
+     */
+    private boolean persistCompletedOutcome(AgentRun run,
+                                            String userGoal,
+                                            LangchainRunStageModelResolver.StageModels stageModels,
+                                            LangchainLinearWorkflowResult result,
+                                            ToolJobResumeContext resumeContext) {
+        String runId = run.getId();
+        String userId = run.getUserId();
+        if (resumeContext != null) {
+            // 按恢复租约条件更新前只生成观测候选项；失去租约的 worker 不能写 Redis 或清理终态锁。
+            PreparedResumedTerminal prepared = prepareResumedTerminalObservability(runId,
+                    buildSnapshot(userGoal, result, AgentRunStatus.COMPLETED),
+                    AgentRunStatus.COMPLETED, null, null);
+            if (persistResumedTerminal(runId, userId, AgentRunStatus.COMPLETED,
+                    result, prepared.snapshot(), null, resumeContext) != 1) {
+                // 数据库没有接受写入就返回 false，不能清理恢复锚点。
+                log.warn("Resumed COMPLETED snapshot was not persisted for run={}", runId);
+                return false;
+            }
+            commitResumedTerminalObservability(prepared);
+            recordSchedulerCompletion(AgentRunStatus.COMPLETED);
+            try {
+                appendCompletedSideEffects(runId, userId, stageModels, result, true);
+            } catch (Exception sideEffect) {
+                log.warn("Resumed COMPLETED side effect failed after durable snapshot run={}: {}",
+                        runId, sideEffect.getMessage());
+            }
+            // durable 主结果已存在，允许 handoff 完成。
+            return true;
+        }
+        // 正常执行的写入顺序：运行快照带可观测摘要 → 数据库终态 → Redis 控制状态 → 事件 → assistant 消息。
+        // 这样前端先看到终态时，通常也能拿到完整答案和可观测摘要；assistant 消息最后写，
+        // 是因为 follow-up 只应该引用已经确定落库的最终答案。
+        String snapshot = attachObservability(
+                runId, buildSnapshot(userGoal, result, AgentRunStatus.COMPLETED), AgentRunStatus.COMPLETED, null, null);
+        int completedRows = runMapper.updateSnapshot(
+                runId, userId, AgentRunStatus.COMPLETED, snapshot, true, null);
+        if (completedRows == 1) {
+            recordSchedulerCompletion(AgentRunStatus.COMPLETED);
+        }
+        appendCompletedSideEffects(runId, userId, stageModels, result, false);
+        return true;
+    }
+
+    /**
+     * PARTIAL（部分完成）终态的持久化与收尾副作用，正常执行与恢复执行共用，
+     * 持久化两条路径的划分与 {@link #persistCompletedOutcome} 相同。
+     */
+    private boolean persistPartialOutcome(AgentRun run,
+                                          String userGoal,
+                                          LangchainRunStageModelResolver.StageModels stageModels,
+                                          LangchainLinearWorkflowResult result,
+                                          ToolJobResumeContext resumeContext) {
+        String runId = run.getId();
+        String userId = run.getUserId();
+        if (resumeContext != null) {
+            PreparedResumedTerminal prepared = prepareResumedTerminalObservability(
+                    runId, buildPartialSnapshot(userGoal, result),
+                    AgentRunStatus.PARTIAL, null, result.getFailureReason());
+            if (persistResumedTerminal(runId, userId, AgentRunStatus.PARTIAL,
+                    result, prepared.snapshot(), result.getFailureReason(), resumeContext) != 1) {
+                log.warn("Resumed PARTIAL snapshot was not persisted for run={}", runId);
+                return false;
+            }
+            commitResumedTerminalObservability(prepared);
+            recordSchedulerCompletion(AgentRunStatus.PARTIAL);
+            try {
+                appendPartialSideEffects(runId, userId, stageModels, result, true);
+            } catch (Exception sideEffect) {
+                log.warn("Resumed PARTIAL side effect failed after durable snapshot run={}: {}",
+                        runId, sideEffect.getMessage());
+            }
+            return true;
+        }
+        String snapshot = attachObservability(
+                runId, buildPartialSnapshot(userGoal, result), AgentRunStatus.PARTIAL, null,
+                result.getFailureReason());
+        int partialRows = runMapper.updateSnapshot(
+                runId, userId, AgentRunStatus.PARTIAL, snapshot, true, result.getFailureReason());
+        if (partialRows == 1) {
+            recordSchedulerCompletion(AgentRunStatus.PARTIAL);
+        }
+        appendPartialSideEffects(runId, userId, stageModels, result, false);
+        return true;
+    }
+
+    /** COMPLETED 的收尾副作用序列：Redis 控制状态、完成事件、assistant 消息、结算、终态事件广播。 */
+    private void appendCompletedSideEffects(String runId,
+                                            String userId,
+                                            LangchainRunStageModelResolver.StageModels stageModels,
+                                            LangchainLinearWorkflowResult result,
+                                            boolean resumed) {
+        markRunStatus(runId, AgentRunStatus.COMPLETED);
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("answer", result.getFinalAnswer());
+        payload.put("toolCallsUsed", result.getToolCallsUsed());
+        payload.put("engine", "agentLangchainService");
+        if (resumed) {
+            payload.put("resumed", true);
+        }
+        eventService.append(runId, userId, "WORKFLOW_COMPLETED", payload);
+        persistAssistantMessage(runId, userId, stageModels, result.getFinalAnswer());
+        tryScheduleSettlement(runId, userId);
+        // 终态事件在同一 JVM 内触发 workspace dump 等后续处理。
+        finalizationService.publishFinalizedEvent(runId, userId, AgentRunStatus.COMPLETED.name());
+    }
+
+    /**
+     * PARTIAL 的收尾副作用序列。PARTIAL 不是普通失败：部分 todo 被明确跳过、最终答案仍可供参考，
+     * 所以正常执行的事件要带 skippedTodoIds 与 recoveryRationale，方便前端解释为什么不是完整完成；
+     * 恢复执行的事件保持既有字段集（不带这两个字段）。
+     */
+    private void appendPartialSideEffects(String runId,
+                                          String userId,
+                                          LangchainRunStageModelResolver.StageModels stageModels,
+                                          LangchainLinearWorkflowResult result,
+                                          boolean resumed) {
+        markRunStatus(runId, AgentRunStatus.PARTIAL);
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("answer", nvl(result.getFinalAnswer()));
+        payload.put("toolCallsUsed", result.getToolCallsUsed());
+        payload.put("engine", "agentLangchainService");
+        payload.put("partial", true);
+        if (resumed) {
+            payload.put("resumed", true);
+        } else {
+            if (result.getSkippedTodoIds() != null) {
+                payload.put("skippedTodoIds", result.getSkippedTodoIds());
+            }
+            if (result.getRecoveryRationale() != null) {
+                payload.put("recoveryRationale", result.getRecoveryRationale());
+            }
+        }
+        eventService.append(runId, userId, "WORKFLOW_PARTIAL_COMPLETED", payload);
+        if (!isBlank(result.getFinalAnswer())) {
+            persistAssistantMessage(runId, userId, stageModels, result.getFinalAnswer());
+        }
+        tryScheduleSettlement(runId, userId);
+        finalizationService.publishFinalizedEvent(runId, userId, AgentRunStatus.PARTIAL.name());
     }
 
     private boolean hasDurableStopState(String runId) {
