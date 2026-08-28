@@ -168,7 +168,7 @@ public interface AgentRunMapper {
                                  @Param("expectedOperationId") String expectedOperationId);
 
     /**
-     * 修复计数专用窄写：只 jsonb 合并 {@code repairAttempts[toolName]}，并顺带去掉旧的
+     * 只合并修复计数的专项更新：只 jsonb 合并 {@code repairAttempts[toolName]}，并顺带去掉旧的
      * pythonRepair* 三键。绑定精确 operationId，不整份写回锚点，避免盖掉暂停/取消处置。
      */
     int persistRepairAttempt(@Param("id") String id,

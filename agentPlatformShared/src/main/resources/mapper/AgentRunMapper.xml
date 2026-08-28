@@ -459,7 +459,7 @@
     </update>
 
     <!--
-        批次 2 T3-B1：修复计数窄写。只合并 repairAttempts[toolName]，并删掉历史
+        修复计数按工具名存取：只合并 repairAttempts[toolName]，并删掉历史
         pythonRepair* 三键。第二个长工具已替换 operationId 时返回 0。
         与 persistCancelDisposition 同形状，谁都不整份写回 tool_job_anchor_json。
     -->

@@ -79,7 +79,7 @@ public class ToolJobAnchorService {
     }
 
     /**
-     * 修复计数窄持久化：只合并 {@code repairAttempts[toolName]}，绑定精确 operationId，
+     * 只合并修复计数的专项更新：只改 {@code repairAttempts[toolName]}，绑定精确 operationId，
      * 不整份写回旧锚点。第二个长工具已替换锚点时返回 false。
      */
     public boolean persistRepairAttempt(String runId, String operationId,
