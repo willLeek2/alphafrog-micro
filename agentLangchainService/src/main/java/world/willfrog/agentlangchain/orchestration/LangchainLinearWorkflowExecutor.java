@@ -18,10 +18,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
-import java.util.stream.Collectors;
 
 /**
  * LINEAR（线性）工作流执行器 —— 按顺序逐个执行 Todo，一步失败则整个 run 失败。
@@ -58,8 +56,7 @@ public class LangchainLinearWorkflowExecutor {
     private final AgentEventService eventService;
     private final CodeRefineLocalConfigLoader codeRefineConfigLoader;
     private final CodeRefineProperties startupCodeRefineProperties;
-
-    private static final Set<String> REPAIRABLE_PYTHON_EXIT_REASONS = Set.of("NON_ZERO_EXIT");
+    private final WorkflowResumeValidator resumeValidator = new WorkflowResumeValidator();
 
     /**
      * 工作流级 Todo 边界 checkpoint。测试或极简上下文可以不装配；生产 Spring 上下文必须存在。
@@ -188,71 +185,30 @@ public class LangchainLinearWorkflowExecutor {
         AgentContext.setWorkflow("linear");
         // extractedEntities 来自原 plan，不重新运行 planning LLM。
         AgentContext.setExtractedEntities(plan.getExtractedEntities());
-        // 首次执行从空列表开始；恢复执行从 anchor 还原已完成前缀。
-        List<LangchainCompletedTodo> completedTodos = resumeContext != null
-                ? restoreCompletedTodos(resumeContext.getCompletedTodos())
-                : restartCheckpoint != null
-                        ? restoreCompletedTodos(restartCheckpoint.getCompletedTodos())
-                        : new ArrayList<>();
+        WorkflowResumeValidator.Result resumeCheck = resumeValidator.validate(
+                plan, resumeContext, restartCheckpoint);
+        List<LangchainCompletedTodo> completedTodos = resumeCheck.completedTodos();
+        if (!resumeCheck.ok()) {
+            Map<String, Object> failureMetadata = WorkflowResumeValidator.PYTHON_REPAIR_EXHAUSTED
+                    .equals(resumeCheck.violationCode())
+                    ? pythonRepairExhaustedMetadata(resumeContext)
+                    : null;
+            return failure(plan, completedTodos, resumeCheck.violationCode(),
+                    toolCalls.get(), failureMetadata);
+        }
         // datasetRefs 是当前 worker 的堆内映射，必须从已完成输出重新注册。
         Map<String, String> datasetRefs = LangchainTodoUserMessageBuilder.newDatasetRefMap();
         completedTodos.forEach(todo -> DatasetRefRegistry.registerFromJson(todo.displayOutput(), datasetRefs));
-        // completedIds 用于 O(1) 跳过已经落稳的 待办节点，防止重复工具副作用。
-        java.util.Set<String> completedIds = completedTodos.stream()
-                .map(LangchainCompletedTodo::getTodoId)
-                .filter(java.util.Objects::nonNull)
-                .collect(Collectors.toCollection(java.util.LinkedHashSet::new));
-        // resultConsumed=true 表示上一次恢复已确认消费终态，当前应从下一节点继续。
-        boolean handoffAccepted = resumeContext != null && resumeContext.isResultConsumed();
-        boolean activePythonRepair = handoffAccepted && isActivePythonRepair(resumeContext);
+        java.util.Set<String> completedIds = resumeCheck.completedIds();
+        boolean handoffAccepted = resumeCheck.handoffAccepted();
+        boolean activePythonRepair = resumeCheck.activePythonRepair();
         if (handoffAccepted) {
             // 崩溃重入的 worker 继续持有同一 token/version；第二次长工具用它精确替换旧 anchor。
             AgentContext.setToolJobResumeHandoff(
                     resumeContext.getResumeToken(), resumeContext.getResumeLeaseVersion());
         }
-        // FINAL_TODO_ID 表示所有 待办节点已完成，本轮只需要生成最终答案。
-        boolean resumeAtFinal = handoffAccepted
-                && ToolJobResumeContext.FINAL_TODO_ID.equals(resumeContext.getTodoId());
-        boolean restartAtFinal = restartCheckpoint != null
-                && WorkflowExecutionCheckpoint.FINAL_TODO_ID.equals(restartCheckpoint.getNextTodoId());
-        String boundaryTodoId = resumeContext != null
-                ? resumeContext.getTodoId()
-                : restartCheckpoint == null ? null : restartCheckpoint.getNextTodoId();
-        // ToolJob resume 找原挂起的待办节点；服务重启找 checkpoint 指向的下一待办节点。
-        TodoItem suspendedItem = (resumeContext == null && restartCheckpoint == null)
-                || resumeAtFinal || restartAtFinal ? null : plan.getItems().stream()
-                .filter(item -> java.util.Objects.equals(item.getId(), boundaryTodoId))
-                .findFirst()
-                .orElse(null);
-        // checkpoint 指向原 plan 中不存在的节点说明上下文损坏，必须 fail-closed。
-        if ((resumeContext != null || restartCheckpoint != null)
-                && suspendedItem == null && !resumeAtFinal && !restartAtFinal) {
-            return failure(plan, completedTodos,
-                    resumeContext != null ? "resume_todo_not_in_plan" : "restart_todo_not_in_plan",
-                    toolCalls.get(), null);
-        }
-        // resumeSequence 是恢复前缀的严格边界；最终回答哨兵放在所有待办节点之后。
-        int resumeSequence = (resumeAtFinal || restartAtFinal) ? Integer.MAX_VALUE : suspendedItem == null
-                ? Integer.MIN_VALUE : suspendedItem.getSequence();
-        // 已完成快照不能包含挂起节点或其后节点，否则说明 checkpoint 顺序自相矛盾。
-        if ((resumeContext != null || restartCheckpoint != null) && completedTodos.stream()
-                .anyMatch(todo -> todo.getSequence() >= resumeSequence)) {
-            return failure(plan, completedTodos,
-                    resumeContext != null
-                            ? "resume_completed_todo_out_of_order"
-                            : "restart_completed_todo_out_of_order",
-                    toolCalls.get(), null);
-        }
-        // 已消费的失败终态不允许继续后续待办节点，直接恢复为确定性失败。
-        if (handoffAccepted && !activePythonRepair
-                && (!resumeContext.isTerminalSuccess() || resumeContext.isPythonRepairPending())) {
-            if (resumeContext.isPythonRepairExhausted()) {
-                return failure(plan, completedTodos, "python_repair_exhausted",
-                        toolCalls.get(), pythonRepairExhaustedMetadata(resumeContext));
-            }
-            return failure(plan, completedTodos, "external_tool_terminal_failure",
-                    toolCalls.get(), null);
-        }
+        TodoItem suspendedItem = resumeCheck.suspendedItem();
+        int resumeSequence = resumeCheck.resumeSequence();
         // 从原 plan 开头遍历，依靠 completedIds/sequence 精确跳过持久化前缀。
         for (TodoItem item : plan.getItems()) {
             // crash reentry 会从已接受的修复 handoff 重跑当前 Todo，不再次消费终态或增加轮次。
@@ -520,25 +476,8 @@ public class LangchainLinearWorkflowExecutor {
         context.setResultConsumed(true);
     }
 
-    private boolean isActivePythonRepair(ToolJobResumeContext context) {
-        return context != null
-                && isRepairablePythonFailure(context)
-                && context.isPythonRepairPending()
-                && !context.isPythonRepairExhausted()
-                && context.getPythonRepairAttempt() > 0
-                && context.isResultConsumed();
-    }
-
     private boolean isRepairablePythonFailure(ToolJobResumeContext context) {
-        return context != null
-                && !context.isTerminalSuccess()
-                && "FAILED".equals(context.getTerminalStatus())
-                // false 表示不得原样重放已失败的 Sandbox 请求；这里会先让模型生成不同代码。
-                && Boolean.FALSE.equals(context.getTerminalRetryable())
-                && REPAIRABLE_PYTHON_EXIT_REASONS.contains(
-                        nvl(context.getTerminalExitReason(), "").toUpperCase(java.util.Locale.ROOT))
-                && context.getPythonFailedRequestFingerprints() != null
-                && !context.getPythonFailedRequestFingerprints().isEmpty();
+        return resumeValidator.isRepairablePythonFailure(context);
     }
 
     private int effectiveMaxPythonAttempts() {
@@ -566,24 +505,6 @@ public class LangchainLinearWorkflowExecutor {
                 "python_repair_exhausted", true,
                 "max_attempts", effectiveMaxAttempts,
                 "failed_request_count", context.getPythonFailedRequestFingerprints().size());
-    }
-
-    private List<LangchainCompletedTodo> restoreCompletedTodos(List<CompletedTodoRecord> records) {
-        // 空 checkpoint 前缀恢复为空可变列表，后续仍可追加当前节点。
-        if (records == null || records.isEmpty()) {
-            return new ArrayList<>();
-        }
-        // 保持持久化顺序逐项还原，不重新运行 Todo 或重新生成摘要。
-        return records.stream().map(record -> LangchainCompletedTodo.builder()
-                        .todoId(record.getTodoId())
-                        .sequence(record.getSequence())
-                        .description(record.getDescription())
-                        .modelOutput(record.getModelOutput())
-                        .output(record.getOutput())
-                        .summary(record.getSummary())
-                        .build())
-                // 需要 ArrayList，因为恢复执行会把后续完成节点继续 append。
-                .collect(Collectors.toCollection(ArrayList::new));
     }
 
     private String resumeTerminalOutput(ToolJobResumeContext context) {
