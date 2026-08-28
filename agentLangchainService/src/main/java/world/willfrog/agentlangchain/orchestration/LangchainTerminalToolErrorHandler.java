@@ -2,14 +2,15 @@ package world.willfrog.agentlangchain.orchestration;
 
 import dev.langchain4j.service.tool.ToolErrorContext;
 import dev.langchain4j.service.tool.ToolErrorHandlerResult;
-import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingException;
+import world.willfrog.agent.platform.exception.AgentRunControlSignal;
+import world.willfrog.agent.platform.exception.RunBudgetException;
 
 /**
  * LangChain4j 工具错误处理器中的“控制信号逃逸口”。
  *
- * <p>普通工具异常会转成文本交给模型自我修复；{@link ExternalToolJobPendingException} 却不是工具失败，
- * 而是“检查点即将落库、当前 worker 应退出”的栈展开信号。如果这里把它转成文本，模型会在旧 worker
- * 上继续推理，pipeline 永远收不到 suspended 结果，也就无法安全释放并发槽位。</p>
+ * <p>普通工具异常会转成文本交给模型自我修复；{@link AgentRunControlSignal} 不是工具失败，
+ * 而是“当前 worker 应退出”的栈展开信号。额度超限同样要绕开模型修复，但走资源类型，不进这个家族。
+ * 如果这里把信号转成文本，模型会在旧 worker 上继续推理，pipeline 收不到挂起或中断结果。</p>
  */
 final class LangchainTerminalToolErrorHandler {
 
@@ -32,20 +33,19 @@ final class LangchainTerminalToolErrorHandler {
         // 框架反射层可能把真实异常包在多层 RuntimeException 中，因此逐层检查 cause。
         Throwable current = throwable;
         while (current != null) {
-            if (current instanceof ExternalToolJobPendingException) {
-                // 命中即停止，不再让下游 handler 将 pending 误包装成 tool error JSON。
-                // 异常对象本身还携带三个恢复关联字段：runId、toolCallId、attempt。
-                // todo executor 会把这些字段复制到 workflow result；pipeline 再与数据库 anchor
-                // 交叉校验，而不是信任某一层单独提供的身份。多层校验可以阻止旧 attempt 的
-                // 迟到异常为新任务写入错误检查点。
+            if (current instanceof AgentRunControlSignal) {
+                // 控制流信号：转后台、取消、暂停。命中即停止，不能交给模型当工具错误文本。
+                return true;
+            }
+            if (current instanceof RunBudgetException) {
+                // 额度不足是资源信号，同样要求栈展开，但不进控制流家族。
                 return true;
             }
             String message = current.getMessage();
             if (message != null
                     && (message.startsWith("RUN_BUDGET_EXCEEDED:")
                     || message.startsWith("RUN_INTERRUPTED:"))) {
-                // 预算与人工控制信号同样要求栈展开，但它们不会进入长工具 resume 状态机。
-                // 保留在同一入口是为了确保所有“本轮 Run 必须停止”的信号都绕开 LLM 错误修复。
+                // 兼容仍按消息前缀抛出的旧包装。
                 return true;
             }
             current = current.getCause();

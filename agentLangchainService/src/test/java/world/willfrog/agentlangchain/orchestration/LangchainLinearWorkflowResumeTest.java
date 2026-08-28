@@ -496,7 +496,7 @@ class LangchainLinearWorkflowResumeTest {
     void repairPromptContainsBoundedTerminalDiagnosticsAndNoReplayInstruction() {
         ToolJobResumeContext context = failedPythonContext(true, 1);
 
-        assertThat(LangchainTodoNodeExecutor.buildPythonRepairUserMessage(context))
+        assertThat(PythonSandboxRepairHandler.buildRepairUserMessage(context))
                 .contains("PYTHON_REPAIR_CONTEXT")
                 .contains("repair_attempt: 1")
                 .contains("exit_reason: NON_ZERO_EXIT")

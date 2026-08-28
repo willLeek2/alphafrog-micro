@@ -6,6 +6,7 @@ import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.exception.AgentRunFailureClass;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.AgentPromptService;
 import world.willfrog.agent.workflow.TodoItem;
@@ -507,19 +508,25 @@ public class LangchainDagWorkflowExecutor {
                         null, record.getFailureMetadata(), false, null));
             }
         } catch (Throwable t) {
-            // 捕获所有未处理异常和错误（Throwable 比 Exception 更宽，能捕获 Error 如 OOM），
-            // 防止单个节点崩溃导致工作线程异常退出但 CompletableFuture 永不完成，进而使整个 DAG 挂死
-            log.error("Failed to execute DAG node {}", item.getId(), t);
+            // 异步线程边界：必须拦住 Error，否则工作线程退出后 CompletableFuture 完不成，整个 DAG 挂死。
+            // 编程错误仍要让异步结果结束，但标成未知缺陷，不和普通节点失败混在一起。
+            boolean unknownDefect = AgentRunFailureClass.containsError(t);
+            if (unknownDefect) {
+                log.error("DAG node {} hit unknown defect; async result still completed", item.getId(), t);
+            } else {
+                log.error("Failed to execute DAG node {}", item.getId(), t);
+            }
             long catchDurationMs = nodeStartMs > 0 ? System.currentTimeMillis() - nodeStartMs : 0;
+            Map<String, Object> catchMetadata = unknownDefect ? unknownDefectMetadata(t) : null;
             LangchainTodoNodeResult failed = LangchainTodoNodeResult.failure(
-                    "DAG execution failed: " + nvl(t.getMessage()));
+                    "DAG execution failed: " + nvl(t.getMessage()), catchMetadata);
             results.put(item.getId(), failed);
             nodeSuccess.put(item.getId(), false);
             stateRecorder.persistNodeState(runId, items, workflowStateLock, nodeStates,
                     item, TodoStatus.FAILED, failed, toolCalls.get());
             emitEventBestEffort(runId, userId, "TODO_NODE_FAILED", todoNodeResultPayload(
                     item, false, failed.getSummary(), catchDurationMs, 0,
-                    null, null, false, null));
+                    null, catchMetadata, false, null));
         } finally {
             // 增加完成计数（用于监控和调试），并清理 ThreadLocal
             completedCount.incrementAndGet();
@@ -1228,6 +1235,14 @@ public class LangchainDagWorkflowExecutor {
         return Map.of(
                 "todo_retry_attempts", result.getTodoRetryAttempts(),
                 "todo_retry_outcome", nvl(result.getTodoRetryOutcome(), "success"));
+    }
+
+    private static Map<String, Object> unknownDefectMetadata(Throwable throwable) {
+        Map<String, Object> meta = new LinkedHashMap<>();
+        meta.put("unknown_defect", true);
+        meta.put("failure_class", AgentRunFailureClass.UNKNOWN_DEFECT.wireName());
+        meta.put("throwable_type", throwable.getClass().getName());
+        return meta;
     }
 
     /**

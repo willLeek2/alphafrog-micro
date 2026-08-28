@@ -101,7 +101,7 @@ final class LangchainToolJobCheckpointCoordinator {
             LangchainLinearWorkflowResult result,
             ToolJobCheckpointRequest failedRequest) {
         if (failedRequest == null) {
-            boolean failed = runMapper.updateSnapshot(runId, userId, AgentRunStatus.FAILED,
+            boolean failed = runMapper.updateTerminalSnapshot(runId, userId, AgentRunStatus.FAILED,
                     "{\"failure\":\"tool_job_checkpoint_anchor_missing\"}", true,
                     "tool_job_checkpoint_anchor_missing") == 1;
             emitFailure(runId, userId, result, failed, false);

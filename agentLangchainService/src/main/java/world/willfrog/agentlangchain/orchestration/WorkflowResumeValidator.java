@@ -30,7 +30,15 @@ public class WorkflowResumeValidator {
     static final String PYTHON_REPAIR_EXHAUSTED = "python_repair_exhausted";
     static final String EXTERNAL_TOOL_TERMINAL_FAILURE = "external_tool_terminal_failure";
 
-    private static final Set<String> REPAIRABLE_PYTHON_EXIT_REASONS = Set.of("NON_ZERO_EXIT");
+    private final ToolRepairCatalog repairCatalog;
+
+    public WorkflowResumeValidator() {
+        this(ToolRepairCatalog.pythonDefaults());
+    }
+
+    public WorkflowResumeValidator(ToolRepairCatalog repairCatalog) {
+        this.repairCatalog = repairCatalog == null ? ToolRepairCatalog.pythonDefaults() : repairCatalog;
+    }
 
     /**
      * 跑完六段检查。违例时 {@link Result#ok()} 为 false，{@link Result#violationCode()} 为原原因码。
@@ -44,7 +52,7 @@ public class WorkflowResumeValidator {
                 .filter(Objects::nonNull)
                 .collect(Collectors.toCollection(LinkedHashSet::new));
         boolean handoffAccepted = resumeContext != null && resumeContext.isResultConsumed();
-        boolean activePythonRepair = handoffAccepted && isActivePythonRepair(resumeContext);
+        boolean activeRepair = handoffAccepted && isActiveRepair(resumeContext);
         boolean resumeAtFinal = handoffAccepted
                 && ToolJobResumeContext.FINAL_TODO_ID.equals(resumeContext.getTodoId());
         boolean restartAtFinal = restartCheckpoint != null
@@ -58,22 +66,22 @@ public class WorkflowResumeValidator {
                 resumeContext, restartCheckpoint, suspendedItem, resumeAtFinal, restartAtFinal);
         if (missingTodoCode != null) {
             return Result.rejected(missingTodoCode, completedTodos, completedIds, handoffAccepted,
-                    activePythonRepair, resumeAtFinal, restartAtFinal, suspendedItem, Integer.MIN_VALUE);
+                    activeRepair, resumeAtFinal, restartAtFinal, suspendedItem, Integer.MIN_VALUE);
         }
         int resumeSequence = computeResumeSequence(resumeAtFinal, restartAtFinal, suspendedItem);
         String orderCode = checkCompletedPrefixNotOverlapping(
                 resumeContext, restartCheckpoint, completedTodos, resumeSequence);
         if (orderCode != null) {
             return Result.rejected(orderCode, completedTodos, completedIds, handoffAccepted,
-                    activePythonRepair, resumeAtFinal, restartAtFinal, suspendedItem, resumeSequence);
+                    activeRepair, resumeAtFinal, restartAtFinal, suspendedItem, resumeSequence);
         }
         String consumedFailureCode = checkConsumedFailureMustNotContinue(
-                resumeContext, handoffAccepted, activePythonRepair);
+                resumeContext, handoffAccepted, activeRepair);
         if (consumedFailureCode != null) {
             return Result.rejected(consumedFailureCode, completedTodos, completedIds, handoffAccepted,
-                    activePythonRepair, resumeAtFinal, restartAtFinal, suspendedItem, resumeSequence);
+                    activeRepair, resumeAtFinal, restartAtFinal, suspendedItem, resumeSequence);
         }
-        return Result.accepted(completedTodos, completedIds, handoffAccepted, activePythonRepair,
+        return Result.accepted(completedTodos, completedIds, handoffAccepted, activeRepair,
                 resumeAtFinal, restartAtFinal, suspendedItem, resumeSequence);
     }
 
@@ -154,42 +162,34 @@ public class WorkflowResumeValidator {
     }
 
     /**
-     * 终态已被工作流接受、且不是进行中的 Python 修复时：失败终态必须落成确定性失败，
+     * 终态已被工作流接受、且不是进行中的工具修复时：失败终态必须落成确定性失败，
      * 不得继续跑后面的待办。
      *
      * @return 原因码；通过时返回 null
      */
     String checkConsumedFailureMustNotContinue(ToolJobResumeContext resumeContext,
                                                boolean handoffAccepted,
-                                               boolean activePythonRepair) {
-        if (handoffAccepted && !activePythonRepair
+                                               boolean activeRepair) {
+        if (handoffAccepted && !activeRepair
                 && (!resumeContext.isTerminalSuccess() || resumeContext.isPythonRepairPending())) {
             if (resumeContext.isPythonRepairExhausted()) {
-                return PYTHON_REPAIR_EXHAUSTED;
+                return repairCatalog.handlerForFailure(resumeContext)
+                        .map(ToolRepairHandler::exhaustedFailureCode)
+                        .orElse(PYTHON_REPAIR_EXHAUSTED);
             }
             return EXTERNAL_TOOL_TERMINAL_FAILURE;
         }
         return null;
     }
 
-    boolean isActivePythonRepair(ToolJobResumeContext context) {
-        return context != null
-                && isRepairablePythonFailure(context)
-                && context.isPythonRepairPending()
-                && !context.isPythonRepairExhausted()
-                && context.getPythonRepairAttempt() > 0
-                && context.isResultConsumed();
+    boolean isActiveRepair(ToolJobResumeContext context) {
+        return repairCatalog.handlerForFailure(context)
+                .filter(handler -> handler.isActiveRepair(context))
+                .isPresent();
     }
 
-    boolean isRepairablePythonFailure(ToolJobResumeContext context) {
-        return context != null
-                && !context.isTerminalSuccess()
-                && "FAILED".equals(context.getTerminalStatus())
-                && Boolean.FALSE.equals(context.getTerminalRetryable())
-                && REPAIRABLE_PYTHON_EXIT_REASONS.contains(
-                        nvl(context.getTerminalExitReason(), "").toUpperCase(java.util.Locale.ROOT))
-                && context.getPythonFailedRequestFingerprints() != null
-                && !context.getPythonFailedRequestFingerprints().isEmpty();
+    boolean isRepairableFailure(ToolJobResumeContext context) {
+        return repairCatalog.handlerForFailure(context).isPresent();
     }
 
     private List<LangchainCompletedTodo> restoreCompletedTodos(List<CompletedTodoRecord> records) {
@@ -207,13 +207,6 @@ public class WorkflowResumeValidator {
                 .collect(Collectors.toCollection(ArrayList::new));
     }
 
-    private static String nvl(String primary, String fallback) {
-        if (primary == null || primary.trim().isEmpty()) {
-            return fallback == null ? "" : fallback;
-        }
-        return primary;
-    }
-
     /** 校验结果：通过时带给执行循环用的派生状态；失败时带原样原因码。 */
     public static final class Result {
         private final boolean ok;
@@ -221,7 +214,7 @@ public class WorkflowResumeValidator {
         private final List<LangchainCompletedTodo> completedTodos;
         private final Set<String> completedIds;
         private final boolean handoffAccepted;
-        private final boolean activePythonRepair;
+        private final boolean activeRepair;
         private final boolean resumeAtFinal;
         private final boolean restartAtFinal;
         private final TodoItem suspendedItem;
@@ -232,7 +225,7 @@ public class WorkflowResumeValidator {
                        List<LangchainCompletedTodo> completedTodos,
                        Set<String> completedIds,
                        boolean handoffAccepted,
-                       boolean activePythonRepair,
+                       boolean activeRepair,
                        boolean resumeAtFinal,
                        boolean restartAtFinal,
                        TodoItem suspendedItem,
@@ -242,7 +235,7 @@ public class WorkflowResumeValidator {
             this.completedTodos = completedTodos;
             this.completedIds = completedIds;
             this.handoffAccepted = handoffAccepted;
-            this.activePythonRepair = activePythonRepair;
+            this.activeRepair = activeRepair;
             this.resumeAtFinal = resumeAtFinal;
             this.restartAtFinal = restartAtFinal;
             this.suspendedItem = suspendedItem;
@@ -252,12 +245,12 @@ public class WorkflowResumeValidator {
         static Result accepted(List<LangchainCompletedTodo> completedTodos,
                                Set<String> completedIds,
                                boolean handoffAccepted,
-                               boolean activePythonRepair,
+                               boolean activeRepair,
                                boolean resumeAtFinal,
                                boolean restartAtFinal,
                                TodoItem suspendedItem,
                                int resumeSequence) {
-            return new Result(true, null, completedTodos, completedIds, handoffAccepted, activePythonRepair,
+            return new Result(true, null, completedTodos, completedIds, handoffAccepted, activeRepair,
                     resumeAtFinal, restartAtFinal, suspendedItem, resumeSequence);
         }
 
@@ -265,13 +258,13 @@ public class WorkflowResumeValidator {
                                List<LangchainCompletedTodo> completedTodos,
                                Set<String> completedIds,
                                boolean handoffAccepted,
-                               boolean activePythonRepair,
+                               boolean activeRepair,
                                boolean resumeAtFinal,
                                boolean restartAtFinal,
                                TodoItem suspendedItem,
                                int resumeSequence) {
             return new Result(false, violationCode, completedTodos, completedIds, handoffAccepted,
-                    activePythonRepair, resumeAtFinal, restartAtFinal, suspendedItem, resumeSequence);
+                    activeRepair, resumeAtFinal, restartAtFinal, suspendedItem, resumeSequence);
         }
 
         public boolean ok() {
@@ -294,8 +287,8 @@ public class WorkflowResumeValidator {
             return handoffAccepted;
         }
 
-        public boolean activePythonRepair() {
-            return activePythonRepair;
+        public boolean activeRepair() {
+            return activeRepair;
         }
 
         public boolean resumeAtFinal() {

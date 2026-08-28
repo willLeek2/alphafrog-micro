@@ -6,11 +6,35 @@ import dev.langchain4j.invocation.InvocationContext;
 import dev.langchain4j.service.tool.ToolErrorContext;
 import org.junit.jupiter.api.Test;
 import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingException;
+import world.willfrog.agent.platform.exception.RunBudgetException;
+import world.willfrog.agent.platform.exception.RunInterruptedException;
+import world.willfrog.agent.platform.exception.ToolJobTransferException;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class LangchainTerminalToolErrorHandlerTest {
+
+    @Test
+    void handle_shouldRethrowTypedBudgetAndInterrupt() {
+        RunBudgetException budget = new RunBudgetException("tool_calls", 30, 30, false);
+        assertSame(budget, assertThrows(RunBudgetException.class,
+                () -> LangchainTerminalToolErrorHandler.handle(budget, null)));
+
+        RunInterruptedException interrupted = new RunInterruptedException("CANCELING");
+        assertSame(interrupted, assertThrows(RunInterruptedException.class,
+                () -> LangchainTerminalToolErrorHandler.handle(interrupted, null)));
+    }
+
+    @Test
+    void handle_shouldTreatTransferFailureAsOrdinaryToolError() {
+        TodoToolExecutionException thrown = assertThrows(
+                TodoToolExecutionException.class,
+                () -> LangchainTerminalToolErrorHandler.handle(
+                        new ToolJobTransferException("capacity transfer to pending conflicted"), null));
+        assertEquals("capacity transfer to pending conflicted", thrown.getMessage());
+    }
 
     @Test
     void handle_shouldRethrowBudgetExceededSignal() {

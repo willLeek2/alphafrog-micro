@@ -1098,6 +1098,35 @@ class ToolJobAnchorMapperIntegrationTest {
                 "run-r4", postCancelWriter, AgentRunStatus.EXECUTING)).isEqualTo(1);
     }
 
+    @Test
+    void persistRepairAttemptMergesNewMapWithoutWipingCancelDisposition() throws Exception {
+        AgentRunMapper mapper = newMapper();
+        insertRun("run-repair-merge", "EXECUTING", """
+            {"operationId":"run-repair:tc-1:1","anchorState":"PREPARING",
+             "pythonRepairAttempt":1,"pythonRepairPending":true,
+             "autoResume":false,"runDisposition":"CANCELED"}""");
+
+        assertThat(mapper.persistRepairAttempt(
+                "run-repair-merge", AgentRunStatus.EXECUTING, "run-repair:tc-1:1",
+                "executePython", 2, true, false)).isEqualTo(1);
+
+        ToolJobAnchor merged = ToolJobAnchor.fromJson(
+                mapper.findById("run-repair-merge").getToolJobAnchorJson());
+        assertThat(merged.getRunDisposition()).isEqualTo("CANCELED");
+        assertThat(merged.isAutoResume()).isFalse();
+        assertThat(merged.getAnchorState()).isEqualTo("PREPARING");
+        assertThat(merged.repairAttempt("executePython").getAttempt()).isEqualTo(2);
+        assertThat(merged.repairAttempt("executePython").isPending()).isTrue();
+        assertThat(merged.isPythonRepairPending()).isTrue();
+        String json = mapper.findById("run-repair-merge").getToolJobAnchorJson();
+        assertThat(json).doesNotContain("pythonRepairAttempt");
+        assertThat(json).contains("repairAttempts");
+
+        assertThat(mapper.persistRepairAttempt(
+                "run-repair-merge", AgentRunStatus.EXECUTING, "stale-operation",
+                "executePython", 9, false, true)).isZero();
+    }
+
     /**
      * 260819：终态 Run 残留取消锚点的兜底收口（e572 告警循环）。Run 已被其他写入方
      * 落进业务终态后，正常取消 CAS 永远 0 行；本语句在 WHERE 内完整复核终态 status、
