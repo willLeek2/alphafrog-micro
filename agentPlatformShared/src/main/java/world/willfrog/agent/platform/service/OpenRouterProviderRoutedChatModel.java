@@ -46,8 +46,9 @@ import java.util.Map;
  * <p>这个类是 agentLangchainService 真正发起模型请求的位置。上一层
  * {@link AgentAiServiceFactory} 只负责按阶段构造 ChatModel，到了这里才会把
  * LangChain4j 的 {@link ChatRequest} 转成 OpenAI 兼容的 chat completions HTTP 请求。
- * 因此面试里被问到「模型请求里到底带了什么」「为什么 OpenRouter 会走某个 provider」
- * 「observability 里的 llm trace 从哪里来」时，答案都在这个文件。</p>
+ * 模型请求里到底带了什么、为什么 OpenRouter 会走某个 provider、观测里的 llm trace
+ * 从哪里来，答案都在这个文件。讲解材料见
+ * {@code agent-working-docs/code-review/phase2/agent-run-overall/interview-comments-migrated.md}。</p>
  *
  * <p>与普通 SDK 封装不同，本类刻意没有直接依赖某个现成 OpenAI client，而是手写
  * HTTP 请求和 SSE 聚合。原因是 agent 运行需要额外控制 provider order、结构化输出、

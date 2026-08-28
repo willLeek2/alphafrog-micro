@@ -13,7 +13,7 @@ import java.util.Map;
  * 已冻结计划的步骤执行与“长工具挂起”交接协调器。
  *
  * <p>Run 启动/规划仍由 pipeline 负责；本类只选择 LINEAR/DAG 执行器，并保证 checkpoint
- * 先于 suspended 事件落稳。这样步骤编排不再与 Run 启动、终态写入混在一个方法里。</p>
+ * 先于 suspended 事件确认成功写入数据库。这样步骤编排不再与 Run 启动、终态写入混在一个方法里。</p>
  */
 @Slf4j
 final class LangchainWorkflowStepCoordinator {

@@ -21,7 +21,7 @@ import java.util.Map;
 public class LangchainLinearWorkflowResult {
     /** 正常跑到工作流终点且已得到最终回答；挂起时固定为 false。 */
     private boolean success;
-    /** DAG recovery judge 判定为部分完成。仅 PARTIAL 终态下为 true。 */
+    /** 恢复判定器判定为部分完成。仅 PARTIAL 终态下为 true。 */
     private boolean partial;
     /** 用户取消或暂停导致的协作式中断；pipeline 不得用自己的返回状态覆盖控制面终态。 */
     private boolean interrupted;
@@ -33,12 +33,12 @@ public class LangchainLinearWorkflowResult {
     @Builder.Default
     private List<LangchainCompletedTodo> completedTodos = new ArrayList<>();
     private int toolCallsUsed;
-    /** DAG recovery judge 返回的跳过节点 ID 列表（仅 PARTIAL 时有值）。 */
+    /** 恢复判定器返回的跳过节点 ID 列表（仅 PARTIAL 时有值）。 */
     private List<String> skippedTodoIds;
-    /** DAG recovery judge 的决策 ID（非真实 LLM trace；用于关联 SKIPPED 事件）。
-     *  实际 LLM trace 在 observability 中通过 phase=dag_recovery_judge 过滤定位。 */
+    /** 恢复判定器的决策 ID（不是真实模型调用追踪号；用于关联 SKIPPED 事件）。
+     *  实际模型调用追踪在观测数据里用 phase=dag_recovery_judge 过滤定位。 */
     private String recoveryJudgeDecisionId;
-    /** DAG recovery judge 的判定理由，截断到 500 字符（仅 PARTIAL 时有值）。 */
+    /** 恢复判定器的判定理由，截断到 500 字符（仅 PARTIAL 时有值）。 */
     private String recoveryRationale;
     /**
      * 失败时的结构化观测数据（透传自首个失败 todo 的 failureMetadata）。

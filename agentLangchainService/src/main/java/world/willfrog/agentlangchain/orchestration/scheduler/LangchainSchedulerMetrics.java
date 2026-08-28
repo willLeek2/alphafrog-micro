@@ -70,9 +70,8 @@ public class LangchainSchedulerMetrics {
     /**
      * Run 终态完成计数，按结果分类。
      *
-     * <p>这是给 workflow pipeline 的稳定入口：Codex 在 task #118 / 最终集成时，
-     * 在已成功持久化的 COMPLETED / PARTIAL / FAILED / CANCELED 出口调用。
-     * WAITING_TOOL_JOB（长工具挂起）不算终态，只记 worker release。</p>
+     * <p>这是给 workflow pipeline 的稳定入口：在已成功持久化的 COMPLETED / PARTIAL / FAILED / CANCELED 出口调用。
+     * WAITING_TOOL_JOB（长工具挂起）不算终态，只记 worker 释放。</p>
      */
     public void recordCompletion(AgentRunStatus status) {
         if (status == null) {

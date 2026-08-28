@@ -112,7 +112,7 @@ final class LangchainWorkflowRouting {
      * 与 resume 读取到完全相同的语义，也不会因为 planner 恰好返回了合法的 DAG 元数据
      * 就误杀本可线性化的计划。</p>
      *
-     * <p>缺失依赖、重复 id 或环都无法安全猜测，必须 fail-closed。无依赖节点之间使用
+     * <p>缺失依赖、重复 id 或环都无法安全猜测，必须失败即关闭。无依赖节点之间使用
      * planner sequence、原数组位置、id 依次作为稳定 tie-break，保证同一输入得到同一计划。</p>
      */
     static LangchainTodoPlan effectivePlan(LangchainTodoPlan plan, boolean forceLinear) {

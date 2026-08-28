@@ -20,17 +20,19 @@ import world.willfrog.agent.platform.dataanalysis.PythonRepairContext;
  * ThreadLocal 方案让所有组件在同一个线程内隐式共享这些上下文，
  * 同时保证不同 run 之间天然隔离。</p>
  *
- * <h2>面试常被追问的三个点</h2>
+ * <h2>三个容易踩坑的点</h2>
  * <ul>
- *   <li><b>"ThreadLocal 不会被线程池复用时串数据吗？"</b>
- *       → 入口 finally 块调 {@link #clear()} 清理所有字段，保证线程归还池时是干净的。</li>
- *   <li><b>"DAG 子线程怎么拿到父线程的 webSearch 开关？"</b>
- *       → {@link #captureRunContext()} / {@link #restoreRunContext(ContextSnapshot)} 快照-还原机制。
+ *   <li><b>线程池复用会不会串数据</b>：入口 finally 块调 {@link #clear()} 清理所有字段，
+ *       保证线程归还池时是干净的。</li>
+ *   <li><b>DAG 子线程怎么拿到父线程的 webSearch 开关</b>：
+ *       {@link #captureRunContext()} / {@link #restoreRunContext(ContextSnapshot)} 快照-还原机制。
  *       父线程拍快照 → 传到子线程 → 子线程还原。历史上缺失这套机制时 webSearch 在子线程永远为 false。</li>
- *   <li><b>"结构化输出（structured output）怎么实现的？"</b>
- *       → {@link StructuredOutputSpec} 存在 ThreadLocal 中，LLM 包装器检测到后自动注入
+ *   <li><b>结构化输出（structured output）怎么实现</b>：
+ *       {@link StructuredOutputSpec} 存在 ThreadLocal 中，模型包装器检测到后自动注入
  *       {@code response_format: json_schema} 到请求体。Planner 在调用前 set，调用后 clear。</li>
  * </ul>
+ *
+ * <p>讲解材料见 {@code agent-working-docs/code-review/phase2/agent-run-overall/interview-comments-migrated.md}。</p>
  */
 public class AgentContext {
     /** 当前 Run ID,由 AgentRunExecutor 在执行入口设置 */
@@ -97,7 +99,7 @@ public class AgentContext {
      * 每个 run 在执行线程(含并行子线程)里独立保存,避免跨 run 串扰。
      */
     private static final ThreadLocal<Boolean> DEBUG_MODE_HOLDER = new ThreadLocal<>();
-    /** task #62 A: run-scoped debug observability session id for JSONL writer. */
+    /** run 级调试观测会话 id，给 JSONL writer 用。 */
     private static final ThreadLocal<String> DEBUG_OBSERVABILITY_SESSION_ID_HOLDER = new ThreadLocal<>();
     /**
      * 网页搜索能力开关。
@@ -934,7 +936,7 @@ public class AgentContext {
             Boolean skipRagPrefetch,
             Integer maxResults
     ) {
-        /** 返回所有字段为空/null 的占位 config,用于 getter null safe 兜底。 */
+        /** 返回所有字段为空/null 的占位 config，用于 getter 在缺失时返回安全默认值。 */
         public static WebSearchConfig empty() {
             return new WebSearchConfig("", "", null, null, null);
         }

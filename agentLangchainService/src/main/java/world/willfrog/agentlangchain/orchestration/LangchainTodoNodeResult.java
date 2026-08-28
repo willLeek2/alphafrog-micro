@@ -110,14 +110,14 @@ public class LangchainTodoNodeResult {
     }
 
     /**
-     * Phase 3.2 A3: 把 failureMetadata 按语义路由到 event payload 的对应子字段。
+     * 把 failureMetadata 按语义路由到 event payload 的对应子字段。
      * <p>
      * 路由规则（互斥，按优先级）：
      * <ul>
-     *   <li>{@code budget_exceeded=true} → {@code budget_failure}（Phase 3.2 A3 新增，
-     *       防止 budget failure 被误归类为 empty_todo_output）</li>
-     *   <li>含 #59 14 字段中任一（如 {@code finish_reason / raw_output_length / recovery_outcome} 等）
-     *       或显式 {@code empty_todo_output} 标记 → {@code empty_output_observation}（#59 兼容）</li>
+     *   <li>{@code budget_exceeded=true} → {@code budget_failure}
+     *       （防止额度失败被误归类为 empty_todo_output）</li>
+     *   <li>含空输出观测字段中任一（如 {@code finish_reason / raw_output_length / recovery_outcome} 等）
+     *       或显式 {@code empty_todo_output} 标记 → {@code empty_output_observation}</li>
      *   <li>其他 generic metadata → {@code failure_metadata}（保留通道，避免信息丢失）</li>
      * </ul>
      * <p>
@@ -134,11 +134,11 @@ public class LangchainTodoNodeResult {
         if (meta == null || meta.isEmpty()) {
             return null;
         }
-        // budget priority 最高：A3 引入，先于 #59 兼容
+        // 额度失败优先于空输出观测：先按 budget_exceeded 路由。
         if (Boolean.TRUE.equals(meta.get("budget_exceeded"))) {
             return BUDGET_FAILURE_FIELD;
         }
-        // #59 兼容：empty_todo_output 显式标记 / 14 字段中任一
+        // 空输出观测：显式 empty_todo_output 标记，或观测字段中任一存在。
         if (meta.containsKey("empty_todo_output")
                 || meta.containsKey("finish_reason")
                 || meta.containsKey("raw_output_length")

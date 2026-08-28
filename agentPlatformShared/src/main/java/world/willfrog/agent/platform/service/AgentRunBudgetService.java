@@ -30,7 +30,7 @@ import java.util.Map;
  * <ol>
  *   <li>Nacos 热加载：{@code agent-llm.local.json → runtime.runBudget.*}</li>
  *   <li>Spring 静态配置：{@code agent.llm.runtime.runBudget.*}</li>
- *   <li>启动默认值：{@code agent.run.budget.*}（本类 @Value 注解），硬编码 fallback</li>
+ *   <li>启动默认值：{@code agent.run.budget.*}（本类 @Value 注解），硬编码备用路径</li>
  * </ol>
  *
  * <h2>检查时机</h2>
@@ -53,15 +53,7 @@ import java.util.Map;
  * <p>封装了生效的五个预算维度值，每次调用 {@code check()} 时动态计算并读取。
  * 支持 Nacos 热加载——下一轮检查即可生效，无需重启 run。</p>
  *
- * <h2>面试常考点</h2>
- * <ul>
- *   <li>"为什么 llm_calls 和 tool_calls 分开检查？"→ 两者消耗模式不同：LLM 调用贵但低频，工具调用便宜但高频。
- *       分开计数可以更精细地控制预算分配。</li>
- *   <li>"tokens 为什么比 llm_calls 更容易超？"→ 一次复杂回测的 planning 阶段可能消耗 50K+ token，
- *       而 llm_calls 可能还不到 10 次。</li>
- *   <li>"预算超限后 run 怎么处理？"→ 抛异常 → TerminalToolErrorHandler 识别 → FailureMapper 分类 →
- *       Pipeline 写入失败事件 → 前端看到 RUN_BUDGET_EXCEEDED。</li>
- * </ul>
+ * <p>讲解材料见 {@code agent-working-docs/code-review/phase2/agent-run-overall/interview-comments-migrated.md}。</p>
  *
  * @see OpenRouterProviderRoutedChatModel LLM 调用前检查的消费方
  * @see world.willfrog.agent.tools.router.ToolRouter 工具调用前检查的消费方

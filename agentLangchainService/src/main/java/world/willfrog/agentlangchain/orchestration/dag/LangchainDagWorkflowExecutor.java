@@ -123,7 +123,7 @@ public class LangchainDagWorkflowExecutor {
     public LangchainLinearWorkflowResult executePlanned(LangchainLinearWorkflowRequest request,
                                                         LangchainTodoPlan plan) {
         validate(request, plan);
-        // toolCalls 是原子计数器，整个 DAG 的所有节点 + recovery judge 共享，各自累加自己的 tool call 次数
+        // toolCalls 是原子计数器，整个 DAG 的所有节点与恢复判定器共享，各自累加自己的工具调用次数
         AtomicInteger toolCalls = new AtomicInteger();
         try {
             applyRunContext(request);
@@ -158,9 +158,9 @@ public class LangchainDagWorkflowExecutor {
                 return interrupted(plan, completedTodos, stopBeforeAnswer.get(), toolCalls.get());
             }
 
-            // DAG recovery judge：开关开启 + 存在失败节点时，用 LLM 判定能否温和降级（跳过部分失败节点、用已完成节点生成部分答案）
-            // Phase 3.2 A3 G1: budget 触顶时**绕过** recovery judge —— budget 已超限，再让 LLM 判定会立即再触发 RunBudgetException。
-            // 直接走 handleBudgetExhaustion 路径（partial if completedTodos 非空 / fail-fast 否则）。
+            // 开关开启且存在失败节点时，用模型判定能否跳过部分失败节点、用已完成节点生成部分答案。
+            // 额度已超限时绕过该判定：再问模型会立刻再次触发 RunBudgetException。
+            // 直接走 handleBudgetExhaustion（有已完成节点则拼部分答案，否则立即失败）。
             if (hasFailedNode(parallelRun.results(), items)) {
                 Map<String, Object> budgetMeta = findBudgetFailureMetadata(parallelRun.results());
                 if (budgetMeta != null) {
@@ -174,7 +174,7 @@ public class LangchainDagWorkflowExecutor {
                     if (judgeResult != null) {
                         return judgeResult;
                     }
-                    // judge 返回 null = NO 判定 → 不走降级，继续走下方普通失败路径
+                    // 恢复判定器返回 null = 不同意跳过 → 不生成部分答案，继续走下方普通失败路径
                 }
             }
 
@@ -265,9 +265,9 @@ public class LangchainDagWorkflowExecutor {
     }
 
     /**
-     * 带预填充结果的 DAG 并行执行（用于 recovery judge YES 后的重调度）。
+     * 带预填充结果的 DAG 并行执行（用于恢复判定器同意跳过失败节点后的重调度）。
      *
-     * <p>当 recovery judge 判定某些失败节点可以跳过时，调用方在 {@code nodeSuccess} 中
+     * <p>当恢复判定器判定某些失败节点可以跳过时，调用方在 {@code nodeSuccess} 中
      * 将这些节点标记为 true，使得被它们阻塞的下游节点在新一轮调度中被释放。</p>
      *
      * @param preResults    已有的节点执行结果（已完成的节点不会被重新调度）
@@ -403,7 +403,7 @@ public class LangchainDagWorkflowExecutor {
         String userId = request.getUserId();
         long nodeStartMs = 0;
         try {
-            // 0. recovery judge 重调度：已有结果的节点跳过，避免重复执行
+            // 0. 恢复判定器重调度：已有结果的节点跳过，避免重复执行
             LangchainTodoNodeResult existing = results.get(item.getId());
             if (existing != null) {
                 nodeSuccess.putIfAbsent(item.getId(), existing.isSuccess());
@@ -546,7 +546,7 @@ public class LangchainDagWorkflowExecutor {
         return null;
     }
 
-    // ========== DAG recovery judge ==========
+    // ========== DAG 恢复判定器 ==========
 
     private boolean hasFailedNode(Map<String, LangchainTodoNodeResult> results, List<TodoItem> items) {
         for (TodoItem item : items) {
@@ -559,10 +559,10 @@ public class LangchainDagWorkflowExecutor {
     }
 
     /**
-     * 尝试 DAG recovery judge 温和降级。
+     * 尝试 DAG 恢复判定：跳过部分失败节点、用已完成节点生成部分答案。
      *
-     * @return PARTIAL 结果（YES 判定）、null（NO 判定，走原有失败路径）、
-     *         或原始 failure 结果（judge 调用本身失败）
+     * @return PARTIAL 结果（同意跳过）、null（不同意，走原有失败路径）、
+     *         或原始 failure 结果（判定调用本身失败）
      */
     private LangchainLinearWorkflowResult tryRecoveryJudge(
             LangchainLinearWorkflowRequest request,
@@ -582,11 +582,11 @@ public class LangchainDagWorkflowExecutor {
             ));
         }
 
-        // 保存 judge 前的 phase/stage，无论 judge 成功还是异常，finally 里都要恢复
+        // 保存恢复判定前的 phase/stage，无论判定成功还是异常，finally 里都要恢复
         String previousPhase = AgentContext.getPhase();
         String previousStage = AgentContext.getStage();
         try {
-            // 1. 构建 judge 的 system prompt + user message（user message 里包含所有 todo 的状态摘要和已完成节点的产出）
+            // 1. 构建恢复判定器的 system prompt + user message（user message 里包含所有 todo 的状态摘要和已完成节点的产出）
             String systemPrompt = promptService.reactSystemPrompt();
             String userMessage = promptService.dagRecoveryJudgeStageInstruction()
                     + "\n\n"
@@ -769,7 +769,7 @@ public class LangchainDagWorkflowExecutor {
     }
 
     /**
-     * 构建 recovery judge 的 user message。
+     * 构建恢复判定器的用户消息。
      * 把「所有 todo 的状态 + 已完成节点的产出摘要」拼成一个结构化文本，
      * 让 LLM 能根据依赖关系和已完成产出来判断哪些失败节点可以安全跳过。
      */
@@ -887,8 +887,8 @@ public class LangchainDagWorkflowExecutor {
     }
 
     /**
-     * Phase 3.2 A3 G2: 带 failureMetadata 的 failure overload，让 budget 等结构化失败原因能透传到 pipeline。
-     * 原 4 参 failure() 保留，供 DAG 普通失败路径（非 budget）继续走。
+     * 带 failureMetadata 的失败重载，让额度等结构化失败原因能透传到 pipeline。
+     * 原 4 参 failure() 保留，供 DAG 普通失败路径（非额度）继续走。
      */
     private LangchainLinearWorkflowResult failure(LangchainTodoPlan plan,
                                                   List<LangchainCompletedTodo> completedTodos,
@@ -922,7 +922,7 @@ public class LangchainDagWorkflowExecutor {
                 .build();
     }
 
-    // ========== Phase 3.2 A3 G1/G3: budget 触顶时的确定性降级（DAG 端） ==========
+    // ========== 额度用尽时用已完成节点生成部分答案（DAG 端） ==========
 
     /**
      * 扫描所有节点结果，返回第一个带 {@code budget_exceeded=true} 的 failureMetadata；无则返 null。
@@ -955,8 +955,8 @@ public class LangchainDagWorkflowExecutor {
     }
 
     /**
-     * Phase 3.2 A3 G3: DAG 端 budget 触顶降级，逻辑与 Linear 一致（共用 {@link LangchainBudgetPartialAnswerBuilder}）。
-     * 区别：还会发 {@code DAG_EXECUTION_COMPLETED} 事件（partial/fail-fast 状态）保持与普通 DAG 完成事件兼容。
+     * DAG 端额度用尽降级，逻辑与 Linear 一致（共用 {@link LangchainBudgetPartialAnswerBuilder}）。
+     * 区别：还会发 {@code DAG_EXECUTION_COMPLETED} 事件（部分完成 / 立即失败）保持与普通 DAG 完成事件兼容。
      */
     private LangchainLinearWorkflowResult handleBudgetExhaustion(LangchainLinearWorkflowRequest request,
                                                                   LangchainTodoPlan plan,
@@ -1168,7 +1168,7 @@ public class LangchainDagWorkflowExecutor {
      * <ul>
      *   <li>{@code failureMetadata} 非空时按 {@link LangchainTodoNodeResult#routeFailureMetadataField} 语义路由
      *       到 {@code budget_failure} / {@code empty_output_observation} / {@code failure_metadata} 子 map
-     *       （Phase 3.2 A3 防止 budget metadata 误挂 empty_output_observation）；</li>
+     *       （防止额度失败的元数据被误写进 empty_output_observation）；</li>
      *   <li>{@code recovered=true} 时写入 {@code recovered=true} + {@code recovery_outcome}，便于压测报告统计 success after recovery；</li>
      *   <li>{@code errorCode} 与 RUN_CANCELED 推断逻辑保持兼容。</li>
      * </ul>
@@ -1211,8 +1211,8 @@ public class LangchainDagWorkflowExecutor {
                     payload.put("todo_retry_outcome", failureMetadata.get("todo_retry_outcome"));
                 }
             }
-            // Phase 3.2 A3: failureMetadata 按语义路由到 budget_failure / empty_output_observation / failure_metadata，
-            // 避免 budget failure 被误挂 empty_output_observation。
+            // failureMetadata 按语义路由到 budget_failure / empty_output_observation / failure_metadata，
+            // 避免额度失败被误写进 empty_output_observation。
             String field = LangchainTodoNodeResult.routeFailureMetadataField(failureMetadata);
             if (field != null && !success) {
                 payload.put(field, failureMetadata);

@@ -152,7 +152,7 @@ public class LangchainRunConcurrencyScheduler {
                                            RunPriority priority, int weight) {
         String key = UUID.randomUUID().toString();
         if (!capacityLedger.tryAcquire(key, weight)) {
-            // 策略判定容量放得下但账本拒绝（策略与账本不一致时 fail-closed）。
+            // 策略判定容量放得下但账本拒绝（策略与账本不一致时失败即关闭）。
             rejectLocked(limits, "capacity_full");
         }
         // 先递增计数再返回 reservation，防止 submit 前被另一个请求抢占。
@@ -197,7 +197,7 @@ public class LangchainRunConcurrencyScheduler {
     }
 
     private Reservation rejectLocked(LangchainRunExecutorLimits limits, String reason) {
-        // running 与 queue 都达到动态/硬限制时 fail-fast，避免无界堆积占满 JVM。
+        // running 与 queue 都达到动态/硬限制时立即拒绝，避免无界堆积占满 JVM。
         rejectedCount.incrementAndGet();
         metrics.recordRejected(reason);
         log.warn("Scheduler rejected reason={}: running={} queued={} rejectedTotal={} hardLimits={} currentLimits={}",
@@ -239,7 +239,7 @@ public class LangchainRunConcurrencyScheduler {
             queue.enqueue(reservation.priority,
                     new PendingRun(run, task, System.currentTimeMillis(),
                             reservation.priority, reservation.id, reservation.weight));
-            // 理论上 reserve 已设置时间；这里兼容历史状态并兜底。
+            // 理论上 reserve 已设置时间；这里兼容历史状态并给出默认值。
             if (oldestQueuedAtMillis == 0) {
                 oldestQueuedAtMillis = System.currentTimeMillis();
             }

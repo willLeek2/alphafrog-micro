@@ -52,12 +52,14 @@ import java.time.LocalDate;
 /**
  * agentLangchainService 的 run 级总控流水线。
  *
- * <p>面试时可以把这个类理解成“一个 AgentRun 从创建后到完成/失败落库”的主线剧本：
+ * <p>一次 AgentRun 从创建后到完成/失败落库的主线：
  * 先恢复 run 记录和运行上下文，再解析 planning（规划）、execution（执行）、
  * final answer（最终答案）三个阶段要用的模型，接着调用 {@link LangchainAiPlanner}
  * 生成 todo（任务项）计划，之后根据计划选择
  * {@link LangchainLinearWorkflowExecutor} 或 {@link LangchainDagWorkflowExecutor} 执行，
  * 最后把答案、事件、运行快照和可观测数据写回共享存储。</p>
+ * <p>讲解材料见
+ * {@code agent-working-docs/code-review/phase2/agent-run-overall/interview-comments-migrated.md}</p>
  *
  * <p>这个类本身不直接和大模型对话，也不直接执行工具；它负责把“模型、prompt、工具目录、
  * 状态机、可观测性、取消/暂停控制”串成一个完整业务流程。具体规划逻辑在
@@ -93,8 +95,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
     private final AgentRunFinalizationService finalizationService;
     private final AgentPromptService promptService;
     /**
-     * 260623-agent-service-deprecation task #47 (P0-2)：agentLangchainService 的 run 级执行
-     * 完毕后清理 {@link AgentRunDatasetRegistry} 的 per-run 状态，避免长生命周期进程里
+     * run 级执行完毕后清理 {@link AgentRunDatasetRegistry} 的 per-run 状态，避免长生命周期进程里
      * registry 无限累积。{@link ObjectProvider} 模式与 {@link #toolProviderProvider} 等
      * 可选依赖保持一致：bean 不存在时静默跳过（如单元测试场景）。
      */
@@ -239,8 +240,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             // 后续 OpenRouterProviderRoutedChatModel、ToolRouterToolProvider、可观测服务都会从这里取 runId/userId/phase。
             AgentContext.setRunId(runId);
             AgentContext.setUserId(userId);
-            // D02：先恢复并校验 run 级 Prompt 身份，再允许任何模型解析、观测初始化或
-            // follow-up 摘要调用。坏摘要必须在第一次 LLM 副作用之前 fail closed。
+            // 先恢复并校验 run 级 Prompt 身份，再允许任何模型解析、观测初始化或
+            // follow-up 摘要调用。坏摘要必须在第一次 LLM 副作用之前失败即关闭。
             setPromptSelectionFromExt(run.getExt());
             DebugObservabilityService debugObservabilityService = debugObservabilityServiceProvider.getIfAvailable();
             if (debugObservabilityService != null) {
@@ -250,7 +251,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             if (!eventService.isRunnable(runId, userId)) {
                 return;
             }
-            // 260612-01-02: 防御性跑前校验（HTTP/Dubbo 已校验，pipeline 再校验一次防漏）
+            // 防御性跑前校验（HTTP/Dubbo 已校验，pipeline 再校验一次防漏）
             if (!hasAdminCreditBypass(run) && !creditService.hasPositiveCredit(userId)) {
                 String reason = "insufficient_credit";
                 log.warn("LangChain run blocked by credit pre-check: runId={} userId={}", runId, userId);
@@ -319,7 +320,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
 
             /*
              * execution mode 是 Run 创建时冻结的用户契约。代码解释器开关只决定是否暴露
-             * executePython，不能再覆盖 LINEAR / DAG / AUTO。非法值由统一解析器 fail-closed；
+             * executePython，不能再覆盖 LINEAR / DAG / AUTO。非法值由统一解析器失败即关闭；
              * 缺省值保持 AUTO。
              */
             PlanExecutionMode requestedExecutionMode = AgentRunEventService.parseExecutionMode(
@@ -451,7 +452,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                             .toolCallsUsed(0)
                             .build(),
                     e);
-            // 260612-01-02: 异常路径也触发结算
+            // 异常路径也触发结算
             tryScheduleSettlement(runId, userId);
         } finally {
             try {
@@ -463,9 +464,9 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 log.warn("Failed to close debug observability session for runId={}: {}",
                         runId, debugCloseEx.getMessage());
             }
-            // 260623-agent-service-deprecation task #47 (P0-2)：清理当前 run 的 dataset/manifest 编号转译层状态。
+            // 清理当前 run 的 dataset/manifest 编号转译层状态。
             // 长生命周期进程里若不清理，registry 会无限累积；run 终态后下一个 run 串到上一个 run 的编号 → 错位。
-            // ObjectProvider 兜底：bean 不存在时静默跳过（保持纯单元测试启动）。
+            // ObjectProvider 在 bean 不存在时静默跳过（保持纯单元测试启动）。
             try {
                 AgentRunDatasetRegistry registry = agentRunDatasetRegistryProvider.getIfAvailable();
                 if (registry != null) {
@@ -848,7 +849,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         runMapper.updatePlanJson(runId, userId, planJson);
         AgentRunStateStore stateStore = stateStoreProvider.getIfAvailable();
         if (stateStore != null) {
-            // Redis 中的 plan 是前端 snapshot/status 的快速恢复来源；DB 中的 plan 是终态和历史兜底。
+            // Redis 中的 plan 是前端 snapshot/status 的快速恢复来源；DB 中的 plan 是终态和历史的权威副本。
             // valid=true 说明这是 planner 生成并被 pipeline 接受的计划，不是 HITL 修改中的临时草稿。
             stateStore.recordPlan(runId, planJson, true);
         }
@@ -997,7 +998,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         }
     }
 
-    /** 从 run.ext 恢复 D02 冻结的 Prompt 选择；旧 Run 没有该字段时保持兼容的当前默认。 */
+    /** 从 run.ext 恢复冻结的 Prompt 选择；旧 Run 没有该字段时保持兼容的当前默认。 */
     private void setPromptSelectionFromExt(String extJson) {
         if (extJson == null || extJson.isBlank()) {
             return;
@@ -1125,12 +1126,11 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         }
         try {
             markRunStatus(runId, AgentRunStatus.FAILED);
-            // 260618-workspace-v0: 触发终态事件
             finalizationService.publishFinalizedEvent(runId, userId, AgentRunStatus.FAILED.name());
             Map<String, Object> payload = new LinkedHashMap<>(decision.getEventPayload());
-            // ccmax #59: empty_todo_output 结构化观测透传到最终 WORKFLOW_FAILED event payload。
+            // empty_todo_output 结构化观测透传到最终 WORKFLOW_FAILED event payload。
             // 主路径：以 result.failureMetadata 非空为准（executor 在 try 块内构造，不依赖 failureReason 字符串协议）。
-            // Phase 3.2 A3: failureMetadata 按语义路由到不同子字段（budget_failure / empty_output_observation / failure_metadata），
+            // failureMetadata 按语义路由到不同子字段（budget_failure / empty_output_observation / failure_metadata），
             // 避免 budget failure 被误归类为 empty_todo_output。
             // Fallback：failureReason 含 empty_todo_output 时也允许兼容（针对历史 / 未来 executor 还没填 metadata 的场景，但 fallback 不伪造 observation）。
             Map<String, Object> failureMetadata = result == null ? null : result.getFailureMetadata();
@@ -1202,7 +1202,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         try {
             prepared.service().commitTerminalSnapshot(prepared.candidate());
         } catch (RuntimeException e) {
-            // 主数据库终态已落稳；观测 Redis 失败不得把 winner 伪装成可重试旧 worker。
+            // 主数据库终态已确认成功写入；观测 Redis 失败不得把 winner 伪装成可重试旧 worker。
             log.warn("Terminal observability commit failed after durable resumed snapshot run={}: {}",
                     prepared.candidate().runId(), e.getMessage());
         }

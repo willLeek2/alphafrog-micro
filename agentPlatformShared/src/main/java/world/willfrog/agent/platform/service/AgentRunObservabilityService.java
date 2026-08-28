@@ -33,7 +33,8 @@ import java.util.function.Consumer;
  * <p>每次 agent run 执行期间会产生大量的 LLM 调用、工具调用、阶段切换、失败重试等事件。
  * 这个类负责把所有非确定性行为（每次 LLM 推理结果不同、工具调用结果变化）记录下来，
  * 形成完整的时间线和追踪链。排障时 matrix 的 summary/events/traces/observability_full
- * 都依赖这里的数据。面试被问"你们怎么排查 agent 失败"时，所有答案都来自这个类。</p>
+ * 都依赖这里的数据。讲解材料见
+ * {@code agent-working-docs/code-review/phase2/agent-run-overall/interview-comments-migrated.md}。</p>
  *
  * <h2>核心职责</h2>
  * <ol>
@@ -48,8 +49,8 @@ import java.util.function.Consumer;
  *       endpoint/model、captureLlmRequests 开关。{@link #recordFailure} 在 run 失败时写入
  *       diagnostics.lastErrorType / lastErrorMessage。</li>
  *   <li><b>阶段（phase）维度聚合</b>：planning / parallel_execution / sub_agent / tool_execution /
- *       summarizing 五个阶段各自聚合 llmCalls、toolCalls、durationMs、tokens、errors。
- *       面试可讲"我们的 observability 按阶段聚合，方便定位是 planning 还是 execution 出了问题"。</li>
+ *       summarizing 五个阶段各自聚合 llmCalls、toolCalls、durationMs、tokens、errors，
+ *       用来判断失败发生在规划还是执行。</li>
  *   <li><b>观测视图组装</b>：{@link #attachObservabilityToSnapshot} 在 run 完成时将观测数据
  *       嵌入到 snapshot JSON（落 DB）。{@link #loadObservabilityJson} 优先从 Redis 加载完整观测，
  *       其次从 snapshot 回退。{@link #loadObservabilitySummaryJson} 返回不含 trace 的轻量摘要。</li>
@@ -63,10 +64,10 @@ import java.util.function.Consumer;
  * 工具调用  → recordToolCall() → mutate() → Redis
  * Run 结束  → attachObservabilityToSnapshot() → scrub 后的 snapshot JSON → DB
  * 详情展开  → safe detail API → Redis detail blob（过期则返回 expired/unavailable）
- * Matrix    → loadObservabilityJson() → Redis 优先，snapshot 兜底
+ * Matrix    → loadObservabilityJson() → Redis 优先，snapshot 备用
  * </pre>
  *
- * <h2>容量保护（面试要点）</h2>
+ * <h2>容量保护</h2>
  * <p>生产环境长时间运行的 agent 可能产生数百次 LLM 调用，不加限制会撑爆 Redis 和 DB。
  * 因此设计了"摘要索引 + 短期 detail blob + 截断预览"三层容量保护：</p>
  * <ul>

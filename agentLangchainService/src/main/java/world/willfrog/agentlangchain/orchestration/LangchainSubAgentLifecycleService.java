@@ -43,7 +43,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * D06 子代理的生产生命周期实现。
+ * 子代理的生产生命周期实现。
  *
  * <p>接受与终态写入同一 Agent Run 的 durable 事件；进程内 Future 只负责当前 JVM 的实际执行。
  * 已完成结果可在句柄清理或重启后通过事件重读。未完成任务不跨 JVM 恢复，等待会明确返回
