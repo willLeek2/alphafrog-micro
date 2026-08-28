@@ -237,23 +237,25 @@ public class LangchainTodoNodeExecutor {
                                            List<LangchainCompletedTodo> completedTodos,
                                            Map<String, String> datasetRefs,
                                            AtomicInteger toolCalls) {
-        return execute(request, item, completedTodos, datasetRefs, toolCalls, null);
+        return runAttempt(request, item, completedTodos, datasetRefs, toolCalls, null, null);
     }
 
     /**
-     * 执行普通 Todo，或在 durable Python 终态失败后用同一 Todo 语义启动一轮修复。
+     * 启动一轮修复：durable Python 终态失败后，用同一 Todo 语义再执行一轮。
      * repairContext 只投影 anchor 中的持久化状态，不是新的真相源。
+     * 正常执行请走 {@link #execute(LangchainLinearWorkflowRequest, TodoItem, List, Map, AtomicInteger)}；
+     * 语义重试不提升为公开入口，在私有 {@link #runAttempt} 内递归。
      */
-    public LangchainTodoNodeResult execute(LangchainLinearWorkflowRequest request,
-                                           TodoItem item,
-                                           List<LangchainCompletedTodo> completedTodos,
-                                           Map<String, String> datasetRefs,
-                                           AtomicInteger toolCalls,
-                                           ToolJobResumeContext repairContext) {
-        return executeInternal(request, item, completedTodos, datasetRefs, toolCalls, repairContext, null);
+    public LangchainTodoNodeResult executeRepairRound(LangchainLinearWorkflowRequest request,
+                                                      TodoItem item,
+                                                      List<LangchainCompletedTodo> completedTodos,
+                                                      Map<String, String> datasetRefs,
+                                                      AtomicInteger toolCalls,
+                                                      ToolJobResumeContext repairContext) {
+        return runAttempt(request, item, completedTodos, datasetRefs, toolCalls, repairContext, null);
     }
 
-    private LangchainTodoNodeResult executeInternal(LangchainLinearWorkflowRequest request,
+    private LangchainTodoNodeResult runAttempt(LangchainLinearWorkflowRequest request,
                                                     TodoItem item,
                                                     List<LangchainCompletedTodo> completedTodos,
                                                     Map<String, String> datasetRefs,
@@ -368,7 +370,7 @@ public class LangchainTodoNodeExecutor {
                 // retryContext 非空表示当前已经是唯一允许的第二次执行，绝不继续递归。
                 if (retryContext == null && repairContext == null && decision.retry()) {
                     todoRetryPolicy.recordAttempt(decision);
-                    LangchainTodoNodeResult retried = executeInternal(
+                    LangchainTodoNodeResult retried = runAttempt(
                             request, item, completedTodos, datasetRefs, toolCalls, repairContext,
                             new TodoRetryContext(
                                     decision.toolName(), decision.previousArguments(),
