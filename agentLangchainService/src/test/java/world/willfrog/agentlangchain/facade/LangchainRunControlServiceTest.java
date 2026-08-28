@@ -132,17 +132,124 @@ class LangchainRunControlServiceTest {
         verify(pipeline).launchAsync(received);
     }
 
+    private ToolJobAnchor pausedAnchor(String operationId, String terminalStatus, String finalizerStep) {
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId(operationId);
+        anchor.setRunDisposition(world.willfrog.agent.platform.dataanalysis.ToolJobRunDisposition.PAUSED);
+        anchor.setAutoResume(false);
+        anchor.setTerminalStatus(terminalStatus);
+        anchor.setFinalizerStep(finalizerStep);
+        return anchor;
+    }
+
     @Test
-    void pauseRejectsRunWaitingToolJob() {
-        // 等待长工具的 run 调暂停必须明确拒绝并提示改用取消：
-        // 只改状态不处置锚点，清理链第一步条件更新会命中 0 行（配额与终态事件丢失）。
+    void resumeRejectsWhilePausedToolJobStillInFlight() {
+        // 暂停时长工具还在跑（锚点没有终态字段）：拒绝恢复，不重置状态、不重新派发。
+        AgentRun waiting = run(AgentRunStatus.WAITING);
+        when(readService.requireWritableRun("r1", "u1")).thenReturn(waiting);
+        when(anchorService.loadAnchor("r1")).thenReturn(pausedAnchor("op-1", null, null));
+
+        IllegalStateException ex = assertThrows(IllegalStateException.class, () ->
+                service.resumeRun(ResumeAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build()));
+
+        assertTrue(ex.getMessage().contains("still in flight"));
+        verify(runMapper, never()).resetForResume(anyString(), anyString(), any());
+        verify(pipeline, never()).launchAsync(any());
+    }
+
+    @Test
+    void resumeRejectsWhilePausedCleanupIncomplete() {
+        // 工具终态已确认但清理链没走完（finalizerStep 未到 EVENT）：拒绝并提示稍后重试。
+        AgentRun waiting = run(AgentRunStatus.WAITING);
+        when(readService.requireWritableRun("r1", "u1")).thenReturn(waiting);
+        when(anchorService.loadAnchor("r1")).thenReturn(pausedAnchor("op-1", "SUCCEEDED", "ENVELOPE"));
+
+        IllegalStateException ex = assertThrows(IllegalStateException.class, () ->
+                service.resumeRun(ResumeAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build()));
+
+        assertTrue(ex.getMessage().contains("cleanup is still in progress"));
+        verify(runMapper, never()).resetForResume(anyString(), anyString(), any());
+        verify(pipeline, never()).launchAsync(any());
+    }
+
+    @Test
+    void resumeClearsFinalizedPausedAnchorThenRelaunches() {
+        // 清理链走完（finalizerStep=EVENT）：先按栅栏清锚点，再走正常恢复流程。
+        AgentRun waiting = run(AgentRunStatus.WAITING);
+        AgentRun received = run(AgentRunStatus.RECEIVED);
+        when(readService.requireWritableRun("r1", "u1")).thenReturn(waiting);
+        when(readService.requireReadableRun("r1", "u1")).thenReturn(received);
+        when(eventService.nextTtlExpiresAt()).thenReturn(OffsetDateTime.now().plusHours(1));
+        when(anchorService.loadAnchor("r1")).thenReturn(pausedAnchor("op-1", "SUCCEEDED", "EVENT"));
+        when(anchorService.clearPausedAnchor("r1", "op-1")).thenReturn(true);
+
+        var response = service.resumeRun(ResumeAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build());
+
+        assertEquals("RECEIVED", response.getStatus());
+        var inOrder = inOrder(anchorService, runMapper, pipeline);
+        inOrder.verify(anchorService).clearPausedAnchor("r1", "op-1");
+        inOrder.verify(runMapper).resetForResume(eq("r1"), eq("u1"), any());
+        inOrder.verify(pipeline).launchAsync(received);
+    }
+
+    @Test
+    void resumeAbortsWhenPausedAnchorClearLostRace() {
+        // 清锚点栅栏没抢到（并发处置已改变状态）：整个恢复失败关闭。
+        AgentRun waiting = run(AgentRunStatus.WAITING);
+        when(readService.requireWritableRun("r1", "u1")).thenReturn(waiting);
+        when(anchorService.loadAnchor("r1")).thenReturn(pausedAnchor("op-1", "SUCCEEDED", "EVENT"));
+        when(anchorService.clearPausedAnchor("r1", "op-1")).thenReturn(false);
+
+        IllegalStateException ex = assertThrows(IllegalStateException.class, () ->
+                service.resumeRun(ResumeAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build()));
+
+        assertTrue(ex.getMessage().contains("resume_anchor_clear_failed"));
+        verify(runMapper, never()).resetForResume(anyString(), anyString(), any());
+        verify(pipeline, never()).launchAsync(any());
+    }
+
+    @Test
+    void pauseOnWaitingToolJobPersistsDispositionThenPauses() {
+        // 等待长工具的 run 调暂停：先往锚点写暂停处置（autoResume=false + PAUSED），
+        // 处置落库后再把状态写成 WAITING——收尾器终态到达时凭 PAUSED 照常走清理链。
+        AgentRun waitingToolJob = run(AgentRunStatus.WAITING_TOOL_JOB);
+        AgentRun paused = run(AgentRunStatus.WAITING);
+        when(readService.requireWritableRun("r1", "u1")).thenReturn(waitingToolJob);
+        when(readService.requireReadableRun("r1", "u1")).thenReturn(paused);
+        when(observabilityService.attachObservabilityToSnapshot("r1", "{}", AgentRunStatus.WAITING))
+                .thenReturn("{\"observability\":{}}");
+        when(eventService.nextInterruptedExpiresAt()).thenReturn(OffsetDateTime.now().plusDays(7));
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId("op-1");
+        when(anchorService.loadAnchor("r1")).thenReturn(anchor);
+        when(anchorService.persistPauseDisposition("r1", "op-1", AgentRunStatus.WAITING_TOOL_JOB))
+                .thenReturn(true);
+
+        service.pauseRun(PauseAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build());
+
+        var inOrder = inOrder(anchorService, runMapper);
+        inOrder.verify(anchorService).persistPauseDisposition("r1", "op-1", AgentRunStatus.WAITING_TOOL_JOB);
+        inOrder.verify(runMapper).updateSnapshot(eq("r1"), eq("u1"), eq(AgentRunStatus.WAITING), anyString(), eq(false), any());
+        verify(runMapper).updateStatusWithTtl(eq("r1"), eq("u1"), eq(AgentRunStatus.WAITING), any());
+        verify(stateStore).markRunStatus("r1", AgentRunStatus.WAITING.name());
+    }
+
+    @Test
+    void pauseOnWaitingToolJobAbortsWhenDispositionRejected() {
+        // 处置写不进去（任务已被替换，或取消/检查点失败已先落处置）：
+        // 整个暂停失败关闭，状态/事件/Redis 一律不动。
         AgentRun waitingToolJob = run(AgentRunStatus.WAITING_TOOL_JOB);
         when(readService.requireWritableRun("r1", "u1")).thenReturn(waitingToolJob);
+        ToolJobAnchor anchor = new ToolJobAnchor();
+        anchor.setOperationId("op-1");
+        when(anchorService.loadAnchor("r1")).thenReturn(anchor);
+        when(anchorService.persistPauseDisposition(anyString(), anyString(), any()))
+                .thenReturn(false);
 
         IllegalStateException ex = assertThrows(IllegalStateException.class, () ->
                 service.pauseRun(PauseAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build()));
 
-        assertTrue(ex.getMessage().contains("use cancel instead"));
+        assertTrue(ex.getMessage().contains("pause_anchor_disposition_failed"));
         verify(runMapper, never()).updateSnapshot(anyString(), anyString(), any(), anyString(), anyBoolean(), any());
         verify(runMapper, never()).updateStatusWithTtl(anyString(), anyString(), any(), any());
         verify(stateStore, never()).markRunStatus(anyString(), anyString());

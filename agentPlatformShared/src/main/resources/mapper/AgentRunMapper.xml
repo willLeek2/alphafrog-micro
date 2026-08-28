@@ -339,6 +339,28 @@
           AND user_id = #{userId}
     </update>
 
+    <!--
+        终态专用快照写入：比 updateSnapshot 多一条状态栅栏——数据库里已是终态
+        （COMPLETED/PARTIAL/FAILED/CANCELED/EXPIRED）时返回 0，不覆盖既有终态。
+        用于执行路径的 COMPLETED/PARTIAL/FAILED 落库：取消与执行并发时，
+        先落库的终态（例如用户取消的 CANCELED）赢，后到的一方拿不到行、
+        由调用方按「未提交」语义跳过收尾副作用。非终态写入（如暂停写 WAITING）
+        仍走 updateSnapshot，不受本条影响。
+    -->
+    <update id="updateTerminalSnapshot">
+        UPDATE alphafrog_agent_run
+        SET status = #{status},
+            snapshot_json = CAST(#{snapshotJson} AS jsonb),
+            last_error = #{lastError},
+            updated_at = CURRENT_TIMESTAMP
+            <if test="completed">
+                , completed_at = CURRENT_TIMESTAMP
+            </if>
+        WHERE id = #{id}
+          AND user_id = #{userId}
+          AND status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')
+    </update>
+
     <update id="resetForResume">
         UPDATE alphafrog_agent_run
         SET status = 'RECEIVED',
@@ -396,12 +418,26 @@
 
     <!-- ===== Tool Job Anchor ===== -->
 
+    <!--
+        WHERE 条件语义：expectedStatus='WAITING_TOOL_JOB' 时同时接受
+        「WAITING 且锚点 runDisposition=PAUSED」——这是被暂停的长工具等待态，
+        与等待中语义等价（收尾器照常接管终态，只是不自动恢复）。
+        写在 mapper 层一处，六个以 WAITING_TOOL_JOB 为条件的调用点（收尾器三处、
+        对账器两处、启动恢复一处）零改动。
+    -->
+    <sql id="toolJobOwnershipFence">
+        AND (status = #{expectedStatus}
+             OR (#{expectedStatus} = 'WAITING_TOOL_JOB'
+                 AND status = 'WAITING'
+                 AND tool_job_anchor_json -&gt;&gt; 'runDisposition' = 'PAUSED'))
+    </sql>
+
     <update id="updateToolJobAnchor">
         UPDATE alphafrog_agent_run
         SET tool_job_anchor_json = CAST(#{toolJobAnchorJson} AS jsonb),
             updated_at = CURRENT_TIMESTAMP
         WHERE id = #{id}
-          AND status = #{expectedStatus}
+          <include refid="toolJobOwnershipFence"/>
 
           <!-- 260818（grace round-4）：整份覆盖写与取消标记的读写一致性——数据库当前
                autoResume 必须仍等于调用方锚点 JSON 里携带的旧值；取消在读取与写入
@@ -417,7 +453,7 @@
             status = #{newStatus},
             updated_at = CURRENT_TIMESTAMP
         WHERE id = #{id}
-          AND status = #{expectedStatus}
+          <include refid="toolJobOwnershipFence"/>
 
           <!-- 260818（grace round-4）：整份覆盖写与取消标记的读写一致性——数据库当前
                autoResume 必须仍等于调用方锚点 JSON 里携带的旧值；取消在读取与写入
@@ -456,6 +492,40 @@
         WHERE id = #{id}
           AND status = #{expectedStatus}
           AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{expectedOperationId}
+    </update>
+
+    <!--
+        暂停意图的专项更新，形状与 persistCancelDisposition 对称：只写
+        autoResume=false 与 runDisposition=PAUSED 两个字段。
+        多一条栅栏：锚点上已有处置（CANCELED/CHECKPOINT_FAILED/DAG 系）时返回 0——
+        取消与检查点失败先于暂停落库时，暂停不能覆盖它们，pauseRun 按返回 0 失败关闭。
+    -->
+    <update id="persistPauseDisposition">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = tool_job_anchor_json || jsonb_build_object(
+                'autoResume', false,
+                'runDisposition', 'PAUSED'
+            ),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status = #{expectedStatus}
+          AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{expectedOperationId}
+          AND (tool_job_anchor_json -&gt;&gt; 'runDisposition') IS NULL
+    </update>
+
+    <!--
+        手动恢复时清掉已收尾的暂停锚点：只有 Run 仍停在 WAITING、处置标记仍是 PAUSED、
+        operationId 未变时才清成 '{}'。任一栅栏不满足返回 0——并发处置已改变状态，
+        resumeRun 必须放弃本次恢复。
+    -->
+    <update id="clearPausedToolJobAnchor">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = CAST('{}' AS jsonb),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status = 'WAITING'
+          AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{expectedOperationId}
+          AND tool_job_anchor_json -&gt;&gt; 'runDisposition' = 'PAUSED'
     </update>
 
     <!--
@@ -669,7 +739,11 @@
             status = #{newStatus},
             updated_at = CURRENT_TIMESTAMP
         WHERE id = #{id}
-          AND status IN ('WAITING_TOOL_JOB', 'EXECUTING')
+          <!-- WAITING 在列的理由：先暂停后取消的 Run 停在 WAITING（锚点处置已从
+               PAUSED 被覆盖为 CANCELED），收尾器必须能把它原子写进 CANCELED，
+               否则每 5 秒重试形成告警循环。无锚点的纯暂停 Run 到不了这里——
+               本语句还有 operationId 栅栏。 -->
+          AND status IN ('WAITING_TOOL_JOB', 'EXECUTING', 'WAITING')
           AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{expectedOperationId}
     </update>
 

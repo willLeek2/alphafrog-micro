@@ -82,6 +82,18 @@ public interface AgentRunMapper {
                        @Param("completed") boolean completed,
                        @Param("lastError") String lastError);
 
+    /**
+     * 终态专用快照写入：比 updateSnapshot 多一条状态栅栏，数据库里已是终态时返回 0，
+     * 不覆盖既有终态（取消与执行并发时先落库的终态赢）。只用于执行路径的
+     * COMPLETED/PARTIAL/FAILED 落库；非终态写入（暂停写 WAITING 等）仍用 updateSnapshot。
+     */
+    int updateTerminalSnapshot(@Param("id") String id,
+                               @Param("userId") String userId,
+                               @Param("status") AgentRunStatus status,
+                               @Param("snapshotJson") String snapshotJson,
+                               @Param("completed") boolean completed,
+                               @Param("lastError") String lastError);
+
     int resetForResume(@Param("id") String id,
                        @Param("userId") String userId,
                        @Param("ttlExpiresAt") OffsetDateTime ttlExpiresAt);
@@ -178,6 +190,24 @@ public interface AgentRunMapper {
                               @Param("attempt") int attempt,
                               @Param("pending") boolean pending,
                               @Param("exhausted") boolean exhausted);
+
+    /**
+     * 暂停意图的专项更新——形状与 persistCancelDisposition 完全对称：仅在 Run 状态与
+     * 精确 operationId 仍匹配时，用 jsonb 合并只写 autoResume=false 与
+     * runDisposition=PAUSED 两个字段。先写处置再改 Run 状态（WAITING），保证长工具
+     * 终态到达时收尾器能凭 PAUSED 标记认出这个等待中的 Run 并走完清理链。
+     * 返回 0 的语义与取消相同：任务已被替换，调用方重读重试或失败关闭。
+     */
+    int persistPauseDisposition(@Param("id") String id,
+                                @Param("expectedStatus") AgentRunStatus expectedStatus,
+                                @Param("expectedOperationId") String expectedOperationId);
+
+    /**
+     * 手动恢复前清掉已收尾的暂停锚点。栅栏：Run 仍 WAITING + runDisposition 仍 PAUSED +
+     * 精确 operationId。返回 0 表示并发处置已改变状态，调用方必须放弃本次恢复。
+     */
+    int clearPausedToolJobAnchor(@Param("id") String id,
+                                 @Param("expectedOperationId") String expectedOperationId);
 
     /**
      * 第一次 PREPARING dispatch 只允许占用空 anchor。

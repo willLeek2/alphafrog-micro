@@ -197,13 +197,13 @@ class LangchainLinearRunPipelineCheckpointTest {
         missingAnchor.setId("run-1");
         when(registryProvider.getIfAvailable()).thenReturn(registry);
         when(runMapper.findById("run-1")).thenReturn(run, missingAnchor);
-        when(runMapper.updateSnapshot(eq("run-1"), eq("user-1"),
+        when(runMapper.updateTerminalSnapshot(eq("run-1"), eq("user-1"),
                 eq(world.willfrog.agent.platform.model.AgentRunStatus.FAILED),
                 any(), eq(true), eq("tool_job_checkpoint_anchor_missing"))).thenReturn(1);
         when(events.isRunnable("run-1", "user-1")).thenReturn(true);
         when(events.extractRunConfig("{}")).thenReturn(AgentRunEventService.RunConfig.defaults());
         pipeline.executeRun(run);
-        verify(runMapper).updateSnapshot(eq("run-1"), eq("user-1"),
+        verify(runMapper).updateTerminalSnapshot(eq("run-1"), eq("user-1"),
                 eq(world.willfrog.agent.platform.model.AgentRunStatus.FAILED),
                 any(), eq(true), eq("tool_job_checkpoint_anchor_missing"));
         verify(events, never()).append(eq("run-1"), eq("user-1"),

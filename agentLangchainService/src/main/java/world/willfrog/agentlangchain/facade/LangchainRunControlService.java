@@ -11,11 +11,13 @@ import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.AgentRunObservabilityService;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
+import world.willfrog.agent.platform.dataanalysis.ToolJobRunDisposition;
 import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
 import world.willfrog.agentlangchain.orchestration.LangchainLinearRunPipeline;
 import world.willfrog.agentlangchain.orchestration.scheduler.LangchainSchedulerMetrics;
 import world.willfrog.agentlangchain.tooljob.ToolJobAnchorService;
+import world.willfrog.agentlangchain.tooljob.ToolJobFinalizer;
 import world.willfrog.alphafrogmicro.agent.idl.AgentEmpty;
 import world.willfrog.alphafrogmicro.agent.idl.CancelAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.DeleteAgentRunRequest;
@@ -224,9 +226,12 @@ public class LangchainRunControlService {
     /**
      * 暂停 run：状态改为 WAITING，可被 resume 恢复。
      * 已在终态的 run 直接返回（幂等）。
-     * 等待长工具结果（WAITING_TOOL_JOB）的 run 暂不支持暂停：此时暂停只改状态、不处置锚点，
-     * 长工具终态到达后清理链第一步的条件更新会命中 0 行，配额释放与终态事件随之丢失。
-     * 需要停止这类 run 请改用取消（cancel 已对该状态做了锚点处置）。
+     * 等待长工具结果（WAITING_TOOL_JOB）的 run 也可以暂停：先在锚点上写暂停处置
+     * （autoResume=false + runDisposition=PAUSED，与取消处置对称），再把状态写成
+     * WAITING——顺序不能反，否则长工具终态到达时收尾器的条件更新会因状态已离开
+     * WAITING_TOOL_JOB 而命中 0 行，配额释放与终态事件随之丢失。处置写失败
+     * （任务已被替换、或取消/检查点失败已先落处置）时本次暂停整体失败关闭，
+     * Run 保持原状。
      */
     public world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage pauseRun(PauseAgentRunRequest request) {
         AgentRun run = runReadService.requireWritableRun(request.getId(), request.getUserId());
@@ -234,8 +239,7 @@ public class LangchainRunControlService {
             return AgentLangchainRunMessageMapper.toRunMessage(run);
         }
         if (run.getStatus() == AgentRunStatus.WAITING_TOOL_JOB) {
-            throw new IllegalStateException(
-                    "run is waiting for a long-running tool job; pause is temporarily unsupported in this state, use cancel instead");
+            persistPauseDispositionOrAbort(run);
         }
         String snapshot = agentObservabilityService.attachObservabilityToSnapshot(
                 run.getId(), run.getSnapshotJson(), AgentRunStatus.WAITING);
@@ -267,6 +271,7 @@ public class LangchainRunControlService {
             stateStore.clearTasks(run.getId());
             stateStore.storePlanOverride(run.getId(), request.getPlanOverrideJson());
         }
+        disposePausedAnchorBeforeResume(run);
         runMapper.resetForResume(run.getId(), run.getUserId(), agentEventService.nextTtlExpiresAt());
         agentEventService.append(run.getId(), run.getUserId(), "WORKFLOW_RESUMED", Map.of(
                 "run_id", run.getId(),
@@ -278,6 +283,77 @@ public class LangchainRunControlService {
         // 这一行会直接抛「队列已满」异常，调用方收到失败，不会阻塞等待。
         pipeline.launchAsync(refreshed);
         return AgentLangchainRunMessageMapper.toRunMessage(refreshed);
+    }
+
+    /**
+     * 暂停一个正在等待长工具的 Run 的前置动作：把暂停处置写进锚点。
+     * 与 cancelRun 的处置写法对称——只合并两个字段，不重写整份锚点；
+     * 返回 0 时重读一次（任务可能刚被第二个长工具替换），仍失败则放弃本次暂停。
+     * 锚点不存在（刚好被清理的极小窗口）时什么都不写，按普通暂停继续。
+     */
+    private void persistPauseDispositionOrAbort(AgentRun run) {
+        String runId = run.getId();
+        ToolJobAnchor toolAnchor = anchorService.loadAnchor(runId);
+        if (toolAnchor == null || toolAnchor.getOperationId() == null
+                || toolAnchor.getOperationId().isBlank()) {
+            return;
+        }
+        boolean persisted = anchorService.persistPauseDisposition(
+                runId, toolAnchor.getOperationId(), run.getStatus());
+        if (!persisted) {
+            ToolJobAnchor current = anchorService.loadAnchor(runId);
+            if (current != null && current.getOperationId() != null
+                    && !current.getOperationId().isBlank()
+                    && !current.getOperationId().equals(toolAnchor.getOperationId())) {
+                persisted = anchorService.persistPauseDisposition(
+                        runId, current.getOperationId(), run.getStatus());
+            }
+        }
+        if (!persisted) {
+            log.warn("Pause CAS failed for run={}: unable to persist pause disposition — "
+                    + "run left untouched (cancel or checkpoint disposition may have won the race).",
+                    runId);
+            throw new IllegalStateException(
+                    "pause_anchor_disposition_failed: unable to persist pause disposition");
+        }
+        log.info("Pause run={} while waiting for tool job: persisted pause disposition", runId);
+    }
+
+    /**
+     * 恢复前的遗留锚点处置：只处理「暂停时长工具还没跑完」留下的锚点
+     * （runDisposition=PAUSED）。长工具仍在跑（锚点还没有终态字段）时拒绝恢复——
+     * 此时重新调度会让工作流与在途工具的清理链交错；清理链正在走时同样拒绝，
+     * 收尾器/对账器几秒内会跑完，用户稍后重试即可。清理链已走完的，先按栅栏
+     * 清掉锚点再放行重新调度（重新调度后该 todo 会重新执行：暂停期间到达的
+     * 工具结果不进手动恢复路径，这是本批的明确取舍）。清锚点失败（并发处置
+     * 已改变状态）则整个恢复失败关闭。
+     * 其他处置标记（取消/DAG 系等）的遗留锚点不由这里处理，交给既有恢复机器。
+     */
+    private void disposePausedAnchorBeforeResume(AgentRun run) {
+        ToolJobAnchor anchor = anchorService.loadAnchor(run.getId());
+        if (anchor == null || anchor.getOperationId() == null
+                || anchor.getOperationId().isBlank()) {
+            return;
+        }
+        if (!ToolJobRunDisposition.PAUSED.equals(anchor.getRunDisposition())) {
+            return;
+        }
+        if (anchor.getTerminalStatus() == null || anchor.getTerminalStatus().isBlank()) {
+            throw new IllegalStateException(
+                    "run is paused while a long-running tool job is still in flight: "
+                    + "wait for the tool to finish (cleanup runs automatically within seconds), "
+                    + "or cancel the run instead");
+        }
+        if (!ToolJobFinalizer.isCleanupChainComplete(anchor)) {
+            throw new IllegalStateException(
+                    "tool job finished but cleanup is still in progress: retry resume in a few seconds");
+        }
+        if (!anchorService.clearPausedAnchor(run.getId(), anchor.getOperationId())) {
+            throw new IllegalStateException(
+                    "resume_anchor_clear_failed: run state changed concurrently, retry");
+        }
+        log.info("Resume run={}: cleared finalized paused anchor operationId={}",
+                run.getId(), anchor.getOperationId());
     }
 
     /** COMPLETED / PARTIAL / FAILED / CANCELED / EXPIRED 均为不可逆终态 */

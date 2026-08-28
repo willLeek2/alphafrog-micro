@@ -261,7 +261,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 }
                 String blockedSnapshot = attachObservability(
                         runId, run.getSnapshotJson(), AgentRunStatus.FAILED, "CreditBlocked", reason);
-                int snapshotRows = runMapper.updateSnapshot(
+                int snapshotRows = runMapper.updateTerminalSnapshot(
                         runId, userId, AgentRunStatus.FAILED, blockedSnapshot, true, reason);
                 int ttlRows = runMapper.updateStatusWithTtl(
                         runId, userId, AgentRunStatus.FAILED, eventService.nextInterruptedExpiresAt());
@@ -711,7 +711,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         // 是因为 follow-up 只应该引用已经确定落库的最终答案。
         String snapshot = attachObservability(
                 runId, buildSnapshot(userGoal, result, AgentRunStatus.COMPLETED), AgentRunStatus.COMPLETED, null, null);
-        int completedRows = runMapper.updateSnapshot(
+        int completedRows = runMapper.updateTerminalSnapshot(
                 runId, userId, AgentRunStatus.COMPLETED, snapshot, true, null);
         if (completedRows != 1) {
             log.warn("Completed snapshot was not persisted for run={} rows={}", runId, completedRows);
@@ -760,7 +760,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         String snapshot = attachObservability(
                 runId, buildPartialSnapshot(userGoal, result), AgentRunStatus.PARTIAL, null,
                 result.getFailureReason());
-        int partialRows = runMapper.updateSnapshot(
+        int partialRows = runMapper.updateTerminalSnapshot(
                 runId, userId, AgentRunStatus.PARTIAL, snapshot, true, result.getFailureReason());
         if (partialRows != 1) {
             log.warn("Partial snapshot was not persisted for run={} rows={}", runId, partialRows);
@@ -1131,7 +1131,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         int updated = requireDurableWrite
                 ? persistResumedTerminal(runId, userId, AgentRunStatus.FAILED,
                 result, snapshot, decision.getReason(), resumeContext)
-                : runMapper.updateSnapshot(runId, userId, AgentRunStatus.FAILED,
+                : runMapper.updateTerminalSnapshot(runId, userId, AgentRunStatus.FAILED,
                 snapshot, true, decision.getReason());
         if (requireDurableWrite && updated != 1) {
             log.warn("FAILED snapshot was not persisted for run={}", runId);

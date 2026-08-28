@@ -113,9 +113,26 @@ public class ToolJobFinalizer {
     // ========== public entry points ==========
 
     /**
-     * @param autoResume false for paused/canceled runs (envelope+release but no CAS/READY)
+     * 一次收尾调用的显式结果：做完（done=true）或没做完（done=false，带步骤与原因）。
+     * 没做完不等于出错——条件更新没抢到所有权、依赖的钩子没就位都属于「这轮没做完，
+     * 下一轮再来」。调用方（进程内追踪器/耐久对账器）据此决定保留登记与重试，
+     * 不再靠「没抛异常」猜测收尾是否完成。
      */
-    public void handleTerminal(String runId, ToolJobAnchor anchor,
+    public record FinalizerOutcome(boolean done, String step, String reason) {
+        static FinalizerOutcome completed() {
+            return new FinalizerOutcome(true, null, null);
+        }
+
+        static FinalizerOutcome incomplete(String step, String reason) {
+            return new FinalizerOutcome(false, step, reason);
+        }
+    }
+
+    /**
+     * @param autoResume false for paused/canceled runs (envelope+release but no CAS/READY)
+     * @return 本次调用是否把该 Run 的终态收尾做完；没做完时带步骤与原因
+     */
+    public FinalizerOutcome handleTerminal(String runId, ToolJobAnchor anchor,
                                 String terminalStatus, TaskResultResponse resultResp,
                                 boolean autoResume) {
         // 同一轮收尾统一使用一个时间点，避免各字段在重入时产生互相矛盾的时间。
@@ -145,7 +162,7 @@ public class ToolJobFinalizer {
                             log.warn("Finance data present but snapshot missing for run={}", runId);
                             anchor.setFinalizerError("finance_snapshot_missing");
                             persistFinalizerAnchor(runId, anchor);
-                            return;
+                            return FinalizerOutcome.incomplete(STEP_ENVELOPE, "finance_snapshot_missing");
                         }
                         try {
                             FinanceRecordChannelConfigLoader.Snapshot snapshot = configLoader
@@ -179,13 +196,13 @@ public class ToolJobFinalizer {
                                     + "ENVELOPE blocked, will retry", runId, e.getCode());
                             anchor.setFinalizerError("finance_processing_failed");
                             persistFinalizerAnchor(runId, anchor);
-                            return;
+                            return FinalizerOutcome.incomplete(STEP_ENVELOPE, "finance_processing_failed");
                         } catch (RuntimeException e) {
                             log.warn("Finance pipeline unexpected error for run={} — "
                                     + "ENVELOPE blocked, will retry", runId, e.getMessage());
                             anchor.setFinalizerError("finance_processing_failed");
                             persistFinalizerAnchor(runId, anchor);
-                            return;
+                            return FinalizerOutcome.incomplete(STEP_ENVELOPE, "finance_processing_failed");
                         }
                     } else {
                         previewJson = formatter.formatSuccess(stdout, List.of(), List.of());
@@ -207,7 +224,7 @@ public class ToolJobFinalizer {
                                     + " for FAILED/CANCELED run={}", runId);
                             anchor.setFinalizerError("finance_snapshot_missing");
                             persistFinalizerAnchor(runId, anchor);
-                            return;
+                            return FinalizerOutcome.incomplete(STEP_ENVELOPE, "finance_snapshot_missing");
                         }
                         try {
                             FinanceRecordChannelConfigLoader.Snapshot snapshot = configLoader
@@ -227,7 +244,7 @@ public class ToolJobFinalizer {
                                     + "ENVELOPE blocked, will retry", runId, e.getCode());
                             anchor.setFinalizerError("finance_demarker_failed");
                             persistFinalizerAnchor(runId, anchor);
-                            return;
+                            return FinalizerOutcome.incomplete(STEP_ENVELOPE, "finance_demarker_failed");
                         }
                     }
                     // 移除 stderr 中的 finance marker 行，防止 formatter 永久拒绝
@@ -273,7 +290,7 @@ public class ToolJobFinalizer {
             if (!persistFinalizerAnchor(runId, anchor)) {
                 // CAS 失败说明别的进程已推进，当前 finalizer 立即退场。
                 log.warn("ENVELOPE CAS failed for run={}", runId);
-                return;
+                return FinalizerOutcome.incomplete(STEP_ENVELOPE, "cas_failed");
             }
         }
 
@@ -284,7 +301,7 @@ public class ToolJobFinalizer {
             anchor.setAnchorState("TERMINAL");
             if (!persistFinalizerAnchor(runId, anchor)) {
                 log.warn("TERMINAL proof backfill CAS failed for run={}", runId);
-                return;
+                return FinalizerOutcome.incomplete(STEP_ENVELOPE, "cas_failed");
             }
         }
 
@@ -303,7 +320,7 @@ public class ToolJobFinalizer {
                 anchor.setFinalizerError(null);
                 if (!persistFinalizerAnchor(runId, anchor)) {
                     log.warn("terminalRetryable backfill CAS failed for run={}", runId);
-                    return;
+                    return FinalizerOutcome.incomplete(STEP_ENVELOPE, "cas_failed");
                 }
             }
         }
@@ -313,7 +330,7 @@ public class ToolJobFinalizer {
             log.warn("terminalRetryable missing for run={}, fail-closed before RELEASE", runId);
             anchor.setFinalizerError("terminal_retryability_missing");
             persistFinalizerAnchor(runId, anchor);
-            return;
+            return FinalizerOutcome.incomplete(STEP_ENVELOPE, "terminal_retryability_missing");
         }
 
         // 第二步：凭数据库里的 reservation 记录与终态证明释放 Sandbox capacity。
@@ -321,45 +338,45 @@ public class ToolJobFinalizer {
             // releaseCapacity 同时处理首次释放和崩溃后 ALREADY_RELEASED。
             if (!releaseCapacity(anchor)) {
                 log.warn("RELEASE failed for run={}, will retry", runId);
-                return;
+                return FinalizerOutcome.incomplete(STEP_RELEASE, "release_failed");
             }
             // 只有容量账本确认释放后才推进 STEP_RELEASE。
             anchor.setFinalizerStep(STEP_RELEASE);
-            if (!persistFinalizerAnchor(runId, anchor)) return;
+            if (!persistFinalizerAnchor(runId, anchor)) return FinalizerOutcome.incomplete(STEP_RELEASE, "cas_failed");
         }
 
         // 第三步：资源用量是终态真相的一部分，hook 缺失或失败都阻塞恢复。
         if (!isStepDone(anchor, STEP_USAGE)) {
             if (usageHook == null) {
                 log.warn("USAGE hook not wired — blocking finalizer for run={}", runId);
-                return;
+                return FinalizerOutcome.incomplete(STEP_USAGE, "hook_not_wired");
             }
             // upsert 使用稳定 operation identity，重复重入不会重复计费。
             boolean ok = usageHook.upsertUsage(runId, anchor);
             if (!ok) {
                 log.warn("USAGE hook failed for run={}, will retry", runId);
-                return;
+                return FinalizerOutcome.incomplete(STEP_USAGE, "hook_failed");
             }
             anchor.setUsagePersisted(true);
             anchor.setFinalizerStep(STEP_USAGE);
-            if (!persistFinalizerAnchor(runId, anchor)) return;
+            if (!persistFinalizerAnchor(runId, anchor)) return FinalizerOutcome.incomplete(STEP_USAGE, "cas_failed");
         }
 
         // 第四步：发唯一逻辑终态事件；成功前不能把 Run 重新入队。
         if (!isStepDone(anchor, STEP_EVENT)) {
             if (eventHook == null) {
                 log.warn("EVENT hook not wired — blocking finalizer for run={}", runId);
-                return;
+                return FinalizerOutcome.incomplete(STEP_EVENT, "hook_not_wired");
             }
             // eventHook 内部按 operation/toolCall/attempt 构造去重键。
             boolean ok = eventHook.emitTerminalEvent(runId, anchor);
             if (!ok) {
                 log.warn("EVENT hook failed for run={}, will retry", runId);
-                return;
+                return FinalizerOutcome.incomplete(STEP_EVENT, "hook_failed");
             }
             anchor.setTerminalEventEmitted(true);
             anchor.setFinalizerStep(STEP_EVENT);
-            if (!persistFinalizerAnchor(runId, anchor)) return;
+            if (!persistFinalizerAnchor(runId, anchor)) return FinalizerOutcome.incomplete(STEP_EVENT, "cas_failed");
         }
 
         if (!autoResume) {
@@ -374,14 +391,14 @@ public class ToolJobFinalizer {
                 if (!failedAndCleared) {
                     log.warn("DAG cleanup-only fail+clear CAS failed for run={}, operationId={}",
                             runId, anchor.getOperationId());
-                    return;
+                    return FinalizerOutcome.incomplete(STEP_EVENT, "dag_cleanup_cas_failed");
                 }
                 // PostgreSQL 已原子保存 FAILED/last_error 并清 anchor，随后清理可重建的 Redis 派生项。
                 redisCache.removeDue(runId);
                 redisCache.deletePendingCache(runId);
                 log.warn("DAG blocking worker lost; cleanup-only finalized run={} "
                         + "(EXECUTING fails, existing FAILED/CANCELED is preserved)", runId);
-                return;
+                return FinalizerOutcome.completed();
             }
             // checkpoint 失败由 finalizer 在完成 envelope/release/usage/event 后把 Run 写成 FAILED。
             if ("CHECKPOINT_FAILED".equals(anchor.getRunDisposition())) {
@@ -389,8 +406,9 @@ public class ToolJobFinalizer {
                 if (!anchorService.updateAnchorAndStatus(runId, anchor,
                         AgentRunStatus.FAILED, AgentRunStatus.WAITING_TOOL_JOB)) {
                     log.warn("CHECKPOINT_FAILED terminal transition failed for run={}", runId);
+                    return FinalizerOutcome.incomplete(STEP_EVENT, "terminal_transition_failed");
                 }
-                return;
+                return FinalizerOutcome.completed();
             }
             // canceled Run 同样必须先释放容量，再把状态原子写成 CANCELED。
             if ("CANCELED".equals(anchor.getRunDisposition())) {
@@ -401,11 +419,11 @@ public class ToolJobFinalizer {
                             runId, anchor.getOperationId())) {
                         redisCache.removeDue(runId);
                         redisCache.deletePendingCache(runId);
-                    } else {
-                        log.warn("CANCELED anchor clear deferred for run={}, will retry via due",
-                                runId);
+                        return FinalizerOutcome.completed();
                     }
-                    return;
+                    log.warn("CANCELED anchor clear deferred for run={}, will retry via due",
+                            runId);
+                    return FinalizerOutcome.incomplete(STEP_CANCELED, "anchor_clear_deferred");
                 }
                 anchor.setFinalizerStep(STEP_CANCELED);
                 // 取消可能落在 WAITING_TOOL_JOB（后台工具等待期）或 EXECUTING
@@ -424,10 +442,10 @@ public class ToolJobFinalizer {
                                 + "operationId={}", runId, anchor.getOperationId());
                         redisCache.removeDue(runId);
                         redisCache.deletePendingCache(runId);
-                        return;
+                        return FinalizerOutcome.completed();
                     }
                     log.warn("CANCELED terminal transition failed for run={}, will retry", runId);
-                    return;
+                    return FinalizerOutcome.incomplete(STEP_CANCELED, "terminal_transition_failed");
                 }
                 if (schedulerMetrics != null) {
                     schedulerMetrics.recordCompletion(AgentRunStatus.CANCELED);
@@ -441,15 +459,23 @@ public class ToolJobFinalizer {
                     redisCache.removeDue(runId);
                     redisCache.deletePendingCache(runId);
                     log.info("Canceled terminal finalized for run={}, capacity released", runId);
-                } else {
-                    log.warn("CANCELED anchor clear deferred for run={}, will retry via due",
-                            runId);
+                    return FinalizerOutcome.completed();
                 }
-                return;
+                log.warn("CANCELED anchor clear deferred for run={}, will retry via due",
+                        runId);
+                return FinalizerOutcome.incomplete(STEP_CANCELED, "anchor_clear_deferred");
+            }
+            // 被暂停的 Run：清理链（envelope/release/usage/event）已在上面走完，
+            // Run 停在 WAITING 等用户手动恢复——不生成 READY、不改状态、不自动拉起。
+            // 恢复时的遗留锚点处置见 LangchainRunControlService.resumeRun。
+            if (ToolJobRunDisposition.PAUSED.equals(anchor.getRunDisposition())) {
+                log.info("Terminal handled for paused run={}, cleanup done, run stays WAITING",
+                        runId);
+                return FinalizerOutcome.completed();
             }
             // 暂停状态保留 WAITING_TOOL_JOB，不生成 READY，等待用户明确恢复。
             log.info("Terminal handled for paused run={}, not auto-resuming", runId);
-            return;
+            return FinalizerOutcome.completed();
         }
 
         // 第五步：把 finalizerStep 与 Run 状态从 WAITING_TOOL_JOB 原子推进到 RECEIVED。
@@ -457,14 +483,17 @@ public class ToolJobFinalizer {
             anchor.setFinalizerStep(STEP_CAS_STATUS);
             if (!anchorService.updateAnchorAndStatus(runId, anchor, AgentRunStatus.RECEIVED, AgentRunStatus.WAITING_TOOL_JOB)) {
                 log.warn("CAS_STATUS atomic update failed for run={}", runId);
-                return;
+                return FinalizerOutcome.incomplete(STEP_CAS_STATUS, "cas_failed");
             }
         }
 
         // 第六步：原子推进 CAS_STATUS→RESUME_READY。正常 finalizer 与 backfill 恢复共享同一条入口。
+        // 竞态输赢在 completeResumeReady 内部按所有权语义处理（输家不写 Redis、不启动 worker），
+        // 对本次调用而言「收尾动作已有着落」，都算 done。
         if (!isStepDone(anchor, STEP_RESUME_READY)) {
             completeResumeReady(runId, anchor);
         }
+        return FinalizerOutcome.completed();
     }
 
     /**
@@ -795,6 +824,18 @@ public class ToolJobFinalizer {
         String current = anchor.getFinalizerStep();
         if (current == null) return false;
         return STEP_ORDER.getOrDefault(current, 0) >= STEP_ORDER.getOrDefault(step, 0);
+    }
+
+    /**
+     * 清理链是否已走完（ENVELOPE/RELEASE/USAGE/EVENT 四步全部落库）。
+     * 给恢复路径用：被暂停的 Run 在工具终态到达后由收尾器走这四步，
+     * 走完才允许 resumeRun 清锚点放行。步骤名与顺序由本类的 STEP_ORDER 唯一定义。
+     */
+    public static boolean isCleanupChainComplete(ToolJobAnchor anchor) {
+        if (anchor == null) {
+            return false;
+        }
+        return STEP_ORDER.getOrDefault(anchor.getFinalizerStep(), 0) >= STEP_ORDER.get(STEP_EVENT);
     }
 
     private boolean persistFinalizerAnchor(String runId, ToolJobAnchor anchor) {

@@ -36,7 +36,7 @@ import static org.mockito.Mockito.when;
 import static world.willfrog.agentlangchain.orchestration.LangchainRunSchedulerTestSupport.immediateScheduler;
 
 /**
- * 提交点语义（T1-6）：终态快照成功写入数据库（updateSnapshot 返回 1）即本次 Run 的提交点，
+ * 提交点语义（T1-6）：终态快照成功写入数据库（带状态栅栏的终态写入返回 1）即本次 Run 的提交点，
  * 之后的收尾动作（事件、assistant 消息、结算、终态广播）降级为尽力而为，失败只告警，
  * 不再向外传播——外层失败出口不允许把已提交的 COMPLETED/PARTIAL 改写成 WORKFLOW_FAILED。
  *
@@ -53,7 +53,7 @@ class LangchainLinearRunPipelineCommitPointTest {
 
         fx.pipeline.executeRun(fx.run);
 
-        verify(fx.runMapper).updateSnapshot(eq("run-cp-1"), eq("user-1"),
+        verify(fx.runMapper).updateTerminalSnapshot(eq("run-cp-1"), eq("user-1"),
                 eq(AgentRunStatus.COMPLETED), anyString(), eq(true), isNull());
         verify(fx.eventService, never()).append(anyString(), anyString(), eq("WORKFLOW_FAILED"), any());
         verify(fx.messageService, never()).createAssistantMessage(anyString(), anyString(), anyString());
@@ -69,7 +69,7 @@ class LangchainLinearRunPipelineCommitPointTest {
 
         fx.pipeline.executeRun(fx.run);
 
-        verify(fx.runMapper).updateSnapshot(eq("run-cp-2"), eq("user-1"),
+        verify(fx.runMapper).updateTerminalSnapshot(eq("run-cp-2"), eq("user-1"),
                 eq(AgentRunStatus.PARTIAL), anyString(), eq(true), any());
         verify(fx.eventService, never()).append(anyString(), anyString(), eq("WORKFLOW_FAILED"), any());
         verify(fx.messageService, never()).createAssistantMessage(anyString(), anyString(), anyString());
@@ -116,7 +116,7 @@ class LangchainLinearRunPipelineCommitPointTest {
 
         fx.pipeline.executeRun(fx.run);
 
-        verify(fx.runMapper).updateSnapshot(eq("run-cp-5"), eq("user-1"),
+        verify(fx.runMapper).updateTerminalSnapshot(eq("run-cp-5"), eq("user-1"),
                 eq(AgentRunStatus.COMPLETED), anyString(), eq(true), isNull());
         verify(fx.eventService, never()).append(anyString(), anyString(), eq("WORKFLOW_COMPLETED"), any());
         verify(fx.eventService, never()).append(anyString(), anyString(), eq("WORKFLOW_FAILED"), any());
@@ -186,7 +186,7 @@ class LangchainLinearRunPipelineCommitPointTest {
 
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
         when(runMapper.findById(runId)).thenReturn(run);
-        when(runMapper.updateSnapshot(eq(runId), eq("user-1"), any(), anyString(), eq(true), any()))
+        when(runMapper.updateTerminalSnapshot(eq(runId), eq("user-1"), any(), anyString(), eq(true), any()))
                 .thenReturn(snapshotRows);
 
         AgentRunEventService eventService = mock(AgentRunEventService.class);

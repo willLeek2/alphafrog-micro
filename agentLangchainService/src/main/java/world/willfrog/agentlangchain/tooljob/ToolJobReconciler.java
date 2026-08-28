@@ -230,7 +230,12 @@ public class ToolJobReconciler {
                             anchor.setTerminalStatus("RESULT_LOST");
                             anchor.setTerminalAt(now);
                             log.error("Result permanently lost for run={}, taskId={}", runId, taskId);
-                            finalizer.handleTerminal(runId, anchor, "RESULT_LOST", null, anchor.isAutoResume());
+                            ToolJobFinalizer.FinalizerOutcome outcome =
+                                    finalizer.handleTerminal(runId, anchor, "RESULT_LOST", null, anchor.isAutoResume());
+                            if (!outcome.done()) {
+                                log.warn("RESULT_LOST finalizer incomplete for run={} step={} reason={}; "
+                                        + "relying on next rebuild cycle", runId, outcome.step(), outcome.reason());
+                            }
                             return;
                         }
                     } else {
@@ -254,7 +259,19 @@ public class ToolJobReconciler {
                     return;
                 }
                 // 结果体完整时进入可重入六步 finalizer，最终生成 READY 并重新入队。
-                finalizer.handleTerminal(runId, anchor, status, resultResp, true);
+                // finalizer 显式返回做没做完；没做完时显式重写 due（带上一步完成进度），
+                // 保证下一轮补扫从 anchor 的 finalizerStep 续跑，不靠日志猜。
+                ToolJobFinalizer.FinalizerOutcome outcome =
+                        finalizer.handleTerminal(runId, anchor, status, resultResp, true);
+                if (!outcome.done()) {
+                    log.warn("Reconciler finalizer incomplete for run={} step={} reason={}; "
+                            + "re-arming due for retry", runId, outcome.step(), outcome.reason());
+                    ToolJobAnchor after = anchorService.loadAnchor(runId);
+                    if (after != null) {
+                        after.setNextPollAt(Instant.now().plusMillis(config.getPollIntervalMs()));
+                        redisCache.upsertDue(runId, after);
+                    }
+                }
             } else if (NOT_FOUND.equals(status)) {
                 // NOT_FOUND 可能是传播延迟或结果保留过期，交给有界丢失判定。
                 finalizer.handleNotFound(runId, anchor);
@@ -361,7 +378,18 @@ public class ToolJobReconciler {
                 TaskResultResponse resultResp = fetchResult(taskId, runId, status);
                 if (resultResp != null) {
                     // 只执行 envelope/release/usage/event，不 CAS RECEIVED、不生成 READY。
-                    finalizer.handleTerminal(runId, anchor, status, resultResp, false);
+                    // 没做完（带步骤与原因）时显式重写 due，下一轮从 anchor 的 finalizerStep 续跑。
+                    ToolJobFinalizer.FinalizerOutcome outcome =
+                            finalizer.handleTerminal(runId, anchor, status, resultResp, false);
+                    if (!outcome.done()) {
+                        log.warn("Paused/canceled finalizer incomplete for run={} step={} reason={}; "
+                                + "re-arming due for retry", runId, outcome.step(), outcome.reason());
+                        ToolJobAnchor after = anchorService.loadAnchor(runId);
+                        if (after != null) {
+                            after.setNextPollAt(Instant.now().plusMillis(config.getPollIntervalMs()));
+                            redisCache.upsertDue(runId, after);
+                        }
+                    }
                 } else {
                     // 终态已确认但结果体不可用时也要有界重试，不能永久占用 DAG/暂停容量。
                     finalizer.handleNotFound(runId, anchor);
