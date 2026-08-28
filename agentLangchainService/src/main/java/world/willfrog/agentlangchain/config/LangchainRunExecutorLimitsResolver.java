@@ -11,8 +11,9 @@ import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 /**
  * 合并静态硬上限、本地热配置和自适应 core 覆盖，产出调度器每次准入使用的限制快照。
  *
- * <p>hardLimits 在启动时冻结，运行期配置只能在硬上限内缩放；adaptiveCoreOverride 只改
- * core，不得扩大 max 或 queue。这样运维热调节和延迟自适应都不能突破实例启动时的安全边界。</p>
+ * <p>hardLimits 在启动时冻结，运行期配置只能在硬上限内缩放；adaptiveCoreOverride
+ * 只作用于 core 这一个维度，max 和 queue 保持不变。这样运维热调节和延迟自适应
+ * 都不会突破实例启动时的硬上限。</p>
  */
 @Component
 @Slf4j
@@ -110,7 +111,7 @@ public class LangchainRunExecutorLimitsResolver {
         LangchainRunExecutorLimits effective = applyOverrideIfSet(clamped);
 
         Integer adaptiveOverride = this.adaptiveCoreOverride;
-        // adaptive 是否实际改变了 core（final effective ≠ pre-adaptive clamped）
+        // adaptive 覆盖是否实际改变了 core（比较最终 effective 与未加 adaptive 的 clamped 值）
         boolean adaptiveAdjusted = adaptiveOverride != null
                 && effective.getCorePoolSize() != clamped.getCorePoolSize();
 

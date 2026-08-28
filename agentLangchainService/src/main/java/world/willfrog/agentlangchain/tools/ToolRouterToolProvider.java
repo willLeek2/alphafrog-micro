@@ -32,17 +32,20 @@ import static world.willfrog.agent.platform.service.AgentObservabilityService.PH
  * LangChain4j（LC4j）{@link ToolProvider} 适配层：把内部 {@link ToolRouter} 工具目录暴露给
  * {@link dev.langchain4j.service.AiServices}，使模型在 tool loop 里看到的工具列表与 legacy 路径一致。
  *
- * <p>职责边界（与 {@link ToolRouterToolExecutor}、{@link ToolRouter} 分工）：</p>
+ * <p>职责分工（与 {@link ToolRouterToolExecutor}、{@link ToolRouter} 的关系）：</p>
  * <ul>
  *   <li><b>本类</b>：决定「这次 AiService 调用里 LLM 能看见哪些工具」——生成
  *       {@link ToolSpecification} 列表，并为每个 spec 绑定同一个 {@link ToolRouterToolExecutor}；</li>
  *   <li>{@link ToolRouterToolExecutor}：模型选中某个 tool 后，把 JSON 参数解析并委托
  *       {@link ToolRouter#invokeWithMeta(String, Map)} 执行；</li>
- *   <li>{@link ToolRouter}：预算、trace、缓存、参数别名、业务工具分发（见 codex 负责的
- *       {@code ToolRouter.java} 注释）。</li>
+ *   <li>{@link ToolRouter}：预算、trace、缓存、参数别名、业务工具分发（详见
+ *       {@code ToolRouter.java} 的注释）。</li>
  * </ul>
  *
- * <p>调用链（面试常问「工具怎么进 raw HTTP tools 数组」）：</p>
+ * <p>工具路由的讲解要点已迁出，见
+ * {@code agent-working-docs/code-review/phase2/agent-run-overall/tool-routing-interview-points.md}。</p>
+ *
+ * <p>调用路径：</p>
  * <ol>
  *   <li>{@link world.willfrog.agentlangchain.orchestration.LangchainTodoNodeExecutor} 构建 AiServices 时
  *       注入 {@code ObjectProvider<ToolProvider>}（Spring Bean 为 {@link world.willfrog.agentlangchain.config.LangchainToolsConfiguration#langchainToolProvider}）；</li>
@@ -54,15 +57,6 @@ import static world.willfrog.agent.platform.service.AgentObservabilityService.PH
  *       {@code checkParallelLimits}（避免 0 参数 {@code @Tool} 反射漏注册）；</li>
  *   <li>返回的 {@link ToolProviderResult} 中，所有 spec 共享一个 {@link ToolRouterToolExecutor} 实例。</li>
  * </ol>
- *
- * <p>面试常考点：</p>
- * <ul>
- *   <li>「langchain 和 legacy 工具列表为何一致？」→ 同一套 {@link ToolCatalogBuilder} 过滤逻辑；</li>
- *   <li>「为什么 searchWeb / executePython 有时不在 tools 里？」→
- *       {@link LangchainToolInvocationKeys#WEB_SEARCH_ENABLED}、
- *       {@link LangchainToolInvocationKeys#CODE_INTERPRETER_ENABLED}；</li>
- *   <li>「Provider 和 Executor 为什么要拆两个类？」→ LC4j 接口分离：目录发现 vs 单次 invoke。</li>
- * </ul>
  *
  * @see ToolRouterToolExecutor 工具执行委托
  * @see ToolCatalogBuilder run 级工具目录拼装
@@ -85,7 +79,7 @@ public class ToolRouterToolProvider implements ToolProvider {
      * 事件服务，传递给 {@link ToolRouterToolExecutor} 用于发射 TOOL_CALL_STARTED / TOOL_CALL_FINISHED
      * SSE 事件（经 Redis pub-sub 推送）。
      */
-    private final AgentEventService eventService;
+    private final AgentEventService agentEventService;
     private final LangchainToolConcurrencyThrottle toolThrottle;
     private final PythonSandboxDispatchStore pythonSandboxDispatchStore;
 
@@ -97,7 +91,7 @@ public class ToolRouterToolProvider implements ToolProvider {
      */
     @Override
     public ToolProviderResult provideTools(ToolProviderRequest request) {
-        // 把 Pipeline / TodoNodeExecutor 塞进 InvocationParameters 的 run 上下文同步到 AgentContext
+        // 把 Pipeline / TodoNodeExecutor 放进 InvocationParameters 的 run 上下文同步到 AgentContext。
         LangchainRunContextBridge.apply(request);
 
         boolean webSearchEnabled = resolveBoolean(
@@ -125,7 +119,7 @@ public class ToolRouterToolProvider implements ToolProvider {
                 codeInterpreterEnabled
         );
         if (PHASE_SUB_AGENT.equals(AgentContext.getPhase())) {
-            // D06 防止子代理递归生成子代理：模型目录和 Router 运行时门闩同时关闭。
+            // 子代理阶段禁止再生成子代理：模型可见目录和 Router 运行时检查同时关掉这两个工具。
             specifications = specifications.stream()
                     .filter(spec -> !"spawnSubAgent".equals(spec.name())
                             && !"waitForSubAgent".equals(spec.name()))
@@ -133,7 +127,7 @@ public class ToolRouterToolProvider implements ToolProvider {
         }
 
         ToolExecutor executor = new ToolRouterToolExecutor(
-                toolRouter, objectMapper, eventService, toolThrottle, pythonSandboxDispatchStore);
+                toolRouter, objectMapper, agentEventService, toolThrottle, pythonSandboxDispatchStore);
         Map<ToolSpecification, ToolExecutor> tools = new LinkedHashMap<>();
         for (ToolSpecification specification : specifications) {
             tools.put(specification, executor);
@@ -159,7 +153,8 @@ public class ToolRouterToolProvider implements ToolProvider {
      * 解析布尔开关，三层优先级：InvocationParameters > AgentContext > 默认值。
      *
      * <p>设计意图：单元测试或无上下文调用时直接使用 invocation parameters；
-     * 生产环境有 runId 时 fallback 到 AgentContext，保证不因为参数未透传就使用硬编码默认值。</p>
+     * 生产环境有 runId 时回退到 AgentContext 的开关值，参数未透传时也能跟随运行
+     * 上下文获取当前值。</p>
      */
     private static boolean resolveBoolean(InvocationParameters parameters,
                                             String key,

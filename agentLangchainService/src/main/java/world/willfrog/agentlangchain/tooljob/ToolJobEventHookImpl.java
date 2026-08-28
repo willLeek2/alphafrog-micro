@@ -18,7 +18,7 @@ import java.util.Map;
 public class ToolJobEventHookImpl implements ToolJobEventHook {
 
     private final AgentRunMapper runMapper;
-    private final AgentEventService eventService;
+    private final AgentEventService agentEventService;
 
     @Override
     public boolean emitTerminalEvent(String runId, ToolJobAnchor anchor) {
@@ -48,7 +48,7 @@ public class ToolJobEventHookImpl implements ToolJobEventHook {
         put(payload, "resource_usage", anchor.getTerminalUsageJson());
         try {
             // appendOnce 若发现同一 key 已存在仍是幂等成功，不阻塞 finalizer 后续恢复。
-            eventService.appendOnce(runId, run.getUserId(), "TOOL_CALL_FINISHED", dedupeKey, payload);
+            agentEventService.appendOnce(runId, run.getUserId(), "TOOL_CALL_FINISHED", dedupeKey, payload);
             return true;
         } catch (Exception e) {
             log.warn("Failed to append logical terminal event runId={} toolCallId={}: {}",

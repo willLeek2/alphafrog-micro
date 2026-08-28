@@ -156,11 +156,10 @@ public class PythonSandboxTools {
     private String runtimeEnvironmentVersion = "python-sandbox-v1";
 
     /**
-     * D14 (Q-14): production fail-closed switch. When false (default), incomplete
-     * Data-intense wiring MUST NOT silently fall back to Legacy create (no
-     * reserve / no operationId). Set true only for explicitly annotated
-     * non-production fixtures: no global capacity admission, no idempotent
-     * recovery — must not be pointed at production Gateway.
+     * 生产环境的安全开关，默认 false。容量组件接线不完整时直接拒绝创建，
+     * 不允许悄悄降级到不带容量管理的老创建路径（老路径没有名额预留、
+     * 没有 operationId，重复请求无法去重）。只允许在明确标注的非生产
+     * 测试夹具里打开，绝不能指向生产网关。
      */
     @Value("${sandbox.create.allow-legacy-without-capacity:false}")
     private boolean allowLegacyWithoutCapacity = false;
@@ -392,9 +391,8 @@ public class PythonSandboxTools {
                         legacyRequest, timeout, toolStartMs);
             }
 
-            // D14 (Q-14): production must not silently degrade to Legacy create.
-            // Fail before any Gateway call. Public error stays stable (no bean/
-            // config inventory); presence details stay in operator logs only.
+            // 生产环境不允许悄悄降级到不带容量管理的老创建路径：
+            // 在调用网关之前就失败。对外的错误保持不变，接线细节只进运维日志。
             if (!allowLegacyWithoutCapacity) {
                 log.error("sandbox.create.wiringIncomplete: production refuses "
                         + "Legacy create; capacityWiringPresent={}; "
@@ -515,7 +513,7 @@ public class PythonSandboxTools {
             return fail("executePython", "TOOL_JOB_IDENTITY_UNAVAILABLE",
                     "executePython requires a stable tool call id", Map.of("run_id", runId));
         }
-        // 当前 durable executePython 首次调用从 attempt=1 开始；后续重试必须使用新轮次。
+        // 首次调用从 attempt=1 开始；后续重试必须使用新轮次。
         int attempt = 1;
         // operationId 由 runId/toolCallId/attempt 确定性派生，Sandbox create 可据此幂等查找。
         DataAnalysisOperationIdentity identity = new DataAnalysisOperationIdentity(
@@ -529,7 +527,7 @@ public class PythonSandboxTools {
             long rows = 0L;
             long bytes = 0L;
             for (AgentRunDatasetEntry dataset : datasets) {
-                // metadata 不完整时 fail-closed，避免低估资源后超卖 Sandbox。
+                // 元数据不完整时直接拒绝，避免低估资源占用后把超出承载能力的任务放进沙箱。
                 DatasetEntryMetadataReader.EntryMetadata metadata = metadataReader.read(dataset);
                 if (metadata.rowCount() == null || metadata.bytes() == null) {
                     return fail("executePython", "DATA_ANALYSIS_ESTIMATE_UNAVAILABLE",
@@ -596,7 +594,8 @@ public class PythonSandboxTools {
                             "request_fingerprint", pythonRequestFingerprint));
         }
 
-        // reservation 是实际容量所有权；取得后任何退出路径都必须释放或转交 pending。
+        // reservation（资源名额凭证）拿到手之后，任何退出路径都必须把它释放掉，
+        // 或者过户给后台任务继续管理，否则名额会一直占着。
         DataAnalysisReservation reservation;
         try {
             // reserve 在容量账本中创建 PREPARING 状态，可能因服务繁忙拒绝。
@@ -630,13 +629,13 @@ public class PythonSandboxTools {
 
         // 在调用 createTask 之前先构造完整 PREPARING anchor，覆盖 RPC 成败不确定窗口。
         ToolJobAnchor anchor = new ToolJobAnchor();
-        // schema 2 是资源分类同源与 canonical fingerprint fail-closed 的 cutover fence。
+        // 版本 2 起，预估与名额预留必须同源、请求指纹必须一致；对不上就拒绝。旧数据只有版本 1 才能兼容处理。
         anchor.setSchemaVersion(DATA_INTENSE_ANCHOR_SCHEMA_VERSION);
         // 幂等操作身份与请求指纹用于启动恢复查询/重放。
         anchor.setOperationId(identity.operationId());
         anchor.setRequestFingerprint(spec.requestFingerprint());
         anchor.setPythonRequestFingerprint(pythonRequestFingerprint);
-        // 新请求已经形成自己的 durable anchor，旧终态后的“待启动修复”阶段结束。
+        // 新请求已经写了自己的数据库进度记录，上一轮终态后等待启动的修复阶段到此结束。
         anchor.setPythonRepairPending(false);
         anchor.setPythonRepairExhausted(false);
         if (repairContext != null) {
@@ -664,11 +663,11 @@ public class PythonSandboxTools {
         }
         anchor.setDatasetSnapshotJson(objectMapper.writeValueAsString(datasetSnapshot));
         anchor.setDatasetSnapshotDigest(datasetSnapshot.immutableDigest());
-        // timeoutAt 和 nextPollAt 都是 durable 时间，重启后不重新计时。
+        // timeoutAt 和 nextPollAt 都写进了数据库，重启后不重新计时。
         anchor.setTimeoutAt(Instant.now().plusMillis(timeoutMillis));
         anchor.setNextPollAt(Instant.now().plusMillis(POLL_INTERVAL_MS));
         if (!waitPolicy.durableSuspend()) {
-            // ownerId 在 JVM 生命周期内稳定；lease 从首次 durable claim 前开始计时。
+            // ownerId 在 JVM 生命周期内稳定；租约从第一次数据库抢占前开始计时。
             anchor.setBlockingOwnerId(DagBlockingWorkerLease.processOwnerId());
             anchor.setBlockingLeaseUntil(DagBlockingWorkerLease.renewedUntil(Instant.now()));
         }
@@ -692,17 +691,17 @@ public class PythonSandboxTools {
         if (!preparingPersisted) {
             // 未取得 anchor owner 时释放尚未转交的容量。
             releasePreDispatch(reservation);
-            // 260818：retryable=false——该失败由 anchor 状态机决定，同一 run 内立刻重试
-            // 必然同样失败（批次 20260818-182948 中 LLM 无停止信号连试 7 次烧完 480s）。
+            // retryable=false：进度记录被别的流程占用时，同一 Run 内立刻重试必然再次失败
+            // （曾有模型无停止信号连试 7 次烧完 480 秒的先例），所以直接告诉模型不可重试。
             return fail("executePython", "TOOL_JOB_ANCHOR_INVALID",
                     "Failed to persist PREPARING tool-job anchor",
                     Map.of("operation_id", identity.operationId(), "retryable", false));
         }
 
         /*
-         * 从 durable PREPARING claim 成功开始，DAG worker 的任何异常退场都必须先移交
-         * owner。局部路径负责更精确的 abort/poll 分类；这里的 outer fallback 覆盖序列化、
-         * capacity restore、persistAttached 以及 create 身份不确定等未被局部 catch 的异常。
+         * 从数据库里的 PREPARING（准备中）抢占成功开始，DAG 线程的任何异常退场都必须先移交
+         * 负责者。局部路径负责更精确的 abort/poll 分类；这里的外层备用路径覆盖序列化、
+         * 名额恢复、persistAttached 以及 create 身份不确定等未被局部 catch 的异常。
          */
         try {
             // createResp 可能来自首次 RPC，也可能来自 operationId 灾后查询。
@@ -822,7 +821,7 @@ public class PythonSandboxTools {
             if (dataAnalysisCapacityService.restoreReservation(reservation) == DataAnalysisRestoreOutcome.CONFLICT) {
                 throw new IllegalStateException("capacity reservation attachment conflicted for task=" + taskId);
             }
-            // taskId、ATTACHED 和 reservation 状态一起落入 durable anchor。
+            // taskId、ATTACHED 和名额状态一起写进数据库进度记录。
             if (!pythonSandboxDispatchStore.persistAttached(runId, anchor)) {
                 if (!waitPolicy.durableSuspend()) {
                     return dagBlockingLeaseLost(
@@ -892,7 +891,7 @@ public class PythonSandboxTools {
                     throw interrupted;
                 }
             }
-            // LINEAR 在 fast-path 后转 durable pending；DAG 留在当前 worker，禁止生成 WAITING_TOOL_JOB。
+            // 线性模式在快路径后转后台等待；DAG 留在当前线程，禁止生成 WAITING_TOOL_JOB。
             if (waitPolicy.durableSuspend()) {
                 return suspend(runId, anchor, reservation, taskId);
             }
@@ -915,8 +914,8 @@ public class PythonSandboxTools {
     }
 
     /**
-     * 处理已经观察到的 Sandbox 终态。LINEAR 若同步收口不完整则转 durable pending；
-     * DAG 只能正常返回显式失败并保留 active anchor，交给 worker-lost cleanup 恢复。
+     * 处理已经观察到的沙箱终态。线性模式如果同步走完终态流程失败，就把任务转成后台等待；
+     * DAG 模式只能正常返回显式失败、保留数据库里的进度记录，交给恢复流程按「执行线程丢失」处理。
      */
     private String finishTerminalByWaitPolicy(
             String runId,
@@ -1096,7 +1095,7 @@ public class PythonSandboxTools {
             renewed = false;
         }
         if (!renewed) {
-            // 续租失败后旧 worker 不能携带新 lease 继续任何 durable 写入。
+            // 续租失败后，旧线程不能拿着新租约继续写数据库。
             anchor.setBlockingLeaseUntil(expectedLeaseUntil);
         }
         return renewed;
@@ -1274,31 +1273,36 @@ public class PythonSandboxTools {
             ToolJobAnchor anchor,
             DataAnalysisReservation current,
             String taskId) throws Exception {
-        // 同步终态尝试可能已经推进 reservation；优先以 anchor 中的 durable 快照为准。
+        // 这个 Python 任务无法在短时间内完成。下面把它从当前线程移交给后台：先把占用的
+        // 资源名额过户给后台任务（线程一旦释放，名额就没人管了），再把任务凭证
+        // 和 Run 状态一起写进数据库，最后通知上层可以释放线程。
+        // 先看数据库进度记录里有没有最新的资源占用信息，有就用它，防止拿调用栈里的旧数据覆盖新状态。
         if (anchor.getReservationJson() != null && !anchor.getReservationJson().isBlank()) {
             current = objectMapper.readValue(anchor.getReservationJson(), DataAnalysisReservation.class);
         }
-        // 只有 TASK_ATTACHED 需要转 PENDING_TRANSFERRED；已更靠后的状态保持原样以支持重入。
+        // 只有 TASK_ATTACHED（任务已交给沙箱）需要转成 PENDING_TRANSFERRED（待过户给后台）；
+        // 更靠后的状态保持原样，让本方法可以安全重入。
         DataAnalysisReservation pending = current.state() == DataAnalysisReservationState.TASK_ATTACHED
                 ? transitionReservation(current, DataAnalysisReservationState.PENDING_TRANSFERRED, taskId)
                 : current;
-        // 把容量所有权从当前同步调用转交给后台 pending 生命周期。
+        // 把占用的资源名额从当前线程过户给后台任务。
         if (current.state() == DataAnalysisReservationState.TASK_ATTACHED
                 && dataAnalysisCapacityService.restoreReservation(pending) == DataAnalysisRestoreOutcome.CONFLICT) {
-            // 转交冲突时绝不能释放 worker，否则容量/任务可能失去 owner。
+            // 过户冲突（另一个流程已经接管了这份名额）按失败处理：此时绝不能释放线程，
+            // 否则任务和名额都无人负责。
             throw new IllegalStateException("capacity transfer to pending conflicted");
         }
-        // 在内存 anchor 中写明后台 pending 与最新 reservation 快照。
+        // 把后台状态和最新的名额记录写进内存凭证，并安排好第一次后台轮询时间（同时写数据库和 Redis 到期索引）。
         anchor.setAnchorState("PENDING");
         anchor.setReservationJson(objectMapper.writeValueAsString(pending));
-        // 安排第一次后台轮询，时间会同时写入 DB 与 Redis due ZSET。
         anchor.setNextPollAt(Instant.now().plusMillis(POLL_INTERVAL_MS));
-        // 单条 CAS 原子完成 anchor 更新和 Run EXECUTING→WAITING_TOOL_JOB。
+        // 一条 SQL 同时写任务凭证、并把 Run 状态从执行中改为等待长工具，要么都成功、要么都不改。
         if (!pythonSandboxDispatchStore.transferToPending(runId, anchor)) {
-            // durable transfer 失败时不抛 pending 控制信号，防止上层释放 worker。
+            // 落库失败按失败处理：不抛挂起信号，防止上层释放线程。
             throw new IllegalStateException("durable transfer to WAITING_TOOL_JOB failed");
         }
-        // 到这里后台任务、容量 owner 和 Run 状态都已持久化，可以安全展开栈并让出 worker。
+        // 到这里后台任务、名额和 Run 状态都已写进数据库。最后抛出一个专门的挂起信号：
+        // 上层看到它就知道任务已转后台、可以释放线程，随后把信号转换成正常的挂起结果。
         throw new ExternalToolJobPendingException(
                 runId, anchor.getToolCallId(), anchor.getAttempt(),
                 "Python Sandbox task continues in background: " + taskId);

@@ -52,7 +52,7 @@ public class LangchainToolCatalogService {
      * {@link ToolCatalogBuilder} 的能力门控实时过滤，可能与全量视图不同。</p>
      *
      * <p>本方法复用 {@link ToolCatalogBuilder} 的共享构建路径，保证 API 目录与运行时目录的
-     * canonical 覆盖、resolveFinanceMethods 兜底逻辑完全一致。</p>
+     * canonical 覆盖、resolveFinanceMethods 补充逻辑完全一致。</p>
      */
     public List<AgentToolMessage> listToolMessages() {
         List<ToolSpecification> specifications = ToolCatalogBuilder.buildSpecifications(

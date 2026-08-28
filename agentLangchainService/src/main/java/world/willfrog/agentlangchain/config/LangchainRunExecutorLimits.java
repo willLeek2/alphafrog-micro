@@ -4,7 +4,7 @@ package world.willfrog.agentlangchain.config;
  * 一次解析后的 Run 调度上限快照。
  *
  * <p>core 是稳定并发，max 是队列打满后可临时扩到的上限，queueCapacity 是业务调度器
- * 自己维护的 FIFO 容量。构造器在边界处统一归一化，确保 core≤max、max≥1、queue≥0，
+ * 自己维护的 FIFO 容量。构造器统一做归一化，保证 core≤max、max≥1、queue≥0，
  * 后续调度热路径不再重复处理非法配置。</p>
  */
 public class LangchainRunExecutorLimits {

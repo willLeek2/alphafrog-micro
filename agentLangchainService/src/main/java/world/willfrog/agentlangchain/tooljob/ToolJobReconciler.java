@@ -148,11 +148,11 @@ public class ToolJobReconciler {
             ToolJobAnchor anchor = anchorService.loadAnchor(runId);
             // DB 已无 active anchor 时清理 Redis 残留，幂等结束。
             if (anchor == null) { redisCache.removeDue(runId); redisCache.deletePendingCache(runId); return; }
-            // 260818（grace round-1）：已接受 handoff 的真实状态是 ACCEPTED（CONSUMED 同源），
+            // 已接受 handoff 的真实状态是 ACCEPTED（CONSUMED 同源）；
             // 旧的 "LAUNCHING && isResultConsumed()" 组合在四态模型下永远为 false（死分支），
-            // 导致 EXECUTING+ACCEPTED 的 Run 被 60s 补扫重新写回 due 并反复进入 Sandbox
+            // 会让 EXECUTING+ACCEPTED 的 Run 被 60 秒补扫重新写回 due 并反复进入 Sandbox
             // finalizer。isResultConsumed() 从 resumeState 推导（ACCEPTED/CONSUMED），是
-            // 可实际读取的字段；autoResume=false（取消/暂停锚点）必须继续走终态收口，
+            // 可实际读取的字段；autoResume=false（取消/暂停锚点）必须继续走终态处理，
             // 不能被这条快速路径提前返回。
             if (anchor.isResultConsumed() && anchor.isAutoResume()) {
                 // 已接受 handoff 的 Run 处于 EXECUTING；旧 due 不能再次进入 Sandbox terminal finalizer。
@@ -170,11 +170,11 @@ public class ToolJobReconciler {
                 // live worker 的 lease 未到期时只重排 expiry；过期后必须先赢 fenced CAS。
                 if (!recoverLiveDagBlocking(runId, anchor)) return;
             }
-            // 260819（grace must-fix-1）：终态取消残留的直接清理入口——不查 Sandbox。
-            // 旧任务结果过保存期后 checkPausedTerminal 的结果拉取链可能永远走不到
+            // 终态取消残留的直接清理入口，不查 Sandbox。
+            // 旧任务结果过保存期后，checkPausedTerminal 的结果拉取流程可能永远走不到
             // finalizer 的 CANCELED 分支；这里让数据库语句自己复核终态 status、任务
-            // 身份、取消处置、autoResume=false 与步骤完成度。非终态 Run（正常取消
-            // 收口中）返回 0 行，继续走下面的 Sandbox 终态确认。
+            // 身份、取消处置、autoResume=false 与步骤完成度。非终态 Run（取消流程
+            // 还没走完）返回 0 行，继续走下面的 Sandbox 终态确认。
             if (CANCELED.equals(anchor.getRunDisposition())
                     && anchorService.closeResidualCanceledAnchor(
                             runId, anchor.getOperationId())) {
@@ -211,7 +211,7 @@ public class ToolJobReconciler {
                     GetTaskStatusRequest.newBuilder().setTaskId(taskId).build());
             String status = statusResp.getStatus();
 
-            // 三个规范终态进入结果拉取与 finalizer 链路。
+            // 三个规范终态进入结果拉取与 finalizer 流程。
             if (SUCCEEDED.equals(status) || FAILED.equals(status) || CANCELED.equals(status)) {
                 // fetchResult 还会核对 taskId/runId/expectedStatus，拒绝错配响应。
                 TaskResultResponse resultResp = fetchResult(taskId, runId, status);
@@ -275,7 +275,7 @@ public class ToolJobReconciler {
             // 只在已知终态后请求结果，减少大响应和无效轮询。
             TaskResultResponse resp = sandboxService.getTaskResult(
                     GetTaskResultRequest.newBuilder().setTaskId(taskId).build());
-            // validator 对任务身份与终态做 fail-closed 校验，错结果不会注入另一个 Run。
+            // validator 对任务身份与终态做严格校验，条件不满足就拒绝，错结果不会注入另一个 Run。
             return ToolJobResultValidator.validate(taskId, runId, resp, expectedStatus);
         } catch (Exception e) {
             log.error("Failed to fetch result for taskId={}, run={}", taskId, runId, e);
@@ -391,7 +391,7 @@ public class ToolJobReconciler {
         }
         Instant now = Instant.now();
         if (!DagBlockingWorkerLease.isExpired(anchor.getBlockingLeaseUntil(), now)) {
-            // 不写 PostgreSQL anchor；当前 live worker 仍拥有 durable lease。
+            // 不写 PostgreSQL anchor；当前 live worker 仍持有数据库里的 lease。
             anchor.setNextPollAt(anchor.getBlockingLeaseUntil());
             redisCache.atomicWritePendingAndDue(runId, anchor);
             return false;

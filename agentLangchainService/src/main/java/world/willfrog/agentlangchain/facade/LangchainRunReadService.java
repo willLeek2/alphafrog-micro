@@ -77,25 +77,26 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Agent 读路径统一入口 —— 所有查询类 RPC 最终都委托到这里。
+ * Agent 运行查询的统一入口 —— 所有查询类 RPC 最终都委托到这里。
+ * 除「读时惰性标记过期」这一处写回外，本类不做任何业务写操作。
  *
  * <h2>在 agent 架构中的位置</h2>
- * 上一轮 Top5 覆盖的是"写路径"（创建 run → planning → 执行 → 落库）。
+ * 创建 run、规划、执行、写入数据库这条"写路径"由编排层覆盖。
  * 本类覆盖"读路径"：前端轮询、matrix 脚本、用户查看历史 run 等所有查询操作。
- * 理解 agent 完整请求链路必须读写两路径都看。
+ * 理解 agent 完整请求路径必须读写两路径都看。
  *
- * <h2>核心职责</h2>
+ * <h2>主要职责</h2>
  * <ul>
  *   <li>run 查询（单个 run 详情、列表分页）</li>
  *   <li>status 轮询（前端 matrix 最频繁调用的接口，含 phase 推断、计划进度、
  *       observability 摘要）</li>
- *   <li>events 增量拉取（通过 afterSeq 游标实现断点续传；当前 Redis 为主、DB 为过渡期兜底）</li>
+ *   <li>events 按新增部分拉取（通过 afterSeq 游标实现断点续传；当前 Redis 为主、数据库为过渡期备用）</li>
  *   <li>result 结果查询（含结构化答案、credits 消耗计算）</li>
  *   <li>配置类查询（可用模型列表、工具列表、credits 余额）</li>
  *   <li>快照分段下载（大 run 的 snapshot 拆成多 part，分段拉取避免 OOM）</li>
  * </ul>
  *
- * <h2>读写一致性边界</h2>
+ * <h2>读写一致性的范围</h2>
  * langchain 服务和 agent runtime 共享同一套 PG/Redis 存储。事件流目前由
  * {@link AgentEventService} 为普通用户优先从 Redis ZSET 读取，只有 Redis 没有该 run 的事件时才回退 DB；
  * 管理员诊断读取直接使用 PostgreSQL 权威事件，避免 GET 冲刷 Redis pending 或刷新 TTL。
@@ -106,7 +107,7 @@ import java.util.Map;
  * <h2>status 方法的 phase 推断</h2>
  * {@link #getStatus} 不仅返回 run 状态，还根据最近事件类型推断当前阶段
  * （PLANNING / EXECUTING / EXECUTING_TOOL / SUMMARIZING / PAUSED）。
- * 这是前端进度展示的核心数据源，具体聚合已下沉到 {@link LangchainRunStatusReadModel}。
+ * 这是前端进度展示的主要数据源，具体聚合已下沉到 {@link LangchainRunStatusReadModel}。
  *
  * <h2>过期标记</h2>
  * 普通用户读取通过 {@link #markExpiredIfNeeded} 检查 run 是否已过期（超过 TTL），
@@ -123,9 +124,9 @@ public class LangchainRunReadService {
     private static final Logger log = LoggerFactory.getLogger(LangchainRunReadService.class);
 
     private final AgentRunMapper runMapper;
-    private final AgentEventService eventService;
+    private final AgentEventService agentEventService;
     private final AgentRunStateStore stateStore;
-    private final AgentObservabilityService observabilityService;
+    private final AgentObservabilityService agentObservabilityService;
     private final AgentCreditService creditService;
     private final AgentRunCostService runCostService;
     private final AgentRunCreditQueryService runCreditQueryService;
@@ -205,16 +206,15 @@ public class LangchainRunReadService {
                 .setTotal(total)
                 .setHasMore(offset + runs.size() < total);
         for (AgentRun run : runs) {
-            AgentRunStatus effectiveStatus = eventService.shouldMarkExpired(run)
+            AgentRunStatus effectiveStatus = agentEventService.shouldMarkExpired(run)
                     ? AgentRunStatus.EXPIRED : run.getStatus();
             builder.addItems(AgentRunListItemMessage.newBuilder()
                     .setId(nvl(run.getId()))
-                    .setMessage(nvl(eventService.extractRunDisplayTitle(run.getExt())))
+                    .setMessage(nvl(agentEventService.extractRunDisplayTitle(run.getExt())))
                     .setStatus(effectiveStatus == null ? "" : effectiveStatus.name())
                     .setCreatedAt(run.getStartedAt() == null ? "" : run.getStartedAt().toString())
                     .setCompletedAt(run.getCompletedAt() == null ? "" : run.getCompletedAt().toString())
-                    // 260814 scheduler-03 review fix：列表读路径同样先查冻结开关，
-                    // 关闭时直接 hasArtifacts=false，绝不触发 artifact 惰性注册。
+                    // 列表读路径同样先查冻结开关；关闭时直接 hasArtifacts=false，绝不触发 artifact 惰性注册。
                     .setHasArtifacts(LangchainArtifactFacadeService.generateArtifactsRequested(run)
                             && !artifactService.listArtifacts(run, false).isEmpty())
                     .setDurationMs(nonNegativeLong(run.getDurationMs()))
@@ -239,12 +239,12 @@ public class LangchainRunReadService {
             // snapshot 阶段只需要最近 N 条事件，前端用它补足首屏上下文；
             // 常规补洞仍走 afterSeq，避免每次都传完整事件流。
             events = request.getIsAdmin()
-                    ? eventService.listLatestByRunIdFromDatabase(request.getId(), limit)
-                    : eventService.listLatestByRunId(request.getId(), limit);
+                    ? agentEventService.listLatestByRunIdFromDatabase(request.getId(), limit)
+                    : agentEventService.listLatestByRunId(request.getId(), limit);
         } else {
             events = request.getIsAdmin()
-                    ? eventService.listByRunIdAfterSeqFromDatabase(request.getId(), afterSeq, limit + 1)
-                    : eventService.listByRunIdAfterSeq(request.getId(), afterSeq, limit + 1);
+                    ? agentEventService.listByRunIdAfterSeqFromDatabase(request.getId(), afterSeq, limit + 1)
+                    : agentEventService.listByRunIdAfterSeq(request.getId(), afterSeq, limit + 1);
             hasMore = events.size() > limit;
             if (hasMore) {
                 events = events.subList(0, limit);
@@ -266,7 +266,7 @@ public class LangchainRunReadService {
                 ? requireReadableRunForAdmin(request.getId())
                 : requireReadableRun(request.getId(), request.getUserId());
         String snapshotJson = nvl(run.getSnapshotJson());
-        String observabilityJson = nvl(observabilityService.loadObservabilityJson(run.getId(), snapshotJson));
+        String observabilityJson = nvl(agentObservabilityService.loadObservabilityJson(run.getId(), snapshotJson));
         observabilityJson = dataAnalysisOverlay().mergeResult(
                 run, observabilityJson, request.getIsAdmin());
         Map<String, Object> snapshot = readExtMap(snapshotJson);
@@ -276,8 +276,8 @@ public class LangchainRunReadService {
             structuredAnswerJson = writeJson(snapshot.get("structured_answer"));
         }
         List<AgentRunEvent> events = request.getIsAdmin()
-                ? eventService.listByRunIdFromDatabase(run.getId())
-                : eventService.listByRunId(run.getId());
+                ? agentEventService.listByRunIdFromDatabase(run.getId())
+                : agentEventService.listByRunId(run.getId());
         int totalCredits = creditService.calculateRunTotalCredits(run, events, observabilityJson);
         return AgentRunResultMessage.newBuilder()
                 .setId(nvl(run.getId()))
@@ -293,7 +293,7 @@ public class LangchainRunReadService {
 
     public world.willfrog.alphafrogmicro.agent.idl.AgentRunCostMessage getRunCost(GetAgentRunCostRequest request) {
         AgentRun run = requireReadableRun(request.getId(), request.getUserId());
-        String observabilityJson = nvl(observabilityService.loadObservabilityJson(run.getId(), run.getSnapshotJson()));
+        String observabilityJson = nvl(agentObservabilityService.loadObservabilityJson(run.getId(), run.getSnapshotJson()));
         return runCostService.buildAndPersist(run, observabilityJson);
     }
 
@@ -326,7 +326,7 @@ public class LangchainRunReadService {
      *   <li>已用时长（elapsedMs）</li>
      * </ul>
      *
-     * <p>这是 agent 前端展示的核心数据源。matrix 脚本在 poll 循环中每 3 秒调一次。
+     * <p>这是 agent 前端展示的主要数据源。matrix 脚本在 poll 循环中每 3 秒调一次。
      * 这里刻意不返回 full observability，避免 status poll 因大 trace 变成 MB 级响应；
      * 需要完整观测或安全调用详情时，由结果/详情接口按需加载。
      */
@@ -405,7 +405,7 @@ public class LangchainRunReadService {
 
     public AgentEmpty submitFeedback(SubmitAgentFeedbackRequest request) {
         AgentRun run = requireReadableRun(request.getId(), request.getUserId());
-        eventService.append(run.getId(), run.getUserId(), "FEEDBACK_RECEIVED", Map.of(
+        agentEventService.append(run.getId(), run.getUserId(), "FEEDBACK_RECEIVED", Map.of(
                 "rating", request.getRating(),
                 "comment", request.getComment(),
                 "tags_json", request.getTagsJson(),
@@ -416,7 +416,7 @@ public class LangchainRunReadService {
     public ExportAgentRunResponse exportRun(ExportAgentRunRequest request) {
         AgentRun run = requireReadableRun(request.getId(), request.getUserId());
         String exportId = java.util.UUID.randomUUID().toString().replace("-", "");
-        eventService.append(run.getId(), run.getUserId(), "EXPORT_REQUESTED", Map.of(
+        agentEventService.append(run.getId(), run.getUserId(), "EXPORT_REQUESTED", Map.of(
                 "export_id", exportId,
                 "format", request.getFormat()));
         return ExportAgentRunResponse.newBuilder()
@@ -536,7 +536,7 @@ public class LangchainRunReadService {
     }
 
     private AgentRun markExpiredIfNeeded(AgentRun run) {
-        if (run == null || !eventService.shouldMarkExpired(run)) {
+        if (run == null || !agentEventService.shouldMarkExpired(run)) {
             return run;
         }
         // 过期是读时发现并补写的状态：旧 run 没有后台定时器一直扫描。
@@ -548,7 +548,7 @@ public class LangchainRunReadService {
                     + "runId={} status={} rows={}", run.getId(), AgentRunStatus.EXPIRED, updatedRows);
             return run;
         }
-        eventService.append(run.getId(), run.getUserId(), "RUN_EXPIRED", Map.of(
+        agentEventService.append(run.getId(), run.getUserId(), "RUN_EXPIRED", Map.of(
                 "run_id", run.getId(),
                 "expired_at", OffsetDateTime.now().toString()));
         stateStore.markRunStatus(run.getId(), AgentRunStatus.EXPIRED.name());
@@ -557,7 +557,7 @@ public class LangchainRunReadService {
         return refreshed == null ? run : refreshed;
     }
 
-    /** Workspace dump 失败走 DB polling 兜底，不能反向破坏已经提交的过期终态。 */
+    /** 工作区归档事件发送失败时走数据库轮询备用路径，不能反向破坏已经提交的过期终态。 */
     private void publishFinalizedEventSafely(String runId, String userId, AgentRunStatus status) {
         try {
             finalizationService.publishFinalizedEvent(runId, userId, status.name());
@@ -603,9 +603,9 @@ public class LangchainRunReadService {
 
     private LangchainRunStatusReadModel statusReadModel() {
         return new LangchainRunStatusReadModel(
-                eventService,
+                agentEventService,
                 stateStore,
-                observabilityService,
+                agentObservabilityService,
                 creditService,
                 objectMapper,
                 dataAnalysisOverlay());

@@ -20,15 +20,15 @@ import world.willfrog.alphafrogmicro.agent.idl.ListAgentArtifactsResponse;
 @RequiredArgsConstructor
 public class LangchainArtifactFacadeService {
 
-    private final LangchainRunReadService readService;
+    private final LangchainRunReadService runReadService;
     private final AgentArtifactService artifactService;
     private final SnapshotPartService snapshotPartService;
 
     public ListAgentArtifactsResponse listArtifacts(ListAgentArtifactsRequest request) {
         AgentRun run = requireReadableRun(request.getId(), request.getUserId(), request.getIsAdmin());
         if (!generateArtifactsRequested(run)) {
-            // 260814 scheduler-03: artifact 默认关闭。未请求的 Run 查询 artifact
-            // 列表返回空列表，且不触发 AgentArtifactService 的惰性注册。
+            // artifact 默认关闭。未请求的 Run 查询 artifact 列表返回空列表，
+            // 且不触发 AgentArtifactService 的惰性注册。
             return ListAgentArtifactsResponse.newBuilder().build();
         }
         return ListAgentArtifactsResponse.newBuilder()
@@ -110,9 +110,9 @@ public class LangchainArtifactFacadeService {
     }
 
     /**
-     * 260814 scheduler-03: artifact 是显式按请求开启的能力。创建 Run 时由
-     * task #118 把请求字段冻结进 ext.generate_artifacts（缺失/无法解析按
-     * false）。未开启的 Run 不得产生或暴露任何 artifact。
+     * artifact 是显式按请求开启的能力。创建 Run 时把请求字段冻结进
+     * ext.generate_artifacts（缺失/无法解析按 false）。未开启的 Run
+     * 不得产生或暴露任何 artifact。
      */
     private void requireArtifactsEnabled(AgentRun run) {
         if (!generateArtifactsRequested(run)) {
@@ -121,11 +121,11 @@ public class LangchainArtifactFacadeService {
     }
 
     /**
-     * 260814 scheduler-03：artifact 是显式按请求开启的能力（task #118 把请求
-     * 字段冻结进 ext.generate_artifacts，缺失/无法解析按 false）。本判定为
-     * facade 四个 artifact 入口与 LangchainRunReadService.listRuns 等列表读
-     * 路径共用的单一冻结开关，关闭时任何路径都不得触发
-     * AgentArtifactService 的惰性注册。
+     * artifact 是显式按请求开启的能力（创建 Run 时把请求字段冻结进
+     * ext.generate_artifacts，缺失/无法解析按 false）。本判定是 facade
+     * 四个 artifact 入口与 LangchainRunReadService.listRuns 等列表读路径
+     * 共用的单一冻结开关，关闭时任何路径都不得触发 AgentArtifactService
+     * 的惰性注册。
      */
     static boolean generateArtifactsRequested(AgentRun run) {
         String ext = run == null ? null : run.getExt();
@@ -150,8 +150,8 @@ public class LangchainArtifactFacadeService {
      */
     private AgentRun requireReadableRun(String runId, String userId, boolean isAdmin) {
         return isAdmin
-                ? readService.requireReadableRunForAdmin(runId)
-                : readService.requireReadableRun(runId, userId);
+                ? runReadService.requireReadableRunForAdmin(runId)
+                : runReadService.requireReadableRun(runId, userId);
     }
 
     private static String nvl(String value) {

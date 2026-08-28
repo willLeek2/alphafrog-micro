@@ -13,7 +13,7 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
-/** D06 子代理专用的有界执行池与超时调度器。 */
+/** 子代理专用的有界执行池与超时调度器。 */
 @Configuration
 public class LangchainSubAgentConfiguration {
 

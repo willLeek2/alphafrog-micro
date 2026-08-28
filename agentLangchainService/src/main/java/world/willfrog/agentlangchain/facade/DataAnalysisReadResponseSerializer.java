@@ -12,7 +12,7 @@ import world.willfrog.agent.platform.dataanalysis.DataAnalysisObservabilitySumma
 
 /**
  * 将 data-analysis observability 序列化为 JSON 字符串，嵌入已有的 observability 响应中。
- * 不直接访问 Redis/DB，不修改 T0 contract。
+ * 不直接访问 Redis/DB，响应契约保持不变。
  */
 @Component
 public class DataAnalysisReadResponseSerializer {

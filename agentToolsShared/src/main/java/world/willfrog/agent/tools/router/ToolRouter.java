@@ -49,10 +49,11 @@ import java.util.concurrent.TimeUnit;
  * 本路由器只负责分发已在注册表中声明的工具。spawnSubAgent / waitForSubAgent
  * 由 D06 的 {@link SubAgentControlHandler} 提供控制语义；声明、目录与路由同时生效。</p>
  *
- * <p>面试里如果只看 agentLangchainService 的 {@code ToolRouterToolExecutor}，
- * 只能知道 LC4j 的 tool call 如何进入 Java；真正的业务语义在这里：是否允许调用、
- * 是否超预算、是否命中缓存、结果如何写 observability、异常如何包装成统一 JSON。
- * 因此本类是「模型工具调用」和「平台业务工具」之间的运行时边界。</p>
+ * <p>agentLangchainService 的 {@code ToolRouterToolExecutor} 只负责把 LC4j 的 tool call
+ * 接入本类；真正的业务语义在本类：是否允许调用、是否超预算、是否命中缓存、
+ * 结果如何写 observability、异常如何包装成统一 JSON。
+ * 因此本类是「模型工具调用」通往「平台业务工具」的唯一入口。讲解要点见
+ * {@code agent-working-docs/code-review/phase2/agent-run-overall/tool-routing-interview-points.md}。</p>
  *
  * <p>Agent V2 前端接入后，工具调用还多了一层实时事件契约：
  * {@code ToolRouterToolExecutor} 负责发 {@code TOOL_CALL_STARTED/FINISHED}，

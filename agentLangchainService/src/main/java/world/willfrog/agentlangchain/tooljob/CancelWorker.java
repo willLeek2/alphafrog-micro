@@ -19,7 +19,7 @@ import java.util.Map;
  * <p>三阶段协议：
  * <ul>
  *   <li>Phase A (CTE tx): 原子写 CANCELLING frontier + 标记所有活跃 child</li>
- *   <li>Phase B (RPC outside tx): 调用 Sandbox cancelTask（upstream blocked: W2 task #102 D11 @ccmax）</li>
+ *   <li>Phase B（事务外 RPC）: 调用 Sandbox cancelTask（该 RPC 尚未就绪，当前先跳过）</li>
  *   <li>Phase C (per-child tx): 根据 RPC 结果写 child 终态或重试计数</li>
  * </ul>
  *
@@ -175,15 +175,13 @@ public class CancelWorker {
                 yield ea != null && ea.newNodeVersion() > 0;
             }
             case RECOVERY -> {
-                // upstream blocked: W2 task #102 D11 cancelTask RPC @ccmax
-                // Scope C: 必须先用 getTaskByOperationId 回查 + 权威保留期证明丢失
-                // 才能调 atomicTerminalLost。D11 RPC 未就绪前保持 no-op。
+                // cancelTask RPC 尚未就绪。就绪后必须先按 operationId 回查任务、
+                // 确认结果保留期已过，才能把任务写成丢失终态；就绪前保持 no-op。
                 log.debug("CancelWorker: RECOVERY blocked nodeId={}", nodeId);
                 yield false;
             }
             case PREPARING, FIRST, RETRY -> {
-                // upstream blocked: W2 task #102 D11 cancelTask RPC @ccmax
-                // 不写任何计数/backoff — 不伪造 RPC 失败
+                // cancelTask RPC 尚未就绪；不写任何计数和退避，避免伪造 RPC 失败记录
                 log.debug("CancelWorker: RPC not available nodeId={} bucket={}",
                         nodeId, bucket);
                 yield false;

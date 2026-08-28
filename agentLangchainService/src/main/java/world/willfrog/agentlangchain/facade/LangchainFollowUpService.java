@@ -19,9 +19,9 @@ import java.util.Map;
 @RequiredArgsConstructor
 public class LangchainFollowUpService {
 
-    private final LangchainRunReadService readService;
+    private final LangchainRunReadService runReadService;
     private final AgentRunMapper runMapper;
-    private final AgentEventService eventService;
+    private final AgentEventService agentEventService;
     private final AgentMessageService messageService;
     private final AgentRunStateStore stateStore;
     private final LangchainLinearRunPipeline pipeline;
@@ -31,7 +31,7 @@ public class LangchainFollowUpService {
         String runId = requireNonBlank(request.getRunId(), "run_id is required");
         String content = requireNonBlank(request.getContent(), "content is required");
 
-        AgentRun run = readService.requireWritableRun(runId, userId);
+        AgentRun run = runReadService.requireWritableRun(runId, userId);
         if (run.getStatus() != AgentRunStatus.COMPLETED) {
             return SendAgentMessageResponse.newBuilder()
                     .setStatus("rejected")
@@ -40,9 +40,9 @@ public class LangchainFollowUpService {
                     .setRunStatus(run.getStatus().name())
                     .build();
         }
-        if (eventService.shouldMarkExpired(run)) {
+        if (agentEventService.shouldMarkExpired(run)) {
             runMapper.updateStatus(runId, userId, AgentRunStatus.EXPIRED);
-            eventService.append(runId, userId, "RUN_EXPIRED", Map.of(
+            agentEventService.append(runId, userId, "RUN_EXPIRED", Map.of(
                     "run_id", runId,
                     "expired_at", java.time.OffsetDateTime.now().toString()));
             return SendAgentMessageResponse.newBuilder()
@@ -54,7 +54,7 @@ public class LangchainFollowUpService {
 
         String metaJson = messageService.buildMetaJson(null, null, null, null);
         AgentRunMessage userMessage = messageService.createUserMessage(runId, content, metaJson);
-        eventService.append(runId, userId, "FOLLOW_UP_RECEIVED", Map.of(
+        agentEventService.append(runId, userId, "FOLLOW_UP_RECEIVED", Map.of(
                 "seq", userMessage.getSeq(),
                 "content_preview", preview(content, 200),
                 "message_id", userMessage.getId()));
@@ -62,15 +62,15 @@ public class LangchainFollowUpService {
         runMapper.updatePlanJson(runId, userId, "{}");
         stateStore.clearPlanCache(runId);
         stateStore.clearTasks(runId);
-        runMapper.resetForResume(runId, userId, eventService.nextTtlExpiresAt());
-        eventService.append(runId, userId, "WORKFLOW_RESUMED", Map.of(
+        runMapper.resetForResume(runId, userId, agentEventService.nextTtlExpiresAt());
+        agentEventService.append(runId, userId, "WORKFLOW_RESUMED", Map.of(
                 "run_id", runId,
                 "reason", "follow_up",
                 "message_seq", userMessage.getSeq(),
                 "engine", "agentLangchainService"));
         stateStore.markRunStatus(runId, AgentRunStatus.RECEIVED.name());
 
-        AgentRun refreshed = readService.requireReadableRun(runId, userId);
+        AgentRun refreshed = runReadService.requireReadableRun(runId, userId);
         pipeline.launchAsync(refreshed);
 
         return SendAgentMessageResponse.newBuilder()

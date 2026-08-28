@@ -77,7 +77,7 @@ import world.willfrog.alphafrogmicro.agent.idl.UpdateAgentRunRequest;
  * <h2>条件装配</h2>
  * 仅在 {@code agent.langchain.provider.enabled=true} 时激活。
  * 这个开关同时控制 Nacos 注册——关闭时 langchain 服务不注册 Dubbo provider，
- * 所有流量自动走 legacy。
+ * 所有流量自动走 legacy（旧版 agent 服务）。
  *
  * @see AgentLangchainRunService 写路径
  * @see LangchainRunReadService 读路径
@@ -89,7 +89,7 @@ import world.willfrog.alphafrogmicro.agent.idl.UpdateAgentRunRequest;
 public class AgentLangchainDubboServiceImpl extends DubboAgentDubboServiceTriple.AgentDubboServiceImplBase {
 
     private final AgentLangchainRunService runService;
-    private final LangchainRunReadService readService;
+    private final LangchainRunReadService runReadService;
     private final LangchainRunControlService controlService;
     private final LangchainFollowUpService followUpService;
     private final LangchainArtifactFacadeService artifactFacadeService;
@@ -97,7 +97,7 @@ public class AgentLangchainDubboServiceImpl extends DubboAgentDubboServiceTriple
     @Override
     public GetAgentDiagnosticReadCapabilitiesResponse getDiagnosticReadCapabilities(
             GetAgentDiagnosticReadCapabilitiesRequest request) {
-        return readService.getDiagnosticReadCapabilities(request);
+        return runReadService.getDiagnosticReadCapabilities(request);
     }
 
     @Override
@@ -107,22 +107,22 @@ public class AgentLangchainDubboServiceImpl extends DubboAgentDubboServiceTriple
 
     @Override
     public AgentRunMessage getRun(GetAgentRunRequest request) {
-        return readService.getRun(request);
+        return runReadService.getRun(request);
     }
 
     @Override
     public AgentRunMessage updateRun(UpdateAgentRunRequest request) {
-        return readService.updateRun(request);
+        return runReadService.updateRun(request);
     }
 
     @Override
     public ListAgentRunsResponse listRuns(ListAgentRunsRequest request) {
-        return readService.listRuns(request);
+        return runReadService.listRuns(request);
     }
 
     @Override
     public ListAgentRunEventsResponse listEvents(ListAgentRunEventsRequest request) {
-        return readService.listEvents(request);
+        return runReadService.listEvents(request);
     }
 
     @Override
@@ -147,32 +147,32 @@ public class AgentLangchainDubboServiceImpl extends DubboAgentDubboServiceTriple
 
     @Override
     public AgentRunResultMessage getResult(GetAgentRunResultRequest request) {
-        return readService.getResult(request);
+        return runReadService.getResult(request);
     }
 
     @Override
     public AgentRunCostMessage getRunCost(GetAgentRunCostRequest request) {
-        return readService.getRunCost(request);
+        return runReadService.getRunCost(request);
     }
 
     @Override
     public GetAgentRunCreditsResponse getRunCredits(GetAgentRunCreditsRequest request) {
-        return readService.getRunCredits(request);
+        return runReadService.getRunCredits(request);
     }
 
     @Override
     public GetAgentRunCreditsResponse refreshRunCredits(RefreshAgentRunCreditsRequest request) {
-        return readService.refreshRunCredits(request);
+        return runReadService.refreshRunCredits(request);
     }
 
     @Override
     public AgentRunStatusMessage getStatus(GetAgentRunStatusRequest request) {
-        return readService.getStatus(request);
+        return runReadService.getStatus(request);
     }
 
     @Override
     public ListAgentToolsResponse listTools(ListAgentToolsRequest request) {
-        return readService.listTools(request);
+        return runReadService.listTools(request);
     }
 
     @Override
@@ -197,32 +197,32 @@ public class AgentLangchainDubboServiceImpl extends DubboAgentDubboServiceTriple
 
     @Override
     public GetAgentConfigResponse getConfig(GetAgentConfigRequest request) {
-        return readService.getConfig(request);
+        return runReadService.getConfig(request);
     }
 
     @Override
     public ListAgentModelsResponse listModels(ListAgentModelsRequest request) {
-        return readService.listModels(request);
+        return runReadService.listModels(request);
     }
 
     @Override
     public GetAgentCreditsResponse getCredits(GetAgentCreditsRequest request) {
-        return readService.getCredits(request);
+        return runReadService.getCredits(request);
     }
 
     @Override
     public ApplyAgentCreditsResponse applyCredits(ApplyAgentCreditsRequest request) {
-        return readService.applyCredits(request);
+        return runReadService.applyCredits(request);
     }
 
     @Override
     public AgentEmpty submitFeedback(SubmitAgentFeedbackRequest request) {
-        return readService.submitFeedback(request);
+        return runReadService.submitFeedback(request);
     }
 
     @Override
     public ExportAgentRunResponse exportRun(ExportAgentRunRequest request) {
-        return readService.exportRun(request);
+        return runReadService.exportRun(request);
     }
 
     @Override
@@ -232,17 +232,17 @@ public class AgentLangchainDubboServiceImpl extends DubboAgentDubboServiceTriple
 
     @Override
     public ListAgentMessagesResponse listMessages(ListAgentMessagesRequest request) {
-        return readService.listMessages(request);
+        return runReadService.listMessages(request);
     }
 
     @Override
     public AgentSnapshotPartsMetaMessage getSnapshotPartsMeta(GetAgentSnapshotPartsRequest request) {
-        return readService.getSnapshotPartsMeta(request);
+        return runReadService.getSnapshotPartsMeta(request);
     }
 
     @Override
     public AgentSnapshotPartMessage getSnapshotPart(GetAgentSnapshotPartRequest request) {
-        return readService.getSnapshotPart(request);
+        return runReadService.getSnapshotPart(request);
     }
 
 }

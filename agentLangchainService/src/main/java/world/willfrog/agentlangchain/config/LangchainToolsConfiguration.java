@@ -18,7 +18,7 @@ import world.willfrog.agentlangchain.tools.ToolRouterToolProvider;
 import world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore;
 
 /**
- * Registers the ToolRouter-backed {@link ToolProvider} for AiServices (P1 A2).
+ * 把基于 {@link ToolRouter} 的 {@link ToolProvider} 注册给 AiServices 使用。
  */
 @Configuration
 @ConditionalOnBean({ToolRouter.class, MarketDataTools.class, RagTools.class, SearchTools.class,
