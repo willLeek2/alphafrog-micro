@@ -8,8 +8,8 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Phase 3.2 A3 G3: 在 run 触发 100% budget 触顶时，从已完成 todo 的 output 拼出一个确定性的 partial answer，
- * 跳过 {@code writeFinalAnswer()} 的 LLM 调用（避免在 budget 已超限时再发请求触发硬截断 / 异常）。
+ * 额度用尽时，从已完成 todo 的 output 拼一份固定的部分答案，
+ * 跳过 {@code writeFinalAnswer()} 的模型调用（避免额度已超限时再发请求触发硬截断 / 异常）。
  *
  * <h2>长度限制</h2>
  * <ul>

@@ -52,14 +52,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  *   <li>消息拼装：{@link LangchainTodoUserMessageBuilder} 负责把 todo 描述、已完成 todo 列表、dataset refs 拼成 user message；</li>
  *   <li>预算/观测：{@link AtomicInteger} toolCalls 由上游传入，用于累加 run 级别的总工具调用次数；{@link AgentContext} 用于注入 tracing/observability 上下文。</li>
  * </ul>
- * <p>
- * 面试常考点：
- * <ul>
- *   <li>“一个 todo 是怎么执行的？” → 看 {@link #execute} 和 {@link #buildTodoAiService}；</li>
- *   <li>“怎么防止 run 被取消后继续发 LLM 请求？” → 看 {@link #ensureRunnable} 和 {@code chatRequestTransformer / beforeToolExecution}；</li>
- *   <li>“tool loop 最多跑多少轮？” → {@link #DEFAULT_MAX_TOOL_ROUND_TRIPS}（30 轮），与 run-level {@code maxToolCalls} 是两层限制；</li>
- *   <li>“dataset 怎么跨 todo 传递？” → 通过 {@link LangchainDatasetRefContext} + {@link DatasetRefRegistry} 注册/读取 JSON 片段。</li>
- * </ul>
+ * <p>讲解材料见
+ * {@code agent-working-docs/code-review/phase2/agent-run-overall/interview-comments-migrated.md}</p>
  *
  * @see LangchainDagWorkflowExecutor DAG 调度层
  * @see AgentPromptService Prompt 装配层
@@ -77,7 +71,7 @@ public class LangchainTodoNodeExecutor {
      * 当模型连续多轮都选择调用工具时，最多允许 30 轮，超过后 LC4j 会停止循环、返回当前结果。
      * <p>
      * 注意：这是<strong>单 todo 级</strong>限制，与 run-level 的 {@code maxToolCalls}（整个 run 所有 todo 的累计工具调用上限）
-     * 是两层独立限制。此前（commit ddf3dce 之前）这个值是 8，导致复杂回测 todo 内工具未执行完就被截断，后改为 30。
+     * 是两层独立限制。默认值从 8 提到 30，是因为复杂回测待办在 8 轮内经常还没跑完工具就被截断。
      */
     private static final int DEFAULT_MAX_TOOL_ROUND_TRIPS = 30;
     private static final String EXECUTE_PYTHON_TOOL = "executePython";
@@ -344,7 +338,7 @@ public class LangchainTodoNodeExecutor {
             }
             String trimmed = output.trim();
             // Prompt 只能表达意图，不能作为执行证明。修复轮次若没有真正完成一次新的
-            // executePython（旧语义请求会在工具层返回 ok=false），纯文本/JSON/解释均 fail-closed。
+            // executePython（旧语义请求会在工具层返回 ok=false），纯文本/JSON/解释均失败即关闭。
             if (pythonRepair && !acceptedPythonRepairExecution.get()) {
                 return LangchainTodoNodeResult.failure(
                         "python_repair_execute_required",
@@ -759,7 +753,7 @@ public class LangchainTodoNodeExecutor {
      *   <li>user message 由 {@link LangchainTodoUserMessageBuilder#buildFinalUserMessage} 拼装，包含用户原始目标 + 全部已完成 todo 的结果汇总。</li>
      * </ul>
      * <p>
-     * 面试注意点：如果 final answer 为空，会在 {@link LangchainDagWorkflowExecutor} 层被判定为失败（empty final answer failed）。
+     * 若最终回答为空，{@link LangchainDagWorkflowExecutor} 会判定为失败（empty final answer failed）。
      *
      * @param request        当前 run 请求上下文
      * @param completedTodos 所有已完成 todo 的结果列表
@@ -784,7 +778,7 @@ public class LangchainTodoNodeExecutor {
     /**
      * 构建用于执行单个 todo 的 LC4j {@link AiServices} 实例。
      * <p>
-     * 配置要点（面试常问）：
+     * 配置要点：
      * <ul>
      *   <li><b>chatModel</b>：使用 execution 阶段模型（{@code request.executionModelOrDefault()}），可与 planning/final answer 阶段不同；</li>
      *   <li><b>systemMessageProvider</b>：每次请求前获取稳定 System（{@link AgentPromptService#reactSystemPrompt()}）；
@@ -907,8 +901,8 @@ public class LangchainTodoNodeExecutor {
      *   <li>{@link #buildTodoAiService} 的 {@code beforeToolExecution} —— 每次执行工具前。</li>
      * </ol>
      * <p>
-     * 面试注意：如果缺少第 2、3 道防线，用户点击 cancel 后，已发出的 LLM 请求可能在 tool loop 中继续执行多轮，
-     * 造成资源浪费和 observability 混乱。
+     * 如果缺少第 2、3 道防线，用户点击 cancel 后，已发出的模型请求可能在工具循环中继续执行多轮，
+     * 造成资源浪费和观测数据混乱。
      *
      * @param request 当前 run 请求上下文，含 runId 和 userId
      */
@@ -1001,8 +995,8 @@ public class LangchainTodoNodeExecutor {
     }
 
     /**
-     * Phase 3.2 A3 M2 path: 从 catch 的异常中提取 budget 超限结构化字段，供 LangchainLinearWorkflowExecutor /
-     * LangchainDagWorkflowExecutor 在 partial / fail-fast 决策时识别。
+     * 从 catch 的异常中提取额度超限结构化字段，供 LangchainLinearWorkflowExecutor /
+     * LangchainDagWorkflowExecutor 在「拼部分答案 / 立即失败」决策时识别。
      * <p>
      * 触发链路：{@link AgentRunBudgetService#checkBeforeLlmCall()} / {@link AgentRunBudgetService#checkBeforeToolCall()}
      * 在 budget 超限时抛 {@link RunBudgetException}（继承 {@link IllegalStateException}），消息格式
@@ -1033,7 +1027,7 @@ public class LangchainTodoNodeExecutor {
             }
             String msg = cur.getMessage();
             if (msg != null && msg.startsWith("RUN_BUDGET_EXCEEDED:")) {
-                // 兜底路径：当上游包了一层（如 RuntimeException 套 RunBudgetException），
+                // 备用路径：当上游包了一层（如 RuntimeException 套 RunBudgetException），
                 // 从 message 里拆出 dimension / actual / limit 三段（format = RUN_BUDGET_EXCEEDED:<dim>:<actual>/<limit>）
                 Map<String, Object> meta = new LinkedHashMap<>();
                 meta.put("budget_exceeded", true);

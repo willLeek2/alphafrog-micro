@@ -49,12 +49,12 @@ public class LangchainRunExecutionGuard {
             }
         }
         if (!isBlank(userId) && !eventService.isRunnable(runId, userId)) {
-            // Redis 可能丢失或尚未同步，因此最终仍以数据库中的持久 Run 状态兜底。
+            // Redis 可能丢失或尚未同步，因此最终仍以数据库中的持久 Run 状态为准。
             AgentRun run = runMapper.findByIdAndUser(runId, userId);
             if (run != null && run.getStatus() != null) {
                 return Optional.of(run.getStatus().name());
             }
-            // isRunnable 已明确拒绝但无法取得具体记录时，也必须 fail-closed，不能放旧 worker 继续跑。
+            // isRunnable 已明确拒绝但无法取得具体记录时，也必须失败即关闭，不能放旧 worker 继续跑。
             return Optional.of("NOT_RUNNABLE");
         }
         return Optional.empty();

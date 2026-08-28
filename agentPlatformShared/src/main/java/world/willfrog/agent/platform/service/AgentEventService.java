@@ -51,7 +51,7 @@ import java.util.Optional;
  * <h3>ext 字段提取方法集</h3>
  * 大量 {@code extractXxx(String extJson)} 方法都遵循统一约定:解析 JSON,缺失/异常返回安全默认值,
  * 避免单个字段问题阻塞 run 执行。execution mode 是会改变 executor 与恢复语义的契约字段，
- * 因此它例外地对未知值 fail-closed。多数方法还兼容 ext 顶层 / context_json 嵌套两种位置,
+     * 因此它例外地对未知值失败即关闭。多数方法还兼容 ext 顶层 / context_json 嵌套两种位置,
  * 同时兼容 camelCase / snake_case 两种命名。
  *
  * <h3>Payload 截断</h3>
@@ -655,7 +655,7 @@ public class AgentEventService {
      * 从 ext JSON 中提取强类型 requested execution mode。
      *
      * <p>这是 pipeline 的统一入口；与 {@link #extractExecutionMode(String)} 使用同一套
-     * trim / case-insensitive / fail-closed 规则。</p>
+     * trim / 忽略大小写 / 失败即关闭规则。</p>
      */
     public PlanExecutionMode extractPlanExecutionMode(String extJson) {
         return parseExecutionMode(extractExecutionMode(extJson));

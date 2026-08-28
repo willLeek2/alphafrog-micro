@@ -50,13 +50,7 @@ import java.util.function.Supplier;
  * 会在首次加载和每次重载时解析为文件内容并内联到配置对象中。
  * 引用的 prompt 文件也参与变更检测——prompt 文件改了同样触发重载。</p>
  *
- * <h2>面试常考点</h2>
- * <ul>
- *   <li>"配置怎么热更新？"→ Nacos 写文件 → 10s 轮询 → 检测配置/Prompt 文件修改时间 → 原子替换</li>
- *   <li>"为什么不用 Redis pub/sub？"→ 文件轮询更简单，Nacos 本身负责把配置分发到文件，
- *       不需要额外引入消息通道</li>
- *   <li>"热加载失败怎么办？"→ 沿用上一次成功加载的配置，不影响正在运行的 agent</li>
- * </ul>
+ * <p>讲解材料见 {@code agent-working-docs/code-review/phase2/agent-run-overall/interview-comments-migrated.md}。</p>
  *
  * @see AgentPromptService#currentPrompts() 消费方
  * @see AgentLlmProperties 配置结构定义

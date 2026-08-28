@@ -20,9 +20,9 @@ import java.util.List;
 /**
  * 为一次 agent run 解析 planning（规划）、execution（执行）、final-answer（最终答案）三个阶段各自使用的 ChatModel。
  *
- * <p>面试高频问题「planning 用什么模型、execution 用什么模型、final answer 用什么模型」的核心答案文件。
- * 它的职责不是直接构造模型，而是把三层配置源合并成每个阶段的 Effective Config（生效配置），
- * 再委托 {@link AgentAiServiceFactory} 去实际 build ChatModel。</p>
+ * <p>它的职责不是直接构造模型，而是把三层配置源合并成每个阶段的生效配置，
+ * 再委托 {@link AgentAiServiceFactory} 去实际 build ChatModel。
+ * 讲解材料见 {@code agent-working-docs/code-review/phase2/agent-run-overall/interview-comments-migrated.md}。</p>
  *
  * <p>三层配置源的优先级（从高到低）：</p>
  * <ol>
@@ -41,7 +41,7 @@ import java.util.List;
  * <p>provider order（供应商优先级）的合并逻辑：
  * 用户指定的 providerOrder（来自请求或 stage config）排在前面，
  * endpoint 级模型元数据中的 validProviders（来自 {@link AgentLlmResolver}）补充到后面，
- * 确保用户偏好优先、系统白名单兜底。</p>
+ * 确保用户偏好优先、系统白名单作为备用路径。</p>
  */
 @Component
 @RequiredArgsConstructor

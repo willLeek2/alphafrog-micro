@@ -23,9 +23,8 @@ import java.util.Map;
 import java.util.Locale;
 
 /**
- * Agent 提示词中心 —— 整个 agent 系统所有 LLM 调用的 prompt 都在这里组装，
- * 是面试理解 agent 全流程最关键的三个文件之一
- * （另两个是 {@code LangchainLinearRunPipelineImpl} 和 {@code LangchainAiPlanner}）。
+ * Agent 提示词中心 —— 整个 agent 系统所有模型调用的 prompt 都在这里组装。
+ * 讲解材料见 {@code agent-working-docs/code-review/phase2/agent-run-overall/interview-comments-migrated.md}。
  *
  * <h2>这个类解决什么问题</h2>
  * <p>agent 在不同阶段（planning 规划 / execution 执行 / final answer 最终回答 / recovery 恢复 / judge 判定）
@@ -38,7 +37,7 @@ import java.util.Locale;
  *       Run 内根据建 Run 时冻结的 reference date 计算当前年月日 + 相对年份映射规则；
  *       非 Run 的轻量调用才使用 {@code LocalDate.now()}。
  *       例如 "当前时间：2026年05月25日（星期一，2026年5月25日）...说去年，指2025年"。
- *       这是防止 LLM 把"去年"推理成错误年份的兜底机制。</li>
+ *       这是防止模型把"去年"推理成错误年份的备用机制。</li>
  *   <li><b>全局 agent 指令</b>（global，来自 {@code agentRunSystemPrompt}）：
  *       所有阶段共享的基础角色定义和约束（如"你是专业金融分析代理"、禁止猜测代码、必须用具体年份等）。
  *       在 System Message 中保持不变，利于 OpenAI 兼容 API 的 KV 前缀缓存（prompt caching）。</li>
@@ -74,19 +73,6 @@ import java.util.Locale;
  * （{@link Complexity#LOW}/{@link Complexity#MEDIUM}/{@link Complexity#HIGH}），
  * 然后从配置中选择对应档位的模型名，高复杂度用强模型（如 GPT-5.4），低复杂度用便宜模型（如 Qwen 122B），
  * 兼顾效果和成本。</p>
- *
- * <h2>面试可能被问到的点</h2>
- * <ul>
- *   <li>"System Prompt 为什么按天变化？不会破坏 KV 缓存吗？"
- *       → 时间基准确实会让 system prompt 每天不同，降低跨日缓存命中率。但我们优先保证时间推理正确
- *       （否则 LLM 会把"去年"算成 2024 而非 2025），缓存损失可接受。</li>
- *   <li>"prompt 怎么发布更新？"
- *       → 先修改 shared classpath 权威正文，再生成/同步外置投影并发布新构建；
- *       Nacos 热加载只接受逐字一致的投影，漂移候选会保留旧快照并产生失败指标。</li>
- *   <li>"checkParallelLimits 为什么放在 prompt 里引导而不是硬编码？"
- *       → 批量上限是运行时配置（可热改），硬编码在 prompt 里会导致配置改了但 LLM 仍按旧数字发请求。
- *       引导 LLM 先调 checkParallelLimits 获取当前上限，配置变更时 prompt 无需改动。</li>
- * </ul>
  *
  * @see AgentLlmLocalConfigLoader 热加载配置加载器
  * @see AgentLlmProperties 配置结构定义
@@ -905,8 +891,7 @@ public class AgentPromptService {
     /**
      * 组装完整的 System Prompt：<b>时间基准 + 全局 agent 指令 + 可选的阶段专属 prompt</b>。
      *
-     * <p>这是整个 agent 系统最重要的 prompt 组装方法，所有 System Prompt 最终都经过这里。
-     * 面试时如果能讲清楚这个三段式结构及其设计意图，基本就掌握了 agent 的 prompt 架构。</p>
+     * <p>这是整个 agent 系统最重要的 prompt 组装方法，所有 System Prompt 最终都经过这里。</p>
      *
      * <h3>三段式结构</h3>
      * <ol>
@@ -916,8 +901,8 @@ public class AgentPromptService {
      *         <li>相对年份映射："用户说2026年，指2026年；说去年，指2025年；说今年，指2026年..."</li>
      *         <li>输出约束："所有输出内容须标明具体公历年份，禁止使用仅含「去年」「明年」等表述"</li>
      *       </ul>
-     *       <b>面试要点</b>：为什么每天动态计算而不是写死？因为 agent 长期运行，
-     *       去年/今年的含义随时间变化。写死会导致跨年后"去年"指代错误。</li>
+     *       为什么每天动态计算而不是写死：agent 长期运行，去年/今年的含义随时间变化。
+     *       写死会导致跨年后"去年"指代错误。</li>
      *   <li><b>全局 agent 指令（静态）</b>：来自 {@code agentRunSystemPrompt}
      *       （通常是 {@code agent_run_system.txt}），包含角色定义、通用约束等。
      *       这部分内容跨阶段保持不变，利于 OpenAI 兼容 API 的自动 KV 前缀缓存。</li>
@@ -1146,8 +1131,8 @@ public class AgentPromptService {
      *   <li>score ＜ 2 → {@link Complexity#LOW}（简单，如搜索一个代码）→ 选便宜模型（如 Qwen 122B）</li>
      * </ul>
      *
-     * <p><b>面试要点</b>：这是一个简单但有效的启发式方法。不需要真正"理解"任务语义，
-     * 只需要看文本长度和关键词就能做出合理的复杂度判断。比硬编码所有 Sub-Agent 用同一个模型更经济。</p>
+     * <p>这是一个简单但有效的启发式方法。不需要真正"理解"任务语义，
+     * 只需要看文本长度和关键词就能做出合理的复杂度判断。比所有子代理共用同一个模型更经济。</p>
      *
      * @param goal    Sub-Agent 的任务目标文本
      * @param context 补充上下文文本

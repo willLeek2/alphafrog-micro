@@ -185,6 +185,7 @@ public class LangchainLinearWorkflowExecutor {
         AgentContext.setWorkflow("linear");
         // extractedEntities 来自原 plan，不重新运行 planning LLM。
         AgentContext.setExtractedEntities(plan.getExtractedEntities());
+        // 进入循环前的恢复/重启不变量由 WorkflowResumeValidator 一次性检查；违例带原原因码失败即关闭。
         WorkflowResumeValidator.Result resumeCheck = resumeValidator.validate(
                 plan, resumeContext, restartCheckpoint);
         List<LangchainCompletedTodo> completedTodos = resumeCheck.completedTodos();
@@ -199,7 +200,9 @@ public class LangchainLinearWorkflowExecutor {
         // datasetRefs 是当前 worker 的堆内映射，必须从已完成输出重新注册。
         Map<String, String> datasetRefs = LangchainTodoUserMessageBuilder.newDatasetRefMap();
         completedTodos.forEach(todo -> DatasetRefRegistry.registerFromJson(todo.displayOutput(), datasetRefs));
+        // completedIds 用于 O(1) 跳过已经确认成功写入数据库的待办节点，防止重复工具副作用。
         java.util.Set<String> completedIds = resumeCheck.completedIds();
+        // resultConsumed=true 表示上一次恢复已确认消费终态，当前应从下一节点继续。
         boolean handoffAccepted = resumeCheck.handoffAccepted();
         boolean activePythonRepair = resumeCheck.activePythonRepair();
         if (handoffAccepted) {
@@ -296,7 +299,7 @@ public class LangchainLinearWorkflowExecutor {
                     emitTodoNodeEvent(request.getRunId(), request.getUserId(),
                             "TODO_NODE_COMPLETED", item, null,
                             System.currentTimeMillis() - nodeStartMs, null, false, null);
-                    // 在内存 context 中把恢复点推进到下一 Todo 或 FINAL 哨兵。
+                    // 在内存 context 中把恢复点推进到下一 Todo，或推进到「所有普通节点已完成」的结尾位置标记。
                     prepareAcceptedHandoff(resumeContext, plan, completedTodos, item, toolCalls.get(), true);
                     // 先持久化推进后的 checkpoint，成功后才允许继续执行后续 Todo。
                     if (terminalConsumed == null || !terminalConsumed.getAsBoolean()) {
@@ -358,8 +361,8 @@ public class LangchainLinearWorkflowExecutor {
                 emitTodoNodeEvent(request.getRunId(), request.getUserId(),
                         "TODO_NODE_FAILED", item, reason, nodeDurationMs,
                         failureMetadata, false, null);
-                // Phase 3.2 A3 M2/G2/G3: budget 超限分支 — 区分 partial (有产出) 与 fail-fast (零产出)，
-                // 跳过 writeFinalAnswer() 的 LLM 调用（budget 已触顶，再发 LLM 会立即再触发 RunBudgetException）。
+                // 额度已超限：有已完成节点则拼部分答案，一个都没有则立即失败。
+                // 跳过 writeFinalAnswer() 的模型调用（额度已用尽，再发请求会立刻再次触发 RunBudgetException）。
                 if (failureMetadata != null && Boolean.TRUE.equals(failureMetadata.get("budget_exceeded"))) {
                     return handleBudgetExhaustion(request, plan, completedTodos, reason,
                             failureMetadata, toolCalls.get());
@@ -442,9 +445,9 @@ public class LangchainLinearWorkflowExecutor {
                 .filter(item -> item.getSequence() > current.getSequence())
                 .min(java.util.Comparator.comparingInt(TodoItem::getSequence))
                 .orElse(null) : null;
-        // 没有后续 Todo 时使用 FINAL 哨兵，防止恢复时重新命中当前节点。
+        // 没有后续 Todo 时写入「所有普通节点已完成」的结尾位置标记，防止恢复时重新命中当前节点。
         context.setTodoId(next == null ? ToolJobResumeContext.FINAL_TODO_ID : next.getId());
-        // 哨兵沿用当前 sequence；有下一节点时保存其真实 sequence。
+        // 结尾位置标记沿用当前序号；有下一节点时保存其真实序号。
         context.setTodoSequence(next == null ? current.getSequence() : next.getSequence());
         context.setPythonRepairPending(false);
         // 最后置 resultConsumed，表示以上上下文字段已经准备好交给 durable consume CAS。
@@ -534,12 +537,12 @@ public class LangchainLinearWorkflowExecutor {
     }
 
     /**
-     * Phase 3.2 A3 M3/G3: budget 触顶时的确定性降级路径。
+     * 额度用尽时的固定降级路径（不再问恢复判定器，避免再次触发额度异常）。
      * <ul>
-     *   <li>已完成 todo ≥ 1 → 用 {@link LangchainBudgetPartialAnswerBuilder} 拼 deterministic finalAnswer
+     *   <li>已完成 todo ≥ 1 → 用 {@link LangchainBudgetPartialAnswerBuilder} 按已有产出拼最终回答
      *       （受 MAX_TODOS / MAX_PER_TODO_CHARS / MAX_TOTAL_CHARS 三重上限保护），发 WORKFLOW_PARTIAL_BUDGET；</li>
-     *   <li>已完成 todo = 0 → 无 partial 内容可拼，发 WORKFLOW_FAILED_BUDGET（completed_todo_count=0）；</li>
-     *   <li>两条路径都不调用 {@code todoNodeExecutor.writeFinalAnswer()} —— budget 已超限，再触发 LLM
+     *   <li>已完成 todo = 0 → 没有可拼的部分内容，发 WORKFLOW_FAILED_BUDGET（completed_todo_count=0）；</li>
+     *   <li>两条路径都不调用 {@code todoNodeExecutor.writeFinalAnswer()} —— 额度已超限，再触发模型调用
      *       会立即再被 {@code AgentRunBudgetService.check()} 拦截抛 {@code RunBudgetException}。</li>
      * </ul>
      * failureMetadata 来源：{@link LangchainTodoNodeExecutor#extractBudgetFailureMetadata} 写入的
@@ -596,7 +599,7 @@ public class LangchainLinearWorkflowExecutor {
             return result;
         }
 
-        // completedTodos 空：fail-fast，无 partial 可拼
+        // completedTodos 空：没有可拼的部分答案，立即失败。
         String failedReason = "RUN_BUDGET_EXCEEDED:" + dimension + ":" + actual + "/" + limit
                 + " — no completed todo, fail-fast";
         LangchainLinearWorkflowResult result = LangchainLinearWorkflowResult.builder()
@@ -733,7 +736,7 @@ public class LangchainLinearWorkflowExecutor {
         }
         // failureMetadata 结构化观测：按语义路由到对应子字段（budget_failure / empty_output_observation / failure_metadata），
         // 让压测报告 / dashboard 能直接消费，不必回 trace 翻。
-        // Phase 3.2 A3: budget metadata 不再误挂 empty_output_observation，避免 budget failure 被误归类为 empty_todo_output。
+        // 额度失败的元数据不要写进 empty_output_observation，否则会被误判成「待办输出为空」。
         if (failureMetadata != null && !failureMetadata.isEmpty()) {
             if (failureMetadata.containsKey("todo_retry_attempts")) {
                 payload.put("todo_retry_attempts", failureMetadata.get("todo_retry_attempts"));
