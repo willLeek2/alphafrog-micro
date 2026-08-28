@@ -1811,8 +1811,17 @@ public class AgentController {
         if (msg.contains("run expired")) {
             return ResponseWrapper.error(ResponseCode.BUSINESS_ERROR, "run 已过期，不能断点续跑，请新建 run");
         }
-        if (msg.contains("use cancel instead")) {
-            return ResponseWrapper.error(ResponseCode.BUSINESS_ERROR, "run 正在等待长工具结果，暂不支持暂停，请改用取消");
+        if (msg.contains("pause_anchor_disposition_failed")) {
+            return ResponseWrapper.error(ResponseCode.BUSINESS_ERROR, "暂停未生效：该 run 的工具任务状态刚发生变化，请刷新后重试");
+        }
+        if (msg.contains("still in flight")) {
+            return ResponseWrapper.error(ResponseCode.BUSINESS_ERROR, "run 等待的长工具还在运行中，等它结束后（几秒到几分钟）再恢复；想立即停下请用取消");
+        }
+        if (msg.contains("cleanup is still in progress")) {
+            return ResponseWrapper.error(ResponseCode.BUSINESS_ERROR, "长工具已结束，结果收尾还在进行，请几秒后重试恢复");
+        }
+        if (msg.contains("resume_anchor_clear_failed")) {
+            return ResponseWrapper.error(ResponseCode.BUSINESS_ERROR, "恢复未生效：该 run 状态刚发生变化，请刷新后重试");
         }
         if (msg.contains("snapshot_version_incompatible")) {
             return ResponseWrapper.error(
@@ -1838,8 +1847,17 @@ public class AgentController {
         if (msg.contains("run expired")) {
             return ResponseWrapper.error(ResponseCode.BUSINESS_ERROR, "run 已过期，不能断点续跑，请新建 run");
         }
-        if (msg.contains("use cancel instead")) {
-            return ResponseWrapper.error(ResponseCode.BUSINESS_ERROR, "run 正在等待长工具结果，暂不支持暂停，请改用取消");
+        if (msg.contains("pause_anchor_disposition_failed")) {
+            return ResponseWrapper.error(ResponseCode.BUSINESS_ERROR, "暂停未生效：该 run 的工具任务状态刚发生变化，请刷新后重试");
+        }
+        if (msg.contains("still in flight")) {
+            return ResponseWrapper.error(ResponseCode.BUSINESS_ERROR, "run 等待的长工具还在运行中，等它结束后（几秒到几分钟）再恢复；想立即停下请用取消");
+        }
+        if (msg.contains("cleanup is still in progress")) {
+            return ResponseWrapper.error(ResponseCode.BUSINESS_ERROR, "长工具已结束，结果收尾还在进行，请几秒后重试恢复");
+        }
+        if (msg.contains("resume_anchor_clear_failed")) {
+            return ResponseWrapper.error(ResponseCode.BUSINESS_ERROR, "恢复未生效：该 run 状态刚发生变化，请刷新后重试");
         }
         if (msg.contains("snapshot_version_incompatible")) {
             return ResponseWrapper.error(

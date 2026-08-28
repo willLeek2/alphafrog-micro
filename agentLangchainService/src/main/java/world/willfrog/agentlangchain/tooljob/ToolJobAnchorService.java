@@ -79,6 +79,31 @@ public class ToolJobAnchorService {
     }
 
     /**
+     * 暂停意图的持久化，与 persistCancelDisposition 对称：只合并 autoResume=false 与
+     * runDisposition=PAUSED 两个字段，绑定精确 operationId，不整份写回旧锚点。
+     * 锚点已有处置（取消/检查点失败/DAG 系）或任务已被替换时返回 false，
+     * 调用方必须失败关闭本次暂停——先落库的处置优先，Run 保持原状。
+     */
+    public boolean persistPauseDisposition(String runId, String operationId,
+                                            AgentRunStatus expectedStatus) {
+        if (operationId == null || operationId.isBlank()) {
+            return false;
+        }
+        return agentRunMapper.persistPauseDisposition(runId, expectedStatus, operationId) == 1;
+    }
+
+    /**
+     * 手动恢复前清掉已收尾的暂停锚点（清成空对象）。栅栏仍满足才清；
+     * 返回 false 表示并发处置已改变状态，调用方必须放弃本次恢复。
+     */
+    public boolean clearPausedAnchor(String runId, String operationId) {
+        if (operationId == null || operationId.isBlank()) {
+            return false;
+        }
+        return agentRunMapper.clearPausedToolJobAnchor(runId, operationId) == 1;
+    }
+
+    /**
      * 只合并修复计数的专项更新：只改 {@code repairAttempts[toolName]}，绑定精确 operationId，
      * 不整份写回旧锚点。第二个长工具已替换锚点时返回 false。
      */

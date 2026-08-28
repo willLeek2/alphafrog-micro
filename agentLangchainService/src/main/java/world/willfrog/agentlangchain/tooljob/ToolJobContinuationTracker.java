@@ -197,10 +197,16 @@ public class ToolJobContinuationTracker {
         log.info("Continuation terminal for run={} status={}, handing to finalizer", runId, status);
         // finalizer 完成 ENVELOPE/RELEASE/USAGE/EVENT/CAS_STATUS，并在 autoResume
         // 时通过 completeResumeReady → resumeService.tryResume 触发续接入队。
-        // 只有 finalizer 成功返回后才移除登记；失败保留登记下一轮重试，
-        // 最终只形成一个终态结果由 finalizer 的可重入六步保证。
+        // 只有 finalizer 明确做完（done）才移除登记；没做完（带步骤与原因）或抛异常
+        // 都保留登记下一轮重试，最终只形成一个终态结果由 finalizer 的可重入六步保证。
         try {
-            finalizer.handleTerminal(runId, anchor, status, resultResp, anchor.isAutoResume());
+            ToolJobFinalizer.FinalizerOutcome outcome =
+                    finalizer.handleTerminal(runId, anchor, status, resultResp, anchor.isAutoResume());
+            if (!outcome.done()) {
+                log.warn("Continuation finalizer incomplete for run={} status={} step={} reason={}; "
+                        + "keeping registration for retry", runId, status, outcome.step(), outcome.reason());
+                return;
+            }
         } catch (Exception finalizeFailure) {
             log.error("Continuation finalizer failed for run={} status={}; "
                     + "keeping registration for retry", runId, status, finalizeFailure);
@@ -219,10 +225,16 @@ public class ToolJobContinuationTracker {
         }
     }
 
-    /** RESULT_LOST 统一终态处理：finalizer 成功后才移除登记，失败保留下一轮重试。 */
+    /** RESULT_LOST 统一终态处理：finalizer 明确做完才移除登记，没做完或异常保留下一轮重试。 */
     private void finalizeResultLost(String runId, ContinuationEntry entry, ToolJobAnchor anchor) {
         try {
-            finalizer.handleTerminal(runId, anchor, "RESULT_LOST", null, anchor.isAutoResume());
+            ToolJobFinalizer.FinalizerOutcome outcome =
+                    finalizer.handleTerminal(runId, anchor, "RESULT_LOST", null, anchor.isAutoResume());
+            if (!outcome.done()) {
+                log.warn("Continuation RESULT_LOST finalizer incomplete for run={} step={} reason={}; "
+                        + "keeping registration for retry", runId, outcome.step(), outcome.reason());
+                return;
+            }
         } catch (Exception finalizeFailure) {
             log.error("Continuation RESULT_LOST finalizer failed for run={}; "
                     + "keeping registration for retry", runId, finalizeFailure);

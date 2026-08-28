@@ -41,6 +41,14 @@ class ToolJobContinuationTrackerTest {
         return tracker;
     }
 
+    @org.junit.jupiter.api.BeforeEach
+    void stubFinalizerDone() {
+        // finalizer 现在显式返回做没做完；默认桩为「做完」，要测保留登记的路径请覆盖本桩。
+        org.mockito.Mockito.lenient()
+                .when(finalizer.handleTerminal(any(), any(), any(), any(), anyBoolean()))
+                .thenReturn(ToolJobFinalizer.FinalizerOutcome.completed());
+    }
+
     private ToolJobAnchor pendingAnchor() {
         ToolJobAnchor anchor = new ToolJobAnchor();
         anchor.setAnchorState("PENDING");
@@ -290,7 +298,7 @@ class ToolJobContinuationTrackerTest {
                         .setStdout("done")
                         .build());
         doThrow(new RuntimeException("db write failed"))
-                .doNothing()
+                .doReturn(ToolJobFinalizer.FinalizerOutcome.completed())
                 .when(finalizer).handleTerminal(
                         eq("run-1"), eq(anchor), eq("SUCCEEDED"), any(), eq(true));
 
@@ -308,5 +316,38 @@ class ToolJobContinuationTrackerTest {
 
         tracker.pollPending();
         verify(finalizer, times(2)).handleTerminal(any(), any(), any(), any(), anyBoolean());
+    }
+
+    @Test
+    void finalizerIncompleteKeepsRegistrationAndRetriesNextPoll() {
+        // finalizer 显式返回「没做完」（比如条件更新没抢到所有权）：与抛异常同效，
+        // 登记保留、下一轮重试；不再靠「没抛异常」猜测收尾完成。
+        ToolJobAnchor anchor = pendingAnchor();
+        ToolJobAnchor after = pendingAnchor();
+        after.setResumeState("LAUNCHING");
+        when(anchorService.loadAnchor("run-1")).thenReturn(anchor, anchor, after);
+        when(runMapper.findById("run-1")).thenReturn(null);
+        when(sandboxService.getTaskStatus(any(GetTaskStatusRequest.class)))
+                .thenReturn(TaskStatusResponse.newBuilder().setStatus("SUCCEEDED").build());
+        when(sandboxService.getTaskResult(any(GetTaskResultRequest.class)))
+                .thenReturn(TaskResultResponse.newBuilder()
+                        .setTaskId("task-1")
+                        .setStatus("SUCCEEDED")
+                        .setStdout("done")
+                        .build());
+        doReturn(ToolJobFinalizer.FinalizerOutcome.incomplete("ENVELOPE", "cas_failed"))
+                .doReturn(ToolJobFinalizer.FinalizerOutcome.completed())
+                .when(finalizer).handleTerminal(
+                        eq("run-1"), eq(anchor), eq("SUCCEEDED"), any(), eq(true));
+
+        ToolJobContinuationTracker tracker = tracker();
+        tracker.register("run-1", anchor);
+        tracker.pollPending();
+        assertThat(tracker.registeredCount()).isEqualTo(1);
+
+        tracker.pollPending();
+        verify(finalizer, times(2)).handleTerminal(
+                eq("run-1"), eq(anchor), eq("SUCCEEDED"), any(), eq(true));
+        assertThat(tracker.registeredCount()).isZero();
     }
 }

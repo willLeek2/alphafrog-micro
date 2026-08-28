@@ -104,7 +104,7 @@ class LangchainLinearRunPipelinePlanReadyTest {
         run.setUserId("user-1");
         run.setExt("{}");
         when(runMapper.findById("run-pending-1")).thenReturn(run);
-        when(runMapper.updateSnapshot(eq("run-pending-1"), eq("user-1"),
+        when(runMapper.updateTerminalSnapshot(eq("run-pending-1"), eq("user-1"),
                 eq(world.willfrog.agent.platform.model.AgentRunStatus.FAILED),
                 any(), eq(true), eq("tool_job_checkpoint_anchor_missing"))).thenReturn(1);
         when(eventService.isRunnable("run-pending-1", "user-1")).thenReturn(true);
@@ -154,7 +154,7 @@ class LangchainLinearRunPipelinePlanReadyTest {
                 .containsEntry("durable_failure_disposition", true);
         verify(eventService, never()).append(eq("run-pending-1"), eq("user-1"),
                 eq("TOOL_CALL_SUSPENDED"), any());
-        verify(runMapper).updateSnapshot(eq("run-pending-1"), eq("user-1"),
+        verify(runMapper).updateTerminalSnapshot(eq("run-pending-1"), eq("user-1"),
                 eq(world.willfrog.agent.platform.model.AgentRunStatus.FAILED),
                 any(), eq(true), eq("tool_job_checkpoint_anchor_missing"));
     }
@@ -287,7 +287,7 @@ class LangchainLinearRunPipelinePlanReadyTest {
         inOrder.verify(runMapper).updatePlanJson("run-plan-1", "user-1", expectedPlanJson);
         inOrder.verify(stateStore).recordPlan("run-plan-1", expectedPlanJson, true);
         inOrder.verify(eventService).append(eq("run-plan-1"), eq("user-1"), eq("PLAN_READY"), any());
-        verify(runMapper).updateSnapshot(eq("run-plan-1"), eq("user-1"), any(), any(), anyBoolean(), any());
+        verify(runMapper).updateTerminalSnapshot(eq("run-plan-1"), eq("user-1"), any(), any(), anyBoolean(), any());
     }
 
     @SuppressWarnings("unchecked")
