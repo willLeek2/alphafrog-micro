@@ -168,6 +168,18 @@ public interface AgentRunMapper {
                                  @Param("expectedOperationId") String expectedOperationId);
 
     /**
+     * 修复计数专用窄写：只 jsonb 合并 {@code repairAttempts[toolName]}，并顺带去掉旧的
+     * pythonRepair* 三键。绑定精确 operationId，不整份写回锚点，避免盖掉暂停/取消处置。
+     */
+    int persistRepairAttempt(@Param("id") String id,
+                              @Param("expectedStatus") AgentRunStatus expectedStatus,
+                              @Param("expectedOperationId") String expectedOperationId,
+                              @Param("toolName") String toolName,
+                              @Param("attempt") int attempt,
+                              @Param("pending") boolean pending,
+                              @Param("exhausted") boolean exhausted);
+
+    /**
      * 第一次 PREPARING dispatch 只允许占用空 anchor。
      * 这是长工具 operation 的最初所有权 CAS，可阻止同一 Run 的并发工具调用互相覆盖恢复坐标。
      */

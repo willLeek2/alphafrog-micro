@@ -139,7 +139,7 @@ class WorkflowResumeValidatorTest {
         WorkflowResumeValidator.Result result = validator.validate(singleTodoPlan(), context, null);
 
         assertThat(result.ok()).isTrue();
-        assertThat(result.activePythonRepair()).isTrue();
+        assertThat(result.activeRepair()).isTrue();
         assertThat(result.handoffAccepted()).isTrue();
     }
 

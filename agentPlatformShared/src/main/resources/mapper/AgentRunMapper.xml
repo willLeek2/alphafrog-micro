@@ -459,6 +459,38 @@
     </update>
 
     <!--
+        批次 2 T3-B1：修复计数窄写。只合并 repairAttempts[toolName]，并删掉历史
+        pythonRepair* 三键。第二个长工具已替换 operationId 时返回 0。
+        与 persistCancelDisposition 同形状，谁都不整份写回 tool_job_anchor_json。
+    -->
+    <update id="persistRepairAttempt">
+        UPDATE alphafrog_agent_run
+        SET tool_job_anchor_json = (
+                (COALESCE(tool_job_anchor_json, '{}'::jsonb)
+                    - 'pythonRepairAttempt'
+                    - 'pythonRepairPending'
+                    - 'pythonRepairExhausted')
+                || jsonb_build_object(
+                    'repairAttempts',
+                    jsonb_set(
+                        COALESCE(tool_job_anchor_json -&gt; 'repairAttempts', '{}'::jsonb),
+                        ARRAY[#{toolName}],
+                        jsonb_build_object(
+                            'attempt', #{attempt}::int,
+                            'pending', #{pending}::boolean,
+                            'exhausted', #{exhausted}::boolean
+                        ),
+                        true
+                    )
+                )
+            ),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND status = #{expectedStatus}
+          AND tool_job_anchor_json -&gt;&gt; 'operationId' = #{expectedOperationId}
+    </update>
+
+    <!--
         恢复 worker 的第二次长工具接管：旧 handoff 已经消费且 Run 已回到 EXECUTING，
         只有持有精确 token/version 的 worker 能原子替换为新 PREPARING。
         260818：resumeState 同时接受 LAUNCHING（结果已注入、尚未 accept）与

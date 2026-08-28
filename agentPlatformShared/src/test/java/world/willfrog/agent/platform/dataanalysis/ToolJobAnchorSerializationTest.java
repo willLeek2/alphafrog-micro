@@ -77,6 +77,41 @@ class ToolJobAnchorSerializationTest {
                 "sha256:" + "b".repeat(64));
         assertThat(restored.getTerminalStderrPreview()).isEqualTo("Traceback: bad date");
         assertThat(restored.getTerminalExitReason()).isEqualTo("NON_ZERO_EXIT");
+        assertThat(anchor.toJson()).contains("\"repairAttempts\"");
+        assertThat(anchor.toJson()).doesNotContain("pythonRepairAttempt");
+        assertThat(anchor.toJson()).doesNotContain("pythonRepairPending");
+        assertThat(anchor.toJson()).doesNotContain("pythonRepairExhausted");
+        assertThat(restored.repairAttempt("executePython").getAttempt()).isEqualTo(2);
+        assertThat(restored.repairAttempt("executePython").isPending()).isTrue();
+        assertThat(restored.repairAttempt("executePython").isExhausted()).isTrue();
+    }
+
+    @Test
+    void readsLegacyPythonRepairKeysAndRewritesOnlyNewMap() {
+        ToolJobAnchor restored = ToolJobAnchor.fromJson("""
+                {"pythonRepairAttempt":2,"pythonRepairPending":true,"pythonRepairExhausted":true}""");
+
+        assertThat(restored.getPythonRepairAttempt()).isEqualTo(2);
+        assertThat(restored.isPythonRepairPending()).isTrue();
+        assertThat(restored.isPythonRepairExhausted()).isTrue();
+        assertThat(restored.repairAttempt("executePython").getAttempt()).isEqualTo(2);
+        String rewritten = restored.toJson();
+        assertThat(rewritten).contains("\"repairAttempts\"");
+        assertThat(rewritten).contains("\"executePython\"");
+        assertThat(rewritten).doesNotContain("pythonRepairAttempt");
+        assertThat(rewritten).doesNotContain("pythonRepairPending");
+        assertThat(rewritten).doesNotContain("pythonRepairExhausted");
+    }
+
+    @Test
+    void newRepairAttemptsKeyWinsOverAbsentLegacyKeys() {
+        ToolJobAnchor restored = ToolJobAnchor.fromJson("""
+                {"repairAttempts":{"executePython":{"attempt":3,"pending":false,"exhausted":true}}}""");
+
+        assertThat(restored.getPythonRepairAttempt()).isEqualTo(3);
+        assertThat(restored.isPythonRepairPending()).isFalse();
+        assertThat(restored.isPythonRepairExhausted()).isTrue();
+        assertThat(restored.toJson()).doesNotContain("pythonRepairAttempt");
     }
 
     @Test
