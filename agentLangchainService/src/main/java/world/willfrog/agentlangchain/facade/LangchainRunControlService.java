@@ -171,14 +171,17 @@ public class LangchainRunControlService {
             // 终态事件与容量释放完成后，finalizer 才把数据库状态改成 CANCELED。
             runMapper.updateSnapshot(runId, userId, run.getStatus(), snapshot, false, null);
         } else {
-            int snapshotRows = runMapper.updateSnapshot(
-                    runId, userId, AgentRunStatus.CANCELED, snapshot, false, null);
-            int ttlRows = runMapper.updateStatusWithTtl(
-                    runId, userId, AgentRunStatus.CANCELED, agentEventService.nextInterruptedExpiresAt());
-            canceledPersisted = snapshotRows == 1 && ttlRows == 1;
+            // 快照+状态+TTL 一条原子写入，带终态栅栏：数据库已是终态（执行刚提交的
+            // COMPLETED 等）时返回 0，先落库的终态赢。迟到取消拿不到行时不发
+            // CANCELED 事件、不写 Redis 终态、不结算，直接按现状返回——不广播
+            // 数据库里不存在的终态。
+            canceledPersisted = runMapper.cancelTerminalSnapshotWithTtl(
+                    runId, userId, snapshot, agentEventService.nextInterruptedExpiresAt()) == 1;
             if (!canceledPersisted) {
-                log.warn("CANCELED persistence was not exact: runId={} snapshotRows={} ttlRows={}",
-                        runId, snapshotRows, ttlRows);
+                log.warn("CANCELED refused by terminal fence (run already terminal or invisible): "
+                        + "runId={} — returning current state without terminal broadcast", runId);
+                AgentRun current = runReadService.requireReadableRun(runId, userId);
+                return AgentLangchainRunMessageMapper.toRunMessage(current);
             }
         }
         if (canceledPersisted && schedulerMetrics != null) {

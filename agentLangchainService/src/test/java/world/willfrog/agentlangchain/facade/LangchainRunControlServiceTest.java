@@ -47,16 +47,14 @@ class LangchainRunControlServiceTest {
         when(observabilityService.attachObservabilityToSnapshot("r1", "{}", AgentRunStatus.CANCELED))
                 .thenReturn("{\"observability\":{}}");
         when(eventService.nextInterruptedExpiresAt()).thenReturn(OffsetDateTime.now().plusDays(7));
-        when(runMapper.updateSnapshot(eq("r1"), eq("u1"), eq(AgentRunStatus.CANCELED),
-                anyString(), eq(false), isNull())).thenReturn(1);
-        when(runMapper.updateStatusWithTtl(eq("r1"), eq("u1"), eq(AgentRunStatus.CANCELED), any()))
+        when(runMapper.cancelTerminalSnapshotWithTtl(eq("r1"), eq("u1"), anyString(), any()))
                 .thenReturn(1);
 
         var response = service.cancelRun(CancelAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build());
 
         assertEquals("CANCELED", response.getStatus());
         verify(observabilityService).forceFlush("r1");
-        verify(runMapper).updateSnapshot(eq("r1"), eq("u1"), eq(AgentRunStatus.CANCELED), anyString(), eq(false), isNull());
+        verify(runMapper).cancelTerminalSnapshotWithTtl(eq("r1"), eq("u1"), anyString(), any());
         verify(eventService).append(eq("r1"), eq("u1"), eq("CANCELED"), anyMap());
         verify(finalizationService).publishFinalizedEvent("r1", "u1", "CANCELED");
     }
@@ -70,9 +68,7 @@ class LangchainRunControlServiceTest {
         when(observabilityService.attachObservabilityToSnapshot("r1", "{}", AgentRunStatus.CANCELED))
                 .thenReturn("{\"observability\":{}}");
         when(eventService.nextInterruptedExpiresAt()).thenReturn(OffsetDateTime.now().plusDays(7));
-        when(runMapper.updateSnapshot(eq("r1"), eq("u1"), eq(AgentRunStatus.CANCELED),
-                anyString(), eq(false), isNull())).thenReturn(1);
-        when(runMapper.updateStatusWithTtl(eq("r1"), eq("u1"), eq(AgentRunStatus.CANCELED), any()))
+        when(runMapper.cancelTerminalSnapshotWithTtl(eq("r1"), eq("u1"), anyString(), any()))
                 .thenReturn(1);
         doThrow(new RuntimeException("listener unavailable"))
                 .when(finalizationService).publishFinalizedEvent("r1", "u1", "CANCELED");
@@ -81,8 +77,7 @@ class LangchainRunControlServiceTest {
                 CancelAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build());
 
         assertEquals("CANCELED", response.getStatus());
-        verify(runMapper).updateStatusWithTtl(
-                eq("r1"), eq("u1"), eq(AgentRunStatus.CANCELED), any());
+        verify(runMapper).cancelTerminalSnapshotWithTtl(eq("r1"), eq("u1"), anyString(), any());
         verify(finalizationService).publishFinalizedEvent("r1", "u1", "CANCELED");
     }
 
@@ -95,14 +90,17 @@ class LangchainRunControlServiceTest {
         when(observabilityService.attachObservabilityToSnapshot("r1", "{}", AgentRunStatus.CANCELED))
                 .thenReturn("{\"observability\":{}}");
         when(eventService.nextInterruptedExpiresAt()).thenReturn(OffsetDateTime.now().plusDays(7));
-        when(runMapper.updateSnapshot(eq("r1"), eq("u1"), eq(AgentRunStatus.CANCELED),
-                anyString(), eq(false), isNull())).thenReturn(0);
-        when(runMapper.updateStatusWithTtl(eq("r1"), eq("u1"), eq(AgentRunStatus.CANCELED), any()))
-                .thenReturn(1);
+        // 终态栅栏拒写（数据库已是终态，例如执行刚提交 COMPLETED）：不发 CANCELED 事件、
+        // 不写 Redis 终态、不结算、不发布，按现状返回——不广播数据库里不存在的终态。
+        when(runMapper.cancelTerminalSnapshotWithTtl(eq("r1"), eq("u1"), anyString(), any()))
+                .thenReturn(0);
 
-        service.cancelRun(CancelAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build());
+        var response = service.cancelRun(CancelAgentRunRequest.newBuilder().setUserId("u1").setId("r1").build());
 
+        assertEquals("EXECUTING", response.getStatus());
         verify(finalizationService, never()).publishFinalizedEvent(anyString(), anyString(), anyString());
+        verify(eventService, never()).append(anyString(), anyString(), eq("CANCELED"), anyMap());
+        verify(stateStore, never()).markRunStatus("r1", AgentRunStatus.CANCELED.name());
     }
 
     @Test

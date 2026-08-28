@@ -671,9 +671,10 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
      * ——失败只记录告警、不再向外传播，避免外层失败出口把已提交的结果改写成失败。
      * 调度完成计数在尽力而为段之前、提交之后立即记录（与恢复路径的位置一致）。</p>
      *
-     * <p>resumeContext 为空表示正常执行：直接附加可观测摘要并更新终态快照；数据库没有
-     * 接受写入（updateSnapshot 的条件只有 id 与 user_id，写不进说明这行对当前用户已不可见）
-     * 时记录告警并返回 false，不广播终态。resumeContext 非空表示恢复执行：先预生成可观测
+     * <p>resumeContext 为空表示正常执行：直接附加可观测摘要并更新终态快照；写入走带终态栅栏的
+     * updateTerminalSnapshot，数据库没有接受写入（rows != 1）有两种成因：这行对 (id, userId)
+     * 已不可见，或数据库已是终态（并发取消先落库、先落者赢）——两种都说明本次写入已失去所有权，
+     * 记录告警并返回 false，不广播终态。resumeContext 非空表示恢复执行：先预生成可观测
      * 候选项，再按恢复租约做条件更新（数据库未接受写入时返回 false，保留恢复锚点供重试），
      * 写入成功后提交可观测。</p>
      */

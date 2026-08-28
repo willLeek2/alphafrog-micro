@@ -94,6 +94,16 @@ public interface AgentRunMapper {
                                @Param("completed") boolean completed,
                                @Param("lastError") String lastError);
 
+    /**
+     * 无活跃锚点取消的终态写入：快照 + 状态 + TTL 一条 UPDATE 原子落库，
+     * 数据库已是终态时返回 0（先落库的终态赢）。返回 0 时调用方必须跳过
+     * CANCELED 事件与 Redis 终态写，按现状返回，不广播未提交的终态。
+     */
+    int cancelTerminalSnapshotWithTtl(@Param("id") String id,
+                                      @Param("userId") String userId,
+                                      @Param("snapshotJson") String snapshotJson,
+                                      @Param("ttlExpiresAt") OffsetDateTime ttlExpiresAt);
+
     int resetForResume(@Param("id") String id,
                        @Param("userId") String userId,
                        @Param("ttlExpiresAt") OffsetDateTime ttlExpiresAt);

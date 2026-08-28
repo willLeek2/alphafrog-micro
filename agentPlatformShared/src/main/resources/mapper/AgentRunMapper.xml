@@ -361,6 +361,23 @@
           AND status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')
     </update>
 
+    <!--
+        无活跃锚点取消的终态写入：快照、状态、TTL 一条 UPDATE 原子落库，栅栏与
+        updateTerminalSnapshot 相同——数据库已是终态时返回 0。取消与执行并发时
+        先落库的终态（例如执行刚提交的 COMPLETED）赢，迟到取消拿不到行，
+        调用方跳过 CANCELED 事件与 Redis 终态写、按现状返回，不广播未提交的终态。
+    -->
+    <update id="cancelTerminalSnapshotWithTtl">
+        UPDATE alphafrog_agent_run
+        SET status = 'CANCELED',
+            snapshot_json = CAST(#{snapshotJson} AS jsonb),
+            ttl_expires_at = #{ttlExpiresAt},
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND user_id = #{userId}
+          AND status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')
+    </update>
+
     <update id="resetForResume">
         UPDATE alphafrog_agent_run
         SET status = 'RECEIVED',
