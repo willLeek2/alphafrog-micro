@@ -5,10 +5,9 @@ import lombok.Getter;
 /**
  * Run 级预算超限的结构化异常。
  *
- * <p>继承 {@link IllegalStateException} 以保持对现有 {@code catch (IllegalStateException)}
- * 代码的兼容。消息格式保持 {@code RUN_BUDGET_EXCEEDED:<dimension>:<actual>/<limit>}，
- * 使 {@link world.willfrog.agentlangchain.orchestration.LangchainTerminalToolErrorHandler}
- * 等依赖字符串前缀的链路继续生效。</p>
+ * <p>这是资源信号，不是控制流。继承 {@link IllegalStateException} 以保持现有
+ * {@code catch (IllegalStateException)} 兼容。消息仍用
+ * {@code RUN_BUDGET_EXCEEDED:<dimension>:<actual>/<limit>}，供日志和旧包装识别。</p>
  */
 @Getter
 public class RunBudgetException extends IllegalStateException {

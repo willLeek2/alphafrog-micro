@@ -10,6 +10,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.dataanalysis.*;
 import world.willfrog.agent.platform.context.AgentContext;
+import world.willfrog.agent.platform.exception.ToolJobTransferException;
 import world.willfrog.agent.platform.finance.FinanceRecordChannelConfigLoader;
 import world.willfrog.agent.platform.finance.FinanceRecordChannelProcessor;
 import world.willfrog.agent.platform.finance.FinanceRecordExtractionRequest;
@@ -1288,9 +1289,8 @@ public class PythonSandboxTools {
         // 把占用的资源名额从当前线程过户给后台任务。
         if (current.state() == DataAnalysisReservationState.TASK_ATTACHED
                 && dataAnalysisCapacityService.restoreReservation(pending) == DataAnalysisRestoreOutcome.CONFLICT) {
-            // 过户冲突（另一个流程已经接管了这份名额）按失败处理：此时绝不能释放线程，
-            // 否则任务和名额都无人负责。
-            throw new IllegalStateException("capacity transfer to pending conflicted");
+            // 这是失败：过户冲突时绝不能释放线程，否则任务和名额都无人负责。
+            throw new ToolJobTransferException("capacity transfer to pending conflicted");
         }
         // 把后台状态和最新的名额记录写进内存凭证，并安排好第一次后台轮询时间（同时写数据库和 Redis 到期索引）。
         anchor.setAnchorState("PENDING");
@@ -1298,11 +1298,11 @@ public class PythonSandboxTools {
         anchor.setNextPollAt(Instant.now().plusMillis(POLL_INTERVAL_MS));
         // 一条 SQL 同时写任务凭证、并把 Run 状态从执行中改为等待长工具，要么都成功、要么都不改。
         if (!pythonSandboxDispatchStore.transferToPending(runId, anchor)) {
-            // 落库失败按失败处理：不抛挂起信号，防止上层释放线程。
-            throw new IllegalStateException("durable transfer to WAITING_TOOL_JOB failed");
+            // 这是失败：落库没成功就不抛挂起信号，防止上层释放线程。
+            throw new ToolJobTransferException("durable transfer to WAITING_TOOL_JOB failed");
         }
-        // 到这里后台任务、名额和 Run 状态都已写进数据库。最后抛出一个专门的挂起信号：
-        // 上层看到它就知道任务已转后台、可以释放线程，随后把信号转换成正常的挂起结果。
+        // 这是信号：后台任务、名额和 Run 状态都已写进数据库，上层看到它就释放线程，
+        // 随后把信号转换成正常的挂起结果。
         throw new ExternalToolJobPendingException(
                 runId, anchor.getToolCallId(), anchor.getAttempt(),
                 "Python Sandbox task continues in background: " + taskId);

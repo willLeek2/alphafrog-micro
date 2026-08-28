@@ -16,6 +16,7 @@ import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingException;
 import world.willfrog.agent.platform.dataanalysis.PythonRepairContext;
 import world.willfrog.agent.platform.exception.RunBudgetException;
+import world.willfrog.agent.platform.exception.RunInterruptedException;
 import world.willfrog.agent.platform.service.AgentPromptService;
 import world.willfrog.agent.platform.service.AgentRunBudgetService;
 import world.willfrog.agent.workflow.DatasetRefRegistry;
@@ -354,7 +355,7 @@ public class LangchainTodoNodeExecutor {
             // LangChain4j 可能把工具异常包进多层运行时异常，先沿 cause 链查找 pending 信号。
             ExternalToolJobPendingException pending = findPending(e);
             if (pending != null) {
-                // 转成结构化 suspended 结果而不是失败；LINEAR executor 会停止当前 Todo 循环。
+                // 信号在这里转换成正常挂起结果，异常传播到此为止。
                 return LangchainTodoNodeResult.suspended(pending);
             }
             TodoToolExecutionException toolFailure = findTodoToolFailure(e);
@@ -891,7 +892,7 @@ public class LangchainTodoNodeExecutor {
      * 检查当前 run 是否仍允许继续执行。
      * <p>
      * 机制：通过 {@link LangchainRunExecutionGuard#stopReason} 查询 run 是否被用户取消（cancel）或暂停（pause）。
-     * 若存在停止原因，则抛出 {@link IllegalStateException}，异常消息格式为 {@code RUN_INTERRUPTED:<reason>}，
+     * 若存在停止原因，则抛出 {@link RunInterruptedException}，异常消息格式仍为 {@code RUN_INTERRUPTED:<reason>}。
      * 上游 catch 后会将当前 todo 标记为失败。
      * <p>
      * 调用点（三道防线）：
@@ -912,7 +913,7 @@ public class LangchainTodoNodeExecutor {
         }
         Optional<String> stop = executionGuard.stopReason(request.getRunId(), request.getUserId());
         if (stop.isPresent()) {
-            throw new IllegalStateException("RUN_INTERRUPTED:" + stop.get());
+            throw new RunInterruptedException(stop.get());
         }
     }
 
