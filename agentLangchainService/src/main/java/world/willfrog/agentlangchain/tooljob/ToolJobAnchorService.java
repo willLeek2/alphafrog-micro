@@ -78,6 +78,23 @@ public class ToolJobAnchorService {
         return agentRunMapper.persistCancelDisposition(runId, expectedStatus, operationId) == 1;
     }
 
+    /**
+     * 只合并修复计数的专项更新：只改 {@code repairAttempts[toolName]}，绑定精确 operationId，
+     * 不整份写回旧锚点。第二个长工具已替换锚点时返回 false。
+     */
+    public boolean persistRepairAttempt(String runId, String operationId,
+                                        AgentRunStatus expectedStatus,
+                                        String toolName, int attempt,
+                                        boolean pending, boolean exhausted) {
+        if (operationId == null || operationId.isBlank()
+                || toolName == null || toolName.isBlank()) {
+            return false;
+        }
+        return agentRunMapper.persistRepairAttempt(
+                runId, expectedStatus, operationId, toolName, Math.max(0, attempt),
+                pending, exhausted) == 1;
+    }
+
     public boolean claimPreparing(String runId, ToolJobAnchor anchor, AgentRunStatus expectedStatus) {
         // 只有空 anchor 才能创建 PREPARING owner，重复分发会返回 false。
         return agentRunMapper.claimPreparingToolJobAnchor(

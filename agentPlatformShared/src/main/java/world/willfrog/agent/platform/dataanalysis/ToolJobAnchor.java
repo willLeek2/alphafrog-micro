@@ -9,8 +9,10 @@ import com.fasterxml.jackson.databind.SerializationFeature;
 
 import java.time.Instant;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 
 /**
  * 外部工具上下文切换的持久化锚点，存放在
@@ -120,11 +122,17 @@ public class ToolJobAnchor {
 
     // pythonRequestFingerprint 排除 operationId，用于跨 worker 判断模型是否原样重放已失败代码。
     private String pythonRequestFingerprint;
-    // pythonRepairAttempt 表示当前 todo 已启动的修复轮次，0 是初次执行。
+    /**
+     * 按工具名存的修复计数。写入只走这里；旧三键 pythonRepair* 只用于读历史 JSON。
+     */
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    private Map<String, RepairAttemptState> repairAttempts;
+    // 旧键仅反序列化历史锚点；序列化不再写出。请改用 {@link #repairAttempt(String)}。
+    @JsonIgnore
     private int pythonRepairAttempt;
-    // pythonRepairPending 表示终态结果已消费、同一 todo 的修复 LLM 尚未产生下一条 Sandbox anchor。
+    @JsonIgnore
     private boolean pythonRepairPending;
-    // pythonRepairExhausted 保留“已耗尽”终态，防止消费成功后崩溃重入丢失失败语义。
+    @JsonIgnore
     private boolean pythonRepairExhausted;
     // pythonFailedRequestFingerprints 是 durable 失败历史，阻止新 toolCallId 绕过同参数判重。
     private List<String> pythonFailedRequestFingerprints = Collections.emptyList();
@@ -162,6 +170,7 @@ public class ToolJobAnchor {
             // 统一使用注册 Java Time 模块的 mapper，确保 Instant 可跨重启还原。
             ToolJobAnchor anchor = MAPPER.readValue(json, ToolJobAnchor.class);
             normalizeLegacyResultConsumed(anchor);
+            normalizeRepairAttempts(anchor);
             return anchor;
         } catch (JsonProcessingException e) {
             // 锚点损坏必须显式失败；静默构造空对象会绕过 CAS 身份保护。
@@ -195,6 +204,27 @@ public class ToolJobAnchor {
             throw new IllegalArgumentException(
                     "ToolJobAnchor has contradictory state: resumeState=READY but resultConsumed=true");
         }
+    }
+
+    public static final String EXECUTE_PYTHON_TOOL = "executePython";
+
+    /**
+     * 读历史 JSON 时：若新键没有 executePython，把旧三字段迁进 {@code repairAttempts}。
+     * 迁完清掉内存里的旧字段，后续 {@link #toJson()} 不再写出旧键。
+     */
+    private static void normalizeRepairAttempts(ToolJobAnchor anchor) {
+        RepairAttemptState existing = anchor.repairAttemptState(EXECUTE_PYTHON_TOOL);
+        boolean hasNew = existing != null;
+        boolean hasLegacy = anchor.pythonRepairAttempt > 0
+                || anchor.pythonRepairPending
+                || anchor.pythonRepairExhausted;
+        if (!hasNew && hasLegacy) {
+            anchor.putRepairAttempt(EXECUTE_PYTHON_TOOL,
+                    anchor.pythonRepairAttempt, anchor.pythonRepairPending, anchor.pythonRepairExhausted);
+        }
+        anchor.pythonRepairAttempt = 0;
+        anchor.pythonRepairPending = false;
+        anchor.pythonRepairExhausted = false;
     }
 
     public String toJson() {
@@ -339,18 +369,80 @@ public class ToolJobAnchor {
         this.pythonRequestFingerprint = pythonRequestFingerprint;
     }
 
-    public int getPythonRepairAttempt() { return pythonRepairAttempt; }
+    public Map<String, RepairAttemptState> getRepairAttempts() { return repairAttempts; }
+    public void setRepairAttempts(Map<String, RepairAttemptState> repairAttempts) {
+        this.repairAttempts = repairAttempts;
+    }
+
+    /** 按工具名读取修复计数；没有新键且工具是 executePython 时回落旧三字段。 */
+    @JsonIgnore
+    public RepairAttemptState repairAttempt(String toolName) {
+        RepairAttemptState state = repairAttemptState(toolName);
+        if (state != null) {
+            return state;
+        }
+        if (EXECUTE_PYTHON_TOOL.equals(toolName)) {
+            return new RepairAttemptState(pythonRepairAttempt, pythonRepairPending, pythonRepairExhausted);
+        }
+        return RepairAttemptState.empty();
+    }
+
+    public void putRepairAttempt(String toolName, int attempt, boolean pending, boolean exhausted) {
+        if (toolName == null || toolName.isBlank()) {
+            return;
+        }
+        if (repairAttempts == null) {
+            repairAttempts = new LinkedHashMap<>();
+        }
+        repairAttempts.put(toolName, new RepairAttemptState(Math.max(0, attempt), pending, exhausted));
+    }
+
+    private RepairAttemptState repairAttemptState(String toolName) {
+        if (repairAttempts == null || toolName == null) {
+            return null;
+        }
+        return repairAttempts.get(toolName);
+    }
+
+    @Deprecated
+    @JsonIgnore
+    public int getPythonRepairAttempt() {
+        return repairAttempt(EXECUTE_PYTHON_TOOL).getAttempt();
+    }
+
+    @Deprecated
+    @JsonProperty("pythonRepairAttempt")
     public void setPythonRepairAttempt(int pythonRepairAttempt) {
+        RepairAttemptState current = repairAttempt(EXECUTE_PYTHON_TOOL);
+        putRepairAttempt(EXECUTE_PYTHON_TOOL, pythonRepairAttempt, current.isPending(), current.isExhausted());
         this.pythonRepairAttempt = Math.max(0, pythonRepairAttempt);
     }
 
-    public boolean isPythonRepairPending() { return pythonRepairPending; }
+    @Deprecated
+    @JsonIgnore
+    public boolean isPythonRepairPending() {
+        return repairAttempt(EXECUTE_PYTHON_TOOL).isPending();
+    }
+
+    @Deprecated
+    @JsonProperty("pythonRepairPending")
     public void setPythonRepairPending(boolean pythonRepairPending) {
+        RepairAttemptState current = repairAttempt(EXECUTE_PYTHON_TOOL);
+        putRepairAttempt(EXECUTE_PYTHON_TOOL, current.getAttempt(), pythonRepairPending, current.isExhausted());
         this.pythonRepairPending = pythonRepairPending;
     }
 
-    public boolean isPythonRepairExhausted() { return pythonRepairExhausted; }
+    @Deprecated
+    @JsonIgnore
+    public boolean isPythonRepairExhausted() {
+        return repairAttempt(EXECUTE_PYTHON_TOOL).isExhausted();
+    }
+
+    @Deprecated
+    @JsonProperty("pythonRepairExhausted")
     public void setPythonRepairExhausted(boolean pythonRepairExhausted) {
+        RepairAttemptState current = repairAttempt(EXECUTE_PYTHON_TOOL);
+        putRepairAttempt(EXECUTE_PYTHON_TOOL, current.getAttempt(), current.isPending(), pythonRepairExhausted);
         this.pythonRepairExhausted = pythonRepairExhausted;
     }
 
@@ -407,4 +499,34 @@ public class ToolJobAnchor {
 
     public Instant getTimeoutAt() { return timeoutAt; }
     public void setTimeoutAt(Instant timeoutAt) { this.timeoutAt = timeoutAt; }
+
+    /**
+     * 某个工具的修复计数。写入锚点 JSON 的 {@code repairAttempts[toolName]}。
+     */
+    public static final class RepairAttemptState {
+        private int attempt;
+        private boolean pending;
+        private boolean exhausted;
+
+        public RepairAttemptState() {}
+
+        public RepairAttemptState(int attempt, boolean pending, boolean exhausted) {
+            this.attempt = Math.max(0, attempt);
+            this.pending = pending;
+            this.exhausted = exhausted;
+        }
+
+        public static RepairAttemptState empty() {
+            return new RepairAttemptState(0, false, false);
+        }
+
+        public int getAttempt() { return attempt; }
+        public void setAttempt(int attempt) { this.attempt = Math.max(0, attempt); }
+
+        public boolean isPending() { return pending; }
+        public void setPending(boolean pending) { this.pending = pending; }
+
+        public boolean isExhausted() { return exhausted; }
+        public void setExhausted(boolean exhausted) { this.exhausted = exhausted; }
+    }
 }

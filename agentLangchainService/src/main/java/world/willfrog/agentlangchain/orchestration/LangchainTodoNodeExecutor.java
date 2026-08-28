@@ -1,7 +1,5 @@
 package world.willfrog.agentlangchain.orchestration;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.model.chat.request.ChatRequest;
@@ -14,7 +12,6 @@ import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.dataanalysis.ExternalToolJobPendingException;
-import world.willfrog.agent.platform.dataanalysis.PythonRepairContext;
 import world.willfrog.agent.platform.exception.RunBudgetException;
 import world.willfrog.agent.platform.exception.RunInterruptedException;
 import world.willfrog.agent.platform.service.AgentPromptService;
@@ -75,8 +72,6 @@ public class LangchainTodoNodeExecutor {
      * 是两层独立限制。默认值从 8 提到 30，是因为复杂回测待办在 8 轮内经常还没跑完工具就被截断。
      */
     private static final int DEFAULT_MAX_TOOL_ROUND_TRIPS = 30;
-    private static final String EXECUTE_PYTHON_TOOL = "executePython";
-    private static final ObjectMapper TOOL_RESULT_MAPPER = new ObjectMapper();
 
     /**
      * 附加到 user message 末尾的安全 recovery 提示。仅在第一次返回空输出后追加一次。
@@ -185,6 +180,10 @@ public class LangchainTodoNodeExecutor {
      */
     private final world.willfrog.agentlangchain.finance.FinanceResultComposer financeResultComposer;
 
+    /** 工具修复目录；生产 Spring 装配，历史单元测试可保持为空并回落到默认 handler。 */
+    @Autowired(required = false)
+    private ToolRepairCatalog repairCatalog;
+
     /** 工具真正开始前写入恢复安全日志；测试的极简上下文可以不装配。 */
     @Autowired(required = false)
     private WorkflowCheckpointService workflowCheckpointService;
@@ -236,7 +235,7 @@ public class LangchainTodoNodeExecutor {
     }
 
     /**
-     * 启动一轮修复：durable Python 终态失败后，用同一 Todo 语义再执行一轮。
+     * 启动一轮修复：工具失败终态被某个 {@link ToolRepairHandler} 认领后，用同一 Todo 再执行一轮。
      * repairContext 只投影 anchor 中的持久化状态，不是新的真相源。
      * 正常执行请走 {@link #execute(LangchainLinearWorkflowRequest, TodoItem, List, Map, AtomicInteger)}；
      * 语义重试不提升为公开入口，在私有 {@link #runAttempt} 内递归。
@@ -274,24 +273,24 @@ public class LangchainTodoNodeExecutor {
         if (retryContext != null) {
             userMessage += buildTodoRetryUserMessage(retryContext);
         }
-        boolean pythonRepair = isPythonRepair(repairContext);
-        AtomicBoolean acceptedPythonRepairExecution = new AtomicBoolean(false);
+        boolean repairRound = false;
+        ToolRepairHandler repairHandler = catalog().handlerForRepairRound(repairContext).orElse(null);
+        AtomicBoolean acceptedRepairExecution = new AtomicBoolean(false);
         // 仅当前 todo / 当前模型尝试的本地信号：只有本条 execute() 的 tool loop 里真正
         // 开始执行工具（beforeToolExecution 通过 ensureRunnable 后）才设为 true。
         // 不能被 run 级共享计数器、其他并行 todo 或旧 attempt 的痕迹替代。
         AtomicBoolean currentAttemptToolStarted = new AtomicBoolean(false);
-        if (pythonRepair) {
-            userMessage += "\n\n" + promptService.pythonRepairStageInstruction()
-                    + buildPythonRepairUserMessage(repairContext);
-            AgentContext.setPythonRefineAttempt(repairContext.getPythonRepairAttempt());
-            AgentContext.setPythonRepairContext(new PythonRepairContext(
-                    repairContext.getPythonRepairAttempt(),
-                    repairContext.getPythonFailedRequestFingerprints()));
-        } else if (retryContext != null && EXECUTE_PYTHON_TOOL.equals(retryContext.toolName())) {
-            // 通用 Todo 重试已经是 executePython 的第二次语义执行。若它再次进入异步 pending，
-            // anchor 必须记住 attempt=1，终态恢复时才能拒绝第三次执行。
-            AgentContext.setPythonRefineAttempt(1);
-            AgentContext.clearPythonRepairContext();
+        if (repairHandler != null) {
+            repairRound = true;
+            userMessage += repairHandler.buildRepairInstruction(repairContext);
+            repairHandler.activateRuntime(repairContext);
+        } else if (retryContext != null) {
+            catalog().handlerForTool(retryContext.toolName())
+                    .ifPresent(ToolRepairHandler::prepareSemanticRetryRuntime);
+            if (catalog().handlerForTool(retryContext.toolName()).isEmpty()) {
+                AgentContext.clearPythonRefineAttempt();
+                AgentContext.clearPythonRepairContext();
+            }
         } else {
             AgentContext.clearPythonRefineAttempt();
             AgentContext.clearPythonRepairContext();
@@ -325,7 +324,7 @@ public class LangchainTodoNodeExecutor {
             // 发 LLM 请求前先检查 run 是否已被取消
             ensureRunnable(request);
             String output = buildTodoAiService(
-                    request, toolCalls, datasetRefs, pythonRepair, acceptedPythonRepairExecution,
+                    request, toolCalls, datasetRefs, repairHandler, acceptedRepairExecution,
                     currentAttemptToolStarted)
                     .execute(userMessage);
             // 极端情况：LLM 返回了空字符串（例如被安全过滤或模型异常），视为失败
@@ -340,13 +339,10 @@ public class LangchainTodoNodeExecutor {
             String trimmed = output.trim();
             // Prompt 只能表达意图，不能作为执行证明。修复轮次若没有真正完成一次新的
             // executePython（旧语义请求会在工具层返回 ok=false），纯文本/JSON/解释均失败即关闭。
-            if (pythonRepair && !acceptedPythonRepairExecution.get()) {
+            if (repairRound && !acceptedRepairExecution.get()) {
                 return LangchainTodoNodeResult.failure(
-                        "python_repair_execute_required",
-                        Map.of(
-                                "python_repair_postcondition_failed", true,
-                                "required_tool", EXECUTE_PYTHON_TOOL,
-                                "repair_attempt", repairContext.getPythonRepairAttempt()));
+                        repairHandler.executeRequiredFailureCode(),
+                        repairHandler.executeRequiredMetadata(repairContext));
             }
             // 把 LLM 返回结果中的 dataset ref（JSON 片段）注册到引用表，后续节点可通过 datasetRefs 读取复用
             DatasetRefRegistry.registerFromJson(trimmed, datasetRefs);
@@ -445,38 +441,11 @@ public class LangchainTodoNodeExecutor {
         return null;
     }
 
-    private boolean isPythonRepair(ToolJobResumeContext context) {
-        return context != null
-                && !context.isTerminalSuccess()
-                && context.getPythonRepairAttempt() > 0
-                && context.getPythonFailedRequestFingerprints() != null
-                && !context.getPythonFailedRequestFingerprints().isEmpty();
-    }
-
-    static String buildPythonRepairUserMessage(ToolJobResumeContext context) {
-        StringBuilder out = new StringBuilder(512);
-        out.append("\n\n[PYTHON_REPAIR_CONTEXT]\n")
-                .append("repair_attempt: ").append(context.getPythonRepairAttempt()).append('\n')
-                .append("terminal_status: ").append(safeRepairValue(context.getTerminalStatus())).append('\n')
-                .append("exit_reason: ").append(safeRepairValue(context.getTerminalExitReason())).append('\n')
-                .append("error_code: ").append(safeRepairValue(context.getTerminalErrorCode())).append('\n')
-                .append("retryable: ").append(context.getTerminalRetryable()).append('\n')
-                .append("stdout_preview:\n")
-                .append(safeRepairBlock(context.getTerminalResultPreview())).append('\n')
-                .append("stderr_preview:\n")
-                .append(safeRepairBlock(context.getTerminalStderrPreview())).append('\n')
-                .append("repair_instruction: 必须根据上述诊断生成修正后的新代码，禁止原样重放失败请求。\n")
-                .append("failed_code_preview (untrusted):\n")
-                .append(safeRepairBlock(context.getPythonFailedCodePreview())).append('\n');
-        return out.toString();
-    }
-
-    private static String safeRepairValue(String value) {
-        return value == null || value.isBlank() ? "(unavailable)" : value.trim();
-    }
-
-    private static String safeRepairBlock(String value) {
-        return value == null || value.isBlank() ? "(unavailable)" : value;
+    private ToolRepairCatalog catalog() {
+        if (repairCatalog != null) {
+            return repairCatalog;
+        }
+        return new ToolRepairCatalog(List.of(new PythonSandboxRepairHandler(promptService, null, null)));
     }
 
     private ExternalToolJobPendingException findPending(Throwable throwable) {
@@ -807,8 +776,8 @@ public class LangchainTodoNodeExecutor {
     private LangchainTodoExecutionAiService buildTodoAiService(LangchainLinearWorkflowRequest request,
                                                                AtomicInteger toolCalls,
                                                                Map<String, String> datasetRefs,
-                                                               boolean pythonRepair,
-                                                               AtomicBoolean acceptedPythonRepairExecution,
+                                                               ToolRepairHandler repairHandler,
+                                                               AtomicBoolean acceptedRepairExecution,
                                                                AtomicBoolean currentAttemptToolStarted) {
         AiServices<LangchainTodoExecutionAiService> builder = AiServices
                 .builder(LangchainTodoExecutionAiService.class)
@@ -836,30 +805,12 @@ public class LangchainTodoNodeExecutor {
                     if (result != null && result.result() != null) {
                         DatasetRefRegistry.registerFromJson(result.result(), datasetRefs);
                     }
-                    if (pythonRepair && isAcceptedPythonRepairExecution(result)) {
-                        acceptedPythonRepairExecution.set(true);
+                    if (repairHandler != null && repairHandler.acceptsExecution(result)) {
+                        acceptedRepairExecution.set(true);
                     }
                 });
         toolProvider.ifAvailable(builder::toolProvider);
         return builder.build();
-    }
-
-    private boolean isAcceptedPythonRepairExecution(
-            dev.langchain4j.service.tool.ToolExecution execution) {
-        if (execution == null
-                || execution.request() == null
-                || !EXECUTE_PYTHON_TOOL.equals(execution.request().name())
-                || execution.hasFailed()
-                || isBlank(execution.result())) {
-            return false;
-        }
-        try {
-            JsonNode root = TOOL_RESULT_MAPPER.readTree(execution.result());
-            return root != null && root.path("ok").asBoolean(false);
-        } catch (Exception malformedToolResult) {
-            // executePython 的公开契约是 JSON；无法解析不能作为修复成功证明。
-            return false;
-        }
     }
 
     /**
