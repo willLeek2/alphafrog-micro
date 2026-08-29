@@ -21,8 +21,10 @@ agent:
       version: UNKNOWN
   llm:
     config-file: ${AF_AGENT_LLM_CONFIG_FILE:}
+    prompt-overlay-file: ${AF_AGENT_PROMPT_OVERLAY_FILE:}
     prompt-base-dir: ${AF_AGENT_LLM_PROMPT_BASE_DIR:}
     config-refresh-interval-ms: ${AF_AGENT_LLM_CONFIG_REFRESH_INTERVAL_MS:10000}
+    prompt-overlay-refresh-interval-ms: ${AF_AGENT_PROMPT_OVERLAY_REFRESH_INTERVAL_MS:10000}
     default-endpoint: ${AF_AGENT_DEFAULT_ENDPOINT:openrouter}
     default-model: ${AF_AGENT_DEFAULT_MODEL:openai/gpt-5.2}
     models: ${AF_AGENT_MODELS:openai/gpt-5.2,openai/gpt-5.1,google/gemini-3-pro-preview,moonshotai/kimi-k2.5,accounts/fireworks/models/kimi-k2p5}
@@ -80,6 +82,9 @@ alphafrog:
         - data-id: ${AF_CONFIG_NACOS_AGENT_LLM_DATA_ID:agent-llm.json}
           group: ${AF_CONFIG_NACOS_GROUP:alphafrog-config}
           target-file: ${AF_AGENT_LLM_CONFIG_FILE:}
+        - data-id: ${AF_CONFIG_NACOS_PROMPT_OVERLAY_DATA_ID:agent-prompt-overlay.json}
+          group: ${AF_CONFIG_NACOS_GROUP:alphafrog-config}
+          target-file: ${AF_AGENT_PROMPT_OVERLAY_FILE:}
         - data-id: ${AF_CONFIG_NACOS_FINANCE_RECORD_DATA_ID:finance-record-channel.json}
           group: ${AF_CONFIG_NACOS_GROUP:alphafrog-config}
           target-file: ${AF_FINANCE_RECORD_CHANNEL_CONFIG_FILE:}

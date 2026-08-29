@@ -127,10 +127,25 @@ class PromptOverlayLoaderTest {
         assertTrue(loader.current().applied());
 
         Files.writeString(file, "{\"formatVersion\": 1, \"prompts\": {\"noSuchField\": \"x\"}}", StandardCharsets.UTF_8);
+        touch(file, 1_000);
         loader.load();
 
         assertTrue(authority.prompts().getAgentRunSystemPrompt().endsWith("有效第一版"));
         assertEquals(1L, loader.overlayReloadFailureCount());
+
+        // 文件没再变化时，轮询不重复解析拒绝，失败计数不增长；文件真正变化后重新尝试。
+        loader.refresh();
+        loader.refresh();
+        assertEquals(1L, loader.overlayReloadFailureCount());
+        Files.writeString(file, "{\"formatVersion\": 1, \"prompts\": {\"anotherBadField\": \"y\"}}", StandardCharsets.UTF_8);
+        touch(file, 2_000);
+        loader.refresh();
+        assertEquals(2L, loader.overlayReloadFailureCount());
+    }
+
+    private static void touch(Path file, long millis) throws Exception {
+        Files.setLastModifiedTime(file, java.nio.file.attribute.FileTime.fromMillis(
+                java.time.Instant.now().toEpochMilli() + millis));
     }
 
     @Test

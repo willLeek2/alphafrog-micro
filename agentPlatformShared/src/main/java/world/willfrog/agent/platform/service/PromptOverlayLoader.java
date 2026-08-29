@@ -76,6 +76,9 @@ public class PromptOverlayLoader {
     private volatile String loadedPath = "";
     private volatile long loadedLastModified = Long.MIN_VALUE;
     private volatile byte[] loadedBytes = new byte[0];
+    /** 上一次解析尝试（无论成败）针对的文件状态：文件没变就不重复解析，坏文档不会每个轮询周期刷一次拒绝日志。 */
+    private volatile String attemptedPath = "";
+    private volatile long attemptedLastModified = Long.MIN_VALUE;
     private final AtomicLong overlayReloadFailureCount = new AtomicLong();
     private volatile OverlayState state = OverlayState.defaultVersion();
 
@@ -123,6 +126,8 @@ public class PromptOverlayLoader {
                 loadedPath = "";
                 loadedLastModified = Long.MIN_VALUE;
                 loadedBytes = new byte[0];
+                attemptedPath = "";
+                attemptedLastModified = Long.MIN_VALUE;
                 state = OverlayState.defaultVersion();
                 if (wasApplied) {
                     log.warn("Prompt overlay file disappeared; fell back to default prompts: {}", path);
@@ -132,9 +137,12 @@ public class PromptOverlayLoader {
             try {
                 long currentModified = Files.getLastModifiedTime(path).toMillis();
                 boolean unchanged = path.toString().equals(loadedPath) && currentModified == loadedLastModified;
-                if (!force && unchanged) {
+                boolean alreadyAttempted = path.toString().equals(attemptedPath) && currentModified == attemptedLastModified;
+                if (!force && (unchanged || alreadyAttempted)) {
                     return;
                 }
+                attemptedPath = path.toString();
+                attemptedLastModified = currentModified;
                 byte[] bytes = Files.readAllBytes(path);
                 OverlayDocument document = parse(bytes);
                 PromptAuthority authority = PromptAuthority.shared();
