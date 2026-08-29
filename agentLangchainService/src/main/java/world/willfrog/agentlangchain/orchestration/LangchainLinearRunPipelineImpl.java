@@ -223,20 +223,28 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         String runId = run.getId();
         String userId = run.getUserId();
         String userGoal = "";
+        // 当前执行到的阶段名：意外异常被安全网接住时，把它带进失败事件，
+        // 让失败点不再被一个大 try 抹平。预期失败（额度不足、校验不过、执行结果失败）
+        // 不走异常通道，各自在阶段内用结果对象返回。
+        String stage = "prepare_run_context";
         try {
             if (!prepareRunContext(run)) {
                 return;
             }
+            stage = "precheck_runnable";
             if (!precheckRunnable(run)) {
                 return;
             }
             emitExecutionStarted(run);
 
+            stage = "resolve_stage_inputs";
             StageInputs inputs = resolveStageInputs(run);
             userGoal = inputs.userGoal();
 
+            stage = "resolve_plan";
             PlanResolution resolution = resolvePlan(run, inputs);
 
+            stage = "execute_workflow";
             LangchainLinearWorkflowResult result = executeWorkflow(inputs, resolution);
             if (result == null) {
                 return;
@@ -256,7 +264,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             } else if (result.isPartial()) {
                 persistPartialOutcome(run, userGoal, inputs.stageModels(), result, null);
             } else {
-                publishFailure(runId, userId, userGoal, result, null);
+                publishFailure(runId, userId, userGoal, result, null, "execute_workflow");
                 tryScheduleSettlement(runId, userId);
             }
         } catch (Exception e) {
@@ -269,7 +277,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                             .failureReason(e.getMessage())
                             .toolCallsUsed(0)
                             .build(),
-                    e);
+                    e, stage);
             // 异常路径也触发结算
             tryScheduleSettlement(runId, userId);
         } finally {
@@ -576,7 +584,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                                 .success(false)
                                 .failureReason(e.getMessage())
                                 .toolCallsUsed(resumeContext.getToolCallsUsed())
-                                .build(), e, resumeContext);
+                                .build(), e, resumeContext, "resume_execute");
             } catch (Exception persistEx) {
                 // 失败本身未持久化时返回 false，保留 LAUNCHING claim 供 reconciler 重入。
                 log.error("Resumed failure could not be persisted runId={}", runId, persistEx);
@@ -645,7 +653,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             return false;
         }
         boolean durable = publishResumedFailure(
-                runId, userId, userGoal, result, null, resumeContext);
+                runId, userId, userGoal, result, null, resumeContext, "resume_persist");
         if (durable) {
             tryScheduleSettlement(runId, userId);
         }
@@ -1096,8 +1104,9 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                                 String userId,
                                 String userGoal,
                                 LangchainLinearWorkflowResult result,
-                                Throwable throwable) {
-        publishFailureInternal(runId, userId, userGoal, result, throwable, null);
+                                Throwable throwable,
+                                String stage) {
+        publishFailureInternal(runId, userId, userGoal, result, throwable, null, stage);
     }
 
     private boolean publishResumedFailure(String runId,
@@ -1105,8 +1114,9 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                                           String userGoal,
                                           LangchainLinearWorkflowResult result,
                                           Throwable throwable,
-                                          ToolJobResumeContext resumeContext) {
-        return publishFailureInternal(runId, userId, userGoal, result, throwable, resumeContext);
+                                          ToolJobResumeContext resumeContext,
+                                          String stage) {
+        return publishFailureInternal(runId, userId, userGoal, result, throwable, resumeContext, stage);
     }
 
     private boolean publishFailureInternal(String runId,
@@ -1114,7 +1124,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                                            String userGoal,
                                            LangchainLinearWorkflowResult result,
                                            Throwable throwable,
-                                           ToolJobResumeContext resumeContext) {
+                                           ToolJobResumeContext resumeContext,
+                                           String stage) {
         boolean requireDurableWrite = resumeContext != null;
         if (abortIfStopped(runId, userId, "before_failure_persist")) {
             return !requireDurableWrite || hasDurableStopState(runId);
@@ -1182,6 +1193,14 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 log.debug("empty_todo_output fallback path (no failureMetadata available), failureReason={}", failureReason);
             }
             payload.put("engine", "agentLangchainService");
+            // 失败事件的两个附加字段：阶段名（失败点不被大 try 抹平）与失败四分类
+            // （业务拒绝 / 资源信号 / 控制流 / 未知缺陷，按映射表从失败细分类归并）。
+            if (stage != null && !stage.isBlank()) {
+                payload.put("stage", stage);
+            }
+            payload.put("failure_class",
+                    world.willfrog.agentlangchain.failure.LangchainFailureClassMapping
+                            .from(decision.getCategory()).name());
             eventService.append(runId, userId, decision.getEventType(), payload);
         } catch (RuntimeException sideEffect) {
             if (!requireDurableWrite) {
