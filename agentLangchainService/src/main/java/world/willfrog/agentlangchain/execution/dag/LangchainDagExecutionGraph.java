@@ -79,4 +79,33 @@ public class LangchainDagExecutionGraph {
         visited.add(nodeId);
         return false;
     }
+
+    /**
+     * 依赖链最大深度：从任意节点沿 dependsOn 走到源头，最长那条链上的节点数。
+     * 无环图才有定义；有环时不要调用。
+     */
+    public int maxDependencyDepth() {
+        if (itemMap == null || itemMap.isEmpty()) {
+            return 0;
+        }
+        Map<String, Integer> memo = new HashMap<>();
+        int max = 0;
+        for (String nodeId : itemMap.keySet()) {
+            max = Math.max(max, depthFrom(nodeId, memo));
+        }
+        return max;
+    }
+
+    private int depthFrom(String nodeId, Map<String, Integer> memo) {
+        Integer cached = memo.get(nodeId);
+        if (cached != null) {
+            return cached;
+        }
+        int depth = 1;
+        for (String dep : getDependencies(nodeId)) {
+            depth = Math.max(depth, 1 + depthFrom(dep, memo));
+        }
+        memo.put(nodeId, depth);
+        return depth;
+    }
 }
