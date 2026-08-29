@@ -81,7 +81,7 @@ class LangchainLinearRunPipelineWorkflowRestartTest {
         when(credit.hasPositiveCredit(run.getUserId())).thenReturn(true);
         ObjectProvider<AgentRunStateStore> stateStoreProvider = mock(ObjectProvider.class);
 
-        LangchainLinearRunPipelineImpl pipeline = new LangchainLinearRunPipelineImpl(
+        FrozenPlanRestartPipeline pipeline = new FrozenPlanRestartPipeline(
                 planner, linear, dag, models, runMapper, events, objectMapper,
                 mock(ObjectProvider.class), stateStoreProvider, mock(ObjectProvider.class),
                 new LangchainFailureMapper(), followUp,
@@ -93,7 +93,7 @@ class LangchainLinearRunPipelineWorkflowRestartTest {
                 mock(ObjectProvider.class), mock(ObjectProvider.class));
         ReflectionTestUtils.setField(pipeline, "workflowCheckpointService", checkpoints);
 
-        pipeline.executeRun(run, true);
+        pipeline.executeRun(run);
 
         verify(planner, never()).plan(any());
         verify(linear).restartPlanned(any(), eq(frozenPlan), eq(checkpoint));
