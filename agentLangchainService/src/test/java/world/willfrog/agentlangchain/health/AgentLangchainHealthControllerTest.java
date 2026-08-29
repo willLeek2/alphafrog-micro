@@ -7,8 +7,8 @@ import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.test.web.servlet.MockMvc;
 import world.willfrog.agentlangchain.config.LangchainServiceProperties;
 import world.willfrog.agentlangchain.config.LangchainToolConcurrencyThrottle;
-import world.willfrog.agentlangchain.orchestration.AgentLangchainOrchestrator;
-import world.willfrog.agentlangchain.orchestration.LangchainRunConcurrencyScheduler;
+import world.willfrog.agentlangchain.control.AgentLangchainOrchestrator;
+import world.willfrog.agentlangchain.control.LangchainRunConcurrencyScheduler;
 
 import java.util.Map;
 
@@ -18,9 +18,9 @@ import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
-import static world.willfrog.agentlangchain.orchestration.AgentLangchainOrchestrator.LINEAR_PIPELINE_READY;
-import static world.willfrog.agentlangchain.orchestration.AgentLangchainOrchestrator.LINEAR_PIPELINE_UNAVAILABLE;
-import static world.willfrog.agentlangchain.orchestration.AgentLangchainOrchestrator.PROVIDER_DISABLED;
+import static world.willfrog.agentlangchain.control.AgentLangchainOrchestrator.LINEAR_PIPELINE_READY;
+import static world.willfrog.agentlangchain.control.AgentLangchainOrchestrator.LINEAR_PIPELINE_UNAVAILABLE;
+import static world.willfrog.agentlangchain.control.AgentLangchainOrchestrator.PROVIDER_DISABLED;
 
 @WebMvcTest(AgentLangchainHealthController.class)
 class AgentLangchainHealthControllerTest {

@@ -4,7 +4,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.ObjectProvider;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
-import world.willfrog.agentlangchain.orchestration.LangchainLinearRunPipelineImpl;
+import world.willfrog.agentlangchain.execution.LangchainLinearRunPipelineImpl;
 
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;

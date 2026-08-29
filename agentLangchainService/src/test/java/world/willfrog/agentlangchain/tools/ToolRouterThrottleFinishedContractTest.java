@@ -14,7 +14,7 @@ import world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.tools.router.ToolRouter;
 import world.willfrog.agentlangchain.config.LangchainToolConcurrencyThrottle;
-import world.willfrog.agentlangchain.orchestration.ToolThrottleResult;
+import world.willfrog.agentlangchain.execution.ToolThrottleResult;
 
 import java.util.Map;
 

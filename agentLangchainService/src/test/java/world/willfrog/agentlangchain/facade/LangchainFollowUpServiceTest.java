@@ -8,7 +8,7 @@ import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.AgentMessageService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
-import world.willfrog.agentlangchain.orchestration.LangchainLinearRunPipeline;
+import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
 import world.willfrog.alphafrogmicro.agent.idl.SendAgentMessageRequest;
 
 import java.time.OffsetDateTime;
