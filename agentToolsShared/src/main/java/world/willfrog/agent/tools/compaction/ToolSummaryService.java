@@ -13,6 +13,7 @@ import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.service.AgentAiServiceFactory;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 import world.willfrog.agent.platform.service.AgentLlmResolver;
+import world.willfrog.agent.platform.service.AgentPromptService;
 import world.willfrog.agent.platform.service.AgentRunObservabilityService;
 
 /**
@@ -29,6 +30,7 @@ public class ToolSummaryService {
     private final AgentAiServiceFactory aiServiceFactory;
     private final AgentLlmLocalConfigLoader localConfigLoader;
     private final AgentRunObservabilityService observabilityService;
+    private final AgentPromptService promptService;
 
     public String summarize(String toolName, String rawOutput, String todoGoal) {
         int attempts = Math.max(0, resolveSummaryMaxRetries()) + 1;
@@ -52,15 +54,11 @@ public class ToolSummaryService {
         if (model == null) {
             throw new IllegalStateException("summary model unavailable");
         }
-        String prompt = """
-                当前任务目标：%s
-                以下是一个工具（%s）返回的原始结果。请保留对当前任务重要的字段和关键数据，删除对当前任务不重要的细节、重复内容和冗长描述。
-                输出一段简洁的自然语言摘要，不要编造原始结果中没有的信息。
-                """.formatted(nvl(todoGoal), nvl(toolName));
+        String prompt = promptService.toolSummaryUserPrompt(nvl(todoGoal), nvl(toolName), nvl(rawOutput));
         long startedAt = System.currentTimeMillis();
         ChatResponse response = model.chat(
-                new SystemMessage("你是工具结果摘要助手，只输出简洁中文摘要。"),
-                new UserMessage(prompt + "\n\n原始结果：\n" + nvl(rawOutput))
+                new SystemMessage(promptService.toolSummarySystemPrompt()),
+                new UserMessage(prompt)
         );
         long durationMs = Math.max(0L, System.currentTimeMillis() - startedAt);
         String summary = response == null || response.aiMessage() == null ? "" : nvl(response.aiMessage().text()).trim();

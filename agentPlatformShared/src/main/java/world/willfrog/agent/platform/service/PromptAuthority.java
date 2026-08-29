@@ -54,6 +54,10 @@ final class PromptAuthority {
             Map.entry("pythonRepairStageInstruction", "prompts/python/python_repair_stage.txt"),
             Map.entry("emptyOutputRecoveryStageInstruction", "prompts/todo/empty_output_recovery_stage.txt"),
             Map.entry("budgetLastMileStageInstruction", "prompts/agent/budget_last_mile_stage.txt"),
+            Map.entry("todoRetryContextInstruction", "prompts/todo/todo_retry_context.txt"),
+            Map.entry("pythonRepairContextInstruction", "prompts/python/python_repair_context.txt"),
+            Map.entry("toolSummarySystemPrompt", "prompts/tools/tool_summary_system.txt"),
+            Map.entry("toolSummaryUserPromptTemplate", "prompts/tools/tool_summary_user.txt"),
             Map.entry("toolCapabilityCatalog", "prompts/tools/tool_capability_catalog.json")
     );
 
@@ -182,6 +186,10 @@ final class PromptAuthority {
         validateIfPresent("pythonRepairStageInstruction", prompts.getPythonRepairStageInstruction(), source);
         validateIfPresent("emptyOutputRecoveryStageInstruction", prompts.getEmptyOutputRecoveryStageInstruction(), source);
         validateIfPresent("budgetLastMileStageInstruction", prompts.getBudgetLastMileStageInstruction(), source);
+        validateIfPresent("todoRetryContextInstruction", prompts.getTodoRetryContextInstruction(), source);
+        validateIfPresent("pythonRepairContextInstruction", prompts.getPythonRepairContextInstruction(), source);
+        validateIfPresent("toolSummarySystemPrompt", prompts.getToolSummarySystemPrompt(), source);
+        validateIfPresent("toolSummaryUserPromptTemplate", prompts.getToolSummaryUserPromptTemplate(), source);
         validateIfPresent("toolCapabilityCatalog", prompts.getToolCapabilityCatalog(), source);
         if (prompts.getPythonRefineRequirements() != null && !prompts.getPythonRefineRequirements().isEmpty()) {
             validateRequirements(prompts.getPythonRefineRequirements(), source);
@@ -246,6 +254,10 @@ final class PromptAuthority {
         prompts.setPythonRepairStageInstruction(texts.get("pythonRepairStageInstruction"));
         prompts.setEmptyOutputRecoveryStageInstruction(texts.get("emptyOutputRecoveryStageInstruction"));
         prompts.setBudgetLastMileStageInstruction(texts.get("budgetLastMileStageInstruction"));
+        prompts.setTodoRetryContextInstruction(texts.get("todoRetryContextInstruction"));
+        prompts.setPythonRepairContextInstruction(texts.get("pythonRepairContextInstruction"));
+        prompts.setToolSummarySystemPrompt(texts.get("toolSummarySystemPrompt"));
+        prompts.setToolSummaryUserPromptTemplate(texts.get("toolSummaryUserPromptTemplate"));
         prompts.setToolCapabilityCatalog(texts.get("toolCapabilityCatalog"));
         prompts.setPythonRefineRequirements(readRequirements(requireResource(REQUIREMENTS_RESOURCE)));
         prompts.setDatasetFieldSpecs(readDatasetSpecs(requireResource(DATASET_SPECS_RESOURCE)));
@@ -388,6 +400,10 @@ final class PromptAuthority {
         copy.setPythonRepairStageInstruction(source.getPythonRepairStageInstruction());
         copy.setEmptyOutputRecoveryStageInstruction(source.getEmptyOutputRecoveryStageInstruction());
         copy.setBudgetLastMileStageInstruction(source.getBudgetLastMileStageInstruction());
+        copy.setTodoRetryContextInstruction(source.getTodoRetryContextInstruction());
+        copy.setPythonRepairContextInstruction(source.getPythonRepairContextInstruction());
+        copy.setToolSummarySystemPrompt(source.getToolSummarySystemPrompt());
+        copy.setToolSummaryUserPromptTemplate(source.getToolSummaryUserPromptTemplate());
         copy.setToolCapabilityCatalog(source.getToolCapabilityCatalog());
         return copy;
     }

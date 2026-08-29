@@ -520,8 +520,7 @@ public class AgentPromptService {
 
     /** DAG recovery judge 阶段正文，只能进入 User Message。 */
     public String dagRecoveryJudgeStageInstruction() {
-        return "[Stage: DAG_RECOVERY_JUDGE]\n"
-                + currentPrompts().getDagRecoveryJudgeSystemPromptTemplate();
+        return currentPrompts().getDagRecoveryJudgeSystemPromptTemplate();
     }
 
     /**
@@ -808,6 +807,49 @@ public class AgentPromptService {
                 Map.of("requirements", renderedRequirements));
     }
 
+    public String todoRetryContextInstruction(String toolName,
+                                              String toolSafety,
+                                              String failureCategory,
+                                              String failureSummary,
+                                              String previousArguments) {
+        return render(currentPrompts().getTodoRetryContextInstruction(), Map.of(
+                "toolName", safe(toolName),
+                "toolSafety", safe(toolSafety),
+                "failureCategory", safe(failureCategory),
+                "failureSummary", safe(failureSummary),
+                "previousArguments", safe(previousArguments)));
+    }
+
+    public String pythonRepairContextInstruction(String repairAttempt,
+                                                 String terminalStatus,
+                                                 String exitReason,
+                                                 String errorCode,
+                                                 String retryable,
+                                                 String stdoutPreview,
+                                                 String stderrPreview,
+                                                 String failedCodePreview) {
+        return render(currentPrompts().getPythonRepairContextInstruction(), Map.of(
+                "repairAttempt", safe(repairAttempt),
+                "terminalStatus", safe(terminalStatus),
+                "exitReason", safe(exitReason),
+                "errorCode", safe(errorCode),
+                "retryable", safe(retryable),
+                "stdoutPreview", safe(stdoutPreview),
+                "stderrPreview", safe(stderrPreview),
+                "failedCodePreview", safe(failedCodePreview)));
+    }
+
+    public String toolSummarySystemPrompt() {
+        return currentPrompts().getToolSummarySystemPrompt();
+    }
+
+    public String toolSummaryUserPrompt(String todoGoal, String toolName, String rawOutput) {
+        return render(currentPrompts().getToolSummaryUserPromptTemplate(), Map.of(
+                "todoGoal", safe(todoGoal),
+                "toolName", safe(toolName),
+                "rawOutput", safe(rawOutput)));
+    }
+
     public String emptyOutputRecoveryStageInstruction() {
         return currentPrompts().getEmptyOutputRecoveryStageInstruction();
     }
@@ -832,11 +874,10 @@ public class AgentPromptService {
      * @return 带 [Stage: TODO_RECOVERY] 标记的 recovery 指令
      */
     public String recoveryStageInstruction() {
-        String specific = firstNonBlank(
+        return firstNonBlank(
                 currentPrompts().getWorkflowTodoRecoverySystemPrompt(),
                 ""
         );
-        return "[Stage: TODO_RECOVERY]\n" + specific;
     }
 
     /**
@@ -846,12 +887,11 @@ public class AgentPromptService {
      * @return 带 [Stage: FINAL_ANSWER] 标记的 final answer 指令
      */
     public String finalAnswerStageInstruction() {
-        String specific = firstNonBlank(
+        return firstNonBlank(
                 currentPrompts().getWorkflowFinalSystemPrompt(),
                 currentPrompts().getParallelFinalSystemPrompt(),
                 ""
         );
-        return "[Stage: FINAL_ANSWER]\n" + specific;
     }
 
     /**
@@ -864,12 +904,11 @@ public class AgentPromptService {
      * @return 带 [Stage: PLAN_JUDGE] 标记的 judge 指令
      */
     public String planJudgeStageInstruction() {
-        String specific = firstNonBlank(
+        return firstNonBlank(
                 currentPrompts().getPlanJudgeRuntimeSystemPromptTemplate(),
                 currentPrompts().getPlanJudgeSystemPromptTemplate(),
                 ""
         );
-        return "[Stage: PLAN_JUDGE]\n" + specific;
     }
 
     /**
@@ -881,11 +920,10 @@ public class AgentPromptService {
      * @return 带 [Stage: PATCH_PLAN] 标记的 patch 指令
      */
     public String patchPlannerStageInstruction() {
-        String specific = firstNonBlank(
+        return firstNonBlank(
                 currentPrompts().getParallelPatchPlannerSystemPromptTemplate(),
                 ""
         );
-        return "[Stage: PATCH_PLAN]\n" + specific;
     }
 
     /**

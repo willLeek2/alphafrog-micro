@@ -448,6 +448,10 @@
     "pythonRepairStageInstruction": "file:prompts/python/python_repair_stage.txt",
     "emptyOutputRecoveryStageInstruction": "file:prompts/todo/empty_output_recovery_stage.txt",
     "budgetLastMileStageInstruction": "file:prompts/agent/budget_last_mile_stage.txt",
+    "todoRetryContextInstruction": "file:prompts/todo/todo_retry_context.txt",
+    "pythonRepairContextInstruction": "file:prompts/python/python_repair_context.txt",
+    "toolSummarySystemPrompt": "file:prompts/tools/tool_summary_system.txt",
+    "toolSummaryUserPromptTemplate": "file:prompts/tools/tool_summary_user.txt",
     "toolCapabilityCatalog": "file:prompts/tools/tool_capability_catalog.json"
   }
 }

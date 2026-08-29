@@ -1,0 +1,10 @@
+
+
+[TODO_RETRY_CONTEXT]
+这是本 Todo 唯一允许的一次语义重试。请根据失败信息修正工具参数；如果无法安全修正，直接说明失败，不要重复相同调用。
+tool: {{toolName}}
+tool_safety: {{toolSafety}}
+failure_category: {{failureCategory}}
+failure_summary: {{failureSummary}}
+previous_arguments:
+{{previousArguments}}
