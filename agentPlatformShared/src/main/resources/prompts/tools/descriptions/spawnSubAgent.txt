@@ -1,0 +1,1 @@
+Start one bounded child agent for an independent goal. The child shares this run's total budget, cancellation and observability. It cannot create another child agent. Call waitForSubAgent with the returned id.

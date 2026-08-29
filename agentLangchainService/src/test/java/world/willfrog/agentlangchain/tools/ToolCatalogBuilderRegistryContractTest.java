@@ -7,6 +7,7 @@ import org.junit.jupiter.api.Test;
 import world.willfrog.agent.platform.artifact.ToolOutputRefService;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.service.SearchEvidenceJudgeService;
+import world.willfrog.agent.platform.service.ToolDescriptionTexts;
 import world.willfrog.agent.tools.compaction.RereadToolHandler;
 import world.willfrog.agent.tools.dataset.DatasetRegistry;
 import world.willfrog.agent.tools.dataset.DatasetWriter;
@@ -73,6 +74,17 @@ class ToolCatalogBuilderRegistryContractTest {
         assertEquals(AgentToolRegistry.declaredToolNames(), built,
                 "两个门控都开启时，构建出的目录应与注册表声明完全一致");
         assertEquals(27, built.size(), "D06 后注册表声明为 27 个工具");
+    }
+
+    @Test
+    void catalogDescriptionsMustMatchAuthorityFiles() {
+        List<ToolSpecification> specs = ToolCatalogBuilder.buildSpecifications(
+                marketDataTools, ragTools, searchTools, pythonSandboxTools, listMyDataTool,
+                loadToolGuideTool, rereadToolHandler, true, true);
+        for (ToolSpecification spec : specs) {
+            assertEquals(ToolDescriptionTexts.require(spec.name()), spec.description(),
+                    spec.name() + " 的目录说明必须等于权威文件");
+        }
     }
 
     @Test

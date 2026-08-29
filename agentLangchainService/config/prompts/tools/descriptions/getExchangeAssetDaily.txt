@@ -1,0 +1,1 @@
+查询场内资产日线（股票/ETF/指数）；simple 模式批量上限请先调用 checkParallelLimits 查询。也支持 mode=advanced，advanced 要求 advancedQuery.asset_type=stock，通过 advancedQuery.conditions 指定指数成分或申万二级/三级行业成分，批量拉取成分股的日线数据。simple 模式继续使用 tsCode + assetType + startDate + endDate。

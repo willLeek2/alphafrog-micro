@@ -6,6 +6,7 @@ import dev.langchain4j.model.chat.request.json.JsonObjectSchema;
 import dev.langchain4j.model.chat.request.json.JsonArraySchema;
 import dev.langchain4j.model.chat.request.json.JsonIntegerSchema;
 import dev.langchain4j.model.chat.request.json.JsonStringSchema;
+import world.willfrog.agent.platform.service.ToolDescriptionTexts;
 import world.willfrog.agent.tools.compaction.RereadToolHandler;
 import world.willfrog.agent.tools.catalog.MarketDataAdvancedToolCatalog;
 import world.willfrog.agent.tools.catalog.ParallelLimitsToolCatalog;
@@ -25,6 +26,7 @@ import java.util.stream.Collectors;
 /**
  * 构建 run 级工具目录。能力过滤统一取自 {@link AgentToolRegistry} 的门控元数据，
  * 保证运行时目录、对外 API 目录与注册表的单一真相源一致。
+ * 写给模型的工具说明在拼装完成后覆盖成 classpath 权威文件，反射只提供参数结构。
  */
 final class ToolCatalogBuilder {
 
@@ -60,7 +62,19 @@ final class ToolCatalogBuilder {
                 addResolveFinanceMethodsIfAbsent(merged));
         // 目录里的每个工具名都必须已在注册表登记，未登记就直接抛错，避免漏进未登记工具。
         result.forEach(spec -> AgentToolRegistry.require(spec.name()));
-        return result;
+        return applyAuthorityDescriptions(result);
+    }
+
+    /**
+     * 反射只负责参数结构；写给模型的说明一律覆盖成 classpath 权威文件正文。
+     * 权威文件缺失时直接失败，不再在 Java 里放备用副本。
+     */
+    private static List<ToolSpecification> applyAuthorityDescriptions(List<ToolSpecification> specifications) {
+        List<ToolSpecification> result = new ArrayList<>(specifications.size());
+        for (ToolSpecification spec : specifications) {
+            result.add(spec.toBuilder().description(ToolDescriptionTexts.require(spec.name())).build());
+        }
+        return List.copyOf(result);
     }
 
     private static void addSpecsIfPresent(List<ToolSpecification> target, Object toolBean) {
@@ -81,13 +95,7 @@ final class ToolCatalogBuilder {
     static ToolSpecification resolveFinanceMethodsSpecification() {
         return ToolSpecification.builder()
                 .name("resolveFinanceMethods")
-                .description("Read-only advisor for financial indicators or calculation methods. "
-                        + "When a question involves a financial metric or computation, pass the user's raw natural-language "
-                        + "expression directly to this tool; do not first rewrite it into fixed fields such as method name, "
-                        + "year, or period count. If the result contains unresolvedTerms, clarify the boundary before computing. "
-                        + "Compatible public-library samples should be preferred but are not mandatory. "
-                        + "When later calling report() or report_custom(), pass the resolverToolCallId from this tool's result "
-                        + "as source_resolver_tool_call_id.")
+                .description(ToolDescriptionTexts.require("resolveFinanceMethods"))
                 .parameters(JsonObjectSchema.builder()
                         .addProperty("query", JsonStringSchema.builder()
                                 .description("The user's raw natural-language financial question (required).")
@@ -115,9 +123,7 @@ final class ToolCatalogBuilder {
         if (result.stream().noneMatch(spec -> "spawnSubAgent".equals(spec.name()))) {
             result.add(ToolSpecification.builder()
                     .name("spawnSubAgent")
-                    .description("Start one bounded child agent for an independent goal. "
-                            + "The child shares this run's total budget, cancellation and observability. "
-                            + "It cannot create another child agent. Call waitForSubAgent with the returned id.")
+                    .description(ToolDescriptionTexts.require("spawnSubAgent"))
                     .parameters(JsonObjectSchema.builder()
                             .addProperty("goal", JsonStringSchema.builder()
                                     .description("Concrete child-agent goal. Required and non-blank.")
@@ -133,8 +139,7 @@ final class ToolCatalogBuilder {
         if (result.stream().noneMatch(spec -> "waitForSubAgent".equals(spec.name()))) {
             result.add(ToolSpecification.builder()
                     .name("waitForSubAgent")
-                    .description("Wait for one or more child agents from this run. Returns one structured state per id. "
-                            + "A wait timeout does not cancel unfinished children; call this tool again to continue waiting.")
+                    .description(ToolDescriptionTexts.require("waitForSubAgent"))
                     .parameters(JsonObjectSchema.builder()
                             .addProperty("subAgentIds", JsonArraySchema.builder()
                                     .description("One or more ids returned by spawnSubAgent.")

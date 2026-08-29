@@ -8,6 +8,8 @@ import dev.langchain4j.model.chat.request.json.JsonObjectSchema;
 import dev.langchain4j.model.chat.request.json.JsonSchemaElement;
 import dev.langchain4j.model.chat.request.json.JsonStringSchema;
 
+import world.willfrog.agent.platform.service.ToolDescriptionTexts;
+
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -50,7 +52,7 @@ public final class MarketDataAdvancedToolCatalog {
     public static ToolSpecification searchIndexSpec() {
         return ToolSpecification.builder()
                 .name("searchIndex")
-                .description("按关键词搜索指数；也支持 mode=advanced，通过 advancedQuery.conditions 做指数成分条件筛选。simple 模式继续使用 keyword。advanced 仅支持 has_stock 条件；日期必须传 YYYYMMDD 格式的日期字符串或 NONE。对 has_stock 的 NONE/NONE 默认取最新公告期完整快照，单边 NONE 表示不限制该侧边界。")
+                .description(ToolDescriptionTexts.require("searchIndex"))
                 .parameters(JsonObjectSchema.builder()
                         .addStringProperty("keyword", "simple 模式指数关键词，如 沪深300；可用 | 批量。advanced 模式忽略。")
                         .addStringProperty("mode", "可选：advanced。省略时为 simple。")
@@ -63,7 +65,7 @@ public final class MarketDataAdvancedToolCatalog {
     public static ToolSpecification searchAssetInfoSpec() {
         return ToolSpecification.builder()
                 .name("searchAssetInfo")
-                .description("统一搜索股票/ETF/指数/场外基金基本信息；也支持 mode=advanced。advanced 要求 advancedQuery.asset_type=stock|etf，stock 支持 index_component / sw_industry_l2_component / sw_industry_l3_component，etf 支持 has_stock。simple 模式继续使用 query + assetTypes。对 index_component 的 NONE/NONE 默认取最新公告期完整快照，单边 NONE 表示不限制该侧边界。")
+                .description(ToolDescriptionTexts.require("searchAssetInfo"))
                 .parameters(JsonObjectSchema.builder()
                         .addStringProperty("query", "simple 模式关键词，支持 | 批量或 JSON 数组。advanced 模式忽略。")
                         .addStringProperty("assetTypes", "simple 模式资产类型，stock,etf,index,off_exchange_fund。")
@@ -78,7 +80,7 @@ public final class MarketDataAdvancedToolCatalog {
     public static ToolSpecification getExchangeAssetDailySpec() {
         return ToolSpecification.builder()
                 .name("getExchangeAssetDaily")
-                .description("查询场内资产日线（股票/ETF/指数）；simple 模式批量上限请先调用 checkParallelLimits 查询。也支持 mode=advanced，advanced 要求 advancedQuery.asset_type=stock，通过 advancedQuery.conditions 指定指数成分或申万二级/三级行业成分，批量拉取成分股的日线数据。simple 模式继续使用 tsCode + assetType + startDate + endDate。")
+                .description(ToolDescriptionTexts.require("getExchangeAssetDaily"))
                 .parameters(JsonObjectSchema.builder()
                         .addStringProperty("tsCode", "simple 模式场内资产代码，支持 | 批量；advanced 模式忽略。")
                         .addStringProperty("assetType", "simple 模式必填 stock|etf|index。advanced 模式忽略，asset_type 放在 advancedQuery 里。")

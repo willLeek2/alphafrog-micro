@@ -19,7 +19,7 @@ import world.willfrog.agent.platform.finance.FinanceRecordProcessingException;
 import world.willfrog.agent.platform.finance.FinanceToolResultFormatter;
 import world.willfrog.agent.platform.debug.DebugObservabilityRpcKeys;
 import world.willfrog.agent.platform.debug.DebugObservabilityService;
-import world.willfrog.agent.platform.util.PromptFileLoader;
+import world.willfrog.agent.platform.service.ToolDescriptionTexts;
 import world.willfrog.agent.tools.finance.FinanceResultModelAdapter;
 import world.willfrog.agent.workflow.AgentRunDatasetCsvWriter;
 import world.willfrog.agent.workflow.AgentRunDatasetEntry;
@@ -61,55 +61,12 @@ public class PythonSandboxTools {
     private static final int DATA_INTENSE_ANCHOR_SCHEMA_VERSION = 2;
 
     /**
-     * 工具说明正文维护在 classpath 文件 {@link #TOOL_DESCRIPTION_PATH} 中。
-     * LangChain4j 的 {@code @Tool} 注解要求 description 为编译期常量，因此注解上只能放
-     * {@link #TOOL_DESCRIPTION_SHORT} 这段简短提示；完整长文案由 {@link #loadToolDescription()} 在运行时加载，
-     * 供 ToolRouter 拼接工具说明等场景使用。文件缺失或内容为空时，回落到 {@link #FALLBACK_TOOL_DESCRIPTION}，
-     * 避免部署后因描述为空触发空指针。
-     */
-    private static final String TOOL_DESCRIPTION_PATH = "prompts/python/execute_python_tool_description.txt";
-
-    private static final String TOOL_DESCRIPTION_SHORT =
-            "Execute Python code in a secure sandbox. Inputs: code (required); at least one of "
-            + "dataset_ids / manifest_ids (comma-separated agent run-level numbers from listMyData); "
-            + "libraries (comma-separated, e.g. 'numpy,pandas'); timeout_seconds (default 30). "
-            + "Sandbox input: paths_dataset.csv + path_manifest.csv; use "
-            + "`from af_dataset_loader import load_manifest, load_datasets`. "
-            + "Runtime preinstalled: numpy==2.4.1, pandas==2.3.3, matplotlib==3.10.8, scipy==1.17.0. "
-            + "Finance questions can pass the raw natural-language expression to resolveFinanceMethods first. "
-            + "If a candidate has unresolved boundaries, do not invent values; use compatible public libraries when available but not mandatory; "
-            + "custom calculations must declare generic fields; pass the resolver root resolverToolCallId to report() or report_custom() "
-            + "via the source_resolver_tool_call_id parameter. "
-            + "See loadToolDescription() for full docs (load failure falls back to a hardcoded equivalent).";
-
-    private static final String FALLBACK_TOOL_DESCRIPTION = "Execute Python code in a secure sandbox. REQUIRED: code and at least one of "
-            + "dataset_ids / manifest_ids. IDs are agent run-level numbers from listMyData, not raw datasetId strings or paths. "
-            + "dataset_ids and manifest_ids may be comma-separated numbers (e.g. '1,3'); prefer manifest_ids for grouped data. "
-            + "Sandbox injects /sandbox/paths_dataset.csv and /sandbox/path_manifest.csv with real task-local paths. "
-            + "In Python, use from af_dataset_loader import load_manifest, load_datasets; load_manifest('1') returns "
-            + "DatasetLoadResult with frame / failed_members / skipped_members; load_datasets('1') returns dict[from_ts_code, DataFrame]. "
-            + "For multiple datasets/manifests, load one run-level number at a time in helper code and merge results. "
-            + "Do not construct /sandbox/input/<dataset_id>/ or /sandbox/runs/<oldTaskId>/ paths. "
-            + "Finance questions can pass the raw natural-language expression to resolveFinanceMethods first. "
-            + "If a candidate has unresolved boundaries, do not invent values; use compatible public libraries when available but not mandatory; "
-            + "custom calculations must declare generic fields; pass the resolver root resolverToolCallId to report() or report_custom() "
-            + "via the source_resolver_tool_call_id parameter. "
-            + "OPTIONAL: libraries (comma-separated, e.g. 'numpy,pandas'), timeout_seconds. "
-            + "Runtime preinstalled: numpy==2.4.1, pandas==2.3.3, matplotlib==3.10.8, scipy==1.17.0. "
-            + "Service stack: fastapi==0.128.0, uvicorn[standard]==0.40.0, pydantic==2.12.5, llm-sandbox[docker]==0.3.33. "
-            + "Please prioritize using the preinstalled runtime libraries to reduce latency.";
-
-    /**
-     * 加载完整工具说明，供 ToolRouter、同包代码与单元测试调用。
-     * 优先读取 {@link #TOOL_DESCRIPTION_PATH}；读不到或内容为空白时，使用 {@link #FALLBACK_TOOL_DESCRIPTION}。
+     * 写给模型的完整说明只维护在 classpath 权威文件里。
+     * {@code @Tool} 不再放正文：LangChain4j 反射只要方法签名，目录构建时再覆盖成权威正文。
+     * 文件缺失或为空时加载直接失败，不再在 Java 里放第二份说明。
      */
     public static String loadToolDescription() {
-        String loaded = PromptFileLoader.load(TOOL_DESCRIPTION_PATH);
-        if (loaded == null || loaded.isBlank()) {
-            log.warn("TOOL_DESCRIPTION classpath resource missing: {} — falling back to hardcoded text", TOOL_DESCRIPTION_PATH);
-            return FALLBACK_TOOL_DESCRIPTION;
-        }
-        return loaded;
+        return ToolDescriptionTexts.require("executePython");
     }
 
     @DubboReference
@@ -174,9 +131,10 @@ public class PythonSandboxTools {
     }
 
     /**
-     * LangChain4j 暴露给 LLM 的五参数入口；参数名与工具描述中的字段一一对应。
+     * LangChain4j 暴露给 LLM 的五参数入口；参数名与权威说明中的字段一一对应。
+     * 方法上的 {@code @Tool} 不再带正文，目录构建时会覆盖成权威文件。
      */
-    @Tool(TOOL_DESCRIPTION_SHORT)
+    @Tool
     public String executePython(String code, String dataset_ids, String manifest_ids, String libraries, Integer timeout_seconds) {
         return executePythonInternal(code, dataset_ids, manifest_ids, libraries, timeout_seconds);
     }

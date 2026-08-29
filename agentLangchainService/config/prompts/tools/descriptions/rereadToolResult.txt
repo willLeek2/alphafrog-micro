@@ -1,0 +1,6 @@
+重新读取被压缩的大型工具输出。
+当某个工具结果包含 data.rawRef（形如 raw_ref_001 或 raw-ref:...）且可见内容不够用时，调用本工具读取原始内容。
+优先使用工具结果中可见的结构化 data 字段；对于 JSON/CSV、dataset 或 manifest 的筛选、聚合、排序、对比、回测等任务，优先使用 listMyData + executePython 确定性处理，不要用本工具反复分页浏览。
+仅在缺少必要字段时，用 keyword/offset/limit 做少量定向补读。rawRef 必须来自工具结果的 data.rawRef；不要把 rawRef 当成 citation。
+keyword 模式必须提供非空 keyword，可选 limit 不能超过配置上限。
+range 模式不传 keyword，必须提供 offset/limit；无 keyword 时 limit 不能低于配置的 rangeMinLimitWithoutKeyword。

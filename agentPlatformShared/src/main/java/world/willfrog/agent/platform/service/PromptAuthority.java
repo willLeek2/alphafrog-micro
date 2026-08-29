@@ -54,11 +54,17 @@ final class PromptAuthority {
             Map.entry("pythonRepairStageInstruction", "prompts/python/python_repair_stage.txt"),
             Map.entry("emptyOutputRecoveryStageInstruction", "prompts/todo/empty_output_recovery_stage.txt"),
             Map.entry("budgetLastMileStageInstruction", "prompts/agent/budget_last_mile_stage.txt"),
+            Map.entry("todoRetryContextInstruction", "prompts/todo/todo_retry_context.txt"),
+            Map.entry("pythonRepairContextInstruction", "prompts/python/python_repair_context.txt"),
+            Map.entry("toolSummarySystemPrompt", "prompts/tools/tool_summary_system.txt"),
+            Map.entry("toolSummaryUserPromptTemplate", "prompts/tools/tool_summary_user.txt"),
             Map.entry("toolCapabilityCatalog", "prompts/tools/tool_capability_catalog.json")
     );
 
     private static final String REQUIREMENTS_RESOURCE = "prompts/python/python_refine_requirements.txt";
     private static final String DATASET_SPECS_RESOURCE = "prompts/python/dataset_field_specs.json";
+    private static final String TOOL_DESCRIPTION_INDEX = "prompts/tools/tool_description_index.json";
+    private static final String EXECUTE_PYTHON_DESCRIPTION = "prompts/python/execute_python_tool_description.txt";
     private static final PromptAuthority SHARED = new PromptAuthority(PromptFileLoader::load, new ObjectMapper());
 
     private final Function<String, String> resourceLoader;
@@ -180,6 +186,10 @@ final class PromptAuthority {
         validateIfPresent("pythonRepairStageInstruction", prompts.getPythonRepairStageInstruction(), source);
         validateIfPresent("emptyOutputRecoveryStageInstruction", prompts.getEmptyOutputRecoveryStageInstruction(), source);
         validateIfPresent("budgetLastMileStageInstruction", prompts.getBudgetLastMileStageInstruction(), source);
+        validateIfPresent("todoRetryContextInstruction", prompts.getTodoRetryContextInstruction(), source);
+        validateIfPresent("pythonRepairContextInstruction", prompts.getPythonRepairContextInstruction(), source);
+        validateIfPresent("toolSummarySystemPrompt", prompts.getToolSummarySystemPrompt(), source);
+        validateIfPresent("toolSummaryUserPromptTemplate", prompts.getToolSummaryUserPromptTemplate(), source);
         validateIfPresent("toolCapabilityCatalog", prompts.getToolCapabilityCatalog(), source);
         if (prompts.getPythonRefineRequirements() != null && !prompts.getPythonRefineRequirements().isEmpty()) {
             validateRequirements(prompts.getPythonRefineRequirements(), source);
@@ -244,10 +254,69 @@ final class PromptAuthority {
         prompts.setPythonRepairStageInstruction(texts.get("pythonRepairStageInstruction"));
         prompts.setEmptyOutputRecoveryStageInstruction(texts.get("emptyOutputRecoveryStageInstruction"));
         prompts.setBudgetLastMileStageInstruction(texts.get("budgetLastMileStageInstruction"));
+        prompts.setTodoRetryContextInstruction(texts.get("todoRetryContextInstruction"));
+        prompts.setPythonRepairContextInstruction(texts.get("pythonRepairContextInstruction"));
+        prompts.setToolSummarySystemPrompt(texts.get("toolSummarySystemPrompt"));
+        prompts.setToolSummaryUserPromptTemplate(texts.get("toolSummaryUserPromptTemplate"));
         prompts.setToolCapabilityCatalog(texts.get("toolCapabilityCatalog"));
         prompts.setPythonRefineRequirements(readRequirements(requireResource(REQUIREMENTS_RESOURCE)));
         prompts.setDatasetFieldSpecs(readDatasetSpecs(requireResource(DATASET_SPECS_RESOURCE)));
-        return new AuthoritySnapshot(Map.copyOf(texts), prompts);
+        return new AuthoritySnapshot(Map.copyOf(texts), prompts, loadToolDescriptions());
+    }
+
+    String requireToolDescription(String toolName) {
+        if (toolName == null || toolName.isBlank()) {
+            throw new PromptConfigurationException("tool_description_missing", "工具名为空，无法读取权威说明");
+        }
+        String text = snapshot().toolDescriptions().get(toolName);
+        if (text == null || text.isBlank()) {
+            throw new PromptConfigurationException(
+                    "tool_description_missing", "工具 " + toolName + " 缺少权威说明");
+        }
+        return stripTrailingNewlines(text);
+    }
+
+    private Map<String, String> loadToolDescriptions() {
+        List<String> names;
+        try {
+            names = objectMapper.readValue(requireResource(TOOL_DESCRIPTION_INDEX), new TypeReference<List<String>>() { });
+        } catch (PromptConfigurationException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new PromptConfigurationException(
+                    "authority_parse_failed", TOOL_DESCRIPTION_INDEX + " 不是合法工具名列表: " + e.getMessage());
+        }
+        if (names == null || names.isEmpty()) {
+            throw new PromptConfigurationException("authority_blank", TOOL_DESCRIPTION_INDEX + " 没有工具名");
+        }
+        Map<String, String> descriptions = new LinkedHashMap<>();
+        for (String name : names) {
+            if (!isSafeToolName(name)) {
+                throw new PromptConfigurationException(
+                        "authority_parse_failed", TOOL_DESCRIPTION_INDEX + " 含非法工具名: " + name);
+            }
+            descriptions.put(name, requireResource(toolDescriptionResource(name)));
+        }
+        return Map.copyOf(descriptions);
+    }
+
+    private static boolean isSafeToolName(String name) {
+        return name != null && name.matches("[A-Za-z][A-Za-z0-9]*");
+    }
+
+    private static String toolDescriptionResource(String name) {
+        if ("executePython".equals(name)) {
+            return EXECUTE_PYTHON_DESCRIPTION;
+        }
+        return "prompts/tools/descriptions/" + name + ".txt";
+    }
+
+    private static String stripTrailingNewlines(String text) {
+        int end = text.length();
+        while (end > 0 && text.charAt(end - 1) == '\n') {
+            end--;
+        }
+        return text.substring(0, end);
     }
 
     private String requireResource(String resource) {
@@ -331,6 +400,10 @@ final class PromptAuthority {
         copy.setPythonRepairStageInstruction(source.getPythonRepairStageInstruction());
         copy.setEmptyOutputRecoveryStageInstruction(source.getEmptyOutputRecoveryStageInstruction());
         copy.setBudgetLastMileStageInstruction(source.getBudgetLastMileStageInstruction());
+        copy.setTodoRetryContextInstruction(source.getTodoRetryContextInstruction());
+        copy.setPythonRepairContextInstruction(source.getPythonRepairContextInstruction());
+        copy.setToolSummarySystemPrompt(source.getToolSummarySystemPrompt());
+        copy.setToolSummaryUserPromptTemplate(source.getToolSummaryUserPromptTemplate());
         copy.setToolCapabilityCatalog(source.getToolCapabilityCatalog());
         return copy;
     }
@@ -345,6 +418,10 @@ final class PromptAuthority {
                 .append(requireResource(REQUIREMENTS_RESOURCE)).append('\n')
                 .append(DATASET_SPECS_RESOURCE).append('\n')
                 .append(requireResource(DATASET_SPECS_RESOURCE));
+        snapshot().toolDescriptions().entrySet().stream()
+                .sorted(Map.Entry.comparingByKey())
+                .forEach(entry -> canonical.append("toolDescription:").append(entry.getKey()).append('\n')
+                        .append(entry.getValue()).append('\n'));
         return sha256(canonical.toString());
     }
 
@@ -357,6 +434,9 @@ final class PromptAuthority {
         }
     }
 
-    private record AuthoritySnapshot(Map<String, String> texts, AgentLlmProperties.Prompts prompts) {
+    private record AuthoritySnapshot(
+            Map<String, String> texts,
+            AgentLlmProperties.Prompts prompts,
+            Map<String, String> toolDescriptions) {
     }
 }

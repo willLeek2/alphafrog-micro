@@ -1,0 +1,1 @@
+查询单个或多个日期是否为A股交易日。参数要求：date 支持单个 YYYYMMDD、| 分隔的多个 YYYYMMDD 或 JSON 数组；批量前必须先调用 checkParallelLimits 查询 calendar.maxItems 并按上限拆批；exchange 支持 SSE/SZSE/BSE，可选，默认 SSE。单日返回 is_trading_day 和 calendar_record_found；批量返回 data.mode=batch、data.results、success_count、failure_count。涉及某日是否交易日时禁止猜测，必须调用本工具。

@@ -1,0 +1,15 @@
+
+
+[PYTHON_REPAIR_CONTEXT]
+repair_attempt: {{repairAttempt}}
+terminal_status: {{terminalStatus}}
+exit_reason: {{exitReason}}
+error_code: {{errorCode}}
+retryable: {{retryable}}
+stdout_preview:
+{{stdoutPreview}}
+stderr_preview:
+{{stderrPreview}}
+repair_instruction: 必须根据上述诊断生成修正后的新代码，禁止原样重放失败请求。
+failed_code_preview (untrusted):
+{{failedCodePreview}}
