@@ -18,6 +18,7 @@ import world.willfrog.alphafrogmicro.common.dao.config.ConfigAuditLogDao;
 import world.willfrog.alphafrogmicro.common.dao.config.ConfigSnapshotDao;
 import world.willfrog.alphafrogmicro.common.dao.config.ConfigTypeDao;
 import world.willfrog.alphafrogmicro.common.exception.config.ConfigConflictException;
+import world.willfrog.alphafrogmicro.common.exception.config.ConfigValidationException;
 import world.willfrog.alphafrogmicro.common.pojo.config.ConfigActive;
 import world.willfrog.alphafrogmicro.common.pojo.config.ConfigAuditLog;
 import world.willfrog.alphafrogmicro.common.pojo.config.ConfigSnapshot;
@@ -34,6 +35,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -191,6 +193,72 @@ class ConfigProfileServiceTest {
 
         verify(nacosConfigService).publishConfig(type.getDataId(), type.getConfigGroup(), snapshot.getContentJson());
         verify(configAuditLogDao).insert(any(ConfigAuditLog.class));
+    }
+
+    @Test
+    void createFromScratch_shouldRejectAgentLlmPromptMissingPlaceholder() throws Exception {
+        ConfigType type = buildAgentLlmType();
+        when(configTypeDao.getByName("agent-llm")).thenReturn(type);
+        var content = objectMapper.readTree("""
+                {"defaultEndpoint":"openrouter","defaultModel":"m","endpoints":{},
+                 "prompts":{"todoRetryContextInstruction":"缺少占位符"}}
+                """);
+
+        assertThrows(ConfigValidationException.class,
+                () -> configProfileService.createFromScratch("agent-llm", content, "bad", "7"));
+        verify(configSnapshotDao, never()).insert(any());
+        verifyNoInteractions(nacosConfigService);
+    }
+
+    @Test
+    void activate_shouldRejectAgentLlmBadOverrideBeforePublish() {
+        ConfigType type = buildAgentLlmType();
+        ConfigSnapshot snapshot = new ConfigSnapshot();
+        snapshot.setId(3);
+        snapshot.setTypeId(9);
+        snapshot.setVersion("v9");
+        snapshot.setContentJson("{\"prompts\":{\"todoRetryContextInstruction\":\"缺少占位符\"}}");
+        when(configTypeDao.getByName("agent-llm")).thenReturn(type);
+        when(configSnapshotDao.getByTypeAndVersion(type.getId(), "v9")).thenReturn(snapshot);
+
+        assertThrows(ConfigValidationException.class,
+                () -> configProfileService.activate("agent-llm", "v9", 1, "7"));
+
+        verify(configActiveDao, never()).updateIfSnapshotMatches(any(), any(), any(), any(), any());
+        verifyNoInteractions(nacosConfigService);
+    }
+
+    @Test
+    void rollback_shouldPublishPreviousSnapshotAndWriteRollbackAudit() throws Exception {
+        ConfigType type = buildType();
+        ConfigSnapshot snapshot = buildSnapshot();
+        when(configTypeDao.getByName("code-refine")).thenReturn(type);
+        when(configSnapshotDao.getByTypeAndVersion(type.getId(), "v2")).thenReturn(snapshot);
+        when(configActiveDao.updateIfSnapshotMatches(eq(type.getId()), eq(snapshot.getId()), eq(1), any(), eq("7")))
+                .thenReturn(1);
+        when(nacosConfigService.publishConfig(type.getDataId(), type.getConfigGroup(), snapshot.getContentJson()))
+                .thenReturn(true);
+
+        configProfileService.rollback("code-refine", "v2", 1, "7");
+
+        ArgumentCaptor<ConfigAuditLog> captor = ArgumentCaptor.forClass(ConfigAuditLog.class);
+        verify(nacosConfigService).publishConfig(type.getDataId(), type.getConfigGroup(), snapshot.getContentJson());
+        verify(configAuditLogDao).insert(captor.capture());
+        assertEquals("ROLLBACK", captor.getValue().getAction());
+        assertEquals(snapshot.getId(), captor.getValue().getSnapshotId());
+    }
+
+    @Test
+    void validateContent_shouldRejectUnknownPromptField() throws Exception {
+        ConfigType type = buildAgentLlmType();
+        when(configTypeDao.getByName("agent-llm")).thenReturn(type);
+        var content = objectMapper.readTree("""
+                {"defaultEndpoint":"openrouter","defaultModel":"m","endpoints":{},
+                 "prompts":{"notIndexed":"x"}}
+                """);
+
+        assertThrows(ConfigValidationException.class,
+                () -> configProfileService.validateContent("agent-llm", content));
     }
 
     @Test
@@ -403,6 +471,16 @@ class ConfigProfileServiceTest {
         type.setName("code-refine");
         type.setDataId("code-refine.json");
         type.setConfigGroup("alphafrog-config");
+        return type;
+    }
+
+    private ConfigType buildAgentLlmType() {
+        ConfigType type = new ConfigType();
+        type.setId(9);
+        type.setName("agent-llm");
+        type.setDataId("agent-llm.json");
+        type.setConfigGroup("alphafrog-config");
+        type.setSchemaJson("");
         return type;
     }
 

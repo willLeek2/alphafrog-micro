@@ -1,0 +1,122 @@
+{
+  "configType": "agent-llm",
+  "dataId": "agent-llm.json",
+  "group": "alphafrog-config",
+  "textFields": [
+    "agentRunSystemPrompt",
+    "followUpSummarySystemPrompt",
+    "todoPlannerSystemPromptTemplate",
+    "workflowFinalSystemPrompt",
+    "workflowTodoRecoverySystemPrompt",
+    "parallelPlannerSystemPromptTemplate",
+    "parallelFinalSystemPrompt",
+    "parallelPatchPlannerSystemPromptTemplate",
+    "planJudgeSystemPromptTemplate",
+    "planJudgeRuntimeSystemPromptTemplate",
+    "semanticJudgeSystemPromptTemplate",
+    "subAgentPlannerSystemPromptTemplate",
+    "subAgentSummarySystemPrompt",
+    "pythonRefineSystemPrompt",
+    "pythonRefineOutputInstruction",
+    "financeMethodResolverSystemPrompt",
+    "orchestratorPlanningSystemPrompt",
+    "orchestratorSummarySystemPrompt",
+    "dagReactSystemPrompt",
+    "dagModeGuidancePrompt",
+    "planningStrategyStage",
+    "planningTodosStage",
+    "dagRecoveryJudgeSystemPromptTemplate",
+    "planningAnalysisStage",
+    "planningStructuredStage",
+    "planningLinearModeGuidance",
+    "planningDagModeGuidance",
+    "planningLinearConstraint",
+    "pythonRepairStageInstruction",
+    "emptyOutputRecoveryStageInstruction",
+    "budgetLastMileStageInstruction",
+    "todoRetryContextInstruction",
+    "pythonRepairContextInstruction",
+    "toolSummarySystemPrompt",
+    "toolSummaryUserPromptTemplate",
+    "toolCapabilityCatalog"
+  ],
+  "pathFields": [
+    "pythonRefineRequirementsFile",
+    "datasetFieldSpecsFile",
+    "financeMethodResolverSystemPromptFile",
+    "dagReactSystemPromptFile",
+    "dagModeGuidancePromptFile",
+    "planningStrategyStageFile",
+    "planningTodosStageFile",
+    "dagRecoveryJudgeSystemPromptFile"
+  ],
+  "placeholders": {
+    "followUpSummarySystemPrompt": [
+      "maxChars"
+    ],
+    "todoPlannerSystemPromptTemplate": [
+      "maxTodos",
+      "toolWhitelist"
+    ],
+    "parallelPlannerSystemPromptTemplate": [
+      "candidateIndex",
+      "candidateCount",
+      "maxTasks",
+      "maxSubSteps",
+      "maxParallelTasks",
+      "maxSubAgents",
+      "toolWhitelist"
+    ],
+    "subAgentPlannerSystemPromptTemplate": [
+      "maxSteps",
+      "tools"
+    ],
+    "financeMethodResolverSystemPrompt": [
+      "RESOLVER_CATALOG"
+    ],
+    "planningStrategyStage": [
+      "toolCapabilities",
+      "strategyMaxDetailLength",
+      "toolWhitelist",
+      "maxTodos"
+    ],
+    "planningTodosStage": [
+      "mode",
+      "detail",
+      "modeGuidance",
+      "toolWhitelist",
+      "maxTodos"
+    ],
+    "pythonRepairStageInstruction": [
+      "requirements"
+    ],
+    "budgetLastMileStageInstruction": [
+      "ratioPct",
+      "dimension",
+      "actual",
+      "limit"
+    ],
+    "todoRetryContextInstruction": [
+      "toolName",
+      "toolSafety",
+      "failureCategory",
+      "failureSummary",
+      "previousArguments"
+    ],
+    "pythonRepairContextInstruction": [
+      "repairAttempt",
+      "terminalStatus",
+      "exitReason",
+      "errorCode",
+      "retryable",
+      "stdoutPreview",
+      "stderrPreview",
+      "failedCodePreview"
+    ],
+    "toolSummaryUserPromptTemplate": [
+      "todoGoal",
+      "toolName",
+      "rawOutput"
+    ]
+  }
+}

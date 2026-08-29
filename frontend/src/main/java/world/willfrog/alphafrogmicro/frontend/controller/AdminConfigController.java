@@ -238,6 +238,61 @@ public class AdminConfigController {
         }
     }
 
+    @PostMapping("/{type}/validate")
+    public ResponseEntity<?> validateContent(@PathVariable String type,
+                                             @RequestBody Map<String, Object> request,
+                                             Authentication authentication) {
+        if (!isAdmin(authentication)) {
+            return ResponseEntity.status(403).body(Map.of("error", "Forbidden"));
+        }
+        try {
+            JsonNode fullConfig = objectMapper.valueToTree(request.get("content"));
+            configProfileService.validateContent(type, fullConfig);
+            return ResponseEntity.ok(Map.of("ok", true));
+        } catch (ConfigNotFoundException e) {
+            return ResponseEntity.status(404).body(Map.of("error", e.getMessage()));
+        } catch (Exception e) {
+            log.error("配置预检失败 type={}", type, e);
+            if (e instanceof IllegalArgumentException) {
+                return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+            }
+            return ResponseEntity.status(500).body(Map.of("error", "Internal Server Error"));
+        }
+    }
+
+    @PostMapping("/{type}/rollback")
+    public ResponseEntity<?> rollbackSnapshot(@PathVariable String type,
+                                              @RequestBody Map<String, Object> request,
+                                              Authentication authentication) {
+        if (!isAdmin(authentication)) {
+            return ResponseEntity.status(403).body(Map.of("error", "Forbidden"));
+        }
+        try {
+            String operatorId = getOperatorId(authentication);
+            String version = String.valueOf(request.get("version"));
+            Integer expectedSnapshotId = request.get("expectedSnapshotId") instanceof Number
+                    ? ((Number) request.get("expectedSnapshotId")).intValue()
+                    : null;
+            configProfileService.rollback(type, version, expectedSnapshotId, operatorId);
+            Map<String, Object> replicas = configProfileService.confirmActiveReplicas(type);
+            return ResponseEntity.ok(Map.of(
+                    "message", "Rolled back to " + version,
+                    "replicas", replicas));
+        } catch (ConfigNotFoundException e) {
+            return ResponseEntity.status(404).body(Map.of("error", e.getMessage()));
+        } catch (ConfigConflictException e) {
+            return ResponseEntity.status(409).body(Map.of("error", e.getMessage()));
+        } catch (ConfigPublishException e) {
+            return ResponseEntity.status(500).body(Map.of("error", e.getMessage()));
+        } catch (Exception e) {
+            log.error("回滚配置失败 type={}", type, e);
+            if (e instanceof IllegalArgumentException) {
+                return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+            }
+            return ResponseEntity.status(500).body(Map.of("error", "Internal Server Error"));
+        }
+    }
+
     @DeleteMapping("/{type}/snapshots/{version}")
     public ResponseEntity<?> deleteSnapshot(@PathVariable String type,
                                             @PathVariable String version,

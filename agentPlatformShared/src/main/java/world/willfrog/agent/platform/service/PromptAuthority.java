@@ -9,6 +9,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Function;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -87,6 +88,10 @@ final class PromptAuthority {
 
     AgentLlmProperties.Prompts prompts() {
         return copyPrompts(snapshot().prompts());
+    }
+
+    Set<String> textFieldNames() {
+        return TEXT_FIELDS.keySet();
     }
 
     String expectedText(String fieldName) {

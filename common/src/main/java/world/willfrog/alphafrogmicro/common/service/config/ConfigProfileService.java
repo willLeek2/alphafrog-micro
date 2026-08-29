@@ -49,6 +49,7 @@ public class ConfigProfileService {
     private final ObjectMapper objectMapper;
     private final ConfigService nacosConfigService;
     private final StringRedisTemplate redisTemplate;
+    private final PromptHotPushValidator promptHotPushValidator = PromptHotPushValidator.shared();
 
     @Autowired
     public ConfigProfileService(ConfigTypeDao configTypeDao,
@@ -90,6 +91,7 @@ public class ConfigProfileService {
     public ConfigSnapshot derive(String typeName, String baseVersion, String patchType,
                                   JsonNode patch, String comment, String operatorId, boolean force) throws Exception {
         DerivedConfigContent derivedContent = buildDerivedContent(typeName, baseVersion, patchType, patch, force);
+        validatePromptOverrideIfNeeded(typeName, derivedContent.contentJson());
         ConfigType type = derivedContent.type();
 
         lockConfigType(type);
@@ -112,7 +114,8 @@ public class ConfigProfileService {
         // 重新读取以获取 id
         ConfigSnapshot saved = configSnapshotDao.getByTypeAndVersion(type.getId(), newVersion);
         insertAuditLog(type.getId(), "DERIVE", saved == null ? null : saved.getId(), baseVersion,
-                operatorId, comment);
+                operatorId, promptAuditReason(typeName, derivedContent.baseSnapshot().getContentJson(),
+                        derivedContent.contentJson(), baseVersion, newVersion, comment));
         log.info("[ConfigProfileService] 派生配置成功 type={} base={} new={} operator={}",
                 typeName, baseVersion, newVersion, operatorId);
         return saved;
@@ -124,6 +127,7 @@ public class ConfigProfileService {
     public Map<String, Object> previewDerive(String typeName, String baseVersion, String patchType,
                                              JsonNode patch, boolean force) throws Exception {
         DerivedConfigContent derivedContent = buildDerivedContent(typeName, baseVersion, patchType, patch, force);
+        validatePromptOverrideIfNeeded(typeName, derivedContent.contentJson());
 
         Map<String, Object> base = new LinkedHashMap<>();
         ConfigSnapshot baseSnapshot = derivedContent.baseSnapshot();
@@ -153,13 +157,14 @@ public class ConfigProfileService {
         ConfigType type = getTypeOrThrow(typeName);
 
         validateSchema(type, fullConfig);
+        String contentJson = canonicalJson(fullConfig);
+        validatePromptOverrideIfNeeded(typeName, contentJson);
 
         lockConfigType(type);
 
         int maxNum = configSnapshotDao.maxVersionNumberByType(type.getId());
         String newVersion = "v" + (maxNum + 1);
 
-        String contentJson = canonicalJson(fullConfig);
         String md5 = ConfigJsonCanonicalizer.md5Hex(contentJson);
 
         ConfigSnapshot snapshot = new ConfigSnapshot();
@@ -175,7 +180,7 @@ public class ConfigProfileService {
 
         ConfigSnapshot saved = configSnapshotDao.getByTypeAndVersion(type.getId(), newVersion);
         insertAuditLog(type.getId(), "CREATE", saved == null ? null : saved.getId(), null,
-                operatorId, comment);
+                operatorId, promptAuditReason(typeName, null, contentJson, null, newVersion, comment));
         log.info("[ConfigProfileService] 创建配置成功 type={} version={} operator={}",
                 typeName, newVersion, operatorId);
         return saved;
@@ -187,8 +192,57 @@ public class ConfigProfileService {
     @Transactional
     public void activate(String typeName, String version, Integer expectedSnapshotId,
                          String operatorId) {
+        switchActive(typeName, version, expectedSnapshotId, operatorId, "ACTIVATE");
+    }
+
+    /**
+     * 回滚到已有快照：把 Nacos 写成该快照正文，再用副本状态确认应用侧已接住。
+     */
+    @Transactional
+    public void rollback(String typeName, String version, Integer expectedSnapshotId,
+                         String operatorId) {
+        switchActive(typeName, version, expectedSnapshotId, operatorId, "ROLLBACK");
+    }
+
+    /**
+     * 推送前预检入口。校验不过抛 {@link world.willfrog.alphafrogmicro.common.exception.config.ConfigValidationException}，
+     * 调用方不得继续写入 Nacos。
+     */
+    public void validateContent(String typeName, JsonNode fullConfig) throws Exception {
+        ConfigType type = getTypeOrThrow(typeName);
+        if (fullConfig == null || fullConfig.isNull()) {
+            throw new IllegalArgumentException("配置正文为空");
+        }
+        validateSchema(type, fullConfig);
+        validatePromptOverrideIfNeeded(typeName, canonicalJson(fullConfig));
+    }
+
+    /**
+     * 应用侧确认：各副本是否已加载当前激活版本。
+     * 回滚接口把这份状态一并返回；未同步时不要把这次回滚当成应用侧已生效。
+     */
+    public Map<String, Object> confirmActiveReplicas(String typeName) {
+        return getActiveWithReplicas(typeName);
+    }
+
+    private void switchActive(String typeName, String version, Integer expectedSnapshotId,
+                              String operatorId, String action) {
         ConfigType type = getTypeOrThrow(typeName);
         ConfigSnapshot target = getSnapshotOrThrow(type, version, "目标版本不存在: " + version);
+        validatePromptOverrideIfNeeded(typeName, target.getContentJson());
+
+        String fromVersion = null;
+        String fromJson = null;
+        ConfigActive current = configActiveDao.getByType(type.getId());
+        if (current != null && current.getSnapshotId() != null) {
+            ConfigSnapshot previous = configSnapshotDao.getById(current.getSnapshotId());
+            if (previous != null) {
+                fromVersion = previous.getVersion();
+                fromJson = previous.getContentJson();
+            }
+        }
+        String reason = promptAuditReason(typeName, fromJson, target.getContentJson(),
+                fromVersion, version, null);
 
         ConfigActive active = new ConfigActive();
         active.setTypeId(type.getId());
@@ -208,10 +262,10 @@ public class ConfigProfileService {
             throw new ConfigConflictException("配置已被他人修改，expectedSnapshotId 不匹配，请刷新后重试");
         }
 
-        registerAfterCommitPublish(type, target, operatorId);
+        registerAfterCommitPublish(type, target, operatorId, action, fromVersion, reason);
 
-        log.info("[ConfigProfileService] 激活配置成功 type={} version={} snapshotId={} operator={}",
-                typeName, version, target.getId(), operatorId);
+        log.info("[ConfigProfileService] {} 配置成功 type={} version={} snapshotId={} operator={}",
+                action, typeName, version, target.getId(), operatorId);
     }
 
     /**
@@ -642,10 +696,11 @@ public class ConfigProfileService {
         return snapshot;
     }
 
-    private void registerAfterCommitPublish(ConfigType type, ConfigSnapshot target, String operatorId) {
+    private void registerAfterCommitPublish(ConfigType type, ConfigSnapshot target, String operatorId,
+                                            String action, String fromVersion, String reason) {
         if (!TransactionSynchronizationManager.isSynchronizationActive()) {
             publishToNacos(type, target, operatorId);
-            insertAuditLog(type.getId(), "ACTIVATE", target.getId(), target.getVersion(), operatorId, null);
+            insertAuditLog(type.getId(), action, target.getId(), fromVersion, operatorId, reason);
             return;
         }
 
@@ -653,17 +708,38 @@ public class ConfigProfileService {
             @Override
             public void afterCommit() {
                 publishToNacos(type, target, operatorId);
-                insertAuditLog(type.getId(), "ACTIVATE", target.getId(), target.getVersion(), operatorId, null);
+                insertAuditLog(type.getId(), action, target.getId(), fromVersion, operatorId, reason);
             }
 
             @Override
             public void afterCompletion(int status) {
                 if (status != STATUS_COMMITTED) {
                     insertAuditLog(type.getId(), "ACTIVATE_ROLLBACK", target.getId(),
-                            target.getVersion(), operatorId, "数据库事务未提交，激活已回滚");
+                            fromVersion, operatorId, "数据库事务未提交，激活已回滚");
                 }
             }
         });
+    }
+
+    private void validatePromptOverrideIfNeeded(String typeName, String contentJson) {
+        if (promptHotPushValidator.appliesTo(typeName)) {
+            promptHotPushValidator.validateContentJson(contentJson);
+        }
+    }
+
+    private String promptAuditReason(String typeName, String fromJson, String toJson,
+                                     String fromVersion, String toVersion, String comment) {
+        if (!promptHotPushValidator.appliesTo(typeName)) {
+            return comment;
+        }
+        String structured = PromptChangeAudit.reason(
+                promptHotPushValidator.diffPromptFields(fromJson, toJson),
+                fromVersion,
+                toVersion);
+        if (comment == null || comment.isBlank()) {
+            return structured;
+        }
+        return structured + " " + comment;
     }
 
     private void publishToNacos(ConfigType type, ConfigSnapshot target, String operatorId) {
