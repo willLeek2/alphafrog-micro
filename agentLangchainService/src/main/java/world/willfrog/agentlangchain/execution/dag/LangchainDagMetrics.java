@@ -11,8 +11,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 /**
  * DAG 调度的低基数指标。
  *
- * <p>不把 runId / todoId 打成标签，避免基数膨胀。gauge 反映当前进程里正在跑的那一次 DAG；
- * summary / timer 按每次调度记录。</p>
+ * <p>不把 runId / todoId 打成标签，避免基数膨胀。gauge 是当前进程内正在真正执行的节点数合计
+ * （并发多张 DAG 时加在一起）；summary / timer 按每次调度各自记录。</p>
  */
 @Component
 public class LangchainDagMetrics {
