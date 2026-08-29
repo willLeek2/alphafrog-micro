@@ -188,5 +188,7 @@ class LangchainLinearRunPipelineFailureStageTest {
         // 预期失败不走异常通道，阶段名标到失败来源的执行阶段。
         assertThat(captured).containsEntry("stage", "execute_workflow");
         assertThat(captured).containsKey("failure_class");
+        assertThat(captured.get("failure_class")).isInstanceOf(String.class);
+        assertThat((String) captured.get("failure_class")).isNotEmpty();
     }
 }
