@@ -1,0 +1,143 @@
+{
+  "_comment": "权威词表新增字段或工具名必须同步本索引。漂移目前靠一致性测试发现，不会在启动时阻止。",
+  "configType": "agent-prompt-overlay",
+  "dataId": "agent-prompt-overlay.json",
+  "group": "alphafrog-config",
+  "textFields": [
+    "agentRunSystemPrompt",
+    "followUpSummarySystemPrompt",
+    "todoPlannerSystemPromptTemplate",
+    "workflowFinalSystemPrompt",
+    "workflowTodoRecoverySystemPrompt",
+    "parallelPlannerSystemPromptTemplate",
+    "parallelFinalSystemPrompt",
+    "parallelPatchPlannerSystemPromptTemplate",
+    "planJudgeSystemPromptTemplate",
+    "planJudgeRuntimeSystemPromptTemplate",
+    "semanticJudgeSystemPromptTemplate",
+    "subAgentPlannerSystemPromptTemplate",
+    "subAgentSummarySystemPrompt",
+    "pythonRefineSystemPrompt",
+    "pythonRefineOutputInstruction",
+    "financeMethodResolverSystemPrompt",
+    "orchestratorPlanningSystemPrompt",
+    "orchestratorSummarySystemPrompt",
+    "dagReactSystemPrompt",
+    "dagModeGuidancePrompt",
+    "planningStrategyStage",
+    "planningTodosStage",
+    "dagRecoveryJudgeSystemPromptTemplate",
+    "planningAnalysisStage",
+    "planningStructuredStage",
+    "planningLinearModeGuidance",
+    "planningDagModeGuidance",
+    "planningLinearConstraint",
+    "pythonRepairStageInstruction",
+    "emptyOutputRecoveryStageInstruction",
+    "budgetLastMileStageInstruction",
+    "todoRetryContextInstruction",
+    "pythonRepairContextInstruction",
+    "toolSummarySystemPrompt",
+    "toolSummaryUserPromptTemplate",
+    "toolCapabilityCatalog"
+  ],
+  "pathFields": [],
+  "toolNames": [
+    "checkParallelLimits",
+    "executePython",
+    "getEtfAdj",
+    "getExchangeAssetDaily",
+    "getFinancialReport",
+    "getIndexDaily",
+    "getIndexInfo",
+    "getListedAssetShareSize",
+    "getOffExchangeAssetDaily",
+    "getStockDaily",
+    "getStockInfo",
+    "getStockSwIndustryInfo",
+    "getTradingDaysSummary",
+    "isTradingDay",
+    "listMyData",
+    "loadDocument",
+    "loadToolGuide",
+    "ragSearch",
+    "rereadToolResult",
+    "resolveFinanceMethods",
+    "searchAssetInfo",
+    "searchFund",
+    "searchIndex",
+    "searchStock",
+    "searchWeb",
+    "spawnSubAgent",
+    "waitForSubAgent"
+  ],
+  "placeholders": {
+    "followUpSummarySystemPrompt": [
+      "maxChars"
+    ],
+    "todoPlannerSystemPromptTemplate": [
+      "maxTodos",
+      "toolWhitelist"
+    ],
+    "parallelPlannerSystemPromptTemplate": [
+      "candidateIndex",
+      "candidateCount",
+      "maxTasks",
+      "maxSubSteps",
+      "maxParallelTasks",
+      "maxSubAgents",
+      "toolWhitelist"
+    ],
+    "subAgentPlannerSystemPromptTemplate": [
+      "maxSteps",
+      "tools"
+    ],
+    "financeMethodResolverSystemPrompt": [
+      "RESOLVER_CATALOG"
+    ],
+    "planningStrategyStage": [
+      "toolCapabilities",
+      "strategyMaxDetailLength",
+      "toolWhitelist",
+      "maxTodos"
+    ],
+    "planningTodosStage": [
+      "mode",
+      "detail",
+      "modeGuidance",
+      "toolWhitelist",
+      "maxTodos"
+    ],
+    "pythonRepairStageInstruction": [
+      "requirements"
+    ],
+    "budgetLastMileStageInstruction": [
+      "ratioPct",
+      "dimension",
+      "actual",
+      "limit"
+    ],
+    "todoRetryContextInstruction": [
+      "toolName",
+      "toolSafety",
+      "failureCategory",
+      "failureSummary",
+      "previousArguments"
+    ],
+    "pythonRepairContextInstruction": [
+      "repairAttempt",
+      "terminalStatus",
+      "exitReason",
+      "errorCode",
+      "retryable",
+      "stdoutPreview",
+      "stderrPreview",
+      "failedCodePreview"
+    ],
+    "toolSummaryUserPromptTemplate": [
+      "todoGoal",
+      "toolName",
+      "rawOutput"
+    ]
+  }
+}

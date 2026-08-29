@@ -105,6 +105,14 @@ final class PromptAuthority {
         return copyPrompts(snapshot().prompts());
     }
 
+    Set<String> textFieldNames() {
+        return TEXT_FIELDS.keySet();
+    }
+
+    Set<String> toolDescriptionNames() {
+        return snapshot().toolDescriptions().keySet();
+    }
+
     String expectedText(String fieldName) {
         String expected = baseSnapshot().texts().get(fieldName);
         if (expected == null) {

@@ -60,6 +60,9 @@ public class NacosConfigBridge {
     @Value("${agent.flow.code-refine.config-file:}")
     private String configFilePath;
 
+    /** Prompt 覆盖层的默认 Nacos dataId。这份配置被删掉时，本地文件也得一起拿掉，加载器才能回落到权威默认。 */
+    private static final String PROMPT_OVERLAY_DATA_ID = "agent-prompt-overlay.json";
+
     private final ObjectMapper objectMapper;
     private final Environment environment;
     private ConfigService configService;
@@ -146,6 +149,9 @@ public class NacosConfigBridge {
         String initialConfig = configService.getConfig(subscription.getDataId(), subscriptionGroup, 5000);
         if (initialConfig != null && !initialConfig.isBlank()) {
             writeConfigToFileIfChanged(subscription, initialConfig, "initial-load");
+        } else if (shouldDeleteLocalOnBlank(subscription)) {
+            // 启动时 Nacos 上已经没有 overlay，别把上次留下的本地文件继续当成覆盖层。
+            removeLocalTargetIfPresent(subscription);
         }
 
         configService.addListener(subscription.getDataId(), subscriptionGroup, new Listener() {
@@ -158,7 +164,12 @@ public class NacosConfigBridge {
             public void receiveConfigInfo(String config) {
                 log.info("[NacosConfigBridge] 收到配置推送 dataId={}", subscription.getDataId());
                 if (config == null || config.isBlank()) {
-                    log.warn("[NacosConfigBridge] 忽略空白配置推送 dataId={}", subscription.getDataId());
+                    if (shouldDeleteLocalOnBlank(subscription)) {
+                        // 空串不是合法 JSON，不能走写入路径（校验失败会把备份还原回来）。
+                        removeLocalTargetIfPresent(subscription);
+                    } else {
+                        log.warn("[NacosConfigBridge] 忽略空白配置推送 dataId={}", subscription.getDataId());
+                    }
                     return;
                 }
                 writeConfigToFileIfChanged(subscription, config, "listener");
@@ -188,7 +199,11 @@ public class NacosConfigBridge {
             try {
                 String latest = configService.getConfig(subscription.getDataId(), subscriptionGroup, 5000);
                 if (latest == null || latest.isBlank()) {
-                    log.warn("[NacosConfigBridge] 定时刷新忽略空白配置 dataId={}", subscription.getDataId());
+                    if (shouldDeleteLocalOnBlank(subscription)) {
+                        removeLocalTargetIfPresent(subscription);
+                    } else {
+                        log.warn("[NacosConfigBridge] 定时刷新忽略空白配置 dataId={}", subscription.getDataId());
+                    }
                     continue;
                 }
                 writeConfigToFileIfChanged(subscription, latest, "periodic-refresh");
@@ -228,6 +243,38 @@ public class NacosConfigBridge {
     private String subscriptionKey(Subscription subscription) {
         String subscriptionGroup = isBlank(subscription.getGroup()) ? group : subscription.getGroup();
         return subscription.getDataId() + "\n" + subscriptionGroup + "\n" + subscription.getTargetFile();
+    }
+
+    /**
+     * 只有 prompt overlay 这份订阅，空白内容才表示「配置被删了」。
+     * 其它 dataId 继续忽略空白，避免误删 agent-llm 等本地文件。
+     */
+    private boolean shouldDeleteLocalOnBlank(Subscription subscription) {
+        return subscription != null && PROMPT_OVERLAY_DATA_ID.equals(subscription.getDataId());
+    }
+
+    /**
+     * 删掉本地目标文件并清掉上次写入缓存。
+     * 文件不在了，PromptOverlayLoader 才会回落到权威默认。
+     */
+    private void removeLocalTargetIfPresent(Subscription subscription) {
+        if (subscription == null || isBlank(subscription.getTargetFile())) {
+            return;
+        }
+        Path targetPath = Paths.get(subscription.getTargetFile()).toAbsolutePath().normalize();
+        synchronized (lastWrittenContentBySubscription) {
+            try {
+                boolean deleted = Files.deleteIfExists(targetPath);
+                lastWrittenContentBySubscription.remove(subscriptionKey(subscription));
+                if (deleted) {
+                    log.info("[NacosConfigBridge] 配置已删除，本地文件已移除 dataId={} file={}",
+                            subscription.getDataId(), targetPath);
+                }
+            } catch (IOException e) {
+                log.warn("[NacosConfigBridge] 删除本地配置文件失败 dataId={} file={}",
+                        subscription.getDataId(), targetPath, e);
+            }
+        }
     }
 
     private void clearNacosLocalSnapshot(String dataId, String subscriptionGroup) {
