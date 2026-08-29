@@ -94,9 +94,9 @@ class LangchainTodoNodeExecutorRetryTest {
         return executor;
     }
 
-    private LangchainLinearWorkflowRequest request(
+    private LangchainWorkflowRequest request(
             dev.langchain4j.model.chat.ChatModel model, String toolName) {
-        return LangchainLinearWorkflowRequest.builder()
+        return LangchainWorkflowRequest.builder()
                 .runId("run-1")
                 .userId("user-1")
                 .userGoal("goal")

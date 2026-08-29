@@ -39,7 +39,7 @@ public class LangchainTodoNodeResult {
 
     /**
      * 结构化观测数据。empty_todo_output 场景下填充，由 executor 在 {@code try} 块内构造、在 {@code finally} 清 ThreadLocal 之前写入。
-     * 链路：LangchainTodoNodeResult → LangchainLinearWorkflowResult → publishFailure event payload
+     * 链路：LangchainTodoNodeResult → LangchainWorkflowResult → publishFailure event payload
      * （按 {@link #routeFailureMetadataField} 语义路由到 {@code budget_failure} / {@code empty_output_observation} / {@code failure_metadata} 之一）。
      */
     private Map<String, Object> failureMetadata;

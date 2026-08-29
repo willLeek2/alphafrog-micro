@@ -6,9 +6,9 @@ import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 import world.willfrog.agent.workflow.TodoItem;
-import world.willfrog.agentlangchain.orchestration.LangchainLinearWorkflowRequest;
+import world.willfrog.agentlangchain.orchestration.LangchainWorkflowRequest;
 import world.willfrog.agentlangchain.orchestration.LangchainRunExecutionGuard;
-import world.willfrog.agentlangchain.orchestration.LangchainLinearWorkflowResult;
+import world.willfrog.agentlangchain.orchestration.LangchainWorkflowResult;
 import world.willfrog.agentlangchain.orchestration.LangchainTodoNodeExecutor;
 import world.willfrog.agentlangchain.orchestration.LangchainTodoNodeResult;
 import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
@@ -50,7 +50,7 @@ class LangchainDagWorkflowExecutorTest {
                 });
         when(nodeExecutor.writeFinalAnswer(any(), any())).thenReturn("final answer");
 
-        LangchainLinearWorkflowRequest request = LangchainLinearWorkflowRequest.builder()
+        LangchainWorkflowRequest request = LangchainWorkflowRequest.builder()
                 .runId("run-dag-order")
                 .userId("user-1")
                 .userGoal("compare indices")
@@ -65,7 +65,7 @@ class LangchainDagWorkflowExecutorTest {
                 ))
                 .build();
 
-        LangchainLinearWorkflowResult result = assertTimeoutPreemptively(Duration.ofSeconds(2),
+        LangchainWorkflowResult result = assertTimeoutPreemptively(Duration.ofSeconds(2),
                 () -> executor.executePlanned(request, plan));
 
         assertThat(result.isSuccess()).isTrue();

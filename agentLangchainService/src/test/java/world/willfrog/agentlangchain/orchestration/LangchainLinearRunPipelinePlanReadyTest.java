@@ -118,7 +118,7 @@ class LangchainLinearRunPipelinePlanReadyTest {
                 .items(List.of(TodoItem.builder().id("todo_2").sequence(2).description("python").build()))
                 .build();
         when(planner.plan(any())).thenReturn(plan);
-        when(linear.executePlanned(any(), eq(plan))).thenReturn(LangchainLinearWorkflowResult.builder()
+        when(linear.executePlanned(any(), eq(plan))).thenReturn(LangchainWorkflowResult.builder()
                 .success(false)
                 .suspended(true)
                 .plan(plan)
@@ -210,7 +210,7 @@ class LangchainLinearRunPipelinePlanReadyTest {
         when(planner.plan(any())).thenReturn(plannerDagPlan);
         when(dag.executePlanned(any(), any())).thenAnswer(invocation -> {
             LangchainTodoPlan effectivePlan = invocation.getArgument(1);
-            return LangchainLinearWorkflowResult.builder()
+            return LangchainWorkflowResult.builder()
                     .success(true)
                     .finalAnswer("ok")
                     .plan(effectivePlan)
@@ -277,8 +277,10 @@ class LangchainLinearRunPipelinePlanReadyTest {
         assertThat(payload)
                 .containsEntry("execution_mode", "DAG")
                 .containsEntry("requested_execution_mode", "AUTO")
+                .containsEntry("planned_execution_mode", "DAG")
                 .containsEntry("effective_execution_mode", "DAG")
-                .containsEntry("workflow", "dag");
+                .containsEntry("workflow", "dag")
+                .containsEntry("reason", "用户未指定模式，规划结果为 DAG，按 DAG 执行");
         assertThat(payload.get("todo_count")).isEqualTo(2);
         assertThat(payload.get("plan")).isSameAs(effectivePlan);
 
@@ -384,13 +386,15 @@ class LangchainLinearRunPipelinePlanReadyTest {
         assertThat((Map<String, Object>) payloadCaptor.getValue())
                 .containsEntry("execution_mode", expectedMode.name())
                 .containsEntry("requested_execution_mode", requestedMode.name())
+                .containsEntry("planned_execution_mode", plannerPlan.getExecutionMode().name())
                 .containsEntry("effective_execution_mode", expectedMode.name())
                 .containsEntry("workflow", expectDag ? "dag" : "linear")
-                .containsEntry("plan", effectivePlan);
+                .containsEntry("plan", effectivePlan)
+                .containsEntry("reason", ExecutionModeResolver.resolve(requestedMode, plannerPlan).reason());
     }
 
-    private LangchainLinearWorkflowResult success(LangchainTodoPlan plan) {
-        return LangchainLinearWorkflowResult.builder()
+    private LangchainWorkflowResult success(LangchainTodoPlan plan) {
+        return LangchainWorkflowResult.builder()
                 .success(true)
                 .finalAnswer("ok")
                 .plan(plan)

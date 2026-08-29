@@ -437,7 +437,7 @@ class LangchainSubAgentLifecycleServiceTest {
         AgentContext.setRunId(runId);
         AgentContext.setUserId("user-1");
         AgentContext.setToolCallId(toolCallId);
-        LangchainLinearWorkflowRequest request = LangchainLinearWorkflowRequest.builder()
+        LangchainWorkflowRequest request = LangchainWorkflowRequest.builder()
                 .runId(runId)
                 .userId("user-1")
                 .userGoal("parent goal")

@@ -13,8 +13,8 @@ import world.willfrog.agent.platform.exception.AgentRunFailureClass;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 import world.willfrog.agent.workflow.TodoItem;
-import world.willfrog.agentlangchain.orchestration.LangchainLinearWorkflowRequest;
-import world.willfrog.agentlangchain.orchestration.LangchainLinearWorkflowResult;
+import world.willfrog.agentlangchain.orchestration.LangchainWorkflowRequest;
+import world.willfrog.agentlangchain.orchestration.LangchainWorkflowResult;
 import world.willfrog.agentlangchain.orchestration.LangchainRunExecutionGuard;
 import world.willfrog.agentlangchain.orchestration.LangchainTodoNodeExecutor;
 import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
@@ -79,7 +79,7 @@ class LangchainDagWorkflowExecutorUnknownDefectTest {
                 .items(List.of(item))
                 .extractedEntities(List.of())
                 .build();
-        LangchainLinearWorkflowRequest request = LangchainLinearWorkflowRequest.builder()
+        LangchainWorkflowRequest request = LangchainWorkflowRequest.builder()
                 .runId("run-dag-unknown-defect")
                 .userId("user-1")
                 .userGoal("test goal")
@@ -87,7 +87,7 @@ class LangchainDagWorkflowExecutorUnknownDefectTest {
                 .finalAnswerModel(mock(ChatModel.class))
                 .build();
 
-        LangchainLinearWorkflowResult result = executor.executePlanned(request, plan);
+        LangchainWorkflowResult result = executor.executePlanned(request, plan);
 
         assertThat(result.isSuccess()).isFalse();
         assertThat(result.getFailureReason()).contains("DAG execution failed");

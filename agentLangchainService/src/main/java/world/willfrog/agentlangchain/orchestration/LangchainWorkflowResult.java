@@ -9,7 +9,9 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * 一次线性工作流执行的完整返回值，也是 pipeline 判断“结束”还是“暂时让出线程”的边界对象。
+ * 一次工作流执行的完整返回值，也是 pipeline 判断“结束”还是“暂时让出线程”的边界对象。
+ *
+ * <p>LINEAR 和 DAG 执行器都返回这个类型。名字不再带 Linear。</p>
  *
  * <p>{@link #suspended} 为 {@code true} 时，本对象绝不能被解释成业务失败：此时外部工具仍在其他
  * 进程中执行，pipeline 只负责把下面的 todo 坐标、工具调用身份和已完成上下文写入 durable anchor，
@@ -18,7 +20,7 @@ import java.util.Map;
  */
 @Data
 @Builder
-public class LangchainLinearWorkflowResult {
+public class LangchainWorkflowResult {
     /** 正常跑到工作流终点且已得到最终回答；挂起时固定为 false。 */
     private boolean success;
     /** 恢复判定器判定为部分完成。仅 PARTIAL 终态下为 true。 */

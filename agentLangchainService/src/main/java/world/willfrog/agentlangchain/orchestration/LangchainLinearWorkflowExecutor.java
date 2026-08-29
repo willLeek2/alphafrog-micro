@@ -88,7 +88,7 @@ public class LangchainLinearWorkflowExecutor {
                 null, new CodeRefineProperties());
     }
 
-    public LangchainLinearWorkflowResult executePlanned(LangchainLinearWorkflowRequest request,
+    public LangchainWorkflowResult executePlanned(LangchainWorkflowRequest request,
                                                         LangchainTodoPlan plan) {
         validate(request);
         AtomicInteger toolCalls = new AtomicInteger();
@@ -97,7 +97,7 @@ public class LangchainLinearWorkflowExecutor {
             plan = LangchainWorkflowRouting.effectivePlan(plan, true);
             return executePlanned(request, plan, toolCalls, null, null, null);
         } catch (Exception e) {
-            return LangchainLinearWorkflowResult.builder()
+            return LangchainWorkflowResult.builder()
                     .success(false)
                     .failureReason(e.getMessage())
                     .plan(plan)
@@ -117,7 +117,7 @@ public class LangchainLinearWorkflowExecutor {
      * @param terminalConsumed 结果注入内存后执行的持久化消费确认
      * @return 继续执行后的工作流结果，也可能再次 suspended
      */
-    public LangchainLinearWorkflowResult resumePlanned(LangchainLinearWorkflowRequest request,
+    public LangchainWorkflowResult resumePlanned(LangchainWorkflowRequest request,
                                                        LangchainTodoPlan plan,
                                                        ToolJobResumeContext context,
                                                        BooleanSupplier terminalConsumed) {
@@ -136,7 +136,7 @@ public class LangchainLinearWorkflowExecutor {
             return executePlanned(request, plan, toolCalls, context, terminalConsumed, null);
         } catch (Exception e) {
             // 把恢复异常转换为普通 workflow result，由 pipeline 统一持久化。
-            return LangchainLinearWorkflowResult.builder()
+            return LangchainWorkflowResult.builder()
                     .success(false)
                     .failureReason(e.getMessage())
                     .plan(plan)
@@ -152,7 +152,7 @@ public class LangchainLinearWorkflowExecutor {
      * 服务重启后的 LINEAR 执行：复用冻结 Plan 和已完成前缀，从 checkpoint 指向的 Todo 开头重跑。
      * 这不是 ToolJob handoff，不设置 resume token，也不尝试接管崩溃前的 Sandbox 任务。
      */
-    public LangchainLinearWorkflowResult restartPlanned(LangchainLinearWorkflowRequest request,
+    public LangchainWorkflowResult restartPlanned(LangchainWorkflowRequest request,
                                                         LangchainTodoPlan plan,
                                                         WorkflowExecutionCheckpoint checkpoint) {
         validate(request);
@@ -164,7 +164,7 @@ public class LangchainLinearWorkflowExecutor {
             applyRunContext(request);
             return executePlanned(request, plan, toolCalls, null, null, checkpoint);
         } catch (Exception e) {
-            return LangchainLinearWorkflowResult.builder()
+            return LangchainWorkflowResult.builder()
                     .success(false)
                     .failureReason(e.getMessage())
                     .plan(plan)
@@ -175,7 +175,7 @@ public class LangchainLinearWorkflowExecutor {
         }
     }
 
-    private LangchainLinearWorkflowResult executePlanned(LangchainLinearWorkflowRequest request,
+    private LangchainWorkflowResult executePlanned(LangchainWorkflowRequest request,
                                                          LangchainTodoPlan plan,
                                                          AtomicInteger toolCalls,
                                                          ToolJobResumeContext resumeContext,
@@ -340,7 +340,7 @@ public class LangchainLinearWorkflowExecutor {
                         "TODO_NODE_SUSPENDED", item, "external_tool_job_pending", nodeDurationMs,
                         null, false, null);
                 // result 只携带堆内上下文；pipeline 下一步负责原子写入 durable anchor。
-                return LangchainLinearWorkflowResult.builder()
+                return LangchainWorkflowResult.builder()
                         .success(false)
                         .suspended(true)
                         .plan(plan)
@@ -395,7 +395,7 @@ public class LangchainLinearWorkflowExecutor {
         if (isBlank(finalAnswer)) {
             return failure(plan, completedTodos, "empty_final_answer", toolCalls.get(), null);
         }
-        return LangchainLinearWorkflowResult.builder()
+        return LangchainWorkflowResult.builder()
                 .success(true)
                 .finalAnswer(finalAnswer.trim())
                 .plan(plan)
@@ -404,7 +404,7 @@ public class LangchainLinearWorkflowExecutor {
                 .build();
     }
 
-    private void persistWorkflowCheckpoint(LangchainLinearWorkflowRequest request,
+    private void persistWorkflowCheckpoint(LangchainWorkflowRequest request,
                                            LangchainTodoPlan plan,
                                            List<LangchainCompletedTodo> completedTodos,
                                            int toolCallsUsed) {
@@ -510,12 +510,12 @@ public class LangchainLinearWorkflowExecutor {
         return context.isTerminalSuccess() ? "external tool completed" : "external tool failed";
     }
 
-    private LangchainLinearWorkflowResult failure(LangchainTodoPlan plan,
+    private LangchainWorkflowResult failure(LangchainTodoPlan plan,
                                                   List<LangchainCompletedTodo> completedTodos,
                                                   String reason,
                                                   int toolCallsUsed,
                                                   Map<String, Object> failureMetadata) {
-        return LangchainLinearWorkflowResult.builder()
+        return LangchainWorkflowResult.builder()
                 .success(false)
                 .failureReason(reason)
                 .plan(plan)
@@ -537,7 +537,7 @@ public class LangchainLinearWorkflowExecutor {
      * failureMetadata 来源：{@link LangchainTodoNodeExecutor#extractBudgetFailureMetadata} 写入的
      * {@code budget_exceeded=true, dimension, actual, limit, ratio, partial} 子 map。
      */
-    private LangchainLinearWorkflowResult handleBudgetExhaustion(LangchainLinearWorkflowRequest request,
+    private LangchainWorkflowResult handleBudgetExhaustion(LangchainWorkflowRequest request,
                                                                   LangchainTodoPlan plan,
                                                                   List<LangchainCompletedTodo> completedTodos,
                                                                   String reason,
@@ -555,7 +555,7 @@ public class LangchainLinearWorkflowExecutor {
                     LangchainBudgetPartialAnswerBuilder.build(completedTodos);
             String partialReason = "RUN_BUDGET_EXCEEDED:" + dimension + ":" + actual + "/" + limit
                     + " — partial answer built from " + partial.includedTodoCount() + " completed todo(s)";
-            LangchainLinearWorkflowResult result = LangchainLinearWorkflowResult.builder()
+            LangchainWorkflowResult result = LangchainWorkflowResult.builder()
                     .success(false)
                     .partial(true)
                     .failureReason(partialReason)
@@ -591,7 +591,7 @@ public class LangchainLinearWorkflowExecutor {
         // completedTodos 空：没有可拼的部分答案，立即失败。
         String failedReason = "RUN_BUDGET_EXCEEDED:" + dimension + ":" + actual + "/" + limit
                 + " — no completed todo, fail-fast";
-        LangchainLinearWorkflowResult result = LangchainLinearWorkflowResult.builder()
+        LangchainWorkflowResult result = LangchainWorkflowResult.builder()
                 .success(false)
                 .failureReason(failedReason)
                 .plan(plan)
@@ -641,11 +641,11 @@ public class LangchainLinearWorkflowExecutor {
         return 0.0;
     }
 
-    private LangchainLinearWorkflowResult interrupted(LangchainTodoPlan plan,
+    private LangchainWorkflowResult interrupted(LangchainTodoPlan plan,
                                                       List<LangchainCompletedTodo> completedTodos,
                                                       String controlStatus,
                                                       int toolCallsUsed) {
-        return LangchainLinearWorkflowResult.builder()
+        return LangchainWorkflowResult.builder()
                 .success(false)
                 .interrupted(true)
                 .failureReason("RUN_INTERRUPTED:" + controlStatus)
@@ -655,7 +655,7 @@ public class LangchainLinearWorkflowExecutor {
                 .build();
     }
 
-    private void applyRunContext(LangchainLinearWorkflowRequest request) {
+    private void applyRunContext(LangchainWorkflowRequest request) {
         if (!isBlank(request.getRunId())) {
             AgentContext.setRunId(request.getRunId());
         }
@@ -665,7 +665,7 @@ public class LangchainLinearWorkflowExecutor {
         AgentContext.setWebSearchEnabled(Boolean.TRUE.equals(request.getWebSearchEnabled()));
     }
 
-    private void validate(LangchainLinearWorkflowRequest request) {
+    private void validate(LangchainWorkflowRequest request) {
         if (request == null) {
             throw new IllegalArgumentException("linear_workflow_request_required");
         }

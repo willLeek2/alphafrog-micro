@@ -56,7 +56,7 @@ public final class LangchainBudgetPartialAnswerBuilder {
      * 从 completedTodos 拼 deterministic partial answer。空列表返回空字符串 + 全零统计。
      *
      * @param completedTodos 当前 run 已经成功完成的 todo（output 可能为 null/blank，会跳过）
-     * @return 拼接结果；finalAnswer 已是 trimmed，可直接写入 LangchainLinearWorkflowResult.finalAnswer
+     * @return 拼接结果；finalAnswer 已是 trimmed，可直接写入 LangchainWorkflowResult.finalAnswer
      */
     public static PartialAnswer build(List<LangchainCompletedTodo> completedTodos) {
         List<LangchainCompletedTodo> safeTodos = completedTodos == null ? List.of() : completedTodos;

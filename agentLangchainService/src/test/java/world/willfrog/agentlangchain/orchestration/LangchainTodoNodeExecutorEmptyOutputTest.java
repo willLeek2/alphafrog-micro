@@ -59,7 +59,7 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
         QueueChatModel model = new QueueChatModel("   ", "RECOVERED_ANSWER");
         LangchainTodoNodeExecutor executor = LangchainTestFixtures.todoNodeExecutor();
 
-        LangchainLinearWorkflowRequest request = baseRequest(model);
+        LangchainWorkflowRequest request = baseRequest(model);
         TodoItem item = todo("todo_1", 1, "分析指数");
         AtomicInteger toolCalls = new AtomicInteger();
 
@@ -79,7 +79,7 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
         QueueChatModel model = new QueueChatModel("   ", "   ");
         LangchainTodoNodeExecutor executor = LangchainTestFixtures.todoNodeExecutor();
 
-        LangchainLinearWorkflowRequest request = baseRequest(model);
+        LangchainWorkflowRequest request = baseRequest(model);
         TodoItem item = todo("todo_2", 1, "分析指数");
         AtomicInteger toolCalls = new AtomicInteger();
 
@@ -100,7 +100,7 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
         QueueChatModel model = new QueueChatModel("   ", new RuntimeException("LLM down"));
         LangchainTodoNodeExecutor executor = LangchainTestFixtures.todoNodeExecutor();
 
-        LangchainLinearWorkflowRequest request = baseRequest(model);
+        LangchainWorkflowRequest request = baseRequest(model);
         TodoItem item = todo("todo_3", 1, "分析指数");
         AtomicInteger toolCalls = new AtomicInteger();
 
@@ -122,7 +122,7 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
         QueueChatModel model = new QueueChatModel("   ", "RECOVERED_ANSWER");
         LangchainTodoNodeExecutor executor = LangchainTestFixtures.todoNodeExecutor();
 
-        LangchainLinearWorkflowRequest request = LangchainLinearWorkflowRequest.builder()
+        LangchainWorkflowRequest request = LangchainWorkflowRequest.builder()
                 .runId("run-1")
                 .userId("user-1")
                 .userGoal("分析指数")
@@ -175,7 +175,7 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
         LangchainTodoNodeExecutor executor = LangchainTestFixtures.todoNodeExecutor(
                 java.util.Optional.of(toolProvider));
 
-        LangchainLinearWorkflowRequest request = LangchainLinearWorkflowRequest.builder()
+        LangchainWorkflowRequest request = LangchainWorkflowRequest.builder()
                 .runId("run-1")
                 .userId("user-1")
                 .userGoal("分析指数")
@@ -221,7 +221,7 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
         };
         LangchainTodoNodeExecutor executor = LangchainTestFixtures.todoNodeExecutor();
 
-        LangchainLinearWorkflowRequest request = baseRequest(model);
+        LangchainWorkflowRequest request = baseRequest(model);
         TodoItem item = todo("todo_parallel", 1, "分析");
         int callsBefore = toolCalls.get();
 
@@ -255,7 +255,7 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
                 LangchainTestFixtures.noopFinanceResultComposer());
 
         QueueChatModel model = new QueueChatModel("   ");
-        LangchainLinearWorkflowRequest request = baseRequest(model);
+        LangchainWorkflowRequest request = baseRequest(model);
         TodoItem item = todo("todo_cancel", 1, "分析");
         AtomicInteger toolCalls = new AtomicInteger();
 
@@ -284,7 +284,7 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
                 LangchainTestFixtures.noopFinanceResultComposer());
 
         QueueChatModel model = new QueueChatModel("   ");
-        LangchainLinearWorkflowRequest request = baseRequest(model);
+        LangchainWorkflowRequest request = baseRequest(model);
         TodoItem item = todo("todo_5", 1, "分析");
         AtomicInteger toolCalls = new AtomicInteger();
 
@@ -315,7 +315,7 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
                 LangchainTestFixtures.noopFinanceResultComposer());
 
         QueueChatModel model = new QueueChatModel("   ", "RECOVERED");
-        LangchainLinearWorkflowRequest request = baseRequest(model);
+        LangchainWorkflowRequest request = baseRequest(model);
         TodoItem item = todo("todo_low_usage", 1, "分析");
         AtomicInteger toolCalls = new AtomicInteger();
 
@@ -345,7 +345,7 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
                 LangchainTestFixtures.noopFinanceResultComposer());
 
         QueueChatModel model = new QueueChatModel("   ");
-        LangchainLinearWorkflowRequest request = baseRequest(model);
+        LangchainWorkflowRequest request = baseRequest(model);
         TodoItem item = todo("todo_near_threshold", 1, "分析");
         AtomicInteger toolCalls = new AtomicInteger();
 
@@ -376,7 +376,7 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
                 LangchainTestFixtures.noopFinanceResultComposer());
 
         QueueChatModel model = new QueueChatModel("   ");
-        LangchainLinearWorkflowRequest request = baseRequest(model);
+        LangchainWorkflowRequest request = baseRequest(model);
         TodoItem item = todo("todo_exceeded", 1, "分析");
         AtomicInteger toolCalls = new AtomicInteger();
 
@@ -398,7 +398,7 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
         QueueChatModel model = new QueueChatModel((String) null);
         LangchainTodoNodeExecutor executor = LangchainTestFixtures.todoNodeExecutor();
 
-        LangchainLinearWorkflowRequest request = baseRequest(model);
+        LangchainWorkflowRequest request = baseRequest(model);
         TodoItem item = todo("todo_6", 1, "分析");
         AtomicInteger toolCalls = new AtomicInteger();
 
@@ -417,7 +417,7 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
         QueueChatModel model = new QueueChatModel("   \n\t  ");
         LangchainTodoNodeExecutor executor = LangchainTestFixtures.todoNodeExecutor();
 
-        LangchainLinearWorkflowRequest request = baseRequest(model);
+        LangchainWorkflowRequest request = baseRequest(model);
         TodoItem item = todo("todo_7", 1, "分析");
         AtomicInteger toolCalls = new AtomicInteger();
 
@@ -445,7 +445,7 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
         completed.add(LangchainCompletedTodo.builder()
                 .todoId("t1").sequence(1).description("").output("REAL_DATA_12345").summary("").build());
 
-        LangchainLinearWorkflowRequest request = baseRequest(model);
+        LangchainWorkflowRequest request = baseRequest(model);
         TodoItem item = todo("todo_8", 2, "下一步");
         AtomicInteger toolCalls = new AtomicInteger();
 
@@ -460,8 +460,8 @@ class LangchainTodoNodeExecutorEmptyOutputTest {
 
     // ========== 辅助方法 ==========
 
-    private static LangchainLinearWorkflowRequest baseRequest(ChatModel model) {
-        return LangchainLinearWorkflowRequest.builder()
+    private static LangchainWorkflowRequest baseRequest(ChatModel model) {
+        return LangchainWorkflowRequest.builder()
                 .runId("run-1")
                 .userId("user-1")
                 .userGoal("分析指数")

@@ -43,7 +43,7 @@ class LangchainTodoNodeExecutorFinalAnswerComposerTest {
                 .thenReturn("模型最终答案\n\n| 方法 | 结果 | 如何计算 |\n|---|---:|---|\n| M | 1 | H |");
         LangchainTodoNodeExecutor executor = newExecutor(composer);
 
-        LangchainLinearWorkflowRequest request = LangchainLinearWorkflowRequest.builder()
+        LangchainWorkflowRequest request = LangchainWorkflowRequest.builder()
                 .runId("run-x")
                 .userId("user-y")
                 .userGoal("分析指数")
@@ -63,7 +63,7 @@ class LangchainTodoNodeExecutorFinalAnswerComposerTest {
                 .thenAnswer(invocation -> invocation.getArgument(2));
         LangchainTodoNodeExecutor executor = newExecutor(composer);
 
-        LangchainLinearWorkflowRequest request = LangchainLinearWorkflowRequest.builder()
+        LangchainWorkflowRequest request = LangchainWorkflowRequest.builder()
                 .runId("run-no-records")
                 .userId("user-z")
                 .userGoal("分析指数")
@@ -86,7 +86,7 @@ class LangchainTodoNodeExecutorFinalAnswerComposerTest {
         LangchainTodoNodeExecutor executor = newExecutor(composer);
         FixedChatModel model = new FixedChatModel("最终答案");
 
-        LangchainLinearWorkflowRequest request = LangchainLinearWorkflowRequest.builder()
+        LangchainWorkflowRequest request = LangchainWorkflowRequest.builder()
                 .runId("run-prompt")
                 .userId("user-p")
                 .userGoal("分析指数")

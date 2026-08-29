@@ -71,7 +71,7 @@ class LangchainLinearRunPipelineRegistryResetTest {
                 .executionMode(PlanExecutionMode.LINEAR)
                 .items(List.of(TodoItem.builder().id("t1").sequence(1).description("x").build()))
                 .build());
-        when(linear.executePlanned(any(), any())).thenReturn(LangchainLinearWorkflowResult.builder()
+        when(linear.executePlanned(any(), any())).thenReturn(LangchainWorkflowResult.builder()
                 .success(true)
                 .finalAnswer("ok")
                 .build());

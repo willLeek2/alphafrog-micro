@@ -12,8 +12,8 @@ import world.willfrog.agent.platform.service.AgentPromptService;
 import world.willfrog.agent.workflow.TodoItem;
 import world.willfrog.agent.workflow.TodoStatus;
 import world.willfrog.agentlangchain.orchestration.LangchainCompletedTodo;
-import world.willfrog.agentlangchain.orchestration.LangchainLinearWorkflowRequest;
-import world.willfrog.agentlangchain.orchestration.LangchainLinearWorkflowResult;
+import world.willfrog.agentlangchain.orchestration.LangchainWorkflowRequest;
+import world.willfrog.agentlangchain.orchestration.LangchainWorkflowResult;
 import world.willfrog.agentlangchain.orchestration.LangchainRunExecutionGuard;
 import world.willfrog.agentlangchain.orchestration.LangchainTodoNodeExecutor;
 import world.willfrog.agentlangchain.orchestration.LangchainTodoNodeResult;
@@ -121,7 +121,7 @@ public class LangchainDagWorkflowExecutor {
      * @param plan    planner 生成的 todo 计划，包含 items 及其依赖关系
      * @return 工作流执行结果，成功时包含 finalAnswer（最终答案），失败时包含 failureReason
      */
-    public LangchainLinearWorkflowResult executePlanned(LangchainLinearWorkflowRequest request,
+    public LangchainWorkflowResult executePlanned(LangchainWorkflowRequest request,
                                                         LangchainTodoPlan plan) {
         validate(request, plan);
         // toolCalls 是原子计数器，整个 DAG 的所有节点与恢复判定器共享，各自累加自己的工具调用次数
@@ -169,7 +169,7 @@ public class LangchainDagWorkflowExecutor {
                             nvl(firstFailedReason(parallelRun.results())), budgetMeta, toolCalls.get());
                 }
                 if (recoveryJudgeEnabled) {
-                    LangchainLinearWorkflowResult judgeResult = tryRecoveryJudge(
+                    LangchainWorkflowResult judgeResult = tryRecoveryJudge(
                             request, plan, graph, items, parallelRun.results(), sharedContext,
                             completedTodos, toolCalls, runId, userId);
                     if (judgeResult != null) {
@@ -212,7 +212,7 @@ public class LangchainDagWorkflowExecutor {
             if (!isBlank(runId) && !isBlank(userId)) {
                 appendDagCompleted(runId, userId, true, null, toolCalls.get());
             }
-            return LangchainLinearWorkflowResult.builder()
+            return LangchainWorkflowResult.builder()
                     .success(true)
                     .finalAnswer(finalAnswer.trim())
                     .plan(plan)
@@ -221,7 +221,7 @@ public class LangchainDagWorkflowExecutor {
                     .build();
         } catch (Exception e) {
             log.error("LangChain DAG workflow failed", e);
-            return LangchainLinearWorkflowResult.builder()
+            return LangchainWorkflowResult.builder()
                     .success(false)
                     .failureReason(e.getMessage())
                     .plan(plan)
@@ -258,7 +258,7 @@ public class LangchainDagWorkflowExecutor {
      */
     private DagParallelRun executeDagParallel(LangchainDagExecutionGraph graph,
                                               List<TodoItem> items,
-                                              LangchainLinearWorkflowRequest request,
+                                              LangchainWorkflowRequest request,
                                               LangchainDagSharedContext sharedContext,
                                               AtomicInteger toolCalls) throws Exception {
         return executeDagParallel(graph, items, request, sharedContext, toolCalls,
@@ -276,7 +276,7 @@ public class LangchainDagWorkflowExecutor {
      */
     private DagParallelRun executeDagParallel(LangchainDagExecutionGraph graph,
                                               List<TodoItem> items,
-                                              LangchainLinearWorkflowRequest request,
+                                              LangchainWorkflowRequest request,
                                               LangchainDagSharedContext sharedContext,
                                               AtomicInteger toolCalls,
                                               Map<String, LangchainTodoNodeResult> preResults,
@@ -337,7 +337,7 @@ public class LangchainDagWorkflowExecutor {
     private CompletableFuture<Void> scheduleNode(LangchainDagExecutionGraph graph,
                                                  List<TodoItem> items,
                                                  TodoItem item,
-                                                 LangchainLinearWorkflowRequest request,
+                                                 LangchainWorkflowRequest request,
                                                  LangchainDagSharedContext sharedContext,
                                                  AtomicInteger toolCalls,
                                                  Map<String, LangchainTodoNodeResult> results,
@@ -391,7 +391,7 @@ public class LangchainDagWorkflowExecutor {
     private void executeNode(LangchainDagExecutionGraph graph,
                              List<TodoItem> items,
                              TodoItem item,
-                             LangchainLinearWorkflowRequest request,
+                             LangchainWorkflowRequest request,
                              LangchainDagSharedContext sharedContext,
                              AtomicInteger toolCalls,
                              Map<String, LangchainTodoNodeResult> results,
@@ -571,8 +571,8 @@ public class LangchainDagWorkflowExecutor {
      * @return PARTIAL 结果（同意跳过）、null（不同意，走原有失败路径）、
      *         或原始 failure 结果（判定调用本身失败）
      */
-    private LangchainLinearWorkflowResult tryRecoveryJudge(
-            LangchainLinearWorkflowRequest request,
+    private LangchainWorkflowResult tryRecoveryJudge(
+            LangchainWorkflowRequest request,
             LangchainTodoPlan plan,
             LangchainDagExecutionGraph graph,
             List<TodoItem> items,
@@ -743,7 +743,7 @@ public class LangchainDagWorkflowExecutor {
             String finalAnswer = todoNodeExecutor.writeFinalAnswer(request, allCompleted);
 
             appendDagCompletedPartial(runId, userId, "PARTIAL by recovery judge", toolCalls.get());
-            return LangchainLinearWorkflowResult.builder()
+            return LangchainWorkflowResult.builder()
                     .success(false)
                     .partial(true)
                     .failureReason("PARTIAL by recovery judge: " + truncatedRationale)
@@ -785,7 +785,7 @@ public class LangchainDagWorkflowExecutor {
             LangchainDagExecutionGraph graph,
             Map<String, LangchainTodoNodeResult> results,
             LangchainDagSharedContext sharedContext,
-            LangchainLinearWorkflowRequest request) {
+            LangchainWorkflowRequest request) {
 
         StringBuilder sb = new StringBuilder();
         sb.append("【用户目标】\n").append(request.getUserGoal()).append("\n\n");
@@ -880,11 +880,11 @@ public class LangchainDagWorkflowExecutor {
     /**
      * 构建失败结果对象。
      */
-    private LangchainLinearWorkflowResult failure(LangchainTodoPlan plan,
+    private LangchainWorkflowResult failure(LangchainTodoPlan plan,
                                                   List<LangchainCompletedTodo> completedTodos,
                                                   String reason,
                                                   int toolCallsUsed) {
-        return LangchainLinearWorkflowResult.builder()
+        return LangchainWorkflowResult.builder()
                 .success(false)
                 .failureReason(reason)
                 .plan(plan)
@@ -897,12 +897,12 @@ public class LangchainDagWorkflowExecutor {
      * 带 failureMetadata 的失败重载，让额度等结构化失败原因能透传到 pipeline。
      * 原 4 参 failure() 保留，供 DAG 普通失败路径（非额度）继续走。
      */
-    private LangchainLinearWorkflowResult failure(LangchainTodoPlan plan,
+    private LangchainWorkflowResult failure(LangchainTodoPlan plan,
                                                   List<LangchainCompletedTodo> completedTodos,
                                                   String reason,
                                                   int toolCallsUsed,
                                                   Map<String, Object> failureMetadata) {
-        return LangchainLinearWorkflowResult.builder()
+        return LangchainWorkflowResult.builder()
                 .success(false)
                 .failureReason(reason)
                 .plan(plan)
@@ -915,11 +915,11 @@ public class LangchainDagWorkflowExecutor {
     /**
      * 构建被中断结果对象（用户 cancel/pause）。
      */
-    private LangchainLinearWorkflowResult interrupted(LangchainTodoPlan plan,
+    private LangchainWorkflowResult interrupted(LangchainTodoPlan plan,
                                                       List<LangchainCompletedTodo> completedTodos,
                                                       String controlStatus,
                                                       int toolCallsUsed) {
-        return LangchainLinearWorkflowResult.builder()
+        return LangchainWorkflowResult.builder()
                 .success(false)
                 .interrupted(true)
                 .failureReason("RUN_INTERRUPTED:" + controlStatus)
@@ -965,7 +965,7 @@ public class LangchainDagWorkflowExecutor {
      * DAG 端额度用尽降级，逻辑与 Linear 一致（共用 {@link LangchainBudgetPartialAnswerBuilder}）。
      * 区别：还会发 {@code DAG_EXECUTION_COMPLETED} 事件（部分完成 / 立即失败）保持与普通 DAG 完成事件兼容。
      */
-    private LangchainLinearWorkflowResult handleBudgetExhaustion(LangchainLinearWorkflowRequest request,
+    private LangchainWorkflowResult handleBudgetExhaustion(LangchainWorkflowRequest request,
                                                                   LangchainTodoPlan plan,
                                                                   List<LangchainCompletedTodo> completedTodos,
                                                                   String reason,
@@ -983,7 +983,7 @@ public class LangchainDagWorkflowExecutor {
                     LangchainBudgetPartialAnswerBuilder.build(completedTodos);
             String partialReason = "RUN_BUDGET_EXCEEDED:" + dimension + ":" + actual + "/" + limit
                     + " — partial answer built from " + partial.includedTodoCount() + " completed todo(s)";
-            LangchainLinearWorkflowResult result = LangchainLinearWorkflowResult.builder()
+            LangchainWorkflowResult result = LangchainWorkflowResult.builder()
                     .success(false)
                     .partial(true)
                     .failureReason(partialReason)
@@ -1019,7 +1019,7 @@ public class LangchainDagWorkflowExecutor {
 
         String failedReason = "RUN_BUDGET_EXCEEDED:" + dimension + ":" + actual + "/" + limit
                 + " — no completed todo, fail-fast";
-        LangchainLinearWorkflowResult result = LangchainLinearWorkflowResult.builder()
+        LangchainWorkflowResult result = LangchainWorkflowResult.builder()
                 .success(false)
                 .failureReason(failedReason)
                 .plan(plan)
@@ -1074,7 +1074,7 @@ public class LangchainDagWorkflowExecutor {
      * 将 request 中的 runId/userId/webSearchEnabled 设置到 AgentContext。
      * 在 DAG 执行开始前调用，使 observability trace 能关联到正确的 run。
      */
-    private void applyRunContext(LangchainLinearWorkflowRequest request) {
+    private void applyRunContext(LangchainWorkflowRequest request) {
         if (!isBlank(request.getRunId())) {
             AgentContext.setRunId(request.getRunId());
         }
@@ -1091,7 +1091,7 @@ public class LangchainDagWorkflowExecutor {
      * user goal（用户目标）非空。任何一项不满足都抛出 IllegalArgumentException，
      * 由上层 {@link #executePlanned} 的 catch 块捕获并包装为失败结果。</p>
      */
-    private void validate(LangchainLinearWorkflowRequest request, LangchainTodoPlan plan) {
+    private void validate(LangchainWorkflowRequest request, LangchainTodoPlan plan) {
         if (request == null) {
             throw new IllegalArgumentException("dag_workflow_request_required");
         }

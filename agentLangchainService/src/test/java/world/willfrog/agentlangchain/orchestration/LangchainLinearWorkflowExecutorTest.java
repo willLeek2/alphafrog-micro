@@ -44,8 +44,8 @@ class LangchainLinearWorkflowExecutorTest {
                 .extractedEntities(List.of("沪深300"))
                 .build();
 
-        LangchainLinearWorkflowResult result = executor.executePlanned(
-                LangchainLinearWorkflowRequest.builder()
+        LangchainWorkflowResult result = executor.executePlanned(
+                LangchainWorkflowRequest.builder()
                         .runId("run-linear-1")
                         .userId("user-1")
                         .userGoal("分析沪深300")
@@ -83,8 +83,8 @@ class LangchainLinearWorkflowExecutorTest {
                 .extractedEntities(List.of())
                 .build();
 
-        LangchainLinearWorkflowResult result = executor.executePlanned(
-                LangchainLinearWorkflowRequest.builder()
+        LangchainWorkflowResult result = executor.executePlanned(
+                LangchainWorkflowRequest.builder()
                         .userGoal("分析")
                         .model(model)
                         .build(),
@@ -114,8 +114,8 @@ class LangchainLinearWorkflowExecutorTest {
                 .extractedEntities(List.of("沪深300"))
                 .build();
 
-        LangchainLinearWorkflowResult result = executor.executePlanned(
-                LangchainLinearWorkflowRequest.builder()
+        LangchainWorkflowResult result = executor.executePlanned(
+                LangchainWorkflowRequest.builder()
                         .runId("run-dataset-1")
                         .userId("user-1")
                         .userGoal("计算收益")
@@ -146,8 +146,8 @@ class LangchainLinearWorkflowExecutorTest {
         TodoItem todo = TodoItem.builder().id("todo_2").sequence(2).description("long python").build();
         LangchainTodoPlan plan = LangchainTodoPlan.builder().items(List.of(todo)).build();
 
-        LangchainLinearWorkflowResult result = executor.executePlanned(
-                LangchainLinearWorkflowRequest.builder()
+        LangchainWorkflowResult result = executor.executePlanned(
+                LangchainWorkflowRequest.builder()
                         .runId("run-pending")
                         .userId("user-1")
                         .userGoal("analyze")
@@ -176,7 +176,7 @@ class LangchainLinearWorkflowExecutorTest {
         };
 
         LangchainTodoNodeResult result = LangchainTestFixtures.todoNodeExecutor().execute(
-                LangchainLinearWorkflowRequest.builder()
+                LangchainWorkflowRequest.builder()
                         .runId("run-pending")
                         .userId("user-1")
                         .userGoal("analyze")
