@@ -5,10 +5,15 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.util.PromptFileLoader;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.HashSet;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.function.Function;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -19,6 +24,10 @@ import java.util.HexFormat;
  *
  * <p>YAML 和外置目录只允许保存权威正文的投影。这个类统一加载关键 Prompt，
  * 并在投影内容为空或与权威正文不一致时失败，避免不同启动路径得到不同模型指令。</p>
+ *
+ * <p>运行时覆盖：classpath 是默认版本与评审基线；{@link #applyOverlay} 在此之上
+ * 叠加一份已通过加载校验的覆盖（文本字段 + 工具说明），消费方一律读叠加后的生效版本，
+ * 覆盖缺失或被清除时自动回到默认版本。投影校验始终对着默认版本，不受覆盖影响。</p>
  */
 final class PromptAuthority {
 
@@ -69,7 +78,14 @@ final class PromptAuthority {
 
     private final Function<String, String> resourceLoader;
     private final ObjectMapper objectMapper;
+    /** 生效快照：默认版本叠加运行时覆盖后的结果；未叠加时等于默认快照。 */
     private volatile AuthoritySnapshot cached;
+    /** 默认快照：只读 classpath 权威资源，是投影校验与覆盖叠加的基线，一经加载不再变化。 */
+    private volatile AuthoritySnapshot base;
+    /** 近期生效版本的指纹留存：推送新覆盖后，在途 Run 冻结的旧指纹仍可通过一致性校验。 */
+    private final ArrayDeque<SelectionDigest> digestHistory = new ArrayDeque<>();
+    private static final int DIGEST_HISTORY_LIMIT = 8;
+    private static final Pattern PLACEHOLDER_PATTERN = Pattern.compile("\\{\\{([A-Za-z0-9_]+)\\}\\}");
 
     private PromptAuthority(Function<String, String> resourceLoader, ObjectMapper objectMapper) {
         this.resourceLoader = resourceLoader;
@@ -89,8 +105,16 @@ final class PromptAuthority {
         return copyPrompts(snapshot().prompts());
     }
 
+    Set<String> textFieldNames() {
+        return TEXT_FIELDS.keySet();
+    }
+
+    Set<String> toolDescriptionNames() {
+        return snapshot().toolDescriptions().keySet();
+    }
+
     String expectedText(String fieldName) {
-        String expected = snapshot().texts().get(fieldName);
+        String expected = baseSnapshot().texts().get(fieldName);
         if (expected == null) {
             throw new PromptConfigurationException("unknown_field", "未知 Prompt 字段 " + fieldName);
         }
@@ -98,19 +122,40 @@ final class PromptAuthority {
     }
 
     List<String> expectedRequirements() {
-        return new ArrayList<>(snapshot().prompts().getPythonRefineRequirements());
+        return new ArrayList<>(baseSnapshot().prompts().getPythonRefineRequirements());
     }
 
     List<AgentLlmProperties.DatasetFieldSpec> expectedDatasetFieldSpecs() {
-        return copyPrompts(snapshot().prompts()).getDatasetFieldSpecs();
+        return copyPrompts(baseSnapshot().prompts()).getDatasetFieldSpecs();
     }
 
     String bundleDigest() {
-        return digest(snapshot().texts());
+        return digestOf(snapshot());
     }
 
     String capabilityCatalogDigest() {
-        return sha256(expectedText("toolCapabilityCatalog"));
+        return sha256(snapshot().texts().get("toolCapabilityCatalog"));
+    }
+
+    /** 默认版本（未叠加覆盖）的整体指纹，供覆盖文档溯源比对与审计。 */
+    String baseBundleDigest() {
+        return digestOf(baseSnapshot());
+    }
+
+    /**
+     * 指纹是否属于当前生效版本或近期留存的生效版本。
+     * 推送新覆盖后，在途 Run 冻结的旧指纹靠这里继续通过消费前校验，不被推送打断。
+     */
+    boolean retainsSelection(String bundleDigest, String capabilityCatalogDigest) {
+        synchronized (this) {
+            for (SelectionDigest entry : digestHistory) {
+                if (entry.bundleDigest().equals(bundleDigest)
+                        && entry.capabilityCatalogDigest().equals(capabilityCatalogDigest)) {
+                    return true;
+                }
+            }
+            return false;
+        }
     }
 
     void validateText(String fieldName, String text, String source) {
@@ -212,9 +257,22 @@ final class PromptAuthority {
         }
         synchronized (this) {
             if (cached == null) {
-                cached = loadSnapshot();
+                cached = baseSnapshot();
             }
             return cached;
+        }
+    }
+
+    private AuthoritySnapshot baseSnapshot() {
+        AuthoritySnapshot current = base;
+        if (current != null) {
+            return current;
+        }
+        synchronized (this) {
+            if (base == null) {
+                base = loadSnapshot();
+            }
+            return base;
         }
     }
 
@@ -223,6 +281,14 @@ final class PromptAuthority {
         TEXT_FIELDS.forEach((field, resource) -> texts.put(field, requireResource(resource)));
 
         AgentLlmProperties.Prompts prompts = new AgentLlmProperties.Prompts();
+        prompts.setPythonRefineRequirements(readRequirements(requireResource(REQUIREMENTS_RESOURCE)));
+        prompts.setDatasetFieldSpecs(readDatasetSpecs(requireResource(DATASET_SPECS_RESOURCE)));
+        applyTexts(prompts, texts);
+        return new AuthoritySnapshot(Map.copyOf(texts), prompts, loadToolDescriptions());
+    }
+
+    /** 把文本字段集装进 Prompts 对象；结构化字段（需求清单/字段规格）由调用方继承基线。 */
+    private static void applyTexts(AgentLlmProperties.Prompts prompts, Map<String, String> texts) {
         prompts.setAgentRunSystemPrompt(texts.get("agentRunSystemPrompt"));
         prompts.setFollowUpSummarySystemPrompt(texts.get("followUpSummarySystemPrompt"));
         prompts.setTodoPlannerSystemPromptTemplate(texts.get("todoPlannerSystemPromptTemplate"));
@@ -259,9 +325,129 @@ final class PromptAuthority {
         prompts.setToolSummarySystemPrompt(texts.get("toolSummarySystemPrompt"));
         prompts.setToolSummaryUserPromptTemplate(texts.get("toolSummaryUserPromptTemplate"));
         prompts.setToolCapabilityCatalog(texts.get("toolCapabilityCatalog"));
-        prompts.setPythonRefineRequirements(readRequirements(requireResource(REQUIREMENTS_RESOURCE)));
-        prompts.setDatasetFieldSpecs(readDatasetSpecs(requireResource(DATASET_SPECS_RESOURCE)));
-        return new AuthoritySnapshot(Map.copyOf(texts), prompts, loadToolDescriptions());
+    }
+
+    /**
+     * 应用一份运行时覆盖并原子替换生效快照。覆盖内容先整体通过加载校验，
+     * 任一校验不过即抛出且不改变当前生效版本。空覆盖等同于清除。
+     */
+    void applyOverlay(Map<String, String> promptTexts, Map<String, String> toolDescriptions) {
+        Map<String, String> overlayTexts = promptTexts == null ? Map.of() : promptTexts;
+        Map<String, String> overlayTools = toolDescriptions == null ? Map.of() : toolDescriptions;
+        if (overlayTexts.isEmpty() && overlayTools.isEmpty()) {
+            clearOverlay();
+            return;
+        }
+        validateOverlay(overlayTexts, overlayTools);
+        synchronized (this) {
+            AuthoritySnapshot baseSnap = baseSnapshot();
+            Map<String, String> texts = new LinkedHashMap<>(baseSnap.texts());
+            texts.putAll(overlayTexts);
+            Map<String, String> tools = new LinkedHashMap<>(baseSnap.toolDescriptions());
+            tools.putAll(overlayTools);
+            AgentLlmProperties.Prompts prompts = copyPrompts(baseSnap.prompts());
+            applyTexts(prompts, texts);
+            AuthoritySnapshot effective = new AuthoritySnapshot(Map.copyOf(texts), prompts, Map.copyOf(tools));
+            swapEffective(effective);
+        }
+    }
+
+    /** 清除覆盖，回到 classpath 默认版本；此前生效版本的指纹进入留存历史。 */
+    void clearOverlay() {
+        synchronized (this) {
+            swapEffective(baseSnapshot());
+        }
+    }
+
+    private void swapEffective(AuthoritySnapshot next) {
+        AuthoritySnapshot current = cached;
+        if (current == null || !digestOf(current).equals(digestOf(next))) {
+            if (current != null) {
+                rememberSelection(current);
+            }
+            cached = next;
+        }
+    }
+
+    private void rememberSelection(AuthoritySnapshot snapshot) {
+        SelectionDigest entry = new SelectionDigest(
+                digestOf(snapshot), sha256(snapshot.texts().get("toolCapabilityCatalog")));
+        digestHistory.addLast(entry);
+        while (digestHistory.size() > DIGEST_HISTORY_LIMIT) {
+            digestHistory.removeFirst();
+        }
+    }
+
+    /**
+     * 覆盖内容的加载校验：字段名必须在基线词表内、正文非空且不是未解析的 file 引用、
+     * 模板必须保留基线模板的全部占位符（否则渲染时占位符静默丢失）、工具能力目录必须是
+     * 非空 JSON 对象、工具说明的工具名必须已在基线索引登记（覆盖不能引入新工具）。
+     */
+    private void validateOverlay(Map<String, String> promptTexts, Map<String, String> toolDescriptions) {
+        AuthoritySnapshot baseSnap = baseSnapshot();
+        for (Map.Entry<String, String> entry : promptTexts.entrySet()) {
+            String field = entry.getKey();
+            String baseText = baseSnap.texts().get(field);
+            if (baseText == null) {
+                throw new PromptConfigurationException("unknown_field", "覆盖包含未知 Prompt 字段: " + field);
+            }
+            String text = entry.getValue();
+            if (text == null || text.isBlank()) {
+                throw new PromptConfigurationException("blank", "覆盖的 " + field + " 为空");
+            }
+            if (looksLikeFileReference(text)) {
+                throw new PromptConfigurationException(
+                        "unresolved_file_reference", "覆盖的 " + field + " 仍是未解析的 file 引用");
+            }
+            Set<String> missing = placeholders(baseText);
+            missing.removeAll(placeholders(text));
+            if (!missing.isEmpty()) {
+                throw new PromptConfigurationException(
+                        "overlay_placeholder_missing",
+                        "覆盖的 " + field + " 缺少基线模板占位符: " + String.join(", ", missing));
+            }
+            if ("toolCapabilityCatalog".equals(field)) {
+                validateCatalogJson(field, text);
+            }
+        }
+        for (Map.Entry<String, String> entry : toolDescriptions.entrySet()) {
+            String toolName = entry.getKey();
+            if (!baseSnap.toolDescriptions().containsKey(toolName)) {
+                throw new PromptConfigurationException(
+                        "tool_description_unknown", "覆盖包含基线索引之外的工具名: " + toolName);
+            }
+            String text = entry.getValue();
+            if (text == null || text.isBlank()) {
+                throw new PromptConfigurationException("blank", "覆盖的工具 " + toolName + " 说明为空");
+            }
+            if (looksLikeFileReference(text)) {
+                throw new PromptConfigurationException(
+                        "unresolved_file_reference", "覆盖的工具 " + toolName + " 说明仍是未解析的 file 引用");
+            }
+        }
+    }
+
+    private void validateCatalogJson(String field, String text) {
+        try {
+            Map<?, ?> parsed = objectMapper.readValue(text, new TypeReference<LinkedHashMap<String, Object>>() { });
+            if (parsed == null || parsed.isEmpty()) {
+                throw new PromptConfigurationException("blank", "覆盖的 " + field + " 不是非空 JSON 对象");
+            }
+        } catch (PromptConfigurationException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new PromptConfigurationException(
+                    "overlay_catalog_invalid", "覆盖的 " + field + " 不是合法 JSON 对象: " + e.getMessage());
+        }
+    }
+
+    private static Set<String> placeholders(String text) {
+        Set<String> found = new HashSet<>();
+        Matcher matcher = PLACEHOLDER_PATTERN.matcher(text == null ? "" : text);
+        while (matcher.find()) {
+            found.add(matcher.group(1));
+        }
+        return found;
     }
 
     String requireToolDescription(String toolName) {
@@ -408,9 +594,9 @@ final class PromptAuthority {
         return copy;
     }
 
-    private String digest(Map<String, String> texts) {
+    private String digestOf(AuthoritySnapshot snapshot) {
         StringBuilder canonical = new StringBuilder();
-        texts.entrySet().stream()
+        snapshot.texts().entrySet().stream()
                 .sorted(Map.Entry.comparingByKey())
                 .forEach(entry -> canonical.append(entry.getKey()).append('\n')
                         .append(entry.getValue()).append('\n'));
@@ -418,7 +604,7 @@ final class PromptAuthority {
                 .append(requireResource(REQUIREMENTS_RESOURCE)).append('\n')
                 .append(DATASET_SPECS_RESOURCE).append('\n')
                 .append(requireResource(DATASET_SPECS_RESOURCE));
-        snapshot().toolDescriptions().entrySet().stream()
+        snapshot.toolDescriptions().entrySet().stream()
                 .sorted(Map.Entry.comparingByKey())
                 .forEach(entry -> canonical.append("toolDescription:").append(entry.getKey()).append('\n')
                         .append(entry.getValue()).append('\n'));
@@ -438,5 +624,9 @@ final class PromptAuthority {
             Map<String, String> texts,
             AgentLlmProperties.Prompts prompts,
             Map<String, String> toolDescriptions) {
+    }
+
+    /** 一个生效版本的整体指纹与工具能力目录指纹，Run 创建时冻结的就是这对值。 */
+    private record SelectionDigest(String bundleDigest, String capabilityCatalogDigest) {
     }
 }

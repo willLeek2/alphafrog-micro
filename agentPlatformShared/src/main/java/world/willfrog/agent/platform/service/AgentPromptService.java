@@ -141,19 +141,31 @@ public class AgentPromptService {
                 LocalDate.now());
     }
 
-    /** 在消费正文前校验持久化选择仍对应当前不可变权威包。 */
+    /**
+     * 在消费正文前校验持久化选择仍对应当前生效版本或近期留存版本。
+     * 运行时覆盖推送会更换生效指纹；在途 Run 冻结的旧指纹只要还在留存窗口内就放行，
+     * 避免一次覆盖推送把正在执行的 Run 打成配置错误。
+     */
     public void validatePromptSelection(PromptRunSelection selection) {
         if (selection == null) {
             return;
         }
-        if (!DefaultPromptVariantSelector.BUNDLE_VERSION.equals(selection.bundleVersion())
-                || !DefaultPromptVariantSelector.VARIANT.equals(selection.variant())
-                || !promptAuthority.bundleDigest().equals(selection.bundleDigest())
-                || !promptAuthority.capabilityCatalogDigest().equals(selection.capabilityCatalogDigest())) {
-            throw new PromptConfigurationException(
-                    "prompt_selection_mismatch",
-                    "Run 冻结的 Prompt 版本或摘要与当前权威资源不一致");
+        boolean current = DefaultPromptVariantSelector.BUNDLE_VERSION.equals(selection.bundleVersion())
+                && DefaultPromptVariantSelector.VARIANT.equals(selection.variant())
+                && promptAuthority.bundleDigest().equals(selection.bundleDigest())
+                && promptAuthority.capabilityCatalogDigest().equals(selection.capabilityCatalogDigest());
+        if (current) {
+            return;
         }
+        if (DefaultPromptVariantSelector.BUNDLE_VERSION.equals(selection.bundleVersion())
+                && DefaultPromptVariantSelector.VARIANT.equals(selection.variant())
+                && promptAuthority.retainsSelection(selection.bundleDigest(), selection.capabilityCatalogDigest())) {
+            log.warn("Prompt selection digest is retained but not current; run continues on current effective texts");
+            return;
+        }
+        throw new PromptConfigurationException(
+                "prompt_selection_mismatch",
+                "Run 冻结的 Prompt 版本或摘要与当前权威资源不一致");
     }
 
     /**

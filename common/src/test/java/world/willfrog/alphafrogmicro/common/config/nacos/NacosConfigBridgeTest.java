@@ -266,6 +266,74 @@ class NacosConfigBridgeTest {
     }
 
     @Test
+    void receiveConfigInfo_shouldDeleteOverlayFileWhenContentBlank(@TempDir Path tempDir) throws Exception {
+        Path targetFile = tempDir.resolve("agent-prompt-overlay.local.json");
+        NacosConfigBridge bridge = new NacosConfigBridge(objectMapper, environment);
+        injectValueField(bridge, "group", "alphafrog-config");
+
+        ConfigService mockConfigService = mock(ConfigService.class);
+        when(mockConfigService.getConfig(eq("agent-prompt-overlay.json"), eq("alphafrog-config"), anyLong()))
+                .thenReturn("{\"formatVersion\":1,\"prompts\":{}}");
+
+        java.lang.reflect.Field configServiceField = NacosConfigBridge.class.getDeclaredField("configService");
+        configServiceField.setAccessible(true);
+        configServiceField.set(bridge, mockConfigService);
+
+        java.lang.reflect.Method subscribeMethod = NacosConfigBridge.class.getDeclaredMethod(
+                "subscribe", NacosConfigBridge.Subscription.class);
+        subscribeMethod.setAccessible(true);
+
+        NacosConfigBridge.Subscription sub = new NacosConfigBridge.Subscription();
+        sub.setDataId("agent-prompt-overlay.json");
+        sub.setGroup("alphafrog-config");
+        sub.setTargetFile(targetFile.toString());
+        subscribeMethod.invoke(bridge, sub);
+
+        assertEquals("{\"formatVersion\":1,\"prompts\":{}}", Files.readString(targetFile));
+
+        ArgumentCaptor<Listener> listenerCaptor = ArgumentCaptor.forClass(Listener.class);
+        verify(mockConfigService).addListener(eq("agent-prompt-overlay.json"), eq("alphafrog-config"),
+                listenerCaptor.capture());
+        Listener listener = listenerCaptor.getValue();
+
+        listener.receiveConfigInfo("   ");
+        assertFalse(Files.exists(targetFile));
+
+        Files.writeString(targetFile, "{\"formatVersion\":1,\"prompts\":{}}");
+        listener.receiveConfigInfo(null);
+        assertFalse(Files.exists(targetFile));
+    }
+
+    @Test
+    void subscribe_shouldDeleteLeftoverOverlayFileWhenInitialConfigBlank(@TempDir Path tempDir) throws Exception {
+        Path targetFile = tempDir.resolve("agent-prompt-overlay.local.json");
+        Files.writeString(targetFile, "{\"formatVersion\":1,\"prompts\":{}}");
+
+        NacosConfigBridge bridge = new NacosConfigBridge(objectMapper, environment);
+        injectValueField(bridge, "group", "alphafrog-config");
+
+        ConfigService mockConfigService = mock(ConfigService.class);
+        when(mockConfigService.getConfig(eq("agent-prompt-overlay.json"), eq("alphafrog-config"), anyLong()))
+                .thenReturn("   ");
+
+        java.lang.reflect.Field configServiceField = NacosConfigBridge.class.getDeclaredField("configService");
+        configServiceField.setAccessible(true);
+        configServiceField.set(bridge, mockConfigService);
+
+        java.lang.reflect.Method subscribeMethod = NacosConfigBridge.class.getDeclaredMethod(
+                "subscribe", NacosConfigBridge.Subscription.class);
+        subscribeMethod.setAccessible(true);
+
+        NacosConfigBridge.Subscription sub = new NacosConfigBridge.Subscription();
+        sub.setDataId("agent-prompt-overlay.json");
+        sub.setGroup("alphafrog-config");
+        sub.setTargetFile(targetFile.toString());
+        subscribeMethod.invoke(bridge, sub);
+
+        assertFalse(Files.exists(targetFile));
+    }
+
+    @Test
     void refreshSubscriptions_shouldPullLatestConfigWhenListenerMissesUpdate(@TempDir Path tempDir) throws Exception {
         Path targetFile = tempDir.resolve("agent-llm.local.json");
         NacosConfigBridge bridge = new NacosConfigBridge(objectMapper, environment);
@@ -296,6 +364,39 @@ class NacosConfigBridgeTest {
 
         assertEquals("{\"version\":\"v14\"}", Files.readString(targetFile));
         verify(mockConfigService, times(2)).getConfig("agent-llm.json", "alphafrog-config", 5000L);
+    }
+
+    @Test
+    void refreshSubscriptions_shouldDeleteOverlayFileWhenLatestBlank(@TempDir Path tempDir) throws Exception {
+        Path targetFile = tempDir.resolve("agent-prompt-overlay.local.json");
+        NacosConfigBridge bridge = new NacosConfigBridge(objectMapper, environment);
+        injectValueField(bridge, "enabled", true);
+        injectValueField(bridge, "group", "alphafrog-config");
+
+        ConfigService mockConfigService = mock(ConfigService.class);
+        when(mockConfigService.getConfig(eq("agent-prompt-overlay.json"), eq("alphafrog-config"), anyLong()))
+                .thenReturn("{\"formatVersion\":1,\"prompts\":{}}", "   ");
+
+        java.lang.reflect.Field configServiceField = NacosConfigBridge.class.getDeclaredField("configService");
+        configServiceField.setAccessible(true);
+        configServiceField.set(bridge, mockConfigService);
+
+        java.lang.reflect.Method subscribeMethod = NacosConfigBridge.class.getDeclaredMethod(
+                "subscribe", NacosConfigBridge.Subscription.class);
+        subscribeMethod.setAccessible(true);
+
+        NacosConfigBridge.Subscription sub = new NacosConfigBridge.Subscription();
+        sub.setDataId("agent-prompt-overlay.json");
+        sub.setGroup("alphafrog-config");
+        sub.setTargetFile(targetFile.toString());
+        subscribeMethod.invoke(bridge, sub);
+
+        assertEquals("{\"formatVersion\":1,\"prompts\":{}}", Files.readString(targetFile));
+
+        bridge.refreshSubscriptions();
+
+        assertFalse(Files.exists(targetFile));
+        verify(mockConfigService, times(2)).getConfig("agent-prompt-overlay.json", "alphafrog-config", 5000L);
     }
 
     @Test
