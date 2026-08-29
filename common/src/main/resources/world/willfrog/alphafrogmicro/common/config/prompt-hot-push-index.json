@@ -1,6 +1,7 @@
 {
-  "configType": "agent-llm",
-  "dataId": "agent-llm.json",
+  "_comment": "权威词表新增字段或工具名必须同步本索引。漂移目前靠一致性测试发现，不会在启动时阻止。",
+  "configType": "agent-prompt-overlay",
+  "dataId": "agent-prompt-overlay.json",
   "group": "alphafrog-config",
   "textFields": [
     "agentRunSystemPrompt",
@@ -40,15 +41,35 @@
     "toolSummaryUserPromptTemplate",
     "toolCapabilityCatalog"
   ],
-  "pathFields": [
-    "pythonRefineRequirementsFile",
-    "datasetFieldSpecsFile",
-    "financeMethodResolverSystemPromptFile",
-    "dagReactSystemPromptFile",
-    "dagModeGuidancePromptFile",
-    "planningStrategyStageFile",
-    "planningTodosStageFile",
-    "dagRecoveryJudgeSystemPromptFile"
+  "pathFields": [],
+  "toolNames": [
+    "checkParallelLimits",
+    "executePython",
+    "getEtfAdj",
+    "getExchangeAssetDaily",
+    "getFinancialReport",
+    "getIndexDaily",
+    "getIndexInfo",
+    "getListedAssetShareSize",
+    "getOffExchangeAssetDaily",
+    "getStockDaily",
+    "getStockInfo",
+    "getStockSwIndustryInfo",
+    "getTradingDaysSummary",
+    "isTradingDay",
+    "listMyData",
+    "loadDocument",
+    "loadToolGuide",
+    "ragSearch",
+    "rereadToolResult",
+    "resolveFinanceMethods",
+    "searchAssetInfo",
+    "searchFund",
+    "searchIndex",
+    "searchStock",
+    "searchWeb",
+    "spawnSubAgent",
+    "waitForSubAgent"
   ],
   "placeholders": {
     "followUpSummarySystemPrompt": [

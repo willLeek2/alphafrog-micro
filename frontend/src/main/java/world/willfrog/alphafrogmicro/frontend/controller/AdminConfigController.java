@@ -7,6 +7,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.*;
+import world.willfrog.alphafrogmicro.common.config.PromptHotPushIndex;
 import world.willfrog.alphafrogmicro.common.exception.config.ConfigConflictException;
 import world.willfrog.alphafrogmicro.common.exception.config.ConfigNotFoundException;
 import world.willfrog.alphafrogmicro.common.exception.config.ConfigPublishException;
@@ -275,8 +276,12 @@ public class AdminConfigController {
                     : null;
             configProfileService.rollback(type, version, expectedSnapshotId, operatorId);
             Map<String, Object> replicas = configProfileService.confirmActiveReplicas(type);
+            boolean overlay = PromptHotPushIndex.shared().configType().equals(type);
+            String message = overlay
+                    ? "覆盖配置已删除，应用将回落权威默认版本"
+                    : "Rolled back to " + version;
             return ResponseEntity.ok(Map.of(
-                    "message", "Rolled back to " + version,
+                    "message", message,
                     "replicas", replicas));
         } catch (ConfigNotFoundException e) {
             return ResponseEntity.status(404).body(Map.of("error", e.getMessage()));

@@ -196,11 +196,16 @@ public class ConfigProfileService {
     }
 
     /**
-     * 回滚到已有快照：把 Nacos 写成该快照正文，再用副本状态确认应用侧已接住。
+     * 回滚。覆盖层是「删除 Nacos 覆盖配置，本地文件消失后应用回落权威默认版本」；
+     * 其它配置类型仍是把某一快照正文重新发布出去。
      */
     @Transactional
     public void rollback(String typeName, String version, Integer expectedSnapshotId,
                          String operatorId) {
+        if (promptHotPushValidator.appliesTo(typeName)) {
+            unpublishOverlay(typeName, expectedSnapshotId, operatorId);
+            return;
+        }
         switchActive(typeName, version, expectedSnapshotId, operatorId, "ROLLBACK");
     }
 
@@ -266,6 +271,39 @@ public class ConfigProfileService {
 
         log.info("[ConfigProfileService] {} 配置成功 type={} version={} snapshotId={} operator={}",
                 action, typeName, version, target.getId(), operatorId);
+    }
+
+    /**
+     * 删除覆盖配置：Nacos removeConfig → 桥接层删本地文件 → 应用回落权威默认版本。
+     * 快照仍留在库里，需要再启用某一版覆盖时走激活，而不是回滚。
+     */
+    private void unpublishOverlay(String typeName, Integer expectedSnapshotId, String operatorId) {
+        ConfigType type = getTypeOrThrow(typeName);
+        ConfigActive current = configActiveDao.getByType(type.getId());
+        String fromVersion = null;
+        String fromJson = null;
+        Integer fromSnapshotId = null;
+        if (current != null && current.getSnapshotId() != null) {
+            ConfigSnapshot previous = configSnapshotDao.getById(current.getSnapshotId());
+            if (previous != null) {
+                fromVersion = previous.getVersion();
+                fromJson = previous.getContentJson();
+                fromSnapshotId = previous.getId();
+            }
+            int deleted = expectedSnapshotId == null
+                    ? configActiveDao.deleteByType(type.getId())
+                    : configActiveDao.deleteIfSnapshotMatches(type.getId(), expectedSnapshotId);
+            if (deleted != 1) {
+                throw new ConfigConflictException("配置已被他人修改，expectedSnapshotId 不匹配，请刷新后重试");
+            }
+        } else if (expectedSnapshotId != null) {
+            throw new ConfigConflictException("当前没有激活的覆盖配置，expectedSnapshotId 不匹配，请刷新后重试");
+        }
+
+        String reason = promptAuditReason(typeName, fromJson, null, fromVersion, null, null);
+        registerAfterCommitRemove(type, fromSnapshotId, operatorId, fromVersion, reason);
+        log.info("[ConfigProfileService] 已删除覆盖配置 type={} fromVersion={} operator={}",
+                typeName, fromVersion, operatorId);
     }
 
     /**
@@ -733,13 +771,59 @@ public class ConfigProfileService {
             return comment;
         }
         String structured = PromptChangeAudit.reason(
-                promptHotPushValidator.diffPromptFields(fromJson, toJson),
+                promptHotPushValidator.diffOverlayFields(fromJson, toJson),
+                promptHotPushValidator.canonicalDigest(fromJson),
+                promptHotPushValidator.canonicalDigest(toJson),
                 fromVersion,
                 toVersion);
         if (comment == null || comment.isBlank()) {
             return structured;
         }
         return structured + " " + comment;
+    }
+
+    private void registerAfterCommitRemove(ConfigType type, Integer snapshotId, String operatorId,
+                                           String fromVersion, String reason) {
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            removeFromNacos(type, snapshotId, operatorId, fromVersion);
+            insertAuditLog(type.getId(), "ROLLBACK", snapshotId, fromVersion, operatorId, reason);
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                removeFromNacos(type, snapshotId, operatorId, fromVersion);
+                insertAuditLog(type.getId(), "ROLLBACK", snapshotId, fromVersion, operatorId, reason);
+            }
+
+            @Override
+            public void afterCompletion(int status) {
+                if (status != STATUS_COMMITTED) {
+                    insertAuditLog(type.getId(), "ACTIVATE_ROLLBACK", snapshotId,
+                            fromVersion, operatorId, "数据库事务未提交，删除覆盖已回滚");
+                }
+            }
+        });
+    }
+
+    private void removeFromNacos(ConfigType type, Integer snapshotId, String operatorId, String fromVersion) {
+        if (nacosConfigService == null) {
+            insertAuditLog(type.getId(), "ACTIVATE_PUBLISH_FAILED", snapshotId,
+                    fromVersion, operatorId, "Nacos Config 未启用或 ConfigService 未初始化");
+            throw new ConfigPublishException("Nacos Config 未启用或 ConfigService 未初始化");
+        }
+        try {
+            boolean success = nacosConfigService.removeConfig(type.getDataId(), type.getConfigGroup());
+            if (!success) {
+                insertAuditLog(type.getId(), "ACTIVATE_PUBLISH_FAILED", snapshotId,
+                        fromVersion, operatorId, "Nacos removeConfig 返回 false");
+                throw new ConfigPublishException("Nacos removeConfig 返回 false");
+            }
+        } catch (NacosException e) {
+            insertAuditLog(type.getId(), "ACTIVATE_PUBLISH_FAILED", snapshotId,
+                    fromVersion, operatorId, "Nacos 删除配置失败: " + e.getMessage());
+            throw new ConfigPublishException("Nacos 删除配置失败", e);
+        }
     }
 
     private void publishToNacos(ConfigType type, ConfigSnapshot target, String operatorId) {

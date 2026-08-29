@@ -10,7 +10,10 @@ import java.util.regex.Pattern;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/** 热推送预检索引必须跟着 classpath 权威字段走，避免两份清单各改各的。 */
+/**
+ * 覆盖层预检索引必须跟着 classpath 权威词表走。
+ * 权威词表新增字段必须同步本索引，避免两份清单各改各的。
+ */
 class PromptHotPushIndexConsistencyTest {
 
     private static final Pattern PLACEHOLDER = Pattern.compile("\\{\\{([A-Za-z][A-Za-z0-9_]*)\\}\\}");
@@ -20,8 +23,11 @@ class PromptHotPushIndexConsistencyTest {
         PromptHotPushIndex index = PromptHotPushIndex.shared();
         PromptAuthority authority = PromptAuthority.shared();
 
-        assertEquals("agent-llm", index.configType());
+        assertEquals("agent-prompt-overlay", index.configType());
+        assertEquals("agent-prompt-overlay.json", index.dataId());
+        assertEquals("alphafrog-config", index.group());
         assertEquals(new LinkedHashSet<>(authority.textFieldNames()), new LinkedHashSet<>(index.textFields()));
+        assertEquals(new LinkedHashSet<>(authority.toolDescriptionNames()), new LinkedHashSet<>(index.toolNames()));
 
         for (String field : index.textFields()) {
             LinkedHashSet<String> fromFile = new LinkedHashSet<>();
@@ -33,5 +39,6 @@ class PromptHotPushIndexConsistencyTest {
                     "占位符清单与权威文件不一致: " + field);
         }
         assertTrue(index.textFields().contains("toolSummarySystemPrompt"));
+        assertTrue(index.toolNames().contains("executePython"));
     }
 }

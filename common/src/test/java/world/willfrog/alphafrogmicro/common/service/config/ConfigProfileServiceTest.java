@@ -196,33 +196,32 @@ class ConfigProfileServiceTest {
     }
 
     @Test
-    void createFromScratch_shouldRejectAgentLlmPromptMissingPlaceholder() throws Exception {
-        ConfigType type = buildAgentLlmType();
-        when(configTypeDao.getByName("agent-llm")).thenReturn(type);
+    void createFromScratch_shouldRejectOverlayPromptMissingPlaceholder() throws Exception {
+        ConfigType type = buildOverlayType();
+        when(configTypeDao.getByName("agent-prompt-overlay")).thenReturn(type);
         var content = objectMapper.readTree("""
-                {"defaultEndpoint":"openrouter","defaultModel":"m","endpoints":{},
-                 "prompts":{"todoRetryContextInstruction":"缺少占位符"}}
+                {"formatVersion":1,"prompts":{"todoRetryContextInstruction":"缺少占位符"}}
                 """);
 
         assertThrows(ConfigValidationException.class,
-                () -> configProfileService.createFromScratch("agent-llm", content, "bad", "7"));
+                () -> configProfileService.createFromScratch("agent-prompt-overlay", content, "bad", "7"));
         verify(configSnapshotDao, never()).insert(any());
         verifyNoInteractions(nacosConfigService);
     }
 
     @Test
-    void activate_shouldRejectAgentLlmBadOverrideBeforePublish() {
-        ConfigType type = buildAgentLlmType();
+    void activate_shouldRejectOverlayBadOverrideBeforePublish() {
+        ConfigType type = buildOverlayType();
         ConfigSnapshot snapshot = new ConfigSnapshot();
         snapshot.setId(3);
-        snapshot.setTypeId(9);
+        snapshot.setTypeId(11);
         snapshot.setVersion("v9");
-        snapshot.setContentJson("{\"prompts\":{\"todoRetryContextInstruction\":\"缺少占位符\"}}");
-        when(configTypeDao.getByName("agent-llm")).thenReturn(type);
+        snapshot.setContentJson("{\"formatVersion\":1,\"prompts\":{\"todoRetryContextInstruction\":\"缺少占位符\"}}");
+        when(configTypeDao.getByName("agent-prompt-overlay")).thenReturn(type);
         when(configSnapshotDao.getByTypeAndVersion(type.getId(), "v9")).thenReturn(snapshot);
 
         assertThrows(ConfigValidationException.class,
-                () -> configProfileService.activate("agent-llm", "v9", 1, "7"));
+                () -> configProfileService.activate("agent-prompt-overlay", "v9", 1, "7"));
 
         verify(configActiveDao, never()).updateIfSnapshotMatches(any(), any(), any(), any(), any());
         verifyNoInteractions(nacosConfigService);
@@ -249,16 +248,48 @@ class ConfigProfileServiceTest {
     }
 
     @Test
+    void rollback_shouldRemoveOverlayConfigAndWriteCanonicalDigestAudit() throws Exception {
+        ConfigType type = buildOverlayType();
+        ConfigSnapshot snapshot = new ConfigSnapshot();
+        snapshot.setId(4);
+        snapshot.setTypeId(11);
+        snapshot.setVersion("v3");
+        snapshot.setContentJson("""
+                {"formatVersion":1,"prompts":{"todoRetryContextInstruction":"{{toolName}} {{toolSafety}} {{failureCategory}} {{failureSummary}} {{previousArguments}}"}}
+                """);
+        ConfigActive active = new ConfigActive();
+        active.setTypeId(type.getId());
+        active.setSnapshotId(snapshot.getId());
+        when(configTypeDao.getByName("agent-prompt-overlay")).thenReturn(type);
+        when(configActiveDao.getByType(type.getId())).thenReturn(active);
+        when(configSnapshotDao.getById(snapshot.getId())).thenReturn(snapshot);
+        when(configActiveDao.deleteIfSnapshotMatches(type.getId(), snapshot.getId())).thenReturn(1);
+        when(nacosConfigService.removeConfig(type.getDataId(), type.getConfigGroup())).thenReturn(true);
+
+        configProfileService.rollback("agent-prompt-overlay", "v3", snapshot.getId(), "7");
+
+        ArgumentCaptor<ConfigAuditLog> captor = ArgumentCaptor.forClass(ConfigAuditLog.class);
+        verify(nacosConfigService).removeConfig(type.getDataId(), type.getConfigGroup());
+        verify(nacosConfigService, never()).publishConfig(any(), any(), any());
+        verify(configAuditLogDao).insert(captor.capture());
+        assertEquals("ROLLBACK", captor.getValue().getAction());
+        assertEquals(snapshot.getId(), captor.getValue().getSnapshotId());
+        assertEquals("v3", captor.getValue().getBaseVersion());
+        assertTrue(captor.getValue().getReason().contains("fromDigest"));
+        assertTrue(captor.getValue().getReason().contains("toDigest"));
+        assertTrue(captor.getValue().getReason().contains("sha256:"));
+    }
+
+    @Test
     void validateContent_shouldRejectUnknownPromptField() throws Exception {
-        ConfigType type = buildAgentLlmType();
-        when(configTypeDao.getByName("agent-llm")).thenReturn(type);
+        ConfigType type = buildOverlayType();
+        when(configTypeDao.getByName("agent-prompt-overlay")).thenReturn(type);
         var content = objectMapper.readTree("""
-                {"defaultEndpoint":"openrouter","defaultModel":"m","endpoints":{},
-                 "prompts":{"notIndexed":"x"}}
+                {"formatVersion":1,"prompts":{"notIndexed":"x"}}
                 """);
 
         assertThrows(ConfigValidationException.class,
-                () -> configProfileService.validateContent("agent-llm", content));
+                () -> configProfileService.validateContent("agent-prompt-overlay", content));
     }
 
     @Test
@@ -474,11 +505,11 @@ class ConfigProfileServiceTest {
         return type;
     }
 
-    private ConfigType buildAgentLlmType() {
+    private ConfigType buildOverlayType() {
         ConfigType type = new ConfigType();
-        type.setId(9);
-        type.setName("agent-llm");
-        type.setDataId("agent-llm.json");
+        type.setId(11);
+        type.setName("agent-prompt-overlay");
+        type.setDataId("agent-prompt-overlay.json");
         type.setConfigGroup("alphafrog-config");
         type.setSchemaJson("");
         return type;

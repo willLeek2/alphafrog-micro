@@ -94,6 +94,10 @@ final class PromptAuthority {
         return TEXT_FIELDS.keySet();
     }
 
+    Set<String> toolDescriptionNames() {
+        return snapshot().toolDescriptions().keySet();
+    }
+
     String expectedText(String fieldName) {
         String expected = snapshot().texts().get(fieldName);
         if (expected == null) {
