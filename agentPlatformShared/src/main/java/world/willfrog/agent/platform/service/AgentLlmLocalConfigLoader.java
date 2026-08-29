@@ -398,6 +398,14 @@ public class AgentLlmLocalConfigLoader {
                 prompts::setEmptyOutputRecoveryStageInstruction, explicitFields, baseDir, fileTimes, authority);
         resolveDirect("budgetLastMileStageInstruction", prompts::getBudgetLastMileStageInstruction,
                 prompts::setBudgetLastMileStageInstruction, explicitFields, baseDir, fileTimes, authority);
+        resolveDirect("todoRetryContextInstruction", prompts::getTodoRetryContextInstruction,
+                prompts::setTodoRetryContextInstruction, explicitFields, baseDir, fileTimes, authority);
+        resolveDirect("pythonRepairContextInstruction", prompts::getPythonRepairContextInstruction,
+                prompts::setPythonRepairContextInstruction, explicitFields, baseDir, fileTimes, authority);
+        resolveDirect("toolSummarySystemPrompt", prompts::getToolSummarySystemPrompt,
+                prompts::setToolSummarySystemPrompt, explicitFields, baseDir, fileTimes, authority);
+        resolveDirect("toolSummaryUserPromptTemplate", prompts::getToolSummaryUserPromptTemplate,
+                prompts::setToolSummaryUserPromptTemplate, explicitFields, baseDir, fileTimes, authority);
         resolveDirect("toolCapabilityCatalog", prompts::getToolCapabilityCatalog,
                 prompts::setToolCapabilityCatalog, explicitFields, baseDir, fileTimes, authority);
 

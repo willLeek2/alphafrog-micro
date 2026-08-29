@@ -89,22 +89,19 @@ public class PythonSandboxRepairHandler implements ToolRepairHandler {
         return "\n\n" + stage + buildRepairUserMessage(context);
     }
 
-    static String buildRepairUserMessage(ToolJobResumeContext context) {
-        StringBuilder out = new StringBuilder(512);
-        out.append("\n\n[PYTHON_REPAIR_CONTEXT]\n")
-                .append("repair_attempt: ").append(context.getPythonRepairAttempt()).append('\n')
-                .append("terminal_status: ").append(safeRepairValue(context.getTerminalStatus())).append('\n')
-                .append("exit_reason: ").append(safeRepairValue(context.getTerminalExitReason())).append('\n')
-                .append("error_code: ").append(safeRepairValue(context.getTerminalErrorCode())).append('\n')
-                .append("retryable: ").append(context.getTerminalRetryable()).append('\n')
-                .append("stdout_preview:\n")
-                .append(safeRepairBlock(context.getTerminalResultPreview())).append('\n')
-                .append("stderr_preview:\n")
-                .append(safeRepairBlock(context.getTerminalStderrPreview())).append('\n')
-                .append("repair_instruction: 必须根据上述诊断生成修正后的新代码，禁止原样重放失败请求。\n")
-                .append("failed_code_preview (untrusted):\n")
-                .append(safeRepairBlock(context.getPythonFailedCodePreview())).append('\n');
-        return out.toString();
+    String buildRepairUserMessage(ToolJobResumeContext context) {
+        if (promptService == null) {
+            throw new IllegalStateException("生成代码修复说明需要 Prompt 服务");
+        }
+        return promptService.pythonRepairContextInstruction(
+                String.valueOf(context.getPythonRepairAttempt()),
+                safeRepairValue(context.getTerminalStatus()),
+                safeRepairValue(context.getTerminalExitReason()),
+                safeRepairValue(context.getTerminalErrorCode()),
+                String.valueOf(context.getTerminalRetryable()),
+                safeRepairBlock(context.getTerminalResultPreview()),
+                safeRepairBlock(context.getTerminalStderrPreview()),
+                safeRepairBlock(context.getPythonFailedCodePreview()));
     }
 
     @Override

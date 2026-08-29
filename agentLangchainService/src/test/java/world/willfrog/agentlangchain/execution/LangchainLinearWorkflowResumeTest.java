@@ -12,6 +12,7 @@ import world.willfrog.agent.platform.service.CodeRefineLocalConfigLoader;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 import world.willfrog.agent.workflow.TodoItem;
 import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
+import world.willfrog.agentlangchain.support.LangchainTestFixtures;
 import world.willfrog.agentlangchain.tooljob.ToolJobResumeContext;
 
 import java.util.List;
@@ -497,7 +498,8 @@ class LangchainLinearWorkflowResumeTest {
     void repairPromptContainsBoundedTerminalDiagnosticsAndNoReplayInstruction() {
         ToolJobResumeContext context = failedPythonContext(true, 1);
 
-        assertThat(PythonSandboxRepairHandler.buildRepairUserMessage(context))
+        assertThat(new PythonSandboxRepairHandler(LangchainTestFixtures.promptService(), null, null)
+                .buildRepairUserMessage(context))
                 .contains("PYTHON_REPAIR_CONTEXT")
                 .contains("repair_attempt: 1")
                 .contains("exit_reason: NON_ZERO_EXIT")

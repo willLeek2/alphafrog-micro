@@ -223,4 +223,46 @@ class AgentPromptServiceCacheTest {
         assertFalse(prompt.contains("单次最多"),
                 "ReAct User 阶段指令不应硬编码批量上限");
     }
+
+    @Test
+    void todoRetryContextInstruction_shouldRenderAuthorityTemplate() {
+        String instruction = promptService.todoRetryContextInstruction(
+                "searchWeb", "READ_ONLY", "TIMEOUT", "upstream timeout", "{\"query\":\"old\"}");
+        assertTrue(instruction.contains("[TODO_RETRY_CONTEXT]"),
+                "语义重试上下文应带标记");
+        assertTrue(instruction.contains("这是本 Todo 唯一允许的一次语义重试"),
+                "语义重试上下文应使用权威正文");
+        assertTrue(instruction.contains("searchWeb"),
+                "语义重试上下文应填入工具名");
+        assertFalse(instruction.contains("{{toolName}}"),
+                "语义重试上下文不应残留占位符");
+    }
+
+    @Test
+    void pythonRepairContextInstruction_shouldRenderAuthorityTemplate() {
+        String instruction = promptService.pythonRepairContextInstruction(
+                "1", "FAILED", "NON_ZERO_EXIT", "E1", "false",
+                "stdout", "stderr", "print(1)");
+        assertTrue(instruction.contains("[PYTHON_REPAIR_CONTEXT]"),
+                "代码修复上下文应带标记");
+        assertTrue(instruction.contains("禁止原样重放失败请求"),
+                "代码修复上下文应使用权威正文");
+        assertTrue(instruction.contains("print(1)"),
+                "代码修复上下文应填入失败代码预览");
+    }
+
+    @Test
+    void toolSummaryPrompts_shouldComeFromAuthorityFiles() {
+        assertEquals("你是工具结果摘要助手，只输出简洁中文摘要。",
+                promptService.toolSummarySystemPrompt());
+        String user = promptService.toolSummaryUserPrompt("目标", "searchWeb", "原始输出");
+        assertTrue(user.contains("当前任务目标：目标"),
+                "工具摘要 User 应填入任务目标");
+        assertTrue(user.contains("searchWeb"),
+                "工具摘要 User 应填入工具名");
+        assertTrue(user.contains("原始输出"),
+                "工具摘要 User 应填入原始结果");
+        assertTrue(user.contains("不要编造原始结果中没有的信息"),
+                "工具摘要 User 应使用权威正文");
+    }
 }

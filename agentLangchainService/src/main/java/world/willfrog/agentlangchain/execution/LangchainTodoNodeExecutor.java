@@ -398,14 +398,13 @@ public class LangchainTodoNodeExecutor {
         }
     }
 
-    private static String buildTodoRetryUserMessage(TodoRetryContext context) {
-        return "\n\n[TODO_RETRY_CONTEXT]\n"
-                + "这是本 Todo 唯一允许的一次语义重试。请根据失败信息修正工具参数；如果无法安全修正，直接说明失败，不要重复相同调用。\n"
-                + "tool: " + safeRetryText(context.toolName(), 256) + "\n"
-                + "tool_safety: " + context.safety().name() + "\n"
-                + "failure_category: " + safeRetryText(context.failureCategory(), 256) + "\n"
-                + "failure_summary: " + safeRetryText(context.failureSummary(), 2048) + "\n"
-                + "previous_arguments:\n" + safeRetryText(context.previousArguments(), 8192) + "\n";
+    private String buildTodoRetryUserMessage(TodoRetryContext context) {
+        return promptService.todoRetryContextInstruction(
+                safeRetryText(context.toolName(), 256),
+                context.safety().name(),
+                safeRetryText(context.failureCategory(), 256),
+                safeRetryText(context.failureSummary(), 2048),
+                safeRetryText(context.previousArguments(), 8192));
     }
 
     private static String safeRetryText(String value, int maxChars) {

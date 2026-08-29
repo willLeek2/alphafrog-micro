@@ -2027,6 +2027,14 @@ public class AgentLlmProperties {
         private String emptyOutputRecoveryStageInstruction;
         /** D02：预算 last-mile User 阶段说明模板。 */
         private String budgetLastMileStageInstruction;
+        /** Todo 语义重试时追加到用户消息的上下文模板。 */
+        private String todoRetryContextInstruction;
+        /** 代码执行失败后修复轮次追加到用户消息的诊断上下文模板。 */
+        private String pythonRepairContextInstruction;
+        /** 工具结果摘要的系统说明。 */
+        private String toolSummarySystemPrompt;
+        /** 工具结果摘要的用户消息模板。 */
+        private String toolSummaryUserPromptTemplate;
         /** D02：按工具名登记的能力说明 JSON。 */
         private String toolCapabilityCatalog;
         /** DAG recovery judge prompt 投影文件路径；loader 保留路径，并把校验后的正文写入 template 字段。 */
@@ -2344,6 +2352,38 @@ public class AgentLlmProperties {
 
         public void setBudgetLastMileStageInstruction(String budgetLastMileStageInstruction) {
             this.budgetLastMileStageInstruction = budgetLastMileStageInstruction;
+        }
+
+        public String getTodoRetryContextInstruction() {
+            return todoRetryContextInstruction;
+        }
+
+        public void setTodoRetryContextInstruction(String todoRetryContextInstruction) {
+            this.todoRetryContextInstruction = todoRetryContextInstruction;
+        }
+
+        public String getPythonRepairContextInstruction() {
+            return pythonRepairContextInstruction;
+        }
+
+        public void setPythonRepairContextInstruction(String pythonRepairContextInstruction) {
+            this.pythonRepairContextInstruction = pythonRepairContextInstruction;
+        }
+
+        public String getToolSummarySystemPrompt() {
+            return toolSummarySystemPrompt;
+        }
+
+        public void setToolSummarySystemPrompt(String toolSummarySystemPrompt) {
+            this.toolSummarySystemPrompt = toolSummarySystemPrompt;
+        }
+
+        public String getToolSummaryUserPromptTemplate() {
+            return toolSummaryUserPromptTemplate;
+        }
+
+        public void setToolSummaryUserPromptTemplate(String toolSummaryUserPromptTemplate) {
+            this.toolSummaryUserPromptTemplate = toolSummaryUserPromptTemplate;
         }
 
         public String getToolCapabilityCatalog() {
