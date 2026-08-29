@@ -178,7 +178,7 @@ public class MarketDataTools {
         this.swIndustryMemberDao = swIndustryMemberDao;
     }
 
-    @Tool("查询单只或多只股票基础信息。参数要求：tsCode 支持 | 分隔的多个代码或 JSON 数组，每个代码必须是 TuShare 格式如 000001.SZ。具体批量上限必须先调用 checkParallelLimits 查询；如果没有 checkParallelLimits 工具，默认不要批量。批量示例：\"000001.SZ|600519.SH\"；批量返回 data.mode=batch、data.results、success_count、failure_count。")
+    @Tool
     public String getStockInfo(String tsCode) {
         int maxItems = resolveMaxParallelSearchQueries();
         List<String> tsCodes = parseBatchValues(tsCode);
@@ -214,7 +214,7 @@ public class MarketDataTools {
         }
     }
 
-    @Tool("查询指定股票的申万一级、二级、三级行业信息。参数要求：tsCode 支持 | 分隔的多个代码或 JSON 数组，每个代码必须是 TuShare 格式如 000001.SZ。返回每只股票的申万行业层级映射，包含 l1_code/l1_name、l2_code/l2_name、l3_code/l3_name；如果某只股票没有申万行业数据，则对应结果项的 items 为空数组。")
+    @Tool
     public String getStockSwIndustryInfo(String tsCode) {
         if (swIndustryMemberDao == null) {
             return serviceUnavailable("getStockSwIndustryInfo", "SwIndustryMemberDao is not available");
@@ -268,7 +268,7 @@ public class MarketDataTools {
      * 大结果会写入 dataset 并返回 {@code dataset_id}，供后续 executePython 等 todo 复用，
      * 避免重复拉取相同数据。</p>
      */
-    @Tool("查询股票区间日线数据。参数要求：1) tsCode 必须为“6位数字.交易所后缀”，也支持 | 分隔的多个代码或 JSON 数组，如 \"000001.SZ|600519.SH\"，具体批量上限必须先调用 checkParallelLimits 查询；如果没有 checkParallelLimits 工具，默认不要批量；2) startDateStr/endDateStr 必须严格使用 YYYYMMDD（如 20240101），禁止传毫秒时间戳或其他日期格式；3) startDateStr 必须早于或等于 endDateStr。批量返回 data.mode=batch、data.results、success_count、failure_count。")
+    @Tool
     public String getStockDaily(String tsCode, String startDateStr, String endDateStr) {
         int maxItems = resolveMaxParallelDailyQueries();
         List<String> tsCodes = parseBatchValues(tsCode);
@@ -312,7 +312,7 @@ public class MarketDataTools {
         }
     }
 
-    @Tool("按关键词搜索股票。参数要求：keyword 必须是非空字符串，建议长度 2-40；可输入股票代码片段、股票简称、全称或拼音片段（例如 平安银行、000001、pingan）。支持 | 分隔的多个关键词或 JSON 数组，具体批量上限必须先调用 checkParallelLimits 查询；如果没有 checkParallelLimits 工具，默认不要批量。批量示例：\"平安银行|万科A\"；批量返回 data.mode=batch、data.results、success_count、failure_count。")
+    @Tool
     public String searchStock(String keyword) {
         int maxItems = resolveMaxParallelSearchQueries();
         List<String> queries = parseBatchValues(keyword);
@@ -354,7 +354,7 @@ public class MarketDataTools {
         }
     }
 
-    @Tool("按关键词搜索场外基金（公募基金），不用于 ETF 或场内上市基金。参数要求：keyword 必须是非空字符串，建议长度 2-40；可输入基金代码片段或名称关键词（例如 005827、易方达蓝筹精选）。支持 | 分隔的多个关键词或 JSON 数组，具体批量上限必须先调用 checkParallelLimits 查询；如果没有 checkParallelLimits 工具，默认不要批量。批量示例：\"易方达蓝筹精选|招商中证白酒\"；批量返回 data.mode=batch、data.results、success_count、failure_count。ETF 请改用 searchAssetInfo(assetTypes=etf)。")
+    @Tool
     public String searchFund(String keyword) {
         int maxItems = resolveMaxParallelSearchQueries();
         List<String> queries = parseBatchValues(keyword);
@@ -395,7 +395,7 @@ public class MarketDataTools {
         }
     }
 
-    @Tool("查询单只或多只指数基础信息。参数要求：tsCode 支持 | 分隔的多个代码或 JSON 数组，每个代码必须是 TuShare 指数代码格式如 000300.SH。具体批量上限必须先调用 checkParallelLimits 查询；如果没有 checkParallelLimits 工具，默认不要批量。批量示例：\"000300.SH|000905.SH\"；批量返回 data.mode=batch、data.results、success_count、failure_count。")
+    @Tool
     public String getIndexInfo(String tsCode) {
         int maxItems = resolveMaxParallelSearchQueries();
         List<String> tsCodes = parseBatchValues(tsCode);
@@ -437,7 +437,7 @@ public class MarketDataTools {
      * <p>支持单代码或多代码批量查询（{@code |} 分隔 / JSON 数组）。
      * 与 {@link #getStockDaily} 类似，大结果写入 dataset 并返回 {@code dataset_id}。</p>
      */
-    @Tool("查询指数区间日线数据。参数要求：1) tsCode 必须为“6位数字.交易所后缀”，也支持 | 分隔的多个代码或 JSON 数组，如 \"000300.SH|000905.SH\"，具体批量上限必须先调用 checkParallelLimits 查询；如果没有 checkParallelLimits 工具，默认不要批量；2) startDateStr/endDateStr 必须严格使用 YYYYMMDD（如 20240101），禁止传毫秒时间戳或其他日期格式；3) startDateStr 必须早于或等于 endDateStr。批量返回 data.mode=batch、data.results、success_count、failure_count。")
+    @Tool
     public String getIndexDaily(String tsCode, String startDateStr, String endDateStr) {
         int maxItems = resolveMaxParallelDailyQueries();
         List<String> tsCodes = parseBatchValues(tsCode);
@@ -480,7 +480,7 @@ public class MarketDataTools {
         }
     }
 
-    @Tool("按关键词搜索指数。simple 模式：keyword 必须是非空字符串，建议长度 2-40；可输入指数代码片段或指数名称关键词（例如 000300、沪深300、中证500）。支持 | 分隔的多个关键词或 JSON 数组，具体批量上限必须先调用 checkParallelLimits 查询；如果没有 checkParallelLimits 工具，默认不要批量。advanced 模式：mode=advanced，advancedQuery 传 {name?, conditions}，仅支持 has_stock 条件。批量返回 data.mode=batch、data.results、success_count、failure_count。")
+    @Tool
     public String searchIndex(String keyword, String mode, String advancedQuery) {
         if (isAdvancedMode(mode)) {
             Map<String, Object> params = buildAdvancedParams(mode, advancedQuery);
@@ -539,7 +539,7 @@ public class MarketDataTools {
      * <p>通过 assetTypes 参数控制搜索范围，未指定时默认覆盖全部四类资产。
      * 不同资产类型会并发查询对应 Dubbo 服务，最后合并为统一结果列表。</p>
      */
-    @Tool("统一搜索股票/ETF/指数/场外基金基本信息。simple 模式：query 支持 | 分隔或 JSON 数组，具体批量上限必须先调用 checkParallelLimits 查询；如果没有 checkParallelLimits 工具，默认不要批量；assetTypes 可选 stock,etf,index,off_exchange_fund（逗号分隔，默认全部）；marketScope 目前仅支持 domestic。advanced 模式：mode=advanced，advancedQuery 传 {asset_type, name?, conditions}，stock 支持 index_component / sw_industry_l2_component / sw_industry_l3_component，etf 支持 has_stock。")
+    @Tool
     public String searchAssetInfo(String query, String assetTypes, String marketScope, String mode, String advancedQuery) {
         if (isAdvancedMode(mode)) {
             Map<String, Object> params = buildAdvancedParams(mode, advancedQuery);
@@ -609,7 +609,7 @@ public class MarketDataTools {
         return ok("searchAssetInfo", data);
     }
 
-    @Tool("查询场内资产日线（股票/ETF/指数）。simple 模式：tsCode 支持 | 分隔或 JSON 数组，assetType 必填 stock|etf|index，startDate/endDate 为 YYYYMMDD，priceMode 目前仅支持 raw_ohlc；批量上限必须先调用 checkParallelLimits 查询。advanced 模式：mode=advanced，advancedQuery 传 {asset_type, name?, conditions}，通过 index_component / sw_industry_l2_component / sw_industry_l3_component 条件批量拉取成分股日线；startDate/endDate 仍为日线日期范围；ETF 复权因子数据会额外包含 adj_factor 列。")
+    @Tool
     /**
      * 查询场内资产日线（股票/ETF/指数），统一入口方法。
      *
@@ -766,25 +766,25 @@ public class MarketDataTools {
         }
     }
 
-    @Tool("查询场外基金净值序列。参数要求：tsCode 为基金代码；startDate/endDate 为 YYYYMMDD。不用于 ETF 场内日线回测。")
+    @Tool
     public String getOffExchangeAssetDaily(String tsCode, String startDate, String endDate) {
         return new MarketDataFundEtfTools(domesticFundService, domesticListedAssetService, this)
                 .getOffExchangeAssetDaily(tsCode, startDate, endDate);
     }
 
-    @Tool("查询 ETF 复权因子时序。参数要求：tsCode/startDate/endDate；仅当 adjFactorEnabled=true 时可用。")
+    @Tool
     public String getEtfAdj(String tsCode, String startDate, String endDate) {
         return new MarketDataFundEtfTools(domesticFundService, domesticListedAssetService, this)
                 .getEtfAdj(tsCode, startDate, endDate);
     }
 
-    @Tool("查询 ETF 份额规模时序。参数要求：tsCode、startDate、endDate；exchange 使用 SSE/SZSE/BSE。")
+    @Tool
     public String getListedAssetShareSize(String tsCode, String startDate, String endDate, String exchange) {
         return new MarketDataFundEtfTools(domesticFundService, domesticListedAssetService, this)
                 .getListedAssetShareSize(tsCode, startDate, endDate, exchange);
     }
 
-    @Tool("查询当前批量/并行查询限制。返回 search 和 daily 工具组的热加载 maxItems，以及各工具组包含哪些工具。使用任何批量参数前必须先调用本工具；如果没有本工具，默认并行查询关闭。")
+    @Tool
     /**
      * 查询当前批量/并行查询限制，所有支持批量的工具在执行前应当先调用本方法。
      *
@@ -855,7 +855,7 @@ public class MarketDataTools {
      * 当区间无交易日时，first_trading_date/last_trading_date 返回 NONE 而非空串，
      * 便于调用方明确区分「无交易日」和「异常未返回」。</p>
      */
-    @Tool("查询A股交易日区间概览。参数要求：startDate/endDate 必须严格使用 YYYYMMDD；exchange 支持 SSE/SZSE/BSE，可选，默认 SSE。返回 trading_days_count、first_trading_date、last_trading_date；区间无交易日时 first_trading_date/last_trading_date 为 NONE。涉及交易日数量、首个交易日、最后交易日时禁止猜测，必须调用本工具。")
+    @Tool
     public String getTradingDaysSummary(String startDate, String endDate, String exchange) {
         return new MarketDataCalendarTools(domesticIndexService, this)
                 .getTradingDaysSummary(startDate, endDate, exchange);
@@ -868,7 +868,7 @@ public class MarketDataTools {
      * 返回字段 {@code calendar_record_found} 用于区分「该日期在日历表中无记录」和「有记录但休市」，
      * 防止 LLM 把数据缺口误判为节假日。</p>
      */
-    @Tool("查询单个或多个日期是否为A股交易日。参数要求：date 支持单个 YYYYMMDD、| 分隔的多个 YYYYMMDD 或 JSON 数组；批量前必须先调用 checkParallelLimits 查询 calendar.maxItems 并按上限拆批；exchange 支持 SSE/SZSE/BSE，可选，默认 SSE。单日返回 is_trading_day 和 calendar_record_found；批量返回 data.mode=batch、data.results、success_count、failure_count。涉及某日是否交易日时禁止猜测，必须调用本工具。")
+    @Tool
     public String isTradingDay(String date, String exchange) {
         return new MarketDataCalendarTools(domesticIndexService, this).isTradingDay(date, exchange);
     }
@@ -2224,32 +2224,7 @@ public class MarketDataTools {
      * 禁止使用 period / year / quarter 等替代参数，否则会被显式拒绝。
      * 查询结果写入 dataset 并返回 {@code dataset_id}，便于后续 executePython 做财务分析。</p>
      */
-    @Tool("""
-        查询上市公司财务报表数据（利润表/资产负债表/现金流量表/业绩快报）。
-
-        【参数规范 - 必须严格遵循】
-          tsCode      - 股票代码（TuShare 格式，如 600519.SH）
-          reportType  - 报告类型：income（利润表）| balancesheet（资产负债表）| cashflow（现金流量表）| express（业绩快报）
-          startPeriod - 报告期开始，YYYYMMDD，如 20240101
-          endPeriod   - 报告期结束，YYYYMMDD，如 20241231
-
-        【⚠️ 严禁使用以下参数，会导致调用失败】
-          period, date, year, month, quarter 等替代参数
-
-        【正确调用示例】
-        ✅ 查茅台2024年年报利润表：{"tool":"getFinancialReport","params":{"tsCode":"600519.SH","reportType":"income","startPeriod":"20240101","endPeriod":"20241231"}}
-        ✅ 查茅台2024年Q1-Q3利润表：{"tool":"getFinancialReport","params":{"tsCode":"600519.SH","reportType":"income","startPeriod":"20240331","endPeriod":"20240930"}}
-
-        【错误调用示例 - 会导致失败】
-        ❌ {"tsCode":"600519.SH","period":"20241231","reportType":"income"}  // 用了period而不是startPeriod/endPeriod
-        ❌ {"tsCode":"600519.SH","year":"2024","reportType":"income"}  // 发明year参数
-
-        【报告期速查】
-        - 2024年报：startPeriod=20240101, endPeriod=20241231
-        - 2024半年报：startPeriod=20240101, endPeriod=20240630
-        - 2024一季报：startPeriod=20240101, endPeriod=20240331
-        - 2024三季报：startPeriod=20240101, endPeriod=20240930
-        """)
+    @Tool
     public String getFinancialReport(String tsCode, String reportType, String startPeriod, String endPeriod) {
         return new MarketDataFinancialTools(domesticStockService, datasetWriter, datasetRegistry, this)
                 .getFinancialReport(tsCode, reportType, startPeriod, endPeriod);

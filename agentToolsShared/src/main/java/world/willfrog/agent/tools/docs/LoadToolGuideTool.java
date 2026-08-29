@@ -36,19 +36,7 @@ public class LoadToolGuideTool {
         this.objectMapper = objectMapper;
     }
 
-    @Tool("""
-        加载平台工具指南文档。只读，不消耗外部配额。
-
-        参数：
-          topic - 指南主题，必填。可选值：
-            python_sandbox      - Python 沙箱环境与 af_dataset_loader 用法
-            dataset_manifest    - dataset_manifest 结构与 partial failure 处理
-            advanced_market_data - searchAssetInfo/searchIndex advanced 模式与日期语义
-            execute_python_tips - executePython 常见陷阱与模板
-            finance_method_knowledge - 金融方法规范、调用约定与常见反例
-
-        返回：{ ok, data: { topic, content, source_path }, error }。
-        """)
+    @Tool
     public String loadToolGuide(@P(value = "指南主题，必填：python_sandbox|dataset_manifest|advanced_market_data|execute_python_tips|finance_method_knowledge", required = true) String topic) {
         try {
             String normalized = topic == null ? "" : topic.trim();
