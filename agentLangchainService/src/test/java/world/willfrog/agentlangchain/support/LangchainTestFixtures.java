@@ -6,8 +6,8 @@ import world.willfrog.agent.platform.config.AgentLlmProperties;
 import world.willfrog.agent.platform.service.AgentLlmLocalConfigLoader;
 import world.willfrog.agent.platform.service.AgentPromptService;
 import org.springframework.beans.factory.ObjectProvider;
-import world.willfrog.agentlangchain.orchestration.LangchainRunExecutionGuard;
-import world.willfrog.agentlangchain.orchestration.LangchainTodoNodeExecutor;
+import world.willfrog.agentlangchain.control.LangchainRunExecutionGuard;
+import world.willfrog.agentlangchain.execution.LangchainTodoNodeExecutor;
 import world.willfrog.agentlangchain.planning.LangchainAiPlanner;
 import world.willfrog.agentlangchain.planning.LangchainPlanningStructuredOutputSettings;
 

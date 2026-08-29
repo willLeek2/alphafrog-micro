@@ -6,7 +6,7 @@ import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
-import world.willfrog.agentlangchain.orchestration.LangchainLinearRunPipelineImpl;
+import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
 
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -28,7 +28,7 @@ import java.util.concurrent.ConcurrentMap;
 public class ToolJobResumeLauncherImpl implements ToolJobResumeLauncher {
 
     private final AgentRunMapper runMapper;
-    private final LangchainLinearRunPipelineImpl pipeline;
+    private final LangchainLinearRunPipeline pipeline;
     private final ObjectProvider<ToolJobResumeService> resumeServiceProvider;
     private final ConcurrentMap<ToolJobResumeClaimKey, Boolean> activeClaims = new ConcurrentHashMap<>();
 

@@ -17,7 +17,7 @@ import world.willfrog.agent.platform.service.AgentSsePayloadSupport;
 import world.willfrog.agent.workflow.DatasetRefRegistry;
 import world.willfrog.agent.tools.router.ToolRouter;
 import world.willfrog.agentlangchain.config.LangchainToolConcurrencyThrottle;
-import world.willfrog.agentlangchain.orchestration.ToolThrottleResult;
+import world.willfrog.agentlangchain.execution.ToolThrottleResult;
 
 import java.time.Duration;
 import java.time.Instant;
@@ -56,7 +56,7 @@ import java.util.UUID;
  * @see ToolRouterToolProvider 工具目录入口
  * @see world.willfrog.agent.tools.router.ToolRouter 统一执行与观测
  * @see LangchainRepeatedToolCallGuard 重复调用防护
- * @see world.willfrog.agentlangchain.orchestration.LangchainTodoNodeExecutor tool loop 宿主
+ * @see world.willfrog.agentlangchain.execution.LangchainTodoNodeExecutor tool loop 宿主
  */
 @RequiredArgsConstructor
 @Slf4j

@@ -8,7 +8,7 @@ import world.willfrog.agent.platform.dataanalysis.PythonSandboxDispatchStore;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.dataanalysis.ToolJobRunDisposition;
 import world.willfrog.agent.platform.model.AgentRunStatus;
-import world.willfrog.agentlangchain.orchestration.scheduler.LangchainSchedulerMetrics;
+import world.willfrog.agentlangchain.control.scheduler.LangchainSchedulerMetrics;
 
 import java.time.Instant;
 

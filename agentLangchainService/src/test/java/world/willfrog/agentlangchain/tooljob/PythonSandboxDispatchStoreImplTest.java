@@ -5,7 +5,7 @@ import org.springframework.beans.factory.ObjectProvider;
 import world.willfrog.agent.platform.dataanalysis.DagBlockingWorkerLease;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
 import world.willfrog.agent.platform.model.AgentRunStatus;
-import world.willfrog.agentlangchain.orchestration.scheduler.LangchainSchedulerMetrics;
+import world.willfrog.agentlangchain.control.scheduler.LangchainSchedulerMetrics;
 
 import java.time.Instant;
 

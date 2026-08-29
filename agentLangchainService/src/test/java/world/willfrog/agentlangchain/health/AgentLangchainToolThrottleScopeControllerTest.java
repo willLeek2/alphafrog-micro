@@ -7,8 +7,8 @@ import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.test.web.servlet.MockMvc;
 import world.willfrog.agentlangchain.config.LangchainServiceProperties;
 import world.willfrog.agentlangchain.config.LangchainToolConcurrencyThrottle;
-import world.willfrog.agentlangchain.orchestration.AgentLangchainOrchestrator;
-import world.willfrog.agentlangchain.orchestration.LangchainRunConcurrencyScheduler;
+import world.willfrog.agentlangchain.control.AgentLangchainOrchestrator;
+import world.willfrog.agentlangchain.control.LangchainRunConcurrencyScheduler;
 
 import java.util.LinkedHashMap;
 import java.util.Map;

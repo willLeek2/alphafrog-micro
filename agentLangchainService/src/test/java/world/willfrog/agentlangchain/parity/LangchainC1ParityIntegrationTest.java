@@ -9,11 +9,11 @@ import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.workflow.TodoItem;
-import world.willfrog.agentlangchain.orchestration.LangchainLinearRunPipelineImpl;
-import world.willfrog.agentlangchain.orchestration.LangchainLinearWorkflowExecutor;
-import world.willfrog.agentlangchain.orchestration.LangchainRunExecutionGuard;
-import world.willfrog.agentlangchain.orchestration.LangchainLinearWorkflowRequest;
-import world.willfrog.agentlangchain.orchestration.LangchainLinearWorkflowResult;
+import world.willfrog.agentlangchain.execution.LangchainLinearRunPipelineImpl;
+import world.willfrog.agentlangchain.execution.LangchainLinearWorkflowExecutor;
+import world.willfrog.agentlangchain.control.LangchainRunExecutionGuard;
+import world.willfrog.agentlangchain.execution.LangchainWorkflowRequest;
+import world.willfrog.agentlangchain.execution.LangchainWorkflowResult;
 import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
 import world.willfrog.agentlangchain.support.LangchainTestFixtures;
 
@@ -46,7 +46,7 @@ class LangchainC1ParityIntegrationTest {
                 "512800.SH 最近一周呈震荡上行。"
         );
 
-        LangchainLinearWorkflowResult result = executor.executePlanned(
+        LangchainWorkflowResult result = executor.executePlanned(
                 request(model, "查询 512800.SH 最近一周走势"),
                 singleTodoPlan("查询 512800.SH 最近一周走势"));
 
@@ -62,7 +62,7 @@ class LangchainC1ParityIntegrationTest {
                 "   "
         );
 
-        LangchainLinearWorkflowResult result = executor.executePlanned(
+        LangchainWorkflowResult result = executor.executePlanned(
                 request(model, "分析某只股票"),
                 singleTodoPlan("分析某只股票"));
 
@@ -76,7 +76,7 @@ class LangchainC1ParityIntegrationTest {
                 ""
         );
 
-        LangchainLinearWorkflowResult result = executor.executePlanned(
+        LangchainWorkflowResult result = executor.executePlanned(
                 request(model, "查询"),
                 singleTodoPlan("查询"));
 
@@ -85,8 +85,8 @@ class LangchainC1ParityIntegrationTest {
         assertThat(result.getFinalAnswer()).isBlank();
     }
 
-    private static LangchainLinearWorkflowRequest request(QueueChatModel model, String goal) {
-        return LangchainLinearWorkflowRequest.builder()
+    private static LangchainWorkflowRequest request(QueueChatModel model, String goal) {
+        return LangchainWorkflowRequest.builder()
                 .runId("run-parity-1")
                 .userId("u1")
                 .userGoal(goal)
@@ -104,7 +104,7 @@ class LangchainC1ParityIntegrationTest {
                 .build();
     }
 
-    private static void assertLegacyAlignedSuccess(LangchainLinearWorkflowResult result, String expectedAnswer) {
+    private static void assertLegacyAlignedSuccess(LangchainWorkflowResult result, String expectedAnswer) {
         assertThat(result.isSuccess()).isTrue();
         assertThat(result.getFinalAnswer()).isEqualTo(expectedAnswer);
         assertThat(result.getFailureReason()).isNull();
@@ -112,7 +112,7 @@ class LangchainC1ParityIntegrationTest {
         assertThat(result.getPlan().getItems()).isNotEmpty();
     }
 
-    private static void assertLegacyAlignedFailure(LangchainLinearWorkflowResult result) {
+    private static void assertLegacyAlignedFailure(LangchainWorkflowResult result) {
         assertThat(result.isSuccess()).isFalse();
         assertThat(result.getFinalAnswer()).isBlank();
         assertThat(result.getFailureReason()).isNotBlank();

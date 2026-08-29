@@ -47,7 +47,7 @@ import static world.willfrog.agent.platform.service.AgentRunObservabilityService
  *
  * <p>调用路径：</p>
  * <ol>
- *   <li>{@link world.willfrog.agentlangchain.orchestration.LangchainTodoNodeExecutor} 构建 AiServices 时
+ *   <li>{@link world.willfrog.agentlangchain.execution.LangchainTodoNodeExecutor} 构建 AiServices 时
  *       注入 {@code ObjectProvider<ToolProvider>}（Spring Bean 为 {@link world.willfrog.agentlangchain.config.LangchainToolsConfiguration#langchainToolProvider}）；</li>
  *   <li>每次 LC4j 发起 chat 前，若 {@link #isDynamic()} 为 true，会调用 {@link #provideTools(ToolProviderRequest)}；</li>
  *   <li>{@link LangchainRunContextBridge} 把 {@link InvocationParameters} 里的 runId/userId 写回
@@ -60,7 +60,7 @@ import static world.willfrog.agent.platform.service.AgentRunObservabilityService
  *
  * @see ToolRouterToolExecutor 工具执行委托
  * @see ToolCatalogBuilder run 级工具目录拼装
- * @see world.willfrog.agentlangchain.orchestration.LangchainTodoNodeExecutor AiServices 注入点
+ * @see world.willfrog.agentlangchain.execution.LangchainTodoNodeExecutor AiServices 注入点
  * @see world.willfrog.agent.tools.router.ToolRouter 统一执行语义
  */
 @RequiredArgsConstructor

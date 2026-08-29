@@ -1,7 +1,7 @@
 package world.willfrog.agentlangchain.config;
 
 import org.junit.jupiter.api.Test;
-import world.willfrog.agentlangchain.orchestration.ToolThrottleResult;
+import world.willfrog.agentlangchain.execution.ToolThrottleResult;
 
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
