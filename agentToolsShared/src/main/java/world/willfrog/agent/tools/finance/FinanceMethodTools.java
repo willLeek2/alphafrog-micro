@@ -83,17 +83,7 @@ public class FinanceMethodTools {
         this.targetEnvironmentProvider = targetEnvironmentProvider;
     }
 
-    @Tool("""
-        金融方法建议工具。只读建议工具，不计算数值。
-
-        输入：
-          query   - 用户自然语言问题，必填。允许包含“这几年”“最近一段”“到现在”等模糊时间表达。
-          context - 可选自然语言上下文（例如已取得的字段、数据说明）。
-
-        输出：候选方法、每个方法的定义、执行所需输入、未解决边界与澄清问题。
-        如果轻量解析器不可用或目录超出预算，会返回明确的技术错误码；
-        此时执行模型仍可继续调用 executePython 做自定义计算。
-        """)
+    @Tool
     public String resolveFinanceMethods(
             @P(value = "用户自然语言问题，必填", required = true) String query,
             @P(value = "可选自然语言上下文") String context) {

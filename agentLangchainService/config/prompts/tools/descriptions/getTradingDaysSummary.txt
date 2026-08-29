@@ -1,0 +1,1 @@
+查询A股交易日区间概览。参数要求：startDate/endDate 必须严格使用 YYYYMMDD；exchange 支持 SSE/SZSE/BSE，可选，默认 SSE。返回 trading_days_count、first_trading_date、last_trading_date；区间无交易日时 first_trading_date/last_trading_date 为 NONE。涉及交易日数量、首个交易日、最后交易日时禁止猜测，必须调用本工具。
