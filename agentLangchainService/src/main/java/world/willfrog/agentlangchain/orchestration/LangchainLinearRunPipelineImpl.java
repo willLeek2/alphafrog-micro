@@ -80,8 +80,8 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
     private final LangchainDagWorkflowExecutor dagWorkflowExecutor;
     private final LangchainRunStageModelResolver stageModelResolver;
     private final AgentRunMapper runMapper;
-    private final AgentRunEventService eventService;
-    private final ObjectMapper objectMapper;
+    protected final AgentRunEventService eventService;
+    protected final ObjectMapper objectMapper;
     private final ObjectProvider<ToolProvider> toolProviderProvider;
     private final ObjectProvider<AgentRunStateStore> stateStoreProvider;
     private final ObjectProvider<AgentRunObservabilityService> observabilityServiceProvider;
@@ -109,10 +109,10 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
     private ToolJobCheckpointFailureRecoveryService checkpointFailureRecoveryService;
 
     @Autowired(required = false)
-    private WorkflowCheckpointService workflowCheckpointService;
+    protected WorkflowCheckpointService workflowCheckpointService;
 
     @Autowired(required = false)
-    private AgentRunDagNodeMapper dagNodeMapper;
+    protected AgentRunDagNodeMapper dagNodeMapper;
 
     @Autowired(required = false)
     private LangchainSchedulerMetrics schedulerMetrics;
@@ -173,15 +173,6 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         runConcurrencyScheduler.submit(reservation, run, () -> executeRun(run));
     }
 
-    @Override
-    public boolean launchRestartedAsync(AgentRun run) {
-        if (run == null || isBlank(run.getId())) {
-            return false;
-        }
-        runConcurrencyScheduler.submit(null, run, () -> executeRun(run, true));
-        return true;
-    }
-
     /**
      * 把一次持久化恢复提交到普通 Run 共用的有界调度器。
      *
@@ -191,6 +182,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
      * @param completion 恢复 Runnable 退出时回报“结果是否已经持久化”的回调
      * @return 参数有效且成功进入调度器时返回 true；不会在这里调用 planner
      */
+    @Override
     public boolean launchResumedAsync(AgentRun run,
                                       ToolJobResumeContext context,
                                       BooleanSupplier terminalConsumed,
@@ -218,10 +210,6 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
     }
 
     void executeRun(AgentRun initialRun) {
-        executeRun(initialRun, false);
-    }
-
-    void executeRun(AgentRun initialRun, boolean serviceRestart) {
         if (initialRun == null || isBlank(initialRun.getId())) {
             return;
         }
@@ -236,192 +224,22 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         String userId = run.getUserId();
         String userGoal = "";
         try {
-            // AgentContext 是本次 LLM/tool 调用链的线程级上下文。
-            // 后续 OpenRouterProviderRoutedChatModel、ToolRouterToolProvider、可观测服务都会从这里取 runId/userId/phase。
-            AgentContext.setRunId(runId);
-            AgentContext.setUserId(userId);
-            // 先恢复并校验 run 级 Prompt 身份，再允许任何模型解析、观测初始化或
-            // follow-up 摘要调用。坏摘要必须在第一次 LLM 副作用之前失败即关闭。
-            setPromptSelectionFromExt(run.getExt());
-            DebugObservabilityService debugObservabilityService = debugObservabilityServiceProvider.getIfAvailable();
-            if (debugObservabilityService != null) {
-                DebugObservabilityRequest debugRequest = debugObservabilityService.parseFromExt(run.getExt());
-                debugObservabilityService.openRunSession(debugRequest, runId, userId);
-            }
-            if (!eventService.isRunnable(runId, userId)) {
+            if (!prepareRunContext(run)) {
                 return;
             }
-            // 防御性跑前校验（HTTP/Dubbo 已校验，pipeline 再校验一次防漏）
-            if (!hasAdminCreditBypass(run) && !creditService.hasPositiveCredit(userId)) {
-                String reason = "insufficient_credit";
-                log.warn("LangChain run blocked by credit pre-check: runId={} userId={}", runId, userId);
-                AgentRunObservabilityService observability = observabilityServiceProvider.getIfAvailable();
-                if (observability != null) {
-                    observability.recordFailure(runId, "CREDIT_BLOCK", reason);
-                }
-                String blockedSnapshot = attachObservability(
-                        runId, run.getSnapshotJson(), AgentRunStatus.FAILED, "CreditBlocked", reason);
-                int snapshotRows = runMapper.updateTerminalSnapshot(
-                        runId, userId, AgentRunStatus.FAILED, blockedSnapshot, true, reason);
-                int ttlRows = runMapper.updateStatusWithTtl(
-                        runId, userId, AgentRunStatus.FAILED, eventService.nextInterruptedExpiresAt());
-                if (snapshotRows == 1 && ttlRows == 1) {
-                    recordSchedulerCompletion(AgentRunStatus.FAILED);
-                }
-                eventService.append(runId, userId, "EXECUTION_BLOCKED",
-                        Map.of("reason", reason, "by", "credit_pre_check", "engine", "agentLangchainService"));
-                markRunStatus(runId, AgentRunStatus.FAILED);
+            if (!precheckRunnable(run)) {
                 return;
             }
-            runMapper.updateStatus(runId, userId, AgentRunStatus.EXECUTING);
-            markRunStatus(runId, AgentRunStatus.EXECUTING);
-            // 先写 EXECUTION_STARTED，让前端和压测脚本知道 run 已经从队列进入执行线程。
-            // 此时还没完成 planning，所以 workflow 先标 pending_plan，后续 PLAN_READY 再给出 linear/dag。
-            eventService.append(runId, userId, "EXECUTION_STARTED", Map.of(
-                    "run_id", runId,
-                    "engine", "agentLangchainService",
-                    "workflow", serviceRestart ? "frozen_plan_restart" : "pending_plan",
-                    "service_restart", serviceRestart,
-                    "restart_attempt", run.getRestartAttempt() == null ? 0 : run.getRestartAttempt()
-            ));
+            emitExecutionStarted(run);
 
-            // 阶段模型解析是 run 级配置落地的入口：
-            // 用户请求、stage_config_json、Nacos agent-llm 配置会在这里合并成 planning/execution/final 三个 ChatModel。
-            LangchainRunStageModelResolver.StageModels stageModels = stageModelResolver.resolve(run);
-            boolean captureLlmRequests = eventService.extractCaptureLlmRequests(run.getExt());
-            AgentRunObservabilityService observabilityService = observabilityServiceProvider.getIfAvailable();
-            if (observabilityService != null) {
-                // initializeRun 只初始化观测容器和默认模型信息，实际每次 LLM/tool 调用会在各自组件里继续追加 trace。
-                observabilityService.initializeRun(
-                        runId,
-                        firstNonBlank(stageModels.planningEndpointName(), eventService.extractEndpointName(run.getExt())),
-                        firstNonBlank(stageModels.planningModelName(), eventService.extractModelName(run.getExt())),
-                        captureLlmRequests);
-            }
-            // follow-up 复用同一个 run：这里把历史对话压缩内容和当前用户目标拆出来，
-            // 让 planning（规划）阶段既能看到追问上下文，又不会把旧消息原样塞满上下文窗口。
-            LangchainFollowUpContextSupport.ExecutionContext executionContext = followUpContextSupport.resolve(run);
-            userGoal = executionContext.userGoal();
-            String dialogueContext = executionContext.dialogueContext();
-            AgentRunEventService.RunConfig runConfig = eventService.extractRunConfig(run.getExt());
-            AgentContext.setWebSearchEnabled(runConfig.webSearchEnabled());
-            AgentContext.setWebSearchConfig(runConfig.webSearchConfig());
+            StageInputs inputs = resolveStageInputs(run);
+            userGoal = inputs.userGoal();
 
-            // 从 ext 反序列化 run 启动时冻结的 dataFreshness 快照
-            setDataFreshnessFromExt(run.getExt());
+            PlanResolution resolution = resolvePlan(run, inputs);
 
-            // 这里先解析”当前 run 允许暴露给模型的工具列表”，planning（规划）阶段会把这些工具能力写进 prompt，
-            // execution（执行）阶段也会用同一套 ToolSpecification 注册到 LC4j（LangChain4j）AiServices。
-            // 如果两处工具目录不一致，planner 可能安排一个执行阶段拿不到的工具，这是最难排查的类型之一。
-            List<ToolSpecification> toolSpecifications = resolveToolSpecifications(runConfig, userGoal);
-            LangchainLinearWorkflowRequest workflowRequest = buildWorkflowRequest(
-                    runId, userId, userGoal, dialogueContext, stageModels,
-                    toolSpecifications, runConfig);
-
-            /*
-             * execution mode 是 Run 创建时冻结的用户契约。代码解释器开关只决定是否暴露
-             * executePython，不能再覆盖 LINEAR / DAG / AUTO。非法值由统一解析器失败即关闭；
-             * 缺省值保持 AUTO。
-             */
-            PlanExecutionMode requestedExecutionMode = AgentRunEventService.parseExecutionMode(
-                    eventService.extractExecutionMode(run.getExt()));
-
-            LangchainTodoPlan plan;
-            boolean useDag;
-            PlanExecutionMode effectiveExecutionMode;
-            WorkflowExecutionCheckpoint restartCheckpoint = null;
-            if (serviceRestart) {
-                // 服务重启只读取数据库里的冻结 Plan；这里绝不调用 planner。
-                if (isBlank(run.getPlanJson()) || "{}".equals(run.getPlanJson().trim())) {
-                    throw new IllegalStateException("workflow_restart_plan_missing");
-                }
-                plan = objectMapper.readValue(run.getPlanJson(), LangchainTodoPlan.class);
-                validateFrozenPlan(plan);
-                useDag = LangchainWorkflowRouting.shouldUseDag(plan);
-                effectiveExecutionMode = useDag ? PlanExecutionMode.DAG : PlanExecutionMode.LINEAR;
-                if (useDag) {
-                    if (workflowCheckpointService == null) {
-                        throw new IllegalStateException("workflow_checkpoint_service_unavailable");
-                    }
-                    // DAG 从头重跑，但仍必须确认崩溃前没有启动过 UNSAFE 工具。
-                    workflowCheckpointService.parseAndValidateDagRestart(run);
-                    // DAG 不复用旧节点执行进度；删除仅用于 durable 展示/恢复的节点行。
-                    if (dagNodeMapper != null) {
-                        dagNodeMapper.deleteByRunId(runId);
-                        dagNodeMapper.clearFrontierForWorkflowRestart(runId);
-                    }
-                } else {
-                    if (workflowCheckpointService == null) {
-                        throw new IllegalStateException("workflow_checkpoint_service_unavailable");
-                    }
-                    restartCheckpoint = workflowCheckpointService.parseAndValidate(run, plan);
-                }
-                int restartAttempt = run.getRestartAttempt() == null ? 0 : run.getRestartAttempt();
-                eventService.appendOnce(runId, userId, "WORKFLOW_RESTARTED",
-                        runId + ":restart:" + restartAttempt,
-                        Map.of(
-                                "run_id", runId,
-                                "restart_attempt", restartAttempt,
-                                "planner_skipped", true,
-                                "workflow", useDag ? "dag" : "linear",
-                                "restart_from", useDag ? "graph_start" : restartCheckpoint.getNextTodoId()
-                        ));
-            } else {
-                // planning（规划）阶段只负责把用户目标变成 todo plan（任务计划）。
-                AgentContext.setPhase("planning");
-                LangchainTodoPlan planned = planner.plan(LangchainPlanningRequest.builder()
-                        .runId(runId)
-                        .userId(userId)
-                        .userGoal(userGoal)
-                        .dialogueContext(dialogueContext)
-                        .model(stageModels.planningModel())
-                        .planningEndpointName(stageModels.planningEndpointName())
-                        .planningModelName(stageModels.planningModelName())
-                        .planningProviderOrder(stageModels.planningProviderOrder())
-                        .toolSpecifications(toolSpecifications)
-                        .executionMode(requestedExecutionMode)
-                        .build());
-                plan = LangchainWorkflowRouting.effectivePlan(planned, requestedExecutionMode);
-                useDag = LangchainWorkflowRouting.shouldUseDag(plan);
-                effectiveExecutionMode = useDag ? PlanExecutionMode.DAG : PlanExecutionMode.LINEAR;
-                if (planned != plan) {
-                    log.info("Resolved effective workflow plan: runId={} requestedMode={} plannerMode={} effectiveMode={}",
-                            runId, requestedExecutionMode, planned.getExecutionMode(), effectiveExecutionMode);
-                }
-                // PLAN_READY 前先把冻结 Plan 和 LINEAR 初始 checkpoint 写稳。
-                persistPlan(runId, userId, plan);
-                if (workflowCheckpointService != null) {
-                    if (useDag) {
-                        workflowCheckpointService.initializeDag(runId, userId);
-                    } else {
-                        workflowCheckpointService.initializeLinear(runId, userId, plan);
-                    }
-                }
-                eventService.append(runId, userId, "PLAN_READY", Map.of(
-                        "execution_mode", effectiveExecutionMode.name(),
-                        "requested_execution_mode", requestedExecutionMode.name(),
-                        "effective_execution_mode", effectiveExecutionMode.name(),
-                        "workflow", useDag ? "dag" : "linear",
-                        "todo_count", plan.getItems() == null ? 0 : plan.getItems().size(),
-                        "plan", plan
-                ));
-            }
-
-            if (abortIfStopped(runId, userId, "before_execution")) {
+            LangchainLinearWorkflowResult result = executeWorkflow(inputs, resolution);
+            if (result == null) {
                 return;
-            }
-
-            // LINEAR 重启从 checkpoint 边界继续；DAG 重启与首次执行一样从整图开头调度。
-            LangchainLinearWorkflowResult result;
-            if (serviceRestart && !useDag) {
-                result = linearWorkflowExecutor.restartPlanned(workflowRequest, plan, restartCheckpoint);
-            } else {
-                LangchainWorkflowStepCoordinator.Outcome stepOutcome = stepCoordinator().execute(
-                        runId, userId, workflowRequest, plan, useDag);
-                result = stepOutcome.result();
-                if (stepOutcome.workerReleased()) {
-                    return;
-                }
             }
 
             // cancel/pause 可能发生在 todo 执行和最终落库之间。
@@ -434,9 +252,9 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
 
             runMapper.updatePlanJson(runId, userId, writeJson(result.getPlan()));
             if (result.isSuccess()) {
-                persistCompletedOutcome(run, userGoal, stageModels, result, null);
+                persistCompletedOutcome(run, userGoal, inputs.stageModels(), result, null);
             } else if (result.isPartial()) {
-                persistPartialOutcome(run, userGoal, stageModels, result, null);
+                persistPartialOutcome(run, userGoal, inputs.stageModels(), result, null);
             } else {
                 publishFailure(runId, userId, userGoal, result, null);
                 tryScheduleSettlement(runId, userId);
@@ -479,6 +297,206 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             // 异步线程会被线程池复用，必须清理 ThreadLocal（线程本地变量），避免下一个 run 继承上一个 run 的 phase/todo/provider 信息。
             AgentContext.clear();
         }
+    }
+
+    /** 当前执行形态的标识，进 EXECUTION_STARTED 事件的 workflow 字段；子类按形态覆盖。 */
+    protected String formKind() {
+        return "pending_plan";
+    }
+
+    /** 阶段一：重建线程级运行上下文（ThreadLocal 身份、Prompt 选择、调试会话）并做可运行检查。 */
+    private boolean prepareRunContext(AgentRun run) {
+        String runId = run.getId();
+        String userId = run.getUserId();
+        // AgentContext 是本次 LLM/tool 调用链的线程级上下文。
+        // 后续 OpenRouterProviderRoutedChatModel、ToolRouterToolProvider、可观测服务都会从这里取 runId/userId/phase。
+        AgentContext.setRunId(runId);
+        AgentContext.setUserId(userId);
+        // 先恢复并校验 run 级 Prompt 身份，再允许任何模型解析、观测初始化或
+        // follow-up 摘要调用。坏摘要必须在第一次 LLM 副作用之前失败即关闭。
+        setPromptSelectionFromExt(run.getExt());
+        DebugObservabilityService debugObservabilityService = debugObservabilityServiceProvider.getIfAvailable();
+        if (debugObservabilityService != null) {
+            DebugObservabilityRequest debugRequest = debugObservabilityService.parseFromExt(run.getExt());
+            debugObservabilityService.openRunSession(debugRequest, runId, userId);
+        }
+        return eventService.isRunnable(runId, userId);
+    }
+
+    /** 阶段二：跑前额度校验（失败即关闭并把 Run 写成 FAILED）并把状态推进到 EXECUTING。 */
+    private boolean precheckRunnable(AgentRun run) {
+        String runId = run.getId();
+        String userId = run.getUserId();
+        // 防御性跑前校验（HTTP/Dubbo 已校验，pipeline 再校验一次防漏）
+        if (!hasAdminCreditBypass(run) && !creditService.hasPositiveCredit(userId)) {
+            String reason = "insufficient_credit";
+            log.warn("LangChain run blocked by credit pre-check: runId={} userId={}", runId, userId);
+            AgentRunObservabilityService observability = observabilityServiceProvider.getIfAvailable();
+            if (observability != null) {
+                observability.recordFailure(runId, "CREDIT_BLOCK", reason);
+            }
+            String blockedSnapshot = attachObservability(
+                    runId, run.getSnapshotJson(), AgentRunStatus.FAILED, "CreditBlocked", reason);
+            int snapshotRows = runMapper.updateTerminalSnapshot(
+                    runId, userId, AgentRunStatus.FAILED, blockedSnapshot, true, reason);
+            int ttlRows = runMapper.updateStatusWithTtl(
+                    runId, userId, AgentRunStatus.FAILED, eventService.nextInterruptedExpiresAt());
+            if (snapshotRows == 1 && ttlRows == 1) {
+                recordSchedulerCompletion(AgentRunStatus.FAILED);
+            }
+            eventService.append(runId, userId, "EXECUTION_BLOCKED",
+                    Map.of("reason", reason, "by", "credit_pre_check", "engine", "agentLangchainService"));
+            markRunStatus(runId, AgentRunStatus.FAILED);
+            return false;
+        }
+        runMapper.updateStatus(runId, userId, AgentRunStatus.EXECUTING);
+        markRunStatus(runId, AgentRunStatus.EXECUTING);
+        return true;
+    }
+
+    /** 阶段三：先写 EXECUTION_STARTED，让前端和压测脚本知道 run 已经从队列进入执行线程。 */
+    private void emitExecutionStarted(AgentRun run) {
+        // 此时还没完成 planning，所以 workflow 先标当前形态（pending_plan / frozen_plan_restart），PLAN_READY 再给出 linear/dag。
+        boolean frozenRestart = "frozen_plan_restart".equals(formKind());
+        eventService.append(run.getId(), run.getUserId(), "EXECUTION_STARTED", Map.of(
+                "run_id", run.getId(),
+                "engine", "agentLangchainService",
+                "workflow", formKind(),
+                "service_restart", frozenRestart,
+                "restart_attempt", run.getRestartAttempt() == null ? 0 : run.getRestartAttempt()
+        ));
+    }
+
+    /**
+     * 阶段四：解析执行所需的全部运行环境——阶段模型、可观测容器初始化、follow-up 上下文、
+     * 运行配置、数据新鲜度、工具目录，并组装工作流请求。三种形态共用同一份解析结果。
+     */
+    private StageInputs resolveStageInputs(AgentRun run) {
+        String runId = run.getId();
+        String userId = run.getUserId();
+        // 阶段模型解析是 run 级配置落地的入口：
+        // 用户请求、stage_config_json、Nacos agent-llm 配置会在这里合并成 planning/execution/final 三个 ChatModel。
+        LangchainRunStageModelResolver.StageModels stageModels = stageModelResolver.resolve(run);
+        boolean captureLlmRequests = eventService.extractCaptureLlmRequests(run.getExt());
+        AgentRunObservabilityService observabilityService = observabilityServiceProvider.getIfAvailable();
+        if (observabilityService != null) {
+            // initializeRun 只初始化观测容器和默认模型信息，实际每次 LLM/tool 调用会在各自组件里继续追加 trace。
+            observabilityService.initializeRun(
+                    runId,
+                    firstNonBlank(stageModels.planningEndpointName(), eventService.extractEndpointName(run.getExt())),
+                    firstNonBlank(stageModels.planningModelName(), eventService.extractModelName(run.getExt())),
+                    captureLlmRequests);
+        }
+        // follow-up 复用同一个 run：这里把历史对话压缩内容和当前用户目标拆出来，
+        // 让 planning（规划）阶段既能看到追问上下文，又不会把旧消息原样塞满上下文窗口。
+        LangchainFollowUpContextSupport.ExecutionContext executionContext = followUpContextSupport.resolve(run);
+        String userGoal = executionContext.userGoal();
+        String dialogueContext = executionContext.dialogueContext();
+        AgentRunEventService.RunConfig runConfig = eventService.extractRunConfig(run.getExt());
+        AgentContext.setWebSearchEnabled(runConfig.webSearchEnabled());
+        AgentContext.setWebSearchConfig(runConfig.webSearchConfig());
+        // 从 ext 反序列化 run 启动时冻结的 dataFreshness 快照
+        setDataFreshnessFromExt(run.getExt());
+        // 这里先解析”当前 run 允许暴露给模型的工具列表”，planning（规划）阶段会把这些工具能力写进 prompt，
+        // execution（执行）阶段也会用同一套 ToolSpecification 注册到 LC4j（LangChain4j）AiServices。
+        // 如果两处工具目录不一致，planner 可能安排一个执行阶段拿不到的工具，这是最难排查的类型之一。
+        List<ToolSpecification> toolSpecifications = resolveToolSpecifications(runConfig, userGoal);
+        LangchainLinearWorkflowRequest workflowRequest = buildWorkflowRequest(
+                runId, userId, userGoal, dialogueContext, stageModels, toolSpecifications, runConfig);
+        /*
+         * execution mode 是 Run 创建时冻结的用户契约。代码解释器开关只决定是否暴露
+         * executePython，不能再覆盖 LINEAR / DAG / AUTO。非法值由统一解析器失败即关闭；
+         * 缺省值保持 AUTO。
+         */
+        PlanExecutionMode requestedExecutionMode = AgentRunEventService.parseExecutionMode(
+                eventService.extractExecutionMode(run.getExt()));
+        return new StageInputs(runId, userId, userGoal, dialogueContext, stageModels,
+                toolSpecifications, workflowRequest, requestedExecutionMode);
+    }
+
+    /**
+     * 阶段五：获取本次执行要用的计划。默认实现是全新执行形态——调规划器现场规划，
+     * 冻结 Plan 与初始检查点，发 PLAN_READY。冻结计划重启形态由子类覆盖本方法，
+     * 只读数据库里的冻结 Plan，绝不调规划器。
+     */
+    protected PlanResolution resolvePlan(AgentRun run, StageInputs inputs) throws Exception {
+        // planning（规划）阶段只负责把用户目标变成 todo plan（任务计划）。
+        AgentContext.setPhase("planning");
+        LangchainTodoPlan planned = planner.plan(LangchainPlanningRequest.builder()
+                .runId(inputs.runId())
+                .userId(inputs.userId())
+                .userGoal(inputs.userGoal())
+                .dialogueContext(inputs.dialogueContext())
+                .model(inputs.stageModels().planningModel())
+                .planningEndpointName(inputs.stageModels().planningEndpointName())
+                .planningModelName(inputs.stageModels().planningModelName())
+                .planningProviderOrder(inputs.stageModels().planningProviderOrder())
+                .toolSpecifications(inputs.toolSpecifications())
+                .executionMode(inputs.requestedExecutionMode())
+                .build());
+        LangchainTodoPlan plan = LangchainWorkflowRouting.effectivePlan(planned, inputs.requestedExecutionMode());
+        boolean useDag = LangchainWorkflowRouting.shouldUseDag(plan);
+        PlanExecutionMode effectiveExecutionMode = useDag ? PlanExecutionMode.DAG : PlanExecutionMode.LINEAR;
+        if (planned != plan) {
+            log.info("Resolved effective workflow plan: runId={} requestedMode={} plannerMode={} effectiveMode={}",
+                    inputs.runId(), inputs.requestedExecutionMode(), planned.getExecutionMode(), effectiveExecutionMode);
+        }
+        // PLAN_READY 前先把冻结 Plan 和 LINEAR 初始 checkpoint 写稳。
+        persistPlan(inputs.runId(), inputs.userId(), plan);
+        if (workflowCheckpointService != null) {
+            if (useDag) {
+                workflowCheckpointService.initializeDag(inputs.runId(), inputs.userId());
+            } else {
+                workflowCheckpointService.initializeLinear(inputs.runId(), inputs.userId(), plan);
+            }
+        }
+        eventService.append(inputs.runId(), inputs.userId(), "PLAN_READY", Map.of(
+                "execution_mode", effectiveExecutionMode.name(),
+                "requested_execution_mode", inputs.requestedExecutionMode().name(),
+                "effective_execution_mode", effectiveExecutionMode.name(),
+                "workflow", useDag ? "dag" : "linear",
+                "todo_count", plan.getItems() == null ? 0 : plan.getItems().size(),
+                "plan", plan
+        ));
+        return new PlanResolution(plan, useDag, effectiveExecutionMode, null);
+    }
+
+    /**
+     * 阶段六：执行工作流。LINEAR 重启（解析结果带检查点边界）从 checkpoint 继续；
+     * 其余情况按计划形态走步骤协调器。返回 null 表示 worker 已被释放（挂起转后台），调用方静默结束。
+     */
+    private LangchainLinearWorkflowResult executeWorkflow(StageInputs inputs, PlanResolution resolution) {
+        if (abortIfStopped(inputs.runId(), inputs.userId(), "before_execution")) {
+            return null;
+        }
+        if (resolution.restartCheckpoint() != null) {
+            return linearWorkflowExecutor.restartPlanned(
+                    inputs.workflowRequest(), resolution.plan(), resolution.restartCheckpoint());
+        }
+        LangchainWorkflowStepCoordinator.Outcome stepOutcome = stepCoordinator().execute(
+                inputs.runId(), inputs.userId(), inputs.workflowRequest(), resolution.plan(), resolution.useDag());
+        if (stepOutcome.workerReleased()) {
+            return null;
+        }
+        return stepOutcome.result();
+    }
+
+    /** 执行阶段的共享输入：三种形态共用同一份环境解析结果。 */
+    protected record StageInputs(String runId,
+                                 String userId,
+                                 String userGoal,
+                                 String dialogueContext,
+                                 LangchainRunStageModelResolver.StageModels stageModels,
+                                 List<ToolSpecification> toolSpecifications,
+                                 LangchainLinearWorkflowRequest workflowRequest,
+                                 PlanExecutionMode requestedExecutionMode) {
+    }
+
+    /** 计划解析结果：计划本体、执行形态、生效模式，以及 LINEAR 重启的检查点边界（非重启形态为 null）。 */
+    protected record PlanResolution(LangchainTodoPlan plan,
+                                    boolean useDag,
+                                    PlanExecutionMode effectiveExecutionMode,
+                                    WorkflowExecutionCheckpoint restartCheckpoint) {
     }
 
     boolean executeResumedRun(AgentRun initialRun,
@@ -875,7 +893,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         }
     }
 
-    private void validateFrozenPlan(LangchainTodoPlan plan) {
+    protected void validateFrozenPlan(LangchainTodoPlan plan) {
         LangchainWorkflowRouting.validateFrozenPlan(plan);
     }
 
@@ -1048,7 +1066,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         return node != null && !node.isNull() ? node.asText() : null;
     }
 
-    private boolean isBlank(String value) {
+    protected boolean isBlank(String value) {
         return value == null || value.trim().isEmpty();
     }
 

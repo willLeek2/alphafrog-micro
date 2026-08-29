@@ -17,4 +17,12 @@ public interface LangchainLinearRunPipeline {
     default boolean launchRestartedAsync(AgentRun run) {
         return false;
     }
+
+    /** 长工具挂起后的恢复入口；实现按恢复令牌与租约把 Run 接回执行。 */
+    default boolean launchResumedAsync(AgentRun run,
+                                       world.willfrog.agentlangchain.tooljob.ToolJobResumeContext context,
+                                       java.util.function.BooleanSupplier terminalConsumed,
+                                       java.util.function.Consumer<Boolean> completion) {
+        return false;
+    }
 }
