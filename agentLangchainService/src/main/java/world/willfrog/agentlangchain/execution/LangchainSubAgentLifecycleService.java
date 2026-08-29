@@ -307,7 +307,7 @@ public class LangchainSubAgentLifecycleService implements SubAgentControlHandler
                             .filter(spec -> !CONTROL_TOOLS.contains(spec.name()))
                             .toList();
             String childGoal = context.isEmpty() ? goal : goal + "\n\nContext:\n" + context;
-            LangchainLinearWorkflowRequest childRequest = LangchainLinearWorkflowRequest.builder()
+            LangchainWorkflowRequest childRequest = LangchainWorkflowRequest.builder()
                     .runId(handle.runId)
                     .userId(handle.userId)
                     .userGoal(childGoal)

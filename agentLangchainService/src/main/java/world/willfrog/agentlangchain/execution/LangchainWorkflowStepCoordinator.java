@@ -35,10 +35,10 @@ final class LangchainWorkflowStepCoordinator {
 
     Outcome execute(String runId,
                     String userId,
-                    LangchainLinearWorkflowRequest request,
+                    LangchainWorkflowRequest request,
                     LangchainTodoPlan plan,
                     boolean useDag) {
-        LangchainLinearWorkflowResult result = useDag
+        LangchainWorkflowResult result = useDag
                 ? dagExecutor.executePlanned(request, plan)
                 : linearExecutor.executePlanned(request, plan);
         if (!result.isSuspended()) {
@@ -70,6 +70,6 @@ final class LangchainWorkflowStepCoordinator {
         return value == null ? "" : value;
     }
 
-    record Outcome(LangchainLinearWorkflowResult result, boolean workerReleased) {
+    record Outcome(LangchainWorkflowResult result, boolean workerReleased) {
     }
 }

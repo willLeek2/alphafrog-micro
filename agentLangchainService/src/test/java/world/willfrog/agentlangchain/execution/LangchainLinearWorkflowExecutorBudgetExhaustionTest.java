@@ -72,7 +72,7 @@ class LangchainLinearWorkflowExecutorBudgetExhaustionTest {
                 .thenReturn(LangchainTodoNodeResult.failure("simulated", budgetMeta));
 
         LangchainTodoPlan plan = planWithItems(item("todo_1", 1), item("todo_2", 2));
-        LangchainLinearWorkflowResult result = executor.executePlanned(
+        LangchainWorkflowResult result = executor.executePlanned(
                 request("run-budget-partial", "user-1"), plan);
 
         // success=false + partial=true + finalAnswer 来自 completed todos（不调 LLM）
@@ -110,7 +110,7 @@ class LangchainLinearWorkflowExecutorBudgetExhaustionTest {
                 .thenReturn(LangchainTodoNodeResult.failure("simulated", budgetMeta));
 
         LangchainTodoPlan plan = planWithItems(item("todo_1", 1));
-        LangchainLinearWorkflowResult result = executor.executePlanned(
+        LangchainWorkflowResult result = executor.executePlanned(
                 request("run-budget-failfast", "user-1"), plan);
 
         // success=false + partial=false（无任何完成 todo）+ no finalAnswer
@@ -147,7 +147,7 @@ class LangchainLinearWorkflowExecutorBudgetExhaustionTest {
                 .thenReturn(LangchainTodoNodeResult.failure("simulated", emptyMeta));
 
         LangchainTodoPlan plan = planWithItems(item("todo_1", 1), item("todo_2", 2));
-        LangchainLinearWorkflowResult result = executor.executePlanned(
+        LangchainWorkflowResult result = executor.executePlanned(
                 request("run-normal-fail", "user-1"), plan);
 
         assertThat(result.isSuccess()).isFalse();
@@ -180,7 +180,7 @@ class LangchainLinearWorkflowExecutorBudgetExhaustionTest {
 
         LangchainTodoPlan plan = planWithItems(
                 item("todo_1", 1), item("todo_2", 2), item("todo_3", 3), item("todo_4", 4));
-        LangchainLinearWorkflowResult result = executor.executePlanned(
+        LangchainWorkflowResult result = executor.executePlanned(
                 request("run-budget-multi", "user-1"), plan);
 
         assertThat(result.isSuccess()).isFalse();
@@ -225,8 +225,8 @@ class LangchainLinearWorkflowExecutorBudgetExhaustionTest {
                 .build();
     }
 
-    private static LangchainLinearWorkflowRequest request(String runId, String userId) {
-        return LangchainLinearWorkflowRequest.builder()
+    private static LangchainWorkflowRequest request(String runId, String userId) {
+        return LangchainWorkflowRequest.builder()
                 .runId(runId)
                 .userId(userId)
                 .userGoal("test goal")

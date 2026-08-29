@@ -82,7 +82,7 @@ class LangchainLinearRunPipelineObservabilityTest {
                 .build());
         LangchainLinearWorkflowExecutor linearWorkflowExecutor = mock(LangchainLinearWorkflowExecutor.class);
         when(linearWorkflowExecutor.executePlanned(any(), any())).thenReturn(
-                LangchainLinearWorkflowResult.builder().success(true).finalAnswer("ok").build());
+                LangchainWorkflowResult.builder().success(true).finalAnswer("ok").build());
 
         LangchainFollowUpContextSupport followUpContextSupport = mock(LangchainFollowUpContextSupport.class);
         when(followUpContextSupport.resolve(run)).thenAnswer(invocation -> {

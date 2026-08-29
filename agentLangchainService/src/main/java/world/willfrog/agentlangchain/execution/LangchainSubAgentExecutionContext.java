@@ -23,7 +23,7 @@ public final class LangchainSubAgentExecutionContext {
     private LangchainSubAgentExecutionContext() {
     }
 
-    public static Scope install(LangchainLinearWorkflowRequest request,
+    public static Scope install(LangchainWorkflowRequest request,
                                 Map<String, String> datasetRefs,
                                 AtomicInteger runToolCalls) {
         Environment previous = CURRENT.get();
@@ -40,14 +40,14 @@ public final class LangchainSubAgentExecutionContext {
         return Optional.ofNullable(CURRENT.get());
     }
 
-    private static LangchainLinearWorkflowRequest copyRequest(LangchainLinearWorkflowRequest source) {
+    private static LangchainWorkflowRequest copyRequest(LangchainWorkflowRequest source) {
         if (source == null) {
             return null;
         }
         List<ToolSpecification> specifications = source.getToolSpecifications() == null
                 ? List.of()
                 : List.copyOf(source.getToolSpecifications());
-        return LangchainLinearWorkflowRequest.builder()
+        return LangchainWorkflowRequest.builder()
                 .runId(source.getRunId())
                 .userId(source.getUserId())
                 .userGoal(source.getUserGoal())
@@ -69,7 +69,7 @@ public final class LangchainSubAgentExecutionContext {
     }
 
     public record Environment(
-            LangchainLinearWorkflowRequest parentRequest,
+            LangchainWorkflowRequest parentRequest,
             AgentContext.ContextSnapshot runContext,
             Map<String, String> datasetRefs,
             AtomicInteger runToolCalls) {

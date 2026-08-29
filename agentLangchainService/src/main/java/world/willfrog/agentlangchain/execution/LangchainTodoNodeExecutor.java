@@ -227,7 +227,7 @@ public class LangchainTodoNodeExecutor {
      * @param toolCalls    run 级工具调用计数器（引用类型，会被修改）
      * @return 执行结果，成功时包含模型输出文本及本 todo 消耗的工具调用次数
      */
-    public LangchainTodoNodeResult execute(LangchainLinearWorkflowRequest request,
+    public LangchainTodoNodeResult execute(LangchainWorkflowRequest request,
                                            TodoItem item,
                                            List<LangchainCompletedTodo> completedTodos,
                                            Map<String, String> datasetRefs,
@@ -238,10 +238,10 @@ public class LangchainTodoNodeExecutor {
     /**
      * 启动一轮修复：工具失败终态被某个 {@link ToolRepairHandler} 认领后，用同一 Todo 再执行一轮。
      * repairContext 只投影 anchor 中的持久化状态，不是新的真相源。
-     * 正常执行请走 {@link #execute(LangchainLinearWorkflowRequest, TodoItem, List, Map, AtomicInteger)}；
+     * 正常执行请走 {@link #execute(LangchainWorkflowRequest, TodoItem, List, Map, AtomicInteger)}；
      * 语义重试不提升为公开入口，在私有 {@link #runAttempt} 内递归。
      */
-    public LangchainTodoNodeResult executeRepairRound(LangchainLinearWorkflowRequest request,
+    public LangchainTodoNodeResult executeRepairRound(LangchainWorkflowRequest request,
                                                       TodoItem item,
                                                       List<LangchainCompletedTodo> completedTodos,
                                                       Map<String, String> datasetRefs,
@@ -250,7 +250,7 @@ public class LangchainTodoNodeExecutor {
         return runAttempt(request, item, completedTodos, datasetRefs, toolCalls, repairContext, null);
     }
 
-    private LangchainTodoNodeResult runAttempt(LangchainLinearWorkflowRequest request,
+    private LangchainTodoNodeResult runAttempt(LangchainWorkflowRequest request,
                                                     TodoItem item,
                                                     List<LangchainCompletedTodo> completedTodos,
                                                     Map<String, String> datasetRefs,
@@ -473,7 +473,7 @@ public class LangchainTodoNodeExecutor {
      *   <li>可恢复 → 走 {@link #buildRecoveryAiService} 第二次调用；success → 标 recovered=true，still blank / exception → 走 {@code empty_todo_output_after_recovery} 失败并附 observation。</li>
      * </ul>
      */
-    private LangchainTodoNodeResult handleEmptyOutput(LangchainLinearWorkflowRequest request,
+    private LangchainTodoNodeResult handleEmptyOutput(LangchainWorkflowRequest request,
                                                        TodoItem item,
                                                        Map<String, String> datasetRefs,
                                                        AtomicInteger toolCalls,
@@ -577,7 +577,7 @@ public class LangchainTodoNodeExecutor {
      *   <li>仅保留 {@code chatRequestTransformer -> ensureRunnable(request)}，防止用户在 recovery 中途点 cancel。</li>
      * </ul>
      */
-    private LangchainTodoExecutionAiService buildRecoveryAiService(LangchainLinearWorkflowRequest request) {
+    private LangchainTodoExecutionAiService buildRecoveryAiService(LangchainWorkflowRequest request) {
         return AiServices.builder(LangchainTodoExecutionAiService.class)
                 .chatModel(request.executionModelOrDefault())
                 .systemMessageProvider(ignored -> promptService.reactSystemPrompt())
@@ -730,7 +730,7 @@ public class LangchainTodoNodeExecutor {
      * @param completedTodos 所有已完成 todo 的结果列表
      * @return 面向用户的最终回答文本
      */
-    public String writeFinalAnswer(LangchainLinearWorkflowRequest request,
+    public String writeFinalAnswer(LangchainWorkflowRequest request,
                                    List<LangchainCompletedTodo> completedTodos) {
         // 生成最终答案前也要检查 run 是否已被取消——避免用户在最后一步点了 cancel 但请求仍发出
         ensureRunnable(request);
@@ -774,7 +774,7 @@ public class LangchainTodoNodeExecutor {
      * @param datasetRefs 跨 todo 数据集引用表
      * @return 配置完成的 LC4j AiServices 代理实例
      */
-    private LangchainTodoExecutionAiService buildTodoAiService(LangchainLinearWorkflowRequest request,
+    private LangchainTodoExecutionAiService buildTodoAiService(LangchainWorkflowRequest request,
                                                                AtomicInteger toolCalls,
                                                                Map<String, String> datasetRefs,
                                                                ToolRepairHandler repairHandler,
@@ -829,7 +829,7 @@ public class LangchainTodoNodeExecutor {
      * @param request 当前 run 请求上下文
      * @return 配置完成的 final answer AiServices 代理实例
      */
-    private LangchainFinalAnswerAiService buildFinalAnswerAiService(LangchainLinearWorkflowRequest request) {
+    private LangchainFinalAnswerAiService buildFinalAnswerAiService(LangchainWorkflowRequest request) {
         return AiServices.builder(LangchainFinalAnswerAiService.class)
                 .chatModel(request.finalAnswerModelOrDefault())
                 .systemMessageProvider(ignored -> promptService.reactSystemPrompt())
@@ -859,7 +859,7 @@ public class LangchainTodoNodeExecutor {
      *
      * @param request 当前 run 请求上下文，含 runId 和 userId
      */
-    private void ensureRunnable(LangchainLinearWorkflowRequest request) {
+    private void ensureRunnable(LangchainWorkflowRequest request) {
         if (request == null) {
             return;
         }
@@ -959,7 +959,7 @@ public class LangchainTodoNodeExecutor {
      * <p>
      * 这里特判：如果 cause chain 任一环是 {@link RunBudgetException} 或异常消息以 {@code RUN_BUDGET_EXCEEDED:} 开头，
      * 返回一个带 {@code budget_exceeded=true} + dimension/actual/limit/ratio 字段的 metadata map，
-     * 透传到 LangchainTodoNodeResult.failureMetadata → LangchainLinearWorkflowResult.failureMetadata →
+     * 透传到 LangchainTodoNodeResult.failureMetadata → LangchainWorkflowResult.failureMetadata →
      * pipeline WORKFLOW_PARTIAL_BUDGET / WORKFLOW_FAILED_BUDGET event payload。
      * <p>
      * 非 budget 异常返回 null，与现有空 failureMetadata 行为一致。

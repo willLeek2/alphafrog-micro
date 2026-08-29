@@ -143,7 +143,7 @@ class LangchainLinearRunPipelineFailureStageTest {
                 .build());
 
         LangchainLinearWorkflowExecutor linear = mock(LangchainLinearWorkflowExecutor.class);
-        when(linear.executePlanned(any(), any())).thenReturn(LangchainLinearWorkflowResult.builder()
+        when(linear.executePlanned(any(), any())).thenReturn(LangchainWorkflowResult.builder()
                 .success(false)
                 .failureReason("tool_execution_failed:some_tool")
                 .toolCallsUsed(1)

@@ -247,7 +247,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             PlanResolution resolution = resolvePlan(run, inputs);
 
             stage = "execute_workflow";
-            LangchainLinearWorkflowResult result = executeWorkflow(inputs, resolution);
+            LangchainWorkflowResult result = executeWorkflow(inputs, resolution);
             if (result == null) {
                 return;
             }
@@ -274,7 +274,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             // 所有未被 workflow result（工作流结果）显式表达的异常都会收敛到统一失败出口，
             // 由 LangchainFailureMapper 决定前端事件类型和 observability failure type（可观测失败类型）。
             publishFailure(runId, userId, userGoal,
-                    LangchainLinearWorkflowResult.builder()
+                    LangchainWorkflowResult.builder()
                             .success(false)
                             .failureReason(e.getMessage())
                             .toolCallsUsed(0)
@@ -411,7 +411,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         // execution（执行）阶段也会用同一套 ToolSpecification 注册到 LC4j（LangChain4j）AiServices。
         // 如果两处工具目录不一致，planner 可能安排一个执行阶段拿不到的工具，这是最难排查的类型之一。
         List<ToolSpecification> toolSpecifications = resolveToolSpecifications(runConfig, userGoal);
-        LangchainLinearWorkflowRequest workflowRequest = buildWorkflowRequest(
+        LangchainWorkflowRequest workflowRequest = buildWorkflowRequest(
                 runId, userId, userGoal, dialogueContext, stageModels, toolSpecifications, runConfig);
         /*
          * execution mode 是 Run 创建时冻结的用户契约。代码解释器开关只决定是否暴露
@@ -444,9 +444,12 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                 .toolSpecifications(inputs.toolSpecifications())
                 .executionMode(inputs.requestedExecutionMode())
                 .build());
-        LangchainTodoPlan plan = LangchainWorkflowRouting.effectivePlan(planned, inputs.requestedExecutionMode());
-        boolean useDag = LangchainWorkflowRouting.shouldUseDag(plan);
-        PlanExecutionMode effectiveExecutionMode = useDag ? PlanExecutionMode.DAG : PlanExecutionMode.LINEAR;
+        // 用户要求、规划结果、生效模式三层词汇交给 ExecutionModeResolver 一次裁完，管线不再自己拼这三层。
+        ExecutionModeResolver.Decision modeDecision =
+                ExecutionModeResolver.resolve(inputs.requestedExecutionMode(), planned);
+        LangchainTodoPlan plan = modeDecision.effectivePlan();
+        boolean useDag = modeDecision.useDag();
+        PlanExecutionMode effectiveExecutionMode = modeDecision.effective();
         if (planned != plan) {
             log.info("Resolved effective workflow plan: runId={} requestedMode={} plannerMode={} effectiveMode={}",
                     inputs.runId(), inputs.requestedExecutionMode(), planned.getExecutionMode(), effectiveExecutionMode);
@@ -463,10 +466,14 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
         eventService.append(inputs.runId(), inputs.userId(), "PLAN_READY", Map.of(
                 "execution_mode", effectiveExecutionMode.name(),
                 "requested_execution_mode", inputs.requestedExecutionMode().name(),
+                "planned_execution_mode", modeDecision.planned() == null
+                        ? ""
+                        : modeDecision.planned().name(),
                 "effective_execution_mode", effectiveExecutionMode.name(),
                 "workflow", useDag ? "dag" : "linear",
                 "todo_count", plan.getItems() == null ? 0 : plan.getItems().size(),
-                "plan", plan
+                "plan", plan,
+                "reason", modeDecision.reason()
         ));
         return new PlanResolution(plan, useDag, effectiveExecutionMode, null);
     }
@@ -475,7 +482,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
      * 阶段六：执行工作流。LINEAR 重启（解析结果带检查点边界）从 checkpoint 继续；
      * 其余情况按计划形态走步骤协调器。返回 null 表示 worker 已被释放（挂起转后台），调用方静默结束。
      */
-    private LangchainLinearWorkflowResult executeWorkflow(StageInputs inputs, PlanResolution resolution) {
+    private LangchainWorkflowResult executeWorkflow(StageInputs inputs, PlanResolution resolution) {
         if (abortIfStopped(inputs.runId(), inputs.userId(), "before_execution")) {
             return null;
         }
@@ -498,7 +505,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
                                  String dialogueContext,
                                  LangchainRunStageModelResolver.StageModels stageModels,
                                  List<ToolSpecification> toolSpecifications,
-                                 LangchainLinearWorkflowRequest workflowRequest,
+                                 LangchainWorkflowRequest workflowRequest,
                                  PlanExecutionMode requestedExecutionMode) {
     }
 
@@ -540,7 +547,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             // 从 DB 还原挂起前冻结的原计划。
             LangchainTodoPlan plan = objectMapper.readValue(run.getPlanJson(), LangchainTodoPlan.class);
             // 当前 durable resume 只实现 LINEAR 顺序语义；DAG 不能降级成 LINEAR 猜测恢复。
-            if (LangchainWorkflowRouting.shouldUseDag(plan)) {
+            if (ExecutionModeResolver.inspectFrozen(plan).useDag()) {
                 throw new IllegalStateException("resume_dag_not_supported");
             }
 
@@ -557,7 +564,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             // 用相同运行配置重建工具目录，但不会再次调用 planner。
             List<ToolSpecification> toolSpecifications = resolveToolSpecifications(runConfig, userGoal);
             // 构造新的请求对象，把持久化数据重新放入当前 worker 的调用链。
-            LangchainLinearWorkflowRequest workflowRequest = buildWorkflowRequest(
+            LangchainWorkflowRequest workflowRequest = buildWorkflowRequest(
                     runId, userId, userGoal, executionContext.dialogueContext(),
                     stageModels, toolSpecifications, runConfig);
 
@@ -573,7 +580,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             ));
 
             // executor 按 checkpoint 跳过已完成 Todo，并把终态结果注入原挂起节点。
-            LangchainLinearWorkflowResult result = linearWorkflowExecutor.resumePlanned(
+            LangchainWorkflowResult result = linearWorkflowExecutor.resumePlanned(
                     workflowRequest, plan, resumeContext, terminalConsumed);
             // 只有结果成功写入 DB，launcher 才能完成消费确认并清理 anchor。
             return persistResumedResult(run, userGoal, stageModels, result, resumeContext);
@@ -582,7 +589,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             log.error("Resumed LangChain run failed: runId={}", runId, e);
             try {
                 return publishResumedFailure(runId, userId, userGoal,
-                        LangchainLinearWorkflowResult.builder()
+                        LangchainWorkflowResult.builder()
                                 .success(false)
                                 .failureReason(e.getMessage())
                                 .toolCallsUsed(resumeContext.getToolCallsUsed())
@@ -611,7 +618,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
     private boolean persistResumedResult(AgentRun run,
                                          String userGoal,
                                          LangchainRunStageModelResolver.StageModels stageModels,
-                                         LangchainLinearWorkflowResult result,
+                                         LangchainWorkflowResult result,
                                          ToolJobResumeContext resumeContext) {
         String runId = run.getId();
         String userId = run.getUserId();
@@ -665,15 +672,16 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
     /**
      * 组装执行器所需的运行环境参数。正常执行与恢复执行使用完全相同的字段集，
      * 收成单一构造点后，两处调用不会再各自维护一份字段清单。
+     * 规划此时可能还没完成，LINEAR 和 DAG 共用 {@link LangchainWorkflowRequest}。
      */
-    private LangchainLinearWorkflowRequest buildWorkflowRequest(String runId,
+    private LangchainWorkflowRequest buildWorkflowRequest(String runId,
                                                                  String userId,
                                                                  String userGoal,
                                                                  String dialogueContext,
                                                                  LangchainRunStageModelResolver.StageModels stageModels,
                                                                  List<ToolSpecification> toolSpecifications,
                                                                  AgentRunEventService.RunConfig runConfig) {
-        return LangchainLinearWorkflowRequest.builder()
+        return LangchainWorkflowRequest.builder()
                 .runId(runId)
                 .userId(userId)
                 .userGoal(userGoal)
@@ -709,7 +717,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
     private boolean persistCompletedOutcome(AgentRun run,
                                             String userGoal,
                                             LangchainRunStageModelResolver.StageModels stageModels,
-                                            LangchainLinearWorkflowResult result,
+                                            LangchainWorkflowResult result,
                                             ToolJobResumeContext resumeContext) {
         String runId = run.getId();
         String userId = run.getUserId();
@@ -763,7 +771,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
     private boolean persistPartialOutcome(AgentRun run,
                                           String userGoal,
                                           LangchainRunStageModelResolver.StageModels stageModels,
-                                          LangchainLinearWorkflowResult result,
+                                          LangchainWorkflowResult result,
                                           ToolJobResumeContext resumeContext) {
         String runId = run.getId();
         String userId = run.getUserId();
@@ -809,7 +817,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
     private void appendCompletedSideEffects(String runId,
                                             String userId,
                                             LangchainRunStageModelResolver.StageModels stageModels,
-                                            LangchainLinearWorkflowResult result,
+                                            LangchainWorkflowResult result,
                                             boolean resumed) {
         markRunStatus(runId, AgentRunStatus.COMPLETED);
         Map<String, Object> payload = new LinkedHashMap<>();
@@ -834,7 +842,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
     private void appendPartialSideEffects(String runId,
                                           String userId,
                                           LangchainRunStageModelResolver.StageModels stageModels,
-                                          LangchainLinearWorkflowResult result,
+                                          LangchainWorkflowResult result,
                                           boolean resumed) {
         markRunStatus(runId, AgentRunStatus.PARTIAL);
         Map<String, Object> payload = new LinkedHashMap<>();
@@ -933,7 +941,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
     }
 
     private String buildSnapshot(String userGoal,
-                                 LangchainLinearWorkflowResult result,
+                                 LangchainWorkflowResult result,
                                  AgentRunStatus status) {
         // snapshot 是给前端、调试脚本和恢复流程看的业务快照；它不是完整观测明细。
         // 大体积 LLM/tool 明细由 AgentRunObservabilityService 拆成摘要索引 + Redis detail blob，
@@ -953,7 +961,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
     }
 
     private String buildPartialSnapshot(String userGoal,
-                                        LangchainLinearWorkflowResult result) {
+                                        LangchainWorkflowResult result) {
         Map<String, Object> snapshot = new LinkedHashMap<>();
         snapshot.put("user_goal", userGoal);
         snapshot.put("plan", result.getPlan());
@@ -1105,7 +1113,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
     private void publishFailure(String runId,
                                 String userId,
                                 String userGoal,
-                                LangchainLinearWorkflowResult result,
+                                LangchainWorkflowResult result,
                                 Throwable throwable,
                                 String stage) {
         publishFailureInternal(runId, userId, userGoal, result, throwable, null, stage);
@@ -1114,7 +1122,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
     private boolean publishResumedFailure(String runId,
                                           String userId,
                                           String userGoal,
-                                          LangchainLinearWorkflowResult result,
+                                          LangchainWorkflowResult result,
                                           Throwable throwable,
                                           ToolJobResumeContext resumeContext,
                                           String stage) {
@@ -1124,7 +1132,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
     private boolean publishFailureInternal(String runId,
                                            String userId,
                                            String userGoal,
-                                           LangchainLinearWorkflowResult result,
+                                           LangchainWorkflowResult result,
                                            Throwable throwable,
                                            ToolJobResumeContext resumeContext,
                                            String stage) {
@@ -1217,7 +1225,7 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
     private int persistResumedTerminal(String runId,
                                        String userId,
                                        AgentRunStatus status,
-                                       LangchainLinearWorkflowResult result,
+                                       LangchainWorkflowResult result,
                                        String snapshot,
                                        String lastError,
                                        ToolJobResumeContext resumeContext) {

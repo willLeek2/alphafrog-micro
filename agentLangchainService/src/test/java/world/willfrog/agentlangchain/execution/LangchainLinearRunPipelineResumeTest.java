@@ -93,7 +93,7 @@ class LangchainLinearRunPipelineResumeTest {
             if (AgentContext.getPromptRunSelection() != null) {
                 restoredSelection.set(AgentContext.getPromptRunSelection());
             }
-            return LangchainLinearWorkflowResult.builder()
+            return LangchainWorkflowResult.builder()
                     .success(true)
                     .finalAnswer("done")
                     .plan(plan)
@@ -148,7 +148,7 @@ class LangchainLinearRunPipelineResumeTest {
         anchor.setAttempt(1);
         run.setToolJobAnchorJson(anchor.toJson());
         when(linear.resumePlanned(any(), any(), any(), any())).thenReturn(
-                LangchainLinearWorkflowResult.builder()
+                LangchainWorkflowResult.builder()
                         .suspended(true).plan(plan).completedTodos(List.of())
                         .suspendedTodoId("todo-2").suspendedTodoSequence(2)
                         .pendingToolCallId("tc-2").pendingAttempt(1).build());
@@ -174,7 +174,7 @@ class LangchainLinearRunPipelineResumeTest {
                 eq("TOOL_JOB_CHECKPOINT_FAILED"), any(), any());
 
         when(linear.resumePlanned(any(), any(), any(), any())).thenReturn(
-                LangchainLinearWorkflowResult.builder()
+                LangchainWorkflowResult.builder()
                         .success(true).finalAnswer("not-durable").plan(plan)
                         .completedTodos(List.of()).build());
         clearInvocations(messageService, settlementService, finalizationService, events,
@@ -192,7 +192,7 @@ class LangchainLinearRunPipelineResumeTest {
         verify(observabilityService, never()).commitTerminalSnapshot(any());
 
         when(linear.resumePlanned(any(), any(), any(), any())).thenReturn(
-                LangchainLinearWorkflowResult.builder()
+                LangchainWorkflowResult.builder()
                         .partial(true).failureReason("partial-result").finalAnswer("partial-answer")
                         .plan(plan).completedTodos(List.of()).build());
         when(runMapper.updateResumedTerminal(eq("run-1"), eq("user-1"),
@@ -208,7 +208,7 @@ class LangchainLinearRunPipelineResumeTest {
         verify(finalizationService, never()).publishFinalizedEvent(any(), any(), any());
 
         when(linear.resumePlanned(any(), any(), any(), any())).thenReturn(
-                LangchainLinearWorkflowResult.builder()
+                LangchainWorkflowResult.builder()
                         .success(false).failureReason("stale-worker-failure").plan(plan)
                         .completedTodos(List.of()).build());
         when(runMapper.updateResumedTerminal(eq("run-1"), eq("user-1"),
@@ -226,7 +226,7 @@ class LangchainLinearRunPipelineResumeTest {
         verify(observabilityService, never()).commitTerminalSnapshot(any());
 
         when(linear.resumePlanned(any(), any(), any(), any())).thenReturn(
-                LangchainLinearWorkflowResult.builder()
+                LangchainWorkflowResult.builder()
                         .partial(true).failureReason("winner-partial").finalAnswer("partial-answer")
                         .plan(plan).completedTodos(List.of()).build());
         when(runMapper.updateResumedTerminal(eq("run-1"), eq("user-1"),
@@ -239,7 +239,7 @@ class LangchainLinearRunPipelineResumeTest {
                 candidate.status() == world.willfrog.agent.platform.model.AgentRunStatus.PARTIAL));
 
         when(linear.resumePlanned(any(), any(), any(), any())).thenReturn(
-                LangchainLinearWorkflowResult.builder()
+                LangchainWorkflowResult.builder()
                         .success(false).failureReason("winner-failure").plan(plan)
                         .completedTodos(List.of()).build());
         when(runMapper.updateResumedTerminal(eq("run-1"), eq("user-1"),
@@ -252,7 +252,7 @@ class LangchainLinearRunPipelineResumeTest {
                 candidate.status() == world.willfrog.agent.platform.model.AgentRunStatus.FAILED));
 
         when(linear.resumePlanned(any(), any(), any(), any())).thenReturn(
-                LangchainLinearWorkflowResult.builder()
+                LangchainWorkflowResult.builder()
                         .partial(true).failureReason("throwing-partial-write")
                         .plan(plan).completedTodos(List.of()).build());
         when(runMapper.updateResumedTerminal(eq("run-1"), eq("user-1"),
@@ -269,7 +269,7 @@ class LangchainLinearRunPipelineResumeTest {
         verify(observabilityService, never()).commitTerminalSnapshot(any());
 
         when(linear.resumePlanned(any(), any(), any(), any())).thenReturn(
-                LangchainLinearWorkflowResult.builder()
+                LangchainWorkflowResult.builder()
                         .success(false).failureReason("throwing-failure-write")
                         .plan(plan).completedTodos(List.of()).build());
         clearInvocations(observabilityService);
@@ -277,7 +277,7 @@ class LangchainLinearRunPipelineResumeTest {
         verify(observabilityService, never()).commitTerminalSnapshot(any());
 
         when(linear.resumePlanned(any(), any(), any(), any())).thenReturn(
-                LangchainLinearWorkflowResult.builder()
+                LangchainWorkflowResult.builder()
                         .success(true).finalAnswer("throwing-write").plan(plan)
                         .completedTodos(List.of()).build());
         when(runMapper.updateResumedTerminal(eq("run-1"), eq("user-1"),

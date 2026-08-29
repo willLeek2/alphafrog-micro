@@ -56,7 +56,7 @@ class LangchainLinearRunPipelineFailureMappingTest {
                 .build());
 
         LangchainLinearWorkflowExecutor linear = mock(LangchainLinearWorkflowExecutor.class);
-        when(linear.executePlanned(any(), any())).thenReturn(LangchainLinearWorkflowResult.builder()
+        when(linear.executePlanned(any(), any())).thenReturn(LangchainWorkflowResult.builder()
                 .success(false)
                 .failureReason("RUN_BUDGET_EXCEEDED wall_clock_ms: 700000 / 600000")
                 .toolCallsUsed(3)

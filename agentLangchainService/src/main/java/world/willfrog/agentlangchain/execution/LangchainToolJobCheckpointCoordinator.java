@@ -48,7 +48,7 @@ final class LangchainToolJobCheckpointCoordinator {
         this.failureRecoveryService = failureRecoveryService;
     }
 
-    Attempt persist(String runId, LangchainLinearWorkflowResult result) {
+    Attempt persist(String runId, LangchainWorkflowResult result) {
         if (result == null || !result.isSuspended()) {
             return new Attempt(false, null);
         }
@@ -98,7 +98,7 @@ final class LangchainToolJobCheckpointCoordinator {
     ToolJobCheckpointFailureRecoveryService.Outcome recordFailure(
             String runId,
             String userId,
-            LangchainLinearWorkflowResult result,
+            LangchainWorkflowResult result,
             ToolJobCheckpointRequest failedRequest) {
         if (failedRequest == null) {
             boolean failed = runMapper.updateTerminalSnapshot(runId, userId, AgentRunStatus.FAILED,
@@ -129,7 +129,7 @@ final class LangchainToolJobCheckpointCoordinator {
     }
 
     private ToolJobCheckpointRequest minimalRequest(String runId,
-                                                    LangchainLinearWorkflowResult result,
+                                                    LangchainWorkflowResult result,
                                                     ToolJobAnchor anchor) {
         return commonRequest(runId, result, anchor)
                 .completedTodos(List.of())
@@ -137,7 +137,7 @@ final class LangchainToolJobCheckpointCoordinator {
     }
 
     private ToolJobCheckpointRequest fullRequest(String runId,
-                                                 LangchainLinearWorkflowResult result,
+                                                 LangchainWorkflowResult result,
                                                  ToolJobAnchor anchor,
                                                  List<CompletedTodoRecord> completed,
                                                  String datasetSnapshotJson,
@@ -154,7 +154,7 @@ final class LangchainToolJobCheckpointCoordinator {
     }
 
     private ToolJobCheckpointRequest.Builder commonRequest(String runId,
-                                                           LangchainLinearWorkflowResult result,
+                                                           LangchainWorkflowResult result,
                                                            ToolJobAnchor anchor) {
         return ToolJobCheckpointRequest.builder(runId)
                 .operationId(anchor.getOperationId())
@@ -169,7 +169,7 @@ final class LangchainToolJobCheckpointCoordinator {
 
     private void emitFailure(String runId,
                              String userId,
-                             LangchainLinearWorkflowResult result,
+                             LangchainWorkflowResult result,
                              boolean durable,
                              boolean retryable) {
         String dedupeKey = runId + ":" + nvl(result.getPendingToolCallId())

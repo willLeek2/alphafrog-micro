@@ -153,7 +153,7 @@ class LangchainLinearRunPipelineCommitPointTest {
     }
 
     private static Fixture fixture(String runId, boolean success, int snapshotRows) {
-        LangchainLinearWorkflowResult result = LangchainLinearWorkflowResult.builder()
+        LangchainWorkflowResult result = LangchainWorkflowResult.builder()
                 .success(success)
                 .finalAnswer("done-answer")
                 .toolCallsUsed(2)
@@ -166,7 +166,7 @@ class LangchainLinearRunPipelineCommitPointTest {
     }
 
     private static Fixture partialFixture(String runId, int snapshotRows) {
-        LangchainLinearWorkflowResult result = LangchainLinearWorkflowResult.builder()
+        LangchainWorkflowResult result = LangchainWorkflowResult.builder()
                 .partial(true)
                 .finalAnswer("partial-answer")
                 .failureReason("some_skip_reason")
@@ -179,7 +179,7 @@ class LangchainLinearRunPipelineCommitPointTest {
         return buildFixture(runId, result, snapshotRows);
     }
 
-    private static Fixture buildFixture(String runId, LangchainLinearWorkflowResult result, int snapshotRows) {
+    private static Fixture buildFixture(String runId, LangchainWorkflowResult result, int snapshotRows) {
         AgentRun run = new AgentRun();
         run.setId(runId);
         run.setUserId("user-1");

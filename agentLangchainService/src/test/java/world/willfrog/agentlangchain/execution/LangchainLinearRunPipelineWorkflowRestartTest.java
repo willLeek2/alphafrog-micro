@@ -69,7 +69,7 @@ class LangchainLinearRunPipelineWorkflowRestartTest {
         when(guard.stopReason(any(), any())).thenReturn(Optional.empty());
         when(checkpoints.parseAndValidate(run, frozenPlan)).thenReturn(checkpoint);
         when(linear.restartPlanned(any(), eq(frozenPlan), eq(checkpoint)))
-                .thenReturn(LangchainLinearWorkflowResult.builder()
+                .thenReturn(LangchainWorkflowResult.builder()
                         .success(true)
                         .plan(frozenPlan)
                         .completedTodos(List.of())

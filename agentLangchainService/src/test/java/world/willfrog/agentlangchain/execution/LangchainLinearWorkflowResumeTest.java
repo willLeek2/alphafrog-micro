@@ -64,7 +64,7 @@ class LangchainLinearWorkflowResumeTest {
         context.setTerminalRawRef("artifact://result-1");
         AtomicInteger consumed = new AtomicInteger();
 
-        LangchainLinearWorkflowResult result = executor.resumePlanned(
+        LangchainWorkflowResult result = executor.resumePlanned(
                 request(), plan, context, () -> {
                     consumed.incrementAndGet();
                     return true;
@@ -121,7 +121,7 @@ class LangchainLinearWorkflowResumeTest {
         context.setTerminalResultPreview(exactPreview);
         context.setTerminalRawRef("artifact://result-1");
 
-        LangchainLinearWorkflowResult result = executor.resumePlanned(
+        LangchainWorkflowResult result = executor.resumePlanned(
                 request(), plan, context, () -> true);
 
         assertThat(result.isSuccess()).isTrue();
@@ -149,7 +149,7 @@ class LangchainLinearWorkflowResumeTest {
         context.setTerminalSuccess(true);
         context.setTerminalResultPreview("terminal-preview");
 
-        LangchainLinearWorkflowResult result = executor.resumePlanned(request(), plan, context, () -> false);
+        LangchainWorkflowResult result = executor.resumePlanned(request(), plan, context, () -> false);
 
         assertThat(result.isSuccess()).isFalse();
         assertThat(result.getFailureReason()).isEqualTo("resume_result_consume_failed");
@@ -178,7 +178,7 @@ class LangchainLinearWorkflowResumeTest {
         first.setTerminalSuccess(true);
         first.setTerminalResultPreview("terminal-preview");
 
-        LangchainLinearWorkflowResult crashed = executor.resumePlanned(
+        LangchainWorkflowResult crashed = executor.resumePlanned(
                 request(), plan, first, () -> false);
         assertThat(crashed.getFailureReason()).isEqualTo("resume_result_consume_failed");
         assertThat(first.isResultConsumed()).isTrue();
@@ -194,7 +194,7 @@ class LangchainLinearWorkflowResumeTest {
         restarted.setResultConsumed(true);
         restarted.setTerminalSuccess(true);
         AtomicInteger consumedAgain = new AtomicInteger();
-        LangchainLinearWorkflowResult resumed = executor.resumePlanned(
+        LangchainWorkflowResult resumed = executor.resumePlanned(
                 request(), plan, restarted, () -> {
                     consumedAgain.incrementAndGet();
                     return true;
@@ -247,7 +247,7 @@ class LangchainLinearWorkflowResumeTest {
         context.setTerminalResultPreview("first-python-result");
         AtomicInteger accepted = new AtomicInteger();
 
-        LangchainLinearWorkflowResult result = executor.resumePlanned(
+        LangchainWorkflowResult result = executor.resumePlanned(
                 request(), plan, context, () -> {
                     accepted.incrementAndGet();
                     return true;
@@ -290,7 +290,7 @@ class LangchainLinearWorkflowResumeTest {
         ToolJobResumeContext context = failedPythonContext(false, 0);
         AtomicInteger consumed = new AtomicInteger();
 
-        LangchainLinearWorkflowResult result = executor.resumePlanned(
+        LangchainWorkflowResult result = executor.resumePlanned(
                 request(), plan, context, () -> {
                     consumed.incrementAndGet();
                     return true;
@@ -327,7 +327,7 @@ class LangchainLinearWorkflowResumeTest {
         ToolJobResumeContext context = failedPythonContext(true, 1);
         AtomicInteger consumed = new AtomicInteger();
 
-        LangchainLinearWorkflowResult result = executor.resumePlanned(
+        LangchainWorkflowResult result = executor.resumePlanned(
                 request(), plan, context, () -> {
                     consumed.incrementAndGet();
                     return true;
@@ -370,7 +370,7 @@ class LangchainLinearWorkflowResumeTest {
         ToolJobResumeContext context = failedPythonContext(false, 2);
         AtomicInteger consumed = new AtomicInteger();
 
-        LangchainLinearWorkflowResult result = executor.resumePlanned(
+        LangchainWorkflowResult result = executor.resumePlanned(
                 request(), plan, context, () -> {
                     consumed.incrementAndGet();
                     return true;
@@ -404,7 +404,7 @@ class LangchainLinearWorkflowResumeTest {
         context.setPythonRepairPending(false);
         context.setPythonRepairExhausted(true);
 
-        LangchainLinearWorkflowResult result = executor.resumePlanned(
+        LangchainWorkflowResult result = executor.resumePlanned(
                 request(), plan, context, () -> {
                     throw new AssertionError("terminal must not be consumed twice");
                 });
@@ -438,7 +438,7 @@ class LangchainLinearWorkflowResumeTest {
                 .build();
 
         ToolJobResumeContext exhaustedAtTwo = failedPythonContext(false, 1);
-        LangchainLinearWorkflowResult exhausted = executor.resumePlanned(
+        LangchainWorkflowResult exhausted = executor.resumePlanned(
                 request(), plan, exhaustedAtTwo, () -> true);
         assertThat(exhausted.getFailureReason()).isEqualTo("python_repair_exhausted");
         assertThat(exhausted.getFailureMetadata()).containsEntry("max_attempts", 2);
@@ -446,7 +446,7 @@ class LangchainLinearWorkflowResumeTest {
 
         live.set(attempts(4));
         ToolJobResumeContext allowedAtFour = failedPythonContext(false, 1);
-        LangchainLinearWorkflowResult allowed = executor.resumePlanned(
+        LangchainWorkflowResult allowed = executor.resumePlanned(
                 request(), plan, allowedAtFour, () -> true);
         assertThat(allowed.isSuccess()).isTrue();
         verify(nodeExecutor).executeRepairRound(any(), any(), any(), any(), any(), same(allowedAtFour));
@@ -464,7 +464,7 @@ class LangchainLinearWorkflowResumeTest {
                 nodeExecutor, guard, mock(AgentRunEventService.class), loader, attempts(5));
         ToolJobResumeContext context = failedPythonContext(false, 2);
 
-        LangchainLinearWorkflowResult result = executor.resumePlanned(
+        LangchainWorkflowResult result = executor.resumePlanned(
                 request(), singleTodoPlan(), context, () -> true);
 
         assertThat(result.getFailureReason()).isEqualTo("python_repair_exhausted");
@@ -486,7 +486,7 @@ class LangchainLinearWorkflowResumeTest {
         ToolJobResumeContext context = failedPythonContext(false, 0);
         context.setTerminalExitReason("EXECUTION_ERROR");
 
-        LangchainLinearWorkflowResult result = executor.resumePlanned(
+        LangchainWorkflowResult result = executor.resumePlanned(
                 request(), plan, context, () -> true);
 
         assertThat(result.getFailureReason()).isEqualTo("external_tool_terminal_failure");
@@ -541,7 +541,7 @@ class LangchainLinearWorkflowResumeTest {
         context.setTerminalExitReason(exitReason);
         context.setPythonRepairExhausted(exhausted);
 
-        LangchainLinearWorkflowResult result = executor.resumePlanned(
+        LangchainWorkflowResult result = executor.resumePlanned(
                 request(), singleTodoPlan(), context,
                 () -> { throw new AssertionError("accepted handoff must not be consumed twice"); });
 
@@ -576,8 +576,8 @@ class LangchainLinearWorkflowResumeTest {
         return TodoItem.builder().id(id).sequence(sequence).description(id + "-description").build();
     }
 
-    private static LangchainLinearWorkflowRequest request() {
-        return LangchainLinearWorkflowRequest.builder()
+    private static LangchainWorkflowRequest request() {
+        return LangchainWorkflowRequest.builder()
                 .runId("run-1")
                 .userId("user-1")
                 .userGoal("goal")

@@ -15,18 +15,11 @@ import java.util.PriorityQueue;
 import java.util.Set;
 
 /**
- * LINEAR vs DAG 路由决策器。~30 行薄判断层。
+ * 按用户要求把规划结果冻成可落库的 LINEAR / DAG 计划。
  *
- * <p>决策逻辑：
- * <ol>
- *   <li>plan 的 executionMode 显式为 DAG → DAG</li>
- *   <li>plan 的 executionMode 显式为 LINEAR → LINEAR</li>
- *   <li>AUTO 模式：检查是否有 Todo 声明了 dependsOn（依赖关系），
- *       有则 DAG，无则 LINEAR</li>
- * </ol>
- *
- * <p>被 {@code LangchainLinearRunPipelineImpl} 调用，
- * 决定走 DAG 执行器还是 LINEAR 执行器。
+ * <p>这里管计划形状：显式 LINEAR 时做稳定拓扑并清掉依赖字段；AUTO 时看 dependsOn。
+ * 三层词汇（用户要求 / 规划结果 / 生效模式）和 PLAN_READY 的原因说明在
+ * {@link ExecutionModeResolver}，不要在管线里再抄一遍。</p>
  */
 final class LangchainWorkflowRouting {
 

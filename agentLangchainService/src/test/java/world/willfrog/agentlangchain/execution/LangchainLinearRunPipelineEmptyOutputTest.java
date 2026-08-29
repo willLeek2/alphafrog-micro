@@ -85,7 +85,7 @@ class LangchainLinearRunPipelineEmptyOutputTest {
                 .build());
 
         LangchainLinearWorkflowExecutor linear = mock(LangchainLinearWorkflowExecutor.class);
-        when(linear.executePlanned(any(), any())).thenReturn(LangchainLinearWorkflowResult.builder()
+        when(linear.executePlanned(any(), any())).thenReturn(LangchainWorkflowResult.builder()
                 .success(false)
                 .failureReason("empty_todo_output_after_recovery:todo_1")
                 .failureMetadata(observation)
@@ -164,7 +164,7 @@ class LangchainLinearRunPipelineEmptyOutputTest {
 
         LangchainLinearWorkflowExecutor linear = mock(LangchainLinearWorkflowExecutor.class);
         // failureMetadata=null（fallback 路径特征）
-        when(linear.executePlanned(any(), any())).thenReturn(LangchainLinearWorkflowResult.builder()
+        when(linear.executePlanned(any(), any())).thenReturn(LangchainWorkflowResult.builder()
                 .success(false)
                 .failureReason("empty_todo_output:todo_1")
                 .toolCallsUsed(1)

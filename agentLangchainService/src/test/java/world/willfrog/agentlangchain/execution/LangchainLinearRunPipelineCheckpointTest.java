@@ -78,7 +78,7 @@ class LangchainLinearRunPipelineCheckpointTest {
         when(planner.plan(any())).thenReturn(plan);
         LangchainCompletedTodo completed = LangchainCompletedTodo.builder()
                 .todoId("todo-1").sequence(1).description("prior").output("out").build();
-        when(linear.executePlanned(any(), eq(plan))).thenReturn(LangchainLinearWorkflowResult.builder()
+        when(linear.executePlanned(any(), eq(plan))).thenReturn(LangchainWorkflowResult.builder()
                 .suspended(true)
                 .plan(plan)
                 .completedTodos(List.of(completed))

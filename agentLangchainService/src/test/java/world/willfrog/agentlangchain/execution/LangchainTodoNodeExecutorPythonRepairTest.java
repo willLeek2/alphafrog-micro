@@ -159,7 +159,7 @@ class LangchainTodoNodeExecutorPythonRepairTest {
             ChatModel model, ToolProvider provider, AtomicInteger toolCalls) {
         LangchainTodoNodeExecutor executor = LangchainTestFixtures.todoNodeExecutor(
                 Optional.ofNullable(provider));
-        LangchainLinearWorkflowRequest request = LangchainLinearWorkflowRequest.builder()
+        LangchainWorkflowRequest request = LangchainWorkflowRequest.builder()
                 .runId("run-repair")
                 .userId("user-repair")
                 .userGoal("fix the failed Python analysis")

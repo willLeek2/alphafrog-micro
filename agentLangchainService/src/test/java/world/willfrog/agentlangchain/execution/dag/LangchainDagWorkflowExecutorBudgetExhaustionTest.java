@@ -12,8 +12,8 @@ import world.willfrog.agent.platform.context.AgentContext;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.workflow.PlanExecutionMode;
 import world.willfrog.agent.workflow.TodoItem;
-import world.willfrog.agentlangchain.execution.LangchainLinearWorkflowRequest;
-import world.willfrog.agentlangchain.execution.LangchainLinearWorkflowResult;
+import world.willfrog.agentlangchain.execution.LangchainWorkflowRequest;
+import world.willfrog.agentlangchain.execution.LangchainWorkflowResult;
 import world.willfrog.agentlangchain.control.LangchainRunExecutionGuard;
 import world.willfrog.agentlangchain.execution.LangchainTodoNodeExecutor;
 import world.willfrog.agentlangchain.execution.LangchainTodoNodeResult;
@@ -102,7 +102,7 @@ class LangchainDagWorkflowExecutorBudgetExhaustionTest {
                 item("t2", 2, List.of("t1")),
                 item("t3", 3, List.of("t2")));
 
-        LangchainLinearWorkflowResult result = executor.executePlanned(
+        LangchainWorkflowResult result = executor.executePlanned(
                 request("run-dag-budget-partial", "user-1"), plan);
 
         // partial = true，finalAnswer 来自 t1（completedTodos 唯一项），不调 writeFinalAnswer
@@ -150,7 +150,7 @@ class LangchainDagWorkflowExecutorBudgetExhaustionTest {
                 item("t2", 2, List.of("t1")),
                 item("t3", 3, List.of("t2")));
 
-        LangchainLinearWorkflowResult result = executor.executePlanned(
+        LangchainWorkflowResult result = executor.executePlanned(
                 request("run-dag-budget-failfast", "user-1"), plan);
 
         // fail-fast: success=false, partial=false, no finalAnswer, completedTodos empty
@@ -179,7 +179,7 @@ class LangchainDagWorkflowExecutorBudgetExhaustionTest {
                 .thenReturn(LangchainTodoNodeResult.failure("empty", emptyMeta));
 
         LangchainTodoPlan plan = planWithItems(item("t1", 1, List.of()));
-        LangchainLinearWorkflowResult result = executor.executePlanned(
+        LangchainWorkflowResult result = executor.executePlanned(
                 request("run-dag-normal-fail", "user-1"), plan);
 
         assertThat(result.isSuccess()).isFalse();
@@ -203,7 +203,7 @@ class LangchainDagWorkflowExecutorBudgetExhaustionTest {
         Map<String, Object> meta = Map.of("custom_key", "custom_value");
         LangchainTodoPlan plan = planWithItems(item);
 
-        LangchainLinearWorkflowResult result = (LangchainLinearWorkflowResult) ReflectionTestUtils.invokeMethod(
+        LangchainWorkflowResult result = (LangchainWorkflowResult) ReflectionTestUtils.invokeMethod(
                 executor, "failure",
                 plan, List.of(), "test_reason", 0, meta);
 
@@ -242,8 +242,8 @@ class LangchainDagWorkflowExecutorBudgetExhaustionTest {
                 .build();
     }
 
-    private static LangchainLinearWorkflowRequest request(String runId, String userId) {
-        return LangchainLinearWorkflowRequest.builder()
+    private static LangchainWorkflowRequest request(String runId, String userId) {
+        return LangchainWorkflowRequest.builder()
                 .runId(runId)
                 .userId(userId)
                 .userGoal("test goal")
