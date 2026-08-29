@@ -3,7 +3,7 @@ package world.willfrog.agentlangchain.config;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
-import world.willfrog.agentlangchain.orchestration.ToolThrottleResult;
+import world.willfrog.agentlangchain.execution.ToolThrottleResult;
 
 import java.util.LinkedHashMap;
 import java.util.Map;

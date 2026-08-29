@@ -9,8 +9,8 @@ import world.willfrog.agent.platform.PlatformModuleMarker;
 import world.willfrog.agent.tools.router.ToolRouter;
 import world.willfrog.agentlangchain.config.LangchainServiceProperties;
 import world.willfrog.agentlangchain.config.LangchainToolConcurrencyThrottle;
-import world.willfrog.agentlangchain.orchestration.AgentLangchainOrchestrator;
-import world.willfrog.agentlangchain.orchestration.LangchainRunConcurrencyScheduler;
+import world.willfrog.agentlangchain.control.AgentLangchainOrchestrator;
+import world.willfrog.agentlangchain.control.LangchainRunConcurrencyScheduler;
 
 import java.util.LinkedHashMap;
 import java.util.Map;

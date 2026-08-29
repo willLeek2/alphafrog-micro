@@ -44,7 +44,7 @@ import world.willfrog.agent.tools.router.ToolRouter;
 import world.willfrog.agent.workflow.AgentRunDatasetEntry;
 import world.willfrog.agent.workflow.AgentRunDatasetRegistry;
 import world.willfrog.agent.workflow.AgentRunDatasetSnapshot;
-import world.willfrog.agentlangchain.orchestration.LangchainLinearRunPipelineImpl;
+import world.willfrog.agentlangchain.execution.LangchainLinearRunPipelineImpl;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
 
 import javax.sql.DataSource;
@@ -177,7 +177,7 @@ class PythonSandboxToolsP001FastPathTest {
         ObjectProvider<ToolJobContinuationTracker> trackerProvider = mock(ObjectProvider.class);
         dispatchStore = spy(new PythonSandboxDispatchStoreImpl(
                 anchorService, redisCache, toolJobConfig, trackerProvider,
-                new world.willfrog.agentlangchain.orchestration.scheduler.LangchainSchedulerMetrics(
+                new world.willfrog.agentlangchain.control.scheduler.LangchainSchedulerMetrics(
                         new io.micrometer.core.instrument.simple.SimpleMeterRegistry())));
 
         // PythonSandboxTools with real dispatch store (rest mocked per existing pattern)

@@ -27,7 +27,7 @@ import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.platform.service.AgentRunObservabilityService;
 import world.willfrog.agent.platform.service.AgentRunCreditSettlementService;
 import world.willfrog.agent.platform.service.AgentRunStateStore;
-import world.willfrog.agentlangchain.orchestration.LangchainLinearRunPipeline;
+import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
 import world.willfrog.agentlangchain.tooljob.ToolJobAnchorService;
 import world.willfrog.agentlangchain.tooljob.ToolJobConfig;
 import world.willfrog.agentlangchain.tooljob.ToolJobEventHook;

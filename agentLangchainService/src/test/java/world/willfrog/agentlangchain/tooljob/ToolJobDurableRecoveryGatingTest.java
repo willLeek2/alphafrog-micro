@@ -11,7 +11,7 @@ import org.springframework.core.env.MapPropertySource;
 import world.willfrog.agent.platform.dataanalysis.DataAnalysisCapacityService;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.tools.python.DataAnalysisCapacityProperties;
-import world.willfrog.agentlangchain.orchestration.scheduler.LangchainSchedulerMetrics;
+import world.willfrog.agentlangchain.control.scheduler.LangchainSchedulerMetrics;
 
 import java.util.Map;
 

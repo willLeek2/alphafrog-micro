@@ -9,11 +9,11 @@ import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.service.AgentRunEventService;
 import world.willfrog.agent.workflow.TodoItem;
-import world.willfrog.agentlangchain.orchestration.LangchainLinearRunPipelineImpl;
-import world.willfrog.agentlangchain.orchestration.LangchainLinearWorkflowExecutor;
-import world.willfrog.agentlangchain.orchestration.LangchainRunExecutionGuard;
-import world.willfrog.agentlangchain.orchestration.LangchainLinearWorkflowRequest;
-import world.willfrog.agentlangchain.orchestration.LangchainLinearWorkflowResult;
+import world.willfrog.agentlangchain.execution.LangchainLinearRunPipelineImpl;
+import world.willfrog.agentlangchain.execution.LangchainLinearWorkflowExecutor;
+import world.willfrog.agentlangchain.control.LangchainRunExecutionGuard;
+import world.willfrog.agentlangchain.execution.LangchainLinearWorkflowRequest;
+import world.willfrog.agentlangchain.execution.LangchainLinearWorkflowResult;
 import world.willfrog.agentlangchain.planning.LangchainTodoPlan;
 import world.willfrog.agentlangchain.support.LangchainTestFixtures;
 

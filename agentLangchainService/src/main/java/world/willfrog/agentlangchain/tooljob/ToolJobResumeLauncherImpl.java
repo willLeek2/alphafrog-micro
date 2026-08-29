@@ -6,7 +6,7 @@ import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
-import world.willfrog.agentlangchain.orchestration.LangchainLinearRunPipelineImpl;
+import world.willfrog.agentlangchain.execution.LangchainLinearRunPipelineImpl;
 
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
