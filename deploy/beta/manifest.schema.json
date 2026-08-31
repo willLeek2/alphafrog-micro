@@ -3,6 +3,7 @@
   "$id": "https://alphafrog.local/schemas/beta/manifest.schema.json",
   "title": "AlphaFrog Beta deployment manifest",
   "description": "Desired services for one isolated Beta traffic scope. Runtime file: /var/lib/alphafrog-beta/deployments/<deployment-id>/manifest.json.",
+  "$comment": "The controller MUST enable Draft 2020-12 format assertions for date-time. Treating format as annotation is not conforming.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -184,7 +185,11 @@
       "required": [
         "containerPort",
         "hostPorts",
+        "healthCheckProfile",
         "readinessTimeoutSeconds",
+        "routeLeaseSeconds",
+        "shutdownProfile",
+        "applicationDrainSeconds",
         "drainGraceSeconds"
       ],
       "properties": {
@@ -200,10 +205,30 @@
             "$ref": "#/$defs/port"
           }
         },
+        "healthCheckProfile": {
+          "const": "CONTROLLER_TCP_V1"
+        },
         "readinessTimeoutSeconds": {
           "type": "integer",
           "minimum": 1,
           "maximum": 3600
+        },
+        "routeLeaseSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 30
+        },
+        "shutdownProfile": {
+          "enum": [
+            "SPRING_BOOT_HTTP_DUBBO_V1",
+            "SPRING_BOOT_DUBBO_V1",
+            "SPRING_BOOT_HTTP_V1"
+          ]
+        },
+        "applicationDrainSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86395
         },
         "drainGraceSeconds": {
           "type": "integer",

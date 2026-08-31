@@ -3,6 +3,7 @@
   "$id": "https://alphafrog.local/schemas/beta/controller-state.schema.json",
   "title": "AlphaFrog Beta traffic controller state",
   "description": "Observed service instances and default traffic cutover state. Runtime file: /var/lib/alphafrog-beta/controller-state.json.",
+  "$comment": "The controller MUST enable Draft 2020-12 format assertions for date-time, ipv4, and ipv6. Treating format as annotation is not conforming.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -165,8 +166,11 @@
         "ip",
         "port",
         "nacosInstanceId",
-        "registeredTrafficScopeId",
-        "registeredReleaseId"
+        "enabled",
+        "healthy",
+        "weight",
+        "ephemeral",
+        "metadata"
       ],
       "properties": {
         "serviceName": {
@@ -192,11 +196,40 @@
         "nacosInstanceId": {
           "$ref": "#/$defs/nacosInstanceId"
         },
-        "registeredTrafficScopeId": {
-          "$ref": "#/$defs/trafficScopeId"
+        "enabled": {
+          "type": "boolean"
         },
-        "registeredReleaseId": {
-          "$ref": "#/$defs/opaqueId"
+        "healthy": {
+          "type": "boolean"
+        },
+        "weight": {
+          "enum": [
+            0,
+            1
+          ]
+        },
+        "ephemeral": {
+          "const": true
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "alphafrog.traffic-scope-id",
+            "alphafrog.release-id",
+            "alphafrog.instance-id"
+          ],
+          "properties": {
+            "alphafrog.traffic-scope-id": {
+              "$ref": "#/$defs/trafficScopeId"
+            },
+            "alphafrog.release-id": {
+              "$ref": "#/$defs/opaqueId"
+            },
+            "alphafrog.instance-id": {
+              "$ref": "#/$defs/opaqueId"
+            }
+          }
         }
       }
     },
@@ -414,10 +447,10 @@
             "endpoint": true,
             "registration": true,
             "drainStartedAt": {
-              "$ref": "#/$defs/timestamp"
+              "$ref": "#/$defs/nullableTimestamp"
             },
             "drainDeadline": {
-              "$ref": "#/$defs/timestamp"
+              "$ref": "#/$defs/nullableTimestamp"
             }
           }
         }
@@ -430,7 +463,8 @@
         "defaultInstanceId",
         "defaultReleaseId",
         "routeVersion",
-        "updatedAt"
+        "updatedAt",
+        "previousVersionValidUntil"
       ],
       "properties": {
         "defaultInstanceId": {
@@ -445,6 +479,9 @@
         },
         "updatedAt": {
           "$ref": "#/$defs/timestamp"
+        },
+        "previousVersionValidUntil": {
+          "$ref": "#/$defs/nullableTimestamp"
         }
       },
       "allOf": [
@@ -502,8 +539,10 @@
             "STARTING_CANDIDATE",
             "WAITING_CANDIDATE_READINESS",
             "SWITCHING_TRAFFIC",
+            "WAITING_OLD_ROUTE_LEASES",
             "DRAINING_PREVIOUS",
             "REMOVING_TRAFFIC",
+            "WAITING_DELETE_ROUTE_LEASES",
             "DRAINING_ACTIVE"
           ]
         },
@@ -558,7 +597,10 @@
               "const": "UPDATE"
             },
             "phase": {
-              "const": "DRAINING_PREVIOUS"
+              "enum": [
+                "WAITING_OLD_ROUTE_LEASES",
+                "DRAINING_PREVIOUS"
+              ]
             },
             "candidateInstanceId": {
               "type": "null"
@@ -574,6 +616,7 @@
             "phase": {
               "enum": [
                 "REMOVING_TRAFFIC",
+                "WAITING_DELETE_ROUTE_LEASES",
                 "DRAINING_ACTIVE"
               ]
             },
@@ -590,7 +633,9 @@
       "required": [
         "code",
         "message",
-        "at"
+        "at",
+        "failedOperationType",
+        "recoveryClass"
       ],
       "properties": {
         "code": {
@@ -607,6 +652,20 @@
         },
         "at": {
           "$ref": "#/$defs/timestamp"
+        },
+        "failedOperationType": {
+          "enum": [
+            "CREATE",
+            "UPDATE",
+            "DELETE"
+          ]
+        },
+        "recoveryClass": {
+          "enum": [
+            "CLEAN_RETRYABLE",
+            "FACTS_UNCERTAIN",
+            "DELETE_RETRYABLE"
+          ]
         }
       }
     },
@@ -714,6 +773,96 @@
       "allOf": [
         {
           "if": {
+            "properties": {
+              "operation": {
+                "type": "object",
+                "properties": {
+                  "phase": {
+                    "enum": [
+                      "WAITING_OLD_ROUTE_LEASES",
+                      "WAITING_DELETE_ROUTE_LEASES"
+                    ]
+                  }
+                },
+                "required": [
+                  "phase"
+                ]
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "drainingInstance": {
+                "allOf": [
+                  {
+                    "$ref": "#/$defs/drainingInstance"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "drainStartedAt": {
+                        "type": "null"
+                      },
+                      "drainDeadline": {
+                        "type": "null"
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "type": "object",
+                "properties": {
+                  "phase": {
+                    "enum": [
+                      "DRAINING_PREVIOUS",
+                      "DRAINING_ACTIVE"
+                    ]
+                  }
+                },
+                "required": [
+                  "phase"
+                ]
+              }
+            },
+            "required": [
+              "operation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "drainingInstance": {
+                "allOf": [
+                  {
+                    "$ref": "#/$defs/drainingInstance"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "drainStartedAt": {
+                        "$ref": "#/$defs/timestamp"
+                      },
+                      "drainDeadline": {
+                        "$ref": "#/$defs/timestamp"
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
             "type": "object",
             "properties": {
               "phase": {
@@ -738,6 +887,14 @@
               },
               "operation": {
                 "type": "null"
+              },
+              "route": {
+                "type": "object",
+                "properties": {
+                  "previousVersionValidUntil": {
+                    "type": "null"
+                  }
+                }
               }
             }
           }
@@ -859,6 +1016,9 @@
                   },
                   "defaultReleaseId": {
                     "$ref": "#/$defs/opaqueId"
+                  },
+                  "previousVersionValidUntil": {
+                    "type": "null"
                   }
                 }
               }
@@ -952,7 +1112,10 @@
                 "type": "object",
                 "properties": {
                   "phase": {
-                    "const": "DRAINING_PREVIOUS"
+                    "enum": [
+                      "WAITING_OLD_ROUTE_LEASES",
+                      "DRAINING_PREVIOUS"
+                    ]
                   }
                 },
                 "required": [
@@ -981,6 +1144,9 @@
                   },
                   "defaultReleaseId": {
                     "$ref": "#/$defs/opaqueId"
+                  },
+                  "previousVersionValidUntil": {
+                    "$ref": "#/$defs/timestamp"
                   }
                 }
               }
@@ -1029,6 +1195,9 @@
                   },
                   "defaultReleaseId": {
                     "$ref": "#/$defs/opaqueId"
+                  },
+                  "previousVersionValidUntil": {
+                    "type": "null"
                   }
                 }
               }
@@ -1045,7 +1214,10 @@
                 "type": "object",
                 "properties": {
                   "phase": {
-                    "const": "DRAINING_ACTIVE"
+                    "enum": [
+                      "WAITING_DELETE_ROUTE_LEASES",
+                      "DRAINING_ACTIVE"
+                    ]
                   }
                 },
                 "required": [
@@ -1077,6 +1249,9 @@
                   },
                   "defaultReleaseId": {
                     "type": "null"
+                  },
+                  "previousVersionValidUntil": {
+                    "$ref": "#/$defs/timestamp"
                   }
                 }
               }
@@ -1111,6 +1286,9 @@
                     "type": "null"
                   },
                   "defaultReleaseId": {
+                    "type": "null"
+                  },
+                  "previousVersionValidUntil": {
                     "type": "null"
                   }
                 }
