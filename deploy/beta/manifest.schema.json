@@ -1,0 +1,261 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://alphafrog.local/schemas/beta/manifest.schema.json",
+  "title": "AlphaFrog Beta deployment manifest",
+  "description": "Desired services for one isolated Beta traffic scope. Runtime file: /var/lib/alphafrog-beta/deployments/<deployment-id>/manifest.json.",
+  "$comment": "The controller MUST enable Draft 2020-12 format assertions for date-time. Treating format as annotation is not conforming.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "deploymentId",
+    "trafficScopeId",
+    "manifestVersion",
+    "gitCommit",
+    "owner",
+    "createdAt",
+    "expiresAt",
+    "services"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "deploymentId": {
+      "$ref": "#/$defs/deploymentId"
+    },
+    "trafficScopeId": {
+      "$ref": "#/$defs/trafficScopeId"
+    },
+    "manifestVersion": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "gitCommit": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{40}$"
+    },
+    "owner": {
+      "$ref": "#/$defs/owner"
+    },
+    "createdAt": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "expiresAt": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "services": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/serviceSpec"
+      }
+    }
+  },
+  "$defs": {
+    "deploymentId": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 64,
+      "pattern": "^(?!stable$)[a-z0-9](?:[a-z0-9-]{1,62}[a-z0-9])$"
+    },
+    "trafficScopeId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 96,
+      "pattern": "^[a-z0-9](?:[a-z0-9._-]{0,94}[a-z0-9])?$"
+    },
+    "serviceName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 96,
+      "pattern": "^[a-z][a-z0-9-]*$"
+    },
+    "opaqueId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "nacosText": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^(?=.*\\S)[^\\u0000-\\u001f\\u007f-\\u009f]+$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "imageId": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "Z$"
+    },
+    "port": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+    },
+    "owner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ownerId"
+      ],
+      "properties": {
+        "ownerId": {
+          "$ref": "#/$defs/opaqueId"
+        }
+      }
+    },
+    "serviceSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "serviceName",
+        "releaseId",
+        "serviceSpecSha256",
+        "machineId",
+        "image",
+        "runtime",
+        "registration"
+      ],
+      "properties": {
+        "serviceName": {
+          "$ref": "#/$defs/serviceName"
+        },
+        "releaseId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "serviceSpecSha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "machineId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "image": {
+          "$ref": "#/$defs/image"
+        },
+        "runtime": {
+          "$ref": "#/$defs/runtime"
+        },
+        "registration": {
+          "$ref": "#/$defs/registrationTemplate"
+        },
+        "runtimeConfigSha256": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/sha256"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      }
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repositoryDigest",
+        "localImageId"
+      ],
+      "properties": {
+        "repositoryDigest": {
+          "type": "string",
+          "minLength": 72,
+          "maxLength": 512,
+          "pattern": "^[^\\s@]+@sha256:[a-f0-9]{64}$"
+        },
+        "localImageId": {
+          "$ref": "#/$defs/imageId"
+        }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "containerPort",
+        "hostPorts",
+        "healthCheckProfile",
+        "readinessTimeoutSeconds",
+        "shutdownProfile",
+        "applicationDrainSeconds",
+        "drainGraceSeconds"
+      ],
+      "properties": {
+        "containerPort": {
+          "$ref": "#/$defs/port"
+        },
+        "hostPorts": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/port"
+          }
+        },
+        "healthCheckProfile": {
+          "const": "CONTROLLER_TCP_V1"
+        },
+        "readinessTimeoutSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3600
+        },
+        "shutdownProfile": {
+          "enum": [
+            "SPRING_BOOT_HTTP_DUBBO_V1",
+            "SPRING_BOOT_DUBBO_V1",
+            "SPRING_BOOT_HTTP_V1"
+          ]
+        },
+        "applicationDrainSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86395
+        },
+        "drainGraceSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400
+        }
+      }
+    },
+    "registrationTemplate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "serviceName",
+        "groupName",
+        "namespaceId",
+        "clusterName"
+      ],
+      "properties": {
+        "serviceName": {
+          "$ref": "#/$defs/nacosText"
+        },
+        "groupName": {
+          "$ref": "#/$defs/nacosText"
+        },
+        "namespaceId": {
+          "$ref": "#/$defs/nacosText"
+        },
+        "clusterName": {
+          "type": "string",
+          "pattern": "^[0-9A-Za-z-]+$",
+          "maxLength": 128
+        }
+      }
+    }
+  }
+}
