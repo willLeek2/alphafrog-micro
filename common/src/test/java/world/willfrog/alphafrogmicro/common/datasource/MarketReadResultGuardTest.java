@@ -146,7 +146,7 @@ class MarketReadResultGuardTest {
 
     @Test
     void checkRows_customEstimator_shouldRejectSaturatedOverflow() {
-        MarketReadResultGuard guard = guardWith(10, Long.MAX_VALUE - 1, 100, 1000);
+        MarketReadResultGuard guard = guardWith(10, Long.MAX_VALUE, 100, 1000);
         List<String> rows = List.of("x", "y");
         MarketReadResultLimitExceededException ex = assertThrows(
                 MarketReadResultLimitExceededException.class,
@@ -155,6 +155,13 @@ class MarketReadResultGuardTest {
         assertEquals(MarketReadResultLimitExceededException.LimitKind.BYTES, ex.getKind());
         assertEquals(Long.MAX_VALUE, ex.getActual());
         assertEquals(2, rows.size());
+    }
+
+    @Test
+    void checkRows_customEstimator_shouldAllowExactMaxBytes() {
+        MarketReadResultGuard guard = guardWith(10, 10, 100, 1000);
+        List<String> rows = List.of("x", "y");
+        assertSame(rows, guard.checkRows(rows, row -> 5L));
     }
 
     @Test

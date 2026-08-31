@@ -131,15 +131,17 @@ public final class MarketReadResultGuard {
 
     private <T> void enforceEstimatedByteLimit(List<T> rows, ToLongFunction<T> byteSize) {
         long bytes = 0L;
+        long maxBytes = limits.getMaxBytes();
         for (T row : rows) {
             long add = Math.max(0L, byteSize.applyAsLong(row));
-            bytes = saturatingAdd(bytes, add);
-            if (bytes > limits.getMaxBytes()) {
+            if (add > maxBytes - bytes) {
+                long actual = add > Long.MAX_VALUE - bytes ? Long.MAX_VALUE : bytes + add;
                 throw new MarketReadResultLimitExceededException(
                         MarketReadResultLimitExceededException.LimitKind.BYTES,
-                        bytes,
-                        limits.getMaxBytes());
+                        actual,
+                        maxBytes);
             }
+            bytes += add;
         }
     }
 
@@ -151,11 +153,4 @@ public final class MarketReadResultGuard {
         }
     }
 
-    static long saturatingAdd(long left, long right) {
-        long sum = left + right;
-        if (((left ^ sum) & (right ^ sum)) < 0) {
-            return Long.MAX_VALUE;
-        }
-        return sum;
-    }
 }
