@@ -1,0 +1,17 @@
+{
+  "ruleVersion": "2026-08-31-01",
+  "bucketSalt": "s1",
+  "rules": [
+    {
+      "ruleId": "agent-financial-report-v2",
+      "enabled": true,
+      "percent": 10,
+      "userFilter": [
+        "frog",
+        "codex"
+      ],
+      "owner": "ccmax",
+      "expiresAt": "2026-09-15T00:00:00+08:00"
+    }
+  ]
+}
