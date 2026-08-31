@@ -159,7 +159,7 @@ function baseInstance(instanceId, releaseId, version, spec, slot, port, selectab
     manifestVersion: version,
     serviceSpecSha256: spec,
     containerName: `af-${instanceId}`,
-    containerId: (slot === 'A' ? 'a' : 'b').repeat(64),
+    containerId: crypto.createHash('sha256').update(`container:${instanceId}`, 'utf8').digest('hex'),
     portSlot: slot,
     hostPort: port,
     endpoint: {address: '10.0.0.8', port},
@@ -313,6 +313,7 @@ function customErrors(manifestValue, stateValue) {
   const deploymentIds = new Set();
   const trafficScopes = new Set();
   const instanceIds = new Set();
+  const containerIds = new Set();
   for (const deployment of stateValue.deployments) {
     if (deploymentIds.has(deployment.deploymentId)) errors.push(`duplicate deployment ${deployment.deploymentId}`);
     if (trafficScopes.has(deployment.trafficScopeId)) errors.push(`duplicate traffic scope ${deployment.trafficScopeId}`);
@@ -334,6 +335,8 @@ function customErrors(manifestValue, stateValue) {
       for (const instance of [item.activeInstance, item.candidateInstance, item.drainingInstance].filter(Boolean)) {
         if (instanceIds.has(instance.instanceId)) errors.push(`duplicate instance ${instance.instanceId}`);
         instanceIds.add(instance.instanceId);
+        if (containerIds.has(instance.containerId)) errors.push(`duplicate container ${instance.containerId}`);
+        containerIds.add(instance.containerId);
         if (roleSlots.has(instance.portSlot)) errors.push(`duplicate role slot ${item.serviceName}:${instance.portSlot}`);
         roleSlots.add(instance.portSlot);
         const registrationValue = instance.registration;
@@ -451,6 +454,9 @@ try {
   const duplicateSlot = clone(positiveStates.updateSwitching);
   duplicateSlot.deployments[0].services[0].candidateInstance.portSlot = 'A';
   customNegatives.push(['duplicate role slot', manifest, duplicateSlot]);
+  const duplicateContainer = clone(positiveStates.updateSwitching);
+  duplicateContainer.deployments[0].services[0].candidateInstance.containerId = duplicateContainer.deployments[0].services[0].activeInstance.containerId;
+  customNegatives.push(['duplicate container', manifest, duplicateContainer]);
   const stableRouteMismatch = clone(positiveStates.stable);
   stableRouteMismatch.deployments[0].services[0].route.defaultInstanceId = 'instance-old';
   customNegatives.push(['stable route mismatch', manifest, stableRouteMismatch]);
@@ -480,6 +486,7 @@ try {
 
   function retryTransitionErrors(beforeState, afterState, action) {
     const errors = [];
+    if (afterState.stateVersion !== beforeState.stateVersion + 1) errors.push('state version must increase by exactly one');
     const beforeServices = beforeState.deployments[0].services;
     const afterServices = afterState.deployments[0].services;
     const failed = beforeServices.find(item => item.lastError !== null);
@@ -516,12 +523,22 @@ try {
   validateState('queue-create-failed', twoServiceManifest, createQueue);
   assert(createQueue.deployments[0].services[1].operation === null, 'create failure must not start the next service');
   const createRetry = clone(createQueue);
+  createRetry.stateVersion++;
   Object.assign(createRetry.deployments[0].services[0], {
     phase: 'CREATING', operation: operation('CREATE', 'STARTING_CANDIDATE', 'instance-retry'),
     failedManifestVersion: null, lastError: null
   });
   validateState('queue-create-retry', twoServiceManifest, createRetry);
   assert(retryTransitionErrors(createQueue, createRetry, {type: 'RETRY_CREATE', serviceName: 'agent-service'}).length === 0, 'create retry transition must restore only the failed service');
+  const unchangedStateVersion = clone(createRetry);
+  unchangedStateVersion.stateVersion = createQueue.stateVersion;
+  assert(retryTransitionErrors(createQueue, unchangedStateVersion, {type: 'RETRY_CREATE', serviceName: 'agent-service'}).length > 0, 'retry must reject an unchanged state version');
+  const reversedStateVersion = clone(createRetry);
+  reversedStateVersion.stateVersion = createQueue.stateVersion - 1;
+  assert(retryTransitionErrors(createQueue, reversedStateVersion, {type: 'RETRY_CREATE', serviceName: 'agent-service'}).length > 0, 'retry must reject a lower state version');
+  const skippedStateVersion = clone(createRetry);
+  skippedStateVersion.stateVersion = createQueue.stateVersion + 2;
+  assert(retryTransitionErrors(createQueue, skippedStateVersion, {type: 'RETRY_CREATE', serviceName: 'agent-service'}).length > 0, 'retry must reject a state version jump');
 
   const updateFailed = service({
     activeInstance: oldActive, route: routeOld, failedManifestVersion: 2,
@@ -532,6 +549,7 @@ try {
   validateState('queue-update-failed', twoServiceManifest, updateFailure);
   assert(updateFailure.deployments[0].services[1].operation === null, 'update failure must not start the next service');
   const updateRetry = clone(updateFailure);
+  updateRetry.stateVersion++;
   Object.assign(updateRetry.deployments[0].services[0], {
     phase: 'UPDATING', operation: operation('UPDATE', 'STARTING_CANDIDATE', 'instance-retry'),
     failedManifestVersion: null, lastError: null
@@ -547,6 +565,7 @@ try {
   validateState('queue-delete-failed', twoServiceManifest, deleteFailure);
   assert(deleteFailure.deployments[0].services[1].operation === null, 'delete failure must not start the next service');
   const deleteRetry = clone(deleteFailure);
+  deleteRetry.stateVersion++;
   Object.assign(deleteRetry.deployments[0].services[0], {
     phase: 'DELETING', operation: operation('DELETE', 'REMOVING_TRAFFIC', null),
     failedManifestVersion: null, lastError: null
@@ -562,6 +581,7 @@ try {
   version3Manifest.gitCommit = '2'.repeat(40);
   runAjv('validate', manifestSchema, writeFixture('manifest-two-service-v3-valid', version3Manifest), true);
   const illegalHigherVersionRetry = clone(uncertainFailure);
+  illegalHigherVersionRetry.stateVersion++;
   Object.assign(illegalHigherVersionRetry.deployments[0], {
     acceptedManifestVersion: 3,
     manifestSha256: digest(version3Manifest),
@@ -575,6 +595,7 @@ try {
   validateState('queue-create-uncertain-illegal-shape', version3Manifest, illegalHigherVersionRetry);
   assert(retryTransitionErrors(uncertainFailure, illegalHigherVersionRetry, {type: 'ACCEPT_HIGHER_MANIFEST', serviceName: 'agent-service', factsReconciled: false}).length > 0, 'a higher manifest alone must not clear uncertain facts');
   const manualRetry = clone(uncertainFailure);
+  manualRetry.stateVersion++;
   Object.assign(manualRetry.deployments[0].services[0], {
     phase: 'CREATING', operation: operation('CREATE', 'STARTING_CANDIDATE', 'instance-manual-retry'),
     failedManifestVersion: null, lastError: null
