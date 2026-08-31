@@ -172,8 +172,8 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
             );
             // 默认启用流式输出。SSE 聚合器负责还原 content/reasoning/tool_calls。
             requestJsonMap.put("stream", true);
-            applyStreamingOptions(requestJsonMap, baseUrl, AgentContext.getPhase());
-            applyEndpointSamplingDefaults(requestJsonMap, baseUrl);
+            applyStreamingOptions(requestJsonMap, baseUrl, AgentContext.getPhase(), endpointName);
+            applyEndpointSamplingDefaults(requestJsonMap, baseUrl, endpointName);
 
             // OpenRouter 特有：添加 providerOrder 与结构化输出参数。
             //
@@ -1033,32 +1033,53 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
     }
 
     private boolean isOpenRouterEndpoint(String url) {
-        if (url == null || url.isBlank()) {
-            return false;
-        }
-        try {
-            URI uri = URI.create(url.trim());
-            return isOpenRouterHost(uri.getHost());
-        } catch (IllegalArgumentException e) {
-            try {
-                URI uri = new URI(url.trim());
-                return isOpenRouterHost(uri.getHost());
-            } catch (URISyntaxException ignored) {
-                return false;
-            }
-        }
+        return isOpenRouter(url, endpointName);
     }
 
     private boolean isFireworksEndpoint(String url) {
-        return isFireworksEndpointUrl(url);
+        return isFireworks(url, endpointName);
     }
 
-    private boolean isOpenRouterHost(String host) {
+    /**
+     * OpenRouter：配置端点名是 {@code openrouter}，或 URL 主机仍是官方 {@code openrouter.ai}。
+     * 两套并存，新加坡网关 URL 和未切配置的直连都能认出来。
+     */
+    public static boolean isOpenRouter(String url, String endpointName) {
+        return isEndpointName(endpointName, "openrouter") || isOpenRouterHost(hostOf(url));
+    }
+
+    /**
+     * Fireworks：配置端点名是 {@code fireworks}，或 URL 主机仍是官方 {@code fireworks.ai}。
+     */
+    public static boolean isFireworks(String url, String endpointName) {
+        return isEndpointName(endpointName, "fireworks") || isFireworksHost(hostOf(url));
+    }
+
+    private static boolean isEndpointName(String endpointName, String expected) {
+        return endpointName != null && expected.equalsIgnoreCase(endpointName.trim());
+    }
+
+    private static boolean isOpenRouterHost(String host) {
         return host != null && (host.equals("openrouter.ai") || host.endsWith(".openrouter.ai"));
     }
 
     private static boolean isFireworksHost(String host) {
         return host != null && (host.equals("fireworks.ai") || host.endsWith(".fireworks.ai"));
+    }
+
+    private static String hostOf(String url) {
+        if (url == null || url.isBlank()) {
+            return null;
+        }
+        try {
+            return URI.create(url.trim()).getHost();
+        } catch (IllegalArgumentException e) {
+            try {
+                return new URI(url.trim()).getHost();
+            } catch (URISyntaxException ignored) {
+                return null;
+            }
+        }
     }
 
     public static void normalizeOpenRouterTokenLimit(Map<String, Object> requestJsonMap) {
@@ -1075,7 +1096,7 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
     }
 
     public static void applyStreamingOptions(Map<String, Object> requestJsonMap, String baseUrl) {
-        applyStreamingOptions(requestJsonMap, baseUrl, AgentContext.getPhase());
+        applyStreamingOptions(requestJsonMap, baseUrl, AgentContext.getPhase(), null);
     }
 
     /**
@@ -1087,10 +1108,15 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
      * {@code stream_options}，即使它支持模型本身，也可能被过滤成 404。</p>
      */
     public static void applyStreamingOptions(Map<String, Object> requestJsonMap, String baseUrl, String phase) {
+        applyStreamingOptions(requestJsonMap, baseUrl, phase, null);
+    }
+
+    public static void applyStreamingOptions(
+            Map<String, Object> requestJsonMap, String baseUrl, String phase, String endpointName) {
         if (requestJsonMap == null) {
             return;
         }
-        if (isFireworksEndpointUrl(baseUrl)) {
+        if (isFireworks(baseUrl, endpointName)) {
             // Fireworks 当前 API 文档没有列出 stream_options；流式 perf metrics 通过最终 chunk 返回。
             requestJsonMap.remove("stream_options");
             requestJsonMap.put("perf_metrics_in_response", true);
@@ -1113,29 +1139,17 @@ public class OpenRouterProviderRoutedChatModel implements ChatModel {
     }
 
     public static void applyEndpointSamplingDefaults(Map<String, Object> requestJsonMap, String baseUrl) {
+        applyEndpointSamplingDefaults(requestJsonMap, baseUrl, null);
+    }
+
+    public static void applyEndpointSamplingDefaults(
+            Map<String, Object> requestJsonMap, String baseUrl, String endpointName) {
         if (requestJsonMap == null) {
             return;
         }
-        if (isFireworksEndpointUrl(baseUrl)) {
+        if (isFireworks(baseUrl, endpointName)) {
             // Fireworks 实验使用服务端默认采样参数，避免本地全局默认 temperature 干扰。
             requestJsonMap.remove("temperature");
-        }
-    }
-
-    private static boolean isFireworksEndpointUrl(String url) {
-        if (url == null || url.isBlank()) {
-            return false;
-        }
-        try {
-            URI uri = URI.create(url.trim());
-            return isFireworksHost(uri.getHost());
-        } catch (IllegalArgumentException e) {
-            try {
-                URI uri = new URI(url.trim());
-                return isFireworksHost(uri.getHost());
-            } catch (URISyntaxException ignored) {
-                return false;
-            }
         }
     }
 
