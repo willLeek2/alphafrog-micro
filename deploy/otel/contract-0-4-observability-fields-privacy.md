@@ -30,43 +30,63 @@
 | `lane.tag` | 流量泳道标签。与 Dubbo 的 `-Ddubbo.provider.tag` 同一字符串。 | 固定字符串 `stable` | 当前唯一活动部署的标签。首版固定为 `lane-test`（全局并发部署上限=1） | 同上。标签来自控制器状态，不来自客户端请求头。 | 同一验收面。稳定与 beta 两条 trace 的 `lane.tag` 能分开过滤。 |
 | `service.version` | 构建该镜像时写入的服务版本字符串。 | 构建/部署流水线注入的 `AF_BUILD_VERSION` | 控制器按本次构建产物写入，与部署单记录一致 | 稳定：部署环境文件提供 `AF_BUILD_VERSION`。beta：控制器写 override。compose 里允许 `${AF_BUILD_VERSION:-local}` 只给本机起容器。 | 与部署单记录的版本字节相等。生产与 beta 预检拒绝值为 `local` 或空。 |
 | `git.commit` | 构建该镜像所用的完整 Git 提交对象 ID。 | 流水线注入的 `AF_BUILD_COMMIT` | 同上，与部署单记录一致 | 同上，变量名 `AF_BUILD_COMMIT`。 | 与部署单记录的提交字节相等。当前仓库是 SHA-1，值为 40 位小写十六进制。禁止短 hash。生产与 beta 预检拒绝值为 `unknown` 或空。 |
-| `image.digest` | 镜像内容摘要。 | 流水线注入的 `AF_BUILD_IMAGE_DIGEST` | 同上 | 同上，变量名 `AF_BUILD_IMAGE_DIGEST`。 | 与容器实际 Image ID 精确相等（`docker inspect` 的镜像 ID，形如 `sha256:` + 64 位小写十六进制）。禁止只核对前缀。生产与 beta 预检拒绝值为 `unknown` 或空。 |
+| `image.digest` | **该服务容器实际使用的本地 Image ID**（见 §2.4 两列，不是仓库清单摘要）。 | 该服务自己的 `AF_BUILD_IMAGE_ID_*`（§2.1 表） | 控制器在镜像已经在本机、容器启动之前，读取该服务镜像的 `docker inspect .Id` 写入 override | 稳定：构建/部署脚本在镜像构建或拉取完成之后、允许启动之前，逐服务读取并写入对应变量。beta：2-4 对选定服务做同样的事。禁止 11 个服务共用一个进程级变量。 | 与**该容器** `docker inspect --format '{{.Image}}'` 的值精确相等。禁止只核对前缀，禁止拿部署单里的 `repository@sha256:...` 仓库摘要来充数。生产与 beta 预检拒绝值为 `unknown` 或空。 |
 
 硬性规则：
 
 1. 五个键缺任何一个，该实例的部署身份不成立。1-5 试点按此判失败。
-2. 验收看构建身份（`service.version` / `git.commit` / `image.digest`），对端 IP 只能说明流量到了哪台机器。
+2. 验收看构建身份（`service.version` / `git.commit` / **该服务的** `image.digest`），对端 IP 只能说明流量到了哪台机器。
 3. `deployment_generation_id`（2-6 的不可变执行代际，环境变量 `AF_DEPLOYMENT_GENERATION_ID`）**不是**本清单的字段，不要写进 `OTEL_RESOURCE_ATTRIBUTES`。
 4. 保留值 `stable` 只用于稳定实例的 `deployment.id` 与 `lane.tag`。2-6 的迁移代 `legacy-stable` 只出现在数据库列 `deployment_generation_id`，不出现在本清单。
+5. `service.version` 与 `git.commit` 在一次部署里 11 个 JVM 服务可以相同（同一次 `deploy_latest.sh`、同一个提交）。`image.digest` 必须每服务不同，因为 11 个服务是 11 个镜像。
 
 ### 2.1 稳定实例：1-1 要写进 compose 的字符串
 
-```text
-OTEL_RESOURCE_ATTRIBUTES: "deployment.id=stable,lane.tag=stable,service.version=${AF_BUILD_VERSION:-local},git.commit=${AF_BUILD_COMMIT:-unknown},image.digest=${AF_BUILD_IMAGE_DIGEST:-unknown}"
-```
-
-配套（不是五字段，但必须同时有）：
+`x-otel-env` 锚点只放协议与导出开关，以及稳定侧**共用的四项**所依赖的插值（`deployment.id` / `lane.tag` / `service.version` / `git.commit`）。**不要**把 `image.digest` 放进锚点。各服务块自己写完整的 `OTEL_RESOURCE_ATTRIBUTES` 五字段字符串，前四项与锚点约定相同，第五项用本服务变量。
 
 ```text
+# x-otel-env 锚点（共用，不含 image.digest）
+OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
 OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
 OTEL_TRACES_EXPORTER: otlp
 OTEL_METRICS_EXPORTER: none
 OTEL_LOGS_EXPORTER: none
 AF_DEPLOYMENT_ID: stable
+
+# 各服务块（以 agent-langchain-service 为例）
+OTEL_RESOURCE_ATTRIBUTES: "deployment.id=stable,lane.tag=stable,service.version=${AF_BUILD_VERSION:-local},git.commit=${AF_BUILD_COMMIT:-unknown},image.digest=${AF_BUILD_IMAGE_ID_AGENT_LANGCHAIN_SERVICE:-unknown}"
 ```
 
 `OTEL_LOGS_EXPORTER=none` 的原因：日志走「文件 → 采集器 → VictoriaLogs」。这里不关，同一行会被送两次。
 
+镜像 ID 环境变量命名规则：`AF_BUILD_IMAGE_ID_` + compose 服务名转大写、连字符改下划线。11 个 JVM 服务（落地版 §1.1，`python-sandbox-service` 不是 Java，本清单不覆盖）固定如下。新增 JVM 服务按同一规则加一行，禁止再引入共用的 `AF_BUILD_IMAGE_DIGEST`。
+
+| compose 服务名 | 环境变量 |
+|----------------|----------|
+| `domestic-stock-service` | `AF_BUILD_IMAGE_ID_DOMESTIC_STOCK_SERVICE` |
+| `domestic-index-service` | `AF_BUILD_IMAGE_ID_DOMESTIC_INDEX_SERVICE` |
+| `domestic-fund-service` | `AF_BUILD_IMAGE_ID_DOMESTIC_FUND_SERVICE` |
+| `domestic-listed-asset-service` | `AF_BUILD_IMAGE_ID_DOMESTIC_LISTED_ASSET_SERVICE` |
+| `domestic-fetch-service` | `AF_BUILD_IMAGE_ID_DOMESTIC_FETCH_SERVICE` |
+| `admin-service` | `AF_BUILD_IMAGE_ID_ADMIN_SERVICE` |
+| `portfolio-service` | `AF_BUILD_IMAGE_ID_PORTFOLIO_SERVICE` |
+| `agent-langchain-service` | `AF_BUILD_IMAGE_ID_AGENT_LANGCHAIN_SERVICE` |
+| `external-info-service` | `AF_BUILD_IMAGE_ID_EXTERNAL_INFO_SERVICE` |
+| `python-sandbox-gateway-service` | `AF_BUILD_IMAGE_ID_PYTHON_SANDBOX_GATEWAY_SERVICE` |
+| `frontend` | `AF_BUILD_IMAGE_ID_FRONTEND` |
+
+生成时点：镜像已经构建或拉取到本机之后、容器允许启动之前。构建前只有提交和版本，不能填写 `image.digest`。部署脚本对每个将要启动的 JVM 服务执行 `docker inspect --format '{{.Id}}' <本机镜像>`（或等价地读将要使用的镜像 ID），写入上表对应变量，再和即将写入 `OTEL_RESOURCE_ATTRIBUTES` 的值比较，一致才允许启动。
+
 ### 2.2 beta 实例：2-4 控制器写进 override 的字符串
 
-控制器在创建容器之前写入，值里不使用 `local` / `unknown` 兜底：
+控制器在**该服务镜像已经在 beta 机本地、容器启动之前**写入，值里不使用 `local` / `unknown` 兜底。每个被拉起的服务写自己的五字段字符串，`image.digest` 取该服务镜像的本地 Image ID，不复用其它服务的值：
 
 ```text
-OTEL_RESOURCE_ATTRIBUTES: "deployment.id=<deployment-id>,lane.tag=<泳道值>,service.version=<版本>,git.commit=<提交>,image.digest=<摘要>"
+OTEL_RESOURCE_ATTRIBUTES: "deployment.id=<deployment-id>,lane.tag=<泳道值>,service.version=<版本>,git.commit=<提交>,image.digest=<该服务本地 Image ID>"
 AF_DEPLOYMENT_ID: "<deployment-id>"
 ```
 
-`<deployment-id>` 与 `AF_DEPLOYMENT_ID`、部署单 id 必须是同一字符串。
+`<deployment-id>` 与 `AF_DEPLOYMENT_ID`、部署单 id 必须是同一字符串。部署单另存「不可变镜像引用」（见 §2.4 左列），不要把那一列抄进 `image.digest`。
 
 ### 2.3 部署预检（生产与 beta；1-1 实现，2-4 在 beta 创建路径复用）
 
@@ -77,13 +97,22 @@ AF_DEPLOYMENT_ID: "<deployment-id>"
 - `service.version` 不是 `local`、不是空。
 - `git.commit` 不是 `unknown`、不是空，且匹配 `^[0-9a-f]{40}$`。
 - `image.digest` 不是 `unknown`、不是空，且匹配 `^sha256:[0-9a-f]{64}$`。
+- 该服务的 `image.digest` 等于该服务即将使用（或已经 `create` 出）的容器 `inspect .Image`，不等于部署单里的仓库摘要列。
 - 五个值都不含 `,` `=` `\n` `\r`。
+- 禁止 11 个服务的 `image.digest` 插值指向同一个环境变量。
 
 本机开发起容器可以用 `local` / `unknown`。那条路径不走生产预检、不走 beta 控制器 create。
 
-### 2.4 `image.digest` 的格式说明
+### 2.4 镜像身份必须分成两列（不要混用）
 
-compose 里镜像引用写成 `repository@sha256:<64位十六进制>`。资源属性 `image.digest` 只写摘要本身：`sha256:` + 64 位小写十六进制。仓库名、tag、`@` 都不进这个字段，避免仓库名带进逗号或大写混乱。验收拿容器实际 Image ID 对，不拿 tag。
+仓库清单摘要和容器本地 Image ID 都长得像 `sha256:` + 64 位十六进制，但它们是两个对象。一次 `docker pull repository@sha256:...` 之后，本地 Image ID 仍可能与清单摘要不同。
+
+| 列 | 存在哪 | 值从哪来 | 谁用来做什么 |
+|----|--------|----------|--------------|
+| 不可变镜像引用（含仓库清单摘要） | 部署单 / 专用部署 Compose 的 `image:` | `repository@sha256:<64位小写十六进制>` | 2-4 按摘要拉取、config 精确比较、禁止按 tag 起容器 |
+| 容器实际 Image ID | span 资源属性 `image.digest`；环境变量 `AF_BUILD_IMAGE_ID_*` | `docker inspect` 的 `.Id`（对镜像）或容器的 `.Image`。格式同样是 `sha256:` + 64 位小写十六进制，**不含**仓库名、**不含** `@` | 观测验收、启动预检。只和该容器实际 Image ID 比 |
+
+把左列填进 `image.digest` 会让 1-5 / 4-4 的「与容器实际 Image ID 精确相等」整批失败，也会让 11 个服务看起来像用了同一份镜像。1-1 和 2-4 生成资源属性时只读右列。
 
 ---
 
@@ -220,8 +249,8 @@ VictoriaLogs 的删除 HTTP 接口（`POST /delete/run_task` 等）默认应保�
 
 下面只列本清单负责的检查。javaagent 能否加载、跨服务 span 是否连上，仍按落地版 §1.6 第 1–4、6 步。
 
-1. 稳定实例任取一条带请求上下文的 trace：五个资源属性都在；`deployment.id=stable`；`lane.tag=stable`；三个构建身份不是 `local` / `unknown`（生产与 beta 环境）。
-2. beta 实例一条 trace：五个资源属性都在；`deployment.id` / `lane.tag` / 三个构建身份与本次部署单一致；`image.digest` 与容器实际 Image ID 精确相等。
+1. 稳定实例任取一条带请求上下文的 trace：五个资源属性都在；`deployment.id=stable`；`lane.tag=stable`；`service.version` / `git.commit` 不是 `local` / `unknown`（生产与 beta 环境）；`image.digest` 等于**该容器**的 `inspect .Image`，且来自该服务自己的 `AF_BUILD_IMAGE_ID_*`，不是共用变量、不是部署单仓库摘要。
+2. beta 实例一条 trace：五个资源属性都在；`deployment.id` / `lane.tag` / `service.version` / `git.commit` 与本次部署单一致；`image.digest` 与**该容器**实际 Image ID 精确相等，不等于部署单里的 `repository@sha256:...` 仓库摘要。
 3. 同一条请求：VictoriaLogs 按 `trace_id` 查到的日志行，`deployment` 字段等于该 trace 的 `deployment.id`。
 4. 同一服务的 stable 与 beta 日志能按 `deployment` 分别查出，值不同。
 5. 采集器配置里找不到用进程级变量覆盖 `deployment` 的 `add` / `replace`。
