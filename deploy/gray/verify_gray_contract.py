@@ -47,6 +47,12 @@ def verify_schema_identity(schema: dict[str, Any]) -> None:
     assert schema["$id"].endswith("gray-rules-v1.schema.json")
     assert set(schema["required"]) == DOCUMENT_KEYS
     assert set(schema["definitions"]["grayRule"]["required"]) == RULE_KEYS
+    expires_at_schema = schema["definitions"]["grayRule"]["properties"]["expiresAt"]
+    timezone_pattern = expires_at_schema["pattern"]
+    assert re.search(timezone_pattern, "2026-09-15T00:00:00Z")
+    assert re.search(timezone_pattern, "2026-09-15T00:00:00+08:00")
+    assert re.search(timezone_pattern, "2026-09-15T00:00:00-05:30")
+    assert not re.search(timezone_pattern, "2026-09-15T00:00:00")
 
 
 def verify_document(document: dict[str, Any]) -> None:

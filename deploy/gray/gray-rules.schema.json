@@ -83,6 +83,7 @@
         "expiresAt": {
           "type": "string",
           "format": "date-time",
+          "pattern": "(?:Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])$",
           "description": "RFC 3339 instant with an explicit UTC offset. At now >= expiresAt, the rule is treated as disabled but remains stored for audit."
         }
       }
