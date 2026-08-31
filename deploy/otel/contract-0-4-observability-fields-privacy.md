@@ -144,7 +144,7 @@ beta 机器把 trace 发到 101 的 `4318`，把日志发到 101 的 `9428`。�
 | 令牌与会话 | `Authorization` / `Bearer` / JWT 全文、`Cookie` / `Set-Cookie` 全文、刷新令牌 |
 | 泳道入口口令 | `AF_LANE_TAG_PASSPHRASE`（请求头口令：不写日志、不回传响应、不进 span 属性或事件） |
 | 数据库口令 | 生产库写口令、beta 库口令、`market_reader` 只读口令；含连接串里的密码段；错误消息不得回显完整连接串 |
-| Nacos 凭据 | 管理员口令、发布口令、各服务读账号口令、`NACOS_AUTH_TOKEN` / `NACOS_AUTH_IDENTITY_VALUE` |
+| Nacos 凭据 | 管理员口令、发布口令、各服务读账号口令；Nacos 2.5 认证三变量必须一并禁止：`NACOS_AUTH_TOKEN`、`NACOS_AUTH_IDENTITY_KEY`、`NACOS_AUTH_IDENTITY_VALUE`（计划二 §二 第 1 条同一组；身份键没有默认值，漏写会让验收把脱敏当成已完整） |
 | 机器与仓库 | SSH 私钥、镜像仓库管理凭据 |
 | API 密钥 | `AF_AGENT_API_KEY` 及各模型 / 搜索 provider 的 key。若日志框架必须打一个引用，只保留「已配置 / 未配置」，不打前 4 后 4 这种仍可拼回的片段 |
 | 完整请求正文 | HTTP 请求体、HTTP 响应体、客户端完整提问原文若与令牌或密码同段出现时整段打码。普通用户问题按落地版允许进日志；不要为了「方便排查」打开请求体采集 |
@@ -226,7 +226,7 @@ VictoriaLogs 的删除 HTTP 接口（`POST /delete/run_task` 等）默认应保�
 4. 同一服务的 stable 与 beta 日志能按 `deployment` 分别查出，值不同。
 5. 采集器配置里找不到用进程级变量覆盖 `deployment` 的 `add` / `replace`。
 6. 坏 JSON 行带着 `parse.error` 到达 VictoriaLogs（落地版 §1.4；本清单不改这条，1-3 / 1-5 执行）。
-7. 抽查 span 属性与日志正文：不含第 6 节禁止项；`db.statement` 中的字面量已被替换成 `?`。
+7. 抽查 span 属性与日志正文：不含第 6 节禁止项。Nacos 认证三变量 `NACOS_AUTH_TOKEN`、`NACOS_AUTH_IDENTITY_KEY`、`NACOS_AUTH_IDENTITY_VALUE` 必须都抽到（键名和值都不出现）；`db.statement` 中的字面量已被替换成 `?`。
 8. 第 7 步容量数字记下来之后，回写第 8 节保留策略。
 
 ---
