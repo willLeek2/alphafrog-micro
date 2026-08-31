@@ -116,4 +116,69 @@ class MarketReadResultGuardTest {
         assertEquals(MarketReadResultLimitExceededException.ERROR_CODE, ex.getErrorCode());
         assertEquals(4, fetched.size());
     }
+
+    @Test
+    void checkRows_shouldCountFullJsonIncludingQuotesAndArray() throws Exception {
+        MarketReadResultGuard guard = guardWith(10, 8, 100, 1000);
+        List<String> rows = List.of("a", "b");
+        com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+        assertEquals(9, mapper.writeValueAsBytes(rows).length);
+        MarketReadResultLimitExceededException ex = assertThrows(
+                MarketReadResultLimitExceededException.class, () -> guard.checkRows(rows));
+        assertEquals(MarketReadResultLimitExceededException.LimitKind.BYTES, ex.getKind());
+        assertEquals(9, ex.getActual());
+        assertEquals(8, ex.getLimit());
+        assertEquals(2, rows.size());
+    }
+
+    @Test
+    void checkRows_shouldCountJsonEscapeOverhead() throws Exception {
+        MarketReadResultGuard guard = guardWith(10, 4, 100, 1000);
+        List<String> rows = List.of("\"");
+        com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+        long jsonBytes = mapper.writeValueAsBytes(rows).length;
+        assertTrue(jsonBytes > 4);
+        MarketReadResultLimitExceededException ex = assertThrows(
+                MarketReadResultLimitExceededException.class, () -> guard.checkRows(rows));
+        assertEquals(MarketReadResultLimitExceededException.LimitKind.BYTES, ex.getKind());
+        assertEquals(jsonBytes, ex.getActual());
+    }
+
+    @Test
+    void checkRows_customEstimator_shouldRejectSaturatedOverflow() {
+        MarketReadResultGuard guard = guardWith(10, Long.MAX_VALUE - 1, 100, 1000);
+        List<String> rows = List.of("x", "y");
+        MarketReadResultLimitExceededException ex = assertThrows(
+                MarketReadResultLimitExceededException.class,
+                () -> guard.checkRows(rows, row -> Long.MAX_VALUE / 2 + 10));
+        assertEquals(MarketReadResultLimitExceededException.ERROR_CODE, ex.getErrorCode());
+        assertEquals(MarketReadResultLimitExceededException.LimitKind.BYTES, ex.getKind());
+        assertEquals(Long.MAX_VALUE, ex.getActual());
+        assertEquals(2, rows.size());
+    }
+
+    @Test
+    void checkPage_shouldCountFullJsonOfReturnedPage() throws Exception {
+        MarketReadResultGuard guard = guardWith(10_000, 20, 2, 2);
+        MarketReadPage page = guard.resolvePage(1, 2);
+        List<String> rows = List.of("a", "b");
+        MarketReadPageResult<String> wouldReturn = new MarketReadPageResult<>(rows, 0L, 2, false);
+        com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+        long jsonBytes = mapper.writeValueAsBytes(wouldReturn).length;
+        assertTrue(jsonBytes > 20);
+        MarketReadResultLimitExceededException ex = assertThrows(
+                MarketReadResultLimitExceededException.class, () -> guard.checkPage(rows, page));
+        assertEquals(MarketReadResultLimitExceededException.LimitKind.BYTES, ex.getKind());
+        assertEquals(jsonBytes, ex.getActual());
+    }
+
+    @Test
+    void resolvePage_largePage_shouldKeepPositiveLongOffset() {
+        MarketReadResultGuard guard = guardWith(10_000, 1_048_576, 100, 1000);
+        MarketReadPage page = guard.resolvePage(Integer.MAX_VALUE, 1000);
+        assertEquals(2_147_483_646_000L, page.offset());
+        assertTrue(page.offset() > 0);
+        MarketReadPageResult<String> result = new MarketReadPageResult<>(List.of(), page.offset(), page.limit(), false);
+        assertEquals(2_147_483_646_000L, result.offset());
+    }
 }

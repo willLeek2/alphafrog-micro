@@ -3,7 +3,6 @@ package world.willfrog.alphafrogmicro.common.datasource;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.function.ToLongFunction;
@@ -11,6 +10,9 @@ import java.util.function.ToLongFunction;
 /**
  * 行情查询共享返回量守卫：检查行数与字节数，并解析分页。超限抛
  * {@link MarketReadResultLimitExceededException}，不截断结果冒充成功。
+ *
+ * <p>默认字节合同按即将返回的完整 JSON 计算（含数组括号、逗号、字符串引号与转义），
+ * 不是逐行原始 UTF-8 相加。</p>
  */
 public final class MarketReadResultGuard {
 
@@ -42,46 +44,43 @@ public final class MarketReadResultGuard {
     }
 
     /**
-     * 检查整表/无分页结果。{@code rows.size()} 大于 {@code maxRows} 或累计字节超过 {@code maxBytes}
-     * 时抛错，返回原列表（不复制、不截断）。
+     * 检查整表/无分页结果。行数超限或完整 JSON 超过 {@code maxBytes} 时抛错，
+     * 返回原列表（不复制、不截断）。
      */
     public <T> List<T> checkRows(List<T> rows) {
-        return checkRows(rows, this::estimateBytes);
+        assertRowCount(rows);
+        enforceJsonByteLimit(rows);
+        return rows;
     }
 
+    /**
+     * 调用方自带逐行估算时，用饱和加法累计，避免 {@code long} 溢出后变成负数被当成通过。
+     */
     public <T> List<T> checkRows(List<T> rows, ToLongFunction<T> byteSize) {
-        if (rows == null) {
-            throw new IllegalArgumentException("market-read rows must not be null");
-        }
-        if (rows.size() > limits.getMaxRows()) {
-            throw new MarketReadResultLimitExceededException(
-                    MarketReadResultLimitExceededException.LimitKind.ROWS,
-                    rows.size(),
-                    limits.getMaxRows());
-        }
-        long bytes = 0L;
-        for (T row : rows) {
-            bytes += Math.max(0L, byteSize.applyAsLong(row));
-            if (bytes > limits.getMaxBytes()) {
-                throw new MarketReadResultLimitExceededException(
-                        MarketReadResultLimitExceededException.LimitKind.BYTES,
-                        bytes,
-                        limits.getMaxBytes());
-            }
-        }
+        assertRowCount(rows);
+        enforceEstimatedByteLimit(rows, byteSize);
         return rows;
     }
 
     /**
      * 分页读取：调用方应按 {@code page.limit() + 1} 向数据库取行（多取一行探是否还有下一页）。
      * 取回超过 {@code limit + 1} 行视为未加分页，按行数超限处理，不会悄悄丢掉多余行。
+     * 字节上限按将返回的 {@link MarketReadPageResult} 完整 JSON 计算。
      */
     public <T> MarketReadPageResult<T> checkPage(List<T> fetched, MarketReadPage page) {
-        return checkPage(fetched, page, this::estimateBytes);
+        MarketReadPageResult<T> result = buildPage(fetched, page);
+        enforceJsonByteLimit(result);
+        return result;
     }
 
     public <T> MarketReadPageResult<T> checkPage(
             List<T> fetched, MarketReadPage page, ToLongFunction<T> byteSize) {
+        MarketReadPageResult<T> result = buildPage(fetched, page);
+        enforceEstimatedByteLimit(result.rows(), byteSize);
+        return result;
+    }
+
+    private <T> MarketReadPageResult<T> buildPage(List<T> fetched, MarketReadPage page) {
         if (fetched == null) {
             throw new IllegalArgumentException("market-read rows must not be null");
         }
@@ -99,27 +98,64 @@ public final class MarketReadResultGuard {
         List<T> pageRows = hasMore
                 ? List.copyOf(fetched.subList(0, page.limit()))
                 : List.copyOf(fetched);
-        checkRows(pageRows, byteSize);
+        if (pageRows.size() > limits.getMaxRows()) {
+            throw new MarketReadResultLimitExceededException(
+                    MarketReadResultLimitExceededException.LimitKind.ROWS,
+                    pageRows.size(),
+                    limits.getMaxRows());
+        }
         return new MarketReadPageResult<>(new ArrayList<>(pageRows), page.offset(), page.limit(), hasMore);
     }
 
-    long estimateBytes(Object row) {
-        if (row == null) {
-            return 0L;
+    private <T> void assertRowCount(List<T> rows) {
+        if (rows == null) {
+            throw new IllegalArgumentException("market-read rows must not be null");
         }
-        if (row instanceof byte[] bytes) {
-            return bytes.length;
+        if (rows.size() > limits.getMaxRows()) {
+            throw new MarketReadResultLimitExceededException(
+                    MarketReadResultLimitExceededException.LimitKind.ROWS,
+                    rows.size(),
+                    limits.getMaxRows());
         }
-        if (row instanceof CharSequence chars) {
-            return chars.toString().getBytes(StandardCharsets.UTF_8).length;
+    }
+
+    private void enforceJsonByteLimit(Object payload) {
+        long bytes = jsonSize(payload);
+        if (bytes > limits.getMaxBytes()) {
+            throw new MarketReadResultLimitExceededException(
+                    MarketReadResultLimitExceededException.LimitKind.BYTES,
+                    bytes,
+                    limits.getMaxBytes());
         }
-        if (row instanceof Number || row instanceof Boolean) {
-            return 8L;
+    }
+
+    private <T> void enforceEstimatedByteLimit(List<T> rows, ToLongFunction<T> byteSize) {
+        long bytes = 0L;
+        for (T row : rows) {
+            long add = Math.max(0L, byteSize.applyAsLong(row));
+            bytes = saturatingAdd(bytes, add);
+            if (bytes > limits.getMaxBytes()) {
+                throw new MarketReadResultLimitExceededException(
+                        MarketReadResultLimitExceededException.LimitKind.BYTES,
+                        bytes,
+                        limits.getMaxBytes());
+            }
         }
+    }
+
+    private long jsonSize(Object payload) {
         try {
-            return objectMapper.writeValueAsBytes(row).length;
+            return objectMapper.writeValueAsBytes(payload).length;
         } catch (JsonProcessingException ex) {
-            return String.valueOf(row).getBytes(StandardCharsets.UTF_8).length;
+            throw new IllegalStateException("market-read result cannot be serialized for byte limit", ex);
         }
+    }
+
+    static long saturatingAdd(long left, long right) {
+        long sum = left + right;
+        if (((left ^ sum) & (right ^ sum)) < 0) {
+            return Long.MAX_VALUE;
+        }
+        return sum;
     }
 }

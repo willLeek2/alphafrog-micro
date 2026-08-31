@@ -28,7 +28,7 @@ public class MarketReadDataSourceProperties {
             throw new IllegalStateException(
                     "alphafrog.datasource.market-read.username is required when alphafrog.market-read.enabled=true");
         }
-        if (password == null) {
+        if (isBlank(password)) {
             throw new IllegalStateException(
                     "alphafrog.datasource.market-read.password is required when alphafrog.market-read.enabled=true");
         }

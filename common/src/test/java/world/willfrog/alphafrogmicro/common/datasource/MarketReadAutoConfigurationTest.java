@@ -74,4 +74,15 @@ class MarketReadAutoConfigurationTest {
                 "alphafrog.datasource.market-read.hikari.initialization-fail-timeout=-1"
         ).run(ctx -> assertThat(ctx).hasFailed());
     }
+
+    @Test
+    void enabledTrue_shouldRejectBlankPassword() {
+        runner().withPropertyValues(
+                "alphafrog.market-read.enabled=true",
+                "alphafrog.datasource.market-read.url=jdbc:postgresql://10.0.0.101:5432/alphafrog",
+                "alphafrog.datasource.market-read.username=alphafrog_market_reader",
+                "alphafrog.datasource.market-read.password=",
+                "alphafrog.datasource.market-read.hikari.initialization-fail-timeout=-1"
+        ).run(ctx -> assertThat(ctx).hasFailed());
+    }
 }
