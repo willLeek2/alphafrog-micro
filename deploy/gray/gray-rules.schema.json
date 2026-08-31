@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "$id": "https://alphafrog.local/schemas/gray-rules-v1.schema.json",
+  "title": "AlphaFrog gray rules document v1",
+  "description": "Schema version v1 for gray-rules.json. ruleVersion is the configuration propagation and audit version; it is not the schema version and never participates in bucketing.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "ruleVersion",
+    "bucketSalt",
+    "rules"
+  ],
+  "properties": {
+    "ruleVersion": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Configuration propagation and audit identifier. It is logged after a successful atomic load and never enters the bucket hash."
+    },
+    "bucketSalt": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+      "description": "Document-wide bucket salt. Changing it intentionally reassigns every rule's buckets. Colons are forbidden so the v1 concatenation remains unambiguous."
+    },
+    "rules": {
+      "type": "array",
+      "maxItems": 10000,
+      "description": "Complete rule set replaced atomically after the whole document passes structural and semantic validation.",
+      "items": {
+        "$ref": "#/definitions/grayRule"
+      }
+    }
+  },
+  "definitions": {
+    "grayRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ruleId",
+        "enabled",
+        "percent",
+        "userFilter",
+        "owner",
+        "expiresAt"
+      ],
+      "properties": {
+        "ruleId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+          "description": "Stable identifier used by business code. It must also be unique within the rules array; uniqueness by ruleId is a semantic check outside JSON Schema draft-07."
+        },
+        "enabled": {
+          "type": "boolean",
+          "description": "Emergency off switch. false takes precedence over userFilter and percent."
+        },
+        "percent": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100,
+          "description": "A non-allowlisted user matches when its stable bucket number is strictly less than percent."
+        },
+        "userFilter": {
+          "type": "array",
+          "maxItems": 10000,
+          "uniqueItems": true,
+          "description": "Exact-match user identifiers that take precedence over percent after enabled, expiry, and non-empty user checks.",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        },
+        "owner": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Accountable maintainer for the rule. Loaders must additionally reject an all-whitespace value."
+        },
+        "expiresAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "RFC 3339 instant with an explicit UTC offset. At now >= expiresAt, the rule is treated as disabled but remains stored for audit."
+        }
+      }
+    }
+  }
+}

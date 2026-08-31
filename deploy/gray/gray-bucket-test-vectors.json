@@ -1,0 +1,296 @@
+{
+  "contractVersion": "gray-bucket-v1",
+  "algorithm": {
+    "input": "ruleId + ':' + bucketSalt + ':' + userId",
+    "textEncoding": "UTF-8",
+    "hash": "SHA-256",
+    "selectedBytes": "digest[0:8]",
+    "integerEncoding": "unsigned big-endian 64-bit",
+    "bucketFormula": "unsigned64 mod 100",
+    "matchFormula": "bucket < percent",
+    "emptyUserIdMatches": false,
+    "ruleVersionParticipatesInHash": false
+  },
+  "vectors": [
+    {
+      "id": "V1",
+      "ruleId": "demo-rule",
+      "bucketSalt": "alpha-salt-260831",
+      "userId": "user-0001",
+      "sha256Hex": "a132d56d31ed277557b77340c413eafacb419526ac09bbce4183dde4d3975854",
+      "firstEightBytesHex": "a132d56d31ed2775",
+      "unsigned64Decimal": "11615581053907707765",
+      "bucket": 65
+    },
+    {
+      "id": "V2",
+      "ruleId": "demo-rule",
+      "bucketSalt": "alpha-salt-260831",
+      "userId": "user-0002",
+      "sha256Hex": "b209ace9b15954e5a4c945960eda8f0790276d1e2d15663d002750e6e082baf5",
+      "firstEightBytesHex": "b209ace9b15954e5",
+      "unsigned64Decimal": "12828975133244347621",
+      "bucket": 21
+    },
+    {
+      "id": "V3",
+      "ruleId": "demo-rule",
+      "bucketSalt": "alpha-salt-260831",
+      "userId": "user-0003",
+      "sha256Hex": "24da5d4d274712dd83156ebfcd1e33a32479da90e37127221e6c83eb564bfbe6",
+      "firstEightBytesHex": "24da5d4d274712dd",
+      "unsigned64Decimal": "2655537516241162973",
+      "bucket": 73
+    },
+    {
+      "id": "V4",
+      "ruleId": "demo-rule",
+      "bucketSalt": "alpha-salt-260831",
+      "userId": "user-0004",
+      "sha256Hex": "a379d80bc51291fce4984caca98da1bfd8901cbf69dc14bed396a5e28ca74b2c",
+      "firstEightBytesHex": "a379d80bc51291fc",
+      "unsigned64Decimal": "11779683845426811388",
+      "bucket": 88
+    },
+    {
+      "id": "V5",
+      "ruleId": "demo-rule",
+      "bucketSalt": "alpha-salt-260831",
+      "userId": "user-0005",
+      "sha256Hex": "cf3a379823f83829045fbb1d0eccd7f7931a484959362fabac7d3afd219d2581",
+      "firstEightBytesHex": "cf3a379823f83829",
+      "unsigned64Decimal": "14932308641078327337",
+      "bucket": 37
+    },
+    {
+      "id": "V6",
+      "ruleId": "demo-rule",
+      "bucketSalt": "alpha-salt-260831",
+      "userId": "alice@example.com",
+      "sha256Hex": "061ab92222026e9c1d9f3fa764472689580340d760e6b7611d5025c9cba1854b",
+      "firstEightBytesHex": "061ab92222026e9c",
+      "unsigned64Decimal": "439867469872656028",
+      "bucket": 28
+    },
+    {
+      "id": "V7",
+      "ruleId": "demo-rule",
+      "bucketSalt": "alpha-salt-260831",
+      "userId": "bob@example.com",
+      "sha256Hex": "ac8c71feb51aa4f1a03008cdabc984f70cdec59bc0d6a322151a41567e45476f",
+      "firstEightBytesHex": "ac8c71feb51aa4f1",
+      "unsigned64Decimal": "12433438010037150961",
+      "bucket": 61
+    },
+    {
+      "id": "V8",
+      "ruleId": "demo-rule",
+      "bucketSalt": "changed-salt",
+      "userId": "user-0001",
+      "sha256Hex": "5512acf565f58f8ccbf3c88798062a590348261a4a024cd9c71f02c826d10aa8",
+      "firstEightBytesHex": "5512acf565f58f8c",
+      "unsigned64Decimal": "6130152212782223244",
+      "bucket": 44
+    },
+    {
+      "id": "V9",
+      "ruleId": "other-rule",
+      "bucketSalt": "alpha-salt-260831",
+      "userId": "user-0001",
+      "sha256Hex": "d11950539107702e63aa06c0572d0e23434fd7e855e7101d75162493bec861e5",
+      "firstEightBytesHex": "d11950539107702e",
+      "unsigned64Decimal": "15067162348190396462",
+      "bucket": 62
+    },
+    {
+      "id": "V10",
+      "ruleId": "demo-rule",
+      "bucketSalt": "alpha-salt-260831",
+      "userId": "中文用户测试",
+      "sha256Hex": "bb4ee10c7b6104fd10c65ef0e6c75eecd76322f4c76f5359577e355720c7b29b",
+      "firstEightBytesHex": "bb4ee10c7b6104fd",
+      "unsigned64Decimal": "13496972577001768189",
+      "bucket": 89
+    },
+    {
+      "id": "V11",
+      "ruleId": "demo-rule",
+      "bucketSalt": "alpha-salt-260831",
+      "userId": "user-0007",
+      "sha256Hex": "855e603647f6a464259756364bca5f83f3e291f31d56f2aecbf9c00155e7b445",
+      "firstEightBytesHex": "855e603647f6a464",
+      "unsigned64Decimal": "9610224441107063908",
+      "bucket": 8
+    }
+  ],
+  "wideningCases": [
+    {
+      "id": "W1-10-to-40",
+      "ruleId": "demo-rule",
+      "bucketSalt": "alpha-salt-260831",
+      "userIds": [
+        "user-0001",
+        "user-0002",
+        "user-0003",
+        "user-0004",
+        "user-0005",
+        "alice@example.com",
+        "bob@example.com",
+        "user-0007"
+      ],
+      "fromPercent": 10,
+      "toPercent": 40,
+      "expectedFromMatches": [
+        "user-0007"
+      ],
+      "expectedToMatches": [
+        "user-0002",
+        "user-0005",
+        "alice@example.com",
+        "user-0007"
+      ]
+    },
+    {
+      "id": "W2-40-to-80",
+      "ruleId": "demo-rule",
+      "bucketSalt": "alpha-salt-260831",
+      "userIds": [
+        "user-0001",
+        "user-0002",
+        "user-0003",
+        "user-0004",
+        "user-0005",
+        "alice@example.com",
+        "bob@example.com",
+        "user-0007"
+      ],
+      "fromPercent": 40,
+      "toPercent": 80,
+      "expectedFromMatches": [
+        "user-0002",
+        "user-0005",
+        "alice@example.com",
+        "user-0007"
+      ],
+      "expectedToMatches": [
+        "user-0001",
+        "user-0002",
+        "user-0003",
+        "user-0005",
+        "alice@example.com",
+        "bob@example.com",
+        "user-0007"
+      ]
+    }
+  ],
+  "versionIndependenceCases": [
+    {
+      "id": "R1-rule-version-does-not-rebucket",
+      "ruleId": "demo-rule",
+      "bucketSalt": "alpha-salt-260831",
+      "userId": "user-0001",
+      "firstRuleVersion": "2026-08-31-01",
+      "secondRuleVersion": "2026-08-31-02",
+      "expectedBucketForBothVersions": 65
+    }
+  ],
+  "decisionCases": [
+    {
+      "id": "D1-missing-user-id",
+      "enabled": true,
+      "expired": false,
+      "percent": 100,
+      "userFilter": [],
+      "userId": null,
+      "expectedMatch": false,
+      "expectedReason": "EMPTY_USER_ID"
+    },
+    {
+      "id": "D2-empty-user-id",
+      "enabled": true,
+      "expired": false,
+      "percent": 100,
+      "userFilter": [],
+      "userId": "",
+      "expectedMatch": false,
+      "expectedReason": "EMPTY_USER_ID"
+    },
+    {
+      "id": "D3-disabled-beats-user-filter",
+      "enabled": false,
+      "expired": false,
+      "percent": 100,
+      "userFilter": [
+        "user-0001"
+      ],
+      "userId": "user-0001",
+      "expectedMatch": false,
+      "expectedReason": "DISABLED"
+    },
+    {
+      "id": "D4-expired-beats-user-filter",
+      "enabled": true,
+      "expired": true,
+      "percent": 100,
+      "userFilter": [
+        "user-0001"
+      ],
+      "userId": "user-0001",
+      "expectedMatch": false,
+      "expectedReason": "EXPIRED"
+    },
+    {
+      "id": "D5-user-filter-beats-zero-percent",
+      "enabled": true,
+      "expired": false,
+      "percent": 0,
+      "userFilter": [
+        "user-0001"
+      ],
+      "userId": "user-0001",
+      "expectedMatch": true,
+      "expectedReason": "USER_FILTER"
+    },
+    {
+      "id": "D6-bucket-hit",
+      "ruleId": "demo-rule",
+      "bucketSalt": "alpha-salt-260831",
+      "enabled": true,
+      "expired": false,
+      "percent": 10,
+      "userFilter": [],
+      "userId": "user-0007",
+      "expectedBucket": 8,
+      "expectedMatch": true,
+      "expectedReason": "BUCKET"
+    },
+    {
+      "id": "D7-bucket-miss",
+      "ruleId": "demo-rule",
+      "bucketSalt": "alpha-salt-260831",
+      "enabled": true,
+      "expired": false,
+      "percent": 10,
+      "userFilter": [],
+      "userId": "user-0001",
+      "expectedBucket": 65,
+      "expectedMatch": false,
+      "expectedReason": "BUCKET"
+    },
+    {
+      "id": "D8-user-filter-is-exact",
+      "ruleId": "demo-rule",
+      "bucketSalt": "alpha-salt-260831",
+      "enabled": true,
+      "expired": false,
+      "percent": 0,
+      "userFilter": [
+        "user-0001"
+      ],
+      "userId": "USER-0001",
+      "expectedBucket": 92,
+      "expectedMatch": false,
+      "expectedReason": "BUCKET"
+    }
+  ]
+}
