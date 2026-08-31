@@ -19,9 +19,8 @@ flowchart LR
     A[旧实例 A 继续接收流量] --> B[在另一个固定端口启动候选 B]
     B --> C{B 的 Docker 健康、Nacos 注册和禁流状态都通过吗}
     C -->|否| D[删除 B，A 继续服务]
-    C -->|是| E[启用 B 并发布新路由：A → B]
-    E --> L[等待旧路由快照最长租期过去]
-    L --> X[禁用 A 的 Nacos 注册并回读]
+    C -->|是| E[原子更新唯一路由指针：A → B]
+    E --> X[回读新路由，禁用 A 的 Nacos 注册]
     X --> F[向 A 发送 SIGTERM]
     F --> G[A 停止接收新连接并处理在手请求]
     G -->|正常退出| H[删除 A，B 成为稳定活动实例]
@@ -74,14 +73,15 @@ Agent Run、数据库事务、业务重试和业务恢复不属于本合同。�
 - `route.defaultInstanceId`：默认实例。
 - `route.defaultReleaseId`：新请求和后续服务调用使用的默认版本标签。
 - `route.routeVersion`：每次创建、切换或移除默认路由时递增。
-- `route.updatedAt`：该路由事实的写入时间。
-- `route.previousVersionValidUntil`：旧快照最晚可以使用到什么时间；没有旧快照时为 `null`。
+- `route.updatedAt`：该路由事实的原子切换时间。
 
-每个服务的 `runtime.routeLeaseSeconds` 是路由快照最长缓存时间，首版上限为 30 秒。2-5 和 2-3 不得在租期到期后继续使用旧快照；刷新失败时停止转发 Beta 新请求，不能回退到未过滤的 Nacos 列表。控制器发布新快照后使用路由接口回读相同 `routeVersion`，并将 `previousVersionValidUntil` 固定为发布时间加租期。在这个时间以前，旧实例仍保持可用；时间到达后，符合合同的路由器不可能再用旧快照接收新请求。控制器随后把旧 Nacos 实例改为 `enabled=false, weight=0`并回读确认，到这时才算切流完成，才能发送 SIGTERM。
+首版不缓存可变的默认路由指针。每个新入口请求或新服务调用开始时，2-5 或 2-3 都从同一个原子路由执行点读取一次当前指针，并把该请求绑定到返回的精确实例。路由读取是新请求的线性化时刻：原子替换以前已经读到 A 的请求继续由 A 完成；替换以后才开始读取的请求只能得到 B。路由执行点无法读取时停止转发 Beta 新请求，不能继续使用上一份指针，也不能回退到未过滤的 Nacos 列表。
+
+控制器通过一次 `controller-state.json` 原子替换同时更新默认指针和实例角色。路由接口回读相同 `routeVersion` 后，控制器把旧 Nacos 实例改为 `enabled=false, weight=0` 并回读确认，然后发送 SIGTERM。
 
 候选注册时先固定为 `enabled=false, weight=0, ephemeral=true`，因此切换前它不具备默认流量资格。候选就绪后，控制器先把它改为 `enabled=true, weight=1`并回读，再发布指向它的路由快照。这个短窗口里路由仍精确指向旧实例，所以新实例仍不会获得默认流量。
 
-`controller-state.json` 是路由快照的持久化依据，2-4 路由接口只能返回已成功原子替换的完整快照；路由接口和遵守租期的 2-5/2-3 路由器合在一起，才是运行时执行点。控制器重启后必须通过一次独立接口请求回读路由，不能仅凭写文件的函数返回成功就宣称切流已生效。
+`controller-state.json` 是路由指针的持久化依据，2-4 路由接口只能返回已成功原子替换的完整指针。控制器重启后必须通过一次独立接口请求回读路由，不能仅凭写文件的函数返回成功就宣称切流已生效。
 
 Nacos 负责保存并发现按版本区分的实例，路由事实负责决定无显式版本的新流量使用哪个版本。Nacos 中同时存在新旧实例不等于新旧实例同时接收默认流量。
 
@@ -136,7 +136,6 @@ Nacos 负责保存并发现按版本区分的实例，路由事实负责决定�
 - `runtime.hostPorts`：两个不同的固定宿主端口，数组第一个对应槽 A，第二个对应槽 B。
 - `runtime.healthCheckProfile`：2-4 为专用 Compose 注入的固定健康检查方案，首版只接受 `CONTROLLER_TCP_V1`。
 - `runtime.readinessTimeoutSeconds`：候选容器从启动到必须就绪的最长时间。
-- `runtime.routeLeaseSeconds`：2-5 和 2-3 最长可以缓存一份路由快照的时间。
 - `runtime.shutdownProfile`：服务在 SIGTERM 后怎样停止接收新请求并等待在手请求。
 - `runtime.applicationDrainSeconds`：应用内部允许排空的最长时间。
 - `runtime.drainGraceSeconds`：Docker 在 SIGTERM 后等待的总时间；它至少比应用排空上限多 5 秒，留给进程退出和容器清理。
@@ -157,7 +156,7 @@ Nacos 负责保存并发现按版本区分的实例，路由事实负责决定�
 
 `serviceSpecSha256` 使用 RFC 8785 JSON Canonicalization Scheme（JCS，规范 JSON 序列化）计算。输入是当前服务对象删除 `serviceSpecSha256` 后的结果。2-4 每次读取部署单时重新计算，摘要不一致就拒绝应用。
 
-`manifestSha256` 使用同一套 JCS 规则计算，输入是已经填好每个 `serviceSpecSha256` 的完整部署单对象。部署单本身不含 `manifestSha256`，所以不删除任何顶层字段。摘要输入是 JCS 产生的 UTF-8 字节，不是原始文件的空格、换行或键顺序。配套脚本中完整有效样例的固定预期值是 `ead51f93aa9a0cc7e442a9a2f6d1777129210363c4e56147d353a056ce37be28`；同一对象的紧凑排版和缩进排版都必须得到该值。
+`manifestSha256` 使用同一套 JCS 规则计算，输入是已经填好每个 `serviceSpecSha256` 的完整部署单对象。部署单本身不含 `manifestSha256`，所以不删除任何顶层字段。摘要输入是 JCS 产生的 UTF-8 字节，不是原始文件的空格、换行或键顺序。配套脚本中完整有效样例的固定预期值是 `33374acd2c19107cca9c23cf9dda3ccc1590678f2aa3e2a2fc7c62cf0d62c40b`；同一对象的紧凑排版和缩进排版都必须得到该值。
 
 ## 6. 全局状态 `controller-state.json`
 
@@ -196,7 +195,7 @@ Nacos 负责保存并发现按版本区分的实例，路由事实负责决定�
 - `DELETING`：默认路由正在移除，或者原活动实例正在排空。
 - `FAILED`：控制器无法唯一确认安全下一步，当前操作已经停止，保留实例和错误事实供人处理。
 
-`failedManifestVersion` 和 `lastError` 记录最近一次失败目标。`lastError.failedOperationType` 说明失败发生在创建、更新还是删除；`lastError.recoveryClass` 只允许三类：
+`failedManifestVersion` 和 `lastError` 记录最近一次失败目标。两者必须同时为空或同时非空，不能只有失败版本而没有错误类别。`lastError.failedOperationType` 说明失败发生在创建、更新还是删除；`lastError.recoveryClass` 只允许三类：
 
 - `CLEAN_RETRYABLE`：候选容器和注册已确认清理，当前路由事实唯一，可以由显式重试重新开始当前服务。
 - `FACTS_UNCERTAIN`：容器、Nacos 或路由的实际事实不唯一。人工消除冲突并由控制器重新核对前，提高部署单版本也不能解除暂停。
@@ -210,24 +209,22 @@ Nacos 负责保存并发现按版本区分的实例，路由事实负责决定�
 
 候选实例另外保存 `readiness`、`readinessObservedAt` 和 `readinessDeadline`。控制器用候选启动时间加 `readinessTimeoutSeconds` 得到截止时间，并在等待健康以前落盘。Docker 状态映射固定为：`starting` 写 `STARTING`，`healthy` 写 `READY`，`unhealthy` 或缺少 HEALTHCHECK 写 `FAILED`；目标机器无法访问写 `UNKNOWN`，不能把候选当作已经不存在。到达截止时间仍未 `READY` 也按候选失败处理。
 
-排空实例另外保存 `drainStartedAt` 和 `drainDeadline`。在等待旧路由租期时，这两个字段都为 `null`，因为旧实例还可能接收持有合法旧快照的新请求。租期到达并禁用旧 Nacos 实例后，控制器在发送 SIGTERM 前先持久化非空排空开始时间和截止时间。实例正常退出或到期强制停止后，先注销该实例的 Nacos 注册并删除容器，再清空 `drainingInstance`。
+排空实例另外保存 `drainStartedAt` 和 `drainDeadline`。`drainStartedAt` 是原子路由指针已移开该实例的时间；从这一时刻开始，新请求不再绑定该实例。这两个时间已经在同一次路由切换中持久化，因此控制器在发送 SIGTERM 前一定能读到截止时间。实例正常退出或到期强制停止后，先注销该实例的 Nacos 注册并删除容器，再清空 `drainingInstance`。
 
 ### 6.4 当前操作
 
-当前操作类型只有 `CREATE`、`UPDATE` 和 `DELETE`，阶段只有八个：
+当前操作类型只有 `CREATE`、`UPDATE` 和 `DELETE`，阶段只有六个：
 
 | 阶段 | 含义 |
 | --- | --- |
 | `STARTING_CANDIDATE` | 已分配候选实例标识，正在创建容器 |
 | `WAITING_CANDIDATE_READINESS` | 候选容器存在，等待 Docker 健康检查 |
 | `SWITCHING_TRAFFIC` | 候选就绪，准备原子替换默认路由和实例角色 |
-| `WAITING_OLD_ROUTE_LEASES` | 新路由已发布，等待所有合规旧快照过期 |
 | `DRAINING_PREVIOUS` | 新实例已接收默认流量，旧实例正在排空 |
 | `REMOVING_TRAFFIC` | 删除服务时正在移除默认路由 |
-| `WAITING_DELETE_ROUTE_LEASES` | 空路由已发布，等待所有合规旧快照过期 |
 | `DRAINING_ACTIVE` | 删除服务时原活动实例正在排空 |
 
-`CREATE` 只使用前三个阶段；`UPDATE` 额外使用 `WAITING_OLD_ROUTE_LEASES` 和 `DRAINING_PREVIOUS`；`DELETE` 只使用 `REMOVING_TRAFFIC`、`WAITING_DELETE_ROUTE_LEASES` 和 `DRAINING_ACTIVE`。创建容器以前，控制器先生成 `candidateInstanceId` 并写入 `STARTING_CANDIDATE`，此时完整 `candidateInstance` 可以仍为 `null`。确定容器事实以后才填写候选记录。
+`CREATE` 只使用前三个阶段；`UPDATE` 额外使用 `DRAINING_PREVIOUS`；`DELETE` 只使用 `REMOVING_TRAFFIC` 和 `DRAINING_ACTIVE`。创建容器以前，控制器先生成 `candidateInstanceId` 并写入 `STARTING_CANDIDATE`，此时完整 `candidateInstance` 可以仍为 `null`。确定容器事实以后才填写候选记录。
 
 ## 7. 创建、更新和删除
 
@@ -254,15 +251,15 @@ CREATING / STARTING_CANDIDATE
 
 候选缺少 HEALTHCHECK、明确 `unhealthy` 或到截止时间仍未就绪时，只删除候选的容器和 Nacos 注册，旧实例继续服务并回到 `STABLE + CLEAN_RETRYABLE`。如果机器无法访问，控制器不能确认候选是否已删除，服务进入 `FAILED + FACTS_UNCERTAIN` 并保留候选事实。普通扫描不自动重试失败目标。更高部署单或显式 `RETRY_UPDATE` 只能在活动实例、旧路由和候选已清理事实都唯一时，于同一次状态替换中清除失败暂停，将 `STABLE` 改为 `UPDATING / STARTING_CANDIDATE` 并建立新 `operationId`。`FACTS_UNCERTAIN` 必须先由人消除冲突，提高版本不能直接清除。
 
-候选就绪后，控制器先写入 `SWITCHING_TRAFFIC` 检查点，启用候选注册并回读。下一次全局状态原子替换同时发布指向候选的新路由、把候选变成 `activeInstance`、把旧活动实例变成 `drainingInstance`、保存 `previousVersionValidUntil`，并进入 `WAITING_OLD_ROUTE_LEASES`。替换成功后，控制器通过独立路由接口请求回读同一 `routeVersion`；回读失败时保持等待，不进入 SIGTERM。
+候选就绪后，控制器先写入 `SWITCHING_TRAFFIC` 检查点，启用候选注册并回读。下一次全局状态原子替换同时发布指向候选的新路由、把候选变成 `activeInstance`、把旧活动实例变成 `drainingInstance`、写入 `drainStartedAt/drainDeadline`，并进入 `DRAINING_PREVIOUS`。这次替换是唯一切流时刻：替换前已经读到旧指针的请求继续由旧实例完成，替换后开始的新入口请求和新服务调用只能读到候选实例。
 
-当前时间达到 `previousVersionValidUntil` 后，控制器将旧 Nacos 实例改为 `enabled=false, weight=0`并回读。随后才持久化 `drainStartedAt/drainDeadline`、进入 `DRAINING_PREVIOUS`，并对旧容器执行带超时的停止。旧请求的成功、失败或业务重试不改变部署状态。旧实例退出或被强制停止、注册和容器都清理后，服务进入 `STABLE`并把 `previousVersionValidUntil` 清空。
+替换成功后，控制器必须通过一次独立路由接口请求回读同一 `routeVersion` 和候选精确端点。回读失败或结果不一致时，控制器保留当前状态并报告错误，不禁用旧注册，也不发送 SIGTERM。回读成功后，控制器将旧 Nacos 实例改为 `enabled=false, weight=0`并再次回读；确认旧实例不再可选择后，才对旧容器执行带超时的停止。旧请求的成功、失败或业务重试不改变部署状态。旧实例退出或被强制停止、注册和容器都清理后，服务进入 `STABLE`。
 
 ### 7.3 删除整个部署
 
 首版普通新部署单禁止从 `services` 中移除已有服务。需要减少服务集合时，调用方先删除整个部署，等实例和端口全部清理，再用新的完整服务集合创建部署。这样删除期间原部署单一直保留每个服务的目标、机器和两个端口，不需要增加单服务删除墓碑。
 
-删除整个部署时，每个服务先进入 `REMOVING_TRAFFIC`。下一次全局状态原子替换同时发布空路由、把活动实例移入 `drainingInstance`、保存 `previousVersionValidUntil`，并进入 `WAITING_DELETE_ROUTE_LEASES`。控制器通过独立路由接口请求回读空路由和新版本；回读失败时保持等待。旧路由租期到达后，控制器把 Nacos 实例改为 `enabled=false, weight=0`并回读，再持久化排空时间、进入 `DRAINING_ACTIVE` 并发送 SIGTERM。实例退出或到期强制停止后，控制器注销注册、删除容器并移除服务状态。
+删除整个部署时，每个服务先进入 `REMOVING_TRAFFIC`。下一次全局状态原子替换同时发布空路由、把活动实例移入 `drainingInstance`、写入 `drainStartedAt/drainDeadline`，并进入 `DRAINING_ACTIVE`。这次替换以后开始的新入口请求和新服务调用读到空路由并立即拒绝，不能继续使用删除前的指针。控制器必须通过一次独立路由接口请求回读空路由和新 `routeVersion`；回读失败或结果不一致时，不禁用旧注册，也不发送 SIGTERM。回读成功后，控制器把旧 Nacos 实例改为 `enabled=false, weight=0`并回读，再发送 SIGTERM。实例退出或到期强制停止后，控制器注销注册、删除容器并移除服务状态。
 
 删除整个部署时，控制器先确认没有其他当前操作，再把部署 `phase` 写成 `DELETING`。尚未轮到的服务保持 `STABLE + operation=null`；控制器按 `serviceName` 字典序选择一个服务，原子写入它的 `DELETING + DELETE operation`，完成后移除该服务，再选择下一个。查询机器、容器或 Nacos 时若无法唯一确认结果，当前服务进入 `FAILED + operation=null`，剩余服务继续保持 `STABLE`，整个部署停止自动删除。显式 `RETRY_DELETE` 只能重建这一服务的 `DELETE` 操作，并从实际路由、Nacos 和容器事实唯一确定的阶段继续。后续服务不能被越过；不确定事实未消除时不能重建操作。
 
@@ -273,13 +270,12 @@ CREATING / STARTING_CANDIDATE
 首版不保证在每个外部调用中断点自动恢复。控制器重启时只做一次有限核对：
 
 1. 读取并校验两类文件；失败就停止写操作并报告错误。
-2. 按 `machineId` 查询记录中的容器，按完整注册键查询 Nacos 2.5.0，并从 2-4 路由接口回读当前 `routeVersion`、精确端点和旧版本租期。`controller-state.json` 是持久化依据，不是已生效路由的唯一证据。
+2. 按 `machineId` 查询记录中的容器，按完整注册键查询 Nacos 2.5.0，并从 2-4 路由接口回读当前 `routeVersion` 和精确端点。`controller-state.json` 是持久化依据，不是已生效路由的唯一证据。
 3. 容器名称和标签必须同时匹配 `deploymentId`、`trafficScopeId`、`serviceName`、`instanceId` 和 `releaseId`。仅找到一个完全匹配对象时可以补齐状态；找到多个对象或身份冲突时写 `FAILED`。
-4. 路由接口仍指向旧实例时，旧实例继续服务；接口已经指向候选时，实例角色也必须是“候选已成为活动实例、旧实例正在等待路由租期或排空”。接口、持久化快照和实例角色不一致时写 `FAILED + FACTS_UNCERTAIN`，不猜测哪一方正确。
+4. 路由接口仍指向旧实例时，旧实例继续服务；接口已经指向候选时，实例角色必须是“候选已成为活动实例、旧实例正在排空”；接口已经返回空路由时，活动实例必须已经移入排空角色。接口、持久化指针和实例角色不一致时写 `FAILED + FACTS_UNCERTAIN`，不猜测哪一方正确。
 5. 候选仍在等待时，控制器同时检查 Docker 健康、Nacos 身份与可选择事实、路由仍未指向候选，再按 `readinessDeadline` 继续或失败。
-6. 处于 `WAITING_OLD_ROUTE_LEASES` 或 `WAITING_DELETE_ROUTE_LEASES` 时，到期前不得发送 SIGTERM；到期后先禁用旧 Nacos 实例并回读，再进入排空阶段。
-7. 存在 `drainingInstance` 且已进入排空阶段时，控制器先核对旧注册已为 `enabled=false, weight=0`，再按剩余 `drainDeadline` 幂等重发停止命令。容器已退出时继续注销 Nacos、删除容器并清空排空记录。
-8. 机器、Nacos 或路由接口查询失败时保留最后事实并写错误，不把“无法观察”当作“对象不存在”。
+6. 处于 `DRAINING_PREVIOUS` 或 `DRAINING_ACTIVE` 时，控制器先核对路由接口已经返回持久化的当前指针，再核对旧注册。旧注册仍可选择时先把它改为 `enabled=false, weight=0`并回读；确认禁用后才按剩余 `drainDeadline` 幂等发送停止命令。容器已退出时继续注销 Nacos、删除容器并清空排空记录。
+7. 机器、Nacos 或路由接口查询失败时保留最后事实并写错误，不把“无法观察”当作“对象不存在”。
 
 如果这些事实不能唯一决定下一步，控制器停在 `FAILED`，由人重新操作。它不建设多阶段自动回滚、通用人工修复工作流或业务请求恢复。
 
@@ -289,9 +285,9 @@ JSON Schema 负责字段、类型、枚举和基本组合。2-4 选用的 Draft 
 
 1. `deploymentId` 唯一；一个 `trafficScopeId` 最多对应一个活动部署；部署内 `serviceName` 唯一。
 2. 所有实例标识、容器标识和完整 Nacos 注册身份全局唯一。同一服务的活动、候选和排空实例不能使用相同 `instanceId` 或端口槽。所有活动部署单中的两个预留槽都参与检查，`machineId + hostPort` 全局唯一；主 Beta、不同泳道和不同服务也不能重叠。服务仍存在时，新部署单的 `machineId + hostPorts` 必须与旧状态一致，因此未退出的上一代实例不会因为部署单改址而提前释放端口。
-3. 候选实例和切流后的新活动实例必须匹配当前目标的 `manifestVersion`、`serviceSpecSha256` 和 `releaseId`。切流前的旧活动实例、切流后的排空实例保留自身上一代事实。`STABLE` 的活动实例可以等于目标，也可以在正常排队或失败暂停时仍是上一代。所有实例的注册端口等于宿主端口；三个固定 metadata 值等于实例的流量范围、版本和实例标识；`ephemeral=true`。候选在切换前必须 `enabled=false, weight=0`；等待旧路由租期时，新旧实例均可为 `enabled=true, weight=1`；进入排空阶段前旧实例必须已是 `enabled=false, weight=0`。
+3. 候选实例和切流后的新活动实例必须匹配当前目标的 `manifestVersion`、`serviceSpecSha256` 和 `releaseId`。切流前的旧活动实例、切流后的排空实例保留自身上一代事实。`STABLE` 的活动实例可以等于目标，也可以在正常排队或失败暂停时仍是上一代。所有实例的注册端口等于宿主端口；三个固定 metadata 值等于实例的流量范围、版本和实例标识；`ephemeral=true`。候选在切换前必须 `enabled=false, weight=0`。路由刚切换或移除时，排空实例的已观察注册可以暂时仍是 `enabled=true, weight=1`；发送 SIGTERM 前必须已经改成 `enabled=false, weight=0`并回读确认。其他 `enabled/weight` 组合非法。
 4. `STABLE` 必须只有一个活动实例，且默认实例和默认版本等于活动实例；不能有候选、排空实例或当前操作。`CREATING` 的默认实例和默认版本必须为空。
-5. `UPDATING` 切流前必须保存“旧活动实例 + 新候选实例”，路由仍指向旧活动实例且 `previousVersionValidUntil=null`；新路由发布后必须保存“新活动实例 + 旧排空实例”，路由指向新活动实例，并保存非空 `previousVersionValidUntil`。删除在 `REMOVING_TRAFFIC` 时路由仍等于活动实例；空路由发布后进入 `WAITING_DELETE_ROUTE_LEASES`，而不是立即 SIGTERM。
+5. `UPDATING` 切流前必须保存“旧活动实例 + 新候选实例”，路由仍指向旧活动实例；同一次原子替换发布新路由后必须保存“新活动实例 + 旧排空实例”，路由逐字指向新活动实例，并进入 `DRAINING_PREVIOUS`。删除在 `REMOVING_TRAFFIC` 时路由仍等于活动实例；同一次原子替换发布空路由后把活动实例移入排空角色，并进入 `DRAINING_ACTIVE`。两种替换都要同时写入排空起止时间。
 6. 全部部署合计最多一个非空 `operation`。没有当前操作时，只要某个部署内存在 `FAILED` 服务，控制器就停止该部署的自动调度。普通调度只能选择没有失败暂停的排队服务；失败创建、更新和删除必须分别走第 7 节的显式原子转换。`FACTS_UNCERTAIN` 不能被更高部署单版本直接清除；删除失败时只能恢复当前服务的 `DELETE`，不能选择后续服务。
 7. `CREATE/UPDATE` 操作先保存非空 `candidateInstanceId`。`STARTING_CANDIDATE` 允许完整候选记录暂时为 `null`；候选记录出现后，它的 `instanceId` 必须逐字等于预分配的 `operation.candidateInstanceId`。`DELETE` 和 `DRAINING_PREVIOUS` 的 `candidateInstanceId` 必须为 `null`。排空期限必须等于或晚于排空开始时间，部署到期时间必须晚于创建时间。
 8. 部署记录的 `acceptedManifestVersion`、按第 5.2 节 JCS 算法计算的 `manifestSha256`、Git 提交、负责人、到期时间和服务目标必须与部署单一致；只允许第 4 节定义的新部署单领先窗口和删除窗口。
@@ -304,7 +300,7 @@ JSON Schema 负责字段、类型、枚举和基本组合。2-4 选用的 Draft 
 
 - `trafficScopeId`、`serviceName` 和服务 `phase`。
 - 活动、候选和排空实例标识。
-- 默认实例、默认版本、路由版本、切换时间和 `previousVersionValidUntil`。
+- 默认实例、默认版本、路由版本和切换时间。
 - 每个实例的 Nacos `enabled`、`healthy`、`weight`、`ephemeral` 与候选就绪状态。
 - 当前操作类型和阶段。
 - 最近一次部署错误和失败的部署单版本。
@@ -321,9 +317,9 @@ JSON Schema 负责字段、类型、枚举和基本组合。2-4 选用的 Draft 
 - 创建起点、候选就绪、切流后排空、稳定状态和删除排空样例通过。
 - `CREATE/UPDATE/DELETE` 与阶段的非法组合被拒绝。
 - 自定义检查拒绝同一范围的两个部署、全局两个并行操作、活动与候选共用端口槽、Nacos 身份重复、`STABLE` 路由不指向活动实例。
-- 候选验收覆盖 Docker 健康、Nacos `healthy=true`、候选仍禁用和路由未指向候选的四项联合条件。路由验收覆盖发布回读、旧快照租期、过期缓存失败关闭、旧 Nacos 实例禁用后才 SIGTERM，以及重启时按实际路由接口而非本地 JSON 判断。
+- 候选验收覆盖 Docker 健康、Nacos `healthy=true`、候选仍禁用和路由未指向候选的四项联合条件。路由验收覆盖单一原子切换时刻：切换前已经绑定旧实例的请求保持完成，切换后的每个新入口请求和新服务调用都重新读取指针并只得到新实例；删除指针后新请求立即拒绝；指针不可读时失败关闭。验收还要覆盖路由回读、旧 Nacos 实例禁用并回读后才 SIGTERM，以及重启时按实际路由接口而非只读本地 JSON 判断。
 - 排空验收必须在 4-4 运行至少一条长 HTTP/SSE 或 RPC 请求：切流完成后新请求不再进入旧实例，已在手请求在 `applicationDrainSeconds` 内完成，整个进程在 `drainGraceSeconds` 内退出。
-- 两服务首次创建失败、更新失败和两服务删除失败均覆盖“后续服务不越过”；显式重试只恢复正确服务和正确操作；`FACTS_UNCERTAIN` 不会被更高版本清除。
+- 两服务首次创建失败、更新失败和两服务删除失败都使用与完整两服务部署单一致的独立摘要、实例和端口，并让失败态与重试态分别通过 Schema 和跨记录检查。转换检查必须证明后续服务不越过、显式重试只恢复正确服务和正确操作、`FACTS_UNCERTAIN` 不会被更高版本直接清除，人工消除冲突后才允许重试。
 - `manifestSha256` 固定向量覆盖同一对象的两种排版，并断言两者产生合同中同一预期摘要。
 - 一个部署单同时更新多个服务时，只允许一个服务拥有 `operation`，其余服务以 `STABLE` 上一代实例合法排队；轮到以后再进入更新。
 - 首次部署两个服务或一次增加两个服务时，只允许一个服务拥有 `CREATE operation`，其余新增服务以 `CREATING + operation=null + candidateInstance=null` 合法排队。

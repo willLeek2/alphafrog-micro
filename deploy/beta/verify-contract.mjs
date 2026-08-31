@@ -98,7 +98,6 @@ const manifest = {
       hostPorts: [28080, 28081],
       healthCheckProfile: 'CONTROLLER_TCP_V1',
       readinessTimeoutSeconds: 120,
-      routeLeaseSeconds: 30,
       shutdownProfile: 'SPRING_BOOT_HTTP_DUBBO_V1',
       applicationDrainSeconds: 55,
       drainGraceSeconds: 60
@@ -116,9 +115,24 @@ manifest.services[0].serviceSpecSha256 = serviceDigest(manifest.services[0]);
 const targetSpec = manifest.services[0].serviceSpecSha256;
 const manifestSha256 = digest(manifest);
 
-function registration(instanceId, releaseId, port, selectable) {
+const toolsServiceSpec = clone(manifest.services[0]);
+toolsServiceSpec.serviceName = 'agent-tools-service';
+toolsServiceSpec.releaseId = 'tools-release-2';
+toolsServiceSpec.serviceSpecSha256 = repeated('0');
+toolsServiceSpec.image.repositoryDigest = `registry.local/agent-tools-service@sha256:${repeated('e')}`;
+toolsServiceSpec.image.localImageId = `sha256:${repeated('f')}`;
+toolsServiceSpec.runtime.containerPort = 18081;
+toolsServiceSpec.runtime.hostPorts = [28180, 28181];
+toolsServiceSpec.registration.serviceName = 'com.alphafrog.AgentToolsService:1.0@@providers';
+toolsServiceSpec.serviceSpecSha256 = serviceDigest(toolsServiceSpec);
+const toolsTargetSpec = toolsServiceSpec.serviceSpecSha256;
+const twoServiceManifest = clone(manifest);
+twoServiceManifest.services.push(toolsServiceSpec);
+const twoServiceManifestSha256 = digest(twoServiceManifest);
+
+function registration(instanceId, releaseId, port, selectable, registeredServiceName = 'com.alphafrog.AgentService:1.0@@providers') {
   return {
-    serviceName: 'com.alphafrog.AgentService:1.0@@providers',
+    serviceName: registeredServiceName,
     groupName: 'DEFAULT_GROUP',
     namespaceId: 'public',
     clusterName: 'DEFAULT',
@@ -137,7 +151,7 @@ function registration(instanceId, releaseId, port, selectable) {
   };
 }
 
-function baseInstance(instanceId, releaseId, version, spec, slot, port, selectable = true) {
+function baseInstance(instanceId, releaseId, version, spec, slot, port, selectable = true, registeredServiceName) {
   return {
     instanceId,
     machineId: 'beta-machine-1',
@@ -149,7 +163,7 @@ function baseInstance(instanceId, releaseId, version, spec, slot, port, selectab
     portSlot: slot,
     hostPort: port,
     endpoint: {address: '10.0.0.8', port},
-    registration: registration(instanceId, releaseId, port, selectable)
+    registration: registration(instanceId, releaseId, port, selectable, registeredServiceName)
   };
 }
 
@@ -158,22 +172,27 @@ const newActive = baseInstance('instance-new', 'release-2', 2, targetSpec, 'B', 
 const newDisabled = baseInstance('instance-new', 'release-2', 2, targetSpec, 'B', 28081, false);
 const candidateStarting = {...newDisabled, readiness: 'STARTING', readinessObservedAt: null, readinessDeadline: '2026-09-01T00:02:00Z'};
 const candidateReady = {...newDisabled, readiness: 'READY', readinessObservedAt: '2026-09-01T00:01:00Z', readinessDeadline: '2026-09-01T00:02:00Z'};
-const oldWaiting = {...oldActive, drainStartedAt: null, drainDeadline: null};
-const oldDisabled = {...clone(oldActive), drainStartedAt: '2026-09-01T00:02:30Z', drainDeadline: '2026-09-01T00:03:30Z'};
+const oldDrainingSelectable = {...clone(oldActive), drainStartedAt: '2026-09-01T00:02:00Z', drainDeadline: '2026-09-01T00:03:00Z'};
+const oldDisabled = clone(oldDrainingSelectable);
 oldDisabled.registration.enabled = false;
 oldDisabled.registration.weight = 0;
+const newDisabledDraining = {...clone(newActive), drainStartedAt: '2026-09-01T00:02:00Z', drainDeadline: '2026-09-01T00:03:00Z'};
+newDisabledDraining.registration.enabled = false;
+newDisabledDraining.registration.weight = 0;
+const toolsOldActive = baseInstance('tools-instance-old', 'tools-release-1', 1, repeated('9'), 'A', 28180, true, 'com.alphafrog.AgentToolsService:1.0@@providers');
+const toolsNewActive = baseInstance('tools-instance-new', 'tools-release-2', 2, toolsTargetSpec, 'B', 28181, true, 'com.alphafrog.AgentToolsService:1.0@@providers');
 
 const routeOld = {
   defaultInstanceId: 'instance-old',
   defaultReleaseId: 'release-1',
   routeVersion: 7,
-  updatedAt: '2026-09-01T00:00:00Z',
-  previousVersionValidUntil: null
+  updatedAt: '2026-09-01T00:00:00Z'
 };
 const routeNewStable = {...routeOld, defaultInstanceId: 'instance-new', defaultReleaseId: 'release-2', routeVersion: 8, updatedAt: '2026-09-01T00:02:00Z'};
-const routeNewWaiting = {...routeNewStable, previousVersionValidUntil: '2026-09-01T00:02:30Z'};
 const routeNone = {...routeOld, defaultInstanceId: null, defaultReleaseId: null, routeVersion: 0};
-const routeNoneWaiting = {...routeNone, routeVersion: 9, updatedAt: '2026-09-01T00:02:00Z', previousVersionValidUntil: '2026-09-01T00:02:30Z'};
+const routeNoneAfterDelete = {...routeNone, routeVersion: 9, updatedAt: '2026-09-01T00:02:00Z'};
+const toolsRouteOld = {...routeOld, defaultInstanceId: toolsOldActive.instanceId, defaultReleaseId: toolsOldActive.releaseId, routeVersion: 4};
+const toolsRouteNew = {...routeNewStable, defaultInstanceId: toolsNewActive.instanceId, defaultReleaseId: toolsNewActive.releaseId, routeVersion: 5};
 
 function operation(type, phase, candidateInstanceId) {
   return {operationId: `op-${type.toLowerCase()}-${phase.toLowerCase()}`, type, phase, candidateInstanceId, startedAt: '2026-09-01T00:00:00Z'};
@@ -226,6 +245,24 @@ function state(serviceState, deploymentOverrides = {}) {
   };
 }
 
+function twoServiceState(firstService, secondService, deploymentOverrides = {}) {
+  return state(firstService, {
+    manifestSha256: twoServiceManifestSha256,
+    services: [firstService, secondService],
+    ...deploymentOverrides
+  });
+}
+
+function toolsService(overrides = {}) {
+  return service({
+    serviceName: 'agent-tools-service',
+    targetServiceSpecSha256: toolsTargetSpec,
+    activeInstance: toolsNewActive,
+    route: toolsRouteNew,
+    ...overrides
+  });
+}
+
 const positiveStates = {
   stable: state(service()),
   createWaiting: state(service({
@@ -236,20 +273,16 @@ const positiveStates = {
     phase: 'UPDATING', activeInstance: oldActive, candidateInstance: candidateReady, route: routeOld,
     operation: operation('UPDATE', 'SWITCHING_TRAFFIC', 'instance-new')
   })),
-  updateLeaseWait: state(service({
-    phase: 'UPDATING', activeInstance: newActive, drainingInstance: oldWaiting, route: routeNewWaiting,
-    operation: operation('UPDATE', 'WAITING_OLD_ROUTE_LEASES', null)
-  })),
   updateDraining: state(service({
-    phase: 'UPDATING', activeInstance: newActive, drainingInstance: oldDisabled, route: routeNewWaiting,
+    phase: 'UPDATING', activeInstance: newActive, drainingInstance: oldDrainingSelectable, route: routeNewStable,
     operation: operation('UPDATE', 'DRAINING_PREVIOUS', null)
   })),
   deleteRemoving: state(service({
     phase: 'DELETING', operation: operation('DELETE', 'REMOVING_TRAFFIC', null)
   }), {phase: 'DELETING'}),
-  deleteLeaseWait: state(service({
-    phase: 'DELETING', activeInstance: null, drainingInstance: {...newActive, drainStartedAt: null, drainDeadline: null},
-    route: routeNoneWaiting, operation: operation('DELETE', 'WAITING_DELETE_ROUTE_LEASES', null)
+  deleteDraining: state(service({
+    phase: 'DELETING', activeInstance: null, drainingInstance: newDisabledDraining,
+    route: routeNoneAfterDelete, operation: operation('DELETE', 'DRAINING_ACTIVE', null)
   }), {phase: 'DELETING'}),
   failedCreate: state(service({
     phase: 'FAILED', activeInstance: null, route: routeNone, failedManifestVersion: 2,
@@ -286,12 +319,17 @@ function customErrors(manifestValue, stateValue) {
     deploymentIds.add(deployment.deploymentId);
     trafficScopes.add(deployment.trafficScopeId);
     if (deployment.manifestSha256 !== digest(manifestValue)) errors.push('manifest digest');
+    if (deployment.acceptedManifestVersion !== manifestValue.manifestVersion) errors.push('manifest version');
     const stateServiceNames = new Set();
     for (const item of deployment.services) {
       if (stateServiceNames.has(item.serviceName)) errors.push(`duplicate state service ${item.serviceName}`);
       stateServiceNames.add(item.serviceName);
       if (item.operation) operationCount++;
       const spec = specByName.get(item.serviceName);
+      if (!spec) errors.push(`state service missing from manifest ${item.serviceName}`);
+      if (spec && item.targetManifestVersion !== manifestValue.manifestVersion) errors.push(`target manifest version ${item.serviceName}`);
+      if (spec && item.targetServiceSpecSha256 !== spec.serviceSpecSha256) errors.push(`target service digest ${item.serviceName}`);
+      if ((item.failedManifestVersion === null) !== (item.lastError === null)) errors.push(`failure fields pair ${item.serviceName}`);
       const roleSlots = new Set();
       for (const instance of [item.activeInstance, item.candidateInstance, item.drainingInstance].filter(Boolean)) {
         if (instanceIds.has(instance.instanceId)) errors.push(`duplicate instance ${instance.instanceId}`);
@@ -308,17 +346,24 @@ function customErrors(manifestValue, stateValue) {
       if (item.activeInstance && (!item.activeInstance.registration.enabled || item.activeInstance.registration.weight !== 1 || !item.activeInstance.registration.healthy)) errors.push(`active not selectable ${item.serviceName}`);
       if (item.candidateInstance && (item.candidateInstance.registration.enabled || item.candidateInstance.registration.weight !== 0)) errors.push(`candidate selectable ${item.serviceName}`);
       if (item.operation?.phase === 'SWITCHING_TRAFFIC' && (!item.candidateInstance?.registration.healthy || item.candidateInstance?.readiness !== 'READY')) errors.push(`candidate not ready ${item.serviceName}`);
-      if (item.operation?.phase === 'WAITING_OLD_ROUTE_LEASES' && (!item.drainingInstance?.registration.enabled || item.drainingInstance?.registration.weight !== 1)) errors.push(`old disabled before lease ${item.serviceName}`);
-      if (item.operation?.phase === 'WAITING_DELETE_ROUTE_LEASES' && (!item.drainingInstance?.registration.enabled || item.drainingInstance?.registration.weight !== 1)) errors.push(`delete old disabled before lease ${item.serviceName}`);
-      if (['DRAINING_PREVIOUS', 'DRAINING_ACTIVE'].includes(item.operation?.phase) && (item.drainingInstance?.registration.enabled || item.drainingInstance?.registration.weight !== 0)) errors.push(`old selectable while draining ${item.serviceName}`);
-      if (item.route.previousVersionValidUntil) {
-        const expected = Date.parse(item.route.updatedAt) + spec.runtime.routeLeaseSeconds * 1000;
-        if (Date.parse(item.route.previousVersionValidUntil) !== expected) errors.push(`route lease ${item.serviceName}`);
+      if (item.drainingInstance) {
+        const {enabled, weight} = item.drainingInstance.registration;
+        if (!((enabled && weight === 1) || (!enabled && weight === 0))) errors.push(`draining registration pair ${item.serviceName}`);
+      }
+      if (item.operation?.phase === 'DRAINING_PREVIOUS') {
+        if (item.route.defaultInstanceId !== item.activeInstance?.instanceId || item.route.defaultReleaseId !== item.activeInstance?.releaseId) errors.push(`draining route ${item.serviceName}`);
+        if (item.drainingInstance?.drainStartedAt !== item.route.updatedAt) errors.push(`draining switch time ${item.serviceName}`);
+      }
+      if (item.operation?.phase === 'DRAINING_ACTIVE') {
+        if (item.route.defaultInstanceId !== null || item.route.defaultReleaseId !== null) errors.push(`delete route ${item.serviceName}`);
+        if (item.drainingInstance?.drainStartedAt !== item.route.updatedAt) errors.push(`delete switch time ${item.serviceName}`);
       }
       if (item.lastError?.recoveryClass === 'DELETE_RETRYABLE' && item.lastError.failedOperationType !== 'DELETE') errors.push(`delete recovery class ${item.serviceName}`);
       if (item.lastError?.recoveryClass === 'CLEAN_RETRYABLE' && item.lastError.failedOperationType === 'DELETE') errors.push(`clean recovery class ${item.serviceName}`);
       if (item.phase === 'STABLE' && item.activeInstance && (item.route.defaultInstanceId !== item.activeInstance.instanceId || item.route.defaultReleaseId !== item.activeInstance.releaseId)) errors.push(`stable route ${item.serviceName}`);
     }
+    if (deployment.services.some(item => item.lastError !== null) && deployment.services.some(item => item.operation !== null)) errors.push(`operation while deployment failure is paused ${deployment.deploymentId}`);
+    if (deployment.phase === 'ACTIVE' && stateServiceNames.size !== specByName.size) errors.push(`active deployment service set ${deployment.deploymentId}`);
   }
   if (operationCount > 1) errors.push('global operation count');
   return errors;
@@ -350,6 +395,12 @@ try {
   const incompleteError = clone(positiveStates.failedCreate);
   delete incompleteError.deployments[0].services[0].lastError.recoveryClass;
   invalidFixtures.push(['state-incomplete-error', stateSchema, incompleteError]);
+  const failedVersionWithoutError = clone(positiveStates.stable);
+  failedVersionWithoutError.deployments[0].services[0].failedManifestVersion = 2;
+  invalidFixtures.push(['state-failed-version-without-error', stateSchema, failedVersionWithoutError]);
+  const errorWithoutFailedVersion = clone(positiveStates.stable);
+  errorWithoutFailedVersion.deployments[0].services[0].lastError = error('UPDATE', 'CLEAN_RETRYABLE');
+  invalidFixtures.push(['state-error-without-failed-version', stateSchema, errorWithoutFailedVersion]);
   const reservedDeployment = clone(manifest);
   reservedDeployment.deploymentId = 'stable';
   invalidFixtures.push(['manifest-reserved-deployment', manifestSchema, reservedDeployment]);
@@ -359,6 +410,18 @@ try {
   const mutableImage = clone(manifest);
   mutableImage.services[0].image.repositoryDigest = 'registry.local/agent-service:latest';
   invalidFixtures.push(['manifest-mutable-image', manifestSchema, mutableImage]);
+  const obsoleteRouteLease = clone(manifest);
+  obsoleteRouteLease.services[0].runtime.routeLeaseSeconds = 30;
+  invalidFixtures.push(['manifest-obsolete-route-lease', manifestSchema, obsoleteRouteLease]);
+  const obsoleteRouteWindow = clone(positiveStates.stable);
+  obsoleteRouteWindow.deployments[0].services[0].route.previousVersionValidUntil = '2026-09-01T00:02:30Z';
+  invalidFixtures.push(['state-obsolete-route-window', stateSchema, obsoleteRouteWindow]);
+  const obsoleteUpdatePhase = clone(positiveStates.updateDraining);
+  obsoleteUpdatePhase.deployments[0].services[0].operation.phase = 'WAITING_OLD_ROUTE_LEASES';
+  invalidFixtures.push(['state-obsolete-update-lease-phase', stateSchema, obsoleteUpdatePhase]);
+  const obsoleteDeletePhase = clone(positiveStates.deleteDraining);
+  obsoleteDeletePhase.deployments[0].services[0].operation.phase = 'WAITING_DELETE_ROUTE_LEASES';
+  invalidFixtures.push(['state-obsolete-delete-lease-phase', stateSchema, obsoleteDeletePhase]);
   for (const [name, schema, value] of invalidFixtures) {
     runAjv('validate', schema, writeFixture(name, value), false);
   }
@@ -372,16 +435,13 @@ try {
   selectableCandidate.deployments[0].services[0].candidateInstance.registration.enabled = true;
   selectableCandidate.deployments[0].services[0].candidateInstance.registration.weight = 1;
   customNegatives.push(['candidate selectable', manifest, selectableCandidate]);
-  const earlyDisable = clone(positiveStates.updateLeaseWait);
-  earlyDisable.deployments[0].services[0].drainingInstance.registration.enabled = false;
-  earlyDisable.deployments[0].services[0].drainingInstance.registration.weight = 0;
-  customNegatives.push(['old disabled before lease', manifest, earlyDisable]);
+  const invalidDrainingRegistration = clone(positiveStates.updateDraining);
+  invalidDrainingRegistration.deployments[0].services[0].drainingInstance.registration.enabled = true;
+  invalidDrainingRegistration.deployments[0].services[0].drainingInstance.registration.weight = 0;
+  customNegatives.push(['draining registration pair', manifest, invalidDrainingRegistration]);
   const badMetadata = clone(positiveStates.stable);
   badMetadata.deployments[0].services[0].activeInstance.registration.metadata['alphafrog.release-id'] = 'wrong-release';
   customNegatives.push(['registration metadata', manifest, badMetadata]);
-  const badLease = clone(positiveStates.updateLeaseWait);
-  badLease.deployments[0].services[0].route.previousVersionValidUntil = '2026-09-01T00:02:31Z';
-  customNegatives.push(['route lease', manifest, badLease]);
   const badServiceDigest = clone(manifest);
   badServiceDigest.services[0].serviceSpecSha256 = repeated('f');
   customNegatives.push(['service digest', badServiceDigest, positiveStates.stable]);
@@ -394,6 +454,9 @@ try {
   const stableRouteMismatch = clone(positiveStates.stable);
   stableRouteMismatch.deployments[0].services[0].route.defaultInstanceId = 'instance-old';
   customNegatives.push(['stable route mismatch', manifest, stableRouteMismatch]);
+  const drainingSwitchMismatch = clone(positiveStates.updateDraining);
+  drainingSwitchMismatch.deployments[0].services[0].drainingInstance.drainStartedAt = '2026-09-01T00:02:01Z';
+  customNegatives.push(['draining switch time', manifest, drainingSwitchMismatch]);
   const twoOperations = clone(positiveStates.updateSwitching);
   const secondOperatingService = clone(twoOperations.deployments[0].services[0]);
   secondOperatingService.serviceName = 'agent-tools-service';
@@ -407,68 +470,161 @@ try {
   const pretty = JSON.stringify(manifest, null, 2);
   assert(digest(JSON.parse(compact)) === digest(JSON.parse(pretty)), 'manifest formatting must not change digest');
   assert(digest(JSON.parse(pretty)) === manifestSha256, 'manifest digest vector must stay fixed');
+  runAjv('validate', manifestSchema, writeFixture('manifest-two-service-valid', twoServiceManifest), true);
 
-  const createQueue = clone(positiveStates.failedCreate);
-  const queuedCreate = clone(createQueue.deployments[0].services[0]);
-  queuedCreate.serviceName = 'agent-tools-service';
-  queuedCreate.phase = 'CREATING';
-  queuedCreate.failedManifestVersion = null;
-  queuedCreate.lastError = null;
-  createQueue.deployments[0].services.push(queuedCreate);
+  function validateState(name, manifestValue, stateValue) {
+    runAjv('validate', stateSchema, writeFixture(name, stateValue), true);
+    const errors = customErrors(manifestValue, stateValue);
+    assert(errors.length === 0, `${name} custom checks should pass: ${errors.join(', ')}`);
+  }
+
+  function retryTransitionErrors(beforeState, afterState, action) {
+    const errors = [];
+    const beforeServices = beforeState.deployments[0].services;
+    const afterServices = afterState.deployments[0].services;
+    const failed = beforeServices.find(item => item.lastError !== null);
+    if (!failed) return ['missing failed service'];
+    if (action.serviceName !== failed.serviceName) errors.push('retry skipped the failed service');
+    if (failed.lastError.recoveryClass === 'FACTS_UNCERTAIN' && action.factsReconciled !== true) errors.push('uncertain facts require manual reconciliation');
+    const afterFailed = afterServices.find(item => item.serviceName === failed.serviceName);
+    const expected = {
+      CREATE: {action: 'RETRY_CREATE', phase: 'CREATING'},
+      UPDATE: {action: 'RETRY_UPDATE', phase: 'UPDATING'},
+      DELETE: {action: 'RETRY_DELETE', phase: 'DELETING'}
+    }[failed.lastError.failedOperationType];
+    if (!expected || action.type !== expected.action) errors.push('retry action does not match failed operation');
+    if (!afterFailed || afterFailed.phase !== expected?.phase || afterFailed.operation?.type !== failed.lastError.failedOperationType) errors.push('failed service did not restart the matching operation');
+    if (afterFailed?.failedManifestVersion !== null || afterFailed?.lastError !== null) errors.push('retry did not clear the accepted failure atomically');
+    for (const beforeOther of beforeServices.filter(item => item.serviceName !== failed.serviceName)) {
+      const afterOther = afterServices.find(item => item.serviceName === beforeOther.serviceName);
+      for (const field of ['phase', 'activeInstance', 'candidateInstance', 'drainingInstance', 'route', 'operation', 'failedManifestVersion', 'lastError']) {
+        if (canonicalize(afterOther?.[field]) !== canonicalize(beforeOther[field])) errors.push(`retry changed later service ${beforeOther.serviceName}`);
+      }
+    }
+    return errors;
+  }
+
+  const createFailed = service({
+    phase: 'FAILED', activeInstance: null, route: routeNone, failedManifestVersion: 2,
+    lastError: error('CREATE', 'CLEAN_RETRYABLE')
+  });
+  const toolsCreateQueued = toolsService({
+    phase: 'CREATING', activeInstance: null, candidateInstance: null, drainingInstance: null,
+    route: routeNone, operation: null
+  });
+  const createQueue = twoServiceState(createFailed, toolsCreateQueued);
+  validateState('queue-create-failed', twoServiceManifest, createQueue);
   assert(createQueue.deployments[0].services[1].operation === null, 'create failure must not start the next service');
-  runAjv('validate', stateSchema, writeFixture('queue-create-failed', createQueue), true);
   const createRetry = clone(createQueue);
-  createRetry.deployments[0].services[0].phase = 'CREATING';
-  createRetry.deployments[0].services[0].operation = operation('CREATE', 'STARTING_CANDIDATE', 'instance-retry');
-  createRetry.deployments[0].services[0].failedManifestVersion = null;
-  createRetry.deployments[0].services[0].lastError = null;
-  assert(createRetry.deployments[0].services[0].operation.type === 'CREATE' && createRetry.deployments[0].services[1].operation === null, 'create retry must restore only the failed service');
-  runAjv('validate', stateSchema, writeFixture('queue-create-retry', createRetry), true);
+  Object.assign(createRetry.deployments[0].services[0], {
+    phase: 'CREATING', operation: operation('CREATE', 'STARTING_CANDIDATE', 'instance-retry'),
+    failedManifestVersion: null, lastError: null
+  });
+  validateState('queue-create-retry', twoServiceManifest, createRetry);
+  assert(retryTransitionErrors(createQueue, createRetry, {type: 'RETRY_CREATE', serviceName: 'agent-service'}).length === 0, 'create retry transition must restore only the failed service');
 
-  const updateFailure = clone(positiveStates.stable);
-  updateFailure.deployments[0].services[0].activeInstance = oldActive;
-  updateFailure.deployments[0].services[0].route = routeOld;
-  updateFailure.deployments[0].services[0].failedManifestVersion = 2;
-  updateFailure.deployments[0].services[0].lastError = error('UPDATE', 'CLEAN_RETRYABLE');
-  const queuedUpdate = clone(updateFailure.deployments[0].services[0]);
-  queuedUpdate.serviceName = 'agent-tools-service';
-  queuedUpdate.failedManifestVersion = null;
-  queuedUpdate.lastError = null;
-  updateFailure.deployments[0].services.push(queuedUpdate);
+  const updateFailed = service({
+    activeInstance: oldActive, route: routeOld, failedManifestVersion: 2,
+    lastError: error('UPDATE', 'CLEAN_RETRYABLE')
+  });
+  const toolsUpdateQueued = toolsService({activeInstance: toolsOldActive, route: toolsRouteOld});
+  const updateFailure = twoServiceState(updateFailed, toolsUpdateQueued);
+  validateState('queue-update-failed', twoServiceManifest, updateFailure);
   assert(updateFailure.deployments[0].services[1].operation === null, 'update failure must not start the next service');
-  runAjv('validate', stateSchema, writeFixture('queue-update-failed', updateFailure), true);
   const updateRetry = clone(updateFailure);
-  updateRetry.deployments[0].services[0].phase = 'UPDATING';
-  updateRetry.deployments[0].services[0].operation = operation('UPDATE', 'STARTING_CANDIDATE', 'instance-retry');
-  updateRetry.deployments[0].services[0].failedManifestVersion = null;
-  updateRetry.deployments[0].services[0].lastError = null;
-  assert(updateRetry.deployments[0].services[0].operation.type === 'UPDATE' && updateRetry.deployments[0].services[1].operation === null, 'update retry must restore only the failed service');
-  runAjv('validate', stateSchema, writeFixture('queue-update-retry', updateRetry), true);
+  Object.assign(updateRetry.deployments[0].services[0], {
+    phase: 'UPDATING', operation: operation('UPDATE', 'STARTING_CANDIDATE', 'instance-retry'),
+    failedManifestVersion: null, lastError: null
+  });
+  validateState('queue-update-retry', twoServiceManifest, updateRetry);
+  assert(retryTransitionErrors(updateFailure, updateRetry, {type: 'RETRY_UPDATE', serviceName: 'agent-service'}).length === 0, 'update retry transition must restore only the failed service');
 
-  const deleteRetry = clone(positiveStates.deleteRemoving);
-  const laterDelete = clone(deleteRetry.deployments[0].services[0]);
-  laterDelete.serviceName = 'agent-tools-service';
-  laterDelete.phase = 'STABLE';
-  laterDelete.operation = null;
-  deleteRetry.deployments[0].services[0].phase = 'FAILED';
-  deleteRetry.deployments[0].services[0].operation = null;
-  deleteRetry.deployments[0].services[0].failedManifestVersion = 2;
-  deleteRetry.deployments[0].services[0].lastError = error('DELETE', 'DELETE_RETRYABLE');
-  deleteRetry.deployments[0].services.push(laterDelete);
-  assert(deleteRetry.deployments[0].services[1].operation === null, 'delete failure must not start the next service');
-  runAjv('validate', stateSchema, writeFixture('queue-delete-failed', deleteRetry), true);
-  deleteRetry.deployments[0].services[0].phase = 'DELETING';
-  deleteRetry.deployments[0].services[0].operation = operation('DELETE', 'REMOVING_TRAFFIC', null);
-  assert(deleteRetry.deployments[0].services[0].operation.type === 'DELETE' && deleteRetry.deployments[0].services[1].operation === null, 'delete retry must restore only the failed delete');
-  deleteRetry.deployments[0].services[0].failedManifestVersion = null;
-  deleteRetry.deployments[0].services[0].lastError = null;
-  runAjv('validate', stateSchema, writeFixture('queue-delete-retry', deleteRetry), true);
+  const deleteFailed = service({
+    phase: 'FAILED', failedManifestVersion: 2,
+    lastError: error('DELETE', 'DELETE_RETRYABLE')
+  });
+  const deleteFailure = twoServiceState(deleteFailed, toolsService(), {phase: 'DELETING'});
+  validateState('queue-delete-failed', twoServiceManifest, deleteFailure);
+  assert(deleteFailure.deployments[0].services[1].operation === null, 'delete failure must not start the next service');
+  const deleteRetry = clone(deleteFailure);
+  Object.assign(deleteRetry.deployments[0].services[0], {
+    phase: 'DELETING', operation: operation('DELETE', 'REMOVING_TRAFFIC', null),
+    failedManifestVersion: null, lastError: null
+  });
+  validateState('queue-delete-retry', twoServiceManifest, deleteRetry);
+  assert(retryTransitionErrors(deleteFailure, deleteRetry, {type: 'RETRY_DELETE', serviceName: 'agent-service'}).length === 0, 'delete retry transition must restore only the failed service');
 
-  const uncertainFailure = clone(positiveStates.failedCreate);
-  uncertainFailure.deployments[0].acceptedManifestVersion = 3;
-  uncertainFailure.deployments[0].services[0].targetManifestVersion = 3;
+  const uncertainFailure = clone(createQueue);
   uncertainFailure.deployments[0].services[0].lastError = error('CREATE', 'FACTS_UNCERTAIN');
-  assert(uncertainFailure.deployments[0].services[0].phase === 'FAILED', 'a higher manifest version must not clear uncertain facts');
+  validateState('queue-create-uncertain', twoServiceManifest, uncertainFailure);
+  const version3Manifest = clone(twoServiceManifest);
+  version3Manifest.manifestVersion = 3;
+  version3Manifest.gitCommit = '2'.repeat(40);
+  runAjv('validate', manifestSchema, writeFixture('manifest-two-service-v3-valid', version3Manifest), true);
+  const illegalHigherVersionRetry = clone(uncertainFailure);
+  Object.assign(illegalHigherVersionRetry.deployments[0], {
+    acceptedManifestVersion: 3,
+    manifestSha256: digest(version3Manifest),
+    gitCommit: version3Manifest.gitCommit
+  });
+  for (const item of illegalHigherVersionRetry.deployments[0].services) item.targetManifestVersion = 3;
+  Object.assign(illegalHigherVersionRetry.deployments[0].services[0], {
+    phase: 'CREATING', operation: operation('CREATE', 'STARTING_CANDIDATE', 'instance-illegal-retry'),
+    failedManifestVersion: null, lastError: null
+  });
+  validateState('queue-create-uncertain-illegal-shape', version3Manifest, illegalHigherVersionRetry);
+  assert(retryTransitionErrors(uncertainFailure, illegalHigherVersionRetry, {type: 'ACCEPT_HIGHER_MANIFEST', serviceName: 'agent-service', factsReconciled: false}).length > 0, 'a higher manifest alone must not clear uncertain facts');
+  const manualRetry = clone(uncertainFailure);
+  Object.assign(manualRetry.deployments[0].services[0], {
+    phase: 'CREATING', operation: operation('CREATE', 'STARTING_CANDIDATE', 'instance-manual-retry'),
+    failedManifestVersion: null, lastError: null
+  });
+  validateState('queue-create-uncertain-manual-retry', twoServiceManifest, manualRetry);
+  assert(retryTransitionErrors(uncertainFailure, manualRetry, {type: 'RETRY_CREATE', serviceName: 'agent-service', factsReconciled: true}).length === 0, 'manual reconciliation must allow the failed service to retry');
+  const skippedFailure = clone(uncertainFailure);
+  skippedFailure.deployments[0].services[1].operation = operation('CREATE', 'STARTING_CANDIDATE', 'tools-illegal-retry');
+  assert(customErrors(twoServiceManifest, skippedFailure).length > 0, 'a retry must not skip the current failed service');
+
+  let currentRoute = clone(routeOld);
+  let routeReads = 0;
+  const instancesById = new Map([
+    [oldActive.instanceId, oldActive],
+    [newActive.instanceId, newActive]
+  ]);
+  function bindNewCall() {
+    routeReads++;
+    const pointer = clone(currentRoute);
+    if (pointer.defaultInstanceId === null) throw new Error('BETA_DEFAULT_ROUTE_UNAVAILABLE');
+    const instance = instancesById.get(pointer.defaultInstanceId);
+    if (!instance || instance.releaseId !== pointer.defaultReleaseId) throw new Error('BETA_ROUTE_FACTS_UNCERTAIN');
+    return {instanceId: instance.instanceId, endpoint: clone(instance.endpoint), routeVersion: pointer.routeVersion};
+  }
+
+  const boundBeforeSwitch = bindNewCall();
+  currentRoute = clone(routeNewStable);
+  const firstAfterSwitch = bindNewCall();
+  const secondAfterSwitch = bindNewCall();
+  assert(boundBeforeSwitch.instanceId === 'instance-old', 'a call bound before the switch must remain on the old instance');
+  assert(firstAfterSwitch.instanceId === 'instance-new' && secondAfterSwitch.instanceId === 'instance-new', 'every call started after the switch must bind the new instance');
+  assert(routeReads === 3, 'the mutable route pointer must be read once for every new call');
+  assert(boundBeforeSwitch.instanceId === 'instance-old' && boundBeforeSwitch.routeVersion === 7, 'the atomic switch must not rewrite an in-flight binding');
+
+  currentRoute = clone(routeNoneAfterDelete);
+  let deleteFailedClosed = false;
+  try {
+    bindNewCall();
+  } catch (errorValue) {
+    deleteFailedClosed = errorValue.message === 'BETA_DEFAULT_ROUTE_UNAVAILABLE';
+  }
+  assert(deleteFailedClosed, 'a call started after route removal must fail closed');
+
+  const postSwitch = clone(positiveStates.updateDraining.deployments[0].services[0]);
+  assert(postSwitch.drainingInstance.registration.enabled, 'the old registration may still be selectable immediately after the atomic pointer switch');
+  postSwitch.drainingInstance.registration.enabled = false;
+  postSwitch.drainingInstance.registration.weight = 0;
+  const routeReadbackMatches = postSwitch.route.routeVersion === routeNewStable.routeVersion
+    && postSwitch.route.defaultInstanceId === postSwitch.activeInstance.instanceId;
+  assert(routeReadbackMatches && !postSwitch.drainingInstance.registration.enabled, 'SIGTERM requires exact route readback and a disabled old registration');
 
   console.log(`0-3 contract verification passed: ${schemaChecks} AJV checks, ${contractChecks} contract checks`);
   console.log(`manifestSha256 vector: ${manifestSha256}`);
