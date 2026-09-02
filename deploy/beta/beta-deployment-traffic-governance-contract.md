@@ -1,4 +1,4 @@
-# 0-3 Beta 部署单与流量状态合同
+# Beta 部署与流量治理合同
 
 本文固定 Beta 部署控制器使用的两类运行时文件。`manifest.json` 记录一个隔离流量范围希望运行哪些服务，`controller-state.json` 记录每个服务当前由哪个实例接收新流量，以及是否有候选实例正在启动、旧实例正在排空。
 
@@ -44,7 +44,7 @@ Agent Run、数据库事务、业务重试和业务恢复不属于本合同。�
 
 ## 2. 流量范围和两个端口槽
 
-`trafficScopeId` 表示一组彼此隔离的流量和实例。主 Beta 固定使用 `main-beta`，泳道使用 0-2 分配的其他标识。同一个服务可以同时出现在主 Beta 和多条泳道里，但 `trafficScopeId + serviceName` 不同，就必须使用彼此独立的实例集合和默认路由。
+`trafficScopeId` 表示一组彼此隔离的流量和实例。主 Beta 固定使用 `main-beta`，泳道使用灰度规则判定与泳道分配模块提供的其他标识。同一个服务可以同时出现在主 Beta 和多条泳道里，但 `trafficScopeId + serviceName` 不同，就必须使用彼此独立的实例集合和默认路由。
 
 一个部署单描述一个完整流量范围。同一时刻只能有一个活动部署占用某个 `trafficScopeId`，不能用两个部署共同维护同一范围。
 
@@ -54,11 +54,11 @@ Agent Run、数据库事务、业务重试和业务恢复不属于本合同。�
 - 更新时，候选实例占用另一个槽，所以新旧实例可以同时运行。
 - 切换完成并删除旧实例后，两个槽的角色互换；下一次更新再使用空闲槽。
 
-端口由部署单的 `runtime.hostPorts` 固定，控制器不能临时另选端口。`machineId` 指向 2-4 控制器配置中的静态机器表；机器地址和访问凭据不写进部署单。机器无法访问时，控制器不能把“没有查到容器”解释成“容器不存在”。
+端口由部署单的 `runtime.hostPorts` 固定，控制器不能临时另选端口。`machineId` 指向 Beta 部署控制器配置中的静态机器表；机器地址和访问凭据不写进部署单。机器无法访问时，控制器不能把“没有查到容器”解释成“容器不存在”。
 
 ## 3. Nacos 注册和默认路由
 
-当前环境固定使用 Nacos 2.5.0，注册、查询和更新实例以 [Nacos 2.x 命名 OpenAPI](https://nacos.io/en/docs/v2/guide/user/open-api/) 或同版 Java SDK 为准，不使用 3.x 管理接口推测 2.5.0 行为。`AF_CONFIG_NACOS_NAMESPACE` 为空时，2-4 必须在发起请求前规范为 `public`；部署单、全局状态和查询参数中都只保存 `public`，不保存空串。
+当前环境固定使用 Nacos 2.5.0，注册、查询和更新实例以 [Nacos 2.x 命名 OpenAPI](https://nacos.io/en/docs/v2/guide/user/open-api/) 或同版 Java SDK 为准，不使用 3.x 管理接口推测 2.5.0 行为。`AF_CONFIG_NACOS_NAMESPACE` 为空时，Beta 部署控制器必须在发起请求前规范为 `public`；部署单、全局状态和查询参数中都只保存 `public`，不保存空串。
 
 新旧实例在切换窗口中都按实例注册到 Nacos。每条实际注册记录保存完整服务名、分组、命名空间、集群、IP、端口、Nacos 实例标识，以及会影响选择结果的 `enabled`、`healthy`、`weight`、`ephemeral`。注册元数据的键名固定为：
 
@@ -68,20 +68,20 @@ Agent Run、数据库事务、业务重试和业务恢复不属于本合同。�
 
 因此正常更新时查询到两个实例不是错误。控制器必须逐字比较完整注册键、三个固定元数据键和四个可选择事实，不能以“查询结果恰好一条”代替身份核对。
 
-默认路由由 `trafficScopeId + serviceName` 唯一定位。首版的实际执行方法是：2-4 提供路由快照接口，2-5 入口和 2-3 服务调用路由器必须根据这份快照选择精确的 `instanceId + endpoint`。Beta 流量禁止直接从未过滤的 Nacos 实例列表随机选择。路由快照包含：
+默认路由由 `trafficScopeId + serviceName` 唯一定位。首版的实际执行方法是：Beta 部署控制器提供路由快照接口，入口请求路由组件和服务间调用路由组件必须根据这份快照选择精确的 `instanceId + endpoint`。Beta 流量禁止直接从未过滤的 Nacos 实例列表随机选择。路由快照包含：
 
 - `route.defaultInstanceId`：默认实例。
 - `route.defaultReleaseId`：新请求和后续服务调用使用的默认版本标签。
 - `route.routeVersion`：每次创建、切换或移除默认路由时递增。
 - `route.updatedAt`：该路由事实的原子切换时间。
 
-首版不缓存可变的默认路由指针。每个新入口请求或新服务调用开始时，2-5 或 2-3 都从同一个原子路由执行点读取一次当前指针，并把该请求绑定到返回的精确实例。路由读取是新请求的线性化时刻：原子替换以前已经读到 A 的请求继续由 A 完成；替换以后才开始读取的请求只能得到 B。路由执行点无法读取时停止转发 Beta 新请求，不能继续使用上一份指针，也不能回退到未过滤的 Nacos 列表。
+首版不缓存可变的默认路由指针。每个新入口请求或新服务调用开始时，入口请求路由组件或服务间调用路由组件都从同一个原子路由执行点读取一次当前指针，并把该请求绑定到返回的精确实例。路由读取是新请求的线性化时刻：原子替换以前已经读到 A 的请求继续由 A 完成；替换以后才开始读取的请求只能得到 B。路由执行点无法读取时停止转发 Beta 新请求，不能继续使用上一份指针，也不能回退到未过滤的 Nacos 列表。
 
 控制器通过一次 `controller-state.json` 原子替换同时更新默认指针和实例角色。路由接口回读相同 `routeVersion` 后，控制器把旧 Nacos 实例改为 `enabled=false, weight=0` 并回读确认，然后发送 SIGTERM。
 
 候选注册时先固定为 `enabled=false, weight=0, ephemeral=true`，因此切换前它不具备默认流量资格。候选就绪后，控制器先把它改为 `enabled=true, weight=1`并回读，再发布指向它的路由快照。这个短窗口里路由仍精确指向旧实例，所以新实例仍不会获得默认流量。
 
-`controller-state.json` 是路由指针的持久化依据，2-4 路由接口只能返回已成功原子替换的完整指针。控制器重启后必须通过一次独立接口请求回读路由，不能仅凭写文件的函数返回成功就宣称切流已生效。
+`controller-state.json` 是路由指针的持久化依据，Beta 部署控制器的路由接口只能返回已成功原子替换的完整指针。控制器重启后必须通过一次独立接口请求回读路由，不能仅凭写文件的函数返回成功就宣称切流已生效。
 
 Nacos 负责保存并发现按版本区分的实例，路由事实负责决定无显式版本的新流量使用哪个版本。Nacos 中同时存在新旧实例不等于新旧实例同时接收默认流量。
 
@@ -97,7 +97,9 @@ Nacos 负责保存并发现按版本区分的实例，路由事实负责决定�
         └── manifest.json
 ```
 
-全局状态文件是 `/var/lib/alphafrog-beta/controller-state.json`。单个部署的部署单是 `/var/lib/alphafrog-beta/deployments/<deployment-id>/manifest.json`。2-4 控制器和测试必须直接引用这两个文件名。
+全局状态文件是 `/var/lib/alphafrog-beta/controller-state.json`。单个部署的部署单是 `/var/lib/alphafrog-beta/deployments/<deployment-id>/manifest.json`。Beta 部署控制器和测试必须直接引用这两个文件名。
+
+`manifest.schema.json` 校验单个部署希望运行的服务、镜像、机器、固定端口和 Nacos 注册模板，也就是 `manifest.json` 的期望配置。`controller-state.schema.json` 校验全局 `controller-state.json` 的完整对象，包括控制器已经接受的部署单身份、实例角色、容器和 Nacos 观察结果、默认路由及当前部署操作。Beta 部署控制器是这两类运行时文件的唯一写入者；控制器启动核对、状态查询和路由快照读取全局状态，测试使用两份 Schema 验证样例。本合同负责定义两份文件的写入顺序、字段关系和 Schema 无法表达的跨文件一致性检查。
 
 两个文件都使用 UTF-8 JSON，禁止重复键。每次更新先在目标目录写临时文件，对文件执行 `fsync`，再使用原子重命名替换正式文件，最后对父目录执行 `fsync`。`controller-state.json` 每次成功替换时把 `stateVersion` 加 1。
 
@@ -134,7 +136,7 @@ Nacos 负责保存并发现按版本区分的实例，路由事实负责决定�
 - `image.localImageId`：目标机器已经安装的本地镜像标识。
 - `runtime.containerPort`：容器内端口。
 - `runtime.hostPorts`：两个不同的固定宿主端口，数组第一个对应槽 A，第二个对应槽 B。
-- `runtime.healthCheckProfile`：2-4 为专用 Compose 注入的固定健康检查方案，首版只接受 `CONTROLLER_TCP_V1`。
+- `runtime.healthCheckProfile`：Beta 部署控制器为专用 Compose 注入的固定健康检查方案，首版只接受 `CONTROLLER_TCP_V1`。
 - `runtime.readinessTimeoutSeconds`：候选容器从启动到必须就绪的最长时间。
 - `runtime.shutdownProfile`：服务在 SIGTERM 后怎样停止接收新请求并等待在手请求。
 - `runtime.applicationDrainSeconds`：应用内部允许排空的最长时间。
@@ -142,19 +144,19 @@ Nacos 负责保存并发现按版本区分的实例，路由事实负责决定�
 - `registration`：Nacos 服务名、分组、命名空间和集群模板。
 - `runtimeConfigSha256`：可选运行配置摘要；秘密值本身不得写入部署单。
 
-当前业务服务的 Dockerfile 和常规 Compose 没有普遍提供 `HEALTHCHECK`，所以 2-4 必须在 Beta 专用 Compose 中提供它。2-4 向容器只读挂载一份由控制器发布的固定 TCP 探针，并注入执行 `/opt/alphafrog-beta/bin/tcp-healthcheck 127.0.0.1 <containerPort>` 的 Compose `healthcheck`。部署单不接受任意命令、脚本路径或网络 URL。探针、挂载或 Docker 健康状态缺失时，候选发布失败。
+当前业务服务的 Dockerfile 和常规 Compose 没有普遍提供 `HEALTHCHECK`，所以 Beta 部署控制器必须在专用 Compose 中提供它。控制器向容器只读挂载一份固定 TCP 探针，并注入执行 `/opt/alphafrog-beta/bin/tcp-healthcheck 127.0.0.1 <containerPort>` 的 Compose `healthcheck`。部署单不接受任意命令、脚本路径或网络 URL。探针、挂载或 Docker 健康状态缺失时，候选发布失败。
 
 `READY` 不等于“容器进程存活”。它必须同时满足：Docker 返回 `State.Health.Status=healthy`；Nacos 查到唯一份完整身份匹配的注册且 `healthy=true`；注册仍为 `enabled=false, weight=0`；路由接口仍精确指向旧实例（首次创建时为空）。这一条件让 RPC 注册比 TCP 端口晚几秒时不会提前切流。
 
-排空统一执行 `docker stop --signal SIGTERM --timeout <drainGraceSeconds>`，明确覆盖镜像可能配置的其他 `STOPSIGNAL`。[Docker stop 命令文档](https://docs.docker.com/reference/cli/docker/container/stop/)说明了显式信号、超时和强制停止行为。只发 SIGTERM 不足以证明已排空，因此 2-4 还必须按 `shutdownProfile` 注入并预检以下固定配置：
+排空统一执行 `docker stop --signal SIGTERM --timeout <drainGraceSeconds>`，明确覆盖镜像可能配置的其他 `STOPSIGNAL`。[Docker stop 命令文档](https://docs.docker.com/reference/cli/docker/container/stop/)说明了显式信号、超时和强制停止行为。只发 SIGTERM 不足以证明已排空，因此 Beta 部署控制器还必须按 `shutdownProfile` 注入并预检以下固定配置：
 
 - `SPRING_BOOT_HTTP_V1`：`server.shutdown=graceful` 和 `spring.lifecycle.timeout-per-shutdown-phase=<applicationDrainSeconds>s`。
 - `SPRING_BOOT_DUBBO_V1`：上述 Spring 生命周期上限，以及 `dubbo.service.shutdown.wait=<applicationDrainSeconds * 1000>` 毫秒。
 - `SPRING_BOOT_HTTP_DUBBO_V1`：同时执行 HTTP 和 Dubbo 的两类约束，整个进程必须在同一 `applicationDrainSeconds` 上限内退出。
 
-[Spring Boot 3.2.3 优雅停机文档](https://docs.spring.io/spring-boot/docs/3.2.3/reference/html/web.html#web.graceful-shutdown)说明了 `server.shutdown=graceful` 和生命周期超时的作用；[Dubbo 优雅停机文档](https://dubbo.apache.org/en/overview/mannual/java-sdk/tasks/shutdown/) 说明了服务端等待请求完成的配置。2-4 必须在专用 Compose 生成后检查有效配置；不识别的服务协议或未实现的停机方案直接拒绝发布。这是 2-4 与 4-4 必须实现和验证的前置，不是当前服务已经具备的事实。
+[Spring Boot 3.2.3 优雅停机文档](https://docs.spring.io/spring-boot/docs/3.2.3/reference/html/web.html#web.graceful-shutdown)说明了 `server.shutdown=graceful` 和生命周期超时的作用；[Dubbo 优雅停机文档](https://dubbo.apache.org/en/docs3-v2/java-sdk/advanced-features-and-usage/others/graceful-shutdown/)说明了服务端等待请求完成的配置。Beta 部署控制器必须在专用 Compose 生成后检查有效配置；不识别的服务协议或未实现的停机方案直接拒绝发布。这是部署控制器实现与泳道端到端验收必须完成的前置，不是当前服务已经具备的事实。
 
-`serviceSpecSha256` 使用 RFC 8785 JSON Canonicalization Scheme（JCS，规范 JSON 序列化）计算。输入是当前服务对象删除 `serviceSpecSha256` 后的结果。2-4 每次读取部署单时重新计算，摘要不一致就拒绝应用。
+`serviceSpecSha256` 使用 RFC 8785 JSON Canonicalization Scheme（JCS，规范 JSON 序列化）计算。输入是当前服务对象删除 `serviceSpecSha256` 后的结果。Beta 部署控制器每次读取部署单时重新计算，摘要不一致就拒绝应用。
 
 `manifestSha256` 使用同一套 JCS 规则计算，输入是已经填好每个 `serviceSpecSha256` 的完整部署单对象。部署单本身不含 `manifestSha256`，所以不删除任何顶层字段。摘要输入是 JCS 产生的 UTF-8 字节，不是原始文件的空格、换行或键顺序。配套脚本中完整有效样例的固定预期值是 `33374acd2c19107cca9c23cf9dda3ccc1590678f2aa3e2a2fc7c62cf0d62c40b`；同一对象的紧凑排版和缩进排版都必须得到该值。
 
@@ -270,7 +272,7 @@ CREATING / STARTING_CANDIDATE
 首版不保证在每个外部调用中断点自动恢复。控制器重启时只做一次有限核对：
 
 1. 读取并校验两类文件；失败就停止写操作并报告错误。
-2. 按 `machineId` 查询记录中的容器，按完整注册键查询 Nacos 2.5.0，并从 2-4 路由接口回读当前 `routeVersion` 和精确端点。`controller-state.json` 是持久化依据，不是已生效路由的唯一证据。
+2. 按 `machineId` 查询记录中的容器，按完整注册键查询 Nacos 2.5.0，并从 Beta 部署控制器的路由接口回读当前 `routeVersion` 和精确端点。`controller-state.json` 是持久化依据，不是已生效路由的唯一证据。
 3. 容器名称和标签必须同时匹配 `deploymentId`、`trafficScopeId`、`serviceName`、`instanceId` 和 `releaseId`。仅找到一个完全匹配对象时可以补齐状态；找到多个对象或身份冲突时写 `FAILED`。
 4. 路由接口仍指向旧实例时，旧实例继续服务；接口已经指向候选时，实例角色必须是“候选已成为活动实例、旧实例正在排空”；接口已经返回空路由时，活动实例必须已经移入排空角色。接口、持久化指针和实例角色不一致时写 `FAILED + FACTS_UNCERTAIN`，不猜测哪一方正确。
 5. 候选仍在等待时，控制器同时检查 Docker 健康、Nacos 身份与可选择事实、路由仍未指向候选，再按 `readinessDeadline` 继续或失败。
@@ -281,7 +283,7 @@ CREATING / STARTING_CANDIDATE
 
 ## 9. Schema 之外的一致性检查
 
-JSON Schema 负责字段、类型、枚举和基本组合。2-4 选用的 Draft 2020-12 校验器必须开启 `date-time`、`ipv4` 和 `ipv6` 的 `format` 断言，不能把 `format` 当作注释。启动自检必须证明合法 IPv4、合法 IPv6 通过，普通文本 IP 和伪 UTC 时间被拒绝；自检失败时控制器拒绝启动。2-4 还必须执行以下跨记录检查：
+JSON Schema 负责字段、类型、枚举和基本组合。Beta 部署控制器选用的 Draft 2020-12 校验器必须开启 `date-time`、`ipv4` 和 `ipv6` 的 `format` 断言，不能把 `format` 当作注释。启动自检必须证明合法 IPv4、合法 IPv6 通过，普通文本 IP 和伪 UTC 时间被拒绝；自检失败时控制器拒绝启动。控制器还必须执行以下跨记录检查：
 
 1. `deploymentId` 唯一；一个 `trafficScopeId` 最多对应一个活动部署；部署内 `serviceName` 唯一。
 2. 所有实例标识、容器标识和完整 Nacos 注册身份全局唯一。同一服务的活动、候选和排空实例不能使用相同 `instanceId` 或端口槽。所有活动部署单中的两个预留槽都参与检查，`machineId + hostPort` 全局唯一；主 Beta、不同泳道和不同服务也不能重叠。服务仍存在时，新部署单的 `machineId + hostPorts` 必须与旧状态一致，因此未退出的上一代实例不会因为部署单改址而提前释放端口。
@@ -305,7 +307,7 @@ JSON Schema 负责字段、类型、枚举和基本组合。2-4 选用的 Draft 
 - 当前操作类型和阶段。
 - 最近一次部署错误和失败的部署单版本。
 
-0-3 的可重放验证入口是 `node deploy/beta/verify-contract.mjs`。脚本会用固定版本的 AJV CLI 与 `ajv-formats` 严格编译两份 Schema，生成临时正反例并运行跨字段检查。运行环境需要 Node.js 和可使用的 npm 包源；实现仓库后应把固定依赖收入正常测试任务，不在运行时下载。
+本合同的可重放验证入口是 `node deploy/beta/verify-contract.mjs`。脚本会用固定版本的 AJV CLI 与 `ajv-formats` 严格编译两份 Schema，生成临时正反例并运行跨字段检查。运行环境需要 Node.js 和可使用的 npm 包源；实现仓库后应把固定依赖收入正常测试任务，不在运行时下载。
 
 静态验收至少覆盖：
 
@@ -318,7 +320,7 @@ JSON Schema 负责字段、类型、枚举和基本组合。2-4 选用的 Draft 
 - `CREATE/UPDATE/DELETE` 与阶段的非法组合被拒绝。
 - 自定义检查拒绝同一范围的两个部署、全局两个并行操作、活动与候选共用端口槽、实例标识或容器标识重复、Nacos 身份重复、`STABLE` 路由不指向活动实例。
 - 候选验收覆盖 Docker 健康、Nacos `healthy=true`、候选仍禁用和路由未指向候选的四项联合条件。路由验收覆盖单一原子切换时刻：切换前已经绑定旧实例的请求保持完成，切换后的每个新入口请求和新服务调用都重新读取指针并只得到新实例；删除指针后新请求立即拒绝；指针不可读时失败关闭。验收还要覆盖路由回读、旧 Nacos 实例禁用并回读后才 SIGTERM，以及重启时按实际路由接口而非只读本地 JSON 判断。
-- 排空验收必须在 4-4 运行至少一条长 HTTP/SSE 或 RPC 请求：切流完成后新请求不再进入旧实例，已在手请求在 `applicationDrainSeconds` 内完成，整个进程在 `drainGraceSeconds` 内退出。
+- 泳道端到端验收必须运行至少一条长 HTTP/SSE 或 RPC 请求：切流完成后新请求不再进入旧实例，已在手请求在 `applicationDrainSeconds` 内完成，整个进程在 `drainGraceSeconds` 内退出。
 - 两服务首次创建失败、更新失败和两服务删除失败都使用与完整两服务部署单一致的独立摘要、实例、容器标识和端口，并让失败态与重试态分别通过 Schema 和跨记录检查。每次重试的 `stateVersion` 必须比失败态精确增加 1；版本不变、倒退或跳号都由转换检查拒绝。转换检查还必须证明后续服务不越过、显式重试只恢复正确服务和正确操作、`FACTS_UNCERTAIN` 不会被更高版本直接清除，人工消除冲突后才允许重试。
 - `manifestSha256` 固定向量覆盖同一对象的两种排版，并断言两者产生合同中同一预期摘要。
 - 一个部署单同时更新多个服务时，只允许一个服务拥有 `operation`，其余服务以 `STABLE` 上一代实例合法排队；轮到以后再进入更新。
