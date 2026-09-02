@@ -136,10 +136,13 @@ def verify_collector() -> int:
     require(config.count("storage: file_storage") == 2, "读取位置与发送队列没有同时使用持久存储")
     require("/var/log/apps/*/*.log" in config, "采集器日志文件匹配规则错误")
     require('field: attributes["parse.error"]' in config, "坏 JSON 没有 parse.error 标记")
+    parse_error_index = config.index('field: attributes["parse.error"]')
+    message_move_index = config.index("from: attributes.message")
+    require(parse_error_index < message_move_index, "parse.error 必须在 message 被移走以前判断")
     require("deployment" not in re.sub(r"#.*", "", config), "采集器不应覆盖日志 deployment 字段")
     require("headers" not in config and "body_capture" not in config, "采集器配置开启了秘密或正文采集")
     subprocess.run(["bash", str(ROOT / "deploy/otel/verify-collector-config.sh")], check=True, cwd=ROOT)
-    checks = 10
+    checks = 11
 
     try:
         import yaml  # type: ignore

@@ -13,6 +13,10 @@ receivers:
       - type: json_parser
         parse_from: body
         on_error: send
+      - type: add
+        field: attributes["parse.error"]
+        value: json_parse_failed
+        if: 'attributes.message == nil'
       - type: move
         from: attributes.message
         to: body
@@ -21,10 +25,6 @@ receivers:
         from: attributes.service
         to: resource["service.name"]
         if: 'attributes.service != nil'
-      - type: add
-        field: attributes["parse.error"]
-        value: json_parse_failed
-        if: 'attributes.message == nil'
 
 processors:
   memory_limiter:
