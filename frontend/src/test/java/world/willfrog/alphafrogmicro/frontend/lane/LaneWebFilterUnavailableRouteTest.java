@@ -14,6 +14,7 @@ import org.springframework.security.authentication.UsernamePasswordAuthenticatio
 import org.springframework.security.core.context.SecurityContextHolder;
 import world.willfrog.alphafrogmicro.common.lane.LaneCallBindingContext;
 import world.willfrog.alphafrogmicro.common.lane.LaneContext;
+import world.willfrog.alphafrogmicro.common.lane.LaneDubboServiceKey;
 import world.willfrog.alphafrogmicro.frontend.filter.LaneWebFilter;
 
 class LaneWebFilterUnavailableRouteTest {
@@ -42,7 +43,9 @@ class LaneWebFilterUnavailableRouteTest {
         LaneRouteFacts outerFacts = LaneRouteFactsTestData.facts("outer-instance", 28999, 99);
         LaneContext.setTrafficScopeId("outer-scope");
         LaneRequestContext.set(outerFacts);
-        LaneCallBindingContext.set(outerFacts.registrationServiceName(), outerFacts.callBinding());
+        LaneCallBindingContext.set(
+                LaneDubboServiceKey.parse(properties.getIdentityDubboServiceKey()),
+                outerFacts.callBinding());
         LaneCallBindingContext.PinnedBinding outerBinding = LaneCallBindingContext.current();
         MDC.put(LaneContext.MDC_LANE_TAG, "outer-mdc");
         MockHttpServletRequest request = new MockHttpServletRequest("POST", "/api/agent/runs");

@@ -6,6 +6,7 @@ import java.time.Duration;
 import java.util.LinkedHashSet;
 import java.util.Set;
 import org.springframework.boot.context.properties.ConfigurationProperties;
+import world.willfrog.alphafrogmicro.common.lane.LaneDubboServiceKey;
 
 /**
  * 入口流量范围配置。入口口令只用于比较，不得写入日志、响应或调用上下文。
@@ -19,6 +20,8 @@ public class LaneEntryProperties {
     private String passphraseHeader = "X-AlphaFrog-Lane-Passphrase";
     private String trafficScopeId = "lane-test";
     private String identityServiceName = "agent-langchain-service";
+    private String identityDubboServiceKey =
+            "langchain/world.willfrog.alphafrogmicro.agent.idl.AgentDubboService";
     private URI controllerBaseUrl = URI.create("http://127.0.0.1:19090");
     private Path controllerApiTokenFile = Path.of("/etc/alphafrog-beta/secrets/controller-api-token");
     private Duration connectTimeout = Duration.ofSeconds(2);
@@ -72,6 +75,18 @@ public class LaneEntryProperties {
 
     public void setIdentityServiceName(String identityServiceName) {
         this.identityServiceName = identityServiceName;
+    }
+
+    public String getIdentityDubboServiceKey() {
+        return identityDubboServiceKey;
+    }
+
+    public void setIdentityDubboServiceKey(String identityDubboServiceKey) {
+        this.identityDubboServiceKey = identityDubboServiceKey;
+    }
+
+    public LaneDubboServiceKey resolvedIdentityDubboServiceKey() {
+        return LaneDubboServiceKey.parse(identityDubboServiceKey);
     }
 
     public URI getControllerBaseUrl() {
@@ -132,6 +147,7 @@ public class LaneEntryProperties {
                 && !trafficScopeId.isBlank()
                 && identityServiceName != null
                 && !identityServiceName.isBlank()
+                && LaneDubboServiceKey.isValid(identityDubboServiceKey)
                 && testUsernames.stream().anyMatch(username -> username != null && !username.isBlank());
     }
 

@@ -19,19 +19,19 @@ public final class LaneCallBindingContext {
         return CURRENT.get();
     }
 
-    public static LaneCallBinding find(String trafficScopeId, String registrationServiceName) {
+    public static LaneCallBinding find(String trafficScopeId, LaneDubboServiceKey dubboServiceKey) {
         PinnedBinding pinned = CURRENT.get();
         if (pinned == null
                 || trafficScopeId == null
                 || !trafficScopeId.equals(pinned.binding().trafficScopeId())
-                || !sameRegistration(pinned.registrationServiceName(), registrationServiceName)) {
+                || !pinned.dubboServiceKey().equals(dubboServiceKey)) {
             return null;
         }
         return pinned.binding();
     }
 
-    public static void set(String registrationServiceName, LaneCallBinding binding) {
-        CURRENT.set(new PinnedBinding(registrationServiceName, binding));
+    public static void set(LaneDubboServiceKey dubboServiceKey, LaneCallBinding binding) {
+        CURRENT.set(new PinnedBinding(dubboServiceKey, binding));
     }
 
     public static void clear() {
@@ -46,24 +46,10 @@ public final class LaneCallBindingContext {
         }
     }
 
-    private static boolean sameRegistration(String expected, String actual) {
-        if (actual == null || actual.isBlank()) {
-            return false;
-        }
-        return expected.equals(actual) || stripProviderSuffix(expected).equals(stripProviderSuffix(actual));
-    }
-
-    private static String stripProviderSuffix(String value) {
-        int separator = value.indexOf("@@");
-        return separator < 0 ? value : value.substring(0, separator);
-    }
-
-    public record PinnedBinding(String registrationServiceName, LaneCallBinding binding) {
+    public record PinnedBinding(LaneDubboServiceKey dubboServiceKey, LaneCallBinding binding) {
 
         public PinnedBinding {
-            if (registrationServiceName == null || registrationServiceName.isBlank()) {
-                throw new IllegalArgumentException("注册服务名称不能为空");
-            }
+            Objects.requireNonNull(dubboServiceKey, "dubboServiceKey");
             Objects.requireNonNull(binding, "binding");
         }
     }

@@ -16,6 +16,7 @@ import java.util.regex.Pattern;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 import world.willfrog.alphafrogmicro.common.lane.LaneCallBinding;
 import world.willfrog.alphafrogmicro.common.lane.LaneEndpoint;
+import world.willfrog.alphafrogmicro.common.lane.LaneDubboServiceKey;
 
 /** 通过部署控制器只读状态接口取得流量范围的默认部署身份。 */
 public final class ControllerLaneRouteFactsClient implements LaneRouteFactsFetcher {
@@ -120,6 +121,10 @@ public final class ControllerLaneRouteFactsClient implements LaneRouteFactsFetch
                 return Optional.empty();
             }
             String registrationServiceName = text(registration, "serviceName");
+            LaneDubboServiceKey dubboServiceKey = properties.resolvedIdentityDubboServiceKey();
+            if (!dubboServiceKey.matchesNacosRegistration(registrationServiceName)) {
+                return Optional.empty();
+            }
             JsonNode endpoint = active.path("endpoint");
             if (!endpoint.isObject()) {
                 return Optional.empty();

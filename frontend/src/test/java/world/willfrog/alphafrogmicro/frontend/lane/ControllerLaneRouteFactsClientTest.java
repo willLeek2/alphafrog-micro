@@ -43,6 +43,19 @@ class ControllerLaneRouteFactsClientTest {
     }
 
     @Test
+    void rejectsRegistrationThatDoesNotMatchConfiguredDubboCallIdentity() {
+        String anotherInterface = validStatus().replace(
+                "world.willfrog.alphafrogmicro.agent.idl.AgentDubboService:1.0@@providers",
+                "world.willfrog.alphafrogmicro.agent.idl.AnotherDubboService:1.0@@providers");
+        String anotherVersion = validStatus().replace(
+                "world.willfrog.alphafrogmicro.agent.idl.AgentDubboService:1.0@@providers",
+                "world.willfrog.alphafrogmicro.agent.idl.AgentDubboService:2.0@@providers");
+
+        assertTrue(client.parseStatus(anotherInterface, "lane-test", "agent-langchain-service").isEmpty());
+        assertTrue(client.parseStatus(anotherVersion, "lane-test", "agent-langchain-service").isEmpty());
+    }
+
+    @Test
     void treatsControllerNotFoundConflictAsAuthoritativeEmptyButKeepsOtherConflictsTransient() {
         assertTrue(client.isAuthoritativeNotFound(404, ""));
         assertTrue(client.isAuthoritativeNotFound(409,

@@ -51,6 +51,7 @@ alphafrog:
       passphrase-header: ${AF_LANE_TAG_PASSPHRASE_HEADER:X-AlphaFrog-Lane-Passphrase}
       traffic-scope-id: ${AF_LANE_TRAFFIC_SCOPE_ID:lane-test}
       identity-service-name: ${AF_LANE_IDENTITY_SERVICE_NAME:agent-langchain-service}
+      identity-dubbo-service-key: ${AF_LANE_IDENTITY_DUBBO_SERVICE_KEY:langchain/world.willfrog.alphafrogmicro.agent.idl.AgentDubboService}
       controller-base-url: ${AF_BETA_CONTROLLER_BASE_URL:http://127.0.0.1:19090}
       controller-api-token-file: ${AF_BETA_CONTROLLER_API_TOKEN_FILE:/etc/alphafrog-beta/secrets/controller-api-token}
       connect-timeout: ${AF_LANE_CONTROLLER_CONNECT_TIMEOUT:2s}

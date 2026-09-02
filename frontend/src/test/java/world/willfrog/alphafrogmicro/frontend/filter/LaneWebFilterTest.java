@@ -44,6 +44,7 @@ class LaneWebFilterTest {
 
     private static final String PASSPHRASE = "p".repeat(32);
     private static final String GENERATION = "gen-" + "a".repeat(64);
+    private static final String AGENT_GROUP = "langchain";
 
     @AfterEach
     void cleanContext() {
@@ -230,14 +231,18 @@ class LaneWebFilterTest {
             LaneRoutingSupport.install(new LaneCallRouter(pointer), true);
             LaneExactInstanceRouter router = new LaneExactInstanceRouter(
                     URL.valueOf("dubbo://127.0.0.1/agent-langchain-service"));
+            URL agentConsumerUrl = agentConsumerUrl();
             List<Invoker<Object>> selected = router.route(
                     List.of(instanceA, instanceB),
-                    URL.valueOf("dubbo://127.0.0.1/" + registrationName()),
-                    realAgentInvocation());
+                    agentConsumerUrl,
+                    realAgentInvocation(agentConsumerUrl));
 
             assertEquals(List.of(instanceA), selected);
             assertEquals(GENERATION, new FrontendDeploymentIdentityProvider(properties).current().generationId());
             assertEquals("instance-a", LaneCallBindingContext.current().binding().instanceId());
+            assertEquals(
+                    AGENT_GROUP + "/" + agentInterfaceName(),
+                    LaneCallBindingContext.current().dubboServiceKey().value());
         });
     }
 
@@ -319,9 +324,25 @@ class LaneWebFilterTest {
     }
 
     @SuppressWarnings("deprecation")
-    private static RpcInvocation realAgentInvocation() {
-        return new RpcInvocation(
-                "invoke", agentInterfaceName(), agentProtocolServiceKey(), new Class<?>[0], new Object[0]);
+    private static RpcInvocation realAgentInvocation(URL consumerUrl) {
+        RpcInvocation invocation = new RpcInvocation(
+                "invoke",
+                consumerUrl.getServiceInterface(),
+                consumerUrl.getProtocolServiceKey(),
+                new Class<?>[0],
+                new Object[0]);
+        invocation.setTargetServiceUniqueName(consumerUrl.getServiceKey());
+        assertEquals(agentInterfaceName(), invocation.getServiceName());
+        assertEquals(AGENT_GROUP + "/" + agentInterfaceName(), invocation.getTargetServiceUniqueName());
+        assertEquals(
+                AGENT_GROUP + "/" + agentInterfaceName() + ":dubbo",
+                invocation.getProtocolServiceKey());
+        return invocation;
+    }
+
+    private static URL agentConsumerUrl() {
+        return URL.valueOf("dubbo://127.0.0.1/" + agentInterfaceName())
+                .addParameter("group", AGENT_GROUP);
     }
 
     private static String registrationName() {
