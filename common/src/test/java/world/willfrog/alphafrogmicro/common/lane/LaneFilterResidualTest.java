@@ -5,6 +5,7 @@ import org.apache.dubbo.rpc.Invocation;
 import org.apache.dubbo.rpc.Invoker;
 import org.apache.dubbo.rpc.Result;
 import org.apache.dubbo.rpc.RpcContext;
+import org.apache.dubbo.rpc.RpcInvocation;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.slf4j.MDC;
@@ -87,6 +88,43 @@ class LaneFilterResidualTest {
         }), mock(Invocation.class));
         assertThat(outbound.get()).isEqualTo("main-beta");
         assertThat(LaneContext.trafficScopeId()).isEqualTo("main-beta");
+    }
+
+    @Test
+    void consumer_unmarkedRpcInvocation_shouldClearStaleInvocationAttachmentInsideInvoker() {
+        LaneContext.clear();
+        RpcInvocation invocation = new RpcInvocation();
+        invocation.setAttachment(LaneContext.ATTACHMENT_TRAFFIC_SCOPE_ID, "stale-invocation-scope");
+        AtomicBoolean insideClean = new AtomicBoolean();
+        new LaneConsumerHopFilter().invoke(invoker(() -> {
+            insideClean.set(
+                    invocation.getAttachment(LaneContext.ATTACHMENT_TRAFFIC_SCOPE_ID) == null
+                            && RpcContext.getClientAttachment()
+                                    .getAttachment(LaneContext.ATTACHMENT_TRAFFIC_SCOPE_ID) == null
+                            && MDC.get(LaneContext.MDC_LANE_TAG) == null);
+            return mock(Result.class);
+        }), invocation);
+        assertThat(insideClean).isTrue();
+        assertThat(invocation.getAttachment(LaneContext.ATTACHMENT_TRAFFIC_SCOPE_ID))
+                .isEqualTo("stale-invocation-scope");
+    }
+
+    @Test
+    void provider_unmarkedRpcInvocation_shouldIgnoreStaleServerAttachment() {
+        RpcContext.getServerAttachment()
+                .setAttachment(LaneContext.ATTACHMENT_TRAFFIC_SCOPE_ID, "stale-server-scope");
+        LaneContext.setTrafficScopeId("outer-scope");
+        MDC.put(LaneContext.MDC_LANE_TAG, "outer-scope");
+        RpcInvocation invocation = new RpcInvocation();
+        AtomicBoolean insideClean = new AtomicBoolean();
+        new LaneProviderEntryFilter().invoke(invoker(() -> {
+            insideClean.set(LaneContext.trafficScopeId() == null
+                    && MDC.get(LaneContext.MDC_LANE_TAG) == null);
+            return mock(Result.class);
+        }), invocation);
+        assertThat(insideClean).isTrue();
+        assertThat(LaneContext.trafficScopeId()).isEqualTo("outer-scope");
+        assertThat(MDC.get(LaneContext.MDC_LANE_TAG)).isEqualTo("outer-scope");
     }
 
     @SuppressWarnings("unchecked")
