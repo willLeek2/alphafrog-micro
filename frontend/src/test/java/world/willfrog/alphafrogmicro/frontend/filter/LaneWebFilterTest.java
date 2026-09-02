@@ -15,8 +15,8 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.dubbo.common.URL;
-import org.apache.dubbo.rpc.Invocation;
 import org.apache.dubbo.rpc.Invoker;
+import org.apache.dubbo.rpc.RpcInvocation;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.slf4j.MDC;
@@ -233,7 +233,7 @@ class LaneWebFilterTest {
             List<Invoker<Object>> selected = router.route(
                     List.of(instanceA, instanceB),
                     URL.valueOf("dubbo://127.0.0.1/" + registrationName()),
-                    invocation(registrationName()));
+                    realAgentInvocation());
 
             assertEquals(List.of(instanceA), selected);
             assertEquals(GENERATION, new FrontendDeploymentIdentityProvider(properties).current().generationId());
@@ -318,13 +318,21 @@ class LaneWebFilterTest {
         return invoker;
     }
 
-    private static Invocation invocation(String serviceName) {
-        Invocation invocation = mock(Invocation.class);
-        when(invocation.getServiceName()).thenReturn(serviceName);
-        return invocation;
+    @SuppressWarnings("deprecation")
+    private static RpcInvocation realAgentInvocation() {
+        return new RpcInvocation(
+                "invoke", agentInterfaceName(), agentProtocolServiceKey(), new Class<?>[0], new Object[0]);
     }
 
     private static String registrationName() {
-        return "world.willfrog.alphafrogmicro.agent.idl.AgentDubboService:1.0@@providers";
+        return agentProtocolServiceKey() + "@@providers";
+    }
+
+    private static String agentProtocolServiceKey() {
+        return agentInterfaceName() + ":1.0";
+    }
+
+    private static String agentInterfaceName() {
+        return "world.willfrog.alphafrogmicro.agent.idl.AgentDubboService";
     }
 }

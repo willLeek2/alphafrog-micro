@@ -83,17 +83,23 @@ public final class LaneExactInstanceRouter implements Router {
     }
 
     private static String registrationName(URL url, Invocation invocation) {
+        // Dubbo 的 serviceName 只有接口名；protocolServiceKey 保留分组和版本，
+        // 只需去掉 Nacos 名称末尾的 @@providers 就能做精确匹配。
+        if (invocation != null
+                && invocation.getProtocolServiceKey() != null
+                && !invocation.getProtocolServiceKey().isBlank()) {
+            return invocation.getProtocolServiceKey();
+        }
+        if (url != null) {
+            String serviceKey = url.getServiceKey();
+            if (serviceKey != null && !serviceKey.isBlank()) {
+                return serviceKey;
+            }
+        }
         if (invocation != null && invocation.getServiceName() != null && !invocation.getServiceName().isBlank()) {
             return invocation.getServiceName();
         }
-        if (url == null) {
-            return "";
-        }
-        String serviceKey = url.getServiceKey();
-        if (serviceKey != null && !serviceKey.isBlank()) {
-            return serviceKey;
-        }
-        return url.getPath();
+        return url == null ? "" : url.getPath();
     }
 
     static boolean matches(URL invokerUrl, LaneCallBinding binding) {

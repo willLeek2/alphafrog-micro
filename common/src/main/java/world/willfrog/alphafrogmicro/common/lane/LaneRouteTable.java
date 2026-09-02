@@ -52,8 +52,21 @@ public final class LaneRouteTable {
         if (exact != null) {
             return exact;
         }
-        String interfaceName = stripGroupSuffix(registrationServiceName);
-        return byRegistration.get(serviceKey(trafficScopeId, interfaceName));
+        // Nacos 末尾的 @@providers 是登记类别，不属于 Dubbo 协议服务键。
+        // 分组、接口名和版本仍全部保留；若去掉类别后出现多个候选，则拒绝猜测。
+        String protocolServiceKey = stripRegistryCategorySuffix(registrationServiceName);
+        LaneServiceRoute matched = null;
+        for (LaneServiceRoute route : byRegistration.values()) {
+            if (!trafficScopeId.equals(route.trafficScopeId())
+                    || !protocolServiceKey.equals(stripRegistryCategorySuffix(route.registrationServiceName()))) {
+                continue;
+            }
+            if (matched != null && matched != route) {
+                return null;
+            }
+            matched = route;
+        }
+        return matched;
     }
 
     public boolean isEmpty() {
@@ -64,7 +77,7 @@ public final class LaneRouteTable {
         return trafficScopeId + "\0" + serviceName;
     }
 
-    private static String stripGroupSuffix(String registrationServiceName) {
+    private static String stripRegistryCategorySuffix(String registrationServiceName) {
         int groupSeparator = registrationServiceName.indexOf("@@");
         if (groupSeparator < 0) {
             return registrationServiceName;

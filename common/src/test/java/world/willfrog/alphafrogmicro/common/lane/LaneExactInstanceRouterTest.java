@@ -4,6 +4,7 @@ import org.apache.dubbo.common.URL;
 import org.apache.dubbo.rpc.Invocation;
 import org.apache.dubbo.rpc.Invoker;
 import org.apache.dubbo.rpc.RpcException;
+import org.apache.dubbo.rpc.RpcInvocation;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
@@ -123,7 +124,7 @@ class LaneExactInstanceRouterTest {
         List<Invoker<Object>> selected = router.route(
                 List.of(oldInvoker, newInvoker),
                 URL.valueOf("dubbo://127.0.0.1/com.alphafrog.AgentService:1.0@@providers"),
-                invocation("com.alphafrog.AgentService:1.0@@providers"));
+                realInvocation("com.alphafrog.AgentService", "com.alphafrog.AgentService:1.0"));
 
         assertThat(selected).containsExactly(newInvoker);
     }
@@ -162,7 +163,7 @@ class LaneExactInstanceRouterTest {
         List<Invoker<Object>> selected = router.route(
                 List.of(pinned, current),
                 URL.valueOf("dubbo://127.0.0.1/com.alphafrog.AgentService:1.0@@providers"),
-                invocation("com.alphafrog.AgentService:1.0@@providers"));
+                realInvocation("com.alphafrog.AgentService", "com.alphafrog.AgentService:1.0"));
 
         assertThat(selected).containsExactly(pinned);
 
@@ -170,8 +171,36 @@ class LaneExactInstanceRouterTest {
         List<Invoker<Object>> selectedTools = router.route(
                 List.of(toolsCurrent),
                 URL.valueOf("dubbo://127.0.0.1/com.alphafrog.ToolsService:1.0@@providers"),
-                invocation("com.alphafrog.ToolsService:1.0@@providers"));
+                realInvocation("com.alphafrog.ToolsService", "com.alphafrog.ToolsService:1.0"));
         assertThat(selectedTools).containsExactly(toolsCurrent);
+    }
+
+    @Test
+    void route_shouldRetainProtocolVersionWhenMatchingARequestBinding() {
+        AtomicLaneRoutePointer pointer = new AtomicLaneRoutePointer();
+        pointer.replaceAll(LaneRouteTable.of(List.of(new LaneServiceRoute(
+                SCOPE,
+                "agent-service-v2",
+                "com.alphafrog.AgentService:2.0@@providers",
+                "instance-v2",
+                "release-v2",
+                "gen-" + "f".repeat(64),
+                10L,
+                "2026-09-01T00:05:00Z",
+                new LaneEndpoint("10.0.0.8", 28083)))));
+        LaneRoutingSupport.install(new LaneCallRouter(pointer), true);
+        LaneContext.setTrafficScopeId(SCOPE);
+        LaneCallBindingContext.set("com.alphafrog.AgentService:1.0@@providers", NEW_BINDING);
+        Invoker<Object> pinnedV1 = invoker("10.0.0.8", 28081, "instance-new");
+        Invoker<Object> currentV2 = invoker("10.0.0.8", 28083, "instance-v2");
+        LaneExactInstanceRouter router = new LaneExactInstanceRouter(URL.valueOf("dubbo://127.0.0.1/agent-service"));
+
+        List<Invoker<Object>> selected = router.route(
+                List.of(pinnedV1, currentV2),
+                URL.valueOf("dubbo://127.0.0.1/com.alphafrog.AgentService:2.0@@providers"),
+                realInvocation("com.alphafrog.AgentService", "com.alphafrog.AgentService:2.0"));
+
+        assertThat(selected).containsExactly(currentV2);
     }
 
     private static void installNewRoute() {
@@ -220,6 +249,15 @@ class LaneExactInstanceRouterTest {
     private static Invocation invocation(String serviceName) {
         Invocation invocation = mock(Invocation.class);
         when(invocation.getServiceName()).thenReturn(serviceName);
+        return invocation;
+    }
+
+    @SuppressWarnings("deprecation")
+    private static RpcInvocation realInvocation(String interfaceName, String protocolServiceKey) {
+        RpcInvocation invocation = new RpcInvocation(
+                "invoke", interfaceName, protocolServiceKey, new Class<?>[0], new Object[0]);
+        assertThat(invocation.getServiceName()).isEqualTo(interfaceName);
+        assertThat(invocation.getProtocolServiceKey()).isEqualTo(protocolServiceKey);
         return invocation;
     }
 }
