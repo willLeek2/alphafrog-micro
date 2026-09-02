@@ -39,6 +39,7 @@ class LangchainLinearRunPipelineFailureMappingTest {
         run.setId("run-budget-1");
         run.setUserId("user-1");
         run.setExt("{}");
+        run.setStatus(world.willfrog.agent.platform.model.AgentRunStatus.RECEIVED);
         when(runMapper.findById("run-budget-1")).thenReturn(run);
         when(runMapper.updateStatus("run-budget-1", "user-1",
                 world.willfrog.agent.platform.model.AgentRunStatus.EXECUTING)).thenReturn(1);

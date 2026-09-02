@@ -104,7 +104,10 @@ class LangchainLinearRunPipelinePlanReadyTest {
         run.setId("run-pending-1");
         run.setUserId("user-1");
         run.setExt("{}");
+        run.setStatus(world.willfrog.agent.platform.model.AgentRunStatus.RECEIVED);
         when(runMapper.findById("run-pending-1")).thenReturn(run);
+        when(runMapper.updateStatus("run-pending-1", "user-1",
+                world.willfrog.agent.platform.model.AgentRunStatus.EXECUTING)).thenReturn(1);
         when(runMapper.updateTerminalSnapshot(eq("run-pending-1"), eq("user-1"),
                 eq(world.willfrog.agent.platform.model.AgentRunStatus.FAILED),
                 any(), eq(true), eq("tool_job_checkpoint_anchor_missing"))).thenReturn(1);
@@ -177,7 +180,10 @@ class LangchainLinearRunPipelinePlanReadyTest {
         run.setId("run-plan-1");
         run.setUserId("user-1");
         run.setExt("{}");
+        run.setStatus(world.willfrog.agent.platform.model.AgentRunStatus.RECEIVED);
         when(runMapper.findById("run-plan-1")).thenReturn(run);
+        when(runMapper.updateStatus("run-plan-1", "user-1",
+                world.willfrog.agent.platform.model.AgentRunStatus.EXECUTING)).thenReturn(1);
         when(eventService.isRunnable("run-plan-1", "user-1")).thenReturn(true);
         when(eventService.extractCaptureLlmRequests(run.getExt())).thenReturn(false);
         when(eventService.extractEndpointName(run.getExt())).thenReturn("openrouter");
@@ -311,7 +317,10 @@ class LangchainLinearRunPipelinePlanReadyTest {
         run.setId("run-mode-" + requestedMode.name().toLowerCase());
         run.setUserId("user-mode");
         run.setExt("{\"execution_mode\":\"" + requestedMode.name() + "\"}");
+        run.setStatus(world.willfrog.agent.platform.model.AgentRunStatus.RECEIVED);
         when(runMapper.findById(run.getId())).thenReturn(run);
+        when(runMapper.updateStatus(run.getId(), run.getUserId(),
+                world.willfrog.agent.platform.model.AgentRunStatus.EXECUTING)).thenReturn(1);
         when(eventService.isRunnable(run.getId(), run.getUserId())).thenReturn(true);
         when(eventService.extractExecutionMode(run.getExt())).thenReturn(requestedMode.name());
         when(eventService.extractRunConfig(run.getExt())).thenReturn(AgentRunEventService.RunConfig.defaults());

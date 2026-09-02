@@ -52,6 +52,19 @@ class LangchainLinearRunPipelineFailureStageTest {
     private static final String GENERATION = "gen-" + "a".repeat(64);
 
     @Test
+    void terminalAndCancelingRunsCannotReenterOrdinaryExecution() {
+        for (AgentRunStatus status : List.of(
+                AgentRunStatus.COMPLETED, AgentRunStatus.FAILED, AgentRunStatus.CANCELING)) {
+            assertRejectedBeforeOrdinarySideEffects(status, true);
+        }
+    }
+
+    @Test
+    void terminalRunDoesNotEnterInsufficientCreditFailurePath() {
+        assertRejectedBeforeOrdinarySideEffects(AgentRunStatus.PARTIAL, false);
+    }
+
+    @Test
     void pauseWinningAfterLastStopCheckRejectsLatePlanAndTerminalWrites() {
         AgentRun run = new AgentRun();
         run.setId("run-pause-race");
@@ -156,6 +169,7 @@ class LangchainLinearRunPipelineFailureStageTest {
         run.setId("run-terminal-race");
         run.setUserId("user-1");
         run.setExt("{}");
+        run.setStatus(AgentRunStatus.RECEIVED);
 
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
         when(runMapper.findById("run-terminal-race")).thenReturn(run);
@@ -206,6 +220,7 @@ class LangchainLinearRunPipelineFailureStageTest {
         run.setId("run-shutdown");
         run.setUserId("user-1");
         run.setExt("{}");
+        run.setStatus(AgentRunStatus.RECEIVED);
 
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
         when(runMapper.findById("run-shutdown")).thenReturn(run);
@@ -266,6 +281,7 @@ class LangchainLinearRunPipelineFailureStageTest {
         run.setId("run-fs-1");
         run.setUserId("user-1");
         run.setExt("{}");
+        run.setStatus(AgentRunStatus.RECEIVED);
 
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
         when(runMapper.findById("run-fs-1")).thenReturn(run);
@@ -342,6 +358,7 @@ class LangchainLinearRunPipelineFailureStageTest {
         run.setId("run-fs-2");
         run.setUserId("user-1");
         run.setExt("{}");
+        run.setStatus(AgentRunStatus.RECEIVED);
 
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
         when(runMapper.findById("run-fs-2")).thenReturn(run);
@@ -417,5 +434,45 @@ class LangchainLinearRunPipelineFailureStageTest {
         assertThat(captured).containsKey("failure_class");
         assertThat(captured.get("failure_class")).isInstanceOf(String.class);
         assertThat((String) captured.get("failure_class")).isNotEmpty();
+    }
+
+    private void assertRejectedBeforeOrdinarySideEffects(AgentRunStatus status,
+                                                          boolean creditAvailable) {
+        String runId = "run-rejected-" + status.name().toLowerCase();
+        AgentRun run = new AgentRun();
+        run.setId(runId);
+        run.setUserId("user-1");
+        run.setExt("{}");
+        run.setStatus(status);
+
+        AgentRunMapper runMapper = mock(AgentRunMapper.class);
+        when(runMapper.findById(runId)).thenReturn(run);
+        AgentRunEventService eventService = mock(AgentRunEventService.class);
+        LangchainAiPlanner planner = mock(LangchainAiPlanner.class);
+        AgentCreditService creditService = mock(AgentCreditService.class);
+        when(creditService.hasPositiveCredit("user-1")).thenReturn(creditAvailable);
+        ObjectProvider<world.willfrog.agent.platform.service.AgentRunStateStore> stateStoreProvider =
+                mock(ObjectProvider.class);
+
+        LangchainLinearRunPipelineImpl pipeline = new LangchainLinearRunPipelineImpl(
+                planner, mock(LangchainLinearWorkflowExecutor.class),
+                mock(LangchainDagWorkflowExecutor.class), mock(LangchainRunStageModelResolver.class),
+                runMapper, eventService, new ObjectMapper(), mock(ObjectProvider.class),
+                stateStoreProvider, mock(ObjectProvider.class), new LangchainFailureMapper(),
+                mock(LangchainFollowUpContextSupport.class), mock(AgentMessageService.class),
+                mock(LangchainRunExecutionGuard.class), immediateScheduler(), creditService,
+                mock(AgentRunCreditSettlementService.class), mock(AgentRunFinalizationService.class),
+                mock(world.willfrog.agent.platform.service.AgentPromptService.class),
+                mock(ObjectProvider.class), mock(ObjectProvider.class));
+
+        pipeline.executeRun(run);
+
+        verify(creditService, never()).hasPositiveCredit(anyString());
+        verify(planner, never()).plan(any());
+        verify(runMapper, never()).updateStatus(anyString(), anyString(), any());
+        verify(runMapper, never()).updateTerminalSnapshot(
+                anyString(), anyString(), any(), anyString(), eq(true), any());
+        verify(eventService, never()).append(anyString(), anyString(), anyString(), any());
+        verify(stateStoreProvider, never()).getIfAvailable();
     }
 }

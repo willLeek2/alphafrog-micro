@@ -52,6 +52,7 @@ class LangchainLinearRunPipelineCheckpointTest {
         run.setId("run-1");
         run.setUserId("user-1");
         run.setExt("{}");
+        run.setStatus(world.willfrog.agent.platform.model.AgentRunStatus.RECEIVED);
         AgentRun anchored = new AgentRun();
         anchored.setId("run-1");
         ToolJobAnchor anchor = new ToolJobAnchor();

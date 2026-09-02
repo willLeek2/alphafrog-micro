@@ -41,6 +41,7 @@ class LangchainLinearRunPipelineInterruptTest {
         run.setId("r1");
         run.setUserId("u1");
         run.setExt("{}");
+        run.setStatus(AgentRunStatus.RECEIVED);
         when(runMapper.findById("r1")).thenReturn(run);
         when(eventService.isRunnable("r1", "u1")).thenReturn(true);
         when(eventService.extractCaptureLlmRequests(any())).thenReturn(false);

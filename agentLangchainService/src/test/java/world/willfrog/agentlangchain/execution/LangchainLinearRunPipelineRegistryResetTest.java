@@ -29,7 +29,6 @@ import static world.willfrog.agentlangchain.control.LangchainRunSchedulerTestSup
 import world.willfrog.agentlangchain.control.LangchainRunExecutionGuard;
 
 /**
- * 260623-agent-service-deprecation task #47 (P0-2)：
  * 验证 {@link LangchainLinearRunPipelineImpl#executeRun(AgentRun)} 在 finally 块里调用
  * {@link AgentRunDatasetRegistry#reset(String)}，清理当前 run 的 per-run 编号转译层状态，
  * 避免跨 run 串到上一个 run 的 dataset/manifest 编号。
@@ -62,6 +61,7 @@ class LangchainLinearRunPipelineRegistryResetTest {
         run.setId(RUN_ID);
         run.setUserId("u1");
         run.setExt("{}");
+        run.setStatus(world.willfrog.agent.platform.model.AgentRunStatus.RECEIVED);
         when(runMapper.findById(RUN_ID)).thenReturn(run);
         when(eventService.isRunnable(RUN_ID, "u1")).thenReturn(true);
         lenient().when(eventService.extractCaptureLlmRequests(any())).thenReturn(false);
@@ -133,7 +133,7 @@ class LangchainLinearRunPipelineRegistryResetTest {
         run.setUserId("u1");
         pipeline.executeRun(run);
 
-        // P0-2 验收：run 完成后 registry 该 run 的状态应被清掉（reset hook 走 finally 块）
+        // Run 完成后 registry 中属于该 Run 的状态应被清掉（reset hook 走 finally 块）。
         assertFalse(registry.hasRunState(RUN_ID),
                 "executeRun finally block should reset AgentRunDatasetRegistry per-run state");
     }
@@ -180,6 +180,7 @@ class LangchainLinearRunPipelineRegistryResetTest {
         run.setId(RUN_ID);
         run.setUserId("u1");
         run.setExt("{}");
+        run.setStatus(world.willfrog.agent.platform.model.AgentRunStatus.RECEIVED);
         when(runMapper.findById(RUN_ID)).thenReturn(run);
         when(eventService.isRunnable(RUN_ID, "u1")).thenReturn(true);
         lenient().when(eventService.extractCaptureLlmRequests(any())).thenReturn(false);

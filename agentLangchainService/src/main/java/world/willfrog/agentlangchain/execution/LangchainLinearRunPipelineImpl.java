@@ -254,6 +254,11 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             closeRetiredLocalRun(run);
             return;
         }
+        if (run.getStatus() != AgentRunStatus.RECEIVED) {
+            log.warn("Run 当前状态不是可执行起点，停止迟到或重复执行: runId={} status={}",
+                    run.getId(), run.getStatus());
+            return;
+        }
         String runId = run.getId();
         String userId = run.getUserId();
         String userGoal = "";
@@ -385,20 +390,26 @@ public class LangchainLinearRunPipelineImpl implements LangchainLinearRunPipelin
             String blockedSnapshot = attachObservability(
                     runId, run.getSnapshotJson(), AgentRunStatus.FAILED, "CreditBlocked", reason);
             int snapshotRows = updateTerminalForLocal(
-                    runId, userId, run.getStatus(), AgentRunStatus.FAILED,
+                    runId, userId, AgentRunStatus.RECEIVED, AgentRunStatus.FAILED,
                     blockedSnapshot, true, reason);
+            if (snapshotRows != 1) {
+                log.warn("额度检查失败终态未落库，停止发布迟到副作用: runId={}", runId);
+                return false;
+            }
             int ttlRows = updateStatusWithTtlForLocal(
                     runId, userId, AgentRunStatus.FAILED, AgentRunStatus.FAILED,
                     eventService.nextInterruptedExpiresAt());
-            if (snapshotRows == 1 && ttlRows == 1) {
-                recordSchedulerCompletion(AgentRunStatus.FAILED);
+            if (ttlRows != 1) {
+                log.warn("额度检查失败状态的存活时间未落库，停止发布终态副作用: runId={}", runId);
+                return false;
             }
+            recordSchedulerCompletion(AgentRunStatus.FAILED);
             eventService.append(runId, userId, "EXECUTION_BLOCKED",
                     Map.of("reason", reason, "by", "credit_pre_check", "engine", "agentLangchainService"));
             markRunStatus(runId, AgentRunStatus.FAILED);
             return false;
         }
-        if (updateStatusForLocal(runId, userId, run.getStatus(), AgentRunStatus.EXECUTING) != 1) {
+        if (updateStatusForLocal(runId, userId, AgentRunStatus.RECEIVED, AgentRunStatus.EXECUTING) != 1) {
             log.warn("Run 状态或部署代际已经变化，停止进入执行阶段: runId={}", runId);
             return false;
         }

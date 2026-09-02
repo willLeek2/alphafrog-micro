@@ -37,7 +37,7 @@ import static world.willfrog.agentlangchain.control.LangchainRunSchedulerTestSup
 import world.willfrog.agentlangchain.control.LangchainRunExecutionGuard;
 
 /**
- * 提交点语义（T1-6）：终态快照成功写入数据库（带状态栅栏的终态写入返回 1）即本次 Run 的提交点，
+ * 提交点语义：终态快照成功写入数据库（带状态栅栏的终态写入返回 1）即本次 Run 的提交点，
  * 之后的收尾动作（事件、assistant 消息、结算、终态广播）降级为尽力而为，失败只告警，
  * 不再向外传播——外层失败出口不允许把已提交的 COMPLETED/PARTIAL 改写成 WORKFLOW_FAILED。
  *
@@ -184,9 +184,11 @@ class LangchainLinearRunPipelineCommitPointTest {
         run.setId(runId);
         run.setUserId("user-1");
         run.setExt("{}");
+        run.setStatus(AgentRunStatus.RECEIVED);
 
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
         when(runMapper.findById(runId)).thenReturn(run);
+        when(runMapper.updateStatus(runId, "user-1", AgentRunStatus.EXECUTING)).thenReturn(1);
         when(runMapper.updateTerminalSnapshot(eq(runId), eq("user-1"), any(), anyString(), eq(true), any()))
                 .thenReturn(snapshotRows);
 

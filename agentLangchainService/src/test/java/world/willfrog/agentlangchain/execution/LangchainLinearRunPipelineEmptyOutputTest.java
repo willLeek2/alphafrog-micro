@@ -22,6 +22,7 @@ import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
@@ -31,7 +32,7 @@ import static world.willfrog.agentlangchain.control.LangchainRunSchedulerTestSup
 import world.willfrog.agentlangchain.control.LangchainRunExecutionGuard;
 
 /**
- * ccmax #59: linear 端 publishFailure 把 failureMetadata 透传到 WORKFLOW_FAILED event payload。
+ * linear 端 publishFailure 把 failureMetadata 透传到 WORKFLOW_FAILED event payload。
  *
  * <p>覆盖两条路径：
  * <ul>
@@ -64,9 +65,14 @@ class LangchainLinearRunPipelineEmptyOutputTest {
         run.setId("run-empty-1");
         run.setUserId("user-1");
         run.setExt("{}");
+        run.setStatus(world.willfrog.agent.platform.model.AgentRunStatus.RECEIVED);
 
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
         when(runMapper.findById("run-empty-1")).thenReturn(run);
+        when(runMapper.updateStatus("run-empty-1", "user-1",
+                world.willfrog.agent.platform.model.AgentRunStatus.EXECUTING)).thenReturn(1);
+        when(runMapper.updateTerminalSnapshot(eq("run-empty-1"), eq("user-1"), any(),
+                anyString(), eq(true), any())).thenReturn(1);
         AgentRunEventService eventService = mock(AgentRunEventService.class);
         when(eventService.isRunnable("run-empty-1", "user-1")).thenReturn(true);
         when(eventService.extractCaptureLlmRequests(run.getExt())).thenReturn(false);
@@ -142,9 +148,14 @@ class LangchainLinearRunPipelineEmptyOutputTest {
         run.setId("run-empty-2");
         run.setUserId("user-1");
         run.setExt("{}");
+        run.setStatus(world.willfrog.agent.platform.model.AgentRunStatus.RECEIVED);
 
         AgentRunMapper runMapper = mock(AgentRunMapper.class);
         when(runMapper.findById("run-empty-2")).thenReturn(run);
+        when(runMapper.updateStatus("run-empty-2", "user-1",
+                world.willfrog.agent.platform.model.AgentRunStatus.EXECUTING)).thenReturn(1);
+        when(runMapper.updateTerminalSnapshot(eq("run-empty-2"), eq("user-1"), any(),
+                anyString(), eq(true), any())).thenReturn(1);
         AgentRunEventService eventService = mock(AgentRunEventService.class);
         when(eventService.isRunnable("run-empty-2", "user-1")).thenReturn(true);
         when(eventService.extractCaptureLlmRequests(run.getExt())).thenReturn(false);
