@@ -37,6 +37,23 @@
       "maxLength": 64,
       "pattern": "^(?!stable$)[a-z0-9](?:[a-z0-9-]{1,62}[a-z0-9])$"
     },
+    "deploymentGenerationId": {
+      "type": "string",
+      "pattern": "^gen-[a-f0-9]{64}$"
+    },
+    "preStopPolicy": {
+      "enum": [
+        "NONE",
+        "AGENT_RETIRE_GENERATION_V1"
+      ]
+    },
+    "shutdownProfile": {
+      "enum": [
+        "SPRING_BOOT_HTTP_DUBBO_V1",
+        "SPRING_BOOT_DUBBO_V1",
+        "SPRING_BOOT_HTTP_V1"
+      ]
+    },
     "trafficScopeId": {
       "type": "string",
       "minLength": 1,
@@ -217,6 +234,7 @@
           "required": [
             "alphafrog.traffic-scope-id",
             "alphafrog.release-id",
+            "alphafrog.deployment-generation-id",
             "alphafrog.instance-id"
           ],
           "properties": {
@@ -225,6 +243,9 @@
             },
             "alphafrog.release-id": {
               "$ref": "#/$defs/opaqueId"
+            },
+            "alphafrog.deployment-generation-id": {
+              "$ref": "#/$defs/deploymentGenerationId"
             },
             "alphafrog.instance-id": {
               "$ref": "#/$defs/opaqueId"
@@ -240,6 +261,11 @@
         "instanceId",
         "machineId",
         "releaseId",
+        "deploymentGenerationId",
+        "preStopPolicy",
+        "shutdownProfile",
+        "applicationDrainSeconds",
+        "drainGraceSeconds",
         "manifestVersion",
         "serviceSpecSha256",
         "containerName",
@@ -258,6 +284,25 @@
         },
         "releaseId": {
           "$ref": "#/$defs/opaqueId"
+        },
+        "deploymentGenerationId": {
+          "$ref": "#/$defs/deploymentGenerationId"
+        },
+        "preStopPolicy": {
+          "$ref": "#/$defs/preStopPolicy"
+        },
+        "shutdownProfile": {
+          "$ref": "#/$defs/shutdownProfile"
+        },
+        "applicationDrainSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86395
+        },
+        "drainGraceSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400
         },
         "manifestVersion": {
           "type": "integer",
@@ -307,6 +352,11 @@
             "instanceId",
             "machineId",
             "releaseId",
+            "deploymentGenerationId",
+            "preStopPolicy",
+            "shutdownProfile",
+            "applicationDrainSeconds",
+            "drainGraceSeconds",
             "manifestVersion",
             "serviceSpecSha256",
             "containerName",
@@ -320,6 +370,11 @@
             "instanceId": true,
             "machineId": true,
             "releaseId": true,
+            "deploymentGenerationId": true,
+            "preStopPolicy": true,
+            "shutdownProfile": true,
+            "applicationDrainSeconds": true,
+            "drainGraceSeconds": true,
             "manifestVersion": true,
             "serviceSpecSha256": true,
             "containerName": true,
@@ -344,6 +399,11 @@
             "instanceId",
             "machineId",
             "releaseId",
+            "deploymentGenerationId",
+            "preStopPolicy",
+            "shutdownProfile",
+            "applicationDrainSeconds",
+            "drainGraceSeconds",
             "manifestVersion",
             "serviceSpecSha256",
             "containerName",
@@ -360,6 +420,11 @@
             "instanceId": true,
             "machineId": true,
             "releaseId": true,
+            "deploymentGenerationId": true,
+            "preStopPolicy": true,
+            "shutdownProfile": true,
+            "applicationDrainSeconds": true,
+            "drainGraceSeconds": true,
             "manifestVersion": true,
             "serviceSpecSha256": true,
             "containerName": true,
@@ -423,6 +488,11 @@
             "instanceId",
             "machineId",
             "releaseId",
+            "deploymentGenerationId",
+            "preStopPolicy",
+            "shutdownProfile",
+            "applicationDrainSeconds",
+            "drainGraceSeconds",
             "manifestVersion",
             "serviceSpecSha256",
             "containerName",
@@ -431,13 +501,20 @@
             "hostPort",
             "endpoint",
             "registration",
-            "drainStartedAt",
-            "drainDeadline"
+            "trafficRemovedAt",
+            "stopSignalRequestedAt",
+            "stopDeadline",
+            "preStopCompletedAt"
           ],
           "properties": {
             "instanceId": true,
             "machineId": true,
             "releaseId": true,
+            "deploymentGenerationId": true,
+            "preStopPolicy": true,
+            "shutdownProfile": true,
+            "applicationDrainSeconds": true,
+            "drainGraceSeconds": true,
             "manifestVersion": true,
             "serviceSpecSha256": true,
             "containerName": true,
@@ -446,13 +523,72 @@
             "hostPort": true,
             "endpoint": true,
             "registration": true,
-            "drainStartedAt": {
+            "trafficRemovedAt": {
               "$ref": "#/$defs/timestamp"
             },
-            "drainDeadline": {
-              "$ref": "#/$defs/timestamp"
+            "stopSignalRequestedAt": {
+              "$ref": "#/$defs/nullableTimestamp"
+            },
+            "stopDeadline": {
+              "$ref": "#/$defs/nullableTimestamp"
+            },
+            "preStopCompletedAt": {
+              "$ref": "#/$defs/nullableTimestamp"
             }
-          }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "preStopCompletedAt": {
+                    "type": "null"
+                  }
+                },
+                "required": [
+                  "preStopCompletedAt"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "stopSignalRequestedAt": {
+                    "type": "null"
+                  },
+                  "stopDeadline": {
+                    "type": "null"
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "stopSignalRequestedAt": {
+                    "type": "null"
+                  }
+                },
+                "required": [
+                  "stopSignalRequestedAt"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "stopDeadline": {
+                    "type": "null"
+                  }
+                }
+              },
+              "else": {
+                "properties": {
+                  "preStopCompletedAt": {
+                    "$ref": "#/$defs/timestamp"
+                  },
+                  "stopDeadline": {
+                    "$ref": "#/$defs/timestamp"
+                  }
+                }
+              }
+            }
+          ]
         }
       ]
     },
@@ -462,6 +598,7 @@
       "required": [
         "defaultInstanceId",
         "defaultReleaseId",
+        "defaultDeploymentGenerationId",
         "routeVersion",
         "updatedAt"
       ],
@@ -471,6 +608,16 @@
         },
         "defaultReleaseId": {
           "$ref": "#/$defs/nullableOpaqueId"
+        },
+        "defaultDeploymentGenerationId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/deploymentGenerationId"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "routeVersion": {
           "type": "integer",
@@ -496,6 +643,9 @@
             "properties": {
               "defaultReleaseId": {
                 "type": "null"
+              },
+              "defaultDeploymentGenerationId": {
+                "type": "null"
               }
             }
           },
@@ -503,6 +653,9 @@
             "properties": {
               "defaultReleaseId": {
                 "$ref": "#/$defs/opaqueId"
+              },
+              "defaultDeploymentGenerationId": {
+                "$ref": "#/$defs/deploymentGenerationId"
               }
             }
           }
@@ -832,11 +985,11 @@
                   {
                     "type": "object",
                     "properties": {
-                      "drainStartedAt": {
+                      "trafficRemovedAt": {
                         "$ref": "#/$defs/timestamp"
                       },
-                      "drainDeadline": {
-                        "$ref": "#/$defs/timestamp"
+                      "preStopCompletedAt": {
+                        "$ref": "#/$defs/nullableTimestamp"
                       }
                     }
                   }

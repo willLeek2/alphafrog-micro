@@ -50,6 +50,7 @@ class LangchainLinearRunPipelineObservabilityTest {
         AgentRun run = new AgentRun();
         run.setId("run-obs-1");
         run.setUserId("user-1");
+        run.setStatus(world.willfrog.agent.platform.model.AgentRunStatus.RECEIVED);
         run.setExt("""
                 {"captureLlmRequests":true,"prompt_selection":{
                 "schema_version":1,"bundle_version":"default-v1","variant":"control",
@@ -57,6 +58,8 @@ class LangchainLinearRunPipelineObservabilityTest {
                 "reference_date":"2025-02-03"}}
                 """);
         when(runMapper.findById("run-obs-1")).thenReturn(run);
+        when(runMapper.updateStatus("run-obs-1", "user-1",
+                world.willfrog.agent.platform.model.AgentRunStatus.EXECUTING)).thenReturn(1);
         when(eventService.isRunnable("run-obs-1", "user-1")).thenReturn(true);
         when(eventService.extractCaptureLlmRequests(run.getExt())).thenReturn(true);
         when(eventService.extractEndpointName(run.getExt())).thenReturn("openrouter");
@@ -150,6 +153,7 @@ class LangchainLinearRunPipelineObservabilityTest {
         AgentRun run = new AgentRun();
         run.setId("run-prompt-mismatch");
         run.setUserId("user-1");
+        run.setStatus(world.willfrog.agent.platform.model.AgentRunStatus.RECEIVED);
         run.setExt("""
                 {"prompt_selection":{"schema_version":1,"bundle_version":"default-v1",
                 "variant":"control","bundle_digest":"stale-digest",

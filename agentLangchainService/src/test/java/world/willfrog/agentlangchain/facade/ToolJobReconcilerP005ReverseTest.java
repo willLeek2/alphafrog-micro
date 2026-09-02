@@ -254,7 +254,9 @@ class ToolJobReconcilerP005ReverseTest {
         controlService = new LangchainRunControlService(
                 readService, mapper, eventService, stateStore,
                 observabilityService, pipeline, creditSettlementService, anchorService,
-                mock(world.willfrog.agent.platform.event.AgentRunFinalizationService.class));
+                mock(world.willfrog.agent.platform.event.AgentRunFinalizationService.class),
+                () -> new world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity(
+                        "stable", "gen-" + "a".repeat(64)));
 
         ToolJobResumeService resumeService = new ToolJobResumeService(
                 anchorService, redisCache, config, om);
@@ -696,11 +698,10 @@ class ToolJobReconcilerP005ReverseTest {
             throw new UnsupportedOperationException("Not implemented in stub");
         }
 
-        // D11 cancelTask RPC (W2 task #102 — ccmax proto/Gateway 单 writer).
-        // 测试桩不在本波实现 cancelTask；与 PythonSandboxService 接口的其他 RPC 一致，
+        // 测试桩不实现 cancelTask；与 PythonSandboxService 接口的其他 RPC 一致，
         // 抛 UnsupportedOperationException 让任何意外调用立即失败。生产 Gateway 实现遵守
-        // D14 装配依赖（codex a3aee2ad 第 六 节裁定 4），DubboPythonSandboxServiceTriple
-        // 生成的默认 cancelTask 返回 UNIMPLEMENTED，不写假 override。
+        // 既有装配依赖；DubboPythonSandboxServiceTriple 生成的默认 cancelTask 返回
+        // UNIMPLEMENTED，不写假 override。
         @Override
         public CancelTaskResponse cancelTask(CancelTaskRequest request) {
             throw new UnsupportedOperationException("Not implemented in stub");

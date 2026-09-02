@@ -23,8 +23,12 @@ import world.willfrog.alphafrogmicro.agent.idl.CancelAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.DeleteAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.PauseAgentRunRequest;
 import world.willfrog.alphafrogmicro.agent.idl.ResumeAgentRunRequest;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
+import world.willfrog.agentlangchain.deployment.DeploymentGenerationRetirementService;
 
 import java.util.Map;
+import java.util.function.Supplier;
 
 /**
  * Agent run 的生命周期控制服务 —— 取消（cancel）、暂停（pause）、恢复（resume）、删除（delete）。
@@ -71,6 +75,10 @@ public class LangchainRunControlService {
     private final AgentRunCreditSettlementService creditSettlementService;
     private final ToolJobAnchorService anchorService;
     private final AgentRunFinalizationService finalizationService;
+    private final DeploymentIdentityProvider deploymentIdentityProvider;
+
+    @Autowired(required = false)
+    private DeploymentGenerationRetirementService retirementService;
 
     @Autowired(required = false)
     private LangchainSchedulerMetrics schedulerMetrics;
@@ -97,6 +105,13 @@ public class LangchainRunControlService {
      * 已在终态的 run 直接返回当前状态（幂等）。
      */
     public world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage cancelRun(CancelAgentRunRequest request) {
+        return executeWhileGenerationActive(() -> cancelRunWhileActive(request));
+    }
+
+    private world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage cancelRunWhileActive(
+            CancelAgentRunRequest request) {
+        DeploymentIdentity localIdentity = deploymentIdentityProvider.current();
+        requireLocalRun(request.getId(), request.getUserId(), localIdentity);
         AgentRun run = runReadService.requireWritableRun(request.getId(), request.getUserId());
         if (isTerminal(run.getStatus())) {
             return AgentLangchainRunMessageMapper.toRunMessage(run);
@@ -169,18 +184,26 @@ public class LangchainRunControlService {
         if (hasActiveAnchor) {
             // 有活跃进度记录时保留数据库现状，给 finalizer 留住条件更新的前提；这里只更新可观测快照。
             // 终态事件与容量释放完成后，finalizer 才把数据库状态改成 CANCELED。
-            runMapper.updateSnapshot(runId, userId, run.getStatus(), snapshot, false, null);
+            if (runMapper.updateSnapshotForDeploymentIfStatus(
+                    runId, userId, localIdentity.deploymentId(), localIdentity.generationId(),
+                    run.getStatus(), snapshot) != 1) {
+                log.warn("取消快照写入时 Run 状态或部署代际已经变化: runId={}", runId);
+                return AgentLangchainRunMessageMapper.toRunMessage(
+                        restoreRedisAfterLostCancelWrite(runId, userId, localIdentity));
+            }
         } else {
             // 快照+状态+TTL 一条原子写入，带终态栅栏：数据库已是终态（执行刚提交的
             // COMPLETED 等）时返回 0，先落库的终态赢。迟到取消拿不到行时不发
             // CANCELED 事件、不写 Redis 终态、不结算，直接按现状返回——不广播
             // 数据库里不存在的终态。
-            canceledPersisted = runMapper.cancelTerminalSnapshotWithTtl(
-                    runId, userId, snapshot, agentEventService.nextInterruptedExpiresAt()) == 1;
+            canceledPersisted = runMapper.cancelTerminalSnapshotWithTtlForDeployment(
+                    runId, userId, localIdentity.deploymentId(), localIdentity.generationId(),
+                    snapshot, agentEventService.nextInterruptedExpiresAt()) == 1;
             if (!canceledPersisted) {
                 log.warn("CANCELED refused by terminal fence (run already terminal or invisible): "
                         + "runId={} — returning current state without terminal broadcast", runId);
-                AgentRun current = runReadService.requireReadableRun(runId, userId);
+                AgentRun current = restoreRedisAfterLostCancelWrite(
+                        runId, userId, localIdentity);
                 return AgentLangchainRunMessageMapper.toRunMessage(current);
             }
         }
@@ -237,6 +260,13 @@ public class LangchainRunControlService {
      * Run 保持原状。
      */
     public world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage pauseRun(PauseAgentRunRequest request) {
+        return executeWhileGenerationActive(() -> pauseRunWhileActive(request));
+    }
+
+    private world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage pauseRunWhileActive(
+            PauseAgentRunRequest request) {
+        DeploymentIdentity localIdentity = deploymentIdentityProvider.current();
+        requireLocalRun(request.getId(), request.getUserId(), localIdentity);
         AgentRun run = runReadService.requireWritableRun(request.getId(), request.getUserId());
         if (isTerminal(run.getStatus())) {
             return AgentLangchainRunMessageMapper.toRunMessage(run);
@@ -246,9 +276,15 @@ public class LangchainRunControlService {
         }
         String snapshot = agentObservabilityService.attachObservabilityToSnapshot(
                 run.getId(), run.getSnapshotJson(), AgentRunStatus.WAITING);
-        runMapper.updateSnapshot(run.getId(), run.getUserId(), AgentRunStatus.WAITING, snapshot, false, null);
-        runMapper.updateStatusWithTtl(run.getId(), run.getUserId(), AgentRunStatus.WAITING,
+        int paused = runMapper.pauseSnapshotWithTtlForDeployment(
+                run.getId(), run.getUserId(), localIdentity.deploymentId(),
+                localIdentity.generationId(), run.getStatus(), snapshot,
                 agentEventService.nextInterruptedExpiresAt());
+        if (paused != 1) {
+            log.warn("暂停写入时 Run 状态或部署代际已经变化: runId={}", run.getId());
+            return AgentLangchainRunMessageMapper.toRunMessage(requireLocalRun(
+                    run.getId(), run.getUserId(), localIdentity));
+        }
         agentEventService.append(run.getId(), run.getUserId(), "PAUSED", Map.of(
                 "run_id", run.getId(),
                 "engine", "agentLangchainService"));
@@ -261,6 +297,21 @@ public class LangchainRunControlService {
      * 先清除旧 plan 再存入新 plan，然后重置状态为 RECEIVED 异步重新执行。
      */
     public world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage resumeRun(ResumeAgentRunRequest request) {
+        return executeWhileGenerationActive(() -> resumeRunWhileActive(request));
+    }
+
+    private world.willfrog.alphafrogmicro.agent.idl.AgentRunMessage resumeRunWhileActive(
+            ResumeAgentRunRequest request) {
+        DeploymentIdentity localIdentity = deploymentIdentityProvider.current();
+        localIdentity.requireExactMatch(
+                request.getDeploymentId(), request.getDeploymentGenerationId());
+        AgentRun ownedRun = runMapper.findByIdAndUserForDeployment(
+                request.getId(), request.getUserId(), localIdentity.deploymentId(),
+                localIdentity.generationId());
+        if (ownedRun == null) {
+            throw new IllegalStateException("原测试部署已停用");
+        }
+        // 身份归属已经用 SQL 确认，之后才允许读取服务执行既有的过期收敛副作用。
         AgentRun run = runReadService.requireWritableRun(request.getId(), request.getUserId());
         if (run.getStatus() == AgentRunStatus.EXPIRED) {
             throw new IllegalStateException("run expired");
@@ -275,12 +326,20 @@ public class LangchainRunControlService {
             stateStore.storePlanOverride(run.getId(), request.getPlanOverrideJson());
         }
         disposePausedAnchorBeforeResume(run);
-        runMapper.resetForResume(run.getId(), run.getUserId(), agentEventService.nextTtlExpiresAt());
+        if (runMapper.resetForResumeForDeployment(
+                run.getId(), run.getUserId(), localIdentity.deploymentId(),
+                localIdentity.generationId(), agentEventService.nextTtlExpiresAt()) != 1) {
+            throw new IllegalStateException("原测试部署已停用或 Run 状态已变化");
+        }
         agentEventService.append(run.getId(), run.getUserId(), "WORKFLOW_RESUMED", Map.of(
                 "run_id", run.getId(),
                 "engine", "agentLangchainService"));
         stateStore.markRunStatus(run.getId(), AgentRunStatus.RECEIVED.name());
-        AgentRun refreshed = runReadService.requireReadableRun(run.getId(), run.getUserId());
+        AgentRun refreshed = runMapper.findByIdAndUserForDeployment(
+                run.getId(), run.getUserId(), localIdentity.deploymentId(), localIdentity.generationId());
+        if (refreshed == null) {
+            throw new IllegalStateException("恢复领取后无法读取同一部署身份的 Run");
+        }
         // 这一行把 Run 重新交给全局调度闸门：线程池有空位就立刻执行，满了就进有界优先级
         // 队列排队；手动恢复和长工具自动恢复走的是同一个调度入口。调度器和队列都满时
         // 这一行会直接抛「队列已满」异常，调用方收到失败，不会阻塞等待。
@@ -357,6 +416,47 @@ public class LangchainRunControlService {
         }
         log.info("Resume run={}: cleared finalized paused anchor operationId={}",
                 run.getId(), anchor.getOperationId());
+    }
+
+    private AgentRun requireLocalRun(String runId, String userId, DeploymentIdentity localIdentity) {
+        AgentRun run = runMapper.findByIdAndUserForDeployment(
+                runId, userId, localIdentity.deploymentId(), localIdentity.generationId());
+        if (run == null) {
+            throw new IllegalStateException("原测试部署已停用");
+        }
+        return run;
+    }
+
+    /**
+     * 取消请求已经写过 Redis 的 CANCELING，但数据库条件更新输给并发写者时，
+     * 用同一部署代际的数据库现状恢复 Redis，避免把已完成或仍执行的 Run 长期显示为取消中。
+     */
+    private AgentRun restoreRedisAfterLostCancelWrite(
+            String runId, String userId, DeploymentIdentity localIdentity) {
+        AgentRun current = requireLocalRun(runId, userId, localIdentity);
+        if (current.getStatus() != null) {
+            try {
+                stateStore.markRunStatus(runId, current.getStatus().name());
+            } catch (RuntimeException e) {
+                log.warn("取消条件写未命中后恢复 Redis 状态失败: runId={} status={} err={}",
+                        runId, current.getStatus(), e.getMessage());
+            }
+        }
+        return current;
+    }
+
+    private <T> T executeWhileGenerationActive(Supplier<T> operation) {
+        if (retirementService == null) {
+            return operation.get();
+        }
+        try {
+            return retirementService.executeWhileActive(operation);
+        } catch (IllegalStateException e) {
+            if ("deployment_generation_inactive".equals(e.getMessage())) {
+                throw new IllegalStateException("原测试部署已停用", e);
+            }
+            throw e;
+        }
     }
 
     /** COMPLETED / PARTIAL / FAILED / CANCELED / EXPIRED 均为不可逆终态 */

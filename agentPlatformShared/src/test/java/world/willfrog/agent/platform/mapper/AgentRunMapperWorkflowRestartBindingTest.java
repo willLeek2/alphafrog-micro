@@ -10,6 +10,7 @@ import org.apache.ibatis.session.Configuration;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import world.willfrog.agent.platform.model.AgentRunStatus;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 
 import java.io.InputStream;
 import java.lang.reflect.Method;
@@ -28,10 +29,28 @@ class AgentRunMapperWorkflowRestartBindingTest {
 
     private static final List<String> STATEMENTS = List.of(
             "updateExecutionCheckpoint",
-            "listStartupRecoveryCandidates",
-            "claimStartupRestart",
-            "completeStartupCancellation",
-            "failStartupRecovery");
+            "updateExecutionCheckpointForDeployment",
+            "findByIdForDeployment",
+            "findByIdAndUserForDeployment",
+            "updateStatusForDeployment",
+            "updateStatusWithTtlForDeployment",
+            "updatePlanJsonForDeployment",
+            "updateSnapshotForDeploymentIfStatus",
+            "pauseSnapshotWithTtlForDeployment",
+            "updateTerminalSnapshotForDeployment",
+            "cancelTerminalSnapshotWithTtlForDeployment",
+            "updateResumedTerminalForDeployment",
+            "closeRetiredDeploymentRun",
+            "closeNonTerminalRunsForDeployment",
+            "listStartupRecoveryCandidatesForDeployment",
+            "claimStartupRestartForDeployment",
+            "completeStartupCancellationForDeployment",
+            "failStartupRecoveryForDeployment",
+            "admitFollowUpForDeployment",
+            "resetForResumeForDeployment",
+            "listActiveToolJobAnchorsForDeployment",
+            "listResumeReadyAnchorsForDeployment",
+            "listStuckAtCasStatusAnchorsForDeployment");
 
     private Configuration configuration;
     private Map<String, Set<String>> methodParams;
@@ -75,13 +94,18 @@ class AgentRunMapperWorkflowRestartBindingTest {
 
     @Test
     void startupDiscoveryIsBoundedAndExcludesManualWaiting() {
-        MappedStatement statement = statement("listStartupRecoveryCandidates");
+        MappedStatement statement = statement("listStartupRecoveryCandidatesForDeployment");
         assertThat(statement.getSqlCommandType()).isEqualTo(SqlCommandType.SELECT);
         String sql = normalizedSql(statement.getBoundSql(Map.of(
-                "startedBefore", OffsetDateTime.now(), "limit", 100)));
+                "startedBefore", OffsetDateTime.now(),
+                "deploymentId", "stable",
+                "deploymentGenerationId", "gen-" + "a".repeat(64),
+                "limit", 100)));
         assertThat(sql)
                 .contains("started_at < ?")
                 .contains("LIMIT ?")
+                .contains("deployment_id = ?")
+                .contains("deployment_generation_id = ?")
                 .contains("'WAITING_TOOL_JOB'")
                 .contains("'CANCELING'")
                 .doesNotContain("'WAITING'");
@@ -89,8 +113,10 @@ class AgentRunMapperWorkflowRestartBindingTest {
 
     @Test
     void restartClaimIsNarrowCasAndClearsOnlyLegacyToolAnchor() {
-        String sql = normalizedSql(statement("claimStartupRestart").getBoundSql(Map.of(
+        String sql = normalizedSql(statement("claimStartupRestartForDeployment").getBoundSql(Map.of(
                 "id", "run-1",
+                "deploymentId", "stable",
+                "deploymentGenerationId", "gen-" + "a".repeat(64),
                 "expectedStatus", AgentRunStatus.EXECUTING,
                 "expectedRestartAttempt", 0,
                 "maxRestartAttempts", 1)));
@@ -101,19 +127,192 @@ class AgentRunMapperWorkflowRestartBindingTest {
                 .contains("status = ?")
                 .contains("restart_attempt = ?")
                 .contains("restart_attempt < ?")
+                .contains("deployment_id = ?")
+                .contains("deployment_generation_id = ?")
                 .doesNotContain("execution_checkpoint_json = '{}'::jsonb");
     }
 
     @Test
     void cancellationAndFailureHaveExpectedStatusFences() {
-        String cancel = normalizedSql(statement("completeStartupCancellation")
-                .getBoundSql(Map.of("id", "run-1")));
-        String fail = normalizedSql(statement("failStartupRecovery").getBoundSql(Map.of(
+        String cancel = normalizedSql(statement("completeStartupCancellationForDeployment")
+                .getBoundSql(Map.of(
+                        "id", "run-1",
+                        "deploymentId", "stable",
+                        "deploymentGenerationId", "gen-" + "a".repeat(64))));
+        String fail = normalizedSql(statement("failStartupRecoveryForDeployment").getBoundSql(Map.of(
                 "id", "run-1",
+                "deploymentId", "stable",
+                "deploymentGenerationId", "gen-" + "a".repeat(64),
                 "expectedStatus", AgentRunStatus.EXECUTING,
                 "lastError", "invalid")));
-        assertThat(cancel).contains("status = 'CANCELED'", "status = 'CANCELING'");
-        assertThat(fail).contains("status = 'FAILED'", "status = ?", "last_error = ?");
+        assertThat(cancel).contains("status = 'CANCELED'", "status = 'CANCELING'",
+                "deployment_id = ?", "deployment_generation_id = ?");
+        assertThat(fail).contains("status = 'FAILED'", "status = ?", "last_error = ?",
+                "deployment_id = ?", "deployment_generation_id = ?");
+    }
+
+    @Test
+    void userAdmissionAndRecoveryScansAlwaysCompareDeploymentIdentity() {
+        for (String id : List.of(
+                "findByIdForDeployment",
+                "findByIdAndUserForDeployment",
+                "updateStatusForDeployment",
+                "updateStatusWithTtlForDeployment",
+                "updatePlanJsonForDeployment",
+                "updateSnapshotForDeploymentIfStatus",
+                "pauseSnapshotWithTtlForDeployment",
+                "updateExecutionCheckpointForDeployment",
+                "updateTerminalSnapshotForDeployment",
+                "cancelTerminalSnapshotWithTtlForDeployment",
+                "updateResumedTerminalForDeployment",
+                "closeRetiredDeploymentRun",
+                "closeNonTerminalRunsForDeployment",
+                "admitFollowUpForDeployment",
+                "resetForResumeForDeployment",
+                "listActiveToolJobAnchorsForDeployment",
+                "listResumeReadyAnchorsForDeployment",
+                "listStuckAtCasStatusAnchorsForDeployment")) {
+            Map<String, Object> parameters = dummyParameters(methodParams.get(id));
+            String sql = normalizedSql(statement(id).getBoundSql(parameters));
+            assertThat(sql).as(id)
+                    .contains("deployment_id = ?")
+                    .contains("deployment_generation_id = ?");
+        }
+    }
+
+    @Test
+    void retirementWritesAnExplicitTerminalStateWithoutChangingIdentity() {
+        String single = normalizedSql(statement("closeRetiredDeploymentRun")
+                .getBoundSql(dummyParameters(methodParams.get("closeRetiredDeploymentRun"))));
+        String generation = normalizedSql(statement("closeNonTerminalRunsForDeployment")
+                .getBoundSql(dummyParameters(methodParams.get("closeNonTerminalRunsForDeployment"))));
+
+        assertThat(single)
+                .contains("CASE WHEN status = 'CANCELING' THEN 'CANCELED' ELSE 'FAILED' END")
+                .contains("deployment_generation_inactive")
+                .contains("status IN ('RECEIVED', 'PLANNING', 'EXECUTING', 'SUMMARIZING', 'WAITING_TOOL_JOB', 'WAITING', 'CANCELING')")
+                .doesNotContain("SET deployment_id")
+                .doesNotContain("SET deployment_generation_id");
+        assertThat(generation)
+                .contains("deployment_id = ?")
+                .contains("deployment_generation_id = ?")
+                .contains("completed_at = CURRENT_TIMESTAMP")
+                .doesNotContain("SET deployment_id")
+                .doesNotContain("SET deployment_generation_id");
+    }
+
+    @Test
+    void ordinaryPipelineWritesCompareDeploymentAndExactSourceStatus() {
+        for (String id : List.of(
+                "updateStatusForDeployment",
+                "updateStatusWithTtlForDeployment",
+                "updatePlanJsonForDeployment",
+                "updateExecutionCheckpointForDeployment",
+                "updateTerminalSnapshotForDeployment")) {
+            String sql = normalizedSql(statement(id)
+                    .getBoundSql(dummyParameters(methodParams.get(id))));
+            assertThat(sql).as(id)
+                    .contains("deployment_id = ?")
+                    .contains("deployment_generation_id = ?")
+                    .contains("status = ?")
+                    .doesNotContain("status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')");
+        }
+
+        String resumed = normalizedSql(statement("updateResumedTerminalForDeployment")
+                .getBoundSql(dummyParameters(methodParams.get("updateResumedTerminalForDeployment"))));
+        assertThat(resumed)
+                .contains("deployment_id = ?")
+                .contains("deployment_generation_id = ?")
+                .contains("status = 'EXECUTING'")
+                .contains("resumeToken")
+                .contains("resumeLeaseVersion")
+                .contains("resumeLauncherOwnerId");
+    }
+
+    @Test
+    void cancelAndPauseControlWritesAreAtomicAndGenerationFenced() {
+        String snapshot = normalizedSql(statement("updateSnapshotForDeploymentIfStatus")
+                .getBoundSql(dummyParameters(methodParams.get("updateSnapshotForDeploymentIfStatus"))));
+        String pause = normalizedSql(statement("pauseSnapshotWithTtlForDeployment")
+                .getBoundSql(dummyParameters(methodParams.get("pauseSnapshotWithTtlForDeployment"))));
+        String cancel = normalizedSql(statement("cancelTerminalSnapshotWithTtlForDeployment")
+                .getBoundSql(dummyParameters(methodParams.get("cancelTerminalSnapshotWithTtlForDeployment"))));
+
+        assertThat(snapshot)
+                .contains("snapshot_json = CAST(? AS jsonb)")
+                .contains("deployment_id = ?", "deployment_generation_id = ?", "status = ?");
+        assertThat(pause)
+                .contains("status = 'WAITING'")
+                .contains("snapshot_json = CAST(? AS jsonb)")
+                .contains("ttl_expires_at = ?")
+                .contains("deployment_id = ?", "deployment_generation_id = ?", "status = ?")
+                .contains("status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')");
+        assertThat(cancel)
+                .contains("status = 'CANCELED'")
+                .contains("snapshot_json = CAST(? AS jsonb)")
+                .contains("ttl_expires_at = ?")
+                .contains("deployment_id = ?", "deployment_generation_id = ?")
+                .contains("status NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELED', 'EXPIRED')");
+    }
+
+    @Test
+    void everyToolJobCompareAndSetCanBindTheLocalDeploymentFence() {
+        List<String> statements = List.of(
+                "updateToolJobAnchor",
+                "updateToolJobAnchorAndStatus",
+                "claimPreparingToolJobAnchor",
+                "persistCancelDisposition",
+                "persistPauseDisposition",
+                "clearPausedToolJobAnchor",
+                "persistRepairAttempt",
+                "claimPreparingToolJobAnchorFromResume",
+                "updateActiveToolJobAnchor",
+                "updateLiveDagBlockingToolJobAnchor",
+                "beginLiveDagBlockingPreparingAbort",
+                "claimLiveDagBlockingPreparingAbortCleanup",
+                "completeLiveDagBlockingPreparingAbort",
+                "updateToolJobAnchorAndStatusByOperation",
+                "cancelToolJobAnchorFromStatuses",
+                "closeResidualCanceledAnchorOnTerminalRun",
+                "clearActiveToolJobAnchor",
+                "promoteExpiredDagBlockingWorkerLost",
+                "updateDagCleanupToolJobAnchor",
+                "clearSynchronouslyCompletedToolJobAnchor",
+                "clearLiveDagBlockingSynchronouslyCompletedToolJobAnchor",
+                "updateDagCleanupPreparingToolJobAnchor",
+                "completeDagCleanupAndClearToolJobAnchor",
+                "markToolJobCheckpointFailed",
+                "markToolJobCheckpointFailurePending",
+                "clearToolJobCheckpointFailurePending",
+                "casUpdateStatus",
+                "promoteCasStatusToResumeReady",
+                "casUpdateAnchorResumeState",
+                "casUpdateAnchorResumeStateAndStatus",
+                "claimResumeLauncher",
+                "takeoverExpiredResumeLauncher",
+                "heartbeatResumeLauncher",
+                "acceptResumeHandoff",
+                "clearAcceptedResumeHandoff",
+                "updateToolJobCheckpoint",
+                "clearToolJobAnchorWithToken");
+        Map<String, Object> parameters = new HashMap<>();
+        parameters.put("deploymentIdentity",
+                new DeploymentIdentity("beta-a", "gen-" + "a".repeat(64)));
+
+        for (String id : statements) {
+            String sql = normalizedSql(statement(id).getBoundSql(parameters));
+            assertThat(sql).as(id)
+                    .contains("deployment_id = ?")
+                    .contains("deployment_generation_id = ?");
+        }
+    }
+
+    @Test
+    void legacyToolJobTestOverloadDoesNotAddAnUnknownDeploymentParameter() {
+        String sql = normalizedSql(statement("updateToolJobAnchor").getBoundSql(Map.of()));
+        assertThat(sql)
+                .doesNotContain("deployment_id = ?")
+                .doesNotContain("deployment_generation_id = ?");
     }
 
     private MappedStatement statement(String id) {
@@ -127,6 +326,10 @@ class AgentRunMapperWorkflowRestartBindingTest {
         for (String name : names) {
             values.put(name, switch (name) {
                 case "startedBefore" -> OffsetDateTime.now();
+                case "ttlExpiresAt" -> OffsetDateTime.now();
+                case "deploymentId" -> "stable";
+                case "deploymentGenerationId" -> "gen-" + "a".repeat(64);
+                case "status" -> AgentRunStatus.EXECUTING;
                 case "expectedStatus" -> AgentRunStatus.EXECUTING;
                 case "limit", "expectedRestartAttempt", "maxRestartAttempts" -> 1;
                 default -> "value";

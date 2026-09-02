@@ -2,7 +2,7 @@ package world.willfrog.agentlangchain.workspace;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
@@ -49,7 +49,8 @@ import java.util.concurrent.atomic.AtomicReference;
 @Component
 // 260814 scheduler-03: workspace export 总开关默认关闭；关闭时本观察者不注册，
 // 没有 @Scheduled 定时线程。
-@ConditionalOnProperty(name = "agent.workspace.export-enabled", havingValue = "true", matchIfMissing = false)
+@ConditionalOnExpression("${agent.workspace.export-enabled:false}"
+        + " && !${agent.deployment.retirement-only:false}")
 @RequiredArgsConstructor
 @Slf4j
 public class WorkspacePollingObserver {

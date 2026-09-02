@@ -29,7 +29,8 @@
     },
     "manifestVersion": {
       "type": "integer",
-      "minimum": 1
+      "minimum": 1,
+      "maximum": 9007199254740991
     },
     "gitCommit": {
       "type": "string",
@@ -187,6 +188,7 @@
         "hostPorts",
         "healthCheckProfile",
         "readinessTimeoutSeconds",
+        "preStopPolicy",
         "shutdownProfile",
         "applicationDrainSeconds",
         "drainGraceSeconds"
@@ -211,6 +213,12 @@
           "type": "integer",
           "minimum": 1,
           "maximum": 3600
+        },
+        "preStopPolicy": {
+          "enum": [
+            "NONE",
+            "AGENT_RETIRE_GENERATION_V1"
+          ]
         },
         "shutdownProfile": {
           "enum": [

@@ -3,7 +3,7 @@ package world.willfrog.agentlangchain.tooljob;
 import org.apache.dubbo.config.annotation.DubboReference;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
@@ -31,10 +31,8 @@ import java.util.Set;
  * 由进程内 ToolJobContinuationTracker 承担发现职责，避免两套机制接管同一个 Run。</p>
  */
 @Service
-@ConditionalOnProperty(
-        name = "agent.tool-job.durable-recovery-enabled",
-        havingValue = "true",
-        matchIfMissing = false)
+@ConditionalOnExpression("${agent.tool-job.durable-recovery-enabled:false}"
+        + " && !${agent.deployment.retirement-only:false}")
 public class ToolJobReconciler {
 
     private static final Logger log = LoggerFactory.getLogger(ToolJobReconciler.class);

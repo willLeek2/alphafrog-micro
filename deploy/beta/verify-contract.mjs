@@ -32,6 +32,28 @@ function serviceDigest(service) {
   return digest(input);
 }
 
+function deploymentGenerationFromParts(manifestVersion, gitCommit, serviceImages) {
+  const lines = [
+    'alphafrog-deployment-generation-v1',
+    `manifest-version:${manifestVersion}`,
+    `git-commit:${gitCommit}`
+  ];
+  for (const [serviceName, imageReference] of Object.entries(serviceImages)
+    .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)) {
+    lines.push(`service:${serviceName}\0${imageReference}`);
+  }
+  const bytes = `${lines.join('\n')}\n`;
+  return `gen-${crypto.createHash('sha256').update(bytes, 'utf8').digest('hex')}`;
+}
+
+function deploymentGeneration(manifestValue) {
+  return deploymentGenerationFromParts(
+    manifestValue.manifestVersion,
+    manifestValue.gitCommit,
+    Object.fromEntries(manifestValue.services.map(service => [service.serviceName, service.image.repositoryDigest]))
+  );
+}
+
 function assert(condition, message) {
   contractChecks++;
   if (!condition) throw new Error(message);
@@ -98,6 +120,7 @@ const manifest = {
       hostPorts: [28080, 28081],
       healthCheckProfile: 'CONTROLLER_TCP_V1',
       readinessTimeoutSeconds: 120,
+      preStopPolicy: 'AGENT_RETIRE_GENERATION_V1',
       shutdownProfile: 'SPRING_BOOT_HTTP_DUBBO_V1',
       applicationDrainSeconds: 55,
       drainGraceSeconds: 60
@@ -114,6 +137,9 @@ const manifest = {
 manifest.services[0].serviceSpecSha256 = serviceDigest(manifest.services[0]);
 const targetSpec = manifest.services[0].serviceSpecSha256;
 const manifestSha256 = digest(manifest);
+const expectedManifestSha256 = 'cce91891dc152cbc64b78e068fd2303c7c451b783f147c95135390fdbb28b73d';
+const targetGeneration = deploymentGeneration(manifest);
+const previousGeneration = `gen-${repeated('8')}`;
 
 const toolsServiceSpec = clone(manifest.services[0]);
 toolsServiceSpec.serviceName = 'agent-tools-service';
@@ -123,14 +149,16 @@ toolsServiceSpec.image.repositoryDigest = `registry.local/agent-tools-service@sh
 toolsServiceSpec.image.localImageId = `sha256:${repeated('f')}`;
 toolsServiceSpec.runtime.containerPort = 18081;
 toolsServiceSpec.runtime.hostPorts = [28180, 28181];
+toolsServiceSpec.runtime.preStopPolicy = 'NONE';
 toolsServiceSpec.registration.serviceName = 'com.alphafrog.AgentToolsService:1.0@@providers';
 toolsServiceSpec.serviceSpecSha256 = serviceDigest(toolsServiceSpec);
 const toolsTargetSpec = toolsServiceSpec.serviceSpecSha256;
 const twoServiceManifest = clone(manifest);
 twoServiceManifest.services.push(toolsServiceSpec);
 const twoServiceManifestSha256 = digest(twoServiceManifest);
+const twoServiceGeneration = deploymentGeneration(twoServiceManifest);
 
-function registration(instanceId, releaseId, port, selectable, registeredServiceName = 'com.alphafrog.AgentService:1.0@@providers') {
+function registration(instanceId, releaseId, generationId, port, selectable, registeredServiceName = 'com.alphafrog.AgentService:1.0@@providers') {
   return {
     serviceName: registeredServiceName,
     groupName: 'DEFAULT_GROUP',
@@ -146,16 +174,23 @@ function registration(instanceId, releaseId, port, selectable, registeredService
     metadata: {
       'alphafrog.traffic-scope-id': 'main-beta',
       'alphafrog.release-id': releaseId,
+      'alphafrog.deployment-generation-id': generationId,
       'alphafrog.instance-id': instanceId
     }
   };
 }
 
-function baseInstance(instanceId, releaseId, version, spec, slot, port, selectable = true, registeredServiceName) {
+function baseInstance(instanceId, releaseId, generationId, version, spec, slot, port, selectable = true,
+  registeredServiceName = 'com.alphafrog.AgentService:1.0@@providers', runtimeFacts = manifest.services[0].runtime) {
   return {
     instanceId,
     machineId: 'beta-machine-1',
     releaseId,
+    deploymentGenerationId: generationId,
+    preStopPolicy: runtimeFacts.preStopPolicy,
+    shutdownProfile: runtimeFacts.shutdownProfile,
+    applicationDrainSeconds: runtimeFacts.applicationDrainSeconds,
+    drainGraceSeconds: runtimeFacts.drainGraceSeconds,
     manifestVersion: version,
     serviceSpecSha256: spec,
     containerName: `af-${instanceId}`,
@@ -163,36 +198,39 @@ function baseInstance(instanceId, releaseId, version, spec, slot, port, selectab
     portSlot: slot,
     hostPort: port,
     endpoint: {address: '10.0.0.8', port},
-    registration: registration(instanceId, releaseId, port, selectable, registeredServiceName)
+    registration: registration(instanceId, releaseId, generationId, port, selectable, registeredServiceName)
   };
 }
 
-const oldActive = baseInstance('instance-old', 'release-1', 1, repeated('d'), 'A', 28080);
-const newActive = baseInstance('instance-new', 'release-2', 2, targetSpec, 'B', 28081);
-const newDisabled = baseInstance('instance-new', 'release-2', 2, targetSpec, 'B', 28081, false);
+const previousAgentRuntime = {...manifest.services[0].runtime, applicationDrainSeconds: 40, drainGraceSeconds: 45};
+const oldActive = baseInstance('instance-old', 'release-1', previousGeneration, 1, repeated('d'), 'A', 28080, true,
+  'com.alphafrog.AgentService:1.0@@providers', previousAgentRuntime);
+const newActive = baseInstance('instance-new', 'release-2', targetGeneration, 2, targetSpec, 'B', 28081);
+const newDisabled = baseInstance('instance-new', 'release-2', targetGeneration, 2, targetSpec, 'B', 28081, false);
 const candidateStarting = {...newDisabled, readiness: 'STARTING', readinessObservedAt: null, readinessDeadline: '2026-09-01T00:02:00Z'};
 const candidateReady = {...newDisabled, readiness: 'READY', readinessObservedAt: '2026-09-01T00:01:00Z', readinessDeadline: '2026-09-01T00:02:00Z'};
-const oldDrainingSelectable = {...clone(oldActive), drainStartedAt: '2026-09-01T00:02:00Z', drainDeadline: '2026-09-01T00:03:00Z'};
+const oldDrainingSelectable = {...clone(oldActive), trafficRemovedAt: '2026-09-01T00:02:00Z', stopSignalRequestedAt: null, stopDeadline: null, preStopCompletedAt: null};
 const oldDisabled = clone(oldDrainingSelectable);
 oldDisabled.registration.enabled = false;
 oldDisabled.registration.weight = 0;
-const newDisabledDraining = {...clone(newActive), drainStartedAt: '2026-09-01T00:02:00Z', drainDeadline: '2026-09-01T00:03:00Z'};
+const newDisabledDraining = {...clone(newActive), trafficRemovedAt: '2026-09-01T00:02:00Z', stopSignalRequestedAt: null, stopDeadline: null, preStopCompletedAt: null};
 newDisabledDraining.registration.enabled = false;
 newDisabledDraining.registration.weight = 0;
-const toolsOldActive = baseInstance('tools-instance-old', 'tools-release-1', 1, repeated('9'), 'A', 28180, true, 'com.alphafrog.AgentToolsService:1.0@@providers');
-const toolsNewActive = baseInstance('tools-instance-new', 'tools-release-2', 2, toolsTargetSpec, 'B', 28181, true, 'com.alphafrog.AgentToolsService:1.0@@providers');
+const toolsOldActive = baseInstance('tools-instance-old', 'tools-release-1', previousGeneration, 1, repeated('9'), 'A', 28180, true, 'com.alphafrog.AgentToolsService:1.0@@providers', toolsServiceSpec.runtime);
+const toolsNewActive = baseInstance('tools-instance-new', 'tools-release-2', twoServiceGeneration, 2, toolsTargetSpec, 'B', 28181, true, 'com.alphafrog.AgentToolsService:1.0@@providers', toolsServiceSpec.runtime);
 
 const routeOld = {
   defaultInstanceId: 'instance-old',
   defaultReleaseId: 'release-1',
+  defaultDeploymentGenerationId: previousGeneration,
   routeVersion: 7,
   updatedAt: '2026-09-01T00:00:00Z'
 };
-const routeNewStable = {...routeOld, defaultInstanceId: 'instance-new', defaultReleaseId: 'release-2', routeVersion: 8, updatedAt: '2026-09-01T00:02:00Z'};
-const routeNone = {...routeOld, defaultInstanceId: null, defaultReleaseId: null, routeVersion: 0};
+const routeNewStable = {...routeOld, defaultInstanceId: 'instance-new', defaultReleaseId: 'release-2', defaultDeploymentGenerationId: targetGeneration, routeVersion: 8, updatedAt: '2026-09-01T00:02:00Z'};
+const routeNone = {...routeOld, defaultInstanceId: null, defaultReleaseId: null, defaultDeploymentGenerationId: null, routeVersion: 0};
 const routeNoneAfterDelete = {...routeNone, routeVersion: 9, updatedAt: '2026-09-01T00:02:00Z'};
-const toolsRouteOld = {...routeOld, defaultInstanceId: toolsOldActive.instanceId, defaultReleaseId: toolsOldActive.releaseId, routeVersion: 4};
-const toolsRouteNew = {...routeNewStable, defaultInstanceId: toolsNewActive.instanceId, defaultReleaseId: toolsNewActive.releaseId, routeVersion: 5};
+const toolsRouteOld = {...routeOld, defaultInstanceId: toolsOldActive.instanceId, defaultReleaseId: toolsOldActive.releaseId, defaultDeploymentGenerationId: toolsOldActive.deploymentGenerationId, routeVersion: 4};
+const toolsRouteNew = {...routeNewStable, defaultInstanceId: toolsNewActive.instanceId, defaultReleaseId: toolsNewActive.releaseId, defaultDeploymentGenerationId: toolsNewActive.deploymentGenerationId, routeVersion: 5};
 
 function operation(type, phase, candidateInstanceId) {
   return {operationId: `op-${type.toLowerCase()}-${phase.toLowerCase()}`, type, phase, candidateInstanceId, startedAt: '2026-09-01T00:00:00Z'};
@@ -246,11 +284,26 @@ function state(serviceState, deploymentOverrides = {}) {
 }
 
 function twoServiceState(firstService, secondService, deploymentOverrides = {}) {
-  return state(firstService, {
+  const serviceStates = clone([firstService, secondService]);
+  const result = state(serviceStates[0], {
     manifestSha256: twoServiceManifestSha256,
-    services: [firstService, secondService],
+    services: serviceStates,
     ...deploymentOverrides
   });
+  for (const serviceState of result.deployments[0].services) {
+    for (const instance of [serviceState.activeInstance, serviceState.candidateInstance, serviceState.drainingInstance].filter(Boolean)) {
+      if (instance.manifestVersion === twoServiceManifest.manifestVersion) {
+        instance.deploymentGenerationId = twoServiceGeneration;
+        instance.registration.metadata['alphafrog.deployment-generation-id'] = twoServiceGeneration;
+      }
+    }
+    if (serviceState.route.defaultInstanceId !== null) {
+      const routed = [serviceState.activeInstance, serviceState.candidateInstance, serviceState.drainingInstance]
+        .find(instance => instance?.instanceId === serviceState.route.defaultInstanceId);
+      if (routed) serviceState.route.defaultDeploymentGenerationId = routed.deploymentGenerationId;
+    }
+  }
+  return result;
 }
 
 function toolsService(overrides = {}) {
@@ -296,6 +349,20 @@ function customErrors(manifestValue, stateValue) {
   const errors = [];
   const specByName = new Map();
   const reservedPorts = new Set();
+  const expectedGeneration = deploymentGeneration(manifestValue);
+  const checkTargetInstance = (instance, spec, role) => {
+    if (!instance || !spec) return;
+    if (instance.manifestVersion !== manifestValue.manifestVersion) errors.push(`${role} manifest version ${instance.instanceId}`);
+    if (instance.serviceSpecSha256 !== spec.serviceSpecSha256) errors.push(`${role} service digest ${instance.instanceId}`);
+    if (instance.releaseId !== spec.releaseId) errors.push(`${role} release ${instance.instanceId}`);
+    if (instance.deploymentGenerationId !== expectedGeneration) errors.push(`${role} deployment generation ${instance.instanceId}`);
+    if (instance.preStopPolicy !== spec.runtime.preStopPolicy) errors.push(`${role} pre-stop policy ${instance.instanceId}`);
+    if (instance.shutdownProfile !== spec.runtime.shutdownProfile
+        || instance.applicationDrainSeconds !== spec.runtime.applicationDrainSeconds
+        || instance.drainGraceSeconds !== spec.runtime.drainGraceSeconds) {
+      errors.push(`${role} shutdown policy ${instance.instanceId}`);
+    }
+  };
   if (Date.parse(manifestValue.expiresAt) <= Date.parse(manifestValue.createdAt)) errors.push('manifest expiry');
   for (const spec of manifestValue.services) {
     if (specByName.has(spec.serviceName)) errors.push(`duplicate manifest service ${spec.serviceName}`);
@@ -328,9 +395,17 @@ function customErrors(manifestValue, stateValue) {
       if (item.operation) operationCount++;
       const spec = specByName.get(item.serviceName);
       if (!spec) errors.push(`state service missing from manifest ${item.serviceName}`);
+      if (spec && item.activeInstance?.preStopPolicy === 'AGENT_RETIRE_GENERATION_V1'
+          && spec.runtime.preStopPolicy !== 'AGENT_RETIRE_GENERATION_V1') {
+        errors.push(`agent pre-stop policy downgrade ${item.serviceName}`);
+      }
       if (spec && item.targetManifestVersion !== manifestValue.manifestVersion) errors.push(`target manifest version ${item.serviceName}`);
       if (spec && item.targetServiceSpecSha256 !== spec.serviceSpecSha256) errors.push(`target service digest ${item.serviceName}`);
       if ((item.failedManifestVersion === null) !== (item.lastError === null)) errors.push(`failure fields pair ${item.serviceName}`);
+      checkTargetInstance(item.candidateInstance, spec, 'candidate');
+      if (item.operation?.phase === 'DRAINING_PREVIOUS') {
+        checkTargetInstance(item.activeInstance, spec, 'post-switch active');
+      }
       const roleSlots = new Set();
       for (const instance of [item.activeInstance, item.candidateInstance, item.drainingInstance].filter(Boolean)) {
         if (instanceIds.has(instance.instanceId)) errors.push(`duplicate instance ${instance.instanceId}`);
@@ -342,9 +417,28 @@ function customErrors(manifestValue, stateValue) {
         const registrationValue = instance.registration;
         if (registrationValue.metadata['alphafrog.traffic-scope-id'] !== deployment.trafficScopeId) errors.push(`scope metadata ${instance.instanceId}`);
         if (registrationValue.metadata['alphafrog.release-id'] !== instance.releaseId) errors.push(`release metadata ${instance.instanceId}`);
+        if (registrationValue.metadata['alphafrog.deployment-generation-id'] !== instance.deploymentGenerationId) errors.push(`generation metadata ${instance.instanceId}`);
         if (registrationValue.metadata['alphafrog.instance-id'] !== instance.instanceId) errors.push(`instance metadata ${instance.instanceId}`);
         if (registrationValue.port !== instance.hostPort || instance.endpoint.port !== instance.hostPort) errors.push(`endpoint ${instance.instanceId}`);
         if (spec && !spec.runtime.hostPorts.includes(instance.hostPort)) errors.push(`port slot ${instance.instanceId}`);
+        if (spec && instance.manifestVersion === manifestValue.manifestVersion
+            && instance.serviceSpecSha256 === spec.serviceSpecSha256
+            && instance.deploymentGenerationId !== expectedGeneration) {
+          errors.push(`deployment generation ${instance.instanceId}`);
+        }
+        if (spec && instance.manifestVersion === manifestValue.manifestVersion
+            && instance.serviceSpecSha256 === spec.serviceSpecSha256
+            && instance.preStopPolicy !== spec.runtime.preStopPolicy) {
+          errors.push(`pre-stop policy ${instance.instanceId}`);
+        }
+        if (spec && instance.manifestVersion === manifestValue.manifestVersion
+            && instance.serviceSpecSha256 === spec.serviceSpecSha256
+            && (instance.shutdownProfile !== spec.runtime.shutdownProfile
+              || instance.applicationDrainSeconds !== spec.runtime.applicationDrainSeconds
+              || instance.drainGraceSeconds !== spec.runtime.drainGraceSeconds)) {
+          errors.push(`shutdown policy ${instance.instanceId}`);
+        }
+        if (instance.applicationDrainSeconds + 5 > instance.drainGraceSeconds) errors.push(`instance drain reserve ${instance.instanceId}`);
       }
       if (item.activeInstance && (!item.activeInstance.registration.enabled || item.activeInstance.registration.weight !== 1 || !item.activeInstance.registration.healthy)) errors.push(`active not selectable ${item.serviceName}`);
       if (item.candidateInstance && (item.candidateInstance.registration.enabled || item.candidateInstance.registration.weight !== 0)) errors.push(`candidate selectable ${item.serviceName}`);
@@ -352,18 +446,39 @@ function customErrors(manifestValue, stateValue) {
       if (item.drainingInstance) {
         const {enabled, weight} = item.drainingInstance.registration;
         if (!((enabled && weight === 1) || (!enabled && weight === 0))) errors.push(`draining registration pair ${item.serviceName}`);
+        if (item.drainingInstance.preStopCompletedAt !== null && enabled) errors.push(`pre-stop before registration disabled ${item.serviceName}`);
+        if (item.drainingInstance.preStopCompletedAt !== null
+            && Date.parse(item.drainingInstance.preStopCompletedAt) < Date.parse(item.drainingInstance.trafficRemovedAt)) {
+          errors.push(`pre-stop before drain ${item.serviceName}`);
+        }
+        if ((item.drainingInstance.stopSignalRequestedAt === null) !== (item.drainingInstance.stopDeadline === null)) {
+          errors.push(`stop timing pair ${item.serviceName}`);
+        }
+        if (item.drainingInstance.stopSignalRequestedAt !== null) {
+          if (item.drainingInstance.preStopCompletedAt === null) errors.push(`stop before pre-stop ${item.serviceName}`);
+          if (Date.parse(item.drainingInstance.stopSignalRequestedAt) < Date.parse(item.drainingInstance.preStopCompletedAt)) errors.push(`stop timing order ${item.serviceName}`);
+          if (Date.parse(item.drainingInstance.stopDeadline) <= Date.parse(item.drainingInstance.stopSignalRequestedAt)) errors.push(`stop deadline ${item.serviceName}`);
+          if (Date.parse(item.drainingInstance.stopDeadline) - Date.parse(item.drainingInstance.stopSignalRequestedAt)
+              !== item.drainingInstance.drainGraceSeconds * 1000) errors.push(`stop grace ${item.serviceName}`);
+        }
       }
       if (item.operation?.phase === 'DRAINING_PREVIOUS') {
-        if (item.route.defaultInstanceId !== item.activeInstance?.instanceId || item.route.defaultReleaseId !== item.activeInstance?.releaseId) errors.push(`draining route ${item.serviceName}`);
-        if (item.drainingInstance?.drainStartedAt !== item.route.updatedAt) errors.push(`draining switch time ${item.serviceName}`);
+        if (item.route.defaultInstanceId !== item.activeInstance?.instanceId
+            || item.route.defaultReleaseId !== item.activeInstance?.releaseId
+            || item.route.defaultDeploymentGenerationId !== item.activeInstance?.deploymentGenerationId) errors.push(`draining route ${item.serviceName}`);
+        if (item.drainingInstance?.trafficRemovedAt !== item.route.updatedAt) errors.push(`draining switch time ${item.serviceName}`);
       }
       if (item.operation?.phase === 'DRAINING_ACTIVE') {
-        if (item.route.defaultInstanceId !== null || item.route.defaultReleaseId !== null) errors.push(`delete route ${item.serviceName}`);
-        if (item.drainingInstance?.drainStartedAt !== item.route.updatedAt) errors.push(`delete switch time ${item.serviceName}`);
+        if (item.route.defaultInstanceId !== null || item.route.defaultReleaseId !== null
+            || item.route.defaultDeploymentGenerationId !== null) errors.push(`delete route ${item.serviceName}`);
+        if (item.drainingInstance?.trafficRemovedAt !== item.route.updatedAt) errors.push(`delete switch time ${item.serviceName}`);
       }
       if (item.lastError?.recoveryClass === 'DELETE_RETRYABLE' && item.lastError.failedOperationType !== 'DELETE') errors.push(`delete recovery class ${item.serviceName}`);
       if (item.lastError?.recoveryClass === 'CLEAN_RETRYABLE' && item.lastError.failedOperationType === 'DELETE') errors.push(`clean recovery class ${item.serviceName}`);
-      if (item.phase === 'STABLE' && item.activeInstance && (item.route.defaultInstanceId !== item.activeInstance.instanceId || item.route.defaultReleaseId !== item.activeInstance.releaseId)) errors.push(`stable route ${item.serviceName}`);
+      if (item.phase === 'STABLE' && item.activeInstance
+          && (item.route.defaultInstanceId !== item.activeInstance.instanceId
+            || item.route.defaultReleaseId !== item.activeInstance.releaseId
+            || item.route.defaultDeploymentGenerationId !== item.activeInstance.deploymentGenerationId)) errors.push(`stable route ${item.serviceName}`);
     }
     if (deployment.services.some(item => item.lastError !== null) && deployment.services.some(item => item.operation !== null)) errors.push(`operation while deployment failure is paused ${deployment.deploymentId}`);
     if (deployment.phase === 'ACTIVE' && stateServiceNames.size !== specByName.size) errors.push(`active deployment service set ${deployment.deploymentId}`);
@@ -413,6 +528,18 @@ try {
   const mutableImage = clone(manifest);
   mutableImage.services[0].image.repositoryDigest = 'registry.local/agent-service:latest';
   invalidFixtures.push(['manifest-mutable-image', manifestSchema, mutableImage]);
+  const unsupportedPreStop = clone(manifest);
+  unsupportedPreStop.services[0].runtime.preStopPolicy = 'RUN_ARBITRARY_SCRIPT';
+  invalidFixtures.push(['manifest-unsupported-pre-stop', manifestSchema, unsupportedPreStop]);
+  const missingDeploymentGeneration = clone(positiveStates.stable);
+  delete missingDeploymentGeneration.deployments[0].services[0].activeInstance.deploymentGenerationId;
+  invalidFixtures.push(['state-missing-deployment-generation', stateSchema, missingDeploymentGeneration]);
+  const missingRouteGeneration = clone(positiveStates.stable);
+  delete missingRouteGeneration.deployments[0].services[0].route.defaultDeploymentGenerationId;
+  invalidFixtures.push(['state-missing-route-generation', stateSchema, missingRouteGeneration]);
+  const missingPreStopCheckpoint = clone(positiveStates.updateDraining);
+  delete missingPreStopCheckpoint.deployments[0].services[0].drainingInstance.preStopCompletedAt;
+  invalidFixtures.push(['state-missing-pre-stop-checkpoint', stateSchema, missingPreStopCheckpoint]);
   const obsoleteRouteLease = clone(manifest);
   obsoleteRouteLease.services[0].runtime.routeLeaseSeconds = 30;
   invalidFixtures.push(['manifest-obsolete-route-lease', manifestSchema, obsoleteRouteLease]);
@@ -438,16 +565,70 @@ try {
   selectableCandidate.deployments[0].services[0].candidateInstance.registration.enabled = true;
   selectableCandidate.deployments[0].services[0].candidateInstance.registration.weight = 1;
   customNegatives.push(['candidate selectable', manifest, selectableCandidate]);
+  const staleCandidateTarget = clone(positiveStates.updateSwitching);
+  const staleCandidate = staleCandidateTarget.deployments[0].services[0].candidateInstance;
+  staleCandidate.manifestVersion = 1;
+  staleCandidate.serviceSpecSha256 = repeated('d');
+  staleCandidate.releaseId = 'release-1';
+  staleCandidate.deploymentGenerationId = previousGeneration;
+  staleCandidate.preStopPolicy = previousAgentRuntime.preStopPolicy;
+  staleCandidate.shutdownProfile = previousAgentRuntime.shutdownProfile;
+  staleCandidate.applicationDrainSeconds = previousAgentRuntime.applicationDrainSeconds;
+  staleCandidate.drainGraceSeconds = previousAgentRuntime.drainGraceSeconds;
+  staleCandidate.registration.metadata['alphafrog.release-id'] = staleCandidate.releaseId;
+  staleCandidate.registration.metadata['alphafrog.deployment-generation-id'] = staleCandidate.deploymentGenerationId;
+  runAjv('validate', stateSchema, writeFixture('state-stale-candidate-target', staleCandidateTarget), true);
+  customNegatives.push(['candidate target mismatch', manifest, staleCandidateTarget]);
+  const stalePostSwitchTarget = clone(positiveStates.updateDraining);
+  const stalePostSwitchActive = stalePostSwitchTarget.deployments[0].services[0].activeInstance;
+  stalePostSwitchActive.manifestVersion = 1;
+  stalePostSwitchActive.serviceSpecSha256 = repeated('d');
+  stalePostSwitchActive.releaseId = 'release-1';
+  stalePostSwitchActive.deploymentGenerationId = previousGeneration;
+  stalePostSwitchActive.preStopPolicy = previousAgentRuntime.preStopPolicy;
+  stalePostSwitchActive.shutdownProfile = previousAgentRuntime.shutdownProfile;
+  stalePostSwitchActive.applicationDrainSeconds = previousAgentRuntime.applicationDrainSeconds;
+  stalePostSwitchActive.drainGraceSeconds = previousAgentRuntime.drainGraceSeconds;
+  stalePostSwitchActive.registration.metadata['alphafrog.release-id'] = stalePostSwitchActive.releaseId;
+  stalePostSwitchActive.registration.metadata['alphafrog.deployment-generation-id'] = stalePostSwitchActive.deploymentGenerationId;
+  stalePostSwitchTarget.deployments[0].services[0].route.defaultReleaseId = stalePostSwitchActive.releaseId;
+  stalePostSwitchTarget.deployments[0].services[0].route.defaultDeploymentGenerationId = stalePostSwitchActive.deploymentGenerationId;
+  runAjv('validate', stateSchema, writeFixture('state-stale-post-switch-target', stalePostSwitchTarget), true);
+  customNegatives.push(['post-switch active target mismatch', manifest, stalePostSwitchTarget]);
   const invalidDrainingRegistration = clone(positiveStates.updateDraining);
   invalidDrainingRegistration.deployments[0].services[0].drainingInstance.registration.enabled = true;
   invalidDrainingRegistration.deployments[0].services[0].drainingInstance.registration.weight = 0;
   customNegatives.push(['draining registration pair', manifest, invalidDrainingRegistration]);
+  const prematurePreStopCheckpoint = clone(positiveStates.updateDraining);
+  prematurePreStopCheckpoint.deployments[0].services[0].drainingInstance.preStopCompletedAt = '2026-09-01T00:02:10Z';
+  customNegatives.push(['pre-stop before registration disabled', manifest, prematurePreStopCheckpoint]);
   const badMetadata = clone(positiveStates.stable);
   badMetadata.deployments[0].services[0].activeInstance.registration.metadata['alphafrog.release-id'] = 'wrong-release';
   customNegatives.push(['registration metadata', manifest, badMetadata]);
+  const badGenerationMetadata = clone(positiveStates.stable);
+  badGenerationMetadata.deployments[0].services[0].activeInstance.registration.metadata['alphafrog.deployment-generation-id'] = previousGeneration;
+  customNegatives.push(['registration generation metadata', manifest, badGenerationMetadata]);
   const badServiceDigest = clone(manifest);
   badServiceDigest.services[0].serviceSpecSha256 = repeated('f');
   customNegatives.push(['service digest', badServiceDigest, positiveStates.stable]);
+  const wrongDeploymentGeneration = clone(positiveStates.stable);
+  wrongDeploymentGeneration.deployments[0].services[0].activeInstance.deploymentGenerationId = `gen-${repeated('7')}`;
+  customNegatives.push(['deployment generation', manifest, wrongDeploymentGeneration]);
+  const wrongPreStopPolicy = clone(positiveStates.stable);
+  wrongPreStopPolicy.deployments[0].services[0].activeInstance.preStopPolicy = 'NONE';
+  customNegatives.push(['pre-stop policy', manifest, wrongPreStopPolicy]);
+  const wrongShutdownPolicy = clone(positiveStates.stable);
+  wrongShutdownPolicy.deployments[0].services[0].activeInstance.applicationDrainSeconds = 54;
+  customNegatives.push(['shutdown policy', manifest, wrongShutdownPolicy]);
+  const downgradedPolicyManifest = clone(manifest);
+  downgradedPolicyManifest.services[0].runtime.preStopPolicy = 'NONE';
+  downgradedPolicyManifest.services[0].serviceSpecSha256 = serviceDigest(downgradedPolicyManifest.services[0]);
+  const downgradedPolicyState = clone(positiveStates.updateSwitching);
+  downgradedPolicyState.deployments[0].manifestSha256 = digest(downgradedPolicyManifest);
+  downgradedPolicyState.deployments[0].services[0].targetServiceSpecSha256 = downgradedPolicyManifest.services[0].serviceSpecSha256;
+  downgradedPolicyState.deployments[0].services[0].candidateInstance.serviceSpecSha256 = downgradedPolicyManifest.services[0].serviceSpecSha256;
+  downgradedPolicyState.deployments[0].services[0].candidateInstance.preStopPolicy = 'NONE';
+  customNegatives.push(['agent pre-stop policy downgrade', downgradedPolicyManifest, downgradedPolicyState]);
   const duplicateServiceManifest = clone(manifest);
   duplicateServiceManifest.services.push(clone(duplicateServiceManifest.services[0]));
   customNegatives.push(['duplicate service', duplicateServiceManifest, positiveStates.stable]);
@@ -460,8 +641,11 @@ try {
   const stableRouteMismatch = clone(positiveStates.stable);
   stableRouteMismatch.deployments[0].services[0].route.defaultInstanceId = 'instance-old';
   customNegatives.push(['stable route mismatch', manifest, stableRouteMismatch]);
+  const stableRouteGenerationMismatch = clone(positiveStates.stable);
+  stableRouteGenerationMismatch.deployments[0].services[0].route.defaultDeploymentGenerationId = previousGeneration;
+  customNegatives.push(['stable route generation mismatch', manifest, stableRouteGenerationMismatch]);
   const drainingSwitchMismatch = clone(positiveStates.updateDraining);
-  drainingSwitchMismatch.deployments[0].services[0].drainingInstance.drainStartedAt = '2026-09-01T00:02:01Z';
+  drainingSwitchMismatch.deployments[0].services[0].drainingInstance.trafficRemovedAt = '2026-09-01T00:02:01Z';
   customNegatives.push(['draining switch time', manifest, drainingSwitchMismatch]);
   const twoOperations = clone(positiveStates.updateSwitching);
   const secondOperatingService = clone(twoOperations.deployments[0].services[0]);
@@ -476,6 +660,13 @@ try {
   const pretty = JSON.stringify(manifest, null, 2);
   assert(digest(JSON.parse(compact)) === digest(JSON.parse(pretty)), 'manifest formatting must not change digest');
   assert(digest(JSON.parse(pretty)) === manifestSha256, 'manifest digest vector must stay fixed');
+  assert(manifestSha256 === expectedManifestSha256, 'manifest digest must match the published fixed vector');
+  const generationVector = JSON.parse(fs.readFileSync(path.join(here, '..', 'agent-run', 'deployment-generation-test-vector.json'), 'utf8'));
+  assert(deploymentGenerationFromParts(
+    generationVector.manifestVersion,
+    generationVector.gitCommit,
+    generationVector.serviceImages
+  ) === generationVector.deploymentGenerationId, 'deployment generation vector must stay fixed');
   runAjv('validate', manifestSchema, writeFixture('manifest-two-service-valid', twoServiceManifest), true);
 
   function validateState(name, manifestValue, stateValue) {
@@ -645,7 +836,19 @@ try {
   postSwitch.drainingInstance.registration.weight = 0;
   const routeReadbackMatches = postSwitch.route.routeVersion === routeNewStable.routeVersion
     && postSwitch.route.defaultInstanceId === postSwitch.activeInstance.instanceId;
-  assert(routeReadbackMatches && !postSwitch.drainingInstance.registration.enabled, 'SIGTERM requires exact route readback and a disabled old registration');
+  const retirementRequest = {
+    deploymentId: manifest.deploymentId,
+    deploymentGenerationId: postSwitch.drainingInstance.deploymentGenerationId
+  };
+  const retirementAccepted = postSwitch.drainingInstance.preStopPolicy === 'AGENT_RETIRE_GENERATION_V1'
+    && retirementRequest.deploymentId === manifest.deploymentId
+    && retirementRequest.deploymentGenerationId === postSwitch.drainingInstance.deploymentGenerationId;
+  if (retirementAccepted) postSwitch.drainingInstance.preStopCompletedAt = '2026-09-01T00:02:10Z';
+  postSwitch.drainingInstance.stopSignalRequestedAt = '2026-09-01T00:02:11Z';
+  postSwitch.drainingInstance.stopDeadline = '2026-09-01T00:02:56Z';
+  assert(routeReadbackMatches && !postSwitch.drainingInstance.registration.enabled && retirementAccepted
+      && postSwitch.drainingInstance.preStopCompletedAt !== null,
+    'SIGTERM requires exact route readback, a disabled old registration, and a successful configured pre-stop hook');
 
   console.log(`Beta deployment traffic contract verification passed: ${schemaChecks} AJV checks, ${contractChecks} contract checks`);
   console.log(`manifestSha256 vector: ${manifestSha256}`);

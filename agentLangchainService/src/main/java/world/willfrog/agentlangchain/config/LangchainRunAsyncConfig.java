@@ -31,8 +31,9 @@ public class LangchainRunAsyncConfig {
         executor.setKeepAliveSeconds(keepAliveSeconds);
         executor.setThreadNamePrefix(hard.getThreadNamePrefix());
         executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
-        executor.setWaitForTasksToCompleteOnShutdown(true);
-        executor.setAwaitTerminationSeconds(30);
+        // 普通重启不能被误认为代际退役。Spring 关闭时立即中断 worker，数据库中的
+        // 同代际 Run 由启动恢复继续；真正退役由控制器显式调用代际退役 RPC。
+        executor.setWaitForTasksToCompleteOnShutdown(false);
         executor.initialize();
         return executor;
     }

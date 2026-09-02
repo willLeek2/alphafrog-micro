@@ -58,10 +58,13 @@ class LangchainLinearRunPipelineWorkflowRestartTest {
         run.setId("run-restart-1");
         run.setUserId("user-1");
         run.setExt("{}");
+        run.setStatus(world.willfrog.agent.platform.model.AgentRunStatus.RECEIVED);
         run.setPlanJson(objectMapper.writeValueAsString(frozenPlan));
         run.setExecutionCheckpointJson("{\"version\":\"v1\"}");
         run.setRestartAttempt(1);
         when(runMapper.findById(run.getId())).thenReturn(run);
+        when(runMapper.updateStatus(run.getId(), run.getUserId(),
+                world.willfrog.agent.platform.model.AgentRunStatus.EXECUTING)).thenReturn(1);
         when(events.isRunnable(run.getId(), run.getUserId())).thenReturn(true);
         when(events.extractRunConfig(run.getExt())).thenReturn(AgentRunEventService.RunConfig.defaults());
         when(models.resolve(run)).thenReturn(new LangchainRunStageModelResolver.StageModels(

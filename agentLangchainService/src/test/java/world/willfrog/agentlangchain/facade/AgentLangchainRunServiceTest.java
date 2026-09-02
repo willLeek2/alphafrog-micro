@@ -16,6 +16,8 @@ import world.willfrog.agentlangchain.control.LangchainRunConcurrencyScheduler;
 import world.willfrog.agentlangchain.control.LangchainRunRejectedException;
 import world.willfrog.alphafrogmicro.agent.idl.CreateAgentRunRequest;
 import world.willfrog.alphafrogmicro.common.dao.user.UserDao;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
@@ -23,6 +25,8 @@ import static org.mockito.Mockito.*;
 
 @ExtendWith(MockitoExtension.class)
 class AgentLangchainRunServiceTest {
+
+    private static final String GENERATION = "gen-" + "a".repeat(64);
 
     @Mock
     private ObjectProvider<AgentRunEventService> eventServiceProvider;
@@ -40,14 +44,18 @@ class AgentLangchainRunServiceTest {
     private AgentCreditService creditService;
     @Mock
     private UserDao userDao;
+    @Mock
+    private DeploymentIdentityProvider deploymentIdentityProvider;
 
     private AgentLangchainRunService runService;
 
     @BeforeEach
     void setUp() {
         runService = new AgentLangchainRunService(eventServiceProvider, pipelineProvider, scheduler, runMapper,
-                creditService, userDao);
+                creditService, userDao, deploymentIdentityProvider);
         lenient().when(creditService.hasPositiveCredit(anyString())).thenReturn(true);
+        lenient().when(deploymentIdentityProvider.current())
+                .thenReturn(new DeploymentIdentity("stable", GENERATION));
     }
 
     @Test
@@ -63,17 +71,21 @@ class AgentLangchainRunServiceTest {
         run.setUserId("u1");
         run.setStatus(AgentRunStatus.RECEIVED);
         when(eventService.createRun(anyString(), anyString(), any(), any(), any(), any(),
-                anyBoolean(), any(), anyInt(), anyBoolean(), any(), anyBoolean(), anyBoolean())).thenReturn(run);
+                anyBoolean(), any(), anyInt(), anyBoolean(), any(), anyString(), anyString(),
+                anyBoolean(), anyBoolean())).thenReturn(run);
         CreateAgentRunRequest request = CreateAgentRunRequest.newBuilder()
                 .setUserId("u1")
                 .setMessage("analyze stocks")
+                .setDeploymentId("stable")
+                .setDeploymentGenerationId(GENERATION)
                 .setGenerateArtifacts(true)
                 .build();
 
         var message = runService.createRun(request);
         assertEquals("run123", message.getId());
         verify(eventService).createRun(eq("u1"), eq("analyze stocks"), any(), any(), any(), any(),
-                anyBoolean(), any(), anyInt(), anyBoolean(), any(), eq(true), anyBoolean());
+                anyBoolean(), any(), anyInt(), anyBoolean(), any(), eq("stable"), eq(GENERATION),
+                eq(true), anyBoolean());
         verify(pipeline).launchAsync(run, reservation);
     }
 
@@ -86,11 +98,14 @@ class AgentLangchainRunServiceTest {
         CreateAgentRunRequest request = CreateAgentRunRequest.newBuilder()
                 .setUserId("u1")
                 .setMessage("analyze stocks")
+                .setDeploymentId("stable")
+                .setDeploymentGenerationId(GENERATION)
                 .build();
 
         assertThrows(LangchainRunRejectedException.class, () -> runService.createRun(request));
         verify(eventService, never()).createRun(anyString(), anyString(), any(), any(), any(), any(),
-                anyBoolean(), any(), anyInt(), anyBoolean(), any(), anyBoolean(), anyBoolean());
+                anyBoolean(), any(), anyInt(), anyBoolean(), any(), anyString(), anyString(),
+                anyBoolean(), anyBoolean());
         verify(pipeline, never()).launchAsync(any(), any());
     }
 
@@ -100,5 +115,18 @@ class AgentLangchainRunServiceTest {
                 .setMessage("hello")
                 .build();
         assertThrows(IllegalArgumentException.class, () -> runService.createRun(request));
+    }
+
+    @Test
+    void createRunRejectsRequestRoutedToDifferentDeploymentBeforeWriting() {
+        CreateAgentRunRequest request = CreateAgentRunRequest.newBuilder()
+                .setUserId("u1")
+                .setMessage("hello")
+                .setDeploymentId("beta-test")
+                .setDeploymentGenerationId(GENERATION)
+                .build();
+
+        assertThrows(IllegalStateException.class, () -> runService.createRun(request));
+        verify(eventServiceProvider, never()).getIfAvailable();
     }
 }

@@ -3,7 +3,7 @@ package world.willfrog.agentlangchain.tooljob;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import world.willfrog.agent.platform.mapper.AgentRunDagNodeMapper;
@@ -19,7 +19,8 @@ import java.util.UUID;
  * 再通过配置显式打开 {@code alphafrog.cancel.reconciler.enabled=true}。
  */
 @Component
-@ConditionalOnProperty(name = "alphafrog.cancel.reconciler.enabled", havingValue = "true", matchIfMissing = false)
+@ConditionalOnExpression("${alphafrog.cancel.reconciler.enabled:false}"
+        + " && !${agent.deployment.retirement-only:false}")
 public class CancelReconciler {
 
     private static final Logger log = LoggerFactory.getLogger(CancelReconciler.class);

@@ -72,8 +72,8 @@ class AgentRunMapperCasStatusBindingTest {
 
     @Test
     void listStuckAtCasStatusAnchorsStatementExists() {
-        assertThat(xmlStatements).as("应包含 listStuckAtCasStatusAnchors")
-                .contains("listStuckAtCasStatusAnchors");
+        assertThat(xmlStatements).as("应包含 listStuckAtCasStatusAnchorsForDeployment")
+                .contains("listStuckAtCasStatusAnchorsForDeployment");
     }
 
     @Test
@@ -86,10 +86,11 @@ class AgentRunMapperCasStatusBindingTest {
 
     @Test
     void listStuckAtCasStatusAnchorsIsSelect() {
-        String fullId = AgentRunMapper.class.getName() + ".listStuckAtCasStatusAnchors";
+        String fullId = AgentRunMapper.class.getName() + ".listStuckAtCasStatusAnchorsForDeployment";
         MappedStatement ms = configuration.getMappedStatement(fullId);
         assertThat(ms.getSqlCommandType())
-                .as("listStuckAtCasStatusAnchors 应为 SELECT").isEqualTo(SqlCommandType.SELECT);
+                .as("listStuckAtCasStatusAnchorsForDeployment 应为 SELECT")
+                .isEqualTo(SqlCommandType.SELECT);
     }
 
     @Test
@@ -104,7 +105,7 @@ class AgentRunMapperCasStatusBindingTest {
 
     @Test
     void listStuckAtCasStatusAnchorsXmlParamsMatchJavaParamAnnotations() {
-        checkParamsMatch("listStuckAtCasStatusAnchors", methodParams);
+        checkParamsMatch("listStuckAtCasStatusAnchorsForDeployment", methodParams);
     }
 
     @Test
@@ -206,7 +207,7 @@ class AgentRunMapperCasStatusBindingTest {
 
     @Test
     void discoverySql_usesBtrimForResumeStateEmptiness() {
-        String sql = getStatementSql("listStuckAtCasStatusAnchors");
+        String sql = getStatementSql("listStuckAtCasStatusAnchorsForDeployment");
         assertThat(sql)
                 .as("resumeState 空白判断必须用 btrim，不能只认长度为 0")
                 .contains("btrim");
@@ -214,7 +215,7 @@ class AgentRunMapperCasStatusBindingTest {
 
     @Test
     void discoverySql_excludesMalformedIdentity() {
-        String sql = getStatementSql("listStuckAtCasStatusAnchors");
+        String sql = getStatementSql("listStuckAtCasStatusAnchorsForDeployment");
         // operationId/toolCallId/taskId 非空 + 非纯空白
         assertThat(sql).as("operationId IS NOT NULL").contains("operationId' IS NOT NULL");
         assertThat(sql).as("toolCallId IS NOT NULL").contains("toolCallId' IS NOT NULL");
@@ -225,7 +226,7 @@ class AgentRunMapperCasStatusBindingTest {
 
     @Test
     void discoverySql_attemptUsesCaseProtectedCast() {
-        String sql = getStatementSql("listStuckAtCasStatusAnchors");
+        String sql = getStatementSql("listStuckAtCasStatusAnchorsForDeployment");
         assertThat(sql)
                 .as("attempt cast 必须包裹在 CASE WHEN regex THEN ::bigint ELSE -1 END 中，"
                     + "不能写成 regex AND ::bigint（PG 不保证求值顺序）")
@@ -237,7 +238,7 @@ class AgentRunMapperCasStatusBindingTest {
 
     @Test
     void discoverySql_leaseVersionUsesCaseProtectedCast() {
-        String sql = getStatementSql("listStuckAtCasStatusAnchors");
+        String sql = getStatementSql("listStuckAtCasStatusAnchorsForDeployment");
         assertThat(sql)
                 .as("leaseVersion cast 必须包裹在 CASE WHEN regex THEN ::numeric ELSE -1 END 中")
                 .contains("CASE WHEN").contains("resumeLeaseVersion' ~")
@@ -278,7 +279,7 @@ class AgentRunMapperCasStatusBindingTest {
 
     @Test
     void discoverySql_doesNotMergeIntoExistingResumeReadyLogic() {
-        String sql = getStatementSql("listStuckAtCasStatusAnchors");
+        String sql = getStatementSql("listStuckAtCasStatusAnchorsForDeployment");
         // 这是一个独立的新查询，不能包含 READY/LAUNCHING/ACCEPTED/CONSUMED 这些既有关键词
         assertThat(sql).as("不应包含 READY（resumeState）").doesNotContain("'READY'");
         assertThat(sql).as("不应包含 LAUNCHING").doesNotContain("'LAUNCHING'");

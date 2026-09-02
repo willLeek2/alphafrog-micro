@@ -2,7 +2,8 @@ package world.willfrog.agentlangchain.tooljob;
 
 import lombok.extern.slf4j.Slf4j;
 import org.apache.dubbo.config.annotation.DubboReference;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import world.willfrog.agent.platform.dataanalysis.ToolJobAnchor;
@@ -10,6 +11,8 @@ import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agent.platform.mapper.AgentRunMapper;
 import world.willfrog.agent.platform.model.AgentRunStatus;
 import world.willfrog.agentlangchain.control.scheduler.LangchainSchedulerMetrics;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentityProvider;
 import world.willfrog.alphafrogmicro.sandbox.idl.*;
 
 import java.time.Instant;
@@ -29,10 +32,8 @@ import java.util.concurrent.ConcurrentMap;
  * 开启耐久恢复时由 ToolJobReconciler 承担发现职责，两者不会同时存在。</p>
  */
 @Service
-@ConditionalOnProperty(
-        name = "agent.tool-job.durable-recovery-enabled",
-        havingValue = "false",
-        matchIfMissing = true)
+@ConditionalOnExpression("!${agent.tool-job.durable-recovery-enabled:false}"
+        + " && !${agent.deployment.retirement-only:false}")
 @Slf4j
 public class ToolJobContinuationTracker {
 
@@ -45,6 +46,8 @@ public class ToolJobContinuationTracker {
     private final AgentRunMapper runMapper;
     private final ToolJobConfig config;
     private final LangchainSchedulerMetrics metrics;
+    @Autowired(required = false)
+    private DeploymentIdentityProvider deploymentIdentityProvider;
 
     @DubboReference
     private PythonSandboxService sandboxService;
@@ -253,7 +256,12 @@ public class ToolJobContinuationTracker {
             return true;
         }
         // 防御：Run 在数据库层面已进入取消终态路径。
-        AgentRun run = runMapper.findById(entry.runId());
+        DeploymentIdentity identity = deploymentIdentityProvider == null
+                ? null : deploymentIdentityProvider.current();
+        AgentRun run = identity == null
+                ? runMapper.findById(entry.runId())
+                : runMapper.findByIdForDeployment(
+                        entry.runId(), identity.deploymentId(), identity.generationId());
         return run != null && (run.getStatus() == AgentRunStatus.CANCELING
                 || run.getStatus() == AgentRunStatus.CANCELED);
     }
