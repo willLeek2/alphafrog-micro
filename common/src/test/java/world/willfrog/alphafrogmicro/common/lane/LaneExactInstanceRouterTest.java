@@ -19,6 +19,14 @@ class LaneExactInstanceRouterTest {
 
     private static final String SCOPE = "main-beta";
     private static final String GEN = "gen-" + "c".repeat(64);
+    private static final LaneCallBinding NEW_BINDING = new LaneCallBinding(
+            SCOPE,
+            "agent-service",
+            "instance-new",
+            "release-2",
+            GEN,
+            8L,
+            new LaneEndpoint("10.0.0.8", 28081));
 
     @AfterEach
     void reset() {
@@ -27,23 +35,10 @@ class LaneExactInstanceRouterTest {
     }
 
     @Test
-    void route_shouldKeepOnlyExactEndpointAndNeverReturnUnfilteredList() {
-        AtomicLaneRoutePointer pointer = new AtomicLaneRoutePointer();
-        pointer.replaceAll(LaneRouteTable.of(List.of(new LaneServiceRoute(
-                SCOPE,
-                "agent-service",
-                "com.alphafrog.AgentService:1.0@@providers",
-                "instance-new",
-                "release-2",
-                GEN,
-                8L,
-                "2026-09-01T00:02:00Z",
-                new LaneEndpoint("10.0.0.8", 28081)))));
-        LaneRoutingSupport.install(new LaneCallRouter(pointer), true);
-        LaneContext.setTrafficScopeId(SCOPE);
-
-        Invoker<Object> oldInvoker = invoker("10.0.0.8", 28080);
-        Invoker<Object> newInvoker = invoker("10.0.0.8", 28081);
+    void route_shouldKeepOnlyExactIdentityAndNeverReturnUnfilteredList() {
+        installNewRoute();
+        Invoker<Object> oldInvoker = invoker("10.0.0.8", 28080, "instance-old");
+        Invoker<Object> newInvoker = invoker("10.0.0.8", 28081, "instance-new");
         List<Invoker<Object>> unfiltered = List.of(oldInvoker, newInvoker);
         LaneExactInstanceRouter router = new LaneExactInstanceRouter(URL.valueOf("dubbo://127.0.0.1/agent-service"));
 
@@ -59,12 +54,44 @@ class LaneExactInstanceRouterTest {
     }
 
     @Test
+    void route_shouldRejectSameEndpointWithWrongInstanceId() {
+        installNewRoute();
+        assertRouteFails(List.of(invoker("10.0.0.8", 28081, "instance-old")));
+        assertThat(LaneExactInstanceRouter.matches(
+                url("10.0.0.8", 28081, "instance-old"), NEW_BINDING)).isFalse();
+    }
+
+    @Test
+    void route_shouldRejectSameInstanceIdWithWrongPort() {
+        installNewRoute();
+        assertRouteFails(List.of(invoker("10.0.0.8", 28080, "instance-new")));
+        assertThat(LaneExactInstanceRouter.matches(
+                url("10.0.0.8", 28080, "instance-new"), NEW_BINDING)).isFalse();
+    }
+
+    @Test
+    void route_shouldRejectMissingInstanceIdEvenWhenEndpointMatches() {
+        installNewRoute();
+        assertRouteFails(List.of(invoker("10.0.0.8", 28081, null)));
+        assertThat(LaneExactInstanceRouter.matches(
+                url("10.0.0.8", 28081, null), NEW_BINDING)).isFalse();
+    }
+
+    @Test
+    void route_shouldRejectMultipleRecordsClaimingTheSameExactIdentity() {
+        installNewRoute();
+        Invoker<Object> first = invoker("10.0.0.8", 28081, "instance-new");
+        Invoker<Object> duplicate = invoker("10.0.0.8", 28081, "instance-new");
+        assertRouteFails(List.of(first, duplicate));
+    }
+
+    @Test
     void route_shouldFailClosedInsteadOfReturningOriginalInvokers() {
         AtomicLaneRoutePointer pointer = new AtomicLaneRoutePointer();
         pointer.replaceAll(LaneRouteTable.empty());
         LaneRoutingSupport.install(new LaneCallRouter(pointer), true);
         LaneContext.setTrafficScopeId(SCOPE);
-        List<Invoker<Object>> unfiltered = List.of(invoker("10.0.0.8", 28080));
+        List<Invoker<Object>> unfiltered = List.of(invoker("10.0.0.8", 28080, "instance-old"));
         LaneExactInstanceRouter router = new LaneExactInstanceRouter(URL.valueOf("dubbo://127.0.0.1/agent-service"));
 
         AtomicReference<List<Invoker<Object>>> captured = new AtomicReference<>();
@@ -79,16 +106,52 @@ class LaneExactInstanceRouterTest {
 
     @Test
     void route_shouldPassThroughWhenDisabledOrUnscoped() {
-        List<Invoker<Object>> unfiltered = List.of(invoker("10.0.0.8", 28080));
+        List<Invoker<Object>> unfiltered = List.of(invoker("10.0.0.8", 28080, "instance-old"));
         LaneExactInstanceRouter router = new LaneExactInstanceRouter(URL.valueOf("dubbo://127.0.0.1/agent-service"));
         assertThat(router.route(unfiltered, null, null)).isSameAs(unfiltered);
     }
 
+    private static void installNewRoute() {
+        AtomicLaneRoutePointer pointer = new AtomicLaneRoutePointer();
+        pointer.replaceAll(LaneRouteTable.of(List.of(new LaneServiceRoute(
+                SCOPE,
+                "agent-service",
+                "com.alphafrog.AgentService:1.0@@providers",
+                "instance-new",
+                "release-2",
+                GEN,
+                8L,
+                "2026-09-01T00:02:00Z",
+                new LaneEndpoint("10.0.0.8", 28081)))));
+        LaneRoutingSupport.install(new LaneCallRouter(pointer), true);
+        LaneContext.setTrafficScopeId(SCOPE);
+    }
+
+    private static void assertRouteFails(List<Invoker<Object>> invokers) {
+        LaneExactInstanceRouter router = new LaneExactInstanceRouter(URL.valueOf("dubbo://127.0.0.1/agent-service"));
+        AtomicReference<List<Invoker<Object>>> captured = new AtomicReference<>();
+        assertThatThrownBy(() -> captured.set(router.route(
+                invokers,
+                URL.valueOf("dubbo://127.0.0.1/com.alphafrog.AgentService:1.0@@providers"),
+                invocation("com.alphafrog.AgentService:1.0@@providers"))))
+                .isInstanceOf(RpcException.class)
+                .hasMessageContaining(LaneRouteFactsUncertainException.CODE);
+        assertThat(captured.get()).isNull();
+    }
+
     @SuppressWarnings("unchecked")
-    private static Invoker<Object> invoker(String host, int port) {
+    private static Invoker<Object> invoker(String host, int port, String instanceId) {
         Invoker<Object> invoker = mock(Invoker.class);
-        when(invoker.getUrl()).thenReturn(URL.valueOf("dubbo://" + host + ":" + port + "/com.alphafrog.AgentService"));
+        when(invoker.getUrl()).thenReturn(url(host, port, instanceId));
         return invoker;
+    }
+
+    private static URL url(String host, int port, String instanceId) {
+        String spec = "dubbo://" + host + ":" + port + "/com.alphafrog.AgentService";
+        if (instanceId != null) {
+            spec += "?alphafrog.instance-id=" + instanceId;
+        }
+        return URL.valueOf(spec);
     }
 
     private static Invocation invocation(String serviceName) {

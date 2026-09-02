@@ -12,8 +12,9 @@ import java.util.List;
 /**
  * 带隔离范围的新调用只保留指针指向的那一个实例。
  *
- * <p>{@link #isRuntime()} 为 true，所以不会把过滤结果缓存到下一次调用。匹配失败时抛错，
- * 绝不把原来的未过滤列表交回去。</p>
+ * <p>匹配要求实例标识、地址和端口同时与当前绑定一致；缺少实例标识或多个记录同时命中
+ * 都视为路由事实不确定。{@link #isRuntime()} 为 true，所以不会把过滤结果缓存到下一次调用。
+ * 匹配失败时抛错，绝不把原来的未过滤列表交回去。</p>
  */
 public final class LaneExactInstanceRouter implements Router {
 
@@ -48,7 +49,7 @@ public final class LaneExactInstanceRouter implements Router {
                     }
                 }
             }
-            if (matched.isEmpty()) {
+            if (matched.size() != 1) {
                 throw new RpcException(
                         RpcException.FORBIDDEN_EXCEPTION,
                         LaneRouteFactsUncertainException.CODE);
@@ -101,12 +102,11 @@ public final class LaneExactInstanceRouter implements Router {
         if (invokerUrl == null || binding == null) {
             return false;
         }
-        String host = invokerUrl.getHost();
-        int port = invokerUrl.getPort();
-        if (binding.matches(host, port)) {
-            return true;
-        }
         String instanceId = invokerUrl.getParameter("alphafrog.instance-id");
-        return binding.instanceId().equals(instanceId);
+        if (instanceId == null || instanceId.isBlank()) {
+            return false;
+        }
+        return binding.instanceId().equals(instanceId)
+                && binding.matches(invokerUrl.getHost(), invokerUrl.getPort());
     }
 }
