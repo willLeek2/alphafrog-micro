@@ -294,8 +294,11 @@ public class DockerComposeContainerRuntime implements ContainerRuntime {
     private void verifyEffectiveCompose(JsonNode manifest, JsonNode service, CandidatePlan plan, String name,
                                         BetaControllerProperties.Machine machine, Path compose,
                                         Map<String, String> processEnvironment) {
-        String output = commands.run(docker(service.path("machineId").asText(), "compose", "--project-name",
-                projectName(plan), "--file", compose.toString(), "config", "--format", "json"),
+        String machineId = service.path("machineId").asText();
+        commands.run(docker(machineId, "compose", "--project-name", projectName(plan), "--file", compose.toString(),
+                "config", "--quiet"), processEnvironment, Duration.ofSeconds(30));
+        String output = commands.run(docker(machineId, "compose", "--project-name", projectName(plan),
+                "--file", compose.toString(), "config", "--no-env-resolution", "--format", "json"),
                 processEnvironment, Duration.ofSeconds(30));
         try {
             JsonNode app = mapper.readTree(output).path("services").path("app");

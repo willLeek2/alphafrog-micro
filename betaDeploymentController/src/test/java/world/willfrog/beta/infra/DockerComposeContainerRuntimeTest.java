@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -84,7 +85,22 @@ class DockerComposeContainerRuntimeTest {
         assertTrue(content.contains("SERVER_SHUTDOWN"));
         assertTrue(content.contains("DUBBO_SERVICE_SHUTDOWN_WAIT"));
         assertEquals("s".repeat(48), commands.composeEnvironment.get("AF_DEPLOYMENT_RETIREMENT_TOKEN"));
-        assertTrue(commands.commands.stream().anyMatch(command -> command.contains("config")));
+        assertTrue(commands.commands.stream().anyMatch(command -> command.contains("--quiet")));
+        assertTrue(commands.commands.stream().anyMatch(command -> command.contains("--no-env-resolution")));
+        assertTrue(commands.commands.stream().anyMatch(command -> command.contains("up")));
+    }
+
+    @Test
+    void createsCandidateWhenDefaultConfigWouldDiscardResolvedEnvFile() throws Exception {
+        FakeCommands commands = new FakeCommands(false, false);
+        DockerComposeContainerRuntime runtime = new DockerComposeContainerRuntime(mapper, commands, properties);
+
+        ContainerRuntime.ContainerObservation created = runtime.create(manifest, service, plan, "s".repeat(48));
+
+        assertTrue(created.running());
+        assertTrue(commands.commands.stream().anyMatch(command -> command.contains("--quiet")));
+        assertTrue(commands.commands.stream().anyMatch(command -> command.contains("--no-env-resolution")));
+        assertTrue(commands.commands.stream().anyMatch(command -> command.contains("up")));
     }
 
     @Test
@@ -170,19 +186,41 @@ class DockerComposeContainerRuntimeTest {
                 return inspectJson(wrongIdentity);
             }
             if (arguments.contains("config")) {
+                if (arguments.contains("--quiet") || arguments.contains("-q")) return "";
                 int file = arguments.indexOf("--file") + 1;
                 try {
-                    String content = Files.readString(Path.of(arguments.get(file)));
-                    if (!leakProductionDotenv) return content;
-                    var root = (com.fasterxml.jackson.databind.node.ObjectNode) mapper.readTree(content);
-                    ((com.fasterxml.jackson.databind.node.ObjectNode) root.path("services").path("app"))
-                            .withArray("env_file")
-                            .add(temporary.resolve(".env").toAbsolutePath().normalize().toString());
+                    ObjectNode root = (ObjectNode) mapper.readTree(Files.readString(Path.of(arguments.get(file))));
+                    ObjectNode app = (ObjectNode) root.path("services").path("app");
+                    if (arguments.contains("--no-env-resolution")) {
+                        if (leakProductionDotenv)
+                            app.withArray("env_file")
+                                    .add(temporary.resolve(".env").toAbsolutePath().normalize().toString());
+                        return mapper.writeValueAsString(root);
+                    }
+                    mergeResolvedEnvironmentAndDiscardEnvFile(app);
                     return mapper.writeValueAsString(root);
                 } catch (Exception exception) { throw new AssertionError(exception); }
             }
             if (arguments.contains("up")) composeEnvironment = new LinkedHashMap<>(environment);
             return "";
+        }
+
+        private void mergeResolvedEnvironmentAndDiscardEnvFile(ObjectNode app) throws Exception {
+            ObjectNode environment = app.has("environment") && app.get("environment").isObject()
+                    ? (ObjectNode) app.get("environment")
+                    : app.putObject("environment");
+            for (JsonNode item : app.path("env_file")) {
+                String location = item.isTextual() ? item.asText() : item.path("path").asText();
+                if (location.isBlank()) continue;
+                for (String line : Files.readAllLines(Path.of(location))) {
+                    String trimmed = line.strip();
+                    if (trimmed.isEmpty() || trimmed.startsWith("#")) continue;
+                    int separator = trimmed.indexOf('=');
+                    if (separator <= 0) continue;
+                    environment.put(trimmed.substring(0, separator), trimmed.substring(separator + 1));
+                }
+            }
+            app.remove("env_file");
         }
 
         private String inspectJson(boolean wrong) {
