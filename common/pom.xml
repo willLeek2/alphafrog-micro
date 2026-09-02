@@ -108,6 +108,12 @@
             <artifactId>json-schema-validator</artifactId>
             <version>1.5.1</version>
         </dependency>
+        <dependency>
+            <groupId>org.apache.dubbo</groupId>
+            <artifactId>dubbo-cluster</artifactId>
+            <version>${dubbo.version}</version>
+            <optional>true</optional>
+        </dependency>
 
     </dependencies>
 

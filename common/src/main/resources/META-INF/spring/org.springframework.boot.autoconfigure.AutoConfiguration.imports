@@ -1,2 +1,3 @@
 world.willfrog.alphafrogmicro.common.datasource.MarketReadAutoConfiguration
 world.willfrog.alphafrogmicro.common.gray.GrayAutoConfiguration
+world.willfrog.alphafrogmicro.common.lane.LaneAutoConfiguration
